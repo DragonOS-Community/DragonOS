@@ -1,8 +1,6 @@
-use crate::{
-    mm::VirtAddr,
-    syscall::{Syscall, SystemError},
-    time::TimeSpec,
-};
+use system_error::SystemError;
+
+use crate::{mm::VirtAddr, syscall::Syscall, time::TimeSpec};
 
 use super::{constant::*, futex::Futex};
 

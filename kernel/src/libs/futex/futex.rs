@@ -5,6 +5,7 @@ use alloc::{
 use core::hash::{Hash, Hasher};
 use core::{intrinsics::likely, sync::atomic::AtomicU64};
 use hashbrown::HashMap;
+use system_error::SystemError;
 
 use crate::{
     arch::{sched::sched, CurrentIrqArch, MMArch},
@@ -12,7 +13,7 @@ use crate::{
     libs::spinlock::{SpinLock, SpinLockGuard},
     mm::{ucontext::AddressSpace, MemoryManagementArch, VirtAddr},
     process::{ProcessControlBlock, ProcessManager},
-    syscall::{user_access::UserBufferReader, SystemError},
+    syscall::user_access::UserBufferReader,
     time::{
         timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
         TimeSpec,

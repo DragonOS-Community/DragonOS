@@ -4,8 +4,6 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use alloc::{boxed::Box, sync::Arc};
-
 use crate::{
     arch::MMArch,
     driver::tty::serial::serial8250::send_to_default_serial8250_port,
@@ -24,9 +22,10 @@ use crate::{
         allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper,
         no_init::pseudo_map_phys, page::PageFlags, MemoryManagementArch, PhysAddr, VirtAddr,
     },
-    syscall::SystemError,
     time::timer::{Timer, TimerFunction},
 };
+use alloc::{boxed::Box, sync::Arc};
+use system_error::SystemError;
 
 pub mod fbdev;
 

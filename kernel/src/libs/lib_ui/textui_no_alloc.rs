@@ -3,11 +3,10 @@ use core::{
     sync::atomic::{AtomicI32, Ordering},
 };
 
-use crate::{
-    driver::{
-        tty::serial::serial8250::send_to_default_serial8250_port, video::video_refresh_manager,
-    },
-    syscall::SystemError,
+use system_error::SystemError;
+
+use crate::driver::{
+    tty::serial::serial8250::send_to_default_serial8250_port, video::video_refresh_manager,
 };
 
 use super::textui::{

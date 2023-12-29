@@ -4,6 +4,7 @@ use alloc::{
     string::ToString,
     sync::{Arc, Weak},
 };
+use system_error::SystemError;
 
 use crate::{
     driver::base::kobject::KObject,
@@ -16,7 +17,6 @@ use crate::{
         vfs::{syscall::ModeType, PollStatus},
     },
     kwarn,
-    syscall::SystemError,
 };
 
 use super::{Attribute, BinAttribute, SysFS, SysFSKernPrivateData};

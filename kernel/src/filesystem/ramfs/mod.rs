@@ -7,18 +7,18 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{core::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
     libs::spinlock::{SpinLock, SpinLockGuard},
-    syscall::SystemError,
     time::TimeSpec,
 };
 
 use super::vfs::{
     file::FilePrivateData, syscall::ModeType, FileSystem, FsInfo, IndexNode, InodeId, Metadata,
-    PollStatus, SpecialNodeData,
+    SpecialNodeData,
 };
 
 /// RamFS的inode名称的最大长度
@@ -208,18 +208,6 @@ impl IndexNode for LockedRamFSInode {
         let target = &mut data[offset..offset + len];
         target.copy_from_slice(&buf[0..len]);
         return Ok(len);
-    }
-
-    fn poll(&self) -> Result<PollStatus, SystemError> {
-        // 加锁
-        let inode: SpinLockGuard<RamFSInode> = self.0.lock();
-
-        // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
-        if inode.metadata.file_type == FileType::Dir {
-            return Err(SystemError::EISDIR);
-        }
-
-        return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

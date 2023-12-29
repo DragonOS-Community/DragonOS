@@ -102,7 +102,9 @@ pub fn do_sched() -> Option<Arc<ProcessControlBlock>> {
     // 当前进程持有锁，不切换，避免死锁
     if ProcessManager::current_pcb().preempt_count() != 0 {
         let binding = ProcessManager::current_pcb();
-        let guard = binding.sched_info_try_upgradeable_irqsave(5);
+        let guard = binding
+            .sched_info()
+            .inner_lock_try_upgradable_read_irqsave(5);
         if unlikely(guard.is_none()) {
             return None;
         }
@@ -154,7 +156,7 @@ pub fn do_sched() -> Option<Arc<ProcessControlBlock>> {
 /// @param reset_time 是否重置虚拟运行时间
 pub fn sched_enqueue(pcb: Arc<ProcessControlBlock>, mut reset_time: bool) {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    if pcb.sched_info().state() != ProcessState::Runnable {
+    if pcb.sched_info().inner_lock_read_irqsave().state() != ProcessState::Runnable {
         return;
     }
     let cfs_scheduler = __get_cfs_scheduler();
@@ -173,7 +175,7 @@ pub fn sched_enqueue(pcb: Arc<ProcessControlBlock>, mut reset_time: bool) {
 
     assert!(pcb.sched_info().on_cpu().is_some());
 
-    match pcb.sched_info().policy() {
+    match pcb.sched_info().inner_lock_read_irqsave().policy() {
         SchedPolicy::CFS => {
             if reset_time {
                 cfs_scheduler.enqueue_reset_vruntime(pcb.clone());
@@ -199,17 +201,19 @@ pub extern "C" fn sched_init() {
 
 /// @brief 当时钟中断到达时，更新时间片
 /// 请注意，该函数只能被时钟中断处理程序调用
-pub extern "C" fn sched_update_jiffies() {
+#[inline(never)]
+pub fn sched_update_jiffies() {
     let binding = ProcessManager::current_pcb();
-    let guard = binding.try_sched_info(10);
+    let guard = binding.sched_info().inner_lock_try_read_irqsave(10);
     if unlikely(guard.is_none()) {
         return;
     }
     let guard = guard.unwrap();
     let policy = guard.policy();
+    drop(guard);
     match policy {
         SchedPolicy::CFS => {
-            __get_cfs_scheduler().timer_update_jiffies(&guard);
+            __get_cfs_scheduler().timer_update_jiffies(binding.sched_info());
         }
         SchedPolicy::FIFO | SchedPolicy::RR => {
             __get_rt_scheduler().timer_update_jiffies();

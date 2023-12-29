@@ -1,9 +1,7 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
+use system_error::SystemError;
 
-use crate::{
-    process::{fork::KernelCloneArgs, KernelStack, ProcessControlBlock, ProcessManager},
-    syscall::SystemError,
-};
+use crate::process::{fork::KernelCloneArgs, KernelStack, ProcessControlBlock, ProcessManager};
 
 use super::interrupt::TrapFrame;
 

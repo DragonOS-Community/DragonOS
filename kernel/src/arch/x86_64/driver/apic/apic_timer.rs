@@ -7,9 +7,9 @@ use crate::kdebug;
 use crate::mm::percpu::PerCpu;
 use crate::sched::core::sched_update_jiffies;
 use crate::smp::core::smp_get_processor_id;
-use crate::syscall::SystemError;
 use crate::time::clocksource::HZ;
 pub use drop;
+use system_error::SystemError;
 use x86::cpuid::cpuid;
 use x86::msr::{wrmsr, IA32_X2APIC_DIV_CONF, IA32_X2APIC_INIT_COUNT};
 
@@ -112,7 +112,7 @@ pub enum LocalApicTimerMode {
 impl LocalApicTimer {
     /// 定时器中断的间隔
     pub const INTERVAL_MS: u64 = 1000 / HZ as u64;
-    pub const DIVISOR: u64 = 3;
+    pub const DIVISOR: u64 = 4;
 
     /// IoApicManager 初值为0或false
     pub const fn new() -> Self {
@@ -131,7 +131,7 @@ impl LocalApicTimer {
         // 疑惑：这里使用khz吗？
         // 我觉得应该是hz，但是由于旧的代码是测量出initcnt的，而不是计算的
         // 然后我发现使用hz会导致计算出来的initcnt太大，导致系统卡顿，而khz的却能跑
-        let count = cpu_khz * Self::INTERVAL_MS / (1000 * Self::DIVISOR);
+        let count = cpu_khz * Self::INTERVAL_MS / (Self::DIVISOR);
         return count;
     }
 

@@ -28,20 +28,9 @@ pub struct WaitQueue(SpinLock<InnerWaitQueue>);
 impl WaitQueue {
     pub const INIT: WaitQueue = WaitQueue(SpinLock::new(InnerWaitQueue::INIT));
 
-    fn before_sleep_check(&self, max_preempt: usize) {
-        let pcb = ProcessManager::current_pcb();
-        if unlikely(pcb.preempt_count() > max_preempt) {
-            kwarn!(
-                "Process {:?}: Try to sleep when preempt count is {}",
-                pcb.pid(),
-                pcb.preempt_count()
-            );
-        }
-    }
-
     /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断
     pub fn sleep(&self) {
-        self.before_sleep_check(0);
+        before_sleep_check(0);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock_irqsave();
         ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
             panic!("sleep error: {:?}", e);
@@ -56,7 +45,7 @@ impl WaitQueue {
     where
         F: FnOnce(),
     {
-        self.before_sleep_check(0);
+        before_sleep_check(0);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
@@ -85,7 +74,7 @@ impl WaitQueue {
     /// 由于sleep_without_schedule不会调用调度函数，因此，如果开发者忘记在执行本函数之后，手动调用调度函数，
     /// 由于时钟中断到来或者‘其他cpu kick了当前cpu’，可能会导致一些未定义的行为。
     pub unsafe fn sleep_without_schedule(&self) {
-        self.before_sleep_check(0);
+        before_sleep_check(1);
         // 安全检查：确保当前处于中断禁止状态
         assert!(CurrentIrqArch::is_irq_enabled() == false);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
@@ -97,7 +86,7 @@ impl WaitQueue {
     }
 
     pub unsafe fn sleep_without_schedule_uninterruptible(&self) {
-        self.before_sleep_check(0);
+        before_sleep_check(0);
         // 安全检查：确保当前处于中断禁止状态
         assert!(CurrentIrqArch::is_irq_enabled() == false);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
@@ -109,7 +98,7 @@ impl WaitQueue {
     }
     /// @brief 让当前进程在等待队列上进行等待，并且，不允许被信号打断
     pub fn sleep_uninterruptible(&self) {
-        self.before_sleep_check(0);
+        before_sleep_check(0);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(false).unwrap_or_else(|e| {
@@ -124,7 +113,7 @@ impl WaitQueue {
     /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断。
     /// 在当前进程的pcb加入队列后，解锁指定的自旋锁。
     pub fn sleep_unlock_spinlock<T>(&self, to_unlock: SpinLockGuard<T>) {
-        self.before_sleep_check(1);
+        before_sleep_check(1);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
@@ -140,7 +129,7 @@ impl WaitQueue {
     /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断。
     /// 在当前进程的pcb加入队列后，解锁指定的Mutex。
     pub fn sleep_unlock_mutex<T>(&self, to_unlock: MutexGuard<T>) {
-        self.before_sleep_check(1);
+        before_sleep_check(1);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
@@ -156,7 +145,7 @@ impl WaitQueue {
     /// @brief 让当前进程在等待队列上进行等待，并且，不允许被信号打断。
     /// 在当前进程的pcb加入队列后，解锁指定的自旋锁。
     pub fn sleep_uninterruptible_unlock_spinlock<T>(&self, to_unlock: SpinLockGuard<T>) {
-        self.before_sleep_check(1);
+        before_sleep_check(1);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(false).unwrap_or_else(|e| {
@@ -172,7 +161,7 @@ impl WaitQueue {
     /// @brief 让当前进程在等待队列上进行等待，并且，不允许被信号打断。
     /// 在当前进程的pcb加入队列后，解锁指定的Mutex。
     pub fn sleep_uninterruptible_unlock_mutex<T>(&self, to_unlock: MutexGuard<T>) {
-        self.before_sleep_check(1);
+        before_sleep_check(1);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(false).unwrap_or_else(|e| {
@@ -195,18 +184,27 @@ impl WaitQueue {
     /// @return true 成功唤醒进程
     /// @return false 没有唤醒进程
     pub fn wakeup(&self, state: Option<ProcessState>) -> bool {
-        let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
+        let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock_irqsave();
         // 如果队列为空，则返回
         if guard.wait_list.is_empty() {
             return false;
         }
         // 如果队列头部的pcb的state与给定的state相与，结果不为0，则唤醒
         if let Some(state) = state {
-            if guard.wait_list.front().unwrap().sched_info().state() != state {
+            if guard
+                .wait_list
+                .front()
+                .unwrap()
+                .sched_info()
+                .inner_lock_read_irqsave()
+                .state()
+                != state
+            {
                 return false;
             }
         }
         let to_wakeup = guard.wait_list.pop_front().unwrap();
+        drop(guard);
         let res = ProcessManager::wakeup(&to_wakeup).is_ok();
         return res;
     }
@@ -226,7 +224,7 @@ impl WaitQueue {
         while let Some(to_wakeup) = guard.wait_list.pop_front() {
             let mut wake = false;
             if let Some(state) = state {
-                if to_wakeup.sched_info().state() == state {
+                if to_wakeup.sched_info().inner_lock_read_irqsave().state() == state {
                     wake = true;
                 }
             } else {
@@ -258,4 +256,125 @@ impl InnerWaitQueue {
     pub const INIT: InnerWaitQueue = InnerWaitQueue {
         wait_list: LinkedList::new(),
     };
+}
+
+fn before_sleep_check(max_preempt: usize) {
+    let pcb = ProcessManager::current_pcb();
+    if unlikely(pcb.preempt_count() > max_preempt) {
+        kwarn!(
+            "Process {:?}: Try to sleep when preempt count is {}",
+            pcb.pid(),
+            pcb.preempt_count()
+        );
+    }
+}
+
+/// 事件等待队列
+#[derive(Debug)]
+pub struct EventWaitQueue {
+    wait_list: SpinLock<Vec<(u64, Arc<ProcessControlBlock>)>>,
+}
+
+impl EventWaitQueue {
+    pub fn new() -> Self {
+        Self {
+            wait_list: SpinLock::new(Vec::new()),
+        }
+    }
+
+    /// ## 让当前进程在该队列上等待感兴趣的事件
+    ///
+    /// ### 参数
+    /// - events: 进程感兴趣的事件，events最好是为位表示，一位表示一个事件
+    ///
+    /// 注意，使用前应该注意有可能其他地方定义了冲突的事件，可能会导致未定义行为
+    pub fn sleep(&self, events: u64) {
+        before_sleep_check(0);
+        let mut guard = self.wait_list.lock_irqsave();
+        ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
+            panic!("sleep error: {:?}", e);
+        });
+        guard.push((events, ProcessManager::current_pcb()));
+        drop(guard);
+        sched();
+    }
+
+    pub unsafe fn sleep_without_schedule(&self, events: u64) {
+        before_sleep_check(1);
+        let mut guard = self.wait_list.lock_irqsave();
+        ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
+            panic!("sleep error: {:?}", e);
+        });
+        guard.push((events, ProcessManager::current_pcb()));
+        drop(guard);
+    }
+
+    pub fn sleep_unlock_spinlock<T>(&self, events: u64, to_unlock: SpinLockGuard<T>) {
+        before_sleep_check(1);
+        let mut guard = self.wait_list.lock_irqsave();
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
+            panic!("sleep error: {:?}", e);
+        });
+        drop(irq_guard);
+        guard.push((events, ProcessManager::current_pcb()));
+        drop(to_unlock);
+        drop(guard);
+        sched();
+    }
+
+    /// ### 唤醒该队列上等待events的进程
+    ///
+    ///  ### 参数
+    /// - events: 发生的事件
+    ///
+    /// 需要注意的是，只要触发了events中的任意一件事件，进程都会被唤醒
+    pub fn wakeup_any(&self, events: u64) -> usize {
+        let mut ret = 0;
+
+        let mut wq_guard = self.wait_list.lock_irqsave();
+        wq_guard.retain(|(es, pcb)| {
+            if *es & events > 0 {
+                // 有感兴趣的事件
+                if ProcessManager::wakeup(pcb).is_ok() {
+                    ret += 1;
+                    return true;
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        });
+        ret
+    }
+
+    /// ### 唤醒该队列上等待events的进程
+    ///
+    ///  ### 参数
+    /// - events: 发生的事件
+    ///
+    /// 需要注意的是，只有满足所有事件的进程才会被唤醒
+    pub fn wakeup(&self, events: u64) -> usize {
+        let mut ret = 0;
+        let mut wq_guard = self.wait_list.lock_irqsave();
+        wq_guard.retain(|(es, pcb)| {
+            if *es == events {
+                // 有感兴趣的事件
+                if ProcessManager::wakeup(pcb).is_ok() {
+                    ret += 1;
+                    return true;
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        });
+        ret
+    }
+
+    pub fn wakeup_all(&self) {
+        self.wakeup_any(u64::MAX);
+    }
 }

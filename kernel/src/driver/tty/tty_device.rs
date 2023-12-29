@@ -3,6 +3,7 @@ use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
 };
+use system_error::SystemError;
 
 use crate::{
     filesystem::{
@@ -17,7 +18,6 @@ use crate::{
         lib_ui::textui::{textui_putchar, FontColor},
         rwlock::RwLock,
     },
-    syscall::SystemError,
 };
 
 use super::{serial::serial_init, TtyCore, TtyError, TtyFileFlag, TtyFilePrivateData};
@@ -212,10 +212,6 @@ impl IndexNode for TtyDevice {
         let r: TtyError = r.unwrap_err();
         kerror!("Error occurred when writing tty deivce. Error msg={r:?}");
         return Err(SystemError::EIO);
-    }
-
-    fn poll(&self) -> Result<crate::filesystem::vfs::PollStatus, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {

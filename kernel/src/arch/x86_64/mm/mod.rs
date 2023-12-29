@@ -27,8 +27,8 @@ use crate::{
 use crate::mm::kernel_mapper::KernelMapper;
 use crate::mm::page::{PageEntry, PageFlags};
 use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, PhysMemoryArea, VirtAddr};
-use crate::syscall::SystemError;
 use crate::{kdebug, kinfo};
+use system_error::SystemError;
 
 use core::arch::asm;
 use core::ffi::c_void;

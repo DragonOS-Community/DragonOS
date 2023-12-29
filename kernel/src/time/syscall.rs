@@ -4,9 +4,10 @@ use core::{
 };
 
 use num_traits::FromPrimitive;
+use system_error::SystemError;
 
 use crate::{
-    syscall::{user_access::UserBufferWriter, Syscall, SystemError},
+    syscall::{user_access::UserBufferWriter, Syscall},
     time::{sleep::nanosleep, TimeSpec},
 };
 

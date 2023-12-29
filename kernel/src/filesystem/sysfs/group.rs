@@ -1,6 +1,7 @@
 use core::intrinsics::unlikely;
 
 use alloc::{string::ToString, sync::Arc};
+use system_error::SystemError;
 
 use crate::{
     driver::base::kobject::KObject,
@@ -11,7 +12,6 @@ use crate::{
     },
     kwarn,
     libs::casting::DowncastArc,
-    syscall::SystemError,
 };
 
 use super::{AttributeGroup, SysFS};

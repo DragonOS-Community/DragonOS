@@ -1,10 +1,10 @@
 use crate::{
     filesystem::{sysfs::SysFSKernPrivateData, vfs::PollStatus},
     libs::spinlock::SpinLockGuard,
-    syscall::SystemError,
 };
 use alloc::sync::Arc;
 use core::fmt::Debug;
+use system_error::SystemError;
 
 use super::KernFSInode;
 

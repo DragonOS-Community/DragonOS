@@ -11,7 +11,6 @@ use crate::{
     kinfo,
     libs::spinlock::SpinLock,
     net::{generate_iface_id, NET_DRIVERS},
-    syscall::SystemError,
     time::Instant,
 };
 use alloc::{string::String, sync::Arc};
@@ -21,6 +20,7 @@ use core::{
     ops::{Deref, DerefMut},
 };
 use smoltcp::{phy, wire};
+use system_error::SystemError;
 
 use super::e1000e::{E1000EBuffer, E1000EDevice};
 
@@ -260,10 +260,7 @@ impl NetDriver for E1000EInterface {
         return Ok(());
     }
 
-    fn poll(
-        &self,
-        sockets: &mut smoltcp::iface::SocketSet,
-    ) -> Result<(), crate::syscall::SystemError> {
+    fn poll(&self, sockets: &mut smoltcp::iface::SocketSet) -> Result<(), SystemError> {
         let timestamp: smoltcp::time::Instant = Instant::now().into();
         let mut guard = self.iface.lock();
         let poll_res = guard.poll(timestamp, self.driver.force_get_mut(), sockets);
@@ -346,6 +343,8 @@ pub fn e1000e_driver_init(device: E1000EDevice) {
     let driver = E1000EDriver::new(device);
     let iface = E1000EInterface::new(driver);
     // 将网卡的接口信息注册到全局的网卡接口信息表中
-    NET_DRIVERS.write().insert(iface.nic_id(), iface.clone());
+    NET_DRIVERS
+        .write_irqsave()
+        .insert(iface.nic_id(), iface.clone());
     kinfo!("e1000e driver init successfully!\tMAC: [{}]", mac);
 }

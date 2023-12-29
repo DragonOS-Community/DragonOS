@@ -1,6 +1,7 @@
 use alloc::sync::Arc;
 
-use crate::{kerror, syscall::SystemError};
+use crate::kerror;
+use system_error::SystemError;
 
 use super::{
     device::{device_manager, mkdev, Device, DeviceNumber, IdTable, CHARDEVS, DEVMAP},

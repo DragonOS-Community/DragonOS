@@ -3,24 +3,40 @@ use core::{
     sync::atomic::AtomicUsize,
 };
 
-use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
+use alloc::{
+    boxed::Box,
+    collections::BTreeMap,
+    sync::{Arc, Weak},
+};
+use system_error::SystemError;
 
-use crate::{driver::net::NetDriver, kwarn, libs::rwlock::RwLock, syscall::SystemError};
-use smoltcp::wire::IpEndpoint;
+use crate::{
+    driver::net::NetDriver,
+    kwarn,
+    libs::{rwlock::RwLock, spinlock::SpinLock},
+    net::event_poll::EventPoll,
+};
+use smoltcp::{iface::SocketHandle, wire::IpEndpoint};
 
-use self::socket::SocketMetadata;
+use self::{
+    event_poll::{EPollEventType, EPollItem},
+    socket::{SocketMetadata, HANDLE_MAP},
+};
 
 pub mod endpoints;
+pub mod event_poll;
 pub mod net_core;
 pub mod socket;
 pub mod syscall;
 
 lazy_static! {
-    /// @brief 所有网络接口的列表
+    /// 所有网络接口的列表
+    ///
+    /// 这个列表在中断上下文会使用到，因此需要irqsave
     pub static ref NET_DRIVERS: RwLock<BTreeMap<usize, Arc<dyn NetDriver>>> = RwLock::new(BTreeMap::new());
 }
 
-/// @brief 生成网络接口的id (全局自增)
+/// 生成网络接口的id (全局自增)
 pub fn generate_iface_id() -> usize {
     static IFACE_ID: AtomicUsize = AtomicUsize::new(0);
     return IFACE_ID
@@ -28,28 +44,13 @@ pub fn generate_iface_id() -> usize {
         .into();
 }
 
-/// @brief 用于指定socket的关闭类型
-/// 参考：https://pubs.opengroup.org/onlinepubs/9699919799/functions/shutdown.html
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
-pub enum ShutdownType {
-    ShutRd = 0,   // Disables further receive operations.
-    ShutWr = 1,   // Disables further send operations.
-    ShutRdwr = 2, // Disables further send and receive operations.
-}
-
-impl TryFrom<i32> for ShutdownType {
-    type Error = SystemError;
-
-    fn try_from(value: i32) -> Result<Self, Self::Error> {
-        use num_traits::FromPrimitive;
-        <Self as FromPrimitive>::from_i32(value).ok_or(SystemError::EINVAL)
-    }
-}
-
-impl Into<i32> for ShutdownType {
-    fn into(self) -> i32 {
-        use num_traits::ToPrimitive;
-        <Self as ToPrimitive>::to_i32(&self).unwrap()
+bitflags! {
+    /// @brief 用于指定socket的关闭类型
+    /// 参考：https://opengrok.ringotek.cn/xref/linux-6.1.9/include/net/sock.h?fi=SHUTDOWN_MASK#1573
+    pub struct ShutdownType: u8 {
+        const RCV_SHUTDOWN = 1;
+        const SEND_SHUTDOWN = 2;
+        const SHUTDOWN_MASK = 3;
     }
 }
 
@@ -69,7 +70,7 @@ pub trait Socket: Sync + Send + Debug {
     ///
     /// @return - 成功：(返回读取的数据的长度，读取数据的端点).
     ///         - 失败：错误码
-    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint);
+    fn read(&mut self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint);
 
     /// @brief 向socket中写入数据。如果socket是阻塞的，那么直到写入的数据全部写入socket中才返回
     ///
@@ -109,7 +110,7 @@ pub trait Socket: Sync + Send + Debug {
     /// 此函数向远程端点发送关闭消息以指示本地端点不再接受新数据。
     ///
     /// @return 返回是否成功关闭
-    fn shutdown(&self, _type: ShutdownType) -> Result<(), SystemError> {
+    fn shutdown(&mut self, _type: ShutdownType) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
@@ -156,8 +157,8 @@ pub trait Socket: Sync + Send + Debug {
     ///     The second boolean value indicates whether the socket is ready for writing. If it is true, then data can be written to the socket without blocking.
     ///     The third boolean value indicates whether the socket has encountered an error condition. If it is true, then the socket is in an error state and should be closed or reset
     ///
-    fn poll(&self) -> (bool, bool, bool) {
-        return (false, false, false);
+    fn poll(&self) -> EPollEventType {
+        return EPollEventType::empty();
     }
 
     /// @brief socket的ioctl函数
@@ -198,6 +199,48 @@ pub trait Socket: Sync + Send + Debug {
     ) -> Result<(), SystemError> {
         kwarn!("setsockopt is not implemented");
         return Ok(());
+    }
+
+    fn socket_handle(&self) -> SocketHandle;
+
+    fn add_epoll(&mut self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
+        HANDLE_MAP
+            .write_irqsave()
+            .get_mut(&self.socket_handle())
+            .unwrap()
+            .add_epoll(epitem);
+        Ok(())
+    }
+
+    fn remove_epoll(
+        &mut self,
+        epoll: &Weak<SpinLock<event_poll::EventPoll>>,
+    ) -> Result<(), SystemError> {
+        HANDLE_MAP
+            .write_irqsave()
+            .get_mut(&self.socket_handle())
+            .unwrap()
+            .remove_epoll(epoll)?;
+
+        Ok(())
+    }
+
+    fn clear_epoll(&mut self) -> Result<(), SystemError> {
+        let mut handle_map_guard = HANDLE_MAP.write_irqsave();
+        let handle_item = handle_map_guard.get_mut(&self.socket_handle()).unwrap();
+
+        for epitem in handle_item.epitems.lock_irqsave().iter() {
+            let epoll = epitem.epoll();
+            if epoll.upgrade().is_some() {
+                let _ = EventPoll::ep_remove(
+                    &mut epoll.upgrade().unwrap().lock_irqsave(),
+                    epitem.fd(),
+                    None,
+                );
+            }
+        }
+
+        Ok(())
     }
 }
 

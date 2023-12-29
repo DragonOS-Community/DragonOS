@@ -6,10 +6,10 @@ use core::{
 
 use alloc::{boxed::Box, collections::LinkedList, string::String, sync::Arc, vec::Vec};
 use lazy_static::__Deref;
+use system_error::SystemError;
 
 use crate::{
     include::bindings::bindings::run_watchdog_kthread, kdebug, kinfo, libs::spinlock::SpinLock,
-    syscall::SystemError,
 };
 
 use super::{

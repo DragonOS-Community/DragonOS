@@ -5,10 +5,10 @@ use super::{
 use crate::{
     driver::base::kobject::KObject,
     filesystem::sysfs::{sysfs_instance, Attribute, AttributeGroup},
-    syscall::SystemError,
 };
 use alloc::{sync::Arc, vec::Vec};
 use core::fmt::Debug;
+use system_error::SystemError;
 
 /// @brief: Driver error
 #[allow(dead_code)]

@@ -1,6 +1,7 @@
 use core::sync::atomic::compiler_fence;
 
 use alloc::sync::Arc;
+use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigCode, SigFlags, SigSet, Signal},
@@ -8,7 +9,6 @@ use crate::{
     kwarn,
     libs::spinlock::SpinLockGuard,
     process::{pid::PidType, Pid, ProcessControlBlock, ProcessFlags, ProcessManager},
-    syscall::SystemError,
 };
 
 use super::signal_types::{
@@ -201,10 +201,8 @@ impl Signal {
         if *self == Signal::SIGKILL {
             return true;
         }
-
-        if pcb.sched_info().state().is_blocked()
-            && (pcb.sched_info().state().is_blocked_interruptable() == false)
-        {
+        let state = pcb.sched_info().inner_lock_read_irqsave().state();
+        if state.is_blocked() && (state.is_blocked_interruptable() == false) {
             return false;
         }
 
@@ -287,7 +285,7 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, _guard: SpinLockGuard<SignalStr
     // 如果不是 fatal 的就只唤醒 stop 的进程来响应
     // kdebug!("signal_wake_up");
     // 如果目标进程已经在运行，则发起一个ipi，使得它陷入内核
-    let state = pcb.sched_info().state();
+    let state = pcb.sched_info().inner_lock_read_irqsave().state();
     let mut wakeup_ok = true;
     if state.is_blocked_interruptable() {
         ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
@@ -337,7 +335,7 @@ fn recalc_sigpending() {
 pub fn flush_signal_handlers(pcb: Arc<ProcessControlBlock>, force_default: bool) {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     // kdebug!("hand=0x{:018x}", hand as *const sighand_struct as usize);
-    let actions = &mut pcb.sig_struct().handlers;
+    let actions = &mut pcb.sig_struct_irqsave().handlers;
 
     for sigaction in actions.iter_mut() {
         if force_default || !sigaction.is_ignore() {
@@ -436,7 +434,7 @@ pub fn set_current_sig_blocked(new_set: &mut SigSet) {
         return;
     }
 
-    let guard = pcb.sig_struct_irq();
+    let guard = pcb.sig_struct_irqsave();
     // todo: 当一个进程有多个线程后，在这里需要设置每个线程的block字段，并且 retarget_shared_pending（虽然我还没搞明白linux这部分是干啥的）
 
     // 设置当前进程的sig blocked

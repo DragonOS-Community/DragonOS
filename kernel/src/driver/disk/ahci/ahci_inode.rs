@@ -4,15 +4,15 @@ use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{
     core::generate_inode_id, make_rawdev, FilePrivateData, FileSystem, FileType, IndexNode,
-    Metadata, PollStatus,
+    Metadata,
 };
-use crate::syscall::SystemError;
 use crate::{libs::spinlock::SpinLock, time::TimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
+use system_error::SystemError;
 
 use super::ahcidisk::LockedAhciDisk;
 
@@ -106,10 +106,6 @@ impl IndexNode for LockedAhciInode {
         inode.metadata.gid = metadata.gid;
 
         return Ok(());
-    }
-
-    fn poll(&self) -> Result<PollStatus, SystemError> {
-        return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 
     /// 读设备 - 应该调用设备的函数读写，而不是通过文件系统读写

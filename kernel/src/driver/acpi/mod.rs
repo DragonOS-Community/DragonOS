@@ -12,8 +12,8 @@ use crate::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         MemoryManagementArch, PhysAddr, VirtAddr,
     },
-    syscall::SystemError,
 };
+use system_error::SystemError;
 
 use super::base::kset::KSet;
 

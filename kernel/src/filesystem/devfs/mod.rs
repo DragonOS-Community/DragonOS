@@ -6,7 +6,7 @@ use super::vfs::{
     core::{generate_inode_id, ROOT_INODE},
     file::FileMode,
     syscall::ModeType,
-    FileSystem, FileType, FsInfo, IndexNode, Metadata, PollStatus,
+    FileSystem, FileType, FsInfo, IndexNode, Metadata,
 };
 use crate::{
     kerror, kinfo,
@@ -14,7 +14,6 @@ use crate::{
         once::Once,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    syscall::SystemError,
     time::TimeSpec,
 };
 use alloc::{
@@ -23,6 +22,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use system_error::SystemError;
 
 const DEVFS_MAX_NAMELEN: usize = 64;
 
@@ -487,18 +487,6 @@ impl IndexNode for LockedDevFSInode {
         inode.metadata.gid = metadata.gid;
 
         return Ok(());
-    }
-
-    fn poll(&self) -> Result<super::vfs::PollStatus, SystemError> {
-        // 加锁
-        let inode: SpinLockGuard<DevFSInode> = self.0.lock();
-
-        // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
-        if inode.metadata.file_type == FileType::Dir {
-            return Err(SystemError::EISDIR);
-        }
-
-        return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 
     /// 读设备 - 应该调用设备的函数读写，而不是通过文件系统读写

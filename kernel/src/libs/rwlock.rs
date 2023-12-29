@@ -7,11 +7,12 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
+use system_error::SystemError;
+
 use crate::{
     arch::CurrentIrqArch,
     exception::{InterruptArch, IrqFlagsGuard},
     process::ProcessManager,
-    syscall::SystemError,
 };
 
 ///RwLock读写锁
@@ -163,6 +164,7 @@ impl<T> RwLock<T> {
         } //忙等待
     }
 
+    /// 关中断并获取读者守卫
     pub fn read_irqsave(&self) -> RwLockReadGuard<T> {
         loop {
             let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
@@ -173,6 +175,17 @@ impl<T> RwLock<T> {
                 }
                 None => spin_loop(),
             }
+        }
+    }
+
+    /// 尝试关闭中断并获取读者守卫
+    pub fn try_read_irqsave(&self) -> Option<RwLockReadGuard<T>> {
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        if let Some(mut guard) = self.try_read() {
+            guard.irq_guard = Some(irq_guard);
+            return Some(guard);
+        } else {
+            return None;
         }
     }
 

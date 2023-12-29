@@ -1,5 +1,7 @@
 use core::{ffi::c_void, intrinsics::unlikely, mem::size_of};
 
+use system_error::SystemError;
+
 use crate::{
     arch::{
         fpu::FpState,
@@ -16,7 +18,7 @@ use crate::{
     kerror,
     mm::MemoryManagementArch,
     process::ProcessManager,
-    syscall::{user_access::UserBufferWriter, Syscall, SystemError},
+    syscall::{user_access::UserBufferWriter, Syscall},
 };
 
 /// 信号处理的栈的栈指针的最小对齐数量
@@ -382,7 +384,7 @@ impl SigContext {
     /// - `false` -> 执行失败
     pub fn restore_sigcontext(&mut self, frame: &mut TrapFrame) -> bool {
         let guard = ProcessManager::current_pcb();
-        let mut arch_info = guard.arch_info();
+        let mut arch_info = guard.arch_info_irqsave();
         (*frame) = self.frame.clone();
         // (*current_thread).trap_num = (*context).trap_num;
         *arch_info.cr2_mut() = self.cr2 as usize;

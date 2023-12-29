@@ -1,6 +1,7 @@
 use core::intrinsics::likely;
 
 use alloc::sync::Arc;
+use system_error::SystemError;
 
 use crate::{
     arch::{
@@ -9,7 +10,7 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    syscall::{user_access::UserBufferWriter, SystemError},
+    syscall::user_access::UserBufferWriter,
 };
 
 use super::{
@@ -153,8 +154,9 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
             let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
             for pid in rd_childen.iter() {
                 let pcb = ProcessManager::find(*pid).ok_or(SystemError::ECHILD)?;
-                if pcb.sched_info().state().is_exited() {
-                    kwo.ret_status = pcb.sched_info().state().exit_code().unwrap() as i32;
+                let state = pcb.sched_info().inner_lock_read_irqsave().state();
+                if state.is_exited() {
+                    kwo.ret_status = state.exit_code().unwrap() as i32;
                     drop(pcb);
                     unsafe { ProcessManager::release(pid.clone()) };
                     return Ok(pid.clone().into());
@@ -178,7 +180,7 @@ fn do_waitpid(
     child_pcb: Arc<ProcessControlBlock>,
     kwo: &mut KernelWaitOption,
 ) -> Option<Result<usize, SystemError>> {
-    let state = child_pcb.sched_info().state();
+    let state = child_pcb.sched_info().inner_lock_read_irqsave().state();
     // 获取退出码
     match state {
         ProcessState::Runnable => {

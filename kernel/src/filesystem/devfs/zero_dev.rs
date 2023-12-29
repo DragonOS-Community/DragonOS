@@ -2,14 +2,15 @@ use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::make_rawdev;
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{
-    core::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata, PollStatus,
+    core::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
 };
-use crate::{libs::spinlock::SpinLock, syscall::SystemError, time::TimeSpec};
+use crate::{libs::spinlock::SpinLock, time::TimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
+use system_error::SystemError;
 // use uuid::{uuid, Uuid};
 use super::{DevFS, DeviceINode};
 
@@ -100,10 +101,6 @@ impl IndexNode for LockedZeroInode {
         inode.metadata.gid = metadata.gid;
 
         return Ok(());
-    }
-
-    fn poll(&self) -> Result<PollStatus, SystemError> {
-        return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 
     /// 读设备 - 应该调用设备的函数读写，而不是通过文件系统读写

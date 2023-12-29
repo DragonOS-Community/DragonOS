@@ -7,8 +7,9 @@ use alloc::{
     collections::BTreeMap,
     sync::{Arc, Weak},
 };
+use system_error::SystemError;
 
-use crate::{driver::base::device::DeviceNumber, libs::spinlock::SpinLock, syscall::SystemError};
+use crate::{driver::base::device::DeviceNumber, libs::spinlock::SpinLock};
 
 use super::{
     file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
@@ -178,11 +179,6 @@ impl IndexNode for MountFSInode {
         data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
         return self.inner_inode.write_at(offset, len, buf, data);
-    }
-
-    #[inline]
-    fn poll(&self) -> Result<super::PollStatus, SystemError> {
-        return self.inner_inode.poll();
     }
 
     #[inline]

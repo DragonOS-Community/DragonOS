@@ -42,6 +42,14 @@ jobs:
           ~/.bashrc
         key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ env.dadk_version }}-${{ hashFiles('.github/workflows/cache-toolchain.yml') }}
       
-    
+    - name: Format check
+      run: |
+            printf "\n" >> kernel/src/include/bindings/bindings.rs
+            printf "\n" >> user/libs/libc/src/include/internal/bindings/bindings.rs
+            FMT_CHECK=1 make fmt
+      
     - name: build the DragonOS
       run: bash -c "source ~/.cargo/env && export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin && make -j $(nproc) "
+    
+    - name: Run kernel static test
+      run: bash -c "source ~/.cargo/env && cd kernel && make test"

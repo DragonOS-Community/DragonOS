@@ -1,16 +1,15 @@
-use core::{
-    cmp::{max, min},
-    intrinsics::unlikely,
-};
-
 use crate::{
     arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch, CurrentTimeArch},
     driver::acpi::pmtmr::{ACPI_PM_OVERRUN, PMTMR_TICKS_PER_SEC},
     exception::InterruptArch,
     kdebug, kerror, kinfo, kwarn,
-    syscall::SystemError,
     time::TimeArch,
 };
+use core::{
+    cmp::{max, min},
+    intrinsics::unlikely,
+};
+use system_error::SystemError;
 
 use super::hpet::hpet_instance;
 
@@ -240,6 +239,17 @@ impl TSCManager {
     ///
     /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/arch/x86/kernel/tsc.c#389
     fn pit_calibrate_tsc(latch: u64, ms: u64, loopmin: u64) -> Option<u64> {
+        // 当前暂时没写legacy pic的驱动，因此这里直接返回
+        let has_legacy_pic = false;
+        if !has_legacy_pic {
+            let mut cnt = 10000;
+            while cnt > 0 {
+                cnt -= 1;
+            }
+
+            return None;
+        }
+
         unsafe {
             // Set the Gate high, disable speaker
             let d = (CurrentPortIOArch::in8(0x61) & (!0x02)) | 0x01;

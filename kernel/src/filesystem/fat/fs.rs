@@ -1,6 +1,6 @@
-#![allow(dead_code)]
 use core::intrinsics::unlikely;
 use core::{any::Any, fmt::Debug};
+use system_error::SystemError;
 
 use alloc::{
     collections::BTreeMap,
@@ -17,14 +17,13 @@ use crate::{
         core::generate_inode_id,
         file::{FileMode, FilePrivateData},
         syscall::ModeType,
-        FileSystem, FileType, IndexNode, InodeId, Metadata, PollStatus,
+        FileSystem, FileType, IndexNode, InodeId, Metadata,
     },
     kerror,
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
         vec_cursor::VecCursor,
     },
-    syscall::SystemError,
     time::TimeSpec,
 };
 
@@ -784,6 +783,7 @@ impl FATFileSystem {
     /// @return Ok(true) 正常
     /// @return Ok(false) 不正常
     /// @return Err(SystemError) 在判断时发生错误
+    #[allow(dead_code)]
     pub fn is_shut_bit_ok(&mut self) -> Result<bool, SystemError> {
         match self.bpb.fat_type {
             FATType::FAT32(_) => {
@@ -1205,6 +1205,7 @@ impl FATFsInfo {
     const LEAD_SIG: u32 = 0x41615252;
     const STRUC_SIG: u32 = 0x61417272;
     const TRAIL_SIG: u32 = 0xAA550000;
+    #[allow(dead_code)]
     const FS_INFO_SIZE: u64 = 512;
 
     /// @brief 从磁盘上读取FAT文件系统的FSInfo结构体
@@ -1413,18 +1414,6 @@ impl IndexNode for LockedFATInode {
                 return Err(SystemError::EROFS);
             }
         }
-    }
-
-    fn poll(&self) -> Result<PollStatus, SystemError> {
-        // 加锁
-        let inode: SpinLockGuard<FATInode> = self.0.lock();
-
-        // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
-        if inode.metadata.file_type == FileType::Dir {
-            return Err(SystemError::EISDIR);
-        }
-
-        return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 
     fn create(

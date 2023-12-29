@@ -16,10 +16,11 @@ use crate::{
         },
         vfs::syscall::ModeType,
     },
-    syscall::SystemError,
 };
+
 use core::fmt::Debug;
 use core::intrinsics::unlikely;
+use system_error::SystemError;
 
 use self::{
     bus::{bus_add_device, bus_probe_device, Bus},

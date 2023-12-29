@@ -1,6 +1,12 @@
-use core::{ffi::c_void, mem::size_of, sync::atomic::AtomicI64};
+use core::{
+    ffi::c_void,
+    mem::size_of,
+    ops::{Deref, DerefMut},
+    sync::atomic::AtomicI64,
+};
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
+use system_error::SystemError;
 
 use crate::{
     arch::{
@@ -10,7 +16,7 @@ use crate::{
     },
     mm::VirtAddr,
     process::Pid,
-    syscall::{user_access::UserBufferWriter, SystemError},
+    syscall::user_access::UserBufferWriter,
 };
 
 /// 用户态程序传入的SIG_DFL的值
@@ -54,13 +60,41 @@ pub const SIG_KERNEL_IGNORE_MASK: SigSet = Signal::into_sigset(Signal::SIGCONT)
 /// SignalStruct 在 pcb 中加锁
 #[derive(Debug)]
 pub struct SignalStruct {
+    inner: Box<InnerSignalStruct>,
+}
+
+#[derive(Debug)]
+pub struct InnerSignalStruct {
     pub cnt: AtomicI64,
     /// 如果对应linux，这部分会有一个引用计数，但是没发现在哪里有用到需要计算引用的地方，因此
     /// 暂时删掉，不然这个Arc会导致其他地方的代码十分丑陋
     pub handlers: [Sigaction; MAX_SIG_NUM as usize],
 }
 
-impl Default for SignalStruct {
+impl SignalStruct {
+    #[inline(never)]
+    pub fn new() -> Self {
+        Self {
+            inner: Box::new(InnerSignalStruct::default()),
+        }
+    }
+}
+
+impl Deref for SignalStruct {
+    type Target = InnerSignalStruct;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for SignalStruct {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Default for InnerSignalStruct {
     fn default() -> Self {
         Self {
             cnt: Default::default(),

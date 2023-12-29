@@ -9,4 +9,5 @@
 
    lib_ui/scm
    lib_ui/textui
+   unified-init
 

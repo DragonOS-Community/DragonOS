@@ -12,6 +12,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use system_error::SystemError;
 
 use crate::{
     arch::{
@@ -47,7 +48,7 @@ use crate::{
         SchedPolicy, SchedPriority,
     },
     smp::kick_cpu,
-    syscall::{user_access::clear_user, Syscall, SystemError},
+    syscall::{user_access::clear_user, Syscall},
 };
 
 use self::kthread::WorkerPrivate;
@@ -111,7 +112,7 @@ impl ProcessManager {
             compiler_fence(Ordering::SeqCst);
         };
 
-        ALL_PROCESS.lock().replace(HashMap::new());
+        ALL_PROCESS.lock_irqsave().replace(HashMap::new());
         Self::arch_init();
         kdebug!("process arch init done.");
         Self::init_idle();
@@ -163,7 +164,7 @@ impl ProcessManager {
     ///
     /// 如果找到了对应的进程，那么返回该进程的pcb，否则返回None
     pub fn find(pid: Pid) -> Option<Arc<ProcessControlBlock>> {
-        return ALL_PROCESS.lock().as_ref()?.get(&pid).cloned();
+        return ALL_PROCESS.lock_irqsave().as_ref()?.get(&pid).cloned();
     }
 
     /// 向系统中添加一个进程的pcb
@@ -177,7 +178,7 @@ impl ProcessManager {
     /// 无
     pub fn add_pcb(pcb: Arc<ProcessControlBlock>) {
         ALL_PROCESS
-            .lock()
+            .lock_irqsave()
             .as_mut()
             .unwrap()
             .insert(pcb.pid(), pcb.clone());
@@ -186,9 +187,9 @@ impl ProcessManager {
     /// 唤醒一个进程
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        let state = pcb.sched_info().state();
+        let state = pcb.sched_info().inner_lock_read_irqsave().state();
         if state.is_blocked() {
-            let mut writer: RwLockWriteGuard<'_, ProcessSchedulerInfo> = pcb.sched_info_mut();
+            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
             let state = writer.state();
             if state.is_blocked() {
                 writer.set_state(ProcessState::Runnable);
@@ -212,9 +213,9 @@ impl ProcessManager {
     /// 唤醒暂停的进程
     pub fn wakeup_stop(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        let state = pcb.sched_info().state();
+        let state = pcb.sched_info().inner_lock_read_irqsave().state();
         if let ProcessState::Stopped = state {
-            let mut writer = pcb.sched_info_mut();
+            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
             let state = writer.state();
             if let ProcessState::Stopped = state {
                 writer.set_state(ProcessState::Runnable);
@@ -250,7 +251,7 @@ impl ProcessManager {
         );
 
         let pcb = ProcessManager::current_pcb();
-        let mut writer = pcb.sched_info_mut_irqsave();
+        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
         if !matches!(writer.state(), ProcessState::Exited(_)) {
             writer.set_state(ProcessState::Blocked(interruptable));
             pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
@@ -275,7 +276,7 @@ impl ProcessManager {
         );
 
         let pcb = ProcessManager::current_pcb();
-        let mut writer = pcb.sched_info_mut_irqsave();
+        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
         if !matches!(writer.state(), ProcessState::Exited(_)) {
             writer.set_state(ProcessState::Stopped);
             pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
@@ -320,10 +321,10 @@ impl ProcessManager {
     /// - `exit_code` : 进程的退出码
     pub fn exit(exit_code: usize) -> ! {
         // 关中断
-        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        unsafe { CurrentIrqArch::interrupt_disable() };
         let pcb = ProcessManager::current_pcb();
         pcb.sched_info
-            .write()
+            .inner_lock_write_irqsave()
             .set_state(ProcessState::Exited(exit_code));
         pcb.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
 
@@ -349,7 +350,7 @@ impl ProcessManager {
         unsafe { pcb.basic_mut().set_user_vm(None) };
         drop(pcb);
         ProcessManager::exit_notify();
-        drop(irq_guard);
+        unsafe { CurrentIrqArch::interrupt_enable() };
 
         sched();
         loop {}
@@ -372,7 +373,7 @@ impl ProcessManager {
             //     panic!()
             // }
 
-            ALL_PROCESS.lock().as_mut().unwrap().remove(&pid);
+            ALL_PROCESS.lock_irqsave().as_mut().unwrap().remove(&pid);
         }
     }
 
@@ -543,7 +544,7 @@ pub struct ProcessControlBlock {
     syscall_stack: RwLock<KernelStack>,
 
     /// 与调度相关的信息
-    sched_info: RwLock<ProcessSchedulerInfo>,
+    sched_info: ProcessSchedulerInfo,
     /// 与处理器架构相关的信息
     arch_info: SpinLock<ArchPCBInfo>,
     /// 与信号处理相关的信息(似乎可以是无锁的)
@@ -591,6 +592,7 @@ impl ProcessControlBlock {
         return Self::do_create_pcb(name, kstack, true);
     }
 
+    #[inline(never)]
     fn do_create_pcb(name: String, kstack: KernelStack, is_idle: bool) -> Arc<Self> {
         let (pid, ppid, cwd) = if is_idle {
             (Pid(0), Pid(0), "/".to_string())
@@ -623,7 +625,7 @@ impl ProcessControlBlock {
             sched_info,
             arch_info,
             sig_info: RwLock::new(ProcessSignalInfo::default()),
-            sig_struct: SpinLock::new(SignalStruct::default()),
+            sig_struct: SpinLock::new(SignalStruct::new()),
             exit_signal: AtomicSignal::new(Signal::SIGCHLD),
             parent_pcb: RwLock::new(ppcb.clone()),
             real_parent_pcb: RwLock::new(ppcb),
@@ -656,7 +658,7 @@ impl ProcessControlBlock {
         // 将当前pcb加入父进程的子进程哈希表中
         if pcb.pid() > Pid(1) {
             if let Some(ppcb_arc) = pcb.parent_pcb.read().upgrade() {
-                let mut children = ppcb_arc.children.write();
+                let mut children = ppcb_arc.children.write_irqsave();
                 children.push(pcb.pid());
             } else {
                 panic!("parent pcb is None");
@@ -701,6 +703,8 @@ impl ProcessControlBlock {
         return self.flags.get_mut();
     }
 
+    /// 请注意，这个值能在中断上下文中读取，但不能被中断上下文修改
+    /// 否则会导致死锁
     #[inline(always)]
     pub fn basic(&self) -> RwLockReadGuard<ProcessBasicInfo> {
         return self.basic.read();
@@ -713,17 +717,26 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     pub fn basic_mut(&self) -> RwLockWriteGuard<ProcessBasicInfo> {
-        return self.basic.write();
+        return self.basic.write_irqsave();
     }
 
-    #[inline(always)]
-    pub fn arch_info(&self) -> SpinLockGuard<ArchPCBInfo> {
-        return self.arch_info.lock();
-    }
-
+    /// # 获取arch info的锁，同时关闭中断
     #[inline(always)]
     pub fn arch_info_irqsave(&self) -> SpinLockGuard<ArchPCBInfo> {
         return self.arch_info.lock_irqsave();
+    }
+
+    /// # 获取arch info的锁，但是不关闭中断
+    ///
+    /// 由于arch info在进程切换的时候会使用到，
+    /// 因此在中断上下文外，获取arch info 而不irqsave是不安全的.
+    ///
+    /// 只能在以下情况下使用这个函数：
+    /// - 在中断上下文中（中断已经禁用），获取arch info的锁。
+    /// - 刚刚创建新的pcb
+    #[inline(always)]
+    pub unsafe fn arch_info(&self) -> SpinLockGuard<ArchPCBInfo> {
+        return self.arch_info.lock();
     }
 
     #[inline(always)]
@@ -738,48 +751,8 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn sched_info(&self) -> RwLockReadGuard<ProcessSchedulerInfo> {
-        return self.sched_info.read();
-    }
-
-    #[inline(always)]
-    pub fn try_sched_info(&self, times: u8) -> Option<RwLockReadGuard<ProcessSchedulerInfo>> {
-        for _ in 0..times {
-            if let Some(r) = self.sched_info.try_read() {
-                return Some(r);
-            }
-        }
-
-        return None;
-    }
-
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub fn sched_info_irqsave(&self) -> RwLockReadGuard<ProcessSchedulerInfo> {
-        return self.sched_info.read_irqsave();
-    }
-
-    #[inline(always)]
-    pub fn sched_info_try_upgradeable_irqsave(
-        &self,
-        times: u8,
-    ) -> Option<RwLockUpgradableGuard<ProcessSchedulerInfo>> {
-        for _ in 0..times {
-            if let Some(r) = self.sched_info.try_upgradeable_read_irqsave() {
-                return Some(r);
-            }
-        }
-        return None;
-    }
-
-    #[inline(always)]
-    pub fn sched_info_mut(&self) -> RwLockWriteGuard<ProcessSchedulerInfo> {
-        return self.sched_info.write();
-    }
-
-    #[inline(always)]
-    pub fn sched_info_mut_irqsave(&self) -> RwLockWriteGuard<ProcessSchedulerInfo> {
-        return self.sched_info.write_irqsave();
+    pub fn sched_info(&self) -> &ProcessSchedulerInfo {
+        return &self.sched_info;
     }
 
     #[inline(always)]
@@ -876,7 +849,7 @@ impl ProcessControlBlock {
     }
 
     pub fn sig_info_mut(&self) -> RwLockWriteGuard<ProcessSignalInfo> {
-        self.sig_info.write()
+        self.sig_info.write_irqsave()
     }
 
     pub fn try_siginfo_mut(&self, times: u8) -> Option<RwLockWriteGuard<ProcessSignalInfo>> {
@@ -903,7 +876,7 @@ impl ProcessControlBlock {
         return None;
     }
 
-    pub fn sig_struct_irq(&self) -> SpinLockGuard<SignalStruct> {
+    pub fn sig_struct_irqsave(&self) -> SpinLockGuard<SignalStruct> {
         self.sig_struct.lock_irqsave()
     }
 }
@@ -970,6 +943,7 @@ pub struct ProcessBasicInfo {
 }
 
 impl ProcessBasicInfo {
+    #[inline(never)]
     pub fn new(
         pgid: Pid,
         ppid: Pid,
@@ -1035,11 +1009,7 @@ pub struct ProcessSchedulerInfo {
     /// 如果当前进程等待被迁移到另一个cpu核心上（也就是flags中的PF_NEED_MIGRATE被置位），
     /// 该字段存储要被迁移到的目标处理器核心号
     migrate_to: AtomicI32,
-
-    /// 当前进程的状态
-    state: ProcessState,
-    /// 进程的调度策略
-    sched_policy: SchedPolicy,
+    inner_locked: RwLock<InnerSchedInfo>,
     /// 进程的调度优先级
     priority: SchedPriority,
     /// 当前进程的虚拟运行时间
@@ -1048,21 +1018,46 @@ pub struct ProcessSchedulerInfo {
     rt_time_slice: AtomicIsize,
 }
 
+#[derive(Debug)]
+pub struct InnerSchedInfo {
+    /// 当前进程的状态
+    state: ProcessState,
+    /// 进程的调度策略
+    sched_policy: SchedPolicy,
+}
+
+impl InnerSchedInfo {
+    pub fn state(&self) -> ProcessState {
+        return self.state;
+    }
+
+    pub fn set_state(&mut self, state: ProcessState) {
+        self.state = state;
+    }
+
+    pub fn policy(&self) -> SchedPolicy {
+        return self.sched_policy;
+    }
+}
+
 impl ProcessSchedulerInfo {
-    pub fn new(on_cpu: Option<u32>) -> RwLock<Self> {
+    #[inline(never)]
+    pub fn new(on_cpu: Option<u32>) -> Self {
         let cpu_id = match on_cpu {
             Some(cpu_id) => cpu_id as i32,
             None => -1,
         };
-        return RwLock::new(Self {
+        return Self {
             on_cpu: AtomicI32::new(cpu_id),
             migrate_to: AtomicI32::new(-1),
-            state: ProcessState::Blocked(false),
-            sched_policy: SchedPolicy::CFS,
+            inner_locked: RwLock::new(InnerSchedInfo {
+                state: ProcessState::Blocked(false),
+                sched_policy: SchedPolicy::CFS,
+            }),
             virtual_runtime: AtomicIsize::new(0),
             rt_time_slice: AtomicIsize::new(0),
             priority: SchedPriority::new(100).unwrap(),
-        });
+        };
     }
 
     pub fn on_cpu(&self) -> Option<u32> {
@@ -1099,16 +1094,38 @@ impl ProcessSchedulerInfo {
         }
     }
 
-    pub fn state(&self) -> ProcessState {
-        return self.state;
+    pub fn inner_lock_write_irqsave(&self) -> RwLockWriteGuard<InnerSchedInfo> {
+        return self.inner_locked.write_irqsave();
     }
 
-    pub fn set_state(&mut self, state: ProcessState) {
-        self.state = state;
+    pub fn inner_lock_read_irqsave(&self) -> RwLockReadGuard<InnerSchedInfo> {
+        return self.inner_locked.read_irqsave();
     }
 
-    pub fn policy(&self) -> SchedPolicy {
-        return self.sched_policy;
+    pub fn inner_lock_try_read_irqsave(
+        &self,
+        times: u8,
+    ) -> Option<RwLockReadGuard<InnerSchedInfo>> {
+        for _ in 0..times {
+            if let Some(r) = self.inner_locked.try_read_irqsave() {
+                return Some(r);
+            }
+        }
+
+        return None;
+    }
+
+    pub fn inner_lock_try_upgradable_read_irqsave(
+        &self,
+        times: u8,
+    ) -> Option<RwLockUpgradableGuard<InnerSchedInfo>> {
+        for _ in 0..times {
+            if let Some(r) = self.inner_locked.try_upgradeable_read_irqsave() {
+                return Some(r);
+            }
+        }
+
+        return None;
     }
 
     pub fn virtual_runtime(&self) -> isize {

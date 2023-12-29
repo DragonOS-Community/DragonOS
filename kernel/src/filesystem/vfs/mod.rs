@@ -9,12 +9,12 @@ mod utils;
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
+use system_error::SystemError;
 
 use crate::{
     driver::base::{block::block_device::BlockDevice, char::CharDevice, device::DeviceNumber},
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
-    syscall::SystemError,
     time::TimeSpec,
 };
 
@@ -166,7 +166,10 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     /// @brief 获取当前inode的状态。
     ///
     /// @return PollStatus结构体
-    fn poll(&self) -> Result<PollStatus, SystemError>;
+    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
 
     /// @brief 获取inode的元数据
     ///

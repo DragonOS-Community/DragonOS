@@ -1,6 +1,8 @@
 /// 系统调用号
 pub mod nr;
-use crate::{exception::InterruptArch, syscall::SystemError};
+use system_error::SystemError;
+
+use crate::exception::InterruptArch;
 
 use super::{interrupt::TrapFrame, CurrentIrqArch};
 

@@ -1,4 +1,9 @@
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use system_error::SystemError;
 
 use crate::{
     driver::{
@@ -6,11 +11,14 @@ use crate::{
         tty::TtyFilePrivateData,
     },
     filesystem::procfs::ProcfsFilePrivateData,
-    ipc::pipe::PipeFsPrivateData,
+    ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
     kerror,
     libs::spinlock::SpinLock,
+    net::{
+        event_poll::{EPollItem, EPollPrivateData, EventPoll},
+        socket::SocketInode,
+    },
     process::ProcessManager,
-    syscall::SystemError,
 };
 
 use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
@@ -27,6 +35,8 @@ pub enum FilePrivateData {
     DevFS(DevicePrivateData),
     /// tty设备文件的私有信息
     Tty(TtyFilePrivateData),
+    /// epoll私有信息
+    EPoll(EPollPrivateData),
     /// 不需要文件私有信息
     Unused,
 }
@@ -34,6 +44,14 @@ pub enum FilePrivateData {
 impl Default for FilePrivateData {
     fn default() -> Self {
         return Self::Unused;
+    }
+}
+
+impl FilePrivateData {
+    pub fn update_mode(&mut self, mode: FileMode) {
+        if let FilePrivateData::Pipefs(pdata) = self {
+            pdata.set_mode(mode);
+        }
     }
 }
 
@@ -378,6 +396,7 @@ impl File {
 
         // 直接修改文件的打开模式
         self.mode = mode;
+        self.private_data.update_mode(mode);
         return Ok(());
     }
 
@@ -395,6 +414,42 @@ impl File {
         // 调用inode的truncate方法
         self.inode.resize(len)?;
         return Ok(());
+    }
+
+    /// ## 向该文件添加一个EPollItem对象
+    ///
+    /// 在文件状态发生变化时，需要向epoll通知
+    pub fn add_epoll(&mut self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
+        match self.file_type {
+            FileType::Socket => {
+                let inode = self.inode.downcast_ref::<SocketInode>().unwrap();
+                let mut socket = inode.inner();
+
+                return socket.add_epoll(epitem);
+            }
+            FileType::Pipe => {
+                let inode = self.inode.downcast_ref::<LockedPipeInode>().unwrap();
+                return inode.inner().lock().add_epoll(epitem);
+            }
+            _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+        }
+    }
+
+    /// ## 删除一个绑定的epoll
+    pub fn remove_epoll(&mut self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
+        match self.file_type {
+            FileType::Socket => {
+                let inode = self.inode.downcast_ref::<SocketInode>().unwrap();
+                let mut socket = inode.inner();
+
+                return socket.remove_epoll(epoll);
+            }
+            _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+        }
+    }
+
+    pub fn poll(&self) -> Result<usize, SystemError> {
+        self.inode.poll(&self.private_data)
     }
 }
 

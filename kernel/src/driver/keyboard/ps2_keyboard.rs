@@ -8,15 +8,14 @@ use crate::{
         devfs::{devfs_register, DevFS, DeviceINode},
         vfs::{
             core::generate_inode_id, file::FileMode, syscall::ModeType, FileType, IndexNode,
-            Metadata, PollStatus,
+            Metadata,
         },
     },
     include::bindings::bindings::vfs_file_operations_t,
     libs::{keyboard_parser::TypeOneFSM, rwlock::RwLock, spinlock::SpinLock},
-    syscall::SystemError,
     time::TimeSpec,
 };
-
+use system_error::SystemError;
 #[derive(Debug)]
 pub struct LockedPS2KeyBoardInode(RwLock<PS2KeyBoardInode>, AtomicI32); // self.1 用来记录有多少个文件打开了这个inode
 
@@ -150,10 +149,6 @@ impl IndexNode for LockedPS2KeyBoardInode {
             let _ = unsafe { func(0 as *mut c_void, 0 as *mut c_void) };
         }
         return Ok(());
-    }
-
-    fn poll(&self) -> Result<PollStatus, SystemError> {
-        return Ok(PollStatus::READ);
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {

@@ -5,11 +5,12 @@ use core::{
 };
 
 use kdepends::memoffset::offset_of;
+use system_error::SystemError;
 
 use crate::{
     arch::process::table::TSSManager, exception::InterruptArch,
     include::bindings::bindings::cpu_core_info, kdebug, libs::rwlock::RwLock, mm::percpu::PerCpu,
-    process::ProcessManager, smp::core::smp_get_processor_id, syscall::SystemError,
+    process::ProcessManager, smp::core::smp_get_processor_id,
 };
 
 use super::CurrentIrqArch;

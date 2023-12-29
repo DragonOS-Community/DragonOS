@@ -7,13 +7,18 @@ use core::{
 };
 
 use acpi::HpetInfo;
+use system_error::SystemError;
 
 use crate::{
+    arch::CurrentIrqArch,
     driver::{
         acpi::acpi_manager,
         timers::hpet::{HpetRegisters, HpetTimerRegisters},
     },
-    exception::softirq::{softirq_vectors, SoftirqNumber},
+    exception::{
+        softirq::{softirq_vectors, SoftirqNumber},
+        InterruptArch,
+    },
     kdebug, kerror, kinfo,
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -23,7 +28,6 @@ use crate::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         PhysAddr,
     },
-    syscall::SystemError,
     time::timer::{clock, timer_get_first_expire, update_timer_jiffies},
 };
 
@@ -51,8 +55,8 @@ struct InnerHpet {
 }
 
 impl Hpet {
-    /// HPET0 中断间隔为500us
-    pub const HPET0_INTERVAL_USEC: u64 = 500;
+    /// HPET0 中断间隔为 10ms
+    pub const HPET0_INTERVAL_USEC: u64 = 10000;
 
     fn new(mut hpet_info: HpetInfo) -> Result<Self, SystemError> {
         let paddr = PhysAddr::new(hpet_info.base_address);
@@ -222,7 +226,8 @@ impl Hpet {
     /// 处理HPET的中断
     pub(super) fn handle_irq(&self, timer_num: u32) {
         if timer_num == 0 {
-            update_timer_jiffies(Self::HPET0_INTERVAL_USEC);
+            assert!(CurrentIrqArch::is_irq_enabled() == false);
+            update_timer_jiffies(Self::HPET0_INTERVAL_USEC, Self::HPET0_INTERVAL_USEC as i64);
 
             if let Ok(first_expire) = timer_get_first_expire() {
                 if first_expire <= clock() {

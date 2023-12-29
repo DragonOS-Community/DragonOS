@@ -3,20 +3,17 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+use crate::libs::{
+    notifier::AtomicNotifierChain,
+    rwlock::{RwLock, RwLockReadGuard},
+    spinlock::SpinLock,
+};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
-
-use crate::{
-    libs::{
-        notifier::AtomicNotifierChain,
-        rwlock::{RwLock, RwLockReadGuard},
-        spinlock::SpinLock,
-    },
-    syscall::SystemError,
-};
+use system_error::SystemError;
 
 use super::{
     class::Class,

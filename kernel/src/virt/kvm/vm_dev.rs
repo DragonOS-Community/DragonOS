@@ -2,7 +2,7 @@ use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
     core::generate_inode_id,
     file::{File, FileMode},
-    make_rawdev, FilePrivateData, FileSystem, FileType, IndexNode, Metadata, PollStatus,
+    make_rawdev, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
 };
 use crate::mm::VirtAddr;
 use crate::process::ProcessManager;
@@ -11,13 +11,14 @@ use crate::virt::kvm::host_mem::KvmUserspaceMemoryRegion;
 use crate::virt::kvm::update_vm;
 use crate::virt::kvm::vcpu_dev::LockedVcpuInode;
 use crate::virt::kvm::vm;
-use crate::{arch::KVMArch, libs::spinlock::SpinLock, syscall::SystemError, time::TimeSpec};
+use crate::{arch::KVMArch, libs::spinlock::SpinLock, time::TimeSpec};
 use crate::{filesystem, kdebug};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
+use system_error::SystemError;
 
 // pub const KVM_API_VERSION:u32 = 12;
 // pub const GUEST_STACK_SIZE:usize = 1024;
@@ -123,10 +124,6 @@ impl IndexNode for LockedVmInode {
         inode.metadata.gid = metadata.gid;
 
         return Ok(());
-    }
-
-    fn poll(&self) -> Result<PollStatus, SystemError> {
-        return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 
     /// @brief io control接口

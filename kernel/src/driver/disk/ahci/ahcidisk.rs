@@ -18,7 +18,6 @@ use crate::kdebug;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::{spinlock::SpinLock, vec_cursor::VecCursor};
 use crate::mm::{phys_2_virt, verify_area, VirtAddr};
-use crate::syscall::SystemError;
 use crate::{
     driver::disk::ahci::hba::{
         FisRegH2D, FisType, HbaCmdHeader, ATA_CMD_READ_DMA_EXT, ATA_CMD_WRITE_DMA_EXT,
@@ -26,6 +25,7 @@ use crate::{
     },
     kerror,
 };
+use system_error::SystemError;
 
 use alloc::sync::Weak;
 use alloc::{string::String, sync::Arc, vec::Vec};

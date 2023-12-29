@@ -3,19 +3,20 @@ use crate::arch::KVMArch;
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
     core::generate_inode_id, file::FileMode, make_rawdev, FilePrivateData, FileSystem, FileType,
-    IndexNode, Metadata, PollStatus,
+    IndexNode, Metadata,
 };
 use crate::mm::VirtAddr;
 use crate::syscall::user_access::copy_from_user;
 use crate::virt::kvm::vcpu::Vcpu;
 use crate::virt::kvm::vm;
 use crate::{filesystem, kdebug};
-use crate::{libs::spinlock::SpinLock, syscall::SystemError, time::TimeSpec};
+use crate::{libs::spinlock::SpinLock, time::TimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
+use system_error::SystemError;
 
 // pub const KVM_API_VERSION:u32 = 12;
 pub const KVM_RUN: u32 = 0x00;
@@ -125,10 +126,6 @@ impl IndexNode for LockedVcpuInode {
         inode.metadata.gid = metadata.gid;
 
         return Ok(());
-    }
-
-    fn poll(&self) -> Result<PollStatus, SystemError> {
-        return Ok(PollStatus::READ | PollStatus::WRITE);
     }
 
     /// @brief io control接口

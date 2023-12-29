@@ -11,8 +11,9 @@ use crate::{
         kset::KSet,
     },
     kinfo,
-    syscall::SystemError,
 };
+
+use system_error::SystemError;
 
 pub fn devices_init() -> Result<(), SystemError> {
     // 创建 `/sys/devices` 目录

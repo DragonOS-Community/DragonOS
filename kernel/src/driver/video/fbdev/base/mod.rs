@@ -3,7 +3,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::base::device::Device,
-    mm::{ucontext::LockedVMA, PhysAddr},
+    mm::{ucontext::LockedVMA, PhysAddr, VirtAddr},
 };
 
 pub mod fbcon;
@@ -638,6 +638,7 @@ pub struct FbVideoMode {
     pub flag: u32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum FbAccel {
     /// 没有硬件加速器
@@ -708,4 +709,103 @@ impl Default for FbAccel {
     fn default() -> Self {
         FbAccel::None
     }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct BootTimeScreenInfo {
+    pub origin_x: u8,
+    pub origin_y: u8,
+    /// text mode时，每行的字符数
+    pub origin_video_cols: u8,
+    /// text mode时，行数
+    pub origin_video_lines: u8,
+    /// 标记屏幕是否为VGA类型
+    pub is_vga: bool,
+    /// video mode type
+    pub video_type: BootTimeVideoType,
+
+    // 以下字段用于线性帧缓冲区
+    /// 线性帧缓冲区的起始物理地址
+    pub lfb_base: PhysAddr,
+    /// 线性帧缓冲区在初始化阶段被映射到的起始虚拟地址
+    /// (这个值应当在内存管理初始化完毕，重新映射时被设置)
+    pub lfb_virt_base: Option<VirtAddr>,
+    /// 线性帧缓冲区的长度
+    pub lfb_size: usize,
+    /// 线性帧缓冲区的宽度（像素）
+    pub lfb_width: u32,
+    /// 线性帧缓冲区的高度（像素）
+    pub lfb_height: u32,
+    /// 线性帧缓冲区的深度（位数）
+    pub lfb_depth: u8,
+    /// 红色位域的大小
+    pub red_size: u8,
+    /// 红色位域的偏移量（左移位数）
+    pub red_pos: u8,
+    /// 绿色位域的大小
+    pub green_size: u8,
+    /// 绿色位域的偏移量（左移位数）
+    pub green_pos: u8,
+    /// 蓝色位域的大小
+    pub blue_size: u8,
+    /// 蓝色位域的偏移量（左移位数）
+    pub blue_pos: u8,
+}
+
+impl BootTimeScreenInfo {
+    pub const DEFAULT: Self = Self {
+        origin_x: 0,
+        origin_y: 0,
+        is_vga: false,
+        lfb_base: PhysAddr::new(0),
+        lfb_size: 0,
+        lfb_width: 0,
+        lfb_height: 0,
+        red_size: 0,
+        red_pos: 0,
+        green_size: 0,
+        green_pos: 0,
+        blue_size: 0,
+        blue_pos: 0,
+        video_type: BootTimeVideoType::UnDefined,
+        origin_video_cols: 0,
+        origin_video_lines: 0,
+        lfb_virt_base: None,
+        lfb_depth: 0,
+    };
+}
+
+/// Video types for different display hardware
+#[allow(dead_code)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum BootTimeVideoType {
+    UnDefined,
+    /// Monochrome Text Display
+    Mda,
+    /// CGA Display
+    Cga,
+    /// EGA/VGA in Monochrome Mode
+    EgaM,
+    /// EGA in Color Mode
+    EgaC,
+    /// VGA+ in Color Mode
+    VgaC,
+    /// VESA VGA in graphic mode
+    Vlfb,
+    /// ACER PICA-61 local S3 video
+    PicaS3,
+    /// MIPS Magnum 4000 G364 video
+    MipsG364,
+    /// Various SGI graphics hardware
+    Sgi,
+    /// DEC TGA
+    TgaC,
+    /// Sun frame buffer
+    Sun,
+    /// Sun PCI based frame buffer
+    SunPci,
+    /// PowerMacintosh frame buffer
+    Pmac,
+    /// EFI graphic mode
+    Efi,
 }

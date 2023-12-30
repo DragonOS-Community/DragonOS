@@ -1,6 +1,7 @@
 use core::{
     ffi::{c_uint, c_void},
     mem::MaybeUninit,
+    sync::atomic::AtomicBool,
 };
 
 use alloc::{
@@ -9,17 +10,22 @@ use alloc::{
     vec::Vec,
 };
 use system_error::SystemError;
+use unified_init::macros::unified_init;
 
 use crate::{
     arch::MMArch,
     driver::{
         base::{
             class::Class,
-            device::{bus::Bus, driver::Driver, Device, DeviceState, DeviceType, IdTable},
+            device::{
+                bus::Bus, device_manager, device_register, driver::Driver, Device, DeviceState,
+                DeviceType, IdTable,
+            },
             kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
             platform::{
-                platform_device::PlatformDevice,
+                platform_bus,
+                platform_device::{platform_device_manager, PlatformDevice},
                 platform_driver::{platform_driver_manager, PlatformDriver},
                 CompatibleTable,
             },
@@ -30,9 +36,10 @@ use crate::{
     include::bindings::bindings::{
         multiboot2_get_Framebuffer_info, multiboot2_iter, multiboot_tag_framebuffer_info_t,
     },
-    init::boot_params,
+    init::{boot_params, initcall::INITCALL_DEVICE},
     libs::{
         align::page_align_up,
+        once::Once,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::SpinLock,
     },
@@ -46,6 +53,9 @@ use super::base::{
     BlankMode, BootTimeVideoType, FbAccel, FbActivateFlags, FbType, FbVModeFlags, FbVarScreenInfo,
     FbVideoMode, FixedScreenInfo, FrameBuffer, FrameBufferInfo, FrameBufferOps,
 };
+
+/// 当前机器上面是否有vesa帧缓冲区
+static HAS_VESA_FB: AtomicBool = AtomicBool::new(false);
 
 lazy_static! {
     static ref VESAFB_FIX_INFO: RwLock<FixedScreenInfo> = RwLock::new(FixedScreenInfo {
@@ -76,6 +86,7 @@ pub struct VesaFb {
 }
 
 impl VesaFb {
+    pub const NAME: &'static str = "vesa_vga";
     pub fn new() -> Self {
         return Self {
             inner: SpinLock::new(InnerVesaFb {
@@ -87,6 +98,8 @@ impl VesaFb {
                 kset: None,
                 kobj_type: None,
                 device_state: DeviceState::NotInitialized,
+                pdev_id: 0,
+                pdev_id_auto: false,
             }),
             kobj_state: LockedKObjectState::new(None),
         };
@@ -103,21 +116,23 @@ struct InnerVesaFb {
     kset: Option<Arc<KSet>>,
     kobj_type: Option<&'static dyn KObjType>,
     device_state: DeviceState,
+    pdev_id: i32,
+    pdev_id_auto: bool,
 }
 
 impl FrameBuffer for VesaFb {}
 
 impl PlatformDevice for VesaFb {
     fn pdev_name(&self) -> &str {
-        todo!()
+        Self::NAME
     }
 
     fn set_pdev_id(&self, id: i32) {
-        todo!()
+        self.inner.lock().pdev_id = id;
     }
 
     fn set_pdev_id_auto(&self, id_auto: bool) {
-        todo!()
+        self.inner.lock().pdev_id_auto = id_auto;
     }
 
     fn compatible_table(&self) -> CompatibleTable {
@@ -140,6 +155,10 @@ impl Device for VesaFb {
 
     fn id_table(&self) -> IdTable {
         IdTable::new(self.name(), None)
+    }
+
+    fn bus(&self) -> Option<Arc<dyn Bus>> {
+        self.inner.lock().bus.clone()
     }
 
     fn set_bus(&self, bus: Option<Arc<dyn Bus>>) {
@@ -211,8 +230,7 @@ impl KObject for VesaFb {
     }
 
     fn name(&self) -> String {
-        let x = VESAFB_FIX_INFO.read().id.map(|x| x as u8);
-        String::from_utf8_lossy(&x).to_string()
+        Self::NAME.to_string()
     }
 
     fn set_name(&self, _name: String) {
@@ -464,6 +482,9 @@ pub fn vesafb_early_init() -> Result<VirtAddr, SystemError> {
     unsafe { fb_info.assume_init() };
     let fb_info: multiboot_tag_framebuffer_info_t = unsafe { core::mem::transmute(fb_info) };
 
+    // todo: 判断是否有vesa帧缓冲区，这里暂时直接设置true
+    HAS_VESA_FB.store(true, core::sync::atomic::Ordering::SeqCst);
+
     let width = fb_info.framebuffer_width;
     let height = fb_info.framebuffer_height;
 
@@ -503,4 +524,29 @@ pub fn vesafb_early_init() -> Result<VirtAddr, SystemError> {
         PageFrameCount::new(page_align_up(boottime_screen_info.lfb_size) / MMArch::PAGE_SIZE);
     unsafe { pseudo_map_phys(buf_vaddr, paddr, count) };
     return Ok(buf_vaddr);
+}
+
+#[unified_init(INITCALL_DEVICE)]
+fn vesa_fb_device_init() -> Result<(), SystemError> {
+    // 如果没有vesa帧缓冲区，直接返回
+    if !HAS_VESA_FB.load(core::sync::atomic::Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        kinfo!("vesa fb device init\n");
+        let device = Arc::new(VesaFb::new());
+        device_manager().device_default_initialize(&(device.clone() as Arc<dyn Device>));
+        let driver = (platform_bus() as Arc<dyn Bus>)
+            .find_driver_by_name(VesaFbDriver::NAME)
+            .unwrap();
+
+        device.set_driver(Some(Arc::downgrade(&driver)));
+        platform_device_manager()
+            .device_add(device as Arc<dyn PlatformDevice>)
+            .expect("vesa_fb_device_init: platform_device_manager().device_add failed");
+    });
+
+    return Ok(());
 }

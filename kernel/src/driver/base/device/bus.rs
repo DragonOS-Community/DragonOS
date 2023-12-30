@@ -226,6 +226,8 @@ impl dyn Bus {
                 if matcher.match_driver(&drv, data) {
                     return Some(drv.clone());
                 }
+            } else {
+                kwarn!("find_driver: driver is none");
             }
         }
         return None;

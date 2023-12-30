@@ -728,7 +728,11 @@ pub struct BootTimeScreenInfo {
     /// 线性帧缓冲区的起始物理地址
     pub lfb_base: PhysAddr,
     /// 线性帧缓冲区在初始化阶段被映射到的起始虚拟地址
-    /// (这个值应当在内存管理初始化完毕，重新映射时被设置)
+    ///
+    /// 这个值可能会被设置2次：
+    ///
+    /// - 内存管理初始化之前，early init阶段，临时映射
+    /// - 内存管理初始化完毕，重新映射时被设置
     pub lfb_virt_base: Option<VirtAddr>,
     /// 线性帧缓冲区的长度
     pub lfb_size: usize,

@@ -6,7 +6,10 @@ use crate::{
     libs::{lib_ui::screen_manager::scm_init, rwlock::RwLock},
 };
 
-pub mod c_adapter;
+mod c_adapter;
+
+pub mod initcall;
+pub mod initial_kthread;
 
 /// 启动参数
 static BOOT_PARAMS: RwLock<BootParams> = RwLock::new(BootParams::new());

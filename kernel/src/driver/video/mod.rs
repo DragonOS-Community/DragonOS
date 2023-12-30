@@ -174,16 +174,18 @@ impl VideoRefreshManager {
     }
 
     /// 此函数用于初始化显示驱动，为后续的图形输出做好准备。
-    #[cfg(not(target_arch = "riscv64"))]
+    #[cfg(target_arch = "x86_64")]
     pub unsafe fn video_init() -> Result<(), SystemError> {
-        use crate::driver::video::fbdev::base::BootTimeVideoType;
+        use crate::{
+            arch::driver::video::arch_video_early_init,
+            driver::video::fbdev::base::BootTimeVideoType,
+        };
 
-        use self::fbdev::vesafb::vesafb_early_init;
-
-        let buf_vaddr = vesafb_early_init()?;
+        arch_video_early_init()?;
 
         let boot_params_guard = boot_params().read();
         let screen_info = &boot_params_guard.screen_info;
+        let buf_vaddr = screen_info.lfb_virt_base.unwrap();
 
         let buf_flag: ScmBufferFlag;
         let device_buffer: ScmBufferInfo;

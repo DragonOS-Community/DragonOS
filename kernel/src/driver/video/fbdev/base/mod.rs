@@ -10,6 +10,7 @@ use self::fbmem::{FbDevice, FrameBufferManager};
 
 pub mod fbcon;
 pub mod fbmem;
+pub mod fbsysfs;
 pub mod modedb;
 
 // 帧缓冲区id
@@ -44,16 +45,10 @@ pub trait FrameBufferInfo {
     fn screen_size(&self) -> usize;
 
     /// 获取当前的可变帧缓冲信息
-    fn current_fb_var(&self) -> &FbVarScreenInfo;
-
-    /// 获取当前的可变帧缓冲信息（可变引用）
-    fn current_fb_var_mut(&mut self) -> &mut FbVarScreenInfo;
+    fn current_fb_var(&self) -> FbVarScreenInfo;
 
     /// 获取当前的固定帧缓冲信息
-    fn current_fb_fix(&self) -> &FixedScreenInfo;
-
-    /// 获取当前的固定帧缓冲信息（可变引用）
-    fn current_fb_fix_mut(&mut self) -> &mut FixedScreenInfo;
+    fn current_fb_fix(&self) -> FixedScreenInfo;
 
     /// 获取当前的视频模式
     fn video_mode(&self) -> Option<&FbVideoMode>;
@@ -63,6 +58,9 @@ pub trait FrameBufferInfo {
 
     /// 设置当前帧缓冲区对应的`/sys/class/graphics/fb0`或者`/sys/class/graphics/fb1`等的设备结构体
     fn set_fb_device(&self, device: Option<Arc<FbDevice>>);
+
+    /// 获取帧缓冲区的状态
+    fn state(&self) -> FbState;
 }
 
 /// 帧缓冲区操作
@@ -124,6 +122,13 @@ pub trait FrameBufferOps {
 
     /// 卸载与该帧缓冲区相关的所有资源
     fn fb_destroy(&self);
+}
+
+/// 帧缓冲区的状态
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum FbState {
+    Running = 0,
+    Suspended = 1,
 }
 
 /// 屏幕黑屏模式。

@@ -53,7 +53,7 @@ use crate::{
 };
 
 use super::base::{
-    fbmem::FbDevice, BlankMode, BootTimeVideoType, FbAccel, FbActivateFlags, FbId, FbType,
+    fbmem::FbDevice, BlankMode, BootTimeVideoType, FbAccel, FbActivateFlags, FbId, FbState, FbType,
     FbVModeFlags, FbVarScreenInfo, FbVideoMode, FixedScreenInfo, FrameBuffer, FrameBufferInfo,
     FrameBufferOps,
 };
@@ -107,6 +107,7 @@ impl VesaFb {
                 pdev_id_auto: false,
                 fb_id: FbId::INIT,
                 fb_device: None,
+                fb_state: FbState::Suspended,
             }),
             kobj_state: LockedKObjectState::new(None),
         };
@@ -127,6 +128,7 @@ struct InnerVesaFb {
     pdev_id_auto: bool,
     fb_id: FbId,
     fb_device: Option<Arc<FbDevice>>,
+    fb_state: FbState,
 }
 
 impl FrameBuffer for VesaFb {
@@ -308,24 +310,20 @@ impl FrameBufferInfo for VesaFb {
         todo!()
     }
 
-    fn current_fb_var(&self) -> &FbVarScreenInfo {
-        todo!()
+    fn current_fb_var(&self) -> FbVarScreenInfo {
+        VESAFB_DEFINED.read().clone()
     }
 
-    fn current_fb_var_mut(&mut self) -> &mut FbVarScreenInfo {
-        todo!()
-    }
-
-    fn current_fb_fix(&self) -> &FixedScreenInfo {
-        todo!()
-    }
-
-    fn current_fb_fix_mut(&mut self) -> &mut FixedScreenInfo {
-        todo!()
+    fn current_fb_fix(&self) -> FixedScreenInfo {
+        VESAFB_FIX_INFO.read().clone()
     }
 
     fn video_mode(&self) -> Option<&FbVideoMode> {
         todo!()
+    }
+
+    fn state(&self) -> FbState {
+        self.inner.lock().fb_state
     }
 }
 
@@ -635,6 +633,7 @@ fn vesa_fb_device_init() -> Result<(), SystemError> {
         kinfo!("vesa fb device init");
 
         let mut fix_info_guard = VESAFB_FIX_INFO.write_irqsave();
+        let mut var_info_guard = VESAFB_DEFINED.write_irqsave();
 
         let boot_params_guard = boot_params().read();
         let boottime_screen_info = &boot_params_guard.screen_info;
@@ -643,12 +642,23 @@ fn vesa_fb_device_init() -> Result<(), SystemError> {
         fix_info_guard.smem_len = boottime_screen_info.lfb_size;
 
         if boottime_screen_info.video_type == BootTimeVideoType::Mda {
-            fix_info_guard.line_length = boottime_screen_info.origin_video_cols as u32;
             fix_info_guard.visual = FbVisual::Mono10;
+            var_info_guard.bits_per_pixel = 8;
+            fix_info_guard.line_length = (boottime_screen_info.origin_video_cols as u32)
+                * (var_info_guard.bits_per_pixel / 8);
+            var_info_guard.xres_virtual = boottime_screen_info.origin_video_cols as u32;
+            var_info_guard.yres_virtual = boottime_screen_info.origin_video_lines as u32;
         } else {
-            fix_info_guard.line_length = boottime_screen_info.lfb_width as u32;
             fix_info_guard.visual = FbVisual::TrueColor;
+            var_info_guard.bits_per_pixel = boottime_screen_info.lfb_depth as u32;
+            fix_info_guard.line_length =
+                (boottime_screen_info.lfb_width as u32) * (var_info_guard.bits_per_pixel / 8);
+            var_info_guard.xres_virtual = boottime_screen_info.lfb_width as u32;
+            var_info_guard.yres_virtual = boottime_screen_info.lfb_height as u32;
         }
+
+        drop(var_info_guard);
+        drop(fix_info_guard);
 
         let device = Arc::new(VesaFb::new());
         device_manager().device_default_initialize(&(device.clone() as Arc<dyn Device>));
@@ -658,8 +668,11 @@ fn vesa_fb_device_init() -> Result<(), SystemError> {
             .expect("vesa_fb_device_init: platform_device_manager().device_add failed");
 
         frame_buffer_manager()
-            .register_fb(device as Arc<dyn FrameBuffer>)
+            .register_fb(device.clone() as Arc<dyn FrameBuffer>)
             .expect("vesa_fb_device_init: frame_buffer_manager().register_fb failed");
+
+        // 设置vesa fb的状态为运行中
+        device.inner.lock().fb_state = FbState::Running;
     });
 
     return Ok(());

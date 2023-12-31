@@ -23,14 +23,14 @@ use crate::{
         kset::KSet,
         subsys::SubSysPrivate,
     },
-    filesystem::kernfs::KernFSInode,
+    filesystem::{kernfs::KernFSInode, sysfs::AttributeGroup},
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::SpinLock,
     },
 };
 
-use super::{fbcon::fb_console_init, FbId, FrameBuffer};
+use super::{fbcon::fb_console_init, fbsysfs::FbDeviceAttrGroup, FbId, FrameBuffer};
 
 /// `/sys/class/graphics` 的 class 实例
 static mut CLASS_GRAPHICS_INSTANCE: Option<Arc<GraphicsClass>> = None;
@@ -207,6 +207,10 @@ impl FbDevice {
             kobj_state: LockedKObjectState::new(None),
         })
     }
+
+    pub fn framebuffer(&self) -> Option<Arc<dyn FrameBuffer>> {
+        self.inner.lock().fb.upgrade()
+    }
 }
 
 #[derive(Debug)]
@@ -326,5 +330,9 @@ impl Device for FbDevice {
 
     fn state_synced(&self) -> bool {
         true
+    }
+
+    fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
+        Some(&[&FbDeviceAttrGroup])
     }
 }

@@ -19,7 +19,7 @@ use super::{platform_bus, platform_device::PlatformDevice};
 pub trait PlatformDriver: Driver {
     /// 检测设备是否能绑定到这个驱动
     ///
-    /// 如果能，则把设备的driver指向这个驱动。
+    /// 如果能，则把设备的driver字段指向这个驱动。
     /// 请注意，这个函数不应该把driver加入驱动的devices列表，相关工作会在外部的函数里面处理。
     fn probe(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError>;
     fn remove(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError>;

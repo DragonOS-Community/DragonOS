@@ -18,7 +18,7 @@ use super::{
     device::{
         bus::{subsystem_manager, Bus},
         driver::Driver,
-        Device, DeviceNumber, DeviceType, IdTable,
+        Device, DeviceType, IdTable,
     },
     kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
     kset::KSet,
@@ -150,7 +150,7 @@ impl Device for CpuSubSystemFakeRootDevice {
     }
 
     fn id_table(&self) -> IdTable {
-        IdTable::new("cpu".to_string(), Some(DeviceNumber::new(0)))
+        IdTable::new("cpu".to_string(), None)
     }
 
     fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {

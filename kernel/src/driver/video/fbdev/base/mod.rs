@@ -6,11 +6,37 @@ use crate::{
     mm::{ucontext::LockedVMA, PhysAddr, VirtAddr},
 };
 
+use self::fbmem::{FbDevice, FrameBufferManager};
+
 pub mod fbcon;
 pub mod fbmem;
+pub mod modedb;
+
+// 帧缓冲区id
+int_like!(FbId, u32);
+
+impl FbId {
+    /// 帧缓冲区id的初始值（无效值）
+    pub const INIT: Self = Self::new(u32::MAX);
+
+    /// 判断是否为无效的帧缓冲区id
+    #[allow(dead_code)]
+    pub const fn is_valid(&self) -> bool {
+        if self.0 == Self::INIT.0 || self.0 >= FrameBufferManager::FB_MAX as u32 {
+            return false;
+        }
+        return true;
+    }
+}
 
 /// 帧缓冲区应该实现的接口
-pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {}
+pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
+    /// 获取帧缓冲区的id
+    fn fb_id(&self) -> FbId;
+
+    /// 设置帧缓冲区的id
+    fn set_fb_id(&self, id: FbId);
+}
 
 /// 帧缓冲区信息
 pub trait FrameBufferInfo {
@@ -31,6 +57,12 @@ pub trait FrameBufferInfo {
 
     /// 获取当前的视频模式
     fn video_mode(&self) -> Option<&FbVideoMode>;
+
+    /// 获取当前帧缓冲区对应的`/sys/class/graphics/fb0`或者`/sys/class/graphics/fb1`等的设备结构体
+    fn fb_device(&self) -> Option<Arc<FbDevice>>;
+
+    /// 设置当前帧缓冲区对应的`/sys/class/graphics/fb0`或者`/sys/class/graphics/fb1`等的设备结构体
+    fn set_fb_device(&self, device: Option<Arc<FbDevice>>);
 }
 
 /// 帧缓冲区操作
@@ -482,7 +514,7 @@ pub struct FixedScreenInfo {
     // 帧缓冲区的起始物理地址
     pub smem_start: Option<PhysAddr>,
     // 帧缓冲区的长度
-    pub smem_len: u32,
+    pub smem_len: usize,
     // 屏幕类型，参考 FB_TYPE_
     pub fb_type: FbType,
     // 用于表示交错平面的小端辅助类型
@@ -497,10 +529,10 @@ pub struct FixedScreenInfo {
     pub ywrapstep: u16,
     // 一行的大小（以字节为单位）
     pub line_length: u32,
-    // 内存映射I/O的起始物理地址
+    // 内存映射I/O端口的起始物理地址
     pub mmio_start: Option<PhysAddr>,
     // 内存映射I/O的长度
-    pub mmio_len: u32,
+    pub mmio_len: usize,
     // 表示驱动器拥有的特定芯片/卡片类型
     pub accel: FbAccel,
     // 表示支持的特性，参考 FB_CAP_

@@ -86,18 +86,24 @@ impl DeviceManager {
                 .flatten()
                 .ok_or(SystemError::EINVAL)?;
             let mut data = DeviceAttachData::new(dev.clone(), allow_async, false);
-            let mut flag = true;
+            let mut flag = false;
             for driver in bus.subsystem().drivers().iter() {
                 let r = self.do_device_attach_driver(&driver, &mut data);
                 if unlikely(r.is_err()) {
                     flag = false;
                     break;
+                } else {
+                    if r.unwrap() == true {
+                        flag = true;
+                        break;
+                    }
                 }
             }
 
             if flag {
                 r = Ok(true);
             }
+            kdebug!("do_device_attach: flag: {}, r: {:?}", flag, r);
 
             if !flag && allow_async && data.have_async {
                 // If we could not find appropriate driver
@@ -120,13 +126,56 @@ impl DeviceManager {
         return r;
     }
 
+    /// 匹配设备和驱动
+    ///
+    /// ## 参数
+    ///
+    /// - `driver`: 驱动
+    /// - `data`: 匹配数据
+    ///
+    /// ## 返回
+    ///
+    /// - Ok(true): 匹配成功
+    /// - Ok(false): 没有匹配成功
+    /// - Err(SystemError): 匹配过程中出现意外错误,没有匹配成功
     /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c#899
     fn do_device_attach_driver(
         &self,
-        _driver: &Arc<dyn Driver>,
-        _data: &mut DeviceAttachData,
-    ) -> Result<(), SystemError> {
-        todo!("do_device_attach_driver")
+        driver: &Arc<dyn Driver>,
+        data: &mut DeviceAttachData,
+    ) -> Result<bool, SystemError> {
+        kdebug!("driver.bus(): {:?}", driver.bus());
+        if let Some(bus) = driver.bus().map(|bus| bus.upgrade()).flatten() {
+            let r = bus.match_device(&data.dev, driver);
+            kdebug!(
+                "do_device_attach_driver: bus.match_device() returned: {:?}",
+                r
+            );
+            if let Err(e) = r {
+                // 如果不是ENOSYS，则总线出错
+                if e != SystemError::ENOSYS {
+                    kdebug!(
+                        "do_device_attach_driver: bus.match_device() failed, dev: '{}', err: {:?}",
+                        data.dev.name(),
+                        e
+                    );
+                    return Err(e);
+                }
+            } else {
+                if r.unwrap() == false {
+                    return Ok(false);
+                }
+            }
+        }
+
+        let async_allowed = driver.allows_async_probing();
+        if data.check_async && async_allowed != data.want_async {
+            return Ok(false);
+        }
+
+        return driver_manager()
+            .probe_device(driver, &data.dev)
+            .map(|_| true);
     }
 
     /// 检查设备是否绑定到驱动程序
@@ -355,7 +404,15 @@ impl DriverManager {
             device_manager().remove(device);
         };
 
+        kinfo!(
+            "really_probe: probing driver '{}' with device '{}'",
+            driver.name(),
+            device.name()
+        );
         device.set_driver(Some(Arc::downgrade(driver)));
+
+        kdebug!("device_kobjtype:{:?}", device.kobj_type());
+        kdebug!("driver_kobjtype:{:?}", driver.kobj_type());
 
         self.add_to_sysfs(device).map_err(|e| {
             kerror!(
@@ -368,6 +425,7 @@ impl DriverManager {
             e
         })?;
 
+        kinfo!("really_probe: before call_driver_probe");
         self.call_driver_probe(device, driver).map_err(|e| {
             kerror!(
                 "really_probe: call_driver_probe failed, dev: '{}', err: {:?}",
@@ -381,6 +439,7 @@ impl DriverManager {
             e
         })?;
 
+        kinfo!("really_probe: before add_groups");
         device_manager()
             .add_groups(device, driver.dev_groups())
             .map_err(|e| {
@@ -396,7 +455,8 @@ impl DriverManager {
                 e
             })?;
 
-        // 我们假设所有的设备都有sync_state这个属性。如果没有的话，也创建属性文件。
+        kinfo!("really_probe: before create `sync_state`");
+        // 我们假设所有的设备都有 sync_state 这个属性。如果没有的话，也创建属性文件。
         device_manager()
             .create_file(device, &DeviceAttrStateSynced)
             .map_err(|e| {
@@ -412,6 +472,7 @@ impl DriverManager {
                 e
             })?;
 
+        kinfo!("really_probe: before driver_bound");
         self.driver_bound(device);
 
         return Ok(());

@@ -3,7 +3,7 @@ use core::{fmt::Debug, sync::atomic::AtomicU32};
 use alloc::sync::Arc;
 use system_error::SystemError;
 
-use crate::{driver::base::device::DeviceNumber, mm::VirtAddr};
+use crate::{driver::base::device::device_number::DeviceNumber, mm::VirtAddr};
 
 use self::serial8250::serial8250_manager;
 

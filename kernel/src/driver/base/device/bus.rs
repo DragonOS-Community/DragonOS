@@ -159,11 +159,14 @@ pub trait Bus: Debug + Send + Sync {
     /// - `Ok(true)` - 匹配成功
     /// - `Ok(false)` - 匹配失败
     /// - `Err(_)` - 由于内部错误导致匹配失败
+    /// - `Err(SystemError::ENOSYS)` - 该总线不支持该操作
     fn match_device(
         &self,
-        device: &Arc<dyn Device>,
-        driver: &Arc<dyn Driver>,
-    ) -> Result<bool, SystemError>;
+        _device: &Arc<dyn Device>,
+        _driver: &Arc<dyn Driver>,
+    ) -> Result<bool, SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
 
     fn subsystem(&self) -> &SubSysPrivate;
 
@@ -578,6 +581,7 @@ pub fn bus_add_device(dev: &Arc<dyn Device>) -> Result<(), SystemError> {
 ///
 /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_probe_device#478
 pub fn bus_probe_device(dev: &Arc<dyn Device>) {
+    kinfo!("bus_probe_device: dev: {:?}", dev.name());
     bus_manager().probe_device(dev);
 }
 

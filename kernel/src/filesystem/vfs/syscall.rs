@@ -8,7 +8,7 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    driver::base::{block::SeekFrom, device::DeviceNumber},
+    driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
     filesystem::vfs::file::FileDescriptorVec,
     kerror,
     libs::rwlock::RwLockWriteGuard,

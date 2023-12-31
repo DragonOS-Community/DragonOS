@@ -11,7 +11,7 @@ use crate::{
             bus::{Bus, BusState},
             device_manager,
             driver::Driver,
-            Device, DeviceNumber, DevicePrivateData, DeviceType, IdTable,
+            Device, DevicePrivateData, DeviceType, IdTable,
         },
         kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
         kset::KSet,
@@ -286,9 +286,8 @@ impl Device for PlatformBusDevice {
     }
 
     #[inline]
-    #[allow(dead_code)]
     fn id_table(&self) -> IdTable {
-        IdTable::new("platform".to_string(), Some(DeviceNumber::new(0)))
+        IdTable::new("platform".to_string(), None)
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {

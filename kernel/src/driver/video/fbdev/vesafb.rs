@@ -108,7 +108,7 @@ impl VesaFb {
 
 #[derive(Debug)]
 struct InnerVesaFb {
-    bus: Option<Arc<dyn Bus>>,
+    bus: Option<Weak<dyn Bus>>,
     class: Option<Arc<dyn Class>>,
     driver: Option<Weak<dyn Driver>>,
     kern_inode: Option<Arc<KernFSInode>>,
@@ -157,11 +157,11 @@ impl Device for VesaFb {
         IdTable::new(self.name(), None)
     }
 
-    fn bus(&self) -> Option<Arc<dyn Bus>> {
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
         self.inner.lock().bus.clone()
     }
 
-    fn set_bus(&self, bus: Option<Arc<dyn Bus>>) {
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
         self.inner.lock().bus = bus;
     }
 
@@ -334,7 +334,7 @@ struct InnerVesaFbDriver {
     parent: Option<Weak<dyn KObject>>,
     kernfs_inode: Option<Arc<KernFSInode>>,
     devices: Vec<Arc<dyn Device>>,
-    bus: Option<Arc<dyn Bus>>,
+    bus: Option<Weak<dyn Bus>>,
 }
 
 impl VesaFbDriver {
@@ -389,11 +389,11 @@ impl Driver for VesaFbDriver {
         guard.devices.retain(|dev| !Arc::ptr_eq(dev, device));
     }
 
-    fn set_bus(&self, bus: Option<Arc<dyn Bus>>) {
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
         self.inner.lock().bus = bus;
     }
 
-    fn bus(&self) -> Option<Arc<dyn Bus>> {
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
         self.inner.lock().bus.clone()
     }
 }

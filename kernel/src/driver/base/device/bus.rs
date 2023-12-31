@@ -188,11 +188,8 @@ impl dyn Bus {
         let subsys = self.subsystem();
         let guard = subsys.devices();
         for dev in guard.iter() {
-            let dev = dev.upgrade();
-            if let Some(dev) = dev {
-                if matcher.match_device(&dev, data) {
-                    return Some(dev.clone());
-                }
+            if matcher.match_device(&dev, data) {
+                return Some(dev.clone());
             }
         }
         return None;
@@ -221,13 +218,8 @@ impl dyn Bus {
         let subsys = self.subsystem();
         let guard = subsys.drivers();
         for drv in guard.iter() {
-            let drv = drv.upgrade();
-            if let Some(drv) = drv {
-                if matcher.match_driver(&drv, data) {
-                    return Some(drv.clone());
-                }
-            } else {
-                kwarn!("find_driver: driver is none");
+            if matcher.match_driver(&drv, data) {
+                return Some(drv.clone());
             }
         }
         return None;
@@ -267,7 +259,7 @@ impl BusManager {
     ///
     /// - `dev` - 要被添加的设备
     pub fn add_device(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
-        let bus = dev.bus();
+        let bus = dev.bus().map(|bus| bus.upgrade()).flatten();
         if let Some(bus) = bus {
             device_manager().add_groups(dev, bus.dev_groups())?;
 
@@ -297,7 +289,11 @@ impl BusManager {
     ///
     /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_add_driver#590
     pub fn add_driver(&self, driver: &Arc<dyn Driver>) -> Result<(), SystemError> {
-        let bus = driver.bus().ok_or(SystemError::EINVAL)?;
+        let bus = driver
+            .bus()
+            .map(|bus| bus.upgrade())
+            .flatten()
+            .ok_or(SystemError::EINVAL)?;
         kdebug!("bus '{}' add driver '{}'", bus.name(), driver.name());
 
         driver.set_kobj_type(Some(&BusDriverKType));
@@ -437,10 +433,7 @@ impl BusManager {
     #[allow(dead_code)]
     pub fn rescan_devices(&self, bus: &Arc<dyn Bus>) -> Result<(), SystemError> {
         for dev in bus.subsystem().devices().iter() {
-            let dev = dev.upgrade();
-            if let Some(dev) = dev {
-                rescan_devices_helper(dev)?;
-            }
+            rescan_devices_helper(dev)?;
         }
         return Ok(());
     }
@@ -449,7 +442,7 @@ impl BusManager {
     ///
     /// Automatically probe for a driver if the bus allows it.
     pub fn probe_device(&self, dev: &Arc<dyn Device>) {
-        let bus = dev.bus();
+        let bus = dev.bus().map(|bus| bus.upgrade()).flatten();
         if bus.is_none() {
             return;
         }
@@ -492,9 +485,12 @@ impl BusManager {
 }
 
 /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?r=&mo=5649&fi=241#684
-fn rescan_devices_helper(dev: Arc<dyn Device>) -> Result<(), SystemError> {
+fn rescan_devices_helper(dev: &Arc<dyn Device>) -> Result<(), SystemError> {
     if dev.driver().is_none() {
-        let need_parent_lock = dev.bus().map(|bus| bus.need_parent_lock()).unwrap_or(false);
+        let need_parent_lock = dev
+            .bus()
+            .map(|bus| bus.upgrade().unwrap().need_parent_lock())
+            .unwrap_or(false);
         if unlikely(need_parent_lock) {
             // todo: lock device parent
             unimplemented!()
@@ -615,7 +611,7 @@ impl Attribute for BusAttrDriversProbe {
 
         let device = bus.find_device_by_name(name).ok_or(SystemError::ENODEV)?;
 
-        if rescan_devices_helper(device).is_ok() {
+        if rescan_devices_helper(&device).is_ok() {
             return Ok(buf.len());
         }
 
@@ -754,7 +750,11 @@ impl Attribute for DriverAttrUnbind {
             SystemError::EOPNOTSUPP_OR_ENOTSUP
         })?;
 
-        let bus = driver.bus().ok_or(SystemError::ENODEV)?;
+        let bus = driver
+            .bus()
+            .map(|bus| bus.upgrade())
+            .flatten()
+            .ok_or(SystemError::ENODEV)?;
 
         let s = CStr::from_bytes_with_nul(buf)
             .map_err(|_| SystemError::EINVAL)?
@@ -800,7 +800,11 @@ impl Attribute for DriverAttrBind {
             SystemError::EOPNOTSUPP_OR_ENOTSUP
         })?;
 
-        let bus = driver.bus().ok_or(SystemError::ENODEV)?;
+        let bus = driver
+            .bus()
+            .map(|bus| bus.upgrade())
+            .flatten()
+            .ok_or(SystemError::ENODEV)?;
         let device = bus
             .find_device_by_name(
                 CStr::from_bytes_with_nul(buf)

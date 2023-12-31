@@ -143,14 +143,14 @@ pub trait Device: KObject {
     }
 
     /// 获取当前设备所属的总线
-    fn bus(&self) -> Option<Arc<dyn Bus>> {
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
         return None;
     }
 
     /// 设置当前设备所属的总线
     ///
-    /// （一定要传入Arc，因为bus的subsysprivate里面存储的是Device的Weak指针）
-    fn set_bus(&self, bus: Option<Arc<dyn Bus>>);
+    /// （一定要传入Arc，因为bus的subsysprivate里面存储的是Device的Arc指针）
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>);
 
     /// 获取当前设备所属的类
     fn class(&self) -> Option<Arc<dyn Class>> {
@@ -521,7 +521,7 @@ impl DeviceManager {
         }
 
         // 通知客户端有关设备添加的信息。此调用必须在 dpm_sysfs_add() 之后且在 kobject_uevent() 之前执行。
-        if let Some(bus) = device.bus() {
+        if let Some(bus) = device.bus().map(|bus| bus.upgrade()).flatten() {
             bus.subsystem().bus_notifier().call_chain(
                 bus::BusNotifyEvent::AddDevice,
                 Some(&device),
@@ -585,7 +585,7 @@ impl DeviceManager {
 
         // subsystems can specify a default root directory for their devices
         if current_parent.is_none() {
-            if let Some(bus) = device.bus() {
+            if let Some(bus) = device.bus().map(|bus| bus.upgrade()).flatten() {
                 if let Some(root) = bus.root_device().map(|x| x.upgrade()).flatten() {
                     return Ok(Some(root as Arc<dyn KObject>));
                 }

@@ -4,7 +4,10 @@ use core::{
     ops::{Deref, DerefMut},
 };
 
-use alloc::{string::String, sync::Arc};
+use alloc::{
+    string::String,
+    sync::{Arc, Weak},
+};
 use smoltcp::{phy, wire};
 use virtio_drivers::{device::net::VirtIONet, transport::Transport};
 
@@ -261,11 +264,11 @@ impl<T: Transport + 'static> Driver for VirtioInterface<T> {
         todo!()
     }
 
-    fn bus(&self) -> Option<Arc<dyn Bus>> {
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
         todo!()
     }
 
-    fn set_bus(&self, _bus: Option<Arc<dyn Bus>>) {
+    fn set_bus(&self, _bus: Option<Weak<dyn Bus>>) {
         todo!()
     }
 }

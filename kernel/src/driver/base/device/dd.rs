@@ -63,6 +63,8 @@ impl DeviceManager {
             return Ok(false);
         }
 
+        kwarn!("do_device_attach: dev: '{}'", dev.name());
+
         let mut do_async = false;
         let mut r = Ok(false);
 
@@ -78,16 +80,18 @@ impl DeviceManager {
                 return Ok(false);
             }
         } else {
-            let bus = dev.bus().ok_or(SystemError::EINVAL)?;
+            let bus = dev
+                .bus()
+                .map(|bus| bus.upgrade())
+                .flatten()
+                .ok_or(SystemError::EINVAL)?;
             let mut data = DeviceAttachData::new(dev.clone(), allow_async, false);
             let mut flag = true;
             for driver in bus.subsystem().drivers().iter() {
-                if let Some(driver) = driver.upgrade() {
-                    let r = self.do_device_attach_driver(&driver, &mut data);
-                    if unlikely(r.is_err()) {
-                        flag = false;
-                        break;
-                    }
+                let r = self.do_device_attach_driver(&driver, &mut data);
+                if unlikely(r.is_err()) {
+                    flag = false;
+                    break;
                 }
             }
 
@@ -162,7 +166,7 @@ impl DeviceManager {
             driver_manager().driver_bound(dev);
             return Err(e);
         } else {
-            if let Some(bus) = dev.bus() {
+            if let Some(bus) = dev.bus().map(|bus| bus.upgrade()).flatten() {
                 bus.subsystem().bus_notifier().call_chain(
                     BusNotifyEvent::DriverNotBound,
                     Some(dev),
@@ -233,13 +237,15 @@ impl DriverManager {
     /// 这个函数会遍历驱动现有的全部设备，然后尝试把他们匹配。
     /// 一旦有一个设备匹配成功，就会返回，并且设备的driver字段会被设置。
     pub fn driver_attach(&self, driver: &Arc<dyn Driver>) -> Result<(), SystemError> {
-        let bus = driver.bus().ok_or(SystemError::EINVAL)?;
+        let bus = driver
+            .bus()
+            .map(|bus| bus.upgrade())
+            .flatten()
+            .ok_or(SystemError::EINVAL)?;
         for dev in bus.subsystem().devices().iter() {
-            if let Some(dev) = dev.upgrade() {
-                if self.do_driver_attach(&dev, &driver) {
-                    // 匹配成功
-                    return Ok(());
-                }
+            if self.do_driver_attach(&dev, &driver) {
+                // 匹配成功
+                return Ok(());
             }
         }
 
@@ -274,7 +280,12 @@ impl DriverManager {
         driver: &Arc<dyn Driver>,
         device: &Arc<dyn Device>,
     ) -> Result<bool, SystemError> {
-        return driver.bus().unwrap().match_device(device, driver);
+        return driver
+            .bus()
+            .map(|bus| bus.upgrade())
+            .flatten()
+            .unwrap()
+            .match_device(device, driver);
     }
 
     /// 尝试把设备和驱动绑定在一起
@@ -327,7 +338,7 @@ impl DriverManager {
         };
 
         let sysfs_failed = || {
-            if let Some(bus) = device.bus() {
+            if let Some(bus) = device.bus().map(|bus| bus.upgrade()).flatten() {
                 bus.subsystem().bus_notifier().call_chain(
                     BusNotifyEvent::DriverNotBound,
                     Some(device),
@@ -410,7 +421,7 @@ impl DriverManager {
     fn add_to_sysfs(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
         let driver = device.driver().ok_or(SystemError::EINVAL)?;
 
-        if let Some(bus) = device.bus() {
+        if let Some(bus) = device.bus().map(|bus| bus.upgrade()).flatten() {
             bus.subsystem().bus_notifier().call_chain(
                 BusNotifyEvent::BindDriver,
                 Some(&device),
@@ -455,7 +466,11 @@ impl DriverManager {
         device: &Arc<dyn Device>,
         driver: &Arc<dyn Driver>,
     ) -> Result<(), SystemError> {
-        let bus = device.bus().ok_or(SystemError::EINVAL)?;
+        let bus = device
+            .bus()
+            .map(|bus| bus.upgrade())
+            .flatten()
+            .ok_or(SystemError::EINVAL)?;
         let r = bus.probe(device);
         if r == Err(SystemError::EOPNOTSUPP_OR_ENOTSUP) {
             kerror!(
@@ -505,7 +520,7 @@ impl DriverManager {
         let driver = device.driver().unwrap();
         driver.add_device(device.clone());
 
-        if let Some(bus) = device.bus() {
+        if let Some(bus) = device.bus().map(|bus| bus.upgrade()).flatten() {
             bus.subsystem().bus_notifier().call_chain(
                 BusNotifyEvent::BoundDriver,
                 Some(device),

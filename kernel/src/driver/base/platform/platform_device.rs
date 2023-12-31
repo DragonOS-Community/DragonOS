@@ -85,7 +85,7 @@ impl PlatformDeviceManager {
             )));
         }
 
-        pdev.set_bus(Some(platform_bus() as Arc<dyn Bus>));
+        pdev.set_bus(Some(Arc::downgrade(&(platform_bus() as Arc<dyn Bus>))));
 
         let id = pdev.pdev_id().0;
         match id {
@@ -195,7 +195,7 @@ pub struct InnerPlatformBusDevice {
 
     kernfs_inode: Option<Arc<KernFSInode>>,
     /// 当前设备挂载到的总线
-    bus: Option<Arc<dyn Bus>>,
+    bus: Option<Weak<dyn Bus>>,
     /// 当前设备已经匹配的驱动
     driver: Option<Weak<dyn Driver>>,
 
@@ -291,11 +291,11 @@ impl Device for PlatformBusDevice {
         IdTable::new("platform".to_string(), Some(DeviceNumber::new(0)))
     }
 
-    fn bus(&self) -> Option<Arc<dyn Bus>> {
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
         self.inner.lock().bus.clone()
     }
 
-    fn set_bus(&self, bus: Option<Arc<dyn Bus>>) {
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
         self.inner.lock().bus = bus;
     }
 

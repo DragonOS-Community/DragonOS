@@ -315,8 +315,8 @@ impl SigInfo {
     ///
     /// ## 注意
     ///
-    /// 该函数对应Linux中的https://opengrok.ringotek.cn/xref/linux-6.1.9/kernel/signal.c#3323
-    /// Linux还提供了 https://opengrok.ringotek.cn/xref/linux-6.1.9/kernel/signal.c#3383 用来实现
+    /// 该函数对应Linux中的https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c#3323
+    /// Linux还提供了 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c#3383 用来实现
     /// kernel_siginfo 保存到 用户的 compact_siginfo 的功能，但是我们系统内还暂时没有对这两种
     /// siginfo做区分，因此暂时不需要第二个函数
     pub fn copy_siginfo_to_user(&self, to: *mut SigInfo) -> Result<i32, SystemError> {

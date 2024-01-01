@@ -111,7 +111,7 @@ impl Bus for PlatformBus {
     /// and compare it against the name of the driver. Return whether they match
     /// or not.
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/platform.c#1331
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/platform.c#1331
     ///
     ///
     fn match_device(
@@ -151,7 +151,7 @@ impl AttributeGroup for PlatformDeviceAttrGroup {
     }
 
     fn attrs(&self) -> &[&'static dyn Attribute] {
-        // todo: https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/platform.c?r=&mo=38425&fi=1511#1311
+        // todo: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/platform.c?r=&mo=38425&fi=1511#1311
         return &[];
     }
 

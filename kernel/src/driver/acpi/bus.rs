@@ -17,7 +17,7 @@ use super::AcpiManager;
 impl AcpiManager {
     /// 通过acpi来匹配驱动
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/acpi/bus.c#949
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/acpi/bus.c#949
     pub fn driver_match_device(
         &self,
         _driver: &Arc<dyn Driver>,
@@ -28,7 +28,7 @@ impl AcpiManager {
         return Ok(false);
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/acpi/bus.c#1286
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/acpi/bus.c#1286
     pub(super) fn bus_init(&self) -> Result<(), SystemError> {
         self.acpi_sysfs_init()?;
 
@@ -42,7 +42,7 @@ impl AcpiManager {
 
 /// ACPI总线
 ///
-/// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/acpi/bus.c#1072
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/acpi/bus.c#1072
 #[derive(Debug)]
 pub(super) struct AcpiBus {
     private: SubSysPrivate,
@@ -68,7 +68,7 @@ impl Bus for AcpiBus {
         self.name()
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/acpi/bus.c#1056
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/acpi/bus.c#1056
     fn remove(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
         todo!("acpi_bus: remove")
     }
@@ -83,7 +83,7 @@ impl Bus for AcpiBus {
 
     /// 通过acpi来匹配驱动
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/acpi/bus.c#1005
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/acpi/bus.c#1005
     fn match_device(
         &self,
         _device: &Arc<dyn Device>,
@@ -93,7 +93,7 @@ impl Bus for AcpiBus {
         return Ok(false);
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/acpi/bus.c#1019
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/acpi/bus.c#1019
     fn probe(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
         todo!("acpi_bus: probe")
     }
@@ -110,7 +110,7 @@ impl Bus for AcpiBus {
 /// todo: 仿照linux的acpi_device去设计这个trait
 ///
 ///
-/// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/include/acpi/acpi_bus.h#364
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/acpi/acpi_bus.h#364
 pub trait AcpiDevice: Device {}
 
 /// Acpi驱动应当实现的trait
@@ -119,5 +119,5 @@ pub trait AcpiDevice: Device {}
 ///
 /// todo: 仿照linux的acpi_driver去设计这个trait
 ///
-/// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/include/acpi/acpi_bus.h#163
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/acpi/acpi_bus.h#163
 pub trait AcpiDriver: Driver {}

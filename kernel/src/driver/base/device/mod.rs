@@ -347,7 +347,7 @@ impl From<DeviceState> for u32 {
 pub struct DeviceKObjType;
 
 impl KObjType for DeviceKObjType {
-    // https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/core.c#2307
+    // https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c#2307
     fn release(&self, kobj: Arc<dyn KObject>) {
         let dev = kobj.cast::<dyn Device>().unwrap();
         /*
@@ -420,7 +420,7 @@ impl DeviceManager {
     /// @parameter dev: 设备实例
     /// @return: None
     ///
-    /// https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/core.c#3398
+    /// https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c#3398
     ///
     /// todo: 完善错误处理逻辑：如果添加失败，需要将之前添加的内容全部回滚
     #[inline]
@@ -553,7 +553,7 @@ impl DeviceManager {
         todo!()
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#542
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#542
     fn remove(&self, _dev: &Arc<dyn Device>) {
         todo!("DeviceManager::remove")
     }
@@ -759,21 +759,21 @@ impl DeviceManager {
         return kobj;
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/core.c?fi=device_links_force_bind#1226
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c?fi=device_links_force_bind#1226
     pub fn device_links_force_bind(&self, _dev: &Arc<dyn Device>) {
         todo!("device_links_force_bind")
     }
 
     /// 把device对象的一些结构进行默认初始化
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/core.c?fi=device_initialize#2976
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c?fi=device_initialize#2976
     pub fn device_default_initialize(&self, dev: &Arc<dyn Device>) {
         dev.set_kset(Some(sys_devices_kset()));
         dev.set_kobj_type(Some(&DeviceKObjType));
         return;
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?r=&mo=29885&fi=1100#1100
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?r=&mo=29885&fi=1100#1100
     pub fn device_driver_attach(
         &self,
         _driver: &Arc<dyn Driver>,
@@ -782,7 +782,7 @@ impl DeviceManager {
         todo!("device_driver_attach")
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?r=&mo=35401&fi=1313#1313
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?r=&mo=35401&fi=1313#1313
     pub fn device_driver_detach(&self, _dev: &Arc<dyn Device>) {
         todo!("device_driver_detach")
     }

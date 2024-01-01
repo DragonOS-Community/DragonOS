@@ -111,7 +111,7 @@ impl SysFS {
         return self.add_file_with_mode(&inode, attr, attr.mode());
     }
 
-    // https://opengrok.ringotek.cn/xref/linux-6.1.9/fs/sysfs/file.c?fi=sysfs_add_file_mode_ns#271
+    // https://code.dragonos.org.cn/xref/linux-6.1.9/fs/sysfs/file.c?fi=sysfs_add_file_mode_ns#271
     pub(super) fn add_file_with_mode(
         &self,
         parent: &Arc<KernFSInode>,
@@ -200,7 +200,7 @@ impl SysFS {
     /// - `kobj` 要创建属性文件的kobject
     /// - `attr` 属性
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/fs/sysfs/file.c#558
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/sysfs/file.c#558
     pub fn create_bin_file(
         &self,
         kobj: &Arc<dyn KObject>,
@@ -229,7 +229,7 @@ impl SysFS {
         }
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/fs/sysfs/file.c#304
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/sysfs/file.c#304
     pub(super) fn add_bin_file_with_mode(
         &self,
         parent: &Arc<KernFSInode>,

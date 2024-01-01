@@ -172,7 +172,7 @@ impl DriverManager {
     ///
     /// - driver: 驱动
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/driver.c#222
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/driver.c#222
     pub fn register(&self, driver: Arc<dyn Driver>) -> Result<(), SystemError> {
         let bus = driver
             .bus()
@@ -215,7 +215,7 @@ impl DriverManager {
         bus_manager().remove_driver(driver);
     }
 
-    /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c#434
+    /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#434
     pub fn driver_sysfs_add(&self, _dev: &Arc<dyn Device>) -> Result<(), SystemError> {
         todo!("DriverManager::driver_sysfs_add()");
     }

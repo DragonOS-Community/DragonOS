@@ -192,7 +192,7 @@ impl KObjectManager {
         let r = Self::create_dir(kobj.clone());
 
         if let Err(e) = r {
-            // https://opengrok.ringotek.cn/xref/linux-6.1.9/lib/kobject.c?r=&mo=10426&fi=394#224
+            // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject.c?r=&mo=10426&fi=394#224
             if let Some(kset) = kobj.kset() {
                 kset.leave(&kobj);
             }

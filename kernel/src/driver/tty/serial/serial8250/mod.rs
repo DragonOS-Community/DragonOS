@@ -79,7 +79,7 @@ impl Serial8250Manager {
     ///
     /// 应当在设备驱动模型初始化之后调用这里
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/tty/serial/8250/8250_core.c?r=&mo=30224&fi=1169#1169
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/tty/serial/8250/8250_core.c?r=&mo=30224&fi=1169#1169
     pub fn init(&self) -> Result<(), SystemError> {
         // 初始化serial8250 isa设备
         let serial8250_isa_dev = Serial8250ISADevices::new();
@@ -123,7 +123,7 @@ impl Serial8250Manager {
 
     /// 把uart端口与uart driver、uart device绑定
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/tty/serial/8250/8250_core.c?r=&mo=30224&fi=1169#553
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/tty/serial/8250/8250_core.c?r=&mo=30224&fi=1169#553
     fn register_ports(
         &self,
         uart_driver: &Arc<Serial8250ISADriver>,
@@ -134,7 +134,7 @@ impl Serial8250Manager {
 
     /// 把uart端口与uart driver绑定
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/tty/serial/serial_core.c?fi=uart_add_one_port#3048
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/tty/serial/serial_core.c?fi=uart_add_one_port#3048
     pub(self) fn uart_add_one_port(
         &self,
         _uart_driver: &Arc<Serial8250ISADriver>,
@@ -344,7 +344,7 @@ impl InnerSerial8250ISADevices {
 }
 
 /// Serial 8250平台设备的id
-/// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/include/linux/serial_8250.h?fi=PLAT8250_DEV_LEGACY#49
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/serial_8250.h?fi=PLAT8250_DEV_LEGACY#49
 #[derive(Debug)]
 #[repr(i32)]
 enum Serial8250PlatformDeviceID {

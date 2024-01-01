@@ -562,7 +562,7 @@ impl KernFSInode {
     ///
     /// Returns the created node on success
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/fs/kernfs/symlink.c#25
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/kernfs/symlink.c#25
     pub fn add_link(
         &self,
         name: String,

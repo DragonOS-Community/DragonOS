@@ -29,7 +29,7 @@ impl TSCManager {
     ///
     /// 目前由于未支持acpi pm timer, 因此调用该函数时，HPET应当完成初始化，否则将无法校准TSC
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/arch/x86/kernel/tsc.c#1511
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/tsc.c#1511
     pub fn init() -> Result<(), SystemError> {
         let cpuid = x86::cpuid::CpuId::new();
         let feat = cpuid.get_feature_info().ok_or(SystemError::ENODEV)?;
@@ -57,7 +57,7 @@ impl TSCManager {
     ///
     /// - `early`：是否在早期初始化
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/arch/x86/kernel/tsc.c#1438
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/tsc.c#1438
     fn determine_cpu_tsc_frequency(early: bool) -> Result<(), SystemError> {
         if unlikely(Self::cpu_khz() != 0 || Self::tsc_khz() != 0) {
             kwarn!("TSC and CPU frequency already determined");
@@ -237,7 +237,7 @@ impl TSCManager {
     /// 尝试使用PIT来校准tsc时间，并且返回tsc的频率（khz）。
     /// 如果失败，那么返回None
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/arch/x86/kernel/tsc.c#389
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/tsc.c#389
     fn pit_calibrate_tsc(latch: u64, ms: u64, loopmin: u64) -> Option<u64> {
         // 当前暂时没写legacy pic的驱动，因此这里直接返回
         let has_legacy_pic = false;
@@ -307,7 +307,7 @@ impl TSCManager {
     ///
     /// - `Ok((tsc, ref))`：tsc和参考值
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/arch/x86/kernel/tsc.c#317
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/tsc.c#317
     fn read_refs(hpet_enabled: bool) -> (u64, u64) {
         let thresh = if Self::tsc_khz() == 0 {
             Self::DEFAULT_THRESHOLD
@@ -335,7 +335,7 @@ impl TSCManager {
 
     /// 根据HPET的参考值计算tsc的频率
     ///
-    /// https://opengrok.ringotek.cn/xref/linux-6.1.9/arch/x86/kernel/tsc.c#339
+    /// https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/tsc.c#339
     fn calc_hpet_ref(mut deltatsc: u64, ref1: u64, mut ref2: u64) -> u64 {
         if ref2 <= ref1 {
             ref2 += 0x100000000;

@@ -36,7 +36,7 @@ pub struct CpuDeviceManager;
 impl CpuDeviceManager {
     /// 初始化设备驱动模型的CPU子系统
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/cpu.c?fi=get_cpu_device#622
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/cpu.c?fi=get_cpu_device#622
     pub fn init(&self) -> Result<(), SystemError> {
         let cpu_subsys = CpuSubSystem::new();
         let root_device = CpuSubSystemFakeRootDevice::new();
@@ -53,7 +53,7 @@ impl CpuDeviceManager {
 
 /// cpu子系统
 ///
-/// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/cpu.c?fi=get_cpu_device#128
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/cpu.c?fi=get_cpu_device#128
 #[derive(Debug)]
 struct CpuSubSystem {
     subsys_private: SubSysPrivate,

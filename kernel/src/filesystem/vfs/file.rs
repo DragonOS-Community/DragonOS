@@ -60,7 +60,7 @@ bitflags! {
     /// 其中，低2bit组合而成的数字的值，用于表示访问权限。其他的bit，才支持通过按位或的方式来表示参数
     ///
     /// 与Linux 5.19.10的uapi/asm-generic/fcntl.h相同
-    /// https://opengrok.ringotek.cn/xref/linux-5.19.10/tools/include/uapi/asm-generic/fcntl.h#19
+    /// https://code.dragonos.org.cn/xref/linux-5.19.10/tools/include/uapi/asm-generic/fcntl.h#19
     pub struct FileMode: u32{
         /* File access modes for `open' and `fcntl'.  */
         /// Open Read-only

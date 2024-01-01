@@ -79,7 +79,7 @@ impl AcpiManager {
 
     /// 在 sysfs 中创建 ACPI 表目录
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/acpi/sysfs.c?fi=acpi_sysfs_init#488
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/acpi/sysfs.c?fi=acpi_sysfs_init#488
     fn acpi_tables_sysfs_init(&self) -> Result<(), SystemError> {
         // 创建 `/sys/firmware/acpi/tables` 目录
         let acpi_tables_kset = KSet::new("tables".to_string());
@@ -115,7 +115,7 @@ impl AcpiManager {
         return Ok(());
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/acpi/sysfs.c?fi=acpi_sysfs_init#469
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/acpi/sysfs.c?fi=acpi_sysfs_init#469
     fn acpi_table_data_init(&self, _header: &SdtHeader) -> Result<(), SystemError> {
         // todo!("AcpiManager::acpi_table_data_init()")
         return Ok(());
@@ -237,7 +237,7 @@ impl BinAttribute for AttrAcpiTable {
 
     /// 展示 ACPI 表的内容
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/acpi/sysfs.c?fi=acpi_sysfs_init#320
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/acpi/sysfs.c?fi=acpi_sysfs_init#320
     fn read(
         &self,
         _kobj: Arc<dyn KObject>,

@@ -103,7 +103,7 @@ impl PlatformDeviceManager {
             }
         }
 
-        // todo: 插入资源： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/platform.c?fi=platform_device_add#691
+        // todo: 插入资源： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/platform.c?fi=platform_device_add#691
         let r = device_manager().add_device(pdev.clone() as Arc<dyn Device>);
         if r.is_ok() {
             pdev.set_state(DeviceState::Initialized);

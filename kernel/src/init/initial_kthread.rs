@@ -1,6 +1,7 @@
 //! 这个文件内放置初始内核线程的代码。
 
 use alloc::string::String;
+use system_error::SystemError;
 
 use crate::{
     arch::process::arch_switch_to_user,
@@ -13,8 +14,23 @@ use crate::{
     process::{kthread::KernelThreadMechanism, process::stdio_init},
 };
 
+use super::initcall::do_initcalls;
+
 pub fn initial_kernel_thread() -> i32 {
+    kernel_init().unwrap_or_else(|err| {
+        panic!("Failed to initialize kernel: {:?}", err);
+    });
+
+    switch_to_user();
+
+    loop {}
+}
+
+fn kernel_init() -> Result<(), SystemError> {
+    kenrel_init_freeable()?;
+
     KernelThreadMechanism::init_stage2();
+
     // 由于目前加锁，速度过慢，所以先不开启双缓冲
     // scm_enable_double_buffer().expect("Failed to enable double buffer");
     stdio_init().expect("Failed to initialize stdio");
@@ -31,9 +47,16 @@ pub fn initial_kernel_thread() -> i32 {
 
     kdebug!("initial kernel thread done.");
 
-    switch_to_user();
+    return Ok(());
+}
 
-    loop {}
+#[inline(never)]
+fn kenrel_init_freeable() -> Result<(), SystemError> {
+    do_initcalls().unwrap_or_else(|err| {
+        panic!("Failed to initialize subsystems: {:?}", err);
+    });
+
+    return Ok(());
 }
 
 /// 切换到用户态

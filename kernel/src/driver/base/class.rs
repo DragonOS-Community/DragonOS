@@ -85,11 +85,8 @@ impl dyn Class {
         let subsys = self.subsystem();
         let guard = subsys.devices();
         for dev in guard.iter() {
-            let dev = dev.upgrade();
-            if let Some(dev) = dev {
-                if matcher.match_device(&dev, data) {
-                    return Some(dev.clone());
-                }
+            if matcher.match_device(&dev, data) {
+                return Some(dev.clone());
             }
         }
         return None;

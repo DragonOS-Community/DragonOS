@@ -12,7 +12,9 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
-    driver::base::{block::block_device::BlockDevice, char::CharDevice, device::DeviceNumber},
+    driver::base::{
+        block::block_device::BlockDevice, char::CharDevice, device::device_number::DeviceNumber,
+    },
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
     time::TimeSpec,

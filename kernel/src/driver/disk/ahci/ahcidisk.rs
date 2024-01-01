@@ -499,11 +499,11 @@ impl Device for LockedAhciDisk {
         todo!()
     }
 
-    fn bus(&self) -> Option<Arc<dyn Bus>> {
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
         todo!("LockedAhciDisk::bus()")
     }
 
-    fn set_bus(&self, _bus: Option<Arc<dyn Bus>>) {
+    fn set_bus(&self, _bus: Option<Weak<dyn Bus>>) {
         todo!("LockedAhciDisk::set_bus()")
     }
 

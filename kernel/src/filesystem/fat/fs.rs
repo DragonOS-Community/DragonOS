@@ -9,6 +9,7 @@ use alloc::{
     vec::Vec,
 };
 
+use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::vfs::SpecialNodeData;
 use crate::ipc::pipe::LockedPipeInode;
 use crate::{
@@ -1685,7 +1686,7 @@ impl IndexNode for LockedFATInode {
         &self,
         filename: &str,
         mode: ModeType,
-        _dev_t: crate::driver::base::device::DeviceNumber,
+        _dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let mut inode = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {

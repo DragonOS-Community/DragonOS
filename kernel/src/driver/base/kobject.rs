@@ -109,11 +109,10 @@ impl Deref for LockedKObjectState {
     }
 }
 
-pub trait KObjectAttribute: Attribute {
-    fn support(&self) -> SysFSOpsSupport;
-
-    fn show(&self, kobj: &dyn KObject, buf: &mut [u8]) -> Result<usize, SystemError>;
-    fn store(&self, kobj: &dyn KObject, buf: &[u8]) -> Result<usize, SystemError>;
+impl Default for LockedKObjectState {
+    fn default() -> Self {
+        LockedKObjectState::new(None)
+    }
 }
 
 #[derive(Debug)]

@@ -15,8 +15,8 @@ use crate::{
         base::{
             class::Class,
             device::{
-                bus::Bus, device_manager, driver::Driver, Device, DeviceKObjType, DeviceNumber,
-                DeviceState, DeviceType, IdTable,
+                bus::Bus, device_manager, device_number::DeviceNumber, driver::Driver, Device,
+                DeviceKObjType, DeviceState, DeviceType, IdTable,
             },
             kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
@@ -94,6 +94,9 @@ impl Serial8250Manager {
         // todo: 把端口绑定到isa_dev、 isa_driver上
         self.register_ports(&serial8250_isa_driver, &serial8250_isa_dev);
 
+        serial8250_isa_dev.set_driver(Some(Arc::downgrade(
+            &(serial8250_isa_driver.clone() as Arc<dyn Driver>),
+        )));
         // todo: 把驱动注册到uart层、tty层
         uart_manager().register_driver(&(serial8250_isa_driver.clone() as Arc<dyn UartDriver>))?;
 
@@ -216,11 +219,11 @@ impl Device for Serial8250ISADevices {
     fn is_dead(&self) -> bool {
         false
     }
-    fn bus(&self) -> Option<Arc<dyn Bus>> {
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
         self.inner.read().bus.clone()
     }
 
-    fn set_bus(&self, bus: Option<Arc<dyn Bus>>) {
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
         self.inner.write().bus = bus;
     }
 
@@ -229,7 +232,7 @@ impl Device for Serial8250ISADevices {
     }
 
     fn id_table(&self) -> IdTable {
-        return IdTable::new(self.name.to_string(), Some(DeviceNumber::new(0)));
+        return IdTable::new(self.name.to_string(), None);
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
@@ -291,7 +294,7 @@ impl KObject for Serial8250ISADevices {
     }
 
     fn set_kobj_type(&self, _ktype: Option<&'static dyn KObjType>) {
-        todo!()
+        // 不允许修改
     }
 
     fn name(&self) -> String {
@@ -319,7 +322,7 @@ struct InnerSerial8250ISADevices {
     kset: Option<Arc<KSet>>,
     parent_kobj: Option<Weak<dyn KObject>>,
     /// 当前设备所述的总线
-    bus: Option<Arc<dyn Bus>>,
+    bus: Option<Weak<dyn Bus>>,
     inode: Option<Arc<KernFSInode>>,
     driver: Option<Weak<dyn Driver>>,
     device_state: DeviceState,
@@ -351,7 +354,7 @@ enum Serial8250PlatformDeviceID {
 #[derive(Debug)]
 
 struct InnerSerial8250ISADriver {
-    bus: Option<Arc<dyn Bus>>,
+    bus: Option<Weak<dyn Bus>>,
     kobj_type: Option<&'static dyn KObjType>,
     kset: Option<Arc<KSet>>,
     parent_kobj: Option<Weak<dyn KObject>>,
@@ -486,11 +489,11 @@ impl Driver for Serial8250ISADriver {
         inner.devices.retain(|d| !Arc::ptr_eq(d, device));
     }
 
-    fn bus(&self) -> Option<Arc<dyn Bus>> {
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
         self.inner.read().bus.clone()
     }
 
-    fn set_bus(&self, bus: Option<Arc<dyn Bus>>) {
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
         self.inner.write().bus = bus;
     }
 }

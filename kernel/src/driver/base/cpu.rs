@@ -18,7 +18,7 @@ use super::{
     device::{
         bus::{subsystem_manager, Bus},
         driver::Driver,
-        Device, DeviceNumber, DeviceType, IdTable,
+        Device, DeviceType, IdTable,
     },
     kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
     kset::KSet,
@@ -124,7 +124,7 @@ impl CpuSubSystemFakeRootDevice {
 #[derive(Debug)]
 struct InnerCpuSubSystemFakeRootDevice {
     parent_kobj: Option<Weak<dyn KObject>>,
-    bus: Option<Arc<dyn Bus>>,
+    bus: Option<Weak<dyn Bus>>,
     kset: Option<Arc<KSet>>,
     name: String,
     kern_inode: Option<Arc<KernFSInode>>,
@@ -150,11 +150,15 @@ impl Device for CpuSubSystemFakeRootDevice {
     }
 
     fn id_table(&self) -> IdTable {
-        IdTable::new("cpu".to_string(), Some(DeviceNumber::new(0)))
+        IdTable::new("cpu".to_string(), None)
     }
 
-    fn set_bus(&self, bus: Option<Arc<dyn Bus>>) {
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
         self.inner.write().bus = bus;
+    }
+
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
+        self.inner.read().bus.clone()
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {

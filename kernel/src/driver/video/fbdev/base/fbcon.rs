@@ -85,7 +85,7 @@ struct InnerFbConsoleDevice {
     kernfs_inode: Option<Arc<KernFSInode>>,
     parent: Option<Weak<dyn KObject>>,
     kset: Option<Arc<KSet>>,
-    bus: Option<Arc<dyn Bus>>,
+    bus: Option<Weak<dyn Bus>>,
     driver: Option<Weak<dyn Driver>>,
     ktype: Option<&'static dyn KObjType>,
 }
@@ -183,8 +183,12 @@ impl Device for FbConsoleDevice {
         IdTable::new(Self::NAME.to_string(), None)
     }
 
-    fn set_bus(&self, bus: Option<Arc<dyn Bus>>) {
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
         self.inner.lock().bus = bus;
+    }
+
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
+        self.inner.lock().bus.clone()
     }
 
     fn set_class(&self, _class: Option<Arc<dyn Class>>) {

@@ -18,12 +18,12 @@ use crate::{
             driver::Driver,
             sys_dev_char_kset, Device, DeviceType, IdTable,
         },
-        init::SUBSYSTEM_INITIALIZER_SLICE,
         kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
         kset::KSet,
         subsys::SubSysPrivate,
     },
     filesystem::{kernfs::KernFSInode, sysfs::AttributeGroup},
+    init::initcall::INITCALL_SUBSYS,
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::SpinLock,
@@ -53,7 +53,7 @@ pub fn frame_buffer_manager() -> &'static FrameBufferManager {
 }
 
 /// 初始化帧缓冲区子系统
-#[unified_init(SUBSYSTEM_INITIALIZER_SLICE)]
+#[unified_init(INITCALL_SUBSYS)]
 pub fn fbmem_init() -> Result<(), SystemError> {
     let graphics_class = GraphicsClass::new();
     class_manager().class_register(&(graphics_class.clone() as Arc<dyn Class>))?;

@@ -551,6 +551,7 @@ impl Attribute for AnonAttrPhysAddr {
     }
 }
 
+#[unified_init(INITCALL_DEVICE)]
 pub fn vesa_fb_driver_init() -> Result<(), SystemError> {
     let driver = VesaFbDriver::new();
 

@@ -189,7 +189,7 @@ impl SubSysPrivate {
     }
 }
 
-/// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/include/linux/device.h#63
+/// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/device.h#63
 pub trait SubSysInterface: Debug + Send + Sync {
     fn name(&self) -> &str;
     fn bus(&self) -> Option<Weak<dyn Bus>>;

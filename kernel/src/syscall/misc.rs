@@ -13,7 +13,7 @@ use super::{user_access::UserBufferWriter, Syscall};
 
 /// 系统信息
 ///
-/// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/include/uapi/linux/sysinfo.h#8
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/uapi/linux/sysinfo.h#8
 #[derive(Debug, Default, Copy, Clone)]
 pub struct SysInfo {
     uptime: u64,

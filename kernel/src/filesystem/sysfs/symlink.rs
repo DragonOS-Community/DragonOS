@@ -19,7 +19,7 @@ impl SysFS {
     /// - `target`: object we're pointing to.
     /// - `name`: 符号链接的名称
     ///
-    /// 参考：https://opengrok.ringotek.cn/xref/linux-6.1.9/fs/sysfs/symlink.c#89
+    /// 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/fs/sysfs/symlink.c#89
     pub fn create_link(
         &self,
         kobj: Option<&Arc<dyn KObject>>,
@@ -37,7 +37,7 @@ impl SysFS {
     /// - `name`: 符号链接的名称
     ///
     ///
-    /// 参考：https://opengrok.ringotek.cn/xref/linux-6.1.9/fs/sysfs/symlink.c#143
+    /// 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/fs/sysfs/symlink.c#143
     pub fn remove_link(&self, _kobj: &Arc<dyn KObject>, _name: String) {
         todo!("sysfs remove link")
     }
@@ -60,7 +60,7 @@ impl SysFS {
         return self.do_create_link_sd(&parent, target, name, warn);
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/fs/sysfs/symlink.c#20
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/sysfs/symlink.c#20
     fn do_create_link_sd(
         &self,
         inode: &Arc<KernFSInode>,

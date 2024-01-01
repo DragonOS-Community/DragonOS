@@ -40,7 +40,7 @@ impl DeviceManager {
     ///
     /// ## 参考
     ///
-    /// https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c#1049
+    /// https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#1049
     pub fn device_attach(&self, dev: &Arc<dyn Device>) -> Result<bool, SystemError> {
         return self.do_device_attach(dev, false);
     }
@@ -49,7 +49,7 @@ impl DeviceManager {
         return self.do_device_attach(dev, true);
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c#978
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#978
     fn do_device_attach(
         &self,
         dev: &Arc<dyn Device>,
@@ -137,7 +137,7 @@ impl DeviceManager {
     /// - Ok(true): 匹配成功
     /// - Ok(false): 没有匹配成功
     /// - Err(SystemError): 匹配过程中出现意外错误,没有匹配成功
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c#899
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#899
     fn do_device_attach_driver(
         &self,
         driver: &Arc<dyn Driver>,
@@ -202,7 +202,7 @@ impl DeviceManager {
     ///
     /// 使用device_manager().driver_attach()会更好
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c#496
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#496
     pub fn device_bind_driver(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
         let r = driver_manager().driver_sysfs_add(dev);
         if let Err(e) = r {
@@ -221,14 +221,14 @@ impl DeviceManager {
         return r;
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#528
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#528
     fn unbind_cleanup(&self, dev: &Arc<dyn Device>) {
         dev.set_driver(None);
         // todo: 添加更多操作，清理数据
     }
 }
 
-/// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c#866
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#866
 #[derive(Debug)]
 #[allow(dead_code)]
 struct DeviceAttachData {
@@ -296,7 +296,7 @@ impl DriverManager {
         return Ok(());
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#1134
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#1134
     fn do_driver_attach(&self, device: &Arc<dyn Device>, driver: &Arc<dyn Driver>) -> bool {
         let r = self.match_device(driver, device).unwrap_or(false);
         if r == false {
@@ -341,7 +341,7 @@ impl DriverManager {
     /// - Err(ENODEV): 设备未注册
     /// - Err(EBUSY): 设备已经绑定到驱动上
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#802
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#802
     fn probe_device(
         &self,
         driver: &Arc<dyn Driver>,
@@ -371,7 +371,7 @@ impl DriverManager {
         return Ok(());
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#584
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#584
     fn really_probe(
         &self,
         driver: &Arc<dyn Driver>,
@@ -461,7 +461,7 @@ impl DriverManager {
         return Ok(());
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#434
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#434
     fn add_to_sysfs(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
         let driver = device.driver().ok_or(SystemError::EINVAL)?;
 
@@ -500,7 +500,7 @@ impl DriverManager {
         return Ok(());
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#469
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#469
     fn remove_from_sysfs(&self, _device: &Arc<dyn Device>) {
         todo!("remove_from_sysfs")
     }
@@ -554,7 +554,7 @@ impl DriverManager {
     }
 
     /// 当设备被成功探测，进行了'设备->驱动'绑定后，调用这个函数，完成'驱动->设备'的绑定
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c#393
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#393
     fn driver_bound(&self, device: &Arc<dyn Device>) {
         if self.driver_is_bound(device) {
             kwarn!("driver_bound: device '{}' is already bound.", device.name());

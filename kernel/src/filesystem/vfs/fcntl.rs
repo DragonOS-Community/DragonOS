@@ -3,7 +3,7 @@ const F_LINUX_SPECIFIC_BASE: u32 = 1024;
 /// fcntl syscall command
 ///
 /// for linux-specific fcntl commands, see:
-/// https://opengrok.ringotek.cn/xref/linux-5.19.10/tools/include/uapi/linux/fcntl.h#8
+/// https://code.dragonos.org.cn/xref/linux-5.19.10/tools/include/uapi/linux/fcntl.h#8
 #[derive(Debug, Copy, Clone, Eq, PartialEq, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
 pub enum FcntlCommand {

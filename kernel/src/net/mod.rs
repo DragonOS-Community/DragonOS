@@ -46,7 +46,7 @@ pub fn generate_iface_id() -> usize {
 
 bitflags! {
     /// @brief 用于指定socket的关闭类型
-    /// 参考：https://opengrok.ringotek.cn/xref/linux-6.1.9/include/net/sock.h?fi=SHUTDOWN_MASK#1573
+    /// 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/include/net/sock.h?fi=SHUTDOWN_MASK#1573
     pub struct ShutdownType: u8 {
         const RCV_SHUTDOWN = 1;
         const SEND_SHUTDOWN = 2;

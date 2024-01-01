@@ -39,7 +39,7 @@ pub struct PlatformDriverManager;
 impl PlatformDriverManager {
     /// 注册平台设备驱动
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/platform.c?fi=__platform_driver_register#861
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/platform.c?fi=__platform_driver_register#861
     pub fn register(&self, driver: Arc<dyn PlatformDriver>) -> Result<(), SystemError> {
         driver.set_bus(Some(Arc::downgrade(&(platform_bus() as Arc<dyn Bus>))));
         return driver_manager().register(driver as Arc<dyn Driver>);

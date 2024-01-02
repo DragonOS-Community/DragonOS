@@ -8,6 +8,11 @@ impl Major {
 
     /// 未命名的主设备
     pub const UNNAMED_MAJOR: Self = Self::new(0);
+
+    pub const IDE0_MAJOR: Self = Self::new(3);
+    pub const HD_MAJOR: Self = Self::IDE0_MAJOR;
+
+    pub const INPUT_MAJOR: Self = Self::new(13);
     /// /dev/fb* framebuffers
     pub const FB_MAJOR: Self = Self::new(29);
 

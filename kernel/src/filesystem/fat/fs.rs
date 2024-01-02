@@ -201,7 +201,7 @@ impl LockedFATInode {
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: 0,
+                raw_dev: DeviceNumber::default(),
             },
             special_node: None,
         })));
@@ -321,7 +321,7 @@ impl FATFileSystem {
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: 0,
+                raw_dev: DeviceNumber::default(),
             },
             special_node: None,
         })));

@@ -12,6 +12,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::mm::LockedFrameAllocator,
+    driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{
         core::{generate_inode_id, ROOT_INODE},
         FileType,
@@ -298,7 +299,7 @@ impl ProcFS {
                     nlinks: 1,
                     uid: 0,
                     gid: 0,
-                    raw_dev: 0,
+                    raw_dev: DeviceNumber::default(),
                 },
                 fs: Weak::default(),
                 fdata: InodeInfo {
@@ -559,7 +560,7 @@ impl IndexNode for LockedProcFSInode {
                     nlinks: 1,
                     uid: 0,
                     gid: 0,
-                    raw_dev: data,
+                    raw_dev: DeviceNumber::from(data as u32),
                 },
                 fs: inode.fs.clone(),
                 fdata: InodeInfo {

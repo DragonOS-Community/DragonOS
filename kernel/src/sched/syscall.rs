@@ -33,4 +33,8 @@ impl Syscall {
         drop(irq_guard);
         return Ok(0);
     }
+
+    pub fn sched_yield() -> Result<usize, SystemError> {
+        return Syscall::sched(false);
+    }
 }

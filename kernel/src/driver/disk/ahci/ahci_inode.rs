@@ -1,10 +1,10 @@
 use crate::driver::base::block::block_device::BlockDevice;
+use crate::driver::base::device::device_number::{DeviceNumber, Major};
 use crate::filesystem::devfs::{DevFS, DeviceINode};
 use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{
-    core::generate_inode_id, make_rawdev, FilePrivateData, FileSystem, FileType, IndexNode,
-    Metadata,
+    core::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
 };
 use crate::{libs::spinlock::SpinLock, time::TimeSpec};
 use alloc::{
@@ -54,7 +54,7 @@ impl LockedAhciInode {
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: make_rawdev(1, 3), // 这里用来作为device number
+                raw_dev: DeviceNumber::new(Major::HD_MAJOR, 0),
             },
         };
 

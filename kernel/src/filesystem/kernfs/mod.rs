@@ -9,6 +9,7 @@ use hashbrown::HashMap;
 use system_error::SystemError;
 
 use crate::{
+    driver::base::device::device_number::DeviceNumber,
     libs::{
         casting::DowncastArc,
         rwlock::RwLock,
@@ -84,7 +85,7 @@ impl KernFS {
             inode_id: generate_inode_id(),
             file_type: FileType::Dir,
             nlinks: 1,
-            raw_dev: 0,
+            raw_dev: DeviceNumber::default(),
         };
         let root_inode = Arc::new(KernFSInode {
             name: String::from(""),
@@ -507,7 +508,7 @@ impl KernFSInode {
             inode_id: generate_inode_id(),
             file_type: file_type.into(),
             nlinks: 1,
-            raw_dev: 0,
+            raw_dev: DeviceNumber::default(),
         };
 
         let new_inode: Arc<KernFSInode> = Self::new(

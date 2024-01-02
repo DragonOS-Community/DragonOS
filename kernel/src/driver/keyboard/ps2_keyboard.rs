@@ -3,7 +3,10 @@ use core::{ffi::c_void, sync::atomic::AtomicI32};
 use alloc::sync::{Arc, Weak};
 
 use crate::{
-    driver::tty::tty_device::TTY_DEVICES,
+    driver::{
+        base::device::device_number::{DeviceNumber, Major},
+        tty::tty_device::TTY_DEVICES,
+    },
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
         vfs::{
@@ -65,7 +68,7 @@ impl LockedPS2KeyBoardInode {
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: 0, // 这里用来作为device number
+                raw_dev: DeviceNumber::new(Major::INPUT_MAJOR, 0), // 这里用来作为device number
             },
         };
 

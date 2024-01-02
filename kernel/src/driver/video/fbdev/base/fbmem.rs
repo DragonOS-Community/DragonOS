@@ -3,6 +3,7 @@ use core::intrinsics::unlikely;
 use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
+    vec::Vec,
 };
 
 use system_error::SystemError;
@@ -22,11 +23,19 @@ use crate::{
         kset::KSet,
         subsys::SubSysPrivate,
     },
-    filesystem::{kernfs::KernFSInode, sysfs::AttributeGroup},
+    filesystem::{
+        devfs::{devfs_register, DevFS, DeviceINode},
+        kernfs::KernFSInode,
+        sysfs::AttributeGroup,
+        vfs::{
+            file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode,
+            Metadata,
+        },
+    },
     init::initcall::INITCALL_SUBSYS,
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
-        spinlock::SpinLock,
+        spinlock::{SpinLock, SpinLockGuard},
     },
 };
 
@@ -141,6 +150,16 @@ impl FrameBufferManager {
         fb.set_fb_device(Some(fb_device.clone()));
 
         device_manager().add_device(fb_device.clone() as Arc<dyn Device>)?;
+        // 添加到devfs
+        devfs_register(&fb_device.name(), fb_device.clone()).map_err(|e| {
+            kerror!(
+                "register fb device '{}' to devfs failed: {:?}",
+                fb_device.name(),
+                e
+            );
+            device_manager().remove(&(fb_device.clone() as Arc<dyn Device>));
+            e
+        })?;
 
         // todo: 从Modedb中获取信息
         // 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/video/fbdev/core/fbmem.c#1584
@@ -195,7 +214,7 @@ pub struct FbDevice {
 impl FbDevice {
     pub const BASENAME: &'static str = "fb";
     fn new(fb: Weak<dyn FrameBuffer>, id: FbId) -> Arc<Self> {
-        Arc::new(Self {
+        let r = Arc::new(Self {
             inner: SpinLock::new(InnerFbDevice {
                 fb,
                 kern_inode: None,
@@ -203,13 +222,35 @@ impl FbDevice {
                 kset: None,
                 ktype: None,
                 fb_id: id,
+                device_inode_fs: None,
+                devfs_metadata: Metadata::new(
+                    FileType::FramebufferDevice,
+                    ModeType::from_bits_truncate(0o666),
+                ),
             }),
             kobj_state: LockedKObjectState::new(None),
-        })
+        });
+
+        let mut inner_guard = r.inner.lock();
+
+        inner_guard.devfs_metadata.raw_dev = r.do_device_number(&inner_guard);
+        drop(inner_guard);
+
+        return r;
     }
 
     pub fn framebuffer(&self) -> Option<Arc<dyn FrameBuffer>> {
         self.inner.lock().fb.upgrade()
+    }
+
+    /// 获取设备号
+    pub fn device_number(&self) -> DeviceNumber {
+        let inner_guard = self.inner.lock();
+        self.do_device_number(&inner_guard)
+    }
+
+    fn do_device_number(&self, inner_guard: &SpinLockGuard<'_, InnerFbDevice>) -> DeviceNumber {
+        DeviceNumber::new(Major::FB_MAJOR, inner_guard.fb_id.data())
     }
 }
 
@@ -222,6 +263,10 @@ struct InnerFbDevice {
     ktype: Option<&'static dyn KObjType>,
     /// 帧缓冲区id
     fb_id: FbId,
+
+    /// device inode要求的字段
+    device_inode_fs: Option<Weak<DevFS>>,
+    devfs_metadata: Metadata,
 }
 
 impl KObject for FbDevice {
@@ -288,13 +333,7 @@ impl Device for FbDevice {
     }
 
     fn id_table(&self) -> IdTable {
-        IdTable::new(
-            Self::BASENAME.to_string(),
-            Some(DeviceNumber::new(
-                Major::FB_MAJOR,
-                self.inner.lock().fb_id.data(),
-            )),
-        )
+        IdTable::new(Self::BASENAME.to_string(), Some(self.device_number()))
     }
 
     fn set_bus(&self, _bus: Option<Weak<dyn Bus>>) {
@@ -334,5 +373,68 @@ impl Device for FbDevice {
 
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
         Some(&[&FbDeviceAttrGroup])
+    }
+}
+
+impl DeviceINode for FbDevice {
+    fn set_fs(&self, fs: Weak<DevFS>) {
+        self.inner.lock().device_inode_fs = Some(fs);
+    }
+}
+
+impl IndexNode for FbDevice {
+    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+        Ok(())
+    }
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: &mut FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        let fb = self.inner.lock().fb.upgrade().unwrap();
+        return fb.fb_read(&mut buf[0..len], offset);
+    }
+
+    fn write_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        _data: &mut FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        let fb = self.inner.lock().fb.upgrade().unwrap();
+        return fb.fb_write(&buf[0..len], offset);
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        self.inner
+            .lock()
+            .device_inode_fs
+            .as_ref()
+            .unwrap()
+            .upgrade()
+            .unwrap()
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn list(&self) -> Result<Vec<String>, SystemError> {
+        todo!()
+    }
+
+    fn metadata(&self) -> Result<Metadata, SystemError> {
+        Ok(self.inner.lock().devfs_metadata.clone())
+    }
+
+    fn resize(&self, _len: usize) -> Result<(), SystemError> {
+        return Ok(());
     }
 }

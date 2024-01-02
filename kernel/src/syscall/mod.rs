@@ -956,6 +956,14 @@ impl Syscall {
                 Self::fchmodat(dirfd, pathname, mode)
             }
 
+            SYS_SCHED_GETAFFINITY => {
+                // todo: 这个系统调用还没有实现
+
+                Err(SystemError::ENOSYS)
+            }
+
+            SYS_SCHED_YIELD => Self::sched_yield(),
+
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

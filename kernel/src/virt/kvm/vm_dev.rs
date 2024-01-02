@@ -1,8 +1,9 @@
+use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
     core::generate_inode_id,
     file::{File, FileMode},
-    make_rawdev, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
+    FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
 };
 use crate::mm::VirtAddr;
 use crate::process::ProcessManager;
@@ -74,7 +75,7 @@ impl LockedVmInode {
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: make_rawdev(1, 4), // 这里用来作为device number
+                raw_dev: DeviceNumber::default(), // 这里用来作为device number
             },
             // fdata: InodeInfo {
             //     kvm: kvm,

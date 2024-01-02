@@ -775,7 +775,7 @@ impl Syscall {
         kstat.nlink = metadata.nlinks as u64;
         kstat.uid = metadata.uid as i32;
         kstat.gid = metadata.gid as i32;
-        kstat.rdev = metadata.raw_dev as i64;
+        kstat.rdev = metadata.raw_dev.data() as i64;
         kstat.mode = metadata.mode;
         match file.lock().file_type() {
             FileType::File => kstat.mode.insert(ModeType::S_IFREG),
@@ -786,6 +786,7 @@ impl Syscall {
             FileType::Socket => kstat.mode.insert(ModeType::S_IFSOCK),
             FileType::Pipe => kstat.mode.insert(ModeType::S_IFIFO),
             FileType::KvmDevice => kstat.mode.insert(ModeType::S_IFCHR),
+            FileType::FramebufferDevice => kstat.mode.insert(ModeType::S_IFCHR),
         }
 
         return Ok(kstat);

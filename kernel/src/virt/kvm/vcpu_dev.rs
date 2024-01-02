@@ -1,9 +1,10 @@
 use crate::arch::kvm::vmx::vcpu::VcpuContextFrame;
 use crate::arch::KVMArch;
+use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
-    core::generate_inode_id, file::FileMode, make_rawdev, FilePrivateData, FileSystem, FileType,
-    IndexNode, Metadata,
+    core::generate_inode_id, file::FileMode, FilePrivateData, FileSystem, FileType, IndexNode,
+    Metadata,
 };
 use crate::mm::VirtAddr;
 use crate::syscall::user_access::copy_from_user;
@@ -76,7 +77,7 @@ impl LockedVcpuInode {
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: make_rawdev(1, 4), // 这里用来作为device number
+                raw_dev: DeviceNumber::default(), // 这里用来作为device number
             },
             // fdata: InodeInfo {
             //     kvm: kvm,

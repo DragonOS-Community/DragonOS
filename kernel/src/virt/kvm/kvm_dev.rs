@@ -1,8 +1,9 @@
+use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::devfs::{DevFS, DeviceINode};
 use crate::filesystem::vfs::{
     core::generate_inode_id,
     file::{File, FileMode},
-    make_rawdev, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
+    FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
 };
 use crate::process::ProcessManager;
 use crate::{arch::KVMArch, libs::spinlock::SpinLock, time::TimeSpec};
@@ -65,7 +66,7 @@ impl LockedKvmInode {
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: make_rawdev(1, 4), // 这里用来作为device number
+                raw_dev: DeviceNumber::default(), // 这里用来作为device number
             },
         };
 

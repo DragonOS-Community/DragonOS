@@ -9,6 +9,7 @@ use super::vfs::{
     FileSystem, FileType, FsInfo, IndexNode, Metadata,
 };
 use crate::{
+    driver::base::device::device_number::DeviceNumber,
     kerror, kinfo,
     libs::{
         once::Once,
@@ -154,6 +155,11 @@ impl DevFS {
                     .add_dev(name, device.clone())
                     .expect("DevFS: Failed to register /dev/kvm");
             }
+            FileType::FramebufferDevice => {
+                dev_root_inode
+                    .add_dev(name, device.clone())
+                    .expect("DevFS: Failed to register /dev/fb");
+            }
             _ => {
                 return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
             }
@@ -254,7 +260,7 @@ impl DevFSInode {
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: data_,
+                raw_dev: DeviceNumber::from(data_ as u32),
             },
             fs: Weak::default(),
         };
@@ -344,7 +350,7 @@ impl LockedDevFSInode {
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: data,
+                raw_dev: DeviceNumber::from(data as u32),
             },
             fs: guard.fs.clone(),
         })));

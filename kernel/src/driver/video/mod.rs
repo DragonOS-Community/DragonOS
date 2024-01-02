@@ -91,15 +91,15 @@ impl VideoRefreshManager {
         );
         boot_params().write_irqsave().screen_info.lfb_virt_base = Some(buf_vaddr);
 
-        let mut frame_buffer_info_graud = self.device_buffer.write();
-        if let ScmBuffer::DeviceBuffer(vaddr) = &mut (frame_buffer_info_graud).buf {
+        let mut frame_buffer_info_guard = self.device_buffer.write();
+        if let ScmBuffer::DeviceBuffer(vaddr) = &mut (frame_buffer_info_guard).buf {
             *vaddr = buf_vaddr;
         }
 
         // 地址映射
         let mut paddr = boot_params().read().screen_info.lfb_base;
         let count = PageFrameCount::new(
-            page_align_up(frame_buffer_info_graud.buf_size()) / MMArch::PAGE_SIZE,
+            page_align_up(frame_buffer_info_guard.buf_size()) / MMArch::PAGE_SIZE,
         );
         let page_flags: PageFlags<MMArch> = PageFlags::new().set_execute(true).set_write(true);
 

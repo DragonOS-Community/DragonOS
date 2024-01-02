@@ -295,6 +295,48 @@ impl FrameBufferOps for VesaFb {
     fn fb_destroy(&self) {
         todo!()
     }
+
+    fn fb_read(&self, buf: &mut [u8], pos: usize) -> Result<usize, SystemError> {
+        let bp = boot_params().read();
+
+        let vaddr = bp.screen_info.lfb_virt_base.ok_or(SystemError::ENODEV)?;
+        let size = self.current_fb_fix().smem_len;
+        drop(bp);
+        if pos >= size {
+            return Ok(0);
+        }
+
+        let pos = pos as i64;
+        let size = size as i64;
+
+        let len = core::cmp::min(size - pos, buf.len() as i64) as usize;
+
+        let slice = unsafe { core::slice::from_raw_parts(vaddr.as_ptr::<u8>(), size as usize) };
+        buf[..len].copy_from_slice(&slice[pos as usize..(pos as usize + len)]);
+
+        return Ok(len);
+    }
+
+    fn fb_write(&self, buf: &[u8], pos: usize) -> Result<usize, SystemError> {
+        let bp = boot_params().read();
+
+        let vaddr = bp.screen_info.lfb_virt_base.ok_or(SystemError::ENODEV)?;
+        let size = self.current_fb_fix().smem_len;
+
+        if pos >= size {
+            return Ok(0);
+        }
+
+        let pos = pos as i64;
+        let size = size as i64;
+
+        let len = core::cmp::min(size - pos, buf.len() as i64) as usize;
+
+        let slice = unsafe { core::slice::from_raw_parts_mut(vaddr.as_ptr::<u8>(), size as usize) };
+        slice[pos as usize..(pos as usize + len)].copy_from_slice(&buf[..len]);
+
+        return Ok(len);
+    }
 }
 
 impl FrameBufferInfo for VesaFb {

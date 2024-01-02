@@ -423,7 +423,7 @@ impl DeviceManager {
     /// https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c#3398
     ///
     /// todo: 完善错误处理逻辑：如果添加失败，需要将之前添加的内容全部回滚
-    #[inline]
+    #[inline(never)]
     #[allow(dead_code)]
     pub fn add_device(&self, device: Arc<dyn Device>) -> Result<(), SystemError> {
         // 在这里处理与parent相关的逻辑
@@ -547,6 +547,9 @@ impl DeviceManager {
     /// @brief: 卸载设备
     /// @parameter id_table: 总线标识符，用于唯一标识该设备
     /// @return: None
+    ///
+    /// ## 注意
+    /// 该函数已废弃，不再使用
     #[inline]
     #[allow(dead_code)]
     pub fn remove_device(&self, _id_table: &IdTable) {
@@ -554,7 +557,7 @@ impl DeviceManager {
     }
 
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#542
-    fn remove(&self, _dev: &Arc<dyn Device>) {
+    pub fn remove(&self, _dev: &Arc<dyn Device>) {
         todo!("DeviceManager::remove")
     }
 

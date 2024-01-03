@@ -9,3 +9,4 @@ pub mod timers;
 pub mod tty;
 pub mod video;
 pub mod virtio;
+pub mod input;

@@ -44,12 +44,18 @@ smoltcp = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/smoltcp.g
 system_error = { path = "crates/system_error" }
 unified-init = { path = "crates/unified-init" }
 virtio-drivers = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/virtio-drivers.git", rev = "f1d1cbb" }
+fdt = "0.1.5"
 
 # target为x86_64时，使用下面的依赖
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 mini-backtrace = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/mini-backtrace.git", rev = "ba98506685" }
 x86 = "0.52.0"
 x86_64 = "0.14.10"
+
+
+# target为riscv64时，使用下面的依赖
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+
 
 
 # 构建时依赖项

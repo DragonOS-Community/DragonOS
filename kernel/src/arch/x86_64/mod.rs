@@ -5,6 +5,7 @@ mod c_adapter;
 pub mod cpu;
 pub mod driver;
 pub mod fpu;
+pub mod init;
 pub mod interrupt;
 pub mod ipc;
 pub mod kvm;

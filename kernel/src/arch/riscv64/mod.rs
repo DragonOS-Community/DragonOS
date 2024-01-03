@@ -1,7 +1,7 @@
 pub mod asm;
 pub mod cpu;
 pub mod driver;
-mod init;
+pub mod init;
 pub mod interrupt;
 pub mod ipc;
 mod kvm;

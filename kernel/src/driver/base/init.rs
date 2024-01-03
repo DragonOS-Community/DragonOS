@@ -1,4 +1,4 @@
-use crate::driver::tty::tty_device::tty_init;
+use crate::driver::{tty::tty_device::tty_init, input::serio::serio_bus_init};
 use system_error::SystemError;
 use unified_init::{define_public_unified_initializer_slice, unified_init};
 
@@ -20,6 +20,7 @@ pub(super) fn driver_init() -> Result<(), SystemError> {
     firmware_init()?;
     hypervisor_init()?;
     platform_bus_init()?;
+    serio_bus_init()?;
     cpu_device_manager().init()?;
     subsystem_init()?;
     // 至此，已完成设备驱动模型的初始化

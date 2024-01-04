@@ -30,6 +30,7 @@ pub trait SerioDriver: Driver {
 
 pub struct SerioDriverManager;
 
+#[allow(dead_code)]
 impl SerioDriverManager {
     pub fn register(&self, driver: Arc<dyn SerioDriver>) -> Result<(), SystemError> {
         driver.set_bus(Some(Arc::downgrade(&(serio_bus() as Arc<dyn Bus>))));

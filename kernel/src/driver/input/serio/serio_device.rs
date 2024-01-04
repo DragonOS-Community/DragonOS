@@ -14,6 +14,7 @@ pub trait SerioDevice: Device {
     fn stop(&self, device: &Arc<dyn SerioDevice>) -> Result<(), SystemError>;
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 pub fn serio_device_manager() -> &'static SerioDeviceManager {
     &SerioDeviceManager
@@ -21,6 +22,7 @@ pub fn serio_device_manager() -> &'static SerioDeviceManager {
 
 pub struct SerioDeviceManager;
 
+#[allow(dead_code)]
 impl SerioDeviceManager {
     pub fn register_port(&self, device: Arc<dyn SerioDevice>) -> Result<(), SystemError> {
         self.init_port(device)

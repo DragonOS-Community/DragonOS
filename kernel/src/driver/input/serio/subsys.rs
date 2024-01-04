@@ -134,7 +134,7 @@ impl AttributeGroup for SerioDeviceAttrGroup {
         return &[];
     }
 
-    fn is_visible(&self, _kobj: Arc<dyn KObject>, attr: &dyn Attribute) -> Option<ModeType> {
+    fn is_visible(&self, _kobj: Arc<dyn KObject>, _attr: &dyn Attribute) -> Option<ModeType> {
         None
     }
 }

@@ -9,7 +9,7 @@ use alloc::{
 };
 use system_error::SystemError;
 
-use crate::{driver::base::device::DeviceNumber, libs::spinlock::SpinLock};
+use crate::{driver::base::device::device_number::DeviceNumber, libs::spinlock::SpinLock};
 
 use super::{
     file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,

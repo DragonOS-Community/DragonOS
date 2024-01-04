@@ -3,6 +3,7 @@ pub mod base;
 pub mod disk;
 pub mod keyboard;
 pub mod net;
+pub mod open_firmware;
 pub mod pci;
 pub mod timers;
 pub mod tty;

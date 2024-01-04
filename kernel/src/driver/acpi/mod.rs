@@ -55,7 +55,7 @@ impl AcpiManager {
     ///
     /// ## 参考资料
     ///
-    /// https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/acpi/bus.c#1390
+    /// https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/acpi/bus.c#1390
     pub fn init(&self, rsdp_vaddr1: u64, rsdp_vaddr2: u64) -> Result<(), SystemError> {
         kinfo!("Initializing Acpi Manager...");
 

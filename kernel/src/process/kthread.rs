@@ -15,14 +15,13 @@ use system_error::SystemError;
 use crate::{
     arch::{sched::sched, CurrentIrqArch},
     exception::InterruptArch,
+    init::initial_kthread::initial_kernel_thread,
     kdebug, kinfo,
     libs::{once::Once, spinlock::SpinLock},
     process::{ProcessManager, ProcessState},
 };
 
-use super::{
-    fork::CloneFlags, init::initial_kernel_thread, Pid, ProcessControlBlock, ProcessFlags,
-};
+use super::{fork::CloneFlags, Pid, ProcessControlBlock, ProcessFlags};
 
 /// 内核线程的创建任务列表
 static KTHREAD_CREATE_LIST: SpinLock<LinkedList<Arc<KernelThreadCreateInfo>>> =

@@ -15,8 +15,8 @@ use crate::{
         base::{
             class::Class,
             device::{
-                bus::Bus, device_manager, driver::Driver, Device, DeviceKObjType, DeviceNumber,
-                DeviceState, DeviceType, IdTable,
+                bus::Bus, device_manager, device_number::DeviceNumber, driver::Driver, Device,
+                DeviceKObjType, DeviceState, DeviceType, IdTable,
             },
             kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
@@ -79,7 +79,7 @@ impl Serial8250Manager {
     ///
     /// 应当在设备驱动模型初始化之后调用这里
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/tty/serial/8250/8250_core.c?r=&mo=30224&fi=1169#1169
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/tty/serial/8250/8250_core.c?r=&mo=30224&fi=1169#1169
     pub fn init(&self) -> Result<(), SystemError> {
         // 初始化serial8250 isa设备
         let serial8250_isa_dev = Serial8250ISADevices::new();
@@ -94,6 +94,9 @@ impl Serial8250Manager {
         // todo: 把端口绑定到isa_dev、 isa_driver上
         self.register_ports(&serial8250_isa_driver, &serial8250_isa_dev);
 
+        serial8250_isa_dev.set_driver(Some(Arc::downgrade(
+            &(serial8250_isa_driver.clone() as Arc<dyn Driver>),
+        )));
         // todo: 把驱动注册到uart层、tty层
         uart_manager().register_driver(&(serial8250_isa_driver.clone() as Arc<dyn UartDriver>))?;
 
@@ -120,7 +123,7 @@ impl Serial8250Manager {
 
     /// 把uart端口与uart driver、uart device绑定
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/tty/serial/8250/8250_core.c?r=&mo=30224&fi=1169#553
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/tty/serial/8250/8250_core.c?r=&mo=30224&fi=1169#553
     fn register_ports(
         &self,
         uart_driver: &Arc<Serial8250ISADriver>,
@@ -131,7 +134,7 @@ impl Serial8250Manager {
 
     /// 把uart端口与uart driver绑定
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/tty/serial/serial_core.c?fi=uart_add_one_port#3048
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/tty/serial/serial_core.c?fi=uart_add_one_port#3048
     pub(self) fn uart_add_one_port(
         &self,
         _uart_driver: &Arc<Serial8250ISADriver>,
@@ -216,11 +219,11 @@ impl Device for Serial8250ISADevices {
     fn is_dead(&self) -> bool {
         false
     }
-    fn bus(&self) -> Option<Arc<dyn Bus>> {
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
         self.inner.read().bus.clone()
     }
 
-    fn set_bus(&self, bus: Option<Arc<dyn Bus>>) {
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
         self.inner.write().bus = bus;
     }
 
@@ -229,7 +232,7 @@ impl Device for Serial8250ISADevices {
     }
 
     fn id_table(&self) -> IdTable {
-        return IdTable::new(self.name.to_string(), Some(DeviceNumber::new(0)));
+        return IdTable::new(self.name.to_string(), None);
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
@@ -291,7 +294,7 @@ impl KObject for Serial8250ISADevices {
     }
 
     fn set_kobj_type(&self, _ktype: Option<&'static dyn KObjType>) {
-        todo!()
+        // 不允许修改
     }
 
     fn name(&self) -> String {
@@ -319,7 +322,7 @@ struct InnerSerial8250ISADevices {
     kset: Option<Arc<KSet>>,
     parent_kobj: Option<Weak<dyn KObject>>,
     /// 当前设备所述的总线
-    bus: Option<Arc<dyn Bus>>,
+    bus: Option<Weak<dyn Bus>>,
     inode: Option<Arc<KernFSInode>>,
     driver: Option<Weak<dyn Driver>>,
     device_state: DeviceState,
@@ -341,7 +344,7 @@ impl InnerSerial8250ISADevices {
 }
 
 /// Serial 8250平台设备的id
-/// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/include/linux/serial_8250.h?fi=PLAT8250_DEV_LEGACY#49
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/serial_8250.h?fi=PLAT8250_DEV_LEGACY#49
 #[derive(Debug)]
 #[repr(i32)]
 enum Serial8250PlatformDeviceID {
@@ -351,7 +354,7 @@ enum Serial8250PlatformDeviceID {
 #[derive(Debug)]
 
 struct InnerSerial8250ISADriver {
-    bus: Option<Arc<dyn Bus>>,
+    bus: Option<Weak<dyn Bus>>,
     kobj_type: Option<&'static dyn KObjType>,
     kset: Option<Arc<KSet>>,
     parent_kobj: Option<Weak<dyn KObject>>,
@@ -486,11 +489,11 @@ impl Driver for Serial8250ISADriver {
         inner.devices.retain(|d| !Arc::ptr_eq(d, device));
     }
 
-    fn bus(&self) -> Option<Arc<dyn Bus>> {
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
         self.inner.read().bus.clone()
     }
 
-    fn set_bus(&self, bus: Option<Arc<dyn Bus>>) {
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
         self.inner.write().bus = bus;
     }
 }

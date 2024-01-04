@@ -3,14 +3,41 @@ use system_error::SystemError;
 
 use crate::{
     driver::base::device::Device,
-    mm::{ucontext::LockedVMA, PhysAddr},
+    mm::{ucontext::LockedVMA, PhysAddr, VirtAddr},
 };
+
+use self::fbmem::{FbDevice, FrameBufferManager};
 
 pub mod fbcon;
 pub mod fbmem;
+pub mod fbsysfs;
+pub mod modedb;
+
+// 帧缓冲区id
+int_like!(FbId, u32);
+
+impl FbId {
+    /// 帧缓冲区id的初始值（无效值）
+    pub const INIT: Self = Self::new(u32::MAX);
+
+    /// 判断是否为无效的帧缓冲区id
+    #[allow(dead_code)]
+    pub const fn is_valid(&self) -> bool {
+        if self.0 == Self::INIT.0 || self.0 >= FrameBufferManager::FB_MAX as u32 {
+            return false;
+        }
+        return true;
+    }
+}
 
 /// 帧缓冲区应该实现的接口
-pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {}
+pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
+    /// 获取帧缓冲区的id
+    fn fb_id(&self) -> FbId;
+
+    /// 设置帧缓冲区的id
+    fn set_fb_id(&self, id: FbId);
+}
 
 /// 帧缓冲区信息
 pub trait FrameBufferInfo {
@@ -18,19 +45,22 @@ pub trait FrameBufferInfo {
     fn screen_size(&self) -> usize;
 
     /// 获取当前的可变帧缓冲信息
-    fn current_fb_var(&self) -> &FbVarScreenInfo;
-
-    /// 获取当前的可变帧缓冲信息（可变引用）
-    fn current_fb_var_mut(&mut self) -> &mut FbVarScreenInfo;
+    fn current_fb_var(&self) -> FbVarScreenInfo;
 
     /// 获取当前的固定帧缓冲信息
-    fn current_fb_fix(&self) -> &FixedScreenInfo;
-
-    /// 获取当前的固定帧缓冲信息（可变引用）
-    fn current_fb_fix_mut(&mut self) -> &mut FixedScreenInfo;
+    fn current_fb_fix(&self) -> FixedScreenInfo;
 
     /// 获取当前的视频模式
     fn video_mode(&self) -> Option<&FbVideoMode>;
+
+    /// 获取当前帧缓冲区对应的`/sys/class/graphics/fb0`或者`/sys/class/graphics/fb1`等的设备结构体
+    fn fb_device(&self) -> Option<Arc<FbDevice>>;
+
+    /// 设置当前帧缓冲区对应的`/sys/class/graphics/fb0`或者`/sys/class/graphics/fb1`等的设备结构体
+    fn set_fb_device(&self, device: Option<Arc<FbDevice>>);
+
+    /// 获取帧缓冲区的状态
+    fn state(&self) -> FbState;
 }
 
 /// 帧缓冲区操作
@@ -92,6 +122,13 @@ pub trait FrameBufferOps {
 
     /// 卸载与该帧缓冲区相关的所有资源
     fn fb_destroy(&self);
+}
+
+/// 帧缓冲区的状态
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum FbState {
+    Running = 0,
+    Suspended = 1,
 }
 
 /// 屏幕黑屏模式。
@@ -221,10 +258,10 @@ pub struct FbVarScreenInfo {
     pub pixel_format: FbPixelFormat,
     /// 激活标志（参见FB_ACTIVATE_*）
     pub activate: FbActivateFlags,
-    /// 帧缓冲区的高度（像素）
-    pub height: u32,
-    /// 帧缓冲区的宽度（像素）
-    pub width: u32,
+    /// 帧缓冲区的高度（像素） None表示未知
+    pub height: Option<u32>,
+    /// 帧缓冲区的宽度（像素） None表示未知
+    pub width: Option<u32>,
     /// 像素时钟（皮秒）
     pub pixclock: u32,
     /// 左边距
@@ -249,6 +286,43 @@ pub struct FbVarScreenInfo {
     pub colorspace: V4l2Colorspace,
 }
 
+impl Default for FbVarScreenInfo {
+    fn default() -> Self {
+        Self {
+            xres: Default::default(),
+            yres: Default::default(),
+            xres_virtual: Default::default(),
+            yres_virtual: Default::default(),
+            xoffset: Default::default(),
+            yoffset: Default::default(),
+            bits_per_pixel: Default::default(),
+            color_mode: Default::default(),
+            red: Default::default(),
+            green: Default::default(),
+            blue: Default::default(),
+            transp: Default::default(),
+            pixel_format: Default::default(),
+            activate: Default::default(),
+            height: None,
+            width: None,
+            pixclock: Default::default(),
+            left_margin: Default::default(),
+            right_margin: Default::default(),
+            upper_margin: Default::default(),
+            lower_margin: Default::default(),
+            hsync_len: Default::default(),
+            vsync_len: Default::default(),
+            sync: FbSyncFlags::empty(),
+            vmode: FbVModeFlags::empty(),
+            rotate_angle: Default::default(),
+            colorspace: Default::default(),
+        }
+    }
+}
+
+/// 帧缓冲区的颜色模式
+///
+/// 默认为彩色
 #[allow(dead_code)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum FbColorMode {
@@ -258,6 +332,12 @@ pub enum FbColorMode {
     Color,
     /// FOURCC
     FourCC,
+}
+
+impl Default for FbColorMode {
+    fn default() -> Self {
+        FbColorMode::Color
+    }
 }
 
 /// `FbBitfield` 结构体用于描述颜色字段的位域。
@@ -285,6 +365,16 @@ impl FbBitfield {
             offset,
             length,
             msb_right,
+        }
+    }
+}
+
+impl Default for FbBitfield {
+    fn default() -> Self {
+        Self {
+            offset: Default::default(),
+            length: Default::default(),
+            msb_right: Default::default(),
         }
     }
 }
@@ -317,6 +407,12 @@ bitflags! {
     }
 }
 
+impl Default for FbActivateFlags {
+    fn default() -> Self {
+        FbActivateFlags::FB_ACTIVATE_NOW
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum FbPixelFormat {
@@ -325,6 +421,12 @@ pub enum FbPixelFormat {
     HAM,
     /// order of pixels in each byte is reversed
     Reserved,
+}
+
+impl Default for FbPixelFormat {
+    fn default() -> Self {
+        FbPixelFormat::Standard
+    }
 }
 
 bitflags! {
@@ -415,9 +517,9 @@ pub struct FixedScreenInfo {
     // 字符串，用于标识屏幕，例如 "TT Builtin"
     pub id: [char; 16],
     // 帧缓冲区的起始物理地址
-    pub smem_start: PhysAddr,
+    pub smem_start: Option<PhysAddr>,
     // 帧缓冲区的长度
-    pub smem_len: u32,
+    pub smem_len: usize,
     // 屏幕类型，参考 FB_TYPE_
     pub fb_type: FbType,
     // 用于表示交错平面的小端辅助类型
@@ -432,14 +534,59 @@ pub struct FixedScreenInfo {
     pub ywrapstep: u16,
     // 一行的大小（以字节为单位）
     pub line_length: u32,
-    // 内存映射I/O的起始物理地址
-    pub mmio_start: PhysAddr,
+    // 内存映射I/O端口的起始物理地址
+    pub mmio_start: Option<PhysAddr>,
     // 内存映射I/O的长度
-    pub mmio_len: u32,
+    pub mmio_len: usize,
     // 表示驱动器拥有的特定芯片/卡片类型
-    pub accel: u32,
+    pub accel: FbAccel,
     // 表示支持的特性，参考 FB_CAP_
     pub capabilities: FbCapability,
+}
+
+impl FixedScreenInfo {
+    /// 将字符串转换为长度为16的字符数组（包含结尾的`\0`）
+    ///
+    /// ## 参数
+    ///
+    /// - `name`: 字符串,长度不超过15，超过的部分将被截断
+    ///
+    /// ## 返回
+    ///
+    /// 长度为16的字符数组
+    pub const fn name2id(name: &str) -> [char; 16] {
+        let mut id = [0 as char; 16];
+        let mut i = 0;
+
+        while i < 15 && i < name.len() {
+            id[i] = name.as_bytes()[i] as char;
+            i += 1;
+        }
+
+        id[i] = '\0';
+        return id;
+    }
+}
+
+impl Default for FixedScreenInfo {
+    fn default() -> Self {
+        Self {
+            id: Default::default(),
+            smem_start: None,
+            smem_len: Default::default(),
+            fb_type: FbType::PackedPixels,
+            type_aux: Default::default(),
+            visual: FbVisual::Mono10,
+            xpanstep: Default::default(),
+            ypanstep: Default::default(),
+            ywrapstep: Default::default(),
+            line_length: Default::default(),
+            mmio_start: None,
+            mmio_len: Default::default(),
+            accel: Default::default(),
+            capabilities: Default::default(),
+        }
+    }
 }
 
 /// 帧缓冲类型
@@ -488,6 +635,12 @@ pub enum FbCapability {
     FourCC,
 }
 
+impl Default for FbCapability {
+    fn default() -> Self {
+        FbCapability::Default
+    }
+}
+
 /// 视频模式
 #[allow(dead_code)]
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -520,4 +673,180 @@ pub struct FbVideoMode {
     pub vmode: FbVModeFlags,
     /// 标志
     pub flag: u32,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum FbAccel {
+    /// 没有硬件加速器
+    None,
+
+    AtariBlitter = 1,
+    AmigaBlitter = 2,
+    S3Trio64 = 3,
+    NCR77C32BLT = 4,
+    S3Virge = 5,
+    AtiMach64GX = 6,
+    DECTGA = 7,
+    AtiMach64CT = 8,
+    AtiMach64VT = 9,
+    AtiMach64GT = 10,
+    SunCreator = 11,
+    SunCGSix = 12,
+    SunLeo = 13,
+    IMSTwinTurbo = 14,
+    Acc3DLabsPermedia2 = 15,
+    MatroxMGA2064W = 16,
+    MatroxMGA1064SG = 17,
+    MatroxMGA2164W = 18,
+    MatroxMGA2164WAGP = 19,
+    MatroxMGAG400 = 20,
+    NV3 = 21,
+    NV4 = 22,
+    NV5 = 23,
+    NV6 = 24,
+    XGIVolariV = 25,
+    XGIVolariZ = 26,
+    Omap1610 = 27,
+    TridentTGUI = 28,
+    Trident3DImage = 29,
+    TridentBlade3D = 30,
+    TridentBladeXP = 31,
+    CirrusAlpine = 32,
+    NeoMagicNM2070 = 90,
+    NeoMagicNM2090 = 91,
+    NeoMagicNM2093 = 92,
+    NeoMagicNM2097 = 93,
+    NeoMagicNM2160 = 94,
+    NeoMagicNM2200 = 95,
+    NeoMagicNM2230 = 96,
+    NeoMagicNM2360 = 97,
+    NeoMagicNM2380 = 98,
+    PXA3XX = 99,
+
+    Savage4 = 0x80,
+    Savage3D = 0x81,
+    Savage3DMV = 0x82,
+    Savage2000 = 0x83,
+    SavageMXMV = 0x84,
+    SavageMX = 0x85,
+    SavageIXMV = 0x86,
+    SavageIX = 0x87,
+    ProSavagePM = 0x88,
+    ProSavageKM = 0x89,
+    S3Twister = 0x8a,
+    S3TwisterK = 0x8b,
+    SuperSavage = 0x8c,
+    ProSavageDDR = 0x8d,
+    ProSavageDDRK = 0x8e,
+    // Add other accelerators here
+}
+
+impl Default for FbAccel {
+    fn default() -> Self {
+        FbAccel::None
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct BootTimeScreenInfo {
+    pub origin_x: u8,
+    pub origin_y: u8,
+    /// text mode时，每行的字符数
+    pub origin_video_cols: u8,
+    /// text mode时，行数
+    pub origin_video_lines: u8,
+    /// 标记屏幕是否为VGA类型
+    pub is_vga: bool,
+    /// video mode type
+    pub video_type: BootTimeVideoType,
+
+    // 以下字段用于线性帧缓冲区
+    /// 线性帧缓冲区的起始物理地址
+    pub lfb_base: PhysAddr,
+    /// 线性帧缓冲区在初始化阶段被映射到的起始虚拟地址
+    ///
+    /// 这个值可能会被设置2次：
+    ///
+    /// - 内存管理初始化之前，early init阶段，临时映射
+    /// - 内存管理初始化完毕，重新映射时被设置
+    pub lfb_virt_base: Option<VirtAddr>,
+    /// 线性帧缓冲区的长度
+    pub lfb_size: usize,
+    /// 线性帧缓冲区的宽度（像素）
+    pub lfb_width: u32,
+    /// 线性帧缓冲区的高度（像素）
+    pub lfb_height: u32,
+    /// 线性帧缓冲区的深度（位数）
+    pub lfb_depth: u8,
+    /// 红色位域的大小
+    pub red_size: u8,
+    /// 红色位域的偏移量（左移位数）
+    pub red_pos: u8,
+    /// 绿色位域的大小
+    pub green_size: u8,
+    /// 绿色位域的偏移量（左移位数）
+    pub green_pos: u8,
+    /// 蓝色位域的大小
+    pub blue_size: u8,
+    /// 蓝色位域的偏移量（左移位数）
+    pub blue_pos: u8,
+}
+
+impl BootTimeScreenInfo {
+    pub const DEFAULT: Self = Self {
+        origin_x: 0,
+        origin_y: 0,
+        is_vga: false,
+        lfb_base: PhysAddr::new(0),
+        lfb_size: 0,
+        lfb_width: 0,
+        lfb_height: 0,
+        red_size: 0,
+        red_pos: 0,
+        green_size: 0,
+        green_pos: 0,
+        blue_size: 0,
+        blue_pos: 0,
+        video_type: BootTimeVideoType::UnDefined,
+        origin_video_cols: 0,
+        origin_video_lines: 0,
+        lfb_virt_base: None,
+        lfb_depth: 0,
+    };
+}
+
+/// Video types for different display hardware
+#[allow(dead_code)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum BootTimeVideoType {
+    UnDefined,
+    /// Monochrome Text Display
+    Mda,
+    /// CGA Display
+    Cga,
+    /// EGA/VGA in Monochrome Mode
+    EgaM,
+    /// EGA in Color Mode
+    EgaC,
+    /// VGA+ in Color Mode
+    VgaC,
+    /// VESA VGA in graphic mode
+    Vlfb,
+    /// ACER PICA-61 local S3 video
+    PicaS3,
+    /// MIPS Magnum 4000 G364 video
+    MipsG364,
+    /// Various SGI graphics hardware
+    Sgi,
+    /// DEC TGA
+    TgaC,
+    /// Sun frame buffer
+    Sun,
+    /// Sun PCI based frame buffer
+    SunPci,
+    /// PowerMacintosh frame buffer
+    Pmac,
+    /// EFI graphic mode
+    Efi,
 }

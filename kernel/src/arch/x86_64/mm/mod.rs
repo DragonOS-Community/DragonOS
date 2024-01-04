@@ -18,6 +18,7 @@ use crate::libs::printk::PrintkWriter;
 use crate::libs::spinlock::SpinLock;
 
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
+use crate::mm::memblock::mem_block_manager;
 use crate::mm::mmio_buddy::mmio_init;
 use crate::{
     arch::MMArch,
@@ -26,8 +27,8 @@ use crate::{
 
 use crate::mm::kernel_mapper::KernelMapper;
 use crate::mm::page::{PageEntry, PageFlags};
-use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, PhysMemoryArea, VirtAddr};
-use crate::{kdebug, kinfo};
+use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr};
+use crate::{kdebug, kinfo, kwarn};
 use system_error::SystemError;
 
 use core::arch::asm;
@@ -42,12 +43,6 @@ use super::kvm::vmx::vmx_asm_wrapper::vmx_vmread;
 
 pub type PageMapper =
     crate::mm::page::PageMapper<crate::arch::x86_64::mm::X86_64MMArch, LockedFrameAllocator>;
-
-/// @brief 用于存储物理内存区域的数组
-static mut PHYS_MEMORY_AREAS: [PhysMemoryArea; 512] = [PhysMemoryArea {
-    base: PhysAddr::new(0),
-    size: 0,
-}; 512];
 
 /// 初始的CR3寄存器的值，用于内存管理初始化时，创建的第一个内核页表的位置
 static mut INITIAL_CR3_VALUE: PhysAddr = PhysAddr::new(0);
@@ -121,7 +116,7 @@ impl MemoryManagementArch for X86_64MMArch {
     const USER_STACK_START: VirtAddr = VirtAddr::new(0x6ffff0a00000);
 
     /// @brief 获取物理内存区域
-    unsafe fn init() -> &'static [crate::mm::PhysMemoryArea] {
+    unsafe fn init() {
         extern "C" {
             fn _text();
             fn _etext();
@@ -147,12 +142,9 @@ impl MemoryManagementArch for X86_64MMArch {
         }
 
         // 初始化物理内存区域(从multiboot2中获取)
-        let areas_count =
-            Self::init_memory_area_from_multiboot2().expect("init memory area failed");
+        Self::init_memory_area_from_multiboot2().expect("init memory area failed");
 
         send_to_default_serial8250_port("x86 64 init end\n\0".as_bytes());
-
-        return &PHYS_MEMORY_AREAS[0..areas_count];
     }
 
     /// @brief 刷新TLB中，关于指定虚拟地址的条目
@@ -336,9 +328,24 @@ impl X86_64MMArch {
                 if mb2_mem_info[i].len == 0 {
                     continue;
                 }
+
                 total_mem_size += mb2_mem_info[i].len as usize;
-                PHYS_MEMORY_AREAS[areas_count].base = PhysAddr::new(mb2_mem_info[i].addr as usize);
-                PHYS_MEMORY_AREAS[areas_count].size = mb2_mem_info[i].len as usize;
+                // PHYS_MEMORY_AREAS[areas_count].base = PhysAddr::new(mb2_mem_info[i].addr as usize);
+                // PHYS_MEMORY_AREAS[areas_count].size = mb2_mem_info[i].len as usize;
+
+                mem_block_manager()
+                    .add_block(
+                        PhysAddr::new(mb2_mem_info[i].addr as usize),
+                        mb2_mem_info[i].len as usize,
+                    )
+                    .unwrap_or_else(|e| {
+                        kwarn!(
+                            "Failed to add memory block: base={:#x}, size={:#x}, error={:?}",
+                            mb2_mem_info[i].addr,
+                            mb2_mem_info[i].len,
+                            e
+                        );
+                    });
                 areas_count += 1;
             }
         }
@@ -412,9 +419,7 @@ unsafe fn allocator_init() {
     let phy_offset =
         unsafe { MMArch::virt_2_phys(VirtAddr::new(page_align_up(virt_offset))) }.unwrap();
 
-    kdebug!("PhysArea[0..10] = {:?}", &PHYS_MEMORY_AREAS[0..10]);
-    let mut bump_allocator =
-        BumpAllocator::<X86_64MMArch>::new(&PHYS_MEMORY_AREAS, phy_offset.data());
+    let mut bump_allocator = BumpAllocator::<X86_64MMArch>::new(phy_offset.data());
     kdebug!(
         "BumpAllocator created, offset={:?}",
         bump_allocator.offset()
@@ -450,7 +455,9 @@ unsafe fn allocator_init() {
         }
         kdebug!("Successfully emptied page table");
 
-        for area in PHYS_MEMORY_AREAS.iter() {
+        let total_num = mem_block_manager().total_initial_memory_regions();
+        for i in 0..total_num {
+            let area = mem_block_manager().get_initial_memory_region(i).unwrap();
             // kdebug!("area: base={:?}, size={:#x}, end={:?}", area.base, area.size, area.base + area.size);
             for i in 0..((area.size + MMArch::PAGE_SIZE - 1) / MMArch::PAGE_SIZE) {
                 let paddr = area.base.add(i * MMArch::PAGE_SIZE);

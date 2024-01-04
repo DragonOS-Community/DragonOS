@@ -31,8 +31,8 @@ sqlite3.o: $(SQLITE3_DIR)/sqlite3.c
 	$(CC) $(CFLAGS) -c $(SQLITE3_DIR)/sqlite3.c -o sqlite3.o
 
 __download_sqlite3:
-	@echo "Download sqlite3 from https://mirrors.ringotek.cn/pub/third_party/sqlite/$(SQLITE_FILENAME).zip"
-	@wget https://mirrors.ringotek.cn/pub/third_party/sqlite/$(SQLITE_FILENAME).zip || (@echo "Download sqlite3 failed" && rm $(SQLITE_FILENAME).zip && exit 1)
+	@echo "Download sqlite3 from https://mirrors.dragonos.org.cn/pub/third_party/sqlite/$(SQLITE_FILENAME).zip"
+	@wget https://mirrors.dragonos.org.cn/pub/third_party/sqlite/$(SQLITE_FILENAME).zip || (@echo "Download sqlite3 failed" && rm $(SQLITE_FILENAME).zip && exit 1)
 	@unzip -o $(SQLITE_FILENAME).zip || (@echo "Unzip sqlite3 failed" && exit 1)
 	@rm $(SQLITE_FILENAME).zip || (@echo "Remove $(SQLITE_FILENAME).zip failed" && exit 1)
 

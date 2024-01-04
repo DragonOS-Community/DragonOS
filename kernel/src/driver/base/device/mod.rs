@@ -24,6 +24,7 @@ use system_error::SystemError;
 
 use self::{
     bus::{bus_add_device, bus_probe_device, Bus},
+    device_number::{DeviceNumber, Major},
     driver::Driver,
 };
 
@@ -36,6 +37,7 @@ use super::{
 
 pub mod bus;
 pub mod dd;
+pub mod device_number;
 pub mod driver;
 pub mod init;
 
@@ -143,14 +145,16 @@ pub trait Device: KObject {
     }
 
     /// 获取当前设备所属的总线
-    fn bus(&self) -> Option<Arc<dyn Bus>> {
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
         return None;
     }
 
     /// 设置当前设备所属的总线
     ///
-    /// （一定要传入Arc，因为bus的subsysprivate里面存储的是Device的Weak指针）
-    fn set_bus(&self, bus: Option<Arc<dyn Bus>>);
+    /// （一定要传入Arc，因为bus的subsysprivate里面存储的是Device的Arc指针）
+    ///
+    /// 注意，如果实现了当前方法，那么必须实现`bus()`方法
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>);
 
     /// 获取当前设备所属的类
     fn class(&self) -> Option<Arc<dyn Class>> {
@@ -158,6 +162,8 @@ pub trait Device: KObject {
     }
 
     /// 设置当前设备所属的类
+    ///
+    /// 注意，如果实现了当前方法，那么必须实现`class()`方法
     fn set_class(&self, class: Option<Arc<dyn Class>>);
 
     /// 返回已经与当前设备匹配好的驱动程序
@@ -221,62 +227,6 @@ impl DevicePrivateData {
     }
 }
 
-int_like!(DeviceNumber, usize);
-
-impl Default for DeviceNumber {
-    fn default() -> Self {
-        DeviceNumber(0)
-    }
-}
-
-impl From<usize> for DeviceNumber {
-    fn from(dev_t: usize) -> Self {
-        DeviceNumber(dev_t)
-    }
-}
-
-impl Into<usize> for DeviceNumber {
-    fn into(self) -> usize {
-        self.0
-    }
-}
-
-impl core::hash::Hash for DeviceNumber {
-    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-
-impl DeviceNumber {
-    /// @brief: 获取主设备号
-    /// @parameter: none
-    /// @return: 主设备号
-    pub fn major(&self) -> usize {
-        (self.0 >> 8) & 0xffffff
-    }
-
-    /// @brief: 获取次设备号
-    /// @parameter: none
-    /// @return: 次设备号
-    pub fn minor(&self) -> usize {
-        self.0 & 0xff
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub fn from_major_minor(major: usize, minor: usize) -> usize {
-        ((major & 0xffffff) << 8) | (minor & 0xff)
-    }
-}
-
-/// @brief: 根据主次设备号创建设备号实例
-/// @parameter: major: 主设备号
-///             minor: 次设备号
-/// @return: 设备号实例
-pub fn mkdev(major: usize, minor: usize) -> DeviceNumber {
-    DeviceNumber(((major & 0xfff) << 20) | (minor & 0xfffff))
-}
-
 /// @brief: 设备类型
 #[allow(dead_code)]
 #[derive(Debug, Eq, PartialEq)]
@@ -317,12 +267,13 @@ impl IdTable {
         if self.id.is_none() {
             return self.basename.clone();
         } else {
-            return format!("{}:{}", self.basename, self.id.unwrap().data());
+            let id = self.id.unwrap();
+            return format!("{}:{}", id.major().data(), id.minor());
         }
     }
 
     pub fn device_number(&self) -> DeviceNumber {
-        return self.id.unwrap_or(DeviceNumber::new(0));
+        return self.id.unwrap_or(DeviceNumber::default());
     }
 }
 
@@ -396,7 +347,7 @@ impl From<DeviceState> for u32 {
 pub struct DeviceKObjType;
 
 impl KObjType for DeviceKObjType {
-    // https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/core.c#2307
+    // https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c#2307
     fn release(&self, kobj: Arc<dyn KObject>) {
         let dev = kobj.cast::<dyn Device>().unwrap();
         /*
@@ -460,14 +411,8 @@ impl DeviceManager {
     }
 
     pub fn register(&self, device: Arc<dyn Device>) -> Result<(), SystemError> {
-        self.device_initialize(&device);
+        self.device_default_initialize(&device);
         return self.add_device(device);
-    }
-
-    /// device_initialize - init device structure.
-    pub fn device_initialize(&self, device: &Arc<dyn Device>) {
-        device.set_kset(Some(sys_devices_kset()));
-        device.set_kobj_type(Some(&DeviceKObjType));
     }
 
     /// @brief: 添加设备
@@ -475,10 +420,10 @@ impl DeviceManager {
     /// @parameter dev: 设备实例
     /// @return: None
     ///
-    /// https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/core.c#3398
+    /// https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c#3398
     ///
     /// todo: 完善错误处理逻辑：如果添加失败，需要将之前添加的内容全部回滚
-    #[inline]
+    #[inline(never)]
     #[allow(dead_code)]
     pub fn add_device(&self, device: Arc<dyn Device>) -> Result<(), SystemError> {
         // 在这里处理与parent相关的逻辑
@@ -514,14 +459,14 @@ impl DeviceManager {
 
         bus_add_device(&device)?;
 
-        if device.id_table().device_number().major() != 0 {
+        if device.id_table().device_number().major() != Major::UNNAMED_MAJOR {
             self.create_file(&device, &DeviceAttrDev)?;
 
             self.create_sys_dev_entry(&device)?;
         }
 
         // 通知客户端有关设备添加的信息。此调用必须在 dpm_sysfs_add() 之后且在 kobject_uevent() 之前执行。
-        if let Some(bus) = device.bus() {
+        if let Some(bus) = device.bus().map(|bus| bus.upgrade()).flatten() {
             bus.subsystem().bus_notifier().call_chain(
                 bus::BusNotifyEvent::AddDevice,
                 Some(&device),
@@ -585,7 +530,7 @@ impl DeviceManager {
 
         // subsystems can specify a default root directory for their devices
         if current_parent.is_none() {
-            if let Some(bus) = device.bus() {
+            if let Some(bus) = device.bus().map(|bus| bus.upgrade()).flatten() {
                 if let Some(root) = bus.root_device().map(|x| x.upgrade()).flatten() {
                     return Ok(Some(root as Arc<dyn KObject>));
                 }
@@ -602,14 +547,17 @@ impl DeviceManager {
     /// @brief: 卸载设备
     /// @parameter id_table: 总线标识符，用于唯一标识该设备
     /// @return: None
+    ///
+    /// ## 注意
+    /// 该函数已废弃，不再使用
     #[inline]
     #[allow(dead_code)]
     pub fn remove_device(&self, _id_table: &IdTable) {
         todo!()
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#542
-    fn remove(&self, _dev: &Arc<dyn Device>) {
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#542
+    pub fn remove(&self, _dev: &Arc<dyn Device>) {
         todo!("DeviceManager::remove")
     }
 
@@ -627,6 +575,7 @@ impl DeviceManager {
         software_node_notify(dev);
     }
 
+    // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c#3224
     fn add_class_symlinks(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
         let class = dev.class();
         if class.is_none() {
@@ -634,6 +583,10 @@ impl DeviceManager {
         }
 
         // 定义错误处理函数，用于在添加符号链接失败时，移除已经添加的符号链接
+
+        let err_remove_device = |dev_kobj: &Arc<dyn KObject>| {
+            sysfs_instance().remove_link(dev_kobj, "device".to_string());
+        };
 
         let err_remove_subsystem = |dev_kobj: &Arc<dyn KObject>| {
             sysfs_instance().remove_link(dev_kobj, "subsystem".to_string());
@@ -645,11 +598,20 @@ impl DeviceManager {
         sysfs_instance().create_link(Some(&dev_kobj), &subsys_kobj, "subsystem".to_string())?;
 
         // todo: 这里需要处理class的parent逻辑, 添加device链接
-        // https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c#3245
+        if let Some(parent) = dev.parent().map(|x| x.upgrade()).flatten() {
+            let parent_kobj = parent.clone() as Arc<dyn KObject>;
+            sysfs_instance()
+                .create_link(Some(&dev_kobj), &&parent_kobj, "device".to_string())
+                .map_err(|e| {
+                    err_remove_subsystem(&dev_kobj);
+                    e
+                })?;
+        }
 
         sysfs_instance()
             .create_link(Some(&subsys_kobj), &dev_kobj, dev.name())
             .map_err(|e| {
+                err_remove_device(&dev_kobj);
                 err_remove_subsystem(&dev_kobj);
                 e
             })?;
@@ -776,7 +738,7 @@ impl DeviceManager {
         let target_kobj = self.device_to_dev_kobj(dev);
         let name = dev.id_table().name();
         let current_kobj = dev.clone() as Arc<dyn KObject>;
-        return sysfs_instance().create_link(Some(&current_kobj), &target_kobj, name);
+        return sysfs_instance().create_link(Some(&target_kobj), &current_kobj, name);
     }
 
     /// Delete symlink for device in `/sys/dev` or `/sys/class/<class_name>`
@@ -800,20 +762,21 @@ impl DeviceManager {
         return kobj;
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/core.c?fi=device_links_force_bind#1226
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c?fi=device_links_force_bind#1226
     pub fn device_links_force_bind(&self, _dev: &Arc<dyn Device>) {
         todo!("device_links_force_bind")
     }
 
     /// 把device对象的一些结构进行默认初始化
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/core.c?fi=device_initialize#2976
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c?fi=device_initialize#2976
     pub fn device_default_initialize(&self, dev: &Arc<dyn Device>) {
         dev.set_kset(Some(sys_devices_kset()));
+        dev.set_kobj_type(Some(&DeviceKObjType));
         return;
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?r=&mo=29885&fi=1100#1100
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?r=&mo=29885&fi=1100#1100
     pub fn device_driver_attach(
         &self,
         _driver: &Arc<dyn Driver>,
@@ -822,7 +785,7 @@ impl DeviceManager {
         todo!("device_driver_attach")
     }
 
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c?r=&mo=35401&fi=1313#1313
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?r=&mo=35401&fi=1313#1313
     pub fn device_driver_detach(&self, _dev: &Arc<dyn Device>) {
         todo!("device_driver_detach")
     }
@@ -874,7 +837,11 @@ impl Attribute for DeviceAttrDev {
         })?;
 
         let device_number = dev.id_table().device_number();
-        let s = format!("{}:{}\n", device_number.major(), device_number.minor());
+        let s = format!(
+            "{}:{}\n",
+            device_number.major().data(),
+            device_number.minor()
+        );
 
         return sysfs_emit_str(buf, &s);
     }

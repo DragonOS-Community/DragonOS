@@ -1156,7 +1156,7 @@ impl Socket for TcpSocket {
 
 /// @brief 地址族的枚举
 ///
-/// 参考：https://opengrok.ringotek.cn/xref/linux-5.19.10/include/linux/socket.h#180
+/// 参考：https://code.dragonos.org.cn/xref/linux-5.19.10/include/linux/socket.h#180
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 pub enum AddressFamily {
     /// AF_UNSPEC 表示地址族未指定

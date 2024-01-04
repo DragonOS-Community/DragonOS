@@ -103,7 +103,7 @@ pub fn kernel_wait4(
     return Ok(r);
 }
 
-/// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/kernel/exit.c#1573
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/exit.c#1573
 fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
     let mut retval: Result<usize, SystemError>;
     // todo: 在signal struct里面增加等待队列，并在这里初始化子进程退出的回调，使得子进程退出时，能唤醒当前进程。

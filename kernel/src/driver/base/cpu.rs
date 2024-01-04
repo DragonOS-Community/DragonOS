@@ -18,7 +18,7 @@ use super::{
     device::{
         bus::{subsystem_manager, Bus},
         driver::Driver,
-        Device, DeviceNumber, DeviceType, IdTable,
+        Device, DeviceType, IdTable,
     },
     kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
     kset::KSet,
@@ -36,7 +36,7 @@ pub struct CpuDeviceManager;
 impl CpuDeviceManager {
     /// 初始化设备驱动模型的CPU子系统
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/cpu.c?fi=get_cpu_device#622
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/cpu.c?fi=get_cpu_device#622
     pub fn init(&self) -> Result<(), SystemError> {
         let cpu_subsys = CpuSubSystem::new();
         let root_device = CpuSubSystemFakeRootDevice::new();
@@ -53,7 +53,7 @@ impl CpuDeviceManager {
 
 /// cpu子系统
 ///
-/// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/cpu.c?fi=get_cpu_device#128
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/cpu.c?fi=get_cpu_device#128
 #[derive(Debug)]
 struct CpuSubSystem {
     subsys_private: SubSysPrivate,
@@ -124,7 +124,7 @@ impl CpuSubSystemFakeRootDevice {
 #[derive(Debug)]
 struct InnerCpuSubSystemFakeRootDevice {
     parent_kobj: Option<Weak<dyn KObject>>,
-    bus: Option<Arc<dyn Bus>>,
+    bus: Option<Weak<dyn Bus>>,
     kset: Option<Arc<KSet>>,
     name: String,
     kern_inode: Option<Arc<KernFSInode>>,
@@ -150,11 +150,15 @@ impl Device for CpuSubSystemFakeRootDevice {
     }
 
     fn id_table(&self) -> IdTable {
-        IdTable::new("cpu".to_string(), Some(DeviceNumber::new(0)))
+        IdTable::new("cpu".to_string(), None)
     }
 
-    fn set_bus(&self, bus: Option<Arc<dyn Bus>>) {
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
         self.inner.write().bus = bus;
+    }
+
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
+        self.inner.read().bus.clone()
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {

@@ -1,5 +1,5 @@
+use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::vfs::file::FileMode;
-use crate::filesystem::vfs::make_rawdev;
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{
     core::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
@@ -49,7 +49,7 @@ impl LockedZeroInode {
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: make_rawdev(1, 3), // 这里用来作为device number
+                raw_dev: DeviceNumber::default(), // 这里用来作为device number
             },
         };
 

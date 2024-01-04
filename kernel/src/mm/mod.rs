@@ -21,6 +21,7 @@ use self::{
 pub mod allocator;
 pub mod c_adapter;
 pub mod kernel_mapper;
+pub mod memblock;
 pub mod mmio_buddy;
 pub mod no_init;
 pub mod page;
@@ -331,6 +332,11 @@ pub struct PhysMemoryArea {
 }
 
 impl PhysMemoryArea {
+    pub const DEFAULT: Self = Self {
+        base: PhysAddr::new(0),
+        size: 0,
+    };
+
     pub fn new(base: PhysAddr, size: usize) -> Self {
         Self { base, size }
     }
@@ -350,10 +356,7 @@ impl PhysMemoryArea {
 
 impl Default for PhysMemoryArea {
     fn default() -> Self {
-        Self {
-            base: PhysAddr::new(0),
-            size: 0,
-        }
+        return Self::DEFAULT;
     }
 }
 
@@ -427,8 +430,8 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     const USER_STACK_START: VirtAddr;
 
     /// @brief 用于初始化内存管理模块与架构相关的信息。
-    /// 该函数应调用其他模块的接口，生成内存区域结构体，提供给BumpAllocator使用
-    unsafe fn init() -> &'static [PhysMemoryArea];
+    /// 该函数应调用其他模块的接口，把可用内存区域添加到memblock，提供给BumpAllocator使用
+    unsafe fn init();
 
     /// @brief 读取指定虚拟地址的值，并假设它是类型T的指针
     #[inline(always)]

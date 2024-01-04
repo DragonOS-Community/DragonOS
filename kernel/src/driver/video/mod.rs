@@ -1,16 +1,12 @@
-use core::{
-    ffi::{c_uint, c_void},
-    mem::MaybeUninit,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     arch::MMArch,
     driver::tty::serial::serial8250::send_to_default_serial8250_port,
     include::bindings::bindings::{
-        multiboot2_get_Framebuffer_info, multiboot2_iter, multiboot_tag_framebuffer_info_t,
         FRAME_BUFFER_MAPPING_OFFSET, SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE,
     },
+    init::boot_params,
     kinfo,
     libs::{
         align::page_align_up,
@@ -19,8 +15,8 @@ use crate::{
         spinlock::SpinLock,
     },
     mm::{
-        allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper,
-        no_init::pseudo_map_phys, page::PageFlags, MemoryManagementArch, PhysAddr, VirtAddr,
+        allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper, page::PageFlags,
+        MemoryManagementArch, VirtAddr,
     },
     time::timer::{Timer, TimerFunction},
 };
@@ -42,7 +38,6 @@ pub fn video_refresh_manager() -> &'static VideoRefreshManager {
 ///管理显示刷新变量的结构体
 pub struct VideoRefreshManager {
     device_buffer: RwLock<ScmBufferInfo>,
-    fb_info: multiboot_tag_framebuffer_info_t,
     refresh_target: RwLock<Option<Arc<SpinLock<Box<[u32]>>>>>,
     running: AtomicBool,
 }
@@ -94,16 +89,17 @@ impl VideoRefreshManager {
         let buf_vaddr = VirtAddr::new(
             SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE as usize + FRAME_BUFFER_MAPPING_OFFSET as usize,
         );
+        boot_params().write_irqsave().screen_info.lfb_virt_base = Some(buf_vaddr);
 
-        let mut frame_buffer_info_graud = self.device_buffer.write();
-        if let ScmBuffer::DeviceBuffer(vaddr) = &mut (frame_buffer_info_graud).buf {
+        let mut frame_buffer_info_guard = self.device_buffer.write();
+        if let ScmBuffer::DeviceBuffer(vaddr) = &mut (frame_buffer_info_guard).buf {
             *vaddr = buf_vaddr;
         }
 
         // 地址映射
-        let mut paddr = PhysAddr::new(self.fb_info.framebuffer_addr as usize);
+        let mut paddr = boot_params().read().screen_info.lfb_base;
         let count = PageFrameCount::new(
-            page_align_up(frame_buffer_info_graud.buf_size()) / MMArch::PAGE_SIZE,
+            page_align_up(frame_buffer_info_guard.buf_size()) / MMArch::PAGE_SIZE,
         );
         let page_flags: PageFlags<MMArch> = PageFlags::new().set_execute(true).set_write(true);
 
@@ -178,68 +174,48 @@ impl VideoRefreshManager {
     }
 
     /// 此函数用于初始化显示驱动，为后续的图形输出做好准备。
-    #[cfg(not(target_arch = "riscv64"))]
+    #[cfg(target_arch = "x86_64")]
     pub unsafe fn video_init() -> Result<(), SystemError> {
-        static INIT: AtomicBool = AtomicBool::new(false);
-
-        if INIT
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            panic!("Try to init video twice!");
-        }
-
-        let mut _reserved: u32 = 0;
-
-        let mut fb_info: MaybeUninit<multiboot_tag_framebuffer_info_t> = MaybeUninit::uninit();
-        //从multiboot2中读取帧缓冲区信息至fb_info
-        multiboot2_iter(
-            Some(multiboot2_get_Framebuffer_info),
-            fb_info.as_mut_ptr() as usize as *mut c_void,
-            &mut _reserved as *mut c_uint,
-        );
-        fb_info.assume_init();
-        let fb_info: multiboot_tag_framebuffer_info_t = core::mem::transmute(fb_info);
-
-        let width = fb_info.framebuffer_width;
-        let height = fb_info.framebuffer_height;
-
-        //初始化帧缓冲区信息结构体
-        let (bit_depth, flags) = if fb_info.framebuffer_type == 2 {
-            //当type=2时,width与height用字符数表示,故depth=8
-
-            (8u32, ScmBufferFlag::SCM_BF_TEXT | ScmBufferFlag::SCM_BF_FB)
-        } else {
-            //否则为图像模式,depth应参照帧缓冲区信息里面的每个像素的位数
-            (
-                fb_info.framebuffer_bpp as u32,
-                ScmBufferFlag::SCM_BF_PIXEL | ScmBufferFlag::SCM_BF_FB,
-            )
+        use crate::{
+            arch::driver::video::arch_video_early_init,
+            driver::video::fbdev::base::BootTimeVideoType,
         };
 
-        let buf_vaddr = VirtAddr::new(0xffff800003200000);
-        let device_buffer = ScmBufferInfo::new_device_buffer(
-            width,
-            height,
-            width * height * ((bit_depth + 7) / 8),
-            bit_depth,
-            flags,
-            buf_vaddr,
-        )
-        .unwrap();
+        arch_video_early_init()?;
 
-        let init_text = "Video driver to map.\n\0";
-        send_to_default_serial8250_port(init_text.as_bytes());
+        let boot_params_guard = boot_params().read();
+        let screen_info = &boot_params_guard.screen_info;
+        let buf_vaddr = screen_info.lfb_virt_base.unwrap();
 
-        //地址映射
-        let paddr = PhysAddr::new(fb_info.framebuffer_addr as usize);
-        let count = PageFrameCount::new(
-            page_align_up(device_buffer.buf_size() as usize) / MMArch::PAGE_SIZE,
-        );
-        pseudo_map_phys(buf_vaddr, paddr, count);
+        let buf_flag: ScmBufferFlag;
+        let device_buffer: ScmBufferInfo;
+
+        if screen_info.video_type == BootTimeVideoType::Mda {
+            buf_flag = ScmBufferFlag::SCM_BF_TEXT | ScmBufferFlag::SCM_BF_FB;
+            device_buffer = ScmBufferInfo::new_device_buffer(
+                screen_info.origin_video_cols.into(),
+                screen_info.origin_video_lines.into(),
+                screen_info.lfb_size as u32,
+                screen_info.lfb_depth.into(),
+                buf_flag,
+                buf_vaddr,
+            )
+            .unwrap();
+        } else {
+            // 图形模式
+            buf_flag = ScmBufferFlag::SCM_BF_PIXEL | ScmBufferFlag::SCM_BF_FB;
+            device_buffer = ScmBufferInfo::new_device_buffer(
+                screen_info.lfb_width,
+                screen_info.lfb_height,
+                screen_info.lfb_size as u32,
+                screen_info.lfb_depth.into(),
+                buf_flag,
+                buf_vaddr,
+            )
+            .unwrap();
+        }
 
         let result = Self {
-            fb_info,
             device_buffer: RwLock::new(device_buffer),
             refresh_target: RwLock::new(None),
             running: AtomicBool::new(false),

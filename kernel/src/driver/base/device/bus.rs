@@ -99,7 +99,7 @@ impl From<BusState> for DeviceState {
 /// 总线子系统的trait，所有总线都应实现该trait
 ///
 /// 请注意，这个trait是用于实现总线子系统的，而不是总线驱动/总线设备。
-/// https://opengrok.ringotek.cn/xref/linux-6.1.9/include/linux/device/bus.h#84
+/// https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/device/bus.h#84
 pub trait Bus: Debug + Send + Sync {
     fn name(&self) -> String;
     /// Used for subsystems to enumerate devices like ("foo%u", dev->id).
@@ -159,11 +159,14 @@ pub trait Bus: Debug + Send + Sync {
     /// - `Ok(true)` - 匹配成功
     /// - `Ok(false)` - 匹配失败
     /// - `Err(_)` - 由于内部错误导致匹配失败
+    /// - `Err(SystemError::ENOSYS)` - 该总线不支持该操作
     fn match_device(
         &self,
-        device: &Arc<dyn Device>,
-        driver: &Arc<dyn Driver>,
-    ) -> Result<bool, SystemError>;
+        _device: &Arc<dyn Device>,
+        _driver: &Arc<dyn Driver>,
+    ) -> Result<bool, SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
 
     fn subsystem(&self) -> &SubSysPrivate;
 
@@ -188,11 +191,8 @@ impl dyn Bus {
         let subsys = self.subsystem();
         let guard = subsys.devices();
         for dev in guard.iter() {
-            let dev = dev.upgrade();
-            if let Some(dev) = dev {
-                if matcher.match_device(&dev, data) {
-                    return Some(dev.clone());
-                }
+            if matcher.match_device(&dev, data) {
+                return Some(dev.clone());
             }
         }
         return None;
@@ -221,11 +221,8 @@ impl dyn Bus {
         let subsys = self.subsystem();
         let guard = subsys.drivers();
         for drv in guard.iter() {
-            let drv = drv.upgrade();
-            if let Some(drv) = drv {
-                if matcher.match_driver(&drv, data) {
-                    return Some(drv.clone());
-                }
+            if matcher.match_driver(&drv, data) {
+                return Some(drv.clone());
             }
         }
         return None;
@@ -259,13 +256,13 @@ impl BusManager {
     /// - 在bus和设备文件夹下，创建软链接
     /// - 把设备添加到它的总线的设备列表中
     ///
-    /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_add_device#441
+    /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_add_device#441
     ///
     /// ## 参数
     ///
     /// - `dev` - 要被添加的设备
     pub fn add_device(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
-        let bus = dev.bus();
+        let bus = dev.bus().map(|bus| bus.upgrade()).flatten();
         if let Some(bus) = bus {
             device_manager().add_groups(dev, bus.dev_groups())?;
 
@@ -293,9 +290,13 @@ impl BusManager {
 
     /// 在总线上添加一个驱动
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_add_driver#590
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_add_driver#590
     pub fn add_driver(&self, driver: &Arc<dyn Driver>) -> Result<(), SystemError> {
-        let bus = driver.bus().ok_or(SystemError::EINVAL)?;
+        let bus = driver
+            .bus()
+            .map(|bus| bus.upgrade())
+            .flatten()
+            .ok_or(SystemError::EINVAL)?;
         kdebug!("bus '{}' add driver '{}'", bus.name(), driver.name());
 
         driver.set_kobj_type(Some(&BusDriverKType));
@@ -349,7 +350,7 @@ impl BusManager {
     /// infrastructure, then register the children subsystems it has:
     /// the devices and drivers that belong to the subsystem.
     ///
-    /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_register#783
+    /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_register#783
     ///
     /// todo: 增加错误处理逻辑
     pub fn register(&self, bus: Arc<dyn Bus>) -> Result<(), SystemError> {
@@ -435,10 +436,7 @@ impl BusManager {
     #[allow(dead_code)]
     pub fn rescan_devices(&self, bus: &Arc<dyn Bus>) -> Result<(), SystemError> {
         for dev in bus.subsystem().devices().iter() {
-            let dev = dev.upgrade();
-            if let Some(dev) = dev {
-                rescan_devices_helper(dev)?;
-            }
+            rescan_devices_helper(dev)?;
         }
         return Ok(());
     }
@@ -447,7 +445,7 @@ impl BusManager {
     ///
     /// Automatically probe for a driver if the bus allows it.
     pub fn probe_device(&self, dev: &Arc<dyn Device>) {
-        let bus = dev.bus();
+        let bus = dev.bus().map(|bus| bus.upgrade()).flatten();
         if bus.is_none() {
             return;
         }
@@ -470,7 +468,7 @@ impl BusManager {
     ///
     /// - `driver` - 驱动实例
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_remove_driver#666
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_remove_driver#666
     pub fn remove_driver(&self, _driver: &Arc<dyn Driver>) {
         todo!("BusManager::remove_driver")
     }
@@ -489,10 +487,13 @@ impl BusManager {
     }
 }
 
-/// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?r=&mo=5649&fi=241#684
-fn rescan_devices_helper(dev: Arc<dyn Device>) -> Result<(), SystemError> {
+/// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?r=&mo=5649&fi=241#684
+fn rescan_devices_helper(dev: &Arc<dyn Device>) -> Result<(), SystemError> {
     if dev.driver().is_none() {
-        let need_parent_lock = dev.bus().map(|bus| bus.need_parent_lock()).unwrap_or(false);
+        let need_parent_lock = dev
+            .bus()
+            .map(|bus| bus.upgrade().unwrap().need_parent_lock())
+            .unwrap_or(false);
         if unlikely(need_parent_lock) {
             // todo: lock device parent
             unimplemented!()
@@ -561,7 +562,7 @@ pub fn buses_init() -> Result<(), SystemError> {
 /// - 在bus和设备文件夹下，创建软链接
 /// - 把设备添加到它的总线的设备列表中
 ///
-/// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_add_device#441
+/// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_add_device#441
 ///
 /// ## 参数
 ///
@@ -578,8 +579,9 @@ pub fn bus_add_device(dev: &Arc<dyn Device>) -> Result<(), SystemError> {
 ///
 /// - `dev` - 要被添加的设备
 ///
-/// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_probe_device#478
+/// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_probe_device#478
 pub fn bus_probe_device(dev: &Arc<dyn Device>) {
+    kinfo!("bus_probe_device: dev: {:?}", dev.name());
     bus_manager().probe_device(dev);
 }
 
@@ -599,7 +601,7 @@ impl Attribute for BusAttrDriversProbe {
         return SysFSOpsSupport::STORE;
     }
 
-    /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?r=&mo=5649&fi=241#241
+    /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?r=&mo=5649&fi=241#241
     fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {
         let kset: Arc<KSet> = kobj.arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
         let bus = bus_manager()
@@ -613,7 +615,7 @@ impl Attribute for BusAttrDriversProbe {
 
         let device = bus.find_device_by_name(name).ok_or(SystemError::ENODEV)?;
 
-        if rescan_devices_helper(device).is_ok() {
+        if rescan_devices_helper(&device).is_ok() {
             return Ok(buf.len());
         }
 
@@ -637,7 +639,7 @@ impl Attribute for BusAttrDriversAutoprobe {
         return SysFSOpsSupport::STORE | SysFSOpsSupport::SHOW;
     }
 
-    /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?r=&mo=5649&fi=241#231
+    /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?r=&mo=5649&fi=241#231
     fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {
         if buf.len() == 0 {
             return Ok(0);
@@ -657,7 +659,7 @@ impl Attribute for BusAttrDriversAutoprobe {
         return Ok(buf.len());
     }
 
-    /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?r=&mo=5649&fi=241#226
+    /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?r=&mo=5649&fi=241#226
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
         let kset: Arc<KSet> = kobj.arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
         let bus = bus_manager()
@@ -752,7 +754,11 @@ impl Attribute for DriverAttrUnbind {
             SystemError::EOPNOTSUPP_OR_ENOTSUP
         })?;
 
-        let bus = driver.bus().ok_or(SystemError::ENODEV)?;
+        let bus = driver
+            .bus()
+            .map(|bus| bus.upgrade())
+            .flatten()
+            .ok_or(SystemError::ENODEV)?;
 
         let s = CStr::from_bytes_with_nul(buf)
             .map_err(|_| SystemError::EINVAL)?
@@ -798,7 +804,11 @@ impl Attribute for DriverAttrBind {
             SystemError::EOPNOTSUPP_OR_ENOTSUP
         })?;
 
-        let bus = driver.bus().ok_or(SystemError::ENODEV)?;
+        let bus = driver
+            .bus()
+            .map(|bus| bus.upgrade())
+            .flatten()
+            .ok_or(SystemError::ENODEV)?;
         let device = bus
             .find_device_by_name(
                 CStr::from_bytes_with_nul(buf)
@@ -831,7 +841,7 @@ impl SubSystemManager {
     /// - `fake_root_dev` - 该子系统的伪根设备
     /// - `parent_of_root` - 该子系统的伪根设备的父级节点
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=subsys_system_register#1078
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=subsys_system_register#1078
     pub fn subsys_register(
         &self,
         subsys: &Arc<dyn Bus>,

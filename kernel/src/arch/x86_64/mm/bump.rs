@@ -1,12 +1,12 @@
 use crate::{
-    kdebug,
     libs::align::{page_align_down, page_align_up},
     mm::{
-        allocator::bump::BumpAllocator, MemoryManagementArch, PhysAddr, PhysMemoryArea, VirtAddr,
+        allocator::bump::BumpAllocator, memblock::mem_block_manager, MemoryManagementArch,
+        PhysAddr, PhysMemoryArea, VirtAddr,
     },
 };
 
-use super::{X86_64MMBootstrapInfo, BOOTSTRAP_MM_INFO, PHYS_MEMORY_AREAS};
+use super::{X86_64MMBootstrapInfo, BOOTSTRAP_MM_INFO};
 
 impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
     pub unsafe fn arch_remain_areas(
@@ -23,7 +23,7 @@ impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
         let offset_end = page_align_down(kernel_code_start - 16384);
 
         // 把内核代码前的空间加入到可用内存区域中
-        for area in &PHYS_MEMORY_AREAS {
+        for area in mem_block_manager().to_iter() {
             let area_base = area.area_base_aligned().data();
             let area_end = area.area_end_aligned().data();
             if area_base >= offset_end {
@@ -44,7 +44,6 @@ impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
             ret_areas[res_count] =
                 PhysMemoryArea::new(PhysAddr::new(new_start), new_end - new_start);
 
-            kdebug!("new arch remain area: {:?}", ret_areas[res_count]);
             res_count += 1;
         }
 

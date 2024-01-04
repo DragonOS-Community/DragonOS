@@ -19,7 +19,7 @@ use super::{platform_bus, platform_device::PlatformDevice};
 pub trait PlatformDriver: Driver {
     /// 检测设备是否能绑定到这个驱动
     ///
-    /// 如果能，则把设备的driver指向这个驱动。
+    /// 如果能，则把设备的driver字段指向这个驱动。
     /// 请注意，这个函数不应该把driver加入驱动的devices列表，相关工作会在外部的函数里面处理。
     fn probe(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError>;
     fn remove(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError>;
@@ -39,9 +39,9 @@ pub struct PlatformDriverManager;
 impl PlatformDriverManager {
     /// 注册平台设备驱动
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/platform.c?fi=__platform_driver_register#861
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/platform.c?fi=__platform_driver_register#861
     pub fn register(&self, driver: Arc<dyn PlatformDriver>) -> Result<(), SystemError> {
-        driver.set_bus(Some(platform_bus() as Arc<dyn Bus>));
+        driver.set_bus(Some(Arc::downgrade(&(platform_bus() as Arc<dyn Bus>))));
         return driver_manager().register(driver as Arc<dyn Driver>);
     }
 

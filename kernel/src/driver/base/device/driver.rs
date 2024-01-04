@@ -6,7 +6,10 @@ use crate::{
     driver::base::kobject::KObject,
     filesystem::sysfs::{sysfs_instance, Attribute, AttributeGroup},
 };
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::fmt::Debug;
 use system_error::SystemError;
 
@@ -86,11 +89,11 @@ pub trait Driver: Sync + Send + Debug + KObject {
         false
     }
 
-    fn bus(&self) -> Option<Arc<dyn Bus>> {
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
         None
     }
 
-    fn set_bus(&self, bus: Option<Arc<dyn Bus>>);
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>);
 
     fn groups(&self) -> &'static [&'static dyn AttributeGroup] {
         &[]
@@ -169,15 +172,19 @@ impl DriverManager {
     ///
     /// - driver: 驱动
     ///
-    /// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/driver.c#222
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/driver.c#222
     pub fn register(&self, driver: Arc<dyn Driver>) -> Result<(), SystemError> {
-        let bus = driver.bus().ok_or_else(|| {
-            kerror!(
-                "DriverManager::register() failed: driver.bus() is None. Driver: '{:?}'",
-                driver.name()
-            );
-            SystemError::EINVAL
-        })?;
+        let bus = driver
+            .bus()
+            .map(|bus| bus.upgrade())
+            .flatten()
+            .ok_or_else(|| {
+                kerror!(
+                    "DriverManager::register() failed: driver.bus() is None. Driver: '{:?}'",
+                    driver.name()
+                );
+                SystemError::EINVAL
+            })?;
 
         let drv_name = driver.name();
         let other = bus.find_driver_by_name(&drv_name);
@@ -208,7 +215,7 @@ impl DriverManager {
         bus_manager().remove_driver(driver);
     }
 
-    /// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/dd.c#434
+    /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#434
     pub fn driver_sysfs_add(&self, _dev: &Arc<dyn Device>) -> Result<(), SystemError> {
         todo!("DriverManager::driver_sysfs_add()");
     }

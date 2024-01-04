@@ -53,7 +53,7 @@ impl MemoryManagementArch for RiscV64MMArch {
 
     const USER_STACK_START: crate::mm::VirtAddr = VirtAddr::new(0x0000_001f_ffa0_0000);
 
-    unsafe fn init() -> &'static [crate::mm::PhysMemoryArea] {
+    unsafe fn init() {
         todo!()
     }
 

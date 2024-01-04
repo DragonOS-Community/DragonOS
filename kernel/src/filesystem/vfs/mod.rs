@@ -12,7 +12,9 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
-    driver::base::{block::block_device::BlockDevice, char::CharDevice, device::DeviceNumber},
+    driver::base::{
+        block::block_device::BlockDevice, char::CharDevice, device::device_number::DeviceNumber,
+    },
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
     time::TimeSpec,
@@ -38,6 +40,8 @@ pub enum FileType {
     BlockDevice,
     /// 字符设备
     CharDevice,
+    /// 帧缓冲设备
+    FramebufferDevice,
     /// kvm设备
     KvmDevice,
     /// 管道文件
@@ -97,6 +101,7 @@ impl FileType {
             FileType::Pipe => DT_FIFO,
             FileType::SymLink => DT_LNK,
             FileType::Socket => DT_SOCK,
+            FileType::FramebufferDevice => DT_CHR,
         };
     }
 }
@@ -534,7 +539,7 @@ pub struct Metadata {
     pub gid: usize,
 
     /// 文件指向的设备的id（对于设备文件系统来说）
-    pub raw_dev: usize,
+    pub raw_dev: DeviceNumber,
 }
 
 impl Default for Metadata {
@@ -553,7 +558,7 @@ impl Default for Metadata {
             nlinks: 1,
             uid: 0,
             gid: 0,
-            raw_dev: 0,
+            raw_dev: DeviceNumber::default(),
         };
     }
 }
@@ -585,11 +590,6 @@ pub struct FsInfo {
     pub max_name_len: usize,
 }
 
-/// @brief 整合主设备号+次设备号
-pub fn make_rawdev(major: usize, minor: usize) -> usize {
-    ((major & 0xffffff) << 8) | (minor & 0xff)
-}
-
 /// @brief
 #[repr(C)]
 #[derive(Debug)]
@@ -617,7 +617,7 @@ impl Metadata {
             nlinks: 1,
             uid: 0,
             gid: 0,
-            raw_dev: 0,
+            raw_dev: DeviceNumber::default(),
         }
     }
 }

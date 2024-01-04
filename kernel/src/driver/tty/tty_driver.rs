@@ -9,7 +9,7 @@ use super::tty_device::TtyDevice;
 /// TTY 驱动
 ///
 ///
-/// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/include/linux/tty_driver.h#434
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/tty_driver.h#434
 pub trait TtyDriver: Debug + Send + Sync + Driver {
     fn driver_name(&self) -> &str;
     fn dev_name(&self) -> &str;
@@ -42,20 +42,20 @@ pub struct TtyDriverMetadata {
     subtype: TtyDriverSubtype,
 }
 
-/// https://opengrok.ringotek.cn/xref/linux-6.1.9/include/linux/tty_driver.h#411
+/// https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/tty_driver.h#411
 #[derive(Debug, Clone, Copy)]
 pub enum TtyDriverType {}
 
-/// https://opengrok.ringotek.cn/xref/linux-6.1.9/include/linux/tty_driver.h#412
+/// https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/tty_driver.h#412
 #[derive(Debug, Clone, Copy)]
 pub enum TtyDriverSubtype {}
 
 bitflags! {
-    /// https://opengrok.ringotek.cn/xref/linux-6.1.9/include/linux/tty_driver.h?fi=SERIAL_TYPE_NORMAL#492
+    /// https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/tty_driver.h?fi=SERIAL_TYPE_NORMAL#492
     pub struct TtyDriverFlags: u64 {
 
     }
 }
 
-/// 参考 https://opengrok.ringotek.cn/xref/linux-6.1.9/include/linux/tty_driver.h#350
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/tty_driver.h#350
 pub trait TtyDriverOperations {}

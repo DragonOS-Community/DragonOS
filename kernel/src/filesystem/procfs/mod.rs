@@ -12,12 +12,16 @@ use system_error::SystemError;
 
 use crate::{
     arch::mm::LockedFrameAllocator,
-    filesystem::vfs::{
-        core::{generate_inode_id, ROOT_INODE},
-        FileType,
+    filesystem::{
+        procfs::kmsg::Kmsg,
+        vfs::{
+            core::{generate_inode_id, ROOT_INODE},
+            FileType,
+        },
     },
     kerror, kinfo,
     libs::{
+        mutex::Mutex,
         once::Once,
         spinlock::{SpinLock, SpinLockGuard},
     },
@@ -32,6 +36,17 @@ use super::vfs::{
     FileSystem, FsInfo, IndexNode, InodeId, Metadata,
 };
 
+mod kmsg;
+mod log_message;
+
+/// 缓冲区容量
+const KMSG_BUFFER_CAPACITY: usize = 1024;
+
+lazy_static! {
+    /// 全局环形缓冲区
+    static ref KMSG: Mutex<Kmsg> = Mutex::new(Kmsg::new(KMSG_BUFFER_CAPACITY));
+}
+
 /// @brief 进程文件类型
 /// @usage 用于定义进程文件夹下的各类文件类型
 #[derive(Debug)]
@@ -41,6 +56,8 @@ pub enum ProcFileType {
     ProcStatus = 0,
     /// meminfo
     ProcMeminfo = 1,
+    /// kmsg
+    ProcKmsg = 2,
     //todo: 其他文件类型
     ///默认文件类型
     Default,
@@ -51,6 +68,7 @@ impl From<u8> for ProcFileType {
         match value {
             0 => ProcFileType::ProcStatus,
             1 => ProcFileType::ProcMeminfo,
+            2 => ProcFileType::ProcKmsg,
             _ => ProcFileType::Default,
         }
     }
@@ -335,6 +353,19 @@ impl ProcFS {
             panic!("create meminfo error");
         }
 
+        // 创建kmsg文件，当作环形缓冲区的文件接口，实际并不存储数据
+        let binding = inode.create("kmsg", FileType::File, ModeType::from_bits_truncate(0o444));
+        if let Ok(kmsg) = binding {
+            let kmsg_file = kmsg
+                .as_any_ref()
+                .downcast_ref::<LockedProcFSInode>()
+                .unwrap();
+            kmsg_file.0.lock().fdata.pid = Pid::new(1);
+            kmsg_file.0.lock().fdata.ftype = ProcFileType::ProcKmsg;
+        } else {
+            panic!("create ksmg error");
+        }
+
         return result;
     }
 
@@ -402,6 +433,7 @@ impl IndexNode for LockedProcFSInode {
         let file_size = match inode.fdata.ftype {
             ProcFileType::ProcStatus => inode.open_status(&mut private_data)?,
             ProcFileType::ProcMeminfo => inode.open_meminfo(&mut private_data)?,
+            ProcFileType::ProcKmsg => KMSG.lock().open()?,
             _ => {
                 todo!()
             }
@@ -455,6 +487,7 @@ impl IndexNode for LockedProcFSInode {
         match inode.fdata.ftype {
             ProcFileType::ProcStatus => return inode.proc_read(offset, len, buf, private_data),
             ProcFileType::ProcMeminfo => return inode.proc_read(offset, len, buf, private_data),
+            ProcFileType::ProcKmsg => return KMSG.lock().read(offset, len, buf),
             ProcFileType::Default => (),
         };
 

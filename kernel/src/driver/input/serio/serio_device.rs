@@ -29,7 +29,7 @@ impl SerioDeviceManager {
 
     //todo：https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/serio.c#494
     pub fn init_port(&self, device: Arc<dyn SerioDevice>) -> Result<(), SystemError> {
-        device.set_bus(Some(serio_bus() as Arc<dyn Bus>));
+        device.set_bus(Some(Arc::downgrade(&(serio_bus() as Arc<dyn Bus>))));
         Ok(())
     }
 }

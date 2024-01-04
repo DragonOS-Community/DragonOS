@@ -26,7 +26,7 @@ pub struct SerioDriverManager;
 impl SerioDriverManager {
 
     pub fn register(&self, driver: Arc<dyn SerioDriver>) -> Result<(), SystemError> {
-        driver.set_bus(Some(serio_bus() as Arc<dyn Bus>));
+        driver.set_bus(Some(Arc::downgrade(&(serio_bus() as Arc<dyn Bus>))));
         return driver_manager().register(driver as Arc<dyn Driver>);
     }        
 

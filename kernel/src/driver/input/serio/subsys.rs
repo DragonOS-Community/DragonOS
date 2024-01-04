@@ -1,13 +1,26 @@
-use alloc::{sync::{Arc, Weak}, string::{ToString, String}};
+use alloc::{
+    string::{String, ToString},
+    sync::{Arc, Weak},
+};
 use intertrait::cast::CastArc;
 use system_error::SystemError;
 
-use crate::{driver::{base::{subsys::SubSysPrivate, device::{bus::Bus, Device, driver::Driver}, kobject::KObject}, acpi::acpi_manager}, filesystem::{sysfs::{AttributeGroup, Attribute}, vfs::syscall::ModeType}};
+use crate::{
+    driver::{
+        acpi::acpi_manager,
+        base::{
+            device::{bus::Bus, driver::Driver, Device},
+            kobject::KObject,
+            subsys::SubSysPrivate,
+        },
+    },
+    filesystem::{
+        sysfs::{Attribute, AttributeGroup},
+        vfs::syscall::ModeType,
+    },
+};
 
 use super::{serio_device::SerioDevice, serio_driver::SerioDriver};
-
-
-
 
 #[derive(Debug)]
 pub struct SerioBus {
@@ -27,7 +40,6 @@ impl SerioBus {
 }
 
 impl Bus for SerioBus {
-
     fn name(&self) -> String {
         return "serio".to_string();
     }
@@ -46,8 +58,11 @@ impl Bus for SerioBus {
 
     fn probe(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
         let drv = device.driver().ok_or(SystemError::EINVAL)?;
-        let pdrv = drv.cast::<dyn SerioDriver>().map_err(|_|{
-            kerror!("SerioBus::probe() failed: device.driver() is not a SerioDriver. Device: '{:?}'", device.name());
+        let pdrv = drv.cast::<dyn SerioDriver>().map_err(|_| {
+            kerror!(
+                "SerioBus::probe() failed: device.driver() is not a SerioDriver. Device: '{:?}'",
+                device.name()
+            );
             SystemError::EINVAL
         })?;
 
@@ -113,7 +128,7 @@ impl AttributeGroup for SerioDeviceAttrGroup {
     fn name(&self) -> Option<&str> {
         None
     }
-    
+
     // todo: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/serio.c#473
     fn attrs(&self) -> &[&'static dyn Attribute] {
         return &[];

@@ -109,11 +109,10 @@ impl Deref for LockedKObjectState {
     }
 }
 
-pub trait KObjectAttribute: Attribute {
-    fn support(&self) -> SysFSOpsSupport;
-
-    fn show(&self, kobj: &dyn KObject, buf: &mut [u8]) -> Result<usize, SystemError>;
-    fn store(&self, kobj: &dyn KObject, buf: &[u8]) -> Result<usize, SystemError>;
+impl Default for LockedKObjectState {
+    fn default() -> Self {
+        LockedKObjectState::new(None)
+    }
 }
 
 #[derive(Debug)]
@@ -193,7 +192,7 @@ impl KObjectManager {
         let r = Self::create_dir(kobj.clone());
 
         if let Err(e) = r {
-            // https://opengrok.ringotek.cn/xref/linux-6.1.9/lib/kobject.c?r=&mo=10426&fi=394#224
+            // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject.c?r=&mo=10426&fi=394#224
             if let Some(kset) = kobj.kset() {
                 kset.leave(&kobj);
             }

@@ -4,6 +4,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use system_error::SystemError;
+use unified_init::macros::unified_init;
 
 use crate::{
     filesystem::{
@@ -13,6 +14,7 @@ use crate::{
             ROOT_INODE,
         },
     },
+    init::initcall::INITCALL_DEVICE,
     kerror,
     libs::{
         lib_ui::textui::{textui_putchar, FontColor},
@@ -280,6 +282,7 @@ impl TtyDevicePrivateData {
 }
 
 /// @brief 初始化TTY设备
+#[unified_init(INITCALL_DEVICE)]
 pub fn tty_init() -> Result<(), SystemError> {
     let tty: Arc<TtyDevice> = TtyDevice::new("tty0");
     let devfs_root_inode = ROOT_INODE().lookup("/dev");

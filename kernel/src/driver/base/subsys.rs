@@ -37,9 +37,9 @@ pub struct SubSysPrivate {
     class: SpinLock<Option<Weak<dyn Class>>>,
     drivers_autoprobe: AtomicBool,
     /// 当前总线上的所有设备
-    devices: RwLock<Vec<Weak<dyn Device>>>,
+    devices: RwLock<Vec<Arc<dyn Device>>>,
     /// 当前总线上的所有驱动
-    drivers: RwLock<Vec<Weak<dyn Driver>>>,
+    drivers: RwLock<Vec<Arc<dyn Driver>>>,
     interfaces: &'static [&'static dyn SubSysInterface],
     bus_notifier: AtomicNotifierChain<BusNotifyEvent, Arc<dyn Device>>,
 }
@@ -106,11 +106,11 @@ impl SubSysPrivate {
         *self.class.lock() = class;
     }
 
-    pub fn devices(&self) -> RwLockReadGuard<Vec<Weak<dyn Device>>> {
+    pub fn devices(&self) -> RwLockReadGuard<Vec<Arc<dyn Device>>> {
         return self.devices.read();
     }
 
-    pub fn drivers(&self) -> RwLockReadGuard<Vec<Weak<dyn Driver>>> {
+    pub fn drivers(&self) -> RwLockReadGuard<Vec<Arc<dyn Driver>>> {
         return self.drivers.read();
     }
 
@@ -155,18 +155,16 @@ impl SubSysPrivate {
 
     pub fn add_driver_to_vec(&self, driver: &Arc<dyn Driver>) -> Result<(), SystemError> {
         let mut drivers = self.drivers.write();
-        let driver_weak = Arc::downgrade(driver);
-        if drivers.iter().any(|d| d.ptr_eq(&driver_weak)) {
+        if drivers.iter().any(|d| Arc::ptr_eq(d, driver)) {
             return Err(SystemError::EEXIST);
         }
-        drivers.push(driver_weak);
+        drivers.push(driver.clone());
         return Ok(());
     }
 
     pub fn remove_driver_from_vec(&self, driver: &Arc<dyn Driver>) {
         let mut drivers = self.drivers.write();
-        let driver_weak = Arc::downgrade(driver);
-        let index = drivers.iter().position(|d| d.ptr_eq(&driver_weak));
+        let index = drivers.iter().position(|d| Arc::ptr_eq(d, driver));
         if let Some(index) = index {
             drivers.remove(index);
         }
@@ -174,26 +172,24 @@ impl SubSysPrivate {
 
     pub fn add_device_to_vec(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
         let mut devices = self.devices.write();
-        let device_weak = Arc::downgrade(device);
-        if devices.iter().any(|d| d.ptr_eq(&device_weak)) {
+        if devices.iter().any(|d| Arc::ptr_eq(d, device)) {
             return Err(SystemError::EEXIST);
         }
-        devices.push(device_weak);
+        devices.push(device.clone());
         return Ok(());
     }
 
     #[allow(dead_code)]
     pub fn remove_device_from_vec(&self, device: &Arc<dyn Device>) {
         let mut devices = self.devices.write();
-        let device_weak = Arc::downgrade(device);
-        let index = devices.iter().position(|d| d.ptr_eq(&device_weak));
+        let index = devices.iter().position(|d| Arc::ptr_eq(d, device));
         if let Some(index) = index {
             devices.remove(index);
         }
     }
 }
 
-/// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/include/linux/device.h#63
+/// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/device.h#63
 pub trait SubSysInterface: Debug + Send + Sync {
     fn name(&self) -> &str;
     fn bus(&self) -> Option<Weak<dyn Bus>>;

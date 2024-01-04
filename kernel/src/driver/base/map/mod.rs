@@ -1,22 +1,21 @@
 use core::ops::{Deref, DerefMut};
 
 use super::{
-    device::{mkdev, DeviceNumber},
+    device::device_number::{DeviceNumber, Major},
     kobject::KObject,
 };
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 
 const KOBJMAP_HASH_SIZE: usize = 255;
-pub(crate) const DEV_MAJOR_HASH_SIZE: usize = 255;
-pub(crate) const DEV_MAJOR_MAX: usize = 512;
-pub(crate) const MINOR_BITS: usize = 20;
-pub(crate) const MINOR_MASK: usize = 1 << MINOR_BITS - 1;
+pub(crate) const DEV_MAJOR_HASH_SIZE: u32 = 255;
+pub(crate) const DEV_MAJOR_MAX: Major = Major::new(512);
+
 /* Marks the bottom of the first segment of free char majors */
-pub(crate) const DEV_MAJOR_DYN_END: usize = 234;
+pub(crate) const DEV_MAJOR_DYN_END: Major = Major::new(234);
 /* Marks the top and bottom of the second segment of free char majors */
-pub(crate) const DEV_MAJOR_DYN_EXT_START: usize = 511;
-pub(crate) const DEV_MAJOR_DYN_EXT_END: usize = 384;
+pub(crate) const DEV_MAJOR_DYN_EXT_START: Major = Major::new(511);
+pub(crate) const DEV_MAJOR_DYN_EXT_END: Major = Major::new(384);
 
 /// @brief: 字符设备与块设备管理结构体
 #[derive(Debug, Clone)]
@@ -63,10 +62,15 @@ pub fn kobj_map(
     range: usize,
     data: Arc<dyn KObject>,
 ) {
-    if let Some(map) = domain.0.lock().0.get_mut(dev_t.major() % 255) {
+    if let Some(map) = domain
+        .0
+        .lock()
+        .0
+        .get_mut((dev_t.major().data() % 255) as usize)
+    {
         for i in 0..range {
             map.insert(
-                mkdev(dev_t.major(), dev_t.minor() + i),
+                DeviceNumber::new(dev_t.major(), dev_t.minor() + i as u32),
                 Probe::new(data.clone()),
             );
         }
@@ -79,9 +83,14 @@ pub fn kobj_map(
 ///             range: 次设备号范围
 /// @return: none
 pub fn kobj_unmap(domain: Arc<LockedKObjMap>, dev_t: DeviceNumber, range: usize) {
-    if let Some(map) = domain.0.lock().0.get_mut(dev_t.major() % 255) {
+    if let Some(map) = domain
+        .0
+        .lock()
+        .0
+        .get_mut((dev_t.major().data() % 255) as usize)
+    {
         for i in 0..range {
-            let rm_dev_t = &DeviceNumber::new(Into::<usize>::into(dev_t) + i);
+            let rm_dev_t = &DeviceNumber::new(dev_t.major(), dev_t.minor() + i as u32);
             match map.get(rm_dev_t) {
                 Some(_) => {
                     map.remove(rm_dev_t);
@@ -98,7 +107,7 @@ pub fn kobj_unmap(domain: Arc<LockedKObjMap>, dev_t: DeviceNumber, range: usize)
 /// @return: 查找成功，返回设备实例，否则返回None
 #[allow(dead_code)]
 pub fn kobj_lookup(domain: Arc<LockedKObjMap>, dev_t: DeviceNumber) -> Option<Arc<dyn KObject>> {
-    if let Some(map) = domain.0.lock().0.get(dev_t.major() % 255) {
+    if let Some(map) = domain.0.lock().0.get((dev_t.major().data() % 255) as usize) {
         match map.get(&dev_t) {
             Some(value) => {
                 return Some(value.0.clone());
@@ -133,7 +142,7 @@ pub struct DevsMap(Vec<Vec<DeviceStruct>>);
 
 impl Default for DevsMap {
     fn default() -> Self {
-        DevsMap(vec![Vec::new(); DEV_MAJOR_HASH_SIZE])
+        DevsMap(vec![Vec::new(); DEV_MAJOR_HASH_SIZE as usize])
     }
 }
 
@@ -156,7 +165,7 @@ impl DerefMut for DevsMap {
 #[derive(Debug, Clone)]
 pub struct DeviceStruct {
     dev_t: DeviceNumber, //起始设备号
-    minorct: usize,      // 次设备号数量
+    minorct: u32,        // 次设备号数量
     name: &'static str,  //字符设备名
 }
 
@@ -169,7 +178,7 @@ impl DeviceStruct {
     /// @return: 实例
     ///
     #[allow(dead_code)]
-    pub fn new(dev_t: DeviceNumber, minorct: usize, name: &'static str) -> Self {
+    pub fn new(dev_t: DeviceNumber, minorct: u32, name: &'static str) -> Self {
         Self {
             dev_t,
             minorct,
@@ -191,7 +200,7 @@ impl DeviceStruct {
     /// @return: 起始设备号
     ///
     #[allow(dead_code)]
-    pub fn base_minor(&self) -> usize {
+    pub fn base_minor(&self) -> u32 {
         self.dev_t.minor()
     }
 
@@ -199,7 +208,7 @@ impl DeviceStruct {
     /// @parameter: None
     /// @return: 次设备号数量
     #[allow(dead_code)]
-    pub fn minorct(&self) -> usize {
+    pub fn minorct(&self) -> u32 {
         self.minorct
     }
 }

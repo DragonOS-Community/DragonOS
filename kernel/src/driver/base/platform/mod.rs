@@ -3,7 +3,7 @@ use self::{platform_device::PlatformBusDevice, subsys::PlatformBus};
 use super::{
     device::{
         bus::{bus_register, Bus, BusState},
-        device_unregister, sys_devices_kset, DeviceNumber, DevicePrivateData, IdTable,
+        device_unregister, sys_devices_kset, DevicePrivateData, IdTable,
     },
     kobject::KObject,
 };
@@ -73,11 +73,11 @@ impl CompatibleTable {
 /// @parameter: None
 /// @return: None
 ///
-/// 参考： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/platform.c?fi=platform_bus_init#1511
+/// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/platform.c?fi=platform_bus_init#1511
 pub fn platform_bus_init() -> Result<(), SystemError> {
     let platform_device: Arc<PlatformBusDevice> = PlatformBusDevice::new(
         DevicePrivateData::new(
-            IdTable::new("platform".to_string(), Some(DeviceNumber::new(0))),
+            IdTable::new("platform".to_string(), None),
             BusState::NotInitialized.into(),
         ),
         Some(Arc::downgrade(&(sys_devices_kset() as Arc<dyn KObject>))),

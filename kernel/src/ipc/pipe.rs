@@ -125,7 +125,7 @@ impl LockedPipeInode {
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: 0,
+                raw_dev: Default::default(),
             },
             reader: 0,
             writer: 0,

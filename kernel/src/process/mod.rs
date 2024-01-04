@@ -59,7 +59,6 @@ pub mod exec;
 pub mod exit;
 pub mod fork;
 pub mod idle;
-pub mod init;
 pub mod kthread;
 pub mod pid;
 pub mod process;

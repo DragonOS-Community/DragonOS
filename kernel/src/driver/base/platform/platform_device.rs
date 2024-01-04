@@ -11,7 +11,7 @@ use crate::{
             bus::{Bus, BusState},
             device_manager,
             driver::Driver,
-            Device, DeviceNumber, DevicePrivateData, DeviceType, IdTable,
+            Device, DevicePrivateData, DeviceType, IdTable,
         },
         kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
         kset::KSet,
@@ -44,8 +44,8 @@ pub const PLATFORM_DEVID_AUTO: i32 = -2;
 ///
 /// ## 注意
 ///
-/// 应当在所有实现这个trait的结构体上方，添加 `#[cast_to([sync] PlatformDriver)]`，
-/// 否则运行时将报错“该对象不是PlatformDriver”
+/// 应当在所有实现这个trait的结构体上方，添加 `#[cast_to([sync] PlatformDevice)]`，
+/// 否则运行时将报错“该对象不是PlatformDevice”
 pub trait PlatformDevice: Device {
     fn pdev_name(&self) -> &str;
     /// 返回平台设备id，以及这个id是否是自动生成的
@@ -85,7 +85,7 @@ impl PlatformDeviceManager {
             )));
         }
 
-        pdev.set_bus(Some(platform_bus() as Arc<dyn Bus>));
+        pdev.set_bus(Some(Arc::downgrade(&(platform_bus() as Arc<dyn Bus>))));
 
         let id = pdev.pdev_id().0;
         match id {
@@ -103,7 +103,7 @@ impl PlatformDeviceManager {
             }
         }
 
-        // todo: 插入资源： https://opengrok.ringotek.cn/xref/linux-6.1.9/drivers/base/platform.c?fi=platform_device_add#691
+        // todo: 插入资源： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/platform.c?fi=platform_device_add#691
         let r = device_manager().add_device(pdev.clone() as Arc<dyn Device>);
         if r.is_ok() {
             pdev.set_state(DeviceState::Initialized);
@@ -195,7 +195,7 @@ pub struct InnerPlatformBusDevice {
 
     kernfs_inode: Option<Arc<KernFSInode>>,
     /// 当前设备挂载到的总线
-    bus: Option<Arc<dyn Bus>>,
+    bus: Option<Weak<dyn Bus>>,
     /// 当前设备已经匹配的驱动
     driver: Option<Weak<dyn Driver>>,
 
@@ -286,16 +286,15 @@ impl Device for PlatformBusDevice {
     }
 
     #[inline]
-    #[allow(dead_code)]
     fn id_table(&self) -> IdTable {
-        IdTable::new("platform".to_string(), Some(DeviceNumber::new(0)))
+        IdTable::new("platform".to_string(), None)
     }
 
-    fn bus(&self) -> Option<Arc<dyn Bus>> {
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
         self.inner.lock().bus.clone()
     }
 
-    fn set_bus(&self, bus: Option<Arc<dyn Bus>>) {
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
         self.inner.lock().bus = bus;
     }
 

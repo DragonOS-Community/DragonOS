@@ -134,7 +134,7 @@ impl X86_64SmpManager {
     }
     /// initialize the logical cpu number to APIC ID mapping
     pub fn build_cpu_map(&self) -> Result<(), SystemError> {
-        // 参考：https://opengrok.ringotek.cn/xref/linux-6.1.9/arch/ia64/kernel/smpboot.c?fi=smp_build_cpu_map#496
+        // 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/arch/ia64/kernel/smpboot.c?fi=smp_build_cpu_map#496
         // todo!("build_cpu_map")
         return Ok(());
     }

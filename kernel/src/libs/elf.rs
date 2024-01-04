@@ -157,7 +157,7 @@ impl ElfLoader {
         }
 
         // todo: 增加与架构相关的处理
-        // ref:  https://opengrok.ringotek.cn/xref/linux-5.19.10/fs/binfmt_elf.c?r=&mo=22652&fi=824#572
+        // ref:  https://code.dragonos.org.cn/xref/linux-5.19.10/fs/binfmt_elf.c?r=&mo=22652&fi=824#572
 
         return prot;
     }
@@ -165,7 +165,7 @@ impl ElfLoader {
     /// 加载ELF文件到用户空间
     ///
     /// 参考Linux的elf_map函数
-    /// https://opengrok.ringotek.cn/xref/linux-5.19.10/fs/binfmt_elf.c?r=&mo=22652&fi=824#365
+    /// https://code.dragonos.org.cn/xref/linux-5.19.10/fs/binfmt_elf.c?r=&mo=22652&fi=824#365
     /// ## 参数
     ///
     /// - `user_vm_guard`：用户空间地址空间
@@ -505,7 +505,7 @@ impl BinaryLoader for ElfLoader {
         let ehdr = Self::parse_ehdr(head_buf).map_err(|_| ExecError::NotExecutable)?;
 
         // 参考linux-5.19的load_elf_binary函数
-        // https://opengrok.ringotek.cn/xref/linux-5.19.10/fs/binfmt_elf.c?r=&mo=22652&fi=824#1034
+        // https://code.dragonos.org.cn/xref/linux-5.19.10/fs/binfmt_elf.c?r=&mo=22652&fi=824#1034
 
         let elf_type = ElfType::from(ehdr.e_type);
         // kdebug!("ehdr = {:?}", ehdr);

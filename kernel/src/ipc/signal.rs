@@ -79,7 +79,7 @@ impl Signal {
             force_send = matches!(siginfo.sig_code(), SigCode::Kernel);
         } else {
             // todo: 判断signal是否来自于一个祖先进程的namespace，如果是，则强制发送信号
-            //详见 https://opengrok.ringotek.cn/xref/linux-6.1.9/kernel/signal.c?r=&mo=32170&fi=1220#1226
+            //详见 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c?r=&mo=32170&fi=1220#1226
         }
 
         if !self.prepare_sianal(pcb.clone(), force_send) {
@@ -259,7 +259,7 @@ impl Signal {
                 .flush_by_mask(&flush);
             let _r = ProcessManager::wakeup_stop(&pcb);
             // TODO 对每个子线程 flush mask
-            // 这里需要补充一段逻辑，详见https://opengrok.ringotek.cn/xref/linux-6.1.9/kernel/signal.c#952
+            // 这里需要补充一段逻辑，详见https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c#952
         }
 
         // 一个被阻塞了的信号肯定是要被处理的

@@ -3,13 +3,11 @@
 /// @FilePath: /DragonOS/kernel/src/mm/allocator/bump.rs
 /// @Description: bump allocator线性分配器
 use super::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
-use crate::mm::{MemoryManagementArch, PhysAddr, PhysMemoryArea};
+use crate::mm::{memblock::mem_block_manager, MemoryManagementArch, PhysAddr, PhysMemoryArea};
 use core::marker::PhantomData;
 
 /// 线性分配器
 pub struct BumpAllocator<MMA> {
-    // 表示可用物理内存区域的数组。每个 PhysMemoryArea 结构体描述一个物理内存区域的起始地址和大小。
-    areas: &'static [PhysMemoryArea],
     // 表示当前分配的物理内存的偏移量.
     offset: usize,
     // 一个占位类型，用于标记 A 类型在结构体中的存在。但是，它并不会占用任何内存空间，因为它的大小为 0。
@@ -22,17 +20,13 @@ impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
     /// @param Fareas 当前的内存区域
     /// @param offset 当前的偏移量
     /// @return 分配器本身
-    pub fn new(areas: &'static [PhysMemoryArea], offset: usize) -> Self {
+    pub fn new(offset: usize) -> Self {
         Self {
-            areas,
             offset,
             phantom: PhantomData,
         }
     }
-    // @brief 获取页帧使用情况
-    pub fn areas(&self) -> &'static [PhysMemoryArea] {
-        return self.areas;
-    }
+
     // @brief 获取当前分配的物理内存的偏移量
     pub fn offset(&self) -> usize {
         return self.offset;
@@ -51,9 +45,10 @@ impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
 
         let mut res_cnt = 0;
 
+        let total_num = mem_block_manager().total_initial_memory_regions();
         // 遍历所有的物理内存区域
-        for i in 0..self.areas().len() {
-            let area = &self.areas()[i];
+        for i in 0..total_num {
+            let area = mem_block_manager().get_initial_memory_region(i).unwrap();
             // 将area的base地址与PAGE_SIZE对齐，对齐时向上取整
             // let area_base = (area.base.data() + MMA::PAGE_SHIFT) & !(MMA::PAGE_SHIFT);
             let area_base = area.area_base_aligned().data();
@@ -75,9 +70,10 @@ impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
             }
             // found
             if offset + 1 * MMA::PAGE_SIZE <= area_end {
-                for j in i..self.areas().len() {
-                    if self.areas()[j].area_base_aligned() < self.areas()[j].area_end_aligned() {
-                        result_area[res_cnt] = self.areas()[j];
+                for j in i..total_num {
+                    let aj = mem_block_manager().get_initial_memory_region(j).unwrap();
+                    if aj.area_base_aligned() < aj.area_end_aligned() {
+                        result_area[res_cnt] = aj;
                         res_cnt += 1;
                     }
                 }
@@ -102,8 +98,11 @@ impl<MMA: MemoryManagementArch> FrameAllocator for BumpAllocator<MMA> {
     /// @return 分配后的物理地址
     unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         let mut offset = self.offset();
+
+        let iter = mem_block_manager().to_iter();
+
         // 遍历所有的物理内存区域
-        for area in self.areas().iter() {
+        for area in iter {
             // 将area的base地址与PAGE_SIZE对齐，对齐时向上取整
             // let area_base = (area.base.data() + MMA::PAGE_SHIFT) & !(MMA::PAGE_SHIFT);
             let area_base = area.area_base_aligned().data();
@@ -145,7 +144,8 @@ impl<MMA: MemoryManagementArch> FrameAllocator for BumpAllocator<MMA> {
     unsafe fn usage(&self) -> PageFrameUsage {
         let mut total = 0;
         let mut used = 0;
-        for area in self.areas().iter() {
+        let iter = mem_block_manager().to_iter();
+        for area in iter {
             // 将area的base地址与PAGE_SIZE对齐，对其时向上取整
             let area_base = (area.base.data() + MMA::PAGE_SHIFT) & !(MMA::PAGE_SHIFT);
             // 将area的末尾地址与PAGE_SIZE对齐，对其时向下取整

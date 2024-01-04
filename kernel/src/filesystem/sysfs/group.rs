@@ -164,7 +164,7 @@ impl SysFS {
     /// - `group` - 属性组
     /// - `update` - 当前是否正在更新属性
     ///
-    /// https://opengrok.ringotek.cn/xref/linux-6.1.9/fs/sysfs/group.c#34
+    /// https://code.dragonos.org.cn/xref/linux-6.1.9/fs/sysfs/group.c#34
     fn group_create_files(
         &self,
         parent: Arc<KernFSInode>,

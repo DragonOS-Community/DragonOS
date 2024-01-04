@@ -3,6 +3,7 @@
 #![feature(allocator_api)]
 #![feature(arbitrary_self_types)]
 #![feature(asm_const)]
+#![feature(const_for)]
 #![feature(const_mut_refs)]
 #![feature(const_trait_impl)]
 #![feature(const_refs_to_cell)]

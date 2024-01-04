@@ -536,7 +536,7 @@ fn handle_signal(
     oldset: &SigSet,
     frame: &mut TrapFrame,
 ) -> Result<i32, SystemError> {
-    // TODO 这里要补充一段逻辑，好像是为了保证引入线程之后的地址空间不会出问题。详见https://opengrok.ringotek.cn/xref/linux-6.1.9/arch/mips/kernel/signal.c#830
+    // TODO 这里要补充一段逻辑，好像是为了保证引入线程之后的地址空间不会出问题。详见https://code.dragonos.org.cn/xref/linux-6.1.9/arch/mips/kernel/signal.c#830
 
     // 设置栈帧
     return setup_frame(sig, sigaction, info, oldset, frame);

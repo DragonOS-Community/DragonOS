@@ -4,10 +4,14 @@ use crate::kerror;
 use system_error::SystemError;
 
 use super::{
-    device::{device_manager, mkdev, Device, DeviceNumber, IdTable, CHARDEVS, DEVMAP},
+    device::{
+        device_manager,
+        device_number::{DeviceNumber, Major},
+        Device, IdTable, CHARDEVS, DEVMAP,
+    },
     map::{
         kobj_map, kobj_unmap, DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END,
-        DEV_MAJOR_DYN_EXT_START, DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX, MINOR_MASK,
+        DEV_MAJOR_DYN_EXT_START, DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX,
     },
 };
 
@@ -41,37 +45,39 @@ impl CharDevOps {
     /// @parameter: major: 主设备号
     /// @return: 返回下标
     #[allow(dead_code)]
-    fn major_to_index(major: usize) -> usize {
-        return major % DEV_MAJOR_HASH_SIZE;
+    fn major_to_index(major: Major) -> usize {
+        return (major.data() % DEV_MAJOR_HASH_SIZE) as usize;
     }
 
     /// @brief: 动态获取主设备号
     /// @parameter: None
     /// @return: 如果成功，返回主设备号，否则，返回错误码
     #[allow(dead_code)]
-    fn find_dynamic_major() -> Result<usize, SystemError> {
+    fn find_dynamic_major() -> Result<Major, SystemError> {
         let chardevs = CHARDEVS.lock();
         // 寻找主设备号为234～255的设备
-        for index in (DEV_MAJOR_DYN_END..DEV_MAJOR_HASH_SIZE).rev() {
-            if let Some(item) = chardevs.get(index) {
+        for index in (DEV_MAJOR_DYN_END.data()..DEV_MAJOR_HASH_SIZE).rev() {
+            if let Some(item) = chardevs.get(index as usize) {
                 if item.is_empty() {
-                    return Ok(index); // 返回可用的主设备号
+                    return Ok(Major::new(index)); // 返回可用的主设备号
                 }
             }
         }
         // 寻找主设备号在384～511的设备
-        for index in (DEV_MAJOR_DYN_EXT_END + 1..DEV_MAJOR_DYN_EXT_START + 1).rev() {
-            if let Some(chardevss) = chardevs.get(Self::major_to_index(index)) {
+        for index in
+            ((DEV_MAJOR_DYN_EXT_END.data() + 1)..(DEV_MAJOR_DYN_EXT_START.data() + 1)).rev()
+        {
+            if let Some(chardevss) = chardevs.get(Self::major_to_index(Major::new(index))) {
                 let mut flag = true;
                 for item in chardevss {
-                    if item.device_number().major() == index {
+                    if item.device_number().major().data() == index {
                         flag = false;
                         break;
                     }
                 }
                 if flag {
                     // 如果数组中不存在主设备号等于index的设备
-                    return Ok(index); // 返回可用的主设备号
+                    return Ok(Major::new(index)); // 返回可用的主设备号
                 }
             }
         }
@@ -86,7 +92,7 @@ impl CharDevOps {
     #[allow(dead_code)]
     pub fn register_chardev_region(
         from: DeviceNumber,
-        count: usize,
+        count: u32,
         name: &'static str,
     ) -> Result<DeviceNumber, SystemError> {
         Self::__register_chardev_region(from, count, name)
@@ -99,11 +105,15 @@ impl CharDevOps {
     /// @return: 如果注册成功，返回，否则，返回false
     #[allow(dead_code)]
     pub fn alloc_chardev_region(
-        baseminor: usize,
-        count: usize,
+        baseminor: u32,
+        count: u32,
         name: &'static str,
     ) -> Result<DeviceNumber, SystemError> {
-        Self::__register_chardev_region(mkdev(0, baseminor), count, name)
+        Self::__register_chardev_region(
+            DeviceNumber::new(Major::UNNAMED_MAJOR, baseminor),
+            count,
+            name,
+        )
     }
 
     /// @brief: 注册设备号
@@ -113,25 +123,25 @@ impl CharDevOps {
     /// @return: 如果注册成功，返回设备号，否则，返回错误码
     fn __register_chardev_region(
         device_number: DeviceNumber,
-        minorct: usize,
+        minorct: u32,
         name: &'static str,
     ) -> Result<DeviceNumber, SystemError> {
         let mut major = device_number.major();
         let baseminor = device_number.minor();
         if major >= DEV_MAJOR_MAX {
             kerror!(
-                "DEV {} major requested {} is greater than the maximum {}\n",
+                "DEV {} major requested {:?} is greater than the maximum {}\n",
                 name,
                 major,
-                DEV_MAJOR_MAX - 1
+                DEV_MAJOR_MAX.data() - 1
             );
         }
-        if minorct > MINOR_MASK + 1 - baseminor {
+        if minorct > DeviceNumber::MINOR_MASK + 1 - baseminor {
             kerror!("DEV {} minor range requested ({}-{}) is out of range of maximum range ({}-{}) for a single major\n",
-                name, baseminor, baseminor + minorct - 1, 0, MINOR_MASK);
+                name, baseminor, baseminor + minorct - 1, 0, DeviceNumber::MINOR_MASK);
         }
-        let chardev = DeviceStruct::new(mkdev(major, baseminor), minorct, name);
-        if major == 0 {
+        let chardev = DeviceStruct::new(DeviceNumber::new(major, baseminor), minorct, name);
+        if major == Major::UNNAMED_MAJOR {
             // 如果主设备号为0,则自动分配主设备号
             major = Self::find_dynamic_major().expect("Find synamic major error.\n");
         }
@@ -157,7 +167,8 @@ impl CharDevOps {
             }
             items.insert(insert_index, chardev);
         }
-        return Ok(mkdev(major, baseminor));
+
+        return Ok(DeviceNumber::new(major, baseminor));
     }
 
     /// @brief: 注销设备号
@@ -167,7 +178,7 @@ impl CharDevOps {
     /// @return: 如果注销成功，返回()，否则，返回错误码
     fn __unregister_chardev_region(
         device_number: DeviceNumber,
-        minorct: usize,
+        minorct: u32,
     ) -> Result<(), SystemError> {
         if let Some(items) = CHARDEVS
             .lock()
@@ -195,7 +206,7 @@ impl CharDevOps {
         id_table: IdTable,
         range: usize,
     ) -> Result<(), SystemError> {
-        if Into::<usize>::into(id_table.device_number()) == 0 {
+        if id_table.device_number().data() == 0 {
             kerror!("Device number can't be 0!\n");
         }
         device_manager().add_device(cdev.clone())?;

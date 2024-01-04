@@ -10,6 +10,7 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
+    driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{core::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
     libs::spinlock::{SpinLock, SpinLockGuard},
@@ -99,7 +100,7 @@ impl RamFS {
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: 0,
+                raw_dev: DeviceNumber::default(),
             },
             fs: Weak::default(),
             special_node: None,
@@ -286,7 +287,7 @@ impl IndexNode for LockedRamFSInode {
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: data,
+                raw_dev: DeviceNumber::from(data as u32),
             },
             fs: inode.fs.clone(),
             special_node: None,
@@ -475,7 +476,7 @@ impl IndexNode for LockedRamFSInode {
         &self,
         filename: &str,
         mode: ModeType,
-        _dev_t: crate::driver::base::device::DeviceNumber,
+        _dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let mut inode = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
@@ -507,7 +508,7 @@ impl IndexNode for LockedRamFSInode {
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: 0,
+                raw_dev: DeviceNumber::default(),
             },
             fs: inode.fs.clone(),
             special_node: None,

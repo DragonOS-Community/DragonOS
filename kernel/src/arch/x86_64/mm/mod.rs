@@ -330,8 +330,6 @@ impl X86_64MMArch {
                 }
 
                 total_mem_size += mb2_mem_info[i].len as usize;
-                // PHYS_MEMORY_AREAS[areas_count].base = PhysAddr::new(mb2_mem_info[i].addr as usize);
-                // PHYS_MEMORY_AREAS[areas_count].size = mb2_mem_info[i].len as usize;
 
                 mem_block_manager()
                     .add_block(

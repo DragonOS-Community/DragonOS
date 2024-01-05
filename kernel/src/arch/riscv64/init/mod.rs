@@ -3,7 +3,7 @@ use core::intrinsics::unreachable;
 use fdt::node::FdtNode;
 
 use crate::{
-    driver::open_firmware::fdt::open_firmware_fdt_driver,
+    driver::{firmware::efi::init::efi_init, open_firmware::fdt::open_firmware_fdt_driver},
     init::{boot_params, init_before_mem_init},
     kinfo,
     mm::{PhysAddr, VirtAddr},
@@ -14,12 +14,22 @@ use crate::{
 pub struct ArchBootParams {
     /// 启动时的fdt物理地址
     pub fdt_paddr: PhysAddr,
+    pub fdt_vaddr: Option<VirtAddr>,
 }
 
 impl ArchBootParams {
     pub const DEFAULT: Self = ArchBootParams {
         fdt_paddr: PhysAddr::new(0),
+        fdt_vaddr: None,
     };
+
+    pub fn arch_fdt(&self) -> VirtAddr {
+        // 如果fdt_vaddr为None，则说明还没有进行内核虚拟地址空间的映射，此时返回物理地址
+        if self.fdt_vaddr.is_none() {
+            return VirtAddr::new(self.fdt_paddr.data());
+        }
+        self.fdt_vaddr.unwrap()
+    }
 }
 
 #[no_mangle]
@@ -37,6 +47,8 @@ unsafe extern "C" fn kernel_main(hartid: usize, fdt_paddr: usize) -> ! {
     print_node(fdt.find_node("/").unwrap(), 0);
 
     parse_dtb();
+
+    efi_init();
 
     loop {}
     unreachable()
@@ -62,9 +74,6 @@ unsafe fn parse_dtb() {
         panic!("Failed to get fdt address!");
     }
 
-    open_firmware_fdt_driver()
-        .set_fdt_vaddr(VirtAddr::new(fdt_paddr.data()))
-        .unwrap();
     open_firmware_fdt_driver()
         .early_scan_device_tree()
         .expect("Failed to scan device tree at boottime.");

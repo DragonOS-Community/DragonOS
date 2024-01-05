@@ -1,6 +1,7 @@
 pub mod acpi;
 pub mod base;
 pub mod disk;
+pub mod firmware;
 pub mod keyboard;
 pub mod net;
 pub mod open_firmware;

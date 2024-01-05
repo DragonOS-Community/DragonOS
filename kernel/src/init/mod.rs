@@ -7,6 +7,7 @@ use crate::{
         video::{fbdev::base::BootTimeScreenInfo, VideoRefreshManager},
     },
     libs::{lib_ui::screen_manager::scm_init, rwlock::RwLock},
+    mm::VirtAddr,
 };
 
 mod c_adapter;
@@ -98,5 +99,15 @@ impl BootParams {
         self.boot_command_line[pos..pos + len].copy_from_slice(&data[0..len]);
 
         self.boot_command_line[pos + len] = 0;
+    }
+
+    /// 获取FDT的物理地址
+    #[allow(dead_code)]
+    pub fn fdt(&self) -> Option<VirtAddr> {
+        #[cfg(target_arch = "riscv64")]
+        return Some(self.arch.arch_fdt());
+
+        #[cfg(target_arch = "x86_64")]
+        return None;
     }
 }

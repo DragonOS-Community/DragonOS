@@ -45,6 +45,7 @@ system_error = { path = "crates/system_error" }
 unified-init = { path = "crates/unified-init" }
 virtio-drivers = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/virtio-drivers.git", rev = "f1d1cbb" }
 fdt = "0.1.5"
+uefi = { version = "0.26.0", features = ["alloc"] }
 
 # target为x86_64时，使用下面的依赖
 [target.'cfg(target_arch = "x86_64")'.dependencies]

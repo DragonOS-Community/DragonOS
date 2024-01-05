@@ -18,6 +18,30 @@ use super::{
     PageTableKind, VirtAddr,
 };
 
+/// 早期重映射使用的页表
+#[repr(C)]
+#[repr(align(4096))]
+#[derive(Clone, Copy)]
+struct EarlyRemapPage {
+    data: [u64; MMArch::PAGE_SIZE],
+}
+
+#[repr(C)]
+struct EarlyIoRemapPages {
+    pages: [EarlyRemapPage; Self::EARLY_REMAP_PAGES_NUM],
+}
+
+impl EarlyIoRemapPages {
+    pub const EARLY_REMAP_PAGES_NUM: usize = 256;
+    pub const fn new() -> Self {
+        Self {
+            pages: [EarlyRemapPage {
+                data: [0; MMArch::PAGE_SIZE],
+            }; Self::EARLY_REMAP_PAGES_NUM],
+        }
+    }
+}
+
 /// 伪分配器
 struct PseudoAllocator<MMA> {
     phantom: PhantomData<MMA>,

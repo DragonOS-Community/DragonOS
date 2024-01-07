@@ -1,0 +1,109 @@
+#include "ps2_mouse.h"
+#include "common/stddef.h"
+#include <arch/x86_64/driver/apic/apic.h>
+#include <mm/mm.h>
+#include <mm/slab.h>
+#include <common/printk.h>
+#include <common/kprint.h>
+
+struct apic_IO_APIC_RTE_entry ps2_mouse_entry;
+static unsigned char ps2_mouse_id = 0;
+
+/**
+ * @brief 鼠标中断处理函数（中断上半部）
+ *  将数据存入缓冲区
+ * @param irq_num 中断向量号
+ * @param param 参数
+ * @param regs 寄存器信息
+ */
+void ps2_mouse_handler(ul irq_num, ul param, struct pt_regs *regs)
+{
+
+}
+
+hardware_intr_controller ps2_mouse_intr_controller =
+    {
+        .enable = apic_ioapic_enable,
+        .disable = apic_ioapic_disable,
+        .install = apic_ioapic_install,
+        .uninstall = apic_ioapic_uninstall,
+        .ack = apic_ioapic_edge_ack,
+};
+
+/**
+ * @brief 从键盘控制器读取ps2_mouse id
+ *
+ * @return unsigned char 鼠标id
+ */
+static unsigned char ps2_mouse_get_mouse_ID()
+{
+    // 读取鼠标的ID
+    io_out8(PORT_KEYBOARD_CONTROL, KEYBOARD_COMMAND_SEND_TO_PS2_MOUSE);
+    wait_keyboard_write();
+    io_out8(PORT_KEYBOARD_DATA, PS2_MOUSE_GET_ID);
+    wait_keyboard_write();
+    ps2_mouse_id = io_in8(PORT_KEYBOARD_DATA);
+    wait_keyboard_write();
+    io_in8(PORT_KEYBOARD_DATA);
+    for (int i = 0; i < 1000; i++)
+        for (int j = 0; j < 1000; j++)
+            nop();
+    return ps2_mouse_id;
+}
+
+/**
+ * @brief 初始化鼠标驱动程序
+ *
+ */
+void ps2_mouse_init()
+{
+    //======== 初始化中断RTE entry ==========
+
+    ps2_mouse_entry.vector = PS2_MOUSE_INTR_VECTOR;   // 设置中断向量号
+    ps2_mouse_entry.deliver_mode = IO_APIC_FIXED; // 投递模式：混合
+    ps2_mouse_entry.dest_mode = DEST_PHYSICAL;    // 物理模式投递中断
+    ps2_mouse_entry.deliver_status = IDLE;
+    ps2_mouse_entry.trigger_mode = EDGE_TRIGGER; // 设置边沿触发
+    ps2_mouse_entry.polarity = POLARITY_HIGH;    // 高电平触发
+    ps2_mouse_entry.remote_IRR = IRR_RESET;
+    ps2_mouse_entry.mask = MASKED;
+    ps2_mouse_entry.reserved = 0;
+
+    ps2_mouse_entry.destination.physical.reserved1 = 0;
+    ps2_mouse_entry.destination.physical.reserved2 = 0;
+    ps2_mouse_entry.destination.physical.phy_dest = 0; // 设置投递到BSP处理器
+
+    // 注册中断处理程序
+    irq_register(PS2_MOUSE_INTR_VECTOR, &ps2_mouse_entry, &ps2_mouse_handler, 0, &ps2_mouse_intr_controller, "ps/2 mouse");
+
+    wait_keyboard_write();
+    io_out8(PORT_KEYBOARD_CONTROL, KEYBOARD_COMMAND_ENABLE_PS2_MOUSE_PORT); // 开启鼠标端口
+    for (int i = 0; i < 1000; i++)
+        for (int j = 0; j < 1000; j++)
+            nop();
+    wait_keyboard_write();
+    io_in8(PORT_KEYBOARD_DATA);
+
+    io_out8(PORT_KEYBOARD_CONTROL, KEYBOARD_COMMAND_SEND_TO_PS2_MOUSE);
+    wait_keyboard_write();
+    io_out8(PORT_KEYBOARD_DATA, PS2_MOUSE_ENABLE); // 允许鼠标设备发送数据包
+    wait_keyboard_write();
+    io_in8(PORT_KEYBOARD_DATA);
+
+    for (int i = 0; i < 1000; i++)
+        for (int j = 0; j < 1000; j++)
+            nop();
+    wait_keyboard_write();
+    io_out8(PORT_KEYBOARD_CONTROL, KEYBOARD_COMMAND_WRITE);
+    wait_keyboard_write();
+    io_out8(PORT_KEYBOARD_DATA, KEYBOARD_PARAM_INIT); // 设置键盘控制器
+    wait_keyboard_write();
+    io_in8(PORT_KEYBOARD_DATA);
+    for (int i = 0; i < 1000; i++)
+        for (int j = 0; j < 1000; j++)
+            nop();
+    wait_keyboard_write();
+    ps2_mouse_get_mouse_ID();
+    ps2_mouse_set_sample_rate(30);
+    kdebug("ps2_mouse ID:%d", ps2_mouse_id);
+}

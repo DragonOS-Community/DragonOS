@@ -42,7 +42,13 @@ pub trait SerioDriver: Driver {
     fn cleanup(&self, device: &Arc<dyn SerioDevice>) -> Result<(), SystemError>;
 }
 
-///todo: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/serio.c#810
+//todo: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/serio.c#810
+
+#[inline(always)]
+pub fn serio_driver_manager() -> &'static SerioDriverManager {
+    &SerioDriverManager
+}
+
 pub struct SerioDriverManager;
 
 #[allow(dead_code)]

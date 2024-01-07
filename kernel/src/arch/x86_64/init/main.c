@@ -142,6 +142,7 @@ void system_initialize() {
 
   cpu_init();
 
+  ps2_keyboard_init();
   io_mfence();
 
   rs_pci_init();

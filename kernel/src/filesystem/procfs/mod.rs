@@ -39,6 +39,7 @@ use super::vfs::{
 
 mod kmsg;
 mod log_message;
+mod syslog;
 
 /// 缓冲区容量
 const KMSG_BUFFER_CAPACITY: usize = 1024;
@@ -354,7 +355,7 @@ impl ProcFS {
             panic!("create meminfo error");
         }
 
-        // 创建kmsg文件，当作环形缓冲区的文件接口，实际并不存储数据
+        // 创建kmsg文件
         let binding = inode.create("kmsg", FileType::File, ModeType::from_bits_truncate(0o444));
         if let Ok(kmsg) = binding {
             let kmsg_file = kmsg
@@ -434,7 +435,6 @@ impl IndexNode for LockedProcFSInode {
         let file_size = match inode.fdata.ftype {
             ProcFileType::ProcStatus => inode.open_status(&mut private_data)?,
             ProcFileType::ProcMeminfo => inode.open_meminfo(&mut private_data)?,
-            ProcFileType::ProcKmsg => KMSG.lock().open()?,
             _ => {
                 todo!()
             }
@@ -488,7 +488,7 @@ impl IndexNode for LockedProcFSInode {
         match inode.fdata.ftype {
             ProcFileType::ProcStatus => return inode.proc_read(offset, len, buf, private_data),
             ProcFileType::ProcMeminfo => return inode.proc_read(offset, len, buf, private_data),
-            ProcFileType::ProcKmsg => return KMSG.lock().read(offset, len, buf),
+            ProcFileType::ProcKmsg => (),
             ProcFileType::Default => (),
         };
 

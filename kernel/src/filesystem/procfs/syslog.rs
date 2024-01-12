@@ -37,7 +37,7 @@ impl Syscall {
             SYSLOG_ACTION_READ => KMSG.lock().read(len, buf),
             SYSLOG_ACTION_READ_CLEAR => KMSG.lock().read_clear(len, buf),
             SYSLOG_ACTION_CLEAR => KMSG.lock().clear(),
-            SYSLOG_ACTION_SIZE_BUFFER => KMSG.lock().buffer_size(),
+            SYSLOG_ACTION_SIZE_BUFFER => KMSG.lock().data_size(),
             SYSLOG_ACTION_CONSOLE_LEVEL => KMSG.lock().set_level(len),
             _ => todo!(),
         }

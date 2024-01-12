@@ -1,46 +1,55 @@
 use super::log_message::LogMessage;
 use alloc::{borrow::ToOwned, string::ToString, vec::Vec};
-use kdepends::thingbuf::ThingBuf;
+use kdepends::ringbuffer::{ConstGenericRingBuffer, RingBuffer};
 use system_error::SystemError;
 
+/// 缓冲区容量
+const KMSG_BUFFER_CAPACITY: usize = 100;
+
+/// 当KMSG的console_loglevel等于CONSOLE_LOGLEVEL_DEFAULT时，表示可以打印所有级别的日志消息到控制台
 const CONSOLE_LOGLEVEL_DEFAULT: usize = 8;
 
 /// 日志
 pub struct Kmsg {
     /// 环形缓冲区
-    buffer: ThingBuf<LogMessage>,
+    buffer: ConstGenericRingBuffer<LogMessage, KMSG_BUFFER_CAPACITY>,
     /// 缓冲区字节数组
     data: Vec<u8>,
     /// 能够输出到控制台的日志级别
     console_loglevel: usize,
+    /// 判断buffer在上一次转成字节数组之后是否发生变动
+    is_changed: bool,
 }
 
 impl Kmsg {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new() -> Self {
         Kmsg {
-            buffer: ThingBuf::<LogMessage>::new(capacity),
+            buffer: ConstGenericRingBuffer::<LogMessage, KMSG_BUFFER_CAPACITY>::new(),
             data: Vec::new(),
             console_loglevel: CONSOLE_LOGLEVEL_DEFAULT,
+            is_changed: false,
         }
     }
 
     /// 添加日志消息
-    pub fn push(&mut self, msg: LogMessage) -> Result<(), SystemError> {
-        let len = self.buffer.len();
-        if len == self.buffer.capacity() {
-            self.buffer.pop();
-        }
-
-        if self.buffer.push(msg).is_err() {
-            return Err(SystemError::ENOMEM);
-        }
-
-        return Ok(());
+    pub fn push(&mut self, msg: LogMessage) {
+        self.buffer.push(msg);
+        self.is_changed = true;
     }
 
     /// 读取缓冲区
     pub fn read(&mut self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        self.tobytes()?;
+        let r = match self.console_loglevel {
+            CONSOLE_LOGLEVEL_DEFAULT => self.read_all(len, buf),
+            _ => self.read_level(len, buf),
+        };
+
+        r
+    }
+
+    /// 读取缓冲区所有日志消息
+    fn read_all(&mut self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.tobytes();
 
         let mut len = len;
         len = self.data.len().min(len);
@@ -54,27 +63,51 @@ impl Kmsg {
         let src = &self.data[0..len];
         buf[0..src.len()].copy_from_slice(src);
 
-        self.console_loglevel = CONSOLE_LOGLEVEL_DEFAULT;
-
         return Ok(src.len());
     }
 
-    /// 清空缓冲区
-    pub fn clear(&mut self) -> Result<usize, SystemError> {
-        while !self.buffer.is_empty() {
-            self.buffer.pop();
-        }
-        self.data.clear();
+    /// 读取缓冲区特定level的日志消息
+    fn read_level(&mut self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let mut data_level: Vec<u8> = Vec::new();
 
-        return Ok(0);
+        for msg in self.buffer.iter() {
+            if msg.level() as usize == self.console_loglevel {
+                data_level.append(&mut msg.to_string().as_bytes().to_owned());
+            }
+        }
+
+        let mut len = len;
+        len = data_level.len().min(len);
+
+        // buffer空间不足
+        if buf.len() < len {
+            return Err(SystemError::ENOBUFS);
+        }
+
+        // 拷贝数据
+        let src = &data_level[0..len];
+        buf[0..src.len()].copy_from_slice(src);
+
+        // 将控制台输出日志level改回默认，否则之后都是打印特定level的日志消息
+        self.console_loglevel = CONSOLE_LOGLEVEL_DEFAULT;
+
+        return Ok(data_level.len());
     }
 
     /// 读取并清空缓冲区
     pub fn read_clear(&mut self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let r = self.read(len, buf);
+        let r = self.read_all(len, buf);
         self.clear()?;
 
         return r;
+    }
+
+    /// 清空缓冲区
+    pub fn clear(&mut self) -> Result<usize, SystemError> {
+        self.buffer.clear();
+        self.data.clear();
+
+        return Ok(0);
     }
 
     /// 设置输出到控制台的日志级别
@@ -89,41 +122,25 @@ impl Kmsg {
         return Ok(0);
     }
 
-    // 将环形缓冲区的日志消息转成字节数组以拷入用户buf
-    pub fn tobytes(&mut self) -> Result<usize, SystemError> {
-        self.data.clear();
+    /// 将环形缓冲区的日志消息转成字节数组以拷入用户buf
+    fn tobytes(&mut self) -> usize {
+        if self.is_changed {
+            self.data.clear();
 
-        let size = self.buffer.len();
-
-        // 如果控制台日志级别为默认级别，则可以输出所有日志消息到控制台
-        if self.console_loglevel == CONSOLE_LOGLEVEL_DEFAULT {
-            for _ in 0..size {
-                if let Some(msg) = self.buffer.pop() {
+            if self.console_loglevel == CONSOLE_LOGLEVEL_DEFAULT {
+                for msg in self.buffer.iter() {
                     self.data.append(&mut msg.to_string().as_bytes().to_owned());
-                    self.push(msg)?;
                 }
             }
-        }
-        // 否则，只能输出特定日志级别的日志消息到控制台
-        else {
-            for _ in 0..size {
-                if let Some(msg) = self.buffer.pop() {
-                    if msg.level() as usize != self.console_loglevel {
-                        self.push(msg)?;
-                        continue;
-                    }
-                    self.data.append(&mut msg.to_string().as_bytes().to_owned());
-                    self.push(msg)?;
-                }
-            }
+
+            self.is_changed = false;
         }
 
-        return Ok(self.data.len());
+        return self.data.len();
     }
 
     // 返回内核缓冲区所占字节数
-    pub fn buffer_size(&mut self) -> Result<usize, SystemError> {
-        self.tobytes()?;
-        return Ok(self.data.len());
+    pub fn data_size(&mut self) -> Result<usize, SystemError> {
+        return Ok(self.tobytes());
     }
 }

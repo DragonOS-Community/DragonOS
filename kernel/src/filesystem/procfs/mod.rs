@@ -4,14 +4,14 @@ use alloc::{
     borrow::ToOwned,
     collections::BTreeMap,
     format,
-    string::String,
+    string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
 use system_error::SystemError;
 
 use crate::{
-    arch::mm::LockedFrameAllocator,
+    arch::{mm::LockedFrameAllocator, CurrentTimeArch},
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
         procfs::kmsg::Kmsg,
@@ -28,8 +28,11 @@ use crate::{
     },
     mm::allocator::page_frame::FrameAllocator,
     process::{Pid, ProcessManager},
+    time::TimeArch,
     time::TimeSpec,
 };
+
+use self::log_message::{LogLevel, LogMessage, LogType};
 
 use super::vfs::{
     file::{FileMode, FilePrivateData},
@@ -41,12 +44,9 @@ mod kmsg;
 mod log_message;
 mod syslog;
 
-/// 缓冲区容量
-const KMSG_BUFFER_CAPACITY: usize = 1024;
-
 lazy_static! {
     /// 全局环形缓冲区
-    static ref KMSG: Mutex<Kmsg> = Mutex::new(Kmsg::new(KMSG_BUFFER_CAPACITY));
+    static ref KMSG: Mutex<Kmsg> = Mutex::new(Kmsg::new());
 }
 
 /// @brief 进程文件类型

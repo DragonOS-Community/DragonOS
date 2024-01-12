@@ -4,7 +4,7 @@ use kdepends::ringbuffer::{ConstGenericRingBuffer, RingBuffer};
 use system_error::SystemError;
 
 /// 缓冲区容量
-const KMSG_BUFFER_CAPACITY: usize = 100;
+const KMSG_BUFFER_CAPACITY: usize = 1024;
 
 /// 当KMSG的console_loglevel等于CONSOLE_LOGLEVEL_DEFAULT时，表示可以打印所有级别的日志消息到控制台
 const CONSOLE_LOGLEVEL_DEFAULT: usize = 8;

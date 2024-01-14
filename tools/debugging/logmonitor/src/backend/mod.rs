@@ -53,7 +53,7 @@ impl AppBackend {
 }
 
 #[derive(Debug)]
-struct BackendData {
+pub(crate) struct BackendData {
     kernel_metadata: Option<loader::KernelMetadata>,
     /// Path to the QEMU shm which contains the kernel memory.
     kmem_path: Option<PathBuf>,

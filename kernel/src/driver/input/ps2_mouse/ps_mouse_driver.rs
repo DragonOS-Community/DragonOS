@@ -25,6 +25,17 @@ use crate::{
 
 use super::ps_mouse_device::Ps2MouseDevice;
 
+#[no_mangle]
+pub extern "C" fn ps2_mouse_driver_interrupt () {
+    ps2_mouse_driver().process_packet();
+}
+
+static mut PS2_MOUSE_DRIVER :Option<Arc<Ps2MouseDriver>> = None;
+
+pub fn ps2_mouse_driver() -> Arc<Ps2MouseDriver> {
+    unsafe { PS2_MOUSE_DRIVER.clone().unwrap() }
+}
+
 #[derive(Debug)]
 pub struct Ps2MouseDriver {
     inner: SpinLock<InnerPs2MouseDriver>,
@@ -50,6 +61,16 @@ impl Ps2MouseDriver {
         r.inner.lock().self_ref = Arc::downgrade(&r);
         return r;
     }
+
+    pub fn process_packet(&self) {
+        let guard = self.inner.lock();
+        if guard.devices.is_empty() {
+            return;
+        }
+        
+        let device: Option<&Ps2MouseDevice> = guard.devices[0].as_any_ref().downcast_ref::<Ps2MouseDevice>();
+        let _ = device.unwrap().process_packet();
+    }
 }
 
 #[derive(Debug)]
@@ -73,6 +94,8 @@ impl Driver for Ps2MouseDriver {
     }
 
     fn add_device(&self, device: Arc<dyn crate::driver::base::device::Device>) {
+        kdebug!("xkd mouse add device");
+
         let mut guard = self.inner.lock();
         // check if the device is already in the list
         if guard.devices.iter().any(|dev| Arc::ptr_eq(dev, &device)) {
@@ -181,15 +204,16 @@ impl SerioDriver for Ps2MouseDriver {
         &self,
         device: &Arc<dyn crate::driver::input::serio::serio_device::SerioDevice>,
     ) -> Result<(), system_error::SystemError> {
-        kdebug!("Connecting to PS/2 mouse");
+        kdebug!("xkd mouse connect");
+
         let device = device
             .clone()
             .arc_any()
             .downcast::<Ps2MouseDevice>()
             .map_err(|_| SystemError::EINVAL)?;
 
+
         device.set_driver(Some(self.inner.lock_irqsave().self_ref.clone()));
-        kdebug!("Connected to PS/2 mouse successfully");
         return Ok(());
     }
 
@@ -224,9 +248,12 @@ impl SerioDriver for Ps2MouseDriver {
 
 #[unified_init(INITCALL_DEVICE)]
 fn ps2_mouse_driver_init() -> Result<(), SystemError> {
+    kdebug!("Ps2_mouse_drive initing...");
     let driver = Ps2MouseDriver::new();
 
-    serio_driver_manager().register(driver)?;
+    serio_driver_manager().register(driver.clone())?;
+
+    unsafe{ PS2_MOUSE_DRIVER = Some(driver) };
 
     return Ok(());
 }

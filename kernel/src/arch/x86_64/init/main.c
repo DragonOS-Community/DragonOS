@@ -23,6 +23,7 @@
 
 #include "driver/acpi/acpi.h"
 #include "driver/disk/ata.h"
+#include "driver/keyboard/ps2_keyboard.h"
 #include "driver/multiboot2/multiboot2.h"
 #include <time/timer.h>
 

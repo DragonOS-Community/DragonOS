@@ -30,7 +30,7 @@ pub struct MMLogMonitor {
 }
 
 impl MMLogMonitor {
-    pub fn new(shared_data: Arc<Mutex<BackendData>>) -> Arc<Self> {
+    pub(crate) fn new(shared_data: Arc<Mutex<BackendData>>) -> Arc<Self> {
         let guard = shared_data.lock().unwrap();
         let mm_log_buffer_symbol: Option<Symbol> = guard
             .kernel_metadata
@@ -153,7 +153,20 @@ impl MMMonitorThread {
     pub fn run(&mut self) {
         info!("MMMonitorThread::run(): kmem_path: {:?}", self.kmem_path);
 
-        let mut kmem_file = self.open_kmem_file().expect("Failed to open kmem file.");
+        let mut kmem_file = {
+            let mut file: File;
+            loop {
+                let f = self.open_kmem_file();
+                if f.is_ok() {
+                    file = f.unwrap();
+                    break;
+                } else {
+                    log::error!("Failed to open kmem file, error: {:?}", f.unwrap_err());
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+            file
+        };
 
         info!("Channel header loaded!");
 

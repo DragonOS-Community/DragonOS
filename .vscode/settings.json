@@ -17,7 +17,7 @@
         "kprint.h": "c",
         "8259a.h": "c",
         "ptrace.h": "c",
-        "mouse.h": "c",
+        "ps2_mouse.h": "c",
         "keyboard.h": "c",
         "apic.h": "c",
         "ps2_keyboard.h": "c",

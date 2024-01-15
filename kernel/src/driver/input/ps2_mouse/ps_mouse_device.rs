@@ -1,3 +1,5 @@
+use core::hint::spin_loop;
+
 use alloc::{
     string::ToString,
     sync::{Arc, Weak},
@@ -6,6 +8,7 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
+    arch::{io::PortIOArch, CurrentPortIOArch},
     driver::{
         base::{
             class::Class,
@@ -20,6 +23,121 @@ use crate::{
     libs::spinlock::SpinLock,
 };
 
+extern "C" {
+    fn ps2_mouse_init();
+}
+
+const ADDRESS_PORT_ADDRESS: u16 = 0x64;
+const DATA_PORT_ADDRESS: u16 = 0x60;
+const GET_STATUS_BYTE: u8 = 0x20;
+const SET_STATUS_BYTE: u8 = 0x60;
+
+const KEYBOARD_COMMAND_ENABLE_PS2_MOUSE_PORT: u8 = 0xa8;
+const KEYBOARD_COMMAND_SEND_TO_PS2_MOUSE: u8 = 0xd4;
+
+
+bitflags! {
+    /// Represents the flags currently set for the mouse.
+    #[derive(Default)]
+    pub struct MouseFlags: u8 {
+        /// Whether or not the left mouse button is pressed.
+        const LEFT_BUTTON = 0b0000_0001;
+
+        /// Whether or not the right mouse button is pressed.
+        const RIGHT_BUTTON = 0b0000_0010;
+
+        /// Whether or not the middle mouse button is pressed.
+        const MIDDLE_BUTTON = 0b0000_0100;
+
+        /// Whether or not the packet is valid or not.
+        const ALWAYS_ONE = 0b0000_1000;
+
+        /// Whether or not the x delta is negative.
+        const X_SIGN = 0b0001_0000;
+
+        /// Whether or not the y delta is negative.
+        const Y_SIGN = 0b0010_0000;
+
+        /// Whether or not the x delta overflowed.
+        const X_OVERFLOW = 0b0100_0000;
+
+        /// Whether or not the y delta overflowed.
+        const Y_OVERFLOW = 0b1000_0000;
+    }
+}
+
+#[repr(u8)]
+enum Command {
+    EnablePacketStreaming = 0xF4,
+    SetDefaults = 0xF6,
+    InitKeyboard = 0x47,
+    GetMouseId = 0xf2,
+}
+
+#[derive(Debug)]
+pub struct MouseState {
+    flags: MouseFlags,
+    x: i16,
+    y: i16,
+}
+
+#[allow(dead_code)]
+impl MouseState {
+    /// Returns a new `MouseState`.
+    pub const fn new() -> MouseState {
+        MouseState {
+            flags: MouseFlags::empty(),
+            x: 0,
+            y: 0,
+        }
+    }
+
+    /// Returns true if the left mouse button is currently down.
+    pub fn left_button_down(&self) -> bool {
+        self.flags.contains(MouseFlags::LEFT_BUTTON)
+    }
+
+    /// Returns true if the left mouse button is currently up.
+    pub fn left_button_up(&self) -> bool {
+        !self.flags.contains(MouseFlags::LEFT_BUTTON)
+    }
+
+    /// Returns true if the right mouse button is currently down.
+    pub fn right_button_down(&self) -> bool {
+        self.flags.contains(MouseFlags::RIGHT_BUTTON)
+    }
+
+    /// Returns true if the right mouse button is currently up.
+    pub fn right_button_up(&self) -> bool {
+        !self.flags.contains(MouseFlags::RIGHT_BUTTON)
+    }
+
+    /// Returns true if the x axis has moved.
+    pub fn x_moved(&self) -> bool {
+        self.x != 0
+    }
+
+    /// Returns true if the y axis has moved.
+    pub fn y_moved(&self) -> bool {
+        self.y != 0
+    }
+
+    /// Returns true if the x or y axis has moved.
+    pub fn moved(&self) -> bool {
+        self.x_moved() || self.y_moved()
+    }
+
+    /// Returns the x delta of the mouse state.
+    pub fn get_x(&self) -> i16 {
+        self.x
+    }
+
+    /// Returns the y delta of the mouse state.
+    pub fn get_y(&self) -> i16 {
+        self.y
+    }
+}
+
 #[derive(Debug)]
 #[cast_to([sync] Device, SerioDevice)]
 pub struct Ps2MouseDevice {
@@ -27,6 +145,7 @@ pub struct Ps2MouseDevice {
     kobj_state: LockedKObjectState,
 }
 
+#[allow(dead_code)]
 impl Ps2MouseDevice {
     pub const NAME: &'static str = "ps2-mouse-device";
     pub fn new() -> Self {
@@ -39,10 +158,147 @@ impl Ps2MouseDevice {
                 parent: None,
                 kset: None,
                 kobj_type: None,
+
+                command_port: ADDRESS_PORT_ADDRESS,
+                data_port: DATA_PORT_ADDRESS,
+                current_packet: 0,
+                current_state: MouseState::new(),
             }),
             kobj_state: LockedKObjectState::new(None),
         };
         return r;
+    }
+
+    #[allow(dead_code)]
+    pub fn init(&mut self) -> Result<(), SystemError> {
+        // self.write_command_port(KEYBOARD_COMMAND_ENABLE_PS2_MOUSE_PORT)?;
+        // loop{spin_loop()}
+        // self.read_data_port()?;
+
+        // self.send_command(Command::EnablePacketStreaming)?;
+        // self.read_data_port()?;
+        // loop{spin_loop()}
+            
+        // self.write_command_port(SET_STATUS_BYTE)?;
+        // self.send_command(Command::InitKeyboard)?;
+        // self.read_data_port()?;
+        // loop{spin_loop()}
+
+        // self.get_mouse_id()?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn get_mouse_id(&self) -> Result<(), SystemError> {
+        self.send_command(Command::GetMouseId)?;
+        let mouse_id = self.read_data_port()?;
+        loop{spin_loop()}
+    }
+
+    pub fn process_packet(&self) -> Result<(), SystemError>{
+        kdebug!("xkd mouse process-packet\n");
+        let packet = self.read_data_port()?;
+        let mut guard = self.inner.lock();
+        match guard.current_packet {
+            0 => {
+                let flags: MouseFlags = MouseFlags::from_bits_truncate(packet);
+                if !flags.contains(MouseFlags::ALWAYS_ONE) {
+                    return Ok(());
+                }
+                guard.current_state.flags = flags;
+            }
+            1 => {
+                self.process_x_movement(packet);
+            }
+            2 => {
+                self.process_y_movement(packet);
+                kdebug!("Ps2MouseDevice packet :{}, {}, {}", guard.current_state.flags.bits, guard.current_state.x, guard.current_state.y);
+            }
+            _ => unreachable!(),
+        }
+        guard.current_packet = (guard.current_packet + 1) % 3;
+        Ok(())
+    }
+
+    fn process_x_movement(&self, packet: u8) {
+        let mut guard = self.inner.lock();
+        if !guard.current_state.flags.contains(MouseFlags::X_OVERFLOW) {
+            guard.current_state.x = if guard.current_state.flags.contains(MouseFlags::X_SIGN) {
+                self.sign_extend(packet)
+            } else {
+                packet as i16
+            }
+        }
+    }
+
+    fn process_y_movement(&self, packet: u8) {
+        let mut guard = self.inner.lock();
+        if !guard.current_state.flags.contains(MouseFlags::Y_OVERFLOW) {
+            guard.current_state.y = if guard.current_state.flags.contains(MouseFlags::Y_SIGN) {
+                self.sign_extend(packet)
+            } else {
+                packet as i16
+            }
+        }
+    }
+
+    fn sign_extend(&self, packet: u8) -> i16 {
+        ((packet as u16) | 0xFF00) as i16
+    }
+
+    fn read_data_port(&self) -> Result<u8, SystemError> {
+        self.wait_for_write()?;
+        let guard = self.inner.lock();
+        let data = unsafe { CurrentPortIOArch::in8(guard.data_port) };
+        Ok(data)
+    }
+
+    fn send_command(&self, command: Command) -> Result<(), SystemError> {
+        self.write_command_port(KEYBOARD_COMMAND_SEND_TO_PS2_MOUSE)?;
+        self.write_data_port(command as u8)?;
+        Ok(())
+    }
+
+    fn write_data_port(&self, data: u8) -> Result<(), SystemError> {
+        self.wait_for_write()?;
+        let guard = self.inner.lock();
+        unsafe {
+            CurrentPortIOArch::out8(guard.data_port, data);
+        }
+        Ok(())
+    }
+
+    fn write_command_port(&self, command: u8) -> Result<(), SystemError> {
+        self.wait_for_write()?;
+        let guard = self.inner.lock();
+        unsafe {
+            CurrentPortIOArch::out8(guard.command_port, command);
+        }
+        Ok(())
+    }
+
+    fn wait_for_read(&self) -> Result<(), SystemError> {
+        let guard = self.inner.lock();
+        let timeout = 100_000;
+        for _ in 0..timeout {
+            let value = unsafe { CurrentPortIOArch::in8(guard.command_port) };
+            if (value & 0x1) == 0x1 {
+                return Ok(());
+            }
+        }
+        Err(SystemError::ETIMEDOUT)
+    }
+
+    fn wait_for_write(&self) -> Result<(), SystemError> {
+        let guard = self.inner.lock();
+        let timeout = 100_000;
+        for _ in 0..timeout {
+            let value = unsafe { CurrentPortIOArch::in8(guard.command_port) };
+            if (value & 0x2) == 0 {
+                return Ok(());
+            }
+        }
+        Err(SystemError::ETIMEDOUT)
     }
 }
 
@@ -55,6 +311,11 @@ struct InnerPs2MouseDevice {
     parent: Option<Weak<dyn KObject>>,
     kset: Option<Arc<KSet>>,
     kobj_type: Option<&'static dyn KObjType>,
+
+    command_port: u16,
+    data_port: u16,
+    current_packet: u8,
+    current_state: MouseState,
 }
 
 impl Device for Ps2MouseDevice {
@@ -86,6 +347,7 @@ impl Device for Ps2MouseDevice {
         &self,
         driver: Option<alloc::sync::Weak<dyn crate::driver::base::device::driver::Driver>>,
     ) {
+        kdebug!("xkd mouse setdriver");
         self.inner.lock().driver = driver;
     }
 
@@ -208,8 +470,11 @@ impl KObject for Ps2MouseDevice {
 
 #[unified_init(INITCALL_DEVICE)]
 fn ps2_mouse_device_int() -> Result<(), SystemError> {
-    let device = Arc::new(Ps2MouseDevice::new());
-    device_manager().device_default_initialize(&(device.clone() as Arc<dyn Device>));
-    serio_device_manager().register_port(device)?;
+    let mut device = Ps2MouseDevice::new();
+    unsafe { ps2_mouse_init() };
+    device.init()?;
+    let ptr = Arc::new(device);
+    device_manager().device_default_initialize(&(ptr.clone() as Arc<dyn Device>));
+    serio_device_manager().register_port(ptr)?;
     return Ok(());
 }

@@ -9,7 +9,13 @@
 //! 也就是说，他们的第二级页表在最顶级页表中，占用了第0和第256个页表项。
 //!
 
-use crate::mm::{MMArch, MemoryManagementArch, PhysAddr};
+use bitmap::{traits::BitMapOps, StaticBitmap};
+
+use crate::{
+    libs::spinlock::SpinLock,
+    mm::{MMArch, MemoryManagementArch, PhysAddr},
+};
+
 use core::marker::PhantomData;
 
 use super::{
@@ -17,6 +23,9 @@ use super::{
     page::PageFlags,
     PageTableKind, VirtAddr,
 };
+
+/// 用于存储重映射页表的位图和页面
+static EARLY_IOREMAP_PAGES: SpinLock<EarlyIoRemapPages> = SpinLock::new(EarlyIoRemapPages::new());
 
 /// 早期重映射使用的页表
 #[repr(C)]
@@ -26,18 +35,57 @@ struct EarlyRemapPage {
     data: [u64; MMArch::PAGE_SIZE],
 }
 
+impl EarlyRemapPage {
+    /// 清空数据
+    fn zero(&mut self) {
+        self.data.fill(0);
+    }
+}
+
 #[repr(C)]
 struct EarlyIoRemapPages {
     pages: [EarlyRemapPage; Self::EARLY_REMAP_PAGES_NUM],
+    bmp: StaticBitmap<{ Self::EARLY_REMAP_PAGES_NUM }>,
 }
 
 impl EarlyIoRemapPages {
+    /// 预留的用于在内存管理初始化之前，映射内存所使用的页表数量
     pub const EARLY_REMAP_PAGES_NUM: usize = 256;
     pub const fn new() -> Self {
         Self {
             pages: [EarlyRemapPage {
                 data: [0; MMArch::PAGE_SIZE],
             }; Self::EARLY_REMAP_PAGES_NUM],
+            bmp: StaticBitmap::new(),
+        }
+    }
+
+    /// 分配一个页面
+    ///
+    /// 如果成功，返回虚拟地址
+    ///
+    /// 如果失败，返回None
+    pub fn allocate_page(&mut self) -> Option<VirtAddr> {
+        if let Some(index) = self.bmp.first_false_index() {
+            self.bmp.set(index, true);
+            // 清空数据
+            self.pages[index].zero();
+
+            let p = &self.pages[index] as *const EarlyRemapPage as usize;
+            return Some(VirtAddr::new(p));
+        } else {
+            return None;
+        }
+    }
+
+    pub fn free_page(&mut self, addr: VirtAddr) {
+        // 判断地址是否合法
+        let start_vaddr = &self.pages[0] as *const EarlyRemapPage as usize;
+        let offset = addr.data() - start_vaddr;
+        let index = offset / MMArch::PAGE_SIZE;
+        if index < Self::EARLY_REMAP_PAGES_NUM {
+            assert_eq!(self.bmp.get(index).unwrap(), true);
+            self.bmp.set(index, false);
         }
     }
 }
@@ -57,17 +105,26 @@ impl<MMA: MemoryManagementArch> PseudoAllocator<MMA> {
 
 /// 为NoInitAllocator实现FrameAllocator
 impl<MMA: MemoryManagementArch> FrameAllocator for PseudoAllocator<MMA> {
-    unsafe fn allocate(&mut self, _count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
-        panic!("NoInitAllocator can't allocate page frame");
+    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
+        assert!(count.data() == 1);
+        let vaddr = EARLY_IOREMAP_PAGES.lock_irqsave().allocate_page()?;
+        let paddr = MMA::virt_2_phys(vaddr)?;
+        return Some((paddr, count));
     }
 
-    unsafe fn free(&mut self, _address: PhysAddr, _count: PageFrameCount) {
-        panic!("NoInitAllocator can't free page frame");
+    unsafe fn free(&mut self, address: PhysAddr, count: PageFrameCount) {
+        assert_eq!(count.data(), 1);
+        assert!(address.check_aligned(MMA::PAGE_SIZE));
+        let vaddr = MMA::phys_2_virt(address);
+        if let Some(vaddr) = vaddr {
+            EARLY_IOREMAP_PAGES.lock_irqsave().free_page(vaddr);
+        }
     }
     /// @brief: 获取内存区域页帧的使用情况
     /// @param  self
     /// @return 页帧的使用情况
     unsafe fn usage(&self) -> PageFrameUsage {
+        // 暂时不支持
         panic!("NoInitAllocator can't get page frame usage");
     }
 }

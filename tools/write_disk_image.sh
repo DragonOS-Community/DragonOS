@@ -74,7 +74,7 @@ if [ ! -f "${root_folder}/bin/${DISK_NAME}" ]; then
         --bios) 
         case "$2" in
                 uefi)
-            sudo ARCH=${ARCH} bash ./create_hdd_image.sh -P MBR #GPT分区
+            sudo ARCH=${ARCH} bash ./create_hdd_image.sh -P GPT #GPT分区
             ;;
                 legacy)
             sudo ARCH=${ARCH} bash ./create_hdd_image.sh -P MBR #MBR分区

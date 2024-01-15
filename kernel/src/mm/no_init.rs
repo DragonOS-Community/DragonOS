@@ -71,7 +71,9 @@ impl EarlyIoRemapPages {
             self.pages[index].zero();
 
             let p = &self.pages[index] as *const EarlyRemapPage as usize;
-            return Some(VirtAddr::new(p));
+            let vaddr = VirtAddr::new(p);
+            assert!(vaddr.check_aligned(MMArch::PAGE_SIZE));
+            return Some(vaddr);
         } else {
             return None;
         }

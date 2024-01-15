@@ -5,6 +5,8 @@ use crate::driver::base::device::{bus::Bus, Device};
 
 use super::serio_bus;
 
+/// @brief: 串行设备，实现该trait的设备实例挂载在serio总线上，同时应该实现Device trait
+///
 /// 参考: https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/serio.h#20
 pub trait SerioDevice: Device {
     /// @brief: Serio设备写入数据

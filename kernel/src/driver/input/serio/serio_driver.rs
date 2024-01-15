@@ -9,6 +9,7 @@ use crate::driver::base::device::{
 use super::{serio_bus, serio_device::SerioDevice};
 
 /// @brief: 实现该trait的设备驱动实例应挂载在serio总线上，同时应该实现Driver trait
+///
 /// 参考:  https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/serio.h#67
 pub trait SerioDriver: Driver {
     // 写入时唤醒设备

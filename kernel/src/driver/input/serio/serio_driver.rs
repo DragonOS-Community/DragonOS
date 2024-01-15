@@ -14,7 +14,7 @@ pub trait SerioDriver: Driver {
     // 写入时唤醒设备
     fn write_wakeup(&self, device: &Arc<dyn SerioDevice>) -> Result<(), SystemError>;
     /// @brief: 中断函数
-    /// @parameter: 
+    /// @parameter:
     /// device: Serio设备
     /// data: 端口数据
     /// flag: 状态掩码
@@ -50,7 +50,7 @@ impl SerioDriverManager {
         driver.set_bus(Some(Arc::downgrade(&(serio_bus() as Arc<dyn Bus>))));
         return driver_manager().register(driver as Arc<dyn Driver>);
     }
-    
+
     /// @brief: 卸载Serio驱动
     /// @parameter: 待卸载的Serio驱动
     /// @return: None

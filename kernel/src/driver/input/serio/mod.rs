@@ -18,7 +18,8 @@ pub fn serio_bus() -> Arc<SerioBus> {
 }
 
 /// @brief: 初始化serio总线
-///
+/// @return: None
+/// 
 /// 参考: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/serio.c#1024
 pub fn serio_bus_init() -> Result<(), SystemError> {
     let serio_bus = SerioBus::new();

@@ -20,18 +20,26 @@ use crate::{
     },
     filesystem::kernfs::KernFSInode,
     init::initcall::INITCALL_DEVICE,
-    libs::spinlock::SpinLock,
+    libs::spinlock::SpinLock, arch::{io::PortIOArch, CurrentPortIOArch},
 };
 
-use super::ps_mouse_device::Ps2MouseDevice;
+use super::ps_mouse_device::{Ps2MouseDevice, ps2_mouse_device};
 
 #[no_mangle]
 pub extern "C" fn ps2_mouse_driver_interrupt () {
-    ps2_mouse_driver().process_packet();
+    //ps2_mouse_driver().process_packet();
+    if ps2_mouse_device().is_some() {
+        let _ = ps2_mouse_device().unwrap().process_packet();
+    }
+    else
+    {
+        unsafe {CurrentPortIOArch::in8(0x60);}
+    }
 }
 
 static mut PS2_MOUSE_DRIVER :Option<Arc<Ps2MouseDriver>> = None;
 
+#[allow(dead_code)]
 pub fn ps2_mouse_driver() -> Arc<Ps2MouseDriver> {
     unsafe { PS2_MOUSE_DRIVER.clone().unwrap() }
 }
@@ -62,6 +70,7 @@ impl Ps2MouseDriver {
         return r;
     }
 
+    #[allow(dead_code)]
     pub fn process_packet(&self) {
         let guard = self.inner.lock();
         if guard.devices.is_empty() {
@@ -94,8 +103,6 @@ impl Driver for Ps2MouseDriver {
     }
 
     fn add_device(&self, device: Arc<dyn crate::driver::base::device::Device>) {
-        kdebug!("xkd mouse add device");
-
         let mut guard = self.inner.lock();
         // check if the device is already in the list
         if guard.devices.iter().any(|dev| Arc::ptr_eq(dev, &device)) {
@@ -204,8 +211,6 @@ impl SerioDriver for Ps2MouseDriver {
         &self,
         device: &Arc<dyn crate::driver::input::serio::serio_device::SerioDevice>,
     ) -> Result<(), system_error::SystemError> {
-        kdebug!("xkd mouse connect");
-
         let device = device
             .clone()
             .arc_any()
@@ -250,10 +255,7 @@ impl SerioDriver for Ps2MouseDriver {
 fn ps2_mouse_driver_init() -> Result<(), SystemError> {
     kdebug!("Ps2_mouse_drive initing...");
     let driver = Ps2MouseDriver::new();
-
     serio_driver_manager().register(driver.clone())?;
-
     unsafe{ PS2_MOUSE_DRIVER = Some(driver) };
-
     return Ok(());
 }

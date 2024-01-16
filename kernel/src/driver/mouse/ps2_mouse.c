@@ -57,26 +57,25 @@ extern void ps2_mouse_driver_interrupt();
  */
 void ps2_mouse_handler(ul irq_num, ul param, struct pt_regs *regs)
 {
-    // printk("xkd");
-    // ps2_mouse_driver_interrupt();
+    ps2_mouse_driver_interrupt();
 
-    // 读取鼠标输入的信息
-    unsigned char x = io_in8(PORT_KEYBOARD_DATA);
+    // // 读取鼠标输入的信息
+    // unsigned char x = io_in8(PORT_KEYBOARD_DATA);
 
-    // 当头指针越过界时，恢复指向数组头部
-    if (ps2_mouse_buf_ptr->ptr_head == ps2_mouse_buf_ptr->buffer + ps2_mouse_buffer_size)
-        ps2_mouse_buf_ptr->ptr_head = ps2_mouse_buf_ptr->buffer;
+    // // 当头指针越过界时，恢复指向数组头部
+    // if (ps2_mouse_buf_ptr->ptr_head == ps2_mouse_buf_ptr->buffer + ps2_mouse_buffer_size)
+    //     ps2_mouse_buf_ptr->ptr_head = ps2_mouse_buf_ptr->buffer;
 
-    if (ps2_mouse_buf_ptr->count >= ps2_mouse_buffer_size)
-    {
-        kwarn("ps2_mouse input buffer is full.");
-        return;
-    }
+    // if (ps2_mouse_buf_ptr->count >= ps2_mouse_buffer_size)
+    // {
+    //     kwarn("ps2_mouse input buffer is full.");
+    //     return;
+    // }
 
-    *ps2_mouse_buf_ptr->ptr_head = x;
-    ++(ps2_mouse_buf_ptr->count);
-    ++(ps2_mouse_buf_ptr->ptr_head);
-    printk("c=%d\tval = %d\n", ++c, x);
+    // *ps2_mouse_buf_ptr->ptr_head = x;
+    // ++(ps2_mouse_buf_ptr->count);
+    // ++(ps2_mouse_buf_ptr->ptr_head);
+    // printk("c=%d\tval = %d\n", ++c, x);
 }
 
 hardware_intr_controller ps2_mouse_intr_controller =
@@ -205,31 +204,31 @@ static int ps2_mouse_enable_5keys()
  */
 void ps2_mouse_init()
 {
-    // // 初始化鼠标读入队列缓冲区
-    // ps2_mouse_buf_ptr = (struct ps2_mouse_input_buffer *)kzalloc(sizeof(struct ps2_mouse_input_buffer), 0);
-    // ps2_mouse_buf_ptr->ptr_head = ps2_mouse_buf_ptr->buffer;
-    // ps2_mouse_buf_ptr->ptr_tail = ps2_mouse_buf_ptr->buffer;
-    // ps2_mouse_buf_ptr->count = 0;
-    // memset(ps2_mouse_buf_ptr->buffer, 0, ps2_mouse_buffer_size);
+    // 初始化鼠标读入队列缓冲区
+    ps2_mouse_buf_ptr = (struct ps2_mouse_input_buffer *)kzalloc(sizeof(struct ps2_mouse_input_buffer), 0);
+    ps2_mouse_buf_ptr->ptr_head = ps2_mouse_buf_ptr->buffer;
+    ps2_mouse_buf_ptr->ptr_tail = ps2_mouse_buf_ptr->buffer;
+    ps2_mouse_buf_ptr->count = 0;
+    memset(ps2_mouse_buf_ptr->buffer, 0, ps2_mouse_buffer_size);
 
-    // // ======== 初始化中断RTE entry ==========
+    // ======== 初始化中断RTE entry ==========
 
-    // ps2_mouse_entry.vector = PS2_MOUSE_INTR_VECTOR;   // 设置中断向量号
-    // ps2_mouse_entry.deliver_mode = IO_APIC_FIXED; // 投递模式：混合
-    // ps2_mouse_entry.dest_mode = DEST_PHYSICAL;    // 物理模式投递中断
-    // ps2_mouse_entry.deliver_status = IDLE;
-    // ps2_mouse_entry.trigger_mode = EDGE_TRIGGER; // 设置边沿触发
-    // ps2_mouse_entry.polarity = POLARITY_HIGH;    // 高电平触发
-    // ps2_mouse_entry.remote_IRR = IRR_RESET;
-    // ps2_mouse_entry.mask = MASKED;
-    // ps2_mouse_entry.reserved = 0;
+    ps2_mouse_entry.vector = PS2_MOUSE_INTR_VECTOR;   // 设置中断向量号
+    ps2_mouse_entry.deliver_mode = IO_APIC_FIXED; // 投递模式：混合
+    ps2_mouse_entry.dest_mode = DEST_PHYSICAL;    // 物理模式投递中断
+    ps2_mouse_entry.deliver_status = IDLE;
+    ps2_mouse_entry.trigger_mode = EDGE_TRIGGER; // 设置边沿触发
+    ps2_mouse_entry.polarity = POLARITY_HIGH;    // 高电平触发
+    ps2_mouse_entry.remote_IRR = IRR_RESET;
+    ps2_mouse_entry.mask = MASKED;
+    ps2_mouse_entry.reserved = 0;
 
-    // ps2_mouse_entry.destination.physical.reserved1 = 0;
-    // ps2_mouse_entry.destination.physical.reserved2 = 0;
-    // ps2_mouse_entry.destination.physical.phy_dest = 0; // 设置投递到BSP处理器
+    ps2_mouse_entry.destination.physical.reserved1 = 0;
+    ps2_mouse_entry.destination.physical.reserved2 = 0;
+    ps2_mouse_entry.destination.physical.phy_dest = 0; // 设置投递到BSP处理器
 
-    // // 注册中断处理程序
-    // irq_register(PS2_MOUSE_INTR_VECTOR, &ps2_mouse_entry, &ps2_mouse_handler, (ul)ps2_mouse_buf_ptr, &ps2_mouse_intr_controller, "ps/2 mouse");
+    // 注册中断处理程序
+    irq_register(PS2_MOUSE_INTR_VECTOR, &ps2_mouse_entry, &ps2_mouse_handler, (ul)ps2_mouse_buf_ptr, &ps2_mouse_intr_controller, "ps/2 mouse");
 
     // wait_keyboard_write();
     // io_out8(PORT_KEYBOARD_CONTROL, KEYBOARD_COMMAND_ENABLE_PS2_MOUSE_PORT); // 开启鼠标端口

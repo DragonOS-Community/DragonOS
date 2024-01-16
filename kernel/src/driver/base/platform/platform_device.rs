@@ -308,6 +308,7 @@ impl Device for PlatformBusDevice {
     }
 
     fn set_driver(&self, driver: Option<Weak<dyn Driver>>) {
+        kdebug!("xkd plat set driver");
         self.inner.lock().driver = driver;
     }
 

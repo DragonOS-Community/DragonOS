@@ -129,7 +129,7 @@ impl AttributeGroup for SerioDeviceAttrGroup {
         None
     }
 
-    // todo: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/serio.c#473
+    /// todo: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/serio.c#473
     fn attrs(&self) -> &[&'static dyn Attribute] {
         return &[];
     }

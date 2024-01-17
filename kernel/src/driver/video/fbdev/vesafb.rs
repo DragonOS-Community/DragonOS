@@ -38,6 +38,7 @@ use crate::{
     },
     include::bindings::bindings::{
         multiboot2_get_Framebuffer_info, multiboot2_iter, multiboot_tag_framebuffer_info_t,
+        FRAME_BUFFER_MAPPING_OFFSET,
     },
     init::{boot_params, initcall::INITCALL_DEVICE},
     libs::{
@@ -650,7 +651,11 @@ pub fn vesafb_early_init() -> Result<VirtAddr, SystemError> {
     boottime_screen_info.lfb_size =
         (width * height * ((fb_info.framebuffer_bpp as u32 + 7) / 8)) as usize;
 
-    let buf_vaddr = VirtAddr::new(0xffff800003200000);
+    // let buf_vaddr = VirtAddr::new(0xffff800003200000);
+    let buf_vaddr = VirtAddr::new(
+        crate::include::bindings::bindings::SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE as usize
+            + FRAME_BUFFER_MAPPING_OFFSET as usize,
+    );
     boottime_screen_info.lfb_virt_base = Some(buf_vaddr);
 
     let init_text = "Video driver to map.\n\0";

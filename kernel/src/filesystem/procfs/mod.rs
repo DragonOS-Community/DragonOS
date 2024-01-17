@@ -4,7 +4,7 @@ use alloc::{
     borrow::ToOwned,
     collections::BTreeMap,
     format,
-    string::{String, ToString},
+    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -29,8 +29,6 @@ use crate::{
     process::{Pid, ProcessManager},
     time::TimeSpec,
 };
-
-use self::log_message::{LogLevel, LogMessage, LogType};
 
 use super::vfs::{
     file::{FileMode, FilePrivateData},

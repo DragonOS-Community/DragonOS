@@ -11,7 +11,7 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    arch::{mm::LockedFrameAllocator, CurrentTimeArch},
+    arch::mm::LockedFrameAllocator,
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
         procfs::kmsg::Kmsg,
@@ -22,13 +22,11 @@ use crate::{
     },
     kerror, kinfo,
     libs::{
-        mutex::Mutex,
         once::Once,
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::allocator::page_frame::FrameAllocator,
     process::{Pid, ProcessManager},
-    time::TimeArch,
     time::TimeSpec,
 };
 
@@ -42,11 +40,11 @@ use super::vfs::{
 
 mod kmsg;
 mod log_message;
-mod syslog;
+mod syscall;
 
 lazy_static! {
     /// 全局环形缓冲区
-    static ref KMSG: Mutex<Kmsg> = Mutex::new(Kmsg::new());
+    static ref KMSG: SpinLock<Kmsg> = SpinLock::new(Kmsg::new());
 }
 
 /// @brief 进程文件类型

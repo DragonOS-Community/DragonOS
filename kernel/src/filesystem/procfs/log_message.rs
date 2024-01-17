@@ -3,7 +3,7 @@ use core::fmt::{Display, Formatter, Result};
 use alloc::string::String;
 
 /// 日志类型
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub enum LogType {
     /// 启动信息
     Startup,
@@ -22,7 +22,7 @@ pub enum LogType {
 }
 
 /// 日志级别
-#[derive(Default, Clone)]
+#[derive(Default, Clone, PartialEq, Debug)]
 pub enum LogLevel {
     EMERG = 0,
     ALERT = 1,
@@ -33,11 +33,11 @@ pub enum LogLevel {
     INFO = 6,
     DEBUG = 7,
     #[default]
-    DEFAULT,
+    DEFAULT = 8,
 }
 
 /// 日志消息
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct LogMessage {
     /// 时间戳
     timestamp: String,

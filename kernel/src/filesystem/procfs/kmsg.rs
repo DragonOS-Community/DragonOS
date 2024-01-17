@@ -1,22 +1,19 @@
-use super::log_message::LogMessage;
+use super::log_message::{LogLevel, LogMessage};
 use alloc::{borrow::ToOwned, string::ToString, vec::Vec};
-use kdepends::ringbuffer::{ConstGenericRingBuffer, RingBuffer};
+use kdepends::ringbuffer::{AllocRingBuffer, RingBuffer};
 use system_error::SystemError;
 
 /// 缓冲区容量
 const KMSG_BUFFER_CAPACITY: usize = 1024;
 
-/// 当KMSG的console_loglevel等于CONSOLE_LOGLEVEL_DEFAULT时，表示可以打印所有级别的日志消息到控制台
-const CONSOLE_LOGLEVEL_DEFAULT: usize = 8;
-
 /// 日志
 pub struct Kmsg {
     /// 环形缓冲区
-    buffer: ConstGenericRingBuffer<LogMessage, KMSG_BUFFER_CAPACITY>,
+    buffer: AllocRingBuffer<LogMessage>,
     /// 缓冲区字节数组
     data: Vec<u8>,
-    /// 能够输出到控制台的日志级别
-    console_loglevel: usize,
+    /// 能够输出到控制台的日志级别，当console_loglevel为DEFAULT时，表示可以打印所有级别的日志消息到控制台
+    console_loglevel: LogLevel,
     /// 判断buffer在上一次转成字节数组之后是否发生变动
     is_changed: bool,
 }
@@ -24,9 +21,9 @@ pub struct Kmsg {
 impl Kmsg {
     pub fn new() -> Self {
         Kmsg {
-            buffer: ConstGenericRingBuffer::<LogMessage, KMSG_BUFFER_CAPACITY>::new(),
+            buffer: AllocRingBuffer::new(KMSG_BUFFER_CAPACITY),
             data: Vec::new(),
-            console_loglevel: CONSOLE_LOGLEVEL_DEFAULT,
+            console_loglevel: LogLevel::DEFAULT,
             is_changed: false,
         }
     }
@@ -40,7 +37,7 @@ impl Kmsg {
     /// 读取缓冲区
     pub fn read(&mut self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         let r = match self.console_loglevel {
-            CONSOLE_LOGLEVEL_DEFAULT => self.read_all(len, buf),
+            LogLevel::DEFAULT => self.read_all(len, buf),
             _ => self.read_level(len, buf),
         };
 
@@ -71,7 +68,7 @@ impl Kmsg {
         let mut data_level: Vec<u8> = Vec::new();
 
         for msg in self.buffer.iter() {
-            if msg.level() as usize == self.console_loglevel {
+            if msg.level() == self.console_loglevel {
                 data_level.append(&mut msg.to_string().as_bytes().to_owned());
             }
         }
@@ -89,7 +86,7 @@ impl Kmsg {
         buf[0..src.len()].copy_from_slice(src);
 
         // 将控制台输出日志level改回默认，否则之后都是打印特定level的日志消息
-        self.console_loglevel = CONSOLE_LOGLEVEL_DEFAULT;
+        self.console_loglevel = LogLevel::DEFAULT;
 
         return Ok(data_level.len());
     }
@@ -113,11 +110,19 @@ impl Kmsg {
     /// 设置输出到控制台的日志级别
     pub fn set_level(&mut self, log_level: usize) -> Result<usize, SystemError> {
         let log_level = log_level - 1;
-        if log_level > 8 {
-            return Err(SystemError::EINVAL);
-        }
 
-        self.console_loglevel = log_level;
+        self.console_loglevel = match log_level {
+            0 => LogLevel::EMERG,
+            1 => LogLevel::ALERT,
+            2 => LogLevel::CRIT,
+            3 => LogLevel::ERR,
+            4 => LogLevel::WARN,
+            5 => LogLevel::NOTICE,
+            6 => LogLevel::INFO,
+            7 => LogLevel::DEBUG,
+            8 => LogLevel::DEFAULT,
+            _ => return Err(SystemError::EINVAL),
+        };
 
         return Ok(0);
     }
@@ -127,7 +132,7 @@ impl Kmsg {
         if self.is_changed {
             self.data.clear();
 
-            if self.console_loglevel == CONSOLE_LOGLEVEL_DEFAULT {
+            if self.console_loglevel == LogLevel::DEFAULT {
                 for msg in self.buffer.iter() {
                     self.data.append(&mut msg.to_string().as_bytes().to_owned());
                 }

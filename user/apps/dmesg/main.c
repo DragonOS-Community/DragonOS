@@ -2,13 +2,14 @@
 
 int main(int argc, char **argv)
 {
-    unsigned len;
+    unsigned len = 1;
     char *buf = NULL;
     int opt;
     unsigned int color = 65280;
 
     // 获取内核缓冲区大小
     len = klogctl(10, buf, len);
+
     if (len < 16 * 1024)
         len = 16 * 1024;
     if (len > 16 * 1024 * 1024)

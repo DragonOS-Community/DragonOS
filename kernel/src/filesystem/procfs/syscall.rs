@@ -25,6 +25,18 @@ enum SyslogAction {
 }
 
 impl Syscall {
+    /// # 操作内核环形缓冲区
+    ///
+    /// ## 参数
+    /// - syslog_action_type: 操作码
+    /// - buf：用户缓冲区
+    /// - len: 需要从内核环形缓冲区读取的字节数。如果操作码为8，即SyslogActionConsoleLevel，则len为待设置的日志级别
+    ///
+    /// ## 返回值
+    /// - 成功，Ok(usize)
+    /// - 失败，Err(SystemError) 操作失败，返回posix错误码
+    ///
+
     pub fn do_syslog(
         syslog_action_type: usize,
         buf: &mut [u8],

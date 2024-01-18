@@ -49,7 +49,7 @@ fdt = "0.1.5"
 
 # target为x86_64时，使用下面的依赖
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-mini-backtrace = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/mini-backtrace.git", rev = "ba98506685" }
+mini-backtrace = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/mini-backtrace.git", rev = "e0b1d90940" }
 x86 = "0.52.0"
 x86_64 = "0.14.10"
 

@@ -20,6 +20,7 @@ use self::{
 
 pub mod allocator;
 pub mod c_adapter;
+pub mod early_ioremap;
 pub mod kernel_mapper;
 pub mod memblock;
 pub mod mmio_buddy;
@@ -92,7 +93,7 @@ impl PhysAddr {
 
     /// @brief 获取物理地址的值
     #[inline(always)]
-    pub fn data(&self) -> usize {
+    pub const fn data(&self) -> usize {
         self.0
     }
 
@@ -211,7 +212,7 @@ impl VirtAddr {
 
     /// @brief 获取虚拟地址的值
     #[inline(always)]
-    pub fn data(&self) -> usize {
+    pub const fn data(&self) -> usize {
         return self.0;
     }
 
@@ -428,6 +429,14 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     const USER_BRK_START: VirtAddr;
     /// 用户栈起始地址（向下生长，不包含该值）
     const USER_STACK_START: VirtAddr;
+
+    /// 内核的固定映射区的起始地址
+    const FIXMAP_START_VADDR: VirtAddr;
+    /// 内核的固定映射区的大小
+    const FIXMAP_SIZE: usize;
+    /// 内核的固定映射区的结束地址
+    const FIXMAP_END_VADDR: VirtAddr =
+        VirtAddr::new(Self::FIXMAP_START_VADDR.data() + Self::FIXMAP_SIZE);
 
     /// @brief 用于初始化内存管理模块与架构相关的信息。
     /// 该函数应调用其他模块的接口，把可用内存区域添加到memblock，提供给BumpAllocator使用

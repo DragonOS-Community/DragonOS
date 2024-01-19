@@ -23,7 +23,7 @@ backtrace = []
 
 # 运行时依赖项
 [dependencies]
-acpi = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/acpi-rs.git", rev = "fb69243dcf" }
+acpi = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/acpi-rs.git", rev = "fb69243dcf" }
 atomic_enum = "0.2.0"
 bit_field = "0.10"
 bitfield-struct = "0.5.3"
@@ -39,18 +39,18 @@ klog_types = { path = "crates/klog_types" }
 linkme = "0.2"
 num = { version = "0.4.0", default-features = false }
 num-derive = "0.3"
-num-traits = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/num-traits.git", rev="1597c1c", default-features = false }
+num-traits = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/num-traits.git", rev="1597c1c", default-features = false }
 raw-cpuid = "11.0.1"
-smoltcp = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/smoltcp.git", rev = "9027825", default-features = false, features = ["log", "alloc",  "socket-raw", "socket-udp", "socket-tcp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-ipv4", "proto-ipv6"]}
+smoltcp = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/smoltcp.git", rev = "9027825", default-features = false, features = ["log", "alloc",  "socket-raw", "socket-udp", "socket-tcp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-ipv4", "proto-ipv6"]}
 system_error = { path = "crates/system_error" }
 unified-init = { path = "crates/unified-init" }
-virtio-drivers = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/virtio-drivers.git", rev = "f1d1cbb" }
+virtio-drivers = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers.git", rev = "f1d1cbb" }
 fdt = "0.1.5"
 uefi = { version = "0.26.0", features = ["alloc"] }
 
 # target为x86_64时，使用下面的依赖
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-mini-backtrace = { git = "https://git.mirrors.dragonos.org/DragonOS-Community/mini-backtrace.git", rev = "ba98506685" }
+mini-backtrace = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/mini-backtrace.git", rev = "e0b1d90940" }
 x86 = "0.52.0"
 x86_64 = "0.14.10"
 

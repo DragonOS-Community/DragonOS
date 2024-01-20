@@ -23,14 +23,12 @@
 
 #include "driver/acpi/acpi.h"
 #include "driver/disk/ata.h"
-#include "driver/keyboard/ps2_keyboard.h"
-#include "driver/mouse/ps2_mouse.h"
 #include "driver/multiboot2/multiboot2.h"
 #include <time/timer.h>
 
 #include <arch/x86_64/driver/apic/apic_timer.h>
-#include <virt/kvm/kvm.h>
 #include <debug/bug.h>
+#include <virt/kvm/kvm.h>
 
 extern int rs_driver_init();
 extern void rs_softirq_init();
@@ -56,8 +54,7 @@ ul bsp_idt_size, bsp_gdt_size;
 struct gdtr gdtp;
 struct idtr idtp;
 ul _stack_start;
-void reload_gdt()
-{
+void reload_gdt() {
 
   gdtp.size = bsp_gdt_size - 1;
   gdtp.gdt_vaddr = (ul)phys_2_virt((ul)&GDT_Table);
@@ -65,8 +62,7 @@ void reload_gdt()
   asm volatile("lgdt (%0)   \n\t" ::"r"(&gdtp) : "memory");
 }
 
-void reload_idt()
-{
+void reload_idt() {
 
   idtp.size = bsp_idt_size - 1;
   idtp.idt_vaddr = (ul)phys_2_virt((ul)&IDT_Table);
@@ -77,8 +73,7 @@ void reload_idt()
 }
 
 // 初始化系统各模块
-void system_initialize()
-{
+void system_initialize() {
   rs_init_before_mem_init();
 
   _stack_start =
@@ -147,7 +142,6 @@ void system_initialize()
 
   cpu_init();
 
-  ps2_keyboard_init();
   io_mfence();
 
   rs_pci_init();
@@ -179,8 +173,7 @@ void system_initialize()
 }
 
 // 操作系统内核从这里开始执行
-void Start_Kernel(void)
-{
+void Start_Kernel(void) {
 
   // 获取multiboot2的信息
   uint64_t mb2_info, mb2_magic;
@@ -201,16 +194,12 @@ void Start_Kernel(void)
   io_mfence();
 
   // idle
-  while (1)
-  {
+  while (1) {
     // 如果调用的时候，启用了中断，则hlt。否则认为是bug
-    if (get_rflags() & 0x200)
-    {
+    if (get_rflags() & 0x200) {
       // kdebug("hlt");
       hlt();
-    }
-    else
-    {
+    } else {
       BUG_ON(1);
       pause();
     }

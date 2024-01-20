@@ -51,7 +51,7 @@ impl EarlyIoRemap {
             return Err(SystemError::EINVAL);
         }
 
-        kdebug!("Early io remap:{phys:?}, size:{size}");
+        // kdebug!("Early io remap:{phys:?}, size:{size}");
 
         let mut slot_guard = SLOTS.lock();
 
@@ -80,7 +80,7 @@ impl EarlyIoRemap {
         let start_slot = start_slot.ok_or(SystemError::ENOMEM)?;
         let vaddr = Self::idx_to_virt(start_slot);
 
-        kdebug!("start_slot:{start_slot}, vaddr: {vaddr:?}, slot_count: {slot_count:?}");
+        // kdebug!("start_slot:{start_slot}, vaddr: {vaddr:?}, slot_count: {slot_count:?}");
         let page_count = PageFrameCount::new(slot_count);
         // 执行映射
         if read_only {
@@ -89,7 +89,7 @@ impl EarlyIoRemap {
             unsafe { pseudo_map_phys(vaddr, phys, page_count) }
         }
 
-        kdebug!("map ok");
+        // kdebug!("map ok");
 
         // 更新slot信息
         let map_size = slot_count * MMArch::PAGE_SIZE;

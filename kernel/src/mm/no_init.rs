@@ -137,6 +137,7 @@ impl<MMA: MemoryManagementArch> FrameAllocator for PseudoAllocator<MMA> {
 /// 调用该函数时，必须保证内存管理器尚未初始化。否则将导致未定义的行为
 ///
 /// 并且，内核引导文件必须以4K页为粒度，填写了前100M的内存映射关系。（具体以本文件开头的注释为准）
+#[inline(never)]
 pub unsafe fn pseudo_map_phys(vaddr: VirtAddr, paddr: PhysAddr, count: PageFrameCount) {
     assert!(vaddr.check_aligned(MMArch::PAGE_SIZE));
     assert!(paddr.check_aligned(MMArch::PAGE_SIZE));
@@ -156,6 +157,34 @@ pub unsafe fn pseudo_map_phys(vaddr: VirtAddr, paddr: PhysAddr, count: PageFrame
         let paddr = paddr + i * MMArch::PAGE_SIZE;
         let flusher = mapper.map_phys(vaddr, paddr, flags).unwrap();
         flusher.ignore();
+    }
+
+    mapper.make_current();
+}
+
+/// Unmap physical memory from virtual memory.
+///
+/// ## 说明
+///
+/// 该函数在系统启动早期，内存管理尚未初始化的时候使用
+#[inline(never)]
+pub unsafe fn pseudo_unmap_phys(vaddr: VirtAddr, count: PageFrameCount) {
+    assert!(vaddr.check_aligned(MMArch::PAGE_SIZE));
+    assert!(count.data() == 1);
+
+    let mut pseudo_allocator = PseudoAllocator::<MMArch>::new();
+
+    let mut mapper = crate::mm::page::PageMapper::<MMArch, _>::new(
+        PageTableKind::Kernel,
+        MMArch::table(PageTableKind::Kernel),
+        &mut pseudo_allocator,
+    );
+
+    for i in 0..count.data() {
+        let vaddr = vaddr + i * MMArch::PAGE_SIZE;
+        mapper.unmap_phys(vaddr, true).map(|(_, _, flusher)| {
+            flusher.ignore();
+        });
     }
 
     mapper.make_current();

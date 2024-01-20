@@ -92,7 +92,7 @@ __init_set_pgtable_loop_end:
 	
 	la a0, BSP_IDLE_STACK_SPACE
 	mv sp, a0
-	li t0, 32768
+	li t0, 32752	// 预留16字节防止越界
 	add sp, sp, t0
 .option pop
 	/*
@@ -330,6 +330,7 @@ __initial_hartid_ptr:
 	.quad 0
 
 // _start标签在启动时被加载到的物理地址
+.global __initial_start_load_paddr
 __initial_start_load_paddr:
 	.quad 0
 
@@ -344,9 +345,11 @@ __initial_satp_mode:
 
 // 初始页表的空间（sv39模式的L0页表）
 .section .initial_pgtable_section
+.global __initial_pgtable
 __initial_pgtable:
 	.skip 4096
 
+.global __initial_l1_pgtable
 __initial_l1_pgtable:
 	.skip 8192
 

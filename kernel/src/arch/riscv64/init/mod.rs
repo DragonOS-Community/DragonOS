@@ -3,10 +3,14 @@ use core::intrinsics::unreachable;
 use fdt::node::FdtNode;
 
 use crate::{
-    driver::{firmware::efi::init::efi_init, open_firmware::fdt::open_firmware_fdt_driver},
+    arch::{mm::init::mm_early_init, MMArch},
+    driver::{
+        firmware::efi::init::efi_init, open_firmware::fdt::open_firmware_fdt_driver,
+        tty::serial::serial8250::send_to_default_serial8250_port,
+    },
     init::{boot_params, init_before_mem_init},
-    kinfo,
-    mm::{PhysAddr, VirtAddr},
+    kdebug, kinfo,
+    mm::{MemoryManagementArch, PhysAddr, VirtAddr},
     print, println,
 };
 
@@ -35,13 +39,23 @@ impl ArchBootParams {
 #[no_mangle]
 unsafe extern "C" fn kernel_main(hartid: usize, fdt_paddr: usize) -> ! {
     let fdt_paddr = PhysAddr::new(fdt_paddr);
+
     init_before_mem_init();
+    extern "C" {
+        fn BSP_IDLE_STACK_SPACE();
+    }
+    kdebug!("BSP_IDLE_STACK_SPACE={:#x}", BSP_IDLE_STACK_SPACE as u64);
+    kdebug!("PAGE_ADDRESS_SIZE={}", MMArch::PAGE_ADDRESS_SIZE);
+    kdebug!("PAGE_ADDRESS_SHIFT={}", MMArch::PAGE_ADDRESS_SHIFT);
+
     boot_params().write().arch.fdt_paddr = fdt_paddr;
     kinfo!(
         "DragonOS kernel is running on hart {}, fdt address:{:?}",
         hartid,
         fdt_paddr
     );
+
+    mm_early_init();
 
     let fdt = fdt::Fdt::from_ptr(fdt_paddr.data() as *const u8).expect("Failed to parse fdt!");
     print_node(fdt.find_node("/").unwrap(), 0);
@@ -54,6 +68,7 @@ unsafe extern "C" fn kernel_main(hartid: usize, fdt_paddr: usize) -> ! {
     unreachable()
 }
 
+#[inline(never)]
 fn print_node(node: FdtNode<'_, '_>, n_spaces: usize) {
     (0..n_spaces).for_each(|_| print!(" "));
     println!("{}/", node.name);
@@ -68,6 +83,7 @@ fn print_node(node: FdtNode<'_, '_>, n_spaces: usize) {
 }
 
 /// 解析fdt，获取内核启动参数
+#[inline(never)]
 unsafe fn parse_dtb() {
     let fdt_paddr = boot_params().read().arch.fdt_paddr;
     if fdt_paddr.is_null() {

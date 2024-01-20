@@ -3,7 +3,7 @@ use system_error::SystemError;
 use crate::{
     arch::MMArch,
     libs::{align::page_align_up, spinlock::SpinLock},
-    mm::no_init::{pseudo_map_phys, pseudo_unmap_phys},
+    mm::no_init::{pseudo_map_phys, pseudo_map_phys_ro, pseudo_unmap_phys},
 };
 
 use super::{allocator::page_frame::PageFrameCount, MemoryManagementArch, PhysAddr, VirtAddr};
@@ -34,6 +34,7 @@ impl EarlyIoRemap {
     ///
     /// - phys: 物理内存地址（需要按页对齐）
     /// - size: 映射的内存大小
+    /// - read_only: 映射区与是否只读
     ///
     /// ## 返回值
     ///
@@ -41,10 +42,16 @@ impl EarlyIoRemap {
     /// - Err(SystemError::ENOMEM): 可用的slot不足
     /// - Err(SystemError::EINVAL): 传入的物理地址没有对齐
     #[allow(dead_code)]
-    pub fn map(phys: PhysAddr, size: usize) -> Result<(VirtAddr, usize), SystemError> {
+    pub fn map(
+        phys: PhysAddr,
+        size: usize,
+        read_only: bool,
+    ) -> Result<(VirtAddr, usize), SystemError> {
         if phys.check_aligned(MMArch::PAGE_SIZE) == false {
             return Err(SystemError::EINVAL);
         }
+
+        kdebug!("Early io remap:{phys:?}, size:{size}");
 
         let mut slot_guard = SLOTS.lock();
 
@@ -72,8 +79,17 @@ impl EarlyIoRemap {
 
         let start_slot = start_slot.ok_or(SystemError::ENOMEM)?;
         let vaddr = Self::idx_to_virt(start_slot);
+
+        kdebug!("start_slot:{start_slot}, vaddr: {vaddr:?}, slot_count: {slot_count:?}");
+        let page_count = PageFrameCount::new(slot_count);
         // 执行映射
-        unsafe { pseudo_map_phys(vaddr, phys, PageFrameCount::new(slot_count)) }
+        if read_only {
+            unsafe { pseudo_map_phys_ro(vaddr, phys, page_count) }
+        } else {
+            unsafe { pseudo_map_phys(vaddr, phys, page_count) }
+        }
+
+        kdebug!("map ok");
 
         // 更新slot信息
         let map_size = slot_count * MMArch::PAGE_SIZE;
@@ -141,7 +157,7 @@ impl EarlyIoRemap {
             *slot = Slot::DEFAULT;
         }
 
-        todo!()
+        return Ok(());
     }
 
     /// 把slot下标转换为这个slot对应的虚拟地址

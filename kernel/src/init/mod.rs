@@ -28,6 +28,7 @@ fn init_intertrait() {
 }
 
 /// 在内存管理初始化之前，执行的初始化
+#[inline(never)]
 pub fn init_before_mem_init() {
     tty_early_init().expect("tty early init failed");
     let video_ok = unsafe { VideoRefreshManager::video_init().is_ok() };

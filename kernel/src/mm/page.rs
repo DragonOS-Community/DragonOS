@@ -102,7 +102,7 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
     /// 获取当前页表的第i个页表项
     pub unsafe fn entry(&self, i: usize) -> Option<PageEntry<Arch>> {
         let entry_virt = self.entry_virt(i)?;
-        return Some(PageEntry::new(Arch::read::<usize>(entry_virt)));
+        return Some(PageEntry::from_usize(Arch::read::<usize>(entry_virt)));
     }
 
     /// 设置当前页表的第i个页表项
@@ -178,7 +178,14 @@ impl<Arch> Debug for PageEntry<Arch> {
 
 impl<Arch: MemoryManagementArch> PageEntry<Arch> {
     #[inline(always)]
-    pub fn new(data: usize) -> Self {
+    pub fn new(paddr: PhysAddr, flags: PageFlags<Arch>) -> Self {
+        Self {
+            data: MMArch::make_entry(paddr, flags.data()),
+            phantom: PhantomData,
+        }
+    }
+    #[inline(always)]
+    pub fn from_usize(data: usize) -> Self {
         Self {
             data,
             phantom: PhantomData,
@@ -198,7 +205,18 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
     /// - Err(PhysAddr) 如果当前页表项不存在, 返回物理地址
     #[inline(always)]
     pub fn address(&self) -> Result<PhysAddr, PhysAddr> {
-        let paddr = PhysAddr::new(self.data & Arch::PAGE_ADDRESS_MASK);
+        let paddr: PhysAddr = {
+            #[cfg(target_arch = "x86_64")]
+            {
+                PhysAddr::new(self.data & Arch::PAGE_ADDRESS_MASK)
+            }
+
+            #[cfg(target_arch = "riscv64")]
+            {
+                let ppn = ((self.data & (!((1 << 10) - 1))) >> 10) & ((1 << 44) - 1);
+                super::allocator::page_frame::PhysPageFrame::from_ppn(ppn).phys_address()
+            }
+        };
 
         if self.present() {
             Ok(paddr)
@@ -290,7 +308,18 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
     #[inline(always)]
     pub fn new_page_table(user: bool) -> Self {
         return unsafe {
-            let r = Self::from_data(Arch::ENTRY_FLAG_DEFAULT_TABLE | Arch::ENTRY_FLAG_READWRITE);
+            let r = {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    Self::from_data(Arch::ENTRY_FLAG_DEFAULT_TABLE | Arch::ENTRY_FLAG_READWRITE)
+                }
+
+                #[cfg(target_arch = "riscv64")]
+                {
+                    // riscv64指向下一级页表的页表项，不应设置R/W/X权限位
+                    Self::from_data(Arch::ENTRY_FLAG_DEFAULT_TABLE)
+                }
+            };
             if user {
                 r.set_user(true)
             } else {
@@ -355,10 +384,22 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
     #[must_use]
     #[inline(always)]
     pub fn set_write(self, value: bool) -> Self {
-        // 有的架构同时具有可写和不可写的标志位，因此需要同时更新
-        return self
-            .update_flags(Arch::ENTRY_FLAG_READONLY, !value)
-            .update_flags(Arch::ENTRY_FLAG_READWRITE, value);
+        #[cfg(target_arch = "x86_64")]
+        {
+            // 有的架构同时具有可写和不可写的标志位，因此需要同时更新
+            return self
+                .update_flags(Arch::ENTRY_FLAG_READONLY, !value)
+                .update_flags(Arch::ENTRY_FLAG_READWRITE, value);
+        }
+
+        #[cfg(target_arch = "riscv64")]
+        {
+            if value {
+                return self.update_flags(Arch::ENTRY_FLAG_READWRITE, true);
+            } else {
+                return self.update_flags(Arch::ENTRY_FLAG_READONLY, true);
+            }
+        }
     }
 
     /// 当前页表项是否可写
@@ -569,12 +610,13 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             );
             return None;
         }
+
         let virt = VirtAddr::new(virt.data() & (!Arch::PAGE_NEGATIVE_MASK));
 
         // TODO： 验证flags是否合法
 
         // 创建页表项
-        let entry = PageEntry::new(phys.data() | flags.data());
+        let entry = PageEntry::new(phys, flags);
         let mut table = self.table();
         loop {
             let i = table.index_of(virt)?;
@@ -585,8 +627,9 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
                 if table.entry_mapped(i)? == true {
                     kwarn!("Page {:?} already mapped", virt);
                 }
-                // kdebug!("Mapping {:?} to {:?}, i = {i}, entry={:?}, flags={:?}", virt, phys, entry, flags);
+
                 compiler_fence(Ordering::SeqCst);
+
                 table.set_entry(i, entry);
                 compiler_fence(Ordering::SeqCst);
                 return Some(PageFlush::new(virt));
@@ -596,27 +639,20 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
                     table = next_table;
                     // kdebug!("Mapping {:?} to next level table...", virt);
                 } else {
-                    // kdebug!("Allocating next level table for {:?}..., i={i}", virt);
                     // 分配下一级页表
                     let frame = self.frame_allocator.allocate_one()?;
+
                     // 清空这个页帧
                     MMArch::write_bytes(MMArch::phys_2_virt(frame).unwrap(), 0, MMArch::PAGE_SIZE);
 
                     // 设置页表项的flags
-                    // let flags = Arch::ENTRY_FLAG_READWRITE
-                    //     | Arch::ENTRY_FLAG_DEFAULT_TABLE
-                    //     | if virt.kind() == PageTableKind::User {
-                    //         Arch::ENTRY_FLAG_USER
-                    //     } else {
-                    //         0
-                    //     };
-                    let flags: PageFlags<MMArch> =
+                    let flags: PageFlags<Arch> =
                         PageFlags::new_page_table(virt.kind() == PageTableKind::User);
 
                     // kdebug!("Flags: {:?}", flags);
 
                     // 把新分配的页表映射到当前页表
-                    table.set_entry(i, PageEntry::new(frame.data() | flags.data()));
+                    table.set_entry(i, PageEntry::new(frame, flags));
 
                     // 获取新分配的页表
                     table = table.next_level_table(i)?;
@@ -765,7 +801,7 @@ unsafe fn unmap_phys_inner<Arch: MemoryManagementArch>(
     // 如果当前是最后一级页表，直接取消页面映射
     if table.level() == 0 {
         let entry = table.entry(i)?;
-        table.set_entry(i, PageEntry::new(0));
+        table.set_entry(i, PageEntry::from_usize(0));
         return Some((entry.address().ok()?, entry.flags()));
     }
 
@@ -784,7 +820,7 @@ unsafe fn unmap_phys_inner<Arch: MemoryManagementArch>(
             .any(|e| e.present());
         if !x {
             // 如果没有，就取消子页表的映射
-            table.set_entry(i, PageEntry::new(0));
+            table.set_entry(i, PageEntry::from_usize(0));
             // 释放子页表
             allocator.free_one(subtable.phys());
         }

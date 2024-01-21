@@ -85,5 +85,5 @@ jobs:
       env:
           ARCH: riscv64
 
-      run: bash -c "source ~/.cargo/env && cd kernel && make -j $(nproc)"
+      run: bash -c "source ~/.cargo/env && make kernel -j $(nproc)"
 

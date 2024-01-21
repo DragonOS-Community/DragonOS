@@ -74,6 +74,8 @@ extern crate intertrait;
 extern crate x86;
 
 extern crate klog_types;
+extern crate uefi;
+extern crate uefi_raw;
 
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
 

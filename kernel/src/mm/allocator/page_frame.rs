@@ -23,6 +23,16 @@ impl PhysPageFrame {
         };
     }
 
+    /// 从物理页号创建PhysPageFrame结构体
+    pub fn from_ppn(ppn: usize) -> Self {
+        return Self { number: ppn };
+    }
+
+    /// 获取当前页对应的物理页号
+    pub fn ppn(&self) -> usize {
+        return self.number;
+    }
+
     /// @brief 获取当前页对应的物理地址
     pub fn phys_address(&self) -> PhysAddr {
         return PhysAddr::new(self.number * MMArch::PAGE_SIZE);
@@ -85,6 +95,12 @@ impl VirtPageFrame {
         return Self {
             number: vaddr.data() / MMArch::PAGE_SIZE,
         };
+    }
+
+    /// 从虚拟页号创建PhysPageFrame结构体
+    #[allow(dead_code)]
+    pub fn from_vpn(vpn: usize) -> Self {
+        return Self { number: vpn };
     }
 
     /// 获取当前虚拟页对应的虚拟地址

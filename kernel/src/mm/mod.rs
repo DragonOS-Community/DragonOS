@@ -76,7 +76,8 @@ pub enum PageTableKind {
     User,
     /// 内核页表
     Kernel,
-    /// 内存虚拟化中使用的EPT
+    /// x86内存虚拟化中使用的EPT
+    #[cfg(target_arch = "x86_64")]
     EPT,
 }
 
@@ -511,6 +512,20 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
 
     /// 初始化新的usermapper，为用户进程创建页表
     fn setup_new_usermapper() -> Result<UserMapper, SystemError>;
+
+    /// 创建页表项
+    ///
+    /// 这是一个低阶api，用于根据物理地址以及指定好的pageflags，创建页表项
+    ///
+    /// ## 参数
+    ///
+    /// - `paddr` 物理地址
+    /// - `page_flags` 页表项的flags
+    ///
+    /// ## 返回值
+    ///
+    /// 页表项的值
+    fn make_entry(paddr: PhysAddr, page_flags: usize) -> usize;
 }
 
 /// @brief 虚拟地址范围

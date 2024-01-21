@@ -19,23 +19,19 @@
 
 // ========= 检测键盘控制器输入/输出缓冲区是否已满
 #define PS2_KEYBOARD_FLAG_OUTBUF_FULL 0x01 // 键盘的输出缓冲区已满标志位
-#define PS2_KEYBOARD_FLAG_INBUF_FULL 0x02  // 键盘的输入缓冲区已满标志位
+#define PS2_KEYBOARD_FLAG_INBUF_FULL 0x02 // 键盘的输入缓冲区已满标志位
 
 // 等待向键盘控制器写入信息完成
 // todo: bugfix:在不包含ps2键盘控制器的机器上，这里会卡死
-#define wait_ps2_keyboard_write() while (io_in8(PORT_PS2_KEYBOARD_STATUS) & PS2_KEYBOARD_FLAG_INBUF_FULL)
+#define wait_ps2_keyboard_write()                                              \
+  while (io_in8(PORT_PS2_KEYBOARD_STATUS) & PS2_KEYBOARD_FLAG_INBUF_FULL)
 // #define wait_ps2_keyboard_write() (1)
 // 等待从键盘控制器读取信息完成
-#define wait_ps2_keyboard_read() while (io_in8(PORT_PS2_KEYBOARD_STATUS) & PS2_KEYBOARD_FLAG_OUTBUF_FULL)
+#define wait_ps2_keyboard_read()                                               \
+  while (io_in8(PORT_PS2_KEYBOARD_STATUS) & PS2_KEYBOARD_FLAG_OUTBUF_FULL)
 // #define wait_ps2_keyboard_read() (1)
 
 extern struct vfs_file_operations_t ps2_keyboard_fops;
-
-/**
- * @brief 初始化键盘驱动程序的函数
- *
- */
-void ps2_keyboard_init();
 
 /**
  * @brief 键盘驱动卸载函数

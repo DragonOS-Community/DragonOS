@@ -115,6 +115,10 @@ impl MemoryManagementArch for X86_64MMArch {
     const USER_BRK_START: VirtAddr = VirtAddr::new(0x700000000000);
     const USER_STACK_START: VirtAddr = VirtAddr::new(0x6ffff0a00000);
 
+    const FIXMAP_START_VADDR: VirtAddr = VirtAddr::new(0xffffb00000000000);
+    /// 设置FIXMAP区域大小为1M
+    const FIXMAP_SIZE: usize = 256 * 4096;
+
     /// @brief 获取物理内存区域
     unsafe fn init() {
         extern "C" {

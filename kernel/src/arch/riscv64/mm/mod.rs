@@ -11,7 +11,7 @@ pub(super) mod init;
 
 pub type PageMapper = crate::mm::page::PageMapper<RiscV64MMArch, LockedFrameAllocator>;
 
-/// RiscV64的内存管理架构结构体
+/// RiscV64的内存管理架构结构体(sv39)
 #[derive(Debug, Clone, Copy, Hash)]
 pub struct RiscV64MMArch;
 
@@ -52,6 +52,11 @@ impl MemoryManagementArch for RiscV64MMArch {
     const USER_BRK_START: crate::mm::VirtAddr = VirtAddr::new(0x0000_001f_ffff_ffff);
 
     const USER_STACK_START: crate::mm::VirtAddr = VirtAddr::new(0x0000_001f_ffa0_0000);
+
+    /// 在距离sv39的顶端还有1G的位置，设置为FIXMAP的起始地址
+    const FIXMAP_START_VADDR: VirtAddr = VirtAddr::new(0xffff_ffff_8000_0000);
+    /// 设置1MB的fixmap空间
+    const FIXMAP_SIZE: usize = 256 * 4096;
 
     unsafe fn init() {
         todo!()

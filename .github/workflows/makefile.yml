@@ -24,7 +24,7 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
-    - uses: ./.github/workflows/cache-toolchain.yml
+    - uses: ./.github/actions/import-toolchain
 
     - name: Format check
       env:
@@ -47,7 +47,7 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
-    - uses: ./.github/workflows/cache-toolchain.yml
+    - uses: ./.github/actions/import-toolchain
 
     - name: Run kernel static test
       env:
@@ -62,7 +62,7 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
-    - uses: ./.github/workflows/cache-toolchain.yml
+    - uses: ./.github/actions/import-toolchain
 
       
     - name: build the DragonOS
@@ -79,7 +79,7 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
-    - uses: ./.github/workflows/cache-toolchain.yml
+    - uses: ./.github/actions/import-toolchain
 
     - name: build the DragonOS
       env:

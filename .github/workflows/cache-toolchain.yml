@@ -1,4 +1,4 @@
-name: Cache x86_64 toolchain
+name: Cache toolchain
 
 on: workflow_call
 

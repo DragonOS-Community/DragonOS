@@ -1,0 +1,34 @@
+name: import-toolchain
+
+runs:
+  using: composite
+  steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: 'recursive'
+
+      - name: Cache DragonOS GCC
+        id: cache-dragonos-gcc
+        uses: actions/cache@v3
+        env:
+            cache-name: cache-dragonos-gcc
+        with:
+          path: |
+            ~/opt
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('tools/build_gcc_toolchain.sh') }}-${{ hashFiles('tools/install_musl_gcc.sh') }}
+
+      - name: Cache build tools
+        id: cache-build-tools
+        uses: actions/cache@v3
+        env:
+            cache-name: cache-build-tools
+            dadk_version: 0.1.6
+        with:
+          path: |
+            ~/.cargo
+            ~/.rustup
+            ~/.bashrc
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ env.dadk_version }}-${{ hashFiles('.github/workflows/cache-toolchain.yml') }}
+      
+      - uses: ./.github/actions/install-apt-packages
+      

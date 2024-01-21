@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use system_error::SystemError;
 
-use crate::driver::base::device::{bus::Bus, Device, device_manager};
+use crate::driver::base::device::{bus::Bus, device_manager, Device};
 
 use super::serio_bus;
 
@@ -38,7 +38,6 @@ pub fn serio_device_manager() -> &'static SerioDeviceManager {
 
 pub struct SerioDeviceManager;
 
-#[allow(dead_code)]
 impl SerioDeviceManager {
     /// # 函数功能
     /// 注册Serio设备

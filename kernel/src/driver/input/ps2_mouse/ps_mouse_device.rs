@@ -1,13 +1,14 @@
+use core::hint::spin_loop;
+
 use alloc::{
     string::ToString,
     sync::{Arc, Weak},
 };
 use system_error::SystemError;
 use unified_init::macros::unified_init;
-use x86_64::instructions::nop;
 
 use crate::{
-    arch::{io::PortIOArch, CurrentPortIOArch},
+    arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch},
     driver::{
         base::{
             class::Class,
@@ -17,16 +18,13 @@ use crate::{
         },
         input::serio::serio_device::{serio_device_manager, SerioDevice},
     },
+    exception::InterruptArch,
     filesystem::kernfs::KernFSInode,
     init::initcall::INITCALL_DEVICE,
     libs::spinlock::SpinLock,
 };
 
-extern "C" {
-    fn ps2_mouse_init();
-}
-
-static mut PS2_MOUSE_DEVICE : Option<Arc<Ps2MouseDevice>> = None;
+static mut PS2_MOUSE_DEVICE: Option<Arc<Ps2MouseDevice>> = None;
 
 pub fn ps2_mouse_device() -> Option<Arc<Ps2MouseDevice>> {
     unsafe { PS2_MOUSE_DEVICE.clone() }
@@ -37,7 +35,6 @@ const DATA_PORT_ADDRESS: u16 = 0x60;
 
 const KEYBOARD_COMMAND_ENABLE_PS2_MOUSE_PORT: u8 = 0xa8;
 const KEYBOARD_COMMAND_SEND_TO_PS2_MOUSE: u8 = 0xd4;
-
 
 bitflags! {
     /// Represents the flags currently set for the mouse.
@@ -69,13 +66,26 @@ bitflags! {
     }
 }
 
-#[repr(u8)]
-enum Command {
-    EnablePacketStreaming = 0xF4,
+#[derive(Debug)]
+enum PsMouseCommand {
+    SampleRate(u8),
+    EnablePacketStreaming,
     // SetDefaults = 0xF6,
-    InitKeyboard = 0x47,
-    GetMouseId = 0xf2,
-    SetSampleRate = 0xf3,
+    InitKeyboard,
+    GetMouseId,
+    SetSampleRate,
+}
+
+impl Into<u8> for PsMouseCommand {
+    fn into(self) -> u8 {
+        match self {
+            Self::SampleRate(x) => x,
+            Self::EnablePacketStreaming => 0xf4,
+            Self::InitKeyboard => 0x47,
+            Self::GetMouseId => 0xf2,
+            Self::SetSampleRate => 0xf3,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -149,9 +159,8 @@ pub struct Ps2MouseDevice {
     kobj_state: LockedKObjectState,
 }
 
-#[allow(dead_code)]
 impl Ps2MouseDevice {
-    pub const NAME: &'static str = "ps2-mouse-device";
+    pub const NAME: &'static str = "psmouse";
     pub fn new() -> Self {
         let r = Self {
             inner: SpinLock::new(InnerPs2MouseDevice {
@@ -162,9 +171,6 @@ impl Ps2MouseDevice {
                 parent: None,
                 kset: None,
                 kobj_type: None,
-
-                command_port: ADDRESS_PORT_ADDRESS,
-                data_port: DATA_PORT_ADDRESS,
                 current_packet: 0,
                 current_state: MouseState::new(),
             }),
@@ -173,65 +179,78 @@ impl Ps2MouseDevice {
         return r;
     }
 
-    #[allow(dead_code)]
-    pub fn init(&mut self) -> Result<(), SystemError> {
-        self.write_command_port(KEYBOARD_COMMAND_ENABLE_PS2_MOUSE_PORT)?;
+    pub fn init(&self) -> Result<(), SystemError> {
+        let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+        self.write_control_port(KEYBOARD_COMMAND_ENABLE_PS2_MOUSE_PORT)?;
         for _i in 0..1000 {
-            for _j in 0.. 1000 {
-                nop();
+            for _j in 0..1000 {
+                spin_loop();
             }
         }
-        self.read_data_port()?;
-        
-        self.send_command(Command::EnablePacketStreaming as u8)?;
-        self.read_data_port()?;
+        self.read_data_port().ok();
+
+        self.send_command_to_ps2mouse(PsMouseCommand::EnablePacketStreaming)
+            .map_err(|e| {
+                kerror!("ps2 mouse init error: {:?}", e);
+                e
+            })?;
+        self.read_data_port().ok();
         for _i in 0..1000 {
-            for _j in 0.. 1000 {
-                nop();
-            }
-        }
-            
-        self.send_command(Command::InitKeyboard as u8)?;
-        self.read_data_port()?;
-        for _i in 0..1000 {
-            for _j in 0.. 1000 {
-                nop();
+            for _j in 0..1000 {
+                spin_loop();
             }
         }
 
-        self.set_sample_rate(30)?;
+        // self.send_command_to_ps2mouse(PsMouseCommand::InitKeyboard)?;
+        self.do_send_command(DATA_PORT_ADDRESS as u8, PsMouseCommand::InitKeyboard.into())?;
+        self.read_data_port().ok();
+        for _i in 0..1000 {
+            for _j in 0..1000 {
+                spin_loop();
+            }
+        }
+
+        self.set_sample_rate(20)?;
         // self.get_mouse_id()?;
         Ok(())
     }
 
     #[allow(dead_code)]
     pub fn get_mouse_id(&self) -> Result<(), SystemError> {
-        self.send_command(Command::GetMouseId as u8)?;
+        self.send_command_to_ps2mouse(PsMouseCommand::GetMouseId)?;
         let _mouse_id = self.read_data_port()?;
         Ok(())
     }
 
-    pub fn set_sample_rate(&self, hz : u8) -> Result<(), SystemError> {
-        self.send_command(Command::SetSampleRate as u8)?;
-        self.read_data_port()?;
+    /// 设置鼠标采样率
+    ///
+    /// `hz` 合法值为 10,20,40,60,80,100,200
+    pub fn set_sample_rate(&self, hz: u8) -> Result<(), SystemError> {
+        const SAMPLE_RATE: [u8; 7] = [10, 20, 40, 60, 80, 100, 200];
+        if !SAMPLE_RATE.contains(&hz) {
+            return Err(SystemError::EINVAL);
+        }
+
+        self.send_command_to_ps2mouse(PsMouseCommand::SetSampleRate)?;
+        self.read_data_port().ok();
         for _i in 0..1000 {
-            for _j in 0.. 1000 {
-                nop();
+            for _j in 0..1000 {
+                spin_loop();
             }
         }
 
-
-        self.send_command(hz)?;
+        self.send_command_to_ps2mouse(PsMouseCommand::SampleRate(hz))?;
         for _i in 0..1000 {
-            for _j in 0.. 1000 {
-                nop();
+            for _j in 0..1000 {
+                spin_loop();
             }
         }
-        self.read_data_port()?;
+        self.read_data_port().ok();
         Ok(())
     }
 
-    pub fn process_packet(&self) -> Result<(), SystemError>{
+    pub fn process_packet(&self) -> Result<(), SystemError> {
         let packet = self.read_data_port()?;
         let mut guard = self.inner.lock();
         match guard.current_packet {
@@ -244,16 +263,22 @@ impl Ps2MouseDevice {
             }
             1 => {
                 let flags = guard.current_state.flags.clone();
-                if !flags.contains(MouseFlags::X_OVERFLOW){
+                if !flags.contains(MouseFlags::X_OVERFLOW) {
                     guard.current_state.x = self.get_x_movement(packet, flags);
                 }
             }
             2 => {
                 let flags = guard.current_state.flags.clone();
-                if !flags.contains(MouseFlags::Y_OVERFLOW){
-                    guard.current_state.y = self.get_x_movement(packet, flags);
+                if !flags.contains(MouseFlags::Y_OVERFLOW) {
+                    guard.current_state.y = self.get_y_movement(packet, flags);
                 }
-                kdebug!("Ps2MouseDevice packet :{}, {}, {}", guard.current_state.flags.bits, guard.current_state.x, guard.current_state.y);
+
+                kdebug!(
+                    "Ps2MouseDevice packet : flags:{}, x:{}, y:{}\n",
+                    guard.current_state.flags.bits,
+                    guard.current_state.x,
+                    guard.current_state.y
+                )
             }
             _ => unreachable!(),
         }
@@ -261,19 +286,19 @@ impl Ps2MouseDevice {
         Ok(())
     }
 
-    fn get_x_movement(&self, packet: u8, flags : MouseFlags) -> i16 {
+    fn get_x_movement(&self, packet: u8, flags: MouseFlags) -> i16 {
         if flags.contains(MouseFlags::X_SIGN) {
-            return self.sign_extend(packet)
+            return self.sign_extend(packet);
         } else {
-            return packet as i16
+            return packet as i16;
         }
     }
 
-    fn get_y_movement(&self, packet: u8, flags : MouseFlags) -> i16 {
+    fn get_y_movement(&self, packet: u8, flags: MouseFlags) -> i16 {
         if flags.contains(MouseFlags::Y_SIGN) {
-            return self.sign_extend(packet)
+            return self.sign_extend(packet);
         } else {
-            return packet as i16
+            return packet as i16;
         }
     }
 
@@ -282,41 +307,49 @@ impl Ps2MouseDevice {
     }
 
     fn read_data_port(&self) -> Result<u8, SystemError> {
-        // self.wait_for_write()?;
-        let guard = self.inner.lock_irqsave();
-        let data = unsafe { CurrentPortIOArch::in8(guard.data_port) };
-        Ok(data)
+        self.wait_for_write()?;
+        let cmd = unsafe { CurrentPortIOArch::in8(ADDRESS_PORT_ADDRESS) };
+        if (cmd & 0x21) == 0x21 {
+            let data = unsafe { CurrentPortIOArch::in8(DATA_PORT_ADDRESS) };
+            return Ok(data);
+        } else {
+            return Err(SystemError::ENODATA);
+        }
     }
 
-    fn send_command(&self, command: u8) -> Result<(), SystemError> {
-        self.write_command_port(KEYBOARD_COMMAND_SEND_TO_PS2_MOUSE)?;
-        self.write_data_port(command)?;
+    #[inline(never)]
+    fn send_command_to_ps2mouse(&self, command: PsMouseCommand) -> Result<(), SystemError> {
+        self.do_send_command(KEYBOARD_COMMAND_SEND_TO_PS2_MOUSE, command.into())?;
         Ok(())
+    }
+
+    #[inline(never)]
+    fn do_send_command(&self, ctrl: u8, command: u8) -> Result<(), SystemError> {
+        self.write_control_port(ctrl)?;
+        self.write_data_port(command)?;
+        return Ok(());
     }
 
     fn write_data_port(&self, data: u8) -> Result<(), SystemError> {
         self.wait_for_write()?;
-        let guard = self.inner.lock_irqsave();
         unsafe {
-            CurrentPortIOArch::out8(guard.data_port, data);
+            CurrentPortIOArch::out8(DATA_PORT_ADDRESS, data);
         }
         Ok(())
     }
 
-    fn write_command_port(&self, command: u8) -> Result<(), SystemError> {
+    fn write_control_port(&self, command: u8) -> Result<(), SystemError> {
         self.wait_for_write()?;
-        let guard = self.inner.lock_irqsave();
         unsafe {
-            CurrentPortIOArch::out8(guard.command_port, command);
+            CurrentPortIOArch::out8(ADDRESS_PORT_ADDRESS, command);
         }
         Ok(())
     }
 
     fn wait_for_read(&self) -> Result<(), SystemError> {
-        let guard = self.inner.lock_irqsave();
         let timeout = 100_000;
         for _ in 0..timeout {
-            let value = unsafe { CurrentPortIOArch::in8(guard.command_port) };
+            let value = unsafe { CurrentPortIOArch::in8(ADDRESS_PORT_ADDRESS) };
             if (value & 0x1) == 0x1 {
                 return Ok(());
             }
@@ -325,10 +358,9 @@ impl Ps2MouseDevice {
     }
 
     fn wait_for_write(&self) -> Result<(), SystemError> {
-        let guard = self.inner.lock_irqsave();
         let timeout = 100_000;
         for _ in 0..timeout {
-            let value = unsafe { CurrentPortIOArch::in8(guard.command_port) };
+            let value = unsafe { CurrentPortIOArch::in8(ADDRESS_PORT_ADDRESS) };
             if (value & 0x2) == 0 {
                 return Ok(());
             }
@@ -347,8 +379,6 @@ struct InnerPs2MouseDevice {
     kset: Option<Arc<KSet>>,
     kobj_type: Option<&'static dyn KObjType>,
 
-    command_port: u16,
-    data_port: u16,
     current_packet: u8,
     current_state: MouseState,
 }
@@ -505,13 +535,13 @@ impl KObject for Ps2MouseDevice {
 
 #[unified_init(INITCALL_DEVICE)]
 fn ps2_mouse_device_int() -> Result<(), SystemError> {
-    kdebug!("ps2_mouse_device initing...");
-    let mut device = Ps2MouseDevice::new();
-    unsafe { ps2_mouse_init() };
-    device.init()?;
+    kdebug!("ps2_mouse_device initializing...");
+    let device = Ps2MouseDevice::new();
+
     let ptr = Arc::new(device);
     device_manager().device_default_initialize(&(ptr.clone() as Arc<dyn Device>));
     serio_device_manager().register_port(ptr.clone())?;
+
     unsafe { PS2_MOUSE_DEVICE = Some(ptr) };
     return Ok(());
 }

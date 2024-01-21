@@ -7,6 +7,7 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
+    arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch},
     driver::{
         base::{
             device::{bus::Bus, driver::Driver, Device, IdTable},
@@ -18,26 +19,28 @@ use crate::{
             subsys::SerioDeviceAttrGroup,
         },
     },
+    exception::InterruptArch,
     filesystem::kernfs::KernFSInode,
     init::initcall::INITCALL_DEVICE,
-    libs::spinlock::SpinLock, arch::{io::PortIOArch, CurrentPortIOArch},
+    libs::spinlock::SpinLock,
 };
 
-use super::ps_mouse_device::{Ps2MouseDevice, ps2_mouse_device};
+use super::ps_mouse_device::{ps2_mouse_device, Ps2MouseDevice};
+
+extern "C" {
+    fn ps2_mouse_init();
+}
 
 #[no_mangle]
-pub extern "C" fn ps2_mouse_driver_interrupt () {
-    //ps2_mouse_driver().process_packet();
-    if ps2_mouse_device().is_some() {
-        let _ = ps2_mouse_device().unwrap().process_packet();
-    }
-    else
-    {
-        unsafe {CurrentPortIOArch::in8(0x60);}
+unsafe extern "C" fn ps2_mouse_driver_interrupt() {
+    if let Some(psmouse_device) = ps2_mouse_device() {
+        psmouse_device.process_packet().ok();
+    } else {
+        unsafe { CurrentPortIOArch::in8(0x60) };
     }
 }
 
-static mut PS2_MOUSE_DRIVER :Option<Arc<Ps2MouseDriver>> = None;
+static mut PS2_MOUSE_DRIVER: Option<Arc<Ps2MouseDriver>> = None;
 
 #[allow(dead_code)]
 pub fn ps2_mouse_driver() -> Arc<Ps2MouseDriver> {
@@ -45,13 +48,15 @@ pub fn ps2_mouse_driver() -> Arc<Ps2MouseDriver> {
 }
 
 #[derive(Debug)]
+#[cast_to([sync] Driver)]
+#[cast_to([sync] SerioDriver)]
 pub struct Ps2MouseDriver {
     inner: SpinLock<InnerPs2MouseDriver>,
     kobj_state: LockedKObjectState,
 }
 
 impl Ps2MouseDriver {
-    pub const NAME: &'static str = "ps2-mouse-driver";
+    pub const NAME: &'static str = "psmouse";
     pub fn new() -> Arc<Self> {
         let r = Arc::new(Ps2MouseDriver {
             inner: SpinLock::new(InnerPs2MouseDriver {
@@ -76,8 +81,10 @@ impl Ps2MouseDriver {
         if guard.devices.is_empty() {
             return;
         }
-        
-        let device: Option<&Ps2MouseDevice> = guard.devices[0].as_any_ref().downcast_ref::<Ps2MouseDevice>();
+
+        let device: Option<&Ps2MouseDevice> = guard.devices[0]
+            .as_any_ref()
+            .downcast_ref::<Ps2MouseDevice>();
         let _ = device.unwrap().process_packet();
     }
 }
@@ -95,7 +102,7 @@ pub struct InnerPs2MouseDriver {
 
 impl Driver for Ps2MouseDriver {
     fn id_table(&self) -> Option<crate::driver::base::device::IdTable> {
-        Some(IdTable::new(Self::NAME.to_string(), None))
+        Some(IdTable::new("psmouse".to_string(), None))
     }
 
     fn devices(&self) -> alloc::vec::Vec<Arc<dyn crate::driver::base::device::Device>> {
@@ -217,8 +224,10 @@ impl SerioDriver for Ps2MouseDriver {
             .downcast::<Ps2MouseDevice>()
             .map_err(|_| SystemError::EINVAL)?;
 
-
         device.set_driver(Some(self.inner.lock_irqsave().self_ref.clone()));
+
+        device.init()?;
+        unsafe { ps2_mouse_init() };
         return Ok(());
     }
 
@@ -256,6 +265,6 @@ fn ps2_mouse_driver_init() -> Result<(), SystemError> {
     kdebug!("Ps2_mouse_drive initing...");
     let driver = Ps2MouseDriver::new();
     serio_driver_manager().register(driver.clone())?;
-    unsafe{ PS2_MOUSE_DRIVER = Some(driver) };
+    unsafe { PS2_MOUSE_DRIVER = Some(driver) };
     return Ok(());
 }

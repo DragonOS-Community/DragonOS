@@ -69,7 +69,6 @@ impl DeviceManager {
         let mut r = Ok(false);
 
         if dev.driver().is_some() {
-            kwarn!("xkd do_device_attach: dev: '{}' 00", dev.name());
             if self.device_is_bound(dev) {
                 return Ok(true);
             }
@@ -81,7 +80,6 @@ impl DeviceManager {
                 return Ok(false);
             }
         } else {
-            kwarn!("xkd do_device_attach: dev: '{}' 10", dev.name());
             let bus = dev
                 .bus()
                 .map(|bus| bus.upgrade())
@@ -145,8 +143,6 @@ impl DeviceManager {
         driver: &Arc<dyn Driver>,
         data: &mut DeviceAttachData,
     ) -> Result<bool, SystemError> {
-        kwarn!("xkd do_device_attach: dev: '{}' 20", driver.name());
-
         if let Some(bus) = driver.bus().map(|bus| bus.upgrade()).flatten() {
             let r = bus.match_device(&data.dev, driver);
 

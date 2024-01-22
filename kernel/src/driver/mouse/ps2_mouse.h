@@ -35,4 +35,4 @@
  * @brief 初始化鼠标驱动程序
  *
  */
-void ps2_mouse_init();
+void c_ps2_mouse_init();

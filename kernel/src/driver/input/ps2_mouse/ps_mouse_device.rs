@@ -260,6 +260,8 @@ impl Ps2MouseDevice {
         Ok(())
     }
 
+    /// # 函数的功能
+    /// 鼠标设备处理数据包
     pub fn process_packet(&self) -> Result<(), SystemError> {
         let packet = self.read_data_port()?;
         let mut guard = self.inner.lock();
@@ -611,7 +613,7 @@ impl IndexNode for Ps2MouseDevice {
 }
 
 #[unified_init(INITCALL_DEVICE)]
-fn ps2_mouse_device_int() -> Result<(), SystemError> {
+fn rs_ps2_mouse_device_int() -> Result<(), SystemError> {
     kdebug!("ps2_mouse_device initializing...");
     let psmouse = Arc::new(Ps2MouseDevice::new());
 

@@ -35,7 +35,7 @@ hardware_intr_controller ps2_mouse_intr_controller =
  * @brief 初始化鼠标驱动程序
  *
  */
-void ps2_mouse_init()
+void c_ps2_mouse_init()
 {
     // ======== 初始化中断RTE entry ==========
 

@@ -27,7 +27,7 @@ use crate::{
 use super::ps_mouse_device::{ps2_mouse_device, Ps2MouseDevice};
 
 extern "C" {
-    fn ps2_mouse_init();
+    fn c_ps2_mouse_init();
 }
 
 #[no_mangle]
@@ -226,7 +226,7 @@ impl SerioDriver for Ps2MouseDriver {
         device.set_driver(Some(self.inner.lock_irqsave().self_ref.clone()));
 
         device.init()?;
-        unsafe { ps2_mouse_init() };
+        unsafe { c_ps2_mouse_init() };
         return Ok(());
     }
 

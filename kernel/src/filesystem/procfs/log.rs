@@ -77,14 +77,6 @@ impl LogMessage {
     pub fn level(&self) -> LogLevel {
         self.level.clone()
     }
-
-    pub fn timestamp(&self) -> String {
-        self.timestamp.clone()
-    }
-
-    pub fn message(&self) -> String {
-        self.message.clone()
-    }
 }
 
 impl Display for LogMessage {

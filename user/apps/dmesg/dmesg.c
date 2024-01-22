@@ -1,3 +1,5 @@
+#include "dmesg.h"
+
 /**
  * @brief 识别dmesg程序的第一个选项参数
  *

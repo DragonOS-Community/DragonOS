@@ -491,7 +491,7 @@ impl SignalArch for X86_64SignalArch {
                 "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
                 sig_number as i32,
                 ProcessManager::current_pcb().pid(),
-                res.unwrap_err()
+                res.as_ref().unwrap_err()
             );
         }
     }

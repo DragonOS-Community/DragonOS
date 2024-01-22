@@ -4,7 +4,7 @@ use system_error::SystemError;
 
 use crate::syscall::Syscall;
 
-use super::KMSG;
+use super::kmsg::KMSG;
 
 /// 操作内核环形缓冲区
 enum SyslogAction {
@@ -22,6 +22,23 @@ enum SyslogAction {
     SyslogActionConsoleLevel = 8,
     /// Return size of the log buffer.
     SyslogActionSizeBuffer = 10,
+    /// Invalid SyslogAction
+    SyslogActionInval,
+}
+
+impl From<usize> for SyslogAction {
+    fn from(value: usize) -> Self {
+        match value {
+            0 => SyslogAction::SyslogActionClose,
+            1 => SyslogAction::SyslogActionOpen,
+            2 => SyslogAction::SyslogActionRead,
+            4 => SyslogAction::SyslogActionReadClear,
+            5 => SyslogAction::SyslogActionClear,
+            8 => SyslogAction::SyslogActionConsoleLevel,
+            10 => SyslogAction::SyslogActionSizeBuffer,
+            _ => SyslogAction::SyslogActionInval,
+        }
+    }
 }
 
 impl Syscall {
@@ -42,29 +59,19 @@ impl Syscall {
         buf: &mut [u8],
         len: usize,
     ) -> Result<usize, SystemError> {
-        let syslog_action = match syslog_action_type {
-            0 => SyslogAction::SyslogActionClose,
-            1 => SyslogAction::SyslogActionOpen,
-            2 => SyslogAction::SyslogActionRead,
-            4 => SyslogAction::SyslogActionReadClear,
-            5 => SyslogAction::SyslogActionClear,
-            8 => SyslogAction::SyslogActionConsoleLevel,
-            10 => SyslogAction::SyslogActionSizeBuffer,
-            _ => return Err(SystemError::EINVAL),
-        };
+        let syslog_action = SyslogAction::from(syslog_action_type);
 
-        let mut kmsg_guard = KMSG.lock();
-        let r = match syslog_action {
+        let mut kmsg_guard = unsafe { KMSG.as_ref().unwrap().lock() };
+
+        match syslog_action {
             SyslogAction::SyslogActionClose => Ok(0),
             SyslogAction::SyslogActionOpen => Ok(0),
-            SyslogAction::SyslogActionRead => kmsg_guard.read(len, buf),
-            SyslogAction::SyslogActionReadClear => kmsg_guard.read_clear(len, buf),
+            SyslogAction::SyslogActionRead => kmsg_guard.read(buf),
+            SyslogAction::SyslogActionReadClear => kmsg_guard.read_clear(buf),
             SyslogAction::SyslogActionClear => kmsg_guard.clear(),
             SyslogAction::SyslogActionSizeBuffer => kmsg_guard.data_size(),
             SyslogAction::SyslogActionConsoleLevel => kmsg_guard.set_level(len),
-        };
-        drop(kmsg_guard);
-
-        return r;
+            SyslogAction::SyslogActionInval => return Err(SystemError::EINVAL),
+        }
     }
 }

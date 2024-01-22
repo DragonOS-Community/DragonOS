@@ -2,7 +2,7 @@
 
 int main(int argc, char **argv)
 {
-    unsigned len = 1;
+    unsigned int len = 1;
     char *buf = NULL;
     int opt;
     unsigned int color = 65280;
@@ -74,18 +74,37 @@ int main(int argc, char **argv)
         }
     }
 
+    // 当前打印内容
+    // 0: 日志级别
+    // 1: 时间戳
+    // 2: 代码行号
+    // 3: 日志消息
+    unsigned int content = 0;
     for (int i = 0; i < len; i++)
     {
         char c[2];
         c[0] = buf[i];
         c[1] = '\0';
         syscall(100000, &c[0], color, 0);
-        if (buf[i] == ']')
+        if (content == 0 && buf[i] == '>')
+        {
+            content++;
+        }
+        else if (content == 1 && buf[i] == ']')
+        {
             color = 16744448;
-        else if (buf[i] == ')')
+            content++;
+        }
+        else if (content == 2 && buf[i] == ')')
+        {
             color = 16777215;
-        else if (buf[i] == '\n')
+            content++;
+        }
+        else if (content == 3 && buf[i] == '\n')
+        {
             color = 65280;
+            content = 0;
+        }
     }
 
     free(buf);

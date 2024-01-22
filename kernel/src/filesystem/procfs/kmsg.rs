@@ -1,10 +1,24 @@
-use super::log_message::{LogLevel, LogMessage};
+use super::log::{LogLevel, LogMessage};
+
+use crate::libs::spinlock::SpinLock;
+
 use alloc::{borrow::ToOwned, string::ToString, vec::Vec};
+
 use kdepends::ringbuffer::{AllocRingBuffer, RingBuffer};
+
 use system_error::SystemError;
 
 /// 缓冲区容量
 const KMSG_BUFFER_CAPACITY: usize = 1024;
+
+/// 全局环形缓冲区
+pub static mut KMSG: Option<SpinLock<Kmsg>> = None;
+
+/// 初始化KMSG
+pub fn kmsg_init() {
+    let kmsg = SpinLock::new(Kmsg::new());
+    unsafe { KMSG = Some(kmsg) };
+}
 
 /// 日志
 pub struct Kmsg {
@@ -35,26 +49,18 @@ impl Kmsg {
     }
 
     /// 读取缓冲区
-    pub fn read(&mut self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let r = match self.console_loglevel {
-            LogLevel::DEFAULT => self.read_all(len, buf),
-            _ => self.read_level(len, buf),
-        };
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.tobytes();
 
-        r
+        match self.console_loglevel {
+            LogLevel::DEFAULT => self.read_all(buf),
+            _ => self.read_level(buf),
+        }
     }
 
     /// 读取缓冲区所有日志消息
-    fn read_all(&mut self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        self.tobytes();
-
-        let mut len = len;
-        len = self.data.len().min(len);
-
-        // buffer空间不足
-        if buf.len() < len {
-            return Err(SystemError::ENOBUFS);
-        }
+    fn read_all(&mut self, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let len = self.data.len().min(buf.len());
 
         // 拷贝数据
         let src = &self.data[0..len];
@@ -64,7 +70,7 @@ impl Kmsg {
     }
 
     /// 读取缓冲区特定level的日志消息
-    fn read_level(&mut self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+    fn read_level(&mut self, buf: &mut [u8]) -> Result<usize, SystemError> {
         let mut data_level: Vec<u8> = Vec::new();
 
         for msg in self.buffer.iter() {
@@ -73,13 +79,7 @@ impl Kmsg {
             }
         }
 
-        let mut len = len;
-        len = data_level.len().min(len);
-
-        // buffer空间不足
-        if buf.len() < len {
-            return Err(SystemError::ENOBUFS);
-        }
+        let len = data_level.len().min(buf.len());
 
         // 拷贝数据
         let src = &data_level[0..len];
@@ -92,8 +92,8 @@ impl Kmsg {
     }
 
     /// 读取并清空缓冲区
-    pub fn read_clear(&mut self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let r = self.read_all(len, buf);
+    pub fn read_clear(&mut self, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let r = self.read_all(buf);
         self.clear()?;
 
         return r;

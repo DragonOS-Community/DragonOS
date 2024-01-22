@@ -2,24 +2,24 @@ use core::fmt::{Display, Formatter, Result};
 
 use alloc::string::String;
 
-/// 日志类型
-#[derive(Default, Clone, Debug)]
-pub enum LogType {
-    /// 启动信息
-    Startup,
-    /// 驱动信息
-    Driver,
-    /// 系统信息
-    System,
-    /// 硬件信息
-    Hardware,
-    /// 内核模块信息
-    KernelModule,
-    /// 内核调试信息
-    KernelDebug,
-    #[default]
-    Default,
-}
+// /// 日志类型
+// #[derive(Default, Clone, Debug)]
+// pub enum LogType {
+//     /// 启动信息
+//     Startup,
+//     /// 驱动信息
+//     Driver,
+//     /// 系统信息
+//     System,
+//     /// 硬件信息
+//     Hardware,
+//     /// 内核模块信息
+//     KernelModule,
+//     /// 内核调试信息
+//     KernelDebug,
+//     #[default]
+//     Default,
+// }
 
 /// 日志级别
 #[derive(Default, Clone, PartialEq, Debug)]
@@ -36,6 +36,22 @@ pub enum LogLevel {
     DEFAULT = 8,
 }
 
+impl From<usize> for LogLevel {
+    fn from(value: usize) -> Self {
+        match value {
+            0 => LogLevel::EMERG,
+            1 => LogLevel::ALERT,
+            2 => LogLevel::CRIT,
+            3 => LogLevel::ERR,
+            4 => LogLevel::WARN,
+            5 => LogLevel::NOTICE,
+            6 => LogLevel::INFO,
+            7 => LogLevel::DEBUG,
+            _ => LogLevel::DEFAULT,
+        }
+    }
+}
+
 /// 日志消息
 #[derive(Default, Clone, Debug)]
 pub struct LogMessage {
@@ -43,18 +59,17 @@ pub struct LogMessage {
     timestamp: String,
     /// 日志级别
     level: LogLevel,
-    /// 日志类型
-    log_type: LogType,
+    // /// 日志类型
+    // log_type: LogType,
     /// 日志消息
     message: String,
 }
 
 impl LogMessage {
-    pub fn new(timestamp: String, level: LogLevel, log_type: LogType, message: String) -> Self {
+    pub fn new(timestamp: String, level: LogLevel, message: String) -> Self {
         LogMessage {
             timestamp,
             level,
-            log_type,
             message,
         }
     }
@@ -65,10 +80,6 @@ impl LogMessage {
 
     pub fn timestamp(&self) -> String {
         self.timestamp.clone()
-    }
-
-    pub fn log_type(&self) -> LogType {
-        self.log_type.clone()
     }
 
     pub fn message(&self) -> String {
@@ -91,19 +102,9 @@ impl Display for LogMessage {
             LogLevel::DEFAULT => "Default",
         };
 
-        let log_type = match self.log_type {
-            LogType::Startup => "Startup",
-            LogType::Driver => "Driver",
-            LogType::System => "System",
-            LogType::Hardware => "Hardware",
-            LogType::KernelModule => "KernelModule",
-            LogType::KernelDebug => "KernelDebug",
-            LogType::Default => "Default",
-        };
-
         let message = &self.message;
 
-        let res = format!("<{}>[{}] ({}): {}\n", level, timestamp, log_type, message);
+        let res = format!("<{}>[{}] : {}\n", level, timestamp, message);
         return write!(f, "{}", res);
     }
 }

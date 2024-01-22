@@ -13,12 +13,9 @@ use system_error::SystemError;
 use crate::{
     arch::mm::LockedFrameAllocator,
     driver::base::device::device_number::DeviceNumber,
-    filesystem::{
-        procfs::kmsg::Kmsg,
-        vfs::{
-            core::{generate_inode_id, ROOT_INODE},
-            FileType,
-        },
+    filesystem::vfs::{
+        core::{generate_inode_id, ROOT_INODE},
+        FileType,
     },
     kerror, kinfo,
     libs::{
@@ -36,14 +33,9 @@ use super::vfs::{
     FileSystem, FsInfo, IndexNode, InodeId, Metadata,
 };
 
-mod kmsg;
-mod log_message;
+pub mod kmsg;
+pub mod log;
 mod syscall;
-
-lazy_static! {
-    /// 全局环形缓冲区
-    static ref KMSG: SpinLock<Kmsg> = SpinLock::new(Kmsg::new());
-}
 
 /// @brief 进程文件类型
 /// @usage 用于定义进程文件夹下的各类文件类型

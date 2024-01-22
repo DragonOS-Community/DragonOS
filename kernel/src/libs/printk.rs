@@ -1,6 +1,17 @@
 use core::fmt::{self, Write};
 
+use alloc::string::ToString;
+
 use super::lib_ui::textui::{textui_putstr, FontColor};
+
+use crate::{
+    arch::CurrentTimeArch,
+    filesystem::procfs::{
+        kmsg::KMSG,
+        log::{LogLevel, LogMessage},
+    },
+    time::TimeArch,
+};
 
 #[macro_export]
 macro_rules! print {
@@ -30,14 +41,15 @@ macro_rules! printk_color {
 #[macro_export]
 macro_rules! kdebug {
     ($($arg:tt)*) => {
+        $crate::libs::printk::Logger.log(7,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
         $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ DEBUG ] ({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)))
-
     }
 }
 
 #[macro_export]
 macro_rules! kinfo {
     ($($arg:tt)*) => {
+        $crate::libs::printk::Logger.log(6,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
         $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ INFO ] ({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)))
     }
 }
@@ -45,6 +57,7 @@ macro_rules! kinfo {
 #[macro_export]
 macro_rules! kwarn {
     ($($arg:tt)*) => {
+        $crate::libs::printk::Logger.log(4,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
         $crate::libs::printk::PrintkWriter.__write_string_color($crate::libs::lib_ui::textui::FontColor::YELLOW, $crate::libs::lib_ui::textui::FontColor::BLACK, "[ WARN ] ");
         $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
     }
@@ -53,6 +66,7 @@ macro_rules! kwarn {
 #[macro_export]
 macro_rules! kerror {
     ($($arg:tt)*) => {
+        $crate::libs::printk::Logger.log(3,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
         $crate::libs::printk::PrintkWriter.__write_string_color($crate::libs::lib_ui::textui::FontColor::RED, $crate::libs::lib_ui::textui::FontColor::BLACK, "[ ERROR ] ");
         $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
     }
@@ -61,6 +75,7 @@ macro_rules! kerror {
 #[macro_export]
 macro_rules! kBUG {
     ($($arg:tt)*) => {
+        $crate::libs::printk::Logger.log(1,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
         $crate::libs::printk::PrintkWriter.__write_string_color($crate::libs::lib_ui::textui::FontColor::RED, $crate::libs::lib_ui::textui::FontColor::BLACK, "[ BUG ] ");
         $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
     }
@@ -96,4 +111,19 @@ impl fmt::Write for PrintkWriter {
 #[doc(hidden)]
 pub fn __printk(args: fmt::Arguments) {
     PrintkWriter.write_fmt(args).unwrap();
+}
+
+pub struct Logger;
+
+impl Logger {
+    pub fn log(&self, log_level: usize, message: fmt::Arguments) {
+        if unsafe { !KMSG.is_none() } {
+            let timestamp = CurrentTimeArch::get_cycles() as f64 / 1_000_000_000.0;
+            let log_level = LogLevel::from(log_level.clone());
+            let log_message =
+                LogMessage::new(timestamp.to_string(), log_level, message.to_string());
+
+            unsafe { KMSG.as_ref().unwrap().lock().push(log_message) };
+        }
+    }
 }

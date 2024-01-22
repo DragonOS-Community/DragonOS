@@ -10,7 +10,7 @@ use crate::{
     libs::{align::page_align_down, rwlock::RwLock},
     mm::{
         memblock::{mem_block_manager, MemBlockManager},
-        MemoryManagementArch, PhysAddr, VirtAddr,
+        MemoryManagementArch, PhysAddr,
     },
 };
 
@@ -42,13 +42,11 @@ impl FdtGlobalData {
     }
 }
 
-static mut FDT_VADDR: Option<VirtAddr> = None;
-
 pub struct OpenFirmwareFdtDriver;
 
 impl OpenFirmwareFdtDriver {
     pub fn early_scan_device_tree(&self) -> Result<(), SystemError> {
-        let fdt_vaddr = unsafe { FDT_VADDR.ok_or(SystemError::EINVAL)? };
+        let fdt_vaddr = boot_params().read().fdt().unwrap();
         let fdt = unsafe {
             fdt::Fdt::from_ptr(fdt_vaddr.as_ptr()).map_err(|e| {
                 kerror!("failed to parse fdt, err={:?}", e);
@@ -280,21 +278,5 @@ impl OpenFirmwareFdtDriver {
         }
 
         return false;
-    }
-
-    pub unsafe fn set_fdt_vaddr(&self, vaddr: VirtAddr) -> Result<(), SystemError> {
-        if vaddr.is_null() {
-            return Err(SystemError::EINVAL);
-        }
-        fdt::Fdt::from_ptr(vaddr.as_ptr()).map_err(|e| {
-            kerror!("failed to parse fdt, err={:?}", e);
-            SystemError::EINVAL
-        })?;
-
-        unsafe {
-            FDT_VADDR = Some(vaddr);
-        }
-
-        Ok(())
     }
 }

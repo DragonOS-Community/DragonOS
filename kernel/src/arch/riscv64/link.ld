@@ -76,6 +76,8 @@ SECTIONS
 		_bss = .;
 		*(.bss)
 		*(.bss.*)
+		*(.sbss)
+		*(.sbss.*)
 		_ebss = .;
 	}
 

@@ -285,6 +285,11 @@ impl MemoryManagementArch for X86_64MMArch {
             return None;
         }
     }
+
+    #[inline(always)]
+    fn make_entry(paddr: PhysAddr, page_flags: usize) -> usize {
+        return paddr.data() | page_flags;
+    }
 }
 
 impl X86_64MMArch {
@@ -335,8 +340,6 @@ impl X86_64MMArch {
                 }
 
                 total_mem_size += mb2_mem_info[i].len as usize;
-                // PHYS_MEMORY_AREAS[areas_count].base = PhysAddr::new(mb2_mem_info[i].addr as usize);
-                // PHYS_MEMORY_AREAS[areas_count].size = mb2_mem_info[i].len as usize;
 
                 mem_block_manager()
                     .add_block(
@@ -453,7 +456,7 @@ unsafe fn allocator_init() {
         // 取消最开始时候，在head.S中指定的映射(暂时不刷新TLB)
         {
             let table = mapper.table();
-            let empty_entry = PageEntry::<MMArch>::new(0);
+            let empty_entry = PageEntry::<MMArch>::from_usize(0);
             for i in 0..MMArch::PAGE_ENTRY_NUM {
                 table
                     .set_entry(i, empty_entry)

@@ -1,7 +1,5 @@
-use crate::{
-    arch::driver::sbi::ecall::{ecall0, ecall1},
-    mm::VirtAddr,
-};
+#![allow(dead_code)]
+use crate::{arch::driver::sbi::ecall::ecall1, mm::VirtAddr};
 use core::arch::asm;
 
 /// `sbi_set_timer` extension ID

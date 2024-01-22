@@ -3,9 +3,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::{
     arch::MMArch,
     driver::tty::serial::serial8250::send_to_default_serial8250_port,
-    include::bindings::bindings::{
-        FRAME_BUFFER_MAPPING_OFFSET, SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE,
-    },
     init::boot_params,
     kinfo,
     libs::{
@@ -16,7 +13,7 @@ use crate::{
     },
     mm::{
         allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper, page::PageFlags,
-        MemoryManagementArch, VirtAddr,
+        MemoryManagementArch,
     },
     time::timer::{Timer, TimerFunction},
 };
@@ -86,10 +83,11 @@ impl VideoRefreshManager {
      */
     fn init_frame_buffer(&self) {
         kinfo!("Re-mapping VBE frame buffer...");
-        let buf_vaddr = VirtAddr::new(
-            SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE as usize + FRAME_BUFFER_MAPPING_OFFSET as usize,
-        );
-        boot_params().write_irqsave().screen_info.lfb_virt_base = Some(buf_vaddr);
+        let buf_vaddr = boot_params()
+            .read_irqsave()
+            .screen_info
+            .lfb_virt_base
+            .unwrap();
 
         let mut frame_buffer_info_guard = self.device_buffer.write();
         if let ScmBuffer::DeviceBuffer(vaddr) = &mut (frame_buffer_info_guard).buf {

@@ -10,8 +10,13 @@ extern "C" {
     fn ps2_keyboard_init() -> c_void;
 }
 
+/// 初始化ps2键盘
+///
+/// todo: 将ps2键盘适配到设备驱动模型后，把初始化时机改为INITCALL_DEVICE
+///
+/// 当前是LATE的原因是键盘驱动的TypeOneFSM需要在tty设备初始化之后才能工作。
 #[unified_init(INITCALL_LATE)]
-pub fn _rs_ps2_keyboard_init() -> Result<(), SystemError> {
+fn rs_ps2_keyboard_init() -> Result<(), SystemError> {
     unsafe {
         ps2_keyboard_init();
     }

@@ -19,7 +19,11 @@ use crate::{
         input::serio::serio_device::{serio_device_manager, SerioDevice},
     },
     exception::InterruptArch,
-    filesystem::kernfs::KernFSInode,
+    filesystem::{
+        devfs::{devfs_register, DevFS, DeviceINode},
+        kernfs::KernFSInode,
+        vfs::{syscall::ModeType, FileType, IndexNode, Metadata},
+    },
     init::initcall::INITCALL_DEVICE,
     libs::spinlock::SpinLock,
 };
@@ -173,6 +177,12 @@ impl Ps2MouseDevice {
                 kobj_type: None,
                 current_packet: 0,
                 current_state: MouseState::new(),
+                buf: [0; 3],
+                devfs_metadata: Metadata::new(
+                    FileType::CharDevice,
+                    ModeType::from_bits_truncate(0o644),
+                ),
+                device_inode_fs: None,
             }),
             kobj_state: LockedKObjectState::new(None),
         };
@@ -253,6 +263,8 @@ impl Ps2MouseDevice {
     pub fn process_packet(&self) -> Result<(), SystemError> {
         let packet = self.read_data_port()?;
         let mut guard = self.inner.lock();
+        let current_packet = guard.current_packet as usize;
+        guard.buf[current_packet] = packet; // 更新缓冲区
         match guard.current_packet {
             0 => {
                 let flags: MouseFlags = MouseFlags::from_bits_truncate(packet);
@@ -273,12 +285,12 @@ impl Ps2MouseDevice {
                     guard.current_state.y = self.get_y_movement(packet, flags);
                 }
 
-                kdebug!(
-                    "Ps2MouseDevice packet : flags:{}, x:{}, y:{}\n",
-                    guard.current_state.flags.bits,
-                    guard.current_state.x,
-                    guard.current_state.y
-                )
+                // kdebug!(
+                //     "Ps2MouseDevice packet : flags:{}, x:{}, y:{}\n",
+                //     guard.current_state.flags.bits,
+                //     guard.current_state.x,
+                //     guard.current_state.y
+                // )
             }
             _ => unreachable!(),
         }
@@ -379,8 +391,14 @@ struct InnerPs2MouseDevice {
     kset: Option<Arc<KSet>>,
     kobj_type: Option<&'static dyn KObjType>,
 
-    current_packet: u8,
+    /// 鼠标数据
     current_state: MouseState,
+    current_packet: u8,
+    buf: [u8; 3],
+
+    /// device inode要求的字段
+    device_inode_fs: Option<Weak<DevFS>>,
+    devfs_metadata: Metadata,
 }
 
 impl Device for Ps2MouseDevice {
@@ -412,7 +430,6 @@ impl Device for Ps2MouseDevice {
         &self,
         driver: Option<alloc::sync::Weak<dyn crate::driver::base::device::driver::Driver>>,
     ) {
-        kdebug!("xkd mouse setdriver");
         self.inner.lock_irqsave().driver = driver;
     }
 
@@ -533,15 +550,84 @@ impl KObject for Ps2MouseDevice {
     }
 }
 
+impl DeviceINode for Ps2MouseDevice {
+    fn set_fs(&self, fs: Weak<DevFS>) {
+        self.inner.lock_irqsave().device_inode_fs = Some(fs);
+    }
+}
+
+impl IndexNode for Ps2MouseDevice {
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: &mut crate::filesystem::vfs::FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        let guard = self.inner.lock_irqsave();
+        if offset > 0 && offset + len < guard.buf.len() {
+            buf.copy_from_slice(&guard.buf[offset..offset + len]);
+            Ok(len)
+        } else {
+            Err(SystemError::ENXIO)
+        }
+    }
+
+    fn write_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
+        _data: &mut crate::filesystem::vfs::FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
+    fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
+        self.inner
+            .lock_irqsave()
+            .device_inode_fs
+            .as_ref()
+            .unwrap()
+            .upgrade()
+            .unwrap()
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
+        todo!()
+    }
+
+    fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
+        Ok(self.inner.lock_irqsave().devfs_metadata.clone())
+    }
+
+    fn resize(&self, _len: usize) -> Result<(), SystemError> {
+        Ok(())
+    }
+}
+
 #[unified_init(INITCALL_DEVICE)]
 fn ps2_mouse_device_int() -> Result<(), SystemError> {
     kdebug!("ps2_mouse_device initializing...");
-    let device = Ps2MouseDevice::new();
+    let psmouse = Arc::new(Ps2MouseDevice::new());
 
-    let ptr = Arc::new(device);
-    device_manager().device_default_initialize(&(ptr.clone() as Arc<dyn Device>));
-    serio_device_manager().register_port(ptr.clone())?;
+    device_manager().device_default_initialize(&(psmouse.clone() as Arc<dyn Device>));
+    serio_device_manager().register_port(psmouse.clone())?;
 
-    unsafe { PS2_MOUSE_DEVICE = Some(ptr) };
+    devfs_register(&psmouse.name(), psmouse.clone()).map_err(|e| {
+        kerror!(
+            "register psmouse device '{}' to devfs failed: {:?}",
+            psmouse.name(),
+            e
+        );
+        device_manager().remove(&(psmouse.clone() as Arc<dyn Device>));
+        e
+    })?;
+
+    unsafe { PS2_MOUSE_DEVICE = Some(psmouse) };
     return Ok(());
 }

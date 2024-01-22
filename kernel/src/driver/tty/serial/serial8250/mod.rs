@@ -480,7 +480,6 @@ impl Driver for Serial8250ISADriver {
     }
 
     fn add_device(&self, device: Arc<dyn Device>) {
-        kdebug!("xkd serio8250 add dev");
         self.inner.write().devices.push(device);
     }
 

@@ -7,7 +7,7 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch},
+    arch::{io::PortIOArch, CurrentPortIOArch},
     driver::{
         base::{
             device::{bus::Bus, driver::Driver, Device, IdTable},
@@ -19,7 +19,6 @@ use crate::{
             subsys::SerioDeviceAttrGroup,
         },
     },
-    exception::InterruptArch,
     filesystem::kernfs::KernFSInode,
     init::initcall::INITCALL_DEVICE,
     libs::spinlock::SpinLock,

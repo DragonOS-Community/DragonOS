@@ -74,7 +74,6 @@ impl Bus for SerioBus {
             SystemError::EINVAL
         })?;
 
-        kdebug!("xkd serio bus probe ok");
         return pdrv.connect(&pdev);
     }
 

@@ -197,18 +197,35 @@ impl IndexNode for TtyDevice {
 
         self.check_rw_param(len, buf)?;
 
+        let mut cnt: usize = 0;
         // 根据当前文件是stdout还是stderr,选择不同的发送方式
         let r: Result<usize, TtyError> = if data.flags.contains(TtyFileFlag::STDOUT) {
-            self.core.stdout(&buf[0..len], true)
+            loop {
+                let r = self.core.stdout(&buf[cnt..len], false);
+                if let Err(TtyError::BufferFull(c)) = r {
+                    self.sync().expect("Failed to sync tty device!");
+                    cnt += c;
+                } else {
+                    break r;
+                }
+            }
         } else if data.flags.contains(TtyFileFlag::STDERR) {
-            self.core.stderr(&buf[0..len], true)
+            loop {
+                let r = self.core.stderr(&buf[cnt..len], false);
+                if let Err(TtyError::BufferFull(c)) = r {
+                    self.sync().expect("Failed to sync tty device!");
+                    cnt += c;
+                } else {
+                    break r;
+                }
+            }
         } else {
             return Err(SystemError::EPERM);
         };
 
         if r.is_ok() {
             self.sync().expect("Failed to sync tty device!");
-            return Ok(r.unwrap());
+            return Ok(cnt + r.unwrap());
         }
 
         let r: TtyError = r.unwrap_err();

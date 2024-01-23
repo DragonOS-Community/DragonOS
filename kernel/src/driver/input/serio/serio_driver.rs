@@ -24,6 +24,8 @@ pub trait SerioDriver: Driver {
     ///
     /// ## 返回值
     /// 无
+    ///
+    /// todo:https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/serio.c?fi=__serio_register_driver#989
     fn interrupt(
         &self,
         device: &Arc<dyn SerioDevice>,

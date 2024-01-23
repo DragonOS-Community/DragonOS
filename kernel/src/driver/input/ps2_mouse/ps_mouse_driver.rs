@@ -11,17 +11,20 @@ use crate::{
     driver::{
         base::{
             device::{bus::Bus, driver::Driver, Device, IdTable},
-            kobject::{KObjType, KObject, LockedKObjectState},
+            kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
         },
         input::serio::{
+            serio_device::SerioDevice,
             serio_driver::{serio_driver_manager, SerioDriver},
-            subsys::SerioDeviceAttrGroup,
         },
     },
     filesystem::kernfs::KernFSInode,
     init::initcall::INITCALL_DEVICE,
-    libs::spinlock::SpinLock,
+    libs::{
+        rwlock::{RwLockReadGuard, RwLockWriteGuard},
+        spinlock::SpinLock,
+    },
 };
 
 use super::ps_mouse_device::{ps2_mouse_device, Ps2MouseDevice};
@@ -33,7 +36,9 @@ extern "C" {
 #[no_mangle]
 unsafe extern "C" fn ps2_mouse_driver_interrupt() {
     if let Some(psmouse_device) = ps2_mouse_device() {
-        psmouse_device.process_packet().ok();
+        ps2_mouse_driver()
+            .interrupt(&(psmouse_device as Arc<dyn SerioDevice>), 0, 0)
+            .ok();
     } else {
         unsafe { CurrentPortIOArch::in8(0x60) };
     }
@@ -100,15 +105,15 @@ pub struct InnerPs2MouseDriver {
 }
 
 impl Driver for Ps2MouseDriver {
-    fn id_table(&self) -> Option<crate::driver::base::device::IdTable> {
+    fn id_table(&self) -> Option<IdTable> {
         Some(IdTable::new("psmouse".to_string(), None))
     }
 
-    fn devices(&self) -> alloc::vec::Vec<Arc<dyn crate::driver::base::device::Device>> {
+    fn devices(&self) -> alloc::vec::Vec<Arc<dyn Device>> {
         self.inner.lock().devices.clone()
     }
 
-    fn add_device(&self, device: Arc<dyn crate::driver::base::device::Device>) {
+    fn add_device(&self, device: Arc<dyn Device>) {
         let mut guard = self.inner.lock();
         // check if the device is already in the list
         if guard.devices.iter().any(|dev| Arc::ptr_eq(dev, &device)) {
@@ -118,21 +123,17 @@ impl Driver for Ps2MouseDriver {
         guard.devices.push(device);
     }
 
-    fn delete_device(&self, device: &Arc<dyn crate::driver::base::device::Device>) {
+    fn delete_device(&self, device: &Arc<dyn Device>) {
         let mut guard = self.inner.lock();
         guard.devices.retain(|dev| !Arc::ptr_eq(dev, device));
     }
 
-    fn set_bus(&self, bus: Option<alloc::sync::Weak<dyn crate::driver::base::device::bus::Bus>>) {
+    fn set_bus(&self, bus: Option<alloc::sync::Weak<dyn Bus>>) {
         self.inner.lock().bus = bus;
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {
         self.inner.lock().bus.clone()
-    }
-
-    fn dev_groups(&self) -> &'static [&'static dyn crate::filesystem::sysfs::AttributeGroup] {
-        return &[&SerioDeviceAttrGroup];
     }
 }
 
@@ -141,11 +142,11 @@ impl KObject for Ps2MouseDriver {
         self
     }
 
-    fn set_inode(&self, inode: Option<Arc<crate::filesystem::kernfs::KernFSInode>>) {
+    fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
         self.inner.lock().kernfs_inode = inode;
     }
 
-    fn inode(&self) -> Option<Arc<crate::filesystem::kernfs::KernFSInode>> {
+    fn inode(&self) -> Option<Arc<KernFSInode>> {
         self.inner.lock().kernfs_inode.clone()
     }
 
@@ -157,19 +158,19 @@ impl KObject for Ps2MouseDriver {
         self.inner.lock().parent = parent;
     }
 
-    fn kset(&self) -> Option<Arc<crate::driver::base::kset::KSet>> {
+    fn kset(&self) -> Option<Arc<KSet>> {
         self.inner.lock().kset.clone()
     }
 
-    fn set_kset(&self, kset: Option<Arc<crate::driver::base::kset::KSet>>) {
+    fn set_kset(&self, kset: Option<Arc<KSet>>) {
         self.inner.lock().kset = kset;
     }
 
-    fn kobj_type(&self) -> Option<&'static dyn crate::driver::base::kobject::KObjType> {
+    fn kobj_type(&self) -> Option<&'static dyn KObjType> {
         self.inner.lock().ktype
     }
 
-    fn set_kobj_type(&self, ktype: Option<&'static dyn crate::driver::base::kobject::KObjType>) {
+    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
         self.inner.lock().ktype = ktype;
     }
 
@@ -179,19 +180,15 @@ impl KObject for Ps2MouseDriver {
 
     fn set_name(&self, _name: alloc::string::String) {}
 
-    fn kobj_state(
-        &self,
-    ) -> crate::libs::rwlock::RwLockReadGuard<crate::driver::base::kobject::KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(
-        &self,
-    ) -> crate::libs::rwlock::RwLockWriteGuard<crate::driver::base::kobject::KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
         self.kobj_state.write()
     }
 
-    fn set_kobj_state(&self, state: crate::driver::base::kobject::KObjectState) {
+    fn set_kobj_state(&self, state: KObjectState) {
         *self.kobj_state.write() = state;
     }
 }
@@ -199,24 +196,27 @@ impl KObject for Ps2MouseDriver {
 impl SerioDriver for Ps2MouseDriver {
     fn write_wakeup(
         &self,
-        _device: &Arc<dyn crate::driver::input::serio::serio_device::SerioDevice>,
+        _device: &Arc<dyn SerioDevice>,
     ) -> Result<(), system_error::SystemError> {
         todo!()
     }
 
     fn interrupt(
         &self,
-        _device: &Arc<dyn crate::driver::input::serio::serio_device::SerioDevice>,
+        device: &Arc<dyn SerioDevice>,
         _char: u8,
         _int: u8,
     ) -> Result<(), system_error::SystemError> {
-        todo!()
+        let device = device
+            .clone()
+            .arc_any()
+            .downcast::<Ps2MouseDevice>()
+            .map_err(|_| SystemError::EINVAL)?;
+        device.process_packet()?;
+        Ok(())
     }
 
-    fn connect(
-        &self,
-        device: &Arc<dyn crate::driver::input::serio::serio_device::SerioDevice>,
-    ) -> Result<(), system_error::SystemError> {
+    fn connect(&self, device: &Arc<dyn SerioDevice>) -> Result<(), system_error::SystemError> {
         let device = device
             .clone()
             .arc_any()
@@ -230,31 +230,22 @@ impl SerioDriver for Ps2MouseDriver {
         return Ok(());
     }
 
-    fn reconnect(
-        &self,
-        _device: &Arc<dyn crate::driver::input::serio::serio_device::SerioDevice>,
-    ) -> Result<(), system_error::SystemError> {
+    fn reconnect(&self, _device: &Arc<dyn SerioDevice>) -> Result<(), system_error::SystemError> {
         todo!()
     }
 
     fn fast_reconnect(
         &self,
-        _device: &Arc<dyn crate::driver::input::serio::serio_device::SerioDevice>,
+        _device: &Arc<dyn SerioDevice>,
     ) -> Result<(), system_error::SystemError> {
         todo!()
     }
 
-    fn disconnect(
-        &self,
-        _device: &Arc<dyn crate::driver::input::serio::serio_device::SerioDevice>,
-    ) -> Result<(), system_error::SystemError> {
+    fn disconnect(&self, _device: &Arc<dyn SerioDevice>) -> Result<(), system_error::SystemError> {
         todo!()
     }
 
-    fn cleanup(
-        &self,
-        _device: &Arc<dyn crate::driver::input::serio::serio_device::SerioDevice>,
-    ) -> Result<(), system_error::SystemError> {
+    fn cleanup(&self, _device: &Arc<dyn SerioDevice>) -> Result<(), system_error::SystemError> {
         todo!()
     }
 }

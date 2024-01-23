@@ -4,6 +4,7 @@ use alloc::{
     string::ToString,
     sync::{Arc, Weak},
 };
+use kdepends::ringbuffer::{AllocRingBuffer, RingBuffer};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -13,7 +14,7 @@ use crate::{
         base::{
             class::Class,
             device::{bus::Bus, device_manager, driver::Driver, Device, DeviceType, IdTable},
-            kobject::{KObjType, KObject, LockedKObjectState},
+            kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
         },
         input::serio::serio_device::{serio_device_manager, SerioDevice},
@@ -22,10 +23,13 @@ use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
         kernfs::KernFSInode,
-        vfs::{syscall::ModeType, FileType, IndexNode, Metadata},
+        vfs::{syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, Metadata},
     },
     init::initcall::INITCALL_DEVICE,
-    libs::spinlock::SpinLock,
+    libs::{
+        rwlock::{RwLockReadGuard, RwLockWriteGuard},
+        spinlock::SpinLock,
+    },
 };
 
 static mut PS2_MOUSE_DEVICE: Option<Arc<Ps2MouseDevice>> = None;
@@ -39,6 +43,8 @@ const DATA_PORT_ADDRESS: u16 = 0x60;
 
 const KEYBOARD_COMMAND_ENABLE_PS2_MOUSE_PORT: u8 = 0xa8;
 const KEYBOARD_COMMAND_SEND_TO_PS2_MOUSE: u8 = 0xd4;
+
+const MOUSE_BUFFER_CAPACITY: usize = 15;
 
 bitflags! {
     /// Represents the flags currently set for the mouse.
@@ -177,7 +183,7 @@ impl Ps2MouseDevice {
                 kobj_type: None,
                 current_packet: 0,
                 current_state: MouseState::new(),
-                buf: [0; 3],
+                buf: AllocRingBuffer::new(MOUSE_BUFFER_CAPACITY),
                 devfs_metadata: Metadata::new(
                     FileType::CharDevice,
                     ModeType::from_bits_truncate(0o644),
@@ -265,8 +271,7 @@ impl Ps2MouseDevice {
     pub fn process_packet(&self) -> Result<(), SystemError> {
         let packet = self.read_data_port()?;
         let mut guard = self.inner.lock();
-        let current_packet = guard.current_packet as usize;
-        guard.buf[current_packet] = packet; // 更新缓冲区
+        guard.buf.push(packet); // 更新缓冲区
         match guard.current_packet {
             0 => {
                 let flags: MouseFlags = MouseFlags::from_bits_truncate(packet);
@@ -396,7 +401,8 @@ struct InnerPs2MouseDevice {
     /// 鼠标数据
     current_state: MouseState,
     current_packet: u8,
-    buf: [u8; 3],
+    /// 鼠标数据环形缓冲区
+    buf: AllocRingBuffer<u8>,
 
     /// device inode要求的字段
     device_inode_fs: Option<Weak<DevFS>>,
@@ -408,30 +414,27 @@ impl Device for Ps2MouseDevice {
         false
     }
 
-    fn dev_type(&self) -> crate::driver::base::device::DeviceType {
+    fn dev_type(&self) -> DeviceType {
         DeviceType::Char
     }
 
-    fn id_table(&self) -> crate::driver::base::device::IdTable {
+    fn id_table(&self) -> IdTable {
         IdTable::new(self.name(), None)
     }
 
-    fn set_bus(&self, bus: Option<alloc::sync::Weak<dyn crate::driver::base::device::bus::Bus>>) {
+    fn set_bus(&self, bus: Option<alloc::sync::Weak<dyn Bus>>) {
         self.inner.lock_irqsave().bus = bus;
     }
 
-    fn set_class(&self, class: Option<alloc::sync::Arc<dyn crate::driver::base::class::Class>>) {
+    fn set_class(&self, class: Option<alloc::sync::Arc<dyn Class>>) {
         self.inner.lock_irqsave().class = class;
     }
 
-    fn driver(&self) -> Option<alloc::sync::Arc<dyn crate::driver::base::device::driver::Driver>> {
+    fn driver(&self) -> Option<alloc::sync::Arc<dyn Driver>> {
         self.inner.lock_irqsave().driver.clone()?.upgrade()
     }
 
-    fn set_driver(
-        &self,
-        driver: Option<alloc::sync::Weak<dyn crate::driver::base::device::driver::Driver>>,
-    ) {
+    fn set_driver(&self, driver: Option<alloc::sync::Weak<dyn Driver>>) {
         self.inner.lock_irqsave().driver = driver;
     }
 
@@ -445,11 +448,11 @@ impl Device for Ps2MouseDevice {
         true
     }
 
-    fn bus(&self) -> Option<alloc::sync::Weak<dyn crate::driver::base::device::bus::Bus>> {
+    fn bus(&self) -> Option<alloc::sync::Weak<dyn Bus>> {
         self.inner.lock_irqsave().bus.clone()
     }
 
-    fn class(&self) -> Option<Arc<dyn crate::driver::base::class::Class>> {
+    fn class(&self) -> Option<Arc<dyn Class>> {
         self.inner.lock_irqsave().class.clone()
     }
 }
@@ -497,11 +500,11 @@ impl KObject for Ps2MouseDevice {
         self
     }
 
-    fn set_inode(&self, inode: Option<alloc::sync::Arc<crate::filesystem::kernfs::KernFSInode>>) {
+    fn set_inode(&self, inode: Option<alloc::sync::Arc<KernFSInode>>) {
         self.inner.lock_irqsave().kern_inode = inode;
     }
 
-    fn inode(&self) -> Option<alloc::sync::Arc<crate::filesystem::kernfs::KernFSInode>> {
+    fn inode(&self) -> Option<alloc::sync::Arc<KernFSInode>> {
         self.inner.lock_irqsave().kern_inode.clone()
     }
 
@@ -513,19 +516,19 @@ impl KObject for Ps2MouseDevice {
         self.inner.lock_irqsave().parent = parent
     }
 
-    fn kset(&self) -> Option<alloc::sync::Arc<crate::driver::base::kset::KSet>> {
+    fn kset(&self) -> Option<alloc::sync::Arc<KSet>> {
         self.inner.lock_irqsave().kset.clone()
     }
 
-    fn set_kset(&self, kset: Option<alloc::sync::Arc<crate::driver::base::kset::KSet>>) {
+    fn set_kset(&self, kset: Option<alloc::sync::Arc<KSet>>) {
         self.inner.lock_irqsave().kset = kset;
     }
 
-    fn kobj_type(&self) -> Option<&'static dyn crate::driver::base::kobject::KObjType> {
+    fn kobj_type(&self) -> Option<&'static dyn KObjType> {
         self.inner.lock_irqsave().kobj_type.clone()
     }
 
-    fn set_kobj_type(&self, ktype: Option<&'static dyn crate::driver::base::kobject::KObjType>) {
+    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
         self.inner.lock_irqsave().kobj_type = ktype;
     }
 
@@ -535,19 +538,15 @@ impl KObject for Ps2MouseDevice {
 
     fn set_name(&self, _name: alloc::string::String) {}
 
-    fn kobj_state(
-        &self,
-    ) -> crate::libs::rwlock::RwLockReadGuard<crate::driver::base::kobject::KObjectState> {
+    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(
-        &self,
-    ) -> crate::libs::rwlock::RwLockWriteGuard<crate::driver::base::kobject::KObjectState> {
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
         self.kobj_state.write()
     }
 
-    fn set_kobj_state(&self, state: crate::driver::base::kobject::KObjectState) {
+    fn set_kobj_state(&self, state: KObjectState) {
         *self.kobj_state.write() = state;
     }
 }
@@ -561,17 +560,19 @@ impl DeviceINode for Ps2MouseDevice {
 impl IndexNode for Ps2MouseDevice {
     fn read_at(
         &self,
-        offset: usize,
+        _offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: &mut crate::filesystem::vfs::FilePrivateData,
+        _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
-        let guard = self.inner.lock_irqsave();
-        if offset > 0 && offset + len < guard.buf.len() {
-            buf.copy_from_slice(&guard.buf[offset..offset + len]);
-            Ok(len)
+        let mut guard = self.inner.lock_irqsave();
+        if len >= 3 && guard.buf.len() >= 3 {
+            for i in 0..3 {
+                buf[i] = guard.buf.dequeue().unwrap();
+            }
+            return Ok(3);
         } else {
-            Err(SystemError::ENXIO)
+            return Ok(0);
         }
     }
 
@@ -580,12 +581,12 @@ impl IndexNode for Ps2MouseDevice {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: &mut crate::filesystem::vfs::FilePrivateData,
+        _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
 
-    fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
+    fn fs(&self) -> Arc<dyn FileSystem> {
         self.inner
             .lock_irqsave()
             .device_inode_fs
@@ -603,7 +604,7 @@ impl IndexNode for Ps2MouseDevice {
         todo!()
     }
 
-    fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
+    fn metadata(&self) -> Result<Metadata, SystemError> {
         Ok(self.inner.lock_irqsave().devfs_metadata.clone())
     }
 

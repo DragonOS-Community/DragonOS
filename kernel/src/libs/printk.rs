@@ -5,12 +5,11 @@ use alloc::string::ToString;
 use super::lib_ui::textui::{textui_putstr, FontColor};
 
 use crate::{
-    arch::CurrentTimeArch,
     filesystem::procfs::{
         kmsg::KMSG,
         log::{LogLevel, LogMessage},
     },
-    time::TimeArch,
+    time::TimeSpec,
 };
 
 #[macro_export]
@@ -118,12 +117,11 @@ pub struct Logger;
 impl Logger {
     pub fn log(&self, log_level: usize, message: fmt::Arguments) {
         if unsafe { !KMSG.is_none() } {
-            let timestamp = CurrentTimeArch::get_cycles() as f64 / 1_000_000_000.0;
+            let timestamp: TimeSpec = TimeSpec::now();
             let log_level = LogLevel::from(log_level.clone());
-            let log_message =
-                LogMessage::new(timestamp.to_string(), log_level, message.to_string());
+            let log_message = LogMessage::new(timestamp, log_level, message.to_string());
 
-            unsafe { KMSG.as_ref().unwrap().lock().push(log_message) };
+            unsafe { KMSG.as_ref().unwrap().lock_irqsave().push(log_message) };
         }
     }
 }

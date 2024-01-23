@@ -1,5 +1,17 @@
+ifeq ($(ARCH), x86_64)
+export PREFIX=x86_64-linux-musl-
+else ifeq ($(ARCH), riscv64)
+export PREFIX=riscv64-linux-musl-
+endif
+
+
+export CC=$(PREFIX)gcc
+
 all: dmesg
-	mv dmesg $(ROOT_PATH)/bin/sysroot/bin/
+	mv dmesg $(DADK_CURRENT_BUILD_DIR)
 
 dmesg: main.c
-	musl-gcc -static -o dmesg main.c dmesg.c
+	$(CC) -static -o dmesg main.c dmesg.c
+
+clean:
+	rm dmesg *.o

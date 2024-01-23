@@ -9,12 +9,7 @@
       }
     }
   },
-  "depends": [
-    {
-      "name": "relibc",
-      "version": "0.1.0"
-    }
-  ],
+  "depends": [ ],
   "build": {
     "build_command": "make"
   },

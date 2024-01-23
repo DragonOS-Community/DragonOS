@@ -61,7 +61,7 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         let syslog_action = SyslogAction::from(syslog_action_type);
 
-        let mut kmsg_guard = unsafe { KMSG.as_ref().unwrap().lock() };
+        let mut kmsg_guard = unsafe { KMSG.as_ref().unwrap().lock_irqsave() };
 
         match syslog_action {
             SyslogAction::SyslogActionClose => Ok(0),

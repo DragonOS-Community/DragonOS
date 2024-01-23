@@ -1,7 +1,10 @@
 use core::{
     fmt,
+    intrinsics::unlikely,
     ops::{self, Sub},
 };
+
+use crate::arch::CurrentTimeArch;
 
 use self::timekeep::ktime_get_real_ns;
 
@@ -54,6 +57,27 @@ impl TimeSpec {
             tv_sec: sec,
             tv_nsec: nsec,
         };
+    }
+
+    /// 获取当前时间
+    pub fn now() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::arch::driver::tsc::TSCManager;
+            let khz = TSCManager::cpu_khz();
+            if unlikely(khz == 0) {
+                return TimeSpec::default();
+            } else {
+                return Self::from(Duration::from_millis(
+                    CurrentTimeArch::get_cycles() as u64 / khz,
+                ));
+            }
+        }
+
+        #[cfg(target_arch = "riscv64")]
+        {
+            unimplemented!("TimeSpec::current()")
+        }
     }
 }
 

@@ -2,6 +2,8 @@ use core::fmt::{Display, Formatter, Result};
 
 use alloc::string::String;
 
+use crate::time::TimeSpec;
+
 // /// 日志类型
 // #[derive(Default, Clone, Debug)]
 // pub enum LogType {
@@ -56,7 +58,7 @@ impl From<usize> for LogLevel {
 #[derive(Default, Clone, Debug)]
 pub struct LogMessage {
     /// 时间戳
-    timestamp: String,
+    timestamp: TimeSpec,
     /// 日志级别
     level: LogLevel,
     // /// 日志类型
@@ -66,7 +68,7 @@ pub struct LogMessage {
 }
 
 impl LogMessage {
-    pub fn new(timestamp: String, level: LogLevel, message: String) -> Self {
+    pub fn new(timestamp: TimeSpec, level: LogLevel, message: String) -> Self {
         LogMessage {
             timestamp,
             level,
@@ -96,7 +98,10 @@ impl Display for LogMessage {
 
         let message = &self.message;
 
-        let res = format!("<{}>[{}] : {}\n", level, timestamp, message);
+        let res = format!(
+            "<{}>[{}.{}] : {}\n",
+            level, timestamp.tv_sec, timestamp.tv_nsec, message
+        );
         return write!(f, "{}", res);
     }
 }

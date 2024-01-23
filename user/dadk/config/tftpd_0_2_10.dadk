@@ -1,0 +1,24 @@
+{
+  "name": "tftpd",
+  "version": "0.2.10",
+  "description": "Multithreaded TFTP server daemon for DragonOS",
+  "task_type": {
+    "BuildFromSource": {
+      "Git": {
+        "url": "https://github.com/yuyi2439/rs-tftpd/",
+        "branch": "dragon-tftpd",
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "envs": []
+}

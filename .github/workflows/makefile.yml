@@ -2,7 +2,7 @@ name: Build Check
 
 on:
   push:
-    branches: [ "master", "patch-add-riscv64-github-workflow" ]
+    branches: [ "master" ]
   pull_request:
     branches: [ "master" ]
 
@@ -68,7 +68,7 @@ jobs:
     - name: build the DragonOS
       env:
           ARCH: x86_64
-      run: bash -c "source ~/.cargo/env && export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin && make -j $(nproc) "
+      run: bash -c "source ~/.bashrc && source ~/.cargo/env && export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin && make -j $(nproc) "
 
   
   build-riscv64:
@@ -87,5 +87,5 @@ jobs:
       env:
           ARCH: riscv64
 
-      run: bash -c "source ~/.cargo/env && make kernel -j $(nproc)"
+      run: bash -c "source ~/.bashrc && source ~/.cargo/env && make kernel -j $(nproc)"
 

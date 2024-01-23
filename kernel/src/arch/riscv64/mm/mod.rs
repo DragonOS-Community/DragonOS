@@ -1,13 +1,10 @@
 use riscv::register::satp;
 use system_error::SystemError;
 
-use crate::{
-    kdebug,
-    mm::{
-        allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage, PhysPageFrame},
-        page::PageFlags,
-        MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
-    },
+use crate::mm::{
+    allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage, PhysPageFrame},
+    page::PageFlags,
+    MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
 };
 
 pub mod bump;
@@ -89,14 +86,11 @@ impl MemoryManagementArch for RiscV64MMArch {
 
         let paddr = PhysPageFrame::from_ppn(ppn).phys_address();
 
-        kdebug!("table(): {paddr:?}, ppn: {ppn}");
-
         return paddr;
     }
 
     unsafe fn set_table(_table_kind: PageTableKind, table: PhysAddr) {
         let ppn = PhysPageFrame::new(table).ppn();
-        kdebug!("set_table(): {table:?}, ppn:{ppn}");
         riscv::asm::sfence_vma_all();
         satp::set(satp::Mode::Sv39, 0, ppn);
     }
@@ -131,13 +125,11 @@ impl MemoryManagementArch for RiscV64MMArch {
     unsafe fn virt_2_phys(virt: VirtAddr) -> Option<PhysAddr> {
         if virt >= KERNEL_BEGIN_VA && virt < KERNEL_END_VA {
             let r = KERNEL_BEGIN_PA + (virt - KERNEL_BEGIN_VA);
-            kdebug!("virt_2_phys: kernel address: virt = {virt:?}, paddr = {r:?}");
             return Some(r);
         }
 
         if let Some(paddr) = virt.data().checked_sub(Self::PHYS_OFFSET) {
             let r = PhysAddr::new(paddr);
-            kdebug!("virt_2_phys: non-kernel address: virt = {virt:?}, paddr = {r:?}");
             return Some(r);
         } else {
             return None;
@@ -147,8 +139,6 @@ impl MemoryManagementArch for RiscV64MMArch {
     fn make_entry(paddr: PhysAddr, page_flags: usize) -> usize {
         let ppn = PhysPageFrame::new(paddr).ppn();
         let r = ((ppn & ((1 << 44) - 1)) << 10) | page_flags;
-
-        kdebug!("make entry: r={r:#x}");
         return r;
     }
 }

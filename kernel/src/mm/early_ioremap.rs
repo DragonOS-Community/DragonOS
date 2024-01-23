@@ -2,7 +2,10 @@ use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
-    libs::{align::page_align_up, spinlock::SpinLock},
+    libs::{
+        align::{page_align_down, page_align_up},
+        spinlock::SpinLock,
+    },
     mm::no_init::{pseudo_map_phys, pseudo_map_phys_ro, pseudo_unmap_phys},
 };
 
@@ -23,6 +26,34 @@ pub struct EarlyIoRemap;
 
 impl EarlyIoRemap {
     const SLOT_CNT: usize = MMArch::FIXMAP_SIZE / MMArch::PAGE_SIZE;
+
+    /// 把物理内存映射到虚拟内存中（物理地址不要求对齐
+    ///
+    /// ## 参数
+    ///
+    /// - phys: 物理内存地址（不需要对齐）
+    /// - size: 映射的内存大小
+    /// - read_only: 映射区与是否只读
+    ///
+    /// ## 返回值
+    ///
+    /// - 成功： (phys对应的虚拟内存地址)
+    /// - Err(SystemError::ENOMEM): 可用的slot不足
+    #[allow(dead_code)]
+    pub fn map_not_aligned(
+        mut phys: PhysAddr,
+        mut size: usize,
+        read_only: bool,
+    ) -> Result<VirtAddr, SystemError> {
+        // kdebug!("map not aligned phys:{phys:?}, size:{size:?}, read_only:{read_only:?}");
+
+        let offset = phys.data() - page_align_down(phys.data());
+        size += offset;
+        phys -= offset;
+
+        let (map_vaddr, _) = Self::map(phys, size, read_only)?;
+        return Ok(map_vaddr + offset);
+    }
 
     /// 把物理内存映射到虚拟内存中
     ///

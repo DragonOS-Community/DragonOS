@@ -14,6 +14,7 @@ use core::{
 
 use self::{
     allocator::page_frame::{VirtPageFrame, VirtPageFrameIter},
+    memblock::MemoryAreaAttr,
     page::round_up_to_page_size,
     ucontext::{AddressSpace, UserMapper},
 };
@@ -87,6 +88,9 @@ pub enum PageTableKind {
 pub struct PhysAddr(usize);
 
 impl PhysAddr {
+    /// 最大物理地址
+    pub const MAX: Self = PhysAddr(usize::MAX);
+
     #[inline(always)]
     pub const fn new(address: usize) -> Self {
         Self(address)
@@ -331,16 +335,19 @@ pub struct PhysMemoryArea {
     pub base: PhysAddr,
     /// 该区域的物理内存大小
     pub size: usize,
+
+    pub flags: MemoryAreaAttr,
 }
 
 impl PhysMemoryArea {
     pub const DEFAULT: Self = Self {
         base: PhysAddr::new(0),
         size: 0,
+        flags: MemoryAreaAttr::empty(),
     };
 
-    pub fn new(base: PhysAddr, size: usize) -> Self {
-        Self { base, size }
+    pub fn new(base: PhysAddr, size: usize, flags: MemoryAreaAttr) -> Self {
+        Self { base, size, flags }
     }
 
     /// 返回向上页面对齐的区域起始物理地址

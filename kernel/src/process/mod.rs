@@ -823,8 +823,8 @@ impl ProcessControlBlock {
     pub fn generate_name(program_path: &str, args: &Vec<String>) -> String {
         let mut name = program_path.to_string();
         for arg in args {
-            name.push_str(arg);
             name.push(' ');
+            name.push_str(arg);
         }
         return name;
     }

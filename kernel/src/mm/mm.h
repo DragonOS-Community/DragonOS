@@ -8,14 +8,14 @@ extern void rs_map_phys(uint64_t virt_addr, uint64_t phys_addr, uint64_t size, u
 extern uint64_t rs_unmap_at_low_addr();
 
 // 内核层的起始地址
-#define PAGE_OFFSET 0xffff800000000000UL
+#define PAGE_OFFSET 0xffff800000000000UL                    
 #define KERNEL_BASE_LINEAR_ADDR 0xffff800000000000UL
 #define USER_MAX_LINEAR_ADDR 0x00007fffffffffffUL
 // MMIO虚拟地址空间：1TB
-#define MMIO_BASE 0xffffa10000000000UL
+#define MMIO_BASE 0xffffa10000000000UL  //依我理解，这是映射到io的地址空间
 #define MMIO_TOP 0xffffa20000000000UL
 
-#define PAGE_4K_SHIFT 12
+#define PAGE_4K_SHIFT 12        //这些变量更像是“不把代码写死”原则的提现，所谓的shift，只不过是左移用的东西罢了
 #define PAGE_2M_SHIFT 21
 #define PAGE_1G_SHIFT 30
 #define PAGE_GDT_SHIFT 39
@@ -26,15 +26,15 @@ extern uint64_t rs_unmap_at_low_addr();
 #define PAGE_1G_SIZE (1UL << PAGE_1G_SHIFT)
 
 // 屏蔽低于x的数值
-#define PAGE_4K_MASK (~(PAGE_4K_SIZE - 1))
+#define PAGE_4K_MASK (~(PAGE_4K_SIZE - 1))      //这是掩码，用于取高位值 如这里的4k就是11111111 11110000 00000000
 #define PAGE_2M_MASK (~(PAGE_2M_SIZE - 1))
 
 // 将addr按照x的上边界对齐
-#define PAGE_4K_ALIGN(addr) (((unsigned long)(addr) + PAGE_4K_SIZE - 1) & PAGE_4K_MASK)
+#define PAGE_4K_ALIGN(addr) (((unsigned long)(addr) + PAGE_4K_SIZE - 1) & PAGE_4K_MASK) //这个是一个对齐函数，它的逻辑是先加后裁。比如8，它对应的上边界是4096，那么我就加一个4095，使得它超过4096的边界，然后把后12位砍掉，就可以获得上边界4096了
 #define PAGE_2M_ALIGN(addr) (((unsigned long)(addr) + PAGE_2M_SIZE - 1) & PAGE_2M_MASK)
 
 // 虚拟地址与物理地址转换
-#define virt_2_phys(addr) ((unsigned long)(addr)-PAGE_OFFSET)
+#define virt_2_phys(addr) ((unsigned long)(addr)-PAGE_OFFSET)           //其实这里使用内核区域分界线是一种方法而已，因为内核区域分界线是一个固定的点，所以我们使用它作为锚点
 #define phys_2_virt(addr) ((unsigned long *)((unsigned long)(addr) + PAGE_OFFSET))
 
 // 在这个地址以上的虚拟空间，用来进行特殊的映射

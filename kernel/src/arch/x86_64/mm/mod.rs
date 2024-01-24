@@ -73,31 +73,31 @@ pub struct X86_64MMArch;
 static XD_RESERVED: AtomicBool = AtomicBool::new(false);
 
 impl MemoryManagementArch for X86_64MMArch {
-    /// 4K页
-    const PAGE_SHIFT: usize = 12;
+    /// 4K页 
+    const PAGE_SHIFT: usize = 12;   //页的大小是4k
 
-    /// 每个页表项占8字节，总共有512个页表项
-    const PAGE_ENTRY_SHIFT: usize = 9;
+    /// 每个页表项占8字节，总共有512个页表项    
+    const PAGE_ENTRY_SHIFT: usize = 9;  //这里表示512的2对数
 
     /// 四级页表（PML4T、PDPT、PDT、PT）
-    const PAGE_LEVELS: usize = 4;
+    const PAGE_LEVELS: usize = 4;   //最大页表等级是4，但是实际上最高层的页表是3级，这四级页表分别是3，2，1，0
 
     /// 页表项的有效位的index。在x86_64中，页表项的第[0, 47]位表示地址和flag，
     /// 第[48, 51]位表示保留。因此，有效位的index为52。
     /// 请注意，第63位是XD位，表示是否允许执行。
-    const ENTRY_ADDRESS_SHIFT: usize = 52;
+    const ENTRY_ADDRESS_SHIFT: usize = 52;  
 
     const ENTRY_FLAG_DEFAULT_PAGE: usize = Self::ENTRY_FLAG_PRESENT;
 
     const ENTRY_FLAG_DEFAULT_TABLE: usize = Self::ENTRY_FLAG_PRESENT;
 
-    const ENTRY_FLAG_PRESENT: usize = 1 << 0;
+    const ENTRY_FLAG_PRESENT: usize = 1 << 0;   //00000000_00000000_00000000_00000001
 
     const ENTRY_FLAG_READONLY: usize = 0;
 
-    const ENTRY_FLAG_READWRITE: usize = 1 << 1;
+    const ENTRY_FLAG_READWRITE: usize = 1 << 1; //00000000_00000000_00000000_00000010
 
-    const ENTRY_FLAG_USER: usize = 1 << 2;
+    const ENTRY_FLAG_USER: usize = 1 << 2;      //00000000_00000000_00000000_00000100
 
     const ENTRY_FLAG_WRITE_THROUGH: usize = 1 << 3;
 

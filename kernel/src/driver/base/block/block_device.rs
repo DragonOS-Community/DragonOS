@@ -17,7 +17,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::any::Any;
 use system_error::SystemError;
 
-use super::disk_info::Partition;
+use super::{disk_info::Partition, cache::cached_block_device::BlockCache};
 
 /// 该文件定义了 Device 和 BlockDevice 的接口
 /// Notice 设备错误码使用 Posix 规定的 int32_t 的错误码表示，而不是自己定义错误enum
@@ -239,6 +239,39 @@ pub trait BlockDevice: Device {
     /// @brief 返回当前磁盘上的所有分区的Arc指针数组
     fn partitions(&self) -> Vec<Arc<Partition>>;
 
+    fn cache_read(&self,lba_id_start: BlockId,count: usize,buf: &mut [u8])-> Result<usize, SystemError>{
+        
+        for i in 0..count{
+            
+        }
+        let cache_response=BlockCache::read_one_block(lba_id_start);
+        match cache_response{
+            Some(x)=>{
+                // assert!(x.len()==self.block_size());
+                buf.copy_from_slice(&x);
+                return Ok(512)
+            },
+            None=>{
+                self.read_at(lba_id_start, count, buf)?;
+                BlockCache::insert_one_block(lba_id_start, buf.to_vec(),512);
+                return Ok(512)
+            }
+        }
+    }
+
+    fn cache_write(
+        &self,
+        lba_id_start: BlockId,
+        count: usize,
+        buf: &[u8],
+    ) -> Result<usize, SystemError>{
+        if count!=1{
+            return self.write_at(lba_id_start, count, buf)
+        }
+        let cache_response=BlockCache::test_write(lba_id_start);
+        self.write_at(lba_id_start, count, buf)
+    }
+
     fn write_at_bytes(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
         // assert!(len <= buf.len());
         if len > buf.len() {
@@ -256,7 +289,8 @@ pub trait BlockDevice: Device {
             let full = multi && range.is_multi() || !multi && range.is_full();
 
             if full {
-                self.write_at(range.lba_start, count, buf_slice)?;
+                self.cache_write(range.lba_start, count, buf_slice)?;
+                // self.write_at(range.lba_start, count, buf_slice)?;
             } else {
                 if self.blk_size_log2() > BLK_SIZE_LOG2_LIMIT {
                     return Err(SystemError::E2BIG);
@@ -265,10 +299,12 @@ pub trait BlockDevice: Device {
                 let mut temp = Vec::new();
                 temp.resize(1usize << self.blk_size_log2(), 0);
                 // 由于块设备每次读写都是整块的，在不完整写入之前，必须把不完整的地方补全
-                self.read_at(range.lba_start, 1, &mut temp[..])?;
+                self.cache_read(range.lba_start, 1, &mut temp[..])?;
+                // self.read_at(range.lba_start, 1, &mut temp[..])?;
                 // 把数据从临时buffer复制到目标buffer
                 temp[range.begin..range.end].copy_from_slice(&buf_slice);
-                self.write_at(range.lba_start, 1, &temp[..])?;
+                self.cache_write(range.lba_start, 1, &temp[..])?;
+                // self.write_at(range.lba_start, 1, &temp[..])?;
             }
         }
         return Ok(len);
@@ -299,7 +335,8 @@ pub trait BlockDevice: Device {
             // 读取整个block作为有效数据
             if full {
                 // 调用 BlockDevice::read_at() 直接把引用传进去，不是把整个数组move进去
-                self.read_at(range.lba_start, count, buf_slice)?;
+                self.cache_read(range.lba_start, count, buf_slice)?;
+                // self.read_at(range.lba_start, count, buf_slice)?;
             } else {
                 // 判断块的长度不能超过最大值
                 if self.blk_size_log2() > BLK_SIZE_LOG2_LIMIT {
@@ -308,7 +345,8 @@ pub trait BlockDevice: Device {
 
                 let mut temp = Vec::new();
                 temp.resize(1usize << self.blk_size_log2(), 0);
-                self.read_at(range.lba_start, 1, &mut temp[..])?;
+                self.cache_read(range.lba_start, 1, &mut temp[..])?;
+                // self.read_at(range.lba_start, 1, &mut temp[..])?;
 
                 // 把数据从临时buffer复制到目标buffer
                 buf_slice.copy_from_slice(&temp[range.begin..range.end]);

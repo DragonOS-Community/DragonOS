@@ -9,5 +9,3 @@ pub extern crate memoffset;
 pub extern crate ringbuffer;
 
 pub extern crate crc;
-
-pub extern crate ringbuffer;

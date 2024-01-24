@@ -68,9 +68,11 @@ jobs:
     - name: build the DragonOS
       env:
           ARCH: x86_64
-      shell: bash
+      shell: bash -leo pipefail {0}
 
-      run: bash -c "cat ~/.bashrc && source ~/.bashrc && echo $PATH && source ~/.cargo/env && export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin && make -j $(nproc) "
+      run: |
+        cat ~/.bashrc && source ~/.bashrc && echo $PATH && source ~/.cargo/env && export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin
+        make -j $(nproc) "
 
   
   build-riscv64:
@@ -86,9 +88,9 @@ jobs:
     - uses: ./.github/actions/import-toolchain
 
     - name: build the DragonOS
-      shell: bash
+      shell: bash -leo pipefail {0}
       env:
           ARCH: riscv64
 
-      run: bash -c "source ~/.bashrc && source ~/.cargo/env && make kernel -j $(nproc)"
+      run: source ~/.bashrc && source ~/.cargo/env && make kernel -j $(nproc)
 

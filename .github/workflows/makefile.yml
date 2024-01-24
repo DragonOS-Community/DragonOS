@@ -68,7 +68,7 @@ jobs:
     - name: build the DragonOS
       env:
           ARCH: x86_64
-      run: bash -c "cat ~/.bashrc && source ~/.bashrc && source ~/.cargo/env && export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin && make -j $(nproc) "
+      run: bash -c "cat ~/.bashrc && source ~/.bashrc && echo $PATH && source ~/.cargo/env && export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin && make -j $(nproc) "
 
   
   build-riscv64:

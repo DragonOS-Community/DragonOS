@@ -594,8 +594,12 @@ pub extern "C" fn rs_e1000e_init() {
 
 pub fn e1000e_init() -> () {
     match e1000e_probe() {
-        Ok(_code) => kinfo!("Successfully init e1000e device!"),
-        Err(_error) => kinfo!("Error occurred!"),
+        Ok(_code) => {
+            kinfo!("Successfully init e1000e device!");
+        }
+        Err(_error) => {
+            kinfo!("Error occurred!");
+        }
     }
 }
 

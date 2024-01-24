@@ -21,7 +21,6 @@ use crate::{
             kset::KSet,
         },
         input::serio::serio_device::{serio_device_manager, SerioDevice},
-        tty::serial::serial8250::send_to_default_serial8250_port,
     },
     exception::InterruptArch,
     filesystem::{

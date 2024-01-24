@@ -13,23 +13,31 @@ use crate::{
     driver::{
         base::{
             class::Class,
-            device::{bus::Bus, device_manager, driver::Driver, Device, DeviceType, IdTable},
+            device::{
+                bus::Bus, device_manager, device_number::DeviceNumber, driver::Driver, Device,
+                DeviceType, IdTable,
+            },
             kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
         },
         input::serio::serio_device::{serio_device_manager, SerioDevice},
+        tty::serial::serial8250::send_to_default_serial8250_port,
     },
     exception::InterruptArch,
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
         kernfs::KernFSInode,
-        vfs::{syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, Metadata},
+        vfs::{
+            core::generate_inode_id, syscall::ModeType, FilePrivateData, FileSystem, FileType,
+            IndexNode, Metadata,
+        },
     },
     init::initcall::INITCALL_DEVICE,
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::SpinLock,
     },
+    time::TimeSpec,
 };
 
 static mut PS2_MOUSE_DEVICE: Option<Arc<Ps2MouseDevice>> = None;
@@ -184,10 +192,22 @@ impl Ps2MouseDevice {
                 current_packet: 0,
                 current_state: MouseState::new(),
                 buf: AllocRingBuffer::new(MOUSE_BUFFER_CAPACITY),
-                devfs_metadata: Metadata::new(
-                    FileType::CharDevice,
-                    ModeType::from_bits_truncate(0o644),
-                ),
+                devfs_metadata: Metadata {
+                    dev_id: 1,
+                    inode_id: generate_inode_id(),
+                    size: 4096,
+                    blk_size: 0,
+                    blocks: 0,
+                    atime: TimeSpec::default(),
+                    mtime: TimeSpec::default(),
+                    ctime: TimeSpec::default(),
+                    file_type: FileType::CharDevice, // 文件夹，block设备，char设备
+                    mode: ModeType::from_bits_truncate(0o644),
+                    nlinks: 1,
+                    uid: 0,
+                    gid: 0,
+                    raw_dev: DeviceNumber::default(), // 这里用来作为device number
+                },
                 device_inode_fs: None,
             }),
             kobj_state: LockedKObjectState::new(None),
@@ -419,7 +439,7 @@ impl Device for Ps2MouseDevice {
     }
 
     fn id_table(&self) -> IdTable {
-        IdTable::new(self.name(), None)
+        IdTable::new(self.name().to_string(), None)
     }
 
     fn set_bus(&self, bus: Option<alloc::sync::Weak<dyn Bus>>) {
@@ -558,15 +578,32 @@ impl DeviceINode for Ps2MouseDevice {
 }
 
 impl IndexNode for Ps2MouseDevice {
+    fn open(
+        &self,
+        _data: &mut FilePrivateData,
+        _mode: &crate::filesystem::vfs::file::FileMode,
+    ) -> Result<(), SystemError> {
+        let mut guard = self.inner.lock_irqsave();
+        guard.buf.clear();
+        Ok(())
+    }
+
+    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+        let mut guard = self.inner.lock_irqsave();
+        guard.buf.clear();
+        Ok(())
+    }
+
     fn read_at(
         &self,
         _offset: usize,
-        len: usize,
+        _len: usize,
         buf: &mut [u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
         let mut guard = self.inner.lock_irqsave();
-        if len >= 3 && guard.buf.len() >= 3 {
+
+        if guard.buf.len() >= 3 {
             for i in 0..3 {
                 buf[i] = guard.buf.dequeue().unwrap();
             }
@@ -583,7 +620,7 @@ impl IndexNode for Ps2MouseDevice {
         _buf: &[u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

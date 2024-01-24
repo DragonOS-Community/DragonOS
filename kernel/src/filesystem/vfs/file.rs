@@ -462,7 +462,7 @@ impl Drop for File {
                 "pid: {:?} failed to close file: {:?}, errno={:?}",
                 ProcessManager::current_pcb().pid(),
                 self,
-                r.unwrap_err()
+                r.as_ref().unwrap_err()
             );
         }
     }

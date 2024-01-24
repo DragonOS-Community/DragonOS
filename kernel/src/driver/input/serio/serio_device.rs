@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use system_error::SystemError;
 
-use crate::driver::base::device::{bus::Bus, Device};
+use crate::driver::base::device::{bus::Bus, device_manager, Device};
 
 use super::serio_bus;
 
@@ -31,7 +31,6 @@ pub trait SerioDevice: Device {
     fn stop(&self, device: &Arc<dyn SerioDevice>) -> Result<(), SystemError>;
 }
 
-#[allow(dead_code)]
 #[inline(always)]
 pub fn serio_device_manager() -> &'static SerioDeviceManager {
     &SerioDeviceManager
@@ -39,7 +38,6 @@ pub fn serio_device_manager() -> &'static SerioDeviceManager {
 
 pub struct SerioDeviceManager;
 
-#[allow(dead_code)]
 impl SerioDeviceManager {
     /// # 函数功能
     /// 注册Serio设备
@@ -65,6 +63,7 @@ impl SerioDeviceManager {
     /// todo：https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/serio.c#494
     pub fn init_port(&self, device: Arc<dyn SerioDevice>) -> Result<(), SystemError> {
         device.set_bus(Some(Arc::downgrade(&(serio_bus() as Arc<dyn Bus>))));
+        device_manager().add_device(device.clone() as Arc<dyn Device>)?;
         Ok(())
     }
 }

@@ -68,7 +68,7 @@ jobs:
     - name: build the DragonOS
       env:
           ARCH: x86_64
-      shell: bash -leo pipefail {0}
+      shell: bash -ileo pipefail {0}
 
       run: |
         cat ~/.bashrc
@@ -92,7 +92,7 @@ jobs:
     - uses: ./.github/actions/import-toolchain
 
     - name: build the DragonOS
-      shell: bash -leo pipefail {0}
+      shell: bash -ileo pipefail {0}
       env:
           ARCH: riscv64
 

@@ -47,7 +47,7 @@ jobs:
           name: Install toolchain
           continue-on-error: false
           run:  | 
-            bash tools/install_musl_gcc.sh
+            USE_GITHUB=1 bash tools/install_musl_gcc.sh
 
             cargo install cargo-binutils
             rustup toolchain install nightly-x86_64-unknown-linux-gnu

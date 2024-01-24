@@ -33,6 +33,10 @@ use super::vfs::{
     FileSystem, FsInfo, IndexNode, InodeId, Metadata,
 };
 
+pub mod kmsg;
+pub mod log;
+mod syscall;
+
 /// @brief 进程文件类型
 /// @usage 用于定义进程文件夹下的各类文件类型
 #[derive(Debug)]
@@ -42,6 +46,8 @@ pub enum ProcFileType {
     ProcStatus = 0,
     /// meminfo
     ProcMeminfo = 1,
+    /// kmsg
+    ProcKmsg = 2,
     //todo: 其他文件类型
     ///默认文件类型
     Default,
@@ -52,6 +58,7 @@ impl From<u8> for ProcFileType {
         match value {
             0 => ProcFileType::ProcStatus,
             1 => ProcFileType::ProcMeminfo,
+            2 => ProcFileType::ProcKmsg,
             _ => ProcFileType::Default,
         }
     }
@@ -336,6 +343,19 @@ impl ProcFS {
             panic!("create meminfo error");
         }
 
+        // 创建kmsg文件
+        let binding = inode.create("kmsg", FileType::File, ModeType::from_bits_truncate(0o444));
+        if let Ok(kmsg) = binding {
+            let kmsg_file = kmsg
+                .as_any_ref()
+                .downcast_ref::<LockedProcFSInode>()
+                .unwrap();
+            kmsg_file.0.lock().fdata.pid = Pid::new(1);
+            kmsg_file.0.lock().fdata.ftype = ProcFileType::ProcKmsg;
+        } else {
+            panic!("create ksmg error");
+        }
+
         return result;
     }
 
@@ -456,6 +476,7 @@ impl IndexNode for LockedProcFSInode {
         match inode.fdata.ftype {
             ProcFileType::ProcStatus => return inode.proc_read(offset, len, buf, private_data),
             ProcFileType::ProcMeminfo => return inode.proc_read(offset, len, buf, private_data),
+            ProcFileType::ProcKmsg => (),
             ProcFileType::Default => (),
         };
 

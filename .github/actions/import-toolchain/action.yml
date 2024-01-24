@@ -15,7 +15,8 @@ runs:
         with:
           path: |
             ~/opt
-          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('tools/build_gcc_toolchain.sh') }}-${{ hashFiles('tools/install_musl_gcc.sh') }}
+            ~/.bashrc
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('tools/build_gcc_toolchain.sh') }}
 
       - name: Cache build tools
         id: cache-build-tools
@@ -28,7 +29,8 @@ runs:
             ~/.cargo
             ~/.rustup
             ~/.bashrc
-          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ env.dadk_version }}-${{ hashFiles('.github/workflows/cache-toolchain.yml') }}
+            ~/opt
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ env.dadk_version }}-${{ hashFiles('.github/workflows/cache-toolchain.yml') }}-${{ hashFiles('tools/install_musl_gcc.sh') }}
       
       - uses: ./.github/actions/install-apt-packages
       

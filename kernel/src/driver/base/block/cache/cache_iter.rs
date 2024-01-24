@@ -57,3 +57,20 @@ impl Iterator for BlockIter{
         }
     }
 }
+
+pub struct FailData{
+    lba_id:usize,
+    index:usize,
+}
+
+impl FailData{
+    pub fn new(lba_id:usize,index:usize)->Self{
+        FailData{
+            lba_id,
+            index
+        }
+    }
+#[inline]
+    pub fn lba_id(&self)->usize{self.lba_id}
+    pub fn index(&self)->usize{self.index}
+}

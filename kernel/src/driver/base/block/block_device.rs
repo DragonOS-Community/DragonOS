@@ -241,20 +241,17 @@ pub trait BlockDevice: Device {
 
     fn cache_read(&self,lba_id_start: BlockId,count: usize,buf: &mut [u8])-> Result<usize, SystemError>{
         
-        for i in 0..count{
-            
-        }
-        let cache_response=BlockCache::read_one_block(lba_id_start);
+        let cache_response=BlockCache::read(lba_id_start,count,buf);
         match cache_response{
-            Some(x)=>{
+            Ok(x)=>{
                 // assert!(x.len()==self.block_size());
-                buf.copy_from_slice(&x);
-                return Ok(512)
+                
+                return Ok(count*512)
             },
-            None=>{
-                self.read_at(lba_id_start, count, buf)?;
-                BlockCache::insert_one_block(lba_id_start, buf.to_vec(),512);
-                return Ok(512)
+            Err(x)=>{
+                let ans=self.read_at(lba_id_start, count, buf)?;
+                BlockCache::insert(x, buf);
+                return Ok(ans)
             }
         }
     }

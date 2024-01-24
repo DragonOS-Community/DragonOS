@@ -4,7 +4,7 @@ use alloc::{boxed::Box, vec::Vec, collections::BTreeMap, borrow::ToOwned};
 
 // use crate::driver::base::block::block_device::BlockIter;
 
-use super::{cache_block::{CacheBlockAddr, CacheBlock}, cache_config::{CACHE_SPACE_SIZE, BLOCK_SIZE}, cache_iter::BlockIter};
+use super::{cache_block::{CacheBlockAddr, CacheBlock}, cache_config:: BLOCK_SIZE, cache_iter::{BlockIter, FailData}};
 // use virtio_drivers::PhysAddr;
 
 static mut INITIAL_FLAG:bool=false;
@@ -22,21 +22,26 @@ impl BlockCache{
         }
     }
 
-    pub fn read(lba_id_start:usize,count:usize,buf:&mut [u8])->Result<usize,Vec<usize>>{
+    pub fn read(lba_id_start:usize,count:usize,buf:&mut [u8])->Result<usize,Vec<FailData>>{
         let block_iter=BlockIter::new(lba_id_start,count,BLOCK_SIZE);
         let mut success_flag=true;
         let mut success_vec:Vec<Vec<u8>>=vec![];
-        let mut fail_vec:Vec<usize>=vec![];
+        let mut fail_vec:Vec<FailData>=vec![];
+        let mut index=0;
         for i in block_iter{
+            
             match Self::read_one_block(i.iba_id()){
                 Some(x)=>{if success_flag {success_vec.push(x)}},
                 None=>{
                     success_flag=false;
-                    fail_vec.push(i.iba_id())
+                    let f_data=FailData::new(i.iba_id(), index);
+                    fail_vec.push(f_data)
                 }
             }
+            index+=1;
         }
         if success_flag{
+            kdebug!("cache hit！");
             for i in 0..success_vec.len(){
                 buf[i*BLOCK_SIZE..(i+1)*BLOCK_SIZE].copy_from_slice(&success_vec
                 [i]);
@@ -73,7 +78,16 @@ impl BlockCache{
         Some(space.read(*addr)?)
     }
 
-    pub fn insert_one_block(lba_id:usize,data:Vec<u8>,count:usize)->Option<()>{
+    pub fn insert(f_data_vec:Vec<FailData>,data:&[u8])->Result<usize,()>{
+        // assert!(f_data_vec.len()*BLOCK_SIZE==data.len());
+        for i in f_data_vec{
+            let index=i.index();
+            Self::insert_one_block(i.lba_id(), data[index*BLOCK_SIZE..(index+1)*BLOCK_SIZE].to_vec());
+        }
+        Ok(0)
+    }
+
+    pub fn insert_one_block(lba_id:usize,data:Vec<u8>)->Option<()>{
         unsafe {
             if !INITIAL_FLAG{
                 Self::init()
@@ -140,14 +154,15 @@ impl CacheSpace{
 
     pub fn insert(&mut self,lba_id:usize,data:Vec<u8>)->Option<CacheBlockAddr>{
         let data_block=CacheBlock::from_data(lba_id,data);
-        let index=self.frame_selector.get_index();
+        
         if(self.frame_selector.can_append()){
-            
+            let index=self.frame_selector.get_index();
             self.root.push(data_block);
-            kdebug!("index:{},root.len:{}",index.data(),self.root.len());
+            // kdebug!("index:{},root.len:{}",index.data(),self.root.len());
             assert!(index.data()==self.root.len()-1);
             Some(index)
         }else{
+            let index=self.frame_selector.get_index();
             self.root[index.data()]=data_block;
             Some(index)
         }
@@ -189,7 +204,7 @@ struct FrameSelector{
 
 impl FrameSelector{
     pub fn new()->Self{
-        Self { threshold: 128, size: 0,current:0 }
+        Self { threshold: 1024, size: 0,current:0 }
     }
 
     pub fn get_index(&mut self)->CacheBlockAddr{

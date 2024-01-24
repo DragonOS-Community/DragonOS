@@ -9,18 +9,23 @@ export USE_GITHUB=${USE_GITHUB:=0}
 
 MUSL_GCC_DATE="231114"
 MUSL_GCC_VERSION="9.4.0"
-MUSL_GCC_X86_64_TAR="x86_64-linux-musl-cross-gcc-${MUSL_GCC_VERSION}-${MUSL_GCC_DATE}.tar.xz"
-MUSL_GCC_RISCV64_TAR="riscv64-linux-musl-cross-gcc-${MUSL_GCC_VERSION}-${MUSL_GCC_DATE}.tar.xz"
+MUSL_GCC_X86_64_TAR=
+MUSL_GCC_RISCV64_TAR=
 
 MUSL_GCC_X86_64_DOWNLOAD_URL=""
 MUSL_GCC_RISCV64_DOWNLOAD_URL=""
 if [ $USE_GITHUB -eq 1 ]; then
     echo "Download from github"
 
-    MUSL_GCC_X86_64_DOWNLOAD_URL="https://github.com/DragonOS-Community/musl-cross-make/releases/download/${MUSL_GCC_VERSION}-${MUSL_GCC_DATE}/x86_64-linux-musl-cross-gcc-${MUSL_GCC_VERSION}.tar.xz"
-    MUSL_GCC_RISCV64_DOWNLOAD_URL="https://github.com/DragonOS-Community/musl-cross-make/releases/download/${MUSL_GCC_VERSION}-${MUSL_GCC_DATE}/riscv64-linux-musl-cross-gcc-${MUSL_GCC_VERSION}.tar.xz"
+    MUSL_GCC_X86_64_TAR=x86_64-linux-musl-cross-gcc-${MUSL_GCC_VERSION}.tar.xz
+    MUSL_GCC_RISCV64_TAR=riscv64-linux-musl-cross-gcc-${MUSL_GCC_VERSION}.tar.xz
+    MUSL_GCC_X86_64_DOWNLOAD_URL="https://github.com/DragonOS-Community/musl-cross-make/releases/download/${MUSL_GCC_VERSION}-${MUSL_GCC_DATE}/${MUSL_GCC_X86_64_TAR}"
+    MUSL_GCC_RISCV64_DOWNLOAD_URL="https://github.com/DragonOS-Community/musl-cross-make/releases/download/${MUSL_GCC_VERSION}-${MUSL_GCC_DATE}/${MUSL_GCC_RISCV64_TAR}"
+    https://github.com/DragonOS-Community/musl-cross-make/releases/download/9.4.0-231114/riscv64-linux-musl-cross-gcc-9.4.0.tar.xz
 else
     echo "Download from mirrors.dragonos.org.cn"
+    MUSL_GCC_X86_64_TAR="x86_64-linux-musl-cross-gcc-${MUSL_GCC_VERSION}-${MUSL_GCC_DATE}.tar.xz"
+    MUSL_GCC_RISCV64_TAR="riscv64-linux-musl-cross-gcc-${MUSL_GCC_VERSION}-${MUSL_GCC_DATE}.tar.xz"
     MUSL_GCC_X86_64_DOWNLOAD_URL="https://mirrors.dragonos.org.cn/pub/third_party/toolchain/gcc/${MUSL_GCC_X86_64_TAR}"
     MUSL_GCC_RISCV64_DOWNLOAD_URL="https://mirrors.dragonos.org.cn/pub/third_party/toolchain/gcc/${MUSL_GCC_RISCV64_TAR}"
 fi

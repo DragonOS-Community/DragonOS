@@ -71,8 +71,12 @@ jobs:
       shell: bash -leo pipefail {0}
 
       run: |
-        cat ~/.bashrc && source ~/.bashrc && echo $PATH && source ~/.cargo/env && export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin
-        make -j $(nproc) "
+        cat ~/.bashrc
+        source ~/.bashrc
+        source ~/.cargo/env
+        export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin
+        echo $PATH
+        make -j $(nproc)
 
   
   build-riscv64:

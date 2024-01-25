@@ -1,6 +1,7 @@
 pub mod asm;
 pub mod cpu;
 pub mod driver;
+pub mod elf;
 pub mod init;
 pub mod interrupt;
 pub mod ipc;
@@ -21,3 +22,5 @@ pub use self::mm::RiscV64MMArch as MMArch;
 pub use self::pci::RiscV64PciArch as PciArch;
 pub use self::pio::RiscV64PortIOArch as CurrentPortIOArch;
 pub use self::time::RiscV64TimeArch as CurrentTimeArch;
+
+pub use self::elf::RiscV64ElfArch as CurrentElfArch;

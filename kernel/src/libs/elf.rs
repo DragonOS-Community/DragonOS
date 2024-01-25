@@ -1,16 +1,23 @@
 use core::{
     cmp::min,
+    fmt::Debug,
     intrinsics::{likely, unlikely},
     ops::Range,
 };
 
 use alloc::vec::Vec;
-use elf::{endian::AnyEndian, file::FileHeader, segment::ProgramHeader};
+use elf::{
+    abi::{PT_GNU_PROPERTY, PT_INTERP},
+    endian::AnyEndian,
+    file::FileHeader,
+    segment::ProgramHeader,
+};
 use system_error::SystemError;
 
 use crate::{
-    arch::MMArch,
+    arch::{CurrentElfArch, MMArch},
     driver::base::block::SeekFrom,
+    filesystem::vfs::file::File,
     kerror,
     libs::align::page_align_up,
     mm::{
@@ -22,12 +29,18 @@ use crate::{
     process::{
         abi::AtType,
         exec::{BinaryLoader, BinaryLoaderResult, ExecError, ExecLoadMode, ExecParam},
-        ProcessManager,
+        ProcessFlags, ProcessManager,
     },
     syscall::user_access::{clear_user, copy_to_user},
 };
 
 use super::rwlock::RwLockWriteGuard;
+
+// 存放跟架构相关的Elf属性，
+pub trait ElfArch: Clone + Copy + Debug {
+    const ELF_ET_DYN_BASE: usize;
+    const ELF_PAGE_SIZE: usize;
+}
 
 #[derive(Debug)]
 pub struct ElfLoader;
@@ -35,9 +48,6 @@ pub struct ElfLoader;
 pub const ELF_LOADER: ElfLoader = ElfLoader::new();
 
 impl ElfLoader {
-    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-    pub const ELF_PAGE_SIZE: usize = MMArch::PAGE_SIZE;
-
     /// 读取文件的缓冲区大小
     pub const FILE_READ_BUF_SIZE: usize = 512 * 1024;
 
@@ -132,15 +142,18 @@ impl ElfLoader {
 
     /// 计算addr在ELF PAGE内的偏移
     fn elf_page_offset(&self, addr: VirtAddr) -> usize {
-        addr.data() & (Self::ELF_PAGE_SIZE - 1)
+        addr.data() & (CurrentElfArch::ELF_PAGE_SIZE - 1)
     }
 
     fn elf_page_start(&self, addr: VirtAddr) -> VirtAddr {
-        VirtAddr::new(addr.data() & (!(Self::ELF_PAGE_SIZE - 1)))
+        VirtAddr::new(addr.data() & (!(CurrentElfArch::ELF_PAGE_SIZE - 1)))
     }
 
     fn elf_page_align_up(&self, addr: VirtAddr) -> VirtAddr {
-        VirtAddr::new((addr.data() + Self::ELF_PAGE_SIZE - 1) & (!(Self::ELF_PAGE_SIZE - 1)))
+        VirtAddr::new(
+            (addr.data() + CurrentElfArch::ELF_PAGE_SIZE - 1)
+                & (!(CurrentElfArch::ELF_PAGE_SIZE - 1)),
+        )
     }
 
     /// 根据ELF的p_flags生成对应的ProtFlags
@@ -343,7 +356,7 @@ impl ElfLoader {
     fn pad_zero(&self, elf_bss: VirtAddr) -> Result<(), SystemError> {
         let nbyte = self.elf_page_offset(elf_bss);
         if nbyte > 0 {
-            let nbyte = Self::ELF_PAGE_SIZE - nbyte;
+            let nbyte = CurrentElfArch::ELF_PAGE_SIZE - nbyte;
             unsafe { clear_user(elf_bss, nbyte).map_err(|_| SystemError::EFAULT) }?;
         }
         return Ok(());
@@ -559,7 +572,7 @@ impl BinaryLoader for ElfLoader {
                 )?;
                 let nbyte = self.elf_page_offset(elf_bss);
                 if nbyte > 0 {
-                    let nbyte = min(Self::ELF_PAGE_SIZE - nbyte, elf_brk - elf_bss);
+                    let nbyte = min(CurrentElfArch::ELF_PAGE_SIZE - nbyte, elf_brk - elf_bss);
                     unsafe {
                         // This bss-zeroing can fail if the ELF file specifies odd protections.
                         // So we don't check the return value.

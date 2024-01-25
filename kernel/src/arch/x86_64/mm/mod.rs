@@ -112,7 +112,9 @@ impl MemoryManagementArch for X86_64MMArch {
     /// 0xffff_8000_0000_0000
     const PHYS_OFFSET: usize = Self::PAGE_NEGATIVE_MASK + (Self::PAGE_ADDRESS_SIZE >> 1);
 
-    const USER_END_VADDR: VirtAddr = VirtAddr::new(0x0000_7eff_ffff_ffff);
+    // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/include/asm/page_64_types.h#75
+    const USER_END_VADDR: VirtAddr =
+        VirtAddr::new((Self::PAGE_ADDRESS_SIZE >> 1) - Self::PAGE_SIZE);
     const USER_BRK_START: VirtAddr = VirtAddr::new(0x700000000000);
     const USER_STACK_START: VirtAddr = VirtAddr::new(0x6ffff0a00000);
 

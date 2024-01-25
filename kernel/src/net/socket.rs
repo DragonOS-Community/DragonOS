@@ -511,9 +511,9 @@ pub struct UdpSocket {
 impl UdpSocket {
     /// 元数据的缓冲区的大小
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
-    /// 默认的发送缓冲区的大小 transmiss
-    pub const DEFAULT_RX_BUF_SIZE: usize = 64 * 1024;
     /// 默认的接收缓冲区的大小 receive
+    pub const DEFAULT_RX_BUF_SIZE: usize = 64 * 1024;
+    /// 默认的发送缓冲区的大小 transmiss
     pub const DEFAULT_TX_BUF_SIZE: usize = 64 * 1024;
 
     /// @brief 创建一个原始的socket

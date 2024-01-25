@@ -6,7 +6,7 @@
     "BuildFromSource": {
       "Git": {
         "url": "https://github.com/yuyi2439/rs-tftpd/",
-        "branch": "dragon-tftpd",
+        "branch": "dragon-tftpd"
       }
     }
   },
@@ -19,6 +19,5 @@
   },
   "clean": {
     "clean_command": "make clean"
-  },
-  "envs": []
+  }
 }

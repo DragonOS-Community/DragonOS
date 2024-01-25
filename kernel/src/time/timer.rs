@@ -129,7 +129,7 @@ impl Timer {
         if unlikely(r.is_err()) {
             kerror!(
                 "Failed to run timer function: {self:?} {:?}",
-                r.err().unwrap()
+                r.as_ref().err().unwrap()
             );
         }
     }

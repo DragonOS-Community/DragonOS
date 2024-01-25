@@ -109,7 +109,15 @@ impl BlockCache{
         mapper.insert(lba_id,addr)
     }
 
-    pub fn test_write(lba_id:usize)->Option<()>{
+    pub fn test_write(lba_id_start:usize,count:usize,data:&[u8])->Result<usize,()>{
+        let block_iter=BlockIter::new(lba_id_start, count, BLOCK_SIZE);
+        for i in block_iter{
+            Self::test_write_one_block(i.iba_id());
+        }
+        Ok(count)
+    }
+
+    pub fn test_write_one_block(lba_id:usize)->Option<()>{
         unsafe {
             if !INITIAL_FLAG{
                 Self::init()

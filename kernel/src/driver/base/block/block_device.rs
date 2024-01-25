@@ -262,10 +262,10 @@ pub trait BlockDevice: Device {
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError>{
-        if count!=1{
-            return self.write_at(lba_id_start, count, buf)
-        }
-        let cache_response=BlockCache::test_write(lba_id_start);
+        // if count!=1{
+        //     return self.write_at(lba_id_start, count, buf)
+        // }
+        let cache_response=BlockCache::test_write(lba_id_start,count,buf);
         self.write_at(lba_id_start, count, buf)
     }
 

@@ -582,6 +582,5 @@ impl BlockDevice for LockedAhciDisk {
         buf: &[u8],
     ) -> Result<usize, SystemError> {
         self.0.lock().write_at(lba_id_start, count, buf)
-        // self.0.lock().write_at(lba_id_start, count, buf)
     }
 }

@@ -29,7 +29,6 @@ impl BlockCache{
         let mut fail_vec:Vec<FailData>=vec![];
         let mut index=0;
         for i in block_iter{
-            
             match Self::read_one_block(i.iba_id()){
                 Some(x)=>{if success_flag {success_vec.push(x)}},
                 None=>{
@@ -41,7 +40,7 @@ impl BlockCache{
             index+=1;
         }
         if success_flag{
-            kdebug!("cache hit！");
+            // kdebug!("cache hit！");
             for i in 0..success_vec.len(){
                 buf[i*BLOCK_SIZE..(i+1)*BLOCK_SIZE].copy_from_slice(&success_vec
                 [i]);
@@ -212,7 +211,7 @@ struct FrameSelector{
 
 impl FrameSelector{
     pub fn new()->Self{
-        Self { threshold: 1024, size: 0,current:0 }
+        Self { threshold: 131072, size: 0,current:0 }
     }
 
     pub fn get_index(&mut self)->CacheBlockAddr{

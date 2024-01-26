@@ -385,6 +385,7 @@ impl FATFileSystem {
         v.resize(self.bpb.bytes_per_sector as usize, 0);
         self.partition
             .disk()
+            // .cache_read(fat_ent_lba as usize, 1 * self.lba_per_sector(), &mut v)?;
             .read_at(fat_ent_lba as usize, 1 * self.lba_per_sector(), &mut v)?;
 
         let mut cursor = VecCursor::new(v);
@@ -480,6 +481,7 @@ impl FATFileSystem {
         self.partition
             .disk()
             .read_at(fat_ent_lba, 1 * self.lba_per_sector(), &mut v)?;
+            // .read_at(fat_ent_lba, 1 * self.lba_per_sector(), &mut v)?;
 
         let mut cursor = VecCursor::new(v);
         cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
@@ -1088,7 +1090,8 @@ impl FATFileSystem {
                 // 写回数据到磁盘上
                 cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
                 cursor.write_u16(new_val)?;
-                self.partition.disk().write_at(lba, 1, cursor.as_slice())?;
+                self.partition.disk().t_write(lba, 1, cursor.as_slice())?;
+                // self.partition.disk().write_at(lba, 1, cursor.as_slice())?;
                 return Ok(());
             }
             FATType::FAT16(_) => {
@@ -1112,7 +1115,8 @@ impl FATFileSystem {
                 cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
 
                 cursor.write_u16(raw_val)?;
-                self.partition.disk().write_at(lba, 1, cursor.as_slice())?;
+                self.partition.disk().t_write(lba, 1, cursor.as_slice())?;
+                // self.partition.disk().write_at(lba, 1, cursor.as_slice())?;
 
                 return Ok(());
             }
@@ -1168,7 +1172,8 @@ impl FATFileSystem {
                     cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
                     cursor.write_u32(raw_val)?;
 
-                    self.partition.disk().write_at(lba, 1, cursor.as_slice())?;
+                    self.partition.disk().t_write(lba, 1, cursor.as_slice())?;
+                    // self.partition.disk().write_at(lba, 1, cursor.as_slice())?;
                 }
 
                 return Ok(());
@@ -1330,7 +1335,8 @@ impl FATFsInfo {
             cursor.seek(SeekFrom::SeekCurrent(12))?;
             cursor.write_u32(self.trail_sig)?;
 
-            partition.disk().write_at(lba, 1, cursor.as_slice())?;
+            partition.disk().t_write(lba, 1, cursor.as_slice())?;
+            // partition.disk().write_at(lba, 1, cursor.as_slice())?;
         }
         return Ok(());
     }

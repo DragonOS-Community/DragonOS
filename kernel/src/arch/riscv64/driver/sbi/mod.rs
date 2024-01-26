@@ -5,6 +5,7 @@ use self::legacy::console_putchar;
 /// Some code takes from `https://github.com/repnop/sbi.git`
 mod ecall;
 pub mod legacy;
+pub mod reset;
 
 /// Error codes returned by SBI calls
 ///

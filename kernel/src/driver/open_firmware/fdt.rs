@@ -4,15 +4,7 @@ use fdt::{
 };
 use system_error::SystemError;
 
-use crate::{
-    arch::MMArch,
-    init::boot_params,
-    libs::{align::page_align_down, rwlock::RwLock},
-    mm::{
-        memblock::{mem_block_manager, MemBlockManager},
-        MemoryManagementArch, PhysAddr,
-    },
-};
+use crate::{init::boot_params, libs::rwlock::RwLock};
 
 #[inline(always)]
 pub fn open_firmware_fdt_driver() -> &'static OpenFirmwareFdtDriver {
@@ -45,6 +37,7 @@ impl FdtGlobalData {
 pub struct OpenFirmwareFdtDriver;
 
 impl OpenFirmwareFdtDriver {
+    #[allow(dead_code)]
     pub fn early_scan_device_tree(&self) -> Result<(), SystemError> {
         let fdt_vaddr = boot_params().read().fdt().unwrap();
         let fdt = unsafe {
@@ -207,7 +200,22 @@ impl OpenFirmwareFdtDriver {
         return found_memory;
     }
 
-    fn early_init_dt_add_memory(&self, base: u64, size: u64) {
+    #[cfg(target_arch = "x86_64")]
+    pub fn early_init_dt_add_memory(&self, _base: u64, _size: u64) {
+        kBUG!("x86_64 should not call early_init_dt_add_memory");
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn early_init_dt_add_memory(&self, base: u64, size: u64) {
+        use crate::{
+            arch::MMArch,
+            libs::align::page_align_down,
+            mm::{
+                memblock::{mem_block_manager, MemBlockManager},
+                MemoryManagementArch, PhysAddr,
+            },
+        };
+
         let mut base = base as usize;
         let mut size = size as usize;
 

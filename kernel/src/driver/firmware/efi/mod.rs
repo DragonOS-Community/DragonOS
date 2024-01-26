@@ -2,11 +2,13 @@ use system_error::SystemError;
 
 use crate::{libs::rwlock::RwLock, mm::PhysAddr};
 
-use self::memmap::EFIMemoryMapInfo;
+use self::{guid::DragonStubPayloadEFI, memmap::EFIMemoryMapInfo};
 
 mod fdt;
+pub mod guid;
 pub mod init;
 pub mod memmap;
+pub mod tables;
 
 static EFI_MANAGER: EFIManager = EFIManager::new();
 
@@ -32,6 +34,7 @@ struct InnerEFIManager {
     pub runtime_paddr: Option<PhysAddr>,
     /// runtime services的版本号
     pub runtime_service_version: Option<uefi_raw::table::Revision>,
+    pub dragonstub_load_info: Option<DragonStubPayloadEFI>,
 }
 
 impl EFIManager {
@@ -42,6 +45,7 @@ impl EFIManager {
                 init_flags: EFIInitFlags::empty(),
                 runtime_paddr: None,
                 runtime_service_version: None,
+                dragonstub_load_info: None,
             }),
         }
     }

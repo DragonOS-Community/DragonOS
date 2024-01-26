@@ -399,6 +399,10 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     const ENTRY_FLAG_NO_EXEC: usize;
     /// 标记当前页面可执行的标志位（Execute enable）
     const ENTRY_FLAG_EXEC: usize;
+    /// 当该位为1时，标明这是一个脏页
+    const ENTRY_FLAG_DIRTY: usize;
+    /// 当该位为1时，代表这个页面被处理器访问过
+    const ENTRY_FLAG_ACCESSED: usize;
 
     /// 虚拟地址与物理地址的偏移量
     const PHYS_OFFSET: usize;

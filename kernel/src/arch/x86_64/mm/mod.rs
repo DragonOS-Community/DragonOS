@@ -108,6 +108,9 @@ impl MemoryManagementArch for X86_64MMArch {
     /// x86_64不存在EXEC标志位，只有NO_EXEC（XD）标志位
     const ENTRY_FLAG_EXEC: usize = 0;
 
+    const ENTRY_FLAG_ACCESSED: usize = 0;
+    const ENTRY_FLAG_DIRTY: usize = 0;
+
     /// 物理地址与虚拟地址的偏移量
     /// 0xffff_8000_0000_0000
     const PHYS_OFFSET: usize = Self::PAGE_NEGATIVE_MASK + (Self::PAGE_ADDRESS_SIZE >> 1);

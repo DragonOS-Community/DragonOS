@@ -18,6 +18,7 @@ use super::efi_manager;
 #[allow(dead_code)]
 #[inline(never)]
 pub fn efi_init() {
+    kinfo!("Initializing efi...");
     let data_from_fdt = efi_manager()
         .get_fdt_params()
         .expect("Failed to get fdt params");

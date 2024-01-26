@@ -25,6 +25,9 @@ pub(self) static mut KERNEL_END_VA: VirtAddr = VirtAddr::new(0);
 #[derive(Debug, Clone, Copy, Hash)]
 pub struct RiscV64MMArch;
 
+impl RiscV64MMArch {
+    pub const ENTRY_FLAG_GLOBAL: usize = 1 << 5;
+}
 impl MemoryManagementArch for RiscV64MMArch {
     const PAGE_SHIFT: usize = 12;
 
@@ -35,13 +38,17 @@ impl MemoryManagementArch for RiscV64MMArch {
 
     const ENTRY_ADDRESS_SHIFT: usize = 39;
 
-    const ENTRY_FLAG_DEFAULT_PAGE: usize = Self::ENTRY_FLAG_PRESENT;
+    const ENTRY_FLAG_DEFAULT_PAGE: usize = Self::ENTRY_FLAG_PRESENT
+        | Self::ENTRY_FLAG_READWRITE
+        | Self::ENTRY_FLAG_DIRTY
+        | Self::ENTRY_FLAG_ACCESSED
+        | Self::ENTRY_FLAG_GLOBAL;
 
     const ENTRY_FLAG_DEFAULT_TABLE: usize = Self::ENTRY_FLAG_PRESENT;
 
     const ENTRY_FLAG_PRESENT: usize = 1 << 0;
 
-    const ENTRY_FLAG_READONLY: usize = 1 << 1;
+    const ENTRY_FLAG_READONLY: usize = 0;
 
     const ENTRY_FLAG_READWRITE: usize = (1 << 2) | (1 << 1);
 
@@ -54,6 +61,8 @@ impl MemoryManagementArch for RiscV64MMArch {
     const ENTRY_FLAG_NO_EXEC: usize = 0;
 
     const ENTRY_FLAG_EXEC: usize = (1 << 3);
+    const ENTRY_FLAG_ACCESSED: usize = (1 << 6);
+    const ENTRY_FLAG_DIRTY: usize = (1 << 7);
 
     const PHYS_OFFSET: usize = 0xffff_ffc0_0000_0000;
 

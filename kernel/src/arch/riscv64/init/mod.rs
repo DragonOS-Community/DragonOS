@@ -3,11 +3,11 @@ use core::intrinsics::unreachable;
 use fdt::node::FdtNode;
 
 use crate::{
-    arch::{mm::init::mm_early_init, MMArch},
+    arch::mm::init::mm_early_init,
     driver::{firmware::efi::init::efi_init, open_firmware::fdt::open_firmware_fdt_driver},
     init::{boot_params, init_before_mem_init},
     kdebug, kinfo,
-    mm::{MemoryManagementArch, PhysAddr, VirtAddr},
+    mm::{PhysAddr, VirtAddr},
     print, println,
 };
 
@@ -36,7 +36,7 @@ impl ArchBootParams {
 #[no_mangle]
 unsafe extern "C" fn kernel_main(hartid: usize, fdt_paddr: usize) -> ! {
     let fdt_paddr = PhysAddr::new(fdt_paddr);
-
+    // system_reset(sbi::reset::ResetType::Shutdown, sbi::reset::ResetReason::NoReason);
     init_before_mem_init();
 
     boot_params().write().arch.fdt_paddr = fdt_paddr;
@@ -49,7 +49,7 @@ unsafe extern "C" fn kernel_main(hartid: usize, fdt_paddr: usize) -> ! {
     mm_early_init();
 
     let fdt = fdt::Fdt::from_ptr(fdt_paddr.data() as *const u8).expect("Failed to parse fdt!");
-    print_node(fdt.find_node("/").unwrap(), 0);
+    // print_node(fdt.find_node("/").unwrap(), 0);
 
     parse_dtb();
 

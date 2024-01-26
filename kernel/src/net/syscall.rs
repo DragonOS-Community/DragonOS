@@ -1,4 +1,4 @@
-use core::cmp::min;
+use core::{cmp::min, ffi::c_int};
 
 use alloc::{boxed::Box, sync::Arc};
 use num_traits::{FromPrimitive, ToPrimitive};
@@ -14,14 +14,11 @@ use crate::{
     mm::{verify_area, VirtAddr},
     net::socket::{AddressFamily, SOL_SOCKET},
     process::ProcessManager,
-    syscall::Syscall,
+    syscall::{user_access::UserBufferWriter, Syscall},
 };
 
 use super::{
-    socket::{
-        PosixSocketType, RawSocket, SocketHandleItem, SocketInode, SocketOptions, TcpSocket,
-        UdpSocket, HANDLE_MAP,
-    },
+    socket::{new_socket, PosixSocketType, SocketHandleItem, SocketInode, HANDLE_MAP},
     Endpoint, Protocol, ShutdownType, Socket,
 };
 
@@ -42,26 +39,10 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         let address_family = AddressFamily::try_from(address_family as u16)?;
         let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
-        // kdebug!("do_socket: address_family: {address_family:?}, socket_type: {socket_type:?}, protocol: {protocol}");
-        // 根据地址族和socket类型创建socket
-        let socket: Box<dyn Socket> = match address_family {
-            AddressFamily::Unix | AddressFamily::INet => match socket_type {
-                PosixSocketType::Stream => Box::new(TcpSocket::new(SocketOptions::default())),
-                PosixSocketType::Datagram => Box::new(UdpSocket::new(SocketOptions::default())),
-                PosixSocketType::Raw => Box::new(RawSocket::new(
-                    Protocol::from(protocol as u8),
-                    SocketOptions::default(),
-                )),
-                _ => {
-                    // kdebug!("do_socket: EINVAL");
-                    return Err(SystemError::EINVAL);
-                }
-            },
-            _ => {
-                // kdebug!("do_socket: EAFNOSUPPORT");
-                return Err(SystemError::EAFNOSUPPORT);
-            }
-        };
+        let protocol = Protocol::from(protocol as u8);
+        // kdebug!("do_socket: address_family: {address_family:?}, socket_type: {socket_type:?}, protocol: {protocol:?}");
+
+        let socket = new_socket(address_family, socket_type, protocol)?;
         let handle_item = SocketHandleItem::new(&socket);
         HANDLE_MAP
             .write_irqsave()
@@ -78,6 +59,30 @@ impl Syscall {
         drop(fd_table_guard);
         // kdebug!("do_socket: fd: {fd:?}");
         return fd;
+    }
+
+    /// # sys_socketpair系统调用的实际执行函数
+    ///
+    /// ## 参数
+    ///
+    /// - `address_family`: 地址族
+    /// - `socket_type`: socket类型
+    /// - `protocol`: 传输协议
+    /// - `fds`: 用于返回文件描述符的数组
+    pub fn socketpair(
+        address_family: usize,
+        socket_type: usize,
+        protocol: usize,
+        fds: *mut i32,
+    ) -> Result<usize, SystemError> {
+        let address_family = AddressFamily::try_from(address_family as u16)?;
+        let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
+        let protocol = Protocol::from(protocol as u8);
+        let fds = UserBufferWriter::new(fds, core::mem::size_of::<[c_int; 2]>(), true)?
+            .buffer::<i32>(0)?;
+        let socket0 = new_socket(address_family, socket_type, protocol)?;
+        let socket1 = new_socket(address_family, socket_type, protocol)?;
+        todo!()
     }
 
     /// @brief sys_setsockopt系统调用的实际执行函数

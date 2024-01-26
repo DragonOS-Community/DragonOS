@@ -346,6 +346,7 @@ impl Syscall {
                     Self::pipe2(pipefd, FileMode::empty())
                 }
             }
+
             SYS_PIPE2 => {
                 let pipefd: *mut i32 = args[0] as *mut c_int;
                 let arg1 = args[1];
@@ -547,22 +548,16 @@ impl Syscall {
             SYS_RECVMSG => {
                 let msg = args[1] as *mut crate::net::syscall::MsgHdr;
                 let flags = args[2] as u32;
-                match UserBufferWriter::new(
+
+                let mut user_buffer_writer = UserBufferWriter::new(
                     msg,
                     core::mem::size_of::<crate::net::syscall::MsgHdr>(),
                     true,
-                ) {
-                    Err(e) => Err(e),
-                    Ok(mut user_buffer_writer) => {
-                        match user_buffer_writer.buffer::<crate::net::syscall::MsgHdr>(0) {
-                            Err(e) => Err(e),
-                            Ok(buffer) => {
-                                let msg = &mut buffer[0];
-                                Self::recvmsg(args[0], msg, flags)
-                            }
-                        }
-                    }
-                }
+                )?;
+                let buffer = user_buffer_writer.buffer::<crate::net::syscall::MsgHdr>(0)?;
+
+                let msg = &mut buffer[0];
+                Self::recvmsg(args[0], msg, flags)
             }
 
             SYS_LISTEN => Self::listen(args[0], args[1]),
@@ -817,7 +812,15 @@ impl Syscall {
             }
 
             SYS_SOCKETPAIR => {
-                unimplemented!()
+                let address_family = args[0];
+                let socket_type = args[1];
+                let protocol = args[2];
+                let fds: *mut i32 = args[4] as *mut c_int;
+                if fds.is_null() {
+                    Err(SystemError::EFAULT)
+                } else {
+                    Self::socketpair(address_family, socket_type, protocol, fds)
+                }
             }
 
             #[cfg(target_arch = "x86_64")]

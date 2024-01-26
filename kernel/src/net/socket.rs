@@ -122,7 +122,7 @@ impl SocketHandleItem {
     }
 }
 
-/// @brief TCP 和 UDP 的端口管理器。
+/// # TCP 和 UDP 的端口管理器。
 /// 如果 TCP/UDP 的 socket 绑定了某个端口，它会在对应的表中记录，以检测端口冲突。
 pub struct PortManager {
     // TCP 端口记录表
@@ -167,6 +167,7 @@ impl PortManager {
                 SocketType::UdpSocket => self.udp_port_table.lock(),
                 SocketType::TcpSocket => self.tcp_port_table.lock(),
                 SocketType::RawSocket => panic!("RawSocket cann't get a port"),
+                SocketType::SeqpacketSocket => panic!("SeqpacketSocket cann't get a port"),
             };
             if let None = listen_table_guard.get(&port) {
                 drop(listen_table_guard);
@@ -190,7 +191,8 @@ impl PortManager {
             let mut listen_table_guard = match socket_type {
                 SocketType::UdpSocket => self.udp_port_table.lock(),
                 SocketType::TcpSocket => self.tcp_port_table.lock(),
-                SocketType::RawSocket => panic!("RawSocket cann't bind a port"),
+                SocketType::RawSocket => panic!("RawSocket cann't get a port"),
+                SocketType::SeqpacketSocket => panic!("SeqpacketSocket cann't get a port"),
             };
             match listen_table_guard.get(&port) {
                 Some(_) => return Err(SystemError::EADDRINUSE),
@@ -207,6 +209,7 @@ impl PortManager {
             SocketType::UdpSocket => self.udp_port_table.lock(),
             SocketType::TcpSocket => self.tcp_port_table.lock(),
             SocketType::RawSocket => return Ok(()),
+            SocketType::SeqpacketSocket => return Ok(()),
         };
         listen_table_guard.remove(&port);
         drop(listen_table_guard);
@@ -254,6 +257,8 @@ pub enum SocketType {
     TcpSocket,
     /// 用于Udp通信的 Socket
     UdpSocket,
+    /// Seqpacket的Socket
+    SeqpacketSocket,
 }
 
 bitflags! {
@@ -306,6 +311,39 @@ impl SocketMetadata {
     }
 }
 
+/// 根据地址族、socket类型和协议创建socket
+pub(super) fn new_socket(
+    address_family: AddressFamily,
+    socket_type: PosixSocketType,
+    protocol: Protocol,
+) -> Result<Box<dyn Socket>, SystemError> {
+    let socket: Box<dyn Socket> = match address_family {
+        AddressFamily::Unix => match socket_type {
+            PosixSocketType::Stream => Box::new(TcpSocket::new(SocketOptions::default())),
+            PosixSocketType::Datagram => Box::new(UdpSocket::new(SocketOptions::default())),
+            PosixSocketType::Raw => Box::new(RawSocket::new(protocol, SocketOptions::default())),
+            PosixSocketType::SeqPacket => {
+                Box::new(SeqpacketSocket::new(protocol, SocketOptions::default()))
+            }
+            _ => {
+                return Err(SystemError::EINVAL);
+            }
+        },
+        AddressFamily::INet => match socket_type {
+            PosixSocketType::Stream => Box::new(TcpSocket::new(SocketOptions::default())),
+            PosixSocketType::Datagram => Box::new(UdpSocket::new(SocketOptions::default())),
+            PosixSocketType::Raw => Box::new(RawSocket::new(protocol, SocketOptions::default())),
+            _ => {
+                return Err(SystemError::EINVAL);
+            }
+        },
+        _ => {
+            return Err(SystemError::EAFNOSUPPORT);
+        }
+    };
+    Ok(socket)
+}
+
 /// @brief 表示原始的socket。原始套接字绕过传输层协议（如 TCP 或 UDP）并提供对网络层协议（如 IP）的直接访问。
 ///
 /// ref: https://man7.org/linux/man-pages/man7/raw.7.html
@@ -323,10 +361,10 @@ pub struct RawSocket {
 impl RawSocket {
     /// 元数据的缓冲区的大小
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
-    /// 默认的发送缓冲区的大小 transmiss
-    pub const DEFAULT_RX_BUF_SIZE: usize = 64 * 1024;
     /// 默认的接收缓冲区的大小 receive
-    pub const DEFAULT_TX_BUF_SIZE: usize = 64 * 1024;
+    pub const DEFAULT_SEND_BUF_SIZE: usize = 64 * 1024;
+    /// 默认的发送缓冲区的大小 transmiss
+    pub const DEFAULT_RECV_BUF_SIZE: usize = 64 * 1024;
 
     /// @brief 创建一个原始的socket
     ///
@@ -337,18 +375,18 @@ impl RawSocket {
     pub fn new(protocol: Protocol, options: SocketOptions) -> Self {
         let tx_buffer = raw::PacketBuffer::new(
             vec![raw::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
-            vec![0; Self::DEFAULT_TX_BUF_SIZE],
+            vec![0; Self::DEFAULT_RECV_BUF_SIZE],
         );
         let rx_buffer = raw::PacketBuffer::new(
             vec![raw::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
-            vec![0; Self::DEFAULT_RX_BUF_SIZE],
+            vec![0; Self::DEFAULT_SEND_BUF_SIZE],
         );
         let protocol: u8 = protocol.into();
         let socket = raw::Socket::new(
             smoltcp::wire::IpVersion::Ipv4,
             wire::IpProtocol::from(protocol),
-            tx_buffer,
             rx_buffer,
+            tx_buffer,
         );
 
         // 把socket添加到socket集合中，并得到socket的句柄
@@ -357,8 +395,8 @@ impl RawSocket {
 
         let metadata = SocketMetadata::new(
             SocketType::RawSocket,
-            Self::DEFAULT_RX_BUF_SIZE,
-            Self::DEFAULT_TX_BUF_SIZE,
+            Self::DEFAULT_SEND_BUF_SIZE,
+            Self::DEFAULT_RECV_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
             options,
         );
@@ -511,27 +549,26 @@ pub struct UdpSocket {
 impl UdpSocket {
     /// 元数据的缓冲区的大小
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
-    /// 默认的发送缓冲区的大小 transmiss
-    pub const DEFAULT_RX_BUF_SIZE: usize = 64 * 1024;
     /// 默认的接收缓冲区的大小 receive
-    pub const DEFAULT_TX_BUF_SIZE: usize = 64 * 1024;
+    pub const DEFAULT_RECV_BUF_SIZE: usize = 64 * 1024;
+    /// 默认的发送缓冲区的大小 transmiss
+    pub const DEFAULT_SEND_BUF_SIZE: usize = 64 * 1024;
 
-    /// @brief 创建一个原始的socket
+    /// @brief 创建一个udp的socket
     ///
-    /// @param protocol 协议号
     /// @param options socket的选项
     ///
-    /// @return 返回创建的原始的socket
+    /// @return 返回创建的udp的socket
     pub fn new(options: SocketOptions) -> Self {
         let tx_buffer = udp::PacketBuffer::new(
             vec![udp::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
-            vec![0; Self::DEFAULT_TX_BUF_SIZE],
+            vec![0; Self::DEFAULT_SEND_BUF_SIZE],
         );
         let rx_buffer = udp::PacketBuffer::new(
             vec![udp::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
-            vec![0; Self::DEFAULT_RX_BUF_SIZE],
+            vec![0; Self::DEFAULT_RECV_BUF_SIZE],
         );
-        let socket = udp::Socket::new(tx_buffer, rx_buffer);
+        let socket = udp::Socket::new(rx_buffer, tx_buffer);
 
         // 把socket添加到socket集合中，并得到socket的句柄
         let handle: Arc<GlobalSocketHandle> =
@@ -539,8 +576,8 @@ impl UdpSocket {
 
         let metadata = SocketMetadata::new(
             SocketType::UdpSocket,
-            Self::DEFAULT_RX_BUF_SIZE,
-            Self::DEFAULT_TX_BUF_SIZE,
+            Self::DEFAULT_SEND_BUF_SIZE,
+            Self::DEFAULT_RECV_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
             options,
         );
@@ -569,7 +606,7 @@ impl UdpSocket {
             }
         } else {
             return Err(SystemError::EINVAL);
-        };
+        }
     }
 }
 
@@ -699,6 +736,7 @@ impl Socket for UdpSocket {
     ) -> Result<usize, SystemError> {
         todo!()
     }
+
     fn metadata(&self) -> Result<SocketMetadata, SystemError> {
         Ok(self.metadata.clone())
     }
@@ -751,25 +789,24 @@ pub struct TcpSocket {
 impl TcpSocket {
     /// 元数据的缓冲区的大小
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
-    /// 默认的发送缓冲区的大小 transmiss
-    pub const DEFAULT_RX_BUF_SIZE: usize = 512 * 1024;
     /// 默认的接收缓冲区的大小 receive
-    pub const DEFAULT_TX_BUF_SIZE: usize = 512 * 1024;
+    pub const DEFAULT_RECV_BUF_SIZE: usize = 512 * 1024;
+    /// 默认的发送缓冲区的大小 transmiss
+    pub const DEFAULT_SEND_BUF_SIZE: usize = 512 * 1024;
 
     /// TcpSocket的特殊事件，用于在事件等待队列上sleep
     pub const CAN_CONNECT: u64 = 1u64 << 63;
     pub const CAN_ACCPET: u64 = 1u64 << 62;
 
-    /// @brief 创建一个原始的socket
+    /// @brief 创建一个tcp的socket
     ///
-    /// @param protocol 协议号
     /// @param options socket的选项
     ///
-    /// @return 返回创建的原始的socket
+    /// @return 返回创建的tcp的socket
     pub fn new(options: SocketOptions) -> Self {
-        let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_TX_BUF_SIZE]);
-        let rx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_RX_BUF_SIZE]);
-        let socket = tcp::Socket::new(tx_buffer, rx_buffer);
+        let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_SEND_BUF_SIZE]);
+        let rx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_RECV_BUF_SIZE]);
+        let socket = tcp::Socket::new(rx_buffer, tx_buffer);
 
         // 把socket添加到socket集合中，并得到socket的句柄
         let handle: Arc<GlobalSocketHandle> =
@@ -777,8 +814,8 @@ impl TcpSocket {
 
         let metadata = SocketMetadata::new(
             SocketType::TcpSocket,
-            Self::DEFAULT_RX_BUF_SIZE,
-            Self::DEFAULT_TX_BUF_SIZE,
+            Self::DEFAULT_SEND_BUF_SIZE,
+            Self::DEFAULT_RECV_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
             options,
         );
@@ -1054,8 +1091,8 @@ impl Socket for TcpSocket {
 
                 let new_socket = {
                     // Initialize the TCP socket's buffers.
-                    let rx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_RX_BUF_SIZE]);
-                    let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_TX_BUF_SIZE]);
+                    let rx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_RECV_BUF_SIZE]);
+                    let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_SEND_BUF_SIZE]);
                     // The new TCP socket used for sending and receiving data.
                     let mut tcp_socket = tcp::Socket::new(rx_buffer, tx_buffer);
                     self.do_listen(&mut tcp_socket, endpoint)
@@ -1080,8 +1117,8 @@ impl Socket for TcpSocket {
 
                     let metadata = SocketMetadata::new(
                         SocketType::TcpSocket,
-                        Self::DEFAULT_RX_BUF_SIZE,
-                        Self::DEFAULT_TX_BUF_SIZE,
+                        Self::DEFAULT_SEND_BUF_SIZE,
+                        Self::DEFAULT_RECV_BUF_SIZE,
                         Self::DEFAULT_METADATA_BUF_SIZE,
                         self.metadata.options,
                     );
@@ -1139,6 +1176,103 @@ impl Socket for TcpSocket {
         let sockets = SOCKET_SET.lock_irqsave();
         let socket = sockets.get::<tcp::Socket>(self.handle.0);
         return socket.remote_endpoint().map(|x| Endpoint::Ip(Some(x)));
+    }
+
+    fn metadata(&self) -> Result<SocketMetadata, SystemError> {
+        Ok(self.metadata.clone())
+    }
+
+    fn box_clone(&self) -> alloc::boxed::Box<dyn Socket> {
+        return Box::new(self.clone());
+    }
+
+    fn socket_handle(&self) -> SocketHandle {
+        self.handle.0
+    }
+}
+
+/// # 表示 seqpacket socket
+#[derive(Debug, Clone)]
+pub struct SeqpacketSocket {
+    handle: Arc<GlobalSocketHandle>,
+    is_listening: bool,
+    metadata: SocketMetadata,
+}
+
+impl SeqpacketSocket {
+    /// 元数据的缓冲区的大小
+    pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
+    /// 默认的接收缓冲区的大小 receive
+    pub const DEFAULT_SEND_BUF_SIZE: usize = 64 * 1024;
+    /// 默认的发送缓冲区的大小 transmiss
+    pub const DEFAULT_RECV_BUF_SIZE: usize = 64 * 1024;
+
+    /// @brief 创建一个seqpacket的socket
+    ///
+    /// @param protocol 协议号
+    /// @param options socket的选项
+    ///
+    /// @return 返回创建的seqpacket的socket
+    pub fn new(protocol: Protocol, options: SocketOptions) -> Self {
+        let tx_buffer = raw::PacketBuffer::new(
+            vec![raw::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
+            vec![0; Self::DEFAULT_RECV_BUF_SIZE],
+        );
+        let rx_buffer = raw::PacketBuffer::new(
+            vec![raw::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
+            vec![0; Self::DEFAULT_SEND_BUF_SIZE],
+        );
+        let protocol: u8 = protocol.into();
+        let socket = raw::Socket::new(
+            smoltcp::wire::IpVersion::Ipv4,
+            wire::IpProtocol::from(protocol),
+            rx_buffer,
+            tx_buffer,
+        );
+
+        // 把socket添加到socket集合中，并得到socket的句柄
+        let handle: Arc<GlobalSocketHandle> =
+            GlobalSocketHandle::new(SOCKET_SET.lock_irqsave().add(socket));
+
+        let metadata = SocketMetadata::new(
+            SocketType::SeqpacketSocket,
+            Self::DEFAULT_SEND_BUF_SIZE,
+            Self::DEFAULT_RECV_BUF_SIZE,
+            Self::DEFAULT_METADATA_BUF_SIZE,
+            options,
+        );
+
+        return Self {
+            handle,
+            is_listening: false,
+            metadata,
+        };
+    }
+}
+
+impl Socket for SeqpacketSocket {
+    fn read(&mut self, _buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
+        todo!()
+    }
+
+    fn write(&self, _buf: &[u8], _to: Option<super::Endpoint>) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn connect(&mut self, _endpoint: super::Endpoint) -> Result<(), SystemError> {
+        todo!()
+    }
+
+    fn bind(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
+        todo!()
+    }
+
+    fn listen(&mut self, _backlog: usize) -> Result<(), SystemError> {
+        todo!()
+    }
+
+    fn accept(&mut self) -> Result<(Box<dyn Socket>, Endpoint), SystemError> {
+        todo!()
     }
 
     fn metadata(&self) -> Result<SocketMetadata, SystemError> {

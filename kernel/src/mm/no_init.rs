@@ -111,14 +111,13 @@ impl<MMA: MemoryManagementArch> FrameAllocator for PseudoAllocator<MMA> {
         assert!(count.data() == 1);
         let vaddr = EARLY_IOREMAP_PAGES.lock_irqsave().allocate_page()?;
         let paddr = MMA::virt_2_phys(vaddr)?;
-        kdebug!("allocate page: vaddr={:?}, paddr={:?}", vaddr, paddr);
         return Some((paddr, count));
     }
 
     unsafe fn free(&mut self, address: PhysAddr, count: PageFrameCount) {
         assert_eq!(count.data(), 1);
         assert!(address.check_aligned(MMA::PAGE_SIZE));
-        kdebug!("free page: paddr={:?}", address);
+
         let vaddr = MMA::phys_2_virt(address);
         if let Some(vaddr) = vaddr {
             EARLY_IOREMAP_PAGES.lock_irqsave().free_page(vaddr);

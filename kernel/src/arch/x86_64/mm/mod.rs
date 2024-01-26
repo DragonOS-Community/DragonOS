@@ -108,11 +108,16 @@ impl MemoryManagementArch for X86_64MMArch {
     /// x86_64不存在EXEC标志位，只有NO_EXEC（XD）标志位
     const ENTRY_FLAG_EXEC: usize = 0;
 
+    const ENTRY_FLAG_ACCESSED: usize = 0;
+    const ENTRY_FLAG_DIRTY: usize = 0;
+
     /// 物理地址与虚拟地址的偏移量
     /// 0xffff_8000_0000_0000
     const PHYS_OFFSET: usize = Self::PAGE_NEGATIVE_MASK + (Self::PAGE_ADDRESS_SIZE >> 1);
 
-    const USER_END_VADDR: VirtAddr = VirtAddr::new(0x0000_7eff_ffff_ffff);
+    // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/include/asm/page_64_types.h#75
+    const USER_END_VADDR: VirtAddr =
+        VirtAddr::new((Self::PAGE_ADDRESS_SIZE >> 1) - Self::PAGE_SIZE);
     const USER_BRK_START: VirtAddr = VirtAddr::new(0x700000000000);
     const USER_STACK_START: VirtAddr = VirtAddr::new(0x6ffff0a00000);
 

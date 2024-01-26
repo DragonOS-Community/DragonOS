@@ -758,7 +758,8 @@ impl BinaryLoader for ElfLoader {
             // 如果程序段要加载的目标地址不在用户空间内，或者是其他不合法的情况，那么就报错
             if !p_vaddr.check_user()
                 || seg_to_load.p_filesz > seg_to_load.p_memsz
-                || seg_to_load.p_memsz > MMArch::USER_END_VADDR.data() as u64
+                || self.elf_page_align_up(p_vaddr + seg_to_load.p_memsz as usize)
+                    >= MMArch::USER_END_VADDR
             {
                 // kdebug!("ERR:     p_vaddr={p_vaddr:?}");
                 return Err(ExecError::InvalidParemeter);

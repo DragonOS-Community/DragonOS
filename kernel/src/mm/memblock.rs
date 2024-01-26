@@ -1,3 +1,5 @@
+use core::intrinsics::unlikely;
+
 use system_error::SystemError;
 
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
@@ -48,6 +50,18 @@ impl MemBlockManager {
     /// 如果添加的区域与已有区域有重叠，会将重叠的区域合并
     #[allow(dead_code)]
     pub fn add_block(&self, base: PhysAddr, size: usize) -> Result<(), SystemError> {
+        return self.add_range(base, size, MemoryAreaAttr::empty());
+    }
+
+    /// 添加内存区域
+    ///
+    /// 如果添加的区域与已有区域有重叠，会将重叠的区域合并
+    fn add_range(
+        &self,
+        base: PhysAddr,
+        size: usize,
+        flags: MemoryAreaAttr,
+    ) -> Result<(), SystemError> {
         if size == 0 {
             return Ok(());
         }
@@ -56,7 +70,7 @@ impl MemBlockManager {
             panic!("Too many memory regions!");
         }
 
-        let block = PhysMemoryArea::new(base, size);
+        let block = PhysMemoryArea::new(base, size, MemoryAreaAttr::empty());
         // 特判第一个区域
         if inner.initial_memory_regions_num == 0 {
             inner.initial_memory_regions[0] = block;
@@ -66,7 +80,7 @@ impl MemBlockManager {
 
         // 先计算需要添加的区域数量
         let blocks_to_add = self
-            .do_add_block(&mut inner, block, false)
+            .do_add_block(&mut inner, block, false, flags)
             .expect("Failed to count blocks to add!");
 
         if inner.initial_memory_regions_num + blocks_to_add > INITIAL_MEMORY_REGIONS_NUM {
@@ -75,7 +89,7 @@ impl MemBlockManager {
         }
 
         // 然后添加区域
-        self.do_add_block(&mut inner, block, true)
+        self.do_add_block(&mut inner, block, true, flags)
             .expect("Failed to add block!");
 
         return Ok(());
@@ -86,6 +100,7 @@ impl MemBlockManager {
         inner: &mut SpinLockGuard<'_, InnerMemBlockManager>,
         block: PhysMemoryArea,
         insert: bool,
+        flags: MemoryAreaAttr,
     ) -> Result<usize, SystemError> {
         let mut base = block.base;
         let end = block.base + block.size;
@@ -117,7 +132,7 @@ impl MemBlockManager {
                         start_index = i as isize;
                     }
                     end_index = (i + 1) as isize;
-                    self.do_insert_area(inner, i, base, range_base - base);
+                    self.do_insert_area(inner, i, base, range_base - base, flags);
                     i += 1;
                 }
             }
@@ -133,7 +148,7 @@ impl MemBlockManager {
                     start_index = i as isize;
                 }
                 end_index = (i + 1) as isize;
-                self.do_insert_area(inner, i, base, end - base);
+                self.do_insert_area(inner, i, base, end - base, flags);
             }
         }
 
@@ -153,12 +168,13 @@ impl MemBlockManager {
         index: usize,
         base: PhysAddr,
         size: usize,
+        flags: MemoryAreaAttr,
     ) {
         let copy_elements = inner.initial_memory_regions_num - index;
         inner
             .initial_memory_regions
             .copy_within(index..index + copy_elements, index + 1);
-        inner.initial_memory_regions[index] = PhysMemoryArea::new(base, size);
+        inner.initial_memory_regions[index] = PhysMemoryArea::new(base, size, flags);
         inner.initial_memory_regions_num += 1;
     }
 
@@ -178,10 +194,13 @@ impl MemBlockManager {
             {
                 let next_base = inner.initial_memory_regions[(i + 1) as usize].base;
                 let next_size = inner.initial_memory_regions[(i + 1) as usize].size;
+                let next_flags = inner.initial_memory_regions[(i + 1) as usize].flags;
                 let this = &mut inner.initial_memory_regions[i as usize];
 
-                if this.base + this.size != next_base {
-                    // BUG_ON(this->base + this->size > next->base);
+                if this.base + this.size != next_base || this.flags != next_flags {
+                    if unlikely(this.base + this.size > next_base) {
+                        kBUG!("this->base + this->size > next->base");
+                    }
                     i += 1;
                     continue;
                 }
@@ -236,6 +255,15 @@ impl MemBlockManager {
         }
     }
 
+    /// 在一个内存块管理器中找到一个物理地址范围内的
+    /// 空闲块，并隔离出所需的内存大小
+    ///
+    /// ## 返回值
+    ///
+    /// - Ok((start_index, end_index)) 表示成功找到了一个连续的内存区域来满足所需的 size。这里：
+    ///     - start_index 是指定的起始内存区域的索引。
+    ///     - end_index 是指定的结束内存区域的索引，它实际上不包含在返回的连续区域中，但它标志着下一个可能的不连续区域的开始。
+    /// - Err(SystemError) 则表示没有找到足够的空间来满足请求的 size，可能是因为内存区域不足或存在其他系统错误
     fn isolate_range(
         &self,
         inner: &mut SpinLockGuard<'_, InnerMemBlockManager>,
@@ -269,13 +297,25 @@ impl MemBlockManager {
                 // regions[idx] intersects from below
                 inner.initial_memory_regions[idx].base = base;
                 inner.initial_memory_regions[idx].size -= base - range_base;
-                self.do_insert_area(inner, idx, range_base, base - range_base);
+                self.do_insert_area(
+                    inner,
+                    idx,
+                    range_base,
+                    base - range_base,
+                    inner.initial_memory_regions[idx].flags,
+                );
             } else if range_end > end {
                 // regions[idx] intersects from above
                 inner.initial_memory_regions[idx].base = end;
                 inner.initial_memory_regions[idx].size -= end - range_base;
 
-                self.do_insert_area(inner, idx, range_base, end - range_base);
+                self.do_insert_area(
+                    inner,
+                    idx,
+                    range_base,
+                    end - range_base,
+                    inner.initial_memory_regions[idx].flags,
+                );
                 if idx == 0 {
                     idx = usize::MAX;
                 } else {
@@ -293,6 +333,46 @@ impl MemBlockManager {
         }
 
         return Ok((start_index, end_index));
+    }
+
+    /// mark_nomap - 用`MemoryAreaAttr::NOMAP`标志标记内存区域
+    ///
+    /// ## 参数
+    ///
+    /// - base: 区域的物理基地址
+    /// - size: 区域的大小
+    ///
+    /// 使用`MemoryAreaAttr::NOMAP`标志标记的内存区域将不会被添加到物理内存的直接映射中。这些区域仍然会被内存映射所覆盖。内存映射中代表NOMAP内存帧的struct page将被PageReserved()。
+    /// 注意：如果被标记为`MemoryAreaAttr::NOMAP`的内存是从memblock分配的，调用者必须忽略该内存
+    pub fn mark_nomap(&self, base: PhysAddr, size: usize) -> Result<(), SystemError> {
+        return self.set_or_clear_flags(base, size, true, MemoryAreaAttr::NOMAP);
+    }
+
+    fn set_or_clear_flags(
+        &self,
+        base: PhysAddr,
+        size: usize,
+        set: bool,
+        flags: MemoryAreaAttr,
+    ) -> Result<(), SystemError> {
+        let mut inner = self.inner.lock();
+        let (start_index, end_index) = self.isolate_range(&mut inner, base, size)?;
+        for i in start_index..end_index {
+            if set {
+                inner.initial_memory_regions[i].flags |= flags;
+            } else {
+                inner.initial_memory_regions[i].flags &= !flags;
+            }
+        }
+
+        let num = inner.initial_memory_regions_num as isize;
+        self.do_merge_blocks(&mut inner, 0, num);
+        return Ok(());
+    }
+
+    /// 标记内存区域为保留区域
+    pub fn reserve_block(&self, base: PhysAddr, size: usize) -> Result<(), SystemError> {
+        return self.set_or_clear_flags(base, size, true, MemoryAreaAttr::RESERVED);
     }
 
     /// 生成迭代器
@@ -347,5 +427,23 @@ impl<'a> Iterator for MemBlockIter<'a> {
         let ret = self.inner.initial_memory_regions[self.index];
         self.index += 1;
         return Some(ret);
+    }
+}
+
+bitflags! {
+    /// 内存区域属性
+    pub struct MemoryAreaAttr: u32 {
+        /// No special request
+        const NONE = 0x0;
+        /// Hotpluggable region
+        const HOTPLUG = (1 << 0);
+        /// Mirrored region
+        const MIRROR = (1 << 1);
+        /// do not add to kenrel direct mapping
+        const NOMAP = (1 << 2);
+        /// Always detected via a driver
+        const DRIVER_MANAGED = (1 << 3);
+        /// Memory is reserved
+        const RESERVED = (1 << 4);
     }
 }

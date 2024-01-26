@@ -3,14 +3,11 @@ use core::intrinsics::unreachable;
 use fdt::node::FdtNode;
 
 use crate::{
-    arch::{mm::init::mm_early_init, MMArch},
-    driver::{
-        firmware::efi::init::efi_init, open_firmware::fdt::open_firmware_fdt_driver,
-        tty::serial::serial8250::send_to_default_serial8250_port,
-    },
+    arch::mm::init::mm_early_init,
+    driver::{firmware::efi::init::efi_init, open_firmware::fdt::open_firmware_fdt_driver},
     init::{boot_params, init_before_mem_init},
     kdebug, kinfo,
-    mm::{MemoryManagementArch, PhysAddr, VirtAddr},
+    mm::{PhysAddr, VirtAddr},
     print, println,
 };
 
@@ -39,14 +36,8 @@ impl ArchBootParams {
 #[no_mangle]
 unsafe extern "C" fn kernel_main(hartid: usize, fdt_paddr: usize) -> ! {
     let fdt_paddr = PhysAddr::new(fdt_paddr);
-
+    // system_reset(sbi::reset::ResetType::Shutdown, sbi::reset::ResetReason::NoReason);
     init_before_mem_init();
-    extern "C" {
-        fn BSP_IDLE_STACK_SPACE();
-    }
-    kdebug!("BSP_IDLE_STACK_SPACE={:#x}", BSP_IDLE_STACK_SPACE as u64);
-    kdebug!("PAGE_ADDRESS_SIZE={}", MMArch::PAGE_ADDRESS_SIZE);
-    kdebug!("PAGE_ADDRESS_SHIFT={}", MMArch::PAGE_ADDRESS_SHIFT);
 
     boot_params().write().arch.fdt_paddr = fdt_paddr;
     kinfo!(
@@ -58,7 +49,7 @@ unsafe extern "C" fn kernel_main(hartid: usize, fdt_paddr: usize) -> ! {
     mm_early_init();
 
     let fdt = fdt::Fdt::from_ptr(fdt_paddr.data() as *const u8).expect("Failed to parse fdt!");
-    print_node(fdt.find_node("/").unwrap(), 0);
+    // print_node(fdt.find_node("/").unwrap(), 0);
 
     parse_dtb();
 

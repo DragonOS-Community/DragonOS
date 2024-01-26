@@ -2,7 +2,7 @@ use core::{fmt, mem};
 
 use uefi_raw::Guid;
 
-/// 由D人agonStub设置的，用于描述内核被放置在的地址的GUID
+/// 由DragonStub设置的，用于描述内核被放置在的地址的GUID
 pub static DRAGONSTUB_EFI_PAYLOAD_EFI_GUID: Guid = Guid::new(
     unsafe { mem::transmute_copy(&0xddf1d47cu32) },
     unsafe { mem::transmute_copy(&0x102cu32) },

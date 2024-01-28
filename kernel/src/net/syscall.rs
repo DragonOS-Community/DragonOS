@@ -1,4 +1,4 @@
-use core::{cmp::min, ffi::c_int};
+use core::cmp::min;
 
 use alloc::{boxed::Box, sync::Arc};
 use num_traits::{FromPrimitive, ToPrimitive};
@@ -14,7 +14,7 @@ use crate::{
     mm::{verify_area, VirtAddr},
     net::socket::{AddressFamily, SOL_SOCKET},
     process::ProcessManager,
-    syscall::{user_access::UserBufferWriter, Syscall},
+    syscall::Syscall,
 };
 
 use super::{
@@ -41,7 +41,6 @@ impl Syscall {
         let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
         let protocol = Protocol::from(protocol as u8);
         // kdebug!("do_socket: address_family: {address_family:?}, socket_type: {socket_type:?}, protocol: {protocol:?}");
-
         let socket = new_socket(address_family, socket_type, protocol)?;
         let handle_item = SocketHandleItem::new(&socket);
         HANDLE_MAP
@@ -73,16 +72,34 @@ impl Syscall {
         address_family: usize,
         socket_type: usize,
         protocol: usize,
-        fds: *mut i32,
+        fds: &mut [i32],
     ) -> Result<usize, SystemError> {
         let address_family = AddressFamily::try_from(address_family as u16)?;
         let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
         let protocol = Protocol::from(protocol as u8);
-        let fds = UserBufferWriter::new(fds, core::mem::size_of::<[c_int; 2]>(), true)?
-            .buffer::<i32>(0)?;
-        let socket0 = new_socket(address_family, socket_type, protocol)?;
-        let socket1 = new_socket(address_family, socket_type, protocol)?;
-        todo!()
+        let mut socket0 = new_socket(address_family, socket_type, protocol)?;
+        let mut socket1 = new_socket(address_family, socket_type, protocol)?;
+
+        socket0.set_peer_handle(socket1.socket_handle());
+        socket1.set_peer_handle(socket0.socket_handle());
+
+        let mut handle_map = HANDLE_MAP.write_irqsave();
+        let binding = ProcessManager::current_pcb().fd_table();
+        let mut fd_table_guard = binding.write();
+
+        let mut alloc_fd = |socket| -> Result<i32, SystemError> {
+            let handle_item = SocketHandleItem::new(&socket);
+            handle_map.insert(socket.socket_handle(), handle_item);
+            let socketinode = SocketInode::new(socket);
+            let file = File::new(socketinode, FileMode::O_RDWR)?;
+            fd_table_guard.alloc_fd(file, None)
+        };
+
+        fds[0] = alloc_fd(socket0)?;
+        fds[1] = alloc_fd(socket1)?;
+
+        drop(fd_table_guard);
+        Ok(0)
     }
 
     /// @brief sys_setsockopt系统调用的实际执行函数

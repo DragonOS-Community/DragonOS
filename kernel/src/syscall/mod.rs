@@ -812,15 +812,13 @@ impl Syscall {
             }
 
             SYS_SOCKETPAIR => {
-                let address_family = args[0];
-                let socket_type = args[1];
-                let protocol = args[2];
-                let fds: *mut i32 = args[4] as *mut c_int;
-                if fds.is_null() {
-                    Err(SystemError::EFAULT)
-                } else {
-                    Self::socketpair(address_family, socket_type, protocol, fds)
-                }
+                let mut user_buffer_writer = UserBufferWriter::new(
+                    args[3] as *mut c_int,
+                    core::mem::size_of::<[c_int; 2]>(),
+                    frame.from_user(),
+                )?;
+                let fds = user_buffer_writer.buffer::<i32>(0)?;
+                Self::socketpair(args[0], args[1], args[2], fds)
             }
 
             #[cfg(target_arch = "x86_64")]

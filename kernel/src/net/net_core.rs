@@ -158,7 +158,7 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
         for (_, iface) in guard.iter() {
             iface.poll(&mut sockets).ok();
         }
-        let _ = send_event(&sockets);
+        send_event(&sockets)?;
         return Ok(());
     }
 

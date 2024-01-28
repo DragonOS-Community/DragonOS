@@ -19,8 +19,9 @@ use crate::{
 use smoltcp::{iface::SocketHandle, wire::IpEndpoint};
 
 use self::{
+    endpoints::LinkLayerEndpoint,
     event_poll::{EPollEventType, EPollItem},
-    socket::{SocketMetadata, HANDLE_MAP},
+    socket::{GlobalSocketHandle, SocketMetadata, HANDLE_MAP},
 };
 
 pub mod endpoints;
@@ -57,7 +58,7 @@ bitflags! {
 #[derive(Debug, Clone)]
 pub enum Endpoint {
     /// 链路层端点
-    LinkLayer(endpoints::LinkLayerEndpoint),
+    LinkLayer(LinkLayerEndpoint),
     /// 网络层端点
     Ip(Option<IpEndpoint>),
     // todo: 增加NetLink机制后，增加NetLink端点
@@ -161,6 +162,10 @@ pub trait Socket: Sync + Send + Debug {
         return EPollEventType::empty();
     }
 
+    fn set_peer_handle(&mut self, _peer_handle: SocketHandle) {
+        todo!("socket_type: {:?}", self.metadata().unwrap().socket_type);
+    }
+
     /// @brief socket的ioctl函数
     ///
     /// @param cmd ioctl命令
@@ -202,6 +207,10 @@ pub trait Socket: Sync + Send + Debug {
     }
 
     fn socket_handle(&self) -> SocketHandle;
+
+    fn handle(&self) -> Arc<GlobalSocketHandle> {
+        todo!("socket_type: {:?}", self.metadata().unwrap().socket_type);
+    }
 
     fn add_epoll(&mut self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
         HANDLE_MAP

@@ -1,4 +1,5 @@
-#![allow(dead_code)]
+use core::cmp::min;
+
 use alloc::{
     boxed::Box,
     collections::LinkedList,
@@ -283,10 +284,10 @@ bitflags! {
 pub struct SocketMetadata {
     /// socket的类型
     pub socket_type: SocketType,
-    /// 发送缓冲区的大小
-    pub send_buf_size: usize,
     /// 接收缓冲区的大小
     pub recv_buf_size: usize,
+    /// 发送缓冲区的大小
+    pub send_buf_size: usize,
     /// 元数据的缓冲区的大小
     pub metadata_buf_size: usize,
     /// socket的选项
@@ -296,15 +297,15 @@ pub struct SocketMetadata {
 impl SocketMetadata {
     fn new(
         socket_type: SocketType,
-        send_buf_size: usize,
         recv_buf_size: usize,
+        send_buf_size: usize,
         metadata_buf_size: usize,
         options: SocketOptions,
     ) -> Self {
         Self {
             socket_type,
-            send_buf_size,
             recv_buf_size,
+            send_buf_size,
             metadata_buf_size,
             options,
         }
@@ -362,9 +363,9 @@ impl RawSocket {
     /// 元数据的缓冲区的大小
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
     /// 默认的接收缓冲区的大小 receive
-    pub const DEFAULT_SEND_BUF_SIZE: usize = 64 * 1024;
-    /// 默认的发送缓冲区的大小 transmiss
     pub const DEFAULT_RECV_BUF_SIZE: usize = 64 * 1024;
+    /// 默认的发送缓冲区的大小 transmiss
+    pub const DEFAULT_SEND_BUF_SIZE: usize = 64 * 1024;
 
     /// @brief 创建一个原始的socket
     ///
@@ -373,17 +374,17 @@ impl RawSocket {
     ///
     /// @return 返回创建的原始的socket
     pub fn new(protocol: Protocol, options: SocketOptions) -> Self {
-        let tx_buffer = raw::PacketBuffer::new(
+        let rx_buffer = raw::PacketBuffer::new(
             vec![raw::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
             vec![0; Self::DEFAULT_RECV_BUF_SIZE],
         );
-        let rx_buffer = raw::PacketBuffer::new(
+        let tx_buffer = raw::PacketBuffer::new(
             vec![raw::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
             vec![0; Self::DEFAULT_SEND_BUF_SIZE],
         );
         let protocol: u8 = protocol.into();
         let socket = raw::Socket::new(
-            smoltcp::wire::IpVersion::Ipv4,
+            wire::IpVersion::Ipv4,
             wire::IpProtocol::from(protocol),
             rx_buffer,
             tx_buffer,
@@ -395,8 +396,8 @@ impl RawSocket {
 
         let metadata = SocketMetadata::new(
             SocketType::RawSocket,
-            Self::DEFAULT_SEND_BUF_SIZE,
             Self::DEFAULT_RECV_BUF_SIZE,
+            Self::DEFAULT_SEND_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
             options,
         );
@@ -422,13 +423,13 @@ impl Socket for RawSocket {
                     let packet = wire::Ipv4Packet::new_unchecked(buf);
                     return (
                         Ok(len),
-                        Endpoint::Ip(Some(smoltcp::wire::IpEndpoint {
+                        Endpoint::Ip(Some(wire::IpEndpoint {
                             addr: wire::IpAddress::Ipv4(packet.src_addr()),
                             port: 0,
                         })),
                     );
                 }
-                Err(smoltcp::socket::raw::RecvError::Exhausted) => {
+                Err(raw::RecvError::Exhausted) => {
                     if !self.metadata.options.contains(SocketOptions::BLOCK) {
                         // 如果是非阻塞的socket，就返回错误
                         return (Err(SystemError::EAGAIN_OR_EWOULDBLOCK), Endpoint::Ip(None));
@@ -444,16 +445,16 @@ impl Socket for RawSocket {
         }
     }
 
-    fn write(&self, buf: &[u8], to: Option<super::Endpoint>) -> Result<usize, SystemError> {
+    fn write(&self, buf: &[u8], to: Option<Endpoint>) -> Result<usize, SystemError> {
         // 如果用户发送的数据包，包含IP头，则直接发送
         if self.header_included {
             let mut socket_set_guard = SOCKET_SET.lock_irqsave();
             let socket = socket_set_guard.get_mut::<raw::Socket>(self.handle.0);
             match socket.send_slice(buf) {
-                Ok(_len) => {
+                Ok(_) => {
                     return Ok(buf.len());
                 }
-                Err(smoltcp::socket::raw::SendError::BufferFull) => {
+                Err(raw::SendError::BufferFull) => {
                     return Err(SystemError::ENOBUFS);
                 }
             }
@@ -469,7 +470,7 @@ impl Socket for RawSocket {
                 let iface = NET_DRIVERS.read_irqsave().get(&0).unwrap().clone();
 
                 // 构造IP头
-                let ipv4_src_addr: Option<smoltcp::wire::Ipv4Address> =
+                let ipv4_src_addr: Option<wire::Ipv4Address> =
                     iface.inner_iface().lock().ipv4_addr();
                 if ipv4_src_addr.is_none() {
                     return Err(SystemError::ENETUNREACH);
@@ -519,7 +520,7 @@ impl Socket for RawSocket {
         }
     }
 
-    fn connect(&mut self, _endpoint: super::Endpoint) -> Result<(), SystemError> {
+    fn connect(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -527,7 +528,7 @@ impl Socket for RawSocket {
         Ok(self.metadata.clone())
     }
 
-    fn box_clone(&self) -> alloc::boxed::Box<dyn Socket> {
+    fn box_clone(&self) -> Box<dyn Socket> {
         return Box::new(self.clone());
     }
 
@@ -560,13 +561,13 @@ impl UdpSocket {
     ///
     /// @return 返回创建的udp的socket
     pub fn new(options: SocketOptions) -> Self {
-        let tx_buffer = udp::PacketBuffer::new(
-            vec![udp::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
-            vec![0; Self::DEFAULT_SEND_BUF_SIZE],
-        );
         let rx_buffer = udp::PacketBuffer::new(
             vec![udp::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
             vec![0; Self::DEFAULT_RECV_BUF_SIZE],
+        );
+        let tx_buffer = udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
+            vec![0; Self::DEFAULT_SEND_BUF_SIZE],
         );
         let socket = udp::Socket::new(rx_buffer, tx_buffer);
 
@@ -576,8 +577,8 @@ impl UdpSocket {
 
         let metadata = SocketMetadata::new(
             SocketType::UdpSocket,
-            Self::DEFAULT_SEND_BUF_SIZE,
             Self::DEFAULT_RECV_BUF_SIZE,
+            Self::DEFAULT_SEND_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
             options,
         );
@@ -640,7 +641,7 @@ impl Socket for UdpSocket {
         }
     }
 
-    fn write(&self, buf: &[u8], to: Option<super::Endpoint>) -> Result<usize, SystemError> {
+    fn write(&self, buf: &[u8], to: Option<Endpoint>) -> Result<usize, SystemError> {
         // kdebug!("udp to send: {:?}, len={}", to, buf.len());
         let remote_endpoint: &wire::IpEndpoint = {
             if let Some(Endpoint::Ip(Some(ref endpoint))) = to {
@@ -664,11 +665,11 @@ impl Socket for UdpSocket {
                 // 远程remote endpoint使用什么协议，发送的时候使用的协议是一样的吧
                 // 否则就用 self.endpoint().addr.unwrap()
                 wire::IpAddress::Ipv4(_) => Endpoint::Ip(Some(wire::IpEndpoint::new(
-                    smoltcp::wire::IpAddress::Ipv4(wire::Ipv4Address::UNSPECIFIED),
+                    wire::IpAddress::Ipv4(wire::Ipv4Address::UNSPECIFIED),
                     temp_port,
                 ))),
                 wire::IpAddress::Ipv6(_) => Endpoint::Ip(Some(wire::IpEndpoint::new(
-                    smoltcp::wire::IpAddress::Ipv6(wire::Ipv6Address::UNSPECIFIED),
+                    wire::IpAddress::Ipv6(wire::Ipv6Address::UNSPECIFIED),
                     temp_port,
                 ))),
             };
@@ -718,7 +719,7 @@ impl Socket for UdpSocket {
     }
 
     /// @brief
-    fn connect(&mut self, endpoint: super::Endpoint) -> Result<(), SystemError> {
+    fn connect(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(_) = endpoint {
             self.remote_endpoint = Some(endpoint);
             return Ok(());
@@ -741,7 +742,7 @@ impl Socket for UdpSocket {
         Ok(self.metadata.clone())
     }
 
-    fn box_clone(&self) -> alloc::boxed::Box<dyn Socket> {
+    fn box_clone(&self) -> Box<dyn Socket> {
         return Box::new(self.clone());
     }
 
@@ -804,8 +805,8 @@ impl TcpSocket {
     ///
     /// @return 返回创建的tcp的socket
     pub fn new(options: SocketOptions) -> Self {
-        let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_SEND_BUF_SIZE]);
         let rx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_RECV_BUF_SIZE]);
+        let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_SEND_BUF_SIZE]);
         let socket = tcp::Socket::new(rx_buffer, tx_buffer);
 
         // 把socket添加到socket集合中，并得到socket的句柄
@@ -814,8 +815,8 @@ impl TcpSocket {
 
         let metadata = SocketMetadata::new(
             SocketType::TcpSocket,
-            Self::DEFAULT_SEND_BUF_SIZE,
             Self::DEFAULT_RECV_BUF_SIZE,
+            Self::DEFAULT_SEND_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
             options,
         );
@@ -829,8 +830,8 @@ impl TcpSocket {
     }
     fn do_listen(
         &mut self,
-        socket: &mut smoltcp::socket::tcp::Socket,
-        local_endpoint: smoltcp::wire::IpEndpoint,
+        socket: &mut tcp::Socket,
+        local_endpoint: wire::IpEndpoint,
     ) -> Result<(), SystemError> {
         let listen_result = if local_endpoint.addr.is_unspecified() {
             // kdebug!("Tcp Socket Listen on port {}", local_endpoint.port);
@@ -925,7 +926,7 @@ impl Socket for TcpSocket {
         }
     }
 
-    fn write(&self, buf: &[u8], _to: Option<super::Endpoint>) -> Result<usize, SystemError> {
+    fn write(&self, buf: &[u8], _to: Option<Endpoint>) -> Result<usize, SystemError> {
         if HANDLE_MAP
             .read_irqsave()
             .get(&self.socket_handle())
@@ -1182,7 +1183,7 @@ impl Socket for TcpSocket {
         Ok(self.metadata.clone())
     }
 
-    fn box_clone(&self) -> alloc::boxed::Box<dyn Socket> {
+    fn box_clone(&self) -> Box<dyn Socket> {
         return Box::new(self.clone());
     }
 
@@ -1195,17 +1196,17 @@ impl Socket for TcpSocket {
 #[derive(Debug, Clone)]
 pub struct SeqpacketSocket {
     handle: Arc<GlobalSocketHandle>,
-    is_listening: bool,
     metadata: SocketMetadata,
+    peer_handle: Option<SocketHandle>,
 }
 
 impl SeqpacketSocket {
     /// 元数据的缓冲区的大小
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
     /// 默认的接收缓冲区的大小 receive
-    pub const DEFAULT_SEND_BUF_SIZE: usize = 64 * 1024;
-    /// 默认的发送缓冲区的大小 transmiss
     pub const DEFAULT_RECV_BUF_SIZE: usize = 64 * 1024;
+    /// 默认的发送缓冲区的大小 transmiss
+    pub const DEFAULT_SEND_BUF_SIZE: usize = 0;
 
     /// @brief 创建一个seqpacket的socket
     ///
@@ -1214,17 +1215,17 @@ impl SeqpacketSocket {
     ///
     /// @return 返回创建的seqpacket的socket
     pub fn new(protocol: Protocol, options: SocketOptions) -> Self {
-        let tx_buffer = raw::PacketBuffer::new(
+        let rx_buffer = raw::PacketBuffer::new(
             vec![raw::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
             vec![0; Self::DEFAULT_RECV_BUF_SIZE],
         );
-        let rx_buffer = raw::PacketBuffer::new(
+        let tx_buffer = raw::PacketBuffer::new(
             vec![raw::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
             vec![0; Self::DEFAULT_SEND_BUF_SIZE],
         );
         let protocol: u8 = protocol.into();
         let socket = raw::Socket::new(
-            smoltcp::wire::IpVersion::Ipv4,
+            wire::IpVersion::Ipv4,
             wire::IpProtocol::from(protocol),
             rx_buffer,
             tx_buffer,
@@ -1236,42 +1237,81 @@ impl SeqpacketSocket {
 
         let metadata = SocketMetadata::new(
             SocketType::SeqpacketSocket,
-            Self::DEFAULT_SEND_BUF_SIZE,
             Self::DEFAULT_RECV_BUF_SIZE,
+            Self::DEFAULT_SEND_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
             options,
         );
 
         return Self {
             handle,
-            is_listening: false,
             metadata,
+            peer_handle: None,
         };
     }
 }
 
 impl Socket for SeqpacketSocket {
-    fn read(&mut self, _buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
-        todo!()
+    fn read(&mut self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
+        if self.peer_handle.is_none() {
+            kwarn!("SeqpacketSocket is now just for socketpair");
+            return (Err(SystemError::ENOSYS), Endpoint::Ip(None));
+        }
+
+        poll_ifaces();
+        loop {
+            let mut socket_set_guard = SOCKET_SET.lock_irqsave();
+            let socket = socket_set_guard.get_mut::<raw::Socket>(self.handle.0);
+
+            if let Ok(((), packet_buf)) = socket.rx_buffer.dequeue() {
+                let len = min(buf.len(), packet_buf.len());
+                buf[..len].copy_from_slice(&packet_buf[..len]);
+                let packet = wire::Ipv4Packet::new_unchecked(buf);
+                return (
+                    Ok(len),
+                    Endpoint::Ip(Some(wire::IpEndpoint {
+                        addr: wire::IpAddress::Ipv4(packet.src_addr()),
+                        port: 0,
+                    })),
+                );
+            } else {
+                if !self.metadata.options.contains(SocketOptions::BLOCK) {
+                    // 如果是非阻塞的socket，就返回错误
+                    return (Err(SystemError::EAGAIN_OR_EWOULDBLOCK), Endpoint::Ip(None));
+                }
+            }
+
+            drop(socket_set_guard);
+            SocketHandleItem::sleep(
+                self.socket_handle(),
+                EPollEventType::EPOLLIN.bits() as u64,
+                HANDLE_MAP.read_irqsave(),
+            );
+        }
     }
 
-    fn write(&self, _buf: &[u8], _to: Option<super::Endpoint>) -> Result<usize, SystemError> {
-        todo!()
+    fn write(&self, buf: &[u8], _to: Option<Endpoint>) -> Result<usize, SystemError> {
+        if self.peer_handle.is_none() {
+            kwarn!("SeqpacketSocket is now just for socketpair");
+            return Err(SystemError::ENOSYS);
+        }
+
+        let mut socket_set_guard = SOCKET_SET.lock_irqsave();
+        let peer_socket = socket_set_guard.get_mut::<raw::Socket>(self.peer_handle.unwrap());
+
+        if let Ok(packet_buf) = peer_socket.rx_buffer.enqueue(buf.len(), ()) {
+            packet_buf.copy_from_slice(buf);
+            return Ok(buf.len());
+        } else {
+            return Err(SystemError::ENOBUFS);
+        }
     }
 
-    fn connect(&mut self, _endpoint: super::Endpoint) -> Result<(), SystemError> {
-        todo!()
+    fn set_peer_handle(&mut self, peer_handle: SocketHandle) {
+        self.peer_handle = Some(peer_handle);
     }
 
-    fn bind(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
-        todo!()
-    }
-
-    fn listen(&mut self, _backlog: usize) -> Result<(), SystemError> {
-        todo!()
-    }
-
-    fn accept(&mut self) -> Result<(Box<dyn Socket>, Endpoint), SystemError> {
+    fn connect(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
         todo!()
     }
 
@@ -1279,7 +1319,7 @@ impl Socket for SeqpacketSocket {
         Ok(self.metadata.clone())
     }
 
-    fn box_clone(&self) -> alloc::boxed::Box<dyn Socket> {
+    fn box_clone(&self) -> Box<dyn Socket> {
         return Box::new(self.clone());
     }
 
@@ -1456,7 +1496,7 @@ impl IndexNode for SocketInode {
             PORT_MANAGER.unbind_port(socket.metadata().unwrap().socket_type, ip.port)?;
         }
 
-        let _ = socket.clear_epoll();
+        socket.clear_epoll()?;
 
         HANDLE_MAP
             .write_irqsave()
@@ -1526,13 +1566,43 @@ pub struct SocketPollMethod;
 impl SocketPollMethod {
     pub fn poll(socket: &socket::Socket, shutdown: ShutdownType) -> EPollEventType {
         match socket {
-            socket::Socket::Raw(_) => todo!(),
+            socket::Socket::Raw(raw) => Self::seqpacket_poll(raw, shutdown), // 这样做是因为Raw类型被用于SeqPacket的实现
             socket::Socket::Icmp(_) => todo!(),
             socket::Socket::Udp(udp) => Self::udp_poll(udp, shutdown),
             socket::Socket::Tcp(tcp) => Self::tcp_poll(tcp, shutdown),
             socket::Socket::Dhcpv4(_) => todo!(),
             socket::Socket::Dns(_) => todo!(),
         }
+    }
+
+    pub fn seqpacket_poll(socket: &socket::raw::Socket, shutdown: ShutdownType) -> EPollEventType {
+        let mut event = EPollEventType::empty();
+
+        if shutdown.contains(ShutdownType::RCV_SHUTDOWN) {
+            event.insert(
+                EPollEventType::EPOLLRDHUP | EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+            );
+        }
+        if shutdown.contains(ShutdownType::SHUTDOWN_MASK) {
+            event.insert(EPollEventType::EPOLLHUP);
+        }
+
+        if socket.can_recv() {
+            event.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
+        }
+        
+        if socket.can_send() {
+            event.insert(
+                EPollEventType::EPOLLOUT
+                    | EPollEventType::EPOLLWRNORM
+                    | EPollEventType::EPOLLWRBAND,
+            );
+        } else {
+            // TODO: 缓冲区空间不够，需要使用信号处理
+            todo!()
+        }
+
+        return event;
     }
 
     pub fn tcp_poll(socket: &socket::tcp::Socket, shutdown: ShutdownType) -> EPollEventType {

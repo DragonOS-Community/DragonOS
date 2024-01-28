@@ -93,9 +93,8 @@ bitflags! {
 }
 
 #[derive(Debug)]
-pub struct ExecParam<'a> {
-    file_path: &'a str,
-    file: Option<File>,
+pub struct ExecParam {
+    file: File,
     vm: Arc<AddressSpace>,
     /// 一些标志位
     flags: ExecParamFlags,
@@ -112,19 +111,23 @@ pub enum ExecLoadMode {
 }
 
 #[allow(dead_code)]
-impl<'a> ExecParam<'a> {
-    pub fn new(file_path: &'a str, vm: Arc<AddressSpace>, flags: ExecParamFlags) -> Self {
-        Self {
-            file_path,
-            file: None,
+impl ExecParam {
+    pub fn new(
+        file_path: &str,
+        vm: Arc<AddressSpace>,
+        flags: ExecParamFlags,
+    ) -> Result<Self, SystemError> {
+        let inode = ROOT_INODE().lookup(file_path)?;
+
+        // 读取文件头部，用于判断文件类型
+        let file = File::new(inode, FileMode::O_RDONLY)?;
+
+        Ok(Self {
+            file,
             vm,
             flags,
             init_info: ProcInitInfo::new(),
-        }
-    }
-
-    pub fn file_path(&self) -> &'a str {
-        self.file_path
+        })
     }
 
     pub fn vm(&self) -> &Arc<AddressSpace> {
@@ -153,17 +156,13 @@ impl<'a> ExecParam<'a> {
     }
 
     pub fn file_mut(&mut self) -> &mut File {
-        self.file.as_mut().unwrap()
+        &mut self.file
     }
 }
 
 /// ## 加载二进制文件
 pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, SystemError> {
-    let inode = ROOT_INODE().lookup(param.file_path)?;
-
     // 读取文件头部，用于判断文件类型
-    let file = File::new(inode, FileMode::O_RDONLY)?;
-    param.file = Some(file);
     let mut head_buf = [0u8; 512];
     param.file_mut().lseek(SeekFrom::SeekSet(0))?;
     let _bytes = param.file_mut().read(512, &mut head_buf)?;

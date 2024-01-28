@@ -4,6 +4,7 @@ mod acpi;
 mod c_adapter;
 pub mod cpu;
 pub mod driver;
+pub mod elf;
 pub mod fpu;
 pub mod init;
 pub mod interrupt;
@@ -33,3 +34,5 @@ pub use kvm::X86_64KVMArch as KVMArch;
 
 pub use crate::arch::ipc::signal::X86_64SignalArch as CurrentSignalArch;
 pub use crate::arch::time::X86_64TimeArch as CurrentTimeArch;
+
+pub use crate::arch::elf::X86_64ElfArch as CurrentElfArch;

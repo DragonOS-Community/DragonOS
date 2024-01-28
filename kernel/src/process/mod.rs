@@ -520,6 +520,8 @@ bitflags! {
         const SIGNALED = 1 << 6;
         /// 进程需要迁移到其他cpu上
         const NEED_MIGRATE = 1 << 7;
+        /// 随机化的虚拟地址空间，主要用于动态链接器的加载
+        const RANDOMIZE = 1 << 8;
     }
 }
 

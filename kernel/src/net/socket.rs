@@ -48,6 +48,7 @@ lazy_static! {
     pub static ref PORT_MANAGER: PortManager = PortManager::new();
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct SocketHandleItem {
     /// socket元数据
@@ -193,8 +194,8 @@ impl PortManager {
             let mut listen_table_guard = match socket_type {
                 SocketType::UdpSocket => self.udp_port_table.lock(),
                 SocketType::TcpSocket => self.tcp_port_table.lock(),
-                SocketType::RawSocket => panic!("RawSocket cann't get a port"),
-                SocketType::SeqpacketSocket => panic!("SeqpacketSocket cann't get a port"),
+                SocketType::RawSocket => panic!("RawSocket cann't bind a port"),
+                SocketType::SeqpacketSocket => panic!("SeqpacketSocket cann't bind a port"),
             };
             match listen_table_guard.get(&port) {
                 Some(_) => return Err(SystemError::EADDRINUSE),
@@ -325,7 +326,7 @@ pub(super) fn new_socket(
             PosixSocketType::Datagram => Box::new(UdpSocket::new(SocketOptions::default())),
             PosixSocketType::Raw => Box::new(RawSocket::new(protocol, SocketOptions::default())),
             PosixSocketType::SeqPacket => {
-                Box::new(SeqpacketSocket::new(protocol, SocketOptions::BLOCK)) // 可能要设置成 default()
+                Box::new(SeqpacketSocket::new(protocol, SocketOptions::default()))
             }
             _ => {
                 return Err(SystemError::EINVAL);
@@ -1259,33 +1260,16 @@ impl Socket for SeqpacketSocket {
             return (Err(SystemError::ENOSYS), Endpoint::SocketHandle(None));
         }
 
-        poll_ifaces();
-        loop {
-            let mut socket_set_guard = SOCKET_SET.lock_irqsave();
-            let socket = socket_set_guard.get_mut::<raw::Socket>(self.handle.0);
+        let mut socket_set_guard = SOCKET_SET.lock_irqsave();
+        let socket = socket_set_guard.get_mut::<raw::Socket>(self.handle.0);
 
-            match socket.recv_slice(buf) {
-                Ok(len) => {
-                    return (Ok(len), Endpoint::SocketHandle(self.peer_handle));
-                }
-                Err(raw::RecvError::Exhausted) => {
-                    if !self.metadata.options.contains(SocketOptions::BLOCK) {
-                        // 如果是非阻塞的socket，就返回错误
-                        return (
-                            Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
-                            Endpoint::SocketHandle(self.peer_handle),
-                        );
-                    }
-                }
-            }
+        let len = if let Ok(len) = socket.recv_slice(buf) {
+            len
+        } else {
+            0
+        };
 
-            drop(socket_set_guard);
-            SocketHandleItem::sleep(
-                self.socket_handle(),
-                EPollEventType::EPOLLIN.bits() as u64,
-                HANDLE_MAP.read_irqsave(),
-            );
-        }
+        (Ok(len), Endpoint::SocketHandle(self.peer_handle))
     }
 
     fn write(&self, buf: &[u8], _to: Option<Endpoint>) -> Result<usize, SystemError> {
@@ -1508,7 +1492,6 @@ impl IndexNode for SocketInode {
             }
         };
 
-        // kdebug!("self: {:#?}", self);
         let mut socket = self.0.lock_irqsave();
         if let Some(Endpoint::Ip(Some(ip))) = socket.endpoint() {
             PORT_MANAGER.unbind_port(socket.metadata().unwrap().socket_type, ip.port)?;

@@ -16,13 +16,14 @@ use crate::{
     libs::spinlock::SpinLock,
     net::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
-        socket::SocketInode,
+        socket::{SocketInode, SocketPrivateData},
     },
     process::ProcessManager,
 };
 
 use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 
+// TODO 这里命名有些乱
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -37,6 +38,8 @@ pub enum FilePrivateData {
     Tty(TtyFilePrivateData),
     /// epoll私有信息
     EPoll(EPollPrivateData),
+    /// Socket私有信息
+    Socket(SocketPrivateData),
     /// 不需要文件私有信息
     Unused,
 }
@@ -592,8 +595,8 @@ impl FileDescriptorVec {
             if let Some(file) = &self.fds[i] {
                 let to_drop = file.lock().close_on_exec();
                 if to_drop {
-                    let r = self.drop_fd(i as i32);
-                    if let Err(r) = r {
+                    // kdebug!("fd to drop: {i}");
+                    if let Err(r) = self.drop_fd(i as i32) {
                         kerror!(
                             "Failed to close file: pid = {:?}, fd = {}, error = {:?}",
                             ProcessManager::current_pcb().pid(),

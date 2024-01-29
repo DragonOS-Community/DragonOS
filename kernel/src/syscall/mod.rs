@@ -131,7 +131,7 @@ impl Syscall {
             }
             SYS_CLOSE => {
                 let fd = args[0];
-
+                // kdebug!("SYS_CLOSE: pid: {:?}, fd: {fd}", crate::process::ProcessManager::current_pcb().pid());
                 let res = Self::close(fd);
 
                 res
@@ -552,7 +552,7 @@ impl Syscall {
                 let mut user_buffer_writer = UserBufferWriter::new(
                     msg,
                     core::mem::size_of::<crate::net::syscall::MsgHdr>(),
-                    true,
+                    frame.from_user(),
                 )?;
                 let buffer = user_buffer_writer.buffer::<crate::net::syscall::MsgHdr>(0)?;
 

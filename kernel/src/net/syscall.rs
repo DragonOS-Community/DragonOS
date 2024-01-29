@@ -9,6 +9,7 @@ use crate::{
     filesystem::vfs::{
         file::{File, FileMode},
         syscall::{IoVec, IoVecs},
+        FilePrivateData,
     },
     libs::spinlock::SpinLockGuard,
     mm::{verify_area, VirtAddr},
@@ -18,7 +19,9 @@ use crate::{
 };
 
 use super::{
-    socket::{new_socket, PosixSocketType, SocketHandleItem, SocketInode, HANDLE_MAP},
+    socket::{
+        new_socket, PosixSocketType, SocketHandleItem, SocketInode, SocketPrivateData, HANDLE_MAP,
+    },
     Endpoint, Protocol, ShutdownType, Socket,
 };
 
@@ -48,7 +51,8 @@ impl Syscall {
             .insert(socket.socket_handle(), handle_item);
         // kdebug!("do_socket: socket: {socket:?}");
         let socketinode: Arc<SocketInode> = SocketInode::new(socket);
-        let f = File::new(socketinode, FileMode::O_RDWR)?;
+        let mut f = File::new(socketinode, FileMode::O_RDWR)?;
+        f.private_data = FilePrivateData::Socket(SocketPrivateData::new());
         // kdebug!("do_socket: f: {f:?}");
         // 把socket添加到当前进程的文件描述符表中
         let binding = ProcessManager::current_pcb().fd_table();
@@ -74,24 +78,26 @@ impl Syscall {
         protocol: usize,
         fds: &mut [i32],
     ) -> Result<usize, SystemError> {
+        // 可能要加上CLOEXEC的判断
         let address_family = AddressFamily::try_from(address_family as u16)?;
         let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
         let protocol = Protocol::from(protocol as u8);
         let mut socket0 = new_socket(address_family, socket_type, protocol)?;
         let mut socket1 = new_socket(address_family, socket_type, protocol)?;
 
-        socket0.set_peer_handle(socket1.socket_handle());
-        socket1.set_peer_handle(socket0.socket_handle());
+        socket0.connect(Endpoint::SocketHandle(Some(socket1.socket_handle())))?;
+        socket1.connect(Endpoint::SocketHandle(Some(socket0.socket_handle())))?;
 
         let mut handle_map = HANDLE_MAP.write_irqsave();
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
 
-        let mut alloc_fd = |socket| -> Result<i32, SystemError> {
+        let mut alloc_fd = |socket: Box<dyn Socket>| -> Result<i32, SystemError> {
             let handle_item = SocketHandleItem::new(&socket);
             handle_map.insert(socket.socket_handle(), handle_item);
             let socketinode = SocketInode::new(socket);
-            let file = File::new(socketinode, FileMode::O_RDWR)?;
+            let mut file = File::new(socketinode, FileMode::O_RDWR)?;
+            file.private_data = FilePrivateData::Socket(SocketPrivateData::new());
             fd_table_guard.alloc_fd(file, None)
         };
 
@@ -398,7 +404,7 @@ impl Syscall {
         }
 
         if SOCK_NONBLOCK != FileMode::O_NONBLOCK && ((flags & SOCK_NONBLOCK.bits()) != 0) {
-            flags = (flags & !SOCK_NONBLOCK.bits()) | FileMode::O_NONBLOCK.bits();
+            flags = (flags & !FileMode::O_NONBLOCK.bits()) | FileMode::O_NONBLOCK.bits();
         }
 
         return Self::do_accept(fd, addr, addrlen, flags);
@@ -424,10 +430,10 @@ impl Syscall {
         let new_socket: Arc<SocketInode> = SocketInode::new(new_socket);
 
         let mut file_mode = FileMode::O_RDWR;
-        if flags & FileMode::O_NONBLOCK.bits() != 0 {
+        if flags & SOCK_NONBLOCK.bits() != 0 {
             file_mode |= FileMode::O_NONBLOCK;
         }
-        if flags & FileMode::O_CLOEXEC.bits() != 0 {
+        if flags & SOCK_CLOEXEC.bits() != 0 {
             file_mode |= FileMode::O_CLOEXEC;
         }
 
@@ -708,10 +714,11 @@ impl From<Endpoint> for SockAddr {
                 };
 
                 return SockAddr { addr_ll };
-            } // _ => {
-              //     // todo: support other endpoint, like Netlink...
-              //     unimplemented!("not support {value:?}");
-              // }
+            }
+            _ => {
+                // todo: support other endpoint, like Netlink...
+                unimplemented!("not support {value:?}");
+            }
         }
     }
 }

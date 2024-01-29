@@ -1,5 +1,3 @@
-use core::cmp::min;
-
 use alloc::{
     boxed::Box,
     collections::LinkedList,
@@ -21,7 +19,10 @@ use system_error::SystemError;
 use crate::{
     arch::{rand::rand, sched::sched},
     driver::net::NetDriver,
-    filesystem::vfs::{syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata},
+    filesystem::vfs::{
+        file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode,
+        Metadata,
+    },
     kerror, kwarn,
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -258,7 +259,7 @@ pub enum SocketType {
     TcpSocket,
     /// 用于Udp通信的 Socket
     UdpSocket,
-    /// Seqpacket的Socket
+    /// 用于进程间通信的 Socket
     SeqpacketSocket,
 }
 
@@ -324,7 +325,7 @@ pub(super) fn new_socket(
             PosixSocketType::Datagram => Box::new(UdpSocket::new(SocketOptions::default())),
             PosixSocketType::Raw => Box::new(RawSocket::new(protocol, SocketOptions::default())),
             PosixSocketType::SeqPacket => {
-                Box::new(SeqpacketSocket::new(protocol, SocketOptions::default()))
+                Box::new(SeqpacketSocket::new(protocol, SocketOptions::BLOCK)) // 可能要设置成 default()
             }
             _ => {
                 return Err(SystemError::EINVAL);
@@ -1255,7 +1256,7 @@ impl Socket for SeqpacketSocket {
     fn read(&mut self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         if self.peer_handle.is_none() {
             kwarn!("SeqpacketSocket is now just for socketpair");
-            return (Err(SystemError::ENOSYS), Endpoint::Ip(None));
+            return (Err(SystemError::ENOSYS), Endpoint::SocketHandle(None));
         }
 
         poll_ifaces();
@@ -1263,21 +1264,18 @@ impl Socket for SeqpacketSocket {
             let mut socket_set_guard = SOCKET_SET.lock_irqsave();
             let socket = socket_set_guard.get_mut::<raw::Socket>(self.handle.0);
 
-            if let Ok(((), packet_buf)) = socket.rx_buffer.dequeue() {
-                let len = min(buf.len(), packet_buf.len());
-                buf[..len].copy_from_slice(&packet_buf[..len]);
-                let packet = wire::Ipv4Packet::new_unchecked(buf);
-                return (
-                    Ok(len),
-                    Endpoint::Ip(Some(wire::IpEndpoint {
-                        addr: wire::IpAddress::Ipv4(packet.src_addr()),
-                        port: 0,
-                    })),
-                );
-            } else {
-                if !self.metadata.options.contains(SocketOptions::BLOCK) {
-                    // 如果是非阻塞的socket，就返回错误
-                    return (Err(SystemError::EAGAIN_OR_EWOULDBLOCK), Endpoint::Ip(None));
+            match socket.recv_slice(buf) {
+                Ok(len) => {
+                    return (Ok(len), Endpoint::SocketHandle(self.peer_handle));
+                }
+                Err(raw::RecvError::Exhausted) => {
+                    if !self.metadata.options.contains(SocketOptions::BLOCK) {
+                        // 如果是非阻塞的socket，就返回错误
+                        return (
+                            Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+                            Endpoint::SocketHandle(self.peer_handle),
+                        );
+                    }
                 }
             }
 
@@ -1307,12 +1305,17 @@ impl Socket for SeqpacketSocket {
         }
     }
 
-    fn set_peer_handle(&mut self, peer_handle: SocketHandle) {
-        self.peer_handle = Some(peer_handle);
+    fn connect(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
+        if let Endpoint::SocketHandle(peer_handler) = endpoint {
+            self.peer_handle = peer_handler;
+            return Ok(());
+        } else {
+            return Err(SystemError::EINVAL);
+        };
     }
 
-    fn connect(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
-        todo!()
+    fn peer_endpoint(&self) -> Option<Endpoint> {
+        Some(Endpoint::SocketHandle(self.peer_handle))
     }
 
     fn metadata(&self) -> Result<SocketMetadata, SystemError> {
@@ -1459,6 +1462,17 @@ impl TryFrom<u8> for PosixSocketType {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SocketPrivateData {
+    pub count: usize,
+}
+
+impl SocketPrivateData {
+    pub fn new() -> Self {
+        Self { count: 1 }
+    }
+}
+
 /// @brief Socket在文件系统中的inode封装
 #[derive(Debug)]
 pub struct SocketInode(SpinLock<Box<dyn Socket>>);
@@ -1479,18 +1493,22 @@ impl SocketInode {
 }
 
 impl IndexNode for SocketInode {
-    fn open(
-        &self,
-        _data: &mut crate::filesystem::vfs::FilePrivateData,
-        _mode: &crate::filesystem::vfs::file::FileMode,
-    ) -> Result<(), SystemError> {
-        return Ok(());
+    fn open(&self, data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+        if let FilePrivateData::Socket(data) = data {
+            data.count += 1;
+        }
+        Ok(())
     }
 
-    fn close(
-        &self,
-        _data: &mut crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<(), SystemError> {
+    fn close(&self, data: &mut FilePrivateData) -> Result<(), SystemError> {
+        if let FilePrivateData::Socket(data) = data {
+            if data.count > 1 {
+                data.count -= 1;
+                return Ok(());
+            }
+        };
+
+        // kdebug!("self: {:#?}", self);
         let mut socket = self.0.lock_irqsave();
         if let Some(Endpoint::Ip(Some(ip))) = socket.endpoint() {
             PORT_MANAGER.unbind_port(socket.metadata().unwrap().socket_type, ip.port)?;
@@ -1502,7 +1520,7 @@ impl IndexNode for SocketInode {
             .write_irqsave()
             .remove(&socket.socket_handle())
             .unwrap();
-        return Ok(());
+        Ok(())
     }
 
     fn read_at(
@@ -1510,7 +1528,7 @@ impl IndexNode for SocketInode {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: &mut crate::filesystem::vfs::FilePrivateData,
+        _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
         return self.0.lock_no_preempt().read(&mut buf[0..len]).0;
     }
@@ -1520,7 +1538,7 @@ impl IndexNode for SocketInode {
         _offset: usize,
         len: usize,
         buf: &[u8],
-        _data: &mut crate::filesystem::vfs::FilePrivateData,
+        _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
         return self.0.lock_no_preempt().write(&buf[0..len], None);
     }
@@ -1530,7 +1548,7 @@ impl IndexNode for SocketInode {
         return Ok(events.bits() as usize);
     }
 
-    fn fs(&self) -> alloc::sync::Arc<dyn crate::filesystem::vfs::FileSystem> {
+    fn fs(&self) -> alloc::sync::Arc<dyn FileSystem> {
         todo!()
     }
 
@@ -1542,7 +1560,7 @@ impl IndexNode for SocketInode {
         return Err(SystemError::ENOTDIR);
     }
 
-    fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
+    fn metadata(&self) -> Result<Metadata, SystemError> {
         let meta = Metadata {
             mode: ModeType::from_bits_truncate(0o755),
             file_type: FileType::Socket,
@@ -1590,7 +1608,7 @@ impl SocketPollMethod {
         if socket.can_recv() {
             event.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
         }
-        
+
         if socket.can_send() {
             event.insert(
                 EPollEventType::EPOLLOUT

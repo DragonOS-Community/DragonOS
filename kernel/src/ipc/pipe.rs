@@ -27,7 +27,7 @@ pub struct PipeFsPrivateData {
 
 impl PipeFsPrivateData {
     pub fn new(mode: FileMode) -> Self {
-        return PipeFsPrivateData { mode: mode };
+        return PipeFsPrivateData { mode };
     }
 
     pub fn set_mode(&mut self, mode: FileMode) {
@@ -153,12 +153,11 @@ impl IndexNode for LockedPipeInode {
         data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
         // 获取mode
-        let mode: FileMode;
-        if let FilePrivateData::Pipefs(pdata) = data {
-            mode = pdata.mode;
+        let mode = if let FilePrivateData::Pipefs(pdata) = data {
+            pdata.mode
         } else {
             return Err(SystemError::EBADF);
-        }
+        };
 
         if buf.len() < len {
             return Err(SystemError::EINVAL);
@@ -272,12 +271,11 @@ impl IndexNode for LockedPipeInode {
     }
 
     fn close(&self, data: &mut FilePrivateData) -> Result<(), SystemError> {
-        let mode: FileMode;
-        if let FilePrivateData::Pipefs(pipe_data) = data {
-            mode = pipe_data.mode;
+        let mode = if let FilePrivateData::Pipefs(pipe_data) = data {
+            pipe_data.mode
         } else {
             return Err(SystemError::EBADF);
-        }
+        };
         let mut guard = self.0.lock();
 
         // 写端关闭

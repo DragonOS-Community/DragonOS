@@ -16,10 +16,10 @@ use crate::{
     libs::{rwlock::RwLock, spinlock::SpinLock},
     net::event_poll::EventPoll,
 };
-use smoltcp::{iface::SocketHandle, wire::IpEndpoint};
+use smoltcp::iface::SocketHandle;
 
 use self::{
-    endpoints::LinkLayerEndpoint,
+    endpoints::Endpoint,
     event_poll::{EPollEventType, EPollItem},
     socket::{SocketMetadata, HANDLE_MAP},
 };
@@ -31,8 +31,7 @@ pub mod socket;
 pub mod syscall;
 
 lazy_static! {
-    /// 所有网络接口的列表
-    ///
+    /// # 所有网络接口的列表
     /// 这个列表在中断上下文会使用到，因此需要irqsave
     pub static ref NET_DRIVERS: RwLock<BTreeMap<usize, Arc<dyn NetDriver>>> = RwLock::new(BTreeMap::new());
 }
@@ -53,17 +52,6 @@ bitflags! {
         const SEND_SHUTDOWN = 2;
         const SHUTDOWN_MASK = 3;
     }
-}
-
-#[derive(Debug, Clone)]
-pub enum Endpoint {
-    /// 链路层端点
-    LinkLayer(LinkLayerEndpoint),
-    /// 网络层端点
-    Ip(Option<IpEndpoint>),
-    /// SocketHandle端点
-    SocketHandle(Option<SocketHandle>),
-    // todo: 增加NetLink机制后，增加NetLink端点
 }
 
 pub trait Socket: Sync + Send + Debug {

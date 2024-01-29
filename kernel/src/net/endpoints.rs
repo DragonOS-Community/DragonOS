@@ -1,4 +1,15 @@
-pub use smoltcp::wire::IpEndpoint;
+use smoltcp::{iface::SocketHandle, wire::IpEndpoint};
+
+#[derive(Debug, Clone)]
+pub enum Endpoint {
+    /// 链路层端点
+    LinkLayer(LinkLayerEndpoint),
+    /// 网络层端点
+    Ip(Option<IpEndpoint>),
+    /// SocketHandle端点
+    SocketHandle(Option<SocketHandle>),
+    // todo: 增加NetLink机制后，增加NetLink端点
+}
 
 /// @brief 链路层端点
 #[derive(Debug, Clone)]

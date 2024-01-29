@@ -8,7 +8,7 @@
             "name": "gdb",
             "type": "cppdbg",
             "request": "launch",
-            "program": "bin/kernel/kernel.elf",
+            "program": "${workspaceFolder}/bin/kernel/kernel.elf",
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "externalConsole": false,

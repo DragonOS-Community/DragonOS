@@ -9,7 +9,6 @@ use crate::{
     filesystem::vfs::{
         file::{File, FileMode},
         syscall::{IoVec, IoVecs},
-        FilePrivateData,
     },
     libs::spinlock::SpinLockGuard,
     mm::{verify_area, VirtAddr},
@@ -19,9 +18,7 @@ use crate::{
 };
 
 use super::{
-    socket::{
-        new_socket, PosixSocketType, SocketHandleItem, SocketInode, SocketPrivateData, HANDLE_MAP,
-    },
+    socket::{new_socket, PosixSocketType, SocketHandleItem, SocketInode, HANDLE_MAP},
     Endpoint, Protocol, ShutdownType, Socket,
 };
 
@@ -51,8 +48,7 @@ impl Syscall {
             .insert(socket.socket_handle(), handle_item);
         // kdebug!("do_socket: socket: {socket:?}");
         let socketinode: Arc<SocketInode> = SocketInode::new(socket);
-        let mut f = File::new(socketinode, FileMode::O_RDWR)?;
-        f.private_data = FilePrivateData::Socket(SocketPrivateData::new());
+        let f = File::new(socketinode, FileMode::O_RDWR)?;
         // kdebug!("do_socket: f: {f:?}");
         // 把socket添加到当前进程的文件描述符表中
         let binding = ProcessManager::current_pcb().fd_table();
@@ -78,13 +74,12 @@ impl Syscall {
         protocol: usize,
         fds: &mut [i32],
     ) -> Result<usize, SystemError> {
-        // 可能要加上CLOEXEC的判断
         let address_family = AddressFamily::try_from(address_family as u16)?;
         let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
         let protocol = Protocol::from(protocol as u8);
+
         let mut socket0 = new_socket(address_family, socket_type, protocol)?;
         let mut socket1 = new_socket(address_family, socket_type, protocol)?;
-
         socket0.connect(Endpoint::SocketHandle(Some(socket1.socket_handle())))?;
         socket1.connect(Endpoint::SocketHandle(Some(socket0.socket_handle())))?;
 
@@ -96,8 +91,7 @@ impl Syscall {
             let handle_item = SocketHandleItem::new(&socket);
             handle_map.insert(socket.socket_handle(), handle_item);
             let socketinode = SocketInode::new(socket);
-            let mut file = File::new(socketinode, FileMode::O_RDWR)?;
-            file.private_data = FilePrivateData::Socket(SocketPrivateData::new());
+            let file = File::new(socketinode, FileMode::O_RDWR)?;
             fd_table_guard.alloc_fd(file, None)
         };
 

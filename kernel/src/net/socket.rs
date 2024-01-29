@@ -1,3 +1,5 @@
+use core::sync::atomic::AtomicUsize;
+
 use alloc::{
     boxed::Box,
     collections::LinkedList,
@@ -7,11 +9,7 @@ use alloc::{
 use hashbrown::HashMap;
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
-    socket::{
-        self, raw,
-        tcp::{self, State},
-        udp,
-    },
+    socket::{self, raw, tcp, udp},
     wire,
 };
 use system_error::SystemError;
@@ -43,7 +41,7 @@ lazy_static! {
     pub static ref SOCKET_SET: SpinLock<SocketSet<'static >> = SpinLock::new(SocketSet::new(vec![]));
     /// SocketHandle表，每个SocketHandle对应一个SocketHandleItem，
     /// 注意！：在网卡中断中需要拿到这张表的🔓，在获取读锁时应该确保关中断避免死锁
-    pub static ref HANDLE_MAP: RwLock<HashMap<SocketHandle,SocketHandleItem>> = RwLock::new(HashMap::new());
+    pub static ref HANDLE_MAP: RwLock<HashMap<SocketHandle, SocketHandleItem>> = RwLock::new(HashMap::new());
     /// 端口管理器
     pub static ref PORT_MANAGER: PortManager = PortManager::new();
 }
@@ -224,7 +222,7 @@ impl PortManager {
 // See: linux-5.19.10/include/uapi/asm-generic/socket.h#9
 pub const SOL_SOCKET: u8 = 1;
 
-/// @brief socket的句柄管理组件。
+/// # socket的句柄管理组件
 /// 它在smoltcp的SocketHandle上封装了一层，增加更多的功能。
 /// 比如，在socket被关闭时，自动释放socket的资源，通知系统的其他组件。
 #[derive(Debug)]
@@ -1446,24 +1444,13 @@ impl TryFrom<u8> for PosixSocketType {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct SocketPrivateData {
-    pub count: usize,
-}
-
-impl SocketPrivateData {
-    pub fn new() -> Self {
-        Self { count: 1 }
-    }
-}
-
-/// @brief Socket在文件系统中的inode封装
+/// # Socket在文件系统中的inode封装
 #[derive(Debug)]
-pub struct SocketInode(SpinLock<Box<dyn Socket>>);
+pub struct SocketInode(SpinLock<Box<dyn Socket>>, AtomicUsize);
 
 impl SocketInode {
     pub fn new(socket: Box<dyn Socket>) -> Arc<Self> {
-        return Arc::new(Self(SpinLock::new(socket)));
+        Arc::new(Self(SpinLock::new(socket), AtomicUsize::new(0)))
     }
 
     #[inline]
@@ -1477,32 +1464,27 @@ impl SocketInode {
 }
 
 impl IndexNode for SocketInode {
-    fn open(&self, data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
-        if let FilePrivateData::Socket(data) = data {
-            data.count += 1;
-        }
+    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+        self.1.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
-    fn close(&self, data: &mut FilePrivateData) -> Result<(), SystemError> {
-        if let FilePrivateData::Socket(data) = data {
-            if data.count > 1 {
-                data.count -= 1;
-                return Ok(());
+    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+        let prev_ref_count = self.1.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+        if prev_ref_count == 1 {
+            // 最后一次关闭，需要释放
+            let mut socket = self.0.lock_irqsave();
+            if let Some(Endpoint::Ip(Some(ip))) = socket.endpoint() {
+                PORT_MANAGER.unbind_port(socket.metadata().unwrap().socket_type, ip.port)?;
             }
-        };
 
-        let mut socket = self.0.lock_irqsave();
-        if let Some(Endpoint::Ip(Some(ip))) = socket.endpoint() {
-            PORT_MANAGER.unbind_port(socket.metadata().unwrap().socket_type, ip.port)?;
+            socket.clear_epoll()?;
+
+            HANDLE_MAP
+                .write_irqsave()
+                .remove(&socket.socket_handle())
+                .unwrap();
         }
-
-        socket.clear_epoll()?;
-
-        HANDLE_MAP
-            .write_irqsave()
-            .remove(&socket.socket_handle())
-            .unwrap();
         Ok(())
     }
 
@@ -1624,7 +1606,7 @@ impl SocketPollMethod {
         }
 
         let state = socket.state();
-        if state != State::SynSent && state != State::SynReceived {
+        if state != tcp::State::SynSent && state != tcp::State::SynReceived {
             // socket有可读数据
             if socket.can_recv() {
                 events.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
@@ -1642,7 +1624,7 @@ impl SocketPollMethod {
                 // 如果我们的socket关闭了SEND_SHUTDOWN，epoll事件就是EPOLLOUT
                 events.insert(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM);
             }
-        } else if state == State::SynSent {
+        } else if state == tcp::State::SynSent {
             events.insert(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM);
         }
 

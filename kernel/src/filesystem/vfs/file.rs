@@ -16,7 +16,7 @@ use crate::{
     libs::spinlock::SpinLock,
     net::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
-        socket::{SocketInode, SocketPrivateData},
+        socket::SocketInode,
     },
     process::ProcessManager,
 };
@@ -38,8 +38,6 @@ pub enum FilePrivateData {
     Tty(TtyFilePrivateData),
     /// epoll私有信息
     EPoll(EPollPrivateData),
-    /// Socket私有信息
-    Socket(SocketPrivateData),
     /// 不需要文件私有信息
     Unused,
 }

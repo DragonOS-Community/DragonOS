@@ -61,7 +61,6 @@ impl Syscall {
     /// # sys_socketpair系统调用的实际执行函数
     ///
     /// ## 参数
-    ///
     /// - `address_family`: 地址族
     /// - `socket_type`: socket类型
     /// - `protocol`: 传输协议

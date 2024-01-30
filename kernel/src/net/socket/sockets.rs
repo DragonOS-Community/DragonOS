@@ -881,11 +881,10 @@ impl SeqpacketSocket {
     /// 默认的缓冲区大小
     pub const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 
-    /// @brief 创建一个seqpacket的socket
+    /// # 创建一个seqpacket的socket
     ///
-    /// @param options socket的选项
-    ///
-    /// @return 返回创建的seqpacket的socket
+    /// ## 参数
+    /// - `options`: socket的选项
     pub fn new(options: SocketOptions) -> Self {
         let buffer = storage::PacketBuffer::new(
             vec![storage::PacketMetadata::<()>::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],

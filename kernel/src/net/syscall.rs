@@ -18,8 +18,8 @@ use crate::{
 };
 
 use super::{
-    socket::{new_socket, PosixSocketType, SocketHandleItem, SocketInode, HANDLE_MAP},
-    Endpoint, Protocol, ShutdownType, Socket,
+    socket::{new_socket, PosixSocketType, Socket, SocketHandleItem, SocketInode, HANDLE_MAP},
+    Endpoint, Protocol, ShutdownType,
 };
 
 /// Flags for socket, socketpair, accept4
@@ -40,23 +40,21 @@ impl Syscall {
         let address_family = AddressFamily::try_from(address_family as u16)?;
         let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
         let protocol = Protocol::from(protocol as u8);
-        // kdebug!("do_socket: address_family: {address_family:?}, socket_type: {socket_type:?}, protocol: {protocol:?}");
+
         let socket = new_socket(address_family, socket_type, protocol)?;
+
         let handle_item = SocketHandleItem::new(&socket);
         HANDLE_MAP
             .write_irqsave()
             .insert(socket.socket_handle(), handle_item);
-        // kdebug!("do_socket: socket: {socket:?}");
+
         let socketinode: Arc<SocketInode> = SocketInode::new(socket);
         let f = File::new(socketinode, FileMode::O_RDWR)?;
-        // kdebug!("do_socket: f: {f:?}");
         // 把socket添加到当前进程的文件描述符表中
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
-
         let fd = fd_table_guard.alloc_fd(f, None).map(|x| x as usize);
         drop(fd_table_guard);
-        // kdebug!("do_socket: fd: {fd:?}");
         return fd;
     }
 
@@ -80,16 +78,13 @@ impl Syscall {
 
         let mut socket0 = new_socket(address_family, socket_type, protocol)?;
         let mut socket1 = new_socket(address_family, socket_type, protocol)?;
-        socket0.connect(Endpoint::SocketHandle(Some(socket1.socket_handle())))?;
-        socket1.connect(Endpoint::SocketHandle(Some(socket0.socket_handle())))?;
+        socket0.set_peer_buffer_index(socket1.buffer_index());
+        socket1.set_peer_buffer_index(socket0.buffer_index());
 
-        let mut handle_map = HANDLE_MAP.write_irqsave();
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
 
         let mut alloc_fd = |socket: Box<dyn Socket>| -> Result<i32, SystemError> {
-            let handle_item = SocketHandleItem::new(&socket);
-            handle_map.insert(socket.socket_handle(), handle_item);
             let socketinode = SocketInode::new(socket);
             let file = File::new(socketinode, FileMode::O_RDWR)?;
             fd_table_guard.alloc_fd(file, None)

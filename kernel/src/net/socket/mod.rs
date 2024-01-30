@@ -113,9 +113,7 @@ pub trait Socket: Sync + Send + Debug {
     /// @param endpoint 要连接的端点
     ///
     /// @return 返回连接是否成功
-    fn connect(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
-        return Ok(());
-    }
+    fn connect(&mut self, _endpoint: Endpoint) -> Result<(), SystemError>;
 
     /// @brief 对应于POSIX的bind函数，用于绑定到本机指定的端点
     ///
@@ -615,9 +613,9 @@ pub struct SocketMetadata {
     /// socket的类型
     pub socket_type: SocketType,
     /// 接收缓冲区的大小
-    pub recv_buf_size: usize,
+    pub rx_buf_size: usize,
     /// 发送缓冲区的大小
-    pub send_buf_size: usize,
+    pub tx_buf_size: usize,
     /// 元数据的缓冲区的大小
     pub metadata_buf_size: usize,
     /// socket的选项
@@ -627,15 +625,15 @@ pub struct SocketMetadata {
 impl SocketMetadata {
     fn new(
         socket_type: SocketType,
-        recv_buf_size: usize,
-        send_buf_size: usize,
+        rx_buf_size: usize,
+        tx_buf_size: usize,
         metadata_buf_size: usize,
         options: SocketOptions,
     ) -> Self {
         Self {
             socket_type,
-            recv_buf_size,
-            send_buf_size,
+            rx_buf_size,
+            tx_buf_size,
             metadata_buf_size,
             options,
         }

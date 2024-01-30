@@ -593,7 +593,6 @@ impl FileDescriptorVec {
             if let Some(file) = &self.fds[i] {
                 let to_drop = file.lock().close_on_exec();
                 if to_drop {
-                    // kdebug!("fd to drop: {i}");
                     if let Err(r) = self.drop_fd(i as i32) {
                         kerror!(
                             "Failed to close file: pid = {:?}, fd = {}, error = {:?}",

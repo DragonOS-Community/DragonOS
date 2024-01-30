@@ -39,9 +39,9 @@ impl RawSocket {
     /// 元数据的缓冲区的大小
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
     /// 默认的接收缓冲区的大小 receive
-    pub const DEFAULT_RECV_BUF_SIZE: usize = 64 * 1024;
+    pub const DEFAULT_RX_BUF_SIZE: usize = 64 * 1024;
     /// 默认的发送缓冲区的大小 transmiss
-    pub const DEFAULT_SEND_BUF_SIZE: usize = 64 * 1024;
+    pub const DEFAULT_TX_BUF_SIZE: usize = 64 * 1024;
 
     /// @brief 创建一个原始的socket
     ///
@@ -52,11 +52,11 @@ impl RawSocket {
     pub fn new(protocol: Protocol, options: SocketOptions) -> Self {
         let rx_buffer = raw::PacketBuffer::new(
             vec![raw::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
-            vec![0; Self::DEFAULT_RECV_BUF_SIZE],
+            vec![0; Self::DEFAULT_RX_BUF_SIZE],
         );
         let tx_buffer = raw::PacketBuffer::new(
             vec![raw::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
-            vec![0; Self::DEFAULT_SEND_BUF_SIZE],
+            vec![0; Self::DEFAULT_TX_BUF_SIZE],
         );
         let protocol: u8 = protocol.into();
         let socket = raw::Socket::new(
@@ -72,8 +72,8 @@ impl RawSocket {
 
         let metadata = SocketMetadata::new(
             SocketType::RawSocket,
-            Self::DEFAULT_RECV_BUF_SIZE,
-            Self::DEFAULT_SEND_BUF_SIZE,
+            Self::DEFAULT_RX_BUF_SIZE,
+            Self::DEFAULT_TX_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
             options,
         );
@@ -196,6 +196,10 @@ impl Socket for RawSocket {
         }
     }
 
+    fn connect(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     fn metadata(&self) -> Result<SocketMetadata, SystemError> {
         Ok(self.metadata.clone())
     }
@@ -223,9 +227,9 @@ impl UdpSocket {
     /// 元数据的缓冲区的大小
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
     /// 默认的接收缓冲区的大小 receive
-    pub const DEFAULT_RECV_BUF_SIZE: usize = 64 * 1024;
+    pub const DEFAULT_RX_BUF_SIZE: usize = 64 * 1024;
     /// 默认的发送缓冲区的大小 transmiss
-    pub const DEFAULT_SEND_BUF_SIZE: usize = 64 * 1024;
+    pub const DEFAULT_TX_BUF_SIZE: usize = 64 * 1024;
 
     /// @brief 创建一个udp的socket
     ///
@@ -235,11 +239,11 @@ impl UdpSocket {
     pub fn new(options: SocketOptions) -> Self {
         let rx_buffer = udp::PacketBuffer::new(
             vec![udp::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
-            vec![0; Self::DEFAULT_RECV_BUF_SIZE],
+            vec![0; Self::DEFAULT_RX_BUF_SIZE],
         );
         let tx_buffer = udp::PacketBuffer::new(
             vec![udp::PacketMetadata::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
-            vec![0; Self::DEFAULT_SEND_BUF_SIZE],
+            vec![0; Self::DEFAULT_TX_BUF_SIZE],
         );
         let socket = udp::Socket::new(rx_buffer, tx_buffer);
 
@@ -249,8 +253,8 @@ impl UdpSocket {
 
         let metadata = SocketMetadata::new(
             SocketType::UdpSocket,
-            Self::DEFAULT_RECV_BUF_SIZE,
-            Self::DEFAULT_SEND_BUF_SIZE,
+            Self::DEFAULT_RX_BUF_SIZE,
+            Self::DEFAULT_TX_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
             options,
         );
@@ -390,7 +394,6 @@ impl Socket for UdpSocket {
         );
     }
 
-    /// @brief
     fn connect(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(_) = endpoint {
             self.remote_endpoint = Some(endpoint);
@@ -463,9 +466,9 @@ impl TcpSocket {
     /// 元数据的缓冲区的大小
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
     /// 默认的接收缓冲区的大小 receive
-    pub const DEFAULT_RECV_BUF_SIZE: usize = 512 * 1024;
+    pub const DEFAULT_RX_BUF_SIZE: usize = 512 * 1024;
     /// 默认的发送缓冲区的大小 transmiss
-    pub const DEFAULT_SEND_BUF_SIZE: usize = 512 * 1024;
+    pub const DEFAULT_TX_BUF_SIZE: usize = 512 * 1024;
 
     /// TcpSocket的特殊事件，用于在事件等待队列上sleep
     pub const CAN_CONNECT: u64 = 1u64 << 63;
@@ -477,8 +480,8 @@ impl TcpSocket {
     ///
     /// @return 返回创建的tcp的socket
     pub fn new(options: SocketOptions) -> Self {
-        let rx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_RECV_BUF_SIZE]);
-        let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_SEND_BUF_SIZE]);
+        let rx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_RX_BUF_SIZE]);
+        let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_TX_BUF_SIZE]);
         let socket = tcp::Socket::new(rx_buffer, tx_buffer);
 
         // 把socket添加到socket集合中，并得到socket的句柄
@@ -487,8 +490,8 @@ impl TcpSocket {
 
         let metadata = SocketMetadata::new(
             SocketType::TcpSocket,
-            Self::DEFAULT_RECV_BUF_SIZE,
-            Self::DEFAULT_SEND_BUF_SIZE,
+            Self::DEFAULT_RX_BUF_SIZE,
+            Self::DEFAULT_TX_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
             options,
         );
@@ -764,8 +767,8 @@ impl Socket for TcpSocket {
 
                 let new_socket = {
                     // Initialize the TCP socket's buffers.
-                    let rx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_RECV_BUF_SIZE]);
-                    let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_SEND_BUF_SIZE]);
+                    let rx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_RX_BUF_SIZE]);
+                    let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_TX_BUF_SIZE]);
                     // The new TCP socket used for sending and receiving data.
                     let mut tcp_socket = tcp::Socket::new(rx_buffer, tx_buffer);
                     self.do_listen(&mut tcp_socket, endpoint)
@@ -790,8 +793,8 @@ impl Socket for TcpSocket {
 
                     let metadata = SocketMetadata::new(
                         SocketType::TcpSocket,
-                        Self::DEFAULT_SEND_BUF_SIZE,
-                        Self::DEFAULT_RECV_BUF_SIZE,
+                        Self::DEFAULT_TX_BUF_SIZE,
+                        Self::DEFAULT_RX_BUF_SIZE,
                         Self::DEFAULT_METADATA_BUF_SIZE,
                         self.metadata.options,
                     );
@@ -955,6 +958,10 @@ impl Socket for SeqpacketSocket {
 
     fn set_peer_buffer_index(&mut self, peer_buffer_index: usize) {
         self.peer_buffer_index = Some(peer_buffer_index);
+    }
+
+    fn connect(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
+        todo!()
     }
 
     fn metadata(&self) -> Result<SocketMetadata, SystemError> {

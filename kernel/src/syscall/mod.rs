@@ -131,7 +131,6 @@ impl Syscall {
             }
             SYS_CLOSE => {
                 let fd = args[0];
-                // kdebug!("SYS_CLOSE: pid: {:?}, fd: {fd}", crate::process::ProcessManager::current_pcb().pid());
                 let res = Self::close(fd);
 
                 res
@@ -546,15 +545,13 @@ impl Syscall {
             }
 
             SYS_RECVMSG => {
-                let msg = args[1] as *mut crate::net::syscall::MsgHdr;
+                use crate::net::syscall::MsgHdr;
+                let msg = args[1] as *mut MsgHdr;
                 let flags = args[2] as u32;
 
-                let mut user_buffer_writer = UserBufferWriter::new(
-                    msg,
-                    core::mem::size_of::<crate::net::syscall::MsgHdr>(),
-                    frame.from_user(),
-                )?;
-                let buffer = user_buffer_writer.buffer::<crate::net::syscall::MsgHdr>(0)?;
+                let mut user_buffer_writer =
+                    UserBufferWriter::new(msg, core::mem::size_of::<MsgHdr>(), frame.from_user())?;
+                let buffer = user_buffer_writer.buffer::<MsgHdr>(0)?;
 
                 let msg = &mut buffer[0];
                 Self::recvmsg(args[0], msg, flags)

@@ -148,7 +148,7 @@ impl Syscall {
                 PosixSocketOption::SO_SNDBUF => {
                     // 返回发送缓冲区大小
                     unsafe {
-                        *optval = socket.metadata()?.send_buf_size as u32;
+                        *optval = socket.metadata()?.tx_buf_size as u32;
                         *optlen = core::mem::size_of::<u32>() as u32;
                     }
                     return Ok(0);
@@ -157,7 +157,7 @@ impl Syscall {
                     let optval = optval as *mut u32;
                     // 返回默认的接收缓冲区大小
                     unsafe {
-                        *optval = socket.metadata()?.recv_buf_size as u32;
+                        *optval = socket.metadata()?.rx_buf_size as u32;
                         *optlen = core::mem::size_of::<u32>() as u32;
                     }
                     return Ok(0);

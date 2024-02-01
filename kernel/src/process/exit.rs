@@ -63,19 +63,21 @@ pub fn kernel_wait4(
     }
 
     // 判断pid类型
-    let pidtype = if pid == -1 {
-        PidType::MAX
-    } else if pid < -1 {
+    let pidtype: PidType;
+
+    if pid == -1 {
+        pidtype = PidType::MAX;
+    } else if pid < 0 {
+        pidtype = PidType::PGID;
         kwarn!("kernel_wait4: currently not support pgid, default to wait for pid\n");
         pid = -pid;
-        PidType::PGID
     } else if pid == 0 {
+        pidtype = PidType::PGID;
         kwarn!("kernel_wait4: currently not support pgid, default to wait for pid\n");
         pid = ProcessManager::current_pcb().pid().data() as i64;
-        PidType::PGID
     } else {
-        PidType::PID
-    };
+        pidtype = PidType::PID;
+    }
 
     let pid = Pid(pid as usize);
 

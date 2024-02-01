@@ -4,6 +4,8 @@ use alloc::{boxed::Box, vec::Vec, collections::BTreeMap, borrow::ToOwned};
 
 // use crate::driver::base::block::block_device::BlockIter;
 
+use crate::driver::base::block;
+
 use super::{cache_block::{CacheBlockAddr, CacheBlock}, cache_config:: BLOCK_SIZE, cache_iter::{BlockIter, FailData}};
 // use virtio_drivers::PhysAddr;
 
@@ -24,57 +26,97 @@ impl BlockCache{
 
     pub fn read(lba_id_start:usize,count:usize,buf:&mut [u8])->Result<usize,Vec<FailData>>{
         let block_iter=BlockIter::new(lba_id_start,count,BLOCK_SIZE);
-        let mut success_flag=true;
-        let mut success_vec:Vec<Vec<u8>>=vec![];
-        let mut fail_vec:Vec<FailData>=vec![];
-        let mut index=0;
-        for i in block_iter{
-            match Self::read_one_block(i.iba_id()){
-                Some(x)=>{if success_flag {success_vec.push(x)}},
-                None=>{
-                    success_flag=false;
-                    let f_data=FailData::new(i.iba_id(), index);
-                    fail_vec.push(f_data)
-                }
-            }
-            index+=1;
+        // let mut success_flag=true;
+        // let mut success_vec:Vec<Vec<u8>>=vec![];
+        // let mut fail_vec:Vec<FailData>=vec![];
+        let cache_block_addr=Self::check_able_to_read(block_iter)?;
+        // let mut index=0;
+        // for i in block_iter{
+        //     match Self::read_one_block(i.iba_id()){
+        //         Some(x)=>{if success_flag {success_vec.push(x)}},
+        //         None=>{
+        //             success_flag=false;
+        //             let f_data=FailData::new(i.iba_id(), index);
+        //             fail_vec.push(f_data)
+        //         }
+        //     }
+        //     index+=1;
+        // }
+        assert!(cache_block_addr.len()==block_iter.count());
+        for (index,i) in block_iter.enumerate(){
+            Self::read_one_block(i.iba_id(), cache_block_addr[index],index, buf);
         }
-        if success_flag{
-            // kdebug!("cache hit！");
-            for i in 0..success_vec.len(){
-                buf[i*BLOCK_SIZE..(i+1)*BLOCK_SIZE].copy_from_slice(&success_vec
-                [i]);
-            }
-            return Ok(count);
-        }else{
-            return Err(fail_vec);
-        }
+        // kdebug!("cache hit！");
+        return Ok(count);
+        // if success_flag{
+        //     // kdebug!("cache hit！");
+        //     for i in 0..success_vec.len(){
+        //         buf[i*BLOCK_SIZE..(i+1)*BLOCK_SIZE].copy_from_slice(&success_vec
+        //         [i]);
+        //     }
+        //     return Ok(count);
+        // }else{
+        //     return Err(fail_vec);
+        // }
         
     }
 
-    pub fn read_one_block(lba_id:usize)->Option<Vec<u8>>{
-        //todo:这里实际上最好要在某个合适的地方进行初始化，这里做这个检查只是权宜之计
+    fn check_able_to_read(block_iter:BlockIter)->Result<Vec<CacheBlockAddr>,Vec<FailData>>{
         unsafe {
             if !INITIAL_FLAG{
                 Self::init()
             }   
         }
-
-
+        let mut ans=vec![];
+        let mut success_ans=vec![];
         let mapper=unsafe {
             match &CMAPPER{
                 Some(x)=>{x},
-                None=>{return None}
+                None=>{panic!("cache fail");}
             }
         };
-        let addr=mapper.find(lba_id)?;
+        let mut index=0;
+        for i in block_iter{
+            match mapper.find(i.iba_id()){
+                Some(x)=>{success_ans.push(*x);continue;}
+                None=>{
+                    ans.push(FailData::new(i.iba_id(),index))
+                }
+            }
+            index+=1;
+        }
+        if ans.len()!=0{
+            return Err(ans);
+        }else{
+            return Ok(success_ans);
+        }
+
+    }
+
+#[inline]
+    pub fn read_one_block(lba_id:usize,cache_block_addr:CacheBlockAddr,position:usize,buf:&mut [u8])->Option<usize>{
+        //todo:这里实际上最好要在某个合适的地方进行初始化，这里做这个检查只是权宜之计
+        // unsafe {
+        //     if !INITIAL_FLAG{
+        //         Self::init()
+        //     }   
+        // }
+
+
+        // let mapper=unsafe {
+        //     match &CMAPPER{
+        //         Some(x)=>{x},
+        //         None=>{return None}
+        //     }
+        // };
+        // let addr=mapper.find(lba_id)?;
         let space=unsafe {
             match &CSPACE{
                 Some(x)=>x,
                 None=>{return None}
             }
         };
-        Some(space.read(*addr)?)
+        Some(space.read(cache_block_addr,position,buf)?)
     }
 
     pub fn insert(f_data_vec:Vec<FailData>,data:&[u8])->Result<usize,()>{
@@ -92,20 +134,20 @@ impl BlockCache{
                 Self::init()
             }   
         }
-        let mapper=unsafe {
-            match &mut CMAPPER{
-                Some(x)=>{x},
-                None=>{return None}
-            }
-        };
+        // let mapper=unsafe {
+        //     match &mut CMAPPER{
+        //         Some(x)=>{x},
+        //         None=>{return None}
+        //     }
+        // };
         let space=unsafe {
             match &mut CSPACE{
                 Some(x)=>x,
                 None=>{return None}
             }
         };
-        let addr=space.insert(lba_id,data)?;
-        mapper.insert(lba_id,addr)
+        space.insert(lba_id,data)
+        // mapper.insert(lba_id,addr)
     }
 
     pub fn test_write(lba_id_start:usize,count:usize,data:&[u8])->Result<usize,()>{
@@ -145,12 +187,12 @@ impl CacheSpace{
             frame_selector:FrameSelector::new()
         }
     }
-
-    pub fn read(&self,addr:CacheBlockAddr)->Option<Vec<u8>>{
-        if(addr>self.frame_selector.get_size()){
+#[inline]
+    pub fn read(&self,addr:CacheBlockAddr,position:usize,buf:&mut [u8])->Option<usize>{
+        if addr>self.frame_selector.get_size() {
             return None;
         }else{
-            return Some(self.root[addr.data()].get_data())
+            return Some(self.root[addr.data()].get_data(&mut buf[position*BLOCK_SIZE..(position+1)*BLOCK_SIZE]));
         }
         
     }
@@ -159,20 +201,32 @@ impl CacheSpace{
         todo!()
     }
 
-    pub fn insert(&mut self,lba_id:usize,data:Vec<u8>)->Option<CacheBlockAddr>{
+    pub fn insert(&mut self,lba_id:usize,data:Vec<u8>)->Option<()>{
         let data_block=CacheBlock::from_data(lba_id,data);
-        
+        let mapper=unsafe {
+                match &mut CMAPPER{
+                    Some(x)=>{x},
+                    None=>{return None}
+                }
+            };
         if(self.frame_selector.can_append()){
             let index=self.frame_selector.get_index();
             self.root.push(data_block);
             // kdebug!("index:{},root.len:{}",index.data(),self.root.len());
             assert!(index.data()==self.root.len()-1);
-            Some(index)
+            mapper.insert(lba_id, index);
+            Some(())
         }else{
             let index=self.frame_selector.get_index();
+            let removed_id=self.root[index.data()].get_lba_id();
+            
             self.root[index.data()]=data_block;
-            Some(index)
+            mapper.insert(lba_id, index);
+            mapper.remove(removed_id);
+            Some(())
         }
+        
+
     }
 }
 
@@ -190,7 +244,7 @@ impl CacheMapper{
         self.map.insert(lba_id, caddr)?;
         Some(())
     }
-
+#[inline]
     pub fn find(&self,lba_id:usize)->Option<&CacheBlockAddr>{
         self.map.get(&lba_id)
     }
@@ -211,11 +265,11 @@ struct FrameSelector{
 
 impl FrameSelector{
     pub fn new()->Self{
-        Self { threshold: 131072, size: 0,current:0 }
+        Self { threshold: 1310720, size: 0,current:0 }
     }
 
     pub fn get_index(&mut self)->CacheBlockAddr{
-        if(self.size>=self.threshold){
+        if self.size>=self.threshold{
             let ans=self.current;
             self.current+=1;
             self.current%=self.threshold;

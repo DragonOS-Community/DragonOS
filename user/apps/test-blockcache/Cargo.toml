@@ -1,0 +1,10 @@
+[package]
+name = "test-blockcache"
+version = "0.1.0"
+edition = "2021"
+description = "用于测试blockcac小程序"
+authors = [ "ZZJJWarth <2678328250@qq.com>" ]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]

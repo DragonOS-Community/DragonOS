@@ -21,7 +21,7 @@ impl BlockData{
 #[inline]
     pub fn block_size(&self)->usize{self.block_size}
 }
-
+#[derive(Copy,Clone)]
 pub struct BlockIter{
     iba_id_start:usize,
     count:usize,

@@ -17,7 +17,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::any::Any;
 use system_error::SystemError;
 
-use super::{disk_info::Partition, cache::cached_block_device::BlockCache};
+use super::{disk_info::Partition, cache::{cache_config::TEST_FLAG, cached_block_device::BlockCache}};
 
 /// 该文件定义了 Device 和 BlockDevice 的接口
 /// Notice 设备错误码使用 Posix 规定的 int32_t 的错误码表示，而不是自己定义错误enum
@@ -240,28 +240,39 @@ pub trait BlockDevice: Device {
     fn partitions(&self) -> Vec<Arc<Partition>>;
 
     fn t_read(&self,lba_id_start: BlockId,count: usize,buf: &mut [u8])-> Result<usize, SystemError>{
-        self.read_at(lba_id_start, count, buf)
+        if TEST_FLAG{
+            self.cache_read(lba_id_start, count, buf)
+        }
+        else{
+            self.read_at(lba_id_start, count, buf)
+        }
+        
     }
 
     fn t_write(&self,lba_id_start: BlockId,count: usize,buf: &[u8])-> Result<usize, SystemError>{
-        self.write_at(lba_id_start, count, buf)
+        if TEST_FLAG{
+            self.cache_write(lba_id_start, count, buf)
+        }else{
+            self.write_at(lba_id_start, count, buf)
+        }
+    
+        
     }
 
     fn cache_read(&self,lba_id_start: BlockId,count: usize,buf: &mut [u8])-> Result<usize, SystemError>{
-        static mut c:usize=0;
-        assert!(false);
+        // static mut c:usize=0;
         let cache_response=BlockCache::read(lba_id_start,count,buf);
         match cache_response{
             Ok(x)=>{
                 // assert!(x.len()==self.block_size());
                 
-                unsafe{c+=1;}
-                if unsafe {c%30==0}{
-                    kdebug!("read(id:{:?},count:{},buf)",lba_id_start,count);
-                    kdebug!("cache:{:?}",&buf[100..200]);
-                    self.read_at(lba_id_start, count, buf)?;
-                    kdebug!("read:{:?}",&buf[100..200]);
-                }
+                // unsafe{c+=1;}
+                // if unsafe {c%30==0}{
+                //     kdebug!("read(id:{:?},count:{},buf)",lba_id_start,count);
+                //     kdebug!("cache:{:?}",&buf[100..200]);
+                //     self.read_at(lba_id_start, count, buf)?;
+                //     kdebug!("read:{:?}",&buf[100..200]);
+                // }
                 return Ok(count*512)
             },
             Err(x)=>{
@@ -281,7 +292,6 @@ pub trait BlockDevice: Device {
         // if count!=1{
         //     return self.write_at(lba_id_start, count, buf)
         // }
-        assert!(false);
         let cache_response=BlockCache::test_write(lba_id_start,count,buf);
         self.write_at(lba_id_start, count, buf)
     }

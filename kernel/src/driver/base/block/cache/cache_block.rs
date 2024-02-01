@@ -72,8 +72,13 @@ impl CacheBlock{
     pub fn set_flag(&mut self,flag:CacheBlockFlag)->Option<()>{
         todo!()
     }
+#[inline]
+    pub fn get_data(&self,buf:&mut [u8])->usize{
+        buf.copy_from_slice(&self.data);
+        return BLOCK_SIZE;
+    }
 
-    pub fn get_data(&self)->Vec<u8>{
-        self.data.to_vec()
+    pub fn get_lba_id(&self)->usize{
+        self.lba_id
     }
 }

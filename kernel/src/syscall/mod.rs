@@ -853,10 +853,20 @@ impl Syscall {
             }
             SYS_GETTID => Self::gettid().map(|tid| tid.into()),
             SYS_GETUID => Self::getuid().map(|uid| uid.into()),
+
             SYS_SYSLOG => {
-                kwarn!("SYS_SYSLOG has not yet been implemented");
-                Ok(0)
+                let syslog_action_type = args[0] as usize;
+                let buf_vaddr = args[1];
+                let len = args[2];
+                let from_user = frame.from_user();
+                let mut user_buffer_writer =
+                    UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)?;
+
+                let user_buf = user_buffer_writer.buffer(0)?;
+                let res = Self::do_syslog(syslog_action_type, user_buf, len);
+                res
             }
+
             SYS_GETGID => Self::getgid().map(|gid| gid.into()),
             SYS_SETUID => {
                 kwarn!("SYS_SETUID has not yet been implemented");

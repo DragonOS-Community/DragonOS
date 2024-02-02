@@ -6,6 +6,7 @@
 #![feature(const_for)]
 #![feature(const_mut_refs)]
 #![feature(const_trait_impl)]
+#![feature(const_transmute_copy)]
 #![feature(const_refs_to_cell)]
 #![feature(core_intrinsics)]
 #![feature(c_void_variant)]

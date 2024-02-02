@@ -18,14 +18,14 @@ jobs:
           with:
             path: |
               ~/opt
-            key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('tools/build_gcc_toolchain.sh') }}-${{ hashFiles('tools/install_musl_gcc.sh') }}
+              ~/.bashrc
+            key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('tools/build_gcc_toolchain.sh') }}
         
         - if: ${{ steps.cache-dragonos-gcc.outputs.cache-hit != 'true' }}
           name: build dragonos-gcc
           continue-on-error: true
           run: |
               bash tools/build_gcc_toolchain.sh -f
-              bash tools/install_musl_gcc.sh
         
         - uses: ./.github/actions/install-apt-packages
 
@@ -40,13 +40,15 @@ jobs:
               ~/.cargo
               ~/.rustup
               ~/.bashrc
-            key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ env.dadk_version }}-${{ hashFiles('.github/workflows/cache-toolchain.yml') }}
+              ~/opt
+            key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ env.dadk_version }}-${{ hashFiles('.github/workflows/cache-toolchain.yml') }}-${{ hashFiles('tools/install_musl_gcc.sh') }}
         
         - if: ${{ steps.cache-build-tools.outputs.cache-hit != 'true' }}
           name: Install toolchain
           continue-on-error: false
           run:  | 
-           
+            USE_GITHUB=1 bash tools/install_musl_gcc.sh
+
             cargo install cargo-binutils
             rustup toolchain install nightly-x86_64-unknown-linux-gnu
             rustup toolchain install nightly-2023-01-21-x86_64-unknown-linux-gnu

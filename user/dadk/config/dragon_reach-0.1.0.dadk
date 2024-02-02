@@ -5,8 +5,8 @@
   "task_type": {
     "BuildFromSource": {
       "Git": {
-        "url" : "https://github.com/yuyi2439/DragonReach",
-        "branch": "refactor-with-musl"
+        "url" : "https://git.mirrors.dragonos.org.cn/DragonOS-Community/DragonReach.git",
+        "revision": "7c7ad4f026"
       }
     }
   },

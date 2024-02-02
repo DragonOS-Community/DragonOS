@@ -56,7 +56,7 @@ impl KernelAllocator {
     }
 }
 
-/// 为内核SLAB分配器实现LocalAlloc的trait
+/// 为内核分配器实现LocalAlloc的trait
 impl LocalAlloc for KernelAllocator {
     unsafe fn local_alloc(&self, layout: Layout) -> *mut u8 {
         return self
@@ -84,7 +84,7 @@ impl LocalAlloc for KernelAllocator {
 /// 为内核slab分配器实现GlobalAlloc特性
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let r = self.local_alloc(layout);
+        let r = self.local_alloc_zeroed(layout);
         mm_debug_log(
             klog_types::AllocatorLogType::Alloc(AllocLogItem::new(
                 layout.clone(),

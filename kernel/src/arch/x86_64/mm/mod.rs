@@ -8,19 +8,16 @@ use x86::time::rdtsc;
 use x86_64::registers::model_specific::EferFlags;
 
 use crate::driver::tty::serial::serial8250::send_to_default_serial8250_port;
-use crate::filesystem::procfs::kmsg::kmsg_init;
 use crate::include::bindings::bindings::{
     multiboot2_get_load_base, multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t,
     multiboot_tag_load_base_addr_t,
 };
 use crate::libs::align::page_align_up;
 use crate::libs::lib_ui::screen_manager::scm_disable_put_to_window;
-use crate::libs::printk::PrintkWriter;
 use crate::libs::spinlock::SpinLock;
 
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::memblock::mem_block_manager;
-use crate::mm::mmio_buddy::mmio_init;
 use crate::{
     arch::MMArch,
     mm::allocator::{buddy::BuddyAllocator, bump::BumpAllocator},
@@ -34,7 +31,7 @@ use system_error::SystemError;
 
 use core::arch::asm;
 use core::ffi::c_void;
-use core::fmt::{Debug, Write};
+use core::fmt::Debug;
 use core::mem::{self};
 
 use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
@@ -114,6 +111,7 @@ impl MemoryManagementArch for X86_64MMArch {
     /// 物理地址与虚拟地址的偏移量
     /// 0xffff_8000_0000_0000
     const PHYS_OFFSET: usize = Self::PAGE_NEGATIVE_MASK + (Self::PAGE_ADDRESS_SIZE >> 1);
+    const KERNEL_LINK_OFFSET: usize = 0x100000;
 
     // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/include/asm/page_64_types.h#75
     const USER_END_VADDR: VirtAddr =
@@ -154,7 +152,14 @@ impl MemoryManagementArch for X86_64MMArch {
         // 初始化物理内存区域(从multiboot2中获取)
         Self::init_memory_area_from_multiboot2().expect("init memory area failed");
 
-        send_to_default_serial8250_port("x86 64 init end\n\0".as_bytes());
+        kdebug!("bootstrap info: {:?}", unsafe { BOOTSTRAP_MM_INFO });
+        kdebug!("phys[0]=virt[0x{:x}]", unsafe {
+            MMArch::phys_2_virt(PhysAddr::new(0)).unwrap().data()
+        });
+
+        // 初始化内存管理器
+        unsafe { allocator_init() };
+        send_to_default_serial8250_port("x86 64 init done\n\0".as_bytes());
     }
 
     /// @brief 刷新TLB中，关于指定虚拟地址的条目
@@ -397,36 +402,6 @@ impl VirtAddr {
         // 如果x为PHYS_OFFSET，说明虚拟地址的高位全为1，是合法的内核地址
         return x == 0 || x == X86_64MMArch::PHYS_OFFSET;
     }
-}
-
-/// @brief 初始化内存管理模块
-pub fn mm_init() {
-    send_to_default_serial8250_port("mm_init\n\0".as_bytes());
-    PrintkWriter
-        .write_fmt(format_args!("mm_init() called\n"))
-        .unwrap();
-    // printk_color!(GREEN, BLACK, "mm_init() called\n");
-    static _CALL_ONCE: AtomicBool = AtomicBool::new(false);
-    if _CALL_ONCE
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        send_to_default_serial8250_port("mm_init err\n\0".as_bytes());
-        panic!("mm_init() can only be called once");
-    }
-
-    unsafe { X86_64MMArch::init() };
-    kdebug!("bootstrap info: {:?}", unsafe { BOOTSTRAP_MM_INFO });
-    kdebug!("phys[0]=virt[0x{:x}]", unsafe {
-        MMArch::phys_2_virt(PhysAddr::new(0)).unwrap().data()
-    });
-
-    // 初始化内存管理器
-    unsafe { allocator_init() };
-    // enable mmio
-    mmio_init();
-    // enable KMSG
-    kmsg_init();
 }
 
 unsafe fn allocator_init() {
@@ -681,8 +656,8 @@ unsafe fn set_inner_allocator(allocator: BuddyAllocator<MMArch>) {
 pub struct LowAddressRemapping;
 
 impl LowAddressRemapping {
-    // 映射32M
-    const REMAP_SIZE: usize = 32 * 1024 * 1024;
+    // 映射64M
+    const REMAP_SIZE: usize = 64 * 1024 * 1024;
 
     pub unsafe fn remap_at_low_address(
         mapper: &mut crate::mm::page::PageMapper<MMArch, &mut BumpAllocator<MMArch>>,
@@ -716,8 +691,4 @@ impl LowAddressRemapping {
             }
         }
     }
-}
-#[no_mangle]
-pub extern "C" fn rs_mm_init() {
-    mm_init();
 }

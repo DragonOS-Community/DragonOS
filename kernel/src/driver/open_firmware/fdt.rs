@@ -1,10 +1,16 @@
+use core::mem::size_of;
+
 use fdt::{
     node::{FdtNode, NodeProperty},
     Fdt,
 };
 use system_error::SystemError;
 
-use crate::{init::boot_params, libs::rwlock::RwLock};
+use crate::{
+    init::boot_params,
+    libs::rwlock::RwLock,
+    mm::{memblock::mem_block_manager, PhysAddr},
+};
 
 #[inline(always)]
 pub fn open_firmware_fdt_driver() -> &'static OpenFirmwareFdtDriver {
@@ -72,13 +78,13 @@ impl OpenFirmwareFdtDriver {
         if let Some(prop) = node.property("#size-cells") {
             guard.root_size_cells = prop.as_usize().unwrap() as u32;
 
-            kdebug!("fdt_root_size_cells={}", guard.root_size_cells);
+            // kdebug!("fdt_root_size_cells={}", guard.root_size_cells);
         }
 
         if let Some(prop) = node.property("#address-cells") {
             guard.root_addr_cells = prop.as_usize().unwrap() as u32;
 
-            kdebug!("fdt_root_addr_cells={}", guard.root_addr_cells);
+            // kdebug!("fdt_root_addr_cells={}", guard.root_addr_cells);
         }
 
         return Ok(());
@@ -151,41 +157,10 @@ impl OpenFirmwareFdtDriver {
             let total_elements_in_reg = reg.value.len() / ((addr_cells + size_cells) * 4);
 
             for i in 0..total_elements_in_reg {
-                let mut base_index = i * (addr_cells + size_cells);
-                let base: u64;
-                let size: u64;
-                match addr_cells {
-                    1 => {
-                        base = u32::from_be_bytes(
-                            reg.value[base_index..base_index + 4].try_into().unwrap(),
-                        ) as u64;
-                    }
-                    2 => {
-                        base = u64::from_be_bytes(
-                            reg.value[base_index..base_index + 8].try_into().unwrap(),
-                        );
-                    }
-                    _ => {
-                        panic!("addr_cells must be 1 or 2");
-                    }
-                }
-                base_index += addr_cells * 4;
+                let base_index = i * (addr_cells + size_cells);
 
-                match size_cells {
-                    1 => {
-                        size = u32::from_be_bytes(
-                            reg.value[base_index..base_index + 4].try_into().unwrap(),
-                        ) as u64;
-                    }
-                    2 => {
-                        size = u64::from_be_bytes(
-                            reg.value[base_index..base_index + 8].try_into().unwrap(),
-                        );
-                    }
-                    _ => {
-                        panic!("size_cells must be 1 or 2");
-                    }
-                }
+                let (base, base_index) = read_cell(reg.value, base_index, addr_cells);
+                let (size, _) = read_cell(reg.value, base_index, size_cells);
 
                 if size == 0 {
                     continue;
@@ -258,20 +233,21 @@ impl OpenFirmwareFdtDriver {
                 size -= MemBlockManager::MIN_MEMBLOCK_ADDR.data() - base;
                 base = MemBlockManager::MIN_MEMBLOCK_ADDR.data();
             }
-
-            mem_block_manager()
-                .add_block(PhysAddr::new(base), size)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "Failed to add memory block '{:#x}-{:#x}', err={:?}",
-                        base,
-                        base + size,
-                        e
-                    );
-                });
         }
+
+        mem_block_manager()
+            .add_block(PhysAddr::new(base), size)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to add memory block '{:#x}-{:#x}', err={:?}",
+                    base,
+                    base + size,
+                    e
+                );
+            });
     }
 
+    /// 判断设备是否可用
     fn is_device_avaliable(&self, node: &FdtNode) -> bool {
         let status = node.property("status");
         if status.is_none() {
@@ -286,5 +262,190 @@ impl OpenFirmwareFdtDriver {
         }
 
         return false;
+    }
+
+    /// 在UEFI初始化后，扫描FDT中的`/reserved-memory`节点，设置保留的内存
+    ///
+    /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/of/fdt.c#634
+    pub fn early_init_fdt_scan_reserved_mem(&self) {
+        let vaddr = boot_params().read().fdt();
+        if vaddr.is_none() {
+            return;
+        }
+        let vaddr = vaddr.unwrap();
+        let fdt = unsafe { Fdt::from_ptr(vaddr.data() as *const u8) };
+        if fdt.is_err() {
+            return;
+        }
+
+        let fdt = fdt.unwrap();
+        self.early_reserve_fdt_itself(&fdt);
+
+        let reserved_mem_nodes = fdt.memory_reservations();
+
+        for node in reserved_mem_nodes {
+            if node.size() != 0 {
+                let address = PhysAddr::new(node.address() as usize);
+                let size = node.size();
+                kdebug!("Reserve memory: {:?}-{:?}", address, address + size);
+                mem_block_manager().reserve_block(address, size).unwrap();
+            }
+        }
+
+        self.fdt_scan_reserved_mem(&fdt)
+            .expect("Failed to scan reserved memory");
+    }
+
+    /// 保留fdt自身的内存空间
+
+    fn early_reserve_fdt_itself(&self, fdt: &Fdt) {
+        #[cfg(target_arch = "riscv64")]
+        {
+            use crate::libs::align::{page_align_down, page_align_up};
+
+            let fdt_paddr = boot_params().read().arch.fdt_paddr;
+            let rsvd_start = PhysAddr::new(page_align_down(fdt_paddr.data()));
+            let rsvd_size = page_align_up(fdt_paddr.data() - rsvd_start.data() + fdt.total_size());
+            mem_block_manager()
+                .reserve_block(rsvd_start, rsvd_size)
+                .expect("Failed to reserve memory for fdt");
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let _ = fdt;
+        }
+    }
+
+    fn fdt_scan_reserved_mem(&self, fdt: &Fdt) -> Result<(), SystemError> {
+        let node = fdt
+            .find_node("/reserved-memory")
+            .ok_or(SystemError::ENODEV)?;
+
+        for child in node.children() {
+            if !self.is_device_avaliable(&child) {
+                continue;
+            }
+
+            reserved_mem_reserve_reg(&child).ok();
+        }
+
+        return Ok(());
+    }
+
+    fn early_init_dt_reserve_memory(
+        &self,
+        base: PhysAddr,
+        size: usize,
+        nomap: bool,
+    ) -> Result<(), SystemError> {
+        if nomap {
+            if mem_block_manager().is_overlapped(base, size)
+                && mem_block_manager().is_overlapped_with_reserved(base, size)
+            {
+                // 如果内存已经被其他区域预留（即已经被映射），我们不应该允许它被标记为`nomap`，
+                // 但是不需要担心如果该区域不是内存（即不会被映射）的情况。
+                return Err(SystemError::EBUSY);
+            }
+
+            return mem_block_manager().mark_nomap(base, size);
+        }
+
+        return mem_block_manager().reserve_block(base, size);
+    }
+}
+
+#[allow(dead_code)]
+fn reserved_mem_reserve_reg(node: &FdtNode<'_, '_>) -> Result<(), SystemError> {
+    let global_data_guard: crate::libs::rwlock::RwLockReadGuard<'_, FdtGlobalData> =
+        FDT_GLOBAL_DATA.read();
+    let t_len = ((global_data_guard.root_addr_cells + global_data_guard.root_size_cells) as usize)
+        * size_of::<u32>();
+    drop(global_data_guard);
+
+    let reg = node.property("reg").ok_or(SystemError::ENOENT)?;
+
+    let mut reg_size = reg.value.len();
+    if reg_size > 0 && reg_size % t_len != 0 {
+        kerror!(
+            "Reserved memory: invalid reg property in '{}', skipping node.",
+            node.name
+        );
+        return Err(SystemError::EINVAL);
+    }
+    // 每个cell是4字节
+    let addr_cells = FDT_GLOBAL_DATA.read().root_addr_cells as usize;
+    let size_cells = FDT_GLOBAL_DATA.read().root_size_cells as usize;
+
+    let nomap = node.property("no-map").is_some();
+
+    let mut base_index = 0;
+
+    while reg_size >= t_len {
+        let (base, bi) = read_cell(reg.value, base_index, addr_cells);
+        base_index = bi;
+        let (size, bi) = read_cell(reg.value, base_index, size_cells);
+        base_index = bi;
+
+        if size > 0
+            && open_firmware_fdt_driver()
+                .early_init_dt_reserve_memory(PhysAddr::new(base as usize), size as usize, nomap)
+                .is_ok()
+        {
+            kdebug!(
+                "Reserved memory: base={:#x}, size={:#x}, nomap={}",
+                base,
+                size,
+                nomap
+            );
+        } else {
+            kerror!(
+                "Failed to reserve memory: base={:#x}, size={:#x}, nomap={}",
+                base,
+                size,
+                nomap
+            );
+        }
+
+        reg_size -= t_len;
+
+        // todo: linux这里保存了节点，但是我感觉现在还用不着。
+    }
+
+    return Ok(());
+}
+
+/// 从FDT的`reg`属性中读取指定数量的cell，作为一个小端u64返回
+///
+/// ## 参数
+///
+/// - `reg_value`：`reg`属性数组的引用
+/// - `base_index`：起始索引
+/// - `cells`：要读取的cell数量，必须是1或2
+///
+/// ## 返回值
+///
+/// (value, next_base_index)
+fn read_cell(reg_value: &[u8], base_index: usize, cells: usize) -> (u64, usize) {
+    let next_base_index = base_index + cells * 4;
+    match cells {
+        1 => {
+            return (
+                u32::from_be_bytes(reg_value[base_index..base_index + 4].try_into().unwrap())
+                    .try_into()
+                    .unwrap(),
+                next_base_index,
+            );
+        }
+
+        2 => {
+            return (
+                u64::from_be_bytes(reg_value[base_index..base_index + 8].try_into().unwrap()),
+                next_base_index,
+            );
+        }
+        _ => {
+            panic!("cells must be 1 or 2");
+        }
     }
 }

@@ -179,7 +179,6 @@ impl EarlyIoRemap {
         let count = PageFrameCount::from_bytes(slot_guard[idx].size as usize).unwrap();
 
         // 取消映射
-
         unsafe { pseudo_unmap_phys(vaddr, count) };
 
         for i in 0..count.data() {

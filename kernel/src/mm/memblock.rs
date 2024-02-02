@@ -2,7 +2,10 @@ use core::intrinsics::unlikely;
 
 use system_error::SystemError;
 
-use crate::libs::spinlock::{SpinLock, SpinLockGuard};
+use crate::libs::{
+    align::{page_align_down, page_align_up},
+    spinlock::{SpinLock, SpinLockGuard},
+};
 
 use super::{PhysAddr, PhysMemoryArea};
 
@@ -50,7 +53,8 @@ impl MemBlockManager {
     /// 如果添加的区域与已有区域有重叠，会将重叠的区域合并
     #[allow(dead_code)]
     pub fn add_block(&self, base: PhysAddr, size: usize) -> Result<(), SystemError> {
-        return self.add_range(base, size, MemoryAreaAttr::empty());
+        let r = self.add_range(base, size, MemoryAreaAttr::empty());
+        return r;
     }
 
     /// 添加内存区域
@@ -350,11 +354,15 @@ impl MemBlockManager {
 
     fn set_or_clear_flags(
         &self,
-        base: PhysAddr,
-        size: usize,
+        mut base: PhysAddr,
+        mut size: usize,
         set: bool,
         flags: MemoryAreaAttr,
     ) -> Result<(), SystemError> {
+        let rsvd_base = PhysAddr::new(page_align_down(base.data()));
+        size = page_align_up((size as usize) + base.data() - rsvd_base.data());
+        base = rsvd_base;
+
         let mut inner = self.inner.lock();
         let (start_index, end_index) = self.isolate_range(&mut inner, base, size)?;
         for i in start_index..end_index {
@@ -375,10 +383,68 @@ impl MemBlockManager {
         return self.set_or_clear_flags(base, size, true, MemoryAreaAttr::RESERVED);
     }
 
+    /// 判断[base, base+size)与已有区域是否有重叠
+    pub fn is_overlapped(&self, base: PhysAddr, size: usize) -> bool {
+        let inner = self.inner.lock();
+        return self.do_is_overlapped(base, size, false, &inner);
+    }
+
+    /// 判断[base, base+size)与已有Reserved区域是否有重叠
+    pub fn is_overlapped_with_reserved(&self, base: PhysAddr, size: usize) -> bool {
+        let inner = self.inner.lock();
+        return self.do_is_overlapped(base, size, true, &inner);
+    }
+
+    fn do_is_overlapped(
+        &self,
+        base: PhysAddr,
+        size: usize,
+        require_reserved: bool,
+        inner: &SpinLockGuard<'_, InnerMemBlockManager>,
+    ) -> bool {
+        let mut res = false;
+        for i in 0..inner.initial_memory_regions_num {
+            if require_reserved
+                && !inner.initial_memory_regions[i]
+                    .flags
+                    .contains(MemoryAreaAttr::RESERVED)
+            {
+                // 忽略非保留区域
+                continue;
+            }
+
+            let range_base = inner.initial_memory_regions[i].base;
+            let range_end = range_base + inner.initial_memory_regions[i].size;
+            if (base >= range_base && base < range_end)
+                || (base + size > range_base && base + size <= range_end)
+                || (base <= range_base && base + size >= range_end)
+            {
+                res = true;
+                break;
+            }
+        }
+
+        return res;
+    }
+
     /// 生成迭代器
     pub fn to_iter(&self) -> MemBlockIter {
         let inner = self.inner.lock();
-        return MemBlockIter { inner, index: 0 };
+        return MemBlockIter {
+            inner,
+            index: 0,
+            usable_only: false,
+        };
+    }
+
+    /// 生成迭代器，迭代所有可用的物理内存区域
+    pub fn to_iter_available(&self) -> MemBlockIter {
+        let inner = self.inner.lock();
+        return MemBlockIter {
+            inner,
+            index: 0,
+            usable_only: true,
+        };
     }
 
     /// 获取初始内存区域数量
@@ -397,6 +463,7 @@ impl MemBlockManager {
 pub struct MemBlockIter<'a> {
     inner: SpinLockGuard<'a, InnerMemBlockManager>,
     index: usize,
+    usable_only: bool,
 }
 
 #[allow(dead_code)]
@@ -421,6 +488,22 @@ impl<'a> Iterator for MemBlockIter<'a> {
     type Item = PhysMemoryArea;
 
     fn next(&mut self) -> Option<Self::Item> {
+        while self.index < self.inner.initial_memory_regions_num {
+            if self.usable_only {
+                if self.inner.initial_memory_regions[self.index]
+                    .flags
+                    .is_empty()
+                    == false
+                {
+                    self.index += 1;
+                    if self.index >= self.inner.initial_memory_regions_num {
+                        return None;
+                    }
+                    continue;
+                }
+            }
+            break;
+        }
         if self.index >= self.inner.initial_memory_regions_num {
             return None;
         }

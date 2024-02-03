@@ -169,12 +169,8 @@ pub trait Socket: Sync + Send + Debug {
         return None;
     }
 
-    fn buffer_index(&self) -> usize {
-        todo!()
-    }
-
-    fn set_peer_buffer_index(&mut self, _peer_buffer_index: usize) {
-        todo!()
+    fn socketpair_ops(&self) -> Option<&'static dyn SocketpairOps> {
+        None
     }
 
     /// @brief
@@ -278,6 +274,11 @@ impl Clone for Box<dyn Socket> {
     fn clone(&self) -> Box<dyn Socket> {
         self.box_clone()
     }
+}
+
+pub trait SocketpairOps {
+    /// 执行socketpair
+    fn socketpair(&self, socket0: &mut Box<dyn Socket>, socket1: &mut Box<dyn Socket>);
 }
 
 /// # Socket在文件系统中的inode封装

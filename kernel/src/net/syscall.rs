@@ -77,8 +77,11 @@ impl Syscall {
 
         let mut socket0 = new_socket(address_family, socket_type, protocol)?;
         let mut socket1 = new_socket(address_family, socket_type, protocol)?;
-        socket0.set_peer_buffer_index(socket1.buffer_index());
-        socket1.set_peer_buffer_index(socket0.buffer_index());
+
+        socket0
+            .socketpair_ops()
+            .unwrap()
+            .socketpair(&mut socket0, &mut socket1);
 
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();

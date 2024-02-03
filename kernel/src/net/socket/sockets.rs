@@ -1,4 +1,5 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use intertrait::CastFrom;
 use smoltcp::{
     iface::SocketHandle,
     socket::{raw, tcp, udp},
@@ -18,7 +19,7 @@ use crate::{
 
 use super::{
     GlobalSocketHandle, Socket, SocketHandleItem, SocketMetadata, SocketOptions, SocketPollMethod,
-    SocketType, HANDLE_MAP, PORT_MANAGER, SOCKET_BUFFER_SET, SOCKET_SET,
+    SocketType, SocketpairOps, HANDLE_MAP, PORT_MANAGER, SOCKET_BUFFER_SET, SOCKET_SET,
 };
 
 /// @brief 表示原始的socket。原始套接字绕过传输层协议（如 TCP 或 UDP）并提供对网络层协议（如 IP）的直接访问。
@@ -909,6 +910,14 @@ impl SeqpacketSocket {
             peer_buffer_index: None,
         };
     }
+
+    fn buffer_index(&self) -> usize {
+        self.buffer_index
+    }
+
+    fn set_peer_buffer_index(&mut self, peer_buffer_index: usize) {
+        self.peer_buffer_index = Some(peer_buffer_index);
+    }
 }
 
 impl Socket for SeqpacketSocket {
@@ -951,12 +960,8 @@ impl Socket for SeqpacketSocket {
         }
     }
 
-    fn buffer_index(&self) -> usize {
-        self.buffer_index
-    }
-
-    fn set_peer_buffer_index(&mut self, peer_buffer_index: usize) {
-        self.peer_buffer_index = Some(peer_buffer_index);
+    fn socketpair_ops(&self) -> Option<&'static dyn SocketpairOps> {
+        Some(&SeqpacketSocketpairOps)
     }
 
     fn connect(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
@@ -969,5 +974,24 @@ impl Socket for SeqpacketSocket {
 
     fn box_clone(&self) -> Box<dyn Socket> {
         return Box::new(self.clone());
+    }
+}
+
+struct SeqpacketSocketpairOps;
+
+impl SocketpairOps for SeqpacketSocketpairOps {
+    fn socketpair(&self, socket0: &mut Box<dyn Socket>, socket1: &mut Box<dyn Socket>) {
+        let pair0 = unsafe {
+            socket0
+                .mut_any()
+                .downcast_mut_unchecked::<Box<SeqpacketSocket>>()
+        };
+        let pair1 = unsafe {
+            socket1
+                .mut_any()
+                .downcast_mut_unchecked::<Box<SeqpacketSocket>>()
+        };
+        pair0.set_peer_buffer_index(pair1.buffer_index());
+        pair1.set_peer_buffer_index(pair0.buffer_index());
     }
 }

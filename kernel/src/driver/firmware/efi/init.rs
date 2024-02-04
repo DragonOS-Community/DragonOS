@@ -75,6 +75,16 @@ pub fn efi_init() {
         )
         .expect("Failed to reserve memory for EFI mmap table");
 
+    // 保留内核的内存
+    if let Some(info) = efi_manager().inner.read().dragonstub_load_info.clone() {
+        mem_block_manager()
+            .reserve_block(
+                PhysAddr::new(info.paddr as usize),
+                page_align_up(info.size as usize),
+            )
+            .expect("Failed to reserve kernel itself memory");
+    }
+
     // todo: Initialize screen info
 
     kinfo!("UEFI init done!");
@@ -212,7 +222,7 @@ fn reserve_memory_regions() {
     let inner_guard = efi_manager().inner.read_irqsave();
     for md in inner_guard.mmap.iter() {
         let page_count = (PhysPageFrame::new(PhysAddr::new(page_align_up(
-            (md.phys_start + md.page_count << (MMArch::PAGE_SHIFT as u64)) as usize,
+            (md.phys_start + (md.page_count << (MMArch::PAGE_SHIFT as u64))) as usize,
         )))
         .ppn()
             - PhysPageFrame::new(PhysAddr::new(page_align_down(md.phys_start as usize))).ppn())
@@ -220,6 +230,7 @@ fn reserve_memory_regions() {
         let phys_start = page_align_down(md.phys_start as usize);
         let size = (page_count << (MMArch::PAGE_SHIFT as u64)) as usize;
 
+        // kdebug!("Reserve memory region: {:#x}-{:#x}({:#x}), is_memory: {}, is_usable_memory:{}, type: {:?}, att: {:?}", phys_start, phys_start + size, page_count, md.is_memory(), md.is_usable_memory(), md.ty, md.att);
         if md.is_memory() {
             open_firmware_fdt_driver().early_init_dt_add_memory(phys_start as u64, size as u64);
             if !md.is_usable_memory() {

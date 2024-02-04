@@ -42,3 +42,15 @@ impl SchedPriority {
         self.0
     }
 }
+
+pub trait SchedArch {
+    /// 开启当前核心的调度
+    fn enable_sched_local();
+    /// 关闭当前核心的调度
+    fn disable_sched_local();
+
+    /// 在第一次开启调度之前，进行初始化工作。
+    ///
+    /// 注意区别于sched_init，这个函数只是做初始化时钟的工作等等。
+    fn initial_setup_sched_local() {}
+}

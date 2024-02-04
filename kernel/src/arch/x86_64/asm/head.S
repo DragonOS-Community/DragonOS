@@ -417,15 +417,16 @@ repeat_set_idt:
 	pushq	%rax
 
     
+    // 传参
+    movq mb2_info, %rdi
+    movq mb2_magic, %rsi
+    movq %r13, %rdx // GDT size
+    movq %r12, %r10 // IDT size
 
-    movq mb2_info, %r15
-    movq mb2_magic, %r14
-
-    
 	lretq
 
 go_to_kernel:
-    .quad Start_Kernel
+    .quad kernel_main
 
 start_smp:
 

@@ -22,6 +22,7 @@ use self::{
 pub mod allocator;
 pub mod c_adapter;
 pub mod early_ioremap;
+pub mod init;
 pub mod kernel_mapper;
 pub mod memblock;
 pub mod mmio_buddy;
@@ -406,6 +407,11 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
 
     /// 虚拟地址与物理地址的偏移量
     const PHYS_OFFSET: usize;
+
+    /// 内核在链接时被链接到的偏移量
+    const KERNEL_LINK_OFFSET: usize;
+
+    const KERNEL_VIRT_START: usize = Self::PHYS_OFFSET + Self::KERNEL_LINK_OFFSET;
 
     /// 每个页面的大小
     const PAGE_SIZE: usize = 1 << Self::PAGE_SHIFT;

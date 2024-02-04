@@ -10,7 +10,9 @@ use super::{
     platform::platform_bus_init,
 };
 
-pub(super) fn driver_init() -> Result<(), SystemError> {
+/// 初始化设备驱动模型
+#[inline(never)]
+pub fn driver_init() -> Result<(), SystemError> {
     devices_init()?;
     buses_init()?;
     classes_init()?;

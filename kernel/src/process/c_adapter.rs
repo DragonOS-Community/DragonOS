@@ -1,15 +1,10 @@
 use crate::smp::core::smp_get_processor_id;
 
-use super::{kthread::kthread_init, process_init, ProcessManager, __PROCESS_MANAGEMENT_INIT_DONE};
+use super::{process_init, ProcessManager, __PROCESS_MANAGEMENT_INIT_DONE};
 
 #[no_mangle]
 unsafe extern "C" fn rs_process_init() {
     process_init();
-}
-
-#[no_mangle]
-unsafe extern "C" fn rs_kthread_init() {
-    kthread_init();
 }
 
 /// 临时用于获取空闲进程的栈顶的函数，这个函数是为了旧的smp模块的初始化而写在这的

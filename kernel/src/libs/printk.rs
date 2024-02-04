@@ -116,9 +116,10 @@ pub struct Logger;
 
 impl Logger {
     pub fn log(&self, log_level: usize, message: fmt::Arguments) {
-        if unsafe { !KMSG.is_none() } {
+        if unsafe { KMSG.is_some() } {
             let timestamp: TimeSpec = TimeSpec::now();
             let log_level = LogLevel::from(log_level.clone());
+
             let log_message = LogMessage::new(timestamp, log_level, message.to_string());
 
             unsafe { KMSG.as_ref().unwrap().lock_irqsave().push(log_message) };

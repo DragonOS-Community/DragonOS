@@ -68,8 +68,8 @@ pub fn textui_framework() -> Arc<TextUiFramework> {
 }
 
 /// 初始化TEXTUI_FRAMEWORK
-pub unsafe fn textui_framwork_init() {
-    if __TEXTUI_FRAMEWORK.is_none() {
+fn textui_framwork_init() {
+    if unsafe { __TEXTUI_FRAMEWORK.is_none() } {
         kinfo!("textuiframework init");
         let metadata = ScmUiFrameworkMetadata::new("TextUI".to_string(), ScmFramworkType::Text);
         kdebug!("textui metadata: {:?}", metadata);
@@ -93,12 +93,14 @@ pub unsafe fn textui_framwork_init() {
             Arc::new(SpinLock::new(LinkedList::new()));
         window_list.lock().push_back(current_window.clone());
 
-        __TEXTUI_FRAMEWORK = Some(Arc::new(TextUiFramework::new(
-            metadata,
-            window_list,
-            current_window,
-            default_window,
-        )));
+        unsafe {
+            __TEXTUI_FRAMEWORK = Some(Arc::new(TextUiFramework::new(
+                metadata,
+                window_list,
+                current_window,
+                default_window,
+            )))
+        };
 
         scm_register(textui_framework()).expect("register textui framework failed");
         kdebug!("textui framework init success");
@@ -1055,18 +1057,9 @@ pub fn textui_putstr(
 }
 
 /// 初始化text ui框架
-
-#[no_mangle]
-pub extern "C" fn rs_textui_init() -> i32 {
-    let r = textui_init().unwrap_or_else(|e| e.to_posix_errno());
-    if r.is_negative() {
-        send_to_default_serial8250_port("textui init failed.\n\0".as_bytes());
-    }
-    return r;
-}
-
-fn textui_init() -> Result<i32, SystemError> {
-    unsafe { textui_framwork_init() };
+#[inline(never)]
+pub fn textui_init() -> Result<i32, SystemError> {
+    textui_framwork_init();
 
     return Ok(0);
 }

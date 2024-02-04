@@ -106,7 +106,7 @@ impl Hpet {
     }
 
     /// 使能HPET
-    pub(super) fn hpet_enable(&self) -> Result<(), SystemError> {
+    pub fn hpet_enable(&self) -> Result<(), SystemError> {
         // ！！！这里是临时糊代码的，需要在apic重构的时候修改！！！
         let (inner_guard, regs) = unsafe { self.hpet_regs_mut() };
         let freq = regs.frequency();

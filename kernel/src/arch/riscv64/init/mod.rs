@@ -1,13 +1,12 @@
-use core::intrinsics::unreachable;
-
 use fdt::node::FdtNode;
+use system_error::SystemError;
 
 use crate::{
     arch::mm::init::mm_early_init,
     driver::{firmware::efi::init::efi_init, open_firmware::fdt::open_firmware_fdt_driver},
-    init::{boot_params, init_before_mem_init},
+    init::{boot_params, init::start_kernel},
     kdebug, kinfo,
-    mm::{PhysAddr, VirtAddr},
+    mm::{memblock::mem_block_manager, PhysAddr, VirtAddr},
     print, println,
 };
 
@@ -33,30 +32,19 @@ impl ArchBootParams {
     }
 }
 
+static mut BOOT_HARTID: usize = 0;
+static mut BOOT_FDT_PADDR: PhysAddr = PhysAddr::new(0);
+
 #[no_mangle]
 unsafe extern "C" fn kernel_main(hartid: usize, fdt_paddr: usize) -> ! {
     let fdt_paddr = PhysAddr::new(fdt_paddr);
-    // system_reset(sbi::reset::ResetType::Shutdown, sbi::reset::ResetReason::NoReason);
-    init_before_mem_init();
 
-    boot_params().write().arch.fdt_paddr = fdt_paddr;
-    kinfo!(
-        "DragonOS kernel is running on hart {}, fdt address:{:?}",
-        hartid,
-        fdt_paddr
-    );
+    unsafe {
+        BOOT_HARTID = hartid;
+        BOOT_FDT_PADDR = fdt_paddr;
+    }
 
-    mm_early_init();
-
-    let fdt = fdt::Fdt::from_ptr(fdt_paddr.data() as *const u8).expect("Failed to parse fdt!");
-    // print_node(fdt.find_node("/").unwrap(), 0);
-
-    parse_dtb();
-
-    efi_init();
-
-    loop {}
-    unreachable()
+    start_kernel();
 }
 
 #[inline(never)]
@@ -84,4 +72,45 @@ unsafe fn parse_dtb() {
     open_firmware_fdt_driver()
         .early_scan_device_tree()
         .expect("Failed to scan device tree at boottime.");
+}
+
+#[inline(never)]
+pub fn early_setup_arch() -> Result<(), SystemError> {
+    let hartid = unsafe { BOOT_HARTID };
+    let fdt_paddr = unsafe { BOOT_FDT_PADDR };
+    boot_params().write().arch.fdt_paddr = fdt_paddr;
+    kinfo!(
+        "DragonOS kernel is running on hart {}, fdt address:{:?}",
+        hartid,
+        fdt_paddr
+    );
+    mm_early_init();
+
+    let fdt =
+        unsafe { fdt::Fdt::from_ptr(fdt_paddr.data() as *const u8).expect("Failed to parse fdt!") };
+    print_node(fdt.find_node("/").unwrap(), 0);
+
+    unsafe { parse_dtb() };
+
+    for x in mem_block_manager().to_iter() {
+        kdebug!("before efi: {x:?}");
+    }
+
+    efi_init();
+
+    open_firmware_fdt_driver().early_init_fdt_scan_reserved_mem();
+
+    return Ok(());
+}
+
+#[inline(never)]
+pub fn setup_arch() -> Result<(), SystemError> {
+    // todo
+    return Ok(());
+}
+
+#[inline(never)]
+pub fn setup_arch_post() -> Result<(), SystemError> {
+    // todo
+    return Ok(());
 }

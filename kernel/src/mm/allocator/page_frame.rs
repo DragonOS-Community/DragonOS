@@ -78,7 +78,8 @@ impl Iterator for PhysPageFrameIter {
         if unlikely(self.current == self.end) {
             return None;
         }
-        let current = self.current.next();
+        let current: PhysPageFrame = self.current;
+        self.current = self.current.next_by(1);
         return Some(current);
     }
 }

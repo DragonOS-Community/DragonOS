@@ -47,8 +47,9 @@ pub fn ROOT_INODE() -> Arc<dyn IndexNode> {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn vfs_init() -> i32 {
+/// 初始化虚拟文件系统
+#[inline(never)]
+pub fn vfs_init() -> Result<(), SystemError> {
     // 使用Ramfs作为默认的根文件系统
     let ramfs = RamFS::new();
     let mount_fs = MountFS::new(ramfs, None);
@@ -80,7 +81,7 @@ pub extern "C" fn vfs_init() -> i32 {
     if root_entries.len() > 0 {
         kinfo!("Successfully initialized VFS!");
     }
-    return 0;
+    return Ok(());
 }
 
 /// @brief 真正执行伪文件系统迁移的过程

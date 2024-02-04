@@ -10,7 +10,7 @@ use system_error::SystemError;
 use crate::{
     driver::net::NetDriver,
     kerror, kwarn,
-    libs::rwlock::RwLock,
+    libs::{rwlock::RwLock, spinlock::SpinLock},
     net::{
         event_poll::EPollEventType, net_core::poll_ifaces, Endpoint, Protocol, ShutdownType,
         NET_DRIVERS,
@@ -19,7 +19,7 @@ use crate::{
 
 use super::{
     GlobalSocketHandle, Socket, SocketHandleItem, SocketMetadata, SocketOptions, SocketPollMethod,
-    SocketType, SocketpairOps, HANDLE_MAP, PORT_MANAGER, SOCKET_BUFFER_SET, SOCKET_SET,
+    SocketType, SocketpairOps, HANDLE_MAP, PORT_MANAGER, SOCKET_SET,
 };
 
 /// @brief 表示原始的socket。原始套接字绕过传输层协议（如 TCP 或 UDP）并提供对网络层协议（如 IP）的直接访问。
@@ -870,13 +870,13 @@ impl Socket for TcpSocket {
 
 /// # 表示 seqpacket socket
 #[derive(Debug, Clone)]
-pub struct SeqpacketSocket {
+pub struct SeqpacketSocket<'a> {
     metadata: SocketMetadata,
-    buffer_index: usize,
-    peer_buffer_index: Option<usize>,
+    buffer: Arc<SpinLock<storage::PacketBuffer<'a, ()>>>,
+    peer_buffer: Option<Arc<SpinLock<storage::PacketBuffer<'a, ()>>>>,
 }
 
-impl SeqpacketSocket {
+impl<'a> SeqpacketSocket<'a> {
     /// 默认的元数据缓冲区大小
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
     /// 默认的缓冲区大小
@@ -900,36 +900,27 @@ impl SeqpacketSocket {
             options,
         );
 
-        let mut buffer_set_guard = SOCKET_BUFFER_SET.lock_irqsave();
-        buffer_set_guard.push(buffer);
-        let buffer_index = buffer_set_guard.len() - 1;
+        let buffer = Arc::new(SpinLock::new(buffer));
 
         return Self {
             metadata,
-            buffer_index,
-            peer_buffer_index: None,
+            buffer,
+            peer_buffer: None,
         };
     }
 
-    fn buffer_index(&self) -> usize {
-        self.buffer_index
+    fn buffer(&self) -> Arc<SpinLock<storage::PacketBuffer<'a, ()>>> {
+        self.buffer.clone()
     }
 
-    fn set_peer_buffer_index(&mut self, peer_buffer_index: usize) {
-        self.peer_buffer_index = Some(peer_buffer_index);
+    fn set_peer_buffer(&mut self, peer_buffer: Arc<SpinLock<storage::PacketBuffer<'a, ()>>>) {
+        self.peer_buffer = Some(peer_buffer);
     }
 }
 
-impl Socket for SeqpacketSocket {
+impl Socket for SeqpacketSocket<'_> {
     fn read(&mut self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
-        if self.peer_buffer_index.is_none() {
-            kwarn!("SeqpacketSocket is now just for socketpair");
-            return (Err(SystemError::ENOSYS), Endpoint::Unused);
-        }
-
-        let mut buffer_set_guard = SOCKET_BUFFER_SET.lock_irqsave();
-        let buffer = buffer_set_guard.get_mut(self.buffer_index).unwrap();
-
+        let mut buffer = self.buffer.lock_irqsave();
         let len = if let Ok(((), packet_buf)) = buffer.dequeue() {
             let length = core::cmp::min(buf.len(), packet_buf.len());
             buf[..length].copy_from_slice(&packet_buf[..length]);
@@ -942,16 +933,13 @@ impl Socket for SeqpacketSocket {
     }
 
     fn write(&self, buf: &[u8], _to: Option<Endpoint>) -> Result<usize, SystemError> {
-        if self.peer_buffer_index.is_none() {
+        if self.peer_buffer.is_none() {
             kwarn!("SeqpacketSocket is now just for socketpair");
             return Err(SystemError::ENOSYS);
         }
 
-        let mut buffer_set_guard = SOCKET_BUFFER_SET.lock_irqsave();
-        let peer_buffer = buffer_set_guard
-            .get_mut(self.peer_buffer_index.unwrap())
-            .unwrap();
-
+        let binding = self.peer_buffer.clone().unwrap();
+        let mut peer_buffer = binding.lock_irqsave();
         if let Ok(packet_buf) = peer_buffer.enqueue(buf.len(), ()) {
             packet_buf.copy_from_slice(buf);
             return Ok(buf.len());
@@ -964,16 +952,12 @@ impl Socket for SeqpacketSocket {
         Some(&SeqpacketSocketpairOps)
     }
 
-    fn connect(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
-        todo!()
-    }
-
     fn metadata(&self) -> Result<SocketMetadata, SystemError> {
         Ok(self.metadata.clone())
     }
 
     fn box_clone(&self) -> Box<dyn Socket> {
-        return Box::new(self.clone());
+        todo!()
     }
 }
 
@@ -991,7 +975,7 @@ impl SocketpairOps for SeqpacketSocketpairOps {
                 .mut_any()
                 .downcast_mut_unchecked::<Box<SeqpacketSocket>>()
         };
-        pair0.set_peer_buffer_index(pair1.buffer_index());
-        pair1.set_peer_buffer_index(pair0.buffer_index());
+        pair0.set_peer_buffer(pair1.buffer());
+        pair1.set_peer_buffer(pair0.buffer());
     }
 }

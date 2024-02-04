@@ -10,8 +10,7 @@ use alloc::{
 use hashbrown::HashMap;
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
-    socket::{self, tcp},
-    storage,
+    socket::{self, tcp, udp},
 };
 use system_error::SystemError;
 
@@ -47,8 +46,6 @@ lazy_static! {
     pub static ref HANDLE_MAP: RwLock<HashMap<SocketHandle, SocketHandleItem>> = RwLock::new(HashMap::new());
     /// 端口管理器
     pub static ref PORT_MANAGER: PortManager = PortManager::new();
-    /// PacketBuffer的集合
-    pub static ref SOCKET_BUFFER_SET: SpinLock<Vec<storage::PacketBuffer<'static,()>>> = SpinLock::new(Vec::new());
 }
 
 /* For setsockopt(2) */
@@ -113,7 +110,9 @@ pub trait Socket: Sync + Send + Debug {
     /// @param endpoint 要连接的端点
     ///
     /// @return 返回连接是否成功
-    fn connect(&mut self, _endpoint: Endpoint) -> Result<(), SystemError>;
+    fn connect(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
 
     /// @brief 对应于POSIX的bind函数，用于绑定到本机指定的端点
     ///
@@ -787,7 +786,7 @@ impl SocketPollMethod {
         }
     }
 
-    pub fn tcp_poll(socket: &socket::tcp::Socket, shutdown: ShutdownType) -> EPollEventType {
+    pub fn tcp_poll(socket: &tcp::Socket, shutdown: ShutdownType) -> EPollEventType {
         let mut events = EPollEventType::empty();
         if socket.is_listening() && socket.is_active() {
             events.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
@@ -835,7 +834,7 @@ impl SocketPollMethod {
         events
     }
 
-    pub fn udp_poll(socket: &socket::udp::Socket, shutdown: ShutdownType) -> EPollEventType {
+    pub fn udp_poll(socket: &udp::Socket, shutdown: ShutdownType) -> EPollEventType {
         let mut event = EPollEventType::empty();
 
         if shutdown.contains(ShutdownType::RCV_SHUTDOWN) {

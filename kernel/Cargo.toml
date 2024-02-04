@@ -19,6 +19,8 @@ members = [
 default = ["backtrace"]
 # 内核栈回溯
 backtrace = []
+# kvm
+kvm = []
 
 
 # 运行时依赖项

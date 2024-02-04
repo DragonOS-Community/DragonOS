@@ -1,7 +1,6 @@
 use crate::{
     arch::{
         init::{early_setup_arch, setup_arch, setup_arch_post},
-        mm::mm_init,
         CurrentIrqArch, CurrentSMPArch, CurrentSchedArch,
     },
     driver::{base::init::driver_init, tty::init::tty_early_init, video::VideoRefreshManager},
@@ -16,6 +15,7 @@ use crate::{
             textui::textui_init,
         },
     },
+    mm::init::mm_init,
     process::{kthread::kthread_init, process_init, ProcessManager},
     sched::{core::sched_init, SchedArch},
     smp::SMPArch,
@@ -23,7 +23,6 @@ use crate::{
     time::{
         clocksource::clocksource_boot_finish, timekeeping::timekeeping_init, timer::timer_init,
     },
-    virt::kvm::kvm_init,
 };
 
 /// The entry point for the kernel
@@ -46,7 +45,7 @@ pub fn start_kernel() -> ! {
 fn do_start_kernel() {
     init_before_mem_init();
     early_setup_arch().expect("setup_arch failed");
-    mm_init();
+    unsafe { mm_init() };
     scm_reinit().unwrap();
     textui_init().unwrap();
     init_intertrait();
@@ -72,7 +71,8 @@ fn do_start_kernel() {
 
     setup_arch_post().expect("setup_arch_post failed");
 
-    kvm_init();
+    #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
+    crate::virt::kvm::kvm_init();
 }
 
 /// 在内存管理初始化之前，执行的初始化

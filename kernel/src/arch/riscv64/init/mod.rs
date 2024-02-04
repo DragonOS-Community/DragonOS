@@ -7,7 +7,7 @@ use crate::{
     driver::{firmware::efi::init::efi_init, open_firmware::fdt::open_firmware_fdt_driver},
     init::{boot_params, init_before_mem_init},
     kdebug, kinfo,
-    mm::{PhysAddr, VirtAddr},
+    mm::{init::mm_init, memblock::mem_block_manager, PhysAddr, VirtAddr},
     print, println,
 };
 
@@ -49,12 +49,19 @@ unsafe extern "C" fn kernel_main(hartid: usize, fdt_paddr: usize) -> ! {
     mm_early_init();
 
     let fdt = fdt::Fdt::from_ptr(fdt_paddr.data() as *const u8).expect("Failed to parse fdt!");
-    // print_node(fdt.find_node("/").unwrap(), 0);
+    print_node(fdt.find_node("/").unwrap(), 0);
 
     parse_dtb();
 
+    for x in mem_block_manager().to_iter() {
+        kdebug!("before efi: {x:?}");
+    }
+
     efi_init();
 
+    open_firmware_fdt_driver().early_init_fdt_scan_reserved_mem();
+
+    mm_init();
     loop {}
     unreachable()
 }

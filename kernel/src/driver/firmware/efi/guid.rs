@@ -12,6 +12,23 @@ pub static DRAGONSTUB_EFI_PAYLOAD_EFI_GUID: Guid = Guid::new(
     [0xbc, 0xef, 0x98, 0x12, 0x00, 0x31],
 );
 
+pub static EFI_MEMORY_ATTRIBUTES_TABLE_GUID: Guid = Guid::new(
+    unsafe { mem::transmute_copy(&0xdcfa911du32) },
+    unsafe { mem::transmute_copy(&0x26ebu32) },
+    unsafe { mem::transmute_copy(&0x469fu32) },
+    0xa2,
+    0x20,
+    [0x38, 0xb7, 0xdc, 0x46, 0x12, 0x20],
+);
+
+pub static EFI_MEMRESERVE_TABLE_GUID: Guid = Guid::new(
+    unsafe { mem::transmute_copy(&0x888eb0c6u32) },
+    unsafe { mem::transmute_copy(&0x8edeu32) },
+    unsafe { mem::transmute_copy(&0x4ff5u32) },
+    0xa8,
+    0xf0,
+    [0x9a, 0xee, 0x5c, 0xb9, 0x77, 0xc2],
+);
 /// 表示内核被加载到的地址的信息。
 ///
 /// 对应 `DRAGONSTUB_EFI_PAYLOAD_EFI_GUID`

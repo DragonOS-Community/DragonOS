@@ -14,8 +14,9 @@ use crate::{
 };
 
 use super::{
-    allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper, mmio_buddy::mmio_pool,
-    no_init::pseudo_map_phys, page::PageFlags, MemoryManagementArch, PhysAddr, VirtAddr,
+    allocator::page_frame::PageFrameCount, init::mm_init, kernel_mapper::KernelMapper,
+    mmio_buddy::mmio_pool, no_init::pseudo_map_phys, page::PageFlags, MemoryManagementArch,
+    PhysAddr, VirtAddr,
 };
 
 lazy_static! {
@@ -164,4 +165,9 @@ pub unsafe extern "C" fn rs_mmio_release(vaddr: u64, length: u64) -> i32 {
     return mmio_pool()
         .release_mmio(VirtAddr::new(vaddr as usize), length as usize)
         .unwrap_or_else(|err| err.to_posix_errno());
+}
+
+#[no_mangle]
+unsafe extern "C" fn rs_mm_init() {
+    mm_init();
 }

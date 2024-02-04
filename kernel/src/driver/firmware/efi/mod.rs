@@ -35,6 +35,10 @@ struct InnerEFIManager {
     /// runtime services的版本号
     pub runtime_service_version: Option<uefi_raw::table::Revision>,
     pub dragonstub_load_info: Option<DragonStubPayloadEFI>,
+    /// uefi 内存属性表的物理地址
+    pub memory_attribute_table_paddr: Option<PhysAddr>,
+    /// uefi 内存保留表的物理地址
+    pub memreserve_table_paddr: Option<PhysAddr>,
 }
 
 impl EFIManager {
@@ -46,12 +50,20 @@ impl EFIManager {
                 runtime_paddr: None,
                 runtime_service_version: None,
                 dragonstub_load_info: None,
+                memory_attribute_table_paddr: None,
+                memreserve_table_paddr: None,
             }),
         }
     }
 
     pub fn desc_version(&self) -> usize {
         return self.inner.read().mmap.desc_version;
+    }
+
+    /// 内核加载的地址、大小的信息
+    #[allow(dead_code)]
+    pub fn kernel_load_info(&self) -> Option<DragonStubPayloadEFI> {
+        return self.inner.read().dragonstub_load_info;
     }
 
     /// 检查是否为有效的system table表头

@@ -141,7 +141,7 @@ impl<MMA: MemoryManagementArch> FrameAllocator for PseudoAllocator<MMA> {
 /// 并且，内核引导文件必须以4K页为粒度，填写了前100M的内存映射关系。（具体以本文件开头的注释为准）
 #[inline(never)]
 pub unsafe fn pseudo_map_phys(vaddr: VirtAddr, paddr: PhysAddr, count: PageFrameCount) {
-    let flags: PageFlags<MMArch> = PageFlags::new().set_write(true).set_execute(true);
+    let flags: PageFlags<MMArch> = PageFlags::new().set_write(true);
 
     pseudo_map_phys_with_flags(vaddr, paddr, count, flags);
 }
@@ -192,7 +192,6 @@ pub unsafe fn pseudo_map_phys_with_flags(
 #[inline(never)]
 pub unsafe fn pseudo_unmap_phys(vaddr: VirtAddr, count: PageFrameCount) {
     assert!(vaddr.check_aligned(MMArch::PAGE_SIZE));
-    assert!(count.data() == 1);
 
     let mut pseudo_allocator = PseudoAllocator::<MMArch>::new();
 

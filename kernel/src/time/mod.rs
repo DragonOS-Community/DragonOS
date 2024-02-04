@@ -76,7 +76,7 @@ impl TimeSpec {
 
         #[cfg(target_arch = "riscv64")]
         {
-            unimplemented!("TimeSpec::now()")
+            return TimeSpec::new(0, 0);
         }
     }
 }

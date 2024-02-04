@@ -6,7 +6,11 @@ use crate::{
     exception::InterruptArch,
     kdebug, kinfo,
     libs::rwlock::RwLock,
-    time::{jiffies::clocksource_default_clock, timekeep::ktime_get_real_ns, TimeSpec},
+    time::{
+        jiffies::{clocksource_default_clock, jiffies_init},
+        timekeep::ktime_get_real_ns,
+        TimeSpec,
+    },
 };
 
 use super::{
@@ -203,6 +207,7 @@ pub fn do_gettimeofday() -> PosixTimeval {
 }
 
 /// # 初始化timekeeping模块
+#[inline(never)]
 pub fn timekeeping_init() {
     kinfo!("Initializing timekeeping module...");
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
@@ -233,6 +238,7 @@ pub fn timekeeping_init() {
     __ADDED_SEC.store(0, Ordering::SeqCst);
 
     drop(irq_guard);
+    jiffies_init();
     kinfo!("timekeeping_init successfully");
 }
 
@@ -306,9 +312,3 @@ pub fn update_wall_time(delta_us: i64) {
 }
 // TODO timekeeping_adjust
 // TODO wall_to_monotic
-
-// ========= 以下为对C的接口 =========
-#[no_mangle]
-pub extern "C" fn rs_timekeeping_init() {
-    timekeeping_init();
-}

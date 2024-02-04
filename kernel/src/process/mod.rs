@@ -91,6 +91,7 @@ impl SwitchResult {
 #[derive(Debug)]
 pub struct ProcessManager;
 impl ProcessManager {
+    #[inline(never)]
     fn init() {
         static INIT_FLAG: AtomicBool = AtomicBool::new(false);
         if INIT_FLAG

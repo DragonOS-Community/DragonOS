@@ -8,12 +8,17 @@ use kdepends::memoffset::offset_of;
 use system_error::SystemError;
 
 use crate::{
-    arch::process::table::TSSManager, exception::InterruptArch,
-    include::bindings::bindings::cpu_core_info, kdebug, libs::rwlock::RwLock, mm::percpu::PerCpu,
-    process::ProcessManager, smp::core::smp_get_processor_id,
+    arch::process::table::TSSManager,
+    exception::InterruptArch,
+    include::bindings::bindings::{cpu_core_info, smp_init},
+    kdebug,
+    libs::rwlock::RwLock,
+    mm::percpu::PerCpu,
+    process::ProcessManager,
+    smp::{core::smp_get_processor_id, SMPArch},
 };
 
-use super::CurrentIrqArch;
+use super::{acpi::early_acpi_boot_init, CurrentIrqArch};
 
 extern "C" {
     fn smp_ap_start_stage2();
@@ -136,6 +141,25 @@ impl X86_64SmpManager {
     pub fn build_cpu_map(&self) -> Result<(), SystemError> {
         // 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/arch/ia64/kernel/smpboot.c?fi=smp_build_cpu_map#496
         // todo!("build_cpu_map")
+        return Ok(());
+    }
+}
+
+pub struct X86_64SMPArch;
+
+impl SMPArch for X86_64SMPArch {
+    #[inline(never)]
+    fn prepare_cpus() -> Result<(), SystemError> {
+        early_acpi_boot_init()?;
+        X86_64_SMP_MANAGER.build_cpu_map()?;
+        return Ok(());
+    }
+
+    #[inline(never)]
+    fn init() -> Result<(), SystemError> {
+        x86::fence::mfence();
+        unsafe { smp_init() };
+        x86::fence::mfence();
         return Ok(());
     }
 }

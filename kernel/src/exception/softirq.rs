@@ -32,6 +32,7 @@ pub extern "C" fn rs_softirq_init() {
     softirq_init().expect("softirq_init failed");
 }
 
+#[inline(never)]
 pub fn softirq_init() -> Result<(), SystemError> {
     kinfo!("Initializing softirq...");
     unsafe {

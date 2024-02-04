@@ -40,7 +40,7 @@ use self::{
 
 use super::{fpu::FpState, interrupt::TrapFrame, syscall::X86_64GSData, CurrentIrqArch};
 
-mod c_adapter;
+pub mod idle;
 pub mod kthread;
 pub mod syscall;
 pub mod table;

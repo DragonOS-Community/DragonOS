@@ -51,6 +51,7 @@ pub struct MmioBuddyMemPool {
 }
 
 impl MmioBuddyMemPool {
+    #[inline(never)]
     fn new() -> Self {
         let mut free_regions: [MaybeUninit<SpinLock<MmioFreeRegionList>>;
             MMIO_BUDDY_REGION_COUNT as usize] = unsafe { MaybeUninit::uninit().assume_init() };

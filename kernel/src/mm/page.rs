@@ -213,7 +213,7 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
 
             #[cfg(target_arch = "riscv64")]
             {
-                let ppn = ((self.data & (!((1 << 10) - 1))) >> 10) & ((1 << 44) - 1);
+                let ppn = ((self.data & (!((1 << 10) - 1))) >> 10) & ((1 << 54) - 1);
                 super::allocator::page_frame::PhysPageFrame::from_ppn(ppn).phys_address()
             }
         };

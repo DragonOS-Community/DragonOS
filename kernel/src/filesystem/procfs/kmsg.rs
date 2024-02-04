@@ -1,3 +1,5 @@
+use core::sync::atomic::{compiler_fence, Ordering};
+
 use super::log::{LogLevel, LogMessage};
 
 use crate::libs::spinlock::SpinLock;
@@ -16,8 +18,13 @@ pub static mut KMSG: Option<SpinLock<Kmsg>> = None;
 
 /// 初始化KMSG
 pub fn kmsg_init() {
+    kinfo!("kmsg_init");
     let kmsg = SpinLock::new(Kmsg::new());
+
+    compiler_fence(Ordering::SeqCst);
     unsafe { KMSG = Some(kmsg) };
+    compiler_fence(Ordering::SeqCst);
+    kinfo!("kmsg_init done");
 }
 
 /// 日志

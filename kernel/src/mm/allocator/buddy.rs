@@ -110,13 +110,16 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
 
         let remain_areas = &res_areas[0..];
 
-        kdebug!("Remain areas: {:?}", &remain_areas[0..10]);
-        kdebug!("offset_in_remain_area: {:?}", offset_in_remain_area);
-
         for area in remain_areas {
             let mut paddr = (area.area_base_aligned() + offset_in_remain_area).data();
             let mut remain_pages =
                 PageFrameCount::from_bytes(area.area_end_aligned().data() - paddr).unwrap();
+
+            if remain_pages.data() == 0 {
+                continue;
+            }
+            kdebug!("area: {area:?}, paddr: {paddr:#x}, remain_pages: {remain_pages:?}");
+
             total_pages_to_buddy += remain_pages;
 
             if offset_in_remain_area != 0 {

@@ -1,11 +1,20 @@
 use riscv::register::satp;
 use system_error::SystemError;
 
-use crate::mm::{
-    allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage, PhysPageFrame},
-    page::PageFlags,
-    MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
+use crate::{
+    arch::MMArch,
+    libs::spinlock::SpinLock,
+    mm::{
+        allocator::{
+            buddy::BuddyAllocator,
+            page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage, PhysPageFrame},
+        },
+        page::PageFlags,
+        MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
+    },
 };
+
+use self::init::riscv_mm_init;
 
 pub mod bump;
 pub(super) mod init;
@@ -20,6 +29,8 @@ pub(self) static mut KERNEL_END_PA: PhysAddr = PhysAddr::new(0);
 pub(self) static mut KERNEL_BEGIN_VA: VirtAddr = VirtAddr::new(0);
 /// 内核结束虚拟地址
 pub(self) static mut KERNEL_END_VA: VirtAddr = VirtAddr::new(0);
+
+pub(self) static INNER_ALLOCATOR: SpinLock<Option<BuddyAllocator<MMArch>>> = SpinLock::new(None);
 
 /// RiscV64的内存管理架构结构体(sv39)
 #[derive(Debug, Clone, Copy, Hash)]
@@ -65,6 +76,7 @@ impl MemoryManagementArch for RiscV64MMArch {
     const ENTRY_FLAG_DIRTY: usize = (1 << 7);
 
     const PHYS_OFFSET: usize = 0xffff_ffc0_0000_0000;
+    const KERNEL_LINK_OFFSET: usize = 0x1000000;
 
     const USER_END_VADDR: crate::mm::VirtAddr = VirtAddr::new(0x0000_003f_ffff_ffff);
 
@@ -77,8 +89,9 @@ impl MemoryManagementArch for RiscV64MMArch {
     /// 设置1MB的fixmap空间
     const FIXMAP_SIZE: usize = 256 * 4096;
 
+    #[inline(never)]
     unsafe fn init() {
-        todo!()
+        riscv_mm_init().expect("init kernel memory management architecture failed");
     }
 
     unsafe fn invalidate_page(address: VirtAddr) {
@@ -147,7 +160,7 @@ impl MemoryManagementArch for RiscV64MMArch {
 
     fn make_entry(paddr: PhysAddr, page_flags: usize) -> usize {
         let ppn = PhysPageFrame::new(paddr).ppn();
-        let r = ((ppn & ((1 << 44) - 1)) << 10) | page_flags;
+        let r = ((ppn & ((1 << 54) - 1)) << 10) | page_flags;
         return r;
     }
 }
@@ -164,8 +177,10 @@ impl VirtAddr {
 }
 
 /// 获取内核地址默认的页面标志
-pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> PageFlags<A> {
-    unimplemented!("riscv64::kernel_page_flags")
+pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(_virt: VirtAddr) -> PageFlags<A> {
+    PageFlags::from_data(RiscV64MMArch::ENTRY_FLAG_DEFAULT_PAGE)
+        .set_user(false)
+        .set_execute(true)
 }
 
 /// 全局的页帧分配器
@@ -174,15 +189,25 @@ pub struct LockedFrameAllocator;
 
 impl FrameAllocator for LockedFrameAllocator {
     unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
-        unimplemented!("RiscV64 LockedFrameAllocator::allocate")
+        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
+            return allocator.allocate(count);
+        } else {
+            return None;
+        }
     }
 
     unsafe fn free(&mut self, address: crate::mm::PhysAddr, count: PageFrameCount) {
         assert!(count.data().is_power_of_two());
-        unimplemented!("RiscV64 LockedFrameAllocator::free")
+        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
+            return allocator.free(address, count);
+        }
     }
 
     unsafe fn usage(&self) -> PageFrameUsage {
-        unimplemented!("RiscV64 LockedFrameAllocator::usage")
+        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
+            return allocator.usage();
+        } else {
+            panic!("usage error");
+        }
     }
 }

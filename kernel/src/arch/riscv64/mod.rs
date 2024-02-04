@@ -13,6 +13,7 @@ pub mod pio;
 pub mod process;
 pub mod rand;
 pub mod sched;
+pub mod smp;
 pub mod syscall;
 pub mod time;
 
@@ -24,3 +25,7 @@ pub use self::pio::RiscV64PortIOArch as CurrentPortIOArch;
 pub use self::time::RiscV64TimeArch as CurrentTimeArch;
 
 pub use self::elf::RiscV64ElfArch as CurrentElfArch;
+
+pub use crate::arch::smp::RiscV64SMPArch as CurrentSMPArch;
+
+pub use crate::arch::sched::RiscV64SchedArch as CurrentSchedArch;

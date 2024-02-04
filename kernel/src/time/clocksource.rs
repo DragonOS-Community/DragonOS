@@ -836,11 +836,6 @@ pub fn clocksource_boot_finish() {
 }
 
 // ======== 以下为对C的接口 ========
-/// # 完成对clocksource模块的加载
-#[no_mangle]
-pub extern "C" fn rs_clocksource_boot_finish() {
-    clocksource_boot_finish();
-}
 
 /// # 启动watchdog线程的辅助函数
 #[no_mangle]

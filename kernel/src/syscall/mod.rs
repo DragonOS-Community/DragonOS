@@ -59,23 +59,20 @@ extern "C" {
     fn do_put_string(s: *const u8, front_color: u32, back_color: u32) -> usize;
 }
 
-#[no_mangle]
-pub extern "C" fn syscall_init() -> i32 {
-    kinfo!("Initializing syscall...");
-    Syscall::init().expect("syscall init failed");
-    kinfo!("Syscall init successfully!");
-    return 0;
-}
-
 impl Syscall {
     /// 初始化系统调用
+    #[inline(never)]
     pub fn init() -> Result<(), SystemError> {
         static INIT_FLAG: AtomicBool = AtomicBool::new(false);
         let prev = INIT_FLAG.swap(true, Ordering::SeqCst);
         if prev {
             panic!("Cannot initialize syscall more than once!");
         }
-        return crate::arch::syscall::arch_syscall_init();
+        kinfo!("Initializing syscall...");
+        let r = crate::arch::syscall::arch_syscall_init();
+        kinfo!("Syscall init successfully!");
+
+        return r;
     }
     /// @brief 系统调用分发器，用于分发系统调用。
     ///

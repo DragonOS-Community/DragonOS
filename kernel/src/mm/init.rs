@@ -17,6 +17,7 @@ pub enum MMInitStatus {
 /// 内存管理的初始化状态
 static MM_INIT: AtomicMMInitStatus = AtomicMMInitStatus::new(MMInitStatus::NotInit);
 
+#[inline(never)]
 pub unsafe fn mm_init() {
     send_to_default_serial8250_port("mm_init\n\0".as_bytes());
     PrintkWriter

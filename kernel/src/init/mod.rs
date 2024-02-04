@@ -2,16 +2,12 @@ use core::cmp::min;
 
 use crate::{
     arch::init::ArchBootParams,
-    driver::{
-        tty::init::tty_early_init,
-        video::{fbdev::base::BootTimeScreenInfo, VideoRefreshManager},
-    },
-    libs::{lib_ui::screen_manager::scm_init, rwlock::RwLock},
+    driver::video::fbdev::base::BootTimeScreenInfo,
+    libs::rwlock::RwLock,
     mm::{PhysAddr, VirtAddr},
 };
 
-mod c_adapter;
-
+pub mod init;
 pub mod initcall;
 pub mod initial_kthread;
 
@@ -23,16 +19,9 @@ pub fn boot_params() -> &'static RwLock<BootParams> {
     &BOOT_PARAMS
 }
 
+#[inline(never)]
 fn init_intertrait() {
     intertrait::init_caster_map();
-}
-
-/// 在内存管理初始化之前，执行的初始化
-#[inline(never)]
-pub fn init_before_mem_init() {
-    tty_early_init().expect("tty early init failed");
-    let video_ok = unsafe { VideoRefreshManager::video_init().is_ok() };
-    scm_init(video_ok);
 }
 
 #[derive(Debug)]

@@ -23,11 +23,5 @@
   },
   "clean": {
     "clean_command": "make clean"
-  },
-  "envs": [
-    {
-      "key": "__dragonos__",
-      "value": "__dragonos__"
-    }
-  ]
+  }
 }

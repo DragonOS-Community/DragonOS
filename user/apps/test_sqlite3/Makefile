@@ -4,14 +4,14 @@ OBJCOPY=objcopy
 SQLITE_FILENAME=sqlite-amalgamation-3420000
 SQLITE3_DIR=$(shell pwd)/$(SQLITE_FILENAME)
 
-RELIBC_OPT=$(DADK_BUILD_CACHE_DIR_RELIBC_0_1_0)
-CFLAGS=-I $(RELIBC_OPT)/include -I $(SQLITE3_DIR) -D__dragonos__ -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_FLOATING_POINT -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_DEBUG
+MUSL_PATH=$(HOME)/opt/x86_64-linux-musl-cross-gcc-9.4.0/x86_64-linux-musl/
+CFLAGS=-I $(MUSL_PATH)/include -I $(SQLITE3_DIR) -D__dragonos__ -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_FLOATING_POINT -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_DEBUG
 
 tmp_output_dir=$(ROOT_PATH)/bin/tmp/user
 output_dir=$(DADK_BUILD_CACHE_DIR_TEST_SQLITE3_3_42_0)
 
-LIBC_OBJS:=$(shell find $(RELIBC_OPT)/lib -name "*.o" | sort )
-LIBC_OBJS+=$(RELIBC_OPT)/lib/libc.a
+LIBC_OBJS:=$(shell find $(MUSL_PATH)/lib -name "*.o" | sort )
+LIBC_OBJS+=$(MUSL_PATH)/lib/libc.a
 
 .PHONY: all clean download_sqlite3 __download_sqlite3
 

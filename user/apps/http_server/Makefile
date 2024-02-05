@@ -2,14 +2,14 @@ CC=$(DragonOS_GCC)/x86_64-elf-gcc
 LD=ld
 OBJCOPY=objcopy
 # 修改这里，把它改为你的relibc的sysroot路径
-RELIBC_OPT=$(DADK_BUILD_CACHE_DIR_RELIBC_0_1_0)
-CFLAGS=-I $(RELIBC_OPT)/include -D__dragonos__
+MUSL_PATH=$(HOME)/opt/x86_64-linux-musl-cross-gcc-9.4.0/x86_64-linux-musl/
+CFLAGS=-I $(MUSL_PATH)/include
 
 tmp_output_dir=$(ROOT_PATH)/bin/tmp/user
 output_dir=$(DADK_BUILD_CACHE_DIR_HTTP_SERVER_0_1_0)
 
-LIBC_OBJS:=$(shell find $(RELIBC_OPT)/lib -name "*.o" | sort )
-LIBC_OBJS+=$(RELIBC_OPT)/lib/libc.a
+LIBC_OBJS:=$(shell find $(MUSL_PATH)/lib -name "*.o" | sort )
+LIBC_OBJS+=$(MUSL_PATH)/lib/libc.a
 
 all: main.o
 	mkdir -p $(tmp_output_dir)

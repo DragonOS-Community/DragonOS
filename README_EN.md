@@ -1,3 +1,16 @@
+<div align="center">
+  <img width="40%" src="docs/_static/dragonos-logo.svg" alt="dragonos-logo"></br>
+  <h2>打造完全自主可控的数字化未来！</h2>
+
+<a href="https://dragonos.org"><img alt="官网" src="https://img.shields.io/badge/%E5%AE%98%E7%BD%91-DragonOS.org-4c69e4?link=https%3A%2F%2Fbbs.dragonos.org.cn" ></a>
+<a href="https://bbs.dragonos.org.cn"><img alt="bbs" src="https://img.shields.io/badge/BBS-bbs.dragonos.org.cn-purple?link=https%3A%2F%2Fbbs.dragonos.org.cn" ></a>
+
+
+
+--- 
+
+</div>
+
 # DragonOS
 
 **Languages** [中文](README.md)|English
@@ -12,7 +25,7 @@
 
 - Home Page  **[DragonOS.org](https://dragonos.org)**
 - Documentation  **[docs.DragonOS.org](https://docs.dragonos.org)**
-- **To learn about development dynamics and development tasks, please visit DragonOS's zulip community:** [https://DragonOS.zulipchat.com](https://DragonOS.zulipchat.com)
+- **To learn about development dynamics and development tasks, please visit DragonOS's BBS:** [https://bbs.dragonos.org.cn](https://bbs.dragonos.org.cn)
 - Software mirror website **[mirrors.DragonOS.org](https://mirrors.DragonOS.org)**
 - Git mirror website **[git.mirrors.DragonOS.org](https://git.mirrors.DragonOS.org)**
 - QQ group **115763565**
@@ -30,7 +43,7 @@
 
 ## How to join DragonOS ?
 
-&emsp;&emsp;If you are willing to join us, you can visit DragonOS's zulip community, learn about development dynamics and development tasks: [https://DragonOS.zulipchat.com](https://DragonOS.zulipchat.com)
+&emsp;&emsp;If you are willing to join us, you can visit DragonOS's BBS , learn about development dynamics and development tasks: [https://bbs.dragonos.org.cn](https://bbs.dragonos.org.cn)
 
 &emsp;&emsp;Or, you can also bring your ideas, discuss with community members, and create some new functions for DragonOS.
 
@@ -40,7 +53,7 @@
 
 &emsp;&emsp;Or join our development exchange QQ group: **115763565**
 
-&emsp;&emsp;For the discussion of formal issues, we recommend that you use the official language to post on the corresponding section of **[DragonOS's zulip community](https://DragonOS.zulipchat.com)**. Or you can post questions under the issue of this repository.
+&emsp;&emsp;For the discussion of formal issues, we recommend that you use the official language to post on the corresponding section of **[https://bbs.dragonos.org.cn](https://bbs.dragonos.org.cn)**. Or you can post questions under the issue of this repository.
 
 
 ## List of contributors

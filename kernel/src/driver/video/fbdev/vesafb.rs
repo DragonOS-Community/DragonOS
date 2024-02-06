@@ -29,11 +29,12 @@ use crate::{
             },
         },
         tty::serial::serial8250::send_to_default_serial8250_port,
-        video::fbdev::base::{fbmem::frame_buffer_manager, FbVisual},
+        tty_new::virtual_terminal::Color,
+        video::fbdev::base::{fbmem::frame_buffer_manager, FbVisual, FRAME_BUFFER_SET},
     },
     filesystem::{
         kernfs::KernFSInode,
-        sysfs::{file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport},
+        sysfs::{Attribute, AttributeGroup, SysFSOpsSupport},
         vfs::syscall::ModeType,
     },
     include::bindings::bindings::{
@@ -56,32 +57,11 @@ use crate::{
 use super::base::{
     fbmem::FbDevice, BlankMode, BootTimeVideoType, FbAccel, FbActivateFlags, FbId, FbState, FbType,
     FbVModeFlags, FbVarScreenInfo, FbVideoMode, FixedScreenInfo, FrameBuffer, FrameBufferInfo,
-    FrameBufferOps,
+    FrameBufferInfoData, FrameBufferOps,
 };
 
 /// 当前机器上面是否有vesa帧缓冲区
 static HAS_VESA_FB: AtomicBool = AtomicBool::new(false);
-
-lazy_static! {
-    static ref VESAFB_FIX_INFO: RwLock<FixedScreenInfo> = RwLock::new(FixedScreenInfo {
-        id: FixedScreenInfo::name2id("VESA VGA"),
-        fb_type: FbType::PackedPixels,
-        accel: FbAccel::None,
-        ..Default::default()
-    });
-    static ref VESAFB_DEFINED: RwLock<FbVarScreenInfo> = RwLock::new(FbVarScreenInfo {
-        activate: FbActivateFlags::FB_ACTIVATE_NOW,
-        height: None,
-        width: None,
-        right_margin: 32,
-        upper_margin: 16,
-        lower_margin: 4,
-        vsync_len: 4,
-        vmode: FbVModeFlags::FB_VMODE_NONINTERLACED,
-
-        ..Default::default()
-    });
-}
 
 #[derive(Debug)]
 #[cast_to([sync] Device)]
@@ -89,11 +69,34 @@ lazy_static! {
 pub struct VesaFb {
     inner: SpinLock<InnerVesaFb>,
     kobj_state: LockedKObjectState,
+    fb_data: RwLock<FrameBufferInfoData>,
 }
 
 impl VesaFb {
     pub const NAME: &'static str = "vesa_vga";
     pub fn new() -> Self {
+        let var = FbVarScreenInfo {
+            activate: FbActivateFlags::FB_ACTIVATE_NOW,
+            height: None,
+            width: None,
+            right_margin: 32,
+            upper_margin: 16,
+            lower_margin: 4,
+            vsync_len: 4,
+            vmode: FbVModeFlags::FB_VMODE_NONINTERLACED,
+
+            ..Default::default()
+        };
+
+        let fix = FixedScreenInfo {
+            id: FixedScreenInfo::name2id("VESA VGA"),
+            fb_type: FbType::PackedPixels,
+            accel: FbAccel::None,
+            ..Default::default()
+        };
+
+        let mut fb_info_data = FrameBufferInfoData::new(var, fix);
+        fb_info_data.pesudo_palette.resize(256, 0);
         return Self {
             inner: SpinLock::new(InnerVesaFb {
                 bus: None,
@@ -109,8 +112,10 @@ impl VesaFb {
                 fb_id: FbId::INIT,
                 fb_device: None,
                 fb_state: FbState::Suspended,
+                color_map: Default::default(),
             }),
             kobj_state: LockedKObjectState::new(None),
+            fb_data: RwLock::new(fb_info_data),
         };
     }
 }
@@ -130,6 +135,8 @@ struct InnerVesaFb {
     fb_id: FbId,
     fb_device: Option<Arc<FbDevice>>,
     fb_state: FbState,
+
+    color_map: Vec<Color>,
 }
 
 impl FrameBuffer for VesaFb {
@@ -281,12 +288,46 @@ impl FrameBufferOps for VesaFb {
 
     fn fb_set_color_register(
         &self,
-        _regno: u16,
-        _red: u16,
-        _green: u16,
-        _blue: u16,
+        regno: u16,
+        mut red: u16,
+        mut green: u16,
+        mut blue: u16,
     ) -> Result<(), SystemError> {
-        todo!()
+        let mut fb_data = self.framebuffer_info_data().write();
+        let var = fb_data.fb_var;
+        if regno as usize >= fb_data.pesudo_palette.len() {
+            return Err(SystemError::E2BIG);
+        }
+
+        if var.bits_per_pixel == 8 {
+            todo!("vesa_setpalette todo");
+        } else if regno < 16 {
+            match var.bits_per_pixel {
+                16 => {
+                    if var.red.offset == 10 {
+                        // RGB 1:5:5:5
+                        fb_data.pesudo_palette[regno as usize] = ((red as u32 & 0xf800) >> 1)
+                            | ((green as u32 & 0xf800) >> 6)
+                            | ((blue as u32 & 0xf800) >> 11);
+                    } else {
+                        fb_data.pesudo_palette[regno as usize] = (red as u32 & 0xf800)
+                            | ((green as u32 & 0xfc00) >> 5)
+                            | ((blue as u32 & 0xf800) >> 11);
+                    }
+                }
+                24 | 32 => {
+                    red >>= 8;
+                    green >>= 8;
+                    blue >>= 8;
+                    fb_data.pesudo_palette[regno as usize] = ((red as u32) << var.red.offset)
+                        | ((green as u32) << var.green.offset)
+                        | ((blue as u32) << var.blue.offset);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
     }
 
     fn fb_blank(&self, _blank_mode: BlankMode) -> Result<(), SystemError> {
@@ -338,6 +379,49 @@ impl FrameBufferOps for VesaFb {
 
         return Ok(len);
     }
+
+    fn fb_image_blit(&self, image: &super::base::FbImage) {
+        self.generic_imageblit(image);
+
+        // image.draw(dst1, bit_per_pixel, self.current_fb_fix().line_length);
+    }
+
+    /// ## 填充矩形
+    fn fb_fillrect(&self, rect: super::base::FillRectData) -> Result<(), SystemError> {
+        // kwarn!("rect {rect:?}");
+
+        let boot_param = boot_params().read();
+        let screen_base = boot_param
+            .screen_info
+            .lfb_virt_base
+            .ok_or(SystemError::ENODEV)?;
+        let fg;
+        if self.current_fb_fix().visual == FbVisual::TrueColor
+            || self.current_fb_fix().visual == FbVisual::DirectColor
+        {
+            fg = self.fb_data.read().pesudo_palette[rect.color as usize];
+        } else {
+            fg = rect.color;
+        }
+
+        let bpp = self.current_fb_var().bits_per_pixel;
+        // 每行像素数
+        let line_offset = self.current_fb_var().xres;
+        match bpp {
+            32 => {
+                let base = screen_base.as_ptr::<u32>();
+
+                for y in rect.dy..(rect.dy + rect.height) {
+                    for x in rect.dx..(rect.dx + rect.width) {
+                        unsafe { *base.add((y * line_offset + x) as usize) = fg };
+                    }
+                }
+            }
+            _ => todo!(),
+        }
+
+        Ok(())
+    }
 }
 
 impl FrameBufferInfo for VesaFb {
@@ -354,11 +438,11 @@ impl FrameBufferInfo for VesaFb {
     }
 
     fn current_fb_var(&self) -> FbVarScreenInfo {
-        VESAFB_DEFINED.read().clone()
+        self.fb_data.read().fb_var.clone()
     }
 
     fn current_fb_fix(&self) -> FixedScreenInfo {
-        VESAFB_FIX_INFO.read().clone()
+        self.fb_data.read().fb_fix.clone()
     }
 
     fn video_mode(&self) -> Option<&FbVideoMode> {
@@ -367,6 +451,10 @@ impl FrameBufferInfo for VesaFb {
 
     fn state(&self) -> FbState {
         self.inner.lock().fb_state
+    }
+
+    fn framebuffer_info_data(&self) -> &RwLock<FrameBufferInfoData> {
+        &self.fb_data
     }
 }
 
@@ -578,19 +666,20 @@ impl Attribute for AnonAttrPhysAddr {
         SysFSOpsSupport::SHOW
     }
 
-    fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
-        sysfs_emit_str(
-            buf,
-            format!(
-                "0x{:x}\n",
-                VESAFB_FIX_INFO
-                    .read()
-                    .smem_start
-                    .unwrap_or(PhysAddr::new(0))
-                    .data()
-            )
-            .as_str(),
-        )
+    fn show(&self, _kobj: Arc<dyn KObject>, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        todo!()
+        // sysfs_emit_str(
+        //     buf,
+        //     format!(
+        //         "0x{:x}\n",
+        //         VESAFB_FIX_INFO
+        //             .read()
+        //             .smem_start
+        //             .unwrap_or(PhysAddr::new(0))
+        //             .data()
+        //     )
+        //     .as_str(),
+        // )
     }
 }
 
@@ -679,36 +768,53 @@ fn vesa_fb_device_init() -> Result<(), SystemError> {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         kinfo!("vesa fb device init");
+        let device = Arc::new(VesaFb::new());
 
-        let mut fix_info_guard = VESAFB_FIX_INFO.write_irqsave();
-        let mut var_info_guard = VESAFB_DEFINED.write_irqsave();
+        let mut fb_data = device.fb_data.write_irqsave();
 
         let boot_params_guard = boot_params().read();
         let boottime_screen_info = &boot_params_guard.screen_info;
 
-        fix_info_guard.smem_start = Some(boottime_screen_info.lfb_base);
-        fix_info_guard.smem_len = boottime_screen_info.lfb_size;
+        fb_data.fb_fix.smem_start = Some(boottime_screen_info.lfb_base);
+        fb_data.fb_fix.smem_len = boottime_screen_info.lfb_size;
 
         if boottime_screen_info.video_type == BootTimeVideoType::Mda {
-            fix_info_guard.visual = FbVisual::Mono10;
-            var_info_guard.bits_per_pixel = 8;
-            fix_info_guard.line_length = (boottime_screen_info.origin_video_cols as u32)
-                * (var_info_guard.bits_per_pixel / 8);
-            var_info_guard.xres_virtual = boottime_screen_info.origin_video_cols as u32;
-            var_info_guard.yres_virtual = boottime_screen_info.origin_video_lines as u32;
+            fb_data.fb_fix.visual = FbVisual::Mono10;
+            fb_data.fb_var.bits_per_pixel = 8;
+            fb_data.fb_fix.line_length = (boottime_screen_info.origin_video_cols as u32)
+                * (fb_data.fb_var.bits_per_pixel / 8);
+            fb_data.fb_var.xres_virtual = boottime_screen_info.origin_video_cols as u32;
+            fb_data.fb_var.yres_virtual = boottime_screen_info.origin_video_lines as u32;
         } else {
-            fix_info_guard.visual = FbVisual::TrueColor;
-            var_info_guard.bits_per_pixel = boottime_screen_info.lfb_depth as u32;
-            fix_info_guard.line_length =
-                (boottime_screen_info.lfb_width as u32) * (var_info_guard.bits_per_pixel / 8);
-            var_info_guard.xres_virtual = boottime_screen_info.lfb_width as u32;
-            var_info_guard.yres_virtual = boottime_screen_info.lfb_height as u32;
+            fb_data.fb_fix.visual = FbVisual::TrueColor;
+            fb_data.fb_var.bits_per_pixel = boottime_screen_info.lfb_depth as u32;
+            fb_data.fb_fix.line_length =
+                (boottime_screen_info.lfb_width as u32) * (fb_data.fb_var.bits_per_pixel / 8);
+            fb_data.fb_var.xres_virtual = boottime_screen_info.lfb_width as u32;
+            fb_data.fb_var.yres_virtual = boottime_screen_info.lfb_height as u32;
+            fb_data.fb_var.xres = boottime_screen_info.lfb_width as u32;
+            fb_data.fb_var.yres = boottime_screen_info.lfb_height as u32;
         }
 
-        drop(var_info_guard);
-        drop(fix_info_guard);
+        fb_data.fb_var.red.length = boottime_screen_info.red_size as u32;
+        fb_data.fb_var.green.length = boottime_screen_info.green_size as u32;
+        fb_data.fb_var.blue.length = boottime_screen_info.blue_size as u32;
 
-        let device = Arc::new(VesaFb::new());
+        fb_data.fb_var.red.offset = boottime_screen_info.red_pos as u32;
+        fb_data.fb_var.green.offset = boottime_screen_info.green_pos as u32;
+        fb_data.fb_var.blue.offset = boottime_screen_info.blue_pos as u32;
+
+        // TODO: 这里是暂时这样写的，初始化为RGB888格式，后续vesa初始化完善后删掉下面
+        fb_data.fb_var.red.offset = 16;
+        fb_data.fb_var.green.offset = 8;
+        fb_data.fb_var.blue.offset = 0;
+
+        if fb_data.fb_var.bits_per_pixel >= 1 && fb_data.fb_var.bits_per_pixel <= 8 {
+            fb_data.fb_var.red.length = fb_data.fb_var.bits_per_pixel;
+            fb_data.fb_var.green.length = fb_data.fb_var.bits_per_pixel;
+            fb_data.fb_var.blue.length = fb_data.fb_var.bits_per_pixel;
+        }
+
         device_manager().device_default_initialize(&(device.clone() as Arc<dyn Device>));
 
         platform_device_manager()
@@ -718,6 +824,16 @@ fn vesa_fb_device_init() -> Result<(), SystemError> {
         frame_buffer_manager()
             .register_fb(device.clone() as Arc<dyn FrameBuffer>)
             .expect("vesa_fb_device_init: frame_buffer_manager().register_fb failed");
+
+        // 加入全局fb表
+        let mut guard = FRAME_BUFFER_SET.write();
+        if guard.get(device.fb_id().data() as usize).unwrap().is_some() {
+            kwarn!(
+                "vesa_fb_device_init: There is already an element {:?} in the FRAME_BUFFER_SET",
+                device.fb_id()
+            );
+        }
+        guard[device.fb_id().data() as usize] = Some(device.clone());
 
         // 设置vesa fb的状态为运行中
         device.inner.lock().fb_state = FbState::Running;

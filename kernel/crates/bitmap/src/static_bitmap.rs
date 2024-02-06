@@ -5,6 +5,7 @@ use crate::{bitmap_core::BitMapCore, traits::BitMapOps};
 /// 静态位图
 ///
 /// 该位图的大小在编译时确定，不可变
+#[derive(Debug, Clone)]
 pub struct StaticBitmap<const N: usize>
 where
     [(); (N + usize::BITS as usize - 1) / (usize::BITS as usize)]:,

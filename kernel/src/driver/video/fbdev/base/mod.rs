@@ -1,12 +1,24 @@
-use alloc::{string::String, sync::Arc};
+use alloc::{string::String, sync::Arc, vec::Vec};
+use hashbrown::HashMap;
 use system_error::SystemError;
 
 use crate::{
-    driver::base::device::Device,
+    driver::{base::device::Device, tty_new::virtual_terminal::Color},
+    init::boot_params,
+    libs::rwlock::RwLock,
     mm::{ucontext::LockedVMA, PhysAddr, VirtAddr},
 };
 
 use self::fbmem::{FbDevice, FrameBufferManager};
+
+const COLOR_TABLE_8: &'static [u32] = &[
+    0x00000000, 0xff000000, 0x00ff0000, 0xffff0000, 0x0000ff00, 0xff00ff00, 0x00ffff00, 0xffffff00,
+    0x000000ff, 0xff0000ff, 0x00ff00ff, 0xffff00ff, 0x0000ffff, 0xff00ffff, 0x00ffffff, 0xffffffff,
+];
+
+const COLOR_TABLE_16: &'static [u32] = &[0x00000000, 0xffff0000, 0x0000ffff, 0xffffffff];
+
+const COLOR_TABLE_32: &'static [u32] = &[0x00000000, 0xffffffff];
 
 pub mod fbcon;
 pub mod fbmem;
@@ -15,6 +27,14 @@ pub mod modedb;
 
 // 帧缓冲区id
 int_like!(FbId, u32);
+
+lazy_static! {
+    pub static ref FRAME_BUFFER_SET: RwLock<Vec<Option<Arc<dyn FrameBuffer>>>> = {
+        let mut ret = Vec::new();
+        ret.resize(FrameBufferManager::FB_MAX, None);
+        RwLock::new(ret)
+    };
+}
 
 impl FbId {
     /// 帧缓冲区id的初始值（无效值）
@@ -37,10 +57,246 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
 
     /// 设置帧缓冲区的id
     fn set_fb_id(&self, id: FbId);
+
+    /// 通用的软件图像绘画
+    fn generic_imageblit(&self, image: &FbImage) {
+        let boot_param = boot_params().read();
+        let x = image.x;
+        let y = image.y;
+        let byte_per_pixel = core::mem::size_of::<u32>() as u32;
+        let bit_per_pixel = self.current_fb_var().bits_per_pixel;
+
+        // 计算图像在帧缓冲中的起始位
+        let mut bitstart = (y * self.current_fb_fix().line_length * 8) + (x * bit_per_pixel);
+        let start_index = bitstart & (32 - 1);
+        let pitch_index = (self.current_fb_fix().line_length & (byte_per_pixel - 1)) * 8;
+        // 位转字节
+        bitstart /= 8;
+
+        // 对齐到像素字节大小
+        bitstart &= !(byte_per_pixel - 1);
+
+        let dst1 = boot_param.screen_info.lfb_virt_base;
+        if dst1.is_none() {
+            return;
+        }
+        let mut dst1 = dst1.unwrap();
+        dst1 = dst1 + VirtAddr::new(bitstart as usize);
+
+        let _ = self.fb_sync();
+
+        if image.depth == 1 {
+            let fg;
+            let bg;
+            if self.current_fb_fix().visual == FbVisual::TrueColor
+                || self.current_fb_fix().visual == FbVisual::DirectColor
+            {
+                let fb_info_data = self.framebuffer_info_data().read();
+                fg = fb_info_data.pesudo_palette[image.fg as usize];
+                bg = fb_info_data.pesudo_palette[image.bg as usize];
+            } else {
+                fg = image.fg;
+                bg = image.bg;
+            }
+
+            if 32 % bit_per_pixel == 0
+                && start_index == 0
+                && pitch_index == 0
+                && image.width & (32 / bit_per_pixel - 1) == 0
+                && bit_per_pixel >= 8
+                && bit_per_pixel <= 32
+            {
+                unsafe { self.fast_imageblit(image, dst1, fg, bg) }
+            } else {
+                self.slow_imageblit(image, dst1, fg, bg, start_index, pitch_index)
+            }
+        } else {
+            todo!("color image blit todo");
+        }
+    }
+
+    /// 优化的单色图像绘制函数
+    ///
+    /// 仅当 bits_per_pixel 为 8、16 或 32 时才能使用。
+    /// 要求 image->width 可以被像素或 dword (ppw) 整除。
+    /// 要求 fix->line_length 可以被 4 整除。
+    /// 扫描线的开始和结束都是 dword 对齐的。
+    unsafe fn fast_imageblit(&self, image: &FbImage, mut dst1: VirtAddr, fg: u32, bg: u32) {
+        let bpp = self.current_fb_var().bits_per_pixel;
+        let mut fgx = fg;
+        let mut bgx = bg;
+        let ppw = 32 / bpp;
+        let spitch = (image.width + 7) / 8;
+        let tab: &[u32];
+        let mut color_tab: [u32; 16] = [0; 16];
+
+        match bpp {
+            8 => {
+                tab = COLOR_TABLE_8;
+            }
+            16 => {
+                tab = COLOR_TABLE_16;
+            }
+            32 => {
+                tab = COLOR_TABLE_32;
+            }
+            _ => {
+                return;
+            }
+        }
+
+        for _ in (0..(ppw - 1)).rev() {
+            fgx <<= bpp;
+            bgx <<= bpp;
+            fgx |= fg;
+            bgx |= bg;
+        }
+
+        let bitmask = (1 << ppw) - 1;
+        let eorx = fgx ^ bgx;
+        let k = image.width / ppw;
+
+        for (idx, val) in tab.iter().enumerate() {
+            color_tab[idx] = (*val & eorx) ^ bgx;
+        }
+
+        let mut dst;
+        let mut shift;
+        let mut src;
+        let mut offset = 0;
+        let mut j = 0;
+        for i in (0..image.height).rev() {
+            dst = dst1.as_ptr::<u32>();
+            shift = 8;
+            src = offset;
+            match ppw {
+                4 => {
+                    // 8bpp
+                    j = k;
+                    while j >= 2 {
+                        *dst = color_tab[(image.data[src] as usize >> 4) & bitmask];
+                        dst = dst.add(1);
+                        *dst = color_tab[(image.data[src] as usize >> 0) & bitmask];
+                        dst = dst.add(1);
+                        j -= 2;
+                        src += 1;
+                    }
+                }
+                2 => {
+                    // 16bpp
+                    j = k;
+                    while j >= 4 {
+                        *dst = color_tab[(image.data[src] as usize >> 6) & bitmask];
+                        dst = dst.add(1);
+                        *dst = color_tab[(image.data[src] as usize >> 4) & bitmask];
+                        dst = dst.add(1);
+                        *dst = color_tab[(image.data[src] as usize >> 2) & bitmask];
+                        dst = dst.add(1);
+                        *dst = color_tab[(image.data[src] as usize >> 0) & bitmask];
+                        dst = dst.add(1);
+                        src += 1;
+                        j -= 4;
+                    }
+                }
+                1 => {
+                    // 32 bpp
+                    j = k;
+                    while j >= 8 {
+                        *dst = color_tab[(image.data[src] as usize >> 7) & bitmask];
+                        dst = dst.add(1);
+                        *dst = color_tab[(image.data[src] as usize >> 6) & bitmask];
+                        dst = dst.add(1);
+                        *dst = color_tab[(image.data[src] as usize >> 5) & bitmask];
+                        dst = dst.add(1);
+                        *dst = color_tab[(image.data[src] as usize >> 4) & bitmask];
+                        dst = dst.add(1);
+                        *dst = color_tab[(image.data[src] as usize >> 3) & bitmask];
+                        dst = dst.add(1);
+                        *dst = color_tab[(image.data[src] as usize >> 2) & bitmask];
+                        dst = dst.add(1);
+                        *dst = color_tab[(image.data[src] as usize >> 1) & bitmask];
+                        dst = dst.add(1);
+                        *dst = color_tab[(image.data[src] as usize >> 0) & bitmask];
+                        dst = dst.add(1);
+                        src += 1;
+                        j -= 8;
+                    }
+                }
+                _ => {}
+            }
+
+            while j != 0 {
+                shift -= ppw;
+                *dst = color_tab[(image.data[src] as usize >> shift) & bitmask];
+                dst = dst.add(1);
+                if shift == 0 {
+                    shift = 8;
+                    src += 1;
+                }
+            }
+
+            dst1 += VirtAddr::new(self.current_fb_fix().line_length as usize);
+            offset += spitch as usize;
+        }
+    }
+
+    fn slow_imageblit(
+        &self,
+        _image: &FbImage,
+        _dst1: VirtAddr,
+        _fg: u32,
+        _bg: u32,
+        _start_index: u32,
+        _pitch_index: u32,
+    ) {
+        todo!();
+        // let bpp = self.current_fb_var().bits_per_pixel;
+        // let pitch = self.current_fb_fix().line_length;
+        // let null_bits = 32 - bpp;
+        // let spitch = (image.width + 7) / 8;
+
+        // // TODO：这里是需要计算的，但是目前用不到，先直接写
+        // let bswapmask = 0;
+
+        // let dst2 = dst1;
+
+        // // 一行一行画
+        // for i in image.height..0 {
+        //     let dst = dst1;
+
+        //     if start_index > 0 {
+        //         let start_mask = !(!(0 as u32) << start_index);
+        //     }
+        // }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct FrameBufferInfoData {
+    /// 颜色映射
+    pub color_map: Vec<Color>,
+    /// 当前的可变帧缓冲信息
+    pub fb_var: FbVarScreenInfo,
+    /// 当前的固定帧缓冲信息
+    pub fb_fix: FixedScreenInfo,
+    /// 颜色映射表
+    pub pesudo_palette: Vec<u32>,
+}
+
+impl FrameBufferInfoData {
+    pub fn new(var: FbVarScreenInfo, fix: FixedScreenInfo) -> Self {
+        Self {
+            fb_fix: fix,
+            fb_var: var,
+            ..Default::default()
+        }
+    }
 }
 
 /// 帧缓冲区信息
-pub trait FrameBufferInfo {
+pub trait FrameBufferInfo: FrameBufferOps {
+    fn framebuffer_info_data(&self) -> &RwLock<FrameBufferInfoData>;
+
     /// Amount of ioremapped VRAM or 0
     fn screen_size(&self) -> usize;
 
@@ -61,6 +317,54 @@ pub trait FrameBufferInfo {
 
     /// 获取帧缓冲区的状态
     fn state(&self) -> FbState;
+
+    /// 颜色位深
+    fn color_depth(&self) -> u32 {
+        return 8;
+
+        // 以下逻辑没问题，但是当前没有初始化好var，所以先直接返回当前vasafb的8
+
+        // let var = self.current_fb_var();
+        // let fix = self.current_fb_fix();
+        // if fix.visual == FbVisual::Mono01 || fix.visual == FbVisual::Mono10 {
+        //     return 1;
+        // } else {
+        //     if var.green.length == var.blue.length
+        //         && var.green.length == var.red.length
+        //         && var.green.offset == var.blue.offset
+        //         && var.green.offset == var.red.offset
+        //     {
+        //         kerror!("return {}", var.green.length);
+        //         return var.green.length;
+        //     } else {
+        //         return var.green.length + var.blue.length + var.red.length;
+        //     }
+        // }
+    }
+
+    /// ## 设置调色板
+    fn set_color_map(&self, cmap: Vec<Color>) -> Result<(), SystemError> {
+        let ret = self.fb_set_color_map(cmap.clone());
+        if ret.is_err() && ret.clone().unwrap_err() == SystemError::ENOSYS {
+            for (idx, color) in cmap.iter().enumerate() {
+                if self
+                    .fb_set_color_register(idx as u16, color.red, color.green, color.blue)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+
+            self.framebuffer_info_data().write().color_map = cmap;
+        } else {
+            if ret.is_ok() {
+                self.framebuffer_info_data().write().color_map = cmap;
+            }
+            return ret;
+        }
+
+        Ok(())
+    }
 }
 
 /// 帧缓冲区操作
@@ -122,6 +426,45 @@ pub trait FrameBufferOps {
 
     /// 卸载与该帧缓冲区相关的所有资源
     fn fb_destroy(&self);
+
+    /// 画光标
+    fn fb_cursor(&self, cursor: &FbCursor) -> Result<(), SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
+
+    /// 画软光标(暂时简要实现)
+    fn soft_cursor(&self, cursor: FbCursor) -> Result<(), SystemError> {
+        let mut image = cursor.image.clone();
+        if cursor.enable {
+            match cursor.rop {
+                true => {
+                    for i in 0..image.data.len() {
+                        image.data[i] ^= cursor.mask[i];
+                    }
+                }
+                false => {
+                    for i in 0..image.data.len() {
+                        image.data[i] &= cursor.mask[i];
+                    }
+                }
+            }
+        }
+
+        let _ = self.fb_image_blit(&image);
+
+        Ok(())
+    }
+
+    fn fb_sync(&self) -> Result<(), SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
+
+    /// 绘画位图
+    fn fb_image_blit(&self, image: &FbImage);
+
+    fn fb_set_color_map(&self, _cmap: Vec<Color>) -> Result<(), SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
 }
 
 /// 帧缓冲区的状态
@@ -849,4 +1192,73 @@ pub enum BootTimeVideoType {
     Pmac,
     /// EFI graphic mode
     Efi,
+}
+
+#[derive(Debug, Default)]
+pub struct FbCursor {
+    /// 设置选项
+    pub set_mode: FbCursorSetMode,
+    /// 开关选项
+    pub enable: bool,
+    /// 表示光标图像的位操作,true表示XOR，false表示COPY
+    pub rop: bool,
+    /// 表示光标掩码（mask）的数据。掩码用于定义光标的形状，指定了哪些像素是光标的一部分。
+    pub mask: Vec<u8>,
+
+    /// 表示光标的热点位置，即在光标图像中被认为是"焦点"的位置
+    pub hot_x: u32,
+    pub hot_y: u32,
+
+    /// 光标图像
+    pub image: FbImage,
+}
+
+bitflags! {
+    /// 硬件光标控制
+    #[derive(Default)]
+    pub struct FbCursorSetMode:u8 {
+        /// 设置位图
+        const FB_CUR_SETIMAGE = 0x01;
+        /// 设置位置
+        const FB_CUR_SETPOS   = 0x02;
+        /// 设置热点
+        const FB_CUR_SETHOT   = 0x04;
+        /// ColorMap
+        const FB_CUR_SETCMAP  = 0x08;
+        /// 形状
+        const FB_CUR_SETSHAPE = 0x10;
+        /// Size
+        const FB_CUR_SETSIZE  = 0x20;
+        /// 全设置
+        const FB_CUR_SETALL   = 0xFF;
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub enum ScrollMode {
+    Move,
+    PanMove,
+    WrapMove,
+    Redraw,
+    PanRedraw,
+}
+
+impl Default for ScrollMode {
+    /// ## 默认Move
+    fn default() -> Self {
+        Self::Redraw
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct FbImage {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub fg: u32,
+    pub bg: u32,
+    pub depth: u8,
+    pub data: Vec<u8>,
 }

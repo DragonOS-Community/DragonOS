@@ -282,7 +282,7 @@ impl TtyDevicePrivateData {
 }
 
 /// @brief 初始化TTY设备
-#[unified_init(INITCALL_DEVICE)]
+// #[unified_init(INITCALL_DEVICE)]
 pub fn tty_init() -> Result<(), SystemError> {
     let tty: Arc<TtyDevice> = TtyDevice::new("tty0");
     let devfs_root_inode = ROOT_INODE().lookup("/dev");
@@ -307,7 +307,8 @@ pub fn tty_init() -> Result<(), SystemError> {
 
     let r = devfs_register(&tty.name(), tty);
     if r.is_err() {
-        return Err(devfs_root_inode.unwrap_err());
+        kerror!("{:?}", r);
+        return Err(r.unwrap_err());
     }
 
     serial_init()?;

@@ -9,6 +9,7 @@ use crate::{
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
         tty::TtyFilePrivateData,
+        tty_new::tty_device::NewTtyFilePrivateData,
     },
     filesystem::procfs::ProcfsFilePrivateData,
     ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
@@ -35,6 +36,8 @@ pub enum FilePrivateData {
     DevFS(DevicePrivateData),
     /// tty设备文件的私有信息
     Tty(TtyFilePrivateData),
+    /// new_tty
+    NTty(NewTtyFilePrivateData),
     /// epoll私有信息
     EPoll(EPollPrivateData),
     /// 不需要文件私有信息

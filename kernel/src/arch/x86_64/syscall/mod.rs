@@ -1,5 +1,3 @@
-use core::ffi::c_void;
-
 use crate::{
     arch::{
         ipc::signal::X86_64SignalArch,

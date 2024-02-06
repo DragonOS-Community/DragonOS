@@ -4,7 +4,6 @@ use crate::{
 };
 
 extern "C" {
-    static mut GDT_Table: [usize; 0usize];
     static mut IDT_Table: [usize; 0usize];
 }
 macro_rules! save_all_regs {

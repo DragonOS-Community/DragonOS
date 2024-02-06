@@ -92,6 +92,7 @@ impl SwitchResult {
 #[derive(Debug)]
 pub struct ProcessManager;
 impl ProcessManager {
+    #[inline(never)]
     fn init() {
         static INIT_FLAG: AtomicBool = AtomicBool::new(false);
         if INIT_FLAG
@@ -521,6 +522,8 @@ bitflags! {
         const SIGNALED = 1 << 6;
         /// 进程需要迁移到其他cpu上
         const NEED_MIGRATE = 1 << 7;
+        /// 随机化的虚拟地址空间，主要用于动态链接器的加载
+        const RANDOMIZE = 1 << 8;
     }
 }
 
@@ -824,8 +827,8 @@ impl ProcessControlBlock {
     pub fn generate_name(program_path: &str, args: &Vec<String>) -> String {
         let mut name = program_path.to_string();
         for arg in args {
-            name.push_str(arg);
             name.push(' ');
+            name.push_str(arg);
         }
         return name;
     }

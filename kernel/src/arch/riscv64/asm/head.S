@@ -17,9 +17,9 @@
 #define SR_VS 0x00000600
 #define SR_FS_VS	(SR_FS | SR_VS) /* Vector and Floating-Point Unit */
 
-#define SATP_MODE_39 0x8000000000000000UL
-#define SATP_MODE_48 0x9000000000000000UL
-#define SATP_MODE_57 0xa000000000000000UL
+#define SATP_MODE_39 0x8000000000000000ULL
+#define SATP_MODE_48 0x9000000000000000ULL
+#define SATP_MODE_57 0xa000000000000000ULL
 
 #define PAGE_OFFSET 0xffffffc000000000
 #define KERNEL_LINK_OFFSET 0x1000000
@@ -84,7 +84,6 @@ ENTRY(_start)
 	call initial_map_1g_identical
 
 __init_set_pgtable_loop_end:
-	
 	call __initial_reloacate_enable_mmu
 
 .option push
@@ -92,7 +91,7 @@ __init_set_pgtable_loop_end:
 	
 	la a0, BSP_IDLE_STACK_SPACE
 	mv sp, a0
-	li t0, 32768
+	li t0, 32752	// 预留16字节防止越界
 	add sp, sp, t0
 .option pop
 	/*
@@ -119,6 +118,7 @@ __initial_reloacate_enable_mmu:
 	// 计算起始物理地址与内核高虚拟地址的偏移量
 	la t0, __initial_start_load_paddr
 	ld t0, 0(t0)
+
 	
 	li t1, KERNEL_VIRT_START
 	sub t1, t1, t0
@@ -128,18 +128,27 @@ __initial_reloacate_enable_mmu:
 
 	/* Point stvec to virtual address of intruction after satp write */
 	/* Set trap vector to spin forever to help debug */
-	la a2, __initial_Lsecondary_park
+	la a2, 1f
 	add a2, a2, t1
 	csrw CSR_TVEC, a2
-	
 	// enable MMU
 	la a2, __initial_pgtable
 	srli a2, a2, 12
 	la a0, __initial_satp_mode
 	ld a0, 0(a0)
 	or a2, a2, a0
+
+
 	sfence.vma
 	csrw satp, a2
+	
+1:
+	la a0, __initial_Lsecondary_park
+	add a0, a0, t1
+	csrw CSR_TVEC, a0
+
+	csrw satp, a2
+	sfence.vma
 
 	ret
 
@@ -165,7 +174,7 @@ initial_map_256M_phys_addr:
 	and t2, t2, t1
 
 	// 计算L0页表项的索引
-	srl t2, t2, 30
+	srli t2, t2, 30
 	andi t2, t2, 511
 	
 	
@@ -220,7 +229,7 @@ __initial_set_l1_pgtable_loop:
 	li t1, 0x3FFFFFFFFFFFFF
 	and t3, t3, t1 // t3 = t3 & 0x3FFFFFFFFFFFFF
 	slli t3, t3, 10 // t3 = t3 << 10
-	ori t3, t3, 0xf // 设置L1页表项属性，R/W/X/V = 1
+	ori t3, t3, 0xEF // 设置L1页表项属性，set R/W/X/V/A/D/G = 1
 	// 设置L1页表项的值
 	sd t3, 0(t0)
 
@@ -262,40 +271,54 @@ initial_map_1g_identical:
 	// 计算起始物理地址,存放在t0中
 	and t0, t0, a0
 
-	
+
 	// 把起始虚拟地址存储到t2中
 	mv t2, a1
 	// 按照1g对齐
 	li t1, -0x40000000
 	and t2, t2, t1
+
 	
 	// 右移30位，得到L0页表项的索引
-	srl t2, t2, 30
+	srli t2, t2, 30
 	// 与511进行与运算，得到L0页表项的索引
 	andi t2, t2, 511
 	
 
 	// 填写页表项
-	// li t2, 0xf // 页表项属性, R/W/X/V = 1
 	la t4, __initial_pgtable
 	slli t3, t2, 3 // t3 = t2 * 8
 	add t4, t4, t3 // t4 = t4 + t3
 
+
 	mv t3, t0
 	srli t3, t3, 12 // t3 = t0 >> 12 (page frame number)
 	slli t3, t3, 10 // t3 = t3 << 10 
-	ori t3, t3, 0xf // set R/W/X/V = 1
-	// 设置t0地址在L0页表中的值
+	ori t3, t3, 0xEF // set R/W/X/V/A/D/G = 1
+
+	// 计算delta的pfn
+	li t2, 0x40000000
+	srli t2, t2, 12
+	// 把delta pfn移位到页表项的第10位的位置
+	slli t2, t2, 10
+	li t1, 2
+
+__loop_set_8g:
+
+	
 	sd t3, 0(t4)
 
 	// 增加 t4 的值
 	addi t4, t4, 8
-	// 增加 t3 的值(1G)
-	li t2, 0x40000000
+	// 增加1G的pfn	
 	add t3, t3, t2
-	sd t3, 0(t4)
+	
+	
+	addi t1, t1, -1
+	bnez t1, __loop_set_8g
 
 	ret
+
 
 // 用于清空页表的空间
 // 参数：
@@ -330,6 +353,7 @@ __initial_hartid_ptr:
 	.quad 0
 
 // _start标签在启动时被加载到的物理地址
+.global __initial_start_load_paddr
 __initial_start_load_paddr:
 	.quad 0
 
@@ -344,9 +368,11 @@ __initial_satp_mode:
 
 // 初始页表的空间（sv39模式的L0页表）
 .section .initial_pgtable_section
+.global __initial_pgtable
 __initial_pgtable:
 	.skip 4096
 
+.global __initial_l1_pgtable
 __initial_l1_pgtable:
 	.skip 8192
 

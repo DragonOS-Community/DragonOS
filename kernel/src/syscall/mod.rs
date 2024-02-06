@@ -59,23 +59,20 @@ extern "C" {
     fn do_put_string(s: *const u8, front_color: u32, back_color: u32) -> usize;
 }
 
-#[no_mangle]
-pub extern "C" fn syscall_init() -> i32 {
-    kinfo!("Initializing syscall...");
-    Syscall::init().expect("syscall init failed");
-    kinfo!("Syscall init successfully!");
-    return 0;
-}
-
 impl Syscall {
     /// 初始化系统调用
+    #[inline(never)]
     pub fn init() -> Result<(), SystemError> {
         static INIT_FLAG: AtomicBool = AtomicBool::new(false);
         let prev = INIT_FLAG.swap(true, Ordering::SeqCst);
         if prev {
             panic!("Cannot initialize syscall more than once!");
         }
-        return crate::arch::syscall::arch_syscall_init();
+        kinfo!("Initializing syscall...");
+        let r = crate::arch::syscall::arch_syscall_init();
+        kinfo!("Syscall init successfully!");
+
+        return r;
     }
     /// @brief 系统调用分发器，用于分发系统调用。
     ///
@@ -853,10 +850,20 @@ impl Syscall {
             }
             SYS_GETTID => Self::gettid().map(|tid| tid.into()),
             SYS_GETUID => Self::getuid().map(|uid| uid.into()),
+
             SYS_SYSLOG => {
-                kwarn!("SYS_SYSLOG has not yet been implemented");
-                Ok(0)
+                let syslog_action_type = args[0] as usize;
+                let buf_vaddr = args[1];
+                let len = args[2];
+                let from_user = frame.from_user();
+                let mut user_buffer_writer =
+                    UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)?;
+
+                let user_buf = user_buffer_writer.buffer(0)?;
+                let res = Self::do_syslog(syslog_action_type, user_buf, len);
+                res
             }
+
             SYS_GETGID => Self::getgid().map(|gid| gid.into()),
             SYS_SETUID => {
                 kwarn!("SYS_SETUID has not yet been implemented");

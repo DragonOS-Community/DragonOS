@@ -187,10 +187,9 @@ pub fn sched_enqueue(pcb: Arc<ProcessControlBlock>, mut reset_time: bool) {
     }
 }
 
-/// @brief 初始化进程调度器模块
-#[allow(dead_code)]
-#[no_mangle]
-pub extern "C" fn sched_init() {
+/// 初始化进程调度器模块
+#[inline(never)]
+pub fn sched_init() {
     kinfo!("Initializing schedulers...");
     unsafe {
         sched_cfs_init();

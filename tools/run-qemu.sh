@@ -87,8 +87,7 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     QEMU_CPU_FEATURES+="-cpu IvyBridge,apic,x2apic,+fpu,check,+vmx,${allflags}"
     QEMU_RTC_CLOCK+=" -rtc clock=host,base=localtime"
 else
-    QEMU_MACHINE=" -machine virt,memory-backend=${QEMU_MEMORY_BACKEND} "
-
+    QEMU_MACHINE=" -machine virt,memory-backend=${QEMU_MEMORY_BACKEND} -cpu sifive-u54 "
 fi
 
 if [ ${ARCH} == "riscv64" ]; then

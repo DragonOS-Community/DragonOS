@@ -15,3 +15,15 @@ pub fn kick_cpu(cpu_id: u32) -> Result<(), SystemError> {
     send_ipi(IpiKind::KickCpu, IpiTarget::Specified(cpu_id as usize));
     return Ok(());
 }
+
+pub trait SMPArch {
+    /// 准备SMP初始化所需的cpu拓扑数据。
+    ///
+    /// 该函数需要标记为 `#[inline(never)]`
+    fn prepare_cpus() -> Result<(), SystemError>;
+
+    /// 初始化SMP
+    ///
+    /// 该函数需要标记为 `#[inline(never)]`
+    fn init() -> Result<(), SystemError>;
+}

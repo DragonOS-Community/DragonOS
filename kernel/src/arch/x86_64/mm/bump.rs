@@ -1,8 +1,9 @@
 use crate::{
     libs::align::{page_align_down, page_align_up},
     mm::{
-        allocator::bump::BumpAllocator, memblock::mem_block_manager, MemoryManagementArch,
-        PhysAddr, PhysMemoryArea, VirtAddr,
+        allocator::bump::BumpAllocator,
+        memblock::{mem_block_manager, MemoryAreaAttr},
+        MemoryManagementArch, PhysAddr, PhysMemoryArea, VirtAddr,
     },
 };
 
@@ -41,8 +42,11 @@ impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
                 continue;
             }
 
-            ret_areas[res_count] =
-                PhysMemoryArea::new(PhysAddr::new(new_start), new_end - new_start);
+            ret_areas[res_count] = PhysMemoryArea::new(
+                PhysAddr::new(new_start),
+                new_end - new_start,
+                MemoryAreaAttr::empty(),
+            );
 
             res_count += 1;
         }

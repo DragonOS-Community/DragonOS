@@ -24,7 +24,8 @@ use super::{
 };
 
 /// 用于存储重映射页表的位图和页面
-static EARLY_IOREMAP_PAGES: SpinLock<EarlyIoRemapPages> = SpinLock::new(EarlyIoRemapPages::new());
+pub static EARLY_IOREMAP_PAGES: SpinLock<EarlyIoRemapPages> =
+    SpinLock::new(EarlyIoRemapPages::new());
 
 /// 早期重映射使用的页表
 #[repr(C)]
@@ -42,7 +43,7 @@ impl EarlyRemapPage {
 }
 
 #[repr(C)]
-struct EarlyIoRemapPages {
+pub struct EarlyIoRemapPages {
     pages: [EarlyRemapPage; Self::EARLY_REMAP_PAGES_NUM],
     bmp: StaticBitmap<{ Self::EARLY_REMAP_PAGES_NUM }>,
 }
@@ -116,6 +117,7 @@ impl<MMA: MemoryManagementArch> FrameAllocator for PseudoAllocator<MMA> {
     unsafe fn free(&mut self, address: PhysAddr, count: PageFrameCount) {
         assert_eq!(count.data(), 1);
         assert!(address.check_aligned(MMA::PAGE_SIZE));
+
         let vaddr = MMA::phys_2_virt(address);
         if let Some(vaddr) = vaddr {
             EARLY_IOREMAP_PAGES.lock_irqsave().free_page(vaddr);
@@ -137,7 +139,29 @@ impl<MMA: MemoryManagementArch> FrameAllocator for PseudoAllocator<MMA> {
 /// 调用该函数时，必须保证内存管理器尚未初始化。否则将导致未定义的行为
 ///
 /// 并且，内核引导文件必须以4K页为粒度，填写了前100M的内存映射关系。（具体以本文件开头的注释为准）
+#[inline(never)]
 pub unsafe fn pseudo_map_phys(vaddr: VirtAddr, paddr: PhysAddr, count: PageFrameCount) {
+    let flags: PageFlags<MMArch> = PageFlags::new().set_write(true);
+
+    pseudo_map_phys_with_flags(vaddr, paddr, count, flags);
+}
+
+/// Use pseudo mapper to map physical memory to virtual memory
+/// with READ_ONLY and EXECUTE flags.
+#[inline(never)]
+pub unsafe fn pseudo_map_phys_ro(vaddr: VirtAddr, paddr: PhysAddr, count: PageFrameCount) {
+    let flags: PageFlags<MMArch> = PageFlags::new().set_write(false).set_execute(true);
+
+    pseudo_map_phys_with_flags(vaddr, paddr, count, flags);
+}
+
+#[inline(never)]
+pub unsafe fn pseudo_map_phys_with_flags(
+    vaddr: VirtAddr,
+    paddr: PhysAddr,
+    count: PageFrameCount,
+    flags: PageFlags<MMArch>,
+) {
     assert!(vaddr.check_aligned(MMArch::PAGE_SIZE));
     assert!(paddr.check_aligned(MMArch::PAGE_SIZE));
 
@@ -149,13 +173,39 @@ pub unsafe fn pseudo_map_phys(vaddr: VirtAddr, paddr: PhysAddr, count: PageFrame
         &mut pseudo_allocator,
     );
 
-    let flags: PageFlags<MMArch> = PageFlags::new().set_write(true).set_execute(true);
-
     for i in 0..count.data() {
         let vaddr = vaddr + i * MMArch::PAGE_SIZE;
         let paddr = paddr + i * MMArch::PAGE_SIZE;
-        let flusher = mapper.map_phys(vaddr, paddr, flags).unwrap();
+        let flusher: crate::mm::page::PageFlush<MMArch> =
+            mapper.map_phys(vaddr, paddr, flags).unwrap();
         flusher.ignore();
+    }
+
+    mapper.make_current();
+}
+
+/// Unmap physical memory from virtual memory.
+///
+/// ## 说明
+///
+/// 该函数在系统启动早期，内存管理尚未初始化的时候使用
+#[inline(never)]
+pub unsafe fn pseudo_unmap_phys(vaddr: VirtAddr, count: PageFrameCount) {
+    assert!(vaddr.check_aligned(MMArch::PAGE_SIZE));
+
+    let mut pseudo_allocator = PseudoAllocator::<MMArch>::new();
+
+    let mut mapper = crate::mm::page::PageMapper::<MMArch, _>::new(
+        PageTableKind::Kernel,
+        MMArch::table(PageTableKind::Kernel),
+        &mut pseudo_allocator,
+    );
+
+    for i in 0..count.data() {
+        let vaddr = vaddr + i * MMArch::PAGE_SIZE;
+        mapper.unmap_phys(vaddr, true).map(|(_, _, flusher)| {
+            flusher.ignore();
+        });
     }
 
     mapper.make_current();

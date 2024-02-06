@@ -32,7 +32,6 @@
 #define EUNSUPPORTED 3  // 当前操作暂不被支持
 
 #include "glib.h"
-#include <libs/lib_ui/screen_manager.h>
 #include <stdarg.h>
 
 /**

@@ -5,6 +5,7 @@ use crate::process::{fork::KernelCloneArgs, KernelStack, ProcessControlBlock, Pr
 
 use super::interrupt::TrapFrame;
 
+pub mod idle;
 pub mod kthread;
 pub mod syscall;
 

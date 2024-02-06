@@ -63,7 +63,7 @@ impl Syscall {
         drop(old_address_space);
         drop(irq_guard);
         // kdebug!("to load binary file");
-        let mut param = ExecParam::new(path.as_str(), address_space.clone(), ExecParamFlags::EXEC);
+        let mut param = ExecParam::new(path.as_str(), address_space.clone(), ExecParamFlags::EXEC)?;
 
         // 加载可执行文件
         let load_result = load_binary_file(&mut param)

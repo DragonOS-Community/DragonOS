@@ -640,8 +640,3 @@ impl Futex {
         Ok(*oldval)
     }
 }
-
-#[no_mangle]
-unsafe extern "C" fn rs_futex_init() {
-    Futex::init();
-}

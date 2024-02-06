@@ -1,16 +1,26 @@
-#![allow(dead_code)]
-
 mod c_adapter;
+pub(super) mod entry;
 pub mod ipi;
+pub mod trap;
 
 use core::{
     arch::asm,
     sync::atomic::{compiler_fence, Ordering},
 };
 
-use crate::exception::{InterruptArch, IrqFlags, IrqFlagsGuard};
+use system_error::SystemError;
 
-use super::asm::irqflags::{local_irq_restore, local_irq_save};
+use crate::{
+    arch::CurrentIrqArch,
+    exception::{InterruptArch, IrqFlags, IrqFlagsGuard},
+};
+
+use self::entry::setup_interrupt_gate;
+
+use super::{
+    asm::irqflags::{local_irq_restore, local_irq_save},
+    driver::apic::{CurrentApic, LocalAPIC},
+};
 
 /// @brief 关闭中断
 #[inline]
@@ -31,6 +41,13 @@ pub fn sti() {
 pub struct X86_64InterruptArch;
 
 impl InterruptArch for X86_64InterruptArch {
+    #[inline(never)]
+    unsafe fn arch_irq_init() -> Result<(), SystemError> {
+        CurrentIrqArch::interrupt_disable();
+        setup_interrupt_gate();
+        CurrentApic.init_current_cpu();
+        return Ok(());
+    }
     unsafe fn interrupt_enable() {
         sti();
     }

@@ -143,7 +143,7 @@ __entry_err_code_to_ret_from_exception:
 
 
 // 0 #DE 除法错误
-ENTRY(divide_error)
+ENTRY(trap_divide_error)
     
     pushq $0    //由于#DE不会产生错误码，但是为了保持弹出结构的一致性，故也压入一个错误码0
     pushq %rax  // 先将rax入栈
@@ -153,7 +153,7 @@ ENTRY(divide_error)
     jmp Err_Code
 
 // 1 #DB 调试异常
-ENTRY(debug)
+ENTRY(trap_debug)
     pushq $0    
     pushq %rax  
     leaq do_debug(%rip), %rax    // 获取中断服务程序的地址
@@ -161,7 +161,7 @@ ENTRY(debug)
     jmp Err_Code
 
 // 2 不可屏蔽中断
-ENTRY(nmi)
+ENTRY(trap_nmi)
     // 不可屏蔽中断不是异常，而是一个外部中断，不会产生错误码
     // 应执行中断处理流程
     pushq $0  //占位err_code
@@ -172,7 +172,7 @@ ENTRY(nmi)
     jmp Err_Code
 
 // 3 #BP 断点异常
-ENTRY(int3)
+ENTRY(trap_int3)
     pushq $0
     pushq %rax
     leaq do_int3(%rip), %rax    // 获取中断服务程序的地址
@@ -180,7 +180,7 @@ ENTRY(int3)
     jmp Err_Code
 
 // 4 #OF 溢出异常
-ENTRY(overflow)
+ENTRY(trap_overflow)
     pushq $0
     pushq %rax
     leaq do_overflow(%rip), %rax    // 获取中断服务程序的地址
@@ -188,7 +188,7 @@ ENTRY(overflow)
     jmp Err_Code
 
 // 5 #BR 越界异常
-ENTRY(bounds)
+ENTRY(trap_bounds)
     pushq $0
     pushq %rax
     leaq do_bounds(%rip), %rax    // 获取中断服务程序的地址
@@ -196,7 +196,7 @@ ENTRY(bounds)
     jmp Err_Code
 
 // 6 #UD 无效/未定义的机器码
-ENTRY(undefined_opcode)
+ENTRY(trap_undefined_opcode)
     pushq $0
     pushq %rax
     leaq do_undefined_opcode(%rip), %rax    // 获取中断服务程序的地址
@@ -204,7 +204,7 @@ ENTRY(undefined_opcode)
     jmp Err_Code
 
 // 7 #NM 设备异常（FPU不存在）
-ENTRY(dev_not_avaliable)
+ENTRY(trap_dev_not_avaliable)
     pushq $0
     pushq %rax
     leaq do_dev_not_avaliable(%rip), %rax    // 获取中断服务程序的地址
@@ -212,14 +212,14 @@ ENTRY(dev_not_avaliable)
     jmp Err_Code
 
 // 8 #DF 双重错误
-ENTRY(double_fault)
+ENTRY(trap_double_fault)
     pushq %rax
     leaq do_double_fault(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
     jmp Err_Code
 
 // 9 协处理器越界（保留）
-ENTRY(coprocessor_segment_overrun)
+ENTRY(trap_coprocessor_segment_overrun)
     pushq $0
     pushq %rax
     leaq do_coprocessor_segment_overrun(%rip), %rax    // 获取中断服务程序的地址
@@ -227,7 +227,7 @@ ENTRY(coprocessor_segment_overrun)
     jmp Err_Code
 
 // 10 #TS 无效的TSS段
-ENTRY(invalid_TSS)
+ENTRY(trap_invalid_TSS)
     // === 不正确的任务状态段 #TS ==
     // 有错误码,处理器已经自动在异常处理程序栈中压入错误码
     pushq %rax
@@ -236,28 +236,28 @@ ENTRY(invalid_TSS)
     jmp Err_Code
 
 // 11 #NP 段不存在
-ENTRY(segment_not_exists)
+ENTRY(trap_segment_not_exists)
     pushq %rax
     leaq do_segment_not_exists(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
     jmp Err_Code
 
 // 12 #SS 段错误
-ENTRY(stack_segment_fault)
+ENTRY(trap_stack_segment_fault)
     pushq %rax
     leaq do_stack_segment_fault(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
     jmp Err_Code
 
 // 13 #GP 通用保护性异常
-ENTRY(general_protection)
+ENTRY(trap_general_protection)
     pushq %rax
     leaq do_general_protection(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
     jmp Err_Code
 
 // 14 #PF 页错误
-ENTRY(page_fault)
+ENTRY(trap_page_fault)
     // === 页故障 #PF ==
     // 有错误码
     pushq %rax
@@ -268,7 +268,7 @@ ENTRY(page_fault)
 // 15 Intel保留，请勿使用
 
 // 16 #MF X87 FPU错误（计算错误）
-ENTRY(x87_FPU_error)
+ENTRY(trap_x87_FPU_error)
     pushq $0
     pushq %rax
     leaq do_x87_FPU_error(%rip), %rax    // 获取中断服务程序的地址
@@ -276,14 +276,14 @@ ENTRY(x87_FPU_error)
     jmp Err_Code
 
 // 17 #AC 对齐检测
-ENTRY(alignment_check)
+ENTRY(trap_alignment_check)
     pushq %rax
     leaq do_alignment_check(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
     jmp Err_Code
 
 // 18 #MC 机器检测
-ENTRY(machine_check)
+ENTRY(trap_machine_check)
     pushq $0
     pushq %rax
     leaq do_machine_check(%rip), %rax    // 获取中断服务程序的地址
@@ -291,7 +291,7 @@ ENTRY(machine_check)
     jmp Err_Code
 
 // 19 #XM SIMD浮点异常
-ENTRY(SIMD_exception)
+ENTRY(trap_SIMD_exception)
     pushq $0
     pushq %rax
     leaq do_SIMD_exception(%rip), %rax    // 获取中断服务程序的地址
@@ -299,7 +299,7 @@ ENTRY(SIMD_exception)
     jmp Err_Code
 
 // 20 #VE 虚拟化异常
-ENTRY(virtualization_exception)
+ENTRY(trap_virtualization_exception)
     pushq $0
     pushq %rax
     leaq do_virtualization_exception(%rip), %rax    // 获取中断服务程序的地址

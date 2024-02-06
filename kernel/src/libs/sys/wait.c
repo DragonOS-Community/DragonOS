@@ -11,5 +11,5 @@
  */
 pid_t waitpid(pid_t pid, int *stat_loc, int options)
 {
-    return (pid_t)enter_syscall_int(SYS_WAIT4, (uint64_t)pid, (uint64_t)stat_loc, options, 0, 0, 0, 0, 0);
+    return (pid_t)enter_syscall_int(SYS_WAIT4, (uint64_t)pid, (uint64_t)stat_loc, options, 0, 0, 0);
 }

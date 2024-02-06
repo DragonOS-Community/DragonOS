@@ -3,7 +3,7 @@ use intertrait::CastFrom;
 use smoltcp::{
     iface::SocketHandle,
     socket::{raw, tcp, udp},
-    storage, wire,
+    wire,
 };
 use system_error::SystemError;
 
@@ -870,13 +870,13 @@ impl Socket for TcpSocket {
 
 /// # 表示 seqpacket socket
 #[derive(Debug, Clone)]
-pub struct SeqpacketSocket<'a> {
+pub struct SeqpacketSocket {
     metadata: SocketMetadata,
-    buffer: Arc<SpinLock<storage::PacketBuffer<'a, ()>>>,
-    peer_buffer: Option<Arc<SpinLock<storage::PacketBuffer<'a, ()>>>>,
+    buffer: Arc<SpinLock<Vec<u8>>>,
+    peer_buffer: Option<Arc<SpinLock<Vec<u8>>>>,
 }
 
-impl<'a> SeqpacketSocket<'a> {
+impl SeqpacketSocket {
     /// 默认的元数据缓冲区大小
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
     /// 默认的缓冲区大小
@@ -887,10 +887,7 @@ impl<'a> SeqpacketSocket<'a> {
     /// ## 参数
     /// - `options`: socket的选项
     pub fn new(options: SocketOptions) -> Self {
-        let buffer = storage::PacketBuffer::new(
-            vec![storage::PacketMetadata::<()>::EMPTY; Self::DEFAULT_METADATA_BUF_SIZE],
-            vec![0; Self::DEFAULT_BUF_SIZE],
-        );
+        let buffer = Vec::with_capacity(Self::DEFAULT_BUF_SIZE);
 
         let metadata = SocketMetadata::new(
             SocketType::SeqpacketSocket,
@@ -900,34 +897,28 @@ impl<'a> SeqpacketSocket<'a> {
             options,
         );
 
-        let buffer = Arc::new(SpinLock::new(buffer));
-
         return Self {
             metadata,
-            buffer,
+            buffer: Arc::new(SpinLock::new(buffer)),
             peer_buffer: None,
         };
     }
 
-    fn buffer(&self) -> Arc<SpinLock<storage::PacketBuffer<'a, ()>>> {
+    fn buffer(&self) -> Arc<SpinLock<Vec<u8>>> {
         self.buffer.clone()
     }
 
-    fn set_peer_buffer(&mut self, peer_buffer: Arc<SpinLock<storage::PacketBuffer<'a, ()>>>) {
+    fn set_peer_buffer(&mut self, peer_buffer: Arc<SpinLock<Vec<u8>>>) {
         self.peer_buffer = Some(peer_buffer);
     }
 }
 
-impl Socket for SeqpacketSocket<'_> {
+impl Socket for SeqpacketSocket {
     fn read(&mut self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
-        let mut buffer = self.buffer.lock_irqsave();
-        let len = if let Ok(((), packet_buf)) = buffer.dequeue() {
-            let length = core::cmp::min(buf.len(), packet_buf.len());
-            buf[..length].copy_from_slice(&packet_buf[..length]);
-            length
-        } else {
-            0
-        };
+        let buffer = self.buffer.lock_irqsave();
+
+        let len = core::cmp::min(buf.len(), buffer.len());
+        buf[..len].copy_from_slice(&buffer[..len]);
 
         (Ok(len), Endpoint::Unused)
     }
@@ -940,12 +931,14 @@ impl Socket for SeqpacketSocket<'_> {
 
         let binding = self.peer_buffer.clone().unwrap();
         let mut peer_buffer = binding.lock_irqsave();
-        if let Ok(packet_buf) = peer_buffer.enqueue(buf.len(), ()) {
-            packet_buf.copy_from_slice(buf);
-            return Ok(buf.len());
-        } else {
+
+        let len = buf.len();
+        if peer_buffer.capacity() - peer_buffer.len() < len {
             return Err(SystemError::ENOBUFS);
         }
+        peer_buffer[..len].copy_from_slice(buf);
+
+        Ok(len)
     }
 
     fn socketpair_ops(&self) -> Option<&'static dyn SocketpairOps> {
@@ -957,7 +950,7 @@ impl Socket for SeqpacketSocket<'_> {
     }
 
     fn box_clone(&self) -> Box<dyn Socket> {
-        todo!()
+        Box::new(self.clone())
     }
 }
 

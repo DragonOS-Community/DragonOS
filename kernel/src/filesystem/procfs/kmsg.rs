@@ -71,9 +71,9 @@ impl Kmsg {
 
         // 拷贝数据
         let src = &self.data[0..len];
-        buf[0..src.len()].copy_from_slice(src);
+        buf[0..len].copy_from_slice(src);
 
-        return Ok(src.len());
+        return Ok(len);
     }
 
     /// 读取缓冲区特定level的日志消息
@@ -90,7 +90,7 @@ impl Kmsg {
 
         // 拷贝数据
         let src = &data_level[0..len];
-        buf[0..src.len()].copy_from_slice(src);
+        buf[0..len].copy_from_slice(src);
 
         // 将控制台输出日志level改回默认，否则之后都是打印特定level的日志消息
         self.console_loglevel = LogLevel::DEFAULT;

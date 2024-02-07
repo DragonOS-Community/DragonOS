@@ -278,7 +278,7 @@ else
 fi
 
 # 安装rust
-rustInstall     
+rustInstall
 
 
 #  初始化DragonOS的musl交叉编译工具链

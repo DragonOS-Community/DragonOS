@@ -27,7 +27,7 @@ pub struct PipeFsPrivateData {
 
 impl PipeFsPrivateData {
     pub fn new(mode: FileMode) -> Self {
-        return PipeFsPrivateData { mode: mode };
+        return PipeFsPrivateData { mode };
     }
 
     pub fn set_mode(&mut self, mode: FileMode) {

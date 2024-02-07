@@ -369,7 +369,7 @@ impl ProcessManager {
 
     pub unsafe fn release(pid: Pid) {
         let pcb = ProcessManager::find(pid);
-        if !pcb.is_none() {
+        if pcb.is_some() {
             // let pcb = pcb.unwrap();
             // 判断该pcb是否在全局没有任何引用
             // TODO: 当前，pcb的Arc指针存在泄露问题，引用计数不正确，打算在接下来实现debug专用的Arc，方便调试，然后解决这个bug。

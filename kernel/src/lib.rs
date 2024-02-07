@@ -10,7 +10,6 @@
 #![feature(const_refs_to_cell)]
 #![feature(core_intrinsics)]
 #![feature(c_void_variant)]
-#![feature(downcast_unchecked)]
 #![feature(extract_if)]
 #![feature(inline_const)]
 #![feature(naked_functions)]

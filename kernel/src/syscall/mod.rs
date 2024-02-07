@@ -7,6 +7,7 @@ use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
     driver::base::device::device_number::DeviceNumber,
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
+    net::syscall::MsgHdr,
     process::{
         fork::KernelCloneArgs,
         resource::{RLimit64, RUsage},
@@ -542,7 +543,6 @@ impl Syscall {
             }
 
             SYS_RECVMSG => {
-                use crate::net::syscall::MsgHdr;
                 let msg = args[1] as *mut MsgHdr;
                 let flags = args[2] as u32;
 

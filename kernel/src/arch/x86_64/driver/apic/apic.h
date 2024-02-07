@@ -217,16 +217,10 @@ struct apic_IO_APIC_RTE_entry
 void do_IRQ(struct pt_regs *rsp, ul number);
 void rs_apic_init_ap();
 
-/**
- * @brief 初始化apic控制器
- *
- */
-int apic_init();
-
 #if ARCH(I386) || ARCH(X86_64)
 
-    // =========== 中断控制操作接口 ============
-    void apic_ioapic_enable(ul irq_num);
+// =========== 中断控制操作接口 ============
+void apic_ioapic_enable(ul irq_num);
 void apic_ioapic_disable(ul irq_num);
 ul apic_ioapic_install(ul irq_num, void *arg);
 void apic_ioapic_uninstall(ul irq_num);

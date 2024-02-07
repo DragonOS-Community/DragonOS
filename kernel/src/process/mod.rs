@@ -138,6 +138,17 @@ impl ProcessManager {
         return ProcessControlBlock::arch_current_pcb();
     }
 
+    /// 获取当前进程的pid
+    ///
+    /// 如果进程管理器未初始化完成，那么返回0
+    pub fn current_pid() -> Pid {
+        if unlikely(unsafe { !__PROCESS_MANAGEMENT_INIT_DONE }) {
+            return Pid(0);
+        }
+
+        return ProcessManager::current_pcb().pid();
+    }
+
     /// 增加当前进程的锁持有计数
     #[inline(always)]
     pub fn preempt_disable() {

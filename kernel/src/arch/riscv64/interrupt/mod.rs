@@ -1,3 +1,5 @@
+use system_error::SystemError;
+
 use crate::exception::{InterruptArch, IrqFlags, IrqFlagsGuard};
 
 pub mod ipi;
@@ -5,6 +7,9 @@ pub mod ipi;
 pub struct RiscV64InterruptArch;
 
 impl InterruptArch for RiscV64InterruptArch {
+    unsafe fn arch_irq_init() -> Result<(), SystemError> {
+        todo!("RiscV64InterruptArch::arch_irq_init")
+    }
     unsafe fn interrupt_enable() {
         riscv::interrupt::enable();
     }

@@ -16,7 +16,7 @@ members = [
 ]
 
 [features]
-default = ["backtrace"]
+default = ["backtrace", "kvm"]
 # 内核栈回溯
 backtrace = []
 # kvm
@@ -50,6 +50,7 @@ virtio-drivers = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community
 fdt = "0.1.5"
 uefi = { version = "0.26.0", features = ["alloc"] }
 uefi-raw = "0.5.0"
+paste = "1.0.14"
 
 
 # target为x86_64时，使用下面的依赖
@@ -62,6 +63,7 @@ x86_64 = "0.14.10"
 # target为riscv64时，使用下面的依赖
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 riscv = { version = "0.11.0", features = [ "s-mode" ] }
+sbi-rt = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/rustsbi.git", rev = "80478bc417", features = ["legacy"] }
 
 
 # 构建时依赖项

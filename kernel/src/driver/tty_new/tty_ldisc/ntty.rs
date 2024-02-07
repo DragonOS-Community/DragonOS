@@ -300,6 +300,9 @@ impl NTtyData {
 
         let mut offset = 0;
         while count > 0 {
+            if offset >= buf.len() {
+                break;
+            }
             let mut c = buf[offset];
             offset += 1;
 
@@ -383,18 +386,18 @@ impl NTtyData {
         }
         drop(flow);
 
-        if c == '\r' as u8 {
+        if c == b'\r' {
             if termios.input_mode.contains(InputMode::IGNCR) {
                 // 忽略
                 return;
             }
             if termios.input_mode.contains(InputMode::ICRNL) {
                 // 映射为换行
-                c = '\n' as u8;
+                c = b'\n';
             }
-        } else if c == '\n' as u8 && termios.input_mode.contains(InputMode::INLCR) {
+        } else if c == b'\n' && termios.input_mode.contains(InputMode::INLCR) {
             // 映射为回车
-            c = '\r' as u8;
+            c = b'\r';
         }
 
         if self.icanon {
@@ -414,7 +417,7 @@ impl NTtyData {
                 if termios.local_mode.contains(LocalMode::ECHO) {
                     self.finish_erasing();
                     if termios.local_mode.contains(LocalMode::ECHOCTL) {
-                        self.echo_char_raw('^' as u8);
+                        self.echo_char_raw(b'^');
                         self.echo_char_raw(8);
                         self.commit_echoes(tty.clone());
                     }
@@ -428,7 +431,7 @@ impl NTtyData {
                 let mut tail = self.canon_head;
                 self.finish_erasing();
                 self.echo_char(c, &termios);
-                self.echo_char_raw('\n' as u8);
+                self.echo_char_raw(b'\n');
                 while ntty_buf_mask(tail) != ntty_buf_mask(self.read_head) {
                     self.echo_char(self.read_buf[ntty_buf_mask(tail)], &termios);
                     tail += 1;
@@ -437,11 +440,11 @@ impl NTtyData {
                 return;
             }
 
-            if c == '\n' as u8 {
+            if c == b'\n' {
                 if termios.local_mode.contains(LocalMode::ECHO)
                     || termios.local_mode.contains(LocalMode::ECHONL)
                 {
-                    self.echo_char_raw('\n' as u8);
+                    self.echo_char_raw(b'\n');
                     self.commit_echoes(tty.clone());
                 }
 
@@ -499,8 +502,8 @@ impl NTtyData {
 
         if termios.local_mode.contains(LocalMode::ECHO) {
             self.finish_erasing();
-            if c == '\n' as u8 {
-                self.echo_char_raw('\n' as u8);
+            if c == b'\n' {
+                self.echo_char_raw(b'\n');
             } else {
                 if self.canon_head == self.read_head {
                     self.add_echo_byte(EchoOperation::Start.to_u8());
@@ -549,7 +552,7 @@ impl NTtyData {
 
                 if termios.local_mode.contains(LocalMode::ECHOK) {
                     // 添加新行
-                    self.echo_char_raw('\n' as u8);
+                    self.echo_char_raw(b'\n');
                 }
                 return;
             }
@@ -565,8 +568,8 @@ impl NTtyData {
                 head -= 1;
                 c = self.read_buf[ntty_buf_mask(head)];
 
-                if Self::is_continuation(c, termios)
-                    && ntty_buf_mask(head) != ntty_buf_mask(self.canon_head)
+                if !(Self::is_continuation(c, termios)
+                    && ntty_buf_mask(head) != ntty_buf_mask(self.canon_head))
                 {
                     break;
                 }
@@ -585,7 +588,7 @@ impl NTtyData {
             if termios.local_mode.contains(LocalMode::ECHO) {
                 if termios.local_mode.contains(LocalMode::ECHOPRT) {
                     if !self.erasing {
-                        self.echo_char_raw('\\' as u8);
+                        self.echo_char_raw(b'\\');
                         self.erasing = true;
                     }
                     self.echo_char(c, termios);
@@ -602,7 +605,7 @@ impl NTtyData {
                         termios.control_characters[ContorlCharIndex::VERASE],
                         termios,
                     );
-                } else if c == '\t' as u8 {
+                } else if c == b'\t' {
                     let mut num_chars = 0;
                     let mut after_tab = false;
                     let mut tail = self.read_head;
@@ -610,7 +613,7 @@ impl NTtyData {
                     while ntty_buf_mask(tail) != ntty_buf_mask(self.canon_head) {
                         tail -= 1;
                         c = self.read_buf[ntty_buf_mask(tail)];
-                        if c == '\t' as u8 {
+                        if c == b'\t' {
                             after_tab = true;
                             break;
                         } else if (c as char).is_control() {
@@ -627,7 +630,7 @@ impl NTtyData {
                     if (c as char).is_control() && termios.local_mode.contains(LocalMode::ECHOCTL) {
                         // 8 => '\b'
                         self.echo_char_raw(8);
-                        self.echo_char_raw(' ' as u8);
+                        self.echo_char_raw(b' ');
                         self.echo_char_raw(8);
                     }
 
@@ -635,7 +638,7 @@ impl NTtyData {
                     {
                         // 8 => '\b'
                         self.echo_char_raw(8);
-                        self.echo_char_raw(' ' as u8);
+                        self.echo_char_raw(b' ');
                         self.echo_char_raw(8);
                     }
                 }
@@ -653,7 +656,7 @@ impl NTtyData {
 
     fn finish_erasing(&mut self) {
         if self.erasing {
-            self.echo_char_raw('/' as u8);
+            self.echo_char_raw(b'/');
             self.erasing = false;
         }
     }
@@ -765,7 +768,7 @@ impl NTtyData {
 
         if termios.local_mode.contains(LocalMode::ECHO) {
             if self.erasing {
-                self.add_echo_byte('/' as u8);
+                self.add_echo_byte(b'/');
                 self.erasing = false;
             }
 
@@ -791,7 +794,7 @@ impl NTtyData {
         } else {
             if termios.local_mode.contains(LocalMode::ECHOCTL)
                 && (c as char).is_control()
-                && c != '\t' as u8
+                && c != b'\t'
             {
                 self.add_echo_byte(EchoOperation::Start.to_u8());
             }
@@ -869,9 +872,15 @@ impl NTtyData {
     ///
     /// ### to: 存储数据
     /// ### tail: 读取尾
-    pub fn ntty_copy(&mut self, to: &mut [u8], tail: usize, n: usize) -> Result<(), SystemError> {
-        if to.len() < n {
-            return Err(SystemError::EINVAL);
+    pub fn ntty_copy(
+        &mut self,
+        to: &mut [u8],
+        tail: usize,
+        n: &mut usize,
+    ) -> Result<(), SystemError> {
+        if to.len() < *n {
+            *n = to.len();
+            // return Err(SystemError::EINVAL);
         }
 
         if tail > NTTY_BUFSIZE {
@@ -880,16 +889,16 @@ impl NTtyData {
 
         let size = NTTY_BUFSIZE - tail;
 
-        if size < n {
+        if size < *n {
             // 有一部分数据在头部,则先拷贝后面部分，再拷贝头部
             // TODO: tty审计？
             to[0..size].copy_from_slice(&self.read_buf[tail..]);
-            to[size..].copy_from_slice(&self.read_buf[..(n - size)]);
+            to[size..].copy_from_slice(&self.read_buf[..(*n - size)]);
         } else {
-            to[..(n - tail)].copy_from_slice(&self.read_buf[tail..n])
+            to[..(*n - tail)].copy_from_slice(&self.read_buf[tail..*n])
         }
 
-        self.zero_buffer(tail, n);
+        self.zero_buffer(tail, *n);
 
         Ok(())
     }
@@ -998,7 +1007,7 @@ impl NTtyData {
             n = count;
         }
 
-        self.ntty_copy(&mut dst[*offset..], tail, n)?;
+        self.ntty_copy(&mut dst[*offset..], tail, &mut n)?;
         *nr -= n;
         *offset += n;
 
@@ -1069,7 +1078,7 @@ impl NTtyData {
 
         if n > 0 {
             // 拷贝数据
-            self.ntty_copy(&mut dst[*offset..], tail, n)?;
+            self.ntty_copy(&mut dst[*offset..], tail, &mut n)?;
             // todo:审计？
             self.read_tail += n;
 
@@ -1278,9 +1287,10 @@ impl NTtyData {
                             break;
                         }
 
-                        if tty.put_char(tty.core(), '^' as u8).is_err() {
-                            tty.write(core, &['^' as u8], 1)?;
+                        if tty.put_char(tty.core(), b'^').is_err() {
+                            tty.write(core, &[b'^'], 1)?;
                         }
+
                         if tty.put_char(tty.core(), ch + 0x40).is_err() {
                             tty.write(core, &[ch + 0x40], 1)?;
                         }
@@ -1393,7 +1403,7 @@ impl NTtyData {
 
                 if termios.output_mode.contains(OutputMode::OCRNL) {
                     // 输出的\r映射为\n
-                    c = '\n' as u8;
+                    c = b'\n';
                     if termios.output_mode.contains(OutputMode::ONLRET) {
                         // \r映射为\n,但是保留\r特性
                         self.cursor_column = 0;

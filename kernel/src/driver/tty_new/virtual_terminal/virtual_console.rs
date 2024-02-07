@@ -19,13 +19,13 @@ use super::{
     Color, DrawRegion, VtMode, VtModeData, COLOR_TABLE, DEFAULT_BLUE, DEFAULT_GREEN, DEFAULT_RED,
 };
 
-pub const NPAR: usize = 16;
+pub(super) const NPAR: usize = 16;
 
 lazy_static! {
     /// 是否已经添加了软光标
-    pub static ref SOFTCURSOR_ORIGINAL: RwLock<Option<VcCursor>> = RwLock::new(None);
+    pub(super) static ref SOFTCURSOR_ORIGINAL: RwLock<Option<VcCursor>> = RwLock::new(None);
 
-    pub static ref CURRENT_VCNUM: RwLock<usize> = RwLock::new(0);
+    pub static ref CURRENT_VCNUM: RwLock<Option<usize>> = RwLock::new(None);
 }
 
 /// ## 虚拟控制台的信息
@@ -139,7 +139,7 @@ pub struct VirtualConsoleData {
     driver_funcs: Option<Weak<dyn ConsoleSwitch>>,
 
     /// 对应的tty端口
-    pub port: Arc<dyn TtyPort>,
+    port: Arc<dyn TtyPort>,
 }
 
 impl VirtualConsoleData {
@@ -205,7 +205,7 @@ impl VirtualConsoleData {
         }
     }
 
-    pub fn init(&mut self, rows: Option<usize>, cols: Option<usize>, _clear: bool) {
+    pub(super) fn init(&mut self, rows: Option<usize>, cols: Option<usize>, _clear: bool) {
         if rows.is_some() {
             self.rows = rows.unwrap();
         }
@@ -226,15 +226,20 @@ impl VirtualConsoleData {
         self.screen_buf.resize(self.cols * self.rows, 0);
     }
 
-    pub fn driver_funcs(&self) -> Arc<dyn ConsoleSwitch> {
+    fn driver_funcs(&self) -> Arc<dyn ConsoleSwitch> {
         self.driver_funcs.as_ref().unwrap().upgrade().unwrap()
     }
 
-    pub fn set_driver_funcs(&mut self, func: Weak<dyn ConsoleSwitch>) {
+    pub(super) fn set_driver_funcs(&mut self, func: Weak<dyn ConsoleSwitch>) {
         self.driver_funcs = Some(func);
     }
 
-    pub fn reset(&mut self) {
+    #[inline]
+    pub fn port(&self) -> Arc<dyn TtyPort> {
+        self.port.clone()
+    }
+
+    pub(super) fn reset(&mut self) {
         self.mode = KDMode::KdText;
         // unicode?
         self.vt_mode.mode = VtMode::Auto;
@@ -261,7 +266,7 @@ impl VirtualConsoleData {
         self.update_attr();
     }
 
-    pub fn reset_palette(&mut self) {
+    fn reset_palette(&mut self) {
         for (idx, color) in self.palette.iter_mut().enumerate() {
             color.red = DEFAULT_RED[idx];
             color.green = DEFAULT_GREEN[idx];
@@ -271,7 +276,7 @@ impl VirtualConsoleData {
         self.set_palette();
     }
 
-    pub fn set_palette(&self) {
+    fn set_palette(&self) {
         if self.mode != KDMode::KdGraphics {
             // todo: 通知driver层的Console
             let _ = self.driver_funcs().con_set_palette(self, COLOR_TABLE);
@@ -285,7 +290,7 @@ impl VirtualConsoleData {
     ///
     /// ### 返回值
     /// ### （转换后的字符:i32，是否需要更多的数据才能进行转换:bool）
-    pub fn translate(&mut self, c: &mut u32) -> (Option<u32>, bool) {
+    pub(super) fn translate(&mut self, c: &mut u32) -> (Option<u32>, bool) {
         if self.vc_state != VirtualConsoleState::ESnormal {
             // 在控制字符状态下不需要翻译
             return (Some(*c), false);
@@ -317,7 +322,7 @@ impl VirtualConsoleData {
     /// ### （转换后的字符:i32，是否需要重新传入该字符:bool）
     ///
     /// !!! 注意，该函数返回true时，元组的第一个数据是无效数据（未转换完成）
-    pub fn translate_unicode(&mut self, c: u32) -> (Option<u32>, bool) {
+    fn translate_unicode(&mut self, c: u32) -> (Option<u32>, bool) {
         // 收到的字符不是首个
         if (c & 0xc8) == 0x80 {
             // 已经不需要继续的字符了，说明这个字符是非法的
@@ -383,7 +388,7 @@ impl VirtualConsoleData {
     }
 
     /// ## 翻译字符，将字符转换为Ascii
-    pub fn translate_ascii(&self, c: u32) -> u32 {
+    fn translate_ascii(&self, c: u32) -> u32 {
         let mut c = c;
         if self.toggle_meta {
             c |= 0x80;
@@ -396,7 +401,7 @@ impl VirtualConsoleData {
     /// Unicode 代码点的范围是从 U+0000 到 U+10FFFF，
     /// 但是有一些特殊的代码点是无效的或者保留给特定用途的。
     /// 这个函数的主要目的是将无效的 Unicode 代码点替换为 U+FFFD，即 Unicode 替代字符。
-    pub fn sanitize_unicode(c: u32) -> u32 {
+    fn sanitize_unicode(c: u32) -> u32 {
         if (c >= 0xd800 && c <= 0xdfff) || c == 0xfffe || c == 0xffff {
             return 0xfffd;
         }
@@ -413,7 +418,7 @@ impl VirtualConsoleData {
     const CTRL_ALWAYS: u32 = 0x0800f501;
 
     /// ## 用于判断tc(终端字符)在当前VC下是不是需要显示的控制字符
-    pub fn is_control(&self, tc: u32, c: u32) -> bool {
+    pub(super) fn is_control(&self, tc: u32, c: u32) -> bool {
         // 当前vc状态机不在正常状态，即在接收特殊字符的状态，则是控制字符
         if self.vc_state != VirtualConsoleState::ESnormal {
             return true;
@@ -443,7 +448,7 @@ impl VirtualConsoleData {
         false
     }
 
-    pub fn set_cursor(&mut self) {
+    pub(super) fn set_cursor(&mut self) {
         if self.mode == KDMode::KdGraphics {
             return;
         }
@@ -460,7 +465,7 @@ impl VirtualConsoleData {
     }
 
     /// ## 添加软光标
-    pub fn add_softcursor(&mut self) {
+    fn add_softcursor(&mut self) {
         let mut i = self.screen_buf[self.pos] as u32;
         let cursor_type = self.cursor_type;
 
@@ -498,14 +503,14 @@ impl VirtualConsoleData {
                 .con_putc(&self, i as u16, self.state.y as u32, self.state.x as u32);
     }
 
-    pub fn hide_cursor(&mut self) {
+    fn hide_cursor(&mut self) {
         // TODO: 处理选择
 
         self.driver_funcs().con_cursor(self, CursorOperation::Erase);
         self.hide_softcursor();
     }
 
-    pub fn hide_softcursor(&mut self) {
+    fn hide_softcursor(&mut self) {
         let softcursor = SOFTCURSOR_ORIGINAL.upgradeable_read_irqsave();
         if softcursor.is_some() {
             self.screen_buf[self.pos] = softcursor.unwrap().bits as u16;
@@ -520,7 +525,7 @@ impl VirtualConsoleData {
         }
     }
 
-    pub fn gotoxay(&mut self, x: i32, y: i32) {
+    fn gotoxay(&mut self, x: i32, y: i32) {
         if self.origin_mode {
             self.gotoxy(x, self.top as i32 + y);
         } else {
@@ -529,7 +534,7 @@ impl VirtualConsoleData {
     }
 
     // ## 将当前vc的光标移动到目标位置
-    pub fn gotoxy(&mut self, x: i32, y: i32) {
+    fn gotoxy(&mut self, x: i32, y: i32) {
         if x < 0 {
             self.state.x = 0;
         } else {
@@ -562,7 +567,7 @@ impl VirtualConsoleData {
         self.need_wrap = false;
     }
 
-    pub fn scroll(&mut self, dir: ScrollDir, mut nr: usize) {
+    fn scroll(&mut self, dir: ScrollDir, mut nr: usize) {
         // todo: uniscr_srceen
 
         if self.top + nr >= self.bottom {
@@ -595,7 +600,7 @@ impl VirtualConsoleData {
     }
 
     /// ## 退格
-    pub fn backspace(&mut self) {
+    fn backspace(&mut self) {
         if self.state.x > 0 {
             self.pos -= 1;
             self.state.x -= 1;
@@ -606,7 +611,7 @@ impl VirtualConsoleData {
     }
 
     /// ## 换行
-    pub fn line_feed(&mut self) {
+    fn line_feed(&mut self) {
         if self.state.y + 1 == self.bottom as usize {
             self.scroll(ScrollDir::Up, 1);
         } else if self.state.y < self.rows - 1 {
@@ -619,7 +624,7 @@ impl VirtualConsoleData {
     }
 
     /// ## 回车
-    pub fn carriage_return(&mut self) {
+    fn carriage_return(&mut self) {
         // 写入位置回退到该行最前
         self.pos -= self.state.x;
         self.need_wrap = false;
@@ -627,12 +632,12 @@ impl VirtualConsoleData {
     }
 
     /// ## Del
-    pub fn delete(&mut self) {
+    fn delete(&mut self) {
         // ignore
     }
 
     /// ## 向上滚动虚拟终端的内容，或者将光标上移一行
-    pub fn reverse_index(&mut self) {
+    fn reverse_index(&mut self) {
         if self.state.y == self.top as usize {
             self.scroll(ScrollDir::Up, 1);
         } else if self.state.y > 0 {
@@ -643,7 +648,7 @@ impl VirtualConsoleData {
     }
 
     /// https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/tty/vt/vt.c#restore_cur
-    pub fn restore_cursor(&mut self) {
+    fn restore_cursor(&mut self) {
         self.saved_state = self.state.clone();
 
         self.gotoxy(self.state.x as i32, self.state.y as i32);
@@ -656,7 +661,7 @@ impl VirtualConsoleData {
     }
 
     /// ## 设置当前vt的各项属性
-    pub fn set_mode(&mut self, on_off: bool) {
+    fn set_mode(&mut self, on_off: bool) {
         for i in 0..self.npar as usize {
             if self.private == Vt102_OP::EPdec {
                 match self.par[i] {
@@ -711,7 +716,7 @@ impl VirtualConsoleData {
         }
     }
 
-    pub fn do_getpars(&mut self, c: char) {
+    fn do_getpars(&mut self, c: char) {
         if c == ';' && self.npar < (NPAR - 1) as u32 {
             self.npar += 1;
             return;
@@ -1121,7 +1126,7 @@ impl VirtualConsoleData {
     }
 
     /// ## 处理终端控制字符
-    pub fn do_control(&mut self, ch: u32) {
+    pub(super) fn do_control(&mut self, ch: u32) {
         // 首先检查是否处于 ANSI 控制字符串状态
         if self.vc_state.is_ansi_control_string() && ch >= 8 && ch <= 13 {
             return;
@@ -1395,7 +1400,12 @@ impl VirtualConsoleData {
         }
     }
 
-    pub fn console_write_normal(&mut self, mut tc: u32, c: u32, draw: &mut DrawRegion) -> bool {
+    pub(super) fn console_write_normal(
+        &mut self,
+        mut tc: u32,
+        c: u32,
+        draw: &mut DrawRegion,
+    ) -> bool {
         let mut attr = self.attr;
         let himask = self.hi_font_mask;
         let charmask = if himask == 0 { 0xff } else { 0x1ff };
@@ -1504,7 +1514,7 @@ impl VirtualConsoleData {
     }
 
     /// ## 当前vc插入nr个字符
-    pub fn insert_char(&mut self, nr: usize) {
+    fn insert_char(&mut self, nr: usize) {
         // TODO: 管理unicode屏幕信息
 
         let pos = self.pos;
@@ -1523,7 +1533,7 @@ impl VirtualConsoleData {
     }
 
     /// ## 更新虚拟控制台指定区域的显示
-    pub fn do_update_region(&self, mut start: usize, mut count: usize) {
+    fn do_update_region(&self, mut start: usize, mut count: usize) {
         let ret = self.driver_funcs().con_getxy();
         let (mut x, mut y) = if ret.is_err() {
             let offset = start / 2;
@@ -1590,7 +1600,7 @@ impl VirtualConsoleData {
     const UNI_DIRECT_BASE: u32 = 0xf000;
     /// ## unicode字符转对应的坐标，暂时这样写，还没有适配unicode
     /// 这里是糊代码的，后面重写
-    pub fn unicode_to_index(&self, ch: u32) -> i32 {
+    fn unicode_to_index(&self, ch: u32) -> i32 {
         if ch > 0xfff {
             // 未找到
             return -4;
@@ -1608,7 +1618,7 @@ impl VirtualConsoleData {
         return -3;
     }
 
-    pub fn invert_attr(&self) -> u8 {
+    fn invert_attr(&self) -> u8 {
         if !self.color_mode {
             return self.attr ^ 0x08;
         }
@@ -1620,7 +1630,7 @@ impl VirtualConsoleData {
         return (self.attr & 0x88) | ((self.attr & 0x70) >> 4) | ((self.attr & 0x07) << 4);
     }
 
-    pub fn flush(&self, draw: &mut DrawRegion) {
+    pub(super) fn flush(&self, draw: &mut DrawRegion) {
         if draw.x.is_none() {
             return;
         }
@@ -1636,7 +1646,7 @@ impl VirtualConsoleData {
         draw.x = None;
     }
 
-    pub fn build_attr(
+    fn build_attr(
         &self,
         color: u8,
         intensity: VirtualConsoleIntensity,
@@ -1690,7 +1700,7 @@ impl VirtualConsoleData {
         ret
     }
 
-    pub fn update_attr(&mut self) {
+    pub(super) fn update_attr(&mut self) {
         self.attr = self.build_attr(
             self.state.color,
             self.state.intensity,
@@ -1712,7 +1722,7 @@ impl VirtualConsoleData {
                 << 8);
     }
 
-    pub fn default_attr(&mut self) {
+    fn default_attr(&mut self) {
         self.state.intensity = VirtualConsoleIntensity::VciNormal;
         self.state.italic = false;
         self.state.underline = false;

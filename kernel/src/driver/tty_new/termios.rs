@@ -28,19 +28,19 @@ pub struct Termios {
 lazy_static! {
     pub static ref INIT_CONTORL_CHARACTERS: [u8; CONTORL_CHARACTER_NUM] = {
         let mut chs: [u8; CONTORL_CHARACTER_NUM] = Default::default();
-        chs[ContorlCharIndex::VINTR] = 'C' as u8 - 0x40;
-        chs[ContorlCharIndex::VQUIT] = '\\' as u8 - 0x40;
+        chs[ContorlCharIndex::VINTR] = b'C' - 0x40;
+        chs[ContorlCharIndex::VQUIT] = b'\\' - 0x40;
         chs[ContorlCharIndex::VERASE] = 0o177;
-        chs[ContorlCharIndex::VKILL] = 'U' as u8 - 0x40;
-        chs[ContorlCharIndex::VEOF] = 'D' as u8 - 0x40;
-        chs[ContorlCharIndex::VSTART] = 'Q' as u8 - 0x40;
-        chs[ContorlCharIndex::VSTOP] = 'S' as u8 - 0x40;
-        chs[ContorlCharIndex::VSUSP] = 'Z' as u8 - 0x40;
-        chs[ContorlCharIndex::VREPRINT] = 'R' as u8 - 0x40;
-        chs[ContorlCharIndex::VDISCARD] = 'O' as u8 - 0x40;
-        chs[ContorlCharIndex::VWERASE] = 'W' as u8 - 0x40;
-        chs[ContorlCharIndex::VLNEXT] = 'V' as u8 - 0x40;
-        // chs[ContorlCharIndex::VDSUSP] = 'Y' as u8  - 0x40;
+        chs[ContorlCharIndex::VKILL] = b'U' - 0x40;
+        chs[ContorlCharIndex::VEOF] = b'D' - 0x40;
+        chs[ContorlCharIndex::VSTART] = b'Q' - 0x40;
+        chs[ContorlCharIndex::VSTOP] = b'S' - 0x40;
+        chs[ContorlCharIndex::VSUSP] = b'Z' - 0x40;
+        chs[ContorlCharIndex::VREPRINT] = b'R' - 0x40;
+        chs[ContorlCharIndex::VDISCARD] = b'O' - 0x40;
+        chs[ContorlCharIndex::VWERASE] = b'W' - 0x40;
+        chs[ContorlCharIndex::VLNEXT] = b'V' - 0x40;
+        // chs[ContorlCharIndex::VDSUSP] = b'Y'  - 0x40;
         chs[ContorlCharIndex::VMIN] = 1;
         return chs;
     };
@@ -263,7 +263,7 @@ bitflags! {
 pub struct ContorlCharIndex;
 #[allow(dead_code)]
 impl ContorlCharIndex {
-    pub const DISABLE_CHAR: u8 = '\0' as u8;
+    pub const DISABLE_CHAR: u8 = b'\0';
     /// 中断信号
     pub const VINTR: usize = 0;
     /// 退出信号

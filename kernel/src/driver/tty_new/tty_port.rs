@@ -1,6 +1,6 @@
 use core::fmt::Debug;
 
-use alloc::sync::Weak;
+use alloc::sync::{Arc, Weak};
 use kdepends::thingbuf::mpsc;
 use system_error::SystemError;
 
@@ -30,6 +30,10 @@ impl TtyPortData {
             receiver,
             tty: Weak::new(),
         }
+    }
+
+    pub fn tty(&self) -> Arc<TtyCore> {
+        self.tty.upgrade().unwrap()
     }
 }
 

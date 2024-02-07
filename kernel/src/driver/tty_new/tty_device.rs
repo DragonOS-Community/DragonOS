@@ -247,6 +247,11 @@ impl IndexNode for TtyDevice {
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
         Ok(())
     }
+
+    fn ioctl(&self, _cmd: u32, _data: usize) -> Result<usize, SystemError> {
+        // todo!()
+        Ok(0)
+    }
 }
 
 impl DeviceINode for TtyDevice {

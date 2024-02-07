@@ -218,9 +218,9 @@ impl TtyDriver {
         if core.port().is_none() {
             VIRT_CONSOLES[core.index()]
                 .lock()
-                .port
+                .port()
                 .setup_tty(Arc::downgrade(&tty));
-            tty.set_port(VIRT_CONSOLES[core.index()].lock().port.clone());
+            tty.set_port(VIRT_CONSOLES[core.index()].lock().port());
         }
 
         TtyLdiscManager::ldisc_setup(tty.clone(), None)?;
@@ -250,7 +250,7 @@ impl TtyDriver {
             None => Self::init_tty_device(driver, index)?,
         };
 
-        *CURRENT_VCNUM.write() = index;
+        *CURRENT_VCNUM.write() = Some(index);
 
         return Ok(tty);
     }

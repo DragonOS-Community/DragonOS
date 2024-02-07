@@ -10,6 +10,7 @@ use crate::{
     process::{
         fork::KernelCloneArgs,
         resource::{RLimit64, RUsage},
+        ProcessManager,
     },
 };
 
@@ -823,6 +824,11 @@ impl Syscall {
                 Ok(0)
             }
 
+            SYS_SETPGID => {
+                kwarn!("SYS_SETPGID has not yet been implemented");
+                Ok(0)
+            }
+
             SYS_RT_SIGPROCMASK => {
                 kwarn!("SYS_RT_SIGPROCMASK has not yet been implemented");
                 Ok(0)
@@ -967,6 +973,18 @@ impl Syscall {
                 // todo: 这个系统调用还没有实现
 
                 Err(SystemError::ENOSYS)
+            }
+
+            SYS_GETRLIMIT => {
+                let resource = args[0];
+                let rlimit = args[1] as *mut RLimit64;
+
+                Self::prlimit64(
+                    ProcessManager::current_pcb().pid(),
+                    resource,
+                    0 as *const RLimit64,
+                    rlimit,
+                )
             }
 
             SYS_SCHED_YIELD => Self::sched_yield(),

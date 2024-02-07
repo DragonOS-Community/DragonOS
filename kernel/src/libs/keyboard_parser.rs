@@ -363,10 +363,9 @@ impl TypeOneFSMState {
 
     #[inline]
     fn current_port() -> Arc<dyn TtyPort> {
-        VIRT_CONSOLES[*CURRENT_VCNUM.read_irqsave()]
+        VIRT_CONSOLES[CURRENT_VCNUM.read_irqsave().unwrap()]
             .lock_irqsave()
-            .port
-            .clone()
+            .port()
     }
 
     /// @brief 处理Prtsc按下事件

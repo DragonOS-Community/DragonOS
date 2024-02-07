@@ -44,6 +44,7 @@ pub fn start_kernel() -> ! {
 #[inline(never)]
 fn do_start_kernel() {
     init_before_mem_init();
+
     early_setup_arch().expect("setup_arch failed");
     unsafe { mm_init() };
     scm_reinit().unwrap();

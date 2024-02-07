@@ -1,5 +1,4 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use intertrait::CastFrom;
 use smoltcp::{
     iface::SocketHandle,
     socket::{raw, tcp, udp},
@@ -88,6 +87,14 @@ impl RawSocket {
 }
 
 impl Socket for RawSocket {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
+    }
+
     fn read(&mut self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         poll_ifaces();
         loop {
@@ -289,6 +296,14 @@ impl UdpSocket {
 }
 
 impl Socket for UdpSocket {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
+    }
+
     /// @brief 在read函数执行之前，请先bind到本地的指定端口
     fn read(&mut self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         loop {
@@ -533,6 +548,14 @@ impl TcpSocket {
 }
 
 impl Socket for TcpSocket {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
+    }
+
     fn read(&mut self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         if HANDLE_MAP
             .read_irqsave()
@@ -870,6 +893,7 @@ impl Socket for TcpSocket {
 
 /// # 表示 seqpacket socket
 #[derive(Debug, Clone)]
+#[cast_to(Socket)]
 pub struct SeqpacketSocket {
     metadata: SocketMetadata,
     buffer: Arc<SpinLock<Vec<u8>>>,
@@ -914,6 +938,14 @@ impl SeqpacketSocket {
 }
 
 impl Socket for SeqpacketSocket {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
+    }
+
     fn read(&mut self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         let buffer = self.buffer.lock_irqsave();
 
@@ -958,16 +990,17 @@ struct SeqpacketSocketpairOps;
 
 impl SocketpairOps for SeqpacketSocketpairOps {
     fn socketpair(&self, socket0: &mut Box<dyn Socket>, socket1: &mut Box<dyn Socket>) {
-        let pair0 = unsafe {
-            socket0
-                .mut_any()
-                .downcast_mut_unchecked::<Box<SeqpacketSocket>>()
-        };
-        let pair1 = unsafe {
-            socket1
-                .mut_any()
-                .downcast_mut_unchecked::<Box<SeqpacketSocket>>()
-        };
+        let pair0 = socket0
+            .as_mut()
+            .as_any_mut()
+            .downcast_mut::<SeqpacketSocket>()
+            .unwrap();
+
+        let pair1 = socket1
+            .as_mut()
+            .as_any_mut()
+            .downcast_mut::<SeqpacketSocket>()
+            .unwrap();
         pair0.set_peer_buffer(pair1.buffer());
         pair1.set_peer_buffer(pair0.buffer());
     }

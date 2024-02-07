@@ -83,7 +83,10 @@ pub(super) fn new_socket(
     Ok(socket)
 }
 
-pub trait Socket: Sync + Send + Debug {
+pub trait Socket: Sync + Send + Debug + Any {
+    fn as_any_ref(&self) -> &dyn Any;
+
+    fn as_any_mut(&mut self) -> &mut dyn Any;
     /// @brief 从socket中读取数据，如果socket是阻塞的，那么直到读取到数据才返回
     ///
     /// @param buf 读取到的数据存放的缓冲区

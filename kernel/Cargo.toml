@@ -63,7 +63,7 @@ x86_64 = "0.14.10"
 # target为riscv64时，使用下面的依赖
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 riscv = { version = "0.11.0", features = [ "s-mode" ] }
-sbi-rt = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/rustsbi.git", rev = "80478bc417", features = ["legacy"] }
+sbi-rt = { version = "0.0.3", features = ["legacy"] }
 
 
 # 构建时依赖项

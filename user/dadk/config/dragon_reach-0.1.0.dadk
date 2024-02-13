@@ -6,7 +6,7 @@
     "BuildFromSource": {
       "Git": {
         "url" : "https://git.mirrors.dragonos.org.cn/DragonOS-Community/DragonReach.git",
-        "revision": "df4e48991b"
+        "revision": "40362c48d6"
       }
     }
   },

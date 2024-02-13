@@ -16,7 +16,7 @@ DragonOS社区负责人: 龙进
 
 DragonOS官网： https://DragonOS.org
 
-了解开发动态、开发任务，请访问DragonOS的zulip社群： https://DragonOS.zulipchat.com
+了解开发动态、开发任务，请访问DragonOS的论坛： https://bbs.dragonos.org.cn
 
 
 赞助及捐赠

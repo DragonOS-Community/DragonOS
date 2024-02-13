@@ -10,7 +10,7 @@ use super::CurrentIrqArch;
 #[no_mangle]
 pub extern "C" fn sched() {
     unsafe {
-        enter_syscall_int(SYS_SCHED as u64, 0, 0, 0, 0, 0, 0, 0, 0);
+        enter_syscall_int(SYS_SCHED as u64, 0, 0, 0, 0, 0, 0);
     }
 }
 

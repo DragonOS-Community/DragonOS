@@ -6,5 +6,6 @@ pub fn current_cpu_id() -> u32 {
 
 /// 重置cpu
 pub unsafe fn cpu_reset() -> ! {
-    unimplemented!("RiscV64 cpu_reset")
+    sbi_rt::system_reset(sbi_rt::WarmReboot, sbi_rt::NoReason);
+    unimplemented!("RiscV64 reset failed, manual override expected ...")
 }

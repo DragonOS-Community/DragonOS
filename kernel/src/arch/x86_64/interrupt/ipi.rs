@@ -67,6 +67,7 @@ impl Into<ApicId> for ArchIpiTarget {
 }
 
 impl ArchIpiTarget {
+    #[allow(dead_code)]
     pub fn shorthand(&self) -> u8 {
         match self {
             ArchIpiTarget::Specified(_) => 0,

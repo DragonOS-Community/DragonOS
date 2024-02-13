@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     event_poll::{EPollEventType, EventPoll},
-    socket::{TcpSocket, HANDLE_MAP, SOCKET_SET},
+    socket::{sockets::TcpSocket, HANDLE_MAP, SOCKET_SET},
 };
 
 /// The network poll function, which will be called by timer.
@@ -158,7 +158,7 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
         for (_, iface) in guard.iter() {
             iface.poll(&mut sockets).ok();
         }
-        let _ = send_event(&sockets);
+        send_event(&sockets)?;
         return Ok(());
     }
 

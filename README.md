@@ -2,8 +2,9 @@
   <img width="40%" src="docs/_static/dragonos-logo.svg" alt="dragonos-logo"></br>
   <h2>打造完全自主可控的数字化未来！</h2>
 
-  [![Static Badge](https://img.shields.io/badge/%E5%AE%98%E7%BD%91-DragonOS.org-4c69e4)](https://dragonos.org)
-  [![Static Badge](https://img.shields.io/badge/社区-dragonos.zulipchat.com-9561e8)](https://dragonos.zulipchat.com)
+<a href="https://dragonos.org"><img alt="官网" src="https://img.shields.io/badge/%E5%AE%98%E7%BD%91-DragonOS.org-4c69e4?link=https%3A%2F%2Fbbs.dragonos.org.cn" ></a>
+<a href="https://bbs.dragonos.org.cn"><img alt="bbs" src="https://img.shields.io/badge/BBS-bbs.dragonos.org.cn-purple?link=https%3A%2F%2Fbbs.dragonos.org.cn" ></a>
+
 
 
 --- 
@@ -30,7 +31,7 @@
 
 - 项目文档  **[docs.DragonOS.org](https://docs.dragonos.org)**
 
-- **了解开发动态、开发任务，请访问DragonOS的zulip社群**： [https://DragonOS.zulipchat.com](https://DragonOS.zulipchat.com)
+- **了解开发动态、开发任务，请访问DragonOS社区论坛**： [https://bbs.dragonos.org.cn](https://bbs.dragonos.org.cn)
 
 - 软件镜像站 **[mirrors.DragonOS.org](https://mirrors.DragonOS.org)**
 - Git镜像站 **[git.mirrors.DragonOS.org](https://git.mirrors.DragonOS.org)**
@@ -54,7 +55,7 @@
 
 ## 如何加入？
 
-&emsp;&emsp;如果你愿意加入我们，你可以访问DragonOS的zulip社群，了解开发动态、开发任务： [https://DragonOS.zulipchat.com](https://DragonOS.zulipchat.com)
+&emsp;&emsp;如果你愿意加入我们，你可以访问DragonOS的论坛，了解开发动态、开发任务： [https://bbs.dragonos.org.cn](https://bbs.dragonos.org.cn)
 
 &emsp;&emsp;你也可以带着你的创意与想法，和社区的小伙伴一起讨论，为DragonOS创造一些新的功能。
 
@@ -64,7 +65,7 @@
 
 &emsp;&emsp;或者是加入我们的开发交流QQ群：**115763565**
 
-&emsp;&emsp;对于正式问题的讨论，请在 **[DragonOS的zulip社群](https://DragonOS.zulipchat.com)** 上的对应板块，使用正式的语言发帖讨论。亦或者是在本仓库的issue下提出问题。
+&emsp;&emsp;对于正式问题的讨论，请在 **[https://bbs.dragonos.org.cn](https://bbs.dragonos.org.cn)** 上的对应板块，使用正式的语言发帖讨论。亦或者是在本仓库的issue下提出问题。
 
 
 ## 贡献者名单

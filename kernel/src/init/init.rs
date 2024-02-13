@@ -4,7 +4,7 @@ use crate::{
         CurrentIrqArch, CurrentSMPArch, CurrentSchedArch,
     },
     driver::{base::init::driver_init, tty::init::tty_early_init, video::VideoRefreshManager},
-    exception::{softirq::softirq_init, InterruptArch},
+    exception::{init::irq_init, softirq::softirq_init, InterruptArch},
     filesystem::vfs::core::vfs_init,
     include::bindings::bindings::acpi_init,
     init::init_intertrait,
@@ -44,6 +44,7 @@ pub fn start_kernel() -> ! {
 #[inline(never)]
 fn do_start_kernel() {
     init_before_mem_init();
+
     early_setup_arch().expect("setup_arch failed");
     unsafe { mm_init() };
     scm_reinit().unwrap();
@@ -52,9 +53,11 @@ fn do_start_kernel() {
     vfs_init().expect("vfs init failed");
     driver_init().expect("driver init failed");
     unsafe { acpi_init() };
+    irq_init().expect("irq init failed");
     CurrentSMPArch::prepare_cpus().expect("prepare_cpus failed");
 
     setup_arch().expect("setup_arch failed");
+
     process_init();
     sched_init();
     softirq_init().expect("softirq init failed");

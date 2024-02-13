@@ -592,8 +592,7 @@ impl FileDescriptorVec {
             if let Some(file) = &self.fds[i] {
                 let to_drop = file.lock().close_on_exec();
                 if to_drop {
-                    let r = self.drop_fd(i as i32);
-                    if let Err(r) = r {
+                    if let Err(r) = self.drop_fd(i as i32) {
                         kerror!(
                             "Failed to close file: pid = {:?}, fd = {}, error = {:?}",
                             ProcessManager::current_pcb().pid(),

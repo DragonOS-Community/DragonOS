@@ -1,0 +1,22 @@
+{
+  "name": "clear",
+  "version": "0.1.0",
+  "description": "清屏",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "apps/clear"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  }
+}

@@ -1564,14 +1564,7 @@ impl VirtualConsoleData {
             if self.state.x == self.cols - 1 {
                 // 需要换行？
                 self.need_wrap = self.autowrap;
-                draw.size += 2;
-
-                if self.state.y + 1 == self.bottom as usize {
-                    // 强制换行，先这样写
-                    self.line_feed();
-                    self.carriage_return();
-                    draw.offset -= self.cols;
-                }
+                draw.size += 1;
             } else {
                 self.state.x += 1;
                 self.pos += 1;
@@ -1724,6 +1717,7 @@ impl VirtualConsoleData {
         );
 
         draw.x = None;
+        draw.size = 0;
     }
 
     fn build_attr(

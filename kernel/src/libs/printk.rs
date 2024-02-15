@@ -48,8 +48,7 @@ macro_rules! printk_color {
 macro_rules! kdebug {
     ($($arg:tt)*) => {
         $crate::libs::printk::Logger.log(7,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        // $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ DEBUG ] ({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)))
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!(""))
+        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ DEBUG ] ({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)))
     }
 }
 
@@ -57,8 +56,7 @@ macro_rules! kdebug {
 macro_rules! kinfo {
     ($($arg:tt)*) => {
         $crate::libs::printk::Logger.log(6,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        // $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ INFO ] ({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)))
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!(""))
+        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ INFO ] ({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)))
     }
 }
 

@@ -1,9 +1,18 @@
-OLD_LIBC_INSTALL_PATH=$(ROOT_PATH)/bin/sysroot/usr/old_libc
+ifeq ($(ARCH), x86_64)
+	PREFIX=x86_64-linux-musl-
+else ifeq ($(ARCH), riscv64)
+	PREFIX=riscv64-linux-musl-
+endif
 
-all: main.o
+CC=$(PREFIX)gcc
 
-	$(LD) -b elf64-x86-64 -z muldefs -o $(tmp_output_dir)/test_kvm  $(shell find . -name "*.o") $(OLD_LIBC_INSTALL_PATH)/lib/libc.a -T link.lds
 
-	$(OBJCOPY) -I elf64-x86-64 -R ".eh_frame" -R ".comment" -O elf64-x86-64 $(tmp_output_dir)/test_kvm $(output_dir)/test_kvm.elf
-main.o: main.c
-	$(CC) $(CFLAGS) -c main.c  -o main.o
+out: main.c
+	$(CC) -static -o out main.c
+
+.PHONY: install clean
+install: out
+	mv out $(DADK_CURRENT_BUILD_DIR)/test_kvm
+
+clean:
+	rm out *.o

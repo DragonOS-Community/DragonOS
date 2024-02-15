@@ -60,16 +60,9 @@ dadk_clean: install_dadk
 #dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot clean src
 #dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot clean target
 
-$(user_sub_dirs): ECHO sys_api_lib 
-
-	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" tmp_output_dir="$(tmp_output_dir)" output_dir="$(output_dir)" sys_libs_dir="$(shell pwd)/libs"
-
-app: $(user_sub_dirs) dadk_run
-
-
 all: make_output_dir
 
-	$(MAKE) app
+	$(MAKE) dadk_run
 
 	@echo 用户态程序编译完成
 

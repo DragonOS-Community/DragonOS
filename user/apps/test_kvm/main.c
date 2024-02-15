@@ -14,10 +14,11 @@
  * 1.在DragonOS的控制台输入 exec bin/test_kvm.elf
  *
  */
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
 #include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
 #define KVM_CREATE_VCPU 0x00
 #define KVM_SET_USER_MEMORY_REGION 0x01

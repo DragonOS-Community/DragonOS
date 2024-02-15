@@ -7,8 +7,8 @@ use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
         vfs::{
-            core::generate_inode_id, file::FileMode, syscall::ModeType, FileType, IndexNode,
-            Metadata,
+            core::generate_inode_id, file::FileMode, syscall::ModeType, FilePrivateData,
+            FileSystem, FileType, IndexNode, Metadata,
         },
     },
     include::bindings::bindings::vfs_file_operations_t,
@@ -90,7 +90,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: &mut crate::filesystem::vfs::FilePrivateData,
+        _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
         let guard = self.0.read();
         let func = guard.f_ops.read.unwrap();
@@ -110,16 +110,12 @@ impl IndexNode for LockedPS2KeyBoardInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: &mut crate::filesystem::vfs::FilePrivateData,
+        _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
-    fn open(
-        &self,
-        _data: &mut crate::filesystem::vfs::FilePrivateData,
-        _mode: &FileMode,
-    ) -> Result<(), SystemError> {
+    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
         let prev_ref_count = self.1.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         if prev_ref_count == 0 {
             // 第一次打开，需要初始化
@@ -130,10 +126,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
         return Ok(());
     }
 
-    fn close(
-        &self,
-        _data: &mut crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<(), SystemError> {
+    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
         let prev_ref_count = self.1.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
         if prev_ref_count == 1 {
             // 最后一次关闭，需要释放
@@ -160,7 +153,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
         return Ok(());
     }
 
-    fn fs(&self) -> alloc::sync::Arc<dyn crate::filesystem::vfs::FileSystem> {
+    fn fs(&self) -> alloc::sync::Arc<dyn FileSystem> {
         return self.0.read().fs.upgrade().unwrap();
     }
 

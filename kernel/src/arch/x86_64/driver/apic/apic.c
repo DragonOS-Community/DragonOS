@@ -5,7 +5,6 @@
 #include <common/kprint.h>
 #include <common/printk.h>
 #include <driver/acpi/acpi.h>
-#include <exception/gate.h>
 #include <exception/softirq.h>
 #include <process/process.h>
 #include <sched/sched.h>
@@ -26,29 +25,6 @@ extern void rs_ioapic_uninstall(uint8_t irq_num);
 extern void rs_ioapic_enable(uint8_t irq_num);
 extern void rs_ioapic_disable(uint8_t irq_num);
 
-/**
- * @brief 初始化apic控制器
- *
- */
-int apic_init()
-{
-    cli();
-    kinfo("Initializing APIC...");
-    // 初始化中断门， 中断使用rsp0防止在软中断时发生嵌套，然后处理器重新加载导致数据被抹掉
-    for (int i = 32; i <= 57; ++i)
-        set_intr_gate(i, 0, interrupt_table[i - 32]);
-
-    // 设置local apic中断门
-    for (int i = 150; i < 160; ++i)
-        set_intr_gate(i, 0, local_apic_interrupt_table[i - 150]);
-
-    // 初始化BSP的APIC
-    rs_apic_init_bsp();
-
-    kinfo("APIC initialized.");
-    // sti();
-    return 0;
-}
 /**
  * @brief 中断服务程序
  *

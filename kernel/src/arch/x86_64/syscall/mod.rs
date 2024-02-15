@@ -1,5 +1,3 @@
-use core::ffi::c_void;
-
 use crate::{
     arch::{
         ipc::signal::X86_64SignalArch,
@@ -7,7 +5,6 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    include::bindings::bindings::set_system_trap_gate,
     ipc::signal_types::SignalArch,
     libs::align::SafeForZero,
     mm::VirtAddr,
@@ -17,7 +14,10 @@ use crate::{
 use alloc::string::String;
 use system_error::SystemError;
 
-use super::{interrupt::TrapFrame, mm::barrier::mfence};
+use super::{
+    interrupt::{entry::set_system_trap_gate, TrapFrame},
+    mm::barrier::mfence,
+};
 
 pub mod nr;
 
@@ -128,7 +128,7 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> () {
 /// 系统调用初始化
 pub fn arch_syscall_init() -> Result<(), SystemError> {
     // kinfo!("arch_syscall_init\n");
-    unsafe { set_system_trap_gate(0x80, 0, syscall_int as *mut c_void) }; // 系统调用门
+    unsafe { set_system_trap_gate(0x80, 0, VirtAddr::new(syscall_int as usize)) }; // 系统调用门
     unsafe { init_syscall_64() };
     return Ok(());
 }

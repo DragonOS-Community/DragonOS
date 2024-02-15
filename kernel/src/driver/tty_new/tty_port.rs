@@ -32,8 +32,8 @@ impl TtyPortData {
         }
     }
 
-    pub fn tty(&self) -> Arc<TtyCore> {
-        self.tty.upgrade().unwrap()
+    pub fn tty(&self) -> Option<Arc<TtyCore>> {
+        self.tty.upgrade()
     }
 }
 

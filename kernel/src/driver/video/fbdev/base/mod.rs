@@ -1,5 +1,4 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
-use hashbrown::HashMap;
 use system_error::SystemError;
 
 use crate::{
@@ -165,7 +164,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         let mut src;
         let mut offset = 0;
         let mut j = 0;
-        for i in (0..image.height).rev() {
+        for _ in (0..image.height).rev() {
             dst = dst1.as_ptr::<u32>();
             shift = 8;
             src = offset;
@@ -428,7 +427,7 @@ pub trait FrameBufferOps {
     fn fb_destroy(&self);
 
     /// 画光标
-    fn fb_cursor(&self, cursor: &FbCursor) -> Result<(), SystemError> {
+    fn fb_cursor(&self, _cursor: &FbCursor) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
@@ -540,25 +539,27 @@ pub enum FillRectROP {
 }
 
 /// `CopyAreaData` 结构体用于表示一个矩形区域，并指定从哪个源位置复制数据。
+///
+/// 注意，源位置必须是有意义的（即包围的矩形都必须得在屏幕内）
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct CopyAreaData {
     /// 目标矩形左上角的x坐标
-    pub dx: u32,
+    pub dx: i32,
     /// 目标矩形左上角的y坐标
-    pub dy: u32,
+    pub dy: i32,
     /// 矩形的宽度
     pub width: u32,
     /// 矩形的高度
     pub height: u32,
     /// 源矩形左上角的x坐标
-    pub sx: u32,
+    pub sx: i32,
     /// 源矩形左上角的y坐标
-    pub sy: u32,
+    pub sy: i32,
 }
 
 impl CopyAreaData {
     #[allow(dead_code)]
-    pub fn new(dx: u32, dy: u32, width: u32, height: u32, sx: u32, sy: u32) -> Self {
+    pub fn new(dx: i32, dy: i32, width: u32, height: u32, sx: i32, sy: i32) -> Self {
         Self {
             dx,
             dy,
@@ -1247,7 +1248,7 @@ pub enum ScrollMode {
 impl Default for ScrollMode {
     /// ## 默认Move
     fn default() -> Self {
-        Self::Redraw
+        Self::Move
     }
 }
 

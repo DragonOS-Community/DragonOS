@@ -270,11 +270,6 @@ impl TtyCoreData {
     }
 
     #[inline]
-    pub fn vc_data(&self) -> SpinLockGuard<VirtualConsoleData> {
-        VIRT_CONSOLES[self.index].lock()
-    }
-
-    #[inline]
     pub fn vc_data_irqsave(&self) -> SpinLockGuard<VirtualConsoleData> {
         VIRT_CONSOLES[self.index].lock_irqsave()
     }

@@ -892,10 +892,10 @@ impl NTtyData {
         if size < *n {
             // 有一部分数据在头部,则先拷贝后面部分，再拷贝头部
             // TODO: tty审计？
-            to[0..size].copy_from_slice(&self.read_buf[tail..]);
-            to[size..].copy_from_slice(&self.read_buf[..(*n - size)]);
+            to[0..size].copy_from_slice(&self.read_buf[tail..(tail + size)]);
+            to[size..].copy_from_slice(&self.read_buf[(tail + size)..(*n + tail)]);
         } else {
-            to[..(*n - tail)].copy_from_slice(&self.read_buf[tail..*n])
+            to[..*n].copy_from_slice(&self.read_buf[tail..(tail + *n)])
         }
 
         self.zero_buffer(tail, *n);
@@ -946,17 +946,13 @@ impl NTtyData {
         offset: &mut usize,
     ) -> Result<bool, SystemError> {
         if *nr == 0 {
-            return Ok(true);
+            return Ok(false);
         }
 
         let canon_head = self.canon_head;
 
         // 取得能够读到的字符数，即canon_head - self.read_tail和nr最小值
-        let mut n = if *nr > (canon_head - self.read_tail) {
-            canon_head - self.read_tail
-        } else {
-            *nr
-        };
+        let mut n = (*nr).min(canon_head - self.read_tail);
 
         // 获得读尾index
         let tail = self.read_tail & (NTTY_BUFSIZE - 1);
@@ -972,6 +968,9 @@ impl NTtyData {
         let tmp = self.read_flags.next_index(tail);
         // 找到的话即为坐标，未找到的话即为NTTY_BUFSIZE
         let mut eol = if tmp.is_none() { size } else { tmp.unwrap() };
+        if eol > size {
+            eol = size
+        }
 
         // 是否需要绕回缓冲区头部
         let more = n - (size - tail);
@@ -986,6 +985,8 @@ impl NTtyData {
                 if tmp < more {
                     eol = tmp;
                 }
+            } else {
+                eol = more;
             }
             eol != more
         } else {
@@ -1282,22 +1283,37 @@ impl NTtyData {
                         tail += 3;
                     }
                     EchoOperation::Undefined(ch) => {
-                        // 不是特殊字节码，则表示控制字符 例如 ^C
-                        if space < 2 {
-                            break;
-                        }
+                        match ch {
+                            8 => {
+                                if tty.put_char(tty.core(), 8).is_err() {
+                                    tty.write(core, &[8], 1)?;
+                                }
+                                if tty.put_char(tty.core(), ' ' as u8).is_err() {
+                                    tty.write(core, &[' ' as u8], 1)?;
+                                }
+                                self.cursor_column -= 1;
+                                space -= 1;
+                                tail += 1;
+                            }
+                            _ => {
+                                // 不是特殊字节码，则表示控制字符 例如 ^C
+                                if space < 2 {
+                                    break;
+                                }
 
-                        if tty.put_char(tty.core(), b'^').is_err() {
-                            tty.write(core, &[b'^'], 1)?;
-                        }
+                                if tty.put_char(tty.core(), b'^').is_err() {
+                                    tty.write(core, &[b'^'], 1)?;
+                                }
 
-                        if tty.put_char(tty.core(), ch + 0x40).is_err() {
-                            tty.write(core, &[ch + 0x40], 1)?;
-                        }
+                                if tty.put_char(tty.core(), ch ^ 0o100).is_err() {
+                                    tty.write(core, &[ch ^ 0o100], 1)?;
+                                }
 
-                        self.cursor_column += 2;
-                        space -= 2;
-                        tail += 2;
+                                self.cursor_column += 2;
+                                space -= 2;
+                                tail += 2;
+                            }
+                        }
                     }
                 }
             } else {
@@ -1513,6 +1529,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         let mut nr = len;
 
         let mut offset = 0;
+
         // 表示接着读
         if *cookie {
             // 规范且非拓展模式
@@ -1557,7 +1574,6 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         drop(ldata);
         while nr != 0 {
             // todo: 处理packet模式
-
             let mut ldata = self.disc_data();
 
             let core = tty.core();
@@ -1632,7 +1648,6 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         if offset > 0 {
             return Ok(offset);
         }
-
         ret
     }
 
@@ -1654,7 +1669,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         }
 
         ldata.process_echoes(tty.clone());
-        drop(ldata);
+        // drop(ldata);
         let mut offset = 0;
         loop {
             if pcb.sig_info().sig_pending().has_pending() {
@@ -1665,7 +1680,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             }
             if termios.output_mode.contains(OutputMode::OPOST) {
                 while nr > 0 {
-                    let mut ldata = self.disc_data();
+                    // let mut ldata = self.disc_data();
                     // 获得一次处理后的数量
                     let ret = ldata.process_output_block(core, core.termios(), &buf[offset..], nr);
                     let num = match ret {

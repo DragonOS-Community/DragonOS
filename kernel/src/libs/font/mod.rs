@@ -1,4 +1,4 @@
-use self::font_type::{vga8x16::FONT_VGA_8X16, vga8x8::FONT_VGA_8X8};
+use self::font_type::vga8x16::FONT_VGA_8X16;
 
 pub mod font_type;
 

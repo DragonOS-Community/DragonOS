@@ -1,5 +1,3 @@
-use core::mem::MaybeUninit;
-
 use alloc::{sync::Arc, vec::Vec};
 use system_error::SystemError;
 
@@ -13,8 +11,8 @@ use crate::{
             },
         },
         video::fbdev::base::{
-            FbCursor, FbCursorSetMode, FbImage, FbVisual, FillRectData, FillRectROP, FrameBuffer,
-            ScrollMode, FRAME_BUFFER_SET,
+            CopyAreaData, FbCursor, FbCursorSetMode, FbImage, FbVisual, FillRectData, FillRectROP,
+            FrameBuffer, ScrollMode, FRAME_BUFFER_SET,
         },
     },
     libs::{
@@ -171,105 +169,6 @@ impl BlittingFbConsole {
 
         self.fb().fb_image_blit(image);
     }
-
-    /// ## scroll 中的重画辅助函数
-    ///
-    /// ### 参数
-    /// - line: 滚动开始的行
-    /// - count: 需要重画的行数
-    /// - up: 方向
-    fn scroll_redraw(
-        &self,
-        vc_data: &mut VirtualConsoleData,
-        mut line: usize,
-        mut count: usize,
-        offset: usize,
-        up: bool,
-    ) {
-        // 这里考虑使用下一行覆盖上一行的笨方法，
-        let mut d_offset = vc_data.cols * line;
-        let mut s_offset = if up {
-            d_offset + offset
-        } else {
-            d_offset - offset
-        };
-
-        while count > 0 {
-            let mut start = s_offset;
-            let le = s_offset + vc_data.cols;
-            let mut attr = 1;
-            let mut x = 0;
-
-            // 处理一行数据
-            loop {
-                let c = vc_data.screen_buf[s_offset];
-                if attr != (c & 0xff00) {
-                    // 属性改变
-                    attr = c & 0xff00;
-                    if s_offset > start {
-                        let _ = self.con_putcs(
-                            vc_data,
-                            &vc_data.screen_buf[start..],
-                            s_offset - start,
-                            line as u32,
-                            x as u32,
-                        );
-
-                        x += s_offset - start;
-                        start = s_offset + 1;
-                    }
-                }
-
-                if c == vc_data.screen_buf[d_offset] {
-                    if s_offset > start {
-                        let _ = self.con_putcs(
-                            vc_data,
-                            &vc_data.screen_buf[start..],
-                            s_offset - start,
-                            line as u32,
-                            x as u32,
-                        );
-                        x += s_offset - start + 1;
-                        start = s_offset;
-                    } else {
-                        x += 1;
-                        start += 1;
-                    }
-                }
-
-                // 更新screenbuf
-                vc_data.screen_buf[d_offset] = c;
-
-                s_offset += 1;
-                d_offset += 1;
-
-                if s_offset == le {
-                    break;
-                }
-            }
-
-            if s_offset > start {
-                // kwarn!("x {x} y {line}",);
-                let _ = self.con_putcs(
-                    vc_data,
-                    &vc_data.screen_buf[start..],
-                    s_offset - start,
-                    line as u32,
-                    x as u32,
-                );
-            }
-
-            if up {
-                line += 1;
-            } else {
-                line -= 1;
-                s_offset -= vc_data.cols;
-                d_offset -= vc_data.cols;
-            }
-
-            count -= 1;
-        }
-    }
 }
 
 impl ConsoleSwitch for BlittingFbConsole {
@@ -408,6 +307,9 @@ impl ConsoleSwitch for BlittingFbConsole {
         ypos: u32,
         xpos: u32,
     ) -> Result<(), SystemError> {
+        if count == 0 {
+            return Ok(());
+        }
         let fbcon_data = self.fbcon_data();
         let c = buf[0];
         self.put_string(
@@ -421,8 +323,22 @@ impl ConsoleSwitch for BlittingFbConsole {
         )
     }
 
-    fn con_getxy(&self) -> Result<(usize, usize, usize), SystemError> {
-        todo!()
+    fn con_getxy(
+        &self,
+        vc_data: &VirtualConsoleData,
+        pos: usize,
+    ) -> Result<(usize, usize, usize), SystemError> {
+        if pos < vc_data.screen_buf.len() {
+            let x = pos % vc_data.cols;
+            let y = pos / vc_data.cols;
+            let mut next_line_start = pos + (vc_data.cols - x);
+            if next_line_start >= vc_data.screen_buf.len() {
+                next_line_start = 0
+            }
+            return Ok((next_line_start, x, y));
+        } else {
+            return Ok((0, 0, 0));
+        }
     }
 
     fn con_cursor(
@@ -443,8 +359,13 @@ impl ConsoleSwitch for BlittingFbConsole {
         fbcon_data.cursor_flash = op != CursorOperation::Erase;
 
         drop(fbcon_data);
-        // 颜色暂且写15（白）
-        self.cursor(vc_data, op, 15, self.get_color(vc_data, c, false));
+
+        self.cursor(
+            vc_data,
+            op,
+            self.get_color(vc_data, c, true),
+            self.get_color(vc_data, c, false),
+        );
     }
 
     fn con_set_palette(
@@ -496,30 +417,74 @@ impl ConsoleSwitch for BlittingFbConsole {
                 }
 
                 match scroll_mode {
-                    ScrollMode::Move => todo!(),
+                    ScrollMode::Move => {
+                        let start = top * vc_data.cols;
+                        let end = bottom * vc_data.cols;
+                        vc_data.screen_buf[start..end].rotate_left(count * vc_data.cols);
+
+                        let _ = self.bmove(
+                            vc_data,
+                            top as i32,
+                            0,
+                            top as i32 - count as i32,
+                            0,
+                            (bottom - top) as u32,
+                            vc_data.cols as u32,
+                        );
+
+                        let _ = self.con_clear(vc_data, bottom - count, 0, count, vc_data.cols);
+
+                        let offset = vc_data.cols * (bottom - count);
+                        for i in
+                            vc_data.screen_buf[offset..(offset + (vc_data.cols * count))].iter_mut()
+                        {
+                            *i = vc_data.erase_char;
+                        }
+
+                        return true;
+                    }
                     ScrollMode::PanMove => todo!(),
                     ScrollMode::WrapMove => todo!(),
                     ScrollMode::Redraw => {
-                        // self.scroll_redraw(
-                        //     vc_data,
-                        //     top,
-                        //     bottom - top - count,
-                        //     count * vc_data.cols,
-                        //     true,
-                        // );
-
                         let start = top * vc_data.cols;
                         let end = bottom * vc_data.cols;
                         vc_data.screen_buf[start..end].rotate_left(count * vc_data.cols);
 
                         let data = &vc_data.screen_buf[start..(bottom - count) * vc_data.cols];
+
                         for line in top..(bottom - count) {
+                            let mut start = line * vc_data.cols;
+                            let end = start + vc_data.cols;
+                            let mut offset = start;
+                            let mut attr = 1;
+                            let mut x = 0;
+                            while offset < end {
+                                let c = data[offset];
+
+                                if attr != c & 0xff00 {
+                                    // 属性变化，输出完上一个的并且更新属性
+                                    attr = c & 0xff00;
+
+                                    let count = offset - start;
+                                    let _ = self.con_putcs(
+                                        vc_data,
+                                        &data[start..offset],
+                                        count,
+                                        line as u32,
+                                        x,
+                                    );
+                                    start = offset;
+                                    x += count as u32;
+                                }
+
+                                offset += 1;
+                            }
                             let _ = self.con_putcs(
                                 vc_data,
-                                &data[line * vc_data.cols..(line + 1) * vc_data.cols],
-                                vc_data.cols,
+                                &data[start..offset],
+                                offset - start,
                                 line as u32,
-                                0,
+                                x,
                             );
                         }
 
@@ -576,14 +541,24 @@ impl ConsoleSwitch for BlittingFbConsole {
 impl FrameBufferConsole for BlittingFbConsole {
     fn bmove(
         &self,
-        sy: u32,
-        sx: u32,
-        dy: u32,
-        dx: u32,
+        vc_data: &VirtualConsoleData,
+        sy: i32,
+        sx: i32,
+        dy: i32,
+        dx: i32,
         height: u32,
         width: u32,
     ) -> Result<(), SystemError> {
-        todo!()
+        let area = CopyAreaData::new(
+            dx * vc_data.font.width as i32,
+            dy * vc_data.font.height as i32,
+            width * vc_data.font.width,
+            height * vc_data.font.height,
+            sx * vc_data.font.width as i32,
+            sy * vc_data.font.height as i32,
+        );
+
+        self.fb().fb_copyarea(area)
     }
 
     fn clear(

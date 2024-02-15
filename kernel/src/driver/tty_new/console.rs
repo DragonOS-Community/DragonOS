@@ -35,8 +35,14 @@ pub trait ConsoleSwitch: Sync + Send {
         xpos: u32,
     ) -> Result<(), SystemError>;
 
-    /// 获取xy坐标，返回(start,x,y)
-    fn con_getxy(&self) -> Result<(usize, usize, usize), SystemError> {
+    /// ## 根据pos计算出对应xy
+    ///
+    /// ### 返回值： （下一行的起始偏移,x，y）
+    fn con_getxy(
+        &self,
+        _vc_data: &VirtualConsoleData,
+        _pos: usize,
+    ) -> Result<(usize, usize, usize), SystemError> {
         return Err(SystemError::ENOSYS);
     }
 

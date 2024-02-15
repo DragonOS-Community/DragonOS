@@ -27,10 +27,7 @@ use crate::{
                 platform_driver::{platform_driver_manager, PlatformDriver},
                 CompatibleTable,
             },
-        },
-        tty::serial::serial8250::send_to_default_serial8250_port,
-        tty_new::virtual_terminal::Color,
-        video::fbdev::base::{fbmem::frame_buffer_manager, FbVisual, FRAME_BUFFER_SET},
+        }, serial::serial8250::send_to_default_serial8250_port, video::fbdev::base::{fbmem::frame_buffer_manager, FbVisual, FRAME_BUFFER_SET}
     },
     filesystem::{
         kernfs::KernFSInode,
@@ -112,7 +109,6 @@ impl VesaFb {
                 fb_id: FbId::INIT,
                 fb_device: None,
                 fb_state: FbState::Suspended,
-                color_map: Default::default(),
             }),
             kobj_state: LockedKObjectState::new(None),
             fb_data: RwLock::new(fb_info_data),
@@ -135,8 +131,6 @@ struct InnerVesaFb {
     fb_id: FbId,
     fb_device: Option<Arc<FbDevice>>,
     fb_state: FbState,
-
-    color_map: Vec<Color>,
 }
 
 impl FrameBuffer for VesaFb {
@@ -382,8 +376,6 @@ impl FrameBufferOps for VesaFb {
 
     fn fb_image_blit(&self, image: &super::base::FbImage) {
         self.generic_imageblit(image);
-
-        // image.draw(dst1, bit_per_pixel, self.current_fb_fix().line_length);
     }
 
     /// ## 填充矩形
@@ -420,6 +412,97 @@ impl FrameBufferOps for VesaFb {
             _ => todo!(),
         }
 
+        Ok(())
+    }
+
+    fn fb_copyarea(&self, data: super::base::CopyAreaData) -> Result<(), SystemError> {
+        let bp = boot_params().read();
+        let base = bp.screen_info.lfb_virt_base.ok_or(SystemError::ENODEV)?;
+        let var = self.current_fb_var();
+
+        if data.sx < 0
+            || data.sy < 0
+            || data.sx as u32 > var.xres
+            || data.sx as u32 + data.width > var.xres
+            || data.sy as u32 > var.yres
+            || data.sy as u32 + data.height > var.yres
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        let bytes_per_pixel = var.bits_per_pixel >> 3;
+        let bytes_per_line = var.xres * bytes_per_pixel;
+
+        let sy = data.sy as u32;
+        let sx = data.sx as u32;
+
+        let dst = {
+            let mut dst = base;
+            if data.dy < 0 {
+                dst -= VirtAddr::new((((-data.dy) as u32) * bytes_per_line) as usize);
+            } else {
+                dst += VirtAddr::new(((data.dy as u32) * bytes_per_line) as usize);
+            }
+
+            if data.dx > 0 && (data.dx as u32) < var.xres {
+                dst += VirtAddr::new(((data.dx as u32) * bytes_per_pixel) as usize);
+            }
+
+            dst
+        };
+        let src = base + VirtAddr::new((sy * bytes_per_line + sx * bytes_per_pixel) as usize);
+
+        match bytes_per_pixel {
+            4 => {
+                // 32bpp
+                let mut dst = dst.as_ptr::<u32>();
+                let mut src = src.as_ptr::<u32>();
+
+                for y in 0..data.height as usize {
+                    if (data.dy + y as i32) < 0 || (data.dy + y as i32) > var.yres as i32 {
+                        unsafe {
+                            // core::ptr::copy(src, dst, data.width as usize);
+                            src = src.add(var.xres as usize);
+                            dst = dst.add(var.xres as usize);
+                        }
+                        continue;
+                    }
+                    if data.dx < 0 {
+                        if ((-data.dx) as u32) < data.width {
+                            unsafe {
+                                core::ptr::copy(
+                                    src.add((-data.dx) as usize),
+                                    dst,
+                                    (data.width as usize) - (-data.dx) as usize,
+                                );
+                                src = src.add(var.xres as usize);
+                                dst = dst.add(var.xres as usize);
+                            }
+                        }
+                    } else if data.dx as u32 + data.width > var.xres {
+                        if (data.dx as u32) < var.xres {
+                            unsafe {
+                                core::ptr::copy(src, dst, (var.xres - data.dx as u32) as usize);
+                                src = src.add(var.xres as usize);
+                                dst = dst.add(var.xres as usize);
+                            }
+                        }
+                    } else {
+                        for i in 0..data.width as usize {
+                            unsafe { *(dst.add(i)) = *(src.add(i)) }
+                        }
+                        unsafe {
+                            // core::ptr::copy(src, dst, data.width as usize);
+                            src = src.add(var.xres as usize);
+                            dst = dst.add(var.xres as usize);
+                        }
+                    }
+                }
+            }
+            _ => {
+                todo!()
+            }
+        }
         Ok(())
     }
 }

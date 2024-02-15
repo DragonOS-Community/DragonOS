@@ -6,17 +6,20 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    driver::base::{
-        char::CharDevice,
-        device::{
-            bus::Bus,
-            device_number::{DeviceNumber, Major},
-            device_register,
-            driver::Driver,
-            Device, DeviceKObjType, DeviceType, IdTable,
+    driver::{
+        base::{
+            char::CharDevice,
+            device::{
+                bus::Bus,
+                device_number::{DeviceNumber, Major},
+                device_register,
+                driver::Driver,
+                Device, DeviceKObjType, DeviceType, IdTable,
+            },
+            kobject::{KObject, LockedKObjectState},
+            kset::KSet,
         },
-        kobject::{KObject, LockedKObjectState},
-        kset::KSet,
+        serial::serial_init,
     },
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
@@ -102,7 +105,7 @@ impl IndexNode for TtyDevice {
         let tty = TtyDriver::open_tty(dev_num)?;
 
         // 设置privdata
-        *data = FilePrivateData::NTty(NewTtyFilePrivateData {
+        *data = FilePrivateData::Tty(TtyFilePrivateData {
             tty: tty.clone(),
             mode: *mode,
         });
@@ -140,7 +143,7 @@ impl IndexNode for TtyDevice {
         buf: &mut [u8],
         data: &mut crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, system_error::SystemError> {
-        let (tty, mode) = if let FilePrivateData::NTty(tty_priv) = data {
+        let (tty, mode) = if let FilePrivateData::Tty(tty_priv) = data {
             (tty_priv.tty.clone(), tty_priv.mode)
         } else {
             return Err(SystemError::EIO);
@@ -152,13 +155,17 @@ impl IndexNode for TtyDevice {
         loop {
             let mut size = if len > buf.len() { buf.len() } else { len };
             size = ld.read(tty.clone(), buf, size, &mut cookie, offset, mode)?;
-
             // 没有更多数据
             if size == 0 {
                 break;
             }
 
             offset += size;
+
+            // 缓冲区写满
+            if offset >= len {
+                break;
+            }
 
             // 没有更多数据
             if !cookie {
@@ -177,7 +184,7 @@ impl IndexNode for TtyDevice {
         data: &mut crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, system_error::SystemError> {
         let mut count = len;
-        let (tty, mode) = if let FilePrivateData::NTty(tty_priv) = data {
+        let (tty, mode) = if let FilePrivateData::Tty(tty_priv) = data {
             (tty_priv.tty.clone(), tty_priv.mode)
         } else {
             return Err(SystemError::EIO);
@@ -194,7 +201,6 @@ impl IndexNode for TtyDevice {
         let pcb = ProcessManager::current_pcb();
         let mut written = 0;
         loop {
-            // let write_guard = core.write_data_irqsave();
             // 至少需要写多少
             let size = chunk.min(count);
 
@@ -212,9 +218,6 @@ impl IndexNode for TtyDevice {
             if pcb.sig_info().sig_pending().has_pending() {
                 return Err(SystemError::ERESTARTSYS);
             }
-
-            // 让出所有锁，让内核能够调度
-            // drop(write_guard);
         }
 
         if written > 0 {
@@ -380,7 +383,7 @@ impl CharDevice for TtyDevice {
 }
 
 #[derive(Debug, Clone)]
-pub struct NewTtyFilePrivateData {
+pub struct TtyFilePrivateData {
     tty: Arc<TtyCore>,
     mode: FileMode,
 }
@@ -433,5 +436,7 @@ pub fn tty_init() -> Result<(), SystemError> {
     device_register(console.clone())?;
     devfs_register(tty.name, tty)?;
     devfs_register(console.name, console)?;
+
+    serial_init()?;
     return vty_init();
 }

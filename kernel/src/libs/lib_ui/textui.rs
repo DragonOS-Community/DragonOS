@@ -1,6 +1,11 @@
 use crate::{
     driver::{
-        tty::serial::serial8250::send_to_default_serial8250_port, video::video_refresh_manager,
+        serial::serial8250::send_to_default_serial8250_port,
+        tty_new::{
+            tty_driver::TtyOperation,
+            virtual_terminal::{virtual_console::CURRENT_VCNUM, VIRT_CONSOLES},
+        },
+        video::video_refresh_manager,
     },
     kdebug, kinfo,
     libs::{
@@ -984,6 +989,29 @@ where
 
 #[no_mangle]
 pub extern "C" fn rs_textui_putchar(character: u8, fr_color: u32, bk_color: u32) -> i32 {
+    let current_vcnum = CURRENT_VCNUM.read_irqsave();
+    if current_vcnum.is_some() {
+        // tty已经初始化了之后才输出到屏幕
+        let fr = (fr_color & 0x00ff0000) >> 16;
+        let fg = (fr_color & 0x0000ff00) >> 8;
+        let fb = fr_color & 0x000000ff;
+        let br = (bk_color & 0x00ff0000) >> 16;
+        let bg = (bk_color & 0x0000ff00) >> 8;
+        let bb = bk_color & 0x000000ff;
+        let buf = format!(
+            "\x1B[38;2;{fr};{fg};{fb};48;2;{br};{bg};{bb}m{}\x1B[0m",
+            character as char
+        );
+        let port = VIRT_CONSOLES[current_vcnum.unwrap()].lock_irqsave().port();
+        let tty = port.port_data().tty();
+        if tty.is_some() {
+            let tty = tty.unwrap();
+            return tty
+                .write(tty.core(), buf.as_bytes(), buf.len())
+                .map(|_| 0)
+                .unwrap_or_else(|e| e.to_posix_errno());
+        }
+    }
     return textui_putchar(
         character as char,
         FontColor::from(fr_color),

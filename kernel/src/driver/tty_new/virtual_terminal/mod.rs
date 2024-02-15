@@ -13,7 +13,7 @@ use crate::{
     libs::spinlock::SpinLock,
 };
 
-use self::virtual_console::VirtualConsoleData;
+use self::virtual_console::{VirtualConsoleData, CURRENT_VCNUM};
 
 use super::{
     console::ConsoleSwitch,
@@ -162,11 +162,15 @@ impl TtyOperation for TtyConsoleDriverInner {
         let mut vc_data = tty.vc_data_irqsave();
 
         let mut offset = 0;
+
+        // 这个参数是用来扫描unicode字符的，但是这部分目前未完成，先写着
         let mut rescan = false;
         let mut ch: u32 = 0;
 
         let mut draw = DrawRegion::default();
-        // todo： 隐藏光标
+
+        // 首先隐藏光标再写
+        vc_data.hide_cursor();
 
         while nr != 0 {
             if !rescan {
@@ -187,6 +191,7 @@ impl TtyOperation for TtyConsoleDriverInner {
             if vc_data.is_control(tc, ch) {
                 vc_data.flush(&mut draw);
                 vc_data.do_control(ch);
+                // vc_data.flush(&mut draw);
                 continue;
             }
 
@@ -202,10 +207,7 @@ impl TtyOperation for TtyConsoleDriverInner {
     }
 
     fn flush_chars(&self, tty: &TtyCoreData) {
-        let mut vc_data = tty.vc_data();
-        if vc_data.pos < 10 {
-            kwarn!("pos {}", vc_data.pos);
-        }
+        let mut vc_data = tty.vc_data_irqsave();
         vc_data.set_cursor();
     }
 
@@ -283,6 +285,8 @@ pub fn vty_init() -> Result<(), SystemError> {
     );
 
     TtyDriverManager::tty_register_driver(console_driver)?;
+
+    *CURRENT_VCNUM.write_irqsave() = Some(0);
 
     // 初始化键盘？
 

@@ -250,7 +250,7 @@ impl TtyDriver {
             None => Self::init_tty_device(driver, index)?,
         };
 
-        *CURRENT_VCNUM.write() = Some(index);
+        *CURRENT_VCNUM.write_irqsave() = Some(index);
 
         return Ok(tty);
     }

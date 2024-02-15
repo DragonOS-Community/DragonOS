@@ -9,7 +9,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::{
-        tty::serial::serial8250::send_to_default_serial8250_port, video::video_refresh_manager,
+        serial::serial8250::send_to_default_serial8250_port, video::video_refresh_manager
     },
     libs::{lib_ui::textui::textui_is_enable_put_to_window, rwlock::RwLock, spinlock::SpinLock},
     mm::VirtAddr,

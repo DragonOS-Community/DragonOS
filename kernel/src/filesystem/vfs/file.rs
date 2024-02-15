@@ -8,8 +8,7 @@ use system_error::SystemError;
 use crate::{
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
-        tty::TtyFilePrivateData,
-        tty_new::tty_device::NewTtyFilePrivateData,
+        tty_new::tty_device::TtyFilePrivateData,
     },
     filesystem::procfs::ProcfsFilePrivateData,
     ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
@@ -36,8 +35,6 @@ pub enum FilePrivateData {
     DevFS(DevicePrivateData),
     /// tty设备文件的私有信息
     Tty(TtyFilePrivateData),
-    /// new_tty
-    NTty(NewTtyFilePrivateData),
     /// epoll私有信息
     EPoll(EPollPrivateData),
     /// 不需要文件私有信息
@@ -179,10 +176,10 @@ impl File {
             return Err(SystemError::ENOBUFS);
         }
 
-        // 如果文件指针已经超过了文件大小，则返回0
-        if self.offset > self.inode.metadata()?.size as usize {
-            return Ok(0);
-        }
+        // // 如果文件指针已经超过了文件大小，则返回0
+        // if self.offset > self.inode.metadata()?.size as usize {
+        //     return Ok(0);
+        // }
         let len = self
             .inode
             .read_at(self.offset, len, buf, &mut self.private_data)?;

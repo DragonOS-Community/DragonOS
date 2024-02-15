@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
@@ -10,7 +12,10 @@ use crate::{
         tty_port::{DefaultTtyPort, TtyPort},
         ConsoleFont, KDMode,
     },
-    libs::{font::FontDesc, rwlock::RwLock},
+    libs::{
+        font::FontDesc,
+        rwlock::RwLock,
+    },
     process::Pid,
 };
 
@@ -26,6 +31,8 @@ lazy_static! {
     pub(super) static ref SOFTCURSOR_ORIGINAL: RwLock<Option<VcCursor>> = RwLock::new(None);
 
     pub static ref CURRENT_VCNUM: RwLock<Option<usize>> = RwLock::new(None);
+
+    pub static ref CONSOLE_BLANKED: AtomicBool = AtomicBool::new(false);
 }
 
 /// ## 虚拟控制台的信息
@@ -145,7 +152,7 @@ pub struct VirtualConsoleData {
 impl VirtualConsoleData {
     pub fn new(num: usize) -> Self {
         Self {
-            state: VirtualConsoleInfo::new(0, 30),
+            state: VirtualConsoleInfo::new(0, 0),
             saved_state: Default::default(),
             cols: Default::default(),
             rows: Default::default(),
@@ -205,7 +212,7 @@ impl VirtualConsoleData {
         }
     }
 
-    pub(super) fn init(&mut self, rows: Option<usize>, cols: Option<usize>, _clear: bool) {
+    pub(super) fn init(&mut self, rows: Option<usize>, cols: Option<usize>, clear: bool) {
         if rows.is_some() {
             self.rows = rows.unwrap();
         }
@@ -221,9 +228,21 @@ impl VirtualConsoleData {
         self.underline_color = 3; // cyan
         self.half_color = 0x08; // grey
 
-        self.reset();
+        self.reset(clear);
 
         self.screen_buf.resize(self.cols * self.rows, 0);
+    }
+
+    pub fn should_update(&self) -> bool {
+        self.is_visible() && !CONSOLE_BLANKED.load(Ordering::SeqCst)
+    }
+
+    pub fn is_visible(&self) -> bool {
+        let guard = CURRENT_VCNUM.read_irqsave();
+        if guard.is_none() {
+            return false;
+        }
+        guard.unwrap() == self.num
     }
 
     fn driver_funcs(&self) -> Arc<dyn ConsoleSwitch> {
@@ -239,7 +258,7 @@ impl VirtualConsoleData {
         self.port.clone()
     }
 
-    pub(super) fn reset(&mut self) {
+    pub(super) fn reset(&mut self, do_clear: bool) {
         self.mode = KDMode::KdText;
         // unicode?
         self.vt_mode.mode = VtMode::Auto;
@@ -264,6 +283,16 @@ impl VirtualConsoleData {
 
         self.default_attr();
         self.update_attr();
+
+        self.tab_stop.set_all(false);
+
+        for i in (0..256).step_by(8) {
+            self.tab_stop.set(i, true);
+        }
+
+        if do_clear {
+            self.csi_J(2);
+        }
     }
 
     fn reset_palette(&mut self) {
@@ -503,7 +532,7 @@ impl VirtualConsoleData {
                 .con_putc(&self, i as u16, self.state.y as u32, self.state.x as u32);
     }
 
-    fn hide_cursor(&mut self) {
+    pub fn hide_cursor(&mut self) {
         // TODO: 处理选择
 
         self.driver_funcs().con_cursor(self, CursorOperation::Erase);
@@ -569,7 +598,6 @@ impl VirtualConsoleData {
 
     fn scroll(&mut self, dir: ScrollDir, mut nr: usize) {
         // todo: uniscr_srceen
-
         if self.top + nr >= self.bottom {
             // 滚动超过一页,则按一页计算
             nr = self.bottom - self.top - 1;
@@ -867,7 +895,8 @@ impl VirtualConsoleData {
                 return;
             }
             'J' => {
-                todo!("csi_J todo");
+                self.csi_J(self.par[0]);
+                return;
             }
             'K' => {
                 todo!("csi_K todo");
@@ -1102,6 +1131,54 @@ impl VirtualConsoleData {
         self.update_attr();
     }
 
+    /// ##  处理Control Sequence Introducer（控制序列引导符） J字符
+    /// 该命令用于擦除终端显示区域的部分或全部内容。根据参数 vpar 的不同值，执行不同的擦除操作：
+    /// - vpar 为 0 时，擦除从光标位置到显示区域末尾的内容；
+    /// - vpar 为 1 时，擦除从显示区域起始位置到光标位置的内容；
+    /// - vpar 为 2 或 3 时，分别表示擦除整个显示区域的内容，其中参数 3 还会清除回滚缓冲区的内容。
+    #[allow(non_snake_case)]
+    fn csi_J(&mut self, vpar: u32) {
+        let count;
+        let start;
+
+        match vpar {
+            0 => {
+                // 擦除从光标位置到显示区域末尾的内容
+                count = self.screen_buf.len() - self.pos;
+                start = self.pos;
+            }
+            1 => {
+                // 擦除从显示区域起始位置到光标位置的内容
+                count = self.pos;
+                start = 0;
+            }
+            2 => {
+                // 擦除整个显示区域的内容
+                count = self.screen_buf.len();
+                start = 0;
+            }
+            3 => {
+                // 表示擦除整个显示区域的内容，还会清除回滚缓冲区的内容
+                // TODO:当前未实现回滚缓冲
+                count = self.screen_buf.len();
+                start = 0;
+            }
+            _ => {
+                return;
+            }
+        }
+
+        for i in self.screen_buf[start..(start + count)].iter_mut() {
+            *i = self.erase_char;
+        }
+
+        if self.should_update() {
+            self.do_update_region(start, count)
+        }
+
+        self.need_wrap = false;
+    }
+
     fn t416_color(&mut self, mut idx: usize) -> (usize, Option<Color>) {
         idx += 1;
         if idx > self.npar as usize {
@@ -1169,6 +1246,7 @@ impl VirtualConsoleData {
                 // LD line feed
                 self.line_feed();
                 // TODO: 检查键盘模式
+                self.carriage_return();
                 return;
             }
             13 => {
@@ -1256,7 +1334,7 @@ impl VirtualConsoleData {
                         self.vc_state = VirtualConsoleState::EShash;
                     }
                     'c' => {
-                        self.reset();
+                        self.reset(true);
                     }
                     '>' => {
                         todo!("clr_kbd todo");
@@ -1314,8 +1392,9 @@ impl VirtualConsoleData {
                 self.vc_state = VirtualConsoleState::ESnormal;
                 if ch as u8 as char == '8' {
                     self.erase_char = (self.erase_char & 0xff00) | 'E' as u16;
-                    todo!("csi_J todo");
-                    // TODO
+                    self.csi_J(2);
+                    self.erase_char = (self.erase_char & 0xff00) | ' ' as u16;
+                    self.do_update_region(0, self.screen_buf.len());
                 }
                 return;
             }
@@ -1484,7 +1563,7 @@ impl VirtualConsoleData {
             if self.state.x == self.cols - 1 {
                 // 需要换行？
                 self.need_wrap = self.autowrap;
-                draw.size = 2;
+                draw.size += 2;
 
                 if self.state.y + 1 == self.bottom as usize {
                     // 强制换行，先这样写
@@ -1534,7 +1613,7 @@ impl VirtualConsoleData {
 
     /// ## 更新虚拟控制台指定区域的显示
     fn do_update_region(&self, mut start: usize, mut count: usize) {
-        let ret = self.driver_funcs().con_getxy();
+        let ret = self.driver_funcs().con_getxy(self, start);
         let (mut x, mut y) = if ret.is_err() {
             let offset = start / 2;
             (offset % self.cols, offset / self.cols)
@@ -1566,10 +1645,10 @@ impl VirtualConsoleData {
                         size = 0;
                         attr = self.screen_buf[start] & 0xff00;
                     }
-                    size += 1;
-                    x += 1;
-                    count -= 1;
                 }
+                size += 1;
+                x += 1;
+                count -= 1;
             }
 
             if size > 0 {
@@ -1589,7 +1668,7 @@ impl VirtualConsoleData {
             x = 0;
             y += 1;
 
-            let ret = self.driver_funcs().con_getxy();
+            let ret = self.driver_funcs().con_getxy(self, start);
             if ret.is_ok() {
                 start = ret.unwrap().0;
             }
@@ -1895,6 +1974,7 @@ impl VcCursor {
 }
 
 #[derive(Debug, PartialEq)]
+#[allow(dead_code)]
 pub enum CursorOperation {
     Draw,
     Erase,

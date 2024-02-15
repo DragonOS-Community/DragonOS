@@ -28,7 +28,7 @@ use crate::{
     },
 };
 
-use super::{fbmem::sys_class_graphics_instance, FbBitfield, FbCursor, ScrollMode};
+use super::{fbmem::sys_class_graphics_instance, FbCursor, ScrollMode};
 
 pub mod framebuffer_console;
 
@@ -371,10 +371,11 @@ pub trait FrameBufferConsole {
     /// ### width: 位图宽度
     fn bmove(
         &self,
-        sy: u32,
-        sx: u32,
-        dy: u32,
-        dx: u32,
+        vc_data: &VirtualConsoleData,
+        sy: i32,
+        sx: i32,
+        dy: i32,
+        dx: i32,
         height: u32,
         width: u32,
     ) -> Result<(), SystemError>;
@@ -426,9 +427,6 @@ pub struct FbConsoleDisplay {
     /// 滚动模式
     pub scroll_mode: ScrollMode,
     virt_rows: u32,
-    red: FbBitfield,
-    green: FbBitfield,
-    blue: FbBitfield,
 }
 
 impl FbConsoleDisplay {

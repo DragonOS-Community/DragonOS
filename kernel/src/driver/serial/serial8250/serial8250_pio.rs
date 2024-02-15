@@ -8,7 +8,9 @@ use core::{
 use alloc::sync::{Arc, Weak};
 
 use crate::{
-    arch::{io::PortIOArch, CurrentPortIOArch}, driver::serial::{AtomicBaudRate, BaudRate, DivisorFraction, UartPort}, libs::rwlock::RwLock
+    arch::{io::PortIOArch, CurrentPortIOArch},
+    driver::serial::{AtomicBaudRate, BaudRate, DivisorFraction, UartPort},
+    libs::rwlock::RwLock,
 };
 use system_error::SystemError;
 

@@ -13,9 +13,7 @@ use crate::{
             kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        tty::virtual_terminal::virtual_console::{
-            CursorOperation, VcCursor, VirtualConsoleData,
-        },
+        tty::virtual_terminal::virtual_console::{CursorOperation, VcCursor, VirtualConsoleData},
     },
     filesystem::{
         kernfs::KernFSInode,

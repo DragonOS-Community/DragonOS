@@ -27,7 +27,9 @@ use crate::{
                 platform_driver::{platform_driver_manager, PlatformDriver},
                 CompatibleTable,
             },
-        }, serial::serial8250::send_to_default_serial8250_port, video::fbdev::base::{fbmem::frame_buffer_manager, FbVisual, FRAME_BUFFER_SET}
+        },
+        serial::serial8250::send_to_default_serial8250_port,
+        video::fbdev::base::{fbmem::frame_buffer_manager, FbVisual, FRAME_BUFFER_SET},
     },
     filesystem::{
         kernfs::KernFSInode,

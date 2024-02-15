@@ -12,10 +12,7 @@ use crate::{
         tty_port::{DefaultTtyPort, TtyPort},
         ConsoleFont, KDMode,
     },
-    libs::{
-        font::FontDesc,
-        rwlock::RwLock,
-    },
+    libs::{font::FontDesc, rwlock::RwLock},
     process::Pid,
 };
 
@@ -289,6 +286,10 @@ impl VirtualConsoleData {
         for i in (0..256).step_by(8) {
             self.tab_stop.set(i, true);
         }
+
+        self.state.x = 0;
+        self.state.y = 0;
+        self.pos = 0;
 
         if do_clear {
             self.csi_J(2);
@@ -667,7 +668,7 @@ impl VirtualConsoleData {
     /// ## 向上滚动虚拟终端的内容，或者将光标上移一行
     fn reverse_index(&mut self) {
         if self.state.y == self.top as usize {
-            self.scroll(ScrollDir::Up, 1);
+            self.scroll(ScrollDir::Down, 1);
         } else if self.state.y > 0 {
             self.state.y -= 1;
             self.pos -= self.cols;

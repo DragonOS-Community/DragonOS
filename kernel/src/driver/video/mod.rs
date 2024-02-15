@@ -175,7 +175,10 @@ impl VideoRefreshManager {
     pub unsafe fn video_init() -> Result<(), SystemError> {
         use crate::{
             arch::driver::video::arch_video_early_init,
-            driver::{serial::serial8250::send_to_default_serial8250_port, video::fbdev::base::BootTimeVideoType},
+            driver::{
+                serial::serial8250::send_to_default_serial8250_port,
+                video::fbdev::base::BootTimeVideoType,
+            },
         };
 
         arch_video_early_init()?;

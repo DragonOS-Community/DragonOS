@@ -7,7 +7,7 @@ use super::lib_ui::textui::{textui_putstr, FontColor};
 use crate::{
     driver::{
         serial::serial8250::send_to_default_serial8250_port,
-        tty_new::{
+        tty::{
             tty_driver::TtyOperation,
             virtual_terminal::{virtual_console::CURRENT_VCNUM, VIRT_CONSOLES},
         },

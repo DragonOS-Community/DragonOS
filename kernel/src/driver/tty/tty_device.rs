@@ -1,5 +1,4 @@
 use alloc::{
-    collections::BTreeMap,
     string::{String, ToString},
     sync::{Arc, Weak},
 };
@@ -7,104 +6,254 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
+    driver::{
+        base::{
+            char::CharDevice,
+            device::{
+                bus::Bus,
+                device_number::{DeviceNumber, Major},
+                device_register,
+                driver::Driver,
+                Device, DeviceKObjType, DeviceType, IdTable,
+            },
+            kobject::{KObject, LockedKObjectState},
+            kset::KSet,
+        },
+        serial::serial_init,
+    },
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
-        vfs::{
-            file::FileMode, syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata,
-            ROOT_INODE,
-        },
+        kernfs::KernFSInode,
+        vfs::{file::FileMode, syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata},
     },
     init::initcall::INITCALL_DEVICE,
-    kerror,
-    libs::{
-        lib_ui::textui::{textui_putchar, FontColor},
-        rwlock::RwLock,
-    },
+    libs::rwlock::RwLock,
+    process::ProcessManager,
 };
 
-use super::{serial::serial_init, TtyCore, TtyError, TtyFileFlag, TtyFilePrivateData};
+use super::{
+    tty_core::{TtyCore, TtyFlag},
+    tty_driver::{TtyDriver, TtyDriverSubType, TtyDriverType, TtyOperation},
+    tty_job_control::TtyJobCtrlManager,
+    virtual_terminal::vty_init,
+};
 
-lazy_static! {
-    /// 所有TTY设备的B树。用于根据名字，找到Arc<TtyDevice>
-    /// TODO: 待设备驱动模型完善，具有类似功能的机制后，删掉这里
-    pub static ref TTY_DEVICES: RwLock<BTreeMap<String, Arc<TtyDevice>>> = RwLock::new(BTreeMap::new());
+#[derive(Debug)]
+pub struct InnerTtyDevice {
+    /// 当前设备所述的kset
+    kset: Option<Arc<KSet>>,
+    parent_kobj: Option<Weak<dyn KObject>>,
+    /// 当前设备所述的总线
+    bus: Option<Weak<dyn Bus>>,
+    inode: Option<Arc<KernFSInode>>,
+    driver: Option<Weak<dyn Driver>>,
+    can_match: bool,
+
+    metadata: Metadata,
 }
 
-/// @brief TTY设备
+impl InnerTtyDevice {
+    pub fn new() -> Self {
+        Self {
+            kset: None,
+            parent_kobj: None,
+            bus: None,
+            inode: None,
+            driver: None,
+            can_match: false,
+            metadata: Metadata::new(FileType::CharDevice, ModeType::from_bits_truncate(0o755)),
+        }
+    }
+}
+
 #[derive(Debug)]
+#[cast_to([sync] Device)]
 pub struct TtyDevice {
-    /// TTY核心
-    core: TtyCore,
+    name: &'static str,
+    id_table: IdTable,
+    inner: RwLock<InnerTtyDevice>,
+    kobj_state: LockedKObjectState,
     /// TTY所属的文件系统
     fs: RwLock<Weak<DevFS>>,
-    /// TTY设备私有信息
-    private_data: RwLock<TtyDevicePrivateData>,
-}
-
-#[derive(Debug)]
-struct TtyDevicePrivateData {
-    /// TTY设备名(如tty1)
-    name: String,
-    /// TTY设备文件的元数据
-    metadata: Metadata,
-    // TODO: 增加指向输出端口连接的设备的指针
 }
 
 impl TtyDevice {
-    pub fn new(name: &str) -> Arc<TtyDevice> {
-        let result = Arc::new(TtyDevice {
-            core: TtyCore::new(),
+    pub fn new(name: &'static str, id_table: IdTable) -> Arc<TtyDevice> {
+        let dev_num = id_table.device_number();
+        let dev = TtyDevice {
+            name,
+            id_table,
+            inner: RwLock::new(InnerTtyDevice::new()),
+            kobj_state: LockedKObjectState::new(None),
             fs: RwLock::new(Weak::default()),
-            private_data: TtyDevicePrivateData::new(name),
-        });
-        // 默认开启输入回显
-        result.core.enable_echo();
-        return result;
-    }
+        };
 
-    /// @brief 判断文件私有信息是否为TTY文件的私有信息
-    #[inline]
-    fn verify_file_private_data<'a>(
+        dev.inner.write().metadata.raw_dev = dev_num;
+
+        Arc::new(dev)
+    }
+}
+
+impl IndexNode for TtyDevice {
+    fn open(
         &self,
-        private_data: &'a mut FilePrivateData,
-    ) -> Result<&'a mut TtyFilePrivateData, SystemError> {
-        if let FilePrivateData::Tty(t) = private_data {
-            return Ok(t);
-        }
-        return Err(SystemError::EIO);
-    }
+        data: &mut crate::filesystem::vfs::FilePrivateData,
+        mode: &crate::filesystem::vfs::file::FileMode,
+    ) -> Result<(), SystemError> {
+        let dev_num = self.metadata()?.raw_dev;
 
-    /// @brief 获取TTY设备名
-    #[inline]
-    pub fn name(&self) -> String {
-        return self.private_data.read().name.clone();
-    }
+        let tty = TtyDriver::open_tty(dev_num)?;
 
-    /// @brief 检查TTY文件的读写参数是否合法
-    #[inline]
-    pub fn check_rw_param(&self, len: usize, buf: &[u8]) -> Result<(), SystemError> {
-        if len > buf.len() {
-            return Err(SystemError::EINVAL);
-        }
-        return Ok(());
-    }
+        // 设置privdata
+        *data = FilePrivateData::Tty(TtyFilePrivateData {
+            tty: tty.clone(),
+            mode: *mode,
+        });
 
-    /// @brief 向TTY的输入端口导入数据
-    pub fn input(&self, buf: &[u8]) -> Result<usize, SystemError> {
-        let r: Result<usize, TtyError> = self.core.input(buf, false);
-        if r.is_ok() {
-            return Ok(r.unwrap());
+        let ret = tty.open(tty.core());
+        if ret.is_err() {
+            let err = ret.unwrap_err();
+            if err == SystemError::ENOSYS {
+                return Err(SystemError::ENODEV);
+            }
+            return Err(err);
         }
 
-        let r = r.unwrap_err();
-        match r {
-            TtyError::BufferFull(x) => return Ok(x),
-            TtyError::Closed => return Err(SystemError::ENODEV),
-            e => {
-                kerror!("tty error occurred while writing data to its input port, msg={e:?}");
-                return Err(SystemError::EBUSY);
+        let driver = tty.core().driver();
+        // 考虑noctty（当前tty）
+        if !(mode.contains(FileMode::O_NOCTTY) && dev_num == DeviceNumber::new(Major::TTY_MAJOR, 0)
+            || dev_num == DeviceNumber::new(Major::TTYAUX_MAJOR, 1)
+            || (driver.tty_driver_type() == TtyDriverType::Pty
+                && driver.tty_driver_sub_type() == TtyDriverSubType::PtyMaster))
+        {
+            let pcb = ProcessManager::current_pcb();
+            let pcb_tty = pcb.sig_info().tty();
+            if pcb_tty.is_none() && tty.core().contorl_info_irqsave().session.is_none() {
+                TtyJobCtrlManager::proc_set_tty(tty);
             }
         }
+
+        Ok(())
+    }
+
+    fn read_at(
+        &self,
+        _offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        data: &mut crate::filesystem::vfs::FilePrivateData,
+    ) -> Result<usize, system_error::SystemError> {
+        let (tty, mode) = if let FilePrivateData::Tty(tty_priv) = data {
+            (tty_priv.tty.clone(), tty_priv.mode)
+        } else {
+            return Err(SystemError::EIO);
+        };
+
+        let ld = tty.ldisc();
+        let mut offset = 0;
+        let mut cookie = false;
+        loop {
+            let mut size = if len > buf.len() { buf.len() } else { len };
+            size = ld.read(tty.clone(), buf, size, &mut cookie, offset, mode)?;
+            // 没有更多数据
+            if size == 0 {
+                break;
+            }
+
+            offset += size;
+
+            // 缓冲区写满
+            if offset >= len {
+                break;
+            }
+
+            // 没有更多数据
+            if !cookie {
+                break;
+            }
+        }
+
+        return Ok(offset);
+    }
+
+    fn write_at(
+        &self,
+        _offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: &mut crate::filesystem::vfs::FilePrivateData,
+    ) -> Result<usize, system_error::SystemError> {
+        let mut count = len;
+        let (tty, mode) = if let FilePrivateData::Tty(tty_priv) = data {
+            (tty_priv.tty.clone(), tty_priv.mode)
+        } else {
+            return Err(SystemError::EIO);
+        };
+
+        let ld = tty.ldisc();
+        let core = tty.core();
+        let mut chunk = 2048;
+        if core.flags().contains(TtyFlag::NO_WRITE_SPLIT) {
+            chunk = 65536;
+        }
+        chunk = chunk.min(count);
+
+        let pcb = ProcessManager::current_pcb();
+        let mut written = 0;
+        loop {
+            // 至少需要写多少
+            let size = chunk.min(count);
+
+            // 将数据从buf拷贝到writebuf
+
+            let ret = ld.write(tty.clone(), buf, size, mode)?;
+
+            written += ret;
+            count -= ret;
+
+            if count == 0 {
+                break;
+            }
+
+            if pcb.sig_info().sig_pending().has_pending() {
+                return Err(SystemError::ERESTARTSYS);
+            }
+        }
+
+        if written > 0 {
+            // todo: 更新时间
+        }
+
+        Ok(written)
+    }
+
+    fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
+        todo!()
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        todo!()
+    }
+
+    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
+        todo!()
+    }
+
+    fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
+        Ok(self.inner.read().metadata.clone())
+    }
+
+    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn resize(&self, _len: usize) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn ioctl(&self, _cmd: u32, _data: usize) -> Result<usize, SystemError> {
+        // todo!()
+        Ok(0)
     }
 }
 
@@ -114,220 +263,180 @@ impl DeviceINode for TtyDevice {
     }
 }
 
-impl IndexNode for TtyDevice {
-    /// @brief 打开TTY设备
-    ///
-    /// @param data 文件私有信息
-    /// @param mode 打开模式
-    ///
-    /// TTY设备通过mode来确定这个文件到底是stdin/stdout/stderr
-    /// - mode的值为O_RDONLY时，表示这个文件是stdin
-    /// - mode的值为O_WRONLY时，表示这个文件是stdout
-    /// - mode的值为O_WRONLY | O_SYNC时，表示这个文件是stderr
-    fn open(&self, data: &mut FilePrivateData, mode: &FileMode) -> Result<(), SystemError> {
-        let mut p = TtyFilePrivateData::default();
-
-        // 检查打开模式
-        let accmode = mode.accmode();
-        if accmode == FileMode::O_RDONLY.accmode() {
-            p.flags.insert(TtyFileFlag::STDIN);
-        } else if accmode == FileMode::O_WRONLY.accmode() {
-            if mode.contains(FileMode::O_SYNC) {
-                p.flags.insert(TtyFileFlag::STDERR);
-            } else {
-                p.flags.insert(TtyFileFlag::STDOUT);
-            }
-        } else {
-            return Err(SystemError::EINVAL);
-        }
-
-        // 保存文件私有信息
-        *data = FilePrivateData::Tty(p);
-        return Ok(());
-    }
-
-    fn read_at(
-        &self,
-        _offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        data: &mut crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<usize, SystemError> {
-        let _data: &mut TtyFilePrivateData = match self.verify_file_private_data(data) {
-            Ok(t) => t,
-            Err(e) => {
-                kerror!("Try to read tty device, but file private data type mismatch!");
-                return Err(e);
-            }
-        };
-        self.check_rw_param(len, buf)?;
-
-        // 读取stdin队列
-        let r: Result<usize, TtyError> = self.core.read_stdin(&mut buf[0..len], true);
-        if r.is_ok() {
-            return Ok(r.unwrap());
-        }
-
-        match r.unwrap_err() {
-            TtyError::EOF(n) => {
-                return Ok(n);
-            }
-
-            x => {
-                kerror!("Error occurred when reading tty, msg={x:?}");
-                return Err(SystemError::ECONNABORTED);
-            }
-        }
-    }
-
-    fn write_at(
-        &self,
-        _offset: usize,
-        len: usize,
-        buf: &[u8],
-        data: &mut crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<usize, SystemError> {
-        let data: &mut TtyFilePrivateData = match self.verify_file_private_data(data) {
-            Ok(t) => t,
-            Err(e) => {
-                kerror!("Try to write tty device, but file private data type mismatch!");
-                return Err(e);
-            }
-        };
-
-        self.check_rw_param(len, buf)?;
-
-        let mut cnt: usize = 0;
-        // 根据当前文件是stdout还是stderr,选择不同的发送方式
-        let r: Result<usize, TtyError> = if data.flags.contains(TtyFileFlag::STDOUT) {
-            loop {
-                let r = self.core.stdout(&buf[cnt..len], false);
-                if let Err(TtyError::BufferFull(c)) = r {
-                    self.sync().expect("Failed to sync tty device!");
-                    cnt += c;
-                } else {
-                    break r;
-                }
-            }
-        } else if data.flags.contains(TtyFileFlag::STDERR) {
-            loop {
-                let r = self.core.stderr(&buf[cnt..len], false);
-                if let Err(TtyError::BufferFull(c)) = r {
-                    self.sync().expect("Failed to sync tty device!");
-                    cnt += c;
-                } else {
-                    break r;
-                }
-            }
-        } else {
-            return Err(SystemError::EPERM);
-        };
-
-        if r.is_ok() {
-            self.sync().expect("Failed to sync tty device!");
-            return Ok(cnt + r.unwrap());
-        }
-
-        let r: TtyError = r.unwrap_err();
-        kerror!("Error occurred when writing tty deivce. Error msg={r:?}");
-        return Err(SystemError::EIO);
-    }
-
-    fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
-        return self.fs.read().upgrade().unwrap();
-    }
-
+impl KObject for TtyDevice {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
 
-    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    fn set_inode(&self, inode: Option<Arc<crate::filesystem::kernfs::KernFSInode>>) {
+        self.inner.write().inode = inode;
     }
 
-    fn metadata(&self) -> Result<Metadata, SystemError> {
-        return Ok(self.private_data.read().metadata.clone());
+    fn inode(&self) -> Option<Arc<crate::filesystem::kernfs::KernFSInode>> {
+        self.inner.read().inode.clone()
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
-        return Ok(());
+    fn parent(&self) -> Option<alloc::sync::Weak<dyn KObject>> {
+        self.inner.read().parent_kobj.clone()
+    }
+
+    fn set_parent(&self, parent: Option<alloc::sync::Weak<dyn KObject>>) {
+        self.inner.write().parent_kobj = parent
+    }
+
+    fn kset(&self) -> Option<Arc<crate::driver::base::kset::KSet>> {
+        self.inner.read().kset.clone()
+    }
+
+    fn set_kset(&self, kset: Option<Arc<crate::driver::base::kset::KSet>>) {
+        self.inner.write().kset = kset
+    }
+
+    fn kobj_type(&self) -> Option<&'static dyn crate::driver::base::kobject::KObjType> {
+        Some(&DeviceKObjType)
+    }
+
+    fn set_kobj_type(&self, _ktype: Option<&'static dyn crate::driver::base::kobject::KObjType>) {}
+
+    fn name(&self) -> alloc::string::String {
+        self.name.to_string()
+    }
+
+    fn set_name(&self, _name: alloc::string::String) {
+        // self.name = name
+    }
+
+    fn kobj_state(
+        &self,
+    ) -> crate::libs::rwlock::RwLockReadGuard<crate::driver::base::kobject::KObjectState> {
+        self.kobj_state.read()
+    }
+
+    fn kobj_state_mut(
+        &self,
+    ) -> crate::libs::rwlock::RwLockWriteGuard<crate::driver::base::kobject::KObjectState> {
+        self.kobj_state.write()
+    }
+
+    fn set_kobj_state(&self, state: crate::driver::base::kobject::KObjectState) {
+        *self.kobj_state.write() = state
+    }
+}
+
+impl Device for TtyDevice {
+    fn dev_type(&self) -> crate::driver::base::device::DeviceType {
+        DeviceType::Char
+    }
+
+    fn id_table(&self) -> crate::driver::base::device::IdTable {
+        self.id_table.clone()
+    }
+
+    fn set_bus(&self, bus: Option<alloc::sync::Weak<dyn crate::driver::base::device::bus::Bus>>) {
+        self.inner.write().bus = bus
+    }
+
+    fn set_class(&self, _class: Option<Arc<dyn crate::driver::base::class::Class>>) {
+        todo!()
+    }
+
+    fn driver(&self) -> Option<Arc<dyn crate::driver::base::device::driver::Driver>> {
+        self.inner.read().driver.clone()?.upgrade()
+    }
+
+    fn set_driver(
+        &self,
+        driver: Option<alloc::sync::Weak<dyn crate::driver::base::device::driver::Driver>>,
+    ) {
+        self.inner.write().driver = driver
+    }
+
+    fn is_dead(&self) -> bool {
+        false
+    }
+
+    fn can_match(&self) -> bool {
+        self.inner.read().can_match
+    }
+
+    fn set_can_match(&self, can_match: bool) {
+        self.inner.write().can_match = can_match
+    }
+
+    fn state_synced(&self) -> bool {
+        true
+    }
+}
+
+impl CharDevice for TtyDevice {
+    fn read(&self, _len: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn write(&self, _len: usize, _buf: &[u8]) -> Result<usize, SystemError> {
+        todo!()
     }
 
     fn sync(&self) -> Result<(), SystemError> {
-        // TODO: 引入IO重定向后，需要将输出重定向到对应的设备。
-        // 目前只是简单的输出到屏幕（为了实现的简便）
-
-        loop {
-            let mut buf = [0u8; 512];
-            let r: Result<usize, TtyError> = self.core.output(&mut buf[0..511], false);
-            let len;
-            match r {
-                Ok(x) => {
-                    len = x;
-                }
-                Err(TtyError::EOF(x)) | Err(TtyError::BufferEmpty(x)) => {
-                    len = x;
-                }
-                _ => return Err(SystemError::EIO),
-            }
-
-            if len == 0 {
-                break;
-            }
-            // 输出到屏幕
-
-            for x in 0..len {
-                textui_putchar(buf[x] as char, FontColor::WHITE, FontColor::BLACK).ok();
-            }
-        }
-        return Ok(());
-    }
-    fn resize(&self, _len: usize) -> Result<(), SystemError> {
-        return Ok(());
+        todo!()
     }
 }
 
-impl TtyDevicePrivateData {
-    pub fn new(name: &str) -> RwLock<Self> {
-        let mut metadata = Metadata::new(FileType::CharDevice, ModeType::from_bits_truncate(0o755));
-        metadata.size = TtyCore::STDIN_BUF_SIZE as i64;
-        return RwLock::new(TtyDevicePrivateData {
-            name: name.to_string(),
-            metadata,
-        });
-    }
+#[derive(Debug, Clone)]
+pub struct TtyFilePrivateData {
+    tty: Arc<TtyCore>,
+    mode: FileMode,
 }
 
-/// @brief 初始化TTY设备
-// #[unified_init(INITCALL_DEVICE)]
+/// 初始化tty设备和console子设备
+#[unified_init(INITCALL_DEVICE)]
 pub fn tty_init() -> Result<(), SystemError> {
-    let tty: Arc<TtyDevice> = TtyDevice::new("tty0");
-    let devfs_root_inode = ROOT_INODE().lookup("/dev");
-    if devfs_root_inode.is_err() {
-        return Err(devfs_root_inode.unwrap_err());
-    }
-    // 当前关闭键盘输入回显
-    // TODO: 完善Termios之后, 改为默认开启键盘输入回显.
-    tty.core.disable_echo();
-    let guard = TTY_DEVICES.upgradeable_read();
+    let tty = TtyDevice::new(
+        "tty0",
+        IdTable::new(
+            String::from("tty0"),
+            Some(DeviceNumber::new(Major::TTY_MAJOR, 0)),
+        ),
+    );
 
-    // 如果已经存在了这个设备
-    if guard.contains_key("tty0") {
-        return Err(SystemError::EEXIST);
-    }
+    let console = TtyDevice::new(
+        "console",
+        IdTable::new(
+            String::from("console"),
+            Some(DeviceNumber::new(Major::TTYAUX_MAJOR, 1)),
+        ),
+    );
 
-    let mut guard = guard.upgrade();
+    // 注册tty设备
+    // CharDevOps::cdev_add(
+    //     tty.clone() as Arc<dyn CharDevice>,
+    // IdTable::new(
+    //     String::from("tty0"),
+    //     Some(DeviceNumber::new(Major::TTYAUX_MAJOR, 0)),
+    // ),
+    //     1,
+    // )?;
 
-    guard.insert("tty0".to_string(), tty.clone());
+    // CharDevOps::register_chardev_region(DeviceNumber::new(Major::TTYAUX_MAJOR, 0), 1, "/dev/tty")?;
 
-    drop(guard);
+    // 注册console设备
+    // CharDevOps::cdev_add(
+    //     console.clone() as Arc<dyn CharDevice>,
+    //     IdTable::new(
+    //         String::from("console"),
+    //         Some(DeviceNumber::new(Major::TTYAUX_MAJOR, 1)),
+    //     ),
+    //     1,
+    // )?;
 
-    let r = devfs_register(&tty.name(), tty);
-    if r.is_err() {
-        kerror!("{:?}", r);
-        return Err(r.unwrap_err());
-    }
+    // CharDevOps::register_chardev_region(DeviceNumber::new(Major::TTYAUX_MAJOR, 1), 1, "/dev/tty")?;
+
+    // 将这两个设备注册到devfs，TODO：这里console设备应该与tty在一个设备group里面
+    device_register(tty.clone())?;
+    device_register(console.clone())?;
+    devfs_register(tty.name, tty)?;
+    devfs_register(console.name, console)?;
 
     serial_init()?;
-    return Ok(());
+    return vty_init();
 }

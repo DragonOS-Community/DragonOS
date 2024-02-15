@@ -9,6 +9,6 @@ pub mod open_firmware;
 pub mod pci;
 pub mod serial;
 pub mod timers;
-pub mod tty_new;
+pub mod tty;
 pub mod video;
 pub mod virtio;

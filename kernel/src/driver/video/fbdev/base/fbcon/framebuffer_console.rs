@@ -3,7 +3,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::{
-        tty_new::{
+        tty::{
             console::ConsoleSwitch,
             virtual_terminal::{
                 virtual_console::{CursorOperation, ScrollDir, VcCursor, VirtualConsoleData},
@@ -344,7 +344,7 @@ impl ConsoleSwitch for BlittingFbConsole {
     fn con_cursor(
         &self,
         vc_data: &VirtualConsoleData,
-        op: crate::driver::tty_new::virtual_terminal::virtual_console::CursorOperation,
+        op: crate::driver::tty::virtual_terminal::virtual_console::CursorOperation,
     ) {
         let mut fbcon_data = self.fbcon_data();
 
@@ -400,7 +400,7 @@ impl ConsoleSwitch for BlittingFbConsole {
         vc_data: &mut VirtualConsoleData,
         top: usize,
         bottom: usize,
-        dir: crate::driver::tty_new::virtual_terminal::virtual_console::ScrollDir,
+        dir: crate::driver::tty::virtual_terminal::virtual_console::ScrollDir,
         mut count: usize,
     ) -> bool {
         self.con_cursor(vc_data, CursorOperation::Erase);

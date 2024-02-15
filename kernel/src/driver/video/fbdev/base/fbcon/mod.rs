@@ -13,7 +13,7 @@ use crate::{
             kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        tty_new::virtual_terminal::virtual_console::{
+        tty::virtual_terminal::virtual_console::{
             CursorOperation, VcCursor, VirtualConsoleData,
         },
     },

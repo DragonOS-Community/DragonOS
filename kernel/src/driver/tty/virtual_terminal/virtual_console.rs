@@ -7,7 +7,7 @@ use alloc::{
 use bitmap::{traits::BitMapOps, StaticBitmap};
 
 use crate::{
-    driver::tty_new::{
+    driver::tty::{
         console::ConsoleSwitch,
         tty_port::{DefaultTtyPort, TtyPort},
         ConsoleFont, KDMode,

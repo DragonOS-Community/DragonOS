@@ -7,7 +7,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
-    driver::tty_new::{
+    driver::tty::{
         termios::{ContorlCharIndex, InputMode, LocalMode, OutputMode, Termios},
         tty_core::{EchoOperation, TtyCore, TtyCoreData, TtyFlag},
         tty_driver::{TtyDriverFlag, TtyOperation},
@@ -1752,7 +1752,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
     fn set_termios(
         &self,
         tty: Arc<TtyCore>,
-        old: Option<crate::driver::tty_new::termios::Termios>,
+        old: Option<crate::driver::tty::termios::Termios>,
     ) -> Result<(), system_error::SystemError> {
         let core = tty.core();
         let termios = core.termios();

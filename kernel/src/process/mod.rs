@@ -21,7 +21,7 @@ use crate::{
         sched::sched,
         CurrentIrqArch,
     },
-    driver::tty_new::tty_core::TtyCore,
+    driver::tty::tty_core::TtyCore,
     exception::InterruptArch,
     filesystem::{
         procfs::procfs_unregister_pid,

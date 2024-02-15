@@ -2,7 +2,7 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
-    driver::{base::device::Device, tty_new::virtual_terminal::Color},
+    driver::{base::device::Device, tty::virtual_terminal::Color},
     init::boot_params,
     libs::rwlock::RwLock,
     mm::{ucontext::LockedVMA, PhysAddr, VirtAddr},

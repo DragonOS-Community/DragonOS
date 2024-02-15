@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 
-use crate::driver::tty_new::{
+use crate::driver::tty::{
     tty_port::TtyPort,
     virtual_terminal::{virtual_console::CURRENT_VCNUM, VIRT_CONSOLES},
 };

@@ -2,13 +2,15 @@ use fdt::node::FdtNode;
 use system_error::SystemError;
 
 use crate::{
-    arch::mm::init::mm_early_init,
+    arch::{driver::sbi::SbiDriver, mm::init::mm_early_init},
     driver::{firmware::efi::init::efi_init, open_firmware::fdt::open_firmware_fdt_driver},
     init::{boot_params, init::start_kernel},
     kdebug, kinfo,
     mm::{memblock::mem_block_manager, PhysAddr, VirtAddr},
     print, println,
 };
+
+use super::driver::sbi::console_putstr;
 
 #[derive(Debug)]
 pub struct ArchBootParams {
@@ -76,9 +78,11 @@ unsafe fn parse_dtb() {
 
 #[inline(never)]
 pub fn early_setup_arch() -> Result<(), SystemError> {
-    let hartid = unsafe { BOOT_HARTID };
+    SbiDriver::early_init();
+    let hartid: usize = unsafe { BOOT_HARTID };
     let fdt_paddr = unsafe { BOOT_FDT_PADDR };
     boot_params().write().arch.fdt_paddr = fdt_paddr;
+
     kinfo!(
         "DragonOS kernel is running on hart {}, fdt address:{:?}",
         hartid,

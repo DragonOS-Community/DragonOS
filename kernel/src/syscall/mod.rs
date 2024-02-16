@@ -8,6 +8,7 @@ use crate::{
     driver::base::device::device_number::DeviceNumber,
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::syscall::MremapFlags,
+    net::syscall::MsgHdr,
     process::{
         fork::KernelCloneArgs,
         resource::{RLimit64, RUsage},
@@ -129,7 +130,6 @@ impl Syscall {
             }
             SYS_CLOSE => {
                 let fd = args[0];
-
                 let res = Self::close(fd);
 
                 res
@@ -344,6 +344,7 @@ impl Syscall {
                     Self::pipe2(pipefd, FileMode::empty())
                 }
             }
+
             SYS_PIPE2 => {
                 let pipefd: *mut i32 = args[0] as *mut c_int;
                 let arg1 = args[1];
@@ -543,24 +544,15 @@ impl Syscall {
             }
 
             SYS_RECVMSG => {
-                let msg = args[1] as *mut crate::net::syscall::MsgHdr;
+                let msg = args[1] as *mut MsgHdr;
                 let flags = args[2] as u32;
-                match UserBufferWriter::new(
-                    msg,
-                    core::mem::size_of::<crate::net::syscall::MsgHdr>(),
-                    true,
-                ) {
-                    Err(e) => Err(e),
-                    Ok(mut user_buffer_writer) => {
-                        match user_buffer_writer.buffer::<crate::net::syscall::MsgHdr>(0) {
-                            Err(e) => Err(e),
-                            Ok(buffer) => {
-                                let msg = &mut buffer[0];
-                                Self::recvmsg(args[0], msg, flags)
-                            }
-                        }
-                    }
-                }
+
+                let mut user_buffer_writer =
+                    UserBufferWriter::new(msg, core::mem::size_of::<MsgHdr>(), frame.from_user())?;
+                let buffer = user_buffer_writer.buffer::<MsgHdr>(0)?;
+
+                let msg = &mut buffer[0];
+                Self::recvmsg(args[0], msg, flags)
             }
 
             SYS_LISTEN => Self::listen(args[0], args[1]),
@@ -858,7 +850,13 @@ impl Syscall {
             }
 
             SYS_SOCKETPAIR => {
-                unimplemented!()
+                let mut user_buffer_writer = UserBufferWriter::new(
+                    args[3] as *mut c_int,
+                    core::mem::size_of::<[c_int; 2]>(),
+                    frame.from_user(),
+                )?;
+                let fds = user_buffer_writer.buffer::<i32>(0)?;
+                Self::socketpair(args[0], args[1], args[2], fds)
             }
 
             #[cfg(target_arch = "x86_64")]

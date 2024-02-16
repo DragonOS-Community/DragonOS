@@ -4,9 +4,9 @@ use system_error::SystemError;
 use x86::dtables::DescriptorTablePointer;
 
 use crate::{
-    arch::process::table::TSSManager,
+    arch::{interrupt::trap::arch_trap_init, process::table::TSSManager},
     driver::pci::pci::pci_init,
-    include::bindings::bindings::{cpu_init, irq_init},
+    include::bindings::bindings::cpu_init,
     init::init::start_kernel,
     kdebug,
     mm::{MemoryManagementArch, PhysAddr},
@@ -34,7 +34,6 @@ extern "C" {
 
     fn multiboot2_init(mb2_info: u64, mb2_magic: u32) -> bool;
     fn __init_set_cpu_stack_start(cpu: u32, stack_start: u64);
-    fn sys_vector_init();
 }
 
 #[no_mangle]
@@ -83,7 +82,7 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
     set_current_core_tss(stack_start, 0);
     unsafe { TSSManager::load_tr() };
     unsafe { __init_set_cpu_stack_start(0, stack_start as u64) };
-    unsafe { sys_vector_init() };
+    arch_trap_init().expect("arch_trap_init failed");
 
     return Ok(());
 }
@@ -92,7 +91,6 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
 #[inline(never)]
 pub fn setup_arch() -> Result<(), SystemError> {
     unsafe {
-        irq_init();
         cpu_init();
     }
 

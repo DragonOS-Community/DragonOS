@@ -18,11 +18,8 @@ use crate::{
 };
 
 use super::{
-    socket::{
-        PosixSocketType, RawSocket, SocketHandleItem, SocketInode, SocketOptions, TcpSocket,
-        UdpSocket, HANDLE_MAP,
-    },
-    Endpoint, Protocol, ShutdownType, Socket,
+    socket::{new_socket, PosixSocketType, Socket, SocketHandleItem, SocketInode, HANDLE_MAP},
+    Endpoint, Protocol, ShutdownType,
 };
 
 /// Flags for socket, socketpair, accept4
@@ -42,42 +39,64 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         let address_family = AddressFamily::try_from(address_family as u16)?;
         let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
-        // kdebug!("do_socket: address_family: {address_family:?}, socket_type: {socket_type:?}, protocol: {protocol}");
-        // 根据地址族和socket类型创建socket
-        let socket: Box<dyn Socket> = match address_family {
-            AddressFamily::Unix | AddressFamily::INet => match socket_type {
-                PosixSocketType::Stream => Box::new(TcpSocket::new(SocketOptions::default())),
-                PosixSocketType::Datagram => Box::new(UdpSocket::new(SocketOptions::default())),
-                PosixSocketType::Raw => Box::new(RawSocket::new(
-                    Protocol::from(protocol as u8),
-                    SocketOptions::default(),
-                )),
-                _ => {
-                    // kdebug!("do_socket: EINVAL");
-                    return Err(SystemError::EINVAL);
-                }
-            },
-            _ => {
-                // kdebug!("do_socket: EAFNOSUPPORT");
-                return Err(SystemError::EAFNOSUPPORT);
-            }
-        };
+        let protocol = Protocol::from(protocol as u8);
+
+        let socket = new_socket(address_family, socket_type, protocol)?;
+
         let handle_item = SocketHandleItem::new(&socket);
         HANDLE_MAP
             .write_irqsave()
             .insert(socket.socket_handle(), handle_item);
-        // kdebug!("do_socket: socket: {socket:?}");
+
         let socketinode: Arc<SocketInode> = SocketInode::new(socket);
         let f = File::new(socketinode, FileMode::O_RDWR)?;
-        // kdebug!("do_socket: f: {f:?}");
         // 把socket添加到当前进程的文件描述符表中
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
-
         let fd = fd_table_guard.alloc_fd(f, None).map(|x| x as usize);
         drop(fd_table_guard);
-        // kdebug!("do_socket: fd: {fd:?}");
         return fd;
+    }
+
+    /// # sys_socketpair系统调用的实际执行函数
+    ///
+    /// ## 参数
+    /// - `address_family`: 地址族
+    /// - `socket_type`: socket类型
+    /// - `protocol`: 传输协议
+    /// - `fds`: 用于返回文件描述符的数组
+    pub fn socketpair(
+        address_family: usize,
+        socket_type: usize,
+        protocol: usize,
+        fds: &mut [i32],
+    ) -> Result<usize, SystemError> {
+        let address_family = AddressFamily::try_from(address_family as u16)?;
+        let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
+        let protocol = Protocol::from(protocol as u8);
+
+        let mut socket0 = new_socket(address_family, socket_type, protocol)?;
+        let mut socket1 = new_socket(address_family, socket_type, protocol)?;
+
+        socket0
+            .socketpair_ops()
+            .unwrap()
+            .socketpair(&mut socket0, &mut socket1);
+
+        let binding = ProcessManager::current_pcb().fd_table();
+        let mut fd_table_guard = binding.write();
+
+        let mut alloc_fd = |socket: Box<dyn Socket>| -> Result<i32, SystemError> {
+            let socketinode = SocketInode::new(socket);
+            let file = File::new(socketinode, FileMode::O_RDWR)?;
+            fd_table_guard.alloc_fd(file, None)
+        };
+
+        fds[0] = alloc_fd(socket0)?;
+        fds[1] = alloc_fd(socket1)?;
+
+        drop(fd_table_guard);
+        Ok(0)
     }
 
     /// @brief sys_setsockopt系统调用的实际执行函数
@@ -131,7 +150,7 @@ impl Syscall {
                 PosixSocketOption::SO_SNDBUF => {
                     // 返回发送缓冲区大小
                     unsafe {
-                        *optval = socket.metadata()?.send_buf_size as u32;
+                        *optval = socket.metadata()?.tx_buf_size as u32;
                         *optlen = core::mem::size_of::<u32>() as u32;
                     }
                     return Ok(0);
@@ -140,7 +159,7 @@ impl Syscall {
                     let optval = optval as *mut u32;
                     // 返回默认的接收缓冲区大小
                     unsafe {
-                        *optval = socket.metadata()?.recv_buf_size as u32;
+                        *optval = socket.metadata()?.rx_buf_size as u32;
                         *optlen = core::mem::size_of::<u32>() as u32;
                     }
                     return Ok(0);
@@ -376,7 +395,7 @@ impl Syscall {
         }
 
         if SOCK_NONBLOCK != FileMode::O_NONBLOCK && ((flags & SOCK_NONBLOCK.bits()) != 0) {
-            flags = (flags & !SOCK_NONBLOCK.bits()) | FileMode::O_NONBLOCK.bits();
+            flags = (flags & !FileMode::O_NONBLOCK.bits()) | FileMode::O_NONBLOCK.bits();
         }
 
         return Self::do_accept(fd, addr, addrlen, flags);
@@ -402,10 +421,10 @@ impl Syscall {
         let new_socket: Arc<SocketInode> = SocketInode::new(new_socket);
 
         let mut file_mode = FileMode::O_RDWR;
-        if flags & FileMode::O_NONBLOCK.bits() != 0 {
+        if flags & SOCK_NONBLOCK.bits() != 0 {
             file_mode |= FileMode::O_NONBLOCK;
         }
-        if flags & FileMode::O_CLOEXEC.bits() != 0 {
+        if flags & SOCK_CLOEXEC.bits() != 0 {
             file_mode |= FileMode::O_CLOEXEC;
         }
 
@@ -686,10 +705,11 @@ impl From<Endpoint> for SockAddr {
                 };
 
                 return SockAddr { addr_ll };
-            } // _ => {
-              //     // todo: support other endpoint, like Netlink...
-              //     unimplemented!("not support {value:?}");
-              // }
+            }
+            _ => {
+                // todo: support other endpoint, like Netlink...
+                unimplemented!("not support {value:?}");
+            }
         }
     }
 }

@@ -2,7 +2,6 @@
 #include <common/cpu.h>
 #include <common/kprint.h>
 #include <common/spinlock.h>
-#include <exception/gate.h>
 #include <mm/slab.h>
 #include <process/process.h>
 #include <arch/x86_64/driver/apic/apic_timer.h>
@@ -10,7 +9,6 @@
 #include <process/preempt.h>
 #include <sched/sched.h>
 #include <driver/acpi/acpi.h>
-#include "exception/trap.h"
 #include "exception/irq.h"
 #include "ipi.h"
 #include <arch/arch.h>
@@ -69,9 +67,7 @@ void smp_init()
     memcpy((unsigned char *)phys_2_virt(0x20000), _apu_boot_start,
            (unsigned long)&_apu_boot_end - (unsigned long)&_apu_boot_start);
     io_mfence();
-    // 设置多核IPI中断门
-    for (int i = 200; i < 210; ++i)
-        set_intr_gate(i, 0, SMP_interrupt_table[i - 200]);
+
     memset((void *)SMP_IPI_desc, 0, sizeof(irq_desc_t) * SMP_IRQ_NUM);
 
     io_mfence();

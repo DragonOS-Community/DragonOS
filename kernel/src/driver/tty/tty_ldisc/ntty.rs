@@ -882,7 +882,6 @@ impl NTtyData {
             *n = to.len();
             // return Err(SystemError::EINVAL);
         }
-
         if tail > NTTY_BUFSIZE {
             return Err(SystemError::EINVAL);
         }
@@ -1556,7 +1555,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
 
         drop(termios);
 
-        TtyJobCtrlManager::tty_check_change(tty.clone(), SigSet::SIGTTIN)?;
+        TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTIN)?;
 
         let mut minimum: usize = 0;
         if !ldata.icanon {
@@ -1648,6 +1647,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         if offset > 0 {
             return Ok(offset);
         }
+
         ret
     }
 
@@ -1665,7 +1665,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         let core = binding.core();
         let termios = core.termios().clone();
         if termios.local_mode.contains(LocalMode::TOSTOP) {
-            TtyJobCtrlManager::tty_check_change(tty.clone(), SigSet::SIGTTOU)?;
+            TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTOU)?;
         }
 
         ldata.process_echoes(tty.clone());
@@ -1746,7 +1746,8 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         _cmd: u32,
         _arg: usize,
     ) -> Result<usize, system_error::SystemError> {
-        todo!()
+        // TODO
+        return Err(SystemError::ENOIOCTLCMD);
     }
 
     fn set_termios(

@@ -6,6 +6,7 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
+    arch::ipc::signal::{SigSet, Signal},
     driver::{
         base::{
             char::CharDevice,
@@ -28,11 +29,14 @@ use crate::{
     },
     init::initcall::INITCALL_DEVICE,
     libs::rwlock::RwLock,
+    mm::VirtAddr,
     process::ProcessManager,
+    syscall::user_access::UserBufferWriter,
 };
 
 use super::{
-    tty_core::{TtyCore, TtyFlag},
+    termios::WindowSize,
+    tty_core::{TtyCore, TtyFlag, TtyIoctlCmd},
     tty_driver::{TtyDriver, TtyDriverSubType, TtyDriverType, TtyOperation},
     tty_job_control::TtyJobCtrlManager,
     virtual_terminal::vty_init,
@@ -251,8 +255,58 @@ impl IndexNode for TtyDevice {
         Ok(())
     }
 
-    fn ioctl(&self, _cmd: u32, _data: usize) -> Result<usize, SystemError> {
-        // todo!()
+    fn ioctl(&self, cmd: u32, arg: usize, data: &FilePrivateData) -> Result<usize, SystemError> {
+        let (tty, _) = if let FilePrivateData::Tty(tty_priv) = data {
+            (tty_priv.tty.clone(), tty_priv.mode)
+        } else {
+            return Err(SystemError::EIO);
+        };
+
+        match cmd {
+            TtyIoctlCmd::TIOCSETD
+            | TtyIoctlCmd::TIOCSBRK
+            | TtyIoctlCmd::TIOCCBRK
+            | TtyIoctlCmd::TCSBRK
+            | TtyIoctlCmd::TCSBRKP => {
+                TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTOU)?;
+                if cmd != TtyIoctlCmd::TIOCCBRK {
+                    todo!()
+                }
+            }
+            _ => {}
+        }
+
+        kwarn!("cmd {cmd:x}");
+        match cmd {
+            TtyIoctlCmd::TIOCGWINSZ => {
+                let core = tty.core();
+                let winsize = *core.window_size();
+
+                let mut user_writer = UserBufferWriter::new(
+                    VirtAddr::new(arg).as_ptr::<WindowSize>(),
+                    core::mem::size_of::<WindowSize>(),
+                    true,
+                )?;
+
+                let err = user_writer.copy_one_to_user(&winsize, 0);
+                if err.is_err() {
+                    return Err(SystemError::EFAULT);
+                }
+                return Ok(0);
+            }
+            _ => match TtyJobCtrlManager::job_ctrl_ioctl(tty.clone(), cmd, arg) {
+                Ok(_) => {}
+                Err(e) => {
+                    if e != SystemError::ENOIOCTLCMD {
+                        return Err(e);
+                    }
+                }
+            },
+        }
+
+        tty.ioctl(tty.clone(), cmd, arg)?;
+        tty.ldisc().ioctl(tty, cmd, arg)?;
+
         Ok(0)
     }
 }

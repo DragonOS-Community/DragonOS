@@ -134,8 +134,8 @@ impl TtyOperation for TtyConsoleDriverInner {
         let window_size = tty_core.window_size_upgradeable();
         if window_size.col == 0 && window_size.row == 0 {
             let mut window_size = window_size.upgrade();
-            window_size.col = vc_data.cols;
-            window_size.row = vc_data.rows;
+            window_size.col = vc_data.cols as u16;
+            window_size.row = vc_data.rows as u16;
         }
 
         if vc_data.utf {
@@ -191,7 +191,6 @@ impl TtyOperation for TtyConsoleDriverInner {
             if vc_data.is_control(tc, ch) {
                 vc_data.flush(&mut draw);
                 vc_data.do_control(ch);
-                // vc_data.flush(&mut draw);
                 continue;
             }
 
@@ -214,6 +213,11 @@ impl TtyOperation for TtyConsoleDriverInner {
     fn put_char(&self, tty: &TtyCoreData, ch: u8) -> Result<(), SystemError> {
         self.write(tty, &[ch], 1)?;
         Ok(())
+    }
+
+    fn ioctl(&self, _tty: Arc<TtyCore>, _cmd: u32, _arg: usize) -> Result<(), SystemError> {
+        // TODO
+        Err(SystemError::ENOIOCTLCMD)
     }
 }
 

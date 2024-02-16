@@ -179,7 +179,7 @@ impl TtyDriver {
             if let Some(t) = self.saved_termios.get(tty_index) {
                 let mut termios = t.clone();
                 termios.line = self.init_termios.line;
-                tty.data_set_termios(termios);
+                tty.set_termios(termios);
             }
         }
         // TODO:设置termios波特率？
@@ -384,6 +384,8 @@ pub trait TtyOperation: Sync + Send + Debug {
     fn flush_buffer(&self, _tty: &TtyCoreData) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
+
+    fn ioctl(&self, tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<(), SystemError>;
 }
 
 #[allow(dead_code)]

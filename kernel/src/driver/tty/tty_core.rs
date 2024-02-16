@@ -16,6 +16,7 @@ use crate::{
 use super::{
     termios::{Termios, WindowSize},
     tty_driver::{TtyDriver, TtyDriverSubType, TtyDriverType, TtyOperation},
+    tty_job_control::TtyJobCtrlManager,
     tty_ldisc::{
         ntty::{NTtyData, NTtyLinediscipline},
         TtyLineDiscipline,
@@ -233,7 +234,7 @@ impl TtyCoreData {
     }
 
     #[inline]
-    pub fn data_set_termios(&self, termios: Termios) {
+    pub fn set_termios(&self, termios: Termios) {
         let mut termios_guard = self.termios.write();
         *termios_guard = termios;
     }
@@ -262,6 +263,11 @@ impl TtyCoreData {
     #[inline]
     pub fn window_size_upgradeable(&self) -> RwLockUpgradableGuard<WindowSize> {
         self.window_size.upgradeable_read()
+    }
+
+    #[inline]
+    pub fn window_size(&self) -> RwLockReadGuard<WindowSize> {
+        self.window_size.read()
     }
 
     #[inline]
@@ -315,6 +321,10 @@ impl TtyOperation for TtyCore {
 
     fn stop(&self, tty: &TtyCoreData) -> Result<(), SystemError> {
         return self.core().tty_driver.driver_funcs().stop(tty);
+    }
+
+    fn ioctl(&self, tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<(), SystemError> {
+        return self.core().tty_driver.driver_funcs().ioctl(tty, cmd, arg);
     }
 }
 
@@ -381,4 +391,90 @@ impl EchoOperation {
             EchoOperation::Undefined(num) => num,
         }
     }
+}
+
+pub struct TtyIoctlCmd;
+
+#[allow(dead_code)]
+impl TtyIoctlCmd {
+    /// 获取终端参数
+    pub const TCGETS: u32 = 0x5401;
+    /// 设置终端参数
+    pub const TCSETS: u32 = 0x5402;
+    /// 设置终端参数并等待所有输出完成
+    pub const TCSETSW: u32 = 0x5403;
+    /// 设置终端参数并且等待所有输出完成，但在这之前将终端清空
+    pub const TCSETSF: u32 = 0x5404;
+    /// 获取终端参数
+    pub const TCGETA: u32 = 0x5405;
+    /// 设置终端参数
+    pub const TCSETA: u32 = 0x5406;
+    /// 设置终端参数并等待所有输出完成
+    pub const TCSETAW: u32 = 0x5407;
+    /// 设置终端参数并且等待所有输出完成，但在这之前将终端清空
+    pub const TCSETAF: u32 = 0x5408;
+    /// 发送零字节，等待所有输出完成
+    pub const TCSBRK: u32 = 0x5409;
+    /// 控制终端的流控
+    pub const TCXONC: u32 = 0x540A;
+    /// 刷新输入/输出缓冲区或者丢弃输入缓冲区
+    pub const TCFLSH: u32 = 0x540B;
+    /// 设置设备为独占模式
+    pub const TIOCEXCL: u32 = 0x540C;
+    /// 设置设备为非独占模式
+    pub const TIOCNXCL: u32 = 0x540D;
+    /// 设置当前进程的控制终端
+    pub const TIOCSCTTY: u32 = 0x540E;
+    /// 获取前台进程组
+    pub const TIOCGPGRP: u32 = 0x540F;
+    ///设置前台进程组
+    pub const TIOCSPGRP: u32 = 0x5410;
+    /// 获取输出队列的字节数
+    pub const TIOCOUTQ: u32 = 0x5411;
+    /// 模拟从终端输入字符
+    pub const TIOCSTI: u32 = 0x5412;
+    /// 获取窗口大小
+    pub const TIOCGWINSZ: u32 = 0x5413;
+    /// 设置窗口大小
+    pub const TIOCSWINSZ: u32 = 0x5414;
+    /// 获取终端控制信号的状态
+    pub const TIOCMGET: u32 = 0x5415;
+    /// 设置终端控制信号的位
+    pub const TIOCMBIS: u32 = 0x5416;
+    /// 清除终端控制信号的位
+    pub const TIOCMBIC: u32 = 0x5417;
+    /// 设置终端控制信号的状态
+    pub const TIOCMSET: u32 = 0x5418;
+    /// 获取软件载波状态
+    pub const TIOCGSOFTCAR: u32 = 0x5419;
+    /// 设置软件载波状态
+    pub const TIOCSSOFTCAR: u32 = 0x541A;
+    /// 获取输入队列的字节数
+    pub const FIONREAD: u32 = 0x541B;
+    /// Linux 特有命令
+    pub const TIOCLINUX: u32 = 0x541C;
+    /// 获取控制台设备
+    pub const TIOCCONS: u32 = 0x541D;
+    /// 获取串行设备参数
+    pub const TIOCGSERIAL: u32 = 0x541E;
+    /// 设置串行设备参数
+    pub const TIOCSSERIAL: u32 = 0x541F;
+    /// 设置套接字的报文模式
+    pub const TIOCPKT: u32 = 0x5420;
+    /// 设置非阻塞 I/O
+    pub const FIONBIO: u32 = 0x5421;
+    /// 清除控制终端
+    pub const TIOCNOTTY: u32 = 0x5422;
+    /// 设置终端线路驱动器
+    pub const TIOCSETD: u32 = 0x5423;
+    /// 获取终端线路驱动器
+    pub const TIOCGETD: u32 = 0x5424;
+    /// 发送终止条件
+    pub const TCSBRKP: u32 = 0x5425;
+    /// 开始发送零比特
+    pub const TIOCSBRK: u32 = 0x5427;
+    /// 停止发送零比特
+    pub const TIOCCBRK: u32 = 0x5428;
+    /// Return the session ID of FD
+    pub const TIOCGSID: u32 = 0x5429;
 }

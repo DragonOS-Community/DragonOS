@@ -281,6 +281,9 @@ pub enum SystemError {
     EVMLAUNCHFailed = 136,
     KVM_HVA_ERR_BAD = 137,
 
+    /// 没有对应的ioctlcmd
+    ENOIOCTLCMD = 515,
+
     // === 以下错误码不应该被用户态程序使用 ===
     ERESTARTSYS = 512,
 }

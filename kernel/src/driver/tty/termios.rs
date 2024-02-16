@@ -1,12 +1,12 @@
 use super::tty_ldisc::LineDisciplineType;
 
 /// ## 窗口大小
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct WindowSize {
     /// 行
-    pub row: usize,
+    pub row: u16,
     /// 列
-    pub col: usize,
+    pub col: u16,
     /// x方向像素数
     pub xpixel: u16,
     /// y方向像素数

@@ -14,7 +14,7 @@ use crate::{
 use super::{
     allocator::page_frame::{PageFrameCount, VirtPageFrame},
     ucontext::{AddressSpace, DEFAULT_MMAP_MIN_ADDR},
-    verify_area, VirtAddr,
+    verify_area, VirtAddr, VmFlags,
 };
 
 bitflags! {
@@ -63,7 +63,13 @@ bitflags! {
 
         /// For anonymous mmap, memory could be uninitialized
         const MAP_UNINITIALIZED = 0x4000000;
+    }
 
+    /// Memory mremapping flags
+    pub struct MremapFlags: u8 {
+        const MREMAP_MAYMOVE = 1;
+        const MREMAP_FIXED = 2;
+        const MREMAP_DONTUNMAP = 4;
     }
 }
 
@@ -156,6 +162,103 @@ impl Syscall {
         return Ok(start_page.virt_address().data());
     }
 
+    /// ## mremap系统调用
+    ///
+    ///
+    /// ## 参数
+    ///
+    /// - `old_vaddr`：原映射的起始地址
+    /// - `old_len`：原映射的长度
+    /// - `new_len`：重新映射的长度
+    /// - `mremap_flags`：重映射标志
+    /// - `new_vaddr`：重新映射的起始地址
+    ///
+    /// ## 返回值
+    ///
+    /// 成功时返回重映射的起始地址，失败时返回错误码
+    pub fn mremap(
+        old_vaddr: VirtAddr,
+        old_len: usize,
+        new_len: usize,
+        mremap_flags: MremapFlags,
+        new_vaddr: VirtAddr,
+    ) -> Result<usize, SystemError> {
+        let current_address_space = AddressSpace::current()?;
+        let vma = current_address_space.read().mappings.contains(old_vaddr);
+        if vma.is_none() {
+            return Err(SystemError::EINVAL);
+        }
+        let vma = vma.unwrap();
+        let vm_flags = vma.lock().vm_flags().clone();
+
+        // 暂时不支持巨页映射
+        if vm_flags.contains(VmFlags::VM_HUGETLB) {
+            kerror!("mmap: not support huge page mapping");
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+
+        // 重映射到新内存区域并且不取消旧内存映射
+        if mremap_flags.contains(MremapFlags::MREMAP_FIXED | MremapFlags::MREMAP_DONTUNMAP) {
+            let r = current_address_space.write().mremap_to(
+                old_vaddr,
+                old_len,
+                new_len,
+                mremap_flags,
+                new_vaddr,
+                vm_flags,
+            )?;
+
+            return Ok(r.data());
+        }
+
+        // 缩小旧内存映射区域
+        if old_len >= new_len {
+            let size = old_len - new_len;
+            if size != 0 {
+                Self::munmap(old_vaddr + new_len, old_len - new_len)?;
+            }
+            return Ok(old_vaddr.data());
+        }
+
+        // 默认重映射
+        if mremap_flags.is_empty() {
+            let r = current_address_space.write().mremap_to(
+                old_vaddr,
+                old_len,
+                new_len,
+                mremap_flags,
+                VirtAddr::new(0),
+                vm_flags,
+            )?;
+
+            // 取消原映射
+            Self::munmap(old_vaddr, old_len)?;
+
+            return Ok(r.data());
+        }
+
+        // 重映射到新内存区域
+        if mremap_flags.contains(MremapFlags::MREMAP_MAYMOVE) {
+            let r = current_address_space.write().mremap_to(
+                old_vaddr,
+                old_len,
+                new_len,
+                mremap_flags,
+                new_vaddr,
+                vm_flags,
+            )?;
+
+            if !mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP) {
+                // 取消旧映射
+                Self::munmap(old_vaddr, old_len)?;
+            }
+
+            return Ok(r.data());
+        }
+
+        return Err(SystemError::EINVAL);
+    }
+
     /// ## munmap系统调用
     ///
     /// ## 参数
@@ -185,6 +288,7 @@ impl Syscall {
             .write()
             .munmap(start_frame, page_count)
             .map_err(|_| SystemError::EINVAL)?;
+
         return Ok(0);
     }
 

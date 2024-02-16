@@ -7,6 +7,7 @@ use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
     driver::base::device::device_number::DeviceNumber,
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
+    mm::syscall::MremapFlags,
     process::{
         fork::KernelCloneArgs,
         resource::{RLimit64, RUsage},
@@ -597,6 +598,49 @@ impl Syscall {
                         args[5],
                     )
                 }
+            }
+            SYS_MREMAP => {
+                let old_vaddr = VirtAddr::new(args[0]);
+                let old_len = args[1];
+                let new_len = args[2];
+                let mremap_flags = MremapFlags::from_bits_truncate(args[3] as u8);
+                let new_vaddr = VirtAddr::new(args[4]);
+
+                // 不允许有MemapFlags不包含的bit
+                if args[3] > 7 {
+                    return Err(SystemError::EINVAL);
+                }
+
+                // 需要重映射到新内存区域的情况下，必须包含MREMAP_MAYMOVE并且指定新地址
+                if mremap_flags.contains(MremapFlags::MREMAP_FIXED)
+                    && (!mremap_flags.contains(MremapFlags::MREMAP_MAYMOVE)
+                        || new_vaddr == VirtAddr::new(0))
+                {
+                    return Err(SystemError::EINVAL);
+                }
+
+                // 不取消旧映射的情况下，必须包含MREMAP_MAYMOVE并且新内存大小等于旧内存大小
+                if mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP)
+                    && (!mremap_flags.contains(MremapFlags::MREMAP_MAYMOVE) || old_len != new_len)
+                {
+                    return Err(SystemError::EINVAL);
+                }
+
+                // 旧内存地址必须对齐
+                if !old_vaddr.check_aligned(MMArch::PAGE_SIZE) {
+                    return Err(SystemError::EINVAL);
+                }
+
+                // 将old_len、new_len 对齐页面大小
+                let old_len = page_align_up(old_len);
+                let new_len = page_align_up(new_len);
+
+                // 不允许重映射内存大小为0
+                if new_len == 0 {
+                    return Err(SystemError::EINVAL);
+                }
+
+                Self::mremap(old_vaddr, old_len, new_len, mremap_flags, new_vaddr)
             }
             SYS_MUNMAP => {
                 let addr = args[0];

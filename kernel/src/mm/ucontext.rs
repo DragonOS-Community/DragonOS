@@ -32,8 +32,8 @@ use super::{
         deallocate_page_frames, PageFrameCount, PhysPageFrame, VirtPageFrame, VirtPageFrameIter,
     },
     page::{Flusher, InactiveFlusher, PageFlags, PageFlushAll},
-    syscall::{MapFlags, ProtFlags},
-    MemoryManagementArch, PageTableKind, VirtAddr, VirtRegion,
+    syscall::{MapFlags, MremapFlags, ProtFlags},
+    MemoryManagementArch, PageTableKind, VirtAddr, VirtRegion, VmFlags,
 };
 
 /// MMAP_MIN_ADDR的默认值
@@ -48,6 +48,78 @@ use super::{
 //   this low address space will need CAP_SYS_RAWIO or disable this
 //   protection by setting the value to 0.
 pub const DEFAULT_MMAP_MIN_ADDR: usize = 65536;
+
+/// 从ProtFlags计算VmFlags
+pub fn calc_vm_prot_flags(prot_flags: ProtFlags) -> VmFlags {
+    let mut vm_flags = VmFlags::VM_NONE;
+
+    if prot_flags.contains(ProtFlags::PROT_READ) {
+        vm_flags |= VmFlags::VM_READ;
+    }
+
+    if prot_flags.contains(ProtFlags::PROT_WRITE) {
+        vm_flags |= VmFlags::VM_WRITE;
+    }
+
+    if prot_flags.contains(ProtFlags::PROT_EXEC) {
+        vm_flags |= VmFlags::VM_EXEC;
+    }
+
+    return vm_flags;
+}
+
+/// 从MapFlags计算VmFlags
+pub fn calc_vm_map_flags(map_flags: MapFlags) -> VmFlags {
+    let mut vm_flags = VmFlags::VM_NONE;
+
+    if map_flags.contains(MapFlags::MAP_GROWSDOWN) {
+        vm_flags |= VmFlags::VM_GROWSDOWN;
+    }
+
+    if map_flags.contains(MapFlags::MAP_LOCKED) {
+        vm_flags |= VmFlags::VM_LOCKED;
+    }
+
+    if map_flags.contains(MapFlags::MAP_SYNC) {
+        vm_flags |= VmFlags::VM_SYNC;
+    }
+
+    return vm_flags;
+}
+
+/// 从VmFlags计算ProtFlags
+pub fn prot_from_vm_flags(vm_flags: VmFlags) -> ProtFlags {
+    let mut r = ProtFlags::PROT_NONE;
+
+    if vm_flags.contains(VmFlags::VM_READ) {
+        r |= ProtFlags::PROT_READ;
+    }
+    if vm_flags.contains(VmFlags::VM_WRITE) {
+        r |= ProtFlags::PROT_WRITE;
+    }
+    if vm_flags.contains(VmFlags::VM_EXEC) {
+        r |= ProtFlags::PROT_EXEC;
+    }
+
+    return r;
+}
+
+/// 从VmFlags计算MapFlags
+pub fn map_from_vm_flags(vm_flags: VmFlags) -> MapFlags {
+    let mut r = MapFlags::MAP_NONE;
+
+    if vm_flags.contains(VmFlags::VM_GROWSDOWN) {
+        r |= MapFlags::MAP_GROWSDOWN;
+    }
+    if vm_flags.contains(VmFlags::VM_LOCKED) {
+        r |= MapFlags::MAP_LOCKED;
+    }
+    if vm_flags.contains(VmFlags::VM_SYNC) {
+        r |= MapFlags::MAP_SYNC;
+    }
+
+    return r;
+}
 
 #[derive(Debug)]
 pub struct AddressSpace {
@@ -177,6 +249,7 @@ impl InnerAddressSpace {
             let new_vma = VMA::zeroed(
                 VirtPageFrame::new(vma_guard.region.start()),
                 PageFrameCount::new(vma_guard.region.size() / MMArch::PAGE_SIZE),
+                vma_guard.vm_flags().clone(),
                 tmp_flags,
                 &mut new_guard.user_mapper.utable,
                 (),
@@ -271,6 +344,12 @@ impl InnerAddressSpace {
 
         let len = page_align_up(len);
 
+        let vm_flags = calc_vm_prot_flags(prot_flags)
+            | calc_vm_map_flags(map_flags)
+            | VmFlags::VM_MAYREAD
+            | VmFlags::VM_MAYWRITE
+            | VmFlags::VM_MAYEXEC;
+
         // kdebug!("map_anonymous: len = {}", len);
 
         let start_page: VirtPageFrame = self.mmap(
@@ -279,7 +358,7 @@ impl InnerAddressSpace {
             prot_flags,
             map_flags,
             move |page, count, flags, mapper, flusher| {
-                Ok(VMA::zeroed(page, count, flags, mapper, flusher)?)
+                Ok(VMA::zeroed(page, count, vm_flags, flags, mapper, flusher)?)
             },
         )?;
 
@@ -360,6 +439,78 @@ impl InnerAddressSpace {
         )?);
 
         return Ok(page);
+    }
+
+    /// 重映射内存区域
+    ///
+    /// # 参数
+    ///
+    /// - `old_vaddr`：原映射的起始地址
+    /// - `old_len`：原映射的长度
+    /// - `new_len`：重新映射的长度
+    /// - `mremap_flags`：重映射标志
+    /// - `new_vaddr`：重新映射的起始地址
+    /// - `vm_flags`：旧内存区域标志
+    ///
+    /// # Returns
+    ///
+    /// 返回重映射的起始虚拟页帧地址
+    ///
+    /// # Errors
+    ///
+    /// - `EINVAL`：参数错误
+    pub fn mremap_to(
+        &mut self,
+        old_vaddr: VirtAddr,
+        old_len: usize,
+        new_len: usize,
+        mremap_flags: MremapFlags,
+        new_vaddr: VirtAddr,
+        vm_flags: VmFlags,
+    ) -> Result<VirtAddr, SystemError> {
+        // 检查新内存地址是否对齐
+        if !new_vaddr.check_aligned(MMArch::PAGE_SIZE) {
+            return Err(SystemError::EINVAL);
+        }
+
+        // 检查新、旧内存区域是否冲突
+        let old_region = VirtRegion::new(old_vaddr, old_len);
+        let new_region = VirtRegion::new(new_vaddr, new_len);
+        if old_region.collide(&new_region) {
+            return Err(SystemError::EINVAL);
+        }
+
+        // 取消新内存区域的原映射
+        if mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
+            let start_page = VirtPageFrame::new(new_vaddr);
+            let page_count = PageFrameCount::new(new_len / MMArch::PAGE_SIZE);
+            self.munmap(start_page, page_count)?;
+        }
+
+        // 初始化映射标志
+        let map_flags = map_from_vm_flags(vm_flags);
+        // 初始化内存区域保护标志
+        let prot_flags = prot_from_vm_flags(vm_flags);
+
+        // 获取映射后的新内存页面
+        let new_page = self.map_anonymous(new_vaddr, new_len, prot_flags, map_flags, true)?;
+        let new_page_vaddr = new_page.virt_address();
+
+        // 拷贝旧内存的页表项到新内存区域
+        let entry = self.user_mapper.utable.translate(old_vaddr);
+        if entry.is_none() {
+            return Err(SystemError::EINVAL);
+        }
+        let entry = entry.unwrap();
+        let r = unsafe {
+            self.user_mapper
+                .utable
+                .map_phys(new_page_vaddr, entry.0, entry.1)
+        }
+        .expect("Failed to map phys, may be OOM error");
+        r.flush();
+
+        return Ok(new_page_vaddr);
     }
 
     /// 取消进程的地址空间中的映射
@@ -660,6 +811,7 @@ impl UserMappings {
 
         // 创建一个新的虚拟内存范围。
         let region = VirtRegion::new(cmp::max(*hole_vaddr, min_vaddr), *size);
+
         return Some(region);
     }
 
@@ -943,6 +1095,8 @@ impl LockedVMA {
 pub struct VMA {
     /// 虚拟内存区域对应的虚拟地址范围
     region: VirtRegion,
+    /// 虚拟内存区域标志
+    vm_flags: VmFlags,
     /// VMA内的页帧的标志
     flags: PageFlags<MMArch>,
     /// VMA内的页帧是否已经映射到页表
@@ -970,8 +1124,37 @@ pub enum Provider {
 
 #[allow(dead_code)]
 impl VMA {
+    pub fn new(
+        region: VirtRegion,
+        vm_flags: VmFlags,
+        flags: PageFlags<MMArch>,
+        mapped: bool,
+    ) -> Self {
+        VMA {
+            region,
+            vm_flags,
+            flags,
+            mapped,
+            user_address_space: None,
+            self_ref: Weak::default(),
+            provider: Provider::Allocated,
+        }
+    }
+
     pub fn region(&self) -> &VirtRegion {
         return &self.region;
+    }
+
+    pub fn vm_flags(&self) -> &VmFlags {
+        return &self.vm_flags;
+    }
+
+    pub fn set_vm_flags(&mut self, vm_flags: VmFlags) {
+        self.vm_flags = vm_flags;
+    }
+
+    pub fn set_region_size(&mut self, new_region_size: usize) {
+        self.region.set_size(new_region_size);
     }
 
     /// # 拷贝当前VMA的内容
@@ -982,6 +1165,7 @@ impl VMA {
     pub unsafe fn clone(&self) -> Self {
         return Self {
             region: self.region,
+            vm_flags: self.vm_flags,
             flags: self.flags,
             mapped: self.mapped,
             user_address_space: self.user_address_space.clone(),
@@ -1057,6 +1241,7 @@ impl VMA {
         phys: PhysPageFrame,
         destination: VirtPageFrame,
         count: PageFrameCount,
+        vm_flags: VmFlags,
         flags: PageFlags<MMArch>,
         mapper: &mut PageMapper,
         mut flusher: impl Flusher<MMArch>,
@@ -1086,6 +1271,7 @@ impl VMA {
 
         let r: Arc<LockedVMA> = LockedVMA::new(VMA {
             region: VirtRegion::new(destination.virt_address(), count.data() * MMArch::PAGE_SIZE),
+            vm_flags,
             flags,
             mapped: true,
             user_address_space: None,
@@ -1107,6 +1293,7 @@ impl VMA {
     pub fn zeroed(
         destination: VirtPageFrame,
         page_count: PageFrameCount,
+        vm_flags: VmFlags,
         flags: PageFlags<MMArch>,
         mapper: &mut PageMapper,
         mut flusher: impl Flusher<MMArch>,
@@ -1135,6 +1322,7 @@ impl VMA {
                 destination.virt_address(),
                 page_count.data() * MMArch::PAGE_SIZE,
             ),
+            vm_flags,
             flags,
             mapped: true,
             user_address_space: None,

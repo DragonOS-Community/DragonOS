@@ -255,8 +255,6 @@ pub trait BlockDevice: Device {
         }else{
             self.write_at(lba_id_start, count, buf)
         }
-    
-        
     }
 
     fn cache_read(&self,lba_id_start: BlockId,count: usize,buf: &mut [u8])-> Result<usize, SystemError>{

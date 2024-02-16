@@ -14,7 +14,7 @@ fn main() -> std::io::Result<()> {
         count+=1;
         file.seek(SeekFrom::Start(0))?;
         let bytes_read = file.read_exact(&mut buffer)?;
-        if count >20000 {
+        if count >50000 {
             break;
         }
     }

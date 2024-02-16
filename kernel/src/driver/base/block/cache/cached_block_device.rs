@@ -95,21 +95,6 @@ impl BlockCache{
 
 #[inline]
     pub fn read_one_block(lba_id:usize,cache_block_addr:CacheBlockAddr,position:usize,buf:&mut [u8])->Option<usize>{
-        //todo:这里实际上最好要在某个合适的地方进行初始化，这里做这个检查只是权宜之计
-        // unsafe {
-        //     if !INITIAL_FLAG{
-        //         Self::init()
-        //     }   
-        // }
-
-
-        // let mapper=unsafe {
-        //     match &CMAPPER{
-        //         Some(x)=>{x},
-        //         None=>{return None}
-        //     }
-        // };
-        // let addr=mapper.find(lba_id)?;
         let space=unsafe {
             match &CSPACE{
                 Some(x)=>x,
@@ -151,14 +136,6 @@ impl BlockCache{
     }
 
     pub fn test_write(lba_id_start:usize,count:usize,data:&[u8])->Result<usize,()>{
-        let block_iter=BlockIter::new(lba_id_start, count, BLOCK_SIZE);
-        for i in block_iter{
-            Self::test_write_one_block(i.iba_id());
-        }
-        Ok(count)
-    }
-
-    pub fn test_write_one_block(lba_id:usize)->Option<()>{
         unsafe {
             if !INITIAL_FLAG{
                 Self::init()
@@ -167,12 +144,21 @@ impl BlockCache{
         let mapper=unsafe {
             match &mut CMAPPER{
                 Some(x)=>{x},
-                None=>{return None}
+                None=>{return Err(())}
             }
         };
-        mapper.remove(lba_id);
-        Some(())
+        let block_iter=BlockIter::new(lba_id_start, count, BLOCK_SIZE);
+        for i in block_iter{
+            mapper.remove(i.iba_id());
+        }
+        Ok(count)
     }
+
+    // pub fn test_write_one_block(lba_id:usize)->Option<()>{
+        
+    //     mapper.remove(lba_id);
+    //     Some(())
+    // }
 }
 
 struct CacheSpace{

@@ -16,7 +16,6 @@ use crate::{
 use super::{
     termios::{Termios, WindowSize},
     tty_driver::{TtyDriver, TtyDriverSubType, TtyDriverType, TtyOperation},
-    tty_job_control::TtyJobCtrlManager,
     tty_ldisc::{
         ntty::{NTtyData, NTtyLinediscipline},
         TtyLineDiscipline,

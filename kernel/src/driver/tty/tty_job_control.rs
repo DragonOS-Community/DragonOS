@@ -3,9 +3,8 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
-    mm::VirtAddr,
     process::{Pid, ProcessManager},
-    syscall::{user_access::UserBufferReader, Syscall},
+    syscall::Syscall,
 };
 
 use super::tty_core::{TtyCore, TtyIoctlCmd};

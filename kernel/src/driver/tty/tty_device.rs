@@ -6,7 +6,7 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    arch::ipc::signal::{SigSet, Signal},
+    arch::ipc::signal::Signal,
     driver::{
         base::{
             char::CharDevice,

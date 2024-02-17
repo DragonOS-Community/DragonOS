@@ -226,7 +226,7 @@ impl BiosParameterBlock {
         // 读取分区的引导扇区
         partition
             .disk()
-            .read_at(partition.lba_start as usize, 1, &mut v)?;
+            .read_at_sync(partition.lba_start as usize, 1, &mut v)?;
 
         // 获取指针对象
         let mut cursor = VecCursor::new(v);

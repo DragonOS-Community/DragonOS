@@ -328,7 +328,7 @@ impl FATFile {
         let zeroes: Vec<u8> = vec![0u8; (range_end - range_start) as usize];
         fs.partition
             .disk()
-            .t_write(range_start as usize, zeroes.len(), zeroes.as_slice())?;
+            .write_at(range_start as usize, zeroes.len(), zeroes.as_slice())?;
         // .write_at(range_start as usize, zeroes.len(), zeroes.as_slice())?;
         return Ok(());
     }
@@ -1089,7 +1089,7 @@ impl LongDirEntry {
         v.resize(1 * fs.lba_per_sector() * LBA_SIZE, 0);
         fs.partition
             .disk()
-            .t_read(lba, 1 * fs.lba_per_sector(), &mut v)?;
+            .read_at(lba, 1 * fs.lba_per_sector(), &mut v)?;
         // .read_at(lba, 1 * fs.lba_per_sector(), &mut v)?;
 
         let mut cursor: VecCursor = VecCursor::new(v);
@@ -1119,7 +1119,7 @@ impl LongDirEntry {
         // 把修改后的长目录项刷入磁盘
         fs.partition
             .disk()
-            .t_write(lba, 1 * fs.lba_per_sector(), cursor.as_slice())?;
+            .write_at(lba, 1 * fs.lba_per_sector(), cursor.as_slice())?;
         // .write_at(lba, 1 * fs.lba_per_sector(), cursor.as_slice())?;
         fs.partition.disk().sync()?;
 
@@ -1305,7 +1305,7 @@ impl ShortDirEntry {
         v.resize(1 * fs.lba_per_sector() * LBA_SIZE, 0);
         fs.partition
             .disk()
-            .t_read(lba, 1 * fs.lba_per_sector(), &mut v)?;
+            .read_at(lba, 1 * fs.lba_per_sector(), &mut v)?;
         // .read_at(lba, 1 * fs.lba_per_sector(), &mut v)?;
 
         let mut cursor: VecCursor = VecCursor::new(v);
@@ -1327,7 +1327,7 @@ impl ShortDirEntry {
         // 把修改后的长目录项刷入磁盘
         fs.partition
             .disk()
-            .t_write(lba, 1 * fs.lba_per_sector(), cursor.as_slice())?;
+            .write_at(lba, 1 * fs.lba_per_sector(), cursor.as_slice())?;
         // .write_at(lba, 1 * fs.lba_per_sector(), cursor.as_slice())?;
         fs.partition.disk().sync()?;
 
@@ -2370,7 +2370,7 @@ pub fn get_raw_dir_entry(
     let mut v: Vec<u8> = Vec::new();
     v.resize(1 * LBA_SIZE, 0);
 
-    fs.partition.disk().t_read(lba, 1, &mut v)?;
+    fs.partition.disk().read_at(lba, 1, &mut v)?;
     // fs.partition.disk().read_at(lba, 1, &mut v)?;
 
     let mut cursor: VecCursor = VecCursor::new(v);

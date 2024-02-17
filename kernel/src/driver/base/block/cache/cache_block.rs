@@ -2,7 +2,10 @@ use core::cmp::Ordering;
 
 use alloc::{boxed::Box, vec::Vec};
 
-use super::cache_config::BLOCK_SIZE;
+use crate::driver::base::block::block_device::BlockId;
+
+use super::{BlockCacheError, BLOCK_SIZE};
+
 /// @brief 该枚举设计来是用于实现回写法的，但是目前并未使用
 #[allow(dead_code)]
 pub enum CacheBlockFlag {
@@ -38,7 +41,7 @@ impl PartialOrd<usize> for CacheBlockAddr {
 pub struct CacheBlock {
     data: Box<[u8]>,
     _flag: CacheBlockFlag,
-    lba_id: usize,
+    lba_id: BlockId,
 }
 
 impl CacheBlock {
@@ -58,13 +61,15 @@ impl CacheBlock {
     pub fn _set_flag(&mut self, _flag: CacheBlockFlag) -> Option<()> {
         todo!()
     }
-    #[inline]
-    pub fn get_data(&self, buf: &mut [u8]) -> usize {
+    pub fn get_data(&self, buf: &mut [u8]) -> Result<usize, BlockCacheError>{
+        if buf.len()!=BLOCK_SIZE{
+            return Err(BlockCacheError::BlockSizeError)
+        }
         buf.copy_from_slice(&self.data);
-        return BLOCK_SIZE;
+        return Ok(BLOCK_SIZE);
     }
 
-    pub fn get_lba_id(&self) -> usize {
+    pub fn get_lba_id(&self) -> BlockId {
         self.lba_id
     }
 }

@@ -49,7 +49,6 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
     ///
     /// 返回顶级页表
     pub unsafe fn top_level_table(table_kind: PageTableKind) -> Self {
-        //这函数似乎可以按照页表类型返回类型的顶层页表（每个类型只有一个顶层页表？）
         return Self::new(
             VirtAddr::new(0),
             Arch::table(table_kind),
@@ -66,7 +65,6 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
     /// 当前页表表示的虚拟地址空间的起始地址
     #[inline(always)]
     pub fn base(&self) -> VirtAddr {
-        //我的理解是，每个页表都会涵盖一个空间，这个空间就是该页表的寻址范围，一般来说顶层页表寻址范围大，底层页表寻址范围小
         self.base
     }
 
@@ -79,7 +77,7 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
     /// 获取当前页表自身所在的虚拟地址
     #[inline(always)]
     pub unsafe fn virt(&self) -> VirtAddr {
-        return Arch::phys_2_virt(self.phys).unwrap(); //获取自身所在的虚拟地址
+        return Arch::phys_2_virt(self.phys).unwrap(); 
     }
 
     /// 获取第i个页表项所表示的虚拟内存空间的起始地址

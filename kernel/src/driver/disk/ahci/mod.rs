@@ -199,7 +199,7 @@ pub fn __test_ahci() {
     // 测试1, 写两个块,读4个块
     // _dd.write_at(123, 2, &buf).unwrap();
     let mut read_buf = [0u8; 3000usize];
-    _dd.read_at(122, 4, &mut read_buf).unwrap();
+    _dd.read_at_sync(122, 4, &mut read_buf).unwrap();
 
     // 测试2, 只读写一个字节
     for i in 0..512 {
@@ -207,5 +207,5 @@ pub fn __test_ahci() {
     }
     // _dd.write_at(123, 2, &buf).unwrap();
     let mut read_buf2 = [0u8; 3000usize];
-    _dd.read_at(122, 4, &mut read_buf2).unwrap();
+    _dd.read_at_sync(122, 4, &mut read_buf2).unwrap();
 }

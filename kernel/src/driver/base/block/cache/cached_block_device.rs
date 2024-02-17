@@ -19,7 +19,7 @@ impl BlockCache {
             CMAPPER = Some(CacheMapper::new());
             // INITIAL_FLAG = true;
         }
-        kdebug!("BlockCache Initialized!")
+        kdebug!("BlockCache Initialized!");
     }
 /// @brief 使用blockcache进行对块设备进行连续块的读操作
 /// 

@@ -23,7 +23,7 @@ pub struct IrqData {
     irq: IrqNumber,
     /// 硬件中断号, 用于表示在某个IrqDomain中的中断号
     hwirq: HardwareIrqNumber,
-    /// 在🤝irq下，涉及的所有irqchip之间共享的数据
+    /// 涉及的所有irqchip之间共享的数据
     common_data: Arc<IrqCommonData>,
     /// 绑定到的中断芯片
     chip: Arc<dyn IrqChip>,

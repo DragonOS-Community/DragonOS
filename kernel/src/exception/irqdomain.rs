@@ -55,6 +55,41 @@ struct InnerIrqDomain {
     parent: Option<Weak<IrqDomain>>,
 }
 
+impl IrqDomain {
+    #[allow(dead_code)]
+    pub fn new(
+        name: Option<&'static str>,
+        allocated_name: Option<String>,
+        ops: &'static dyn IrqDomainOps,
+        flags: IrqDomainFlags,
+        bus_token: IrqDomainBusToken,
+    ) -> Option<Arc<Self>> {
+        if name.is_none() && allocated_name.is_none() {
+            return None;
+        }
+
+        let x = IrqDomain {
+            name,
+            allocated_name,
+            ops,
+            inner: SpinLock::new(InnerIrqDomain {
+                flags,
+                mapcount: 0,
+                bus_token,
+                generic_chip: None,
+                device: None,
+                parent: None,
+            }),
+            revmap: RwLock::new(IrqDomainRevMap {
+                map: HashMap::new(),
+                hwirq_max: HardwareIrqNumber::new(0),
+            }),
+        };
+
+        return Some(Arc::new(x));
+    }
+}
+
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irqdomain.h#190
 #[allow(dead_code)]
 #[derive(Debug)]

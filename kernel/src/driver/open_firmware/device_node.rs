@@ -45,7 +45,7 @@ impl DeviceNode {
 
         let x = DeviceNode {
             full_name,
-            full_name_allocated: None,
+            full_name_allocated,
             inner: SpinLock::new(InnerDeviceNode {
                 properties: Vec::new(),
                 parent: Weak::new(),

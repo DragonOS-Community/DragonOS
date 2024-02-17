@@ -1,6 +1,6 @@
 pub mod block_device;
-pub mod disk_info;
 pub mod cache;
+pub mod disk_info;
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum SeekFrom {

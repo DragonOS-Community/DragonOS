@@ -33,9 +33,11 @@ pub struct KernelMapper {
 }
 
 impl KernelMapper {
-    fn lock_cpu(cpuid: usize, mapper: PageMapper) -> Self { //这个函数需要使用一个cpuid和一个mapper才能获得一个KernelMapper
+    fn lock_cpu(cpuid: usize, mapper: PageMapper) -> Self {
+        //这个函数需要使用一个cpuid和一个mapper才能获得一个KernelMapper
         loop {
-            match KERNEL_MAPPER_LOCK_OWNER.compare_exchange_weak(   //这里有一个lock_owner的变量，它表示一个当前拥有KernelMapper的cpu的id
+            match KERNEL_MAPPER_LOCK_OWNER.compare_exchange_weak(
+                //这里有一个lock_owner的变量，它表示一个当前拥有KernelMapper的cpu的id
                 KERNEL_MAPPER_NO_PROCESSOR,
                 cpuid,
                 Ordering::Acquire,
@@ -60,7 +62,8 @@ impl KernelMapper {
 
     /// @brief 锁定内核映射器, 并返回一个内核映射器对象
     #[inline(always)]
-    pub fn lock() -> Self {         //运行这个函数可以直接获得内核映射器，获得的是当前cpu的内核映射器
+    pub fn lock() -> Self {
+        //运行这个函数可以直接获得内核映射器，获得的是当前cpu的内核映射器
         let cpuid = smp_get_processor_id() as usize;
         let mapper = unsafe { PageMapper::current(PageTableKind::Kernel, LockedFrameAllocator) };
         return Self::lock_cpu(cpuid, mapper);

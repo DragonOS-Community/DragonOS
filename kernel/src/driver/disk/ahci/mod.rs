@@ -4,6 +4,7 @@ pub mod ahcidisk;
 pub mod hba;
 
 use crate::driver::base::block::block_device::BlockDevice;
+use crate::driver::base::block::cache::cached_block_device::BlockCache;
 use crate::driver::base::block::disk_info::BLK_GF_AHCI;
 // 依赖的rust工具包
 use crate::driver::pci::pci::{
@@ -149,6 +150,7 @@ pub fn ahci_init() -> Result<(), SystemError> {
                 }
             }
         }
+        BlockCache::init();
     }
 
     compiler_fence(core::sync::atomic::Ordering::SeqCst);

@@ -481,7 +481,7 @@ impl FATFileSystem {
         self.partition
             .disk()
             .read_at(fat_ent_lba, 1 * self.lba_per_sector(), &mut v)?;
-            // .read_at(fat_ent_lba, 1 * self.lba_per_sector(), &mut v)?;
+        // .read_at(fat_ent_lba, 1 * self.lba_per_sector(), &mut v)?;
 
         let mut cursor = VecCursor::new(v);
         cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;

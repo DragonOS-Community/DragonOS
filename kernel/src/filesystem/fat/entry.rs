@@ -329,7 +329,7 @@ impl FATFile {
         fs.partition
             .disk()
             .t_write(range_start as usize, zeroes.len(), zeroes.as_slice())?;
-            // .write_at(range_start as usize, zeroes.len(), zeroes.as_slice())?;
+        // .write_at(range_start as usize, zeroes.len(), zeroes.as_slice())?;
         return Ok(());
     }
 
@@ -1120,7 +1120,7 @@ impl LongDirEntry {
         fs.partition
             .disk()
             .t_write(lba, 1 * fs.lba_per_sector(), cursor.as_slice())?;
-            // .write_at(lba, 1 * fs.lba_per_sector(), cursor.as_slice())?;
+        // .write_at(lba, 1 * fs.lba_per_sector(), cursor.as_slice())?;
         fs.partition.disk().sync()?;
 
         return Ok(());
@@ -1306,7 +1306,7 @@ impl ShortDirEntry {
         fs.partition
             .disk()
             .t_read(lba, 1 * fs.lba_per_sector(), &mut v)?;
-            // .read_at(lba, 1 * fs.lba_per_sector(), &mut v)?;
+        // .read_at(lba, 1 * fs.lba_per_sector(), &mut v)?;
 
         let mut cursor: VecCursor = VecCursor::new(v);
         // 切换游标到对应位置
@@ -1328,7 +1328,7 @@ impl ShortDirEntry {
         fs.partition
             .disk()
             .t_write(lba, 1 * fs.lba_per_sector(), cursor.as_slice())?;
-            // .write_at(lba, 1 * fs.lba_per_sector(), cursor.as_slice())?;
+        // .write_at(lba, 1 * fs.lba_per_sector(), cursor.as_slice())?;
         fs.partition.disk().sync()?;
 
         return Ok(());

@@ -1,5 +1,10 @@
+/// @brief 一个简单的结构体，是BlockIter的输出
+/// 
+/// #数据成员：
+/// - 'iba_id' :表示单个块对应的iba_id
+/// - '_data_start_addr' :表示该块在buf中的起始地址，目前并没有作用（例如：若该块是第2个块，那么该数据成员值为2*BLOCK_SIZE)
+/// - '_block_size' :表示该块的大小
 #[derive(Debug)]
-
 pub struct BlockData {
     iba_id: usize,
     _data_start_addr: usize,
@@ -27,6 +32,15 @@ impl BlockData {
         self._block_size
     }
 }
+
+/// @brief块迭代器，它获取需求（起始块，连续块的个数），并将连续的块输出为单一的块（如你需要读取lba_id为10~20的连续块，它就可以输出10,11...,20的BlockData)
+/// 
+/// #数据成员：
+/// - 'iba_id_start' :表示起始块的iba_id
+/// - 'count' :表示从起始块开始你需要读多少个块
+/// - 'current' :表示当前遍历到第几个块了
+/// - 'block_size' :规定块的大小
+
 #[derive(Copy, Clone)]
 pub struct BlockIter {
     iba_id_start: usize,
@@ -49,7 +63,6 @@ impl BlockIter {
 impl Iterator for BlockIter {
     type Item = BlockData;
 
-    // 定义 next 方法，返回 Option<Self::Item>
     fn next(&mut self) -> Option<Self::Item> {
         if self.current < self.count {
             let ans = BlockData::new(
@@ -65,6 +78,11 @@ impl Iterator for BlockIter {
     }
 }
 
+/// @brief 表示缺块信息的数据结构，往往在读取的时候发现缺块并产生FailData，在插入的时候使用FailData
+/// 
+/// #数据成员：
+/// - 'lba_id' :表示缺块的lba_id
+/// - 'index' :表示缺块在buf中的位置，用于在insert的时候定位缺块数据的位置
 pub struct FailData {
     lba_id: usize,
     index: usize,

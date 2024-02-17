@@ -239,6 +239,7 @@ pub trait BlockDevice: Device {
     /// @brief 返回当前磁盘上的所有分区的Arc指针数组
     fn partitions(&self) -> Vec<Arc<Partition>>;
 
+    /// @brief 是对read_at的覆盖。所有read_at函数均更改为了本函数
     fn t_read(
         &self,
         lba_id_start: BlockId,
@@ -248,6 +249,7 @@ pub trait BlockDevice: Device {
         self.cache_read(lba_id_start, count, buf)
     }
 
+    /// @brief 是对write_at的覆盖。所有write_at函数均更改为了本函数
     fn t_write(
         &self,
         lba_id_start: BlockId,
@@ -257,6 +259,7 @@ pub trait BlockDevice: Device {
         self.cache_write(lba_id_start, count, buf)
     }
 
+    /// @brief 其功能对外而言和read_at函数完全一致，但是加入blockcache的功能
     fn cache_read(
         &self,
         lba_id_start: BlockId,
@@ -274,6 +277,7 @@ pub trait BlockDevice: Device {
         }
     }
 
+    /// @brief 其功能对外而言和write_at函数完全一致，但是加入blockcache的功能
     fn cache_write(
         &self,
         lba_id_start: BlockId,

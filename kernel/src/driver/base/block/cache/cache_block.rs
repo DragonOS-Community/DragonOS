@@ -3,6 +3,7 @@ use core::cmp::Ordering;
 use alloc::{boxed::Box, vec::Vec};
 
 use super::cache_config::BLOCK_SIZE;
+/// @brief 该枚举设计来是用于实现回写法的，但是目前并未使用
 #[allow(dead_code)]
 pub enum CacheBlockFlag {
     Unused,
@@ -33,6 +34,7 @@ impl PartialOrd<usize> for CacheBlockAddr {
     }
 }
 
+/// @brief存储数据的最小单位
 pub struct CacheBlock {
     data: Box<[u8]>,
     _flag: CacheBlockFlag,

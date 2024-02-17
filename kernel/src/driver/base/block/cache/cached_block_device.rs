@@ -1,8 +1,8 @@
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
 
 use super::{
     cache_block::{CacheBlock, CacheBlockAddr},
-    cache_config::BLOCK_SIZE,
+    cache_config::{BLOCK_SIZE, BLOCK_SIZE_LOG, CACHE_THRESHOLD},
     cache_iter::{BlockIter, FailData},
 };
 
@@ -184,7 +184,7 @@ impl BlockCache {
 /// - 'frame_selector' :在块换出换入时，用于选择替换块的结构体
 struct CacheSpace {
     root: Vec<CacheBlock>,
-    frame_selector: FrameSelector,
+    frame_selector: Box<dyn FrameSelector>,
     // cache_mapper:CacheMapper,
 }
 
@@ -192,7 +192,7 @@ impl CacheSpace {
     pub fn new() -> Self {
         Self {
             root: Vec::new(),
-            frame_selector: FrameSelector::new(),
+            frame_selector: Box::new(SimpleFrameSelector::new()),   //如果要修改替换算法，可以设计一个结构体实现FrameSelector trait，再在这里替换掉SimpleFrameSelector
             // cache_mapper: CacheMapper::new(),
         }
     }
@@ -237,90 +237,114 @@ impl CacheSpace {
                 None => return Err(()),
             }
         };
-        if self.frame_selector.can_append() {
-            let index = self.frame_selector.get_index();
-            self.root.push(data_block);
-            // kdebug!("index:{},root.len:{}",index.data(),self.root.len());
-            assert!(index.data() == self.root.len() - 1);
-            mapper.insert(lba_id, index);
+        if self.frame_selector.can_append() {   //这里我设计了cache的一个threshold，如果不超过阈值就可以append，否则只能替换
+            //这是append的操作逻辑：
+            let index = self.frame_selector.get_index_append(); //从frame_selector获得一个CacheBlockAddr
+            self.root.push(data_block); //直接将块push进去就可以，因为现在是append操作
+            assert!(index.data() == self.root.len() - 1);   
+            mapper.insert(lba_id, index);   //建立mapper的映射
             Ok(())
         } else {
-            let index = self.frame_selector.get_index();
-            let removed_id = self.root[index.data()].get_lba_id();
+            //这是replace的操作逻辑
+            let index = self.frame_selector.get_index_replace();    //从frame_selector获得一个CacheBlockAddr，这次是它替换出来的
+            let removed_id = self.root[index.data()].get_lba_id();  //获取被替换的块的lba_id，待会用于取消映射
 
-            self.root[index.data()] = data_block;
-            mapper.insert(lba_id, index);
-            mapper.remove(removed_id);
+            self.root[index.data()] = data_block;   //直接替换原本的块，由于被替换的块没有引用了，所以会被drop
+            mapper.insert(lba_id, index);   //建立映射插入块的映射
+            mapper.remove(removed_id);      //取消被替换块的映射
             Ok(())
         }
     }
 }
 
+/// @brief 该结构体用于建立lba_id到cached块的映射
+/// 
+/// #数据成员：
+/// - 'map' :执行键值对操作的map
 struct CacheMapper {
     map: BTreeMap<usize, CacheBlockAddr>,
-    count: usize,
 }
 
 impl CacheMapper {
     pub fn new() -> Self {
         Self {
             map: BTreeMap::new(),
-            count: 0,
         }
     }
-
+/// @brief 插入操作
     pub fn insert(&mut self, lba_id: usize, caddr: CacheBlockAddr) -> Option<()> {
         self.map.insert(lba_id, caddr)?;
         Some(())
     }
+/// @brief 查找操作
     #[inline]
     pub fn find(&self, lba_id: usize) -> Option<&CacheBlockAddr> {
         self.map.get(&lba_id)
     }
-
+/// @brief 去除操作
     pub fn remove(&mut self, lba_id: usize) {
         match self.map.remove(&lba_id) {
-            Some(_) => self.count -= 1,
+            Some(_) => {}
             None => {}
         }
     }
 }
 
-struct FrameSelector {
+/// @brief 该trait用于实现块的换入换出算法，需要设计替换算法只需要实现该trait即可
+trait FrameSelector{
+    /// @brief 给出append操作的index（理论上，如果cache没满，就不需要换出块，就可以使用append操作）
+    fn get_index_append(&mut self) -> CacheBlockAddr;
+    /// @brief 给出replace操作后的index
+    fn get_index_replace(&mut self) -> CacheBlockAddr;
+    /// @brief 判断是否可以append
+    fn can_append(&self) -> bool;
+    /// @获取size
+    fn get_size(&self) -> usize;
+}
+
+/// @brief 该结构体用于管理块的换入换出过程中，CacheBlockAddr的选择，替换算法在这里实现
+/// 
+/// #数据成员：
+/// - 'threshold' :表示BlockCache的阈值，即最大可以存放多少块，这里目前还不支持动态变化
+/// - 'size' :表示使用过的块帧的数量
+/// - 'current' :这里使用从头至的替换算法，其替换策略为0，1，2，...，threshold，0，1...以此类推（该算法比FIFO还要简陋，后面可以再实现别的：）
+struct SimpleFrameSelector {
     threshold: usize,
     size: usize,
     current: usize,
 }
 
-impl FrameSelector {
+impl SimpleFrameSelector {
     pub fn new() -> Self {
         Self {
-            threshold: 1310720,
+            threshold: CACHE_THRESHOLD*(1<<(20-BLOCK_SIZE_LOG)),    //这里定义了cache的threshold，见cache_config.rs
             size: 0,
             current: 0,
         }
     }
+}
 
-    pub fn get_index(&mut self) -> CacheBlockAddr {
-        if self.size >= self.threshold {
-            let ans = self.current;
-            self.current += 1;
-            self.current %= self.threshold;
-            return CacheBlockAddr::new(ans);
-        } else {
-            let ans = self.current;
-            self.size += 1;
-            self.current += 1;
-            self.current %= self.threshold;
-            return CacheBlockAddr::new(ans);
-        }
+impl FrameSelector for SimpleFrameSelector{
+    fn get_index_append(&mut self) -> CacheBlockAddr {
+        let ans = self.current;
+        self.size += 1;
+        self.current += 1;
+        self.current %= self.threshold;
+        return CacheBlockAddr::new(ans);
     }
 
-    pub fn can_append(&self) -> bool {
+    fn get_index_replace(&mut self) -> CacheBlockAddr{
+        let ans = self.current;
+        self.current += 1;
+        self.current %= self.threshold;
+        return CacheBlockAddr::new(ans);
+    }
+
+    fn can_append(&self) -> bool {
         self.size < self.threshold
     }
 
-    pub fn get_size(&self) -> usize {
+    fn get_size(&self) -> usize {
         self.size
     }
 }

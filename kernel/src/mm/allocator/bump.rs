@@ -3,7 +3,14 @@
 /// @FilePath: /DragonOS/kernel/src/mm/allocator/bump.rs
 /// @Description: bump allocator线性分配器
 use super::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
-use crate::mm::{memblock::mem_block_manager, MemoryManagementArch, PhysAddr, PhysMemoryArea};
+use crate::mm::{
+    allocator::page_frame::{PhysPageFrame, PhysPageFrameIter},
+    init::{mm_init_status, MMInitStatus},
+    memblock::mem_block_manager,
+    no_init::pseudo_map_phys,
+    page::PageMapper,
+    MemoryManagementArch, PageTableKind, PhysAddr, PhysMemoryArea,
+};
 use core::marker::PhantomData;
 
 /// 线性分配器
@@ -41,44 +48,47 @@ impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
     pub fn remain_areas(&self, result_area: &mut [PhysMemoryArea]) -> Option<usize> {
         let mut offset = self.offset();
 
+        let iter = mem_block_manager().to_iter_available();
+
         let mut ret_offset_aligned = 0;
 
         let mut res_cnt = 0;
 
-        let total_num = mem_block_manager().total_initial_memory_regions();
+        let mut found_start = false;
         // 遍历所有的物理内存区域
-        for i in 0..total_num {
-            let area = mem_block_manager().get_initial_memory_region(i).unwrap();
-            // 将area的base地址与PAGE_SIZE对齐，对齐时向上取整
-            // let area_base = (area.base.data() + MMA::PAGE_SHIFT) & !(MMA::PAGE_SHIFT);
-            let area_base = area.area_base_aligned().data();
-            // 将area的末尾地址与PAGE_SIZE对齐，对齐时向下取整
-            // let area_end = (area.base.data() + area.size) & !(MMA::PAGE_SHIFT);
-            let area_end = area.area_end_aligned().data();
+        for area in iter {
+            if found_start == false {
+                // 将area的base地址与PAGE_SIZE对齐，对齐时向上取整
+                // let area_base = (area.base.data() + MMA::PAGE_SHIFT) & !(MMA::PAGE_SHIFT);
+                let area_base = area.area_base_aligned().data();
+                // 将area的末尾地址与PAGE_SIZE对齐，对齐时向下取整
+                // let area_end = (area.base.data() + area.size) & !(MMA::PAGE_SHIFT);
+                let area_end = area.area_end_aligned().data();
 
-            // 如果offset大于area_end，说明当前的物理内存区域已经分配完了，需要跳到下一个物理内存区域
-            if offset >= area_end {
-                continue;
-            }
-
-            // 如果offset小于area_base ,说明当前的物理内存区域还没有分配过页帧，将offset设置为area_base
-            if offset < area_base {
-                offset = area_base;
-            } else if offset < area_end {
-                // 将offset对齐到PAGE_SIZE
-                offset = (offset + (MMA::PAGE_SIZE - 1)) & !(MMA::PAGE_SIZE - 1);
-            }
-            // found
-            if offset + 1 * MMA::PAGE_SIZE <= area_end {
-                for j in i..total_num {
-                    let aj = mem_block_manager().get_initial_memory_region(j).unwrap();
-                    if aj.area_base_aligned() < aj.area_end_aligned() {
-                        result_area[res_cnt] = aj;
-                        res_cnt += 1;
-                    }
+                // 如果offset大于area_end，说明当前的物理内存区域已经分配完了，需要跳到下一个物理内存区域
+                if offset >= area_end {
+                    continue;
                 }
-                ret_offset_aligned = offset;
-                break;
+
+                // 如果offset小于area_base ,说明当前的物理内存区域还没有分配过页帧，将offset设置为area_base
+                if offset < area_base {
+                    offset = area_base;
+                } else if offset < area_end {
+                    // 将offset对齐到PAGE_SIZE
+                    offset = (offset + (MMA::PAGE_SIZE - 1)) & !(MMA::PAGE_SIZE - 1);
+                }
+                // found
+                if offset + 1 * MMA::PAGE_SIZE <= area_end {
+                    ret_offset_aligned = offset - area.area_base_aligned().data();
+                    found_start = true;
+                }
+            }
+
+            if found_start {
+                if area.area_base_aligned() < area.area_end_aligned() {
+                    result_area[res_cnt] = area;
+                    res_cnt += 1;
+                }
             }
         }
 
@@ -87,6 +97,28 @@ impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
             return None;
         } else {
             return Some(ret_offset_aligned);
+        }
+    }
+
+    #[inline(never)]
+    unsafe fn ensure_early_mapping(&self, start_paddr: PhysAddr, count: PageFrameCount) {
+        // 确保在内存管理未被初始化时，这地址已经被映射了
+        if mm_init_status() != MMInitStatus::Initialized {
+            // 映射涉及的页
+
+            let iter = PhysPageFrameIter::new(
+                PhysPageFrame::new(start_paddr),
+                PhysPageFrame::new(start_paddr + count.bytes()),
+            );
+            let mapper =
+                PageMapper::<MMA, _>::current(PageTableKind::Kernel, BumpAllocator::<MMA>::new(0));
+
+            for p in iter {
+                if let None = mapper.translate(MMA::phys_2_virt(p.phys_address()).unwrap()) {
+                    let vaddr = MMA::phys_2_virt(p.phys_address()).unwrap();
+                    pseudo_map_phys(vaddr, p.phys_address(), PageFrameCount::new(1));
+                }
+            }
         }
     }
 }
@@ -99,7 +131,7 @@ impl<MMA: MemoryManagementArch> FrameAllocator for BumpAllocator<MMA> {
     unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         let mut offset = self.offset();
 
-        let iter = mem_block_manager().to_iter();
+        let iter = mem_block_manager().to_iter_available();
 
         // 遍历所有的物理内存区域
         for area in iter {
@@ -128,7 +160,9 @@ impl<MMA: MemoryManagementArch> FrameAllocator for BumpAllocator<MMA> {
                 // 将offset增加至分配后的内存
                 self.offset = offset + count.data() * MMA::PAGE_SIZE;
 
-                return Some((PhysAddr(res_page_phys), count));
+                let r = (PhysAddr(res_page_phys), count);
+                self.ensure_early_mapping(r.0, r.1);
+                return Some(r);
             }
         }
         return None;
@@ -144,7 +178,7 @@ impl<MMA: MemoryManagementArch> FrameAllocator for BumpAllocator<MMA> {
     unsafe fn usage(&self) -> PageFrameUsage {
         let mut total = 0;
         let mut used = 0;
-        let iter = mem_block_manager().to_iter();
+        let iter = mem_block_manager().to_iter_available();
         for area in iter {
             // 将area的base地址与PAGE_SIZE对齐，对其时向上取整
             let area_base = (area.base.data() + MMA::PAGE_SHIFT) & !(MMA::PAGE_SHIFT);

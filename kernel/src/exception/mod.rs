@@ -1,18 +1,23 @@
+use system_error::SystemError;
+
 use crate::arch::CurrentIrqArch;
 
+pub mod init;
 pub mod ipi;
 pub mod softirq;
 
-/// @brief 中断相关的操作
+/// 中断的架构相关的trait
 pub trait InterruptArch: Send + Sync {
-    /// @brief 使能中断
+    /// 架构相关的中断初始化
+    unsafe fn arch_irq_init() -> Result<(), SystemError>;
+    /// 使能中断
     unsafe fn interrupt_enable();
-    /// @brief 禁止中断
+    /// 禁止中断
     unsafe fn interrupt_disable();
-    /// @brief 检查中断是否被禁止
+    /// 检查中断是否被禁止
     fn is_irq_enabled() -> bool;
 
-    /// @brief 保存当前中断状态，并且禁止中断
+    /// 保存当前中断状态，并且禁止中断
     unsafe fn save_and_disable_irq() -> IrqFlagsGuard;
     unsafe fn restore_irq(flags: IrqFlags);
 }

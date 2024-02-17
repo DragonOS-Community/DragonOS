@@ -11,7 +11,51 @@ jobs:
   ensure-toolchain:
     uses: ./.github/workflows/cache-toolchain.yml
   
-  build:
+  format-check:
+    name: Format check ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    needs: [ensure-toolchain]
+    continue-on-error: true
+
+    strategy:
+      matrix:
+        arch: [x86_64, riscv64]
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - uses: ./.github/actions/import-toolchain
+
+    - name: Format check
+      env:
+          ARCH: ${{ matrix.arch }}
+      run: |
+            printf "\n" >> kernel/src/include/bindings/bindings.rs
+            printf "\n" >> user/libs/libc/src/include/internal/bindings/bindings.rs
+            FMT_CHECK=1 make fmt
+  
+  kernel-static-test:
+    name: Kernel static test ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    needs: [ensure-toolchain]
+    continue-on-error: true
+
+    strategy:
+      matrix:
+        arch: [x86_64, riscv64]
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - uses: ./.github/actions/import-toolchain
+
+    - name: Run kernel static test
+      shell: bash -ileo pipefail {0}
+      env:
+          ARCH: ${{ matrix.arch }}
+      run: bash -c "source ~/.cargo/env && cd kernel && make test"
+    
+  build-x86_64:
 
     runs-on: ubuntu-latest
     needs: [ensure-toolchain]
@@ -19,37 +63,38 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
-    - name: Cache DragonOS GCC
-      id: cache-dragonos-gcc
-      uses: actions/cache@v3
-      env:
-          cache-name: cache-dragonos-gcc
-      with:
-        path: |
-          ~/opt
-        key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('tools/build_gcc_toolchain.sh') }}
-    
-    - name: Cache build tools
-      id: cache-build-tools
-      uses: actions/cache@v3
-      env:
-          cache-name: cache-build-tools
-          dadk_version: 0.1.2
-      with:
-        path: |
-          ~/.cargo
-          ~/.rustup
-          ~/.bashrc
-        key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ env.dadk_version }}-${{ hashFiles('.github/workflows/cache-toolchain.yml') }}
-      
-    - name: Format check
-      run: |
-            printf "\n" >> kernel/src/include/bindings/bindings.rs
-            printf "\n" >> user/libs/libc/src/include/internal/bindings/bindings.rs
-            FMT_CHECK=1 make fmt
+    - uses: ./.github/actions/import-toolchain
+
       
     - name: build the DragonOS
-      run: bash -c "source ~/.cargo/env && export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin && make -j $(nproc) "
-    
-    - name: Run kernel static test
-      run: bash -c "source ~/.cargo/env && cd kernel && make test"
+      env:
+          ARCH: x86_64
+      shell: bash -ileo pipefail {0}
+
+      run: |
+        source ~/.bashrc
+        source ~/.cargo/env
+        export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin
+        
+        make -j $(nproc)
+
+  
+  build-riscv64:
+
+    runs-on: ubuntu-latest
+    needs: [ensure-toolchain]
+
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: 'recursive'
+
+    - uses: ./.github/actions/import-toolchain
+
+    - name: build the DragonOS
+      shell: bash -ileo pipefail {0}
+      env:
+          ARCH: riscv64
+
+      run: source ~/.bashrc && source ~/.cargo/env && make kernel -j $(nproc)
+

@@ -2,7 +2,6 @@
 #include <common/errno.h>
 #include <common/fcntl.h>
 #include <common/string.h>
-#include <exception/gate.h>
 #include <exception/irq.h>
 #include <filesystem/vfs/VFS.h>
 #include <mm/slab.h>
@@ -29,33 +28,30 @@ extern void syscall_int(void);
  * @return long
  */
 
-long enter_syscall_int(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg4, ul arg5, ul arg6, ul arg7)
+long enter_syscall_int(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg4, ul arg5)
 {
-    long err_code;
-    __asm__ __volatile__("movq %2, %%r8 \n\t"
-                         "movq %3, %%r9 \n\t"
-                         "movq %4, %%r10 \n\t"
-                         "movq %5, %%r11 \n\t"
-                         "movq %6, %%r12 \n\t"
-                         "movq %7, %%r13 \n\t"
-                         "movq %8, %%r14 \n\t"
-                         "movq %9, %%r15 \n\t"
-                         "int $0x80   \n\t"
-                         : "=a"(err_code)
-                         : "a"(syscall_id), "m"(arg0), "m"(arg1), "m"(arg2), "m"(arg3), "m"(arg4), "m"(arg5), "m"(arg6),
-                           "m"(arg7)
-                         : "memory", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rcx", "rdx");
+  long err_code;
+  __asm__ __volatile__("movq %2, %%rdi \n\t"
+                       "movq %3, %%rsi \n\t"
+                       "movq %4, %%rdx \n\t"
+                       "movq %5, %%r10 \n\t"
+                       "movq %6, %%r8 \n\t"
+                       "movq %7, %%r9 \n\t"
+                       "int $0x80   \n\t"
+                       : "=a"(err_code)
+                       : "a"(syscall_id), "m"(arg0), "m"(arg1), "m"(arg2), "m"(arg3), "m"(arg4), "m"(arg5)
+                       : "memory", "r8", "r9", "r10", "rdi", "rsi", "rdx");
 
-    return err_code;
+  return err_code;
 }
 
 #else
-long enter_syscall_int(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg4, ul arg5, ul arg6, ul arg7){
+long enter_syscall_int(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg4, ul arg5)
+{
   while (1)
   {
     /* code */
   }
-  
 }
 
 #endif
@@ -74,8 +70,6 @@ long enter_syscall_int(ul syscall_id, ul arg0, ul arg1, ul arg2, ul arg3, ul arg
 ul do_put_string(char *s, uint32_t front_color, uint32_t background_color)
 {
 
-    printk_color(front_color, background_color, s);
-    return 0;
+  printk_color(front_color, background_color, s);
+  return 0;
 }
-
-

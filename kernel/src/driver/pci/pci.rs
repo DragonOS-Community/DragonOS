@@ -1090,25 +1090,9 @@ fn pci_check_bus(bus: u8) -> Result<u8, PciError> {
     }
     Ok(0)
 }
-/// @brief pci初始化函数(for c)
-#[no_mangle]
-pub extern "C" fn rs_pci_init() {
-    pci_init();
-    if PCI_ROOT_0.is_some() {
-        kdebug!("{}", PCI_ROOT_0.as_ref().unwrap());
-        //以下为ecam的读取寄存器值测试，经测试可正常读取
-        // let bus_device_function = BusDeviceFunction {
-        //     bus: 0,
-        //     device: 2,
-        //     function: 0,
-        // };
-        // kdebug!(
-        //     "Ecam read virtio-net device status={:#x}",
-        //     (PCI_ROOT_0.unwrap().read_config(bus_device_function, 4)>>16) as u16
-        // );
-    }
-}
-/// @brief pci初始化函数
+
+/// pci初始化函数
+#[inline(never)]
 pub fn pci_init() {
     kinfo!("Initializing PCI bus...");
     if let Err(e) = pci_check_all_buses() {

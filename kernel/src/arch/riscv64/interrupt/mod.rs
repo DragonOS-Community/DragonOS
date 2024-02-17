@@ -1,3 +1,5 @@
+use system_error::SystemError;
+
 use crate::exception::{InterruptArch, IrqFlags, IrqFlagsGuard};
 
 pub mod ipi;
@@ -5,24 +7,33 @@ pub mod ipi;
 pub struct RiscV64InterruptArch;
 
 impl InterruptArch for RiscV64InterruptArch {
+    unsafe fn arch_irq_init() -> Result<(), SystemError> {
+        todo!("RiscV64InterruptArch::arch_irq_init")
+    }
     unsafe fn interrupt_enable() {
-        unimplemented!("RiscV64InterruptArch::interrupt_enable")
+        riscv::interrupt::enable();
     }
 
     unsafe fn interrupt_disable() {
-        unimplemented!("RiscV64InterruptArch::interrupt_disable")
+        riscv::interrupt::disable();
     }
 
     fn is_irq_enabled() -> bool {
-        unimplemented!("RiscV64InterruptArch::is_irq_enabled")
+        riscv::register::sstatus::read().sie()
     }
 
     unsafe fn save_and_disable_irq() -> IrqFlagsGuard {
-        unimplemented!("RiscV64InterruptArch::save_and_disable_irq")
+        let sie = riscv::register::sstatus::read().sie();
+        IrqFlagsGuard::new(IrqFlags::new(sie.into()))
     }
 
     unsafe fn restore_irq(flags: IrqFlags) {
-        unimplemented!("RiscV64InterruptArch::restore_irq")
+        let sie: bool = flags.flags() != 0;
+        if sie {
+            riscv::register::sstatus::set_sie();
+        } else {
+            riscv::register::sstatus::clear_sie();
+        }
     }
 }
 

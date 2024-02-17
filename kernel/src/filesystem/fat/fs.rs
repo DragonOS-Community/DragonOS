@@ -1201,7 +1201,7 @@ impl Drop for FATFileSystem {
         if r.is_err() {
             kerror!(
                 "Umount FAT filesystem failed: errno={:?}, FS detail:{self:?}",
-                r.unwrap_err()
+                r.as_ref().unwrap_err()
             );
         }
     }

@@ -14,12 +14,10 @@ use crate::include::bindings::bindings::{
 };
 use crate::libs::align::page_align_up;
 use crate::libs::lib_ui::screen_manager::scm_disable_put_to_window;
-use crate::libs::printk::PrintkWriter;
 use crate::libs::spinlock::SpinLock;
 
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::memblock::mem_block_manager;
-use crate::mm::mmio_buddy::mmio_init;
 use crate::{
     arch::MMArch,
     mm::allocator::{buddy::BuddyAllocator, bump::BumpAllocator},
@@ -33,7 +31,7 @@ use system_error::SystemError;
 
 use core::arch::asm;
 use core::ffi::c_void;
-use core::fmt::{Debug, Write};
+use core::fmt::Debug;
 use core::mem::{self};
 
 use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
@@ -107,13 +105,23 @@ impl MemoryManagementArch for X86_64MMArch {
     /// x86_64不存在EXEC标志位，只有NO_EXEC（XD）标志位
     const ENTRY_FLAG_EXEC: usize = 0;
 
+    const ENTRY_FLAG_ACCESSED: usize = 0;
+    const ENTRY_FLAG_DIRTY: usize = 0;
+
     /// 物理地址与虚拟地址的偏移量
     /// 0xffff_8000_0000_0000
     const PHYS_OFFSET: usize = Self::PAGE_NEGATIVE_MASK + (Self::PAGE_ADDRESS_SIZE >> 1);
+    const KERNEL_LINK_OFFSET: usize = 0x100000;
 
-    const USER_END_VADDR: VirtAddr = VirtAddr::new(0x0000_7eff_ffff_ffff);
+    // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/include/asm/page_64_types.h#75
+    const USER_END_VADDR: VirtAddr =
+        VirtAddr::new((Self::PAGE_ADDRESS_SIZE >> 1) - Self::PAGE_SIZE);
     const USER_BRK_START: VirtAddr = VirtAddr::new(0x700000000000);
     const USER_STACK_START: VirtAddr = VirtAddr::new(0x6ffff0a00000);
+
+    const FIXMAP_START_VADDR: VirtAddr = VirtAddr::new(0xffffb00000000000);
+    /// 设置FIXMAP区域大小为1M
+    const FIXMAP_SIZE: usize = 256 * 4096;
 
     /// @brief 获取物理内存区域
     unsafe fn init() {
@@ -144,7 +152,14 @@ impl MemoryManagementArch for X86_64MMArch {
         // 初始化物理内存区域(从multiboot2中获取)
         Self::init_memory_area_from_multiboot2().expect("init memory area failed");
 
-        send_to_default_serial8250_port("x86 64 init end\n\0".as_bytes());
+        kdebug!("bootstrap info: {:?}", unsafe { BOOTSTRAP_MM_INFO });
+        kdebug!("phys[0]=virt[0x{:x}]", unsafe {
+            MMArch::phys_2_virt(PhysAddr::new(0)).unwrap().data()
+        });
+
+        // 初始化内存管理器
+        unsafe { allocator_init() };
+        send_to_default_serial8250_port("x86 64 init done\n\0".as_bytes());
     }
 
     /// @brief 刷新TLB中，关于指定虚拟地址的条目
@@ -280,6 +295,11 @@ impl MemoryManagementArch for X86_64MMArch {
             return None;
         }
     }
+
+    #[inline(always)]
+    fn make_entry(paddr: PhysAddr, page_flags: usize) -> usize {
+        return paddr.data() | page_flags;
+    }
 }
 
 impl X86_64MMArch {
@@ -330,8 +350,6 @@ impl X86_64MMArch {
                 }
 
                 total_mem_size += mb2_mem_info[i].len as usize;
-                // PHYS_MEMORY_AREAS[areas_count].base = PhysAddr::new(mb2_mem_info[i].addr as usize);
-                // PHYS_MEMORY_AREAS[areas_count].size = mb2_mem_info[i].len as usize;
 
                 mem_block_manager()
                     .add_block(
@@ -386,34 +404,6 @@ impl VirtAddr {
     }
 }
 
-/// @brief 初始化内存管理模块
-pub fn mm_init() {
-    send_to_default_serial8250_port("mm_init\n\0".as_bytes());
-    PrintkWriter
-        .write_fmt(format_args!("mm_init() called\n"))
-        .unwrap();
-    // printk_color!(GREEN, BLACK, "mm_init() called\n");
-    static _CALL_ONCE: AtomicBool = AtomicBool::new(false);
-    if _CALL_ONCE
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        send_to_default_serial8250_port("mm_init err\n\0".as_bytes());
-        panic!("mm_init() can only be called once");
-    }
-
-    unsafe { X86_64MMArch::init() };
-    kdebug!("bootstrap info: {:?}", unsafe { BOOTSTRAP_MM_INFO });
-    kdebug!("phys[0]=virt[0x{:x}]", unsafe {
-        MMArch::phys_2_virt(PhysAddr::new(0)).unwrap().data()
-    });
-
-    // 初始化内存管理器
-    unsafe { allocator_init() };
-    // enable mmio
-    mmio_init();
-}
-
 unsafe fn allocator_init() {
     let virt_offset = BOOTSTRAP_MM_INFO.unwrap().start_brk;
     let phy_offset =
@@ -446,7 +436,7 @@ unsafe fn allocator_init() {
         // 取消最开始时候，在head.S中指定的映射(暂时不刷新TLB)
         {
             let table = mapper.table();
-            let empty_entry = PageEntry::<MMArch>::new(0);
+            let empty_entry = PageEntry::<MMArch>::from_usize(0);
             for i in 0..MMArch::PAGE_ENTRY_NUM {
                 table
                     .set_entry(i, empty_entry)
@@ -666,8 +656,8 @@ unsafe fn set_inner_allocator(allocator: BuddyAllocator<MMArch>) {
 pub struct LowAddressRemapping;
 
 impl LowAddressRemapping {
-    // 映射32M
-    const REMAP_SIZE: usize = 32 * 1024 * 1024;
+    // 映射64M
+    const REMAP_SIZE: usize = 64 * 1024 * 1024;
 
     pub unsafe fn remap_at_low_address(
         mapper: &mut crate::mm::page::PageMapper<MMArch, &mut BumpAllocator<MMArch>>,
@@ -701,8 +691,4 @@ impl LowAddressRemapping {
             }
         }
     }
-}
-#[no_mangle]
-pub extern "C" fn rs_mm_init() {
-    mm_init();
 }

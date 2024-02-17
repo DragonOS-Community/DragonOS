@@ -409,15 +409,15 @@ pub fn scm_disable_put_to_window() {
     }
 }
 /// 当内存管理单元被初始化之后，重新处理帧缓冲区问题
-#[no_mangle]
-pub extern "C" fn scm_reinit() -> i32 {
-    let r = true_scm_reinit().unwrap_or_else(|e| e.to_posix_errno());
-    if r.is_negative() {
+#[inline(never)]
+pub fn scm_reinit() -> Result<(), SystemError> {
+    let r = true_scm_reinit();
+    if r.is_err() {
         send_to_default_serial8250_port("scm reinit failed.\n\0".as_bytes());
     }
     return r;
 }
-fn true_scm_reinit() -> Result<i32, SystemError> {
+fn true_scm_reinit() -> Result<(), SystemError> {
     video_refresh_manager()
         .video_reinitialize(false)
         .expect("video reinitialize failed");
@@ -432,5 +432,5 @@ fn true_scm_reinit() -> Result<i32, SystemError> {
 
     scm_enable_put_to_window();
 
-    return Ok(0);
+    return Ok(());
 }

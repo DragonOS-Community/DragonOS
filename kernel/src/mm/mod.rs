@@ -14,12 +14,15 @@ use core::{
 
 use self::{
     allocator::page_frame::{VirtPageFrame, VirtPageFrameIter},
+    memblock::MemoryAreaAttr,
     page::round_up_to_page_size,
     ucontext::{AddressSpace, UserMapper},
 };
 
 pub mod allocator;
 pub mod c_adapter;
+pub mod early_ioremap;
+pub mod init;
 pub mod kernel_mapper;
 pub mod memblock;
 pub mod mmio_buddy;
@@ -75,7 +78,8 @@ pub enum PageTableKind {
     User,
     /// 内核页表
     Kernel,
-    /// 内存虚拟化中使用的EPT
+    /// x86内存虚拟化中使用的EPT
+    #[cfg(target_arch = "x86_64")]
     EPT,
 }
 
@@ -85,6 +89,9 @@ pub enum PageTableKind {
 pub struct PhysAddr(usize);
 
 impl PhysAddr {
+    /// 最大物理地址
+    pub const MAX: Self = PhysAddr(usize::MAX);
+
     #[inline(always)]
     pub const fn new(address: usize) -> Self {
         Self(address)
@@ -92,7 +99,7 @@ impl PhysAddr {
 
     /// @brief 获取物理地址的值
     #[inline(always)]
-    pub fn data(&self) -> usize {
+    pub const fn data(&self) -> usize {
         self.0
     }
 
@@ -211,7 +218,7 @@ impl VirtAddr {
 
     /// @brief 获取虚拟地址的值
     #[inline(always)]
-    pub fn data(&self) -> usize {
+    pub const fn data(&self) -> usize {
         return self.0;
     }
 
@@ -329,16 +336,19 @@ pub struct PhysMemoryArea {
     pub base: PhysAddr,
     /// 该区域的物理内存大小
     pub size: usize,
+
+    pub flags: MemoryAreaAttr,
 }
 
 impl PhysMemoryArea {
     pub const DEFAULT: Self = Self {
         base: PhysAddr::new(0),
         size: 0,
+        flags: MemoryAreaAttr::empty(),
     };
 
-    pub fn new(base: PhysAddr, size: usize) -> Self {
-        Self { base, size }
+    pub fn new(base: PhysAddr, size: usize, flags: MemoryAreaAttr) -> Self {
+        Self { base, size, flags }
     }
 
     /// 返回向上页面对齐的区域起始物理地址
@@ -390,9 +400,18 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     const ENTRY_FLAG_NO_EXEC: usize;
     /// 标记当前页面可执行的标志位（Execute enable）
     const ENTRY_FLAG_EXEC: usize;
+    /// 当该位为1时，标明这是一个脏页
+    const ENTRY_FLAG_DIRTY: usize;
+    /// 当该位为1时，代表这个页面被处理器访问过
+    const ENTRY_FLAG_ACCESSED: usize;
 
     /// 虚拟地址与物理地址的偏移量
     const PHYS_OFFSET: usize;
+
+    /// 内核在链接时被链接到的偏移量
+    const KERNEL_LINK_OFFSET: usize;
+
+    const KERNEL_VIRT_START: usize = Self::PHYS_OFFSET + Self::KERNEL_LINK_OFFSET;
 
     /// 每个页面的大小
     const PAGE_SIZE: usize = 1 << Self::PAGE_SHIFT;
@@ -428,6 +447,14 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     const USER_BRK_START: VirtAddr;
     /// 用户栈起始地址（向下生长，不包含该值）
     const USER_STACK_START: VirtAddr;
+
+    /// 内核的固定映射区的起始地址
+    const FIXMAP_START_VADDR: VirtAddr;
+    /// 内核的固定映射区的大小
+    const FIXMAP_SIZE: usize;
+    /// 内核的固定映射区的结束地址
+    const FIXMAP_END_VADDR: VirtAddr =
+        VirtAddr::new(Self::FIXMAP_START_VADDR.data() + Self::FIXMAP_SIZE);
 
     /// @brief 用于初始化内存管理模块与架构相关的信息。
     /// 该函数应调用其他模块的接口，把可用内存区域添加到memblock，提供给BumpAllocator使用
@@ -502,6 +529,20 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
 
     /// 初始化新的usermapper，为用户进程创建页表
     fn setup_new_usermapper() -> Result<UserMapper, SystemError>;
+
+    /// 创建页表项
+    ///
+    /// 这是一个低阶api，用于根据物理地址以及指定好的pageflags，创建页表项
+    ///
+    /// ## 参数
+    ///
+    /// - `paddr` 物理地址
+    /// - `page_flags` 页表项的flags
+    ///
+    /// ## 返回值
+    ///
+    /// 页表项的值
+    fn make_entry(paddr: PhysAddr, page_flags: usize) -> usize;
 }
 
 /// @brief 虚拟地址范围

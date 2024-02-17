@@ -51,9 +51,8 @@ endif
 .PHONY: dadk_run
 dadk_run: install_dadk
 	mkdir -p $(DADK_CACHE_DIR)
-# 之所以在这里临时设置ARCH为空，是因为如果要设置这个环境变量，应当在DADK的配置文件中设置
-	ARCH= dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot build
-	ARCH= dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot install
+	dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot build
+	dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot install
 
 .PHONY: dadk_clean
 dadk_clean: install_dadk

@@ -91,6 +91,7 @@ impl SwitchResult {
 #[derive(Debug)]
 pub struct ProcessManager;
 impl ProcessManager {
+    #[inline(never)]
     fn init() {
         static INIT_FLAG: AtomicBool = AtomicBool::new(false);
         if INIT_FLAG
@@ -135,6 +136,17 @@ impl ProcessManager {
             }
         }
         return ProcessControlBlock::arch_current_pcb();
+    }
+
+    /// 获取当前进程的pid
+    ///
+    /// 如果进程管理器未初始化完成，那么返回0
+    pub fn current_pid() -> Pid {
+        if unlikely(unsafe { !__PROCESS_MANAGEMENT_INIT_DONE }) {
+            return Pid(0);
+        }
+
+        return ProcessManager::current_pcb().pid();
     }
 
     /// 增加当前进程的锁持有计数
@@ -357,7 +369,7 @@ impl ProcessManager {
 
     pub unsafe fn release(pid: Pid) {
         let pcb = ProcessManager::find(pid);
-        if !pcb.is_none() {
+        if pcb.is_some() {
             // let pcb = pcb.unwrap();
             // 判断该pcb是否在全局没有任何引用
             // TODO: 当前，pcb的Arc指针存在泄露问题，引用计数不正确，打算在接下来实现debug专用的Arc，方便调试，然后解决这个bug。
@@ -520,6 +532,8 @@ bitflags! {
         const SIGNALED = 1 << 6;
         /// 进程需要迁移到其他cpu上
         const NEED_MIGRATE = 1 << 7;
+        /// 随机化的虚拟地址空间，主要用于动态链接器的加载
+        const RANDOMIZE = 1 << 8;
     }
 }
 
@@ -823,8 +837,8 @@ impl ProcessControlBlock {
     pub fn generate_name(program_path: &str, args: &Vec<String>) -> String {
         let mut name = program_path.to_string();
         for arg in args {
-            name.push_str(arg);
             name.push(' ');
+            name.push_str(arg);
         }
         return name;
     }

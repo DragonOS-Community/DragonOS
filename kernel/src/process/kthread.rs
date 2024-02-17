@@ -490,6 +490,8 @@ pub unsafe extern "C" fn kernel_thread_bootstrap_stage2(ptr: *const KernelThread
     ProcessManager::exit(retval as usize);
 }
 
+/// 初始化内核线程机制
+#[inline(never)]
 pub fn kthread_init() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {

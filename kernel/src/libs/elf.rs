@@ -1,16 +1,23 @@
 use core::{
-    cmp::min,
+    cmp::{max, min},
+    fmt::Debug,
     intrinsics::{likely, unlikely},
     ops::Range,
 };
 
 use alloc::vec::Vec;
-use elf::{endian::AnyEndian, file::FileHeader, segment::ProgramHeader};
+use elf::{
+    abi::{PT_GNU_PROPERTY, PT_INTERP},
+    endian::AnyEndian,
+    file::FileHeader,
+    segment::ProgramHeader,
+};
 use system_error::SystemError;
 
 use crate::{
-    arch::MMArch,
+    arch::{CurrentElfArch, MMArch},
     driver::base::block::SeekFrom,
+    filesystem::vfs::file::File,
     kerror,
     libs::align::page_align_up,
     mm::{
@@ -22,12 +29,18 @@ use crate::{
     process::{
         abi::AtType,
         exec::{BinaryLoader, BinaryLoaderResult, ExecError, ExecLoadMode, ExecParam},
-        ProcessManager,
+        ProcessFlags, ProcessManager,
     },
     syscall::user_access::{clear_user, copy_to_user},
 };
 
 use super::rwlock::RwLockWriteGuard;
+
+// 存放跟架构相关的Elf属性，
+pub trait ElfArch: Clone + Copy + Debug {
+    const ELF_ET_DYN_BASE: usize;
+    const ELF_PAGE_SIZE: usize;
+}
 
 #[derive(Debug)]
 pub struct ElfLoader;
@@ -35,9 +48,6 @@ pub struct ElfLoader;
 pub const ELF_LOADER: ElfLoader = ElfLoader::new();
 
 impl ElfLoader {
-    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-    pub const ELF_PAGE_SIZE: usize = MMArch::PAGE_SIZE;
-
     /// 读取文件的缓冲区大小
     pub const FILE_READ_BUF_SIZE: usize = 512 * 1024;
 
@@ -58,7 +68,9 @@ impl ElfLoader {
         // 判断是否以可执行文件的形式加载
         if param.load_mode() == ExecLoadMode::Exec {
             // 检查文件类型是否为可执行文件
-            if ElfType::from(ehdr.e_type) != ElfType::Executable {
+            if ElfType::from(ehdr.e_type) != ElfType::Executable
+                && ElfType::from(ehdr.e_type) != ElfType::DSO
+            {
                 return Err(ExecError::NotExecutable);
             }
         } else {
@@ -132,15 +144,18 @@ impl ElfLoader {
 
     /// 计算addr在ELF PAGE内的偏移
     fn elf_page_offset(&self, addr: VirtAddr) -> usize {
-        addr.data() & (Self::ELF_PAGE_SIZE - 1)
+        addr.data() & (CurrentElfArch::ELF_PAGE_SIZE - 1)
     }
 
     fn elf_page_start(&self, addr: VirtAddr) -> VirtAddr {
-        VirtAddr::new(addr.data() & (!(Self::ELF_PAGE_SIZE - 1)))
+        VirtAddr::new(addr.data() & (!(CurrentElfArch::ELF_PAGE_SIZE - 1)))
     }
 
     fn elf_page_align_up(&self, addr: VirtAddr) -> VirtAddr {
-        VirtAddr::new((addr.data() + Self::ELF_PAGE_SIZE - 1) & (!(Self::ELF_PAGE_SIZE - 1)))
+        VirtAddr::new(
+            (addr.data() + CurrentElfArch::ELF_PAGE_SIZE - 1)
+                & (!(CurrentElfArch::ELF_PAGE_SIZE - 1)),
+        )
     }
 
     /// 根据ELF的p_flags生成对应的ProtFlags
@@ -343,7 +358,7 @@ impl ElfLoader {
     fn pad_zero(&self, elf_bss: VirtAddr) -> Result<(), SystemError> {
         let nbyte = self.elf_page_offset(elf_bss);
         if nbyte > 0 {
-            let nbyte = Self::ELF_PAGE_SIZE - nbyte;
+            let nbyte = CurrentElfArch::ELF_PAGE_SIZE - nbyte;
             unsafe { clear_user(elf_bss, nbyte).map_err(|_| SystemError::EFAULT) }?;
         }
         return Ok(());
@@ -477,6 +492,12 @@ impl ElfLoader {
             buf,
         )));
     }
+
+    // 解析 PT_GNU_PROPERTY 类型的段
+    // 参照 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#767
+    fn parse_gnu_property() -> Result<(), ExecError> {
+        return Ok(());
+    }
 }
 
 impl BinaryLoader for ElfLoader {
@@ -515,16 +536,49 @@ impl BinaryLoader for ElfLoader {
 
         // todo: 增加对user stack上的内存是否具有可执行权限的处理（方法：寻找phdr里面的PT_GNU_STACK段）
 
-        // todo: 增加对动态链接的处理
-
         // kdebug!("to parse segments");
         // 加载ELF文件并映射到用户空间
         let mut phdr_buf = Vec::new();
-        let loadable_sections = Self::parse_segments(param, &ehdr, &mut phdr_buf)
+        let phdr_table = Self::parse_segments(param, &ehdr, &mut phdr_buf)
             .map_err(|_| ExecError::ParseError)?
-            .ok_or(ExecError::ParseError)?
-            .iter()
-            .filter(|seg| seg.p_type == elf::abi::PT_LOAD);
+            .ok_or(ExecError::ParseError)?;
+        let mut _gnu_property_data: Option<ProgramHeader> = None;
+        let interpreter: Option<File> = None;
+        for seg in phdr_table {
+            if seg.p_type == PT_GNU_PROPERTY {
+                _gnu_property_data = Some(seg.clone());
+                continue;
+            }
+            if seg.p_type != PT_INTERP {
+                continue;
+            }
+            // 接下来处理这个 .interpreter 段以及动态链接器
+            // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#881
+
+            if seg.p_filesz > 4096 || seg.p_filesz < 2 {
+                return Err(ExecError::NotExecutable);
+            }
+
+            let interpreter_ptr = unsafe {
+                core::slice::from_raw_parts(
+                    seg.p_offset as *const u8,
+                    seg.p_filesz.try_into().unwrap(),
+                )
+            };
+            let _interpreter_path = core::str::from_utf8(interpreter_ptr).map_err(|e| {
+                ExecError::Other(format!(
+                    "Failed to parse the path of dynamic linker with error {}",
+                    e
+                ))
+            })?;
+
+            //TODO 加入对动态链接器的加载，参照 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#890
+        }
+        if interpreter.is_some() {
+            /* Some simple consistency checks for the interpreter */
+            // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#950
+        }
+        Self::parse_gnu_property()?;
 
         // kdebug!("loadable_sections = {:?}", loadable_sections);
 
@@ -535,14 +589,44 @@ impl BinaryLoader for ElfLoader {
         let mut start_data: Option<VirtAddr> = None;
         let mut end_data: Option<VirtAddr> = None;
 
-        // 加载的时候的偏移量（这个偏移量在加载动态链接段的时候产生，由于还没有动态链接，因此暂时不可变。）
-        // 请不要删除load_bias! 以免到时候写动态链接的时候忘记了。
-        let load_bias = 0usize;
+        // 加载的时候的偏移量（这个偏移量在加载动态链接段的时候产生）
+        let mut load_bias = 0usize;
         let mut bss_prot_flags = ProtFlags::empty();
         // 是否是第一个加载的段
         let mut first_pt_load = true;
         // program header的虚拟地址
         let mut phdr_vaddr: Option<VirtAddr> = None;
+        let mut _reloc_func_desc = 0usize;
+        // 参考https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#1158，获取要加载的total_size
+        let mut has_load = false;
+        let mut min_address = VirtAddr::new(usize::MAX);
+        let mut max_address = VirtAddr::new(0usize);
+        let loadable_sections = phdr_table
+            .into_iter()
+            .filter(|seg| seg.p_type == elf::abi::PT_LOAD);
+        for seg_to_load in loadable_sections {
+            min_address = min(
+                min_address,
+                self.elf_page_start(VirtAddr::new(seg_to_load.p_vaddr.try_into().unwrap())),
+            );
+            max_address = max(
+                max_address,
+                VirtAddr::new(
+                    (seg_to_load.p_vaddr + seg_to_load.p_memsz)
+                        .try_into()
+                        .unwrap(),
+                ),
+            );
+            has_load = true;
+        }
+        let total_size = if has_load {
+            max_address - min_address
+        } else {
+            0
+        };
+        let loadable_sections = phdr_table
+            .into_iter()
+            .filter(|seg| seg.p_type == elf::abi::PT_LOAD);
         for seg_to_load in loadable_sections {
             // kdebug!("seg_to_load = {:?}", seg_to_load);
             if unlikely(elf_brk > elf_bss) {
@@ -559,7 +643,7 @@ impl BinaryLoader for ElfLoader {
                 )?;
                 let nbyte = self.elf_page_offset(elf_bss);
                 if nbyte > 0 {
-                    let nbyte = min(Self::ELF_PAGE_SIZE - nbyte, elf_brk - elf_bss);
+                    let nbyte = min(CurrentElfArch::ELF_PAGE_SIZE - nbyte, elf_brk - elf_bss);
                     unsafe {
                         // This bss-zeroing can fail if the ELF file specifies odd protections.
                         // So we don't check the return value.
@@ -569,12 +653,11 @@ impl BinaryLoader for ElfLoader {
             }
 
             // 生成ProtFlags.
-            // TODO: 当有了动态链接之后，需要根据情况设置这里的has_interpreter
-            let elf_prot_flags = self.make_prot(seg_to_load.p_flags, false, false);
+            let elf_prot_flags = self.make_prot(seg_to_load.p_flags, interpreter.is_some(), false);
 
             let mut elf_map_flags = MapFlags::MAP_PRIVATE;
 
-            let vaddr = VirtAddr::new(seg_to_load.p_vaddr as usize);
+            let vaddr = VirtAddr::new(seg_to_load.p_vaddr.try_into().unwrap());
 
             if !first_pt_load {
                 elf_map_flags.insert(MapFlags::MAP_FIXED_NOREPLACE);
@@ -587,11 +670,28 @@ impl BinaryLoader for ElfLoader {
                 elf_map_flags.insert(MapFlags::MAP_FIXED_NOREPLACE);
             } else if elf_type == ElfType::DSO {
                 // TODO: 支持动态链接
-                unimplemented!("DragonOS currently does not support dynamic linking!");
+                if interpreter.is_some() {
+                    load_bias = CurrentElfArch::ELF_ET_DYN_BASE;
+                    if ProcessManager::current_pcb()
+                        .flags()
+                        .contains(ProcessFlags::RANDOMIZE)
+                    {
+                        //这里x86下需要一个随机加载的方法，但是很多架构，比如Risc-V都是0，就暂时不写了
+                    } else {
+                        load_bias = 0;
+                    }
+                }
+                load_bias = self
+                    .elf_page_start(VirtAddr::new(
+                        load_bias - TryInto::<usize>::try_into(seg_to_load.p_vaddr).unwrap(),
+                    ))
+                    .data();
+                if total_size == 0 {
+                    return Err(ExecError::InvalidParemeter);
+                }
             }
 
             // 加载这个段到用户空间
-            // todo: 引入动态链接后，这里的total_size要按照实际的填写，而不一定是0
 
             let e = self
                 .load_elf_segment(
@@ -601,7 +701,7 @@ impl BinaryLoader for ElfLoader {
                     vaddr + load_bias,
                     &elf_prot_flags,
                     &elf_map_flags,
-                    0,
+                    total_size,
                 )
                 .map_err(|e| match e {
                     SystemError::EFAULT => ExecError::BadAddress(None),
@@ -618,7 +718,14 @@ impl BinaryLoader for ElfLoader {
                 first_pt_load = false;
                 if elf_type == ElfType::DSO {
                     // todo: 在这里增加对load_bias和reloc_func_desc的更新代码
-                    todo!()
+                    load_bias += e.0.data()
+                        - self
+                            .elf_page_start(VirtAddr::new(
+                                load_bias
+                                    + TryInto::<usize>::try_into(seg_to_load.p_vaddr).unwrap(),
+                            ))
+                            .data();
+                    _reloc_func_desc = load_bias;
                 }
             }
 
@@ -651,7 +758,8 @@ impl BinaryLoader for ElfLoader {
             // 如果程序段要加载的目标地址不在用户空间内，或者是其他不合法的情况，那么就报错
             if !p_vaddr.check_user()
                 || seg_to_load.p_filesz > seg_to_load.p_memsz
-                || seg_to_load.p_memsz > MMArch::USER_END_VADDR.data() as u64
+                || self.elf_page_align_up(p_vaddr + seg_to_load.p_memsz as usize)
+                    >= MMArch::USER_END_VADDR
             {
                 // kdebug!("ERR:     p_vaddr={p_vaddr:?}");
                 return Err(ExecError::InvalidParemeter);
@@ -713,7 +821,10 @@ impl BinaryLoader for ElfLoader {
             // kdebug!("elf_bss = {elf_bss:?}, elf_brk = {elf_brk:?}");
             return Err(ExecError::BadAddress(Some(elf_bss)));
         }
-        // todo: 动态链接：增加加载interpreter的代码
+        if interpreter.is_some() {
+            // TODO 添加对动态加载器的处理
+            // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#1249
+        }
         // kdebug!("to create auxv");
 
         self.create_auxv(param, program_entrypoint, phdr_vaddr, &ehdr)?;

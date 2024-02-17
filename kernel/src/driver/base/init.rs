@@ -1,3 +1,4 @@
+use crate::driver::input::serio::serio_bus_init;
 use system_error::SystemError;
 
 use super::{
@@ -9,13 +10,16 @@ use super::{
     platform::platform_bus_init,
 };
 
-pub(super) fn driver_init() -> Result<(), SystemError> {
+/// 初始化设备驱动模型
+#[inline(never)]
+pub fn driver_init() -> Result<(), SystemError> {
     devices_init()?;
     buses_init()?;
     classes_init()?;
     firmware_init()?;
     hypervisor_init()?;
     platform_bus_init()?;
+    serio_bus_init()?;
     cpu_device_manager().init()?;
 
     // 至此，已完成设备驱动模型的初始化

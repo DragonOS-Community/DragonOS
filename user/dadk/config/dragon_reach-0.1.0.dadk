@@ -5,8 +5,8 @@
   "task_type": {
     "BuildFromSource": {
       "Git": {
-        "url" : "https://git.mirrors.dragonos.org/DragonOS-Community/DragonReach.git",
-        "revision": "4768985ade"
+        "url" : "https://git.mirrors.dragonos.org.cn/DragonOS-Community/DragonReach.git",
+        "revision": "3d99c3a9d9"
       }
     }
   },
@@ -19,11 +19,5 @@
   },
   "install": {
     "in_dragonos_path": "/"
-  },
-  "envs": [    
-    {
-      "key": "TARGET",
-      "value": "${ROOT_PATH}/user/dadk/target/x86_64-unknown-dragonos.json"
-    }
-  ]
+  }
 }

@@ -31,8 +31,7 @@ use crate::{
 
 impl Syscall {
     pub fn fork(frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let r = ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into());
-        return r;
+        ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into())
     }
 
     pub fn vfork(frame: &mut TrapFrame) -> Result<usize, SystemError> {

@@ -4,8 +4,6 @@
         "stdbool.h": "c",
         "printk.h": "c",
         "stdarg.h": "c",
-        "trap.h": "c",
-        "gate.h": "c",
         "process.h": "c",
         "cpu.h": "c",
         "mm.h": "c",
@@ -172,7 +170,13 @@
         "clocksource.h": "c",
         "ata.h": "c",
         "barrier": "c",
-        "charconv": "c"
+        "charconv": "c",
+        "printf.h": "c",
+        "klog.h": "c",
+        "sqlite3ext.h": "c",
+        "malloc.h": "c",
+        "*.o": "c",
+        "k_log.h": "c"
     },
     "C_Cpp.errorSquiggles": "enabled",
     "esbonio.sphinx.confDir": "",

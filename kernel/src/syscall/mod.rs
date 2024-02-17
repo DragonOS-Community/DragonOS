@@ -7,6 +7,7 @@ use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
     driver::base::device::device_number::DeviceNumber,
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
+    net::syscall::MsgHdr,
     process::{
         fork::KernelCloneArgs,
         resource::{RLimit64, RUsage},
@@ -59,23 +60,20 @@ extern "C" {
     fn do_put_string(s: *const u8, front_color: u32, back_color: u32) -> usize;
 }
 
-#[no_mangle]
-pub extern "C" fn syscall_init() -> i32 {
-    kinfo!("Initializing syscall...");
-    Syscall::init().expect("syscall init failed");
-    kinfo!("Syscall init successfully!");
-    return 0;
-}
-
 impl Syscall {
     /// 初始化系统调用
+    #[inline(never)]
     pub fn init() -> Result<(), SystemError> {
         static INIT_FLAG: AtomicBool = AtomicBool::new(false);
         let prev = INIT_FLAG.swap(true, Ordering::SeqCst);
         if prev {
             panic!("Cannot initialize syscall more than once!");
         }
-        return crate::arch::syscall::arch_syscall_init();
+        kinfo!("Initializing syscall...");
+        let r = crate::arch::syscall::arch_syscall_init();
+        kinfo!("Syscall init successfully!");
+
+        return r;
     }
     /// @brief 系统调用分发器，用于分发系统调用。
     ///
@@ -131,7 +129,6 @@ impl Syscall {
             }
             SYS_CLOSE => {
                 let fd = args[0];
-
                 let res = Self::close(fd);
 
                 res
@@ -346,6 +343,7 @@ impl Syscall {
                     Self::pipe2(pipefd, FileMode::empty())
                 }
             }
+
             SYS_PIPE2 => {
                 let pipefd: *mut i32 = args[0] as *mut c_int;
                 let arg1 = args[1];
@@ -545,24 +543,15 @@ impl Syscall {
             }
 
             SYS_RECVMSG => {
-                let msg = args[1] as *mut crate::net::syscall::MsgHdr;
+                let msg = args[1] as *mut MsgHdr;
                 let flags = args[2] as u32;
-                match UserBufferWriter::new(
-                    msg,
-                    core::mem::size_of::<crate::net::syscall::MsgHdr>(),
-                    true,
-                ) {
-                    Err(e) => Err(e),
-                    Ok(mut user_buffer_writer) => {
-                        match user_buffer_writer.buffer::<crate::net::syscall::MsgHdr>(0) {
-                            Err(e) => Err(e),
-                            Ok(buffer) => {
-                                let msg = &mut buffer[0];
-                                Self::recvmsg(args[0], msg, flags)
-                            }
-                        }
-                    }
-                }
+
+                let mut user_buffer_writer =
+                    UserBufferWriter::new(msg, core::mem::size_of::<MsgHdr>(), frame.from_user())?;
+                let buffer = user_buffer_writer.buffer::<MsgHdr>(0)?;
+
+                let msg = &mut buffer[0];
+                Self::recvmsg(args[0], msg, flags)
             }
 
             SYS_LISTEN => Self::listen(args[0], args[1]),
@@ -817,7 +806,13 @@ impl Syscall {
             }
 
             SYS_SOCKETPAIR => {
-                unimplemented!()
+                let mut user_buffer_writer = UserBufferWriter::new(
+                    args[3] as *mut c_int,
+                    core::mem::size_of::<[c_int; 2]>(),
+                    frame.from_user(),
+                )?;
+                let fds = user_buffer_writer.buffer::<i32>(0)?;
+                Self::socketpair(args[0], args[1], args[2], fds)
             }
 
             #[cfg(target_arch = "x86_64")]
@@ -853,10 +848,20 @@ impl Syscall {
             }
             SYS_GETTID => Self::gettid().map(|tid| tid.into()),
             SYS_GETUID => Self::getuid().map(|uid| uid.into()),
+
             SYS_SYSLOG => {
-                kwarn!("SYS_SYSLOG has not yet been implemented");
-                Ok(0)
+                let syslog_action_type = args[0] as usize;
+                let buf_vaddr = args[1];
+                let len = args[2];
+                let from_user = frame.from_user();
+                let mut user_buffer_writer =
+                    UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)?;
+
+                let user_buf = user_buffer_writer.buffer(0)?;
+                let res = Self::do_syslog(syslog_action_type, user_buf, len);
+                res
             }
+
             SYS_GETGID => Self::getgid().map(|gid| gid.into()),
             SYS_SETUID => {
                 kwarn!("SYS_SETUID has not yet been implemented");

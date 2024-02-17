@@ -52,8 +52,8 @@ pub fn vm(id: usize) -> Option<Vm> {
     vm_list.iter().find(|&x| x.id == id).cloned()
 }
 
-#[no_mangle]
-pub extern "C" fn kvm_init() {
+#[inline(never)]
+pub fn kvm_init() {
     kdebug!("kvm init");
 
     match KVMArch::kvm_arch_cpu_supports_vm() {

@@ -20,7 +20,7 @@
   "clean": {
     "clean_command": "make clean"
   },
-  "envs": [    
+  "envs": [
     {
       "key": "TARGET",
       "value": "x86_64-unknown-dragonos"

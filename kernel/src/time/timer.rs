@@ -129,7 +129,7 @@ impl Timer {
         if unlikely(r.is_err()) {
             kerror!(
                 "Failed to run timer function: {self:?} {:?}",
-                r.err().unwrap()
+                r.as_ref().err().unwrap()
             );
         }
     }
@@ -236,7 +236,8 @@ impl SoftirqVec for DoTimerSoftirq {
     }
 }
 
-/// @brief 初始化timer模块
+/// 初始化系统定时器
+#[inline(never)]
 pub fn timer_init() {
     // FIXME 调用register_trap
     let do_timer_softirq = Arc::new(DoTimerSoftirq::new());

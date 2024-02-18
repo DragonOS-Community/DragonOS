@@ -73,6 +73,86 @@ bitflags! {
     }
 }
 
+impl From<MapFlags> for VmFlags {
+    fn from(map_flags: MapFlags) -> Self {
+        let mut vm_flags = VmFlags::VM_NONE;
+
+        if map_flags.contains(MapFlags::MAP_GROWSDOWN) {
+            vm_flags |= VmFlags::VM_GROWSDOWN;
+        }
+
+        if map_flags.contains(MapFlags::MAP_LOCKED) {
+            vm_flags |= VmFlags::VM_LOCKED;
+        }
+
+        if map_flags.contains(MapFlags::MAP_SYNC) {
+            vm_flags |= VmFlags::VM_SYNC;
+        }
+
+        vm_flags
+    }
+}
+
+impl From<ProtFlags> for VmFlags {
+    fn from(prot_flags: ProtFlags) -> Self {
+        let mut vm_flags = VmFlags::VM_NONE;
+
+        if prot_flags.contains(ProtFlags::PROT_READ) {
+            vm_flags |= VmFlags::VM_READ;
+        }
+
+        if prot_flags.contains(ProtFlags::PROT_WRITE) {
+            vm_flags |= VmFlags::VM_WRITE;
+        }
+
+        if prot_flags.contains(ProtFlags::PROT_EXEC) {
+            vm_flags |= VmFlags::VM_EXEC;
+        }
+
+        vm_flags
+    }
+}
+
+impl Into<MapFlags> for VmFlags {
+    fn into(self) -> MapFlags {
+        let mut map_flags = MapFlags::MAP_NONE;
+
+        if self.contains(VmFlags::VM_GROWSDOWN) {
+            map_flags |= MapFlags::MAP_GROWSDOWN;
+        }
+
+        if self.contains(VmFlags::VM_LOCKED) {
+            map_flags |= MapFlags::MAP_LOCKED;
+        }
+
+        if self.contains(VmFlags::VM_SYNC) {
+            map_flags |= MapFlags::MAP_SYNC;
+        }
+
+        map_flags
+    }
+}
+
+impl Into<ProtFlags> for VmFlags {
+    fn into(self) -> ProtFlags {
+        let mut prot_flags = ProtFlags::PROT_NONE;
+
+        if self.contains(VmFlags::VM_READ) {
+            prot_flags |= ProtFlags::PROT_READ;
+        }
+
+        if self.contains(VmFlags::VM_WRITE) {
+            prot_flags |= ProtFlags::PROT_WRITE;
+        }
+
+        if self.contains(VmFlags::VM_EXEC) {
+            prot_flags |= ProtFlags::PROT_EXEC;
+        }
+
+        prot_flags
+    }
+}
+
 impl Syscall {
     pub fn brk(new_addr: VirtAddr) -> Result<VirtAddr, SystemError> {
         // kdebug!("brk: new_addr={:?}", new_addr);

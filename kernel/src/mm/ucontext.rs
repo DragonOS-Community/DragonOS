@@ -49,78 +49,6 @@ use super::{
 //   protection by setting the value to 0.
 pub const DEFAULT_MMAP_MIN_ADDR: usize = 65536;
 
-/// 从ProtFlags计算VmFlags
-pub fn calc_vm_prot_flags(prot_flags: ProtFlags) -> VmFlags {
-    let mut vm_flags = VmFlags::VM_NONE;
-
-    if prot_flags.contains(ProtFlags::PROT_READ) {
-        vm_flags |= VmFlags::VM_READ;
-    }
-
-    if prot_flags.contains(ProtFlags::PROT_WRITE) {
-        vm_flags |= VmFlags::VM_WRITE;
-    }
-
-    if prot_flags.contains(ProtFlags::PROT_EXEC) {
-        vm_flags |= VmFlags::VM_EXEC;
-    }
-
-    return vm_flags;
-}
-
-/// 从MapFlags计算VmFlags
-pub fn calc_vm_map_flags(map_flags: MapFlags) -> VmFlags {
-    let mut vm_flags = VmFlags::VM_NONE;
-
-    if map_flags.contains(MapFlags::MAP_GROWSDOWN) {
-        vm_flags |= VmFlags::VM_GROWSDOWN;
-    }
-
-    if map_flags.contains(MapFlags::MAP_LOCKED) {
-        vm_flags |= VmFlags::VM_LOCKED;
-    }
-
-    if map_flags.contains(MapFlags::MAP_SYNC) {
-        vm_flags |= VmFlags::VM_SYNC;
-    }
-
-    return vm_flags;
-}
-
-/// 从VmFlags计算ProtFlags
-pub fn prot_from_vm_flags(vm_flags: VmFlags) -> ProtFlags {
-    let mut r = ProtFlags::PROT_NONE;
-
-    if vm_flags.contains(VmFlags::VM_READ) {
-        r |= ProtFlags::PROT_READ;
-    }
-    if vm_flags.contains(VmFlags::VM_WRITE) {
-        r |= ProtFlags::PROT_WRITE;
-    }
-    if vm_flags.contains(VmFlags::VM_EXEC) {
-        r |= ProtFlags::PROT_EXEC;
-    }
-
-    return r;
-}
-
-/// 从VmFlags计算MapFlags
-pub fn map_from_vm_flags(vm_flags: VmFlags) -> MapFlags {
-    let mut r = MapFlags::MAP_NONE;
-
-    if vm_flags.contains(VmFlags::VM_GROWSDOWN) {
-        r |= MapFlags::MAP_GROWSDOWN;
-    }
-    if vm_flags.contains(VmFlags::VM_LOCKED) {
-        r |= MapFlags::MAP_LOCKED;
-    }
-    if vm_flags.contains(VmFlags::VM_SYNC) {
-        r |= MapFlags::MAP_SYNC;
-    }
-
-    return r;
-}
-
 #[derive(Debug)]
 pub struct AddressSpace {
     inner: RwLock<InnerAddressSpace>,
@@ -344,8 +272,8 @@ impl InnerAddressSpace {
 
         let len = page_align_up(len);
 
-        let vm_flags = calc_vm_prot_flags(prot_flags)
-            | calc_vm_map_flags(map_flags)
+        let vm_flags = VmFlags::from(prot_flags)
+            | VmFlags::from(map_flags)
             | VmFlags::VM_MAYREAD
             | VmFlags::VM_MAYWRITE
             | VmFlags::VM_MAYEXEC;
@@ -488,9 +416,9 @@ impl InnerAddressSpace {
         }
 
         // 初始化映射标志
-        let map_flags = map_from_vm_flags(vm_flags);
+        let map_flags: MapFlags = vm_flags.into();
         // 初始化内存区域保护标志
-        let prot_flags = prot_from_vm_flags(vm_flags);
+        let prot_flags: ProtFlags = vm_flags.into();
 
         // 获取映射后的新内存页面
         let new_page = self.map_anonymous(new_vaddr, new_len, prot_flags, map_flags, true)?;

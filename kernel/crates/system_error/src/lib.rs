@@ -89,204 +89,200 @@ pub enum SystemError {
     /// 符号链接级别过多 Too many levels of symbolic links.
     ELOOP = 40,
     /// 没有期待类型的消息 No message of the desired type.
-    ENOMSG = 42,
+    ENOMSG = 41,
     /// 标志符被移除 Identifier removed.
-    EIDRM = 43,
+    EIDRM = 42,
     /// 通道号超出范围 Channel number out of range
-    ECHRNG = 44,
+    ECHRNG = 43,
     /// 二级不同步 Level 2 not synchronized
-    EL2NSYNC = 45,
+    EL2NSYNC = 44,
     /// 三级暂停 Level 3 halted
-    EL3HLT = 46,
+    EL3HLT = 45,
     /// 三级重置 Level 3 reset
-    EL3RST = 47,
+    EL3RST = 46,
     /// 链接号超出范围 Link number out of range
-    ELNRNG = 48,
+    ELNRNG = 47,
     /// 未连接协议驱动程序 Protocol driver not attached
-    EUNATCH = 49,
+    EUNATCH = 48,
     /// 没有可用的CSI结构 No CSI structure available
-    ENOCSI = 50,
+    ENOCSI = 49,
     /// 二级暂停 Level 2 halted
-    EL2HLT = 51,
+    EL2HLT = 50,
     /// 无效交换 Invalid exchange
-    EBADE = 52,
+    EBADE = 51,
     /// 无效的请求描述符 Invalid request descriptor
-    EBADR = 53,
+    EBADR = 52,
     /// 交换满 Exchange full
-    EXFULL = 54,
+    EXFULL = 53,
     /// 无阳极 No anode
-    ENOANO = 55,
+    ENOANO = 54,
     /// 请求码无效 Invalid request code
-    EBADRQC = 56,
+    EBADRQC = 55,
     /// 无效插槽 Invalid slot
-    EBADSLT = 57,
+    EBADSLT = 56,
     /// 资源死锁 Resource deadlock would occur
-    EDEADLOCK = 58,
+    EDEADLOCK = 57,
     /// 错误的字体文件格式 Bad font file format
-    EBFONT = 59,
+    EBFONT = 58,
     /// 不是STREAM Not a STREAM
-    ENOSTR = 60,
+    ENOSTR = 59,
     /// 队列头没有可读取的消息 No message is available on the STREAM head read queue.
-    ENODATA = 61,
+    ENODATA = 60,
     /// 流式ioctl()超时 Stream ioctl() timeout
-    ETIME = 62,
+    ETIME = 61,
     /// 没有STREAM资源  No STREAM resources.
-    ENOSR = 63,
+    ENOSR = 62,
     /// 机器不在网络上 Machine is not on the network
-    ENONET = 64,
+    ENONET = 63,
     /// 未安装软件包 Package not installed
-    ENOPKG = 65,
+    ENOPKG = 64,
     /// 远程对象 Object is remote
-    EREMOTE = 66,
+    EREMOTE = 65,
     /// 保留 Reserved.
-    ENOLINK = 67,
+    ENOLINK = 66,
     /// 外设错误 Advertise error.
-    EADV = 68,
+    EADV = 67,
     /// 安装错误 Srmount error
-    ESRMNT = 69,
+    ESRMNT = 68,
     /// 发送时发生通信错误 Communication error on send
-    ECOMM = 70,
+    ECOMM = 69,
     /// 协议错误 Protocol error.
-    EPROTO = 71,
+    EPROTO = 70,
     /// 保留使用 Reserved.
-    EMULTIHOP = 72,
+    EMULTIHOP = 71,
     /// RFS特定错误 RFS specific error
-    EDOTDOT = 73,
+    EDOTDOT = 72,
     /// 错误的消息 Bad message.
-    EBADMSG = 74,
+    EBADMSG = 73,
     /// 数值过大，产生溢出 Value too large to be stored in data type.
-    EOVERFLOW = 75,
+    EOVERFLOW = 74,
     /// 名称在网络上不是唯一的 Name not unique on network
-    ENOTUNIQ = 76,
+    ENOTUNIQ = 75,
     /// 处于不良状态的文件描述符 File descriptor in bad state
-    EBADFD = 77,
+    EBADFD = 76,
     /// 远程地址已更改 Remote address changed
-    EREMCHG = 78,
+    EREMCHG = 77,
     /// 无法访问所需的共享库 Can not access a needed shared library
-    ELIBACC = 79,
+    ELIBACC = 78,
     /// 访问损坏的共享库 Accessing a corrupted shared library
-    ELIBBAD = 80,
+    ELIBBAD = 79,
     /// a. out中的.lib部分已损坏 .lib section in a.out corrupted
-    ELIBSCN = 81,
+    ELIBSCN = 80,
     /// 尝试链接太多共享库 Attempting to link in too many shared libraries
-    ELIBMAX = 82,
+    ELIBMAX = 81,
     /// 无法直接执行共享库 Cannot exec a shared library directly    
-    ELIBEXEC = 83,
+    ELIBEXEC = 82,
     /// 不合法的字符序列 Illegal byte sequence.
-    EILSEQ = 84,
+    EILSEQ = 83,
     /// 中断的系统调用应该重新启动 Interrupted system call should be restarted
-    ERESTART = 85,
+    ERESTART = 84,
     /// 流管道错误 Streams pipe error
-    ESTRPIPE = 86,
+    ESTRPIPE = 85,
     /// 用户太多 Too many users
-    EUSERS = 87,
+    EUSERS = 86,
     /// 不是一个套接字 Not a socket.
-    ENOTSOCK = 88,
+    ENOTSOCK = 87,
     /// 需要目标地址 Destination address required.
-    EDESTADDRREQ = 89,
+    EDESTADDRREQ = 88,
     /// 消息过大 Message too large.
-    EMSGSIZE = 90,
+    EMSGSIZE = 89,
     /// 对于套接字而言，错误的协议 Protocol wrong type for socket.
-    EPROTOTYPE = 91,
+    EPROTOTYPE = 90,
     /// 协议不可用 Protocol not available.
-    ENOPROTOOPT = 92,
+    ENOPROTOOPT = 91,
     /// 协议不被支持 Protocol not supported.
-    EPROTONOSUPPORT = 93,
+    EPROTONOSUPPORT = 92,
     /// 不支持套接字类型 Socket type not supported
-    ESOCKTNOSUPPORT = 94,
+    ESOCKTNOSUPPORT = 93,
     /// 套接字不支持该操作 Operation not supported on socket (may be the same value as [ENOTSUP]).
     ///
     /// 不被支持 Not supported (may be the same value as [EOPNOTSUPP]).
-    EOPNOTSUPP_OR_ENOTSUP = 95,
+    EOPNOTSUPP_OR_ENOTSUP = 94,
     /// 不支持协议系列 Protocol family not supported
-    EPFNOSUPPORT = 96,
+    EPFNOSUPPORT = 95,
     /// 地址family不支持 Address family not supported.
-    EAFNOSUPPORT = 97,
+    EAFNOSUPPORT = 96,
     /// 地址正在被使用 Address in use.
-    EADDRINUSE = 98,
+    EADDRINUSE = 97,
     /// 地址不可用 Address  not available.
-    EADDRNOTAVAIL = 99,
+    EADDRNOTAVAIL = 98,
     /// 网络已关闭 Network is down.
-    ENETDOWN = 100,
+    ENETDOWN = 99,
     /// 网络不可达 Network unreachable.
-    ENETUNREACH = 101,
+    ENETUNREACH = 100,
     /// 网络连接已断开 Connection aborted by network.
-    ENETRESET = 102,
+    ENETRESET = 101,
     /// 连接已断开 Connection aborted.
-    ECONNABORTED = 103,
+    ECONNABORTED = 102,
     /// 连接被重置 Connection reset.
-    ECONNRESET = 104,
+    ECONNRESET = 103,
     /// 缓冲区空间不足 No buffer space available.
-    ENOBUFS = 105,
+    ENOBUFS = 104,
     /// 套接字已连接 Socket is connected.
-    EISCONN = 106,
+    EISCONN = 105,
     /// 套接字未连接 The socket is not connected.
-    ENOTCONN = 107,
+    ENOTCONN = 106,
     /// 传输端点关闭后无法发送 Cannot send after transport endpoint shutdown
-    ESHUTDOWN = 108,
+    ESHUTDOWN = 107,
     /// 引用太多：无法拼接 Too many references: cannot splice
-    ETOOMANYREFS = 109,
+    ETOOMANYREFS = 108,
     /// 连接超时 Connection timed out.
-    ETIMEDOUT = 110,
+    ETIMEDOUT = 109,
     /// 连接被拒绝 Connection refused.
-    ECONNREFUSED = 111,
+    ECONNREFUSED = 110,
     /// 主机已关闭 Host is down
-    EHOSTDOWN = 112,
+    EHOSTDOWN = 111,
     /// 主机不可达 Host is unreachable.
-    EHOSTUNREACH = 113,
+    EHOSTUNREACH = 112,
     /// 连接已经在处理 Connection already in progress.
-    EALREADY = 114,
+    EALREADY = 113,
     /// 操作正在处理 Operation in progress.
-    EINPROGRESS = 115,
+    EINPROGRESS = 114,
     /// 保留 Reserved.
-    ESTALE = 116,
+    ESTALE = 115,
     /// 结构需要清理 Structure needs cleaning
-    EUCLEAN = 117,
+    EUCLEAN = 116,
     /// 不是XENIX命名类型文件 Not a XENIX named type file
-    ENOTNAM = 118,
+    ENOTNAM = 117,
     /// 没有可用的XENIX信号量 No XENIX semaphores available
-    ENAVAIL = 119,
+    ENAVAIL = 118,
     /// 是命名类型文件 Is a named type file    
-    EISNAM = 120,
+    EISNAM = 119,
     /// 远程I/O错误 Remote I/O error
-    EREMOTEIO = 121,
+    EREMOTEIO = 120,
     /// 保留使用 Reserved
-    EDQUOT = 122,
+    EDQUOT = 121,
     /// 没有找到媒介 No medium found
-    ENOMEDIUM = 123,
+    ENOMEDIUM = 122,
     /// 介质类型错误 Wrong medium type
-    EMEDIUMTYPE = 124,
+    EMEDIUMTYPE = 123,
     /// 操作被取消 Operation canceled.
-    ECANCELED = 125,
+    ECANCELED = 124,
     /// 所需的密钥不可用 Required key not available
-    ENOKEY = 126,
+    ENOKEY = 125,
     /// 密钥已过期 Key has expired
-    EKEYEXPIRED = 127,
+    EKEYEXPIRED = 126,
     /// 密钥已被撤销 Key has been revoked
-    EKEYREVOKED = 128,
+    EKEYREVOKED = 127,
     /// 密钥被服务拒绝 Key has been revoked
-    EKEYREJECTED = 129,
+    EKEYREJECTED = 128,
     /// 之前的拥有者挂了 Previous owner died.
-    EOWNERDEAD = 130,
+    EOWNERDEAD = 129,
     /// 状态不可恢复 State not recoverable.
-    ENOTRECOVERABLE = 131,
-    /// 由于射频终止，无法操作 Operation not possible due to RF-kill
-    ERFKILL = 132,
-    ///
-    EHWPOISON = 133,
+    ENOTRECOVERABLE = 130,
+    // VMX on 虚拟化开启指令出错
+    EVMXONFailed = 131,
+    // VMX off 虚拟化关闭指令出错
+    EVMXOFFFailed = 132,
+    // VMX VMWRITE 写入虚拟化VMCS内存出错
+    EVMWRITEFailed = 133,
+    EVMREADFailed = 134,
+    EVMPRTLDFailed = 135,
+    EVMLAUNCHFailed = 136,
+    KVM_HVA_ERR_BAD = 137,
 
     // === 以下错误码不应该被用户态程序使用 ===
     ERESTARTSYS = 512,
-    // VMX on 虚拟化开启指令出错
-    EVMXONFailed = 513,
-    // VMX off 虚拟化关闭指令出错
-    EVMXOFFFailed = 514,
-    // VMX VMWRITE 写入虚拟化VMCS内存出错
-    EVMWRITEFailed = 515,
-    EVMREADFailed = 516,
-    EVMPRTLDFailed = 517,
-    EVMLAUNCHFailed = 518,
-    KVM_HVA_ERR_BAD = 519,
 }
 
 impl SystemError {

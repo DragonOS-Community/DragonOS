@@ -78,7 +78,6 @@ struct InnerIrqData {
 /// per irq data shared by all irqchips
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irq.h#147
-
 #[derive(Debug)]
 pub struct IrqCommonData {
     inner: SpinLock<InnerIrqCommonData>,

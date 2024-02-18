@@ -1,5 +1,6 @@
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -20,11 +21,11 @@ int main() {
       }
     }
   }
-  printf("fd: %d", fd);
+  printf("fd: %ld", fd);
   // 写入字符串
   char *str = "------fuck-----";
   int len = write(fd, str, strlen(str));
-  printf("len: %d", len);
+  printf("len: %ld", len);
   // 关闭文件
   close(fd);
   return 0;

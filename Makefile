@@ -51,9 +51,10 @@ user:
 
 .PHONY: clean
 clean:
-	@for subdir in $(SUBDIRS); do \
+	@list='$(SUBDIRS)'; for subdir in $$list; do \
 		echo "Clean in dir: $$subdir";\
-		$(MAKE) -C $$subdir clean;\
+		cd $$subdir && $(MAKE) clean;\
+		cd .. ;\
 	done
 
 .PHONY: ECHO

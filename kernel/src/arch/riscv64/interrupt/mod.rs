@@ -35,6 +35,11 @@ impl InterruptArch for RiscV64InterruptArch {
             riscv::register::sstatus::clear_sie();
         }
     }
+
+    fn probe_total_irq_num() -> u32 {
+        // todo: 获取中断总数
+        256
+    }
 }
 
 /// 中断栈帧结构体

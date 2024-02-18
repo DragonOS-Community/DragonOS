@@ -1,12 +1,16 @@
 #pragma once
 
+#include <stdio.h>
+#include <malloc.h>
+#include <string.h>
+
 /**
  * @brief 识别dmesg程序的第一个选项参数
  *
  * @param arg dmesg命令第一个选项参数
  * @return int 有效时返回对应选项码，无效时返回 -1
  */
-int getoption(char *arg);
+int getopt(char *arg);
 
 /**
  * @brief 识别dmesg程序的第二个选项参数

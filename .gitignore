@@ -10,7 +10,6 @@ kernel/kernel
 *.o
 *.a
 *.s
-out
 serial_opt.txt
 user/sys_api_lib
 docs/_build

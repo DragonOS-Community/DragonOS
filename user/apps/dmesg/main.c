@@ -1,8 +1,4 @@
 #include "dmesg.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/klog.h>
-#include <unistd.h>
 
 int main(int argc, char **argv)
 {
@@ -34,7 +30,7 @@ int main(int argc, char **argv)
     else
     {
         // 获取第一个选项参数
-        opt = getoption(argv[1]);
+        opt = getopt(argv[1]);
 
         // 无效参数
         if (opt == -1)

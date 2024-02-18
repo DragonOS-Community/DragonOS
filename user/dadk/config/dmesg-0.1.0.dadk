@@ -9,9 +9,9 @@
       }
     }
   },
-  "depends": [],
+  "depends": [ ],
   "build": {
-    "build_command": "make install"
+    "build_command": "make"
   },
   "install": {
     "in_dragonos_path": "/bin"

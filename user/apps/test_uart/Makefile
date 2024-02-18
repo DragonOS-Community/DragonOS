@@ -1,18 +1,25 @@
-ifeq ($(ARCH), x86_64)
-	PREFIX=x86_64-linux-musl-
-else ifeq ($(ARCH), riscv64)
-	PREFIX=riscv64-linux-musl-
-endif
+CC=$(DragonOS_GCC)/x86_64-elf-gcc
+LD=ld
+OBJCOPY=objcopy
+# 修改这里，把它改为你的relibc的sysroot路径
+MUSL_PATH=$(HOME)/opt/x86_64-linux-musl-cross-gcc-9.4.0/x86_64-linux-musl/
+CFLAGS=-I $(MUSL_PATH)/include
 
-CC=$(PREFIX)gcc
+tmp_output_dir=$(ROOT_PATH)/bin/tmp/user
+output_dir=$(DADK_BUILD_CACHE_DIR_TEST_UART_0_1_0)
 
+LIBC_OBJS:=$(shell find $(MUSL_PATH)/lib -name "*.o" | sort )
+LIBC_OBJS+=$(MUSL_PATH)/lib/libc.a
 
-out: main.c
-	$(CC) -static -o out main.c
+all: main.o
+	mkdir -p $(tmp_output_dir)
+	
+	$(LD) -b elf64-x86-64 -z muldefs -o $(tmp_output_dir)/test_uart  $(shell find . -name "*.o") $(LIBC_OBJS) -T link.lds
 
-.PHONY: install clean
-install: out
-	mv out $(DADK_CURRENT_BUILD_DIR)/test_uart
+	$(OBJCOPY) -I elf64-x86-64 -R ".eh_frame" -R ".comment" -O elf64-x86-64 $(tmp_output_dir)/test_uart $(output_dir)/test_uart.elf
+	mv $(output_dir)/test_uart.elf $(output_dir)/test_uart
+main.o: main.c
+	$(CC) $(CFLAGS) -c main.c  -o main.o
 
 clean:
-	rm out *.o
+	rm -f *.o

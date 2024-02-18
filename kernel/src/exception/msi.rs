@@ -116,7 +116,7 @@ impl MsiDesc {
     }
 }
 
-pub trait MsiDescFunc: Debug {
+pub trait MsiDescFunc: Debug + Send + Sync {
     /// Callback that may be called when the MSI message
     /// address or data changes.
     fn write_msi_msg(&self, data: Arc<dyn MsiDescFuncData>);

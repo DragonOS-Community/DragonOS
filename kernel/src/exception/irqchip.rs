@@ -41,18 +41,18 @@ pub trait IrqChip: Sync + Send + Any + Debug {
     fn irq_ack(&self, irq: &Arc<IrqData>);
 
     /// mask an interrupt source
-    fn irq_mask(&self, irq: &Arc<IrqData>);
+    fn irq_mask(&self, _irq: &Arc<IrqData>) {}
     /// ack and mask an interrupt source
-    fn irq_mask_ack(&self, irq: &Arc<IrqData>);
+    fn irq_mask_ack(&self, _irq: &Arc<IrqData>) {}
     /// unmask an interrupt source
-    fn irq_unmask(&self, irq: &Arc<IrqData>);
+    fn irq_unmask(&self, _irq: &Arc<IrqData>) {}
     /// end of interrupt
-    fn irq_eoi(&self, irq: &Arc<IrqData>);
+    fn irq_eoi(&self, _irq: &Arc<IrqData>) {}
 
     // todo: set affinity
 
     /// retrigger an IRQ to the CPU
-    fn retrigger(&self, irq: &Arc<IrqData>);
+    fn retrigger(&self, _irq: &Arc<IrqData>) {}
 
     /// set the flow type of an interrupt
     ///
@@ -83,14 +83,14 @@ pub trait IrqChip: Sync + Send + Any + Debug {
 
     /// function called from core code on suspend once per
     /// chip, when one or more interrupts are installed
-    fn irq_suspend(&self, irq: &Arc<IrqData>);
+    fn irq_suspend(&self, _irq: &Arc<IrqData>) {}
 
     /// function called from core code on resume once per chip,
     /// when one ore more interrupts are installed
-    fn irq_resume(&self, irq: &Arc<IrqData>);
+    fn irq_resume(&self, _irq: &Arc<IrqData>) {}
 
     /// function called from core code on shutdown once per chip
-    fn irq_pm_shutdown(&self, irq: &Arc<IrqData>);
+    fn irq_pm_shutdown(&self, _irq: &Arc<IrqData>) {}
 
     /// Optional function to set irq_data.mask for special cases
     fn irq_calc_mask(&self, _irq: &Arc<IrqData>) {}
@@ -135,7 +135,7 @@ pub trait IrqChip: Sync + Send + Any + Debug {
     // todo: set vcpu affinity
 
     /// send a single IPI to destination cpus
-    fn send_single_ipi(&self, irq: &Arc<IrqData>, cpu: u32);
+    fn send_single_ipi(&self, _irq: &Arc<IrqData>, _cpu: u32) {}
 
     // todo: send ipi with cpu mask
 
@@ -145,7 +145,9 @@ pub trait IrqChip: Sync + Send + Any + Debug {
     }
 
     /// function called from core code after disabling an NMI
-    fn irq_nmi_teardown(&self, irq: &Arc<IrqData>);
+    fn irq_nmi_teardown(&self, _irq: &Arc<IrqData>) {}
+
+    fn flags(&self) -> IrqChipFlags;
 }
 
 #[allow(dead_code)]
@@ -214,7 +216,7 @@ struct InnerIrqChipGeneric {
     chip_types: Vec<IrqChipType>,
 }
 
-pub trait IrqChipGenericOps: Debug {
+pub trait IrqChipGenericOps: Debug + Send + Sync {
     /// Alternate I/O accessor (defaults to readl if NULL)
     unsafe fn reg_readl(&self, addr: VirtAddr) -> u32;
 
@@ -236,4 +238,34 @@ pub trait IrqChipGenericPrivateData: Sync + Send + Any + Debug {}
 #[derive(Debug)]
 pub struct IrqChipType {
     // todo https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irq.h#1024
+}
+
+bitflags! {
+    /// IrqChip specific flags
+    pub struct IrqChipFlags: u32 {
+        /// 在调用chip.irq_set_type()之前屏蔽
+        const IRQCHIP_SET_TYPE_MASKED = 1 << 0;
+        /// 只有在irq被处理时才发出irq_eoi()
+        const IRQCHIP_EOI_IF_HANDLED = 1 << 1;
+        /// 在挂起路径中屏蔽非唤醒irq
+        const IRQCHIP_MASK_ON_SUSPEND = 1 << 2;
+        /// 只有在irq启用时才调用irq_on/off_line回调
+        const IRQCHIP_ONOFFLINE_ENABLED = 1 << 3;
+        /// 跳过chip.irq_set_wake()，对于这个irq芯片
+        const IRQCHIP_SKIP_SET_WAKE = 1 << 4;
+        /// 单次触发不需要屏蔽/取消屏蔽
+        const IRQCHIP_ONESHOT_SAFE = 1 << 5;
+        /// 芯片在线程模式下需要在取消屏蔽时eoi()
+        const IRQCHIP_EOI_THREADED = 1 << 6;
+        /// 芯片可以为Level MSIs提供两个门铃
+        const IRQCHIP_SUPPORTS_LEVEL_MSI = 1 << 7;
+        /// 芯片可以传递NMIs，仅适用于根irqchips
+        const IRQCHIP_SUPPORTS_NMI = 1 << 8;
+        /// 在挂起路径中，如果它们处于禁用状态，则调用__enable_irq()/__disable_irq()以唤醒irq
+        const IRQCHIP_ENABLE_WAKEUP_ON_SUSPEND = 1 << 9;
+        /// 在启动前更新默认亲和性
+        const IRQCHIP_AFFINITY_PRE_STARTUP = 1 << 10;
+        /// 不要在这个芯片中改变任何东西
+        const IRQCHIP_IMMUTABLE = 1 << 11;
+    }
 }

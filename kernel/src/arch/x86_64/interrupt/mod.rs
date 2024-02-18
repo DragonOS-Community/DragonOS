@@ -78,6 +78,12 @@ impl InterruptArch for X86_64InterruptArch {
         local_irq_restore(flags.flags());
         compiler_fence(Ordering::SeqCst);
     }
+
+    fn probe_total_irq_num() -> u32 {
+        // todo: 从APIC获取
+        // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/apic/vector.c?r=&mo=19514&fi=704#704
+        256
+    }
 }
 
 /// 中断栈帧结构体

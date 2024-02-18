@@ -92,6 +92,10 @@ impl IrqDesc {
     fn inner(&self) -> SpinLockGuard<InnerIrqDesc> {
         self.inner.lock_irqsave()
     }
+
+    pub fn irq(&self) -> IrqNumber {
+        self.inner().irq_data.irq()
+    }
 }
 
 #[allow(dead_code)]

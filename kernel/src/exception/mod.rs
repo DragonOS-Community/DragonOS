@@ -35,6 +35,9 @@ pub trait InterruptArch: Send + Sync {
     fn arch_early_irq_init() -> Result<(), SystemError> {
         Ok(())
     }
+
+    /// 响应未注册的中断
+    fn ack_bad_irq(irq: IrqNumber);
 }
 
 #[derive(Debug, Clone, Copy)]

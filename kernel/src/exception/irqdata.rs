@@ -56,6 +56,10 @@ impl IrqData {
         let common_data = self.inner.lock().common_data.clone();
         common_data.irqd_clear(status);
     }
+
+    pub fn irq(&self) -> IrqNumber {
+        self.irq
+    }
 }
 
 #[allow(dead_code)]

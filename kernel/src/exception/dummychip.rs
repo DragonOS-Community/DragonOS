@@ -1,9 +1,12 @@
 use alloc::sync::Arc;
 use system_error::SystemError;
 
+use crate::arch::CurrentIrqArch;
+
 use super::{
     irqchip::{IrqChip, IrqChipFlags},
     irqdata::IrqData,
+    InterruptArch,
 };
 
 static mut NO_IRQ_CHIP: Option<Arc<NoIrqChip>> = None;
@@ -20,9 +23,9 @@ pub fn dummy_irq_chip() -> Arc<dyn IrqChip> {
     unsafe { DUMMY_IRQ_CHIP.as_ref().unwrap().clone() }
 }
 
-fn ack_bad(_irq_data: &Arc<IrqData>) {
-    todo!("ack_bad");
-    // todo: https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/irq/dummychip.c?fi=no_irq_chip#18
+fn ack_bad(irq_data: &Arc<IrqData>) {
+    // todo: print_irq_desc
+    CurrentIrqArch::ack_bad_irq(irq_data.irq());
 }
 
 #[derive(Debug)]

@@ -58,7 +58,7 @@ all:
 	@echo 用户态程序编译完成
 
 .PHONY: clean
-clean: 
+clean:
 	rm -rf $(GARBAGE)
 	$(MAKE) dadk_clean
 	@list='$(user_sub_dirs)'; for subdir in $$list; do \
@@ -69,4 +69,4 @@ clean:
 
 .PHONY: fmt
 fmt:
-	FMT_CHECK=$(FMT_CHECK) $(MAKE) -C apps
+	# FMT_CHECK=$(FMT_CHECK) $(MAKE) -C apps

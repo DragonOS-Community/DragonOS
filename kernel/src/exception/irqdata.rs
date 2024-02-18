@@ -21,6 +21,50 @@ use super::{
 pub struct IrqData {
     /// 中断号, 用于表示软件逻辑视角的中断号，全局唯一
     irq: IrqNumber,
+    inner: SpinLock<InnerIrqData>,
+}
+
+impl IrqData {
+    pub fn new(
+        irq: IrqNumber,
+        hwirq: HardwareIrqNumber,
+        common_data: Arc<IrqCommonData>,
+        chip: Arc<dyn IrqChip>,
+    ) -> Self {
+        return IrqData {
+            irq,
+            inner: SpinLock::new(InnerIrqData {
+                hwirq,
+                common_data,
+                chip,
+                chip_data: None,
+                domain: None,
+                parent_data: None,
+            }),
+        };
+    }
+
+    pub fn irqd_set(&self, status: IrqStatus) {
+        // clone是为了释放inner锁
+        let common_data = self.inner.lock().common_data.clone();
+        common_data.irqd_set(status);
+    }
+
+    #[allow(dead_code)]
+    pub fn irqd_clear(&self, status: IrqStatus) {
+        // clone是为了释放inner锁
+        let common_data = self.inner.lock().common_data.clone();
+        common_data.irqd_clear(status);
+    }
+
+    pub fn irq(&self) -> IrqNumber {
+        self.irq
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+struct InnerIrqData {
     /// 硬件中断号, 用于表示在某个IrqDomain中的中断号
     hwirq: HardwareIrqNumber,
     /// 涉及的所有irqchip之间共享的数据
@@ -28,9 +72,9 @@ pub struct IrqData {
     /// 绑定到的中断芯片
     chip: Arc<dyn IrqChip>,
     /// 中断芯片的私有数据（与当前irq相关）
-    chip_data: Arc<dyn IrqChipData>,
+    chip_data: Option<Arc<dyn IrqChipData>>,
     /// 中断域
-    domain: Arc<IrqDomain>,
+    domain: Option<Arc<IrqDomain>>,
     /// 中断的父中断（如果具有中断域继承的话）
     parent_data: Option<Weak<IrqData>>,
 }
@@ -38,10 +82,30 @@ pub struct IrqData {
 /// per irq data shared by all irqchips
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irq.h#147
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct IrqCommonData {
     inner: SpinLock<InnerIrqCommonData>,
+}
+
+impl IrqCommonData {
+    pub fn new() -> Self {
+        let inner = InnerIrqCommonData {
+            state: IrqStatus::empty(),
+            handler_data: None,
+            msi_desc: None,
+        };
+        return IrqCommonData {
+            inner: SpinLock::new(inner),
+        };
+    }
+
+    pub fn irqd_set(&self, status: IrqStatus) {
+        self.inner.lock_irqsave().irqd_set(status);
+    }
+
+    pub fn irqd_clear(&self, status: IrqStatus) {
+        self.inner.lock_irqsave().irqd_clear(status);
+    }
 }
 
 #[allow(dead_code)]
@@ -53,6 +117,16 @@ struct InnerIrqCommonData {
     handler_data: Option<Arc<dyn IrqHandlerData>>,
     msi_desc: Option<Arc<MsiDesc>>,
     // todo: affinity
+}
+
+impl InnerIrqCommonData {
+    pub fn irqd_set(&mut self, status: IrqStatus) {
+        self.state.insert(status);
+    }
+
+    pub fn irqd_clear(&mut self, status: IrqStatus) {
+        self.state.remove(status);
+    }
 }
 
 pub trait IrqHandlerData: Send + Sync + Any + Debug {}

@@ -145,7 +145,7 @@ pub enum IrqDomainBusToken {
 /// IrqDomain的操作方法
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irqdomain.h#107
-pub trait IrqDomainOps: Debug {
+pub trait IrqDomainOps: Debug + Send + Sync {
     /// 匹配一个中断控制器设备节点到一个主机。
     fn match_node(
         &self,

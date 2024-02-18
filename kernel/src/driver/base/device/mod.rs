@@ -711,7 +711,7 @@ impl DeviceManager {
     ) -> Result<(), SystemError> {
         if unlikely(
             attr.mode().contains(ModeType::S_IRUGO)
-                && (!attr.support().contains(SysFSOpsSupport::SHOW)),
+                && (!attr.support().contains(SysFSOpsSupport::ATTR_SHOW)),
         ) {
             kwarn!(
                 "Attribute '{}': read permission without 'show'",
@@ -720,7 +720,7 @@ impl DeviceManager {
         }
         if unlikely(
             attr.mode().contains(ModeType::S_IWUGO)
-                && (!attr.support().contains(SysFSOpsSupport::STORE)),
+                && (!attr.support().contains(SysFSOpsSupport::ATTR_STORE)),
         ) {
             kwarn!(
                 "Attribute '{}': write permission without 'store'",
@@ -847,7 +847,7 @@ impl Attribute for DeviceAttrDev {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::SHOW
+        SysFSOpsSupport::ATTR_SHOW
     }
 }
 

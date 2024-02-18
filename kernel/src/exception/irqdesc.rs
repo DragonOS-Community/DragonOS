@@ -1,8 +1,8 @@
 use core::{any::Any, fmt::Debug};
 
 use alloc::{
-    collections::BTreeMap,
-    string::String,
+    collections::{btree_map, BTreeMap},
+    string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -27,7 +27,7 @@ use super::{
     dummychip::no_irq_chip,
     handle::bad_irq_handler,
     irqdata::{IrqCommonData, IrqData, IrqStatus},
-    sysfs::IrqKObjType,
+    sysfs::{irq_sysfs_del, IrqKObjType},
     HardwareIrqNumber, InterruptArch, IrqNumber,
 };
 
@@ -65,6 +65,7 @@ impl IrqDesc {
             inner: SpinLock::new(InnerIrqDesc {
                 common_data,
                 irq_data,
+                desc_internal_state: IrqDescState::empty(),
                 actions: Vec::new(),
                 name,
                 parent_irq: None,
@@ -93,8 +94,44 @@ impl IrqDesc {
         self.inner.lock_irqsave()
     }
 
+    pub fn actions(&self) -> Vec<Arc<IrqAction>> {
+        self.inner().actions.clone()
+    }
+
     pub fn irq(&self) -> IrqNumber {
         self.inner().irq_data.irq()
+    }
+
+    pub fn hardware_irq(&self) -> HardwareIrqNumber {
+        self.inner().irq_data.hardware_irq()
+    }
+
+    pub fn irq_data(&self) -> Arc<IrqData> {
+        self.inner().irq_data.clone()
+    }
+
+    /// 标记当前irq描述符已经被添加到sysfs
+    pub fn mark_in_sysfs(&self) {
+        self.inner()
+            .desc_internal_state
+            .insert(IrqDescState::IRQS_SYSFS);
+    }
+
+    pub fn mark_not_in_sysfs(&self) {
+        self.inner()
+            .desc_internal_state
+            .remove(IrqDescState::IRQS_SYSFS);
+    }
+
+    /// 判断当前描述符是否已经添加到了sysfs
+    pub fn in_sysfs(&self) -> bool {
+        self.inner()
+            .desc_internal_state
+            .contains(IrqDescState::IRQS_SYSFS)
+    }
+
+    pub fn name(&self) -> Option<String> {
+        self.inner().name.clone()
     }
 }
 
@@ -111,6 +148,7 @@ struct InnerIrqDesc {
     depth: u32,
     /// nested wake enables
     wake_depth: u32,
+    desc_internal_state: IrqDescState,
 
     kern_inode: Option<Arc<KernFSInode>>,
     kset: Option<Arc<KSet>>,
@@ -153,7 +191,7 @@ impl KObject for IrqDesc {
     fn set_kobj_type(&self, _ktype: Option<&'static dyn KObjType>) {}
 
     fn name(&self) -> String {
-        self.inner().name.clone().unwrap_or_else(|| format!(""))
+        self.inner().irq_data.irq().data().to_string()
     }
 
     fn set_name(&self, _name: String) {}
@@ -168,6 +206,32 @@ impl KObject for IrqDesc {
 
     fn set_kobj_state(&self, state: KObjectState) {
         *self.kobj_state_mut() = state;
+    }
+}
+
+bitflags! {
+    /// Bit masks for desc->desc_internal_state
+    struct IrqDescState: u32 {
+        /// autodetection in progress
+        const IRQS_AUTODETECT = 0x00000001;
+        /// was disabled due to spurious interrupt detection
+        const IRQS_SPURIOUS_DISABLED = 0x00000002;
+        /// polling in progress
+        const IRQS_POLL_INPROGRESS = 0x00000008;
+        /// irq is not unmasked in primary handler
+        const IRQS_ONESHOT = 0x00000020;
+        /// irq is replayed
+        const IRQS_REPLAY = 0x00000040;
+        /// irq is waiting
+        const IRQS_WAITING = 0x00000080;
+        /// irq is pending and replayed later
+        const IRQS_PENDING = 0x00000200;
+        /// irq is suspended
+        const IRQS_SUSPENDED = 0x00000800;
+        /// irq line is used to deliver NMIs
+        const IRQS_NMI = 0x00002000;
+        /// descriptor has been added to sysfs
+        const IRQS_SYSFS = 0x00004000;
     }
 }
 
@@ -200,6 +264,14 @@ impl IrqAction {
         };
 
         return Arc::new(action);
+    }
+
+    pub fn name(&self) -> String {
+        self.inner().name.clone()
+    }
+
+    fn inner(&self) -> SpinLockGuard<InnerIrqAction> {
+        self.inner.lock_irqsave()
     }
 }
 
@@ -268,7 +340,19 @@ pub(super) fn early_irq_init() -> Result<(), SystemError> {
         manager.insert(IrqNumber::new(i), irq_desc);
     }
 
+    unsafe {
+        IRQ_DESC_MANAGER = Some(manager);
+    }
+
     return CurrentIrqArch::arch_early_irq_init();
+}
+
+static mut IRQ_DESC_MANAGER: Option<IrqDescManager> = None;
+
+/// 获取中断描述符管理器的引用
+#[inline(always)]
+pub(super) fn irq_desc_manager() -> &'static IrqDescManager {
+    return unsafe { IRQ_DESC_MANAGER.as_ref().unwrap() };
 }
 
 pub(super) struct IrqDescManager {
@@ -290,5 +374,19 @@ impl IrqDescManager {
 
     fn insert(&mut self, irq: IrqNumber, desc: Arc<IrqDesc>) {
         self.irq_descs.insert(irq, desc);
+    }
+
+    /// 释放中断描述符
+    #[allow(dead_code)]
+    fn free_desc(&mut self, irq: IrqNumber) {
+        if let Some(desc) = self.irq_descs.get(&irq) {
+            irq_sysfs_del(desc);
+            self.irq_descs.remove(&irq);
+        }
+    }
+
+    /// 迭代中断描述符
+    pub fn iter_descs(&self) -> btree_map::Iter<'_, IrqNumber, Arc<IrqDesc>> {
+        self.irq_descs.iter()
     }
 }

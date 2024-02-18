@@ -274,7 +274,7 @@ pub enum SystemError {
     ERFKILL = 132,
     ///
     EHWPOISON = 133,
-    
+
     // === 以下错误码不应该被用户态程序使用 ===
     ERESTARTSYS = 512,
     // VMX on 虚拟化开启指令出错

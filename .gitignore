@@ -12,7 +12,6 @@ kernel/kernel
 *.s
 out
 serial_opt.txt
-user/sys_api_lib
 docs/_build
 draft
 cppcheck.xml

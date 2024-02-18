@@ -603,35 +603,6 @@ impl Syscall {
                     return Err(SystemError::EINVAL);
                 }
 
-                // 需要重映射到新内存区域的情况下，必须包含MREMAP_MAYMOVE并且指定新地址
-                if mremap_flags.contains(MremapFlags::MREMAP_FIXED)
-                    && (!mremap_flags.contains(MremapFlags::MREMAP_MAYMOVE)
-                        || new_vaddr == VirtAddr::new(0))
-                {
-                    return Err(SystemError::EINVAL);
-                }
-
-                // 不取消旧映射的情况下，必须包含MREMAP_MAYMOVE并且新内存大小等于旧内存大小
-                if mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP)
-                    && (!mremap_flags.contains(MremapFlags::MREMAP_MAYMOVE) || old_len != new_len)
-                {
-                    return Err(SystemError::EINVAL);
-                }
-
-                // 旧内存地址必须对齐
-                if !old_vaddr.check_aligned(MMArch::PAGE_SIZE) {
-                    return Err(SystemError::EINVAL);
-                }
-
-                // 将old_len、new_len 对齐页面大小
-                let old_len = page_align_up(old_len);
-                let new_len = page_align_up(new_len);
-
-                // 不允许重映射内存大小为0
-                if new_len == 0 {
-                    return Err(SystemError::EINVAL);
-                }
-
                 Self::mremap(old_vaddr, old_len, new_len, mremap_flags, new_vaddr)
             }
             SYS_MUNMAP => {

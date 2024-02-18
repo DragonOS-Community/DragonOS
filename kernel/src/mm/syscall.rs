@@ -183,6 +183,35 @@ impl Syscall {
         mremap_flags: MremapFlags,
         new_vaddr: VirtAddr,
     ) -> Result<usize, SystemError> {
+        // 需要重映射到新内存区域的情况下，必须包含MREMAP_MAYMOVE并且指定新地址
+        if mremap_flags.contains(MremapFlags::MREMAP_FIXED)
+            && (!mremap_flags.contains(MremapFlags::MREMAP_MAYMOVE)
+                || new_vaddr == VirtAddr::new(0))
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        // 不取消旧映射的情况下，必须包含MREMAP_MAYMOVE并且新内存大小等于旧内存大小
+        if mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP)
+            && (!mremap_flags.contains(MremapFlags::MREMAP_MAYMOVE) || old_len != new_len)
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        // 旧内存地址必须对齐
+        if !old_vaddr.check_aligned(MMArch::PAGE_SIZE) {
+            return Err(SystemError::EINVAL);
+        }
+
+        // 将old_len、new_len 对齐页面大小
+        let old_len = page_align_up(old_len);
+        let new_len = page_align_up(new_len);
+
+        // 不允许重映射内存区域大小为0
+        if new_len == 0 {
+            return Err(SystemError::EINVAL);
+        }
+
         let current_address_space = AddressSpace::current()?;
         let vma = current_address_space.read().mappings.contains(old_vaddr);
         if vma.is_none() {
@@ -197,66 +226,27 @@ impl Syscall {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
 
-        // 重映射到新内存区域并且不取消旧内存映射
-        if mremap_flags.contains(MremapFlags::MREMAP_FIXED | MremapFlags::MREMAP_DONTUNMAP) {
-            let r = current_address_space.write().mremap_to(
-                old_vaddr,
-                old_len,
-                new_len,
-                mremap_flags,
-                new_vaddr,
-                vm_flags,
-            )?;
-
-            return Ok(r.data());
-        }
-
         // 缩小旧内存映射区域
-        if old_len >= new_len {
-            let size = old_len - new_len;
-            if size != 0 {
-                Self::munmap(old_vaddr + new_len, old_len - new_len)?;
-            }
+        if old_len > new_len {
+            Self::munmap(old_vaddr + new_len, old_len - new_len)?;
             return Ok(old_vaddr.data());
         }
 
-        // 默认重映射
-        if mremap_flags.is_empty() {
-            let r = current_address_space.write().mremap_to(
-                old_vaddr,
-                old_len,
-                new_len,
-                mremap_flags,
-                VirtAddr::new(0),
-                vm_flags,
-            )?;
-
-            // 取消原映射
-            Self::munmap(old_vaddr, old_len)?;
-
-            return Ok(r.data());
-        }
-
         // 重映射到新内存区域
-        if mremap_flags.contains(MremapFlags::MREMAP_MAYMOVE) {
-            let r = current_address_space.write().mremap_to(
-                old_vaddr,
-                old_len,
-                new_len,
-                mremap_flags,
-                new_vaddr,
-                vm_flags,
-            )?;
+        let r = current_address_space.write().mremap_to(
+            old_vaddr,
+            old_len,
+            new_len,
+            mremap_flags,
+            new_vaddr,
+            vm_flags,
+        )?;
 
-            if !mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP) {
-                // 取消旧映射
-                Self::munmap(old_vaddr, old_len)?;
-            }
-
-            return Ok(r.data());
+        if !mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP) {
+            Self::munmap(old_vaddr, old_len)?;
         }
 
-        return Err(SystemError::EINVAL);
+        return Ok(r.data());
     }
 
     /// ## munmap系统调用

@@ -139,13 +139,13 @@ impl SysFS {
         let sys_support = sysfs_ops.support(attr);
 
         let kern_callback: &'static dyn KernFSCallback;
-        if sys_support.contains(SysFSOpsSupport::SHOW)
-            && sys_support.contains(SysFSOpsSupport::STORE)
+        if sys_support.contains(SysFSOpsSupport::ATTR_SHOW)
+            && sys_support.contains(SysFSOpsSupport::ATTR_STORE)
         {
             kern_callback = &PreallocKFOpsRW;
-        } else if sys_support.contains(SysFSOpsSupport::SHOW) {
+        } else if sys_support.contains(SysFSOpsSupport::ATTR_SHOW) {
             kern_callback = &PreallocKFOpsReadOnly;
-        } else if sys_support.contains(SysFSOpsSupport::STORE) {
+        } else if sys_support.contains(SysFSOpsSupport::ATTR_STORE) {
             kern_callback = &PreallocKFOpsWriteOnly;
         } else {
             kern_callback = &PreallocKFOpsEmpty;
@@ -250,13 +250,13 @@ impl SysFS {
         let kern_callback: &'static dyn KernFSCallback;
         let bin_support = attr.support_battr();
 
-        if bin_support.contains(SysFSOpsSupport::READ)
-            && bin_support.contains(SysFSOpsSupport::WRITE)
+        if bin_support.contains(SysFSOpsSupport::BATTR_READ)
+            && bin_support.contains(SysFSOpsSupport::BATTR_WRITE)
         {
             kern_callback = &PreallocKFOpsRW;
-        } else if bin_support.contains(SysFSOpsSupport::READ) {
+        } else if bin_support.contains(SysFSOpsSupport::BATTR_READ) {
             kern_callback = &PreallocKFOpsReadOnly;
-        } else if bin_support.contains(SysFSOpsSupport::WRITE) {
+        } else if bin_support.contains(SysFSOpsSupport::BATTR_WRITE) {
             kern_callback = &PreallocKFOpsWriteOnly;
         } else {
             kern_callback = &PreallocKFOpsEmpty;

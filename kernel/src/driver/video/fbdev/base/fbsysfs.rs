@@ -57,7 +57,7 @@ impl Attribute for AttrName {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::SHOW
+        SysFSOpsSupport::ATTR_SHOW
     }
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
@@ -81,7 +81,7 @@ impl Attribute for AttrBitsPerPixel {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::SHOW | SysFSOpsSupport::STORE
+        SysFSOpsSupport::ATTR_SHOW | SysFSOpsSupport::ATTR_STORE
     }
 
     fn store(&self, _kobj: Arc<dyn KObject>, _buf: &[u8]) -> Result<usize, SystemError> {
@@ -111,7 +111,7 @@ impl Attribute for AttrBlank {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::STORE
+        SysFSOpsSupport::ATTR_STORE
     }
 
     // todo:  https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/video/fbdev/core/fbsysfs.c#309
@@ -134,7 +134,7 @@ impl Attribute for AttrMode {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::SHOW | SysFSOpsSupport::STORE
+        SysFSOpsSupport::ATTR_SHOW | SysFSOpsSupport::ATTR_STORE
     }
 
     /// https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/video/fbdev/core/fbsysfs.c#166
@@ -161,7 +161,7 @@ impl Attribute for AttrModes {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::SHOW | SysFSOpsSupport::STORE
+        SysFSOpsSupport::ATTR_SHOW | SysFSOpsSupport::ATTR_STORE
     }
 
     /// https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/video/fbdev/core/fbsysfs.c#206
@@ -188,7 +188,7 @@ impl Attribute for AttrPan {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::SHOW | SysFSOpsSupport::STORE
+        SysFSOpsSupport::ATTR_SHOW | SysFSOpsSupport::ATTR_STORE
     }
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
@@ -217,7 +217,7 @@ impl Attribute for AttrVirtualSize {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::SHOW | SysFSOpsSupport::STORE
+        SysFSOpsSupport::ATTR_SHOW | SysFSOpsSupport::ATTR_STORE
     }
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
@@ -249,7 +249,7 @@ impl Attribute for AttrStride {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::SHOW
+        SysFSOpsSupport::ATTR_SHOW
     }
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
@@ -273,7 +273,7 @@ impl Attribute for AttrRotate {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::SHOW | SysFSOpsSupport::STORE
+        SysFSOpsSupport::ATTR_SHOW | SysFSOpsSupport::ATTR_STORE
     }
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
@@ -303,7 +303,7 @@ impl Attribute for AttrState {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::SHOW | SysFSOpsSupport::STORE
+        SysFSOpsSupport::ATTR_SHOW | SysFSOpsSupport::ATTR_STORE
     }
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {

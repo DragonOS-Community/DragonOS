@@ -60,6 +60,35 @@ impl IrqData {
     pub fn irq(&self) -> IrqNumber {
         self.irq
     }
+
+    pub fn hardware_irq(&self) -> HardwareIrqNumber {
+        self.inner.lock_irqsave().hwirq
+    }
+
+    pub fn chip(&self) -> Arc<dyn IrqChip> {
+        self.inner.lock_irqsave().chip.clone()
+    }
+
+    /// 是否为电平触发
+    pub fn is_level_type(&self) -> bool {
+        self.inner
+            .lock_irqsave()
+            .common_data
+            .inner
+            .lock()
+            .state
+            .is_level_type()
+    }
+
+    pub fn is_wakeup_set(&self) -> bool {
+        self.inner
+            .lock_irqsave()
+            .common_data
+            .inner
+            .lock()
+            .state
+            .is_wakeup_set()
+    }
 }
 
 #[allow(dead_code)]

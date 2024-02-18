@@ -51,14 +51,11 @@ dadk_clean: install_dadk
 #dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot clean target
 
 all:
-	$(MAKE) install_libc
+	mkdir -p $(ROOT_PATH)/bin/sysroot
+	
 	$(MAKE) dadk_run
 
 	@echo 用户态程序编译完成
-
-install_libc:
-	mkdir -p $(ROOT_PATH)/bin/sysroot/usr/
-	cp -r $(HOME)/opt/$(ARCH)-linux-musl-cross-gcc-9.4.0/$(ARCH)-linux-musl/* $(ROOT_PATH)/bin/sysroot/usr/
 
 .PHONY: clean
 clean: 

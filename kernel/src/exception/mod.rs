@@ -2,9 +2,17 @@ use system_error::SystemError;
 
 use crate::arch::CurrentIrqArch;
 
+pub mod dummychip;
+pub mod handle;
 pub mod init;
 pub mod ipi;
+pub mod irqchip;
+pub mod irqdata;
+pub mod irqdesc;
+pub mod irqdomain;
+pub mod msi;
 pub mod softirq;
+pub mod sysfs;
 
 /// 中断的架构相关的trait
 pub trait InterruptArch: Send + Sync {
@@ -20,6 +28,16 @@ pub trait InterruptArch: Send + Sync {
     /// 保存当前中断状态，并且禁止中断
     unsafe fn save_and_disable_irq() -> IrqFlagsGuard;
     unsafe fn restore_irq(flags: IrqFlags);
+
+    /// 检测系统支持的中断总数
+    fn probe_total_irq_num() -> u32;
+
+    fn arch_early_irq_init() -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// 响应未注册的中断
+    fn ack_bad_irq(irq: IrqNumber);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -77,3 +95,11 @@ impl Drop for IrqFlagsGuard {
         }
     }
 }
+
+// 定义中断号结构体
+// 用于表示软件逻辑视角的中断号，全局唯一
+int_like!(IrqNumber, u32);
+
+// 硬件中断号
+// 用于表示在某个IrqDomain中的中断号
+int_like!(HardwareIrqNumber, u32);

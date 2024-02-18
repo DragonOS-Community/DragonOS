@@ -4,7 +4,10 @@ use crate::{
         base::{kobject::KObject, kset::KSet},
     },
     filesystem::{
-        sysfs::{file::sysfs_emit_str, sysfs_instance, Attribute, BinAttribute, SysFSOpsSupport},
+        sysfs::{
+            file::sysfs_emit_str, sysfs_instance, Attribute, BinAttribute, SysFSOpsSupport,
+            SYSFS_ATTR_MODE_RO,
+        },
         vfs::syscall::ModeType,
     },
     libs::rwlock::RwLock,
@@ -131,11 +134,11 @@ impl Attribute for AttrForceRemove {
     }
 
     fn mode(&self) -> ModeType {
-        return ModeType::from_bits_truncate(0o444);
+        SYSFS_ATTR_MODE_RO
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        return SysFSOpsSupport::SHOW;
+        return SysFSOpsSupport::ATTR_SHOW;
     }
 
     fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
@@ -224,7 +227,7 @@ impl Attribute for AttrAcpiTable {
 
 impl BinAttribute for AttrAcpiTable {
     fn support_battr(&self) -> SysFSOpsSupport {
-        return SysFSOpsSupport::READ;
+        return SysFSOpsSupport::BATTR_READ;
     }
     fn write(
         &self,

@@ -6,7 +6,9 @@ use intertrait::cast::CastArc;
 use crate::{
     driver::base::kobject::KObject,
     filesystem::{
-        sysfs::{file::sysfs_emit_str, sysfs_instance, Attribute, SysFSOpsSupport},
+        sysfs::{
+            file::sysfs_emit_str, sysfs_instance, Attribute, SysFSOpsSupport, SYSFS_ATTR_MODE_WO,
+        },
         vfs::syscall::ModeType,
     },
     libs::wait_queue::WaitQueue,
@@ -615,7 +617,7 @@ impl Attribute for DeviceAttrStateSynced {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::SHOW
+        SysFSOpsSupport::ATTR_SHOW
     }
 }
 
@@ -628,11 +630,11 @@ impl Attribute for DeviceAttrCoredump {
     }
 
     fn mode(&self) -> ModeType {
-        ModeType::from_bits_truncate(0o200)
+        SYSFS_ATTR_MODE_WO
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::STORE
+        SysFSOpsSupport::ATTR_STORE
     }
 
     fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {

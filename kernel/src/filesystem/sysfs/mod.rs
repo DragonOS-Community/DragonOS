@@ -110,6 +110,13 @@ pub trait AttributeGroup: Debug + Send + Sync {
     fn is_visible(&self, kobj: Arc<dyn KObject>, attr: &'static dyn Attribute) -> Option<ModeType>;
 }
 
+/// sysfs只读属性文件的权限
+pub const SYSFS_ATTR_MODE_RO: ModeType = ModeType::from_bits_truncate(0o444);
+/// sysfs只写属性文件的权限
+pub const SYSFS_ATTR_MODE_WO: ModeType = ModeType::from_bits_truncate(0o200);
+/// sysfs读写属性文件的权限
+pub const SYSFS_ATTR_MODE_RW: ModeType = ModeType::from_bits_truncate(0o644);
+
 /// sysfs文件的属性
 pub trait Attribute: Debug + Send + Sync {
     fn name(&self) -> &str;
@@ -178,11 +185,11 @@ pub trait SysFSOps: Debug {
 bitflags! {
     pub struct SysFSOpsSupport: u8{
         // === for attribute ===
-        const SHOW = 1 << 0;
-        const STORE = 1 << 1;
+        const ATTR_SHOW = 1 << 0;
+        const ATTR_STORE = 1 << 1;
         // === for bin attribute ===
-        const READ = 1 << 2;
-        const WRITE = 1 << 3;
+        const BATTR_READ = 1 << 2;
+        const BATTR_WRITE = 1 << 3;
     }
 }
 

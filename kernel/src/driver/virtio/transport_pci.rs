@@ -5,7 +5,7 @@ use crate::driver::pci::pci::{
     PciStandardDeviceBar, PCI_CAP_ID_VNDR,
 };
 
-use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqMsg, IrqSpecificMsg, PciInterrupt, IRQ};
+use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqMsg, IRQ};
 use crate::include::bindings::bindings::pt_regs;
 use crate::libs::volatile::{
     volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
@@ -133,7 +133,7 @@ impl PciTransport {
             .irq_init(IRQ::PCI_IRQ_MSIX)
             .expect("IRQ init failed");
         // 中断相关信息
-        let msg = IrqMsg {
+        let msg = PciIrqMsg {
             irq_common_message: IrqCommonMsg::init_from(
                 0,
                 "Virtio_Recv_IRQ",

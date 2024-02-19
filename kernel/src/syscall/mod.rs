@@ -7,6 +7,7 @@ use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
     driver::base::device::device_number::DeviceNumber,
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
+    mm::syscall::MremapFlags,
     net::syscall::MsgHdr,
     process::{
         fork::KernelCloneArgs,
@@ -611,6 +612,15 @@ impl Syscall {
                         args[5],
                     )
                 }
+            }
+            SYS_MREMAP => {
+                let old_vaddr = VirtAddr::new(args[0]);
+                let old_len = args[1];
+                let new_len = args[2];
+                let mremap_flags = MremapFlags::from_bits_truncate(args[3] as u8);
+                let new_vaddr = VirtAddr::new(args[4]);
+
+                Self::mremap(old_vaddr, old_len, new_len, mremap_flags, new_vaddr)
             }
             SYS_MUNMAP => {
                 let addr = args[0];

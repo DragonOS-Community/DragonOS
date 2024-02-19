@@ -313,7 +313,7 @@ impl Syscall {
         }
 
         // 重映射到新内存区域
-        let r = current_address_space.write().mremap_to(
+        let r = current_address_space.write().mremap(
             old_vaddr,
             old_len,
             new_len,

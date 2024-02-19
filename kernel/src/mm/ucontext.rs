@@ -25,6 +25,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     process::ProcessManager,
+    syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
 use super::{
@@ -387,7 +388,7 @@ impl InnerAddressSpace {
     /// # Errors
     ///
     /// - `EINVAL`：参数错误
-    pub fn mremap_to(
+    pub fn mremap(
         &mut self,
         old_vaddr: VirtAddr,
         old_len: usize,
@@ -411,7 +412,7 @@ impl InnerAddressSpace {
         // 取消新内存区域的原映射
         if mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
             let start_page = VirtPageFrame::new(new_vaddr);
-            let page_count = PageFrameCount::new(new_len / MMArch::PAGE_SIZE);
+            let page_count = PageFrameCount::from_bytes(new_len).unwrap();
             self.munmap(start_page, page_count)?;
         }
 
@@ -421,22 +422,48 @@ impl InnerAddressSpace {
         let prot_flags: ProtFlags = vm_flags.into();
 
         // 获取映射后的新内存页面
-        let new_page = self.map_anonymous(new_vaddr, new_len, prot_flags, map_flags, true)?;
+        let mut new_page = self.map_anonymous(new_vaddr, new_len, prot_flags, map_flags, true)?;
         let new_page_vaddr = new_page.virt_address();
 
-        // 拷贝旧内存的页表项到新内存区域
+        // 获取旧内存区域页表项
         let entry = self.user_mapper.utable.translate(old_vaddr);
         if entry.is_none() {
             return Err(SystemError::EINVAL);
         }
         let entry = entry.unwrap();
-        let r = unsafe {
-            self.user_mapper
-                .utable
-                .map_phys(new_page_vaddr, entry.0, entry.1)
+
+        // 为新内存区域重新分配物理页
+        let page_count = PageFrameCount::from_bytes(new_len).unwrap();
+        for _ in 0..page_count.data() {
+            let unmap_flusher =
+                unsafe { self.user_mapper.utable.unmap(new_page.virt_address(), true) };
+            if let Some(flusher) = unmap_flusher {
+                flusher.flush();
+            }
+
+            let map_flusher = unsafe {
+                self.user_mapper
+                    .utable
+                    .map(new_page.virt_address(), entry.1)
+            };
+            if let Some(flusher) = map_flusher {
+                flusher.flush();
+            }
+
+            new_page = new_page.next();
         }
-        .expect("Failed to map phys, may be OOM error");
-        r.flush();
+
+        // 拷贝旧内存区域内容到新内存区域
+        let old_buffer_reader =
+            UserBufferReader::new(old_vaddr.data() as *const u8, old_len, true)?;
+        let old_buf: &[u8] = old_buffer_reader.read_from_user(0)?;
+        let mut new_buffer_writer =
+            UserBufferWriter::new(new_page_vaddr.data() as *mut u8, new_len, true)?;
+        let new_buf: &mut [u8] = new_buffer_writer.buffer(0)?;
+        let len = old_buf.len().min(new_buf.len());
+        for i in 0..len {
+            new_buf[i] = old_buf[i];
+        }
 
         return Ok(new_page_vaddr);
     }

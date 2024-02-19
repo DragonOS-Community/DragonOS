@@ -598,11 +598,6 @@ impl Syscall {
                 let mremap_flags = MremapFlags::from_bits_truncate(args[3] as u8);
                 let new_vaddr = VirtAddr::new(args[4]);
 
-                // 不允许有MemapFlags不包含的bit
-                if args[3] > 7 {
-                    return Err(SystemError::EINVAL);
-                }
-
                 Self::mremap(old_vaddr, old_len, new_len, mremap_flags, new_vaddr)
             }
             SYS_MUNMAP => {

@@ -422,36 +422,8 @@ impl InnerAddressSpace {
         let prot_flags: ProtFlags = vm_flags.into();
 
         // 获取映射后的新内存页面
-        let mut new_page = self.map_anonymous(new_vaddr, new_len, prot_flags, map_flags, true)?;
+        let new_page = self.map_anonymous(new_vaddr, new_len, prot_flags, map_flags, true)?;
         let new_page_vaddr = new_page.virt_address();
-
-        // 获取旧内存区域页表项
-        let entry = self.user_mapper.utable.translate(old_vaddr);
-        if entry.is_none() {
-            return Err(SystemError::EINVAL);
-        }
-        let entry = entry.unwrap();
-
-        // 为新内存区域重新分配物理页
-        let page_count = PageFrameCount::from_bytes(new_len).unwrap();
-        for _ in 0..page_count.data() {
-            let unmap_flusher =
-                unsafe { self.user_mapper.utable.unmap(new_page.virt_address(), true) };
-            if let Some(flusher) = unmap_flusher {
-                flusher.flush();
-            }
-
-            let map_flusher = unsafe {
-                self.user_mapper
-                    .utable
-                    .map(new_page.virt_address(), entry.1)
-            };
-            if let Some(flusher) = map_flusher {
-                flusher.flush();
-            }
-
-            new_page = new_page.next();
-        }
 
         // 拷贝旧内存区域内容到新内存区域
         let old_buffer_reader =

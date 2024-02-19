@@ -303,7 +303,7 @@ impl Syscall {
         // 暂时不支持巨页映射
         if vm_flags.contains(VmFlags::VM_HUGETLB) {
             kerror!("mmap: not support huge page mapping");
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::ENOSYS);
         }
 
         // 缩小旧内存映射区域

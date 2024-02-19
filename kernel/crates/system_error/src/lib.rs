@@ -270,7 +270,7 @@ pub enum SystemError {
     ENOTRECOVERABLE = 131,
     /// 由于射频终止，无法操作 Operation not possible due to RF-kill
     ERFKILL = 132,
-    /// Memory page has hardware error
+    /// 内存页面有硬件错误 Memory page has hardware error
     EHWPOISON = 133,
 
     // === 以下错误码不应该被用户态程序使用 ===

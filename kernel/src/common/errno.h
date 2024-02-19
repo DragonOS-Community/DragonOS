@@ -142,4 +142,4 @@
 #define EOWNERDEAD 130      /* 之前的拥有者挂了 Previous owner died. */
 #define ENOTRECOVERABLE 131 /* 状态不可恢复 State not recoverable. */
 #define ERFKILL 132         /* 由于射频终止，无法操作 Operation not possible due to RF-kill */
-#define EHWPOISON 132       /*  */
+#define EHWPOISON 132       /* 内存页面有硬件错误 Memory page has hardware error */

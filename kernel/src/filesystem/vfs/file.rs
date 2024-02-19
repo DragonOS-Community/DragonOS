@@ -226,10 +226,6 @@ impl File {
         if buf.len() < len {
             return Err(SystemError::ENOBUFS);
         }
-        // 如果文件指针已经超过了文件大小，则返回0
-        if offset > self.inode.metadata()?.size as usize {
-            return Ok(0);
-        }
 
         let len = self
             .inode

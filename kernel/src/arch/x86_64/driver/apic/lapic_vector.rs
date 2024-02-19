@@ -77,6 +77,7 @@ struct ApicChipData {
 }
 
 impl ApicChipData {
+    #[allow(dead_code)]
     pub fn new(
         hw_irq_cfg: HardwareIrqConfig,
         irq: IrqNumber,
@@ -101,6 +102,7 @@ impl ApicChipData {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 struct InnerApicChipData {
     hw_irq_cfg: HardwareIrqConfig,
@@ -165,6 +167,7 @@ pub(super) fn irq_msi_compose_msg(cfg: &HardwareIrqConfig, msg: &mut MsiMsg, dma
 static mut X86_VECTOR_DOMAIN: Option<Arc<IrqDomain>> = None;
 
 #[inline(always)]
+#[allow(dead_code)]
 pub fn x86_vector_domain() -> &'static Arc<IrqDomain> {
     unsafe { X86_VECTOR_DOMAIN.as_ref().unwrap() }
 }
@@ -179,33 +182,38 @@ pub fn arch_early_irq_init() -> Result<(), SystemError> {
     unsafe { X86_VECTOR_DOMAIN = Some(vec_domain) };
 
     // todo: add vector matrix
+    // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/apic/vector.c#803
     kwarn!("arch_early_irq_init: todo: add vector matrix");
-    todo!("arch_early_irq_init");
+
+    return Ok(());
 }
 
+/// x86的中断域操作
+///
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/apic/vector.c#693
 #[derive(Debug)]
 struct X86VectorDomainOps;
 
 impl IrqDomainOps for X86VectorDomainOps {
     fn match_node(
         &self,
-        irq_domain: &Arc<IrqDomain>,
-        device_node: &Arc<DeviceNode>,
-        bus_token: IrqDomainBusToken,
+        _irq_domain: &Arc<IrqDomain>,
+        _device_node: &Arc<DeviceNode>,
+        _bus_token: IrqDomainBusToken,
     ) -> bool {
         todo!()
     }
 
     fn map(
         &self,
-        irq_domain: &Arc<IrqDomain>,
-        hwirq: HardwareIrqNumber,
-        virq: IrqNumber,
+        _irq_domain: &Arc<IrqDomain>,
+        _hwirq: HardwareIrqNumber,
+        _virq: IrqNumber,
     ) -> Result<(), SystemError> {
         todo!()
     }
 
-    fn unmap(&self, irq_domain: &Arc<IrqDomain>, virq: IrqNumber) {
+    fn unmap(&self, _irq_domain: &Arc<IrqDomain>, _virq: IrqNumber) {
         todo!()
     }
 }

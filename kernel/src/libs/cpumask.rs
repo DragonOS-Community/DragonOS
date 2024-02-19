@@ -1,6 +1,6 @@
 use bitmap::{traits::BitMapOps, AllocBitmap};
 
-use crate::mm::percpu::PerCpu;
+use crate::{mm::percpu::PerCpu, smp::cpu::ProcessorId};
 
 pub struct CpuMask {
     bmp: AllocBitmap,
@@ -9,40 +9,50 @@ pub struct CpuMask {
 #[allow(dead_code)]
 impl CpuMask {
     pub fn new() -> Self {
-        let bmp = AllocBitmap::new(PerCpu::MAX_CPU_NUM);
+        let bmp = AllocBitmap::new(PerCpu::MAX_CPU_NUM as usize);
         Self { bmp }
     }
 
     /// 获取CpuMask中的第一个cpu
-    pub fn first(&self) -> Option<usize> {
-        self.bmp.first_index()
+    pub fn first(&self) -> Option<ProcessorId> {
+        self.bmp
+            .first_index()
+            .map(|index| ProcessorId::new(index as u32))
     }
 
     /// 获取CpuMask中第一个未被置位的cpu
-    pub fn first_zero(&self) -> Option<usize> {
-        self.bmp.first_false_index()
+    pub fn first_zero(&self) -> Option<ProcessorId> {
+        self.bmp
+            .first_false_index()
+            .map(|index| ProcessorId::new(index as u32))
     }
 
     /// 获取CpuMask中的最后一个被置位的cpu
-    pub fn last(&self) -> Option<usize> {
-        self.bmp.last_index()
+    pub fn last(&self) -> Option<ProcessorId> {
+        self.bmp
+            .last_index()
+            .map(|index| ProcessorId::new(index as u32))
     }
 
     /// 获取指定cpu之后第一个为1的位的cpu
-    pub fn next_index(&self, cpu: usize) -> Option<usize> {
-        self.bmp.next_index(cpu)
+    pub fn next_index(&self, cpu: ProcessorId) -> Option<ProcessorId> {
+        self.bmp
+            .next_index(cpu.data() as usize)
+            .map(|index| ProcessorId::new(index as u32))
     }
 
     /// 获取指定cpu之后第一个为未被置位的cpu
-    pub fn next_zero_index(&self, cpu: usize) -> Option<usize> {
-        self.bmp.next_false_index(cpu)
+    pub fn next_zero_index(&self, cpu: ProcessorId) -> Option<ProcessorId> {
+        self.bmp
+            .next_false_index(cpu.data() as usize)
+            .map(|index| ProcessorId::new(index as u32))
     }
 
     /// 迭代所有被置位的cpu
     pub fn iter_cpu(&self) -> CpuMaskIter {
         CpuMaskIter {
             mask: self,
-            index: 0,
+            index: ProcessorId::new(0),
             set: true,
         }
     }
@@ -51,7 +61,7 @@ impl CpuMask {
     pub fn iter_zero_cpu(&self) -> CpuMaskIter {
         CpuMaskIter {
             mask: self,
-            index: 0,
+            index: ProcessorId::new(0),
             set: false,
         }
     }
@@ -59,15 +69,15 @@ impl CpuMask {
 
 pub struct CpuMaskIter<'a> {
     mask: &'a CpuMask,
-    index: usize,
+    index: ProcessorId,
     set: bool,
 }
 
 impl<'a> Iterator for CpuMaskIter<'a> {
-    type Item = usize;
+    type Item = ProcessorId;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.index == 0 {
+    fn next(&mut self) -> Option<ProcessorId> {
+        if self.index.data() == 0 {
             if self.set {
                 self.index = self.mask.first()?;
             } else {

@@ -77,7 +77,7 @@ pub enum SystemError {
     /// 结果过大 Result too large.
     ERANGE = 34,
     /// 资源死锁将要发生 Resource deadlock would occur.
-    EDEADLK = 35,
+    EDEADLK_OR_EDEADLOCK = 35,
     /// 文件名过长 Filename too long.
     ENAMETOOLONG = 36,
     /// 没有可用的锁 No locks available.
@@ -120,8 +120,6 @@ pub enum SystemError {
     EBADRQC = 56,
     /// 无效插槽 Invalid slot
     EBADSLT = 57,
-    /// 资源死锁 Resource deadlock would occur
-    EDEADLOCK = 58,
     /// 错误的字体文件格式 Bad font file format
     EBFONT = 59,
     /// 不是STREAM Not a STREAM

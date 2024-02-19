@@ -17,14 +17,14 @@ use crate::{
     libs::rwlock::RwLock,
     mm::percpu::{PerCpu, PerCpuVar},
     process::ProcessManager,
-    smp::core::smp_get_processor_id,
+    smp::{core::smp_get_processor_id, cpu::ProcessorId},
     time::timer::clock,
 };
 
 const MAX_SOFTIRQ_NUM: u64 = 64;
 const MAX_SOFTIRQ_RESTART: i32 = 20;
 
-static mut __CPU_PENDING: Option<Box<[VecStatus; PerCpu::MAX_CPU_NUM]>> = None;
+static mut __CPU_PENDING: Option<Box<[VecStatus; PerCpu::MAX_CPU_NUM as usize]>> = None;
 static mut __SORTIRQ_VECTORS: *mut Softirq = null_mut();
 
 #[no_mangle]
@@ -57,9 +57,9 @@ pub fn softirq_vectors() -> &'static mut Softirq {
 }
 
 #[inline(always)]
-fn cpu_pending(cpu_id: usize) -> &'static mut VecStatus {
+fn cpu_pending(cpu_id: ProcessorId) -> &'static mut VecStatus {
     unsafe {
-        return &mut __CPU_PENDING.as_mut().unwrap()[cpu_id];
+        return &mut __CPU_PENDING.as_mut().unwrap()[cpu_id.data() as usize];
     }
 }
 
@@ -176,7 +176,7 @@ impl Softirq {
         // self.running.lock().set(VecStatus::from(softirq_num), false);
         // 将对应CPU的pending置0
         compiler_fence(Ordering::SeqCst);
-        cpu_pending(smp_get_processor_id() as usize).set(VecStatus::from(softirq_num), false);
+        cpu_pending(smp_get_processor_id()).set(VecStatus::from(softirq_num), false);
         compiler_fence(Ordering::SeqCst);
     }
 
@@ -194,8 +194,8 @@ impl Softirq {
         let mut max_restart = MAX_SOFTIRQ_RESTART;
         loop {
             compiler_fence(Ordering::SeqCst);
-            let pending = cpu_pending(cpu_id as usize).bits;
-            cpu_pending(cpu_id as usize).bits = 0;
+            let pending = cpu_pending(cpu_id).bits;
+            cpu_pending(cpu_id).bits = 0;
             compiler_fence(Ordering::SeqCst);
 
             unsafe { CurrentIrqArch::interrupt_enable() };
@@ -229,7 +229,7 @@ impl Softirq {
             unsafe { CurrentIrqArch::interrupt_disable() };
             max_restart -= 1;
             compiler_fence(Ordering::SeqCst);
-            if cpu_pending(cpu_id as usize).is_empty() {
+            if cpu_pending(cpu_id).is_empty() {
                 compiler_fence(Ordering::SeqCst);
                 if clock() < end && max_restart > 0 {
                     continue;
@@ -245,7 +245,7 @@ impl Softirq {
 
     pub fn raise_softirq(&self, softirq_num: SoftirqNumber) {
         let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        let processor_id = smp_get_processor_id() as usize;
+        let processor_id = smp_get_processor_id();
 
         cpu_pending(processor_id).insert(VecStatus::from(softirq_num));
 
@@ -256,7 +256,7 @@ impl Softirq {
     }
     pub unsafe fn clear_softirq_pending(&self, softirq_num: SoftirqNumber) {
         compiler_fence(Ordering::SeqCst);
-        cpu_pending(smp_get_processor_id() as usize).remove(VecStatus::from(softirq_num));
+        cpu_pending(smp_get_processor_id()).remove(VecStatus::from(softirq_num));
         compiler_fence(Ordering::SeqCst);
     }
 }

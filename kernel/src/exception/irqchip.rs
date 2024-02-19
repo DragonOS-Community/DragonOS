@@ -6,7 +6,10 @@ use alloc::{
 };
 use system_error::SystemError;
 
-use crate::{libs::spinlock::SpinLock, mm::VirtAddr};
+use crate::{
+    libs::{casting::DowncastArc, spinlock::SpinLock},
+    mm::VirtAddr,
+};
 
 use super::{
     irqdata::{IrqData, IrqLineStatus},
@@ -52,7 +55,9 @@ pub trait IrqChip: Sync + Send + Any + Debug {
     // todo: set affinity
 
     /// retrigger an IRQ to the CPU
-    fn retrigger(&self, _irq: &Arc<IrqData>) {}
+    fn retrigger(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 
     /// set the flow type of an interrupt
     ///
@@ -108,6 +113,8 @@ pub trait IrqChip: Sync + Send + Any + Debug {
     fn irq_release_resources(&self, _irq: &Arc<IrqData>) {}
 
     /// optional to compose message content for MSI
+    ///
+    /// 组装MSI消息并返回到msg中
     fn irq_compose_msi_msg(&self, _irq: &Arc<IrqData>, _msg: &mut MsiMsg) {}
 
     /// optional to write message content for MSI

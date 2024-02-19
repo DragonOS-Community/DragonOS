@@ -7,6 +7,7 @@ use crate::kdebug;
 use crate::mm::percpu::PerCpu;
 use crate::sched::core::sched_update_jiffies;
 use crate::smp::core::smp_get_processor_id;
+use crate::smp::cpu::ProcessorId;
 use crate::time::clocksource::HZ;
 pub use drop;
 use system_error::SystemError;
@@ -16,27 +17,29 @@ use x86::msr::{wrmsr, IA32_X2APIC_DIV_CONF, IA32_X2APIC_INIT_COUNT};
 use super::xapic::XApicOffset;
 use super::{CurrentApic, LVTRegister, LocalAPIC, LVT};
 
-static mut LOCAL_APIC_TIMERS: [RefCell<LocalApicTimer>; PerCpu::MAX_CPU_NUM] =
-    [const { RefCell::new(LocalApicTimer::new()) }; PerCpu::MAX_CPU_NUM];
+static mut LOCAL_APIC_TIMERS: [RefCell<LocalApicTimer>; PerCpu::MAX_CPU_NUM as usize] =
+    [const { RefCell::new(LocalApicTimer::new()) }; PerCpu::MAX_CPU_NUM as usize];
 
 #[inline(always)]
-pub(super) fn local_apic_timer_instance(cpu_id: u32) -> core::cell::Ref<'static, LocalApicTimer> {
-    unsafe { LOCAL_APIC_TIMERS[cpu_id as usize].borrow() }
+pub(super) fn local_apic_timer_instance(
+    cpu_id: ProcessorId,
+) -> core::cell::Ref<'static, LocalApicTimer> {
+    unsafe { LOCAL_APIC_TIMERS[cpu_id.data() as usize].borrow() }
 }
 
 #[inline(always)]
 pub(super) fn local_apic_timer_instance_mut(
-    cpu_id: u32,
+    cpu_id: ProcessorId,
 ) -> core::cell::RefMut<'static, LocalApicTimer> {
-    unsafe { LOCAL_APIC_TIMERS[cpu_id as usize].borrow_mut() }
+    unsafe { LOCAL_APIC_TIMERS[cpu_id.data() as usize].borrow_mut() }
 }
 
 /// 初始化BSP的APIC定时器
 ///
 fn init_bsp_apic_timer() {
     kdebug!("init_bsp_apic_timer");
-    assert!(smp_get_processor_id() == 0);
-    let mut local_apic_timer = local_apic_timer_instance_mut(0);
+    assert!(smp_get_processor_id().data() == 0);
+    let mut local_apic_timer = local_apic_timer_instance_mut(ProcessorId::new(0));
     local_apic_timer.init(
         LocalApicTimerMode::Periodic,
         LocalApicTimer::periodic_default_initial_count(),
@@ -48,7 +51,7 @@ fn init_bsp_apic_timer() {
 fn init_ap_apic_timer() {
     kdebug!("init_ap_apic_timer");
     let cpu_id = smp_get_processor_id();
-    assert!(cpu_id != 0);
+    assert!(cpu_id.data() != 0);
 
     let mut local_apic_timer = local_apic_timer_instance_mut(cpu_id);
     local_apic_timer.init(
@@ -64,7 +67,7 @@ pub(super) struct LocalApicTimerIntrController;
 impl LocalApicTimerIntrController {
     pub(super) fn install(&self, _irq_num: u8) {
         kdebug!("LocalApicTimerIntrController::install");
-        if smp_get_processor_id() == 0 {
+        if smp_get_processor_id().data() == 0 {
             init_bsp_apic_timer();
         } else {
             init_ap_apic_timer();

@@ -18,6 +18,88 @@ use super::{
     HardwareIrqNumber, IrqNumber,
 };
 
+static mut IRQ_DOMAIN_MANAGER: Option<Arc<IrqDomainManager>> = None;
+
+/// 获取中断域管理器的引用
+#[inline(always)]
+pub fn irq_domain_manager() -> &'static Arc<IrqDomainManager> {
+    unsafe { IRQ_DOMAIN_MANAGER.as_ref().unwrap() }
+}
+
+pub(super) fn irq_domain_manager_init() {
+    unsafe {
+        IRQ_DOMAIN_MANAGER = Some(Arc::new(IrqDomainManager::new()));
+    }
+}
+/// 中断域管理器
+pub struct IrqDomainManager {
+    domains: SpinLock<Vec<Arc<IrqDomain>>>,
+    inner: RwLock<InnerIrqDomainManager>,
+}
+
+impl IrqDomainManager {
+    pub fn new() -> IrqDomainManager {
+        IrqDomainManager {
+            domains: SpinLock::new(Vec::new()),
+            inner: RwLock::new(InnerIrqDomainManager {
+                default_domain: None,
+            }),
+        }
+    }
+
+    /// 创建一个新的irqdomain, 并将其添加到irqdomain管理器中
+    ///
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/irq/irqdomain.c?fi=__irq_domain_add#139
+    pub fn create_and_add(
+        &self,
+        name: String,
+        ops: &'static dyn IrqDomainOps,
+        hwirq_max: HardwareIrqNumber,
+    ) -> Arc<IrqDomain> {
+        let domain = IrqDomain::new(
+            None,
+            Some(name),
+            ops,
+            IrqDomainFlags::NAME_ALLOCATED,
+            IrqDomainBusToken::Any,
+        )
+        .unwrap();
+        domain.set_hwirq_max(hwirq_max);
+        self.add_domain(domain.clone());
+
+        return domain;
+    }
+
+    fn add_domain(&self, domain: Arc<IrqDomain>) {
+        self.domains.lock_irqsave().push(domain);
+    }
+
+    pub fn remove_domain(&self, domain: &Arc<IrqDomain>) {
+        let mut domains = self.domains.lock_irqsave();
+        let index = domains
+            .iter()
+            .position(|x| Arc::ptr_eq(x, domain))
+            .expect("domain not found");
+        domains.remove(index);
+    }
+
+    /// 获取默认的中断域
+    pub fn default_domain(&self) -> Option<Arc<IrqDomain>> {
+        self.inner.read().default_domain.clone()
+    }
+
+    /// 设置默认的中断域
+    ///
+    /// 在创建IRQ映射的时候，如果没有指定中断域，就会使用默认的中断域
+    pub fn set_default_domain(&self, domain: Arc<IrqDomain>) {
+        self.inner.write_irqsave().default_domain = Some(domain);
+    }
+}
+
+struct InnerIrqDomainManager {
+    default_domain: Option<Arc<IrqDomain>>,
+}
+
 /// 中断域
 ///
 /// 用于把硬件中断号翻译为软件中断号的映射的对象
@@ -87,6 +169,10 @@ impl IrqDomain {
         };
 
         return Some(Arc::new(x));
+    }
+
+    fn set_hwirq_max(&self, hwirq_max: HardwareIrqNumber) {
+        self.revmap.write_irqsave().hwirq_max = hwirq_max;
     }
 }
 

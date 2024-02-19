@@ -1,6 +1,7 @@
 mod c_adapter;
 pub(super) mod entry;
 pub mod ipi;
+pub mod msi;
 pub mod trap;
 
 use core::{
@@ -20,7 +21,7 @@ use self::entry::setup_interrupt_gate;
 
 use super::{
     asm::irqflags::{local_irq_restore, local_irq_save},
-    driver::apic::{CurrentApic, LocalAPIC},
+    driver::apic::{lapic_vector::arch_early_irq_init, CurrentApic, LocalAPIC},
 };
 
 /// @brief 关闭中断
@@ -89,6 +90,10 @@ impl InterruptArch for X86_64InterruptArch {
     fn ack_bad_irq(irq: IrqNumber) {
         kerror!("Unexpected IRQ trap at vector {}", irq.data());
         CurrentApic.send_eoi();
+    }
+
+    fn arch_early_irq_init() -> Result<(), SystemError> {
+        arch_early_irq_init()
     }
 }
 

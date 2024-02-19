@@ -6,15 +6,20 @@ use crate::{
         driver::apic::{CurrentApic, LocalAPIC},
         smp::SMP_BOOT_DATA,
     },
-    exception::ipi::{IpiKind, IpiTarget},
+    exception::{
+        ipi::{IpiKind, IpiTarget},
+        HardwareIrqNumber,
+    },
+    smp::cpu::ProcessorId,
 };
 
 /// IPI的种类(架构相关，指定了向量号)
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-#[repr(u8)]
+#[repr(u32)]
 pub enum ArchIpiKind {
     KickCpu = 200,
     FlushTLB = 201,
+    SpecVector(HardwareIrqNumber),
 }
 
 impl From<IpiKind> for ArchIpiKind {
@@ -22,6 +27,17 @@ impl From<IpiKind> for ArchIpiKind {
         match kind {
             IpiKind::KickCpu => ArchIpiKind::KickCpu,
             IpiKind::FlushTLB => ArchIpiKind::FlushTLB,
+            IpiKind::SpecVector(vec) => ArchIpiKind::SpecVector(vec),
+        }
+    }
+}
+
+impl Into<u8> for ArchIpiKind {
+    fn into(self) -> u8 {
+        match self {
+            ArchIpiKind::KickCpu => 200,
+            ArchIpiKind::FlushTLB => 201,
+            ArchIpiKind::SpecVector(vec) => (vec.data() & 0xFF) as u8,
         }
     }
 }
@@ -46,7 +62,7 @@ impl From<IpiTarget> for ArchIpiTarget {
             IpiTarget::All => ArchIpiTarget::All,
             IpiTarget::Other => ArchIpiTarget::Other,
             IpiTarget::Specified(cpu_id) => {
-                ArchIpiTarget::Specified(Self::cpu_id_to_apic_id(cpu_id as u32))
+                ArchIpiTarget::Specified(Self::cpu_id_to_apic_id(cpu_id))
             }
         }
     }
@@ -78,11 +94,11 @@ impl ArchIpiTarget {
     }
 
     #[inline(always)]
-    fn cpu_id_to_apic_id(cpu_id: u32) -> x86::apic::ApicId {
+    fn cpu_id_to_apic_id(cpu_id: ProcessorId) -> x86::apic::ApicId {
         if CurrentApic.x2apic_enabled() {
-            x86::apic::ApicId::X2Apic(cpu_id as u32)
+            x86::apic::ApicId::X2Apic(cpu_id.data() as u32)
         } else {
-            x86::apic::ApicId::XApic(cpu_id as u8)
+            x86::apic::ApicId::XApic(cpu_id.data() as u8)
         }
     }
 }
@@ -102,7 +118,7 @@ impl Into<x86::apic::DestinationShorthand> for ArchIpiTarget {
 pub fn send_ipi(kind: IpiKind, target: IpiTarget) {
     // kdebug!("send_ipi: {:?} {:?}", kind, target);
 
-    let ipi_vec = ArchIpiKind::from(kind) as u8;
+    let ipi_vec = ArchIpiKind::from(kind).into();
     let target = ArchIpiTarget::from(target);
     let shorthand: x86::apic::DestinationShorthand = target.into();
     let destination: x86::apic::ApicId = target.into();
@@ -170,11 +186,11 @@ pub fn ipi_send_smp_init() -> Result<(), SystemError> {
 /// ## 参数
 ///
 /// * `target_cpu` - 目标CPU
-pub fn ipi_send_smp_startup(target_cpu: u32) -> Result<(), SystemError> {
-    if target_cpu as usize >= SMP_BOOT_DATA.cpu_count() {
+pub fn ipi_send_smp_startup(target_cpu: ProcessorId) -> Result<(), SystemError> {
+    if target_cpu.data() as usize >= SMP_BOOT_DATA.cpu_count() {
         return Err(SystemError::EINVAL);
     }
-    let target: ArchIpiTarget = IpiTarget::Specified(target_cpu as usize).into();
+    let target: ArchIpiTarget = IpiTarget::Specified(target_cpu).into();
 
     let icr = if CurrentApic.x2apic_enabled() {
         x86::apic::Icr::for_x2apic(

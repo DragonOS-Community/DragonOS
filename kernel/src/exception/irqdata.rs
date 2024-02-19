@@ -89,6 +89,10 @@ impl IrqData {
             .state
             .is_wakeup_set()
     }
+
+    pub fn chip_data(&self) -> Option<Arc<dyn IrqChipData>> {
+        self.inner.lock_irqsave().chip_data.clone()
+    }
 }
 
 #[allow(dead_code)]

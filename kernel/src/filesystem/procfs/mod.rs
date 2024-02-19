@@ -157,7 +157,7 @@ impl ProcFSInode {
         let state = sched_info_guard.inner_lock_read_irqsave().state();
         let cpu_id = sched_info_guard
             .on_cpu()
-            .map(|cpu| cpu as i32)
+            .map(|cpu| cpu.data() as i32)
             .unwrap_or(-1);
 
         let priority = sched_info_guard.priority();

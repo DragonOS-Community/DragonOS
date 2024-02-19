@@ -1,9 +1,14 @@
+use crate::smp::cpu::ProcessorId;
+
+use super::HardwareIrqNumber;
+
 #[allow(dead_code)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-#[repr(u8)]
 pub enum IpiKind {
     KickCpu,
     FlushTLB,
+    /// 指定中断向量号
+    SpecVector(HardwareIrqNumber),
 }
 
 /// IPI投递目标
@@ -17,5 +22,5 @@ pub enum IpiTarget {
     /// 除了当前CPU以外的所有CPU
     Other,
     /// 指定的CPU
-    Specified(usize),
+    Specified(ProcessorId),
 }

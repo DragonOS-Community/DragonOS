@@ -36,8 +36,8 @@ impl BlockData {
 /// @brief块迭代器，它获取需求（起始块，连续块的个数），并将连续的块输出为单一的块（如你需要读取lba_id为10~20的连续块，它就可以输出10,11...,20的BlockData）
 #[derive(Copy, Clone)]
 pub struct BlockIter {
-    //表示起始块的iba_id
-    iba_id_start: BlockId,
+    //表示起始块的lba_id
+    lba_id_start: BlockId,
     //表示从起始块开始你需要读多少个块
     count: usize,
     //表示当前遍历到第几个块了
@@ -49,7 +49,7 @@ pub struct BlockIter {
 impl BlockIter {
     pub fn new(lba_id_start: usize, count: usize, block_size: usize) -> Self {
         Self {
-            iba_id_start: lba_id_start,
+            lba_id_start,
             count,
             block_size,
             current: 0,
@@ -63,7 +63,7 @@ impl Iterator for BlockIter {
     fn next(&mut self) -> Option<Self::Item> {
         if self.current < self.count {
             let ans = BlockData::new(
-                self.iba_id_start + self.current,
+                self.lba_id_start + self.current,
                 self.current * self.block_size,
                 self.block_size,
             );

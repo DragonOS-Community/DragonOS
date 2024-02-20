@@ -70,7 +70,7 @@ pub enum IrqType {
 
 // PCI设备install中断时需要传递的参数
 #[derive(Clone, Debug)]
-pub struct IrqMsg {
+pub struct PciIrqMsg {
     pub irq_common_message: IrqCommonMsg,
     pub irq_specific_message: IrqSpecificMsg,
 }
@@ -301,7 +301,7 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @param self PCI设备的可变引用
     /// @param msg PCI设备install中断时需要传递的共同参数
     /// @return 一切正常返回Ok(0),有错误返回对应错误原因
-    fn irq_install(&mut self, msg: IrqMsg) -> Result<u8, PciError> {
+    fn irq_install(&mut self, msg: PciIrqMsg) -> Result<u8, PciError> {
         if let Some(irq_vector) = self.irq_vector_mut() {
             if msg.irq_common_message.irq_index as usize > irq_vector.len() {
                 return Err(PciError::PciIrqError(PciIrqError::InvalidIrqIndex(
@@ -332,7 +332,7 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @param self PCI设备的可变引用
     /// @param msg PCI设备install中断时需要传递的共同参数
     /// @return 一切正常返回Ok(0),有错误返回对应错误原因
-    fn msi_install(&mut self, msg: IrqMsg) -> Result<u8, PciError> {
+    fn msi_install(&mut self, msg: PciIrqMsg) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
             match *irq_type {
                 IrqType::Msi {
@@ -482,7 +482,7 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @param self PCI设备的可变引用
     /// @param msg PCI设备install中断时需要传递的共同参数
     /// @return 一切正常返回Ok(0),有错误返回对应错误原因
-    fn msix_install(&mut self, msg: IrqMsg) -> Result<u8, PciError> {
+    fn msix_install(&mut self, msg: PciIrqMsg) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
             match *irq_type {
                 IrqType::Msix {

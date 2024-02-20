@@ -12,7 +12,8 @@ use system_error::SystemError;
 
 use crate::{
     arch::CurrentIrqArch,
-    exception::{InterruptArch, IrqFlags, IrqFlagsGuard},
+    exception::{InterruptArch, IrqFlags, IrqFlagsGuard, IrqNumber},
+    kerror,
 };
 
 use self::entry::setup_interrupt_gate;
@@ -77,6 +78,17 @@ impl InterruptArch for X86_64InterruptArch {
         compiler_fence(Ordering::SeqCst);
         local_irq_restore(flags.flags());
         compiler_fence(Ordering::SeqCst);
+    }
+
+    fn probe_total_irq_num() -> u32 {
+        // todo: 从APIC获取
+        // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/apic/vector.c?r=&mo=19514&fi=704#704
+        256
+    }
+
+    fn ack_bad_irq(irq: IrqNumber) {
+        kerror!("Unexpected IRQ trap at vector {}", irq.data());
+        CurrentApic.send_eoi();
     }
 }
 

@@ -711,7 +711,7 @@ impl DeviceManager {
     ) -> Result<(), SystemError> {
         if unlikely(
             attr.mode().contains(ModeType::S_IRUGO)
-                && (!attr.support().contains(SysFSOpsSupport::SHOW)),
+                && (!attr.support().contains(SysFSOpsSupport::ATTR_SHOW)),
         ) {
             kwarn!(
                 "Attribute '{}': read permission without 'show'",
@@ -720,7 +720,7 @@ impl DeviceManager {
         }
         if unlikely(
             attr.mode().contains(ModeType::S_IWUGO)
-                && (!attr.support().contains(SysFSOpsSupport::STORE)),
+                && (!attr.support().contains(SysFSOpsSupport::ATTR_STORE)),
         ) {
             kwarn!(
                 "Attribute '{}': write permission without 'store'",
@@ -847,7 +847,7 @@ impl Attribute for DeviceAttrDev {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::SHOW
+        SysFSOpsSupport::ATTR_SHOW
     }
 }
 
@@ -871,5 +871,47 @@ impl DeviceMatcher<&str> for DeviceMatchName {
     #[inline]
     fn match_device(&self, device: &Arc<dyn Device>, data: &str) -> bool {
         return device.name() == data;
+    }
+}
+
+/// Cookie to identify the device
+#[derive(Debug, Clone)]
+pub struct DeviceId {
+    data: Option<&'static str>,
+    allocated: Option<String>,
+}
+
+impl DeviceId {
+    #[allow(dead_code)]
+    pub fn new(data: Option<&'static str>, allocated: Option<String>) -> Option<Self> {
+        if data.is_none() && allocated.is_none() {
+            return None;
+        }
+
+        // 如果data和allocated都有值，那么返回None
+        if data.is_some() && allocated.is_some() {
+            return None;
+        }
+
+        return Some(Self { data, allocated });
+    }
+
+    pub fn id(&self) -> Option<&str> {
+        if self.data.is_some() {
+            return Some(self.data.unwrap());
+        } else {
+            return self.allocated.as_deref();
+        }
+    }
+
+    pub fn set_allocated(&mut self, allocated: String) {
+        self.allocated = Some(allocated);
+        self.data = None;
+    }
+}
+
+impl PartialEq for DeviceId {
+    fn eq(&self, other: &Self) -> bool {
+        return self.id() == other.id();
     }
 }

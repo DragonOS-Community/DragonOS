@@ -1,5 +1,19 @@
 #!/bin/bash
-CURRENT_SHELL=$(basename $SHELL)
+
+if test -n "$ZSH_VERSION"; then
+  CURRENT_SHELL=zsh
+elif test -n "$BASH_VERSION"; then
+  CURRENT_SHELL=bash
+elif test -n "$KSH_VERSION"; then
+  CURRENT_SHELL=ksh
+elif test -n "$FCEDIT"; then
+  CURRENT_SHELL=ksh
+elif test -n "$PS3"; then
+  CURRENT_SHELL=unknown
+else
+  CURRENT_SHELL=sh
+fi
+
 source "$HOME/.$CURRENT_SHELL"rc
 
 ABS_PREFIX=/opt/dragonos-grub

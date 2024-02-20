@@ -17,7 +17,10 @@ use alloc::{sync::Arc, vec::Vec};
 use core::any::Any;
 use system_error::SystemError;
 
-use super::{cache::{cached_block_device::BlockCache, BlockCacheError, BLOCK_SIZE}, disk_info::Partition};
+use super::{
+    cache::{cached_block_device::BlockCache, BlockCacheError, BLOCK_SIZE},
+    disk_info::Partition,
+};
 
 /// 该文件定义了 Device 和 BlockDevice 的接口
 /// Notice 设备错误码使用 Posix 规定的 int32_t 的错误码表示，而不是自己定义错误enum
@@ -269,25 +272,22 @@ pub trait BlockDevice: Device {
         let cache_response = BlockCache::read(lba_id_start, count, buf);
         match cache_response {
             Ok(_) => return Ok(count * BLOCK_SIZE),
-            Err(x) => {
-                match x{
-                    BlockCacheError::StaticParameterError=>{
-                        BlockCache::init();
-                        let ans = self.read_at_sync(lba_id_start, count, buf)?;
-                        return Ok(ans);
-                    }
-                    BlockCacheError::BlockFaultError(fail_vec)=>{
-                        let ans = self.read_at_sync(lba_id_start, count, buf)?;
-                        let _ = BlockCache::insert(fail_vec, buf);
-                        return Ok(ans);
-                    }
-                    _=>{
-                        let ans = self.read_at_sync(lba_id_start, count, buf)?;
-                        return Ok(ans);
-                    }
+            Err(x) => match x {
+                BlockCacheError::StaticParameterError => {
+                    BlockCache::init();
+                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
+                    return Ok(ans);
                 }
-                
-            }
+                BlockCacheError::BlockFaultError(fail_vec) => {
+                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
+                    let _ = BlockCache::insert(fail_vec, buf);
+                    return Ok(ans);
+                }
+                _ => {
+                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
+                    return Ok(ans);
+                }
+            },
         }
     }
 

@@ -1,26 +1,26 @@
 use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
 
 use super::{
-    cache_block::{CacheBlock, CacheBlockAddr}, cache_iter::{BlockIter, FailData}, BlockCacheError, BLOCK_SIZE, BLOCK_SIZE_LOG, CACHE_THRESHOLD
+    cache_block::{CacheBlock, CacheBlockAddr},
+    cache_iter::{BlockIter, FailData},
+    BlockCacheError, BLOCK_SIZE, BLOCK_SIZE_LOG, CACHE_THRESHOLD,
 };
 
 static mut CSPACE: Option<CacheSpace> = None;
 static mut CMAPPER: Option<CacheMapper> = None;
 //该结构体向外提供BlockCache服务
-pub struct BlockCache;      
+pub struct BlockCache;
 
-unsafe fn get_mapper()->Result<&'static mut CacheMapper,BlockCacheError>{
-    unsafe {                
+unsafe fn get_mapper() -> Result<&'static mut CacheMapper, BlockCacheError> {
+    unsafe {
         match &mut CMAPPER {
             Some(x) => return Ok(x),
-            None => {
-                return Err(BlockCacheError::StaticParameterError)
-            }
+            None => return Err(BlockCacheError::StaticParameterError),
         }
     };
 }
 
-unsafe fn get_space()->Result<&'static mut CacheSpace,BlockCacheError>{
+unsafe fn get_space() -> Result<&'static mut CacheSpace, BlockCacheError> {
     unsafe {
         match &mut CSPACE {
             Some(x) => return Ok(x),
@@ -30,103 +30,107 @@ unsafe fn get_space()->Result<&'static mut CacheSpace,BlockCacheError>{
 }
 
 impl BlockCache {
-/// @brief 初始化BlockCache需要的结构体
-    pub fn init() {         
+    /// @brief 初始化BlockCache需要的结构体
+    pub fn init() {
         unsafe {
             CSPACE = Some(CacheSpace::new());
             CMAPPER = Some(CacheMapper::new());
         }
         kdebug!("BlockCache Initialized!");
     }
-/// @brief 使用blockcache进行对块设备进行连续块的读操作
-/// 
-/// ## 参数：
-/// - 'lba_id_start' :连续块的起始块的lba_id
-/// - 'count' :从连续块算起需要读多少块
-/// - 'buf' :读取出来的数据存放在buf中
-/// 
-/// ## 返回值：
-/// - Ok(usize) :表示读取块的个数
-/// - Err(BlockCacheError::BlockFaultError) :缺块的情况下，返回读取失败的块的数据，利用该返回值可以帮助blockcache插入读取失败的块值（见insert函数）
-/// - Err(BlockCacheError::____) :不缺块的情况往往是初始化或者其他问题，这种异常会在block_device中得到处理
-    pub fn read(lba_id_start: usize, count: usize, buf: &mut [u8]) -> Result<usize, BlockCacheError> {
+    /// @brief 使用blockcache进行对块设备进行连续块的读操作
+    ///
+    /// ## 参数：
+    /// - 'lba_id_start' :连续块的起始块的lba_id
+    /// - 'count' :从连续块算起需要读多少块
+    /// - 'buf' :读取出来的数据存放在buf中
+    ///
+    /// ## 返回值：
+    /// - Ok(usize) :表示读取块的个数
+    /// - Err(BlockCacheError::BlockFaultError) :缺块的情况下，返回读取失败的块的数据，利用该返回值可以帮助blockcache插入读取失败的块值（见insert函数）
+    /// - Err(BlockCacheError::____) :不缺块的情况往往是初始化或者其他问题，这种异常会在block_device中得到处理
+    pub fn read(
+        lba_id_start: usize,
+        count: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, BlockCacheError> {
         //生成一个块迭代器（BlockIter），它可以迭代地给出所有需要块的数据，其中就包括lba_id
-        let block_iter = BlockIter::new(lba_id_start, count, BLOCK_SIZE);               
+        let block_iter = BlockIter::new(lba_id_start, count, BLOCK_SIZE);
         //调用检查函数，检查有无缺块，如果没有就可以获得所有块的Cache地址。如果失败了就直接返回FailData向量
-        let cache_block_addr = Self::check_able_to_read(block_iter)?;        
-        //块地址vec的长度应当等于块迭代器的大小 
-        assert!(cache_block_addr.len() == block_iter.count());  
+        let cache_block_addr = Self::check_able_to_read(block_iter)?;
+        //块地址vec的长度应当等于块迭代器的大小
+        assert!(cache_block_addr.len() == block_iter.count());
         //迭代地读取cache并写入到buf中
-        for (index, _) in block_iter.enumerate() {       
+        for (index, _) in block_iter.enumerate() {
             Self::read_one_block(cache_block_addr[index], index, buf)?;
         }
         return Ok(count);
     }
 
-/// @brief 检查cache中是否有缺块的函数
-/// 
-/// ## 参数：
-/// - 'block_iter' :需要检查的块迭代器（因为块迭代器包含了需要读块的信息，所以传入块迭代器）
-/// 
-/// ## 返回值：
-/// - Ok(Vec<CacheBlockAddr>) :如果成功了，那么函数会返回每个块的Cache地址，利用Cache地址就可以访问Cache了
-/// - Err(BlockCacheError::BlockFaultError) :如果发现了缺块，那么我们会返回所有缺块的信息（即FailData）
-/// - Err(BlockCacheError::____) :不缺块的情况往往是初始化或者其他问题                  
+    /// @brief 检查cache中是否有缺块的函数
+    ///
+    /// ## 参数：
+    /// - 'block_iter' :需要检查的块迭代器（因为块迭代器包含了需要读块的信息，所以传入块迭代器）
+    ///
+    /// ## 返回值：
+    /// - Ok(Vec<CacheBlockAddr>) :如果成功了，那么函数会返回每个块的Cache地址，利用Cache地址就可以访问Cache了
+    /// - Err(BlockCacheError::BlockFaultError) :如果发现了缺块，那么我们会返回所有缺块的信息（即FailData）
+    /// - Err(BlockCacheError::____) :不缺块的情况往往是初始化或者其他问题                  
     fn check_able_to_read(block_iter: BlockIter) -> Result<Vec<CacheBlockAddr>, BlockCacheError> {
         //存放缺块信息的向量
-        let mut fail_ans = vec![];        
-        //存放命中块地址的向量  
-        let mut success_ans = vec![]; 
+        let mut fail_ans = vec![];
+        //存放命中块地址的向量
+        let mut success_ans = vec![];
         //获取mapper
-        let mapper = unsafe {get_mapper()?};
-        for (index,i) in block_iter.enumerate() {
+        let mapper = unsafe { get_mapper()? };
+        for (index, i) in block_iter.enumerate() {
             //在mapper中寻找块的iba_id，判断是否命中
-            match mapper.find(i.iba_id()) {         
+            match mapper.find(i.iba_id()) {
                 Some(x) => {
-                    success_ans.push(*x);                   
+                    success_ans.push(*x);
                     continue;
                 }
                 //缺块就放入fail_ans
-                None => fail_ans.push(FailData::new(i.iba_id(), index)),    
+                None => fail_ans.push(FailData::new(i.iba_id(), index)),
                 //缺块不break的原因是，我们需要把所有缺块都找出来，这样才能补上缺块
             }
         }
         //只要有缺块就认为cache失败，因为需要补块就需要进行io操作
-        if fail_ans.len() != 0 {    
+        if fail_ans.len() != 0 {
             return Err(BlockCacheError::BlockFaultError(fail_ans));
         } else {
             return Ok(success_ans);
         }
     }
-/// @brief 在cache中读取一个块的数据并放置于缓存的指定位置
-/// 
-/// ## 参数：
-/// - 'cache_block_addr' :表示需要读取的cache块的地址
-/// - 'position' :表示该块的数据需要放置在buf的哪个位置，比如position为2，那么读出的数据将放置在buf\[1024..1536\](这里假设块大小是512)
-/// - 'buf' :块数据的缓存
-/// 
-/// ## 返回值：
-/// - Ok(usize) :表示读取了多少个字节
-/// - Err(BlockCacheError) :如果输入的cache_block_addr超过了cache的容量，那么将返回Err（由于目前的cache不支持动态变化上限，所以可能出现这种错误;而实际上，由于Cache的地址是由frame_selector给出的,所以正确实现的frame_selector理论上不会出现这种错误）
+    /// @brief 在cache中读取一个块的数据并放置于缓存的指定位置
+    ///
+    /// ## 参数：
+    /// - 'cache_block_addr' :表示需要读取的cache块的地址
+    /// - 'position' :表示该块的数据需要放置在buf的哪个位置，比如position为2，那么读出的数据将放置在buf\[1024..1536\](这里假设块大小是512)
+    /// - 'buf' :块数据的缓存
+    ///
+    /// ## 返回值：
+    /// - Ok(usize) :表示读取了多少个字节
+    /// - Err(BlockCacheError) :如果输入的cache_block_addr超过了cache的容量，那么将返回Err（由于目前的cache不支持动态变化上限，所以可能出现这种错误;而实际上，由于Cache的地址是由frame_selector给出的,所以正确实现的frame_selector理论上不会出现这种错误）
     pub fn read_one_block(
         cache_block_addr: CacheBlockAddr,
         position: usize,
         buf: &mut [u8],
-    ) -> Result<usize,BlockCacheError> {
-        let space = unsafe {get_space()?};
-        space.read(cache_block_addr, position, buf)  
+    ) -> Result<usize, BlockCacheError> {
+        let space = unsafe { get_space()? };
+        space.read(cache_block_addr, position, buf)
     }
-/// @brief 根据缺块的数据和io获得的数据，向cache中补充块数据
-/// 
-/// ## 参数：
-/// - 'f_data_vec' :这里输入的一般是从read函数中返回的缺块数据
-/// - 'data' :经过一次io后获得的数据
-/// 
-/// ## 返回值：
-/// Ok(usize) :表示补上缺页的个数
-/// Err(BlockCacheError) :一般来说不会产生错误，这里产生错误的原因只有插入时还没有初始化（一般也很难发生）
+    /// @brief 根据缺块的数据和io获得的数据，向cache中补充块数据
+    ///
+    /// ## 参数：
+    /// - 'f_data_vec' :这里输入的一般是从read函数中返回的缺块数据
+    /// - 'data' :经过一次io后获得的数据
+    ///
+    /// ## 返回值：
+    /// Ok(usize) :表示补上缺页的个数
+    /// Err(BlockCacheError) :一般来说不会产生错误，这里产生错误的原因只有插入时还没有初始化（一般也很难发生）
     pub fn insert(f_data_vec: Vec<FailData>, data: &[u8]) -> Result<usize, BlockCacheError> {
-        let count=f_data_vec.len();
+        let count = f_data_vec.len();
         for i in f_data_vec {
             let index = i.index();
             Self::insert_one_block(
@@ -137,31 +141,35 @@ impl BlockCache {
         Ok(count)
     }
 
-/// @brief 将一个块数据插入到cache中
-/// 
-/// ## 参数：
-/// - 'lba_id' :表明该块对应的lba_id，用于建立映射
-/// - 'data' :传入的数据
-/// 
-/// ## 返回值：
-/// Ok(()):表示插入成功
-/// Err(BlockCacheError) :一般来说不会产生错误，这里产生错误的原因只有插入时还没有初始化（一般也很难发生）
-    pub fn insert_one_block(lba_id: usize, data: Vec<u8>) -> Result<(),BlockCacheError> {
-        let space = unsafe {get_space()?};
+    /// @brief 将一个块数据插入到cache中
+    ///
+    /// ## 参数：
+    /// - 'lba_id' :表明该块对应的lba_id，用于建立映射
+    /// - 'data' :传入的数据
+    ///
+    /// ## 返回值：
+    /// Ok(()):表示插入成功
+    /// Err(BlockCacheError) :一般来说不会产生错误，这里产生错误的原因只有插入时还没有初始化（一般也很难发生）
+    pub fn insert_one_block(lba_id: usize, data: Vec<u8>) -> Result<(), BlockCacheError> {
+        let space = unsafe { get_space()? };
         space.insert(lba_id, data)
     }
-/// @brief 测试版本的写入操作，这里仅仅作为取消映射的方法，并没有真正写入到cache的功能
-/// 
-/// ## 参数：
-/// - 'lba_id_start' :需要读取的连续块的起始块
-/// - 'count' :需要读取块的个数
-/// - '_data' :目前没有写入功能，该参数暂时无用
-/// 
-/// ## 返回值：
-/// Ok(usize) :表示写入了多少个块
-/// Err(BlockCacheError) :这里产生错误的原因只有插入时还没有初始化
-    pub fn test_write(lba_id_start: usize, count: usize, _data: &[u8]) -> Result<usize, BlockCacheError> {
-        let mapper = unsafe {get_mapper()?};
+    /// @brief 测试版本的写入操作，这里仅仅作为取消映射的方法，并没有真正写入到cache的功能
+    ///
+    /// ## 参数：
+    /// - 'lba_id_start' :需要读取的连续块的起始块
+    /// - 'count' :需要读取块的个数
+    /// - '_data' :目前没有写入功能，该参数暂时无用
+    ///
+    /// ## 返回值：
+    /// Ok(usize) :表示写入了多少个块
+    /// Err(BlockCacheError) :这里产生错误的原因只有插入时还没有初始化
+    pub fn test_write(
+        lba_id_start: usize,
+        count: usize,
+        _data: &[u8],
+    ) -> Result<usize, BlockCacheError> {
+        let mapper = unsafe { get_mapper()? };
         let block_iter = BlockIter::new(lba_id_start, count, BLOCK_SIZE);
         for i in block_iter {
             mapper.remove(i.iba_id());
@@ -183,69 +191,74 @@ impl CacheSpace {
         Self {
             root: Vec::new(),
             //如果要修改替换算法，可以设计一个结构体实现FrameSelector trait，再在这里替换掉SimpleFrameSelector
-            frame_selector: Box::new(SimpleFrameSelector::new()),   
+            frame_selector: Box::new(SimpleFrameSelector::new()),
         }
     }
-/// @brief 将一个块的数据写入到buf的指定位置
-/// 
-/// ## 参数：
-/// - 'addr' :请求块在Cache中的地址
-/// - 'position' :表示需要将Cache放入buf中的位置，例如:若position为1，则块的数据放入buf\[512..1024\]
-/// - 'buf' :存放数据的buf
-/// 
-/// ## 返回值：
-/// Some(usize):表示读取的字节数（这里默认固定为BLOCK_SIZE）
-/// Err(BlockCacheError):如果你输入地址大于cache的最大上限，那么就返回InsufficientCacheSpace
-    pub fn read(&self, addr: CacheBlockAddr, position: usize, buf: &mut [u8]) -> Result<usize,BlockCacheError> {
+    /// @brief 将一个块的数据写入到buf的指定位置
+    ///
+    /// ## 参数：
+    /// - 'addr' :请求块在Cache中的地址
+    /// - 'position' :表示需要将Cache放入buf中的位置，例如:若position为1，则块的数据放入buf\[512..1024\]
+    /// - 'buf' :存放数据的buf
+    ///
+    /// ## 返回值：
+    /// Some(usize):表示读取的字节数（这里默认固定为BLOCK_SIZE）
+    /// Err(BlockCacheError):如果你输入地址大于cache的最大上限，那么就返回InsufficientCacheSpace
+    pub fn read(
+        &self,
+        addr: CacheBlockAddr,
+        position: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, BlockCacheError> {
         if addr > self.frame_selector.get_size() {
             return Err(BlockCacheError::InsufficientCacheSpace);
         } else {
             return Ok(
                 //CacheBlockAddr就是用于给root寻址的
-                self.root[addr.data()]  
+                self.root[addr.data()]
                     .get_data(&mut buf[position * BLOCK_SIZE..(position + 1) * BLOCK_SIZE])?,
             );
         }
     }
-/// @brief 向cache空间中写入的函数，目前尚未实现
+    /// @brief 向cache空间中写入的函数，目前尚未实现
     pub fn _write(&mut self, _addr: CacheBlockAddr, _data: CacheBlock) -> Option<()> {
         todo!()
     }
-/// @brief 向cache中插入一个块并建立lba_id到块之间的映射
-/// 
-/// ## 参数：
-/// - 'lba_id' :表明你插入的块的lba_id，用于建立映射
-/// - 'data' :要插入块的数据
-/// 
-/// ## 返回值：
-/// Ok(())
-    pub fn insert(&mut self, lba_id: usize, data: Vec<u8>) -> Result<(),BlockCacheError>{
+    /// @brief 向cache中插入一个块并建立lba_id到块之间的映射
+    ///
+    /// ## 参数：
+    /// - 'lba_id' :表明你插入的块的lba_id，用于建立映射
+    /// - 'data' :要插入块的数据
+    ///
+    /// ## 返回值：
+    /// Ok(())
+    pub fn insert(&mut self, lba_id: usize, data: Vec<u8>) -> Result<(), BlockCacheError> {
         //CacheBlock是cached block的基本单位，这里使用data生成一个CacheBlock用于向Cache空间中插入块
-        let data_block = CacheBlock::from_data(lba_id, data);   
-        let mapper = unsafe {get_mapper()?};
+        let data_block = CacheBlock::from_data(lba_id, data);
+        let mapper = unsafe { get_mapper()? };
         //这里我设计了cache的一个threshold，如果不超过阈值就可以append，否则只能替换
-        if self.frame_selector.can_append() {   
+        if self.frame_selector.can_append() {
             //这是append的操作逻辑：
             //从frame_selector获得一个CacheBlockAddr
-            let index = self.frame_selector.get_index_append(); 
+            let index = self.frame_selector.get_index_append();
             //直接将块push进去就可以，因为现在是append操作
-            self.root.push(data_block); 
-            assert!(index.data() == self.root.len() - 1);   
+            self.root.push(data_block);
+            assert!(index.data() == self.root.len() - 1);
             //建立mapper的映射
-            mapper.insert(lba_id, index);   
+            mapper.insert(lba_id, index);
             Ok(())
         } else {
             //这是replace的操作逻辑
             //从frame_selector获得一个CacheBlockAddr，这次是它替换出来的
-            let index = self.frame_selector.get_index_replace();    
+            let index = self.frame_selector.get_index_replace();
             //获取被替换的块的lba_id，待会用于取消映射
-            let removed_id = self.root[index.data()].get_lba_id();  
+            let removed_id = self.root[index.data()].get_lba_id();
             //直接替换原本的块，由于被替换的块没有引用了，所以会被drop
-            self.root[index.data()] = data_block;  
-            //建立映射插入块的映射 
-            mapper.insert(lba_id, index);   
+            self.root[index.data()] = data_block;
+            //建立映射插入块的映射
+            mapper.insert(lba_id, index);
             //取消被替换块的映射
-            mapper.remove(removed_id);      
+            mapper.remove(removed_id);
             Ok(())
         }
     }
@@ -263,24 +276,24 @@ impl CacheMapper {
             map: BTreeMap::new(),
         }
     }
-/// @brief 插入操作
+    /// @brief 插入操作
     pub fn insert(&mut self, lba_id: usize, caddr: CacheBlockAddr) -> Option<()> {
         self.map.insert(lba_id, caddr)?;
         Some(())
     }
-/// @brief 查找操作
+    /// @brief 查找操作
     #[inline]
     pub fn find(&self, lba_id: usize) -> Option<&CacheBlockAddr> {
         self.map.get(&lba_id)
     }
-/// @brief 去除操作
+    /// @brief 去除操作
     pub fn remove(&mut self, lba_id: usize) {
         self.map.remove(&lba_id);
     }
 }
 
 /// @brief 该trait用于实现块的换入换出算法，需要设计替换算法只需要实现该trait即可
-trait FrameSelector{
+trait FrameSelector {
     /// @brief 给出append操作的index（理论上，如果cache没满，就不需要换出块，就可以使用append操作）
     fn get_index_append(&mut self) -> CacheBlockAddr;
     /// @brief 给出replace操作后的index
@@ -304,14 +317,14 @@ struct SimpleFrameSelector {
 impl SimpleFrameSelector {
     pub fn new() -> Self {
         Self {
-            threshold: CACHE_THRESHOLD*(1<<(20-BLOCK_SIZE_LOG)),    
+            threshold: CACHE_THRESHOLD * (1 << (20 - BLOCK_SIZE_LOG)),
             size: 0,
             current: 0,
         }
     }
 }
 
-impl FrameSelector for SimpleFrameSelector{
+impl FrameSelector for SimpleFrameSelector {
     fn get_index_append(&mut self) -> CacheBlockAddr {
         let ans = self.current;
         self.size += 1;
@@ -320,7 +333,7 @@ impl FrameSelector for SimpleFrameSelector{
         return CacheBlockAddr::new(ans);
     }
 
-    fn get_index_replace(&mut self) -> CacheBlockAddr{
+    fn get_index_replace(&mut self) -> CacheBlockAddr {
         let ans = self.current;
         self.current += 1;
         self.current %= self.threshold;

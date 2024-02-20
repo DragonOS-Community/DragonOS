@@ -91,7 +91,7 @@ impl FailData {
     pub fn lba_id(&self) -> usize {
         self.lba_id
     }
-///@brief 该函数返回的是缺块在buf中的位置，比如：index=1，那么我们就应该取buf\[512..1024\]
+    ///@brief 该函数返回的是缺块在buf中的位置，比如：index=1，那么我们就应该取buf\[512..1024\]
     pub fn index(&self) -> usize {
         self.index
     }

@@ -61,9 +61,9 @@ impl CacheBlock {
     pub fn _set_flag(&mut self, _flag: CacheBlockFlag) -> Option<()> {
         todo!()
     }
-    pub fn get_data(&self, buf: &mut [u8]) -> Result<usize, BlockCacheError>{
-        if buf.len()!=BLOCK_SIZE{
-            return Err(BlockCacheError::BlockSizeError)
+    pub fn get_data(&self, buf: &mut [u8]) -> Result<usize, BlockCacheError> {
+        if buf.len() != BLOCK_SIZE {
+            return Err(BlockCacheError::BlockSizeError);
         }
         buf.copy_from_slice(&self.data);
         return Ok(BLOCK_SIZE);

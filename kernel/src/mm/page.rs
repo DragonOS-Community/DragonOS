@@ -77,7 +77,7 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
     /// 获取当前页表自身所在的虚拟地址
     #[inline(always)]
     pub unsafe fn virt(&self) -> VirtAddr {
-        return Arch::phys_2_virt(self.phys).unwrap(); 
+        return Arch::phys_2_virt(self.phys).unwrap();
     }
 
     /// 获取第i个页表项所表示的虚拟内存空间的起始地址

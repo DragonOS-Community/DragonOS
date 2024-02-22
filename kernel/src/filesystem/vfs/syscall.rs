@@ -305,7 +305,7 @@ impl Syscall {
     /// @brief 根据文件描述符，读取文件数据。尝试读取的数据长度与buf的长度相同。
     ///
     /// @param fd 文件描述符编号
-    /// @param buf 输出缓冲区。
+    /// @param buf 输出缓冲区
     ///
     /// @return Ok(usize) 成功读取的数据的字节数
     /// @return Err(SystemError) 读取失败，返回posix错误码
@@ -327,7 +327,7 @@ impl Syscall {
     /// @brief 根据文件描述符，向文件写入数据。尝试写入的数据长度与buf的长度相同。
     ///
     /// @param fd 文件描述符编号
-    /// @param buf 输入缓冲区。
+    /// @param buf 输入缓冲区
     ///
     /// @return Ok(usize) 成功写入的数据的字节数
     /// @return Err(SystemError) 写入失败，返回posix错误码
@@ -361,6 +361,50 @@ impl Syscall {
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
         return file.lock_no_preempt().lseek(seek);
+    }
+
+    /// # sys_pread64 系统调用的实际执行函数
+    ///
+    /// ## 参数
+    /// - `fd`: 文件描述符
+    /// - `buf`: 读出缓冲区
+    /// - `len`: 要读取的字节数
+    /// - `offset`: 文件偏移量
+    pub fn pread(fd: i32, buf: &mut [u8], len: usize, offset: usize) -> Result<usize, SystemError> {
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+
+        let file = fd_table_guard.get_file_by_fd(fd);
+        if file.is_none() {
+            return Err(SystemError::EBADF);
+        }
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
+        let file = file.unwrap();
+
+        return file.lock_no_preempt().pread(offset, len, buf);
+    }
+
+    /// # sys_pwrite64 系统调用的实际执行函数
+    ///
+    /// ## 参数
+    /// - `fd`: 文件描述符
+    /// - `buf`: 写入缓冲区
+    /// - `len`: 要写入的字节数
+    /// - `offset`: 文件偏移量
+    pub fn pwrite(fd: i32, buf: &[u8], len: usize, offset: usize) -> Result<usize, SystemError> {
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+
+        let file = fd_table_guard.get_file_by_fd(fd);
+        if file.is_none() {
+            return Err(SystemError::EBADF);
+        }
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
+        let file = file.unwrap();
+
+        return file.lock_no_preempt().pwrite(offset, len, buf);
     }
 
     /// @brief 切换工作目录

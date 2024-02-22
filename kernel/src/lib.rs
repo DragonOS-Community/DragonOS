@@ -45,6 +45,7 @@ mod exception;
 mod filesystem;
 mod init;
 mod ipc;
+mod misc;
 mod mm;
 mod net;
 mod process;

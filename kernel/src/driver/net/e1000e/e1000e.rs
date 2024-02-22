@@ -14,7 +14,7 @@ use crate::driver::pci::pci::{
     get_pci_device_structure_mut, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,
     PCI_DEVICE_LINKEDLIST,
 };
-use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqMsg, IrqSpecificMsg, PciInterrupt, IRQ};
+use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqMsg, IRQ};
 use crate::include::bindings::bindings::pt_regs;
 use crate::libs::volatile::{ReadOnly, Volatile, WriteOnly};
 use crate::net::net_core::poll_ifaces_try_lock_onetime;
@@ -227,7 +227,7 @@ impl E1000EDevice {
         let irq_vector = device.irq_vector_mut().unwrap();
         irq_vector.push(E1000E_RECV_VECTOR);
         device.irq_init(IRQ::PCI_IRQ_MSI).expect("IRQ Init Failed");
-        let msg = IrqMsg {
+        let msg = PciIrqMsg {
             irq_common_message: IrqCommonMsg::init_from(
                 0,
                 "E1000E_RECV_IRQ",

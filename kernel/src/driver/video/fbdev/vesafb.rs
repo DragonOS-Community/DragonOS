@@ -748,7 +748,7 @@ impl Attribute for AnonAttrPhysAddr {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::SHOW
+        SysFSOpsSupport::ATTR_SHOW
     }
 
     fn show(&self, _kobj: Arc<dyn KObject>, _buf: &mut [u8]) -> Result<usize, SystemError> {

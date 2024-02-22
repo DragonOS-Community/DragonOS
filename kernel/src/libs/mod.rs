@@ -1,5 +1,6 @@
 pub mod align;
 pub mod casting;
+pub mod cpumask;
 pub mod elf;
 pub mod ffi_convert;
 #[macro_use]

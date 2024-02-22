@@ -7,6 +7,7 @@ use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
     driver::base::device::device_number::DeviceNumber,
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
+    mm::syscall::MremapFlags,
     net::syscall::MsgHdr,
     process::{
         fork::KernelCloneArgs,
@@ -130,9 +131,7 @@ impl Syscall {
             }
             SYS_CLOSE => {
                 let fd = args[0];
-                let res = Self::close(fd);
-
-                res
+                Self::close(fd)
             }
             SYS_READ => {
                 let fd = args[0] as i32;
@@ -143,8 +142,7 @@ impl Syscall {
                     UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)?;
 
                 let user_buf = user_buffer_writer.buffer(0)?;
-                let res = Self::read(fd, user_buf);
-                res
+                Self::read(fd, user_buf)
             }
             SYS_WRITE => {
                 let fd = args[0] as i32;
@@ -155,8 +153,7 @@ impl Syscall {
                     UserBufferReader::new(buf_vaddr as *const u8, len, from_user)?;
 
                 let user_buf = user_buffer_reader.read_from_user(0)?;
-                let res = Self::write(fd, user_buf);
-                res
+                Self::write(fd, user_buf)
             }
 
             SYS_LSEEK => {
@@ -174,6 +171,32 @@ impl Syscall {
 
                 Self::lseek(fd, w)
             }
+
+            SYS_PREAD64 => {
+                let fd = args[0] as i32;
+                let buf_vaddr = args[1];
+                let len = args[2];
+                let offset = args[3];
+
+                let mut user_buffer_writer =
+                    UserBufferWriter::new(buf_vaddr as *mut u8, len, frame.from_user())?;
+                let buf = user_buffer_writer.buffer(0)?;
+                Self::pread(fd, buf, len, offset)
+            }
+
+            SYS_PWRITE64 => {
+                let fd = args[0] as i32;
+                let buf_vaddr = args[1];
+                let len = args[2];
+                let offset = args[3];
+
+                let user_buffer_reader =
+                    UserBufferReader::new(buf_vaddr as *const u8, len, frame.from_user())?;
+
+                let buf = user_buffer_reader.read_from_user(0)?;
+                Self::pwrite(fd, buf, len, offset)
+            }
+
             SYS_IOCTL => {
                 let fd = args[0];
                 let cmd = args[1];
@@ -591,6 +614,15 @@ impl Syscall {
                     )
                 }
             }
+            SYS_MREMAP => {
+                let old_vaddr = VirtAddr::new(args[0]);
+                let old_len = args[1];
+                let new_len = args[2];
+                let mremap_flags = MremapFlags::from_bits_truncate(args[3] as u8);
+                let new_vaddr = VirtAddr::new(args[4]);
+
+                Self::mremap(old_vaddr, old_len, new_len, mremap_flags, new_vaddr)
+            }
             SYS_MUNMAP => {
                 let addr = args[0];
                 let len = page_align_up(args[1]);
@@ -947,6 +979,16 @@ impl Syscall {
             SYS_UMASK => {
                 let mask = args[0] as u32;
                 Self::umask(mask)
+            }
+
+            SYS_FCHOWN => {
+                kwarn!("SYS_FCHOWN has not yet been implemented");
+                Ok(0)
+            }
+
+            SYS_FSYNC => {
+                kwarn!("SYS_FSYNC has not yet been implemented");
+                Ok(0)
             }
 
             #[cfg(target_arch = "x86_64")]

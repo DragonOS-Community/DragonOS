@@ -169,22 +169,7 @@ impl File {
     /// @return Ok(usize) 成功读取的字节数
     /// @return Err(SystemError) 错误码
     pub fn read(&mut self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        // 先检查本文件在权限等规则下，是否可读取。
-        self.readable()?;
-
-        if buf.len() < len {
-            return Err(SystemError::ENOBUFS);
-        }
-
-        // // 如果文件指针已经超过了文件大小，则返回0
-        // if self.offset > self.inode.metadata()?.size as usize {
-        //     return Ok(0);
-        // }
-        let len = self
-            .inode
-            .read_at(self.offset, len, buf, &mut self.private_data)?;
-        self.offset += len;
-        return Ok(len);
+        self.do_read(self.offset, len, buf, true)
     }
 
     /// @brief 从buffer向文件写入指定的字节数的数据
@@ -195,6 +180,71 @@ impl File {
     /// @return Ok(usize) 成功写入的字节数
     /// @return Err(SystemError) 错误码
     pub fn write(&mut self, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        self.do_write(self.offset, len, buf, true)
+    }
+
+    /// ## 从文件中指定的偏移处读取指定的字节数到buf中
+    ///
+    /// ### 参数
+    /// - `offset`: 文件偏移量
+    /// - `len`: 要读取的字节数
+    /// - `buf`: 读出缓冲区
+    ///
+    /// ### 返回值
+    /// - `Ok(usize)`: 成功读取的字节数
+    pub fn pread(
+        &mut self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        self.do_read(offset, len, buf, false)
+    }
+
+    /// ## 从buf向文件中指定的偏移处写入指定的字节数的数据
+    ///
+    /// ### 参数
+    /// - `offset`: 文件偏移量
+    /// - `len`: 要写入的字节数
+    /// - `buf`: 写入缓冲区
+    ///
+    /// ### 返回值
+    /// - `Ok(usize)`: 成功写入的字节数
+    pub fn pwrite(&mut self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        self.do_write(offset, len, buf, false)
+    }
+
+    fn do_read(
+        &mut self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        update_offset: bool,
+    ) -> Result<usize, SystemError> {
+        // 先检查本文件在权限等规则下，是否可读取。
+        self.readable()?;
+        if buf.len() < len {
+            return Err(SystemError::ENOBUFS);
+        }
+
+        let len = self
+            .inode
+            .read_at(offset, len, buf, &mut self.private_data)?;
+
+        if update_offset {
+            self.offset += len;
+        }
+
+        Ok(len)
+    }
+
+    fn do_write(
+        &mut self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        update_offset: bool,
+    ) -> Result<usize, SystemError> {
         // 先检查本文件在权限等规则下，是否可写入。
         self.writeable()?;
         if buf.len() < len {
@@ -202,15 +252,18 @@ impl File {
         }
 
         // 如果文件指针已经超过了文件大小，则需要扩展文件大小
-        let file_size = self.inode.metadata()?.size as usize;
-        if self.offset > file_size {
-            self.inode.resize(self.offset)?;
+        if offset > self.inode.metadata()?.size as usize {
+            self.inode.resize(offset)?;
         }
         let len = self
             .inode
-            .write_at(self.offset, len, buf, &mut self.private_data)?;
-        self.offset += len;
-        return Ok(len);
+            .write_at(offset, len, buf, &mut self.private_data)?;
+
+        if update_offset {
+            self.offset += len;
+        }
+
+        Ok(len)
     }
 
     /// @brief 获取文件的元数据

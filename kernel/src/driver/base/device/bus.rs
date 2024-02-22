@@ -12,7 +12,7 @@ use crate::{
     filesystem::{
         sysfs::{
             file::sysfs_emit_str, sysfs_instance, Attribute, AttributeGroup, SysFSOps,
-            SysFSOpsSupport,
+            SysFSOpsSupport, SYSFS_ATTR_MODE_RW, SYSFS_ATTR_MODE_WO,
         },
         vfs::syscall::ModeType,
     },
@@ -598,7 +598,7 @@ impl Attribute for BusAttrDriversProbe {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        return SysFSOpsSupport::STORE;
+        return SysFSOpsSupport::ATTR_STORE;
     }
 
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?r=&mo=5649&fi=241#241
@@ -628,7 +628,7 @@ struct BusAttrDriversAutoprobe;
 
 impl Attribute for BusAttrDriversAutoprobe {
     fn mode(&self) -> ModeType {
-        return ModeType::from_bits_truncate(0o644);
+        SYSFS_ATTR_MODE_RW
     }
 
     fn name(&self) -> &str {
@@ -636,7 +636,7 @@ impl Attribute for BusAttrDriversAutoprobe {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        return SysFSOpsSupport::STORE | SysFSOpsSupport::SHOW;
+        return SysFSOpsSupport::ATTR_STORE | SysFSOpsSupport::ATTR_SHOW;
     }
 
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?r=&mo=5649&fi=241#231
@@ -738,7 +738,7 @@ struct DriverAttrUnbind;
 
 impl Attribute for DriverAttrUnbind {
     fn mode(&self) -> ModeType {
-        ModeType::from_bits_truncate(0o200)
+        SYSFS_ATTR_MODE_WO
     }
 
     fn name(&self) -> &str {
@@ -774,7 +774,7 @@ impl Attribute for DriverAttrUnbind {
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::STORE
+        SysFSOpsSupport::ATTR_STORE
     }
 }
 
@@ -787,7 +787,7 @@ impl Attribute for DriverAttrBind {
     }
 
     fn mode(&self) -> ModeType {
-        ModeType::from_bits_truncate(0o200)
+        SYSFS_ATTR_MODE_WO
     }
 
     /*
@@ -825,7 +825,7 @@ impl Attribute for DriverAttrBind {
         return Err(SystemError::ENODEV);
     }
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::STORE
+        SysFSOpsSupport::ATTR_STORE
     }
 }
 

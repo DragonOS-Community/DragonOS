@@ -189,7 +189,6 @@ impl TtyCore {
         }
 
         self.set_termios_next(tty, tmp_termios)?;
-
         Ok(0)
     }
 
@@ -216,6 +215,7 @@ impl TtyCore {
             termios.output_speed = old_termios.output_speed;
         }
 
+        drop(termios);
         let ld = self.ldisc();
         ld.set_termios(tty, Some(old_termios))?;
 

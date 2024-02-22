@@ -49,6 +49,20 @@ impl NTtyLinediscipline {
     pub fn disc_data_try_lock(&self) -> Result<SpinLockGuard<NTtyData>, SystemError> {
         self.data.try_lock_irqsave()
     }
+
+    fn ioctl_helper(&self, tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<usize, SystemError> {
+        match cmd {
+            TtyIoctlCmd::TCXONC => {
+                todo!()
+            }
+            TtyIoctlCmd::TCFLSH => {
+                todo!()
+            }
+            _ => {
+                return tty.tty_mode_ioctl(tty.clone(), cmd, arg);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -150,20 +164,6 @@ impl NTtyData {
     pub fn read_at(&self, i: usize) -> u8 {
         let i = i & (NTTY_BUFSIZE - 1);
         self.read_buf[i]
-    }
-
-    fn ioctl_helper(&self, tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<usize, SystemError> {
-        match cmd {
-            TtyIoctlCmd::TCXONC => {
-                todo!()
-            }
-            TtyIoctlCmd::TCFLSH => {
-                todo!()
-            }
-            _ => {
-                return tty.tty_mode_ioctl(tty.clone(), cmd, arg);
-            }
-        }
     }
 
     /// ### 接收数据到NTTY
@@ -1761,8 +1761,6 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         cmd: u32,
         arg: usize,
     ) -> Result<usize, system_error::SystemError> {
-        let ldata = self.disc_data();
-
         match cmd {
             TtyIoctlCmd::TIOCOUTQ => {
                 let mut user_writer = UserBufferWriter::new(
@@ -1776,6 +1774,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 return Ok(0);
             }
             TtyIoctlCmd::FIONREAD => {
+                let ldata = self.disc_data();
                 let termios = tty.core().termios();
                 let retval;
                 if termios.local_mode.contains(LocalMode::ICANON)
@@ -1814,7 +1813,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 return Ok(0);
             }
             _ => {
-                return ldata.ioctl_helper(tty, cmd, arg);
+                return self.ioctl_helper(tty, cmd, arg);
             }
         }
     }

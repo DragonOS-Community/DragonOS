@@ -6,10 +6,10 @@ use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
 use crate::{
-    arch::ipc::signal::{SigSet, Signal},
+    arch::ipc::signal::Signal,
     driver::tty::{
-        termios::{ContorlCharIndex, InputMode, LocalMode, OutputMode, Termios},
-        tty_core::{EchoOperation, TtyCore, TtyCoreData, TtyFlag},
+        termios::{ControlCharIndex, InputMode, LocalMode, OutputMode, Termios},
+        tty_core::{EchoOperation, TtyCore, TtyCoreData, TtyFlag, TtyIoctlCmd},
         tty_driver::{TtyDriverFlag, TtyOperation},
         tty_job_control::TtyJobCtrlManager,
     },
@@ -18,9 +18,10 @@ use crate::{
         rwlock::RwLockReadGuard,
         spinlock::{SpinLock, SpinLockGuard},
     },
+    mm::VirtAddr,
     net::event_poll::EPollEventType,
     process::ProcessManager,
-    syscall::Syscall,
+    syscall::{user_access::UserBufferWriter, Syscall},
 };
 
 use super::TtyLineDiscipline;
@@ -149,6 +150,20 @@ impl NTtyData {
     pub fn read_at(&self, i: usize) -> u8 {
         let i = i & (NTTY_BUFSIZE - 1);
         self.read_buf[i]
+    }
+
+    fn ioctl_helper(&self, tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<usize, SystemError> {
+        match cmd {
+            TtyIoctlCmd::TCXONC => {
+                todo!()
+            }
+            TtyIoctlCmd::TCFLSH => {
+                todo!()
+            }
+            _ => {
+                return tty.tty_mode_ioctl(tty.clone(), cmd, arg);
+            }
+        }
     }
 
     /// ### 接收数据到NTTY
@@ -359,17 +374,17 @@ impl NTtyData {
         }
 
         if termios.local_mode.contains(LocalMode::ISIG) {
-            if c == termios.control_characters[ContorlCharIndex::VINTR] {
+            if c == termios.control_characters[ControlCharIndex::VINTR] {
                 self.recv_sig_char(tty.clone(), &termios, Signal::SIGINT, c);
                 return;
             }
 
-            if c == termios.control_characters[ContorlCharIndex::VQUIT] {
+            if c == termios.control_characters[ControlCharIndex::VQUIT] {
                 self.recv_sig_char(tty.clone(), &termios, Signal::SIGQUIT, c);
                 return;
             }
 
-            if c == termios.control_characters[ContorlCharIndex::VSUSP] {
+            if c == termios.control_characters[ControlCharIndex::VSUSP] {
                 self.recv_sig_char(tty.clone(), &termios, Signal::SIGTSTP, c);
                 return;
             }
@@ -401,16 +416,16 @@ impl NTtyData {
         }
 
         if self.icanon {
-            if c == termios.control_characters[ContorlCharIndex::VERASE]
-                || c == termios.control_characters[ContorlCharIndex::VKILL]
-                || (c == termios.control_characters[ContorlCharIndex::VWERASE]
+            if c == termios.control_characters[ControlCharIndex::VERASE]
+                || c == termios.control_characters[ControlCharIndex::VKILL]
+                || (c == termios.control_characters[ControlCharIndex::VWERASE]
                     && termios.local_mode.contains(LocalMode::IEXTEN))
             {
                 self.eraser(c, &termios);
                 self.commit_echoes(tty.clone());
                 return;
             }
-            if c == termios.control_characters[ContorlCharIndex::VLNEXT]
+            if c == termios.control_characters[ControlCharIndex::VLNEXT]
                 && termios.local_mode.contains(LocalMode::IEXTEN)
             {
                 self.lnext = true;
@@ -424,7 +439,7 @@ impl NTtyData {
                 }
                 return;
             }
-            if c == termios.control_characters[ContorlCharIndex::VREPRINT]
+            if c == termios.control_characters[ControlCharIndex::VREPRINT]
                 && termios.local_mode.contains(LocalMode::ECHO)
                 && termios.local_mode.contains(LocalMode::IEXTEN)
             {
@@ -458,8 +473,8 @@ impl NTtyData {
                 return;
             }
 
-            if c == termios.control_characters[ContorlCharIndex::VEOF] {
-                c = ContorlCharIndex::DISABLE_CHAR;
+            if c == termios.control_characters[ControlCharIndex::VEOF] {
+                c = ControlCharIndex::DISABLE_CHAR;
 
                 self.read_flags.set(ntty_buf_mask(self.read_head), true);
                 self.read_buf[ntty_buf_mask(self.read_head)] = c;
@@ -471,8 +486,8 @@ impl NTtyData {
                 return;
             }
 
-            if c == termios.control_characters[ContorlCharIndex::VEOL]
-                || (c == termios.control_characters[ContorlCharIndex::VEOL2]
+            if c == termios.control_characters[ControlCharIndex::VEOL]
+                || (c == termios.control_characters[ControlCharIndex::VEOL2]
                     && termios.local_mode.contains(LocalMode::IEXTEN))
             {
                 if termios.local_mode.contains(LocalMode::ECHO) {
@@ -530,8 +545,8 @@ impl NTtyData {
             return;
         }
 
-        let erase = c == termios.control_characters[ContorlCharIndex::VERASE];
-        let werase = c == termios.control_characters[ContorlCharIndex::VWERASE];
+        let erase = c == termios.control_characters[ControlCharIndex::VERASE];
+        let werase = c == termios.control_characters[ControlCharIndex::VWERASE];
         let kill = !erase && !werase;
 
         if kill {
@@ -602,7 +617,7 @@ impl NTtyData {
                     }
                 } else if erase && !termios.local_mode.contains(LocalMode::ECHOE) {
                     self.echo_char(
-                        termios.control_characters[ContorlCharIndex::VERASE],
+                        termios.control_characters[ControlCharIndex::VERASE],
                         termios,
                     );
                 } else if c == b'\t' {
@@ -684,8 +699,8 @@ impl NTtyData {
     pub fn is_flow_ctrl_char(&mut self, tty: Arc<TtyCore>, c: u8, lookahead_done: bool) -> bool {
         let termios = tty.core().termios();
 
-        if !(termios.control_characters[ContorlCharIndex::VSTART] == c
-            || termios.control_characters[ContorlCharIndex::VSTOP] == c)
+        if !(termios.control_characters[ControlCharIndex::VSTART] == c
+            || termios.control_characters[ControlCharIndex::VSTOP] == c)
         {
             return false;
         }
@@ -694,7 +709,7 @@ impl NTtyData {
             return true;
         }
 
-        if termios.control_characters[ContorlCharIndex::VSTART] == c {
+        if termios.control_characters[ControlCharIndex::VSTART] == c {
             tty.tty_start();
             self.process_echoes(tty.clone());
             return true;
@@ -917,7 +932,7 @@ impl NTtyData {
         }
 
         // 确保读取位置是'\0'字符
-        if self.read_buf[tail] != ContorlCharIndex::DISABLE_CHAR {
+        if self.read_buf[tail] != ControlCharIndex::DISABLE_CHAR {
             return;
         }
 
@@ -1003,7 +1018,7 @@ impl NTtyData {
         let count = if found { n + 1 } else { n };
 
         // 表示这一行未结束
-        if !found || self.read_at(eol) != ContorlCharIndex::DISABLE_CHAR {
+        if !found || self.read_at(eol) != ControlCharIndex::DISABLE_CHAR {
             n = count;
         }
 
@@ -1036,10 +1051,10 @@ impl NTtyData {
     pub fn input_available(&self, termios: RwLockReadGuard<Termios>, poll: bool) -> bool {
         // 计算最小字符数
         let amt = if poll
-            && termios.control_characters[ContorlCharIndex::VTIME] as u32 == 0
-            && termios.control_characters[ContorlCharIndex::VMIN] as u32 != 0
+            && termios.control_characters[ControlCharIndex::VTIME] as u32 == 0
+            && termios.control_characters[ControlCharIndex::VMIN] as u32 != 0
         {
-            termios.control_characters[ContorlCharIndex::VMIN] as usize
+            termios.control_characters[ControlCharIndex::VMIN] as usize
         } else {
             1
         };
@@ -1084,7 +1099,7 @@ impl NTtyData {
 
             // 是否只读取了eof
             let eof =
-                n == 1 && self.read_buf[tail] == termios.control_characters[ContorlCharIndex::VEOF];
+                n == 1 && self.read_buf[tail] == termios.control_characters[ControlCharIndex::VEOF];
 
             if termios.local_mode.contains(LocalMode::EXTPROC)
                 && self.icanon
@@ -1561,7 +1576,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         if !ldata.icanon {
             let core = tty.core();
             let termios = core.termios();
-            minimum = termios.control_characters[ContorlCharIndex::VMIN] as usize;
+            minimum = termios.control_characters[ControlCharIndex::VMIN] as usize;
             if minimum == 0 {
                 minimum = 1;
             }
@@ -1742,12 +1757,66 @@ impl TtyLineDiscipline for NTtyLinediscipline {
 
     fn ioctl(
         &self,
-        _tty: Arc<TtyCore>,
-        _cmd: u32,
-        _arg: usize,
+        tty: Arc<TtyCore>,
+        cmd: u32,
+        arg: usize,
     ) -> Result<usize, system_error::SystemError> {
-        // TODO
-        return Err(SystemError::ENOIOCTLCMD);
+        let ldata = self.disc_data();
+
+        match cmd {
+            TtyIoctlCmd::TIOCOUTQ => {
+                let mut user_writer = UserBufferWriter::new(
+                    VirtAddr::new(arg).as_ptr::<i32>(),
+                    core::mem::size_of::<i32>(),
+                    true,
+                )?;
+
+                let count = tty.chars_in_buffer();
+                user_writer.copy_one_to_user::<i32>(&(count as i32), 0)?;
+                return Ok(0);
+            }
+            TtyIoctlCmd::FIONREAD => {
+                let termios = tty.core().termios();
+                let retval;
+                if termios.local_mode.contains(LocalMode::ICANON)
+                    && !termios.local_mode.contains(LocalMode::EXTPROC)
+                {
+                    if ldata.canon_head == ldata.read_tail {
+                        retval = 0;
+                    } else {
+                        let head = ldata.canon_head;
+                        let mut tail = ldata.read_tail;
+                        let mut nr = head - tail;
+
+                        while ntty_buf_mask(head) != ntty_buf_mask(tail) {
+                            if ldata.read_flags.get(ntty_buf_mask(tail)).unwrap()
+                                && ldata.read_buf[ntty_buf_mask(tail)]
+                                    == ControlCharIndex::DISABLE_CHAR
+                            {
+                                nr -= 1;
+                            }
+                            tail += 1;
+                        }
+
+                        retval = nr;
+                    }
+                } else {
+                    retval = ldata.read_cnt();
+                }
+
+                let mut user_writer = UserBufferWriter::new(
+                    VirtAddr::new(arg).as_ptr::<i32>(),
+                    core::mem::size_of::<i32>(),
+                    true,
+                )?;
+
+                user_writer.copy_one_to_user::<i32>(&(retval as i32), 0)?;
+                return Ok(0);
+            }
+            _ => {
+                return ldata.ioctl_helper(tty, cmd, arg);
+            }
+        }
     }
 
     fn set_termios(
@@ -1829,32 +1898,32 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             if termios.local_mode.contains(LocalMode::ICANON) {
                 ldata
                     .char_map
-                    .set(contorl_chars[ContorlCharIndex::VERASE] as usize, true);
+                    .set(contorl_chars[ControlCharIndex::VERASE] as usize, true);
                 ldata
                     .char_map
-                    .set(contorl_chars[ContorlCharIndex::VKILL] as usize, true);
+                    .set(contorl_chars[ControlCharIndex::VKILL] as usize, true);
                 ldata
                     .char_map
-                    .set(contorl_chars[ContorlCharIndex::VEOF] as usize, true);
+                    .set(contorl_chars[ControlCharIndex::VEOF] as usize, true);
                 ldata.char_map.set('\n' as usize, true);
                 ldata
                     .char_map
-                    .set(contorl_chars[ContorlCharIndex::VEOL] as usize, true);
+                    .set(contorl_chars[ControlCharIndex::VEOL] as usize, true);
 
                 if termios.local_mode.contains(LocalMode::IEXTEN) {
                     ldata
                         .char_map
-                        .set(contorl_chars[ContorlCharIndex::VWERASE] as usize, true);
+                        .set(contorl_chars[ControlCharIndex::VWERASE] as usize, true);
                     ldata
                         .char_map
-                        .set(contorl_chars[ContorlCharIndex::VLNEXT] as usize, true);
+                        .set(contorl_chars[ControlCharIndex::VLNEXT] as usize, true);
                     ldata
                         .char_map
-                        .set(contorl_chars[ContorlCharIndex::VEOL2] as usize, true);
+                        .set(contorl_chars[ControlCharIndex::VEOL2] as usize, true);
                     if termios.local_mode.contains(LocalMode::ECHO) {
                         ldata
                             .char_map
-                            .set(contorl_chars[ContorlCharIndex::VREPRINT] as usize, true);
+                            .set(contorl_chars[ControlCharIndex::VREPRINT] as usize, true);
                     }
                 }
             }
@@ -1863,27 +1932,27 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             if termios.input_mode.contains(InputMode::IXON) {
                 ldata
                     .char_map
-                    .set(contorl_chars[ContorlCharIndex::VSTART] as usize, true);
+                    .set(contorl_chars[ControlCharIndex::VSTART] as usize, true);
                 ldata
                     .char_map
-                    .set(contorl_chars[ContorlCharIndex::VSTOP] as usize, true);
+                    .set(contorl_chars[ControlCharIndex::VSTOP] as usize, true);
             }
 
             if termios.local_mode.contains(LocalMode::ISIG) {
                 ldata
                     .char_map
-                    .set(contorl_chars[ContorlCharIndex::VINTR] as usize, true);
+                    .set(contorl_chars[ControlCharIndex::VINTR] as usize, true);
                 ldata
                     .char_map
-                    .set(contorl_chars[ContorlCharIndex::VQUIT] as usize, true);
+                    .set(contorl_chars[ControlCharIndex::VQUIT] as usize, true);
                 ldata
                     .char_map
-                    .set(contorl_chars[ContorlCharIndex::VSUSP] as usize, true);
+                    .set(contorl_chars[ControlCharIndex::VSUSP] as usize, true);
             }
 
             ldata
                 .char_map
-                .set(ContorlCharIndex::DISABLE_CHAR as usize, true);
+                .set(ControlCharIndex::DISABLE_CHAR as usize, true);
             ldata.raw = false;
             ldata.real_raw = false;
         } else {

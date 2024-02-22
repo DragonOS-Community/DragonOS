@@ -1,3 +1,5 @@
+use core::sync::atomic::Ordering;
+
 use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
@@ -157,6 +159,7 @@ impl TtyOperation for TtyConsoleDriverInner {
         32768
     }
 
+    /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/tty/vt/vt.c#2894
     fn write(&self, tty: &TtyCoreData, buf: &[u8], mut nr: usize) -> Result<usize, SystemError> {
         // 关闭中断
         let mut vc_data = tty.vc_data_irqsave();
@@ -252,6 +255,7 @@ pub struct DrawRegion {
 }
 
 // 初始化虚拟终端
+#[inline(never)]
 pub fn vty_init() -> Result<(), SystemError> {
     // 注册虚拟终端设备并将虚拟终端设备加入到文件系统
     let vc0 = TtyDevice::new(
@@ -290,7 +294,7 @@ pub fn vty_init() -> Result<(), SystemError> {
 
     TtyDriverManager::tty_register_driver(console_driver)?;
 
-    *CURRENT_VCNUM.write_irqsave() = Some(0);
+    CURRENT_VCNUM.store(0, Ordering::SeqCst);
 
     // 初始化键盘？
 

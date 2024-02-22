@@ -9,12 +9,14 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::EventWaitQueue,
     },
+    mm::VirtAddr,
     net::event_poll::EPollEventType,
     process::Pid,
+    syscall::user_access::UserBufferWriter,
 };
 
 use super::{
-    termios::{Termios, WindowSize},
+    termios::{ControlMode, PosixTermios, Termios, TtySetTermiosOpt, WindowSize},
     tty_driver::{TtyDriver, TtyDriverSubType, TtyDriverType, TtyOperation},
     tty_ldisc::{
         ntty::{NTtyData, NTtyLinediscipline},
@@ -124,6 +126,100 @@ impl TtyCore {
         self.core()
             .write_wq
             .wakeup(EPollEventType::EPOLLOUT.bits() as u64);
+    }
+
+    pub fn tty_mode_ioctl(
+        &self,
+        tty: Arc<TtyCore>,
+        cmd: u32,
+        arg: usize,
+    ) -> Result<usize, SystemError> {
+        match cmd {
+            TtyIoctlCmd::TCGETS => {
+                let termios = PosixTermios::from_kernel_termios(self.core.termios().clone());
+                let mut user_writer = UserBufferWriter::new(
+                    VirtAddr::new(arg).as_ptr::<PosixTermios>(),
+                    core::mem::size_of::<PosixTermios>(),
+                    true,
+                )?;
+
+                user_writer.copy_one_to_user(&termios, 0)?;
+                return Ok(0);
+            }
+            TtyIoctlCmd::TCSETSW => {
+                return self.core_set_termios(
+                    tty,
+                    VirtAddr::new(arg),
+                    TtySetTermiosOpt::TERMIOS_WAIT | TtySetTermiosOpt::TERMIOS_OLD,
+                );
+            }
+            _ => {
+                return Err(SystemError::ENOIOCTLCMD);
+            }
+        }
+    }
+
+    pub fn core_set_termios(
+        &self,
+        tty: Arc<TtyCore>,
+        arg: VirtAddr,
+        opt: TtySetTermiosOpt,
+    ) -> Result<usize, SystemError> {
+        let tmp_termios = self.core().termios().clone();
+
+        if opt.contains(TtySetTermiosOpt::TERMIOS_TERMIO) {
+            todo!()
+        } else {
+            let mut user_writer = UserBufferWriter::new(
+                arg.as_ptr::<PosixTermios>(),
+                core::mem::size_of::<PosixTermios>(),
+                true,
+            )?;
+
+            user_writer.copy_one_to_user(&tmp_termios, 0)?;
+        }
+
+        if opt.contains(TtySetTermiosOpt::TERMIOS_FLUSH) {
+            let ld = self.ldisc();
+            let _ = ld.flush_buffer(tty.clone());
+        }
+
+        if opt.contains(TtySetTermiosOpt::TERMIOS_WAIT) {
+            // TODO
+        }
+
+        self.set_termios_next(tty, tmp_termios)?;
+
+        Ok(0)
+    }
+
+    pub fn set_termios_next(
+        &self,
+        tty: Arc<TtyCore>,
+        new_termios: Termios,
+    ) -> Result<(), SystemError> {
+        let mut termios = self.core().termios_write();
+
+        let old_termios = termios.clone();
+
+        *termios = new_termios;
+
+        let tmp = termios.control_mode;
+        termios.control_mode ^= (tmp ^ old_termios.control_mode) & ControlMode::ADDRB;
+
+        let ret = self.set_termios(tty.clone(), old_termios);
+        if ret.is_err() {
+            termios.control_mode &= ControlMode::HUPCL | ControlMode::CREAD | ControlMode::CLOCAL;
+            termios.control_mode |= old_termios.control_mode
+                & !(ControlMode::HUPCL | ControlMode::CREAD | ControlMode::CLOCAL);
+            termios.input_speed = old_termios.input_speed;
+            termios.output_speed = old_termios.output_speed;
+        }
+
+        let ld = self.ldisc();
+        ld.set_termios(tty, Some(old_termios))?;
+
+        Ok(())
     }
 }
 
@@ -314,16 +410,33 @@ impl TtyOperation for TtyCore {
         return self.core().tty_driver.driver_funcs().install(driver, tty);
     }
 
+    #[inline]
     fn start(&self, tty: &TtyCoreData) -> Result<(), SystemError> {
         return self.core().tty_driver.driver_funcs().start(tty);
     }
 
+    #[inline]
     fn stop(&self, tty: &TtyCoreData) -> Result<(), SystemError> {
         return self.core().tty_driver.driver_funcs().stop(tty);
     }
 
+    #[inline]
     fn ioctl(&self, tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<(), SystemError> {
         return self.core().tty_driver.driver_funcs().ioctl(tty, cmd, arg);
+    }
+
+    #[inline]
+    fn chars_in_buffer(&self) -> usize {
+        return self.core().tty_driver.driver_funcs().chars_in_buffer();
+    }
+
+    #[inline]
+    fn set_termios(&self, tty: Arc<TtyCore>, old_termios: Termios) -> Result<(), SystemError> {
+        return self
+            .core()
+            .tty_driver
+            .driver_funcs()
+            .set_termios(tty, old_termios);
     }
 }
 

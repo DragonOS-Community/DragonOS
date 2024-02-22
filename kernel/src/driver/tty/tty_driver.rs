@@ -1,4 +1,4 @@
-use core::fmt::Debug;
+use core::{fmt::Debug, sync::atomic::Ordering};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use hashbrown::HashMap;
@@ -250,7 +250,7 @@ impl TtyDriver {
             None => Self::init_tty_device(driver, index)?,
         };
 
-        *CURRENT_VCNUM.write_irqsave() = Some(index);
+        CURRENT_VCNUM.store(index as isize, Ordering::SeqCst);
 
         return Ok(tty);
     }
@@ -386,6 +386,14 @@ pub trait TtyOperation: Sync + Send + Debug {
     }
 
     fn ioctl(&self, tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<(), SystemError>;
+
+    fn chars_in_buffer(&self) -> usize {
+        0
+    }
+
+    fn set_termios(&self, _tty: Arc<TtyCore>, _old_termios: Termios) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 }
 
 #[allow(dead_code)]

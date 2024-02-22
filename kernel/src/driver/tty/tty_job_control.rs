@@ -3,8 +3,9 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
+    mm::VirtAddr,
     process::{Pid, ProcessManager},
-    syscall::Syscall,
+    syscall::{user_access::UserBufferWriter, Syscall},
 };
 
 use super::tty_core::{TtyCore, TtyIoctlCmd};
@@ -85,9 +86,7 @@ impl TtyJobCtrlManager {
                 // )?;
 
                 // let pgrp = user_reader.read_one_from_user::<usize>(0)?;
-                return Ok(0);
-                kwarn!("arg {arg}");
-                kwarn!("*arg {}", unsafe { *(arg as *const usize) });
+
                 let current = ProcessManager::current_pcb();
 
                 let mut ctrl = tty.core().contorl_info_irqsave();
@@ -101,6 +100,33 @@ impl TtyJobCtrlManager {
                 }
 
                 ctrl.pgid = Some(Pid::new(arg));
+
+                return Ok(0);
+            }
+
+            TtyIoctlCmd::TIOCGPGRP => {
+                let current = ProcessManager::current_pcb();
+                if current.sig_info().tty().is_some()
+                    && !Arc::ptr_eq(&current.sig_info().tty().unwrap(), &tty)
+                {
+                    return Err(SystemError::ENOTTY);
+                }
+
+                let mut user_writer = UserBufferWriter::new(
+                    VirtAddr::new(arg).as_ptr::<i32>(),
+                    core::mem::size_of::<i32>(),
+                    true,
+                )?;
+
+                user_writer.copy_one_to_user(
+                    &(tty
+                        .core()
+                        .contorl_info_irqsave()
+                        .pgid
+                        .unwrap_or(Pid::new(0))
+                        .data() as i32),
+                    0,
+                )?;
 
                 return Ok(0);
             }

@@ -77,7 +77,18 @@ pub trait TtyLineDiscipline: Sync + Send + Debug {
 
 #[derive(Debug, Clone, Copy)]
 pub enum LineDisciplineType {
-    NTty,
+    NTty = 0,
+}
+
+impl LineDisciplineType {
+    pub fn from_line(line: u8) -> Self {
+        match line {
+            0 => Self::NTty,
+            _ => {
+                todo!()
+            }
+        }
+    }
 }
 
 pub struct TtyLdiscManager;

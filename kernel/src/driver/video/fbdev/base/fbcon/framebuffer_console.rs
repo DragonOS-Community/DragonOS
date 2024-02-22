@@ -172,10 +172,6 @@ impl BlittingFbConsole {
 }
 
 impl ConsoleSwitch for BlittingFbConsole {
-    fn con_startup(&self) -> Result<alloc::string::String, system_error::SystemError> {
-        todo!()
-    }
-
     fn con_init(
         &self,
         vc_data: &mut VirtualConsoleData,

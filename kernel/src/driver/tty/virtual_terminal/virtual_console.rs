@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use alloc::{
     sync::{Arc, Weak},
@@ -27,7 +27,7 @@ lazy_static! {
     /// 是否已经添加了软光标
     pub(super) static ref SOFTCURSOR_ORIGINAL: RwLock<Option<VcCursor>> = RwLock::new(None);
 
-    pub static ref CURRENT_VCNUM: RwLock<Option<usize>> = RwLock::new(None);
+    pub static ref CURRENT_VCNUM: AtomicIsize = AtomicIsize::new(-1);
 
     pub static ref CONSOLE_BLANKED: AtomicBool = AtomicBool::new(false);
 }
@@ -235,11 +235,12 @@ impl VirtualConsoleData {
     }
 
     pub fn is_visible(&self) -> bool {
-        let guard = CURRENT_VCNUM.read_irqsave();
-        if guard.is_none() {
+        let cur_vc = CURRENT_VCNUM.load(Ordering::SeqCst);
+        if cur_vc == -1 {
             return false;
         }
-        guard.unwrap() == self.num
+
+        cur_vc as usize == self.num
     }
 
     fn driver_funcs(&self) -> Arc<dyn ConsoleSwitch> {
@@ -1841,6 +1842,7 @@ impl VirtualConsoleInfo {
     }
 }
 
+/// 字符强度
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub enum VirtualConsoleIntensity {
     /// 暗淡

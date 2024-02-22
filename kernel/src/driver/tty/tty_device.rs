@@ -276,7 +276,6 @@ impl IndexNode for TtyDevice {
             _ => {}
         }
 
-        kwarn!("cmd {cmd:x}");
         match cmd {
             TtyIoctlCmd::TIOCGWINSZ => {
                 let core = tty.core();
@@ -295,7 +294,9 @@ impl IndexNode for TtyDevice {
                 return Ok(0);
             }
             _ => match TtyJobCtrlManager::job_ctrl_ioctl(tty.clone(), cmd, arg) {
-                Ok(_) => {}
+                Ok(_) => {
+                    return Ok(0);
+                }
                 Err(e) => {
                     if e != SystemError::ENOIOCTLCMD {
                         return Err(e);
@@ -304,7 +305,16 @@ impl IndexNode for TtyDevice {
             },
         }
 
-        tty.ioctl(tty.clone(), cmd, arg)?;
+        match tty.ioctl(tty.clone(), cmd, arg) {
+            Ok(_) => {
+                return Ok(0);
+            }
+            Err(e) => {
+                if e != SystemError::ENOIOCTLCMD {
+                    return Err(e);
+                }
+            }
+        }
         tty.ldisc().ioctl(tty, cmd, arg)?;
 
         Ok(0)
@@ -444,6 +454,7 @@ pub struct TtyFilePrivateData {
 
 /// 初始化tty设备和console子设备
 #[unified_init(INITCALL_DEVICE)]
+#[inline(never)]
 pub fn tty_init() -> Result<(), SystemError> {
     let tty = TtyDevice::new(
         "tty0",

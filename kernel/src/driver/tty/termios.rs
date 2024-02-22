@@ -1,6 +1,7 @@
 use super::tty_ldisc::LineDisciplineType;
 
 /// ## 窗口大小
+#[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WindowSize {
     /// 行
@@ -25,38 +26,110 @@ pub struct Termios {
     pub output_speed: u32,
 }
 
-lazy_static! {
-    pub static ref INIT_CONTORL_CHARACTERS: [u8; CONTORL_CHARACTER_NUM] = {
-        let mut chs: [u8; CONTORL_CHARACTER_NUM] = Default::default();
-        chs[ContorlCharIndex::VINTR] = b'C' - 0x40;
-        chs[ContorlCharIndex::VQUIT] = b'\\' - 0x40;
-        chs[ContorlCharIndex::VERASE] = 0o177;
-        chs[ContorlCharIndex::VKILL] = b'U' - 0x40;
-        chs[ContorlCharIndex::VEOF] = b'D' - 0x40;
-        chs[ContorlCharIndex::VSTART] = b'Q' - 0x40;
-        chs[ContorlCharIndex::VSTOP] = b'S' - 0x40;
-        chs[ContorlCharIndex::VSUSP] = b'Z' - 0x40;
-        chs[ContorlCharIndex::VREPRINT] = b'R' - 0x40;
-        chs[ContorlCharIndex::VDISCARD] = b'O' - 0x40;
-        chs[ContorlCharIndex::VWERASE] = b'W' - 0x40;
-        chs[ContorlCharIndex::VLNEXT] = b'V' - 0x40;
-        // chs[ContorlCharIndex::VDSUSP] = b'Y'  - 0x40;
-        chs[ContorlCharIndex::VMIN] = 1;
-        return chs;
-    };
+#[derive(Clone, Copy)]
+pub struct PosixTermios {
+    pub c_iflag: u32,
+    pub c_oflag: u32,
+    pub c_cflag: u32,
+    pub c_lflag: u32,
+    pub c_cc: [u8; CONTORL_CHARACTER_NUM],
+    pub c_line: u8,
+    pub c_ispeed: u32,
+    pub c_ospeed: u32,
+}
 
+impl PosixTermios {
+    pub fn from_kernel_termios(termios: Termios) -> Self {
+        Self {
+            c_iflag: termios.input_mode.bits,
+            c_oflag: termios.output_mode.bits,
+            c_cflag: termios.control_mode.bits,
+            c_lflag: termios.local_mode.bits,
+            c_cc: termios.control_characters.clone(),
+            c_line: termios.line as u8,
+            c_ispeed: termios.input_speed,
+            c_ospeed: termios.output_speed,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn to_kernel_termios(&self) -> Termios {
+        Termios {
+            input_mode: InputMode::from_bits_truncate(self.c_iflag),
+            output_mode: OutputMode::from_bits_truncate(self.c_oflag),
+            control_mode: ControlMode::from_bits_truncate(self.c_cflag),
+            local_mode: LocalMode::from_bits_truncate(self.c_lflag),
+            control_characters: self.c_cc.clone(),
+            line: LineDisciplineType::from_line(self.c_line),
+            input_speed: self.c_ispeed,
+            output_speed: self.c_ospeed,
+        }
+    }
+}
+
+pub const INIT_CONTORL_CHARACTERS: [u8; CONTORL_CHARACTER_NUM] = [
+    b'C' - 0x40,  // VINTR
+    b'\\' - 0x40, // VQUIT
+    0o177,        // VERASE
+    b'U' - 0x40,  // VKILL
+    b'D' - 0x40,  // VEOF
+    1,            // VMIN
+    0,            // VEOL
+    0,            // VTIME
+    0,            // VEOL2
+    0,            // VSWTC
+    b'W' - 0x40,  // VWERASE
+    b'R' - 0x40,  // VREPRINT
+    b'Z' - 0x40,  // VSUSP
+    b'Q' - 0x40,  // VSTART
+    b'S' - 0x40,  // VSTOP
+    b'V' - 0x40,  // VLNEXT
+    b'O' - 0x40,  // VDISCARD
+    0,
+    0,
+];
+
+// pub const INIT_CONTORL_CHARACTERS: [u8; CONTORL_CHARACTER_NUM] = {
+//     let mut chs: [u8; CONTORL_CHARACTER_NUM] = Default::default();
+//     chs[ControlCharIndex::VINTR] = b'C' - 0x40;
+//     chs[ControlCharIndex::VQUIT] = b'\\' - 0x40;
+//     chs[ControlCharIndex::VERASE] = 0o177;
+//     chs[ControlCharIndex::VKILL] = b'U' - 0x40;
+//     chs[ControlCharIndex::VEOF] = b'D' - 0x40;
+//     chs[ControlCharIndex::VSTART] = b'Q' - 0x40;
+//     chs[ControlCharIndex::VSTOP] = b'S' - 0x40;
+//     chs[ControlCharIndex::VSUSP] = b'Z' - 0x40;
+//     chs[ControlCharIndex::VREPRINT] = b'R' - 0x40;
+//     chs[ControlCharIndex::VDISCARD] = b'O' - 0x40;
+//     chs[ControlCharIndex::VWERASE] = b'W' - 0x40;
+//     chs[ControlCharIndex::VLNEXT] = b'V' - 0x40;
+//     // chs[ContorlCharIndex::VDSUSP] = b'Y'  - 0x40;
+//     chs[ControlCharIndex::VMIN] = 1;
+//     return chs;
+// };
+
+lazy_static! {
     pub static ref TTY_STD_TERMIOS: Termios = {
         Termios {
             input_mode: InputMode::ICRNL | InputMode::IXON,
             output_mode: OutputMode::OPOST | OutputMode::ONLCR,
-            control_mode: ControlMode::B38400 | ControlMode::CREAD | ControlMode::HUPCL | ControlMode::CS8,
-            local_mode: LocalMode::ISIG | LocalMode::ICANON | LocalMode::ECHO
-                        | LocalMode::ECHOE | LocalMode::ECHOK | LocalMode::ECHOCTL
-                        | LocalMode::ECHOKE | LocalMode::IEXTEN,
+            control_mode: ControlMode::B38400
+                | ControlMode::CREAD
+                | ControlMode::HUPCL
+                | ControlMode::CS8,
+            local_mode: LocalMode::ISIG
+                | LocalMode::ICANON
+                | LocalMode::ECHO
+                | LocalMode::ECHOE
+                | LocalMode::ECHOK
+                | LocalMode::ECHOCTL
+                | LocalMode::ECHOKE
+                | LocalMode::IEXTEN,
             control_characters: INIT_CONTORL_CHARACTERS.clone(),
             line: LineDisciplineType::NTty,
             input_speed: 38400,
-            output_speed: 38400 }
+            output_speed: 38400,
+        }
     };
 }
 
@@ -220,6 +293,8 @@ bitflags! {
         const CLOCAL	= 0x00008000;
         /// 指定输入波特率的掩码
         const CIBAUD	= 0x00ff0000;
+
+        const ADDRB = 0x20000000;
     }
 
     /// 配置终端设备的本地模式（local mode）或控制输入处理的行为
@@ -257,12 +332,19 @@ bitflags! {
         /// 表示启用扩展的处理函数
         const EXTPROC= 0x10000000;
     }
+
+    pub struct TtySetTermiosOpt: u8 {
+        const TERMIOS_FLUSH	=1;
+        const TERMIOS_WAIT	=2;
+        const TERMIOS_TERMIO	=4;
+        const TERMIOS_OLD	=8;
+    }
 }
 
 /// 对应termios中控制字符的索引
-pub struct ContorlCharIndex;
+pub struct ControlCharIndex;
 #[allow(dead_code)]
-impl ContorlCharIndex {
+impl ControlCharIndex {
     pub const DISABLE_CHAR: u8 = b'\0';
     /// 中断信号
     pub const VINTR: usize = 0;

@@ -1,4 +1,7 @@
-use core::fmt::{self, Write};
+use core::{
+    fmt::{self, Write},
+    sync::atomic::Ordering,
+};
 
 use alloc::string::ToString;
 
@@ -98,10 +101,10 @@ impl PrintkWriter {
     /// 并输出白底黑字
     /// @param str: 要写入的字符
     pub fn __write_string(&mut self, s: &str) {
-        let current_vcnum = CURRENT_VCNUM.read_irqsave();
-        if current_vcnum.is_some() {
+        let current_vcnum = CURRENT_VCNUM.load(Ordering::SeqCst);
+        if current_vcnum != -1 {
             // tty已经初始化了之后才输出到屏幕
-            let port = VIRT_CONSOLES[current_vcnum.unwrap()].lock_irqsave().port();
+            let port = VIRT_CONSOLES[current_vcnum as usize].lock_irqsave().port();
             let tty = port.port_data().tty();
             if tty.is_some() {
                 let tty = tty.unwrap();

@@ -1,3 +1,5 @@
+use core::sync::atomic::Ordering;
+
 use alloc::sync::Arc;
 
 use crate::driver::tty::{
@@ -363,7 +365,7 @@ impl TypeOneFSMState {
 
     #[inline]
     fn current_port() -> Arc<dyn TtyPort> {
-        VIRT_CONSOLES[CURRENT_VCNUM.read_irqsave().unwrap()]
+        VIRT_CONSOLES[CURRENT_VCNUM.load(Ordering::SeqCst) as usize]
             .lock_irqsave()
             .port()
     }

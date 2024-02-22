@@ -973,6 +973,7 @@ impl Syscall {
                 Err(SystemError::ENOSYS)
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_GETRLIMIT => {
                 let resource = args[0];
                 let rlimit = args[1] as *mut RLimit64;

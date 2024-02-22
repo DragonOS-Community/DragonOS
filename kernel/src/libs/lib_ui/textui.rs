@@ -989,8 +989,8 @@ where
 
 #[no_mangle]
 pub extern "C" fn rs_textui_putchar(character: u8, fr_color: u32, bk_color: u32) -> i32 {
-    let current_vcnum = CURRENT_VCNUM.read_irqsave();
-    if current_vcnum.is_some() {
+    let current_vcnum = CURRENT_VCNUM.load(Ordering::SeqCst);
+    if current_vcnum != -1 {
         // tty已经初始化了之后才输出到屏幕
         let fr = (fr_color & 0x00ff0000) >> 16;
         let fg = (fr_color & 0x0000ff00) >> 8;
@@ -1002,7 +1002,7 @@ pub extern "C" fn rs_textui_putchar(character: u8, fr_color: u32, bk_color: u32)
             "\x1B[38;2;{fr};{fg};{fb};48;2;{br};{bg};{bb}m{}\x1B[0m",
             character as char
         );
-        let port = VIRT_CONSOLES[current_vcnum.unwrap()].lock_irqsave().port();
+        let port = VIRT_CONSOLES[current_vcnum as usize].lock_irqsave().port();
         let tty = port.port_data().tty();
         if tty.is_some() {
             let tty = tty.unwrap();

@@ -118,7 +118,7 @@ pub struct TranslationMap {
 }
 
 impl TranslationMap {
-    pub fn new(map_type: TranslationMapType) -> Self {
+    pub const fn new(map_type: TranslationMapType) -> Self {
         let map = match map_type {
             TranslationMapType::Lat1Map => LAT1_MAP,
             TranslationMapType::GrafMap => GRAF_MAP,

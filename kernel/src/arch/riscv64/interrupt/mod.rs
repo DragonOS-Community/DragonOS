@@ -1,6 +1,6 @@
 use system_error::SystemError;
 
-use crate::exception::{InterruptArch, IrqFlags, IrqFlagsGuard};
+use crate::exception::{InterruptArch, IrqFlags, IrqFlagsGuard, IrqNumber};
 
 pub mod ipi;
 
@@ -34,6 +34,15 @@ impl InterruptArch for RiscV64InterruptArch {
         } else {
             riscv::register::sstatus::clear_sie();
         }
+    }
+
+    fn probe_total_irq_num() -> u32 {
+        // todo: 获取中断总数
+        256
+    }
+
+    fn ack_bad_irq(irq: IrqNumber) {
+        todo!("ack_bad_irq: {}", irq.data());
     }
 }
 

@@ -1,4 +1,19 @@
-CURRENT_SHELL=$(basename $SHELL)
+#!/bin/bash
+
+if test -n "$ZSH_VERSION"; then
+  CURRENT_SHELL=zsh
+elif test -n "$BASH_VERSION"; then
+  CURRENT_SHELL=bash
+elif test -n "$KSH_VERSION"; then
+  CURRENT_SHELL=ksh
+elif test -n "$FCEDIT"; then
+  CURRENT_SHELL=ksh
+elif test -n "$PS3"; then
+  CURRENT_SHELL=unknown
+else
+  CURRENT_SHELL=sh
+fi
+
 source "$HOME/.$CURRENT_SHELL"rc
 
 emulator="qemu"
@@ -90,7 +105,7 @@ install_archlinux_pkg()
 	curl wget bridge-utils dnsmasq \
         diffutils pkgconf which unzip util-linux dosfstools \
         gcc make flex texinfo gmp mpfr qemu-base \
-        libmpc libssl-dev
+        libmpc openssl
 
 }
 
@@ -289,14 +304,16 @@ install_python_pkg
 # 安装dadk
 cargo install dadk || exit 1
 
+bashpath=$(cd `dirname $0`; pwd)
+
 # 创建磁盘镜像
-bash create_hdd_image.sh
+bash ${bashpath}/create_hdd_image.sh
 # 编译安装GCC交叉编译工具链
-bash build_gcc_toolchain.sh -cs -kb -kg || (echo "GCC交叉编译工具链安装失败" && exit 1)
+bash ${bashpath}/build_gcc_toolchain.sh -cs -kb -kg || (echo "GCC交叉编译工具链安装失败" && exit 1)
 # 编译安装musl交叉编译工具链
-bash install_musl_gcc.sh || (echo "musl交叉编译工具链安装失败" && exit 1)
+bash ${bashpath}/install_musl_gcc.sh || (echo "musl交叉编译工具链安装失败" && exit 1)
 # 编译安装grub
-bash grub_auto_install.sh || (echo "grub安装失败" && exit 1)
+bash ${bashpath}/grub_auto_install.sh || (echo "grub安装失败" && exit 1)
 
 # 解决kvm权限问题
 USR=$USER

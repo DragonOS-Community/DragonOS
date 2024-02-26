@@ -35,6 +35,45 @@ pub mod ucontext;
 /// 内核INIT进程的用户地址空间结构体（仅在process_init中初始化）
 static mut __INITIAL_PROCESS_ADDRESS_SPACE: Option<Arc<AddressSpace>> = None;
 
+bitflags! {
+    /// Virtual memory flags
+    pub struct VmFlags:u32{
+        const VM_NONE = 0x00000000;
+
+        const VM_READ = 0x00000001;
+        const VM_WRITE = 0x00000002;
+        const VM_EXEC = 0x00000004;
+        const VM_SHARED = 0x00000008;
+
+        const VM_MAYREAD = 0x00000010;
+        const VM_MAYWRITE = 0x00000020;
+        const VM_MAYEXEC = 0x00000040;
+        const VM_MAYSHARE = 0x00000080;
+
+        const VM_GROWSDOWN = 0x00000100;
+        const VM_UFFD_MISSING = 0x00000200;
+        const VM_PFNMAP = 0x00000400;
+        const VM_UFFD_WP = 0x00001000;
+
+        const VM_LOCKED = 0x00002000;
+        const VM_IO = 0x00004000;
+
+        const VM_SEQ_READ = 0x00008000;
+        const VM_RAND_READ = 0x00010000;
+
+        const VM_DONTCOPY = 0x00020000;
+        const VM_DONTEXPAND = 0x00040000;
+        const VM_LOCKONFAULT = 0x00080000;
+        const VM_ACCOUNT = 0x00100000;
+        const VM_NORESERVE = 0x00200000;
+        const VM_HUGETLB = 0x00400000;
+        const VM_SYNC = 0x00800000;
+        const VM_ARCH_1 = 0x01000000;
+        const VM_WIPEONFORK = 0x02000000;
+        const VM_DONTDUMP = 0x04000000;
+    }
+}
+
 /// 获取内核INIT进程的用户地址空间结构体
 #[allow(non_snake_case)]
 #[inline(always)]

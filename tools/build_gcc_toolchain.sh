@@ -1,4 +1,19 @@
-CURRENT_SHELL=$(basename $SHELL)
+#!/bin/bash
+
+if test -n "$ZSH_VERSION"; then
+  CURRENT_SHELL=zsh
+elif test -n "$BASH_VERSION"; then
+  CURRENT_SHELL=bash
+elif test -n "$KSH_VERSION"; then
+  CURRENT_SHELL=ksh
+elif test -n "$FCEDIT"; then
+  CURRENT_SHELL=ksh
+elif test -n "$PS3"; then
+  CURRENT_SHELL=unknown
+else
+  CURRENT_SHELL=sh
+fi
+
 source "$HOME/.$CURRENT_SHELL"rc
 
 # init something here
@@ -101,9 +116,9 @@ case `cat /etc/os-release | grep '^NAME=' | cut -d'"' -f2` in
 esac
 
 # build the workspace
-mkdir $HOME/opt
-mkdir $INSTALL_POS
-mkdir $PREFIX
+mkdir -p $HOME/opt
+mkdir -p $INSTALL_POS
+mkdir -p $PREFIX
 cd $INSTALL_POS
 
 
@@ -145,7 +160,7 @@ GCC_FILE_TAR="${GCC_FILE}.tar.gz"
 if [ ! -n "$(find $PREFIX/bin/* -name $TARGET_GCC)" ] || [ ${KEEP_GCC} -ne 1 ]; then
     if [ $KEEP_GCC -eq 1 ]; then
         echo -e "\033[35m 没有检测到 $TARGET_GCC, -kg参数无效 \033[0m"
-        echo -e "\033[35m 开始安装binutils \033[0m"
+        echo -e "\033[35m 开始安装gcc \033[0m"
         sleep 1s
     fi
     if [ ! -d "$GCC_FILE" ]; then

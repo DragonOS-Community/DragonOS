@@ -967,6 +967,18 @@ impl Syscall {
                 Err(SystemError::ENOSYS)
             }
 
+            SYS_FADVISE64 => {
+                // todo: 这个系统调用还没有实现
+                // let fd = args[0] as i32;
+                // let offset = args[1] as i64;
+            
+                // let len = page_align_up(args[2]);
+                // let advise = args[3] as i32;
+                // Self::fadvise(fd, offset, len, advise);
+                kwarn!("SYS_EXIT_FADVISE has not yet been implemented");
+                Ok(0)
+            }
+
             SYS_SCHED_YIELD => Self::sched_yield(),
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),

@@ -1,0 +1,24 @@
+{
+  "name": "cat",
+  "version": "0.1.0",
+  "description": "test for cat",
+  "rust_target": null,
+  "task_type": {
+    "InstallFromPrebuilt": {
+      "Local": {
+        "path": "/home/hyt/DragonOS/user/apps/test_cat"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    
+  },
+  "install": {
+    "in_dragonos_path": "/bin"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "envs": []
+}

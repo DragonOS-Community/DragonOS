@@ -26,7 +26,7 @@ pub struct Termios {
     pub output_speed: u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct PosixTermios {
     pub c_iflag: u32,
     pub c_oflag: u32,
@@ -54,6 +54,7 @@ impl PosixTermios {
 
     #[allow(dead_code)]
     pub fn to_kernel_termios(&self) -> Termios {
+        // TODO：这里没有考虑非规范模式
         Termios {
             input_mode: InputMode::from_bits_truncate(self.c_iflag),
             output_mode: OutputMode::from_bits_truncate(self.c_oflag),

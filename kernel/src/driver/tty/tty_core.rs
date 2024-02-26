@@ -12,7 +12,7 @@ use crate::{
     mm::VirtAddr,
     net::event_poll::EPollEventType,
     process::Pid,
-    syscall::user_access::UserBufferWriter,
+    syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
 use super::{
@@ -165,18 +165,23 @@ impl TtyCore {
         arg: VirtAddr,
         opt: TtySetTermiosOpt,
     ) -> Result<usize, SystemError> {
-        let tmp_termios = self.core().termios().clone();
+        #[allow(unused_assignments)]
+        // TERMIOS_TERMIO下会用到
+        let mut tmp_termios = self.core().termios().clone();
 
         if opt.contains(TtySetTermiosOpt::TERMIOS_TERMIO) {
             todo!()
         } else {
-            let mut user_writer = UserBufferWriter::new(
+            let user_reader = UserBufferReader::new(
                 arg.as_ptr::<PosixTermios>(),
                 core::mem::size_of::<PosixTermios>(),
                 true,
             )?;
 
-            user_writer.copy_one_to_user(&tmp_termios, 0)?;
+            let mut term = PosixTermios::default();
+            user_reader.copy_one_from_user(&mut term, 0)?;
+
+            tmp_termios = term.to_kernel_termios();
         }
 
         if opt.contains(TtySetTermiosOpt::TERMIOS_FLUSH) {

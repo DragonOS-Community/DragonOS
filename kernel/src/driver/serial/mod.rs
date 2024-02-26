@@ -7,11 +7,9 @@ use crate::{driver::base::device::device_number::DeviceNumber, mm::VirtAddr};
 
 use self::serial8250::serial8250_manager;
 
-use super::tty_driver::TtyDriver;
-
 pub mod serial8250;
 
-pub trait UartDriver: Debug + Send + Sync + TtyDriver {
+pub trait UartDriver: Debug + Send + Sync {
     fn device_number(&self) -> DeviceNumber;
 
     /// 获取最大的设备数量
@@ -56,6 +54,7 @@ impl UartManager {
     /// todo: 把uart设备注册到tty层
     ///
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/tty/serial/serial_core.c?fi=uart_register_driver#2720
+    #[allow(dead_code)]
     pub fn register_driver(&self, _driver: &Arc<dyn UartDriver>) -> Result<(), SystemError> {
         return Ok(());
     }

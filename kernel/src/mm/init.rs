@@ -1,7 +1,7 @@
 use core::{fmt::Write, sync::atomic::Ordering};
 
 use crate::{
-    arch::MMArch, driver::tty::serial::serial8250::send_to_default_serial8250_port,
+    arch::MMArch, driver::serial::serial8250::send_to_default_serial8250_port,
     filesystem::procfs::kmsg::kmsg_init, libs::printk::PrintkWriter, mm::mmio_buddy::mmio_init,
 };
 

@@ -285,6 +285,8 @@ pub enum SystemError {
     EVMPRTLDFailed = 517,
     EVMLAUNCHFailed = 518,
     KVM_HVA_ERR_BAD = 519,
+    /// 没有对应的ioctlcmd
+    ENOIOCTLCMD = 520,
 }
 
 impl SystemError {

@@ -317,8 +317,13 @@ impl IndexNode for MountFSInode {
     }
 
     #[inline]
-    fn ioctl(&self, cmd: u32, data: usize) -> Result<usize, SystemError> {
-        return self.inner_inode.ioctl(cmd, data);
+    fn ioctl(
+        &self,
+        cmd: u32,
+        data: usize,
+        private_data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        return self.inner_inode.ioctl(cmd, data, private_data);
     }
 
     #[inline]

@@ -1,4 +1,4 @@
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Major(u32);
 
 impl Major {
@@ -10,6 +10,8 @@ impl Major {
     pub const UNNAMED_MAJOR: Self = Self::new(0);
 
     pub const IDE0_MAJOR: Self = Self::new(3);
+    pub const TTY_MAJOR: Self = Self::new(4);
+    pub const TTYAUX_MAJOR: Self = Self::new(5);
     pub const HD_MAJOR: Self = Self::IDE0_MAJOR;
 
     pub const INPUT_MAJOR: Self = Self::new(13);

@@ -19,7 +19,10 @@ use crate::{
             kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        input::{ps2_dev::ps2_device::Ps2Device, serio::serio_device::SerioDevice},
+        input::{
+            ps2_dev::ps2_device::Ps2Device,
+            serio::serio_device::{serio_device_manager, SerioDevice},
+        },
     },
     exception::InterruptArch,
     filesystem::{
@@ -314,7 +317,7 @@ impl Ps2MouseDevice {
                 //     guard.current_state.flags.bits,
                 //     guard.current_state.x,
                 //     guard.current_state.y
-                // )
+                // );
             }
             _ => unreachable!(),
         }
@@ -655,7 +658,7 @@ pub fn rs_ps2_mouse_device_init(parent: Arc<dyn KObject>) -> Result<(), SystemEr
 
     device_manager().device_default_initialize(&(psmouse.clone() as Arc<dyn Device>));
     psmouse.set_parent(Some(Arc::downgrade(&parent)));
-    device_manager().add_device(psmouse.clone() as Arc<dyn Device>)?;
+    serio_device_manager().register_port(psmouse.clone() as Arc<dyn SerioDevice>)?;
 
     devfs_register(&psmouse.name(), psmouse.clone()).map_err(|e| {
         kerror!(

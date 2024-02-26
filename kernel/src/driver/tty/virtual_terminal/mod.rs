@@ -96,7 +96,6 @@ pub struct TtyConsoleDriverInner {
     console: Arc<BlittingFbConsole>,
 }
 
-unsafe impl Send for TtyConsoleDriverInner {}
 unsafe impl Sync for TtyConsoleDriverInner {}
 
 impl TtyConsoleDriverInner {

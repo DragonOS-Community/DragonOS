@@ -1,14 +1,31 @@
 use core::fmt::Debug;
 
-use alloc::sync::{Arc, Weak};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use kdepends::thingbuf::mpsc;
 use system_error::SystemError;
 
-use crate::libs::spinlock::{SpinLock, SpinLockGuard};
+use crate::{
+    driver::tty::virtual_terminal::MAX_NR_CONSOLES,
+    libs::spinlock::{SpinLock, SpinLockGuard},
+};
 
 use super::tty_core::TtyCore;
 
 const TTY_PORT_BUFSIZE: usize = 4096;
+
+lazy_static! {
+    pub static ref TTY_PORTS: Vec<Arc<dyn TtyPort>> = {
+        let mut v: Vec<Arc<dyn TtyPort>> = Vec::with_capacity(MAX_NR_CONSOLES as usize);
+        for _ in 0..MAX_NR_CONSOLES as usize {
+            v.push(Arc::new(DefaultTtyPort::new()))
+        }
+
+        v
+    };
+}
 
 #[allow(dead_code)]
 #[derive(Debug)]

@@ -274,19 +274,13 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
 pub struct FrameBufferInfoData {
     /// 颜色映射
     pub color_map: Vec<Color>,
-    /// 当前的可变帧缓冲信息
-    pub fb_var: FbVarScreenInfo,
-    /// 当前的固定帧缓冲信息
-    pub fb_fix: FixedScreenInfo,
     /// 颜色映射表
     pub pesudo_palette: Vec<u32>,
 }
 
 impl FrameBufferInfoData {
-    pub fn new(var: FbVarScreenInfo, fix: FixedScreenInfo) -> Self {
+    pub fn new() -> Self {
         Self {
-            fb_fix: fix,
-            fb_var: var,
             ..Default::default()
         }
     }

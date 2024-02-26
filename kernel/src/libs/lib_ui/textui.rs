@@ -2,8 +2,8 @@ use crate::{
     driver::{
         serial::serial8250::send_to_default_serial8250_port,
         tty::{
-            tty_driver::TtyOperation,
-            virtual_terminal::{virtual_console::CURRENT_VCNUM, VIRT_CONSOLES},
+            tty_driver::TtyOperation, tty_port::TTY_PORTS,
+            virtual_terminal::virtual_console::CURRENT_VCNUM,
         },
         video::video_refresh_manager,
     },
@@ -1002,7 +1002,7 @@ pub extern "C" fn rs_textui_putchar(character: u8, fr_color: u32, bk_color: u32)
             "\x1B[38;2;{fr};{fg};{fb};48;2;{br};{bg};{bb}m{}\x1B[0m",
             character as char
         );
-        let port = VIRT_CONSOLES[current_vcnum as usize].lock_irqsave().port();
+        let port = TTY_PORTS[current_vcnum as usize].clone();
         let tty = port.port_data().tty();
         if tty.is_some() {
             let tty = tty.unwrap();

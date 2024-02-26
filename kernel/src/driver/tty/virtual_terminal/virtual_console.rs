@@ -7,11 +7,7 @@ use alloc::{
 use bitmap::{traits::BitMapOps, StaticBitmap};
 
 use crate::{
-    driver::tty::{
-        console::ConsoleSwitch,
-        tty_port::{DefaultTtyPort, TtyPort},
-        ConsoleFont, KDMode,
-    },
+    driver::tty::{console::ConsoleSwitch, ConsoleFont, KDMode},
     libs::{font::FontDesc, rwlock::RwLock},
     process::Pid,
 };
@@ -141,9 +137,6 @@ pub struct VirtualConsoleData {
 
     /// 对应的Console Driver funcs
     driver_funcs: Option<Weak<dyn ConsoleSwitch>>,
-
-    /// 对应的tty端口
-    port: Arc<dyn TtyPort>,
 }
 
 impl VirtualConsoleData {
@@ -205,7 +198,6 @@ impl VirtualConsoleData {
             driver_funcs: None,
             cursor_type: VcCursor::empty(),
             num,
-            port: Arc::new(DefaultTtyPort::new()),
         }
     }
 
@@ -249,11 +241,6 @@ impl VirtualConsoleData {
 
     pub(super) fn set_driver_funcs(&mut self, func: Weak<dyn ConsoleSwitch>) {
         self.driver_funcs = Some(func);
-    }
-
-    #[inline]
-    pub fn port(&self) -> Arc<dyn TtyPort> {
-        self.port.clone()
     }
 
     pub(super) fn reset(&mut self, do_clear: bool) {
@@ -901,7 +888,8 @@ impl VirtualConsoleData {
                 return;
             }
             'K' => {
-                todo!("csi_K todo");
+                self.csi_K(self.par[0]);
+                return;
             }
             'L' => {
                 todo!("csi_L todo");
@@ -1164,6 +1152,48 @@ impl VirtualConsoleData {
                 // TODO:当前未实现回滚缓冲
                 count = self.screen_buf.len();
                 start = 0;
+            }
+            _ => {
+                return;
+            }
+        }
+
+        for i in self.screen_buf[start..(start + count)].iter_mut() {
+            *i = self.erase_char;
+        }
+
+        if self.should_update() {
+            self.do_update_region(start, count)
+        }
+
+        self.need_wrap = false;
+    }
+
+    /// ##  处理Control Sequence Introducer（控制序列引导符） K字符
+    /// 该命令用于擦除终端当前行的部分或全部内容。根据参数 vpar 的不同值，执行不同的擦除操作：
+    /// - vpar 为 0 时，擦除从光标位置到该行末尾的内容
+    /// - vpar 为 1 时，擦除从该行起始位置到光标位置的内容
+    /// - vpar 为 2 时，擦除整个行。
+    #[allow(non_snake_case)]
+    fn csi_K(&mut self, vpar: u32) {
+        let count;
+        let start;
+
+        match vpar {
+            0 => {
+                // 擦除从光标位置到该行末尾的内容
+                count = self.cols - self.state.x;
+                start = self.pos;
+            }
+            1 => {
+                // 擦除从该行起始位置到光标位置的内容
+                count = self.state.x + 1;
+                start = self.pos - self.state.x;
+            }
+            2 => {
+                // 擦除整个行
+                count = self.cols;
+                start = self.pos - self.state.x;
             }
             _ => {
                 return;

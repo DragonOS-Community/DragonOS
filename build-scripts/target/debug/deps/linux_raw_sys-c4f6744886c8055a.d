@@ -1,0 +1,9 @@
+/home/hyt/DragonOS/build-scripts/target/debug/deps/liblinux_raw_sys-c4f6744886c8055a.rmeta: /home/hyt/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/linux-raw-sys-0.4.13/src/lib.rs /home/hyt/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/linux-raw-sys-0.4.13/src/elf.rs /home/hyt/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/linux-raw-sys-0.4.13/src/x86_64/errno.rs /home/hyt/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/linux-raw-sys-0.4.13/src/x86_64/general.rs /home/hyt/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/linux-raw-sys-0.4.13/src/x86_64/ioctl.rs
+
+/home/hyt/DragonOS/build-scripts/target/debug/deps/linux_raw_sys-c4f6744886c8055a.d: /home/hyt/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/linux-raw-sys-0.4.13/src/lib.rs /home/hyt/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/linux-raw-sys-0.4.13/src/elf.rs /home/hyt/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/linux-raw-sys-0.4.13/src/x86_64/errno.rs /home/hyt/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/linux-raw-sys-0.4.13/src/x86_64/general.rs /home/hyt/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/linux-raw-sys-0.4.13/src/x86_64/ioctl.rs
+
+/home/hyt/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/linux-raw-sys-0.4.13/src/lib.rs:
+/home/hyt/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/linux-raw-sys-0.4.13/src/elf.rs:
+/home/hyt/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/linux-raw-sys-0.4.13/src/x86_64/errno.rs:
+/home/hyt/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/linux-raw-sys-0.4.13/src/x86_64/general.rs:
+/home/hyt/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/linux-raw-sys-0.4.13/src/x86_64/ioctl.rs:

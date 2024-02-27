@@ -7,13 +7,14 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    libs::{casting::DowncastArc, spinlock::SpinLock},
+    libs::{casting::DowncastArc, cpumask::CpuMask, spinlock::SpinLock},
     mm::VirtAddr,
 };
 
 use super::{
     irqdata::{IrqData, IrqLineStatus},
     irqdomain::IrqDomain,
+    manage::IrqManager,
     msi::MsiMsg,
 };
 
@@ -44,20 +45,54 @@ pub trait IrqChip: Sync + Send + Any + Debug {
     fn irq_ack(&self, irq: &Arc<IrqData>);
 
     /// mask an interrupt source
-    fn irq_mask(&self, _irq: &Arc<IrqData>) {}
+    ///
+    /// 用于屏蔽中断
+    ///
+    /// 如果返回ENOSYS，则表明irq_mask()不支持.
+    ///
+    /// 如果返回错误，那么中断的屏蔽状态将不会改变。
+    fn irq_mask(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
     /// ack and mask an interrupt source
     fn irq_mask_ack(&self, _irq: &Arc<IrqData>) {}
+
     /// unmask an interrupt source
-    fn irq_unmask(&self, _irq: &Arc<IrqData>) {}
+    ///
+    /// 用于取消屏蔽中断
+    ///
+    /// 如果返回ENOSYS，则表明irq_unmask()不支持.
+    fn irq_unmask(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
     /// end of interrupt
     fn irq_eoi(&self, _irq: &Arc<IrqData>) {}
 
-    // todo: set affinity
+    /// 指示当前芯片是否可以设置中断亲和性。
+    fn can_set_affinity(&self) -> bool;
+
+    /// 在SMP机器上设置CPU亲和性。
+    ///
+    /// 如果force参数为真，它告诉驱动程序无条件地应用亲和性设置。
+    /// 不需要对提供的亲和性掩码进行完整性检查。这用于CPU热插拔，其中目标CPU尚未在cpu_online_mask中设置。
+    fn irq_set_affinity(
+        &self,
+        _irq: &Arc<IrqData>,
+        _cpu: &CpuMask,
+        _force: bool,
+    ) -> Result<IrqChipSetMaskResult, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 
     /// retrigger an IRQ to the CPU
     fn retrigger(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
+
+    /// 指示当前芯片是否可以设置中断流类型。
+    ///
+    /// 如果返回true，则可以调用irq_set_type()。
+    fn can_set_flow_type(&self) -> bool;
 
     /// set the flow type of an interrupt
     ///
@@ -67,7 +102,7 @@ pub trait IrqChip: Sync + Send + Any + Debug {
         &self,
         _irq: &Arc<IrqData>,
         _flow_type: IrqLineStatus,
-    ) -> Result<(), SystemError> {
+    ) -> Result<IrqChipSetMaskResult, SystemError> {
         Err(SystemError::ENOSYS)
     }
 
@@ -170,7 +205,10 @@ pub enum IrqChipState {
     LineLevel,
 }
 
-pub trait IrqChipData: Sync + Send + Any + Debug {}
+/// 中断芯片的数据（per-irq的）
+pub trait IrqChipData: Sync + Send + Any + Debug {
+    fn as_any_ref(&self) -> &dyn Any;
+}
 
 bitflags! {
     /// 定义 IrqGcFlags 位标志
@@ -247,10 +285,22 @@ pub struct IrqChipType {
     // todo https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irq.h#1024
 }
 
+#[derive(Debug)]
+pub enum IrqChipSetMaskResult {
+    /// core updates mask ok.
+    SetMaskOk,
+    /// core updates mask ok. No change.
+    SetMaskOkNoChange,
+    /// core updates mask ok. Done.(same as SetMaskOk)
+    ///
+    /// 支持堆叠irq芯片的特殊代码, 表示跳过所有子irq芯片。
+    SetMaskOkDone,
+}
+
 bitflags! {
     /// IrqChip specific flags
     pub struct IrqChipFlags: u32 {
-        /// 在调用chip.irq_set_type()之前屏蔽
+        /// 在调用chip.irq_set_type()之前屏蔽中断
         const IRQCHIP_SET_TYPE_MASKED = 1 << 0;
         /// 只有在irq被处理时才发出irq_eoi()
         const IRQCHIP_EOI_IF_HANDLED = 1 << 1;
@@ -274,5 +324,41 @@ bitflags! {
         const IRQCHIP_AFFINITY_PRE_STARTUP = 1 << 10;
         /// 不要在这个芯片中改变任何东西
         const IRQCHIP_IMMUTABLE = 1 << 11;
+    }
+}
+
+impl IrqManager {
+    /// Acknowledge the parent interrupt
+    pub fn irq_chip_ack_parent(&self, irq_data: &Arc<IrqData>) {
+        let parent_data = irq_data.parent_data().map(|p| p.upgrade()).flatten();
+
+        if let Some(parent_data) = parent_data {
+            let parent_chip = parent_data.chip();
+            parent_chip.irq_ack(&parent_data);
+        }
+    }
+
+    /// 在硬件中重新触发中断
+    ///
+    /// 遍历中断域的层次结构，并检查是否存在一个硬件重新触发函数。如果存在则调用它
+    pub fn irq_chip_retrigger_hierarchy(&self, irq_data: &Arc<IrqData>) -> Result<(), SystemError> {
+        let mut data: Option<Arc<IrqData>> = Some(irq_data.clone());
+        loop {
+            if let Some(d) = data {
+                if let Err(e) = d.chip().retrigger(&d) {
+                    if e == SystemError::ENOSYS {
+                        data = d.parent_data().map(|p| p.upgrade()).flatten();
+                    } else {
+                        return Err(e);
+                    }
+                } else {
+                    return Ok(());
+                }
+            } else {
+                break;
+            }
+        }
+
+        return Ok(());
     }
 }

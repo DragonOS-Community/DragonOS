@@ -35,10 +35,18 @@ impl IrqChip for LocalApicChip {
         "APIC"
     }
 
+    fn can_set_flow_type(&self) -> bool {
+        false
+    }
+
     fn irq_disable(&self, _irq: &Arc<IrqData>) {}
 
     fn irq_ack(&self, _irq: &Arc<IrqData>) {
         CurrentApic.send_eoi();
+    }
+
+    fn can_set_affinity(&self) -> bool {
+        false
     }
 
     fn irq_compose_msi_msg(&self, irq: &Arc<IrqData>, msg: &mut MsiMsg) {
@@ -102,7 +110,6 @@ impl ApicChipData {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 struct InnerApicChipData {
     hw_irq_cfg: HardwareIrqConfig,
@@ -114,7 +121,11 @@ struct InnerApicChipData {
     status: ApicChipStatus,
 }
 
-impl IrqChipData for ApicChipData {}
+impl IrqChipData for ApicChipData {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+}
 
 bitflags! {
     pub struct ApicChipStatus: u32 {
@@ -173,11 +184,15 @@ pub fn x86_vector_domain() -> &'static Arc<IrqDomain> {
 }
 
 pub fn arch_early_irq_init() -> Result<(), SystemError> {
-    let vec_domain = irq_domain_manager().create_and_add(
-        "VECTOR".to_string(),
-        &X86VectorDomainOps,
-        HardwareIrqNumber::new(u32::MAX),
-    );
+    let vec_domain = irq_domain_manager()
+        .create_and_add(
+            "VECTOR".to_string(),
+            &X86VectorDomainOps,
+            IrqNumber::new(32),
+            HardwareIrqNumber::new(32),
+            223,
+        )
+        .ok_or(SystemError::ENOMEM)?;
     irq_domain_manager().set_default_domain(vec_domain.clone());
     unsafe { X86_VECTOR_DOMAIN = Some(vec_domain) };
 
@@ -210,7 +225,7 @@ impl IrqDomainOps for X86VectorDomainOps {
         _hwirq: HardwareIrqNumber,
         _virq: IrqNumber,
     ) -> Result<(), SystemError> {
-        todo!()
+        Err(SystemError::ENOSYS)
     }
 
     fn unmap(&self, _irq_domain: &Arc<IrqDomain>, _virq: IrqNumber) {

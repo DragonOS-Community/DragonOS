@@ -57,7 +57,8 @@ macro_rules! interrupt_handler {
                         lea rax, ret_from_intr[rip]
                         push rax
                         mov rsi, {irqnum}
-                        jmp do_IRQ
+                        jmp x86_64_do_irq
+                        // jmp do_IRQ
                         "
                     ),
                     irqnum = const($name),

@@ -448,12 +448,6 @@ pub unsafe extern "C" fn switch_finish_hook() {
 
 int_like!(Pid, AtomicPid, usize, AtomicUsize);
 
-impl Hash for Pid {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-
 impl Pid {
     pub fn to_string(&self) -> String {
         self.0.to_string()

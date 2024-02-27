@@ -56,7 +56,7 @@ unsafe extern "C" fn rs_ioapic_install(
     active_high: bool,
     dest_logic: bool,
 ) -> i32 {
-    return ioapic_install(vector, dest, level_triggered, active_high, dest_logic)
+    return ioapic_install(vector, dest, level_triggered, active_high, dest_logic, true)
         .map(|_| 0)
         .unwrap_or_else(|e| e.to_posix_errno());
 }

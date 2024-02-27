@@ -1,11 +1,21 @@
 use core::{ffi::c_void, sync::atomic::AtomicI32};
 
-use alloc::sync::{Arc, Weak};
+use alloc::{
+    string::ToString,
+    sync::{Arc, Weak},
+};
+use unified_init::macros::unified_init;
 
 use crate::{
     driver::{
         base::device::device_number::{DeviceNumber, Major},
         tty::tty_device::TTY_DEVICES,
+    },
+    exception::{
+        irqdata::IrqHandlerData,
+        irqdesc::{IrqHandleFlags, IrqHandler, IrqReturn},
+        manage::irq_manager,
+        IrqNumber,
     },
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
@@ -15,10 +25,15 @@ use crate::{
         },
     },
     include::bindings::bindings::vfs_file_operations_t,
+    init::initcall::INITCALL_DEVICE,
     libs::{keyboard_parser::TypeOneFSM, rwlock::RwLock, spinlock::SpinLock},
     time::TimeSpec,
 };
 use system_error::SystemError;
+
+/// PS2键盘的中断向量号
+const PS2_KEYBOARD_INTR_VECTOR: IrqNumber = IrqNumber::new(0x21);
+
 #[derive(Debug)]
 pub struct LockedPS2KeyBoardInode(RwLock<PS2KeyBoardInode>, AtomicI32); // self.1 用来记录有多少个文件打开了这个inode
 
@@ -181,4 +196,38 @@ impl IndexNode for LockedPS2KeyBoardInode {
 /// for test
 pub extern "C" fn ps2_keyboard_parse_keycode(input: u8) {
     PS2_KEYBOARD_FSM.lock().parse(input);
+}
+
+#[derive(Debug)]
+struct Ps2KeyboardIrqHandler;
+
+impl IrqHandler for Ps2KeyboardIrqHandler {
+    fn handle(
+        &self,
+        irq: IrqNumber,
+        static_data: Option<&dyn IrqHandlerData>,
+        dynamic_data: Option<Arc<dyn IrqHandlerData>>,
+    ) -> Result<IrqReturn, SystemError> {
+        kdebug!("ps2_keyboard irq handler");
+        todo!()
+    }
+}
+
+impl Ps2KeyboardIrqHandler {
+    const INTR_HANDLE_FLAGS: IrqHandleFlags =
+        IrqHandleFlags::from_bits_truncate(IrqHandleFlags::IRQF_TRIGGER_RISING.bits());
+}
+
+#[unified_init(INITCALL_DEVICE)]
+fn ps2_keyboard_init() -> Result<(), SystemError> {
+    irq_manager()
+        .request_irq(
+            PS2_KEYBOARD_INTR_VECTOR,
+            "ps2keyboard".to_string(),
+            &Ps2KeyboardIrqHandler,
+            Ps2KeyboardIrqHandler::INTR_HANDLE_FLAGS,
+            None,
+        )
+        .expect("Failed to request irq for ps2 keyboard");
+    Ok(())
 }

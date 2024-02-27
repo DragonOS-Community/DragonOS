@@ -2,6 +2,7 @@ use bitmap::{traits::BitMapOps, AllocBitmap};
 
 use crate::{mm::percpu::PerCpu, smp::cpu::ProcessorId};
 
+#[derive(Clone)]
 pub struct CpuMask {
     bmp: AllocBitmap,
 }
@@ -48,6 +49,18 @@ impl CpuMask {
             .map(|index| ProcessorId::new(index as u32))
     }
 
+    pub fn set(&mut self, cpu: ProcessorId, value: bool) -> Option<bool> {
+        self.bmp.set(cpu.data() as usize, value)
+    }
+
+    pub fn get(&self, cpu: ProcessorId) -> Option<bool> {
+        self.bmp.get(cpu.data() as usize)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bmp.is_empty()
+    }
+
     /// 迭代所有被置位的cpu
     pub fn iter_cpu(&self) -> CpuMaskIter {
         CpuMaskIter {
@@ -91,5 +104,13 @@ impl<'a> Iterator for CpuMaskIter<'a> {
             self.index = self.mask.next_zero_index(self.index)?;
         }
         Some(self.index)
+    }
+}
+
+impl core::fmt::Debug for CpuMask {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CpuMask")
+            .field("bmp", &format!("size: {}", self.bmp.size()))
+            .finish()
     }
 }

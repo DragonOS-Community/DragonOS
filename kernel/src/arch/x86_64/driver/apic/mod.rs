@@ -6,7 +6,7 @@ use x86::{apic::Icr, msr::IA32_APIC_BASE};
 
 use crate::{
     arch::{
-        driver::apic::{hw_irq::ApicId, ioapic::ioapic_init, x2apic::X2Apic, xapic::XApic},
+        driver::apic::{hw_irq::ApicId, x2apic::X2Apic, xapic::XApic},
         io::PortIOArch,
         CurrentPortIOArch,
     },
@@ -516,9 +516,7 @@ impl LocalAPIC for CurrentApic {
 
             kinfo!("xAPIC initialized for cpu {:?}", cpu_id);
         }
-        if cpu_id.data() == 0 {
-            ioapic_init();
-        }
+
         kinfo!("Apic initialized.");
         return true;
     }

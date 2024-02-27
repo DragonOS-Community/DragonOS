@@ -2,7 +2,10 @@ use core::{any::Any, fmt::Debug};
 
 use alloc::sync::{Arc, Weak};
 
-use crate::libs::spinlock::SpinLock;
+use crate::libs::{
+    cpumask::CpuMask,
+    spinlock::{SpinLock, SpinLockGuard},
+};
 
 use super::{
     irqchip::{IrqChip, IrqChipData},
@@ -36,7 +39,7 @@ impl IrqData {
             inner: SpinLock::new(InnerIrqData {
                 hwirq,
                 common_data,
-                chip,
+                chip: Some(chip),
                 chip_data: None,
                 domain: None,
                 parent_data: None,
@@ -47,14 +50,14 @@ impl IrqData {
     pub fn irqd_set(&self, status: IrqStatus) {
         // clone是为了释放inner锁
         let common_data = self.inner.lock().common_data.clone();
-        common_data.irqd_set(status);
+        common_data.insert_status(status);
     }
 
     #[allow(dead_code)]
     pub fn irqd_clear(&self, status: IrqStatus) {
         // clone是为了释放inner锁
         let common_data = self.inner.lock().common_data.clone();
-        common_data.irqd_clear(status);
+        common_data.clear_status(status);
     }
 
     pub fn irq(&self) -> IrqNumber {
@@ -66,7 +69,7 @@ impl IrqData {
     }
 
     pub fn chip(&self) -> Arc<dyn IrqChip> {
-        self.inner.lock_irqsave().chip.clone()
+        self.inner.lock_irqsave().chip.clone().unwrap()
     }
 
     /// 是否为电平触发
@@ -93,23 +96,69 @@ impl IrqData {
     pub fn chip_data(&self) -> Option<Arc<dyn IrqChipData>> {
         self.inner.lock_irqsave().chip_data.clone()
     }
+
+    pub fn common_data(&self) -> Arc<IrqCommonData> {
+        self.inner.lock_irqsave().common_data.clone()
+    }
+
+    pub fn domain(&self) -> Option<Arc<IrqDomain>> {
+        self.inner.lock_irqsave().domain.clone()
+    }
+
+    pub fn inner(&self) -> SpinLockGuard<InnerIrqData> {
+        self.inner.lock_irqsave()
+    }
+
+    pub fn parent_data(&self) -> Option<Weak<IrqData>> {
+        self.inner.lock_irqsave().parent_data.clone()
+    }
 }
 
 #[allow(dead_code)]
 #[derive(Debug)]
-struct InnerIrqData {
+pub struct InnerIrqData {
     /// 硬件中断号, 用于表示在某个IrqDomain中的中断号
     hwirq: HardwareIrqNumber,
     /// 涉及的所有irqchip之间共享的数据
     common_data: Arc<IrqCommonData>,
     /// 绑定到的中断芯片
-    chip: Arc<dyn IrqChip>,
+    chip: Option<Arc<dyn IrqChip>>,
     /// 中断芯片的私有数据（与当前irq相关）
     chip_data: Option<Arc<dyn IrqChipData>>,
     /// 中断域
     domain: Option<Arc<IrqDomain>>,
     /// 中断的父中断（如果具有中断域继承的话）
     parent_data: Option<Weak<IrqData>>,
+}
+
+impl InnerIrqData {
+    pub fn set_hwirq(&mut self, hwirq: HardwareIrqNumber) {
+        self.hwirq = hwirq;
+    }
+
+    pub fn domain(&self) -> Option<Arc<IrqDomain>> {
+        self.domain.clone()
+    }
+
+    pub fn set_domain(&mut self, domain: Option<Arc<IrqDomain>>) {
+        self.domain = domain;
+    }
+
+    pub fn chip(&self) -> Option<&Arc<dyn IrqChip>> {
+        self.chip.as_ref()
+    }
+
+    pub fn set_chip(&mut self, chip: Option<Arc<dyn IrqChip>>) {
+        self.chip = chip;
+    }
+
+    pub fn set_chip_data(&mut self, chip_data: Option<Arc<dyn IrqChipData>>) {
+        self.chip_data = chip_data;
+    }
+
+    pub fn chip_data(&self) -> Option<Arc<dyn IrqChipData>> {
+        self.chip_data.clone()
+    }
 }
 
 /// per irq data shared by all irqchips
@@ -126,18 +175,61 @@ impl IrqCommonData {
             state: IrqStatus::empty(),
             handler_data: None,
             msi_desc: None,
+            affinity: CpuMask::new(),
         };
         return IrqCommonData {
             inner: SpinLock::new(inner),
         };
     }
 
-    pub fn irqd_set(&self, status: IrqStatus) {
-        self.inner.lock_irqsave().irqd_set(status);
+    pub fn insert_status(&self, status: IrqStatus) {
+        self.inner.lock_irqsave().irqd_insert(status);
     }
 
-    pub fn irqd_clear(&self, status: IrqStatus) {
+    pub fn clear_status(&self, status: IrqStatus) {
         self.inner.lock_irqsave().irqd_clear(status);
+    }
+
+    pub fn clear_managed_shutdown(&self) {
+        self.inner
+            .lock_irqsave()
+            .state
+            .remove(IrqStatus::IRQD_MANAGED_SHUTDOWN);
+    }
+
+    pub fn clear_masked(&self) {
+        self.clear_status(IrqStatus::IRQD_IRQ_MASKED);
+    }
+
+    pub fn clear_disabled(&self) {
+        self.clear_status(IrqStatus::IRQD_IRQ_DISABLED);
+    }
+
+    pub fn status(&self) -> IrqStatus {
+        self.inner.lock_irqsave().state
+    }
+
+    pub fn trigger_type(&self) -> IrqLineStatus {
+        self.inner.lock_irqsave().state.trigger_type()
+    }
+
+    pub fn set_trigger_type(&self, trigger: IrqLineStatus) {
+        self.inner.lock_irqsave().state.set_trigger_type(trigger);
+    }
+
+    pub fn set_started(&self) {
+        self.inner
+            .lock_irqsave()
+            .state
+            .insert(IrqStatus::IRQD_IRQ_STARTED);
+    }
+
+    pub fn affinity(&self) -> CpuMask {
+        self.inner.lock_irqsave().affinity.clone()
+    }
+
+    pub fn set_affinity(&self, affinity: CpuMask) {
+        self.inner.lock_irqsave().affinity = affinity;
     }
 }
 
@@ -149,11 +241,11 @@ struct InnerIrqCommonData {
     /// per-IRQ data for the irq_chip methods
     handler_data: Option<Arc<dyn IrqHandlerData>>,
     msi_desc: Option<Arc<MsiDesc>>,
-    // todo: affinity
+    affinity: CpuMask,
 }
 
 impl InnerIrqCommonData {
-    pub fn irqd_set(&mut self, status: IrqStatus) {
+    pub fn irqd_insert(&mut self, status: IrqStatus) {
         self.state.insert(status);
     }
 
@@ -162,6 +254,7 @@ impl InnerIrqCommonData {
     }
 }
 
+/// 中断处理函数传入的数据
 pub trait IrqHandlerData: Send + Sync + Any + Debug {}
 
 bitflags! {
@@ -224,11 +317,44 @@ bitflags! {
 
 
 }
+
+impl IrqLineStatus {
+    pub const fn trigger_bits(&self) -> u32 {
+        self.bits & Self::IRQ_TYPE_SENSE_MASK.bits
+    }
+
+    pub fn trigger_type(&self) -> Self {
+        *self & Self::IRQ_TYPE_SENSE_MASK
+    }
+
+    pub fn is_level_type(&self) -> bool {
+        self.contains(Self::IRQ_LEVEL)
+    }
+
+    /// 是否为高电平触发
+    ///
+    /// ## 返回
+    ///
+    /// - 如果不是电平触发类型，则返回None
+    /// - 如果是电平触发类型，则返回Some(bool)，当为true时表示高电平触发
+    pub fn is_level_high(&self) -> Option<bool> {
+        if !self.is_level_type() {
+            return None;
+        }
+        return Some(self.contains(Self::IRQ_TYPE_LEVEL_HIGH));
+    }
+}
 bitflags! {
     /// 中断状态（存储在IrqCommonData)
     ///
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irq.h#227
     pub struct IrqStatus: u32 {
+        const IRQD_TRIGGER_NONE = IrqLineStatus::IRQ_TYPE_NONE.bits();
+        const IRQD_TRIGGER_RISING = IrqLineStatus::IRQ_TYPE_EDGE_RISING.bits();
+        const IRQD_TRIGGER_FALLING = IrqLineStatus::IRQ_TYPE_EDGE_FALLING.bits();
+        const IRQD_TRIGGER_HIGH = IrqLineStatus::IRQ_TYPE_LEVEL_HIGH.bits();
+        const IRQD_TRIGGER_LOW = IrqLineStatus::IRQ_TYPE_LEVEL_LOW.bits();
+
         /// 触发类型位的掩码
         const IRQD_TRIGGER_MASK = 0xf;
         /// 亲和性设置待处理
@@ -265,7 +391,7 @@ bitflags! {
         const IRQD_MANAGED_SHUTDOWN = 1 << 23;
         /// IRQ只允许单个亲和性目标
         const IRQD_SINGLE_TARGET = 1 << 24;
-        /// 预期的触发器已设置
+        /// 默认的触发器已设置
         const IRQD_DEFAULT_TRIGGER_SET = 1 << 25;
         /// 可以使用保留模式
         const IRQD_CAN_RESERVE = 1 << 26;
@@ -296,6 +422,14 @@ impl IrqStatus {
 
     pub const fn affinity_was_set(&self) -> bool {
         self.contains(Self::IRQD_AFFINITY_SET)
+    }
+
+    pub fn masked(&self) -> bool {
+        self.contains(Self::IRQD_IRQ_MASKED)
+    }
+
+    pub fn disabled(&self) -> bool {
+        self.contains(Self::IRQD_IRQ_DISABLED)
     }
 
     pub fn mark_affinity_set(&mut self) {
@@ -357,14 +491,6 @@ impl IrqStatus {
         self.contains(Self::IRQD_MOVE_PCNTXT)
     }
 
-    pub const fn is_irq_disabled(&self) -> bool {
-        self.contains(Self::IRQD_IRQ_DISABLED)
-    }
-
-    pub const fn is_irq_masked(&self) -> bool {
-        self.contains(Self::IRQD_IRQ_MASKED)
-    }
-
     pub const fn is_irq_in_progress(&self) -> bool {
         self.contains(Self::IRQD_IRQ_INPROGRESS)
     }
@@ -381,7 +507,7 @@ impl IrqStatus {
         self.insert(Self::IRQD_FORWARDED_TO_VCPU);
     }
 
-    pub const fn is_affinity_managed(&self) -> bool {
+    pub const fn affinity_managed(&self) -> bool {
         self.contains(Self::IRQD_AFFINITY_MANAGED)
     }
 
@@ -435,5 +561,9 @@ impl IrqStatus {
 
     pub const fn is_affinity_on_activate(&self) -> bool {
         self.contains(Self::IRQD_AFFINITY_ON_ACTIVATE)
+    }
+
+    pub const fn started(&self) -> bool {
+        self.contains(Self::IRQD_IRQ_STARTED)
     }
 }

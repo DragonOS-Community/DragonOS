@@ -581,7 +581,7 @@ impl VirtualConsoleData {
             self.state.y = y as usize;
         }
 
-        self.pos = self.state.y * self.cols + (self.state.x << 1);
+        self.pos = self.state.y * self.cols + self.state.x;
         self.need_wrap = false;
     }
 

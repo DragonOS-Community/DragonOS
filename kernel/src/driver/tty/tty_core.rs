@@ -51,6 +51,7 @@ impl TtyCore {
             ctrl: SpinLock::new(TtyContorlInfo::default()),
             closing: AtomicBool::new(false),
             flow: SpinLock::new(TtyFlowState::default()),
+            link: None,
         };
 
         return Arc::new(Self {
@@ -128,15 +129,19 @@ impl TtyCore {
             .wakeup(EPollEventType::EPOLLOUT.bits() as u64);
     }
 
-    pub fn tty_mode_ioctl(
-        &self,
-        tty: Arc<TtyCore>,
-        cmd: u32,
-        arg: usize,
-    ) -> Result<usize, SystemError> {
+    pub fn tty_mode_ioctl(tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<usize, SystemError> {
+        let real_tty;
+        let core = tty.core();
+        if core.driver().tty_driver_type() == TtyDriverType::Pty
+            && core.driver().tty_driver_sub_type() == TtyDriverSubType::PtyMaster
+        {
+            real_tty = core.link().unwrap();
+        } else {
+            real_tty = tty;
+        }
         match cmd {
             TtyIoctlCmd::TCGETS => {
-                let termios = PosixTermios::from_kernel_termios(self.core.termios().clone());
+                let termios = PosixTermios::from_kernel_termios(real_tty.core.termios().clone());
                 let mut user_writer = UserBufferWriter::new(
                     VirtAddr::new(arg).as_ptr::<PosixTermios>(),
                     core::mem::size_of::<PosixTermios>(),
@@ -147,8 +152,8 @@ impl TtyCore {
                 return Ok(0);
             }
             TtyIoctlCmd::TCSETSW => {
-                return self.core_set_termios(
-                    tty,
+                return TtyCore::core_set_termios(
+                    real_tty,
                     VirtAddr::new(arg),
                     TtySetTermiosOpt::TERMIOS_WAIT | TtySetTermiosOpt::TERMIOS_OLD,
                 );
@@ -160,14 +165,13 @@ impl TtyCore {
     }
 
     pub fn core_set_termios(
-        &self,
         tty: Arc<TtyCore>,
         arg: VirtAddr,
         opt: TtySetTermiosOpt,
     ) -> Result<usize, SystemError> {
         #[allow(unused_assignments)]
         // TERMIOS_TERMIO下会用到
-        let mut tmp_termios = self.core().termios().clone();
+        let mut tmp_termios = tty.core().termios().clone();
 
         if opt.contains(TtySetTermiosOpt::TERMIOS_TERMIO) {
             todo!()
@@ -185,7 +189,7 @@ impl TtyCore {
         }
 
         if opt.contains(TtySetTermiosOpt::TERMIOS_FLUSH) {
-            let ld = self.ldisc();
+            let ld = tty.ldisc();
             let _ = ld.flush_buffer(tty.clone());
         }
 
@@ -193,16 +197,12 @@ impl TtyCore {
             // TODO
         }
 
-        self.set_termios_next(tty, tmp_termios)?;
+        TtyCore::set_termios_next(tty, tmp_termios)?;
         Ok(0)
     }
 
-    pub fn set_termios_next(
-        &self,
-        tty: Arc<TtyCore>,
-        new_termios: Termios,
-    ) -> Result<(), SystemError> {
-        let mut termios = self.core().termios_write();
+    pub fn set_termios_next(tty: Arc<TtyCore>, new_termios: Termios) -> Result<(), SystemError> {
+        let mut termios = tty.core().termios_write();
 
         let old_termios = termios.clone();
 
@@ -211,7 +211,7 @@ impl TtyCore {
         let tmp = termios.control_mode;
         termios.control_mode ^= (tmp ^ old_termios.control_mode) & ControlMode::ADDRB;
 
-        let ret = self.set_termios(tty.clone(), old_termios);
+        let ret = tty.set_termios(tty.clone(), old_termios);
         if ret.is_err() {
             termios.control_mode &= ControlMode::HUPCL | ControlMode::CREAD | ControlMode::CLOCAL;
             termios.control_mode |= old_termios.control_mode
@@ -221,7 +221,7 @@ impl TtyCore {
         }
 
         drop(termios);
-        let ld = self.ldisc();
+        let ld = tty.ldisc();
         ld.set_termios(tty, Some(old_termios))?;
 
         Ok(())
@@ -290,6 +290,8 @@ pub struct TtyCoreData {
     closing: AtomicBool,
     /// 流控状态
     flow: SpinLock<TtyFlowState>,
+    /// 链接tty
+    link: Option<Arc<TtyCore>>,
 }
 
 impl TtyCoreData {
@@ -378,6 +380,11 @@ impl TtyCoreData {
     #[inline]
     pub fn vc_data_irqsave(&self) -> SpinLockGuard<VirtualConsoleData> {
         VIRT_CONSOLES[self.index].lock_irqsave()
+    }
+
+    #[inline]
+    pub fn link(&self) -> Option<Arc<TtyCore>> {
+        self.link.clone()
     }
 }
 

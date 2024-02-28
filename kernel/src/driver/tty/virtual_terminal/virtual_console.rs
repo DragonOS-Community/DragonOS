@@ -581,7 +581,7 @@ impl VirtualConsoleData {
             self.state.y = y as usize;
         }
 
-        self.pos = self.state.y * self.cols + (self.state.x << 1);
+        self.pos = self.state.y * self.cols + self.state.x;
         self.need_wrap = false;
     }
 
@@ -1200,12 +1200,13 @@ impl VirtualConsoleData {
             }
         }
 
-        for i in self.screen_buf[start..(start + count)].iter_mut() {
+        let max_idx = self.screen_buf.len();
+        for i in self.screen_buf[start..max_idx.min(start + count)].iter_mut() {
             *i = self.erase_char;
         }
 
         if self.should_update() {
-            self.do_update_region(start, count)
+            self.do_update_region(start, count.min(max_idx - start))
         }
 
         self.need_wrap = false;

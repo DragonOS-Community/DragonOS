@@ -59,7 +59,7 @@ impl NTtyLinediscipline {
                 todo!()
             }
             _ => {
-                return tty.tty_mode_ioctl(tty.clone(), cmd, arg);
+                return TtyCore::tty_mode_ioctl(tty.clone(), cmd, arg);
             }
         }
     }

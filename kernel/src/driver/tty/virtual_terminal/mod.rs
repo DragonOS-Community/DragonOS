@@ -96,8 +96,6 @@ pub struct TtyConsoleDriverInner {
     console: Arc<BlittingFbConsole>,
 }
 
-unsafe impl Sync for TtyConsoleDriverInner {}
-
 impl TtyConsoleDriverInner {
     pub fn new() -> Result<Self, SystemError> {
         Ok(Self {

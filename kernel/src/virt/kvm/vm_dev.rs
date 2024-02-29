@@ -134,7 +134,12 @@ impl IndexNode for LockedVmInode {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn ioctl(&self, cmd: u32, data: usize) -> Result<usize, SystemError> {
+    fn ioctl(
+        &self,
+        cmd: u32,
+        data: usize,
+        _private_data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
         match cmd {
             0xdeadbeef => {
                 kdebug!("kvm_vm ioctl");

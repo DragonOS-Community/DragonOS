@@ -297,7 +297,8 @@ impl Syscall {
 
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
-        let r = file.lock_no_preempt().inode().ioctl(cmd, data);
+        let file = file.lock_no_preempt();
+        let r = file.inode().ioctl(cmd, data, &file.private_data);
         return r;
     }
 
@@ -683,7 +684,7 @@ impl Syscall {
                 for i in arg..FileDescriptorVec::PROCESS_MAX_FD {
                     let binding = ProcessManager::current_pcb().fd_table();
                     let mut fd_table_guard = binding.write();
-                    if fd_table_guard.get_file_by_fd(fd).is_none() {
+                    if fd_table_guard.get_file_by_fd(i as i32).is_none() {
                         return Self::do_dup2(fd, i as i32, &mut fd_table_guard);
                     }
                 }

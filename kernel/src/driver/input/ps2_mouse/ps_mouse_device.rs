@@ -6,7 +6,6 @@ use alloc::{
 };
 use kdepends::ringbuffer::{AllocRingBuffer, RingBuffer};
 use system_error::SystemError;
-use unified_init::macros::unified_init;
 
 use crate::{
     arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch},
@@ -20,7 +19,10 @@ use crate::{
             kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        input::serio::serio_device::{serio_device_manager, SerioDevice},
+        input::{
+            ps2_dev::ps2_device::Ps2Device,
+            serio::serio_device::{serio_device_manager, SerioDevice},
+        },
     },
     exception::InterruptArch,
     filesystem::{
@@ -31,7 +33,6 @@ use crate::{
             IndexNode, Metadata,
         },
     },
-    init::initcall::INITCALL_DEVICE,
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::SpinLock,
@@ -316,7 +317,7 @@ impl Ps2MouseDevice {
                 //     guard.current_state.flags.bits,
                 //     guard.current_state.x,
                 //     guard.current_state.y
-                // )
+                // );
             }
             _ => unreachable!(),
         }
@@ -649,13 +650,15 @@ impl IndexNode for Ps2MouseDevice {
     }
 }
 
-#[unified_init(INITCALL_DEVICE)]
-fn rs_ps2_mouse_device_int() -> Result<(), SystemError> {
+impl Ps2Device for Ps2MouseDevice {}
+
+pub fn rs_ps2_mouse_device_init(parent: Arc<dyn KObject>) -> Result<(), SystemError> {
     kdebug!("ps2_mouse_device initializing...");
     let psmouse = Arc::new(Ps2MouseDevice::new());
 
     device_manager().device_default_initialize(&(psmouse.clone() as Arc<dyn Device>));
-    serio_device_manager().register_port(psmouse.clone())?;
+    psmouse.set_parent(Some(Arc::downgrade(&parent)));
+    serio_device_manager().register_port(psmouse.clone() as Arc<dyn SerioDevice>)?;
 
     devfs_register(&psmouse.name(), psmouse.clone()).map_err(|e| {
         kerror!(

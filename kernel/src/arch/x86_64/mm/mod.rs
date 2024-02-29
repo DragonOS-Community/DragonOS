@@ -7,7 +7,7 @@ use hashbrown::HashSet;
 use x86::time::rdtsc;
 use x86_64::registers::model_specific::EferFlags;
 
-use crate::driver::tty::serial::serial8250::send_to_default_serial8250_port;
+use crate::driver::serial::serial8250::send_to_default_serial8250_port;
 use crate::include::bindings::bindings::{
     multiboot2_get_load_base, multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t,
     multiboot_tag_load_base_addr_t,

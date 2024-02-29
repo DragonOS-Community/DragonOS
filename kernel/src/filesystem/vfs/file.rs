@@ -8,7 +8,7 @@ use system_error::SystemError;
 use crate::{
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
-        tty::TtyFilePrivateData,
+        tty::tty_device::TtyFilePrivateData,
     },
     filesystem::procfs::ProcfsFilePrivateData,
     ipc::pipe::{LockedPipeInode, PipeFsPrivateData},

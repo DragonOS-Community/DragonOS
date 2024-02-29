@@ -339,7 +339,12 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn ioctl(&self, _cmd: u32, _data: usize) -> Result<usize, SystemError> {
+    fn ioctl(
+        &self,
+        _cmd: u32,
+        _data: usize,
+        _private_data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }

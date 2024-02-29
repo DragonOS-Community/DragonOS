@@ -15,7 +15,7 @@ user/sys_api_lib
 docs/_build
 draft
 cppcheck.xml
-/target/
+target/
 Cargo.lock
 .cache
 compile_commands.json

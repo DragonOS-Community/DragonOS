@@ -1,6 +1,11 @@
+use core::sync::atomic::Ordering;
+
 use alloc::sync::Arc;
 
-use crate::driver::tty::tty_device::TtyDevice;
+use crate::driver::tty::{
+    tty_port::{TtyPort, TTY_PORTS},
+    virtual_terminal::virtual_console::CURRENT_VCNUM,
+};
 
 #[allow(dead_code)]
 pub const NUM_SCAN_CODES: u8 = 0x80;
@@ -28,25 +33,21 @@ pub enum KeyFlag {
 pub struct TypeOneFSM {
     status: ScanCodeStatus,
     current_state: TypeOneFSMState,
-    tty: Arc<TtyDevice>,
 }
 
 impl TypeOneFSM {
     #[allow(dead_code)]
-    pub fn new(tty: Arc<TtyDevice>) -> Self {
+    pub fn new() -> Self {
         Self {
             status: ScanCodeStatus::new(),
             current_state: TypeOneFSMState::Start,
-            tty,
         }
     }
 
     /// @brief 解析扫描码
     #[allow(dead_code)]
     pub fn parse(&mut self, scancode: u8) -> TypeOneFSMState {
-        self.current_state = self
-            .current_state
-            .parse(scancode, &mut self.status, &self.tty);
+        self.current_state = self.current_state.parse(scancode, &mut self.status);
         self.current_state
     }
 }
@@ -69,42 +70,30 @@ pub enum TypeOneFSMState {
 
 impl TypeOneFSMState {
     /// @brief 状态机总控程序
-    fn parse(
-        &self,
-        scancode: u8,
-        scancode_status: &mut ScanCodeStatus,
-        tty: &Arc<TtyDevice>,
-    ) -> TypeOneFSMState {
+    fn parse(&self, scancode: u8, scancode_status: &mut ScanCodeStatus) -> TypeOneFSMState {
         // kdebug!("the code is {:#x}\n", scancode);
         match self {
             TypeOneFSMState::Start => {
-                return self.handle_start(scancode, scancode_status, tty);
+                return self.handle_start(scancode, scancode_status);
             }
             TypeOneFSMState::PauseBreak(n) => {
-                return self.handle_pause_break(*n, scancode_status, tty);
+                return self.handle_pause_break(*n, scancode_status);
             }
             TypeOneFSMState::Func0 => {
-                return self.handle_func0(scancode, scancode_status, tty);
+                return self.handle_func0(scancode, scancode_status);
             }
             TypeOneFSMState::Type3 => {
-                return self.handle_type3(scancode, scancode_status, tty);
+                return self.handle_type3(scancode, scancode_status);
             }
-            TypeOneFSMState::PrtscPress(n) => {
-                return self.handle_prtsc_press(*n, scancode_status, tty)
-            }
+            TypeOneFSMState::PrtscPress(n) => return self.handle_prtsc_press(*n, scancode_status),
             TypeOneFSMState::PrtscRelease(n) => {
-                return self.handle_prtsc_release(*n, scancode_status, tty)
+                return self.handle_prtsc_release(*n, scancode_status)
             }
         }
     }
 
     /// @brief 处理起始状态
-    fn handle_start(
-        &self,
-        scancode: u8,
-        scancode_status: &mut ScanCodeStatus,
-        tty: &Arc<TtyDevice>,
-    ) -> TypeOneFSMState {
+    fn handle_start(&self, scancode: u8, scancode_status: &mut ScanCodeStatus) -> TypeOneFSMState {
         //kdebug!("in handle_start the code is {:#x}\n",scancode);
         match scancode {
             0xe1 => {
@@ -115,7 +104,7 @@ impl TypeOneFSMState {
             }
             _ => {
                 //kdebug!("in _d the code is {:#x}\n",scancode);
-                return TypeOneFSMState::Type3.handle_type3(scancode, scancode_status, tty);
+                return TypeOneFSMState::Type3.handle_type3(scancode, scancode_status);
             }
         }
     }
@@ -125,17 +114,16 @@ impl TypeOneFSMState {
         &self,
         scancode: u8,
         scancode_status: &mut ScanCodeStatus,
-        tty: &Arc<TtyDevice>,
     ) -> TypeOneFSMState {
         static PAUSE_BREAK_SCAN_CODE: [u8; 6] = [0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5];
         let i = match self {
             TypeOneFSMState::PauseBreak(i) => *i,
             _ => {
-                return self.handle_type3(scancode, scancode_status, tty);
+                return self.handle_type3(scancode, scancode_status);
             }
         };
         if scancode != PAUSE_BREAK_SCAN_CODE[i as usize] {
-            return self.handle_type3(scancode, scancode_status, tty);
+            return self.handle_type3(scancode, scancode_status);
         } else {
             if i == 5 {
                 // 所有Pause Break扫描码都被清除
@@ -146,12 +134,7 @@ impl TypeOneFSMState {
         }
     }
 
-    fn handle_func0(
-        &self,
-        scancode: u8,
-        scancode_status: &mut ScanCodeStatus,
-        tty: &Arc<TtyDevice>,
-    ) -> TypeOneFSMState {
+    fn handle_func0(&self, scancode: u8, scancode_status: &mut ScanCodeStatus) -> TypeOneFSMState {
         //0xE0
         match scancode {
             0x2a => {
@@ -214,7 +197,7 @@ impl TypeOneFSMState {
             }
             0x53 => {
                 scancode_status.del = true;
-                Self::emit(tty, 127);
+                Self::emit(127);
             }
             0xd3 => {
                 scancode_status.del = false;
@@ -233,32 +216,32 @@ impl TypeOneFSMState {
             }
             0x48 => {
                 scancode_status.arrow_u = true;
-                Self::emit(tty, 224);
-                Self::emit(tty, 72);
+                Self::emit(224);
+                Self::emit(72);
             }
             0xc8 => {
                 scancode_status.arrow_u = false;
             }
             0x4b => {
                 scancode_status.arrow_l = true;
-                Self::emit(tty, 224);
-                Self::emit(tty, 75);
+                Self::emit(224);
+                Self::emit(75);
             }
             0xcb => {
                 scancode_status.arrow_l = false;
             }
             0x50 => {
                 scancode_status.arrow_d = true;
-                Self::emit(tty, 224);
-                Self::emit(tty, 80);
+                Self::emit(224);
+                Self::emit(80);
             }
             0xd0 => {
                 scancode_status.arrow_d = false;
             }
             0x4d => {
                 scancode_status.arrow_r = true;
-                Self::emit(tty, 224);
-                Self::emit(tty, 77);
+                Self::emit(224);
+                Self::emit(77);
             }
             0xcd => {
                 scancode_status.arrow_r = false;
@@ -269,14 +252,14 @@ impl TypeOneFSMState {
                 scancode_status.kp_forward_slash = true;
 
                 let ch = '/' as u8;
-                Self::emit(tty, ch);
+                Self::emit(ch);
             }
             0xb5 => {
                 scancode_status.kp_forward_slash = false;
             }
             0x1c => {
                 scancode_status.kp_enter = true;
-                Self::emit(tty, '\n' as u8);
+                Self::emit('\n' as u8);
             }
             0x9c => {
                 scancode_status.kp_enter = false;
@@ -288,12 +271,7 @@ impl TypeOneFSMState {
         return TypeOneFSMState::Start;
     }
 
-    fn handle_type3(
-        &self,
-        scancode: u8,
-        scancode_status: &mut ScanCodeStatus,
-        tty: &Arc<TtyDevice>,
-    ) -> TypeOneFSMState {
+    fn handle_type3(&self, scancode: u8, scancode_status: &mut ScanCodeStatus) -> TypeOneFSMState {
         // 判断按键是被按下还是抬起
         let flag_make = if (scancode & (TYPE1_KEYCODE_FLAG_BREAK as u8)) > 0 {
             false //up
@@ -358,18 +336,36 @@ impl TypeOneFSMState {
             }
         }
 
-        let ch = TYPE1_KEY_CODE_MAPTABLE[col as usize + 2 * index as usize];
+        let mut ch = TYPE1_KEY_CODE_MAPTABLE[col as usize + 2 * index as usize];
         if key != KeyFlag::NoneFlag {
             // kdebug!("EMIT: ch is '{}', keyflag is {:?}\n", ch as char, key);
-            Self::emit(tty, ch);
+            if scancode_status.ctrl_l || scancode_status.ctrl_r {
+                ch = Self::to_ctrl(ch);
+            }
+            Self::emit(ch);
         }
         return TypeOneFSMState::Start;
     }
 
+    #[inline]
+    fn to_ctrl(ch: u8) -> u8 {
+        return match ch as char {
+            'a'..='z' => ch - 0x40,
+            'A'..='Z' => ch - 0x40,
+            '@'..='_' => ch - 0x40,
+            _ => ch,
+        };
+    }
+
     #[inline(always)]
-    fn emit(tty: &Arc<TtyDevice>, ch: u8) {
+    fn emit(ch: u8) {
         // 发送到tty
-        tty.input(&[ch]).ok();
+        let _ = Self::current_port().receive_buf(&[ch], &[], 1);
+    }
+
+    #[inline]
+    fn current_port() -> Arc<dyn TtyPort> {
+        TTY_PORTS[CURRENT_VCNUM.load(Ordering::SeqCst) as usize].clone()
     }
 
     /// @brief 处理Prtsc按下事件
@@ -377,7 +373,6 @@ impl TypeOneFSMState {
         &self,
         scancode: u8,
         scancode_status: &mut ScanCodeStatus,
-        tty: &Arc<TtyDevice>,
     ) -> TypeOneFSMState {
         static PRTSC_SCAN_CODE: [u8; 4] = [0xe0, 0x2a, 0xe0, 0x37];
         let i = match self {
@@ -389,7 +384,7 @@ impl TypeOneFSMState {
             return TypeOneFSMState::Start;
         }
         if scancode != PRTSC_SCAN_CODE[i as usize] {
-            return self.handle_type3(scancode, scancode_status, tty);
+            return self.handle_type3(scancode, scancode_status);
         } else {
             if i == 3 {
                 // 成功解析出PrtscPress
@@ -405,7 +400,6 @@ impl TypeOneFSMState {
         &self,
         scancode: u8,
         scancode_status: &mut ScanCodeStatus,
-        tty: &Arc<TtyDevice>,
     ) -> TypeOneFSMState {
         static PRTSC_SCAN_CODE: [u8; 4] = [0xe0, 0xb7, 0xe0, 0xaa];
         let i = match self {
@@ -417,7 +411,7 @@ impl TypeOneFSMState {
             return TypeOneFSMState::Start;
         }
         if scancode != PRTSC_SCAN_CODE[i as usize] {
-            return self.handle_type3(scancode, scancode_status, tty);
+            return self.handle_type3(scancode, scancode_status);
         } else {
             if i == 3 {
                 // 成功解析出PrtscRelease

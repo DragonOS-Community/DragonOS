@@ -6,7 +6,7 @@ use super::vfs::{
     core::{generate_inode_id, ROOT_INODE},
     file::FileMode,
     syscall::ModeType,
-    FileSystem, FileType, FsInfo, IndexNode, Metadata,
+    FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Metadata,
 };
 use crate::{
     driver::base::device::device_number::DeviceNumber,
@@ -461,7 +461,12 @@ impl IndexNode for LockedDevFSInode {
         }
     }
 
-    fn ioctl(&self, _cmd: u32, _data: usize) -> Result<usize, SystemError> {
+    fn ioctl(
+        &self,
+        _cmd: u32,
+        _data: usize,
+        _private_data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 

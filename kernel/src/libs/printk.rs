@@ -1,10 +1,20 @@
-use core::fmt::{self, Write};
+use core::{
+    fmt::{self, Write},
+    sync::atomic::Ordering,
+};
 
 use alloc::string::ToString;
 
 use super::lib_ui::textui::{textui_putstr, FontColor};
 
 use crate::{
+    driver::{
+        serial::serial8250::send_to_default_serial8250_port,
+        tty::{
+            tty_driver::TtyOperation, tty_port::TTY_PORTS,
+            virtual_terminal::virtual_console::CURRENT_VCNUM,
+        },
+    },
     filesystem::procfs::{
         kmsg::KMSG,
         log::{LogLevel, LogMessage},
@@ -57,7 +67,7 @@ macro_rules! kinfo {
 macro_rules! kwarn {
     ($($arg:tt)*) => {
         $crate::libs::printk::Logger.log(4,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        $crate::libs::printk::PrintkWriter.__write_string_color($crate::libs::lib_ui::textui::FontColor::YELLOW, $crate::libs::lib_ui::textui::FontColor::BLACK, "[ WARN ] ");
+        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("\x1B[1;33m[ WARN ] \x1B[0m"));
         $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
     }
 }
@@ -66,7 +76,7 @@ macro_rules! kwarn {
 macro_rules! kerror {
     ($($arg:tt)*) => {
         $crate::libs::printk::Logger.log(3,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        $crate::libs::printk::PrintkWriter.__write_string_color($crate::libs::lib_ui::textui::FontColor::RED, $crate::libs::lib_ui::textui::FontColor::BLACK, "[ ERROR ] ");
+        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("\x1B[41m[ ERROR ] \x1B[0m"));
         $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
     }
 }
@@ -75,7 +85,7 @@ macro_rules! kerror {
 macro_rules! kBUG {
     ($($arg:tt)*) => {
         $crate::libs::printk::Logger.log(1,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        $crate::libs::printk::PrintkWriter.__write_string_color($crate::libs::lib_ui::textui::FontColor::RED, $crate::libs::lib_ui::textui::FontColor::BLACK, "[ BUG ] ");
+        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("\x1B[41m[ BUG ] \x1B[0m"));
         $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
     }
 }
@@ -91,11 +101,21 @@ impl PrintkWriter {
     /// 并输出白底黑字
     /// @param str: 要写入的字符
     pub fn __write_string(&mut self, s: &str) {
-        textui_putstr(s, FontColor::WHITE, FontColor::BLACK).ok();
-    }
-
-    pub fn __write_string_color(&self, fr_color: FontColor, bk_color: FontColor, s: &str) {
-        textui_putstr(s, fr_color, bk_color).ok();
+        let current_vcnum = CURRENT_VCNUM.load(Ordering::SeqCst);
+        if current_vcnum != -1 {
+            // tty已经初始化了之后才输出到屏幕
+            let port = TTY_PORTS[current_vcnum as usize].clone();
+            let tty = port.port_data().tty();
+            if tty.is_some() {
+                let tty = tty.unwrap();
+                let _ = tty.write(tty.core(), s.as_bytes(), s.len());
+                send_to_default_serial8250_port(s.as_bytes());
+            } else {
+                let _ = textui_putstr(s, FontColor::WHITE, FontColor::BLACK);
+            }
+        } else {
+            let _ = textui_putstr(s, FontColor::WHITE, FontColor::BLACK);
+        }
     }
 }
 

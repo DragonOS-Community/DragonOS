@@ -5,6 +5,7 @@ use crate::driver::base::device::bus::{bus_register, Bus};
 
 use self::subsys::SerioBus;
 
+pub mod i8042;
 pub mod serio_device;
 pub mod serio_driver;
 pub mod subsys;

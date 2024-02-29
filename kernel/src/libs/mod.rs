@@ -25,3 +25,5 @@ pub mod volatile;
 pub mod futex;
 pub mod rand;
 pub mod wait_queue;
+
+pub mod font;

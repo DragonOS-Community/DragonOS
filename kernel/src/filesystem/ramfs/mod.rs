@@ -324,6 +324,11 @@ impl IndexNode for LockedRamFSInode {
             return Err(SystemError::EEXIST);
         }
 
+        // 如果当前文件夹下硬连接重复，报错。
+        if self.get_entry_name(other.0.lock().metadata.inode_id).is_ok() {
+            return Err(SystemError::EEXIST);
+        }
+
         inode
             .children
             .insert(String::from(name), other_locked.self_ref.upgrade().unwrap());
@@ -439,6 +444,8 @@ impl IndexNode for LockedRamFSInode {
                 match key.len() {
                     0=>{return Err(SystemError::ENOENT);}
                     1=>{return Ok(key.remove(0));}
+                    // shouldn't panic but return Vec<String>
+                    // or just return String.concat together
                     _ => panic!("Ramfs get_entry_name: key.len()={key_len}>1, current inode_id={inode_id:?}, to find={to_find:?}", key_len=key.len(), inode_id = inode.metadata.inode_id, to_find=ino)
                 }
             }

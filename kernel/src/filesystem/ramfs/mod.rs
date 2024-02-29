@@ -429,25 +429,12 @@ impl IndexNode for LockedRamFSInode {
                 return Ok(String::from(".."));
             }
             ino => {
-                // 暴力遍历所有的children，判断inode id是否相同
-                // TODO: 优化这里，这个地方性能很差！
                 let mut key: Vec<String> = inode
-                    .children
-                    .keys()
-                    .filter(|k| {
-                        inode
-                            .children
-                            .get(*k)
-                            .unwrap()
-                            .0
-                            .lock()
-                            .metadata
-                            .inode_id
-                            .into()
-                            == ino
+                    .children.iter().filter(|iter| {
+                        iter.1.0.lock().metadata.inode_id.into() == ino
                     })
-                    .cloned()
-                    .collect();
+                    .map(|iter| iter.0)
+                    .cloned().collect();
 
                 match key.len() {
                     0=>{return Err(SystemError::ENOENT);}

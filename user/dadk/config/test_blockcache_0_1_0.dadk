@@ -6,7 +6,7 @@
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "/home/warth/DragonOS/user/apps/test-blockcache"
+        "path": "apps/test-blockcache"
       }
     }
   },

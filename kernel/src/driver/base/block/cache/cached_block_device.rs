@@ -8,7 +8,7 @@ use super::{
 
 static mut CSPACE: Option<CacheSpace> = None;
 static mut CMAPPER: Option<CacheMapper> = None;
-//该结构体向外提供BlockCache服务
+///该结构体向外提供BlockCache服务
 pub struct BlockCache;
 
 unsafe fn get_mapper() -> Result<&'static mut CacheMapper, BlockCacheError> {
@@ -30,7 +30,8 @@ unsafe fn get_space() -> Result<&'static mut CacheSpace, BlockCacheError> {
 }
 
 impl BlockCache {
-    /// @brief 初始化BlockCache需要的结构体
+    /// # 函数的功能
+    /// 初始化BlockCache需要的结构体
     pub fn init() {
         unsafe {
             CSPACE = Some(CacheSpace::new());
@@ -38,7 +39,8 @@ impl BlockCache {
         }
         kdebug!("BlockCache Initialized!");
     }
-    /// @brief 使用blockcache进行对块设备进行连续块的读操作
+    /// # 函数的功能
+    /// 使用blockcache进行对块设备进行连续块的读操作
     ///
     /// ## 参数：
     /// - 'lba_id_start' :连续块的起始块的lba_id
@@ -67,7 +69,8 @@ impl BlockCache {
         return Ok(count);
     }
 
-    /// @brief 检查cache中是否有缺块的函数
+    /// # 函数的功能
+    /// 检查cache中是否有缺块的函数
     ///
     /// ## 参数：
     /// - 'block_iter' :需要检查的块迭代器（因为块迭代器包含了需要读块的信息，所以传入块迭代器）
@@ -102,7 +105,8 @@ impl BlockCache {
             return Ok(success_ans);
         }
     }
-    /// @brief 在cache中读取一个块的数据并放置于缓存的指定位置
+    /// # 函数的功能
+    /// 在cache中读取一个块的数据并放置于缓存的指定位置
     ///
     /// ## 参数：
     /// - 'cache_block_addr' :表示需要读取的cache块的地址
@@ -120,7 +124,8 @@ impl BlockCache {
         let space = unsafe { get_space()? };
         space.read(cache_block_addr, position, buf)
     }
-    /// @brief 根据缺块的数据和io获得的数据，向cache中补充块数据
+    /// # 函数的功能
+    /// 根据缺块的数据和io获得的数据，向cache中补充块数据
     ///
     /// ## 参数：
     /// - 'f_data_vec' :这里输入的一般是从read函数中返回的缺块数据
@@ -141,7 +146,8 @@ impl BlockCache {
         Ok(count)
     }
 
-    /// @brief 将一个块数据插入到cache中
+    /// # 函数的功能
+    /// 将一个块数据插入到cache中
     ///
     /// ## 参数：
     /// - 'lba_id' :表明该块对应的lba_id，用于建立映射
@@ -154,7 +160,8 @@ impl BlockCache {
         let space = unsafe { get_space()? };
         space.insert(lba_id, data)
     }
-    /// @brief 测试版本的写入操作，这里仅仅作为取消映射的方法，并没有真正写入到cache的功能
+    /// # 函数的功能
+    /// 测试版本的写入操作，这里仅仅作为取消映射的方法，并没有真正写入到cache的功能
     ///
     /// ## 参数：
     /// - 'lba_id_start' :需要读取的连续块的起始块
@@ -194,7 +201,8 @@ impl CacheSpace {
             frame_selector: Box::new(SimpleFrameSelector::new()),
         }
     }
-    /// @brief 将一个块的数据写入到buf的指定位置
+    /// # 函数的功能
+    /// 将一个块的数据写入到buf的指定位置
     ///
     /// ## 参数：
     /// - 'addr' :请求块在Cache中的地址
@@ -220,11 +228,13 @@ impl CacheSpace {
             );
         }
     }
-    /// @brief 向cache空间中写入的函数，目前尚未实现
+    /// # 函数的功能
+    /// 向cache空间中写入的函数，目前尚未实现
     pub fn _write(&mut self, _addr: CacheBlockAddr, _data: CacheBlock) -> Option<()> {
         todo!()
     }
-    /// @brief 向cache中插入一个块并建立lba_id到块之间的映射
+    /// # 函数的功能
+    /// 向cache中插入一个块并建立lba_id到块之间的映射
     ///
     /// ## 参数：
     /// - 'lba_id' :表明你插入的块的lba_id，用于建立映射
@@ -276,17 +286,20 @@ impl CacheMapper {
             map: BTreeMap::new(),
         }
     }
-    /// @brief 插入操作
+    /// # 函数的功能
+    /// 插入操作
     pub fn insert(&mut self, lba_id: usize, caddr: CacheBlockAddr) -> Option<()> {
         self.map.insert(lba_id, caddr)?;
         Some(())
     }
-    /// @brief 查找操作
+    /// # 函数的功能
+    /// 查找操作
     #[inline]
     pub fn find(&self, lba_id: usize) -> Option<&CacheBlockAddr> {
         self.map.get(&lba_id)
     }
-    /// @brief 去除操作
+    /// # 函数的功能
+    /// 去除操作
     pub fn remove(&mut self, lba_id: usize) {
         self.map.remove(&lba_id);
     }
@@ -294,13 +307,17 @@ impl CacheMapper {
 
 /// @brief 该trait用于实现块的换入换出算法，需要设计替换算法只需要实现该trait即可
 trait FrameSelector {
-    /// @brief 给出append操作的index（理论上，如果cache没满，就不需要换出块，就可以使用append操作）
+    /// # 函数的功能
+    /// 给出append操作的index（理论上，如果cache没满，就不需要换出块，就可以使用append操作）
     fn get_index_append(&mut self) -> CacheBlockAddr;
-    /// @brief 给出replace操作后的index
+    /// # 函数的功能
+    /// 给出replace操作后的index
     fn get_index_replace(&mut self) -> CacheBlockAddr;
-    /// @brief 判断是否可以append
+    /// # 函数的功能
+    /// 判断是否可以append
     fn can_append(&self) -> bool;
-    /// @获取size
+    /// # 函数的功能
+    /// 获取size
     fn get_size(&self) -> usize;
 }
 

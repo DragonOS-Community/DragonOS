@@ -109,8 +109,10 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
 
     /// 设置当前页表的第i个页表项
     pub unsafe fn set_entry(&self, i: usize, entry: PageEntry<Arch>) -> Option<()> {
-        let entry_virt = self.entry_virt(i)?; //这个是写页表，在当前的页表里面写
-        Arch::write::<usize>(entry_virt, entry.data()); //注意，这里体现当前页表的是entry_virt函数，这个函数里面就包含了本页表的信息
+        //这个是写页表，在当前的页表里面写
+        let entry_virt = self.entry_virt(i)?; 
+        //注意，这里体现当前页表的是entry_virt函数，这个函数里面就包含了本页表的信息
+        Arch::write::<usize>(entry_virt, entry.data()); 
         return Some(());
     }
 
@@ -121,7 +123,8 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
     /// - Some(false) 如果未填写值
     /// - None 如果i超出了页表项的范围
     pub fn entry_mapped(&self, i: usize) -> Option<bool> {
-        let etv = unsafe { self.entry_virt(i) }?; //用于判断第i个表项是否已经有了值
+        //用于判断第i个表项是否已经有了值
+        let etv = unsafe { self.entry_virt(i) }?; 
         if unsafe { Arch::read::<usize>(etv) } != 0 {
             return Some(true);
         } else {
@@ -139,7 +142,8 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
     ///
     /// 页表项在页表中的下标。如果addr不在当前页表所表示的虚拟地址空间中，则返回None
     pub unsafe fn index_of(&self, addr: VirtAddr) -> Option<usize> {
-        let addr = VirtAddr::new(addr.data() & Arch::PAGE_ADDRESS_MASK); //获得上面页表项的那个i，当然是根据虚拟地址来的
+        //获得上面页表项的那个i，当然是根据虚拟地址来的
+        let addr = VirtAddr::new(addr.data() & Arch::PAGE_ADDRESS_MASK); 
         let shift = self.level * Arch::PAGE_ENTRY_SHIFT + Arch::PAGE_SHIFT;
 
         let mask = (MMArch::PAGE_ENTRY_NUM << shift) - 1;
@@ -190,7 +194,7 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
     #[inline(always)]
     pub fn from_usize(data: usize) -> Self {
         Self {
-            data, //这里的这个data它有点像那种按位取字段的那种设计，这里至少分为标志位和数据位（数据用来存储地址）
+            data, 
             phantom: PhantomData,
         }
     }
@@ -230,7 +234,8 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
 
     #[inline(always)]
     pub fn flags(&self) -> PageFlags<Arch> {
-        unsafe { PageFlags::from_data(self.data & Arch::ENTRY_FLAGS_MASK) } //通过掩码，我们可以获得标志位
+        //通过掩码，我们可以获得标志位
+        unsafe { PageFlags::from_data(self.data & Arch::ENTRY_FLAGS_MASK) } 
     }
 
     #[inline(always)]
@@ -240,7 +245,8 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
 
     #[inline(always)]
     pub fn present(&self) -> bool {
-        return self.data & Arch::ENTRY_FLAG_PRESENT != 0; //表示是否在物理内存中
+        //表示是否在物理内存中
+        return self.data & Arch::ENTRY_FLAG_PRESENT != 0; 
     }
 }
 
@@ -256,10 +262,11 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
     #[inline(always)]
     pub fn new() -> Self {
         let mut r = unsafe {
+            //新的标志位对象应该是所有标志位都为1
             Self::from_data(
                 Arch::ENTRY_FLAG_DEFAULT_PAGE
                     | Arch::ENTRY_FLAG_READONLY
-                    | Arch::ENTRY_FLAG_NO_EXEC, //新的标志位对象应该是所有标志位都为1
+                    | Arch::ENTRY_FLAG_NO_EXEC, 
             )
         };
 
@@ -538,8 +545,9 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
 
     /// 创建页表，并为这个页表创建页面映射器
     pub unsafe fn create(table_kind: PageTableKind, mut allocator: F) -> Option<Self> {
-        let table_paddr = allocator.allocate_one()?; //这种相当于new的语法糖，就是直接给你生产一个页面mapper，不需要你自己分配物理地址
-                                                     // 清空页表
+        //这种相当于new的语法糖，就是直接给你生产一个页面mapper，不需要你自己分配物理地址
+        let table_paddr = allocator.allocate_one()?; 
+        // 清空页表                                             
         let table_vaddr = Arch::phys_2_virt(table_paddr)?;
         Arch::write_bytes(table_vaddr, 0, Arch::PAGE_SIZE);
         return Some(Self::new(table_kind, table_paddr, allocator));

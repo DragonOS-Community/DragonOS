@@ -6,7 +6,7 @@ use crate::driver::base::block::block_device::BlockId;
 
 use super::{BlockCacheError, BLOCK_SIZE};
 
-/// @brief 该枚举设计来是用于实现回写法的，但是目前并未使用
+/// 该枚举设计来是用于实现回写法的，但是目前并未使用
 #[allow(dead_code)]
 pub enum CacheBlockFlag {
     Unused,
@@ -37,7 +37,7 @@ impl PartialOrd<usize> for CacheBlockAddr {
     }
 }
 
-/// @brief存储数据的最小单位
+/// 存储数据的最小单位
 pub struct CacheBlock {
     data: Box<[u8]>,
     _flag: CacheBlockFlag,

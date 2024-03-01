@@ -338,12 +338,12 @@ impl EventWaitQueue {
                 // 有感兴趣的事件
                 if ProcessManager::wakeup(pcb).is_ok() {
                     ret += 1;
-                    return true;
-                } else {
                     return false;
+                } else {
+                    return true;
                 }
             } else {
-                return false;
+                return true;
             }
         });
         ret
@@ -363,12 +363,12 @@ impl EventWaitQueue {
                 // 有感兴趣的事件
                 if ProcessManager::wakeup(pcb).is_ok() {
                     ret += 1;
-                    return true;
-                } else {
                     return false;
+                } else {
+                    return true;
                 }
             } else {
-                return false;
+                return true;
             }
         });
         ret

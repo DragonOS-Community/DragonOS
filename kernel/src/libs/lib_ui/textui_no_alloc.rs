@@ -6,7 +6,7 @@ use core::{
 use system_error::SystemError;
 
 use crate::driver::{
-    tty::serial::serial8250::send_to_default_serial8250_port, video::video_refresh_manager,
+    serial::serial8250::send_to_default_serial8250_port, video::video_refresh_manager,
 };
 
 use super::textui::{

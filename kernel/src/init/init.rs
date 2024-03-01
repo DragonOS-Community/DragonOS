@@ -3,7 +3,7 @@ use crate::{
         init::{early_setup_arch, setup_arch, setup_arch_post},
         CurrentIrqArch, CurrentSMPArch, CurrentSchedArch,
     },
-    driver::{base::init::driver_init, tty::init::tty_early_init, video::VideoRefreshManager},
+    driver::{base::init::driver_init, serial::serial_early_init, video::VideoRefreshManager},
     exception::{init::irq_init, softirq::softirq_init, InterruptArch},
     filesystem::vfs::core::vfs_init,
     include::bindings::bindings::acpi_init,
@@ -81,7 +81,7 @@ fn do_start_kernel() {
 /// 在内存管理初始化之前，执行的初始化
 #[inline(never)]
 fn init_before_mem_init() {
-    tty_early_init().expect("tty early init failed");
+    serial_early_init().expect("serial early init failed");
     let video_ok = unsafe { VideoRefreshManager::video_init().is_ok() };
     scm_init(video_ok);
 }

@@ -11,23 +11,17 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    driver::{
-        base::{
-            class::Class,
-            device::{
-                bus::Bus, device_manager, device_number::DeviceNumber, driver::Driver, Device,
-                DeviceKObjType, DeviceState, DeviceType, IdTable,
-            },
-            kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
-            kset::KSet,
-            platform::{
-                platform_device::{platform_device_manager, PlatformDevice},
-                platform_driver::{platform_driver_manager, PlatformDriver},
-            },
+    driver::base::{
+        class::Class,
+        device::{
+            bus::Bus, device_manager, device_number::DeviceNumber, driver::Driver, Device,
+            DeviceKObjType, DeviceState, DeviceType, IdTable,
         },
-        tty::{
-            tty_device::TtyDevice,
-            tty_driver::{TtyDriver, TtyDriverMetadata, TtyDriverOperations},
+        kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+        kset::KSet,
+        platform::{
+            platform_device::{platform_device_manager, PlatformDevice},
+            platform_driver::{platform_driver_manager, PlatformDriver},
         },
     },
     filesystem::kernfs::KernFSInode,
@@ -377,6 +371,7 @@ impl InnerSerial8250ISADriver {
 
 #[derive(Debug)]
 #[cast_to([sync] Driver, PlatformDriver)]
+#[allow(dead_code)]
 struct Serial8250ISADriver {
     inner: RwLock<InnerSerial8250ISADriver>,
     name: &'static str,
@@ -399,32 +394,6 @@ impl Serial8250ISADriver {
         }
 
         return r;
-    }
-}
-
-impl TtyDriver for Serial8250ISADriver {
-    fn driver_name(&self) -> &str {
-        self.name
-    }
-
-    fn dev_name(&self) -> &str {
-        todo!()
-    }
-
-    fn metadata(&self) -> &TtyDriverMetadata {
-        todo!()
-    }
-
-    fn other(&self) -> Option<&Arc<dyn TtyDriver>> {
-        todo!()
-    }
-
-    fn ttys(&self) -> &[Arc<TtyDevice>] {
-        todo!()
-    }
-
-    fn tty_ops(&self) -> Option<&'static dyn TtyDriverOperations> {
-        None
     }
 }
 

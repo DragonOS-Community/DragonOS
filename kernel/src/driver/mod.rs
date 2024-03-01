@@ -7,6 +7,7 @@ pub mod keyboard;
 pub mod net;
 pub mod open_firmware;
 pub mod pci;
+pub mod serial;
 pub mod timers;
 pub mod tty;
 pub mod video;

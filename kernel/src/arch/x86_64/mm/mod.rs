@@ -72,10 +72,10 @@ static XD_RESERVED: AtomicBool = AtomicBool::new(false);
 
 impl MemoryManagementArch for X86_64MMArch {
     /// 4K页
-    const PAGE_SHIFT: usize = 12; 
+    const PAGE_SHIFT: usize = 12;
 
     /// 每个页表项占8字节，总共有512个页表项    这里表示512的2对数
-    const PAGE_ENTRY_SHIFT: usize = 9; 
+    const PAGE_ENTRY_SHIFT: usize = 9;
 
     /// 四级页表（PML4T、PDPT、PDT、PT）
     const PAGE_LEVELS: usize = 4;
@@ -89,13 +89,13 @@ impl MemoryManagementArch for X86_64MMArch {
 
     const ENTRY_FLAG_DEFAULT_TABLE: usize = Self::ENTRY_FLAG_PRESENT;
     //00000000_00000000_00000000_00000001
-    const ENTRY_FLAG_PRESENT: usize = 1 << 0; 
+    const ENTRY_FLAG_PRESENT: usize = 1 << 0;
 
     const ENTRY_FLAG_READONLY: usize = 0;
     //00000000_00000000_00000000_00000010
-    const ENTRY_FLAG_READWRITE: usize = 1 << 1; 
+    const ENTRY_FLAG_READWRITE: usize = 1 << 1;
     //00000000_00000000_00000000_00000100
-    const ENTRY_FLAG_USER: usize = 1 << 2; 
+    const ENTRY_FLAG_USER: usize = 1 << 2;
 
     const ENTRY_FLAG_WRITE_THROUGH: usize = 1 << 3;
 

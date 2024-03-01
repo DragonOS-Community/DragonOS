@@ -383,9 +383,11 @@ impl FATFileSystem {
 
         let mut v = Vec::<u8>::new();
         v.resize(self.bpb.bytes_per_sector as usize, 0);
-        self.partition
-            .disk()
-            .read_at_sync(fat_ent_lba as usize, 1 * self.lba_per_sector(), &mut v)?;
+        self.partition.disk().read_at_sync(
+            fat_ent_lba as usize,
+            1 * self.lba_per_sector(),
+            &mut v,
+        )?;
 
         let mut cursor = VecCursor::new(v);
         cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;

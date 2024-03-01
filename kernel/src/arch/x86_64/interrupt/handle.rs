@@ -1,9 +1,13 @@
 use core::{ffi::c_void, intrinsics::likely};
 
 use crate::{
-    arch::driver::apic::{CurrentApic, LocalAPIC},
-    exception::{irqdesc::irq_desc_manager, IrqNumber},
+    arch::{
+        driver::apic::{CurrentApic, LocalAPIC},
+        CurrentIrqArch,
+    },
+    exception::{irqdesc::irq_desc_manager, InterruptArch, IrqNumber},
     include::bindings::bindings::{do_IRQ, pt_regs},
+    kdebug,
 };
 
 use super::TrapFrame;

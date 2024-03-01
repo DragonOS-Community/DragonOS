@@ -9,6 +9,7 @@ use crate::{
         acpi::glue::acpi_device_notify,
         base::map::{LockedDevsMap, LockedKObjMap},
     },
+    exception::irqdata::IrqHandlerData,
     filesystem::{
         sysfs::{
             file::sysfs_emit_str, sysfs_instance, Attribute, AttributeGroup, SysFSOps,
@@ -883,7 +884,7 @@ pub struct DeviceId {
 
 impl DeviceId {
     #[allow(dead_code)]
-    pub fn new(data: Option<&'static str>, allocated: Option<String>) -> Option<Self> {
+    pub fn new(data: Option<&'static str>, allocated: Option<String>) -> Option<Arc<Self>> {
         if data.is_none() && allocated.is_none() {
             return None;
         }
@@ -893,7 +894,7 @@ impl DeviceId {
             return None;
         }
 
-        return Some(Self { data, allocated });
+        return Some(Arc::new(Self { data, allocated }));
     }
 
     pub fn id(&self) -> Option<&str> {
@@ -915,3 +916,5 @@ impl PartialEq for DeviceId {
         return self.id() == other.id();
     }
 }
+
+impl IrqHandlerData for DeviceId {}

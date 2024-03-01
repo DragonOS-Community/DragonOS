@@ -42,6 +42,10 @@ impl IrqChip for NoIrqChip {
         "none"
     }
 
+    fn can_mask_ack(&self) -> bool {
+        false
+    }
+
     fn irq_enable(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
         Ok(())
     }
@@ -85,6 +89,10 @@ impl DummyIrqChip {
 impl IrqChip for DummyIrqChip {
     fn name(&self) -> &'static str {
         "dummy"
+    }
+
+    fn can_mask_ack(&self) -> bool {
+        false
     }
 
     fn irq_enable(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {

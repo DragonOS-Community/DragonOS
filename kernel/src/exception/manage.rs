@@ -56,14 +56,13 @@ impl IrqManager {
     /// - handler: 中断处理函数
     /// - flags: 中断处理标志
     /// - dev_id: 一个用于标识设备的cookie
-    #[allow(dead_code)]
     pub fn request_irq(
         &self,
         irq: IrqNumber,
         name: String,
         handler: &'static dyn IrqHandler,
         flags: IrqHandleFlags,
-        dev_id: Option<DeviceId>,
+        dev_id: Option<Arc<DeviceId>>,
     ) -> Result<(), SystemError> {
         return self.request_threaded_irq(irq, Some(handler), None, flags, name, dev_id);
     }
@@ -111,7 +110,7 @@ impl IrqManager {
         thread_fn: Option<&'static dyn IrqHandler>,
         flags: IrqHandleFlags,
         dev_name: String,
-        dev_id: Option<DeviceId>,
+        dev_id: Option<Arc<DeviceId>>,
     ) -> Result<(), SystemError> {
         if irq == IrqNumber::IRQ_NOTCONNECTED {
             return Err(SystemError::ENOTCONN);
@@ -386,8 +385,6 @@ impl IrqManager {
                 ));
             }
 
-            // 在队列末尾添加新的irqaction
-            desc_inner_guard.add_action(action.clone());
             irq_shared = true;
         }
 
@@ -515,6 +512,9 @@ impl IrqManager {
                 kwarn!("Irq {} uses trigger type: {old_trigger_type:?}, but requested trigger type: {new_trigger_type:?}.", irq.data());
             }
         }
+
+        // 在队列末尾添加新的irqaction
+        desc_inner_guard.add_action(action.clone());
 
         // 检查我们是否曾经通过虚构的中断处理程序禁用过irq。重新启用它并再给它一次机会。
         if irq_shared
@@ -870,7 +870,7 @@ impl IrqManager {
 
         if chip.flags().contains(IrqChipFlags::IRQCHIP_SET_TYPE_MASKED) {
             if desc_inner_guard.common_data().status().masked() == false {
-                self.mask_irq(desc_inner_guard);
+                self.mask_irq(desc_inner_guard.irq_data());
             }
             if desc_inner_guard.common_data().status().disabled() == false {
                 to_unmask = true;
@@ -962,33 +962,21 @@ impl IrqManager {
     }
 
     /// 屏蔽中断
-    pub fn mask_irq(&self, desc_inner_guard: &mut SpinLockGuard<'_, InnerIrqDesc>) {
-        if desc_inner_guard.common_data().status().masked() {
+    pub(super) fn mask_irq(&self, irq_data: &Arc<IrqData>) {
+        if irq_data.common_data().status().masked() {
             return;
         }
 
-        let r = desc_inner_guard
-            .irq_data()
-            .chip()
-            .irq_mask(&desc_inner_guard.irq_data());
-        if let Err(e) = r {
-            if e != SystemError::ENOSYS {
-                kerror!(
-                    "Failed to mask irq {} on irqchip {}, error {:?}",
-                    desc_inner_guard.irq_data().irq().data(),
-                    desc_inner_guard.irq_data().chip().name(),
-                    e
-                );
-            }
-        } else {
-            desc_inner_guard
-                .common_data()
-                .insert_status(IrqStatus::IRQD_IRQ_MASKED);
+        let chip = irq_data.chip();
+        let r = chip.irq_mask(irq_data);
+
+        if r.is_ok() {
+            irq_data.common_data().set_masked();
         }
     }
 
     /// 解除屏蔽中断
-    pub fn unmask_irq(&self, desc_inner_guard: &SpinLockGuard<'_, InnerIrqDesc>) {
+    pub(super) fn unmask_irq(&self, desc_inner_guard: &SpinLockGuard<'_, InnerIrqDesc>) {
         if desc_inner_guard.common_data().status().masked() == false {
             return;
         }

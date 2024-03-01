@@ -49,14 +49,14 @@ impl IrqData {
 
     pub fn irqd_set(&self, status: IrqStatus) {
         // clone是为了释放inner锁
-        let common_data = self.inner.lock().common_data.clone();
+        let common_data = self.inner.lock_irqsave().common_data.clone();
         common_data.insert_status(status);
     }
 
     #[allow(dead_code)]
     pub fn irqd_clear(&self, status: IrqStatus) {
         // clone是为了释放inner锁
-        let common_data = self.inner.lock().common_data.clone();
+        let common_data = self.inner.lock_irqsave().common_data.clone();
         common_data.clear_status(status);
     }
 
@@ -78,7 +78,7 @@ impl IrqData {
             .lock_irqsave()
             .common_data
             .inner
-            .lock()
+            .lock_irqsave()
             .state
             .is_level_type()
     }
@@ -88,7 +88,7 @@ impl IrqData {
             .lock_irqsave()
             .common_data
             .inner
-            .lock()
+            .lock_irqsave()
             .state
             .is_wakeup_set()
     }
@@ -197,8 +197,44 @@ impl IrqCommonData {
             .remove(IrqStatus::IRQD_MANAGED_SHUTDOWN);
     }
 
+    pub fn masked(&self) -> bool {
+        self.inner.lock_irqsave().state.masked()
+    }
+
+    pub fn set_masked(&self) {
+        self.inner
+            .lock_irqsave()
+            .state
+            .insert(IrqStatus::IRQD_IRQ_MASKED);
+    }
+
     pub fn clear_masked(&self) {
         self.clear_status(IrqStatus::IRQD_IRQ_MASKED);
+    }
+
+    pub fn set_inprogress(&self) {
+        self.inner
+            .lock_irqsave()
+            .state
+            .insert(IrqStatus::IRQD_IRQ_INPROGRESS);
+    }
+
+    pub fn clear_inprogress(&self) {
+        self.inner
+            .lock_irqsave()
+            .state
+            .remove(IrqStatus::IRQD_IRQ_INPROGRESS);
+    }
+
+    pub fn disabled(&self) -> bool {
+        self.inner.lock_irqsave().state.disabled()
+    }
+
+    pub fn set_disabled(&self) {
+        self.inner
+            .lock_irqsave()
+            .state
+            .insert(IrqStatus::IRQD_IRQ_DISABLED);
     }
 
     pub fn clear_disabled(&self) {

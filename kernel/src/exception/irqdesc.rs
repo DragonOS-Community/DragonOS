@@ -1,4 +1,8 @@
-use core::{any::Any, fmt::Debug};
+use core::{
+    any::Any,
+    fmt::Debug,
+    sync::atomic::{AtomicI64, Ordering},
+};
 
 use alloc::{
     collections::{btree_map, BTreeMap},
@@ -71,6 +75,8 @@ pub struct IrqDesc {
     /// 一个用于串行化 request_irq()和free_irq() 的互斥锁
     request_mutex: Mutex<()>,
     kobj_state: LockedKObjectState,
+    /// 当前描述符内正在运行的中断线程数
+    threads_active: AtomicI64,
 }
 
 impl IrqDesc {
@@ -106,12 +112,28 @@ impl IrqDesc {
             request_mutex: Mutex::new(()),
             handler: RwLock::new(None),
             kobj_state: LockedKObjectState::new(Some(KObjectState::INITIALIZED)),
+            threads_active: AtomicI64::new(0),
         };
 
         irq_desc.set_handler(bad_irq_handler());
         irq_desc.inner().irq_data.irqd_set(irqd_flags);
 
         return Arc::new(irq_desc);
+    }
+
+    /// 返回当前活跃的中断线程数量
+    pub fn threads_active(&self) -> i64 {
+        self.threads_active.load(Ordering::SeqCst)
+    }
+
+    /// 增加当前活跃的中断线程数量, 返回增加前的值
+    pub fn inc_threads_active(&self) -> i64 {
+        self.threads_active.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// 减少当前活跃的中断线程数量, 返回减少前的值
+    pub fn dec_threads_active(&self) -> i64 {
+        self.threads_active.fetch_sub(1, Ordering::SeqCst)
     }
 
     pub fn set_handler(&self, handler: &'static dyn IrqFlowHandler) {
@@ -318,6 +340,10 @@ impl InnerIrqDesc {
         !self.line_status.contains(IrqLineStatus::IRQ_NOAUTOEN)
     }
 
+    pub fn can_thread(&self) -> bool {
+        !self.line_status.contains(IrqLineStatus::IRQ_NOTHREAD)
+    }
+
     /// 中断是否可以设置CPU亲和性
     pub fn can_set_affinity(&self) -> bool {
         if self.common_data.status().can_balance() == false
@@ -488,6 +514,7 @@ impl IrqAction {
                 irq,
                 flags: IrqHandleFlags::empty(),
                 name,
+                thread_flags: ThreadedHandlerFlags::empty(),
             }),
             thread_completion: Completion::new(),
         };
@@ -508,7 +535,7 @@ impl IrqAction {
 #[derive(Debug)]
 pub struct InnerIrqAction {
     /// cookie to identify the device
-    dev_id: Option<DeviceId>,
+    dev_id: Option<Arc<DeviceId>>,
     /// 中断处理程序
     handler: Option<&'static dyn IrqHandler>,
     /// interrupt handler function for threaded interrupts
@@ -520,16 +547,18 @@ pub struct InnerIrqAction {
     /// 中断号
     irq: IrqNumber,
     flags: IrqHandleFlags,
+    /// 中断线程的标志
+    thread_flags: ThreadedHandlerFlags,
     /// name of the device
     name: String,
 }
 
 impl InnerIrqAction {
-    pub fn dev_id(&self) -> &Option<DeviceId> {
+    pub fn dev_id(&self) -> &Option<Arc<DeviceId>> {
         &self.dev_id
     }
 
-    pub fn dev_id_mut(&mut self) -> &mut Option<DeviceId> {
+    pub fn dev_id_mut(&mut self) -> &mut Option<Arc<DeviceId>> {
         &mut self.dev_id
     }
 
@@ -551,6 +580,14 @@ impl InnerIrqAction {
 
     pub fn set_thread(&mut self, thread: Option<Arc<ProcessControlBlock>>) {
         self.thread = thread;
+    }
+
+    pub fn thread_flags(&self) -> &ThreadedHandlerFlags {
+        &self.thread_flags
+    }
+
+    pub fn thread_flags_mut(&mut self) -> &mut ThreadedHandlerFlags {
+        &mut self.thread_flags
     }
 
     pub fn secondary(&self) -> Option<Arc<IrqAction>> {
@@ -575,6 +612,40 @@ impl InnerIrqAction {
 
     pub fn name(&self) -> &String {
         &self.name
+    }
+}
+
+bitflags! {
+    /// 这些标志由线程处理程序使用
+    pub struct ThreadedHandlerFlags: u32 {
+        /// IRQTF_RUNTHREAD - 表示应运行中断处理程序线程
+        const IRQTF_RUNTHREAD = 1 << 0;
+        /// IRQTF_WARNED - 已打印警告 "IRQ_WAKE_THREAD w/o thread_fn"
+        const IRQTF_WARNED = 1 << 1;
+        /// IRQTF_AFFINITY - 请求irq线程调整亲和性
+        const IRQTF_AFFINITY = 1 << 2;
+        /// IRQTF_FORCED_THREAD - irq操作被强制线程化
+        const IRQTF_FORCED_THREAD = 1 << 3;
+        /// IRQTF_READY - 表示irq线程已准备就绪
+        const IRQTF_READY = 1 << 4;
+    }
+}
+
+/// Implements the `ThreadedHandlerFlags` structure.
+impl ThreadedHandlerFlags {
+    /// 在 `ThreadedHandlerFlags` 结构中测试并设置特定的位。
+    ///
+    /// # 参数
+    ///
+    /// * `bit` - 要测试并设置的位。
+    ///
+    /// # 返回
+    ///
+    /// 如果操作前该位已被设置，则返回 `true`，否则返回 `false`。
+    pub fn test_and_set_bit(&mut self, bit: ThreadedHandlerFlags) -> bool {
+        let res = (self.bits & bit.bits) != 0;
+        self.bits |= bit.bits;
+        return res;
     }
 }
 

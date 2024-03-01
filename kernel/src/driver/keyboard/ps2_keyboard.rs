@@ -1,12 +1,14 @@
-use core::{ffi::c_void, sync::atomic::AtomicI32};
+use core::{ffi::c_void, hint::spin_loop, sync::atomic::AtomicI32};
 
 use alloc::{
     string::ToString,
     sync::{Arc, Weak},
 };
+use bitfield_struct::bitfield;
 use unified_init::macros::unified_init;
 
 use crate::{
+    arch::{io::PortIOArch, CurrentPortIOArch},
     driver::{
         base::device::device_number::{DeviceNumber, Major},
         tty::tty_device::TTY_DEVICES,
@@ -24,7 +26,6 @@ use crate::{
             FileSystem, FileType, IndexNode, Metadata,
         },
     },
-    include::bindings::bindings::vfs_file_operations_t,
     init::initcall::INITCALL_DEVICE,
     libs::{keyboard_parser::TypeOneFSM, rwlock::RwLock, spinlock::SpinLock},
     time::TimeSpec,
@@ -34,8 +35,62 @@ use system_error::SystemError;
 /// PS2键盘的中断向量号
 const PS2_KEYBOARD_INTR_VECTOR: IrqNumber = IrqNumber::new(0x21);
 
+const PORT_PS2_KEYBOARD_DATA: u8 = 0x60;
+const PORT_PS2_KEYBOARD_STATUS: u8 = 0x64;
+const PORT_PS2_KEYBOARD_CONTROL: u8 = 0x64;
+
+/// 向键盘发送配置命令
+const PS2_KEYBOARD_COMMAND_WRITE: u8 = 0x60;
+/// 读取键盘的配置值
+const PS2_KEYBOARD_COMMAND_READ: u8 = 0x20;
+/// 初始化键盘控制器的配置值
+const PS2_KEYBOARD_PARAM_INIT: u8 = 0x47;
+
+/// PS2键盘控制器的状态寄存器
+#[bitfield(u8)]
+struct StatusRegister {
+    /// 输出缓冲区满标志
+    ///
+    /// （必须在尝试从 IO 端口 0x60 读取数据之前设置）
+    outbuf_full: bool,
+
+    /// 输入缓冲区满标志
+    ///
+    /// （在尝试向 IO 端口 0x60 或 IO 端口 0x64 写入数据之前必须清除）
+    inbuf_full: bool,
+
+    /// 系统标志
+    ///
+    /// 如果系统通过自检 (POST)，则意味着在复位时被清除并由固件设置（通过 PS/2 控制器配置字节）
+    system_flag: bool,
+
+    /// 命令/数据标志
+    ///
+    /// （0 = 写入输入缓冲区的数据是 PS/2 设备的数据，1 = 写入输入缓冲区的数据是 PS/2 控制器命令的数据）
+    command_data: bool,
+
+    /// 未知标志1
+    ///
+    /// 可能是“键盘锁”（现代系统中更可能未使用）
+    unknown1: bool,
+
+    /// 未知标志2
+    ///
+    /// 可能是“接收超时”或“第二个 PS/2 端口输出缓冲区已满”
+    unknown2: bool,
+    /// 超时错误标志
+    ///
+    /// 超时错误（0 = 无错误，1 = 超时错误）
+    timeout_error: bool,
+
+    /// 奇偶校验错误标志
+    ///
+    /// （0 = 无错误，1 = 奇偶校验错误）
+    parity_error: bool,
+}
+
 #[derive(Debug)]
-pub struct LockedPS2KeyBoardInode(RwLock<PS2KeyBoardInode>, AtomicI32); // self.1 用来记录有多少个文件打开了这个inode
+pub struct LockedPS2KeyBoardInode(RwLock<PS2KeyBoardInode>);
 
 lazy_static! {
     static ref PS2_KEYBOARD_FSM: SpinLock<TypeOneFSM> = {
@@ -58,17 +113,14 @@ pub struct PS2KeyBoardInode {
     fs: Weak<DevFS>,
     /// INode 元数据
     metadata: Metadata,
-    /// 键盘操作函数
-    f_ops: vfs_file_operations_t,
 }
 
 impl LockedPS2KeyBoardInode {
-    pub fn new(f_ops: &vfs_file_operations_t) -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         let inode = PS2KeyBoardInode {
             // uuid: Uuid::new_v5(),
             self_ref: Weak::default(),
             fs: Weak::default(),
-            f_ops: f_ops.clone(), // 从引用复制一遍获取所有权
             metadata: Metadata {
                 dev_id: 1,
                 inode_id: generate_inode_id(),
@@ -87,10 +139,7 @@ impl LockedPS2KeyBoardInode {
             },
         };
 
-        let result = Arc::new(LockedPS2KeyBoardInode(
-            RwLock::new(inode),
-            AtomicI32::new(0),
-        ));
+        let result = Arc::new(LockedPS2KeyBoardInode(RwLock::new(inode)));
         result.0.write().self_ref = Arc::downgrade(&result);
 
         return result;
@@ -103,9 +152,8 @@ impl DeviceINode for LockedPS2KeyBoardInode {
     }
 }
 
-#[no_mangle] // 不重命名
-pub extern "C" fn ps2_keyboard_register(f_ops: &vfs_file_operations_t) {
-    devfs_register("ps2_keyboard", LockedPS2KeyBoardInode::new(f_ops))
+fn ps2_keyboard_register() {
+    devfs_register("ps2_keyboard", LockedPS2KeyBoardInode::new())
         .expect("Failed to register ps/2 keyboard");
 }
 
@@ -117,17 +165,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
         buf: &mut [u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
-        let guard = self.0.read();
-        let func = guard.f_ops.read.unwrap();
-        let r = unsafe {
-            func(
-                0 as *mut c_void,
-                &mut buf[0..len] as *mut [u8] as *mut i8,
-                len as i64,
-                0 as *mut i64,
-            )
-        };
-        return Ok(r as usize);
+        return Err(SystemError::ENOSYS);
     }
 
     fn write_at(
@@ -137,28 +175,14 @@ impl IndexNode for LockedPS2KeyBoardInode {
         _buf: &[u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
-        let prev_ref_count = self.1.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-        if prev_ref_count == 0 {
-            // 第一次打开，需要初始化
-            let guard = self.0.write();
-            let func = guard.f_ops.open.unwrap();
-            let _ = unsafe { func(0 as *mut c_void, 0 as *mut c_void) };
-        }
         return Ok(());
     }
 
     fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
-        let prev_ref_count = self.1.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
-        if prev_ref_count == 1 {
-            // 最后一次关闭，需要释放
-            let guard = self.0.write();
-            let func = guard.f_ops.close.unwrap();
-            let _ = unsafe { func(0 as *mut c_void, 0 as *mut c_void) };
-        }
         return Ok(());
     }
 
@@ -191,25 +215,28 @@ impl IndexNode for LockedPS2KeyBoardInode {
     }
 }
 
-#[allow(dead_code)]
-#[no_mangle]
-/// for test
-pub extern "C" fn ps2_keyboard_parse_keycode(input: u8) {
-    PS2_KEYBOARD_FSM.lock().parse(input);
-}
-
 #[derive(Debug)]
 struct Ps2KeyboardIrqHandler;
 
 impl IrqHandler for Ps2KeyboardIrqHandler {
     fn handle(
         &self,
-        irq: IrqNumber,
-        static_data: Option<&dyn IrqHandlerData>,
-        dynamic_data: Option<Arc<dyn IrqHandlerData>>,
+        _irq: IrqNumber,
+        _static_data: Option<&dyn IrqHandlerData>,
+        _dev_id: Option<Arc<dyn IrqHandlerData>>,
     ) -> Result<IrqReturn, SystemError> {
-        kdebug!("ps2_keyboard irq handler");
-        todo!()
+        // 先检查状态寄存器，看看是否有数据
+        let status = unsafe { CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_STATUS.into()) };
+        let status = StatusRegister::from(status);
+        if !status.outbuf_full() {
+            return Ok(IrqReturn::NotHandled);
+        }
+
+        let input = unsafe { CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_DATA.into()) };
+        // wait_ps2_keyboard_read();
+        PS2_KEYBOARD_FSM.lock().parse(input);
+
+        return Ok(IrqReturn::Handled);
     }
 }
 
@@ -218,8 +245,36 @@ impl Ps2KeyboardIrqHandler {
         IrqHandleFlags::from_bits_truncate(IrqHandleFlags::IRQF_TRIGGER_RISING.bits());
 }
 
+/// 等待 PS/2 键盘的输入缓冲区为空
+fn wait_ps2_keyboard_write() {
+    let mut status = StatusRegister::new();
+    loop {
+        status = StatusRegister::from(unsafe {
+            CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_STATUS.into())
+        });
+        if !status.inbuf_full() {
+            break;
+        }
+
+        spin_loop();
+    }
+}
 #[unified_init(INITCALL_DEVICE)]
 fn ps2_keyboard_init() -> Result<(), SystemError> {
+    // ======== 初始化键盘控制器，写入配置值 =========
+    wait_ps2_keyboard_write();
+    unsafe {
+        CurrentPortIOArch::out8(PORT_PS2_KEYBOARD_CONTROL.into(), PS2_KEYBOARD_COMMAND_WRITE);
+        wait_ps2_keyboard_write();
+        CurrentPortIOArch::out8(PORT_PS2_KEYBOARD_DATA.into(), PS2_KEYBOARD_PARAM_INIT);
+        wait_ps2_keyboard_write();
+    }
+
+    // 执行一百万次nop，等待键盘控制器把命令执行完毕
+    for _ in 0..1000000 {
+        spin_loop();
+    }
+
     irq_manager()
         .request_irq(
             PS2_KEYBOARD_INTR_VECTOR,
@@ -229,5 +284,16 @@ fn ps2_keyboard_init() -> Result<(), SystemError> {
             None,
         )
         .expect("Failed to request irq for ps2 keyboard");
+
+    // 先读一下键盘的数据，防止由于在键盘初始化之前，由于按键被按下从而导致接收不到中断。
+    let status = unsafe { CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_STATUS.into()) };
+    let status = StatusRegister::from(status);
+    if status.outbuf_full() {
+        unsafe { CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_DATA.into()) };
+    }
+
+    // 将设备挂载到devfs
+    ps2_keyboard_register();
+
     Ok(())
 }

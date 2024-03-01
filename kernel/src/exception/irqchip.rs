@@ -54,6 +54,10 @@ pub trait IrqChip: Sync + Send + Any + Debug {
     fn irq_mask(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
+
+    /// 指示当前芯片是否实现了`irq_mask_ack`函数
+    fn can_mask_ack(&self) -> bool;
+
     /// ack and mask an interrupt source
     fn irq_mask_ack(&self, _irq: &Arc<IrqData>) {}
 

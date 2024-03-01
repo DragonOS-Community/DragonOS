@@ -1001,7 +1001,7 @@ pub fn textui_putchar(
     if unsafe { TEXTUI_IS_INIT } {
         return textui_framework()
             .current_window
-            .lock()
+            .lock_irqsave()
             .textui_putchar_window(
                 character,
                 fr_color,
@@ -1033,7 +1033,7 @@ pub fn textui_putstr(
         None
     };
 
-    let mut guard = window.as_ref().map(|w| w.lock());
+    let mut guard = window.as_ref().map(|w| w.lock_irqsave());
 
     for character in string.chars() {
         if unsafe { TEXTUI_IS_INIT } {

@@ -49,6 +49,10 @@ impl IrqChip for LocalApicChip {
         false
     }
 
+    fn can_mask_ack(&self) -> bool {
+        false
+    }
+
     fn irq_compose_msi_msg(&self, irq: &Arc<IrqData>, msg: &mut MsiMsg) {
         let chip_data = irq.chip_data().unwrap();
         let apicd = chip_data.ref_any().downcast_ref::<ApicChipData>().unwrap();

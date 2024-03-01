@@ -586,6 +586,10 @@ impl IrqChip for IoApicChip {
         Ok(())
     }
 
+    fn can_mask_ack(&self) -> bool {
+        true
+    }
+
     fn irq_mask_ack(&self, irq: &Arc<IrqData>) {
         self.irq_mask(irq).ok();
         self.irq_eoi(irq);
@@ -646,7 +650,8 @@ impl IrqChip for IoApicChip {
     }
 
     fn irq_ack(&self, irq_data: &Arc<IrqData>) {
-        irq_manager().irq_chip_ack_parent(irq_data);
+        // irq_manager().irq_chip_ack_parent(irq_data);
+        self.irq_eoi(irq_data);
     }
 
     fn flags(&self) -> IrqChipFlags {

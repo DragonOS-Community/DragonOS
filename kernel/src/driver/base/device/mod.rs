@@ -905,6 +905,7 @@ impl DeviceId {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_allocated(&mut self, allocated: String) {
         self.allocated = Some(allocated);
         self.data = None;

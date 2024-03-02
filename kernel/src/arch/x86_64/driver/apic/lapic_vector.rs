@@ -31,7 +31,7 @@ use crate::{
 };
 
 use super::{
-    apic_timer::LocalApicTimerIntrController, hw_irq::HardwareIrqConfig, CurrentApic, LocalAPIC,
+    hw_irq::HardwareIrqConfig, CurrentApic, LocalAPIC,
 };
 
 static mut LOCAL_APIC_CHIP: Option<Arc<LocalApicChip>> = None;
@@ -154,6 +154,7 @@ impl ApicChipData {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 struct InnerApicChipData {
     hw_irq_cfg: HardwareIrqConfig,

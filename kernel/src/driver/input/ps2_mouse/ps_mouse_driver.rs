@@ -48,7 +48,7 @@ impl IrqHandler for Ps2MouseIrqHandler {
         &self,
         _irq: IrqNumber,
         _static_data: Option<&dyn IrqHandlerData>,
-        dev_id: Option<Arc<dyn IrqHandlerData>>,
+        _dev_id: Option<Arc<dyn IrqHandlerData>>,
     ) -> Result<IrqReturn, SystemError> {
         if let Some(psmouse_device) = ps2_mouse_device() {
             return Ok(ps2_mouse_driver()

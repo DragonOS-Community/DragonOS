@@ -8,7 +8,6 @@
 #include <process/preempt.h>
 #include <sched/sched.h>
 #include <driver/acpi/acpi.h>
-#include "exception/irq.h"
 #include <arch/arch.h>
 
 /* x86-64 specific MSRs */
@@ -16,9 +15,6 @@
 #define MSR_STAR 0xc0000081         /* legacy mode SYSCALL target */
 #define MSR_LSTAR 0xc0000082        /* long mode SYSCALL target */
 #define MSR_SYSCALL_MASK 0xc0000084 /* EFLAGS mask for syscall */
-
-static void __smp_kick_cpu_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs);
-static void __smp__flush_tlb_ipi_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs);
 
 static spinlock_t multi_core_starting_lock = {1}; // 多核启动锁
 
@@ -66,7 +62,6 @@ void smp_init()
            (unsigned long)&_apu_boot_end - (unsigned long)&_apu_boot_start);
     io_mfence();
 
-    memset((void *)SMP_IPI_desc, 0, sizeof(irq_desc_t) * SMP_IRQ_NUM);
 
     io_mfence();
 

@@ -38,4 +38,3 @@
 #include <time/sleep.h>
 #include <common/errno.h>
 #include <common/cpu.h>
-#include <exception/irq.h>

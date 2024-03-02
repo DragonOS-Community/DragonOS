@@ -1,6 +1,5 @@
 use core::cell::RefCell;
 
-use crate::arch::cpu;
 use crate::arch::driver::tsc::TSCManager;
 use crate::arch::interrupt::TrapFrame;
 use crate::driver::base::device::DeviceId;
@@ -11,12 +10,12 @@ use crate::exception::irqdesc::{
 use crate::exception::manage::irq_manager;
 use crate::exception::IrqNumber;
 
+use crate::kdebug;
 use crate::mm::percpu::PerCpu;
 use crate::sched::core::sched_update_jiffies;
 use crate::smp::core::smp_get_processor_id;
 use crate::smp::cpu::ProcessorId;
 use crate::time::clocksource::HZ;
-use crate::{kdebug, kerror, kwarn};
 use alloc::string::ToString;
 use alloc::sync::Arc;
 pub use drop;
@@ -33,6 +32,7 @@ pub const APIC_TIMER_IRQ_NUM: IrqNumber = IrqNumber::new(151);
 static mut LOCAL_APIC_TIMERS: [RefCell<LocalApicTimer>; PerCpu::MAX_CPU_NUM as usize] =
     [const { RefCell::new(LocalApicTimer::new()) }; PerCpu::MAX_CPU_NUM as usize];
 
+#[allow(dead_code)]
 #[inline(always)]
 pub(super) fn local_apic_timer_instance(
     cpu_id: ProcessorId,
@@ -140,6 +140,7 @@ impl LocalApicTimerIntrController {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn uninstall(&self) {
         let cpu_id = smp_get_processor_id();
         let local_apic_timer = local_apic_timer_instance(cpu_id);

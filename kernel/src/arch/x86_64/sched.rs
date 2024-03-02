@@ -1,11 +1,8 @@
 use core::hint::spin_loop;
 
 use crate::{
-    exception::{manage::irq_manager, InterruptArch},
-    include::bindings::bindings::enter_syscall_int,
-    sched::SchedArch,
-    smp::core::smp_get_processor_id,
-    syscall::SYS_SCHED,
+    exception::InterruptArch, include::bindings::bindings::enter_syscall_int, sched::SchedArch,
+    smp::core::smp_get_processor_id, syscall::SYS_SCHED,
 };
 
 use super::{driver::apic::apic_timer::apic_timer_init, CurrentIrqArch};

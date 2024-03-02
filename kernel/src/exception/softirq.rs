@@ -180,6 +180,7 @@ impl Softirq {
         compiler_fence(Ordering::SeqCst);
     }
 
+    #[inline(never)]
     pub fn do_softirq(&self) {
         if self.cpu_running_count().get().load(Ordering::SeqCst) >= Self::MAX_RUNNING_PER_CPU {
             // 当前CPU的软中断嵌套层数已经达到最大值，不再执行
@@ -282,25 +283,6 @@ impl<'a> Drop for RunningCountGuard<'a> {
     }
 }
 
-// ======= 以下为给C提供的接口 =======
-#[no_mangle]
-pub extern "C" fn rs_raise_softirq(softirq_num: u32) {
-    softirq_vectors().raise_softirq(SoftirqNumber::from(softirq_num as u64));
-}
-
-#[no_mangle]
-pub extern "C" fn rs_unregister_softirq(softirq_num: u32) {
-    softirq_vectors().unregister_softirq(SoftirqNumber::from(softirq_num as u64));
-}
-
-#[no_mangle]
-pub extern "C" fn rs_do_softirq() {
+pub fn do_softirq() {
     softirq_vectors().do_softirq();
-}
-
-#[no_mangle]
-pub extern "C" fn rs_clear_softirq_pending(softirq_num: u32) {
-    unsafe {
-        softirq_vectors().clear_softirq_pending(SoftirqNumber::from(softirq_num as u64));
-    }
 }

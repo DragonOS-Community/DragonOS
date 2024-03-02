@@ -453,7 +453,7 @@ fn register_handler(desc: &Arc<IrqDesc>, level_triggered: bool) {
 /// * `active_high` - 是否为高电平有效
 /// * `dest_logic` - 是否为逻辑模式
 /// * `mask` - 是否屏蔽
-pub(super) fn ioapic_install(
+fn ioapic_install(
     vector: u8,
     dest: u8,
     level_triggered: bool,
@@ -471,24 +471,6 @@ pub(super) fn ioapic_install(
         dest_logic,
         mask,
     );
-}
-
-/// 卸载中断
-pub(super) fn ioapic_uninstall(vector: u8) {
-    let rte_index = IoApic::vector_rte_index(vector);
-    IOAPIC().lock_irqsave().disable(rte_index);
-}
-
-/// 使能中断
-pub(super) fn ioapic_enable(vector: u8) {
-    let rte_index = IoApic::vector_rte_index(vector);
-    IOAPIC().lock_irqsave().enable(rte_index);
-}
-
-/// 禁用中断
-pub(super) fn ioapic_disable(vector: u8) {
-    let rte_index = IoApic::vector_rte_index(vector);
-    IOAPIC().lock_irqsave().disable(rte_index);
 }
 
 /// IoApic中断芯片

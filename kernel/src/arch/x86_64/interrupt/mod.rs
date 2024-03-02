@@ -16,14 +16,11 @@ use crate::{
     arch::CurrentIrqArch,
     exception::{InterruptArch, IrqFlags, IrqFlagsGuard, IrqNumber},
     kerror,
-    smp::core::smp_get_processor_id,
 };
 
 use super::{
     asm::irqflags::{local_irq_restore, local_irq_save},
-    driver::apic::{
-        ioapic::ioapic_init, lapic_vector::arch_early_irq_init, CurrentApic, LocalAPIC,
-    },
+    driver::apic::{lapic_vector::arch_early_irq_init, CurrentApic, LocalAPIC},
 };
 
 /// @brief 关闭中断

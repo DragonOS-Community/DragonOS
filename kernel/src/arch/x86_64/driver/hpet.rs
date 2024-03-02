@@ -1,5 +1,4 @@
 use core::{
-    ffi::c_void,
     intrinsics::unlikely,
     mem::size_of,
     ptr::NonNull,
@@ -34,10 +33,6 @@ use crate::{
     },
     time::timer::{clock, timer_get_first_expire, update_timer_jiffies},
 };
-
-extern "C" {
-    fn c_hpet_register_irq() -> c_void;
-}
 
 static mut HPET_INSTANCE: Option<Hpet> = None;
 
@@ -161,6 +156,8 @@ impl Hpet {
         drop(inner_guard);
 
         kinfo!("HPET enabled");
+
+        drop(irq_guard);
         return Ok(());
     }
 
@@ -272,7 +269,7 @@ struct HpetIrqHandler;
 impl IrqHandler for HpetIrqHandler {
     fn handle(
         &self,
-        irq: IrqNumber,
+        _irq: IrqNumber,
         _static_data: Option<&dyn IrqHandlerData>,
         _dynamic_data: Option<Arc<dyn IrqHandlerData>>,
     ) -> Result<IrqReturn, SystemError> {

@@ -1,24 +1,32 @@
+use alloc::sync::Arc;
 use system_error::SystemError;
 use x86::apic::ApicId;
 
 use crate::{
     arch::{
-        driver::apic::{CurrentApic, LocalAPIC},
+        driver::apic::{lapic_vector::local_apic_chip, CurrentApic, LocalAPIC},
         smp::SMP_BOOT_DATA,
     },
     exception::{
-        ipi::{IpiKind, IpiTarget},
-        HardwareIrqNumber,
+        ipi::{FlushTLBIpiHandler, IpiKind, IpiTarget, KickCpuIpiHandler},
+        irqdata::{IrqData, IrqLineStatus},
+        irqdesc::{irq_desc_manager, IrqDesc, IrqFlowHandler, IrqHandler},
+        HardwareIrqNumber, IrqNumber,
     },
+    kerror,
     smp::cpu::ProcessorId,
 };
 
+use super::TrapFrame;
+
+pub const IPI_NUM_KICK_CPU: IrqNumber = IrqNumber::new(200);
+pub const IPI_NUM_FLUSH_TLB: IrqNumber = IrqNumber::new(201);
 /// IPI的种类(架构相关，指定了向量号)
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ArchIpiKind {
-    KickCpu = 200,
-    FlushTLB = 201,
+    KickCpu = IPI_NUM_KICK_CPU.data(),
+    FlushTLB = IPI_NUM_FLUSH_TLB.data(),
     SpecVector(HardwareIrqNumber),
 }
 
@@ -35,8 +43,8 @@ impl From<IpiKind> for ArchIpiKind {
 impl Into<u8> for ArchIpiKind {
     fn into(self) -> u8 {
         match self {
-            ArchIpiKind::KickCpu => 200,
-            ArchIpiKind::FlushTLB => 201,
+            ArchIpiKind::KickCpu => IPI_NUM_KICK_CPU.data() as u8,
+            ArchIpiKind::FlushTLB => IPI_NUM_FLUSH_TLB.data() as u8,
             ArchIpiKind::SpecVector(vec) => (vec.data() & 0xFF) as u8,
         }
     }
@@ -218,4 +226,43 @@ pub fn ipi_send_smp_startup(target_cpu: ProcessorId) -> Result<(), SystemError> 
 
     CurrentApic.write_icr(icr);
     return Ok(());
+}
+
+/// 初始化IPI处理函数
+pub fn arch_ipi_handler_init() {
+    do_init_irq_handler(IPI_NUM_KICK_CPU);
+    do_init_irq_handler(IPI_NUM_FLUSH_TLB);
+}
+
+fn do_init_irq_handler(irq: IrqNumber) {
+    let desc = irq_desc_manager().lookup(irq).unwrap();
+    let irq_data: Arc<IrqData> = desc.irq_data();
+    let mut chip_info_guard = irq_data.chip_info_write_irqsave();
+    chip_info_guard.set_chip(Some(local_apic_chip().clone()));
+
+    desc.modify_status(IrqLineStatus::IRQ_LEVEL, IrqLineStatus::empty());
+    drop(chip_info_guard);
+    desc.set_handler(&X86_64IpiIrqFlowHandler);
+}
+
+#[derive(Debug)]
+struct X86_64IpiIrqFlowHandler;
+
+impl IrqFlowHandler for X86_64IpiIrqFlowHandler {
+    fn handle(&self, irq_desc: &Arc<IrqDesc>, _trap_frame: &mut TrapFrame) {
+        let irq = irq_desc.irq_data().irq();
+        match irq {
+            IPI_NUM_KICK_CPU => {
+                KickCpuIpiHandler.handle(irq, None, None).ok();
+            }
+            IPI_NUM_FLUSH_TLB => {
+                FlushTLBIpiHandler.handle(irq, None, None).ok();
+            }
+            _ => {
+                kerror!("Unknown IPI: {}", irq.data());
+            }
+        }
+
+        CurrentApic.send_eoi();
+    }
 }

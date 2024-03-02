@@ -88,6 +88,7 @@ pub fn apic_timer_init() {
 }
 
 /// 初始化本地APIC定时器的中断描述符
+#[inline(never)]
 pub(super) fn local_apic_timer_irq_desc_init() {
     let desc = irq_desc_manager().lookup(APIC_TIMER_IRQ_NUM).unwrap();
     let irq_data: Arc<crate::exception::irqdata::IrqData> = desc.irq_data();

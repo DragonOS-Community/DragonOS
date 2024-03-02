@@ -12,7 +12,7 @@ use crate::{
         },
         interrupt::{
             entry::arch_setup_interrupt_gate,
-            ipi::send_ipi,
+            ipi::{arch_ipi_handler_init, send_ipi, IPI_NUM_FLUSH_TLB, IPI_NUM_KICK_CPU},
             msi::{X86MsiAddrHi, X86MsiAddrLoNormal, X86MsiDataNormal, X86_MSI_BASE_ADDRESS_LOW},
         },
     },
@@ -36,12 +36,12 @@ use super::{
 
 static mut LOCAL_APIC_CHIP: Option<Arc<LocalApicChip>> = None;
 
-pub(super) fn local_apic_chip() -> &'static Arc<LocalApicChip> {
+pub fn local_apic_chip() -> &'static Arc<LocalApicChip> {
     unsafe { LOCAL_APIC_CHIP.as_ref().unwrap() }
 }
 
 #[derive(Debug)]
-pub(super) struct LocalApicChip {
+pub struct LocalApicChip {
     inner: SpinLock<InnerIrqChip>,
 }
 
@@ -227,6 +227,7 @@ pub fn x86_vector_domain() -> &'static Arc<IrqDomain> {
     unsafe { X86_VECTOR_DOMAIN.as_ref().unwrap() }
 }
 
+#[inline(never)]
 pub fn arch_early_irq_init() -> Result<(), SystemError> {
     let vec_domain = irq_domain_manager()
         .create_and_add(
@@ -249,10 +250,11 @@ pub fn arch_early_irq_init() -> Result<(), SystemError> {
     kwarn!("arch_early_irq_init: todo: add vector matrix");
 
     local_apic_timer_irq_desc_init();
+    arch_ipi_handler_init();
     CurrentApic.init_current_cpu();
     if smp_get_processor_id().data() == 0 {
         unsafe { arch_setup_interrupt_gate() };
-        ioapic_init(&[APIC_TIMER_IRQ_NUM]);
+        ioapic_init(&[APIC_TIMER_IRQ_NUM, IPI_NUM_KICK_CPU, IPI_NUM_FLUSH_TLB]);
     }
     return Ok(());
 }

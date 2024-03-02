@@ -389,6 +389,7 @@ impl InnerIoApicChipData {
     }
 }
 
+#[inline(never)]
 pub fn ioapic_init(ignore: &'static [IrqNumber]) {
     kinfo!("Initializing ioapic...");
     let ioapic = unsafe { IoApic::new() };

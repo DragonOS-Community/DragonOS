@@ -67,7 +67,7 @@ pub struct RamFS {
     /// RamFS的root
     root: Arc<LockedDEntry>,
     // Dentry cache
-    cache: DCache,
+    cache: DCache<LockedDEntry>,
 }
 
 impl FileSystem for RamFS {

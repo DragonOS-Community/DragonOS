@@ -8,7 +8,6 @@ pub mod cache;
 mod utils;
 
 use ::core::{any::Any, fmt::Debug, ops::Index, result, sync::atomic::AtomicUsize};
-use std::path;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
@@ -510,15 +509,16 @@ impl dyn IndexNode {
     /// 
     /// 缓存可能未命中
     fn quick_lookup(&self, path: &str) -> Option<Arc<dyn IndexNode>> {
-        if let Some(cache) = self.fs().cache().ok().
-        if let Some((_, name)) = path.rsplit_once('/') {
-            // if let Some(result) = /* quick_lookup(name) */
-            
-            
+        if let Some((path_left, name)) = path.rsplit_once('/') {
+            return match self.fs().cache() {
+                Some(cache) => cache.get(name),
+                None => None
+            };
         }
-        
+        None
     }
 }
+
 
 /// IndexNode的元数据
 ///
@@ -604,12 +604,9 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     fn as_any_ref(&self) -> &dyn Any;
 
     /// @brief 返回查询缓存
-    fn cache(&self) -> Option<DCache> {
+    fn cache(&self) -> Option<DCache<dyn IndexNode>> {
         None
     }
-}
-
-impl dyn FileSystem {
 }
 
 impl DowncastArc for dyn FileSystem {

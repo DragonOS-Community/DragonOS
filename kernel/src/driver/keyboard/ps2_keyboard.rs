@@ -1,10 +1,10 @@
-use core::{ffi::c_void, hint::spin_loop, sync::atomic::AtomicI32};
+use core::hint::spin_loop;
 
 use alloc::{
     string::ToString,
     sync::{Arc, Weak},
 };
-use bitfield_struct::bitfield;
+
 use unified_init::macros::unified_init;
 
 use crate::{
@@ -42,7 +42,9 @@ const PORT_PS2_KEYBOARD_CONTROL: u8 = 0x64;
 
 /// 向键盘发送配置命令
 const PS2_KEYBOARD_COMMAND_WRITE: u8 = 0x60;
+
 /// 读取键盘的配置值
+#[allow(dead_code)]
 const PS2_KEYBOARD_COMMAND_READ: u8 = 0x20;
 /// 初始化键盘控制器的配置值
 const PS2_KEYBOARD_PARAM_INIT: u8 = 0x47;
@@ -119,8 +121,8 @@ impl IndexNode for LockedPS2KeyBoardInode {
     fn read_at(
         &self,
         _offset: usize,
-        len: usize,
-        buf: &mut [u8],
+        _len: usize,
+        _buf: &mut [u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
@@ -205,7 +207,7 @@ impl Ps2KeyboardIrqHandler {
 
 /// 等待 PS/2 键盘的输入缓冲区为空
 fn wait_ps2_keyboard_write() {
-    let mut status = Ps2StatusRegister::new();
+    let mut status: Ps2StatusRegister;
     loop {
         status = Ps2StatusRegister::from(unsafe {
             CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_STATUS.into())

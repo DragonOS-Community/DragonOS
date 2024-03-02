@@ -7,7 +7,7 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    libs::{casting::DowncastArc, cpumask::CpuMask, spinlock::SpinLock},
+    libs::{cpumask::CpuMask, spinlock::SpinLock},
     mm::VirtAddr,
 };
 
@@ -289,6 +289,7 @@ pub struct IrqChipType {
     // todo https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irq.h#1024
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum IrqChipSetMaskResult {
     /// core updates mask ok.
@@ -333,6 +334,7 @@ bitflags! {
 
 impl IrqManager {
     /// Acknowledge the parent interrupt
+    #[allow(dead_code)]
     pub fn irq_chip_ack_parent(&self, irq_data: &Arc<IrqData>) {
         let parent_data = irq_data.parent_data().map(|p| p.upgrade()).flatten();
 

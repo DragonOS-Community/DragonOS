@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU32, AtomicUsize};
+use core::sync::atomic::AtomicU32;
 
 use alloc::vec::Vec;
 

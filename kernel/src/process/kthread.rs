@@ -14,10 +14,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{sched::sched, CurrentIrqArch},
-    exception::{
-        irqdesc::{IrqAction, IrqHandler},
-        InterruptArch,
-    },
+    exception::{irqdesc::IrqAction, InterruptArch},
     init::initial_kthread::initial_kernel_thread,
     kdebug, kinfo,
     libs::{once::Once, spinlock::SpinLock},

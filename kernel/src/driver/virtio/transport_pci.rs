@@ -10,14 +10,14 @@ use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, Pc
 use crate::driver::virtio::irq::virtio_irq_manager;
 use crate::exception::irqdata::IrqHandlerData;
 use crate::exception::irqdesc::{IrqHandler, IrqReturn};
-use crate::exception::manage::irq_manager;
+
 use crate::exception::IrqNumber;
-use crate::include::bindings::bindings::pt_regs;
+
 use crate::libs::volatile::{
     volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
 };
 use crate::mm::VirtAddr;
-use crate::net::net_core::poll_ifaces_try_lock_onetime;
+
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use core::{
@@ -91,6 +91,7 @@ fn device_type(pci_device_id: u16) -> DeviceType {
 /// PCI transport for VirtIO.
 ///
 /// Ref: 4.1 Virtio Over PCI Bus
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PciTransport {
     device_type: DeviceType,

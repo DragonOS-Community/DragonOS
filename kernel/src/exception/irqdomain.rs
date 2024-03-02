@@ -89,6 +89,7 @@ impl IrqDomainManager {
         self.domains.lock_irqsave().push(domain);
     }
 
+    #[allow(dead_code)]
     pub fn remove_domain(&self, domain: &Arc<IrqDomain>) {
         let mut domains = self.domains.lock_irqsave();
         let index = domains
@@ -99,6 +100,7 @@ impl IrqDomainManager {
     }
 
     /// 获取默认的中断域
+    #[allow(dead_code)]
     pub fn default_domain(&self) -> Option<Arc<IrqDomain>> {
         self.inner.read().default_domain.clone()
     }
@@ -358,6 +360,7 @@ impl IrqDomain {
             .contains(IrqDomainFlags::NO_MAP)
     }
 
+    #[allow(dead_code)]
     fn set_hwirq_max(&self, hwirq_max: HardwareIrqNumber) {
         self.revmap.write_irqsave().hwirq_max = hwirq_max;
     }
@@ -393,10 +396,12 @@ impl IrqDomainRevMap {
         self.map.insert(hwirq, irq_data);
     }
 
+    #[allow(dead_code)]
     fn remove(&mut self, hwirq: HardwareIrqNumber) {
         self.map.remove(&hwirq);
     }
 
+    #[allow(dead_code)]
     fn lookup(&self, hwirq: HardwareIrqNumber) -> Option<Arc<IrqData>> {
         self.map.get(&hwirq).cloned()
     }

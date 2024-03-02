@@ -43,7 +43,9 @@ pub struct IrqManager;
 
 impl IrqManager {
     pub const IRQ_RESEND: bool = true;
+    #[allow(dead_code)]
     pub const IRQ_NORESEND: bool = false;
+    #[allow(dead_code)]
     pub const IRQ_START_FORCE: bool = true;
     pub const IRQ_START_COND: bool = false;
 
@@ -598,7 +600,7 @@ impl IrqManager {
 
     pub(super) fn irq_activate(
         &self,
-        desc: Arc<IrqDesc>,
+        _desc: Arc<IrqDesc>,
         desc_inner_guard: &mut SpinLockGuard<'_, InnerIrqDesc>,
     ) -> Result<(), SystemError> {
         let irq_data = desc_inner_guard.irq_data();
@@ -706,7 +708,7 @@ impl IrqManager {
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/irq/manage.c#589
     pub fn irq_setup_affinity(
         &self,
-        desc: &Arc<IrqDesc>,
+        _desc: &Arc<IrqDesc>,
         desc_inner_guard: &mut SpinLockGuard<'_, InnerIrqDesc>,
     ) -> Result<(), SystemError> {
         let common_data = desc_inner_guard.common_data();
@@ -861,8 +863,8 @@ impl IrqManager {
 
     pub fn do_enable_irq(
         &self,
-        desc: Arc<IrqDesc>,
-        desc_inner_guard: &mut SpinLockGuard<'_, InnerIrqDesc>,
+        _desc: Arc<IrqDesc>,
+        _desc_inner_guard: &mut SpinLockGuard<'_, InnerIrqDesc>,
     ) -> Result<(), SystemError> {
         // https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/irq/manage.c?r=&mo=59252&fi=2138#776
         todo!("do_enable_irq")
@@ -871,7 +873,7 @@ impl IrqManager {
     #[inline(never)]
     pub fn do_set_irq_trigger(
         &self,
-        desc: Arc<IrqDesc>,
+        _desc: Arc<IrqDesc>,
         desc_inner_guard: &mut SpinLockGuard<'_, InnerIrqDesc>,
         mut trigger_type: IrqLineStatus,
     ) -> Result<(), SystemError> {
@@ -954,9 +956,9 @@ impl IrqManager {
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/irq/manage.c?r=&mo=59252&fi=2138#1448
     fn setup_irq_thread(
         &self,
-        irq: IrqNumber,
-        action: &InnerIrqAction,
-        secondary: bool,
+        _irq: IrqNumber,
+        _action: &InnerIrqAction,
+        _secondary: bool,
     ) -> Result<(), SystemError> {
         // if secondary {
         //     KernelThreadMechanism::create(func, name)
@@ -1046,7 +1048,7 @@ impl IrqManager {
     /// ## 注意
     ///
     /// 此函数不可以在中断上下文中调用。
-    pub fn free_irq(&self, irq: IrqNumber, dev_id: Option<Arc<DeviceId>>) {
+    pub fn free_irq(&self, _irq: IrqNumber, _dev_id: Option<Arc<DeviceId>>) {
         kwarn!("Unimplemented free_irq");
     }
 }

@@ -165,7 +165,8 @@ impl Softirq {
 
     /// @brief 解注册软中断向量
     ///
-    /// @param irq_num 中断向量号码   
+    /// @param irq_num 中断向量号码  
+    #[allow(dead_code)]
     pub fn unregister_softirq(&self, softirq_num: SoftirqNumber) {
         // kdebug!("unregister_softirq softirq_num = {:?}", softirq_num as u64);
         let mut table_guard = self.table.write_irqsave();
@@ -255,6 +256,8 @@ impl Softirq {
         drop(guard);
         // kdebug!("raise_softirq exited");
     }
+
+    #[allow(dead_code)]
     pub unsafe fn clear_softirq_pending(&self, softirq_num: SoftirqNumber) {
         compiler_fence(Ordering::SeqCst);
         cpu_pending(smp_get_processor_id()).remove(VecStatus::from(softirq_num));

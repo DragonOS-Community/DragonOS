@@ -1,5 +1,5 @@
 use core::{
-    hash::{Hash, Hasher},
+    hash::Hash,
     hint::spin_loop,
     intrinsics::{likely, unlikely},
     mem::ManuallyDrop,

@@ -30,9 +30,7 @@ use crate::{
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 
-use super::{
-    hw_irq::HardwareIrqConfig, CurrentApic, LocalAPIC,
-};
+use super::{hw_irq::HardwareIrqConfig, CurrentApic, LocalAPIC};
 
 static mut LOCAL_APIC_CHIP: Option<Arc<LocalApicChip>> = None;
 

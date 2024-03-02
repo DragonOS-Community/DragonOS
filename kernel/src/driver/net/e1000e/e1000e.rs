@@ -20,9 +20,9 @@ use crate::driver::pci::pci::{
 };
 use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqMsg, IRQ};
 use crate::exception::IrqNumber;
-use crate::include::bindings::bindings::pt_regs;
+
 use crate::libs::volatile::{ReadOnly, Volatile, WriteOnly};
-use crate::net::net_core::poll_ifaces_try_lock_onetime;
+
 use crate::{kdebug, kinfo};
 
 const PAGE_SIZE: usize = 4096;

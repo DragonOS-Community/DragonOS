@@ -24,7 +24,6 @@ use crate::{
         mutex::{Mutex, MutexGuard},
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
-        wait_queue::EventWaitQueue,
     },
     process::ProcessControlBlock,
     sched::completion::Completion,
@@ -122,6 +121,7 @@ impl IrqDesc {
     }
 
     /// 返回当前活跃的中断线程数量
+    #[allow(dead_code)]
     pub fn threads_active(&self) -> i64 {
         self.threads_active.load(Ordering::SeqCst)
     }
@@ -132,6 +132,7 @@ impl IrqDesc {
     }
 
     /// 减少当前活跃的中断线程数量, 返回减少前的值
+    #[allow(dead_code)]
     pub fn dec_threads_active(&self) -> i64 {
         self.threads_active.fetch_sub(1, Ordering::SeqCst)
     }
@@ -201,10 +202,12 @@ impl IrqDesc {
         self.inner().can_request()
     }
 
+    #[allow(dead_code)]
     pub fn set_norequest(&self) {
         self.inner().set_norequest();
     }
 
+    #[allow(dead_code)]
     pub fn clear_norequest(&self) {
         self.inner().clear_norequest();
     }
@@ -332,10 +335,12 @@ impl InnerIrqDesc {
         !self.line_status.contains(IrqLineStatus::IRQ_NOREQUEST)
     }
 
+    #[allow(dead_code)]
     pub fn set_norequest(&mut self) {
         self.line_status.insert(IrqLineStatus::IRQ_NOREQUEST);
     }
 
+    #[allow(dead_code)]
     pub fn clear_norequest(&mut self) {
         self.line_status.remove(IrqLineStatus::IRQ_NOREQUEST);
     }
@@ -348,10 +353,12 @@ impl InnerIrqDesc {
         self.line_status.insert(IrqLineStatus::IRQ_PER_CPU);
     }
 
+    #[allow(dead_code)]
     pub fn line_status_clear_per_cpu(&mut self) {
         self.line_status.remove(IrqLineStatus::IRQ_PER_CPU);
     }
 
+    #[allow(dead_code)]
     pub fn line_status(&self) -> &IrqLineStatus {
         &self.line_status
     }
@@ -360,6 +367,7 @@ impl InnerIrqDesc {
         self.line_status.insert(IrqLineStatus::IRQ_NO_BALANCING);
     }
 
+    #[allow(dead_code)]
     pub fn line_status_clear_no_debug(&mut self) {
         self.line_status.remove(IrqLineStatus::IRQ_NO_BALANCING);
     }
@@ -615,6 +623,7 @@ impl InnerIrqAction {
         self.thread = thread;
     }
 
+    #[allow(dead_code)]
     pub fn thread_flags(&self) -> &ThreadedHandlerFlags {
         &self.thread_flags
     }
@@ -627,10 +636,12 @@ impl InnerIrqAction {
         self.secondary.clone()
     }
 
+    #[allow(dead_code)]
     pub fn irq(&self) -> IrqNumber {
         self.irq
     }
 
+    #[allow(dead_code)]
     pub fn set_irq(&mut self, irq: IrqNumber) {
         self.irq = irq;
     }
@@ -737,6 +748,7 @@ impl IrqHandleFlags {
         self.bits |= trigger.trigger_bits() & IrqHandleFlags::IRQF_TRIGGER_MASK.bits;
     }
 
+    #[allow(dead_code)]
     pub fn remove_trigger_type(&mut self, trigger: IrqLineStatus) {
         self.bits &= !(trigger.trigger_bits() & IrqHandleFlags::IRQF_TRIGGER_MASK.bits);
     }

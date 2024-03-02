@@ -144,6 +144,7 @@ impl InnerIrqData {
         self.hwirq = hwirq;
     }
 
+    #[allow(dead_code)]
     pub fn domain(&self) -> Option<Arc<IrqDomain>> {
         self.domain.clone()
     }
@@ -215,6 +216,7 @@ impl IrqCommonData {
             .remove(IrqStatus::IRQD_MANAGED_SHUTDOWN);
     }
 
+    #[allow(dead_code)]
     pub fn masked(&self) -> bool {
         self.inner.lock_irqsave().state.masked()
     }
@@ -248,6 +250,7 @@ impl IrqCommonData {
         self.inner.lock_irqsave().state.disabled()
     }
 
+    #[allow(dead_code)]
     pub fn set_disabled(&self) {
         self.inner
             .lock_irqsave()

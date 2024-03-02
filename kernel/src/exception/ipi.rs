@@ -9,7 +9,7 @@ use crate::{
 
 use super::{
     irqdata::IrqHandlerData,
-    irqdesc::{IrqFlowHandler, IrqHandler, IrqReturn},
+    irqdesc::{IrqHandler, IrqReturn},
     HardwareIrqNumber, IrqNumber,
 };
 

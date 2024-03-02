@@ -54,7 +54,7 @@ impl IrqFlowHandler for HandleBadIrq {
 struct FastEOIIrqHandler;
 
 impl IrqFlowHandler for FastEOIIrqHandler {
-    fn handle(&self, irq_desc: &Arc<IrqDesc>, _trap_frame: &mut TrapFrame) {
+    fn handle(&self, _irq_desc: &Arc<IrqDesc>, _trap_frame: &mut TrapFrame) {
         // https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/irq/chip.c?r=&mo=17578&fi=689#689
         todo!("FastEOIIrqHandler");
     }
@@ -118,7 +118,7 @@ impl IrqFlowHandler for EdgeIrqHandler {
 
             drop(desc_inner_guard);
 
-            let r = do_handle_irq_event(irq_desc);
+            let _r = do_handle_irq_event(irq_desc);
 
             desc_inner_guard = irq_desc.inner();
             desc_inner_guard.common_data().clear_inprogress();

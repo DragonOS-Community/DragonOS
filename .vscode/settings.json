@@ -120,7 +120,6 @@
         "fat_ent.h": "c",
         "semaphore.h": "c",
         "mm-types.h": "c",
-        "vfs.h": "c",
         "current.h": "c",
         "traceback.h": "c",
         "bitcount.h": "c",

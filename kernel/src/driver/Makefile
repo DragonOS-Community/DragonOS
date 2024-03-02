@@ -1,7 +1,7 @@
 
 CFLAGS += -I .
 
-kernel_driver_subdirs:=acpi disk mouse multiboot2 timers hid 
+kernel_driver_subdirs:=acpi disk multiboot2 timers hid 
 
 ECHO:
 	@echo "$@"

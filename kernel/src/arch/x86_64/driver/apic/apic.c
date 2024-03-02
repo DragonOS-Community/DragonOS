@@ -32,7 +32,7 @@ extern void rs_ioapic_disable(uint8_t irq_num);
  */
 void do_IRQ(struct pt_regs *rsp, ul number)
 {
-    
+    kerror("do_IRQ: %d", number);
     // if ((rsp->cs & 0x3) == 3)
     // {
     //     asm volatile("swapgs" ::: "memory");

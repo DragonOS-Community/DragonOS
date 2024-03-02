@@ -11,6 +11,7 @@ use crate::{
     arch::{io::PortIOArch, CurrentPortIOArch},
     driver::{
         base::device::device_number::{DeviceNumber, Major},
+        input::ps2_dev::Ps2StatusRegister,
         tty::tty_device::TTY_DEVICES,
     },
     exception::{
@@ -45,49 +46,6 @@ const PS2_KEYBOARD_COMMAND_WRITE: u8 = 0x60;
 const PS2_KEYBOARD_COMMAND_READ: u8 = 0x20;
 /// 初始化键盘控制器的配置值
 const PS2_KEYBOARD_PARAM_INIT: u8 = 0x47;
-
-/// PS2键盘控制器的状态寄存器
-#[bitfield(u8)]
-struct StatusRegister {
-    /// 输出缓冲区满标志
-    ///
-    /// （必须在尝试从 IO 端口 0x60 读取数据之前设置）
-    outbuf_full: bool,
-
-    /// 输入缓冲区满标志
-    ///
-    /// （在尝试向 IO 端口 0x60 或 IO 端口 0x64 写入数据之前必须清除）
-    inbuf_full: bool,
-
-    /// 系统标志
-    ///
-    /// 如果系统通过自检 (POST)，则意味着在复位时被清除并由固件设置（通过 PS/2 控制器配置字节）
-    system_flag: bool,
-
-    /// 命令/数据标志
-    ///
-    /// （0 = 写入输入缓冲区的数据是 PS/2 设备的数据，1 = 写入输入缓冲区的数据是 PS/2 控制器命令的数据）
-    command_data: bool,
-
-    /// 未知标志1
-    ///
-    /// 可能是“键盘锁”（现代系统中更可能未使用）
-    unknown1: bool,
-
-    /// 未知标志2
-    ///
-    /// 可能是“接收超时”或“第二个 PS/2 端口输出缓冲区已满”
-    unknown2: bool,
-    /// 超时错误标志
-    ///
-    /// 超时错误（0 = 无错误，1 = 超时错误）
-    timeout_error: bool,
-
-    /// 奇偶校验错误标志
-    ///
-    /// （0 = 无错误，1 = 奇偶校验错误）
-    parity_error: bool,
-}
 
 #[derive(Debug)]
 pub struct LockedPS2KeyBoardInode(RwLock<PS2KeyBoardInode>);
@@ -227,7 +185,7 @@ impl IrqHandler for Ps2KeyboardIrqHandler {
     ) -> Result<IrqReturn, SystemError> {
         // 先检查状态寄存器，看看是否有数据
         let status = unsafe { CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_STATUS.into()) };
-        let status = StatusRegister::from(status);
+        let status = Ps2StatusRegister::from(status);
         if !status.outbuf_full() {
             return Ok(IrqReturn::NotHandled);
         }
@@ -247,9 +205,9 @@ impl Ps2KeyboardIrqHandler {
 
 /// 等待 PS/2 键盘的输入缓冲区为空
 fn wait_ps2_keyboard_write() {
-    let mut status = StatusRegister::new();
+    let mut status = Ps2StatusRegister::new();
     loop {
-        status = StatusRegister::from(unsafe {
+        status = Ps2StatusRegister::from(unsafe {
             CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_STATUS.into())
         });
         if !status.inbuf_full() {
@@ -287,7 +245,7 @@ fn ps2_keyboard_init() -> Result<(), SystemError> {
 
     // 先读一下键盘的数据，防止由于在键盘初始化之前，由于按键被按下从而导致接收不到中断。
     let status = unsafe { CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_STATUS.into()) };
-    let status = StatusRegister::from(status);
+    let status = Ps2StatusRegister::from(status);
     if status.outbuf_full() {
         unsafe { CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_DATA.into()) };
     }

@@ -316,7 +316,7 @@ impl Ps2MouseDevice {
                 //     guard.current_state.flags.bits,
                 //     guard.current_state.x,
                 //     guard.current_state.y
-                // )
+                // );
             }
             _ => unreachable!(),
         }

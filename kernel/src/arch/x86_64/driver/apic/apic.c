@@ -1,5 +1,4 @@
 #include "apic.h"
-#include "apic_timer.h"
 #include <common/cpu.h>
 #include <common/glib.h>
 #include <common/kprint.h>

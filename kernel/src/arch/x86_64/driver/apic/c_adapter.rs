@@ -6,7 +6,7 @@ use super::{
 
 #[no_mangle]
 unsafe extern "C" fn rs_apic_timer_install(irq_num: u8) {
-    LocalApicTimerIntrController.install(irq_num);
+    LocalApicTimerIntrController.install();
 }
 
 #[no_mangle]

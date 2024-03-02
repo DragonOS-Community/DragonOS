@@ -1,7 +1,12 @@
 use core::cell::RefCell;
 
+use crate::arch::cpu;
 use crate::arch::driver::tsc::TSCManager;
-use crate::include::bindings::bindings::APIC_TIMER_IRQ_NUM;
+use crate::driver::base::device::DeviceId;
+use crate::exception::irqdata::IrqHandlerData;
+use crate::exception::irqdesc::{IrqHandleFlags, IrqHandler, IrqReturn};
+use crate::exception::manage::irq_manager;
+use crate::exception::IrqNumber;
 
 use crate::kdebug;
 use crate::mm::percpu::PerCpu;
@@ -9,6 +14,8 @@ use crate::sched::core::sched_update_jiffies;
 use crate::smp::core::smp_get_processor_id;
 use crate::smp::cpu::ProcessorId;
 use crate::time::clocksource::HZ;
+use alloc::string::ToString;
+use alloc::sync::Arc;
 pub use drop;
 use system_error::SystemError;
 use x86::cpuid::cpuid;
@@ -16,6 +23,8 @@ use x86::msr::{wrmsr, IA32_X2APIC_DIV_CONF, IA32_X2APIC_INIT_COUNT};
 
 use super::xapic::XApicOffset;
 use super::{CurrentApic, LVTRegister, LocalAPIC, LVT};
+
+pub const APIC_TIMER_IRQ_NUM: IrqNumber = IrqNumber::new(151);
 
 static mut LOCAL_APIC_TIMERS: [RefCell<LocalApicTimer>; PerCpu::MAX_CPU_NUM as usize] =
     [const { RefCell::new(LocalApicTimer::new()) }; PerCpu::MAX_CPU_NUM as usize];
@@ -32,6 +41,34 @@ pub(super) fn local_apic_timer_instance_mut(
     cpu_id: ProcessorId,
 ) -> core::cell::RefMut<'static, LocalApicTimer> {
     unsafe { LOCAL_APIC_TIMERS[cpu_id.data() as usize].borrow_mut() }
+}
+
+#[derive(Debug)]
+struct LocalApicTimerHandler;
+
+impl IrqHandler for LocalApicTimerHandler {
+    fn handle(
+        &self,
+        _irq: IrqNumber,
+        _static_data: Option<&dyn IrqHandlerData>,
+        _dynamic_data: Option<Arc<dyn IrqHandlerData>>,
+    ) -> Result<IrqReturn, SystemError> {
+        LocalApicTimer::handle_irq()
+    }
+}
+
+pub fn apic_timer_init() {
+    irq_manager()
+        .request_irq(
+            APIC_TIMER_IRQ_NUM,
+            "LocalApic".to_string(),
+            &LocalApicTimerHandler,
+            IrqHandleFlags::IRQF_SHARED,
+            Some(DeviceId::new(Some("lapic timer"), None).unwrap()),
+        )
+        .expect("Apic timer init failed");
+    LocalApicTimerIntrController.install();
+    LocalApicTimerIntrController.enable();
 }
 
 /// 初始化BSP的APIC定时器
@@ -65,7 +102,7 @@ fn init_ap_apic_timer() {
 pub(super) struct LocalApicTimerIntrController;
 
 impl LocalApicTimerIntrController {
-    pub(super) fn install(&self, _irq_num: u8) {
+    pub(super) fn install(&self) {
         kdebug!("LocalApicTimerIntrController::install");
         if smp_get_processor_id().data() == 0 {
             init_bsp_apic_timer();
@@ -160,7 +197,11 @@ impl LocalApicTimer {
         self.mode = LocalApicTimerMode::Periodic;
         self.set_divisor(divisor);
         self.set_initial_cnt(initial_count);
-        self.setup_lvt(APIC_TIMER_IRQ_NUM as u8, true, LocalApicTimerMode::Periodic);
+        self.setup_lvt(
+            APIC_TIMER_IRQ_NUM.data() as u8,
+            true,
+            LocalApicTimerMode::Periodic,
+        );
     }
 
     fn setup_lvt(&mut self, vector: u8, mask: bool, mode: LocalApicTimerMode) {
@@ -203,9 +244,9 @@ impl LocalApicTimer {
         return (res.ecx & (1 << 24)) != 0;
     }
 
-    pub(super) fn handle_irq() -> Result<(), SystemError> {
+    pub(super) fn handle_irq() -> Result<IrqReturn, SystemError> {
         sched_update_jiffies();
-        return Ok(());
+        return Ok(IrqReturn::Handled);
     }
 }
 

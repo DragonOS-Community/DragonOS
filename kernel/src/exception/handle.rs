@@ -68,7 +68,7 @@ impl IrqFlowHandler for EdgeIrqHandler {
     fn handle(&self, irq_desc: &Arc<IrqDesc>, _trap_frame: &mut TrapFrame) {
         let mut desc_inner_guard: SpinLockGuard<'_, InnerIrqDesc> = irq_desc.inner();
         if !irq_may_run(&desc_inner_guard) {
-            kdebug!("!irq_may_run");
+            // kdebug!("!irq_may_run");
             desc_inner_guard
                 .internal_state_mut()
                 .insert(IrqDescState::IRQS_PENDING);
@@ -77,7 +77,7 @@ impl IrqFlowHandler for EdgeIrqHandler {
         }
 
         if desc_inner_guard.common_data().disabled() {
-            kdebug!("desc_inner_guard.common_data().disabled()");
+            // kdebug!("desc_inner_guard.common_data().disabled()");
             desc_inner_guard
                 .internal_state_mut()
                 .insert(IrqDescState::IRQS_PENDING);
@@ -104,7 +104,7 @@ impl IrqFlowHandler for EdgeIrqHandler {
             {
                 let status = desc_inner_guard.common_data().status();
                 if status.disabled() == false && status.masked() {
-                    kdebug!("re-enable irq");
+                    // kdebug!("re-enable irq");
                     irq_manager().unmask_irq(&desc_inner_guard);
                 }
             }

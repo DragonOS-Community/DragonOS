@@ -4,7 +4,6 @@
 #include <common/spinlock.h>
 #include <mm/slab.h>
 #include <process/process.h>
-#include <arch/x86_64/driver/apic/apic_timer.h>
 
 #include <process/preempt.h>
 #include <sched/sched.h>
@@ -161,7 +160,7 @@ void smp_ap_start_stage2()
 
     rs_init_syscall_64();
     
-    apic_timer_ap_core_init();
+    rs_init_current_core_sched();
 #endif
 
     sti();

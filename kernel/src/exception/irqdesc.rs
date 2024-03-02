@@ -336,6 +336,26 @@ impl InnerIrqDesc {
         self.line_status.contains(IrqLineStatus::IRQ_NESTED_THREAD)
     }
 
+    pub fn line_status_set_per_cpu(&mut self) {
+        self.line_status.insert(IrqLineStatus::IRQ_PER_CPU);
+    }
+
+    pub fn line_status_clear_per_cpu(&mut self) {
+        self.line_status.remove(IrqLineStatus::IRQ_PER_CPU);
+    }
+
+    pub fn line_status(&self) -> &IrqLineStatus {
+        &self.line_status
+    }
+
+    pub fn line_status_set_no_debug(&mut self) {
+        self.line_status.insert(IrqLineStatus::IRQ_NO_BALANCING);
+    }
+
+    pub fn line_status_clear_no_debug(&mut self) {
+        self.line_status.remove(IrqLineStatus::IRQ_NO_BALANCING);
+    }
+
     pub fn can_autoenable(&self) -> bool {
         !self.line_status.contains(IrqLineStatus::IRQ_NOAUTOEN)
     }

@@ -109,7 +109,6 @@
         "ia64_msi.h": "c",
         "errno.h": "c",
         "bug.h": "c",
-        "apic_timer.h": "c",
         "sched.h": "c",
         "preempt.h": "c",
         "softirq.h": "c",

@@ -294,12 +294,6 @@ impl IoApic {
             volwrite!(p, virt_eoi, irq_num as u32);
         }
     }
-
-    /// 边沿响应
-    #[allow(dead_code)]
-    fn edge_ack(&self, _irq_num: u8) {
-        CurrentApic.send_eoi();
-    }
 }
 
 /// Register index: ID
@@ -599,7 +593,7 @@ impl IrqChip for IoApicChip {
         if irq.is_level_type() {
             IOAPIC().lock_irqsave().level_ack(irq.irq().data() as u8);
         } else {
-            IOAPIC().lock_irqsave().edge_ack(irq.irq().data() as u8);
+            CurrentApic.send_eoi();
         }
     }
 

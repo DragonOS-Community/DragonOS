@@ -459,7 +459,14 @@ impl IrqManager {
                 .clear_status(IrqStatus::IRQD_IRQ_INPROGRESS);
 
             if action_guard.flags().contains(IrqHandleFlags::IRQF_PERCPU) {
-                unimplemented!("percpu irq");
+                desc_inner_guard
+                    .common_data()
+                    .insert_status(IrqStatus::IRQD_PER_CPU);
+                desc_inner_guard.line_status_set_per_cpu();
+
+                if action_guard.flags().contains(IrqHandleFlags::IRQF_NO_DEBUG) {
+                    desc_inner_guard.line_status_set_no_debug();
+                }
             }
 
             if action_guard.flags().contains(IrqHandleFlags::IRQF_ONESHOT) {

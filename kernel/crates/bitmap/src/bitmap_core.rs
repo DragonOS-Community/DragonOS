@@ -2,7 +2,7 @@ use core::{intrinsics::unlikely, marker::PhantomData};
 
 use crate::traits::BitOps;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct BitMapCore<T: BitOps> {
     phantom: PhantomData<T>,
 }

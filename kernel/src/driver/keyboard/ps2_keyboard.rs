@@ -12,7 +12,6 @@ use crate::{
     driver::{
         base::device::device_number::{DeviceNumber, Major},
         input::ps2_dev::Ps2StatusRegister,
-        tty::tty_device::TTY_DEVICES,
     },
     exception::{
         irqdata::IrqHandlerData,
@@ -53,14 +52,7 @@ const PS2_KEYBOARD_PARAM_INIT: u8 = 0x47;
 pub struct LockedPS2KeyBoardInode(RwLock<PS2KeyBoardInode>);
 
 lazy_static! {
-    static ref PS2_KEYBOARD_FSM: SpinLock<TypeOneFSM> = {
-        let tty0 = TTY_DEVICES
-            .read()
-            .get("tty0")
-            .expect("Initializing PS2_KEYBOARD_FSM: Cannot found TTY0!")
-            .clone();
-        SpinLock::new(TypeOneFSM::new(tty0))
-    };
+    static ref PS2_KEYBOARD_FSM: SpinLock<TypeOneFSM> = SpinLock::new(TypeOneFSM::new());
 }
 
 #[derive(Debug)]

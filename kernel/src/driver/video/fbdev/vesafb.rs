@@ -28,8 +28,8 @@ use crate::{
                 CompatibleTable,
             },
         },
-        tty::serial::serial8250::send_to_default_serial8250_port,
-        video::fbdev::base::{fbmem::frame_buffer_manager, FbVisual},
+        serial::serial8250::send_to_default_serial8250_port,
+        video::fbdev::base::{fbmem::frame_buffer_manager, FbVisual, FRAME_BUFFER_SET},
     },
     filesystem::{
         kernfs::KernFSInode,
@@ -56,7 +56,7 @@ use crate::{
 use super::base::{
     fbmem::FbDevice, BlankMode, BootTimeVideoType, FbAccel, FbActivateFlags, FbId, FbState, FbType,
     FbVModeFlags, FbVarScreenInfo, FbVideoMode, FixedScreenInfo, FrameBuffer, FrameBufferInfo,
-    FrameBufferOps,
+    FrameBufferInfoData, FrameBufferOps,
 };
 
 /// 当前机器上面是否有vesa帧缓冲区
@@ -89,11 +89,14 @@ lazy_static! {
 pub struct VesaFb {
     inner: SpinLock<InnerVesaFb>,
     kobj_state: LockedKObjectState,
+    fb_data: RwLock<FrameBufferInfoData>,
 }
 
 impl VesaFb {
     pub const NAME: &'static str = "vesa_vga";
     pub fn new() -> Self {
+        let mut fb_info_data = FrameBufferInfoData::new();
+        fb_info_data.pesudo_palette.resize(256, 0);
         return Self {
             inner: SpinLock::new(InnerVesaFb {
                 bus: None,
@@ -111,6 +114,7 @@ impl VesaFb {
                 fb_state: FbState::Suspended,
             }),
             kobj_state: LockedKObjectState::new(None),
+            fb_data: RwLock::new(fb_info_data),
         };
     }
 }
@@ -281,12 +285,46 @@ impl FrameBufferOps for VesaFb {
 
     fn fb_set_color_register(
         &self,
-        _regno: u16,
-        _red: u16,
-        _green: u16,
-        _blue: u16,
+        regno: u16,
+        mut red: u16,
+        mut green: u16,
+        mut blue: u16,
     ) -> Result<(), SystemError> {
-        todo!()
+        let mut fb_data = self.framebuffer_info_data().write();
+        let var = self.current_fb_var();
+        if regno as usize >= fb_data.pesudo_palette.len() {
+            return Err(SystemError::E2BIG);
+        }
+
+        if var.bits_per_pixel == 8 {
+            todo!("vesa_setpalette todo");
+        } else if regno < 16 {
+            match var.bits_per_pixel {
+                16 => {
+                    if var.red.offset == 10 {
+                        // RGB 1:5:5:5
+                        fb_data.pesudo_palette[regno as usize] = ((red as u32 & 0xf800) >> 1)
+                            | ((green as u32 & 0xf800) >> 6)
+                            | ((blue as u32 & 0xf800) >> 11);
+                    } else {
+                        fb_data.pesudo_palette[regno as usize] = (red as u32 & 0xf800)
+                            | ((green as u32 & 0xfc00) >> 5)
+                            | ((blue as u32 & 0xf800) >> 11);
+                    }
+                }
+                24 | 32 => {
+                    red >>= 8;
+                    green >>= 8;
+                    blue >>= 8;
+                    fb_data.pesudo_palette[regno as usize] = ((red as u32) << var.red.offset)
+                        | ((green as u32) << var.green.offset)
+                        | ((blue as u32) << var.blue.offset);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
     }
 
     fn fb_blank(&self, _blank_mode: BlankMode) -> Result<(), SystemError> {
@@ -338,6 +376,138 @@ impl FrameBufferOps for VesaFb {
 
         return Ok(len);
     }
+
+    fn fb_image_blit(&self, image: &super::base::FbImage) {
+        self.generic_imageblit(image);
+    }
+
+    /// ## 填充矩形
+    fn fb_fillrect(&self, rect: super::base::FillRectData) -> Result<(), SystemError> {
+        // kwarn!("rect {rect:?}");
+
+        let boot_param = boot_params().read();
+        let screen_base = boot_param
+            .screen_info
+            .lfb_virt_base
+            .ok_or(SystemError::ENODEV)?;
+        let fg;
+        if self.current_fb_fix().visual == FbVisual::TrueColor
+            || self.current_fb_fix().visual == FbVisual::DirectColor
+        {
+            fg = self.fb_data.read().pesudo_palette[rect.color as usize];
+        } else {
+            fg = rect.color;
+        }
+
+        let bpp = self.current_fb_var().bits_per_pixel;
+        // 每行像素数
+        let line_offset = self.current_fb_var().xres;
+        match bpp {
+            32 => {
+                let base = screen_base.as_ptr::<u32>();
+
+                for y in rect.dy..(rect.dy + rect.height) {
+                    for x in rect.dx..(rect.dx + rect.width) {
+                        unsafe { *base.add((y * line_offset + x) as usize) = fg };
+                    }
+                }
+            }
+            _ => todo!(),
+        }
+
+        Ok(())
+    }
+
+    fn fb_copyarea(&self, data: super::base::CopyAreaData) -> Result<(), SystemError> {
+        let bp = boot_params().read();
+        let base = bp.screen_info.lfb_virt_base.ok_or(SystemError::ENODEV)?;
+        let var = self.current_fb_var();
+
+        if data.sx < 0
+            || data.sy < 0
+            || data.sx as u32 > var.xres
+            || data.sx as u32 + data.width > var.xres
+            || data.sy as u32 > var.yres
+            || data.sy as u32 + data.height > var.yres
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        let bytes_per_pixel = var.bits_per_pixel >> 3;
+        let bytes_per_line = var.xres * bytes_per_pixel;
+
+        let sy = data.sy as u32;
+        let sx = data.sx as u32;
+
+        let dst = {
+            let mut dst = base;
+            if data.dy < 0 {
+                dst -= VirtAddr::new((((-data.dy) as u32) * bytes_per_line) as usize);
+            } else {
+                dst += VirtAddr::new(((data.dy as u32) * bytes_per_line) as usize);
+            }
+
+            if data.dx > 0 && (data.dx as u32) < var.xres {
+                dst += VirtAddr::new(((data.dx as u32) * bytes_per_pixel) as usize);
+            }
+
+            dst
+        };
+        let src = base + VirtAddr::new((sy * bytes_per_line + sx * bytes_per_pixel) as usize);
+
+        match bytes_per_pixel {
+            4 => {
+                // 32bpp
+                let mut dst = dst.as_ptr::<u32>();
+                let mut src = src.as_ptr::<u32>();
+
+                for y in 0..data.height as usize {
+                    if (data.dy + y as i32) < 0 || (data.dy + y as i32) > var.yres as i32 {
+                        unsafe {
+                            // core::ptr::copy(src, dst, data.width as usize);
+                            src = src.add(var.xres as usize);
+                            dst = dst.add(var.xres as usize);
+                        }
+                        continue;
+                    }
+                    if data.dx < 0 {
+                        if ((-data.dx) as u32) < data.width {
+                            unsafe {
+                                core::ptr::copy(
+                                    src.add((-data.dx) as usize),
+                                    dst,
+                                    (data.width as usize) - (-data.dx) as usize,
+                                );
+                                src = src.add(var.xres as usize);
+                                dst = dst.add(var.xres as usize);
+                            }
+                        }
+                    } else if data.dx as u32 + data.width > var.xres {
+                        if (data.dx as u32) < var.xres {
+                            unsafe {
+                                core::ptr::copy(src, dst, (var.xres - data.dx as u32) as usize);
+                                src = src.add(var.xres as usize);
+                                dst = dst.add(var.xres as usize);
+                            }
+                        }
+                    } else {
+                        for i in 0..data.width as usize {
+                            unsafe { *(dst.add(i)) = *(src.add(i)) }
+                        }
+                        unsafe {
+                            // core::ptr::copy(src, dst, data.width as usize);
+                            src = src.add(var.xres as usize);
+                            dst = dst.add(var.xres as usize);
+                        }
+                    }
+                }
+            }
+            _ => {
+                todo!()
+            }
+        }
+        Ok(())
+    }
 }
 
 impl FrameBufferInfo for VesaFb {
@@ -367,6 +537,10 @@ impl FrameBufferInfo for VesaFb {
 
     fn state(&self) -> FbState {
         self.inner.lock().fb_state
+    }
+
+    fn framebuffer_info_data(&self) -> &RwLock<FrameBufferInfoData> {
+        &self.fb_data
     }
 }
 
@@ -679,36 +853,54 @@ fn vesa_fb_device_init() -> Result<(), SystemError> {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         kinfo!("vesa fb device init");
+        let device = Arc::new(VesaFb::new());
 
-        let mut fix_info_guard = VESAFB_FIX_INFO.write_irqsave();
-        let mut var_info_guard = VESAFB_DEFINED.write_irqsave();
+        let mut fb_fix = VESAFB_FIX_INFO.write_irqsave();
+        let mut fb_var = VESAFB_DEFINED.write_irqsave();
 
         let boot_params_guard = boot_params().read();
         let boottime_screen_info = &boot_params_guard.screen_info;
 
-        fix_info_guard.smem_start = Some(boottime_screen_info.lfb_base);
-        fix_info_guard.smem_len = boottime_screen_info.lfb_size;
+        fb_fix.smem_start = Some(boottime_screen_info.lfb_base);
+        fb_fix.smem_len = boottime_screen_info.lfb_size;
 
         if boottime_screen_info.video_type == BootTimeVideoType::Mda {
-            fix_info_guard.visual = FbVisual::Mono10;
-            var_info_guard.bits_per_pixel = 8;
-            fix_info_guard.line_length = (boottime_screen_info.origin_video_cols as u32)
-                * (var_info_guard.bits_per_pixel / 8);
-            var_info_guard.xres_virtual = boottime_screen_info.origin_video_cols as u32;
-            var_info_guard.yres_virtual = boottime_screen_info.origin_video_lines as u32;
+            fb_fix.visual = FbVisual::Mono10;
+            fb_var.bits_per_pixel = 8;
+            fb_fix.line_length =
+                (boottime_screen_info.origin_video_cols as u32) * (fb_var.bits_per_pixel / 8);
+            fb_var.xres_virtual = boottime_screen_info.origin_video_cols as u32;
+            fb_var.yres_virtual = boottime_screen_info.origin_video_lines as u32;
         } else {
-            fix_info_guard.visual = FbVisual::TrueColor;
-            var_info_guard.bits_per_pixel = boottime_screen_info.lfb_depth as u32;
-            fix_info_guard.line_length =
-                (boottime_screen_info.lfb_width as u32) * (var_info_guard.bits_per_pixel / 8);
-            var_info_guard.xres_virtual = boottime_screen_info.lfb_width as u32;
-            var_info_guard.yres_virtual = boottime_screen_info.lfb_height as u32;
+            fb_fix.visual = FbVisual::TrueColor;
+            fb_var.bits_per_pixel = boottime_screen_info.lfb_depth as u32;
+            fb_fix.line_length =
+                (boottime_screen_info.lfb_width as u32) * (fb_var.bits_per_pixel / 8);
+            fb_var.xres_virtual = boottime_screen_info.lfb_width as u32;
+            fb_var.yres_virtual = boottime_screen_info.lfb_height as u32;
+            fb_var.xres = boottime_screen_info.lfb_width as u32;
+            fb_var.yres = boottime_screen_info.lfb_height as u32;
         }
 
-        drop(var_info_guard);
-        drop(fix_info_guard);
+        fb_var.red.length = boottime_screen_info.red_size as u32;
+        fb_var.green.length = boottime_screen_info.green_size as u32;
+        fb_var.blue.length = boottime_screen_info.blue_size as u32;
 
-        let device = Arc::new(VesaFb::new());
+        fb_var.red.offset = boottime_screen_info.red_pos as u32;
+        fb_var.green.offset = boottime_screen_info.green_pos as u32;
+        fb_var.blue.offset = boottime_screen_info.blue_pos as u32;
+
+        // TODO: 这里是暂时这样写的，初始化为RGB888格式，后续vesa初始化完善后删掉下面
+        fb_var.red.offset = 16;
+        fb_var.green.offset = 8;
+        fb_var.blue.offset = 0;
+
+        if fb_var.bits_per_pixel >= 1 && fb_var.bits_per_pixel <= 8 {
+            fb_var.red.length = fb_var.bits_per_pixel;
+            fb_var.green.length = fb_var.bits_per_pixel;
+            fb_var.blue.length = fb_var.bits_per_pixel;
+        }
+
         device_manager().device_default_initialize(&(device.clone() as Arc<dyn Device>));
 
         platform_device_manager()
@@ -718,6 +910,16 @@ fn vesa_fb_device_init() -> Result<(), SystemError> {
         frame_buffer_manager()
             .register_fb(device.clone() as Arc<dyn FrameBuffer>)
             .expect("vesa_fb_device_init: frame_buffer_manager().register_fb failed");
+
+        // 加入全局fb表
+        let mut guard = FRAME_BUFFER_SET.write();
+        if guard.get(device.fb_id().data() as usize).unwrap().is_some() {
+            kwarn!(
+                "vesa_fb_device_init: There is already an element {:?} in the FRAME_BUFFER_SET",
+                device.fb_id()
+            );
+        }
+        guard[device.fb_id().data() as usize] = Some(device.clone());
 
         // 设置vesa fb的状态为运行中
         device.inner.lock().fb_state = FbState::Running;

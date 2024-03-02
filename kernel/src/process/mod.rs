@@ -21,6 +21,7 @@ use crate::{
         sched::sched,
         CurrentIrqArch,
     },
+    driver::tty::tty_core::TtyCore,
     exception::InterruptArch,
     filesystem::{
         procfs::procfs_unregister_pid,
@@ -1297,6 +1298,8 @@ pub struct ProcessSignalInfo {
     sig_pending: SigPending,
     // sig_shared_pending 中存储当前线程所属进程要处理的信号
     sig_shared_pending: SigPending,
+    // 当前进程对应的tty
+    tty: Option<Arc<TtyCore>>,
 }
 
 impl ProcessSignalInfo {
@@ -1324,6 +1327,14 @@ impl ProcessSignalInfo {
         &self.sig_shared_pending
     }
 
+    pub fn tty(&self) -> Option<Arc<TtyCore>> {
+        self.tty.clone()
+    }
+
+    pub fn set_tty(&mut self, tty: Arc<TtyCore>) {
+        self.tty = Some(tty);
+    }
+
     /// 从 pcb 的 siginfo中取出下一个要处理的信号，先处理线程信号，再处理进程信号
     ///
     /// ## 参数
@@ -1346,6 +1357,7 @@ impl Default for ProcessSignalInfo {
             sig_block: SigSet::empty(),
             sig_pending: SigPending::default(),
             sig_shared_pending: SigPending::default(),
+            tty: None,
         }
     }
 }

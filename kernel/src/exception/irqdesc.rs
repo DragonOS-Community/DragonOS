@@ -223,7 +223,11 @@ impl IrqDesc {
 
     pub fn chip_bus_lock(&self) {
         let irq_data = self.inner().irq_data.clone();
-        irq_data.chip().irq_bus_lock(&irq_data).ok();
+        irq_data
+            .chip_info_read_irqsave()
+            .chip()
+            .irq_bus_lock(&irq_data)
+            .ok();
     }
 
     /// 同步释放低速总线锁
@@ -234,7 +238,11 @@ impl IrqDesc {
     ///     必须已经释放。否则将死锁。
     pub fn chip_bus_sync_unlock(&self) {
         let irq_data = self.inner().irq_data.clone();
-        irq_data.chip().irq_bus_sync_unlock(&irq_data).ok();
+        irq_data
+            .chip_info_write_irqsave()
+            .chip()
+            .irq_bus_sync_unlock(&irq_data)
+            .ok();
     }
 
     pub fn modify_status(&self, clear: IrqLineStatus, set: IrqLineStatus) {
@@ -367,7 +375,12 @@ impl InnerIrqDesc {
     /// 中断是否可以设置CPU亲和性
     pub fn can_set_affinity(&self) -> bool {
         if self.common_data.status().can_balance() == false
-            || self.irq_data().chip().can_set_affinity() == false
+            || self
+                .irq_data()
+                .chip_info_read_irqsave()
+                .chip()
+                .can_set_affinity()
+                == false
         {
             return false;
         }

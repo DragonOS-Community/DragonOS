@@ -337,7 +337,7 @@ impl IrqManager {
         let parent_data = irq_data.parent_data().map(|p| p.upgrade()).flatten();
 
         if let Some(parent_data) = parent_data {
-            let parent_chip = parent_data.chip();
+            let parent_chip = parent_data.chip_info_read_irqsave().chip();
             parent_chip.irq_ack(&parent_data);
         }
     }
@@ -349,7 +349,7 @@ impl IrqManager {
         let mut data: Option<Arc<IrqData>> = Some(irq_data.clone());
         loop {
             if let Some(d) = data {
-                if let Err(e) = d.chip().retrigger(&d) {
+                if let Err(e) = d.chip_info_read_irqsave().chip().retrigger(&d) {
                     if e == SystemError::ENOSYS {
                         data = d.parent_data().map(|p| p.upgrade()).flatten();
                     } else {

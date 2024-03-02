@@ -5,6 +5,7 @@ use intertrait::CastFromSync;
 
 use crate::libs::{
     cpumask::CpuMask,
+    rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
     spinlock::{SpinLock, SpinLockGuard},
 };
 
@@ -26,6 +27,8 @@ pub struct IrqData {
     /// 中断号, 用于表示软件逻辑视角的中断号，全局唯一
     irq: IrqNumber,
     inner: SpinLock<InnerIrqData>,
+
+    chip_info: RwLock<InnerIrqChipInfo>,
 }
 
 impl IrqData {
@@ -40,10 +43,13 @@ impl IrqData {
             inner: SpinLock::new(InnerIrqData {
                 hwirq,
                 common_data,
-                chip: Some(chip),
-                chip_data: None,
+
                 domain: None,
                 parent_data: None,
+            }),
+            chip_info: RwLock::new(InnerIrqChipInfo {
+                chip: Some(chip),
+                chip_data: None,
             }),
         };
     }
@@ -69,10 +75,6 @@ impl IrqData {
         self.inner.lock_irqsave().hwirq
     }
 
-    pub fn chip(&self) -> Arc<dyn IrqChip> {
-        self.inner.lock_irqsave().chip.clone().unwrap()
-    }
-
     /// 是否为电平触发
     pub fn is_level_type(&self) -> bool {
         self.inner
@@ -94,10 +96,6 @@ impl IrqData {
             .is_wakeup_set()
     }
 
-    pub fn chip_data(&self) -> Option<Arc<dyn IrqChipData>> {
-        self.inner.lock_irqsave().chip_data.clone()
-    }
-
     pub fn common_data(&self) -> Arc<IrqCommonData> {
         self.inner.lock_irqsave().common_data.clone()
     }
@@ -108,6 +106,18 @@ impl IrqData {
 
     pub fn inner(&self) -> SpinLockGuard<InnerIrqData> {
         self.inner.lock_irqsave()
+    }
+
+    pub fn chip_info_read(&self) -> RwLockReadGuard<InnerIrqChipInfo> {
+        self.chip_info.read()
+    }
+
+    pub fn chip_info_read_irqsave(&self) -> RwLockReadGuard<InnerIrqChipInfo> {
+        self.chip_info.read_irqsave()
+    }
+
+    pub fn chip_info_write_irqsave(&self) -> RwLockWriteGuard<InnerIrqChipInfo> {
+        self.chip_info.write_irqsave()
     }
 
     pub fn parent_data(&self) -> Option<Weak<IrqData>> {
@@ -122,10 +132,7 @@ pub struct InnerIrqData {
     hwirq: HardwareIrqNumber,
     /// 涉及的所有irqchip之间共享的数据
     common_data: Arc<IrqCommonData>,
-    /// 绑定到的中断芯片
-    chip: Option<Arc<dyn IrqChip>>,
-    /// 中断芯片的私有数据（与当前irq相关）
-    chip_data: Option<Arc<dyn IrqChipData>>,
+
     /// 中断域
     domain: Option<Arc<IrqDomain>>,
     /// 中断的父中断（如果具有中断域继承的话）
@@ -144,17 +151,27 @@ impl InnerIrqData {
     pub fn set_domain(&mut self, domain: Option<Arc<IrqDomain>>) {
         self.domain = domain;
     }
+}
 
-    pub fn chip(&self) -> Option<&Arc<dyn IrqChip>> {
-        self.chip.as_ref()
-    }
+#[derive(Debug)]
+pub struct InnerIrqChipInfo {
+    /// 绑定到的中断芯片
+    chip: Option<Arc<dyn IrqChip>>,
+    /// 中断芯片的私有数据（与当前irq相关）
+    chip_data: Option<Arc<dyn IrqChipData>>,
+}
 
+impl InnerIrqChipInfo {
     pub fn set_chip(&mut self, chip: Option<Arc<dyn IrqChip>>) {
         self.chip = chip;
     }
 
     pub fn set_chip_data(&mut self, chip_data: Option<Arc<dyn IrqChipData>>) {
         self.chip_data = chip_data;
+    }
+
+    pub fn chip(&self) -> Arc<dyn IrqChip> {
+        self.chip.clone().unwrap()
     }
 
     pub fn chip_data(&self) -> Option<Arc<dyn IrqChipData>> {

@@ -52,5 +52,7 @@ impl SchedArch for X86_64SchedArch {
                 BSP_INIT_OK = true;
             }
         }
+
+        drop(irq_guard);
     }
 }

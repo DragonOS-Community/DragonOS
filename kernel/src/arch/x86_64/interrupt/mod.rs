@@ -19,8 +19,6 @@ use crate::{
     smp::core::smp_get_processor_id,
 };
 
-use self::entry::setup_interrupt_gate;
-
 use super::{
     asm::irqflags::{local_irq_restore, local_irq_save},
     driver::apic::{
@@ -51,11 +49,6 @@ impl InterruptArch for X86_64InterruptArch {
     unsafe fn arch_irq_init() -> Result<(), SystemError> {
         CurrentIrqArch::interrupt_disable();
 
-        CurrentApic.init_current_cpu();
-        if smp_get_processor_id().data() == 0 {
-            setup_interrupt_gate();
-            ioapic_init();
-        }
         return Ok(());
     }
     unsafe fn interrupt_enable() {

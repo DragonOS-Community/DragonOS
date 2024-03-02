@@ -183,7 +183,7 @@ impl IrqDomainManager {
         }
 
         if domain.name().is_none() {
-            let chip = irq_data.chip();
+            let chip = irq_data.chip_info_read_irqsave().chip();
             domain.set_name(chip.name().to_string());
         }
 

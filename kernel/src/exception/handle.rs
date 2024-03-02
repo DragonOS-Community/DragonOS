@@ -87,7 +87,7 @@ impl IrqFlowHandler for EdgeIrqHandler {
 
         let irq_data = desc_inner_guard.irq_data().clone();
 
-        irq_data.chip().irq_ack(&irq_data);
+        irq_data.chip_info_read_irqsave().chip().irq_ack(&irq_data);
 
         loop {
             if unlikely(desc_inner_guard.actions().is_empty()) {
@@ -149,7 +149,7 @@ fn irq_may_run(desc_inner_guard: &SpinLockGuard<'_, InnerIrqDesc>) -> bool {
 }
 
 fn mask_ack_irq(irq_data: &Arc<IrqData>) {
-    let chip = irq_data.chip();
+    let chip = irq_data.chip_info_read_irqsave().chip();
     if chip.can_mask_ack() {
         chip.irq_mask_ack(&irq_data);
         irq_data.common_data().set_masked();

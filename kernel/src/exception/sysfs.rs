@@ -153,7 +153,7 @@ impl Attribute for AttrChipName {
             .downcast::<IrqDesc>()
             .map_err(|_| SystemError::EINVAL)?;
 
-        let chip = irq_desc.irq_data().chip();
+        let chip = irq_desc.irq_data().chip_info_read_irqsave().chip();
         let name = chip.name();
         let len = core::cmp::min(name.len() + 1, buf.len());
         let name = format!("{}\n", name);

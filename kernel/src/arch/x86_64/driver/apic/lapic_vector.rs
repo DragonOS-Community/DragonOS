@@ -5,9 +5,16 @@ use intertrait::CastFrom;
 use system_error::SystemError;
 
 use crate::{
-    arch::interrupt::{
-        ipi::send_ipi,
-        msi::{X86MsiAddrHi, X86MsiAddrLoNormal, X86MsiDataNormal, X86_MSI_BASE_ADDRESS_LOW},
+    arch::{
+        driver::apic::{
+            apic_timer::{local_apic_timer_irq_desc_init, APIC_TIMER_IRQ_NUM},
+            ioapic::ioapic_init,
+        },
+        interrupt::{
+            entry::arch_setup_interrupt_gate,
+            ipi::send_ipi,
+            msi::{X86MsiAddrHi, X86MsiAddrLoNormal, X86MsiDataNormal, X86_MSI_BASE_ADDRESS_LOW},
+        },
     },
     driver::open_firmware::device_node::DeviceNode,
     exception::{
@@ -20,14 +27,32 @@ use crate::{
     },
     kwarn,
     libs::spinlock::{SpinLock, SpinLockGuard},
-    smp::cpu::ProcessorId,
+    smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 
-use super::{hw_irq::HardwareIrqConfig, CurrentApic, LocalAPIC};
+use super::{
+    apic_timer::LocalApicTimerIntrController, hw_irq::HardwareIrqConfig, CurrentApic, LocalAPIC,
+};
+
+static mut LOCAL_APIC_CHIP: Option<Arc<LocalApicChip>> = None;
+
+pub(super) fn local_apic_chip() -> &'static Arc<LocalApicChip> {
+    unsafe { LOCAL_APIC_CHIP.as_ref().unwrap() }
+}
 
 #[derive(Debug)]
-struct LocalApicChip {
+pub(super) struct LocalApicChip {
     inner: SpinLock<InnerIrqChip>,
+}
+
+impl LocalApicChip {
+    pub fn new() -> Self {
+        Self {
+            inner: SpinLock::new(InnerIrqChip {
+                flags: IrqChipFlags::empty(),
+            }),
+        }
+    }
 }
 
 impl IrqChip for LocalApicChip {
@@ -53,16 +78,31 @@ impl IrqChip for LocalApicChip {
         false
     }
 
+    fn irq_enable(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
+        // 这里临时处理，后续需要修改
+        return Ok(());
+    }
+
+    fn irq_unmask(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     fn irq_compose_msi_msg(&self, irq: &Arc<IrqData>, msg: &mut MsiMsg) {
-        let chip_data = irq.chip_data().unwrap();
+        let chip_data = irq.chip_info_read_irqsave().chip_data().unwrap();
         let apicd = chip_data.ref_any().downcast_ref::<ApicChipData>().unwrap();
         let cfg = &apicd.inner().hw_irq_cfg;
         irq_msi_compose_msg(cfg, msg, false);
     }
 
     fn retrigger(&self, irq: &Arc<IrqData>) -> Result<(), SystemError> {
-        let chip_data = irq.chip_data().unwrap();
-        let apicd = chip_data.ref_any().downcast_ref::<ApicChipData>().unwrap();
+        let chip_data = irq
+            .chip_info_read_irqsave()
+            .chip_data()
+            .ok_or(SystemError::EINVAL)?;
+        let apicd = chip_data
+            .ref_any()
+            .downcast_ref::<ApicChipData>()
+            .ok_or(SystemError::EINVAL)?;
         let inner = apicd.inner();
 
         send_ipi(
@@ -200,10 +240,20 @@ pub fn arch_early_irq_init() -> Result<(), SystemError> {
     irq_domain_manager().set_default_domain(vec_domain.clone());
     unsafe { X86_VECTOR_DOMAIN = Some(vec_domain) };
 
+    let apic_chip = Arc::new(LocalApicChip::new());
+
+    unsafe { LOCAL_APIC_CHIP = Some(apic_chip) };
+
     // todo: add vector matrix
     // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/apic/vector.c#803
     kwarn!("arch_early_irq_init: todo: add vector matrix");
 
+    local_apic_timer_irq_desc_init();
+    CurrentApic.init_current_cpu();
+    if smp_get_processor_id().data() == 0 {
+        unsafe { arch_setup_interrupt_gate() };
+        ioapic_init(&[APIC_TIMER_IRQ_NUM]);
+    }
     return Ok(());
 }
 

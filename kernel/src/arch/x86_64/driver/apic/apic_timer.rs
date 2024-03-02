@@ -2,18 +2,21 @@ use core::cell::RefCell;
 
 use crate::arch::cpu;
 use crate::arch::driver::tsc::TSCManager;
+use crate::arch::interrupt::TrapFrame;
 use crate::driver::base::device::DeviceId;
-use crate::exception::irqdata::IrqHandlerData;
-use crate::exception::irqdesc::{IrqHandleFlags, IrqHandler, IrqReturn};
+use crate::exception::irqdata::{IrqHandlerData, IrqLineStatus};
+use crate::exception::irqdesc::{
+    irq_desc_manager, IrqDesc, IrqFlowHandler, IrqHandleFlags, IrqHandler, IrqReturn,
+};
 use crate::exception::manage::irq_manager;
 use crate::exception::IrqNumber;
 
-use crate::kdebug;
 use crate::mm::percpu::PerCpu;
 use crate::sched::core::sched_update_jiffies;
 use crate::smp::core::smp_get_processor_id;
 use crate::smp::cpu::ProcessorId;
 use crate::time::clocksource::HZ;
+use crate::{kdebug, kerror, kwarn};
 use alloc::string::ToString;
 use alloc::sync::Arc;
 pub use drop;
@@ -21,6 +24,7 @@ use system_error::SystemError;
 use x86::cpuid::cpuid;
 use x86::msr::{wrmsr, IA32_X2APIC_DIV_CONF, IA32_X2APIC_INIT_COUNT};
 
+use super::lapic_vector::local_apic_chip;
 use super::xapic::XApicOffset;
 use super::{CurrentApic, LVTRegister, LocalAPIC, LVT};
 
@@ -53,7 +57,18 @@ impl IrqHandler for LocalApicTimerHandler {
         _static_data: Option<&dyn IrqHandlerData>,
         _dynamic_data: Option<Arc<dyn IrqHandlerData>>,
     ) -> Result<IrqReturn, SystemError> {
-        LocalApicTimer::handle_irq()
+        // empty (只是为了让编译通过，不会被调用到。真正的处理函数在LocalApicTimerIrqFlowHandler中)
+        Ok(IrqReturn::NotHandled)
+    }
+}
+
+#[derive(Debug)]
+struct LocalApicTimerIrqFlowHandler;
+
+impl IrqFlowHandler for LocalApicTimerIrqFlowHandler {
+    fn handle(&self, _irq_desc: &Arc<IrqDesc>, _trap_frame: &mut TrapFrame) {
+        LocalApicTimer::handle_irq().ok();
+        CurrentApic.send_eoi();
     }
 }
 
@@ -63,12 +78,25 @@ pub fn apic_timer_init() {
             APIC_TIMER_IRQ_NUM,
             "LocalApic".to_string(),
             &LocalApicTimerHandler,
-            IrqHandleFlags::IRQF_SHARED,
+            IrqHandleFlags::IRQF_SHARED | IrqHandleFlags::IRQF_PERCPU,
             Some(DeviceId::new(Some("lapic timer"), None).unwrap()),
         )
         .expect("Apic timer init failed");
+
     LocalApicTimerIntrController.install();
     LocalApicTimerIntrController.enable();
+}
+
+/// 初始化本地APIC定时器的中断描述符
+pub(super) fn local_apic_timer_irq_desc_init() {
+    let desc = irq_desc_manager().lookup(APIC_TIMER_IRQ_NUM).unwrap();
+    let irq_data: Arc<crate::exception::irqdata::IrqData> = desc.irq_data();
+    let mut chip_info_guard = irq_data.chip_info_write_irqsave();
+    chip_info_guard.set_chip(Some(local_apic_chip().clone()));
+
+    desc.modify_status(IrqLineStatus::IRQ_LEVEL, IrqLineStatus::empty());
+    drop(chip_info_guard);
+    desc.set_handler(&LocalApicTimerIrqFlowHandler);
 }
 
 /// 初始化BSP的APIC定时器

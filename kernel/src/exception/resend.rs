@@ -74,6 +74,7 @@ impl IrqManager {
     ) -> Result<(), SystemError> {
         if let Err(e) = desc_inner_guard
             .irq_data()
+            .chip_info_read_irqsave()
             .chip()
             .retrigger(desc_inner_guard.irq_data())
         {

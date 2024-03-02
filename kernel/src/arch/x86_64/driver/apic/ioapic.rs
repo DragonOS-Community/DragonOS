@@ -389,7 +389,7 @@ impl InnerIoApicChipData {
     }
 }
 
-pub fn ioapic_init() {
+pub fn ioapic_init(ignore: &'static [IrqNumber]) {
     kinfo!("Initializing ioapic...");
     let ioapic = unsafe { IoApic::new() };
     unsafe {
@@ -402,15 +402,20 @@ pub fn ioapic_init() {
     // 绑定irqchip
     for i in 32..256 {
         let irq = IrqNumber::new(i);
+
+        if ignore.contains(&irq) {
+            continue;
+        }
+
         let desc = irq_desc_manager().lookup(irq).unwrap();
         let irq_data = desc.irq_data();
-        let mut data_inner = irq_data.inner();
-        data_inner.set_chip(Some(ioapic_ir_chip()));
+        let mut chip_info_guard = irq_data.chip_info_write_irqsave();
+        chip_info_guard.set_chip(Some(ioapic_ir_chip()));
         let chip_data = IoApicChipData::DEFAULT;
         chip_data.inner().rte_index = IoApic::vector_rte_index(i as u8);
         chip_data.inner().vector = i as u8;
-        data_inner.set_chip_data(Some(Arc::new(chip_data)));
-        drop(data_inner);
+        chip_info_guard.set_chip_data(Some(Arc::new(chip_data)));
+        drop(chip_info_guard);
         let level = irq_data.is_level_type();
 
         register_handler(&desc, level);
@@ -501,7 +506,10 @@ impl IrqChip for IoApicChip {
     }
 
     fn irq_mask(&self, irq: &Arc<IrqData>) -> Result<(), SystemError> {
-        let binding = irq.chip_data().ok_or(SystemError::EINVAL)?;
+        let binding = irq
+            .chip_info_read_irqsave()
+            .chip_data()
+            .ok_or(SystemError::EINVAL)?;
         let chip_data = binding
             .as_any_ref()
             .downcast_ref::<IoApicChipData>()
@@ -529,7 +537,10 @@ impl IrqChip for IoApicChip {
         irq: &Arc<IrqData>,
         flow_type: IrqLineStatus,
     ) -> Result<IrqChipSetMaskResult, SystemError> {
-        let binding = irq.chip_data().ok_or(SystemError::EINVAL)?;
+        let binding = irq
+            .chip_info_read_irqsave()
+            .chip_data()
+            .ok_or(SystemError::EINVAL)?;
         let chip_data = binding
             .as_any_ref()
             .downcast_ref::<IoApicChipData>()
@@ -554,7 +565,10 @@ impl IrqChip for IoApicChip {
         // 使用mask的第1个可用CPU
         let dest = (cpu.first().ok_or(SystemError::EINVAL)?.data() & 0xff) as u8;
 
-        let binding = irq.chip_data().ok_or(SystemError::EINVAL)?;
+        let binding = irq
+            .chip_info_read_irqsave()
+            .chip_data()
+            .ok_or(SystemError::EINVAL)?;
         let chip_data = binding
             .as_any_ref()
             .downcast_ref::<IoApicChipData>()
@@ -602,7 +616,10 @@ impl IrqChip for IoApicChip {
     }
 
     fn irqchip_state(&self, irq: &Arc<IrqData>, which: IrqChipState) -> Result<bool, SystemError> {
-        let binding = irq.chip_data().ok_or(SystemError::EINVAL)?;
+        let binding = irq
+            .chip_info_read_irqsave()
+            .chip_data()
+            .ok_or(SystemError::EINVAL)?;
         let chip_data = binding
             .as_any_ref()
             .downcast_ref::<IoApicChipData>()
@@ -632,7 +649,11 @@ impl IrqChip for IoApicChip {
     }
 
     fn irq_disable(&self, irq: &Arc<IrqData>) {
-        let binding = irq.chip_data().ok_or(SystemError::EINVAL).unwrap();
+        let binding = irq
+            .chip_info_read_irqsave()
+            .chip_data()
+            .ok_or(SystemError::EINVAL)
+            .unwrap();
         let chip_data = binding
             .as_any_ref()
             .downcast_ref::<IoApicChipData>()

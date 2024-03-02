@@ -226,7 +226,10 @@ impl IrqManager {
 
         // ===== 代码开始 =====
 
-        if Arc::ptr_eq(&desc.irq_data().chip(), &no_irq_chip()) {
+        if Arc::ptr_eq(
+            &desc.irq_data().chip_info_read_irqsave().chip(),
+            &no_irq_chip(),
+        ) {
             return Err(SystemError::ENOSYS);
         }
 
@@ -274,6 +277,7 @@ impl IrqManager {
 
         if desc
             .irq_data()
+            .chip_info_read_irqsave()
             .chip()
             .flags()
             .contains(IrqChipFlags::IRQCHIP_ONESHOT_SAFE)
@@ -300,7 +304,7 @@ impl IrqManager {
                     "Failed to request resources for {} (irq {}) on irqchip {}, error {:?}",
                     action_guard.name(),
                     irq.data(),
-                    desc.irq_data().chip().name(),
+                    desc.irq_data().chip_info_read_irqsave().chip().name(),
                     e
                 );
                 return Err(err_out_bus_unlock(
@@ -329,7 +333,11 @@ impl IrqManager {
                     "Invalid attempt to share NMI for {} (irq {}) on irqchip {}",
                     action_guard.name(),
                     irq.data(),
-                    desc_inner_guard.irq_data().chip().name()
+                    desc_inner_guard
+                        .irq_data()
+                        .chip_info_read_irqsave()
+                        .chip()
+                        .name()
                 );
                 return Err(err_out_unlock(
                     SystemError::EINVAL,
@@ -394,6 +402,7 @@ impl IrqManager {
             h.type_id() == (&DefaultPrimaryIrqHandler as &dyn IrqHandler).type_id()
         }) && desc_inner_guard
             .irq_data()
+            .chip_info_read_irqsave()
             .chip()
             .flags()
             .contains(IrqChipFlags::IRQCHIP_ONESHOT_SAFE)
@@ -620,6 +629,7 @@ impl IrqManager {
             match self.__irq_startup_managed(desc_inner_guard, &affinity, force) {
                 IrqStartupResult::Normal => {
                     if irq_data
+                        .chip_info_read_irqsave()
                         .chip()
                         .flags()
                         .contains(IrqChipFlags::IRQCHIP_AFFINITY_PRE_STARTUP)
@@ -630,6 +640,7 @@ impl IrqManager {
                     ret = self.__irq_startup(desc_inner_guard);
 
                     if !irq_data
+                        .chip_info_read_irqsave()
                         .chip()
                         .flags()
                         .contains(IrqChipFlags::IRQCHIP_AFFINITY_PRE_STARTUP)
@@ -671,7 +682,7 @@ impl IrqManager {
         } else {
             common_data.clear_disabled();
 
-            let chip = desc_inner_guard.irq_data().chip();
+            let chip = desc_inner_guard.irq_data().chip_info_read_irqsave().chip();
 
             if let Err(e) = chip.irq_enable(&desc_inner_guard.irq_data()) {
                 if e == SystemError::ENOSYS {
@@ -734,7 +745,7 @@ impl IrqManager {
         cpumask: &CpuMask,
         force: bool,
     ) -> Result<(), SystemError> {
-        let chip = irq_data.chip();
+        let chip = irq_data.chip_info_read_irqsave().chip();
         if !chip.can_set_affinity() {
             return Err(SystemError::EINVAL);
         }
@@ -778,6 +789,7 @@ impl IrqManager {
 
         if let Err(e) = desc_inner_guard
             .irq_data()
+            .chip_info_read_irqsave()
             .chip()
             .irq_startup(desc_inner_guard.irq_data())
         {
@@ -863,7 +875,7 @@ impl IrqManager {
         desc_inner_guard: &mut SpinLockGuard<'_, InnerIrqDesc>,
         mut trigger_type: IrqLineStatus,
     ) -> Result<(), SystemError> {
-        let chip = desc_inner_guard.irq_data().chip();
+        let chip = desc_inner_guard.irq_data().chip_info_read_irqsave().chip();
         let mut to_unmask = false;
 
         if !chip.can_set_flow_type() {
@@ -935,7 +947,7 @@ impl IrqManager {
 
     fn irq_request_resources(&self, desc: Arc<IrqDesc>) -> Result<(), SystemError> {
         let irq_data = desc.irq_data();
-        let irq_chip = irq_data.chip();
+        let irq_chip = irq_data.chip_info_read_irqsave().chip();
         irq_chip.irq_request_resources(&irq_data)
     }
 
@@ -974,7 +986,7 @@ impl IrqManager {
             return;
         }
 
-        let chip = irq_data.chip();
+        let chip = irq_data.chip_info_read_irqsave().chip();
         let r = chip.irq_mask(irq_data);
 
         if r.is_ok() {
@@ -990,6 +1002,7 @@ impl IrqManager {
 
         let r = desc_inner_guard
             .irq_data()
+            .chip_info_read_irqsave()
             .chip()
             .irq_unmask(&desc_inner_guard.irq_data());
 
@@ -998,7 +1011,11 @@ impl IrqManager {
                 kerror!(
                     "Failed to unmask irq {} on irqchip {}, error {:?}",
                     desc_inner_guard.irq_data().irq().data(),
-                    desc_inner_guard.irq_data().chip().name(),
+                    desc_inner_guard
+                        .irq_data()
+                        .chip_info_read_irqsave()
+                        .chip()
+                        .name(),
                     e
                 );
             }

@@ -4,9 +4,11 @@ pub mod file;
 pub mod mount;
 pub mod open;
 pub mod syscall;
+pub mod cache;
 mod utils;
 
-use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
+use ::core::{any::Any, fmt::Debug, ops::Index, result, sync::atomic::AtomicUsize};
+use std::path;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
@@ -20,7 +22,7 @@ use crate::{
     time::TimeSpec,
 };
 
-use self::{core::generate_inode_id, file::FileMode, syscall::ModeType};
+use self::{cache::DCache, core::generate_inode_id, file::FileMode, syscall::ModeType};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
@@ -415,7 +417,11 @@ impl dyn IndexNode {
     /// @return Ok(Arc<dyn IndexNode>) 要寻找的目录项的inode
     /// @return Err(SystemError) 错误码
     pub fn lookup(&self, path: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return self.lookup_follow_symlink(path, 0);
+        // quick lookup
+        if let Some(x) = self.quick_lookup(path) {
+            return Ok(x);
+        }
+        self.lookup_follow_symlink(path, 0)
     }
 
     /// @brief 查找文件（考虑符号链接）
@@ -494,6 +500,23 @@ impl dyn IndexNode {
         }
 
         return Ok(result);
+    }
+    
+    /// @brief 缓存查询
+    ///
+    /// @param path 文件路径
+    /// @return Ok(Arc<dyn IndexNode>) 要寻找的目录项的inode
+    /// @return Err(SystemError) 错误码
+    /// 
+    /// 缓存可能未命中
+    fn quick_lookup(&self, path: &str) -> Option<Arc<dyn IndexNode>> {
+        if let Some(cache) = self.fs().cache().ok().
+        if let Some((_, name)) = path.rsplit_once('/') {
+            // if let Some(result) = /* quick_lookup(name) */
+            
+            
+        }
+        
     }
 }
 
@@ -579,6 +602,14 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// @brief 本函数用于实现动态转换。
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;
+
+    /// @brief 返回查询缓存
+    fn cache(&self) -> Option<DCache> {
+        None
+    }
+}
+
+impl dyn FileSystem {
 }
 
 impl DowncastArc for dyn FileSystem {

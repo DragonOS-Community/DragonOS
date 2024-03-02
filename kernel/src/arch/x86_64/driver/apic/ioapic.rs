@@ -384,6 +384,8 @@ struct InnerIoApicChipData {
 impl InnerIoApicChipData {
     /// 把中断数据同步到芯片
     fn sync_to_chip(&self) -> Result<(), SystemError> {
+        kdebug!("IoApicChipData::sync_to_chip: rte_index: {}, vector: {}, dest: {}, level_triggered: {}, active_high: {}, dest_logic: {}, mask: {}",
+                self.rte_index, self.vector, self.dest, self.level_triggered, self.active_high, self.dest_logic, self.mask);
         ioapic_install(
             self.vector,
             self.dest,
@@ -503,6 +505,7 @@ impl IrqChip for IoApicChip {
     }
 
     fn irq_startup(&self, irq: &Arc<IrqData>) -> Result<(), SystemError> {
+        kdebug!("IoApicChip::irq_startup: irq: {}", irq.irq().data());
         self.irq_unmask(irq)
     }
 
@@ -527,7 +530,7 @@ impl IrqChip for IoApicChip {
     }
 
     fn can_set_flow_type(&self) -> bool {
-        false
+        true
     }
 
     fn irq_set_type(
@@ -580,6 +583,7 @@ impl IrqChip for IoApicChip {
     }
 
     fn irq_unmask(&self, irq: &Arc<IrqData>) -> Result<(), SystemError> {
+        kdebug!("IoApicChip::irq_unmask: irq: {}", irq.irq().data());
         IOAPIC()
             .lock_irqsave()
             .enable(IoApic::vector_rte_index(irq.irq().data() as u8));

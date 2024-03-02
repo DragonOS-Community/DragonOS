@@ -9,6 +9,7 @@ use alloc::{
     vec::Vec,
 };
 use system_error::SystemError;
+use x86::vmx::vmcs::control::EntryControls;
 
 use crate::{
     driver::base::device::device_number::DeviceNumber,
@@ -160,7 +161,8 @@ impl Hash for DEntry {
 
 impl IndexNode for LockedDEntry {
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
-        let mut inode = self.0.lock().inode.0.lock();
+        let mut entry = self.0.lock();
+        let mut inode = entry.inode.0.lock();
 
         //如果是文件夹，则报错
         if inode.metadata.file_type == FileType::Dir {
@@ -197,7 +199,8 @@ impl IndexNode for LockedDEntry {
             return Err(SystemError::EINVAL);
         }
         // 加锁
-        let inode = self.0.lock().inode.0.lock();
+        let dentry: SpinLockGuard<DEntry> = self.0.lock();
+        let inode: SpinLockGuard<INode> = dentry.inode.0.lock();
 
         // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
         if inode.metadata.file_type == FileType::Dir {
@@ -230,7 +233,8 @@ impl IndexNode for LockedDEntry {
         }
 
         // 加锁
-        let mut inode = self.0.lock().inode.0.lock();
+        let mut dentry: SpinLockGuard<DEntry> = self.0.lock();
+        let mut inode: SpinLockGuard<INode> = dentry.inode.0.lock();
 
         // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
         if inode.metadata.file_type == FileType::Dir {
@@ -259,7 +263,8 @@ impl IndexNode for LockedDEntry {
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
-        let inode = self.0.lock().inode.0.lock();
+        let dentry: SpinLockGuard<DEntry> = self.0.lock();
+        let inode: SpinLockGuard<INode> = dentry.inode.0.lock();
         let mut metadata = inode.metadata.clone();
         metadata.size = inode.data.len() as i64;
 
@@ -267,7 +272,8 @@ impl IndexNode for LockedDEntry {
     }
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
-        let mut inode = self.0.lock().inode.0.lock();
+        let mut dentry: SpinLockGuard<DEntry> = self.0.lock();
+        let mut inode: SpinLockGuard<INode> = dentry.inode.0.lock();
 
         inode.metadata.atime = metadata.atime;
         inode.metadata.mtime = metadata.mtime;
@@ -280,7 +286,8 @@ impl IndexNode for LockedDEntry {
     }
 
     fn resize(&self, len: usize) -> Result<(), SystemError> {
-        let mut inode = self.0.lock().inode.0.lock();
+        let mut dentry: SpinLockGuard<DEntry> = self.0.lock();
+        let mut inode: SpinLockGuard<INode> = dentry.inode.0.lock();
         if inode.metadata.file_type == FileType::File {
             inode.data.resize(len, 0);
             Ok(())
@@ -298,12 +305,13 @@ impl IndexNode for LockedDEntry {
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 获取当前inode
         let mut dentry = self.0.lock();
+        {
         let mut inode = dentry.inode.0.lock();
         // 如果当前inode不是文件夹，则返回
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
-
+        }
         // 重名则返回
         if dentry.get(name).is_some() {
             return Err(SystemError::EEXIST);
@@ -355,13 +363,16 @@ impl IndexNode for LockedDEntry {
         let mut dentry: SpinLockGuard<DEntry> = self.0.lock();
         let other_dentry: SpinLockGuard<DEntry> = other.0.lock();
 
-        let inode: SpinLockGuard<INode> = dentry.inode.0.lock();
+        {   
+            let inode: SpinLockGuard<INode> = dentry.inode.0.lock();
+            // 如果当前inode不是文件夹，那么报错
+            if inode.metadata.file_type != FileType::Dir {
+                return Err(SystemError::ENOTDIR);
+            }
+        }
+
         let mut other_locked: SpinLockGuard<INode> = other_dentry.inode.0.lock();
 
-        // 如果当前inode不是文件夹，那么报错
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
 
         // 如果另一个inode是文件夹，那么也报错
         if other_locked.metadata.file_type == FileType::Dir {
@@ -388,10 +399,12 @@ impl IndexNode for LockedDEntry {
 
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
         let mut dentry: SpinLockGuard<DEntry> = self.0.lock();
-        let mut inode: SpinLockGuard<INode> = dentry.inode.0.lock();
-        // 如果当前inode不是目录，那么也没有子目录/文件的概念了，因此要求当前inode的类型是目录
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+        {
+            let inode: SpinLockGuard<INode> = dentry.inode.0.lock();
+            // 如果当前inode不是目录，那么也没有子目录/文件的概念了，因此要求当前inode的类型是目录
+            if inode.metadata.file_type != FileType::Dir {
+                return Err(SystemError::ENOTDIR);
+            }
         }
         // 不允许删除当前文件夹，也不允许删除上一个目录
         if name == "." || name == ".." {
@@ -419,10 +432,12 @@ impl IndexNode for LockedDEntry {
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
         let mut dentry: SpinLockGuard<DEntry> = self.0.lock();
-        let mut inode: SpinLockGuard<INode> = dentry.inode.0.lock();
-        // 如果当前inode不是目录，那么也没有子目录/文件的概念了，因此要求当前inode的类型是目录
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+        {
+            let inode: SpinLockGuard<INode> = dentry.inode.0.lock();
+            // 如果当前inode不是目录，那么也没有子目录/文件的概念了，因此要求当前inode的类型是目录
+            if inode.metadata.file_type != FileType::Dir {
+                return Err(SystemError::ENOTDIR);
+            }
         }
         // 获得要删除的文件夹的inode
         let to_delete = dentry.get(name).ok_or(SystemError::ENOENT)?;
@@ -550,11 +565,12 @@ impl IndexNode for LockedDEntry {
         _dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let mut dentry = self.0.lock();
-        let mut inode = dentry.inode.0.lock();
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+        {
+            let inode = dentry.inode.0.lock();
+            if inode.metadata.file_type != FileType::Dir {
+                return Err(SystemError::ENOTDIR);
+            }
         }
-
         // 判断需要创建的类型
         if unlikely(mode.contains(ModeType::S_IFREG)) {
             // 普通文件

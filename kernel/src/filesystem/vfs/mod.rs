@@ -511,7 +511,7 @@ impl dyn IndexNode {
     fn quick_lookup(&self, path: &str) -> Option<Arc<dyn IndexNode>> {
         if let Some((path_left, name)) = path.rsplit_once('/') {
             return match self.fs().cache() {
-                Some(cache) => cache.get(name),
+                Some(mut cache) => cache.get(name),
                 None => None
             };
         }

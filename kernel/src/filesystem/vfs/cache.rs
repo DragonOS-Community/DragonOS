@@ -48,13 +48,17 @@ impl<T: IndexNode + ?Sized> DCache<T> {
         to_ret
     }
 
-    pub fn get(&self, key: &str) -> Option<Arc<T>> {
+    pub fn get(&mut self, key: &str) -> Option<Arc<T>> {
         if let Some(entry) = self
-            .arr[Self::position(key) as usize].entry {
-            return entry.upgrade().and_then(|en|{
+            .arr[Self::position(key) as usize].entry.clone() {
+            if let Some(ex) = entry.upgrade() {
                 self.arr[Self::position(key) as usize].count += 1;
-                Some(en)
-            });
+                return Some(ex);
+            }
+            // return entry.upgrade().and_then(|en|{
+            //     self.arr[Self::position(key) as usize].count += 1;
+            //     Some(en)
+            // });
         }
         None
     }

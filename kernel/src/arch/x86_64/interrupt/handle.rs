@@ -20,6 +20,8 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
 
     if trap_frame.from_user() {
         x86_64::registers::segmentation::GS::swap();
+        // 拒绝用户态中断
+        return;
     }
 
     // 由于x86上面，虚拟中断号与物理中断号是一一对应的，所以这里直接使用vector作为中断号来查询irqdesc

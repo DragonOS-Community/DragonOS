@@ -17,9 +17,9 @@ pub struct DefaultNetIrqHandler;
 impl IrqHandler for DefaultNetIrqHandler {
     fn handle(
         &self,
-        irq: IrqNumber,
-        static_data: Option<&dyn IrqHandlerData>,
-        dynamic_data: Option<Arc<dyn IrqHandlerData>>,
+        _irq: IrqNumber,
+        _static_data: Option<&dyn IrqHandlerData>,
+        _dynamic_data: Option<Arc<dyn IrqHandlerData>>,
     ) -> Result<IrqReturn, SystemError> {
         poll_ifaces_try_lock_onetime().ok();
         Ok(IrqReturn::Handled)

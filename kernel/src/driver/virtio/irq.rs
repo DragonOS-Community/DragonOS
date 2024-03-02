@@ -54,9 +54,9 @@ impl VirtIOIrqManager {
     /// # 参数
     ///
     /// - `device` - 需要被取消注册的设备，它是一个实现了 `VirtIODevice` trait 的智能指针。
-    pub fn unregister_device(&self, device: Arc<dyn VirtIODevice>) {
+    pub fn unregister_device(&self, dev_id: &Arc<DeviceId>) {
         let mut map = self.map.write_irqsave();
-        map.remove(device.dev_id());
+        map.remove(dev_id);
     }
 
     /// 查找并返回指定设备ID的设备。

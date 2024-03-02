@@ -47,7 +47,7 @@ void do_IRQ(struct pt_regs *rsp, ul number)
         if (irq != NULL && irq->handler != NULL)
             irq->handler(number, irq->parameter, rsp);
         else
-            kwarn("Intr vector [%d] does not have a handler!");
+            kwarn("Intr vector [%d] does not have a handler!", number);
         // 向中断控制器发送应答消息
         // if (irq->controller != NULL && irq->controller->ack != NULL)
         //     irq->controller->ack(number);

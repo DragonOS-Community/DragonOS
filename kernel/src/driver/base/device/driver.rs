@@ -50,7 +50,7 @@ pub fn driver_manager() -> &'static DriverManager {
 /// 否则在运行时会报错
 pub trait Driver: Sync + Send + Debug + KObject {
     fn coredump(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        Err(SystemError::ENOSYS)
     }
 
     /// @brief: 获取驱动标识符

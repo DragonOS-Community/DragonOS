@@ -3,6 +3,7 @@
 
 use super::pci_irq::{IrqType, PciIrqError};
 use crate::arch::{PciArch, TraitPciArch};
+use crate::exception::IrqNumber;
 use crate::include::bindings::bindings::PAGE_2M_SIZE;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -371,7 +372,7 @@ pub trait PciDeviceStructure: Send + Sync {
     /// @brief 返回结构体中的irq_type的可变引用
     fn irq_type_mut(&mut self) -> Option<&mut IrqType>;
     /// @brief 返回结构体中的irq_vector的可变引用
-    fn irq_vector_mut(&mut self) -> Option<&mut Vec<u16>>;
+    fn irq_vector_mut(&mut self) -> Option<&mut Vec<IrqNumber>>;
 }
 
 /// Pci_Device_Structure_Header PCI设备结构体共有的头部
@@ -404,7 +405,7 @@ pub struct PciDeviceStructureGeneralDevice {
     // 中断结构体，包括legacy,msi,msix三种情况
     pub irq_type: IrqType,
     // 使用的中断号的vec集合
-    pub irq_vector: Vec<u16>,
+    pub irq_vector: Vec<IrqNumber>,
     pub standard_device_bar: PciStandardDeviceBar,
     pub cardbus_cis_pointer: u32, // 指向卡信息结构，供在 CardBus 和 PCI 之间共享芯片的设备使用。
     pub subsystem_vendor_id: u16,
@@ -464,7 +465,7 @@ impl PciDeviceStructure for PciDeviceStructureGeneralDevice {
         Some(&mut self.irq_type)
     }
     #[inline(always)]
-    fn irq_vector_mut(&mut self) -> Option<&mut Vec<u16>> {
+    fn irq_vector_mut(&mut self) -> Option<&mut Vec<IrqNumber>> {
         Some(&mut self.irq_vector)
     }
 }
@@ -476,7 +477,7 @@ pub struct PciDeviceStructurePciToPciBridge {
     // 中断结构体，包括legacy,msi,msix三种情况
     pub irq_type: IrqType,
     // 使用的中断号的vec集合
-    pub irq_vector: Vec<u16>,
+    pub irq_vector: Vec<IrqNumber>,
     pub bar0: u32,
     pub bar1: u32,
     pub primary_bus_number: u8,
@@ -528,7 +529,7 @@ impl PciDeviceStructure for PciDeviceStructurePciToPciBridge {
         Some(&mut self.irq_type)
     }
     #[inline(always)]
-    fn irq_vector_mut(&mut self) -> Option<&mut Vec<u16>> {
+    fn irq_vector_mut(&mut self) -> Option<&mut Vec<IrqNumber>> {
         Some(&mut self.irq_vector)
     }
 }
@@ -587,7 +588,7 @@ impl PciDeviceStructure for PciDeviceStructurePciToCardbusBridge {
         None
     }
     #[inline(always)]
-    fn irq_vector_mut(&mut self) -> Option<&mut Vec<u16>> {
+    fn irq_vector_mut(&mut self) -> Option<&mut Vec<IrqNumber>> {
         None
     }
 }

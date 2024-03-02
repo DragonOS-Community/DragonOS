@@ -1,6 +1,7 @@
 use core::{any::Any, fmt::Debug};
 
 use alloc::sync::{Arc, Weak};
+use intertrait::CastFromSync;
 
 use crate::libs::{
     cpumask::CpuMask,
@@ -291,7 +292,7 @@ impl InnerIrqCommonData {
 }
 
 /// 中断处理函数传入的数据
-pub trait IrqHandlerData: Send + Sync + Any + Debug {}
+pub trait IrqHandlerData: Send + Sync + Any + Debug + CastFromSync {}
 
 bitflags! {
     /// 中断线状态

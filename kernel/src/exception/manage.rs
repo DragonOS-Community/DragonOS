@@ -133,7 +133,7 @@ impl IrqManager {
         }
         let desc = irq_desc_manager().lookup(irq).ok_or(SystemError::EINVAL)?;
         if !desc.can_request() {
-            kdebug!("desc can not request");
+            kwarn!("desc {} can not request", desc.irq().data());
             return Err(SystemError::EINVAL);
         }
 
@@ -153,7 +153,7 @@ impl IrqManager {
         *action_guard.flags_mut() = flags;
         *action_guard.dev_id_mut() = dev_id;
         drop(action_guard);
-        kdebug!("to inner_setup_irq");
+
         return self.inner_setup_irq(irq, irqaction, desc);
     }
 
@@ -860,11 +860,11 @@ impl IrqManager {
         let mut to_unmask = false;
 
         if !chip.can_set_flow_type() {
-            kdebug!(
-                "No set_irq_type function for irq {}, chip {}",
-                desc_inner_guard.irq_data().irq().data(),
-                chip.name()
-            );
+            // kdebug!(
+            //     "No set_irq_type function for irq {}, chip {}",
+            //     desc_inner_guard.irq_data().irq().data(),
+            //     chip.name()
+            // );
             return Ok(());
         }
 
@@ -1000,6 +1000,30 @@ impl IrqManager {
                 .common_data()
                 .clear_status(IrqStatus::IRQD_IRQ_MASKED);
         }
+    }
+
+    /// 释放使用request_irq分配的中断
+    ///
+    /// ## 参数
+    ///
+    /// - irq: 要释放的中断线
+    /// - dev_id: 要释放的设备身份
+    ///
+    /// ## 返回
+    ///
+    /// 返回传递给request_irq的devname参数
+    ///
+    /// ## 说明
+    ///
+    /// 移除一个中断处理程序。处理程序被移除，如果该中断线不再被任何驱动程序使用，则会被禁用。
+    ///
+    /// 在共享IRQ的情况下，调用者必须确保在调用此功能之前，它在所驱动的卡上禁用了中断。
+    ///
+    /// ## 注意
+    ///
+    /// 此函数不可以在中断上下文中调用。
+    pub fn free_irq(&self, irq: IrqNumber, dev_id: Option<Arc<DeviceId>>) {
+        kwarn!("Unimplemented free_irq");
     }
 }
 

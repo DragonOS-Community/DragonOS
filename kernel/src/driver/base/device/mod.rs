@@ -876,7 +876,7 @@ impl DeviceMatcher<&str> for DeviceMatchName {
 }
 
 /// Cookie to identify the device
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct DeviceId {
     data: Option<&'static str>,
     allocated: Option<String>,
@@ -916,5 +916,7 @@ impl PartialEq for DeviceId {
         return self.id() == other.id();
     }
 }
+
+impl Eq for DeviceId {}
 
 impl IrqHandlerData for DeviceId {}

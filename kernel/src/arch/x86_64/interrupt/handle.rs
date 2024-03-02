@@ -21,7 +21,7 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
     }
 
     // 暂时只处理33号中断，其他的中断都交给do_IRQ处理
-    if vector != 33 {
+    if vector != 33 && vector != 56 {
         return do_IRQ(
             trap_frame as *mut TrapFrame as usize as *mut pt_regs,
             vector as u64,

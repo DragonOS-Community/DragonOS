@@ -8,9 +8,11 @@ use crate::{
     },
     exception::InterruptArch,
     libs::align::page_align_up,
-    mm::allocator::page_frame::PageFrameCount,
-    mm::{MMArch, MemoryManagementArch},
-    smp::core::smp_get_processor_id,
+    mm::{allocator::page_frame::PageFrameCount, MMArch, MemoryManagementArch},
+    smp::{
+        core::smp_get_processor_id,
+        cpu::{AtomicProcessorId, ProcessorId},
+    },
 };
 use core::{
     ops::Deref,
@@ -18,10 +20,11 @@ use core::{
 };
 
 /// 标志当前没有处理器持有内核映射器的锁
-/// 之所以需要这个标志，是因为AtomicUsize::new(0)会把0当作一个处理器的id
-const KERNEL_MAPPER_NO_PROCESSOR: usize = !0;
+/// 之所以需要这个标志，是因为 AtomicProcessorId::new(0) 会把0当作一个处理器的id
+const KERNEL_MAPPER_NO_PROCESSOR: ProcessorId = ProcessorId::INVALID;
 /// 当前持有内核映射器锁的处理器
-static KERNEL_MAPPER_LOCK_OWNER: AtomicUsize = AtomicUsize::new(KERNEL_MAPPER_NO_PROCESSOR);
+static KERNEL_MAPPER_LOCK_OWNER: AtomicProcessorId =
+    AtomicProcessorId::new(KERNEL_MAPPER_NO_PROCESSOR);
 /// 内核映射器的锁计数器
 static KERNEL_MAPPER_LOCK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -33,7 +36,7 @@ pub struct KernelMapper {
 }
 
 impl KernelMapper {
-    fn lock_cpu(cpuid: usize, mapper: PageMapper) -> Self {
+    fn lock_cpu(cpuid: ProcessorId, mapper: PageMapper) -> Self {
         loop {
             match KERNEL_MAPPER_LOCK_OWNER.compare_exchange_weak(
                 KERNEL_MAPPER_NO_PROCESSOR,
@@ -61,7 +64,7 @@ impl KernelMapper {
     /// @brief 锁定内核映射器, 并返回一个内核映射器对象
     #[inline(always)]
     pub fn lock() -> Self {
-        let cpuid = smp_get_processor_id() as usize;
+        let cpuid = smp_get_processor_id();
         let mapper = unsafe { PageMapper::current(PageTableKind::Kernel, LockedFrameAllocator) };
         return Self::lock_cpu(cpuid, mapper);
     }

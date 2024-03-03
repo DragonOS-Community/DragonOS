@@ -2,6 +2,7 @@ use alloc::vec::Vec;
 
 use crate::{bitmap_core::BitMapCore, traits::BitMapOps};
 
+#[derive(Clone)]
 pub struct AllocBitmap {
     elements: usize,
     data: Vec<usize>,

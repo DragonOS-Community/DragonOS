@@ -41,8 +41,21 @@ impl IrqChip for NoIrqChip {
     fn name(&self) -> &'static str {
         "none"
     }
+
+    fn can_mask_ack(&self) -> bool {
+        false
+    }
+
     fn irq_enable(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
         Ok(())
+    }
+
+    fn can_set_affinity(&self) -> bool {
+        false
+    }
+
+    fn can_set_flow_type(&self) -> bool {
+        false
     }
 
     fn irq_disable(&self, _irq: &Arc<IrqData>) {}
@@ -78,16 +91,25 @@ impl IrqChip for DummyIrqChip {
         "dummy"
     }
 
+    fn can_mask_ack(&self) -> bool {
+        false
+    }
+
     fn irq_enable(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
         Ok(())
+    }
+
+    fn can_set_flow_type(&self) -> bool {
+        false
+    }
+
+    fn can_set_affinity(&self) -> bool {
+        false
     }
 
     fn irq_disable(&self, _irq: &Arc<IrqData>) {}
 
     fn irq_ack(&self, _irq: &Arc<IrqData>) {}
-
-    fn irq_mask(&self, _irq: &Arc<IrqData>) {}
-    fn irq_unmask(&self, _irq: &Arc<IrqData>) {}
 
     fn irq_startup(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
         Ok(())

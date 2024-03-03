@@ -32,24 +32,24 @@ pub unsafe fn switch_fs_and_gs(fs: SegmentSelector, gs: SegmentSelector) {
 
 #[derive(Debug)]
 pub struct TSSManager {
-    tss: [TaskStateSegment; PerCpu::MAX_CPU_NUM],
+    tss: [TaskStateSegment; PerCpu::MAX_CPU_NUM as usize],
 }
 
 impl TSSManager {
     const fn new() -> Self {
         return Self {
-            tss: [TaskStateSegment::new(); PerCpu::MAX_CPU_NUM],
+            tss: [TaskStateSegment::new(); PerCpu::MAX_CPU_NUM as usize],
         };
     }
 
     /// 获取当前CPU的TSS
     pub unsafe fn current_tss() -> &'static mut TaskStateSegment {
-        &mut TSS_MANAGER.tss[smp_get_processor_id() as usize]
+        &mut TSS_MANAGER.tss[smp_get_processor_id().data() as usize]
     }
 
     /// 加载当前CPU的TSS
     pub unsafe fn load_tr() {
-        let index = (10 + smp_get_processor_id() * 2) as u16;
+        let index = (10 + smp_get_processor_id().data() * 2) as u16;
         let selector = SegmentSelector::new(index, Ring::Ring0);
 
         Self::set_tss_descriptor(

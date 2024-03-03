@@ -54,8 +54,15 @@ all:
 	mkdir -p $(ROOT_PATH)/bin/sysroot
 	
 	$(MAKE) dadk_run
+	$(MAKE) copy_services
 
 	@echo 用户态程序编译完成
+
+copy_services: dadk_run
+	cp -r services/* $(ROOT_PATH)/bin/sysroot/etc/reach/system/
+
+
+	
 
 .PHONY: clean
 clean:

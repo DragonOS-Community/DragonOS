@@ -10,6 +10,7 @@ use system_error::SystemError;
 
 mod dma;
 pub mod e1000e;
+pub mod irq_handle;
 pub mod virtio_net;
 
 pub trait NetDriver: Driver {

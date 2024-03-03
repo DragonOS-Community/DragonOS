@@ -10,7 +10,7 @@ use crate::{
     kinfo,
     mm::percpu::PerCpu,
     process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
-    smp::core::smp_get_processor_id,
+    smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 
 use super::rt::{sched_rt_init, SchedulerRT, __get_rt_scheduler};
@@ -39,23 +39,23 @@ impl CpuExecuting {
     }
 
     #[inline(always)]
-    pub fn set(&self, cpu_id: u32, pid: Pid) {
-        self.data[cpu_id as usize].store(pid, Ordering::SeqCst);
+    pub fn set(&self, cpu_id: ProcessorId, pid: Pid) {
+        self.data[cpu_id.data() as usize].store(pid, Ordering::SeqCst);
     }
 
     #[inline(always)]
-    pub fn get(&self, cpu_id: u32) -> Pid {
-        self.data[cpu_id as usize].load(Ordering::SeqCst)
+    pub fn get(&self, cpu_id: ProcessorId) -> Pid {
+        self.data[cpu_id.data() as usize].load(Ordering::SeqCst)
     }
 }
 
 // 获取某个cpu的负载情况，返回当前负载，cpu_id 是获取负载的cpu的id
 // TODO:将获取负载情况调整为最近一段时间运行进程的数量
-pub fn get_cpu_loads(cpu_id: u32) -> u32 {
+pub fn get_cpu_loads(cpu_id: ProcessorId) -> u32 {
     let cfs_scheduler = __get_cfs_scheduler();
     let rt_scheduler = __get_rt_scheduler();
-    let len_cfs = cfs_scheduler.get_cfs_queue_len(cpu_id as u32);
-    let len_rt = rt_scheduler.rt_queue_len(cpu_id as u32);
+    let len_cfs = cfs_scheduler.get_cfs_queue_len(cpu_id);
+    let len_rt = rt_scheduler.rt_queue_len(cpu_id);
     // let load_rt = rt_scheduler.get_load_list_len(cpu_id);
     // kdebug!("this cpu_id {} is load rt {}", cpu_id, load_rt);
 
@@ -70,6 +70,7 @@ pub fn loads_balance(pcb: Arc<ProcessControlBlock>) {
     let mut min_loads_cpu_id = smp_get_processor_id();
     let mut min_loads = get_cpu_loads(smp_get_processor_id());
     for cpu_id in 0..cpu_num {
+        let cpu_id = ProcessorId::new(cpu_id);
         let tmp_cpu_loads = get_cpu_loads(cpu_id);
         if min_loads - tmp_cpu_loads > 0 {
             min_loads_cpu_id = cpu_id;

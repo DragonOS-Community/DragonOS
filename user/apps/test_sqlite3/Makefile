@@ -1,23 +1,23 @@
 ifeq ($(ARCH), x86_64)
-	PREFIX=x86_64-linux-musl-
+	CROSS_COMPILE=x86_64-linux-musl-
 else ifeq ($(ARCH), riscv64)
-	PREFIX=riscv64-linux-musl-
+	CROSS_COMPILE=riscv64-linux-musl-
 endif
 
 SQLITE_FILENAME=sqlite-amalgamation-3420000
 SQLITE3_DIR=$(shell pwd)/$(SQLITE_FILENAME)
-CC=$(PREFIX)gcc
+CC=$(CROSS_COMPILE)gcc
 
-
-out: main.c $(SQLITE3_DIR)/sqlite3.c
-	$(CC) -I $(SQLITE3_DIR) -static -o out main.c $(SQLITE3_DIR)/sqlite3.c
+.PHONY: all
+all: main.c $(SQLITE3_DIR)/sqlite3.c
+	$(CC) -I $(SQLITE3_DIR) -static -o test_sqlite3 main.c $(SQLITE3_DIR)/sqlite3.c
 
 .PHONY: install clean download_sqlite3 __download_sqlite3
-install: out
-	mv out $(DADK_CURRENT_BUILD_DIR)/test_sqlite3
+install: all
+	mv test_sqlite3 $(DADK_CURRENT_BUILD_DIR)/test_sqlite3
 
 clean:
-	rm out *.o
+	rm test_sqlite3 *.o
 
 __download_sqlite3:
 	@echo "Download sqlite3 from https://mirrors.dragonos.org.cn/pub/third_party/sqlite/$(SQLITE_FILENAME).zip"

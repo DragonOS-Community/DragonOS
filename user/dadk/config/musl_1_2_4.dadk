@@ -12,7 +12,7 @@
   },
   "depends": [],
   "build": {
-    "build_command": "touch config.mak && DESTDIR=$DADK_CURRENT_BUILD_DIR make install"
+    "build_command": "touch config.mak && DESTDIR=$DADK_CURRENT_BUILD_DIR make install -j $(nproc)"
   },
   "install": {
     "in_dragonos_path": "/"

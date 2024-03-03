@@ -1,18 +1,18 @@
 ifeq ($(ARCH), x86_64)
-	PREFIX=x86_64-linux-musl-
+	CROSS_COMPILE=x86_64-linux-musl-
 else ifeq ($(ARCH), riscv64)
-	PREFIX=riscv64-linux-musl-
+	CROSS_COMPILE=riscv64-linux-musl-
 endif
 
-CC=$(PREFIX)gcc
+CC=$(CROSS_COMPILE)gcc
 
-
-out: main.c
-	$(CC) -static -o out main.c
+.PHONY: all
+all: main.c
+	$(CC) -static -o test_bind main.c
 
 .PHONY: install clean
-install: out
-	mv out $(DADK_CURRENT_BUILD_DIR)/test_bind
+install: all
+	mv test_bind $(DADK_CURRENT_BUILD_DIR)/test_bind
 
 clean:
-	rm out *.o
+	rm test_bind *.o

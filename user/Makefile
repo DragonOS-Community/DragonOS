@@ -69,4 +69,4 @@ clean:
 
 .PHONY: fmt
 fmt:
-	# FMT_CHECK=$(FMT_CHECK) $(MAKE) -C apps
+	FMT_CHECK=$(FMT_CHECK) $(MAKE) -C apps

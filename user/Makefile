@@ -64,8 +64,10 @@ $(user_sub_dirs): ECHO sys_api_lib
 
 	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" tmp_output_dir="$(tmp_output_dir)" output_dir="$(output_dir)" sys_libs_dir="$(shell pwd)/libs"
 
-app: $(user_sub_dirs) dadk_run
+copy_services: dadk_run
+	cp -r services/* $(ROOT_PATH)/bin/sysroot/etc/reach/system/
 
+app: $(user_sub_dirs) dadk_run copy_services
 
 all: make_output_dir
 

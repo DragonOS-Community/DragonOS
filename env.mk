@@ -12,6 +12,8 @@ endif
 # 设置编译器
 ifeq ($(ARCH), x86_64)
 
+export PATH := ${PATH}:${HOME}/opt/x86_64-linux-musl-cross-gcc-9.4.0/bin
+
 # 如果 x86_64时，DragonOS_GCC 为空，那么设置为默认值
 export DragonOS_GCC?=$(HOME)/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin
 
@@ -23,6 +25,8 @@ export AR=$(DragonOS_GCC)/x86_64-elf-ar
 export OBJCOPY=$(DragonOS_GCC)/x86_64-elf-objcopy
 
 else ifeq ($(ARCH), riscv64)
+
+export PATH := ${PATH}:${HOME}/opt/riscv64-linux-musl-cross-gcc-9.4.0/bin
 
 export CC=riscv64-unknown-elf-gcc
 # binutils版本需要>=2.38

@@ -17,19 +17,19 @@ void print_copyright()
     printf(" DragonOS - An opensource operating system.\n");
     printf(" Copyright: DragonOS Community. 2022-2024, All rights reserved.\n");
     printf(" Version: ");
-    printf("\x1B[32m%s\x1B[0m", "V0.1.8\n");
+    printf("\033[1;32m%s\033[0m", "V0.1.8\n");
     printf(" Git commit SHA1: %s\n", DRAGONOS_GIT_COMMIT_SHA1);
     printf(" Build time: %s %s\n", __DATE__, __TIME__);
     printf(" \nYou can visit the project via:\n");
     printf("\n");
-    printf("\x1B[36m%s\x1B[0m", "    Official Website: https://DragonOS.org\n");
-    printf("\x1B[33m%s\x1B[0m", "    GitHub: https://github.com/DragonOS-Community/DragonOS\n");
+    printf("\x1B[1;36m%s\x1B[0m", "    Official Website: https://DragonOS.org\n");
+    printf("\x1B[1;33m%s\x1B[0m", "    GitHub: https://github.com/DragonOS-Community/DragonOS\n");
     printf("\n");
     printf(" Maintainer: longjin <longjin@DragonOS.org>\n");
     printf(" Get contact with the community: <contact@DragonOS.org>\n");
     printf("\n");
     printf(" Join our development community:\n");
-    printf("\x1B[33m%s\x1B[0m", "    https://bbs.dragonos.org.cn\n");
+    printf("\x1B[1;33m%s\x1B[0m", "    https://bbs.dragonos.org.cn\n");
     printf("\n");
 }
 

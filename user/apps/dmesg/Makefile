@@ -16,3 +16,5 @@ install: all
 
 clean:
 	rm dmesg *.o
+
+fmt:

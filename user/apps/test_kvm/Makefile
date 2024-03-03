@@ -16,3 +16,5 @@ install: all
 
 clean:
 	rm test_kvm *.o
+
+fmt:

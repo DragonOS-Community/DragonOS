@@ -16,3 +16,5 @@ install: all
 
 clean:
 	rm http_server *.o
+
+fmt:

@@ -22,3 +22,5 @@ clean:
 # 生成版本头文件sys_version.h
 version_header: about.c
 	@echo "#define DRAGONOS_GIT_COMMIT_SHA1 \"$(GIT_COMMIT_SHA1)\"" > sys_version.h
+
+fmt:

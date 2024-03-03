@@ -28,3 +28,5 @@ __download_sqlite3:
 download_sqlite3:
 # 如果文件夹不存在，则下载，否则不下载
 	@test -d $(SQLITE3_DIR) || $(MAKE) __download_sqlite3
+
+fmt:

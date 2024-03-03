@@ -5,14 +5,16 @@ use crate::{
     exception::ipi::{IpiKind, IpiTarget},
 };
 
+use self::cpu::ProcessorId;
+
 pub mod c_adapter;
 pub mod core;
 pub mod cpu;
 
-pub fn kick_cpu(cpu_id: u32) -> Result<(), SystemError> {
+pub fn kick_cpu(cpu_id: ProcessorId) -> Result<(), SystemError> {
     // todo: 增加对cpu_id的有效性检查
 
-    send_ipi(IpiKind::KickCpu, IpiTarget::Specified(cpu_id as usize));
+    send_ipi(IpiKind::KickCpu, IpiTarget::Specified(cpu_id));
     return Ok(());
 }
 

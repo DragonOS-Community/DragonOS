@@ -14,7 +14,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{sched::sched, CurrentIrqArch},
-    exception::InterruptArch,
+    exception::{irqdesc::IrqAction, InterruptArch},
     init::initial_kthread::initial_kernel_thread,
     kdebug, kinfo,
     libs::{once::Once, spinlock::SpinLock},
@@ -87,15 +87,31 @@ impl KernelThreadPcbPrivate {
 #[allow(dead_code)]
 pub enum KernelThreadClosure {
     UsizeClosure((Box<dyn Fn(usize) -> i32 + Send + Sync>, usize)),
+    StaticUsizeClosure((&'static dyn Fn(usize) -> i32, usize)),
     EmptyClosure((Box<dyn Fn() -> i32 + Send + Sync>, ())),
+    StaticEmptyClosure((&'static dyn Fn() -> i32, ())),
+    IrqThread(
+        (
+            &'static dyn Fn(Arc<IrqAction>) -> Result<(), SystemError>,
+            Arc<IrqAction>,
+        ),
+    ),
     // 添加其他类型入参的闭包，返回值必须是i32
 }
+
+unsafe impl Send for KernelThreadClosure {}
+unsafe impl Sync for KernelThreadClosure {}
 
 impl KernelThreadClosure {
     pub fn run(self) -> i32 {
         match self {
             Self::UsizeClosure((func, arg)) => func(arg),
             Self::EmptyClosure((func, _arg)) => func(),
+            Self::StaticUsizeClosure((func, arg)) => func(arg),
+            Self::StaticEmptyClosure((func, _arg)) => func(),
+            Self::IrqThread((func, arg)) => {
+                func(arg).map(|_| 0).unwrap_or_else(|e| e.to_posix_errno())
+            }
         }
     }
 }

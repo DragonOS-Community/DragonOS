@@ -1,6 +1,8 @@
+use crate::smp::cpu::ProcessorId;
+
 /// 获取当前cpu的id
 #[inline]
-pub fn current_cpu_id() -> u32 {
+pub fn current_cpu_id() -> ProcessorId {
     unimplemented!("RiscV64 current_cpu_id")
 }
 

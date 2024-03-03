@@ -1,5 +1,6 @@
 use super::transport_pci::PciTransport;
 use super::virtio_impl::HalImpl;
+use crate::driver::base::device::DeviceId;
 use crate::driver::net::virtio_net::virtio_net;
 use crate::driver::pci::pci::{
     get_pci_device_structure_mut, PciDeviceStructure, PciDeviceStructureGeneralDevice,
@@ -7,6 +8,7 @@ use crate::driver::pci::pci::{
 };
 use crate::libs::rwlock::RwLockWriteGuard;
 use crate::{kdebug, kerror, kwarn};
+use alloc::sync::Arc;
 use alloc::{boxed::Box, collections::LinkedList};
 use virtio_drivers::transport::{DeviceType, Transport};
 const NETWORK_CLASS: u8 = 0x2;
@@ -23,14 +25,16 @@ pub fn virtio_probe() {
     let mut list = PCI_DEVICE_LINKEDLIST.write();
     if let Ok(virtio_list) = virtio_device_search(&mut list) {
         for virtio_device in virtio_list {
-            match PciTransport::new::<HalImpl>(virtio_device) {
+            let dev_id = virtio_device.common_header.device_id;
+            let dev_id = DeviceId::new(None, Some(format!("virtio_{}", dev_id))).unwrap();
+            match PciTransport::new::<HalImpl>(virtio_device, dev_id.clone()) {
                 Ok(mut transport) => {
                     kdebug!(
                         "Detected virtio PCI device with device type {:?}, features {:#018x}",
                         transport.device_type(),
                         transport.read_device_features(),
                     );
-                    virtio_device_init(transport);
+                    virtio_device_init(transport, dev_id);
                 }
                 Err(err) => {
                     kerror!("Pci transport create failed because of error: {}", err);
@@ -43,7 +47,7 @@ pub fn virtio_probe() {
 }
 
 ///@brief 为virtio设备寻找对应的驱动进行初始化
-fn virtio_device_init(transport: impl Transport + 'static) {
+fn virtio_device_init(transport: impl Transport + 'static, dev_id: Arc<DeviceId>) {
     match transport.device_type() {
         DeviceType::Block => {
             kwarn!("Not support virtio_block device for now");
@@ -54,7 +58,7 @@ fn virtio_device_init(transport: impl Transport + 'static) {
         DeviceType::Input => {
             kwarn!("Not support virtio_input device for now");
         }
-        DeviceType::Network => virtio_net(transport),
+        DeviceType::Network => virtio_net(transport, dev_id),
         t => {
             kwarn!("Unrecognized virtio device: {:?}", t);
         }

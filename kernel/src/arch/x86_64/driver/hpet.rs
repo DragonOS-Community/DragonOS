@@ -1,5 +1,4 @@
 use core::{
-    ffi::c_void,
     intrinsics::unlikely,
     mem::size_of,
     ptr::NonNull,
@@ -7,6 +6,7 @@ use core::{
 };
 
 use acpi::HpetInfo;
+use alloc::{string::ToString, sync::Arc};
 use system_error::SystemError;
 
 use crate::{
@@ -16,8 +16,11 @@ use crate::{
         timers::hpet::{HpetRegisters, HpetTimerRegisters},
     },
     exception::{
+        irqdata::IrqHandlerData,
+        irqdesc::{IrqHandleFlags, IrqHandler, IrqReturn},
+        manage::irq_manager,
         softirq::{softirq_vectors, SoftirqNumber},
-        InterruptArch,
+        InterruptArch, IrqNumber,
     },
     kdebug, kerror, kinfo,
     libs::{
@@ -30,10 +33,6 @@ use crate::{
     },
     time::timer::{clock, timer_get_first_expire, update_timer_jiffies},
 };
-
-extern "C" {
-    fn c_hpet_register_irq() -> c_void;
-}
 
 static mut HPET_INSTANCE: Option<Hpet> = None;
 
@@ -57,6 +56,8 @@ struct InnerHpet {
 impl Hpet {
     /// HPET0 中断间隔为 10ms
     pub const HPET0_INTERVAL_USEC: u64 = 10000;
+
+    const HPET0_IRQ: IrqNumber = IrqNumber::new(34);
 
     fn new(mut hpet_info: HpetInfo) -> Result<Self, SystemError> {
         let paddr = PhysAddr::new(hpet_info.base_address);
@@ -107,6 +108,8 @@ impl Hpet {
 
     /// 使能HPET
     pub fn hpet_enable(&self) -> Result<(), SystemError> {
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
         // ！！！这里是临时糊代码的，需要在apic重构的时候修改！！！
         let (inner_guard, regs) = unsafe { self.hpet_regs_mut() };
         let freq = regs.frequency();
@@ -135,8 +138,14 @@ impl Hpet {
         }
         drop(inner_guard);
 
-        // todo!("register irq in C");
-        unsafe { c_hpet_register_irq() };
+        irq_manager().request_irq(
+            Self::HPET0_IRQ,
+            "HPET0".to_string(),
+            &HpetIrqHandler,
+            IrqHandleFlags::IRQF_TRIGGER_RISING,
+            None,
+        )?;
+
         self.enabled.store(true, Ordering::SeqCst);
 
         let (inner_guard, regs) = unsafe { self.hpet_regs_mut() };
@@ -147,6 +156,8 @@ impl Hpet {
         drop(inner_guard);
 
         kinfo!("HPET enabled");
+
+        drop(irq_guard);
         return Ok(());
     }
 
@@ -250,4 +261,19 @@ pub fn hpet_init() -> Result<(), SystemError> {
     }
 
     return Ok(());
+}
+
+#[derive(Debug)]
+struct HpetIrqHandler;
+
+impl IrqHandler for HpetIrqHandler {
+    fn handle(
+        &self,
+        _irq: IrqNumber,
+        _static_data: Option<&dyn IrqHandlerData>,
+        _dynamic_data: Option<Arc<dyn IrqHandlerData>>,
+    ) -> Result<IrqReturn, SystemError> {
+        hpet_instance().handle_irq(0);
+        return Ok(IrqReturn::Handled);
+    }
 }

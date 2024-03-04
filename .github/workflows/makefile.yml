@@ -31,7 +31,6 @@ jobs:
           ARCH: ${{ matrix.arch }}
       run: |
             printf "\n" >> kernel/src/include/bindings/bindings.rs
-            printf "\n" >> user/libs/libc/src/include/internal/bindings/bindings.rs
             FMT_CHECK=1 make fmt
   
   kernel-static-test:

@@ -1,4 +1,6 @@
 #include "dmesg.h"
+#include <stdio.h>
+#include <string.h>
 
 /**
  * @brief 识别dmesg程序的第一个选项参数
@@ -6,7 +8,7 @@
  * @param arg dmesg命令第一个选项参数
  * @return int 有效时返回对应选项码，无效时返回 -1
  */
-int getopt(char *arg)
+int getoption(char *arg)
 {
     if (!strcmp(arg, "-h") || !strcmp(arg, "--help"))
         return 0;

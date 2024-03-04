@@ -36,7 +36,7 @@ pub fn no_init_textui_putchar_window(
     bkcolor: FontColor,
     is_put_to_window: bool,
 ) -> Result<(), SystemError> {
-    if NO_ALLOC_OPERATIONS_LINE.load(Ordering::SeqCst) > TRUE_LINE_NUM.load(Ordering::SeqCst) {
+    if NO_ALLOC_OPERATIONS_LINE.load(Ordering::SeqCst) >= TRUE_LINE_NUM.load(Ordering::SeqCst) {
         NO_ALLOC_OPERATIONS_LINE.store(0, Ordering::SeqCst);
     }
     //字符'\0'代表ASCII码表中的空字符,表示字符串的结尾

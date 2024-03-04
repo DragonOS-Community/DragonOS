@@ -1,19 +1,26 @@
-use core::ffi::CStr;
+use core::{
+    default,
+    ffi::{c_char, c_void, CStr},
+    result,
+};
 
 use alloc::{
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
+    borrow::ToOwned, string::{String, ToString}, sync::Arc, vec::Vec
 };
 use system_error::SystemError;
 
 use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
-    filesystem::vfs::file::FileDescriptorVec,
+    filesystem::{
+        self,
+        fat::fs::FATFileSystem,
+        ramfs::RamFS,
+        vfs::{core as Vcore, file::FileDescriptorVec},
+    },
     kerror,
     libs::rwlock::RwLockWriteGuard,
     mm::{verify_area, VirtAddr},
-    process::ProcessManager,
+    process::{ProcessManager, SwitchResult},
     syscall::{
         user_access::{check_and_clone_cstr, UserBufferReader, UserBufferWriter},
         Syscall,
@@ -27,7 +34,7 @@ use super::{
     file::{File, FileMode},
     open::{do_faccessat, do_fchmodat, do_sys_open},
     utils::{rsplit_path, user_path_at},
-    Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    Dirent, FileSystem, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 // use crate::kdebug;
 
@@ -1008,6 +1015,75 @@ impl Syscall {
         kwarn!("fchmod not fully implemented");
         return Ok(0);
     }
+
+    pub fn mount(
+        source: *const c_char,
+        target: *const c_char,
+        filesystemtype: *const c_char,
+        mountflags: usize,
+        data: *const c_void,
+    ) -> Result<usize, SystemError> {
+        let ureader = UserBufferReader::new(source, MAX_PATHLEN, true)?;
+
+        let buf: &[u8] = ureader.buffer(0).unwrap();
+
+        let source: &CStr = CStr::from_bytes_until_nul(buf).map_err(|_| SystemError::EINVAL)?;
+
+        let source: &str = source.to_str().map_err(|_| SystemError::EINVAL)?;
+
+        if source.len() >= MAX_PATHLEN {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+
+        let source = source.trim();
+        let ureader = UserBufferReader::new(target, MAX_PATHLEN, true)?;
+
+        let buf: &[u8] = ureader.buffer(0).unwrap();
+
+        let target: &CStr = CStr::from_bytes_until_nul(buf).map_err(|_| SystemError::EINVAL)?;
+
+        let target: &str = target.to_str().map_err(|_| SystemError::EINVAL)?;
+
+        if target.len() >= MAX_PATHLEN {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+
+        let target = target.trim();
+        let ureader = UserBufferReader::new(filesystemtype, MAX_PATHLEN, true)?;
+
+        let buf: &[u8] = ureader.buffer(0).unwrap();
+
+        let filesystemtype: &CStr =
+            CStr::from_bytes_until_nul(buf).map_err(|_| SystemError::EINVAL)?;
+
+        let filesystemtype: &str = filesystemtype.to_str().map_err(|_| SystemError::EINVAL)?;
+
+        if filesystemtype.len() >= MAX_PATHLEN {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+
+        let filesystemtype = filesystemtype.trim();
+        Self::mkdir((target.to_owned()+source).as_str(), FileMode::O_PATH_FLAGS.bits().try_into().unwrap());
+        // (FileMode::O_WRONLY|FileMode::O_RDWR|FileMode::O_ACCMODE|FileMode::O_CREAT|FileMode::O_EXCL|FileMode::O_NOCTTY).bits().try_into().unwrap()
+        let _filesystemtype= RamFS::new();
+
+        return Vcore::do_mount(_filesystemtype, (target.to_owned()+source).as_str());
+    }
+
+    // pub fn read_from_cstr<'a>(source: *const c_char)->Result<&'a str,SystemError>{
+    //     let ureader = UserBufferReader::new(source, MAX_PATHLEN, true)?;
+
+    //     let buf: &[u8] = ureader.buffer(0).unwrap();
+
+    //     let result: &CStr = CStr::from_bytes_until_nul(buf).map_err(|_| SystemError::EINVAL)?;
+
+    //     let result: &str = result.to_str().map_err(|_| SystemError::EINVAL)?;
+
+    //     if result.len() >= MAX_PATHLEN {
+    //         return Err(SystemError::ENAMETOOLONG);
+    //     }
+    //     Ok(result.trim())
+    // }
 }
 
 #[repr(C)]

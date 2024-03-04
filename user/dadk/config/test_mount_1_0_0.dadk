@@ -1,0 +1,22 @@
+{
+  "name": "test-mount",
+  "version": "1.0.0",
+  "description": "to test user mode mount",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "/home/dk/Desktop/DragonOS/user/apps/test-mount"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  }
+}

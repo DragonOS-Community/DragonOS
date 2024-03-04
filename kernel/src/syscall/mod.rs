@@ -1,11 +1,13 @@
 use core::{
     ffi::{c_char, c_int, c_void, CStr},
+    ptr::null,
     sync::atomic::{AtomicBool, Ordering},
 };
 
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
     driver::base::device::device_number::DeviceNumber,
+    filesystem::vfs::mount,
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::syscall::MremapFlags,
     net::syscall::MsgHdr,
@@ -1029,6 +1031,13 @@ impl Syscall {
             }
 
             SYS_SCHED_YIELD => Self::sched_yield(),
+
+            SYS_MOUNT => {
+                let source = args[0] as *const c_char;
+                let target = args[1] as *const c_char;
+                let filesystemtype = args[2] as *const c_char;
+                return Self::mount(source, target, filesystemtype, 0, null());
+            }
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };

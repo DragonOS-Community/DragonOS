@@ -1015,7 +1015,14 @@ impl Syscall {
         kwarn!("fchmod not fully implemented");
         return Ok(0);
     }
-
+    /// #mount
+    /// ## 介绍:
+    /// 用于挂载文件系统,目前仅支持ramfs挂载
+    /// ## 参数: 
+    /// @param source 挂载目标的文件夹名
+    /// @param target 挂载目录的父目录
+    /// @param filesystemtype 文件系统
+    /// 
     pub fn mount(
         source: *const c_char,
         target: *const c_char,
@@ -1023,67 +1030,36 @@ impl Syscall {
         mountflags: usize,
         data: *const c_void,
     ) -> Result<usize, SystemError> {
-        let ureader = UserBufferReader::new(source, MAX_PATHLEN, true)?;
+        let source = Self::read_from_cstr(source).unwrap();
+        
+        let target = Self::read_from_cstr(target).unwrap();
+        
+        let filesystemtype = Self::read_from_cstr(filesystemtype).unwrap();
 
-        let buf: &[u8] = ureader.buffer(0).unwrap();
+        kdebug!("input fs is {}",filesystemtype);
 
-        let source: &CStr = CStr::from_bytes_until_nul(buf).map_err(|_| SystemError::EINVAL)?;
-
-        let source: &str = source.to_str().map_err(|_| SystemError::EINVAL)?;
-
-        if source.len() >= MAX_PATHLEN {
-            return Err(SystemError::ENAMETOOLONG);
-        }
-
-        let source = source.trim();
-        let ureader = UserBufferReader::new(target, MAX_PATHLEN, true)?;
-
-        let buf: &[u8] = ureader.buffer(0).unwrap();
-
-        let target: &CStr = CStr::from_bytes_until_nul(buf).map_err(|_| SystemError::EINVAL)?;
-
-        let target: &str = target.to_str().map_err(|_| SystemError::EINVAL)?;
-
-        if target.len() >= MAX_PATHLEN {
-            return Err(SystemError::ENAMETOOLONG);
-        }
-
-        let target = target.trim();
-        let ureader = UserBufferReader::new(filesystemtype, MAX_PATHLEN, true)?;
-
-        let buf: &[u8] = ureader.buffer(0).unwrap();
-
-        let filesystemtype: &CStr =
-            CStr::from_bytes_until_nul(buf).map_err(|_| SystemError::EINVAL)?;
-
-        let filesystemtype: &str = filesystemtype.to_str().map_err(|_| SystemError::EINVAL)?;
-
-        if filesystemtype.len() >= MAX_PATHLEN {
-            return Err(SystemError::ENAMETOOLONG);
-        }
-
-        let filesystemtype = filesystemtype.trim();
-        Self::mkdir((target.to_owned()+source).as_str(), FileMode::O_PATH_FLAGS.bits().try_into().unwrap());
+        Self::mkdir((target.clone()+&source).as_str(), FileMode::O_PATH_FLAGS.bits().try_into().unwrap());
         // (FileMode::O_WRONLY|FileMode::O_RDWR|FileMode::O_ACCMODE|FileMode::O_CREAT|FileMode::O_EXCL|FileMode::O_NOCTTY).bits().try_into().unwrap()
+        // bug: when using match , cannot return the right filesystem
         let _filesystemtype= RamFS::new();
 
-        return Vcore::do_mount(_filesystemtype, (target.to_owned()+source).as_str());
+        return Vcore::do_mount(_filesystemtype, (target.clone()+&source).as_str());
     }
 
-    // pub fn read_from_cstr<'a>(source: *const c_char)->Result<&'a str,SystemError>{
-    //     let ureader = UserBufferReader::new(source, MAX_PATHLEN, true)?;
+    pub fn read_from_cstr(source: *const c_char) -> Result<String, SystemError> {
+    // Create a CString from the raw pointer
+    let cstr = unsafe { CStr::from_ptr(source) };
 
-    //     let buf: &[u8] = ureader.buffer(0).unwrap();
+    // Convert the CString to a Rust String
+    let result = cstr.to_string_lossy().into_owned();
 
-    //     let result: &CStr = CStr::from_bytes_until_nul(buf).map_err(|_| SystemError::EINVAL)?;
+    if result.len() >= MAX_PATHLEN {
+        return Err(SystemError::ENAMETOOLONG);
+    }
 
-    //     let result: &str = result.to_str().map_err(|_| SystemError::EINVAL)?;
-
-    //     if result.len() >= MAX_PATHLEN {
-    //         return Err(SystemError::ENAMETOOLONG);
-    //     }
-    //     Ok(result.trim())
-    // }
+    Ok(result)
+    }
+    
 }
 
 #[repr(C)]

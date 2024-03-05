@@ -329,9 +329,9 @@ pub struct TextuiCharChromatic {
 
 #[derive(Debug)]
 pub struct TextuiBuf<'a> {
-    buf: Option<&'a mut [u32]>,
+    buf: Option<&'a mut [u8]>,
 
-    guard: Option<SpinLockGuard<'a, Box<[u32]>>>,
+    guard: Option<SpinLockGuard<'a, Box<[u8]>>>,
 
     bit_depth:u32,
 }
@@ -344,7 +344,7 @@ impl TextuiBuf<'_> {
             ScmBuffer::DeviceBuffer(vaddr) => {
                 return TextuiBuf {
                     buf: Some(unsafe {
-                        core::slice::from_raw_parts_mut(vaddr.data() as *mut u32, len)
+                        core::slice::from_raw_parts_mut(vaddr.data() as *mut u8, len)
                     }),
                     guard: None,
                     bit_depth:depth,
@@ -352,7 +352,7 @@ impl TextuiBuf<'_> {
             }
 
             ScmBuffer::DoubleBuffer(double_buffer) => {
-                let guard: SpinLockGuard<'_, Box<[u32]>> = double_buffer.lock();
+                let guard: SpinLockGuard<'_, Box<[u8]>> = double_buffer.lock();
 
                 return TextuiBuf {
                     buf: None,
@@ -363,7 +363,7 @@ impl TextuiBuf<'_> {
         }
     }
 
-    pub fn buf_mut(&mut self) -> &mut [u32] {
+    pub fn buf_mut(&mut self) -> &mut [u8] {
         if let Some(buf) = &mut self.buf {
             return buf;
         } else {
@@ -371,15 +371,26 @@ impl TextuiBuf<'_> {
         }
     }
     pub fn put_color_in_pixel(&mut self, color: u32, index: usize) {
+        let index=index as isize;
         match self.bit_depth{
             32=>{
-                let buf: &mut [u32] = self.buf_mut();
-                buf[index] = color;
+                let buf= self.buf_mut().as_mut_ptr() as *mut u32;
+                unsafe{*buf.offset(index) = color;}
             },
             24=>{
+                // let index=index as isize;
                 let buf =self.buf_mut().as_mut_ptr() as *mut u8;
-                unsafe{copy_nonoverlapping(&color as *const u32 as *const u8, buf, 3)};
+                unsafe{copy_nonoverlapping(&color as *const u32 as *const u8, buf.offset(index*3), 3)};
             },
+            16=>{
+                // let index=index as isize;
+                let buf=self.buf_mut().as_mut_ptr() as *mut u8;
+                let gap:u16=0x0000;
+                unsafe{
+                    copy_nonoverlapping(&color as *const u32 as *const u8, buf.offset(index*2), 2);
+                };
+            
+            }
             _=>{
                 panic!("不支持的位深度！")
             }

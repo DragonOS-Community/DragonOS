@@ -5,7 +5,7 @@
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "/home/dk/Desktop/DragonOS/user/apps/test-mount"
+        "path": "apps/test-mount"
       }
     }
   },

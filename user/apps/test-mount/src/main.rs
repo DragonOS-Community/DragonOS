@@ -7,7 +7,6 @@ fn main() {
     let fstype = b"ramfs".as_ptr() as *const c_char;
     let flags = MS_BIND;
     let data = std::ptr::null() as *const c_void;
-
     let result = unsafe { mount(source, target, fstype, flags, data) };
 
     if result == 0 {

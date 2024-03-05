@@ -1,11 +1,12 @@
 {
-  "name": "test_signal",
+  "name": "test_kvm",
   "version": "0.1.0",
-  "description": "一个用来测试signal能够正常运行的app",
+  "description": "测试kvm的程序",
+  "rust_target": null,
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "apps/test_signal"
+        "path": "apps/test_kvm"
       }
     }
   },

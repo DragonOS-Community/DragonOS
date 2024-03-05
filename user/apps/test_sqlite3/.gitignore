@@ -1,2 +1,3 @@
 sqlite*.zip
 sqlite-*/
+test_sqlite3

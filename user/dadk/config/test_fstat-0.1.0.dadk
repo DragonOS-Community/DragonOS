@@ -9,25 +9,14 @@
       }
     }
   },
-  "depends": [
-    {
-      "name": "relibc",
-      "version": "0.1.0"
-    }
-  ],
+  "depends": [],
   "build": {
-    "build_command": "make"
+    "build_command": "make install"
   },
   "install": {
     "in_dragonos_path": "/bin"
   },
   "clean": {
     "clean_command": "make clean"
-  },
-  "envs": [
-    {
-      "key": "__dragonos__",
-      "value": "__dragonos__"
-    }
-  ]
+  }
 }

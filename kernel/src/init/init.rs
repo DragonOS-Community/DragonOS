@@ -18,7 +18,7 @@ use crate::{
     mm::init::mm_init,
     process::{kthread::kthread_init, process_init, ProcessManager},
     sched::{core::sched_init, SchedArch},
-    smp::SMPArch,
+    smp::{early_smp_init, SMPArch},
     syscall::Syscall,
     time::{
         clocksource::clocksource_boot_finish, timekeeping::timekeeping_init, timer::timer_init,
@@ -47,12 +47,20 @@ fn do_start_kernel() {
 
     early_setup_arch().expect("setup_arch failed");
     unsafe { mm_init() };
+
     scm_reinit().unwrap();
     textui_init().unwrap();
     init_intertrait();
+
     vfs_init().expect("vfs init failed");
     driver_init().expect("driver init failed");
-    unsafe { acpi_init() };
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        acpi_init()
+    };
+
+    early_smp_init().expect("early smp init failed");
     irq_init().expect("irq init failed");
     CurrentSMPArch::prepare_cpus().expect("prepare_cpus failed");
 

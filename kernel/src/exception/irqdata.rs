@@ -288,11 +288,15 @@ impl IrqCommonData {
     pub fn set_affinity(&self, affinity: CpuMask) {
         self.inner.lock_irqsave().affinity = affinity;
     }
+
+    pub fn inner(&self) -> SpinLockGuard<InnerIrqCommonData> {
+        self.inner.lock_irqsave()
+    }
 }
 
 #[allow(dead_code)]
 #[derive(Debug)]
-struct InnerIrqCommonData {
+pub struct InnerIrqCommonData {
     /// status information for irq chip functions.
     state: IrqStatus,
     /// per-IRQ data for the irq_chip methods
@@ -308,6 +312,16 @@ impl InnerIrqCommonData {
 
     pub fn irqd_clear(&mut self, status: IrqStatus) {
         self.state.remove(status);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_handler_data(&mut self, handler_data: Option<Arc<dyn IrqHandlerData>>) {
+        self.handler_data = handler_data;
+    }
+
+    #[allow(dead_code)]
+    pub fn handler_data(&self) -> Option<Arc<dyn IrqHandlerData>> {
+        self.handler_data.clone()
     }
 }
 
@@ -399,6 +413,11 @@ impl IrqLineStatus {
             return None;
         }
         return Some(self.contains(Self::IRQ_TYPE_LEVEL_HIGH));
+    }
+
+    #[allow(dead_code)]
+    pub fn is_per_cpu_devid(&self) -> bool {
+        self.contains(Self::IRQ_PER_CPU_DEVID)
     }
 }
 bitflags! {

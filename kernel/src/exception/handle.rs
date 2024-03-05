@@ -6,8 +6,9 @@ use system_error::SystemError;
 use crate::{
     arch::{interrupt::TrapFrame, CurrentIrqArch},
     exception::irqdesc::InnerIrqDesc,
-    libs::spinlock::SpinLockGuard,
+    libs::{once::Once, spinlock::SpinLockGuard},
     process::{ProcessFlags, ProcessManager},
+    smp::core::smp_get_processor_id,
 };
 
 use super::{
@@ -148,7 +149,7 @@ fn irq_may_run(desc_inner_guard: &SpinLockGuard<'_, InnerIrqDesc>) -> bool {
     return false;
 }
 
-fn mask_ack_irq(irq_data: &Arc<IrqData>) {
+pub(super) fn mask_ack_irq(irq_data: &Arc<IrqData>) {
     let chip = irq_data.chip_info_read_irqsave().chip();
     if chip.can_mask_ack() {
         chip.irq_mask_ack(&irq_data);
@@ -241,4 +242,72 @@ fn warn_no_thread(irq: IrqNumber, action_inner: &mut SpinLockGuard<'_, InnerIrqA
         irq.data(),
         action_inner.name()
     );
+}
+
+/// `handle_percpu_devid_irq` - 带有per-CPU设备id的perCPU本地中断处理程序
+///
+///
+/// * `desc`: 此中断的中断描述结构
+///
+/// 在没有锁定要求的SMP机器上的每个CPU中断。与linux的`handle_percpu_irq()`相同，但有以下额外内容：
+///
+/// `action->percpu_dev_id`是一个指向per-cpu变量的指针，这些变量
+/// 包含调用此处理程序的cpu的真实设备id
+#[derive(Debug)]
+pub struct PerCpuDevIdIrqHandler;
+
+impl IrqFlowHandler for PerCpuDevIdIrqHandler {
+    fn handle(&self, irq_desc: &Arc<IrqDesc>, _trap_frame: &mut TrapFrame) {
+        let desc_inner_guard = irq_desc.inner();
+        let irq_data = desc_inner_guard.irq_data().clone();
+        let chip = irq_data.chip_info_read().chip();
+
+        chip.irq_ack(&irq_data);
+
+        let irq = irq_data.irq();
+
+        let action = desc_inner_guard.actions().first().cloned();
+
+        drop(desc_inner_guard);
+
+        if let Some(action) = action {
+            let action_inner = action.inner();
+            let per_cpu_devid = action_inner.per_cpu_dev_id().cloned();
+
+            let handler = action_inner.handler().unwrap();
+            drop(action_inner);
+
+            let _r = handler.handle(
+                irq,
+                None,
+                per_cpu_devid.map(|d| d as Arc<dyn IrqHandlerData>),
+            );
+        } else {
+            let cpu = smp_get_processor_id();
+
+            let enabled = irq_desc
+                .inner()
+                .percpu_enabled()
+                .as_ref()
+                .unwrap()
+                .get(cpu)
+                .unwrap_or(false);
+
+            if enabled {
+                irq_manager().irq_percpu_disable(irq_desc, &irq_data, &chip, cpu);
+            }
+            static ONCE: Once = Once::new();
+
+            ONCE.call_once(|| {
+                kerror!(
+                    "Spurious percpu irq {} on cpu {:?}, enabled: {}",
+                    irq.data(),
+                    cpu,
+                    enabled
+                );
+            });
+        }
+
+        chip.irq_eoi(&irq_data);
+    }
 }

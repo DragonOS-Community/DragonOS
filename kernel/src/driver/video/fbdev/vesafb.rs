@@ -419,7 +419,6 @@ impl FrameBufferOps for VesaFb {
     }
 
     fn fb_copyarea(&self, data: super::base::CopyAreaData) -> Result<(), SystemError> {
-        // panic!("123456");
         let bp = boot_params().read();
         let base = bp.screen_info.lfb_virt_base.ok_or(SystemError::ENODEV)?;
         let var = self.current_fb_var();

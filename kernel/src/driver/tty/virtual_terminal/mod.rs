@@ -160,7 +160,6 @@ impl TtyOperation for TtyConsoleDriverInner {
     fn write(&self, tty: &TtyCoreData, buf: &[u8], mut nr: usize) -> Result<usize, SystemError> {
         // 关闭中断
         let mut vc_data = tty.vc_data_irqsave();
-
         let mut offset = 0;
 
         // 这个参数是用来扫描unicode字符的，但是这部分目前未完成，先写着

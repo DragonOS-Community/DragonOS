@@ -5,7 +5,10 @@ use core::{
 };
 
 use alloc::{
-    borrow::ToOwned, string::{String, ToString}, sync::Arc, vec::Vec
+    borrow::ToOwned,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
 };
 use system_error::SystemError;
 
@@ -1018,11 +1021,11 @@ impl Syscall {
     /// #mount
     /// ## 介绍:
     /// 用于挂载文件系统,目前仅支持ramfs挂载
-    /// ## 参数: 
+    /// ## 参数:
     /// @param source 挂载目标的文件夹名
     /// @param target 挂载目录的父目录
     /// @param filesystemtype 文件系统
-    /// 
+    ///
     pub fn mount(
         source: *const c_char,
         target: *const c_char,
@@ -1031,35 +1034,44 @@ impl Syscall {
         data: *const c_void,
     ) -> Result<usize, SystemError> {
         let source = Self::read_from_cstr(source).unwrap();
-        
+
         let target = Self::read_from_cstr(target).unwrap();
-        
+
         let filesystemtype = Self::read_from_cstr(filesystemtype).unwrap();
 
-        kdebug!("input fs is {}",filesystemtype);
+        kdebug!("input fs is {}", filesystemtype);
 
-        Self::mkdir((target.clone()+&source).as_str(), FileMode::O_PATH_FLAGS.bits().try_into().unwrap());
-        // (FileMode::O_WRONLY|FileMode::O_RDWR|FileMode::O_ACCMODE|FileMode::O_CREAT|FileMode::O_EXCL|FileMode::O_NOCTTY).bits().try_into().unwrap()
+        Self::mkdir(
+            (target.clone() + &source).as_str(),
+            FileMode::O_PATH_FLAGS.bits().try_into().unwrap(),
+        );
+
         // bug: when using match , cannot return the right filesystem
-        let _filesystemtype= RamFS::new();
+        // let _filesystemtype= RamFS::new();
+        let _filesystemtype = match filesystemtype.as_str() {
+            "ramfs" => Ok(RamFS::new()),
+            _ => Err(SystemError::EUNSUPFS),
+        };
 
-        return Vcore::do_mount(_filesystemtype, (target.clone()+&source).as_str());
+        return Vcore::do_mount(
+            _filesystemtype.unwrap(),
+            (target.clone() + &source).as_str(),
+        );
     }
 
     pub fn read_from_cstr(source: *const c_char) -> Result<String, SystemError> {
-    // Create a CString from the raw pointer
-    let cstr = unsafe { CStr::from_ptr(source) };
+        // Create a CString from the raw pointer
+        let cstr = unsafe { CStr::from_ptr(source) };
 
-    // Convert the CString to a Rust String
-    let result = cstr.to_string_lossy().into_owned();
+        // Convert the CString to a Rust String
+        let result = cstr.to_string_lossy().into_owned();
 
-    if result.len() >= MAX_PATHLEN {
-        return Err(SystemError::ENAMETOOLONG);
+        if result.len() >= MAX_PATHLEN {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+
+        Ok(result)
     }
-
-    Ok(result)
-    }
-    
 }
 
 #[repr(C)]

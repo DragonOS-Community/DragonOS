@@ -3,8 +3,9 @@ use core::sync::atomic::AtomicU32;
 use alloc::vec::Vec;
 
 use crate::{
-    include::bindings::bindings::smp_get_total_cpu, libs::lazy_init::Lazy,
-    smp::core::smp_get_processor_id,
+    include::bindings::bindings::smp_get_total_cpu,
+    libs::lazy_init::Lazy,
+    smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 
 /// 系统中的CPU数量
@@ -81,6 +82,14 @@ impl<T> PerCpuVar<T> {
 
     pub fn get_mut(&mut self) -> &mut T {
         let cpu_id = smp_get_processor_id();
+        &mut self.inner[cpu_id.data() as usize]
+    }
+
+    pub unsafe fn force_get(&self, cpu_id: ProcessorId) -> &T {
+        &self.inner[cpu_id.data() as usize]
+    }
+
+    pub unsafe fn force_get_mut(&mut self, cpu_id: ProcessorId) -> &mut T {
         &mut self.inner[cpu_id.data() as usize]
     }
 }

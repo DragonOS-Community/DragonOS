@@ -3,26 +3,33 @@ use system_error::SystemError;
 
 use crate::{
     arch::{driver::sbi::SbiDriver, mm::init::mm_early_init},
-    driver::{firmware::efi::init::efi_init, open_firmware::fdt::open_firmware_fdt_driver},
+    driver::{
+        firmware::efi::init::efi_init, irqchip::riscv_intc::riscv_intc_init,
+        open_firmware::fdt::open_firmware_fdt_driver,
+    },
     init::{boot_params, init::start_kernel},
     kdebug, kinfo,
     mm::{memblock::mem_block_manager, PhysAddr, VirtAddr},
     print, println,
+    smp::cpu::ProcessorId,
 };
 
-use super::driver::sbi::console_putstr;
+use super::{cpu::init_local_context, driver::sbi::console_putstr};
 
 #[derive(Debug)]
 pub struct ArchBootParams {
     /// 启动时的fdt物理地址
     pub fdt_paddr: PhysAddr,
     pub fdt_vaddr: Option<VirtAddr>,
+
+    pub boot_hartid: ProcessorId,
 }
 
 impl ArchBootParams {
     pub const DEFAULT: Self = ArchBootParams {
         fdt_paddr: PhysAddr::new(0),
         fdt_vaddr: None,
+        boot_hartid: ProcessorId::new(0),
     };
 
     pub fn arch_fdt(&self) -> VirtAddr {
@@ -34,7 +41,7 @@ impl ArchBootParams {
     }
 }
 
-static mut BOOT_HARTID: usize = 0;
+static mut BOOT_HARTID: u32 = 0;
 static mut BOOT_FDT_PADDR: PhysAddr = PhysAddr::new(0);
 
 #[no_mangle]
@@ -42,7 +49,7 @@ unsafe extern "C" fn kernel_main(hartid: usize, fdt_paddr: usize) -> ! {
     let fdt_paddr = PhysAddr::new(fdt_paddr);
 
     unsafe {
-        BOOT_HARTID = hartid;
+        BOOT_HARTID = hartid as u32;
         BOOT_FDT_PADDR = fdt_paddr;
     }
 
@@ -79,9 +86,14 @@ unsafe fn parse_dtb() {
 #[inline(never)]
 pub fn early_setup_arch() -> Result<(), SystemError> {
     SbiDriver::early_init();
-    let hartid: usize = unsafe { BOOT_HARTID };
+    let hartid = unsafe { BOOT_HARTID };
     let fdt_paddr = unsafe { BOOT_FDT_PADDR };
-    boot_params().write().arch.fdt_paddr = fdt_paddr;
+
+    let mut arch_boot_params_guard = boot_params().write();
+    arch_boot_params_guard.arch.fdt_paddr = fdt_paddr;
+    arch_boot_params_guard.arch.boot_hartid = ProcessorId::new(hartid);
+
+    drop(arch_boot_params_guard);
 
     kinfo!(
         "DragonOS kernel is running on hart {}, fdt address:{:?}",
@@ -109,7 +121,7 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
 
 #[inline(never)]
 pub fn setup_arch() -> Result<(), SystemError> {
-    // todo
+    init_local_context();
     return Ok(());
 }
 

@@ -21,17 +21,21 @@ use crate::{
     },
     filesystem::kernfs::KernFSInode,
     libs::{
+        cpumask::CpuMask,
         mutex::{Mutex, MutexGuard},
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
+    mm::percpu::PerCpuVar,
     process::ProcessControlBlock,
     sched::completion::Completion,
+    smp::cpu::smp_cpu_manager,
 };
 
 use super::{
     dummychip::no_irq_chip,
     handle::bad_irq_handler,
+    irqchip::IrqChip,
     irqdata::{IrqCommonData, IrqData, IrqHandlerData, IrqLineStatus, IrqStatus},
     sysfs::{irq_sysfs_del, IrqKObjType},
     HardwareIrqNumber, InterruptArch, IrqNumber,
@@ -95,6 +99,8 @@ impl IrqDesc {
 
         let irq_desc = IrqDesc {
             inner: SpinLock::new(InnerIrqDesc {
+                percpu_affinity: None,
+                percpu_enabled: None,
                 common_data,
                 irq_data,
                 desc_internal_state: IrqDescState::empty(),
@@ -142,6 +148,24 @@ impl IrqDesc {
         let mut guard = self.handler.write_irqsave();
         *guard = Some(handler);
         self.chip_bus_sync_unlock();
+    }
+
+    /// 设置中断处理程序（不对desc->inner）
+    ///
+    ///
+    /// ## Safety
+    ///
+    /// 需要保证irq_data和chip是当前irqdesc的
+    pub fn set_handler_no_lock_inner(
+        &self,
+        handler: &'static dyn IrqFlowHandler,
+        irq_data: &Arc<IrqData>,
+        chip: &Arc<dyn IrqChip>,
+    ) {
+        chip.irq_bus_lock(irq_data).ok();
+        let mut guard = self.handler.write_irqsave();
+        *guard = Some(handler);
+        chip.irq_bus_sync_unlock(irq_data).ok();
     }
 
     pub fn handler(&self) -> Option<&'static dyn IrqFlowHandler> {
@@ -248,6 +272,17 @@ impl IrqDesc {
             .ok();
     }
 
+    pub fn set_percpu_devid_flags(&self) {
+        self.modify_status(
+            IrqLineStatus::empty(),
+            IrqLineStatus::IRQ_NOAUTOEN
+                | IrqLineStatus::IRQ_PER_CPU
+                | IrqLineStatus::IRQ_NOTHREAD
+                | IrqLineStatus::IRQ_NOPROBE
+                | IrqLineStatus::IRQ_PER_CPU_DEVID,
+        );
+    }
+
     pub fn modify_status(&self, clear: IrqLineStatus, set: IrqLineStatus) {
         let mut desc_guard = self.inner();
         desc_guard.line_status.remove(clear);
@@ -323,12 +358,21 @@ pub struct InnerIrqDesc {
     kern_inode: Option<Arc<KernFSInode>>,
     kset: Option<Arc<KSet>>,
     parent_kobj: Option<Weak<dyn KObject>>,
+    /// per-cpu enabled mask
+    percpu_enabled: Option<CpuMask>,
+    /// per-cpu affinity
+    percpu_affinity: Option<CpuMask>,
     // wait_for_threads: EventWaitQueue
 }
 
 impl InnerIrqDesc {
     pub fn name(&self) -> Option<&String> {
         self.name.as_ref()
+    }
+
+    #[allow(dead_code)]
+    pub fn set_name(&mut self, name: Option<String>) {
+        self.name = name;
     }
 
     pub fn can_request(&self) -> bool {
@@ -343,6 +387,24 @@ impl InnerIrqDesc {
     #[allow(dead_code)]
     pub fn clear_norequest(&mut self) {
         self.line_status.remove(IrqLineStatus::IRQ_NOREQUEST);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_noprobe(&mut self) {
+        self.line_status.insert(IrqLineStatus::IRQ_NOPROBE);
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_noprobe(&mut self) {
+        self.line_status.remove(IrqLineStatus::IRQ_NOPROBE);
+    }
+
+    pub fn set_nothread(&mut self) {
+        self.line_status.insert(IrqLineStatus::IRQ_NOTHREAD);
+    }
+
+    pub fn clear_nothread(&mut self) {
+        self.line_status.remove(IrqLineStatus::IRQ_NOTHREAD);
     }
 
     pub fn nested_thread(&self) -> bool {
@@ -404,6 +466,14 @@ impl InnerIrqDesc {
         self.actions.push(action);
     }
 
+    pub fn clear_actions(&mut self) {
+        self.actions.clear();
+    }
+
+    pub fn remove_action(&mut self, action: &Arc<IrqAction>) {
+        self.actions.retain(|a| !Arc::ptr_eq(a, action));
+    }
+
     pub fn internal_state(&self) -> &IrqDescState {
         &self.desc_internal_state
     }
@@ -444,6 +514,22 @@ impl InnerIrqDesc {
 
     pub fn set_level(&mut self) {
         self.line_status.insert(IrqLineStatus::IRQ_LEVEL);
+    }
+
+    pub fn percpu_enabled(&self) -> &Option<CpuMask> {
+        &self.percpu_enabled
+    }
+
+    pub fn percpu_enabled_mut(&mut self) -> &mut Option<CpuMask> {
+        &mut self.percpu_enabled
+    }
+
+    pub fn percpu_affinity(&self) -> &Option<CpuMask> {
+        &self.percpu_affinity
+    }
+
+    pub fn percpu_affinity_mut(&mut self) -> &mut Option<CpuMask> {
+        &mut self.percpu_affinity
     }
 }
 
@@ -548,6 +634,7 @@ impl IrqAction {
         let action: IrqAction = IrqAction {
             inner: SpinLock::new(InnerIrqAction {
                 dev_id: None,
+                per_cpu_dev_id: None,
                 handler,
                 thread_fn,
                 thread: None,
@@ -577,6 +664,8 @@ impl IrqAction {
 pub struct InnerIrqAction {
     /// cookie to identify the device
     dev_id: Option<Arc<DeviceId>>,
+    /// cookie to identify the device (per cpu)
+    per_cpu_dev_id: Option<PerCpuVar<Arc<DeviceId>>>,
     /// 中断处理程序
     handler: Option<&'static dyn IrqHandler>,
     /// interrupt handler function for threaded interrupts
@@ -601,6 +690,15 @@ impl InnerIrqAction {
 
     pub fn dev_id_mut(&mut self) -> &mut Option<Arc<DeviceId>> {
         &mut self.dev_id
+    }
+
+    pub fn per_cpu_dev_id(&self) -> Option<&Arc<DeviceId>> {
+        self.per_cpu_dev_id.as_ref().map(|v| v.get())
+    }
+
+    #[allow(dead_code)]
+    pub fn per_cpu_dev_id_mut(&mut self) -> Option<&mut Arc<DeviceId>> {
+        self.per_cpu_dev_id.as_mut().map(|v| v.get_mut())
     }
 
     pub fn handler(&self) -> Option<&'static dyn IrqHandler> {
@@ -798,6 +896,42 @@ impl IrqDescManager {
         self.irq_descs.get(&irq).map(|desc| desc.clone())
     }
 
+    /// 查找中断描述符并锁定总线(没有对irqdesc进行加锁)
+    #[allow(dead_code)]
+    pub fn lookup_and_lock_bus(
+        &self,
+        irq: IrqNumber,
+        check_global: bool,
+        check_percpu: bool,
+    ) -> Option<Arc<IrqDesc>> {
+        self.do_lookup_and_lock(irq, true, check_global, check_percpu)
+    }
+
+    fn do_lookup_and_lock(
+        &self,
+        irq: IrqNumber,
+        lock_bus: bool,
+        check_global: bool,
+        check_percpu: bool,
+    ) -> Option<Arc<IrqDesc>> {
+        let desc = self.lookup(irq)?;
+        if check_global || check_percpu {
+            if check_percpu && !desc.inner().line_status().is_per_cpu_devid() {
+                return None;
+            }
+
+            if check_global && desc.inner().line_status().is_per_cpu_devid() {
+                return None;
+            }
+        }
+
+        if lock_bus {
+            desc.chip_bus_lock();
+        }
+
+        return Some(desc);
+    }
+
     fn insert(&mut self, irq: IrqNumber, desc: Arc<IrqDesc>) {
         self.irq_descs.insert(irq, desc);
     }
@@ -814,5 +948,42 @@ impl IrqDescManager {
     /// 迭代中断描述符
     pub fn iter_descs(&self) -> btree_map::Iter<'_, IrqNumber, Arc<IrqDesc>> {
         self.irq_descs.iter()
+    }
+
+    /// 设置指定irq的可用cpu为所有cpu
+    pub fn set_percpu_devid_all(&self, irq: IrqNumber) -> Result<(), SystemError> {
+        self.set_percpu_devid(irq, None)
+    }
+
+    /// 设置指定irq的可用cpu
+    ///
+    /// 如果affinity为None，则表示设置为所有cpu
+    pub fn set_percpu_devid(
+        &self,
+        irq: IrqNumber,
+        affinity: Option<&CpuMask>,
+    ) -> Result<(), SystemError> {
+        let desc = self.lookup(irq).ok_or(SystemError::EINVAL)?;
+        let mut desc_inner = desc.inner();
+
+        if desc_inner.percpu_enabled().is_some() {
+            return Err(SystemError::EINVAL);
+        }
+
+        *desc_inner.percpu_enabled_mut() = Some(CpuMask::new());
+
+        if let Some(affinity) = affinity {
+            desc_inner.percpu_affinity_mut().replace(affinity.clone());
+        } else {
+            desc_inner
+                .percpu_affinity_mut()
+                .replace(smp_cpu_manager().possible_cpus().clone());
+        }
+
+        drop(desc_inner);
+
+        desc.set_percpu_devid_flags();
+
+        return Ok(());
     }
 }

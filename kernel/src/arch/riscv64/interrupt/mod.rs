@@ -1,6 +1,9 @@
 use system_error::SystemError;
 
-use crate::exception::{InterruptArch, IrqFlags, IrqFlagsGuard, IrqNumber};
+use crate::{
+    driver::irqchip::riscv_intc::riscv_intc_init,
+    exception::{InterruptArch, IrqFlags, IrqFlagsGuard, IrqNumber},
+};
 
 pub mod ipi;
 
@@ -8,7 +11,9 @@ pub struct RiscV64InterruptArch;
 
 impl InterruptArch for RiscV64InterruptArch {
     unsafe fn arch_irq_init() -> Result<(), SystemError> {
-        todo!("RiscV64InterruptArch::arch_irq_init")
+        riscv_intc_init()?;
+
+        Ok(())
     }
     unsafe fn interrupt_enable() {
         riscv::interrupt::enable();

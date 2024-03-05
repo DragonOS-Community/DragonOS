@@ -138,7 +138,7 @@ impl FATInode {
                 }
                 // 在缓存区找不到
                 // 在磁盘查找
-                kdebug!("{:?}",name);
+                kdebug!("{:?}", name);
                 let fat_entry: FATDirEntry =
                     d.find_entry(name, None, None, self.fs.upgrade().unwrap())?;
                 kdebug!("find entry from disk ok, entry={fat_entry:?}");

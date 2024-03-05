@@ -288,7 +288,7 @@ pub enum SystemError {
     /// 没有对应的ioctlcmd
     ENOIOCTLCMD = 520,
     /// unsupported file system
-    EUNSUPFS =521,
+    EUNSUPFS = 521,
 }
 
 impl SystemError {

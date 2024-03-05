@@ -2,8 +2,6 @@
 #include <common/errno.h>
 #include <common/fcntl.h>
 #include <common/string.h>
-#include <exception/irq.h>
-#include <filesystem/vfs/VFS.h>
 #include <mm/slab.h>
 #include <process/process.h>
 #include <time/sleep.h>

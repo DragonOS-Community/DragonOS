@@ -1,0 +1,8 @@
+[Unit]
+Description=Shell
+
+[Service]
+Type=simple
+ExecStart=/bin/NovaShell
+Restart=always
+ExecStartPre=-/bin/about.elf

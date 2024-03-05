@@ -15,14 +15,15 @@ use super::NetDriver;
 use crate::{
     driver::{
         base::{
-            device::{bus::Bus, driver::Driver, Device, IdTable},
+            device::{bus::Bus, driver::Driver, Device, DeviceId, IdTable},
             kobject::{KObjType, KObject, KObjectState},
         },
-        virtio::virtio_impl::HalImpl,
+        virtio::{irq::virtio_irq_manager, virtio_impl::HalImpl, VirtIODevice},
     },
+    exception::{irqdesc::IrqReturn, IrqNumber},
     kerror, kinfo,
     libs::spinlock::SpinLock,
-    net::{generate_iface_id, NET_DRIVERS},
+    net::{generate_iface_id, net_core::poll_ifaces_try_lock_onetime, NET_DRIVERS},
     time::Instant,
 };
 use system_error::SystemError;
@@ -40,7 +41,8 @@ impl<T: Transport> Clone for VirtioNICDriver<T> {
     }
 }
 
-/// @brief 网卡驱动的包裹器，这是为了获取网卡驱动的可变引用而设计的。
+/// 网卡驱动的包裹器，这是为了获取网卡驱动的可变引用而设计的。
+///
 /// 由于smoltcp的设计，导致需要在poll的时候获取网卡驱动的可变引用，
 /// 同时需要在token的consume里面获取可变引用。为了避免双重加锁，所以需要这个包裹器。
 struct VirtioNICDriverWrapper<T: Transport>(UnsafeCell<VirtioNICDriver<T>>);
@@ -76,6 +78,7 @@ pub struct VirtioInterface<T: Transport> {
     iface_id: usize,
     iface: SpinLock<smoltcp::iface::Interface>,
     name: String,
+    dev_id: Arc<DeviceId>,
 }
 
 impl<T: Transport> Debug for VirtioInterface<T> {
@@ -90,7 +93,7 @@ impl<T: Transport> Debug for VirtioInterface<T> {
 }
 
 impl<T: Transport> VirtioInterface<T> {
-    pub fn new(mut driver: VirtioNICDriver<T>) -> Arc<Self> {
+    pub fn new(mut driver: VirtioNICDriver<T>, dev_id: Arc<DeviceId>) -> Arc<Self> {
         let iface_id = generate_iface_id();
         let mut iface_config = smoltcp::iface::Config::new();
 
@@ -109,9 +112,28 @@ impl<T: Transport> VirtioInterface<T> {
             iface_id,
             iface: SpinLock::new(iface),
             name: format!("eth{}", iface_id),
+            dev_id,
         });
 
         return result;
+    }
+}
+
+impl<T: Transport + 'static> VirtIODevice for VirtioInterface<T> {
+    fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
+        poll_ifaces_try_lock_onetime().ok();
+        return Ok(IrqReturn::Handled);
+    }
+
+    fn dev_id(&self) -> &Arc<DeviceId> {
+        return &self.dev_id;
+    }
+}
+
+impl<T: Transport> Drop for VirtioInterface<T> {
+    fn drop(&mut self) {
+        // 从全局的网卡接口信息表中删除这个网卡的接口信息
+        NET_DRIVERS.write_irqsave().remove(&self.iface_id);
     }
 }
 
@@ -223,7 +245,7 @@ impl<T: Transport> phy::RxToken for VirtioNetToken<T> {
 }
 
 /// @brief virtio-net 驱动的初始化与测试
-pub fn virtio_net<T: Transport + 'static>(transport: T) {
+pub fn virtio_net<T: Transport + 'static>(transport: T, dev_id: Arc<DeviceId>) {
     let driver_net: VirtIONet<HalImpl, T, 2> =
         match VirtIONet::<HalImpl, T, 2>::new(transport, 4096) {
             Ok(net) => net,
@@ -234,12 +256,16 @@ pub fn virtio_net<T: Transport + 'static>(transport: T) {
         };
     let mac = smoltcp::wire::EthernetAddress::from_bytes(&driver_net.mac_address());
     let driver: VirtioNICDriver<T> = VirtioNICDriver::new(driver_net);
-    let iface = VirtioInterface::new(driver);
+    let iface = VirtioInterface::new(driver, dev_id);
     let name = iface.name.clone();
     // 将网卡的接口信息注册到全局的网卡接口信息表中
     NET_DRIVERS
         .write_irqsave()
         .insert(iface.nic_id(), iface.clone());
+
+    virtio_irq_manager()
+        .register_device(iface.clone())
+        .expect("Register virtio net failed");
     kinfo!(
         "Virtio-net driver init successfully!\tNetDevID: [{}], MAC: [{}]",
         name,

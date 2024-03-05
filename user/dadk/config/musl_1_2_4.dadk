@@ -1,0 +1,24 @@
+{
+  "name": "musl",
+  "version": "1.2.4",
+  "description": "musl libc",
+  "rust_target": null,
+  "task_type": {
+    "BuildFromSource": {
+      "Archive": {
+        "url": "https://mirrors.dragonos.org.cn/pub/third_party/musl/musl-1.2.4.tar.gz"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "touch config.mak && DESTDIR=$DADK_CURRENT_BUILD_DIR make install -j $(nproc)"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "envs": []
+}

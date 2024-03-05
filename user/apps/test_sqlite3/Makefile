@@ -1,34 +1,23 @@
-CC=$(DragonOS_GCC)/x86_64-elf-gcc
-LD=ld
-OBJCOPY=objcopy
+ifeq ($(ARCH), x86_64)
+	CROSS_COMPILE=x86_64-linux-musl-
+else ifeq ($(ARCH), riscv64)
+	CROSS_COMPILE=riscv64-linux-musl-
+endif
+
 SQLITE_FILENAME=sqlite-amalgamation-3420000
 SQLITE3_DIR=$(shell pwd)/$(SQLITE_FILENAME)
+CC=$(CROSS_COMPILE)gcc
 
-RELIBC_OPT=$(DADK_BUILD_CACHE_DIR_RELIBC_0_1_0)
-CFLAGS=-I $(RELIBC_OPT)/include -I $(SQLITE3_DIR) -D__dragonos__ -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_FLOATING_POINT -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_DEBUG
+.PHONY: all
+all: main.c $(SQLITE3_DIR)/sqlite3.c
+	$(CC) -I $(SQLITE3_DIR) -static -o test_sqlite3 main.c $(SQLITE3_DIR)/sqlite3.c
 
-tmp_output_dir=$(ROOT_PATH)/bin/tmp/user
-output_dir=$(DADK_BUILD_CACHE_DIR_TEST_SQLITE3_3_42_0)
+.PHONY: install clean download_sqlite3 __download_sqlite3
+install: all
+	mv test_sqlite3 $(DADK_CURRENT_BUILD_DIR)/test_sqlite3
 
-LIBC_OBJS:=$(shell find $(RELIBC_OPT)/lib -name "*.o" | sort )
-LIBC_OBJS+=$(RELIBC_OPT)/lib/libc.a
-
-.PHONY: all clean download_sqlite3 __download_sqlite3
-
-
-all: main.o sqlite3.o
-	mkdir -p $(tmp_output_dir)
-	
-	$(LD) -b elf64-x86-64 -z muldefs -o $(tmp_output_dir)/test_sqlite3  $(shell find . -name "*.o") $(LIBC_OBJS)
-
-	$(OBJCOPY) -I elf64-x86-64 -R ".eh_frame" -R ".comment" -O elf64-x86-64 $(tmp_output_dir)/test_sqlite3 $(output_dir)/test_sqlite3.elf
-	mv $(output_dir)/test_sqlite3.elf $(output_dir)/test_sqlite3
-
-main.o: main.c
-	$(CC) $(CFLAGS) -c main.c  -o main.o
-
-sqlite3.o: $(SQLITE3_DIR)/sqlite3.c
-	$(CC) $(CFLAGS) -c $(SQLITE3_DIR)/sqlite3.c -o sqlite3.o
+clean:
+	rm test_sqlite3 *.o
 
 __download_sqlite3:
 	@echo "Download sqlite3 from https://mirrors.dragonos.org.cn/pub/third_party/sqlite/$(SQLITE_FILENAME).zip"
@@ -40,5 +29,4 @@ download_sqlite3:
 # 如果文件夹不存在，则下载，否则不下载
 	@test -d $(SQLITE3_DIR) || $(MAKE) __download_sqlite3
 
-clean:
-	rm -f *.o
+fmt:

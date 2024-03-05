@@ -1,82 +1,133 @@
-
-use core::hash::{Hash,Hasher,SipHasher};
-
-use alloc::{collections::{linked_list::Cursor, LinkedList}, sync::{Arc, Weak}};
+use alloc::{collections::{linked_list::CursorMut, LinkedList}, sync::{Arc, Weak}, vec::Vec};
+use system_error::SystemError;
+use core::{hash::{Hash, Hasher, SipHasher}, marker::PhantomData, mem::size_of, ptr::NonNull};
 
 use super::IndexNode;
 
-const DEFAULT_MAX_SIZE: u64 = 1024;
-
-#[derive(Debug)]
-pub struct DCache<'a, T: IndexNode + ?Sized> {
-    curr_size: usize,
-    arr: Vec<Cursor<'a, CacheLine<T>>>,
-    lru: LinkedList<CacheLine<T>>,
+pub trait Cacher<T, H: Hasher + Default> {
+    fn cache(&self) -> Arc<DefaultCache<T, H>>;
 }
 
-#[derive(Debug)]
-pub struct CacheLine<T: IndexNode + ?Sized> {
-    count: i64,
-    entry: Option<Weak<T>>,
+pub trait Cachable<'a> : IndexNode {
+    // name for hashing
+    fn key(&self) -> Result<String, SystemError>;
+    // value to store
+    fn path(&self) -> Result<String, SystemError>;
+    // fn value(&self) -> Weak<Self>;
+
+    // 
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    }
 }
 
-impl<'a, T: IndexNode + ?Sized> DCache<'a, T> {
-    // const INIT: Cursor<'a, CacheLine<T>> = CacheLine { count: 0, entry: None };
-    fn position(key: &str) -> u64 {
-        let mut hasher = SipHasher::new();
-        key.hash(&mut hasher);
-        hasher.finish() % DEFAULT_MAX_SIZE
-    }
+// CacheLine = Weak<T>
 
-    pub fn new(max_size: Option<usize>) -> DCache<'a, T> {
-        let mut ret = DCache {
-            curr_size: 0,
-            arr: Vec::new(),
-            lru: LinkedList::new(),
-        };
-        ret.arr.resize(
-            max_size.unwrap_or(DEFAULT_MAX_SIZE as usize), 
-            ret.lru.cursor_back()
-        );
-        
-        ret
-    }
+pub struct DefaultCache<'a, T: ?Sized, H: Hasher + Default = SipHasher> {
+    _hash_type: PhantomData<H>,
+    table: Vec<LinkedList<CursorMut<'a, Weak<T>>>>,
+    deque: LinkedList<Weak<T>>,
+    max_size: u64,
+}
 
-    pub fn put(&mut self, name: &str, entry: &Arc<T>) -> Option<Arc<T>> {
-        let position = Self::position(name);
-        let to_ret: Option<Arc<T>> = self
-            .arr[position as usize]
-            .entry
-            .take()?
-            .upgrade()
-            .or_else(||{self.curr_size+=1;None});
-        self.arr[position as usize].entry = Some(Arc::downgrade(&entry));
-        self.arr[position as usize].count = 1;
-        to_ret
-    }
 
-    pub fn get(&mut self, key: &str) -> Option<Arc<T>> {
-        if let Some(entry) = self
-            .arr[Self::position(key) as usize].entry.clone() {
-            if let Some(ex) = entry.upgrade() {
-                self.arr[Self::position(key) as usize].count += 1;
-                return Some(ex);
-            }
+impl<'a, 'b, T: Cachable<'b>, H: Hasher + Default> DefaultCache<'a, T, H> {
+    const DEFAULT_MEMORY_SIZE: u64 = 1024 /* K */ * 1024 /* Byte */;
+    ///@brief table size / 2 * (sizeof Cursor + sizeof listnode) = Memory Cost.
+    fn new(size: Option<u64>) -> DefaultCache<'a, T, H> {
+
+        let vec_size = size.unwrap_or(Self::DEFAULT_MEMORY_SIZE) / 
+            (size_of::<CursorMut<'a, T>>() + size_of::<Option<NonNull<T>>>()) as u64 * 2;
+        let capacity = vec_size / 2;
+        let mut tmp: Vec<LinkedList<CursorMut<'a, Weak<T>>>> = Vec::new();
+        // tmp.resize(vec_size as usize, LinkedList::new());
+        for _ in [0..vec_size] {
+            tmp.push(LinkedList::new());
         }
+
+        DefaultCache {
+            _hash_type: PhantomData::default(),
+            table: tmp,
+            deque: LinkedList::new(),
+            max_size: capacity,
+        }
+    }
+
+    // gain possision by spercific hasher
+    fn position(&self, key: &str) -> usize {
+        let mut state = H::default();
+        key.hash(&mut state);
+        (state.finish() / (self.max_size * 2)) as usize
+    }
+
+    // fn 
+
+    fn put(&'a mut self, line: &Arc<T>) -> Result<(), SystemError> {
+        // get coresponding table position
+        let position = self.position(line.key()?.as_str());
+
+        // extract origin
+        if let Some(mut cur) = self.table[position]
+            .extract_if(|cur| {
+                if let Some(wptr) = cur.as_cursor().current() {
+                    if let Some(entry) = wptr.upgrade() {
+                        if entry == *line { // fix
+                            return true;
+                        }
+                    }
+                }
+                false
+            })
+            .next()
+        {
+            cur.remove_current();
+        }
+
+        // push in deque
+        self.deque.push_back(Arc::downgrade(line));
+
+        // sign in table
+        let cur = self.deque.cursor_back_mut();
+
+        self.table[position].push_back(cur);
+        Ok(())
+    }
+
+    // fn check(&self, key: &str) -> Cursor<'a, Weak<T>> {
+    //     let position = self.possition(key);
+    //     self.table[position].contains()
+    // }
+
+    fn get(&self, key: &str) -> Option<Arc<T>> {
+        let position = self.position(key);
+        self.table[position]
+            .iter()
+            .filter(|cur| 
+                self._cur_unwrap(cur).is_some_and(|ent| 
+                    ent.key() == key))
+            
+
         None
     }
 
-    pub fn remove(&mut self, key: &str) {
-        self
-            .arr[Self::position(key) as usize]
-            .entry
-            .take();
+    // fn walk
+
+    fn _cur_unwrap(&self, mut cur: CursorMut<Weak<T>>) -> Option<Arc<T>> {
+        match cur.current() {
+            Some(wptr) => wptr.upgrade(),
+            None => None
+        }
     }
 
-    pub fn clear(&mut self) {
-        // overwrite the array to yeet everything
-        self.curr_size = 0;
-        self.arr = [Self::INIT; DEFAULT_MAX_SIZE as usize];
+    fn _get_helper(&mut self, key: &str) -> Option<usize> {
+        self.table[self.position(key)]
+            .iter()
+            .find(|cur| {
+                cur.as_cursor().current()
+                    .is_some_and(|wptr| {
+                        wptr.upgrade()
+                            .is_some_and(|entry|
+                                entry.key() == key)})})?
+            .index()
     }
-
 }

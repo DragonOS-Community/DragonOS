@@ -7,9 +7,9 @@ pub mod syscall;
 pub mod cache;
 mod utils;
 
-use ::core::{any::Any, fmt::Debug, ops::Index, result, sync::atomic::AtomicUsize};
+use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, sync::{Arc, Weak}, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
@@ -21,7 +21,7 @@ use crate::{
     time::TimeSpec,
 };
 
-use self::{cache::DCache, core::generate_inode_id, file::FileMode, syscall::ModeType};
+use self::{cache::DefaultCache, core::generate_inode_id, file::FileMode, syscall::ModeType};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
@@ -604,7 +604,7 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     fn as_any_ref(&self) -> &dyn Any;
 
     /// @brief 返回查询缓存
-    fn cache(&self) -> Option<DCache<dyn IndexNode>> {
+    fn cache(&self) -> Option<DefaultCache<dyn IndexNode>> {
         None
     }
 }

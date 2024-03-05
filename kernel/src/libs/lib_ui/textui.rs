@@ -17,10 +17,7 @@ use crate::{
 use alloc::{boxed::Box, collections::LinkedList, string::ToString};
 use alloc::{sync::Arc, vec::Vec};
 use core::{
-    fmt::Debug,
-    intrinsics::unlikely,
-    ops::{Add, AddAssign, Sub},
-    sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
+    fmt::Debug, intrinsics::unlikely, ops::{Add, AddAssign, Sub}, ptr::copy_nonoverlapping, sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering}
 };
 use system_error::SystemError;
 
@@ -300,6 +297,7 @@ pub struct TextuiCharChromatic {
 #[derive(Debug)]
 pub struct TextuiBuf<'a> {
     buf: Option<&'a mut [u32]>,
+
     guard: Option<SpinLockGuard<'a, Box<[u32]>>>,
 }
 
@@ -404,6 +402,9 @@ impl TextuiCharChromatic {
 
         let mut buf = TextuiBuf::new(&mut _binding);
 
+        let buf_depth=video_refresh_manager().device_buffer().bit_depth();
+
+        let byte_num_of_depth=(buf_depth/8) as usize ;
         // 在缓冲区画出一个字体，每个字体有TEXTUI_CHAR_HEIGHT行，TEXTUI_CHAR_WIDTH列个像素点
         for i in 0..TEXTUI_CHAR_HEIGHT {
             let start = count;
@@ -434,8 +435,10 @@ impl TextuiCharChromatic {
 
         let id_y: u32 = lineid.into();
         let y: u32 = id_y * TEXTUI_CHAR_HEIGHT;
-
+        let buf_depth=video_refresh_manager().device_buffer().bit_depth();
         let buf_width = video_refresh_manager().device_buffer().width();
+        let byte_num_of_depth=(buf_depth/8) as usize ;
+        
         // 找到输入缓冲区的起始地址位置
         let buf_start =
             if let ScmBuffer::DeviceBuffer(vaddr) = video_refresh_manager().device_buffer().buf {
@@ -450,23 +453,32 @@ impl TextuiCharChromatic {
         for i in 0..TEXTUI_CHAR_HEIGHT {
             // 计算出帧缓冲区每一行打印的起始位置的地址（起始位置+（y+i）*缓冲区的宽度+x）
 
-            let mut addr: *mut u32 =
-                (buf_start + buf_width as usize * 4 * (y as usize + i as usize) + 4 * x as usize)
-                    .data() as *mut u32;
+            let mut addr: *mut u8 =
+                (buf_start + buf_width as usize * byte_num_of_depth * (y as usize + i as usize) + byte_num_of_depth * x as usize)
+                    .data() as *mut u8;
 
             testbit = 1 << (TEXTUI_CHAR_WIDTH + 1);
 
-            for _j in 0..TEXTUI_CHAR_WIDTH {
+            for _j in 0..TEXTUI_CHAR_WIDTH {        //该循环是渲染一行像素
                 //从左往右逐个测试相应位
                 testbit >>= 1;
                 if (font.0[i as usize] & testbit as u8) != 0 {
-                    unsafe { *addr = self.frcolor.into() }; // 字，显示前景色
+                    let color:u32=self.frcolor.into();
+                    // let c=&color as *const u32;
+                    // let a=addr as *mut u32;
+                    // unsafe { *a = color }; // 字，显示前景色 
+                    // unsafe { *addr = self.frcolor.into() }; // 字，显示前景色 
+                    unsafe { copy_nonoverlapping(&color as *const u32 as *const u8, addr, byte_num_of_depth) }; // 字，显示前景色 
                 } else {
-                    unsafe { *addr = self.bkcolor.into() }; // 背景色
+                    let color:u32=self.bkcolor.into();
+                    // let a=addr as *mut u32;
+                    // unsafe { *a = color }; // 背景色\
+                    // unsafe { *addr = self.bkcolor.into() }; // 背景色\
+                    unsafe { copy_nonoverlapping(&color as *const u32 as *const u8, addr, byte_num_of_depth) };
                 }
 
                 unsafe {
-                    addr = (addr.offset(1)) as *mut u32;
+                    addr = (addr.offset(byte_num_of_depth as isize)) as *mut u8;
                 }
             }
         }

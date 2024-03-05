@@ -1022,10 +1022,11 @@ impl Syscall {
     /// ## 介绍:
     /// 用于挂载文件系统,目前仅支持ramfs挂载
     /// ## 参数:
-    /// @param source 挂载目标的文件夹名
-    /// @param target 挂载目录的父目录
-    /// @param filesystemtype 文件系统
-    ///
+    /// @param source       挂载目标的文件夹名
+    /// @param target       挂载目录的父目录
+    /// @param filesystemtype   文件系统
+    /// @param mountflags     挂载选项（暂未实现）
+    /// @param data        带数据挂载
     pub fn mount(
         source: *const c_char,
         target: *const c_char,

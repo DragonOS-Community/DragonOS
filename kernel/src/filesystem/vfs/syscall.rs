@@ -1,26 +1,22 @@
-use core::{
-    default,
-    ffi::{c_char, c_void, CStr},
-    result,
-};
+use core::ffi::{c_char, c_void, CStr};
 
 use alloc::{
-    borrow::ToOwned, string::{String, ToString}, sync::Arc, vec::Vec
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
 };
 use system_error::SystemError;
 
 use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
     filesystem::{
-        self,
-        fat::fs::FATFileSystem,
         ramfs::RamFS,
         vfs::{core as Vcore, file::FileDescriptorVec},
     },
     kerror,
     libs::rwlock::RwLockWriteGuard,
     mm::{verify_area, VirtAddr},
-    process::{ProcessManager, SwitchResult},
+    process::ProcessManager,
     syscall::{
         user_access::{check_and_clone_cstr, UserBufferReader, UserBufferWriter},
         Syscall,
@@ -34,7 +30,7 @@ use super::{
     file::{File, FileMode},
     open::{do_faccessat, do_fchmodat, do_sys_open},
     utils::{rsplit_path, user_path_at},
-    Dirent, FileSystem, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 // use crate::kdebug;
 
@@ -1028,39 +1024,42 @@ impl Syscall {
         source: *const c_char,
         target: *const c_char,
         filesystemtype: *const c_char,
-        mountflags: usize,
-        data: *const c_void,
+        _mountflags: usize,
+        _data: *const c_void,
     ) -> Result<usize, SystemError> {
         let source = Self::read_from_cstr(source).unwrap();
-        
+
         let target = Self::read_from_cstr(target).unwrap();
-        
+
         let filesystemtype = Self::read_from_cstr(filesystemtype).unwrap();
 
-        kdebug!("input fs is {}",filesystemtype);
-
-        Self::mkdir((target.clone()+&source).as_str(), FileMode::O_PATH_FLAGS.bits().try_into().unwrap());
+        Self::mkdir(
+            (target.clone() + &source).as_str(),
+            FileMode::O_PATH_FLAGS.bits().try_into().unwrap(),
+        )?;
         // (FileMode::O_WRONLY|FileMode::O_RDWR|FileMode::O_ACCMODE|FileMode::O_CREAT|FileMode::O_EXCL|FileMode::O_NOCTTY).bits().try_into().unwrap()
         // bug: when using match , cannot return the right filesystem
-        let _filesystemtype= RamFS::new();
+        let filesystemtype = match filesystemtype.as_str() {
+            "ramfs" => Ok(RamFS::new()),
+            _ => Err(SystemError::EUNSUPFS),
+        }?;
 
-        return Vcore::do_mount(_filesystemtype, (target.clone()+&source).as_str());
+        return Vcore::do_mount(filesystemtype, (target.clone() + &source).as_str());
     }
 
     pub fn read_from_cstr(source: *const c_char) -> Result<String, SystemError> {
-    // Create a CString from the raw pointer
-    let cstr = unsafe { CStr::from_ptr(source) };
+        // Create a CString from the raw pointer
+        let cstr = unsafe { CStr::from_ptr(source) };
 
-    // Convert the CString to a Rust String
-    let result = cstr.to_string_lossy().into_owned();
+        // Convert the CString to a Rust String
+        let result = cstr.to_string_lossy().into_owned();
 
-    if result.len() >= MAX_PATHLEN {
-        return Err(SystemError::ENAMETOOLONG);
+        if result.len() >= MAX_PATHLEN {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+
+        Ok(result)
     }
-
-    Ok(result)
-    }
-    
 }
 
 #[repr(C)]

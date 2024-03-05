@@ -1032,12 +1032,12 @@ impl Syscall {
         data: *const c_void,
     ) -> Result<usize, SystemError> {
         let source = Self::read_from_cstr(source).unwrap();
-        
+
         let target = Self::read_from_cstr(target).unwrap();
-        
+
         let filesystemtype = Self::read_from_cstr(filesystemtype).unwrap();
 
-        kdebug!("input fs is {}",filesystemtype);
+        kdebug!("input fs is {}", filesystemtype);
 
         Self::mkdir((target.clone()+&source).as_str(), FileMode::O_PATH_FLAGS.bits().try_into().unwrap());
         // (FileMode::O_WRONLY|FileMode::O_RDWR|FileMode::O_ACCMODE|FileMode::O_CREAT|FileMode::O_EXCL|FileMode::O_NOCTTY).bits().try_into().unwrap()

@@ -9,9 +9,9 @@
       }
     }
   },
-  "depends": [ ],
+  "depends": [],
   "build": {
-    "build_command": "make"
+    "build_command": "make install -j $(nproc)"
   },
   "install": {
     "in_dragonos_path": "/bin"

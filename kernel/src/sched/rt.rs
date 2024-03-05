@@ -8,6 +8,7 @@ use crate::{
     kBUG, kdebug,
     libs::spinlock::SpinLock,
     process::{ProcessControlBlock, ProcessFlags, ProcessManager},
+    smp::cpu::ProcessorId,
 };
 
 use super::{
@@ -122,11 +123,11 @@ impl SchedulerRT {
     }
 
     /// @brief 挑选下一个可执行的rt进程
-    pub fn pick_next_task_rt(&mut self, cpu_id: u32) -> Option<Arc<ProcessControlBlock>> {
+    pub fn pick_next_task_rt(&mut self, cpu_id: ProcessorId) -> Option<Arc<ProcessControlBlock>> {
         // 循环查找，直到找到
         // 这里应该是优先级数量，而不是CPU数量，需要修改
         for i in 0..SchedulerRT::MAX_RT_PRIO {
-            let cpu_queue_i: &mut RTQueue = self.cpu_queue[cpu_id as usize][i as usize];
+            let cpu_queue_i: &mut RTQueue = self.cpu_queue[cpu_id.data() as usize][i as usize];
             let proc: Option<Arc<ProcessControlBlock>> = cpu_queue_i.dequeue();
             if proc.is_some() {
                 return proc;
@@ -136,10 +137,10 @@ impl SchedulerRT {
         None
     }
 
-    pub fn rt_queue_len(&mut self, cpu_id: u32) -> usize {
+    pub fn rt_queue_len(&mut self, cpu_id: ProcessorId) -> usize {
         let mut sum = 0;
         for prio in 0..SchedulerRT::MAX_RT_PRIO {
-            sum += self.cpu_queue[cpu_id as usize][prio as usize].get_rt_queue_size();
+            sum += self.cpu_queue[cpu_id.data() as usize][prio as usize].get_rt_queue_size();
         }
         return sum as usize;
     }
@@ -151,7 +152,7 @@ impl SchedulerRT {
     }
 
     pub fn enqueue_front(&mut self, pcb: Arc<ProcessControlBlock>) {
-        let cpu_id = current_cpu_id() as usize;
+        let cpu_id = current_cpu_id().data() as usize;
         let priority = pcb.sched_info().priority().data() as usize;
 
         self.cpu_queue[cpu_id][priority].enqueue_front(pcb);
@@ -216,7 +217,8 @@ impl Scheduler for SchedulerRT {
                 }
                 // curr优先级更大，说明一定是实时进程，将所选进程入队列，此时需要入队首
                 else {
-                    self.cpu_queue[cpu_id as usize][priority.data() as usize].enqueue_front(proc);
+                    self.cpu_queue[cpu_id.data() as usize][priority.data() as usize]
+                        .enqueue_front(proc);
                 }
             }
             _ => panic!("unsupported schedule policy"),
@@ -226,7 +228,7 @@ impl Scheduler for SchedulerRT {
 
     fn enqueue(&mut self, pcb: Arc<ProcessControlBlock>) {
         let cpu_id = pcb.sched_info().on_cpu().unwrap();
-        let cpu_queue = &mut self.cpu_queue[cpu_id as usize];
+        let cpu_queue = &mut self.cpu_queue[cpu_id.data() as usize];
         let priority = pcb.sched_info().priority().data() as usize;
         cpu_queue[priority].enqueue(pcb);
     }

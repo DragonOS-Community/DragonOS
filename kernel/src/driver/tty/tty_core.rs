@@ -4,6 +4,7 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
+    driver::serial::serial8250::send_to_default_serial8250_port,
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
@@ -70,6 +71,13 @@ impl TtyCore {
     #[inline]
     pub fn ldisc(&self) -> Arc<dyn TtyLineDiscipline> {
         self.line_discipline.clone()
+    }
+
+    pub fn write_without_serial(&self, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
+        self.core
+            .driver()
+            .driver_funcs()
+            .write(self.core(), buf, nr)
     }
 
     pub fn reopen(&self) -> Result<(), SystemError> {
@@ -404,6 +412,7 @@ impl TtyOperation for TtyCore {
 
     #[inline]
     fn write(&self, tty: &TtyCoreData, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
+        send_to_default_serial8250_port(buf);
         return self.core().tty_driver.driver_funcs().write(tty, buf, nr);
     }
 

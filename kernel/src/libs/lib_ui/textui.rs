@@ -1,10 +1,7 @@
 use crate::{
     driver::{
         serial::serial8250::send_to_default_serial8250_port,
-        tty::{
-            tty_driver::TtyOperation, tty_port::TTY_PORTS,
-            virtual_terminal::virtual_console::CURRENT_VCNUM,
-        },
+        tty::{tty_port::TTY_PORTS, virtual_terminal::virtual_console::CURRENT_VCNUM},
         video::video_refresh_manager,
     },
     kdebug, kinfo,
@@ -1006,8 +1003,9 @@ pub extern "C" fn rs_textui_putchar(character: u8, fr_color: u32, bk_color: u32)
         let tty = port.port_data().tty();
         if tty.is_some() {
             let tty = tty.unwrap();
+            send_to_default_serial8250_port(&[character]);
             return tty
-                .write(tty.core(), buf.as_bytes(), buf.len())
+                .write_without_serial(buf.as_bytes(), buf.len())
                 .map(|_| 0)
                 .unwrap_or_else(|e| e.to_posix_errno());
         }
@@ -1029,7 +1027,7 @@ pub fn textui_putchar(
     if unsafe { TEXTUI_IS_INIT } {
         return textui_framework()
             .current_window
-            .lock()
+            .lock_irqsave()
             .textui_putchar_window(
                 character,
                 fr_color,
@@ -1061,7 +1059,7 @@ pub fn textui_putstr(
         None
     };
 
-    let mut guard = window.as_ref().map(|w| w.lock());
+    let mut guard = window.as_ref().map(|w| w.lock_irqsave());
 
     for character in string.chars() {
         if unsafe { TEXTUI_IS_INIT } {

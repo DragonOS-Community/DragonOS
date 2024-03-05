@@ -5,7 +5,7 @@ use x86::msr::{
 
 use crate::{kdebug, kinfo};
 
-use super::{LVTRegister, LocalAPIC, LVT};
+use super::{hw_irq::ApicId, LVTRegister, LocalAPIC, LVT};
 
 #[derive(Debug)]
 pub struct X2Apic;
@@ -84,8 +84,8 @@ impl LocalAPIC for X2Apic {
     }
 
     /// 获取 x2APIC 的 APIC ID
-    fn id(&self) -> u32 {
-        unsafe { rdmsr(IA32_X2APIC_APICID.into()) as u32 }
+    fn id(&self) -> ApicId {
+        unsafe { ApicId::new(rdmsr(IA32_X2APIC_APICID.into()) as u32) }
     }
 
     /// 设置 Local Vector Table (LVT) 寄存器

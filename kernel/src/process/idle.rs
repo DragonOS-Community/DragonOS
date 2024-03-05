@@ -8,7 +8,7 @@ use alloc::{sync::Arc, vec::Vec};
 use crate::{
     mm::{percpu::PerCpu, VirtAddr, INITIAL_PROCESS_ADDRESS_SPACE},
     process::KernelStack,
-    smp::core::smp_get_processor_id,
+    smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 
 use super::{ProcessControlBlock, ProcessManager};
@@ -27,10 +27,10 @@ impl ProcessManager {
         }
 
         assert!(
-            smp_get_processor_id() == 0,
+            smp_get_processor_id() == ProcessorId::new(0),
             "Idle process must be initialized on the first processor"
         );
-        let mut v: Vec<Arc<ProcessControlBlock>> = Vec::with_capacity(PerCpu::MAX_CPU_NUM);
+        let mut v: Vec<Arc<ProcessControlBlock>> = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
 
         for i in 0..PerCpu::MAX_CPU_NUM {
             let kstack = if unlikely(i == 0) {
@@ -57,7 +57,7 @@ impl ProcessManager {
             };
 
             assert!(idle_pcb.sched_info().on_cpu().is_none());
-            idle_pcb.sched_info().set_on_cpu(Some(i as u32));
+            idle_pcb.sched_info().set_on_cpu(Some(ProcessorId::new(i)));
             v.push(idle_pcb);
         }
 

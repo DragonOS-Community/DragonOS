@@ -8,12 +8,9 @@ use alloc::string::ToString;
 use super::lib_ui::textui::{textui_putstr, FontColor};
 
 use crate::{
-    driver::{
-        serial::serial8250::send_to_default_serial8250_port,
-        tty::{
-            tty_driver::TtyOperation, tty_port::TTY_PORTS,
-            virtual_terminal::virtual_console::CURRENT_VCNUM,
-        },
+    driver::tty::{
+        tty_driver::TtyOperation, tty_port::TTY_PORTS,
+        virtual_terminal::virtual_console::CURRENT_VCNUM,
     },
     filesystem::procfs::{
         kmsg::KMSG,
@@ -109,7 +106,6 @@ impl PrintkWriter {
             if tty.is_some() {
                 let tty = tty.unwrap();
                 let _ = tty.write(tty.core(), s.as_bytes(), s.len());
-                send_to_default_serial8250_port(s.as_bytes());
             } else {
                 let _ = textui_putstr(s, FontColor::WHITE, FontColor::BLACK);
             }

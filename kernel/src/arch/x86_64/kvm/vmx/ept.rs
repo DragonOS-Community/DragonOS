@@ -4,6 +4,8 @@ use crate::arch::MMArch;
 use crate::mm::page::PageFlags;
 use crate::mm::{PageTableKind, PhysAddr, VirtAddr};
 use crate::smp::core::smp_get_processor_id;
+use crate::smp::cpu::AtomicProcessorId;
+use crate::smp::cpu::ProcessorId;
 use core::sync::atomic::{compiler_fence, AtomicUsize, Ordering};
 use system_error::SystemError;
 use x86::msr;
@@ -25,9 +27,9 @@ pub fn check_ept_features() -> Result<(), SystemError> {
 
 /// 标志当前没有处理器持有内核映射器的锁
 /// 之所以需要这个标志，是因为AtomicUsize::new(0)会把0当作一个处理器的id
-const EPT_MAPPER_NO_PROCESSOR: usize = !0;
+const EPT_MAPPER_NO_PROCESSOR: ProcessorId = ProcessorId::INVALID;
 /// 当前持有内核映射器锁的处理器
-static EPT_MAPPER_LOCK_OWNER: AtomicUsize = AtomicUsize::new(EPT_MAPPER_NO_PROCESSOR);
+static EPT_MAPPER_LOCK_OWNER: AtomicProcessorId = AtomicProcessorId::new(EPT_MAPPER_NO_PROCESSOR);
 /// 内核映射器的锁计数器
 static EPT_MAPPER_LOCK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -41,7 +43,7 @@ pub struct EptMapper {
 }
 
 impl EptMapper {
-    fn lock_cpu(cpuid: usize, mapper: PageMapper) -> Self {
+    fn lock_cpu(cpuid: ProcessorId, mapper: PageMapper) -> Self {
         loop {
             match EPT_MAPPER_LOCK_OWNER.compare_exchange_weak(
                 EPT_MAPPER_NO_PROCESSOR,
@@ -69,7 +71,7 @@ impl EptMapper {
     /// @brief 锁定内核映射器, 并返回一个内核映射器对象
     #[inline(always)]
     pub fn lock() -> Self {
-        let cpuid = smp_get_processor_id() as usize;
+        let cpuid = smp_get_processor_id();
         let mapper = unsafe { PageMapper::current(PageTableKind::EPT, LockedFrameAllocator) };
         return Self::lock_cpu(cpuid, mapper);
     }

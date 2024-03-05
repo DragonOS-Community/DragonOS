@@ -51,7 +51,6 @@ fn do_start_kernel() {
     textui_init().unwrap();
     init_intertrait();
     vfs_init().expect("vfs init failed");
-    loop{}
     driver_init().expect("driver init failed");
     unsafe { acpi_init() };
     irq_init().expect("irq init failed");

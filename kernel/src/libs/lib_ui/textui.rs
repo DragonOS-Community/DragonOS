@@ -17,7 +17,7 @@ use crate::{
 use alloc::{boxed::Box, collections::LinkedList, string::ToString};
 use alloc::{sync::Arc, vec::Vec};
 use core::{
-    fmt::Debug, intrinsics::unlikely, ops::{Add, AddAssign, Sub}, ptr::copy_nonoverlapping, sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering}
+    fmt::Debug, intrinsics::unlikely, ops::{Add, AddAssign, Sub}, ptr::{self, copy_nonoverlapping}, sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering}
 };
 use system_error::SystemError;
 
@@ -294,17 +294,52 @@ pub struct TextuiCharChromatic {
     bkcolor: FontColor, // rgb
 }
 
+// #[derive(Debug)]
+// pub struct TextuiBuf24<'a>{
+//     buf:Option<&'a mut [u32]>,
+
+//     guard:Option<SpinLockGuard<'a, Box<[u32]>>>,
+// }
+
+// impl TextuiBuf24<'_>{
+//     pub fn new(buf: &mut ScmBufferInfo) -> TextuiBuf {
+//         let len = buf.buf_size() / 4;
+
+//         match &buf.buf {
+//             ScmBuffer::DeviceBuffer(vaddr) => {
+//                 return TextuiBuf {
+//                     buf: Some(unsafe {
+//                         core::slice::from_raw_parts_mut(vaddr.data() as *mut u32, len)
+//                     }),
+//                     guard: None,
+//                 };
+//             }
+
+//             ScmBuffer::DoubleBuffer(double_buffer) => {
+//                 let guard: SpinLockGuard<'_, Box<[u32]>> = double_buffer.lock();
+
+//                 return TextuiBuf {
+//                     buf: None,
+//                     guard: Some(guard),
+//                 };
+//             }
+//         }
+//     }
+// }
+
 #[derive(Debug)]
 pub struct TextuiBuf<'a> {
     buf: Option<&'a mut [u32]>,
 
     guard: Option<SpinLockGuard<'a, Box<[u32]>>>,
+
+    bit_depth:u32,
 }
 
 impl TextuiBuf<'_> {
     pub fn new(buf: &mut ScmBufferInfo) -> TextuiBuf {
         let len = buf.buf_size() / 4;
-
+        let depth=video_refresh_manager().device_buffer().bit_depth();
         match &buf.buf {
             ScmBuffer::DeviceBuffer(vaddr) => {
                 return TextuiBuf {
@@ -312,6 +347,7 @@ impl TextuiBuf<'_> {
                         core::slice::from_raw_parts_mut(vaddr.data() as *mut u32, len)
                     }),
                     guard: None,
+                    bit_depth:depth,
                 };
             }
 
@@ -321,6 +357,7 @@ impl TextuiBuf<'_> {
                 return TextuiBuf {
                     buf: None,
                     guard: Some(guard),
+                    bit_depth:depth,
                 };
             }
         }
@@ -334,8 +371,20 @@ impl TextuiBuf<'_> {
         }
     }
     pub fn put_color_in_pixel(&mut self, color: u32, index: usize) {
-        let buf: &mut [u32] = self.buf_mut();
-        buf[index] = color;
+        match self.bit_depth{
+            32=>{
+                let buf: &mut [u32] = self.buf_mut();
+                buf[index] = color;
+            },
+            24=>{
+                let buf =self.buf_mut().as_mut_ptr() as *mut u8;
+                unsafe{copy_nonoverlapping(&color as *const u32 as *const u8, buf, 3)};
+            },
+            _=>{
+                panic!("不支持的位深度！")
+            }
+        }
+        
     }
     pub fn get_index_of_next_line(now_index: usize) -> usize {
         textui_framework().metadata.read().buf_info().width() as usize + now_index
@@ -402,9 +451,6 @@ impl TextuiCharChromatic {
 
         let mut buf = TextuiBuf::new(&mut _binding);
 
-        let buf_depth=video_refresh_manager().device_buffer().bit_depth();
-
-        let byte_num_of_depth=(buf_depth/8) as usize ;
         // 在缓冲区画出一个字体，每个字体有TEXTUI_CHAR_HEIGHT行，TEXTUI_CHAR_WIDTH列个像素点
         for i in 0..TEXTUI_CHAR_HEIGHT {
             let start = count;

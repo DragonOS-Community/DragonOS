@@ -8,7 +8,7 @@ use kdepends::thingbuf::mpsc;
 use system_error::SystemError;
 
 use crate::{
-    driver::tty::virtual_terminal::MAX_NR_CONSOLES,
+    driver::{serial::serial8250::send_to_default_serial8250_port, tty::virtual_terminal::MAX_NR_CONSOLES},
     libs::spinlock::{SpinLock, SpinLockGuard},
 };
 
@@ -80,6 +80,7 @@ pub trait TtyPort: Sync + Send + Debug {
 
     /// 作为客户端的tty ports接收数据
     fn receive_buf(&self, buf: &[u8], _flags: &[u8], count: usize) -> Result<usize, SystemError> {
+        // send_to_default_serial8250_port(format!("{:?}\n\0",self.port_data()).as_bytes());
         let tty = self.port_data().tty.upgrade().unwrap();
 
         let ld = tty.ldisc();

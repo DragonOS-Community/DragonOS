@@ -133,7 +133,6 @@
         "cmd.h": "c",
         "sleep.h": "c",
         "net.h": "c",
-        "lz4.h": "c",
         "cmd_test.h": "c",
         "cmpxchg.h": "c",
         "mman.h": "c",

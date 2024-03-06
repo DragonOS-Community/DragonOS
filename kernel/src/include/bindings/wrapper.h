@@ -12,7 +12,6 @@
 
 
 #include <common/glib.h>
-#include <common/lz4.h>
 #include <common/printk.h>
 #include <common/spinlock.h>
 #include <common/stdio.h>

@@ -91,7 +91,6 @@
         "spinlock.h": "c",
         "stat.h": "c",
         "video.h": "c",
-        "libm.h": "c",
         "ahci.h": "c",
         "slab.h": "c",
         "boot_info.h": "c",

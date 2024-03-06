@@ -19,7 +19,6 @@
 #include <common/time.h>
 #include <common/unistd.h>
 #include <driver/multiboot2/multiboot2.h>
-#include <include/DragonOS/refcount.h>
 #include <libs/lib_ui/textui.h>
 #include <mm/mm.h>
 #include <mm/mmio.h>

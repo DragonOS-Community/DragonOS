@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+// #![allow(dead_code)]
 use core::intrinsics::unlikely;
 
 use alloc::{collections::LinkedList, sync::Arc, vec::Vec};
@@ -25,6 +25,7 @@ struct InnerWaitQueue {
 #[derive(Debug)]
 pub struct WaitQueue(SpinLock<InnerWaitQueue>);
 
+#[allow(dead_code)]
 impl WaitQueue {
     pub const INIT: WaitQueue = WaitQueue(SpinLock::new(InnerWaitQueue::INIT));
 
@@ -275,6 +276,7 @@ pub struct EventWaitQueue {
     wait_list: SpinLock<Vec<(u64, Arc<ProcessControlBlock>)>>,
 }
 
+#[allow(dead_code)]
 impl EventWaitQueue {
     pub fn new() -> Self {
         Self {
@@ -338,12 +340,12 @@ impl EventWaitQueue {
                 // 有感兴趣的事件
                 if ProcessManager::wakeup(pcb).is_ok() {
                     ret += 1;
-                    return true;
-                } else {
                     return false;
+                } else {
+                    return true;
                 }
             } else {
-                return false;
+                return true;
             }
         });
         ret
@@ -363,12 +365,12 @@ impl EventWaitQueue {
                 // 有感兴趣的事件
                 if ProcessManager::wakeup(pcb).is_ok() {
                     ret += 1;
-                    return true;
-                } else {
                     return false;
+                } else {
+                    return true;
                 }
             } else {
-                return false;
+                return true;
             }
         });
         ret

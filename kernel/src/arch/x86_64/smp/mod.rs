@@ -15,7 +15,7 @@ use crate::{
     libs::rwlock::RwLock,
     mm::percpu::PerCpu,
     process::ProcessManager,
-    smp::{core::smp_get_processor_id, SMPArch},
+    smp::{core::smp_get_processor_id, cpu::ProcessorId, SMPArch},
 };
 
 use super::{acpi::early_acpi_boot_init, CurrentIrqArch};
@@ -35,7 +35,7 @@ struct ApStartStackInfo {
 #[no_mangle]
 unsafe extern "C" fn smp_ap_start() -> ! {
     CurrentIrqArch::interrupt_disable();
-    let vaddr = cpu_core_info[smp_get_processor_id() as usize].stack_start as usize;
+    let vaddr = cpu_core_info[smp_get_processor_id().data() as usize].stack_start as usize;
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     let v = ApStartStackInfo { vaddr };
     smp_init_switch_stack(&v);
@@ -55,8 +55,8 @@ unsafe extern "sysv64" fn smp_init_switch_stack(st: &ApStartStackInfo) -> ! {
 
 unsafe extern "C" fn smp_ap_start_stage1() -> ! {
     let id = smp_get_processor_id();
-    kdebug!("smp_ap_start_stage1: id: {}\n", id);
-    let current_idle = ProcessManager::idle_pcb()[smp_get_processor_id() as usize].clone();
+    kdebug!("smp_ap_start_stage1: id: {}\n", id.data());
+    let current_idle = ProcessManager::idle_pcb()[smp_get_processor_id().data() as usize].clone();
 
     let tss = TSSManager::current_tss();
 
@@ -80,7 +80,7 @@ pub struct SmpBootData {
     /// CPU的物理ID（指的是Local APIC ID）
     ///
     /// 这里必须保证第0项的是bsp的物理ID
-    phys_id: [usize; PerCpu::MAX_CPU_NUM],
+    phys_id: [usize; PerCpu::MAX_CPU_NUM as usize],
 }
 
 #[allow(dead_code)]
@@ -99,17 +99,17 @@ impl SmpBootData {
         self.phys_id[0]
     }
 
-    pub unsafe fn set_cpu_count(&self, cpu_count: usize) {
+    pub unsafe fn set_cpu_count(&self, cpu_count: u32) {
         if self.initialized.load(Ordering::SeqCst) == false {
             let p = self as *const SmpBootData as *mut SmpBootData;
-            (*p).cpu_count = cpu_count;
+            (*p).cpu_count = cpu_count.try_into().unwrap();
         }
     }
 
-    pub unsafe fn set_phys_id(&self, cpu_id: usize, phys_id: usize) {
+    pub unsafe fn set_phys_id(&self, cpu_id: ProcessorId, phys_id: usize) {
         if self.initialized.load(Ordering::SeqCst) == false {
             let p = self as *const SmpBootData as *mut SmpBootData;
-            (*p).phys_id[cpu_id] = phys_id;
+            (*p).phys_id[cpu_id.data() as usize] = phys_id;
         }
     }
 
@@ -122,19 +122,19 @@ impl SmpBootData {
 pub(super) static SMP_BOOT_DATA: SmpBootData = SmpBootData {
     initialized: AtomicBool::new(false),
     cpu_count: 0,
-    phys_id: [0; PerCpu::MAX_CPU_NUM],
+    phys_id: [0; PerCpu::MAX_CPU_NUM as usize],
 };
 
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct X86_64SmpManager {
-    ia64_cpu_to_sapicid: RwLock<[Option<usize>; PerCpu::MAX_CPU_NUM]>,
+    ia64_cpu_to_sapicid: RwLock<[Option<usize>; PerCpu::MAX_CPU_NUM as usize]>,
 }
 
 impl X86_64SmpManager {
     pub const fn new() -> Self {
         return Self {
-            ia64_cpu_to_sapicid: RwLock::new([None; PerCpu::MAX_CPU_NUM]),
+            ia64_cpu_to_sapicid: RwLock::new([None; PerCpu::MAX_CPU_NUM as usize]),
         };
     }
     /// initialize the logical cpu number to APIC ID mapping

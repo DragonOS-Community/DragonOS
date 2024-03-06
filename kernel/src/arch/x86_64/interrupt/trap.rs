@@ -73,7 +73,7 @@ unsafe extern "C" fn do_divide_error(regs: &'static TrapFrame, error_code: u64) 
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Divide Error");
@@ -87,7 +87,7 @@ unsafe extern "C" fn do_debug(regs: &'static TrapFrame, error_code: u64) {
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Debug Exception");
@@ -101,7 +101,7 @@ unsafe extern "C" fn do_nmi(regs: &'static TrapFrame, error_code: u64) {
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("NMI Interrupt");
@@ -115,7 +115,7 @@ unsafe extern "C" fn do_int3(regs: &'static TrapFrame, error_code: u64) {
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Int3");
@@ -129,7 +129,7 @@ unsafe extern "C" fn do_overflow(regs: &'static TrapFrame, error_code: u64) {
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Overflow Exception");
@@ -143,7 +143,7 @@ unsafe extern "C" fn do_bounds(regs: &'static TrapFrame, error_code: u64) {
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Bounds Check");
@@ -157,7 +157,7 @@ unsafe extern "C" fn do_undefined_opcode(regs: &'static TrapFrame, error_code: u
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Undefined Opcode");
@@ -171,7 +171,7 @@ unsafe extern "C" fn do_dev_not_avaliable(regs: &'static TrapFrame, error_code: 
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Device Not Available");
@@ -185,7 +185,7 @@ unsafe extern "C" fn do_double_fault(regs: &'static TrapFrame, error_code: u64) 
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Double Fault");
@@ -199,7 +199,7 @@ unsafe extern "C" fn do_coprocessor_segment_overrun(regs: &'static TrapFrame, er
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Coprocessor Segment Overrun");
@@ -236,7 +236,7 @@ unsafe extern "C" fn do_invalid_TSS(regs: &'static TrapFrame, error_code: u64) {
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid(),
         msg1,
         msg2
@@ -252,7 +252,7 @@ unsafe extern "C" fn do_segment_not_exists(regs: &'static TrapFrame, error_code:
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Segment Not Exists");
@@ -266,7 +266,7 @@ unsafe extern "C" fn do_stack_segment_fault(regs: &'static TrapFrame, error_code
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Stack Segment Fault");
@@ -313,7 +313,7 @@ Segment Selector Index: {:#x}\n
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid(),
         msg1, msg2, msg3,
         error_code & 0xfff8
@@ -329,7 +329,7 @@ unsafe extern "C" fn do_page_fault(regs: &'static TrapFrame, error_code: u64) {
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid(),
         x86::controlregs::cr2()
     );
@@ -370,7 +370,7 @@ unsafe extern "C" fn do_x87_FPU_error(regs: &'static TrapFrame, error_code: u64)
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("x87 FPU Error");
@@ -384,7 +384,7 @@ unsafe extern "C" fn do_alignment_check(regs: &'static TrapFrame, error_code: u6
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Alignment Check");
@@ -398,7 +398,7 @@ unsafe extern "C" fn do_machine_check(regs: &'static TrapFrame, error_code: u64)
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Machine Check");
@@ -412,7 +412,7 @@ unsafe extern "C" fn do_SIMD_exception(regs: &'static TrapFrame, error_code: u64
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("SIMD Exception");
@@ -426,7 +426,7 @@ unsafe extern "C" fn do_virtualization_exception(regs: &'static TrapFrame, error
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Virtualization Exception");

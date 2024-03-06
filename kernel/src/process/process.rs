@@ -8,6 +8,22 @@ use crate::{
     process::{Pid, ProcessManager},
 };
 
+use super::{ProcessFlags, __PROCESS_MANAGEMENT_INIT_DONE};
+
+pub fn current_pcb_flags() -> ProcessFlags {
+    if unsafe { !__PROCESS_MANAGEMENT_INIT_DONE } {
+        return ProcessFlags::empty();
+    }
+    return ProcessManager::current_pcb().flags().clone();
+}
+
+pub fn current_pcb_preempt_count() -> usize {
+    if unsafe { !__PROCESS_MANAGEMENT_INIT_DONE } {
+        return 0;
+    }
+    return ProcessManager::current_pcb().preempt_count();
+}
+
 /// @brief 初始化pid=1的进程的stdio
 pub fn stdio_init() -> Result<(), SystemError> {
     if ProcessManager::current_pcb().pid() != Pid(1) {

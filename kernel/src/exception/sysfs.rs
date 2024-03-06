@@ -152,7 +152,8 @@ impl Attribute for AttrChipName {
             .arc_any()
             .downcast::<IrqDesc>()
             .map_err(|_| SystemError::EINVAL)?;
-        let chip = irq_desc.irq_data().chip();
+
+        let chip = irq_desc.irq_data().chip_info_read_irqsave().chip();
         let name = chip.name();
         let len = core::cmp::min(name.len() + 1, buf.len());
         let name = format!("{}\n", name);
@@ -301,9 +302,11 @@ impl Attribute for AttrActions {
 
         for action in actions {
             if len != 0 {
-                len += sysfs_emit_str(&mut buf[len..], &format!(",{}", action.name())).unwrap();
+                len += sysfs_emit_str(&mut buf[len..], &format!(",{}", action.inner().name()))
+                    .unwrap();
             } else {
-                len += sysfs_emit_str(&mut buf[len..], &format!("{}", action.name())).unwrap();
+                len +=
+                    sysfs_emit_str(&mut buf[len..], &format!("{}", action.inner().name())).unwrap();
             }
 
             if len >= buf.len() {

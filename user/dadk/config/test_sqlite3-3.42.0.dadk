@@ -9,14 +9,9 @@
       }
     }
   },
-  "depends": [
-    {
-      "name": "relibc",
-      "version": "0.1.0"
-    }
-  ],
+  "depends": [],
   "build": {
-    "build_command": "make download_sqlite3 && make -j $(nproc)"
+    "build_command": "make download_sqlite3 && make install"
   },
   "install": {
     "in_dragonos_path": "/bin"

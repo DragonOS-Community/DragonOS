@@ -14,15 +14,15 @@ use crate::{
     smp::core::smp_get_processor_id,
 };
 
-use super::{LVTRegister, LocalAPIC, LVT};
+use super::{hw_irq::ApicId, LVTRegister, LocalAPIC, LVT};
 
 /// per-cpu的xAPIC的MMIO空间起始地址
-static mut XAPIC_INSTANCES: [RefCell<Option<XApic>>; PerCpu::MAX_CPU_NUM] =
-    [const { RefCell::new(None) }; PerCpu::MAX_CPU_NUM];
+static mut XAPIC_INSTANCES: [RefCell<Option<XApic>>; PerCpu::MAX_CPU_NUM as usize] =
+    [const { RefCell::new(None) }; PerCpu::MAX_CPU_NUM as usize];
 
 #[inline(always)]
 pub(super) fn current_xapic_instance() -> &'static RefCell<Option<XApic>> {
-    unsafe { &XAPIC_INSTANCES.as_ref()[smp_get_processor_id() as usize] }
+    unsafe { &XAPIC_INSTANCES.as_ref()[smp_get_processor_id().data() as usize] }
 }
 
 /// TODO：统一变量
@@ -300,8 +300,8 @@ impl LocalAPIC for XApic {
     }
 
     /// 获取ID
-    fn id(&self) -> u32 {
-        unsafe { self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ID.into()) >> 24 }
+    fn id(&self) -> ApicId {
+        unsafe { ApicId::new(self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ID.into()) >> 24) }
     }
 
     /// 设置LVT寄存器的值

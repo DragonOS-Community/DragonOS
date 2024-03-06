@@ -32,7 +32,6 @@ macro_rules! println {
     ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
 }
 
-
 #[macro_export]
 macro_rules! kdebug {
     ($($arg:tt)*) => {

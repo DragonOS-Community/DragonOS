@@ -184,7 +184,4 @@
         "check",
         
     ],
-    "editor.mouseWheelZoom": true,
-    "editor.fontFamily": " 'monospace', monospace",
-    
 }

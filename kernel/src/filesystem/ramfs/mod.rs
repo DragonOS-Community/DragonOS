@@ -60,7 +60,6 @@ impl FileSystem for RamFS {
     }
 }
 
-
 ////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -87,7 +86,6 @@ use crate::{
 ////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////
 
-
 #[derive(Debug)]
 pub struct Keyer(Weak<LockedEntry>, Option<String>);
 
@@ -113,57 +111,137 @@ impl Keyer {
 // For Btree insertion
 impl PartialEq for Keyer {
     fn eq(&self, other: &Self) -> bool {
-        if self.0.ptr_eq(&other.0) {
-            return true;
-        }
-        if other.1.is_some() {
-            if let Some(enkey) = self.0.upgrade() {
-                return &enkey.0.lock().name == other.1.as_ref().unwrap();
-            } 
-        } else if self.1.is_some() {
-            if let Some(enkey) = other.0.upgrade() {
-                return &enkey.0.lock().name == self.1.as_ref().unwrap();
-            }
-        }
-        false
+        // if self.0.ptr_eq(&other.0) {
+        //     return true;
+        // }
+        // if other.1.is_some() {
+        //     if let Some(enkey) = self.0.upgrade() {
+        //         return &enkey.0.lock().name == other.1.as_ref().unwrap();
+        //     } 
+        // } else if self.1.is_some() {
+        //     if let Some(enkey) = other.0.upgrade() {
+        //         return &enkey.0.lock().name == self.1.as_ref().unwrap();
+        //     }
+        // }
+        kinfo!("Call Keyer::eq");
+        self.get().is_some_and(|k1|{
+            other.get().is_some_and(|k2|{
+                k1 == k2
+            })
+        })
     }
 }
 
 impl Eq for Keyer {}
 
+// Todo: improve performance
 impl PartialOrd for Keyer {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        // let ret: Ordering;
+        // if self.0.ptr_eq(&other.0) {
+        //     ret = Ordering::Equal;
+        // } else if other.1.is_some() {
+        //     if let Some(enkey) = self.0.upgrade() {
+        //         ret = enkey.0.lock().name.cmp(&other.1.as_ref().unwrap());
+        //     } else {
+        //         kwarn!("Entry reach empty\0");
+        //         ret = Ordering::Less;
+        //     }
+        // } else if self.1.is_some() {
+        //     if let Some(enkey) = other.0.upgrade() {
+        //         ret = enkey.0.lock().name.cmp(&self.1.as_ref().unwrap());
+        //     } else {
+        //         kwarn!("Entry reach empty\0");
+        //         ret = Ordering::Greater;
+        //     }
+        // } else {
+        //     ret = self.get().cmp(&other.get());
+        // }
+        let ret: Ordering;
         if self.0.ptr_eq(&other.0) {
-            return Some(Ordering::Equal);
-        }
-        if other.1.is_some() {
-            if let Some(enkey) = self.0.upgrade() {
-                return Some(enkey.0.lock().name.cmp(&other.1.as_ref().unwrap()));
-            }
-        } else if self.1.is_some() {
-            if let Some(enkey) = other.0.upgrade() {
-                return Some(enkey.0.lock().name.cmp(&self.1.as_ref().unwrap()));
-            }
-        }
-        Some(Ordering::Less)
+            ret = Ordering::Equal;
+        }/* else if other.1.is_some() { */ 
+        //     if let Some(enkey) = self.0.upgrade() {
+        //         ret = enkey.cmp(&other.1.as_ref().unwrap());
+
+        //         kdebug!("Branch1");
+        //     } else {
+        //         kdebug!("Entry reach empty");
+        //         ret = Ordering::Less;
+        //     }
+        // } else if self.1.is_some() {
+        //     if let Some(enkey) = other.0.upgrade() {
+        //         kdebug!("Branch2");
+        //         ret = enkey.0.lock().name.cmp(&self.1.as_ref().unwrap());
+        //     } else {
+        //         kdebug!("Entry reach empty");
+        //         ret = Ordering::Greater;
+        //     }
+        // } else {
+        //     ret = self.get().cmp(&other.get());
+        // } 
+        else {
+            ret = self.get().cmp(&other.get());
+        } // Debug low performance
+        let destring = match ret {
+            Ordering::Equal => "Equal",
+            Ordering::Less => "Less",
+            Ordering::Greater => "Greater",
+        };
+        kdebug!("POrd::Cmp {} and {} with result: {}\0", self.get().unwrap(), other.get().unwrap(), destring);
+        Some(ret)
     }
 }
 
 impl Ord for Keyer {
     fn cmp(&self, other: &Self) -> Ordering {
+        // kinfo!("Call Keyer::Ord::cmp");
+        // if self.0.ptr_eq(&other.0) {
+        //     return Ordering::Equal;
+        // }
+        // if other.1.is_some() {
+        //     if let Some(enkey) = self.0.upgrade() {
+        //         return enkey.0.lock().name.cmp(&other.1.as_ref().unwrap());
+        //     }
+        // } else if self.1.is_some() {
+        //     if let Some(enkey) = other.0.upgrade() {
+        //         return enkey.0.lock().name.cmp(&self.1.as_ref().unwrap());
+        //     }
+        // }
+        // Ordering::Less
+        let ret: Ordering;
         if self.0.ptr_eq(&other.0) {
-            return Ordering::Equal;
-        }
-        if other.1.is_some() {
-            if let Some(enkey) = self.0.upgrade() {
-                return enkey.0.lock().name.cmp(&other.1.as_ref().unwrap());
-            }
-        } else if self.1.is_some() {
-            if let Some(enkey) = other.0.upgrade() {
-                return enkey.0.lock().name.cmp(&self.1.as_ref().unwrap());
-            }
-        }
-        Ordering::Less
+            ret = Ordering::Equal;
+        }/* else if other.1.is_some() { */ 
+        //     if let Some(enkey) = self.0.upgrade() {
+        //         ret = enkey.cmp(&other.1.as_ref().unwrap());
+
+        //         kdebug!("Branch1");
+        //     } else {
+        //         kdebug!("Entry reach empty");
+        //         ret = Ordering::Less;
+        //     }
+        // } else if self.1.is_some() {
+        //     if let Some(enkey) = other.0.upgrade() {
+        //         kdebug!("Branch2");
+        //         ret = enkey.0.lock().name.cmp(&self.1.as_ref().unwrap());
+        //     } else {
+        //         kdebug!("Entry reach empty");
+        //         ret = Ordering::Greater;
+        //     }
+        // } else {
+        //     ret = self.get().cmp(&other.get());
+        // } 
+        else {
+            ret = self.get().cmp(&other.get());
+        } // Debug low performance
+        let destring = match ret {
+            Ordering::Equal => "Equal",
+            Ordering::Less => "Less",
+            Ordering::Greater => "Greater",
+        };
+        kdebug!("Ord::Cmp {} and {} with result: {}", self.get().unwrap(), other.get().unwrap(), destring);
+        ret
     }
 }
 
@@ -400,6 +478,7 @@ impl IndexNode for LockedEntry {
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> 
     {
+        kinfo!("Call Ramfs::create_with_data");
         // 获取当前inode
         let mut entry = self.0.lock();
 {
@@ -438,6 +517,7 @@ impl IndexNode for LockedEntry {
     /// Not Stable, waiting for improvement
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> 
     {
+        kinfo!("Call Ramfs::link");
         let other: &LockedEntry = other
             .downcast_ref::<LockedEntry>()
             .ok_or(SystemError::EPERM)?;
@@ -565,7 +645,9 @@ impl IndexNode for LockedEntry {
         Ok(())
     }
 
-    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> 
+    {
+        kinfo!("Call Ramfs::find");
         let entry = self.0.lock();
         let inode = entry.inode.0.lock();
 
@@ -583,6 +665,7 @@ impl IndexNode for LockedEntry {
             }
             name => {
                 // 在子目录项中查找
+                kinfo!("...Find in children directory.");
                 Ok(entry.children.get(&Keyer::from_str(name)).ok_or(SystemError::ENOENT)?.clone())
             }
         }
@@ -622,7 +705,9 @@ impl IndexNode for LockedEntry {
         }
     }
 
-    fn list(&self) -> Result<Vec<String>, SystemError> {
+    fn list(&self) -> Result<Vec<String>, SystemError> 
+    {
+        kinfo!("Call Ramfs::list");
         let info = self.metadata()?;
         if info.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);

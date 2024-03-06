@@ -14,6 +14,7 @@ use crate::{
         resource::{RLimit64, RUsage},
         ProcessManager,
     },
+    syscall::user_access::check_and_clone_cstr,
 };
 
 use num_traits::FromPrimitive;
@@ -57,10 +58,6 @@ pub const SYS_SCHED: usize = 100003;
 
 #[derive(Debug)]
 pub struct Syscall;
-
-extern "C" {
-    fn do_put_string(s: *const u8, front_color: u32, back_color: u32) -> usize;
-}
 
 impl Syscall {
     /// 初始化系统调用
@@ -1038,10 +1035,13 @@ impl Syscall {
 
     pub fn put_string(
         s: *const u8,
-        front_color: u32,
-        back_color: u32,
+        _front_color: u32,
+        _back_color: u32,
     ) -> Result<usize, SystemError> {
-        return Ok(unsafe { do_put_string(s, front_color, back_color) });
+        // todo: 删除这个系统调用
+        let s = check_and_clone_cstr(s, Some(4096))?;
+        print!("{s}");
+        return Ok(s.len());
     }
 
     pub fn reboot() -> Result<usize, SystemError> {

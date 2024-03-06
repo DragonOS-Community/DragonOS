@@ -30,8 +30,9 @@ use crate::{
     init::initcall::INITCALL_DEVICE,
     libs::rwlock::RwLock,
     mm::VirtAddr,
+    net::event_poll::{EPollItem, EventPoll},
     process::ProcessManager,
-    syscall::user_access::UserBufferWriter,
+    syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
 use super::{
@@ -273,6 +274,20 @@ impl IndexNode for TtyDevice {
                     todo!()
                 }
             }
+            EventPoll::ADD_EPOLLITEM => {
+                let _ = UserBufferReader::new(
+                    arg as *const Arc<EPollItem>,
+                    core::mem::size_of::<Arc<EPollItem>>(),
+                    false,
+                )?;
+                let epitem = unsafe { &*(arg as *const Arc<EPollItem>) };
+
+                let core = tty.core();
+
+                core.add_epitem(epitem.clone());
+
+                return Ok(0);
+            }
             _ => {}
         }
 
@@ -318,6 +333,16 @@ impl IndexNode for TtyDevice {
         tty.ldisc().ioctl(tty, cmd, arg)?;
 
         Ok(0)
+    }
+
+    fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
+        let (tty, _) = if let FilePrivateData::Tty(tty_priv) = private_data {
+            (tty_priv.tty.clone(), tty_priv.mode)
+        } else {
+            return Err(SystemError::EIO);
+        };
+
+        tty.ldisc().poll(tty)
     }
 }
 

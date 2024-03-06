@@ -1,3 +1,4 @@
+use core::intrinsics::likely;
 use core::ops::BitXor;
 
 use bitmap::{traits::BitMapOps, StaticBitmap};
@@ -249,11 +250,10 @@ impl NTtyData {
             || termios.local_mode.contains(LocalMode::IEXTEN);
 
         let look_ahead = self.lookahead_count.min(count);
-
         if self.real_raw {
-            todo!("tty real raw mode todo");
+            self.receive_buf_real_raw(buf, count);
         } else if self.raw || (termios.local_mode.contains(LocalMode::EXTPROC) && !preops) {
-            todo!("tty raw mode todo");
+            self.receive_buf_raw(buf, flags, count);
         } else if tty.core().is_closing() && !termios.local_mode.contains(LocalMode::EXTPROC) {
             todo!()
         } else {
@@ -282,7 +282,47 @@ impl NTtyData {
         if self.read_cnt() > 0 {
             tty.core()
                 .read_wq()
-                .wakeup((EPollEventType::EPOLLIN | EPollEventType::EPOLLRDBAND).bits() as u64);
+                .wakeup_any((EPollEventType::EPOLLIN | EPollEventType::EPOLLRDBAND).bits() as u64);
+        }
+    }
+
+    fn receive_buf_real_raw(&mut self, buf: &[u8], mut count: usize) {
+        let mut head = ntty_buf_mask(self.read_head);
+        let mut n = count.min(NTTY_BUFSIZE - head);
+
+        // 假如有一部分在队列头部，则这部分是拷贝尾部部分
+        self.read_buf[head..(head + n)].copy_from_slice(&buf[0..n]);
+        self.read_head += n;
+        count -= n;
+        let offset = n;
+
+        // 假如有一部分在队列头部，则这部分是拷贝头部部分
+        head = ntty_buf_mask(self.read_head);
+        n = count.min(NTTY_BUFSIZE - head);
+        self.read_buf[head..(head + n)].copy_from_slice(&buf[offset..(offset + n)]);
+        self.read_head += n;
+    }
+
+    fn receive_buf_raw(&mut self, buf: &[u8], flags: Option<&[u8]>, mut count: usize) {
+        // TTY_NORMAL 目前这部分未做，所以先占位置而不做抽象
+        let mut flag = 1;
+        let mut f_offset = 0;
+        let mut c_offset = 0;
+        while count != 0 {
+            if flags.is_some() {
+                flag = flags.as_ref().unwrap()[f_offset];
+                f_offset += 1;
+            }
+
+            if likely(flag == 1) {
+                self.read_buf[self.read_head] = buf[c_offset];
+                c_offset += 1;
+                self.read_head += 1;
+            } else {
+                todo!()
+            }
+
+            count -= 1;
         }
     }
 
@@ -467,9 +507,9 @@ impl NTtyData {
                 self.read_buf[ntty_buf_mask(self.read_head)] = c;
                 self.read_head += 1;
                 self.canon_head = self.read_head;
-                tty.core()
-                    .read_wq()
-                    .wakeup((EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as u64);
+                tty.core().read_wq().wakeup_any(
+                    (EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as u64,
+                );
                 return;
             }
 
@@ -480,9 +520,9 @@ impl NTtyData {
                 self.read_buf[ntty_buf_mask(self.read_head)] = c;
                 self.read_head += 1;
                 self.canon_head = self.read_head;
-                tty.core()
-                    .read_wq()
-                    .wakeup((EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as u64);
+                tty.core().read_wq().wakeup_any(
+                    (EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as u64,
+                );
                 return;
             }
 
@@ -508,9 +548,9 @@ impl NTtyData {
                 self.read_buf[ntty_buf_mask(self.read_head)] = c;
                 self.read_head += 1;
                 self.canon_head = self.read_head;
-                tty.core()
-                    .read_wq()
-                    .wakeup((EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as u64);
+                tty.core().read_wq().wakeup_any(
+                    (EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as u64,
+                );
                 return;
             }
         }
@@ -907,7 +947,7 @@ impl NTtyData {
             // 有一部分数据在头部,则先拷贝后面部分，再拷贝头部
             // TODO: tty审计？
             to[0..size].copy_from_slice(&self.read_buf[tail..(tail + size)]);
-            to[size..].copy_from_slice(&self.read_buf[(tail + size)..(*n + tail)]);
+            to[size..(*n)].copy_from_slice(&self.read_buf[0..(*n - size)]);
         } else {
             to[..*n].copy_from_slice(&self.read_buf[tail..(tail + *n)])
         }
@@ -975,7 +1015,7 @@ impl NTtyData {
         let size = if tail + n > NTTY_BUFSIZE {
             NTTY_BUFSIZE
         } else {
-            tail + *nr
+            tail + n
         };
 
         // 找到eol的坐标
@@ -1088,7 +1128,7 @@ impl NTtyData {
         let tail = self.read_tail & (NTTY_BUFSIZE - 1);
 
         // 计算出可读的字符数
-        let mut n = (NTTY_BUFSIZE - tail).min(self.read_tail);
+        let mut n = (NTTY_BUFSIZE - tail).min(head - self.read_tail);
         n = n.min(*nr);
 
         if n > 0 {
@@ -1555,7 +1595,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                     return Ok(len - nr);
                 }
             } else {
-                if ldata.canon_copy_from_read_buf(buf, &mut nr, &mut offset)? {
+                if ldata.copy_from_read_buf(termios, buf, &mut nr, &mut offset)? {
                     return Ok(len - nr);
                 }
             }
@@ -1829,14 +1869,13 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         let contorl_chars = termios.control_characters;
 
         // 第一次设置或者规范模式 (ICANON) 或者扩展处理 (EXTPROC) 标志发生变化
-        if old.is_none()
-            || (old.is_some()
-                && old
-                    .unwrap()
-                    .local_mode
-                    .bitxor(termios.local_mode)
-                    .contains(LocalMode::ICANON | LocalMode::EXTPROC))
-        {
+        let mut spec_mode_changed = false;
+        if old.is_some() {
+            let local_mode = old.clone().unwrap().local_mode.bitxor(termios.local_mode);
+            spec_mode_changed =
+                local_mode.contains(LocalMode::ICANON) || local_mode.contains(LocalMode::EXTPROC);
+        }
+        if old.is_none() || spec_mode_changed {
             // 重置read_flags
             ldata.read_flags.set_all(false);
 
@@ -1859,10 +1898,8 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             ldata.lnext = false;
         }
 
-        // 设置规范模式
-        if termios.local_mode.contains(LocalMode::ICANON) {
-            ldata.icanon = true;
-        }
+        // 设置模式
+        ldata.icanon = termios.local_mode.contains(LocalMode::ICANON);
 
         // 设置回显
         if termios.local_mode.contains(LocalMode::ECHO) {
@@ -1984,8 +2021,37 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         Ok(())
     }
 
-    fn poll(&self, _tty: Arc<TtyCore>) -> Result<(), system_error::SystemError> {
-        todo!()
+    fn poll(&self, tty: Arc<TtyCore>) -> Result<usize, system_error::SystemError> {
+        let core = tty.core();
+        let ldata = self.disc_data();
+
+        let mut event = EPollEventType::empty();
+        if ldata.input_available(core.termios(), true) {
+            event.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM)
+        }
+
+        if core.contorl_info_irqsave().packet {
+            let link = core.link();
+            if link.is_some() && link.unwrap().core().contorl_info_irqsave().pktstatus != 0 {
+                event.insert(
+                    EPollEventType::EPOLLPRI
+                        | EPollEventType::EPOLLIN
+                        | EPollEventType::EPOLLRDNORM,
+                );
+            }
+        }
+
+        if core.flags().contains(TtyFlag::OTHER_CLOSED) {
+            event.insert(EPollEventType::EPOLLHUP);
+        }
+
+        if core.driver().driver_funcs().chars_in_buffer() < 256
+            && core.driver().driver_funcs().write_room(core) > 0
+        {
+            event.insert(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM);
+        }
+
+        Ok(event.bits() as usize)
     }
 
     fn hangup(&self, _tty: Arc<TtyCore>) -> Result<(), system_error::SystemError> {

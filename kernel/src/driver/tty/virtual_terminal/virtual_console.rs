@@ -7,7 +7,10 @@ use alloc::{
 use bitmap::{traits::BitMapOps, StaticBitmap};
 
 use crate::{
-    driver::tty::{console::ConsoleSwitch, ConsoleFont, KDMode},
+    driver::{
+        serial::serial8250::send_to_default_serial8250_port,
+        tty::{console::ConsoleSwitch, ConsoleFont, KDMode},
+    },
     libs::{font::FontDesc, rwlock::RwLock},
     process::Pid,
 };
@@ -264,7 +267,8 @@ impl VirtualConsoleData {
         self.pid = None;
         self.vc_state = VirtualConsoleState::ESnormal;
         self.reset_palette();
-        self.cursor_type = VcCursor::CUR_UNDERLINE;
+        // self.cursor_type = VcCursor::CUR_UNDERLINE;
+        self.cursor_type = VcCursor::CUR_BLOCK;
 
         self.default_attr();
         self.update_attr();
@@ -567,10 +571,10 @@ impl VirtualConsoleData {
         let min_y;
         if self.origin_mode {
             min_y = self.top;
-            max_y = self.bottom;
+            max_y = self.bottom - 1;
         } else {
             min_y = 0;
-            max_y = self.rows;
+            max_y = self.rows - 1;
         }
 
         if y < min_y as i32 {
@@ -789,9 +793,11 @@ impl VirtualConsoleData {
             'n' => {
                 if self.private == Vt102_OP::EPecma {
                     if self.par[0] == 5 {
-                        kwarn!("tty status report todo");
+                        send_to_default_serial8250_port("tty status report todo".as_bytes());
+                        panic!();
                     } else if self.par[0] == 6 {
-                        kwarn!("tty cursor report todo");
+                        send_to_default_serial8250_port("tty cursor report todo".as_bytes());
+                        panic!();
                     }
                 }
                 return;
@@ -847,7 +853,7 @@ impl VirtualConsoleData {
                     self.par[0] += 1;
                 }
                 self.gotoxy(
-                    (self.state.x - self.par[0] as usize) as i32,
+                    self.state.x as i32 - self.par[0] as i32,
                     self.state.y as i32,
                 );
                 return;
@@ -863,7 +869,7 @@ impl VirtualConsoleData {
                 if self.par[0] == 0 {
                     self.par[0] += 1;
                 }
-                self.gotoxy(0, (self.state.y - self.par[0] as usize) as i32);
+                self.gotoxy(0, self.state.y as i32 - self.par[0] as i32);
                 return;
             }
             'd' => {
@@ -874,6 +880,7 @@ impl VirtualConsoleData {
                 return;
             }
             'H' | 'f' => {
+                // MOVETO
                 if self.par[0] != 0 {
                     self.par[0] -= 1;
                 }

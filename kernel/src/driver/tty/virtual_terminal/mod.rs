@@ -102,62 +102,8 @@ impl TtyConsoleDriverInner {
             console: Arc::new(BlittingFbConsole::new()?),
         })
     }
-}
 
-impl TtyOperation for TtyConsoleDriverInner {
-    fn install(&self, _driver: Arc<TtyDriver>, tty: Arc<TtyCore>) -> Result<(), SystemError> {
-        let tty_core = tty.core();
-        let mut vc_data = VIRT_CONSOLES[tty_core.index()].lock();
-
-        self.console.con_init(&mut vc_data, true)?;
-        if vc_data.complement_mask == 0 {
-            vc_data.complement_mask = if vc_data.color_mode { 0x7700 } else { 0x0800 };
-        }
-        vc_data.s_complement_mask = vc_data.complement_mask;
-        // vc_data.bytes_per_row = vc_data.cols << 1;
-        vc_data.index = tty_core.index();
-        vc_data.bottom = vc_data.rows;
-        vc_data.set_driver_funcs(Arc::downgrade(
-            &(self.console.clone() as Arc<dyn ConsoleSwitch>),
-        ));
-
-        // todo: unicode字符集处理？
-
-        if vc_data.cols > VC_MAXCOL || vc_data.rows > VC_MAXROW {
-            return Err(SystemError::EINVAL);
-        }
-
-        vc_data.init(None, None, true);
-        vc_data.update_attr();
-
-        let window_size = tty_core.window_size_upgradeable();
-        if window_size.col == 0 && window_size.row == 0 {
-            let mut window_size = window_size.upgrade();
-            window_size.col = vc_data.cols as u16;
-            window_size.row = vc_data.rows as u16;
-        }
-
-        if vc_data.utf {
-            tty_core.termios_write().input_mode.insert(InputMode::IUTF8);
-        } else {
-            tty_core.termios_write().input_mode.remove(InputMode::IUTF8);
-        }
-
-        // 加入sysfs？
-
-        Ok(())
-    }
-
-    fn open(&self, _tty: &TtyCoreData) -> Result<(), SystemError> {
-        Ok(())
-    }
-
-    fn write_room(&self, _tty: &TtyCoreData) -> usize {
-        32768
-    }
-
-    /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/tty/vt/vt.c#2894
-    fn write(&self, tty: &TtyCoreData, buf: &[u8], mut nr: usize) -> Result<usize, SystemError> {
+    fn do_write(&self, tty: &TtyCoreData, buf: &[u8], mut nr: usize) -> Result<usize, SystemError> {
         // 关闭中断
         let mut vc_data = tty.vc_data_irqsave();
 
@@ -203,6 +149,67 @@ impl TtyOperation for TtyConsoleDriverInner {
 
         // TODO: notify update
         return Ok(offset);
+    }
+}
+
+impl TtyOperation for TtyConsoleDriverInner {
+    fn install(&self, _driver: Arc<TtyDriver>, tty: Arc<TtyCore>) -> Result<(), SystemError> {
+        let tty_core = tty.core();
+        let mut vc_data = VIRT_CONSOLES[tty_core.index()].lock();
+
+        self.console.con_init(&mut vc_data, true)?;
+        if vc_data.complement_mask == 0 {
+            vc_data.complement_mask = if vc_data.color_mode { 0x7700 } else { 0x0800 };
+        }
+        vc_data.s_complement_mask = vc_data.complement_mask;
+        // vc_data.bytes_per_row = vc_data.cols << 1;
+        vc_data.index = tty_core.index();
+        vc_data.bottom = vc_data.rows;
+        vc_data.set_driver_funcs(Arc::downgrade(
+            &(self.console.clone() as Arc<dyn ConsoleSwitch>),
+        ));
+
+        // todo: unicode字符集处理？
+
+        if vc_data.cols > VC_MAXCOL || vc_data.rows > VC_MAXROW {
+            return Err(SystemError::EINVAL);
+        }
+
+        vc_data.init(None, None, true);
+        vc_data.update_attr();
+
+        let window_size = tty_core.window_size_upgradeable();
+        if window_size.col == 0 && window_size.row == 0 {
+            let mut window_size = window_size.upgrade();
+            window_size.col = vc_data.cols as u16;
+            window_size.row = vc_data.rows as u16;
+            kerror!("window_size {:?}", *window_size);
+        }
+
+        if vc_data.utf {
+            tty_core.termios_write().input_mode.insert(InputMode::IUTF8);
+        } else {
+            tty_core.termios_write().input_mode.remove(InputMode::IUTF8);
+        }
+
+        // 加入sysfs？
+
+        Ok(())
+    }
+
+    fn open(&self, _tty: &TtyCoreData) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn write_room(&self, _tty: &TtyCoreData) -> usize {
+        32768
+    }
+
+    /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/tty/vt/vt.c#2894
+    fn write(&self, tty: &TtyCoreData, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
+        let ret = self.do_write(tty, buf, nr);
+        self.flush_chars(tty);
+        ret
     }
 
     fn flush_chars(&self, tty: &TtyCoreData) {

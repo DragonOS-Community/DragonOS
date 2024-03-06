@@ -11,11 +11,6 @@
 #pragma once
 
 
-#include <common/crc16.h>
-#include <common/crc32.h>
-#include <common/crc64.h>
-#include <common/crc7.h>
-#include <common/crc8.h>
 #include <common/glib.h>
 #include <common/kfifo.h>
 #include <common/lz4.h>

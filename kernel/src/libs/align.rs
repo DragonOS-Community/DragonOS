@@ -126,14 +126,24 @@ unsafe impl<const NUM: usize> SafeForZero for [u8; NUM] {}
 /// 参数 `addr`：要对齐的地址。
 ///
 /// 返回值：对齐后的地址。
-pub fn page_align_up(addr: usize) -> usize {
+pub const fn page_align_up(addr: usize) -> usize {
     let page_size = MMArch::PAGE_SIZE;
     return (addr + page_size - 1) & (!(page_size - 1));
 }
 
-pub fn page_align_down(addr: usize) -> usize {
+pub const fn page_align_down(addr: usize) -> usize {
     let page_size = MMArch::PAGE_SIZE;
     return addr & (!(page_size - 1));
+}
+
+pub const fn align_up(addr: usize, align: usize) -> usize {
+    assert!(align != 0 && align.is_power_of_two());
+    return (addr + align - 1) & (!(align - 1));
+}
+
+pub const fn align_down(addr: usize, align: usize) -> usize {
+    assert!(align != 0 && align.is_power_of_two());
+    return addr & (!(align - 1));
 }
 
 /// ## 检查是否对齐

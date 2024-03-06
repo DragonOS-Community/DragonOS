@@ -1,45 +1,36 @@
 use alloc::{collections::{linked_list::CursorMut, LinkedList}, sync::{Arc, Weak}, vec::Vec};
 use system_error::SystemError;
-use core::{hash::{Hash, Hasher, SipHasher}, marker::PhantomData, mem::size_of, ptr::NonNull};
+use core::{hash::{Hash, Hasher, SipHasher}, marker::PhantomData, mem::size_of, ops::Index, ptr::NonNull};
 
 use super::IndexNode;
 
-pub trait Cacher<T, H: Hasher + Default> {
-    fn cache(&self) -> Arc<DefaultCache<T, H>>;
-}
+// pub trait Cacher<H: Hasher + Default> {
+//     fn cache(&self) -> Arc<DefaultCache<dyn IndexNode, H>>;
+// }
 
-pub trait Cachable<'a> : IndexNode {
-    // name for hashing
-    fn key(&self) -> Result<String, SystemError>;
-    // value to store
-    fn path(&self) -> Result<String, SystemError>;
-    // fn value(&self) -> Weak<Self>;
+// pub trait Cachable<'a> : IndexNode {
+    
+// }
 
-    // 
-    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
-    }
-}
+// CacheLine = Weak<dyn IndexNode>
 
-// CacheLine = Weak<T>
-
-pub struct DefaultCache<'a, T: ?Sized, H: Hasher + Default = SipHasher> {
+pub struct DefaultCache<'a, H: Hasher + Default = SipHasher> {
     _hash_type: PhantomData<H>,
-    table: Vec<LinkedList<CursorMut<'a, Weak<T>>>>,
-    deque: LinkedList<Weak<T>>,
+    table: Vec<LinkedList<CursorMut<'a, Weak<dyn IndexNode>>>>,
+    deque: LinkedList<Weak<dyn IndexNode>>,
     max_size: u64,
 }
 
 
-impl<'a, 'b, T: Cachable<'b>, H: Hasher + Default> DefaultCache<'a, T, H> {
+impl<'a, 'b, H: Hasher + Default> DefaultCache<'a, H> {
     const DEFAULT_MEMORY_SIZE: u64 = 1024 /* K */ * 1024 /* Byte */;
     ///@brief table size / 2 * (sizeof Cursor + sizeof listnode) = Memory Cost.
-    fn new(size: Option<u64>) -> DefaultCache<'a, T, H> {
+    fn new(size: Option<u64>) -> DefaultCache<'a, H> {
 
         let vec_size = size.unwrap_or(Self::DEFAULT_MEMORY_SIZE) / 
-            (size_of::<CursorMut<'a, T>>() + size_of::<Option<NonNull<T>>>()) as u64 * 2;
+            (size_of::<CursorMut<'a, Weak<dyn IndexNode>>>() + size_of::<Option<NonNull<dyn IndexNode>>>()) as u64 * 2;
         let capacity = vec_size / 2;
-        let mut tmp: Vec<LinkedList<CursorMut<'a, Weak<T>>>> = Vec::new();
+        let mut tmp: Vec<LinkedList<CursorMut<'a, Weak<dyn IndexNode>>>> = Vec::new();
         // tmp.resize(vec_size as usize, LinkedList::new());
         for _ in [0..vec_size] {
             tmp.push(LinkedList::new());
@@ -62,7 +53,7 @@ impl<'a, 'b, T: Cachable<'b>, H: Hasher + Default> DefaultCache<'a, T, H> {
 
     // fn 
 
-    fn put(&'a mut self, line: &Arc<T>) -> Result<(), SystemError> {
+    fn put(&'a mut self, line: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
         // get coresponding table position
         let position = self.position(line.key()?.as_str());
 
@@ -71,9 +62,7 @@ impl<'a, 'b, T: Cachable<'b>, H: Hasher + Default> DefaultCache<'a, T, H> {
             .extract_if(|cur| {
                 if let Some(wptr) = cur.as_cursor().current() {
                     if let Some(entry) = wptr.upgrade() {
-                        if entry == *line { // fix
-                            return true;
-                        }
+                        todo!() 
                     }
                 }
                 false
@@ -93,26 +82,24 @@ impl<'a, 'b, T: Cachable<'b>, H: Hasher + Default> DefaultCache<'a, T, H> {
         Ok(())
     }
 
-    // fn check(&self, key: &str) -> Cursor<'a, Weak<T>> {
+    // fn check(&self, key: &str) -> Cursor<'a, Weak<dyn IndexNode>> {
     //     let position = self.possition(key);
     //     self.table[position].contains()
     // }
 
-    fn get(&self, key: &str) -> Option<Arc<T>> {
-        let position = self.position(key);
-        self.table[position]
-            .iter()
-            .filter(|cur| 
-                self._cur_unwrap(cur).is_some_and(|ent| 
-                    ent.key() == key))
-            
-
-        None
+    fn get(&self, key: &str) -> Option<Arc<dyn IndexNode>> {
+        // let position = self.position(key);
+        // self.table[position]
+        //     .iter()
+        //     .filter(|cur| 
+        //         self._cur_unwrap(cur).is_some_and(|ent| 
+        //             ent.key() == key))
+        todo!();
     }
 
     // fn walk
 
-    fn _cur_unwrap(&self, mut cur: CursorMut<Weak<T>>) -> Option<Arc<T>> {
+    fn _cur_unwrap(&self, mut cur: CursorMut<Weak<dyn IndexNode>>) -> Option<Arc<dyn IndexNode>> {
         match cur.current() {
             Some(wptr) => wptr.upgrade(),
             None => None
@@ -127,7 +114,7 @@ impl<'a, 'b, T: Cachable<'b>, H: Hasher + Default> DefaultCache<'a, T, H> {
                     .is_some_and(|wptr| {
                         wptr.upgrade()
                             .is_some_and(|entry|
-                                entry.key() == key)})})?
+                                entry.key().is_ok_and(|k| k == key))})})?
             .index()
     }
 }

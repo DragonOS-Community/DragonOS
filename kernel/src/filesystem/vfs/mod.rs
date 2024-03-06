@@ -9,7 +9,7 @@ mod utils;
 
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 
-use alloc::{string::String, sync::{Arc, Weak}, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
@@ -116,7 +116,14 @@ bitflags! {
     }
 }
 
-pub trait IndexNode: Any + Sync + Send + Debug {
+trait IsCache { fn is_cache() -> bool; }
+pub struct Cachable;
+pub struct UnCachable;
+
+impl IsCache for Cachable { fn is_cache() -> bool { true } }
+impl IsCache for UnCachable { fn is_cache() -> bool { false } }
+
+pub trait IndexNode<C: IsCache = UnCachable>: Any + Sync + Send + Debug {
     /// @brief 打开文件
     ///
     /// @return 成功：Ok()
@@ -278,7 +285,8 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
-    /// @brief 将指定名称的子目录项的文件内容，移动到target这个目录下。如果_old_name所指向的inode与_target的相同，那么则直接执行重命名的操作。
+    /// @brief 将指定名称的子目录项的文件内容，移动到target这个目录下。
+    /// 如果_old_name所指向的inode与_target的相同，那么则直接执行重命名的操作。
     ///
     /// @param old_name 旧的名字
     ///
@@ -394,6 +402,26 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     fn special_node(&self) -> Option<SpecialNodeData> {
         None
     }
+
+    fn cachable(&self) -> bool {
+        C::is_cache()
+    }
+
+    /// name for hashing
+    fn key(&self) -> Result<String, SystemError> {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    }
+
+    /// node for examined
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP) 
+    }
+
+
+    /// @brief 返回查询缓存
+    fn cache(&self) -> Result<Arc<DefaultCache>, SystemError> {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    }
 }
 
 impl DowncastArc for dyn IndexNode {
@@ -416,10 +444,6 @@ impl dyn IndexNode {
     /// @return Ok(Arc<dyn IndexNode>) 要寻找的目录项的inode
     /// @return Err(SystemError) 错误码
     pub fn lookup(&self, path: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        // quick lookup
-        if let Some(x) = self.quick_lookup(path) {
-            return Ok(x);
-        }
         self.lookup_follow_symlink(path, 0)
     }
 
@@ -435,8 +459,13 @@ impl dyn IndexNode {
         path: &str,
         max_follow_times: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        
         if self.metadata()?.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
+        }
+
+        if self.cachable() {
+            todo!("cacheseaching series")
         }
 
         // 处理绝对路径
@@ -510,10 +539,7 @@ impl dyn IndexNode {
     /// 缓存可能未命中
     fn quick_lookup(&self, path: &str) -> Option<Arc<dyn IndexNode>> {
         if let Some((path_left, name)) = path.rsplit_once('/') {
-            return match self.fs().cache() {
-                Some(mut cache) => cache.get(name),
-                None => None
-            };
+            todo!("Should imple lookup walk");
         }
         None
     }
@@ -572,7 +598,7 @@ pub struct Metadata {
 
 impl Default for Metadata {
     fn default() -> Self {
-        return Self {
+        Self {
             dev_id: 0,
             inode_id: InodeId::new(0),
             size: 0,
@@ -587,7 +613,7 @@ impl Default for Metadata {
             uid: 0,
             gid: 0,
             raw_dev: DeviceNumber::default(),
-        };
+        }
     }
 }
 
@@ -603,10 +629,6 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;
 
-    /// @brief 返回查询缓存
-    fn cache(&self) -> Option<DefaultCache<dyn IndexNode>> {
-        None
-    }
 }
 
 impl DowncastArc for dyn FileSystem {

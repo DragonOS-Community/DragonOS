@@ -287,8 +287,7 @@ pub enum SystemError {
     KVM_HVA_ERR_BAD = 519,
     /// 没有对应的ioctlcmd
     ENOIOCTLCMD = 520,
-    /// unsupported file system
-    EUNSUPFS = 521,
+
 }
 
 impl SystemError {

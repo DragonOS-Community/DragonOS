@@ -1,9 +1,7 @@
 use core::ffi::{c_char, c_void, CStr};
 
 use alloc::{
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
+    borrow::ToOwned, string::{String, ToString}, sync::Arc, vec::Vec
 };
 use system_error::SystemError;
 
@@ -18,7 +16,7 @@ use crate::{
     mm::{verify_area, VirtAddr},
     process::ProcessManager,
     syscall::{
-        user_access::{check_and_clone_cstr, UserBufferReader, UserBufferWriter},
+        user_access::{self, check_and_clone_cstr, UserBufferReader, UserBufferWriter},
         Syscall,
     },
     time::TimeSpec,
@@ -1011,55 +1009,47 @@ impl Syscall {
         kwarn!("fchmod not fully implemented");
         return Ok(0);
     }
-    /// #mount
-    /// ## 介绍:
+    /// #挂载文件系统
+    /// 
     /// 用于挂载文件系统,目前仅支持ramfs挂载
+    /// 
     /// ## 参数:
-    /// @param source       挂载目标的文件夹名
-    /// @param target       挂载目录的父目录
-    /// @param filesystemtype   文件系统
-    /// @param mountflags     挂载选项（暂未实现）
-    /// @param data        带数据挂载
+    /// 
+    /// - source       挂载目标的文件夹名
+    /// - target       挂载目录的父目录
+    /// - filesystemtype   文件系统
+    /// - mountflags     挂载选项（暂未实现）
+    /// - data        带数据挂载
+    /// 
+    /// ## 返回值
+    /// - Ok(0): 挂载成功
+    /// - Err(SystemError) :挂载过程中出错
     pub fn mount(
-        source: *const c_char,
-        target: *const c_char,
-        filesystemtype: *const c_char,
+        source: *const u8,
+        target: *const u8,
+        filesystemtype: *const u8,
         _mountflags: usize,
         _data: *const c_void,
     ) -> Result<usize, SystemError> {
-        let source = Self::read_from_cstr(source).unwrap();
+        let source = user_access::check_and_clone_cstr(source, Some(MAX_PATHLEN))?;
 
-        let target = Self::read_from_cstr(target).unwrap();
+        let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?;
 
-        let filesystemtype = Self::read_from_cstr(filesystemtype).unwrap();
+        let filesystemtype = user_access::check_and_clone_cstr(filesystemtype, Some(MAX_PATHLEN))?;
 
         Self::mkdir(
-            (target.clone() + &source).as_str(),
+            (format!("{target}{source}")).as_str(),
             FileMode::O_PATH_FLAGS.bits().try_into().unwrap(),
         )?;
-        // (FileMode::O_WRONLY|FileMode::O_RDWR|FileMode::O_ACCMODE|FileMode::O_CREAT|FileMode::O_EXCL|FileMode::O_NOCTTY).bits().try_into().unwrap()
-        // bug: when using match , cannot return the right filesystem
+        
         let filesystemtype = match filesystemtype.as_str() {
             "ramfs" => Ok(RamFS::new()),
-            _ => Err(SystemError::EUNSUPFS),
+            _ => Err(SystemError::EINVAL),
         }?;
 
-        return Vcore::do_mount(filesystemtype, (target.clone() + &source).as_str());
+        return Vcore::do_mount(filesystemtype, (format!("{target}{source}")).as_str());
     }
 
-    pub fn read_from_cstr(source: *const c_char) -> Result<String, SystemError> {
-        // Create a CString from the raw pointer
-        let cstr = unsafe { CStr::from_ptr(source) };
-
-        // Convert the CString to a Rust String
-        let result = cstr.to_string_lossy().into_owned();
-
-        if result.len() >= MAX_PATHLEN {
-            return Err(SystemError::ENAMETOOLONG);
-        }
-
-        Ok(result)
-    }
 }
 
 #[repr(C)]

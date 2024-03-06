@@ -295,9 +295,7 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 // @brief mount filesystem
 pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<usize, SystemError> {
     let _t = ROOT_INODE()
-        .lookup_follow_symlink(&mount_point, VFS_MAX_FOLLOW_SYMLINK_TIMES)
-        .expect(format!("Cannot find {}", mount_point).as_str())
-        .mount(fs)
-        .expect("Failed to mount");
+        .lookup_follow_symlink(&mount_point, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
+        .mount(fs)?;
     Ok(0)
 }

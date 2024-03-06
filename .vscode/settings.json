@@ -128,7 +128,6 @@
         "idr.h": "c",
         "ktest_utils.h": "c",
         "kthread.h": "c",
-        "lockref.h": "c",
         "compiler_attributes.h": "c",
         "timer.h": "c",
         "hid.h": "c",

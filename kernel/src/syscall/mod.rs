@@ -6,6 +6,7 @@ use core::{
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
     driver::base::device::device_number::DeviceNumber,
+    ipc::shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::syscall::MremapFlags,
     net::syscall::MsgHdr,
@@ -1029,6 +1030,30 @@ impl Syscall {
             }
 
             SYS_SCHED_YIELD => Self::sched_yield(),
+
+            SYS_SHMGET => {
+                let key = ShmKey::new(args[0]);
+                let size = args[1];
+                let shm_flags = ShmFlags::from_bits_truncate(args[2] as u32);
+                Self::shmget(key, size, shm_flags)
+            }
+            SYS_SHMAT => {
+                let shm_id = ShmId::new(args[0]);
+                let start_vaddr = VirtAddr::new(args[1]);
+                let shm_flags = ShmFlags::from_bits_truncate(args[2] as u32);
+                Self::shmat(shm_id, start_vaddr, shm_flags)
+            }
+            SYS_SHMDT => {
+                let start_vaddr = VirtAddr::new(args[0]);
+                Self::shmdt(start_vaddr)
+            }
+            SYS_SHMCTL => {
+                let shm_id = ShmId::new(args[0]);
+                let cmd = ShmCtlCmd::from(args[1]);
+                let buf_vaddr = args[2];
+                let from_user = frame.from_user();
+                Self::shmctl(shm_id, cmd, buf_vaddr, from_user)
+            }
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };

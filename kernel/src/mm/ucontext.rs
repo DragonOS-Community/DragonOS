@@ -19,6 +19,7 @@ use system_error::SystemError;
 use crate::{
     arch::{mm::PageMapper, CurrentIrqArch, MMArch},
     exception::InterruptArch,
+    ipc::shm::SHM_MANAGER,
     libs::{
         align::page_align_up,
         rwlock::{RwLock, RwLockWriteGuard},
@@ -899,6 +900,10 @@ impl LockedVMA {
         return self.0.lock();
     }
 
+    pub fn update_mapped(&self, mapped: bool) {
+        self.lock().mapped = mapped;
+    }
+
     /// 调整当前VMA的页面的标志位
     ///
     /// TODO：增加调整虚拟页映射的物理地址的功能
@@ -946,7 +951,12 @@ impl LockedVMA {
 
             // 目前由于还没有实现共享页，所以直接释放物理页也没问题。
             // 但是在实现共享页之后，就不能直接释放物理页了，需要在anon_vma链表长度为0的时候才能释放物理页
-            unsafe { deallocate_page_frames(PhysPageFrame::new(paddr), PageFrameCount::new(1)) };
+
+            if SHM_MANAGER.lock().can_deallocate(paddr) {
+                unsafe {
+                    deallocate_page_frames(PhysPageFrame::new(paddr), PageFrameCount::new(1))
+                };
+            }
 
             flusher.consume(flush);
         }

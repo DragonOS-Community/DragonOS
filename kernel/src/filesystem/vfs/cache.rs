@@ -1,9 +1,15 @@
+/**
+ * Todo:
+ * [ ] - 注入式的路径比较：path是否需要设计
+ * [ ] -
+ */
 use alloc::{collections::{linked_list::CursorMut, LinkedList}, sync::{Arc, Weak}, vec::Vec};
 use system_error::SystemError;
-use core::{hash::{Hash, Hasher, SipHasher}, marker::PhantomData, mem::size_of, ops::Index, ptr::NonNull};
+use core::{hash::{Hash, Hasher, SipHasher}, marker::PhantomData, mem::size_of, ptr::NonNull};
 
 use super::IndexNode;
 
+// use std::path
 // pub trait Cacher<H: Hasher + Default> {
 //     fn cache(&self) -> Arc<DefaultCache<dyn IndexNode, H>>;
 // }
@@ -62,6 +68,7 @@ impl<'a, 'b, H: Hasher + Default> DefaultCache<'a, H> {
             .extract_if(|cur| {
                 if let Some(wptr) = cur.as_cursor().current() {
                     if let Some(entry) = wptr.upgrade() {
+                        // Check if the same
                         todo!() 
                     }
                 }

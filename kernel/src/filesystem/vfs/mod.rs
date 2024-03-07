@@ -3,7 +3,7 @@ pub mod fcntl;
 pub mod file;
 pub mod mount;
 pub mod open;
-pub mod syscall;
+pub mod syscall; 
 pub mod cache;
 mod utils;
 
@@ -116,14 +116,8 @@ bitflags! {
     }
 }
 
-trait IsCache { fn is_cache() -> bool; }
-pub struct Cachable;
-pub struct UnCachable;
 
-impl IsCache for Cachable { fn is_cache() -> bool { true } }
-impl IsCache for UnCachable { fn is_cache() -> bool { false } }
-
-pub trait IndexNode<C: IsCache = UnCachable>: Any + Sync + Send + Debug {
+pub trait IndexNode: Any + Sync + Send + Debug {
     /// @brief 打开文件
     ///
     /// @return 成功：Ok()
@@ -403,10 +397,6 @@ pub trait IndexNode<C: IsCache = UnCachable>: Any + Sync + Send + Debug {
         None
     }
 
-    fn cachable(&self) -> bool {
-        C::is_cache()
-    }
-
     /// name for hashing
     fn key(&self) -> Result<String, SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
@@ -416,7 +406,6 @@ pub trait IndexNode<C: IsCache = UnCachable>: Any + Sync + Send + Debug {
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP) 
     }
-
 
     /// @brief 返回查询缓存
     fn cache(&self) -> Result<Arc<DefaultCache>, SystemError> {
@@ -464,7 +453,7 @@ impl dyn IndexNode {
             return Err(SystemError::ENOTDIR);
         }
 
-        if self.cachable() {
+        if let Some(cache) = self.cache().ok() {
             todo!("cacheseaching series")
         }
 
@@ -478,7 +467,7 @@ impl dyn IndexNode {
             (self.find(".")?, String::from(path))
         };
 
-        // 逐级查找文件
+        // 逐级查找文件 
         while !rest_path.is_empty() {
             // 当前这一级不是文件夹
             if result.metadata()?.file_type != FileType::Dir {

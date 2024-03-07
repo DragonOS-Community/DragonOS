@@ -90,11 +90,11 @@ use crate::{
 pub struct Keyer(Weak<LockedEntry>, Option<String>);
 
 impl Keyer {
-    fn from_str(key: &str) -> Keyer {
+    fn from_str(key: &str) -> Self {
         Keyer(Weak::new(), Some(String::from(key)))
     }
 
-    fn from_entry(entry: &Arc<LockedEntry>) -> Keyer {
+    fn from_entry(entry: &Arc<LockedEntry>) -> Self {
         Keyer(Arc::downgrade(entry), None)
     }
 }
@@ -106,29 +106,59 @@ impl Keyer {
         }
         Some(self.0.upgrade()?.0.lock().name.clone())
     }
+
+    // /// [unsafe]: use in one line or may lead to memory leak
+    // fn inline_ref(&self) -> Option<&str> {
+    //     if self.1.is_some() {
+    //         return self.1.as_ref().map(|x| x.as_str());
+    //     }
+    //     Some(&self.0.upgrade()?.0.lock().name)
+    // }
+
+    
 }
 
 // For Btree insertion
 impl PartialEq for Keyer {
     fn eq(&self, other: &Self) -> bool {
-        // if self.0.ptr_eq(&other.0) {
-        //     return true;
-        // }
-        // if other.1.is_some() {
-        //     if let Some(enkey) = self.0.upgrade() {
-        //         return &enkey.0.lock().name == other.1.as_ref().unwrap();
-        //     } 
-        // } else if self.1.is_some() {
-        //     if let Some(enkey) = other.0.upgrade() {
-        //         return &enkey.0.lock().name == self.1.as_ref().unwrap();
-        //     }
-        // }
         kinfo!("Call Keyer::eq");
-        self.get().is_some_and(|k1|{
-            other.get().is_some_and(|k2|{
-                k1 == k2
-            })
-        })
+        if self.0.ptr_eq(&other.0) {
+            kinfo!("Compare itself!");
+            return true;
+        }
+        if self.1.is_none() && other.1.is_none() {
+            // cmp between wrapper
+            let opt1 = self.0.upgrade();
+            let opt2 = other.0.upgrade();
+            if opt1.is_none() && opt2.is_none() {
+                kerror!("Empty Both none!");
+                return false;
+            }
+            if opt1.is_none() || opt2.is_none() {
+                return false;
+            }
+            return opt1.unwrap().0.lock().name == opt2.unwrap().0.lock().name;
+        }
+
+        if self.1.is_none() {
+            let opt = self.0.upgrade();
+            if opt.is_none() {
+                kwarn!("depecated");
+                return false;
+            }
+
+            return &opt.unwrap().0.lock().name == other.1.as_ref().unwrap();
+
+        } else {
+            let opt = other.0.upgrade();
+            if opt.is_none() {
+                kwarn!("depecated");
+                return false;
+            }
+            
+            return &opt.unwrap().0.lock().name == self.1.as_ref().unwrap();
+
+        }
     }
 }
 
@@ -137,110 +167,104 @@ impl Eq for Keyer {}
 // Todo: improve performance
 impl PartialOrd for Keyer {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        // let ret: Ordering;
-        // if self.0.ptr_eq(&other.0) {
-        //     ret = Ordering::Equal;
-        // } else if other.1.is_some() {
-        //     if let Some(enkey) = self.0.upgrade() {
-        //         ret = enkey.0.lock().name.cmp(&other.1.as_ref().unwrap());
-        //     } else {
-        //         kwarn!("Entry reach empty\0");
-        //         ret = Ordering::Less;
-        //     }
-        // } else if self.1.is_some() {
-        //     if let Some(enkey) = other.0.upgrade() {
-        //         ret = enkey.0.lock().name.cmp(&self.1.as_ref().unwrap());
-        //     } else {
-        //         kwarn!("Entry reach empty\0");
-        //         ret = Ordering::Greater;
-        //     }
-        // } else {
-        //     ret = self.get().cmp(&other.get());
-        // }
-        let ret: Ordering;
-        if self.0.ptr_eq(&other.0) {
+        let mut ret: Ordering = Ordering::Equal;
+        if self.0.ptr_eq(&other.0) { 
+            kinfo!("Compare itself!");
             ret = Ordering::Equal;
-        }/* else if other.1.is_some() { */ 
-        //     if let Some(enkey) = self.0.upgrade() {
-        //         ret = enkey.cmp(&other.1.as_ref().unwrap());
+        }
+        if self.1.is_none() && other.1.is_none() {
+            // cmp between wrapper
+            let opt1 = self.0.upgrade();
+            let opt2 = other.0.upgrade();
+            if opt1.is_none() && opt2.is_none() {
+                kerror!("Empty Both none!");
+                panic!("All Keys None, compare error!");
+            }
+            if opt1.is_some() && opt2.is_some() {
+                ret = opt1.unwrap().0.lock().name.cmp(&opt2.unwrap().0.lock().name);
+            } else {
+                kwarn!("depecated");
+                panic!("Empty Key!");
+            }
+        } else {
+            if self.1.is_none() {
+                let opt = self.0.upgrade();
+                if opt.is_none() {
+                    kwarn!("depecated");
+                    panic!("Empty Key!");
+                }
+                ret = opt.unwrap().0.lock().name.cmp(other.1.as_ref().unwrap());
 
-        //         kdebug!("Branch1");
-        //     } else {
-        //         kdebug!("Entry reach empty");
-        //         ret = Ordering::Less;
-        //     }
-        // } else if self.1.is_some() {
-        //     if let Some(enkey) = other.0.upgrade() {
-        //         kdebug!("Branch2");
-        //         ret = enkey.0.lock().name.cmp(&self.1.as_ref().unwrap());
-        //     } else {
-        //         kdebug!("Entry reach empty");
-        //         ret = Ordering::Greater;
-        //     }
-        // } else {
-        //     ret = self.get().cmp(&other.get());
-        // } 
-        else {
-            ret = self.get().cmp(&other.get());
-        } // Debug low performance
+            } else {
+                let opt = other.0.upgrade();
+                if opt.is_none() {
+                    kwarn!("depecated");
+                    panic!("Empty Key!");
+                }
+
+                ret = opt.unwrap().0.lock().name.cmp(self.1.as_ref().unwrap());
+            }
+        }
         let destring = match ret {
             Ordering::Equal => "Equal",
             Ordering::Less => "Less",
             Ordering::Greater => "Greater",
         };
-        kdebug!("POrd::Cmp {} and {} with result: {}\0", self.get().unwrap(), other.get().unwrap(), destring);
+        kdebug!("POrd::Cmp {} and {} with result: {}\0", self.get().unwrap_or(String::from("fail")), other.get().unwrap_or(String::from("fail")), destring);
         Some(ret)
     }
 }
 
 impl Ord for Keyer {
     fn cmp(&self, other: &Self) -> Ordering {
-        // kinfo!("Call Keyer::Ord::cmp");
-        // if self.0.ptr_eq(&other.0) {
-        //     return Ordering::Equal;
-        // }
-        // if other.1.is_some() {
-        //     if let Some(enkey) = self.0.upgrade() {
-        //         return enkey.0.lock().name.cmp(&other.1.as_ref().unwrap());
-        //     }
-        // } else if self.1.is_some() {
-        //     if let Some(enkey) = other.0.upgrade() {
-        //         return enkey.0.lock().name.cmp(&self.1.as_ref().unwrap());
-        //     }
-        // }
-        // Ordering::Less
-        let ret: Ordering;
+        kdebug!("Call Compare");
+        kdebug!("Comparing {:?} with {:?}", self, other);
+        let mut ret: Ordering = Ordering::Equal;
         if self.0.ptr_eq(&other.0) {
+            kdebug!("Compare itself!");
             ret = Ordering::Equal;
-        }/* else if other.1.is_some() { */ 
-        //     if let Some(enkey) = self.0.upgrade() {
-        //         ret = enkey.cmp(&other.1.as_ref().unwrap());
+        }
+        if self.1.is_none() && other.1.is_none() {
+            // cmp between wrapper
+            let opt1 = self.0.upgrade();
+            let opt2 = other.0.upgrade();
+            if opt1.is_none() && opt2.is_none() {
+                kerror!("Both None!");
+                panic!("All Keys None, compare error!");
+            }
+            if opt1.is_some() && opt2.is_some() {
+                ret = opt1.unwrap().0.lock().name.cmp(&opt2.unwrap().0.lock().name);
+                kdebug!("Comparing {:?} with {:?}", self.0.upgrade().unwrap().0.lock().name, other.0.upgrade().unwrap().0.lock().name);
+            } else {
+                kwarn!("depecated");
+                panic!("Empty Key!");
+            }
+        } else {
 
-        //         kdebug!("Branch1");
-        //     } else {
-        //         kdebug!("Entry reach empty");
-        //         ret = Ordering::Less;
-        //     }
-        // } else if self.1.is_some() {
-        //     if let Some(enkey) = other.0.upgrade() {
-        //         kdebug!("Branch2");
-        //         ret = enkey.0.lock().name.cmp(&self.1.as_ref().unwrap());
-        //     } else {
-        //         kdebug!("Entry reach empty");
-        //         ret = Ordering::Greater;
-        //     }
-        // } else {
-        //     ret = self.get().cmp(&other.get());
-        // } 
-        else {
-            ret = self.get().cmp(&other.get());
-        } // Debug low performance
+            if self.1.is_none() {
+                let opt = self.0.upgrade();
+                if opt.is_none() {
+                    kwarn!("depecated");
+                    panic!("Empty Key!");
+                }
+                ret = opt.unwrap().0.lock().name.cmp(other.1.as_ref().unwrap());
+
+            } else {
+                let opt = other.0.upgrade();
+                if opt.is_none() {
+                    kwarn!("depecated");
+                    panic!("Empty Key!");
+                }
+
+                ret = self.1.as_ref().unwrap().cmp(&opt.unwrap().0.lock().name);
+            }
+        }
         let destring = match ret {
             Ordering::Equal => "Equal",
             Ordering::Less => "Less",
             Ordering::Greater => "Greater",
         };
-        kdebug!("Ord::Cmp {} and {} with result: {}", self.get().unwrap(), other.get().unwrap(), destring);
+        kdebug!("Ord::Cmp {} and {} with result: {}\0", self.get().unwrap_or(String::from("fail")), other.get().unwrap_or(String::from("fail")), destring);
         ret
     }
 }
@@ -250,9 +274,9 @@ impl Ord for Keyer {
 
 #[derive(Debug)]
 pub struct Inode {
-    
+    /// 元数据
     metadata: Metadata,
-
+    /// 数据块
     data: Vec<u8>,
 }
 
@@ -264,7 +288,7 @@ pub struct LockedInode(SpinLock<Inode>);
 #[derive(Debug)]
 pub struct Entry {
 
-    pub name: String,
+    name: String,
 
     inode: Arc<LockedInode>,
 

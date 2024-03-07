@@ -407,7 +407,7 @@ impl Syscall {
                     }
                 }
             }
-            
+
             #[cfg(target_arch = "x86_64")]
             SYS_RMDIR => {
                 let pathname = args[0] as *const u8;

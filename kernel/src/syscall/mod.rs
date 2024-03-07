@@ -407,6 +407,12 @@ impl Syscall {
                     }
                 }
             }
+            
+            #[cfg(target_arch = "x86_64")]
+            SYS_RMDIR => {
+                let pathname = args[0] as *const u8;
+                Self::rmdir(pathname)
+            }
 
             #[cfg(target_arch = "x86_64")]
             SYS_UNLINK => {

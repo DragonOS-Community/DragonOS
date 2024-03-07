@@ -297,6 +297,17 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
+    /// @brief 对文件进行重命名操作
+    ///
+    /// @param new_name 新的文件名
+    ///
+    /// @return 成功: Ok()
+    ///         失败: Err(错误码) 
+    fn rename(&self, _old_name:&str, _new_name:&str) -> Result<(),SystemError> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
     /// @brief 寻找一个名为Name的inode
     ///
     /// @param name 要寻找的inode的名称

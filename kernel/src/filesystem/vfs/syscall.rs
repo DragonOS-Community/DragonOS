@@ -266,6 +266,8 @@ impl Syscall {
         return do_sys_open(dirfd, path, o_flags, mode, follow_symlink);
     }
 
+    
+
     /// @brief 关闭文件
     ///
     /// @param fd 文件描述符编号
@@ -574,6 +576,8 @@ impl Syscall {
         }
     }
 
+   
+
     pub fn unlink(pathname: *const u8) -> Result<usize, SystemError> {
         if pathname.is_null() {
             return Err(SystemError::EFAULT);
@@ -591,6 +595,27 @@ impl Syscall {
         let pathname = pathname.trim();
 
         return do_unlink_at(AtFlags::AT_FDCWD.bits(), pathname).map(|v| v as usize);
+    }
+
+    //Syscall_rename
+    pub fn do_renameat2(oldfd: i32, filename_from: &str, newfd: i32, filename_to: &str, _flags: u32, ) -> Result<usize,SystemError> {
+        // 文件名过长
+        if filename_from.len() > MAX_PATHLEN as usize || filename_to.len() > MAX_PATHLEN as usize {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+        //获取pcb，文件节点
+        let pcb = ProcessManager::current_pcb();
+        let (old_inode_begin,_old_remain_path) = user_path_at(&pcb,oldfd,filename_from)?;     
+        let (new_inode_begin,_new_remain_path) = user_path_at(&pcb,newfd,filename_to)?;
+        //获取父目录
+        let (old_filename,old_parent_path) = rsplit_path(filename_from);
+        let old_parent_inode = old_inode_begin
+            .lookup_follow_symlink(old_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        let (new_filename,new_parent_path) = rsplit_path(filename_to);
+        let new_parent_inode = new_inode_begin
+            .lookup_follow_symlink(new_parent_path.unwrap_or("/"),VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        old_parent_inode.move_(old_filename,&new_parent_inode,new_filename)?;
+        return Ok(0);
     }
 
     /// @brief 根据提供的文件描述符的fd，复制对应的文件结构体，并返回新复制的文件结构体对应的fd
@@ -1111,3 +1136,6 @@ impl IoVecs {
         return buf;
     }
 }
+
+
+        

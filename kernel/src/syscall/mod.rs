@@ -3,17 +3,17 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+
 use crate::{
-    arch::{ipc::signal::SigSet, syscall::nr::*},
+    arch::{ipc::signal::SigSet, syscall::nr::*}, 
     driver::base::device::device_number::DeviceNumber,
-    libs::{futex::constant::FutexFlag, rand::GRandFlags},
-    mm::syscall::MremapFlags,
-    net::syscall::MsgHdr,
+    libs::{futex::constant::FutexFlag, rand::GRandFlags}, 
+    mm::syscall::MremapFlags, net::syscall::MsgHdr, 
     process::{
         fork::KernelCloneArgs,
         resource::{RLimit64, RUsage},
         ProcessManager,
-    },
+    }
 };
 
 use num_traits::FromPrimitive;
@@ -23,7 +23,7 @@ use crate::{
     arch::{cpu::cpu_reset, interrupt::TrapFrame, MMArch},
     driver::base::block::SeekFrom,
     filesystem::vfs::{
-        fcntl::FcntlCommand,
+        fcntl::{FcntlCommand,AtFlags},
         file::FileMode,
         syscall::{ModeType, PosixKstat, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
         MAX_PATHLEN,
@@ -108,6 +108,27 @@ impl Syscall {
                     Self::open(path, open_flags, mode, true)
                 };
                 res
+            }
+
+            SYS_RENAME => {
+                let oldname: *const i8 = args[0] as *const c_char;
+                let newname: *const i8 = args[1] as * const c_char;
+                let getname = |name| {
+                    let name: &CStr = unsafe {CStr::from_ptr(name)};
+                    let name: &str = name.to_str().map_err(|_| SystemError::EINVAL)?;
+                    if name.len() >= MAX_PATHLEN{
+                        return Err(SystemError::ENAMETOOLONG);
+                    }
+                    return Ok(name.trim());
+                };
+                let oldname = getname(oldname);
+                let newname = getname(newname);
+                Self::do_renameat2(
+                    AtFlags::AT_FDCWD.bits(),
+                    oldname.unwrap(),
+                    AtFlags::AT_FDCWD.bits(),
+                    newname.unwrap(),
+                    0)
             }
 
             SYS_OPENAT => {
@@ -1028,6 +1049,24 @@ impl Syscall {
                 )
             }
 
+            SYS_FADVISE64 => {
+                 // todo: 这个系统调用还没有实现
+
+                Err(SystemError::ENOSYS)
+            }
+            SYS_NEWFSTATAT =>{
+                 // todo: 这个系统调用还没有实现
+
+                 Err(SystemError::ENOSYS)
+            }
+
+           
+            SYS_RMDIR => {
+                // todo: 这个系统调用还没有实现
+                //需要实现才可正常运行rmdir
+                Err(SystemError::ENOSYS)
+            }
+            
             SYS_SCHED_YIELD => Self::sched_yield(),
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),

@@ -201,6 +201,7 @@ impl IndexNode for KernFSInode {
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
     ) -> Result<(), SystemError> {
+        kdebug!("kernfs");
         // 应当通过kernfs的其它方法来操作文件，而不能从用户态直接调用此方法。
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
@@ -282,6 +283,7 @@ impl IndexNode for KernFSInode {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
+        
         let info = self.metadata()?;
         if info.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
@@ -365,6 +367,11 @@ impl IndexNode for KernFSInode {
             .as_ref()
             .unwrap()
             .write(callback_data, &buf[..len], offset);
+    }
+
+    fn rename(&self, _old_name:&str, _new_name:&str) -> Result<(),SystemError> {
+        //待实现
+        return Ok(());
     }
 }
 

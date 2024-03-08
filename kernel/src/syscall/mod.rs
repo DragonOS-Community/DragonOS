@@ -1035,12 +1035,18 @@ impl Syscall {
 
     pub fn put_string(
         s: *const u8,
-        _front_color: u32,
-        _back_color: u32,
+        front_color: u32,
+        back_color: u32,
     ) -> Result<usize, SystemError> {
         // todo: 删除这个系统调用
         let s = check_and_clone_cstr(s, Some(4096))?;
-        print!("{s}");
+        let fr = (front_color & 0x00ff0000) >> 16;
+        let fg = (front_color & 0x0000ff00) >> 8;
+        let fb = front_color & 0x000000ff;
+        let br = (back_color & 0x00ff0000) >> 16;
+        let bg = (back_color & 0x0000ff00) >> 8;
+        let bb = back_color & 0x000000ff;
+        print!("\x1B[38;2;{fr};{fg};{fb};48;2;{br};{bg};{bb}m{s}\x1B[0m");
         return Ok(s.len());
     }
 

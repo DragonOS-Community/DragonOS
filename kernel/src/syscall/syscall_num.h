@@ -65,6 +65,8 @@
 
 #define SYS_MKDIR 83
 
+#define SYS_RMDIR 84
+
 #define SYS_GETTIMEOFDAY 96
 
 #define SYS_ARCH_PRCTL 158

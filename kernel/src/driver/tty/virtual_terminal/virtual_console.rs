@@ -737,6 +737,7 @@ impl VirtualConsoleData {
         }
     }
 
+    #[inline(never)]
     fn do_getpars(&mut self, c: char) {
         if c == ';' && self.npar < (NPAR - 1) as u32 {
             self.npar += 1;
@@ -907,6 +908,18 @@ impl VirtualConsoleData {
             'P' => {
                 todo!("csi_P todo");
             }
+
+            // 非ANSI标准，为ANSI拓展
+            'S' => {
+                self.scroll(ScrollDir::Up, self.par[0] as usize);
+                return;
+            }
+
+            'T' => {
+                self.scroll(ScrollDir::Down, self.par[0] as usize);
+                return;
+            }
+
             'c' => {
                 if self.par[0] == 0 {
                     kwarn!("respone ID todo");
@@ -964,6 +977,7 @@ impl VirtualConsoleData {
     }
 
     /// ##  处理Control Sequence Introducer（控制序列引导符） m字符
+    #[inline(never)]
     fn csi_m(&mut self) {
         let mut i = 0;
         loop {
@@ -1243,6 +1257,7 @@ impl VirtualConsoleData {
     }
 
     /// ## 处理终端控制字符
+    #[inline(never)]
     pub(super) fn do_control(&mut self, ch: u32) {
         // 首先检查是否处于 ANSI 控制字符串状态
         if self.vc_state.is_ansi_control_string() && ch >= 8 && ch <= 13 {
@@ -1519,6 +1534,7 @@ impl VirtualConsoleData {
         }
     }
 
+    #[inline(never)]
     pub(super) fn console_write_normal(
         &mut self,
         mut tc: u32,
@@ -1648,8 +1664,7 @@ impl VirtualConsoleData {
     fn do_update_region(&self, mut start: usize, mut count: usize) {
         let ret = self.driver_funcs().con_getxy(self, start);
         let (mut x, mut y) = if ret.is_err() {
-            let offset = start / 2;
-            (offset % self.cols, offset / self.cols)
+            (start % self.cols, start / self.cols)
         } else {
             let (tmp_start, tmp_x, tmp_y) = ret.unwrap();
             start = tmp_start;

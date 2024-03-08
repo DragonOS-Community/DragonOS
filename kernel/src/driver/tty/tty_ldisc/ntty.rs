@@ -404,6 +404,7 @@ impl NTtyData {
         }
     }
 
+    #[inline(never)]
     pub fn receive_special_char(&mut self, mut c: u8, tty: Arc<TtyCore>, lookahead_done: bool) {
         let is_flow_ctrl = self.is_flow_ctrl_char(tty.clone(), c, lookahead_done);
         let termios = tty.core().termios();
@@ -580,6 +581,7 @@ impl NTtyData {
     }
 
     /// ## ntty默认eraser function
+    #[inline(never)]
     fn eraser(&mut self, mut c: u8, termios: &RwLockReadGuard<Termios>) {
         if self.read_head == self.canon_head {
             return;
@@ -1249,6 +1251,7 @@ impl NTtyData {
         }
     }
 
+    #[inline(never)]
     pub fn echoes(&mut self, tty: Arc<TtyCore>) -> Result<usize, SystemError> {
         let mut space = tty.write_room(tty.core());
         let ospace = space;
@@ -1559,6 +1562,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         Ok(())
     }
 
+    #[inline(never)]
     fn read(
         &self,
         tty: Arc<TtyCore>,
@@ -1706,6 +1710,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         ret
     }
 
+    #[inline(never)]
     fn write(
         &self,
         tty: Arc<TtyCore>,
@@ -1858,6 +1863,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         }
     }
 
+    #[inline(never)]
     fn set_termios(
         &self,
         tty: Arc<TtyCore>,

@@ -1,30 +1,7 @@
 #include "common/asm.h"
+#include "asm/csr.h"
 
 .section .bootstrap
-
-#define CSR_SSTATUS		0x100
-#define CSR_SIE			0x104
-#define CSR_STVEC		0x105
-#define CSR_SIP			0x144
-
-# define CSR_TVEC	CSR_STVEC
-
-# define CSR_STATUS	CSR_SSTATUS
-#define CSR_IE CSR_SIE
-#define CSR_IP CSR_SIP
-
-#define SR_FS 0x00006000
-#define SR_VS 0x00000600
-#define SR_FS_VS	(SR_FS | SR_VS) /* Vector and Floating-Point Unit */
-
-#define SATP_MODE_39 0x8000000000000000ULL
-#define SATP_MODE_48 0x9000000000000000ULL
-#define SATP_MODE_57 0xa000000000000000ULL
-
-#define PAGE_OFFSET 0xffffffc000000000
-#define KERNEL_LINK_OFFSET 0x1000000
-#define KERNEL_VIRT_START (PAGE_OFFSET + KERNEL_LINK_OFFSET)
-
 
 // 内核入口（从DragonStub跳转到这里）
 // 参数：
@@ -86,9 +63,11 @@ ENTRY(_start)
 __init_set_pgtable_loop_end:
 	call __initial_reloacate_enable_mmu
 
+
+
 .option push
 .option norelax
-	
+	// 设置栈指针
 	la a0, BSP_IDLE_STACK_SPACE
 	mv sp, a0
 	li t0, 32752	// 预留16字节防止越界
@@ -100,6 +79,7 @@ __init_set_pgtable_loop_end:
 	 */
 	li t0, SR_FS_VS
 	csrc CSR_STATUS, t0
+
 	
 	/* Call the kernel */
 	la a0, __initial_hartid_ptr
@@ -128,7 +108,7 @@ __initial_reloacate_enable_mmu:
 
 	/* Point stvec to virtual address of intruction after satp write */
 	/* Set trap vector to spin forever to help debug */
-	la a2, 1f
+	la a2, 3f
 	add a2, a2, t1
 	csrw CSR_TVEC, a2
 	// enable MMU
@@ -142,7 +122,7 @@ __initial_reloacate_enable_mmu:
 	sfence.vma
 	csrw satp, a2
 	
-1:
+3:
 	la a0, __initial_Lsecondary_park
 	add a0, a0, t1
 	csrw CSR_TVEC, a0
@@ -336,6 +316,7 @@ __initial_clear_pgtable_loop:
 	bnez t1, __initial_clear_pgtable_loop
 
 	ret
+
 
 .align 2
 __initial_Lsecondary_park:

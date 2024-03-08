@@ -3,125 +3,143 @@
  * [ ] - 注入式的路径比较：path是否需要设计
  * [ ] -
  */
-use alloc::{collections::{linked_list::CursorMut, LinkedList}, sync::{Arc, Weak}, vec::Vec};
+use alloc::{collections::{LinkedList, VecDeque}, sync::{Arc, Weak}, vec::Vec};
 use system_error::SystemError;
-use core::{hash::{Hash, Hasher, SipHasher}, marker::PhantomData, mem::size_of, ptr::NonNull};
+use core::{hash::{Hash, Hasher, SipHasher}, marker::PhantomData, mem::size_of, ops::Index};
+
+use crate::libs::{rwlock::{RwLock, RwLockReadGuard}, spinlock::SpinLock};
 
 use super::IndexNode;
+type Resource = Weak<dyn IndexNode>;
+type SrcPtr = Weak<Resource>;
+type SrcManage = Arc<Resource>;
 
-// use std::path
-// pub trait Cacher<H: Hasher + Default> {
-//     fn cache(&self) -> Arc<DefaultCache<dyn IndexNode, H>>;
-// }
-
-// pub trait Cachable<'a> : IndexNode {
-    
-// }
-
-// CacheLine = Weak<dyn IndexNode>
-
-pub struct DefaultCache<'a, H: Hasher + Default = SipHasher> {
+struct HashTable<H: Hasher + Default> {
     _hash_type: PhantomData<H>,
-    table: Vec<LinkedList<CursorMut<'a, Weak<dyn IndexNode>>>>,
-    deque: LinkedList<Weak<dyn IndexNode>>,
-    max_size: u64,
+    table: Vec<RwLock<LinkedList<SrcPtr>>>,
 }
 
-
-impl<'a, 'b, H: Hasher + Default> DefaultCache<'a, H> {
-    const DEFAULT_MEMORY_SIZE: u64 = 1024 /* K */ * 1024 /* Byte */;
-    ///@brief table size / 2 * (sizeof Cursor + sizeof listnode) = Memory Cost.
-    fn new(size: Option<u64>) -> DefaultCache<'a, H> {
-
-        let vec_size = size.unwrap_or(Self::DEFAULT_MEMORY_SIZE) / 
-            (size_of::<CursorMut<'a, Weak<dyn IndexNode>>>() + size_of::<Option<NonNull<dyn IndexNode>>>()) as u64 * 2;
-        let capacity = vec_size / 2;
-        let mut tmp: Vec<LinkedList<CursorMut<'a, Weak<dyn IndexNode>>>> = Vec::new();
-        // tmp.resize(vec_size as usize, LinkedList::new());
-        for _ in [0..vec_size] {
-            tmp.push(LinkedList::new());
-        }
-
-        DefaultCache {
+impl<H: Hasher + Default> HashTable<H> {
+    fn new(size: usize) -> Self {
+        Self {
             _hash_type: PhantomData::default(),
-            table: tmp,
-            deque: LinkedList::new(),
-            max_size: capacity,
+            table: Vec::with_capacity(size)
+        }
+    }
+    /// 下标帮助函数
+    fn _position(&self, key: &str) -> usize {
+        let mut hasher = H::default();
+        key.hash(&mut hasher);
+        hasher.finish() as usize % self.table.capacity()
+    }
+    /// 获取哈希桶
+    fn get_list(&self, key: &str) -> RwLockReadGuard<LinkedList<SrcPtr>> {
+        self.table[self._position(key)].read()
+    }
+    /// 插入索引
+    fn put(&mut self, key: &str, src: SrcPtr) {
+        let mut guard = self.table[self._position(key)].write();
+        guard.push_back(src);
+    }
+}
+
+struct LruList {
+    list: VecDeque<SrcPtr>,
+}
+
+impl LruList {
+    fn new() -> Self {
+        Self {
+            list: VecDeque::new()
         }
     }
 
-    // gain possision by spercific hasher
-    fn position(&self, key: &str) -> usize {
-        let mut state = H::default();
-        key.hash(&mut state);
-        (state.finish() / (self.max_size * 2)) as usize
+    fn push(&mut self, src: SrcPtr) {
+        self.list.push_back(src);
     }
-
-    // fn 
-
-    fn put(&'a mut self, line: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        // get coresponding table position
-        let position = self.position(line.key()?.as_str());
-
-        // extract origin
-        if let Some(mut cur) = self.table[position]
-            .extract_if(|cur| {
-                if let Some(wptr) = cur.as_cursor().current() {
-                    if let Some(entry) = wptr.upgrade() {
-                        // Check if the same
-                        todo!() 
-                    }
-                }
-                false
-            })
-            .next()
-        {
-            cur.remove_current();
+    fn pop(&mut self) {
+        if self.list.is_empty() {
+            return;
         }
-
-        // push in deque
-        self.deque.push_back(Arc::downgrade(line));
-
-        // sign in table
-        let cur = self.deque.cursor_back_mut();
-
-        self.table[position].push_back(cur);
-        Ok(())
+        for iter in 0..self.list.len() {
+            self.list.swap(0, iter);
+            if self.list[0].upgrade().is_none() {
+                self.list.pop_front();
+            }
+        }
     }
+}
 
-    // fn check(&self, key: &str) -> Cursor<'a, Weak<dyn IndexNode>> {
-    //     let position = self.possition(key);
-    //     self.table[position].contains()
-    // }
+struct CacheManager {
+    source: LinkedList<SrcManage>,
+}
 
-    fn get(&self, key: &str) -> Option<Arc<dyn IndexNode>> {
-        // let position = self.position(key);
-        // self.table[position]
-        //     .iter()
-        //     .filter(|cur| 
-        //         self._cur_unwrap(cur).is_some_and(|ent| 
-        //             ent.key() == key))
-        todo!();
-    }
-
-    // fn walk
-
-    fn _cur_unwrap(&self, mut cur: CursorMut<Weak<dyn IndexNode>>) -> Option<Arc<dyn IndexNode>> {
-        match cur.current() {
-            Some(wptr) => wptr.upgrade(),
-            None => None
+impl CacheManager {
+    fn new() -> Self {
+        Self {
+            source: LinkedList::new(),
         }
     }
 
-    fn _get_helper(&mut self, key: &str) -> Option<usize> {
-        self.table[self.position(key)]
-            .iter()
-            .find(|cur| {
-                cur.as_cursor().current()
-                    .is_some_and(|wptr| {
-                        wptr.upgrade()
-                            .is_some_and(|entry|
-                                entry.key().is_ok_and(|k| k == key))})})?
-            .index()
+    fn add(&mut self, src: Resource) -> SrcPtr {
+        let ptr = Arc::new(src);
+        let wptr = Arc::downgrade(&ptr);
+        self.source.push_back(ptr);
+        wptr
     }
+
+    fn release(&mut self) -> usize {
+        self.source.extract_if(|src| {
+            if src.weak_count() < 2 {
+                return true;
+            }
+            false
+        }).count()
+    }
+}
+
+pub struct DefaultCache<H: Hasher + Default = SipHasher> {
+    /// hash index
+    table: HashTable<H>,
+    /// lru note
+    deque: SpinLock<LruList>,
+    /// resource release
+    source: SpinLock<CacheManager>,
+
+    max_size: usize,
+}
+
+impl<H: Hasher + Default> DefaultCache<H> {
+    const DEFAULT_MEMORY_SIZE: usize = 1024 /* K */ * 1024 /* Byte */;
+    pub fn new(mem_size: Option<usize>) -> Self {
+        let mem_size = mem_size.unwrap_or(Self::DEFAULT_MEMORY_SIZE);
+        let max_size = mem_size / (2 * size_of::<SrcPtr>() + size_of::<SrcManage>());
+        let hash_table_size = max_size / 7 * 10 /* 0.7 */;
+        Self {
+            table: HashTable::new(hash_table_size),
+            deque: SpinLock::new(LruList::new()),
+            source: SpinLock::new(CacheManager::new()),
+            max_size,
+        }
+    }
+
+    pub fn put(&mut self, key: &str, src: Resource) {
+        let src_p = self.source.lock().add(src);
+        self.table.put(key, src_p);
+        self.deque.lock().push(src_p);
+    }
+
+    pub fn get(&mut self, key: &str) -> RwLockReadGuard<LinkedList<SrcPtr>> {
+        self.table.get_list(key)
+    }
+
+    pub fn release(&mut self) -> usize {
+        self.source.lock().release()
+    }
+
+}
+
+trait Cachable<'a>: IndexNode {
+    fn name() -> Option<&'a str>;
+    fn parent() -> Option<&'a str>;
 }

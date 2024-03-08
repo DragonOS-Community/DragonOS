@@ -217,8 +217,6 @@ impl PartialOrd for Keyer {
 
 impl Ord for Keyer {
     fn cmp(&self, other: &Self) -> Ordering {
-        kdebug!("Call Compare");
-        kdebug!("Comparing {:?} with {:?}", self, other);
         let mut ret: Ordering = Ordering::Equal;
         if self.0.ptr_eq(&other.0) {
             kdebug!("Compare itself!");
@@ -234,7 +232,6 @@ impl Ord for Keyer {
             }
             if opt1.is_some() && opt2.is_some() {
                 ret = opt1.unwrap().0.lock().name.cmp(&opt2.unwrap().0.lock().name);
-                kdebug!("Comparing {:?} with {:?}", self.0.upgrade().unwrap().0.lock().name, other.0.upgrade().unwrap().0.lock().name);
             } else {
                 kwarn!("depecated");
                 panic!("Empty Key!");

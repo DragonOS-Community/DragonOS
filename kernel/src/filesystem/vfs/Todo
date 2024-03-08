@@ -1,3 +1,4 @@
 [ ] Rewrite lookup functions
 [ ] INode Factory
 [ ] Enhance Usability
+[ ] 设计哈希表读写锁，引进锁管理

@@ -21,7 +21,7 @@ use crate::{
     time::TimeSpec,
 };
 
-use self::{cache::DefaultCache, core::generate_inode_id, file::FileMode, syscall::ModeType};
+use self::{cache::DefaultCache, core::generate_inode_id, file::FileMode, syscall::ModeType, utils::{rsplit_path, split_path}};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
@@ -398,7 +398,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     }
 
     /// name for hashing
-    fn key(&self) -> Result<String, SystemError> {
+    fn name(&self) -> Result<String, SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
@@ -526,14 +526,65 @@ impl dyn IndexNode {
     /// @return Err(SystemError) 错误码
     /// 
     /// 缓存可能未命中
-    fn quick_lookup(&self, path: &str) -> Option<Arc<dyn IndexNode>> {
-        if let Some((path_left, name)) = path.rsplit_once('/') {
-            todo!("Should imple lookup walk");
+    fn quick_lookup(&self, path: &str) -> (Option<&str>, Option<Arc<dyn IndexNode>>) {
+        // get cache
+        let get = self.cache();
+        if get.is_err() {
+            return (None, None);
         }
-        None
+        let (key, rest) = rsplit_path(path);
+
+        let mut cache = get.unwrap();
+        let guard = cache.get(key);
+        let mut cur = guard.cursor_front();
+
+        let mut ret_node: Option<Arc<dyn IndexNode>>;
+        while let Some(elem) = cur.peek_next() {
+            if let Some(tmp) = elem.upgrade() {
+                if let Some(inode) = tmp.upgrade() {
+                    
+                }
+            }
+            cur.move_next();
+        }
+        todo!()
     }
+
 }
 
+fn check_same_inode(mut inode: Arc<dyn IndexNode>, path: &Vec<&str>) -> bool {
+    if path.is_empty() {
+        kwarn!("Checking Path empty");
+        return false;
+    }
+
+    for name in path {
+        let wrap = inode.parent();
+        if wrap.is_err() {
+            return false;
+        }
+        let parent = wrap.unwrap();
+        if parent.name().is_err() {
+            return false;
+        }
+        if parent.name().unwrap() != *name {
+            return false;
+        }
+        inode = parent;
+    }
+
+    true
+}
+
+fn path_parse(path: &str) -> Vec<&str> {
+    let mut parse = Vec::new();
+    let path = Some(path);
+    while path.is_some() {
+        let (key, path) = rsplit_path(path.unwrap());
+        parse.push(key);
+    }
+    parse
+}
 
 /// IndexNode的元数据
 ///

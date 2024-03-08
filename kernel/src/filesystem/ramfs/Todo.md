@@ -5,7 +5,7 @@
      - Design: Entry::name_cmp(key: &str) -> Self
      - Boo: （在已经臃肿的结构里）多管理一个生命周期并不好
 
-- [ ] 将Keyer的复制比较消除
+- [x] 将Keyer的复制比较消除
 
 - [ ] ~~为LockedEntry与LockedInode实现Deref Trait, 简化程序逻辑~~
 

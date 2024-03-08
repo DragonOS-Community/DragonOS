@@ -1,7 +1,9 @@
-use core::ffi::{c_char, c_void, CStr};
+use core::ffi::{c_void, CStr};
 
 use alloc::{
-    borrow::ToOwned, string::{String, ToString}, sync::Arc, vec::Vec
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
 };
 use system_error::SystemError;
 
@@ -28,7 +30,7 @@ use super::{
     file::{File, FileMode},
     open::{do_faccessat, do_fchmodat, do_sys_open},
     utils::{rsplit_path, user_path_at},
-    Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    Dirent, FileSystem, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 // use crate::kdebug;
 
@@ -1010,17 +1012,17 @@ impl Syscall {
         return Ok(0);
     }
     /// #挂载文件系统
-    /// 
+    ///
     /// 用于挂载文件系统,目前仅支持ramfs挂载
-    /// 
+    ///
     /// ## 参数:
-    /// 
+    ///
     /// - source       挂载目标的文件夹名
     /// - target       挂载目录的父目录
     /// - filesystemtype   文件系统
     /// - mountflags     挂载选项（暂未实现）
     /// - data        带数据挂载
-    /// 
+    ///
     /// ## 返回值
     /// - Ok(0): 挂载成功
     /// - Err(SystemError) :挂载过程中出错
@@ -1041,7 +1043,8 @@ impl Syscall {
             (format!("{target}{source}")).as_str(),
             FileMode::O_PATH_FLAGS.bits().try_into().unwrap(),
         )?;
-        
+
+        //TODO 将判断逻辑迁移到FS中实现
         let filesystemtype = match filesystemtype.as_str() {
             "ramfs" => Ok(RamFS::new()),
             _ => Err(SystemError::EINVAL),
@@ -1049,7 +1052,20 @@ impl Syscall {
 
         return Vcore::do_mount(filesystemtype, (format!("{target}{source}")).as_str());
     }
+    /// 该实验函数可以用作实现文件系统内管理器的雏形（重点在于返回值trait运用）
+    /// 想法：可以在VFS中实现一个文件系统分发器，流程如下：
+    /// 1. 接受从上方传来的文件类型字符串
+    /// 2. 将传入值与启动时准备好的字符串数组逐个比较（probe）
+    /// 3. 直接在函数内调用构造方法并直接返回文件系统对象
+    ///
+    /// Linux文件系统流程还包括判断文件夹是否是设备，以及从设备构造文件系统，需要调用mknod方法
 
+    fn do_match_fs(fs: &str) -> Result<Arc<dyn FileSystem>, SystemError> {
+        match fs {
+            "ramfs" => Ok(RamFS::new()),
+            _ => Err(SystemError::EINVAL),
+        }
+    }
 }
 
 #[repr(C)]

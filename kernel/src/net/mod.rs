@@ -5,7 +5,11 @@ use core::{
 
 use alloc::{collections::BTreeMap, sync::Arc};
 
-use crate::{driver::net::NetDriver, libs::rwlock::RwLock};
+use crate::{
+    driver::net::NetDriver,
+    filesystem::vfs::file::File,
+    libs::{rwlock::RwLock, spinlock::SpinLock},
+};
 use smoltcp::wire::IpEndpoint;
 
 pub mod event_poll;
@@ -41,8 +45,8 @@ pub enum Endpoint {
     LinkLayer(LinkLayerEndpoint),
     /// 网络层端点
     Ip(Option<IpEndpoint>),
-    /// 不需要端点
-    Unused,
+    /// 文件端点
+    File(Option<Arc<SpinLock<File>>>),
     // todo: 增加NetLink机制后，增加NetLink端点
 }
 

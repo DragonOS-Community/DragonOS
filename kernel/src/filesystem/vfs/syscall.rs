@@ -253,7 +253,7 @@ impl Syscall {
         mode: ModeType,
         follow_symlink: bool,
     ) -> Result<usize, SystemError> {
-        return do_sys_open(AtFlags::AT_FDCWD.bits(), path, flags, mode, follow_symlink);
+        do_sys_open(AtFlags::AT_FDCWD.bits(), path, flags, mode, follow_symlink)
     }
 
     pub fn openat(
@@ -263,7 +263,7 @@ impl Syscall {
         mode: ModeType,
         follow_symlink: bool,
     ) -> Result<usize, SystemError> {
-        return do_sys_open(dirfd, path, o_flags, mode, follow_symlink);
+        do_sys_open(dirfd, path, o_flags, mode, follow_symlink)
     }
 
     /// @brief 关闭文件
@@ -275,9 +275,7 @@ impl Syscall {
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
 
-        let res = fd_table_guard.drop_fd(fd as i32).map(|_| 0);
-
-        return res;
+        fd_table_guard.drop_fd(fd as i32).map(|_| 0)
     }
 
     /// @brief 发送命令到文件描述符对应的设备，

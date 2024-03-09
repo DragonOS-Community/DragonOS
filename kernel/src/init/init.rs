@@ -62,9 +62,8 @@ fn do_start_kernel() {
 
     early_smp_init().expect("early smp init failed");
     irq_init().expect("irq init failed");
-    CurrentSMPArch::prepare_cpus().expect("prepare_cpus failed");
-
     setup_arch().expect("setup_arch failed");
+    CurrentSMPArch::prepare_cpus().expect("prepare_cpus failed");
 
     process_init();
     sched_init();

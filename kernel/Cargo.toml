@@ -42,7 +42,6 @@ linkme = "=0.2"
 num = { version = "=0.4.0", default-features = false }
 num-derive = "=0.3"
 num-traits = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/num-traits.git", rev="1597c1c", default-features = false }
-
 smoltcp = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/smoltcp.git", rev = "9027825", default-features = false, features = ["log", "alloc",  "socket-raw", "socket-udp", "socket-tcp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-ipv4", "proto-ipv6"]}
 system_error = { path = "crates/system_error" }
 unified-init = { path = "crates/unified-init" }
@@ -62,7 +61,7 @@ x86_64 = "=0.14.10"
 
 # target为riscv64时，使用下面的依赖
 [target.'cfg(target_arch = "riscv64")'.dependencies]
-riscv = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/riscv.git", revision = "5c01a8320e", features = [ "s-mode" ] }
+riscv = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/riscv.git", revision = "79d27d0f3a", features = [ "s-mode" ] }
 sbi-rt = { version = "=0.0.3", features = ["legacy"] }
 
 

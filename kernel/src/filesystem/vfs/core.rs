@@ -220,19 +220,13 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 
     let pcb = ProcessManager::current_pcb();
     let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
+    let (filename, parent_path) = rsplit_path(&remain_path);
 
-    let inode: Result<Arc<dyn IndexNode>, SystemError> =
-        inode_begin.lookup_follow_symlink(remain_path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES);
-
-    if inode.is_err() {
-        let errno = inode.unwrap_err();
-        // 文件不存在
-        if errno == SystemError::ENOENT {
-            return Err(SystemError::ENOENT);
-        }
+    // 最后一项文件项为.时返回EINVAL
+    if filename == "." {
+        return Err(SystemError::EINVAL);
     }
 
-    let (filename, parent_path) = rsplit_path(&remain_path);
     // 查找父目录
     let parent_inode: Arc<dyn IndexNode> = inode_begin
         .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
@@ -241,7 +235,8 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::ENOTDIR);
     }
 
-    let target_inode: Arc<dyn IndexNode> = parent_inode.find(filename)?;
+    // 在目标点为symlink时也返回ENOTDIR
+    let target_inode = parent_inode.find(filename)?;
     if target_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }

@@ -5,8 +5,6 @@ use crate::{
     process::ProcessManager,
 };
 
-/// 信号处理的栈的栈指针的最小对齐数量
-pub const STACK_ALIGN: u64 = 16;
 /// 信号最大值
 pub const MAX_SIG_NUM: usize = 64;
 #[allow(dead_code)]

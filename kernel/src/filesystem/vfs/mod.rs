@@ -21,7 +21,7 @@ use crate::{
     time::TimeSpec,
 };
 
-use self::{cache::DefaultCache, core::generate_inode_id, file::FileMode, syscall::ModeType, utils::{rsplit_path, split_path}};
+use self::{cache::DefaultCache, core::generate_inode_id, file::FileMode, syscall::ModeType, utils::{clean_path, is_absolute, rsplit_path, split_path}};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
@@ -448,13 +448,45 @@ impl dyn IndexNode {
         path: &str,
         max_follow_times: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        // non cache lookup
+        let get = self.cache();
+        if get.is_err() {
+            kdebug!("Cache Not Found.");
+            return self._lookup_follow_symlink(path, max_follow_times);
+        }
+        let head_path = self._abs_path();
+        if head_path.is_err() { 
+            kwarn!("Illegal parent search: {:?}, deprecated to non cache searching", head_path);
+            return self.lookup_follow_symlink(path, max_follow_times); 
+        }
+        let current = head_path.unwrap();
+        // cache lookup
+        let abs_path: String = if is_absolute(path) {
+            clean_path(path)
+        } else {
+            &current + clean_path(path)
+        };
+        kdebug!("Cache Search path {}", abs_path);
+        if let Some((inode, l_rest)) = self.quick_lookup(get.unwrap(), &abs_path, &current) {
+            let r_rest = abs_path.strip_prefix(l_rest);
+            kdebug!("Cache Rest path {:?}", r_rest);
+            if r_rest.is_none() {
+                return Ok(inode);
+            }
+            return inode._lookup_follow_symlink(r_rest.unwrap(), max_follow_times);
+        } else {
+            return self._lookup_follow_symlink(path, max_follow_times);
+        }
+    }
+
+    fn _lookup_follow_symlink(
+        &self,
+        path: &str,
+        max_follow_times: usize,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
         
         if self.metadata()?.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
-        }
-
-        if let Some(cache) = self.cache().ok() {
-            todo!("cacheseaching series")
         }
 
         // 处理绝对路径
@@ -510,7 +542,7 @@ impl dyn IndexNode {
 
                 let new_path = link_path + "/" + &rest_path;
                 // 继续查找符号链接
-                return result.lookup_follow_symlink(&new_path, max_follow_times - 1);
+                return result._lookup_follow_symlink(&new_path, max_follow_times - 1);
             } else {
                 result = inode;
             }
@@ -522,69 +554,55 @@ impl dyn IndexNode {
     /// @brief 缓存查询
     ///
     /// @param path 文件路径
-    /// @return Ok(Arc<dyn IndexNode>) 要寻找的目录项的inode
+    /// @return Ok((Arc<dyn IndexNode>, &str)) 
+    /// 要寻找的目录项路径上最长已缓存的inode 与 该inode的绝对路径
     /// @return Err(SystemError) 错误码
     /// 
     /// 缓存可能未命中
-    fn quick_lookup(&self, path: &str) -> (Option<&str>, Option<Arc<dyn IndexNode>>) {
-        // get cache
-        let get = self.cache();
-        if get.is_err() {
-            return (None, None);
+    fn quick_lookup(&self, cache: Arc<DefaultCache>, abs_path: &str, current: &str) -> Option<(Arc<dyn IndexNode>, &str)> {
+        // check again. 
+        self._quick_lookup(cache, abs_path, current)
+    }
+
+    fn _quick_lookup(&self, cache: Arc<DefaultCache>, abs_path: &str, current: &str) -> Option<(Arc<dyn IndexNode>, &str)> {
+        // let cache = self.cache().unwrap();
+        let (key, left_rest) = rsplit_path(abs_path);
+        if left_rest.is_none() {
+            return None;
         }
-        let (key, rest) = rsplit_path(path);
+        if left_rest.is_some_and(|l_rest| l_rest == current) {
+            return None;
+        }
+        let result = cache.get(key).find(|src| {
+            src.name() == key && src._abs_path() == abs_path
+        });
+        if result.is_some() {
+            return Some((result.unwrap(), abs_path));
+        }
+        return self._quick_lookup(cache, left_rest.unwrap(), current);
+    }
 
-        let mut cache = get.unwrap();
-        let guard = cache.get(key);
-        let mut cur = guard.cursor_front();
-
-        let mut ret_node: Option<Arc<dyn IndexNode>>;
-        while let Some(elem) = cur.peek_next() {
-            if let Some(tmp) = elem.upgrade() {
-                if let Some(inode) = tmp.upgrade() {
-                    
-                }
+    fn _abs_path(&self) -> Result<String, SystemError> {
+        if self.parent().is_err_and(|err| err == SystemError::EOPNOTSUPP_OR_ENOTSUP) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        let mut inode = self;
+        let mut path = String::new();
+        loop {
+            if inode.parent().is_err_and(|err| err == SystemError::ENOENT) {
+                break;
             }
-            cur.move_next();
+            let name = inode.parent().unwrap().name();
+            if name.is_err() {
+                return Err(name);
+            }
+            path = name.unwrap() + '/' + &path;
         }
-        todo!()
+        path = '/' + path;
+        Ok(path)
     }
-
 }
 
-fn check_same_inode(mut inode: Arc<dyn IndexNode>, path: &Vec<&str>) -> bool {
-    if path.is_empty() {
-        kwarn!("Checking Path empty");
-        return false;
-    }
-
-    for name in path {
-        let wrap = inode.parent();
-        if wrap.is_err() {
-            return false;
-        }
-        let parent = wrap.unwrap();
-        if parent.name().is_err() {
-            return false;
-        }
-        if parent.name().unwrap() != *name {
-            return false;
-        }
-        inode = parent;
-    }
-
-    true
-}
-
-fn path_parse(path: &str) -> Vec<&str> {
-    let mut parse = Vec::new();
-    let path = Some(path);
-    while path.is_some() {
-        let (key, path) = rsplit_path(path.unwrap());
-        parse.push(key);
-    }
-    parse
-}
 
 /// IndexNode的元数据
 ///

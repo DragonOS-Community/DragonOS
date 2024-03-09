@@ -21,7 +21,7 @@ impl RamFS {
             name: String::new(),
             inode: Arc::new(LockedInode(SpinLock::new(
                 Inode::new(
-                    FileType::Dir, 
+                    FileType::Dir,  
                     ModeType::from_bits_truncate(0o777))))),
             parent: Weak::new(),
             self_ref: Weak::new(),

@@ -1052,20 +1052,11 @@ impl Syscall {
 
         return Vcore::do_mount(filesystemtype, (format!("{target}{source}")).as_str());
     }
-    /// 该实验函数可以用作实现文件系统内管理器的雏形（重点在于返回值trait运用）
-    /// 想法：可以在VFS中实现一个文件系统分发器，流程如下：
-    /// 1. 接受从上方传来的文件类型字符串
-    /// 2. 将传入值与启动时准备好的字符串数组逐个比较（probe）
-    /// 3. 直接在函数内调用构造方法并直接返回文件系统对象
-    ///
-    /// Linux文件系统流程还包括判断文件夹是否是设备，以及从设备构造文件系统，需要调用mknod方法
 
-    fn do_match_fs(fs: &str) -> Result<Arc<dyn FileSystem>, SystemError> {
-        match fs {
-            "ramfs" => Ok(RamFS::new()),
-            _ => Err(SystemError::EINVAL),
-        }
-    }
+    // 想法：可以在VFS中实现一个文件系统分发器，流程如下：
+    // 1. 接受从上方传来的文件类型字符串
+    // 2. 将传入值与启动时准备好的字符串数组逐个比较（probe）
+    // 3. 直接在函数内调用构造方法并直接返回文件系统对象
 }
 
 #[repr(C)]

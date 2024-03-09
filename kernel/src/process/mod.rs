@@ -439,6 +439,7 @@ impl ProcessManager {
 
 /// 上下文切换的钩子函数,当这个函数return的时候,将会发生上下文切换
 #[cfg(target_arch = "x86_64")]
+#[inline(never)]
 pub unsafe extern "sysv64" fn switch_finish_hook() {
     ProcessManager::switch_finish_hook();
 }
@@ -891,7 +892,6 @@ impl ProcessControlBlock {
 impl Drop for ProcessControlBlock {
     fn drop(&mut self) {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        // kdebug!("drop: {:?}", self.pid);
         // 在ProcFS中,解除进程的注册
         procfs_unregister_pid(self.pid())
             .unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));

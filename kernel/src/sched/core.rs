@@ -63,8 +63,8 @@ pub fn get_cpu_loads(cpu_id: ProcessorId) -> u32 {
 }
 // 负载均衡
 pub fn loads_balance(pcb: Arc<ProcessControlBlock>) {
-    // 对pcb的迁移情况进行调整
-
+    // FIXME: 由于目前负载均衡是直接添加到目标CPU的队列中，导致会由于时序问题导致进程在两个CPU上都存在。
+    // 在调度子系统重写/改进之前，暂时只设置进程在0号CPU上运行
     // 由于调度器问题，暂时不进行负载均衡，见issue: https://github.com/DragonOS-Community/DragonOS/issues/571
     let min_loads_cpu_id = ProcessorId::new(0);
 

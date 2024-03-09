@@ -46,7 +46,7 @@ impl Syscall {
 
         let socket = new_socket(address_family, socket_type, protocol)?;
 
-        let handle_item = SocketHandleItem::new(&socket);
+        let handle_item = SocketHandleItem::new();
         HANDLE_MAP
             .write_irqsave()
             .insert(socket.socket_handle(), handle_item);

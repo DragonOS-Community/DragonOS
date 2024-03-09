@@ -411,11 +411,8 @@ impl IndexNode for SocketInode {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct SocketHandleItem {
-    /// socket元数据
-    metadata: SocketMetadata,
     /// shutdown状态
     pub shutdown_type: RwLock<ShutdownType>,
     /// socket的waitqueue
@@ -425,25 +422,15 @@ pub struct SocketHandleItem {
 }
 
 impl SocketHandleItem {
-    pub fn new(socket: &Box<dyn Socket>) -> Self {
+    pub fn new() -> Self {
         Self {
-            metadata: socket.metadata().unwrap(),
             shutdown_type: RwLock::new(ShutdownType::empty()),
             wait_queue: EventWaitQueue::new(),
             epitems: SpinLock::new(LinkedList::new()),
         }
     }
 
-    pub fn from_socket<A: Socket>(socket: &Box<A>) -> Self {
-        Self {
-            metadata: socket.metadata().unwrap(),
-            shutdown_type: RwLock::new(ShutdownType::empty()),
-            wait_queue: EventWaitQueue::new(),
-            epitems: SpinLock::new(LinkedList::new()),
-        }
-    }
-
-    /// ### 在socket的等待队列上睡眠
+    /// ## 在socket的等待队列上睡眠
     pub fn sleep(
         socket_handle: SocketHandle,
         events: u64,

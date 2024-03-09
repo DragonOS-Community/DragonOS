@@ -27,7 +27,10 @@ use crate::{
     },
 };
 
-use self::sockets::{RawSocket, SeqpacketSocket, TcpSocket, UdpSocket};
+use self::{
+    inet::{RawSocket, TcpSocket, UdpSocket},
+    unix::{SeqpacketSocket, StreamSocket},
+};
 
 use super::{
     event_poll::{EPollEventType, EPollItem, EventPoll},
@@ -35,7 +38,8 @@ use super::{
     Endpoint, Protocol, ShutdownType,
 };
 
-pub mod sockets;
+pub mod inet;
+pub mod unix;
 
 lazy_static! {
     /// 所有socket的集合
@@ -59,19 +63,17 @@ pub(super) fn new_socket(
     protocol: Protocol,
 ) -> Result<Box<dyn Socket>, SystemError> {
     let socket: Box<dyn Socket> = match address_family {
-        AddressFamily::Unix => match socket_type {
-            PosixSocketType::Stream => Box::new(TcpSocket::new(SocketOptions::default())),
-            PosixSocketType::Datagram => Box::new(UdpSocket::new(SocketOptions::default())),
-            PosixSocketType::Raw => Box::new(RawSocket::new(protocol, SocketOptions::default())),
-            PosixSocketType::SeqPacket => Box::new(SeqpacketSocket::new(SocketOptions::default())),
-            _ => {
-                return Err(SystemError::EINVAL);
-            }
-        },
         AddressFamily::INet => match socket_type {
             PosixSocketType::Stream => Box::new(TcpSocket::new(SocketOptions::default())),
             PosixSocketType::Datagram => Box::new(UdpSocket::new(SocketOptions::default())),
             PosixSocketType::Raw => Box::new(RawSocket::new(protocol, SocketOptions::default())),
+            _ => {
+                return Err(SystemError::EINVAL);
+            }
+        },
+        AddressFamily::Unix => match socket_type {
+            PosixSocketType::Stream => Box::new(StreamSocket::new(SocketOptions::default())),
+            PosixSocketType::SeqPacket => Box::new(SeqpacketSocket::new(SocketOptions::default())),
             _ => {
                 return Err(SystemError::EINVAL);
             }
@@ -83,10 +85,27 @@ pub(super) fn new_socket(
     Ok(socket)
 }
 
-pub trait Socket: Sync + Send + Debug + Any {
-    fn as_any_ref(&self) -> &dyn Any;
+/// 根据地址族、socket类型创建socketpair
+pub(super) fn new_socketpair(
+    address_family: AddressFamily,
+    socket_type: PosixSocketType,
+) -> Result<Box<dyn SocketPair>, SystemError> {
+    let socket: Box<dyn SocketPair> = match address_family {
+        AddressFamily::Unix => match socket_type {
+            PosixSocketType::Stream => Box::new(StreamSocket::new(SocketOptions::default())),
+            PosixSocketType::SeqPacket => Box::new(SeqpacketSocket::new(SocketOptions::default())),
+            _ => {
+                return Err(SystemError::EINVAL);
+            }
+        },
+        _ => {
+            return Err(SystemError::EAFNOSUPPORT);
+        }
+    };
+    Ok(socket)
+}
 
-    fn as_any_mut(&mut self) -> &mut dyn Any;
+pub trait Socket: Sync + Send + Debug {
     /// @brief 从socket中读取数据，如果socket是阻塞的，那么直到读取到数据才返回
     ///
     /// @param buf 读取到的数据存放的缓冲区
@@ -169,10 +188,6 @@ pub trait Socket: Sync + Send + Debug + Any {
     /// @return 返回socket的对端端点
     fn peer_endpoint(&self) -> Option<Endpoint> {
         return None;
-    }
-
-    fn socketpair_ops(&self) -> Option<&'static dyn SocketpairOps> {
-        None
     }
 
     /// @brief
@@ -278,9 +293,21 @@ impl Clone for Box<dyn Socket> {
     }
 }
 
+pub trait SocketPair: Socket + Any {
+    fn as_any_ref(&self) -> &dyn Any;
+
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    fn socketpair_ops(&self) -> Option<&'static dyn SocketpairOps>;
+
+    fn buffer(&self) -> Arc<SpinLock<Vec<u8>>>;
+
+    fn set_peer_buffer(&mut self, peer_buffer: Arc<SpinLock<Vec<u8>>>);
+}
+
 pub trait SocketpairOps {
     /// 执行socketpair
-    fn socketpair(&self, socket0: &mut Box<dyn Socket>, socket1: &mut Box<dyn Socket>);
+    fn socketpair(&self, socket0: &mut Box<dyn SocketPair>, socket1: &mut Box<dyn SocketPair>);
 }
 
 /// # Socket在文件系统中的inode封装
@@ -314,7 +341,7 @@ impl IndexNode for SocketInode {
             // 最后一次关闭，需要释放
             let mut socket = self.0.lock_irqsave();
 
-            if socket.metadata().unwrap().socket_type == SocketType::SeqpacketSocket {
+            if socket.metadata().unwrap().socket_type == SocketType::Unix {
                 return Ok(());
             }
 
@@ -503,8 +530,8 @@ impl PortManager {
 
             // 使用 ListenTable 检查端口是否被占用
             let listen_table_guard = match socket_type {
-                SocketType::UdpSocket => self.udp_port_table.lock(),
-                SocketType::TcpSocket => self.tcp_port_table.lock(),
+                SocketType::Udp => self.udp_port_table.lock(),
+                SocketType::Tcp => self.tcp_port_table.lock(),
                 _ => panic!("{:?} cann't get a port", socket_type),
             };
             if let None = listen_table_guard.get(&port) {
@@ -527,8 +554,8 @@ impl PortManager {
     ) -> Result<(), SystemError> {
         if port > 0 {
             let mut listen_table_guard = match socket_type {
-                SocketType::UdpSocket => self.udp_port_table.lock(),
-                SocketType::TcpSocket => self.tcp_port_table.lock(),
+                SocketType::Udp => self.udp_port_table.lock(),
+                SocketType::Tcp => self.tcp_port_table.lock(),
                 _ => panic!("{:?} cann't bind a port", socket_type),
             };
             match listen_table_guard.get(&port) {
@@ -543,8 +570,8 @@ impl PortManager {
     /// @brief 在对应的端口记录表中将端口和 socket 解绑
     pub fn unbind_port(&self, socket_type: SocketType, port: u16) -> Result<(), SystemError> {
         let mut listen_table_guard = match socket_type {
-            SocketType::UdpSocket => self.udp_port_table.lock(),
-            SocketType::TcpSocket => self.tcp_port_table.lock(),
+            SocketType::Udp => self.udp_port_table.lock(),
+            SocketType::Tcp => self.tcp_port_table.lock(),
             _ => return Ok(()),
         };
         listen_table_guard.remove(&port);
@@ -584,13 +611,13 @@ impl Drop for GlobalSocketHandle {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SocketType {
     /// 原始的socket
-    RawSocket,
+    Raw,
     /// 用于Tcp通信的 Socket
-    TcpSocket,
+    Tcp,
     /// 用于Udp通信的 Socket
-    UdpSocket,
-    /// 用于进程间通信的 Socket
-    SeqpacketSocket,
+    Udp,
+    /// unix域的 Socket
+    Unix,
 }
 
 bitflags! {

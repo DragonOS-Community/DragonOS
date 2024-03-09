@@ -1,6 +1,6 @@
 use core::cmp::min;
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, string::String, sync::Arc};
 use num_traits::{FromPrimitive, ToPrimitive};
 use smoltcp::wire;
 use system_error::SystemError;
@@ -8,7 +8,7 @@ use system_error::SystemError;
 use crate::{
     filesystem::vfs::{
         file::{File, FileMode},
-        syscall::{IoVec, IoVecs},
+        syscall::{IoVec, IoVecs, ModeType},
     },
     libs::spinlock::SpinLockGuard,
     mm::{verify_area, VirtAddr},
@@ -18,7 +18,10 @@ use crate::{
 };
 
 use super::{
-    socket::{new_socket, PosixSocketType, Socket, SocketHandleItem, SocketInode, HANDLE_MAP},
+    socket::{
+        new_socket, new_socketpair, PosixSocketType, Socket, SocketHandleItem, SocketInode,
+        HANDLE_MAP,
+    },
     Endpoint, Protocol, ShutdownType,
 };
 
@@ -68,15 +71,14 @@ impl Syscall {
     pub fn socketpair(
         address_family: usize,
         socket_type: usize,
-        protocol: usize,
+        _protocol: usize,
         fds: &mut [i32],
     ) -> Result<usize, SystemError> {
         let address_family = AddressFamily::try_from(address_family as u16)?;
         let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
-        let protocol = Protocol::from(protocol as u8);
 
-        let mut socket0 = new_socket(address_family, socket_type, protocol)?;
-        let mut socket1 = new_socket(address_family, socket_type, protocol)?;
+        let mut socket0 = new_socketpair(address_family, socket_type)?;
+        let mut socket1 = new_socketpair(address_family, socket_type)?;
 
         socket0
             .socketpair_ops()
@@ -205,9 +207,8 @@ impl Syscall {
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let mut socket = unsafe { socket.inner_no_preempt() };
-        // kdebug!("connect to {:?}...", endpoint);
         socket.connect(endpoint)?;
-        return Ok(0);
+        Ok(0)
     }
 
     /// @brief sys_bind系统调用的实际执行函数
@@ -224,7 +225,7 @@ impl Syscall {
             .ok_or(SystemError::EBADF)?;
         let mut socket = unsafe { socket.inner_no_preempt() };
         socket.bind(endpoint)?;
-        return Ok(0);
+        Ok(0)
     }
 
     /// @brief sys_sendto系统调用的实际执行函数
@@ -253,7 +254,7 @@ impl Syscall {
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let socket = unsafe { socket.inner_no_preempt() };
-        return socket.write(buf, endpoint);
+        socket.write(buf, endpoint)
     }
 
     /// @brief sys_recvfrom系统调用的实际执行函数
@@ -289,7 +290,7 @@ impl Syscall {
                 sockaddr_in.write_to_user(addr, addrlen)?;
             }
         }
-        return Ok(n);
+        Ok(n)
     }
 
     /// @brief sys_recvmsg系统调用的实际执行函数
@@ -588,15 +589,30 @@ impl SockAddr {
 
                     return Ok(Endpoint::Ip(Some(wire::IpEndpoint::new(ip, port))));
                 }
+                AddressFamily::Unix => {
+                    let addr_un: SockAddrUn = addr.addr_un;
+
+                    let fd = Syscall::open(
+                        String::from_utf8(addr_un.sun_path.to_vec())
+                            .map_err(|_| SystemError::EINVAL)?
+                            .as_str(),
+                        FileMode::O_RDWR,
+                        ModeType::from_bits_truncate(0o755),
+                        true,
+                    )?;
+
+                    let binding = ProcessManager::current_pcb().fd_table();
+                    let fd_table_guard = binding.read();
+
+                    let file = fd_table_guard.get_file_by_fd(fd as i32);
+                    return Ok(Endpoint::File(file));
+                }
                 AddressFamily::Packet => {
                     // TODO: support packet socket
                     return Err(SystemError::EINVAL);
                 }
                 AddressFamily::Netlink => {
                     // TODO: support netlink socket
-                    return Err(SystemError::EINVAL);
-                }
-                AddressFamily::Unix => {
                     return Err(SystemError::EINVAL);
                 }
                 _ => {
@@ -706,6 +722,7 @@ impl From<Endpoint> for SockAddr {
 
                 return SockAddr { addr_ll };
             }
+
             _ => {
                 // todo: support other endpoint, like Netlink...
                 unimplemented!("not support {value:?}");

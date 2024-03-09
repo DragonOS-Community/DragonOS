@@ -1654,7 +1654,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 }
 
                 if ProcessManager::current_pcb()
-                    .sig_info()
+                    .sig_info_irqsave()
                     .sig_pending()
                     .has_pending()
                 {
@@ -1732,7 +1732,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         // drop(ldata);
         let mut offset = 0;
         loop {
-            if pcb.sig_info().sig_pending().has_pending() {
+            if pcb.sig_info_irqsave().sig_pending().has_pending() {
                 return Err(SystemError::ERESTARTSYS);
             }
             if core.flags().contains(TtyFlag::HUPPED) {

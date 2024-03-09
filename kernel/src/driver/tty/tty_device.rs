@@ -132,7 +132,7 @@ impl IndexNode for TtyDevice {
                 && driver.tty_driver_sub_type() == TtyDriverSubType::PtyMaster))
         {
             let pcb = ProcessManager::current_pcb();
-            let pcb_tty = pcb.sig_info().tty();
+            let pcb_tty = pcb.sig_info_irqsave().tty();
             if pcb_tty.is_none() && tty.core().contorl_info_irqsave().session.is_none() {
                 TtyJobCtrlManager::proc_set_tty(tty);
             }
@@ -220,7 +220,7 @@ impl IndexNode for TtyDevice {
                 break;
             }
 
-            if pcb.sig_info().sig_pending().has_pending() {
+            if pcb.sig_info_irqsave().sig_pending().has_pending() {
                 return Err(SystemError::ERESTARTSYS);
             }
         }

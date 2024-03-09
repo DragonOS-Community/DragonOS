@@ -206,12 +206,14 @@ impl TtyOperation for TtyConsoleDriverInner {
     }
 
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/tty/vt/vt.c#2894
+    #[inline(never)]
     fn write(&self, tty: &TtyCoreData, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
         let ret = self.do_write(tty, buf, nr);
         self.flush_chars(tty);
         ret
     }
 
+    #[inline(never)]
     fn flush_chars(&self, tty: &TtyCoreData) {
         let mut vc_data = tty.vc_data_irqsave();
         vc_data.set_cursor();

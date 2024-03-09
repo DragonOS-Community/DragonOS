@@ -464,7 +464,7 @@ impl EventPoll {
                 }
 
                 // 如果有未处理的信号则返回错误
-                if current_pcb.sig_info().sig_pending().signal().bits() != 0 {
+                if current_pcb.sig_info_irqsave().sig_pending().signal().bits() != 0 {
                     return Err(SystemError::EINTR);
                 }
 

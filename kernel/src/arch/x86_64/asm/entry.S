@@ -327,6 +327,7 @@ ENTRY(ignore_int)
 
 ENTRY(syscall_64)
     // 切换用户栈和内核栈
+    cli
     swapgs
     movq %rsp, %gs:0x8
     movq %gs:0x0, %rsp
@@ -376,6 +377,8 @@ ENTRY(syscall_64)
 
     // 将原本要返回的栈帧的栈指针传入do_signal的第一个参数
     movq %rsp, %rdi
+
+    sti
     callq do_signal
 
     cli

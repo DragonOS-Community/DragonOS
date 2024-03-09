@@ -143,6 +143,7 @@ pub struct VirtualConsoleData {
 }
 
 impl VirtualConsoleData {
+    #[inline(never)]
     pub fn new(num: usize) -> Self {
         Self {
             state: VirtualConsoleInfo::new(0, 0),
@@ -600,9 +601,10 @@ impl VirtualConsoleData {
             return;
         }
 
-        if self
-            .driver_funcs()
-            .con_scroll(self, self.top, self.bottom, dir, nr)
+        if self.is_visible()
+            && self
+                .driver_funcs()
+                .con_scroll(self, self.top, self.bottom, dir, nr)
         {
             // 如果成功
             return;
@@ -1666,8 +1668,8 @@ impl VirtualConsoleData {
         let (mut x, mut y) = if ret.is_err() {
             (start % self.cols, start / self.cols)
         } else {
-            let (tmp_start, tmp_x, tmp_y) = ret.unwrap();
-            start = tmp_start;
+            let (_, tmp_x, tmp_y) = ret.unwrap();
+            // start = tmp_start;
             (tmp_x, tmp_y)
         };
 
@@ -1719,6 +1721,8 @@ impl VirtualConsoleData {
             let ret = self.driver_funcs().con_getxy(self, start);
             if ret.is_ok() {
                 start = ret.unwrap().0;
+            } else {
+                return;
             }
         }
     }

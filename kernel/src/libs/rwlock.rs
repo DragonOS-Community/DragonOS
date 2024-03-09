@@ -220,6 +220,23 @@ impl<T> RwLock<T> {
 
     #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     #[allow(dead_code)]
+    #[inline]
+    pub fn try_write_irqsave(&self) -> Option<RwLockWriteGuard<T>> {
+        ProcessManager::preempt_disable();
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let r = self.inner_try_write().map(|mut g| {
+            g.irq_guard = Some(irq_guard);
+            g
+        });
+        if r.is_none() {
+            ProcessManager::preempt_enable();
+        }
+
+        return r;
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    #[allow(dead_code)]
     fn inner_try_write(&self) -> Option<RwLockWriteGuard<T>> {
         let res: bool = self
             .lock

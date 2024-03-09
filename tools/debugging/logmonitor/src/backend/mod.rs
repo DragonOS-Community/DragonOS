@@ -46,7 +46,7 @@ impl AppBackend {
             })
         };
 
-        *r.main_thread.write().unwrap() = Some(main_thread);
+        *r.main_thread.write_irqsave().unwrap() = Some(main_thread);
 
         return r;
     }

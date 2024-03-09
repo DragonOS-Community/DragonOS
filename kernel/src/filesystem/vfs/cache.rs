@@ -4,7 +4,7 @@
  * [ ] -
  */
 use alloc::{collections::{LinkedList, VecDeque}, sync::{Arc, Weak}, vec::Vec};
-use core::{hash::{Hash, Hasher, SipHasher}, marker::PhantomData, mem::size_of};
+use core::{hash::{Hash, Hasher, SipHasher}, marker::PhantomData, mem::size_of, ops::DerefMut};
 
 use crate::libs::{rwlock::{RwLock, RwLockUpgradableGuard}, spinlock::SpinLock};
 
@@ -14,27 +14,32 @@ type SrcPtr = Weak<Resource>;
 type SrcManage = Arc<Resource>;
 
 // struct SrcList<'a>(RwLockUpgradableGuard<'a, VecDeque<SrcPtr>>);
-struct SrcIter<'a> {
+pub struct SrcIter<'a> {
     idx: usize,
     // src: Option<Arc<dyn IndexNode>>,
-    vec: RwLockUpgradableGuard<'a, VecDeque<SrcPtr>>,
+    vec: Option<RwLockUpgradableGuard<'a, VecDeque<SrcPtr>>>,
 }
 
 impl<'a> Iterator for SrcIter<'a> {
     type Item = Arc<dyn IndexNode>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.idx == self.vec.len() {
+        let vec_here = core::mem::take(&mut self.vec);
+        let mut vec_cur = vec_here.unwrap();
+        if self.idx == vec_cur.len() {
             return None;
         }
         // 自动删除空节点
-        while self.vec[self.idx].upgrade().is_none() || 
-        self.vec[self.idx].upgrade().unwrap().upgrade().is_none() {
-            let mut writer = self.vec.upgrade();
+        while vec_cur[self.idx].upgrade().is_none() || 
+        vec_cur[self.idx].upgrade().unwrap().upgrade().is_none() {
+            let mut writer = vec_cur.upgrade();
             writer.remove(self.idx);
+            vec_cur = writer.downgrade_to_upgradeable();
         }
         self.idx += 1;
-        self.vec[self.idx - 1].upgrade().unwrap().upgrade()
+        let ret = vec_cur[self.idx - 1].upgrade().unwrap().upgrade();
+        self.vec = Some(vec_cur);
+        ret
     }
 }
 
@@ -60,7 +65,7 @@ impl<H: Hasher + Default> HashTable<H> {
     fn get_list_iter(&self, key: &str) -> SrcIter {
         SrcIter{
             idx: 0,
-            vec: self.table[self._position(key)].read()
+            vec: Some(self.table[self._position(key)].upgradeable_read())
         }
     }
     /// 插入索引
@@ -151,7 +156,7 @@ impl<H: Hasher + Default> DefaultCache<H> {
     }
 
     /// 获取哈希桶迭代器
-    pub fn get(&mut self, key: &str) -> SrcIter {
+    pub fn get(&self, key: &str) -> SrcIter {
         self.table.get_list_iter(key)
     }
 
@@ -167,7 +172,7 @@ impl<H: Hasher + Default> DefaultCache<H> {
 
 }
 
-trait Cachable<'a>: IndexNode {
-    fn name() -> Option<&'a str>;
-    fn parent() -> Option<&'a str>;
-}
+// trait Cachable<'a>: IndexNode {
+//     fn name() -> Option<&'a str>;
+//     fn parent() -> Option<&'a str>;
+// }

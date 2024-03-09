@@ -4,10 +4,7 @@ use alloc::{format, string::ToString, sync::Arc};
 use system_error::SystemError;
 
 use crate::{
-    driver::{
-        base::block::disk_info::Partition,
-        disk::ahci::{self},
-    },
+    driver::{base::block::disk_info::Partition, disk::ahci},
     filesystem::{
         devfs::devfs_init,
         fat::fs::FATFileSystem,
@@ -69,6 +66,9 @@ pub fn vfs_init() -> Result<(), SystemError> {
     root_inode
         .create("sys", FileType::Dir, ModeType::from_bits_truncate(0o755))
         .expect("Failed to create /sys");
+    root_inode
+        .create("ram", FileType::Dir, ModeType::from_bits_truncate(0o755))
+        .expect("Failed to create /ram");
     kdebug!("dir in root:{:?}", root_inode.list());
 
     procfs_init().expect("Failed to initialize procfs");
@@ -76,6 +76,8 @@ pub fn vfs_init() -> Result<(), SystemError> {
     devfs_init().expect("Failed to initialize devfs");
 
     sysfs_init().expect("Failed to initialize sysfs");
+
+    mount_ramfs().expect("Failed to initialize ramfs");
 
     let root_entries = ROOT_INODE().list().expect("VFS init failed");
     if root_entries.len() > 0 {
@@ -88,7 +90,7 @@ pub fn vfs_init() -> Result<(), SystemError> {
 ///
 /// @param mountpoint_name 在根目录下的挂载点的名称
 /// @param inode 原本的挂载点的inode
-fn do_migrate(
+pub fn do_migrate(
     new_root_inode: Arc<dyn IndexNode>,
     mountpoint_name: &str,
     fs: &MountFS,
@@ -124,6 +126,8 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     let dev: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
     let binding = ROOT_INODE().find("sys").expect("SysFs not mounted!").fs();
     let sys: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
+    let binding = ROOT_INODE().find("ram").expect("SysFs not mounted!").fs();
+    let ram: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
 
     let new_fs = MountFS::new(new_fs, None);
     // 获取新的根文件系统的根节点的引用
@@ -133,6 +137,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     do_migrate(new_root_inode.clone(), "proc", proc)?;
     do_migrate(new_root_inode.clone(), "dev", dev)?;
     do_migrate(new_root_inode.clone(), "sys", sys)?;
+    do_migrate(new_root_inode.clone(), "ram", ram)?;
     unsafe {
         // drop旧的Root inode
         let old_root_inode = __ROOT_INODE.take().unwrap();
@@ -289,4 +294,15 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     parent_inode.unlink(filename)?;
 
     return Ok(0);
+}
+
+fn mount_ramfs() -> Result<(), SystemError> {
+    let ramfs = RamFS::new();
+    let _t = ROOT_INODE()
+        .find("ram")
+        .expect("cannot find /ram")
+        .mount(ramfs)
+        .expect("Failed to mount ram");
+    kinfo!("RamFS mounted");
+    Ok(())
 }

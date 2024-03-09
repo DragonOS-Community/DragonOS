@@ -1,4 +1,4 @@
-use alloc::{string::String, sync::Arc};
+use alloc::{string::{String, ToString}, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::process::ProcessControlBlock;
@@ -80,37 +80,26 @@ pub fn is_absolute(path: &str) -> bool {
 
 pub fn clean_path(path: &str) -> String {
     let mut tmp = path;
-    let mut clean = "";
+    let mut clean = String::new();
     loop {
         match split_path(tmp) {
-            (key, Some(tmp)) => {
+            (key, Some(rest)) => {
                 match key {
                     "." => {},
-                    ".." => {clean = rsplit_path(&clean).1.unwrap_or("");},
-                    others => { clean = clean + '/' + others; },
+                    ".." => {clean = rsplit_path(&clean).1.unwrap_or("").to_string();},
+                    others => { clean = clean + "/" + others; },
                 };
+                tmp = rest;
             },
             (key, None) => { 
                 match key {
                     "." => {},
-                    ".." => {clean = rsplit_path(&clean).1.unwrap_or("");},
-                    others => { clean = clean + '/' + others; },
+                    ".." => {clean = rsplit_path(&clean).1.unwrap_or("").to_string();},
+                    others => { clean = clean + "/" + others; },
                 };
                 break; 
             }
         }
-        // match rest_path.find('/') {
-        //     Some(pos) => {
-        //         // 找到了，设置下一个要查找的名字
-        //         name = String::from(&rest_path[0..pos]);
-        //         // 剩余的路径字符串
-        //         rest_path = String::from(&rest_path[pos + 1..]);
-        //     }
-        //     None => {
-        //         name = rest_path;
-        //         rest_path = String::new();
-        //     }
-        // }
     }
     String::from(clean)
 }

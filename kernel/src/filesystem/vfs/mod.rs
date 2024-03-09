@@ -9,7 +9,7 @@ mod utils;
 
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::{String, ToString}, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
@@ -398,7 +398,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     }
 
     /// name for hashing
-    fn name(&self) -> Result<String, SystemError> {
+    fn key(&self) -> Result<String, SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
@@ -464,7 +464,7 @@ impl dyn IndexNode {
         let abs_path: String = if is_absolute(path) {
             clean_path(path)
         } else {
-            &current + clean_path(path)
+            current.clone() + &clean_path(path)
         };
         kdebug!("Cache Search path {}", abs_path);
         if let Some((inode, l_rest)) = self.quick_lookup(get.unwrap(), &abs_path, &current) {
@@ -559,12 +559,12 @@ impl dyn IndexNode {
     /// @return Err(SystemError) 错误码
     /// 
     /// 缓存可能未命中
-    fn quick_lookup(&self, cache: Arc<DefaultCache>, abs_path: &str, current: &str) -> Option<(Arc<dyn IndexNode>, &str)> {
+    fn quick_lookup<'a>(&'a self, cache: Arc<DefaultCache>, abs_path: &'a str, current: &'a str) -> Option<(Arc<dyn IndexNode>, &str)> {
         // check again. 
         self._quick_lookup(cache, abs_path, current)
     }
 
-    fn _quick_lookup(&self, cache: Arc<DefaultCache>, abs_path: &str, current: &str) -> Option<(Arc<dyn IndexNode>, &str)> {
+    fn _quick_lookup<'a>(&'a self, mut cache: Arc<DefaultCache>, abs_path: &'a str, current: &'a str) -> Option<(Arc<dyn IndexNode>, &str)> {
         // let cache = self.cache().unwrap();
         let (key, left_rest) = rsplit_path(abs_path);
         if left_rest.is_none() {
@@ -574,7 +574,7 @@ impl dyn IndexNode {
             return None;
         }
         let result = cache.get(key).find(|src| {
-            src.name() == key && src._abs_path() == abs_path
+            src.key().unwrap() == key && src._abs_path().unwrap() == abs_path
         });
         if result.is_some() {
             return Some((result.unwrap(), abs_path));
@@ -592,13 +592,13 @@ impl dyn IndexNode {
             if inode.parent().is_err_and(|err| err == SystemError::ENOENT) {
                 break;
             }
-            let name = inode.parent().unwrap().name();
+            let name = inode.parent().unwrap().key();
             if name.is_err() {
-                return Err(name);
+                return Err(name.unwrap_err());
             }
-            path = name.unwrap() + '/' + &path;
+            path = name.unwrap() + &"/".to_string() + &path.to_string();
         }
-        path = '/' + path;
+        path = "/".to_string() + &path;
         Ok(path)
     }
 }

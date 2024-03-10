@@ -9,6 +9,7 @@ use crate::{
     filesystem::vfs::{
         file::{File, FileMode},
         syscall::{IoVec, IoVecs, ModeType},
+        FileType,
     },
     libs::spinlock::SpinLockGuard,
     mm::{verify_area, VirtAddr},
@@ -19,7 +20,7 @@ use crate::{
 
 use super::{
     socket::{
-        new_socket, new_socketpair, PosixSocketType, Socket, SocketHandleItem, SocketInode,
+        new_socket, new_pairsocket, PosixSocketType, Socket, SocketHandleItem, SocketInode,
         HANDLE_MAP,
     },
     Endpoint, Protocol, ShutdownType,
@@ -74,28 +75,28 @@ impl Syscall {
         _protocol: usize,
         fds: &mut [i32],
     ) -> Result<usize, SystemError> {
+        // 创建一对socket
         let address_family = AddressFamily::try_from(address_family as u16)?;
         let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
 
-        let mut socket0 = new_socketpair(address_family, socket_type)?;
-        let mut socket1 = new_socketpair(address_family, socket_type)?;
-
-        socket0
-            .socketpair_ops()
-            .unwrap()
-            .socketpair(&mut socket0, &mut socket1);
+        let socket0 = new_pairsocket(address_family, socket_type)?;
+        let socket1 = new_pairsocket(address_family, socket_type)?;
 
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
 
-        let mut alloc_fd = |socket: Box<dyn Socket>| -> Result<i32, SystemError> {
-            let socketinode = SocketInode::new(socket);
-            let file = File::new(socketinode, FileMode::O_RDWR)?;
-            fd_table_guard.alloc_fd(file, None)
-        };
+        let inode0 = SocketInode::new(socket0);
+        let inode1 = SocketInode::new(socket1);
 
-        fds[0] = alloc_fd(socket0)?;
-        fds[1] = alloc_fd(socket1)?;
+        // 进行pair
+        inode0.do_inner_pair(inode1.clone())?;
+        inode1.do_inner_pair(inode0.clone())?;
+
+        let file0 = File::new(inode0, FileMode::O_RDWR)?;
+        let file1 = File::new(inode1, FileMode::O_RDWR)?;
+
+        fds[0] = fd_table_guard.alloc_fd(file0, None)?;
+        fds[1] = fd_table_guard.alloc_fd(file1, None)?;
 
         drop(fd_table_guard);
         Ok(0)
@@ -152,7 +153,7 @@ impl Syscall {
                 PosixSocketOption::SO_SNDBUF => {
                     // 返回发送缓冲区大小
                     unsafe {
-                        *optval = socket.metadata()?.tx_buf_size as u32;
+                        *optval = socket.metadata().tx_buf_size as u32;
                         *optlen = core::mem::size_of::<u32>() as u32;
                     }
                     return Ok(0);
@@ -161,7 +162,7 @@ impl Syscall {
                     let optval = optval as *mut u32;
                     // 返回默认的接收缓冲区大小
                     unsafe {
-                        *optval = socket.metadata()?.rx_buf_size as u32;
+                        *optval = socket.metadata().rx_buf_size as u32;
                         *optlen = core::mem::size_of::<u32>() as u32;
                     }
                     return Ok(0);
@@ -276,7 +277,7 @@ impl Syscall {
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let mut socket = unsafe { socket.inner_no_preempt() };
+        let socket = unsafe { socket.inner_no_preempt() };
 
         let (n, endpoint) = socket.read(buf);
         drop(socket);
@@ -307,7 +308,7 @@ impl Syscall {
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let mut socket = unsafe { socket.inner_no_preempt() };
+        let socket = unsafe { socket.inner_no_preempt() };
 
         let mut buf = iovs.new_buf(true);
         // 从socket中读取数据
@@ -604,8 +605,15 @@ impl SockAddr {
                     let binding = ProcessManager::current_pcb().fd_table();
                     let fd_table_guard = binding.read();
 
-                    let file = fd_table_guard.get_file_by_fd(fd as i32);
-                    return Ok(Endpoint::File(file));
+                    let binding = fd_table_guard.get_file_by_fd(fd as i32).unwrap();
+                    let file = binding.lock();
+                    if file.file_type() != FileType::Socket {
+                        return Err(SystemError::ENOTSOCK);
+                    }
+                    let inode = file.inode();
+                    let socketinode = inode.as_any_ref().downcast_ref::<Arc<SocketInode>>();
+
+                    return Ok(Endpoint::Inode(socketinode.cloned()));
                 }
                 AddressFamily::Packet => {
                     // TODO: support packet socket

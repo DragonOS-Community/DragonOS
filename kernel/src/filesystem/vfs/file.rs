@@ -158,7 +158,7 @@ impl File {
         // kdebug!("inode:{:?}",f.inode);
         f.inode.open(&mut f.private_data, &mode)?;
 
-        return Ok(f);
+        Ok(f)
     }
 
     /// @brief 从文件中读取指定的字节数到buffer中
@@ -623,7 +623,7 @@ impl FileDescriptorVec {
         if !FileDescriptorVec::validate_fd(fd) {
             return None;
         }
-        return self.fds[fd as usize].clone();
+        self.fds[fd as usize].clone()
     }
 
     /// 释放文件描述符，同时关闭文件。

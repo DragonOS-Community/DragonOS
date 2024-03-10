@@ -87,7 +87,7 @@ impl RawSocket {
 }
 
 impl Socket for RawSocket {
-    fn read(&mut self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
+    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         poll_ifaces();
         loop {
             // 如何优化这里？
@@ -200,16 +200,24 @@ impl Socket for RawSocket {
         Ok(())
     }
 
-    fn metadata(&self) -> Result<SocketMetadata, SystemError> {
-        Ok(self.metadata.clone())
+    fn metadata(&self) -> SocketMetadata {
+        self.metadata.clone()
     }
 
     fn box_clone(&self) -> Box<dyn Socket> {
-        return Box::new(self.clone());
+        Box::new(self.clone())
     }
 
     fn socket_handle(&self) -> SocketHandle {
         self.handle.0
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
     }
 }
 
@@ -289,7 +297,7 @@ impl UdpSocket {
 
 impl Socket for UdpSocket {
     /// @brief 在read函数执行之前，请先bind到本地的指定端口
-    fn read(&mut self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
+    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         loop {
             // kdebug!("Wait22 to Read");
             poll_ifaces();
@@ -397,10 +405,10 @@ impl Socket for UdpSocket {
     fn connect(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(_) = endpoint {
             self.remote_endpoint = Some(endpoint);
-            return Ok(());
+            Ok(())
         } else {
-            return Err(SystemError::EINVAL);
-        };
+            Err(SystemError::EINVAL)
+        }
     }
 
     fn ioctl(
@@ -413,8 +421,8 @@ impl Socket for UdpSocket {
         todo!()
     }
 
-    fn metadata(&self) -> Result<SocketMetadata, SystemError> {
-        Ok(self.metadata.clone())
+    fn metadata(&self) -> SocketMetadata {
+        self.metadata.clone()
     }
 
     fn box_clone(&self) -> Box<dyn Socket> {
@@ -448,6 +456,14 @@ impl Socket for UdpSocket {
 
     fn socket_handle(&self) -> SocketHandle {
         self.handle.0
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
     }
 }
 
@@ -533,7 +549,7 @@ impl TcpSocket {
 }
 
 impl Socket for TcpSocket {
-    fn read(&mut self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
+    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         if HANDLE_MAP
             .read_irqsave()
             .get(&self.socket_handle())
@@ -855,15 +871,23 @@ impl Socket for TcpSocket {
         return socket.remote_endpoint().map(|x| Endpoint::Ip(Some(x)));
     }
 
-    fn metadata(&self) -> Result<SocketMetadata, SystemError> {
-        Ok(self.metadata.clone())
+    fn metadata(&self) -> SocketMetadata {
+        self.metadata.clone()
     }
 
     fn box_clone(&self) -> Box<dyn Socket> {
-        return Box::new(self.clone());
+        Box::new(self.clone())
     }
 
     fn socket_handle(&self) -> SocketHandle {
         self.handle.0
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
     }
 }

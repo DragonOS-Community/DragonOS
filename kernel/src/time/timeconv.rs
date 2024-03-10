@@ -101,11 +101,11 @@ pub fn time_to_calendar(totalsecs: PosixTimeT, offset: i32) -> CalendarTime {
     }
     // 计算对应的小时数
     result.tm_hour = (rem / SECS_PER_HOUR) as i32;
-    rem = rem % SECS_PER_HOUR;
+    rem %= SECS_PER_HOUR;
 
     // 计算对应的分钟数
     result.tm_min = (rem / 60) as i32;
-    rem = rem % 60;
+    rem %= 60;
 
     // 秒数
     result.tm_sec = rem as i32;

@@ -707,7 +707,7 @@ impl EventPoll {
 
     /// ### epoll的回调，支持epoll的文件有事件到来时直接调用该方法即可
     pub fn wakeup_epoll(
-        epitems: &mut SpinLock<LinkedList<Arc<EPollItem>>>,
+        epitems: &SpinLock<LinkedList<Arc<EPollItem>>>,
         pollflags: EPollEventType,
     ) -> Result<(), SystemError> {
         let mut epitems_guard = epitems.try_lock_irqsave()?;

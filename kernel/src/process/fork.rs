@@ -151,7 +151,7 @@ impl ProcessManager {
     ///
     /// - fork失败的话，子线程不会执行。
     pub fn fork(
-        current_trapframe: &mut TrapFrame,
+        current_trapframe: &TrapFrame,
         clone_flags: CloneFlags,
     ) -> Result<Pid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
@@ -300,7 +300,7 @@ impl ProcessManager {
         current_pcb: &Arc<ProcessControlBlock>,
         pcb: &Arc<ProcessControlBlock>,
         clone_args: KernelCloneArgs,
-        current_trapframe: &mut TrapFrame,
+        current_trapframe: &TrapFrame,
     ) -> Result<(), SystemError> {
         let clone_flags = clone_args.flags;
         // 不允许与不同namespace的进程共享根目录

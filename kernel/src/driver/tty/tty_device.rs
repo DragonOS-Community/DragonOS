@@ -211,7 +211,7 @@ impl IndexNode for TtyDevice {
 
             // 将数据从buf拷贝到writebuf
 
-            let ret = ld.write(tty.clone(), buf, size, mode)?;
+            let ret = ld.write(tty.clone(), &buf[written..], size, mode)?;
 
             written += ret;
             count -= ret;

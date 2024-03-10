@@ -343,17 +343,17 @@ impl TtyCoreData {
 
     #[inline]
     pub fn termios(&self) -> RwLockReadGuard<'_, Termios> {
-        self.termios.read()
+        self.termios.read_irqsave()
     }
 
     #[inline]
     pub fn termios_write(&self) -> RwLockWriteGuard<Termios> {
-        self.termios.write()
+        self.termios.write_irqsave()
     }
 
     #[inline]
     pub fn set_termios(&self, termios: Termios) {
-        let mut termios_guard = self.termios.write();
+        let mut termios_guard = self.termios.write_irqsave();
         *termios_guard = termios;
     }
 

@@ -158,7 +158,7 @@ impl File {
         // kdebug!("inode:{:?}",f.inode);
         f.inode.open(&mut f.private_data, &mode)?;
 
-        Ok(f)
+        return Ok(f);
     }
 
     /// @brief 从文件中读取指定的字节数到buffer中

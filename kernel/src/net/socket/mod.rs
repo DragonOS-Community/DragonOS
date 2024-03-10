@@ -63,17 +63,17 @@ pub(super) fn new_socket(
     protocol: Protocol,
 ) -> Result<Box<dyn Socket>, SystemError> {
     let socket: Box<dyn Socket> = match address_family {
-        AddressFamily::INet => match socket_type {
-            PosixSocketType::Stream => Box::new(TcpSocket::new(SocketOptions::default())),
-            PosixSocketType::Datagram => Box::new(UdpSocket::new(SocketOptions::default())),
-            PosixSocketType::Raw => Box::new(RawSocket::new(protocol, SocketOptions::default())),
+        AddressFamily::Unix => match socket_type {
+            PosixSocketType::Stream => Box::new(StreamSocket::new(SocketOptions::default())),
+            PosixSocketType::SeqPacket => Box::new(SeqpacketSocket::new(SocketOptions::default())),
             _ => {
                 return Err(SystemError::EINVAL);
             }
         },
-        AddressFamily::Unix => match socket_type {
-            PosixSocketType::Stream => Box::new(StreamSocket::new(SocketOptions::default())),
-            PosixSocketType::SeqPacket => Box::new(SeqpacketSocket::new(SocketOptions::default())),
+        AddressFamily::INet => match socket_type {
+            PosixSocketType::Stream => Box::new(TcpSocket::new(SocketOptions::default())),
+            PosixSocketType::Datagram => Box::new(UdpSocket::new(SocketOptions::default())),
+            PosixSocketType::Raw => Box::new(RawSocket::new(protocol, SocketOptions::default())),
             _ => {
                 return Err(SystemError::EINVAL);
             }
@@ -295,17 +295,6 @@ impl SocketInode {
 
     pub unsafe fn inner_no_preempt(&self) -> SpinLockGuard<Box<dyn Socket>> {
         self.0.lock_no_preempt()
-    }
-
-    pub fn do_inner_pair(&self, peer_inode: Arc<SocketInode>) -> Result<(), SystemError> {
-        let mut socket = self.inner();
-        if socket.metadata().socket_type != SocketType::Unix {
-            return Err(SystemError::EINVAL);
-        }
-
-        socket.connect(Endpoint::Inode(Some(peer_inode)))?;
-
-        Ok(())
     }
 
     pub fn write_buffer(&self, buf: &[u8]) -> Result<usize, SystemError> {

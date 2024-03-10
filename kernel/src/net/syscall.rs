@@ -72,29 +72,29 @@ impl Syscall {
         protocol: usize,
         fds: &mut [i32],
     ) -> Result<usize, SystemError> {
-        // 创建一对socket
         let address_family = AddressFamily::try_from(address_family as u16)?;
         let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
         let protocol = Protocol::from(protocol as u8);
 
-        let socket0 = new_socket(address_family, socket_type, protocol)?;
-        let socket1 = new_socket(address_family, socket_type, protocol)?;
-
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
 
-        let inode0 = SocketInode::new(socket0);
-        let inode1 = SocketInode::new(socket1);
+        // 创建一对socket
+        let inode0 = SocketInode::new(new_socket(address_family, socket_type, protocol)?);
+        let inode1 = SocketInode::new(new_socket(address_family, socket_type, protocol)?);
 
         // 进行pair
-        inode0.do_inner_pair(inode1.clone())?;
-        inode1.do_inner_pair(inode0.clone())?;
+        unsafe {
+            inode0
+                .inner_no_preempt()
+                .connect(Endpoint::Inode(Some(inode1.clone())))?;
+            inode1
+                .inner_no_preempt()
+                .connect(Endpoint::Inode(Some(inode0.clone())))?;
+        }
 
-        let file0 = File::new(inode0, FileMode::O_RDWR)?;
-        let file1 = File::new(inode1, FileMode::O_RDWR)?;
-
-        fds[0] = fd_table_guard.alloc_fd(file0, None)?;
-        fds[1] = fd_table_guard.alloc_fd(file1, None)?;
+        fds[0] = fd_table_guard.alloc_fd(File::new(inode0, FileMode::O_RDWR)?, None)?;
+        fds[1] = fd_table_guard.alloc_fd(File::new(inode1, FileMode::O_RDWR)?, None)?;
 
         drop(fd_table_guard);
         Ok(0)
@@ -253,7 +253,7 @@ impl Syscall {
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let socket = unsafe { socket.inner_no_preempt() };
-        socket.write(buf, endpoint)
+        return socket.write(buf, endpoint);
     }
 
     /// @brief sys_recvfrom系统调用的实际执行函数
@@ -289,7 +289,7 @@ impl Syscall {
                 sockaddr_in.write_to_user(addr, addrlen)?;
             }
         }
-        Ok(n)
+        return Ok(n);
     }
 
     /// @brief sys_recvmsg系统调用的实际执行函数

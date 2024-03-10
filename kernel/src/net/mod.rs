@@ -5,12 +5,10 @@ use core::{
 
 use alloc::{collections::BTreeMap, sync::Arc};
 
-use crate::{
-    driver::net::NetDriver,
-    filesystem::vfs::file::File,
-    libs::{rwlock::RwLock, spinlock::SpinLock},
-};
+use crate::{driver::net::NetDriver, libs::rwlock::RwLock};
 use smoltcp::wire::IpEndpoint;
+
+use self::socket::SocketInode;
 
 pub mod event_poll;
 pub mod net_core;
@@ -45,8 +43,8 @@ pub enum Endpoint {
     LinkLayer(LinkLayerEndpoint),
     /// 网络层端点
     Ip(Option<IpEndpoint>),
-    /// 文件端点
-    File(Option<Arc<SpinLock<File>>>),
+    /// inode端点
+    Inode(Option<Arc<SocketInode>>),
     // todo: 增加NetLink机制后，增加NetLink端点
 }
 

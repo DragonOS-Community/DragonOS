@@ -19,10 +19,7 @@ use crate::{
 };
 
 use super::{
-    socket::{
-        new_pairsocket, new_socket, PosixSocketType, Socket, SocketHandleItem, SocketInode,
-        HANDLE_MAP,
-    },
+    socket::{new_socket, PosixSocketType, Socket, SocketHandleItem, SocketInode, HANDLE_MAP},
     Endpoint, Protocol, ShutdownType,
 };
 
@@ -72,15 +69,16 @@ impl Syscall {
     pub fn socketpair(
         address_family: usize,
         socket_type: usize,
-        _protocol: usize,
+        protocol: usize,
         fds: &mut [i32],
     ) -> Result<usize, SystemError> {
         // 创建一对socket
         let address_family = AddressFamily::try_from(address_family as u16)?;
         let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
+        let protocol = Protocol::from(protocol as u8);
 
-        let socket0 = new_pairsocket(address_family, socket_type)?;
-        let socket1 = new_pairsocket(address_family, socket_type)?;
+        let socket0 = new_socket(address_family, socket_type, protocol)?;
+        let socket1 = new_socket(address_family, socket_type, protocol)?;
 
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();

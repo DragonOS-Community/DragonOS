@@ -3,7 +3,7 @@ use system_error::SystemError;
 
 use crate::{libs::spinlock::SpinLock, net::Endpoint};
 
-use super::{Socket, SocketInode, SocketMetadata, SocketOptions, SocketPair, SocketType};
+use super::{Socket, SocketInode, SocketMetadata, SocketOptions, SocketType};
 
 #[derive(Debug, Clone)]
 pub struct StreamSocket {
@@ -74,6 +74,18 @@ impl Socket for StreamSocket {
         }
     }
 
+    fn write_buffer(&self, buf: &[u8]) -> Result<usize, SystemError> {
+        let mut buffer = self.buffer.lock_irqsave();
+
+        let len = buf.len();
+        if buffer.capacity() - buffer.len() < len {
+            return Err(SystemError::ENOBUFS);
+        }
+        buffer[..len].copy_from_slice(buf);
+
+        Ok(len)
+    }
+
     fn metadata(&self) -> SocketMetadata {
         self.metadata.clone()
     }
@@ -88,32 +100,6 @@ impl Socket for StreamSocket {
 
     fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
         self
-    }
-}
-
-impl SocketPair for StreamSocket {
-    // fn socketpair_ops(&self) -> Option<&'static dyn SocketpairOps> {
-    //     Some(&SeqpacketSocketpairOps)
-    // }
-
-    // fn buffer(&self) -> Arc<SpinLock<Vec<u8>>> {
-    //     self.buffer.clone()
-    // }
-
-    // fn set_peer_buffer(&mut self, peer_buffer: Arc<SpinLock<Vec<u8>>>) {
-    //     self.peer_inode = Some(peer_buffer);
-    // }
-
-    fn write_buffer(&self, buf: &[u8]) -> Result<usize, SystemError> {
-        let mut buffer = self.buffer.lock_irqsave();
-
-        let len = buf.len();
-        if buffer.capacity() - buffer.len() < len {
-            return Err(SystemError::ENOBUFS);
-        }
-        buffer[..len].copy_from_slice(buf);
-
-        Ok(len)
     }
 }
 
@@ -186,6 +172,18 @@ impl Socket for SeqpacketSocket {
         }
     }
 
+    fn write_buffer(&self, buf: &[u8]) -> Result<usize, SystemError> {
+        let mut buffer = self.buffer.lock_irqsave();
+
+        let len = buf.len();
+        if buffer.capacity() - buffer.len() < len {
+            return Err(SystemError::ENOBUFS);
+        }
+        buffer[..len].copy_from_slice(buf);
+
+        Ok(len)
+    }
+
     fn metadata(&self) -> SocketMetadata {
         self.metadata.clone()
     }
@@ -202,49 +200,3 @@ impl Socket for SeqpacketSocket {
         self
     }
 }
-
-impl SocketPair for SeqpacketSocket {
-    // fn socketpair_ops(&self) -> Option<&'static dyn SocketpairOps> {
-    //     Some(&SeqpacketSocketpairOps)
-    // }
-
-    // fn buffer(&self) -> Arc<SpinLock<Vec<u8>>> {
-    //     self.buffer.clone()
-    // }
-
-    // fn set_peer_buffer(&mut self, peer_buffer: Arc<SpinLock<Vec<u8>>>) {
-    //     self.peer_inode = Some(peer_buffer);
-    // }
-
-    fn write_buffer(&self, buf: &[u8]) -> Result<usize, SystemError> {
-        let mut buffer = self.buffer.lock_irqsave();
-
-        let len = buf.len();
-        if buffer.capacity() - buffer.len() < len {
-            return Err(SystemError::ENOBUFS);
-        }
-        buffer[..len].copy_from_slice(buf);
-
-        Ok(len)
-    }
-}
-
-// struct SeqpacketSocketpairOps;
-
-// impl SocketpairOps for SeqpacketSocketpairOps {
-//     fn socketpair(&self, socket0: &mut Box<dyn SocketPair>, socket1: &mut Box<dyn SocketPair>) {
-//         let pair0 = socket0
-//             .as_mut()
-//             .as_any_mut()
-//             .downcast_mut::<SeqpacketSocket>()
-//             .unwrap();
-
-//         let pair1 = socket1
-//             .as_mut()
-//             .as_any_mut()
-//             .downcast_mut::<SeqpacketSocket>()
-//             .unwrap();
-//         pair0.set_peer_buffer(pair1.buffer());
-//         pair1.set_peer_buffer(pair0.buffer());
-//     }
-// }

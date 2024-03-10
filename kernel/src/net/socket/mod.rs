@@ -85,26 +85,6 @@ pub(super) fn new_socket(
     Ok(socket)
 }
 
-/// 根据地址族、socket类型创建socketpair
-pub(super) fn new_pairsocket(
-    address_family: AddressFamily,
-    socket_type: PosixSocketType,
-) -> Result<Box<dyn SocketPair>, SystemError> {
-    let socket: Box<dyn SocketPair> = match address_family {
-        AddressFamily::Unix => match socket_type {
-            PosixSocketType::Stream => Box::new(StreamSocket::new(SocketOptions::default())),
-            PosixSocketType::SeqPacket => Box::new(SeqpacketSocket::new(SocketOptions::default())),
-            _ => {
-                return Err(SystemError::EINVAL);
-            }
-        },
-        _ => {
-            return Err(SystemError::EAFNOSUPPORT);
-        }
-    };
-    Ok(socket)
-}
-
 pub trait Socket: Sync + Send + Debug + Any {
     /// @brief 从socket中读取数据，如果socket是阻塞的，那么直到读取到数据才返回
     ///
@@ -247,6 +227,10 @@ pub trait Socket: Sync + Send + Debug + Any {
         todo!()
     }
 
+    fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
+        todo!()
+    }
+
     fn as_any_ref(&self) -> &dyn Any;
 
     fn as_any_mut(&mut self) -> &mut dyn Any;
@@ -295,21 +279,6 @@ impl Clone for Box<dyn Socket> {
     }
 }
 
-pub trait SocketPair: Socket {
-    // fn socketpair_ops(&self) -> Option<&'static dyn SocketpairOps>;
-
-    // fn buffer(&self) -> Arc<SpinLock<Vec<u8>>>;
-
-    // fn set_peer_buffer(&mut self, peer_buffer: Arc<SpinLock<Vec<u8>>>);
-
-    fn write_buffer(&self, buf: &[u8]) -> Result<usize, SystemError>;
-}
-
-pub trait SocketpairOps {
-    /// 执行socketpair
-    fn socketpair(&self, socket0: &mut Box<dyn SocketPair>, socket1: &mut Box<dyn SocketPair>);
-}
-
 /// # Socket在文件系统中的inode封装
 #[derive(Debug)]
 pub struct SocketInode(SpinLock<Box<dyn Socket>>, AtomicUsize);
@@ -334,11 +303,6 @@ impl SocketInode {
             return Err(SystemError::EINVAL);
         }
 
-        let socket = socket
-            .as_any_mut()
-            .downcast_mut::<Box<dyn SocketPair>>()
-            .unwrap();
-
         socket.connect(Endpoint::Inode(Some(peer_inode)))?;
 
         Ok(())
@@ -349,11 +313,6 @@ impl SocketInode {
         if socket.metadata().socket_type != SocketType::Unix {
             return Err(SystemError::EINVAL);
         }
-
-        let socket = socket
-            .as_any_ref()
-            .downcast_ref::<Box<dyn SocketPair>>()
-            .unwrap();
 
         let len = socket.write_buffer(buf)?;
         Ok(len)

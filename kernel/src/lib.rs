@@ -23,6 +23,13 @@
 #![feature(slice_ptr_get)]
 #![feature(vec_into_raw_parts)]
 #![cfg_attr(target_os = "none", no_std)]
+// clippy的配置
+#![deny(clippy::all)]
+// DragonOS允许在函数中使用return语句（尤其是长函数时，我们推荐这么做）
+#![allow(clippy::let_and_return)]
+#![allow(clippy::needless_pass_by_ref_mut)]
+#![allow(clippy::needless_return)]
+#![allow(clippy::upper_case_acronyms)]
 
 #[cfg(test)]
 #[macro_use]

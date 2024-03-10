@@ -30,11 +30,11 @@ use crate::{
 };
 
 impl Syscall {
-    pub fn fork(frame: &mut TrapFrame) -> Result<usize, SystemError> {
+    pub fn fork(frame: &TrapFrame) -> Result<usize, SystemError> {
         ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into())
     }
 
-    pub fn vfork(frame: &mut TrapFrame) -> Result<usize, SystemError> {
+    pub fn vfork(frame: &TrapFrame) -> Result<usize, SystemError> {
         // 由于Linux vfork需要保证子进程先运行（除非子进程调用execve或者exit），
         // 而我们目前没有实现这个特性，所以暂时使用fork代替vfork（linux文档表示这样也是也可以的）
         Self::fork(frame)
@@ -171,7 +171,7 @@ impl Syscall {
     }
 
     pub fn clone(
-        current_trapframe: &mut TrapFrame,
+        current_trapframe: &TrapFrame,
         clone_args: KernelCloneArgs,
     ) -> Result<usize, SystemError> {
         let flags = clone_args.flags;

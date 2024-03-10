@@ -99,9 +99,9 @@ impl From<Duration> for TimeSpec {
     }
 }
 
-impl Into<Duration> for TimeSpec {
-    fn into(self) -> Duration {
-        Duration::from_micros(self.tv_sec as u64 * 1000000 + self.tv_nsec as u64 / 1000)
+impl From<TimeSpec> for Duration {
+    fn from(val: TimeSpec) -> Self {
+        Duration::from_micros(val.tv_sec as u64 * 1000000 + val.tv_nsec as u64 / 1000)
     }
 }
 
@@ -403,9 +403,9 @@ impl From<smoltcp::time::Instant> for Instant {
     }
 }
 
-impl Into<smoltcp::time::Instant> for Instant {
-    fn into(self) -> smoltcp::time::Instant {
-        smoltcp::time::Instant::from_millis(self.millis())
+impl From<Instant> for smoltcp::time::Instant {
+    fn from(val: Instant) -> Self {
+        smoltcp::time::Instant::from_millis(val.millis())
     }
 }
 
@@ -416,9 +416,9 @@ impl From<smoltcp::time::Duration> for Duration {
     }
 }
 
-impl Into<smoltcp::time::Duration> for Duration {
-    fn into(self) -> smoltcp::time::Duration {
-        smoltcp::time::Duration::from_millis(self.millis())
+impl From<Duration> for smoltcp::time::Duration {
+    fn from(val: Duration) -> Self {
+        smoltcp::time::Duration::from_millis(val.millis())
     }
 }
 

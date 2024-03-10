@@ -142,7 +142,7 @@ impl Vm {
             }
         }
 
-        if !(new_slot.flags & KVM_MEM_LOG_DIRTY_PAGES != 0) {
+        if (new_slot.flags & KVM_MEM_LOG_DIRTY_PAGES) == 0 {
             // new_slot.dirty_bitmap = 0;
         }
 
@@ -154,7 +154,7 @@ impl Vm {
         // }
         if change == KvmMemoryChange::Create {
             new_slot.userspace_addr = mem.userspace_addr;
-            let mut memslots = self.memslots[as_id as usize].memslots.clone();
+            let mut memslots = self.memslots[as_id as usize].memslots;
             memslots[id as usize] = new_slot;
             self.memslots[as_id as usize].memslots = memslots;
             self.memslots[as_id as usize].used_slots += 1;

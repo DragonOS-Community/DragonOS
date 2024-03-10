@@ -20,7 +20,7 @@ use crate::{
 
 use super::{
     socket::{
-        new_socket, new_pairsocket, PosixSocketType, Socket, SocketHandleItem, SocketInode,
+        new_pairsocket, new_socket, PosixSocketType, Socket, SocketHandleItem, SocketInode,
         HANDLE_MAP,
     },
     Endpoint, Protocol, ShutdownType,

@@ -409,17 +409,18 @@ impl InnerAddressSpace {
             return Err(SystemError::EINVAL);
         }
 
+        // 初始化映射标志
+        let mut map_flags: MapFlags = vm_flags.into();
+        // 初始化内存区域保护标志
+        let prot_flags: ProtFlags = vm_flags.into();
+
         // 取消新内存区域的原映射
         if mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
+            map_flags |= MapFlags::MAP_FIXED;
             let start_page = VirtPageFrame::new(new_vaddr);
             let page_count = PageFrameCount::from_bytes(new_len).unwrap();
             self.munmap(start_page, page_count)?;
         }
-
-        // 初始化映射标志
-        let map_flags: MapFlags = vm_flags.into();
-        // 初始化内存区域保护标志
-        let prot_flags: ProtFlags = vm_flags.into();
 
         // 获取映射后的新内存页面
         let new_page = self.map_anonymous(new_vaddr, new_len, prot_flags, map_flags, true)?;

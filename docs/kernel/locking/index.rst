@@ -9,7 +9,6 @@
 
    locks
    spinlock
-   lockref
    mutex
    rwlock
 

@@ -3,10 +3,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{driver::sbi::SbiDriver, mm::init::mm_early_init},
-    driver::{
-        firmware::efi::init::efi_init, irqchip::riscv_intc::riscv_intc_init,
-        open_firmware::fdt::open_firmware_fdt_driver,
-    },
+    driver::{firmware::efi::init::efi_init, open_firmware::fdt::open_firmware_fdt_driver},
     init::{boot_params, init::start_kernel},
     kdebug, kinfo,
     mm::{memblock::mem_block_manager, PhysAddr, VirtAddr},
@@ -14,7 +11,7 @@ use crate::{
     smp::cpu::ProcessorId,
 };
 
-use super::{cpu::init_local_context, driver::sbi::console_putstr};
+use super::{cpu::init_local_context, interrupt::entry::handle_exception};
 
 #[derive(Debug)]
 pub struct ArchBootParams {
@@ -52,8 +49,20 @@ unsafe extern "C" fn kernel_main(hartid: usize, fdt_paddr: usize) -> ! {
         BOOT_HARTID = hartid as u32;
         BOOT_FDT_PADDR = fdt_paddr;
     }
-
+    setup_trap_vector();
     start_kernel();
+}
+
+/// 设置中断、异常处理函数
+fn setup_trap_vector() {
+    let ptr = handle_exception as *const () as usize;
+
+    unsafe {
+        riscv::register::stvec::write(ptr, riscv::register::stvec::TrapMode::Direct);
+        // Set sup0 scratch register to 0, indicating to exception vector that
+        // we are presently executing in kernel.
+        riscv::register::sscratch::write(0);
+    }
 }
 
 #[inline(never)]

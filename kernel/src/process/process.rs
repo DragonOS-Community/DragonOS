@@ -14,7 +14,7 @@ pub fn current_pcb_flags() -> ProcessFlags {
     if unsafe { !__PROCESS_MANAGEMENT_INIT_DONE } {
         return ProcessFlags::empty();
     }
-    return ProcessManager::current_pcb().flags().clone();
+    return *ProcessManager::current_pcb().flags();
 }
 
 pub fn current_pcb_preempt_count() -> usize {

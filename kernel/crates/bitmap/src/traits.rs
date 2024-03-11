@@ -311,7 +311,7 @@ pub trait BitMapOps<T: BitOps> {
 
     /// # Unsafe
     /// *不应直接修改字节数组*
-    /// 
+    ///
     /// 将bitmap转换为字节数组
     unsafe fn as_bytes(&self) -> &[u8];
 }

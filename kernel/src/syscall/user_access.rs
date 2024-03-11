@@ -49,7 +49,7 @@ pub unsafe fn copy_from_user(dst: &mut [u8], src: VirtAddr) -> Result<usize, Sys
 
     let src: &[u8] = core::slice::from_raw_parts(src.data() as *const u8, dst.len());
     // 拷贝数据
-    dst.copy_from_slice(&src);
+    dst.copy_from_slice(src);
 
     return Ok(dst.len());
 }
@@ -182,7 +182,7 @@ impl<'a> UserBufferReader<'a> {
     /// @return 返回用户空间数据的切片(对单个结构体就返回长度为一的切片)
     ///
     pub fn read_from_user<T>(&self, offset: usize) -> Result<&[T], SystemError> {
-        return self.convert_with_offset(&self.buffer, offset);
+        return self.convert_with_offset(self.buffer, offset);
     }
     /// 从用户空间读取一个指定偏移量的数据(到变量中)
     ///
@@ -190,7 +190,7 @@ impl<'a> UserBufferReader<'a> {
     /// @return 返回用户空间数据的引用
     ///    
     pub fn read_one_from_user<T>(&self, offset: usize) -> Result<&T, SystemError> {
-        return self.convert_one_with_offset(&self.buffer, offset);
+        return self.convert_one_with_offset(self.buffer, offset);
     }
 
     /// 从用户空间拷贝数据(到指定地址中)
@@ -203,7 +203,7 @@ impl<'a> UserBufferReader<'a> {
         dst: &mut [T],
         offset: usize,
     ) -> Result<usize, SystemError> {
-        let data = self.convert_with_offset(&self.buffer, offset)?;
+        let data = self.convert_with_offset(self.buffer, offset)?;
         dst.copy_from_slice(data);
         return Ok(dst.len());
     }
@@ -218,7 +218,7 @@ impl<'a> UserBufferReader<'a> {
         dst: &mut T,
         offset: usize,
     ) -> Result<(), SystemError> {
-        let data = self.convert_one_with_offset::<T>(&self.buffer, offset)?;
+        let data = self.convert_one_with_offset::<T>(self.buffer, offset)?;
         dst.clone_from(data);
         return Ok(());
     }
@@ -297,7 +297,7 @@ impl<'a> UserBufferWriter<'a> {
         offset: usize,
     ) -> Result<usize, SystemError> {
         let dst = Self::convert_with_offset(self.buffer, offset)?;
-        dst.copy_from_slice(&src);
+        dst.copy_from_slice(src);
         return Ok(src.len());
     }
 

@@ -251,10 +251,8 @@ impl IrqManager {
             }
 
             action_guard.set_handler(Some(&IrqNestedPrimaryHandler));
-        } else {
-            if desc.can_thread() {
-                self.setup_forced_threading(action_guard.deref_mut())?;
-            }
+        } else if desc.can_thread() {
+            self.setup_forced_threading(action_guard.deref_mut())?;
         }
 
         // 如果具有中断线程处理程序，并且中断不是嵌套的，则设置中断线程
@@ -510,15 +508,14 @@ impl IrqManager {
                 // 共享中断可能在它仍然被禁用时请求它，然后永远等待中断。
 
                 static mut WARNED: bool = false;
-                if action_guard.flags().contains(IrqHandleFlags::IRQF_SHARED) {
-                    if unsafe { !WARNED } {
-                        kwarn!(
-                            "Shared interrupt {} for {} requested but not auto enabled",
-                            irq.data(),
-                            action_guard.name()
-                        );
-                        unsafe { WARNED = true };
-                    }
+                if action_guard.flags().contains(IrqHandleFlags::IRQF_SHARED) && unsafe { !WARNED }
+                {
+                    kwarn!(
+                        "Shared interrupt {} for {} requested but not auto enabled",
+                        irq.data(),
+                        action_guard.name()
+                    );
+                    unsafe { WARNED = true };
                 }
 
                 desc_inner_guard.set_depth(1);

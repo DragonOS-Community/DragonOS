@@ -120,11 +120,10 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
 
             if !kwo.options.contains(WaitOption::WNOHANG) {
                 retval = Err(SystemError::ERESTARTSYS);
-                if ProcessManager::current_pcb()
+                if !ProcessManager::current_pcb()
                     .sig_info_irqsave()
                     .sig_pending()
                     .has_pending()
-                    == false
                 {
                     // todo: 增加子进程退出的回调后，这里可以直接等待在自身的child_wait等待队列上。
                     continue;

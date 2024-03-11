@@ -211,7 +211,7 @@ pub(super) fn irq_msi_compose_msg(cfg: &HardwareIrqConfig, msg: &mut MsiMsg, dma
             cfg.apic_id.data()
         );
     }
-    
+
     msg.address_hi = address_hi.into();
     msg.address_lo = address_lo.into();
     msg.data = arch_data.into();

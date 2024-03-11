@@ -156,7 +156,7 @@ impl Syscall {
                     return Ok(0);
                 }
                 PosixSocketOption::SO_RCVBUF => {
-                    let optval = optval as *mut u32;
+                    let optval = optval;
                     // 返回默认的接收缓冲区大小
                     unsafe {
                         *optval = socket.metadata()?.rx_buf_size as u32;
@@ -666,7 +666,7 @@ impl From<Endpoint> for SockAddr {
         match value {
             Endpoint::Ip(ip_endpoint) => {
                 // 未指定地址
-                if let None = ip_endpoint {
+                if ip_endpoint.is_none() {
                     return SockAddr {
                         addr_ph: SockAddrPlaceholder {
                             family: AddressFamily::Unspecified as u16,

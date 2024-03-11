@@ -1241,7 +1241,7 @@ impl VirtualConsoleData {
             return (idx, None);
         }
 
-        if self.par[idx] == 5 && idx + 1 <= self.npar as usize {
+        if self.par[idx] == 5 && idx < self.npar as usize {
             // 256色
             idx += 1;
             return (idx, Some(Color::from_256(self.par[idx])));
@@ -1549,10 +1549,8 @@ impl VirtualConsoleData {
         let mut width = 1;
         // 表示需不需要反转
         let mut invert = false;
-        if self.utf && !self.display_ctrl {
-            if FontDesc::is_double_width(c) {
-                width = 2;
-            }
+        if self.utf && !self.display_ctrl && FontDesc::is_double_width(c) {
+            width = 2;
         }
 
         let tmp = self.unicode_to_index(tc);
@@ -1681,20 +1679,18 @@ impl VirtualConsoleData {
 
             while count != 0 && x < self.cols {
                 // 检查属性是否变化，如果属性变了，则将前一个字符先输出
-                if attr != (self.screen_buf[start] & 0xff00) {
-                    if size > 0 {
-                        let _ = self.driver_funcs().con_putcs(
-                            self,
-                            &self.screen_buf[start..],
-                            size,
-                            y as u32,
-                            startx as u32,
-                        );
-                        startx = x;
-                        start += size;
-                        size = 0;
-                        attr = self.screen_buf[start] & 0xff00;
-                    }
+                if attr != (self.screen_buf[start] & 0xff00) && size > 0 {
+                    let _ = self.driver_funcs().con_putcs(
+                        self,
+                        &self.screen_buf[start..],
+                        size,
+                        y as u32,
+                        startx as u32,
+                    );
+                    startx = x;
+                    start += size;
+                    size = 0;
+                    attr = self.screen_buf[start] & 0xff00;
                 }
                 size += 1;
                 x += 1;

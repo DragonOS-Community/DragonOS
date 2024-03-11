@@ -864,7 +864,6 @@ impl TextuiWindow {
                 return self.true_textui_putchar_window(character, frcolor, bkcolor);
             }
         }
-        
 
         return Ok(());
     }

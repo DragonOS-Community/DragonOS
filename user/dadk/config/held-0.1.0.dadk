@@ -1,0 +1,23 @@
+{
+  "name": "Held",
+  "version": "0.1.0",
+  "description": "中断文本编辑器",
+  "task_type": {
+    "BuildFromSource": {
+      "Git": {
+        "url" : "https://git.mirrors.dragonos.org.cn/DragonOS-Community/Held.git",
+        "revision": "76304e995f"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install-dragonos"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  }
+}

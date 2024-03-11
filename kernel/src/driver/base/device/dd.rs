@@ -94,11 +94,9 @@ impl DeviceManager {
                 if unlikely(r.is_err()) {
                     flag = false;
                     break;
-                } else {
-                    if r.unwrap() == true {
-                        flag = true;
-                        break;
-                    }
+                } else if r.unwrap() == true {
+                    flag = true;
+                    break;
                 }
             }
 
@@ -158,10 +156,8 @@ impl DeviceManager {
                     );
                     return Err(e);
                 }
-            } else {
-                if r.unwrap() == false {
-                    return Ok(false);
-                }
+            } else if r.unwrap() == false {
+                return Ok(false);
             }
         }
 
@@ -211,14 +207,12 @@ impl DeviceManager {
             self.device_links_force_bind(dev);
             driver_manager().driver_bound(dev);
             return Err(e);
-        } else {
-            if let Some(bus) = dev.bus().map(|bus| bus.upgrade()).flatten() {
-                bus.subsystem().bus_notifier().call_chain(
-                    BusNotifyEvent::DriverNotBound,
-                    Some(dev),
-                    None,
-                );
-            }
+        } else if let Some(bus) = dev.bus().map(|bus| bus.upgrade()).flatten() {
+            bus.subsystem().bus_notifier().call_chain(
+                BusNotifyEvent::DriverNotBound,
+                Some(dev),
+                None,
+            );
         }
         return r;
     }

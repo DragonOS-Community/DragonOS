@@ -19,7 +19,7 @@ pub struct VecCursor {
 impl VecCursor {
     /// @brief 新建一个游标
     pub fn new(data: Vec<u8>) -> Self {
-        return Self { data: data, pos: 0 };
+        return Self { data, pos: 0 };
     }
 
     /// @brief 创建一个全0的cursor

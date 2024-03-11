@@ -1447,18 +1447,16 @@ impl NTtyData {
             '\t' => {
                 // 计算输出一个\t需要的空间
                 let spaces = 8 - (self.cursor_column & 7) as usize;
-                if termios.output_mode.contains(OutputMode::TABDLY) {
-                    if OutputMode::TABDLY.bits() == OutputMode::XTABS.bits() {
-                        // 配置的tab选项是真正输出空格到驱动
-                        if space < spaces {
-                            // 空间不够
-                            return Err(SystemError::ENOBUFS);
-                        }
-                        self.cursor_column += spaces as u32;
-                        // 写入sapces个空格
-                        tty.write(core, "        ".as_bytes(), spaces)?;
-                        return Ok(spaces);
+                if termios.output_mode.contains(OutputMode::TABDLY) && OutputMode::TABDLY.bits() == OutputMode::XTABS.bits() {
+                    // 配置的tab选项是真正输出空格到驱动
+                    if space < spaces {
+                    // 空间不够
+                        return Err(SystemError::ENOBUFS);
                     }
+                    self.cursor_column += spaces as u32;
+                    // 写入sapces个空格
+                    tty.write(core, "        ".as_bytes(), spaces)?;
+                    return Ok(spaces);
                 }
                 self.cursor_column += spaces as u32;
             }

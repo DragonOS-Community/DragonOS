@@ -155,7 +155,7 @@ impl E1000EBuffer {
         return self.length;
     }
     // 释放buffer内部的dma_pages，需要小心使用
-    pub fn free_buffer(self) -> () {
+    pub fn free_buffer(self) {
         if self.length != 0 {
             unsafe { dma_dealloc(self.paddr, self.buffer, E1000E_DMA_PAGES) };
         }
@@ -593,7 +593,7 @@ pub extern "C" fn rs_e1000e_init() {
     e1000e_init();
 }
 
-pub fn e1000e_init() -> () {
+pub fn e1000e_init() {
     match e1000e_probe() {
         Ok(_code) => {
             kinfo!("Successfully init e1000e device!");

@@ -287,9 +287,9 @@ impl DriverMatcher<&str> for DriverMatchName {
 }
 
 /// enum probe_type - device driver probe type to try
-///	Device drivers may opt in for special handling of their
-///	respective probe routines. This tells the core what to
-///	expect and prefer.
+/// Device drivers may opt in for special handling of their
+/// respective probe routines. This tells the core what to
+/// expect and prefer.
 ///
 /// Note that the end goal is to switch the kernel to use asynchronous
 /// probing by default, so annotating drivers with
@@ -300,18 +300,18 @@ impl DriverMatcher<&str> for DriverMatchName {
 #[derive(Debug)]
 pub enum DriverProbeType {
     /// Used by drivers that work equally well
-    ///	whether probed synchronously or asynchronously.
+    /// whether probed synchronously or asynchronously.
     DefaultStrategy,
 
     /// Drivers for "slow" devices which
-    ///	probing order is not essential for booting the system may
-    ///	opt into executing their probes asynchronously.
+    /// probing order is not essential for booting the system may
+    /// opt into executing their probes asynchronously.
     PreferAsync,
 
     /// Use this to annotate drivers that need
-    ///	their probe routines to run synchronously with driver and
-    ///	device registration (with the exception of -EPROBE_DEFER
-    ///	handling - re-probing always ends up being done asynchronously).
+    /// their probe routines to run synchronously with driver and
+    /// device registration (with the exception of -EPROBE_DEFER
+    /// handling - re-probing always ends up being done asynchronously).
     ForceSync,
 }
 

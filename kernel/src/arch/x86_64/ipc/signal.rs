@@ -415,7 +415,8 @@ pub struct X86_64SignalArch;
 impl SignalArch for X86_64SignalArch {
     unsafe fn do_signal(frame: &mut TrapFrame) {
         let pcb = ProcessManager::current_pcb();
-        let siginfo = pcb.try_siginfo(5);
+
+        let siginfo = pcb.try_siginfo_irqsave(5);
 
         if unlikely(siginfo.is_none()) {
             return;
@@ -437,7 +438,7 @@ impl SignalArch for X86_64SignalArch {
         let sig_block: SigSet = siginfo_read_guard.sig_block().clone();
         drop(siginfo_read_guard);
 
-        let sig_guard = pcb.try_sig_struct_irq(5);
+        let sig_guard = pcb.try_sig_struct_irqsave(5);
         if unlikely(sig_guard.is_none()) {
             return;
         }

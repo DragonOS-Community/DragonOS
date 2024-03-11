@@ -363,12 +363,12 @@ impl ProcessManager {
 
         // 设置clear_child_tid，在线程结束时将其置0以通知父进程
         if clone_flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
-            pcb.thread.write().clear_child_tid = Some(clone_args.child_tid);
+            pcb.thread.write_irqsave().clear_child_tid = Some(clone_args.child_tid);
         }
 
         // 设置child_tid，意味着子线程能够知道自己的id
         if clone_flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
-            pcb.thread.write().set_child_tid = Some(clone_args.child_tid);
+            pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
         }
 
         // 将子进程/线程的id存储在用户态传进的地址中
@@ -424,13 +424,14 @@ impl ProcessManager {
 
         // 设置线程组id、组长
         if clone_flags.contains(CloneFlags::CLONE_THREAD) {
-            pcb.thread.write().group_leader = current_pcb.thread.read().group_leader.clone();
+            pcb.thread.write_irqsave().group_leader =
+                current_pcb.thread.read_irqsave().group_leader.clone();
             unsafe {
                 let ptr = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
                 (*ptr).tgid = current_pcb.tgid;
             }
         } else {
-            pcb.thread.write().group_leader = Arc::downgrade(&pcb);
+            pcb.thread.write_irqsave().group_leader = Arc::downgrade(&pcb);
             unsafe {
                 let ptr = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
                 (*ptr).tgid = pcb.tgid;
@@ -439,12 +440,13 @@ impl ProcessManager {
 
         // CLONE_PARENT re-uses the old parent
         if clone_flags.contains(CloneFlags::CLONE_PARENT | CloneFlags::CLONE_THREAD) {
-            *pcb.real_parent_pcb.write() = current_pcb.real_parent_pcb.read().clone();
+            *pcb.real_parent_pcb.write_irqsave() =
+                current_pcb.real_parent_pcb.read_irqsave().clone();
 
             if clone_flags.contains(CloneFlags::CLONE_THREAD) {
                 pcb.exit_signal.store(Signal::INVALID, Ordering::SeqCst);
             } else {
-                let leader = current_pcb.thread.read().group_leader();
+                let leader = current_pcb.thread.read_irqsave().group_leader();
                 if unlikely(leader.is_none()) {
                     panic!(
                         "fork: Failed to get leader of current process, current pid: [{:?}]",
@@ -459,7 +461,7 @@ impl ProcessManager {
             }
         } else {
             // 新创建的进程，设置其父进程为当前进程
-            *pcb.real_parent_pcb.write() = Arc::downgrade(&current_pcb);
+            *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(&current_pcb);
             pcb.exit_signal
                 .store(clone_args.exit_signal, Ordering::SeqCst);
         }

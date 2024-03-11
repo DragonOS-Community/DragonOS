@@ -52,6 +52,8 @@ pub struct EventPoll {
 
 impl EventPoll {
     pub const EP_MAX_EVENTS: u32 = INT32_MAX / (core::mem::size_of::<EPollEvent>() as u32);
+    /// 用于获取inode中的epitem队列
+    pub const ADD_EPOLLITEM: u32 = 0x7965;
     pub fn new() -> Self {
         Self {
             epoll_wq: WaitQueue::INIT,
@@ -462,7 +464,7 @@ impl EventPoll {
                 }
 
                 // 如果有未处理的信号则返回错误
-                if current_pcb.sig_info().sig_pending().signal().bits() != 0 {
+                if current_pcb.sig_info_irqsave().sig_pending().signal().bits() != 0 {
                     return Err(SystemError::EINTR);
                 }
 

@@ -1309,12 +1309,10 @@ impl<K: Ord, V> RBTree<K, V> {
             let mut replace = node.right().min_node();
             if node == self.root {
                 self.root = replace;
+            } else if node.parent().left() == node {
+                node.parent().set_left(replace);
             } else {
-                if node.parent().left() == node {
-                    node.parent().set_left(replace);
-                } else {
-                    node.parent().set_right(replace);
-                }
+                node.parent().set_right(replace);
             }
 
             // child是"取代节点"的右孩子，也是需要"调整的节点"。
@@ -1360,12 +1358,10 @@ impl<K: Ord, V> RBTree<K, V> {
 
         if self.root == node {
             self.root = child
+        } else if parent.left() == node {
+            parent.set_left(child);
         } else {
-            if parent.left() == node {
-                parent.set_left(child);
-            } else {
-                parent.set_right(child);
-            }
+            parent.set_right(child);
         }
 
         if color == Color::Black {

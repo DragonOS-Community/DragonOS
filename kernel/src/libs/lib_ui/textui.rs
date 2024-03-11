@@ -853,19 +853,18 @@ impl TextuiWindow {
                     self.textui_refresh_vlines(self.top_vline, actual_line_sum)?;
                 }
             }
-        } else {
-            if is_enable_window == true {
-                if let TextuiVline::Chromatic(vline) =
-                    &self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
-                {
-                    if !vline.index.check(self.chars_per_line) {
-                        self.textui_new_line()?;
-                    }
-
-                    return self.true_textui_putchar_window(character, frcolor, bkcolor);
+        } else if is_enable_window == true {
+            if let TextuiVline::Chromatic(vline) =
+                &self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
+            {
+                if !vline.index.check(self.chars_per_line) {
+                    self.textui_new_line()?;
                 }
+
+                return self.true_textui_putchar_window(character, frcolor, bkcolor);
             }
         }
+        
 
         return Ok(());
     }

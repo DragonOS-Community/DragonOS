@@ -275,7 +275,7 @@ bitflags! {
         const SIGSYS   =  1<<30;
         const SIGRTMIN =  1<<31;
         // TODO 写上实时信号
-        const SIGRTMAX =  1<<MAX_SIG_NUM-1;
+        const SIGRTMAX =  1 << (MAX_SIG_NUM-1);
     }
 }
 

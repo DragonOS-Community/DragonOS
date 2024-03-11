@@ -317,12 +317,10 @@ impl Futex {
         };
 
         // 如果是超时唤醒，则返回错误
-        if timer.is_some() {
-            if timer.clone().unwrap().timeout() {
-                bucket_mut.remove(futex_q);
+        if timer.is_some() && timer.clone().unwrap().timeout() {
+            bucket_mut.remove(futex_q);
 
-                return Err(SystemError::ETIMEDOUT);
-            }
+            return Err(SystemError::ETIMEDOUT);
         }
 
         // TODO: 如果没有挂起的信号，则重新判断是否满足wait要求，重新进入wait
@@ -555,16 +553,14 @@ impl Futex {
         let mut oparg = sign_extend32((encoded_op & 0x00fff000) >> 12, 11);
         let cmparg = sign_extend32(encoded_op & 0x00000fff, 11);
 
-        if encoded_op & (FutexOP::FUTEX_OP_OPARG_SHIFT.bits() << 28) != 0 {
-            if oparg > 31 {
-                kwarn!(
-                    "futex_wake_op: pid:{} tries to shift op by {}; fix this program",
-                    ProcessManager::current_pcb().pid().data(),
-                    oparg
-                );
+        if (encoded_op & (FutexOP::FUTEX_OP_OPARG_SHIFT.bits() << 28) != 0) && oparg > 31 {
+            kwarn!(
+                "futex_wake_op: pid:{} tries to shift op by {}; fix this program",
+                ProcessManager::current_pcb().pid().data(),
+                oparg
+            );
 
-                oparg &= 31;
-            }
+            oparg &= 31;
         }
 
         // TODO: 这个汇编似乎是有问题的，目前不好测试

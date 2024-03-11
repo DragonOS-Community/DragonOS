@@ -39,7 +39,7 @@ impl LockedAhciInode {
             // uuid: Uuid::new_v5(),
             self_ref: Weak::default(),
             fs: Weak::default(),
-            disk: disk,
+            disk,
             metadata: Metadata {
                 dev_id: 1,
                 inode_id: generate_inode_id(),

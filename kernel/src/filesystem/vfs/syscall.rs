@@ -603,17 +603,19 @@ impl Syscall {
         if filename_from.len() > MAX_PATHLEN as usize || filename_to.len() > MAX_PATHLEN as usize {
             return Err(SystemError::ENAMETOOLONG);
         }
+
+
         //获取pcb，文件节点
         let pcb = ProcessManager::current_pcb();
-        let (old_inode_begin,_old_remain_path) = user_path_at(&pcb,oldfd,filename_from)?;     
-        let (new_inode_begin,_new_remain_path) = user_path_at(&pcb,newfd,filename_to)?;
+        let (_old_inode_begin,old_remain_path) = user_path_at(&pcb,oldfd,filename_from)?;     
+        let (_new_inode_begin,new_remain_path) = user_path_at(&pcb,newfd,filename_to)?;
         //获取父目录
-        let (old_filename,old_parent_path) = rsplit_path(filename_from);
-        let old_parent_inode = old_inode_begin
-            .lookup_follow_symlink(old_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-        let (new_filename,new_parent_path) = rsplit_path(filename_to);
-        let new_parent_inode = new_inode_begin
-            .lookup_follow_symlink(new_parent_path.unwrap_or("/"),VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        let (old_filename,old_parent_path) = rsplit_path(&old_remain_path);
+        let old_parent_inode = ROOT_INODE()
+            .lookup(old_parent_path.unwrap_or("/"))?;
+        let (new_filename,new_parent_path) = rsplit_path(&new_remain_path);
+        let new_parent_inode = ROOT_INODE()
+            .lookup(new_parent_path.unwrap_or("/"))?;
         old_parent_inode.move_(old_filename,&new_parent_inode,new_filename)?;
         return Ok(0);
     }

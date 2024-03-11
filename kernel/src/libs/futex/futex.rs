@@ -553,7 +553,7 @@ impl Futex {
         let mut oparg = sign_extend32((encoded_op & 0x00fff000) >> 12, 11);
         let cmparg = sign_extend32(encoded_op & 0x00000fff, 11);
 
-        if encoded_op & (FutexOP::FUTEX_OP_OPARG_SHIFT.bits() << 28) != 0 && oparg > 31 {
+        if (encoded_op & (FutexOP::FUTEX_OP_OPARG_SHIFT.bits() << 28) != 0) && oparg > 31 {
             kwarn!(
                 "futex_wake_op: pid:{} tries to shift op by {}; fix this program",
                 ProcessManager::current_pcb().pid().data(),

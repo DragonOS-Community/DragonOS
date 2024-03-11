@@ -57,7 +57,7 @@ impl Socket for StreamSocket {
         }
 
         let peer_inode = self.peer_inode.clone().unwrap();
-        let len = peer_inode.write_buffer(buf)?;
+        let len = peer_inode.inner().write_buffer(buf)?;
         Ok(len)
     }
 
@@ -155,7 +155,7 @@ impl Socket for SeqpacketSocket {
         }
 
         let peer_inode = self.peer_inode.clone().unwrap();
-        let len = peer_inode.write_buffer(buf)?;
+        let len = peer_inode.inner().write_buffer(buf)?;
         Ok(len)
     }
 

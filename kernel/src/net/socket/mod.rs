@@ -296,16 +296,6 @@ impl SocketInode {
     pub unsafe fn inner_no_preempt(&self) -> SpinLockGuard<Box<dyn Socket>> {
         self.0.lock_no_preempt()
     }
-
-    pub fn write_buffer(&self, buf: &[u8]) -> Result<usize, SystemError> {
-        let socket = self.inner();
-        if socket.metadata().socket_type != SocketType::Unix {
-            return Err(SystemError::EINVAL);
-        }
-
-        let len = socket.write_buffer(buf)?;
-        Ok(len)
-    }
 }
 
 impl IndexNode for SocketInode {

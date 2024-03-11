@@ -408,9 +408,7 @@ pub trait FrameBufferOps {
     }
 
     /// 将数据从一处复制到另一处。
-    fn fb_copyarea(&self, _data: CopyAreaData) -> Result<(), SystemError> {
-        Err(SystemError::ENOSYS)
-    }
+    fn fb_copyarea(&self, _data: CopyAreaData);
 
     /// 将帧缓冲区的内容映射到用户空间。
     fn fb_mmap(&self, _vma: &Arc<LockedVMA>) -> Result<(), SystemError> {

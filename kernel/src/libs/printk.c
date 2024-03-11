@@ -599,7 +599,7 @@ int printk_color(unsigned int FRcolor, unsigned int BKcolor, const char *fmt, ..
     io_mfence();
     va_list args;
     va_start(args, fmt);
-    char buf[4096]; // vsprintf()的缓冲区
+    static char buf[4096]; // vsprintf()的缓冲区
     int len = vsprintf(buf, fmt, args);
 
     va_end(args);

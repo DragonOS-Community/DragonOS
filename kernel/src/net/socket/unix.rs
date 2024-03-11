@@ -43,10 +43,12 @@ impl StreamSocket {
 
 impl Socket for StreamSocket {
     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
-        let buffer = self.buffer.lock_irqsave();
+        let mut buffer = self.buffer.lock_irqsave();
 
         let len = core::cmp::min(buf.len(), buffer.len());
         buf[..len].copy_from_slice(&buffer[..len]);
+
+        let _ = buffer.split_off(len);
 
         (Ok(len), Endpoint::Inode(self.peer_inode.clone()))
     }
@@ -81,7 +83,7 @@ impl Socket for StreamSocket {
         if buffer.capacity() - buffer.len() < len {
             return Err(SystemError::ENOBUFS);
         }
-        buffer[..len].copy_from_slice(buf);
+        buffer.extend_from_slice(buf);
 
         Ok(len)
     }
@@ -141,10 +143,12 @@ impl SeqpacketSocket {
 
 impl Socket for SeqpacketSocket {
     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
-        let buffer = self.buffer.lock_irqsave();
+        let mut buffer = self.buffer.lock_irqsave();
 
         let len = core::cmp::min(buf.len(), buffer.len());
         buf[..len].copy_from_slice(&buffer[..len]);
+
+        let _ = buffer.split_off(len);
 
         (Ok(len), Endpoint::Inode(self.peer_inode.clone()))
     }
@@ -179,7 +183,7 @@ impl Socket for SeqpacketSocket {
         if buffer.capacity() - buffer.len() < len {
             return Err(SystemError::ENOBUFS);
         }
-        buffer[..len].copy_from_slice(buf);
+        buffer.extend_from_slice(buf);
 
         Ok(len)
     }

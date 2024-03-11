@@ -38,7 +38,6 @@
    :caption: 应用层
    
    userland/appdev/index
-   userland/libc/index
 
 .. toctree::
    :maxdepth: 1

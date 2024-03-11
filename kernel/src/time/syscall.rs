@@ -1,7 +1,4 @@
-use core::{
-    ffi::{c_int, c_longlong},
-    ptr::null_mut,
-};
+use core::ffi::{c_int, c_longlong};
 
 use num_traits::FromPrimitive;
 use system_error::SystemError;
@@ -76,7 +73,7 @@ impl Syscall {
         sleep_time: *const TimeSpec,
         rm_time: *mut TimeSpec,
     ) -> Result<usize, SystemError> {
-        if sleep_time == null_mut() {
+        if sleep_time.is_null() {
             return Err(SystemError::EFAULT);
         }
         let slt_spec = TimeSpec {
@@ -85,7 +82,7 @@ impl Syscall {
         };
 
         let r: Result<usize, SystemError> = nanosleep(slt_spec).map(|slt_spec| {
-            if rm_time != null_mut() {
+            if !rm_time.is_null() {
                 unsafe { *rm_time }.tv_sec = slt_spec.tv_sec;
                 unsafe { *rm_time }.tv_nsec = slt_spec.tv_nsec;
             }

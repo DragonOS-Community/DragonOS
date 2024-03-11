@@ -180,10 +180,10 @@ if [ ! -n "$(find $PREFIX/bin/* -name $TARGET_GCC)" ] || [ ${KEEP_GCC} -ne 1 ]; 
     mkdir build-gcc
     cd build-gcc
     ../${GCC_FILE}/configure --target=$TARGET --prefix="$PREFIX" --disable-nls --enable-languages=c,c++ --without-headers
-    make all-gcc -j $(nproc) || exit 1
-    make all-target-libgcc -j $(nproc)  || exit 1
-    make install-gcc -j $(nproc)  || exit 1
-    make install-target-libgcc -j $(nproc)  || exit 1
+    make MAKEINFO=true all-gcc -j $(nproc) || exit 1
+    make MAKEINFO=true all-target-libgcc -j $(nproc)  || exit 1
+    make MAKEINFO=true install-gcc -j $(nproc)  || exit 1
+    make MAKEINFO=true install-target-libgcc -j $(nproc)  || exit 1
     cd ..
 fi
 
@@ -196,7 +196,7 @@ else
 	echo 'export PATH="$DragonOS_GCC:$PATH"'	>> "$HOME/.$(basename $SHELL)rc"
 	echo "[info] Add DragonOS_GCC into PATH successfully."
 fi
-source "$HOME/.$(basename $SHELL)rc"
+source "$HOME/.$CURRENT_SHELL"rc
 
 # final check
 if [ -n "$(find $PREFIX/bin/* -name $TARGET_GCC)" ] &&

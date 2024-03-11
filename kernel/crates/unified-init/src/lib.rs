@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::needless_return)]
 
 use system_error::SystemError;
 pub use unified_init_macros as macros;

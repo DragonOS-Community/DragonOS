@@ -145,7 +145,7 @@ impl Timer {
         TIMER_LIST
             .lock_irqsave()
             .extract_if(|x| Arc::ptr_eq(&this_arc, x))
-            .for_each(|p| drop(p));
+            .for_each(drop);
         true
     }
 }
@@ -179,11 +179,7 @@ impl DoTimerSoftirq {
         let x = self
             .running
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed);
-        if x.is_ok() {
-            return true;
-        } else {
-            return false;
-        }
+        return x.is_ok();
     }
 
     fn clear_run(&self) {
@@ -192,7 +188,7 @@ impl DoTimerSoftirq {
 }
 impl SoftirqVec for DoTimerSoftirq {
     fn run(&self) {
-        if self.set_run() == false {
+        if !self.set_run() {
             return;
         }
         // 最多只处理TIMER_RUN_CYCLE_THRESHOLD个计时器

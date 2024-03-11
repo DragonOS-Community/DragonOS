@@ -57,7 +57,7 @@ impl CFSQueue {
         CFSQueue {
             cpu_exec_proc_jiffies: 0,
             locked_queue: SpinLock::new(RBTree::new()),
-            idle_pcb: idle_pcb,
+            idle_pcb,
         }
     }
 

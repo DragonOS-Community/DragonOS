@@ -1,5 +1,6 @@
 #![no_std]
 #![feature(core_intrinsics)]
+#![allow(clippy::needless_return)]
 
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

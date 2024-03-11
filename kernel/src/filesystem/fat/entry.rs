@@ -388,7 +388,7 @@ impl FATDir {
             current_cluster: self.first_cluster,
             offset: self.root_offset.unwrap_or(0),
             is_root: self.is_root(),
-            fs: fs,
+            fs,
         };
     }
 
@@ -1885,8 +1885,8 @@ impl ShortNameGenerator {
 
         return ShortNameGenerator {
             name: short_name,
-            flags: flags,
-            basename_len: basename_len,
+            flags,
+            basename_len,
             checksum: Self::fletcher_16_checksum(name),
             ..Default::default()
         };
@@ -2212,8 +2212,8 @@ impl LongNameEntryGenerator {
         // 先从最后一个长目录项开始生成
         let start_index = (name.len() / 13) as u8;
         return LongNameEntryGenerator {
-            name: name,
-            checksum: checksum,
+            name,
+            checksum,
             idx: start_index,
             last_index: start_index,
         };

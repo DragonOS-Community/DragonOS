@@ -426,8 +426,6 @@ impl ProcessManager {
         let cpu_id = pcb.sched_info().on_cpu();
 
         if let Some(cpu_id) = cpu_id {
-            let cpu_id = cpu_id;
-
             if pcb.pid() == CPU_EXECUTING.get(cpu_id) {
                 kick_cpu(cpu_id).expect("ProcessManager::kick(): Failed to kick cpu");
             }
@@ -1192,7 +1190,7 @@ impl KernelStack {
     ///
     /// 仅仅用于BSP启动时，为idle进程构造内核栈。其他时候使用这个函数，很可能造成错误！
     pub unsafe fn from_existed(base: VirtAddr) -> Result<Self, SystemError> {
-        if base.is_null() || base.check_aligned(Self::ALIGN) == false {
+        if base.is_null() || !base.check_aligned(Self::ALIGN) {
             return Err(SystemError::EFAULT);
         }
 
@@ -1273,7 +1271,7 @@ impl KernelStack {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        if !self.stack.is_none() {
+        if self.stack.is_some() {
             let ptr = self.stack.as_ref().unwrap().as_ptr() as *const *const ProcessControlBlock;
             if unsafe { !(*ptr).is_null() } {
                 let pcb_ptr: Weak<ProcessControlBlock> = unsafe { Weak::from_raw(*ptr) };

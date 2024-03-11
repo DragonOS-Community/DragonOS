@@ -507,7 +507,7 @@ impl PortManager {
                 SocketType::TcpSocket => self.tcp_port_table.lock(),
                 _ => panic!("{:?} cann't get a port", socket_type),
             };
-            if let None = listen_table_guard.get(&port) {
+            if listen_table_guard.get(&port).is_none() {
                 drop(listen_table_guard);
                 return Ok(port);
             }

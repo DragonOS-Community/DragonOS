@@ -235,9 +235,9 @@ impl Syscall {
                     }
                     let dest_path: &CStr = unsafe { CStr::from_ptr(path_ptr) };
                     let dest_path: &str = dest_path.to_str().map_err(|_| SystemError::EINVAL)?;
-                    if dest_path.len() == 0 {
+                    if dest_path.is_empty() {
                         return Err(SystemError::EINVAL);
-                    } else if dest_path.len() > MAX_PATHLEN as usize {
+                    } else if dest_path.len() > MAX_PATHLEN {
                         return Err(SystemError::ENAMETOOLONG);
                     }
 
@@ -256,7 +256,7 @@ impl Syscall {
                 let len = args[2];
                 let virt_addr: VirtAddr = VirtAddr::new(buf_vaddr);
                 // 判断缓冲区是否来自用户态，进行权限校验
-                let res = if frame.from_user() && verify_area(virt_addr, len as usize).is_err() {
+                let res = if frame.from_user() && verify_area(virt_addr, len).is_err() {
                     // 来自用户态，而buffer在内核态，这样的操作不被允许
                     Err(SystemError::EPERM)
                 } else if buf_vaddr == 0 {
@@ -280,7 +280,7 @@ impl Syscall {
                 let virt_env_ptr = VirtAddr::new(env_ptr);
                 // 权限校验
                 if frame.from_user()
-                    && (verify_area(virt_path_ptr, MAX_PATHLEN as usize).is_err()
+                    && (verify_area(virt_path_ptr, MAX_PATHLEN).is_err()
                         || verify_area(virt_argv_ptr, PAGE_4K_SIZE as usize).is_err())
                     || verify_area(virt_env_ptr, PAGE_4K_SIZE as usize).is_err()
                 {
@@ -324,7 +324,7 @@ impl Syscall {
                     let path: &CStr = unsafe { CStr::from_ptr(path_ptr) };
                     let path: &str = path.to_str().map_err(|_| SystemError::EINVAL)?.trim();
 
-                    if path == "" {
+                    if path.is_empty() {
                         return Err(SystemError::EINVAL);
                     }
                     return Ok(path);
@@ -344,9 +344,8 @@ impl Syscall {
                 let virt_req = VirtAddr::new(req as usize);
                 let virt_rem = VirtAddr::new(rem as usize);
                 if frame.from_user()
-                    && (verify_area(virt_req, core::mem::size_of::<TimeSpec>() as usize).is_err()
-                        || verify_area(virt_rem, core::mem::size_of::<TimeSpec>() as usize)
-                            .is_err())
+                    && (verify_area(virt_req, core::mem::size_of::<TimeSpec>()).is_err()
+                        || verify_area(virt_rem, core::mem::size_of::<TimeSpec>()).is_err())
                 {
                     Err(SystemError::EFAULT)
                 } else {
@@ -448,10 +447,10 @@ impl Syscall {
             SYS_SOCKET => Self::socket(args[0], args[1], args[2]),
             SYS_SETSOCKOPT => {
                 let optval = args[3] as *const u8;
-                let optlen = args[4] as usize;
+                let optlen = args[4];
                 let virt_optval = VirtAddr::new(optval as usize);
                 // 验证optval的地址是否合法
-                if verify_area(virt_optval, optlen as usize).is_err() {
+                if verify_area(virt_optval, optlen).is_err() {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
                 } else {
@@ -472,7 +471,7 @@ impl Syscall {
                     }
 
                     // 验证optlen的地址是否合法
-                    if verify_area(virt_optlen, core::mem::size_of::<u32>() as usize).is_err() {
+                    if verify_area(virt_optlen, core::mem::size_of::<u32>()).is_err() {
                         // 地址空间超出了用户空间的范围，不合法
                         return Err(SystemError::EFAULT);
                     }
@@ -488,10 +487,10 @@ impl Syscall {
 
             SYS_CONNECT => {
                 let addr = args[1] as *const SockAddr;
-                let addrlen = args[2] as usize;
+                let addrlen = args[2];
                 let virt_addr = VirtAddr::new(addr as usize);
                 // 验证addr的地址是否合法
-                if verify_area(virt_addr, addrlen as usize).is_err() {
+                if verify_area(virt_addr, addrlen).is_err() {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
                 } else {
@@ -500,10 +499,10 @@ impl Syscall {
             }
             SYS_BIND => {
                 let addr = args[1] as *const SockAddr;
-                let addrlen = args[2] as usize;
+                let addrlen = args[2];
                 let virt_addr = VirtAddr::new(addr as usize);
                 // 验证addr的地址是否合法
-                if verify_area(virt_addr, addrlen as usize).is_err() {
+                if verify_area(virt_addr, addrlen).is_err() {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
                 } else {
@@ -513,17 +512,17 @@ impl Syscall {
 
             SYS_SENDTO => {
                 let buf = args[1] as *const u8;
-                let len = args[2] as usize;
+                let len = args[2];
                 let flags = args[3] as u32;
                 let addr = args[4] as *const SockAddr;
-                let addrlen = args[5] as usize;
+                let addrlen = args[5];
                 let virt_buf = VirtAddr::new(buf as usize);
                 let virt_addr = VirtAddr::new(addr as usize);
                 // 验证buf的地址是否合法
-                if verify_area(virt_buf, len as usize).is_err() {
+                if verify_area(virt_buf, len).is_err() {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
-                } else if verify_area(virt_addr, addrlen as usize).is_err() {
+                } else if verify_area(virt_addr, addrlen).is_err() {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
                 } else {
@@ -534,7 +533,7 @@ impl Syscall {
 
             SYS_RECVFROM => {
                 let buf = args[1] as *mut u8;
-                let len = args[2] as usize;
+                let len = args[2];
                 let flags = args[3] as u32;
                 let addr = args[4] as *mut SockAddr;
                 let addrlen = args[5] as *mut usize;

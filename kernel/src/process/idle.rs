@@ -47,7 +47,7 @@ impl ProcessManager {
                 })
             };
 
-            let idle_pcb = ProcessControlBlock::new_idle(i as u32, kstack);
+            let idle_pcb = ProcessControlBlock::new_idle(i, kstack);
 
             assert!(idle_pcb.basic().user_vm().is_none());
             unsafe {

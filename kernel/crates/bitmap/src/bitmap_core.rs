@@ -238,7 +238,7 @@ impl<T: BitOps> BitMapCore<T> {
                     return true;
                 }
             } else if element != &T::make_mask(T::bit_size()) {
-                    return false;
+                return false;
             }
         }
 

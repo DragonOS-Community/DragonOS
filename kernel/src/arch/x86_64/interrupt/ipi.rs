@@ -85,7 +85,6 @@ impl Into<ApicId> for ArchIpiTarget {
         } else {
             return x86::apic::ApicId::XApic(0);
         }
-        
     }
 }
 

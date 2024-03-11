@@ -255,7 +255,7 @@ impl ConsoleSwitch for BlittingFbConsole {
         }
 
         let y_break = (fb_data.display.virt_rows - fb_data.display.yscroll) as usize;
-        if sy < y_break && sy + height - 1 >= y_break {
+        if sy < y_break && sy + height > y_break {
             // 分两次clear
             let b = y_break - sy;
             let _ = self.clear(

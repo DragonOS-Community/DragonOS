@@ -462,21 +462,21 @@ impl IrqManager {
             }
         }
         let handler = handler.unwrap();
-        if core::ptr::eq(handler, bad_irq_handler()) {
-            if Arc::ptr_eq(
+        if core::ptr::eq(handler, bad_irq_handler())
+            && Arc::ptr_eq(
                 &desc_inner.irq_data().chip_info_read_irqsave().chip(),
                 &no_irq_chip(),
-            ) {
-                let irq_data = desc_inner.irq_data();
-                mask_ack_irq(irq_data);
+            )
+        {
+            let irq_data = desc_inner.irq_data();
+            mask_ack_irq(irq_data);
 
-                irq_data.irqd_set(IrqStatus::IRQD_IRQ_DISABLED);
+            irq_data.irqd_set(IrqStatus::IRQD_IRQ_DISABLED);
 
-                if is_chained {
-                    desc_inner.clear_actions();
-                }
-                desc_inner.set_depth(1);
+            if is_chained {
+                desc_inner.clear_actions();
             }
+            desc_inner.set_depth(1);
         }
         let chip = desc_inner.irq_data().chip_info_read_irqsave().chip();
         desc.set_handler_no_lock_inner(handler, desc_inner.irq_data(), &chip);

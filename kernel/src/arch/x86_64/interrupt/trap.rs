@@ -229,7 +229,7 @@ unsafe extern "C" fn do_invalid_TSS(regs: &'static TrapFrame, error_code: u64) {
     } else {
         msg2 = ERR_MSG_4;
     }
-    
+
     kerror!(
         "do_invalid_TSS(10), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}\n{}{}",
         error_code,

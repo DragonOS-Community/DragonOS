@@ -102,8 +102,7 @@ pub fn no_init_textui_putchar_window(
         // 输出其他字符
         let char = TextuiCharChromatic::new(Some(character), frcolor, bkcolor);
 
-        if NO_ALLOC_OPERATIONS_INDEX.load(Ordering::SeqCst)
-            == CHAR_PER_LINE.load(Ordering::SeqCst)
+        if NO_ALLOC_OPERATIONS_INDEX.load(Ordering::SeqCst) == CHAR_PER_LINE.load(Ordering::SeqCst)
         {
             NO_ALLOC_OPERATIONS_INDEX.store(0, Ordering::SeqCst);
             NO_ALLOC_OPERATIONS_LINE.fetch_add(1, Ordering::SeqCst);

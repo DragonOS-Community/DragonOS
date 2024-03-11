@@ -434,9 +434,7 @@ impl InnerAddressSpace {
             UserBufferWriter::new(new_page_vaddr.data() as *mut u8, new_len, true)?;
         let new_buf: &mut [u8] = new_buffer_writer.buffer(0)?;
         let len = old_buf.len().min(new_buf.len());
-        for i in 0..len {
-            new_buf[i] = old_buf[i];
-        }
+        new_buf[..len].copy_from_slice(&old_buf[..len]);
 
         return Ok(new_page_vaddr);
     }
@@ -517,7 +515,7 @@ impl InnerAddressSpace {
 
         for r in regions {
             // kdebug!("mprotect: r: {:?}", r);
-            let r = r.lock().region().clone();
+            let r = r.lock().region();
             let r = self.mappings.remove_vma(&r).unwrap();
 
             let intersection = r.lock().region().intersect(&region).unwrap();
@@ -625,7 +623,7 @@ impl InnerAddressSpace {
         let new_brk = if incr > 0 {
             self.brk + incr as usize
         } else {
-            self.brk - (incr.abs() as usize)
+            self.brk - (incr.abs())
         };
 
         let new_brk = VirtAddr::new(page_align_up(new_brk.data()));

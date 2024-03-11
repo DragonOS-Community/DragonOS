@@ -743,8 +743,9 @@ impl BinaryLoader for ElfLoader {
             }
 
             let p_vaddr = VirtAddr::new(seg_to_load.p_vaddr as usize);
-            if (seg_to_load.p_flags & elf::abi::PF_X) != 0 && 
-                (start_code.is_none() || start_code.as_ref().unwrap() > &p_vaddr) {
+            if (seg_to_load.p_flags & elf::abi::PF_X) != 0
+                && (start_code.is_none() || start_code.as_ref().unwrap() > &p_vaddr)
+            {
                 start_code = Some(p_vaddr);
             }
 

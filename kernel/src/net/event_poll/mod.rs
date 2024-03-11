@@ -372,7 +372,7 @@ impl EventPoll {
                         epds.events |=
                             EPollEventType::EPOLLERR.bits() | EPollEventType::EPOLLHUP.bits();
 
-                        Self::ep_modify(&mut epoll_guard, ep_item, &epds)?;
+                        Self::ep_modify(&mut epoll_guard, ep_item, epds)?;
                     }
                 }
             }

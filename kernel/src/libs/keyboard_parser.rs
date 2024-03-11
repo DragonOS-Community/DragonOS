@@ -129,7 +129,7 @@ impl TypeOneFSMState {
             return TypeOneFSMState::Start;
         } else {
             return TypeOneFSMState::PauseBreak(i + 1);
-        } 
+        }
     }
 
     fn handle_func0(&self, scancode: u8, scancode_status: &mut ScanCodeStatus) -> TypeOneFSMState {

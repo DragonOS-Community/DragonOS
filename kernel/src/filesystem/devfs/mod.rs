@@ -243,7 +243,7 @@ impl DevFSInode {
         data_: usize,
     ) -> Self {
         return DevFSInode {
-            parent: parent,
+            parent,
             self_ref: Weak::default(),
             children: BTreeMap::new(),
             metadata: Metadata {

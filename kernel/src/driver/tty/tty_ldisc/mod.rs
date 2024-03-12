@@ -48,7 +48,7 @@ pub trait TtyLineDiscipline: Sync + Send + Debug {
     /// - old: 之前的termios，如果为None则表示第一次设置
     fn set_termios(&self, tty: Arc<TtyCore>, old: Option<Termios>) -> Result<(), SystemError>;
 
-    fn poll(&self, tty: Arc<TtyCore>) -> Result<(), SystemError>;
+    fn poll(&self, tty: Arc<TtyCore>) -> Result<usize, SystemError>;
     fn hangup(&self, tty: Arc<TtyCore>) -> Result<(), SystemError>;
 
     /// ## 接收数据

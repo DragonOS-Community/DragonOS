@@ -248,11 +248,11 @@ impl dyn Clocksource {
     /// # 计算时钟源能记录的最大时间跨度
     pub fn clocksource_max_deferment(&self) -> u64 {
         let cs_data_guard = self.clocksource_data();
-        let max_nsecs: u64;
+
         let mut max_cycles: u64;
         max_cycles = (1 << (63 - (log2(cs_data_guard.mult) + 1))) as u64;
         max_cycles = max_cycles.min(cs_data_guard.mask.bits);
-        max_nsecs = clocksource_cyc2ns(
+        let max_nsecs = clocksource_cyc2ns(
             CycleNum(max_cycles),
             cs_data_guard.mult,
             cs_data_guard.shift,

@@ -369,6 +369,11 @@ impl IndexNode for MountFSInode {
     fn special_node(&self) -> Option<super::SpecialNodeData> {
         self.inner_inode.special_node()
     }
+
+    #[inline]
+    fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
+        self.inner_inode.poll(private_data)
+    }
 }
 
 impl FileSystem for MountFS {
@@ -388,5 +393,9 @@ impl FileSystem for MountFS {
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+
+    fn name(&self)->&str {
+        "mountfs"
     }
 }

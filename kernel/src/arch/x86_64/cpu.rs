@@ -1,6 +1,6 @@
 use x86::cpuid::{cpuid, CpuIdResult};
 
-use crate::smp::cpu::ProcessorId;
+use crate::smp::cpu::{ProcessorId, SmpCpuManager};
 
 /// 获取当前cpu的apic id
 #[inline]
@@ -15,4 +15,8 @@ pub unsafe fn cpu_reset() -> ! {
     // 重启计算机
     unsafe { x86::io::outb(0x64, 0xfe) };
     loop {}
+}
+
+impl SmpCpuManager {
+    pub fn arch_init(_boot_cpu: ProcessorId) {}
 }

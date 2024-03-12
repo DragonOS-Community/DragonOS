@@ -129,6 +129,10 @@ impl Into<MapFlags> for VmFlags {
             map_flags |= MapFlags::MAP_SYNC;
         }
 
+        if self.contains(VmFlags::VM_MAYSHARE) {
+            map_flags |= MapFlags::MAP_SHARED;
+        }
+
         map_flags
     }
 }

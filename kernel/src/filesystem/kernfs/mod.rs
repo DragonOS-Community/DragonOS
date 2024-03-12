@@ -47,6 +47,10 @@ impl FileSystem for KernFS {
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         return self.root_inode.clone();
     }
+
+    fn name(&self)->&str {
+        "kernfs"
+    }
 }
 
 impl KernFS {

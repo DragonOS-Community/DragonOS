@@ -1571,13 +1571,13 @@ impl IndexNode for LockedFATInode {
         return Ok(());
     }
 
-    fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        let other: &LockedFATInode = other
+    fn link(&self, name: &str, target: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        let target: &LockedFATInode = target
             .downcast_ref::<LockedFATInode>()
             .ok_or(SystemError::EPERM)?;
         
         let mut inode: SpinLockGuard<FATInode> = self.0.lock();
-        let mut other_locked: SpinLockGuard<FATInode> = other.0.lock();
+        let mut target_locked: SpinLockGuard<FATInode> = target.0.lock();
 
         // 如果当前inode不是文件夹，那么报错
         if inode.metadata.file_type != FileType::Dir {
@@ -1585,7 +1585,7 @@ impl IndexNode for LockedFATInode {
         }
 
         // 如果另一个inode是文件夹，那么也报错
-        if other_locked.metadata.file_type == FileType::Dir {
+        if target_locked.metadata.file_type == FileType::Dir {
             return Err(SystemError::EISDIR);
         }
 
@@ -1596,10 +1596,10 @@ impl IndexNode for LockedFATInode {
 
         inode
             .children
-            .insert(String::from(name), other_locked.self_ref.upgrade().unwrap());
+            .insert(String::from(name), target_locked.self_ref.upgrade().unwrap());
 
         // 增加硬链接计数
-        other_locked.metadata.nlinks += 1;
+        target_locked.metadata.nlinks += 1;
         return Ok(());
     }
 
@@ -1675,7 +1675,7 @@ impl IndexNode for LockedFATInode {
         }
     }
 
-    fn move_(
+    fn move_to(
         &self,
         old_name: &str,
         target: &Arc<dyn IndexNode>,

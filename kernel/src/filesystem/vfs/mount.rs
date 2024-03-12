@@ -253,13 +253,13 @@ impl IndexNode for MountFSInode {
     }
 
     #[inline]
-    fn move_(
+    fn move_to(
         &self,
         old_name: &str,
         target: &Arc<dyn IndexNode>,
         new_name: &str,
     ) -> Result<(), SystemError> {
-        return self.inner_inode.move_(old_name, target, new_name);
+        return self.inner_inode.move_to(old_name, target, new_name);
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {

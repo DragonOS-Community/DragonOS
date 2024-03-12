@@ -374,13 +374,12 @@ impl IndexNode for LockedRamFSInode {
         return Ok(());
     }
 
-    fn move_(
+    fn move_to(
         &self,
         old_name: &str,
         target: &Arc<dyn IndexNode>,
         new_name: &str,
     ) -> Result<(), SystemError> {
-        kdebug!("ramfs");
         let old_inode: Arc<dyn IndexNode> = self.find(old_name)?;
 
         // 在新的目录下创建一个硬链接

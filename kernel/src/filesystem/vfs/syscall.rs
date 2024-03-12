@@ -623,7 +623,7 @@ impl Syscall {
         let (new_filename,new_parent_path) = rsplit_path(&new_remain_path);
         let new_parent_inode = ROOT_INODE()
             .lookup(new_parent_path.unwrap_or("/"))?;
-        old_parent_inode.move_(old_filename,&new_parent_inode,new_filename)?;
+        old_parent_inode.move_to(old_filename,&new_parent_inode,new_filename)?;
         return Ok(0);
     }
 

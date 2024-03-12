@@ -195,13 +195,12 @@ impl IndexNode for KernFSInode {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
-    fn move_(
+    fn move_to(
         &self,
         _old_name: &str,
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
     ) -> Result<(), SystemError> {
-        kdebug!("kernfs");
         // 应当通过kernfs的其它方法来操作文件，而不能从用户态直接调用此方法。
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
@@ -371,7 +370,7 @@ impl IndexNode for KernFSInode {
 
     fn rename(&self, _old_name:&str, _new_name:&str) -> Result<(),SystemError> {
         //待实现
-        return Ok(());
+        Err(SystemError::ENOSYS)
     }
 }
 

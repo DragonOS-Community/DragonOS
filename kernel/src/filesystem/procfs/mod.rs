@@ -655,13 +655,12 @@ impl IndexNode for LockedProcFSInode {
         return Ok(());
     }
 
-    fn move_(
+    fn move_to(
         &self,
         _old_name: &str,
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
     ) -> Result<(), SystemError> {
-        kdebug!("procfs");
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 

@@ -287,7 +287,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     ///
     /// @return 成功: Ok()
     ///         失败: Err(错误码)
-    fn move_(
+    fn move_to(
         &self,
         _old_name: &str,
         _target: &Arc<dyn IndexNode>,

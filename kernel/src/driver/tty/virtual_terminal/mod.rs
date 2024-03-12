@@ -44,7 +44,7 @@ pub const DEFAULT_BLUE: [u16; 16] = [
     0x00, 0x00, 0x00, 0x00, 0xaa, 0xaa, 0xaa, 0xaa, 0x55, 0x55, 0x55, 0x55, 0xff, 0xff, 0xff, 0xff,
 ];
 
-pub const COLOR_TABLE: &'static [u8] = &[0, 4, 2, 6, 1, 5, 3, 7, 8, 12, 10, 14, 9, 13, 11, 15];
+pub const COLOR_TABLE: & [u8] = &[0, 4, 2, 6, 1, 5, 3, 7, 8, 12, 10, 14, 9, 13, 11, 15];
 
 lazy_static! {
     pub static ref VIRT_CONSOLES: Vec<Arc<SpinLock<VirtualConsoleData>>> = {

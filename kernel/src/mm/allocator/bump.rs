@@ -84,12 +84,11 @@ impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
                 }
             }
 
-            if found_start {
-                if area.area_base_aligned() < area.area_end_aligned() {
-                    result_area[res_cnt] = area;
-                    res_cnt += 1;
-                }
+            if found_start && area.area_base_aligned() < area.area_end_aligned() {
+                result_area[res_cnt] = area;
+                res_cnt += 1;
             }
+            
         }
 
         let res_cnt = unsafe { Self::arch_remain_areas(result_area, res_cnt) };

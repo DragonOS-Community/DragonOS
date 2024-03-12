@@ -515,7 +515,7 @@ impl InnerAddressSpace {
 
         for r in regions {
             // kdebug!("mprotect: r: {:?}", r);
-            let r = r.lock().region();
+            let r = r.lock().region().clone();
             let r = self.mappings.remove_vma(&r).unwrap();
 
             let intersection = r.lock().region().intersect(&region).unwrap();
@@ -623,7 +623,7 @@ impl InnerAddressSpace {
         let new_brk = if incr > 0 {
             self.brk + incr as usize
         } else {
-            self.brk - (incr.abs())
+            self.brk - (incr.abs()) as usize
         };
 
         let new_brk = VirtAddr::new(page_align_up(new_brk.data()));

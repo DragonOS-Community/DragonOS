@@ -80,7 +80,7 @@ fn do_unified_init(args: TokenStream, input: TokenStream) -> syn::Result<proc_ma
 /// ```
 fn check_function_signature(function: &ItemFn) -> syn::Result<()> {
     // 检查函数签名
-    if function.sig.inputs.len() != 0 {
+    if !function.sig.inputs.is_empty() {
         return Err(syn::Error::new(
             function.sig.inputs.span(),
             "Expected no arguments",

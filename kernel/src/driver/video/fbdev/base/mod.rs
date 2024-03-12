@@ -10,14 +10,14 @@ use crate::{
 
 use self::fbmem::{FbDevice, FrameBufferManager};
 
-const COLOR_TABLE_8: &'static [u32] = &[
+const COLOR_TABLE_8: & [u32] = &[
     0x00000000, 0xff000000, 0x00ff0000, 0xffff0000, 0x0000ff00, 0xff00ff00, 0x00ffff00, 0xffffff00,
     0x000000ff, 0xff0000ff, 0x00ff00ff, 0xffff00ff, 0x0000ffff, 0xff00ffff, 0x00ffffff, 0xffffffff,
 ];
 
-const COLOR_TABLE_16: &'static [u32] = &[0x00000000, 0xffff0000, 0x0000ffff, 0xffffffff];
+const COLOR_TABLE_16: & [u32] = &[0x00000000, 0xffff0000, 0x0000ffff, 0xffffffff];
 
-const COLOR_TABLE_32: &'static [u32] = &[0x00000000, 0xffffffff];
+const COLOR_TABLE_32: & [u32] = &[0x00000000, 0xffffffff];
 
 pub mod fbcon;
 pub mod fbmem;

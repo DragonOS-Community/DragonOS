@@ -70,7 +70,8 @@ impl BlockIter {
         return BlockIter {
             begin: start_addr,
             end: end_addr,
-            blk_size_log2: blk_size_log2,
+            
+            blk_size_log2,
             multiblock: true,
         };
     }

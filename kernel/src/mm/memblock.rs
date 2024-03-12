@@ -489,18 +489,14 @@ impl<'a> Iterator for MemBlockIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.index < self.inner.initial_memory_regions_num {
-            if self.usable_only {
-                if self.inner.initial_memory_regions[self.index]
+            if self.usable_only && self.inner.initial_memory_regions[self.index]
                     .flags
-                    .is_empty()
-                    == false
-                {
-                    self.index += 1;
-                    if self.index >= self.inner.initial_memory_regions_num {
-                        return None;
-                    }
-                    continue;
+                    .is_empty() == false{
+                self.index += 1;
+                if self.index >= self.inner.initial_memory_regions_num {
+                    return None;
                 }
+                continue;
             }
             break;
         }

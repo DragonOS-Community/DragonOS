@@ -329,10 +329,8 @@ impl ProcessManager {
 
         // 如果新进程使用不同的 pid 或 namespace，
         // 则不允许它与分叉任务共享线程组。
-        if clone_flags.contains(CloneFlags::CLONE_THREAD) {
-            if clone_flags.contains(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWPID) {
-                return Err(SystemError::EINVAL);
-            }
+        if clone_flags.contains(CloneFlags::CLONE_THREAD) && clone_flags.contains(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWPID) {
+            return Err(SystemError::EINVAL);
             // TODO: 判断新进程与当前进程namespace是否相同，不同则返回错误
         }
 

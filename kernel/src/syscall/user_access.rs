@@ -95,7 +95,7 @@ pub fn check_and_clone_cstr(
         }
         buffer.push(c[0]);
     }
-    return Ok(String::from_utf8(buffer).map_err(|_| SystemError::EFAULT)?);
+    String::from_utf8(buffer).map_err(|_| SystemError::EFAULT)
 }
 
 /// 检查并从用户态拷贝一个 C 字符串数组
@@ -229,9 +229,8 @@ impl<'a> UserBufferReader<'a> {
     ///
     /// - `offset`：字节偏移量
     pub fn buffer<T>(&self, offset: usize) -> Result<&[T], SystemError> {
-        Ok(self
-            .convert_with_offset::<T>(self.buffer, offset)
-            .map_err(|_| SystemError::EINVAL)?)
+        self.convert_with_offset::<T>(self.buffer, offset)
+            .map_err(|_| SystemError::EINVAL)
     }
 
     fn convert_with_offset<T>(&self, src: &[u8], offset: usize) -> Result<&[T], SystemError> {
@@ -318,7 +317,7 @@ impl<'a> UserBufferWriter<'a> {
     }
 
     pub fn buffer<T>(&'a mut self, offset: usize) -> Result<&mut [T], SystemError> {
-        Ok(Self::convert_with_offset::<T>(self.buffer, offset).map_err(|_| SystemError::EINVAL)?)
+        Self::convert_with_offset::<T>(self.buffer, offset).map_err(|_| SystemError::EINVAL)
     }
 
     fn convert_with_offset<T>(src: &mut [u8], offset: usize) -> Result<&mut [T], SystemError> {

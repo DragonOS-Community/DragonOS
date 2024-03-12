@@ -115,9 +115,7 @@ impl SchedulerRT {
         }
         // 为每个cpu核心创建负载统计队列
         for _ in 0..MAX_CPU_NUM {
-            result
-                .load_list
-                .push(Box::leak(Box::new(LinkedList::new())));
+            result.load_list.push(Box::leak(Box::default()));
         }
         return result;
     }

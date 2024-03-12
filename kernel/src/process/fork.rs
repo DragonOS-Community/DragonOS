@@ -275,8 +275,7 @@ impl ProcessManager {
         }
 
         if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
-            (*new_pcb.sig_struct_irqsave()).handlers =
-                current_pcb.sig_struct_irqsave().handlers.clone();
+            new_pcb.sig_struct_irqsave().handlers = current_pcb.sig_struct_irqsave().handlers;
         }
         return Ok(());
     }
@@ -383,7 +382,7 @@ impl ProcessManager {
         }
 
         // 拷贝标志位
-        Self::copy_flags(&clone_flags, &pcb).unwrap_or_else(|e| {
+        Self::copy_flags(&clone_flags, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy flags from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e
@@ -391,7 +390,7 @@ impl ProcessManager {
         });
 
         // 拷贝用户地址空间
-        Self::copy_mm(&clone_flags, &current_pcb, &pcb).unwrap_or_else(|e| {
+        Self::copy_mm(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy mm from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e
@@ -399,7 +398,7 @@ impl ProcessManager {
         });
 
         // 拷贝文件描述符表
-        Self::copy_files(&clone_flags, &current_pcb, &pcb).unwrap_or_else(|e| {
+        Self::copy_files(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy files from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e
@@ -407,7 +406,7 @@ impl ProcessManager {
         });
 
         // 拷贝信号相关数据
-        Self::copy_sighand(&clone_flags, &current_pcb, pcb).map_err(|e| {
+        Self::copy_sighand(&clone_flags, current_pcb, pcb).map_err(|e| {
             panic!(
                 "fork: Failed to copy sighand from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e

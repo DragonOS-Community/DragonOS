@@ -1,8 +1,3 @@
-/**
- * Todo:
- * [ ] - 注入式的路径比较：path是否需要设计
- * [ ] -
- */
 use alloc::{collections::{LinkedList, VecDeque}, sync::{Arc, Weak}, vec::Vec};
 use core::{hash::{Hash, Hasher, SipHasher}, marker::PhantomData, mem::size_of};
 
@@ -13,10 +8,8 @@ type Resource = Weak<dyn IndexNode>;
 type SrcPtr = Weak<Resource>;
 type SrcManage = Arc<Resource>;
 
-// struct SrcList<'a>(RwLockUpgradableGuard<'a, VecDeque<SrcPtr>>);
 pub struct SrcIter<'a> {
     idx: usize,
-    // src: Option<Arc<dyn IndexNode>>,
     vec: Option<RwLockUpgradableGuard<'a, VecDeque<SrcPtr>>>,
 }
 

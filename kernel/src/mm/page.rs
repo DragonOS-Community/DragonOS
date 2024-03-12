@@ -293,7 +293,7 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
     #[inline(always)]
     pub const unsafe fn from_data(data: usize) -> Self {
         return Self {
-            data: data,
+            data,
             phantom: PhantomData,
         };
     }

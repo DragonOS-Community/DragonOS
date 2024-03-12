@@ -157,11 +157,10 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                     }
                 }
             }
-
             // 然后从高往低，把剩余的页面加入链表
             let mut remain_bytes = remain_pages.data() * A::PAGE_SIZE;
 
-            assert!(remain_bytes < (1 << MAX_ORDER - 1));
+            assert!(remain_bytes < (1 << MAX_ORDER) - 1);
 
             for i in (MIN_ORDER..MAX_ORDER).rev() {
                 if remain_bytes >= (1 << i) {

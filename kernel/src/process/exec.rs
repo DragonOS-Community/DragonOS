@@ -21,10 +21,10 @@ const BINARY_LOADERS: [&'static dyn BinaryLoader; 1] = [&ELF_LOADER];
 
 pub trait BinaryLoader: 'static + Debug {
     /// 检查二进制文件是否为当前加载器支持的格式
-    fn probe(self: &'static Self, param: &ExecParam, buf: &[u8]) -> Result<(), ExecError>;
+    fn probe(&'static self, param: &ExecParam, buf: &[u8]) -> Result<(), ExecError>;
 
     fn load(
-        self: &'static Self,
+        &'static self,
         param: &mut ExecParam,
         head_buf: &[u8],
     ) -> Result<BinaryLoaderResult, ExecError>;

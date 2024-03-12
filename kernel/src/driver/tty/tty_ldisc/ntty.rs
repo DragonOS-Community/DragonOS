@@ -1598,10 +1598,8 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 } else if ldata.canon_copy_from_read_buf(buf, &mut nr, &mut offset)? {
                     return Ok(len - nr);
                 }
-            } else {
-                if ldata.copy_from_read_buf(termios, buf, &mut nr, &mut offset)? {
-                    return Ok(len - nr);
-                }
+            } else if ldata.copy_from_read_buf(termios, buf, &mut nr, &mut offset)? {
+                return Ok(len - nr);
             }
 
             // 没有数据可读

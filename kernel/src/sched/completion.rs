@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::intrinsics::saturating_add;
+use core::intrinsics::saturating_add;
 
 use system_error::SystemError;
 

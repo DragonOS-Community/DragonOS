@@ -560,12 +560,10 @@ impl VirtualConsoleData {
     fn gotoxy(&mut self, x: i32, y: i32) {
         if x < 0 {
             self.state.x = 0;
+        } else if x as usize >= self.cols {
+            self.state.x = self.cols - 1;
         } else {
-            if x as usize >= self.cols {
-                self.state.x = self.cols - 1;
-            } else {
-                self.state.x = x as usize;
-            }
+            self.state.x = x as usize;
         }
 
         let max_y;

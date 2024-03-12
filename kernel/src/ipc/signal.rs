@@ -321,12 +321,10 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, _guard: SpinLockGuard<SignalStr
 
     if wakeup_ok {
         ProcessManager::kick(&pcb);
-    } else {
-        if fatal {
-            let _r = ProcessManager::wakeup(&pcb).map(|_| {
-                ProcessManager::kick(&pcb);
-            });
-        }
+    } else if fatal {
+        let _r = ProcessManager::wakeup(&pcb).map(|_| {
+            ProcessManager::kick(&pcb);
+        });
     }
 }
 

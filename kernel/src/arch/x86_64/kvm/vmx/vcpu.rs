@@ -534,7 +534,7 @@ pub fn adjust_vmx_exit_controls() -> u32 {
 }
 
 pub fn adjust_vmx_pinbased_controls() -> u32 {
-    let mut controls: u32 = 0000_0016;
+    let mut controls: u32 = 16;
     adjust_vmx_controls(0, 0, msr::IA32_VMX_TRUE_PINBASED_CTLS, &mut controls);
     // kdebug!("adjust_vmx_pinbased_controls: {:x}", controls);
     return controls;

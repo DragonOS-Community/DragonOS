@@ -76,6 +76,10 @@ impl FileSystem for RamFS {
     fn as_any_ref(&self) -> &dyn Any {
         self
     }
+
+    fn name(&self)->&str {
+        "ramfs"
+    }
 }
 
 impl RamFS {

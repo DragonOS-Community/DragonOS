@@ -248,6 +248,10 @@ impl FileSystem for FATFileSystem {
     fn as_any_ref(&self) -> &dyn Any {
         self
     }
+
+    fn name(&self)->&str {
+        "fat"
+    }
 }
 
 impl FATFileSystem {

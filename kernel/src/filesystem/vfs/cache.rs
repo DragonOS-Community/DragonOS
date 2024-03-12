@@ -4,7 +4,7 @@
  * [ ] -
  */
 use alloc::{collections::{LinkedList, VecDeque}, sync::{Arc, Weak}, vec::Vec};
-use core::{hash::{Hash, Hasher, SipHasher}, marker::PhantomData, mem::size_of, ops::DerefMut};
+use core::{hash::{Hash, Hasher, SipHasher}, marker::PhantomData, mem::size_of};
 
 use crate::libs::{rwlock::{RwLock, RwLockUpgradableGuard}, spinlock::SpinLock};
 
@@ -171,8 +171,3 @@ impl<H: Hasher + Default> DefaultCache<H> {
     }
 
 }
-
-// trait Cachable<'a>: IndexNode {
-//     fn name() -> Option<&'a str>;
-//     fn parent() -> Option<&'a str>;
-// }

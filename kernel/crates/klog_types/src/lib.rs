@@ -1,6 +1,7 @@
 #![no_std]
 #![feature(const_refs_to_cell)]
 #![feature(const_size_of_val)]
+#![allow(clippy::needless_return)]
 
 extern crate alloc;
 use core::{fmt::Debug, mem::size_of_val};
@@ -88,7 +89,7 @@ impl AllocatorLog {
 
     /// 当前日志是否有效
     pub fn is_valid(&self) -> bool {
-        if self.validate_checksum() == false {
+        if !self.validate_checksum() {
             return false;
         }
 
@@ -102,7 +103,7 @@ impl AllocatorLog {
 
 impl PartialOrd for AllocatorLog {
     fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        return self.id.partial_cmp(&other.id);
+        Some(self.cmp(other))
     }
 }
 

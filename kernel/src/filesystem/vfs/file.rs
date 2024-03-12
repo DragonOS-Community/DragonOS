@@ -484,7 +484,18 @@ impl File {
                 let inode = self.inode.downcast_ref::<LockedPipeInode>().unwrap();
                 return inode.inner().lock().add_epoll(epitem);
             }
-            _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+            _ => {
+                let r = self.inode.ioctl(
+                    EventPoll::ADD_EPOLLITEM,
+                    &epitem as *const Arc<EPollItem> as usize,
+                    &self.private_data,
+                );
+                if r.is_err() {
+                    return Err(SystemError::ENOSYS);
+                }
+
+                Ok(())
+            }
         }
     }
 

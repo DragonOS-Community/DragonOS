@@ -543,18 +543,18 @@ impl Syscall {
                 let virt_addr = VirtAddr::new(addr as usize);
                 let security_check = || {
                     // 验证buf的地址是否合法
-                    if verify_area(virt_buf, len as usize).is_err() {
+                    if verify_area(virt_buf, len).is_err() {
                         // 地址空间超出了用户空间的范围，不合法
                         return Err(SystemError::EFAULT);
                     }
 
                     // 验证addrlen的地址是否合法
-                    if verify_area(virt_addrlen, core::mem::size_of::<u32>() as usize).is_err() {
+                    if verify_area(virt_addrlen, core::mem::size_of::<u32>()).is_err() {
                         // 地址空间超出了用户空间的范围，不合法
                         return Err(SystemError::EFAULT);
                     }
 
-                    if verify_area(virt_addr, core::mem::size_of::<SockAddr>() as usize).is_err() {
+                    if verify_area(virt_addr, core::mem::size_of::<SockAddr>()).is_err() {
                         // 地址空间超出了用户空间的范围，不合法
                         return Err(SystemError::EFAULT);
                     }
@@ -603,8 +603,8 @@ impl Syscall {
             }
             SYS_MMAP => {
                 let len = page_align_up(args[1]);
-                let virt_addr = VirtAddr::new(args[0] as usize);
-                if verify_area(virt_addr, len as usize).is_err() {
+                let virt_addr = VirtAddr::new(args[0]);
+                if verify_area(virt_addr, len).is_err() {
                     Err(SystemError::EFAULT)
                 } else {
                     Self::mmap(
@@ -649,7 +649,7 @@ impl Syscall {
 
             SYS_GETCWD => {
                 let buf = args[0] as *mut u8;
-                let size = args[1] as usize;
+                let size = args[1];
                 let security_check = || {
                     verify_area(VirtAddr::new(buf as usize), size)?;
                     return Ok(());
@@ -695,7 +695,7 @@ impl Syscall {
 
             SYS_FTRUNCATE => {
                 let fd = args[0] as i32;
-                let len = args[1] as usize;
+                let len = args[1];
                 let res = Self::ftruncate(fd, len);
                 // kdebug!("FTRUNCATE: fd: {}, len: {}, res: {:?}", fd, len, res);
                 res
@@ -746,7 +746,7 @@ impl Syscall {
                         true,
                     )?;
 
-                    timespec = Some(reader.read_one_from_user::<TimeSpec>(0)?.clone());
+                    timespec = Some(*reader.read_one_from_user::<TimeSpec>(0)?);
                 }
 
                 Self::do_futex(uaddr, operation, val, timespec, uaddr2, utime as u32, val3)
@@ -824,7 +824,7 @@ impl Syscall {
                 }
                 let sigmask_reader =
                     UserBufferReader::new(sigmask_addr, core::mem::size_of::<SigSet>(), true)?;
-                let mut sigmask = sigmask_reader.read_one_from_user::<SigSet>(0)?.clone();
+                let mut sigmask = *sigmask_reader.read_one_from_user::<SigSet>(0)?;
 
                 Self::epoll_pwait(
                     args[0] as i32,
@@ -888,10 +888,10 @@ impl Syscall {
                 Ok(0)
             }
             SYS_GETTID => Self::gettid().map(|tid| tid.into()),
-            SYS_GETUID => Self::getuid().map(|uid| uid.into()),
+            SYS_GETUID => Self::getuid(),
 
             SYS_SYSLOG => {
-                let syslog_action_type = args[0] as usize;
+                let syslog_action_type = args[0];
                 let buf_vaddr = args[1];
                 let len = args[2];
                 let from_user = frame.from_user();
@@ -899,11 +899,10 @@ impl Syscall {
                     UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)?;
 
                 let user_buf = user_buffer_writer.buffer(0)?;
-                let res = Self::do_syslog(syslog_action_type, user_buf, len);
-                res
+                Self::do_syslog(syslog_action_type, user_buf, len)
             }
 
-            SYS_GETGID => Self::getgid().map(|gid| gid.into()),
+            SYS_GETGID => Self::getgid(),
             SYS_SETUID => {
                 kwarn!("SYS_SETUID has not yet been implemented");
                 Ok(0)
@@ -912,8 +911,8 @@ impl Syscall {
                 kwarn!("SYS_SETGID has not yet been implemented");
                 Ok(0)
             }
-            SYS_GETEUID => Self::geteuid().map(|euid| euid.into()),
-            SYS_GETEGID => Self::getegid().map(|egid| egid.into()),
+            SYS_GETEUID => Self::geteuid(),
+            SYS_GETEGID => Self::getegid(),
             SYS_GETRUSAGE => {
                 let who = args[0] as c_int;
                 let rusage = args[1] as *mut RUsage;
@@ -924,7 +923,7 @@ impl Syscall {
             SYS_READLINK => {
                 let path = args[0] as *const u8;
                 let buf = args[1] as *mut u8;
-                let bufsiz = args[2] as usize;
+                let bufsiz = args[2];
                 Self::readlink(path, buf, bufsiz)
             }
 
@@ -932,7 +931,7 @@ impl Syscall {
                 let dirfd = args[0] as i32;
                 let pathname = args[1] as *const u8;
                 let buf = args[2] as *mut u8;
-                let bufsiz = args[3] as usize;
+                let bufsiz = args[3];
                 Self::readlink_at(dirfd, pathname, buf, bufsiz)
             }
 
@@ -1026,7 +1025,7 @@ impl Syscall {
                 Self::prlimit64(
                     ProcessManager::current_pcb().pid(),
                     resource,
-                    0 as *const RLimit64,
+                    core::ptr::null::<RLimit64>(),
                     rlimit,
                 )
             }

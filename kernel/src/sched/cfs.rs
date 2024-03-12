@@ -57,7 +57,7 @@ impl CFSQueue {
         CFSQueue {
             cpu_exec_proc_jiffies: 0,
             locked_queue: SpinLock::new(RBTree::new()),
-            idle_pcb: idle_pcb,
+            idle_pcb,
         }
     }
 
@@ -100,6 +100,7 @@ impl CFSQueue {
         }
     }
     /// 获取运行队列的长度
+    #[allow(dead_code)]
     pub fn get_cfs_queue_size(
         queue: &SpinLockGuard<RBTree<i64, Arc<ProcessControlBlock>>>,
     ) -> usize {

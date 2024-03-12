@@ -602,7 +602,6 @@ impl EventPoll {
             // 如果目标文件不支持poll
             return Err(SystemError::ENOSYS);
         }
-        
 
         epoll_guard.ep_items.insert(epitem.fd, epitem.clone());
 

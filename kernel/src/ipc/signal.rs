@@ -326,7 +326,6 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, _guard: SpinLockGuard<SignalStr
             ProcessManager::kick(&pcb);
         });
     }
-    
 }
 
 /// @brief 当一个进程具有多个线程之后，在这里需要重新计算线程的flag中的TIF_SIGPENDING位

@@ -88,7 +88,6 @@ impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
                 result_area[res_cnt] = area;
                 res_cnt += 1;
             }
-            
         }
 
         let res_cnt = unsafe { Self::arch_remain_areas(result_area, res_cnt) };

@@ -561,9 +561,9 @@ impl VirtualConsoleData {
         if x < 0 {
             self.state.x = 0;
         } else if x as usize >= self.cols {
-                self.state.x = self.cols - 1;
-            } else {
-                self.state.x = x as usize;
+            self.state.x = self.cols - 1;
+        } else {
+            self.state.x = x as usize;
         }
 
         let max_y;

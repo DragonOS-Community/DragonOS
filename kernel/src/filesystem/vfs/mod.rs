@@ -564,7 +564,7 @@ impl dyn IndexNode {
         self._quick_lookup(cache, abs_path, current)
     }
 
-    fn _quick_lookup<'a>(&'a self, mut cache: Arc<DefaultCache>, abs_path: &'a str, current: &'a str) -> Option<(Arc<dyn IndexNode>, &str)> {
+    fn _quick_lookup<'a>(&'a self, cache: Arc<DefaultCache>, abs_path: &'a str, current: &'a str) -> Option<(Arc<dyn IndexNode>, &str)> {
         // let cache = self.cache().unwrap();
         let (key, left_rest) = rsplit_path(abs_path);
         if left_rest.is_none() {
@@ -586,7 +586,7 @@ impl dyn IndexNode {
         if self.parent().is_err_and(|err| err == SystemError::EOPNOTSUPP_OR_ENOTSUP) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
-        let mut inode = self;
+        let inode = self;
         let mut path = String::new();
         loop {
             if inode.parent().is_err_and(|err| err == SystemError::ENOENT) {

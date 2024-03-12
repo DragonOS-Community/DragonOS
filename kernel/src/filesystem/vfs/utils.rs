@@ -1,4 +1,4 @@
-use alloc::{string::{String, ToString}, sync::Arc, vec::Vec};
+use alloc::{string::{String, ToString}, sync::Arc};
 use system_error::SystemError;
 
 use crate::process::ProcessControlBlock;
@@ -102,18 +102,4 @@ pub fn clean_path(path: &str) -> String {
         }
     }
     String::from(clean)
-}
-
-fn path_parse(path: &str) -> Vec<&str> {
-    let mut parse = Vec::new();
-    let path = Some(path);
-    while path.is_some() {
-        let (key, path) = rsplit_path(path.unwrap());
-        match key {
-            "." => {}
-            ".." => { parse.pop(); }
-            other => { parse.push(other); }
-        };
-    }
-    parse
 }

@@ -1,10 +1,33 @@
-use core::any::Any;
+/**
+ * **RAMFS**
+ */
+use super::vfs::{
+    FileSystem, FsInfo,
+    core::generate_inode_id, 
+    FileType, file::{FilePrivateData, FileMode}, 
+    IndexNode, Metadata, SpecialNodeData,
+    syscall::ModeType
+};
+use core::{
+    any::Any,
+    cmp::Ordering,
+    intrinsics::unlikely
+};
 
-use alloc::{string::String, sync::{Arc, Weak}};
+use alloc::{
+    string::String, 
+    sync::{Arc, Weak},
+    collections::BTreeMap,
+    vec::Vec,
+};
+use system_error::SystemError;
 
-use crate::libs::spinlock::SpinLock;
-
-use super::vfs::{FileSystem, FsInfo};
+use crate::{
+    driver::base::device::device_number::DeviceNumber,
+    ipc::pipe::LockedPipeInode,
+    time::TimeSpec,
+    libs::spinlock::SpinLock
+};
 
 /// RamFS的inode名称的最大长度
 const RAMFS_MAX_NAMELEN: usize = 64;
@@ -12,7 +35,6 @@ const RAMFS_MAX_NAMELEN: usize = 64;
 #[derive(Debug)]
 pub struct RamFS {
     root: Arc<LockedEntry>,
-    // To Add Cache
 }
 
 impl RamFS {
@@ -60,32 +82,6 @@ impl FileSystem for RamFS {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////
-
-use core::cmp::Ordering;
-use core::intrinsics::unlikely;
-
-use alloc::{
-    collections::BTreeMap,
-    vec::Vec,
-};
-use system_error::SystemError;
-
-use crate::filesystem::vfs::syscall::ModeType;
-use crate::{
-    driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{
-        core::generate_inode_id, 
-        FileType, file::{FilePrivateData, FileMode}, 
-        IndexNode, Metadata, SpecialNodeData},
-    ipc::pipe::LockedPipeInode,
-    time::TimeSpec,
-};
-
-////////////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////
-
 #[derive(Debug)]
 pub struct Keyer(Weak<LockedEntry>, Option<String>);
 
@@ -97,25 +93,14 @@ impl Keyer {
     fn from_entry(entry: &Arc<LockedEntry>) -> Self {
         Keyer(Arc::downgrade(entry), None)
     }
-}
 
-impl Keyer {
+    /// 获取name
     fn get(&self) -> Option<String> {
         if self.1.is_some() {
             return self.1.clone();
         }
         Some(self.0.upgrade()?.0.lock().name.clone())
     }
-
-    // /// [unsafe]: use in one line or may lead to memory leak
-    // fn inline_ref(&self) -> Option<&str> {
-    //     if self.1.is_some() {
-    //         return self.1.as_ref().map(|x| x.as_str());
-    //     }
-    //     Some(&self.0.upgrade()?.0.lock().name)
-    // }
-
-    
 }
 
 // For Btree insertion
@@ -132,7 +117,7 @@ impl PartialEq for Keyer {
             let opt2 = other.0.upgrade();
             if opt1.is_none() && opt2.is_none() {
                 kerror!("Empty Both none!");
-                return false;
+                panic!("Empty of both");
             }
             if opt1.is_none() || opt2.is_none() {
                 return false;
@@ -164,63 +149,17 @@ impl PartialEq for Keyer {
 
 impl Eq for Keyer {}
 
-// Todo: improve performance
 impl PartialOrd for Keyer {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        let mut ret: Ordering = Ordering::Equal;
-        if self.0.ptr_eq(&other.0) { 
-            kinfo!("Compare itself!");
-            ret = Ordering::Equal;
-        }
-        if self.1.is_none() && other.1.is_none() {
-            // cmp between wrapper
-            let opt1 = self.0.upgrade();
-            let opt2 = other.0.upgrade();
-            if opt1.is_none() && opt2.is_none() {
-                kerror!("Empty Both none!");
-                panic!("All Keys None, compare error!");
-            }
-            if opt1.is_some() && opt2.is_some() {
-                ret = opt1.unwrap().0.lock().name.cmp(&opt2.unwrap().0.lock().name);
-            } else {
-                kwarn!("depecated");
-                panic!("Empty Key!");
-            }
-        } else {
-            if self.1.is_none() {
-                let opt = self.0.upgrade();
-                if opt.is_none() {
-                    kwarn!("depecated");
-                    panic!("Empty Key!");
-                }
-                ret = opt.unwrap().0.lock().name.cmp(other.1.as_ref().unwrap());
-
-            } else {
-                let opt = other.0.upgrade();
-                if opt.is_none() {
-                    kwarn!("depecated");
-                    panic!("Empty Key!");
-                }
-
-                ret = opt.unwrap().0.lock().name.cmp(self.1.as_ref().unwrap());
-            }
-        }
-        let destring = match ret {
-            Ordering::Equal => "Equal",
-            Ordering::Less => "Less",
-            Ordering::Greater => "Greater",
-        };
-        kdebug!("POrd::Cmp {} and {} with result: {}\0", self.get().unwrap_or(String::from("fail")), other.get().unwrap_or(String::from("fail")), destring);
-        Some(ret)
+        Some(self.cmp(other))
     }
 }
 
-impl Ord for Keyer {
-    fn cmp(&self, other: &Self) -> Ordering {
-        let mut ret: Ordering = Ordering::Equal;
+impl Keyer {
+    fn _cmp(&self, other: &Self) -> Ordering {
         if self.0.ptr_eq(&other.0) {
             kdebug!("Compare itself!");
-            ret = Ordering::Equal;
+            return Ordering::Equal;
         }
         if self.1.is_none() && other.1.is_none() {
             // cmp between wrapper
@@ -231,43 +170,54 @@ impl Ord for Keyer {
                 panic!("All Keys None, compare error!");
             }
             if opt1.is_some() && opt2.is_some() {
-                ret = opt1.unwrap().0.lock().name.cmp(&opt2.unwrap().0.lock().name);
-            } else {
-                kwarn!("depecated");
-                panic!("Empty Key!");
+                return opt1
+                            .unwrap().0
+                            .lock()
+                            .name
+                            .cmp(
+                                &opt2
+                                    .unwrap().0
+                                    .lock()
+                                    .name
+                            );
             }
         } else {
-
             if self.1.is_none() {
-                let opt = self.0.upgrade();
-                if opt.is_none() {
-                    kwarn!("depecated");
-                    panic!("Empty Key!");
-                }
-                ret = opt.unwrap().0.lock().name.cmp(other.1.as_ref().unwrap());
-
+                return self.0
+                            .upgrade()
+                            .unwrap().0
+                            .lock()
+                            .name
+                            .cmp( 
+                                other.1
+                                    .as_ref()
+                                    .unwrap()
+                            );
             } else {
-                let opt = other.0.upgrade();
-                if opt.is_none() {
-                    kwarn!("depecated");
-                    panic!("Empty Key!");
-                }
-
-                ret = self.1.as_ref().unwrap().cmp(&opt.unwrap().0.lock().name);
+                return self.1
+                            .as_ref()
+                            .unwrap()
+                            .cmp( 
+                                &other.0
+                                    .upgrade()
+                                    .unwrap().0
+                                    .lock()
+                                    .name
+                            );
             }
         }
-        let destring = match ret {
-            Ordering::Equal => "Equal",
-            Ordering::Less => "Less",
-            Ordering::Greater => "Greater",
-        };
-        kdebug!("Ord::Cmp {} and {} with result: {}\0", self.get().unwrap_or(String::from("fail")), other.get().unwrap_or(String::from("fail")), destring);
-        ret
+        kwarn!("depecated");
+        panic!("Empty Key!");
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////
+impl Ord for Keyer {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let ret = self._cmp(other);
+        kdebug!("Cmp {} and {} with result: {:?}\0", self.get().unwrap_or(String::from("fail")), other.get().unwrap_or(String::from("fail")), ret);
+        ret
+    }
+}
 
 #[derive(Debug)]
 pub struct Inode {
@@ -302,9 +252,6 @@ pub struct Entry {
 
 #[derive(Debug)]
 pub struct LockedEntry(SpinLock<Entry>);
-
-////////////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////
 
 impl Inode {
     pub fn new(file_type: FileType, mode: ModeType) -> Inode {

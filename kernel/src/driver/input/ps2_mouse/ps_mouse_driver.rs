@@ -276,9 +276,10 @@ impl SerioDriver for Ps2MouseDriver {
 
 #[unified_init(INITCALL_DEVICE)]
 fn ps2_mouse_driver_init() -> Result<(), SystemError> {
-    kdebug!("Ps2_mouse_drive initing...");
+    kdebug!("Ps2_mouse_drive initializing...");
     let driver = Ps2MouseDriver::new();
     serio_driver_manager().register(driver.clone())?;
     unsafe { PS2_MOUSE_DRIVER = Some(driver) };
+    kdebug!("Ps2_mouse_drive initialized!");
     return Ok(());
 }

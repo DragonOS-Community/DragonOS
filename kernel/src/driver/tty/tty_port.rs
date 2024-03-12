@@ -1,4 +1,4 @@
-use core::fmt::Debug;
+use core::{fmt::Debug, sync::atomic::Ordering};
 
 use alloc::{
     sync::{Arc, Weak},
@@ -12,7 +12,7 @@ use crate::{
     libs::spinlock::{SpinLock, SpinLockGuard},
 };
 
-use super::tty_core::TtyCore;
+use super::{tty_core::TtyCore, virtual_terminal::virtual_console::CURRENT_VCNUM};
 
 const TTY_PORT_BUFSIZE: usize = 4096;
 
@@ -25,6 +25,12 @@ lazy_static! {
 
         v
     };
+}
+
+/// 获取当前tty port
+#[inline]
+pub fn current_tty_port() -> Arc<dyn TtyPort> {
+    TTY_PORTS[CURRENT_VCNUM.load(Ordering::SeqCst) as usize].clone()
 }
 
 #[allow(dead_code)]

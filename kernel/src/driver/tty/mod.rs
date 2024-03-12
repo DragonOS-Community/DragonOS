@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 
 pub mod console;
+pub mod kthread;
 pub mod termios;
 pub mod tty_core;
 pub mod tty_device;

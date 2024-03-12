@@ -1,4 +1,5 @@
 use core::{
+    fmt::Display,
     hash::Hash,
     hint::spin_loop,
     intrinsics::{likely, unlikely},
@@ -259,9 +260,8 @@ impl ProcessManager {
     /// - 进入当前函数之前，必须关闭中断
     /// - 进入当前函数之后必须保证逻辑的正确性，避免被重复加入调度队列
     pub fn mark_sleep(interruptable: bool) -> Result<(), SystemError> {
-        assert_eq!(
-            CurrentIrqArch::is_irq_enabled(),
-            false,
+        assert!(
+            !CurrentIrqArch::is_irq_enabled(),
             "interrupt must be disabled before enter ProcessManager::mark_sleep()"
         );
 
@@ -284,9 +284,8 @@ impl ProcessManager {
     /// - 进入当前函数之前，不能持有sched_info的锁
     /// - 进入当前函数之前，必须关闭中断
     pub fn mark_stop() -> Result<(), SystemError> {
-        assert_eq!(
-            CurrentIrqArch::is_irq_enabled(),
-            false,
+        assert!(
+            !CurrentIrqArch::is_irq_enabled(),
             "interrupt must be disabled before enter ProcessManager::mark_stop()"
         );
 
@@ -447,8 +446,8 @@ pub unsafe extern "C" fn switch_finish_hook() {
 
 int_like!(Pid, AtomicPid, usize, AtomicUsize);
 
-impl Pid {
-    pub fn to_string(&self) -> String {
+impl ToString for Pid {
+    fn to_string(&self) -> String {
         self.0.to_string()
     }
 }
@@ -620,7 +619,7 @@ impl ProcessControlBlock {
 
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find(ppid)
             .map(|p| Arc::downgrade(&p))
-            .unwrap_or_else(|| Weak::new());
+            .unwrap_or_default();
 
         let pcb = Self {
             pid,

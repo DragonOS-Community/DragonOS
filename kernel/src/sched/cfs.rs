@@ -210,7 +210,7 @@ impl Scheduler for SchedulerCFS {
     /// @brief 在当前cpu上进行调度。
     /// 请注意，进入该函数之前，需要关中断
     fn sched(&mut self) -> Option<Arc<ProcessControlBlock>> {
-        assert!(CurrentIrqArch::is_irq_enabled() == false);
+        assert!(!CurrentIrqArch::is_irq_enabled());
 
         ProcessManager::current_pcb()
             .flags()

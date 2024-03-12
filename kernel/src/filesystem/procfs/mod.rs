@@ -4,7 +4,7 @@ use alloc::{
     borrow::ToOwned,
     collections::BTreeMap,
     format,
-    string::String,
+    string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };

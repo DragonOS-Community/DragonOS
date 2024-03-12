@@ -92,17 +92,15 @@ impl Syscall {
             SYS_OPEN => {
                 let path: &CStr = unsafe { CStr::from_ptr(args[0] as *const c_char) };
                 let path: Result<&str, core::str::Utf8Error> = path.to_str();
-                let res = if path.is_err() {
-                    Err(SystemError::EINVAL)
-                } else {
-                    let path: &str = path.unwrap();
-
+                let res = if let Ok(path) = path {
                     let flags = args[1];
                     let mode = args[2];
 
                     let open_flags: FileMode = FileMode::from_bits_truncate(flags as u32);
                     let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
                     Self::open(path, open_flags, mode, true)
+                } else {
+                    Err(SystemError::EINVAL)
                 };
                 res
             }
@@ -114,16 +112,15 @@ impl Syscall {
                 let mode = args[3];
 
                 let path: Result<&str, core::str::Utf8Error> = path.to_str();
-                let res = if path.is_err() {
-                    Err(SystemError::EINVAL)
-                } else {
-                    let path: &str = path.unwrap();
-
+                let res = if let Ok(path) = path {
                     let open_flags: FileMode =
                         FileMode::from_bits(flags as u32).ok_or(SystemError::EINVAL)?;
                     let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
                     Self::openat(dirfd, path, open_flags, mode, true)
+                } else {
+                    Err(SystemError::EINVAL)
                 };
+
                 res
             }
             SYS_CLOSE => {
@@ -331,8 +328,8 @@ impl Syscall {
                 };
 
                 let path = security_check();
-                if path.is_err() {
-                    Err(path.unwrap_err())
+                if let Err(e) = path {
+                    Err(e)
                 } else {
                     Self::mkdir(path.unwrap(), mode)
                 }
@@ -380,9 +377,9 @@ impl Syscall {
                 let pathname = args[1] as *const c_char;
                 let flags = args[2] as u32;
                 let virt_pathname = VirtAddr::new(pathname as usize);
-                if frame.from_user() && verify_area(virt_pathname, PAGE_4K_SIZE as usize).is_err() {
-                    Err(SystemError::EFAULT)
-                } else if pathname.is_null() {
+                if (frame.from_user() && verify_area(virt_pathname, PAGE_4K_SIZE as usize).is_err())
+                    || pathname.is_null()
+                {
                     Err(SystemError::EFAULT)
                 } else {
                     let get_path = || {
@@ -395,8 +392,8 @@ impl Syscall {
                         return Ok(pathname.trim());
                     };
                     let pathname = get_path();
-                    if pathname.is_err() {
-                        Err(pathname.unwrap_err())
+                    if let Err(e) = pathname {
+                        Err(e)
                     } else {
                         // kdebug!("sys unlinkat: dirfd: {}, pathname: {}", dirfd, pathname.as_ref().unwrap());
                         Self::unlinkat(dirfd, pathname.unwrap(), flags)
@@ -478,8 +475,8 @@ impl Syscall {
                     return Ok(());
                 };
                 let r = security_check();
-                if r.is_err() {
-                    Err(r.unwrap_err())
+                if let Err(e) = r {
+                    Err(e)
                 } else {
                     Self::getsockopt(args[0], args[1], args[2], optval, optlen as *mut u32)
                 }
@@ -519,10 +516,7 @@ impl Syscall {
                 let virt_buf = VirtAddr::new(buf as usize);
                 let virt_addr = VirtAddr::new(addr as usize);
                 // 验证buf的地址是否合法
-                if verify_area(virt_buf, len).is_err() {
-                    // 地址空间超出了用户空间的范围，不合法
-                    Err(SystemError::EFAULT)
-                } else if verify_area(virt_addr, addrlen).is_err() {
+                if verify_area(virt_buf, len).is_err() || verify_area(virt_addr, addrlen).is_err() {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
                 } else {
@@ -560,8 +554,8 @@ impl Syscall {
                     return Ok(());
                 };
                 let r = security_check();
-                if r.is_err() {
-                    Err(r.unwrap_err())
+                if let Err(e) = r {
+                    Err(e)
                 } else {
                     let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
                     Self::recvfrom(args[0], buf, flags, addr, addrlen as *mut u32)
@@ -654,8 +648,8 @@ impl Syscall {
                     return Ok(());
                 };
                 let r = security_check();
-                if r.is_err() {
-                    Err(r.unwrap_err())
+                if let Err(e) = r {
+                    Err(e)
                 } else {
                     let buf = unsafe { core::slice::from_raw_parts_mut(buf, size) };
                     Self::getcwd(buf).map(|ptr| ptr.data())
@@ -760,16 +754,15 @@ impl Syscall {
             SYS_LSTAT => {
                 let path: &CStr = unsafe { CStr::from_ptr(args[0] as *const c_char) };
                 let path: Result<&str, core::str::Utf8Error> = path.to_str();
-                let res = if path.is_err() {
-                    Err(SystemError::EINVAL)
-                } else {
-                    let path: &str = path.unwrap();
+                let res = if let Ok(path) = path {
                     let kstat = args[1] as *mut PosixKstat;
                     let vaddr = VirtAddr::new(kstat as usize);
                     match verify_area(vaddr, core::mem::size_of::<PosixKstat>()) {
                         Ok(_) => Self::lstat(path, kstat),
                         Err(e) => Err(e),
                     }
+                } else {
+                    Err(SystemError::EINVAL)
                 };
 
                 res
@@ -779,16 +772,15 @@ impl Syscall {
             SYS_STAT => {
                 let path: &CStr = unsafe { CStr::from_ptr(args[0] as *const c_char) };
                 let path: Result<&str, core::str::Utf8Error> = path.to_str();
-                let res = if path.is_err() {
-                    Err(SystemError::EINVAL)
-                } else {
-                    let path: &str = path.unwrap();
+                let res = if let Ok(path) = path {
                     let kstat = args[1] as *mut PosixKstat;
                     let vaddr = VirtAddr::new(kstat as usize);
                     match verify_area(vaddr, core::mem::size_of::<PosixKstat>()) {
                         Ok(_) => Self::stat(path, kstat),
                         Err(e) => Err(e),
                     }
+                } else {
+                    Err(SystemError::EINVAL)
                 };
 
                 res

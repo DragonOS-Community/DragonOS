@@ -554,7 +554,6 @@ impl Syscall {
             // kdebug!("rmdir");
             match do_remove_dir(dirfd, &pathname) {
                 Err(err) => {
-                    kerror!("Failed to Remove Directory, Error Code = {:?}", err);
                     return Err(err);
                 }
                 Ok(_) => {
@@ -565,7 +564,6 @@ impl Syscall {
 
         match do_unlink_at(dirfd, &pathname) {
             Err(err) => {
-                kerror!("Failed to Remove Directory, Error Code = {:?}", err);
                 return Err(err);
             }
             Ok(_) => {
@@ -936,10 +934,6 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
         let mut user_buf = UserBufferWriter::new(user_buf, buf_size, true)?;
-
-        if path.len() == 0 {
-            return Err(SystemError::EINVAL);
-        }
 
         let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
 

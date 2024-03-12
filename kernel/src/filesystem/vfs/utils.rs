@@ -38,6 +38,10 @@ pub fn user_path_at(
     dirfd: i32,
     path: &str,
 ) -> Result<(Arc<dyn IndexNode>, String), SystemError> {
+    if path.is_empty() {
+        return Err(SystemError::EINVAL);
+    }
+
     let mut inode = ROOT_INODE();
     let ret_path;
     // 如果path不是绝对路径，则需要拼接

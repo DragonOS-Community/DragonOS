@@ -302,8 +302,8 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     /// @param new_name 新的文件名
     ///
     /// @return 成功: Ok()
-    ///         失败: Err(错误码) 
-    fn rename(&self, _old_name:&str, _new_name:&str) -> Result<(),SystemError> {
+    ///         失败: Err(错误码)
+    fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }

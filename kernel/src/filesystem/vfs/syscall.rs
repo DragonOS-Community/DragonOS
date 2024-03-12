@@ -266,8 +266,6 @@ impl Syscall {
         return do_sys_open(dirfd, path, o_flags, mode, follow_symlink);
     }
 
-    
-
     /// @brief 关闭文件
     ///
     /// @param fd 文件描述符编号
@@ -605,25 +603,28 @@ impl Syscall {
     }
 
     //Syscall_rename
-    pub fn do_renameat2(oldfd: i32, filename_from: &str, newfd: i32, filename_to: &str, _flags: u32, ) -> Result<usize,SystemError> {
+    pub fn do_renameat2(
+        oldfd: i32,
+        filename_from: &str,
+        newfd: i32,
+        filename_to: &str,
+        _flags: u32,
+    ) -> Result<usize, SystemError> {
         // 文件名过长
         if filename_from.len() > MAX_PATHLEN as usize || filename_to.len() > MAX_PATHLEN as usize {
             return Err(SystemError::ENAMETOOLONG);
         }
 
-
         //获取pcb，文件节点
         let pcb = ProcessManager::current_pcb();
-        let (_old_inode_begin,old_remain_path) = user_path_at(&pcb,oldfd,filename_from)?;     
-        let (_new_inode_begin,new_remain_path) = user_path_at(&pcb,newfd,filename_to)?;
+        let (_old_inode_begin, old_remain_path) = user_path_at(&pcb, oldfd, filename_from)?;
+        let (_new_inode_begin, new_remain_path) = user_path_at(&pcb, newfd, filename_to)?;
         //获取父目录
-        let (old_filename,old_parent_path) = rsplit_path(&old_remain_path);
-        let old_parent_inode = ROOT_INODE()
-            .lookup(old_parent_path.unwrap_or("/"))?;
-        let (new_filename,new_parent_path) = rsplit_path(&new_remain_path);
-        let new_parent_inode = ROOT_INODE()
-            .lookup(new_parent_path.unwrap_or("/"))?;
-        old_parent_inode.move_to(old_filename,&new_parent_inode,new_filename)?;
+        let (old_filename, old_parent_path) = rsplit_path(&old_remain_path);
+        let old_parent_inode = ROOT_INODE().lookup(old_parent_path.unwrap_or("/"))?;
+        let (new_filename, new_parent_path) = rsplit_path(&new_remain_path);
+        let new_parent_inode = ROOT_INODE().lookup(new_parent_path.unwrap_or("/"))?;
+        old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename)?;
         return Ok(0);
     }
 
@@ -1145,6 +1146,3 @@ impl IoVecs {
         return buf;
     }
 }
-
-
-        

@@ -282,7 +282,6 @@ impl IndexNode for KernFSInode {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
-        
         let info = self.metadata()?;
         if info.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
@@ -368,7 +367,7 @@ impl IndexNode for KernFSInode {
             .write(callback_data, &buf[..len], offset);
     }
 
-    fn rename(&self, _old_name:&str, _new_name:&str) -> Result<(),SystemError> {
+    fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), SystemError> {
         //待实现
         Err(SystemError::ENOSYS)
     }

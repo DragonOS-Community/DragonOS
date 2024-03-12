@@ -1513,7 +1513,6 @@ impl IndexNode for LockedFATInode {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
-        
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let fatent: &FATDirEntry = &guard.inode_type;
         match fatent {
@@ -1556,7 +1555,6 @@ impl IndexNode for LockedFATInode {
         }
     }
 
-
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let target = guard.find(name)?;
@@ -1575,7 +1573,7 @@ impl IndexNode for LockedFATInode {
         let target: &LockedFATInode = target
             .downcast_ref::<LockedFATInode>()
             .ok_or(SystemError::EPERM)?;
-        
+
         let mut inode: SpinLockGuard<FATInode> = self.0.lock();
         let mut target_locked: SpinLockGuard<FATInode> = target.0.lock();
 
@@ -1594,9 +1592,10 @@ impl IndexNode for LockedFATInode {
             return Err(SystemError::EEXIST);
         }
 
-        inode
-            .children
-            .insert(String::from(name), target_locked.self_ref.upgrade().unwrap());
+        inode.children.insert(
+            String::from(name),
+            target_locked.self_ref.upgrade().unwrap(),
+        );
 
         // 增加硬链接计数
         target_locked.metadata.nlinks += 1;
@@ -1681,7 +1680,6 @@ impl IndexNode for LockedFATInode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
     ) -> Result<(), SystemError> {
-        
         let old_id = self.metadata().unwrap().inode_id;
         let new_id = target.metadata().unwrap().inode_id;
         //若在同一父目录下
@@ -1690,7 +1688,7 @@ impl IndexNode for LockedFATInode {
             let old_inode: Arc<LockedFATInode> = guard.find(old_name)?;
             // 对目标inode上锁，以防更改
             let old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
-            let fs  = old_inode_guard.fs.upgrade().unwrap();
+            let fs = old_inode_guard.fs.upgrade().unwrap();
             // 先从缓存删除
             let nod = guard.children.remove(&old_name.to_uppercase());
             // 若删除缓存中为管道的文件，则不需要再到磁盘删除
@@ -1713,17 +1711,17 @@ impl IndexNode for LockedFATInode {
             // 检查文件是否存在
             old_dir.check_existence(old_name, Some(false), guard.fs.upgrade().unwrap())?;
             old_dir.rename(fs, old_name, new_name)?;
-        } else{
-             let mut old_guard = self.0.lock();
+        } else {
+            let mut old_guard = self.0.lock();
             let other: &LockedFATInode = target
-            .downcast_ref::<LockedFATInode>()
-            .ok_or(SystemError::EPERM)?;
-            
-            let  new_guard = other.0.lock();
+                .downcast_ref::<LockedFATInode>()
+                .ok_or(SystemError::EPERM)?;
+
+            let new_guard = other.0.lock();
             let old_inode: Arc<LockedFATInode> = old_guard.find(old_name)?;
             // 对目标inode上锁，以防更改
             let old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
-            let fs  = old_inode_guard.fs.upgrade().unwrap();
+            let fs = old_inode_guard.fs.upgrade().unwrap();
             // 先从缓存删除
             let nod = old_guard.children.remove(&old_name.to_uppercase());
             // 若删除缓存中为管道的文件，则不需要再到磁盘删除
@@ -1757,7 +1755,7 @@ impl IndexNode for LockedFATInode {
             old_dir.check_existence(old_name, Some(false), old_guard.fs.upgrade().unwrap())?;
             old_dir.rename_across(fs, new_dir, old_name, new_name)?;
         }
-       
+
         return Ok(());
     }
 

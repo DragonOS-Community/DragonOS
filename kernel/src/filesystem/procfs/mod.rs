@@ -631,27 +631,26 @@ impl IndexNode for LockedProcFSInode {
     }
 
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
-      
         let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
         // 如果当前inode不是目录，那么也没有子目录/文件的概念了，因此要求当前inode的类型是目录
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
-        
+
         // 不允许删除当前文件夹，也不允许删除上一个目录
         if name == "." || name == ".." {
             return Err(SystemError::ENOTEMPTY);
         }
-       
+
         // 获得要删除的文件的inode
         let to_delete = inode.children.get(name).ok_or(SystemError::ENOENT)?;
-       
+
         // 减少硬链接计数
         to_delete.0.lock().metadata.nlinks -= 1;
-        
+
         // 在当前目录中删除这个子目录项
         inode.children.remove(name);
-        
+
         return Ok(());
     }
 
@@ -730,7 +729,6 @@ impl IndexNode for LockedProcFSInode {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
-        
         let info = self.metadata()?;
         if info.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);

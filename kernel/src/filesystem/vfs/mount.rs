@@ -328,7 +328,6 @@ impl IndexNode for MountFSInode {
 
     #[inline]
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
-        
         return self.inner_inode.list();
     }
 

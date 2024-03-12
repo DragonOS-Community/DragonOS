@@ -9,7 +9,7 @@ mod utils;
 
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 
-use alloc::{string::{String, ToString}, sync::{Arc, Weak}, vec::Vec};
+use alloc::{string::{String, ToString}, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{

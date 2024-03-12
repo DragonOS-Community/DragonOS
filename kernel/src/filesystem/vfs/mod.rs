@@ -455,9 +455,9 @@ impl dyn IndexNode {
         // kdebug!("When I call a list, i call {:?}", self.list());
         kdebug!("Looking path at {}", path);
         kdebug!("Current dir has children {:?}", self.list());
-        if self.metadata()?.inode_id == ROOT_INODE().metadata()?.inode_id {
-            todo!("Is Looking up from root.");
-        }
+        // if self.metadata()?.inode_id == ROOT_INODE().metadata()?.inode_id {
+        //     kinfo!("Is Looking up from root.");
+        // }
         let get = self.cache();
         if get.is_err() {
             kdebug!("No Cache to use");

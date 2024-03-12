@@ -13,7 +13,9 @@ use crate::{
     libs::{rwlock::RwLock, spinlock::SpinLock, vec_cursor::VecCursor},
 };
 
-lazy_static! {}
+lazy_static! {
+    pub static ref EXT2_SUPER_BLOCK: RwLock<Ex2SuperBlock> = RwLock::new(Ex2SuperBlock::default());
+}
 
 #[derive(Debug)]
 pub struct Ext2FsInfo {}
@@ -75,7 +77,7 @@ pub struct Ex2SuperBlock {
     /// 错误操作码
     pub error_action: u16,
     /// 版本号
-    pub minor_revision_level: u16,
+    pub minor_version: u16,
     /// 最后检查时间
     pub last_check_time: u32,
     /// 检查时间间隔
@@ -83,7 +85,7 @@ pub struct Ex2SuperBlock {
     /// OS
     pub os_id: u32,
     /// revision level(修订等级)
-    pub revision_level: u32,
+    pub major_version: u32,
     /// 保留块的默认uid
     pub def_resuid: u16,
     /// 保留块的默认gid
@@ -158,11 +160,11 @@ impl Default for Ex2SuperBlock {
             signatrue: 0,
             state: 0,
             error_action: 0,
-            minor_revision_level: 0,
+            minor_version: 0,
             last_check_time: 0,
             check_interval: 0,
             os_id: 0,
-            revision_level: 0,
+            major_version: 0,
             def_resuid: 0,
             def_resgid: 0,
             first_ino: 0,
@@ -182,79 +184,80 @@ impl Default for Ex2SuperBlock {
         superblock
     }
 }
+impl Ex2SuperBlock {
+    pub fn read_superblock(partition: Arc<Partition>) -> Result<Ex2SuperBlock, SystemError> {
+        let mut blc_data = Vec::with_capacity(LBA_SIZE * 2);
+        blc_data.resize(LBA_SIZE * 2, 0);
 
-pub fn read_superblock(partition: Arc<Partition>) -> Result<Ex2SuperBlock, SystemError> {
-    let mut blc_data = Vec::with_capacity(LBA_SIZE * 2);
-    blc_data.resize(LBA_SIZE * 2, 0);
+        // super_block起始于volume的1024byte,并占用1024bytes
+        partition.disk().read_at(
+            (partition.lba_start + LBA_SIZE as u64 * 2) as usize,
+            2,
+            &mut blc_data,
+        )?;
+        let mut super_block = Ex2SuperBlock::default();
 
-    // super_block起始于volume的1024byte,并占用1024bytes
-    partition.disk().read_at(
-        (partition.lba_start + LBA_SIZE as u64 * 2) as usize,
-        2,
-        &mut blc_data,
-    )?;
-    let mut super_block = Ex2SuperBlock::default();
+        let mut cursor = VecCursor::new(blc_data);
 
-    let mut cursor = VecCursor::new(blc_data);
+        // 读取super_block
+        super_block.inode_count = cursor.read_u32()?;
+        super_block.block_count = cursor.read_u32()?;
+        super_block.reserved_block_count = cursor.read_u32()?;
+        super_block.free_block_count = cursor.read_u32()?;
+        super_block.free_inode_count = cursor.read_u32()?;
+        super_block.first_data_block = cursor.read_u32()?;
+        super_block.block_size = cursor.read_u32()?;
+        super_block.fragment_size = cursor.read_u32()?;
+        super_block.blocks_per_group = cursor.read_u32()?;
+        super_block.fragments_per_group = cursor.read_u32()?;
+        super_block.inodes_per_group = cursor.read_u32()?;
+        super_block.mount_time = cursor.read_u32()?;
+        super_block.write_time = cursor.read_u32()?;
 
-    // 读取super_block
-    super_block.inode_count = cursor.read_u32()?;
-    super_block.block_count = cursor.read_u32()?;
-    super_block.reserved_block_count = cursor.read_u32()?;
-    super_block.free_block_count = cursor.read_u32()?;
-    super_block.free_inode_count = cursor.read_u32()?;
-    super_block.first_data_block = cursor.read_u32()?;
-    super_block.block_size = cursor.read_u32()?;
-    super_block.fragment_size = cursor.read_u32()?;
-    super_block.blocks_per_group = cursor.read_u32()?;
-    super_block.fragments_per_group = cursor.read_u32()?;
-    super_block.inodes_per_group = cursor.read_u32()?;
-    super_block.mount_time = cursor.read_u32()?;
-    super_block.write_time = cursor.read_u32()?;
+        super_block.mount_count = cursor.read_u16()?;
+        super_block.max_mount_count = cursor.read_u16()?;
+        super_block.signatrue = cursor.read_u16()?;
+        super_block.state = cursor.read_u16()?;
+        super_block.error_action = cursor.read_u16()?;
+        super_block.minor_version = cursor.read_u16()?;
 
-    super_block.mount_count = cursor.read_u16()?;
-    super_block.max_mount_count = cursor.read_u16()?;
-    super_block.signatrue = cursor.read_u16()?;
-    super_block.state = cursor.read_u16()?;
-    super_block.error_action = cursor.read_u16()?;
-    super_block.minor_revision_level = cursor.read_u16()?;
+        super_block.last_check_time = cursor.read_u32()?;
+        super_block.check_interval = cursor.read_u32()?;
+        super_block.os_id = cursor.read_u32()?;
+        super_block.major_version = cursor.read_u32()?;
 
-    super_block.last_check_time = cursor.read_u32()?;
-    super_block.check_interval = cursor.read_u32()?;
-    super_block.os_id = cursor.read_u32()?;
-    super_block.revision_level = cursor.read_u32()?;
+        super_block.def_resuid = cursor.read_u16()?;
+        super_block.def_resgid = cursor.read_u16()?;
+        // ------extended superblock fields------
+        super_block.first_ino = cursor.read_u32()?;
+        super_block.inode_size = cursor.read_u16()?;
+        super_block.super_block_group = cursor.read_u16()?;
+        super_block.feature_compat = cursor.read_u32()?;
+        super_block.feature_incompat = cursor.read_u32()?;
+        super_block.feature_ro_compat = cursor.read_u32()?;
 
-    super_block.def_resuid = cursor.read_u16()?;
-    super_block.def_resgid = cursor.read_u16()?;
-    // ------extended superblock fields------
-    super_block.first_ino = cursor.read_u32()?;
-    super_block.inode_size = cursor.read_u16()?;
-    super_block.super_block_group = cursor.read_u16()?;
-    super_block.feature_compat = cursor.read_u32()?;
-    super_block.feature_incompat = cursor.read_u32()?;
-    super_block.feature_ro_compat = cursor.read_u32()?;
+        cursor.read_exact(&mut super_block.uuid)?;
+        cursor.read_exact(&mut super_block.volume_name)?;
+        cursor.read_exact(&mut super_block.last_mounted_path)?;
 
-    cursor.read_exact(&mut super_block.uuid)?;
-    cursor.read_exact(&mut super_block.volume_name)?;
-    cursor.read_exact(&mut super_block.last_mounted_path)?;
+        super_block.algorithm_usage_bitmap = cursor.read_u32()?;
+        super_block.prealloc_blocks = cursor.read_u8()?;
+        super_block.prealloc_dir_blocks = cursor.read_u8()?;
 
-    super_block.algorithm_usage_bitmap = cursor.read_u32()?;
-    super_block.prealloc_blocks = cursor.read_u8()?;
-    super_block.prealloc_dir_blocks = cursor.read_u8()?;
+        cursor.read_exact(&mut super_block.journal_uuid)?;
+        super_block.journal_inode = cursor.read_u32()?;
+        super_block.journal_device = cursor.read_u32()?;
+        // FIXME 不知道会不会有问题，因为是指针，有可能需要u64
+        super_block.last_orphan = cursor.read_u32()?;
 
-    cursor.read_exact(&mut super_block.journal_uuid)?;
-    super_block.journal_inode = cursor.read_u32()?;
-    super_block.journal_device = cursor.read_u32()?;
-    // FIXME 不知道会不会有问题，因为是指针，有可能需要u64
-    super_block.last_orphan = cursor.read_u32()?;
-
-    Ok(super_block)
+        Ok(super_block)
+    }
 }
 
 /// 块组描述符表(位于superblock之后)
 #[derive(Debug)]
 #[repr(C, align(1))]
-pub struct BlockGroupDescriptorTable {
+pub struct BlockGroupDescriptor {
     block_bitmap_address: u32,
     inode_bitmap_address: u32,
     inode_table_start: u32,
@@ -264,7 +267,7 @@ pub struct BlockGroupDescriptorTable {
     padding: Vec<u8>,
 }
 
-impl BlockGroupDescriptorTable {
+impl BlockGroupDescriptor {
     pub fn new() -> Self {
         Self {
             block_bitmap_address: 0,
@@ -278,10 +281,10 @@ impl BlockGroupDescriptorTable {
     }
 }
 /// 读取块组描述符表
-pub fn read_block_grp_des_table(
+pub fn read_block_grp_descriptor(
     partition: Arc<Partition>,
-) -> Result<BlockGroupDescriptorTable, SystemError> {
-    let mut grp_des_table = BlockGroupDescriptorTable::new();
+) -> Result<BlockGroupDescriptor, SystemError> {
+    let mut grp_des_table = BlockGroupDescriptor::new();
     let mut data: Vec<u8> = Vec::with_capacity(LBA_SIZE);
     data.resize(LBA_SIZE, 0);
     partition.disk().read_at(
@@ -308,24 +311,93 @@ pub struct LockedExt2Inode(SpinLock<Ext2Inode>);
 
 #[derive(Debug)]
 pub struct Ext2Inode {
-    /// 指向自身的弱引用
-    self_ref: Weak<LockedExt2Inode>,
+    /// 文件类型和权限
+    type_perm: u16,
+    /// 文件所有者
+    uid: u16,
+    /// 文件大小
+    lower_size: u32,
+    /// 文件访问时间
+    access_time: u32,
+    /// 文件创建时间
+    create_time: u32,
+    /// 文件修改时间
+    modify_time: u32,
+    /// 文件删除时间
+    delete_time: u32,
+    /// 文件组
+    gid: u16,
+    /// 文件链接数
+    hard_link_num: u16,
+    /// 文件在磁盘上的扇区
+    disk_sector: u32,
+    /// 文件属性
+    flags: u32,
+    /// 操作系统依赖
+    os_dependent_1: u32,
 
-    /// 当前inode的元数据
-    metadata: Metadata,
+    /// 目录项指针
+    direc_p_0: u32,
+    direc_p_1: u32,
+    direc_p_2: u32,
+    direc_p_3: u32,
+    direc_p_4: u32,
+    direc_p_5: u32,
+    direc_p_6: u32,
+    direc_p_7: u32,
+    direc_p_8: u32,
+    direc_p_9: u32,
+    direc_p_10: u32,
+    direc_p_11: u32,
 
-    /// TODO 一级指针 12个
-    direct_block0: Weak<LockedDataBlock>,
+    /// 单向目录项指针
+    singly_indir_p: u32,
+    /// 双向目录项指针
+    doubly_indir_p: u32,
+    /// triply indir p
+    triply_indir_p: u32,
 
-    /// TODO 二级指针 1
-    indirect_block: Weak<LockedExt2Inode>,
-    /// TODO 三级指针 1
-    three_level_block: Weak<LockedExt2Inode>,
+    /// Generation number (Primarily used for NFS)
+    generation_num: u32,
+
+    /// In Ext2 version 0, this field is reserved.
+    /// In version >= 1, Extended attribute block (File ACL).
+    file_acl: u32,
+
+    /// In Ext2 version 0, this field is reserved.
+    /// In version >= 1, Upper 32 bits of file size (if feature bit set) if it's a file,
+    /// Directory ACL if it's a directory
+    directory_acl: u32,
+
+    /// 片段地址
+    fragment_addr: u32,
+    /// 操作系统依赖
+    os_dependent_2: u32,
 }
-
 impl Ext2Inode {}
 
-impl LockedExt2Inode {}
+impl LockedExt2Inode {
+    pub fn get_block_group(inode: usize) -> usize {
+        let inodes_per_group = EXT2_SUPER_BLOCK.read().inodes_per_group;
+        return ((inode as u32 - 1) / inodes_per_group) as usize;
+    }
+
+    pub fn get_index_in_group(inode: usize) -> usize {
+        let inodes_per_group = EXT2_SUPER_BLOCK.read().inodes_per_group;
+        return ((inode as u32 - 1) % inodes_per_group) as usize;
+    }
+
+    pub fn get_block_addr(inode: usize) -> usize {
+        let super_block = EXT2_SUPER_BLOCK.read();
+        let mut inode_size = super_block.inode_size as usize;
+        let mut block_size = super_block.block_size as usize;
+
+        if super_block.major_version < 1 {
+            inode_size = 128;
+        }
+        return (inode * inode_size) / block_size;
+    }
+}
 
 impl IndexNode for LockedExt2Inode {
     fn read_at(

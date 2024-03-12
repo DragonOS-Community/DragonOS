@@ -100,6 +100,7 @@ impl CFSQueue {
         }
     }
     /// 获取运行队列的长度
+    #[allow(dead_code)]
     pub fn get_cfs_queue_size(
         queue: &SpinLockGuard<RBTree<i64, Arc<ProcessControlBlock>>>,
     ) -> usize {

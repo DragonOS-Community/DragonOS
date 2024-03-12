@@ -1,17 +1,15 @@
-/**
- * **RAMFS**
- */
 use super::vfs::{
-    FileSystem, FsInfo,
+    cache::DefaultCache, FileSystem, FsInfo,
+    syscall::ModeType, FileType, 
     core::generate_inode_id, 
-    FileType, file::{FilePrivateData, FileMode}, 
-    IndexNode, Metadata, SpecialNodeData,
-    syscall::ModeType
+    file::{FilePrivateData, FileMode}, 
+    IndexNode, Metadata, SpecialNodeData
 };
+
 use core::{
-    any::Any,
-    cmp::Ordering,
-    intrinsics::unlikely
+    cmp::Ordering, 
+    intrinsics::unlikely,
+    any::Any
 };
 
 use alloc::{
@@ -26,15 +24,16 @@ use crate::{
     driver::base::device::device_number::DeviceNumber,
     ipc::pipe::LockedPipeInode,
     time::TimeSpec,
-    libs::spinlock::SpinLock
+    libs::spinlock::SpinLock,
 };
-
 /// RamFS的inode名称的最大长度
 const RAMFS_MAX_NAMELEN: usize = 64;
 
 #[derive(Debug)]
 pub struct RamFS {
     root: Arc<LockedEntry>,
+    // To Add Cache
+    cache: Arc<DefaultCache>,
 }
 
 impl RamFS {
@@ -51,7 +50,10 @@ impl RamFS {
             fs: Weak::new(),
             special_node: None,
         })));
-        let ret = Arc::new(RamFS{ root });
+        let ret = Arc::new(RamFS{ 
+            root, 
+            cache: Arc::new(DefaultCache::new(None)),
+        });
 {
         let mut entry = ret.root.0.lock();
         entry.parent = Arc::downgrade(&ret.root);
@@ -61,7 +63,6 @@ impl RamFS {
         ret
     }
 }
-
 
 impl FileSystem for RamFS {
     fn root_inode(&self) -> Arc<dyn super::vfs::IndexNode> {
@@ -100,15 +101,14 @@ impl Keyer {
             return self.1.clone();
         }
         Some(self.0.upgrade()?.0.lock().name.clone())
-    }
+    }   
 }
 
 // For Btree insertion
 impl PartialEq for Keyer {
     fn eq(&self, other: &Self) -> bool {
-        kinfo!("Call Keyer::eq");
         if self.0.ptr_eq(&other.0) {
-            kinfo!("Compare itself!");
+            kdebug!("Compare itself!");
             return true;
         }
         if self.1.is_none() && other.1.is_none() {
@@ -149,14 +149,52 @@ impl PartialEq for Keyer {
 
 impl Eq for Keyer {}
 
+// Uncheck Stable
 impl PartialOrd for Keyer {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+        if self.0.ptr_eq(&other.0) { 
+            kdebug!("Compare itself!");
+            return Some(Ordering::Equal);
+        }
+        if self.1.is_none() && other.1.is_none() {
+            // cmp between wrapper
+            let opt1 = self.0.upgrade();
+            let opt2 = other.0.upgrade();
+            if opt1.is_none() && opt2.is_none() {
+                kerror!("Empty Both none!");
+                panic!("All Keys None, compare error!");
+            }
+            if opt1.is_some() && opt2.is_some() {
+                return Some(opt1.unwrap().0.lock().name.cmp(&opt2.unwrap().0.lock().name));
+            } else {
+                kwarn!("depecated");
+                panic!("Empty Key!");
+            }
+        } else {
+            if self.1.is_none() {
+                let opt = self.0.upgrade();
+                if opt.is_none() {
+                    kwarn!("depecated");
+                    panic!("Empty Key!");
+                }
+                return Some(opt.unwrap().0.lock().name.cmp(other.1.as_ref().unwrap()));
+
+            } else {
+                let opt = other.0.upgrade();
+                if opt.is_none() {
+                    kwarn!("depecated");
+                    panic!("Empty Key!");
+                }
+
+                return Some(opt.unwrap().0.lock().name.cmp(self.1.as_ref().unwrap()));
+            }
+        }
     }
 }
 
-impl Keyer {
-    fn _cmp(&self, other: &Self) -> Ordering {
+impl Ord for Keyer {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // let mut ret: Ordering = Ordering::Equal;
         if self.0.ptr_eq(&other.0) {
             kdebug!("Compare itself!");
             return Ordering::Equal;
@@ -170,52 +208,37 @@ impl Keyer {
                 panic!("All Keys None, compare error!");
             }
             if opt1.is_some() && opt2.is_some() {
-                return opt1
-                            .unwrap().0
-                            .lock()
-                            .name
-                            .cmp(
-                                &opt2
-                                    .unwrap().0
-                                    .lock()
-                                    .name
-                            );
+                return opt1.unwrap().0.lock().name.cmp(&opt2.unwrap().0.lock().name);
+            } else {
+                kwarn!("depecated");
+                panic!("Empty Key!");
             }
         } else {
             if self.1.is_none() {
-                return self.0
-                            .upgrade()
-                            .unwrap().0
-                            .lock()
-                            .name
-                            .cmp( 
-                                other.1
-                                    .as_ref()
-                                    .unwrap()
-                            );
+                let opt = self.0.upgrade();
+                if opt.is_none() {
+                    kwarn!("depecated");
+                    panic!("Empty Key!");
+                }
+                return opt.unwrap().0.lock().name.cmp(other.1.as_ref().unwrap());
+
             } else {
-                return self.1
-                            .as_ref()
-                            .unwrap()
-                            .cmp( 
-                                &other.0
-                                    .upgrade()
-                                    .unwrap().0
-                                    .lock()
-                                    .name
-                            );
+                let opt = other.0.upgrade();
+                if opt.is_none() {
+                    kwarn!("depecated");
+                    panic!("Empty Key!");
+                }
+
+                return self.1.as_ref().unwrap().cmp(&opt.unwrap().0.lock().name);
             }
         }
-        kwarn!("depecated");
-        panic!("Empty Key!");
-    }
-}
-
-impl Ord for Keyer {
-    fn cmp(&self, other: &Self) -> Ordering {
-        let ret = self._cmp(other);
-        kdebug!("Cmp {} and {} with result: {:?}\0", self.get().unwrap_or(String::from("fail")), other.get().unwrap_or(String::from("fail")), ret);
-        ret
+        // let destring = match ret {
+        //     Ordering::Equal => "Equal",
+        //     Ordering::Less => "Less",
+        //     Ordering::Greater => "Greater",
+        // };
+        // // kdebug!("Ord::Cmp {} and {} with result: {}\0", self.get().unwrap_or(String::from("fail")), other.get().unwrap_or(String::from("fail")), destring);
+        // ret
     }
 }
 
@@ -446,7 +469,6 @@ impl IndexNode for LockedEntry {
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> 
     {
-        kinfo!("Call Ramfs::create_with_data");
         // 获取当前inode
         let mut entry = self.0.lock();
 {
@@ -485,7 +507,6 @@ impl IndexNode for LockedEntry {
     /// Not Stable, waiting for improvement
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> 
     {
-        kinfo!("Call Ramfs::link");
         let other: &LockedEntry = other
             .downcast_ref::<LockedEntry>()
             .ok_or(SystemError::EPERM)?;
@@ -615,7 +636,6 @@ impl IndexNode for LockedEntry {
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> 
     {
-        kinfo!("Call Ramfs::find");
         let entry = self.0.lock();
         let inode = entry.inode.0.lock();
 
@@ -633,7 +653,6 @@ impl IndexNode for LockedEntry {
             }
             name => {
                 // 在子目录项中查找
-                kinfo!("...Find in children directory.");
                 Ok(entry.children.get(&Keyer::from_str(name)).ok_or(SystemError::ENOENT)?.clone())
             }
         }
@@ -675,7 +694,7 @@ impl IndexNode for LockedEntry {
 
     fn list(&self) -> Result<Vec<String>, SystemError> 
     {
-        kinfo!("Call Ramfs::list");
+        // kinfo!("Call Ramfs::list");
         let info = self.metadata()?;
         if info.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
@@ -748,4 +767,23 @@ impl IndexNode for LockedEntry {
         self.0.lock().special_node.clone()
     }
 
+    fn key(&self) -> Result<String, SystemError> {
+        Ok(self.0.lock().name.clone())
+    }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        match self.0.lock().parent.upgrade() {
+            Some(pptr) => Ok(pptr.clone()),
+            None => Err(SystemError::ENOENT),
+        }
+    }
+
+    fn cache(&self) -> Result<Arc<DefaultCache>, SystemError> {
+        kdebug!("call ramfs cache");
+        Ok(self.0.lock().fs.upgrade().unwrap().cache.clone())
+    }
+
+    fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Ok(self.0.lock().self_ref.upgrade().ok_or(SystemError::ENOENT)?)
+    }
 }

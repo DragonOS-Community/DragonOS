@@ -333,7 +333,7 @@ impl IndexNode for MountFSInode {
 
     /// @brief 在当前inode下，挂载一个文件系统
     ///
-    /// @return Ok(Arc<MountFS>) 挂载成功，返回指向MountFS的指针
+    /// @return Ok(Arc<MountFS>) 挂载成功，返 回指向MountFS的指针
     fn mount(&self, fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, SystemError> {
         let metadata = self.inner_inode.metadata()?;
         if metadata.file_type != FileType::Dir {

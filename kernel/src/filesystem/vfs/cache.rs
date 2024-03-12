@@ -1,5 +1,5 @@
 use alloc::{collections::{LinkedList, VecDeque}, sync::{Arc, Weak}, vec::Vec};
-use core::{hash::{Hash, Hasher, SipHasher}, marker::PhantomData, mem::size_of};
+use core::{hash::{Hash, Hasher, SipHasher}, marker::PhantomData, mem::size_of, sync::atomic::{AtomicUsize, Ordering}};
 
 use crate::libs::{rwlock::{RwLock, RwLockUpgradableGuard}, spinlock::SpinLock};
 
@@ -8,6 +8,7 @@ type Resource = Weak<dyn IndexNode>;
 type SrcPtr = Weak<Resource>;
 type SrcManage = Arc<Resource>;
 
+// not thread safe
 pub struct SrcIter<'a> {
     idx: usize,
     vec: Option<RwLockUpgradableGuard<'a, VecDeque<SrcPtr>>>,
@@ -30,12 +31,12 @@ impl<'a> Iterator for SrcIter<'a> {
             vec_cur = writer.downgrade_to_upgradeable();
         }
         self.idx += 1;
-        let ret = vec_cur[self.idx - 1].upgrade().unwrap().upgrade();
+        let result = vec_cur[self.idx - 1].upgrade().unwrap().upgrade();
         self.vec = Some(vec_cur);
-        ret
+        result
     }
 }
-
+#[derive(Debug)]
 struct HashTable<H: Hasher + Default> {
     _hash_type: PhantomData<H>,
     table: Vec<RwLock<VecDeque<SrcPtr>>>,
@@ -62,12 +63,13 @@ impl<H: Hasher + Default> HashTable<H> {
         }
     }
     /// 插入索引
-    fn put(&mut self, key: &str, src: SrcPtr) {
+    fn put(&self, key: &str, src: SrcPtr) {
         let mut guard = self.table[self._position(key)].write();
         guard.push_back(src);
     }
 }
 
+#[derive(Debug)]
 struct LruList {
     list: LinkedList<SrcManage>,
 }
@@ -118,6 +120,7 @@ impl LruList {
 
 /// Directory Cache 的默认实现
 /// Todo: 使用自定义优化哈希函数
+#[derive(Debug)]
 pub struct DefaultCache<H: Hasher + Default = SipHasher> {
     /// hash index
     table: HashTable<H>,
@@ -125,8 +128,8 @@ pub struct DefaultCache<H: Hasher + Default = SipHasher> {
     deque: SpinLock<LruList>,
     // /// resource release
     // source: SpinLock<CacheManager>,
-
-    max_size: usize,
+    max_size: AtomicUsize,
+    size: AtomicUsize,
 }
 
 impl<H: Hasher + Default> DefaultCache<H> {
@@ -139,13 +142,19 @@ impl<H: Hasher + Default> DefaultCache<H> {
             table: HashTable::new(hash_table_size),
             deque: SpinLock::new(LruList::new()),
             // source: SpinLock::new(CacheManager::new()),
-            max_size,
+            max_size: AtomicUsize::new(max_size),
+            size: AtomicUsize::new(0),
         }
     }
 
     /// 缓存目录项
-    pub fn put(&mut self, key: &str, src: Resource) {
+    pub fn put(&self, key: &str, src: Resource) {
+        kdebug!("Cache with key {}.", key);
         self.table.put(key, self.deque.lock().push(src));
+        self.size.fetch_add(1, Ordering::Acquire);
+        if self.size.load(Ordering::Acquire) >= self.max_size.load(Ordering::Acquire) {
+            self.clean();
+        }
     }
 
     /// 获取哈希桶迭代器
@@ -154,13 +163,19 @@ impl<H: Hasher + Default> DefaultCache<H> {
     }
 
     /// 清除已被删除的目录项
-    pub fn clean(&mut self) -> usize {
-        self.deque.lock().clean()
+    pub fn clean(&self) -> usize {
+        let ret = self.deque.lock().clean();
+        self.size.fetch_sub(ret, Ordering::Acquire);
+        kdebug!("Clean {} empty entry", ret);
+        ret
     }
 
     /// 释放未在使用的目录项与清除已删除的目录项
-    pub fn release(&mut self) -> usize {
-        self.deque.lock().release()
+    pub fn release(&self) -> usize {
+        let ret = self.deque.lock().release();
+        self.size.fetch_sub(ret, Ordering::Acquire);
+        kdebug!("Release {} empty entry", ret);
+        ret
     }
 
 }

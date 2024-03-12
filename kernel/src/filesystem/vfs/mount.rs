@@ -370,6 +370,11 @@ impl IndexNode for MountFSInode {
     fn special_node(&self) -> Option<super::SpecialNodeData> {
         self.inner_inode.special_node()
     }
+
+    #[inline]
+    fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
+        self.inner_inode.poll(private_data)
+    }
 }
 
 impl FileSystem for MountFS {

@@ -1,21 +1,36 @@
-use core::{any::Any, fmt::Debug};
+use core::{any::Any, fmt::Debug, intrinsics::unlikely};
 
 use alloc::{
+    string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
 use system_error::SystemError;
 
 use crate::{
-    libs::{cpumask::CpuMask, spinlock::SpinLock},
+    exception::{
+        dummychip::no_irq_chip,
+        handle::{bad_irq_handler, mask_ack_irq},
+        irqdata::IrqStatus,
+        irqdesc::irq_desc_manager,
+        manage::irq_manager,
+    },
+    libs::{
+        cpumask::CpuMask,
+        once::Once,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
     mm::VirtAddr,
+    smp::cpu::ProcessorId,
 };
 
 use super::{
-    irqdata::{IrqData, IrqLineStatus},
+    irqdata::{IrqData, IrqHandlerData, IrqLineStatus},
+    irqdesc::{InnerIrqDesc, IrqAction, IrqDesc, IrqFlowHandler, IrqHandler, IrqReturn},
     irqdomain::IrqDomain,
     manage::IrqManager,
     msi::MsiMsg,
+    IrqNumber,
 };
 
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irq.h#506
@@ -48,7 +63,7 @@ pub trait IrqChip: Sync + Send + Any + Debug {
     ///
     /// 用于屏蔽中断
     ///
-    /// 如果返回ENOSYS，则表明irq_mask()不支持.
+    /// 如果返回ENOSYS，则表明irq_mask()不支持. 那么中断机制代码将调用irq_disable()。
     ///
     /// 如果返回错误，那么中断的屏蔽状态将不会改变。
     fn irq_mask(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
@@ -366,5 +381,204 @@ impl IrqManager {
         }
 
         return Ok(());
+    }
+
+    pub(super) fn __irq_set_handler(
+        &self,
+        irq: IrqNumber,
+        handler: &'static dyn IrqFlowHandler,
+        is_chained: bool,
+        name: Option<String>,
+    ) {
+        let r = irq_desc_manager().lookup_and_lock_bus(irq, false, false);
+        if r.is_none() {
+            return;
+        }
+
+        let irq_desc = r.unwrap();
+
+        let mut desc_inner = irq_desc.inner();
+        self.__irq_do_set_handler(&irq_desc, &mut desc_inner, Some(handler), is_chained, name);
+
+        drop(desc_inner);
+        irq_desc.chip_bus_sync_unlock();
+    }
+
+    fn __irq_do_set_handler(
+        &self,
+        desc: &Arc<IrqDesc>,
+        desc_inner: &mut SpinLockGuard<'_, InnerIrqDesc>,
+        mut handler: Option<&'static dyn IrqFlowHandler>,
+        is_chained: bool,
+        name: Option<String>,
+    ) {
+        if handler.is_none() {
+            handler = Some(bad_irq_handler());
+        } else {
+            let mut irq_data = Some(desc_inner.irq_data().clone());
+
+            /*
+             * 在具有中断域继承的domain中，我们可能会遇到这样的情况，
+             * 最外层的芯片还没有设置好，但是内部的芯片已经存在了。
+             * 我们选择安装处理程序，而不是退出，
+             * 但显然我们此时无法启用/启动中断。
+             */
+            while irq_data.is_some() {
+                let dt = irq_data.as_ref().unwrap().clone();
+
+                let chip_info = dt.chip_info_read_irqsave();
+
+                if !Arc::ptr_eq(&chip_info.chip(), &no_irq_chip()) {
+                    break;
+                }
+
+                /*
+                 * 如果最外层的芯片没有设置好，并且预期立即开始中断，
+                 * 则放弃。
+                 */
+                if unlikely(is_chained) {
+                    kwarn!(
+                        "Chained handler for irq {} is not supported",
+                        dt.irq().data()
+                    );
+                    return;
+                }
+
+                //  try the parent
+                let parent_data = dt.parent_data().map(|p| p.upgrade()).flatten();
+
+                irq_data = parent_data;
+            }
+
+            if unlikely(
+                irq_data.is_none()
+                    || Arc::ptr_eq(
+                        &irq_data.as_ref().unwrap().chip_info_read_irqsave().chip(),
+                        &no_irq_chip(),
+                    ),
+            ) {
+                kwarn!("No irq chip for irq {}", desc_inner.irq_data().irq().data());
+                return;
+            }
+        }
+        let handler = handler.unwrap();
+        if core::ptr::eq(handler, bad_irq_handler()) {
+            if Arc::ptr_eq(
+                &desc_inner.irq_data().chip_info_read_irqsave().chip(),
+                &no_irq_chip(),
+            ) {
+                let irq_data = desc_inner.irq_data();
+                mask_ack_irq(irq_data);
+
+                irq_data.irqd_set(IrqStatus::IRQD_IRQ_DISABLED);
+
+                if is_chained {
+                    desc_inner.clear_actions();
+                }
+                desc_inner.set_depth(1);
+            }
+        }
+        let chip = desc_inner.irq_data().chip_info_read_irqsave().chip();
+        desc.set_handler_no_lock_inner(handler, desc_inner.irq_data(), &chip);
+        desc_inner.set_name(name);
+
+        if !core::ptr::eq(handler, bad_irq_handler()) && is_chained {
+            let trigger_type = desc_inner.common_data().trigger_type();
+
+            /*
+             * 我们即将立即启动这个中断，
+             * 因此需要设置触发配置。
+             * 但是 .irq_set_type 回调可能已经覆盖了
+             * irqflowhandler，忽略了我们正在处理的
+             * 是一个链式中断。立即重置它，因为我们
+             * 确实知道更好的处理方式。
+             */
+
+            if trigger_type != IrqLineStatus::IRQ_TYPE_NONE {
+                irq_manager()
+                    .do_set_irq_trigger(desc.clone(), desc_inner, trigger_type)
+                    .ok();
+                desc.set_handler(handler);
+            }
+
+            desc_inner.set_noprobe();
+            desc_inner.set_norequest();
+            desc_inner.set_nothread();
+
+            desc_inner.clear_actions();
+            desc_inner.add_action(chained_action());
+
+            irq_manager()
+                .irq_activate_and_startup(desc, desc_inner, IrqManager::IRQ_RESEND)
+                .ok();
+        }
+
+        return;
+    }
+
+    pub fn irq_set_handler_data(
+        &self,
+        irq: IrqNumber,
+        data: Option<Arc<dyn IrqHandlerData>>,
+    ) -> Result<(), SystemError> {
+        let desc = irq_desc_manager().lookup(irq).ok_or(SystemError::EINVAL)?;
+        desc.inner().common_data().inner().set_handler_data(data);
+
+        return Ok(());
+    }
+
+    pub fn irq_percpu_disable(
+        &self,
+        desc: &Arc<IrqDesc>,
+        irq_data: &Arc<IrqData>,
+        irq_chip: &Arc<dyn IrqChip>,
+        cpu: ProcessorId,
+    ) {
+        if let Err(e) = irq_chip.irq_mask(irq_data) {
+            if e == SystemError::ENOSYS {
+                irq_chip.irq_disable(irq_data);
+            }
+        }
+
+        desc.inner()
+            .percpu_enabled_mut()
+            .as_mut()
+            .unwrap()
+            .set(cpu, false);
+    }
+}
+
+lazy_static! {
+    pub(super) static ref CHAINED_ACTION: Arc<IrqAction> = IrqAction::new(
+        IrqNumber::new(0),
+        "".to_string(),
+        Some(&ChainedActionHandler),
+        None,
+    );
+}
+
+#[allow(dead_code)]
+pub(super) fn chained_action() -> Arc<IrqAction> {
+    CHAINED_ACTION.clone()
+}
+
+/// Chained handlers 永远不应该在它们的IRQ上调用irqaction。如果发生这种情况，
+/// 这个默认irqaction将发出警告。
+#[derive(Debug)]
+struct ChainedActionHandler;
+
+impl IrqHandler for ChainedActionHandler {
+    fn handle(
+        &self,
+        irq: IrqNumber,
+        _static_data: Option<&dyn IrqHandlerData>,
+        _dynamic_data: Option<Arc<dyn IrqHandlerData>>,
+    ) -> Result<IrqReturn, SystemError> {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            kwarn!("Chained irq {} should not call an action.", irq.data());
+        });
+
+        Ok(IrqReturn::NotHandled)
     }
 }

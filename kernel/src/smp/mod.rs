@@ -5,7 +5,10 @@ use crate::{
     exception::ipi::{IpiKind, IpiTarget},
 };
 
-use self::cpu::ProcessorId;
+use self::{
+    core::smp_get_processor_id,
+    cpu::{smp_cpu_manager_init, ProcessorId},
+};
 
 pub mod c_adapter;
 pub mod core;
@@ -28,4 +31,12 @@ pub trait SMPArch {
     ///
     /// 该函数需要标记为 `#[inline(never)]`
     fn init() -> Result<(), SystemError>;
+}
+
+/// 早期SMP初始化
+#[inline(never)]
+pub fn early_smp_init() -> Result<(), SystemError> {
+    smp_cpu_manager_init(smp_get_processor_id());
+
+    return Ok(());
 }

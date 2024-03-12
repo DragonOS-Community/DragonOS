@@ -576,7 +576,14 @@ impl Syscall {
         }
     }
 
-   
+    pub fn rmdir(pathname: *const u8) -> Result<usize, SystemError> {
+        let pathname: String = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?;
+        if pathname.len() >= MAX_PATHLEN {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+        let pathname = pathname.as_str().trim();
+        return do_remove_dir(AtFlags::AT_FDCWD.bits(), pathname).map(|v| v as usize);
+    }
 
     pub fn unlink(pathname: *const u8) -> Result<usize, SystemError> {
         if pathname.is_null() {

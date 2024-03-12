@@ -30,8 +30,9 @@ use crate::{
     init::initcall::INITCALL_DEVICE,
     libs::rwlock::RwLock,
     mm::VirtAddr,
+    net::event_poll::{EPollItem, EventPoll},
     process::ProcessManager,
-    syscall::user_access::UserBufferWriter,
+    syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
 use super::{
@@ -131,7 +132,7 @@ impl IndexNode for TtyDevice {
                 && driver.tty_driver_sub_type() == TtyDriverSubType::PtyMaster))
         {
             let pcb = ProcessManager::current_pcb();
-            let pcb_tty = pcb.sig_info().tty();
+            let pcb_tty = pcb.sig_info_irqsave().tty();
             if pcb_tty.is_none() && tty.core().contorl_info_irqsave().session.is_none() {
                 TtyJobCtrlManager::proc_set_tty(tty);
             }
@@ -210,7 +211,7 @@ impl IndexNode for TtyDevice {
 
             // 将数据从buf拷贝到writebuf
 
-            let ret = ld.write(tty.clone(), buf, size, mode)?;
+            let ret = ld.write(tty.clone(), &buf[written..], size, mode)?;
 
             written += ret;
             count -= ret;
@@ -219,7 +220,7 @@ impl IndexNode for TtyDevice {
                 break;
             }
 
-            if pcb.sig_info().sig_pending().has_pending() {
+            if pcb.sig_info_irqsave().sig_pending().has_pending() {
                 return Err(SystemError::ERESTARTSYS);
             }
         }
@@ -273,6 +274,20 @@ impl IndexNode for TtyDevice {
                     todo!()
                 }
             }
+            EventPoll::ADD_EPOLLITEM => {
+                let _ = UserBufferReader::new(
+                    arg as *const Arc<EPollItem>,
+                    core::mem::size_of::<Arc<EPollItem>>(),
+                    false,
+                )?;
+                let epitem = unsafe { &*(arg as *const Arc<EPollItem>) };
+
+                let core = tty.core();
+
+                core.add_epitem(epitem.clone());
+
+                return Ok(0);
+            }
             _ => {}
         }
 
@@ -318,6 +333,16 @@ impl IndexNode for TtyDevice {
         tty.ldisc().ioctl(tty, cmd, arg)?;
 
         Ok(0)
+    }
+
+    fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
+        let (tty, _) = if let FilePrivateData::Tty(tty_priv) = private_data {
+            (tty_priv.tty.clone(), tty_priv.mode)
+        } else {
+            return Err(SystemError::EIO);
+        };
+
+        tty.ldisc().poll(tty)
     }
 }
 

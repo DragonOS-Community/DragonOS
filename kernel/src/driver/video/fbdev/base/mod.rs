@@ -1,14 +1,17 @@
+
+
 use alloc::{string::String, sync::Arc, vec::Vec};
+use elf::endian::{BigEndian, LittleEndian};
 use system_error::SystemError;
 
 use crate::{
-    driver::{base::device::Device, tty::virtual_terminal::Color},
+    driver::{base::device::Device, serial::serial8250::send_to_default_serial8250_port, tty::virtual_terminal::Color},
     init::boot_params,
     libs::rwlock::RwLock,
     mm::{ucontext::LockedVMA, PhysAddr, VirtAddr},
 };
 
-use self::fbmem::{FbDevice, FrameBufferManager};
+use self::{fbmem::{FbDevice, FrameBufferManager}, render_helper::{BitItor, EndianPattern}};
 
 const COLOR_TABLE_8: &'static [u32] = &[
     0x00000000, 0xff000000, 0x00ff0000, 0xffff0000, 0x0000ff00, 0xff00ff00, 0x00ffff00, 0xffffff00,
@@ -23,7 +26,7 @@ pub mod fbcon;
 pub mod fbmem;
 pub mod fbsysfs;
 pub mod modedb;
-
+pub mod render_helper;
 // 帧缓冲区id
 int_like!(FbId, u32);
 
@@ -64,11 +67,13 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         let y = image.y;
         let byte_per_pixel = core::mem::size_of::<u32>() as u32;
         let bit_per_pixel = self.current_fb_var().bits_per_pixel;
-
+        
         // 计算图像在帧缓冲中的起始位
         let mut bitstart = (y * self.current_fb_fix().line_length * 8) + (x * bit_per_pixel);
         let start_index = bitstart & (32 - 1);
         let pitch_index = (self.current_fb_fix().line_length & (byte_per_pixel - 1)) * 8;
+        // let pitch_index = (self.current_fb_fix().line_length & (byte_per_pixel - 1)) * 8;
+        // kdebug!("image:{:?};{:?};{:?}",bitstart,start_index,pitch_index);
         // 位转字节
         bitstart /= 8;
 
@@ -105,7 +110,8 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                 && bit_per_pixel >= 8
                 && bit_per_pixel <= 32
             {
-                unsafe { self.fast_imageblit(image, dst1, fg, bg) }
+                self.slow_imageblit(image, dst1, fg, bg, bitstart/4, self.current_fb_fix().line_length)
+                // unsafe { self.fast_imageblit(image, dst1, fg, bg) }
             } else {
                 self.slow_imageblit(image, dst1, fg, bg, start_index, pitch_index)
             }
@@ -239,6 +245,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         }
     }
 
+
     fn slow_imageblit(
         &self,
         _image: &FbImage,
@@ -248,7 +255,32 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         _start_index: u32,
         _pitch_index: u32,
     ) {
-        todo!();
+        // let test:Vec<u8>=vec![0b10101010,0b00001111,0b11110000];
+        
+        // kdebug!("dst1:{:?},start:{},pitch:{}",_dst1,_start_index,_pitch_index);
+        let mut dst =unsafe{ _dst1.as_ptr::<u32>()};
+        let mut line_length=0;
+        let mut count=0;
+        // let mut ans=vec![];
+        let iter=BitItor::new(0x00ffffff, 0x00000000,EndianPattern::LittleEndian, EndianPattern::LittleEndian, self.current_fb_var().bits_per_pixel/8, _image.data.iter());
+        // let iter=BitItor::new(0x00ffffff, 0x00000000,EndianPattern::LittleEndian, EndianPattern::LittleEndian, self.current_fb_var().bits_per_pixel/8, test.iter());
+        for i in iter{
+            // ans.push(i);
+            unsafe{
+                *dst=i;
+                dst=dst.add(1);
+            }
+            line_length+=1;
+            if line_length>=_image.width{
+                count+=1;
+                line_length=0;
+                dst=unsafe{_dst1.as_ptr::<u32>().add((1600*count) as usize)};
+                // dst=unsafe{dst.add((400) as usize)};
+            }
+
+        }
+        // send_to_default_serial8250_port(format!("{:?}\n\0",ans).as_bytes());
+        // panic!()
         // let bpp = self.current_fb_var().bits_per_pixel;
         // let pitch = self.current_fb_fix().line_length;
         // let null_bits = 32 - bpp;

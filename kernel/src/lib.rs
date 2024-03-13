@@ -137,10 +137,14 @@ pub fn panic(info: &PanicInfo) -> ! {
             for frame in bt.frames {
                 lookup_kallsyms(frame as u64, level);
                 level += 1;
+                if  level==2{
+                    break;
+                }
             }
         };
     }
 
-    println!("Current PCB:\n\t{:?}", *(ProcessManager::current_pcb()));
+    println!("Current PCB:\n\t{:?}", (ProcessManager::current_pcb().pid()));
+    println!("info:{:?}\n",info);
     ProcessManager::exit(usize::MAX);
 }

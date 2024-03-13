@@ -2,11 +2,11 @@
 
 use core::slice::Iter;
 
-pub struct BitItor<'a>{
+pub struct BitIter<'a>{
     fgcolor:u32,
     bkcolor:u32,
-    color_pattern:EndianPattern,
-    dst_pattern:EndianPattern,
+    _color_pattern:EndianPattern,
+    _dst_pattern:EndianPattern,
     src:Iter<'a,u8>,
     read_mask:u8,
     byte_per_pixel:u32,
@@ -14,10 +14,12 @@ pub struct BitItor<'a>{
     current:u8,
     left_byte:u32,
     done:bool,
+    consumed_bit:u32,
+    image_width:u32,
 }
 
-impl<'a> BitItor<'a>{
-    pub fn new(fgcolor:u32,bkcolor:u32,dst_pattern:EndianPattern,color_pattern:EndianPattern,byte_per_pixel:u32,src:Iter<'a,u8>)->Self{
+impl<'a> BitIter<'a>{
+    pub fn new(fgcolor:u32,bkcolor:u32,dst_pattern:EndianPattern,color_pattern:EndianPattern,byte_per_pixel:u32,src:Iter<'a,u8>,image_width:u32)->Self{
         let mut fgcolor=fgcolor;
         let mut bkcolor=bkcolor;
         if dst_pattern!=color_pattern{
@@ -28,8 +30,8 @@ impl<'a> BitItor<'a>{
         let mut ans=Self{
             fgcolor,
             bkcolor,
-            color_pattern,
-            dst_pattern,
+            _color_pattern: color_pattern,
+            _dst_pattern: dst_pattern,
             src:src,
             read_mask:0b10000000,
             byte_per_pixel,
@@ -37,6 +39,8 @@ impl<'a> BitItor<'a>{
             current:0,
             left_byte:0,
             done:false,
+            consumed_bit:0,
+            image_width,
         };
         ans.current=ans.src.next().unwrap().clone();
         return ans;
@@ -57,6 +61,7 @@ impl<'a> BitItor<'a>{
     }
 
     fn move_mask(&mut self)->bool{
+        self.consumed_bit+=1;
         self.read_mask>>=1;
         if self.read_mask==0b000000000{
             self.read_mask=0b10000000;
@@ -76,35 +81,33 @@ impl<'a> BitItor<'a>{
         }
     }
 
-    fn full_buffer(&mut self)->Result<u32,u32>{
+    fn full_buffer(&mut self)->Result<PixelLineStatus,PixelLineStatus>{
         let mut color=self.read_bit();
         let mut buffer_pointer=0;
         let mask=0x000000ff;
         let mut temp=0;
         while buffer_pointer<4{
-            temp=(color&(mask<<self.left_byte*8));
-            // temp<<=(buffer_pointer-self.left_byte) as u32;
-            
-            if buffer_pointer>self.left_byte{
-                temp<<=(buffer_pointer-self.left_byte)*8
-            }else{
-                temp>>=(self.left_byte-buffer_pointer)*8
+            if self.consumed_bit>=self.image_width{
+                return Ok(PixelLineStatus::Full(self.buffer))
             }
-            
+            temp=color&mask;
+            color>>=8;
             self.buffer|=temp;
-            // println!("temp1:{}",self.buffer);
+            if buffer_pointer!=3{
+                self.buffer<<=8;
+            }
             buffer_pointer+=1;
             self.left_byte+=1;
             // println!("{},{}",buffer_pointer,self.left_byte);
             if self.left_byte>=self.byte_per_pixel{
                 self.left_byte=0;
                 if !self.move_mask(){
-                    return Err(self.buffer);
+                    return Err(PixelLineStatus::Full(self.buffer));
                 }
                 color=self.read_bit();
             }
         }
-        return Ok(self.buffer);
+        return Ok(PixelLineStatus::NotFull(self.buffer));
     }
 
     // fn write_buffer(index:u32,dst:&mut u32,src:&u32){
@@ -123,20 +126,22 @@ impl<'a> BitItor<'a>{
     }
 }
 
-impl Iterator for BitItor<'_>{
-    type Item = u32;
+impl Iterator for BitIter<'_>{
+    type Item = (u32,bool);
     fn next(&mut self) -> Option<Self::Item> {
+        let consumed_bit=self.consumed_bit;
+        self.consumed_bit=0;
         if self.done{
             return None;
         }
         match self.full_buffer(){
             Ok(x)=>{
                 self.buffer=0;
-                return Some(x);
+                return Some(x.unwarp());
             },
             Err(x)=>{
                 self.done=true;
-                return Some(x);
+                return Some(x.unwarp());
             }
         }
         
@@ -144,6 +149,20 @@ impl Iterator for BitItor<'_>{
 }
 #[derive(PartialEq, PartialOrd)]
 pub enum EndianPattern{
-    BigEndian,
+    _BigEndian,
     LittleEndian,
+}
+
+pub enum PixelLineStatus{
+    Full(u32),
+    NotFull(u32),
+}
+
+impl PixelLineStatus{
+    pub fn unwarp(self)->(u32,bool){
+        match self{
+            PixelLineStatus::Full(x)=>(x,true),
+            PixelLineStatus::NotFull(x)=>(x,false)
+        }
+    }
 }

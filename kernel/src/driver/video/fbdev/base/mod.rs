@@ -11,7 +11,7 @@ use crate::{
     mm::{ucontext::LockedVMA, PhysAddr, VirtAddr},
 };
 
-use self::{fbmem::{FbDevice, FrameBufferManager}, render_helper::{BitItor, EndianPattern}};
+use self::{fbmem::{FbDevice, FrameBufferManager}, render_helper::{BitIter, EndianPattern}};
 
 const COLOR_TABLE_8: &'static [u32] = &[
     0x00000000, 0xff000000, 0x00ff0000, 0xffff0000, 0x0000ff00, 0xff00ff00, 0x00ffff00, 0xffffff00,
@@ -262,19 +262,18 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         let mut line_length=0;
         let mut count=0;
         // let mut ans=vec![];
-        let iter=BitItor::new(0x00ffffff, 0x00000000,EndianPattern::LittleEndian, EndianPattern::LittleEndian, self.current_fb_var().bits_per_pixel/8, _image.data.iter());
-        // let iter=BitItor::new(0x00ffffff, 0x00000000,EndianPattern::LittleEndian, EndianPattern::LittleEndian, self.current_fb_var().bits_per_pixel/8, test.iter());
-        for i in iter{
+        let iter=BitIter::new(_fg, _bg,EndianPattern::LittleEndian, EndianPattern::LittleEndian, self.current_fb_var().bits_per_pixel/8, _image.data.iter(),_image.width);
+        // let iter=BiteIter::new(0x00ffffff, 0x00000000,EndianPattern::LittleEndian, EndianPattern::LittleEndian, self.current_fb_var().bits_per_pixel/8, test.iter());
+        for (content,full) in iter{
             // ans.push(i);
             unsafe{
-                *dst=i;
+                *dst=content;
                 dst=dst.add(1);
             }
-            line_length+=1;
-            if line_length>=_image.width{
+            if full{
                 count+=1;
-                line_length=0;
-                dst=unsafe{_dst1.as_ptr::<u32>().add((1600*count) as usize)};
+                // dst=unsafe{_dst1.as_ptr::<u32>().add((640*count/2) as usize)};
+                dst=unsafe{_dst1.as_ptr::<u32>().add((_pitch_index*count/(self.current_fb_var().bits_per_pixel/8)) as usize)};
                 // dst=unsafe{dst.add((400) as usize)};
             }
 

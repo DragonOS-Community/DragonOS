@@ -280,11 +280,7 @@ impl VirtAddr {
     /// @brief 判断虚拟地址是否在用户空间
     #[inline(always)]
     pub fn check_user(&self) -> bool {
-        if self < &MMArch::USER_END_VADDR {
-            return true;
-        } else {
-            return false;
-        }
+        return self < &MMArch::USER_END_VADDR;
     }
 
     #[inline(always)]
@@ -720,7 +716,7 @@ impl VirtRegion {
 
 impl PartialOrd for VirtRegion {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        return self.start.partial_cmp(&other.start);
+        Some(self.cmp(other))
     }
 }
 

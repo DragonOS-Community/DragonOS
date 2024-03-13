@@ -24,7 +24,7 @@ pub enum FcntlCommand {
     /// set record locking info (blocking)
     SetLockWait = 7,
 
-    SetLease = F_LINUX_SPECIFIC_BASE + 0,
+    SetLease = F_LINUX_SPECIFIC_BASE,
     GetLease = F_LINUX_SPECIFIC_BASE + 1,
 
     /// Request nofications on a directory.

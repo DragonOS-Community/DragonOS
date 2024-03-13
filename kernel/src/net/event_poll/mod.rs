@@ -65,6 +65,12 @@ impl EventPoll {
     }
 }
 
+impl Default for EventPoll {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// EpollItem表示的是Epoll所真正管理的对象
 /// 每当用户向Epoll添加描述符时都会注册一个新的EpollItem，EpollItem携带了一些被监听的描述符的必要信息
 #[derive(Debug)]
@@ -409,14 +415,12 @@ impl EventPoll {
         if let FilePrivateData::EPoll(epoll_data) = &ep_file.lock_irqsave().private_data {
             epolldata = Some(epoll_data.clone())
         }
-        if epolldata.is_some() {
-            let epoll_data = epolldata.unwrap();
+        if let Some(epoll_data) = epolldata {
             let epoll = epoll_data.epoll.clone();
             let epoll_guard = epoll.0.lock_irqsave();
 
             let mut timeout = false;
-            if timespec.is_some() {
-                let timespec = timespec.unwrap();
+            if let Some(timespec) = timespec {
                 if !(timespec.tv_sec > 0 || timespec.tv_nsec > 0) {
                     // 非阻塞情况
                     timeout = true;
@@ -471,8 +475,7 @@ impl EventPoll {
                 // 还未等待到事件发生，则睡眠
                 // 注册定时器
                 let mut timer = None;
-                if timespec.is_some() {
-                    let timespec = timespec.unwrap();
+                if let Some(timespec) = timespec {
                     let handle = WakeUpHelper::new(current_pcb.clone());
                     let jiffies = next_n_us_timer_jiffies(
                         (timespec.tv_sec * 1000000 + timespec.tv_nsec / 1000) as u64,
@@ -487,13 +490,13 @@ impl EventPoll {
                 sched();
                 // 被唤醒后,检查是否有事件可读
                 available = epoll.0.lock_irqsave().ep_events_available();
-                if timer.is_some() {
-                    if timer.as_ref().unwrap().timeout() {
+                if let Some(timer) = timer {
+                    if timer.as_ref().timeout() {
                         // 超时
                         timeout = true;
                     } else {
                         // 未超时，则取消计时器
-                        timer.unwrap().cancel();
+                        timer.cancel();
                     }
                 }
             }
@@ -630,8 +633,7 @@ impl EventPoll {
         fd: i32,
         dst_file: Option<Arc<SpinLock<File>>>,
     ) -> Result<(), SystemError> {
-        if dst_file.is_some() {
-            let dst_file = dst_file.unwrap();
+        if let Some(dst_file) = dst_file {
             let mut file_guard = dst_file.lock_irqsave();
 
             file_guard.remove_epoll(epoll.self_ref.as_ref().unwrap())?;

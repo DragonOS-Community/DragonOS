@@ -1,5 +1,4 @@
 use core::{
-    fmt::Display,
     hash::Hash,
     hint::spin_loop,
     intrinsics::{likely, unlikely},

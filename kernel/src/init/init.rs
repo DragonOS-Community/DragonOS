@@ -30,7 +30,7 @@ use crate::{
 /// 前面可能会有一个架构相关的函数
 pub fn start_kernel() -> ! {
     // 进入内核后，中断应该是关闭的
-    assert_eq!(CurrentIrqArch::is_irq_enabled(), false);
+    assert!(!CurrentIrqArch::is_irq_enabled());
 
     do_start_kernel();
 
@@ -76,7 +76,7 @@ fn do_start_kernel() {
 
     CurrentSMPArch::init().expect("smp init failed");
     // SMP初始化有可能会开中断，所以这里再次检查中断是否关闭
-    assert_eq!(CurrentIrqArch::is_irq_enabled(), false);
+    assert!(!CurrentIrqArch::is_irq_enabled());
     Futex::init();
 
     setup_arch_post().expect("setup_arch_post failed");

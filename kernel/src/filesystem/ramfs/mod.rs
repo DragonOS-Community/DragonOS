@@ -486,7 +486,7 @@ impl IndexNode for LockedRamFSInode {
         // 判断需要创建的类型
         if unlikely(mode.contains(ModeType::S_IFREG)) {
             // 普通文件
-            return Ok(self.create(filename, FileType::File, mode)?);
+            return self.create(filename, FileType::File, mode);
         }
 
         let nod = Arc::new(LockedRamFSInode(SpinLock::new(RamFSInode {

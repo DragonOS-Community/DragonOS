@@ -208,7 +208,7 @@ impl From<PosixOpenHow> for OpenHow {
     fn from(posix_open_how: PosixOpenHow) -> Self {
         let o_flags = FileMode::from_bits_truncate(posix_open_how.flags as u32);
         let mode = ModeType::from_bits_truncate(posix_open_how.mode as u32);
-        let resolve = OpenHowResolve::from_bits_truncate(posix_open_how.resolve as u64);
+        let resolve = OpenHowResolve::from_bits_truncate(posix_open_how.resolve);
         return Self::new(o_flags, mode, resolve);
     }
 }
@@ -434,13 +434,13 @@ impl Syscall {
         // Copy path to kernel space to avoid some security issues
         let path = dest_path.to_string();
         let mut new_path = String::from("");
-        if path.len() > 0 {
+        if !path.is_empty() {
             let cwd = match path.as_bytes()[0] {
                 b'/' => String::from("/"),
                 _ => proc.basic().cwd(),
             };
-            let mut cwd_vec: Vec<_> = cwd.split("/").filter(|&x| x != "").collect();
-            let path_split = path.split("/").filter(|&x| x != "");
+            let mut cwd_vec: Vec<_> = cwd.split('/').filter(|&x| !x.is_empty()).collect();
+            let path_split = path.split('/').filter(|&x| !x.is_empty());
             for seg in path_split {
                 if seg == ".." {
                     cwd_vec.pop();
@@ -452,10 +452,10 @@ impl Syscall {
             }
             //proc.basic().set_path(String::from(""));
             for seg in cwd_vec {
-                new_path.push_str("/");
+                new_path.push('/');
                 new_path.push_str(seg);
             }
-            if new_path == "" {
+            if new_path.is_empty() {
                 new_path = String::from("/");
             }
         }
@@ -469,7 +469,7 @@ impl Syscall {
             };
         let metadata = inode.metadata()?;
         if metadata.file_type == FileType::Dir {
-            proc.basic_mut().set_cwd(String::from(new_path));
+            proc.basic_mut().set_cwd(new_path);
             return Ok(0);
         } else {
             return Err(SystemError::ENOTDIR);
@@ -552,7 +552,7 @@ impl Syscall {
 
         if flags.contains(AtFlags::AT_REMOVEDIR) {
             // kdebug!("rmdir");
-            match do_remove_dir(dirfd, &pathname) {
+            match do_remove_dir(dirfd, pathname) {
                 Err(err) => {
                     kerror!("Failed to Remove Directory, Error Code = {:?}", err);
                     return Err(err);
@@ -563,7 +563,7 @@ impl Syscall {
             }
         }
 
-        match do_unlink_at(dirfd, &pathname) {
+        match do_unlink_at(dirfd, pathname) {
             Err(err) => {
                 kerror!("Failed to Remove Directory, Error Code = {:?}", err);
                 return Err(err);
@@ -656,7 +656,7 @@ impl Syscall {
         let new_exists = fd_table_guard.get_file_by_fd(newfd).is_some();
         if new_exists {
             // close newfd
-            if let Err(_) = fd_table_guard.drop_fd(newfd) {
+            if fd_table_guard.drop_fd(newfd).is_err() {
                 // An I/O error occurred while attempting to close fildes2.
                 return Err(SystemError::EIO);
             }
@@ -813,7 +813,7 @@ impl Syscall {
         let mut kstat = PosixKstat::new();
         // 获取文件信息
         let metadata = file.lock().metadata()?;
-        kstat.size = metadata.size as i64;
+        kstat.size = metadata.size;
         kstat.dev_id = metadata.dev_id as u64;
         kstat.inode = metadata.inode_id.into() as u64;
         kstat.blcok_size = metadata.blk_size as i64;
@@ -883,7 +883,7 @@ impl Syscall {
         let path = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
 
         // 文件名过长
-        if path.len() > MAX_PATHLEN as usize {
+        if path.len() > MAX_PATHLEN {
             return Err(SystemError::ENAMETOOLONG);
         }
 
@@ -937,7 +937,7 @@ impl Syscall {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
         let mut user_buf = UserBufferWriter::new(user_buf, buf_size, true)?;
 
-        if path.len() == 0 {
+        if path.is_empty() {
             return Err(SystemError::EINVAL);
         }
 

@@ -106,7 +106,7 @@ impl FreeBlockList {
 
 impl Drop for FreeBlockList {
     fn drop(&mut self) {
-        while let Some(_) = self.pop() {}
+        while self.pop().is_some() {}
     }
 }
 

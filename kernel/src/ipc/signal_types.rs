@@ -98,7 +98,7 @@ impl Default for InnerSignalStruct {
     fn default() -> Self {
         Self {
             cnt: Default::default(),
-            handlers: [Sigaction::default(); MAX_SIG_NUM as usize],
+            handlers: [Sigaction::default(); MAX_SIG_NUM],
         }
     }
 }
@@ -142,13 +142,13 @@ pub enum SaHandlerType {
     SigCustomized(VirtAddr),
 }
 
-impl Into<usize> for SaHandlerType {
-    fn into(self) -> usize {
-        match self {
-            Self::SigError => 2 as usize,
-            Self::SigIgnore => 1 as usize,
-            Self::SigDefault => 0 as usize,
-            Self::SigCustomized(handler) => handler.data(),
+impl From<SaHandlerType> for usize {
+    fn from(value: SaHandlerType) -> Self {
+        match value {
+            SaHandlerType::SigError => 2,
+            SaHandlerType::SigIgnore => 1,
+            SaHandlerType::SigDefault => 0,
+            SaHandlerType::SigCustomized(handler) => handler.data(),
         }
     }
 }
@@ -353,19 +353,10 @@ impl SigInfo {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SigPending {
     signal: SigSet,
     queue: SigQueue,
-}
-
-impl Default for SigPending {
-    fn default() -> Self {
-        SigPending {
-            signal: SigSet::default(),
-            queue: SigQueue::default(),
-        }
-    }
 }
 
 impl SigPending {
@@ -425,8 +416,8 @@ impl SigPending {
             self.signal_mut().remove(sig.into());
         }
 
-        if info.is_some() {
-            return info.unwrap();
+        if let Some(info) = info {
+            return info;
         } else {
             // 信号不在sigqueue中，这意味着当前信号是来自快速路径，因此直接把siginfo设置为0即可。
             let mut ret = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(Pid::from(0)));
@@ -442,13 +433,12 @@ impl SigPending {
         // 获取下一个要处理的信号的编号
         let sig = self.next_signal(sig_mask);
 
-        let info: Option<SigInfo>;
-        if sig != Signal::INVALID {
+        let info: Option<SigInfo> = if sig != Signal::INVALID {
             // 如果下一个要处理的信号是合法的，则收集其siginfo
-            info = Some(self.collect_signal(sig));
+            Some(self.collect_signal(sig))
         } else {
-            info = None;
-        }
+            None
+        };
 
         // 当一个进程具有多个线程之后，在这里需要重新计算线程的flag中的TIF_SIGPENDING位
         // recalc_sigpending();
@@ -463,7 +453,7 @@ impl SigPending {
 }
 
 /// @brief 进程接收到的信号的队列
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SigQueue {
     pub q: Vec<SigInfo>,
 }
@@ -533,14 +523,6 @@ impl SigQueue {
         let sq = p as *mut SigQueue;
         let sq = unsafe { sq.as_mut::<'static>() }.unwrap();
         return sq;
-    }
-}
-
-impl Default for SigQueue {
-    fn default() -> Self {
-        Self {
-            q: Default::default(),
-        }
     }
 }
 

@@ -196,7 +196,7 @@ impl ProcessManager {
         if clone_flags.contains(CloneFlags::CLONE_VM) {
             new_pcb.flags().insert(ProcessFlags::VFORK);
         }
-        *new_pcb.flags.get_mut() = ProcessManager::current_pcb().flags().clone();
+        *new_pcb.flags.get_mut() = *ProcessManager::current_pcb().flags();
         return Ok(());
     }
 

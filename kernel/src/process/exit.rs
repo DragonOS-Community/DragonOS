@@ -140,8 +140,8 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
             // 获取weak引用，以便于在do_waitpid中能正常drop pcb
             let child_weak = Arc::downgrade(&child_pcb);
             let r = do_waitpid(child_pcb, kwo);
-            if r.is_some() {
-                return r.unwrap();
+            if let Some(r) = r {
+                return r;
             } else {
                 child_weak.upgrade().unwrap().wait_queue.sleep();
             }
@@ -157,8 +157,8 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                 if state.is_exited() {
                     kwo.ret_status = state.exit_code().unwrap() as i32;
                     drop(pcb);
-                    unsafe { ProcessManager::release(pid.clone()) };
-                    return Ok(pid.clone().into());
+                    unsafe { ProcessManager::release(*pid) };
+                    return Ok((*pid).into());
                 } else {
                     unsafe { pcb.wait_queue.sleep_without_schedule() };
                 }

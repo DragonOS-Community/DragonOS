@@ -57,7 +57,7 @@ impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
         let mut found_start = false;
         // 遍历所有的物理内存区域
         for area in iter {
-            if found_start == false {
+            if !found_start {
                 // 将area的base地址与PAGE_SIZE对齐，对齐时向上取整
                 // let area_base = (area.base.data() + MMA::PAGE_SHIFT) & !(MMA::PAGE_SHIFT);
                 let area_base = area.area_base_aligned().data();
@@ -78,7 +78,7 @@ impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
                     offset = (offset + (MMA::PAGE_SIZE - 1)) & !(MMA::PAGE_SIZE - 1);
                 }
                 // found
-                if offset + 1 * MMA::PAGE_SIZE <= area_end {
+                if offset + MMA::PAGE_SIZE <= area_end {
                     ret_offset_aligned = offset - area.area_base_aligned().data();
                     found_start = true;
                 }
@@ -112,7 +112,10 @@ impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
                 PageMapper::<MMA, _>::current(PageTableKind::Kernel, BumpAllocator::<MMA>::new(0));
 
             for p in iter {
-                if let None = mapper.translate(MMA::phys_2_virt(p.phys_address()).unwrap()) {
+                if mapper
+                    .translate(MMA::phys_2_virt(p.phys_address()).unwrap())
+                    .is_none()
+                {
                     let vaddr = MMA::phys_2_virt(p.phys_address()).unwrap();
                     pseudo_map_phys(vaddr, p.phys_address(), PageFrameCount::new(1));
                 }

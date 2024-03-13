@@ -1,7 +1,4 @@
-use core::{ffi::c_char, mem};
-
 use alloc::{
-    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -9,7 +6,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition},
-    filesystem::vfs::{FileSystem, IndexNode, Metadata},
+    filesystem::vfs::{FileSystem, IndexNode},
     libs::{rwlock::RwLock, spinlock::SpinLock, vec_cursor::VecCursor},
 };
 
@@ -33,9 +30,60 @@ impl FileSystem for Ext2FsInfo {
         todo!()
     }
 }
+pub enum OSType{
+    Linux,
+    HURD,
+    MASIX,
+    FreeBSD,
+    Lites,
+}
+pub struct LockSBInfo(SpinLock<Ext2SuperBlockInfo>);
 
-// TODO 获取磁盘上的superblock并存储
+#[derive(Debug)]
+#[repr(C, align(1))]
+///second extended-fs super-block data in memory
+pub struct Ext2SuperBlockInfo {
+    s_frag_size: u32,        /* Size of a fragment in bytes */
+    s_frags_per_block: u32,  /* Number of fragments per block */
+    s_inodes_per_block: u32, /* Number of inodes per block */
+    s_frags_per_group: u32,  /* Number of fragments in a group */
+    s_blocks_per_group: u32, /* Number of blocks in a group */
+    s_inodes_per_group: u32, /* Number of inodes in a group */
+    s_itb_per_group: u32,    /* Number of inode table blocks per group */
+    s_gdb_count: u32,        /* Number of group descriptor blocks */
+    s_desc_per_block: u32,   /* Number of group descriptors per block */
+    s_groups_count: u32,     /* Number of groups in the fs */
+    s_overhead_last: u32,    /* Last calculated overhead */
+    s_blocks_last: u32,      /* Last seen block count */
+    // struct buffer_head * s_sbh,	/* Buffer containing the super block */
+    ext2_super_block: Ex2SuperBlock, /* Pointer to the super block in the buffer */
+    //应该是一个二维数组
 
+    // struct buffer_head ** s_group_desc,
+    s_mount_opt: u32,
+    s_sb_block: u32,
+    // uid_t s_resuid,
+    // gid_t s_resgid,
+    s_mount_state: u16,
+    s_pad: u16,
+    s_addr_per_block_bits: u32,
+    s_desc_per_block_bits: u32,
+    s_inode_size: u32,
+    s_first_ino: u32,
+    // spinlock_t s_next_gen_lock,
+    // u32 s_next_generation,
+    s_dir_count: u32,
+    // u8 *s_debts,
+    // struct percpu_counter s_freeblocks_counter,
+    // struct percpu_counter s_freeinodes_counter,
+    // struct percpu_counter s_dirs_counter,
+    // struct blockgroup_lock *s_blockgroup_lock,
+
+    /* root of the per fs reservation window tree */
+    // spinlock_t s_rsv_window_lock,
+    // struct rb_root s_rsv_window_root,
+    // struct ext2_reserve_window_node s_rsv_window_head,
+}
 // ext2超级块,大小为1024bytes
 #[derive(Debug)]
 #[repr(C, align(1))]
@@ -71,7 +119,7 @@ pub struct Ex2SuperBlock {
     /// 最大挂载次数
     pub max_mount_count: u16,
     /// ext2签名（0xef53），用于确定是否为ext2
-    pub signatrue: u16,
+    pub magic_signatrue: u16,
     /// 文件系统状态
     pub state: u16,
     /// 错误操作码
@@ -157,7 +205,7 @@ impl Default for Ex2SuperBlock {
             write_time: 0,
             mount_count: 0,
             max_mount_count: 0,
-            signatrue: 0,
+            magic_signatrue: 0,
             state: 0,
             error_action: 0,
             minor_version: 0,
@@ -216,7 +264,7 @@ impl Ex2SuperBlock {
 
         super_block.mount_count = cursor.read_u16()?;
         super_block.max_mount_count = cursor.read_u16()?;
-        super_block.signatrue = cursor.read_u16()?;
+        super_block.magic_signatrue = cursor.read_u16()?;
         super_block.state = cursor.read_u16()?;
         super_block.error_action = cursor.read_u16()?;
         super_block.minor_version = cursor.read_u16()?;
@@ -254,181 +302,8 @@ impl Ex2SuperBlock {
     }
 }
 
-/// 块组描述符表(位于superblock之后)
-#[derive(Debug)]
-#[repr(C, align(1))]
-pub struct BlockGroupDescriptor {
-    block_bitmap_address: u32,
-    inode_bitmap_address: u32,
-    inode_table_start: u32,
-    free_blocks_num: u16,
-    free_inodes_num: u16,
-    dir_num: u16,
-    padding: Vec<u8>,
-}
 
-impl BlockGroupDescriptor {
-    pub fn new() -> Self {
-        Self {
-            block_bitmap_address: 0,
-            inode_bitmap_address: 0,
-            inode_table_start: 0,
-            free_blocks_num: 0,
-            free_inodes_num: 0,
-            dir_num: 0,
-            padding: vec![0; 14],
-        }
-    }
-}
-/// 读取块组描述符表
-pub fn read_block_grp_descriptor(
-    partition: Arc<Partition>,
-) -> Result<BlockGroupDescriptor, SystemError> {
-    let mut grp_des_table = BlockGroupDescriptor::new();
-    let mut data: Vec<u8> = Vec::with_capacity(LBA_SIZE);
-    data.resize(LBA_SIZE, 0);
-    partition.disk().read_at(
-        (partition.lba_start + LBA_SIZE as u64 * 2) as usize,
-        1,
-        &mut data,
-    )?;
-    let mut cursor = VecCursor::new(data);
-    grp_des_table.block_bitmap_address = cursor.read_u32()?;
-    grp_des_table.inode_bitmap_address = cursor.read_u32()?;
-    grp_des_table.inode_table_start = cursor.read_u32()?;
-    grp_des_table.free_blocks_num = cursor.read_u16()?;
-    grp_des_table.free_inodes_num = cursor.read_u16()?;
-    grp_des_table.dir_num = cursor.read_u16()?;
-
-    Ok(grp_des_table)
-}
 pub struct DataBlock {
     data: [u8; 4 * 1024],
 }
 pub struct LockedDataBlock(RwLock<DataBlock>);
-#[derive(Debug)]
-pub struct LockedExt2Inode(SpinLock<Ext2Inode>);
-
-#[derive(Debug)]
-pub struct Ext2Inode {
-    /// 文件类型和权限
-    type_perm: u16,
-    /// 文件所有者
-    uid: u16,
-    /// 文件大小
-    lower_size: u32,
-    /// 文件访问时间
-    access_time: u32,
-    /// 文件创建时间
-    create_time: u32,
-    /// 文件修改时间
-    modify_time: u32,
-    /// 文件删除时间
-    delete_time: u32,
-    /// 文件组
-    gid: u16,
-    /// 文件链接数
-    hard_link_num: u16,
-    /// 文件在磁盘上的扇区
-    disk_sector: u32,
-    /// 文件属性
-    flags: u32,
-    /// 操作系统依赖
-    os_dependent_1: u32,
-
-    /// 目录项指针
-    direc_p_0: u32,
-    direc_p_1: u32,
-    direc_p_2: u32,
-    direc_p_3: u32,
-    direc_p_4: u32,
-    direc_p_5: u32,
-    direc_p_6: u32,
-    direc_p_7: u32,
-    direc_p_8: u32,
-    direc_p_9: u32,
-    direc_p_10: u32,
-    direc_p_11: u32,
-
-    /// 单向目录项指针
-    singly_indir_p: u32,
-    /// 双向目录项指针
-    doubly_indir_p: u32,
-    /// triply indir p
-    triply_indir_p: u32,
-
-    /// Generation number (Primarily used for NFS)
-    generation_num: u32,
-
-    /// In Ext2 version 0, this field is reserved.
-    /// In version >= 1, Extended attribute block (File ACL).
-    file_acl: u32,
-
-    /// In Ext2 version 0, this field is reserved.
-    /// In version >= 1, Upper 32 bits of file size (if feature bit set) if it's a file,
-    /// Directory ACL if it's a directory
-    directory_acl: u32,
-
-    /// 片段地址
-    fragment_addr: u32,
-    /// 操作系统依赖
-    os_dependent_2: u32,
-}
-impl Ext2Inode {}
-
-impl LockedExt2Inode {
-    pub fn get_block_group(inode: usize) -> usize {
-        let inodes_per_group = EXT2_SUPER_BLOCK.read().inodes_per_group;
-        return ((inode as u32 - 1) / inodes_per_group) as usize;
-    }
-
-    pub fn get_index_in_group(inode: usize) -> usize {
-        let inodes_per_group = EXT2_SUPER_BLOCK.read().inodes_per_group;
-        return ((inode as u32 - 1) % inodes_per_group) as usize;
-    }
-
-    pub fn get_block_addr(inode: usize) -> usize {
-        let super_block = EXT2_SUPER_BLOCK.read();
-        let mut inode_size = super_block.inode_size as usize;
-        let mut block_size = super_block.block_size as usize;
-
-        if super_block.major_version < 1 {
-            inode_size = 128;
-        }
-        return (inode * inode_size) / block_size;
-    }
-}
-
-impl IndexNode for LockedExt2Inode {
-    fn read_at(
-        &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        _data: &mut crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<usize, system_error::SystemError> {
-        todo!()
-    }
-
-    fn write_at(
-        &self,
-        offset: usize,
-        len: usize,
-        buf: &[u8],
-        _data: &mut crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<usize, system_error::SystemError> {
-        todo!()
-    }
-
-    fn fs(&self) -> alloc::sync::Arc<dyn FileSystem> {
-        todo!()
-    }
-
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        todo!()
-    }
-
-    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
-        todo!()
-    }
-}

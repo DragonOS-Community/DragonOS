@@ -396,7 +396,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
 
     /// name for hashing
     fn key(&self) -> Result<String, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return self.parent()?.get_entry_name(self.metadata()?.inode_id);
     }
 
     /// node for examined
@@ -411,7 +411,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     }
 
     fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return self.parent()?.find(&self.key()?);
+        return self.;
     }
 }
 
@@ -458,6 +458,16 @@ impl dyn IndexNode {
         // if self.metadata()?.inode_id == ROOT_INODE().metadata()?.inode_id {
         //     kinfo!("Is Looking up from root.");
         // }
+
+        // 1. 转换为MountFS, 检查是否是当前FS根节点
+        // 2. 查询当前FS缓存
+        // 3. 普通查询
+        // 
+        // or
+        //  
+        // 1. 查询全局mount表
+        // 2. 根据mount表查询对应系统目录缓存
+        // 3. 普通查询
         let get = self.cache();
         if get.is_err() {
             kdebug!("No Cache to use");

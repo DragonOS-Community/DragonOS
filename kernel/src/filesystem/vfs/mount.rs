@@ -15,6 +15,20 @@ use super::{
     file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
 };
 
+static mut __MOUNTS_LIST: Option<Arc<SpinLock<BTreeMap<String, Arc<dyn FileSystem>>>>> = None;
+
+/// 返回MOUNT LIST
+#[inline(always)]
+#[allow(non_snake_case)]
+pub fn MOUNTS_LIST() -> Arc<SpinLock<BTreeMap<String, Arc<dyn FileSystem>>>> {
+    unsafe {
+        if __MOUNTS_LIST.is_none() {
+            __MOUNTS_LIST = Some(Arc::new(SpinLock::new(BTreeMap::new())));
+        }
+        return __MOUNTS_LIST.as_ref().unwrap().clone();
+    }
+}
+
 /// @brief 挂载文件系统
 /// 挂载文件系统的时候，套了MountFS这一层，以实现文件系统的递归挂载
 #[derive(Debug)]
@@ -347,6 +361,7 @@ impl IndexNode for MountFSInode {
             .mountpoints
             .lock()
             .insert(metadata.inode_id, new_mount_fs.clone());
+        MOUNTS_LIST().lock().insert(self.key()?, new_mount_fs.clone());
         return Ok(new_mount_fs);
     }
 

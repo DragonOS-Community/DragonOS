@@ -1,11 +1,25 @@
+pub mod clock;
+pub mod cputime;
 pub mod fair;
 
-use core::intrinsics::{likely, unlikely};
+use core::{
+    intrinsics::{likely, unlikely},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
-use alloc::sync::Arc;
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use bitmap::traits::BitOps;
 
-use crate::process::ProcessControlBlock;
+use crate::{
+    include::bindings::bindings::MAX_CPU_NUM,
+    process::{ProcessControlBlock, ProcessFlags},
+    smp::core::smp_get_processor_id,
+};
+
+use self::{
+    clock::{ClockUpdataFlag, SchedClock},
+    cputime::{irq_time_read, IrqTime, CPU_IQR_TIME},
+};
 
 lazy_static! {
     pub static ref SCHED_FEATURES: SchedFeature = SchedFeature::GENTLE_FAIR_SLEEPERS
@@ -155,7 +169,74 @@ impl LoadWeight {
 }
 
 /// ## PerCpu的运行队列，其中维护了各个调度器对应的rq
-pub struct CpuRunQueue {}
+pub struct CpuRunQueue {
+    cpu: usize,
+    clock_task: u64,
+    clock: u64,
+    prev_irq_time: u64,
+    clock_updata_flags: ClockUpdataFlag,
+
+    /// 当前在运行队列上执行的进程
+    current: Arc<ProcessControlBlock>,
+}
+
+impl CpuRunQueue {
+    pub fn update_rq_clock(&mut self) {
+        // 需要跳过这次时钟更新
+        if self
+            .clock_updata_flags
+            .contains(ClockUpdataFlag::RQCF_ACT_SKIP)
+        {
+            return;
+        }
+
+        let clock = SchedClock::sched_clock_cpu(self.cpu);
+        if clock < self.clock as u128 {
+            return;
+        }
+
+        let delta = (clock - self.clock as u128) as u64;
+        self.clock += delta;
+        self.update_rq_clock_task(delta);
+    }
+
+    pub fn update_rq_clock_task(&mut self, mut delta: u64) {
+        let mut irq_delta = irq_time_read(self.cpu) - self.prev_irq_time;
+
+        if irq_delta > delta {
+            irq_delta = delta;
+        }
+
+        self.prev_irq_time += irq_delta;
+
+        delta -= irq_delta;
+
+        // todo: psi?
+
+        self.clock_task += delta;
+
+        // todo: pelt?
+    }
+
+    /// 重新调度当前进程
+    pub fn resched_current(&mut self) {
+        let current = self.current;
+
+        // 又需要被调度？
+        if unlikely(current.flags().contains(ProcessFlags::NEED_SCHEDULE)) {
+            return;
+        }
+
+        let cpu = self.cpu;
+
+        if cpu == smp_get_processor_id().data() as usize {
+            
+        }
+
+        // 需要迁移到其他cpu
+        todo!()
+    }
+}
 
 bitflags! {
     pub struct SchedFeature:u32 {
@@ -187,4 +268,18 @@ bitflags! {
         /// 启用基本时间片
         const BASE_SLICE = 1 << 13;
     }
+}
+
+#[inline(never)]
+pub fn sched_init() {
+    // 初始化percpu变量
+    unsafe {
+        CPU_IQR_TIME = Some(Vec::with_capacity(MAX_CPU_NUM as usize));
+        CPU_IQR_TIME
+            .as_mut()
+            .unwrap()
+            .resize_with(MAX_CPU_NUM as usize, || {
+                Box::leak(Box::new(IrqTime::default()))
+            });
+    };
 }

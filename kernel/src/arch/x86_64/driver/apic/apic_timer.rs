@@ -66,8 +66,8 @@ impl IrqHandler for LocalApicTimerHandler {
 struct LocalApicTimerIrqFlowHandler;
 
 impl IrqFlowHandler for LocalApicTimerIrqFlowHandler {
-    fn handle(&self, _irq_desc: &Arc<IrqDesc>, _trap_frame: &mut TrapFrame) {
-        LocalApicTimer::handle_irq().ok();
+    fn handle(&self, _irq_desc: &Arc<IrqDesc>, trap_frame: &mut TrapFrame) {
+        LocalApicTimer::handle_irq(&trap_frame).ok();
         CurrentApic.send_eoi();
     }
 }
@@ -274,7 +274,7 @@ impl LocalApicTimer {
         return (res.ecx & (1 << 24)) != 0;
     }
 
-    pub(super) fn handle_irq() -> Result<IrqReturn, SystemError> {
+    pub(super) fn handle_irq(trap_frame: &TrapFrame) -> Result<IrqReturn, SystemError> {
         sched_update_jiffies();
         return Ok(IrqReturn::Handled);
     }

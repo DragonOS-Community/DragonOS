@@ -84,18 +84,21 @@ impl<'a> BitIter<'a>{
     fn full_buffer(&mut self)->Result<PixelLineStatus,PixelLineStatus>{
         let mut color=self.read_bit();
         let mut buffer_pointer=0;
-        let mask=0x000000ff;
+        let mask=0x000000ff<<(self.byte_per_pixel-1)*8;
         let mut temp=0;
         while buffer_pointer<4{
             if self.consumed_bit>=self.image_width{
+                self.consumed_bit=0;
                 return Ok(PixelLineStatus::Full(self.buffer))
             }
             temp=color&mask;
-            color>>=8;
+            color<<=8;
+            temp<<=(4-self.byte_per_pixel)*8;
+            temp>>=buffer_pointer*8;
             self.buffer|=temp;
-            if buffer_pointer!=3{
-                self.buffer<<=8;
-            }
+            // if buffer_pointer!=3{
+            //     self.buffer<<=8;
+            // }
             buffer_pointer+=1;
             self.left_byte+=1;
             // println!("{},{}",buffer_pointer,self.left_byte);
@@ -106,6 +109,10 @@ impl<'a> BitIter<'a>{
                 }
                 color=self.read_bit();
             }
+        }
+        if self.consumed_bit>=self.image_width{
+            self.consumed_bit=0;
+            return Ok(PixelLineStatus::Full(self.buffer))
         }
         return Ok(PixelLineStatus::NotFull(self.buffer));
     }
@@ -129,8 +136,6 @@ impl<'a> BitIter<'a>{
 impl Iterator for BitIter<'_>{
     type Item = (u32,bool);
     fn next(&mut self) -> Option<Self::Item> {
-        let consumed_bit=self.consumed_bit;
-        self.consumed_bit=0;
         if self.done{
             return None;
         }

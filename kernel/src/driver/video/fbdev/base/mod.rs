@@ -255,49 +255,32 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         _start_index: u32,
         _pitch_index: u32,
     ) {
-        // let test:Vec<u8>=vec![0b10101010,0b00001111,0b11110000];
+        let test:Vec<u8>=vec![0b10101010,0b00001111,0b11110000];
         
         // kdebug!("dst1:{:?},start:{},pitch:{}",_dst1,_start_index,_pitch_index);
         let mut dst =unsafe{ _dst1.as_ptr::<u32>()};
         let mut line_length=0;
         let mut count=0;
         // let mut ans=vec![];
+    
         let iter=BitIter::new(_fg, _bg,EndianPattern::LittleEndian, EndianPattern::LittleEndian, self.current_fb_var().bits_per_pixel/8, _image.data.iter(),_image.width);
-        // let iter=BiteIter::new(0x00ffffff, 0x00000000,EndianPattern::LittleEndian, EndianPattern::LittleEndian, self.current_fb_var().bits_per_pixel/8, test.iter());
+        // let iter=BitIter::new(0x00ffffff, 0x00000000,EndianPattern::LittleEndian, EndianPattern::LittleEndian, 2, test.iter(),64);
         for (content,full) in iter{
-            // ans.push(i);
+            // ans.push(content);
             unsafe{
                 *dst=content;
                 dst=dst.add(1);
             }
+            
             if full{
                 count+=1;
-                // dst=unsafe{_dst1.as_ptr::<u32>().add((640*count/2) as usize)};
-                dst=unsafe{_dst1.as_ptr::<u32>().add((_pitch_index*count/(self.current_fb_var().bits_per_pixel/8)) as usize)};
-                // dst=unsafe{dst.add((400) as usize)};
+                dst=unsafe{_dst1.as_ptr::<u8>().add((_pitch_index*count) as usize) as *mut u32};
             }
 
         }
         // send_to_default_serial8250_port(format!("{:?}\n\0",ans).as_bytes());
         // panic!()
-        // let bpp = self.current_fb_var().bits_per_pixel;
-        // let pitch = self.current_fb_fix().line_length;
-        // let null_bits = 32 - bpp;
-        // let spitch = (image.width + 7) / 8;
-
-        // // TODO：这里是需要计算的，但是目前用不到，先直接写
-        // let bswapmask = 0;
-
-        // let dst2 = dst1;
-
-        // // 一行一行画
-        // for i in image.height..0 {
-        //     let dst = dst1;
-
-        //     if start_index > 0 {
-        //         let start_mask = !(!(0 as u32) << start_index);
-        //     }
-        // }
+    
     }
 }
 

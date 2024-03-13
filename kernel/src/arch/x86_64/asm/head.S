@@ -111,9 +111,9 @@ framebuffer_tag_start:
     .short MULTIBOOT_HEADER_TAG_FRAMEBUFFER
     .short MULTIBOOT_HEADER_TAG_OPTIONAL
     .long framebuffer_tag_end - framebuffer_tag_start
-    .long 640   // 宽
-    .long 480   // 高
-    .long 16
+    .long 1600   // 宽
+    .long 900   // 高
+    .long 32
 framebuffer_tag_end:
 .align 8
 	.short MULTIBOOT_HEADER_TAG_END

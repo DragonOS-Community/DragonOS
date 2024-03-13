@@ -394,16 +394,17 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         None
     }
 
-    /// name for hashing
+    /// @brief 获取目录项
     fn key(&self) -> Result<String, SystemError> {
         return self.parent()?.get_entry_name(self.metadata()?.inode_id);
     }
 
-    /// node for examined
+    /// @brief 获取父目录
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return self.find("..");
     }
 
+    // to remove
     /// @brief 返回查询缓存
     fn cache(&self) -> Result<Arc<DefaultCache>, SystemError> {
         kdebug!("call IndexNode::cache");
@@ -411,7 +412,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     }
 
     fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return self.parent()?.find(&self.key()?);
+        return self.find(".");
     }
 }
 

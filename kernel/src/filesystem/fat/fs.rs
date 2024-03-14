@@ -1569,39 +1569,6 @@ impl IndexNode for LockedFATInode {
         return Ok(());
     }
 
-    fn link(&self, name: &str, target: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        let target: &LockedFATInode = target
-            .downcast_ref::<LockedFATInode>()
-            .ok_or(SystemError::EPERM)?;
-
-        let mut inode: SpinLockGuard<FATInode> = self.0.lock();
-        let mut target_locked: SpinLockGuard<FATInode> = target.0.lock();
-
-        // 如果当前inode不是文件夹，那么报错
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-
-        // 如果另一个inode是文件夹，那么也报错
-        if target_locked.metadata.file_type == FileType::Dir {
-            return Err(SystemError::EISDIR);
-        }
-
-        // 如果当前文件夹下已经有同名文件，也报错。
-        if inode.children.contains_key(name) {
-            return Err(SystemError::EEXIST);
-        }
-
-        inode.children.insert(
-            String::from(name),
-            target_locked.self_ref.upgrade().unwrap(),
-        );
-
-        // 增加硬链接计数
-        target_locked.metadata.nlinks += 1;
-        return Ok(());
-    }
-
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let target: Arc<LockedFATInode> = guard.find(name)?;

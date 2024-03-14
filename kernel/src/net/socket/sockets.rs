@@ -859,8 +859,7 @@ impl Socket for TcpSocket {
     }
 
     fn endpoint(&self) -> Option<Endpoint> {
-        let mut result: Option<Endpoint> =
-            self.local_endpoint.map(|x| Endpoint::Ip(Some(x)));
+        let mut result: Option<Endpoint> = self.local_endpoint.map(|x| Endpoint::Ip(Some(x)));
 
         if result.is_none() {
             let sockets = SOCKET_SET.lock_irqsave();

@@ -94,7 +94,7 @@ impl DeviceManager {
                 if unlikely(r.is_err()) {
                     flag = false;
                     break;
-                } else if r.unwrap() == true {
+                } else if r.unwrap() {
                     flag = true;
                     break;
                 }

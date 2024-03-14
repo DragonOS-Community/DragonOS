@@ -776,14 +776,14 @@ impl TextuiWindow {
         if character == '\n' {
             // 换行时还需要输出\r
             send_to_default_serial8250_port(&[b'\r']);
-            if is_enable_window == true {
+            if is_enable_window {
                 self.textui_new_line()?;
             }
             return Ok(());
         }
         // 输出制表符
         else if character == '\t' {
-            if is_enable_window == true {
+            if is_enable_window {
                 if let TextuiVline::Chromatic(vline) =
                     &self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
                 {
@@ -798,7 +798,7 @@ impl TextuiWindow {
         }
         // 字符 '\x08' 代表 ASCII 码中的退格字符。它在输出中的作用是将光标向左移动一个位置，并在该位置上输出后续的字符，从而实现字符的删除或替换。
         else if character == '\x08' {
-            if is_enable_window == true {
+            if is_enable_window {
                 let mut tmp = LineIndex(0);
                 if let TextuiVline::Chromatic(vline) =
                     &mut self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
@@ -853,7 +853,7 @@ impl TextuiWindow {
                     self.textui_refresh_vlines(self.top_vline, actual_line_sum)?;
                 }
             }
-        } else if is_enable_window == true {
+        } else if is_enable_window {
             if let TextuiVline::Chromatic(vline) =
                 &self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
             {

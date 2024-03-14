@@ -71,7 +71,7 @@ impl RawSocket {
             GlobalSocketHandle::new(SOCKET_SET.lock_irqsave().add(socket));
 
         let metadata = SocketMetadata::new(
-            SocketType::RawSocket,
+            SocketType::Raw,
             Self::DEFAULT_RX_BUF_SIZE,
             Self::DEFAULT_TX_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
@@ -260,7 +260,7 @@ impl UdpSocket {
             GlobalSocketHandle::new(SOCKET_SET.lock_irqsave().add(socket));
 
         let metadata = SocketMetadata::new(
-            SocketType::UdpSocket,
+            SocketType::Udp,
             Self::DEFAULT_RX_BUF_SIZE,
             Self::DEFAULT_TX_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
@@ -505,7 +505,7 @@ impl TcpSocket {
             GlobalSocketHandle::new(SOCKET_SET.lock_irqsave().add(socket));
 
         let metadata = SocketMetadata::new(
-            SocketType::TcpSocket,
+            SocketType::Tcp,
             Self::DEFAULT_RX_BUF_SIZE,
             Self::DEFAULT_TX_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
@@ -816,7 +816,7 @@ impl Socket for TcpSocket {
                     }
 
                     let metadata = SocketMetadata::new(
-                        SocketType::TcpSocket,
+                        SocketType::Tcp,
                         Self::DEFAULT_TX_BUF_SIZE,
                         Self::DEFAULT_RX_BUF_SIZE,
                         Self::DEFAULT_METADATA_BUF_SIZE,
@@ -860,7 +860,7 @@ impl Socket for TcpSocket {
 
     fn endpoint(&self) -> Option<Endpoint> {
         let mut result: Option<Endpoint> =
-            self.local_endpoint.clone().map(|x| Endpoint::Ip(Some(x)));
+            self.local_endpoint.map(|x| Endpoint::Ip(Some(x)));
 
         if result.is_none() {
             let sockets = SOCKET_SET.lock_irqsave();
@@ -914,7 +914,7 @@ impl SeqpacketSocket {
         let buffer = Vec::with_capacity(Self::DEFAULT_BUF_SIZE);
 
         let metadata = SocketMetadata::new(
-            SocketType::SeqpacketSocket,
+            SocketType::Seqpacket,
             Self::DEFAULT_BUF_SIZE,
             0,
             Self::DEFAULT_METADATA_BUF_SIZE,

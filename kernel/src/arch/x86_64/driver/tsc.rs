@@ -171,7 +171,7 @@ impl TSCManager {
 
             // 如果误差在10%以内，那么认为测量成功
             // 返回参考值，因为它是更精确的
-            if delta >= 90 && delta <= 110 {
+            if (90..=110).contains(&delta) {
                 kinfo!(
                     "PIT calibration matches {}. {} loops",
                     if hpet { "HPET" } else { "PMTIMER" },

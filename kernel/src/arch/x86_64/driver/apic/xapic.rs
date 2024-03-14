@@ -223,14 +223,14 @@ impl LocalAPIC for XApic {
                 return false;
             }
             // 设置 Spurious Interrupt Vector Register
-            let val = self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR.into());
+            let val = self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR);
 
             self.write(
-                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR.into(),
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR,
                 val | ENABLE,
             );
 
-            let val = self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR.into());
+            let val = self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR);
             if val & ENABLE == 0 {
                 kerror!("xAPIC software enable failed.");
 
@@ -246,22 +246,22 @@ impl LocalAPIC for XApic {
             self.mask_all_lvt();
 
             // 清除错误状态寄存器（需要连续写入两次）
-            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR.into(), 0);
-            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR.into(), 0);
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR, 0);
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR, 0);
 
             // 确认任何未完成的中断
-            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_EOI.into(), 0);
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_EOI, 0);
 
             // 发送 Init Level De-Assert 信号以同步仲裁ID
             self.write(
-                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_63_32.into(),
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_63_32,
                 0,
             );
             self.write(
-                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into(),
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0,
                 BCAST | INIT | LEVEL,
             );
-            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into()) & DELIVS != 0
+            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0) & DELIVS != 0
             {
                 spin_loop();
             }
@@ -274,26 +274,26 @@ impl LocalAPIC for XApic {
     fn send_eoi(&self) {
         unsafe {
             let s = self as *const Self as *mut Self;
-            (*s).write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_EOI.into(), 0);
+            (*s).write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_EOI, 0);
         }
     }
 
     /// 获取版本号
     fn version(&self) -> u8 {
         unsafe {
-            (self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) & 0xff) as u8
+            (self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version) & 0xff) as u8
         }
     }
 
     fn support_eoi_broadcast_suppression(&self) -> bool {
         unsafe {
-            ((self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) >> 24) & 1) == 1
+            ((self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version) >> 24) & 1) == 1
         }
     }
 
     fn max_lvt_entry(&self) -> u8 {
         unsafe {
-            ((self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) >> 16) & 0xff)
+            ((self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version) >> 16) & 0xff)
                 as u8
                 + 1
         }
@@ -301,7 +301,7 @@ impl LocalAPIC for XApic {
 
     /// 获取ID
     fn id(&self) -> ApicId {
-        unsafe { ApicId::new(self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ID.into()) >> 24) }
+        unsafe { ApicId::new(self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ID) >> 24) }
     }
 
     /// 设置LVT寄存器的值
@@ -315,7 +315,7 @@ impl LocalAPIC for XApic {
         unsafe {
             LVT::new(
                 reg,
-                self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER.into()),
+                self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER),
             )
             .unwrap()
         }
@@ -334,22 +334,22 @@ impl LocalAPIC for XApic {
     fn write_icr(&self, icr: x86::apic::Icr) {
         unsafe {
             // Wait for any previous send to finish
-            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into()) & DELIVS != 0
+            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0) & DELIVS != 0
             {
                 spin_loop();
             }
 
             self.write(
-                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_63_32.into(),
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_63_32,
                 icr.upper(),
             );
             self.write(
-                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into(),
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0,
                 icr.lower(),
             );
 
             // Wait for send to finish
-            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into()) & DELIVS != 0
+            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0) & DELIVS != 0
             {
                 spin_loop();
             }

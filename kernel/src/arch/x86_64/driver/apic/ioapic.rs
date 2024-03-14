@@ -86,13 +86,13 @@ impl IoApic {
                     }
                     return false;
                 })
-                            .and_then(|x| {
-                        if let acpi::madt::MadtEntry::IoApic(x) = x {
-                            Some(x.io_apic_address)
-                        } else {
-                            None
-                        }
-                    })
+                .and_then(|x| {
+                    if let acpi::madt::MadtEntry::IoApic(x) = x {
+                        Some(x.io_apic_address)
+                    } else {
+                        None
+                    }
+                })
                 .unwrap();
 
             let phys_base = PhysAddr::new(io_apic_paddr as usize);

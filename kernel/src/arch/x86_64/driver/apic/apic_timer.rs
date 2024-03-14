@@ -181,7 +181,7 @@ pub enum LocalApicTimerMode {
 
 impl LocalApicTimer {
     /// 定时器中断的间隔
-    pub const INTERVAL_MS: u64 = 1000 / HZ ;
+    pub const INTERVAL_MS: u64 = 1000 / HZ;
     pub const DIVISOR: u64 = 4;
 
     /// IoApicManager 初值为0或false
@@ -307,10 +307,7 @@ impl CurrentApic {
             unsafe { wrmsr(IA32_X2APIC_DIV_CONF, divisor.into()) };
         } else {
             unsafe {
-                self.write_xapic_register(
-                    XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_CLKDIV,
-                    divisor,
-                )
+                self.write_xapic_register(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_CLKDIV, divisor)
             };
         }
     }

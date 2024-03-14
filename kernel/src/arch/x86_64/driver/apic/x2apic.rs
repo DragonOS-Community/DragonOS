@@ -22,10 +22,7 @@ impl LocalAPIC for X2Apic {
     fn init_current_cpu(&mut self) -> bool {
         unsafe {
             // 设置 x2APIC 使能位
-            wrmsr(
-                IA32_APIC_BASE,
-                rdmsr(IA32_APIC_BASE) | 1 << 10,
-            );
+            wrmsr(IA32_APIC_BASE, rdmsr(IA32_APIC_BASE) | 1 << 10);
 
             assert!(
                 (rdmsr(IA32_APIC_BASE) & 0xc00) == 0xc00,

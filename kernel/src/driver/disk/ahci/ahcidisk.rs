@@ -91,8 +91,7 @@ impl AhciDisk {
         #[allow(unused_unsafe)]
         let cmdheader: &mut HbaCmdHeader = unsafe {
             (phys_2_virt(
-                volatile_read!(port.clb) as usize
-                    + slot as usize * size_of::<HbaCmdHeader>(),
+                volatile_read!(port.clb) as usize + slot as usize * size_of::<HbaCmdHeader>(),
             ) as *mut HbaCmdHeader)
                 .as_mut()
                 .unwrap()
@@ -219,7 +218,7 @@ impl AhciDisk {
         assert!((buf.len() & 511) == 0);
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         let check_length = ((count - 1) >> 4) + 1; // prdt length
-        if count * 512 > buf.len() || check_length > 8{
+        if count * 512 > buf.len() || check_length > 8 {
             // 不可能的操作
             return Err(SystemError::E2BIG);
         } else if count == 0 {
@@ -240,8 +239,7 @@ impl AhciDisk {
         #[allow(unused_unsafe)]
         let cmdheader: &mut HbaCmdHeader = unsafe {
             (phys_2_virt(
-                volatile_read!(port.clb) as usize
-                    + slot as usize * size_of::<HbaCmdHeader>(),
+                volatile_read!(port.clb) as usize + slot as usize * size_of::<HbaCmdHeader>(),
             ) as *mut HbaCmdHeader)
                 .as_mut()
                 .unwrap()

@@ -225,10 +225,7 @@ impl LocalAPIC for XApic {
             // 设置 Spurious Interrupt Vector Register
             let val = self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR);
 
-            self.write(
-                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR,
-                val | ENABLE,
-            );
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR, val | ENABLE);
 
             let val = self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR);
             if val & ENABLE == 0 {
@@ -253,16 +250,12 @@ impl LocalAPIC for XApic {
             self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_EOI, 0);
 
             // 发送 Init Level De-Assert 信号以同步仲裁ID
-            self.write(
-                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_63_32,
-                0,
-            );
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_63_32, 0);
             self.write(
                 XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0,
                 BCAST | INIT | LEVEL,
             );
-            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0) & DELIVS != 0
-            {
+            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0) & DELIVS != 0 {
                 spin_loop();
             }
         }
@@ -280,22 +273,16 @@ impl LocalAPIC for XApic {
 
     /// 获取版本号
     fn version(&self) -> u8 {
-        unsafe {
-            (self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version) & 0xff) as u8
-        }
+        unsafe { (self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version) & 0xff) as u8 }
     }
 
     fn support_eoi_broadcast_suppression(&self) -> bool {
-        unsafe {
-            ((self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version) >> 24) & 1) == 1
-        }
+        unsafe { ((self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version) >> 24) & 1) == 1 }
     }
 
     fn max_lvt_entry(&self) -> u8 {
         unsafe {
-            ((self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version) >> 16) & 0xff)
-                as u8
-                + 1
+            ((self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version) >> 16) & 0xff) as u8 + 1
         }
     }
 
@@ -334,8 +321,7 @@ impl LocalAPIC for XApic {
     fn write_icr(&self, icr: x86::apic::Icr) {
         unsafe {
             // Wait for any previous send to finish
-            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0) & DELIVS != 0
-            {
+            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0) & DELIVS != 0 {
                 spin_loop();
             }
 
@@ -349,8 +335,7 @@ impl LocalAPIC for XApic {
             );
 
             // Wait for send to finish
-            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0) & DELIVS != 0
-            {
+            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0) & DELIVS != 0 {
                 spin_loop();
             }
         }

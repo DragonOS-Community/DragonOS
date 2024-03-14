@@ -13,17 +13,17 @@ use crate::{
 #[repr(C, align(1))]
 pub struct Ext2BlockGroupDescriptor {
     /// 块位图的地址
-    block_bitmap_address: u32,
+    pub block_bitmap_address: u32,
     /// 节点位图的地址
-    inode_bitmap_address: u32,
+    pub inode_bitmap_address: u32,
     /// 节点表的起始地址
-    inode_table_start: u32,
+    pub inode_table_start: u32,
     /// 空闲的块数
-    free_blocks_num: u16,
+    pub free_blocks_num: u16,
     /// 空闲的节点数
-    free_inodes_num: u16,
+    pub free_inodes_num: u16,
     /// 目录数
-    dir_num: u16,
+    pub dir_num: u16,
     /// 填充
     padding: Vec<u8>,
 }
@@ -40,7 +40,7 @@ impl Ext2BlockGroupDescriptor {
             padding: vec![0; 14],
         }
     }
-    pub fn get_des_per_blc() -> u32 {
+    pub fn get_des_per_blc() -> usize {
         LBA_SIZE / mem::size_of::<Ext2BlockGroupDescriptor>()
     }
 }
@@ -49,7 +49,7 @@ pub fn read_block_grp_descriptor(
     partition: Arc<Partition>,
 ) -> Result<Ext2BlockGroupDescriptor, SystemError> {
     // TODO 要计算读多少个块，读到一个数组里面
-
+    
     let mut grp_des_table = Ext2BlockGroupDescriptor::new();
     let mut data: Vec<u8> = Vec::with_capacity(LBA_SIZE);
     data.resize(LBA_SIZE, 0);

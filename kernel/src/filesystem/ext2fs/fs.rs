@@ -243,22 +243,21 @@ pub struct Ext2SuperBlockInfo {
 }
 impl Ext2SuperBlockInfo {
     pub fn new(sb: &Ex2SuperBlock) -> Self {
-        let arc_sb = Arc::new(sb.clone());
         Self {
             s_frag_size: sb.fragment_size,
             // TODO 计算
-            s_frags_per_block: (),
-            s_inodes_per_block: (),
+            s_frags_per_block: todo!(),
+            s_inodes_per_block: todo!(),
             s_frags_per_group: sb.fragments_per_group,
             s_blocks_per_group: sb.blocks_per_group,
             s_inodes_per_group: sb.inodes_per_group,
-            s_itb_per_group: (),
-            s_gdb_count: (),
-            s_desc_per_block: (),
-            s_groups_count: (),
-            s_overhead_last: (),
-            s_blocks_last: (),
-            ext2_super_block: Arc::downgrade(arc_sb),
+            s_itb_per_group: todo!(),
+            s_gdb_count: todo!(),
+            s_desc_per_block: todo!(),
+            s_groups_count: todo!(),
+            s_overhead_last: todo!(),
+            s_blocks_last: todo!(),
+            ext2_super_block: Arc::downgrade(&Arc::new(*sb.clone())),
             group_desc_table: Weak::default(),
             s_mount_opt: 0,
             s_sb_block: sb.first_data_block,
@@ -266,12 +265,12 @@ impl Ext2SuperBlockInfo {
             s_resgid: sb.def_resgid,
             s_mount_state: sb.state,
             s_pad: 0,
-            s_addr_per_block_bits: (),
-            s_desc_per_block_bits: (),
-            s_inode_size: sb.inode_size,
+            s_addr_per_block_bits: todo!(),
+            s_desc_per_block_bits: todo!(),
+            s_inode_size: sb.inode_size as u32,
             s_first_ino: sb.first_ino,
-            s_next_generation: (),
-            s_dir_count: (),
+            s_next_generation: todo!(),
+            s_dir_count: todo!(),
             s_freeblocks_counter: AtomicU32::new(sb.free_block_count),
             s_freeinodes_counter: AtomicU32::new(sb.free_inode_count),
             s_dirs_counter: AtomicU32::new(1),
@@ -348,11 +347,12 @@ impl Ex2SuperBlock {
     }
 
     /// block group的数量
-    pub fn get_group_count(&self) -> u32 {
-        return (self.block_count - self.first_data_block - 1) / self.blocks_per_group + 1;
+    pub fn get_group_count(&self) -> usize {
+        return ((self.block_count - self.first_data_block - 1) / self.blocks_per_group + 1)
+            as usize;
     }
     /// 块描述符所需要的块数
-    pub fn get_db_count(&self) -> u32 {
+    pub fn get_db_count(&self) -> usize {
         let group_count = self.get_group_count();
         let des_per_block = Ext2BlockGroupDescriptor::get_des_per_blc();
         (group_count + des_per_block - 1) / des_per_block
@@ -361,11 +361,33 @@ impl Ex2SuperBlock {
         &self,
         partition: Arc<Partition>,
     ) -> Result<Vec<Ext2BlockGroupDescriptor>, SystemError> {
-        // TODO 读取块描述付
-        // 需要确定读多少个
-        let mut decs: Vec<Ext2BlockGroupDescriptor> = Vec::new();
         // 先确定块数，再遍历块，再n个字节n个字节读
+        let db_count = self.get_db_count();
+        let des_per_block = Ext2BlockGroupDescriptor::get_des_per_blc();
+        // 需要确定读多少个
+        let mut decs: Vec<Ext2BlockGroupDescriptor> = Vec::with_capacity(db_count * des_per_block);
 
+        let mut blc_data = Vec::with_capacity(LBA_SIZE * db_count);
+        blc_data.resize(LBA_SIZE * db_count, 0);
+
+        partition.disk().read_at(
+            (partition.lba_start + (LBA_SIZE * db_count) as u64) as usize,
+            db_count,
+            &mut blc_data,
+        )?;
+        let mut cursor = VecCursor::new(blc_data);
+        for _ in 0..db_count {
+            let mut d = Ext2BlockGroupDescriptor::new();
+            d.block_bitmap_address = cursor.read_u32()?;
+            d.inode_bitmap_address = cursor.read_u32()?;
+            d.inode_table_start = cursor.read_u32()?;
+            d.free_blocks_num = cursor.read_u16()?;
+            d.free_inodes_num = cursor.read_u16()?;
+            d.dir_num = cursor.read_u16()?;
+
+            decs.push(d);
+        }
+        Ok(decs)
     }
 }
 

@@ -80,12 +80,10 @@ impl Into<ApicId> for ArchIpiTarget {
     fn into(self) -> ApicId {
         if let ArchIpiTarget::Specified(id) = self {
             return id;
+        } else if CurrentApic.x2apic_enabled() {
+            return x86::apic::ApicId::X2Apic(0);
         } else {
-            if CurrentApic.x2apic_enabled() {
-                return x86::apic::ApicId::X2Apic(0);
-            } else {
-                return x86::apic::ApicId::XApic(0);
-            }
+            return x86::apic::ApicId::XApic(0);
         }
     }
 }

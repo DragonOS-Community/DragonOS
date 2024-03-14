@@ -1,14 +1,25 @@
+use riscv::register::{scause::Scause, sstatus::Sstatus};
 use system_error::SystemError;
 
-use crate::exception::{InterruptArch, IrqFlags, IrqFlagsGuard, IrqNumber};
+use crate::{
+    driver::irqchip::riscv_intc::riscv_intc_init,
+    exception::{InterruptArch, IrqFlags, IrqFlagsGuard, IrqNumber},
+    libs::align::align_up,
+};
 
+use super::cpu::STACK_ALIGN;
+
+pub(super) mod entry;
+mod handle;
 pub mod ipi;
 
 pub struct RiscV64InterruptArch;
 
 impl InterruptArch for RiscV64InterruptArch {
     unsafe fn arch_irq_init() -> Result<(), SystemError> {
-        todo!("RiscV64InterruptArch::arch_irq_init")
+        riscv_intc_init()?;
+
+        Ok(())
     }
     unsafe fn interrupt_enable() {
         riscv::interrupt::enable();
@@ -50,12 +61,54 @@ impl InterruptArch for RiscV64InterruptArch {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct TrapFrame {
-    // todo
+    epc: usize,
+    ra: usize,
+    sp: usize,
+    gp: usize,
+    tp: usize,
+    t0: usize,
+    t1: usize,
+    t2: usize,
+    s0: usize,
+    s1: usize,
+    a0: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+    a7: usize,
+    s2: usize,
+    s3: usize,
+    s4: usize,
+    s5: usize,
+    s6: usize,
+    s7: usize,
+    s8: usize,
+    s9: usize,
+    s10: usize,
+    s11: usize,
+    t3: usize,
+    t4: usize,
+    t5: usize,
+    t6: usize,
+    // 以下是中断发生时自动保存的寄存器
+    status: Sstatus,
+    badaddr: usize,
+    cause: Scause,
+    /// a0 value before the syscall
+    origin_a0: usize,
 }
 
 impl TrapFrame {
+    /// 中断栈帧结构体的大小
+    pub const SIZE: usize = core::mem::size_of::<TrapFrame>();
+
+    /// 中断栈帧在栈上的大小
+    pub const SIZE_ON_STACK: usize = align_up(Self::SIZE, STACK_ALIGN);
     /// 判断当前中断是否来自用户模式
     pub fn from_user(&self) -> bool {
-        unimplemented!("TrapFrame::from_user")
+        self.status.spp() == riscv::register::sstatus::SPP::User
     }
 }

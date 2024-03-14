@@ -86,7 +86,7 @@ impl Signal {
             return Err(SystemError::EINVAL);
         }
         // kdebug!("force send={}", force_send);
-        let pcb_info = pcb.sig_info();
+        let pcb_info = pcb.sig_info_irqsave();
         let pending = if matches!(pt, PidType::PID) {
             pcb_info.sig_shared_pending()
         } else {
@@ -108,12 +108,12 @@ impl Signal {
             let new_sig_info = match info {
                 Some(siginfo) => {
                     // 已经显式指定了siginfo，则直接使用它。
-                    (*siginfo).clone()
+                    *siginfo
                 }
                 None => {
                     // 不需要显示指定siginfo，因此设置为默认值
                     SigInfo::new(
-                        self.clone(),
+                        *self,
                         0,
                         SigCode::User,
                         SigType::Kill(ProcessManager::current_pcb().pid()),
@@ -127,7 +127,7 @@ impl Signal {
                 .q
                 .push(new_sig_info);
 
-            if pt == PidType::PGID || pt == PidType::SID {}
+            // if pt == PidType::PGID || pt == PidType::SID {}
             self.complete_signal(pcb.clone(), pt);
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -189,7 +189,11 @@ impl Signal {
     #[inline]
     fn wants_signal(&self, pcb: Arc<ProcessControlBlock>) -> bool {
         // 如果改进程屏蔽了这个signal，则不能接收
-        if pcb.sig_info().sig_block().contains(self.clone().into()) {
+        if pcb
+            .sig_info_irqsave()
+            .sig_block()
+            .contains(self.clone().into())
+        {
             return false;
         }
 
@@ -209,11 +213,7 @@ impl Signal {
         // todo: 检查目标进程是否正在一个cpu上执行，如果是，则返回true，否则继续检查下一项
 
         // 检查目标进程是否有信号正在等待处理，如果是，则返回false，否则返回true
-        if pcb.sig_info().sig_pending().signal().bits() == 0 {
-            return true;
-        } else {
-            return false;
-        }
+        return pcb.sig_info_irqsave().sig_pending().signal().bits() == 0;
     }
 
     /// @brief 判断signal的处理是否可能使得整个进程组退出
@@ -263,7 +263,11 @@ impl Signal {
         }
 
         // 一个被阻塞了的信号肯定是要被处理的
-        if pcb.sig_info().sig_block().contains(self.into_sigset()) {
+        if pcb
+            .sig_info_irqsave()
+            .sig_block()
+            .contains(self.into_sigset())
+        {
             return true;
         }
         return !pcb.sig_struct().handlers[self.clone() as usize - 1].is_ignore();
@@ -313,12 +317,10 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, _guard: SpinLockGuard<SignalStr
 
     if wakeup_ok {
         ProcessManager::kick(&pcb);
-    } else {
-        if fatal {
-            let _r = ProcessManager::wakeup(&pcb).map(|_| {
-                ProcessManager::kick(&pcb);
-            });
-        }
+    } else if fatal {
+        let _r = ProcessManager::wakeup(&pcb).map(|_| {
+            ProcessManager::kick(&pcb);
+        });
     }
 }
 
@@ -368,8 +370,7 @@ pub(super) fn do_sigaction(
 
     // 保存原有的 sigaction
     let old_act: Option<&mut Sigaction> = {
-        if old_act.is_some() {
-            let oa = old_act.unwrap();
+        if let Some(oa) = old_act {
             *(oa) = (*action).clone();
             Some(oa)
         } else {
@@ -378,8 +379,7 @@ pub(super) fn do_sigaction(
     };
     // 清除所有的脏的sa_flags位（也就是清除那些未使用的）
     let act = {
-        if act.is_some() {
-            let ac = act.unwrap();
+        if let Some(ac) = act {
             *ac.flags_mut() &= SigFlags::SA_ALL;
             Some(ac)
         } else {
@@ -391,8 +391,7 @@ pub(super) fn do_sigaction(
         *old_act.unwrap().flags_mut() &= SigFlags::SA_ALL;
     }
 
-    if act.is_some() {
-        let ac = act.unwrap();
+    if let Some(ac) = act {
         // 将act.sa_mask的SIGKILL SIGSTOP的屏蔽清除
         ac.mask_mut()
             .remove(SigSet::from(Signal::SIGKILL.into()) | SigSet::from(Signal::SIGSTOP.into()));
@@ -430,7 +429,7 @@ pub fn set_current_sig_blocked(new_set: &mut SigSet) {
         如果当前pcb的sig_blocked和新的相等，那么就不用改变它。
         请注意，一个进程的sig_blocked字段不能被其他进程修改！
     */
-    if pcb.sig_info().sig_block().eq(new_set) {
+    if pcb.sig_info_irqsave().sig_block().eq(new_set) {
         return;
     }
 

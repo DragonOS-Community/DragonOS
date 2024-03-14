@@ -62,7 +62,7 @@ impl BlockIter {
         return BlockIter {
             begin: start_addr,
             end: end_addr,
-            blk_size_log2: blk_size_log2,
+            blk_size_log2,
             multiblock: false,
         };
     }
@@ -70,7 +70,8 @@ impl BlockIter {
         return BlockIter {
             begin: start_addr,
             end: end_addr,
-            blk_size_log2: blk_size_log2,
+
+            blk_size_log2,
             multiblock: true,
         };
     }
@@ -92,9 +93,9 @@ impl BlockIter {
         return BlockRange {
             lba_start: lba_id,
             lba_end: lba_id + 1,
-            begin: begin,
-            end: end,
-            blk_size_log2: blk_size_log2,
+            begin,
+            end,
+            blk_size_log2,
         };
     }
 
@@ -119,11 +120,11 @@ impl BlockIter {
         self.begin += end - begin;
 
         return BlockRange {
-            lba_start: lba_start,
-            lba_end: lba_end,
-            begin: begin,
-            end: end,
-            blk_size_log2: blk_size_log2,
+            lba_start,
+            lba_end,
+            begin,
+            end,
+            blk_size_log2,
         };
     }
 }

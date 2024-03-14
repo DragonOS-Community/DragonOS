@@ -18,7 +18,7 @@ use crate::{
     mm::init::mm_init,
     process::{kthread::kthread_init, process_init, ProcessManager},
     sched::{core::sched_init, SchedArch},
-    smp::SMPArch,
+    smp::{early_smp_init, SMPArch},
     syscall::Syscall,
     time::{
         clocksource::clocksource_boot_finish, timekeeping::timekeeping_init, timer::timer_init,
@@ -30,7 +30,7 @@ use crate::{
 /// 前面可能会有一个架构相关的函数
 pub fn start_kernel() -> ! {
     // 进入内核后，中断应该是关闭的
-    assert_eq!(CurrentIrqArch::is_irq_enabled(), false);
+    assert!(!CurrentIrqArch::is_irq_enabled());
 
     do_start_kernel();
 
@@ -47,16 +47,23 @@ fn do_start_kernel() {
 
     early_setup_arch().expect("setup_arch failed");
     unsafe { mm_init() };
+
     scm_reinit().unwrap();
     textui_init().unwrap();
     init_intertrait();
+
     vfs_init().expect("vfs init failed");
     driver_init().expect("driver init failed");
-    unsafe { acpi_init() };
-    irq_init().expect("irq init failed");
-    CurrentSMPArch::prepare_cpus().expect("prepare_cpus failed");
 
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        acpi_init()
+    };
+
+    early_smp_init().expect("early smp init failed");
+    irq_init().expect("irq init failed");
     setup_arch().expect("setup_arch failed");
+    CurrentSMPArch::prepare_cpus().expect("prepare_cpus failed");
 
     process_init();
     sched_init();
@@ -69,7 +76,7 @@ fn do_start_kernel() {
 
     CurrentSMPArch::init().expect("smp init failed");
     // SMP初始化有可能会开中断，所以这里再次检查中断是否关闭
-    assert_eq!(CurrentIrqArch::is_irq_enabled(), false);
+    assert!(!CurrentIrqArch::is_irq_enabled());
     Futex::init();
 
     setup_arch_post().expect("setup_arch_post failed");

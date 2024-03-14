@@ -23,12 +23,5 @@ pub fn driver_init() -> Result<(), SystemError> {
     cpu_device_manager().init()?;
 
     // 至此，已完成设备驱动模型的初始化
-    // 接下来，初始化设备
-    actual_device_init()?;
-    return Ok(());
-}
-
-fn actual_device_init() -> Result<(), SystemError> {
-    // 应当使用unified_init来初始化
     return Ok(());
 }

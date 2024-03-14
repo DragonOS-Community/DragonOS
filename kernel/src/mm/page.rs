@@ -293,7 +293,7 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
     #[inline(always)]
     pub const unsafe fn from_data(data: usize) -> Self {
         return Self {
-            data: data,
+            data,
             phantom: PhantomData,
         };
     }
@@ -624,7 +624,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             if table.level() == 0 {
                 // todo: 检查是否已经映射
                 // 现在不检查的原因是，刚刚启动系统时，内核会映射一些页。
-                if table.entry_mapped(i)? == true {
+                if table.entry_mapped(i)? {
                     kwarn!("Page {:?} already mapped", virt);
                 }
 
@@ -752,8 +752,8 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             return None;
         }
 
-        let mut table = self.table();
-        return unmap_phys_inner(virt, &mut table, unmap_parents, self.allocator_mut())
+        let table = self.table();
+        return unmap_phys_inner(virt, &table, unmap_parents, self.allocator_mut())
             .map(|(paddr, flags)| (paddr, flags, PageFlush::<Arch>::new(virt)));
     }
 
@@ -791,7 +791,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
 /// 如果取消成功，返回被取消映射的页表项的：【物理地址】和【flags】，否则返回None
 unsafe fn unmap_phys_inner<Arch: MemoryManagementArch>(
     vaddr: VirtAddr,
-    table: &mut PageTable<Arch>,
+    table: &PageTable<Arch>,
     unmap_parents: bool,
     allocator: &mut impl FrameAllocator,
 ) -> Option<(PhysAddr, PageFlags<Arch>)> {
@@ -805,9 +805,9 @@ unsafe fn unmap_phys_inner<Arch: MemoryManagementArch>(
         return Some((entry.address().ok()?, entry.flags()));
     }
 
-    let mut subtable = table.next_level_table(i)?;
+    let subtable = table.next_level_table(i)?;
     // 递归地取消映射
-    let result = unmap_phys_inner(vaddr, &mut subtable, unmap_parents, allocator)?;
+    let result = unmap_phys_inner(vaddr, &subtable, unmap_parents, allocator)?;
 
     // TODO: This is a bad idea for architectures where the kernel mappings are done in the process tables,
     // as these mappings may become out of sync

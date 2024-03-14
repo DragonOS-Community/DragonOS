@@ -205,14 +205,13 @@ pub(super) fn irq_msi_compose_msg(cfg: &HardwareIrqConfig, msg: &mut MsiMsg, dma
         // todo: 判断vmx是否支持 extended destination mode
         // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/apic/apic.c?fi=__irq_msi_compose_msg#2580
         address_lo.set_virt_destid_8_14(cfg.apic_id.data() >> 8);
-    } else {
-        if unlikely(cfg.apic_id.data() > 0xff) {
-            kwarn!(
-                "irq_msi_compose_msg: Invalid APIC ID: {}",
-                cfg.apic_id.data()
-            );
-        }
+    } else if unlikely(cfg.apic_id.data() > 0xff) {
+        kwarn!(
+            "irq_msi_compose_msg: Invalid APIC ID: {}",
+            cfg.apic_id.data()
+        );
     }
+
     msg.address_hi = address_hi.into();
     msg.address_lo = address_lo.into();
     msg.data = arch_data.into();

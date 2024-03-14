@@ -147,39 +147,39 @@ impl Signal {
             Signal::INVALID => {
                 kerror!("attempting to handler an Invalid");
             }
-            Signal::SIGHUP => sig_terminate(self.clone()),
-            Signal::SIGINT => sig_terminate(self.clone()),
-            Signal::SIGQUIT => sig_terminate_dump(self.clone()),
-            Signal::SIGILL => sig_terminate_dump(self.clone()),
-            Signal::SIGTRAP => sig_terminate_dump(self.clone()),
-            Signal::SIGABRT_OR_IOT => sig_terminate_dump(self.clone()),
-            Signal::SIGBUS => sig_terminate_dump(self.clone()),
-            Signal::SIGFPE => sig_terminate_dump(self.clone()),
-            Signal::SIGKILL => sig_terminate(self.clone()),
-            Signal::SIGUSR1 => sig_terminate(self.clone()),
-            Signal::SIGSEGV => sig_terminate_dump(self.clone()),
-            Signal::SIGUSR2 => sig_terminate(self.clone()),
-            Signal::SIGPIPE => sig_terminate(self.clone()),
-            Signal::SIGALRM => sig_terminate(self.clone()),
-            Signal::SIGTERM => sig_terminate(self.clone()),
-            Signal::SIGSTKFLT => sig_terminate(self.clone()),
-            Signal::SIGCHLD => sig_ignore(self.clone()),
-            Signal::SIGCONT => sig_continue(self.clone()),
-            Signal::SIGSTOP => sig_stop(self.clone()),
-            Signal::SIGTSTP => sig_stop(self.clone()),
-            Signal::SIGTTIN => sig_stop(self.clone()),
-            Signal::SIGTTOU => sig_stop(self.clone()),
-            Signal::SIGURG => sig_ignore(self.clone()),
-            Signal::SIGXCPU => sig_terminate_dump(self.clone()),
-            Signal::SIGXFSZ => sig_terminate_dump(self.clone()),
-            Signal::SIGVTALRM => sig_terminate(self.clone()),
-            Signal::SIGPROF => sig_terminate(self.clone()),
-            Signal::SIGWINCH => sig_ignore(self.clone()),
-            Signal::SIGIO_OR_POLL => sig_terminate(self.clone()),
-            Signal::SIGPWR => sig_terminate(self.clone()),
-            Signal::SIGSYS => sig_terminate(self.clone()),
-            Signal::SIGRTMIN => sig_terminate(self.clone()),
-            Signal::SIGRTMAX => sig_terminate(self.clone()),
+            Signal::SIGHUP => sig_terminate(*self),
+            Signal::SIGINT => sig_terminate(*self),
+            Signal::SIGQUIT => sig_terminate_dump(*self),
+            Signal::SIGILL => sig_terminate_dump(*self),
+            Signal::SIGTRAP => sig_terminate_dump(*self),
+            Signal::SIGABRT_OR_IOT => sig_terminate_dump(*self),
+            Signal::SIGBUS => sig_terminate_dump(*self),
+            Signal::SIGFPE => sig_terminate_dump(*self),
+            Signal::SIGKILL => sig_terminate(*self),
+            Signal::SIGUSR1 => sig_terminate(*self),
+            Signal::SIGSEGV => sig_terminate_dump(*self),
+            Signal::SIGUSR2 => sig_terminate(*self),
+            Signal::SIGPIPE => sig_terminate(*self),
+            Signal::SIGALRM => sig_terminate(*self),
+            Signal::SIGTERM => sig_terminate(*self),
+            Signal::SIGSTKFLT => sig_terminate(*self),
+            Signal::SIGCHLD => sig_ignore(*self),
+            Signal::SIGCONT => sig_continue(*self),
+            Signal::SIGSTOP => sig_stop(*self),
+            Signal::SIGTSTP => sig_stop(*self),
+            Signal::SIGTTIN => sig_stop(*self),
+            Signal::SIGTTOU => sig_stop(*self),
+            Signal::SIGURG => sig_ignore(*self),
+            Signal::SIGXCPU => sig_terminate_dump(*self),
+            Signal::SIGXFSZ => sig_terminate_dump(*self),
+            Signal::SIGVTALRM => sig_terminate(*self),
+            Signal::SIGPROF => sig_terminate(*self),
+            Signal::SIGWINCH => sig_ignore(*self),
+            Signal::SIGIO_OR_POLL => sig_terminate(*self),
+            Signal::SIGPWR => sig_terminate(*self),
+            Signal::SIGSYS => sig_terminate(*self),
+            Signal::SIGRTMIN => sig_terminate(*self),
+            Signal::SIGRTMAX => sig_terminate(*self),
         }
     }
 }
@@ -275,7 +275,7 @@ bitflags! {
         const SIGSYS   =  1<<30;
         const SIGRTMIN =  1<<31;
         // TODO 写上实时信号
-        const SIGRTMAX =  1<<MAX_SIG_NUM-1;
+        const SIGRTMAX =  1 << (MAX_SIG_NUM-1);
     }
 }
 
@@ -415,7 +415,8 @@ pub struct X86_64SignalArch;
 impl SignalArch for X86_64SignalArch {
     unsafe fn do_signal(frame: &mut TrapFrame) {
         let pcb = ProcessManager::current_pcb();
-        let siginfo = pcb.try_siginfo(5);
+
+        let siginfo = pcb.try_siginfo_irqsave(5);
 
         if unlikely(siginfo.is_none()) {
             return;
@@ -437,7 +438,7 @@ impl SignalArch for X86_64SignalArch {
         let sig_block: SigSet = siginfo_read_guard.sig_block().clone();
         drop(siginfo_read_guard);
 
-        let sig_guard = pcb.try_sig_struct_irq(5);
+        let sig_guard = pcb.try_sig_struct_irqsave(5);
         if unlikely(sig_guard.is_none()) {
             return;
         }

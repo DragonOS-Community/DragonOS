@@ -501,7 +501,7 @@ impl ElfLoader {
 }
 
 impl BinaryLoader for ElfLoader {
-    fn probe(self: &'static Self, param: &ExecParam, buf: &[u8]) -> Result<(), ExecError> {
+    fn probe(&'static self, param: &ExecParam, buf: &[u8]) -> Result<(), ExecError> {
         // let elf_bytes =
         //     ElfBytes::<AnyEndian>::minimal_parse(buf).map_err(|_| ExecError::NotExecutable)?;
 
@@ -518,7 +518,7 @@ impl BinaryLoader for ElfLoader {
     }
 
     fn load(
-        self: &'static Self,
+        &'static self,
         param: &mut ExecParam,
         head_buf: &[u8],
     ) -> Result<BinaryLoaderResult, ExecError> {
@@ -743,10 +743,10 @@ impl BinaryLoader for ElfLoader {
             }
 
             let p_vaddr = VirtAddr::new(seg_to_load.p_vaddr as usize);
-            if (seg_to_load.p_flags & elf::abi::PF_X) != 0 {
-                if start_code.is_none() || start_code.as_ref().unwrap() > &p_vaddr {
-                    start_code = Some(p_vaddr);
-                }
+            if (seg_to_load.p_flags & elf::abi::PF_X) != 0
+                && (start_code.is_none() || start_code.as_ref().unwrap() > &p_vaddr)
+            {
+                start_code = Some(p_vaddr);
             }
 
             if start_data.is_none()

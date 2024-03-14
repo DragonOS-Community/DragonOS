@@ -357,7 +357,7 @@ impl KernelThreadMechanism {
     ) -> Option<Arc<ProcessControlBlock>> {
         let pcb = Self::create(func, name)?;
         ProcessManager::wakeup(&pcb)
-            .expect(format!("Failed to wakeup kthread: {:?}", pcb.pid()).as_str());
+            .unwrap_or_else(|_| panic!("Failed to wakeup kthread: {:?}", pcb.pid()));
         return Some(pcb);
     }
 

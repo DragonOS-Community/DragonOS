@@ -1,4 +1,6 @@
 #![no_std]
+#![allow(clippy::needless_return)]
+#![allow(clippy::upper_case_acronyms)]
 
 use num_derive::{FromPrimitive, ToPrimitive};
 

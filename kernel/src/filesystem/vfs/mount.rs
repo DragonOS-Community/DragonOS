@@ -48,7 +48,7 @@ impl MountFS {
         return MountFS {
             inner_filesystem: inner_fs,
             mountpoints: SpinLock::new(BTreeMap::new()),
-            self_mountpoint: self_mountpoint,
+            self_mountpoint,
             self_ref: Weak::default(),
         }
         .wrap();
@@ -368,6 +368,11 @@ impl IndexNode for MountFSInode {
     #[inline]
     fn special_node(&self) -> Option<super::SpecialNodeData> {
         self.inner_inode.special_node()
+    }
+
+    #[inline]
+    fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
+        self.inner_inode.poll(private_data)
     }
 }
 

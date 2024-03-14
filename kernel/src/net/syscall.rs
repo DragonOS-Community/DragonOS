@@ -156,7 +156,6 @@ impl Syscall {
                     return Ok(0);
                 }
                 PosixSocketOption::SO_RCVBUF => {
-                    let optval = optval as *mut u32;
                     // 返回默认的接收缓冲区大小
                     unsafe {
                         *optval = socket.metadata()?.rx_buf_size as u32;
@@ -666,7 +665,7 @@ impl From<Endpoint> for SockAddr {
         match value {
             Endpoint::Ip(ip_endpoint) => {
                 // 未指定地址
-                if let None = ip_endpoint {
+                if ip_endpoint.is_none() {
                     return SockAddr {
                         addr_ph: SockAddrPlaceholder {
                             family: AddressFamily::Unspecified as u16,
@@ -802,9 +801,9 @@ impl TryFrom<u16> for PosixIpProtocol {
     }
 }
 
-impl Into<u16> for PosixIpProtocol {
-    fn into(self) -> u16 {
-        <Self as ToPrimitive>::to_u16(&self).unwrap()
+impl From<PosixIpProtocol> for u16 {
+    fn from(value: PosixIpProtocol) -> Self {
+        <PosixIpProtocol as ToPrimitive>::to_u16(&value).unwrap()
     }
 }
 
@@ -923,9 +922,9 @@ impl TryFrom<i32> for PosixSocketOption {
     }
 }
 
-impl Into<i32> for PosixSocketOption {
-    fn into(self) -> i32 {
-        <Self as ToPrimitive>::to_i32(&self).unwrap()
+impl From<PosixSocketOption> for i32 {
+    fn from(value: PosixSocketOption) -> Self {
+        <PosixSocketOption as ToPrimitive>::to_i32(&value).unwrap()
     }
 }
 

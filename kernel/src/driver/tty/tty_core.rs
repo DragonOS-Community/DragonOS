@@ -1,6 +1,6 @@
 use core::{fmt::Debug, sync::atomic::AtomicBool};
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{collections::LinkedList, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
@@ -11,7 +11,7 @@ use crate::{
         wait_queue::EventWaitQueue,
     },
     mm::VirtAddr,
-    net::event_poll::EPollEventType,
+    net::event_poll::{EPollEventType, EPollItem},
     process::Pid,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
@@ -53,6 +53,7 @@ impl TtyCore {
             closing: AtomicBool::new(false),
             flow: SpinLock::new(TtyFlowState::default()),
             link: None,
+            epitems: SpinLock::new(LinkedList::new()),
         };
 
         return Arc::new(Self {
@@ -159,6 +160,13 @@ impl TtyCore {
                 user_writer.copy_one_to_user(&termios, 0)?;
                 return Ok(0);
             }
+            TtyIoctlCmd::TCSETS => {
+                return TtyCore::core_set_termios(
+                    real_tty,
+                    VirtAddr::new(arg),
+                    TtySetTermiosOpt::TERMIOS_OLD,
+                );
+            }
             TtyIoctlCmd::TCSETSW => {
                 return TtyCore::core_set_termios(
                     real_tty,
@@ -213,9 +221,7 @@ impl TtyCore {
         let mut termios = tty.core().termios_write();
 
         let old_termios = termios.clone();
-
         *termios = new_termios;
-
         let tmp = termios.control_mode;
         termios.control_mode ^= (tmp ^ old_termios.control_mode) & ControlMode::ADDRB;
 
@@ -300,6 +306,8 @@ pub struct TtyCoreData {
     flow: SpinLock<TtyFlowState>,
     /// 链接tty
     link: Option<Arc<TtyCore>>,
+    /// epitems
+    epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
 }
 
 impl TtyCoreData {
@@ -335,17 +343,17 @@ impl TtyCoreData {
 
     #[inline]
     pub fn termios(&self) -> RwLockReadGuard<'_, Termios> {
-        self.termios.read()
+        self.termios.read_irqsave()
     }
 
     #[inline]
     pub fn termios_write(&self) -> RwLockWriteGuard<Termios> {
-        self.termios.write()
+        self.termios.write_irqsave()
     }
 
     #[inline]
     pub fn set_termios(&self, termios: Termios) {
-        let mut termios_guard = self.termios.write();
+        let mut termios_guard = self.termios.write_irqsave();
         *termios_guard = termios;
     }
 
@@ -393,6 +401,11 @@ impl TtyCoreData {
     #[inline]
     pub fn link(&self) -> Option<Arc<TtyCore>> {
         self.link.clone()
+    }
+
+    #[inline]
+    pub fn add_epitem(&self, epitem: Arc<EPollItem>) {
+        self.epitems.lock().push_back(epitem)
     }
 }
 

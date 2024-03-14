@@ -40,9 +40,10 @@ pub const PAGE_SHIFT: u32 = 12;
 pub const PAGE_SIZE: u32 = 1 << PAGE_SHIFT;
 pub const PAGE_MASK: u32 = !(PAGE_SIZE - 1);
 
-#[repr(C)]
 /// 通过这个结构可以将虚拟机的物理地址对应到用户进程的虚拟地址
 /// 用来表示虚拟机的一段物理内存
+#[repr(C)]
+#[derive(Default)]
 pub struct KvmUserspaceMemoryRegion {
     pub slot: u32, // 要在哪个slot上注册内存区间
     // flags有两个取值，KVM_MEM_LOG_DIRTY_PAGES和KVM_MEM_READONLY，用来指示kvm针对这段内存应该做的事情。
@@ -77,18 +78,6 @@ pub enum KvmMemoryChange {
     Delete,
     Move,
     FlagsOnly,
-}
-
-impl Default for KvmUserspaceMemoryRegion {
-    fn default() -> KvmUserspaceMemoryRegion {
-        KvmUserspaceMemoryRegion {
-            slot: 0,
-            flags: 0,
-            guest_phys_addr: 0,
-            memory_size: 0,
-            userspace_addr: 0,
-        }
-    }
 }
 
 pub fn kvm_vcpu_memslots(_vcpu: &mut dyn Vcpu) -> KvmMemorySlots {
@@ -127,10 +116,10 @@ fn __gfn_to_hva_many(
         return Err(SystemError::KVM_HVA_ERR_BAD);
     }
 
-    if nr_pages.is_some() {
-        let nr_pages = nr_pages.unwrap();
+    if let Some(nr_pages) = nr_pages {
         *nr_pages = slot.npages - (gfn - slot.base_gfn);
     }
+
     return Ok(__gfn_to_hva(slot, gfn));
 }
 

@@ -224,13 +224,12 @@ unsafe extern "C" fn do_invalid_TSS(regs: &'static TrapFrame, error_code: u64) {
     let msg2: &str;
     if (error_code & 0x02) != 0 {
         msg2 = ERR_MSG_2;
+    } else if (error_code & 0x04) != 0 {
+        msg2 = ERR_MSG_3;
     } else {
-        if (error_code & 0x04) != 0 {
-            msg2 = ERR_MSG_3;
-        } else {
-            msg2 = ERR_MSG_4;
-        }
+        msg2 = ERR_MSG_4;
     }
+
     kerror!(
         "do_invalid_TSS(10), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}\n{}{}",
         error_code,

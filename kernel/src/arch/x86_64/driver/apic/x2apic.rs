@@ -22,13 +22,10 @@ impl LocalAPIC for X2Apic {
     fn init_current_cpu(&mut self) -> bool {
         unsafe {
             // 设置 x2APIC 使能位
-            wrmsr(
-                IA32_APIC_BASE.into(),
-                rdmsr(IA32_APIC_BASE.into()) | 1 << 10,
-            );
+            wrmsr(IA32_APIC_BASE, rdmsr(IA32_APIC_BASE) | 1 << 10);
 
             assert!(
-                (rdmsr(IA32_APIC_BASE.into()) & 0xc00) == 0xc00,
+                (rdmsr(IA32_APIC_BASE) & 0xc00) == 0xc00,
                 "x2APIC enable failed."
             );
 
@@ -40,10 +37,10 @@ impl LocalAPIC for X2Apic {
                     1 << 8
                 };
 
-                wrmsr(IA32_X2APIC_SIVR.into(), val);
+                wrmsr(IA32_X2APIC_SIVR, val);
 
                 assert!(
-                    (rdmsr(IA32_X2APIC_SIVR.into()) & 0x100) == 0x100,
+                    (rdmsr(IA32_X2APIC_SIVR) & 0x100) == 0x100,
                     "x2APIC software enable failed."
                 );
                 kinfo!("x2APIC software enabled.");
@@ -66,17 +63,17 @@ impl LocalAPIC for X2Apic {
     /// 发送 EOI (End Of Interrupt)
     fn send_eoi(&self) {
         unsafe {
-            wrmsr(IA32_X2APIC_EOI.into(), 0);
+            wrmsr(IA32_X2APIC_EOI, 0);
         }
     }
 
     /// 获取 x2APIC 版本
     fn version(&self) -> u8 {
-        unsafe { (rdmsr(IA32_X2APIC_VERSION.into()) & 0xff) as u8 }
+        unsafe { (rdmsr(IA32_X2APIC_VERSION) & 0xff) as u8 }
     }
 
     fn support_eoi_broadcast_suppression(&self) -> bool {
-        unsafe { ((rdmsr(IA32_X2APIC_VERSION.into()) >> 24) & 1) == 1 }
+        unsafe { ((rdmsr(IA32_X2APIC_VERSION) >> 24) & 1) == 1 }
     }
 
     fn max_lvt_entry(&self) -> u8 {
@@ -85,7 +82,7 @@ impl LocalAPIC for X2Apic {
 
     /// 获取 x2APIC 的 APIC ID
     fn id(&self) -> ApicId {
-        unsafe { ApicId::new(rdmsr(IA32_X2APIC_APICID.into()) as u32) }
+        unsafe { ApicId::new(rdmsr(IA32_X2APIC_APICID) as u32) }
     }
 
     /// 设置 Local Vector Table (LVT) 寄存器

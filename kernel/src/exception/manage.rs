@@ -251,10 +251,8 @@ impl IrqManager {
             }
 
             action_guard.set_handler(Some(&IrqNestedPrimaryHandler));
-        } else {
-            if desc.can_thread() {
-                self.setup_forced_threading(action_guard.deref_mut())?;
-            }
+        } else if desc.can_thread() {
+            self.setup_forced_threading(action_guard.deref_mut())?;
         }
 
         // 如果具有中断线程处理程序，并且中断不是嵌套的，则设置中断线程
@@ -451,7 +449,7 @@ impl IrqManager {
             }
 
             // 激活中断。这种激活必须独立于IRQ_NOAUTOEN进行*desc_inner_guard.internal_state_mut() |= IrqDescState::IRQS_NOREQUEST;uest.
-            if let Err(e) = self.irq_activate(desc.clone(), &mut desc_inner_guard) {
+            if let Err(e) = self.irq_activate(&desc, &mut desc_inner_guard) {
                 return Err(err_out_unlock(
                     e,
                     desc_inner_guard,
@@ -499,7 +497,7 @@ impl IrqManager {
             {
                 // 如果没有设置IRQF_NOAUTOEN，则自动使能中断
                 self.irq_startup(
-                    desc.clone(),
+                    &desc,
                     &mut desc_inner_guard,
                     Self::IRQ_RESEND,
                     Self::IRQ_START_COND,
@@ -510,15 +508,14 @@ impl IrqManager {
                 // 共享中断可能在它仍然被禁用时请求它，然后永远等待中断。
 
                 static mut WARNED: bool = false;
-                if action_guard.flags().contains(IrqHandleFlags::IRQF_SHARED) {
-                    if unsafe { !WARNED } {
-                        kwarn!(
-                            "Shared interrupt {} for {} requested but not auto enabled",
-                            irq.data(),
-                            action_guard.name()
-                        );
-                        unsafe { WARNED = true };
-                    }
+                if action_guard.flags().contains(IrqHandleFlags::IRQF_SHARED) && unsafe { !WARNED }
+                {
+                    kwarn!(
+                        "Shared interrupt {} for {} requested but not auto enabled",
+                        irq.data(),
+                        action_guard.name()
+                    );
+                    unsafe { WARNED = true };
                 }
 
                 desc_inner_guard.set_depth(1);
@@ -598,9 +595,19 @@ impl IrqManager {
             .ok();
     }
 
+    pub(super) fn irq_activate_and_startup(
+        &self,
+        desc: &Arc<IrqDesc>,
+        desc_inner_guard: &mut SpinLockGuard<'_, InnerIrqDesc>,
+        resend: bool,
+    ) -> Result<(), SystemError> {
+        self.irq_activate(desc, desc_inner_guard)?;
+        self.irq_startup(desc, desc_inner_guard, resend, Self::IRQ_START_FORCE)
+    }
+
     pub(super) fn irq_activate(
         &self,
-        _desc: Arc<IrqDesc>,
+        _desc: &Arc<IrqDesc>,
         desc_inner_guard: &mut SpinLockGuard<'_, InnerIrqDesc>,
     ) -> Result<(), SystemError> {
         let irq_data = desc_inner_guard.irq_data();
@@ -615,7 +622,7 @@ impl IrqManager {
     /// 设置CPU亲和性并开启中断
     pub(super) fn irq_startup(
         &self,
-        desc: Arc<IrqDesc>,
+        desc: &Arc<IrqDesc>,
         desc_inner_guard: &mut SpinLockGuard<'_, InnerIrqDesc>,
         resend: bool,
         force: bool,
@@ -636,7 +643,7 @@ impl IrqManager {
                         .flags()
                         .contains(IrqChipFlags::IRQCHIP_AFFINITY_PRE_STARTUP)
                     {
-                        self.irq_setup_affinity(&desc, desc_inner_guard).ok();
+                        self.irq_setup_affinity(desc, desc_inner_guard).ok();
                     }
 
                     ret = self.__irq_startup(desc_inner_guard);
@@ -647,7 +654,7 @@ impl IrqManager {
                         .flags()
                         .contains(IrqChipFlags::IRQCHIP_AFFINITY_PRE_STARTUP)
                     {
-                        self.irq_setup_affinity(&desc, desc_inner_guard).ok();
+                        self.irq_setup_affinity(desc, desc_inner_guard).ok();
                     }
                 }
                 IrqStartupResult::Managed => {

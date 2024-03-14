@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+
 use system_error::SystemError;
 
 use crate::{
@@ -91,7 +92,7 @@ impl Completion {
     pub fn complete(&self) {
         let mut inner = self.inner.lock_irqsave();
         if inner.done != COMPLETE_ALL {
-            inner.done += 1;
+            inner.done = inner.done.saturating_add(1);
         }
         inner.wait_queue.wakeup(None);
         // 脱离生命周期，自动释放guard

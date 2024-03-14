@@ -25,7 +25,7 @@ use super::{
 };
 
 /// 所有的要解析的表格的解析器
-static TABLE_PARSERS: &'static [&'static TableMatcher] = &[
+static TABLE_PARSERS: &[&TableMatcher] = &[
     &TableMatcher::new(&MatchTableDragonStubPayloadEFI),
     &TableMatcher::new(&MatchTableMemoryAttributes),
     &TableMatcher::new(&MatchTableMemReserve),

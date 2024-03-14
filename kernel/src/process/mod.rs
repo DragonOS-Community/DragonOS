@@ -259,9 +259,8 @@ impl ProcessManager {
     /// - 进入当前函数之前，必须关闭中断
     /// - 进入当前函数之后必须保证逻辑的正确性，避免被重复加入调度队列
     pub fn mark_sleep(interruptable: bool) -> Result<(), SystemError> {
-        assert_eq!(
-            CurrentIrqArch::is_irq_enabled(),
-            false,
+        assert!(
+            !CurrentIrqArch::is_irq_enabled(),
             "interrupt must be disabled before enter ProcessManager::mark_sleep()"
         );
 
@@ -284,9 +283,8 @@ impl ProcessManager {
     /// - 进入当前函数之前，不能持有sched_info的锁
     /// - 进入当前函数之前，必须关闭中断
     pub fn mark_stop() -> Result<(), SystemError> {
-        assert_eq!(
-            CurrentIrqArch::is_irq_enabled(),
-            false,
+        assert!(
+            !CurrentIrqArch::is_irq_enabled(),
             "interrupt must be disabled before enter ProcessManager::mark_stop()"
         );
 
@@ -311,7 +309,7 @@ impl ProcessManager {
                     .adopt_childen()
                     .unwrap_or_else(|e| panic!("adopte_childen failed: error: {e:?}"))
             };
-            let r = current.parent_pcb.read().upgrade();
+            let r = current.parent_pcb.read_irqsave().upgrade();
             if r.is_none() {
                 return;
             }
@@ -344,7 +342,7 @@ impl ProcessManager {
         pcb.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
 
         // 进行进程退出后的工作
-        let thread = pcb.thread.write();
+        let thread = pcb.thread.write_irqsave();
         if let Some(addr) = thread.set_child_tid {
             unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
         }
@@ -426,8 +424,6 @@ impl ProcessManager {
         let cpu_id = pcb.sched_info().on_cpu();
 
         if let Some(cpu_id) = cpu_id {
-            let cpu_id = cpu_id;
-
             if pcb.pid() == CPU_EXECUTING.get(cpu_id) {
                 kick_cpu(cpu_id).expect("ProcessManager::kick(): Failed to kick cpu");
             }
@@ -449,8 +445,8 @@ pub unsafe extern "C" fn switch_finish_hook() {
 
 int_like!(Pid, AtomicPid, usize, AtomicUsize);
 
-impl Pid {
-    pub fn to_string(&self) -> String {
+impl ToString for Pid {
+    fn to_string(&self) -> String {
         self.0.to_string()
     }
 }
@@ -622,7 +618,7 @@ impl ProcessControlBlock {
 
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find(ppid)
             .map(|p| Arc::downgrade(&p))
-            .unwrap_or_else(|| Weak::new());
+            .unwrap_or_default();
 
         let pcb = Self {
             pid,
@@ -668,7 +664,7 @@ impl ProcessControlBlock {
 
         // 将当前pcb加入父进程的子进程哈希表中
         if pcb.pid() > Pid(1) {
-            if let Some(ppcb_arc) = pcb.parent_pcb.read().upgrade() {
+            if let Some(ppcb_arc) = pcb.parent_pcb.read_irqsave().upgrade() {
                 let mut children = ppcb_arc.children.write_irqsave();
                 children.push(pcb.pid());
             } else {
@@ -718,7 +714,7 @@ impl ProcessControlBlock {
     /// 否则会导致死锁
     #[inline(always)]
     pub fn basic(&self) -> RwLockReadGuard<ProcessBasicInfo> {
-        return self.basic.read();
+        return self.basic.read_irqsave();
     }
 
     #[inline(always)]
@@ -841,17 +837,13 @@ impl ProcessControlBlock {
         return name;
     }
 
-    pub fn sig_info(&self) -> RwLockReadGuard<ProcessSignalInfo> {
-        self.sig_info.read()
-    }
-
     pub fn sig_info_irqsave(&self) -> RwLockReadGuard<ProcessSignalInfo> {
         self.sig_info.read_irqsave()
     }
 
-    pub fn try_siginfo(&self, times: u8) -> Option<RwLockReadGuard<ProcessSignalInfo>> {
+    pub fn try_siginfo_irqsave(&self, times: u8) -> Option<RwLockReadGuard<ProcessSignalInfo>> {
         for _ in 0..times {
-            if let Some(r) = self.sig_info.try_read() {
+            if let Some(r) = self.sig_info.try_read_irqsave() {
                 return Some(r);
             }
         }
@@ -865,7 +857,7 @@ impl ProcessControlBlock {
 
     pub fn try_siginfo_mut(&self, times: u8) -> Option<RwLockWriteGuard<ProcessSignalInfo>> {
         for _ in 0..times {
-            if let Some(r) = self.sig_info.try_write() {
+            if let Some(r) = self.sig_info.try_write_irqsave() {
                 return Some(r);
             }
         }
@@ -874,10 +866,10 @@ impl ProcessControlBlock {
     }
 
     pub fn sig_struct(&self) -> SpinLockGuard<SignalStruct> {
-        self.sig_struct.lock()
+        self.sig_struct.lock_irqsave()
     }
 
-    pub fn try_sig_struct_irq(&self, times: u8) -> Option<SpinLockGuard<SignalStruct>> {
+    pub fn try_sig_struct_irqsave(&self, times: u8) -> Option<SpinLockGuard<SignalStruct>> {
         for _ in 0..times {
             if let Ok(r) = self.sig_struct.try_lock_irqsave() {
                 return Some(r);
@@ -894,13 +886,19 @@ impl ProcessControlBlock {
 
 impl Drop for ProcessControlBlock {
     fn drop(&mut self) {
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        // kdebug!("drop: {:?}", self.pid);
         // 在ProcFS中,解除进程的注册
         procfs_unregister_pid(self.pid())
             .unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));
 
-        if let Some(ppcb) = self.parent_pcb.read().upgrade() {
-            ppcb.children.write().retain(|pid| *pid != self.pid());
+        if let Some(ppcb) = self.parent_pcb.read_irqsave().upgrade() {
+            ppcb.children
+                .write_irqsave()
+                .retain(|pid| *pid != self.pid());
         }
+
+        drop(irq_guard);
     }
 }
 
@@ -1190,7 +1188,7 @@ impl KernelStack {
     ///
     /// 仅仅用于BSP启动时，为idle进程构造内核栈。其他时候使用这个函数，很可能造成错误！
     pub unsafe fn from_existed(base: VirtAddr) -> Result<Self, SystemError> {
-        if base.is_null() || base.check_aligned(Self::ALIGN) == false {
+        if base.is_null() || !base.check_aligned(Self::ALIGN) {
             return Err(SystemError::EFAULT);
         }
 
@@ -1271,7 +1269,7 @@ impl KernelStack {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        if !self.stack.is_none() {
+        if self.stack.is_some() {
             let ptr = self.stack.as_ref().unwrap().as_ptr() as *const *const ProcessControlBlock;
             if unsafe { !(*ptr).is_null() } {
                 let pcb_ptr: Weak<ProcessControlBlock> = unsafe { Weak::from_raw(*ptr) };

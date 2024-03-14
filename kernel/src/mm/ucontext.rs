@@ -178,7 +178,7 @@ impl InnerAddressSpace {
             let new_vma = VMA::zeroed(
                 VirtPageFrame::new(vma_guard.region.start()),
                 PageFrameCount::new(vma_guard.region.size() / MMArch::PAGE_SIZE),
-                vma_guard.vm_flags().clone(),
+                *vma_guard.vm_flags(),
                 tmp_flags,
                 &mut new_guard.user_mapper.utable,
                 (),
@@ -287,7 +287,7 @@ impl InnerAddressSpace {
             prot_flags,
             map_flags,
             move |page, count, flags, mapper, flusher| {
-                Ok(VMA::zeroed(page, count, vm_flags, flags, mapper, flusher)?)
+                VMA::zeroed(page, count, vm_flags, flags, mapper, flusher)
             },
         )?;
 
@@ -409,17 +409,18 @@ impl InnerAddressSpace {
             return Err(SystemError::EINVAL);
         }
 
+        // 初始化映射标志
+        let mut map_flags: MapFlags = vm_flags.into();
+        // 初始化内存区域保护标志
+        let prot_flags: ProtFlags = vm_flags.into();
+
         // 取消新内存区域的原映射
         if mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
+            map_flags |= MapFlags::MAP_FIXED;
             let start_page = VirtPageFrame::new(new_vaddr);
             let page_count = PageFrameCount::from_bytes(new_len).unwrap();
             self.munmap(start_page, page_count)?;
         }
-
-        // 初始化映射标志
-        let map_flags: MapFlags = vm_flags.into();
-        // 初始化内存区域保护标志
-        let prot_flags: ProtFlags = vm_flags.into();
 
         // 获取映射后的新内存页面
         let new_page = self.map_anonymous(new_vaddr, new_len, prot_flags, map_flags, true)?;
@@ -433,9 +434,7 @@ impl InnerAddressSpace {
             UserBufferWriter::new(new_page_vaddr.data() as *mut u8, new_len, true)?;
         let new_buf: &mut [u8] = new_buffer_writer.buffer(0)?;
         let len = old_buf.len().min(new_buf.len());
-        for i in 0..len {
-            new_buf[i] = old_buf[i];
-        }
+        new_buf[..len].copy_from_slice(&old_buf[..len]);
 
         return Ok(new_page_vaddr);
     }
@@ -516,7 +515,7 @@ impl InnerAddressSpace {
 
         for r in regions {
             // kdebug!("mprotect: r: {:?}", r);
-            let r = r.lock().region().clone();
+            let r = *r.lock().region();
             let r = self.mappings.remove_vma(&r).unwrap();
 
             let intersection = r.lock().region().intersect(&region).unwrap();
@@ -624,7 +623,7 @@ impl InnerAddressSpace {
         let new_brk = if incr > 0 {
             self.brk + incr as usize
         } else {
-            self.brk - (incr.abs() as usize)
+            self.brk - incr.unsigned_abs()
         };
 
         let new_brk = VirtAddr::new(page_align_up(new_brk.data()));
@@ -706,7 +705,7 @@ impl UserMappings {
         let r = self
             .vmas
             .iter()
-            .filter(move |v| !v.lock().region.intersect(&request).is_none())
+            .filter(move |v| v.lock().region.intersect(&request).is_some())
             .cloned();
         return r;
     }
@@ -828,7 +827,7 @@ impl UserMappings {
 
     /// 在当前进程的映射关系中，插入一个新的VMA。
     pub fn insert_vma(&mut self, vma: Arc<LockedVMA>) {
-        let region = vma.lock().region.clone();
+        let region = vma.lock().region;
         // 要求插入的地址范围必须是空闲的，也就是说，当前进程的地址空间中，不能有任何与之重叠的VMA。
         assert!(self.conflicts(region).next().is_none());
         self.reserve_hole(&region);
@@ -1292,7 +1291,7 @@ impl Eq for VMA {}
 
 impl PartialOrd for VMA {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        return self.region.partial_cmp(&other.region);
+        Some(self.cmp(other))
     }
 }
 

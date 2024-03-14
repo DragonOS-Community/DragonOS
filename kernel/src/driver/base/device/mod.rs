@@ -98,11 +98,11 @@ pub fn sys_dev_char_kset() -> Arc<KSet> {
     unsafe { DEV_CHAR_KSET_INSTANCE.as_ref().unwrap().clone() }
 }
 
-pub(self) unsafe fn set_sys_dev_block_kset(kset: Arc<KSet>) {
+unsafe fn set_sys_dev_block_kset(kset: Arc<KSet>) {
     DEV_BLOCK_KSET_INSTANCE = Some(kset);
 }
 
-pub(self) unsafe fn set_sys_dev_char_kset(kset: Arc<KSet>) {
+unsafe fn set_sys_dev_char_kset(kset: Arc<KSet>) {
     DEV_CHAR_KSET_INSTANCE = Some(kset);
 }
 
@@ -111,7 +111,7 @@ pub fn sys_devices_virtual_kset() -> Arc<KSet> {
     unsafe { DEVICES_VIRTUAL_KSET_INSTANCE.as_ref().unwrap().clone() }
 }
 
-pub(self) unsafe fn set_sys_devices_virtual_kset(kset: Arc<KSet>) {
+unsafe fn set_sys_devices_virtual_kset(kset: Arc<KSet>) {
     DEVICES_VIRTUAL_KSET_INSTANCE = Some(kset);
 }
 

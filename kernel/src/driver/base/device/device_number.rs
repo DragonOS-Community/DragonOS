@@ -33,7 +33,7 @@ pub struct DeviceNumber {
 
 impl DeviceNumber {
     pub const MINOR_BITS: u32 = 20;
-    pub const MINOR_MASK: u32 = 1 << Self::MINOR_BITS - 1;
+    pub const MINOR_MASK: u32 = 1 << (Self::MINOR_BITS - 1);
 
     pub const fn new(major: Major, minor: u32) -> Self {
         Self {

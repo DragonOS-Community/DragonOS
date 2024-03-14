@@ -52,6 +52,8 @@ pub struct EventPoll {
 
 impl EventPoll {
     pub const EP_MAX_EVENTS: u32 = INT32_MAX / (core::mem::size_of::<EPollEvent>() as u32);
+    /// 用于获取inode中的epitem队列
+    pub const ADD_EPOLLITEM: u32 = 0x7965;
     pub fn new() -> Self {
         Self {
             epoll_wq: WaitQueue::INIT,
@@ -60,6 +62,12 @@ impl EventPoll {
             shutdown: AtomicBool::new(false),
             self_ref: None,
         }
+    }
+}
+
+impl Default for EventPoll {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -370,7 +378,7 @@ impl EventPoll {
                         epds.events |=
                             EPollEventType::EPOLLERR.bits() | EPollEventType::EPOLLHUP.bits();
 
-                        Self::ep_modify(&mut epoll_guard, ep_item, &epds)?;
+                        Self::ep_modify(&mut epoll_guard, ep_item, epds)?;
                     }
                 }
             }
@@ -407,14 +415,12 @@ impl EventPoll {
         if let FilePrivateData::EPoll(epoll_data) = &ep_file.lock_irqsave().private_data {
             epolldata = Some(epoll_data.clone())
         }
-        if epolldata.is_some() {
-            let epoll_data = epolldata.unwrap();
+        if let Some(epoll_data) = epolldata {
             let epoll = epoll_data.epoll.clone();
             let epoll_guard = epoll.0.lock_irqsave();
 
             let mut timeout = false;
-            if timespec.is_some() {
-                let timespec = timespec.unwrap();
+            if let Some(timespec) = timespec {
                 if !(timespec.tv_sec > 0 || timespec.tv_nsec > 0) {
                     // 非阻塞情况
                     timeout = true;
@@ -462,15 +468,14 @@ impl EventPoll {
                 }
 
                 // 如果有未处理的信号则返回错误
-                if current_pcb.sig_info().sig_pending().signal().bits() != 0 {
+                if current_pcb.sig_info_irqsave().sig_pending().signal().bits() != 0 {
                     return Err(SystemError::EINTR);
                 }
 
                 // 还未等待到事件发生，则睡眠
                 // 注册定时器
                 let mut timer = None;
-                if timespec.is_some() {
-                    let timespec = timespec.unwrap();
+                if let Some(timespec) = timespec {
                     let handle = WakeUpHelper::new(current_pcb.clone());
                     let jiffies = next_n_us_timer_jiffies(
                         (timespec.tv_sec * 1000000 + timespec.tv_nsec / 1000) as u64,
@@ -485,13 +490,13 @@ impl EventPoll {
                 sched();
                 // 被唤醒后,检查是否有事件可读
                 available = epoll.0.lock_irqsave().ep_events_available();
-                if timer.is_some() {
-                    if timer.as_ref().unwrap().timeout() {
+                if let Some(timer) = timer {
+                    if timer.as_ref().timeout() {
                         // 超时
                         timeout = true;
                     } else {
                         // 未超时，则取消计时器
-                        timer.unwrap().cancel();
+                        timer.cancel();
                     }
                 }
             }
@@ -596,11 +601,9 @@ impl EventPoll {
         }
 
         let test_poll = dst_file.lock_irqsave().poll();
-        if test_poll.is_err() {
-            if test_poll.unwrap_err() == SystemError::EOPNOTSUPP_OR_ENOTSUP {
-                // 如果目标文件不支持poll
-                return Err(SystemError::ENOSYS);
-            }
+        if test_poll.is_err() && test_poll.unwrap_err() == SystemError::EOPNOTSUPP_OR_ENOTSUP {
+            // 如果目标文件不支持poll
+            return Err(SystemError::ENOSYS);
         }
 
         epoll_guard.ep_items.insert(epitem.fd, epitem.clone());
@@ -630,8 +633,7 @@ impl EventPoll {
         fd: i32,
         dst_file: Option<Arc<SpinLock<File>>>,
     ) -> Result<(), SystemError> {
-        if dst_file.is_some() {
-            let dst_file = dst_file.unwrap();
+        if let Some(dst_file) = dst_file {
             let mut file_guard = dst_file.lock_irqsave();
 
             file_guard.remove_epoll(epoll.self_ref.as_ref().unwrap())?;
@@ -707,7 +709,7 @@ impl EventPoll {
 
     /// ### epoll的回调，支持epoll的文件有事件到来时直接调用该方法即可
     pub fn wakeup_epoll(
-        epitems: &mut SpinLock<LinkedList<Arc<EPollItem>>>,
+        epitems: &SpinLock<LinkedList<Arc<EPollItem>>>,
         pollflags: EPollEventType,
     ) -> Result<(), SystemError> {
         let mut epitems_guard = epitems.try_lock_irqsave()?;

@@ -15,8 +15,10 @@ use crate::{
 };
 
 use super::{
-    irqchip::{IrqChipGeneric, IrqGcFlags},
-    irqdata::IrqData,
+    dummychip::no_irq_chip,
+    irqchip::{IrqChip, IrqChipData, IrqChipGeneric, IrqGcFlags},
+    irqdata::{IrqData, IrqHandlerData},
+    irqdesc::IrqFlowHandler,
     HardwareIrqNumber, IrqNumber,
 };
 
@@ -47,6 +49,31 @@ impl IrqDomainManager {
                 default_domain: None,
             }),
         }
+    }
+
+    /// 创建一个新的线性映射的irqdomain, 并将其添加到irqdomain管理器中
+    ///
+    /// 创建的irqdomain，中断号是线性的，即从0开始，依次递增
+    ///
+    /// ## 参数
+    ///
+    /// - `name` - 中断域的名字
+    /// - `ops` - 中断域的操作
+    /// - `irq_size` - 中断号的数量
+    #[allow(dead_code)]
+    pub fn create_and_add_linear(
+        &self,
+        name: String,
+        ops: &'static dyn IrqDomainOps,
+        irq_size: u32,
+    ) -> Option<Arc<IrqDomain>> {
+        self.create_and_add(
+            name,
+            ops,
+            IrqNumber::new(0),
+            HardwareIrqNumber::new(0),
+            irq_size,
+        )
     }
 
     /// 创建一个新的irqdomain, 并将其添加到irqdomain管理器中
@@ -272,6 +299,97 @@ impl IrqDomainManager {
             }
         }
     }
+
+    /// `irq_domain_set_info` - 在 @domain 中为 @virq 设置完整的数据
+    ///
+    /// ## 参数
+    ///
+    /// - `domain`: 要匹配的中断域
+    /// - `virq`: IRQ号
+    /// - `hwirq`: 硬件中断号
+    /// - `chip`: 相关的中断芯片
+    /// - `chip_data`: 相关的中断芯片数据
+    /// - `handler`: 中断流处理器
+    /// - `handler_data`: 中断流处理程序数据
+    /// - `handler_name`: 中断处理程序名称
+    pub fn domain_set_info(
+        &self,
+        domain: &Arc<IrqDomain>,
+        virq: IrqNumber,
+        hwirq: HardwareIrqNumber,
+        chip: Arc<dyn IrqChip>,
+        chip_data: Option<Arc<dyn IrqChipData>>,
+        flow_handler: &'static dyn IrqFlowHandler,
+        handler_data: Option<Arc<dyn IrqHandlerData>>,
+        handler_name: Option<String>,
+    ) {
+        let r = self.domain_set_hwirq_and_chip(domain, virq, hwirq, Some(chip), chip_data);
+        if r.is_err() {
+            return;
+        }
+        irq_manager().__irq_set_handler(virq, flow_handler, false, handler_name);
+        irq_manager().irq_set_handler_data(virq, handler_data).ok();
+    }
+
+    /// `domain_set_hwirq_and_chip` - 在 @domain 中为 @virq 设置 hwirq 和 irqchip
+    ///
+    /// ## 参数
+    ///
+    /// - `domain`: 要匹配的中断域
+    /// - `virq`: IRQ号
+    /// - `hwirq`: hwirq号
+    /// - `chip`: 相关的中断芯片
+    /// - `chip_data`: 相关的芯片数据
+    pub fn domain_set_hwirq_and_chip(
+        &self,
+        domain: &Arc<IrqDomain>,
+        virq: IrqNumber,
+        hwirq: HardwareIrqNumber,
+        chip: Option<Arc<dyn IrqChip>>,
+        chip_data: Option<Arc<dyn IrqChipData>>,
+    ) -> Result<(), SystemError> {
+        let irq_data: Arc<IrqData> = self
+            .domain_get_irq_data(domain, virq)
+            .ok_or(SystemError::ENOENT)?;
+        let mut inner = irq_data.inner();
+        let mut chip_info = irq_data.chip_info_write_irqsave();
+
+        inner.set_hwirq(hwirq);
+        if let Some(chip) = chip {
+            chip_info.set_chip(Some(chip));
+        } else {
+            chip_info.set_chip(Some(no_irq_chip()));
+        };
+
+        chip_info.set_chip_data(chip_data);
+
+        return Ok(());
+    }
+
+    /// `irq_domain_get_irq_data` - 获取与 @virq 和 @domain 关联的 irq_data
+    ///
+    /// ## 参数
+    ///
+    /// - `domain`: 要匹配的域
+    /// - `virq`: 要获取 irq_data 的IRQ号
+    pub fn domain_get_irq_data(
+        &self,
+        domain: &Arc<IrqDomain>,
+        virq: IrqNumber,
+    ) -> Option<Arc<IrqData>> {
+        let desc = irq_desc_manager().lookup(virq)?;
+        let mut irq_data = Some(desc.irq_data());
+
+        while irq_data.is_some() {
+            let dt = irq_data.unwrap();
+            if dt.domain().is_some() && Arc::ptr_eq(dt.domain().as_ref().unwrap(), domain) {
+                return Some(dt);
+            }
+            irq_data = dt.parent_data().map(|x| x.upgrade()).flatten();
+        }
+
+        return None;
+    }
 }
 
 struct InnerIrqDomainManager {
@@ -299,6 +417,8 @@ pub struct IrqDomain {
 #[allow(dead_code)]
 #[derive(Debug)]
 struct InnerIrqDomain {
+    /// this field not touched by the core code
+    host_data: Option<Arc<dyn IrqChipData>>,
     /// host per irq_domain flags
     flags: IrqDomainFlags,
     /// The number of mapped interrupts
@@ -335,6 +455,7 @@ impl IrqDomain {
             allocated_name: SpinLock::new(allocated_name),
             ops,
             inner: SpinLock::new(InnerIrqDomain {
+                host_data: None,
                 flags,
                 mapcount: 0,
                 bus_token,
@@ -379,6 +500,14 @@ impl IrqDomain {
     /// The number of mapped interrupts
     pub fn map_count(&self) -> u32 {
         self.revmap.read().map.len() as u32
+    }
+
+    pub fn host_data(&self) -> Option<Arc<dyn IrqChipData>> {
+        self.inner.lock_irqsave().host_data.clone()
+    }
+
+    pub fn set_host_data(&self, host_data: Option<Arc<dyn IrqChipData>>) {
+        self.inner.lock_irqsave().host_data = host_data;
     }
 }
 
@@ -458,10 +587,12 @@ pub trait IrqDomainOps: Debug + Send + Sync {
     /// 匹配一个中断控制器设备节点到一个主机。
     fn match_node(
         &self,
-        irq_domain: &Arc<IrqDomain>,
-        device_node: &Arc<DeviceNode>,
-        bus_token: IrqDomainBusToken,
-    ) -> bool;
+        _irq_domain: &Arc<IrqDomain>,
+        _device_node: &Arc<DeviceNode>,
+        _bus_token: IrqDomainBusToken,
+    ) -> bool {
+        false
+    }
 
     /// 创建或更新一个虚拟中断号与一个硬件中断号之间的映射。
     /// 对于给定的映射，这只会被调用一次。

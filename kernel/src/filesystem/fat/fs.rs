@@ -178,11 +178,11 @@ impl LockedFATInode {
         };
 
         let inode: Arc<LockedFATInode> = Arc::new(LockedFATInode(SpinLock::new(FATInode {
-            parent: parent,
+            parent,
             self_ref: Weak::default(),
             children: BTreeMap::new(),
             fs: Arc::downgrade(&fs),
-            inode_type: inode_type,
+            inode_type,
             metadata: Metadata {
                 dev_id: 0,
                 inode_id: generate_inode_id(),
@@ -196,7 +196,7 @@ impl LockedFATInode {
                 atime: TimeSpec::default(),
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
-                file_type: file_type,
+                file_type,
                 mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
                 uid: 0,
@@ -327,11 +327,11 @@ impl FATFileSystem {
         })));
 
         let result: Arc<FATFileSystem> = Arc::new(FATFileSystem {
-            partition: partition,
+            partition,
             bpb,
             first_data_sector,
             fs_info: Arc::new(LockedFATFsInfo::new(fs_info)),
-            root_inode: root_inode,
+            root_inode,
         });
 
         // 对root inode加锁，并继续完成初始化工作

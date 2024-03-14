@@ -124,13 +124,11 @@ impl TypeOneFSMState {
         };
         if scancode != PAUSE_BREAK_SCAN_CODE[i as usize] {
             return self.handle_type3(scancode, scancode_status);
+        } else if i == 5 {
+            // 所有Pause Break扫描码都被清除
+            return TypeOneFSMState::Start;
         } else {
-            if i == 5 {
-                // 所有Pause Break扫描码都被清除
-                return TypeOneFSMState::Start;
-            } else {
-                return TypeOneFSMState::PauseBreak(i + 1);
-            }
+            return TypeOneFSMState::PauseBreak(i + 1);
         }
     }
 
@@ -385,14 +383,12 @@ impl TypeOneFSMState {
         }
         if scancode != PRTSC_SCAN_CODE[i as usize] {
             return self.handle_type3(scancode, scancode_status);
+        } else if i == 3 {
+            // 成功解析出PrtscPress
+            return TypeOneFSMState::Start;
         } else {
-            if i == 3 {
-                // 成功解析出PrtscPress
-                return TypeOneFSMState::Start;
-            } else {
-                // 继续解析
-                return TypeOneFSMState::PrtscPress(i + 1);
-            }
+            // 继续解析
+            return TypeOneFSMState::PrtscPress(i + 1);
         }
     }
 
@@ -412,14 +408,12 @@ impl TypeOneFSMState {
         }
         if scancode != PRTSC_SCAN_CODE[i as usize] {
             return self.handle_type3(scancode, scancode_status);
+        } else if i == 3 {
+            // 成功解析出PrtscRelease
+            return TypeOneFSMState::Start;
         } else {
-            if i == 3 {
-                // 成功解析出PrtscRelease
-                return TypeOneFSMState::Start;
-            } else {
-                // 继续解析
-                return TypeOneFSMState::PrtscRelease(i + 1);
-            }
+            // 继续解析
+            return TypeOneFSMState::PrtscRelease(i + 1);
         }
     }
 }

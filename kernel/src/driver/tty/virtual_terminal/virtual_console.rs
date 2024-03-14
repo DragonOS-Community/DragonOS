@@ -7,7 +7,10 @@ use alloc::{
 use bitmap::{traits::BitMapOps, StaticBitmap};
 
 use crate::{
-    driver::tty::{console::ConsoleSwitch, ConsoleFont, KDMode},
+    driver::{
+        serial::serial8250::send_to_default_serial8250_port,
+        tty::{console::ConsoleSwitch, ConsoleFont, KDMode},
+    },
     libs::{font::FontDesc, rwlock::RwLock},
     process::Pid,
 };
@@ -140,6 +143,7 @@ pub struct VirtualConsoleData {
 }
 
 impl VirtualConsoleData {
+    #[inline(never)]
     pub fn new(num: usize) -> Self {
         Self {
             state: VirtualConsoleInfo::new(0, 0),
@@ -264,7 +268,8 @@ impl VirtualConsoleData {
         self.pid = None;
         self.vc_state = VirtualConsoleState::ESnormal;
         self.reset_palette();
-        self.cursor_type = VcCursor::CUR_UNDERLINE;
+        // self.cursor_type = VcCursor::CUR_UNDERLINE;
+        self.cursor_type = VcCursor::CUR_BLOCK;
 
         self.default_attr();
         self.update_attr();
@@ -555,22 +560,20 @@ impl VirtualConsoleData {
     fn gotoxy(&mut self, x: i32, y: i32) {
         if x < 0 {
             self.state.x = 0;
+        } else if x as usize >= self.cols {
+            self.state.x = self.cols - 1;
         } else {
-            if x as usize >= self.cols {
-                self.state.x = self.cols - 1;
-            } else {
-                self.state.x = x as usize;
-            }
+            self.state.x = x as usize;
         }
 
         let max_y;
         let min_y;
         if self.origin_mode {
             min_y = self.top;
-            max_y = self.bottom;
+            max_y = self.bottom - 1;
         } else {
             min_y = 0;
-            max_y = self.rows;
+            max_y = self.rows - 1;
         }
 
         if y < min_y as i32 {
@@ -596,9 +599,10 @@ impl VirtualConsoleData {
             return;
         }
 
-        if self
-            .driver_funcs()
-            .con_scroll(self, self.top, self.bottom, dir, nr)
+        if self.is_visible()
+            && self
+                .driver_funcs()
+                .con_scroll(self, self.top, self.bottom, dir, nr)
         {
             // 如果成功
             return;
@@ -733,6 +737,7 @@ impl VirtualConsoleData {
         }
     }
 
+    #[inline(never)]
     fn do_getpars(&mut self, c: char) {
         if c == ';' && self.npar < (NPAR - 1) as u32 {
             self.npar += 1;
@@ -789,9 +794,11 @@ impl VirtualConsoleData {
             'n' => {
                 if self.private == Vt102_OP::EPecma {
                     if self.par[0] == 5 {
-                        kwarn!("tty status report todo");
+                        send_to_default_serial8250_port("tty status report todo".as_bytes());
+                        panic!();
                     } else if self.par[0] == 6 {
-                        kwarn!("tty cursor report todo");
+                        send_to_default_serial8250_port("tty cursor report todo".as_bytes());
+                        panic!();
                     }
                 }
                 return;
@@ -847,7 +854,7 @@ impl VirtualConsoleData {
                     self.par[0] += 1;
                 }
                 self.gotoxy(
-                    (self.state.x - self.par[0] as usize) as i32,
+                    self.state.x as i32 - self.par[0] as i32,
                     self.state.y as i32,
                 );
                 return;
@@ -863,7 +870,7 @@ impl VirtualConsoleData {
                 if self.par[0] == 0 {
                     self.par[0] += 1;
                 }
-                self.gotoxy(0, (self.state.y - self.par[0] as usize) as i32);
+                self.gotoxy(0, self.state.y as i32 - self.par[0] as i32);
                 return;
             }
             'd' => {
@@ -874,6 +881,7 @@ impl VirtualConsoleData {
                 return;
             }
             'H' | 'f' => {
+                // MOVETO
                 if self.par[0] != 0 {
                     self.par[0] -= 1;
                 }
@@ -900,6 +908,18 @@ impl VirtualConsoleData {
             'P' => {
                 todo!("csi_P todo");
             }
+
+            // 非ANSI标准，为ANSI拓展
+            'S' => {
+                self.scroll(ScrollDir::Up, self.par[0] as usize);
+                return;
+            }
+
+            'T' => {
+                self.scroll(ScrollDir::Down, self.par[0] as usize);
+                return;
+            }
+
             'c' => {
                 if self.par[0] == 0 {
                     kwarn!("respone ID todo");
@@ -957,6 +977,7 @@ impl VirtualConsoleData {
     }
 
     /// ##  处理Control Sequence Introducer（控制序列引导符） m字符
+    #[inline(never)]
     fn csi_m(&mut self) {
         let mut i = 0;
         loop {
@@ -1218,7 +1239,7 @@ impl VirtualConsoleData {
             return (idx, None);
         }
 
-        if self.par[idx] == 5 && idx + 1 <= self.npar as usize {
+        if self.par[idx] == 5 && idx < self.npar as usize {
             // 256色
             idx += 1;
             return (idx, Some(Color::from_256(self.par[idx])));
@@ -1236,6 +1257,7 @@ impl VirtualConsoleData {
     }
 
     /// ## 处理终端控制字符
+    #[inline(never)]
     pub(super) fn do_control(&mut self, ch: u32) {
         // 首先检查是否处于 ANSI 控制字符串状态
         if self.vc_state.is_ansi_control_string() && ch >= 8 && ch <= 13 {
@@ -1512,6 +1534,7 @@ impl VirtualConsoleData {
         }
     }
 
+    #[inline(never)]
     pub(super) fn console_write_normal(
         &mut self,
         mut tc: u32,
@@ -1524,10 +1547,8 @@ impl VirtualConsoleData {
         let mut width = 1;
         // 表示需不需要反转
         let mut invert = false;
-        if self.utf && !self.display_ctrl {
-            if FontDesc::is_double_width(c) {
-                width = 2;
-            }
+        if self.utf && !self.display_ctrl && FontDesc::is_double_width(c) {
+            width = 2;
         }
 
         let tmp = self.unicode_to_index(tc);
@@ -1641,11 +1662,10 @@ impl VirtualConsoleData {
     fn do_update_region(&self, mut start: usize, mut count: usize) {
         let ret = self.driver_funcs().con_getxy(self, start);
         let (mut x, mut y) = if ret.is_err() {
-            let offset = start / 2;
-            (offset % self.cols, offset / self.cols)
+            (start % self.cols, start / self.cols)
         } else {
-            let (tmp_start, tmp_x, tmp_y) = ret.unwrap();
-            start = tmp_start;
+            let (_, tmp_x, tmp_y) = ret.unwrap();
+            // start = tmp_start;
             (tmp_x, tmp_y)
         };
 
@@ -1657,20 +1677,18 @@ impl VirtualConsoleData {
 
             while count != 0 && x < self.cols {
                 // 检查属性是否变化，如果属性变了，则将前一个字符先输出
-                if attr != (self.screen_buf[start] & 0xff00) {
-                    if size > 0 {
-                        let _ = self.driver_funcs().con_putcs(
-                            self,
-                            &self.screen_buf[start..],
-                            size,
-                            y as u32,
-                            startx as u32,
-                        );
-                        startx = x;
-                        start += size;
-                        size = 0;
-                        attr = self.screen_buf[start] & 0xff00;
-                    }
+                if attr != (self.screen_buf[start] & 0xff00) && size > 0 {
+                    let _ = self.driver_funcs().con_putcs(
+                        self,
+                        &self.screen_buf[start..],
+                        size,
+                        y as u32,
+                        startx as u32,
+                    );
+                    startx = x;
+                    start += size;
+                    size = 0;
+                    attr = self.screen_buf[start] & 0xff00;
                 }
                 size += 1;
                 x += 1;
@@ -1697,6 +1715,8 @@ impl VirtualConsoleData {
             let ret = self.driver_funcs().con_getxy(self, start);
             if ret.is_ok() {
                 start = ret.unwrap().0;
+            } else {
+                return;
             }
         }
     }

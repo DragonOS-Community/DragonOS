@@ -98,24 +98,21 @@ pub fn no_init_textui_putchar_window(
                 }
             }
         }
-    } else {
-        if is_put_to_window == true {
-            // 输出其他字符
-            let char = TextuiCharChromatic::new(Some(character), frcolor, bkcolor);
+    } else if is_put_to_window == true {
+        // 输出其他字符
+        let char = TextuiCharChromatic::new(Some(character), frcolor, bkcolor);
 
-            if NO_ALLOC_OPERATIONS_INDEX.load(Ordering::SeqCst)
-                == CHAR_PER_LINE.load(Ordering::SeqCst)
-            {
-                NO_ALLOC_OPERATIONS_INDEX.store(0, Ordering::SeqCst);
-                NO_ALLOC_OPERATIONS_LINE.fetch_add(1, Ordering::SeqCst);
-            }
-            char.no_init_textui_render_chromatic(
-                LineId::new(NO_ALLOC_OPERATIONS_LINE.load(Ordering::SeqCst)),
-                LineIndex::new(NO_ALLOC_OPERATIONS_INDEX.load(Ordering::SeqCst)),
-            );
-
-            NO_ALLOC_OPERATIONS_INDEX.fetch_add(1, Ordering::SeqCst);
+        if NO_ALLOC_OPERATIONS_INDEX.load(Ordering::SeqCst) == CHAR_PER_LINE.load(Ordering::SeqCst)
+        {
+            NO_ALLOC_OPERATIONS_INDEX.store(0, Ordering::SeqCst);
+            NO_ALLOC_OPERATIONS_LINE.fetch_add(1, Ordering::SeqCst);
         }
+        char.no_init_textui_render_chromatic(
+            LineId::new(NO_ALLOC_OPERATIONS_LINE.load(Ordering::SeqCst)),
+            LineIndex::new(NO_ALLOC_OPERATIONS_INDEX.load(Ordering::SeqCst)),
+        );
+
+        NO_ALLOC_OPERATIONS_INDEX.fetch_add(1, Ordering::SeqCst);
     }
 
     return Ok(());

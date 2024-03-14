@@ -113,39 +113,43 @@ impl From<ProtFlags> for VmFlags {
     }
 }
 
-impl Into<MapFlags> for VmFlags {
-    fn into(self) -> MapFlags {
+impl From<VmFlags> for MapFlags {
+    fn from(value: VmFlags) -> Self {
         let mut map_flags = MapFlags::MAP_NONE;
 
-        if self.contains(VmFlags::VM_GROWSDOWN) {
+        if value.contains(VmFlags::VM_GROWSDOWN) {
             map_flags |= MapFlags::MAP_GROWSDOWN;
         }
 
-        if self.contains(VmFlags::VM_LOCKED) {
+        if value.contains(VmFlags::VM_LOCKED) {
             map_flags |= MapFlags::MAP_LOCKED;
         }
 
-        if self.contains(VmFlags::VM_SYNC) {
+        if value.contains(VmFlags::VM_SYNC) {
             map_flags |= MapFlags::MAP_SYNC;
+        }
+
+        if value.contains(VmFlags::VM_MAYSHARE) {
+            map_flags |= MapFlags::MAP_SHARED;
         }
 
         map_flags
     }
 }
 
-impl Into<ProtFlags> for VmFlags {
-    fn into(self) -> ProtFlags {
+impl From<VmFlags> for ProtFlags {
+    fn from(value: VmFlags) -> Self {
         let mut prot_flags = ProtFlags::PROT_NONE;
 
-        if self.contains(VmFlags::VM_READ) {
+        if value.contains(VmFlags::VM_READ) {
             prot_flags |= ProtFlags::PROT_READ;
         }
 
-        if self.contains(VmFlags::VM_WRITE) {
+        if value.contains(VmFlags::VM_WRITE) {
             prot_flags |= ProtFlags::PROT_WRITE;
         }
 
-        if self.contains(VmFlags::VM_EXEC) {
+        if value.contains(VmFlags::VM_EXEC) {
             prot_flags |= ProtFlags::PROT_EXEC;
         }
 
@@ -298,7 +302,7 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
         let vma = vma.unwrap();
-        let vm_flags = vma.lock().vm_flags().clone();
+        let vm_flags = *vma.lock().vm_flags();
 
         // 暂时不支持巨页映射
         if vm_flags.contains(VmFlags::VM_HUGETLB) {

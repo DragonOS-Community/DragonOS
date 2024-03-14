@@ -1,3 +1,5 @@
+use core::mem::{self, size_of};
+
 use alloc::{sync::Arc, vec::Vec};
 use system_error::SystemError;
 
@@ -9,17 +11,24 @@ use crate::{
 /// 块组描述符表(位于superblock之后)
 #[derive(Debug)]
 #[repr(C, align(1))]
-pub struct BlockGroupDescriptor {
+pub struct Ext2BlockGroupDescriptor {
+    /// 块位图的地址
     block_bitmap_address: u32,
+    /// 节点位图的地址
     inode_bitmap_address: u32,
+    /// 节点表的起始地址
     inode_table_start: u32,
+    /// 空闲的块数
     free_blocks_num: u16,
+    /// 空闲的节点数
     free_inodes_num: u16,
+    /// 目录数
     dir_num: u16,
+    /// 填充
     padding: Vec<u8>,
 }
 
-impl BlockGroupDescriptor {
+impl Ext2BlockGroupDescriptor {
     pub fn new() -> Self {
         Self {
             block_bitmap_address: 0,
@@ -31,12 +40,17 @@ impl BlockGroupDescriptor {
             padding: vec![0; 14],
         }
     }
+    pub fn get_des_per_blc() -> u32 {
+        LBA_SIZE / mem::size_of::<Ext2BlockGroupDescriptor>()
+    }
 }
 /// 读取块组描述符表
 pub fn read_block_grp_descriptor(
     partition: Arc<Partition>,
-) -> Result<BlockGroupDescriptor, SystemError> {
-    let mut grp_des_table = BlockGroupDescriptor::new();
+) -> Result<Ext2BlockGroupDescriptor, SystemError> {
+    // TODO 要计算读多少个块，读到一个数组里面
+
+    let mut grp_des_table = Ext2BlockGroupDescriptor::new();
     let mut data: Vec<u8> = Vec::with_capacity(LBA_SIZE);
     data.resize(LBA_SIZE, 0);
     partition.disk().read_at(

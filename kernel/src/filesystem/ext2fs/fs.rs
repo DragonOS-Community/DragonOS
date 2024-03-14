@@ -1,3 +1,5 @@
+use core::sync::atomic::AtomicU32;
+
 use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
@@ -10,8 +12,12 @@ use crate::{
     libs::{rwlock::RwLock, spinlock::SpinLock, vec_cursor::VecCursor},
 };
 
+use super::block_group_desc::Ext2BlockGroupDescriptor;
+
 lazy_static! {
     pub static ref EXT2_SUPER_BLOCK: RwLock<Ex2SuperBlock> = RwLock::new(Ex2SuperBlock::default());
+    pub static ref EXT2_SB_INFO: RwLock<Ext2SuperBlockInfo> =
+        RwLock::new(Ext2SuperBlockInfo::default());
 }
 
 #[derive(Debug)]
@@ -30,60 +36,14 @@ impl FileSystem for Ext2FsInfo {
         todo!()
     }
 }
-pub enum OSType{
+pub enum OSType {
     Linux,
     HURD,
     MASIX,
     FreeBSD,
     Lites,
 }
-pub struct LockSBInfo(SpinLock<Ext2SuperBlockInfo>);
 
-#[derive(Debug)]
-#[repr(C, align(1))]
-///second extended-fs super-block data in memory
-pub struct Ext2SuperBlockInfo {
-    s_frag_size: u32,        /* Size of a fragment in bytes */
-    s_frags_per_block: u32,  /* Number of fragments per block */
-    s_inodes_per_block: u32, /* Number of inodes per block */
-    s_frags_per_group: u32,  /* Number of fragments in a group */
-    s_blocks_per_group: u32, /* Number of blocks in a group */
-    s_inodes_per_group: u32, /* Number of inodes in a group */
-    s_itb_per_group: u32,    /* Number of inode table blocks per group */
-    s_gdb_count: u32,        /* Number of group descriptor blocks */
-    s_desc_per_block: u32,   /* Number of group descriptors per block */
-    s_groups_count: u32,     /* Number of groups in the fs */
-    s_overhead_last: u32,    /* Last calculated overhead */
-    s_blocks_last: u32,      /* Last seen block count */
-    // struct buffer_head * s_sbh,	/* Buffer containing the super block */
-    ext2_super_block: Ex2SuperBlock, /* Pointer to the super block in the buffer */
-    //应该是一个二维数组
-
-    // struct buffer_head ** s_group_desc,
-    s_mount_opt: u32,
-    s_sb_block: u32,
-    // uid_t s_resuid,
-    // gid_t s_resgid,
-    s_mount_state: u16,
-    s_pad: u16,
-    s_addr_per_block_bits: u32,
-    s_desc_per_block_bits: u32,
-    s_inode_size: u32,
-    s_first_ino: u32,
-    // spinlock_t s_next_gen_lock,
-    // u32 s_next_generation,
-    s_dir_count: u32,
-    // u8 *s_debts,
-    // struct percpu_counter s_freeblocks_counter,
-    // struct percpu_counter s_freeinodes_counter,
-    // struct percpu_counter s_dirs_counter,
-    // struct blockgroup_lock *s_blockgroup_lock,
-
-    /* root of the per fs reservation window tree */
-    // spinlock_t s_rsv_window_lock,
-    // struct rb_root s_rsv_window_root,
-    // struct ext2_reserve_window_node s_rsv_window_head,
-}
 // ext2超级块,大小为1024bytes
 #[derive(Debug)]
 #[repr(C, align(1))]
@@ -98,7 +58,7 @@ pub struct Ex2SuperBlock {
     pub free_block_count: u32,
     /// 未分配结点数
     pub free_inode_count: u32,
-    /// 包含超级块的数据块数
+    /// 包含超级块的数据块
     pub first_data_block: u32,
     /// 块大小
     pub block_size: u32,
@@ -177,6 +137,7 @@ pub struct Ex2SuperBlock {
     /// 凑成1024B
     padding2: Vec<u32>,
 }
+
 impl Default for Ex2SuperBlock {
     fn default() -> Self {
         let uuid: Vec<u8> = vec![0; 16];
@@ -230,6 +191,91 @@ impl Default for Ex2SuperBlock {
             last_orphan: 0,
         };
         superblock
+    }
+}
+z
+pub struct LockSBInfo(SpinLock<Ext2SuperBlockInfo>);
+
+#[derive(Debug, Default)]
+#[repr(C, align(1))]
+///second extended-fs super-block data in memory
+pub struct Ext2SuperBlockInfo {
+    s_frag_size: u32,                      /* Size of a fragment in bytes */
+    s_frags_per_block: u32,                /* Number of fragments per block */
+    s_inodes_per_block: u32,               /* Number of inodes per block */
+    s_frags_per_group: u32,                /* Number of fragments in a group */
+    s_blocks_per_group: u32,               /* Number of blocks in a group */
+    s_inodes_per_group: u32,               /* Number of inodes in a group */
+    s_itb_per_group: u32,                  /* Number of inode table blocks per group */
+    s_gdb_count: u32,                      /* Number of group descriptor blocks */
+    s_desc_per_block: u32,                 /* Number of group descriptors per block */
+    s_groups_count: u32,                   /* Number of groups in the fs */
+    s_overhead_last: u32,                  /* Last calculated overhead */
+    s_blocks_last: u32,                    /* Last seen block count */
+    ext2_super_block: Weak<Ex2SuperBlock>, /* Pointer to the super block in the buffer */
+
+    group_desc_table: Weak<Vec<Ext2BlockGroupDescriptor>>,
+    s_mount_opt: u32,
+    s_sb_block: u32,
+    s_resuid: u16,
+    s_resgid: u16,
+    s_mount_state: u16,
+    s_pad: u16,
+    /// 每个块的地址位数。
+    s_addr_per_block_bits: u32,
+    /// 每个块的组描述符位数。
+    s_desc_per_block_bits: u32,
+    s_inode_size: u32,
+    /// 第一个可用的inode号
+    s_first_ino: u32,
+    // spinlock_t s_next_gen_lock,
+    /// 下一个分配的号码
+    s_next_generation: u32,
+    s_dir_count: u32,
+    // u8 *s_debts,
+    s_freeblocks_counter: AtomicU32,
+    s_freeinodes_counter: AtomicU32,
+    s_dirs_counter: AtomicU32,
+    /* root of the per fs reservation window tree */
+    // spinlock_t s_rsv_window_lock,
+    // struct rb_root s_rsv_window_root,
+    // struct ext2_reserve_window_node s_rsv_window_head,
+}
+impl Ext2SuperBlockInfo {
+    pub fn new(sb: &Ex2SuperBlock) -> Self {
+        let arc_sb = Arc::new(sb.clone());
+        Self {
+            s_frag_size: sb.fragment_size,
+            // TODO 计算
+            s_frags_per_block: (),
+            s_inodes_per_block: (),
+            s_frags_per_group: sb.fragments_per_group,
+            s_blocks_per_group: sb.blocks_per_group,
+            s_inodes_per_group: sb.inodes_per_group,
+            s_itb_per_group: (),
+            s_gdb_count: (),
+            s_desc_per_block: (),
+            s_groups_count: (),
+            s_overhead_last: (),
+            s_blocks_last: (),
+            ext2_super_block: Arc::downgrade(arc_sb),
+            group_desc_table: Weak::default(),
+            s_mount_opt: 0,
+            s_sb_block: sb.first_data_block,
+            s_resuid: sb.def_resuid,
+            s_resgid: sb.def_resgid,
+            s_mount_state: sb.state,
+            s_pad: 0,
+            s_addr_per_block_bits: (),
+            s_desc_per_block_bits: (),
+            s_inode_size: sb.inode_size,
+            s_first_ino: sb.first_ino,
+            s_next_generation: (),
+            s_dir_count: (),
+            s_freeblocks_counter: AtomicU32::new(sb.free_block_count),
+            s_freeinodes_counter: AtomicU32::new(sb.free_inode_count),
+            s_dirs_counter: AtomicU32::new(1),
+        }
     }
 }
 impl Ex2SuperBlock {
@@ -300,8 +346,28 @@ impl Ex2SuperBlock {
 
         Ok(super_block)
     }
-}
 
+    /// block group的数量
+    pub fn get_group_count(&self) -> u32 {
+        return (self.block_count - self.first_data_block - 1) / self.blocks_per_group + 1;
+    }
+    /// 块描述符所需要的块数
+    pub fn get_db_count(&self) -> u32 {
+        let group_count = self.get_group_count();
+        let des_per_block = Ext2BlockGroupDescriptor::get_des_per_blc();
+        (group_count + des_per_block - 1) / des_per_block
+    }
+    fn read_group_descs(
+        &self,
+        partition: Arc<Partition>,
+    ) -> Result<Vec<Ext2BlockGroupDescriptor>, SystemError> {
+        // TODO 读取块描述付
+        // 需要确定读多少个
+        let mut decs: Vec<Ext2BlockGroupDescriptor> = Vec::new();
+
+
+    }
+}
 
 pub struct DataBlock {
     data: [u8; 4 * 1024],

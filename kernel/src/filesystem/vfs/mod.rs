@@ -407,7 +407,6 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     // to remove
     /// @brief 返回查询缓存
     fn cache(&self) -> Result<Arc<DefaultCache>, SystemError> {
-        kdebug!("call IndexNode::cache");
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
@@ -454,11 +453,8 @@ impl dyn IndexNode {
         // non cache lookup
         // kdebug!("My self is {:?}", self.fs().as_any_ref().downcast_ref::<LockedEntry>());
         // kdebug!("When I call a list, i call {:?}", self.list());
-        kdebug!("Looking path at {}", path);
-        kdebug!("Current dir has children {:?}", self.list());
-        if self.metadata()?.inode_id == ROOT_INODE().metadata()?.inode_id {
-            todo!("Is Looking up from root.");
-        }
+        // kdebug!("Looking path at {}", path);
+        // kdebug!("Current dir has children {:?}", self.list());
         let get = self.cache();
         if get.is_err() {
             kdebug!("No Cache to use");
@@ -498,7 +494,7 @@ impl dyn IndexNode {
         if self.metadata()?.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
-        kdebug!("Normal Lookup");
+        // kdebug!("Normal Lookup");
         // 处理绝对路径
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
@@ -663,27 +659,37 @@ impl dyn IndexNode {
         if result.is_some() {
             return Some((result.unwrap(), abs_path));
         }
-        self._quick_lookup(cache, left_rest.unwrap(), current)
+        return self._quick_lookup(cache, left_rest.unwrap(), current);
     }
 
-    fn _abs_path(&self) -> Result<String, SystemError> {
-        if self.parent().is_err_and(|err| err == SystemError::EOPNOTSUPP_OR_ENOTSUP) {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-        }
-        let inode = self;
-        let mut path = String::new();
-        loop {
-            if inode.parent().is_err_and(|err| err == SystemError::ENOENT) {
-                break;
+    pub(super) fn _abs_path(&self) -> Result<String, SystemError> {
+        let mut inode = self.self_ref()?;
+        let mut path_stack = Vec::new();
+        path_stack.push(self.key()?);
+        // kdebug!("Inode with children {:?}, {:?}" , inode.list(), inode.metadata()?.inode_id);
+        // kdebug!("ROOT with children {:?}, {:?}", ROOT_INODE().list(), ROOT_INODE().metadata()?.inode_id);
+        while inode.metadata()?.inode_id != ROOT_INODE().metadata()?.inode_id {
+            let tmp = inode.parent();
+            match tmp {
+                Err(e) => {
+                    match e {
+                        SystemError::ENOENT => {
+                            kdebug!("Break because no parent.");
+                            break; 
+                        }
+                        e => { return Err(e); }
+                    }
+                }
+                Ok(o) => { inode = o; }
             }
-            let name = inode.parent().unwrap().key();
-            if name.is_err() {
-                return Err(name.unwrap_err());
-            }
-            path = name.unwrap() + &"/".to_string() + &path.to_string();
+            path_stack.push(inode.key()?);
         }
-        path = "/".to_string() + &path;
-        Ok(path)
+        path_stack.pop();
+        path_stack.reverse();
+        kdebug!("Item in path_stack are{:?}", path_stack);
+        let ret = "/".to_string() + &path_stack.join("/");
+        kdebug!("Abs path of {:?} is {:?}", self.key(), ret);
+        return Ok(ret);
     }
 
 }

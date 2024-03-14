@@ -430,6 +430,9 @@ impl Syscall {
     ///  
     /// ENAMETOOLONG |        路径过长        
     pub fn chdir(dest_path: &str) -> Result<usize, SystemError> {
+        // crate::filesystem::vfs::mount::MOUNTS_LIST().lock().iter().for_each(|iter| {
+        //     kdebug!("{:?}", iter);
+        // });
         let proc = ProcessManager::current_pcb();
         // Copy path to kernel space to avoid some security issues
         let path = dest_path.to_string();

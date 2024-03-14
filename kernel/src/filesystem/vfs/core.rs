@@ -11,7 +11,7 @@ use crate::{
         procfs::procfs_init,
         ramfs::RamFS,
         sysfs::sysfs_init,
-        vfs::{mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
+        vfs::{mount::{MountFS, CLEAR_MOUNTS_LIST, MOUNTS_LIST}, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
     },
     kdebug, kerror, kinfo,
     process::ProcessManager,
@@ -133,18 +133,19 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     // 获取新的根文件系统的根节点的引用
     let new_root_inode = new_fs.root_inode();
 
-    // 把上述文件系统,迁移到新的文件系统下
-    do_migrate(new_root_inode.clone(), "proc", proc)?;
-    do_migrate(new_root_inode.clone(), "dev", dev)?;
-    do_migrate(new_root_inode.clone(), "sys", sys)?;
-    do_migrate(new_root_inode.clone(), "ram", ram)?;
     unsafe {
-        // drop旧的Root inode
-        let old_root_inode = __ROOT_INODE.take().unwrap();
-        drop(old_root_inode);
-
         // 设置全局的新的ROOT Inode
+        let old_root_inode = __ROOT_INODE.take().unwrap();
         __ROOT_INODE = Some(new_root_inode);
+
+        // 把上述文件系统,迁移到新的文件系统下
+        do_migrate(ROOT_INODE(), "proc", proc)?;
+        do_migrate(ROOT_INODE(), "dev", dev)?;
+        do_migrate(ROOT_INODE(), "sys", sys)?;
+        do_migrate(ROOT_INODE(), "ram", ram)?;
+
+        // drop旧的Root inode
+        drop(old_root_inode);
     }
 
     kinfo!("VFS: Migrate filesystems done!");

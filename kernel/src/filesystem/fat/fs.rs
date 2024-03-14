@@ -163,6 +163,11 @@ impl FATInode {
             }
         }
     }
+
+    #[inline]
+    fn key(&self) -> Result<String, SystemError> {
+        Ok(self.inode_type.name())
+    }
 }
 
 impl LockedFATInode {
@@ -1729,6 +1734,10 @@ impl IndexNode for LockedFATInode {
 
     fn special_node(&self) -> Option<SpecialNodeData> {
         self.0.lock().special_node.clone()
+    }
+
+    fn key(&self) -> Result<String, SystemError> {
+        self.0.lock().key()
     }
 }
 

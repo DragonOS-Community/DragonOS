@@ -4,6 +4,7 @@ use core::{
 };
 
 use alloc::{
+    string::String,
     collections::BTreeMap,
     sync::{Arc, Weak},
 };
@@ -12,7 +13,7 @@ use system_error::SystemError;
 use crate::{driver::base::device::device_number::DeviceNumber, libs::spinlock::SpinLock};
 
 use super::{
-    file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
+    file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId, ROOT_INODE
 };
 
 static mut __MOUNTS_LIST: Option<Arc<SpinLock<BTreeMap<String, Arc<dyn FileSystem>>>>> = None;
@@ -26,6 +27,14 @@ pub fn MOUNTS_LIST() -> Arc<SpinLock<BTreeMap<String, Arc<dyn FileSystem>>>> {
             __MOUNTS_LIST = Some(Arc::new(SpinLock::new(BTreeMap::new())));
         }
         return __MOUNTS_LIST.as_ref().unwrap().clone();
+    }
+}
+
+#[inline(always)]
+#[allow(non_snake_case)]
+pub fn CLEAR_MOUNTS_LIST() {
+    unsafe {
+        __MOUNTS_LIST = None;
     }
 }
 
@@ -361,7 +370,14 @@ impl IndexNode for MountFSInode {
             .mountpoints
             .lock()
             .insert(metadata.inode_id, new_mount_fs.clone());
-        MOUNTS_LIST().lock().insert(self.key()?, new_mount_fs.clone());
+        if self.metadata()?.inode_id == ROOT_INODE().metadata()?.inode_id {
+            MOUNTS_LIST().lock().insert(String::from("/"), new_mount_fs.clone());
+        } else {
+            MOUNTS_LIST().lock().insert(self.self_ref()?._abs_path()?, new_mount_fs.clone());
+        }
+        kdebug!("fs to mount is {:?}", new_mount_fs);
+        kdebug!("Parent with children {:?}, {:?}" , self.parent()?.list(), self.parent()?.metadata()?.inode_id);
+        kdebug!("ROOT with children {:?}, {:?}", ROOT_INODE().list(), ROOT_INODE().metadata()?.inode_id);
         return Ok(new_mount_fs);
     }
 
@@ -388,6 +404,20 @@ impl IndexNode for MountFSInode {
     #[inline]
     fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
         self.inner_inode.poll(private_data)
+    }
+
+    fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Ok(self.self_ref.upgrade().ok_or(SystemError::ENOENT)?)
+    }
+
+    #[inline]
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.find("..")
+    }
+
+    #[inline]
+    fn key(&self) -> Result<String, SystemError> {
+        self.inner_inode.key()
     }
 }
 

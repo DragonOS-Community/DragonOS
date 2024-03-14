@@ -232,13 +232,6 @@ impl Ord for Keyer {
                 return self.1.as_ref().unwrap().cmp(&opt.unwrap().0.lock().name);
             }
         }
-        // let destring = match ret {
-        //     Ordering::Equal => "Equal",
-        //     Ordering::Less => "Less",
-        //     Ordering::Greater => "Greater",
-        // };
-        // // kdebug!("Ord::Cmp {} and {} with result: {}\0", self.get().unwrap_or(String::from("fail")), other.get().unwrap_or(String::from("fail")), destring);
-        // ret
     }
 }
 

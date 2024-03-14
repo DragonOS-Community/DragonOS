@@ -21,6 +21,8 @@ use crate::{
     process::{ProcessManager, ProcessState},
 };
 
+type IrqHandler =  dyn Fn(Arc<IrqAction>) -> Result<(), SystemError>;
+
 use super::{fork::CloneFlags, Pid, ProcessControlBlock, ProcessFlags};
 
 /// 内核线程的创建任务列表
@@ -92,7 +94,7 @@ pub enum KernelThreadClosure {
     StaticEmptyClosure((&'static dyn Fn() -> i32, ())),
     IrqThread(
         (
-            &'static dyn Fn(Arc<IrqAction>) -> Result<(), SystemError>,
+            &'static IrqHandler,
             Arc<IrqAction>,
         ),
     ),

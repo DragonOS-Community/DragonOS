@@ -110,7 +110,7 @@ impl AhciDisk {
 
         let user_buf = verify_area(VirtAddr::new(buf_ptr), buf.len()).is_ok();
         let mut kbuf = if user_buf {
-            let mut x: Vec<u8> = vec![0; buf.len()];
+            let x: Vec<u8> = vec![0; buf.len()];
             Some(x)
         } else {
             None

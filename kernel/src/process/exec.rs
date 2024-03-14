@@ -269,7 +269,7 @@ impl ProcInitInfo {
 
     fn push_slice<T: Copy>(&self, ustack: &mut UserStack, slice: &[T]) -> Result<(), SystemError> {
         let mut sp = ustack.sp();
-        sp -= slice.len() * core::mem::size_of::<T>();
+        sp -= core::mem::size_of_val(slice);
         sp -= sp.data() % core::mem::align_of::<T>();
 
         unsafe { core::slice::from_raw_parts_mut(sp.data() as *mut T, slice.len()) }

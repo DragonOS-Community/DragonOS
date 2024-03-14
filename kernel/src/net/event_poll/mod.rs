@@ -291,7 +291,7 @@ impl EventPoll {
             .ok_or(SystemError::EBADF)?;
 
         // 检查是否允许 EPOLLWAKEUP
-        if op != EPollCtlOption::EpollCtlDel {
+        if op != EPollCtlOption::Del {
             epds.events &= !EPollEventType::EPOLLWAKEUP.bits();
         }
 
@@ -304,14 +304,14 @@ impl EventPoll {
             return Err(SystemError::EINVAL);
         }
 
-        if op != EPollCtlOption::EpollCtlDel && events.contains(EPollEventType::EPOLLEXCLUSIVE) {
+        if op != EPollCtlOption::Del && events.contains(EPollEventType::EPOLLEXCLUSIVE) {
             // epoll独占模式下不允许EpollCtlMod
-            if op == EPollCtlOption::EpollCtlMod {
+            if op == EPollCtlOption::Mod {
                 return Err(SystemError::EINVAL);
             }
 
             // 不支持嵌套的独占唤醒
-            if op == EPollCtlOption::EpollCtlAdd && Self::is_epoll_file(&dst_file)
+            if op == EPollCtlOption::Add && Self::is_epoll_file(&dst_file)
                 || !events
                     .difference(EPollEventType::EPOLLEXCLUSIVE_OK_BITS)
                     .is_empty()
@@ -335,7 +335,7 @@ impl EventPoll {
                 }
             };
 
-            if op == EPollCtlOption::EpollCtlAdd {
+            if op == EPollCtlOption::Add {
                 // TODO: 循环检查是否为epoll嵌套epoll的情况，如果是则需要检测其深度
                 // 这里是需要一种检测算法的，但是目前未考虑epoll嵌套epoll的情况，所以暂时未实现
                 // Linux算法：https://code.dragonos.org.cn/xref/linux-6.1.9/fs/eventpoll.c?r=&mo=56953&fi=2057#2133
@@ -346,7 +346,7 @@ impl EventPoll {
 
             let ep_item = epoll_guard.ep_items.get(&fd);
             match op {
-                EPollCtlOption::EpollCtlAdd => {
+                EPollCtlOption::Add => {
                     // 如果已经存在，则返回错误
                     if ep_item.is_some() {
                         return Err(SystemError::EEXIST);
@@ -360,7 +360,7 @@ impl EventPoll {
                     ));
                     Self::ep_insert(&mut epoll_guard, dst_file, epitem)?;
                 }
-                EPollCtlOption::EpollCtlDel => {
+                EPollCtlOption::Del => {
                     // 不存在则返回错误
                     if ep_item.is_none() {
                         return Err(SystemError::ENOENT);
@@ -368,7 +368,7 @@ impl EventPoll {
                     // 删除
                     Self::ep_remove(&mut epoll_guard, fd, Some(dst_file))?;
                 }
-                EPollCtlOption::EpollCtlMod => {
+                EPollCtlOption::Mod => {
                     // 不存在则返回错误
                     if ep_item.is_none() {
                         return Err(SystemError::ENOENT);
@@ -785,19 +785,19 @@ impl EPollEvent {
 #[derive(Debug, PartialEq)]
 pub enum EPollCtlOption {
     /// 注册新的文件描述符到epfd
-    EpollCtlAdd,
+    Add,
     /// 将对应的文件描述符从epfd中删除
-    EpollCtlDel,
+    Del,
     /// 修改已经注册的文件描述符的监听事件
-    EpollCtlMod,
+    Mod,
 }
 
 impl EPollCtlOption {
     pub fn from_op_num(op: usize) -> Result<Self, SystemError> {
         match op {
-            1 => Ok(Self::EpollCtlAdd),
-            2 => Ok(Self::EpollCtlDel),
-            3 => Ok(Self::EpollCtlMod),
+            1 => Ok(Self::Add),
+            2 => Ok(Self::Del),
+            3 => Ok(Self::Mod),
             _ => Err(SystemError::EINVAL),
         }
     }

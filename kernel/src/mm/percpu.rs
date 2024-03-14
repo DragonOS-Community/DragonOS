@@ -26,7 +26,7 @@ impl PerCpu {
     /// 该函数会调用`smp_get_total_cpu()`获取CPU数量，然后将其存储在`CPU_NUM`中。
     #[allow(dead_code)]
     pub fn init() {
-        static CPU_NUM:AtomicU32=CPU_NUM_ATOMIC;
+        static CPU_NUM: AtomicU32 = CPU_NUM_ATOMIC;
         if CPU_NUM.load(core::sync::atomic::Ordering::SeqCst) != 0 {
             panic!("PerCpu::init() called twice");
         }

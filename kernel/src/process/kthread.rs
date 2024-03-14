@@ -21,7 +21,7 @@ use crate::{
     process::{ProcessManager, ProcessState},
 };
 
-type IrqHandler =  dyn Fn(Arc<IrqAction>) -> Result<(), SystemError>;
+type IrqHandler = dyn Fn(Arc<IrqAction>) -> Result<(), SystemError>;
 
 use super::{fork::CloneFlags, Pid, ProcessControlBlock, ProcessFlags};
 
@@ -92,12 +92,7 @@ pub enum KernelThreadClosure {
     StaticUsizeClosure((&'static dyn Fn(usize) -> i32, usize)),
     EmptyClosure((Box<dyn Fn() -> i32 + Send + Sync>, ())),
     StaticEmptyClosure((&'static dyn Fn() -> i32, ())),
-    IrqThread(
-        (
-            &'static IrqHandler,
-            Arc<IrqAction>,
-        ),
-    ),
+    IrqThread((&'static IrqHandler, Arc<IrqAction>)),
     // 添加其他类型入参的闭包，返回值必须是i32
 }
 

@@ -301,7 +301,7 @@ pub fn scm_framework_enable(framework: Arc<dyn ScmUiFramework>) -> Result<i32, S
     // }
     let mut current_framework = CURRENT_FRAMEWORK.write();
 
-    if SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) == true {
+    if SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) {
         video_refresh_manager().set_refresh_target(&metadata.buf_info)?;
     }
 

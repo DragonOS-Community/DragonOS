@@ -364,7 +364,7 @@ impl Ex2SuperBlock {
         // TODO 读取块描述付
         // 需要确定读多少个
         let mut decs: Vec<Ext2BlockGroupDescriptor> = Vec::new();
-
+        // 先确定块数，再遍历块，再n个字节n个字节读
 
     }
 }

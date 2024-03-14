@@ -1,9 +1,11 @@
+use alloc::sync::Arc;
+
 use crate::{
     filesystem::vfs::{FileSystem, IndexNode},
     libs::spinlock::SpinLock,
 };
 
-use super::fs::EXT2_SUPER_BLOCK;
+use super::fs::EXT2_SB_INFO;
 
 const EXT2_NDIR_BLOCKS: usize = 12;
 const EXT2_DIND_BLOCK: usize = 13;
@@ -38,12 +40,10 @@ pub struct Ext2Inode {
     disk_sector: u32,
     /// 文件属性
     flags: u32,
-        // TODO 系统依赖在c++上为union
-
+    // TODO 系统依赖在c++上为union
     /// 操作系统依赖
     os_dependent_1: u32,
 
-    //TODO 15长度的数组 指向块
     blocks: [u32; EXT2_BP_NUM],
 
     /// Generation number (Primarily used for NFS)
@@ -68,21 +68,24 @@ impl Ext2Inode {}
 
 impl LockedExt2Inode {
     pub fn get_block_group(inode: usize) -> usize {
-        let inodes_per_group = EXT2_SUPER_BLOCK.read().inodes_per_group;
+        let sb = &EXT2_SB_INFO.read().ext2_super_block.upgrade().unwrap();
+        let inodes_per_group = sb.inodes_per_group;
         return ((inode as u32 - 1) / inodes_per_group) as usize;
     }
 
     pub fn get_index_in_group(inode: usize) -> usize {
-        let inodes_per_group = EXT2_SUPER_BLOCK.read().inodes_per_group;
+        let sb = &EXT2_SB_INFO.read().ext2_super_block.upgrade().unwrap();
+
+        let inodes_per_group = sb.inodes_per_group;
         return ((inode as u32 - 1) % inodes_per_group) as usize;
     }
 
     pub fn get_block_addr(inode: usize) -> usize {
-        let super_block = EXT2_SUPER_BLOCK.read();
-        let mut inode_size = super_block.inode_size as usize;
-        let mut block_size = super_block.block_size as usize;
+        let sb = &EXT2_SB_INFO.read().ext2_super_block.upgrade().unwrap();
+        let mut inode_size = sb.inode_size as usize;
+        let block_size = sb.block_size as usize;
 
-        if super_block.major_version < 1 {
+        if sb.major_version < 1 {
             inode_size = 128;
         }
         return (inode * inode_size) / block_size;

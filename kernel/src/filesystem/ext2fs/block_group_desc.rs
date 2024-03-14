@@ -44,30 +44,6 @@ impl Ext2BlockGroupDescriptor {
         LBA_SIZE / mem::size_of::<Ext2BlockGroupDescriptor>()
     }
 }
-/// 读取块组描述符表
-pub fn read_block_grp_descriptor(
-    partition: Arc<Partition>,
-) -> Result<Ext2BlockGroupDescriptor, SystemError> {
-    // TODO 要计算读多少个块，读到一个数组里面
-    
-    let mut grp_des_table = Ext2BlockGroupDescriptor::new();
-    let mut data: Vec<u8> = Vec::with_capacity(LBA_SIZE);
-    data.resize(LBA_SIZE, 0);
-    partition.disk().read_at(
-        (partition.lba_start + LBA_SIZE as u64 * 2) as usize,
-        1,
-        &mut data,
-    )?;
-    let mut cursor = VecCursor::new(data);
-    grp_des_table.block_bitmap_address = cursor.read_u32()?;
-    grp_des_table.inode_bitmap_address = cursor.read_u32()?;
-    grp_des_table.inode_table_start = cursor.read_u32()?;
-    grp_des_table.free_blocks_num = cursor.read_u16()?;
-    grp_des_table.free_inodes_num = cursor.read_u16()?;
-    grp_des_table.dir_num = cursor.read_u16()?;
-
-    Ok(grp_des_table)
-}
 
 const EXT2_NAME_LEN: usize = 255;
 pub struct Ext2DirEntry {

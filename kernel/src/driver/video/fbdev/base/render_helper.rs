@@ -67,11 +67,9 @@ impl<'a> BitIter<'a>{
             self.read_mask=0b10000000;
             self.current=match self.src.next(){
                 Some(x)=>{
-                    // println!("x:{:?}",x);
                     x.clone()
                 },
                 None=>{
-                    // println!("x:None",);
                     return false;
                 }
             };
@@ -82,11 +80,12 @@ impl<'a> BitIter<'a>{
     }
 
     fn full_buffer(&mut self)->Result<PixelLineStatus,PixelLineStatus>{
+        let mut same_endian=if self._dst_pattern==self._color_pattern {1} else {-1};
         let mut color=self.read_bit();
-        let mut buffer_pointer=0;
+        let mut buffer_pointer=if self._dst_pattern==self._color_pattern {0} else {3};
         let mask=0x000000ff<<(self.byte_per_pixel-1)*8;
         let mut temp=0;
-        while buffer_pointer<4{
+        while buffer_pointer>=0&&buffer_pointer<=3{
             if self.consumed_bit>=self.image_width{
                 self.consumed_bit=0;
                 return Ok(PixelLineStatus::Full(self.buffer))
@@ -96,12 +95,8 @@ impl<'a> BitIter<'a>{
             temp<<=(4-self.byte_per_pixel)*8;
             temp>>=buffer_pointer*8;
             self.buffer|=temp;
-            // if buffer_pointer!=3{
-            //     self.buffer<<=8;
-            // }
-            buffer_pointer+=1;
+            buffer_pointer+=same_endian;
             self.left_byte+=1;
-            // println!("{},{}",buffer_pointer,self.left_byte);
             if self.left_byte>=self.byte_per_pixel{
                 self.left_byte=0;
                 if !self.move_mask(){
@@ -116,10 +111,6 @@ impl<'a> BitIter<'a>{
         }
         return Ok(PixelLineStatus::NotFull(self.buffer));
     }
-
-    // fn write_buffer(index:u32,dst:&mut u32,src:&u32){
-        
-    // }
 
     fn read_bit(&self)->u32{
         match self.read_mask&self.current{

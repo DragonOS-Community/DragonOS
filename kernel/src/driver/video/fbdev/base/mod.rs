@@ -256,17 +256,12 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         _pitch_index: u32,
     ) {
         let test:Vec<u8>=vec![0b10101010,0b00001111,0b11110000];
-        
-        // kdebug!("dst1:{:?},start:{},pitch:{}",_dst1,_start_index,_pitch_index);
         let mut dst =unsafe{ _dst1.as_ptr::<u32>()};
         let mut line_length=0;
         let mut count=0;
-        // let mut ans=vec![];
-    
-        let iter=BitIter::new(_fg, _bg,EndianPattern::LittleEndian, EndianPattern::LittleEndian, self.current_fb_var().bits_per_pixel/8, _image.data.iter(),_image.width);
-        // let iter=BitIter::new(0x00ffffff, 0x00000000,EndianPattern::LittleEndian, EndianPattern::LittleEndian, 2, test.iter(),64);
+        let image=FbImage{ x: 0, y: 0, width: 8, height: 16, fg: 15, bg: 0, depth: 1, data: vec![0, 0, 0, 0, 0, 120, 12, 124, 204, 204, 204, 118, 0, 0, 0, 0]};
+        let iter=BitIter::new(_fg, _bg,EndianPattern::_BigEndian, EndianPattern::LittleEndian, self.current_fb_var().bits_per_pixel/8, _image.data.iter(),_image.width);
         for (content,full) in iter{
-            // ans.push(content);
             unsafe{
                 *dst=content;
                 dst=dst.add(1);
@@ -278,9 +273,6 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
             }
 
         }
-        // send_to_default_serial8250_port(format!("{:?}\n\0",ans).as_bytes());
-        // panic!()
-    
     }
 }
 

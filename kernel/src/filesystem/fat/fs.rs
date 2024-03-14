@@ -1709,7 +1709,8 @@ impl IndexNode for LockedFATInode {
                 }
             };
             // 检查文件是否存在
-            old_dir.check_existence(old_name, Some(false), guard.fs.upgrade().unwrap())?;
+            // old_dir.check_existence(old_name, Some(false), guard.fs.upgrade().unwrap())?;
+
             old_dir.rename(fs, old_name, new_name)?;
         } else {
             let mut old_guard = self.0.lock();

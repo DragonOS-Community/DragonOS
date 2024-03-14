@@ -605,11 +605,21 @@ impl Syscall {
     //Syscall_rename
     pub fn do_renameat2(
         oldfd: i32,
-        filename_from: &str,
+        filename_from: *const i8,
         newfd: i32,
-        filename_to: &str,
+        filename_to: *const i8,
         _flags: u32,
     ) -> Result<usize, SystemError> {
+        let getname = |name: *const i8| {
+            let name: &CStr = unsafe { CStr::from_ptr(name) };
+            let name: &str = name.to_str().map_err(|_| SystemError::EINVAL)?;
+            if name.len() >= MAX_PATHLEN {
+                return Err(SystemError::ENAMETOOLONG);
+            }
+            return Ok(name.trim());
+        };
+        let filename_from = getname(filename_from).unwrap();
+        let filename_to = getname(filename_to).unwrap();
         // 文件名过长
         if filename_from.len() > MAX_PATHLEN as usize || filename_to.len() > MAX_PATHLEN as usize {
             return Err(SystemError::ENAMETOOLONG);

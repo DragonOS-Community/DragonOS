@@ -110,23 +110,30 @@ impl Syscall {
             SYS_RENAME => {
                 let oldname: *const i8 = args[0] as *const c_char;
                 let newname: *const i8 = args[1] as *const c_char;
-                let getname = |name| {
-                    let name: &CStr = unsafe { CStr::from_ptr(name) };
-                    let name: &str = name.to_str().map_err(|_| SystemError::EINVAL)?;
-                    if name.len() >= MAX_PATHLEN {
-                        return Err(SystemError::ENAMETOOLONG);
-                    }
-                    return Ok(name.trim());
-                };
-                let oldname = getname(oldname);
-                let newname = getname(newname);
                 Self::do_renameat2(
                     AtFlags::AT_FDCWD.bits(),
-                    oldname.unwrap(),
+                    oldname,
                     AtFlags::AT_FDCWD.bits(),
-                    newname.unwrap(),
+                    newname,
                     0,
                 )
+            }
+
+            SYS_RENAMEAT => {
+                let oldfd = args[0] as i32;
+                let oldname: *const i8 = args[1] as *const c_char;
+                let newfd = args[2] as i32;
+                let newname: *const i8 = args[3] as *const c_char;
+                Self::do_renameat2(oldfd, oldname, newfd, newname, 0)
+            }
+
+            SYS_RENAMEAT2 => {
+                let oldfd = args[0] as i32;
+                let oldname: *const i8 = args[1] as *const c_char;
+                let newfd = args[2] as i32;
+                let newname: *const i8 = args[3] as *const c_char;
+                let flags = args[4] as u32;
+                Self::do_renameat2(oldfd, oldname, newfd, newname, flags)
             }
 
             SYS_OPENAT => {

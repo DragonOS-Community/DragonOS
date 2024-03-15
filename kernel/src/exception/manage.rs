@@ -320,7 +320,7 @@ impl IrqManager {
 
         // 标记当前irq是否是共享的
         let mut irq_shared = false;
-        if desc_inner_guard.actions().is_empty() == false {
+        if !desc_inner_guard.actions().is_empty() {
             // 除非双方都同意并且是相同类型（级别、边沿、极性），否则不能共享中断。
             // 因此，两个标志字段都必须设置IRQF_SHARED，并且设置触发类型的位必须匹配。
             // 另外，所有各方都必须就ONESHOT达成一致。
@@ -362,11 +362,10 @@ impl IrqManager {
             let old = &desc_inner_guard.actions()[0].clone();
             let old_guard = old.inner();
 
-            if ((old_guard
+            if (!(old_guard
                 .flags()
                 .intersection(*action_guard.flags())
-                .contains(IrqHandleFlags::IRQF_SHARED))
-                == false)
+                .contains(IrqHandleFlags::IRQF_SHARED)))
                 || (old_trigger_type != (action_guard.flags().trigger_type()))
                 || ((old_guard.flags().bitxor(*action_guard.flags()))
                     .contains(IrqHandleFlags::IRQF_ONESHOT))
@@ -406,7 +405,6 @@ impl IrqManager {
             .chip()
             .flags()
             .contains(IrqChipFlags::IRQCHIP_ONESHOT_SAFE)
-            == false
         {
             // 请求中断时 hander = NULL，因此我们为其使用默认的主处理程序。
             // 但它没有设置ONESHOT标志。与电平触发中断结合时，

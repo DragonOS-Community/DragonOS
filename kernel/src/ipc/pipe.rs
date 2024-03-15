@@ -384,7 +384,7 @@ impl IndexNode for LockedPipeInode {
             .read_wait_queue
             .wakeup(Some(ProcessState::Blocked(true)));
 
-        let pollflag = EPollEventType::from_bits_truncate(inode.poll(&data)? as u32);
+        let pollflag = EPollEventType::from_bits_truncate(inode.poll(data)? as u32);
         // 唤醒epoll中等待的进程
         EventPoll::wakeup_epoll(&mut inode.epitems, pollflag)?;
 

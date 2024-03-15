@@ -1125,7 +1125,7 @@ impl LongDirEntry {
 }
 
 impl ShortDirEntry {
-    const PADDING: u8 = ' ' as u8;
+    const PADDING: u8 = b' ';
 
     /// @brief 判断当前目录项是否为文件夹
     ///
@@ -1176,7 +1176,7 @@ impl ShortDirEntry {
 
         // 拷贝扩展名，并计算总的长度
         let total_len = if ext_len > 0 {
-            name[base_len] = '.' as u8;
+            name[base_len] = b'.';
             name[base_len + 1..base_len + 1 + ext_len].copy_from_slice(&self.name[8..8 + ext_len]);
             // 总长度为基础名长度+点号+扩展名长度
             base_len + 1 + ext_len
@@ -1208,7 +1208,7 @@ impl ShortDirEntry {
 
             file.file_name = self.name_to_string();
             file.first_cluster = first_cluster;
-            file.short_dir_entry = self.clone();
+            file.short_dir_entry = *self;
             file.loc = (loc, loc);
 
             // 根据当前短目录项的类型的不同，返回对应的枚举类型。
@@ -1223,7 +1223,7 @@ impl ShortDirEntry {
             dir.dir_name = self.name_to_string();
             dir.first_cluster = first_cluster;
             dir.root_offset = None;
-            dir.short_dir_entry = Some(self.clone());
+            dir.short_dir_entry = Some(*self);
             dir.loc = Some((loc, loc));
 
             return FATDirEntry::Dir(dir);
@@ -1251,7 +1251,7 @@ impl ShortDirEntry {
             file.first_cluster = first_cluster;
             file.file_name = name;
             file.loc = loc;
-            file.short_dir_entry = self.clone();
+            file.short_dir_entry = *self;
 
             if self.is_file() {
                 return FATDirEntry::File(file);
@@ -1264,7 +1264,7 @@ impl ShortDirEntry {
             dir.first_cluster = first_cluster;
             dir.dir_name = name;
             dir.loc = Some(loc);
-            dir.short_dir_entry = Some(self.clone());
+            dir.short_dir_entry = Some(*self);
             dir.root_offset = None;
 
             return FATDirEntry::Dir(dir);
@@ -1298,8 +1298,7 @@ impl ShortDirEntry {
         let lba = fs.get_lba_from_offset(
             fs.bytes_to_sector(fs.get_in_partition_bytes_offset(disk_bytes_offset)),
         );
-        let mut v: Vec<u8> = Vec::new();
-        v.resize(1 * fs.lba_per_sector() * LBA_SIZE, 0);
+        let mut v: Vec<u8> = vec![0; 1 * fs.lba_per_sector() * LBA_SIZE];
         fs.partition
             .disk()
             .read_at(lba, 1 * fs.lba_per_sector(), &mut v)?;
@@ -1772,7 +1771,7 @@ impl FATDirEntry {
 
     /// @brief 将FATDirEntry转换为FATFile对象
     pub fn to_file(&self) -> Result<FATFile, SystemError> {
-        if self.is_file() == false {
+        if !self.is_file() {
             return Err(SystemError::EISDIR);
         }
 
@@ -1786,7 +1785,7 @@ impl FATDirEntry {
 
     /// @brief 将FATDirEntry转换为FATDir对象
     pub fn to_dir(&self) -> Result<FATDir, SystemError> {
-        if self.is_dir() == false {
+        if !self.is_dir() {
             return Err(SystemError::ENOTDIR);
         }
         match &self {
@@ -1833,12 +1832,12 @@ impl ShortNameGenerator {
 
         let mut short_name: [u8; 11] = [0x20u8; 11];
         if name == "." {
-            short_name[0] = '.' as u8;
+            short_name[0] = b'.';
         }
 
         if name == ".." {
-            short_name[0] = '.' as u8;
-            short_name[1] = '.' as u8;
+            short_name[0] = b'.';
+            short_name[1] = b'.';
         }
 
         // @name_fits: 名称是否被完全拷贝
@@ -1862,7 +1861,7 @@ impl ShortNameGenerator {
             None => {
                 // 文件名中，不存在"."
                 let (b_len, fits, b_lossy) =
-                    Self::copy_part(&mut short_name[..Self::SHORT_NAME_LEN], &name);
+                    Self::copy_part(&mut short_name[..Self::SHORT_NAME_LEN], name);
                 (fits, b_len, b_lossy)
             }
         };
@@ -2050,7 +2049,7 @@ impl ShortNameGenerator {
             prefix_len
         };
 
-        buf[prefix_len] = '~' as u8;
+        buf[prefix_len] = b'~';
         buf[prefix_len + 1] = char::from_digit(num, 10).unwrap() as u8;
         buf[8..].copy_from_slice(&self.name[8..]);
         return buf;
@@ -2362,8 +2361,7 @@ pub fn get_raw_dir_entry(
     // let step2 = fs.bytes_to_sector(step1);
     // let lba = fs.get_lba_from_offset(step2);
     // kdebug!("step1={step1}, step2={step2}, lba={lba}");
-    let mut v: Vec<u8> = Vec::new();
-    v.resize(1 * LBA_SIZE, 0);
+    let mut v: Vec<u8> = vec![0; LBA_SIZE];
 
     fs.partition.disk().read_at(lba, 1, &mut v)?;
 

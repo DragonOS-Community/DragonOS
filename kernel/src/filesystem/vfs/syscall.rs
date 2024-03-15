@@ -918,8 +918,7 @@ impl Syscall {
         // IoVecs会进行用户态检验
         let mut iovecs = unsafe { IoVecs::from_user(iov as *const IoVec, count, true) }?;
 
-        let mut data = Vec::new();
-        data.resize(iovecs.0.iter().map(|x| x.len()).sum(), 0);
+        let mut data = vec![0; iovecs.0.iter().map(|x| x.len()).sum()];
 
         let len = Self::read(fd, &mut data)?;
 

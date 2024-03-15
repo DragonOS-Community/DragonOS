@@ -100,7 +100,7 @@ impl Signal {
             self.complete_signal(pcb.clone(), pt);
         }
         // 如果不是实时信号的话，同一时刻信号队列里只会有一个待处理的信号，如果重复接收就不做处理
-        else if !self.is_rt_signal() && pending.queue().find(self.clone()).0.is_some() {
+        else if !self.is_rt_signal() && pending.queue().find(*self).0.is_some() {
             return Ok(0);
         } else {
             // TODO signalfd_notify 完善 signalfd 机制
@@ -158,7 +158,7 @@ impl Signal {
             pcb.sig_info_mut()
                 .sig_pending_mut()
                 .signal_mut()
-                .insert(self.clone().into());
+                .insert((*self).into());
             target_pcb = Some(pcb.clone());
         } else if pt == PidType::PID {
             /*
@@ -189,11 +189,7 @@ impl Signal {
     #[inline]
     fn wants_signal(&self, pcb: Arc<ProcessControlBlock>) -> bool {
         // 如果改进程屏蔽了这个signal，则不能接收
-        if pcb
-            .sig_info_irqsave()
-            .sig_block()
-            .contains(self.clone().into())
-        {
+        if pcb.sig_info_irqsave().sig_block().contains((*self).into()) {
             return false;
         }
 
@@ -221,7 +217,7 @@ impl Signal {
     #[allow(dead_code)]
     #[inline]
     fn sig_fatal(&self, pcb: Arc<ProcessControlBlock>) -> bool {
-        let action = pcb.sig_struct().handlers[self.clone() as usize - 1].action();
+        let action = pcb.sig_struct().handlers[*self as usize - 1].action();
         // 如果handler是空，采用默认函数，signal处理可能会导致进程退出。
         match action {
             SigactionType::SaHandler(handler) => handler.is_sig_default(),
@@ -270,7 +266,7 @@ impl Signal {
         {
             return true;
         }
-        return !pcb.sig_struct().handlers[self.clone() as usize - 1].is_ignore();
+        return !pcb.sig_struct().handlers[*self as usize - 1].is_ignore();
 
         //TODO 仿照 linux 中的prepare signal完善逻辑，linux 中还会根据例如当前进程状态(Existing)进行判断，现在的信号能否发出就只是根据 ignored 来判断
     }
@@ -371,7 +367,7 @@ pub(super) fn do_sigaction(
     // 保存原有的 sigaction
     let old_act: Option<&mut Sigaction> = {
         if let Some(oa) = old_act {
-            *(oa) = (*action);
+            *(oa) = *action;
             Some(oa)
         } else {
             None

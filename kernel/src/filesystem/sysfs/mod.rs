@@ -26,7 +26,7 @@ static mut SYSFS_INSTANCE: Option<SysFS> = None;
 #[inline(always)]
 pub fn sysfs_instance() -> &'static SysFS {
     unsafe {
-        return &SYSFS_INSTANCE.as_ref().unwrap();
+        return SYSFS_INSTANCE.as_ref().unwrap();
     }
 }
 

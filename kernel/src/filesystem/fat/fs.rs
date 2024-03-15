@@ -432,7 +432,7 @@ impl FATFileSystem {
                 let entry = cursor.read_u32()? & 0x0fffffff;
 
                 match entry {
-                    _n if (current_cluster >= 0x0ffffff7 && current_cluster <= 0x0fffffff) => {
+                    _n if (0x0ffffff7..=0x0fffffff).contains(&current_cluster) => {
                         // 当前簇号不是一个能被获得的簇（可能是文件系统出错了）
                         kerror!("FAT32 get fat entry: current cluster number [{}] is not an allocatable cluster number.", current_cluster);
                         FATEntry::Bad
@@ -474,7 +474,7 @@ impl FATFileSystem {
         // FAT表项在逻辑块内的字节偏移量
         let blk_offset = self.get_in_block_offset(fat_bytes_offset);
 
-        let mut v: Vec<u8> =vec![0; self.bpb.bytes_per_sector as usize];
+        let mut v: Vec<u8> = vec![0; self.bpb.bytes_per_sector as usize];
         self.partition
             .disk()
             .read_at(fat_ent_lba, 1 * self.lba_per_sector(), &mut v)?;
@@ -987,7 +987,7 @@ impl FATFileSystem {
 
                     let lba = self.get_lba_from_offset(self.bytes_to_sector(part_bytes_offset));
 
-                    let mut v: Vec<u8> =vec![0; self.lba_per_sector() * LBA_SIZE];
+                    let mut v: Vec<u8> = vec![0; self.lba_per_sector() * LBA_SIZE];
                     self.partition
                         .disk()
                         .read_at(lba, self.lba_per_sector(), &mut v)?;

@@ -1291,7 +1291,7 @@ impl Eq for VMA {}
 
 impl PartialOrd for VMA {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-       Some(self.cmp(other))
+        Some(self.cmp(other))
     }
 }
 

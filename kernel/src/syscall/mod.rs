@@ -367,8 +367,7 @@ impl Syscall {
                 let virt_rem = VirtAddr::new(rem as usize);
                 if frame.from_user()
                     && (verify_area(virt_req, core::mem::size_of::<TimeSpec>()).is_err()
-                        || verify_area(virt_rem, core::mem::size_of::<TimeSpec>())
-                            .is_err())
+                        || verify_area(virt_rem, core::mem::size_of::<TimeSpec>()).is_err())
                 {
                     Err(SystemError::EFAULT)
                 } else {

@@ -229,8 +229,7 @@ impl<'a> UserBufferReader<'a> {
     ///
     /// - `offset`：字节偏移量
     pub fn buffer<T>(&self, offset: usize) -> Result<&[T], SystemError> {
-        self
-            .convert_with_offset::<T>(self.buffer, offset)
+        self.convert_with_offset::<T>(self.buffer, offset)
             .map_err(|_| SystemError::EINVAL)
     }
 

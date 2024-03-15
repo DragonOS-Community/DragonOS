@@ -1207,7 +1207,7 @@ impl ShortDirEntry {
 
         // 当前是文件或卷号
         if self.is_file() || self.is_volume_id() {
-            let mut file: FATFile = FATFile {
+            let file: FATFile = FATFile {
                 file_name: self.name_to_string(),
                 first_cluster,
                 short_dir_entry: *self,

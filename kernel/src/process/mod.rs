@@ -619,7 +619,7 @@ impl ProcessControlBlock {
 
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find(ppid)
             .map(|p| Arc::downgrade(&p))
-            .unwrap_or_else(Weak::new());
+            .unwrap_or_else(|| Weak::new());
 
         let pcb = Self {
             pid,

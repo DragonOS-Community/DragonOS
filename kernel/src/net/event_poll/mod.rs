@@ -50,6 +50,12 @@ pub struct EventPoll {
     self_ref: Option<Weak<SpinLock<EventPoll>>>,
 }
 
+impl Default for EventPoll {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EventPoll {
     pub const EP_MAX_EVENTS: u32 = INT32_MAX / (core::mem::size_of::<EPollEvent>() as u32);
     /// 用于获取inode中的epitem队列
@@ -372,7 +378,7 @@ impl EventPoll {
                         epds.events |=
                             EPollEventType::EPOLLERR.bits() | EPollEventType::EPOLLHUP.bits();
 
-                        Self::ep_modify(&mut epoll_guard, ep_item, &epds)?;
+                        Self::ep_modify(&mut epoll_guard, ep_item, epds)?;
                     }
                 }
             }

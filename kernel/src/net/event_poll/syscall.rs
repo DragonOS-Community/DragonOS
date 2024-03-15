@@ -96,7 +96,7 @@ impl Syscall {
         mut sigmask: &mut SigSet,
     ) -> Result<usize, SystemError> {
         // 设置屏蔽的信号
-        set_current_sig_blocked(&mut sigmask);
+        set_current_sig_blocked(sigmask);
 
         let wait_ret = Self::epoll_wait(epfd, epoll_event, max_events, timespec);
 

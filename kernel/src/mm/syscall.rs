@@ -302,7 +302,7 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
         let vma = vma.unwrap();
-        let vm_flags = vma.lock().vm_flags().clone();
+        let vm_flags = *vma.lock().vm_flags();
 
         // 暂时不支持巨页映射
         if vm_flags.contains(VmFlags::VM_HUGETLB) {

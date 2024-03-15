@@ -90,9 +90,7 @@ impl Completion {
     /// @brief 唤醒一个wait_queue中的节点
     pub fn complete(&self) {
         let mut inner = self.inner.lock_irqsave();
-        if inner.done != COMPLETE_ALL {
-            inner.done += 1;
-        }
+        inner.done.saturating_add(1);
         inner.wait_queue.wakeup(None);
         // 脱离生命周期，自动释放guard
     }

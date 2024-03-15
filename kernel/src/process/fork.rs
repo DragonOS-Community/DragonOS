@@ -383,7 +383,7 @@ impl ProcessManager {
         }
 
         // 拷贝标志位
-        Self::copy_flags(&clone_flags, &pcb).unwrap_or_else(|e| {
+        Self::copy_flags(&clone_flags, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy flags from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e
@@ -391,7 +391,7 @@ impl ProcessManager {
         });
 
         // 拷贝用户地址空间
-        Self::copy_mm(&clone_flags, &current_pcb, &pcb).unwrap_or_else(|e| {
+        Self::copy_mm(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy mm from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e
@@ -399,7 +399,7 @@ impl ProcessManager {
         });
 
         // 拷贝文件描述符表
-        Self::copy_files(&clone_flags, &current_pcb, &pcb).unwrap_or_else(|e| {
+        Self::copy_files(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy files from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e
@@ -407,7 +407,7 @@ impl ProcessManager {
         });
 
         // 拷贝信号相关数据
-        Self::copy_sighand(&clone_flags, &current_pcb, &pcb).map_err(|e| {
+        Self::copy_sighand(&clone_flags, current_pcb, pcb).map_err(|e| {
             panic!(
                 "fork: Failed to copy sighand from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e
@@ -415,7 +415,7 @@ impl ProcessManager {
         })?;
 
         // 拷贝线程
-        Self::copy_thread(&current_pcb, &pcb, clone_args,&current_trapframe).unwrap_or_else(|e| {
+        Self::copy_thread(current_pcb, pcb, clone_args,current_trapframe).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy thread from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e
@@ -431,7 +431,7 @@ impl ProcessManager {
                 (*ptr).tgid = current_pcb.tgid;
             }
         } else {
-            pcb.thread.write_irqsave().group_leader = Arc::downgrade(&pcb);
+            pcb.thread.write_irqsave().group_leader = Arc::downgrade(pcb);
             unsafe {
                 let ptr = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
                 (*ptr).tgid = pcb.tgid;
@@ -461,7 +461,7 @@ impl ProcessManager {
             }
         } else {
             // 新创建的进程，设置其父进程为当前进程
-            *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(&current_pcb);
+            *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
             pcb.exit_signal
                 .store(clone_args.exit_signal, Ordering::SeqCst);
         }

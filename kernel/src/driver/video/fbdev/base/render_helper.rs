@@ -81,7 +81,7 @@ impl<'a> BitIter<'a>{
 
     fn full_buffer(&mut self)->Result<PixelLineStatus,PixelLineStatus>{
         let mut same_endian=if self._dst_pattern==self._color_pattern {1} else {-1};
-        let mut color=self.read_bit();
+        let mut color=self.read_bit()<<self.left_byte*8;
         let mut buffer_pointer=if self._dst_pattern==self._color_pattern {0} else {3};
         let mask=0x000000ff<<(self.byte_per_pixel-1)*8;
         let mut temp=0;

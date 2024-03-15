@@ -421,7 +421,19 @@ impl FrameBufferOps for VesaFb {
                     }
                 }
             }
-            _ => todo!(),
+            24 => {
+                let base = screen_base.as_ptr::<[u8;3]>();
+
+                for y in rect.dy..(rect.dy + rect.height) {
+                    for x in rect.dx..(rect.dx + rect.width) {
+                        unsafe { *base.add((y * line_offset + x) as usize) = [0,0,0] };
+                    }
+                }
+            },
+            _=>{
+                send_to_default_serial8250_port(format!("unsupported bit depth:{}!\n\0",bpp).as_bytes());
+                todo!()
+            }
         }
 
         Ok(())
@@ -555,7 +567,53 @@ impl FrameBufferOps for VesaFb {
                         }
                     }
                 }
+            },
+            3=>{
+                let mut dst = dst.as_ptr::<[u8;3]>();
+                let mut src = src.as_ptr::<[u8;3]>();
+
+                for y in 0..data.height as usize {
+                    if (data.dy + y as i32) < 0 || (data.dy + y as i32) > var.yres as i32 {
+                        unsafe {
+                            // core::ptr::copy(src, dst, data.width as usize);
+                            src = src.add(var.xres as usize);
+                            dst = dst.add(var.xres as usize);
+                        }
+                        continue;
+                    }
+                    if data.dx < 0 {
+                        if ((-data.dx) as u32) < data.width {
+                            unsafe {
+                                core::ptr::copy(
+                                    src.add((-data.dx) as usize),
+                                    dst,
+                                    (data.width as usize) - (-data.dx) as usize,
+                                );
+                                src = src.add(var.xres as usize);
+                                dst = dst.add(var.xres as usize);
+                            }
+                        }
+                    } else if data.dx as u32 + data.width > var.xres {
+                        if (data.dx as u32) < var.xres {
+                            unsafe {
+                                core::ptr::copy(src, dst, (var.xres - data.dx as u32) as usize);
+                                src = src.add(var.xres as usize);
+                                dst = dst.add(var.xres as usize);
+                            }
+                        }
+                    } else {
+                        for i in 0..data.width as usize {
+                            unsafe { *(dst.add(i)) = *(src.add(i)) }
+                        }
+                        unsafe {
+                            // core::ptr::copy(src, dst, data.width as usize);
+                            src = src.add(var.xres as usize);
+                            dst = dst.add(var.xres as usize);
+                        }
+                    }
+                }
             }
+
             _ => {
                 send_to_default_serial8250_port(format!("bytes_per_pixel:{}\n\0",bytes_per_pixel).as_bytes());
                 todo!()

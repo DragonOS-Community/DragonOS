@@ -113,7 +113,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                 self.slow_imageblit(image, dst1, fg, bg, bitstart/4, self.current_fb_fix().line_length)
                 // unsafe { self.fast_imageblit(image, dst1, fg, bg) }
             } else {
-                self.slow_imageblit(image, dst1, fg, bg, start_index, pitch_index)
+                self.slow_imageblit(image, dst1, fg, bg, bitstart/4, self.current_fb_fix().line_length)
             }
         } else {
             todo!("color image blit todo");
@@ -257,6 +257,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
     ) {
         let test:Vec<u8>=vec![0b10101010,0b00001111,0b11110000];
         let mut dst =unsafe{ _dst1.as_ptr::<u32>()};
+        // send_to_default_serial8250_port(format!("{:?}\n\0",_image).as_bytes());
         let mut line_length=0;
         let mut count=0;
         let image=FbImage{ x: 0, y: 0, width: 8, height: 16, fg: 15, bg: 0, depth: 1, data: vec![0, 0, 0, 0, 0, 120, 12, 124, 204, 204, 204, 118, 0, 0, 0, 0]};
@@ -264,6 +265,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         for (content,full) in iter{
             unsafe{
                 *dst=content;
+                
                 dst=dst.add(1);
             }
             
@@ -273,6 +275,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
             }
 
         }
+        // send_to_default_serial8250_port(format!("{:?}\n\0",content).as_bytes());
     }
 }
 

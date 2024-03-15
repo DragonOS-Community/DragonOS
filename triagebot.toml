@@ -69,12 +69,12 @@ trigger_files = [
     ".mailmap",
 ]
 
-[autolabel."S-waiting-on-review"]
+[autolabel."S-等待审查"]
 new_pr = true
 
 [no-merges]
 exclude_titles = ["Rollup of", "subtree update", "Subtree update"]
-labels = ["S-waiting-on-author"]
+labels = ["S-等待作者修改"]
 
 [mentions."triagebot.toml"]
 message = "`triagebot.toml` has been modified, there may have been changes to the review queue."

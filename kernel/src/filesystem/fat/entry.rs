@@ -1772,7 +1772,7 @@ impl FATDirEntry {
 
     /// @brief 将FATDirEntry转换为FATFile对象
     pub fn to_file(&self) -> Result<FATFile, SystemError> {
-        if self.is_file() == false {
+        if !self.is_file() {
             return Err(SystemError::EISDIR);
         }
 
@@ -1786,7 +1786,7 @@ impl FATDirEntry {
 
     /// @brief 将FATDirEntry转换为FATDir对象
     pub fn to_dir(&self) -> Result<FATDir, SystemError> {
-        if self.is_dir() == false {
+        if !self.is_dir(){
             return Err(SystemError::ENOTDIR);
         }
         match &self {
@@ -1833,12 +1833,12 @@ impl ShortNameGenerator {
 
         let mut short_name: [u8; 11] = [0x20u8; 11];
         if name == "." {
-            short_name[0] = '.' as u8;
+            short_name[0] = b'.';
         }
 
         if name == ".." {
-            short_name[0] = '.' as u8;
-            short_name[1] = '.' as u8;
+            short_name[0] = b'.';
+            short_name[1] = b'.';
         }
 
         // @name_fits: 名称是否被完全拷贝
@@ -2362,8 +2362,7 @@ pub fn get_raw_dir_entry(
     // let step2 = fs.bytes_to_sector(step1);
     // let lba = fs.get_lba_from_offset(step2);
     // kdebug!("step1={step1}, step2={step2}, lba={lba}");
-    let mut v: Vec<u8> = Vec::new();
-    v.resize(1 * LBA_SIZE, 0);
+    let mut v: Vec<u8> = vec![0; 1 * LBA_SIZE];
 
     fs.partition.disk().read_at(lba, 1, &mut v)?;
 

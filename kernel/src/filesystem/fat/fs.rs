@@ -381,8 +381,7 @@ impl FATFileSystem {
         // FAT表项在逻辑块内的字节偏移量
         let blk_offset = self.get_in_block_offset(fat_bytes_offset);
 
-        let mut v = Vec::<u8>::new();
-        v.resize(self.bpb.bytes_per_sector as usize, 0);
+        let mut v: Vec<u8> = vec![0; self.bpb.bytes_per_sector as usize];
         self.partition
             .disk()
             .read_at(fat_ent_lba as usize, 1 * self.lba_per_sector(), &mut v)?;
@@ -475,8 +474,7 @@ impl FATFileSystem {
         // FAT表项在逻辑块内的字节偏移量
         let blk_offset = self.get_in_block_offset(fat_bytes_offset);
 
-        let mut v = Vec::<u8>::new();
-        v.resize(self.bpb.bytes_per_sector as usize, 0);
+        let mut v: Vec<u8> =vec![0; self.bpb.bytes_per_sector as usize];
         self.partition
             .disk()
             .read_at(fat_ent_lba, 1 * self.lba_per_sector(), &mut v)?;
@@ -944,8 +942,7 @@ impl FATFileSystem {
 
                 // 由于FAT12的FAT表不大于6K，因此直接读取6K
                 let num_lba = (6 * 1024) / LBA_SIZE;
-                let mut v: Vec<u8> = Vec::new();
-                v.resize(num_lba * LBA_SIZE, 0);
+                let mut v: Vec<u8> = vec![0; num_lba * LBA_SIZE];
                 self.partition.disk().read_at(lba, num_lba, &mut v)?;
 
                 let mut cursor: VecCursor = VecCursor::new(v);
@@ -990,8 +987,7 @@ impl FATFileSystem {
 
                     let lba = self.get_lba_from_offset(self.bytes_to_sector(part_bytes_offset));
 
-                    let mut v: Vec<u8> = Vec::new();
-                    v.resize(self.lba_per_sector() * LBA_SIZE, 0);
+                    let mut v: Vec<u8> =vec![0; self.lba_per_sector() * LBA_SIZE];
                     self.partition
                         .disk()
                         .read_at(lba, self.lba_per_sector(), &mut v)?;
@@ -1022,8 +1018,7 @@ impl FATFileSystem {
 
                     let lba = self.get_lba_from_offset(self.bytes_to_sector(part_bytes_offset));
 
-                    let mut v: Vec<u8> = Vec::new();
-                    v.resize(self.lba_per_sector() * LBA_SIZE, 0);
+                    let mut v: Vec<u8> = vec![0; self.lba_per_sector() * LBA_SIZE];
                     self.partition
                         .disk()
                         .read_at(lba, self.lba_per_sector(), &mut v)?;
@@ -1071,8 +1066,7 @@ impl FATFileSystem {
 
                 let lba = self.get_lba_from_offset(self.bytes_to_sector(fat_part_bytes_offset));
 
-                let mut v: Vec<u8> = Vec::new();
-                v.resize(LBA_SIZE, 0);
+                let mut v: Vec<u8> = vec![0; LBA_SIZE];
                 self.partition.disk().read_at(lba, 1, &mut v)?;
 
                 let mut cursor: VecCursor = VecCursor::new(v);
@@ -1104,8 +1098,7 @@ impl FATFileSystem {
 
                 let lba = self.get_lba_from_offset(self.bytes_to_sector(fat_part_bytes_offset));
 
-                let mut v: Vec<u8> = Vec::new();
-                v.resize(LBA_SIZE, 0);
+                let mut v: Vec<u8> = vec![0; LBA_SIZE];
                 self.partition.disk().read_at(lba, 1, &mut v)?;
 
                 let mut cursor: VecCursor = VecCursor::new(v);
@@ -1131,8 +1124,7 @@ impl FATFileSystem {
                     let lba = self.get_lba_from_offset(self.bytes_to_sector(f_offset));
 
                     // kdebug!("set entry, lba={lba}, in_block_offset={in_block_offset}");
-                    let mut v: Vec<u8> = Vec::new();
-                    v.resize(LBA_SIZE, 0);
+                    let mut v: Vec<u8> = vec![0; LBA_SIZE];
                     self.partition.disk().read_at(lba, 1, &mut v)?;
 
                     let mut cursor: VecCursor = VecCursor::new(v);
@@ -1219,8 +1211,7 @@ impl FATFsInfo {
         in_disk_fs_info_offset: u64,
         bytes_per_sec: usize,
     ) -> Result<Self, SystemError> {
-        let mut v = Vec::<u8>::new();
-        v.resize(bytes_per_sec, 0);
+        let mut v = vec![0; bytes_per_sec];
 
         // 计算fs_info扇区在磁盘上的字节偏移量，从磁盘读取数据
         partition
@@ -1315,8 +1306,7 @@ impl FATFsInfo {
 
             let lba = off as usize / LBA_SIZE;
 
-            let mut v: Vec<u8> = Vec::new();
-            v.resize(LBA_SIZE, 0);
+            let mut v: Vec<u8> = vec![0; LBA_SIZE];
             partition.disk().read_at(lba, 1, &mut v)?;
 
             let mut cursor: VecCursor = VecCursor::new(v);
@@ -1344,8 +1334,7 @@ impl FATFsInfo {
 
             let lba = off as usize / LBA_SIZE;
 
-            let mut v: Vec<u8> = Vec::new();
-            v.resize(LBA_SIZE, 0);
+            let mut v: Vec<u8> = vec![0; LBA_SIZE];
             partition.disk().read_at(lba, 1, &mut v)?;
             let mut cursor: VecCursor = VecCursor::new(v);
             cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
@@ -1578,7 +1567,7 @@ impl IndexNode for LockedFATInode {
         let nod = guard.children.remove(&name.to_uppercase());
 
         // 若删除缓存中为管道的文件，则不需要再到磁盘删除
-        if let Some(_) = nod {
+        if nod.is_some() {
             let file_type = target_guard.metadata.file_type;
             if file_type == FileType::Pipe {
                 return Ok(());

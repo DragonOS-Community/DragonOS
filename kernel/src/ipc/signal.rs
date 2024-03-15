@@ -371,7 +371,7 @@ pub(super) fn do_sigaction(
     // 保存原有的 sigaction
     let old_act: Option<&mut Sigaction> = {
         if let Some(oa) = old_act {
-            *(oa) = (*action).clone();
+            *(oa) = (*action);
             Some(oa)
         } else {
             None

@@ -81,6 +81,8 @@ impl RTQueue {
         }
         queue.push_front(pcb);
     }
+
+    #[allow(dead_code)]
     pub fn get_rt_queue_size(&mut self) -> usize {
         let queue = self.locked_queue.lock_irqsave();
         return queue.len();

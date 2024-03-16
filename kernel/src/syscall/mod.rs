@@ -412,6 +412,7 @@ impl Syscall {
                 Self::rmdir(pathname)
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_LINK => {
                 let old_cstr = args[0] as *const u8;
                 let new_cstr = args[1] as *const u8;
@@ -427,6 +428,7 @@ impl Syscall {
                 return Self::link(&old, &new);
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_LINKAT => {
                 let oldfd = args[0] as i32;
                 let old_cstr = args[1] as *const u8;

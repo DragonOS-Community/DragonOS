@@ -623,7 +623,7 @@ impl FATDir {
                 dot_entry.set_first_cluster(first_cluster);
 
                 // todo: 设置创建、访问时间
-                dot_entry.flush(&fs, fs.cluster_bytes_offset(first_cluster) + offset)?;
+                dot_entry.flush(fs, fs.cluster_bytes_offset(first_cluster) + offset)?;
 
                 // 偏移量加上一个目录项的长度
                 offset += FATRawDirEntry::DIR_ENTRY_LEN;
@@ -637,7 +637,7 @@ impl FATDir {
                 dot_dot_entry.set_first_cluster(self.first_cluster);
                 // todo: 设置创建、访问时间
 
-                dot_dot_entry.flush(&fs, fs.cluster_bytes_offset(first_cluster) + offset)?;
+                dot_dot_entry.flush(fs, fs.cluster_bytes_offset(first_cluster) + offset)?;
 
                 // kdebug!("to create dentries");
                 // 在当前目录下创建目标目录项
@@ -1093,7 +1093,7 @@ impl LongDirEntry {
         let mut v: Vec<u8> = vec![0; fs.lba_per_sector() * LBA_SIZE];
         fs.partition
             .disk()
-            .read_at(lba, 1 * fs.lba_per_sector(), &mut v)?;
+            .read_at(lba, fs.lba_per_sector(), &mut v)?;
 
         let mut cursor: VecCursor = VecCursor::new(v);
         // 切换游标到对应位置
@@ -1308,10 +1308,10 @@ impl ShortDirEntry {
         let lba = fs.get_lba_from_offset(
             fs.bytes_to_sector(fs.get_in_partition_bytes_offset(disk_bytes_offset)),
         );
-        let mut v: Vec<u8> = vec![0; 1 * fs.lba_per_sector() * LBA_SIZE];
+        let mut v: Vec<u8> = vec![0; fs.lba_per_sector() * LBA_SIZE];
         fs.partition
             .disk()
-            .read_at(lba, 1 * fs.lba_per_sector(), &mut v)?;
+            .read_at(lba, fs.lba_per_sector(), &mut v)?;
 
         let mut cursor: VecCursor = VecCursor::new(v);
         // 切换游标到对应位置
@@ -2070,7 +2070,7 @@ impl ShortNameGenerator {
         let c3 = char::from_digit((x as u32 >> 4) & 0xf, 16)
             .unwrap()
             .to_ascii_uppercase() as u8;
-        let c4 = char::from_digit((x as u32 >> 0) & 0xf, 16)
+        let c4 = char::from_digit((x as u32) & 0xf, 16)
             .unwrap()
             .to_ascii_uppercase() as u8;
         return [c1, c2, c3, c4];

@@ -384,7 +384,7 @@ impl FATFileSystem {
         let mut v: Vec<u8> = vec![0; self.bpb.bytes_per_sector as usize];
         self.partition
             .disk()
-            .read_at(fat_ent_lba as usize, 1 * self.lba_per_sector(), &mut v)?;
+            .read_at(fat_ent_lba as usize, self.lba_per_sector(), &mut v)?;
 
         let mut cursor = VecCursor::new(v);
         cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
@@ -477,7 +477,7 @@ impl FATFileSystem {
         let mut v: Vec<u8> = vec![0; self.bpb.bytes_per_sector as usize];
         self.partition
             .disk()
-            .read_at(fat_ent_lba, 1 * self.lba_per_sector(), &mut v)?;
+            .read_at(fat_ent_lba, self.lba_per_sector(), &mut v)?;
 
         let mut cursor = VecCursor::new(v);
         cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
@@ -560,10 +560,7 @@ impl FATFileSystem {
         let end_cluster: Cluster = self.max_cluster_number();
         let start_cluster: Cluster = match self.bpb.fat_type {
             FATType::FAT32(_) => {
-                let next_free: u64 = match self.fs_info.0.lock().next_free() {
-                    Some(x) => x,
-                    None => 0xffffffff,
-                };
+                let next_free: u64 = self.fs_info.0.lock().next_free().unwrap_or(0xffffffff);
                 if next_free < end_cluster.cluster_num {
                     Cluster::new(next_free)
                 } else {
@@ -956,7 +953,7 @@ impl FATFileSystem {
                         packed_val & 0x0fff
                     };
                     if val == 0 {
-                        return Ok(Cluster::new(cluster as u64));
+                        return Ok(Cluster::new(cluster));
                     }
 
                     cluster += 1;
@@ -1519,7 +1516,7 @@ impl IndexNode for LockedFATInode {
                     let name: String = ent.name();
                     // kdebug!("name={name}");
 
-                    if guard.children.contains_key(&name.to_uppercase()) == false
+                    if !guard.children.contains_key(&name.to_uppercase())
                         && name != "."
                         && name != ".."
                     {
@@ -1685,7 +1682,7 @@ impl IndexNode for LockedFATInode {
         // 判断需要创建的类型
         if unlikely(mode.contains(ModeType::S_IFREG)) {
             // 普通文件
-            return Ok(self.create(filename, FileType::File, mode)?);
+            return self.create(filename, FileType::File, mode);
         }
 
         let nod = LockedFATInode::new(

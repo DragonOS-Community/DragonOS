@@ -656,7 +656,7 @@ impl IrqManager {
                     }
                 }
                 IrqStartupResult::Managed => {
-                    self.irq_do_set_affinity(&irq_data, &desc_inner_guard, &affinity, false)
+                    self.irq_do_set_affinity(&irq_data, desc_inner_guard, &affinity, false)
                         .ok();
                     ret = self.__irq_startup(desc_inner_guard);
                 }
@@ -691,7 +691,7 @@ impl IrqManager {
 
             let chip = desc_inner_guard.irq_data().chip_info_read_irqsave().chip();
 
-            if let Err(e) = chip.irq_enable(&desc_inner_guard.irq_data()) {
+            if let Err(e) = chip.irq_enable(desc_inner_guard.irq_data()) {
                 if e == SystemError::ENOSYS {
                     self.unmask_irq(desc_inner_guard);
                 }
@@ -739,7 +739,7 @@ impl IrqManager {
 
         return self.irq_do_set_affinity(
             desc_inner_guard.irq_data(),
-            &desc_inner_guard,
+            desc_inner_guard,
             &to_set,
             false,
         );
@@ -761,10 +761,8 @@ impl IrqManager {
 
         let common_data = desc_inner_guard.common_data();
         let r;
-        if !force && !cpumask.is_empty() {
-            r = chip.irq_set_affinity(irq_data, &cpumask, force);
-        } else if force {
-            r = chip.irq_set_affinity(irq_data, &cpumask, force);
+        if (!force && !cpumask.is_empty()) || force {
+            r = chip.irq_set_affinity(irq_data, cpumask, force);
         } else {
             return Err(SystemError::EINVAL);
         }
@@ -895,10 +893,10 @@ impl IrqManager {
         }
 
         if chip.flags().contains(IrqChipFlags::IRQCHIP_SET_TYPE_MASKED) {
-            if desc_inner_guard.common_data().status().masked() == false {
+            if !desc_inner_guard.common_data().status().masked() {
                 self.mask_irq(desc_inner_guard.irq_data());
             }
-            if desc_inner_guard.common_data().status().disabled() == false {
+            if !desc_inner_guard.common_data().status().disabled() {
                 to_unmask = true;
             }
         }
@@ -924,7 +922,7 @@ impl IrqManager {
                         .clear_status(IrqStatus::IRQD_LEVEL);
                     desc_inner_guard.clear_level();
 
-                    if (flags & IrqLineStatus::IRQ_TYPE_LEVEL_MASK).is_empty() == false {
+                    if !(flags & IrqLineStatus::IRQ_TYPE_LEVEL_MASK).is_empty() {
                         desc_inner_guard.set_level();
                         desc_inner_guard
                             .common_data()
@@ -1003,7 +1001,7 @@ impl IrqManager {
 
     /// 解除屏蔽中断
     pub(super) fn unmask_irq(&self, desc_inner_guard: &SpinLockGuard<'_, InnerIrqDesc>) {
-        if desc_inner_guard.common_data().status().masked() == false {
+        if !desc_inner_guard.common_data().status().masked() {
             return;
         }
 
@@ -1011,7 +1009,7 @@ impl IrqManager {
             .irq_data()
             .chip_info_read_irqsave()
             .chip()
-            .irq_unmask(&desc_inner_guard.irq_data());
+            .irq_unmask(desc_inner_guard.irq_data());
 
         if let Err(e) = r {
             if e != SystemError::ENOSYS {

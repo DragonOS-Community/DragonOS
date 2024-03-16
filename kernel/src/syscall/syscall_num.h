@@ -64,8 +64,9 @@
 #define SYS_CHDIR 80
 
 #define SYS_MKDIR 83
-
 #define SYS_RMDIR 84
+
+#define SYS_LINK 86
 
 #define SYS_GETTIMEOFDAY 96
 
@@ -83,6 +84,8 @@
 #define SYS_SET_TID_ADDR 218
 
 #define SYS_UNLINK_AT 263
+
+#define SYS_LINKAT 265
 
 #define SYS_PIPE 293
 

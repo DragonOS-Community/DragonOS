@@ -6,6 +6,7 @@ use core::{
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
     driver::base::device::device_number::DeviceNumber,
+    filesystem::vfs::fcntl::AtFlags,
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::syscall::MremapFlags,
     net::syscall::MsgHdr,
@@ -409,6 +410,41 @@ impl Syscall {
             SYS_RMDIR => {
                 let pathname = args[0] as *const u8;
                 Self::rmdir(pathname)
+            }
+
+            SYS_LINK => {
+                let old_cstr = args[0] as *const u8;
+                let new_cstr = args[1] as *const u8;
+
+                let old = check_and_clone_cstr(old_cstr, Some(MAX_PATHLEN))?;
+                let new = check_and_clone_cstr(new_cstr, Some(MAX_PATHLEN))?;
+                if old.len() >= MAX_PATHLEN || new.len() >= MAX_PATHLEN {
+                    return Err(SystemError::ENAMETOOLONG);
+                }
+                if old.len() <= 0 || new.len() <= 0 {
+                    return Err(SystemError::ENOENT);
+                }
+                return Self::link(&old, &new);
+            }
+
+            SYS_LINKAT => {
+                let oldfd = args[0] as i32;
+                let old_cstr = args[1] as *const u8;
+                let newfd = args[2] as i32;
+                let new_cstr = args[3] as *const u8;
+                let flags = args[4] as i32;
+
+                let old = check_and_clone_cstr(old_cstr, Some(MAX_PATHLEN))?;
+                let new = check_and_clone_cstr(new_cstr, Some(MAX_PATHLEN))?;
+                if old.len() >= MAX_PATHLEN || new.len() >= MAX_PATHLEN {
+                    return Err(SystemError::ENAMETOOLONG);
+                }
+                // old.len() 根据flags & AtFlags::AT_EMPTY_PATH判空
+                if new.len() <= 0 || (old.len() <= 0 && flags & AtFlags::AT_EMPTY_PATH.bits() == 0)
+                {
+                    return Err(SystemError::ENOENT);
+                }
+                return Self::linkat(oldfd, &old, newfd, &new, flags);
             }
 
             #[cfg(target_arch = "x86_64")]

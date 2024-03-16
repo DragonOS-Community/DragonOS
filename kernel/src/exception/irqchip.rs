@@ -351,7 +351,7 @@ impl IrqManager {
     /// Acknowledge the parent interrupt
     #[allow(dead_code)]
     pub fn irq_chip_ack_parent(&self, irq_data: &Arc<IrqData>) {
-        let parent_data = irq_data.parent_data().map(|p| p.upgrade()).flatten();
+        let parent_data = irq_data.parent_data().and_then(|p| p.upgrade());
 
         if let Some(parent_data) = parent_data {
             let parent_chip = parent_data.chip_info_read_irqsave().chip();
@@ -364,21 +364,32 @@ impl IrqManager {
     /// 遍历中断域的层次结构，并检查是否存在一个硬件重新触发函数。如果存在则调用它
     pub fn irq_chip_retrigger_hierarchy(&self, irq_data: &Arc<IrqData>) -> Result<(), SystemError> {
         let mut data: Option<Arc<IrqData>> = Some(irq_data.clone());
-        loop {
-            if let Some(d) = data {
-                if let Err(e) = d.chip_info_read_irqsave().chip().retrigger(&d) {
-                    if e == SystemError::ENOSYS {
-                        data = d.parent_data().map(|p| p.upgrade()).flatten();
-                    } else {
-                        return Err(e);
-                    }
+        while let Some(d) = data {
+            if let Err(e) = d.chip_info_read_irqsave().chip().retrigger(&d) {
+                if e == SystemError::ENOSYS {
+                    data = d.parent_data().and_then(|p| p.upgrade());
                 } else {
-                    return Ok(());
+                    return Err(e);
                 }
             } else {
-                break;
+                return Ok(());
             }
         }
+        // loop {
+        //     if let Some(d) = data {
+        //         if let Err(e) = d.chip_info_read_irqsave().chip().retrigger(&d) {
+        //             if e == SystemError::ENOSYS {
+        //                 data = d.parent_data().map(|p| p.upgrade()).flatten();
+        //             } else {
+        //                 return Err(e);
+        //             }
+        //         } else {
+        //             return Ok(());
+        //         }
+        //     } else {
+        //         break;
+        //     }
+        // }
 
         return Ok(());
     }
@@ -445,7 +456,7 @@ impl IrqManager {
                 }
 
                 //  try the parent
-                let parent_data = dt.parent_data().map(|p| p.upgrade()).flatten();
+                let parent_data = dt.parent_data().and_then(|p| p.upgrade());
 
                 irq_data = parent_data;
             }

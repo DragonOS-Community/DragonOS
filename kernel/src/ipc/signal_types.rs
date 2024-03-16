@@ -75,7 +75,7 @@ impl SignalStruct {
     #[inline(never)]
     pub fn new() -> Self {
         Self {
-            inner: Box::new(InnerSignalStruct::default()),
+            inner: Box::<InnerSignalStruct>::default(),
         }
     }
 }

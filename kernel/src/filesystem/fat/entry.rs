@@ -1257,7 +1257,7 @@ impl ShortDirEntry {
             let file = FATFile {
                 first_cluster,
                 file_name: name,
-                loc: loc,
+                loc,
                 short_dir_entry: *self,
                 ..Default::default()
             };
@@ -1269,7 +1269,7 @@ impl ShortDirEntry {
             }
         } else {
             let dir = FATDir {
-                first_cluster: first_cluster,
+                first_cluster,
                 dir_name: name,
                 loc: Some(loc),
                 short_dir_entry: Some(*self),

@@ -399,7 +399,7 @@ impl IrqManager {
             // todo: oneshot
         } else if action_guard.handler().is_some_and(|h| {
             h.type_id() == (&DefaultPrimaryIrqHandler as &dyn IrqHandler).type_id()
-        }) && desc_inner_guard
+        }) && !desc_inner_guard
             .irq_data()
             .chip_info_read_irqsave()
             .chip()

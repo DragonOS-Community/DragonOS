@@ -221,7 +221,6 @@ impl BiosParameterBlockFAT32 {
 impl BiosParameterBlock {
     pub fn new(partition: Arc<Partition>) -> Result<BiosParameterBlock, SystemError> {
         let mut v = vec![0; LBA_SIZE];
-        v.resize(LBA_SIZE, 0);
 
         // 读取分区的引导扇区
         partition

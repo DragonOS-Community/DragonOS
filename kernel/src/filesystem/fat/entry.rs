@@ -555,7 +555,7 @@ impl FATDir {
         let r: Result<FATDirEntryOrShortName, SystemError> =
             self.check_existence(name, Some(false), fs.clone());
         // 检查错误码，如果能够表明目录项已经存在，则返回-EEXIST
-        if let Err(err_val) = r { 
+        if let Err(err_val) = r {
             if err_val == (SystemError::EISDIR) || err_val == (SystemError::ENOTDIR) {
                 return Err(SystemError::EEXIST);
             } else {
@@ -617,7 +617,7 @@ impl FATDir {
                 // '.'目录项
                 let mut dot_entry = ShortDirEntry {
                     name: ShortNameGenerator::new(".").generate().unwrap(),
-                    attributes:  FileAttributes::new(FileAttributes::DIRECTORY),
+                    attributes: FileAttributes::new(FileAttributes::DIRECTORY),
                     ..Default::default()
                 };
                 dot_entry.set_first_cluster(first_cluster);
@@ -758,7 +758,9 @@ impl FATDir {
         let offset = fs.cluster_bytes_offset(end.0) + end.1;
         short_dentry.flush(&fs, offset)?;
 
-        return Ok(short_dentry.convert_to_dir_entry_with_long_name(long_name.to_string(), (start, end)));
+        return Ok(
+            short_dentry.convert_to_dir_entry_with_long_name(long_name.to_string(), (start, end))
+        );
     }
 
     /// @brief 判断当前目录是否为空
@@ -1223,7 +1225,7 @@ impl ShortDirEntry {
             }
         } else {
             // 当前是文件夹
-            let mut dir = FATDir {
+            let dir = FATDir {
                 dir_name: self.name_to_string(),
                 first_cluster,
                 root_offset: None,
@@ -1266,7 +1268,7 @@ impl ShortDirEntry {
                 return FATDirEntry::VolId(file);
             }
         } else {
-            let mut dir = FATDir {
+            let dir = FATDir {
                 first_cluster: first_cluster,
                 dir_name: name,
                 loc: Some(loc),
@@ -1735,7 +1737,7 @@ impl FATDirEntry {
 
     /// @brief 判断目录项是否为文件
     pub fn is_file(&self) -> bool {
-        matches!(self,&FATDirEntry::File(_) | &FATDirEntry::VolId(_))
+        matches!(self, &FATDirEntry::File(_) | &FATDirEntry::VolId(_))
     }
 
     /// @brief 判断目录项是否为文件夹
@@ -1988,6 +1990,7 @@ impl ShortNameGenerator {
                 .map(|s| u16::from_str_radix(s, 16));
             // 如果校验码相同
             if checksum_result == Ok(Ok(self.checksum)) {
+                // 置位checksum_bitmask中，基础名末尾数字的对应位
                 if let Some(num) = num_suffix {
                     self.checksum_bitmask |= 1 << num;
                 }

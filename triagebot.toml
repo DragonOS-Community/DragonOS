@@ -72,6 +72,8 @@ trigger_files = [
 [autolabel."S-等待审查"]
 new_pr = true
 
+[shortcut]
+
 [no-merges]
 exclude_titles = ["Rollup of", "subtree update", "Subtree update"]
 labels = ["S-等待作者修改"]

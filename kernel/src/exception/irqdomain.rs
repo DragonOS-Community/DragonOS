@@ -249,7 +249,7 @@ impl IrqDomainManager {
             r = self.do_activate_irq(Some(irq_data.clone()), reserve);
         }
 
-        if !r.is_ok() {
+        if r.is_err() {
             irq_data.common_data().status().set_activated();
         }
 
@@ -385,7 +385,7 @@ impl IrqDomainManager {
             if dt.domain().is_some() && Arc::ptr_eq(dt.domain().as_ref().unwrap(), domain) {
                 return Some(dt);
             }
-            irq_data = dt.parent_data().map(|x| x.upgrade()).flatten();
+            irq_data = dt.parent_data().and_then(|x| x.upgrade());
         }
 
         return None;

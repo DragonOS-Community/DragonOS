@@ -36,10 +36,6 @@ pub(super) fn do_faccessat(
 
     let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
 
-    if path.len() == 0 {
-        return Err(SystemError::EINVAL);
-    }
-
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
 
     // 如果找不到文件，则返回错误码ENOENT
@@ -51,10 +47,6 @@ pub(super) fn do_faccessat(
 
 pub fn do_fchmodat(dirfd: i32, path: *const u8, _mode: ModeType) -> Result<usize, SystemError> {
     let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
-
-    if path.len() == 0 {
-        return Err(SystemError::EINVAL);
-    }
 
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
 

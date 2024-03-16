@@ -1,5 +1,3 @@
-use core::ffi::CStr;
-
 use alloc::{
     string::{String, ToString},
     sync::Arc,
@@ -10,12 +8,11 @@ use system_error::SystemError;
 use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
     filesystem::vfs::file::FileDescriptorVec,
-    kerror,
     libs::rwlock::RwLockWriteGuard,
     mm::{verify_area, VirtAddr},
     process::ProcessManager,
     syscall::{
-        user_access::{check_and_clone_cstr, UserBufferReader, UserBufferWriter},
+        user_access::{check_and_clone_cstr, UserBufferWriter},
         Syscall,
     },
     time::TimeSpec,
@@ -461,8 +458,7 @@ impl Syscall {
         }
         let inode =
             match ROOT_INODE().lookup_follow_symlink(&new_path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
-                Err(e) => {
-                    kerror!("Change Directory Failed, Error = {:?}", e);
+                Err(_) => {
                     return Err(SystemError::ENOENT);
                 }
                 Ok(i) => i,
@@ -554,7 +550,6 @@ impl Syscall {
             // kdebug!("rmdir");
             match do_remove_dir(dirfd, &pathname) {
                 Err(err) => {
-                    kerror!("Failed to Remove Directory, Error Code = {:?}", err);
                     return Err(err);
                 }
                 Ok(_) => {
@@ -565,7 +560,6 @@ impl Syscall {
 
         match do_unlink_at(dirfd, &pathname) {
             Err(err) => {
-                kerror!("Failed to Remove Directory, Error Code = {:?}", err);
                 return Err(err);
             }
             Ok(_) => {
@@ -575,29 +569,14 @@ impl Syscall {
     }
 
     pub fn rmdir(pathname: *const u8) -> Result<usize, SystemError> {
-        let pathname: String = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?;
-        if pathname.len() >= MAX_PATHLEN {
-            return Err(SystemError::ENAMETOOLONG);
-        }
+        let pathname = Self::get_pathname(pathname).map_err(|_| SystemError::EINVAL.into())?;
         let pathname = pathname.as_str().trim();
         return do_remove_dir(AtFlags::AT_FDCWD.bits(), pathname).map(|v| v as usize);
     }
 
     pub fn unlink(pathname: *const u8) -> Result<usize, SystemError> {
-        if pathname.is_null() {
-            return Err(SystemError::EFAULT);
-        }
-        let ureader = UserBufferReader::new(pathname, MAX_PATHLEN, true)?;
-
-        let buf: &[u8] = ureader.buffer(0).unwrap();
-
-        let pathname: &CStr = CStr::from_bytes_until_nul(buf).map_err(|_| SystemError::EINVAL)?;
-
-        let pathname: &str = pathname.to_str().map_err(|_| SystemError::EINVAL)?;
-        if pathname.len() >= MAX_PATHLEN {
-            return Err(SystemError::ENAMETOOLONG);
-        }
-        let pathname = pathname.trim();
+        let pathname = Self::get_pathname(pathname).map_err(|_| SystemError::EINVAL.into())?;
+        let pathname = pathname.as_str().trim();
 
         return do_unlink_at(AtFlags::AT_FDCWD.bits(), pathname).map(|v| v as usize);
     }
@@ -872,29 +851,22 @@ impl Syscall {
     }
 
     pub fn mknod(
-        path_ptr: *const i8,
+        path_ptr: *const u8,
         mode: ModeType,
         dev_t: DeviceNumber,
     ) -> Result<usize, SystemError> {
-        // 安全检验
-        let len = unsafe { CStr::from_ptr(path_ptr).to_bytes().len() };
-        let user_buffer = UserBufferReader::new(path_ptr, len, true)?;
-        let buf = user_buffer.read_from_user::<u8>(0)?;
-        let path = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
-
-        // 文件名过长
-        if path.len() > MAX_PATHLEN as usize {
-            return Err(SystemError::ENAMETOOLONG);
-        }
+        let pathname = path_ptr;
+        let pathname = Self::get_pathname(pathname).map_err(|_| SystemError::EINVAL.into())?;
+        let pathname = pathname.as_str().trim();
 
         let inode: Result<Arc<dyn IndexNode>, SystemError> =
-            ROOT_INODE().lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
+            ROOT_INODE().lookup_follow_symlink(pathname, VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
         if inode.is_ok() {
             return Err(SystemError::EEXIST);
         }
 
-        let (filename, parent_path) = rsplit_path(path);
+        let (filename, parent_path) = rsplit_path(pathname);
 
         // 查找父目录
         let parent_inode: Arc<dyn IndexNode> = ROOT_INODE()
@@ -936,10 +908,6 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
         let mut user_buf = UserBufferWriter::new(user_buf, buf_size, true)?;
-
-        if path.len() == 0 {
-            return Err(SystemError::EINVAL);
-        }
 
         let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
 
@@ -1016,6 +984,21 @@ impl Syscall {
         // todo: 实现fchmod
         kwarn!("fchmod not fully implemented");
         return Ok(0);
+    }
+
+    /// @brief 处理文件路径字符串，并将其从用户空间复制到内核空间
+    pub fn get_pathname(pathname: *const u8) -> Result<String, SystemError> {
+        let pathname: String = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?;
+
+        if pathname.len() >= MAX_PATHLEN {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+
+        if pathname.is_empty() {
+            return Err(SystemError::ENOENT);
+        }
+
+        Ok(pathname)
     }
 }
 

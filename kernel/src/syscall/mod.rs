@@ -1,5 +1,5 @@
 use core::{
-    ffi::{c_char, c_int, c_void, CStr},
+    ffi::{c_char, c_int, c_void},
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -90,41 +90,31 @@ impl Syscall {
             }
             #[cfg(target_arch = "x86_64")]
             SYS_OPEN => {
-                let path: &CStr = unsafe { CStr::from_ptr(args[0] as *const c_char) };
-                let path: Result<&str, core::str::Utf8Error> = path.to_str();
-                let res = if path.is_err() {
-                    Err(SystemError::EINVAL)
-                } else {
-                    let path: &str = path.unwrap();
+                let pathname = args[0] as *const u8;
+                let pathname =
+                    Self::get_pathname(pathname).map_err(|_| SystemError::EINVAL.into())?;
+                let pathname = pathname.trim();
 
-                    let flags = args[1];
-                    let mode = args[2];
-
-                    let open_flags: FileMode = FileMode::from_bits_truncate(flags as u32);
-                    let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
-                    Self::open(path, open_flags, mode, true)
-                };
-                res
+                let flags = args[1];
+                let mode = args[2];
+                let open_flags: FileMode = FileMode::from_bits_truncate(flags as u32);
+                let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
+                Self::open(pathname, open_flags, mode, true)
             }
 
             SYS_OPENAT => {
                 let dirfd = args[0] as i32;
-                let path: &CStr = unsafe { CStr::from_ptr(args[1] as *const c_char) };
+                let pathname = args[1] as *const u8;
+                let pathname =
+                    Self::get_pathname(pathname).map_err(|_| SystemError::EINVAL.into())?;
+                let pathname = pathname.trim();
                 let flags = args[2];
                 let mode = args[3];
 
-                let path: Result<&str, core::str::Utf8Error> = path.to_str();
-                let res = if path.is_err() {
-                    Err(SystemError::EINVAL)
-                } else {
-                    let path: &str = path.unwrap();
-
-                    let open_flags: FileMode =
-                        FileMode::from_bits(flags as u32).ok_or(SystemError::EINVAL)?;
-                    let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
-                    Self::openat(dirfd, path, open_flags, mode, true)
-                };
-                res
+                let open_flags: FileMode =
+                    FileMode::from_bits(flags as u32).ok_or(SystemError::EINVAL)?;
+                let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
+                Self::openat(dirfd, pathname, open_flags, mode, true)
             }
             SYS_CLOSE => {
                 let fd = args[0];
@@ -233,18 +223,16 @@ impl Syscall {
                     {
                         return Err(SystemError::EINVAL);
                     }
-                    let dest_path: &CStr = unsafe { CStr::from_ptr(path_ptr) };
-                    let dest_path: &str = dest_path.to_str().map_err(|_| SystemError::EINVAL)?;
-                    if dest_path.len() == 0 {
-                        return Err(SystemError::EINVAL);
-                    } else if dest_path.len() > MAX_PATHLEN as usize {
-                        return Err(SystemError::ENAMETOOLONG);
-                    }
+
+                    let dest_path = arg0 as *const u8;
+                    let dest_path =
+                        Self::get_pathname(dest_path).map_err(|_| SystemError::EINVAL.into())?;
 
                     return Ok(dest_path);
                 };
 
                 let r = chdir_check(args[0])?;
+                let r = r.as_str().trim();
                 Self::chdir(r)
             }
 
@@ -321,21 +309,16 @@ impl Syscall {
                     {
                         return Err(SystemError::EINVAL);
                     }
-                    let path: &CStr = unsafe { CStr::from_ptr(path_ptr) };
-                    let path: &str = path.to_str().map_err(|_| SystemError::EINVAL)?.trim();
+                    let pathname = args[0] as *const u8;
+                    let pathname =
+                        Self::get_pathname(pathname).map_err(|_| SystemError::EINVAL.into())?;
 
-                    if path == "" {
-                        return Err(SystemError::EINVAL);
-                    }
-                    return Ok(path);
+                    return Ok(pathname);
                 };
 
-                let path = security_check();
-                if path.is_err() {
-                    Err(path.unwrap_err())
-                } else {
-                    Self::mkdir(path.unwrap(), mode)
-                }
+                let pathname = security_check()?;
+                let pathname = pathname.as_str().trim();
+                Self::mkdir(pathname, mode)
             }
 
             SYS_NANOSLEEP => {
@@ -378,30 +361,24 @@ impl Syscall {
 
             SYS_UNLINKAT => {
                 let dirfd = args[0] as i32;
-                let pathname = args[1] as *const c_char;
+                let path_ptr = args[1] as *const c_char;
                 let flags = args[2] as u32;
-                let virt_pathname = VirtAddr::new(pathname as usize);
+                let virt_pathname = VirtAddr::new(path_ptr as usize);
                 if frame.from_user() && verify_area(virt_pathname, PAGE_4K_SIZE as usize).is_err() {
                     Err(SystemError::EFAULT)
-                } else if pathname.is_null() {
+                } else if path_ptr.is_null() {
                     Err(SystemError::EFAULT)
                 } else {
                     let get_path = || {
-                        let pathname: &CStr = unsafe { CStr::from_ptr(pathname) };
-
-                        let pathname: &str = pathname.to_str().map_err(|_| SystemError::EINVAL)?;
-                        if pathname.len() >= MAX_PATHLEN {
-                            return Err(SystemError::ENAMETOOLONG);
-                        }
-                        return Ok(pathname.trim());
+                        let pathname = args[1] as *const u8;
+                        let pathname =
+                            Self::get_pathname(pathname).map_err(|_| SystemError::EINVAL.into())?;
+                        return Ok(pathname);
                     };
-                    let pathname = get_path();
-                    if pathname.is_err() {
-                        Err(pathname.unwrap_err())
-                    } else {
-                        // kdebug!("sys unlinkat: dirfd: {}, pathname: {}", dirfd, pathname.as_ref().unwrap());
-                        Self::unlinkat(dirfd, pathname.unwrap(), flags)
-                    }
+                    let pathname = get_path()?;
+                    let pathname = pathname.as_str().trim();
+                    // kdebug!("sys unlinkat: dirfd: {}, pathname: {}", dirfd, pathname.as_ref().unwrap());
+                    Self::unlinkat(dirfd, pathname, flags)
                 }
             }
 
@@ -707,7 +684,7 @@ impl Syscall {
                 let flags = args[1];
                 let dev_t = args[2];
                 let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
-                Self::mknod(path as *const i8, flags, DeviceNumber::from(dev_t as u32))
+                Self::mknod(path as *const u8, flags, DeviceNumber::from(dev_t as u32))
             }
 
             SYS_CLONE => {
@@ -759,40 +736,30 @@ impl Syscall {
 
             #[cfg(target_arch = "x86_64")]
             SYS_LSTAT => {
-                let path: &CStr = unsafe { CStr::from_ptr(args[0] as *const c_char) };
-                let path: Result<&str, core::str::Utf8Error> = path.to_str();
-                let res = if path.is_err() {
-                    Err(SystemError::EINVAL)
-                } else {
-                    let path: &str = path.unwrap();
-                    let kstat = args[1] as *mut PosixKstat;
-                    let vaddr = VirtAddr::new(kstat as usize);
-                    match verify_area(vaddr, core::mem::size_of::<PosixKstat>()) {
-                        Ok(_) => Self::lstat(path, kstat),
-                        Err(e) => Err(e),
-                    }
-                };
+                let pathname = Self::get_pathname(args[0] as *const u8)
+                    .map_err(|_| SystemError::EINVAL.into())?;
+                let pathname = pathname.as_str().trim();
 
-                res
+                let kstat = args[1] as *mut PosixKstat;
+                let vaddr = VirtAddr::new(kstat as usize);
+                match verify_area(vaddr, core::mem::size_of::<PosixKstat>()) {
+                    Ok(_) => Self::lstat(pathname, kstat),
+                    Err(e) => Err(e),
+                }
             }
 
             #[cfg(target_arch = "x86_64")]
             SYS_STAT => {
-                let path: &CStr = unsafe { CStr::from_ptr(args[0] as *const c_char) };
-                let path: Result<&str, core::str::Utf8Error> = path.to_str();
-                let res = if path.is_err() {
-                    Err(SystemError::EINVAL)
-                } else {
-                    let path: &str = path.unwrap();
-                    let kstat = args[1] as *mut PosixKstat;
-                    let vaddr = VirtAddr::new(kstat as usize);
-                    match verify_area(vaddr, core::mem::size_of::<PosixKstat>()) {
-                        Ok(_) => Self::stat(path, kstat),
-                        Err(e) => Err(e),
-                    }
-                };
+                let pathname = Self::get_pathname(args[0] as *const u8)
+                    .map_err(|_| SystemError::EINVAL.into())?;
+                let pathname = pathname.as_str().trim();
 
-                res
+                let kstat = args[1] as *mut PosixKstat;
+                let vaddr = VirtAddr::new(kstat as usize);
+                match verify_area(vaddr, core::mem::size_of::<PosixKstat>()) {
+                    Ok(_) => Self::stat(pathname, kstat),
+                    Err(e) => Err(e),
+                }
             }
 
             SYS_EPOLL_CREATE => Self::epoll_create(args[0] as i32),

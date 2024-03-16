@@ -761,7 +761,7 @@ impl IrqManager {
 
         let common_data = desc_inner_guard.common_data();
         let r;
-        if (!force && !cpumask.is_empty()) || force {
+        if force || !cpumask.is_empty() {
             r = chip.irq_set_affinity(irq_data, cpumask, force);
         } else {
             return Err(SystemError::EINVAL);

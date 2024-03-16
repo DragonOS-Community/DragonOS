@@ -1011,8 +1011,8 @@ impl TryFrom<i32> for PosixTcpSocketOptions {
     }
 }
 
-impl Into<i32> for PosixTcpSocketOptions {
-    fn into(self) -> i32 {
-        <Self as ToPrimitive>::to_i32(&self).unwrap()
+impl From<PosixTcpSocketOptions> for i32 {
+    fn from(val: PosixTcpSocketOptions) -> Self {
+        <PosixTcpSocketOptions as ToPrimitive>::to_i32(&val).unwrap()
     }
 }

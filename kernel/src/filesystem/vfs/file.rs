@@ -138,13 +138,10 @@ impl File {
     pub fn new(inode: Arc<dyn IndexNode>, mode: FileMode) -> Result<Self, SystemError> {
         let mut inode = inode;
         let file_type = inode.metadata()?.file_type;
-        match file_type {
-            FileType::Pipe => {
-                if let Some(SpecialNodeData::Pipe(pipe_inode)) = inode.special_node() {
-                    inode = pipe_inode;
-                }
+        if file_type == FileType::Pipe {
+            if let Some(SpecialNodeData::Pipe(pipe_inode)) = inode.special_node() {
+                inode = pipe_inode;
             }
-            _ => {}
         }
 
         let mut f = File {

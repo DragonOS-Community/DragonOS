@@ -763,7 +763,7 @@ impl FATFileSystem {
     /// @brief 获取从start_cluster开始的簇链中，第n个簇的信息。（请注意，下标从0开始）
     #[inline]
     pub fn get_cluster_by_relative(&self, start_cluster: Cluster, n: usize) -> Option<Cluster> {
-        return self.cluster_iter(start_cluster).skip(n).next();
+        return self.cluster_iter(start_cluster).nth(n);
     }
 
     /// @brief 获取整个簇链的最后一个簇

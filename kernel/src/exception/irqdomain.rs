@@ -198,7 +198,7 @@ impl IrqDomainManager {
         irq_data_guard.set_hwirq(hwirq);
         irq_data_guard.set_domain(Some(domain.clone()));
         drop(irq_data_guard);
-        let r = domain.ops.map(&domain, hwirq, irq);
+        let r = domain.ops.map(domain, hwirq, irq);
         if let Err(e) = r {
             if e != SystemError::ENOSYS {
                 if e != SystemError::EPERM {
@@ -216,7 +216,7 @@ impl IrqDomainManager {
             domain.set_name(chip.name().to_string());
         }
 
-        self.irq_domain_set_mapping(&domain, hwirq, irq_data);
+        self.irq_domain_set_mapping(domain, hwirq, irq_data);
 
         irq_manager().irq_clear_status_flags(irq, IrqLineStatus::IRQ_NOREQUEST)?;
 
@@ -264,21 +264,19 @@ impl IrqDomainManager {
     ) -> Result<(), SystemError> {
         let mut r = Ok(());
 
-        if irq_data.is_some() && irq_data.as_ref().unwrap().domain().is_some() {
-            let domain = irq_data.as_ref().unwrap().domain().unwrap();
+        if let Some(irq_data) = irq_data {
+            if let Some(domain) = irq_data.domain() {
+                let parent_data = irq_data.parent_data().and_then(|x| x.upgrade());
+                if let Some(parent_data) = parent_data.clone() {
+                    r = self.do_activate_irq(Some(parent_data), reserve);
+                }
 
-            let irq_data = irq_data.unwrap();
-
-            let parent_data = irq_data.parent_data().map(|x| x.upgrade()).flatten();
-            if let Some(parent_data) = parent_data.clone() {
-                r = self.do_activate_irq(Some(parent_data), reserve);
-            }
-
-            if r.is_err() {
-                let tmpr = domain.ops.activate(&domain, &irq_data, reserve);
-                if let Err(e) = tmpr {
-                    if e != SystemError::ENOSYS && parent_data.is_some() {
-                        self.do_deactivate_irq(parent_data);
+                if r.is_err() {
+                    let tmpr = domain.ops.activate(&domain, &irq_data, reserve);
+                    if let Err(e) = tmpr {
+                        if e != SystemError::ENOSYS && parent_data.is_some() {
+                            self.do_deactivate_irq(parent_data);
+                        }
                     }
                 }
             }
@@ -291,7 +289,7 @@ impl IrqDomainManager {
         if let Some(irq_data) = irq_data {
             if let Some(domain) = irq_data.domain() {
                 domain.ops.deactivate(&domain, &irq_data);
-                let pp = irq_data.parent_data().map(|x| x.upgrade()).flatten();
+                let pp = irq_data.parent_data().and_then(|x| x.upgrade());
 
                 if pp.is_some() {
                     self.do_deactivate_irq(pp);

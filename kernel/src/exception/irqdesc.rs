@@ -444,13 +444,12 @@ impl InnerIrqDesc {
 
     /// 中断是否可以设置CPU亲和性
     pub fn can_set_affinity(&self) -> bool {
-        if self.common_data.status().can_balance() == false
-            || self
+        if !self.common_data.status().can_balance()
+            || !self
                 .irq_data()
                 .chip_info_read_irqsave()
                 .chip()
                 .can_set_affinity()
-                == false
         {
             return false;
         }
@@ -893,7 +892,7 @@ impl IrqDescManager {
 
     /// 查找中断描述符
     pub fn lookup(&self, irq: IrqNumber) -> Option<Arc<IrqDesc>> {
-        self.irq_descs.get(&irq).map(|desc| desc.clone())
+        self.irq_descs.get(&irq).cloned()
     }
 
     /// 查找中断描述符并锁定总线(没有对irqdesc进行加锁)

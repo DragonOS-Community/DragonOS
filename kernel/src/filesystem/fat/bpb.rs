@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use alloc::{sync::Arc, vec::Vec};
+use alloc::sync::Arc;
 use system_error::SystemError;
 
 use crate::{
@@ -220,8 +220,7 @@ impl BiosParameterBlockFAT32 {
 
 impl BiosParameterBlock {
     pub fn new(partition: Arc<Partition>) -> Result<BiosParameterBlock, SystemError> {
-        let mut v = Vec::with_capacity(LBA_SIZE);
-        v.resize(LBA_SIZE, 0);
+        let mut v = vec![0; LBA_SIZE];
 
         // 读取分区的引导扇区
         partition

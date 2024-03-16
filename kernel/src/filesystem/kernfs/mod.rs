@@ -293,7 +293,6 @@ impl IndexNode for KernFSInode {
         self.children
             .lock()
             .keys()
-            .into_iter()
             .for_each(|x| keys.push(x.clone()));
 
         return Ok(keys);

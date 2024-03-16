@@ -1,0 +1,22 @@
+{
+  "name": "test_uname",
+  "version": "0.1.0",
+  "description": "一个用来测试uname的程序",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "apps/test_uname"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "install": {
+    "in_dragonos_path": "/bin"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  }
+}

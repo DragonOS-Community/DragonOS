@@ -34,7 +34,8 @@ use crate::{
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
-    process::{fork::CloneFlags, Pid},
+    process::{fork::CloneFlags, Pid,
+              syscall::PosixOldUtsName},
     time::{
         syscall::{PosixTimeZone, PosixTimeval},
         TimeSpec,
@@ -1031,7 +1032,10 @@ impl Syscall {
             }
 
             SYS_SCHED_YIELD => Self::sched_yield(),
-
+            SYS_UNAME => {
+                let name = args[0] as *mut PosixOldUtsName;
+                Self::uname(name)
+            }
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

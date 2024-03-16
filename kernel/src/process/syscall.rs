@@ -29,6 +29,43 @@ use crate::{
     },
 };
 
+//参考资料：https://code.dragonos.org.cn/xref/linux-6.1.9/include/uapi/linux/utsname.h#17
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PosixOldUtsName {
+    pub sysname: [u8; 65],
+    pub nodename: [u8; 65],
+    pub release: [u8; 65],
+    pub version: [u8; 65],
+    pub machine: [u8; 65],
+}
+
+impl PosixOldUtsName {
+    pub fn new() -> Self {
+        const SYS_NAME: &[u8] = b"Dragon.OS";
+        const NODENAME: &[u8] = b"RinGoTek";
+        const RELEASE: &[u8] = b"0.1.9";
+        const VERSION: &[u8] = b"2022.01.01";
+        const MACHINE: &[u8] = b"x86_64";
+
+        let mut r = Self {
+            sysname: [0; 65],
+            nodename: [0; 65],
+            release: [0; 65],
+            version: [0; 65],
+            machine: [0; 65],
+        };
+
+        r.sysname[0..SYS_NAME.len()].copy_from_slice(SYS_NAME);
+        r.nodename[0..NODENAME.len()].copy_from_slice(NODENAME);
+        r.release[0..RELEASE.len()].copy_from_slice(RELEASE);
+        r.version[0..VERSION.len()].copy_from_slice(VERSION);
+        r.machine[0..MACHINE.len()].copy_from_slice(MACHINE);
+
+        return r;
+    }
+}
+
 impl Syscall {
     pub fn fork(frame: &TrapFrame) -> Result<usize, SystemError> {
         ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into())
@@ -340,5 +377,17 @@ impl Syscall {
                 return Err(SystemError::ENOSYS);
             }
         }
+    }
+
+    pub fn uname(name: *mut PosixOldUtsName) -> Result<usize, SystemError> {
+        if name.is_null() {
+            return Err(SystemError::EFAULT);
+        }
+
+        let mut writer =
+            UserBufferWriter::new(name, core::mem::size_of::<PosixOldUtsName>(), true)?;
+        writer.copy_one_to_user(&PosixOldUtsName::new(), 0)?;
+
+        return Ok(0);
     }
 }

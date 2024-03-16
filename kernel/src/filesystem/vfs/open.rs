@@ -111,11 +111,8 @@ fn do_sys_openat2(
             let parent_inode: Arc<dyn IndexNode> =
                 ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
             // 创建文件
-            let inode: Arc<dyn IndexNode> = parent_inode.create(
-                filename,
-                FileType::File,
-                how.mode,
-            )?;
+            let inode: Arc<dyn IndexNode> =
+                parent_inode.create(filename, FileType::File, how.mode)?;
             inode
         } else {
             // 不需要创建文件，因此返回错误码

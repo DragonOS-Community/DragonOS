@@ -1,6 +1,6 @@
-use core::cmp::min;
+use core::{cmp::min, ffi::CStr};
 
-use alloc::{boxed::Box, string::String, sync::Arc};
+use alloc::{boxed::Box, sync::Arc};
 use num_traits::{FromPrimitive, ToPrimitive};
 use smoltcp::wire;
 use system_error::SystemError;
@@ -44,10 +44,12 @@ impl Syscall {
 
         let socket = new_socket(address_family, socket_type, protocol)?;
 
-        let handle_item = SocketHandleItem::new();
-        HANDLE_MAP
-            .write_irqsave()
-            .insert(socket.socket_handle(), handle_item);
+        if address_family != AddressFamily::Unix {
+            let handle_item = SocketHandleItem::new();
+            HANDLE_MAP
+                .write_irqsave()
+                .insert(socket.socket_handle(), handle_item);
+        }
 
         let socketinode: Arc<SocketInode> = SocketInode::new(socket);
         let f = File::new(socketinode, FileMode::O_RDWR)?;
@@ -573,12 +575,13 @@ impl SockAddr {
         .map_err(|_| SystemError::EFAULT)?;
 
         let addr = unsafe { addr.as_ref() }.ok_or(SystemError::EFAULT)?;
-        if len < addr.len()? {
-            return Err(SystemError::EINVAL);
-        }
         unsafe {
             match AddressFamily::try_from(addr.family)? {
                 AddressFamily::INet => {
+                    if len < addr.len()? {
+                        return Err(SystemError::EINVAL);
+                    }
+
                     let addr_in: SockAddrIn = addr.addr_in;
 
                     let ip: wire::IpAddress = wire::IpAddress::from(wire::Ipv4Address::from_bytes(
@@ -591,11 +594,14 @@ impl SockAddr {
                 AddressFamily::Unix => {
                     let addr_un: SockAddrUn = addr.addr_un;
 
+                    let path = CStr::from_bytes_until_nul(&addr_un.sun_path)
+                        .map_err(|_| SystemError::EINVAL)?
+                        .to_str()
+                        .map_err(|_| SystemError::EINVAL)?;
+
                     let fd = Syscall::open(
-                        String::from_utf8(addr_un.sun_path.to_vec())
-                            .map_err(|_| SystemError::EINVAL)?
-                            .as_str(),
-                        FileMode::O_RDWR,
+                        path,
+                        FileMode::O_RDWR | FileMode::O_CREAT,
                         ModeType::from_bits_truncate(0o755),
                         true,
                     )?;

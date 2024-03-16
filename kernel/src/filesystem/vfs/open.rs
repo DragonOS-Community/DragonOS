@@ -84,7 +84,7 @@ fn do_sys_openat2(
     how: OpenHow,
     follow_symlink: bool,
 ) -> Result<usize, SystemError> {
-    // kdebug!("open: path: {}, mode: {:?}", path, mode);
+    // kdebug!("open path: {}, how: {:?}", path, how);
     // 文件名过长
     if path.len() > MAX_PATHLEN as usize {
         return Err(SystemError::ENAMETOOLONG);
@@ -114,7 +114,7 @@ fn do_sys_openat2(
             let inode: Arc<dyn IndexNode> = parent_inode.create(
                 filename,
                 FileType::File,
-                ModeType::from_bits_truncate(0o755),
+                how.mode,
             )?;
             inode
         } else {

@@ -1113,6 +1113,7 @@ impl LongDirEntry {
                 | '^' | '#' | '&' => {}
                 '+' | ',' | ';' | '=' | '[' | ']' | '.' | ' ' => {}
                 _ => {
+                    kdebug!("error char: {}", c);
                     return Err(SystemError::EILSEQ);
                 }
             }

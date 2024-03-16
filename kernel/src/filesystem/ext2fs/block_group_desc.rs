@@ -1,11 +1,10 @@
 use core::mem::{self, size_of};
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition},
-    libs::vec_cursor::VecCursor,
 };
 
 /// 块组描述符表(位于superblock之后)
@@ -16,7 +15,7 @@ pub struct Ext2BlockGroupDescriptor {
     pub block_bitmap_address: u32,
     /// 节点位图的地址
     pub inode_bitmap_address: u32,
-    /// 节点表的起始地址
+    /// 指向inode table的指针
     pub inode_table_start: u32,
     /// 空闲的块数
     pub free_blocks_num: u16,
@@ -43,6 +42,7 @@ impl Ext2BlockGroupDescriptor {
     pub fn get_des_per_blc() -> usize {
         LBA_SIZE / mem::size_of::<Ext2BlockGroupDescriptor>()
     }
+    // TODO 读取inode
 }
 
 const EXT2_NAME_LEN: usize = 255;
@@ -59,6 +59,11 @@ pub struct Ext2DirEntry {
     name: [u8; EXT2_NAME_LEN],
 }
 
+impl Ext2DirEntry {
+    pub fn get_name(&self) -> String {
+        String::from_utf8(self.name.to_vec()).expect("Invalid UTF-8 in entry name")
+    }
+}
 pub enum Ext2FileType {
     /// 未定义
     Unknown = 0,
@@ -77,3 +82,6 @@ pub enum Ext2FileType {
     /// 符号链接
     Symlink,
 }
+
+
+

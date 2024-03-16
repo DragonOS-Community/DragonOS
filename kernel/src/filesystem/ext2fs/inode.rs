@@ -1,7 +1,13 @@
-use alloc::sync::Arc;
+use core::{
+    fmt::{Debug},
+    mem::ManuallyDrop,
+};
+
+
+use alloc::rc::Weak;
 
 use crate::{
-    filesystem::vfs::{FileSystem, IndexNode},
+    filesystem::vfs::{FileSystem, IndexNode, Metadata},
     libs::spinlock::SpinLock,
 };
 
@@ -15,7 +21,62 @@ const EXT2_BP_NUM: usize = 15;
 #[derive(Debug)]
 pub struct LockedExt2Inode(SpinLock<Ext2Inode>);
 
+/// inode中根据不同系统的保留值
+#[repr(C, align(1))]
+pub union OSD1 {
+    linux_reserved: u32,
+    hurd_tanslator: u32,
+    masix_reserved: u32,
+}
+impl Debug for OSD1 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "OSD1:{}", unsafe { self.linux_reserved })
+    }
+}
 #[derive(Debug)]
+#[repr(C, align(1))]
+struct MasixOsd2 {
+    frag_num: u8,
+    frag_size: u8,
+    pad: u16,
+    reserved: [u32; 2],
+}
+#[derive(Debug)]
+#[repr(C, align(1))]
+struct LinuxOsd2 {
+    frag_num: u8,
+    frag_size: u8,
+    pad: u16,
+    uid_high: u16,
+    gid_high: u16,
+    reserved: u32,
+}
+
+#[repr(C, align(1))]
+#[derive(Debug)]
+struct HurdOsd2 {
+    frag_num: u8,
+    frag_size: u8,
+    mode_high: u16,
+    uid_high: u16,
+    gid_high: u16,
+    author: u32,
+}
+
+/// inode中根据不同系统的保留值
+#[repr(C, align(1))]
+pub union OSD2 {
+    linux: ManuallyDrop<LinuxOsd2>,
+    hurd: ManuallyDrop<HurdOsd2>,
+    masix: ManuallyDrop<MasixOsd2>,
+}
+impl Debug for OSD2 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "OSD2:{:?}", unsafe { &self.linux })
+    }
+}
+#[derive(Debug)]
+#[repr(C, align(1))]
 /// 磁盘中存储的inode
 pub struct Ext2Inode {
     /// 文件类型和权限
@@ -40,9 +101,8 @@ pub struct Ext2Inode {
     disk_sector: u32,
     /// 文件属性
     flags: u32,
-    // TODO 系统依赖在c++上为union
     /// 操作系统依赖
-    os_dependent_1: u32,
+    os_dependent_1: OSD1,
 
     blocks: [u32; EXT2_BP_NUM],
 
@@ -61,8 +121,7 @@ pub struct Ext2Inode {
     /// 片段地址
     fragment_addr: u32,
     /// 操作系统依赖
-    os_dependent_2: u32,
-    // TODO 系统依赖在c++上为union
+    os_dependent_2: OSD2,
 }
 impl Ext2Inode {}
 
@@ -92,6 +151,28 @@ impl LockedExt2Inode {
     }
 }
 
+pub struct Indirect{
+    pub self_ref:Weak<Indirect>,
+    // pub block:Arc<
+}
+#[derive(Debug)]
+pub struct LockedExt2InodeInfo(SpinLock<Ext2InodeInfo>);
+
+#[derive(Debug)]
+/// 存储在内存中的inode
+pub struct Ext2InodeInfo {
+    // TODO 将ext2iode内容和meta联系在一起，可自行设计
+    meta: Metadata,
+
+}
+
+impl Ext2InodeInfo {
+    pub fn new(inode: Ext2Inode) -> Self {
+        // TODO 初始化inode info
+        todo!()
+    }
+}
+
 impl IndexNode for LockedExt2Inode {
     fn read_at(
         &self,
@@ -118,7 +199,7 @@ impl IndexNode for LockedExt2Inode {
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
-        todo!()
+        self
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {

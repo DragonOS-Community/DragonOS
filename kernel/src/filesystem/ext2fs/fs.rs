@@ -12,7 +12,10 @@ use crate::{
     libs::{rwlock::RwLock, spinlock::SpinLock, vec_cursor::VecCursor},
 };
 
-use super::{block_group_desc::Ext2BlockGroupDescriptor, inode::LockedExt2Inode};
+use super::{
+    block_group_desc::Ext2BlockGroupDescriptor,
+    inode::{LockedExt2Inode, LockedExt2InodeInfo},
+};
 
 lazy_static! {
     pub static ref EXT2_SUPER_BLOCK: RwLock<Ex2SuperBlock> = RwLock::new(Ex2SuperBlock::default());
@@ -21,10 +24,23 @@ lazy_static! {
 }
 
 #[derive(Debug)]
-pub struct Ext2FsInfo {}
+pub struct LockedExt2SBInfo(SpinLock<Ext2SuperBlockInfo>);
 
-impl FileSystem for Ext2FsInfo {
+#[derive(Debug)]
+pub struct Ext2FileSystem {
+    /// 当前文件系统所在的分区
+    pub partition: Arc<Partition>,
+    /// 当前文件系统的第一个数据扇区（相对分区开始位置）
+    pub first_data_sector: u64,
+    /// 文件系统信息结构体
+    pub sb_info: Arc<LockedExt2SBInfo>,
+    /// 文件系统的根inode
+    root_inode: Arc<LockedExt2InodeInfo>,
+}
+// TODO 用于加载fs
+impl FileSystem for Ext2FileSystem {
     fn root_inode(&self) -> alloc::sync::Arc<dyn crate::filesystem::vfs::IndexNode> {
+        // TODO root inode位于第二个inode
         todo!()
     }
 
@@ -33,7 +49,7 @@ impl FileSystem for Ext2FsInfo {
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
-        todo!()
+        self
     }
 }
 pub enum OSType {
@@ -280,6 +296,7 @@ impl Ext2SuperBlockInfo {
 }
 
 impl Ex2SuperBlock {
+    // TODO 需要有个函数在加载的时候read superblock and read des table ，并且读root inode
     pub fn read_superblock(partition: Arc<Partition>) -> Result<Ex2SuperBlock, SystemError> {
         let mut blc_data = Vec::with_capacity(LBA_SIZE * 2);
         blc_data.resize(LBA_SIZE * 2, 0);

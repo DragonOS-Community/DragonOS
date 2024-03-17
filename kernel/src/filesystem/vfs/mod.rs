@@ -297,14 +297,18 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
-    /// @brief 对文件进行重命名操作
+    /// # 修改文件名
     ///
-    /// @param old_name 旧的名字
     ///
-    /// @param new_name 新的文件名
+    /// ## 参数
     ///
-    /// @return 成功: Ok()
-    ///         失败: Err(错误码)
+    /// - _old_name: 源文件路径
+    /// - _new_name: 目标文件路径
+    ///
+    /// ## 返回值
+    /// - Ok(返回值类型): 返回值的说明
+    /// - Err(错误值类型): 错误的说明
+    ///
     fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);

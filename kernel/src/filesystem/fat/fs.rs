@@ -1656,15 +1656,8 @@ impl IndexNode for LockedFATInode {
             // 对目标inode上锁，以防更改
             let old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
             let fs = old_inode_guard.fs.upgrade().unwrap();
-            // 先从缓存删除
-            let nod = guard.children.remove(&old_name.to_uppercase());
-            // 若删除缓存中为管道的文件，则不需要再到磁盘删除
-            if nod.is_some() {
-                let file_type = old_inode_guard.metadata.file_type;
-                if file_type == FileType::Pipe {
-                    return Ok(());
-                }
-            }
+            // 从缓存删除
+            let _nod = guard.children.remove(&old_name.to_uppercase());
             let old_dir = match &guard.inode_type {
                 FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
                     return Err(SystemError::ENOTDIR);
@@ -1690,15 +1683,8 @@ impl IndexNode for LockedFATInode {
             // 对目标inode上锁，以防更改
             let old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
             let fs = old_inode_guard.fs.upgrade().unwrap();
-            // 先从缓存删除
-            let nod = old_guard.children.remove(&old_name.to_uppercase());
-            // 若删除缓存中为管道的文件，则不需要再到磁盘删除
-            if nod.is_some() {
-                let file_type = old_inode_guard.metadata.file_type;
-                if file_type == FileType::Pipe {
-                    return Ok(());
-                }
-            }
+            // 从缓存删除
+            let _nod = old_guard.children.remove(&old_name.to_uppercase());
             let old_dir = match &old_guard.inode_type {
                 FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
                     return Err(SystemError::ENOTDIR);

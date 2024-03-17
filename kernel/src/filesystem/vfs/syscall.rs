@@ -602,7 +602,22 @@ impl Syscall {
         return do_unlink_at(AtFlags::AT_FDCWD.bits(), pathname).map(|v| v as usize);
     }
 
-    //Syscall_rename
+    /// # 修改文件名
+    ///
+    ///
+    /// ## 参数
+    ///
+    /// - oldfd: 源文件描述符
+    /// - filename_from: 源文件路径
+    /// - newfd: 目标文件描述符
+    /// - filename_to: 目标文件路径
+    /// - flags: 标志位
+    ///
+    ///
+    /// ## 返回值
+    /// - Ok(返回值类型): 返回值的说明
+    /// - Err(错误值类型): 错误的说明
+    ///
     pub fn do_renameat2(
         oldfd: i32,
         filename_from: *const u8,

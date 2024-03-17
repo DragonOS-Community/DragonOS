@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use core::{cmp::min, intrinsics::unlikely};
+use core::{cmp::min, fmt::Display, intrinsics::unlikely};
 use system_error::SystemError;
 
 use crate::{
@@ -2163,14 +2163,14 @@ impl LongNameExtractor {
     }
 
     /// @brief 返回抽取得到的名称字符串
-    fn to_string(&self) -> String {
-        let mut s = String::from_utf16_lossy(self.name.as_slice());
-        // 计算字符串的长度。如果字符串中有\0，那么就截取字符串的前面部分
-        if let Some(len) = s.find('\u{0}') {
-            s.truncate(len);
-        }
-        return s;
-    }
+    // fn to_string(&self) -> String {
+    //     let mut s = String::from_utf16_lossy(self.name.as_slice());
+    //     // 计算字符串的长度。如果字符串中有\0，那么就截取字符串的前面部分
+    //     if let Some(len) = s.find('\u{0}') {
+    //         s.truncate(len);
+    //     }
+    //     return s;
+    // }
 
     /// @brief 判断校验码是否与指定的短目录项的校验码相同
     ///
@@ -2178,6 +2178,17 @@ impl LongNameExtractor {
     ///                 不同 => false
     fn validate_checksum(&self, short_dentry: &ShortDirEntry) -> bool {
         return self.checksum == short_dentry.checksum();
+    }
+}
+
+impl Display for LongNameExtractor {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut s = String::from_utf16_lossy(self.name.as_slice());
+        // 计算字符串的长度。如果字符串中有\0，那么就截取字符串的前面部分
+        if let Some(len) = s.find('\u{0}') {
+            s.truncate(len);
+        }
+        write!(f, "{}", s)
     }
 }
 

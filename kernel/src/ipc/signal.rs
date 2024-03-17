@@ -202,7 +202,7 @@ impl Signal {
             return true;
         }
         let state = pcb.sched_info().inner_lock_read_irqsave().state();
-        if state.is_blocked() && (state.is_blocked_interruptable() == false) {
+        if state.is_blocked() && (!state.is_blocked_interruptable()) {
             return false;
         }
 
@@ -337,7 +337,7 @@ pub fn flush_signal_handlers(pcb: Arc<ProcessControlBlock>, force_default: bool)
 
     for sigaction in actions.iter_mut() {
         if force_default || !sigaction.is_ignore() {
-            sigaction.set_action(SigactionType::SaHandler(SaHandlerType::SigDefault));
+            sigaction.set_action(SigactionType::SaHandler(SaHandlerType::Default));
         }
         // 清除flags中，除了DFL和IGN以外的所有标志
         sigaction.set_restorer(None);
@@ -383,8 +383,8 @@ pub(super) fn do_sigaction(
         }
     };
 
-    if old_act.is_some() {
-        *old_act.unwrap().flags_mut() &= SigFlags::SA_ALL;
+    if let Some(act) = old_act {
+        *act.flags_mut() &= SigFlags::SA_ALL;
     }
 
     if let Some(ac) = act {

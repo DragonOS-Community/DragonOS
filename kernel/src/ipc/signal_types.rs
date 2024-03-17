@@ -123,32 +123,32 @@ impl SigactionType {
     ///
     /// [`SigIgnore`]: SaHandlerType::SigIgnore
     pub fn is_ignore(&self) -> bool {
-        return matches!(self, Self::SaHandler(SaHandlerType::SigIgnore));
+        return matches!(self, Self::SaHandler(SaHandlerType::Ignore));
     }
     /// Returns `true` if the sa handler type is [`SaHandler(SaHandlerType::SigCustomized(_))`].
     ///
     /// [`SigCustomized`]: SaHandlerType::SigCustomized(_)
     pub fn is_customized(&self) -> bool {
-        return matches!(self, Self::SaHandler(SaHandlerType::SigCustomized(_)));
+        return matches!(self, Self::SaHandler(SaHandlerType::Customized(_)));
     }
 }
 
 #[derive(Debug, Copy, Clone)]
 #[allow(dead_code)]
 pub enum SaHandlerType {
-    SigError, // 暂时没有用上
-    SigDefault,
-    SigIgnore,
-    SigCustomized(VirtAddr),
+    Error, // 暂时没有用上
+    Default,
+    Ignore,
+    Customized(VirtAddr),
 }
 
 impl From<SaHandlerType> for usize {
     fn from(value: SaHandlerType) -> Self {
         match value {
-            SaHandlerType::SigError => 2,
-            SaHandlerType::SigIgnore => 1,
-            SaHandlerType::SigDefault => 0,
-            SaHandlerType::SigCustomized(handler) => handler.data(),
+            SaHandlerType::Error => 2,
+            SaHandlerType::Ignore => 1,
+            SaHandlerType::Default => 0,
+            SaHandlerType::Customized(handler) => handler.data(),
         }
     }
 }
@@ -158,21 +158,21 @@ impl SaHandlerType {
     ///
     /// [`SigDefault`]: SaHandlerType::SigDefault
     pub fn is_sig_default(&self) -> bool {
-        matches!(self, Self::SigDefault)
+        matches!(self, Self::Default)
     }
 
     /// Returns `true` if the sa handler type is [`SigIgnore`].
     ///
     /// [`SigIgnore`]: SaHandlerType::SigIgnore
     pub fn is_sig_ignore(&self) -> bool {
-        matches!(self, Self::SigIgnore)
+        matches!(self, Self::Ignore)
     }
 
     /// Returns `true` if the sa handler type is [`SigError`].
     ///
     /// [`SigError`]: SaHandlerType::SigError
     pub fn is_sig_error(&self) -> bool {
-        matches!(self, Self::SigError)
+        matches!(self, Self::Error)
     }
 }
 
@@ -190,7 +190,7 @@ pub struct Sigaction {
 impl Default for Sigaction {
     fn default() -> Self {
         Self {
-            action: SigactionType::SaHandler(SaHandlerType::SigDefault),
+            action: SigactionType::SaHandler(SaHandlerType::Default),
             flags: Default::default(),
             mask: Default::default(),
             restorer: Default::default(),
@@ -260,7 +260,7 @@ impl Sigaction {
 
     /// 默认信号处理程序占位符（用于在sighand结构体中的action数组中占位）
     pub const DEFAULT_SIGACTION: Sigaction = Sigaction {
-        action: SigactionType::SaHandler(SaHandlerType::SigDefault),
+        action: SigactionType::SaHandler(SaHandlerType::Default),
         flags: SigFlags::empty(),
         mask: SigSet::from_bits_truncate(0),
         restorer: None,
@@ -268,7 +268,7 @@ impl Sigaction {
 
     /// 默认的“忽略信号”的sigaction
     pub const DEFAULT_SIGACTION_IGNORE: Sigaction = Sigaction {
-        action: SigactionType::SaHandler(SaHandlerType::SigIgnore),
+        action: SigactionType::SaHandler(SaHandlerType::Ignore),
         flags: SigFlags::empty(),
         mask: SigSet::from_bits_truncate(0),
         restorer: None,

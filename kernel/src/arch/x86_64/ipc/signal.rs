@@ -460,16 +460,16 @@ impl SignalArch for X86_64SignalArch {
 
             match sigaction.action() {
                 SigactionType::SaHandler(action_type) => match action_type {
-                    SaHandlerType::SigError => {
+                    SaHandlerType::Error => {
                         kerror!("Trying to handle a Sigerror on Process:{:?}", pcb.pid());
                         return;
                     }
-                    SaHandlerType::SigDefault => {
+                    SaHandlerType::Default => {
                         sigaction = Sigaction::default();
                         break;
                     }
-                    SaHandlerType::SigIgnore => continue,
-                    SaHandlerType::SigCustomized(_) => {
+                    SaHandlerType::Ignore => continue,
+                    SaHandlerType::Customized(_) => {
                         break;
                     }
                 },
@@ -557,11 +557,11 @@ fn setup_frame(
     let temp_handler: *mut c_void;
     match sigaction.action() {
         SigactionType::SaHandler(handler_type) => match handler_type {
-            SaHandlerType::SigDefault => {
+            SaHandlerType::Default => {
                 sig.handle_default();
                 return Ok(0);
             }
-            SaHandlerType::SigCustomized(handler) => {
+            SaHandlerType::Customized(handler) => {
                 // 如果handler位于内核空间
                 if handler >= MMArch::USER_END_VADDR {
                     // 如果当前是SIGSEGV,则采用默认函数处理
@@ -602,7 +602,7 @@ fn setup_frame(
                     temp_handler = handler.data() as *mut c_void;
                 }
             }
-            SaHandlerType::SigIgnore => {
+            SaHandlerType::Ignore => {
                 return Ok(0);
             }
             _ => {

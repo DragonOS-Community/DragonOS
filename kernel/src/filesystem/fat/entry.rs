@@ -2181,14 +2181,14 @@ impl LongNameExtractor {
     }
 }
 
-impl Display for LongNameExtractor{
+impl Display for LongNameExtractor {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let mut s = String::from_utf16_lossy(self.name.as_slice());
         // 计算字符串的长度。如果字符串中有\0，那么就截取字符串的前面部分
         if let Some(len) = s.find('\u{0}') {
             s.truncate(len);
         }
-        write!(f,"{}",s)
+        write!(f, "{}", s)
     }
 }
 

@@ -3,7 +3,7 @@ use core::default::Default;
 
 /// @brief MBR硬盘分区表项的结构
 #[repr(packed)]
-#[derive(Debug, Clone, Copy,Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct MbrDiskPartitionTableEntry {
     pub flags: u8,                     // 引导标志符，标记此分区为活动分区
     pub starting_head: u8,             // 起始磁头号
@@ -38,7 +38,6 @@ pub struct MbrDiskPartionTable {
     pub dpte: [MbrDiskPartitionTableEntry; 4], // 磁盘分区表项
     pub bs_trailsig: u16,
 }
-
 
 impl Default for MbrDiskPartionTable {
     fn default() -> Self {

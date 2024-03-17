@@ -202,7 +202,7 @@ impl Signal {
             return true;
         }
         let state = pcb.sched_info().inner_lock_read_irqsave().state();
-        if state.is_blocked() && (!state.is_blocked_interruptable() ) {
+        if state.is_blocked() && (!state.is_blocked_interruptable()) {
             return false;
         }
 
@@ -383,9 +383,8 @@ pub(super) fn do_sigaction(
         }
     };
 
-    
-    if let Some(act)=old_act{
-        *act.flags_mut()&=SigFlags::SA_ALL;
+    if let Some(act) = old_act {
+        *act.flags_mut() &= SigFlags::SA_ALL;
     }
 
     if let Some(ac) = act {

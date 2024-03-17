@@ -554,46 +554,43 @@ impl Syscall {
         old: &str,
         newfd: i32,
         new: &str,
-        flags: i32,
+        flags: AtFlags,
     ) -> Result<usize, SystemError> {
-        // flag错误时返回EINVAL
-        if flags & ((!(AtFlags::AT_EMPTY_PATH | AtFlags::AT_SYMLINK_FOLLOW)).bits()) != 0 {
+        // flag包含其他未规定值时返回EINVAL
+        if !(AtFlags::AT_EMPTY_PATH | AtFlags::AT_SYMLINK_FOLLOW).contains(flags) {
             return Err(SystemError::EINVAL);
         }
         // TODO AT_EMPTY_PATH标志启用时，进行调用者CAP_DAC_READ_SEARCH或相似的检查
-        let symlink_times = match flags & AtFlags::AT_SYMLINK_FOLLOW.bits() {
-            0 => 0,
-            _ => VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        let symlink_times = if flags.contains(AtFlags::AT_SYMLINK_FOLLOW) {
+            0 as usize
+        } else {
+            VFS_MAX_FOLLOW_SYMLINK_TIMES
         };
         let pcb = ProcessManager::current_pcb();
 
-        // AT_EMPTY_PATH标志不启用时得到源路径的inode的闭包
-        let get_old_inode_without_empty_flag = || {
+        // 得到源路径的inode
+        let old_inode: Arc<dyn IndexNode> = if old.is_empty() {
+            if flags.contains(AtFlags::AT_EMPTY_PATH) {
+                // 在AT_EMPTY_PATH启用时，old可以为空，old_inode实际为oldfd所指文件，但该文件不能为目录。
+                let binding = pcb.fd_table();
+                let fd_table_guard = binding.read();
+                let file = fd_table_guard
+                    .get_file_by_fd(oldfd)
+                    .ok_or(SystemError::EBADF)?;
+                let old_inode = file.lock().inode();
+                old_inode
+            } else {
+                return Err(SystemError::ENONET);
+            }
+        } else {
             let (old_begin_inode, old_remain_path) = user_path_at(&pcb, oldfd, old)?;
-            old_begin_inode.lookup_follow_symlink(&old_remain_path, symlink_times)
+            old_begin_inode.lookup_follow_symlink(&old_remain_path, symlink_times)?
         };
 
-        // 得到源路径的inode
-        let old_inode: Arc<dyn IndexNode> = match flags & AtFlags::AT_EMPTY_PATH.bits() {
-            0 => get_old_inode_without_empty_flag()?,
-            _ => {
-                if old.len() == 0 {
-                    // 在AT_EMPTY_PATH启用时，old可以为空，old_inode实际为oldfd所指文件，但该文件不能为目录。
-                    let binding = pcb.fd_table();
-                    let fd_table_guard = binding.read();
-                    let file = fd_table_guard
-                        .get_file_by_fd(oldfd)
-                        .ok_or(SystemError::EBADF)?;
-                    let old_inode = file.lock().inode();
-                    if old_inode.metadata().unwrap().file_type == FileType::Dir {
-                        return Err(SystemError::EPERM);
-                    }
-                    old_inode
-                } else {
-                    get_old_inode_without_empty_flag()?
-                }
-            }
-        };
+        // old_inode为目录时返回EPERM
+        if old_inode.metadata().unwrap().file_type == FileType::Dir {
+            return Err(SystemError::EPERM);
+        }
 
         // 得到新创建节点的父节点
         let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newfd, new)?;
@@ -605,24 +602,46 @@ impl Syscall {
         return new_parent.link(&new_name, &old_inode).map(|_| 0);
     }
 
-    pub fn link(old: &str, new: &str) -> Result<usize, SystemError> {
-        Self::do_linkat(
+    pub fn link(old: *const u8, new: *const u8) -> Result<usize, SystemError> {
+        let get_path = |cstr: *const u8| -> Result<String, SystemError> {
+            let res = check_and_clone_cstr(cstr, Some(MAX_PATHLEN))?;
+            if res.len() >= MAX_PATHLEN {
+                return Err(SystemError::ENAMETOOLONG);
+            }
+            if res.is_empty() {
+                return Err(SystemError::ENOENT);
+            }
+            Ok(res)
+        };
+        let old = get_path(old)?;
+        let new = get_path(new)?;
+        return Self::do_linkat(
             AtFlags::AT_FDCWD.bits() as i32,
-            old,
+            &old,
             AtFlags::AT_FDCWD.bits() as i32,
-            new,
-            0,
-        )
+            &new,
+            AtFlags::empty(),
+        );
     }
 
     pub fn linkat(
         oldfd: i32,
-        old: &str,
+        old: *const u8,
         newfd: i32,
-        new: &str,
+        new: *const u8,
         flags: i32,
     ) -> Result<usize, SystemError> {
-        Self::do_linkat(oldfd, old, newfd, new, flags)
+        let old = check_and_clone_cstr(old, Some(MAX_PATHLEN))?;
+        let new = check_and_clone_cstr(new, Some(MAX_PATHLEN))?;
+        if old.len() >= MAX_PATHLEN || new.len() >= MAX_PATHLEN {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+        // old 根据flags & AtFlags::AT_EMPTY_PATH判空
+        if new.is_empty() {
+            return Err(SystemError::ENOENT);
+        }
+        let flags = AtFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
+        Self::do_linkat(oldfd, &old, newfd, &new, flags)
     }
 
     /// **删除文件夹、取消文件的链接、删除文件的系统调用**

@@ -12,7 +12,7 @@ use crate::{
 ///
 /// todo: 待smp模块重构后，从smp模块获取CPU数量。
 /// 目前由于smp模块初始化时机较晚，导致大部分内核模块无法在早期初始化PerCpu变量。
-const CPU_NUM_ATOMIC: AtomicU32 = AtomicU32::new(PerCpu::MAX_CPU_NUM);
+static CPU_NUM_ATOMIC: AtomicU32 = AtomicU32::new(PerCpu::MAX_CPU_NUM);
 
 #[derive(Debug)]
 pub struct PerCpu;
@@ -26,13 +26,13 @@ impl PerCpu {
     /// 该函数会调用`smp_get_total_cpu()`获取CPU数量，然后将其存储在`CPU_NUM`中。
     #[allow(dead_code)]
     pub fn init() {
-        static CPU_NUM: AtomicU32 = CPU_NUM_ATOMIC;
-        if CPU_NUM.load(core::sync::atomic::Ordering::SeqCst) != 0 {
+        let cpu_num: &AtomicU32 = &CPU_NUM_ATOMIC;
+        if cpu_num.load(core::sync::atomic::Ordering::SeqCst) != 0 {
             panic!("PerCpu::init() called twice");
         }
         let cpus = unsafe { smp_get_total_cpu() };
         assert!(cpus > 0, "PerCpu::init(): smp_get_total_cpu() returned 0");
-        CPU_NUM.store(cpus, core::sync::atomic::Ordering::SeqCst);
+        cpu_num.store(cpus, core::sync::atomic::Ordering::SeqCst);
     }
 }
 

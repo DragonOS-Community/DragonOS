@@ -238,7 +238,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 if !next_page_list_addr.is_null() {
                     // 此时page_list已经没有空闲伙伴块了，又因为非唯一页，需要删除该page_list
                     self.free_area[Self::order2index(spec_order)] = next_page_list_addr;
-                    drop(page_list);
+                    let _ = page_list;
                     // kdebug!("FREE: page_list_addr={:b}", page_list_addr.data());
                     unsafe {
                         self.buddy_free(page_list_addr, MMArch::PAGE_SHIFT as u8);
@@ -283,7 +283,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                     if !page_list.next_page.is_null() {
                         // 此时page_list已经没有空闲伙伴块了，又因为非唯一页，需要删除该page_list
                         self.free_area[Self::order2index(spec_order)] = page_list.next_page;
-                        drop(page_list);
+                        let _ = page_list;
                         unsafe { self.buddy_free(page_list_addr, MMArch::PAGE_SHIFT as u8) };
                     } else {
                         Self::write_page(page_list_addr, page_list);

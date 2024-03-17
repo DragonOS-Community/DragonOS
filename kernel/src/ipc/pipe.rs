@@ -234,7 +234,7 @@ impl IndexNode for LockedPipeInode {
 
         let pollflag = EPollEventType::from_bits_truncate(inode.poll(data)? as u32);
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&inode.epitems, pollflag)?;
+        EventPoll::wakeup_epoll(&mut inode.epitems, pollflag)?;
 
         //返回读取的字节数
         return Ok(num);
@@ -330,7 +330,7 @@ impl IndexNode for LockedPipeInode {
         let mut inode = self.0.lock();
 
         // TODO: 如果已经没有读端存在了，则向写端进程发送SIGPIPE信号
-        inode.reader == 0;
+        let _ = inode.reader == 0;
 
         // 如果管道空间不够
 
@@ -386,7 +386,7 @@ impl IndexNode for LockedPipeInode {
 
         let pollflag = EPollEventType::from_bits_truncate(inode.poll(data)? as u32);
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&inode.epitems, pollflag)?;
+        EventPoll::wakeup_epoll(&mut inode.epitems, pollflag)?;
 
         // 返回写入的字节数
         return Ok(len);

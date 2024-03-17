@@ -493,7 +493,7 @@ impl IrqStatus {
     }
 
     pub const fn can_balance(&self) -> bool {
-        ((self.bits & (Self::IRQD_PER_CPU.bits | Self::IRQD_NO_BALANCING.bits)) == 0)
+        (self.bits & (Self::IRQD_PER_CPU.bits | Self::IRQD_NO_BALANCING.bits)) == 0
     }
 
     pub const fn affinity_was_set(&self) -> bool {

@@ -145,7 +145,7 @@ impl Syscall {
                     // 从用户空间获得sigaction结构体
                     // TODO mask是default还是用户空间传入
                     new_ka = Sigaction::new(
-                        SigactionType::SaHandler(SaHandlerType::SigCustomized(unsafe {
+                        SigactionType::SaHandler(SaHandlerType::Customized(unsafe {
                             VirtAddr::new((*act).handler as usize)
                         })),
                         unsafe { (*act).flags },
@@ -201,7 +201,7 @@ impl Syscall {
 
             let sigaction_handler = match old_sigaction.action() {
                 SigactionType::SaHandler(handler) => {
-                    if let SaHandlerType::SigCustomized(hand) = handler {
+                    if let SaHandlerType::Customized(hand) = handler {
                         hand
                     } else if handler.is_sig_ignore() {
                         VirtAddr::new(USER_SIG_IGN as usize)

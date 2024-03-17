@@ -1,3 +1,4 @@
+use core::cmp::Ordering;
 use core::intrinsics::unlikely;
 use core::{any::Any, fmt::Debug};
 use system_error::SystemError;
@@ -1456,10 +1457,10 @@ impl IndexNode for LockedFATInode {
         match &mut guard.inode_type {
             FATDirEntry::File(file) | FATDirEntry::VolId(file) => {
                 // 如果新的长度和旧的长度相同，那么就直接返回
-                if len == old_size {
-                    return Ok(());
-                } else if len > old_size {
-                    // 如果新的长度比旧的长度大，那么就在文件末尾添加空白
+                match len.cmp(&old_size){
+                    Ordering::Equal=>{return Ok(());},
+                    Ordering::Greater=>{
+                        // 如果新的长度比旧的长度大，那么就在文件末尾添加空白
                     let mut buf: Vec<u8> = Vec::new();
                     let mut remain_size = len - old_size;
                     let buf_size = remain_size;
@@ -1473,8 +1474,8 @@ impl IndexNode for LockedFATInode {
                         remain_size -= write_size;
                         offset += write_size;
                     }
-                } else {
-                    file.truncate(fs, len as u64)?;
+                    },
+                    Ordering::Less=>{file.truncate(fs, len as u64)?;}
                 }
                 guard.update_metadata();
                 return Ok(());
@@ -1614,17 +1615,28 @@ impl IndexNode for LockedFATInode {
         // 再从磁盘删除
         let r: Result<(), SystemError> =
             dir.remove(guard.fs.upgrade().unwrap().clone(), name, true);
-        if r.is_ok() {
-            return r;
-        } else {
-            let r = r.unwrap_err();
-            if r == SystemError::ENOTEMPTY {
-                // 如果要删除的是目录，且不为空，则删除动作未发生，重新加入缓存
-                guard.children.insert(name.to_uppercase(), target.clone());
-                drop(target_guard);
+        match r{
+            Ok(_)=>{return r},
+            Err(r)=>{
+                if r == SystemError::ENOTEMPTY {
+                    // 如果要删除的是目录，且不为空，则删除动作未发生，重新加入缓存
+                    guard.children.insert(name.to_uppercase(), target.clone());
+                    drop(target_guard);
+                }
+                return Err(r);
             }
-            return Err(r);
         }
+        // if r.is_ok() {
+        //     return r;
+        // } else {
+        //     let r = r.unwrap_err();
+        //     if r == SystemError::ENOTEMPTY {
+        //         // 如果要删除的是目录，且不为空，则删除动作未发生，重新加入缓存
+        //         guard.children.insert(name.to_uppercase(), target.clone());
+        //         drop(target_guard);
+        //     }
+        //     return Err(r);
+        // }
     }
 
     fn get_entry_name(&self, ino: InodeId) -> Result<String, SystemError> {

@@ -69,8 +69,28 @@ trigger_files = [
     ".mailmap",
 ]
 
+[autolabel."A-fs"]
+trigger_files = [
+    "kernel/src/filesystem",
+]
+
+[autolabel."T-driver"]
+trigger_files = [
+    "kernel/src/driver",
+    "kernel/src/arch/x86_64/driver",
+    "kernel/src/arch/riscv64/driver",
+]
+
+[autolabel."T-virtulization"]
+trigger_files = [
+    "kernel/src/virt",
+    "kernel/src/arch/x86_64/kvm"
+]
+
 [autolabel."S-等待审查"]
 new_pr = true
+
+[shortcut]
 
 [no-merges]
 exclude_titles = ["Rollup of", "subtree update", "Subtree update"]
@@ -78,7 +98,16 @@ labels = ["S-等待作者修改"]
 
 [mentions."triagebot.toml"]
 message = "`triagebot.toml` has been modified, there may have been changes to the review queue."
+cc = ["@fslongjin", "@GnoCiYeH"]
+
+[mentions."kernel/src/driver/base"]
+message = "设备驱动模型部分发生了更改，请进行审查"
 cc = ["@fslongjin"]
+
+[mentions."kernel/src/driver/tty"]
+message = "tty驱动发生了更改，请进行审查"
+cc = ["@GnoCiYeH"]
+
 
 [assign]
 warn_non_default_branch = true
@@ -100,6 +129,10 @@ virtulization = [
     "@ZXXYy"
 ]
 
+filesystem = [
+    "@fslongjin"
+]
+
 # CI/CD
 infra-ci = [
     "@fslongjin"
@@ -112,3 +145,6 @@ bootstrap = [
 [assign.owners]
 "/.github/workflows" =                                   ["infra-ci"]
 "/kernel/src/driver" =                                   ["driver"]
+"/kernel/src/filesystem" =                               ["filesystem"]
+"/kernel/src/virt" =                                     ["virtulization"]
+"/kernel/src/arch/x86_64/kvm" =                          ["virtulization"]

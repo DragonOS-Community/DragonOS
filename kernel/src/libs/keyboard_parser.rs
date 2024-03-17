@@ -325,11 +325,11 @@ impl TypeOneFSMState {
         }
 
         if scancode_status.caps_lock {
-            if index >= 0x10 && index <= 0x19 {
+            if (0x10..=0x19).contains(&index) {
                 col = !col;
-            } else if index >= 0x1e && index <= 0x26 {
+            } else if (0x1e..=0x26).contains(&index) {
                 col = !col;
-            } else if index >= 0x2c && index <= 0x32 {
+            } else if (0x2c..=0x32).contains(&index) {
                 col = !col;
             }
         }
@@ -485,51 +485,51 @@ impl ScanCodeStatus {
 
 const TYPE1_KEY_CODE_MAPTABLE: [u8; 256] = [
     /*0x00*/ 0, 0, /*0x01*/ 0, 0, // ESC
-    /*0x02*/ '1' as u8, '!' as u8, /*0x03*/ '2' as u8, '@' as u8,
-    /*0x04*/ '3' as u8, '#' as u8, /*0x05*/ '4' as u8, '$' as u8,
-    /*0x06*/ '5' as u8, '%' as u8, /*0x07*/ '6' as u8, '^' as u8,
-    /*0x08*/ '7' as u8, '&' as u8, /*0x09*/ '8' as u8, '*' as u8,
-    /*0x0a*/ '9' as u8, '(' as u8, /*0x0b*/ '0' as u8, ')' as u8,
-    /*0x0c*/ '-' as u8, '_' as u8, /*0x0d*/ '=' as u8, '+' as u8,
+    /*0x02*/ b'1' as u8, b'!' as u8, /*0x03*/ b'2' as u8, b'@' as u8,
+    /*0x04*/ b'3' as u8, b'#' as u8, /*0x05*/ b'4' as u8, b'$' as u8,
+    /*0x06*/ b'5' as u8, b'%' as u8, /*0x07*/ b'6' as u8, b'^' as u8,
+    /*0x08*/ b'7' as u8, b'&' as u8, /*0x09*/ b'8' as u8, b'*' as u8,
+    /*0x0a*/ b'9' as u8, b'(' as u8, /*0x0b*/ b'0' as u8, b')' as u8,
+    /*0x0c*/ b'-' as u8, b'_' as u8, /*0x0d*/ b'=' as u8, b'+' as u8,
     /*0x0e  \b */ 8 as u8, 8 as u8, // BACKSPACE
-    /*0x0f*/ '\t' as u8, '\t' as u8, // TAB
+    /*0x0f*/ b'\t' as u8, b'\t' as u8, // TAB
     ////////////////////////character///////////////////////////
-    /*0x10*/ 'q' as u8,
-    'Q' as u8, /*0x11*/ 'w' as u8, 'W' as u8, /*0x12*/ 'e' as u8, 'E' as u8,
-    /*0x13*/ 'r' as u8, 'R' as u8, /*0x14*/ 't' as u8, 'T' as u8,
-    /*0x15*/ 'y' as u8, 'Y' as u8, /*0x16*/ 'u' as u8, 'U' as u8,
-    /*0x17*/ 'i' as u8, 'I' as u8, /*0x18*/ 'o' as u8, 'O' as u8,
-    /*0x19*/ 'p' as u8, 'P' as u8,
+    /*0x10*/ b'q' as u8,
+    b'Q' as u8, /*0x11*/ b'w' as u8, b'W' as u8, /*0x12*/ b'e' as u8, b'E' as u8,
+    /*0x13*/ b'r' as u8, b'R' as u8, /*0x14*/ b't' as u8, b'T' as u8,
+    /*0x15*/ b'y' as u8, b'Y' as u8, /*0x16*/ b'u' as u8, b'U' as u8,
+    /*0x17*/ b'i' as u8, b'I' as u8, /*0x18*/ b'o' as u8, b'O' as u8,
+    /*0x19*/ b'p' as u8, b'P' as u8,
     ////////////////////////character///////////////////////////
 
-    /*0x1a*/ '[' as u8,
-    '{' as u8, /*0x1b*/ ']' as u8, '}' as u8, /*0x1c*/ '\n' as u8,
-    '\n' as u8, // ENTER
+    /*0x1a*/ b'[' as u8,
+    b'{' as u8, /*0x1b*/ b']' as u8, b'}' as u8, /*0x1c*/ b'\n' as u8,
+    b'\n' as u8, // ENTER
     /*0x1d*/ 0x1d, 0x1d, // CTRL Left
     ////////////////////////character///////////////////////////
-    /*0x1e*/ 'a' as u8,
-    'A' as u8, /*0x1f*/ 's' as u8, 'S' as u8, /*0x20*/ 'd' as u8, 'D' as u8,
-    /*0x21*/ 'f' as u8, 'F' as u8, /*0x22*/ 'g' as u8, 'G' as u8,
-    /*0x23*/ 'h' as u8, 'H' as u8, /*0x24*/ 'j' as u8, 'J' as u8,
-    /*0x25*/ 'k' as u8, 'K' as u8, /*0x26*/ 'l' as u8, 'L' as u8,
+    /*0x1e*/ b'a' as u8,
+    b'A' as u8, /*0x1f*/ b's' as u8, b'S' as u8, /*0x20*/ b'd' as u8, b'D' as u8,
+    /*0x21*/ b'f' as u8, b'F' as u8, /*0x22*/ b'g' as u8, b'G' as u8,
+    /*0x23*/ b'h' as u8, b'H' as u8, /*0x24*/ b'j' as u8, b'J' as u8,
+    /*0x25*/ b'k' as u8, b'K' as u8, /*0x26*/ b'l' as u8, b'L' as u8,
     ////////////////////////character///////////////////////////
 
-    /*0x27*/ ';' as u8,
-    ':' as u8, /*0x28*/ '\'' as u8, '"' as u8, /*0x29*/ '`' as u8, '~' as u8,
+    /*0x27*/ b';' as u8,
+    b':' as u8, /*0x28*/ b'\'' as u8, b'"' as u8, /*0x29*/ b'`' as u8, b'~' as u8,
     /*0x2a*/ 0x2a, 0x2a, // SHIFT Left
-    /*0x2b*/ '\\' as u8, '|' as u8,
+    /*0x2b*/ b'\\' as u8, b'|' as u8,
     ////////////////////////character///////////////////////////
-    /*0x2c*/ 'z' as u8,
-    'Z' as u8, /*0x2d*/ 'x' as u8, 'X' as u8, /*0x2e*/ 'c' as u8, 'C' as u8,
-    /*0x2f*/ 'v' as u8, 'V' as u8, /*0x30*/ 'b' as u8, 'B' as u8,
-    /*0x31*/ 'n' as u8, 'N' as u8, /*0x32*/ 'm' as u8, 'M' as u8,
+    /*0x2c*/ b'z' as u8,
+    b'Z' as u8, /*0x2d*/ b'x' as u8, b'X' as u8, /*0x2e*/ b'c' as u8, b'C' as u8,
+    /*0x2f*/ b'v' as u8, b'V' as u8, /*0x30*/ b'b' as u8, b'B' as u8,
+    /*0x31*/ b'n' as u8, b'N' as u8, /*0x32*/ b'm' as u8, b'M' as u8,
     ////////////////////////character///////////////////////////
 
-    /*0x33*/ ',' as u8,
-    '<' as u8, /*0x34*/ '.' as u8, '>' as u8, /*0x35*/ '/' as u8, '?' as u8,
+    /*0x33*/ b',' as u8,
+    b'<' as u8, /*0x34*/ b'.' as u8, b'>' as u8, /*0x35*/ b'/' as u8, b'?' as u8,
     /*0x36*/ 0x36, 0x36, // SHIFT Right
-    /*0x37*/ '*' as u8, '*' as u8, /*0x38*/ 0x38, 0x38, // ALT Left
-    /*0x39*/ ' ' as u8, ' ' as u8, /*0x3a*/ 0, 0, // CAPS LOCK
+    /*0x37*/ b'*' as u8, b'*' as u8, /*0x38*/ 0x38, 0x38, // ALT Left
+    /*0x39*/ b' ' as u8, b' ' as u8, /*0x3a*/ 0, 0, // CAPS LOCK
     /*0x3b*/ 0, 0, // F1
     /*0x3c*/ 0, 0, // F2
     /*0x3d*/ 0, 0, // F3
@@ -542,19 +542,19 @@ const TYPE1_KEY_CODE_MAPTABLE: [u8; 256] = [
     /*0x44*/ 0, 0, // F10
     /*0x45*/ 0, 0, // NUM LOCK
     /*0x46*/ 0, 0, // SCROLL LOCK
-    /*0x47*/ '7' as u8, 0, /*PAD HONE*/
-    /*0x48*/ '8' as u8, 0, /*PAD UP*/
-    /*0x49*/ '9' as u8, 0, /*PAD PAGEUP*/
-    /*0x4a*/ '-' as u8, 0, /*PAD MINUS*/
-    /*0x4b*/ '4' as u8, 0, /*PAD LEFT*/
-    /*0x4c*/ '5' as u8, 0, /*PAD MID*/
-    /*0x4d*/ '6' as u8, 0, /*PAD RIGHT*/
-    /*0x4e*/ '+' as u8, 0, /*PAD PLUS*/
-    /*0x4f*/ '1' as u8, 0, /*PAD END*/
-    /*0x50*/ '2' as u8, 0, /*PAD DOWN*/
-    /*0x51*/ '3' as u8, 0, /*PAD PAGEDOWN*/
-    /*0x52*/ '0' as u8, 0, /*PAD INS*/
-    /*0x53*/ '.' as u8, 0, /*PAD DOT*/
+    /*0x47*/ b'7' as u8, 0, /*PAD HONE*/
+    /*0x48*/ b'8' as u8, 0, /*PAD UP*/
+    /*0x49*/ b'9' as u8, 0, /*PAD PAGEUP*/
+    /*0x4a*/ b'-' as u8, 0, /*PAD MINUS*/
+    /*0x4b*/ b'4' as u8, 0, /*PAD LEFT*/
+    /*0x4c*/ b'5' as u8, 0, /*PAD MID*/
+    /*0x4d*/ b'6' as u8, 0, /*PAD RIGHT*/
+    /*0x4e*/ b'+' as u8, 0, /*PAD PLUS*/
+    /*0x4f*/ b'1' as u8, 0, /*PAD END*/
+    /*0x50*/ b'2' as u8, 0, /*PAD DOWN*/
+    /*0x51*/ b'3' as u8, 0, /*PAD PAGEDOWN*/
+    /*0x52*/ b'0' as u8, 0, /*PAD INS*/
+    /*0x53*/ b'.' as u8, 0, /*PAD DOT*/
     /*0x54*/ 0, 0, /*0x55*/ 0, 0, /*0x56*/ 0, 0, /*0x57*/ 0, 0, // F11
     /*0x58*/ 0, 0, // F12
     /*0x59*/ 0, 0, /*0x5a*/ 0, 0, /*0x5b*/ 0, 0, /*0x5c*/ 0, 0,

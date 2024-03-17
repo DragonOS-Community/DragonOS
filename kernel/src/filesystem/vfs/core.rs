@@ -4,10 +4,7 @@ use alloc::{format, string::ToString, sync::Arc};
 use system_error::SystemError;
 
 use crate::{
-    driver::{
-        base::block::disk_info::Partition,
-        disk::ahci::{self},
-    },
+    driver::{base::block::disk_info::Partition, disk::ahci},
     filesystem::{
         devfs::devfs_init,
         fat::fs::FATFileSystem,
@@ -18,6 +15,7 @@ use crate::{
     },
     kdebug, kerror, kinfo,
     process::ProcessManager,
+    syscall::user_access::check_and_clone_cstr,
 };
 
 use super::{
@@ -180,11 +178,9 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
 }
 
 /// @brief 创建文件/文件夹
-pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
-    // 文件名过长
-    if path.len() > MAX_PATHLEN as usize {
-        return Err(SystemError::ENAMETOOLONG);
-    }
+pub fn do_mkdir(path: *const u8, _mode: FileMode) -> Result<u64, SystemError> {
+    let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+    let path = path.as_str().trim();
 
     let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
 
@@ -212,11 +208,9 @@ pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
 }
 
 /// @brief 删除文件夹
-pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
-    // 文件名过长
-    if path.len() > MAX_PATHLEN as usize {
-        return Err(SystemError::ENAMETOOLONG);
-    }
+pub fn do_remove_dir(dirfd: i32, path: *const u8) -> Result<u64, SystemError> {
+    let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+    let path = path.as_str().trim();
 
     let pcb = ProcessManager::current_pcb();
     let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
@@ -248,11 +242,10 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 }
 
 /// @brief 删除文件
-pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
-    // 文件名过长
-    if path.len() > MAX_PATHLEN as usize {
-        return Err(SystemError::ENAMETOOLONG);
-    }
+pub fn do_unlink_at(dirfd: i32, path: *const u8) -> Result<u64, SystemError> {
+    let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+    let path = path.as_str().trim();
+
     let pcb = ProcessManager::current_pcb();
     let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
 

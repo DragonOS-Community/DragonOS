@@ -1,8 +1,4 @@
-use alloc::{
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
@@ -245,7 +241,7 @@ impl Syscall {
     ///
     /// @return 文件描述符编号，或者是错误码
     pub fn open(
-        path: &str,
+        path: *const u8,
         flags: FileMode,
         mode: ModeType,
         follow_symlink: bool,
@@ -255,7 +251,7 @@ impl Syscall {
 
     pub fn openat(
         dirfd: i32,
-        path: &str,
+        path: *const u8,
         o_flags: FileMode,
         mode: ModeType,
         follow_symlink: bool,
@@ -348,7 +344,15 @@ impl Syscall {
     ///
     /// @return Ok(usize) 调整后，文件访问指针相对于文件头部的偏移量
     /// @return Err(SystemError) 调整失败，返回posix错误码
-    pub fn lseek(fd: i32, seek: SeekFrom) -> Result<usize, SystemError> {
+    pub fn lseek(fd: i32, offset: i64, seek: u32) -> Result<usize, SystemError> {
+        let seek = match seek {
+            SEEK_SET => Ok(SeekFrom::SeekSet(offset)),
+            SEEK_CUR => Ok(SeekFrom::SeekCurrent(offset)),
+            SEEK_END => Ok(SeekFrom::SeekEnd(offset)),
+            SEEK_MAX => Ok(SeekFrom::SeekEnd(0)),
+            _ => Err(SystemError::EINVAL),
+        }?;
+
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
         let file = fd_table_guard
@@ -426,10 +430,10 @@ impl Syscall {
     ///    EFAULT    |       错误的地址      
     ///  
     /// ENAMETOOLONG |        路径过长        
-    pub fn chdir(dest_path: &str) -> Result<usize, SystemError> {
+    pub fn chdir(path: *const u8) -> Result<usize, SystemError> {
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
         let proc = ProcessManager::current_pcb();
         // Copy path to kernel space to avoid some security issues
-        let path = dest_path.to_string();
         let mut new_path = String::from("");
         if path.len() > 0 {
             let cwd = match path.as_bytes()[0] {
@@ -530,7 +534,7 @@ impl Syscall {
     /// @param path(r8) 路径 / mode(r9) 模式
     ///
     /// @return uint64_t 负数错误码 / 0表示成功
-    pub fn mkdir(path: &str, mode: usize) -> Result<usize, SystemError> {
+    pub fn mkdir(path: *const u8, mode: usize) -> Result<usize, SystemError> {
         return do_mkdir(path, FileMode::from_bits_truncate(mode as u32)).map(|x| x as usize);
     }
 
@@ -543,12 +547,12 @@ impl Syscall {
     /// - `flags`：标志位
     ///
     ///
-    pub fn unlinkat(dirfd: i32, pathname: &str, flags: u32) -> Result<usize, SystemError> {
+    pub fn unlinkat(dirfd: i32, path: *const u8, flags: u32) -> Result<usize, SystemError> {
         let flags = AtFlags::from_bits(flags as i32).ok_or(SystemError::EINVAL)?;
 
         if flags.contains(AtFlags::AT_REMOVEDIR) {
             // kdebug!("rmdir");
-            match do_remove_dir(dirfd, &pathname) {
+            match do_remove_dir(dirfd, path) {
                 Err(err) => {
                     return Err(err);
                 }
@@ -558,7 +562,7 @@ impl Syscall {
             }
         }
 
-        match do_unlink_at(dirfd, &pathname) {
+        match do_unlink_at(dirfd, path) {
             Err(err) => {
                 return Err(err);
             }
@@ -568,17 +572,12 @@ impl Syscall {
         }
     }
 
-    pub fn rmdir(pathname: *const u8) -> Result<usize, SystemError> {
-        let pathname = Self::get_pathname(pathname).map_err(|_| SystemError::EINVAL.into())?;
-        let pathname = pathname.as_str().trim();
-        return do_remove_dir(AtFlags::AT_FDCWD.bits(), pathname).map(|v| v as usize);
+    pub fn rmdir(path: *const u8) -> Result<usize, SystemError> {
+        return do_remove_dir(AtFlags::AT_FDCWD.bits(), path).map(|v| v as usize);
     }
 
-    pub fn unlink(pathname: *const u8) -> Result<usize, SystemError> {
-        let pathname = Self::get_pathname(pathname).map_err(|_| SystemError::EINVAL.into())?;
-        let pathname = pathname.as_str().trim();
-
-        return do_unlink_at(AtFlags::AT_FDCWD.bits(), pathname).map(|v| v as usize);
+    pub fn unlink(path: *const u8) -> Result<usize, SystemError> {
+        return do_unlink_at(AtFlags::AT_FDCWD.bits(), path).map(|v| v as usize);
     }
 
     /// @brief 根据提供的文件描述符的fd，复制对应的文件结构体，并返回新复制的文件结构体对应的fd
@@ -836,14 +835,14 @@ impl Syscall {
         return Ok(0);
     }
 
-    pub fn stat(path: &str, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
+    pub fn stat(path: *const u8, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
         let fd = Self::open(path, FileMode::O_RDONLY, ModeType::empty(), true)?;
         let r = Self::fstat(fd as i32, user_kstat);
         Self::close(fd).ok();
         return r;
     }
 
-    pub fn lstat(path: &str, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
+    pub fn lstat(path: *const u8, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
         let fd = Self::open(path, FileMode::O_RDONLY, ModeType::empty(), false)?;
         let r = Self::fstat(fd as i32, user_kstat);
         Self::close(fd).ok();
@@ -851,22 +850,21 @@ impl Syscall {
     }
 
     pub fn mknod(
-        path_ptr: *const u8,
+        path: *const u8,
         mode: ModeType,
         dev_t: DeviceNumber,
     ) -> Result<usize, SystemError> {
-        let pathname = path_ptr;
-        let pathname = Self::get_pathname(pathname).map_err(|_| SystemError::EINVAL.into())?;
-        let pathname = pathname.as_str().trim();
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = path.as_str().trim();
 
         let inode: Result<Arc<dyn IndexNode>, SystemError> =
-            ROOT_INODE().lookup_follow_symlink(pathname, VFS_MAX_FOLLOW_SYMLINK_TIMES);
+            ROOT_INODE().lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
         if inode.is_ok() {
             return Err(SystemError::EEXIST);
         }
 
-        let (filename, parent_path) = rsplit_path(pathname);
+        let (filename, parent_path) = rsplit_path(path);
 
         // 查找父目录
         let parent_inode: Arc<dyn IndexNode> = ROOT_INODE()
@@ -907,6 +905,7 @@ impl Syscall {
         buf_size: usize,
     ) -> Result<usize, SystemError> {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = path.as_str().trim();
         let mut user_buf = UserBufferWriter::new(user_buf, buf_size, true)?;
 
         let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
@@ -984,21 +983,6 @@ impl Syscall {
         // todo: 实现fchmod
         kwarn!("fchmod not fully implemented");
         return Ok(0);
-    }
-
-    /// @brief 处理文件路径字符串，并将其从用户空间复制到内核空间
-    pub fn get_pathname(pathname: *const u8) -> Result<String, SystemError> {
-        let pathname: String = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?;
-
-        if pathname.len() >= MAX_PATHLEN {
-            return Err(SystemError::ENAMETOOLONG);
-        }
-
-        if pathname.is_empty() {
-            return Err(SystemError::ENOENT);
-        }
-
-        Ok(pathname)
     }
 }
 

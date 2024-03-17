@@ -22,11 +22,10 @@ use system_error::SystemError;
 
 use crate::{
     arch::{cpu::cpu_reset, interrupt::TrapFrame, MMArch},
-    driver::base::block::SeekFrom,
     filesystem::vfs::{
         fcntl::FcntlCommand,
         file::FileMode,
-        syscall::{ModeType, PosixKstat, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
+        syscall::{ModeType, PosixKstat},
         MAX_PATHLEN,
     },
     include::bindings::bindings::{PAGE_2M_SIZE, PAGE_4K_SIZE},
@@ -90,31 +89,24 @@ impl Syscall {
             }
             #[cfg(target_arch = "x86_64")]
             SYS_OPEN => {
-                let pathname = args[0] as *const u8;
-                let pathname =
-                    Self::get_pathname(pathname).map_err(|_| SystemError::EINVAL.into())?;
-                let pathname = pathname.trim();
-
+                let path = args[0] as *const u8;
                 let flags = args[1];
                 let mode = args[2];
                 let open_flags: FileMode = FileMode::from_bits_truncate(flags as u32);
                 let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
-                Self::open(pathname, open_flags, mode, true)
+                Self::open(path, open_flags, mode, true)
             }
 
             SYS_OPENAT => {
                 let dirfd = args[0] as i32;
-                let pathname = args[1] as *const u8;
-                let pathname =
-                    Self::get_pathname(pathname).map_err(|_| SystemError::EINVAL.into())?;
-                let pathname = pathname.trim();
+                let path = args[1] as *const u8;
                 let flags = args[2];
                 let mode = args[3];
 
                 let open_flags: FileMode =
                     FileMode::from_bits(flags as u32).ok_or(SystemError::EINVAL)?;
                 let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
-                Self::openat(dirfd, pathname, open_flags, mode, true)
+                Self::openat(dirfd, path, open_flags, mode, true)
             }
             SYS_CLOSE => {
                 let fd = args[0];
@@ -148,15 +140,7 @@ impl Syscall {
                 let offset = args[1] as i64;
                 let whence = args[2] as u32;
 
-                let w = match whence {
-                    SEEK_SET => Ok(SeekFrom::SeekSet(offset)),
-                    SEEK_CUR => Ok(SeekFrom::SeekCurrent(offset)),
-                    SEEK_END => Ok(SeekFrom::SeekEnd(offset)),
-                    SEEK_MAX => Ok(SeekFrom::SeekEnd(0)),
-                    _ => Err(SystemError::EINVAL),
-                }?;
-
-                Self::lseek(fd, w)
+                Self::lseek(fd, offset, whence)
             }
 
             SYS_PREAD64 => {
@@ -209,30 +193,19 @@ impl Syscall {
             SYS_REBOOT => Self::reboot(),
 
             SYS_CHDIR => {
-                // Closure for checking arguments
-                let chdir_check = |arg0: usize| {
-                    if arg0 == 0 {
-                        return Err(SystemError::EFAULT);
-                    }
-                    let path_ptr = arg0 as *const c_char;
-                    let virt_addr = VirtAddr::new(path_ptr as usize);
-                    // 权限校验
-                    if path_ptr.is_null()
-                        || (frame.from_user()
-                            && verify_area(virt_addr, PAGE_2M_SIZE as usize).is_err())
-                    {
-                        return Err(SystemError::EINVAL);
-                    }
+                if args[0] == 0 {
+                    return Err(SystemError::EFAULT);
+                }
+                let path_ptr = args[0] as *const c_char;
+                let virt_addr = VirtAddr::new(path_ptr as usize);
+                // 权限校验
+                if path_ptr.is_null()
+                    || (frame.from_user() && verify_area(virt_addr, PAGE_2M_SIZE as usize).is_err())
+                {
+                    return Err(SystemError::EINVAL);
+                }
 
-                    let dest_path = arg0 as *const u8;
-                    let dest_path =
-                        Self::get_pathname(dest_path).map_err(|_| SystemError::EINVAL.into())?;
-
-                    return Ok(dest_path);
-                };
-
-                let r = chdir_check(args[0])?;
-                let r = r.as_str().trim();
+                let r = args[0] as *const u8;
                 Self::chdir(r)
             }
 
@@ -302,23 +275,15 @@ impl Syscall {
                 let path_ptr = args[0] as *const c_char;
                 let mode = args[1];
                 let virt_path_ptr = VirtAddr::new(path_ptr as usize);
-                let security_check = || {
-                    if path_ptr.is_null()
-                        || (frame.from_user()
-                            && verify_area(virt_path_ptr, PAGE_2M_SIZE as usize).is_err())
-                    {
-                        return Err(SystemError::EINVAL);
-                    }
-                    let pathname = args[0] as *const u8;
-                    let pathname =
-                        Self::get_pathname(pathname).map_err(|_| SystemError::EINVAL.into())?;
+                if path_ptr.is_null()
+                    || (frame.from_user()
+                        && verify_area(virt_path_ptr, PAGE_2M_SIZE as usize).is_err())
+                {
+                    return Err(SystemError::EINVAL);
+                }
 
-                    return Ok(pathname);
-                };
-
-                let pathname = security_check()?;
-                let pathname = pathname.as_str().trim();
-                Self::mkdir(pathname, mode)
+                let path = args[0] as *const u8;
+                Self::mkdir(path, mode)
             }
 
             SYS_NANOSLEEP => {
@@ -369,29 +334,22 @@ impl Syscall {
                 } else if path_ptr.is_null() {
                     Err(SystemError::EFAULT)
                 } else {
-                    let get_path = || {
-                        let pathname = args[1] as *const u8;
-                        let pathname =
-                            Self::get_pathname(pathname).map_err(|_| SystemError::EINVAL.into())?;
-                        return Ok(pathname);
-                    };
-                    let pathname = get_path()?;
-                    let pathname = pathname.as_str().trim();
+                    let path = args[1] as *const u8;
                     // kdebug!("sys unlinkat: dirfd: {}, pathname: {}", dirfd, pathname.as_ref().unwrap());
-                    Self::unlinkat(dirfd, pathname, flags)
+                    Self::unlinkat(dirfd, path, flags)
                 }
             }
 
             #[cfg(target_arch = "x86_64")]
             SYS_RMDIR => {
-                let pathname = args[0] as *const u8;
-                Self::rmdir(pathname)
+                let path = args[0] as *const u8;
+                Self::rmdir(path)
             }
 
             #[cfg(target_arch = "x86_64")]
             SYS_UNLINK => {
-                let pathname = args[0] as *const u8;
-                Self::unlink(pathname)
+                let path = args[0] as *const u8;
+                Self::unlink(path)
             }
             SYS_KILL => {
                 let pid = Pid::new(args[0]);
@@ -736,28 +694,22 @@ impl Syscall {
 
             #[cfg(target_arch = "x86_64")]
             SYS_LSTAT => {
-                let pathname = Self::get_pathname(args[0] as *const u8)
-                    .map_err(|_| SystemError::EINVAL.into())?;
-                let pathname = pathname.as_str().trim();
-
+                let path = args[0] as *const u8;
                 let kstat = args[1] as *mut PosixKstat;
                 let vaddr = VirtAddr::new(kstat as usize);
                 match verify_area(vaddr, core::mem::size_of::<PosixKstat>()) {
-                    Ok(_) => Self::lstat(pathname, kstat),
+                    Ok(_) => Self::lstat(path, kstat),
                     Err(e) => Err(e),
                 }
             }
 
             #[cfg(target_arch = "x86_64")]
             SYS_STAT => {
-                let pathname = Self::get_pathname(args[0] as *const u8)
-                    .map_err(|_| SystemError::EINVAL.into())?;
-                let pathname = pathname.as_str().trim();
-
+                let path = args[0] as *const u8;
                 let kstat = args[1] as *mut PosixKstat;
                 let vaddr = VirtAddr::new(kstat as usize);
                 match verify_area(vaddr, core::mem::size_of::<PosixKstat>()) {
-                    Ok(_) => Self::stat(pathname, kstat),
+                    Ok(_) => Self::stat(path, kstat),
                     Err(e) => Err(e),
                 }
             }
@@ -896,10 +848,10 @@ impl Syscall {
 
             SYS_READLINKAT => {
                 let dirfd = args[0] as i32;
-                let pathname = args[1] as *const u8;
+                let path = args[1] as *const u8;
                 let buf = args[2] as *mut u8;
                 let bufsiz = args[3];
-                Self::readlink_at(dirfd, pathname, buf, bufsiz)
+                Self::readlink_at(dirfd, path, buf, bufsiz)
             }
 
             SYS_PRLIMIT64 => {

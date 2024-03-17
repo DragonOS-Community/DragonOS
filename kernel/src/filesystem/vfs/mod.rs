@@ -299,6 +299,8 @@ pub trait IndexNode: Any + Sync + Send + Debug {
 
     /// @brief 对文件进行重命名操作
     ///
+    /// @param old_name 旧的名字
+    ///
     /// @param new_name 新的文件名
     ///
     /// @return 成功: Ok()

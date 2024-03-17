@@ -605,21 +605,13 @@ impl Syscall {
     //Syscall_rename
     pub fn do_renameat2(
         oldfd: i32,
-        filename_from: *const i8,
+        filename_from: *const u8,
         newfd: i32,
-        filename_to: *const i8,
+        filename_to: *const u8,
         _flags: u32,
     ) -> Result<usize, SystemError> {
-        let getname = |name: *const i8| {
-            let name: &CStr = unsafe { CStr::from_ptr(name) };
-            let name: &str = name.to_str().map_err(|_| SystemError::EINVAL)?;
-            if name.len() >= MAX_PATHLEN {
-                return Err(SystemError::ENAMETOOLONG);
-            }
-            return Ok(name.trim());
-        };
-        let filename_from = getname(filename_from).unwrap();
-        let filename_to = getname(filename_to).unwrap();
+        let filename_from = check_and_clone_cstr(filename_from, Some(MAX_PATHLEN)).unwrap();
+        let filename_to = check_and_clone_cstr(filename_to, Some(MAX_PATHLEN)).unwrap();
         // 文件名过长
         if filename_from.len() > MAX_PATHLEN as usize || filename_to.len() > MAX_PATHLEN as usize {
             return Err(SystemError::ENAMETOOLONG);
@@ -627,13 +619,15 @@ impl Syscall {
 
         //获取pcb，文件节点
         let pcb = ProcessManager::current_pcb();
-        let (_old_inode_begin, old_remain_path) = user_path_at(&pcb, oldfd, filename_from)?;
-        let (_new_inode_begin, new_remain_path) = user_path_at(&pcb, newfd, filename_to)?;
+        let (_old_inode_begin, old_remain_path) = user_path_at(&pcb, oldfd, &filename_from)?;
+        let (_new_inode_begin, new_remain_path) = user_path_at(&pcb, newfd, &filename_to)?;
         //获取父目录
         let (old_filename, old_parent_path) = rsplit_path(&old_remain_path);
-        let old_parent_inode = ROOT_INODE().lookup(old_parent_path.unwrap_or("/"))?;
+        let old_parent_inode = ROOT_INODE()
+            .lookup_follow_symlink(old_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
         let (new_filename, new_parent_path) = rsplit_path(&new_remain_path);
-        let new_parent_inode = ROOT_INODE().lookup(new_parent_path.unwrap_or("/"))?;
+        let new_parent_inode = ROOT_INODE()
+            .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
         old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename)?;
         return Ok(0);
     }

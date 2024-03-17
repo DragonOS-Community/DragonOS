@@ -368,7 +368,7 @@ impl IndexNode for KernFSInode {
     }
 
     fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), SystemError> {
-        //待实现
+        // 待实现
         Err(SystemError::ENOSYS)
     }
 }

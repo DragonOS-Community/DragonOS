@@ -1649,7 +1649,7 @@ impl IndexNode for LockedFATInode {
     ) -> Result<(), SystemError> {
         let old_id = self.metadata().unwrap().inode_id;
         let new_id = target.metadata().unwrap().inode_id;
-        //若在同一父目录下
+        // 若在同一父目录下
         if old_id == new_id {
             let mut guard = self.0.lock();
             let old_inode: Arc<LockedFATInode> = guard.find(old_name)?;
@@ -1659,7 +1659,7 @@ impl IndexNode for LockedFATInode {
             // 先从缓存删除
             let nod = guard.children.remove(&old_name.to_uppercase());
             // 若删除缓存中为管道的文件，则不需要再到磁盘删除
-            if let Some(_) = nod {
+            if nod.is_some() {
                 let file_type = old_inode_guard.metadata.file_type;
                 if file_type == FileType::Pipe {
                     return Ok(());
@@ -1693,7 +1693,7 @@ impl IndexNode for LockedFATInode {
             // 先从缓存删除
             let nod = old_guard.children.remove(&old_name.to_uppercase());
             // 若删除缓存中为管道的文件，则不需要再到磁盘删除
-            if let Some(_) = nod {
+            if nod.is_some() {
                 let file_type = old_inode_guard.metadata.file_type;
                 if file_type == FileType::Pipe {
                     return Ok(());

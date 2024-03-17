@@ -540,7 +540,7 @@ impl IndexNode for LockedRamFSInode {
         return self.0.lock().special_node.clone();
     }
 
-    //rename 方法用于重命名内存中的文件或目录。它会在文件系统内部的数据结构中修改相应的文件名字段。
+    /// # 用于重命名内存中的文件或目录
     fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), SystemError> {
         let old_inode: Arc<dyn IndexNode> = self.find(_old_name)?;
         // 在新的目录下创建一个硬链接

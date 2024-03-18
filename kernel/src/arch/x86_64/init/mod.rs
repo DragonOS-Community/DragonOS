@@ -51,9 +51,9 @@ unsafe extern "C" fn kernel_main(
     gdtp.base = gdt_vaddr.data() as *const usize;
     gdtp.limit = bsp_gdt_size as u16 - 1;
 
-    let idtp = DescriptorTablePointer::<usize> { 
-        base: idt_vaddr.data() as *const usize, 
-        limit: bsp_idt_size as u16 - 1
+    let idtp = DescriptorTablePointer::<usize> {
+        base: idt_vaddr.data() as *const usize,
+        limit: bsp_idt_size as u16 - 1,
     };
 
     x86::dtables::lgdt(&gdtp);

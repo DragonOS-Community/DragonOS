@@ -377,7 +377,8 @@ impl Syscall {
                 let pathname = args[1] as *const c_char;
                 let flags = args[2] as u32;
                 let virt_pathname = VirtAddr::new(pathname as usize);
-                if (frame.is_from_user() && verify_area(virt_pathname, PAGE_4K_SIZE as usize).is_err())
+                if (frame.is_from_user()
+                    && verify_area(virt_pathname, PAGE_4K_SIZE as usize).is_err())
                     || pathname.is_null()
                 {
                     Err(SystemError::EFAULT)
@@ -566,8 +567,11 @@ impl Syscall {
                 let msg = args[1] as *mut MsgHdr;
                 let flags = args[2] as u32;
 
-                let mut user_buffer_writer =
-                    UserBufferWriter::new(msg, core::mem::size_of::<MsgHdr>(), frame.is_from_user())?;
+                let mut user_buffer_writer = UserBufferWriter::new(
+                    msg,
+                    core::mem::size_of::<MsgHdr>(),
+                    frame.is_from_user(),
+                )?;
                 let buffer = user_buffer_writer.buffer::<MsgHdr>(0)?;
 
                 let msg = &mut buffer[0];

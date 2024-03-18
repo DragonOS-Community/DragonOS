@@ -206,10 +206,10 @@ impl VirtualConsoleData {
     }
 
     pub(super) fn init(&mut self, rows: Option<usize>, cols: Option<usize>, clear: bool) {
-        if rows.is_some() {
+        if let Some(..) = rows {
             self.rows = rows.unwrap();
         }
-        if cols.is_some() {
+        if let Some(..) = cols {
             self.cols = cols.unwrap();
         }
 
@@ -321,7 +321,7 @@ impl VirtualConsoleData {
         if self.utf && !self.display_ctrl {
             // utf模式并且不显示控制字符
             let (ret, rescan) = self.translate_unicode(*c);
-            if ret.is_some() {
+            if let Some(..) = ret {
                 *c = ret.unwrap();
             }
             return (ret, rescan);
@@ -425,7 +425,7 @@ impl VirtualConsoleData {
     /// 但是有一些特殊的代码点是无效的或者保留给特定用途的。
     /// 这个函数的主要目的是将无效的 Unicode 代码点替换为 U+FFFD，即 Unicode 替代字符。
     fn sanitize_unicode(c: u32) -> u32 {
-        if (c >= 0xd800 && c <= 0xdfff) || c == 0xfffe || c == 0xffff {
+        if (0xd800..=0xdfff).contains(&c) || c == 0xfffe || c == 0xffff {
             return 0xfffd;
         }
         return c;
@@ -523,7 +523,7 @@ impl VirtualConsoleData {
 
         let _ =
             self.driver_funcs()
-                .con_putc(&self, i as u16, self.state.y as u32, self.state.x as u32);
+                .con_putc(self, i as u16, self.state.y as u32, self.state.x as u32);
     }
 
     pub fn hide_cursor(&mut self) {
@@ -633,7 +633,7 @@ impl VirtualConsoleData {
 
     /// ## 换行
     fn line_feed(&mut self) {
-        if self.state.y + 1 == self.bottom{
+        if self.state.y + 1 == self.bottom {
             self.scroll(ScrollDir::Up, 1);
         } else if self.state.y < self.rows - 1 {
             self.state.y += 1;
@@ -659,7 +659,7 @@ impl VirtualConsoleData {
 
     /// ## 向上滚动虚拟终端的内容，或者将光标上移一行
     fn reverse_index(&mut self) {
-        if self.state.y == self.top{
+        if self.state.y == self.top {
             self.scroll(ScrollDir::Down, 1);
         } else if self.state.y > 0 {
             self.state.y -= 1;
@@ -744,7 +744,7 @@ impl VirtualConsoleData {
             return;
         }
 
-        if ('0'..='9').contains(&c) {
+        if c.is_ascii_digit() {
             self.par[self.npar as usize] *= 10;
             self.par[self.npar as usize] += (c as u8 - b'0') as u32;
             return;
@@ -1066,7 +1066,7 @@ impl VirtualConsoleData {
                     // 设置前景色
                     let (idx, color) = self.t416_color(i);
                     i = idx;
-                    if let Some(..) = color {
+                    if color.is_some() {
                         let color = color.unwrap();
                         let mut max = color.red.max(color.green);
                         max = max.max(color.blue);
@@ -1099,7 +1099,7 @@ impl VirtualConsoleData {
                     // 设置背景色
                     let (idx, color) = self.t416_color(i);
                     i = idx;
-                    if let Some(..) = color {
+                    if color.is_some() {
                         let color = color.unwrap();
                         self.state.color = (self.state.color & 0x0f)
                             | ((color.red as u8 & 0x80) >> 1)
@@ -1260,7 +1260,7 @@ impl VirtualConsoleData {
     #[inline(never)]
     pub(super) fn do_control(&mut self, ch: u32) {
         // 首先检查是否处于 ANSI 控制字符串状态
-        if self.vc_state.is_ansi_control_string() && ch >= 8 && ch <= 13 {
+        if self.vc_state.is_ansi_control_string() && (8..=13).contains(&ch) {
             return;
         }
 
@@ -1494,7 +1494,7 @@ impl VirtualConsoleData {
                 } else if c == 'R' {
                     self.reset_palette();
                     self.vc_state = VirtualConsoleState::ESnormal;
-                } else if ('0'..='9').contains(&c) {
+                } else if c.is_ascii_digit() {
                     self.vc_state = VirtualConsoleState::ESosc;
                 } else {
                     self.vc_state = VirtualConsoleState::ESnormal;
@@ -1713,7 +1713,7 @@ impl VirtualConsoleData {
             y += 1;
 
             let ret = self.driver_funcs().con_getxy(self, start);
-            if let Ok(..) = ret {
+            if ret.is_ok() {
                 start = ret.unwrap().0;
             } else {
                 return;

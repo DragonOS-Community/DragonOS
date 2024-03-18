@@ -80,7 +80,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
             return;
         }
         let mut dst1 = dst1.unwrap();
-        dst1 = dst1 + VirtAddr::new(bitstart as usize);
+        dst1 += VirtAddr::new(bitstart as usize);
 
         let _ = self.fb_sync();
 
@@ -102,8 +102,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                 && start_index == 0
                 && pitch_index == 0
                 && image.width & (32 / bit_per_pixel - 1) == 0
-                && bit_per_pixel >= 8
-                && bit_per_pixel <= 32
+                && (8..=32).contains(&bit_per_pixel)
             {
                 unsafe { self.fast_imageblit(image, dst1, fg, bg) }
             } else {
@@ -126,23 +125,16 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         let mut bgx = bg;
         let ppw = 32 / bpp;
         let spitch = (image.width + 7) / 8;
-        let tab: &[u32];
         let mut color_tab: [u32; 16] = [0; 16];
 
-        match bpp {
-            8 => {
-                tab = COLOR_TABLE_8;
-            }
-            16 => {
-                tab = COLOR_TABLE_16;
-            }
-            32 => {
-                tab = COLOR_TABLE_32;
-            }
+        let tab: &[u32] = match bpp {
+            8 => COLOR_TABLE_8,
+            16 => COLOR_TABLE_16,
+            32 => COLOR_TABLE_32,
             _ => {
                 return;
             }
-        }
+        };
 
         for _ in (0..(ppw - 1)).rev() {
             fgx <<= bpp;
@@ -175,7 +167,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                     while j >= 2 {
                         *dst = color_tab[(image.data[src] as usize >> 4) & bitmask];
                         dst = dst.add(1);
-                        *dst = color_tab[(image.data[src] as usize >> 0) & bitmask];
+                        *dst = color_tab[(image.data[src] as usize) & bitmask];
                         dst = dst.add(1);
                         j -= 2;
                         src += 1;
@@ -191,7 +183,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                         dst = dst.add(1);
                         *dst = color_tab[(image.data[src] as usize >> 2) & bitmask];
                         dst = dst.add(1);
-                        *dst = color_tab[(image.data[src] as usize >> 0) & bitmask];
+                        *dst = color_tab[(image.data[src] as usize) & bitmask];
                         dst = dst.add(1);
                         src += 1;
                         j -= 4;
@@ -215,7 +207,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                         dst = dst.add(1);
                         *dst = color_tab[(image.data[src] as usize >> 1) & bitmask];
                         dst = dst.add(1);
-                        *dst = color_tab[(image.data[src] as usize >> 0) & bitmask];
+                        *dst = color_tab[(image.data[src] as usize) & bitmask];
                         dst = dst.add(1);
                         src += 1;
                         j -= 8;

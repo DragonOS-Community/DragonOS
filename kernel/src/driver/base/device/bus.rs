@@ -191,7 +191,7 @@ impl dyn Bus {
         let subsys = self.subsystem();
         let guard = subsys.devices();
         for dev in guard.iter() {
-            if matcher.match_device(&dev, data) {
+            if matcher.match_device(dev, data) {
                 return Some(dev.clone());
             }
         }
@@ -221,7 +221,7 @@ impl dyn Bus {
         let subsys = self.subsystem();
         let guard = subsys.drivers();
         for drv in guard.iter() {
-            if matcher.match_driver(&drv, data) {
+            if matcher.match_driver(drv, data) {
                 return Some(drv.clone());
             }
         }
@@ -280,7 +280,7 @@ impl BusManager {
             )?;
             sysfs_instance().create_link(
                 Some(&dev_kobj),
-                &(&bus.subsystem().subsys().as_kobject()),
+                &bus.subsystem().subsys().as_kobject(),
                 "subsystem".to_string(),
             )?;
             bus.subsystem().add_device_to_vec(dev)?;

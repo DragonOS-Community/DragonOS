@@ -81,10 +81,10 @@ impl BlittingFbConsole {
                    其中颜色0映射为黑色，颜色1到6映射为白色，
                    颜色7到8映射为灰色，其他颜色映射为强烈的白色。
                 */
-                if color >= 1 && color <= 6 {
+                if (1..=6).contains(&color) {
                     // 白色
                     color = 2;
-                } else if color >= 7 && color <= 8 {
+                } else if (7..=8).contains(&color) {
                     // 灰色
                     color = 1;
                 } else {
@@ -147,8 +147,7 @@ impl BlittingFbConsole {
             // 设置image的data
 
             let src = &vc_data.font.data[font_offset..font_offset_end];
-            let mut dst = Vec::new();
-            dst.resize(src.len(), 0);
+            let mut dst = vec![0; src.len()];
             dst.copy_from_slice(src);
 
             if !attr.is_empty() {
@@ -671,7 +670,7 @@ impl FrameBufferConsole for BlittingFbConsole {
         let attr = FbConAttr::get_attr(c, fb_info.color_depth());
         let char_offset = (c as usize & charmask) * ((w * vc_data.font.height) as usize);
 
-        if fbcon_data.cursor_state.image.data != &vc_data.font.data[char_offset..]
+        if fbcon_data.cursor_state.image.data != vc_data.font.data[char_offset..]
             || fbcon_data.cursor_reset
         {
             fbcon_data.cursor_state.image.data = vc_data.font.data[char_offset..].to_vec();

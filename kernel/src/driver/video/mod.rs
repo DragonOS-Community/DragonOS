@@ -69,11 +69,7 @@ impl VideoRefreshManager {
         let res = self
             .running
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
-        if res.is_ok() {
-            return true;
-        } else {
-            return false;
-        }
+        return res.is_ok()
     }
 
     /**
@@ -276,7 +272,7 @@ impl TimerFunction for VideoRefreshExecutor {
         let refresh_target = refresh_target.unwrap();
 
         if let ScmBuffer::DeviceBuffer(vaddr) = manager.device_buffer().buf {
-            let p = vaddr.as_ptr() as *mut u8;
+            let p = vaddr.as_ptr()as *mut u8;
             let mut target_guard = None;
             for _ in 0..2 {
                 if let Ok(guard) = refresh_target.as_ref().unwrap().try_lock_irqsave() {

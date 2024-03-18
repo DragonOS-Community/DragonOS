@@ -533,7 +533,7 @@ impl FrameBufferOps for VesaFb {
                         }
                     }
                 } else {
-                    let mut tmp: Vec<u32> = Vec::with_capacity(size);
+                    let mut tmp: Vec<u32> = vec![0; size];
                     tmp.resize(size, 0);
                     let mut tmp_ptr = tmp.as_mut_ptr();
 

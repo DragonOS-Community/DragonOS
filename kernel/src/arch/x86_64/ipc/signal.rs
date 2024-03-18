@@ -363,11 +363,11 @@ impl SigContext {
         let pcb = ProcessManager::current_pcb();
         let mut archinfo_guard = pcb.arch_info_irqsave();
         self.oldmask = *mask;
-        self.frame = frame.clone();
+        self.frame = *frame;
         // context.trap_num = unsafe { (*current_thread).trap_num };
         // context.err_code = unsafe { (*current_thread).err_code };
         // context.cr2 = unsafe { (*current_thread).cr2 };
-        self.reserved_for_x87_state = archinfo_guard.fp_state().clone();
+        self.reserved_for_x87_state = *archinfo_guard.fp_state();
 
         // 保存完毕后，清空fp_state，以免下次save的时候，出现SIMD exception
         archinfo_guard.clear_fp_state();
@@ -385,12 +385,12 @@ impl SigContext {
     pub fn restore_sigcontext(&mut self, frame: &mut TrapFrame) -> bool {
         let guard = ProcessManager::current_pcb();
         let mut arch_info = guard.arch_info_irqsave();
-        (*frame) = self.frame.clone();
+        (*frame) = self.frame;
         // (*current_thread).trap_num = (*context).trap_num;
         *arch_info.cr2_mut() = self.cr2 as usize;
         // (*current_thread).err_code = (*context).err_code;
         // 如果当前进程有fpstate，则将其恢复到pcb的fp_state中
-        *arch_info.fp_state_mut() = self.reserved_for_x87_state.clone();
+        *arch_info.fp_state_mut() = self.reserved_for_x87_state;
         arch_info.restore_fp_state();
         return true;
     }
@@ -478,7 +478,7 @@ impl SignalArch for X86_64SignalArch {
             // 如果当前动作是忽略这个信号，就继续循环。
         }
 
-        let oldset = siginfo_mut_guard.sig_block().clone();
+        let oldset = *siginfo_mut_guard.sig_block();
         //避免死锁
         drop(siginfo_mut_guard);
         drop(sig_guard);
@@ -615,7 +615,7 @@ fn setup_frame(
             return Err(SystemError::EINVAL);
         }
     }
-    let frame: *mut SigFrame = get_stack(&trap_frame, size_of::<SigFrame>());
+    let frame: *mut SigFrame = get_stack(trap_frame, size_of::<SigFrame>());
     // kdebug!("frame=0x{:016x}", frame as usize);
     // 要求这个frame的地址位于用户空间，因此进行校验
     let r: Result<UserBufferWriter<'_>, SystemError> =
@@ -646,7 +646,7 @@ fn setup_frame(
     unsafe {
         (*frame)
             .context
-            .setup_sigcontext(oldset, &trap_frame)
+            .setup_sigcontext(oldset, trap_frame)
             .map_err(|e: SystemError| -> SystemError {
                 let r = Syscall::kill(ProcessManager::current_pcb().pid(), Signal::SIGSEGV as i32);
                 if r.is_err() {

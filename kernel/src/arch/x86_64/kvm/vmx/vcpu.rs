@@ -200,10 +200,10 @@ impl VmxVcpu {
         vmx_vmwrite(VmcsFields::GUEST_RFLAGS as u32, 2)?;
 
         vmx_vmwrite(VmcsFields::GUEST_GDTR_BASE as u32, 0)?;
-        vmx_vmwrite(VmcsFields::GUEST_GDTR_LIMIT as u32, 0x0000_FFFF as u64)?;
+        vmx_vmwrite(VmcsFields::GUEST_GDTR_LIMIT as u32, 0x0000_FFFF_u64)?;
 
         vmx_vmwrite(VmcsFields::GUEST_IDTR_BASE as u32, 0)?;
-        vmx_vmwrite(VmcsFields::GUEST_IDTR_LIMIT as u32, 0x0000_FFFF as u64)?;
+        vmx_vmwrite(VmcsFields::GUEST_IDTR_LIMIT as u32, 0x0000_FFFF_u64)?;
 
         vmx_vmwrite(VmcsFields::GUEST_ACTIVITY_STATE as u32, 0)?; // State = Active
         vmx_vmwrite(VmcsFields::GUEST_INTERRUPTIBILITY_STATE as u32, 0)?;
@@ -312,7 +312,7 @@ impl VmxVcpu {
         vmx_vmwrite(
             VmcsFields::HOST_TR_BASE as u32,
             get_segment_base(pseudo_descriptpr.base, pseudo_descriptpr.limit, unsafe {
-                x86::task::tr().bits().into()
+                x86::task::tr().bits()
             }),
         )?;
         vmx_vmwrite(

@@ -24,7 +24,7 @@ use crate::{
     arch::{cpu::cpu_reset, interrupt::TrapFrame, MMArch},
     driver::base::block::SeekFrom,
     filesystem::vfs::{
-        fcntl::FcntlCommand,
+        fcntl::{AtFlags, FcntlCommand},
         file::FileMode,
         syscall::{ModeType, PosixKstat, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
         MAX_PATHLEN,
@@ -105,6 +105,35 @@ impl Syscall {
                     Self::open(path, open_flags, mode, true)
                 };
                 res
+            }
+
+            SYS_RENAME => {
+                let oldname: *const u8 = args[0] as *const u8;
+                let newname: *const u8 = args[1] as *const u8;
+                Self::do_renameat2(
+                    AtFlags::AT_FDCWD.bits(),
+                    oldname,
+                    AtFlags::AT_FDCWD.bits(),
+                    newname,
+                    0,
+                )
+            }
+
+            SYS_RENAMEAT => {
+                let oldfd = args[0] as i32;
+                let oldname: *const u8 = args[1] as *const u8;
+                let newfd = args[2] as i32;
+                let newname: *const u8 = args[3] as *const u8;
+                Self::do_renameat2(oldfd, oldname, newfd, newname, 0)
+            }
+
+            SYS_RENAMEAT2 => {
+                let oldfd = args[0] as i32;
+                let oldname: *const u8 = args[1] as *const u8;
+                let newfd = args[2] as i32;
+                let newname: *const u8 = args[3] as *const u8;
+                let flags = args[4] as u32;
+                Self::do_renameat2(oldfd, oldname, newfd, newname, flags)
             }
 
             SYS_OPENAT => {
@@ -1028,6 +1057,17 @@ impl Syscall {
                     core::ptr::null::<RLimit64>(),
                     rlimit,
                 )
+            }
+
+            SYS_FADVISE64 => {
+                // todo: 这个系统调用还没有实现
+
+                Err(SystemError::ENOSYS)
+            }
+            SYS_NEWFSTATAT => {
+                // todo: 这个系统调用还没有实现
+
+                Err(SystemError::ENOSYS)
             }
 
             SYS_SCHED_YIELD => Self::sched_yield(),

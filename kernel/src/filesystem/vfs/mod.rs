@@ -15,7 +15,7 @@ use system_error::SystemError;
 use crate::{
     driver::base::{
         block::block_device::BlockDevice, char::CharDevice, device::device_number::DeviceNumber,
-    }, ipc::pipe::LockedPipeInode, libs::casting::DowncastArc, time::TimeSpec
+    }, filesystem::vfs::mount::MOUNTS_LIST, ipc::pipe::LockedPipeInode, libs::casting::DowncastArc, time::TimeSpec
 };
 
 use self::{cache::DefaultCache, core::generate_inode_id, file::FileMode, syscall::ModeType, utils::{clean_path, is_absolute, rsplit_path}};
@@ -404,12 +404,6 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         return self.find("..");
     }
 
-    // to remove
-    /// @brief 返回查询缓存
-    fn cache(&self) -> Result<Arc<DefaultCache>, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    }
-
     fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         return self.find(".");
     }
@@ -450,39 +444,43 @@ impl dyn IndexNode {
         path: &str,
         max_follow_times: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        // non cache lookup
-        // kdebug!("My self is {:?}", self.fs().as_any_ref().downcast_ref::<LockedEntry>());
-        // kdebug!("When I call a list, i call {:?}", self.list());
-        // kdebug!("Looking path at {}", path);
-        // kdebug!("Current dir has children {:?}", self.list());
-        let get = self.cache();
-        if get.is_err() {
-            kdebug!("No Cache to use");
-            return self._lookup_follow_symlink(path, max_follow_times);
-        }
-        let head_path = self._abs_path();
-        if head_path.is_err() { 
-            kwarn!("Illegal parent search: {:?}, deprecated to non cache searching", head_path);
-            return self.lookup_follow_symlink(path, max_follow_times);
-        }
-        kdebug!("Cache Founded.");
-        let current = head_path.unwrap();
-        // cache lookup
-        let abs_path: String = if is_absolute(path) {
+        // 拼接绝对路径
+        let abs_path = if is_absolute(path) {
             clean_path(path)
         } else {
-            current.clone() + &clean_path(path)
+            self._abs_path()? + &clean_path(path)
         };
-        kdebug!("Cache Search path {}", abs_path);
-        if let Some((inode, l_rest)) = self.quick_lookup(get.unwrap(), &abs_path, &current) {
-            let r_rest = abs_path.strip_prefix(l_rest);
-            kdebug!("Cache Rest path {:?}", r_rest);
-            if r_rest.is_none() {
-                return Ok(inode);
+
+        // 检查根目录缓存
+        if let Some((rpath, root))
+            = MOUNTS_LIST().lock().iter().filter_map(|(key, value)| {
+                let strkey = key.as_ref();
+                return if abs_path.starts_with(&strkey) {
+                    Some((strkey, value))
+                } else {
+                    None
+                }
+            }).next()
+        {
+            if let Ok(fscache) = root.cache() {
+                if let Some((inode, l_rest)) = self.quick_lookup(fscache, &abs_path, rpath) {
+                    let r_rest = abs_path.strip_prefix(l_rest);
+                    kdebug!("Cache Rest path {:?}", r_rest);
+                    if r_rest.is_none() {
+                        return Ok(inode);
+                    }
+                    return inode._lookup_follow_symlink2(
+                            &abs_path.strip_prefix(&rpath.to_string()).unwrap(), 
+                            max_follow_times
+                    );
+                }
+                return root.root_inode()._lookup_follow_symlink2(&abs_path.strip_prefix(&rpath.to_string()).unwrap(), max_follow_times);
             }
-            return inode._lookup_follow_symlink2(r_rest.unwrap(), max_follow_times);
         }
-        return self._lookup_follow_symlink2(path, max_follow_times);
+        // Except Normal lookup
+        return self._lookup_follow_symlink(path, max_follow_times);
+
+        
     }
 
     fn _lookup_follow_symlink(
@@ -608,7 +606,11 @@ impl dyn IndexNode {
             }
 
             let inode = result.find(&name)?;
-            cache.put(&inode.key()?, Arc::downgrade(&inode));
+            // 处理文件系统挂载缓存问题
+            if let Ok(cache1) = inode.cache() {
+                kdebug!("Adding Line {:?}", inode.key());
+                cache1.put(&inode.key()?, Arc::downgrade(&inode));
+            }
 
             // 处理符号链接的问题
             if inode.metadata()?.file_type == FileType::SymLink && max_follow_times > 0 {
@@ -673,10 +675,7 @@ impl dyn IndexNode {
             match tmp {
                 Err(e) => {
                     match e {
-                        SystemError::ENOENT => {
-                            kdebug!("Break because no parent.");
-                            break; 
-                        }
+                        SystemError::ENOENT => { break; }
                         e => { return Err(e); }
                     }
                 }
@@ -686,9 +685,9 @@ impl dyn IndexNode {
         }
         path_stack.pop();
         path_stack.reverse();
-        kdebug!("Item in path_stack are{:?}", path_stack);
+        // kdebug!("Item in path_stack are{:?}", path_stack);
         let ret = "/".to_string() + &path_stack.join("/");
-        kdebug!("Abs path of {:?} is {:?}", self.key(), ret);
+        // kdebug!("Abs path of {:?} is {:?}", self.key(), ret);
         return Ok(ret);
     }
 
@@ -778,6 +777,10 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;
 
+    fn cache(&self) -> Result<Arc<DefaultCache>, SystemError> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
 }
 
 impl DowncastArc for dyn FileSystem {

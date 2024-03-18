@@ -13,15 +13,65 @@ use system_error::SystemError;
 use crate::{driver::base::device::device_number::DeviceNumber, libs::spinlock::SpinLock};
 
 use super::{
-    file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId, ROOT_INODE
+    file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId
 };
 
-static mut __MOUNTS_LIST: Option<Arc<SpinLock<BTreeMap<String, Arc<dyn FileSystem>>>>> = None;
+static mut __MOUNTS_LIST: Option<Arc<SpinLock<BTreeMap<MountPath, Arc<dyn FileSystem>>>>> = None;
+
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct MountPath {
+    path: String,
+    depth: usize,
+}
+
+// impl MountPath {
+//     pub fn new(path: &str) -> Self {
+//         let depth = path.chars().filter(|&c| c == '/').count();
+//         Self { path: String::from(path), depth }
+//     }
+// }
+
+impl From<&str> for MountPath {
+    fn from(value: &str) -> Self {
+        let depth = value.chars().filter(|&c| c == '/').count();
+        Self { path: String::from(value), depth }
+    }
+}
+
+impl ToString for MountPath {
+    fn to_string(&self) -> String {
+        self.path.clone()
+    }
+}
+
+impl AsRef<str> for MountPath {
+    fn as_ref(&self) -> &str {
+        &self.path
+    }
+}
+
+impl PartialOrd for MountPath {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        if self.depth == other.depth {
+            Some(self.path.cmp(&other.path))
+        } else {
+            self.depth.partial_cmp(&other.depth).map(|ret| ret.reverse() )
+        }
+    }
+}
+
+impl Ord for MountPath {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.partial_cmp(other).unwrap()
+    }
+}
+
 
 /// 返回MOUNT LIST
 #[inline(always)]
 #[allow(non_snake_case)]
-pub fn MOUNTS_LIST() -> Arc<SpinLock<BTreeMap<String, Arc<dyn FileSystem>>>> {
+pub fn MOUNTS_LIST() -> Arc<SpinLock<BTreeMap<MountPath, Arc<dyn FileSystem>>>> {
     unsafe {
         if __MOUNTS_LIST.is_none() {
             __MOUNTS_LIST = Some(Arc::new(SpinLock::new(BTreeMap::new())));
@@ -236,6 +286,7 @@ impl IndexNode for MountFSInode {
         file_type: FileType,
         mode: ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        kdebug!("Creating: {:?}", self.inner_inode);
         return Ok(MountFSInode {
             inner_inode: self.inner_inode.create(name, file_type, mode)?,
             mount_fs: self.mount_fs.clone(),
@@ -370,14 +421,7 @@ impl IndexNode for MountFSInode {
             .mountpoints
             .lock()
             .insert(metadata.inode_id, new_mount_fs.clone());
-        if self.metadata()?.inode_id == ROOT_INODE().metadata()?.inode_id {
-            MOUNTS_LIST().lock().insert(String::from("/"), new_mount_fs.clone());
-        } else {
-            MOUNTS_LIST().lock().insert(self.self_ref()?._abs_path()?, new_mount_fs.clone());
-        }
-        kdebug!("fs to mount is {:?}", new_mount_fs);
-        kdebug!("Parent with children {:?}, {:?}" , self.parent()?.list(), self.parent()?.metadata()?.inode_id);
-        kdebug!("ROOT with children {:?}, {:?}", ROOT_INODE().list(), ROOT_INODE().metadata()?.inode_id);
+        MOUNTS_LIST().lock().insert(MountPath::from(self.self_ref()?._abs_path()?.as_str()), new_mount_fs.clone());
         return Ok(new_mount_fs);
     }
 
@@ -406,6 +450,7 @@ impl IndexNode for MountFSInode {
         self.inner_inode.poll(private_data)
     }
 
+    #[inline]
     fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         Ok(self.self_ref.upgrade().ok_or(SystemError::ENOENT)?)
     }

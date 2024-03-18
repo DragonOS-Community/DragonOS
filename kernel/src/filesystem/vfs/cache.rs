@@ -44,10 +44,14 @@ struct HashTable<H: Hasher + Default> {
 
 impl<H: Hasher + Default> HashTable<H> {
     fn new(size: usize) -> Self {
-        Self {
+        let mut new = Self {
             _hash_type: PhantomData::default(),
             table: Vec::with_capacity(size)
+        };
+        for _ in 0..size {
+            new.table.push(RwLock::new(VecDeque::new()));
         }
+        new
     }
     /// 下标帮助函数
     fn _position(&self, key: &str) -> usize {
@@ -149,11 +153,18 @@ impl<H: Hasher + Default> DefaultCache<H> {
 
     /// 缓存目录项
     pub fn put(&self, key: &str, src: Resource) {
-        kdebug!("Cache with key {}.", key);
-        self.table.put(key, self.deque.lock().push(src));
-        self.size.fetch_add(1, Ordering::Acquire);
-        if self.size.load(Ordering::Acquire) >= self.max_size.load(Ordering::Acquire) {
-            self.clean();
+        match key {
+            "" => { return; }
+            "." => { return; }
+            ".." => { return; }
+            key => {
+                kdebug!("Cache with key {}.", key);
+                self.table.put(key, self.deque.lock().push(src));
+                self.size.fetch_add(1, Ordering::Acquire);
+                if self.size.load(Ordering::Acquire) >= self.max_size.load(Ordering::Acquire) {
+                    self.clean();
+                }
+            }
         }
     }
 

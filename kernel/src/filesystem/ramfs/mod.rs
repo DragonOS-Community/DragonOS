@@ -81,6 +81,10 @@ impl FileSystem for RamFS {
     fn as_any_ref(&self) -> &dyn Any {
         self
     }
+
+    fn cache(&self) -> Result<DefaultCache, SystemError> {
+        Ok(self.cache.clone())
+    }
 }
 
 #[derive(Debug)]
@@ -462,6 +466,7 @@ impl IndexNode for LockedEntry {
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> 
     {
+        kdebug!("Call Ramfs create.");
         // 获取当前inode
         let mut entry = self.0.lock();
 {
@@ -769,11 +774,6 @@ impl IndexNode for LockedEntry {
             Some(pptr) => Ok(pptr.clone()),
             None => Err(SystemError::ENOENT),
         }
-    }
-
-    fn cache(&self) -> Result<Arc<DefaultCache>, SystemError> {
-        kdebug!("call ramfs cache");
-        Ok(self.0.lock().fs.upgrade().unwrap().cache.clone())
     }
 
     fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {

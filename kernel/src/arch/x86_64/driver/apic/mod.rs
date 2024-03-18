@@ -454,9 +454,9 @@ impl CurrentApic {
     }
 
     pub(self) unsafe fn write_xapic_register(&self, reg: XApicOffset, value: u32) {
-        current_xapic_instance().borrow_mut().as_mut().map(|xapic| {
-            xapic.write(reg, value);
-        });
+        if let Some(xapic) = current_xapic_instance().borrow_mut().as_mut() { 
+            xapic.write(reg, value); 
+        }
     }
 
     /// 屏蔽类8259A芯片
@@ -525,9 +525,9 @@ impl LocalAPIC for CurrentApic {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             X2Apic.send_eoi();
         } else {
-            current_xapic_instance().borrow().as_ref().map(|xapic| {
+            if let Some(xapic) = current_xapic_instance().borrow().as_ref() {
                 xapic.send_eoi();
-            });
+            }
         }
     }
 
@@ -583,9 +583,9 @@ impl LocalAPIC for CurrentApic {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             X2Apic.set_lvt(lvt);
         } else {
-            current_xapic_instance().borrow_mut().as_mut().map(|xapic| {
+            if let Some(xapic) = current_xapic_instance().borrow_mut().as_mut() {
                 xapic.set_lvt(lvt);
-            });
+            }
         }
     }
 
@@ -605,9 +605,9 @@ impl LocalAPIC for CurrentApic {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             X2Apic.mask_all_lvt();
         } else {
-            current_xapic_instance().borrow_mut().as_mut().map(|xapic| {
+            if let Some(xapic) = current_xapic_instance().borrow_mut().as_mut() {
                 xapic.mask_all_lvt();
-            });
+            }
         }
     }
 
@@ -615,9 +615,9 @@ impl LocalAPIC for CurrentApic {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             X2Apic.write_icr(icr);
         } else {
-            current_xapic_instance().borrow().as_ref().map(|xapic| {
+            if let Some(xapic) = current_xapic_instance().borrow().as_ref() {
                 xapic.write_icr(icr);
-            });
+            }
         }
     }
 }

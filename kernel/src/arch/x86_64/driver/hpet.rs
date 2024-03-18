@@ -115,7 +115,7 @@ impl Hpet {
         let freq = regs.frequency();
         kdebug!("HPET frequency: {} Hz", freq);
         let ticks = Self::HPET0_INTERVAL_USEC * freq / 1000000;
-        if ticks <= 0 || ticks > freq * 8 {
+        if ticks == 0 || ticks > freq * 8 {
             kerror!("HPET enable: ticks '{ticks}' is invalid");
             return Err(SystemError::EINVAL);
         }

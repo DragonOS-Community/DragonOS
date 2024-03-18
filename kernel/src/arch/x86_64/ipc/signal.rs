@@ -425,7 +425,7 @@ impl SignalArch for X86_64SignalArch {
         let siginfo_read_guard = siginfo.unwrap();
 
         // 检查sigpending是否为0
-        if siginfo_read_guard.sig_pending().signal().bits() == 0 || !frame.from_user() {
+        if siginfo_read_guard.sig_pending().signal().bits() == 0 || !frame.is_from_user() {
             // 若没有正在等待处理的信号，或者将要返回到的是内核态，则返回
             return;
         }

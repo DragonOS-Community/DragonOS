@@ -1070,12 +1070,6 @@ impl Syscall {
                 Err(SystemError::ENOSYS)
             }
 
-            SYS_RMDIR => {
-                // todo: 这个系统调用还没有实现
-                //需要实现才可正常运行rmdir
-                Err(SystemError::ENOSYS)
-            }
-
             SYS_SCHED_YIELD => Self::sched_yield(),
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),

@@ -187,7 +187,7 @@ impl VirtualConsoleData {
             autowrap: Default::default(),
             cursor_visible: Default::default(),
             insert_mode: Default::default(),
-            private: Vt102_OP::EPecma,
+            private: Vt102_OP::Pecma,
             need_wrap: Default::default(),
             report_mouse: Default::default(),
             utf: Default::default(),
@@ -684,7 +684,7 @@ impl VirtualConsoleData {
     /// ## 设置当前vt的各项属性
     fn set_mode(&mut self, on_off: bool) {
         for i in 0..self.npar as usize {
-            if self.private == Vt102_OP::EPdec {
+            if self.private == Vt102_OP::Pdec {
                 match self.par[i] {
                     1 => {
                         todo!("kbd todo");
@@ -759,19 +759,19 @@ impl VirtualConsoleData {
 
         match c {
             'h' => {
-                if self.private <= Vt102_OP::EPdec {
+                if self.private <= Vt102_OP::Pdec {
                     self.set_mode(true);
                 }
                 return;
             }
             'l' => {
-                if self.private <= Vt102_OP::EPdec {
+                if self.private <= Vt102_OP::Pdec {
                     self.set_mode(false);
                 }
                 return;
             }
             'c' => {
-                if self.private == Vt102_OP::EPdec {
+                if self.private == Vt102_OP::Pdec {
                     if self.par[0] != 0 {
                         self.cursor_type =
                             VcCursor::make_cursor(self.par[0], self.par[1], self.par[2])
@@ -782,7 +782,7 @@ impl VirtualConsoleData {
                 }
             }
             'm' => {
-                if self.private == Vt102_OP::EPdec {
+                if self.private == Vt102_OP::Pdec {
                     if self.par[0] != 0 {
                         self.complement_mask = (self.par[0] << 8 | self.par[1]) as u16;
                     } else {
@@ -792,7 +792,7 @@ impl VirtualConsoleData {
                 }
             }
             'n' => {
-                if self.private == Vt102_OP::EPecma {
+                if self.private == Vt102_OP::Pecma {
                     if self.par[0] == 5 {
                         send_to_default_serial8250_port("tty status report todo".as_bytes());
                         panic!();
@@ -806,8 +806,8 @@ impl VirtualConsoleData {
             _ => {}
         }
 
-        if self.private != Vt102_OP::EPecma {
-            self.private = Vt102_OP::EPecma;
+        if self.private != Vt102_OP::Pecma {
+            self.private = Vt102_OP::Pecma;
             return;
         }
 
@@ -992,12 +992,12 @@ impl VirtualConsoleData {
 
                 1 => {
                     // 设置粗体
-                    self.state.intensity = VirtualConsoleIntensity::VciBold;
+                    self.state.intensity = VirtualConsoleIntensity::Bold;
                 }
 
                 2 => {
                     // 设置半亮度（半明显
-                    self.state.intensity = VirtualConsoleIntensity::VciHalfBright;
+                    self.state.intensity = VirtualConsoleIntensity::HalfBright;
                 }
 
                 3 => {
@@ -1039,7 +1039,7 @@ impl VirtualConsoleData {
 
                 22 => {
                     //  关闭粗体和半亮度，恢复正常亮度
-                    self.state.intensity = VirtualConsoleIntensity::VciNormal;
+                    self.state.intensity = VirtualConsoleIntensity::Normal;
                 }
 
                 23 => {
@@ -1084,11 +1084,11 @@ impl VirtualConsoleData {
 
                         if hue == 7 && max <= 0x55 {
                             hue = 0;
-                            self.state.intensity = VirtualConsoleIntensity::VciBold;
+                            self.state.intensity = VirtualConsoleIntensity::Bold;
                         } else if max > 0xaa {
-                            self.state.intensity = VirtualConsoleIntensity::VciBold;
+                            self.state.intensity = VirtualConsoleIntensity::Bold;
                         } else {
-                            self.state.intensity = VirtualConsoleIntensity::VciNormal;
+                            self.state.intensity = VirtualConsoleIntensity::Normal;
                         }
 
                         self.state.color = (self.state.color & 0xf0) | hue;
@@ -1121,7 +1121,7 @@ impl VirtualConsoleData {
                 _ => {
                     if self.par[i] >= 90 && self.par[i] <= 107 {
                         if self.par[i] < 100 {
-                            self.state.intensity = VirtualConsoleIntensity::VciBold;
+                            self.state.intensity = VirtualConsoleIntensity::Bold;
                         }
                         self.par[i] -= 60;
                     }
@@ -1414,25 +1414,25 @@ impl VirtualConsoleData {
 
                 match c {
                     '?' => {
-                        self.private = Vt102_OP::EPdec;
+                        self.private = Vt102_OP::Pdec;
                         return;
                     }
                     '>' => {
-                        self.private = Vt102_OP::EPgt;
+                        self.private = Vt102_OP::Pgt;
                         return;
                     }
                     '=' => {
-                        self.private = Vt102_OP::EPeq;
+                        self.private = Vt102_OP::Peq;
                         return;
                     }
                     '<' => {
-                        self.private = Vt102_OP::EPlt;
+                        self.private = Vt102_OP::Plt;
                         return;
                     }
                     _ => {}
                 }
 
-                self.private = Vt102_OP::EPecma;
+                self.private = Vt102_OP::Pecma;
                 self.do_getpars(c);
             }
             VirtualConsoleState::ESgetpars => {
@@ -1732,7 +1732,7 @@ impl VirtualConsoleData {
         } else if ch < 0x20 {
             // 不可打印
             return -1;
-        } else if ch == 0xfeff || (ch >= 0x200b && ch <= 0x200f) {
+        } else if ch == 0xfeff || (0x200b..=0x200f).contains(&ch) {
             // 零长空格
             return -2;
         } else if (ch & !Self::UNI_DIRECT_MAKS) == Self::UNI_DIRECT_BASE {
@@ -1765,7 +1765,7 @@ impl VirtualConsoleData {
             &self.screen_buf[draw.offset..draw.offset + draw.size],
             draw.size,
             self.state.y as u32,
-            draw.x.unwrap() as u32,
+            draw.x.unwrap(),
         );
 
         draw.x = None;
@@ -1785,8 +1785,8 @@ impl VirtualConsoleData {
             .driver_funcs()
             .con_build_attr(self, color, intensity, blink, underline, reverse, italic);
 
-        if ret.is_ok() {
-            return ret.unwrap();
+        if let Ok(ret) = ret {
+            return ret;
         }
 
         let mut ret = color;
@@ -1803,7 +1803,7 @@ impl VirtualConsoleData {
             ret = (ret & 0xf0) | self.italic_color as u8;
         } else if underline {
             ret = (ret & 0xf0) | self.underline_color as u8;
-        } else if intensity == VirtualConsoleIntensity::VciHalfBright {
+        } else if intensity == VirtualConsoleIntensity::HalfBright {
             ret = (ret & 0xf0) | self.half_color as u8;
         }
 
@@ -1815,7 +1815,7 @@ impl VirtualConsoleData {
             ret ^= 0x80;
         }
 
-        if intensity == VirtualConsoleIntensity::VciBold {
+        if intensity == VirtualConsoleIntensity::Bold {
             ret ^= 0x08;
         }
 
@@ -1839,7 +1839,7 @@ impl VirtualConsoleData {
         self.erase_char = ' ' as u16
             | ((self.build_attr(
                 self.state.color,
-                VirtualConsoleIntensity::VciNormal,
+                VirtualConsoleIntensity::Normal,
                 self.state.blink,
                 false,
                 self.screen_mode,
@@ -1849,7 +1849,7 @@ impl VirtualConsoleData {
     }
 
     fn default_attr(&mut self) {
-        self.state.intensity = VirtualConsoleIntensity::VciNormal;
+        self.state.intensity = VirtualConsoleIntensity::Normal;
         self.state.italic = false;
         self.state.underline = false;
         self.state.reverse = false;
@@ -1897,16 +1897,16 @@ impl VirtualConsoleInfo {
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub enum VirtualConsoleIntensity {
     /// 暗淡
-    VciHalfBright = 0,
+    HalfBright = 0,
     /// 正常
-    VciNormal = 1,
+    Normal = 1,
     /// 粗体
-    VciBold = 2,
+    Bold = 2,
 }
 
 impl Default for VirtualConsoleIntensity {
     fn default() -> Self {
-        Self::VciNormal
+        Self::Normal
     }
 }
 
@@ -1966,11 +1966,11 @@ impl VirtualConsoleState {
 #[derive(Debug, Clone, PartialEq, PartialOrd)]
 #[allow(non_camel_case_types)]
 pub enum Vt102_OP {
-    EPecma,
-    EPdec,
-    EPeq,
-    EPgt,
-    EPlt,
+    Pecma,
+    Pdec,
+    Peq,
+    Pgt,
+    Plt,
 }
 
 bitflags! {

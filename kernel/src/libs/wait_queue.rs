@@ -77,7 +77,7 @@ impl WaitQueue {
     pub unsafe fn sleep_without_schedule(&self) {
         before_sleep_check(1);
         // 安全检查：确保当前处于中断禁止状态
-        assert!(CurrentIrqArch::is_irq_enabled() == false);
+        assert!(!CurrentIrqArch::is_irq_enabled());
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
             panic!("sleep error: {:?}", e);
@@ -89,7 +89,7 @@ impl WaitQueue {
     pub unsafe fn sleep_without_schedule_uninterruptible(&self) {
         before_sleep_check(0);
         // 安全检查：确保当前处于中断禁止状态
-        assert!(CurrentIrqArch::is_irq_enabled() == false);
+        assert!(!CurrentIrqArch::is_irq_enabled());
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         ProcessManager::mark_sleep(false).unwrap_or_else(|e| {
             panic!("sleep error: {:?}", e);

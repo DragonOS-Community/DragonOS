@@ -263,12 +263,11 @@ pub trait BlockDevice: Device {
                     return Err(SystemError::E2BIG);
                 }
 
-                let mut temp = Vec::new();
-                temp.resize(1usize << self.blk_size_log2(), 0);
+                let mut temp = vec![0; 1usize << self.blk_size_log2()];
                 // 由于块设备每次读写都是整块的，在不完整写入之前，必须把不完整的地方补全
                 self.read_at(range.lba_start, 1, &mut temp[..])?;
                 // 把数据从临时buffer复制到目标buffer
-                temp[range.begin..range.end].copy_from_slice(&buf_slice);
+                temp[range.begin..range.end].copy_from_slice(buf_slice);
                 self.write_at(range.lba_start, 1, &temp[..])?;
             }
         }
@@ -307,8 +306,7 @@ pub trait BlockDevice: Device {
                     return Err(SystemError::E2BIG);
                 }
 
-                let mut temp = Vec::new();
-                temp.resize(1usize << self.blk_size_log2(), 0);
+                let mut temp = vec![0; 1usize << self.blk_size_log2()];
                 self.read_at(range.lba_start, 1, &mut temp[..])?;
 
                 // 把数据从临时buffer复制到目标buffer
@@ -333,7 +331,7 @@ impl BlockDeviceOps {
     /// @return: 返回下标
     #[allow(dead_code)]
     fn major_to_index(major: Major) -> usize {
-        return (major.data() % DEV_MAJOR_HASH_SIZE as u32) as usize;
+        return (major.data() % DEV_MAJOR_HASH_SIZE) as usize;
     }
 
     /// @brief: 动态获取主设备号
@@ -358,7 +356,7 @@ impl BlockDeviceOps {
             {
                 let mut flag = true;
                 for item in blockdevss {
-                    if item.device_number().major() == Major::new(index as u32) {
+                    if item.device_number().major() == Major::new(index) {
                         flag = false;
                         break;
                     }

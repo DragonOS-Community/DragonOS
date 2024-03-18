@@ -4,11 +4,11 @@ use core::{
 };
 
 
-use alloc::rc::Weak;
+use alloc::{rc::Weak, sync::Arc, vec::Vec};
 
 use crate::{
     filesystem::vfs::{FileSystem, IndexNode, Metadata},
-    libs::spinlock::SpinLock,
+    libs::{rwlock::RwLock, spinlock::SpinLock},
 };
 
 use super::fs::EXT2_SB_INFO;
@@ -150,10 +150,15 @@ impl LockedExt2Inode {
         return (inode * inode_size) / block_size;
     }
 }
+pub struct DataBlock {
+    data: [u8; 4 * 1024],
+}
+pub struct LockedDataBlock(RwLock<DataBlock>);
 
 pub struct Indirect{
     pub self_ref:Weak<Indirect>,
-    // pub block:Arc<
+    pub next_point:Option<Vec<Arc<Indirect>>>,
+    pub data_block:Option<Arc<DataBlock>>,
 }
 #[derive(Debug)]
 pub struct LockedExt2InodeInfo(SpinLock<Ext2InodeInfo>);

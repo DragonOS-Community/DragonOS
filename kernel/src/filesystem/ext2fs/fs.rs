@@ -410,7 +410,3 @@ impl Ex2SuperBlock {
     }
 }
 
-pub struct DataBlock {
-    data: [u8; 4 * 1024],
-}
-pub struct LockedDataBlock(RwLock<DataBlock>);

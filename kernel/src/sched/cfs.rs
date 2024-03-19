@@ -14,7 +14,7 @@ use crate::{
     process::{
         ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSchedulerInfo, ProcessState,
     },
-    smp::core::smp_get_processor_id,
+    smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 
 use super::{
@@ -57,7 +57,7 @@ impl CFSQueue {
         CFSQueue {
             cpu_exec_proc_jiffies: 0,
             locked_queue: SpinLock::new(RBTree::new()),
-            idle_pcb: idle_pcb,
+            idle_pcb,
         }
     }
 
@@ -100,6 +100,7 @@ impl CFSQueue {
         }
     }
     /// 获取运行队列的长度
+    #[allow(dead_code)]
     pub fn get_cfs_queue_size(
         queue: &SpinLockGuard<RBTree<i64, Arc<ProcessControlBlock>>>,
     ) -> usize {
@@ -150,7 +151,8 @@ impl SchedulerCFS {
 
     /// @brief 时钟中断到来时，由sched的core模块中的函数，调用本函数，更新CFS进程的可执行时间
     pub fn timer_update_jiffies(&mut self, sched_info: &ProcessSchedulerInfo) {
-        let current_cpu_queue: &mut CFSQueue = self.cpu_queue[smp_get_processor_id() as usize];
+        let current_cpu_queue: &mut CFSQueue =
+            self.cpu_queue[smp_get_processor_id().data() as usize];
         // todo: 引入调度周期以及所有进程的优先权进行计算，然后设置进程的可执行时间
 
         let mut queue = None;
@@ -180,7 +182,7 @@ impl SchedulerCFS {
 
     /// @brief 将进程加入cpu的cfs调度队列，并且重设其虚拟运行时间为当前队列的最小值
     pub fn enqueue_reset_vruntime(&mut self, pcb: Arc<ProcessControlBlock>) {
-        let cpu_queue = &mut self.cpu_queue[pcb.sched_info().on_cpu().unwrap() as usize];
+        let cpu_queue = &mut self.cpu_queue[pcb.sched_info().on_cpu().unwrap().data() as usize];
         let queue = cpu_queue.locked_queue.lock_irqsave();
         if queue.len() > 0 {
             pcb.sched_info()
@@ -197,8 +199,10 @@ impl SchedulerCFS {
         self.cpu_queue[cpu_id].idle_pcb = pcb;
     }
     /// 获取某个cpu的运行队列中的进程数
-    pub fn get_cfs_queue_len(&mut self, cpu_id: u32) -> usize {
-        let queue = self.cpu_queue[cpu_id as usize].locked_queue.lock_irqsave();
+    pub fn get_cfs_queue_len(&mut self, cpu_id: ProcessorId) -> usize {
+        let queue = self.cpu_queue[cpu_id.data() as usize]
+            .locked_queue
+            .lock_irqsave();
         return CFSQueue::get_cfs_queue_size(&queue);
     }
 }
@@ -213,7 +217,7 @@ impl Scheduler for SchedulerCFS {
             .flags()
             .remove(ProcessFlags::NEED_SCHEDULE);
 
-        let current_cpu_id = smp_get_processor_id() as usize;
+        let current_cpu_id = smp_get_processor_id().data() as usize;
 
         let current_cpu_queue: &mut CFSQueue = self.cpu_queue[current_cpu_id];
 
@@ -272,7 +276,7 @@ impl Scheduler for SchedulerCFS {
     }
 
     fn enqueue(&mut self, pcb: Arc<ProcessControlBlock>) {
-        let cpu_queue = &mut self.cpu_queue[pcb.sched_info().on_cpu().unwrap() as usize];
+        let cpu_queue = &mut self.cpu_queue[pcb.sched_info().on_cpu().unwrap().data() as usize];
 
         cpu_queue.enqueue(pcb);
     }

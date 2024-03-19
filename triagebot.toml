@@ -1,0 +1,150 @@
+[relabel]
+allow-unauthenticated = [
+    "A-*",
+    "C-*",
+    "D-*",
+    "E-*",
+    "F-*",
+    "I-*",
+    "NLL-*",
+    "O-*",
+    "S-*",
+    "T-*",
+    "relnotes",
+    "requires-*",
+    "regression-*",
+    "rla-*",
+    "perf-*",
+    "needs-triage",
+    "has-merge-commits",
+]
+
+[review-submitted]
+# 这个标签会在被标记了"request changes"的审查时被添加。
+reviewed_label = "S-等待作者修改"
+# These labels are removed when a "request changes" review is submitted.
+review_labels = ["S-等待审查"]
+
+
+[review-requested]
+# Those labels are removed when PR author requests a review from an assignee
+remove_labels = ["S-等待作者修改"]
+# Those labels are added when PR author requests a review from an assignee
+add_labels = ["S-等待审查"]
+
+[prioritize]
+label = "I-prioritize"
+
+
+[autolabel."I-prioritize"]
+trigger_labels = [
+    "regression-untriaged",
+    "regression-from-stable-to-stable",
+    "regression-from-stable-to-beta",
+    "regression-from-stable-to-nightly",
+    "I-unsound",
+]
+exclude_labels = [
+    "P-*",
+    "T-release",
+    "requires-nightly",
+]
+
+[autolabel."T-doc"]
+trigger_files = [
+    # Source code
+    "doc",
+]
+exclude_labels = [
+    "T-*",
+]
+
+
+[autolabel."A-meta"]
+trigger_files = [
+    "triagebot.toml",
+    "LICENSES",
+    "README.md",
+    "README_EN.md",
+    ".mailmap",
+]
+
+[autolabel."A-fs"]
+trigger_files = [
+    "kernel/src/filesystem",
+]
+
+[autolabel."T-driver"]
+trigger_files = [
+    "kernel/src/driver",
+    "kernel/src/arch/x86_64/driver",
+    "kernel/src/arch/riscv64/driver",
+]
+
+[autolabel."T-virtulization"]
+trigger_files = [
+    "kernel/src/virt",
+    "kernel/src/arch/x86_64/kvm"
+]
+
+[autolabel."S-等待审查"]
+new_pr = true
+
+[shortcut]
+
+[no-merges]
+exclude_titles = ["Rollup of", "subtree update", "Subtree update"]
+labels = ["S-等待作者修改"]
+
+[mentions."triagebot.toml"]
+message = "`triagebot.toml` has been modified, there may have been changes to the review queue."
+cc = ["@fslongjin", "@GnoCiYeH"]
+
+[mentions."kernel/src/driver/base"]
+message = "设备驱动模型部分发生了更改，请进行审查"
+cc = ["@fslongjin"]
+
+[mentions."kernel/src/driver/tty"]
+message = "tty驱动发生了更改，请进行审查"
+cc = ["@GnoCiYeH"]
+
+
+[assign]
+warn_non_default_branch = true
+contributing_url = "https://docs.dragonos.org/zh-cn/latest/community/code_contribution/index.html"
+users_on_vacation = []
+
+[assign.adhoc_groups]
+
+# 驱动程序
+driver = [
+    "@fslongjin",
+    "@YJwu2023",
+    "@GnoCiYeH"
+]
+
+# 虚拟化
+virtulization = [
+    "@fslongjin",
+    "@ZXXYy"
+]
+
+filesystem = [
+    "@fslongjin"
+]
+
+# CI/CD
+infra-ci = [
+    "@fslongjin"
+]
+
+bootstrap = [
+    "@fslongjin"
+]
+
+[assign.owners]
+"/.github/workflows" =                                   ["infra-ci"]
+"/kernel/src/driver" =                                   ["driver"]
+"/kernel/src/filesystem" =                               ["filesystem"]
+"/kernel/src/virt" =                                     ["virtulization"]
+"/kernel/src/arch/x86_64/kvm" =                          ["virtulization"]

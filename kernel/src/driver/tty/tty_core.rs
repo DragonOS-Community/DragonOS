@@ -1,16 +1,20 @@
-use core::{fmt::Debug, sync::atomic::AtomicBool};
+use core::{
+    fmt::Debug,
+    sync::atomic::{AtomicBool, AtomicUsize},
+};
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{collections::LinkedList, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
+    driver::serial::serial8250::send_to_default_serial8250_port,
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::EventWaitQueue,
     },
     mm::VirtAddr,
-    net::event_poll::EPollEventType,
+    net::event_poll::{EPollEventType, EPollItem},
     process::Pid,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
@@ -42,7 +46,7 @@ impl TtyCore {
             termios: RwLock::new(termios),
             name,
             flags: RwLock::new(TtyFlag::empty()),
-            count: RwLock::new(0),
+            count: AtomicUsize::new(0),
             window_size: RwLock::new(WindowSize::default()),
             read_wq: EventWaitQueue::new(),
             write_wq: EventWaitQueue::new(),
@@ -52,6 +56,7 @@ impl TtyCore {
             closing: AtomicBool::new(false),
             flow: SpinLock::new(TtyFlowState::default()),
             link: None,
+            epitems: SpinLock::new(LinkedList::new()),
         };
 
         return Arc::new(Self {
@@ -70,6 +75,13 @@ impl TtyCore {
     #[inline]
     pub fn ldisc(&self) -> Arc<dyn TtyLineDiscipline> {
         self.line_discipline.clone()
+    }
+
+    pub fn write_without_serial(&self, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
+        self.core
+            .driver()
+            .driver_funcs()
+            .write(self.core(), buf, nr)
     }
 
     pub fn reopen(&self) -> Result<(), SystemError> {
@@ -120,7 +132,7 @@ impl TtyCore {
     }
 
     pub fn tty_wakeup(&self) {
-        if self.core.flags.read().contains(TtyFlag::DO_WRITE_WAKEUP) {
+        if self.core.flags().contains(TtyFlag::DO_WRITE_WAKEUP) {
             let _ = self.ldisc().write_wakeup(self.core());
         }
 
@@ -150,6 +162,13 @@ impl TtyCore {
 
                 user_writer.copy_one_to_user(&termios, 0)?;
                 return Ok(0);
+            }
+            TtyIoctlCmd::TCSETS => {
+                return TtyCore::core_set_termios(
+                    real_tty,
+                    VirtAddr::new(arg),
+                    TtySetTermiosOpt::TERMIOS_OLD,
+                );
             }
             TtyIoctlCmd::TCSETSW => {
                 return TtyCore::core_set_termios(
@@ -205,9 +224,7 @@ impl TtyCore {
         let mut termios = tty.core().termios_write();
 
         let old_termios = termios.clone();
-
         *termios = new_termios;
-
         let tmp = termios.control_mode;
         termios.control_mode ^= (tmp ^ old_termios.control_mode) & ControlMode::ADDRB;
 
@@ -275,7 +292,7 @@ pub struct TtyCoreData {
     flags: RwLock<TtyFlag>,
     /// 在初始化时即确定不会更改，所以这里不用加锁
     index: usize,
-    count: RwLock<usize>,
+    count: AtomicUsize,
     /// 窗口大小
     window_size: RwLock<WindowSize>,
     /// 读等待队列
@@ -292,6 +309,8 @@ pub struct TtyCoreData {
     flow: SpinLock<TtyFlowState>,
     /// 链接tty
     link: Option<Arc<TtyCore>>,
+    /// epitems
+    epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
 }
 
 impl TtyCoreData {
@@ -322,29 +341,29 @@ impl TtyCoreData {
 
     #[inline]
     pub fn flags(&self) -> TtyFlag {
-        self.flags.read().clone()
+        self.flags.read_irqsave().clone()
     }
 
     #[inline]
     pub fn termios(&self) -> RwLockReadGuard<'_, Termios> {
-        self.termios.read()
+        self.termios.read_irqsave()
     }
 
     #[inline]
     pub fn termios_write(&self) -> RwLockWriteGuard<Termios> {
-        self.termios.write()
+        self.termios.write_irqsave()
     }
 
     #[inline]
     pub fn set_termios(&self, termios: Termios) {
-        let mut termios_guard = self.termios.write();
+        let mut termios_guard = self.termios_write();
         *termios_guard = termios;
     }
 
     #[inline]
     pub fn add_count(&self) {
-        let mut guard = self.count.write();
-        *guard += 1;
+        self.count
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     }
 
     #[inline]
@@ -386,6 +405,11 @@ impl TtyCoreData {
     pub fn link(&self) -> Option<Arc<TtyCore>> {
         self.link.clone()
     }
+
+    #[inline]
+    pub fn add_epitem(&self, epitem: Arc<EPollItem>) {
+        self.epitems.lock().push_back(epitem)
+    }
 }
 
 /// TTY 核心接口，不同的tty需要各自实现这个trait
@@ -404,6 +428,7 @@ impl TtyOperation for TtyCore {
 
     #[inline]
     fn write(&self, tty: &TtyCoreData, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
+        send_to_default_serial8250_port(buf);
         return self.core().tty_driver.driver_funcs().write(tty, buf, nr);
     }
 

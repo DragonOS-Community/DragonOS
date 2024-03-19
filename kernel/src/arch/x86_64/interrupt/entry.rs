@@ -57,7 +57,8 @@ macro_rules! interrupt_handler {
                         lea rax, ret_from_intr[rip]
                         push rax
                         mov rsi, {irqnum}
-                        jmp do_IRQ
+                        jmp x86_64_do_irq
+                        // jmp do_IRQ
                         "
                     ),
                     irqnum = const($name),
@@ -294,7 +295,7 @@ interrupt_handler!(254);
 interrupt_handler!(255);
 
 #[inline(never)]
-pub(super) unsafe fn setup_interrupt_gate() {
+pub unsafe fn arch_setup_interrupt_gate() {
     set_intr_gate(32, 0, VirtAddr::new(irq_handler32 as usize));
     set_intr_gate(33, 0, VirtAddr::new(irq_handler33 as usize));
     set_intr_gate(34, 0, VirtAddr::new(irq_handler34 as usize));

@@ -1,17 +1,20 @@
 ifeq ($(ARCH), x86_64)
-export PREFIX=x86_64-linux-musl-
+	CROSS_COMPILE=x86_64-linux-musl-
 else ifeq ($(ARCH), riscv64)
-export PREFIX=riscv64-linux-musl-
+	CROSS_COMPILE=riscv64-linux-musl-
 endif
 
+CC=$(CROSS_COMPILE)gcc
 
-export CC=$(PREFIX)gcc
 
-all: dmesg
-	mv dmesg $(DADK_CURRENT_BUILD_DIR)
-
-dmesg: main.c
+all: main.c dmesg.c
 	$(CC) -static -o dmesg main.c dmesg.c
+
+.PHONY: install clean
+install: all
+	mv dmesg $(DADK_CURRENT_BUILD_DIR)/dmesg
 
 clean:
 	rm dmesg *.o
+
+fmt:

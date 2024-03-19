@@ -1,7 +1,7 @@
 
 CFLAGS += -I .
 
-kernel_lib_subdirs:= sys
+kernel_lib_subdirs:=
 
 kernel_lib_objs:= $(shell find ./*.c)
 

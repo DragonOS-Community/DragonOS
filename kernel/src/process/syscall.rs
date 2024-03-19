@@ -30,11 +30,11 @@ use crate::{
 };
 
 impl Syscall {
-    pub fn fork(frame: &mut TrapFrame) -> Result<usize, SystemError> {
+    pub fn fork(frame: &TrapFrame) -> Result<usize, SystemError> {
         ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into())
     }
 
-    pub fn vfork(frame: &mut TrapFrame) -> Result<usize, SystemError> {
+    pub fn vfork(frame: &TrapFrame) -> Result<usize, SystemError> {
         // 由于Linux vfork需要保证子进程先运行（除非子进程调用execve或者exit），
         // 而我们目前没有实现这个特性，所以暂时使用fork代替vfork（linux文档表示这样也是也可以的）
         Self::fork(frame)
@@ -171,7 +171,7 @@ impl Syscall {
     }
 
     pub fn clone(
-        current_trapframe: &mut TrapFrame,
+        current_trapframe: &TrapFrame,
         clone_args: KernelCloneArgs,
     ) -> Result<usize, SystemError> {
         let flags = clone_args.flags;
@@ -202,11 +202,11 @@ impl Syscall {
         });
 
         if flags.contains(CloneFlags::CLONE_VFORK) {
-            pcb.thread.write().vfork_done = Some(vfork.clone());
+            pcb.thread.write_irqsave().vfork_done = Some(vfork.clone());
         }
 
-        if pcb.thread.read().set_child_tid.is_some() {
-            let addr = pcb.thread.read().set_child_tid.unwrap();
+        if pcb.thread.read_irqsave().set_child_tid.is_some() {
+            let addr = pcb.thread.read_irqsave().set_child_tid.unwrap();
             let mut writer =
                 UserBufferWriter::new(addr.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
             writer.copy_one_to_user(&(pcb.pid().data() as i32), 0)?;
@@ -234,7 +234,7 @@ impl Syscall {
             .map_err(|_| SystemError::EFAULT)?;
 
         let pcb = ProcessManager::current_pcb();
-        pcb.thread.write().clear_child_tid = Some(VirtAddr::new(ptr));
+        pcb.thread.write_irqsave().clear_child_tid = Some(VirtAddr::new(ptr));
         Ok(pcb.pid.0)
     }
 

@@ -36,7 +36,7 @@ export ASFLAGS := --64
 LD_LIST := ""
 
 
-kernel_subdirs := common driver debug exception smp syscall libs time
+kernel_subdirs := common driver debug smp syscall libs time
 
 
 kernel_rust:

@@ -1,9 +1,9 @@
 use core::{
-    hash::{Hash, Hasher},
+    hash::Hash,
     hint::spin_loop,
     intrinsics::{likely, unlikely},
     mem::ManuallyDrop,
-    sync::atomic::{compiler_fence, AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, AtomicBool, AtomicIsize, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -48,7 +48,10 @@ use crate::{
         core::{sched_enqueue, CPU_EXECUTING},
         SchedPolicy, SchedPriority,
     },
-    smp::kick_cpu,
+    smp::{
+        cpu::{AtomicProcessorId, ProcessorId},
+        kick_cpu,
+    },
     syscall::{user_access::clear_user, Syscall},
 };
 
@@ -308,7 +311,7 @@ impl ProcessManager {
                     .adopt_childen()
                     .unwrap_or_else(|e| panic!("adopte_childen failed: error: {e:?}"))
             };
-            let r = current.parent_pcb.read().upgrade();
+            let r = current.parent_pcb.read_irqsave().upgrade();
             if r.is_none() {
                 return;
             }
@@ -341,7 +344,7 @@ impl ProcessManager {
         pcb.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
 
         // 进行进程退出后的工作
-        let thread = pcb.thread.write();
+        let thread = pcb.thread.write_irqsave();
         if let Some(addr) = thread.set_child_tid {
             unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
         }
@@ -436,6 +439,7 @@ impl ProcessManager {
 
 /// 上下文切换的钩子函数,当这个函数return的时候,将会发生上下文切换
 #[cfg(target_arch = "x86_64")]
+#[inline(never)]
 pub unsafe extern "sysv64" fn switch_finish_hook() {
     ProcessManager::switch_finish_hook();
 }
@@ -445,12 +449,6 @@ pub unsafe extern "C" fn switch_finish_hook() {
 }
 
 int_like!(Pid, AtomicPid, usize, AtomicUsize);
-
-impl Hash for Pid {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
 
 impl Pid {
     pub fn to_string(&self) -> String {
@@ -671,7 +669,7 @@ impl ProcessControlBlock {
 
         // 将当前pcb加入父进程的子进程哈希表中
         if pcb.pid() > Pid(1) {
-            if let Some(ppcb_arc) = pcb.parent_pcb.read().upgrade() {
+            if let Some(ppcb_arc) = pcb.parent_pcb.read_irqsave().upgrade() {
                 let mut children = ppcb_arc.children.write_irqsave();
                 children.push(pcb.pid());
             } else {
@@ -721,7 +719,7 @@ impl ProcessControlBlock {
     /// 否则会导致死锁
     #[inline(always)]
     pub fn basic(&self) -> RwLockReadGuard<ProcessBasicInfo> {
-        return self.basic.read();
+        return self.basic.read_irqsave();
     }
 
     #[inline(always)]
@@ -844,17 +842,13 @@ impl ProcessControlBlock {
         return name;
     }
 
-    pub fn sig_info(&self) -> RwLockReadGuard<ProcessSignalInfo> {
-        self.sig_info.read()
-    }
-
     pub fn sig_info_irqsave(&self) -> RwLockReadGuard<ProcessSignalInfo> {
         self.sig_info.read_irqsave()
     }
 
-    pub fn try_siginfo(&self, times: u8) -> Option<RwLockReadGuard<ProcessSignalInfo>> {
+    pub fn try_siginfo_irqsave(&self, times: u8) -> Option<RwLockReadGuard<ProcessSignalInfo>> {
         for _ in 0..times {
-            if let Some(r) = self.sig_info.try_read() {
+            if let Some(r) = self.sig_info.try_read_irqsave() {
                 return Some(r);
             }
         }
@@ -868,7 +862,7 @@ impl ProcessControlBlock {
 
     pub fn try_siginfo_mut(&self, times: u8) -> Option<RwLockWriteGuard<ProcessSignalInfo>> {
         for _ in 0..times {
-            if let Some(r) = self.sig_info.try_write() {
+            if let Some(r) = self.sig_info.try_write_irqsave() {
                 return Some(r);
             }
         }
@@ -877,10 +871,10 @@ impl ProcessControlBlock {
     }
 
     pub fn sig_struct(&self) -> SpinLockGuard<SignalStruct> {
-        self.sig_struct.lock()
+        self.sig_struct.lock_irqsave()
     }
 
-    pub fn try_sig_struct_irq(&self, times: u8) -> Option<SpinLockGuard<SignalStruct>> {
+    pub fn try_sig_struct_irqsave(&self, times: u8) -> Option<SpinLockGuard<SignalStruct>> {
         for _ in 0..times {
             if let Ok(r) = self.sig_struct.try_lock_irqsave() {
                 return Some(r);
@@ -897,13 +891,18 @@ impl ProcessControlBlock {
 
 impl Drop for ProcessControlBlock {
     fn drop(&mut self) {
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         // 在ProcFS中,解除进程的注册
         procfs_unregister_pid(self.pid())
             .unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));
 
-        if let Some(ppcb) = self.parent_pcb.read().upgrade() {
-            ppcb.children.write().retain(|pid| *pid != self.pid());
+        if let Some(ppcb) = self.parent_pcb.read_irqsave().upgrade() {
+            ppcb.children
+                .write_irqsave()
+                .retain(|pid| *pid != self.pid());
         }
+
+        drop(irq_guard);
     }
 }
 
@@ -1019,10 +1018,10 @@ impl ProcessBasicInfo {
 #[derive(Debug)]
 pub struct ProcessSchedulerInfo {
     /// 当前进程所在的cpu
-    on_cpu: AtomicI32,
+    on_cpu: AtomicProcessorId,
     /// 如果当前进程等待被迁移到另一个cpu核心上（也就是flags中的PF_NEED_MIGRATE被置位），
     /// 该字段存储要被迁移到的目标处理器核心号
-    migrate_to: AtomicI32,
+    migrate_to: AtomicProcessorId,
     inner_locked: RwLock<InnerSchedInfo>,
     /// 进程的调度优先级
     priority: SchedPriority,
@@ -1056,14 +1055,11 @@ impl InnerSchedInfo {
 
 impl ProcessSchedulerInfo {
     #[inline(never)]
-    pub fn new(on_cpu: Option<u32>) -> Self {
-        let cpu_id = match on_cpu {
-            Some(cpu_id) => cpu_id as i32,
-            None => -1,
-        };
+    pub fn new(on_cpu: Option<ProcessorId>) -> Self {
+        let cpu_id = on_cpu.unwrap_or(ProcessorId::INVALID);
         return Self {
-            on_cpu: AtomicI32::new(cpu_id),
-            migrate_to: AtomicI32::new(-1),
+            on_cpu: AtomicProcessorId::new(cpu_id),
+            migrate_to: AtomicProcessorId::new(ProcessorId::INVALID),
             inner_locked: RwLock::new(InnerSchedInfo {
                 state: ProcessState::Blocked(false),
                 sched_policy: SchedPolicy::CFS,
@@ -1074,37 +1070,38 @@ impl ProcessSchedulerInfo {
         };
     }
 
-    pub fn on_cpu(&self) -> Option<u32> {
+    pub fn on_cpu(&self) -> Option<ProcessorId> {
         let on_cpu = self.on_cpu.load(Ordering::SeqCst);
-        if on_cpu == -1 {
+        if on_cpu == ProcessorId::INVALID {
             return None;
         } else {
-            return Some(on_cpu as u32);
+            return Some(on_cpu);
         }
     }
 
-    pub fn set_on_cpu(&self, on_cpu: Option<u32>) {
+    pub fn set_on_cpu(&self, on_cpu: Option<ProcessorId>) {
         if let Some(cpu_id) = on_cpu {
-            self.on_cpu.store(cpu_id as i32, Ordering::SeqCst);
+            self.on_cpu.store(cpu_id, Ordering::SeqCst);
         } else {
-            self.on_cpu.store(-1, Ordering::SeqCst);
+            self.on_cpu.store(ProcessorId::INVALID, Ordering::SeqCst);
         }
     }
 
-    pub fn migrate_to(&self) -> Option<u32> {
+    pub fn migrate_to(&self) -> Option<ProcessorId> {
         let migrate_to = self.migrate_to.load(Ordering::SeqCst);
-        if migrate_to == -1 {
+        if migrate_to == ProcessorId::INVALID {
             return None;
         } else {
-            return Some(migrate_to as u32);
+            return Some(migrate_to);
         }
     }
 
-    pub fn set_migrate_to(&self, migrate_to: Option<u32>) {
+    pub fn set_migrate_to(&self, migrate_to: Option<ProcessorId>) {
         if let Some(data) = migrate_to {
-            self.migrate_to.store(data as i32, Ordering::SeqCst);
+            self.migrate_to.store(data, Ordering::SeqCst);
         } else {
-            self.migrate_to.store(-1, Ordering::SeqCst)
+            self.migrate_to
+                .store(ProcessorId::INVALID, Ordering::SeqCst)
         }
     }
 

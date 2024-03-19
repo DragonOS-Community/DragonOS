@@ -34,7 +34,9 @@ impl TtyJobCtrlManager {
     pub fn tty_check_change(tty: Arc<TtyCore>, sig: Signal) -> Result<(), SystemError> {
         let pcb = ProcessManager::current_pcb();
 
-        if pcb.sig_info().tty().is_none() || !Arc::ptr_eq(&pcb.sig_info().tty().unwrap(), &tty) {
+        if pcb.sig_info_irqsave().tty().is_none()
+            || !Arc::ptr_eq(&pcb.sig_info_irqsave().tty().unwrap(), &tty)
+        {
             return Ok(());
         }
 
@@ -91,8 +93,8 @@ impl TtyJobCtrlManager {
 
                 let mut ctrl = tty.core().contorl_info_irqsave();
 
-                if current.sig_info().tty().is_none()
-                    || !Arc::ptr_eq(&current.sig_info().tty().clone().unwrap(), &tty)
+                if current.sig_info_irqsave().tty().is_none()
+                    || !Arc::ptr_eq(&current.sig_info_irqsave().tty().clone().unwrap(), &tty)
                     || ctrl.session.is_none()
                     || ctrl.session.unwrap() != current.pid()
                 {
@@ -106,8 +108,8 @@ impl TtyJobCtrlManager {
 
             TtyIoctlCmd::TIOCGPGRP => {
                 let current = ProcessManager::current_pcb();
-                if current.sig_info().tty().is_some()
-                    && !Arc::ptr_eq(&current.sig_info().tty().unwrap(), &tty)
+                if current.sig_info_irqsave().tty().is_some()
+                    && !Arc::ptr_eq(&current.sig_info_irqsave().tty().unwrap(), &tty)
                 {
                     return Err(SystemError::ENOTTY);
                 }

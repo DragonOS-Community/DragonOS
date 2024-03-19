@@ -321,8 +321,8 @@ impl VirtualConsoleData {
         if self.utf && !self.display_ctrl {
             // utf模式并且不显示控制字符
             let (ret, rescan) = self.translate_unicode(*c);
-            if let Some(..) = ret {
-                *c = ret.unwrap();
+            if let Some(ret) = ret {
+                *c = ret;
             }
             return (ret, rescan);
         }

@@ -1,8 +1,4 @@
-use core::{
-    fmt::{Debug},
-    mem::ManuallyDrop,
-};
-
+use core::{fmt::Debug, mem::ManuallyDrop};
 
 use alloc::{rc::Weak, sync::Arc, vec::Vec};
 
@@ -155,10 +151,10 @@ pub struct DataBlock {
 }
 pub struct LockedDataBlock(RwLock<DataBlock>);
 
-pub struct Indirect{
-    pub self_ref:Weak<Indirect>,
-    pub next_point:Option<Vec<Arc<Indirect>>>,
-    pub data_block:Option<Arc<DataBlock>>,
+pub struct Indirect {
+    pub self_ref: Weak<Indirect>,
+    pub next_point: Vec<Option<Arc<Indirect>>>,
+    pub data_block: Option<Arc<DataBlock>>,
 }
 #[derive(Debug)]
 pub struct LockedExt2InodeInfo(SpinLock<Ext2InodeInfo>);
@@ -168,7 +164,6 @@ pub struct LockedExt2InodeInfo(SpinLock<Ext2InodeInfo>);
 pub struct Ext2InodeInfo {
     // TODO 将ext2iode内容和meta联系在一起，可自行设计
     meta: Metadata,
-
 }
 
 impl Ext2InodeInfo {

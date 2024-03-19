@@ -57,7 +57,7 @@ pub enum FcntlCommand {
     GetFileRwHint = F_LINUX_SPECIFIC_BASE + 13,
     SetFileRwHint = F_LINUX_SPECIFIC_BASE + 14,
 }
-#[allow(clippy::bad_bit_mask)]
+
 bitflags! {
 
     ///  The constants AT_REMOVEDIR and AT_EACCESS have the same value.  AT_EACCESS is
@@ -66,6 +66,7 @@ bitflags! {
     ///  the flags can be allowed to overlap.  For example, passing AT_REMOVEDIR to
     ///  faccessat would be undefined behavior and thus treating it equivalent to
     ///  AT_EACCESS is valid undefined behavior.
+    #[allow(clippy::bad_bit_mask)]
     pub struct AtFlags: i32 {
         /// 特殊值，用于指示openat应使用当前工作目录。
         const AT_FDCWD = -100;

@@ -612,7 +612,7 @@ impl IndexNode for LockedEntry {
         Ok(())
     }
 
-    fn move_(
+    fn move_to(
         &self,
         old_name: &str,
         target: &Arc<dyn IndexNode>,
@@ -778,5 +778,21 @@ impl IndexNode for LockedEntry {
 
     fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         Ok(self.0.lock().self_ref.upgrade().ok_or(SystemError::ENOENT)?)
+    }
+
+    /// # 用于重命名内存中的文件或目录
+    fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), SystemError> {
+        let old_inode: Arc<dyn IndexNode> = self.find(_old_name)?;
+        // 在新的目录下创建一个硬链接
+        self.link(_new_name, &old_inode)?;
+
+        // 取消现有的目录下的这个硬链接
+        if let Err(err) = self.unlink(_old_name) {
+            // 如果取消失败，那就取消新的目录下的硬链接
+            self.unlink(_new_name)?;
+            return Err(err);
+        }
+
+        return Ok(());
     }
 }

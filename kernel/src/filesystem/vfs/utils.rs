@@ -87,7 +87,7 @@ pub fn clean_path(path: &str) -> String {
                 match key {
                     "." => {},
                     ".." => {clean = rsplit_path(&clean).1.unwrap_or("").to_string();},
-                    others => { clean = clean + "/" + others; },
+                    others => { clean = clean + "/" + others;},
                 };
                 tmp = rest;
             },
@@ -101,5 +101,6 @@ pub fn clean_path(path: &str) -> String {
             }
         }
     }
-    String::from(clean)
+    // kdebug!("Clean Result: {}", clean);
+    clean
 }

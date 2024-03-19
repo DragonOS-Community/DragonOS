@@ -82,7 +82,7 @@ impl FileSystem for RamFS {
         self
     }
 
-    fn cache(&self) -> Result<DefaultCache, SystemError> {
+    fn cache(&self) -> Result<Arc<DefaultCache>, SystemError> {
         Ok(self.cache.clone())
     }
 }

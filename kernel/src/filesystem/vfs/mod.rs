@@ -18,7 +18,7 @@ use crate::{
     }, filesystem::vfs::mount::MOUNTS_LIST, ipc::pipe::LockedPipeInode, libs::casting::DowncastArc, time::TimeSpec
 };
 
-use self::{cache::DefaultCache, core::generate_inode_id, file::FileMode, syscall::ModeType, utils::{clean_path, is_absolute, rsplit_path}};
+use self::{cache::DefaultCache, core::generate_inode_id, file::FileMode, syscall::ModeType, utils::{clean_path, is_absolute, rsplit_path, split_path}};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
@@ -445,23 +445,26 @@ impl dyn IndexNode {
         max_follow_times: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 拼接绝对路径
-        let abs_path = if is_absolute(path) {
+        // kdebug!("Using path: {}", path);
+        let abs_path = if is_absolute(path) || self.metadata()?.inode_id == ROOT_INODE().metadata()?.inode_id {
             clean_path(path)
         } else {
             self._abs_path()? + &clean_path(path)
         };
-
+        // kdebug!("Abs_path: {:?}", abs_path);
         // 检查根目录缓存
         if let Some((rpath, root))
             = MOUNTS_LIST().lock().iter().filter_map(|(key, value)| {
                 let strkey = key.as_ref();
-                return if abs_path.starts_with(&strkey) {
+                return if abs_path.starts_with(strkey) {
                     Some((strkey, value))
                 } else {
                     None
                 }
             }).next()
         {
+            kdebug!("Hit fs: {}", rpath);
+            kdebug!("I have cache?{}", root.cache().is_ok());
             if let Ok(fscache) = root.cache() {
                 if let Some((inode, l_rest)) = self.quick_lookup(fscache, &abs_path, rpath) {
                     let r_rest = abs_path.strip_prefix(l_rest);
@@ -469,18 +472,17 @@ impl dyn IndexNode {
                     if r_rest.is_none() {
                         return Ok(inode);
                     }
-                    return inode._lookup_follow_symlink2(
+                    return inode._lookup_walk(
                             &abs_path.strip_prefix(&rpath.to_string()).unwrap(), 
                             max_follow_times
                     );
                 }
-                return root.root_inode()._lookup_follow_symlink2(&abs_path.strip_prefix(&rpath.to_string()).unwrap(), max_follow_times);
+                return root.root_inode()._lookup_walk(&abs_path.strip_prefix(&rpath.to_string()).unwrap(), max_follow_times);
             }
         }
         // Except Normal lookup
+        kdebug!("Depredecated.");
         return self._lookup_follow_symlink(path, max_follow_times);
-
-        
     }
 
     fn _lookup_follow_symlink(
@@ -553,86 +555,48 @@ impl dyn IndexNode {
 
         Ok(result)
     }
-
-    fn _lookup_follow_symlink2(
-        &self,
-        path: &str,
-        max_follow_times: usize,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        kdebug!("Call lookup cache2");
+    
+    fn _lookup_walk(&self, rest_path: &str, max_follow_times: usize)
+        -> Result<Arc<dyn IndexNode>, SystemError> 
+    {
+        kdebug!("walking though {}", rest_path);
         if self.metadata()?.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
-
-        // 处理绝对路径
-        // result: 上一个被找到的inode
-        // rest_path: 还没有查找的路径
-        let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
-            (ROOT_INODE().clone(), String::from(rest))
-        } else {
-            // 是相对路径
-            (self.find(".")?, String::from(path))
-        };
-
-        let cache = self.cache().unwrap();
-        cache.put(&self.key()?, Arc::downgrade(&self.self_ref()?));
-
-        // 逐级查找文件 
-        while !rest_path.is_empty() {
-            // 当前这一级不是文件夹
-            if result.metadata()?.file_type != FileType::Dir {
-                return Err(SystemError::ENOTDIR);
-            }
-
-            let name;
-
-            // 寻找“/”
-            match rest_path.find('/') {
-                Some(pos) => {
-                    // 找到了，设置下一个要查找的名字
-                    name = String::from(&rest_path[0..pos]);
-                    // 剩余的路径字符串
-                    rest_path = String::from(&rest_path[pos + 1..]);
+        let (child, left_path) = split_path(rest_path);
+        match self.find(child) {
+            Ok(child_node) => {
+                if child_node.metadata()?.file_type == FileType::SymLink && max_follow_times > 0 {
+                    // symlink wrapping problem
+                    return self._lookup_walk(
+                        &(child_node.from_symlink()? + "/" + rest_path), 
+                        max_follow_times - 1);
                 }
-                None => {
-                    name = rest_path;
-                    rest_path = String::new();
+                kdebug!("Im: {:?}", self.key());
+                kdebug!("My cache: {:?}", self.fs().cache());
+                if let Ok(cache) = self.fs().cache() {
+                    kdebug!("Calling cache put with child {}", child);
+                    cache.put(child, Arc::downgrade(&child_node));
                 }
-            }
-
-            // 遇到连续多个"/"的情况
-            if name.is_empty() {
-                continue;
-            }
-
-            let inode = result.find(&name)?;
-            // 处理文件系统挂载缓存问题
-            if let Ok(cache1) = inode.cache() {
-                kdebug!("Adding Line {:?}", inode.key());
-                cache1.put(&inode.key()?, Arc::downgrade(&inode));
-            }
-
-            // 处理符号链接的问题
-            if inode.metadata()?.file_type == FileType::SymLink && max_follow_times > 0 {
-                let mut content = [0u8; 256];
-                // 读取符号链接
-                let len = inode.read_at(0, 256, &mut content, &mut FilePrivateData::Unused)?;
-
-                // 将读到的数据转换为utf8字符串（先转为str，再转为String）
-                let link_path = String::from(
-                    ::core::str::from_utf8(&content[..len]).map_err(|_| SystemError::ENOTDIR)?,
-                );
-
-                let new_path = link_path + "/" + &rest_path;
-                // 继续查找符号链接
-                return result._lookup_follow_symlink2(&new_path, max_follow_times - 1);
-            }
-            result = inode;
+                if let Some(rest) = left_path {
+                    return child_node._lookup_walk(rest, max_follow_times);
+                } else {
+                    return Ok(child_node);
+                }
+            },
+            Err(e) => { return Err(e); }
         }
-
-        Ok(result)
     }
-    
+
+    fn from_symlink(&self) -> Result<String, SystemError> {
+        let mut content = [0u8; 256];
+        let len = self.read_at(0, 256, &mut content, &mut FilePrivateData::Unused)?;
+
+        return Ok(String::from(
+            ::core::str::from_utf8(&content[..len]).map_err(|_| SystemError::ENOTDIR)?,
+        ))
+    }
+
     /// @brief 缓存查询
     ///
     /// @param path 文件路径

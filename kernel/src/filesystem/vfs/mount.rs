@@ -34,14 +34,11 @@ pub struct MountPath {
 
 impl From<&str> for MountPath {
     fn from(value: &str) -> Self {
+        if value == "/" {
+            return Self { path: String::from(value), depth: 0 };
+        }
         let depth = value.chars().filter(|&c| c == '/').count();
         Self { path: String::from(value), depth }
-    }
-}
-
-impl ToString for MountPath {
-    fn to_string(&self) -> String {
-        self.path.clone()
     }
 }
 
@@ -56,7 +53,7 @@ impl PartialOrd for MountPath {
         if self.depth == other.depth {
             Some(self.path.cmp(&other.path))
         } else {
-            self.depth.partial_cmp(&other.depth).map(|ret| ret.reverse() )
+            other.depth.partial_cmp(&self.depth)
         }
     }
 }
@@ -483,5 +480,9 @@ impl FileSystem for MountFS {
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+
+    fn cache(&self) -> Result<Arc<super::cache::DefaultCache>, SystemError> {
+        self.inner_filesystem.cache()
     }
 }

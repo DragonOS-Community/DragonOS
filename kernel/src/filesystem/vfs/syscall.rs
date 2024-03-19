@@ -1,40 +1,23 @@
-
+use core::ffi::c_void;
 use core::mem::size_of;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
-
 use crate::producefs;
 use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
-
-    filesystem::{
-        ramfs::RamFS,
-        vfs::{core as Vcore, file::FileDescriptorVec},
-    },
+    filesystem::vfs::{core as Vcore, file::FileDescriptorVec},
     kerror,
-
-
     libs::rwlock::RwLockWriteGuard,
     mm::{verify_area, VirtAddr},
     process::ProcessManager,
     syscall::{
-
-        user_access::{self, check_and_clone_cstr, UserBufferReader, UserBufferWriter},
-
- 
-
+        user_access::{self, check_and_clone_cstr, UserBufferWriter},
         Syscall,
     },
     time::TimeSpec,
 };
-use alloc::{
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
-use system_error::SystemError;
 
 use super::{
     core::{do_mkdir, do_remove_dir, do_unlink_at},
@@ -42,8 +25,7 @@ use super::{
     file::{File, FileMode},
     open::{do_faccessat, do_fchmodat, do_sys_open},
     utils::{rsplit_path, user_path_at},
-    Dirent, FileSystem, FileType, IndexNode, FSMAKER, MAX_PATHLEN, ROOT_INODE,
-    VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    Dirent, FileType, IndexNode, FSMAKER, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 // use crate::kdebug;
 
@@ -1087,8 +1069,8 @@ impl Syscall {
     ///
     /// ## 参数:
     ///
-    /// - source       挂载目标的文件夹名
-    /// - target       挂载目录的父目录
+    /// - source       挂载设备
+    /// - target       挂载目录
     /// - filesystemtype   文件系统
     /// - mountflags     挂载选项（暂未实现）
     /// - data        带数据挂载
@@ -1097,27 +1079,21 @@ impl Syscall {
     /// - Ok(0): 挂载成功
     /// - Err(SystemError) :挂载过程中出错
     pub fn mount(
-        source: *const u8,
+        _source: *const u8,
         target: *const u8,
         filesystemtype: *const u8,
         _mountflags: usize,
         _data: *const c_void,
     ) -> Result<usize, SystemError> {
-        let source = user_access::check_and_clone_cstr(source, Some(MAX_PATHLEN))?;
+        let _source = user_access::check_and_clone_cstr(_source, Some(MAX_PATHLEN))?;
 
         let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?;
 
         let filesystemtype = user_access::check_and_clone_cstr(filesystemtype, Some(MAX_PATHLEN))?;
 
-        Self::mkdir(
-            (format!("{target}{source}")).as_str(),
-            FileMode::O_PATH_FLAGS.bits().try_into().unwrap(),
-        )?;
-
-        //TODO 将判断逻辑迁移到FS中实现
         let filesystemtype = producefs!(FSMAKER, filesystemtype)?;
 
-        return Vcore::do_mount(filesystemtype, (format!("{target}{source}")).as_str());
+        return Vcore::do_mount(filesystemtype, (format!("{target}")).as_str());
     }
 
     // 想法：可以在VFS中实现一个文件系统分发器，流程如下：

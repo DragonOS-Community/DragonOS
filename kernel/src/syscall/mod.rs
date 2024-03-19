@@ -1,7 +1,6 @@
 use core::{
-    ffi::{c_char, c_int, c_void, CStr},
+    ffi::{c_int, c_void},
     ptr::null,
-
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -942,16 +941,14 @@ impl Syscall {
             SYS_FADVISE64 => {
                 // todo: 这个系统调用还没有实现
 
+                Err(SystemError::ENOSYS)
+            }
 
             SYS_MOUNT => {
                 let source = args[0] as *const u8;
                 let target = args[1] as *const u8;
                 let filesystemtype = args[2] as *const u8;
                 return Self::mount(source, target, filesystemtype, 0, null());
-            }
-
-
-                Err(SystemError::ENOSYS)
             }
             SYS_NEWFSTATAT => {
                 // todo: 这个系统调用还没有实现

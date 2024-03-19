@@ -660,14 +660,9 @@ impl FileSystemMaker {
     pub fn call(&self) -> Result<Arc<dyn FileSystem>, SystemError> {
         (self.function)()
     }
-
-    pub const fn name(&self) -> &'static str {
-        self.name
-    }
 }
 
 pub type FileSystemNewFunction = fn() -> Result<Arc<dyn FileSystem>, SystemError>;
-pub type FileSystemName = &'static str;
 
 #[macro_export]
 macro_rules! define_filesystem_maker_slice {

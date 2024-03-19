@@ -222,7 +222,7 @@ impl Sub<i32> for LineIndex {
 
 impl Into<i32> for LineIndex {
     fn into(self) -> i32 {
-        self.0.clone()
+        self.0
     }
 }
 impl Into<u32> for LineIndex {

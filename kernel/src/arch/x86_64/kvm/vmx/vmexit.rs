@@ -227,7 +227,7 @@ extern "C" fn vmexit_handler() {
         }
         VmxExitReason::EPT_VIOLATION => {
             kdebug!("vmexit handler: ept violation!");
-            let gpa = vmx_vmread(GUEST_PHYSICAL_ADDR_FULL as u32).unwrap();
+            let gpa = vmx_vmread(GUEST_PHYSICAL_ADDR_FULL).unwrap();
             let exit_qualification = vmx_vmread(VmcsFields::VMEXIT_QUALIFICATION as u32).unwrap();
             /* It is a write fault? */
             let mut error_code = exit_qualification & (1 << 1);
@@ -240,7 +240,7 @@ extern "C" fn vmexit_handler() {
             let vcpu = kvm.vcpu[0].clone();
             // Use the data
             let kvm_ept_page_fault = vcpu.lock().mmu.page_fault.unwrap();
-            kvm_ept_page_fault(&mut (*vcpu.lock()), gpa, error_code as u32, false)
+            kvm_ept_page_fault(&mut *vcpu.lock(), gpa, error_code as u32, false)
                 .expect("ept page fault error");
         }
         _ => {

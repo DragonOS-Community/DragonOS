@@ -341,26 +341,26 @@ impl X86_64MMArch {
         let mb2_count = mb2_count as usize;
         let mut areas_count = 0usize;
         let mut total_mem_size = 0usize;
-        for i in 0..mb2_count {
+        for info_entry in mb2_mem_info.iter().take(mb2_count) {
             // Only use the memory area if its type is 1 (RAM)
-            if mb2_mem_info[i].type_ == 1 {
+            if info_entry.type_ == 1 {
                 // Skip the memory area if its len is 0
-                if mb2_mem_info[i].len == 0 {
+                if info_entry.len == 0 {
                     continue;
                 }
 
-                total_mem_size += mb2_mem_info[i].len as usize;
+                total_mem_size += info_entry.len as usize;
 
                 mem_block_manager()
                     .add_block(
-                        PhysAddr::new(mb2_mem_info[i].addr as usize),
-                        mb2_mem_info[i].len as usize,
+                        PhysAddr::new(info_entry.addr as usize),
+                        info_entry.len as usize,
                     )
                     .unwrap_or_else(|e| {
                         kwarn!(
                             "Failed to add memory block: base={:#x}, size={:#x}, error={:?}",
-                            mb2_mem_info[i].addr,
-                            mb2_mem_info[i].len,
+                            info_entry.addr,
+                            info_entry.len,
                             e
                         );
                     });
@@ -525,7 +525,7 @@ pub fn test_buddy() {
             let mut random_size = 0u64;
             unsafe { x86::random::rdrand64(&mut random_size) };
             // 一次最多申请4M
-            random_size %= (1024 * 4096);
+            random_size %= 1024 * 4096;
             if random_size == 0 {
                 continue;
             }
@@ -555,8 +555,8 @@ pub fn test_buddy() {
                     allocated_frame_count.data() * MMArch::PAGE_SIZE,
                 )
             };
-            for i in 0..slice.len() {
-                slice[i] = ((i + unsafe { rdtsc() } as usize) % 256) as u8;
+            for (i, item) in slice.iter_mut().enumerate() {
+                *item = ((i + unsafe { rdtsc() } as usize) % 256) as u8;
             }
 
             // 随机释放一个内存块

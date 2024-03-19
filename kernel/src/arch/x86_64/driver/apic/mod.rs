@@ -456,7 +456,7 @@ impl CurrentApic {
     pub(self) unsafe fn write_xapic_register(&self, reg: XApicOffset, value: u32) {
         if let Some(xapic) = current_xapic_instance().borrow_mut().as_mut() {
             xapic.write(reg, value);
-        };
+        }
     }
 
     /// 屏蔽类8259A芯片
@@ -527,7 +527,7 @@ impl LocalAPIC for CurrentApic {
         } else {
             if let Some(xapic) = current_xapic_instance().borrow().as_ref() {
                 xapic.send_eoi();
-            };
+            }
         }
     }
 
@@ -585,7 +585,7 @@ impl LocalAPIC for CurrentApic {
         } else {
             if let Some(xapic) = current_xapic_instance().borrow_mut().as_mut() {
                 xapic.set_lvt(lvt);
-            };
+            }
         }
     }
 
@@ -607,7 +607,7 @@ impl LocalAPIC for CurrentApic {
         } else {
             if let Some(xapic) = current_xapic_instance().borrow_mut().as_mut() {
                 xapic.mask_all_lvt();
-            };
+            }
         }
     }
 
@@ -617,7 +617,7 @@ impl LocalAPIC for CurrentApic {
         } else {
             if let Some(xapic) = current_xapic_instance().borrow().as_ref() {
                 xapic.write_icr(icr);
-            };
+            }
         }
     }
 }

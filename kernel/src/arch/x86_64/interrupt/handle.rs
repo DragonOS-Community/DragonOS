@@ -18,7 +18,7 @@ use super::TrapFrame;
 unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
     // swapgs
 
-    if trap_frame.from_user() {
+    if trap_frame.is_from_user() {
         x86_64::registers::segmentation::GS::swap();
     }
 

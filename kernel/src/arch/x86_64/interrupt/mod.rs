@@ -161,7 +161,7 @@ impl TrapFrame {
     }
 
     /// 判断当前中断是否来自用户模式
-    pub fn from_user(&self) -> bool {
+    pub fn is_from_user(&self) -> bool {
         return (self.cs & 0x3) != 0;
     }
 }

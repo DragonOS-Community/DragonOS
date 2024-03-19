@@ -425,14 +425,13 @@ pub fn ioapic_init(ignore: &'static [IrqNumber]) {
 }
 
 fn register_handler(desc: &Arc<IrqDesc>, level_triggered: bool) {
-    let fasteoi: bool;
-    if level_triggered {
+    let fasteoi: bool = if level_triggered {
         desc.modify_status(IrqLineStatus::empty(), IrqLineStatus::IRQ_LEVEL);
-        fasteoi = true;
+        true
     } else {
         desc.modify_status(IrqLineStatus::IRQ_LEVEL, IrqLineStatus::empty());
-        fasteoi = false;
-    }
+        false
+    };
 
     let handler: &dyn IrqFlowHandler = if fasteoi {
         fast_eoi_irq_handler()

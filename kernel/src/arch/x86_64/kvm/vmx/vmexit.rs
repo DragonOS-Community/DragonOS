@@ -240,7 +240,7 @@ extern "C" fn vmexit_handler() {
             let vcpu = kvm.vcpu[0].clone();
             // Use the data
             let kvm_ept_page_fault = vcpu.lock().mmu.page_fault.unwrap();
-            kvm_ept_page_fault(&mut *vcpu.lock(), gpa, error_code as u32, false)
+            kvm_ept_page_fault(&mut vcpu.lock(), gpa, error_code as u32, false)
                 .expect("ept page fault error");
         }
         _ => {

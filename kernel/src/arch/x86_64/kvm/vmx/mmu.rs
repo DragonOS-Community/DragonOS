@@ -227,7 +227,6 @@ pub fn __direct_map(
     unsafe {
         assert!(ept_mapper.walk(gpa, pfn << PAGE_SHIFT, page_flags).is_ok());
     }
-    drop(ept_mapper);
     return Ok(0);
 }
 

@@ -1217,9 +1217,10 @@ impl FATFsInfo {
             .read_at(in_disk_fs_info_offset as usize / LBA_SIZE, 1, &mut v)?;
         let mut cursor = VecCursor::new(v);
 
-        let mut fsinfo = FATFsInfo::default();
-
-        fsinfo.lead_sig = cursor.read_u32()?;
+        let mut fsinfo = FATFsInfo{
+            lead_sig : cursor.read_u32()?,
+            ..Default::default()
+        };
         cursor.seek(SeekFrom::SeekCurrent(480))?;
         fsinfo.struc_sig = cursor.read_u32()?;
         fsinfo.free_count = cursor.read_u32()?;

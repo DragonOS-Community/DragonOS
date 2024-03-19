@@ -20,10 +20,11 @@ use super::{
     InterruptArch, IrqNumber,
 };
 
+static HANDLE_BAD_IRQ: HandleBadIrq = HandleBadIrq;
 /// 获取用于处理错误的中断的处理程序
 #[inline(always)]
 pub fn bad_irq_handler() -> &'static dyn IrqFlowHandler {
-    &HandleBadIrq
+    &HANDLE_BAD_IRQ
 }
 
 /// 获取用于处理快速EOI的中断的处理程序
@@ -124,10 +125,9 @@ impl IrqFlowHandler for EdgeIrqHandler {
             desc_inner_guard = irq_desc.inner();
             desc_inner_guard.common_data().clear_inprogress();
 
-            if !(desc_inner_guard
+            if !desc_inner_guard
                 .internal_state()
-                .contains(IrqDescState::IRQS_PENDING)
-                && !desc_inner_guard.common_data().disabled())
+                .contains(IrqDescState::IRQS_PENDING) || desc_inner_guard.common_data().disabled()
             {
                 break;
             }

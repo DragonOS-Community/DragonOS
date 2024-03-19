@@ -61,6 +61,7 @@ bitflags! {
     ///
     /// 与Linux 5.19.10的uapi/asm-generic/fcntl.h相同
     /// https://code.dragonos.org.cn/xref/linux-5.19.10/tools/include/uapi/asm-generic/fcntl.h#19
+    #[allow(clippy::bad_bit_mask)]
     pub struct FileMode: u32{
         /* File access modes for `open' and `fcntl'.  */
         /// Open Read-only

@@ -20,16 +20,10 @@ use crate::{
         process::ArchPCBInfo,
         sched::sched,
         CurrentIrqArch,
-    },
-    driver::tty::tty_core::TtyCore,
-    exception::InterruptArch,
-    filesystem::{
+    }, driver::tty::tty_core::TtyCore, exception::InterruptArch, filesystem::{
         procfs::procfs_unregister_pid,
         vfs::{file::FileDescriptorVec, FileType},
-    },
-    ipc::signal_types::{SigInfo, SigPending, SignalStruct},
-    kdebug, kinfo,
-    libs::{
+    }, ipc::signal_types::{SigInfo, SigPending, SignalStruct}, kdebug, kinfo, libs::{
         align::AlignedBox,
         casting::DowncastArc,
         futex::{
@@ -40,19 +34,14 @@ use crate::{
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
-    },
-    mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
-    net::socket::SocketInode,
-    sched::{
+    }, mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr}, net::socket::SocketInode, panic, sched::{
         completion::Completion,
         core::{sched_enqueue, CPU_EXECUTING},
         SchedPolicy, SchedPriority,
-    },
-    smp::{
+    }, smp::{
         cpu::{AtomicProcessorId, ProcessorId},
         kick_cpu,
-    },
-    syscall::{user_access::clear_user, Syscall},
+    }, syscall::{user_access::clear_user, Syscall}
 };
 
 use self::kthread::WorkerPrivate;
@@ -336,6 +325,7 @@ impl ProcessManager {
         // 关中断
         unsafe { CurrentIrqArch::interrupt_disable() };
         let pcb = ProcessManager::current_pcb();
+        let pid = pcb.pid();
         pcb.sched_info
             .inner_lock_write_irqsave()
             .set_state(ProcessState::Exited(exit_code));
@@ -366,7 +356,11 @@ impl ProcessManager {
         unsafe { CurrentIrqArch::interrupt_enable() };
 
         sched();
-        loop {}
+        kerror!("pid {pid:?} exited but sched again!");
+        #[allow(clippy::empty_loop)]
+        loop{
+            spin_loop();
+        }
     }
 
     pub unsafe fn release(pid: Pid) {

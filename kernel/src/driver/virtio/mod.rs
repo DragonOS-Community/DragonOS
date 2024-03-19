@@ -11,7 +11,7 @@ pub(super) mod irq;
 pub mod transport_pci;
 pub mod virtio;
 pub mod virtio_impl;
-
+#[allow(clippy::module_inception)]
 pub trait VirtIODevice: Send + Sync + Any {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError>;
 

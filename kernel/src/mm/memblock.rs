@@ -513,6 +513,7 @@ impl<'a> Iterator for MemBlockIter<'a> {
 
 bitflags! {
     /// 内存区域属性
+    #[allow(clippy::bad_bit_mask)]
     pub struct MemoryAreaAttr: u32 {
         /// No special request
         const NONE = 0x0;

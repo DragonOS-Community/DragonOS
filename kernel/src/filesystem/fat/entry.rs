@@ -1214,7 +1214,6 @@ impl ShortDirEntry {
                 first_cluster,
                 short_dir_entry: *self,
                 loc: (loc, loc),
-                ..Default::default()
             };
 
             // 根据当前短目录项的类型的不同，返回对应的枚举类型。
@@ -1231,7 +1230,6 @@ impl ShortDirEntry {
                 root_offset: None,
                 short_dir_entry: Some(*self),
                 loc: Some((loc, loc)),
-                ..Default::default()
             };
 
             return FATDirEntry::Dir(dir);
@@ -1259,7 +1257,6 @@ impl ShortDirEntry {
                 file_name: name,
                 loc,
                 short_dir_entry: *self,
-                ..Default::default()
             };
 
             if self.is_file() {
@@ -1274,7 +1271,6 @@ impl ShortDirEntry {
                 loc: Some(loc),
                 short_dir_entry: Some(*self),
                 root_offset: None,
-                ..Default::default()
             };
 
             return FATDirEntry::Dir(dir);
@@ -2401,9 +2397,10 @@ pub fn get_raw_dir_entry(
 
             if file_attr.contains(FileAttributes::LONG_NAME) {
                 // 当前目录项是一个长目录项
-                let mut long_dentry = LongDirEntry::default();
-
-                long_dentry.ord = cursor.read_u8()?;
+                let mut long_dentry = LongDirEntry{
+                    ord : cursor.read_u8()?,
+                    ..Default::default()
+                };
                 cursor.read_u16_into(&mut long_dentry.name1)?;
                 long_dentry.file_attrs = FileAttributes::new(cursor.read_u8()?);
                 long_dentry.dirent_type = cursor.read_u8()?;

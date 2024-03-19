@@ -115,9 +115,10 @@ impl IndexNode for LockedZeroInode {
             return Err(SystemError::EINVAL);
         }
 
-        for i in 0..len {
-            buf[i] = 0;
+        for itr in buf.iter_mut().take(len) {
+            *itr = 0;
         }
+        
 
         return Ok(len);
     }

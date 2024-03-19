@@ -390,14 +390,14 @@ impl FrameBufferOps for VesaFb {
             .screen_info
             .lfb_virt_base
             .ok_or(SystemError::ENODEV)?;
-        let fg;
-        if self.current_fb_fix().visual == FbVisual::TrueColor
+        
+        let fg = if self.current_fb_fix().visual == FbVisual::TrueColor
             || self.current_fb_fix().visual == FbVisual::DirectColor
         {
-            fg = self.fb_data.read().pesudo_palette[rect.color as usize];
+            self.fb_data.read().pesudo_palette[rect.color as usize]
         } else {
-            fg = rect.color;
-        }
+            rect.color
+        };
 
         let bpp = self.current_fb_var().bits_per_pixel;
         // 每行像素数
@@ -574,11 +574,11 @@ impl FrameBufferInfo for VesaFb {
     }
 
     fn current_fb_var(&self) -> FbVarScreenInfo {
-        VESAFB_DEFINED.read().clone()
+        *VESAFB_DEFINED.read()
     }
 
     fn current_fb_fix(&self) -> FixedScreenInfo {
-        VESAFB_FIX_INFO.read().clone()
+        *VESAFB_FIX_INFO.read()
     }
 
     fn video_mode(&self) -> Option<&FbVideoMode> {

@@ -42,11 +42,19 @@ pub struct PosixOldUtsName {
 
 impl PosixOldUtsName {
     pub fn new() -> Self {
-        const SYS_NAME: &[u8] = b"Dragon.OS";
-        const NODENAME: &[u8] = b"RinGoTek";
-        const RELEASE: &[u8] = b"0.1.9";
-        const VERSION: &[u8] = b"2022.01.01";
+        const SYS_NAME: &[u8] = b"DragonOS";
+        const NODENAME: &[u8] = b"DragonOS";
+        const RELEASE: &[u8] = env!("CARGO_PKG_VERSION").as_bytes();
+        const VERSION: &[u8] = env!("CARGO_PKG_VERSION").as_bytes();
+
+        #[cfg(target_arch = "x86_64")]
         const MACHINE: &[u8] = b"x86_64";
+
+        #[cfg(target_arch = "aarch64")]
+        const MACHINE: &[u8] = b"aarch64";
+
+        #[cfg(target_arch = "riscv64")]
+        const MACHINE: &[u8] = b"riscv64";
 
         let mut r = Self {
             sysname: [0; 65],
@@ -380,10 +388,6 @@ impl Syscall {
     }
 
     pub fn uname(name: *mut PosixOldUtsName) -> Result<usize, SystemError> {
-        if name.is_null() {
-            return Err(SystemError::EFAULT);
-        }
-
         let mut writer =
             UserBufferWriter::new(name, core::mem::size_of::<PosixOldUtsName>(), true)?;
         writer.copy_one_to_user(&PosixOldUtsName::new(), 0)?;

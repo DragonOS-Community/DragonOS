@@ -206,11 +206,11 @@ impl VirtualConsoleData {
     }
 
     pub(super) fn init(&mut self, rows: Option<usize>, cols: Option<usize>, clear: bool) {
-        if let Some(..) = rows {
-            self.rows = rows.unwrap();
+        if let Some(rows) = rows {
+            self.rows = rows;
         }
-        if let Some(..) = cols {
-            self.cols = cols.unwrap();
+        if let Some(cols) = cols {
+            self.cols = cols;
         }
 
         self.pos = self.cols * self.state.y + self.state.x;

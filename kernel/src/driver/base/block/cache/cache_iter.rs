@@ -1,10 +1,11 @@
 use crate::driver::base::block::block_device::BlockId;
 
+/// #结构功能
 /// 一个简单的结构体，是BlockIter的输出
 #[derive(Debug)]
 pub struct BlockData {
-    //表示单个块对应的iba_id
-    iba_id: usize,
+    //表示单个块对应的lba_id
+    lba_id: usize,
     //表示该块在buf中的起始地址，目前并没有作用（例如：若该块是第2个块，那么该数据成员值为2*BLOCK_SIZE）
     _data_start_addr: usize,
     //表示该块的大小
@@ -12,16 +13,16 @@ pub struct BlockData {
 }
 
 impl BlockData {
-    pub fn new(iba_id: usize, data_start_addr: usize, block_size: usize) -> Self {
+    pub fn new(lba_id: usize, data_start_addr: usize, block_size: usize) -> Self {
         Self {
-            iba_id,
+            lba_id,
             _data_start_addr: data_start_addr,
             _block_size: block_size,
         }
     }
     #[inline]
-    pub fn iba_id(&self) -> usize {
-        self.iba_id
+    pub fn lba_id(&self) -> usize {
+        self.lba_id
     }
     #[inline]
     pub fn _data_start_addr(&self) -> usize {
@@ -33,7 +34,8 @@ impl BlockData {
     }
 }
 
-/// @brief块迭代器，它获取需求（起始块，连续块的个数），并将连续的块输出为单一的块（如你需要读取lba_id为10~20的连续块，它就可以输出10,11...,20的BlockData）
+/// # 结构功能
+/// 块迭代器，它获取需求（起始块，连续块的个数），并将连续的块输出为单一的块（如你需要读取lba_id为10~20的连续块，它就可以输出10,11...,20的BlockData）
 #[derive(Copy, Clone)]
 pub struct BlockIter {
     //表示起始块的lba_id
@@ -75,7 +77,8 @@ impl Iterator for BlockIter {
     }
 }
 
-/// @brief 表示缺块信息的数据结构，往往在读取的时候发现缺块并产生FailData，在插入的时候使用FailData
+/// # 结构功能
+/// 表示缺块信息的数据结构，往往在读取的时候发现缺块并产生FailData，在插入的时候使用FailData
 pub struct FailData {
     //表示缺块的lba_id
     lba_id: usize,

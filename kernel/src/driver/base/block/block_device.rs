@@ -262,7 +262,8 @@ pub trait BlockDevice: Device {
         self.cache_write(lba_id_start, count, buf)
     }
 
-    /// @brief 其功能对外而言和read_at函数完全一致，但是加入blockcache的功能
+    /// # 函数的功能
+    /// 其功能对外而言和read_at函数完全一致，但是加入blockcache的功能
     fn cache_read(
         &self,
         lba_id_start: BlockId,
@@ -291,7 +292,8 @@ pub trait BlockDevice: Device {
         }
     }
 
-    /// @brief 其功能对外而言和write_at函数完全一致，但是加入blockcache的功能
+    /// # 函数功能
+    /// 其功能对外而言和write_at函数完全一致，但是加入blockcache的功能
     fn cache_write(
         &self,
         lba_id_start: BlockId,
@@ -303,7 +305,6 @@ pub trait BlockDevice: Device {
     }
 
     fn write_at_bytes(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        // assert!(len <= buf.len());
         if len > buf.len() {
             return Err(SystemError::E2BIG);
         }
@@ -320,7 +321,6 @@ pub trait BlockDevice: Device {
 
             if full {
                 self.write_at(range.lba_start, count, buf_slice)?;
-                // self.write_at(range.lba_start, count, buf_slice)?;
             } else {
                 if self.blk_size_log2() > BLK_SIZE_LOG2_LIMIT {
                     return Err(SystemError::E2BIG);
@@ -330,15 +330,12 @@ pub trait BlockDevice: Device {
                 temp.resize(1usize << self.blk_size_log2(), 0);
                 // 由于块设备每次读写都是整块的，在不完整写入之前，必须把不完整的地方补全
                 self.read_at(range.lba_start, 1, &mut temp[..])?;
-                // self.read_at(range.lba_start, 1, &mut temp[..])?;
                 // 把数据从临时buffer复制到目标buffer
                 temp[range.begin..range.end].copy_from_slice(&buf_slice);
                 self.write_at(range.lba_start, 1, &temp[..])?;
-                // self.write_at(range.lba_start, 1, &temp[..])?;
             }
         }
         return Ok(len);
-        //self.0.lock().write_at(lba_id_start, count, buf)
     }
 
     fn read_at_bytes(
@@ -366,7 +363,6 @@ pub trait BlockDevice: Device {
             if full {
                 // 调用 BlockDevice::read_at() 直接把引用传进去，不是把整个数组move进去
                 self.read_at(range.lba_start, count, buf_slice)?;
-                // self.read_at(range.lba_start, count, buf_slice)?;
             } else {
                 // 判断块的长度不能超过最大值
                 if self.blk_size_log2() > BLK_SIZE_LOG2_LIMIT {
@@ -376,18 +372,12 @@ pub trait BlockDevice: Device {
                 let mut temp = Vec::new();
                 temp.resize(1usize << self.blk_size_log2(), 0);
                 self.read_at(range.lba_start, 1, &mut temp[..])?;
-                // self.read_at(range.lba_start, 1, &mut temp[..])?;
 
                 // 把数据从临时buffer复制到目标buffer
                 buf_slice.copy_from_slice(&temp[range.begin..range.end]);
             }
         }
         return Ok(len);
-
-        // kdebug!(
-        //     "ahci read at {lba_id_start}, count={count}, lock={:?}",
-        //     self.0
-        // );
     }
 }
 

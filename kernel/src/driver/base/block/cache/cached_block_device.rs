@@ -8,10 +8,11 @@ use super::{
 
 static mut CSPACE: Option<CacheSpace> = None;
 static mut CMAPPER: Option<CacheMapper> = None;
-///该结构体向外提供BlockCache服务
+/// # 结构功能
+/// 该结构体向外提供BlockCache服务
 pub struct BlockCache;
 
-unsafe fn get_mapper() -> Result<&'static mut CacheMapper, BlockCacheError> {
+unsafe fn mapper() -> Result<&'static mut CacheMapper, BlockCacheError> {
     unsafe {
         match &mut CMAPPER {
             Some(x) => return Ok(x),
@@ -20,7 +21,7 @@ unsafe fn get_mapper() -> Result<&'static mut CacheMapper, BlockCacheError> {
     };
 }
 
-unsafe fn get_space() -> Result<&'static mut CacheSpace, BlockCacheError> {
+unsafe fn space() -> Result<&'static mut CacheSpace, BlockCacheError> {
     unsafe {
         match &mut CSPACE {
             Some(x) => return Ok(x),
@@ -85,16 +86,16 @@ impl BlockCache {
         //存放命中块地址的向量
         let mut success_ans = vec![];
         //获取mapper
-        let mapper = unsafe { get_mapper()? };
+        let mapper = unsafe { mapper()? };
         for (index, i) in block_iter.enumerate() {
-            //在mapper中寻找块的iba_id，判断是否命中
-            match mapper.find(i.iba_id()) {
+            //在mapper中寻找块的lba_id，判断是否命中
+            match mapper.find(i.lba_id()) {
                 Some(x) => {
                     success_ans.push(*x);
                     continue;
                 }
                 //缺块就放入fail_ans
-                None => fail_ans.push(FailData::new(i.iba_id(), index)),
+                None => fail_ans.push(FailData::new(i.lba_id(), index)),
                 //缺块不break的原因是，我们需要把所有缺块都找出来，这样才能补上缺块
             }
         }
@@ -121,7 +122,7 @@ impl BlockCache {
         position: usize,
         buf: &mut [u8],
     ) -> Result<usize, BlockCacheError> {
-        let space = unsafe { get_space()? };
+        let space = unsafe { space()? };
         space.read(cache_block_addr, position, buf)
     }
     /// # 函数的功能
@@ -157,7 +158,7 @@ impl BlockCache {
     /// Ok(()):表示插入成功
     /// Err(BlockCacheError) :一般来说不会产生错误，这里产生错误的原因只有插入时还没有初始化（一般也很难发生）
     pub fn insert_one_block(lba_id: usize, data: Vec<u8>) -> Result<(), BlockCacheError> {
-        let space = unsafe { get_space()? };
+        let space = unsafe { space()? };
         space.insert(lba_id, data)
     }
     /// # 函数的功能
@@ -176,16 +177,17 @@ impl BlockCache {
         count: usize,
         _data: &[u8],
     ) -> Result<usize, BlockCacheError> {
-        let mapper = unsafe { get_mapper()? };
+        let mapper = unsafe { mapper()? };
         let block_iter = BlockIter::new(lba_id_start, count, BLOCK_SIZE);
         for i in block_iter {
-            mapper.remove(i.iba_id());
+            mapper.remove(i.lba_id());
         }
         Ok(count)
     }
 }
 
-/// @brief 管理Cache空间的结构体
+/// # 结构功能
+/// 管理Cache空间的结构体
 struct CacheSpace {
     //用于存放CacheBlock，是Cache数据的实际存储空间的向量
     root: Vec<CacheBlock>,
@@ -218,13 +220,13 @@ impl CacheSpace {
         position: usize,
         buf: &mut [u8],
     ) -> Result<usize, BlockCacheError> {
-        if addr > self.frame_selector.get_size() {
+        if addr > self.frame_selector.size() {
             return Err(BlockCacheError::InsufficientCacheSpace);
         } else {
             return Ok(
                 //CacheBlockAddr就是用于给root寻址的
                 self.root[addr.data()]
-                    .get_data(&mut buf[position * BLOCK_SIZE..(position + 1) * BLOCK_SIZE])?,
+                    .data(&mut buf[position * BLOCK_SIZE..(position + 1) * BLOCK_SIZE])?,
             );
         }
     }
@@ -245,12 +247,12 @@ impl CacheSpace {
     pub fn insert(&mut self, lba_id: usize, data: Vec<u8>) -> Result<(), BlockCacheError> {
         //CacheBlock是cached block的基本单位，这里使用data生成一个CacheBlock用于向Cache空间中插入块
         let data_block = CacheBlock::from_data(lba_id, data);
-        let mapper = unsafe { get_mapper()? };
+        let mapper = unsafe { mapper()? };
         //这里我设计了cache的一个threshold，如果不超过阈值就可以append，否则只能替换
         if self.frame_selector.can_append() {
             //这是append的操作逻辑：
             //从frame_selector获得一个CacheBlockAddr
-            let index = self.frame_selector.get_index_append();
+            let index = self.frame_selector.index_append();
             //直接将块push进去就可以，因为现在是append操作
             self.root.push(data_block);
             assert!(index.data() == self.root.len() - 1);
@@ -260,9 +262,9 @@ impl CacheSpace {
         } else {
             //这是replace的操作逻辑
             //从frame_selector获得一个CacheBlockAddr，这次是它替换出来的
-            let index = self.frame_selector.get_index_replace();
+            let index = self.frame_selector.index_replace();
             //获取被替换的块的lba_id，待会用于取消映射
-            let removed_id = self.root[index.data()].get_lba_id();
+            let removed_id = self.root[index.data()].lba_id();
             //直接替换原本的块，由于被替换的块没有引用了，所以会被drop
             self.root[index.data()] = data_block;
             //建立映射插入块的映射
@@ -274,7 +276,8 @@ impl CacheSpace {
     }
 }
 
-/// @brief 该结构体用于建立lba_id到cached块的映射
+/// # 结构功能
+/// 该结构体用于建立lba_id到cached块的映射
 struct CacheMapper {
     //执行键值对操作的map
     map: BTreeMap<usize, CacheBlockAddr>,
@@ -305,23 +308,25 @@ impl CacheMapper {
     }
 }
 
-/// @brief 该trait用于实现块的换入换出算法，需要设计替换算法只需要实现该trait即可
+/// # 结构功能
+/// 该trait用于实现块的换入换出算法，需要设计替换算法只需要实现该trait即可
 trait FrameSelector {
     /// # 函数的功能
     /// 给出append操作的index（理论上，如果cache没满，就不需要换出块，就可以使用append操作）
-    fn get_index_append(&mut self) -> CacheBlockAddr;
+    fn index_append(&mut self) -> CacheBlockAddr;
     /// # 函数的功能
     /// 给出replace操作后的index
-    fn get_index_replace(&mut self) -> CacheBlockAddr;
+    fn index_replace(&mut self) -> CacheBlockAddr;
     /// # 函数的功能
     /// 判断是否可以append
     fn can_append(&self) -> bool;
     /// # 函数的功能
     /// 获取size
-    fn get_size(&self) -> usize;
+    fn size(&self) -> usize;
 }
 
-/// @brief 该结构体用于管理块的换入换出过程中，CacheBlockAddr的选择，替换算法在这里实现
+/// # 结构功能
+/// 该结构体用于管理块的换入换出过程中，CacheBlockAddr的选择，替换算法在这里实现
 struct SimpleFrameSelector {
     //表示BlockCache的阈值，即最大可以存放多少块，这里目前还不支持动态变化
     threshold: usize,
@@ -342,7 +347,7 @@ impl SimpleFrameSelector {
 }
 
 impl FrameSelector for SimpleFrameSelector {
-    fn get_index_append(&mut self) -> CacheBlockAddr {
+    fn index_append(&mut self) -> CacheBlockAddr {
         let ans = self.current;
         self.size += 1;
         self.current += 1;
@@ -350,7 +355,7 @@ impl FrameSelector for SimpleFrameSelector {
         return CacheBlockAddr::new(ans);
     }
 
-    fn get_index_replace(&mut self) -> CacheBlockAddr {
+    fn index_replace(&mut self) -> CacheBlockAddr {
         let ans = self.current;
         self.current += 1;
         self.current %= self.threshold;
@@ -361,7 +366,7 @@ impl FrameSelector for SimpleFrameSelector {
         self.size < self.threshold
     }
 
-    fn get_size(&self) -> usize {
+    fn size(&self) -> usize {
         self.size
     }
 }

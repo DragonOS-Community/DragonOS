@@ -6,6 +6,7 @@ use crate::driver::base::block::block_device::BlockId;
 
 use super::{BlockCacheError, BLOCK_SIZE};
 
+/// # 枚举功能
 /// 该枚举设计来是用于实现回写法的，但是目前并未使用
 #[allow(dead_code)]
 pub enum CacheBlockFlag {
@@ -37,6 +38,7 @@ impl PartialOrd<usize> for CacheBlockAddr {
     }
 }
 
+/// # 结构功能
 /// 存储数据的最小单位
 pub struct CacheBlock {
     data: Box<[u8]>,
@@ -61,7 +63,7 @@ impl CacheBlock {
     pub fn _set_flag(&mut self, _flag: CacheBlockFlag) -> Option<()> {
         todo!()
     }
-    pub fn get_data(&self, buf: &mut [u8]) -> Result<usize, BlockCacheError> {
+    pub fn data(&self, buf: &mut [u8]) -> Result<usize, BlockCacheError> {
         if buf.len() != BLOCK_SIZE {
             return Err(BlockCacheError::BlockSizeError);
         }
@@ -69,7 +71,7 @@ impl CacheBlock {
         return Ok(BLOCK_SIZE);
     }
 
-    pub fn get_lba_id(&self) -> BlockId {
+    pub fn lba_id(&self) -> BlockId {
         self.lba_id
     }
 }

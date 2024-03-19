@@ -1116,7 +1116,6 @@ impl FATFileSystem {
 
                 cursor.write_u16(raw_val)?;
                 self.partition.disk().write_at(lba, 1, cursor.as_slice())?;
-                // self.partition.disk().write_at(lba, 1, cursor.as_slice())?;
 
                 return Ok(());
             }
@@ -1173,7 +1172,6 @@ impl FATFileSystem {
                     cursor.write_u32(raw_val)?;
 
                     self.partition.disk().write_at(lba, 1, cursor.as_slice())?;
-                    // self.partition.disk().write_at(lba, 1, cursor.as_slice())?;
                 }
 
                 return Ok(());
@@ -1336,7 +1334,6 @@ impl FATFsInfo {
             cursor.write_u32(self.trail_sig)?;
 
             partition.disk().write_at(lba, 1, cursor.as_slice())?;
-            // partition.disk().write_at(lba, 1, cursor.as_slice())?;
         }
         return Ok(());
     }

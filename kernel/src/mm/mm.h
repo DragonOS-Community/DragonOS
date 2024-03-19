@@ -12,10 +12,10 @@ extern uint64_t rs_unmap_at_low_addr();
 #define KERNEL_BASE_LINEAR_ADDR 0xffff800000000000UL
 #define USER_MAX_LINEAR_ADDR 0x00007fffffffffffUL
 // MMIO虚拟地址空间：1TB
-#define MMIO_BASE 0xffffa10000000000UL  //依我理解，这是映射到io的地址空间
+#define MMIO_BASE 0xffffa10000000000UL  
 #define MMIO_TOP 0xffffa20000000000UL
 
-#define PAGE_4K_SHIFT 12        //这些变量更像是“不把代码写死”原则的提现，所谓的shift，只不过是左移用的东西罢了
+#define PAGE_4K_SHIFT 12        
 #define PAGE_2M_SHIFT 21
 #define PAGE_1G_SHIFT 30
 #define PAGE_GDT_SHIFT 39

@@ -2415,7 +2415,6 @@ pub fn get_raw_dir_entry(
     v.resize(1 * LBA_SIZE, 0);
 
     fs.partition.disk().read_at(lba, 1, &mut v)?;
-    // fs.partition.disk().read_at(lba, 1, &mut v)?;
 
     let mut cursor: VecCursor = VecCursor::new(v);
     // 切换游标到对应位置

@@ -6,7 +6,7 @@ use crate::{
     libs::rwlock::RwLock,
     mm::{PhysAddr, VirtAddr},
 };
-
+#[allow(clippy::module_inception)]
 pub mod init;
 pub mod initcall;
 pub mod initial_kthread;

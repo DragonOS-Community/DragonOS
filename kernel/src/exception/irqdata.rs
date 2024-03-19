@@ -327,7 +327,7 @@ impl InnerIrqCommonData {
 
 /// 中断处理函数传入的数据
 pub trait IrqHandlerData: Send + Sync + Any + Debug + CastFromSync {}
-
+#[allow(clippy::bad_bit_mask)]
 bitflags! {
     /// 中断线状态
     /// https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irq.h?fi=IRQ_TYPE_PROBE#77
@@ -420,6 +420,7 @@ impl IrqLineStatus {
         self.contains(Self::IRQ_PER_CPU_DEVID)
     }
 }
+#[allow(clippy::bad_bit_mask)]
 bitflags! {
     /// 中断状态（存储在IrqCommonData)
     ///

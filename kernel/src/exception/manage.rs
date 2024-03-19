@@ -760,20 +760,19 @@ impl IrqManager {
         // todo: 处理CPU中断隔离相关的逻辑
 
         let common_data = desc_inner_guard.common_data();
-        let r;
-        if force || !cpumask.is_empty() {
-            r = chip.irq_set_affinity(irq_data, cpumask, force);
+        let r = if force || !cpumask.is_empty() {
+            chip.irq_set_affinity(irq_data, cpumask, force)
         } else {
             return Err(SystemError::EINVAL);
-        }
+        };
 
         let mut ret = Ok(());
         if let Ok(rs) = r {
             match rs {
-                IrqChipSetMaskResult::SetMaskOk | IrqChipSetMaskResult::SetMaskOkDone => {
+                IrqChipSetMaskResult::Success | IrqChipSetMaskResult::Done => {
                     common_data.set_affinity(cpumask.clone());
                 }
-                IrqChipSetMaskResult::SetMaskOkNoChange => {
+                IrqChipSetMaskResult::NoChange => {
 
                     // irq_validate_effective_affinity(data);
                     // irq_set_thread_affinity(desc);
@@ -907,14 +906,14 @@ impl IrqManager {
         let ret;
         if let Ok(rs) = r {
             match rs {
-                IrqChipSetMaskResult::SetMaskOk | IrqChipSetMaskResult::SetMaskOkDone => {
+                IrqChipSetMaskResult::Success | IrqChipSetMaskResult::Done => {
                     let common_data = desc_inner_guard.common_data();
                     common_data.clear_status(IrqStatus::IRQD_TRIGGER_MASK);
                     let mut irqstatus = IrqStatus::empty();
                     irqstatus.set_trigger_type(trigger_type);
                     common_data.insert_status(irqstatus);
                 }
-                IrqChipSetMaskResult::SetMaskOkNoChange => {
+                IrqChipSetMaskResult::NoChange => {
                     let flags = desc_inner_guard.common_data().trigger_type();
                     desc_inner_guard.set_trigger_type(flags);
                     desc_inner_guard

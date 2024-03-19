@@ -1999,20 +1999,14 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             // 原模式或real_raw
             ldata.raw = true;
 
-            if termios.input_mode.contains(InputMode::IGNBRK)
-                || (!termios.input_mode.contains(InputMode::BRKINT)
+            ldata.real_raw = termios.input_mode.contains(InputMode::IGNBRK) || (!termios.input_mode.contains(InputMode::BRKINT)
                     && !termios.input_mode.contains(InputMode::PARMRK))
                     && (termios.input_mode.contains(InputMode::IGNPAR)
                         || !termios.input_mode.contains(InputMode::INPCK))
                     && (core
                         .driver()
                         .flags()
-                        .contains(TtyDriverFlag::TTY_DRIVER_REAL_RAW))
-            {
-                ldata.real_raw = true;
-            } else {
-                ldata.real_raw = false;
-            }
+                        .contains(TtyDriverFlag::TTY_DRIVER_REAL_RAW));
         }
 
         // if !termios.input_mode.contains(InputMode::IXON)

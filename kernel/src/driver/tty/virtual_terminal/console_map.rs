@@ -105,10 +105,10 @@ pub const USER_MAP: &[u16] = &[
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum TranslationMapType {
-    Lat1Map,
-    GrafMap,
-    IbmpcMap,
-    UserMap,
+    Lat1,
+    Graf,
+    Ibmpc,
+    User,
 }
 
 #[derive(Debug, Clone)]
@@ -120,10 +120,10 @@ pub struct TranslationMap {
 impl TranslationMap {
     pub const fn new(map_type: TranslationMapType) -> Self {
         let map = match map_type {
-            TranslationMapType::Lat1Map => LAT1_MAP,
-            TranslationMapType::GrafMap => GRAF_MAP,
-            TranslationMapType::IbmpcMap => IBMPC_MAP,
-            TranslationMapType::UserMap => USER_MAP,
+            TranslationMapType::Lat1 => LAT1_MAP,
+            TranslationMapType::Graf => GRAF_MAP,
+            TranslationMapType::Ibmpc => IBMPC_MAP,
+            TranslationMapType::User => USER_MAP,
         };
 
         Self { map_type, map }

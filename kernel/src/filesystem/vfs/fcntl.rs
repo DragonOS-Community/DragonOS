@@ -57,7 +57,7 @@ pub enum FcntlCommand {
     GetFileRwHint = F_LINUX_SPECIFIC_BASE + 13,
     SetFileRwHint = F_LINUX_SPECIFIC_BASE + 14,
 }
-
+#[allow(clippy::bad_bit_mask)]
 bitflags! {
 
     ///  The constants AT_REMOVEDIR and AT_EACCESS have the same value.  AT_EACCESS is

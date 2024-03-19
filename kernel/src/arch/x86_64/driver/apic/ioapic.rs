@@ -534,7 +534,7 @@ impl IrqChip for IoApicChip {
         chip_data_inner.level_triggered = level_triggered;
         chip_data_inner.sync_to_chip()?;
 
-        return Ok(IrqChipSetMaskResult::SetMaskOk);
+        return Ok(IrqChipSetMaskResult::Success);
     }
 
     fn irq_set_affinity(
@@ -558,14 +558,14 @@ impl IrqChip for IoApicChip {
         let mut chip_data_inner = chip_data.inner();
         let origin_dest = chip_data_inner.dest;
         if origin_dest == dest {
-            return Ok(IrqChipSetMaskResult::SetMaskOk);
+            return Ok(IrqChipSetMaskResult::Success);
         }
 
         chip_data_inner.dest = dest;
 
         chip_data_inner.sync_to_chip()?;
 
-        return Ok(IrqChipSetMaskResult::SetMaskOk);
+        return Ok(IrqChipSetMaskResult::Success);
     }
 
     fn irq_unmask(&self, irq: &Arc<IrqData>) -> Result<(), SystemError> {

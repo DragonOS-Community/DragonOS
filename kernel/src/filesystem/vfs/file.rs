@@ -54,7 +54,7 @@ impl FilePrivateData {
         }
     }
 }
-
+#[allow(clippy::bad_bit_mask)]
 bitflags! {
     /// @brief 文件打开模式
     /// 其中，低2bit组合而成的数字的值，用于表示访问权限。其他的bit，才支持通过按位或的方式来表示参数

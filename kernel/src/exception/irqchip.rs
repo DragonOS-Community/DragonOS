@@ -308,13 +308,13 @@ pub struct IrqChipType {
 #[derive(Debug)]
 pub enum IrqChipSetMaskResult {
     /// core updates mask ok.
-    SetMaskOk,
+    Success,
     /// core updates mask ok. No change.
-    SetMaskOkNoChange,
+    NoChange,
     /// core updates mask ok. Done.(same as SetMaskOk)
     ///
     /// 支持堆叠irq芯片的特殊代码, 表示跳过所有子irq芯片。
-    SetMaskOkDone,
+    Done,
 }
 
 bitflags! {

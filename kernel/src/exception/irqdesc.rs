@@ -791,6 +791,7 @@ impl ThreadedHandlerFlags {
 }
 
 // 定义IrqFlags位标志
+#[allow(clippy::bad_bit_mask)]
 bitflags! {
     /// 这些标志仅由内核在中断处理例程中使用。
     pub struct IrqHandleFlags: u32 {

@@ -386,7 +386,7 @@ impl IndexNode for LockedPipeInode {
 
         let pollflag = EPollEventType::from_bits_truncate(inode.poll(data)? as u32);
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&mut inode.epitems, pollflag)?;
+        EventPoll::wakeup_epoll(& inode.epitems, pollflag)?;
 
         // 返回写入的字节数
         return Ok(len);

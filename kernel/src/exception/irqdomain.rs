@@ -284,7 +284,7 @@ impl IrqDomainManager {
 
         return r;
     }
-
+    #[allow(clippy::only_used_in_recursion)]
     fn do_deactivate_irq(&self, irq_data: Option<Arc<IrqData>>) {
         if let Some(irq_data) = irq_data {
             if let Some(domain) = irq_data.domain() {
@@ -310,6 +310,7 @@ impl IrqDomainManager {
     /// - `handler`: 中断流处理器
     /// - `handler_data`: 中断流处理程序数据
     /// - `handler_name`: 中断处理程序名称
+    #[allow(clippy::too_many_arguments)]
     pub fn domain_set_info(
         &self,
         domain: &Arc<IrqDomain>,

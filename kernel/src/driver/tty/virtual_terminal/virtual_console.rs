@@ -193,7 +193,7 @@ impl VirtualConsoleData {
             utf: Default::default(),
             utf_count: Default::default(),
             utf_char: Default::default(),
-            translate: TranslationMap::new(TranslationMapType::Lat1Map),
+            translate: TranslationMap::new(TranslationMapType::Lat1),
             npar: Default::default(),
             tab_stop: StaticBitmap::new(),
             par: [0; 16],
@@ -263,7 +263,7 @@ impl VirtualConsoleData {
         self.need_wrap = false;
         self.report_mouse = 0;
         self.utf_count = 0;
-        self.translate = TranslationMap::new(TranslationMapType::Lat1Map);
+        self.translate = TranslationMap::new(TranslationMapType::Lat1);
         self.utf = true;
         self.pid = None;
         self.vc_state = VirtualConsoleState::ESnormal;
@@ -502,7 +502,7 @@ impl VirtualConsoleData {
         }
 
         let mut soft_cursor_guard = SOFTCURSOR_ORIGINAL.write_irqsave();
-        *soft_cursor_guard = Some(unsafe { VcCursor::from_bits_unchecked(i as u32) });
+        *soft_cursor_guard = Some(unsafe { VcCursor::from_bits_unchecked(i) });
 
         let soft_cursor = soft_cursor_guard.unwrap();
 
@@ -1066,8 +1066,7 @@ impl VirtualConsoleData {
                     // 设置前景色
                     let (idx, color) = self.t416_color(i);
                     i = idx;
-                    if color.is_some() {
-                        let color = color.unwrap();
+                    if let Some(color) = color {
                         let mut max = color.red.max(color.green);
                         max = max.max(color.blue);
 
@@ -1099,8 +1098,7 @@ impl VirtualConsoleData {
                     // 设置背景色
                     let (idx, color) = self.t416_color(i);
                     i = idx;
-                    if color.is_some() {
-                        let color = color.unwrap();
+                    if let Some(color) = color {
                         self.state.color = (self.state.color & 0x0f)
                             | ((color.red as u8 & 0x80) >> 1)
                             | ((color.green as u8 & 0x80) >> 2)
@@ -1245,10 +1243,7 @@ impl VirtualConsoleData {
             return (idx, Some(Color::from_256(self.par[idx])));
         } else if self.par[idx] == 2 && idx + 3 <= self.npar as usize {
             // 24位
-            let mut color = Color::default();
-            color.red = self.par[idx + 1] as u16;
-            color.green = self.par[idx + 2] as u16;
-            color.blue = self.par[idx + 3] as u16;
+            let mut color = Color { red: self.par[idx + 1] as u16, green: self.par[idx + 2] as u16, blue: self.par[idx + 3] as u16, ..Default::default() };
             idx += 3;
             return (idx, Some(color));
         } else {

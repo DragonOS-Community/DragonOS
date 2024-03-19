@@ -286,12 +286,29 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     ///
     /// @return 成功: Ok()
     ///         失败: Err(错误码)
-    fn move_(
+    fn move_to(
         &self,
         _old_name: &str,
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
     ) -> Result<(), SystemError> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    /// # 修改文件名
+    ///
+    ///
+    /// ## 参数
+    ///
+    /// - _old_name: 源文件路径
+    /// - _new_name: 目标文件路径
+    ///
+    /// ## 返回值
+    /// - Ok(返回值类型): 返回值的说明
+    /// - Err(错误值类型): 错误的说明
+    ///
+    fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }

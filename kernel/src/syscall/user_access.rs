@@ -75,7 +75,7 @@ pub fn check_and_clone_cstr(
     max_length: Option<usize>,
 ) -> Result<String, SystemError> {
     if user.is_null() {
-        return Ok(String::new());
+        return Err(SystemError::EFAULT);
     }
 
     // 从用户态读取，直到遇到空字符 '\0' 或者达到最大长度

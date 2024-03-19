@@ -6,7 +6,6 @@ use core::{
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    include::bindings::bindings::smp_get_total_cpu,
     kinfo,
     mm::percpu::PerCpu,
     process::{AtomicPid, Pid, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
@@ -51,6 +50,7 @@ impl CpuExecuting {
 
 // 获取某个cpu的负载情况，返回当前负载，cpu_id 是获取负载的cpu的id
 // TODO:将获取负载情况调整为最近一段时间运行进程的数量
+#[allow(dead_code)]
 pub fn get_cpu_loads(cpu_id: ProcessorId) -> u32 {
     let cfs_scheduler = __get_cfs_scheduler();
     let rt_scheduler = __get_rt_scheduler();
@@ -63,20 +63,23 @@ pub fn get_cpu_loads(cpu_id: ProcessorId) -> u32 {
 }
 // 负载均衡
 pub fn loads_balance(pcb: Arc<ProcessControlBlock>) {
-    // 对pcb的迁移情况进行调整
+    // FIXME: 由于目前负载均衡是直接添加到目标CPU的队列中，导致会由于时序问题导致进程在两个CPU上都存在。
+    // 在调度子系统重写/改进之前，暂时只设置进程在0号CPU上运行
+    // 由于调度器问题，暂时不进行负载均衡，见issue: https://github.com/DragonOS-Community/DragonOS/issues/571
+    let min_loads_cpu_id = ProcessorId::new(0);
+
     // 获取总的CPU数量
-    let cpu_num = unsafe { smp_get_total_cpu() };
+    // let cpu_num = unsafe { smp_get_total_cpu() };
     // 获取当前负载最小的CPU的id
-    let mut min_loads_cpu_id = smp_get_processor_id();
-    let mut min_loads = get_cpu_loads(smp_get_processor_id());
-    for cpu_id in 0..cpu_num {
-        let cpu_id = ProcessorId::new(cpu_id);
-        let tmp_cpu_loads = get_cpu_loads(cpu_id);
-        if min_loads - tmp_cpu_loads > 0 {
-            min_loads_cpu_id = cpu_id;
-            min_loads = tmp_cpu_loads;
-        }
-    }
+    // let mut min_loads = get_cpu_loads(smp_get_processor_id());
+    // for cpu_id in 0..cpu_num {
+    //     let cpu_id = ProcessorId::new(cpu_id);
+    //     let tmp_cpu_loads = get_cpu_loads(cpu_id);
+    //     if min_loads - tmp_cpu_loads > 0 {
+    //         min_loads_cpu_id = cpu_id;
+    //         min_loads = tmp_cpu_loads;
+    //     }
+    // }
 
     let pcb_cpu = pcb.sched_info().on_cpu();
     // 将当前pcb迁移到负载最小的CPU

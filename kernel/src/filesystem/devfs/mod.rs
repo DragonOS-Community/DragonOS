@@ -50,7 +50,7 @@ impl FileSystem for DevFS {
         };
     }
 
-    fn name(&self)->&str {
+    fn name(&self) -> &str {
         "devfs"
     }
 }

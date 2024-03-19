@@ -281,7 +281,7 @@ impl FileSystem for ProcFS {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
-    fn name(&self)->&str {
+    fn name(&self) -> &str {
         "procfs"
     }
 }

@@ -580,7 +580,7 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;
 
-    fn name(&self)->&str;
+    fn name(&self) -> &str;
 }
 
 impl DowncastArc for dyn FileSystem {

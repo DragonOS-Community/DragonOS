@@ -150,6 +150,9 @@
     "rust-analyzer.linkedProjects": [
         "./kernel/Cargo.toml",
         "./tools/Cargo.toml",
+        "./kernel/Cargo.toml",
+        "./kernel/Cargo.toml",
+        "./kernel/Cargo.toml"
     ],
     // "rust-analyzer.cargo.target": "riscv64imac-unknown-none-elf",
     "rust-analyzer.cargo.target": "x86_64-unknown-none",
@@ -158,4 +161,5 @@
         "check",
         
     ],
+    "rust-analyzer.showUnlinkedFileNotification": false,
 }

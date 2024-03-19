@@ -48,7 +48,7 @@ impl FileSystem for KernFS {
         return self.root_inode.clone();
     }
 
-    fn name(&self)->&str {
+    fn name(&self) -> &str {
         "kernfs"
     }
 }

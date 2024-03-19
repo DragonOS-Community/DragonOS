@@ -395,7 +395,7 @@ impl FileSystem for MountFS {
         self
     }
 
-    fn name(&self)->&str {
+    fn name(&self) -> &str {
         "mountfs"
     }
 }

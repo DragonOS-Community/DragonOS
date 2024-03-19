@@ -77,7 +77,7 @@ impl FileSystem for RamFS {
         self
     }
 
-    fn name(&self)->&str {
+    fn name(&self) -> &str {
         "ramfs"
     }
 }

@@ -546,7 +546,7 @@ impl BinaryLoader for ElfLoader {
         let interpreter: Option<File> = None;
         for seg in phdr_table {
             if seg.p_type == PT_GNU_PROPERTY {
-                _gnu_property_data = Some(seg.clone());
+                _gnu_property_data = Some(seg);
                 continue;
             }
             if seg.p_type != PT_INTERP {

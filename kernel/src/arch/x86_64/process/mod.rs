@@ -257,8 +257,8 @@ impl ArchPCBInfo {
             cr2: self.cr2,
             fsbase: self.fsbase,
             gsbase: self.gsbase,
-            fs: self.fs.clone(),
-            gs: self.gs.clone(),
+            fs: self.fs,
+            gs: self.gs,
             gsdata: self.gsdata.clone(),
             fp_state: self.fp_state,
         }
@@ -320,7 +320,7 @@ impl ProcessManager {
         current_trapframe: &TrapFrame,
     ) -> Result<(), SystemError> {
         let clone_flags = clone_args.flags;
-        let mut child_trapframe = current_trapframe.clone();
+        let mut child_trapframe = *current_trapframe;
 
         // 子进程的返回值为0
         child_trapframe.set_return_value(0);
@@ -383,7 +383,7 @@ impl ProcessManager {
     /// - `prev`：上一个进程的pcb
     /// - `next`：下一个进程的pcb
     pub unsafe fn switch_process(prev: Arc<ProcessControlBlock>, next: Arc<ProcessControlBlock>) {
-        assert!(CurrentIrqArch::is_irq_enabled() == false);
+        assert!(!CurrentIrqArch::is_irq_enabled());
 
         // 保存浮点寄存器
         prev.arch_info_irqsave().save_fp_state();

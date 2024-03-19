@@ -20,11 +20,11 @@ pub const TYPE1_KEYCODE_FLAG_BREAK: u8 = 0x80; // 用于判断按键是否被按
 #[derive(Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum KeyFlag {
-    NoneFlag = 0 as u8,
-    PauseBreak = 1 as u8,
-    PrintScreenPress = 2 as u8,
-    PrintScreenRelease = 4 as u8,
-    OtherKey = 8 as u8, // 除了上面两个按键以外的功能按键（不包括下面的第三类按键）
+    NoneFlag = 0_u8,
+    PauseBreak = 1_u8,
+    PrintScreenPress = 2_u8,
+    PrintScreenRelease = 4_u8,
+    OtherKey = 8_u8, // 除了上面两个按键以外的功能按键（不包括下面的第三类按键）
 }
 
 /// @brief A FSM to parse type one keyboard scan code
@@ -249,7 +249,7 @@ impl TypeOneFSMState {
                 // 数字小键盘的 / 符号
                 scancode_status.kp_forward_slash = true;
 
-                let ch = '/' as u8;
+                let ch = b'/';
                 Self::emit(ch);
             }
             0xb5 => {
@@ -257,7 +257,7 @@ impl TypeOneFSMState {
             }
             0x1c => {
                 scancode_status.kp_enter = true;
-                Self::emit('\n' as u8);
+                Self::emit(b'\n');
             }
             0x9c => {
                 scancode_status.kp_enter = false;
@@ -312,7 +312,7 @@ impl TypeOneFSMState {
                 key = KeyFlag::NoneFlag;
             }
             _ => {
-                if flag_make == false {
+                if !flag_make {
                     // kdebug!("in type3 ch is {:#x}\n",ch);
                     key = KeyFlag::NoneFlag;
                 }
@@ -488,31 +488,31 @@ const TYPE1_KEY_CODE_MAPTABLE: [u8; 256] = [
     0,
     /*0x01*/ 0,
     0, // ESC
-    /*0x02*/ b'1' as u8,
-    b'!' as u8,
-    /*0x03*/ b'2' as u8,
-    b'@' as u8,
-    /*0x04*/ b'3' as u8,
-    b'#' as u8,
-    /*0x05*/ b'4' as u8,
-    b'$' as u8,
-    /*0x06*/ b'5' as u8,
-    b'%' as u8,
-    /*0x07*/ b'6' as u8,
-    b'^' as u8,
-    /*0x08*/ b'7' as u8,
-    b'&' as u8,
-    /*0x09*/ b'8' as u8,
-    b'*' as u8,
-    /*0x0a*/ b'9' as u8,
-    b'(' as u8,
-    /*0x0b*/ b'0' as u8,
-    b')' as u8,
-    /*0x0c*/ b'-' as u8,
-    b'_' as u8,
-    /*0x0d*/ b'=' as u8,
-    b'+' as u8,
-    /*0x0e  \b */ 8 as u8,
+    /*0x02*/ b'1',
+    b'!',
+    /*0x03*/ b'2',
+    b'@',
+    /*0x04*/ b'3',
+    b'#',
+    /*0x05*/ b'4',
+    b'$',
+    /*0x06*/ b'5',
+    b'%',
+    /*0x07*/ b'6',
+    b'^',
+    /*0x08*/ b'7',
+    b'&',
+    /*0x09*/ b'8',
+    b'*',
+    /*0x0a*/ b'9',
+    b'(',
+    /*0x0b*/ b'0',
+    b')',
+    /*0x0c*/ b'-',
+    b'_',
+    /*0x0d*/ b'=',
+    b'+',
+    /*0x0e  \b */ 8,
     8 as u8, // BACKSPACE
     /*0x0f*/ b'\t' as u8,
     b'\t' as u8, // TAB

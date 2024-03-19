@@ -567,7 +567,7 @@ pub fn test_buddy() {
                 if random_index % 10 > 7 {
                     continue;
                 }
-                random_index = random_index % v.len() as u64;
+                random_index %= v.len() as u64;
                 let random_index = random_index as usize;
                 let (paddr, allocated_frame_count) = v.remove(random_index);
                 assert!(addr_set.remove(&paddr));
@@ -626,7 +626,7 @@ impl FrameAllocator for LockedFrameAllocator {
 
 /// 获取内核地址默认的页面标志
 pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> PageFlags<A> {
-    let info: X86_64MMBootstrapInfo = BOOTSTRAP_MM_INFO.clone().unwrap();
+    let info: X86_64MMBootstrapInfo = BOOTSTRAP_MM_INFO.unwrap();
 
     if virt.data() >= info.kernel_code_start && virt.data() < info.kernel_code_end {
         // Remap kernel code  execute
@@ -686,7 +686,7 @@ impl LowAddressRemapping {
                 .unwrap()
                 .unmap_phys(vaddr, true)
                 .expect("Failed to unmap frame");
-            if flush == false {
+            if !flush {
                 flusher.ignore();
             }
         }

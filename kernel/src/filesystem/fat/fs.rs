@@ -1091,7 +1091,6 @@ impl FATFileSystem {
                 cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
                 cursor.write_u16(new_val)?;
                 self.partition.disk().write_at(lba, 1, cursor.as_slice())?;
-                // self.partition.disk().write_at(lba, 1, cursor.as_slice())?;
                 return Ok(());
             }
             FATType::FAT16(_) => {

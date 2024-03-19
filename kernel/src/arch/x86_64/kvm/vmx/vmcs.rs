@@ -519,10 +519,8 @@ const fn encode_vmcs_field(
     index: u32,
 ) -> u32 {
     let mut encoding: u32 = 0;
-    encoding |= (access_type as u32)
-        | (index as u32) << 1
-        | (vmcs_type as u32) << 10
-        | (vmcs_width as u32) << 13;
+    encoding |=
+        (access_type as u32) | (index) << 1 | (vmcs_type as u32) << 10 | (vmcs_width as u32) << 13;
     return encoding;
 }
 

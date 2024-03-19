@@ -100,14 +100,14 @@ impl SmpBootData {
     }
 
     pub unsafe fn set_cpu_count(&self, cpu_count: u32) {
-        if self.initialized.load(Ordering::SeqCst) == false {
+        if !self.initialized.load(Ordering::SeqCst) {
             let p = self as *const SmpBootData as *mut SmpBootData;
             (*p).cpu_count = cpu_count.try_into().unwrap();
         }
     }
 
     pub unsafe fn set_phys_id(&self, cpu_id: ProcessorId, phys_id: usize) {
-        if self.initialized.load(Ordering::SeqCst) == false {
+        if !self.initialized.load(Ordering::SeqCst) {
             let p = self as *const SmpBootData as *mut SmpBootData;
             (*p).phys_id[cpu_id.data() as usize] = phys_id;
         }

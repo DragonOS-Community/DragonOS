@@ -222,13 +222,11 @@ pub fn __direct_map(
         return Err(SystemError::KVM_HVA_ERR_BAD);
     }
     // 把gpa映射到hpa
-    {
-        let mut ept_mapper = EptMapper::lock();
-        let page_flags = PageFlags::from_prot_flags(ProtFlags::from_bits_truncate(0x7_u64), false);
-        unsafe {
-            assert!(ept_mapper.walk(gpa, pfn << PAGE_SHIFT, page_flags).is_ok());
-        }
-    } // 通过作用域提前丢弃ept_mapper, 虽然我不知道有什么用xd
+    let mut ept_mapper = EptMapper::lock();
+    let page_flags = PageFlags::from_prot_flags(ProtFlags::from_bits_truncate(0x7_u64), false);
+    unsafe {
+        assert!(ept_mapper.walk(gpa, pfn << PAGE_SHIFT, page_flags).is_ok());
+    }
     return Ok(0);
 }
 

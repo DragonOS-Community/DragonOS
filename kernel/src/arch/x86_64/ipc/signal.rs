@@ -435,7 +435,7 @@ impl SignalArch for X86_64SignalArch {
         let mut sig_number: Signal;
         let mut info: Option<SigInfo>;
         let mut sigaction: Sigaction;
-        let sig_block: SigSet = siginfo_read_guard.sig_block().clone();
+        let sig_block: SigSet = *siginfo_read_guard.sig_block();
         drop(siginfo_read_guard);
 
         let sig_guard = pcb.try_sig_struct_irqsave(5);

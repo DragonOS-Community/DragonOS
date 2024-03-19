@@ -454,8 +454,8 @@ impl CurrentApic {
     }
 
     pub(self) unsafe fn write_xapic_register(&self, reg: XApicOffset, value: u32) {
-        if let Some(xapic) = current_xapic_instance().borrow_mut().as_mut() { 
-            xapic.write(reg, value); 
+        if let Some(xapic) = current_xapic_instance().borrow_mut().as_mut() {
+            xapic.write(reg, value);
         }
     }
 

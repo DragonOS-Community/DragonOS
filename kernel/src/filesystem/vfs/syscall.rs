@@ -1,3 +1,5 @@
+use core::mem::size_of;
+
 use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
@@ -79,6 +81,7 @@ bitflags! {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 /// # 文件信息结构体
 pub struct PosixKstat {
     /// 硬件设备ID
@@ -242,21 +245,33 @@ impl Syscall {
     /// @return 文件描述符编号，或者是错误码
     pub fn open(
         path: *const u8,
-        flags: FileMode,
-        mode: ModeType,
+        o_flags: u32,
+        mode: u32,
         follow_symlink: bool,
     ) -> Result<usize, SystemError> {
-        return do_sys_open(AtFlags::AT_FDCWD.bits(), path, flags, mode, follow_symlink);
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
+        let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
+        return do_sys_open(
+            AtFlags::AT_FDCWD.bits(),
+            &path,
+            open_flags,
+            mode,
+            follow_symlink,
+        );
     }
 
     pub fn openat(
         dirfd: i32,
         path: *const u8,
-        o_flags: FileMode,
-        mode: ModeType,
+        o_flags: u32,
+        mode: u32,
         follow_symlink: bool,
     ) -> Result<usize, SystemError> {
-        return do_sys_open(dirfd, path, o_flags, mode, follow_symlink);
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
+        let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
+        return do_sys_open(dirfd, &path, open_flags, mode, follow_symlink);
     }
 
     /// @brief 关闭文件
@@ -431,6 +446,10 @@ impl Syscall {
     ///  
     /// ENAMETOOLONG |        路径过长        
     pub fn chdir(path: *const u8) -> Result<usize, SystemError> {
+        if path.is_null() {
+            return Err(SystemError::EFAULT);
+        }
+
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
         let proc = ProcessManager::current_pcb();
         // Copy path to kernel space to avoid some security issues
@@ -535,7 +554,8 @@ impl Syscall {
     ///
     /// @return uint64_t 负数错误码 / 0表示成功
     pub fn mkdir(path: *const u8, mode: usize) -> Result<usize, SystemError> {
-        return do_mkdir(path, FileMode::from_bits_truncate(mode as u32)).map(|x| x as usize);
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        return do_mkdir(&path, FileMode::from_bits_truncate(mode as u32)).map(|x| x as usize);
     }
 
     /// **删除文件夹、取消文件的链接、删除文件的系统调用**
@@ -550,9 +570,11 @@ impl Syscall {
     pub fn unlinkat(dirfd: i32, path: *const u8, flags: u32) -> Result<usize, SystemError> {
         let flags = AtFlags::from_bits(flags as i32).ok_or(SystemError::EINVAL)?;
 
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+
         if flags.contains(AtFlags::AT_REMOVEDIR) {
             // kdebug!("rmdir");
-            match do_remove_dir(dirfd, path) {
+            match do_remove_dir(dirfd, &path) {
                 Err(err) => {
                     return Err(err);
                 }
@@ -562,7 +584,7 @@ impl Syscall {
             }
         }
 
-        match do_unlink_at(dirfd, path) {
+        match do_unlink_at(dirfd, &path) {
             Err(err) => {
                 return Err(err);
             }
@@ -573,11 +595,13 @@ impl Syscall {
     }
 
     pub fn rmdir(path: *const u8) -> Result<usize, SystemError> {
-        return do_remove_dir(AtFlags::AT_FDCWD.bits(), path).map(|v| v as usize);
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        return do_remove_dir(AtFlags::AT_FDCWD.bits(), &path).map(|v| v as usize);
     }
 
     pub fn unlink(path: *const u8) -> Result<usize, SystemError> {
-        return do_unlink_at(AtFlags::AT_FDCWD.bits(), path).map(|v| v as usize);
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        return do_unlink_at(AtFlags::AT_FDCWD.bits(), &path).map(|v| v as usize);
     }
 
     /// @brief 根据提供的文件描述符的fd，复制对应的文件结构体，并返回新复制的文件结构体对应的fd
@@ -825,25 +849,32 @@ impl Syscall {
     }
 
     pub fn fstat(fd: i32, usr_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
+        let mut writer = UserBufferWriter::new(usr_kstat, size_of::<PosixKstat>(), true)?;
         let kstat = Self::do_fstat(fd)?;
-        if usr_kstat.is_null() {
-            return Err(SystemError::EFAULT);
-        }
-        unsafe {
-            *usr_kstat = kstat;
-        }
+
+        writer.copy_one_to_user(&kstat, 0)?;
         return Ok(0);
     }
 
     pub fn stat(path: *const u8, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
-        let fd = Self::open(path, FileMode::O_RDONLY, ModeType::empty(), true)?;
+        let fd = Self::open(
+            path,
+            FileMode::O_RDONLY.bits(),
+            ModeType::empty().bits(),
+            true,
+        )?;
         let r = Self::fstat(fd as i32, user_kstat);
         Self::close(fd).ok();
         return r;
     }
 
     pub fn lstat(path: *const u8, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
-        let fd = Self::open(path, FileMode::O_RDONLY, ModeType::empty(), false)?;
+        let fd = Self::open(
+            path,
+            FileMode::O_RDONLY.bits(),
+            ModeType::empty().bits(),
+            false,
+        )?;
         let r = Self::fstat(fd as i32, user_kstat);
         Self::close(fd).ok();
         return r;

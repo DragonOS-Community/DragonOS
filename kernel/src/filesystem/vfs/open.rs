@@ -61,7 +61,7 @@ pub fn do_fchmodat(dirfd: i32, path: *const u8, _mode: ModeType) -> Result<usize
 
 pub(super) fn do_sys_open(
     dfd: i32,
-    path: *const u8,
+    path: &str,
     o_flags: FileMode,
     mode: ModeType,
     follow_symlink: bool,
@@ -72,13 +72,12 @@ pub(super) fn do_sys_open(
 
 fn do_sys_openat2(
     dirfd: i32,
-    path: *const u8,
+    path: &str,
     how: OpenHow,
     follow_symlink: bool,
 ) -> Result<usize, SystemError> {
     // kdebug!("open: path: {}, mode: {:?}", path, mode);
-    let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
-    let path = path.as_str().trim();
+    let path = path.trim();
 
     let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
     let inode: Result<Arc<dyn IndexNode>, SystemError> = inode_begin.lookup_follow_symlink(

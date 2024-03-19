@@ -1,5 +1,5 @@
 use core::{
-    ffi::{c_char, c_int, c_void},
+    ffi::{c_int, c_void},
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -28,7 +28,7 @@ use crate::{
         syscall::{ModeType, PosixKstat},
         MAX_PATHLEN,
     },
-    include::bindings::bindings::{PAGE_2M_SIZE, PAGE_4K_SIZE},
+    include::bindings::bindings::PAGE_4K_SIZE,
     kinfo,
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
@@ -90,23 +90,19 @@ impl Syscall {
             #[cfg(target_arch = "x86_64")]
             SYS_OPEN => {
                 let path = args[0] as *const u8;
-                let flags = args[1];
-                let mode = args[2];
-                let open_flags: FileMode = FileMode::from_bits_truncate(flags as u32);
-                let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
-                Self::open(path, open_flags, mode, true)
+                let flags = args[1] as u32;
+                let mode = args[2] as u32;
+
+                Self::open(path, flags, mode, true)
             }
 
             SYS_OPENAT => {
                 let dirfd = args[0] as i32;
                 let path = args[1] as *const u8;
-                let flags = args[2];
-                let mode = args[3];
+                let flags = args[2] as u32;
+                let mode = args[3] as u32;
 
-                let open_flags: FileMode =
-                    FileMode::from_bits(flags as u32).ok_or(SystemError::EINVAL)?;
-                let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
-                Self::openat(dirfd, path, open_flags, mode, true)
+                Self::openat(dirfd, path, flags, mode, true)
             }
             SYS_CLOSE => {
                 let fd = args[0];
@@ -193,18 +189,6 @@ impl Syscall {
             SYS_REBOOT => Self::reboot(),
 
             SYS_CHDIR => {
-                if args[0] == 0 {
-                    return Err(SystemError::EFAULT);
-                }
-                let path_ptr = args[0] as *const c_char;
-                let virt_addr = VirtAddr::new(path_ptr as usize);
-                // 权限校验
-                if path_ptr.is_null()
-                    || (frame.from_user() && verify_area(virt_addr, PAGE_2M_SIZE as usize).is_err())
-                {
-                    return Err(SystemError::EINVAL);
-                }
-
                 let r = args[0] as *const u8;
                 Self::chdir(r)
             }
@@ -272,17 +256,9 @@ impl Syscall {
             }
             #[cfg(target_arch = "x86_64")]
             SYS_MKDIR => {
-                let path_ptr = args[0] as *const c_char;
-                let mode = args[1];
-                let virt_path_ptr = VirtAddr::new(path_ptr as usize);
-                if path_ptr.is_null()
-                    || (frame.from_user()
-                        && verify_area(virt_path_ptr, PAGE_2M_SIZE as usize).is_err())
-                {
-                    return Err(SystemError::EINVAL);
-                }
-
                 let path = args[0] as *const u8;
+                let mode = args[1];
+
                 Self::mkdir(path, mode)
             }
 
@@ -326,18 +302,9 @@ impl Syscall {
 
             SYS_UNLINKAT => {
                 let dirfd = args[0] as i32;
-                let path_ptr = args[1] as *const c_char;
+                let path = args[1] as *const u8;
                 let flags = args[2] as u32;
-                let virt_pathname = VirtAddr::new(path_ptr as usize);
-                if frame.from_user() && verify_area(virt_pathname, PAGE_4K_SIZE as usize).is_err() {
-                    Err(SystemError::EFAULT)
-                } else if path_ptr.is_null() {
-                    Err(SystemError::EFAULT)
-                } else {
-                    let path = args[1] as *const u8;
-                    // kdebug!("sys unlinkat: dirfd: {}, pathname: {}", dirfd, pathname.as_ref().unwrap());
-                    Self::unlinkat(dirfd, path, flags)
-                }
+                Self::unlinkat(dirfd, path, flags)
             }
 
             #[cfg(target_arch = "x86_64")]
@@ -696,22 +663,14 @@ impl Syscall {
             SYS_LSTAT => {
                 let path = args[0] as *const u8;
                 let kstat = args[1] as *mut PosixKstat;
-                let vaddr = VirtAddr::new(kstat as usize);
-                match verify_area(vaddr, core::mem::size_of::<PosixKstat>()) {
-                    Ok(_) => Self::lstat(path, kstat),
-                    Err(e) => Err(e),
-                }
+                Self::lstat(path, kstat)
             }
 
             #[cfg(target_arch = "x86_64")]
             SYS_STAT => {
                 let path = args[0] as *const u8;
                 let kstat = args[1] as *mut PosixKstat;
-                let vaddr = VirtAddr::new(kstat as usize);
-                match verify_area(vaddr, core::mem::size_of::<PosixKstat>()) {
-                    Ok(_) => Self::stat(path, kstat),
-                    Err(e) => Err(e),
-                }
+                Self::stat(path, kstat)
             }
 
             SYS_EPOLL_CREATE => Self::epoll_create(args[0] as i32),

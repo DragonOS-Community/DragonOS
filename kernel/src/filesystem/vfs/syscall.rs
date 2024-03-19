@@ -1069,7 +1069,7 @@ impl Syscall {
     ///
     /// ## 参数:
     ///
-    /// - source       挂载设备
+    /// - source       挂载设备(暂时不支持)
     /// - target       挂载目录
     /// - filesystemtype   文件系统
     /// - mountflags     挂载选项（暂未实现）
@@ -1085,8 +1085,6 @@ impl Syscall {
         _mountflags: usize,
         _data: *const c_void,
     ) -> Result<usize, SystemError> {
-        let _source = user_access::check_and_clone_cstr(_source, Some(MAX_PATHLEN))?;
-
         let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?;
 
         let filesystemtype = user_access::check_and_clone_cstr(filesystemtype, Some(MAX_PATHLEN))?;

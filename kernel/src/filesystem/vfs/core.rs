@@ -191,7 +191,6 @@ pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
             let parent_inode: Arc<dyn IndexNode> =
                 ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
             // 创建文件夹
-            kdebug!("{:?}", _mode);
             let _create_inode: Arc<dyn IndexNode> = parent_inode.create(
                 filename,
                 FileType::Dir,
@@ -277,7 +276,7 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 
 // @brief mount filesystem
 pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<usize, SystemError> {
-    let _t = ROOT_INODE()
+    ROOT_INODE()
         .lookup_follow_symlink(&mount_point, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
         .mount(fs)?;
     Ok(0)

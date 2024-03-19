@@ -1,6 +1,14 @@
 use core::any::Any;
 use core::intrinsics::unlikely;
 
+use crate::filesystem::vfs::FSMAKER;
+use crate::{
+    driver::base::device::device_number::DeviceNumber,
+    filesystem::vfs::{core::generate_inode_id, FileType},
+    ipc::pipe::LockedPipeInode,
+    libs::spinlock::{SpinLock, SpinLockGuard},
+    time::TimeSpec,
+};
 use alloc::{
     collections::BTreeMap,
     string::String,
@@ -9,17 +17,9 @@ use alloc::{
 };
 use system_error::SystemError;
 
-use crate::{
-    driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{core::generate_inode_id, FileType},
-    ipc::pipe::LockedPipeInode,
-    libs::spinlock::{SpinLock, SpinLockGuard},
-    time::TimeSpec,
-};
-
 use super::vfs::{
-    file::FilePrivateData, syscall::ModeType, FileSystem, FsInfo, IndexNode, InodeId, Metadata,
-    SpecialNodeData,
+    file::FilePrivateData, syscall::ModeType, FileSystem, FileSystemMaker, FsInfo, IndexNode,
+    InodeId, Metadata, SpecialNodeData,
 };
 
 /// RamFS的inode名称的最大长度
@@ -122,7 +122,18 @@ impl RamFS {
 
         return result;
     }
+
+    pub fn make_ramfs() -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        let fs = RamFS::new();
+        return Ok(fs);
+    }
 }
+
+#[distributed_slice(FSMAKER)]
+static RAMFSMAKER: FileSystemMaker = FileSystemMaker::new(
+    "ramfs",
+    &(RamFS::make_ramfs as fn() -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
+);
 
 impl IndexNode for LockedRamFSInode {
     fn truncate(&self, len: usize) -> Result<(), SystemError> {

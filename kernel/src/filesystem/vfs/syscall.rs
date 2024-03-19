@@ -1,12 +1,6 @@
 use core::ffi::{c_void, CStr};
 
-use alloc::{
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
-use system_error::SystemError;
-
+use crate::producefs;
 use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
     filesystem::{
@@ -23,6 +17,12 @@ use crate::{
     },
     time::TimeSpec,
 };
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
+use system_error::SystemError;
 
 use super::{
     core::{do_mkdir, do_remove_dir, do_unlink_at},
@@ -30,7 +30,8 @@ use super::{
     file::{File, FileMode},
     open::{do_faccessat, do_fchmodat, do_sys_open},
     utils::{rsplit_path, user_path_at},
-    Dirent, FileSystem, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    Dirent, FileSystem, FileType, IndexNode, FSMAKER, MAX_PATHLEN, ROOT_INODE,
+    VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 // use crate::kdebug;
 
@@ -1054,10 +1055,7 @@ impl Syscall {
         )?;
 
         //TODO 将判断逻辑迁移到FS中实现
-        let filesystemtype = match filesystemtype.as_str() {
-            "ramfs" => Ok(RamFS::new()),
-            _ => Err(SystemError::EINVAL),
-        }?;
+        let filesystemtype = producefs!(FSMAKER, filesystemtype)?;
 
         return Vcore::do_mount(filesystemtype, (format!("{target}{source}")).as_str());
     }

@@ -69,11 +69,7 @@ impl VideoRefreshManager {
         let res = self
             .running
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
-        if res.is_ok() {
-            return true;
-        } else {
-            return false;
-        }
+        return res.is_ok();
     }
 
     /**

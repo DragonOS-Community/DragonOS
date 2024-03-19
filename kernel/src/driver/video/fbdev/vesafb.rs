@@ -533,8 +533,7 @@ impl FrameBufferOps for VesaFb {
                         }
                     }
                 } else {
-                    let mut tmp: Vec<u32> = Vec::with_capacity(size);
-                    tmp.resize(size, 0);
+                    let mut tmp: Vec<u32> = vec![0; size];
                     let mut tmp_ptr = tmp.as_mut_ptr();
 
                     // 这里是一个可以优化的点，现在为了避免指针拷贝时覆盖，统一先拷贝进入buf再拷贝到dst

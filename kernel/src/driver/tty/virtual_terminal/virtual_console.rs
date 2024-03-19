@@ -206,11 +206,11 @@ impl VirtualConsoleData {
     }
 
     pub(super) fn init(&mut self, rows: Option<usize>, cols: Option<usize>, clear: bool) {
-        if rows.is_some() {
-            self.rows = rows.unwrap();
+        if let Some(rows) = rows {
+            self.rows = rows;
         }
-        if cols.is_some() {
-            self.cols = cols.unwrap();
+        if let Some(cols) = cols {
+            self.cols = cols;
         }
 
         self.pos = self.cols * self.state.y + self.state.x;
@@ -321,8 +321,8 @@ impl VirtualConsoleData {
         if self.utf && !self.display_ctrl {
             // utf模式并且不显示控制字符
             let (ret, rescan) = self.translate_unicode(*c);
-            if ret.is_some() {
-                *c = ret.unwrap();
+            if let Some(ret) = ret {
+                *c = ret;
             }
             return (ret, rescan);
         }
@@ -425,7 +425,7 @@ impl VirtualConsoleData {
     /// 但是有一些特殊的代码点是无效的或者保留给特定用途的。
     /// 这个函数的主要目的是将无效的 Unicode 代码点替换为 U+FFFD，即 Unicode 替代字符。
     fn sanitize_unicode(c: u32) -> u32 {
-        if (c >= 0xd800 && c <= 0xdfff) || c == 0xfffe || c == 0xffff {
+        if (0xd800..=0xdfff).contains(&c) || c == 0xfffe || c == 0xffff {
             return 0xfffd;
         }
         return c;
@@ -523,7 +523,7 @@ impl VirtualConsoleData {
 
         let _ =
             self.driver_funcs()
-                .con_putc(&self, i as u16, self.state.y as u32, self.state.x as u32);
+                .con_putc(self, i as u16, self.state.y as u32, self.state.x as u32);
     }
 
     pub fn hide_cursor(&mut self) {
@@ -538,7 +538,7 @@ impl VirtualConsoleData {
         if softcursor.is_some() {
             self.screen_buf[self.pos] = softcursor.unwrap().bits as u16;
             let _ = self.driver_funcs().con_putc(
-                &self,
+                self,
                 softcursor.unwrap().bits as u16,
                 self.state.y as u32,
                 self.state.x as u32,
@@ -577,9 +577,9 @@ impl VirtualConsoleData {
         }
 
         if y < min_y as i32 {
-            self.state.y = min_y as usize;
+            self.state.y = min_y;
         } else if y >= max_y as i32 {
-            self.state.y = max_y as usize;
+            self.state.y = max_y;
         } else {
             self.state.y = y as usize;
         }
@@ -633,7 +633,7 @@ impl VirtualConsoleData {
 
     /// ## 换行
     fn line_feed(&mut self) {
-        if self.state.y + 1 == self.bottom as usize {
+        if self.state.y + 1 == self.bottom {
             self.scroll(ScrollDir::Up, 1);
         } else if self.state.y < self.rows - 1 {
             self.state.y += 1;
@@ -659,7 +659,7 @@ impl VirtualConsoleData {
 
     /// ## 向上滚动虚拟终端的内容，或者将光标上移一行
     fn reverse_index(&mut self) {
-        if self.state.y == self.top as usize {
+        if self.state.y == self.top {
             self.scroll(ScrollDir::Down, 1);
         } else if self.state.y > 0 {
             self.state.y -= 1;
@@ -744,9 +744,9 @@ impl VirtualConsoleData {
             return;
         }
 
-        if c >= '0' && c <= '9' {
+        if c.is_ascii_digit() {
             self.par[self.npar as usize] *= 10;
-            self.par[self.npar as usize] += (c as u8 - '0' as u8) as u32;
+            self.par[self.npar as usize] += (c as u8 - b'0') as u32;
             return;
         }
 
@@ -928,7 +928,7 @@ impl VirtualConsoleData {
             }
             'g' => {
                 if self.par[0] == 0 && self.state.x < 256 {
-                    self.tab_stop.set(self.state.x as usize, true);
+                    self.tab_stop.set(self.state.x, true);
                 } else if self.par[0] == 3 {
                     self.tab_stop.set_all(false);
                 }
@@ -1260,7 +1260,7 @@ impl VirtualConsoleData {
     #[inline(never)]
     pub(super) fn do_control(&mut self, ch: u32) {
         // 首先检查是否处于 ANSI 控制字符串状态
-        if self.vc_state.is_ansi_control_string() && ch >= 8 && ch <= 13 {
+        if self.vc_state.is_ansi_control_string() && (8..=13).contains(&ch) {
             return;
         }
 
@@ -1297,7 +1297,7 @@ impl VirtualConsoleData {
                 // TODO: notify
                 return;
             }
-            10 | 11 | 12 => {
+            10..=12 => {
                 // LD line feed
                 self.line_feed();
                 // TODO: 检查键盘模式
@@ -1476,7 +1476,7 @@ impl VirtualConsoleData {
                 return;
             }
             VirtualConsoleState::EScsiignore => {
-                if ch >= 20 && ch <= 0x3f {
+                if (20..=0x3f).contains(&ch) {
                     return;
                 }
                 self.vc_state = VirtualConsoleState::ESnormal;
@@ -1494,7 +1494,7 @@ impl VirtualConsoleData {
                 } else if c == 'R' {
                     self.reset_palette();
                     self.vc_state = VirtualConsoleState::ESnormal;
-                } else if c >= '0' && c <= '9' {
+                } else if c.is_ascii_digit() {
                     self.vc_state = VirtualConsoleState::ESosc;
                 } else {
                     self.vc_state = VirtualConsoleState::ESnormal;
@@ -1502,7 +1502,7 @@ impl VirtualConsoleData {
             }
             VirtualConsoleState::ESpalette => {
                 let c = ch as u8 as char;
-                if c.is_digit(16) {
+                if c.is_ascii_hexdigit() {
                     self.npar += 1;
                     self.par[self.npar as usize] = c.to_digit(16).unwrap();
 
@@ -1593,7 +1593,7 @@ impl VirtualConsoleData {
             // TODO: 处理unicode screen buf
 
             if himask != 0 {
-                tc = ((if tc & 0x100 != 0 { himask as u32 } else { 0 }) | (tc & 0xff)) as u32;
+                tc = ((if tc & 0x100 != 0 { himask as u32 } else { 0 }) | (tc & 0xff));
             }
 
             tc |= ((attr as u32) << 8) & (!himask as u32);

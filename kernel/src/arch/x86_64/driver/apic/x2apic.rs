@@ -47,7 +47,7 @@ impl LocalAPIC for X2Apic {
 
                 if self.support_eoi_broadcast_suppression() {
                     assert!(
-                        (rdmsr(IA32_X2APIC_SIVR.into()) & 0x1000) == 0x1000,
+                        (rdmsr(IA32_X2APIC_SIVR) & 0x1000) == 0x1000,
                         "x2APIC EOI broadcast suppression enable failed."
                     );
                     kinfo!("x2APIC EOI broadcast suppression enabled.");
@@ -77,7 +77,7 @@ impl LocalAPIC for X2Apic {
     }
 
     fn max_lvt_entry(&self) -> u8 {
-        unsafe { ((rdmsr(IA32_X2APIC_VERSION.into()) >> 16) & 0xff) as u8 + 1 }
+        unsafe { ((rdmsr(IA32_X2APIC_VERSION) >> 16) & 0xff) as u8 + 1 }
     }
 
     /// 获取 x2APIC 的 APIC ID

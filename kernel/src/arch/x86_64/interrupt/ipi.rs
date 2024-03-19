@@ -102,7 +102,7 @@ impl ArchIpiTarget {
     #[inline(always)]
     fn cpu_id_to_apic_id(cpu_id: ProcessorId) -> x86::apic::ApicId {
         if CurrentApic.x2apic_enabled() {
-            x86::apic::ApicId::X2Apic(cpu_id.data() as u32)
+            x86::apic::ApicId::X2Apic(cpu_id.data())
         } else {
             x86::apic::ApicId::XApic(cpu_id.data() as u8)
         }

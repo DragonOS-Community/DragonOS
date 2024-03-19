@@ -131,7 +131,7 @@ impl Syscall {
                 let fd = args[0] as i32;
                 let buf_vaddr = args[1];
                 let len = args[2];
-                let from_user = frame.from_user();
+                let from_user = frame.is_from_user();
                 let mut user_buffer_writer =
                     UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)?;
 
@@ -142,7 +142,7 @@ impl Syscall {
                 let fd = args[0] as i32;
                 let buf_vaddr = args[1];
                 let len = args[2];
-                let from_user = frame.from_user();
+                let from_user = frame.is_from_user();
                 let user_buffer_reader =
                     UserBufferReader::new(buf_vaddr as *const u8, len, from_user)?;
 
@@ -173,7 +173,7 @@ impl Syscall {
                 let offset = args[3];
 
                 let mut user_buffer_writer =
-                    UserBufferWriter::new(buf_vaddr as *mut u8, len, frame.from_user())?;
+                    UserBufferWriter::new(buf_vaddr as *mut u8, len, frame.is_from_user())?;
                 let buf = user_buffer_writer.buffer(0)?;
                 Self::pread(fd, buf, len, offset)
             }
@@ -185,7 +185,7 @@ impl Syscall {
                 let offset = args[3];
 
                 let user_buffer_reader =
-                    UserBufferReader::new(buf_vaddr as *const u8, len, frame.from_user())?;
+                    UserBufferReader::new(buf_vaddr as *const u8, len, frame.is_from_user())?;
 
                 let buf = user_buffer_reader.read_from_user(0)?;
                 Self::pwrite(fd, buf, len, offset)
@@ -225,7 +225,7 @@ impl Syscall {
                     let virt_addr = VirtAddr::new(path_ptr as usize);
                     // 权限校验
                     if path_ptr.is_null()
-                        || (frame.from_user()
+                        || (frame.is_from_user()
                             && verify_area(virt_addr, PAGE_2M_SIZE as usize).is_err())
                     {
                         return Err(SystemError::EINVAL);
@@ -253,7 +253,7 @@ impl Syscall {
                 let len = args[2];
                 let virt_addr: VirtAddr = VirtAddr::new(buf_vaddr);
                 // 判断缓冲区是否来自用户态，进行权限校验
-                let res = if frame.from_user() && verify_area(virt_addr, len).is_err() {
+                let res = if frame.is_from_user() && verify_area(virt_addr, len).is_err() {
                     // 来自用户态，而buffer在内核态，这样的操作不被允许
                     Err(SystemError::EPERM)
                 } else if buf_vaddr == 0 {
@@ -276,7 +276,7 @@ impl Syscall {
                 let virt_argv_ptr = VirtAddr::new(argv_ptr);
                 let virt_env_ptr = VirtAddr::new(env_ptr);
                 // 权限校验
-                if frame.from_user()
+                if frame.is_from_user()
                     && (verify_area(virt_path_ptr, MAX_PATHLEN).is_err()
                         || verify_area(virt_argv_ptr, PAGE_4K_SIZE as usize).is_err())
                     || verify_area(virt_env_ptr, PAGE_4K_SIZE as usize).is_err()
@@ -313,7 +313,7 @@ impl Syscall {
                 let virt_path_ptr = VirtAddr::new(path_ptr as usize);
                 let security_check = || {
                     if path_ptr.is_null()
-                        || (frame.from_user()
+                        || (frame.is_from_user()
                             && verify_area(virt_path_ptr, PAGE_2M_SIZE as usize).is_err())
                     {
                         return Err(SystemError::EINVAL);
@@ -340,7 +340,7 @@ impl Syscall {
                 let rem = args[1] as *mut TimeSpec;
                 let virt_req = VirtAddr::new(req as usize);
                 let virt_rem = VirtAddr::new(rem as usize);
-                if frame.from_user()
+                if frame.is_from_user()
                     && (verify_area(virt_req, core::mem::size_of::<TimeSpec>()).is_err()
                         || verify_area(virt_rem, core::mem::size_of::<TimeSpec>()).is_err())
                 {
@@ -377,7 +377,8 @@ impl Syscall {
                 let pathname = args[1] as *const c_char;
                 let flags = args[2] as u32;
                 let virt_pathname = VirtAddr::new(pathname as usize);
-                if (frame.from_user() && verify_area(virt_pathname, PAGE_4K_SIZE as usize).is_err())
+                if (frame.is_from_user()
+                    && verify_area(virt_pathname, PAGE_4K_SIZE as usize).is_err())
                     || pathname.is_null()
                 {
                     Err(SystemError::EFAULT)
@@ -423,12 +424,12 @@ impl Syscall {
                 let sig = args[0] as c_int;
                 let act = args[1];
                 let old_act = args[2];
-                Self::sigaction(sig, act, old_act, frame.from_user())
+                Self::sigaction(sig, act, old_act, frame.is_from_user())
             }
 
             SYS_GETPID => Self::getpid().map(|pid| pid.into()),
 
-            SYS_SCHED => Self::sched(frame.from_user()),
+            SYS_SCHED => Self::sched(frame.is_from_user()),
             SYS_DUP => {
                 let oldfd: i32 = args[0] as c_int;
                 Self::dup(oldfd)
@@ -566,8 +567,11 @@ impl Syscall {
                 let msg = args[1] as *mut MsgHdr;
                 let flags = args[2] as u32;
 
-                let mut user_buffer_writer =
-                    UserBufferWriter::new(msg, core::mem::size_of::<MsgHdr>(), frame.from_user())?;
+                let mut user_buffer_writer = UserBufferWriter::new(
+                    msg,
+                    core::mem::size_of::<MsgHdr>(),
+                    frame.is_from_user(),
+                )?;
                 let buffer = user_buffer_writer.buffer::<MsgHdr>(0)?;
 
                 let msg = &mut buffer[0];
@@ -836,7 +840,7 @@ impl Syscall {
                 let mut user_buffer_writer = UserBufferWriter::new(
                     args[3] as *mut c_int,
                     core::mem::size_of::<[c_int; 2]>(),
-                    frame.from_user(),
+                    frame.is_from_user(),
                 )?;
                 let fds = user_buffer_writer.buffer::<i32>(0)?;
                 Self::socketpair(args[0], args[1], args[2], fds)
@@ -885,7 +889,7 @@ impl Syscall {
                 let syslog_action_type = args[0];
                 let buf_vaddr = args[1];
                 let len = args[2];
-                let from_user = frame.from_user();
+                let from_user = frame.is_from_user();
                 let mut user_buffer_writer =
                     UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)?;
 

@@ -167,6 +167,10 @@ impl<T> SpinLock<T> {
         self.lock.store(false, Ordering::SeqCst);
         ProcessManager::preempt_enable();
     }
+
+    pub fn is_locked(&self) -> bool {
+        self.lock.load(Ordering::SeqCst)
+    }
 }
 
 /// 实现Deref trait，支持通过获取SpinLockGuard来获取临界区数据的不可变引用

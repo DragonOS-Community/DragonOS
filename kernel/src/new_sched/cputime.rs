@@ -2,12 +2,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
 
-pub static mut CPU_IQR_TIME: Option<Vec<&'static mut IrqTime>> = None;
-
-#[inline]
-pub fn cpu_irq_time(cpu: usize) -> &'static mut IrqTime {
-    unsafe { CPU_IQR_TIME.as_mut().unwrap()[cpu] }
-}
+use super::{cpu_irq_time, CpuRunQueue};
 
 #[inline]
 pub fn irq_time_read(cpu: usize) -> u64 {

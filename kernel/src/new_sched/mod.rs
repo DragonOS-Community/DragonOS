@@ -1,25 +1,59 @@
 pub mod clock;
 pub mod cputime;
 pub mod fair;
+pub mod pelt;
 
 use core::{
     intrinsics::{likely, unlikely},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use bitmap::traits::BitOps;
+use alloc::{boxed::Box, collections::LinkedList, sync::Arc, vec::Vec};
 
 use crate::{
     include::bindings::bindings::MAX_CPU_NUM,
-    process::{ProcessControlBlock, ProcessFlags},
+    libs::{
+        lazy_init::Lazy,
+        rwlock::{RwLock, RwLockReadGuard},
+        spinlock::{SpinLock, SpinLockGuard},
+    },
+    mm::percpu::PerCpu,
+    process::{ProcessControlBlock, ProcessFlags, ProcessManager, SchedInfo},
     smp::core::smp_get_processor_id,
+    time::{clocksource::HZ, timer::clock},
 };
 
 use self::{
     clock::{ClockUpdataFlag, SchedClock},
-    cputime::{irq_time_read, IrqTime, CPU_IQR_TIME},
+    cputime::{irq_time_read, IrqTime},
+    fair::{CfsRunQueue, CompletelyFairScheduler, FairSchedEntity},
 };
+
+static mut CPU_IQR_TIME: Option<Vec<&'static mut IrqTime>> = None;
+
+// 这里虽然rq是percpu的，但是在负载均衡的时候需要修改对端cpu的rq，所以仍需加锁
+static CPU_RUNQUEUE: Lazy<Vec<Arc<CpuRunQueue>>> = Lazy::new();
+
+/// 用于记录系统中所有 CPU 的可执行进程数量的总和。
+static CALCULATE_LOAD_TASKS: AtomicUsize = AtomicUsize::new(0);
+
+const LOAD_FREQ: usize = HZ as usize * 5 + 1;
+
+pub const SCHED_FIXEDPOINT_SHIFT: u64 = 10;
+pub const SCHED_FIXEDPOINT_SCALE: u64 = 1 << SCHED_FIXEDPOINT_SHIFT;
+pub const SCHED_CAPACITY_SHIFT: u64 = SCHED_FIXEDPOINT_SHIFT;
+pub const SCHED_CAPACITY_SCALE: u64 = 1 << SCHED_CAPACITY_SHIFT;
+
+#[inline]
+pub fn cpu_irq_time(cpu: usize) -> &'static mut IrqTime {
+    unsafe { CPU_IQR_TIME.as_mut().unwrap()[cpu] }
+}
+
+#[inline]
+pub fn cpu_rq(cpu: usize) -> Arc<CpuRunQueue> {
+    CPU_RUNQUEUE.ensure();
+    CPU_RUNQUEUE.get()[cpu].clone()
+}
 
 lazy_static! {
     pub static ref SCHED_FEATURES: SchedFeature = SchedFeature::GENTLE_FAIR_SLEEPERS
@@ -39,24 +73,53 @@ lazy_static! {
 
 pub trait Scheduler {
     /// ## 加入当任务进入可运行状态时调用。它将调度实体（任务）放到红黑树中，增加nr_running变量的值。
-    fn enqueue(&self, pcb: Arc<ProcessControlBlock>, flags: u32);
+    fn enqueue(rq: &mut CpuRunQueue, pcb: Arc<ProcessControlBlock>, flags: EnqueueFlag);
 
     /// ## 当任务不再可运行时被调用，对应的调度实体被移出红黑树。它减少nr_running变量的值。
-    fn dequeue(&self, pcb: Arc<ProcessControlBlock>, flags: u32);
+    fn dequeue(rq: &mut CpuRunQueue, pcb: Arc<ProcessControlBlock>, flags: DequeueFlag);
 
     /// ## 主动让出cpu，这个函数的行为基本上是出队，紧接着入队
-    fn yield_task(&self) -> bool;
+    fn yield_task(rq: &mut CpuRunQueue);
 
     /// ## 检查进入可运行状态的任务能否抢占当前正在运行的任务
-    fn check_preempt_currnet(&self, pcb: Arc<ProcessControlBlock>, flags: u32);
+    fn check_preempt_currnet(rq: &mut CpuRunQueue, pcb: Arc<ProcessControlBlock>, flags: u32);
 
     /// ## 选择接下来最适合运行的任务
-    fn pick_next_task(&self) -> Arc<ProcessControlBlock>;
+    fn pick_task(rq: &mut CpuRunQueue) -> Option<Arc<ProcessControlBlock>>;
 
     /// ## 被时间滴答函数调用，它可能导致进程切换。驱动了运行时抢占。
-    fn tick(&self, pcb: Arc<ProcessControlBlock>, queued: bool);
+    fn tick(rq: &mut CpuRunQueue, pcb: Arc<ProcessControlBlock>, queued: bool);
+
+    /// ## 在进程fork时，如需加入cfs，则调用
+    fn task_fork(pcb: Arc<ProcessControlBlock>);
 }
 
+/// 调度策略
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedPolicy {
+    /// 完全公平调度
+    CFS,
+    /// 先进先出调度
+    FIFO,
+    /// 轮转调度
+    RR,
+    /// IDLE
+    IDLE,
+}
+
+pub struct TaskGroup {
+    /// CFS管理的调度实体，percpu的
+    entitys: Vec<Arc<FairSchedEntity>>,
+    /// 每个CPU的CFS运行队列
+    cfs: Vec<Arc<CfsRunQueue>>,
+    /// 父节点
+    parent: Option<Arc<TaskGroup>>,
+
+    shares: u64,
+}
+
+#[derive(Debug)]
 pub struct LoadWeight {
     /// 负载权重
     pub weight: u64,
@@ -73,17 +136,17 @@ impl LoadWeight {
 
     pub const NICE_0_LOAD_SHIFT: u32 = Self::SCHED_FIXEDPOINT_SHIFT + Self::SCHED_FIXEDPOINT_SHIFT;
 
-    pub fn update_add(&mut self, inc: u64) {
+    pub fn update_load_add(&mut self, inc: u64) {
         self.weight += inc;
         self.inv_weight = 0;
     }
 
-    pub fn update_sub(&mut self, dec: u64) {
+    pub fn update_load_sub(&mut self, dec: u64) {
         self.weight -= dec;
         self.inv_weight = 0;
     }
 
-    pub fn update_set(&mut self, weight: u64) {
+    pub fn update_load_set(&mut self, weight: u64) {
         self.weight = weight;
         self.inv_weight = 0;
     }
@@ -169,18 +232,160 @@ impl LoadWeight {
 }
 
 /// ## PerCpu的运行队列，其中维护了各个调度器对应的rq
+#[derive(Debug)]
 pub struct CpuRunQueue {
+    lock: SpinLock<()>,
+    lock_on_who: AtomicUsize,
+
     cpu: usize,
     clock_task: u64,
     clock: u64,
     prev_irq_time: u64,
     clock_updata_flags: ClockUpdataFlag,
 
+    /// 过载
+    overload: bool,
+
+    next_balance: u64,
+
+    /// 运行任务数
+    nr_running: usize,
+
+    /// 被阻塞的任务数量
+    nr_uninterruptible: usize,
+
+    /// 记录上次更新负载时间
+    cala_load_update: usize,
+    cala_load_active: usize,
+
+    /// CFS调度器
+    cfs: Arc<CfsRunQueue>,
+
+    clock_pelt: u64,
+    lost_idle_time: u64,
+    clock_idle: u64,
+
+    cfs_tasks: LinkedList<Arc<FairSchedEntity>>,
+
+    /// 最近一次的调度信息
+    sched_info: SchedInfo,
+
     /// 当前在运行队列上执行的进程
     current: Arc<ProcessControlBlock>,
 }
 
 impl CpuRunQueue {
+    /// 获取到rq的可变引用，需要注意的是返回的第二个值需要确保其生命周期
+    /// 所以可以说这个函数是unsafe的，需要确保正确性
+    pub fn self_mut(&self) -> (&mut Self, Option<SpinLockGuard<()>>) {
+        if self.lock.is_locked()
+            && smp_get_processor_id().data() as usize == self.lock_on_who.load(Ordering::SeqCst)
+        {
+            // 在本cpu已上锁则可以直接拿
+            (
+                unsafe { &mut *(self as *const Self as usize as *mut Self) },
+                None,
+            )
+        } else {
+            // 否则先上锁再拿
+            let guard = self.lock();
+            (
+                unsafe { &mut *(self as *const Self as usize as *mut Self) },
+                Some(guard),
+            )
+        }
+    }
+
+    fn lock(&self) -> SpinLockGuard<()> {
+        let guard = self.lock.lock_irqsave();
+
+        // 更新在哪一个cpu上锁
+        self.lock_on_who
+            .store(smp_get_processor_id().data() as usize, Ordering::SeqCst);
+
+        guard
+    }
+
+    pub fn enqueue_task(&mut self, pcb: Arc<ProcessControlBlock>, flags: EnqueueFlag) {
+        if !flags.contains(EnqueueFlag::ENQUEUE_NOCLOCK) {
+            self.update_rq_clock();
+        }
+
+        if !flags.contains(EnqueueFlag::ENQUEUE_RESTORE) {
+            let sched_info = pcb.sched_info().sched_stat.upgradeable_read_irqsave();
+            if sched_info.last_queued == 0 {
+                sched_info.upgrade().last_queued = self.clock;
+            }
+        }
+
+        match pcb.sched_info().policy() {
+            SchedPolicy::CFS => CompletelyFairScheduler::enqueue(self, pcb, flags),
+            SchedPolicy::FIFO => todo!(),
+            SchedPolicy::RR => todo!(),
+            SchedPolicy::IDLE => todo!(),
+        }
+
+        // TODO:https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/sched/core.c#239
+    }
+
+    pub fn dequeue_task(&mut self, pcb: Arc<ProcessControlBlock>, flags: DequeueFlag) {
+        // TODO:sched_core
+
+        if !flags.contains(DequeueFlag::DEQUEUE_NOCLOCK) {
+            self.update_rq_clock()
+        }
+
+        if !flags.contains(DequeueFlag::DEQUEUE_SAVE) {
+            let sched_info = pcb.sched_info().sched_stat.upgradeable_read_irqsave();
+
+            if sched_info.last_queued > 0 {
+                let delta = self.clock - sched_info.last_queued;
+
+                let mut sched_info = sched_info.upgrade();
+                sched_info.last_queued = 0;
+                sched_info.run_delay += delta as usize;
+
+                self.sched_info.run_delay += delta as usize;
+            }
+        }
+
+        match pcb.sched_info().policy() {
+            SchedPolicy::CFS => CompletelyFairScheduler::dequeue(self, pcb, flags),
+            SchedPolicy::FIFO => todo!(),
+            SchedPolicy::RR => todo!(),
+            SchedPolicy::IDLE => todo!(),
+        }
+    }
+
+    pub fn activate_task(&mut self, pcb: Arc<ProcessControlBlock>, mut flags: EnqueueFlag) {
+        if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::OnRqMigrating {
+            flags |= EnqueueFlag::ENQUEUE_MIGRATED;
+        }
+
+        if flags.contains(EnqueueFlag::ENQUEUE_MIGRATED) {
+            todo!()
+        }
+
+        self.enqueue_task(pcb.clone(), flags);
+
+        *pcb.sched_info().on_rq.lock_irqsave() = OnRq::OnRqQueued;
+    }
+
+    pub fn deactive_task(&mut self, pcb: Arc<ProcessControlBlock>, flags: DequeueFlag) {
+        *pcb.sched_info().on_rq.lock_irqsave() = if flags.contains(DequeueFlag::DEQUEUE_SLEEP) {
+            OnRq::NoOnRq
+        } else {
+            OnRq::OnRqMigrating
+        };
+
+        self.dequeue_task(pcb, flags);
+    }
+
+    #[inline]
+    pub fn cfs_rq(&self) -> Arc<CfsRunQueue> {
+        self.cfs.clone()
+    }
+
     pub fn update_rq_clock(&mut self) {
         // 需要跳过这次时钟更新
         if self
@@ -218,9 +423,67 @@ impl CpuRunQueue {
         // todo: pelt?
     }
 
+    /// 计算当前进程中的可执行数量
+    fn calculate_load_fold_active(&mut self, adjust: usize) -> usize {
+        let mut nr_active = self.nr_running - adjust;
+        nr_active += self.nr_uninterruptible;
+        let mut delta = 0;
+
+        if nr_active != self.cala_load_active {
+            delta = nr_active - self.cala_load_active;
+            self.cala_load_active = nr_active;
+        }
+
+        delta
+    }
+
+    /// ## tick计算全局负载
+    pub fn calculate_global_load_tick(&mut self) {
+        if clock() < self.cala_load_update as u64 {
+            // 如果当前时间在上次更新时间之前，则直接返回
+            return;
+        }
+
+        let delta = self.calculate_load_fold_active(0);
+
+        if delta != 0 {
+            CALCULATE_LOAD_TASKS.fetch_add(delta, Ordering::SeqCst);
+        }
+
+        self.cala_load_update += LOAD_FREQ;
+    }
+
+    pub fn add_nr_running(&mut self, nr_running: usize) {
+        let prev = self.nr_running;
+
+        self.nr_running = prev + nr_running;
+
+        if prev < 2 && self.nr_running >= 2 {
+            if !self.overload {
+                self.overload = true;
+            }
+        }
+    }
+
+    pub fn sched_idle_rq(&self) -> bool {
+        return unlikely(
+            self.nr_running == self.cfs.idle_h_nr_running as usize && self.nr_running > 0,
+        );
+    }
+
+    #[inline]
+    pub fn current(&self) -> Arc<ProcessControlBlock> {
+        self.current.clone()
+    }
+
+    #[inline]
+    pub fn clock_task(&self) -> u64 {
+        self.clock_task
+    }
+
     /// 重新调度当前进程
-    pub fn resched_current(&mut self) {
-        let current = self.current;
+    pub fn resched_current(&self) {
+        let current = self.current();
 
         // 又需要被调度？
         if unlikely(current.flags().contains(ProcessFlags::NEED_SCHEDULE)) {
@@ -230,7 +493,9 @@ impl CpuRunQueue {
         let cpu = self.cpu;
 
         if cpu == smp_get_processor_id().data() as usize {
-            
+            // 设置需要调度
+            current.flags().insert(ProcessFlags::NEED_SCHEDULE);
+            return;
         }
 
         // 需要迁移到其他cpu
@@ -268,6 +533,67 @@ bitflags! {
         /// 启用基本时间片
         const BASE_SLICE = 1 << 13;
     }
+
+    pub struct EnqueueFlag: u8 {
+        const ENQUEUE_WAKEUP	= 0x01;
+        const ENQUEUE_RESTORE	= 0x02;
+        const ENQUEUE_MOVE	= 0x04;
+        const ENQUEUE_NOCLOCK	= 0x08;
+
+        const ENQUEUE_MIGRATED	= 0x40;
+
+        const ENQUEUE_INITIAL	= 0x80;
+    }
+
+    pub struct DequeueFlag: u8 {
+        const DEQUEUE_SLEEP		= 0x01;
+        const DEQUEUE_SAVE		= 0x02; /* Matches ENQUEUE_RESTORE */
+        const DEQUEUE_MOVE		= 0x04; /* Matches ENQUEUE_MOVE */
+        const DEQUEUE_NOCLOCK		= 0x08; /* Matches ENQUEUE_NOCLOCK */
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum OnRq {
+    OnRqQueued,
+    OnRqMigrating,
+    NoOnRq,
+}
+
+impl ProcessManager {
+    /// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/sched/core.c#4852
+    ///
+    /// SMP TODO
+    pub fn wakeup_new(pcb: Arc<ProcessControlBlock>) {}kkk
+}
+
+/// ## 时钟tick时调用此函数
+pub fn scheduler_tick() {
+    // 获取当前CPU索引
+    let cpu_idx = smp_get_processor_id().data() as usize;
+
+    // 获取当前CPU的请求队列
+    let rq = cpu_rq(cpu_idx);
+    let mut _rq_guard = rq.lock.lock_irqsave();
+
+    let (rq, guard) = rq.self_mut();
+
+    // 获取当前请求队列的当前请求
+    let current = rq.current();
+
+    // 更新请求队列时钟
+    rq.update_rq_clock();
+
+    match current.sched_info().policy() {
+        SchedPolicy::CFS => CompletelyFairScheduler::tick(rq, current, false),
+        SchedPolicy::FIFO => todo!(),
+        SchedPolicy::RR => todo!(),
+        SchedPolicy::IDLE => todo!(),
+    }
+
+    rq.calculate_global_load_tick();
+
+    // TODO:处理负载均衡
 }
 
 #[inline(never)]
@@ -281,5 +607,13 @@ pub fn sched_init() {
             .resize_with(MAX_CPU_NUM as usize, || {
                 Box::leak(Box::new(IrqTime::default()))
             });
+
+        // CPU_RUNQUEUE = Some(Vec::with_capacity(MAX_CPU_NUM as usize));
+        // CPU_RUNQUEUE
+        //     .as_mut()
+        //     .unwrap()
+        //     .resize_with(MAX_CPU_NUM as usize, || {
+        //         Box::leak(Box::new(CpuRunQueue::default()))
+        //     });
     };
 }

@@ -43,6 +43,7 @@ use crate::{
     },
     mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
     net::socket::SocketInode,
+    new_sched::{fair::FairSchedEntity, OnRq},
     sched::{
         completion::Completion,
         core::{sched_enqueue, CPU_EXECUTING},
@@ -1029,6 +1030,25 @@ pub struct ProcessSchedulerInfo {
     virtual_runtime: AtomicIsize,
     /// 由实时调度器管理的时间片
     rt_time_slice: AtomicIsize,
+
+    pub sched_stat: RwLock<SchedInfo>,
+    /// 调度策略
+    pub sched_policy: crate::new_sched::SchedPolicy,
+    /// cfs调度实体
+    pub sched_entity: Arc<FairSchedEntity>,
+    pub on_rq: SpinLock<OnRq>,
+}
+
+#[derive(Debug)]
+pub struct SchedInfo {
+    /// 记录任务在特定 CPU 上运行的次数
+    pub pcount: usize,
+    /// 记录任务等待在运行队列上的时间
+    pub run_delay: usize,
+    /// 记录任务上次在 CPU 上运行的时间戳
+    pub last_arrival: u64,
+    /// 记录任务上次被加入到运行队列中的时间戳
+    pub last_queued: u64,
 }
 
 #[derive(Debug)]
@@ -1067,7 +1087,15 @@ impl ProcessSchedulerInfo {
             virtual_runtime: AtomicIsize::new(0),
             rt_time_slice: AtomicIsize::new(0),
             priority: SchedPriority::new(100).unwrap(),
+            sched_stat: todo!(),
+            sched_policy: todo!(),
+            sched_entity: todo!(),
+            on_rq: SpinLock::new(OnRq::NoOnRq),
         };
+    }
+
+    pub fn sched_entity(&self) -> Arc<FairSchedEntity> {
+        return self.sched_entity.clone();
     }
 
     pub fn on_cpu(&self) -> Option<ProcessorId> {
@@ -1165,6 +1193,10 @@ impl ProcessSchedulerInfo {
 
     pub fn priority(&self) -> SchedPriority {
         return self.priority;
+    }
+
+    pub fn policy(&self) -> crate::new_sched::SchedPolicy {
+        return self.sched_policy;
     }
 }
 

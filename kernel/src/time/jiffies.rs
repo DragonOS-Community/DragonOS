@@ -19,6 +19,7 @@ pub const JIFFIES_SHIFT: u32 = 8;
 pub const LATCH: u32 = (CLOCK_TICK_RATE + (HZ as u32) / 2) / HZ as u32;
 pub const ACTHZ: u32 = sh_div(CLOCK_TICK_RATE, LATCH, 8);
 pub const NSEC_PER_JIFFY: u32 = (NSEC_PER_SEC << 8) / ACTHZ;
+pub const TICK_NESC: u32 = (NSEC_PER_SEC + (HZ as u32) / 2) / HZ as u32;
 pub const fn sh_div(nom: u32, den: u32, lsh: u32) -> u32 {
     (((nom) / (den)) << (lsh)) + ((((nom) % (den)) << (lsh)) + (den) / 2) / (den)
 }

@@ -131,7 +131,7 @@ impl<T> RwLock<T> {
         let reader_value = self.current_reader();
         //得到自增后的reader_value, 包括了尝试获得READER守卫的进程
 
-        let value = if let Ok(rv) = reader_value  {
+        let value = if let Ok(rv) = reader_value {
             rv
         } else {
             return None;

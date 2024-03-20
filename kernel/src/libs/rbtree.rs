@@ -17,9 +17,9 @@ use core::fmt::{self, Debug};
 use core::iter::{FromIterator, IntoIterator};
 use core::marker;
 use core::mem;
+use core::mem::swap;
 use core::ops::Index;
 use core::ptr;
-use core::mem::swap;
 
 use alloc::boxed::Box;
 
@@ -63,7 +63,9 @@ where
 struct NodePtr<K: Ord, V>(*mut RBTreeNode<K, V>);
 
 impl<K: Ord, V> Clone for NodePtr<K, V> {
-    fn clone(&self) -> NodePtr<K, V> { *self }
+    fn clone(&self) -> NodePtr<K, V> {
+        *self
+    }
 }
 
 impl<K: Ord, V> Copy for NodePtr<K, V> {}
@@ -75,7 +77,9 @@ impl<K: Ord, V> Ord for NodePtr<K, V> {
 }
 
 impl<K: Ord, V> PartialOrd for NodePtr<K, V> {
-    fn partial_cmp(&self, other: &NodePtr<K, V>) -> Option<Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &NodePtr<K, V>) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl<K: Ord, V> PartialEq for NodePtr<K, V> {

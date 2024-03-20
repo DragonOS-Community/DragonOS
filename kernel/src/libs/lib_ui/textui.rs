@@ -1002,9 +1002,9 @@ pub extern "C" fn rs_textui_putchar(character: u8, fr_color: u32, bk_color: u32)
         if let Some(tty) = tty {
             send_to_default_serial8250_port(&[character]);
             return tty
-            .write_without_serial(buf.as_bytes(), buf.len())
-            .map(|_| 0)
-            .unwrap_or_else(|e| e.to_posix_errno());
+                .write_without_serial(buf.as_bytes(), buf.len())
+                .map(|_| 0)
+                .unwrap_or_else(|e| e.to_posix_errno());
         }
     }
     return textui_putchar(

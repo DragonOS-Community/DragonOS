@@ -262,7 +262,7 @@ impl BusManager {
     ///
     /// - `dev` - 要被添加的设备
     pub fn add_device(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
-        let bus = dev.bus().map(|bus| bus.upgrade()).flatten();
+        let bus = dev.bus().and_then(|bus| bus.upgrade());
         if let Some(bus) = bus {
             device_manager().add_groups(dev, bus.dev_groups())?;
 
@@ -294,8 +294,7 @@ impl BusManager {
     pub fn add_driver(&self, driver: &Arc<dyn Driver>) -> Result<(), SystemError> {
         let bus = driver
             .bus()
-            .map(|bus| bus.upgrade())
-            .flatten()
+            .and_then(|bus| bus.upgrade())
             .ok_or(SystemError::EINVAL)?;
         kdebug!("bus '{}' add driver '{}'", bus.name(), driver.name());
 
@@ -314,25 +313,25 @@ impl BusManager {
 
         driver_manager()
             .add_groups(driver, bus.drv_groups())
-            .or_else(|e| {
+            .map_err(|e| {
                 kerror!(
                     "BusManager::add_driver: driver '{:?}' add_groups failed, err: '{:?}",
                     driver.name(),
                     e
                 );
-                Err(e)
+                e
             })
             .ok();
 
         if !driver.suppress_bind_attrs() {
             self.add_bind_files(driver)
-                .or_else(|e| {
+                .map_err(|e| {
                     kerror!(
                         "BusManager::add_driver: driver '{:?}' add_bind_files failed, err: '{:?}",
                         driver.name(),
                         e
                     );
-                    Err(e)
+                    e
                 })
                 .ok();
         }

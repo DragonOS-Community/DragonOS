@@ -19,6 +19,7 @@ use core::marker;
 use core::mem;
 use core::ops::Index;
 use core::ptr;
+use core::mem::swap;
 
 use alloc::boxed::Box;
 
@@ -62,9 +63,7 @@ where
 struct NodePtr<K: Ord, V>(*mut RBTreeNode<K, V>);
 
 impl<K: Ord, V> Clone for NodePtr<K, V> {
-    fn clone(&self) -> NodePtr<K, V> {
-        NodePtr(self.0)
-    }
+    fn clone(&self) -> NodePtr<K, V> { *self }
 }
 
 impl<K: Ord, V> Copy for NodePtr<K, V> {}
@@ -76,9 +75,7 @@ impl<K: Ord, V> Ord for NodePtr<K, V> {
 }
 
 impl<K: Ord, V> PartialOrd for NodePtr<K, V> {
-    fn partial_cmp(&self, other: &NodePtr<K, V>) -> Option<Ordering> {
-        unsafe { Some((*self.0).key.cmp(&(*other.0).key)) }
-    }
+    fn partial_cmp(&self, other: &NodePtr<K, V>) -> Option<Ordering> { Some(self.cmp(other)) }
 }
 
 impl<K: Ord, V> PartialEq for NodePtr<K, V> {
@@ -158,7 +155,7 @@ impl<K: Ord, V> NodePtr<K, V> {
 
     #[inline]
     fn min_node(self) -> NodePtr<K, V> {
-        let mut temp = self.clone();
+        let mut temp = self;
         while !temp.left().is_null() {
             temp = temp.left();
         }
@@ -167,7 +164,7 @@ impl<K: Ord, V> NodePtr<K, V> {
 
     #[inline]
     fn max_node(self) -> NodePtr<K, V> {
-        let mut temp = self.clone();
+        let mut temp = self;
         while !temp.right().is_null() {
             temp = temp.right();
         }
@@ -239,7 +236,7 @@ impl<K: Ord, V> NodePtr<K, V> {
         if self.is_null() {
             return NodePtr::null();
         }
-        unsafe { (*self.0).parent.clone() }
+        unsafe { (*self.0).parent }
     }
 
     #[inline]
@@ -247,7 +244,7 @@ impl<K: Ord, V> NodePtr<K, V> {
         if self.is_null() {
             return NodePtr::null();
         }
-        unsafe { (*self.0).left.clone() }
+        unsafe { (*self.0).left }
     }
 
     #[inline]
@@ -255,7 +252,7 @@ impl<K: Ord, V> NodePtr<K, V> {
         if self.is_null() {
             return NodePtr::null();
         }
-        unsafe { (*self.0).right.clone() }
+        unsafe { (*self.0).right }
     }
 
     #[inline]
@@ -882,20 +879,20 @@ impl<K: Ord, V> RBTree<K, V> {
         node.set_right(temp.left());
 
         if !temp.left().is_null() {
-            temp.left().set_parent(node.clone());
+            temp.left().set_parent(node);
         }
 
         temp.set_parent(node.parent());
         if node == self.root {
-            self.root = temp.clone();
+            self.root = temp;
         } else if node == node.parent().left() {
-            node.parent().set_left(temp.clone());
+            node.parent().set_left(temp);
         } else {
-            node.parent().set_right(temp.clone());
+            node.parent().set_right(temp);
         }
 
-        temp.set_left(node.clone());
-        node.set_parent(temp.clone());
+        temp.set_left(node);
+        node.set_parent(temp);
     }
 
     /*
@@ -917,20 +914,20 @@ impl<K: Ord, V> RBTree<K, V> {
         node.set_left(temp.right());
 
         if !temp.right().is_null() {
-            temp.right().set_parent(node.clone());
+            temp.right().set_parent(node);
         }
 
         temp.set_parent(node.parent());
         if node == self.root {
-            self.root = temp.clone();
+            self.root = temp;
         } else if node == node.parent().right() {
-            node.parent().set_right(temp.clone());
+            node.parent().set_right(temp);
         } else {
-            node.parent().set_left(temp.clone());
+            node.parent().set_left(temp);
         }
 
-        temp.set_right(node.clone());
-        node.set_parent(temp.clone());
+        temp.set_right(node);
+        node.set_parent(temp);
     }
 
     /// replace value if key exist, if not exist insert it.
@@ -983,9 +980,7 @@ impl<K: Ord, V> RBTree<K, V> {
                 // Case 2条件：叔叔是黑色，且当前节点是右孩子
                 if parent.right() == node {
                     self.left_rotate(parent);
-                    let temp = parent;
-                    parent = node;
-                    node = temp;
+                    swap(&mut parent, &mut node);
                 }
 
                 // Case 3条件：叔叔是黑色，且当前节点是左孩子。
@@ -1006,9 +1001,7 @@ impl<K: Ord, V> RBTree<K, V> {
                 // Case 2条件：叔叔是黑色，且当前节点是右孩子
                 if parent.left() == node {
                     self.right_rotate(parent);
-                    let temp = parent;
-                    parent = node;
-                    node = temp;
+                    swap(&mut parent, &mut node);
                 }
 
                 // Case 3条件：叔叔是黑色，且当前节点是左孩子。
@@ -1029,7 +1022,7 @@ impl<K: Ord, V> RBTree<K, V> {
 
         while !x.is_null() {
             y = x;
-            match node.cmp(&&mut x) {
+            match node.cmp(&x) {
                 Ordering::Less => {
                     x = x.left();
                 }
@@ -1043,7 +1036,7 @@ impl<K: Ord, V> RBTree<K, V> {
         if y.is_null() {
             self.root = node;
         } else {
-            match node.cmp(&&mut y) {
+            match node.cmp(&y) {
                 Ordering::Less => {
                     y.set_left(node);
                 }

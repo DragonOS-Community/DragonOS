@@ -411,8 +411,8 @@ impl FrameBufferOps for VesaFb {
                         unsafe { *base.add((y * line_offset + x) as usize) = fg };
                     }
                 }
-            },
-            16=>{
+            }
+            16 => {
                 let base = screen_base.as_ptr::<u16>();
 
                 for y in rect.dy..(rect.dy + rect.height) {
@@ -422,16 +422,18 @@ impl FrameBufferOps for VesaFb {
                 }
             }
             24 => {
-                let base = screen_base.as_ptr::<[u8;3]>();
+                let base = screen_base.as_ptr::<[u8; 3]>();
 
                 for y in rect.dy..(rect.dy + rect.height) {
                     for x in rect.dx..(rect.dx + rect.width) {
-                        unsafe { *base.add((y * line_offset + x) as usize) = [0,0,0] };
+                        unsafe { *base.add((y * line_offset + x) as usize) = [0, 0, 0] };
                     }
                 }
-            },
-            _=>{
-                send_to_default_serial8250_port(format!("unsupported bit depth:{}!\n\0",bpp).as_bytes());
+            }
+            _ => {
+                send_to_default_serial8250_port(
+                    format!("unsupported bit depth:{}!\n\0", bpp).as_bytes(),
+                );
                 todo!()
             }
         }
@@ -575,99 +577,83 @@ impl FrameBufferOps for VesaFb {
                     }
                 }
             }
-            2=>{
+            2 => {
                 let mut dst = dst.as_ptr::<u16>();
                 let mut src = src.as_ptr::<u16>();
+                let line_offset = var.xres as usize;
 
-                for y in 0..data.height as usize {
-                    if (data.dy + y as i32) < 0 || (data.dy + y as i32) > var.yres as i32 {
-                        unsafe {
-                            // core::ptr::copy(src, dst, data.width as usize);
-                            src = src.add(var.xres as usize);
-                            dst = dst.add(var.xres as usize);
+                if s_real_x > d_real_x {
+                    // 如果src在dst下方，则可以直接拷贝不会出现指针覆盖
+                    unsafe {
+                        for _ in 0..visiable_h {
+                            core::ptr::copy(src, dst, visiable_w as usize);
+                            src = src.add(line_offset);
+                            dst = dst.add(visiable_w as usize);
                         }
-                        continue;
                     }
-                    if data.dx < 0 {
-                        if ((-data.dx) as u32) < data.width {
-                            unsafe {
-                                core::ptr::copy(
-                                    src.add((-data.dx) as usize),
-                                    dst,
-                                    (data.width as usize) - (-data.dx) as usize,
-                                );
-                                src = src.add(var.xres as usize);
-                                dst = dst.add(var.xres as usize);
-                            }
+                } else {
+                    let mut tmp: Vec<u32> = Vec::with_capacity(size);
+                    tmp.resize(size, 0);
+                    let mut tmp_ptr = tmp.as_mut_ptr() as *mut u16;
+
+                    // 这里是一个可以优化的点，现在为了避免指针拷贝时覆盖，统一先拷贝进入buf再拷贝到dst
+                    unsafe {
+                        for _ in 0..visiable_h {
+                            core::ptr::copy(src, tmp_ptr, visiable_w as usize);
+                            src = src.add(line_offset);
+                            tmp_ptr = tmp_ptr.add(visiable_w as usize);
                         }
-                    } else if data.dx as u32 + data.width > var.xres {
-                        if (data.dx as u32) < var.xres {
-                            unsafe {
-                                core::ptr::copy(src, dst, (var.xres - data.dx as u32) as usize);
-                                src = src.add(var.xres as usize);
-                                dst = dst.add(var.xres as usize);
-                            }
-                        }
-                    } else {
-                        for i in 0..data.width as usize {
-                            unsafe { *(dst.add(i)) = *(src.add(i)) }
-                        }
-                        unsafe {
-                            // core::ptr::copy(src, dst, data.width as usize);
-                            src = src.add(var.xres as usize);
-                            dst = dst.add(var.xres as usize);
+
+                        tmp_ptr = tmp_ptr.sub(size);
+                        for _ in 0..visiable_h {
+                            core::ptr::copy(tmp_ptr, dst, visiable_w as usize);
+                            dst = dst.add(line_offset);
+                            tmp_ptr = tmp_ptr.add(visiable_w as usize);
                         }
                     }
                 }
-            },
-            3=>{
-                let mut dst = dst.as_ptr::<[u8;3]>();
-                let mut src = src.as_ptr::<[u8;3]>();
+            }
+            3 => {
+                let mut dst = dst.as_ptr::<[u8; 3]>();
+                let mut src = src.as_ptr::<[u8; 3]>();
+                let line_offset = var.xres as usize;
 
-                for y in 0..data.height as usize {
-                    if (data.dy + y as i32) < 0 || (data.dy + y as i32) > var.yres as i32 {
-                        unsafe {
-                            // core::ptr::copy(src, dst, data.width as usize);
-                            src = src.add(var.xres as usize);
-                            dst = dst.add(var.xres as usize);
+                if s_real_x > d_real_x {
+                    // 如果src在dst下方，则可以直接拷贝不会出现指针覆盖
+                    unsafe {
+                        for _ in 0..visiable_h {
+                            core::ptr::copy(src, dst, visiable_w as usize);
+                            src = src.add(line_offset);
+                            dst = dst.add(visiable_w as usize);
                         }
-                        continue;
                     }
-                    if data.dx < 0 {
-                        if ((-data.dx) as u32) < data.width {
-                            unsafe {
-                                core::ptr::copy(
-                                    src.add((-data.dx) as usize),
-                                    dst,
-                                    (data.width as usize) - (-data.dx) as usize,
-                                );
-                                src = src.add(var.xres as usize);
-                                dst = dst.add(var.xres as usize);
-                            }
+                } else {
+                    let mut tmp: Vec<u32> = Vec::with_capacity(size);
+                    tmp.resize(size, 0);
+                    let mut tmp_ptr = tmp.as_mut_ptr() as *mut [u8; 3];
+
+                    // 这里是一个可以优化的点，现在为了避免指针拷贝时覆盖，统一先拷贝进入buf再拷贝到dst
+                    unsafe {
+                        for _ in 0..visiable_h {
+                            core::ptr::copy(src, tmp_ptr, visiable_w as usize);
+                            src = src.add(line_offset);
+                            tmp_ptr = tmp_ptr.add(visiable_w as usize);
                         }
-                    } else if data.dx as u32 + data.width > var.xres {
-                        if (data.dx as u32) < var.xres {
-                            unsafe {
-                                core::ptr::copy(src, dst, (var.xres - data.dx as u32) as usize);
-                                src = src.add(var.xres as usize);
-                                dst = dst.add(var.xres as usize);
-                            }
-                        }
-                    } else {
-                        for i in 0..data.width as usize {
-                            unsafe { *(dst.add(i)) = *(src.add(i)) }
-                        }
-                        unsafe {
-                            // core::ptr::copy(src, dst, data.width as usize);
-                            src = src.add(var.xres as usize);
-                            dst = dst.add(var.xres as usize);
+
+                        tmp_ptr = tmp_ptr.sub(size);
+                        for _ in 0..visiable_h {
+                            core::ptr::copy(tmp_ptr, dst, visiable_w as usize);
+                            dst = dst.add(line_offset);
+                            tmp_ptr = tmp_ptr.add(visiable_w as usize);
                         }
                     }
                 }
             }
 
             _ => {
-                send_to_default_serial8250_port(format!("bytes_per_pixel:{}\n\0",bytes_per_pixel).as_bytes());
+                send_to_default_serial8250_port(
+                    format!("bytes_per_pixel:{}\n\0", bytes_per_pixel).as_bytes(),
+                );
                 todo!()
             }
         }

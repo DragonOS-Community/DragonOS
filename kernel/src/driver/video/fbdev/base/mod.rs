@@ -1,17 +1,17 @@
-
-
 use alloc::{string::String, sync::Arc, vec::Vec};
-use elf::endian::{BigEndian, LittleEndian};
 use system_error::SystemError;
 
 use crate::{
-    driver::{base::device::Device, serial::serial8250::send_to_default_serial8250_port, tty::virtual_terminal::Color},
+    driver::{base::device::Device, tty::virtual_terminal::Color},
     init::boot_params,
     libs::rwlock::RwLock,
     mm::{ucontext::LockedVMA, PhysAddr, VirtAddr},
 };
 
-use self::{fbmem::{FbDevice, FrameBufferManager}, render_helper::{BitIter, EndianPattern}};
+use self::{
+    fbmem::{FbDevice, FrameBufferManager},
+    render_helper::{BitIter, EndianPattern},
+};
 
 const COLOR_TABLE_8: &'static [u32] = &[
     0x00000000, 0xff000000, 0x00ff0000, 0xffff0000, 0x0000ff00, 0xff00ff00, 0x00ffff00, 0xffffff00,
@@ -67,7 +67,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         let y = image.y;
         let byte_per_pixel = core::mem::size_of::<u32>() as u32;
         let bit_per_pixel = self.current_fb_var().bits_per_pixel;
-        
+
         // 计算图像在帧缓冲中的起始位
         let mut bitstart = (y * self.current_fb_fix().line_length * 8) + (x * bit_per_pixel);
         let start_index = bitstart & (32 - 1);
@@ -110,10 +110,16 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                 && bit_per_pixel >= 8
                 && bit_per_pixel <= 32
             {
-                self.slow_imageblit(image, dst1, fg, bg, bitstart/4, self.current_fb_fix().line_length)
-                // unsafe { self.fast_imageblit(image, dst1, fg, bg) }
+                unsafe { self.fast_imageblit(image, dst1, fg, bg) }
             } else {
-                self.slow_imageblit(image, dst1, fg, bg, bitstart/4, self.current_fb_fix().line_length)
+                self.slow_imageblit(
+                    image,
+                    dst1,
+                    fg,
+                    bg,
+                    bitstart / 4,
+                    self.current_fb_fix().line_length,
+                )
             }
         } else {
             todo!("color image blit todo");
@@ -245,7 +251,6 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         }
     }
 
-
     fn slow_imageblit(
         &self,
         _image: &FbImage,
@@ -255,27 +260,31 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         _start_index: u32,
         _pitch_index: u32,
     ) {
-        let test:Vec<u8>=vec![0b10101010,0b00001111,0b11110000];
-        let mut dst =unsafe{ _dst1.as_ptr::<u32>()};
-        // send_to_default_serial8250_port(format!("{:?}\n\0",_image).as_bytes());
-        let mut line_length=0;
-        let mut count=0;
-        let image=FbImage{ x: 0, y: 0, width: 8, height: 16, fg: 15, bg: 0, depth: 1, data: vec![0, 0, 0, 0, 0, 120, 12, 124, 204, 204, 204, 118, 0, 0, 0, 0]};
-        let iter=BitIter::new(_fg, _bg,EndianPattern::_BigEndian, EndianPattern::LittleEndian, self.current_fb_var().bits_per_pixel/8, _image.data.iter(),_image.width);
-        for (content,full) in iter{
-            unsafe{
-                *dst=content;
-                
-                dst=dst.add(1);
-            }
-            
-            if full{
-                count+=1;
-                dst=unsafe{_dst1.as_ptr::<u8>().add((_pitch_index*count) as usize) as *mut u32};
+        let mut dst = _dst1.as_ptr::<u32>();
+        let mut count = 0;
+        let iter = BitIter::new(
+            _fg,
+            _bg,
+            EndianPattern::Big,
+            EndianPattern::Little,
+            self.current_fb_var().bits_per_pixel / 8,
+            _image.data.iter(),
+            _image.width,
+        );
+        for (content, full) in iter {
+            unsafe {
+                *dst = content;
+
+                dst = dst.add(1);
             }
 
+            if full {
+                count += 1;
+                dst = unsafe {
+                    _dst1.as_ptr::<u8>().add((_pitch_index * count) as usize) as *mut u32
+                };
+            }
         }
-        // send_to_default_serial8250_port(format!("{:?}\n\0",content).as_bytes());
     }
 }
 

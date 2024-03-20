@@ -8,7 +8,7 @@ use kdepends::thingbuf::mpsc;
 use system_error::SystemError;
 
 use crate::{
-    driver::{serial::serial8250::send_to_default_serial8250_port, tty::virtual_terminal::MAX_NR_CONSOLES},
+    driver::tty::virtual_terminal::MAX_NR_CONSOLES,
     libs::spinlock::{SpinLock, SpinLockGuard},
 };
 

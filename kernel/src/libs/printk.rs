@@ -58,7 +58,8 @@ macro_rules! kwarn {
 }
 
 #[macro_export]
-macro_rules! kerror {
+macro_rules!
+kerror {
     ($($arg:tt)*) => {
         $crate::libs::printk::Logger.log(3,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
         $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("\x1B[41m[ ERROR ] \x1B[0m"));

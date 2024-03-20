@@ -109,7 +109,7 @@ pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator;
 pub fn panic(info: &PanicInfo) -> ! {
     use crate::driver::serial::serial8250::send_to_default_serial8250_port;
 
-    send_to_default_serial8250_port(format!("{:?}\n\0",info).as_bytes());
+    send_to_default_serial8250_port(format!("{:?}\n\0", info).as_bytes());
 
     kerror!("Kernel Panic Occurred.");
 
@@ -145,14 +145,17 @@ pub fn panic(info: &PanicInfo) -> ! {
             for frame in bt.frames {
                 lookup_kallsyms(frame as u64, level);
                 level += 1;
-                if  level==2{
+                if level == 2 {
                     break;
                 }
             }
         };
     }
 
-    println!("Current PCB:\n\t{:?}", (ProcessManager::current_pcb().pid()));
-    println!("info:{:?}\n",info);
+    println!(
+        "Current PCB:\n\t{:?}",
+        (ProcessManager::current_pcb().pid())
+    );
+    println!("info:{:?}\n", info);
     ProcessManager::exit(usize::MAX);
 }

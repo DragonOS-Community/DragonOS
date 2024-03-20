@@ -836,7 +836,7 @@ impl Socket for TcpSocket {
                     let item = handle_guard.remove(&old_handle.0).unwrap();
                     // 按照smoltcp行为，将新的handle绑定到原来的item
                     handle_guard.insert(new_handle.0, item);
-                    let new_item = SocketHandleItem::from_socket(&new_socket);
+                    let new_item = SocketHandleItem::from_socket(new_socket.as_ref());
                     // 插入新的item
                     handle_guard.insert(old_handle.0, new_item);
 

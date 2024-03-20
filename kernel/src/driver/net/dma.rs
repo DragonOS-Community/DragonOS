@@ -48,7 +48,7 @@ pub unsafe fn dma_dealloc(paddr: usize, vaddr: NonNull<u8>, pages: usize) -> i32
     );
 
     // 恢复页面属性
-    let vaddr = VirtAddr::new(vaddr.as_ptr() as *mut u8 as usize);
+    let vaddr = VirtAddr::new(vaddr.as_ptr() as usize);
     let mut kernel_mapper = KernelMapper::lock();
     let kernel_mapper = kernel_mapper.as_mut().unwrap();
     let flusher = kernel_mapper

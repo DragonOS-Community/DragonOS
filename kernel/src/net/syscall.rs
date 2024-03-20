@@ -43,7 +43,7 @@ impl Syscall {
 
         let socket = new_socket(address_family, socket_type, protocol)?;
 
-        let handle_item = SocketHandleItem::new(&socket);
+        let handle_item = SocketHandleItem::new(socket.as_ref());
         HANDLE_MAP
             .write_irqsave()
             .insert(socket.socket_handle(), handle_item);

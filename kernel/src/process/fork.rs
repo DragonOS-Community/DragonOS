@@ -406,12 +406,12 @@ impl ProcessManager {
         });
 
         // 拷贝信号相关数据
-        Self::copy_sighand(&clone_flags, current_pcb, pcb).map_err(|e| {
+        Self::copy_sighand(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy sighand from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e
             )
-        })?;
+        });
 
         // 拷贝线程
         Self::copy_thread(current_pcb, pcb, clone_args,current_trapframe).unwrap_or_else(|e| {

@@ -68,14 +68,13 @@ pub enum ExecError {
     BadAddress(Option<VirtAddr>),
     Other(String),
 }
-
-impl Into<SystemError> for ExecError {
-    fn into(self) -> SystemError {
-        match self {
+impl From<ExecError> for SystemError {
+    fn from(val: ExecError) -> Self {
+        match val {
             ExecError::NotExecutable => SystemError::ENOEXEC,
-            ExecError::WrongArchitecture => SystemError::EOPNOTSUPP_OR_ENOTSUP,
+            ExecError::WrongArchitecture => SystemError::ENOEXEC,
             ExecError::PermissionDenied => SystemError::EACCES,
-            ExecError::NotSupported => SystemError::EOPNOTSUPP_OR_ENOTSUP,
+            ExecError::NotSupported => SystemError::ENOSYS,
             ExecError::ParseError => SystemError::ENOEXEC,
             ExecError::OutOfMemory => SystemError::ENOMEM,
             ExecError::InvalidParemeter => SystemError::EINVAL,

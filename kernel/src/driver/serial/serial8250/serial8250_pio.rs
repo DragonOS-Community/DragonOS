@@ -25,11 +25,9 @@ impl Serial8250Manager {
         uart_driver: &Arc<Serial8250ISADriver>,
         devs: &Arc<Serial8250ISADevices>,
     ) {
-        for i in 0..8 {
-            if let Some(port) = unsafe { PIO_PORTS[i].as_ref() } {
-                port.set_device(Some(devs));
-                self.uart_add_one_port(uart_driver, port).ok();
-            }
+        for port in unsafe { &PIO_PORTS }.iter().flatten() {
+            port.set_device(Some(devs));
+            self.uart_add_one_port(uart_driver, port).ok();
         }
     }
 }

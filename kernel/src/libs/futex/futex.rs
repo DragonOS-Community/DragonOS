@@ -15,7 +15,7 @@ use crate::{
     process::{ProcessControlBlock, ProcessManager},
     syscall::user_access::UserBufferReader,
     time::{
-        timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
+        timer::{self, next_n_us_timer_jiffies, Timer, WakeUpHelper},
         TimeSpec,
     },
 };
@@ -307,8 +307,8 @@ impl Futex {
             }
             None => {
                 // 取消定时器任务
-                if timer.is_some() {
-                    timer.unwrap().cancel();
+                if let Some(timer) = timer {
+                    timer.cancel();
                 }
                 return Ok(0);
             }

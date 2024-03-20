@@ -1713,8 +1713,8 @@ impl VirtualConsoleData {
             y += 1;
 
             let ret = self.driver_funcs().con_getxy(self, start);
-            if ret.is_ok() {
-                start = ret.unwrap().0;
+            if let Ok(ret) = ret {
+                start = ret.0;
             } else {
                 return;
             }

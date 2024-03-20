@@ -433,7 +433,7 @@ pub trait FrameBufferOps {
             }
         }
 
-        let _ = self.fb_image_blit(&image);
+        self.fb_image_blit(&image);
 
         Ok(())
     }

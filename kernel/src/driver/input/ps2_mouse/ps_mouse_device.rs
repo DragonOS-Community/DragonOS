@@ -302,13 +302,13 @@ impl Ps2MouseDevice {
                 guard.current_state.flags = flags;
             }
             1 => {
-                let flags = guard.current_state.flags.clone();
+                let flags = guard.current_state.flags;
                 if !flags.contains(MouseFlags::X_OVERFLOW) {
                     guard.current_state.x = self.get_x_movement(packet, flags);
                 }
             }
             2 => {
-                let flags = guard.current_state.flags.clone();
+                let flags = guard.current_state.flags;
                 if !flags.contains(MouseFlags::Y_OVERFLOW) {
                     guard.current_state.y = self.get_y_movement(packet, flags);
                 }
@@ -546,7 +546,7 @@ impl KObject for Ps2MouseDevice {
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.inner.lock_irqsave().kobj_type.clone()
+        self.inner.lock_irqsave().kobj_type
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {

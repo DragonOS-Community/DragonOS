@@ -146,7 +146,7 @@ impl TtyDriver {
             .flags
             .contains(TtyDriverFlag::TTY_DRIVER_UNNUMBERED_NODE)
         {
-            return format!("{}", self.name);
+            return self.name.to_string();
         } else {
             return format!("{}{}", self.name, index + self.name_base);
         }

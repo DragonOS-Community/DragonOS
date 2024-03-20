@@ -641,7 +641,7 @@ impl Attribute for BusAttrDriversAutoprobe {
 
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?r=&mo=5649&fi=241#231
     fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {
-        if buf.len() == 0 {
+        if buf.is_empty() {
             return Ok(0);
         }
 
@@ -650,7 +650,7 @@ impl Attribute for BusAttrDriversAutoprobe {
             .get_bus_by_kset(&kset)
             .ok_or(SystemError::EINVAL)?;
 
-        if buf[0] == '0' as u8 {
+        if buf[0] == b'0' {
             bus.subsystem().set_drivers_autoprobe(false);
         } else {
             bus.subsystem().set_drivers_autoprobe(true);

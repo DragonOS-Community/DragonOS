@@ -158,7 +158,7 @@ impl<K: Ord, V> NodePtr<K, V> {
 
     #[inline]
     fn min_node(self) -> NodePtr<K, V> {
-        let mut temp = self.clone();
+        let mut temp = self;
         while !temp.left().is_null() {
             temp = temp.left();
         }
@@ -167,7 +167,7 @@ impl<K: Ord, V> NodePtr<K, V> {
 
     #[inline]
     fn max_node(self) -> NodePtr<K, V> {
-        let mut temp = self.clone();
+        let mut temp = self;
         while !temp.right().is_null() {
             temp = temp.right();
         }
@@ -239,7 +239,7 @@ impl<K: Ord, V> NodePtr<K, V> {
         if self.is_null() {
             return NodePtr::null();
         }
-        unsafe { (*self.0).parent.clone() }
+        unsafe { (*self.0).parent }
     }
 
     #[inline]
@@ -247,7 +247,7 @@ impl<K: Ord, V> NodePtr<K, V> {
         if self.is_null() {
             return NodePtr::null();
         }
-        unsafe { (*self.0).left.clone() }
+        unsafe { (*self.0).left }
     }
 
     #[inline]
@@ -882,20 +882,20 @@ impl<K: Ord, V> RBTree<K, V> {
         node.set_right(temp.left());
 
         if !temp.left().is_null() {
-            temp.left().set_parent(node.clone());
+            temp.left().set_parent(node);
         }
 
         temp.set_parent(node.parent());
         if node == self.root {
             self.root = temp.clone();
         } else if node == node.parent().left() {
-            node.parent().set_left(temp.clone());
+            node.parent().set_left(temp);
         } else {
-            node.parent().set_right(temp.clone());
+            node.parent().set_right(temp);
         }
 
-        temp.set_left(node.clone());
-        node.set_parent(temp.clone());
+        temp.set_left(node);
+        node.set_parent(temp);
     }
 
     /*
@@ -917,20 +917,20 @@ impl<K: Ord, V> RBTree<K, V> {
         node.set_left(temp.right());
 
         if !temp.right().is_null() {
-            temp.right().set_parent(node.clone());
+            temp.right().set_parent(node);
         }
 
         temp.set_parent(node.parent());
         if node == self.root {
-            self.root = temp.clone();
+            self.root = temp;
         } else if node == node.parent().right() {
-            node.parent().set_right(temp.clone());
+            node.parent().set_right(temp);
         } else {
-            node.parent().set_left(temp.clone());
+            node.parent().set_left(temp);
         }
 
-        temp.set_right(node.clone());
-        node.set_parent(temp.clone());
+        temp.set_right(node);
+        node.set_parent(temp);
     }
 
     /// replace value if key exist, if not exist insert it.

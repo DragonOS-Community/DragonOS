@@ -1246,7 +1246,7 @@ impl NTtyData {
         let echoed = self.echoes(tty.clone());
 
         if echoed.is_ok() && echoed.unwrap() > 0 {
-            let _ = tty.flush_chars(tty.core());
+            tty.flush_chars(tty.core());
         }
     }
 
@@ -1344,8 +1344,8 @@ impl NTtyData {
                                 if tty.put_char(tty.core(), 8).is_err() {
                                     tty.write(core, &[8], 1)?;
                                 }
-                                if tty.put_char(tty.core(), ' ' as u8).is_err() {
-                                    tty.write(core, &[' ' as u8], 1)?;
+                                if tty.put_char(tty.core(), b' ').is_err() {
+                                    tty.write(core, &[b' '], 1)?;
                                 }
                                 self.cursor_column -= 1;
                                 space -= 1;
@@ -1720,7 +1720,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         let pcb = ProcessManager::current_pcb();
         let binding = tty.clone();
         let core = binding.core();
-        let termios = core.termios().clone();
+        let termios = core.termios();
         if termios.local_mode.contains(LocalMode::TOSTOP) {
             TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTOU)?;
         }
@@ -1766,7 +1766,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                     nr -= 1;
                 }
 
-                let _ = tty.flush_chars(core);
+                tty.flush_chars(core);
             } else {
                 while nr > 0 {
                     let write = tty.write(core, &buf[offset..], nr)?;
@@ -1873,8 +1873,8 @@ impl TtyLineDiscipline for NTtyLinediscipline {
 
         // 第一次设置或者规范模式 (ICANON) 或者扩展处理 (EXTPROC) 标志发生变化
         let mut spec_mode_changed = false;
-        if old.is_some() {
-            let local_mode = old.clone().unwrap().local_mode.bitxor(termios.local_mode);
+        if let Some(old) = old {
+            let local_mode = old.local_mode.bitxor(termios.local_mode);
             spec_mode_changed =
                 local_mode.contains(LocalMode::ICANON) || local_mode.contains(LocalMode::EXTPROC);
         }

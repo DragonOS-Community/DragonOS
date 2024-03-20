@@ -294,7 +294,7 @@ pub fn vty_init() -> Result<(), SystemError> {
         Major::TTY_MAJOR,
         0,
         TtyDriverType::Console,
-        TTY_STD_TERMIOS.clone(),
+        *TTY_STD_TERMIOS,
         Arc::new(TtyConsoleDriverInner::new()?),
     );
 

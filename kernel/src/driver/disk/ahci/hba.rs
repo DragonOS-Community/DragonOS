@@ -217,7 +217,7 @@ impl HbaPort {
         // Command table offset: 40K + 8K*portno
         // Command table size = 256*32 = 8K per port
         let mut cmdheaders = phys_2_virt(clb as usize) as *mut u64 as *mut HbaCmdHeader;
-        for i in 0..32 as usize {
+        for i in 0..32 {
             volatile_write!((*cmdheaders).prdtl, 0); // 一开始没有询问，prdtl = 0（预留了8个PRDT项的空间）
             volatile_write!((*cmdheaders).ctba, ctbas[i]);
             // 这里限制了 prdtl <= 8, 所以一共用了256bytes，如果需要修改，可以修改这里

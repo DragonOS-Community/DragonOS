@@ -192,6 +192,7 @@ impl IoApic {
     /// * `active_high` - 是否为高电平有效
     /// * `dest_logic` - 是否为逻辑模式
     /// * `mask` - 是否屏蔽
+    #[allow(clippy::too_many_arguments)]
     pub fn install(
         &mut self,
         rte_index: u8,
@@ -334,7 +335,9 @@ impl IrqChipData for IoApicChipData {
 }
 
 impl IoApicChipData {
-    const DEFAULT: Self = Self::new(0, 0, 0, false, false, false, true);
+    const fn default() -> Self {
+        Self::new(0, 0, 0, false, false, false, true)
+    }
 
     const fn new(
         rte_index: u8,
@@ -411,7 +414,7 @@ pub fn ioapic_init(ignore: &'static [IrqNumber]) {
         let irq_data = desc.irq_data();
         let mut chip_info_guard = irq_data.chip_info_write_irqsave();
         chip_info_guard.set_chip(Some(ioapic_ir_chip()));
-        let chip_data = IoApicChipData::DEFAULT;
+        let chip_data = IoApicChipData::default();
         chip_data.inner().rte_index = IoApic::vector_rte_index(i as u8);
         chip_data.inner().vector = i as u8;
         chip_info_guard.set_chip_data(Some(Arc::new(chip_data)));

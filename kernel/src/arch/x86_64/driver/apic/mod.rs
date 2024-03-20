@@ -118,9 +118,9 @@ pub enum LVTRegister {
     ErrorReg = 0x837,
 }
 
-impl Into<u32> for LVTRegister {
-    fn into(self) -> u32 {
-        self as u32
+impl From<LVTRegister> for u32 {
+    fn from(val: LVTRegister) -> Self {
+        val as u32
     }
 }
 

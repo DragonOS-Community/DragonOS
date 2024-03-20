@@ -37,9 +37,6 @@
 #[macro_use]
 extern crate std;
 
-#[allow(non_upper_case_globals)]
-#[allow(non_camel_case_types)]
-#[allow(non_snake_case)]
 use core::panic::PanicInfo;
 
 /// 导出x86_64架构相关的代码，命名为arch模块

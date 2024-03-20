@@ -92,9 +92,9 @@ impl From<usize> for Signal {
     }
 }
 
-impl Into<usize> for Signal {
-    fn into(self) -> usize {
-        self as usize
+impl From<Signal> for usize {
+    fn from(val: Signal) -> Self {
+        val as usize
     }
 }
 
@@ -109,10 +109,10 @@ impl From<i32> for Signal {
     }
 }
 
-impl Into<SigSet> for Signal {
-    fn into(self) -> SigSet {
+impl From<Signal> for SigSet {
+    fn from(val: Signal) -> Self {
         SigSet {
-            bits: (1 << (self as usize - 1) as u64),
+            bits: (1 << (val as usize - 1) as u64),
         }
     }
 }

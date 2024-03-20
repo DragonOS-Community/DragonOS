@@ -76,9 +76,9 @@ impl From<IpiTarget> for ArchIpiTarget {
     }
 }
 
-impl Into<ApicId> for ArchIpiTarget {
-    fn into(self) -> ApicId {
-        if let ArchIpiTarget::Specified(id) = self {
+impl From<ArchIpiTarget> for ApicId {
+    fn from(val: ArchIpiTarget) -> Self {
+        if let ArchIpiTarget::Specified(id) = val {
             return id;
         } else if CurrentApic.x2apic_enabled() {
             return x86::apic::ApicId::X2Apic(0);
@@ -109,9 +109,9 @@ impl ArchIpiTarget {
     }
 }
 
-impl Into<x86::apic::DestinationShorthand> for ArchIpiTarget {
-    fn into(self) -> x86::apic::DestinationShorthand {
-        match self {
+impl From<ArchIpiTarget> for x86::apic::DestinationShorthand {
+    fn from(val: ArchIpiTarget) -> Self {
+        match val {
             ArchIpiTarget::Specified(_) => x86::apic::DestinationShorthand::NoShorthand,
             ArchIpiTarget::Current => x86::apic::DestinationShorthand::Myself,
             ArchIpiTarget::All => x86::apic::DestinationShorthand::AllIncludingSelf,

@@ -90,7 +90,7 @@ impl DeviceManager {
             let mut data = DeviceAttachData::new(dev.clone(), allow_async, false);
             let mut flag = false;
             for driver in bus.subsystem().drivers().iter() {
-                let r = self.do_device_attach_driver(&driver, &mut data);
+                let r = self.do_device_attach_driver(driver, &mut data);
                 if unlikely(r.is_err()) {
                     flag = false;
                     break;
@@ -156,7 +156,7 @@ impl DeviceManager {
                     );
                     return Err(e);
                 }
-            } else if r.unwrap() == false {
+            } else if !r.unwrap() {
                 return Ok(false);
             }
         }
@@ -181,11 +181,7 @@ impl DeviceManager {
     ///
     /// 如果传递的设备已成功完成对驱动程序的探测，则返回true，否则返回false。
     pub fn device_is_bound(&self, dev: &Arc<dyn Device>) -> bool {
-        if dev.driver().is_some() {
-            return true;
-        } else {
-            return false;
-        }
+        return dev.driver().is_some();
     }
 
     /// 把一个驱动绑定到设备上
@@ -283,7 +279,7 @@ impl DriverManager {
             .flatten()
             .ok_or(SystemError::EINVAL)?;
         for dev in bus.subsystem().devices().iter() {
-            if self.do_driver_attach(&dev, &driver) {
+            if self.do_driver_attach(dev, driver) {
                 // 匹配成功
                 return Ok(());
             }
@@ -295,7 +291,7 @@ impl DriverManager {
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#1134
     fn do_driver_attach(&self, device: &Arc<dyn Device>, driver: &Arc<dyn Driver>) -> bool {
         let r = self.match_device(driver, device).unwrap_or(false);
-        if r == false {
+        if !r {
             // 不匹配
             return false;
         }
@@ -464,7 +460,7 @@ impl DriverManager {
         if let Some(bus) = device.bus().map(|bus| bus.upgrade()).flatten() {
             bus.subsystem().bus_notifier().call_chain(
                 BusNotifyEvent::BindDriver,
-                Some(&device),
+                Some(device),
                 None,
             );
         }

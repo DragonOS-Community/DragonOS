@@ -274,7 +274,7 @@ impl E1000EDevice {
             // close the interrupt
             volwrite!(interrupt_regs, imc, E1000E_IMC_CLEAR);
             let mut gcr = volread!(pcie_regs, gcr);
-            gcr |= (1 << 22);
+            gcr |= 1 << 22;
             volwrite!(pcie_regs, gcr, gcr);
             compiler_fence(Ordering::AcqRel);
             // PHY Initialization 14.8.1

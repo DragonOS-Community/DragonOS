@@ -1720,7 +1720,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         let pcb = ProcessManager::current_pcb();
         let binding = tty.clone();
         let core = binding.core();
-        let termios = core.termios();
+        let termios = *core.termios();
         if termios.local_mode.contains(LocalMode::TOSTOP) {
             TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTOU)?;
         }

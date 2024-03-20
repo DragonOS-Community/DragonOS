@@ -10,7 +10,7 @@ mod utils;
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 
 use alloc::{
-    string::{String, ToString},
+    string::String,
     sync::Arc,
     vec::Vec,
 };
@@ -424,16 +424,17 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         None
     }
 
-    /// @brief 获取目录项
+    /// 获取目录名
     fn key(&self) -> Result<String, SystemError> {
         return self.parent()?.get_entry_name(self.metadata()?.inode_id);
     }
 
-    /// @brief 获取父目录
+    /// 获取父目录
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         return self.find("..");
     }
 
+    /// 返回自身引用
     fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         return self.find(".");
     }
@@ -475,7 +476,6 @@ impl dyn IndexNode {
         max_follow_times: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 拼接绝对路径
-        // kdebug!("Using path: {}", path);
         let abs_path = if is_absolute(path)
             || self.metadata()?.inode_id == ROOT_INODE().metadata()?.inode_id
         {
@@ -483,7 +483,6 @@ impl dyn IndexNode {
         } else {
             self._abs_path()? + &clean_path(path)
         };
-        // kdebug!("Abs_path: {:?}", abs_path);
         // 检查根目录缓存
         if let Some((root_path, fs)) = MOUNTS_LIST()
             .lock()
@@ -505,7 +504,6 @@ impl dyn IndexNode {
                     .unwrap()
                     .inner_filesystem()
                     .root_inode();
-            // kdebug!("I have cache? {}", fs.cache().is_ok());
             if let Ok(fscache) = fs.cache() {
                 let mut path_under = abs_path.strip_prefix(root_path).unwrap();
                 kdebug!("Path under FSroot: {:?}", path_under);
@@ -530,14 +528,14 @@ impl dyn IndexNode {
 
                     // some path left, pop prefix '/'
                     rest_path = rest_path.strip_prefix('/').unwrap();
-                    return inode._lookup_walk(
+                    return inode.lookup_walk(
                         rest_path,
                         max_follow_times,
                     );
                 }
 
                 // Cache record not found
-                return root_inode._lookup_walk(
+                return root_inode.lookup_walk(
                     path_under,
                     max_follow_times,
                 );
@@ -547,8 +545,8 @@ impl dyn IndexNode {
             return fs.root_inode()._lookup_follow_symlink(path, max_follow_times);
         }
 
-        // Exception Normal lookup
-        kdebug!("Depredecated.");
+        // Exception Normal lookup, for non-cache fs
+        // kdebug!("Depredecated.");
         return self._lookup_follow_symlink(path, max_follow_times);
     }
 
@@ -560,7 +558,7 @@ impl dyn IndexNode {
         if self.metadata()?.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
-        // kdebug!("Normal Lookup");
+
         // 处理绝对路径
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
@@ -622,7 +620,7 @@ impl dyn IndexNode {
         Ok(result)
     }
 
-    fn _lookup_walk(
+    fn lookup_walk(
         &self,
         rest_path: &str,
         max_follow_times: usize,
@@ -637,19 +635,20 @@ impl dyn IndexNode {
             Ok(child_node) => {
                 if child_node.metadata()?.file_type == FileType::SymLink && max_follow_times > 0 {
                     // symlink wrapping problem
-                    return self._lookup_walk(
+                    return self.lookup_walk(
                         &(child_node.from_symlink()? + "/" + rest_path),
                         max_follow_times - 1,
                     );
                 }
 
+                // 潜在优化可能：重复的文件系统缓存获取
                 if let Ok(cache) = self.fs().cache() {
                     // kdebug!("Calling cache put with child {}", child);
                     cache.put(child, Arc::downgrade(&child_node));
                 }
 
                 if let Some(rest) = left_path {
-                    return child_node._lookup_walk(rest, max_follow_times);
+                    return child_node.lookup_walk(rest, max_follow_times);
                 }
 
                 return Ok(child_node);
@@ -680,31 +679,19 @@ impl dyn IndexNode {
     fn quick_lookup<'a>(
         &'a self,
         cache: Arc<DefaultCache>,
-        abs_path: &'a str, // abs to fs's root inode
-    ) -> Option<(Arc<dyn IndexNode>, &str)> {
-        // kdebug!("Quick Lookup");
-        self._quick_lookup(cache, abs_path)
-    }
-
-    fn _quick_lookup<'a>(
-        &'a self,
-        cache: Arc<DefaultCache>,
         abs_path: &'a str,
     ) -> Option<(Arc<dyn IndexNode>, &str)> {
         let (key, left_rest) = rsplit_path(abs_path);
 
-        // kdebug!("Quick Lookup with key {:?}", key);
-        kdebug!("It's abs_path is {:?}", abs_path);
-
         let result = cache
             .get(key)
             .find(|src| {
-                kdebug!("Src: {}, {}; Lookup: {}, {}", src.key().unwrap(), src._abs_path().unwrap(), key, abs_path);
+                // kdebug!("Src: {}, {}; Lookup: {}, {}", src.key().unwrap(), src._abs_path().unwrap(), key, abs_path);
                 src.key().unwrap() == key && src._abs_path().unwrap().strip_prefix('/').unwrap() == abs_path
             });
 
         if result.is_some() {
-            kdebug!("Hit cache!!!");
+            // kdebug!("Hit cache!!!");
             return Some((result.unwrap(), abs_path));
         }
 
@@ -712,15 +699,14 @@ impl dyn IndexNode {
             return None;
         }
 
-        return self._quick_lookup(cache, left_rest.unwrap());
+        return self.quick_lookup(cache, left_rest.unwrap());
     }
 
     pub(super) fn _abs_path(&self) -> Result<String, SystemError> {
         let mut inode = self.self_ref()?;
         let mut path_stack = Vec::new();
         path_stack.push(self.key()?);
-        // kdebug!("Inode with children {:?}, {:?}" , inode.list(), inode.metadata()?.inode_id);
-        // kdebug!("ROOT with children {:?}, {:?}", ROOT_INODE().list(), ROOT_INODE().metadata()?.inode_id);
+
         while inode.metadata()?.inode_id != ROOT_INODE().metadata()?.inode_id {
             let tmp = inode.parent();
             match tmp {
@@ -742,14 +728,13 @@ impl dyn IndexNode {
             path_stack.push(inode.key()?);
         }
         if let Some(last_key) = path_stack.last() {
+            // 根目录没有目录名，弹出
             if last_key == "" || last_key == "." || last_key == ".." {
                 path_stack.pop();
             }
             path_stack.reverse();
-            // kdebug!("Item in path_stack are{:?}", path_stack);
             let mut ret = String::from("/");
             ret.push_str(&path_stack.join("/"));
-            // kdebug!("Abs path of {:?} is {:?}", self.key(), ret);
             return Ok(ret);
         }
         return Ok(String::from("/"));

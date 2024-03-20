@@ -36,8 +36,8 @@ impl<'a> Iterator for SrcIter<'a> {
         if self.idx == vec_cur.len() {
             return None;
         }
-        kdebug!("Something in Hash list! Length: {}", vec_cur.len());
-        // 自动删除空节点
+
+        // 自动删除空节点（未测试）
         while vec_cur[self.idx].upgrade().is_none()
             || vec_cur[self.idx].upgrade().unwrap().upgrade().is_none()
         {
@@ -45,7 +45,6 @@ impl<'a> Iterator for SrcIter<'a> {
             writer.remove(self.idx);
             vec_cur = writer.downgrade_to_upgradeable();
         }
-        kdebug!("Finish Empty pop");
         self.idx += 1;
         let result = vec_cur[self.idx - 1].upgrade().unwrap().upgrade();
         self.vec = Some(vec_cur);
@@ -57,7 +56,7 @@ struct HashTable<H: Hasher + Default> {
     _hash_type: PhantomData<H>,
     table: Vec<RwLock<VecDeque<SrcPtr>>>,
 }
-/* Todo: Change VecDeque to BTreeMap to record depth message. */
+
 impl<H: Hasher + Default> HashTable<H> {
     fn new(size: usize) -> Self {
         let mut new = Self {
@@ -199,7 +198,7 @@ impl<H: Hasher + Default> DefaultCache<H> {
         self.table.get_list_iter(key)
     }
 
-    /// 清除已被删除的目录项
+    /// 清除已被删除的目录项（未测试）
     pub fn clean(&self) -> usize {
         let ret = self.deque.lock().clean();
         self.size.fetch_sub(ret, Ordering::Acquire);
@@ -207,7 +206,7 @@ impl<H: Hasher + Default> DefaultCache<H> {
         ret
     }
 
-    /// 释放未在使用的目录项与清除已删除的目录项
+    /// 释放未在使用的目录项与清除已删除的目录项（未测试）
     pub fn release(&self) -> usize {
         let ret = self.deque.lock().release();
         self.size.fetch_sub(ret, Ordering::Acquire);

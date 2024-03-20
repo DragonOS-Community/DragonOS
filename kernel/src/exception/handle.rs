@@ -127,7 +127,8 @@ impl IrqFlowHandler for EdgeIrqHandler {
 
             if !desc_inner_guard
                 .internal_state()
-                .contains(IrqDescState::IRQS_PENDING) || desc_inner_guard.common_data().disabled()
+                .contains(IrqDescState::IRQS_PENDING)
+                || desc_inner_guard.common_data().disabled()
             {
                 break;
             }

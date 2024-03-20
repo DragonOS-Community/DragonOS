@@ -118,7 +118,6 @@ impl IndexNode for LockedZeroInode {
         for itr in buf.iter_mut().take(len) {
             *itr = 0;
         }
-        
 
         return Ok(len);
     }

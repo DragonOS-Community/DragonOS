@@ -524,10 +524,8 @@ impl LocalAPIC for CurrentApic {
     fn send_eoi(&self) {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             X2Apic.send_eoi();
-        } else {
-            if let Some(xapic) = current_xapic_instance().borrow().as_ref() {
-                xapic.send_eoi();
-            }
+        } else if let Some(xapic) = current_xapic_instance().borrow().as_ref() {
+            xapic.send_eoi();
         }
     }
 
@@ -582,10 +580,8 @@ impl LocalAPIC for CurrentApic {
     fn set_lvt(&mut self, lvt: LVT) {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             X2Apic.set_lvt(lvt);
-        } else {
-            if let Some(xapic) = current_xapic_instance().borrow_mut().as_mut() {
-                xapic.set_lvt(lvt);
-            }
+        } else if let Some(xapic) = current_xapic_instance().borrow_mut().as_mut() {
+            xapic.set_lvt(lvt);
         }
     }
 
@@ -604,20 +600,16 @@ impl LocalAPIC for CurrentApic {
     fn mask_all_lvt(&mut self) {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             X2Apic.mask_all_lvt();
-        } else {
-            if let Some(xapic) = current_xapic_instance().borrow_mut().as_mut() {
-                xapic.mask_all_lvt();
-            }
+        } else if let Some(xapic) = current_xapic_instance().borrow_mut().as_mut() {
+            xapic.mask_all_lvt();
         }
     }
 
     fn write_icr(&self, icr: Icr) {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             X2Apic.write_icr(icr);
-        } else {
-            if let Some(xapic) = current_xapic_instance().borrow().as_ref() {
-                xapic.write_icr(icr);
-            }
+        } else if let Some(xapic) = current_xapic_instance().borrow().as_ref() {
+            xapic.write_icr(icr);
         }
     }
 }

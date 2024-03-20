@@ -567,7 +567,7 @@ impl PciDeviceStructure for PciDeviceStructurePciToCardbusBridge {
     }
     #[inline(always)]
     fn as_pci_to_carbus_bridge_device(&self) -> Option<&PciDeviceStructurePciToCardbusBridge> {
-        Some(&self)
+        Some(self)
     }
     #[inline(always)]
     fn as_pci_to_carbus_bridge_device_mut(
@@ -634,7 +634,7 @@ impl PciRoot {
         let size = (bus_number_double as usize) * (PAGE_2M_SIZE as usize);
         unsafe {
             let space_guard = mmio_pool()
-                .create_mmio(size as usize)
+                .create_mmio(size)
                 .map_err(|_| PciError::CreateMmioError)?;
             let space_guard = Arc::new(space_guard);
             self.mmio_guard = Some(space_guard.clone());

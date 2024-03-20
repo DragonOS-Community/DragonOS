@@ -1243,7 +1243,12 @@ impl VirtualConsoleData {
             return (idx, Some(Color::from_256(self.par[idx])));
         } else if self.par[idx] == 2 && idx + 3 <= self.npar as usize {
             // 24位
-            let mut color = Color { red: self.par[idx + 1] as u16, green: self.par[idx + 2] as u16, blue: self.par[idx + 3] as u16, ..Default::default() };
+            let mut color = Color {
+                red: self.par[idx + 1] as u16,
+                green: self.par[idx + 2] as u16,
+                blue: self.par[idx + 3] as u16,
+                ..Default::default()
+            };
             idx += 3;
             return (idx, Some(color));
         } else {
@@ -1588,7 +1593,7 @@ impl VirtualConsoleData {
             // TODO: 处理unicode screen buf
 
             if himask != 0 {
-                tc = ((if tc & 0x100 != 0 { himask as u32 } else { 0 }) | (tc & 0xff));
+                tc = (if tc & 0x100 != 0 { himask as u32 } else { 0 }) | (tc & 0xff);
             }
 
             tc |= ((attr as u32) << 8) & (!himask as u32);

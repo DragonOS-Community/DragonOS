@@ -326,7 +326,7 @@ impl E1000EDevice {
             recv_buffers.push(buffer);
         }
         // Same as receive buffers
-        for i in 0..trans_ring_length {
+        for i in 0..recv_ring_length {
             let buffer = E1000EBuffer::new(PAGE_SIZE);
             trans_desc_ring[i].addr = buffer.as_paddr() as u64;
             trans_desc_ring[i].status = 1;
@@ -340,7 +340,7 @@ impl E1000EDevice {
         while mta_adress != vaddress + E1000E_MTA_REGS_END_OFFSET {
             let mta: NonNull<MTARegs> = get_register_ptr(mta_adress, 0);
             unsafe { volwrite!(mta, mta, 0) };
-            mta_adress = mta_adress + 4;
+            mta_adress += 4;
         }
         // 连续的寄存器读-写操作，放在同一个unsafe块中
         unsafe {
@@ -491,8 +491,8 @@ impl E1000EDevice {
     pub fn e1000e_intr_set(&mut self, state: bool) {
         let mut ims = unsafe { volread!(self.interrupt_regs, ims) };
         match state {
-            true => ims = ims | E1000E_IMS_RXT0,
-            false => ims = ims & !E1000E_IMS_RXT0,
+            true => ims |= E1000E_IMS_RXT0,
+            false => ims &= !E1000E_IMS_RXT0,
         }
         unsafe { volwrite!(self.interrupt_regs, ims, ims) };
     }
@@ -512,8 +512,7 @@ impl E1000EDevice {
             // close interrupt
             self.e1000e_intr_set(false);
             loop {
-                if self.napi_buffer_tail == self.napi_buffer_head && self.napi_buffer_empty == false
-                {
+                if self.napi_buffer_tail == self.napi_buffer_head && !self.napi_buffer_empty {
                     // napi缓冲队列已满，停止收包
                     // napi queue is full, stop
                     break;

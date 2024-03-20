@@ -20,10 +20,16 @@ use crate::{
         process::ArchPCBInfo,
         sched::sched,
         CurrentIrqArch,
-    }, driver::tty::tty_core::TtyCore, exception::InterruptArch, filesystem::{
+    },
+    driver::tty::tty_core::TtyCore,
+    exception::InterruptArch,
+    filesystem::{
         procfs::procfs_unregister_pid,
         vfs::{file::FileDescriptorVec, FileType},
-    }, ipc::signal_types::{SigInfo, SigPending, SignalStruct}, kdebug, kinfo, libs::{
+    },
+    ipc::signal_types::{SigInfo, SigPending, SignalStruct},
+    kdebug, kinfo,
+    libs::{
         align::AlignedBox,
         casting::DowncastArc,
         futex::{
@@ -34,14 +40,19 @@ use crate::{
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
-    }, mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr}, net::socket::SocketInode, panic, sched::{
+    },
+    mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
+    net::socket::SocketInode,
+    sched::{
         completion::Completion,
         core::{sched_enqueue, CPU_EXECUTING},
         SchedPolicy, SchedPriority,
-    }, smp::{
+    },
+    smp::{
         cpu::{AtomicProcessorId, ProcessorId},
         kick_cpu,
-    }, syscall::{user_access::clear_user, Syscall}
+    },
+    syscall::{user_access::clear_user, Syscall},
 };
 
 use self::kthread::WorkerPrivate;
@@ -358,7 +369,7 @@ impl ProcessManager {
         sched();
         kerror!("pid {pid:?} exited but sched again!");
         #[allow(clippy::empty_loop)]
-        loop{
+        loop {
             spin_loop();
         }
     }

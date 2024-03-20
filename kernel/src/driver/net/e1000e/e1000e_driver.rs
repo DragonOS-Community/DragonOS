@@ -76,7 +76,7 @@ impl phy::RxToken for E1000ERxToken {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let result = f(&mut self.0.as_mut_slice());
+        let result = f(self.0.as_mut_slice());
         self.0.free_buffer();
         return result;
     }
@@ -253,7 +253,7 @@ impl NetDriver for E1000EInterface {
 
         self.iface.lock().update_ip_addrs(|addrs| {
             let dest = addrs.iter_mut().next();
-            if let None = dest {
+            if dest.is_none() {
                 addrs.push(ip_addrs[0]).expect("Push ipCidr failed: full");
             } else {
                 let dest = dest.unwrap();

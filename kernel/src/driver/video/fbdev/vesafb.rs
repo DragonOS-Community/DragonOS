@@ -390,7 +390,7 @@ impl FrameBufferOps for VesaFb {
             .screen_info
             .lfb_virt_base
             .ok_or(SystemError::ENODEV)?;
-        
+
         let fg = if self.current_fb_fix().visual == FbVisual::TrueColor
             || self.current_fb_fix().visual == FbVisual::DirectColor
         {

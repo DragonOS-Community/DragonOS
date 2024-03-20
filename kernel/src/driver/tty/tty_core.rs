@@ -139,18 +139,17 @@ impl TtyCore {
     }
 
     pub fn tty_mode_ioctl(tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<usize, SystemError> {
-        let real_tty;
         let core = tty.core();
-        if core.driver().tty_driver_type() == TtyDriverType::Pty
+        let real_tty = if core.driver().tty_driver_type() == TtyDriverType::Pty
             && core.driver().tty_driver_sub_type() == TtyDriverSubType::PtyMaster
         {
-            real_tty = core.link().unwrap();
+            core.link().unwrap()
         } else {
-            real_tty = tty;
-        }
+            tty
+        };
         match cmd {
             TtyIoctlCmd::TCGETS => {
-                let termios = PosixTermios::from_kernel_termios(real_tty.core.termios().clone());
+                let termios = PosixTermios::from_kernel_termios(*real_tty.core.termios());
                 let mut user_writer = UserBufferWriter::new(
                     VirtAddr::new(arg).as_ptr::<PosixTermios>(),
                     core::mem::size_of::<PosixTermios>(),
@@ -187,7 +186,7 @@ impl TtyCore {
     ) -> Result<usize, SystemError> {
         #[allow(unused_assignments)]
         // TERMIOS_TERMIO下会用到
-        let mut tmp_termios = tty.core().termios().clone();
+        let mut tmp_termios = *tty.core().termios();
 
         if opt.contains(TtySetTermiosOpt::TERMIOS_TERMIO) {
             todo!()
@@ -220,7 +219,7 @@ impl TtyCore {
     pub fn set_termios_next(tty: Arc<TtyCore>, new_termios: Termios) -> Result<(), SystemError> {
         let mut termios = tty.core().termios_write();
 
-        let old_termios = termios.clone();
+        let old_termios = *termios;
         *termios = new_termios;
         let tmp = termios.control_mode;
         termios.control_mode ^= (tmp ^ old_termios.control_mode) & ControlMode::ADDRB;
@@ -242,7 +241,7 @@ impl TtyCore {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct TtyContorlInfo {
     /// 前台进程pid
     pub session: Option<Pid>,
@@ -252,17 +251,6 @@ pub struct TtyContorlInfo {
     /// packet模式下使用，目前未用到
     pub pktstatus: u8,
     pub packet: bool,
-}
-
-impl Default for TtyContorlInfo {
-    fn default() -> Self {
-        Self {
-            session: None,
-            pgid: None,
-            pktstatus: Default::default(),
-            packet: Default::default(),
-        }
-    }
 }
 
 #[derive(Debug, Default)]
@@ -338,7 +326,7 @@ impl TtyCoreData {
 
     #[inline]
     pub fn flags(&self) -> TtyFlag {
-        self.flags.read().clone()
+        *self.flags.read()
     }
 
     #[inline]

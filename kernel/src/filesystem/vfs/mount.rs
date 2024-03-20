@@ -482,6 +482,10 @@ impl FileSystem for MountFS {
         self
     }
 
+    fn name(&self) -> &str {
+        "mountfs"
+    }
+
     fn cache(&self) -> Result<Arc<super::cache::DefaultCache>, SystemError> {
         self.inner_filesystem.cache()
     }

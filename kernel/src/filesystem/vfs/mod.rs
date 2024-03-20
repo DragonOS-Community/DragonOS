@@ -1,19 +1,14 @@
+pub mod cache;
 pub mod core;
 pub mod fcntl;
 pub mod file;
 pub mod mount;
 pub mod open;
-pub mod syscall; 
-pub mod cache;
+pub mod syscall;
 mod utils;
 
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
-
-use alloc::{
-    string::String,
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
@@ -497,13 +492,12 @@ impl dyn IndexNode {
             })
             .next()
         {
-            let root_inode 
-                = fs
-                    .as_any_ref()
-                    .downcast_ref::<MountFS>()
-                    .unwrap()
-                    .inner_filesystem()
-                    .root_inode();
+            let root_inode = fs
+                .as_any_ref()
+                .downcast_ref::<MountFS>()
+                .unwrap()
+                .inner_filesystem()
+                .root_inode();
             if let Ok(fscache) = fs.cache() {
                 let mut path_under = abs_path.strip_prefix(root_path).unwrap();
                 kdebug!("Path under FSroot: {:?}", path_under);
@@ -513,11 +507,7 @@ impl dyn IndexNode {
 
                 path_under = path_under.strip_prefix('/').unwrap();
                 // Cache record is found
-                if let Some((inode, found_path)) 
-                    = root_inode.quick_lookup(
-                        fscache,
-                        path_under
-                ) {
+                if let Some((inode, found_path)) = root_inode.quick_lookup(fscache, path_under) {
                     kdebug!("Found path: {}", found_path);
                     let mut rest_path = path_under.strip_prefix(found_path).unwrap();
                     kdebug!("Rest path {:?}", rest_path);
@@ -528,21 +518,17 @@ impl dyn IndexNode {
 
                     // some path left, pop prefix '/'
                     rest_path = rest_path.strip_prefix('/').unwrap();
-                    return inode.lookup_walk(
-                        rest_path,
-                        max_follow_times,
-                    );
+                    return inode.lookup_walk(rest_path, max_follow_times);
                 }
 
                 // Cache record not found
-                return root_inode.lookup_walk(
-                    path_under,
-                    max_follow_times,
-                );
+                return root_inode.lookup_walk(path_under, max_follow_times);
             }
 
             // 在对应文件系统根开始lookup
-            return fs.root_inode()._lookup_follow_symlink(path, max_follow_times);
+            return fs
+                .root_inode()
+                ._lookup_follow_symlink(path, max_follow_times);
         }
 
         // Exception Normal lookup, for non-cache fs
@@ -683,12 +669,11 @@ impl dyn IndexNode {
     ) -> Option<(Arc<dyn IndexNode>, &str)> {
         let (key, left_rest) = rsplit_path(abs_path);
 
-        let result = cache
-            .get(key)
-            .find(|src| {
-                // kdebug!("Src: {}, {}; Lookup: {}, {}", src.key().unwrap(), src._abs_path().unwrap(), key, abs_path);
-                src.key().unwrap() == key && src._abs_path().unwrap().strip_prefix('/').unwrap() == abs_path
-            });
+        let result = cache.get(key).find(|src| {
+            // kdebug!("Src: {}, {}; Lookup: {}, {}", src.key().unwrap(), src._abs_path().unwrap(), key, abs_path);
+            src.key().unwrap() == key
+                && src._abs_path().unwrap().strip_prefix('/').unwrap() == abs_path
+        });
 
         if result.is_some() {
             // kdebug!("Hit cache!!!");
@@ -824,6 +809,8 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;
 
+    fn name(&self) -> &str;
+
     fn cache(&self) -> Result<Arc<DefaultCache>, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
@@ -875,3 +862,49 @@ impl Metadata {
         }
     }
 }
+pub struct FileSystemMaker {
+    function: &'static FileSystemNewFunction,
+    name: &'static str,
+}
+
+impl FileSystemMaker {
+    pub const fn new(
+        name: &'static str,
+        function: &'static FileSystemNewFunction,
+    ) -> FileSystemMaker {
+        FileSystemMaker { function, name }
+    }
+
+    pub fn call(&self) -> Result<Arc<dyn FileSystem>, SystemError> {
+        (self.function)()
+    }
+}
+
+pub type FileSystemNewFunction = fn() -> Result<Arc<dyn FileSystem>, SystemError>;
+
+#[macro_export]
+macro_rules! define_filesystem_maker_slice {
+    ($name:ident) => {
+        #[::linkme::distributed_slice]
+        pub static $name: [FileSystemMaker] = [..];
+    };
+    () => {
+        compile_error!("define_filesystem_maker_slice! requires at least one argument: slice_name");
+    };
+}
+
+/// 调用指定数组中的所有初始化器
+#[macro_export]
+macro_rules! producefs {
+    ($initializer_slice:ident,$filesystem:ident) => {
+        match $initializer_slice.iter().find(|&m| m.name == $filesystem) {
+            Some(maker) => maker.call(),
+            None => {
+                kerror!("mismatch filesystem type : {}", $filesystem);
+                Err(SystemError::EINVAL)
+            }
+        }
+    };
+}
+
+define_filesystem_maker_slice!(FSMAKER);

@@ -20,5 +20,8 @@
   "clean": {
     "clean_command": "make clean"
   },
-  "envs": []
+  "envs": [],
+  "build_once": true,
+
+  "install_once": true
 }

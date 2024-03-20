@@ -1,13 +1,15 @@
-use super::vfs::{
-    cache::DefaultCache,
-    core::generate_inode_id,
-    file::{FileMode, FilePrivateData},
-    syscall::ModeType,
-    FileSystem, FileType, FsInfo, IndexNode, Metadata, SpecialNodeData,
+use core::any::Any;
+use core::cmp::Ordering;
+use core::intrinsics::unlikely;
+
+use crate::filesystem::vfs::FSMAKER;
+use crate::{
+    driver::base::device::device_number::DeviceNumber,
+    filesystem::vfs::{core::generate_inode_id, FileType},
+    ipc::pipe::LockedPipeInode,
+    libs::spinlock::SpinLock,
+    time::TimeSpec,
 };
-
-use core::{any::Any, cmp::Ordering, intrinsics::unlikely};
-
 use alloc::{
     collections::BTreeMap,
     string::String,
@@ -16,10 +18,11 @@ use alloc::{
 };
 use system_error::SystemError;
 
-use crate::{
-    driver::base::device::device_number::DeviceNumber, ipc::pipe::LockedPipeInode,
-    libs::spinlock::SpinLock, time::TimeSpec,
+use super::vfs::{
+    cache::DefaultCache, file::FilePrivateData, syscall::ModeType, FileSystem, FileSystemMaker,
+    FsInfo, IndexNode, Metadata, SpecialNodeData,
 };
+
 /// RamFS的inode名称的最大长度
 const RAMFS_MAX_NAMELEN: usize = 64;
 
@@ -56,7 +59,18 @@ impl RamFS {
         }
         ret
     }
+
+    pub fn make_ramfs() -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        let fs = RamFS::new();
+        return Ok(fs);
+    }
 }
+
+#[distributed_slice(FSMAKER)]
+static RAMFSMAKER: FileSystemMaker = FileSystemMaker::new(
+    "ramfs",
+    &(RamFS::make_ramfs as fn() -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
+);
 
 impl FileSystem for RamFS {
     fn root_inode(&self) -> Arc<dyn super::vfs::IndexNode> {
@@ -74,6 +88,10 @@ impl FileSystem for RamFS {
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+
+    fn name(&self) -> &str {
+        "ramfs"
     }
 
     fn cache(&self) -> Result<Arc<DefaultCache>, SystemError> {
@@ -305,8 +323,6 @@ impl Inode {
     }
 }
 
-// impl trait for LockedEntry
-
 impl IndexNode for LockedEntry {
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
         let entry = self.0.lock();
@@ -329,8 +345,12 @@ impl IndexNode for LockedEntry {
         Ok(())
     }
 
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
-        Ok(())
+    fn open(
+        &self,
+        _data: &mut FilePrivateData,
+        _mode: &super::vfs::file::FileMode,
+    ) -> Result<(), SystemError> {
+        return Ok(());
     }
 
     fn read_at(

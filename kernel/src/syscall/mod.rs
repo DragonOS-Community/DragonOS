@@ -1,5 +1,6 @@
 use core::{
     ffi::{c_int, c_void},
+    ptr::null,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -942,6 +943,13 @@ impl Syscall {
 
                 Err(SystemError::ENOSYS)
             }
+
+            SYS_MOUNT => {
+                let source = args[0] as *const u8;
+                let target = args[1] as *const u8;
+                let filesystemtype = args[2] as *const u8;
+                return Self::mount(source, target, filesystemtype, 0, null());
+            }
             SYS_NEWFSTATAT => {
                 // todo: 这个系统调用还没有实现
 
@@ -953,6 +961,7 @@ impl Syscall {
                 let name = args[0] as *mut PosixOldUtsName;
                 Self::uname(name)
             }
+
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

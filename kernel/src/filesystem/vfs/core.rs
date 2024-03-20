@@ -81,8 +81,6 @@ pub fn vfs_init() -> Result<(), SystemError> {
 
     sysfs_init().expect("Failed to initialize sysfs");
 
-    mount_ramfs().expect("Failed to initialize ramfs");
-
     let root_entries = ROOT_INODE().list().expect("VFS init failed");
     if root_entries.len() > 0 {
         kinfo!("Successfully initialized VFS!");
@@ -291,13 +289,10 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     return Ok(0);
 }
 
-fn mount_ramfs() -> Result<(), SystemError> {
-    let ramfs = RamFS::new();
-    let _t = ROOT_INODE()
-        .find("ram")
-        .expect("cannot find /ram")
-        .mount(ramfs)
-        .expect("Failed to mount ram");
-    kinfo!("RamFS mounted");
-    Ok(())
+// @brief mount filesystem
+pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<usize, SystemError> {
+    ROOT_INODE()
+        .lookup_follow_symlink(&mount_point, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
+        .mount(fs)?;
+    Ok(0)
 }

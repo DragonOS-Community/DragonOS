@@ -20,4 +20,4 @@ Cargo.lock
 .cache
 compile_commands.json
 /logs/
-compile_error.log
+.vscode

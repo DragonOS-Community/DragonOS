@@ -65,9 +65,10 @@ pub mod fork;
 pub mod idle;
 pub mod kthread;
 pub mod pid;
-pub mod process;
 pub mod resource;
+pub mod stdio;
 pub mod syscall;
+pub mod utils;
 
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);

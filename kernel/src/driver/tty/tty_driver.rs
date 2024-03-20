@@ -113,6 +113,7 @@ pub struct TtyDriver {
 }
 
 impl TtyDriver {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         count: u32,
         node_name: &'static str,

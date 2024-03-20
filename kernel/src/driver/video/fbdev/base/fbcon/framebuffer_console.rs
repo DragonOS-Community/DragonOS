@@ -138,7 +138,7 @@ impl BlittingFbConsole {
         let byte_width = vc_data.font.width as usize / 8;
         let font_height = vc_data.font.height as usize;
         // let mut char_offset = 0;
-        for char_offset in 0..cnt as usize {
+        for (char_offset, _) in buf.iter().enumerate().take(cnt as usize) {
             // 在字符表中的index
             let ch = buf[char_offset] & charmask;
             // 计算出在font表中的偏移量
@@ -258,14 +258,14 @@ impl ConsoleSwitch for BlittingFbConsole {
             // 分两次clear
             let b = y_break - sy;
             let _ = self.clear(
-                &vc_data,
+                vc_data,
                 fb_data.display.real_y(sy as u32),
                 sx as u32,
                 b as u32,
                 width as u32,
             );
             let _ = self.clear(
-                &vc_data,
+                vc_data,
                 fb_data.display.real_y((sy + b) as u32),
                 sx as u32,
                 (height - b) as u32,
@@ -273,7 +273,7 @@ impl ConsoleSwitch for BlittingFbConsole {
             );
         } else {
             let _ = self.clear(
-                &vc_data,
+                vc_data,
                 fb_data.display.real_y(sy as u32),
                 sx as u32,
                 height as u32,
@@ -336,6 +336,7 @@ impl ConsoleSwitch for BlittingFbConsole {
         }
     }
 
+    #[allow(clippy::if_same_then_else)]
     fn con_cursor(
         &self,
         vc_data: &VirtualConsoleData,

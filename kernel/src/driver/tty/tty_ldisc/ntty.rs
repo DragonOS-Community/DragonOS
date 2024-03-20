@@ -209,15 +209,10 @@ impl NTtyData {
             }
 
             if !overflow {
-                if flags.is_none() {
-                    self.receive_buf(tty.clone(), &buf[offset..], flags, n);
+                if let Some(flags) = flags {
+                    self.receive_buf(tty.clone(), &buf[offset..], Some(&flags[offset..]), n);
                 } else {
-                    self.receive_buf(
-                        tty.clone(),
-                        &buf[offset..],
-                        Some(&flags.unwrap()[offset..]),
-                        n,
-                    );
+                    self.receive_buf(tty.clone(), &buf[offset..], flags, n);
                 }
             }
 
@@ -1023,7 +1018,7 @@ impl NTtyData {
         // 找到eol的坐标
         let tmp = self.read_flags.next_index(tail);
         // 找到的话即为坐标，未找到的话即为NTTY_BUFSIZE
-        let mut eol = if tmp.is_none() { size } else { tmp.unwrap() };
+        let mut eol = if let Some(tmp) = tmp { tmp } else { size };
         if eol > size {
             eol = size
         }
@@ -1178,9 +1173,9 @@ impl NTtyData {
         }
 
         let mut cnt = 0;
-        for i in 0..nr {
+        for (i, c) in buf.iter().enumerate().take(nr) {
             cnt = i;
-            let c = buf[i];
+            let c = *c;
             if c as usize == 8 {
                 // 表示退格
                 if self.cursor_column > 0 {

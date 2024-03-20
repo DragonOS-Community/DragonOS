@@ -95,14 +95,14 @@ enum PsMouseCommand {
     SetSampleRate,
 }
 
-impl Into<u8> for PsMouseCommand {
-    fn into(self) -> u8 {
-        match self {
-            Self::SampleRate(x) => x,
-            Self::EnablePacketStreaming => 0xf4,
-            Self::InitKeyboard => 0x47,
-            Self::GetMouseId => 0xf2,
-            Self::SetSampleRate => 0xf3,
+impl From<PsMouseCommand> for u8 {
+    fn from(val: PsMouseCommand) -> Self {
+        match val {
+            PsMouseCommand::SampleRate(x) => x,
+            PsMouseCommand::EnablePacketStreaming => 0xf4,
+            PsMouseCommand::InitKeyboard => 0x47,
+            PsMouseCommand::GetMouseId => 0xf2,
+            PsMouseCommand::SetSampleRate => 0xf3,
         }
     }
 }
@@ -605,8 +605,8 @@ impl IndexNode for Ps2MouseDevice {
         let mut guard = self.inner.lock_irqsave();
 
         if guard.buf.len() >= 3 {
-            for i in 0..3 {
-                buf[i] = guard.buf.dequeue().unwrap();
+            for item in buf.iter_mut().take(3) {
+                *item = guard.buf.dequeue().unwrap();
             }
             return Ok(3);
         } else {

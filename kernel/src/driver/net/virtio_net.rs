@@ -61,6 +61,7 @@ impl<T: Transport> DerefMut for VirtioNICDriverWrapper<T> {
     }
 }
 
+#[allow(clippy::mut_from_ref)]
 impl<T: Transport> VirtioNICDriverWrapper<T> {
     fn force_get_mut(&self) -> &mut VirtioNICDriver<T> {
         unsafe { &mut *self.0.get() }
@@ -160,7 +161,7 @@ pub struct VirtioNetToken<T: Transport> {
     rx_buffer: Option<virtio_drivers::device::net::RxBuffer>,
 }
 
-impl<'a, T: Transport> VirtioNetToken<T> {
+impl<T: Transport> VirtioNetToken<T> {
     pub fn new(
         driver: VirtioNICDriver<T>,
         rx_buffer: Option<virtio_drivers::device::net::RxBuffer>,
@@ -322,11 +323,11 @@ impl<T: Transport + 'static> NetDriver for VirtioInterface<T> {
 
         self.iface.lock().update_ip_addrs(|addrs| {
             let dest = addrs.iter_mut().next();
-            if dest.is_none() {
-                addrs.push(ip_addrs[0]).expect("Push ipCidr failed: full");
-            } else {
-                let dest = dest.unwrap();
+
+            if let Some(dest) = dest {
                 *dest = ip_addrs[0];
+            } else {
+                addrs.push(ip_addrs[0]).expect("Push ipCidr failed: full");
             }
         });
         return Ok(());

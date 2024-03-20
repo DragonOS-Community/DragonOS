@@ -464,16 +464,16 @@ impl InnerAddressSpace {
             let r = r.lock().region;
             let r = self.mappings.remove_vma(&r).unwrap();
             let intersection = r.lock().region().intersect(&to_unmap).unwrap();
-            let (before, r, after) = r.extract(intersection).unwrap();
+            let split_result = r.extract(intersection).unwrap();
 
             // TODO: 当引入后备页映射后，这里需要增加通知文件的逻辑
 
-            if let Some(before) = before {
+            if let Some(before) = split_result.prev {
                 // 如果前面有VMA，则需要将前面的VMA重新插入到地址空间的VMA列表中
                 self.mappings.insert_vma(before);
             }
 
-            if let Some(after) = after {
+            if let Some(after) = split_result.after {
                 // 如果后面有VMA，则需要将后面的VMA重新插入到地址空间的VMA列表中
                 self.mappings.insert_vma(after);
             }
@@ -519,12 +519,12 @@ impl InnerAddressSpace {
             let r = self.mappings.remove_vma(&r).unwrap();
 
             let intersection = r.lock().region().intersect(&region).unwrap();
-            let (before, r, after) = r.extract(intersection).expect("Failed to extract VMA");
+            let split_result = r.extract(intersection).expect("Failed to extract VMA");
 
-            if let Some(before) = before {
+            if let Some(before) = split_result.prev {
                 self.mappings.insert_vma(before);
             }
-            if let Some(after) = after {
+            if let Some(after) = split_result.after {
                 self.mappings.insert_vma(after);
             }
 
@@ -961,14 +961,7 @@ impl LockedVMA {
     /// 1. 前面的VMA，如果没有则为None
     /// 2. 中间的VMA，也就是传入的Region
     /// 3. 后面的VMA，如果没有则为None
-    pub fn extract(
-        &self,
-        region: VirtRegion,
-    ) -> Option<(
-        Option<Arc<LockedVMA>>,
-        Arc<LockedVMA>,
-        Option<Arc<LockedVMA>>,
-    )> {
+    pub fn extract(&self, region: VirtRegion) -> Option<VMASplitResult> {
         assert!(region.start().check_aligned(MMArch::PAGE_SIZE));
         assert!(region.end().check_aligned(MMArch::PAGE_SIZE));
 
@@ -988,7 +981,11 @@ impl LockedVMA {
             let intersect: VirtRegion = intersect.unwrap();
             if unlikely(intersect == guard.region) {
                 // 如果当前VMA完全包含region，则直接返回当前VMA
-                return Some((None, guard.self_ref.upgrade().unwrap(), None));
+                return Some(VMASplitResult::new(
+                    None,
+                    guard.self_ref.upgrade().unwrap(),
+                    None,
+                ));
             }
         }
 
@@ -1012,7 +1009,32 @@ impl LockedVMA {
 
         // TODO: 重新设置before、after这两个VMA里面的物理页的anon_vma
 
-        return Some((before, guard.self_ref.upgrade().unwrap(), after));
+        return Some(VMASplitResult::new(
+            before,
+            guard.self_ref.upgrade().unwrap(),
+            after,
+        ));
+    }
+}
+
+/// VMA切分结果
+pub struct VMASplitResult {
+    pub prev: Option<Arc<LockedVMA>>,
+    pub middle: Arc<LockedVMA>,
+    pub after: Option<Arc<LockedVMA>>,
+}
+
+impl VMASplitResult {
+    pub fn new(
+        prev: Option<Arc<LockedVMA>>,
+        middle: Arc<LockedVMA>,
+        post: Option<Arc<LockedVMA>>,
+    ) -> Self {
+        Self {
+            prev,
+            middle,
+            after: post,
+        }
     }
 }
 

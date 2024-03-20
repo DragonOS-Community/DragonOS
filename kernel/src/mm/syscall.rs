@@ -19,7 +19,6 @@ use super::{
 
 bitflags! {
     /// Memory protection flags
-    #[allow(clippy::bad_bit_mask)]
     pub struct ProtFlags: u64 {
         const PROT_NONE = 0x0;
         const PROT_READ = 0x1;

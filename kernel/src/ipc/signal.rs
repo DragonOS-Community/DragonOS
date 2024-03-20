@@ -139,6 +139,7 @@ impl Signal {
     /// @param sig 信号
     /// @param pcb 目标pcb
     /// @param pt siginfo结构体中，pid字段代表的含义
+    #[allow(clippy::if_same_then_else)]
     fn complete_signal(&self, pcb: Arc<ProcessControlBlock>, pt: PidType) {
         // kdebug!("complete_signal");
 
@@ -390,7 +391,7 @@ pub(super) fn do_sigaction(
     if let Some(ac) = act {
         // 将act.sa_mask的SIGKILL SIGSTOP的屏蔽清除
         ac.mask_mut()
-            .remove(SigSet::from(Signal::SIGKILL.into()) | SigSet::from(Signal::SIGSTOP.into()));
+            .remove(<Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into());
 
         // 将新的sigaction拷贝到进程的action中
         *action = *ac;
@@ -417,7 +418,9 @@ pub(super) fn do_sigaction(
 ///
 /// - `new_set` 新的屏蔽信号bitmap的值
 pub fn set_current_sig_blocked(new_set: &mut SigSet) {
-    new_set.remove(SigSet::from(Signal::SIGKILL.into()) | SigSet::from(Signal::SIGSTOP.into()));
+    let to_remove: SigSet =
+        <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
+    new_set.remove(to_remove);
     //TODO 把这个散装函数用 sigsetops 替换掉
     let pcb = ProcessManager::current_pcb();
 

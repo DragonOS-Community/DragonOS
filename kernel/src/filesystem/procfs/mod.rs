@@ -780,7 +780,7 @@ pub fn procfs_init() -> Result<(), SystemError> {
     INIT.call_once(|| {
         kinfo!("Initializing ProcFS...");
         // 创建 procfs 实例
-         let procfs: Arc<ProcFS> = ProcFS::new();
+        let procfs: Arc<ProcFS> = ProcFS::new();
 
         // procfs 挂载
         let _t = ROOT_INODE()

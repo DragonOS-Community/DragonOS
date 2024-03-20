@@ -1,30 +1,24 @@
 use super::vfs::{
-    cache::DefaultCache, FileSystem, FsInfo,
-    syscall::ModeType, FileType, 
-    core::generate_inode_id, 
-    file::{FilePrivateData, FileMode}, 
-    IndexNode, Metadata, SpecialNodeData
+    cache::DefaultCache,
+    core::generate_inode_id,
+    file::{FileMode, FilePrivateData},
+    syscall::ModeType,
+    FileSystem, FileType, FsInfo, IndexNode, Metadata, SpecialNodeData,
 };
 
-use core::{
-    cmp::Ordering, 
-    intrinsics::unlikely,
-    any::Any
-};
+use core::{any::Any, cmp::Ordering, intrinsics::unlikely};
 
 use alloc::{
-    string::String, 
-    sync::{Arc, Weak},
     collections::BTreeMap,
+    string::String,
+    sync::{Arc, Weak},
     vec::Vec,
 };
 use system_error::SystemError;
 
 use crate::{
-    driver::base::device::device_number::DeviceNumber,
-    ipc::pipe::LockedPipeInode,
-    time::TimeSpec,
-    libs::spinlock::SpinLock,
+    driver::base::device::device_number::DeviceNumber, ipc::pipe::LockedPipeInode,
+    libs::spinlock::SpinLock, time::TimeSpec,
 };
 /// RamFS的inode名称的最大长度
 const RAMFS_MAX_NAMELEN: usize = 64;
@@ -38,28 +32,28 @@ pub struct RamFS {
 
 impl RamFS {
     pub fn new() -> Arc<Self> {
-        let root =  Arc::new(LockedEntry(SpinLock::new(Entry{
+        let root = Arc::new(LockedEntry(SpinLock::new(Entry {
             name: String::new(),
-            inode: Arc::new(LockedInode(SpinLock::new(
-                Inode::new(
-                    FileType::Dir,  
-                    ModeType::from_bits_truncate(0o777))))),
+            inode: Arc::new(LockedInode(SpinLock::new(Inode::new(
+                FileType::Dir,
+                ModeType::from_bits_truncate(0o777),
+            )))),
             parent: Weak::new(),
             self_ref: Weak::new(),
             children: BTreeMap::new(),
             fs: Weak::new(),
             special_node: None,
         })));
-        let ret = Arc::new(RamFS{ 
-            root, 
+        let ret = Arc::new(RamFS {
+            root,
             cache: Arc::new(DefaultCache::new(None)),
         });
-{
-        let mut entry = ret.root.0.lock();
-        entry.parent = Arc::downgrade(&ret.root);
-        entry.self_ref = Arc::downgrade(&ret.root);
-        entry.fs = Arc::downgrade(&ret);
-}
+        {
+            let mut entry = ret.root.0.lock();
+            entry.parent = Arc::downgrade(&ret.root);
+            entry.self_ref = Arc::downgrade(&ret.root);
+            entry.fs = Arc::downgrade(&ret);
+        }
         ret
     }
 }
@@ -105,7 +99,7 @@ impl Keyer {
             return self.1.clone();
         }
         Some(self.0.upgrade()?.0.lock().name.clone())
-    }   
+    }
 }
 
 // For Btree insertion
@@ -137,16 +131,14 @@ impl PartialEq for Keyer {
             }
 
             return &opt.unwrap().0.lock().name == other.1.as_ref().unwrap();
-
         } else {
             let opt = other.0.upgrade();
             if opt.is_none() {
                 kwarn!("depecated");
                 return false;
             }
-            
-            return &opt.unwrap().0.lock().name == self.1.as_ref().unwrap();
 
+            return &opt.unwrap().0.lock().name == self.1.as_ref().unwrap();
         }
     }
 }
@@ -156,7 +148,7 @@ impl Eq for Keyer {}
 // Uncheck Stable
 impl PartialOrd for Keyer {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        if self.0.ptr_eq(&other.0) { 
+        if self.0.ptr_eq(&other.0) {
             kdebug!("Compare itself!");
             return Some(Ordering::Equal);
         }
@@ -169,7 +161,13 @@ impl PartialOrd for Keyer {
                 panic!("All Keys None, compare error!");
             }
             if opt1.is_some() && opt2.is_some() {
-                return Some(opt1.unwrap().0.lock().name.cmp(&opt2.unwrap().0.lock().name));
+                return Some(
+                    opt1.unwrap()
+                        .0
+                        .lock()
+                        .name
+                        .cmp(&opt2.unwrap().0.lock().name),
+                );
             } else {
                 kwarn!("depecated");
                 panic!("Empty Key!");
@@ -182,7 +180,6 @@ impl PartialOrd for Keyer {
                     panic!("Empty Key!");
                 }
                 return Some(opt.unwrap().0.lock().name.cmp(other.1.as_ref().unwrap()));
-
             } else {
                 let opt = other.0.upgrade();
                 if opt.is_none() {
@@ -212,7 +209,12 @@ impl Ord for Keyer {
                 panic!("All Keys None, compare error!");
             }
             if opt1.is_some() && opt2.is_some() {
-                return opt1.unwrap().0.lock().name.cmp(&opt2.unwrap().0.lock().name);
+                return opt1
+                    .unwrap()
+                    .0
+                    .lock()
+                    .name
+                    .cmp(&opt2.unwrap().0.lock().name);
             } else {
                 kwarn!("depecated");
                 panic!("Empty Key!");
@@ -225,7 +227,6 @@ impl Ord for Keyer {
                     panic!("Empty Key!");
                 }
                 return opt.unwrap().0.lock().name.cmp(other.1.as_ref().unwrap());
-
             } else {
                 let opt = other.0.upgrade();
                 if opt.is_none() {
@@ -251,10 +252,9 @@ pub struct Inode {
 pub struct LockedInode(SpinLock<Inode>);
 
 /// [WARN] [UNSAFE]
-/// Every 
+/// Every
 #[derive(Debug)]
 pub struct Entry {
-
     name: String,
 
     inode: Arc<LockedInode>,
@@ -300,7 +300,7 @@ impl Inode {
                 uid: 0,
                 gid: 0,
                 raw_dev: DeviceNumber::from(data as u32),
-            }
+            },
         }
     }
 }
@@ -308,8 +308,7 @@ impl Inode {
 // impl trait for LockedEntry
 
 impl IndexNode for LockedEntry {
-    fn truncate(&self, len: usize) -> Result<(), SystemError> 
-    {
+    fn truncate(&self, len: usize) -> Result<(), SystemError> {
         let entry = self.0.lock();
         let mut inode = entry.inode.0.lock();
 
@@ -326,17 +325,11 @@ impl IndexNode for LockedEntry {
         Ok(())
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> 
-    {
+    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
         Ok(())
     }
 
-    fn open(
-        &self,
-        _data: &mut FilePrivateData,
-        _mode: &FileMode,
-    ) -> Result<(), SystemError> 
-    {
+    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
         Ok(())
     }
 
@@ -346,8 +339,7 @@ impl IndexNode for LockedEntry {
         len: usize,
         buf: &mut [u8],
         _data: &mut FilePrivateData,
-    ) -> Result<usize, SystemError> 
-    {
+    ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
@@ -381,8 +373,7 @@ impl IndexNode for LockedEntry {
         len: usize,
         buf: &[u8],
         _data: &mut FilePrivateData,
-    ) -> Result<usize, SystemError> 
-    {
+    ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
@@ -409,32 +400,28 @@ impl IndexNode for LockedEntry {
         Ok(len)
     }
 
-    fn fs(&self) -> Arc<dyn FileSystem> 
-    {
+    fn fs(&self) -> Arc<dyn FileSystem> {
         self.0.lock().fs.upgrade().unwrap()
     }
 
-    fn as_any_ref(&self) -> &dyn core::any::Any 
-    {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
 
-    fn metadata(&self) -> Result<Metadata, SystemError> 
-    {
-
+    fn metadata(&self) -> Result<Metadata, SystemError> {
         let entry = self.0.lock();
         let inode = entry.inode.0.lock();
         let mut metadata = inode.metadata.clone();
 
         metadata.size = inode.data.len() as i64;
-        
-        drop(inode); drop(entry);
+
+        drop(inode);
+        drop(entry);
 
         Ok(metadata)
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> 
-    {
+    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
         let entry = self.0.lock();
         let mut inode = entry.inode.0.lock();
         inode.metadata.atime = metadata.atime;
@@ -447,8 +434,7 @@ impl IndexNode for LockedEntry {
         Ok(())
     }
 
-    fn resize(&self, len: usize) -> Result<(), SystemError> 
-    {
+    fn resize(&self, len: usize) -> Result<(), SystemError> {
         let entry = self.0.lock();
         let mut inode = entry.inode.0.lock();
         if inode.metadata.file_type == FileType::File {
@@ -464,18 +450,17 @@ impl IndexNode for LockedEntry {
         file_type: FileType,
         mode: ModeType,
         data: usize,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> 
-    {
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
         kdebug!("Call Ramfs create.");
         // 获取当前inode
         let mut entry = self.0.lock();
-{
-        let inode = entry.inode.0.lock();
-        // 如果当前inode不是文件夹，则返回
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+        {
+            let inode = entry.inode.0.lock();
+            // 如果当前inode不是文件夹，则返回
+            if inode.metadata.file_type != FileType::Dir {
+                return Err(SystemError::ENOTDIR);
+            }
         }
-}
 
         // 如果有重名的，则返回
         if entry.children.contains_key(&Keyer::from_str(name)) {
@@ -487,7 +472,9 @@ impl IndexNode for LockedEntry {
             parent: entry.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
-            inode: Arc::new(LockedInode(SpinLock::new(Inode::from(file_type, mode, data)))),
+            inode: Arc::new(LockedInode(SpinLock::new(Inode::from(
+                file_type, mode, data,
+            )))),
             fs: entry.fs.clone(),
             special_node: None,
             name: String::from(name),
@@ -497,14 +484,15 @@ impl IndexNode for LockedEntry {
         result.0.lock().self_ref = Arc::downgrade(&result);
 
         // 将子inode插入父inode的B树中
-        entry.children.insert(Keyer::from_entry(&result), result.clone());
+        entry
+            .children
+            .insert(Keyer::from_entry(&result), result.clone());
 
         Ok(result)
     }
 
     /// Not Stable, waiting for improvement
-    fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> 
-    {
+    fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
         let other: &LockedEntry = other
             .downcast_ref::<LockedEntry>()
             .ok_or(SystemError::EPERM)?;
@@ -512,14 +500,14 @@ impl IndexNode for LockedEntry {
         let mut entry = self.0.lock();
         let other_entry = other.0.lock();
         let mut other_inode = other_entry.inode.0.lock();
-{
-        let inode = entry.inode.0.lock();
-        
-        // 如果当前inode不是文件夹，那么报错
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+        {
+            let inode = entry.inode.0.lock();
+
+            // 如果当前inode不是文件夹，那么报错
+            if inode.metadata.file_type != FileType::Dir {
+                return Err(SystemError::ENOTDIR);
+            }
         }
-}
         // 如果另一个inode是文件夹，那么也报错
         if other_inode.metadata.file_type == FileType::Dir {
             return Err(SystemError::EISDIR);
@@ -537,11 +525,13 @@ impl IndexNode for LockedEntry {
             inode: other_entry.inode.clone(),
             parent: entry.self_ref.clone(),
             self_ref: Weak::new(),
-            children: BTreeMap::new(),  // File should not have children
+            children: BTreeMap::new(), // File should not have children
             fs: other_entry.fs.clone(),
             special_node: other_entry.special_node.clone(),
         })));
-        entry.children.insert(Keyer::from_entry(&to_insert), to_insert);
+        entry
+            .children
+            .insert(Keyer::from_entry(&to_insert), to_insert);
 
         // 增加硬链接计数
         other_inode.metadata.nlinks += 1;
@@ -549,64 +539,68 @@ impl IndexNode for LockedEntry {
         Ok(())
     }
 
-    fn unlink(&self, name: &str) -> Result<(), SystemError> 
-    {
+    fn unlink(&self, name: &str) -> Result<(), SystemError> {
         let mut entry = self.0.lock();
-{
-        let inode = entry.inode.0.lock();
-        // 如果当前inode不是目录，那么也没有子目录/文件的概念了，因此要求当前inode的类型是目录
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+        {
+            let inode = entry.inode.0.lock();
+            // 如果当前inode不是目录，那么也没有子目录/文件的概念了，因此要求当前inode的类型是目录
+            if inode.metadata.file_type != FileType::Dir {
+                return Err(SystemError::ENOTDIR);
+            }
         }
-}
         // 不允许删除当前文件夹，也不允许删除上一个目录
         if name == "." || name == ".." {
             return Err(SystemError::ENOTEMPTY);
         }
-{
-        // 获得要删除的文件的inode
-        let to_del_entry = entry.children.get(&Keyer::from_str(name))
-            .ok_or(SystemError::ENOENT)?.0.lock();
-        let mut to_del_node = to_del_entry.inode.0.lock();
+        {
+            // 获得要删除的文件的inode
+            let to_del_entry = entry
+                .children
+                .get(&Keyer::from_str(name))
+                .ok_or(SystemError::ENOENT)?
+                .0
+                .lock();
+            let mut to_del_node = to_del_entry.inode.0.lock();
 
-        if to_del_node.metadata.file_type == FileType::Dir {
-            return Err(SystemError::EPERM);
+            if to_del_node.metadata.file_type == FileType::Dir {
+                return Err(SystemError::EPERM);
+            }
+            // 减少硬链接计数
+            to_del_node.metadata.nlinks -= 1;
         }
-        // 减少硬链接计数
-        to_del_node.metadata.nlinks -= 1;
-}
         // 在当前目录中删除这个子目录项
         entry.children.remove(&Keyer::from_str(name));
 
         Ok(())
     }
 
-    fn rmdir(&self, name: &str) -> Result<(), SystemError> 
-    {
+    fn rmdir(&self, name: &str) -> Result<(), SystemError> {
         let mut entry = self.0.lock();
-{
-        let inode = entry.inode.0.lock();
+        {
+            let inode = entry.inode.0.lock();
 
-        // 如果当前inode不是目录，那么也没有子目录/文件的概念了，因此要求当前inode的类型是目录
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+            // 如果当前inode不是目录，那么也没有子目录/文件的概念了，因此要求当前inode的类型是目录
+            if inode.metadata.file_type != FileType::Dir {
+                return Err(SystemError::ENOTDIR);
+            }
         }
-}
         // Gain keyer
         let keyer = Keyer::from_str(name);
-{
-        // 获得要删除的文件夹的inode
-        let to_del_ent = entry.children
-            .get(&keyer)
-            .ok_or(SystemError::ENOENT)?
-            .0.lock();
-        let mut to_del_nod = to_del_ent.inode.0.lock();
-        if to_del_nod.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
+        {
+            // 获得要删除的文件夹的inode
+            let to_del_ent = entry
+                .children
+                .get(&keyer)
+                .ok_or(SystemError::ENOENT)?
+                .0
+                .lock();
+            let mut to_del_nod = to_del_ent.inode.0.lock();
+            if to_del_nod.metadata.file_type != FileType::Dir {
+                return Err(SystemError::ENOTDIR);
+            }
 
-        to_del_nod.metadata.nlinks -= 1;
-}
+            to_del_nod.metadata.nlinks -= 1;
+        }
         // 在当前目录中删除这个子目录项
         entry.children.remove(&keyer);
         Ok(())
@@ -617,8 +611,7 @@ impl IndexNode for LockedEntry {
         old_name: &str,
         target: &Arc<dyn IndexNode>,
         new_name: &str,
-    ) -> Result<(), SystemError> 
-    {
+    ) -> Result<(), SystemError> {
         let old_inode: Arc<dyn IndexNode> = self.find(old_name)?;
 
         // 在新的目录下创建一个硬链接
@@ -632,8 +625,7 @@ impl IndexNode for LockedEntry {
         Ok(())
     }
 
-    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> 
-    {
+    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         let entry = self.0.lock();
         let inode = entry.inode.0.lock();
 
@@ -642,24 +634,22 @@ impl IndexNode for LockedEntry {
         }
 
         match name {
-            "" | "." => {
-                Ok(entry.self_ref.upgrade().ok_or(SystemError::ENOENT)?)
-            }
+            "" | "." => Ok(entry.self_ref.upgrade().ok_or(SystemError::ENOENT)?),
 
-            ".." => {
-                Ok(entry.parent.upgrade().ok_or(SystemError::ENOENT)?)
-            }
+            ".." => Ok(entry.parent.upgrade().ok_or(SystemError::ENOENT)?),
             name => {
                 // 在子目录项中查找
-                Ok(entry.children.get(&Keyer::from_str(name)).ok_or(SystemError::ENOENT)?.clone())
+                Ok(entry
+                    .children
+                    .get(&Keyer::from_str(name))
+                    .ok_or(SystemError::ENOENT)?
+                    .clone())
             }
         }
     }
 
     /// Potential panic
-    fn get_entry_name(&self, ino: crate::filesystem::vfs::InodeId) 
-        -> Result<String, SystemError> 
-    {
+    fn get_entry_name(&self, ino: crate::filesystem::vfs::InodeId) -> Result<String, SystemError> {
         let entry = self.0.lock();
         let inode = entry.inode.0.lock();
         if inode.metadata.file_type != FileType::Dir {
@@ -690,8 +680,7 @@ impl IndexNode for LockedEntry {
         }
     }
 
-    fn list(&self) -> Result<Vec<String>, SystemError> 
-    {
+    fn list(&self) -> Result<Vec<String>, SystemError> {
         // kinfo!("Call Ramfs::list");
         let info = self.metadata()?;
         if info.file_type != FileType::Dir {
@@ -701,10 +690,15 @@ impl IndexNode for LockedEntry {
         let mut keys: Vec<String> = Vec::new();
         keys.push(String::from("."));
         keys.push(String::from(".."));
-        keys.append(&mut self.0.lock().children.keys()
-            .map(|k|{k.get().unwrap_or(
-                String::from("[unknown_filename]"))})
-            .collect());
+        keys.append(
+            &mut self
+                .0
+                .lock()
+                .children
+                .keys()
+                .map(|k| k.get().unwrap_or(String::from("[unknown_filename]")))
+                .collect(),
+        );
 
         Ok(keys)
     }
@@ -716,19 +710,19 @@ impl IndexNode for LockedEntry {
         _dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let mut entry = self.0.lock();
-{
-        let inode = entry.inode.0.lock();
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+        {
+            let inode = entry.inode.0.lock();
+            if inode.metadata.file_type != FileType::Dir {
+                return Err(SystemError::ENOTDIR);
+            }
         }
-}
         // 判断需要创建的类型
         if unlikely(mode.contains(ModeType::S_IFREG)) {
             // 普通文件
             return Ok(self.create(filename, FileType::File, mode)?);
         }
 
-        let nod = Arc::new(LockedEntry(SpinLock::new(Entry{
+        let nod = Arc::new(LockedEntry(SpinLock::new(Entry {
             parent: entry.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
@@ -737,7 +731,7 @@ impl IndexNode for LockedEntry {
             special_node: None,
             name: String::from(filename),
         })));
-        
+
         nod.0.lock().self_ref = Arc::downgrade(&nod);
         if mode.contains(ModeType::S_IFIFO) {
             nod.0.lock().inode.0.lock().metadata.file_type = FileType::Pipe;
@@ -753,11 +747,10 @@ impl IndexNode for LockedEntry {
             unimplemented!() // Todo
         }
 
-        entry.children
-            .insert(
-                Keyer::from_str(String::from(filename)
-                                            .to_uppercase().as_str()), 
-                nod.clone());
+        entry.children.insert(
+            Keyer::from_str(String::from(filename).to_uppercase().as_str()),
+            nod.clone(),
+        );
         Ok(nod)
     }
 
@@ -777,7 +770,12 @@ impl IndexNode for LockedEntry {
     }
 
     fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        Ok(self.0.lock().self_ref.upgrade().ok_or(SystemError::ENOENT)?)
+        Ok(self
+            .0
+            .lock()
+            .self_ref
+            .upgrade()
+            .ok_or(SystemError::ENOENT)?)
     }
 
     /// # 用于重命名内存中的文件或目录

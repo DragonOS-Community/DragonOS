@@ -1,7 +1,19 @@
-use alloc::{collections::{LinkedList, VecDeque}, sync::{Arc, Weak}, vec::Vec};
-use core::{hash::{Hash, Hasher, SipHasher}, marker::PhantomData, mem::size_of, sync::atomic::{AtomicUsize, Ordering}};
+use alloc::{
+    collections::{LinkedList, VecDeque},
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use core::{
+    hash::{Hash, Hasher, SipHasher},
+    marker::PhantomData,
+    mem::size_of,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
-use crate::libs::{rwlock::{RwLock, RwLockUpgradableGuard}, spinlock::SpinLock};
+use crate::libs::{
+    rwlock::{RwLock, RwLockUpgradableGuard},
+    spinlock::SpinLock,
+};
 
 use super::IndexNode;
 type Resource = Weak<dyn IndexNode>;
@@ -20,16 +32,20 @@ impl<'a> Iterator for SrcIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let vec_here = core::mem::take(&mut self.vec);
         let mut vec_cur = vec_here.unwrap();
+        kdebug!("Hash list RLock!");
         if self.idx == vec_cur.len() {
             return None;
         }
+        kdebug!("Something in Hash list! Length: {}", vec_cur.len());
         // 自动删除空节点
-        while vec_cur[self.idx].upgrade().is_none() || 
-        vec_cur[self.idx].upgrade().unwrap().upgrade().is_none() {
+        while vec_cur[self.idx].upgrade().is_none()
+            || vec_cur[self.idx].upgrade().unwrap().upgrade().is_none()
+        {
             let mut writer = vec_cur.upgrade();
             writer.remove(self.idx);
             vec_cur = writer.downgrade_to_upgradeable();
         }
+        kdebug!("Finish Empty pop");
         self.idx += 1;
         let result = vec_cur[self.idx - 1].upgrade().unwrap().upgrade();
         self.vec = Some(vec_cur);
@@ -46,7 +62,7 @@ impl<H: Hasher + Default> HashTable<H> {
     fn new(size: usize) -> Self {
         let mut new = Self {
             _hash_type: PhantomData::default(),
-            table: Vec::with_capacity(size)
+            table: Vec::with_capacity(size),
         };
         for _ in 0..size {
             new.table.push(RwLock::new(VecDeque::new()));
@@ -61,9 +77,9 @@ impl<H: Hasher + Default> HashTable<H> {
     }
     /// 获取哈希桶迭代器
     fn get_list_iter(&self, key: &str) -> SrcIter {
-        SrcIter{
+        SrcIter {
             idx: 0,
-            vec: Some(self.table[self._position(key)].upgradeable_read())
+            vec: Some(self.table[self._position(key)].upgradeable_read()),
         }
     }
     /// 插入索引
@@ -81,7 +97,7 @@ struct LruList {
 impl LruList {
     fn new() -> Self {
         Self {
-            list: LinkedList::new()
+            list: LinkedList::new(),
         }
     }
 
@@ -95,30 +111,34 @@ impl LruList {
         if self.list.is_empty() {
             return 0;
         }
-        self.list.extract_if(|src| {
-            // 原始指针已被销毁
-            if src.upgrade().is_none() {
-                return true
-            }
-            false
-        }).count()
+        self.list
+            .extract_if(|src| {
+                // 原始指针已被销毁
+                if src.upgrade().is_none() {
+                    return true;
+                }
+                false
+            })
+            .count()
     }
 
     fn release(&mut self) -> usize {
         if self.list.is_empty() {
             return 0;
         }
-        self.list.extract_if(|src| {
-            // 原始指针已被销毁
-            if src.upgrade().is_none() {
-                return true
-            }
-            // 已无外界在使用该文件
-            if src.strong_count() < 2 {
-                return true
-            }
-            false
-        }).count()
+        self.list
+            .extract_if(|src| {
+                // 原始指针已被销毁
+                if src.upgrade().is_none() {
+                    return true;
+                }
+                // 已无外界在使用该文件
+                if src.strong_count() < 2 {
+                    return true;
+                }
+                false
+            })
+            .count()
     }
 }
 
@@ -154,9 +174,15 @@ impl<H: Hasher + Default> DefaultCache<H> {
     /// 缓存目录项
     pub fn put(&self, key: &str, src: Resource) {
         match key {
-            "" => { return; }
-            "." => { return; }
-            ".." => { return; }
+            "" => {
+                return;
+            }
+            "." => {
+                return;
+            }
+            ".." => {
+                return;
+            }
             key => {
                 kdebug!("Cache with key {}.", key);
                 self.table.put(key, self.deque.lock().push(src));
@@ -188,5 +214,4 @@ impl<H: Hasher + Default> DefaultCache<H> {
         kdebug!("Release {} empty entry", ret);
         ret
     }
-
 }

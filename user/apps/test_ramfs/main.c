@@ -147,7 +147,7 @@ int main(int argc, char const* argv[]) {
     createDirectories();
     createAndWriteToFile();
     readAndDeleteFile();
-    removeDirectories();
+    // removeDirectories();
 
     return 0;
 }

@@ -1,4 +1,7 @@
-use alloc::{string::{String, ToString}, sync::Arc};
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+};
 use system_error::SystemError;
 
 use crate::process::ProcessControlBlock;
@@ -85,19 +88,27 @@ pub fn clean_path(path: &str) -> String {
         match split_path(tmp) {
             (key, Some(rest)) => {
                 match key {
-                    "." => {},
-                    ".." => {clean = rsplit_path(&clean).1.unwrap_or("").to_string();},
-                    others => { clean = clean + "/" + others;},
+                    "." => {}
+                    ".." => {
+                        clean = rsplit_path(&clean).1.unwrap_or("").to_string();
+                    }
+                    others => {
+                        clean = clean + "/" + others;
+                    }
                 };
                 tmp = rest;
-            },
-            (key, None) => { 
+            }
+            (key, None) => {
                 match key {
-                    "." => {},
-                    ".." => {clean = rsplit_path(&clean).1.unwrap_or("").to_string();},
-                    others => { clean = clean + "/" + others; },
+                    "." => {}
+                    ".." => {
+                        clean = rsplit_path(&clean).1.unwrap_or("").to_string();
+                    }
+                    others => {
+                        clean = clean + "/" + others;
+                    }
                 };
-                break; 
+                break;
             }
         }
     }

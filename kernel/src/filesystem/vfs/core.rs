@@ -11,7 +11,11 @@ use crate::{
         procfs::procfs_init,
         ramfs::RamFS,
         sysfs::sysfs_init,
-        vfs::{mount::{MountFS, MountPath, CLEAR_MOUNTS_LIST, MOUNTS_LIST}, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
+        vfs::{
+            mount::{MountFS, MountPath, CLEAR_MOUNTS_LIST, MOUNTS_LIST},
+            syscall::ModeType,
+            AtomicInodeId, FileSystem, FileType,
+        },
     },
     kdebug, kerror, kinfo,
     process::ProcessManager,
@@ -149,7 +153,9 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
         drop(old_root_inode);
     }
 
-    MOUNTS_LIST().lock().insert(MountPath::from("/"), ROOT_INODE().fs());
+    MOUNTS_LIST()
+        .lock()
+        .insert(MountPath::from("/"), ROOT_INODE().fs());
     kinfo!("VFS: Migrate filesystems done!");
 
     return Ok(());

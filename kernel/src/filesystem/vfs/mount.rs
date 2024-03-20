@@ -4,8 +4,8 @@ use core::{
 };
 
 use alloc::{
-    string::String,
     collections::BTreeMap,
+    string::String,
     sync::{Arc, Weak},
 };
 use system_error::SystemError;
@@ -13,11 +13,10 @@ use system_error::SystemError;
 use crate::{driver::base::device::device_number::DeviceNumber, libs::spinlock::SpinLock};
 
 use super::{
-    file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId
+    file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
 };
 
 static mut __MOUNTS_LIST: Option<Arc<SpinLock<BTreeMap<MountPath, Arc<dyn FileSystem>>>>> = None;
-
 
 #[derive(PartialEq, Eq, Debug)]
 pub struct MountPath {
@@ -25,20 +24,19 @@ pub struct MountPath {
     depth: usize,
 }
 
-// impl MountPath {
-//     pub fn new(path: &str) -> Self {
-//         let depth = path.chars().filter(|&c| c == '/').count();
-//         Self { path: String::from(path), depth }
-//     }
-// }
-
 impl From<&str> for MountPath {
     fn from(value: &str) -> Self {
         if value == "/" {
-            return Self { path: String::from(value), depth: 0 };
+            return Self {
+                path: String::from(value),
+                depth: 0,
+            };
         }
         let depth = value.chars().filter(|&c| c == '/').count();
-        Self { path: String::from(value), depth }
+        Self {
+            path: String::from(value),
+            depth,
+        }
     }
 }
 
@@ -63,7 +61,6 @@ impl Ord for MountPath {
         self.partial_cmp(other).unwrap()
     }
 }
-
 
 /// 返回MOUNT LIST
 #[inline(always)]
@@ -118,7 +115,7 @@ impl MountFS {
         return MountFS {
             inner_filesystem: inner_fs,
             mountpoints: SpinLock::new(BTreeMap::new()),
-            self_mountpoint: self_mountpoint,
+            self_mountpoint,
             self_ref: Weak::default(),
         }
         .wrap();
@@ -283,7 +280,7 @@ impl IndexNode for MountFSInode {
         file_type: FileType,
         mode: ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        kdebug!("Creating: {:?}", self.inner_inode);
+        kdebug!("Creating {:?} at {:?}", name, self.key());
         return Ok(MountFSInode {
             inner_inode: self.inner_inode.create(name, file_type, mode)?,
             mount_fs: self.mount_fs.clone(),
@@ -418,7 +415,10 @@ impl IndexNode for MountFSInode {
             .mountpoints
             .lock()
             .insert(metadata.inode_id, new_mount_fs.clone());
-        MOUNTS_LIST().lock().insert(MountPath::from(self.self_ref()?._abs_path()?.as_str()), new_mount_fs.clone());
+        MOUNTS_LIST().lock().insert(
+            MountPath::from(self.self_ref()?._abs_path()?.as_str()),
+            new_mount_fs.clone(),
+        );
         return Ok(new_mount_fs);
     }
 

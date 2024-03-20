@@ -4,13 +4,10 @@
 #include <common/spinlock.h>
 #include <mm/slab.h>
 #include <process/process.h>
-#include <arch/x86_64/driver/apic/apic_timer.h>
 
 #include <process/preempt.h>
 #include <sched/sched.h>
 #include <driver/acpi/acpi.h>
-#include "exception/irq.h"
-#include "ipi.h"
 #include <arch/arch.h>
 
 /* x86-64 specific MSRs */
@@ -18,9 +15,6 @@
 #define MSR_STAR 0xc0000081         /* legacy mode SYSCALL target */
 #define MSR_LSTAR 0xc0000082        /* long mode SYSCALL target */
 #define MSR_SYSCALL_MASK 0xc0000084 /* EFLAGS mask for syscall */
-
-static void __smp_kick_cpu_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs);
-static void __smp__flush_tlb_ipi_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs);
 
 static spinlock_t multi_core_starting_lock = {1}; // 多核启动锁
 
@@ -68,7 +62,6 @@ void smp_init()
            (unsigned long)&_apu_boot_end - (unsigned long)&_apu_boot_start);
     io_mfence();
 
-    memset((void *)SMP_IPI_desc, 0, sizeof(irq_desc_t) * SMP_IRQ_NUM);
 
     io_mfence();
 
@@ -76,10 +69,7 @@ void smp_init()
     rs_ipi_send_smp_init();
 
     kdebug("total_processor_num=%d", total_processor_num);
-    // 注册接收kick_cpu功能的处理函数。（向量号200）
-    ipi_regiserIPI(KICK_CPU_IRQ_NUM, NULL, &__smp_kick_cpu_handler, (uint64_t)NULL, NULL, "IPI kick cpu");
-    ipi_regiserIPI(FLUSH_TLB_IRQ_NUM, NULL, &__smp__flush_tlb_ipi_handler, NULL, NULL, "IPI flush tlb");
-
+   
     int core_to_start = 0;
     // total_processor_num = 3;
     for (int i = 0; i < total_processor_num; ++i) // i从1开始，不初始化bsp
@@ -161,7 +151,7 @@ void smp_ap_start_stage2()
 
     rs_init_syscall_64();
     
-    apic_timer_ap_core_init();
+    rs_init_current_core_sched();
 #endif
 
     sti();
@@ -179,27 +169,6 @@ void smp_ap_start_stage2()
     }
     while (1) // 这里要循环hlt，原因是当收到中断后，核心会被唤醒，处理完中断之后不会自动hlt
         hlt();
-}
-
-/**
- * @brief kick_cpu 核心间通信的处理函数
- *
- * @param irq_num
- * @param param
- * @param regs
- */
-static void __smp_kick_cpu_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs)
-{
-    if (user_mode(regs))
-        return;
-    sched();
-}
-
-static void __smp__flush_tlb_ipi_handler(uint64_t irq_num, uint64_t param, struct pt_regs *regs)
-{
-    if (user_mode(regs))
-        return;
-    flush_tlb();
 }
 
 /**

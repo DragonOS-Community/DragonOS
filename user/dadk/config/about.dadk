@@ -1,0 +1,24 @@
+{
+    "name": "about",
+    "version": "0.1.0",
+    "description": "",
+    "rust_target": null,
+    "task_type": {
+      "BuildFromSource": {
+        "Local": {
+          "path": "apps/about"
+        }
+      }
+    },
+    "depends": [],
+    "build": {
+      "build_command": "make install"
+    },
+    "install": {
+      "in_dragonos_path": "/bin"
+    },
+    "clean": {
+      "clean_command": "make clean"
+    },
+    "envs": []
+  }

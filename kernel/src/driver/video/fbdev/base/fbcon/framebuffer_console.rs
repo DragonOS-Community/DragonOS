@@ -391,6 +391,7 @@ impl ConsoleSwitch for BlittingFbConsole {
         Ok(())
     }
 
+    #[inline(never)]
     fn con_scroll(
         &self,
         vc_data: &mut VirtualConsoleData,
@@ -504,7 +505,30 @@ impl ConsoleSwitch for BlittingFbConsole {
                 }
 
                 match scroll_mode {
-                    ScrollMode::Move => todo!(),
+                    ScrollMode::Move => {
+                        let start = top * vc_data.cols;
+                        let end = bottom * vc_data.cols;
+                        vc_data.screen_buf[start..end].rotate_right(count * vc_data.cols);
+
+                        let _ = self.bmove(
+                            vc_data,
+                            top as i32,
+                            0,
+                            top as i32 + count as i32,
+                            0,
+                            (bottom - top - count) as u32,
+                            vc_data.cols as u32,
+                        );
+
+                        let _ = self.con_clear(vc_data, top, 0, count, vc_data.cols);
+
+                        let offset = vc_data.cols * count;
+                        for i in vc_data.screen_buf[start..(start + offset)].iter_mut() {
+                            *i = vc_data.erase_char;
+                        }
+
+                        return true;
+                    }
                     ScrollMode::PanMove => todo!(),
                     ScrollMode::WrapMove => todo!(),
                     ScrollMode::Redraw => {
@@ -554,7 +578,8 @@ impl FrameBufferConsole for BlittingFbConsole {
             sy * vc_data.font.height as i32,
         );
 
-        self.fb().fb_copyarea(area)
+        self.fb().fb_copyarea(area);
+        Ok(())
     }
 
     fn clear(

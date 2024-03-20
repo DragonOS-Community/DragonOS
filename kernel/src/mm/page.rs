@@ -791,7 +791,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
 /// 如果取消成功，返回被取消映射的页表项的：【物理地址】和【flags】，否则返回None
 unsafe fn unmap_phys_inner<Arch: MemoryManagementArch>(
     vaddr: VirtAddr,
-    table: &mut PageTable<Arch>,
+    table: &PageTable<Arch>,
     unmap_parents: bool,
     allocator: &mut impl FrameAllocator,
 ) -> Option<(PhysAddr, PageFlags<Arch>)> {

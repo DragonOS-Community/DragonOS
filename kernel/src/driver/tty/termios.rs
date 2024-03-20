@@ -140,12 +140,12 @@ bitflags! {
     /// termios输入特性
     pub struct InputMode: u32 {
         /// 如果设置了该标志，表示启用软件流控制。
-        const IXON = 0x0200;
+        const IXON = 0x0400;
         /// 如果设置了该标志，表示启用输入流控制。
-        const IXOFF = 0x0400;
+        const IXOFF = 0x1000;
         /// Map Uppercase to Lowercase on Input 将大写转换为小写
         /// 表示不区分大小写
-        const IUCLC = 0x1000;
+        const IUCLC = 0x0200;
         /// 如果设置了该标志，表示当输入队列满时，产生一个响铃信号。
         const IMAXBEL = 0x2000;
         /// 如果设置了该标志，表示输入数据被视为 UTF-8 编码。
@@ -176,46 +176,44 @@ bitflags! {
     /// termios输出特性
     pub struct OutputMode: u32 {
         /// 在输出时将换行符替换\r\n
-        const ONLCR	= 0x00002;
+        const ONLCR	= 0x00004;
         /// Map Lowercase to Uppercase on Output 输出字符时将小写字母映射为大写字母
-        const OLCUC	= 0x00004;
+        const OLCUC	= 0x00002;
 
         /// 与NL协同 配置换行符的处理方式
-        const NLDLY	= 0x00300;
+        const NLDLY	= 0x00100;
         const   NL0	= 0x00000;  // 不延迟换行
         const   NL1	= 0x00100;  // 延迟换行（输出回车后等待一段时间再输出换行）
-        const   NL2	= 0x00200;  // NL2 和 NL3保留，暂未使用
-        const   NL3	= 0x00300;
 
         /// 配置水平制表符的处理方式
-        const TABDLY = 0x00c00;
+        const TABDLY = 0x01800;
         const  TAB0 = 0x00000;  // 不延迟水平制表符
-        const  TAB1 = 0x00400;  // 在输出水平制表符时，延迟到下一个设置的水平制表符位置
-        const  TAB2 = 0x00800;  // 在输出水平制表符时，延迟到下一个设置的 8 的倍数的位置
-        const  TAB3 = 0x00c00;  // TAB3 和 XTABS（与 TAB3 等效）保留，暂未使用
-        const XTABS = 0x00c00;
+        const  TAB1 = 0x00800;  // 在输出水平制表符时，延迟到下一个设置的水平制表符位置
+        const  TAB2 = 0x01000;  // 在输出水平制表符时，延迟到下一个设置的 8 的倍数的位置
+        const  TAB3 = 0x01800;  // TAB3 和 XTABS（与 TAB3 等效）保留，暂未使用
+        const XTABS = 0x01800;
 
         /// 配置回车符的处理方式
-        const CRDLY	= 0x03000;
+        const CRDLY	= 0x00600;
         const   CR0	= 0x00000;  // 不延迟回车
-        const   CR1	= 0x01000;  //  延迟回车（输出回车后等待一段时间再输出换行）
-        const   CR2	= 0x02000;  // CR2 和 CR3保留，暂未使用
-        const   CR3	= 0x03000;
+        const   CR1	= 0x02000;  //  延迟回车（输出回车后等待一段时间再输出换行）
+        const   CR2	= 0x04000;  // CR2 和 CR3保留，暂未使用
+        const   CR3	= 0x06000;
 
         /// 配置换页符（form feed）的处理方式
-        const FFDLY	= 0x04000;
+        const FFDLY	= 0x08000;
         const   FF0	= 0x00000;  // 不延迟换页
-        const   FF1	= 0x04000;  // 延迟换页
+        const   FF1	= 0x08000;  // 延迟换页
 
         /// 配置退格符（backspace）的处理方式
-        const BSDLY	= 0x08000;
+        const BSDLY	= 0x02000;
         const   BS0	= 0x00000;  // 不延迟退格
-        const   BS1	= 0x08000;  // 延迟退格
+        const   BS1	= 0x02000;  // 延迟退格
 
         /// 配置垂直制表符（vertical tab）的处理方式
-        const VTDLY	= 0x10000;
+        const VTDLY	= 0x04000;
         const   VT0	= 0x00000;  // 不延迟垂直制表符
-        const   VT1	= 0x10000;  // 延迟垂直制表符
+        const   VT1	= 0x04000;  // 延迟垂直制表符
 
         /// 表示执行输出处理，即启用输出处理函数
         const OPOST	= 0x01;
@@ -234,13 +232,14 @@ bitflags! {
     /// 配置终端设备的基本特性和控制参数
     pub struct ControlMode: u32 {
         /// Baud Rate Mask 指定波特率的掩码
-        const CBAUD		= 0x000000ff;
+        const CBAUD		= 0x0000100f;
         /// Extra Baud Bits 指定更高的波特率位
-        const CBAUDEX	= 0x00000000;
+        const CBAUDEX	= 0x00001000;
         /// Custom Baud Rate 指定自定义波特率 如果设置了 BOTHER，则通过以下位来设置自定义的波特率值
-        const BOTHER	= 0x0000001f;
+        const BOTHER	= 0x00001000;
 
-        const     B0	= 0x00000000;
+        /* Common CBAUD rates */
+        const     B0	= 0x00000000;	/* hang up */
         const    B50	= 0x00000001;
         const    B75	= 0x00000002;
         const   B110	= 0x00000003;
@@ -257,43 +256,43 @@ bitflags! {
         const B19200	= 0x0000000e;
         const B38400	= 0x0000000f;
 
-        const    B57600	= 0x00000010;
-        const   B115200	= 0x00000011;
-        const   B230400	= 0x00000012;
-        const   B460800	= 0x00000013;
-        const   B500000	= 0x00000014;
-        const   B576000	= 0x00000015;
-        const   B921600	= 0x00000016;
-        const  B1000000	= 0x00000017;
-        const  B1152000	= 0x00000018;
-        const  B1500000	= 0x00000019;
-        const  B2000000	= 0x0000001a;
-        const  B2500000	= 0x0000001b;
-        const  B3000000	= 0x0000001c;
-        const  B3500000	= 0x0000001d;
-        const  B4000000	= 0x0000001e;
+        const     B57600 = 0x00001001;
+        const    B115200 = 0x00001002;
+        const    B230400 = 0x00001003;
+        const    B460800 = 0x00001004;
+        const    B500000 = 0x00001005;
+        const    B576000 = 0x00001006;
+        const    B921600 = 0x00001007;
+        const   B1000000 = 0x00001008;
+        const   B1152000 = 0x00001009;
+        const   B1500000 = 0x0000100a;
+        const   B2000000 = 0x0000100b;
+        const   B2500000 = 0x0000100c;
+        const   B3000000 = 0x0000100d;
+        const   B3500000 = 0x0000100e;
+        const   B4000000 = 0x0000100f;
 
         /// 指定字符大小的掩码 以下位为特定字符大小
-        const CSIZE		= 0x00000300;
+        const CSIZE		= 0x00000030;
         const   CS5		= 0x00000000;
-        const   CS6		= 0x00000100;
-        const   CS7		= 0x00000200;
-        const   CS8		= 0x00000300;
+        const   CS6		= 0x00000010;
+        const   CS7		= 0x00000020;
+        const   CS8		= 0x00000030;
 
         /// Stop Bit Select 表示使用两个停止位；否则，表示使用一个停止位
-        const CSTOPB	= 0x00000400;
+        const CSTOPB	= 0x00000040;
         /// 表示启用接收器。如果未设置，则禁用接收器。
-        const CREAD		= 0x00000800;
+        const CREAD		= 0x00000080;
         /// 表示启用奇偶校验。如果未设置，则禁用奇偶校验。
-        const PARENB	= 0x00001000;
+        const PARENB	= 0x00000100;
         /// 表示启用奇校验。如果未设置，则表示启用偶校验。
-        const PARODD	= 0x00002000;
+        const PARODD	= 0x00000200;
         /// 表示在终端设备被关闭时挂断线路（执行挂断操作）
-        const HUPCL		= 0x00004000;
+        const HUPCL		= 0x00000400;
         /// 表示忽略调制解调器的状态（DCD、DSR、CTS 等）
-        const CLOCAL	= 0x00008000;
+        const CLOCAL	= 0x00000800;
         /// 指定输入波特率的掩码
-        const CIBAUD	= 0x00ff0000;
+        const CIBAUD	= 0x100f0000;
 
         const ADDRB = 0x20000000;
     }
@@ -301,37 +300,37 @@ bitflags! {
     /// 配置终端设备的本地模式（local mode）或控制输入处理的行为
     pub struct LocalMode: u32 {
         /// 启用中断字符（Ctrl-C、Ctrl-Z）
-        const ISIG	 = 0x00000080;
+        const ISIG	 = 0x00001;
         /// 表示启用规范模式，即启用行缓冲和回显。在规范模式下，输入被缓冲，并且只有在输入回车符时才会传递给应用程序。
-        const ICANON = 0x00000100;
+        const ICANON = 0x00002;
         /// 表示启用大写模式，即输入输出都将被转换为大写。
-        const XCASE	 = 0x00004000;
+        const XCASE	 = 0x00004;
         /// 表示启用回显（显示用户输入的字符）
-        const ECHO	 = 0x00000008;
+        const ECHO	 = 0x00008;
         /// 表示在回显时将擦除的字符用 backspace 和空格字符显示。
-        const ECHOE	 = 0x00000002;
+        const ECHOE	 = 0x00010;
         /// 表示在回显时将换行符后的字符用空格字符显示。
-        const ECHOK	 = 0x00000004;
+        const ECHOK	 = 0x00020;
         /// 表示在回显时将换行符显示为换行和回车符。
-        const ECHONL = 0x00000010;
+        const ECHONL = 0x00040;
         /// 表示在收到中断（Ctrl-C）和退出（Ctrl-\）字符后，不清空输入和输出缓冲区。
-        const NOFLSH = 0x80000000;
+        const NOFLSH = 0x00080;
         /// 表示在后台进程尝试写入终端时，发送停止信号（Ctrl-S）
-        const TOSTOP = 0x00400000;
+        const TOSTOP = 0x00100;
         /// 表示在回显时，显示控制字符为 ^ 加字符。
-        const ECHOCTL= 0x00000040;
+        const ECHOCTL= 0x00200;
         /// 表示在回显时显示带有 # 的换行符（为了与 echo -n 命令兼容）。
-        const ECHOPRT= 0x00000020;
+        const ECHOPRT= 0x00400;
         /// 表示在回显时将 KILL 字符（Ctrl-U）用空格字符显示。
-        const ECHOKE = 0x00000001;
+        const ECHOKE = 0x00800;
         /// 表示输出正在被冲刷（flush），通常是由于输入/输出流的状态变化。
-        const FLUSHO = 0x00800000;
+        const FLUSHO = 0x01000;
         /// 表示在规范模式下，存在需要重新打印的字符。
-        const PENDIN = 0x20000000;
+        const PENDIN = 0x04000;
         /// 表示启用实现定义的输入处理。
-        const IEXTEN = 0x00000400;
+        const IEXTEN = 0x08000;
         /// 表示启用扩展的处理函数
-        const EXTPROC= 0x10000000;
+        const EXTPROC= 0x10000;
     }
 
     pub struct TtySetTermiosOpt: u8 {

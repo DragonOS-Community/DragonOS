@@ -77,7 +77,7 @@ impl Syscall {
         while count < len {
             let rand = rand();
             for offset in 0..4 {
-                ret.push((rand >> offset * 2) as u8);
+                ret.push((rand >> (offset * 2)) as u8);
                 count += 1;
             }
         }

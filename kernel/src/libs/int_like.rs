@@ -27,7 +27,7 @@
 #[macro_export]
 macro_rules! int_like {
     ($new_type_name:ident, $backing_type: ident) => {
-        #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
+        #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy, Hash)]
         pub struct $new_type_name($backing_type);
 
         impl $new_type_name {

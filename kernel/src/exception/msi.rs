@@ -51,6 +51,14 @@ impl MsiMsg {
     pub const fn address(&self) -> u64 {
         (self.address_hi as u64) << 32 | self.address_lo as u64
     }
+
+    pub const fn new_zeroed() -> Self {
+        MsiMsg {
+            address_lo: 0,
+            address_hi: 0,
+            data: 0,
+        }
+    }
 }
 
 #[allow(dead_code)]

@@ -1,3 +1,5 @@
+use core::ops::Add;
+
 use system_error::SystemError;
 
 use crate::arch::CurrentIrqArch;
@@ -10,7 +12,9 @@ pub mod irqchip;
 pub mod irqdata;
 pub mod irqdesc;
 pub mod irqdomain;
+pub mod manage;
 pub mod msi;
+mod resend;
 pub mod softirq;
 pub mod sysfs;
 
@@ -100,6 +104,28 @@ impl Drop for IrqFlagsGuard {
 // 用于表示软件逻辑视角的中断号，全局唯一
 int_like!(IrqNumber, u32);
 
+impl IrqNumber {
+    /// 如果一个(PCI)设备中断没有被连接，我们将设置irqnumber为IRQ_NOTCONNECTED。
+    /// 这导致request_irq()失败，返回-ENOTCONN，这样我们就可以区分这种情况和其他错误返回。
+    pub const IRQ_NOTCONNECTED: IrqNumber = IrqNumber::new(u32::MAX);
+}
+
 // 硬件中断号
 // 用于表示在某个IrqDomain中的中断号
 int_like!(HardwareIrqNumber, u32);
+
+impl Add<u32> for HardwareIrqNumber {
+    type Output = HardwareIrqNumber;
+
+    fn add(self, rhs: u32) -> HardwareIrqNumber {
+        HardwareIrqNumber::new(self.0 + rhs)
+    }
+}
+
+impl Add<u32> for IrqNumber {
+    type Output = IrqNumber;
+
+    fn add(self, rhs: u32) -> IrqNumber {
+        IrqNumber::new(self.0 + rhs)
+    }
+}

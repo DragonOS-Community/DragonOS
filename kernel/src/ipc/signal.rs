@@ -86,7 +86,7 @@ impl Signal {
             return Err(SystemError::EINVAL);
         }
         // kdebug!("force send={}", force_send);
-        let pcb_info = pcb.sig_info();
+        let pcb_info = pcb.sig_info_irqsave();
         let pending = if matches!(pt, PidType::PID) {
             pcb_info.sig_shared_pending()
         } else {
@@ -189,7 +189,11 @@ impl Signal {
     #[inline]
     fn wants_signal(&self, pcb: Arc<ProcessControlBlock>) -> bool {
         // 如果改进程屏蔽了这个signal，则不能接收
-        if pcb.sig_info().sig_block().contains(self.clone().into()) {
+        if pcb
+            .sig_info_irqsave()
+            .sig_block()
+            .contains(self.clone().into())
+        {
             return false;
         }
 
@@ -209,7 +213,7 @@ impl Signal {
         // todo: 检查目标进程是否正在一个cpu上执行，如果是，则返回true，否则继续检查下一项
 
         // 检查目标进程是否有信号正在等待处理，如果是，则返回false，否则返回true
-        if pcb.sig_info().sig_pending().signal().bits() == 0 {
+        if pcb.sig_info_irqsave().sig_pending().signal().bits() == 0 {
             return true;
         } else {
             return false;
@@ -263,7 +267,11 @@ impl Signal {
         }
 
         // 一个被阻塞了的信号肯定是要被处理的
-        if pcb.sig_info().sig_block().contains(self.into_sigset()) {
+        if pcb
+            .sig_info_irqsave()
+            .sig_block()
+            .contains(self.into_sigset())
+        {
             return true;
         }
         return !pcb.sig_struct().handlers[self.clone() as usize - 1].is_ignore();
@@ -430,7 +438,7 @@ pub fn set_current_sig_blocked(new_set: &mut SigSet) {
         如果当前pcb的sig_blocked和新的相等，那么就不用改变它。
         请注意，一个进程的sig_blocked字段不能被其他进程修改！
     */
-    if pcb.sig_info().sig_block().eq(new_set) {
+    if pcb.sig_info_irqsave().sig_block().eq(new_set) {
         return;
     }
 

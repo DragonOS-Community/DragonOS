@@ -1,6 +1,8 @@
 // 参考手册: PCIe* GbE Controllers Open Source Software Developer’s Manual
 // Refernce: PCIe* GbE Controllers Open Source Software Developer’s Manual
 
+use alloc::string::ToString;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::intrinsics::unlikely;
 use core::mem::size_of;
@@ -9,15 +11,18 @@ use core::slice::{from_raw_parts, from_raw_parts_mut};
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use super::e1000e_driver::e1000e_driver_init;
+use crate::driver::base::device::DeviceId;
 use crate::driver::net::dma::{dma_alloc, dma_dealloc};
+use crate::driver::net::irq_handle::DefaultNetIrqHandler;
 use crate::driver::pci::pci::{
     get_pci_device_structure_mut, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,
     PCI_DEVICE_LINKEDLIST,
 };
 use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqMsg, IRQ};
-use crate::include::bindings::bindings::pt_regs;
+use crate::exception::IrqNumber;
+
 use crate::libs::volatile::{ReadOnly, Volatile, WriteOnly};
-use crate::net::net_core::poll_ifaces_try_lock_onetime;
+
 use crate::{kdebug, kinfo};
 
 const PAGE_SIZE: usize = 4096;
@@ -55,7 +60,7 @@ const E1000E_REG_SIZE: u8 = 4;
 const E1000E_DMA_PAGES: usize = 1;
 
 // 中断相关
-const E1000E_RECV_VECTOR: u16 = 57;
+const E1000E_RECV_VECTOR: IrqNumber = IrqNumber::new(57);
 
 // napi队列中暂时存储的buffer个数
 const E1000E_RECV_NAPI: usize = 1024;
@@ -157,12 +162,6 @@ impl E1000EBuffer {
     }
 }
 
-// 中断处理函数, 调用协议栈的poll函数，未来可能会用napi来替换这里
-// Interrupt handler
-unsafe extern "C" fn e1000e_irq_handler(_irq_num: u64, _irq_paramer: u64, _regs: *mut pt_regs) {
-    poll_ifaces_try_lock_onetime().ok();
-}
-
 #[allow(dead_code)]
 pub struct E1000EDevice {
     // 设备寄存器
@@ -201,7 +200,10 @@ impl E1000EDevice {
     // 从PCI标准设备进行驱动初始化
     // init the device for PCI standard device struct
     #[allow(unused_assignments)]
-    pub fn new(device: &mut PciDeviceStructureGeneralDevice) -> Result<Self, E1000EPciError> {
+    pub fn new(
+        device: &mut PciDeviceStructureGeneralDevice,
+        device_id: Arc<DeviceId>,
+    ) -> Result<Self, E1000EPciError> {
         // 从BAR0获取我们需要的寄存器
         // Build registers sturcts from BAR0
         device.bar_ioremap().unwrap()?;
@@ -230,10 +232,9 @@ impl E1000EDevice {
         let msg = PciIrqMsg {
             irq_common_message: IrqCommonMsg::init_from(
                 0,
-                "E1000E_RECV_IRQ",
-                0,
-                e1000e_irq_handler,
-                None,
+                "E1000E_RECV_IRQ".to_string(),
+                &DefaultNetIrqHandler,
+                device_id,
             ),
             irq_specific_message: IrqSpecificMsg::msi_default(),
         };
@@ -619,7 +620,12 @@ pub fn e1000e_probe() -> Result<u64, E1000EPciError> {
                     "Detected e1000e PCI device with device id {:#x}",
                     header.device_id
                 );
-                let e1000e = E1000EDevice::new(standard_device)?;
+
+                // todo: 根据pci的path来生成device id
+                let e1000e = E1000EDevice::new(
+                    standard_device,
+                    DeviceId::new(None, Some(format!("e1000e_{}", header.device_id))).unwrap(),
+                )?;
                 e1000e_driver_init(e1000e);
             }
         }

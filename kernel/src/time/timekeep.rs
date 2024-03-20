@@ -8,7 +8,7 @@ pub type ktime_t = i64;
 // @brief 将ktime_t类型转换为纳秒类型
 #[inline]
 fn ktime_to_ns(kt: ktime_t) -> i64 {
-    return kt as i64;
+    return kt;
 }
 
 /// @brief 从RTC获取当前时间，然后计算时间戳。
@@ -20,8 +20,8 @@ fn ktime_get_real() -> ktime_t {
     {
         let r = rtc_time.get();
         // 返回错误码
-        if r.is_err() {
-            return r.unwrap_err() as ktime_t;
+        if let Err(e) = r {
+            return e as ktime_t;
         }
     }
 

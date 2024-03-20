@@ -18,7 +18,6 @@ impl CFilesArch for X86_64CFilesArch {
     }
 
     fn setup_files(&self, _c: &mut Build, files: &mut Vec<PathBuf>) {
-        files.push(arch_path("driver/hpet.c"));
         // 获取`kernel/src/arch/x86_64/driver/apic`下的所有C文件
         files.append(&mut FileUtils::list_all_files(
             &arch_path("driver/apic"),

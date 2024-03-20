@@ -3,6 +3,7 @@ use core::hint::spin_loop;
 use alloc::{
     string::ToString,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use kdepends::ringbuffer::{AllocRingBuffer, RingBuffer};
 use system_error::SystemError;
@@ -637,7 +638,7 @@ impl IndexNode for Ps2MouseDevice {
         self
     }
 
-    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
+    fn list(&self) -> Result<Vec<alloc::string::String>, SystemError> {
         todo!()
     }
 

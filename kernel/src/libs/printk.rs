@@ -9,7 +9,7 @@ use super::lib_ui::textui::{textui_putstr, FontColor};
 
 use crate::{
     driver::tty::{
-        self, tty_driver::TtyOperation, tty_port::TTY_PORTS,
+        tty_driver::TtyOperation, tty_port::TTY_PORTS,
         virtual_terminal::virtual_console::CURRENT_VCNUM,
     },
     filesystem::procfs::{

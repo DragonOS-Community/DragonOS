@@ -15,7 +15,7 @@ use crate::{
     process::{ProcessControlBlock, ProcessManager},
     syscall::user_access::UserBufferReader,
     time::{
-        timer::{self, next_n_us_timer_jiffies, Timer, WakeUpHelper},
+        timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
         TimeSpec,
     },
 };

@@ -1,21 +1,19 @@
-use core::ffi::CStr;
+use core::ffi::c_void;
+use core::mem::size_of;
 
-use alloc::{
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
+use crate::producefs;
 use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
-    filesystem::vfs::file::FileDescriptorVec,
+    filesystem::vfs::{core as Vcore, file::FileDescriptorVec},
     kerror,
     libs::rwlock::RwLockWriteGuard,
     mm::{verify_area, VirtAddr},
     process::ProcessManager,
     syscall::{
-        user_access::{check_and_clone_cstr, UserBufferReader, UserBufferWriter},
+        user_access::{self, check_and_clone_cstr, UserBufferWriter},
         Syscall,
     },
     time::TimeSpec,
@@ -27,7 +25,7 @@ use super::{
     file::{File, FileMode},
     open::{do_faccessat, do_fchmodat, do_sys_open},
     utils::{rsplit_path, user_path_at},
-    Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    Dirent, FileType, IndexNode, FSMAKER, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 // use crate::kdebug;
 
@@ -86,6 +84,7 @@ bitflags! {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 /// # 文件信息结构体
 pub struct PosixKstat {
     /// 硬件设备ID
@@ -248,22 +247,34 @@ impl Syscall {
     ///
     /// @return 文件描述符编号，或者是错误码
     pub fn open(
-        path: &str,
-        flags: FileMode,
-        mode: ModeType,
+        path: *const u8,
+        o_flags: u32,
+        mode: u32,
         follow_symlink: bool,
     ) -> Result<usize, SystemError> {
-        return do_sys_open(AtFlags::AT_FDCWD.bits(), path, flags, mode, follow_symlink);
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
+        let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
+        return do_sys_open(
+            AtFlags::AT_FDCWD.bits(),
+            &path,
+            open_flags,
+            mode,
+            follow_symlink,
+        );
     }
 
     pub fn openat(
         dirfd: i32,
-        path: &str,
-        o_flags: FileMode,
-        mode: ModeType,
+        path: *const u8,
+        o_flags: u32,
+        mode: u32,
         follow_symlink: bool,
     ) -> Result<usize, SystemError> {
-        return do_sys_open(dirfd, path, o_flags, mode, follow_symlink);
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
+        let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
+        return do_sys_open(dirfd, &path, open_flags, mode, follow_symlink);
     }
 
     /// @brief 关闭文件
@@ -351,7 +362,15 @@ impl Syscall {
     ///
     /// @return Ok(usize) 调整后，文件访问指针相对于文件头部的偏移量
     /// @return Err(SystemError) 调整失败，返回posix错误码
-    pub fn lseek(fd: i32, seek: SeekFrom) -> Result<usize, SystemError> {
+    pub fn lseek(fd: i32, offset: i64, seek: u32) -> Result<usize, SystemError> {
+        let seek = match seek {
+            SEEK_SET => Ok(SeekFrom::SeekSet(offset)),
+            SEEK_CUR => Ok(SeekFrom::SeekCurrent(offset)),
+            SEEK_END => Ok(SeekFrom::SeekEnd(offset)),
+            SEEK_MAX => Ok(SeekFrom::SeekEnd(0)),
+            _ => Err(SystemError::EINVAL),
+        }?;
+
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
         let file = fd_table_guard
@@ -429,10 +448,14 @@ impl Syscall {
     ///    EFAULT    |       错误的地址      
     ///  
     /// ENAMETOOLONG |        路径过长        
-    pub fn chdir(dest_path: &str) -> Result<usize, SystemError> {
+    pub fn chdir(path: *const u8) -> Result<usize, SystemError> {
+        if path.is_null() {
+            return Err(SystemError::EFAULT);
+        }
+
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
         let proc = ProcessManager::current_pcb();
         // Copy path to kernel space to avoid some security issues
-        let path = dest_path.to_string();
         let mut new_path = String::from("");
         if path.len() > 0 {
             let cwd = match path.as_bytes()[0] {
@@ -461,8 +484,7 @@ impl Syscall {
         }
         let inode =
             match ROOT_INODE().lookup_follow_symlink(&new_path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
-                Err(e) => {
-                    kerror!("Change Directory Failed, Error = {:?}", e);
+                Err(_) => {
                     return Err(SystemError::ENOENT);
                 }
                 Ok(i) => i,
@@ -534,8 +556,9 @@ impl Syscall {
     /// @param path(r8) 路径 / mode(r9) 模式
     ///
     /// @return uint64_t 负数错误码 / 0表示成功
-    pub fn mkdir(path: &str, mode: usize) -> Result<usize, SystemError> {
-        return do_mkdir(path, FileMode::from_bits_truncate(mode as u32)).map(|x| x as usize);
+    pub fn mkdir(path: *const u8, mode: usize) -> Result<usize, SystemError> {
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        return do_mkdir(&path, FileMode::from_bits_truncate(mode as u32)).map(|x| x as usize);
     }
 
     /// **删除文件夹、取消文件的链接、删除文件的系统调用**
@@ -547,14 +570,15 @@ impl Syscall {
     /// - `flags`：标志位
     ///
     ///
-    pub fn unlinkat(dirfd: i32, pathname: &str, flags: u32) -> Result<usize, SystemError> {
+    pub fn unlinkat(dirfd: i32, path: *const u8, flags: u32) -> Result<usize, SystemError> {
         let flags = AtFlags::from_bits(flags as i32).ok_or(SystemError::EINVAL)?;
+
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
 
         if flags.contains(AtFlags::AT_REMOVEDIR) {
             // kdebug!("rmdir");
-            match do_remove_dir(dirfd, &pathname) {
+            match do_remove_dir(dirfd, &path) {
                 Err(err) => {
-                    kerror!("Failed to Remove Directory, Error Code = {:?}", err);
                     return Err(err);
                 }
                 Ok(_) => {
@@ -563,9 +587,8 @@ impl Syscall {
             }
         }
 
-        match do_unlink_at(dirfd, &pathname) {
+        match do_unlink_at(dirfd, &path) {
             Err(err) => {
-                kerror!("Failed to Remove Directory, Error Code = {:?}", err);
                 return Err(err);
             }
             Ok(_) => {
@@ -574,32 +597,59 @@ impl Syscall {
         }
     }
 
-    pub fn rmdir(pathname: *const u8) -> Result<usize, SystemError> {
-        let pathname: String = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?;
-        if pathname.len() >= MAX_PATHLEN {
-            return Err(SystemError::ENAMETOOLONG);
-        }
-        let pathname = pathname.as_str().trim();
-        return do_remove_dir(AtFlags::AT_FDCWD.bits(), pathname).map(|v| v as usize);
+    pub fn rmdir(path: *const u8) -> Result<usize, SystemError> {
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        return do_remove_dir(AtFlags::AT_FDCWD.bits(), &path).map(|v| v as usize);
     }
 
-    pub fn unlink(pathname: *const u8) -> Result<usize, SystemError> {
-        if pathname.is_null() {
-            return Err(SystemError::EFAULT);
-        }
-        let ureader = UserBufferReader::new(pathname, MAX_PATHLEN, true)?;
+    pub fn unlink(path: *const u8) -> Result<usize, SystemError> {
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        return do_unlink_at(AtFlags::AT_FDCWD.bits(), &path).map(|v| v as usize);
+    }
 
-        let buf: &[u8] = ureader.buffer(0).unwrap();
-
-        let pathname: &CStr = CStr::from_bytes_until_nul(buf).map_err(|_| SystemError::EINVAL)?;
-
-        let pathname: &str = pathname.to_str().map_err(|_| SystemError::EINVAL)?;
-        if pathname.len() >= MAX_PATHLEN {
+    /// # 修改文件名
+    ///
+    ///
+    /// ## 参数
+    ///
+    /// - oldfd: 源文件描述符
+    /// - filename_from: 源文件路径
+    /// - newfd: 目标文件描述符
+    /// - filename_to: 目标文件路径
+    /// - flags: 标志位
+    ///
+    ///
+    /// ## 返回值
+    /// - Ok(返回值类型): 返回值的说明
+    /// - Err(错误值类型): 错误的说明
+    ///
+    pub fn do_renameat2(
+        oldfd: i32,
+        filename_from: *const u8,
+        newfd: i32,
+        filename_to: *const u8,
+        _flags: u32,
+    ) -> Result<usize, SystemError> {
+        let filename_from = check_and_clone_cstr(filename_from, Some(MAX_PATHLEN)).unwrap();
+        let filename_to = check_and_clone_cstr(filename_to, Some(MAX_PATHLEN)).unwrap();
+        // 文件名过长
+        if filename_from.len() > MAX_PATHLEN as usize || filename_to.len() > MAX_PATHLEN as usize {
             return Err(SystemError::ENAMETOOLONG);
         }
-        let pathname = pathname.trim();
 
-        return do_unlink_at(AtFlags::AT_FDCWD.bits(), pathname).map(|v| v as usize);
+        //获取pcb，文件节点
+        let pcb = ProcessManager::current_pcb();
+        let (_old_inode_begin, old_remain_path) = user_path_at(&pcb, oldfd, &filename_from)?;
+        let (_new_inode_begin, new_remain_path) = user_path_at(&pcb, newfd, &filename_to)?;
+        //获取父目录
+        let (old_filename, old_parent_path) = rsplit_path(&old_remain_path);
+        let old_parent_inode = ROOT_INODE()
+            .lookup_follow_symlink(old_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        let (new_filename, new_parent_path) = rsplit_path(&new_remain_path);
+        let new_parent_inode = ROOT_INODE()
+            .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename)?;
+        return Ok(0);
     }
 
     /// @brief 根据提供的文件描述符的fd，复制对应的文件结构体，并返回新复制的文件结构体对应的fd
@@ -847,45 +897,44 @@ impl Syscall {
     }
 
     pub fn fstat(fd: i32, usr_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
+        let mut writer = UserBufferWriter::new(usr_kstat, size_of::<PosixKstat>(), true)?;
         let kstat = Self::do_fstat(fd)?;
-        if usr_kstat.is_null() {
-            return Err(SystemError::EFAULT);
-        }
-        unsafe {
-            *usr_kstat = kstat;
-        }
+
+        writer.copy_one_to_user(&kstat, 0)?;
         return Ok(0);
     }
 
-    pub fn stat(path: &str, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
-        let fd = Self::open(path, FileMode::O_RDONLY, ModeType::empty(), true)?;
+    pub fn stat(path: *const u8, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
+        let fd = Self::open(
+            path,
+            FileMode::O_RDONLY.bits(),
+            ModeType::empty().bits(),
+            true,
+        )?;
         let r = Self::fstat(fd as i32, user_kstat);
         Self::close(fd).ok();
         return r;
     }
 
-    pub fn lstat(path: &str, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
-        let fd = Self::open(path, FileMode::O_RDONLY, ModeType::empty(), false)?;
+    pub fn lstat(path: *const u8, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
+        let fd = Self::open(
+            path,
+            FileMode::O_RDONLY.bits(),
+            ModeType::empty().bits(),
+            false,
+        )?;
         let r = Self::fstat(fd as i32, user_kstat);
         Self::close(fd).ok();
         return r;
     }
 
     pub fn mknod(
-        path_ptr: *const i8,
+        path: *const u8,
         mode: ModeType,
         dev_t: DeviceNumber,
     ) -> Result<usize, SystemError> {
-        // 安全检验
-        let len = unsafe { CStr::from_ptr(path_ptr).to_bytes().len() };
-        let user_buffer = UserBufferReader::new(path_ptr, len, true)?;
-        let buf = user_buffer.read_from_user::<u8>(0)?;
-        let path = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
-
-        // 文件名过长
-        if path.len() > MAX_PATHLEN as usize {
-            return Err(SystemError::ENAMETOOLONG);
-        }
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = path.as_str().trim();
 
         let inode: Result<Arc<dyn IndexNode>, SystemError> =
             ROOT_INODE().lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
@@ -935,11 +984,8 @@ impl Syscall {
         buf_size: usize,
     ) -> Result<usize, SystemError> {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = path.as_str().trim();
         let mut user_buf = UserBufferWriter::new(user_buf, buf_size, true)?;
-
-        if path.len() == 0 {
-            return Err(SystemError::EINVAL);
-        }
 
         let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
 
@@ -1017,6 +1063,41 @@ impl Syscall {
         kwarn!("fchmod not fully implemented");
         return Ok(0);
     }
+    /// #挂载文件系统
+    ///
+    /// 用于挂载文件系统,目前仅支持ramfs挂载
+    ///
+    /// ## 参数:
+    ///
+    /// - source       挂载设备(暂时不支持)
+    /// - target       挂载目录
+    /// - filesystemtype   文件系统
+    /// - mountflags     挂载选项（暂未实现）
+    /// - data        带数据挂载
+    ///
+    /// ## 返回值
+    /// - Ok(0): 挂载成功
+    /// - Err(SystemError) :挂载过程中出错
+    pub fn mount(
+        _source: *const u8,
+        target: *const u8,
+        filesystemtype: *const u8,
+        _mountflags: usize,
+        _data: *const c_void,
+    ) -> Result<usize, SystemError> {
+        let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?;
+
+        let filesystemtype = user_access::check_and_clone_cstr(filesystemtype, Some(MAX_PATHLEN))?;
+
+        let filesystemtype = producefs!(FSMAKER, filesystemtype)?;
+
+        return Vcore::do_mount(filesystemtype, (format!("{target}")).as_str());
+    }
+
+    // 想法：可以在VFS中实现一个文件系统分发器，流程如下：
+    // 1. 接受从上方传来的文件类型字符串
+    // 2. 将传入值与启动时准备好的字符串数组逐个比较（probe）
+    // 3. 直接在函数内调用构造方法并直接返回文件系统对象
 }
 
 #[repr(C)]

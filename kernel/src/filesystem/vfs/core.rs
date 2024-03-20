@@ -273,3 +273,11 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 
     return Ok(0);
 }
+
+// @brief mount filesystem
+pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<usize, SystemError> {
+    ROOT_INODE()
+        .lookup_follow_symlink(&mount_point, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
+        .mount(fs)?;
+    Ok(0)
+}

@@ -618,7 +618,7 @@ impl Syscall {
         let new_parent = new_begin_inode
             .lookup_follow_symlink(&new_parent_path.unwrap_or("/"), symlink_times)?;
 
-        // 在下层检查是否处于同一文件系统
+        // 被调用者利用downcast_ref判断两inode是否为同一文件系统
         return new_parent.link(&new_name, &old_inode).map(|_| 0);
     }
 

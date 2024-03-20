@@ -505,13 +505,15 @@ impl dyn IndexNode {
                     .unwrap()
                     .inner_filesystem()
                     .root_inode();
-            kdebug!("I have cache? {}", fs.cache().is_ok());
+            // kdebug!("I have cache? {}", fs.cache().is_ok());
             if let Ok(fscache) = fs.cache() {
-                let path_under = abs_path.strip_prefix(root_path).unwrap();
+                let mut path_under = abs_path.strip_prefix(root_path).unwrap();
                 kdebug!("Path under FSroot: {:?}", path_under);
                 if path_under.is_empty() {
                     return Ok(root_inode);
                 }
+
+                path_under = path_under.strip_prefix('/').unwrap();
                 // Cache record is found
                 if let Some((inode, found_path)) 
                     = root_inode.quick_lookup(
@@ -519,27 +521,24 @@ impl dyn IndexNode {
                         path_under
                 ) {
                     kdebug!("Found path: {}", found_path);
-                    let rest_path = path_under.strip_prefix(found_path);
+                    let mut rest_path = path_under.strip_prefix(found_path).unwrap();
                     kdebug!("Rest path {:?}", rest_path);
-                    if rest_path.is_none() {
-                        // error cache handling, 
-                        return root_inode._lookup_walk(
-                            &abs_path.strip_prefix(&root_path.to_string()).unwrap(),
-                            max_follow_times,
-                        );
-                    }
-                    if rest_path.unwrap().is_empty() {
+                    // no path left
+                    if rest_path.is_empty() {
                         return Ok(inode);
                     }
+
+                    // some path left, pop prefix '/'
+                    rest_path = rest_path.strip_prefix('/').unwrap();
                     return inode._lookup_walk(
-                        rest_path.unwrap(),
+                        rest_path,
                         max_follow_times,
                     );
                 }
 
                 // Cache record not found
                 return root_inode._lookup_walk(
-                    &abs_path.strip_prefix(&root_path.to_string()).unwrap(),
+                    path_under,
                     max_follow_times,
                 );
             }
@@ -645,7 +644,7 @@ impl dyn IndexNode {
                 }
 
                 if let Ok(cache) = self.fs().cache() {
-                    kdebug!("Calling cache put with child {}", child);
+                    // kdebug!("Calling cache put with child {}", child);
                     cache.put(child, Arc::downgrade(&child_node));
                 }
 
@@ -683,7 +682,7 @@ impl dyn IndexNode {
         cache: Arc<DefaultCache>,
         abs_path: &'a str, // abs to fs's root inode
     ) -> Option<(Arc<dyn IndexNode>, &str)> {
-        kdebug!("Quick Lookup");
+        // kdebug!("Quick Lookup");
         self._quick_lookup(cache, abs_path)
     }
 
@@ -694,14 +693,14 @@ impl dyn IndexNode {
     ) -> Option<(Arc<dyn IndexNode>, &str)> {
         let (key, left_rest) = rsplit_path(abs_path);
 
-        kdebug!("Quick Lookup with key {:?}", key);
+        // kdebug!("Quick Lookup with key {:?}", key);
         kdebug!("It's abs_path is {:?}", abs_path);
 
         let result = cache
             .get(key)
             .find(|src| {
-                kdebug!("Next src: {:?}", src.key());
-                src.key().unwrap() == key && src._abs_path().unwrap() == abs_path
+                kdebug!("Src: {}, {}; Lookup: {}, {}", src.key().unwrap(), src._abs_path().unwrap(), key, abs_path);
+                src.key().unwrap() == key && src._abs_path().unwrap().strip_prefix('/').unwrap() == abs_path
             });
 
         if result.is_some() {

@@ -32,7 +32,7 @@ impl<'a> Iterator for SrcIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let vec_here = core::mem::take(&mut self.vec);
         let mut vec_cur = vec_here.unwrap();
-        kdebug!("Hash list RLock!");
+        // kdebug!("Hash list RLock!");
         if self.idx == vec_cur.len() {
             return None;
         }
@@ -57,7 +57,7 @@ struct HashTable<H: Hasher + Default> {
     _hash_type: PhantomData<H>,
     table: Vec<RwLock<VecDeque<SrcPtr>>>,
 }
-
+/* Todo: Change VecDeque to BTreeMap to record depth message. */
 impl<H: Hasher + Default> HashTable<H> {
     fn new(size: usize) -> Self {
         let mut new = Self {

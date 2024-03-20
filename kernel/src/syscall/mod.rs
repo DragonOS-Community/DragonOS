@@ -1,20 +1,14 @@
 use core::{
-    ffi::{c_int, c_void},
+    ffi::{c_char, c_int, c_void, CStr},
     sync::atomic::{AtomicBool, Ordering},
 };
 
 use crate::{
-    arch::{ipc::signal::SigSet, syscall::nr::*},
-    driver::base::device::device_number::DeviceNumber,
-    libs::{futex::constant::FutexFlag, rand::GRandFlags},
-    mm::syscall::MremapFlags,
-    net::syscall::MsgHdr,
-    process::{
+    arch::{ipc::signal::SigSet, syscall::nr::*}, driver::base::device::device_number::DeviceNumber, filesystem::vfs::syscall::Statx, libs::{futex::constant::FutexFlag, rand::GRandFlags}, mm::syscall::MremapFlags, net::syscall::MsgHdr, process::{
         fork::KernelCloneArgs,
         resource::{RLimit64, RUsage},
         ProcessManager,
-    },
-    syscall::user_access::check_and_clone_cstr,
+    }, syscall::user_access::check_and_clone_cstr
 };
 
 use num_traits::FromPrimitive;
@@ -702,25 +696,18 @@ impl Syscall {
                 Self::stat(path, kstat)
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_STATX => {
                 let fd = args[0] as i32;
-                let path: &CStr = unsafe { CStr::from_ptr(args[1] as *const char) };
-                let path: Result<&str, core::str::Utf8Error> = path.to_str();
-                let res = if path.is_err() {
-                    Err(SystemError::EINVAL)
-                } else {
-                    let path: &str = path.unwrap();
-                    let flags = args[2] as u32;
-                    let mask = args[3] as u32;
-                    let kstat = args[4] as *mut Statx;
-                    let vaddr = VirtAddr::new(kstat as usize);
-                    match verify_area(vaddr, core::mem::size_of::<Statx>()) {
-                        Ok(_) => Self::do_statx(fd, path, flags, mask, kstat),
-                        Err(e) => Err(e),
-                    }
-                };
-
-                res
+                let path = args[0] as *const u8;
+                let flags = args[2] as u32;
+                let mask = args[3] as u32;
+                let kstat = args[4] as *mut Statx;
+                let vaddr = VirtAddr::new(kstat as usize);
+                match verify_area(vaddr, core::mem::size_of::<Statx>()) {
+                    Ok(_) => Self::do_statx(fd, path, flags, mask, kstat),
+                    Err(e) => Err(e),
+                }              
             }
 
             SYS_EPOLL_CREATE => Self::epoll_create(args[0] as i32),

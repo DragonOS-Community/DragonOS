@@ -128,6 +128,7 @@ pub fn get_pci_device_structure_mut<'a>(
 /// @param class_code 寄存器值
 /// @param subclass 寄存器值，与class_code一起确定设备类型
 /// @return Vec<&'a Box<(dyn PciDeviceStructure)  包含链表中所有满足条件的PCI结构体的不可变引用的容器
+#[allow(clippy::borrowed_box)]
 pub fn get_pci_device_structure<'a>(
     list: &'a mut RwLockReadGuard<'_, LinkedList<Box<dyn PciDeviceStructure>>>,
     class_code: u8,

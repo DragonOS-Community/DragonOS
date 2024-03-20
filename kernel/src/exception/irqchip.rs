@@ -473,7 +473,7 @@ impl IrqManager {
             }
         }
         let handler = handler.unwrap();
-        if core::ptr::eq(handler, bad_irq_handler())
+        if handler.type_id() == bad_irq_handler().type_id()
             && Arc::ptr_eq(
                 &desc_inner.irq_data().chip_info_read_irqsave().chip(),
                 &no_irq_chip(),
@@ -493,7 +493,7 @@ impl IrqManager {
         desc.set_handler_no_lock_inner(handler, desc_inner.irq_data(), &chip);
         desc_inner.set_name(name);
 
-        if !core::ptr::eq(handler, bad_irq_handler()) && is_chained {
+        if handler.type_id() != bad_irq_handler().type_id() && is_chained {
             let trigger_type = desc_inner.common_data().trigger_type();
 
             /*

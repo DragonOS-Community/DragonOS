@@ -7,7 +7,7 @@ use crate::{
     },
     exception::{irqdesc::irq_desc_manager, softirq::do_softirq, IrqNumber},
     process::{
-        process::{current_pcb_flags, current_pcb_preempt_count},
+        utils::{current_pcb_flags, current_pcb_preempt_count},
         ProcessFlags,
     },
 };

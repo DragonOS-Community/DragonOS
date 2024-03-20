@@ -274,7 +274,7 @@ impl E1000EDevice {
             // close the interrupt
             volwrite!(interrupt_regs, imc, E1000E_IMC_CLEAR);
             let mut gcr = volread!(pcie_regs, gcr);
-            gcr = gcr | (1 << 22);
+            gcr |= 1 << 22;
             volwrite!(pcie_regs, gcr, gcr);
             compiler_fence(Ordering::AcqRel);
             // PHY Initialization 14.8.1
@@ -291,11 +291,11 @@ impl E1000EDevice {
         let ral = unsafe { volread!(ra_regs, ral0) };
         let rah = unsafe { volread!(ra_regs, rah0) };
         let mac: [u8; 6] = [
-            ((ral >> 0) & 0xFF) as u8,
+            (ral & 0xFF) as u8,
             ((ral >> 8) & 0xFF) as u8,
             ((ral >> 16) & 0xFF) as u8,
             ((ral >> 24) & 0xFF) as u8,
-            ((rah >> 0) & 0xFF) as u8,
+            (rah & 0xFF) as u8,
             ((rah >> 8) & 0xFF) as u8,
         ];
         // 初始化receive和transimit descriptor环形队列
@@ -319,17 +319,17 @@ impl E1000EDevice {
 
         // 初始化缓冲区与descriptor，descriptor 中的addr字典应当指向buffer的物理地址
         // Receive buffers of appropriate size should be allocated and pointers to these buffers should be stored in the descriptor ring.
-        for i in 0..recv_ring_length {
+        for ring in recv_desc_ring.iter_mut().take(recv_ring_length) {
             let buffer = E1000EBuffer::new(PAGE_SIZE);
-            recv_desc_ring[i].addr = buffer.as_paddr() as u64;
-            recv_desc_ring[i].status = 0;
+            ring.addr = buffer.as_paddr() as u64;
+            ring.status = 0;
             recv_buffers.push(buffer);
         }
         // Same as receive buffers
-        for i in 0..recv_ring_length {
+        for ring in trans_desc_ring.iter_mut().take(recv_ring_length) {
             let buffer = E1000EBuffer::new(PAGE_SIZE);
-            trans_desc_ring[i].addr = buffer.as_paddr() as u64;
-            trans_desc_ring[i].status = 1;
+            ring.addr = buffer.as_paddr() as u64;
+            ring.status = 1;
             trans_buffers.push(buffer);
         }
 

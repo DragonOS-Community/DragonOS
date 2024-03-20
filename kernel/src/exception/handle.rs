@@ -20,11 +20,10 @@ use super::{
     InterruptArch, IrqNumber,
 };
 
-static HANDLE_BAD_IRQ: HandleBadIrq = HandleBadIrq;
 /// 获取用于处理错误的中断的处理程序
 #[inline(always)]
 pub fn bad_irq_handler() -> &'static dyn IrqFlowHandler {
-    &HANDLE_BAD_IRQ
+    &HandleBadIrq
 }
 
 /// 获取用于处理快速EOI的中断的处理程序

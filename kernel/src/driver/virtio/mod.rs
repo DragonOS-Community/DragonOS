@@ -9,9 +9,10 @@ use super::base::device::DeviceId;
 
 pub(super) mod irq;
 pub mod transport_pci;
+#[allow(clippy::module_inception)]
 pub mod virtio;
 pub mod virtio_impl;
-#[allow(clippy::module_inception)]
+
 pub trait VirtIODevice: Send + Sync + Any {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError>;
 

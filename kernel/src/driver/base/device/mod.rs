@@ -509,7 +509,7 @@ impl DeviceManager {
         current_parent: Option<Arc<dyn Device>>,
     ) -> Result<Option<Arc<dyn KObject>>, SystemError> {
         // kdebug!("get_device_parent() device:{:?}", device.name());
-        if let Some(_) = device.class() {
+        if device.class().is_some() {
             let parent_kobj: Arc<dyn KObject>;
             // kdebug!("current_parent:{:?}", current_parent);
             if current_parent.is_none() {
@@ -538,8 +538,8 @@ impl DeviceManager {
             }
         }
 
-        if current_parent.is_some() {
-            return Ok(Some(current_parent.unwrap().clone() as Arc<dyn KObject>));
+        if let Some(current_parent) = current_parent {
+            return Ok(Some(current_parent as Arc<dyn KObject>));
         }
 
         return Ok(None);

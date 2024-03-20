@@ -37,6 +37,7 @@ static mut __INITIAL_PROCESS_ADDRESS_SPACE: Option<Arc<AddressSpace>> = None;
 
 bitflags! {
     /// Virtual memory flags
+    #[allow(clippy::bad_bit_mask)]
     pub struct VmFlags:u32{
         const VM_NONE = 0x00000000;
 

@@ -53,7 +53,7 @@ impl PosixTermios {
     }
 
     #[allow(dead_code)]
-    pub fn to_kernel_termios(&self) -> Termios {
+    pub fn to_kernel_termios(self) -> Termios {
         // TODO：这里没有考虑非规范模式
         Termios {
             input_mode: InputMode::from_bits_truncate(self.c_iflag),

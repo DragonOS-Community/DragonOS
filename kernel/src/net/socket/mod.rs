@@ -398,7 +398,7 @@ pub struct SocketHandleItem {
 }
 
 impl SocketHandleItem {
-    pub fn new(socket: &Box<dyn Socket>) -> Self {
+    pub fn new(socket: &dyn Socket) -> Self {
         Self {
             metadata: socket.metadata().unwrap(),
             shutdown_type: RwLock::new(ShutdownType::empty()),
@@ -407,7 +407,7 @@ impl SocketHandleItem {
         }
     }
 
-    pub fn from_socket<A: Socket>(socket: &Box<A>) -> Self {
+    pub fn from_socket<A: Socket>(socket: &A) -> Self {
         Self {
             metadata: socket.metadata().unwrap(),
             shutdown_type: RwLock::new(ShutdownType::empty()),

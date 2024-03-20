@@ -1243,7 +1243,7 @@ impl VirtualConsoleData {
             return (idx, Some(Color::from_256(self.par[idx])));
         } else if self.par[idx] == 2 && idx + 3 <= self.npar as usize {
             // 24位
-            let mut color = Color {
+            let color = Color {
                 red: self.par[idx + 1] as u16,
                 green: self.par[idx + 2] as u16,
                 blue: self.par[idx + 3] as u16,
@@ -1287,10 +1287,10 @@ impl VirtualConsoleData {
 
                 let ret = self.tab_stop.next_index(self.state.x + 1);
 
-                if ret.is_none() {
-                    self.state.x = self.cols - 1;
+                if let Some(x) = ret {
+                    self.state.x = x;
                 } else {
-                    self.state.x = ret.unwrap();
+                    self.state.x = self.cols - 1;
                 }
 
                 self.pos += self.state.x;
@@ -1661,12 +1661,11 @@ impl VirtualConsoleData {
     /// ## 更新虚拟控制台指定区域的显示
     fn do_update_region(&self, mut start: usize, mut count: usize) {
         let ret = self.driver_funcs().con_getxy(self, start);
-        let (mut x, mut y) = if ret.is_err() {
-            (start % self.cols, start / self.cols)
-        } else {
-            let (_, tmp_x, tmp_y) = ret.unwrap();
+        let (mut x, mut y) = if let Ok((_, tmp_x, tmp_y)) = ret {
             // start = tmp_start;
             (tmp_x, tmp_y)
+        } else {
+            (start % self.cols, start / self.cols)
         };
 
         loop {
@@ -1713,8 +1712,8 @@ impl VirtualConsoleData {
             y += 1;
 
             let ret = self.driver_funcs().con_getxy(self, start);
-            if ret.is_ok() {
-                start = ret.unwrap().0;
+            if let Ok(ret) = ret {
+                start = ret.0;
             } else {
                 return;
             }

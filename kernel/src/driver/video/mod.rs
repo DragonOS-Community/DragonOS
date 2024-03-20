@@ -273,7 +273,7 @@ impl TimerFunction for VideoRefreshExecutor {
         let refresh_target = refresh_target.unwrap();
 
         if let ScmBuffer::DeviceBuffer(vaddr) = manager.device_buffer().buf {
-            let p: *mut u8 = vaddr.as_ptr() ;
+            let p: *mut u8 = vaddr.as_ptr();
             let mut target_guard = None;
             for _ in 0..2 {
                 if let Ok(guard) = refresh_target.as_ref().unwrap().try_lock_irqsave() {

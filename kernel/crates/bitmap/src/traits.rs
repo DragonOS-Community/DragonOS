@@ -309,7 +309,7 @@ pub trait BitMapOps<T: BitOps> {
     /// 判断bitmap是否为空
     fn is_empty(&self) -> bool;
 
-    /// # Unsafe
+    /// # Safety
     /// *不应直接修改字节数组*
     ///
     /// 将bitmap转换为字节数组

@@ -322,7 +322,7 @@ impl<T: Transport + 'static> NetDriver for VirtioInterface<T> {
 
         self.iface.lock().update_ip_addrs(|addrs| {
             let dest = addrs.iter_mut().next();
-            if let None = dest {
+            if dest.is_none() {
                 addrs.push(ip_addrs[0]).expect("Push ipCidr failed: full");
             } else {
                 let dest = dest.unwrap();

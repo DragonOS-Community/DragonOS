@@ -792,8 +792,8 @@ impl NTtyData {
         // 先处理信号
         let mut ctrl_info = tty.core().contorl_info_irqsave();
         let pg = ctrl_info.pgid;
-        if pg.is_some() {
-            let _ = Syscall::kill(pg.unwrap(), signal as i32);
+        if let Some(pg) = pg {
+            let _ = Syscall::kill(pg, signal as i32);
         }
 
         ctrl_info.pgid = None;
@@ -1035,8 +1035,7 @@ impl NTtyData {
         let found = if eol == NTTY_BUFSIZE && more > 0 {
             // 需要返回头部
             let ret = self.read_flags.first_index();
-            if ret.is_some() {
-                let tmp = ret.unwrap();
+            if let Some(tmp) = ret {
                 // 在头部范围内找到eol
                 if tmp < more {
                     eol = tmp;
@@ -1999,7 +1998,8 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             // 原模式或real_raw
             ldata.raw = true;
 
-            ldata.real_raw = termios.input_mode.contains(InputMode::IGNBRK) || (!termios.input_mode.contains(InputMode::BRKINT)
+            ldata.real_raw = termios.input_mode.contains(InputMode::IGNBRK)
+                || (!termios.input_mode.contains(InputMode::BRKINT)
                     && !termios.input_mode.contains(InputMode::PARMRK))
                     && (termios.input_mode.contains(InputMode::IGNPAR)
                         || !termios.input_mode.contains(InputMode::INPCK))

@@ -2397,8 +2397,8 @@ pub fn get_raw_dir_entry(
 
             if file_attr.contains(FileAttributes::LONG_NAME) {
                 // 当前目录项是一个长目录项
-                let mut long_dentry = LongDirEntry{
-                    ord : cursor.read_u8()?,
+                let mut long_dentry = LongDirEntry {
+                    ord: cursor.read_u8()?,
                     ..Default::default()
                 };
                 cursor.read_u16_into(&mut long_dentry.name1)?;

@@ -86,9 +86,7 @@ impl Serial8250PIOPort {
             inner: RwLock::new(Serial8250PIOPortInner::new()),
         };
 
-        if let Err(e) = r.check_baudrate(&baudrate) {
-            return Err(e);
-        }
+        r.check_baudrate(&baudrate)?;
 
         return Ok(r);
     }
@@ -112,10 +110,10 @@ impl Serial8250PIOPort {
             CurrentPortIOArch::out8(port + 2, 0xC7); // Enable FIFO, clear them, with 14-byte threshold
             CurrentPortIOArch::out8(port + 4, 0x08); // IRQs enabled, RTS/DSR clear (现代计算机上一般都不需要hardware flow control，因此不需要置位RTS/DSR)
             CurrentPortIOArch::out8(port + 4, 0x1E); // Set in loopback mode, test the serial chip
-            CurrentPortIOArch::out8(port + 0, 0xAE); // Test serial chip (send byte 0xAE and check if serial returns same byte)
+            CurrentPortIOArch::out8(port, 0xAE); // Test serial chip (send byte 0xAE and check if serial returns same byte)
 
             // Check if serial is faulty (i.e: not same byte as sent)
-            if CurrentPortIOArch::in8(port + 0) != 0xAE {
+            if CurrentPortIOArch::in8(port) != 0xAE {
                 self.initialized.store(false, Ordering::SeqCst);
                 return Err(SystemError::ENODEV);
             }
@@ -149,19 +147,11 @@ impl Serial8250PIOPort {
 
     #[allow(dead_code)]
     fn serial_received(&self) -> bool {
-        if self.serial_in(5) & 1 != 0 {
-            true
-        } else {
-            false
-        }
+        self.serial_in(5) & 1 != 0
     }
 
     fn is_transmit_empty(&self) -> bool {
-        if self.serial_in(5) & 0x20 != 0 {
-            true
-        } else {
-            false
-        }
+        self.serial_in(5) & 0x20 != 0
     }
 
     /// 发送字节
@@ -170,7 +160,7 @@ impl Serial8250PIOPort {
     ///
     /// - `s`：待发送的字节
     fn send_bytes(&self, s: &[u8]) {
-        while self.is_transmit_empty() == false {
+        while !self.is_transmit_empty() {
             spin_loop();
         }
 
@@ -182,7 +172,7 @@ impl Serial8250PIOPort {
     /// 读取一个字节
     #[allow(dead_code)]
     fn read_one_byte(&self) -> u8 {
-        while self.serial_received() == false {
+        while !self.serial_received() {
             spin_loop();
         }
         return self.serial_in(0) as u8;
@@ -223,7 +213,7 @@ impl UartPort for Serial8250PIOPort {
 
             let divisor = self.divisor(baud).0;
 
-            CurrentPortIOArch::out8(port + 0, (divisor & 0xff) as u8); // Set divisor  (lo byte)
+            CurrentPortIOArch::out8(port, (divisor & 0xff) as u8); // Set divisor  (lo byte)
             CurrentPortIOArch::out8(port + 1, ((divisor >> 8) & 0xff) as u8); // (hi byte)
             CurrentPortIOArch::out8(port + 3, 0x03); // 8 bits, no parity, one stop bit
         }
@@ -271,7 +261,7 @@ impl Serial8250PIOPortInner {
     }
 
     fn set_device(&mut self, device: Option<&Arc<Serial8250ISADevices>>) {
-        self.device = device.map(|d| Arc::downgrade(d));
+        self.device = device.map(Arc::downgrade);
     }
 }
 

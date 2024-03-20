@@ -76,7 +76,7 @@ pub fn efi_init() {
         .expect("Failed to reserve memory for EFI mmap table");
 
     // 保留内核的内存
-    if let Some(info) = efi_manager().inner.read().dragonstub_load_info.clone() {
+    if let Some(info) = efi_manager().inner.read().dragonstub_load_info {
         mem_block_manager()
             .reserve_block(
                 PhysAddr::new(info.paddr as usize),

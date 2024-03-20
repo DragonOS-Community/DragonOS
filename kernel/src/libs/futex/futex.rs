@@ -307,8 +307,8 @@ impl Futex {
             }
             None => {
                 // 取消定时器任务
-                if timer.is_some() {
-                    timer.unwrap().cancel();
+                if let Some(timer) = timer {
+                    timer.cancel();
                 }
                 return Ok(0);
             }

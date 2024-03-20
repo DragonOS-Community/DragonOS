@@ -362,7 +362,7 @@ impl TableMatcher {
     /// 判断配置表与当前匹配器是否匹配
     #[inline(never)]
     fn match_table(&self, table: &ConfigurationTable) -> Option<Result<(), SystemError>> {
-        if table.vendor_guid.equivalent(self.table.guid()) == false {
+        if !table.vendor_guid.equivalent(self.table.guid()) {
             return None;
         }
 

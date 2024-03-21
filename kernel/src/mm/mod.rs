@@ -33,7 +33,7 @@ pub mod syscall;
 pub mod ucontext;
 
 /// 内核INIT进程的用户地址空间结构体（仅在process_init中初始化）
-static mut __INITIAL_PROCESS_ADDRESS_SPACE: Option<Arc<AddressSpace>> = None;
+static mut __IDLE_PROCESS_ADDRESS_SPACE: Option<Arc<AddressSpace>> = None;
 
 bitflags! {
     /// Virtual memory flags
@@ -75,29 +75,29 @@ bitflags! {
     }
 }
 
-/// 获取内核INIT进程的用户地址空间结构体
+/// 获取内核IDLE进程的用户地址空间结构体
 #[allow(non_snake_case)]
 #[inline(always)]
-pub fn INITIAL_PROCESS_ADDRESS_SPACE() -> Arc<AddressSpace> {
+pub fn IDLE_PROCESS_ADDRESS_SPACE() -> Arc<AddressSpace> {
     unsafe {
-        return __INITIAL_PROCESS_ADDRESS_SPACE
+        return __IDLE_PROCESS_ADDRESS_SPACE
             .as_ref()
-            .expect("INITIAL_PROCESS_ADDRESS_SPACE is null")
+            .expect("IDLE_PROCESS_ADDRESS_SPACE is null")
             .clone();
     }
 }
 
-/// 设置内核INIT进程的用户地址空间结构体全局变量
+/// 设置内核IDLE进程的用户地址空间结构体全局变量
 #[allow(non_snake_case)]
-pub unsafe fn set_INITIAL_PROCESS_ADDRESS_SPACE(address_space: Arc<AddressSpace>) {
+pub unsafe fn set_IDLE_PROCESS_ADDRESS_SPACE(address_space: Arc<AddressSpace>) {
     static INITIALIZED: AtomicBool = AtomicBool::new(false);
     if INITIALIZED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::Acquire)
         .is_err()
     {
-        panic!("INITIAL_PROCESS_ADDRESS_SPACE is already initialized");
+        panic!("IDLE_PROCESS_ADDRESS_SPACE is already initialized");
     }
-    __INITIAL_PROCESS_ADDRESS_SPACE = Some(address_space);
+    __IDLE_PROCESS_ADDRESS_SPACE = Some(address_space);
 }
 
 /// @brief 将内核空间的虚拟地址转换为物理地址

@@ -1,6 +1,5 @@
 pub mod barrier;
 pub mod bump;
-mod c_adapter;
 
 use alloc::vec::Vec;
 use hashbrown::HashSet;
@@ -159,6 +158,7 @@ impl MemoryManagementArch for X86_64MMArch {
 
         // 初始化内存管理器
         unsafe { allocator_init() };
+
         send_to_default_serial8250_port("x86 64 init done\n\0".as_bytes());
     }
 
@@ -181,11 +181,10 @@ impl MemoryManagementArch for X86_64MMArch {
     unsafe fn table(table_kind: PageTableKind) -> PhysAddr {
         match table_kind {
             PageTableKind::Kernel | PageTableKind::User => {
-                let paddr: usize;
                 compiler_fence(Ordering::SeqCst);
-                asm!("mov {}, cr3", out(reg) paddr, options(nomem, nostack, preserves_flags));
+                let cr3 = x86::controlregs::cr3() as usize;
                 compiler_fence(Ordering::SeqCst);
-                return PhysAddr::new(paddr);
+                return PhysAddr::new(cr3);
             }
             PageTableKind::EPT => {
                 let eptp =
@@ -461,9 +460,6 @@ unsafe fn allocator_init() {
                 flusher.ignore();
             }
         }
-
-        // 添加低地址的映射（在smp完成初始化之前，需要使用低地址的映射.初始化之后需要取消这一段映射）
-        LowAddressRemapping::remap_at_low_address(&mut mapper);
     }
 
     unsafe {
@@ -659,9 +655,7 @@ impl LowAddressRemapping {
     // 映射64M
     const REMAP_SIZE: usize = 64 * 1024 * 1024;
 
-    pub unsafe fn remap_at_low_address(
-        mapper: &mut crate::mm::page::PageMapper<MMArch, &mut BumpAllocator<MMArch>>,
-    ) {
+    pub unsafe fn remap_at_low_address(mapper: &mut PageMapper) {
         for i in 0..(Self::REMAP_SIZE / MMArch::PAGE_SIZE) {
             let paddr = PhysAddr::new(i * MMArch::PAGE_SIZE);
             let vaddr = VirtAddr::new(i * MMArch::PAGE_SIZE);
@@ -676,14 +670,10 @@ impl LowAddressRemapping {
     }
 
     /// 取消低地址的映射
-    pub unsafe fn unmap_at_low_address(flush: bool) {
-        let mut mapper = KernelMapper::lock();
-        assert!(mapper.as_mut().is_some());
+    pub unsafe fn unmap_at_low_address(mapper: &mut PageMapper, flush: bool) {
         for i in 0..(Self::REMAP_SIZE / MMArch::PAGE_SIZE) {
             let vaddr = VirtAddr::new(i * MMArch::PAGE_SIZE);
             let (_, _, flusher) = mapper
-                .as_mut()
-                .unwrap()
                 .unmap_phys(vaddr, true)
                 .expect("Failed to unmap frame");
             if !flush {

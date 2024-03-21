@@ -49,6 +49,10 @@ impl FileSystem for DevFS {
             max_name_len: DEVFS_MAX_NAMELEN,
         };
     }
+
+    fn name(&self) -> &str {
+        "devfs"
+    }
 }
 
 impl DevFS {

@@ -1,4 +1,7 @@
-use core::{fmt::Debug, sync::atomic::AtomicBool};
+use core::{
+    fmt::Debug,
+    sync::atomic::{AtomicBool, AtomicUsize},
+};
 
 use alloc::{collections::LinkedList, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
@@ -43,7 +46,7 @@ impl TtyCore {
             termios: RwLock::new(termios),
             name,
             flags: RwLock::new(TtyFlag::empty()),
-            count: RwLock::new(0),
+            count: AtomicUsize::new(0),
             window_size: RwLock::new(WindowSize::default()),
             read_wq: EventWaitQueue::new(),
             write_wq: EventWaitQueue::new(),
@@ -129,7 +132,7 @@ impl TtyCore {
     }
 
     pub fn tty_wakeup(&self) {
-        if self.core.flags.read().contains(TtyFlag::DO_WRITE_WAKEUP) {
+        if self.core.flags().contains(TtyFlag::DO_WRITE_WAKEUP) {
             let _ = self.ldisc().write_wakeup(self.core());
         }
 
@@ -277,7 +280,7 @@ pub struct TtyCoreData {
     flags: RwLock<TtyFlag>,
     /// 在初始化时即确定不会更改，所以这里不用加锁
     index: usize,
-    count: RwLock<usize>,
+    count: AtomicUsize,
     /// 窗口大小
     window_size: RwLock<WindowSize>,
     /// 读等待队列
@@ -326,7 +329,7 @@ impl TtyCoreData {
 
     #[inline]
     pub fn flags(&self) -> TtyFlag {
-        *self.flags.read()
+        *self.flags.read_irqsave()
     }
 
     #[inline]
@@ -341,14 +344,14 @@ impl TtyCoreData {
 
     #[inline]
     pub fn set_termios(&self, termios: Termios) {
-        let mut termios_guard = self.termios.write_irqsave();
+        let mut termios_guard = self.termios_write();
         *termios_guard = termios;
     }
 
     #[inline]
     pub fn add_count(&self) {
-        let mut guard = self.count.write();
-        *guard += 1;
+        self.count
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     }
 
     #[inline]

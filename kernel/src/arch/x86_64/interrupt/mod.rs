@@ -1,4 +1,3 @@
-mod c_adapter;
 pub(super) mod entry;
 mod handle;
 pub mod ipi;
@@ -92,6 +91,14 @@ impl InterruptArch for X86_64InterruptArch {
 
     fn arch_early_irq_init() -> Result<(), SystemError> {
         arch_early_irq_init()
+    }
+
+    fn arch_ap_early_irq_init() -> Result<(), SystemError> {
+        if !CurrentApic.init_current_cpu() {
+            return Err(SystemError::ENODEV);
+        }
+
+        Ok(())
     }
 }
 

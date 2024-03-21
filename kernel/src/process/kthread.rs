@@ -89,10 +89,15 @@ impl KernelThreadPcbPrivate {
 #[allow(dead_code)]
 pub enum KernelThreadClosure {
     UsizeClosure((Box<dyn Fn(usize) -> i32 + Send + Sync>, usize)),
-    StaticUsizeClosure((&'static dyn Fn(usize) -> i32, usize)),
+    StaticUsizeClosure((&'static fn(usize) -> i32, usize)),
     EmptyClosure((Box<dyn Fn() -> i32 + Send + Sync>, ())),
-    StaticEmptyClosure((&'static dyn Fn() -> i32, ())),
-    IrqThread((&'static IrqHandler, Arc<IrqAction>)),
+    StaticEmptyClosure((&'static fn() -> i32, ())),
+    IrqThread(
+        (
+            &'static dyn Fn(Arc<IrqAction>) -> Result<(), SystemError>,
+            Arc<IrqAction>,
+        ),
+    ),
     // 添加其他类型入参的闭包，返回值必须是i32
 }
 
@@ -308,7 +313,7 @@ impl KernelThreadMechanism {
             unsafe {
                 KTHREAD_DAEMON_PCB.replace(pcb);
             }
-            kinfo!("Initializing kernel thread mechanism stage2 complete");
+            kinfo!("Initialize kernel thread mechanism stage2 complete");
         });
     }
 
@@ -432,6 +437,7 @@ impl KernelThreadMechanism {
     }
 
     /// A daemon thread which creates other kernel threads
+    #[inline(never)]
     fn kthread_daemon() -> i32 {
         let current_pcb = ProcessManager::current_pcb();
         kdebug!("kthread_daemon: pid: {:?}", current_pcb.pid());
@@ -451,9 +457,10 @@ impl KernelThreadMechanism {
                 drop(list);
 
                 // create a new kernel thread
-                let result: Result<Pid, SystemError> =
-                    Self::__inner_create(&info, CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGNAL);
-
+                let result: Result<Pid, SystemError> = Self::__inner_create(
+                    &info,
+                    CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGNAL,
+                );
                 if result.is_err() {
                     // 创建失败
                     info.created

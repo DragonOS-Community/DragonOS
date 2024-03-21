@@ -165,8 +165,15 @@ impl ProcessManager {
         let mut args = KernelCloneArgs::new();
         args.flags = clone_flags;
         args.exit_signal = Signal::SIGCHLD;
-
-        Self::copy_process(&current_pcb, &pcb, args, current_trapframe)?;
+        Self::copy_process(&current_pcb, &pcb, args, current_trapframe).map_err(|e| {
+            kerror!(
+                "fork: Failed to copy process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.pid(),
+                pcb.pid(),
+                e
+            );
+            e
+        })?;
         ProcessManager::add_pcb(pcb.clone());
 
         // 向procfs注册进程

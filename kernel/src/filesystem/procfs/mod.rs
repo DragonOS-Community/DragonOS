@@ -287,6 +287,9 @@ impl FileSystem for ProcFS {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
+    fn name(&self) -> &str {
+        "procfs"
+    }
 }
 
 impl ProcFS {
@@ -642,6 +645,7 @@ impl IndexNode for LockedProcFSInode {
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
+
         // 不允许删除当前文件夹，也不允许删除上一个目录
         if name == "." || name == ".." {
             return Err(SystemError::ENOTEMPTY);
@@ -649,14 +653,17 @@ impl IndexNode for LockedProcFSInode {
 
         // 获得要删除的文件的inode
         let to_delete = inode.children.get(name).ok_or(SystemError::ENOENT)?;
+
         // 减少硬链接计数
         to_delete.0.lock().metadata.nlinks -= 1;
+
         // 在当前目录中删除这个子目录项
         inode.children.remove(name);
+
         return Ok(());
     }
 
-    fn move_(
+    fn move_to(
         &self,
         _old_name: &str,
         _target: &Arc<dyn IndexNode>,

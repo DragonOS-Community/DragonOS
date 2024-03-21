@@ -899,6 +899,55 @@ impl FATDir {
             return Err(SystemError::EPERM);
         }
     }
+
+    /// @brief 跨目录，重命名一个目录项
+    ///
+    pub fn rename_across(
+        &self,
+        fs: Arc<FATFileSystem>,
+        target: &FATDir,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<FATDirEntry, SystemError> {
+        // 判断源目录项是否存在
+        let old_dentry: FATDirEntry = if let FATDirEntryOrShortName::DirEntry(dentry) =
+            self.check_existence(old_name, None, fs.clone())?
+        {
+            dentry
+        } else {
+            // 如果目标目录项不存在，则返回错误
+            return Err(SystemError::ENOENT);
+        };
+
+        let short_name = if let FATDirEntryOrShortName::ShortName(s) =
+            target.check_existence(new_name, None, fs.clone())?
+        {
+            s
+        } else {
+            // 如果目标目录项存在，那么就返回错误
+            return Err(SystemError::EEXIST);
+        };
+
+        let old_short_dentry: Option<ShortDirEntry> = old_dentry.short_dir_entry();
+        if let Some(se) = old_short_dentry {
+            // 删除原来的目录项
+            self.remove(fs.clone(), old_dentry.name().as_str(), false)?;
+
+            // 创建新的目录项
+            let new_dentry: FATDirEntry = target.create_dir_entries(
+                new_name,
+                &short_name,
+                Some(se),
+                se.attributes,
+                fs.clone(),
+            )?;
+
+            return Ok(new_dentry);
+        } else {
+            // 不允许对根目录项进行重命名
+            return Err(SystemError::EPERM);
+        }
+    }
 }
 
 impl FileAttributes {

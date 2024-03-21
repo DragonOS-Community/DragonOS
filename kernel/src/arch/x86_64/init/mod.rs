@@ -6,7 +6,6 @@ use x86::dtables::DescriptorTablePointer;
 use crate::{
     arch::{interrupt::trap::arch_trap_init, process::table::TSSManager},
     driver::pci::pci::pci_init,
-    include::bindings::bindings::cpu_init,
     init::init::start_kernel,
     kdebug,
     mm::{MemoryManagementArch, PhysAddr},
@@ -33,7 +32,6 @@ extern "C" {
     fn head_stack_start();
 
     fn multiboot2_init(mb2_info: u64, mb2_magic: u32) -> bool;
-    fn __init_set_cpu_stack_start(cpu: u32, stack_start: u64);
 }
 
 #[no_mangle]
@@ -82,7 +80,6 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
 
     set_current_core_tss(stack_start, 0);
     unsafe { TSSManager::load_tr() };
-    unsafe { __init_set_cpu_stack_start(0, stack_start as u64) };
     arch_trap_init().expect("arch_trap_init failed");
 
     return Ok(());
@@ -91,10 +88,6 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
 /// 架构相关的初始化
 #[inline(never)]
 pub fn setup_arch() -> Result<(), SystemError> {
-    unsafe {
-        cpu_init();
-    }
-
     // todo: 将来pci接入设备驱动模型之后，删掉这里。
     pci_init();
     return Ok(());

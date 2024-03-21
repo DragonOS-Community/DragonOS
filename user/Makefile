@@ -7,7 +7,7 @@ GARBAGE := $(foreach DIR,$(DIRS),$(addprefix $(DIR)/,$(GARBAGE_PATTERNS)))
 
 DADK_VERSION=$(shell dadk -V | awk 'END {print $$2}')
 # 最小的DADK版本
-MIN_DADK_VERSION = 0.1.8
+MIN_DADK_VERSION = 0.1.10
 DADK_CACHE_DIR = $(ROOT_PATH)/bin/dadk_cache
 
 ECHO:
@@ -60,10 +60,9 @@ all:
 	@echo 用户态程序编译完成
 
 copy_services: dadk_run
+	@mkdir -p $(ROOT_PATH)/bin/sysroot/etc/reach/system
 	cp -r services/* $(ROOT_PATH)/bin/sysroot/etc/reach/system/
 
-
-	
 
 .PHONY: clean
 clean:

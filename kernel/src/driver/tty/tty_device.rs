@@ -36,6 +36,7 @@ use crate::{
 };
 
 use super::{
+    kthread::tty_flush_thread_init,
     termios::WindowSize,
     tty_core::{TtyCore, TtyFlag, TtyIoctlCmd},
     tty_driver::{TtyDriver, TtyDriverSubType, TtyDriverType, TtyOperation},
@@ -527,5 +528,7 @@ pub fn tty_init() -> Result<(), SystemError> {
     devfs_register(console.name, console)?;
 
     serial_init()?;
+
+    tty_flush_thread_init();
     return vty_init();
 }

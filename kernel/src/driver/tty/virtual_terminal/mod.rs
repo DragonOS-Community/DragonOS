@@ -183,7 +183,6 @@ impl TtyOperation for TtyConsoleDriverInner {
             let mut window_size = window_size.upgrade();
             window_size.col = vc_data.cols as u16;
             window_size.row = vc_data.rows as u16;
-            kerror!("window_size {:?}", *window_size);
         }
 
         if vc_data.utf {

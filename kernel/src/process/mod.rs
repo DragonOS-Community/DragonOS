@@ -41,7 +41,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
-    mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
+    mm::{percpu::PerCpuVar, set_IDLE_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
     net::socket::SocketInode,
     sched::{
         completion::Completion,
@@ -110,7 +110,7 @@ impl ProcessManager {
             compiler_fence(Ordering::SeqCst);
             kdebug!("To create address space for INIT process.");
             // test_buddy();
-            set_INITIAL_PROCESS_ADDRESS_SPACE(
+            set_IDLE_PROCESS_ADDRESS_SPACE(
                 AddressSpace::new(true).expect("Failed to create address space for INIT process."),
             );
             kdebug!("INIT process address space created.");
@@ -441,6 +441,7 @@ impl ProcessManager {
 
 /// 上下文切换的钩子函数,当这个函数return的时候,将会发生上下文切换
 #[cfg(target_arch = "x86_64")]
+#[inline(never)]
 pub unsafe extern "sysv64" fn switch_finish_hook() {
     ProcessManager::switch_finish_hook();
 }
@@ -893,7 +894,6 @@ impl ProcessControlBlock {
 impl Drop for ProcessControlBlock {
     fn drop(&mut self) {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        // kdebug!("drop: {:?}", self.pid);
         // 在ProcFS中,解除进程的注册
         procfs_unregister_pid(self.pid())
             .unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));

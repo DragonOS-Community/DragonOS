@@ -229,6 +229,7 @@ impl SmpCpuManager {
 
         ProcessManager::wakeup(cpu_state.thread.as_ref().unwrap())?;
         CurrentSMPArch::start_cpu(cpu_id, cpu_state)?;
+        assert_eq!(ProcessManager::current_pcb().preempt_count(), 0);
         self.wait_for_ap_thread(cpu_state, cpu_state.bringup);
 
         return Ok(());

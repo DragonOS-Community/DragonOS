@@ -87,10 +87,9 @@ unsafe extern "C" fn smp_ap_start_stage1() -> ! {
     );
     TSSManager::load_tr();
 
+    CurrentIrqArch::arch_ap_early_irq_init().expect("arch_ap_early_irq_init failed");
+
     smp_ap_start_stage2();
-    loop {
-        spin_loop();
-    }
 }
 
 /// 多核的数据
@@ -214,16 +213,16 @@ impl SMPArch for X86_64SMPArch {
         return Ok(());
     }
 
-    fn start_cpu(cpu_id: ProcessorId, cpu_hpstate: &CpuHpCpuState) -> Result<(), SystemError> {
+    fn start_cpu(cpu_id: ProcessorId, _cpu_hpstate: &CpuHpCpuState) -> Result<(), SystemError> {
         kdebug!("start_cpu: cpu_id: {:#x}\n", cpu_id.data());
 
         Self::copy_smp_start_code();
 
         ipi_send_smp_init();
         fence(Ordering::SeqCst);
-        ipi_send_smp_startup(cpu_id);
+        ipi_send_smp_startup(cpu_id)?;
         fence(Ordering::SeqCst);
-        ipi_send_smp_startup(cpu_id);
+        ipi_send_smp_startup(cpu_id)?;
         fence(Ordering::SeqCst);
 
         return Ok(());

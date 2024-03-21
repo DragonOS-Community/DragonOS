@@ -1,10 +1,27 @@
-use crate::smp::{core::smp_get_processor_id, cpu::smp_cpu_manager};
+use crate::{
+    arch::{syscall::arch_syscall_init, CurrentIrqArch, CurrentSchedArch},
+    exception::InterruptArch,
+    process::ProcessManager,
+    sched::SchedArch,
+    smp::{core::smp_get_processor_id, cpu::smp_cpu_manager},
+};
 
 #[inline(never)]
-pub fn smp_ap_start_stage2() {
+pub fn smp_ap_start_stage2() -> ! {
+    assert_eq!(CurrentIrqArch::is_irq_enabled(), false);
+
     smp_cpu_manager().complete_ap_thread(true);
 
-    kinfo!("Successfully started AP {}", smp_get_processor_id().data());
+    do_ap_start_stage2();
 
-    loop {}
+    CurrentSchedArch::initial_setup_sched_local();
+
+    CurrentSchedArch::enable_sched_local();
+    ProcessManager::arch_idle_func();
+}
+
+#[inline(never)]
+fn do_ap_start_stage2() {
+    kinfo!("Successfully started AP {}", smp_get_processor_id().data());
+    arch_syscall_init().expect("AP core failed to initialize syscall");
 }

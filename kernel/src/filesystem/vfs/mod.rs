@@ -409,6 +409,27 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     fn special_node(&self) -> Option<SpecialNodeData> {
         None
     }
+
+    /// ### 自引用
+    /// 获取具体文件系统节点自身的引用
+    fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    /// ### 父引用
+    /// 获取父目录的引用
+    /// - `Todo`: MountFS层的逻辑
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    /// ### 目录名
+    /// 获取当下目录的具体名称
+    /// - `Impl hint`: 有且仅有此处拷贝一份
+    /// - 有条件应在具体文件系统实现效率更高的方法
+    fn key(&self) -> Result<String, SystemError> {
+        self.parent()?.get_entry_name(self.metadata()?.inode_id)
+    }
 }
 
 impl DowncastArc for dyn IndexNode {

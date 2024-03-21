@@ -422,7 +422,7 @@ impl BusManager {
 
     /// 根据bus的kset找到bus实例
     fn get_bus_by_kset(&self, kset: &Arc<KSet>) -> Option<Arc<dyn Bus>> {
-        return self.kset_bus_map.read().get(kset).map(|bus| bus.clone());
+        return self.kset_bus_map.read().get(kset).cloned();
     }
 
     /// 为bus上的设备选择可能的驱动程序
@@ -444,7 +444,7 @@ impl BusManager {
     ///
     /// Automatically probe for a driver if the bus allows it.
     pub fn probe_device(&self, dev: &Arc<dyn Device>) {
-        let bus = dev.bus().map(|bus| bus.upgrade()).flatten();
+        let bus = dev.bus().and_then(|bus| bus.upgrade());
         if bus.is_none() {
             return;
         }
@@ -497,7 +497,7 @@ fn rescan_devices_helper(dev: &Arc<dyn Device>) -> Result<(), SystemError> {
             // todo: lock device parent
             unimplemented!()
         }
-        device_manager().device_attach(&dev)?;
+        device_manager().device_attach(dev)?;
     }
     return Ok(());
 }
@@ -755,8 +755,7 @@ impl Attribute for DriverAttrUnbind {
 
         let bus = driver
             .bus()
-            .map(|bus| bus.upgrade())
-            .flatten()
+            .and_then(|bus| bus.upgrade())
             .ok_or(SystemError::ENODEV)?;
 
         let s = CStr::from_bytes_with_nul(buf)

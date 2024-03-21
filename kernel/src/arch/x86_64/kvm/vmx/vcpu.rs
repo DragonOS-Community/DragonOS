@@ -67,9 +67,9 @@ pub struct VcpuContextFrame {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum VcpuState {
-    VcpuInv = 0,
-    VcpuPend = 1,
-    VcpuAct = 2,
+    Inv = 0,
+    Pend = 1,
+    Act = 2,
 }
 
 #[derive(Debug)]
@@ -158,7 +158,7 @@ impl VmxVcpu {
                 rip: 0,
                 rflags: 0,
             },
-            vcpu_state: VcpuState::VcpuInv,
+            vcpu_state: VcpuState::Inv,
             mmu: KvmMmu::default(),
             data: VcpuData::alloc()?,
             parent_vm,

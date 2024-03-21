@@ -84,8 +84,7 @@ impl DeviceManager {
         } else {
             let bus = dev
                 .bus()
-                .map(|bus| bus.upgrade())
-                .flatten()
+                .and_then(|bus| bus.upgrade())
                 .ok_or(SystemError::EINVAL)?;
             let mut data = DeviceAttachData::new(dev.clone(), allow_async, false);
             let mut flag = false;
@@ -143,7 +142,7 @@ impl DeviceManager {
         driver: &Arc<dyn Driver>,
         data: &mut DeviceAttachData,
     ) -> Result<bool, SystemError> {
-        if let Some(bus) = driver.bus().map(|bus| bus.upgrade()).flatten() {
+        if let Some(bus) = driver.bus().and_then(|bus| bus.upgrade()) {
             let r = bus.match_device(&data.dev, driver);
 
             if let Err(e) = r {
@@ -203,7 +202,7 @@ impl DeviceManager {
             self.device_links_force_bind(dev);
             driver_manager().driver_bound(dev);
             return Err(e);
-        } else if let Some(bus) = dev.bus().map(|bus| bus.upgrade()).flatten() {
+        } else if let Some(bus) = dev.bus().and_then(|bus| bus.upgrade()) {
             bus.subsystem().bus_notifier().call_chain(
                 BusNotifyEvent::DriverNotBound,
                 Some(dev),
@@ -275,8 +274,7 @@ impl DriverManager {
     pub fn driver_attach(&self, driver: &Arc<dyn Driver>) -> Result<(), SystemError> {
         let bus = driver
             .bus()
-            .map(|bus| bus.upgrade())
-            .flatten()
+            .and_then(|bus| bus.upgrade())
             .ok_or(SystemError::EINVAL)?;
         for dev in bus.subsystem().devices().iter() {
             if self.do_driver_attach(dev, driver) {
@@ -318,8 +316,7 @@ impl DriverManager {
     ) -> Result<bool, SystemError> {
         return driver
             .bus()
-            .map(|bus| bus.upgrade())
-            .flatten()
+            .and_then(|bus| bus.upgrade())
             .unwrap()
             .match_device(device, driver);
     }
@@ -374,7 +371,7 @@ impl DriverManager {
         };
 
         let sysfs_failed = || {
-            if let Some(bus) = device.bus().map(|bus| bus.upgrade()).flatten() {
+            if let Some(bus) = device.bus().and_then(|bus| bus.upgrade()) {
                 bus.subsystem().bus_notifier().call_chain(
                     BusNotifyEvent::DriverNotBound,
                     Some(device),
@@ -457,7 +454,7 @@ impl DriverManager {
     fn add_to_sysfs(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
         let driver = device.driver().ok_or(SystemError::EINVAL)?;
 
-        if let Some(bus) = device.bus().map(|bus| bus.upgrade()).flatten() {
+        if let Some(bus) = device.bus().and_then(|bus| bus.upgrade()) {
             bus.subsystem().bus_notifier().call_chain(
                 BusNotifyEvent::BindDriver,
                 Some(device),
@@ -504,8 +501,7 @@ impl DriverManager {
     ) -> Result<(), SystemError> {
         let bus = device
             .bus()
-            .map(|bus| bus.upgrade())
-            .flatten()
+            .and_then(|bus| bus.upgrade())
             .ok_or(SystemError::EINVAL)?;
         let r = bus.probe(device);
         if r == Err(SystemError::EOPNOTSUPP_OR_ENOTSUP) {
@@ -556,7 +552,7 @@ impl DriverManager {
         let driver = device.driver().unwrap();
         driver.add_device(device.clone());
 
-        if let Some(bus) = device.bus().map(|bus| bus.upgrade()).flatten() {
+        if let Some(bus) = device.bus().and_then(|bus| bus.upgrade()) {
             bus.subsystem().bus_notifier().call_chain(
                 BusNotifyEvent::BoundDriver,
                 Some(device),

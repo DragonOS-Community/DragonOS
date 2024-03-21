@@ -274,7 +274,7 @@ impl IdTable {
     }
 
     pub fn device_number(&self) -> DeviceNumber {
-        return self.id.unwrap_or(DeviceNumber::default());
+        return self.id.unwrap_or_default();
     }
 }
 
@@ -433,8 +433,7 @@ impl DeviceManager {
             .parent()
             .map(|x| x.upgrade())
             .flatten()
-            .map(|x| x.arc_any().cast::<dyn Device>().ok())
-            .flatten();
+            .and_then(|x| x.arc_any().cast::<dyn Device>().ok());
 
         let actual_parent = self.get_device_parent(&device, current_parent)?;
         if let Some(actual_parent) = actual_parent {

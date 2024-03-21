@@ -55,12 +55,8 @@ impl X86_64KVMArch {
     #[deny(clippy::match_single_binding)]
     pub fn kvm_arch_dev_ioctl(cmd: u32, _arg: usize) -> Result<usize, SystemError> {
         // unknown single match binding
-        match cmd {
-            _ => {
-                kerror!("unknown kvm ioctl cmd: {}", cmd);
-                return Err(SystemError::EINVAL);
-            }
-        }
+        kerror!("unknown kvm ioctl cmd: {}", cmd);
+        return Err(SystemError::EINVAL);
     }
 
     pub fn kvm_arch_vcpu_create(id: u32) -> Result<Arc<Mutex<VmxVcpu>>, SystemError> {

@@ -351,7 +351,7 @@ impl ProcessManager {
         new_arch_guard.gsbase = current_arch_guard.gsbase;
         new_arch_guard.fs = current_arch_guard.fs;
         new_arch_guard.gs = current_arch_guard.gs;
-        new_arch_guard.fp_state = current_arch_guard.fp_state.clone();
+        new_arch_guard.fp_state = current_arch_guard.fp_state;
 
         // 拷贝浮点寄存器的状态
         if let Some(fp_state) = current_arch_guard.fp_state.as_ref() {

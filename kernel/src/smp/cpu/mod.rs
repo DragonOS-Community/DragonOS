@@ -13,8 +13,6 @@ use crate::{
 
 use super::{core::smp_get_processor_id, SMPArch};
 
-mod c_adapter;
-
 int_like!(ProcessorId, AtomicProcessorId, u32, AtomicU32);
 
 impl ProcessorId {
@@ -76,6 +74,10 @@ pub struct SmpCpuManager {
     possible_cpus: CpuMask,
     /// 出现的CPU
     present_cpus: CpuMask,
+    /// 出现在系统中的CPU的数量
+    present_cnt: AtomicU32,
+    /// 可用的CPU的数量
+    possible_cnt: AtomicU32,
     /// CPU的状态
     cpuhp_state: PerCpuVar<CpuHpCpuState>,
 }
@@ -96,6 +98,8 @@ impl SmpCpuManager {
             possible_cpus,
             present_cpus,
             cpuhp_state,
+            present_cnt: AtomicU32::new(0),
+            possible_cnt: AtomicU32::new(0),
         }
     }
 
@@ -110,20 +114,48 @@ impl SmpCpuManager {
         // 强制获取mut引用，因为该函数只能在初始化阶段调用
         let p = (self as *const Self as *mut Self).as_mut().unwrap();
 
-        p.possible_cpus.set(cpu, value);
+        if let Some(prev) = p.possible_cpus.set(cpu, value) {
+            if prev != value {
+                if value {
+                    p.possible_cnt
+                        .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+                } else {
+                    p.possible_cnt
+                        .fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
     }
 
     /// 获取可用的CPU
-    #[allow(dead_code)]
     pub fn possible_cpus(&self) -> &CpuMask {
         &self.possible_cpus
+    }
+
+    #[allow(dead_code)]
+    pub fn possible_cpus_count(&self) -> u32 {
+        self.possible_cnt.load(core::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn present_cpus_count(&self) -> u32 {
+        self.present_cnt.load(core::sync::atomic::Ordering::SeqCst)
     }
 
     pub unsafe fn set_present_cpu(&self, cpu: ProcessorId, value: bool) {
         // 强制获取mut引用，因为该函数只能在初始化阶段调用
         let p = (self as *const Self as *mut Self).as_mut().unwrap();
 
-        p.present_cpus.set(cpu, value);
+        if let Some(prev) = p.present_cpus.set(cpu, value) {
+            if prev != value {
+                if value {
+                    p.present_cnt
+                        .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+                } else {
+                    p.present_cnt
+                        .fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
     }
 
     /// 获取CPU的状态

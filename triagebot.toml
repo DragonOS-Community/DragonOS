@@ -74,6 +74,16 @@ trigger_files = [
     "kernel/src/filesystem",
 ]
 
+[autolabel."O-x86_64"]
+trigger_files = [
+    "kernel/src/arch/x86_64",
+]
+
+[autolabel."O-riscv64"]
+trigger_files = [
+    "kernel/src/arch/riscv64",
+]
+
 [autolabel."T-driver"]
 trigger_files = [
     "kernel/src/driver",
@@ -133,6 +143,16 @@ filesystem = [
     "@fslongjin"
 ]
 
+riscv64 = [
+    "@fslongjin"
+]
+
+x86_64 = [
+    "@fslongjin",
+    "@GnoCiYeH",
+    "@Chiichen",
+]
+
 # CI/CD
 infra-ci = [
     "@fslongjin"
@@ -148,3 +168,6 @@ bootstrap = [
 "/kernel/src/filesystem" =                               ["filesystem"]
 "/kernel/src/virt" =                                     ["virtulization"]
 "/kernel/src/arch/x86_64/kvm" =                          ["virtulization"]
+"/kernel/src/arch/x86_64"   =                            ["x86_64"]
+"/kernel/src/arch/riscv64"   =                           ["riscv64"]
+

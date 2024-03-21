@@ -7,6 +7,7 @@ use core::{
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
     driver::base::device::device_number::DeviceNumber,
+    filesystem::vfs::syscall::PosixStatx,
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::syscall::MremapFlags,
     net::syscall::MsgHdr,
@@ -20,6 +21,7 @@ use crate::{
 
 use num_traits::FromPrimitive;
 use system_error::SystemError;
+use uefi::proto::debug;
 
 use crate::{
     arch::{cpu::cpu_reset, interrupt::TrapFrame, MMArch},
@@ -701,6 +703,16 @@ impl Syscall {
                 let path = args[0] as *const u8;
                 let kstat = args[1] as *mut PosixKstat;
                 Self::stat(path, kstat)
+            }
+
+            SYS_STATX => {
+                let fd = args[0] as i32;
+                let path = args[1] as *const u8;
+                let flags = args[2] as u32;
+                let mask = args[3] as u32;
+                let kstat = args[4] as *mut PosixStatx;
+
+                Self::do_statx(fd, path, flags, mask, kstat)
             }
 
             SYS_EPOLL_CREATE => Self::epoll_create(args[0] as i32),

@@ -3,9 +3,11 @@ use core::sync::atomic::AtomicU32;
 use alloc::vec::Vec;
 
 use crate::{
-    include::bindings::bindings::smp_get_total_cpu,
     libs::lazy_init::Lazy,
-    smp::{core::smp_get_processor_id, cpu::ProcessorId},
+    smp::{
+        core::smp_get_processor_id,
+        cpu::{smp_cpu_manager, ProcessorId},
+    },
 };
 
 /// 系统中的CPU数量
@@ -29,8 +31,9 @@ impl PerCpu {
         if CPU_NUM.load(core::sync::atomic::Ordering::SeqCst) != 0 {
             panic!("PerCpu::init() called twice");
         }
-        let cpus = unsafe { smp_get_total_cpu() };
-        assert!(cpus > 0, "PerCpu::init(): smp_get_total_cpu() returned 0");
+        let cpus = smp_cpu_manager().present_cpus_count();
+        assert!(cpus > 0, "PerCpu::init(): present_cpus_count() returned 0");
+
         CPU_NUM.store(cpus, core::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -80,17 +83,19 @@ impl<T> PerCpuVar<T> {
         &self.inner[cpu_id.data() as usize]
     }
 
-    pub fn get_mut(&mut self) -> &mut T {
+    pub fn get_mut(&self) -> &mut T {
         let cpu_id = smp_get_processor_id();
-        &mut self.inner[cpu_id.data() as usize]
+        unsafe {
+            &mut (self as *const Self as *mut Self).as_mut().unwrap().inner[cpu_id.data() as usize]
+        }
     }
 
     pub unsafe fn force_get(&self, cpu_id: ProcessorId) -> &T {
         &self.inner[cpu_id.data() as usize]
     }
 
-    pub unsafe fn force_get_mut(&mut self, cpu_id: ProcessorId) -> &mut T {
-        &mut self.inner[cpu_id.data() as usize]
+    pub unsafe fn force_get_mut(&self, cpu_id: ProcessorId) -> &mut T {
+        &mut (self as *const Self as *mut Self).as_mut().unwrap().inner[cpu_id.data() as usize]
     }
 }
 

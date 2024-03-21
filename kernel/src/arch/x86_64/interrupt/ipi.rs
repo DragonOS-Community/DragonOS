@@ -160,7 +160,7 @@ pub fn send_ipi(kind: IpiKind, target: IpiTarget) {
 }
 
 /// 发送smp初始化IPI
-pub fn ipi_send_smp_init() -> Result<(), SystemError> {
+pub fn ipi_send_smp_init() {
     let target = ArchIpiTarget::Other;
     let icr = if CurrentApic.x2apic_enabled() {
         x86::apic::Icr::for_x2apic(
@@ -186,7 +186,6 @@ pub fn ipi_send_smp_init() -> Result<(), SystemError> {
         )
     };
     CurrentApic.write_icr(icr);
-    return Ok(());
 }
 
 /// 发送smp启动IPI

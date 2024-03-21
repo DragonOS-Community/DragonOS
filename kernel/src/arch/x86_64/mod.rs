@@ -1,7 +1,6 @@
 #[macro_use]
 pub mod asm;
 mod acpi;
-mod c_adapter;
 pub mod cpu;
 pub mod driver;
 pub mod elf;

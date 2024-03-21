@@ -107,6 +107,12 @@ impl<V: Clone + Copy, T> NotifierChain<V, T> {
 #[derive(Debug)]
 pub struct AtomicNotifierChain<V: Clone + Copy, T>(SpinLock<NotifierChain<V, T>>);
 
+impl<V: Clone + Copy, T> Default for AtomicNotifierChain<V, T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<V: Clone + Copy, T> AtomicNotifierChain<V, T> {
     pub fn new() -> Self {
         Self(SpinLock::new(NotifierChain::<V, T>::new()))

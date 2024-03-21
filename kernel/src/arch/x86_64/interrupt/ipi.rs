@@ -40,9 +40,9 @@ impl From<IpiKind> for ArchIpiKind {
     }
 }
 
-impl Into<u8> for ArchIpiKind {
-    fn into(self) -> u8 {
-        match self {
+impl From<ArchIpiKind> for u8 {
+    fn from(value: ArchIpiKind) -> Self {
+        match value {
             ArchIpiKind::KickCpu => IPI_NUM_KICK_CPU.data() as u8,
             ArchIpiKind::FlushTLB => IPI_NUM_FLUSH_TLB.data() as u8,
             ArchIpiKind::SpecVector(vec) => (vec.data() & 0xFF) as u8,

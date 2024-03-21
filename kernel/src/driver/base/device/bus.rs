@@ -804,8 +804,7 @@ impl Attribute for DriverAttrBind {
 
         let bus = driver
             .bus()
-            .map(|bus| bus.upgrade())
-            .flatten()
+            .and_then(|bus| bus.upgrade())
             .ok_or(SystemError::ENODEV)?;
         let device = bus
             .find_device_by_name(

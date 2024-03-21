@@ -140,7 +140,7 @@ impl dyn Driver {
     ) -> Option<Arc<dyn Device>> {
         self.devices()
             .into_iter()
-            .find(|dev| matcher.match_device(&dev, data))
+            .find(|dev| matcher.match_device(dev, data))
     }
 
     /// 根据设备名称查找绑定到驱动的设备

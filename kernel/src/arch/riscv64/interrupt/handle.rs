@@ -48,7 +48,7 @@ fn riscv64_do_interrupt(_trap_frame: &mut TrapFrame) {
 fn riscv64_do_exception(trap_frame: &mut TrapFrame) {
     kdebug!(
         "riscv64_do_exception: from_user: {}",
-        trap_frame.from_user()
+        trap_frame.is_from_user()
     );
     let code = trap_frame.cause.code();
 

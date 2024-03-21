@@ -659,14 +659,7 @@ impl BinaryLoader for ElfLoader {
 
             let vaddr = VirtAddr::new(seg_to_load.p_vaddr.try_into().unwrap());
 
-            if !first_pt_load {
-                elf_map_flags.insert(MapFlags::MAP_FIXED_NOREPLACE);
-            } else if elf_type == ElfType::Executable {
-                /*
-                 * This logic is run once for the first LOAD Program
-                 * Header for ET_EXEC binaries. No special handling
-                 * is needed.
-                 */
+            if !first_pt_load || elf_type == ElfType::Executable {
                 elf_map_flags.insert(MapFlags::MAP_FIXED_NOREPLACE);
             } else if elf_type == ElfType::DSO {
                 // TODO: 支持动态链接

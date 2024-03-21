@@ -367,8 +367,8 @@ impl TableMatcher {
         }
 
         let table_map_size = self.table.map_size();
-        let vendor_table_vaddr: Option<VirtAddr>;
-        if table_map_size > 0 {
+
+        let vendor_table_vaddr: Option<VirtAddr> = if table_map_size > 0 {
             let table_paddr: PhysAddr = PhysAddr::new(table.vendor_table as usize);
             let vaddr = EarlyIoRemap::map_not_aligned(table_paddr, table_map_size, true);
 
@@ -376,10 +376,10 @@ impl TableMatcher {
                 return Some(Err(e));
             }
 
-            vendor_table_vaddr = Some(vaddr.unwrap());
+            Some(vaddr.unwrap())
         } else {
-            vendor_table_vaddr = None;
-        }
+            None
+        };
 
         let r = self.table.post_process(vendor_table_vaddr, table);
 

@@ -220,9 +220,9 @@ impl Sub<i32> for LineIndex {
     }
 }
 
-impl Into<i32> for LineIndex {
-    fn into(self) -> i32 {
-        self.0
+impl From<LineIndex> for i32 {
+    fn from(val: LineIndex) -> Self {
+        val.0
     }
 }
 impl Into<u32> for LineIndex {
@@ -463,7 +463,7 @@ impl TextuiCharChromatic {
                 }
 
                 unsafe {
-                    addr = (addr.offset(1)) as *mut u32;
+                    addr = addr.offset(1);
                 }
             }
         }

@@ -72,7 +72,7 @@ impl ScmBufferInfo {
     ///
     /// - `Result<Self, SystemError>` 创建成功返回新的帧缓冲区结构体，创建失败返回错误码
     pub fn new(mut buf_type: ScmBufferFlag) -> Result<Self, SystemError> {
-        if unlikely(SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) == false) {
+        if unlikely(!SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst)) {
             let mut device_buffer = video_refresh_manager().device_buffer().clone();
             buf_type.remove(ScmBufferFlag::SCM_BF_DB);
             buf_type.insert(ScmBufferFlag::SCM_BF_FB);
@@ -143,16 +143,10 @@ impl ScmBufferInfo {
     }
 
     pub fn is_double_buffer(&self) -> bool {
-        match &self.buf {
-            ScmBuffer::DoubleBuffer(_) => true,
-            _ => false,
-        }
+        matches!(&self.buf, ScmBuffer::DoubleBuffer(_))
     }
     pub fn is_device_buffer(&self) -> bool {
-        match &self.buf {
-            ScmBuffer::DeviceBuffer(_) => true,
-            _ => false,
-        }
+        matches!(&self.buf, ScmBuffer::DeviceBuffer(_))
     }
 
     pub fn copy_from_nonoverlapping(&mut self, src: &ScmBufferInfo) {
@@ -393,7 +387,7 @@ pub fn scm_disable_put_to_window() {
     // mm之前要停止往窗口打印信息时，因为没有动态内存分配(rwlock与otion依然能用，但是textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
     if CURRENT_FRAMEWORK.read().is_none() {
         textui_disable_put_to_window();
-        assert!(textui_is_enable_put_to_window() == false);
+        assert!(!textui_is_enable_put_to_window());
     } else {
         let r = CURRENT_FRAMEWORK
             .write()

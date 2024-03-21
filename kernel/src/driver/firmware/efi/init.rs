@@ -1,4 +1,4 @@
-use core::{intrinsics::unlikely, mem::size_of};
+use core::{hint::spin_loop, intrinsics::unlikely, mem::size_of};
 
 use system_error::SystemError;
 use uefi_raw::table::boot::{MemoryAttribute, MemoryType};
@@ -37,7 +37,9 @@ pub fn efi_init() {
         // 所以如果我们无法访问它，那么继续进行下去就没有什么意义了
 
         kerror!("Failed to initialize early memory map");
-        loop {}
+        loop {
+            spin_loop();
+        }
     }
     // kdebug!("NNNN");
     // kwarn!("BBBB, e:{:?}", SystemError::EINVAL);

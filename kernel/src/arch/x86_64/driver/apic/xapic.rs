@@ -91,9 +91,9 @@ pub enum XApicOffset {
     LOCAL_APIC_OFFSET_Local_APIC_CLKDIV = 0x3e0,
 }
 
-impl Into<u32> for XApicOffset {
-    fn into(self) -> u32 {
-        self as u32
+impl From<XApicOffset> for u32 {
+    fn from(val: XApicOffset) -> Self {
+        val as u32
     }
 }
 

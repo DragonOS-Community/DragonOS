@@ -4,9 +4,9 @@ use alloc::{boxed::Box, collections::LinkedList, sync::Arc, vec::Vec};
 
 use crate::{
     arch::cpu::current_cpu_id,
-    include::bindings::bindings::MAX_CPU_NUM,
     kBUG, kdebug,
     libs::spinlock::SpinLock,
+    mm::percpu::PerCpu,
     process::{ProcessControlBlock, ProcessFlags, ProcessManager},
     smp::cpu::ProcessorId,
 };
@@ -108,7 +108,7 @@ impl SchedulerRT {
         };
 
         // 为每个cpu核心创建队列
-        for cpu_id in 0..MAX_CPU_NUM {
+        for cpu_id in 0..PerCpu::MAX_CPU_NUM {
             result.cpu_queue.push(Vec::new());
             // 每个CPU有MAX_RT_PRIO个优先级队列
             for _ in 0..SchedulerRT::MAX_RT_PRIO {
@@ -116,7 +116,7 @@ impl SchedulerRT {
             }
         }
         // 为每个cpu核心创建负载统计队列
-        for _ in 0..MAX_CPU_NUM {
+        for _ in 0..PerCpu::MAX_CPU_NUM {
             result
                 .load_list
                 .push(Box::leak(Box::new(LinkedList::new())));

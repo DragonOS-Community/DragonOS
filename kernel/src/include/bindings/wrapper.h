@@ -28,4 +28,3 @@
 #include <time/clocksource.h>
 #include <time/sleep.h>
 #include <common/errno.h>
-#include <common/cpu.h>

@@ -253,7 +253,7 @@ pub trait BlockDevice: Device {
             let buf_begin = range.origin_begin() - offset; // 本次读操作的起始位置/已经读了这么多字节
             let buf_end = range.origin_end() - offset;
             let buf_slice = &buf[buf_begin..buf_end];
-            let count: usize = (range.lba_end - range.lba_start).try_into().unwrap();
+            let count: usize = range.lba_end - range.lba_start;
             let full = multi && range.is_multi() || !multi && range.is_full();
 
             if full {
@@ -293,7 +293,7 @@ pub trait BlockDevice: Device {
             let buf_begin = range.origin_begin() - offset; // 本次读操作的起始位置/已经读了这么多字节
             let buf_end = range.origin_end() - offset;
             let buf_slice = &mut buf[buf_begin..buf_end];
-            let count: usize = (range.lba_end - range.lba_start).try_into().unwrap();
+            let count: usize = range.lba_end - range.lba_start;
             let full = multi && range.is_multi() || !multi && range.is_full();
 
             // 读取整个block作为有效数据
@@ -352,8 +352,7 @@ impl BlockDeviceOps {
         for index in
             ((DEV_MAJOR_DYN_EXT_END.data() + 1)..(DEV_MAJOR_DYN_EXT_START.data() + 1)).rev()
         {
-            if let Some(blockdevss) = blockdevs.get(Self::major_to_index(Major::new(index as u32)))
-            {
+            if let Some(blockdevss) = blockdevs.get(Self::major_to_index(Major::new(index))) {
                 let mut flag = true;
                 for item in blockdevss {
                     if item.device_number().major() == Major::new(index) {

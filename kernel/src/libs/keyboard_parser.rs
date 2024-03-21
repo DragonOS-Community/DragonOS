@@ -324,13 +324,12 @@ impl TypeOneFSMState {
             col = true;
         }
 
-        if scancode_status.caps_lock {
-            if (0x10..=0x19).contains(&index)
+        if scancode_status.caps_lock
+            && ((0x10..=0x19).contains(&index)
                 || (0x1e..=0x26).contains(&index)
-                || (0x2c..=0x32).contains(&index)
-            {
-                col = !col;
-            }
+                || (0x2c..=0x32).contains(&index))
+        {
+            col = !col;
         }
 
         let mut ch = TYPE1_KEY_CODE_MAPTABLE[col as usize + 2 * index as usize];

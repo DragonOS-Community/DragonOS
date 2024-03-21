@@ -71,6 +71,6 @@ impl TSSManager {
             | (((vaddr >> 16) & 0xff) << 32)
             | (0x89 << 40)
             | (((vaddr >> 24) & 0xff) << 56);
-        gdt[index as usize + 1] = ((vaddr >> 32) & 0xffffffff) | 0;
+        gdt[index as usize + 1] = (vaddr >> 32) & 0xffffffff;
     }
 }

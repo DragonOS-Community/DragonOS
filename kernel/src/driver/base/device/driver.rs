@@ -138,13 +138,9 @@ impl dyn Driver {
         matcher: &dyn DeviceMatcher<T>,
         data: T,
     ) -> Option<Arc<dyn Device>> {
-        for dev in self.devices() {
-            if matcher.match_device(&dev, data) {
-                return Some(dev);
-            }
-        }
-
-        return None;
+        self.devices()
+            .into_iter()
+            .find(|dev| matcher.match_device(&dev, data))
     }
 
     /// 根据设备名称查找绑定到驱动的设备
@@ -174,17 +170,13 @@ impl DriverManager {
     ///
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/driver.c#222
     pub fn register(&self, driver: Arc<dyn Driver>) -> Result<(), SystemError> {
-        let bus = driver
-            .bus()
-            .map(|bus| bus.upgrade())
-            .flatten()
-            .ok_or_else(|| {
-                kerror!(
-                    "DriverManager::register() failed: driver.bus() is None. Driver: '{:?}'",
-                    driver.name()
-                );
-                SystemError::EINVAL
-            })?;
+        let bus = driver.bus().and_then(|bus| bus.upgrade()).ok_or_else(|| {
+            kerror!(
+                "DriverManager::register() failed: driver.bus() is None. Driver: '{:?}'",
+                driver.name()
+            );
+            SystemError::EINVAL
+        })?;
 
         let drv_name = driver.name();
         let other = bus.find_driver_by_name(&drv_name);
@@ -297,12 +289,8 @@ impl DriverMatcher<&str> for DriverMatchName {
 /// to speed up boot process while we are validating the rest of the
 /// drivers.
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub enum DriverProbeType {
-    /// Used by drivers that work equally well
-    /// whether probed synchronously or asynchronously.
-    DefaultStrategy,
-
     /// Drivers for "slow" devices which
     /// probing order is not essential for booting the system may
     /// opt into executing their probes asynchronously.
@@ -313,10 +301,9 @@ pub enum DriverProbeType {
     /// device registration (with the exception of -EPROBE_DEFER
     /// handling - re-probing always ends up being done asynchronously).
     ForceSync,
-}
 
-impl Default for DriverProbeType {
-    fn default() -> Self {
-        DriverProbeType::DefaultStrategy
-    }
+    #[default]
+    /// Used by drivers that work equally well
+    /// whether probed synchronously or asynchronously.
+    DefaultStrategy,
 }

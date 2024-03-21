@@ -1,4 +1,3 @@
-mod c_adapter;
 pub(super) mod entry;
 mod handle;
 pub mod ipi;

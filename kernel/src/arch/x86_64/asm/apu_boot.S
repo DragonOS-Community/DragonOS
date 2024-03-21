@@ -20,7 +20,7 @@ _apu_boot_base = .
 
     // 设置栈指针
     movl $(_apu_boot_tmp_stack_end - _apu_boot_base), %esp
-    
+
     // 计算ap处理器引导程序的基地址
     mov %cs, %ax
     movzx %ax, %esi

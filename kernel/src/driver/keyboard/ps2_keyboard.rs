@@ -181,7 +181,7 @@ impl IrqHandler for Ps2KeyboardIrqHandler {
         let status = unsafe { CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_STATUS.into()) };
         let status = Ps2StatusRegister::from(status);
         if !status.outbuf_full() {
-            return Ok(IrqReturn::NotHandled);
+            return Ok(IrqReturn::Handled);
         }
 
         let input = unsafe { CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_DATA.into()) };

@@ -1,27 +1,38 @@
 use core::{
     arch::asm,
     hint::spin_loop,
-    sync::atomic::{compiler_fence, AtomicBool, Ordering},
+    sync::atomic::{compiler_fence, fence, AtomicBool, Ordering},
 };
 
 use kdepends::memoffset::offset_of;
 use system_error::SystemError;
 
 use crate::{
-    arch::process::table::TSSManager,
+    arch::{mm::LowAddressRemapping, process::table::TSSManager, MMArch},
     exception::InterruptArch,
-    include::bindings::bindings::{cpu_core_info, smp_init},
     kdebug,
-    libs::rwlock::RwLock,
-    mm::percpu::PerCpu,
+    libs::{cpumask::CpuMask, rwlock::RwLock},
+    mm::{percpu::PerCpu, MemoryManagementArch, PhysAddr, VirtAddr, IDLE_PROCESS_ADDRESS_SPACE},
     process::ProcessManager,
-    smp::{core::smp_get_processor_id, cpu::ProcessorId, SMPArch},
+    smp::{
+        core::smp_get_processor_id,
+        cpu::{smp_cpu_manager, CpuHpCpuState, ProcessorId, SmpCpuManager},
+        init::smp_ap_start_stage2,
+        SMPArch,
+    },
 };
 
-use super::{acpi::early_acpi_boot_init, CurrentIrqArch};
+use super::{
+    acpi::early_acpi_boot_init,
+    interrupt::ipi::{ipi_send_smp_init, ipi_send_smp_startup},
+    CurrentIrqArch,
+};
 
 extern "C" {
-    fn smp_ap_start_stage2();
+    /// AP处理器启动时，会将CR3设置为这个值
+    pub static mut __APU_START_CR3: u64;
+    fn _apu_boot_start();
+    fn _apu_boot_end();
 }
 
 pub(super) static X86_64_SMP_MANAGER: X86_64SmpManager = X86_64SmpManager::new();
@@ -35,7 +46,17 @@ struct ApStartStackInfo {
 #[no_mangle]
 unsafe extern "C" fn smp_ap_start() -> ! {
     CurrentIrqArch::interrupt_disable();
-    let vaddr = cpu_core_info[smp_get_processor_id().data() as usize].stack_start as usize;
+    let vaddr = if let Some(t) = smp_cpu_manager()
+        .cpuhp_state(smp_get_processor_id())
+        .thread()
+    {
+        t.kernel_stack().stack_max_address().data() - 16
+    } else {
+        // 没有设置ap核心的栈，那么就进入死循环。
+        loop {
+            spin_loop();
+        }
+    };
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     let v = ApStartStackInfo { vaddr };
     smp_init_switch_stack(&v);
@@ -49,7 +70,7 @@ unsafe extern "sysv64" fn smp_init_switch_stack(st: &ApStartStackInfo) -> ! {
         jmp {stage1}
     "), 
         off_rsp = const(offset_of!(ApStartStackInfo, vaddr)),
-        stage1 = sym smp_ap_start_stage1, 
+        stage1 = sym smp_ap_start_stage1,
     options(noreturn));
 }
 
@@ -141,8 +162,32 @@ impl X86_64SmpManager {
     pub fn build_cpu_map(&self) -> Result<(), SystemError> {
         // 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/arch/ia64/kernel/smpboot.c?fi=smp_build_cpu_map#496
         // todo!("build_cpu_map")
+        unsafe {
+            smp_cpu_manager().set_possible_cpu(ProcessorId::new(0), true);
+            smp_cpu_manager().set_present_cpu(ProcessorId::new(0), true);
+            smp_cpu_manager().set_online_cpu(ProcessorId::new(0));
+        }
+
+        for cpu in 1..SMP_BOOT_DATA.cpu_count() {
+            unsafe {
+                smp_cpu_manager().set_possible_cpu(ProcessorId::new(cpu as u32), true);
+                smp_cpu_manager().set_present_cpu(ProcessorId::new(cpu as u32), true);
+            }
+        }
+
+        print_cpus("possible", smp_cpu_manager().possible_cpus());
+        print_cpus("present", smp_cpu_manager().present_cpus());
         return Ok(());
     }
+}
+
+fn print_cpus(s: &str, mask: &CpuMask) {
+    let mut v = vec![];
+    for cpu in mask.iter_cpu() {
+        v.push(cpu.data());
+    }
+
+    kdebug!("{s}: cpus: {v:?}\n");
 }
 
 pub struct X86_64SMPArch;
@@ -155,11 +200,87 @@ impl SMPArch for X86_64SMPArch {
         return Ok(());
     }
 
-    #[inline(never)]
-    fn init() -> Result<(), SystemError> {
-        x86::fence::mfence();
-        unsafe { smp_init() };
-        x86::fence::mfence();
+    fn post_init() -> Result<(), SystemError> {
+        // AP核心启动完毕，取消低地址映射
+        unsafe {
+            LowAddressRemapping::unmap_at_low_address(
+                &mut IDLE_PROCESS_ADDRESS_SPACE()
+                    .write_irqsave()
+                    .user_mapper
+                    .utable,
+                true,
+            )
+        }
         return Ok(());
+    }
+
+    fn start_cpu(cpu_id: ProcessorId, cpu_hpstate: &CpuHpCpuState) -> Result<(), SystemError> {
+        kdebug!("start_cpu: cpu_id: {:#x}\n", cpu_id.data());
+
+        Self::copy_smp_start_code();
+
+        ipi_send_smp_init();
+        fence(Ordering::SeqCst);
+        ipi_send_smp_startup(cpu_id);
+        fence(Ordering::SeqCst);
+        ipi_send_smp_startup(cpu_id);
+        fence(Ordering::SeqCst);
+
+        return Ok(());
+    }
+}
+
+impl X86_64SMPArch {
+    const SMP_CODE_START: usize = 0x20000;
+    /// 复制SMP启动代码到0x20000处
+    fn copy_smp_start_code() -> (VirtAddr, usize) {
+        let apu_boot_size = Self::start_code_size();
+
+        fence(Ordering::SeqCst);
+        unsafe {
+            core::ptr::copy(
+                _apu_boot_start as *const u8,
+                Self::SMP_CODE_START as *mut u8,
+                apu_boot_size,
+            )
+        };
+        fence(Ordering::SeqCst);
+
+        return (VirtAddr::new(Self::SMP_CODE_START), apu_boot_size);
+    }
+
+    fn start_code_size() -> usize {
+        let apu_boot_start = _apu_boot_start as usize;
+        let apu_boot_end = _apu_boot_end as usize;
+        let apu_boot_size = apu_boot_end - apu_boot_start;
+        return apu_boot_size;
+    }
+}
+
+impl SmpCpuManager {
+    pub fn arch_init(_boot_cpu: ProcessorId) {
+        assert!(smp_get_processor_id().data() == 0);
+        // 写入APU_START_CR3，这个值会在AP处理器启动时设置到CR3寄存器
+        let addr = IDLE_PROCESS_ADDRESS_SPACE()
+            .read_irqsave()
+            .user_mapper
+            .utable
+            .table()
+            .phys();
+        let vaddr = unsafe {
+            MMArch::phys_2_virt(PhysAddr::new(&mut __APU_START_CR3 as *mut u64 as usize)).unwrap()
+        };
+        let ptr = vaddr.data() as *mut u64;
+        unsafe { *ptr = addr.data() as u64 };
+
+        // 添加低地址映射
+        unsafe {
+            LowAddressRemapping::remap_at_low_address(
+                &mut IDLE_PROCESS_ADDRESS_SPACE()
+                    .write_irqsave()
+                    .user_mapper
+                    .utable,
+            )
+        };
     }
 }

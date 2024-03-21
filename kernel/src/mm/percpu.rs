@@ -80,17 +80,19 @@ impl<T> PerCpuVar<T> {
         &self.inner[cpu_id.data() as usize]
     }
 
-    pub fn get_mut(&mut self) -> &mut T {
+    pub fn get_mut(&self) -> &mut T {
         let cpu_id = smp_get_processor_id();
-        &mut self.inner[cpu_id.data() as usize]
+        unsafe {
+            &mut (self as *const Self as *mut Self).as_mut().unwrap().inner[cpu_id.data() as usize]
+        }
     }
 
     pub unsafe fn force_get(&self, cpu_id: ProcessorId) -> &T {
         &self.inner[cpu_id.data() as usize]
     }
 
-    pub unsafe fn force_get_mut(&mut self, cpu_id: ProcessorId) -> &mut T {
-        &mut self.inner[cpu_id.data() as usize]
+    pub unsafe fn force_get_mut(&self, cpu_id: ProcessorId) -> &mut T {
+        &mut (self as *const Self as *mut Self).as_mut().unwrap().inner[cpu_id.data() as usize]
     }
 }
 

@@ -1,0 +1,25 @@
+{
+  "name": "test_statx",
+  "version": "0.1.0",
+  "description": "statx测试",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "apps/statx_test"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "envs": [],
+  "build_once": false,
+  "install_once": false
+}

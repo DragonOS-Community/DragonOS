@@ -13,6 +13,7 @@ use crate::{
 
 use num_traits::FromPrimitive;
 use system_error::SystemError;
+use uefi::proto::debug;
 
 use crate::{
     arch::{cpu::cpu_reset, interrupt::TrapFrame, MMArch},
@@ -699,11 +700,12 @@ impl Syscall {
             #[cfg(target_arch = "x86_64")]
             SYS_STATX => {
                 let fd = args[0] as i32;
-                let path = args[0] as *const u8;
+                let path = args[1] as *const u8;
                 let flags = args[2] as u32;
                 let mask = args[3] as u32;
                 let kstat = args[4] as *mut Statx;
                 let vaddr = VirtAddr::new(kstat as usize);
+                
                 match verify_area(vaddr, core::mem::size_of::<Statx>()) {
                     Ok(_) => Self::do_statx(fd, path, flags, mask, kstat),
                     Err(e) => Err(e),
@@ -719,7 +721,7 @@ impl Syscall {
                 args[2] as i32,
                 VirtAddr::new(args[3]),
             ),
-
+            
             SYS_EPOLL_WAIT => Self::epoll_wait(
                 args[0] as i32,
                 VirtAddr::new(args[1]),

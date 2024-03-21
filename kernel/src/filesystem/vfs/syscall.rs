@@ -144,6 +144,7 @@ impl PosixKstat {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 /// # 文件信息结构体X
 pub struct Statx {
     /* 0x00 */
@@ -1116,20 +1117,22 @@ impl Syscall {
         }
 
         let flags = FileMode::from_bits_truncate(flags);
-        Self::open(path, flags.bits(), ModeType::empty().bits, true)?;
+        let ofd = Self::open(path, flags.bits(), ModeType::empty().bits, true)?;
 
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
         let file = fd_table_guard
-            .get_file_by_fd(fd)
+            .get_file_by_fd(ofd as i32)
             .ok_or(SystemError::EBADF)?;
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
+        let mut writer = UserBufferWriter::new(usr_kstat, size_of::<Statx>(), true)?;
         let mut tmp: Statx = Statx::new();
         // 获取文件信息
         let metadata = file.lock().metadata()?;
 
         tmp.stx_mask |= StxMask::STATX_BASIC_STATS;
+        tmp.stx_blksize = metadata.blk_size as u32;
         if is_contain(mask, StxMask::STATX_MODE) || is_contain(mask, StxMask::STATX_TYPE) {
             tmp.stx_mode = metadata.mode;
         }
@@ -1162,9 +1165,9 @@ impl Syscall {
             tmp.stx_size = metadata.size;
         }
         if is_contain(mask, StxMask::STATX_BLOCKS) {
-            tmp.stx_blksize = metadata.blk_size as u32;
+            tmp.stx_blocks = metadata.blocks as u64;
         }
-        if is_contain(mask, StxMask::STATX_BASIC_STATS) {}
+        
         if is_contain(mask, StxMask::STATX_BTIME) {
             // btime是文件创建时间
             tmp.stx_btime.tv_sec = metadata.ctime.tv_sec;
@@ -1172,15 +1175,17 @@ impl Syscall {
         }
         if is_contain(mask, StxMask::STATX_ALL) {
             tmp.stx_attributes = StxAttributes::STATX_ATTR_APPEND;
-            tmp.stx_blocks = metadata.blocks as u64;
             tmp.stx_attributes_mask |=
                 StxAttributes::STATX_ATTR_AUTOMOUNT | StxAttributes::STATX_ATTR_DAX;
-
             tmp.stx_dev_major = metadata.dev_id as u32;
             tmp.stx_dev_minor = metadata.dev_id as u32; //
             tmp.stx_rdev_major = metadata.raw_dev.data() as u32;
             tmp.stx_rdev_minor = metadata.raw_dev.data() as u32;
-            tmp.stx_mnt_id = 0;
+        }
+        if is_contain(mask,StxMask::STATX_MNT_ID){
+             tmp.stx_mnt_id = 0;
+        }
+        if is_contain(mask,StxMask::STATX_DIOALIGN){
             tmp.stx_dio_mem_align = 0;
             tmp.stx_dio_offset_align = 0;
         }
@@ -1200,10 +1205,7 @@ impl Syscall {
         if usr_kstat.is_null() {
             return Err(SystemError::EFAULT);
         }
-        unsafe {
-            *usr_kstat = tmp;
-        }
-
+        writer.copy_one_to_user(&tmp, 0)?;
         Self::close(fd as usize).ok();
         return Ok(0);
     }

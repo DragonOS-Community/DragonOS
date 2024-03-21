@@ -465,7 +465,7 @@ impl DeviceManager {
         }
 
         // 通知客户端有关设备添加的信息。此调用必须在 dpm_sysfs_add() 之后且在 kobject_uevent() 之前执行。
-        if let Some(bus) = device.bus().and_then(|bus| bus.upgrade()){
+        if let Some(bus) = device.bus().and_then(|bus| bus.upgrade()) {
             bus.subsystem().bus_notifier().call_chain(
                 bus::BusNotifyEvent::AddDevice,
                 Some(&device),
@@ -597,7 +597,7 @@ impl DeviceManager {
         sysfs_instance().create_link(Some(&dev_kobj), &subsys_kobj, "subsystem".to_string())?;
 
         // todo: 这里需要处理class的parent逻辑, 添加device链接
-        if let Some(parent) = dev.parent().and_then(|x| x.upgrade()){
+        if let Some(parent) = dev.parent().and_then(|x| x.upgrade()) {
             let parent_kobj = parent.clone() as Arc<dyn KObject>;
             sysfs_instance()
                 .create_link(Some(&dev_kobj), &parent_kobj, "device".to_string())

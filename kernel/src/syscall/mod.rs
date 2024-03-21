@@ -705,19 +705,14 @@ impl Syscall {
                 Self::stat(path, kstat)
             }
 
-            #[cfg(target_arch = "x86_64")]
             SYS_STATX => {
                 let fd = args[0] as i32;
                 let path = args[1] as *const u8;
                 let flags = args[2] as u32;
                 let mask = args[3] as u32;
                 let kstat = args[4] as *mut PosixStatx;
-                let vaddr = VirtAddr::new(kstat as usize);
 
-                match verify_area(vaddr, core::mem::size_of::<PosixStatx>()) {
-                    Ok(_) => Self::do_statx(fd, path, flags, mask, kstat),
-                    Err(e) => Err(e),
-                }
+                Self::do_statx(fd, path, flags, mask, kstat)
             }
 
             SYS_EPOLL_CREATE => Self::epoll_create(args[0] as i32),

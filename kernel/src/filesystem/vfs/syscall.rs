@@ -151,7 +151,7 @@ impl PosixKstat {
 /// # 文件信息结构体X
 pub struct PosixStatx {
     /* 0x00 */
-    stx_mask: StxMask,
+    stx_mask: PosixStatxMask,
     /// 文件系统块大小
     stx_blksize: u32,
     /// Flags conveying information about the file [uncond]
@@ -204,7 +204,7 @@ pub struct PosixStatx {
 impl PosixStatx {
     fn new() -> Self {
         Self {
-            stx_mask: StxMask::STATX_BASIC_STATS,
+            stx_mask: PosixStatxMask::STATX_BASIC_STATS,
             stx_blksize: 0,
             stx_attributes: StxAttributes::STATX_ATTR_APPEND,
             stx_nlink: 0,
@@ -243,7 +243,7 @@ impl PosixStatx {
 }
 
 bitflags! {
-    pub struct StxMask: u32{
+    pub struct PosixStatxMask: u32{
         ///  Want stx_mode & S_IFMT
         const STATX_TYPE = 0x00000001;
 
@@ -1111,11 +1111,13 @@ impl Syscall {
         mask: u32,
         usr_kstat: *mut PosixStatx,
     ) -> Result<usize, SystemError> {
-        let is_contain = |mask0: u32, mask1: StxMask| {
-            return (mask0 & mask1.bits) == mask1.bits;
-        };
+        if usr_kstat.is_null() {
+            return Err(SystemError::EFAULT);
+        }
 
-        if is_contain(mask, StxMask::STATX_RESERVED) {
+        let mask = PosixStatxMask::from_bits_truncate(mask);
+
+        if mask.contains(PosixStatxMask::STATX_RESERVED) {
             return Err(SystemError::ENAVAIL);
         }
 
@@ -1134,49 +1136,49 @@ impl Syscall {
         // 获取文件信息
         let metadata = file.lock().metadata()?;
 
-        tmp.stx_mask |= StxMask::STATX_BASIC_STATS;
+        tmp.stx_mask |= PosixStatxMask::STATX_BASIC_STATS;
         tmp.stx_blksize = metadata.blk_size as u32;
-        if is_contain(mask, StxMask::STATX_MODE) || is_contain(mask, StxMask::STATX_TYPE) {
+        if mask.contains(PosixStatxMask::STATX_MODE) || mask.contains(PosixStatxMask::STATX_TYPE) {
             tmp.stx_mode = metadata.mode;
         }
-        if is_contain(mask, StxMask::STATX_NLINK) {
+        if mask.contains(PosixStatxMask::STATX_NLINK) {
             tmp.stx_nlink = metadata.nlinks as u32;
         }
-        if is_contain(mask, StxMask::STATX_UID) {
+        if mask.contains(PosixStatxMask::STATX_UID) {
             tmp.stx_uid = metadata.uid as u32;
         }
-        if is_contain(mask, StxMask::STATX_GID) {
+        if mask.contains(PosixStatxMask::STATX_GID) {
             tmp.stx_gid = metadata.gid as u32;
         }
-        if is_contain(mask, StxMask::STATX_ATIME) {
+        if mask.contains(PosixStatxMask::STATX_ATIME) {
             tmp.stx_atime.tv_sec = metadata.atime.tv_sec;
             tmp.stx_atime.tv_nsec = metadata.atime.tv_nsec;
         }
-        if is_contain(mask, StxMask::STATX_MTIME) {
+        if mask.contains(PosixStatxMask::STATX_MTIME) {
             tmp.stx_mtime.tv_sec = metadata.ctime.tv_sec;
             tmp.stx_mtime.tv_nsec = metadata.ctime.tv_nsec;
         }
-        if is_contain(mask, StxMask::STATX_CTIME) {
+        if mask.contains(PosixStatxMask::STATX_CTIME) {
             // ctime是文件上次修改状态的时间
             tmp.stx_ctime.tv_sec = metadata.mtime.tv_sec;
             tmp.stx_ctime.tv_nsec = metadata.mtime.tv_nsec;
         }
-        if is_contain(mask, StxMask::STATX_INO) {
+        if mask.contains(PosixStatxMask::STATX_INO) {
             tmp.stx_inode = metadata.inode_id.into() as u64;
         }
-        if is_contain(mask, StxMask::STATX_SIZE) {
+        if mask.contains(PosixStatxMask::STATX_SIZE) {
             tmp.stx_size = metadata.size;
         }
-        if is_contain(mask, StxMask::STATX_BLOCKS) {
+        if mask.contains(PosixStatxMask::STATX_BLOCKS) {
             tmp.stx_blocks = metadata.blocks as u64;
         }
 
-        if is_contain(mask, StxMask::STATX_BTIME) {
+        if mask.contains(PosixStatxMask::STATX_BTIME) {
             // btime是文件创建时间
             tmp.stx_btime.tv_sec = metadata.ctime.tv_sec;
             tmp.stx_btime.tv_nsec = metadata.ctime.tv_nsec;
         }
-        if is_contain(mask, StxMask::STATX_ALL) {
+        if mask.contains(PosixStatxMask::STATX_ALL) {
             tmp.stx_attributes = StxAttributes::STATX_ATTR_APPEND;
             tmp.stx_attributes_mask |=
                 StxAttributes::STATX_ATTR_AUTOMOUNT | StxAttributes::STATX_ATTR_DAX;
@@ -1185,10 +1187,10 @@ impl Syscall {
             tmp.stx_rdev_major = metadata.raw_dev.data() as u32;
             tmp.stx_rdev_minor = metadata.raw_dev.data() as u32;
         }
-        if is_contain(mask, StxMask::STATX_MNT_ID) {
+        if mask.contains(PosixStatxMask::STATX_MNT_ID) {
             tmp.stx_mnt_id = 0;
         }
-        if is_contain(mask, StxMask::STATX_DIOALIGN) {
+        if mask.contains(PosixStatxMask::STATX_DIOALIGN) {
             tmp.stx_dio_mem_align = 0;
             tmp.stx_dio_offset_align = 0;
         }
@@ -1205,9 +1207,6 @@ impl Syscall {
             FileType::FramebufferDevice => tmp.stx_mode.insert(ModeType::S_IFCHR),
         }
 
-        if usr_kstat.is_null() {
-            return Err(SystemError::EFAULT);
-        }
         writer.copy_one_to_user(&tmp, 0)?;
         Self::close(fd as usize).ok();
         return Ok(0);

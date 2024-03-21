@@ -20,7 +20,11 @@ const CPU_NUM: AtomicU32 = AtomicU32::new(PerCpu::MAX_CPU_NUM);
 pub struct PerCpu;
 
 impl PerCpu {
+    #[cfg(target_arch = "x86_64")]
     pub const MAX_CPU_NUM: u32 = 128;
+    #[cfg(target_arch = "riscv64")]
+    pub const MAX_CPU_NUM: u32 = 64;
+
     /// # 初始化PerCpu
     ///
     /// 该函数应该在内核初始化时调用一次。

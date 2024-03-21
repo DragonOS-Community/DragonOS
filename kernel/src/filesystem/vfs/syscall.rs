@@ -149,7 +149,7 @@ impl PosixKstat {
 #[repr(C)]
 #[derive(Clone, Copy)]
 /// # 文件信息结构体X
-pub struct Statx {
+pub struct PosixStatx {
     /* 0x00 */
     stx_mask: StxMask,
     /// 文件系统块大小
@@ -201,7 +201,7 @@ pub struct Statx {
     stx_dio_mem_align: u32,
     stx_dio_offset_align: u32,
 }
-impl Statx {
+impl PosixStatx {
     fn new() -> Self {
         Self {
             stx_mask: StxMask::STATX_BASIC_STATS,
@@ -1109,7 +1109,7 @@ impl Syscall {
         path: *const u8,
         flags: u32,
         mask: u32,
-        usr_kstat: *mut Statx,
+        usr_kstat: *mut PosixStatx,
     ) -> Result<usize, SystemError> {
         let is_contain = |mask0: u32, mask1: StxMask| {
             return (mask0 & mask1.bits) == mask1.bits;
@@ -1129,8 +1129,8 @@ impl Syscall {
             .ok_or(SystemError::EBADF)?;
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
-        let mut writer = UserBufferWriter::new(usr_kstat, size_of::<Statx>(), true)?;
-        let mut tmp: Statx = Statx::new();
+        let mut writer = UserBufferWriter::new(usr_kstat, size_of::<PosixStatx>(), true)?;
+        let mut tmp: PosixStatx = PosixStatx::new();
         // 获取文件信息
         let metadata = file.lock().metadata()?;
 

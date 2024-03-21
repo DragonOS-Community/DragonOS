@@ -1170,7 +1170,7 @@ impl Syscall {
         if is_contain(mask, StxMask::STATX_BLOCKS) {
             tmp.stx_blocks = metadata.blocks as u64;
         }
-        
+
         if is_contain(mask, StxMask::STATX_BTIME) {
             // btime是文件创建时间
             tmp.stx_btime.tv_sec = metadata.ctime.tv_sec;
@@ -1185,10 +1185,10 @@ impl Syscall {
             tmp.stx_rdev_major = metadata.raw_dev.data() as u32;
             tmp.stx_rdev_minor = metadata.raw_dev.data() as u32;
         }
-        if is_contain(mask,StxMask::STATX_MNT_ID){
-             tmp.stx_mnt_id = 0;
+        if is_contain(mask, StxMask::STATX_MNT_ID) {
+            tmp.stx_mnt_id = 0;
         }
-        if is_contain(mask,StxMask::STATX_DIOALIGN){
+        if is_contain(mask, StxMask::STATX_DIOALIGN) {
             tmp.stx_dio_mem_align = 0;
             tmp.stx_dio_offset_align = 0;
         }

@@ -1,6 +1,6 @@
-use std::ffi::CString;
 use libc::syscall;
 use libc::AT_FDCWD;
+use std::ffi::CString;
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -43,10 +43,10 @@ fn main() {
     let path = CString::new("/bin/about.elf").expect("Failed to create CString");
     let mut statxbuf: Statx = unsafe { std::mem::zeroed() };
     let x = sc::nr::STATX as i64;
-   
+
     let result = unsafe {
         syscall(
-            x, 
+            x,
             AT_FDCWD,
             path.as_ptr(),
             libc::AT_SYMLINK_NOFOLLOW,
@@ -54,7 +54,7 @@ fn main() {
             &mut statxbuf,
         )
     };
-    
+
     if result != -1 {
         println!("statx succeeded: {:?}", statxbuf);
     } else {

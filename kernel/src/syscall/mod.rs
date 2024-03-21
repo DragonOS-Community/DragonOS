@@ -5,11 +5,18 @@ use core::{
 };
 
 use crate::{
-    arch::{ipc::signal::SigSet, syscall::nr::*}, driver::base::device::device_number::DeviceNumber, filesystem::vfs::syscall::Statx, libs::{futex::constant::FutexFlag, rand::GRandFlags}, mm::syscall::MremapFlags, net::syscall::MsgHdr, process::{
+    arch::{ipc::signal::SigSet, syscall::nr::*},
+    driver::base::device::device_number::DeviceNumber,
+    filesystem::vfs::syscall::Statx,
+    libs::{futex::constant::FutexFlag, rand::GRandFlags},
+    mm::syscall::MremapFlags,
+    net::syscall::MsgHdr,
+    process::{
         fork::KernelCloneArgs,
         resource::{RLimit64, RUsage},
         ProcessManager,
-    }, syscall::user_access::check_and_clone_cstr
+    },
+    syscall::user_access::check_and_clone_cstr,
 };
 
 use num_traits::FromPrimitive;
@@ -706,11 +713,11 @@ impl Syscall {
                 let mask = args[3] as u32;
                 let kstat = args[4] as *mut Statx;
                 let vaddr = VirtAddr::new(kstat as usize);
-                
+
                 match verify_area(vaddr, core::mem::size_of::<Statx>()) {
                     Ok(_) => Self::do_statx(fd, path, flags, mask, kstat),
                     Err(e) => Err(e),
-                }              
+                }
             }
 
             SYS_EPOLL_CREATE => Self::epoll_create(args[0] as i32),
@@ -722,7 +729,7 @@ impl Syscall {
                 args[2] as i32,
                 VirtAddr::new(args[3]),
             ),
-            
+
             SYS_EPOLL_WAIT => Self::epoll_wait(
                 args[0] as i32,
                 VirtAddr::new(args[1]),

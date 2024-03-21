@@ -309,9 +309,9 @@ pub enum SigChildCode {
     Continued = 6,
 }
 
-impl Into<i32> for SigChildCode {
-    fn into(self) -> i32 {
-        self as i32
+impl From<SigChildCode> for i32 {
+    fn from(value: SigChildCode) -> Self {
+        value as i32
     }
 }
 

@@ -107,8 +107,8 @@ impl LockedPipeInode {
             valid_cnt: 0,
             read_pos: 0,
             write_pos: 0,
-            read_wait_queue: WaitQueue::INIT,
-            write_wait_queue: WaitQueue::INIT,
+            read_wait_queue: WaitQueue::default(),
+            write_wait_queue: WaitQueue::default(),
             data: [0; PIPE_BUFF_SIZE],
 
             metadata: Metadata {

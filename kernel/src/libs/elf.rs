@@ -194,6 +194,7 @@ impl ElfLoader {
     /// ## 返回值
     ///
     /// - `Ok((VirtAddr, bool))`：如果成功加载，则bool值为true，否则为false. VirtAddr为加载的地址
+    #[allow(clippy::too_many_arguments)]
     fn load_elf_segment(
         &self,
         user_vm_guard: &mut RwLockWriteGuard<'_, InnerAddressSpace>,

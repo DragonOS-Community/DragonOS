@@ -379,6 +379,7 @@ where
 
 /// This is a method to help us to get inner struct.
 impl<K: Ord + Debug, V: Debug> RBTree<K, V> {
+    #[allow(clippy::only_used_in_recursion)]
     fn tree_print(&self, node: NodePtr<K, V>, direction: i32) {
         if node.is_null() {
             return;
@@ -1187,6 +1188,7 @@ impl<K: Ord, V> RBTree<K, V> {
         true
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     #[inline]
     fn clear_recurse(&mut self, current: NodePtr<K, V>) {
         if !current.is_null() {

@@ -53,7 +53,8 @@ pub struct KvmMmuPageRole {
 //     num_objs: u32,
 //     objs: [*mut u8; KVM_NR_MEM_OBJS as usize],
 // }
-
+pub type KvmMmuPageFaultHandler =
+    fn(vcpu: &mut VmxVcpu, gpa: u64, error_code: u32, prefault: bool) -> Result<(), SystemError>;
 #[derive(Default)]
 pub struct KvmMmu {
     pub root_hpa: u64,
@@ -62,14 +63,7 @@ pub struct KvmMmu {
     // ...还有一些变量不知道用来做什么
     pub get_cr3: Option<fn(&VmxVcpu) -> u64>,
     pub set_eptp: Option<fn(u64) -> Result<(), SystemError>>,
-    pub page_fault: Option<
-        fn(
-            vcpu: &mut VmxVcpu,
-            gpa: u64,
-            error_code: u32,
-            prefault: bool,
-        ) -> Result<(), SystemError>,
-    >,
+    pub page_fault: Option<KvmMmuPageFaultHandler>,
     // get_pdptr: Option<fn(& VmxVcpu, index:u32) -> u64>, // Page Directory Pointer Table Register?暂时不知道和CR3的区别是什么
     // inject_page_fault: Option<fn(&mut VmxVcpu, fault: &X86Exception)>,
     // gva_to_gpa: Option<fn(&mut VmxVcpu, gva: u64, access: u32, exception: &X86Exception) -> u64>,
@@ -206,6 +200,7 @@ pub fn init_kvm_tdp_mmu(vcpu: &Mutex<VmxVcpu>) {
     // }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn __direct_map(
     vcpu: &mut VmxVcpu,
     gpa: u64,

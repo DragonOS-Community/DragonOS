@@ -22,7 +22,7 @@ use super::{
     Device, DeviceManager,
 };
 
-static PROBE_WAIT_QUEUE: WaitQueue = WaitQueue::INIT;
+static PROBE_WAIT_QUEUE: WaitQueue = WaitQueue::default();
 
 impl DeviceManager {
     /// 尝试把一个设备与一个驱动匹配

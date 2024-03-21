@@ -24,9 +24,9 @@ pub enum DriverError {
     UnInitialized,         // 未初始化
 }
 
-impl Into<SystemError> for DriverError {
-    fn into(self) -> SystemError {
-        match self {
+impl From<DriverError> for SystemError {
+    fn from(value: DriverError) -> Self {
+        match value {
             DriverError::ProbeError => SystemError::ENODEV,
             DriverError::RegisterError => SystemError::ENODEV,
             DriverError::AllocateResourceError => SystemError::EIO,

@@ -149,7 +149,7 @@ impl InnerCompletion {
     pub const fn new() -> Self {
         Self {
             done: 0,
-            wait_queue: WaitQueue::INIT,
+            wait_queue: WaitQueue::default(),
         }
     }
 }

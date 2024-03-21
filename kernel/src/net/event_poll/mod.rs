@@ -56,7 +56,7 @@ impl EventPoll {
     pub const ADD_EPOLLITEM: u32 = 0x7965;
     pub fn new() -> Self {
         Self {
-            epoll_wq: WaitQueue::INIT,
+            epoll_wq: WaitQueue::default(),
             ep_items: RBTree::new(),
             ready_list: LinkedList::new(),
             shutdown: AtomicBool::new(false),

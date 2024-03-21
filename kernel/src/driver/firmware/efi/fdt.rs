@@ -56,13 +56,13 @@ enum FdtPropType {
 impl FdtPropType {
     /// 获取属性对应的fdt属性名
     fn prop_name(&self) -> &'static str {
-        (*self).clone().into()
+        (*self).into()
     }
 }
 
-impl Into<&'static str> for FdtPropType {
-    fn into(self) -> &'static str {
-        match self {
+impl From<FdtPropType> for &'static str {
+    fn from(value: FdtPropType) -> Self {
+        match value {
             FdtPropType::SystemTable => "linux,uefi-system-table",
             FdtPropType::MMBase => "linux,uefi-mmap-start",
             FdtPropType::MMSize => "linux,uefi-mmap-size",

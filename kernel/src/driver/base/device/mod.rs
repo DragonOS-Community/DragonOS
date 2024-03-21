@@ -307,9 +307,9 @@ pub enum DeviceError {
     UnsupportedOperation, // 不支持的操作
 }
 
-impl Into<SystemError> for DeviceError {
-    fn into(self) -> SystemError {
-        match self {
+impl From<DeviceError> for SystemError {
+    fn from(value: DeviceError) -> Self {
+        match value {
             DeviceError::DriverExists => SystemError::EEXIST,
             DeviceError::DeviceExists => SystemError::EEXIST,
             DeviceError::InitializeFailed => SystemError::EIO,
@@ -510,16 +510,14 @@ impl DeviceManager {
         if device.class().is_some() {
             let parent_kobj: Arc<dyn KObject>;
             // kdebug!("current_parent:{:?}", current_parent);
-            if current_parent.is_none() {
-                parent_kobj = sys_devices_virtual_kset() as Arc<dyn KObject>;
-            } else {
-                let cp = current_parent.unwrap();
-
+            if let Some(cp) = current_parent {
                 if cp.class().is_some() {
                     return Ok(Some(cp.clone() as Arc<dyn KObject>));
                 } else {
                     parent_kobj = cp.clone() as Arc<dyn KObject>;
                 }
+            } else {
+                parent_kobj = sys_devices_virtual_kset() as Arc<dyn KObject>;
             }
 
             // 是否需要glue dir?
@@ -874,7 +872,7 @@ impl DeviceMatcher<&str> for DeviceMatchName {
 }
 
 /// Cookie to identify the device
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone)]
 pub struct DeviceId {
     data: Option<&'static str>,
     allocated: Option<String>,
@@ -913,6 +911,12 @@ impl DeviceId {
 impl PartialEq for DeviceId {
     fn eq(&self, other: &Self) -> bool {
         return self.id() == other.id();
+    }
+}
+
+impl core::hash::Hash for DeviceId {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.id().hash(state);
     }
 }
 

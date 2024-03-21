@@ -158,20 +158,19 @@ impl Sub<i32> for LineId {
         LineId::new(self.0 - rhs)
     }
 }
-
-impl Into<i32> for LineId {
-    fn into(self) -> i32 {
-        self.0
+impl From<LineId> for i32 {
+    fn from(value: LineId) -> Self {
+        value.0
     }
 }
-impl Into<u32> for LineId {
-    fn into(self) -> u32 {
-        self.0 as u32
+impl From<LineId> for u32 {
+    fn from(value: LineId) -> Self {
+        value.0 as u32
     }
 }
-impl Into<usize> for LineId {
-    fn into(self) -> usize {
-        self.0 as usize
+impl From<LineId> for usize {
+    fn from(value: LineId) -> Self {
+        value.0 as usize
     }
 }
 impl Sub<LineId> for LineId {
@@ -225,14 +224,14 @@ impl From<LineIndex> for i32 {
         val.0
     }
 }
-impl Into<u32> for LineIndex {
-    fn into(self) -> u32 {
-        self.0 as u32
+impl From<LineIndex> for u32 {
+    fn from(value: LineIndex) -> Self {
+        value.0 as u32
     }
 }
-impl Into<usize> for LineIndex {
-    fn into(self) -> usize {
-        self.0 as usize
+impl From<LineIndex> for usize {
+    fn from(value: LineIndex) -> Self {
+        value.0 as usize
     }
 }
 #[derive(Copy, Clone, Debug)]
@@ -260,24 +259,24 @@ impl From<u32> for FontColor {
         return Self(value & 0x00ffffff);
     }
 }
-impl Into<usize> for FontColor {
-    fn into(self) -> usize {
-        self.0 as usize
+impl From<FontColor> for usize {
+    fn from(value: FontColor) -> Self {
+        value.0 as usize
     }
 }
-impl Into<u32> for FontColor {
-    fn into(self) -> u32 {
-        self.0
+impl From<FontColor> for u32 {
+    fn from(value: FontColor) -> Self {
+        value.0
     }
 }
-impl Into<u16> for FontColor {
-    fn into(self) -> u16 {
-        self.0 as u16
+impl From<FontColor> for u16 {
+    fn from(value: FontColor) -> Self {
+        value.0 as u16
     }
 }
-impl Into<u64> for FontColor {
-    fn into(self) -> u64 {
-        self.0 as u64
+impl From<FontColor> for u64 {
+    fn from(value: FontColor) -> Self {
+        value.0 as u64
     }
 }
 

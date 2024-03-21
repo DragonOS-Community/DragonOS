@@ -234,7 +234,7 @@ impl KObject for PlatformBusDevice {
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.inner.lock().ktype.clone()
+        self.inner.lock().ktype
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {

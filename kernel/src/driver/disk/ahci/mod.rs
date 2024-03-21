@@ -200,8 +200,8 @@ pub fn __test_ahci() {
     _dd.read_at(122, 4, &mut read_buf).unwrap();
 
     // 测试2, 只读写一个字节
-    for i in 0..512 {
-        buf[i] = 233;
+    for item in buf.iter_mut().take(512) {
+        *item = 233;
     }
     // _dd.write_at(123, 2, &buf).unwrap();
     let mut read_buf2 = [0u8; 3000usize];

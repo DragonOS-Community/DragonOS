@@ -431,8 +431,7 @@ impl DeviceManager {
 
         let current_parent = device
             .parent()
-            .map(|x| x.upgrade())
-            .flatten()
+            .and_then(|x| x.upgrade())
             .and_then(|x| x.arc_any().cast::<dyn Device>().ok());
 
         let actual_parent = self.get_device_parent(&device, current_parent)?;
@@ -466,7 +465,7 @@ impl DeviceManager {
         }
 
         // 通知客户端有关设备添加的信息。此调用必须在 dpm_sysfs_add() 之后且在 kobject_uevent() 之前执行。
-        if let Some(bus) = device.bus().map(|bus| bus.upgrade()).flatten() {
+        if let Some(bus) = device.bus().and_then(|bus| bus.upgrade()){
             bus.subsystem().bus_notifier().call_chain(
                 bus::BusNotifyEvent::AddDevice,
                 Some(&device),
@@ -530,8 +529,8 @@ impl DeviceManager {
 
         // subsystems can specify a default root directory for their devices
         if current_parent.is_none() {
-            if let Some(bus) = device.bus().map(|bus| bus.upgrade()).flatten() {
-                if let Some(root) = bus.root_device().map(|x| x.upgrade()).flatten() {
+            if let Some(bus) = device.bus().and_then(|bus| bus.upgrade()) {
+                if let Some(root) = bus.root_device().and_then(|x| x.upgrade()) {
                     return Ok(Some(root as Arc<dyn KObject>));
                 }
             }
@@ -598,10 +597,10 @@ impl DeviceManager {
         sysfs_instance().create_link(Some(&dev_kobj), &subsys_kobj, "subsystem".to_string())?;
 
         // todo: 这里需要处理class的parent逻辑, 添加device链接
-        if let Some(parent) = dev.parent().map(|x| x.upgrade()).flatten() {
+        if let Some(parent) = dev.parent().and_then(|x| x.upgrade()){
             let parent_kobj = parent.clone() as Arc<dyn KObject>;
             sysfs_instance()
-                .create_link(Some(&dev_kobj), &&parent_kobj, "device".to_string())
+                .create_link(Some(&dev_kobj), &parent_kobj, "device".to_string())
                 .map_err(|e| {
                     err_remove_subsystem(&dev_kobj);
                     e

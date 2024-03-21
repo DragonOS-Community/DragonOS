@@ -789,11 +789,7 @@ impl BinaryLoader for ElfLoader {
         }
         // kdebug!("elf load: phdr_vaddr={phdr_vaddr:?}");
         let program_entrypoint = VirtAddr::new(ehdr.e_entry as usize + load_bias);
-        let phdr_vaddr = if let Some(phdr_vaddr) = phdr_vaddr {
-            Some(phdr_vaddr + load_bias)
-        } else {
-            None
-        };
+        let phdr_vaddr = phdr_vaddr.map(|phdr_vaddr| phdr_vaddr + load_bias);
 
         elf_bss += load_bias;
         elf_brk += load_bias;

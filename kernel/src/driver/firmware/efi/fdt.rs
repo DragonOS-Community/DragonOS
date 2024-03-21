@@ -56,7 +56,7 @@ enum FdtPropType {
 impl FdtPropType {
     /// 获取属性对应的fdt属性名
     fn prop_name(&self) -> &'static str {
-        self.clone().into()
+        (*self).clone().into()
     }
 }
 

@@ -263,7 +263,7 @@ impl AhciDisk {
         // TODO：在内存管理重构后，可以直接使用用户空间的内存地址
         let user_buf = verify_area(VirtAddr::new(buf_ptr), buf.len()).is_ok();
         let mut kbuf = if user_buf {
-            let mut x: Vec<u8> = Vec::with_capacity(buf.len());
+            let mut x: Vec<u8> = vec![0; buf.len()];
             x.resize(buf.len(), 0);
             x.copy_from_slice(buf);
             Some(x)
@@ -398,7 +398,7 @@ impl LockedAhciDisk {
         let mut table: MbrDiskPartionTable = Default::default();
 
         // 数据缓冲区
-        let mut buf: Vec<u8> = Vec::new();
+        let mut buf: Vec<u8> = vec![0; size_of::<MbrDiskPartionTable>()];
         buf.resize(size_of::<MbrDiskPartionTable>(), 0);
 
         self.read_at(0, 1, &mut buf)?;

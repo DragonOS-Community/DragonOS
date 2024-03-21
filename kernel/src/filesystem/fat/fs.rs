@@ -10,6 +10,7 @@ use alloc::{
 };
 
 use crate::driver::base::device::device_number::DeviceNumber;
+use crate::filesystem::vfs::cache::DefaultCache;
 use crate::filesystem::vfs::SpecialNodeData;
 use crate::ipc::pipe::LockedPipeInode;
 use crate::{
@@ -74,6 +75,8 @@ pub struct FATFileSystem {
     pub fs_info: Arc<LockedFATFsInfo>,
     /// 文件系统的根inode
     root_inode: Arc<LockedFATInode>,
+    /// 文件系统目录索引缓存
+    index_cache: Arc<DefaultCache>,
 }
 
 /// FAT文件系统的Inode
@@ -256,6 +259,10 @@ impl FileSystem for FATFileSystem {
     fn name(&self) -> &str {
         "fat"
     }
+
+    fn cache(&self) -> Result<Arc<DefaultCache>, SystemError> {
+        Ok(self.index_cache.clone())
+    }
 }
 
 impl FATFileSystem {
@@ -340,6 +347,7 @@ impl FATFileSystem {
             first_data_sector,
             fs_info: Arc::new(LockedFATFsInfo::new(fs_info)),
             root_inode: root_inode,
+            index_cache: Arc::new(DefaultCache::new(None)),
         });
 
         // 对root inode加锁，并继续完成初始化工作
@@ -1813,6 +1821,14 @@ impl IndexNode for LockedFATInode {
 
     fn key(&self) -> Result<String, SystemError> {
         self.0.lock().key()
+    }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Ok(self.0.lock().parent.upgrade().ok_or(SystemError::ENOENT)?)
+    }
+
+    fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Ok(self.0.lock().self_ref.upgrade().ok_or(SystemError::ENOENT)?)
     }
 }
 

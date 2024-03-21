@@ -32,25 +32,32 @@ impl<'a> Iterator for SrcIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let vec_here = core::mem::take(&mut self.vec);
         let mut vec_cur = vec_here.unwrap();
-        // kdebug!("Hash list RLock!");
-        if self.idx == vec_cur.len() {
-            return None;
-        }
 
+        kdebug!("Index {}, len {}", self.idx, vec_cur.len());
+        kdebug!("Vec {:?}", vec_cur.iter().collect::<Vec<_>>());
+        
         // 自动删除空节点（未测试）
-        while vec_cur[self.idx].upgrade().is_none()
-            || vec_cur[self.idx].upgrade().unwrap().upgrade().is_none()
-        {
+        let result = loop {
+            if vec_cur.len() == self.idx {
+                break None;
+            }
+            if let Some(c1) = vec_cur[self.idx].upgrade() {
+                if let Some(c2) = c1.upgrade() {
+                    break Some(c2);
+                }
+            }
             let mut writer = vec_cur.upgrade();
             writer.remove(self.idx);
             vec_cur = writer.downgrade_to_upgradeable();
-        }
-        self.idx += 1;
-        let result = vec_cur[self.idx - 1].upgrade().unwrap().upgrade();
+        };
+
         self.vec = Some(vec_cur);
+        self.idx += 1;
+
         result
     }
 }
+
 #[derive(Debug)]
 struct HashTable<H: Hasher + Default> {
     _hash_type: PhantomData<H>,

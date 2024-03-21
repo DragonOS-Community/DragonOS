@@ -421,17 +421,17 @@ pub trait IndexNode: Any + Sync + Send + Debug {
 
     /// 获取目录名
     fn key(&self) -> Result<String, SystemError> {
-        return self.parent()?.get_entry_name(self.metadata()?.inode_id);
+        self.parent()?.get_entry_name(self.metadata()?.inode_id)
     }
 
     /// 获取父目录
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return self.find("..");
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
     /// 返回自身引用
     fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return self.find(".");
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 }
 
@@ -505,7 +505,7 @@ impl dyn IndexNode {
                     return Ok(root_inode);
                 }
 
-                path_under = path_under.strip_prefix('/').unwrap();
+                path_under = path_under.strip_prefix('/').unwrap_or(path_under);
                 // Cache record is found
                 if let Some((inode, found_path)) = root_inode.quick_lookup(fscache, path_under) {
                     kdebug!("Found path: {}", found_path);
@@ -712,6 +712,7 @@ impl dyn IndexNode {
             }
             path_stack.push(inode.key()?);
         }
+
         if let Some(last_key) = path_stack.last() {
             // 根目录没有目录名，弹出
             if last_key == "" || last_key == "." || last_key == ".." {

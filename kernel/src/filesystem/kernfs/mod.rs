@@ -375,6 +375,18 @@ impl IndexNode for KernFSInode {
         // 待实现
         Err(SystemError::ENOSYS)
     }
+
+    fn key(&self) -> Result<String, SystemError> {
+        Ok(self.name.clone())
+    }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Ok(self.inner.read().parent.upgrade().ok_or(SystemError::ENOENT)?)
+    }
+
+    fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Ok(self.self_ref.upgrade().ok_or(SystemError::ENOENT)?)
+    }
 }
 
 impl KernFSInode {

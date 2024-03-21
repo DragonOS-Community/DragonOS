@@ -5,7 +5,7 @@
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "apps/statx_test"
+        "path": "apps/test_statx"
       }
     }
   },

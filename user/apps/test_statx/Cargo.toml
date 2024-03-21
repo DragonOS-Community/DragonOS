@@ -1,9 +1,8 @@
 [package]
-name = "statx_test"
+name = "test_statx"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 libc = "0.2.153"
-nix = "0.22.0"
 sc = "0.2.7"

@@ -140,7 +140,6 @@ impl FATInode {
                 // 在磁盘查找
                 let fat_entry: FATDirEntry =
                     d.find_entry(name, None, None, self.fs.upgrade().unwrap())?;
-                // kdebug!("find entry from disk ok, entry={fat_entry:?}");
                 // 创建新的inode
                 let entry_inode: Arc<LockedFATInode> = LockedFATInode::new(
                     self.fs.upgrade().unwrap(),
@@ -247,6 +246,10 @@ impl FileSystem for FATFileSystem {
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+
+    fn name(&self) -> &str {
+        "fat"
     }
 }
 

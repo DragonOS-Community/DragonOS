@@ -1,16 +1,19 @@
+use core::ffi::c_void;
 use core::mem::size_of;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
+use crate::producefs;
 use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
-    filesystem::vfs::file::FileDescriptorVec,
+    filesystem::vfs::{core as Vcore, file::FileDescriptorVec},
+    kerror,
     libs::rwlock::RwLockWriteGuard,
     mm::{verify_area, VirtAddr},
     process::ProcessManager,
     syscall::{
-        user_access::{check_and_clone_cstr, UserBufferWriter},
+        user_access::{self, check_and_clone_cstr, UserBufferWriter},
         Syscall,
     },
     time::TimeSpec,
@@ -22,7 +25,7 @@ use super::{
     file::{File, FileMode},
     open::{do_faccessat, do_fchmodat, do_sys_open},
     utils::{rsplit_path, user_path_at},
-    Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    Dirent, FileType, IndexNode, FSMAKER, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 // use crate::kdebug;
 
@@ -1345,6 +1348,41 @@ impl Syscall {
         kwarn!("fchmod not fully implemented");
         return Ok(0);
     }
+    /// #挂载文件系统
+    ///
+    /// 用于挂载文件系统,目前仅支持ramfs挂载
+    ///
+    /// ## 参数:
+    ///
+    /// - source       挂载设备(暂时不支持)
+    /// - target       挂载目录
+    /// - filesystemtype   文件系统
+    /// - mountflags     挂载选项（暂未实现）
+    /// - data        带数据挂载
+    ///
+    /// ## 返回值
+    /// - Ok(0): 挂载成功
+    /// - Err(SystemError) :挂载过程中出错
+    pub fn mount(
+        _source: *const u8,
+        target: *const u8,
+        filesystemtype: *const u8,
+        _mountflags: usize,
+        _data: *const c_void,
+    ) -> Result<usize, SystemError> {
+        let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?;
+
+        let filesystemtype = user_access::check_and_clone_cstr(filesystemtype, Some(MAX_PATHLEN))?;
+
+        let filesystemtype = producefs!(FSMAKER, filesystemtype)?;
+
+        return Vcore::do_mount(filesystemtype, (format!("{target}")).as_str());
+    }
+
+    // 想法：可以在VFS中实现一个文件系统分发器，流程如下：
+    // 1. 接受从上方传来的文件类型字符串
+    // 2. 将传入值与启动时准备好的字符串数组逐个比较（probe）
+    // 3. 直接在函数内调用构造方法并直接返回文件系统对象
 }
 
 #[repr(C)]

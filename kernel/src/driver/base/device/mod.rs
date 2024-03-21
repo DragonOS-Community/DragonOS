@@ -872,7 +872,7 @@ impl DeviceMatcher<&str> for DeviceMatchName {
 }
 
 /// Cookie to identify the device
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone)]
 pub struct DeviceId {
     data: Option<&'static str>,
     allocated: Option<String>,
@@ -911,6 +911,12 @@ impl DeviceId {
 impl PartialEq for DeviceId {
     fn eq(&self, other: &Self) -> bool {
         return self.id() == other.id();
+    }
+}
+
+impl core::hash::Hash for DeviceId {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.id().hash(state);
     }
 }
 

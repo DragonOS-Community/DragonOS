@@ -27,7 +27,9 @@ pub struct WaitQueue(SpinLock<InnerWaitQueue>);
 
 #[allow(dead_code)]
 impl WaitQueue {
-    pub const INIT: WaitQueue = WaitQueue(SpinLock::new(InnerWaitQueue::INIT));
+    pub const fn default() -> Self {
+        WaitQueue(SpinLock::new(InnerWaitQueue::INIT))
+    }
 
     /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断
     pub fn sleep(&self) {

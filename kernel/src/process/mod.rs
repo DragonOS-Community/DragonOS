@@ -643,7 +643,7 @@ impl ProcessControlBlock {
             parent_pcb: RwLock::new(ppcb.clone()),
             real_parent_pcb: RwLock::new(ppcb),
             children: RwLock::new(Vec::new()),
-            wait_queue: WaitQueue::INIT,
+            wait_queue: WaitQueue::default(),
             thread: RwLock::new(ThreadInfo::new()),
         };
 

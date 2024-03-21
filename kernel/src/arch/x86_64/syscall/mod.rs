@@ -159,6 +159,6 @@ pub(super) unsafe fn init_syscall_64() {
     x86::msr::wrmsr(x86::msr::IA32_STAR, u64::from(high) << 32);
 
     // 初始化LSTAR,该寄存器存储syscall指令入口
-    x86::msr::wrmsr(x86::msr::IA32_LSTAR, syscall_64 as u64);
+    x86::msr::wrmsr(x86::msr::IA32_LSTAR, syscall_64 as usize as u64);
     x86::msr::wrmsr(x86::msr::IA32_FMASK, 0xfffffffe);
 }

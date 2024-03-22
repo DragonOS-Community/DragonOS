@@ -35,7 +35,7 @@ impl<'a> Iterator for SrcIter<'a> {
 
         kdebug!("Index {}, len {}", self.idx, vec_cur.len());
         kdebug!("Vec {:?}", vec_cur.iter().collect::<Vec<_>>());
-        
+
         // 自动删除空节点（未测试）
         let result = loop {
             if vec_cur.len() == self.idx {

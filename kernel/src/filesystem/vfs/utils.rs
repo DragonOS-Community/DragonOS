@@ -112,6 +112,5 @@ pub fn clean_path(path: &str) -> String {
             }
         }
     }
-    // kdebug!("Clean Result: {}", clean);
     clean
 }

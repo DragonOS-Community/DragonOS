@@ -750,7 +750,12 @@ impl IndexNode for LockedProcFSInode {
     }
 
     fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        Ok(self.0.lock().self_ref.upgrade().ok_or(SystemError::ENOENT)?)
+        Ok(self
+            .0
+            .lock()
+            .self_ref
+            .upgrade()
+            .ok_or(SystemError::ENOENT)?)
     }
 }
 

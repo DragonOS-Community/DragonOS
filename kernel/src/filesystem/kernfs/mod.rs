@@ -381,7 +381,12 @@ impl IndexNode for KernFSInode {
     }
 
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        Ok(self.inner.read().parent.upgrade().ok_or(SystemError::ENOENT)?)
+        Ok(self
+            .inner
+            .read()
+            .parent
+            .upgrade()
+            .ok_or(SystemError::ENOENT)?)
     }
 
     fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {

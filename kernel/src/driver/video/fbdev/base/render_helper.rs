@@ -1,5 +1,3 @@
-// use alloc::collections::vec_deque::Iter;
-
 use core::slice::Iter;
 
 pub struct BitIter<'a> {
@@ -86,7 +84,7 @@ impl<'a> BitIter<'a> {
     }
 
     fn full_buffer(&mut self) -> Result<PixelLineStatus, PixelLineStatus> {
-        let mut same_endian = if self._dst_pattern == self._color_pattern {
+        let same_endian = if self._dst_pattern == self._color_pattern {
             1
         } else {
             -1
@@ -98,7 +96,7 @@ impl<'a> BitIter<'a> {
             3
         };
         let mask = 0x000000ff << (self.byte_per_pixel - 1) * 8;
-        let mut temp = 0;
+        let mut temp;
         while buffer_pointer >= 0 && buffer_pointer <= 3 {
             if self.consumed_bit >= self.image_width {
                 self.consumed_bit = 0;

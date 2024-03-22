@@ -381,16 +381,13 @@ impl TextuiBuf<'_> {
                 }
             }
             24 => {
-                // let index=index as isize;
                 let buf = self.buf_mut().as_mut_ptr() as *mut u8;
                 unsafe {
                     copy_nonoverlapping(&color as *const u32 as *const u8, buf.offset(index * 3), 3)
                 };
             }
             16 => {
-                // let index=index as isize;
                 let buf = self.buf_mut().as_mut_ptr() as *mut u8;
-                let gap: u16 = 0x0000;
                 unsafe {
                     copy_nonoverlapping(
                         &color as *const u32 as *const u8,

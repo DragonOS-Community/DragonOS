@@ -25,8 +25,8 @@ clean:
 
 .PHONY: fmt
 fmt:
-	cargo fmt --all $(FMT_CHECK)
-	cargo clippy --all-features
+	@cargo fmt --all $(FMT_CHECK)
+	@cargo clippy --all-features
 
 .PHONY: check
 check: ECHO

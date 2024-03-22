@@ -87,7 +87,7 @@ impl WaitQueue {
     }
 
     pub unsafe fn sleep_without_schedule_uninterruptible(&self) {
-        before_sleep_check(0);
+        before_sleep_check(1);
         // 安全检查：确保当前处于中断禁止状态
         assert!(CurrentIrqArch::is_irq_enabled() == false);
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
@@ -264,7 +264,7 @@ fn before_sleep_check(max_preempt: usize) {
     if unlikely(pcb.preempt_count() > max_preempt) {
         kwarn!(
             "Process {:?}: Try to sleep when preempt count is {}",
-            pcb.pid(),
+            pcb.pid().data(),
             pcb.preempt_count()
         );
     }

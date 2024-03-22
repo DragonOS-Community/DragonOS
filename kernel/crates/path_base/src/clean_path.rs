@@ -39,8 +39,8 @@
 //! # Example
 //!
 //! ```rust
-//! use crate::{Path, PathBuf};
-//! use clean_path::{clean, Clean};
+//! use path_base::{Path, PathBuf};
+//! use path_base::clean_path::{clean, Clean};
 //!
 //! assert_eq!(clean("foo/../../bar"), PathBuf::from("../bar"));
 //! assert_eq!(Path::new("hello/world/..").clean(), PathBuf::from("hello"));

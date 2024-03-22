@@ -1,31 +1,27 @@
 #![no_std]
 #![feature(strict_provenance)]
 extern crate alloc;
+mod util;
+#[cfg(test)]
+mod test;
 pub mod clean_path;
 
-mod util;
-mod test;
+use core::{ 
+    borrow::Borrow, cmp, fmt, 
+    hash::{Hash, Hasher}, 
+    iter::FusedIterator, 
+    ops::{self, Deref}, 
+    str::{self, FromStr},
+};
 
-use core::borrow::Borrow;
-use core::cmp;
-use core::fmt;
-use core::hash::{Hash, Hasher};
-use core::iter::FusedIterator;
-use core::ops::{self, Deref};
-use core::str::FromStr;
-use alloc::borrow::Cow;
-use alloc::borrow::ToOwned;
-use alloc::boxed::Box;
-use alloc::rc::Rc;
-use alloc::string::ToString;
-use alloc::sync::Arc;
-use alloc::collections::TryReserveError;
-use alloc::string::String;
-use alloc::vec::Vec;
-use core::str;
+use alloc::{
+    borrow::{Cow, ToOwned},
+    string::{String, ToString},
+    boxed::Box, rc::Rc, vec::Vec, 
+    sync::Arc, collections::TryReserveError,
+};
 
-use self::util::parse_prefix;
-use self::util::{MAIN_SEP_STR, is_verbatim_sep, is_sep_byte};
+use self::util::{MAIN_SEP_STR, parse_prefix, is_verbatim_sep, is_sep_byte};
 
 #[derive(Copy, Clone, Debug, Hash, PartialOrd, Ord, PartialEq, Eq)]
 pub enum Prefix<'a> {

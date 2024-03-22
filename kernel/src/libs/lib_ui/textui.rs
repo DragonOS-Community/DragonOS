@@ -295,39 +295,6 @@ pub struct TextuiCharChromatic {
     bkcolor: FontColor, // rgb
 }
 
-// #[derive(Debug)]
-// pub struct TextuiBuf24<'a>{
-//     buf:Option<&'a mut [u32]>,
-
-//     guard:Option<SpinLockGuard<'a, Box<[u32]>>>,
-// }
-
-// impl TextuiBuf24<'_>{
-//     pub fn new(buf: &mut ScmBufferInfo) -> TextuiBuf {
-//         let len = buf.buf_size() / 4;
-
-//         match &buf.buf {
-//             ScmBuffer::DeviceBuffer(vaddr) => {
-//                 return TextuiBuf {
-//                     buf: Some(unsafe {
-//                         core::slice::from_raw_parts_mut(vaddr.data() as *mut u32, len)
-//                     }),
-//                     guard: None,
-//                 };
-//             }
-
-//             ScmBuffer::DoubleBuffer(double_buffer) => {
-//                 let guard: SpinLockGuard<'_, Box<[u32]>> = double_buffer.lock();
-
-//                 return TextuiBuf {
-//                     buf: None,
-//                     guard: Some(guard),
-//                 };
-//             }
-//         }
-//     }
-// }
-
 #[derive(Debug)]
 pub struct TextuiBuf<'a> {
     buf: Option<&'a mut [u8]>,
@@ -527,10 +494,6 @@ impl TextuiCharChromatic {
                 testbit >>= 1;
                 if (font.0[i as usize] & testbit as u8) != 0 {
                     let color: u32 = self.frcolor.into();
-                    // let c=&color as *const u32;
-                    // let a=addr as *mut u32;
-                    // unsafe { *a = color }; // 字，显示前景色
-                    // unsafe { *addr = self.frcolor.into() }; // 字，显示前景色
                     unsafe {
                         copy_nonoverlapping(
                             &color as *const u32 as *const u8,
@@ -540,9 +503,6 @@ impl TextuiCharChromatic {
                     }; // 字，显示前景色
                 } else {
                     let color: u32 = self.bkcolor.into();
-                    // let a=addr as *mut u32;
-                    // unsafe { *a = color }; // 背景色\
-                    // unsafe { *addr = self.bkcolor.into() }; // 背景色\
                     unsafe {
                         copy_nonoverlapping(
                             &color as *const u32 as *const u8,

@@ -795,8 +795,8 @@ impl Syscall {
         // 得到新创建节点的父节点
         let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newfd, new)?;
         let (new_name, new_parent_path) = rsplit_path(&new_remain_path);
-        let new_parent = new_begin_inode
-            .lookup_follow_symlink(new_parent_path.unwrap_or("/"), symlink_times)?;
+        let new_parent =
+            new_begin_inode.lookup_follow_symlink(new_parent_path.unwrap_or("/"), symlink_times)?;
 
         // 被调用者利用downcast_ref判断两inode是否为同一文件系统
         return new_parent.link(new_name, &old_inode).map(|_| 0);

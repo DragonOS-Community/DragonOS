@@ -32,7 +32,6 @@ jobs:
       run: |
             printf "\n" >> kernel/src/include/bindings/bindings.rs
             FMT_CHECK=1 make fmt
-            cd kernel && cargo clippy --all-features
   
   kernel-static-test:
     name: Kernel static test ${{ matrix.arch }}

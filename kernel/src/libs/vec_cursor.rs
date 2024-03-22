@@ -116,7 +116,7 @@ impl VecCursor {
             return Err(SystemError::E2BIG);
         }
 
-        for (_, item) in buf.iter_mut().enumerate() {
+        for item in buf.iter_mut() {
             *item = self.read_u16()?;
         }
 

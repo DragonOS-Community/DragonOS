@@ -163,6 +163,7 @@ impl SmpCpuManager {
         unsafe { self.cpuhp_state.force_get(cpu_id) }
     }
 
+    #[allow(clippy::mut_from_ref)]
     fn cpuhp_state_mut(&self, cpu_id: ProcessorId) -> &mut CpuHpCpuState {
         unsafe { self.cpuhp_state.force_get_mut(cpu_id) }
     }

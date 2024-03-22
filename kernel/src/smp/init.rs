@@ -8,7 +8,7 @@ use crate::{
 
 #[inline(never)]
 pub fn smp_ap_start_stage2() -> ! {
-    assert_eq!(CurrentIrqArch::is_irq_enabled(), false);
+    assert!(!CurrentIrqArch::is_irq_enabled());
 
     smp_cpu_manager().complete_ap_thread(true);
 

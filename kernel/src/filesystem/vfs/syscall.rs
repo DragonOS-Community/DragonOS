@@ -1,6 +1,7 @@
 use core::ffi::c_void;
 use core::mem::size_of;
 
+use alloc::string::ToString;
 use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
@@ -430,7 +431,7 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
         let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
-        let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
+        let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
         return do_sys_open(
             AtFlags::AT_FDCWD.bits(),
             &path,
@@ -449,7 +450,7 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
         let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
-        let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
+        let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
         return do_sys_open(dirfd, &path, open_flags, mode, follow_symlink);
     }
 
@@ -809,7 +810,7 @@ impl Syscall {
         let filename_from = check_and_clone_cstr(filename_from, Some(MAX_PATHLEN)).unwrap();
         let filename_to = check_and_clone_cstr(filename_to, Some(MAX_PATHLEN)).unwrap();
         // 文件名过长
-        if filename_from.len() > MAX_PATHLEN as usize || filename_to.len() > MAX_PATHLEN as usize {
+        if filename_from.len() > MAX_PATHLEN || filename_to.len() > MAX_PATHLEN {
             return Err(SystemError::ENAMETOOLONG);
         }
 
@@ -1184,8 +1185,8 @@ impl Syscall {
                 StxAttributes::STATX_ATTR_AUTOMOUNT | StxAttributes::STATX_ATTR_DAX;
             tmp.stx_dev_major = metadata.dev_id as u32;
             tmp.stx_dev_minor = metadata.dev_id as u32; //
-            tmp.stx_rdev_major = metadata.raw_dev.data() as u32;
-            tmp.stx_rdev_minor = metadata.raw_dev.data() as u32;
+            tmp.stx_rdev_major = metadata.raw_dev.data();
+            tmp.stx_rdev_minor = metadata.raw_dev.data();
         }
         if mask.contains(PosixStatxMask::STATX_MNT_ID) {
             tmp.stx_mnt_id = 0;
@@ -1270,7 +1271,7 @@ impl Syscall {
         let path = path.as_str().trim();
         let mut user_buf = UserBufferWriter::new(user_buf, buf_size, true)?;
 
-        let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
+        let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
         let inode = inode.lookup(path.as_str())?;
         if inode.metadata()?.file_type != FileType::SymLink {
@@ -1374,7 +1375,7 @@ impl Syscall {
 
         let filesystemtype = producefs!(FSMAKER, filesystemtype)?;
 
-        return Vcore::do_mount(filesystemtype, (format!("{target}")).as_str());
+        return Vcore::do_mount(filesystemtype, target.to_string().as_str());
     }
 
     // 想法：可以在VFS中实现一个文件系统分发器，流程如下：

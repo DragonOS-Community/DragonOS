@@ -88,6 +88,7 @@ impl<T> PerCpuVar<T> {
         &self.inner[cpu_id.data() as usize]
     }
 
+    #[allow(clippy::mut_from_ref)]
     pub fn get_mut(&self) -> &mut T {
         let cpu_id = smp_get_processor_id();
         unsafe {
@@ -99,6 +100,7 @@ impl<T> PerCpuVar<T> {
         &self.inner[cpu_id.data() as usize]
     }
 
+    #[allow(clippy::mut_from_ref)]
     pub unsafe fn force_get_mut(&self, cpu_id: ProcessorId) -> &mut T {
         &mut (self as *const Self as *mut Self).as_mut().unwrap().inner[cpu_id.data() as usize]
     }

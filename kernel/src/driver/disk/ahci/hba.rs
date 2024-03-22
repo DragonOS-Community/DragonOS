@@ -1,4 +1,3 @@
-//use alloc::vec::Vec;
 use core::{intrinsics::size_of, ptr};
 
 use core::sync::atomic::compiler_fence;
@@ -212,13 +211,13 @@ impl HbaPort {
         // Command table offset: 40K + 8K*portno
         // Command table size = 256*32 = 8K per port
         let mut cmdheaders = phys_2_virt(clb as usize) as *mut u64 as *mut HbaCmdHeader;
-        for (i, _ctbas_value) in ctbas.iter().enumerate().take(32) {
+        for ctbas_value in ctbas.iter().take(32) {
             volatile_write!((*cmdheaders).prdtl, 0); // 一开始没有询问，prdtl = 0（预留了8个PRDT项的空间）
-            volatile_write!((*cmdheaders).ctba, ctbas[i]);
+            volatile_write!((*cmdheaders).ctba, *ctbas_value);
             // 这里限制了 prdtl <= 8, 所以一共用了256bytes，如果需要修改，可以修改这里
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
             unsafe {
-                ptr::write_bytes(phys_2_virt(ctbas[i] as usize) as *mut u64, 0, 256);
+                ptr::write_bytes(phys_2_virt(*ctbas_value as usize) as *mut u64, 0, 256);
             }
             cmdheaders = (cmdheaders as usize + size_of::<HbaCmdHeader>()) as *mut HbaCmdHeader;
         }

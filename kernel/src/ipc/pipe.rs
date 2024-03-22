@@ -329,8 +329,9 @@ impl IndexNode for LockedPipeInode {
 
         let mut inode = self.0.lock();
 
-        // TODO: 如果已经没有读端存在了，则向写端进程发送SIGPIPE信号
-        let _ = inode.reader == 0;
+        if inode.reader == 0 {
+            // TODO: 如果已经没有读端存在了，则向写端进程发送SIGPIPE信号
+        }
 
         // 如果管道空间不够
 

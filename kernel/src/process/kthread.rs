@@ -21,8 +21,6 @@ use crate::{
     process::{ProcessManager, ProcessState},
 };
 
-type IrqHandler = dyn Fn(Arc<IrqAction>) -> Result<(), SystemError>;
-
 use super::{fork::CloneFlags, Pid, ProcessControlBlock, ProcessFlags};
 
 /// 内核线程的创建任务列表
@@ -87,6 +85,7 @@ impl KernelThreadPcbPrivate {
 ///
 /// 对于非原始类型的参数，需要使用Box包装
 #[allow(dead_code)]
+#[allow(clippy::type_complexity)]
 pub enum KernelThreadClosure {
     UsizeClosure((Box<dyn Fn(usize) -> i32 + Send + Sync>, usize)),
     StaticUsizeClosure((&'static fn(usize) -> i32, usize)),

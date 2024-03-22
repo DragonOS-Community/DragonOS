@@ -375,21 +375,6 @@ impl IrqManager {
                 return Ok(());
             }
         }
-        // loop {
-        //     if let Some(d) = data {
-        //         if let Err(e) = d.chip_info_read_irqsave().chip().retrigger(&d) {
-        //             if e == SystemError::ENOSYS {
-        //                 data = d.parent_data().map(|p| p.upgrade()).flatten();
-        //             } else {
-        //                 return Err(e);
-        //             }
-        //         } else {
-        //             return Ok(());
-        //         }
-        //     } else {
-        //         break;
-        //     }
-        // }
 
         return Ok(());
     }

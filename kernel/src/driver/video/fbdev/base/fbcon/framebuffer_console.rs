@@ -138,9 +138,9 @@ impl BlittingFbConsole {
         let byte_width = vc_data.font.width as usize / 8;
         let font_height = vc_data.font.height as usize;
         // let mut char_offset = 0;
-        for (char_offset, _) in buf.iter().enumerate().take(cnt as usize) {
+        for (char_offset, char_item) in buf.iter().enumerate().take(cnt as usize) {
             // 在字符表中的index
-            let ch = buf[char_offset] & charmask;
+            let ch = char_item & charmask;
             // 计算出在font表中的偏移量
             let font_offset = ch as usize * cellsize as usize;
             let font_offset_end = font_offset + cellsize as usize;

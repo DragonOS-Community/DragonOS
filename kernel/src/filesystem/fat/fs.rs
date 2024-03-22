@@ -1634,17 +1634,6 @@ impl IndexNode for LockedFATInode {
                 return Err(r);
             }
         }
-        // if r.is_ok() {
-        //     return r;
-        // } else {
-        //     let r = r.unwrap_err();
-        //     if r == SystemError::ENOTEMPTY {
-        //         // 如果要删除的是目录，且不为空，则删除动作未发生，重新加入缓存
-        //         guard.children.insert(name.to_uppercase(), target.clone());
-        //         drop(target_guard);
-        //     }
-        //     return Err(r);
-        // }
     }
 
     fn move_to(

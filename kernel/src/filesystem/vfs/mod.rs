@@ -664,7 +664,6 @@ impl FileSystemMaker {
 
 pub type FileSystemNewFunction = fn() -> Result<Arc<dyn FileSystem>, SystemError>;
 
-
 ///定义公有的文件系统创建器的分布式数组
 #[macro_export]
 macro_rules! define_filesystem_maker_slice {
@@ -676,7 +675,6 @@ macro_rules! define_filesystem_maker_slice {
         compile_error!("define_filesystem_maker_slice! requires at least one argument: slice_name");
     };
 }
-
 
 /// 匹配文件系统类型，创建文件系统实例
 #[macro_export]

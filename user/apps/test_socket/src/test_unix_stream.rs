@@ -1,8 +1,7 @@
-use std::fs::remove_file;
 use std::io::{Error, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::str::from_utf8;
 use std::thread;
+use std::{fs, str};
 
 const SOCKET_PATH: &str = "/test.socket";
 const MSG: &str = "Hello, unix stream socket!";
@@ -18,7 +17,7 @@ fn client() -> std::io::Result<()> {
 pub fn test_unix_stream() -> std::io::Result<()> {
     println!("unix stream socket path: {}", SOCKET_PATH);
     // 删除可能已存在的socket文件
-    remove_file(&SOCKET_PATH).ok();
+    fs::remove_file(&SOCKET_PATH).ok();
     // 创建Unix域监听socket
     let listener = UnixListener::bind(SOCKET_PATH)?;
 
@@ -29,11 +28,11 @@ pub fn test_unix_stream() -> std::io::Result<()> {
 
     let mut buffer = [0; 1024];
     let nbytes = stream.read(&mut buffer).expect("read error");
-    let received_msg = from_utf8(&buffer[..nbytes]).unwrap();
+    let received_msg = str::from_utf8(&buffer[..nbytes]).unwrap();
 
     client_thread.join().ok();
 
-    remove_file(&SOCKET_PATH).ok();
+    fs::remove_file(&SOCKET_PATH).ok();
 
     if received_msg == MSG {
         Ok(())

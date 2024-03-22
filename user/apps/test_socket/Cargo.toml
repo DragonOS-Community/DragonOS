@@ -2,9 +2,3 @@
 name = "test_socket"
 version = "0.1.0"
 edition = "2021"
-description = "A test case for socket"
-authors = [ "yuyi2439 <yuyi2439@qq.com>" ]
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[dependencies]

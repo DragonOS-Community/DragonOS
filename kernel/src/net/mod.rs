@@ -126,9 +126,9 @@ impl From<u8> for Protocol {
     }
 }
 
-impl Into<u8> for Protocol {
-    fn into(self) -> u8 {
-        match self {
+impl From<Protocol> for u8 {
+    fn from(value: Protocol) -> Self {
+        match value {
             Protocol::HopByHop => 0x00,
             Protocol::Icmp => 0x01,
             Protocol::Igmp => 0x02,

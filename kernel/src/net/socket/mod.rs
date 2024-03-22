@@ -417,7 +417,7 @@ impl SocketHandleItem {
     }
 
     pub fn shutdown_type(&self) -> ShutdownType {
-        self.shutdown_type.read().clone()
+        *self.shutdown_type.read()
     }
 
     pub fn shutdown_type_writer(&mut self) -> RwLockWriteGuard<ShutdownType> {
@@ -479,7 +479,7 @@ impl PortManager {
                 if EPHEMERAL_PORT == 65535 {
                     EPHEMERAL_PORT = 49152;
                 } else {
-                    EPHEMERAL_PORT = EPHEMERAL_PORT + 1;
+                    EPHEMERAL_PORT += 1;
                 }
                 port = EPHEMERAL_PORT;
             }
@@ -490,7 +490,7 @@ impl PortManager {
                 SocketType::Tcp => self.tcp_port_table.lock(),
                 _ => panic!("{:?} cann't get a port", socket_type),
             };
-            if let None = listen_table_guard.get(&port) {
+            if listen_table_guard.get(&port).is_none() {
                 drop(listen_table_guard);
                 return Ok(port);
             }
@@ -733,7 +733,7 @@ impl TryFrom<u16> for AddressFamily {
     type Error = SystemError;
     fn try_from(x: u16) -> Result<Self, Self::Error> {
         use num_traits::FromPrimitive;
-        return <Self as FromPrimitive>::from_u16(x).ok_or_else(|| SystemError::EINVAL);
+        return <Self as FromPrimitive>::from_u16(x).ok_or(SystemError::EINVAL);
     }
 }
 
@@ -753,7 +753,7 @@ impl TryFrom<u8> for PosixSocketType {
     type Error = SystemError;
     fn try_from(x: u8) -> Result<Self, Self::Error> {
         use num_traits::FromPrimitive;
-        return <Self as FromPrimitive>::from_u8(x).ok_or_else(|| SystemError::EINVAL);
+        return <Self as FromPrimitive>::from_u8(x).ok_or(SystemError::EINVAL);
     }
 }
 

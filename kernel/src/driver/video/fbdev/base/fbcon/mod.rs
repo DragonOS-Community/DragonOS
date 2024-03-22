@@ -367,6 +367,7 @@ pub trait FrameBufferConsole {
     /// ### dx: 目标位置的x坐标
     /// ### height: 位图高度
     /// ### width: 位图宽度
+    #[allow(clippy::too_many_arguments)]
     fn bmove(
         &self,
         vc_data: &VirtualConsoleData,
@@ -401,6 +402,7 @@ pub trait FrameBufferConsole {
     /// ### x: 起始位置的x坐标、
     /// ### fg: 前景色
     /// ### bg: 背景色
+    #[allow(clippy::too_many_arguments)]
     fn put_string(
         &self,
         vc_data: &VirtualConsoleData,

@@ -89,27 +89,30 @@ fn do_sys_openat2(
         },
     );
 
-    let inode: Arc<dyn IndexNode> = if inode.is_err() {
-        let errno = inode.unwrap_err();
-        // 文件不存在，且需要创建
-        if how.o_flags.contains(FileMode::O_CREAT)
-            && !how.o_flags.contains(FileMode::O_DIRECTORY)
-            && errno == SystemError::ENOENT
-        {
-            let (filename, parent_path) = rsplit_path(&path);
-            // 查找父目录
-            let parent_inode: Arc<dyn IndexNode> =
-                ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
-            // 创建文件
-            let inode: Arc<dyn IndexNode> =
-                parent_inode.create(filename, FileType::File, how.mode)?;
-            inode
-        } else {
-            // 不需要创建文件，因此返回错误码
-            return Err(errno);
+    let inode: Arc<dyn IndexNode> = match inode {
+        Ok(inode) => inode,
+        Err(errno) => {
+            // 文件不存在，且需要创建
+            if how.o_flags.contains(FileMode::O_CREAT)
+                && !how.o_flags.contains(FileMode::O_DIRECTORY)
+                && errno == SystemError::ENOENT
+            {
+                let (filename, parent_path) = rsplit_path(&path);
+                // 查找父目录
+                let parent_inode: Arc<dyn IndexNode> =
+                    ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+                // 创建文件
+                let inode: Arc<dyn IndexNode> = parent_inode.create(
+                    filename,
+                    FileType::File,
+                    ModeType::from_bits_truncate(0o755),
+                )?;
+                inode
+            } else {
+                // 不需要创建文件，因此返回错误码
+                return Err(errno);
+            }
         }
-    } else {
-        inode.unwrap()
     };
 
     let file_type: FileType = inode.metadata()?.file_type;

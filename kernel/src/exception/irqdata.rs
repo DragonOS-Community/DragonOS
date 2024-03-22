@@ -331,6 +331,7 @@ pub trait IrqHandlerData: Send + Sync + Any + Debug + CastFromSync {}
 bitflags! {
     /// 中断线状态
     /// https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irq.h?fi=IRQ_TYPE_PROBE#77
+    #[allow(clippy::bad_bit_mask)]
     pub struct IrqLineStatus: u32 {
         /// 默认，未指明类型
         const IRQ_TYPE_NONE     = 0x00000000;
@@ -420,10 +421,12 @@ impl IrqLineStatus {
         self.contains(Self::IRQ_PER_CPU_DEVID)
     }
 }
+
 bitflags! {
     /// 中断状态（存储在IrqCommonData)
     ///
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irq.h#227
+    #[allow(clippy::bad_bit_mask)]
     pub struct IrqStatus: u32 {
         const IRQD_TRIGGER_NONE = IrqLineStatus::IRQ_TYPE_NONE.bits();
         const IRQD_TRIGGER_RISING = IrqLineStatus::IRQ_TYPE_EDGE_RISING.bits();
@@ -493,7 +496,7 @@ impl IrqStatus {
     }
 
     pub const fn can_balance(&self) -> bool {
-        !((self.bits & (Self::IRQD_PER_CPU.bits | Self::IRQD_NO_BALANCING.bits)) != 0)
+        (self.bits & (Self::IRQD_PER_CPU.bits | Self::IRQD_NO_BALANCING.bits)) == 0
     }
 
     pub const fn affinity_was_set(&self) -> bool {

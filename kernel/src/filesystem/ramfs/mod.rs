@@ -1,6 +1,14 @@
 use core::any::Any;
 use core::intrinsics::unlikely;
 
+use crate::filesystem::vfs::FSMAKER;
+use crate::{
+    driver::base::device::device_number::DeviceNumber,
+    filesystem::vfs::{core::generate_inode_id, FileType},
+    ipc::pipe::LockedPipeInode,
+    libs::spinlock::{SpinLock, SpinLockGuard},
+    time::TimeSpec,
+};
 use alloc::{
     collections::BTreeMap,
     string::String,
@@ -9,17 +17,9 @@ use alloc::{
 };
 use system_error::SystemError;
 
-use crate::{
-    driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{core::generate_inode_id, FileType},
-    ipc::pipe::LockedPipeInode,
-    libs::spinlock::{SpinLock, SpinLockGuard},
-    time::TimeSpec,
-};
-
 use super::vfs::{
-    file::FilePrivateData, syscall::ModeType, FileSystem, FsInfo, IndexNode, InodeId, Metadata,
-    SpecialNodeData,
+    file::FilePrivateData, syscall::ModeType, FileSystem, FileSystemMaker, FsInfo, IndexNode,
+    InodeId, Metadata, SpecialNodeData,
 };
 
 /// RamFS的inode名称的最大长度
@@ -76,6 +76,10 @@ impl FileSystem for RamFS {
     fn as_any_ref(&self) -> &dyn Any {
         self
     }
+
+    fn name(&self) -> &str {
+        "ramfs"
+    }
 }
 
 impl RamFS {
@@ -118,7 +122,18 @@ impl RamFS {
 
         return result;
     }
+
+    pub fn make_ramfs() -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        let fs = RamFS::new();
+        return Ok(fs);
+    }
 }
+
+#[distributed_slice(FSMAKER)]
+static RAMFSMAKER: FileSystemMaker = FileSystemMaker::new(
+    "ramfs",
+    &(RamFS::make_ramfs as fn() -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
+);
 
 impl IndexNode for LockedRamFSInode {
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
@@ -282,8 +297,8 @@ impl IndexNode for LockedRamFSInode {
                 atime: TimeSpec::default(),
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
-                file_type: file_type,
-                mode: mode,
+                file_type,
+                mode,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -486,7 +501,7 @@ impl IndexNode for LockedRamFSInode {
         // 判断需要创建的类型
         if unlikely(mode.contains(ModeType::S_IFREG)) {
             // 普通文件
-            return Ok(self.create(filename, FileType::File, mode)?);
+            return self.create(filename, FileType::File, mode);
         }
 
         let nod = Arc::new(LockedRamFSInode(SpinLock::new(RamFSInode {
@@ -504,7 +519,7 @@ impl IndexNode for LockedRamFSInode {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: FileType::Pipe,
-                mode: mode,
+                mode,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,

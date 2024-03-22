@@ -65,8 +65,9 @@ impl CpuMask {
     pub fn iter_cpu(&self) -> CpuMaskIter {
         CpuMaskIter {
             mask: self,
-            index: ProcessorId::new(0),
+            index: None,
             set: true,
+            begin: true,
         }
     }
 
@@ -74,36 +75,41 @@ impl CpuMask {
     pub fn iter_zero_cpu(&self) -> CpuMaskIter {
         CpuMaskIter {
             mask: self,
-            index: ProcessorId::new(0),
+            index: None,
             set: false,
+            begin: true,
         }
     }
 }
 
 pub struct CpuMaskIter<'a> {
     mask: &'a CpuMask,
-    index: ProcessorId,
+    index: Option<ProcessorId>,
     set: bool,
+    begin: bool,
 }
 
 impl<'a> Iterator for CpuMaskIter<'a> {
     type Item = ProcessorId;
 
     fn next(&mut self) -> Option<ProcessorId> {
-        if self.index.data() == 0 {
+        if self.index.is_none() && self.begin {
             if self.set {
-                self.index = self.mask.first()?;
+                self.index = self.mask.first();
             } else {
-                self.index = self.mask.first_zero()?;
+                self.index = self.mask.first_zero();
             }
+
+            self.begin = false;
+        }
+        let result = self.index;
+        if self.set {
+            self.index = self.mask.next_index(self.index?);
+        } else {
+            self.index = self.mask.next_zero_index(self.index?);
         }
 
-        if self.set {
-            self.index = self.mask.next_index(self.index)?;
-        } else {
-            self.index = self.mask.next_zero_index(self.index)?;
-        }
-        Some(self.index)
+        result
     }
 }
 

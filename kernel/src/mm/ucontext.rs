@@ -178,7 +178,7 @@ impl InnerAddressSpace {
             let new_vma = VMA::zeroed(
                 VirtPageFrame::new(vma_guard.region.start()),
                 PageFrameCount::new(vma_guard.region.size() / MMArch::PAGE_SIZE),
-                vma_guard.vm_flags().clone(),
+                *vma_guard.vm_flags(),
                 tmp_flags,
                 &mut new_guard.user_mapper.utable,
                 (),
@@ -287,7 +287,7 @@ impl InnerAddressSpace {
             prot_flags,
             map_flags,
             move |page, count, flags, mapper, flusher| {
-                Ok(VMA::zeroed(page, count, vm_flags, flags, mapper, flusher)?)
+                VMA::zeroed(page, count, vm_flags, flags, mapper, flusher)
             },
         )?;
 
@@ -434,9 +434,7 @@ impl InnerAddressSpace {
             UserBufferWriter::new(new_page_vaddr.data() as *mut u8, new_len, true)?;
         let new_buf: &mut [u8] = new_buffer_writer.buffer(0)?;
         let len = old_buf.len().min(new_buf.len());
-        for i in 0..len {
-            new_buf[i] = old_buf[i];
-        }
+        new_buf[..len].copy_from_slice(&old_buf[..len]);
 
         return Ok(new_page_vaddr);
     }
@@ -466,16 +464,16 @@ impl InnerAddressSpace {
             let r = r.lock().region;
             let r = self.mappings.remove_vma(&r).unwrap();
             let intersection = r.lock().region().intersect(&to_unmap).unwrap();
-            let (before, r, after) = r.extract(intersection).unwrap();
+            let split_result = r.extract(intersection).unwrap();
 
             // TODO: 当引入后备页映射后，这里需要增加通知文件的逻辑
 
-            if let Some(before) = before {
+            if let Some(before) = split_result.prev {
                 // 如果前面有VMA，则需要将前面的VMA重新插入到地址空间的VMA列表中
                 self.mappings.insert_vma(before);
             }
 
-            if let Some(after) = after {
+            if let Some(after) = split_result.after {
                 // 如果后面有VMA，则需要将后面的VMA重新插入到地址空间的VMA列表中
                 self.mappings.insert_vma(after);
             }
@@ -517,16 +515,16 @@ impl InnerAddressSpace {
 
         for r in regions {
             // kdebug!("mprotect: r: {:?}", r);
-            let r = r.lock().region().clone();
+            let r = *r.lock().region();
             let r = self.mappings.remove_vma(&r).unwrap();
 
             let intersection = r.lock().region().intersect(&region).unwrap();
-            let (before, r, after) = r.extract(intersection).expect("Failed to extract VMA");
+            let split_result = r.extract(intersection).expect("Failed to extract VMA");
 
-            if let Some(before) = before {
+            if let Some(before) = split_result.prev {
                 self.mappings.insert_vma(before);
             }
-            if let Some(after) = after {
+            if let Some(after) = split_result.after {
                 self.mappings.insert_vma(after);
             }
 
@@ -625,7 +623,7 @@ impl InnerAddressSpace {
         let new_brk = if incr > 0 {
             self.brk + incr as usize
         } else {
-            self.brk - (incr.abs() as usize)
+            self.brk - incr.unsigned_abs()
         };
 
         let new_brk = VirtAddr::new(page_align_up(new_brk.data()));
@@ -707,7 +705,7 @@ impl UserMappings {
         let r = self
             .vmas
             .iter()
-            .filter(move |v| !v.lock().region.intersect(&request).is_none())
+            .filter(move |v| v.lock().region.intersect(&request).is_some())
             .cloned();
         return r;
     }
@@ -829,7 +827,7 @@ impl UserMappings {
 
     /// 在当前进程的映射关系中，插入一个新的VMA。
     pub fn insert_vma(&mut self, vma: Arc<LockedVMA>) {
-        let region = vma.lock().region.clone();
+        let region = vma.lock().region;
         // 要求插入的地址范围必须是空闲的，也就是说，当前进程的地址空间中，不能有任何与之重叠的VMA。
         assert!(self.conflicts(region).next().is_none());
         self.reserve_hole(&region);
@@ -963,14 +961,7 @@ impl LockedVMA {
     /// 1. 前面的VMA，如果没有则为None
     /// 2. 中间的VMA，也就是传入的Region
     /// 3. 后面的VMA，如果没有则为None
-    pub fn extract(
-        &self,
-        region: VirtRegion,
-    ) -> Option<(
-        Option<Arc<LockedVMA>>,
-        Arc<LockedVMA>,
-        Option<Arc<LockedVMA>>,
-    )> {
+    pub fn extract(&self, region: VirtRegion) -> Option<VMASplitResult> {
         assert!(region.start().check_aligned(MMArch::PAGE_SIZE));
         assert!(region.end().check_aligned(MMArch::PAGE_SIZE));
 
@@ -990,7 +981,11 @@ impl LockedVMA {
             let intersect: VirtRegion = intersect.unwrap();
             if unlikely(intersect == guard.region) {
                 // 如果当前VMA完全包含region，则直接返回当前VMA
-                return Some((None, guard.self_ref.upgrade().unwrap(), None));
+                return Some(VMASplitResult::new(
+                    None,
+                    guard.self_ref.upgrade().unwrap(),
+                    None,
+                ));
             }
         }
 
@@ -1014,7 +1009,32 @@ impl LockedVMA {
 
         // TODO: 重新设置before、after这两个VMA里面的物理页的anon_vma
 
-        return Some((before, guard.self_ref.upgrade().unwrap(), after));
+        return Some(VMASplitResult::new(
+            before,
+            guard.self_ref.upgrade().unwrap(),
+            after,
+        ));
+    }
+}
+
+/// VMA切分结果
+pub struct VMASplitResult {
+    pub prev: Option<Arc<LockedVMA>>,
+    pub middle: Arc<LockedVMA>,
+    pub after: Option<Arc<LockedVMA>>,
+}
+
+impl VMASplitResult {
+    pub fn new(
+        prev: Option<Arc<LockedVMA>>,
+        middle: Arc<LockedVMA>,
+        post: Option<Arc<LockedVMA>>,
+    ) -> Self {
+        Self {
+            prev,
+            middle,
+            after: post,
+        }
     }
 }
 
@@ -1293,7 +1313,7 @@ impl Eq for VMA {}
 
 impl PartialOrd for VMA {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        return self.region.partial_cmp(&other.region);
+        Some(self.cmp(other))
     }
 }
 

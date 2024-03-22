@@ -262,7 +262,9 @@ pub fn next_n_us_timer_jiffies(expire_us: u64) -> u64 {
 pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
     // kdebug!("schedule_timeout");
     if timeout == MAX_TIMEOUT {
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(true).ok();
+        drop(irq_guard);
         sched();
         return Ok(MAX_TIMEOUT);
     } else if timeout < 0 {

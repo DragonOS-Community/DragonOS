@@ -41,7 +41,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
-    mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
+    mm::{percpu::PerCpuVar, set_IDLE_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
     net::socket::SocketInode,
     sched::{
         completion::Completion,
@@ -65,9 +65,10 @@ pub mod fork;
 pub mod idle;
 pub mod kthread;
 pub mod pid;
-pub mod process;
 pub mod resource;
+pub mod stdio;
 pub mod syscall;
+pub mod utils;
 
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);
@@ -109,7 +110,7 @@ impl ProcessManager {
             compiler_fence(Ordering::SeqCst);
             kdebug!("To create address space for INIT process.");
             // test_buddy();
-            set_INITIAL_PROCESS_ADDRESS_SPACE(
+            set_IDLE_PROCESS_ADDRESS_SPACE(
                 AddressSpace::new(true).expect("Failed to create address space for INIT process."),
             );
             kdebug!("INIT process address space created.");
@@ -259,9 +260,8 @@ impl ProcessManager {
     /// - 进入当前函数之前，必须关闭中断
     /// - 进入当前函数之后必须保证逻辑的正确性，避免被重复加入调度队列
     pub fn mark_sleep(interruptable: bool) -> Result<(), SystemError> {
-        assert_eq!(
-            CurrentIrqArch::is_irq_enabled(),
-            false,
+        assert!(
+            !CurrentIrqArch::is_irq_enabled(),
             "interrupt must be disabled before enter ProcessManager::mark_sleep()"
         );
 
@@ -284,9 +284,8 @@ impl ProcessManager {
     /// - 进入当前函数之前，不能持有sched_info的锁
     /// - 进入当前函数之前，必须关闭中断
     pub fn mark_stop() -> Result<(), SystemError> {
-        assert_eq!(
-            CurrentIrqArch::is_irq_enabled(),
-            false,
+        assert!(
+            !CurrentIrqArch::is_irq_enabled(),
             "interrupt must be disabled before enter ProcessManager::mark_stop()"
         );
 
@@ -338,6 +337,7 @@ impl ProcessManager {
         // 关中断
         unsafe { CurrentIrqArch::interrupt_disable() };
         let pcb = ProcessManager::current_pcb();
+        let pid = pcb.pid();
         pcb.sched_info
             .inner_lock_write_irqsave()
             .set_state(ProcessState::Exited(exit_code));
@@ -368,7 +368,11 @@ impl ProcessManager {
         unsafe { CurrentIrqArch::interrupt_enable() };
 
         sched();
-        loop {}
+        kerror!("pid {pid:?} exited but sched again!");
+        #[allow(clippy::empty_loop)]
+        loop {
+            spin_loop();
+        }
     }
 
     pub unsafe fn release(pid: Pid) {
@@ -426,8 +430,6 @@ impl ProcessManager {
         let cpu_id = pcb.sched_info().on_cpu();
 
         if let Some(cpu_id) = cpu_id {
-            let cpu_id = cpu_id;
-
             if pcb.pid() == CPU_EXECUTING.get(cpu_id) {
                 kick_cpu(cpu_id).expect("ProcessManager::kick(): Failed to kick cpu");
             }
@@ -450,8 +452,8 @@ pub unsafe extern "C" fn switch_finish_hook() {
 
 int_like!(Pid, AtomicPid, usize, AtomicUsize);
 
-impl Pid {
-    pub fn to_string(&self) -> String {
+impl ToString for Pid {
+    fn to_string(&self) -> String {
         self.0.to_string()
     }
 }
@@ -623,7 +625,7 @@ impl ProcessControlBlock {
 
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find(ppid)
             .map(|p| Arc::downgrade(&p))
-            .unwrap_or_else(|| Weak::new());
+            .unwrap_or_default();
 
         let pcb = Self {
             pid,
@@ -642,7 +644,7 @@ impl ProcessControlBlock {
             parent_pcb: RwLock::new(ppcb.clone()),
             real_parent_pcb: RwLock::new(ppcb),
             children: RwLock::new(Vec::new()),
-            wait_queue: WaitQueue::INIT,
+            wait_queue: WaitQueue::default(),
             thread: RwLock::new(ThreadInfo::new()),
         };
 
@@ -1192,7 +1194,7 @@ impl KernelStack {
     ///
     /// 仅仅用于BSP启动时，为idle进程构造内核栈。其他时候使用这个函数，很可能造成错误！
     pub unsafe fn from_existed(base: VirtAddr) -> Result<Self, SystemError> {
-        if base.is_null() || base.check_aligned(Self::ALIGN) == false {
+        if base.is_null() || !base.check_aligned(Self::ALIGN) {
             return Err(SystemError::EFAULT);
         }
 
@@ -1273,7 +1275,7 @@ impl KernelStack {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        if !self.stack.is_none() {
+        if self.stack.is_some() {
             let ptr = self.stack.as_ref().unwrap().as_ptr() as *const *const ProcessControlBlock;
             if unsafe { !(*ptr).is_null() } {
                 let pcb_ptr: Weak<ProcessControlBlock> = unsafe { Weak::from_raw(*ptr) };

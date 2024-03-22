@@ -394,4 +394,8 @@ impl FileSystem for MountFS {
     fn as_any_ref(&self) -> &dyn Any {
         self
     }
+
+    fn name(&self) -> &str {
+        "mountfs"
+    }
 }

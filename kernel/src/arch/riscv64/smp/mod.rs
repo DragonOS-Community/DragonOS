@@ -1,6 +1,9 @@
 use system_error::SystemError;
 
-use crate::smp::SMPArch;
+use crate::smp::{
+    cpu::{CpuHpCpuState, ProcessorId},
+    SMPArch,
+};
 
 pub struct RiscV64SMPArch;
 
@@ -10,7 +13,7 @@ impl SMPArch for RiscV64SMPArch {
         todo!()
     }
 
-    fn init() -> Result<(), SystemError> {
+    fn start_cpu(cpu_id: ProcessorId, hp_state: &CpuHpCpuState) -> Result<(), SystemError> {
         todo!()
     }
 }

@@ -12,9 +12,10 @@ use system_error::SystemError;
 use crate::{driver::base::device::device_number::DeviceNumber, libs::spinlock::SpinLock};
 
 use super::{
-    file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
+    file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId, SuperBlock,
 };
-
+const BLOCK_SIZE: u64 = 1024;
+const MOUNTFS_MAX_NAMELEN: u64 = 64;
 /// @brief 挂载文件系统
 /// 挂载文件系统的时候，套了MountFS这一层，以实现文件系统的递归挂载
 #[derive(Debug)]
@@ -397,5 +398,8 @@ impl FileSystem for MountFS {
 
     fn name(&self) -> &str {
         "mountfs"
+    }
+    fn super_block(&self) -> super::SuperBlock {
+        SuperBlock::new(61267, BLOCK_SIZE, MOUNTFS_MAX_NAMELEN)
     }
 }

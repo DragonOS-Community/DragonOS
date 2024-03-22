@@ -19,8 +19,7 @@ use crate::{
     },
     kerror, kinfo,
     libs::{
-        once::Once,
-        spinlock::{SpinLock, SpinLockGuard},
+        once::Once, rwlock::RwLock, spinlock::{SpinLock, SpinLockGuard}
     },
     mm::allocator::page_frame::FrameAllocator,
     process::{Pid, ProcessManager},
@@ -30,7 +29,7 @@ use crate::{
 use super::vfs::{
     file::{FileMode, FilePrivateData},
     syscall::ModeType,
-    FileSystem, FsInfo, IndexNode, InodeId, Metadata,
+    FileSystem, FsInfo, IndexNode, InodeId, Metadata, SuperBlock,
 };
 
 pub mod kmsg;
@@ -76,7 +75,8 @@ pub struct InodeInfo {
 
 /// @brief procfs的inode名称的最大长度
 const PROCFS_MAX_NAMELEN: usize = 64;
-
+const PROC_MAGIC: u64 = 0x9fa0;
+const BLOCK_SIZE: u64 = 1024;
 /// @brief procfs文件系统的Inode结构体
 #[derive(Debug)]
 pub struct LockedProcFSInode(SpinLock<ProcFSInode>);
@@ -86,6 +86,7 @@ pub struct LockedProcFSInode(SpinLock<ProcFSInode>);
 pub struct ProcFS {
     /// procfs的root inode
     root_inode: Arc<LockedProcFSInode>,
+    super_block: RwLock<SuperBlock>,
 }
 
 #[derive(Debug, Clone)]
@@ -284,10 +285,15 @@ impl FileSystem for ProcFS {
     fn name(&self) -> &str {
         "procfs"
     }
+
+    fn super_block(&self) -> super::vfs::SuperBlock {
+        self.super_block.read().clone()
+    }
 }
 
 impl ProcFS {
     pub fn new() -> Arc<Self> {
+        let super_block = SuperBlock::new(PROC_MAGIC,BLOCK_SIZE,PROCFS_MAX_NAMELEN as u64);
         // 初始化root inode
         let root: Arc<LockedProcFSInode> =
             Arc::new(LockedProcFSInode(SpinLock::new(ProcFSInode {
@@ -318,7 +324,7 @@ impl ProcFS {
                 },
             })));
 
-        let result: Arc<ProcFS> = Arc::new(ProcFS { root_inode: root });
+        let result: Arc<ProcFS> = Arc::new(ProcFS { root_inode: root, super_block: RwLock::new(super_block)});
 
         // 对root inode加锁，并继续完成初始化工作
         let mut root_guard: SpinLockGuard<ProcFSInode> = result.root_inode.0.lock();

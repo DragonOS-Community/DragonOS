@@ -22,7 +22,7 @@ use self::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 
 use super::vfs::{
     core::generate_inode_id, file::FileMode, syscall::ModeType, FilePrivateData, FileSystem,
-    FileType, FsInfo, IndexNode, InodeId, Metadata,
+    FileType, FsInfo, IndexNode, InodeId, Metadata, SuperBlock,
 };
 
 pub mod callback;
@@ -51,11 +51,15 @@ impl FileSystem for KernFS {
     fn name(&self) -> &str {
         "kernfs"
     }
+
+    fn super_block(&self) -> super::vfs::SuperBlock {
+        SuperBlock::new(61267,KernFS::BLOCK_SIZE,KernFS::MAX_NAMELEN as u64)
+    }
 }
 
 impl KernFS {
     pub const MAX_NAMELEN: usize = 4096;
-
+    pub const BLOCK_SIZE: u64 = 1024;
     #[allow(dead_code)]
     pub fn new() -> Arc<Self> {
         let root_inode = Self::create_root_inode();

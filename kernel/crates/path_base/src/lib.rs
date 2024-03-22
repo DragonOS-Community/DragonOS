@@ -550,7 +550,6 @@ impl fmt::Debug for Iter<'_> {
 }
 
 impl<'a> Iter<'a> {
-
     #[must_use]
     #[inline]
     pub fn as_path(&self) -> &'a Path {
@@ -1380,7 +1379,6 @@ impl Path {
         self.inner.as_bytes()
     }
 
-
     pub fn new<S: AsRef<str> + ?Sized>(s: &S) -> &Path {
         unsafe { &*(s.as_ref() as *const str as *const Path) }
     }
@@ -1402,7 +1400,6 @@ impl Path {
     pub fn as_mut_os_str(&mut self) -> &mut str {
         &mut self.inner
     }
-
 
     #[must_use = "this returns the result of the operation, \
                   without modifying the original"]

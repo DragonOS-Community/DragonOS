@@ -248,28 +248,6 @@ impl Hash for PrefixComponent<'_> {
     }
 }
 
-/// A single component of a path.
-///
-/// A `Component` roughly corresponds to a substring between path separators
-/// (`/` or `\`).
-///
-/// This `enum` is created by iterating over [`Components`], which in turn is
-/// created by the [`components`](Path::components) method on [`Path`].
-///
-/// # Examples
-///
-/// ```rust
-/// use std::path::{Component, Path};
-///
-/// let path = Path::new("/tmp/foo/bar.txt");
-/// let components = path.components().collect::<Vec<_>>();
-/// assert_eq!(&components, &[
-///     Component::RootDir,
-///     Component::Normal("tmp".as_ref()),
-///     Component::Normal("foo".as_ref()),
-///     Component::Normal("bar.txt".as_ref()),
-/// ]);
-/// ```
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 
 pub enum Component<'a> {
@@ -325,24 +303,6 @@ impl AsRef<Path> for Component<'_> {
     }
 }
 
-/// An iterator over the [`Component`]s of a [`Path`].
-///
-/// This `struct` is created by the [`components`] method on [`Path`].
-/// See its documentation for more.
-///
-/// # Examples
-///
-/// ```
-/// use std::path::Path;
-///
-/// let path = Path::new("/tmp/foo/bar.txt");
-///
-/// for component in path.components() {
-///     println!("{component:?}");
-/// }
-/// ```
-///
-/// [`components`]: Path::components
 #[derive(Clone)]
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 
@@ -449,19 +409,6 @@ impl<'a> Components<'a> {
         }
     }
 
-    /// Extracts a slice corresponding to the portion of the path remaining for iteration.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    ///
-    /// let mut components = Path::new("/tmp/foo/bar.txt").components();
-    /// components.next();
-    /// components.next();
-    ///
-    /// assert_eq!(Path::new("foo/bar.txt"), components.as_path());
-    /// ```
     #[must_use]
 
     pub fn as_path(&self) -> &'a Path {
@@ -603,19 +550,6 @@ impl fmt::Debug for Iter<'_> {
 }
 
 impl<'a> Iter<'a> {
-    /// Extracts a slice corresponding to the portion of the path remaining for iteration.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    ///
-    /// let mut iter = Path::new("/tmp/foo/bar.txt").iter();
-    /// iter.next();
-    /// iter.next();
-    ///
-    /// assert_eq!(Path::new("foo/bar.txt"), iter.as_path());
-    /// ```
 
     #[must_use]
     #[inline]
@@ -837,24 +771,6 @@ fn compare_components(mut left: Components<'_>, mut right: Components<'_>) -> cm
     Iterator::cmp(left, right)
 }
 
-/// An iterator over [`Path`] and its ancestors.
-///
-/// This `struct` is created by the [`ancestors`] method on [`Path`].
-/// See its documentation for more.
-///
-/// # Examples
-///
-/// ```
-/// use std::path::Path;
-///
-/// let path = Path::new("/foo/bar");
-///
-/// for ancestor in path.ancestors() {
-///     println!("{}", ancestor.display());
-/// }
-/// ```
-///
-/// [`ancestors`]: Path::ancestors
 #[derive(Copy, Clone, Debug)]
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct Ancestors<'a> {
@@ -874,59 +790,6 @@ impl<'a> Iterator for Ancestors<'a> {
 
 impl FusedIterator for Ancestors<'_> {}
 
-////////////////////////////////////////////////////////////////////////////////
-// Basic types and traits
-////////////////////////////////////////////////////////////////////////////////
-
-/// An owned, mutable path (akin to [`String`]).
-///
-/// This type provides methods like [`push`] and [`set_extension`] that mutate
-/// the path in place. It also implements [`Deref`] to [`Path`], meaning that
-/// all methods on [`Path`] slices are available on `PathBuf` values as well.
-///
-/// [`push`]: PathBuf::push
-/// [`set_extension`]: PathBuf::set_extension
-///
-/// More details about the overall approach can be found in
-/// the [module documentation](self).
-///
-/// # Examples
-///
-/// You can use [`push`] to build up a `PathBuf` from
-/// components:
-///
-/// ```
-/// use std::path::PathBuf;
-///
-/// let mut path = PathBuf::new();
-///
-/// path.push(r"C:\");
-/// path.push("windows");
-/// path.push("system32");
-///
-/// path.set_extension("dll");
-/// ```
-///
-/// However, [`push`] is best used for dynamic situations. This is a better way
-/// to do this when you know all of the components ahead of time:
-///
-/// ```
-/// use std::path::PathBuf;
-///
-/// let path: PathBuf = [r"C:\", "windows", "system32.dll"].iter().collect();
-/// ```
-///
-/// We can still do better than this! Since these are all strings, we can use
-/// `From::from`:
-///
-/// ```
-/// use std::path::PathBuf;
-///
-/// let path = PathBuf::from(r"C:\windows\system32.dll");
-/// ```
-///
-/// Which method works best depends on what kind of situation you're in.
-
 // `PathBuf::as_mut_vec` current implementation relies
 // on `PathBuf` being layout-compatible with `Vec<u8>`.
 // However, `PathBuf` layout is considered an implementation detail and must not be relied upon. We
@@ -943,16 +806,6 @@ impl PathBuf {
         unsafe { &mut *(self as *mut PathBuf as *mut Vec<u8>) }
     }
 
-    /// Allocates an empty `PathBuf`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::PathBuf;
-    ///
-    /// let path = PathBuf::new();
-    /// ```
-
     #[must_use]
     #[inline]
     pub fn new() -> PathBuf {
@@ -961,24 +814,6 @@ impl PathBuf {
         }
     }
 
-    /// Creates a new `PathBuf` with a given capacity used to create the
-    /// internal [`string`]. See [`with_capacity`] defined on [`string`].
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::PathBuf;
-    ///
-    /// let mut path = PathBuf::with_capacity(10);
-    /// let capacity = path.capacity();
-    ///
-    /// // This push is done without reallocating
-    /// path.push(r"C:\");
-    ///
-    /// assert_eq!(capacity, path.capacity());
-    /// ```
-    ///
-    /// [`with_capacity`]: string::with_capacity
     #[must_use]
     #[inline]
     pub fn with_capacity(capacity: usize) -> PathBuf {
@@ -987,60 +822,11 @@ impl PathBuf {
         }
     }
 
-    /// Coerces to a [`Path`] slice.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::{Path, PathBuf};
-    ///
-    /// let p = PathBuf::from("/test");
-    /// assert_eq!(Path::new("/test"), p.as_path());
-    /// ```
-
     #[must_use]
     #[inline]
     pub fn as_path(&self) -> &Path {
         self
     }
-
-    /// Extends `self` with `path`.
-    ///
-    /// If `path` is absolute, it replaces the current path.
-    ///
-    /// On Windows:
-    ///
-    /// * if `path` has a root but no prefix (e.g., `\windows`), it
-    ///   replaces everything except for the prefix (if any) of `self`.
-    /// * if `path` has a prefix but no root, it replaces `self`.
-    /// * if `self` has a verbatim prefix (e.g. `\\?\C:\windows`)
-    ///   and `path` is not empty, the new path is normalized: all references
-    ///   to `.` and `..` are removed.
-    ///
-    /// Consider using [`Path::join`] if you need a new `PathBuf` instead of
-    /// using this function on a cloned `PathBuf`.
-    ///
-    /// # Examples
-    ///
-    /// Pushing a relative path extends the existing path:
-    ///
-    /// ```
-    /// use std::path::PathBuf;
-    ///
-    /// let mut path = PathBuf::from("/tmp");
-    /// path.push("file.bk");
-    /// assert_eq!(path, PathBuf::from("/tmp/file.bk"));
-    /// ```
-    ///
-    /// Pushing an absolute path replaces the existing path:
-    ///
-    /// ```
-    /// use std::path::PathBuf;
-    ///
-    /// let mut path = PathBuf::from("/tmp");
-    /// path.push("/etc");
-    /// assert_eq!(path, PathBuf::from("/etc"));
-    /// ```
 
     pub fn push<P: AsRef<Path>>(&mut self, path: P) {
         self._push(path.as_ref())
@@ -1121,26 +907,6 @@ impl PathBuf {
         self.inner.push_str(path.as_ref());
     }
 
-    /// Truncates `self` to [`self.parent`].
-    ///
-    /// Returns `false` and does nothing if [`self.parent`] is [`None`].
-    /// Otherwise, returns `true`.
-    ///
-    /// [`self.parent`]: Path::parent
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::{Path, PathBuf};
-    ///
-    /// let mut p = PathBuf::from("/spirited/away.rs");
-    ///
-    /// p.pop();
-    /// assert_eq!(Path::new("/spirited"), p);
-    /// p.pop();
-    /// assert_eq!(Path::new("/"), p);
-    /// ```
-
     pub fn pop(&mut self) -> bool {
         match self.parent().map(|p| p.as_u8_slice().len()) {
             Some(len) => {
@@ -1150,37 +916,6 @@ impl PathBuf {
             None => false,
         }
     }
-
-    /// Updates [`self.file_name`] to `file_name`.
-    ///
-    /// If [`self.file_name`] was [`None`], this is equivalent to pushing
-    /// `file_name`.
-    ///
-    /// Otherwise it is equivalent to calling [`pop`] and then pushing
-    /// `file_name`. The new path will be a sibling of the original path.
-    /// (That is, it will have the same parent.)
-    ///
-    /// [`self.file_name`]: Path::file_name
-    /// [`pop`]: PathBuf::pop
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::PathBuf;
-    ///
-    /// let mut buf = PathBuf::from("/");
-    /// assert!(buf.file_name() == None);
-    ///
-    /// buf.set_file_name("foo.txt");
-    /// assert!(buf == PathBuf::from("/foo.txt"));
-    /// assert!(buf.file_name().is_some());
-    ///
-    /// buf.set_file_name("bar.txt");
-    /// assert!(buf == PathBuf::from("/bar.txt"));
-    ///
-    /// buf.set_file_name("baz");
-    /// assert!(buf == PathBuf::from("/baz"));
-    /// ```
 
     pub fn set_file_name<S: AsRef<str>>(&mut self, file_name: S) {
         self._set_file_name(file_name.as_ref())
@@ -1193,58 +928,6 @@ impl PathBuf {
         }
         self.push(file_name);
     }
-
-    /// Updates [`self.extension`] to `Some(extension)` or to `None` if
-    /// `extension` is empty.
-    ///
-    /// Returns `false` and does nothing if [`self.file_name`] is [`None`],
-    /// returns `true` and updates the extension otherwise.
-    ///
-    /// If [`self.extension`] is [`None`], the extension is added; otherwise
-    /// it is replaced.
-    ///
-    /// If `extension` is the empty string, [`self.extension`] will be [`None`]
-    /// afterwards, not `Some("")`.
-    ///
-    /// # Caveats
-    ///
-    /// The new `extension` may contain dots and will be used in its entirety,
-    /// but only the part after the final dot will be reflected in
-    /// [`self.extension`].
-    ///
-    /// If the file stem contains internal dots and `extension` is empty, part
-    /// of the old file stem will be considered the new [`self.extension`].
-    ///
-    /// See the examples below.
-    ///
-    /// [`self.file_name`]: Path::file_name
-    /// [`self.extension`]: Path::extension
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::{Path, PathBuf};
-    ///
-    /// let mut p = PathBuf::from("/feel/the");
-    ///
-    /// p.set_extension("force");
-    /// assert_eq!(Path::new("/feel/the.force"), p.as_path());
-    ///
-    /// p.set_extension("dark.side");
-    /// assert_eq!(Path::new("/feel/the.dark.side"), p.as_path());
-    ///
-    /// p.set_extension("cookie");
-    /// assert_eq!(Path::new("/feel/the.dark.cookie"), p.as_path());
-    ///
-    /// p.set_extension("");
-    /// assert_eq!(Path::new("/feel/the.dark"), p.as_path());
-    ///
-    /// p.set_extension("");
-    /// assert_eq!(Path::new("/feel/the"), p.as_path());
-    ///
-    /// p.set_extension("");
-    /// assert_eq!(Path::new("/feel/the"), p.as_path());
-    /// ```
 
     pub fn set_extension<S: AsRef<str>>(&mut self, extension: S) -> bool {
         self._set_extension(extension.as_ref())
@@ -1273,38 +956,11 @@ impl PathBuf {
         true
     }
 
-    /// Yields a mutable reference to the underlying [`string`] instance.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::{Path, PathBuf};
-    ///
-    /// let mut path = PathBuf::from("/foo");
-    ///
-    /// path.push("bar");
-    /// assert_eq!(path, Path::new("/foo/bar"));
-    ///
-    /// // string's `push` does not add a separator.
-    /// path.as_mut_os_string().push("baz");
-    /// assert_eq!(path, Path::new("/foo/barbaz"));
-    /// ```
     #[must_use]
     #[inline]
     pub fn as_mut_os_string(&mut self) -> &mut String {
         &mut self.inner
     }
-
-    /// Consumes the `PathBuf`, yielding its internal [`string`] storage.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::PathBuf;
-    ///
-    /// let p = PathBuf::from("/the/head");
-    /// let os_str = p.into_os_string();
-    /// ```
 
     #[must_use = "`self` will be dropped if the result is not used"]
     #[inline]
@@ -1482,16 +1138,6 @@ impl From<PathBuf> for String {
     }
 }
 
-// impl From<String> for PathBuf {
-//     /// Converts a [`String`] into a [`PathBuf`]
-//     ///
-//     /// This conversion does not allocate or copy memory.
-//     #[inline]
-//     fn from(s: String) -> PathBuf {
-//         PathBuf::from(String::from(s))
-//     }
-// }
-
 impl FromStr for PathBuf {
     type Err = core::convert::Infallible;
 
@@ -1513,11 +1159,6 @@ impl<P: AsRef<Path>> Extend<P> for PathBuf {
     fn extend<I: IntoIterator<Item = P>>(&mut self, iter: I) {
         iter.into_iter().for_each(move |p| self.push(p.as_ref()));
     }
-
-    // #[inline]
-    // fn extend_one(&mut self, p: P) {
-    //     self.push(p.as_ref());
-    // }
 }
 
 impl fmt::Debug for PathBuf {
@@ -1739,28 +1380,6 @@ impl Path {
         self.inner.as_bytes()
     }
 
-    /// Directly wraps a string slice as a `Path` slice.
-    ///
-    /// This is a cost-free conversion.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    ///
-    /// Path::new("foo.txt");
-    /// ```
-    ///
-    /// You can create `Path`s from `String`s, or even other `Path`s:
-    ///
-    /// ```
-    /// use std::path::Path;
-    ///
-    /// let string = String::from("foo.txt");
-    /// let from_string = Path::new(&String);
-    /// let from_path = Path::new(&from_string);
-    /// assert_eq!(from_string, from_path);
-    /// ```
 
     pub fn new<S: AsRef<str> + ?Sized>(s: &S) -> &Path {
         unsafe { &*(s.as_ref() as *const str as *const Path) }
@@ -1772,60 +1391,18 @@ impl Path {
         unsafe { &mut *(inner as *mut str as *mut Path) }
     }
 
-    /// Yields the underlying [`str`] slice.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    ///
-    /// let os_str = Path::new("foo.txt").as_os_str();
-    /// assert_eq!(os_str, std::ffi::str::new("foo.txt"));
-    /// ```
-
     #[must_use]
     #[inline]
     pub fn as_os_str(&self) -> &str {
         &self.inner
     }
 
-    /// Yields a mutable reference to the underlying [`str`] slice.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::{Path, PathBuf};
-    ///
-    /// let mut path = PathBuf::from("Foo.TXT");
-    ///
-    /// assert_ne!(path, Path::new("foo.txt"));
-    ///
-    /// path.as_mut_os_str().make_ascii_lowercase();
-    /// assert_eq!(path, Path::new("foo.txt"));
-    /// ```
-    // #[stable(feature = "path_as_mut_os_str", since = "1.70.0")]
     #[must_use]
     #[inline]
     pub fn as_mut_os_str(&mut self) -> &mut str {
         &mut self.inner
     }
 
-    /// Yields a [`&str`] slice if the `Path` is valid unicode.
-    ///
-    /// This conversion may entail doing a check for UTF-8 validity.
-    /// Note that validation is performed because non-UTF-8 strings are
-    /// perfectly valid for some OS.
-    ///
-    /// [`&str`]: str
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    ///
-    /// let path = Path::new("foo.txt");
-    /// assert_eq!(path.to_str(), Some("foo.txt"));
-    /// ```
 
     #[must_use = "this returns the result of the operation, \
                   without modifying the original"]
@@ -1834,70 +1411,12 @@ impl Path {
         Some(&self.inner)
     }
 
-    /// Converts a `Path` to a [`Cow<str>`].
-    ///
-    /// Any non-Unicode sequences are replaced with
-    /// [`U+FFFD REPLACEMENT CHARACTER`][U+FFFD].
-    ///
-    /// [U+FFFD]: super::char::REPLACEMENT_CHARACTER
-    ///
-    /// # Examples
-    ///
-    /// Calling `to_string_lossy` on a `Path` with valid unicode:
-    ///
-    /// ```
-    /// use std::path::Path;
-    ///
-    /// let path = Path::new("foo.txt");
-    /// assert_eq!(path.to_string_lossy(), "foo.txt");
-    /// ```
-    ///
-    /// Had `path` contained invalid unicode, the `to_string_lossy` call might
-    /// have returned `"fo�.txt"`.
-
-    // #[must_use = "this returns the result of the operation, \
-    //               without modifying the original"]
-    // #[inline]
-    // pub fn to_string_lossy(&self) -> Cow<'_, str> {
-    //     self.inner.to_string()
-    // }
-
-    /// Converts a `Path` to an owned [`PathBuf`].
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    ///
-    /// let path_buf = Path::new("foo.txt").to_path_buf();
-    /// assert_eq!(path_buf, std::path::PathBuf::from("foo.txt"));
-    /// ```
-    // #[rustc_conversion_suggestion]
     #[must_use = "this returns the result of the operation, \
                   without modifying the original"]
 
     pub fn to_path_buf(&self) -> PathBuf {
         PathBuf::from(self.inner.to_string())
     }
-
-    /// Returns `true` if the `Path` is absolute, i.e., if it is independent of
-    /// the current directory.
-    ///
-    /// * On Unix, a path is absolute if it starts with the root, so
-    /// `is_absolute` and [`has_root`] are equivalent.
-    ///
-    /// * On Windows, a path is absolute if it has a prefix and starts with the
-    /// root: `c:\windows` is absolute, while `c:temp` and `\temp` are not.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    ///
-    /// assert!(!Path::new("foo.txt").is_absolute());
-    /// ```
-    ///
-    /// [`has_root`]: Path::has_root
 
     #[must_use]
     #[allow(deprecated)]
@@ -1910,20 +1429,6 @@ impl Path {
         }
     }
 
-    /// Returns `true` if the `Path` is relative, i.e., not absolute.
-    ///
-    /// See [`is_absolute`]'s documentation for more details.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    ///
-    /// assert!(Path::new("foo.txt").is_relative());
-    /// ```
-    ///
-    /// [`is_absolute`]: Path::is_absolute
-
     #[must_use]
     #[inline]
     pub fn is_relative(&self) -> bool {
@@ -1934,57 +1439,11 @@ impl Path {
         self.components().prefix
     }
 
-    /// Returns `true` if the `Path` has a root.
-    ///
-    /// * On Unix, a path has a root if it begins with `/`.
-    ///
-    /// * On Windows, a path has a root if it:
-    ///     * has no prefix and begins with a separator, e.g., `\windows`
-    ///     * has a prefix followed by a separator, e.g., `c:\windows` but not `c:windows`
-    ///     * has any non-disk prefix, e.g., `\\server\share`
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    ///
-    /// assert!(Path::new("/etc/passwd").has_root());
-    /// ```
-
     #[must_use]
     #[inline]
     pub fn has_root(&self) -> bool {
         self.components().has_root()
     }
-
-    /// Returns the `Path` without its final component, if there is one.
-    ///
-    /// This means it returns `Some("")` for relative paths with one component.
-    ///
-    /// Returns [`None`] if the path terminates in a root or prefix, or if it's
-    /// the empty string.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    ///
-    /// let path = Path::new("/foo/bar");
-    /// let parent = path.parent().unwrap();
-    /// assert_eq!(parent, Path::new("/foo"));
-    ///
-    /// let grand_parent = parent.parent().unwrap();
-    /// assert_eq!(grand_parent, Path::new("/"));
-    /// assert_eq!(grand_parent.parent(), None);
-    ///
-    /// let relative_path = Path::new("foo/bar");
-    /// let parent = relative_path.parent();
-    /// assert_eq!(parent, Some(Path::new("foo")));
-    /// let grand_parent = parent.and_then(Path::parent);
-    /// assert_eq!(grand_parent, Some(Path::new("")));
-    /// let great_grand_parent = grand_parent.and_then(Path::parent);
-    /// assert_eq!(great_grand_parent, None);
-    /// ```
 
     #[doc(alias = "dirname")]
     #[must_use]
@@ -2006,28 +1465,6 @@ impl Path {
     /// `&self.parent().unwrap().parent().unwrap()` and so on. If the [`parent`] method returns
     /// [`None`], the iterator will do likewise. The iterator will always yield at least one value,
     /// namely `&self`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    ///
-    /// let mut ancestors = Path::new("/foo/bar").ancestors();
-    /// assert_eq!(ancestors.next(), Some(Path::new("/foo/bar")));
-    /// assert_eq!(ancestors.next(), Some(Path::new("/foo")));
-    /// assert_eq!(ancestors.next(), Some(Path::new("/")));
-    /// assert_eq!(ancestors.next(), None);
-    ///
-    /// let mut ancestors = Path::new("../foo/bar").ancestors();
-    /// assert_eq!(ancestors.next(), Some(Path::new("../foo/bar")));
-    /// assert_eq!(ancestors.next(), Some(Path::new("../foo")));
-    /// assert_eq!(ancestors.next(), Some(Path::new("..")));
-    /// assert_eq!(ancestors.next(), Some(Path::new("")));
-    /// assert_eq!(ancestors.next(), None);
-    /// ```
-    ///
-    /// [`parent`]: Path::parent
-    // #[stable(feature = "path_ancestors", since = "1.28.0")]
     #[inline]
     pub fn ancestors(&self) -> Ancestors<'_> {
         Ancestors { next: Some(&self) }
@@ -2039,20 +1476,6 @@ impl Path {
     /// is the directory name.
     ///
     /// Returns [`None`] if the path terminates in `..`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    /// use std::ffi::str;
-    ///
-    /// assert_eq!(Some(str::new("bin")), Path::new("/usr/bin/").file_name());
-    /// assert_eq!(Some(str::new("foo.txt")), Path::new("tmp/foo.txt").file_name());
-    /// assert_eq!(Some(str::new("foo.txt")), Path::new("foo.txt/.").file_name());
-    /// assert_eq!(Some(str::new("foo.txt")), Path::new("foo.txt/.//").file_name());
-    /// assert_eq!(None, Path::new("foo.txt/..").file_name());
-    /// assert_eq!(None, Path::new("/").file_name());
-    /// ```
 
     #[doc(alias = "basename")]
     #[must_use]
@@ -2071,27 +1494,6 @@ impl Path {
     /// returns `false`), returns [`Err`].
     ///
     /// [`starts_with`]: Path::starts_with
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::{Path, PathBuf};
-    ///
-    /// let path = Path::new("/test/haha/foo.txt");
-    ///
-    /// assert_eq!(path.strip_prefix("/"), Ok(Path::new("test/haha/foo.txt")));
-    /// assert_eq!(path.strip_prefix("/test"), Ok(Path::new("haha/foo.txt")));
-    /// assert_eq!(path.strip_prefix("/test/"), Ok(Path::new("haha/foo.txt")));
-    /// assert_eq!(path.strip_prefix("/test/haha/foo.txt"), Ok(Path::new("")));
-    /// assert_eq!(path.strip_prefix("/test/haha/foo.txt/"), Ok(Path::new("")));
-    ///
-    /// assert!(path.strip_prefix("test").is_err());
-    /// assert!(path.strip_prefix("/haha").is_err());
-    ///
-    /// let prefix = PathBuf::from("/test/");
-    /// assert_eq!(path.strip_prefix(prefix), Ok(Path::new("haha/foo.txt")));
-    /// ```
-    // #[stable(since = "1.7.0", feature = "path_strip_prefix")]
     pub fn strip_prefix<P>(&self, base: P) -> Result<&Path, StripPrefixError>
     where
         P: AsRef<Path>,
@@ -2108,26 +1510,6 @@ impl Path {
     /// Determines whether `base` is a prefix of `self`.
     ///
     /// Only considers whole path components to match.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    ///
-    /// let path = Path::new("/etc/passwd");
-    ///
-    /// assert!(path.starts_with("/etc"));
-    /// assert!(path.starts_with("/etc/"));
-    /// assert!(path.starts_with("/etc/passwd"));
-    /// assert!(path.starts_with("/etc/passwd/")); // extra slash is okay
-    /// assert!(path.starts_with("/etc/passwd///")); // multiple extra slashes are okay
-    ///
-    /// assert!(!path.starts_with("/e"));
-    /// assert!(!path.starts_with("/etc/passwd.txt"));
-    ///
-    /// assert!(!Path::new("/etc/foo.rs").starts_with("/etc/foo"));
-    /// ```
-
     #[must_use]
     pub fn starts_with<P: AsRef<Path>>(&self, base: P) -> bool {
         self._starts_with(base.as_ref())
@@ -2140,21 +1522,6 @@ impl Path {
     /// Determines whether `child` is a suffix of `self`.
     ///
     /// Only considers whole path components to match.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    ///
-    /// let path = Path::new("/etc/resolv.conf");
-    ///
-    /// assert!(path.ends_with("resolv.conf"));
-    /// assert!(path.ends_with("etc/resolv.conf"));
-    /// assert!(path.ends_with("/etc/resolv.conf"));
-    ///
-    /// assert!(!path.ends_with("/resolv.conf"));
-    /// assert!(!path.ends_with("conf")); // use .extension() instead
-    /// ```
 
     #[must_use]
     pub fn ends_with<P: AsRef<Path>>(&self, child: P) -> bool {
@@ -2176,21 +1543,6 @@ impl Path {
     /// * The entire file name if the file name begins with `.` and has no other `.`s within;
     /// * Otherwise, the portion of the file name before the final `.`
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    ///
-    /// assert_eq!("foo", Path::new("foo.rs").file_stem().unwrap());
-    /// assert_eq!("foo.tar", Path::new("foo.tar.gz").file_stem().unwrap());
-    /// ```
-    ///
-    /// # See Also
-    /// This method is similar to [`Path::file_prefix`], which extracts the portion of the file name
-    /// before the *first* `.`
-    ///
-    /// [`Path::file_prefix`]: Path::file_prefix
-    ///
 
     #[must_use]
     pub fn file_stem(&self) -> Option<&str> {
@@ -2211,23 +1563,6 @@ impl Path {
     ///
     /// [`self.file_name`]: Path::file_name
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// # #![feature(path_file_prefix)]
-    /// use std::path::Path;
-    ///
-    /// assert_eq!("foo", Path::new("foo.rs").file_prefix().unwrap());
-    /// assert_eq!("foo", Path::new("foo.tar.gz").file_prefix().unwrap());
-    /// ```
-    ///
-    /// # See Also
-    /// This method is similar to [`Path::file_stem`], which extracts the portion of the file name
-    /// before the *last* `.`
-    ///
-    /// [`Path::file_stem`]: Path::file_stem
-    ///
-    // #[unstable(feature = "path_file_prefix", issue = "86319")]
     #[must_use]
     pub fn file_prefix(&self) -> Option<&str> {
         self.file_name()
@@ -2246,14 +1581,6 @@ impl Path {
     ///
     /// [`self.file_name`]: Path::file_name
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    ///
-    /// assert_eq!("rs", Path::new("foo.rs").extension().unwrap());
-    /// assert_eq!("gz", Path::new("foo.tar.gz").extension().unwrap());
-    /// ```
 
     #[must_use]
     pub fn extension(&self) -> Option<&str> {
@@ -2268,14 +1595,6 @@ impl Path {
     ///
     /// See [`PathBuf::push`] for more details on what it means to adjoin a path.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::{Path, PathBuf};
-    ///
-    /// assert_eq!(Path::new("/etc").join("passwd"), PathBuf::from("/etc/passwd"));
-    /// assert_eq!(Path::new("/etc").join("/bin/sh"), PathBuf::from("/bin/sh"));
-    /// ```
 
     #[must_use]
     pub fn join<P: AsRef<Path>>(&self, path: P) -> PathBuf {
@@ -2292,18 +1611,6 @@ impl Path {
     ///
     /// See [`PathBuf::set_file_name`] for more details.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::{Path, PathBuf};
-    ///
-    /// let path = Path::new("/tmp/foo.png");
-    /// assert_eq!(path.with_file_name("bar"), PathBuf::from("/tmp/bar"));
-    /// assert_eq!(path.with_file_name("bar.txt"), PathBuf::from("/tmp/bar.txt"));
-    ///
-    /// let path = Path::new("/tmp");
-    /// assert_eq!(path.with_file_name("var"), PathBuf::from("/var"));
-    /// ```
 
     #[must_use]
     pub fn with_file_name<S: AsRef<str>>(&self, file_name: S) -> PathBuf {
@@ -2320,19 +1627,6 @@ impl Path {
     ///
     /// See [`PathBuf::set_extension`] for more details.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::{Path, PathBuf};
-    ///
-    /// let path = Path::new("foo.rs");
-    /// assert_eq!(path.with_extension("txt"), PathBuf::from("foo.txt"));
-    ///
-    /// let path = Path::new("foo.tar.gz");
-    /// assert_eq!(path.with_extension(""), PathBuf::from("foo.tar"));
-    /// assert_eq!(path.with_extension("xz"), PathBuf::from("foo.tar.xz"));
-    /// assert_eq!(path.with_extension("").with_extension("txt"), PathBuf::from("foo.txt"));
-    /// ```
 
     pub fn with_extension<S: AsRef<str>>(&self, extension: S) -> PathBuf {
         self._with_extension(extension.as_ref())
@@ -2380,20 +1674,6 @@ impl Path {
     /// and `a/b/../c` are distinct, to account for the possibility that `b`
     /// is a symbolic link (so its parent isn't `a`).
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::{Path, Component};
-    /// use std::ffi::str;
-    ///
-    /// let mut components = Path::new("/tmp/foo.txt").components();
-    ///
-    /// assert_eq!(components.next(), Some(Component::RootDir));
-    /// assert_eq!(components.next(), Some(Component::Normal(str::new("tmp"))));
-    /// assert_eq!(components.next(), Some(Component::Normal(str::new("foo.txt"))));
-    /// assert_eq!(components.next(), None)
-    /// ```
-    ///
     /// [`CurDir`]: Component::CurDir
 
     pub fn components(&self) -> Components<'_> {
@@ -2416,18 +1696,6 @@ impl Path {
     ///
     /// [`components`]: Path::components
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::{self, Path};
-    /// use std::ffi::str;
-    ///
-    /// let mut it = Path::new("/tmp/foo.txt").iter();
-    /// assert_eq!(it.next(), Some(str::new(&path::MAIN_SEPARATOR.to_string())));
-    /// assert_eq!(it.next(), Some(str::new("tmp")));
-    /// assert_eq!(it.next(), Some(str::new("foo.txt")));
-    /// assert_eq!(it.next(), None)
-    /// ```
 
     #[inline]
     pub fn iter(&self) -> Iter<'_> {
@@ -2444,15 +1712,6 @@ impl Path {
     /// [`Display`]: fmt::Display
     /// [`Debug`]: fmt::Debug
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    ///
-    /// let path = Path::new("/tmp/foo.rs");
-    ///
-    /// println!("{}", path.display());
-    /// ```
 
     #[must_use = "this does not display the path, \
                   it returns an object that can be displayed"]
@@ -2460,262 +1719,6 @@ impl Path {
     pub fn display(&self) -> Display<'_> {
         Display { inner: &self.inner }
     }
-
-    /// Queries the file system to get information about a file, directory, etc.
-    ///
-    /// This function will traverse symbolic links to query information about the
-    /// destination file.
-    ///
-    /// This is an alias to [`fs::metadata`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::path::Path;
-    ///
-    /// let path = Path::new("/Minas/tirith");
-    /// let metadata = path.metadata().expect("metadata call failed");
-    /// println!("{:?}", metadata.file_type());
-    /// ```
-    // #[stable(feature = "path_ext", since = "1.5.0")]
-    // #[inline]
-    // pub fn metadata(&self) -> io::Result<fs::Metadata> {
-    //     fs::metadata(self)
-    // }
-
-    /// Queries the metadata about a file without following symlinks.
-    ///
-    /// This is an alias to [`fs::symlink_metadata`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::path::Path;
-    ///
-    /// let path = Path::new("/Minas/tirith");
-    /// let metadata = path.symlink_metadata().expect("symlink_metadata call failed");
-    /// println!("{:?}", metadata.file_type());
-    /// ```
-    // #[stable(feature = "path_ext", since = "1.5.0")]
-    // #[inline]
-    // pub fn symlink_metadata(&self) -> io::Result<fs::Metadata> {
-    //     fs::symlink_metadata(self)
-    // }
-
-    /// Returns the canonical, absolute form of the path with all intermediate
-    /// components normalized and symbolic links resolved.
-    ///
-    /// This is an alias to [`fs::canonicalize`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::path::{Path, PathBuf};
-    ///
-    /// let path = Path::new("/foo/test/../test/bar.rs");
-    /// assert_eq!(path.canonicalize().unwrap(), PathBuf::from("/foo/test/bar.rs"));
-    /// ```
-    // #[stable(feature = "path_ext", since = "1.5.0")]
-    // #[inline]
-    // pub fn canonicalize(&self) -> io::Result<PathBuf> {
-    //     fs::canonicalize(self)
-    // }
-
-    /// Reads a symbolic link, returning the file that the link points to.
-    ///
-    /// This is an alias to [`fs::read_link`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::path::Path;
-    ///
-    /// let path = Path::new("/laputa/sky_castle.rs");
-    /// let path_link = path.read_link().expect("read_link call failed");
-    /// ```
-    // #[stable(feature = "path_ext", since = "1.5.0")]
-    // #[inline]
-    // pub fn read_link(&self) -> io::Result<PathBuf> {
-    //     fs::read_link(self)
-    // }
-
-    /// Returns an iterator over the entries within a directory.
-    ///
-    /// The iterator will yield instances of <code>[io::Result]<[fs::DirEntry]></code>. New
-    /// errors may be encountered after an iterator is initially constructed.
-    ///
-    /// This is an alias to [`fs::read_dir`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::path::Path;
-    ///
-    /// let path = Path::new("/laputa");
-    /// for entry in path.read_dir().expect("read_dir call failed") {
-    ///     if let Ok(entry) = entry {
-    ///         println!("{:?}", entry.path());
-    ///     }
-    /// }
-    /// ```
-    // #[stable(feature = "path_ext", since = "1.5.0")]
-    // #[inline]
-    // pub fn read_dir(&self) -> io::Result<fs::ReadDir> {
-    //     fs::read_dir(self)
-    // }
-
-    /// Returns `true` if the path points at an existing entity.
-    ///
-    /// Warning: this method may be error-prone, consider using [`try_exists()`] instead!
-    /// It also has a risk of introducing time-of-check to time-of-use (TOCTOU) bugs.
-    ///
-    /// This function will traverse symbolic links to query information about the
-    /// destination file.
-    ///
-    /// If you cannot access the metadata of the file, e.g. because of a
-    /// permission error or broken symbolic links, this will return `false`.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::path::Path;
-    /// assert!(!Path::new("does_not_exist.txt").exists());
-    /// ```
-    ///
-    /// # See Also
-    ///
-    /// This is a convenience function that coerces errors to false. If you want to
-    /// check errors, call [`Path::try_exists`].
-    ///
-    /// [`try_exists()`]: Self::try_exists
-    // #[stable(feature = "path_ext", since = "1.5.0")]
-    // #[must_use]
-    // #[inline]
-    // pub fn exists(&self) -> bool {
-    //     fs::metadata(self).is_ok()
-    // }
-
-    /// Returns `Ok(true)` if the path points at an existing entity.
-    ///
-    /// This function will traverse symbolic links to query information about the
-    /// destination file. In case of broken symbolic links this will return `Ok(false)`.
-    ///
-    /// [`Path::exists()`] only checks whether or not a path was both found and readable. By
-    /// contrast, `try_exists` will return `Ok(true)` or `Ok(false)`, respectively, if the path
-    /// was _verified_ to exist or not exist. If its existence can neither be confirmed nor
-    /// denied, it will propagate an `Err(_)` instead. This can be the case if e.g. listing
-    /// permission is denied on one of the parent directories.
-    ///
-    /// Note that while this avoids some pitfalls of the `exists()` method, it still can not
-    /// prevent time-of-check to time-of-use (TOCTOU) bugs. You should only use it in scenarios
-    /// where those bugs are not an issue.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::path::Path;
-    /// assert!(!Path::new("does_not_exist.txt").try_exists().expect("Can't check existence of file does_not_exist.txt"));
-    /// assert!(Path::new("/root/secret_file.txt").try_exists().is_err());
-    /// ```
-    ///
-    /// [`exists()`]: Self::exists
-    // #[stable(feature = "path_try_exists", since = "1.63.0")]
-    // #[inline]
-    // pub fn try_exists(&self) -> io::Result<bool> {
-    //     fs::try_exists(self)
-    // }
-
-    /// Returns `true` if the path exists on disk and is pointing at a regular file.
-    ///
-    /// This function will traverse symbolic links to query information about the
-    /// destination file.
-    ///
-    /// If you cannot access the metadata of the file, e.g. because of a
-    /// permission error or broken symbolic links, this will return `false`.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::path::Path;
-    /// assert_eq!(Path::new("./is_a_directory/").is_file(), false);
-    /// assert_eq!(Path::new("a_file.txt").is_file(), true);
-    /// ```
-    ///
-    /// # See Also
-    ///
-    /// This is a convenience function that coerces errors to false. If you want to
-    /// check errors, call [`fs::metadata`] and handle its [`Result`]. Then call
-    /// [`fs::Metadata::is_file`] if it was [`Ok`].
-    ///
-    /// When the goal is simply to read from (or write to) the source, the most
-    /// reliable way to test the source can be read (or written to) is to open
-    /// it. Only using `is_file` can break workflows like `diff <( prog_a )` on
-    /// a Unix-like system for example. See [`fs::File::open`] or
-    /// [`fs::OpenOptions::open`] for more information.
-    // #[stable(feature = "path_ext", since = "1.5.0")]
-    // #[must_use]
-    // pub fn is_file(&self) -> bool {
-    //     fs::metadata(self).map(|m| m.is_file()).unwrap_or(false)
-    // }
-
-    /// Returns `true` if the path exists on disk and is pointing at a directory.
-    ///
-    /// This function will traverse symbolic links to query information about the
-    /// destination file.
-    ///
-    /// If you cannot access the metadata of the file, e.g. because of a
-    /// permission error or broken symbolic links, this will return `false`.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::path::Path;
-    /// assert_eq!(Path::new("./is_a_directory/").is_dir(), true);
-    /// assert_eq!(Path::new("a_file.txt").is_dir(), false);
-    /// ```
-    ///
-    /// # See Also
-    ///
-    /// This is a convenience function that coerces errors to false. If you want to
-    /// check errors, call [`fs::metadata`] and handle its [`Result`]. Then call
-    /// [`fs::Metadata::is_dir`] if it was [`Ok`].
-    // #[stable(feature = "path_ext", since = "1.5.0")]
-    // #[must_use]
-    // pub fn is_dir(&self) -> bool {
-    //     fs::metadata(self).map(|m| m.is_dir()).unwrap_or(false)
-    // }
-
-    /// Returns `true` if the path exists on disk and is pointing at a symbolic link.
-    ///
-    /// This function will not traverse symbolic links.
-    /// In case of a broken symbolic link this will also return true.
-    ///
-    /// If you cannot access the directory containing the file, e.g., because of a
-    /// permission error, this will return false.
-    ///
-    /// # Examples
-    ///
-    #[cfg_attr(unix, doc = "```no_run")]
-    #[cfg_attr(not(unix), doc = "```ignore")]
-    /// use std::path::Path;
-    /// use std::os::unix::fs::symlink;
-    ///
-    /// let link_path = Path::new("link");
-    /// symlink("/origin_does_not_exist/", link_path).unwrap();
-    /// assert_eq!(link_path.is_symlink(), true);
-    /// assert_eq!(link_path.exists(), false);
-    /// ```
-    ///
-    /// # See Also
-    ///
-    /// This is a convenience function that coerces errors to false. If you want to
-    /// check errors, call [`fs::symlink_metadata`] and handle its [`Result`]. Then call
-    /// [`fs::Metadata::is_symlink`] if it was [`Ok`].
-    // #[must_use]
-    // #[stable(feature = "is_symlink", since = "1.58.0")]
-    // pub fn is_symlink(&self) -> bool {
-    //     fs::symlink_metadata(self).map(|m| m.is_symlink()).unwrap_or(false)
-    // }
 
     /// Converts a [`Box<Path>`](Box) into a [`PathBuf`] without copying or
     /// allocating.
@@ -2751,19 +1754,6 @@ impl fmt::Debug for Path {
 /// conversion, depending on the platform. If you would like an implementation
 /// which escapes the path please use [`Debug`] instead.
 ///
-/// # Examples
-///
-/// ```
-/// use std::path::Path;
-///
-/// let path = Path::new("/tmp/foo.rs");
-///
-/// println!("{}", path.display());
-/// ```
-///
-/// [`Display`]: fmt::Display
-/// [`format!`]: crate::format
-
 pub struct Display<'a> {
     inner: &'a str,
 }
@@ -2886,20 +1876,6 @@ impl AsRef<Path> for String {
     }
 }
 
-// impl AsRef<Path> for str {
-//     #[inline]
-//     fn as_ref(&self) -> &Path {
-//         Path::new(self)
-//     }
-// }
-
-// impl AsRef<Path> for String {
-//     #[inline]
-//     fn as_ref(&self) -> &Path {
-//         Path::new(self)
-//     }
-// }
-
 impl AsRef<Path> for PathBuf {
     #[inline]
     fn as_ref(&self) -> &Path {
@@ -2968,81 +1944,3 @@ impl_cmp!(<'a> PathBuf, &'a Path);
 impl_cmp!(<'a> Cow<'a, Path>, Path);
 impl_cmp!(<'a, 'b> Cow<'a, Path>, &'b Path);
 impl_cmp!(<'a> Cow<'a, Path>, PathBuf);
-
-// macro_rules! impl_cmp_os_str {
-//     (<$($life:lifetime),*> $lhs:ty, $rhs: ty) => {
-//         // #[stable(feature = "cmp_path", since = "1.8.0")]
-//         impl<$($life),*> PartialEq<$rhs> for $lhs {
-//             #[inline]
-//             fn eq(&self, other: &$rhs) -> bool {
-//                 <Path as PartialEq>::eq(self, other.as_ref())
-//             }
-//         }
-
-//         #[stable(feature = "cmp_path", since = "1.8.0")]
-//         impl<$($life),*> PartialEq<$lhs> for $rhs {
-//             #[inline]
-//             fn eq(&self, other: &$lhs) -> bool {
-//                 <Path as PartialEq>::eq(self.as_ref(), other)
-//             }
-//         }
-
-//         #[stable(feature = "cmp_path", since = "1.8.0")]
-//         impl<$($life),*> PartialOrd<$rhs> for $lhs {
-//             #[inline]
-//             fn partial_cmp(&self, other: &$rhs) -> Option<cmp::Ordering> {
-//                 <Path as PartialOrd>::partial_cmp(self, other.as_ref())
-//             }
-//         }
-
-//         #[stable(feature = "cmp_path", since = "1.8.0")]
-//         impl<$($life),*> PartialOrd<$lhs> for $rhs {
-//             #[inline]
-//             fn partial_cmp(&self, other: &$lhs) -> Option<cmp::Ordering> {
-//                 <Path as PartialOrd>::partial_cmp(self.as_ref(), other)
-//             }
-//         }
-//     };
-// }
-
-// impl_cmp_os_str!(<> PathBuf, str);
-// impl_cmp_os_str!(<'a> PathBuf, &'a str);
-// impl_cmp_os_str!(<'a> PathBuf, Cow<'a, str>);
-// impl_cmp_os_str!(<> PathBuf, String);
-// impl_cmp_os_str!(<> Path, str);
-// impl_cmp_os_str!(<'a> Path, &'a str);
-// impl_cmp_os_str!(<'a> Path, Cow<'a, str>);
-// impl_cmp_os_str!(<> Path, String);
-// impl_cmp_os_str!(<'a> &'a Path, str);
-// impl_cmp_os_str!(<'a, 'b> &'a Path, Cow<'b, str>);
-// impl_cmp_os_str!(<'a> &'a Path, String);
-// impl_cmp_os_str!(<'a> Cow<'a, Path>, str);
-// impl_cmp_os_str!(<'a, 'b> Cow<'a, Path>, &'b str);
-// impl_cmp_os_str!(<'a> Cow<'a, Path>, String);
-
-// #[stable(since = "1.7.0", feature = "strip_prefix")]
-// impl fmt::Display for StripPrefixError {
-//     #[allow(deprecated, deprecated_in_future)]
-//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-//         self.description().fmt(f)
-//     }
-// }
-
-// #[stable(since = "1.7.0", feature = "strip_prefix")]
-// impl Error for StripPrefixError {
-//     #[allow(deprecated)]
-//     fn description(&self) -> &str {
-//         "prefix not found"
-//     }
-// }
-
-// / [windows-path]: https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfullpathnamew
-// #[unstable(feature = "absolute_path", issue = "92750")]
-// pub fn absolute<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
-//     let path = path.as_ref();
-//     if path.as_os_str().is_empty() {
-//         Err(io::const_io_error!(io::ErrorKind::InvalidInput, "cannot make an empty path absolute",))
-//     } else {
-//         sys::path::absolute(path)
-//     }
-// }

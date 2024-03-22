@@ -1,5 +1,5 @@
 # 导入环境变量
-include ../env.mk
+include ./env.mk
 
 export ARCH ?= x86_64
 # 如果是x86_64, 则使用x86_64-unknown-none.json作为target

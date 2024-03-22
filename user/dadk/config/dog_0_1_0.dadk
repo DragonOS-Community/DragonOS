@@ -1,0 +1,27 @@
+{
+  "name": "dog",
+  "version": "0.1.0",
+  "description": "dns-lookup",
+  "rust_target": null,
+  "task_type": {
+        "BuildFromSource": {
+       "Git": {
+        "url": "https://github.com/val213/dog.git",
+        "revision": "78f5a66a1cca0a8efb2bfcdab31da525cd9f257b"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "envs": [
+    
+  ]
+}

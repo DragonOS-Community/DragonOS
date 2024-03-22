@@ -6,7 +6,7 @@ use core::{
 
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
-    driver::base::device::device_number::DeviceNumber,
+    filesystem::vfs::syscall::PosixStatx,
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::syscall::MremapFlags,
     net::syscall::MsgHdr,
@@ -97,6 +97,7 @@ impl Syscall {
                 Self::open(path, flags, mode, true)
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_RENAME => {
                 let oldname: *const u8 = args[0] as *const u8;
                 let newname: *const u8 = args[1] as *const u8;
@@ -109,6 +110,7 @@ impl Syscall {
                 )
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_RENAMEAT => {
                 let oldfd = args[0] as i32;
                 let oldname: *const u8 = args[1] as *const u8;
@@ -341,6 +343,21 @@ impl Syscall {
             SYS_RMDIR => {
                 let path = args[0] as *const u8;
                 Self::rmdir(path)
+            }
+
+            SYS_LINK => {
+                let old = args[0] as *const u8;
+                let new = args[1] as *const u8;
+                return Self::link(old, new);
+            }
+
+            SYS_LINKAT => {
+                let oldfd = args[0] as i32;
+                let old = args[1] as *const u8;
+                let newfd = args[2] as i32;
+                let new = args[3] as *const u8;
+                let flags = args[4] as i32;
+                return Self::linkat(oldfd, old, newfd, new, flags);
             }
 
             #[cfg(target_arch = "x86_64")]
@@ -635,6 +652,8 @@ impl Syscall {
 
             #[cfg(target_arch = "x86_64")]
             SYS_MKNOD => {
+                use crate::driver::base::device::device_number::DeviceNumber;
+
                 let path = args[0];
                 let flags = args[1];
                 let dev_t = args[2];
@@ -703,6 +722,17 @@ impl Syscall {
                 Self::stat(path, kstat)
             }
 
+            SYS_STATX => {
+                let fd = args[0] as i32;
+                let path = args[1] as *const u8;
+                let flags = args[2] as u32;
+                let mask = args[3] as u32;
+                let kstat = args[4] as *mut PosixStatx;
+
+                Self::do_statx(fd, path, flags, mask, kstat)
+            }
+
+            #[cfg(target_arch = "x86_64")]
             SYS_EPOLL_CREATE => Self::epoll_create(args[0] as i32),
             SYS_EPOLL_CREATE1 => Self::epoll_create1(args[0]),
 
@@ -713,6 +743,7 @@ impl Syscall {
                 VirtAddr::new(args[3]),
             ),
 
+            #[cfg(target_arch = "x86_64")]
             SYS_EPOLL_WAIT => Self::epoll_wait(
                 args[0] as i32,
                 VirtAddr::new(args[1]),

@@ -163,7 +163,7 @@ pub fn timekeeper_init() {
 pub fn getnstimeofday() -> TimeSpec {
     // kdebug!("enter getnstimeofday");
 
-    // let mut nsecs: u64 = 0;0
+    // let mut nsecs: u64 = 0;
     let mut _xtime = TimeSpec {
         tv_nsec: 0,
         tv_sec: 0,
@@ -196,7 +196,6 @@ pub fn getnstimeofday() -> TimeSpec {
 /// # 获取1970.1.1至今的UTC时间戳(最小单位:usec)
 ///
 /// ## 返回值
-///
 /// * 'PosixTimeval' - 时间戳
 pub fn do_gettimeofday() -> PosixTimeval {
     let tp = getnstimeofday();
@@ -224,15 +223,11 @@ pub fn timekeeping_init() {
     let mut timekeeper = timekeeper().0.write_irqsave();
     timekeeper.xtime.tv_nsec = ktime_get_real_ns();
 
-    // 初始化wall time到monotonic的时间
-    let mut nsec = -timekeeper.xtime.tv_nsec;
-    let mut sec = -timekeeper.xtime.tv_sec;
-    // FIXME: 这里有个奇怪的奇怪的bug
-    let num = nsec % NSEC_PER_SEC as i64;
-    nsec += num * NSEC_PER_SEC as i64;
-    sec -= num;
-    timekeeper.wall_to_monotonic.tv_nsec = nsec;
-    timekeeper.wall_to_monotonic.tv_sec = sec;
+    //参考https://elixir.bootlin.com/linux/v4.4/source/kernel/time/timekeeping.c#L1251 对wtm进行初始化
+    (
+        timekeeper.wall_to_monotonic.tv_nsec,
+        timekeeper.wall_to_monotonic.tv_sec,
+    ) = (-timekeeper.xtime.tv_nsec, -timekeeper.xtime.tv_sec);
 
     __ADDED_USEC.store(0, Ordering::SeqCst);
     __ADDED_SEC.store(0, Ordering::SeqCst);

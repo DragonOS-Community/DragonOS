@@ -664,6 +664,7 @@ impl FileSystemMaker {
 
 pub type FileSystemNewFunction = fn() -> Result<Arc<dyn FileSystem>, SystemError>;
 
+///定义公有的文件系统创建器的分布式数组
 #[macro_export]
 macro_rules! define_filesystem_maker_slice {
     ($name:ident) => {
@@ -675,7 +676,7 @@ macro_rules! define_filesystem_maker_slice {
     };
 }
 
-/// 调用指定数组中的所有初始化器
+/// 匹配文件系统类型，创建文件系统实例
 #[macro_export]
 macro_rules! producefs {
     ($initializer_slice:ident,$filesystem:ident) => {

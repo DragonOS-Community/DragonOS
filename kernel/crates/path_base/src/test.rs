@@ -18,7 +18,10 @@ fn test_path_prefix() {
 }
 #[test]
 fn test_path_file_name() {
-    assert_eq!(Path::new("/home/work/../work/dir/./../dir/").file_name(), Some("dir"))
+    assert_eq!(
+        Path::new("/home/work/../work/dir/./../dir/").file_name(),
+        Some("dir")
+    )
 }
 #[test]
 fn test_path_search() {

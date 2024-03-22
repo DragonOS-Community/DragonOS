@@ -1,45 +1,43 @@
 #![no_std]
 #![feature(strict_provenance)]
 extern crate alloc;
-mod util;
+pub mod clean_path;
 #[cfg(test)]
 mod test;
-pub mod clean_path;
+mod util;
 
-use core::{ 
-    borrow::Borrow, cmp, fmt, 
-    hash::{Hash, Hasher}, 
-    iter::FusedIterator, 
-    ops::{self, Deref}, 
+use core::{
+    borrow::Borrow,
+    cmp, fmt,
+    hash::{Hash, Hasher},
+    iter::FusedIterator,
+    ops::{self, Deref},
     str::{self, FromStr},
 };
 
 use alloc::{
     borrow::{Cow, ToOwned},
+    boxed::Box,
+    collections::TryReserveError,
+    rc::Rc,
     string::{String, ToString},
-    boxed::Box, rc::Rc, vec::Vec, 
-    sync::Arc, collections::TryReserveError,
+    sync::Arc,
+    vec::Vec,
 };
 
-use self::util::{MAIN_SEP_STR, parse_prefix, is_verbatim_sep, is_sep_byte};
+use self::util::{is_sep_byte, is_verbatim_sep, parse_prefix, MAIN_SEP_STR};
 
 #[derive(Copy, Clone, Debug, Hash, PartialOrd, Ord, PartialEq, Eq)]
 pub enum Prefix<'a> {
     Verbatim(&'a str),
 
-    VerbatimUNC(
-        &'a str,
-        &'a str,
-    ),
+    VerbatimUNC(&'a str, &'a str),
 
     VerbatimDisk(u8),
 
     DeviceNS(&'a str),
 
-    UNC(
-        &'a str,
-        &'a str,
-    ),
+    UNC(&'a str, &'a str),
 
     Disk(u8),
 }
@@ -54,10 +52,22 @@ impl<'a> Prefix<'a> {
         match *self {
             Verbatim(x) => 4 + os_str_len(x),
             VerbatimUNC(x, y) => {
-                8 + os_str_len(x) + if os_str_len(y) > 0 { 1 + os_str_len(y) } else { 0 }
+                8 + os_str_len(x)
+                    + if os_str_len(y) > 0 {
+                        1 + os_str_len(y)
+                    } else {
+                        0
+                    }
             }
             VerbatimDisk(_) => 6,
-            UNC(x, y) => 2 + os_str_len(x) + if os_str_len(y) > 0 { 1 + os_str_len(y) } else { 0 },
+            UNC(x, y) => {
+                2 + os_str_len(x)
+                    + if os_str_len(y) > 0 {
+                        1 + os_str_len(y)
+                    } else {
+                        0
+                    }
+            }
             DeviceNS(x) => 4 + os_str_len(x),
             Disk(_) => 2,
         }
@@ -106,7 +116,11 @@ fn has_redox_scheme(s: &[u8]) -> bool {
 
 /// Says whether the first byte after the prefix is a separator.
 fn has_physical_root(s: &[u8], prefix: Option<Prefix<'_>>) -> bool {
-    let path = if let Some(p) = prefix { &s[p.len()..] } else { s };
+    let path = if let Some(p) = prefix {
+        &s[p.len()..]
+    } else {
+        s
+    };
     !path.is_empty() && is_sep_byte(path[0])
 }
 
@@ -191,7 +205,7 @@ impl<'a> PrefixComponent<'a> {
     ///
     /// See [`Prefix`]'s documentation for more information on the different
     /// kinds of prefixes.
-    
+
     #[must_use]
     #[inline]
     pub fn kind(&self) -> Prefix<'a> {
@@ -199,14 +213,13 @@ impl<'a> PrefixComponent<'a> {
     }
 
     /// Returns the raw [`str`] slice for this prefix.
-    
+
     #[must_use]
     #[inline]
     pub fn as_os_str(&self) -> &'a str {
         self.raw
     }
 }
-
 
 impl<'a> PartialEq for PrefixComponent<'a> {
     #[inline]
@@ -215,7 +228,6 @@ impl<'a> PartialEq for PrefixComponent<'a> {
     }
 }
 
-
 impl<'a> PartialOrd for PrefixComponent<'a> {
     #[inline]
     fn partial_cmp(&self, other: &PrefixComponent<'a>) -> Option<cmp::Ordering> {
@@ -223,14 +235,12 @@ impl<'a> PartialOrd for PrefixComponent<'a> {
     }
 }
 
-
 impl Ord for PrefixComponent<'_> {
     #[inline]
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         Ord::cmp(&self.parsed, &other.parsed)
     }
 }
-
 
 impl Hash for PrefixComponent<'_> {
     fn hash<H: Hasher>(&self, h: &mut H) {
@@ -269,28 +279,23 @@ pub enum Component<'a> {
     /// for more.
     ///
     /// Does not occur on Unix.
-    
     Prefix(PrefixComponent<'a>),
 
     /// The root directory component, appears after any prefix and before anything else.
     ///
     /// It represents a separator that designates that a path starts from root.
-    
     RootDir,
 
     /// A reference to the current directory, i.e., `.`.
-    
     CurDir,
 
     /// A reference to the parent directory, i.e., `..`.
-    
     ParentDir,
 
     /// A normal component, e.g., `a` and `b` in `a/b`.
     ///
     /// This variant is the most common one, it represents references to files
     /// or directories.
-    
     Normal(&'a str),
 }
 impl<'a> Component<'a> {
@@ -305,7 +310,6 @@ impl<'a> Component<'a> {
         }
     }
 }
-
 
 impl AsRef<str> for Component<'_> {
     #[inline]
@@ -383,7 +387,9 @@ impl fmt::Debug for Components<'_> {
             }
         }
 
-        f.debug_tuple("Components").field(&DebugHelper(self.as_path())).finish()
+        f.debug_tuple("Components")
+            .field(&DebugHelper(self.as_path()))
+            .finish()
     }
 }
 
@@ -396,20 +402,35 @@ impl<'a> Components<'a> {
 
     #[inline]
     fn prefix_verbatim(&self) -> bool {
-        self.prefix.as_ref().map(Prefix::is_verbatim).unwrap_or(false)
+        self.prefix
+            .as_ref()
+            .map(Prefix::is_verbatim)
+            .unwrap_or(false)
     }
 
     /// how much of the prefix is left from the point of view of iteration?
     #[inline]
     fn prefix_remaining(&self) -> usize {
-        if self.front == State::Prefix { self.prefix_len() } else { 0 }
+        if self.front == State::Prefix {
+            self.prefix_len()
+        } else {
+            0
+        }
     }
 
     // Given the iteration so far, how much of the pre-State::Body path is left?
     #[inline]
     fn len_before_body(&self) -> usize {
-        let root = if self.front <= State::StartDir && self.has_physical_root { 1 } else { 0 };
-        let cur_dir = if self.front <= State::StartDir && self.include_cur_dir() { 1 } else { 0 };
+        let root = if self.front <= State::StartDir && self.has_physical_root {
+            1
+        } else {
+            0
+        };
+        let cur_dir = if self.front <= State::StartDir && self.include_cur_dir() {
+            1
+        } else {
+            0
+        };
         self.prefix_remaining() + root + cur_dir
     }
 
@@ -421,7 +442,11 @@ impl<'a> Components<'a> {
 
     #[inline]
     fn is_sep_byte(&self, b: u8) -> bool {
-        if self.prefix_verbatim() { is_verbatim_sep(b) } else { is_sep_byte(b) }
+        if self.prefix_verbatim() {
+            is_verbatim_sep(b)
+        } else {
+            is_sep_byte(b)
+        }
     }
 
     /// Extracts a slice corresponding to the portion of the path remaining for iteration.
@@ -438,7 +463,7 @@ impl<'a> Components<'a> {
     /// assert_eq!(Path::new("foo/bar.txt"), components.as_path());
     /// ```
     #[must_use]
-    
+
     pub fn as_path(&self) -> &'a Path {
         let mut comps = self.clone();
         if comps.front == State::Body {
@@ -499,7 +524,9 @@ impl<'a> Components<'a> {
             Some(i) => (1, &self.path[..i]),
         };
         // SAFETY: `comp` is a valid substring, since it is split on a separator.
-        (comp.len() + extra, unsafe { self.parse_single_component(comp) })
+        (comp.len() + extra, unsafe {
+            self.parse_single_component(comp)
+        })
     }
 
     // parse a component from the right, saying how many bytes to consume to
@@ -507,12 +534,17 @@ impl<'a> Components<'a> {
     fn parse_next_component_back(&self) -> (usize, Option<Component<'a>>) {
         debug_assert!(self.back == State::Body);
         let start = self.len_before_body();
-        let (extra, comp) = match self.path[start..].iter().rposition(|b| self.is_sep_byte(*b)) {
+        let (extra, comp) = match self.path[start..]
+            .iter()
+            .rposition(|b| self.is_sep_byte(*b))
+        {
             None => (0, &self.path[start..]),
             Some(i) => (1, &self.path[start + i + 1..]),
         };
         // SAFETY: `comp` is a valid substring, since it is split on a separator.
-        (comp.len() + extra, unsafe { self.parse_single_component(comp) })
+        (comp.len() + extra, unsafe {
+            self.parse_single_component(comp)
+        })
     }
 
     // trim away repeated separators (i.e., empty components) on the left
@@ -540,14 +572,12 @@ impl<'a> Components<'a> {
     }
 }
 
-
 impl AsRef<Path> for Components<'_> {
     #[inline]
     fn as_ref(&self) -> &Path {
         self.as_path()
     }
 }
-
 
 impl AsRef<str> for Components<'_> {
     #[inline]
@@ -566,7 +596,9 @@ impl fmt::Debug for Iter<'_> {
             }
         }
 
-        f.debug_tuple("Iter").field(&DebugHelper(self.as_path())).finish()
+        f.debug_tuple("Iter")
+            .field(&DebugHelper(self.as_path()))
+            .finish()
     }
 }
 
@@ -584,14 +616,13 @@ impl<'a> Iter<'a> {
     ///
     /// assert_eq!(Path::new("foo/bar.txt"), iter.as_path());
     /// ```
-    
+
     #[must_use]
     #[inline]
     pub fn as_path(&self) -> &'a Path {
         self.inner.as_path()
     }
 }
-
 
 impl AsRef<Path> for Iter<'_> {
     #[inline]
@@ -600,14 +631,12 @@ impl AsRef<Path> for Iter<'_> {
     }
 }
 
-
 impl AsRef<str> for Iter<'_> {
     #[inline]
     fn as_ref(&self) -> &str {
         self.as_path().as_os_str()
     }
 }
-
 
 impl<'a> Iterator for Iter<'a> {
     type Item = &'a str;
@@ -617,7 +646,6 @@ impl<'a> Iterator for Iter<'a> {
         self.inner.next().map(Component::as_os_str)
     }
 }
-
 
 impl<'a> DoubleEndedIterator for Iter<'a> {
     #[inline]
@@ -680,7 +708,6 @@ impl<'a> Iterator for Components<'a> {
     }
 }
 
-
 impl<'a> DoubleEndedIterator for Components<'a> {
     fn next_back(&mut self) -> Option<Component<'a>> {
         while !self.finished() {
@@ -712,7 +739,7 @@ impl<'a> DoubleEndedIterator for Components<'a> {
                 State::Prefix if self.prefix_len() > 0 => {
                     self.back = State::Done;
                     return Some(Component::Prefix(PrefixComponent {
-                    raw: unsafe { str::from_utf8_unchecked(self.path) },
+                        raw: unsafe { str::from_utf8_unchecked(self.path) },
                         parsed: self.prefix.unwrap(),
                     }));
                 }
@@ -729,11 +756,16 @@ impl<'a> DoubleEndedIterator for Components<'a> {
 
 impl FusedIterator for Components<'_> {}
 
-
 impl<'a> PartialEq for Components<'a> {
     #[inline]
     fn eq(&self, other: &Components<'a>) -> bool {
-        let Components { path: _, front: _, back: _, has_physical_root: _, prefix: _ } = self;
+        let Components {
+            path: _,
+            front: _,
+            back: _,
+            has_physical_root: _,
+            prefix: _,
+        } = self;
 
         // Fast path for exact matches, e.g. for hashmap lookups.
         // Don't explicitly compare the prefix or has_physical_root fields since they'll
@@ -756,9 +788,7 @@ impl<'a> PartialEq for Components<'a> {
     }
 }
 
-
 impl Eq for Components<'_> {}
-
 
 impl<'a> PartialOrd for Components<'a> {
     #[inline]
@@ -766,7 +796,6 @@ impl<'a> PartialOrd for Components<'a> {
         Some(compare_components(self.clone(), other.clone()))
     }
 }
-
 
 impl Ord for Components<'_> {
     #[inline]
@@ -793,8 +822,9 @@ fn compare_components(mut left: Components<'_>, mut right: Components<'_>) -> cm
             Some(diff) => diff,
         };
 
-        if let Some(previous_sep) =
-            left.path[..first_difference].iter().rposition(|&b| left.is_sep_byte(b))
+        if let Some(previous_sep) = left.path[..first_difference]
+            .iter()
+            .rposition(|&b| left.is_sep_byte(b))
         {
             let mismatched_component_start = previous_sep + 1;
             left.path = &left.path[mismatched_component_start..];
@@ -922,11 +952,13 @@ impl PathBuf {
     ///
     /// let path = PathBuf::new();
     /// ```
-    
+
     #[must_use]
     #[inline]
     pub fn new() -> PathBuf {
-        PathBuf { inner: String::new() }
+        PathBuf {
+            inner: String::new(),
+        }
     }
 
     /// Creates a new `PathBuf` with a given capacity used to create the
@@ -950,7 +982,9 @@ impl PathBuf {
     #[must_use]
     #[inline]
     pub fn with_capacity(capacity: usize) -> PathBuf {
-        PathBuf { inner: String::with_capacity(capacity) }
+        PathBuf {
+            inner: String::with_capacity(capacity),
+        }
     }
 
     /// Coerces to a [`Path`] slice.
@@ -963,7 +997,7 @@ impl PathBuf {
     /// let p = PathBuf::from("/test");
     /// assert_eq!(Path::new("/test"), p.as_path());
     /// ```
-    
+
     #[must_use]
     #[inline]
     pub fn as_path(&self) -> &Path {
@@ -1007,14 +1041,18 @@ impl PathBuf {
     /// path.push("/etc");
     /// assert_eq!(path, PathBuf::from("/etc"));
     /// ```
-    
+
     pub fn push<P: AsRef<Path>>(&mut self, path: P) {
         self._push(path.as_ref())
     }
 
     fn _push(&mut self, path: &Path) {
         // in general, a separator is needed if the rightmost byte is not a separator
-        let mut need_sep = self.as_mut_vec().last().map(|c| !is_sep_byte(*c)).unwrap_or(false);
+        let mut need_sep = self
+            .as_mut_vec()
+            .last()
+            .map(|c| !is_sep_byte(*c))
+            .unwrap_or(false);
 
         // in the special case of `C:` on Windows, do *not* add a separator
         let comps = self.components();
@@ -1102,7 +1140,7 @@ impl PathBuf {
     /// p.pop();
     /// assert_eq!(Path::new("/"), p);
     /// ```
-    
+
     pub fn pop(&mut self) -> bool {
         match self.parent().map(|p| p.as_u8_slice().len()) {
             Some(len) => {
@@ -1143,7 +1181,7 @@ impl PathBuf {
     /// buf.set_file_name("baz");
     /// assert!(buf == PathBuf::from("/baz"));
     /// ```
-    
+
     pub fn set_file_name<S: AsRef<str>>(&mut self, file_name: S) {
         self._set_file_name(file_name.as_ref())
     }
@@ -1207,7 +1245,7 @@ impl PathBuf {
     /// p.set_extension("");
     /// assert_eq!(Path::new("/feel/the"), p.as_path());
     /// ```
-    
+
     pub fn set_extension<S: AsRef<str>>(&mut self, extension: S) -> bool {
         self._set_extension(extension.as_ref())
     }
@@ -1267,7 +1305,7 @@ impl PathBuf {
     /// let p = PathBuf::from("/the/head");
     /// let os_str = p.into_os_string();
     /// ```
-    
+
     #[must_use = "`self` will be dropped if the result is not used"]
     #[inline]
     pub fn into_os_string(self) -> String {
@@ -1348,11 +1386,12 @@ impl PathBuf {
     }
 }
 
-
 impl Clone for PathBuf {
     #[inline]
     fn clone(&self) -> Self {
-        PathBuf { inner: self.inner.clone() }
+        PathBuf {
+            inner: self.inner.clone(),
+        }
     }
 
     #[inline]
@@ -1413,7 +1452,6 @@ impl Clone for Box<Path> {
     }
 }
 
-
 impl<T: ?Sized + AsRef<str>> From<&T> for PathBuf {
     /// Converts a borrowed [`str`] to a [`PathBuf`].
     ///
@@ -1423,7 +1461,6 @@ impl<T: ?Sized + AsRef<str>> From<&T> for PathBuf {
         PathBuf::from(s.as_ref().to_string())
     }
 }
-
 
 impl From<String> for PathBuf {
     /// Converts an [`String`] into a [`PathBuf`]
@@ -1445,7 +1482,6 @@ impl From<PathBuf> for String {
     }
 }
 
-
 // impl From<String> for PathBuf {
 //     /// Converts a [`String`] into a [`PathBuf`]
 //     ///
@@ -1465,7 +1501,6 @@ impl FromStr for PathBuf {
     }
 }
 
-
 impl<P: AsRef<Path>> FromIterator<P> for PathBuf {
     fn from_iter<I: IntoIterator<Item = P>>(iter: I) -> PathBuf {
         let mut buf = PathBuf::new();
@@ -1473,7 +1508,6 @@ impl<P: AsRef<Path>> FromIterator<P> for PathBuf {
         buf
     }
 }
-
 
 impl<P: AsRef<Path>> Extend<P> for PathBuf {
     fn extend<I: IntoIterator<Item = P>>(&mut self, iter: I) {
@@ -1486,13 +1520,11 @@ impl<P: AsRef<Path>> Extend<P> for PathBuf {
     // }
 }
 
-
 impl fmt::Debug for PathBuf {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, formatter)
     }
 }
-
 
 impl ops::Deref for PathBuf {
     type Target = Path;
@@ -1509,7 +1541,6 @@ impl ops::DerefMut for PathBuf {
         Path::from_inner_mut(&mut self.inner)
     }
 }
-
 
 impl Borrow<Path> for PathBuf {
     #[inline]
@@ -1615,7 +1646,6 @@ impl From<&Path> for Rc<Path> {
     }
 }
 
-
 impl ToOwned for Path {
     type Owned = PathBuf;
     #[inline]
@@ -1628,7 +1658,6 @@ impl ToOwned for Path {
     }
 }
 
-
 impl PartialEq for PathBuf {
     #[inline]
     fn eq(&self, other: &PathBuf) -> bool {
@@ -1636,16 +1665,13 @@ impl PartialEq for PathBuf {
     }
 }
 
-
 impl Hash for PathBuf {
     fn hash<H: Hasher>(&self, h: &mut H) {
         self.as_path().hash(h)
     }
 }
 
-
 impl Eq for PathBuf {}
-
 
 impl PartialOrd for PathBuf {
     #[inline]
@@ -1654,14 +1680,12 @@ impl PartialOrd for PathBuf {
     }
 }
 
-
 impl Ord for PathBuf {
     #[inline]
     fn cmp(&self, other: &PathBuf) -> cmp::Ordering {
         compare_components(self.components(), other.components())
     }
 }
-
 
 impl AsRef<str> for PathBuf {
     #[inline]
@@ -1737,7 +1761,7 @@ impl Path {
     /// let from_path = Path::new(&from_string);
     /// assert_eq!(from_string, from_path);
     /// ```
-    
+
     pub fn new<S: AsRef<str> + ?Sized>(s: &S) -> &Path {
         unsafe { &*(s.as_ref() as *const str as *const Path) }
     }
@@ -1758,7 +1782,7 @@ impl Path {
     /// let os_str = Path::new("foo.txt").as_os_str();
     /// assert_eq!(os_str, std::ffi::str::new("foo.txt"));
     /// ```
-    
+
     #[must_use]
     #[inline]
     pub fn as_os_str(&self) -> &str {
@@ -1802,7 +1826,7 @@ impl Path {
     /// let path = Path::new("foo.txt");
     /// assert_eq!(path.to_str(), Some("foo.txt"));
     /// ```
-    
+
     #[must_use = "this returns the result of the operation, \
                   without modifying the original"]
     #[inline]
@@ -1830,7 +1854,7 @@ impl Path {
     ///
     /// Had `path` contained invalid unicode, the `to_string_lossy` call might
     /// have returned `"fo�.txt"`.
-    
+
     // #[must_use = "this returns the result of the operation, \
     //               without modifying the original"]
     // #[inline]
@@ -1851,7 +1875,7 @@ impl Path {
     // #[rustc_conversion_suggestion]
     #[must_use = "this returns the result of the operation, \
                   without modifying the original"]
-    
+
     pub fn to_path_buf(&self) -> PathBuf {
         PathBuf::from(self.inner.to_string())
     }
@@ -1874,7 +1898,7 @@ impl Path {
     /// ```
     ///
     /// [`has_root`]: Path::has_root
-    
+
     #[must_use]
     #[allow(deprecated)]
     pub fn is_absolute(&self) -> bool {
@@ -1899,7 +1923,7 @@ impl Path {
     /// ```
     ///
     /// [`is_absolute`]: Path::is_absolute
-    
+
     #[must_use]
     #[inline]
     pub fn is_relative(&self) -> bool {
@@ -1926,7 +1950,7 @@ impl Path {
     ///
     /// assert!(Path::new("/etc/passwd").has_root());
     /// ```
-    
+
     #[must_use]
     #[inline]
     pub fn has_root(&self) -> bool {
@@ -1961,7 +1985,7 @@ impl Path {
     /// let great_grand_parent = grand_parent.and_then(Path::parent);
     /// assert_eq!(great_grand_parent, None);
     /// ```
-    
+
     #[doc(alias = "dirname")]
     #[must_use]
     pub fn parent(&self) -> Option<&Path> {
@@ -2029,7 +2053,7 @@ impl Path {
     /// assert_eq!(None, Path::new("foo.txt/..").file_name());
     /// assert_eq!(None, Path::new("/").file_name());
     /// ```
-    
+
     #[doc(alias = "basename")]
     #[must_use]
     pub fn file_name(&self) -> Option<&str> {
@@ -2103,7 +2127,7 @@ impl Path {
     ///
     /// assert!(!Path::new("/etc/foo.rs").starts_with("/etc/foo"));
     /// ```
-    
+
     #[must_use]
     pub fn starts_with<P: AsRef<Path>>(&self, base: P) -> bool {
         self._starts_with(base.as_ref())
@@ -2131,7 +2155,7 @@ impl Path {
     /// assert!(!path.ends_with("/resolv.conf"));
     /// assert!(!path.ends_with("conf")); // use .extension() instead
     /// ```
-    
+
     #[must_use]
     pub fn ends_with<P: AsRef<Path>>(&self, child: P) -> bool {
         self._ends_with(child.as_ref())
@@ -2167,10 +2191,12 @@ impl Path {
     ///
     /// [`Path::file_prefix`]: Path::file_prefix
     ///
-    
+
     #[must_use]
     pub fn file_stem(&self) -> Option<&str> {
-        self.file_name().map(rsplit_file_at_dot).and_then(|(before, after)| before.or(after))
+        self.file_name()
+            .map(rsplit_file_at_dot)
+            .and_then(|(before, after)| before.or(after))
     }
 
     /// Extracts the prefix of [`self.file_name`].
@@ -2204,7 +2230,9 @@ impl Path {
     // #[unstable(feature = "path_file_prefix", issue = "86319")]
     #[must_use]
     pub fn file_prefix(&self) -> Option<&str> {
-        self.file_name().map(split_file_at_dot).and_then(|(before, _after)| Some(before))
+        self.file_name()
+            .map(split_file_at_dot)
+            .and_then(|(before, _after)| Some(before))
     }
 
     /// Extracts the extension (without the leading dot) of [`self.file_name`], if possible.
@@ -2226,10 +2254,12 @@ impl Path {
     /// assert_eq!("rs", Path::new("foo.rs").extension().unwrap());
     /// assert_eq!("gz", Path::new("foo.tar.gz").extension().unwrap());
     /// ```
-    
+
     #[must_use]
     pub fn extension(&self) -> Option<&str> {
-        self.file_name().map(rsplit_file_at_dot).and_then(|(before, after)| before.and(after))
+        self.file_name()
+            .map(rsplit_file_at_dot)
+            .and_then(|(before, after)| before.and(after))
     }
 
     /// Creates an owned [`PathBuf`] with `path` adjoined to `self`.
@@ -2246,7 +2276,7 @@ impl Path {
     /// assert_eq!(Path::new("/etc").join("passwd"), PathBuf::from("/etc/passwd"));
     /// assert_eq!(Path::new("/etc").join("/bin/sh"), PathBuf::from("/bin/sh"));
     /// ```
-    
+
     #[must_use]
     pub fn join<P: AsRef<Path>>(&self, path: P) -> PathBuf {
         self._join(path.as_ref())
@@ -2274,7 +2304,7 @@ impl Path {
     /// let path = Path::new("/tmp");
     /// assert_eq!(path.with_file_name("var"), PathBuf::from("/var"));
     /// ```
-    
+
     #[must_use]
     pub fn with_file_name<S: AsRef<str>>(&self, file_name: S) -> PathBuf {
         self._with_file_name(file_name.as_ref())
@@ -2303,7 +2333,7 @@ impl Path {
     /// assert_eq!(path.with_extension("xz"), PathBuf::from("foo.tar.xz"));
     /// assert_eq!(path.with_extension("").with_extension("txt"), PathBuf::from("foo.txt"));
     /// ```
-    
+
     pub fn with_extension<S: AsRef<str>>(&self, extension: S) -> PathBuf {
         self._with_extension(extension.as_ref())
     }
@@ -2365,7 +2395,7 @@ impl Path {
     /// ```
     ///
     /// [`CurDir`]: Component::CurDir
-    
+
     pub fn components(&self) -> Components<'_> {
         let prefix = parse_prefix(self.as_os_str());
         Components {
@@ -2398,10 +2428,12 @@ impl Path {
     /// assert_eq!(it.next(), Some(str::new("foo.txt")));
     /// assert_eq!(it.next(), None)
     /// ```
-    
+
     #[inline]
     pub fn iter(&self) -> Iter<'_> {
-        Iter { inner: self.components() }
+        Iter {
+            inner: self.components(),
+        }
     }
 
     /// Returns an object that implements [`Display`] for safely printing paths
@@ -2421,7 +2453,7 @@ impl Path {
     ///
     /// println!("{}", path.display());
     /// ```
-    
+
     #[must_use = "this does not display the path, \
                   it returns an object that can be displayed"]
     #[inline]
@@ -2692,10 +2724,11 @@ impl Path {
     pub fn into_path_buf(self: Box<Path>) -> PathBuf {
         let rw = Box::into_raw(self) as *mut str;
         let inner = unsafe { Box::from_raw(rw) };
-        PathBuf { inner: String::from(inner) }
+        PathBuf {
+            inner: String::from(inner),
+        }
     }
 }
-
 
 impl AsRef<str> for Path {
     #[inline]
@@ -2703,7 +2736,6 @@ impl AsRef<str> for Path {
         &self.inner
     }
 }
-
 
 impl fmt::Debug for Path {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2736,13 +2768,11 @@ pub struct Display<'a> {
     inner: &'a str,
 }
 
-
 impl fmt::Debug for Display<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&self.inner, f)
     }
 }
-
 
 impl fmt::Display for Display<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2750,14 +2780,12 @@ impl fmt::Display for Display<'_> {
     }
 }
 
-
 impl PartialEq for Path {
     #[inline]
     fn eq(&self, other: &Path) -> bool {
         self.components() == other.components()
     }
 }
-
 
 impl Hash for Path {
     fn hash<H: Hasher>(&self, h: &mut H) {
@@ -2775,7 +2803,11 @@ impl Hash for Path {
         let mut bytes_hashed = 0;
 
         for i in 0..bytes.len() {
-            let is_sep = if verbatim { is_verbatim_sep(bytes[i]) } else { is_sep_byte(bytes[i]) };
+            let is_sep = if verbatim {
+                is_verbatim_sep(bytes[i])
+            } else {
+                is_sep_byte(bytes[i])
+            };
             if is_sep {
                 if i > component_start {
                     let to_hash = &bytes[component_start..i];
@@ -2809,9 +2841,7 @@ impl Hash for Path {
     }
 }
 
-
 impl Eq for Path {}
-
 
 impl PartialOrd for Path {
     #[inline]
@@ -2820,7 +2850,6 @@ impl PartialOrd for Path {
     }
 }
 
-
 impl Ord for Path {
     #[inline]
     fn cmp(&self, other: &Path) -> cmp::Ordering {
@@ -2828,14 +2857,12 @@ impl Ord for Path {
     }
 }
 
-
 impl AsRef<Path> for Path {
     #[inline]
     fn as_ref(&self) -> &Path {
         self
     }
 }
-
 
 impl AsRef<Path> for str {
     #[inline]
@@ -2852,14 +2879,12 @@ impl AsRef<Path> for Cow<'_, str> {
     }
 }
 
-
 impl AsRef<Path> for String {
     #[inline]
     fn as_ref(&self) -> &Path {
         Path::new(self)
     }
 }
-
 
 // impl AsRef<Path> for str {
 //     #[inline]
@@ -2868,14 +2893,12 @@ impl AsRef<Path> for String {
 //     }
 // }
 
-
 // impl AsRef<Path> for String {
 //     #[inline]
 //     fn as_ref(&self) -> &Path {
 //         Path::new(self)
 //     }
 // }
-
 
 impl AsRef<Path> for PathBuf {
     #[inline]

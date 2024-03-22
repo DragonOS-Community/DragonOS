@@ -762,7 +762,7 @@ impl Syscall {
         }
         // TODO AT_EMPTY_PATH标志启用时，进行调用者CAP_DAC_READ_SEARCH或相似的检查
         let symlink_times = if flags.contains(AtFlags::AT_SYMLINK_FOLLOW) {
-            0 as usize
+            0_usize
         } else {
             VFS_MAX_FOLLOW_SYMLINK_TIMES
         };
@@ -795,11 +795,11 @@ impl Syscall {
         // 得到新创建节点的父节点
         let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newfd, new)?;
         let (new_name, new_parent_path) = rsplit_path(&new_remain_path);
-        let new_parent = new_begin_inode
-            .lookup_follow_symlink(&new_parent_path.unwrap_or("/"), symlink_times)?;
+        let new_parent =
+            new_begin_inode.lookup_follow_symlink(new_parent_path.unwrap_or("/"), symlink_times)?;
 
         // 被调用者利用downcast_ref判断两inode是否为同一文件系统
-        return new_parent.link(&new_name, &old_inode).map(|_| 0);
+        return new_parent.link(new_name, &old_inode).map(|_| 0);
     }
 
     pub fn link(old: *const u8, new: *const u8) -> Result<usize, SystemError> {
@@ -816,9 +816,9 @@ impl Syscall {
         let old = get_path(old)?;
         let new = get_path(new)?;
         return Self::do_linkat(
-            AtFlags::AT_FDCWD.bits() as i32,
+            AtFlags::AT_FDCWD.bits(),
             &old,
-            AtFlags::AT_FDCWD.bits() as i32,
+            AtFlags::AT_FDCWD.bits(),
             &new,
             AtFlags::empty(),
         );

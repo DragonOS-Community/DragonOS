@@ -209,15 +209,10 @@ impl NTtyData {
             }
 
             if !overflow {
-                if flags.is_none() {
-                    self.receive_buf(tty.clone(), &buf[offset..], flags, n);
+                if let Some(flags) = flags {
+                    self.receive_buf(tty.clone(), &buf[offset..], Some(&flags[offset..]), n);
                 } else {
-                    self.receive_buf(
-                        tty.clone(),
-                        &buf[offset..],
-                        Some(&flags.unwrap()[offset..]),
-                        n,
-                    );
+                    self.receive_buf(tty.clone(), &buf[offset..], flags, n);
                 }
             }
 
@@ -792,8 +787,8 @@ impl NTtyData {
         // 先处理信号
         let mut ctrl_info = tty.core().contorl_info_irqsave();
         let pg = ctrl_info.pgid;
-        if pg.is_some() {
-            let _ = Syscall::kill(pg.unwrap(), signal as i32);
+        if let Some(pg) = pg {
+            let _ = Syscall::kill(pg, signal as i32);
         }
 
         ctrl_info.pgid = None;
@@ -1023,7 +1018,7 @@ impl NTtyData {
         // 找到eol的坐标
         let tmp = self.read_flags.next_index(tail);
         // 找到的话即为坐标，未找到的话即为NTTY_BUFSIZE
-        let mut eol = if tmp.is_none() { size } else { tmp.unwrap() };
+        let mut eol = if let Some(tmp) = tmp { tmp } else { size };
         if eol > size {
             eol = size
         }
@@ -1035,8 +1030,7 @@ impl NTtyData {
         let found = if eol == NTTY_BUFSIZE && more > 0 {
             // 需要返回头部
             let ret = self.read_flags.first_index();
-            if ret.is_some() {
-                let tmp = ret.unwrap();
+            if let Some(tmp) = ret {
                 // 在头部范围内找到eol
                 if tmp < more {
                     eol = tmp;
@@ -1179,9 +1173,9 @@ impl NTtyData {
         }
 
         let mut cnt = 0;
-        for i in 0..nr {
+        for (i, c) in buf.iter().enumerate().take(nr) {
             cnt = i;
-            let c = buf[i];
+            let c = *c;
             if c as usize == 8 {
                 // 表示退格
                 if self.cursor_column > 0 {
@@ -1247,7 +1241,7 @@ impl NTtyData {
         let echoed = self.echoes(tty.clone());
 
         if echoed.is_ok() && echoed.unwrap() > 0 {
-            let _ = tty.flush_chars(tty.core());
+            tty.flush_chars(tty.core());
         }
     }
 
@@ -1345,8 +1339,8 @@ impl NTtyData {
                                 if tty.put_char(tty.core(), 8).is_err() {
                                     tty.write(core, &[8], 1)?;
                                 }
-                                if tty.put_char(tty.core(), ' ' as u8).is_err() {
-                                    tty.write(core, &[' ' as u8], 1)?;
+                                if tty.put_char(tty.core(), b' ').is_err() {
+                                    tty.write(core, &[b' '], 1)?;
                                 }
                                 self.cursor_column -= 1;
                                 space -= 1;
@@ -1490,18 +1484,18 @@ impl NTtyData {
             '\t' => {
                 // 计算输出一个\t需要的空间
                 let spaces = 8 - (self.cursor_column & 7) as usize;
-                if termios.output_mode.contains(OutputMode::TABDLY) {
-                    if OutputMode::TABDLY.bits() == OutputMode::XTABS.bits() {
-                        // 配置的tab选项是真正输出空格到驱动
-                        if space < spaces {
-                            // 空间不够
-                            return Err(SystemError::ENOBUFS);
-                        }
-                        self.cursor_column += spaces as u32;
-                        // 写入sapces个空格
-                        tty.write(core, "        ".as_bytes(), spaces)?;
-                        return Ok(spaces);
+                if termios.output_mode.contains(OutputMode::TABDLY)
+                    && OutputMode::TABDLY.bits() == OutputMode::XTABS.bits()
+                {
+                    // 配置的tab选项是真正输出空格到驱动
+                    if space < spaces {
+                        // 空间不够
+                        return Err(SystemError::ENOBUFS);
                     }
+                    self.cursor_column += spaces as u32;
+                    // 写入sapces个空格
+                    tty.write(core, "        ".as_bytes(), spaces)?;
+                    return Ok(spaces);
                 }
                 self.cursor_column += spaces as u32;
             }
@@ -1598,10 +1592,8 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 } else if ldata.canon_copy_from_read_buf(buf, &mut nr, &mut offset)? {
                     return Ok(len - nr);
                 }
-            } else {
-                if ldata.copy_from_read_buf(termios, buf, &mut nr, &mut offset)? {
-                    return Ok(len - nr);
-                }
+            } else if ldata.copy_from_read_buf(termios, buf, &mut nr, &mut offset)? {
+                return Ok(len - nr);
             }
 
             // 没有数据可读
@@ -1723,7 +1715,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         let pcb = ProcessManager::current_pcb();
         let binding = tty.clone();
         let core = binding.core();
-        let termios = core.termios().clone();
+        let termios = *core.termios();
         if termios.local_mode.contains(LocalMode::TOSTOP) {
             TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTOU)?;
         }
@@ -1769,7 +1761,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                     nr -= 1;
                 }
 
-                let _ = tty.flush_chars(core);
+                tty.flush_chars(core);
             } else {
                 while nr > 0 {
                     let write = tty.write(core, &buf[offset..], nr)?;
@@ -1876,8 +1868,8 @@ impl TtyLineDiscipline for NTtyLinediscipline {
 
         // 第一次设置或者规范模式 (ICANON) 或者扩展处理 (EXTPROC) 标志发生变化
         let mut spec_mode_changed = false;
-        if old.is_some() {
-            let local_mode = old.clone().unwrap().local_mode.bitxor(termios.local_mode);
+        if let Some(old) = old {
+            let local_mode = old.local_mode.bitxor(termios.local_mode);
             spec_mode_changed =
                 local_mode.contains(LocalMode::ICANON) || local_mode.contains(LocalMode::EXTPROC);
         }
@@ -2001,7 +1993,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             // 原模式或real_raw
             ldata.raw = true;
 
-            if termios.input_mode.contains(InputMode::IGNBRK)
+            ldata.real_raw = termios.input_mode.contains(InputMode::IGNBRK)
                 || (!termios.input_mode.contains(InputMode::BRKINT)
                     && !termios.input_mode.contains(InputMode::PARMRK))
                     && (termios.input_mode.contains(InputMode::IGNPAR)
@@ -2009,12 +2001,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                     && (core
                         .driver()
                         .flags()
-                        .contains(TtyDriverFlag::TTY_DRIVER_REAL_RAW))
-            {
-                ldata.real_raw = true;
-            } else {
-                ldata.real_raw = false;
-            }
+                        .contains(TtyDriverFlag::TTY_DRIVER_REAL_RAW));
         }
 
         // if !termios.input_mode.contains(InputMode::IXON)

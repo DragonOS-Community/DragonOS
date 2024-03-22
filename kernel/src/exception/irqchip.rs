@@ -308,13 +308,13 @@ pub struct IrqChipType {
 #[derive(Debug)]
 pub enum IrqChipSetMaskResult {
     /// core updates mask ok.
-    SetMaskOk,
+    Success,
     /// core updates mask ok. No change.
-    SetMaskOkNoChange,
+    NoChange,
     /// core updates mask ok. Done.(same as SetMaskOk)
     ///
     /// 支持堆叠irq芯片的特殊代码, 表示跳过所有子irq芯片。
-    SetMaskOkDone,
+    Done,
 }
 
 bitflags! {
@@ -351,7 +351,7 @@ impl IrqManager {
     /// Acknowledge the parent interrupt
     #[allow(dead_code)]
     pub fn irq_chip_ack_parent(&self, irq_data: &Arc<IrqData>) {
-        let parent_data = irq_data.parent_data().map(|p| p.upgrade()).flatten();
+        let parent_data = irq_data.parent_data().and_then(|p| p.upgrade());
 
         if let Some(parent_data) = parent_data {
             let parent_chip = parent_data.chip_info_read_irqsave().chip();
@@ -364,19 +364,15 @@ impl IrqManager {
     /// 遍历中断域的层次结构，并检查是否存在一个硬件重新触发函数。如果存在则调用它
     pub fn irq_chip_retrigger_hierarchy(&self, irq_data: &Arc<IrqData>) -> Result<(), SystemError> {
         let mut data: Option<Arc<IrqData>> = Some(irq_data.clone());
-        loop {
-            if let Some(d) = data {
-                if let Err(e) = d.chip_info_read_irqsave().chip().retrigger(&d) {
-                    if e == SystemError::ENOSYS {
-                        data = d.parent_data().map(|p| p.upgrade()).flatten();
-                    } else {
-                        return Err(e);
-                    }
+        while let Some(d) = data {
+            if let Err(e) = d.chip_info_read_irqsave().chip().retrigger(&d) {
+                if e == SystemError::ENOSYS {
+                    data = d.parent_data().and_then(|p| p.upgrade());
                 } else {
-                    return Ok(());
+                    return Err(e);
                 }
             } else {
-                break;
+                return Ok(());
             }
         }
 
@@ -445,7 +441,7 @@ impl IrqManager {
                 }
 
                 //  try the parent
-                let parent_data = dt.parent_data().map(|p| p.upgrade()).flatten();
+                let parent_data = dt.parent_data().and_then(|p| p.upgrade());
 
                 irq_data = parent_data;
             }
@@ -462,27 +458,27 @@ impl IrqManager {
             }
         }
         let handler = handler.unwrap();
-        if core::ptr::eq(handler, bad_irq_handler()) {
-            if Arc::ptr_eq(
+        if handler.type_id() == bad_irq_handler().type_id()
+            && Arc::ptr_eq(
                 &desc_inner.irq_data().chip_info_read_irqsave().chip(),
                 &no_irq_chip(),
-            ) {
-                let irq_data = desc_inner.irq_data();
-                mask_ack_irq(irq_data);
+            )
+        {
+            let irq_data = desc_inner.irq_data();
+            mask_ack_irq(irq_data);
 
-                irq_data.irqd_set(IrqStatus::IRQD_IRQ_DISABLED);
+            irq_data.irqd_set(IrqStatus::IRQD_IRQ_DISABLED);
 
-                if is_chained {
-                    desc_inner.clear_actions();
-                }
-                desc_inner.set_depth(1);
+            if is_chained {
+                desc_inner.clear_actions();
             }
+            desc_inner.set_depth(1);
         }
         let chip = desc_inner.irq_data().chip_info_read_irqsave().chip();
         desc.set_handler_no_lock_inner(handler, desc_inner.irq_data(), &chip);
         desc_inner.set_name(name);
 
-        if !core::ptr::eq(handler, bad_irq_handler()) && is_chained {
+        if handler.type_id() != bad_irq_handler().type_id() && is_chained {
             let trigger_type = desc_inner.common_data().trigger_type();
 
             /*

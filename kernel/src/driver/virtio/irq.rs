@@ -71,7 +71,7 @@ impl VirtIOIrqManager {
 
     pub fn lookup_device(&self, dev_id: &Arc<DeviceId>) -> Option<Arc<dyn VirtIODevice>> {
         let map = self.map.read_irqsave();
-        map.get(dev_id).map(|x| x.clone())
+        map.get(dev_id).cloned()
     }
 }
 

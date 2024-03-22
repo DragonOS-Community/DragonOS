@@ -1,3 +1,5 @@
+use core::hint::spin_loop;
+
 use x86::cpuid::{cpuid, CpuIdResult};
 
 use crate::smp::cpu::ProcessorId;
@@ -14,5 +16,7 @@ pub fn current_cpu_id() -> ProcessorId {
 pub unsafe fn cpu_reset() -> ! {
     // 重启计算机
     unsafe { x86::io::outb(0x64, 0xfe) };
-    loop {}
+    loop {
+        spin_loop();
+    }
 }

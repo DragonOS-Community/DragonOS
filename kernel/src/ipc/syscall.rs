@@ -130,13 +130,13 @@ impl Syscall {
             let input_sighandler = unsafe { (*act).handler as u64 };
             match input_sighandler {
                 USER_SIG_DFL => {
-                    new_ka = Sigaction::DEFAULT_SIGACTION.clone();
+                    new_ka = Sigaction::DEFAULT_SIGACTION;
                     *new_ka.flags_mut() = unsafe { (*act).flags };
                     new_ka.set_restorer(None);
                 }
 
                 USER_SIG_IGN => {
-                    new_ka = Sigaction::DEFAULT_SIGACTION_IGNORE.clone();
+                    new_ka = Sigaction::DEFAULT_SIGACTION_IGNORE;
                     *new_ka.flags_mut() = unsafe { (*act).flags };
 
                     new_ka.set_restorer(None);
@@ -145,7 +145,7 @@ impl Syscall {
                     // 从用户空间获得sigaction结构体
                     // TODO mask是default还是用户空间传入
                     new_ka = Sigaction::new(
-                        SigactionType::SaHandler(SaHandlerType::SigCustomized(unsafe {
+                        SigactionType::SaHandler(SaHandlerType::Customized(unsafe {
                             VirtAddr::new((*act).handler as usize)
                         })),
                         unsafe { (*act).flags },
@@ -171,7 +171,7 @@ impl Syscall {
             *new_ka.mask_mut() = mask;
         }
 
-        let sig = Signal::from(sig as i32);
+        let sig = Signal::from(sig);
         // 如果给出的信号值不合法
         if sig == Signal::INVALID {
             return Err(SystemError::EINVAL);
@@ -199,10 +199,9 @@ impl Syscall {
                 return Err(SystemError::EFAULT);
             }
 
-            let sigaction_handler: VirtAddr;
-            sigaction_handler = match old_sigaction.action() {
+            let sigaction_handler = match old_sigaction.action() {
                 SigactionType::SaHandler(handler) => {
-                    if let SaHandlerType::SigCustomized(hand) = handler {
+                    if let SaHandlerType::Customized(hand) = handler {
                         hand
                     } else if handler.is_sig_ignore() {
                         VirtAddr::new(USER_SIG_IGN as usize)

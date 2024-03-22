@@ -194,6 +194,7 @@ impl ElfLoader {
     /// ## 返回值
     ///
     /// - `Ok((VirtAddr, bool))`：如果成功加载，则bool值为true，否则为false. VirtAddr为加载的地址
+    #[allow(clippy::too_many_arguments)]
     fn load_elf_segment(
         &self,
         user_vm_guard: &mut RwLockWriteGuard<'_, InnerAddressSpace>,
@@ -501,7 +502,7 @@ impl ElfLoader {
 }
 
 impl BinaryLoader for ElfLoader {
-    fn probe(self: &'static Self, param: &ExecParam, buf: &[u8]) -> Result<(), ExecError> {
+    fn probe(&'static self, param: &ExecParam, buf: &[u8]) -> Result<(), ExecError> {
         // let elf_bytes =
         //     ElfBytes::<AnyEndian>::minimal_parse(buf).map_err(|_| ExecError::NotExecutable)?;
 
@@ -518,7 +519,7 @@ impl BinaryLoader for ElfLoader {
     }
 
     fn load(
-        self: &'static Self,
+        &'static self,
         param: &mut ExecParam,
         head_buf: &[u8],
     ) -> Result<BinaryLoaderResult, ExecError> {
@@ -546,7 +547,7 @@ impl BinaryLoader for ElfLoader {
         let interpreter: Option<File> = None;
         for seg in phdr_table {
             if seg.p_type == PT_GNU_PROPERTY {
-                _gnu_property_data = Some(seg.clone());
+                _gnu_property_data = Some(seg);
                 continue;
             }
             if seg.p_type != PT_INTERP {
@@ -659,6 +660,7 @@ impl BinaryLoader for ElfLoader {
 
             let vaddr = VirtAddr::new(seg_to_load.p_vaddr.try_into().unwrap());
 
+            #[allow(clippy::if_same_then_else)]
             if !first_pt_load {
                 elf_map_flags.insert(MapFlags::MAP_FIXED_NOREPLACE);
             } else if elf_type == ElfType::Executable {
@@ -743,10 +745,10 @@ impl BinaryLoader for ElfLoader {
             }
 
             let p_vaddr = VirtAddr::new(seg_to_load.p_vaddr as usize);
-            if (seg_to_load.p_flags & elf::abi::PF_X) != 0 {
-                if start_code.is_none() || start_code.as_ref().unwrap() > &p_vaddr {
-                    start_code = Some(p_vaddr);
-                }
+            if (seg_to_load.p_flags & elf::abi::PF_X) != 0
+                && (start_code.is_none() || start_code.as_ref().unwrap() > &p_vaddr)
+            {
+                start_code = Some(p_vaddr);
             }
 
             if start_data.is_none()
@@ -796,11 +798,7 @@ impl BinaryLoader for ElfLoader {
         }
         // kdebug!("elf load: phdr_vaddr={phdr_vaddr:?}");
         let program_entrypoint = VirtAddr::new(ehdr.e_entry as usize + load_bias);
-        let phdr_vaddr = if phdr_vaddr.is_some() {
-            Some(phdr_vaddr.unwrap() + load_bias)
-        } else {
-            None
-        };
+        let phdr_vaddr = phdr_vaddr.map(|phdr_vaddr| phdr_vaddr + load_bias);
 
         elf_bss += load_bias;
         elf_brk += load_bias;

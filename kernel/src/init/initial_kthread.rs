@@ -11,7 +11,7 @@ use crate::{
     filesystem::vfs::core::mount_root_fs,
     kdebug, kerror,
     net::net_core::net_init,
-    process::{kthread::KernelThreadMechanism, process::stdio_init},
+    process::{kthread::KernelThreadMechanism, stdio::stdio_init},
     smp::smp_init,
 };
 
@@ -24,7 +24,7 @@ pub fn initial_kernel_thread() -> i32 {
 
     switch_to_user();
 
-    loop {}
+    unreachable!();
 }
 
 fn kernel_init() -> Result<(), SystemError> {

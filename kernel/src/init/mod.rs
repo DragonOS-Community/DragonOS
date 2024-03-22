@@ -6,7 +6,7 @@ use crate::{
     libs::rwlock::RwLock,
     mm::{PhysAddr, VirtAddr},
 };
-
+#[allow(clippy::module_inception)]
 pub mod init;
 pub mod initcall;
 pub mod initial_kthread;
@@ -77,7 +77,7 @@ impl BootParams {
                 break;
             }
         }
-        let pos = pos.unwrap_or_else(|| self.boot_command_line.len() - 1) as isize;
+        let pos = pos.unwrap_or(self.boot_command_line.len() - 1) as isize;
 
         let avail = self.boot_command_line.len() as isize - pos - 1;
         if avail <= 0 {

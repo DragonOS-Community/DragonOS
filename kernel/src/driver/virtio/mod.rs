@@ -9,6 +9,7 @@ use super::base::device::DeviceId;
 
 pub(super) mod irq;
 pub mod transport_pci;
+#[allow(clippy::module_inception)]
 pub mod virtio;
 pub mod virtio_impl;
 

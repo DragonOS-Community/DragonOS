@@ -21,8 +21,7 @@ impl Syscall {
         // 根据调度结果统一进行切换
         let pcb = do_sched();
 
-        if pcb.is_some() {
-            let next_pcb = pcb.unwrap();
+        if let Some(next_pcb) = pcb {
             let current_pcb = ProcessManager::current_pcb();
             // kdebug!("sched: current_pcb: {:?}, next_pcb: {:?}\n", current_pcb, next_pcb);
             if current_pcb.pid() != next_pcb.pid() {

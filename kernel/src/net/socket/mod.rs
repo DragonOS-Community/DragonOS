@@ -314,7 +314,7 @@ impl IndexNode for SocketInode {
             // 最后一次关闭，需要释放
             let mut socket = self.0.lock_irqsave();
 
-            if socket.metadata().unwrap().socket_type == SocketType::SeqpacketSocket {
+            if socket.metadata().unwrap().socket_type == SocketType::Seqpacket {
                 return Ok(());
             }
 
@@ -398,7 +398,7 @@ pub struct SocketHandleItem {
 }
 
 impl SocketHandleItem {
-    pub fn new(socket: &Box<dyn Socket>) -> Self {
+    pub fn new(socket: &dyn Socket) -> Self {
         Self {
             metadata: socket.metadata().unwrap(),
             shutdown_type: RwLock::new(ShutdownType::empty()),
@@ -407,7 +407,7 @@ impl SocketHandleItem {
         }
     }
 
-    pub fn from_socket<A: Socket>(socket: &Box<A>) -> Self {
+    pub fn from_socket<A: Socket>(socket: &A) -> Self {
         Self {
             metadata: socket.metadata().unwrap(),
             shutdown_type: RwLock::new(ShutdownType::empty()),
@@ -434,7 +434,7 @@ impl SocketHandleItem {
     }
 
     pub fn shutdown_type(&self) -> ShutdownType {
-        self.shutdown_type.read().clone()
+        *self.shutdown_type.read()
     }
 
     pub fn shutdown_type_writer(&mut self) -> RwLockWriteGuard<ShutdownType> {
@@ -496,18 +496,18 @@ impl PortManager {
                 if EPHEMERAL_PORT == 65535 {
                     EPHEMERAL_PORT = 49152;
                 } else {
-                    EPHEMERAL_PORT = EPHEMERAL_PORT + 1;
+                    EPHEMERAL_PORT += 1;
                 }
                 port = EPHEMERAL_PORT;
             }
 
             // 使用 ListenTable 检查端口是否被占用
             let listen_table_guard = match socket_type {
-                SocketType::UdpSocket => self.udp_port_table.lock(),
-                SocketType::TcpSocket => self.tcp_port_table.lock(),
+                SocketType::Udp => self.udp_port_table.lock(),
+                SocketType::Tcp => self.tcp_port_table.lock(),
                 _ => panic!("{:?} cann't get a port", socket_type),
             };
-            if let None = listen_table_guard.get(&port) {
+            if listen_table_guard.get(&port).is_none() {
                 drop(listen_table_guard);
                 return Ok(port);
             }
@@ -527,8 +527,8 @@ impl PortManager {
     ) -> Result<(), SystemError> {
         if port > 0 {
             let mut listen_table_guard = match socket_type {
-                SocketType::UdpSocket => self.udp_port_table.lock(),
-                SocketType::TcpSocket => self.tcp_port_table.lock(),
+                SocketType::Udp => self.udp_port_table.lock(),
+                SocketType::Tcp => self.tcp_port_table.lock(),
                 _ => panic!("{:?} cann't bind a port", socket_type),
             };
             match listen_table_guard.get(&port) {
@@ -543,8 +543,8 @@ impl PortManager {
     /// @brief 在对应的端口记录表中将端口和 socket 解绑
     pub fn unbind_port(&self, socket_type: SocketType, port: u16) -> Result<(), SystemError> {
         let mut listen_table_guard = match socket_type {
-            SocketType::UdpSocket => self.udp_port_table.lock(),
-            SocketType::TcpSocket => self.tcp_port_table.lock(),
+            SocketType::Udp => self.udp_port_table.lock(),
+            SocketType::Tcp => self.tcp_port_table.lock(),
             _ => return Ok(()),
         };
         listen_table_guard.remove(&port);
@@ -584,13 +584,13 @@ impl Drop for GlobalSocketHandle {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SocketType {
     /// 原始的socket
-    RawSocket,
+    Raw,
     /// 用于Tcp通信的 Socket
-    TcpSocket,
+    Tcp,
     /// 用于Udp通信的 Socket
-    UdpSocket,
+    Udp,
     /// 用于进程间通信的 Socket
-    SeqpacketSocket,
+    Seqpacket,
 }
 
 bitflags! {
@@ -750,7 +750,7 @@ impl TryFrom<u16> for AddressFamily {
     type Error = SystemError;
     fn try_from(x: u16) -> Result<Self, Self::Error> {
         use num_traits::FromPrimitive;
-        return <Self as FromPrimitive>::from_u16(x).ok_or_else(|| SystemError::EINVAL);
+        return <Self as FromPrimitive>::from_u16(x).ok_or(SystemError::EINVAL);
     }
 }
 
@@ -770,7 +770,7 @@ impl TryFrom<u8> for PosixSocketType {
     type Error = SystemError;
     fn try_from(x: u8) -> Result<Self, Self::Error> {
         use num_traits::FromPrimitive;
-        return <Self as FromPrimitive>::from_u8(x).ok_or_else(|| SystemError::EINVAL);
+        return <Self as FromPrimitive>::from_u8(x).ok_or(SystemError::EINVAL);
     }
 }
 

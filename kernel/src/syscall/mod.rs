@@ -345,6 +345,21 @@ impl Syscall {
                 Self::rmdir(path)
             }
 
+            SYS_LINK => {
+                let old = args[0] as *const u8;
+                let new = args[1] as *const u8;
+                return Self::link(old, new);
+            }
+
+            SYS_LINKAT => {
+                let oldfd = args[0] as i32;
+                let old = args[1] as *const u8;
+                let newfd = args[2] as i32;
+                let new = args[3] as *const u8;
+                let flags = args[4] as i32;
+                return Self::linkat(oldfd, old, newfd, new, flags);
+            }
+
             #[cfg(target_arch = "x86_64")]
             SYS_UNLINK => {
                 let path = args[0] as *const u8;

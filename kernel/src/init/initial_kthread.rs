@@ -12,6 +12,7 @@ use crate::{
     kdebug, kerror,
     net::net_core::net_init,
     process::{kthread::KernelThreadMechanism, process::stdio_init},
+    smp::smp_init,
 };
 
 use super::initcall::do_initcalls;
@@ -54,6 +55,8 @@ fn kenrel_init_freeable() -> Result<(), SystemError> {
     do_initcalls().unwrap_or_else(|err| {
         panic!("Failed to initialize subsystems: {:?}", err);
     });
+
+    smp_init();
 
     return Ok(());
 }

@@ -41,7 +41,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
-    mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
+    mm::{percpu::PerCpuVar, set_IDLE_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
     net::socket::SocketInode,
     sched::{
         completion::Completion,
@@ -109,7 +109,7 @@ impl ProcessManager {
             compiler_fence(Ordering::SeqCst);
             kdebug!("To create address space for INIT process.");
             // test_buddy();
-            set_INITIAL_PROCESS_ADDRESS_SPACE(
+            set_IDLE_PROCESS_ADDRESS_SPACE(
                 AddressSpace::new(true).expect("Failed to create address space for INIT process."),
             );
             kdebug!("INIT process address space created.");

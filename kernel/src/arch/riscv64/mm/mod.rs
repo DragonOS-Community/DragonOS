@@ -1,17 +1,23 @@
+use acpi::address;
 use riscv::register::satp;
+use sbi_rt::{HartMask, SbiRet};
 use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
+    kdebug,
     libs::spinlock::SpinLock,
     mm::{
         allocator::{
             buddy::BuddyAllocator,
             page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage, PhysPageFrame},
         },
-        page::PageFlags,
+        kernel_mapper::KernelMapper,
+        page::{PageEntry, PageFlags},
+        ucontext::UserMapper,
         MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
     },
+    smp::cpu::ProcessorId,
 };
 
 use self::init::riscv_mm_init;
@@ -38,7 +44,47 @@ pub struct RiscV64MMArch;
 
 impl RiscV64MMArch {
     pub const ENTRY_FLAG_GLOBAL: usize = 1 << 5;
+
+    /// 使远程cpu的TLB中，指定地址范围的页失效
+    pub fn remote_invalidate_page(
+        cpu: ProcessorId,
+        address: VirtAddr,
+        size: usize,
+    ) -> Result<(), SbiRet> {
+        let r = sbi_rt::remote_sfence_vma(Into::into(cpu), address.data(), size);
+        if r.is_ok() {
+            return Ok(());
+        } else {
+            return Err(r);
+        }
+    }
+
+    /// 使指定远程cpu的TLB中，所有范围的页失效
+    pub fn remote_invalidate_all(cpu: ProcessorId) -> Result<(), SbiRet> {
+        let r = Self::remote_invalidate_page(
+            cpu,
+            VirtAddr::new(0),
+            1 << RiscV64MMArch::ENTRY_ADDRESS_SHIFT,
+        );
+
+        return r;
+    }
+
+    pub fn remote_invalidate_all_with_mask(mask: HartMask) -> Result<(), SbiRet> {
+        let r = sbi_rt::remote_sfence_vma(mask, 0, 1 << RiscV64MMArch::ENTRY_ADDRESS_SHIFT);
+        if r.is_ok() {
+            return Ok(());
+        } else {
+            return Err(r);
+        }
+    }
 }
+
+/// 内核空间起始地址在顶层页表中的索引
+const KERNEL_TOP_PAGE_ENTRY_NO: usize = (RiscV64MMArch::PHYS_OFFSET
+    & ((1 << RiscV64MMArch::ENTRY_ADDRESS_SHIFT) - 1))
+    >> (RiscV64MMArch::ENTRY_ADDRESS_SHIFT - RiscV64MMArch::PAGE_ENTRY_SHIFT);
+
 impl MemoryManagementArch for RiscV64MMArch {
     const PAGE_SHIFT: usize = 12;
 
@@ -117,16 +163,35 @@ impl MemoryManagementArch for RiscV64MMArch {
         satp::set(satp::Mode::Sv39, 0, ppn);
     }
 
-    fn virt_is_valid(virt: crate::mm::VirtAddr) -> bool {
+    fn virt_is_valid(virt: VirtAddr) -> bool {
         virt.is_canonical()
     }
 
-    fn initial_page_table() -> crate::mm::PhysAddr {
+    fn initial_page_table() -> PhysAddr {
         todo!()
     }
 
-    fn setup_new_usermapper() -> Result<crate::mm::ucontext::UserMapper, SystemError> {
-        todo!()
+    fn setup_new_usermapper() -> Result<UserMapper, SystemError> {
+        let new_umapper: crate::mm::page::PageMapper<MMArch, LockedFrameAllocator> = unsafe {
+            PageMapper::create(PageTableKind::User, LockedFrameAllocator)
+                .ok_or(SystemError::ENOMEM)?
+        };
+
+        let current_ktable: KernelMapper = KernelMapper::lock();
+        let copy_mapping = |pml4_entry_no| unsafe {
+            let entry: PageEntry<RiscV64MMArch> = current_ktable
+                .table()
+                .entry(pml4_entry_no)
+                .unwrap_or_else(|| panic!("entry {} not found", pml4_entry_no));
+            new_umapper.table().set_entry(pml4_entry_no, entry)
+        };
+
+        // 复制内核的映射
+        for pml4_entry_no in KERNEL_TOP_PAGE_ENTRY_NO..512 {
+            copy_mapping(pml4_entry_no);
+        }
+
+        return Ok(crate::mm::ucontext::UserMapper::new(new_umapper));
     }
 
     unsafe fn phys_2_virt(phys: PhysAddr) -> Option<VirtAddr> {

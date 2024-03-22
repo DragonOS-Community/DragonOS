@@ -6,7 +6,7 @@ use core::{
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    mm::{percpu::PerCpu, VirtAddr, INITIAL_PROCESS_ADDRESS_SPACE},
+    mm::{percpu::PerCpu, VirtAddr, IDLE_PROCESS_ADDRESS_SPACE},
     process::KernelStack,
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
@@ -53,7 +53,7 @@ impl ProcessManager {
             unsafe {
                 idle_pcb
                     .basic_mut()
-                    .set_user_vm(Some(INITIAL_PROCESS_ADDRESS_SPACE()))
+                    .set_user_vm(Some(IDLE_PROCESS_ADDRESS_SPACE()))
             };
 
             assert!(idle_pcb.sched_info().on_cpu().is_none());

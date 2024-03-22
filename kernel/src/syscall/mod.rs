@@ -1,11 +1,12 @@
 use core::{
     ffi::{c_int, c_void},
+    ptr::null,
     sync::atomic::{AtomicBool, Ordering},
 };
 
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
-    driver::base::device::device_number::DeviceNumber,
+    filesystem::vfs::syscall::PosixStatx,
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::syscall::MremapFlags,
     net::syscall::MsgHdr,
@@ -96,6 +97,7 @@ impl Syscall {
                 Self::open(path, flags, mode, true)
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_RENAME => {
                 let oldname: *const u8 = args[0] as *const u8;
                 let newname: *const u8 = args[1] as *const u8;
@@ -108,6 +110,7 @@ impl Syscall {
                 )
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_RENAMEAT => {
                 let oldfd = args[0] as i32;
                 let oldname: *const u8 = args[1] as *const u8;
@@ -634,6 +637,8 @@ impl Syscall {
 
             #[cfg(target_arch = "x86_64")]
             SYS_MKNOD => {
+                use crate::driver::base::device::device_number::DeviceNumber;
+
                 let path = args[0];
                 let flags = args[1];
                 let dev_t = args[2];
@@ -702,6 +707,17 @@ impl Syscall {
                 Self::stat(path, kstat)
             }
 
+            SYS_STATX => {
+                let fd = args[0] as i32;
+                let path = args[1] as *const u8;
+                let flags = args[2] as u32;
+                let mask = args[3] as u32;
+                let kstat = args[4] as *mut PosixStatx;
+
+                Self::do_statx(fd, path, flags, mask, kstat)
+            }
+
+            #[cfg(target_arch = "x86_64")]
             SYS_EPOLL_CREATE => Self::epoll_create(args[0] as i32),
             SYS_EPOLL_CREATE1 => Self::epoll_create1(args[0]),
 
@@ -712,6 +728,7 @@ impl Syscall {
                 VirtAddr::new(args[3]),
             ),
 
+            #[cfg(target_arch = "x86_64")]
             SYS_EPOLL_WAIT => Self::epoll_wait(
                 args[0] as i32,
                 VirtAddr::new(args[1]),
@@ -942,6 +959,13 @@ impl Syscall {
 
                 Err(SystemError::ENOSYS)
             }
+
+            SYS_MOUNT => {
+                let source = args[0] as *const u8;
+                let target = args[1] as *const u8;
+                let filesystemtype = args[2] as *const u8;
+                return Self::mount(source, target, filesystemtype, 0, null());
+            }
             SYS_NEWFSTATAT => {
                 // todo: 这个系统调用还没有实现
 
@@ -953,6 +977,7 @@ impl Syscall {
                 let name = args[0] as *mut PosixOldUtsName;
                 Self::uname(name)
             }
+
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

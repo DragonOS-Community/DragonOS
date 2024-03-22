@@ -72,6 +72,7 @@
 
 #define SYS_ARCH_PRCTL 158
 
+#define SYS_MOUNT 165
 #define SYS_REBOOT 169
 
 #define SYS_GETPPID 110

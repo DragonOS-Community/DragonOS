@@ -8,7 +8,7 @@ use system_error::SystemError;
 use crate::{
     filesystem::vfs::{
         file::{File, FileMode},
-        syscall::{IoVec, IoVecs, ModeType},
+        syscall::{IoVec, IoVecs},
         FileType,
     },
     libs::spinlock::SpinLockGuard,
@@ -599,12 +599,7 @@ impl SockAddr {
                         .to_str()
                         .map_err(|_| SystemError::EINVAL)?;
 
-                    let fd = Syscall::open(
-                        path,
-                        FileMode::O_RDWR | FileMode::O_CREAT,
-                        ModeType::from_bits_truncate(0o755),
-                        true,
-                    )?;
+                    let fd = Syscall::open(path.as_ptr(), FileMode::O_RDWR.bits(), 0o755, true)?;
 
                     let binding = ProcessManager::current_pcb().fd_table();
                     let fd_table_guard = binding.read();

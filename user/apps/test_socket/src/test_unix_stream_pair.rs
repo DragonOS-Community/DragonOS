@@ -20,7 +20,9 @@ pub fn test_unix_stream_pair() -> std::io::Result<()> {
     let nbytes = sock0.read(&mut buffer).expect("read error");
     let received_msg = from_utf8(&buffer[..nbytes]).unwrap();
 
-    client_thread.join().ok();
+    if client_thread.join().is_err() {
+        return Err(Error::from_raw_os_error(-2));
+    }
 
     if received_msg == MSG {
         Ok(())

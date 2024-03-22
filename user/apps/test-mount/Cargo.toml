@@ -1,0 +1,11 @@
+[package]
+name = "test-mount"
+version = "0.1.0"
+edition = "2021"
+description = "test the new mount syscall"
+authors = [ "xiaolin2004 <1553367438@qq.com>" ]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+libc="0.2"

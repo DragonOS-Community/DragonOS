@@ -360,7 +360,7 @@ impl MemBlockManager {
         flags: MemoryAreaAttr,
     ) -> Result<(), SystemError> {
         let rsvd_base = PhysAddr::new(page_align_down(base.data()));
-        size = page_align_up((size as usize) + base.data() - rsvd_base.data());
+        size = page_align_up(size + base.data() - rsvd_base.data());
         base = rsvd_base;
 
         let mut inner = self.inner.lock();
@@ -489,18 +489,16 @@ impl<'a> Iterator for MemBlockIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.index < self.inner.initial_memory_regions_num {
-            if self.usable_only {
-                if self.inner.initial_memory_regions[self.index]
+            if self.usable_only
+                && !self.inner.initial_memory_regions[self.index]
                     .flags
                     .is_empty()
-                    == false
-                {
-                    self.index += 1;
-                    if self.index >= self.inner.initial_memory_regions_num {
-                        return None;
-                    }
-                    continue;
+            {
+                self.index += 1;
+                if self.index >= self.inner.initial_memory_regions_num {
+                    return None;
                 }
+                continue;
             }
             break;
         }
@@ -515,6 +513,7 @@ impl<'a> Iterator for MemBlockIter<'a> {
 
 bitflags! {
     /// 内存区域属性
+    #[allow(clippy::bad_bit_mask)]
     pub struct MemoryAreaAttr: u32 {
         /// No special request
         const NONE = 0x0;

@@ -301,8 +301,8 @@ impl IndexNode for LockedRamFSInode {
                 atime: TimeSpec::default(),
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
-                file_type: file_type,
-                mode: mode,
+                file_type,
+                mode,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -505,7 +505,7 @@ impl IndexNode for LockedRamFSInode {
         // 判断需要创建的类型
         if unlikely(mode.contains(ModeType::S_IFREG)) {
             // 普通文件
-            return Ok(self.create(filename, FileType::File, mode)?);
+            return self.create(filename, FileType::File, mode);
         }
 
         let nod = Arc::new(LockedRamFSInode(SpinLock::new(RamFSInode {
@@ -523,7 +523,7 @@ impl IndexNode for LockedRamFSInode {
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
                 file_type: FileType::Pipe,
-                mode: mode,
+                mode,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,

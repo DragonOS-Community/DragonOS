@@ -107,8 +107,8 @@ impl LockedPipeInode {
             valid_cnt: 0,
             read_pos: 0,
             write_pos: 0,
-            read_wait_queue: WaitQueue::INIT,
-            write_wait_queue: WaitQueue::INIT,
+            read_wait_queue: WaitQueue::default(),
+            write_wait_queue: WaitQueue::default(),
             data: [0; PIPE_BUFF_SIZE],
 
             metadata: Metadata {
@@ -232,9 +232,9 @@ impl IndexNode for LockedPipeInode {
             .write_wait_queue
             .wakeup(Some(ProcessState::Blocked(true)));
 
-        let pollflag = EPollEventType::from_bits_truncate(inode.poll(&data)? as u32);
+        let pollflag = EPollEventType::from_bits_truncate(inode.poll(data)? as u32);
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&mut inode.epitems, pollflag)?;
+        EventPoll::wakeup_epoll(&inode.epitems, pollflag)?;
 
         //返回读取的字节数
         return Ok(num);
@@ -329,8 +329,9 @@ impl IndexNode for LockedPipeInode {
 
         let mut inode = self.0.lock();
 
-        // TODO: 如果已经没有读端存在了，则向写端进程发送SIGPIPE信号
-        if inode.reader == 0 {}
+        if inode.reader == 0 {
+            // TODO: 如果已经没有读端存在了，则向写端进程发送SIGPIPE信号
+        }
 
         // 如果管道空间不够
 
@@ -384,9 +385,9 @@ impl IndexNode for LockedPipeInode {
             .read_wait_queue
             .wakeup(Some(ProcessState::Blocked(true)));
 
-        let pollflag = EPollEventType::from_bits_truncate(inode.poll(&data)? as u32);
+        let pollflag = EPollEventType::from_bits_truncate(inode.poll(data)? as u32);
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&mut inode.epitems, pollflag)?;
+        EventPoll::wakeup_epoll(&inode.epitems, pollflag)?;
 
         // 返回写入的字节数
         return Ok(len);

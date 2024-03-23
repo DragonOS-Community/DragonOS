@@ -251,10 +251,8 @@ impl IrqManager {
             }
 
             action_guard.set_handler(Some(&IrqNestedPrimaryHandler));
-        } else {
-            if desc.can_thread() {
-                self.setup_forced_threading(action_guard.deref_mut())?;
-            }
+        } else if desc.can_thread() {
+            self.setup_forced_threading(action_guard.deref_mut())?;
         }
 
         // 如果具有中断线程处理程序，并且中断不是嵌套的，则设置中断线程
@@ -322,7 +320,7 @@ impl IrqManager {
 
         // 标记当前irq是否是共享的
         let mut irq_shared = false;
-        if desc_inner_guard.actions().is_empty() == false {
+        if !desc_inner_guard.actions().is_empty() {
             // 除非双方都同意并且是相同类型（级别、边沿、极性），否则不能共享中断。
             // 因此，两个标志字段都必须设置IRQF_SHARED，并且设置触发类型的位必须匹配。
             // 另外，所有各方都必须就ONESHOT达成一致。
@@ -364,11 +362,10 @@ impl IrqManager {
             let old = &desc_inner_guard.actions()[0].clone();
             let old_guard = old.inner();
 
-            if ((old_guard
+            if (!(old_guard
                 .flags()
                 .intersection(*action_guard.flags())
-                .contains(IrqHandleFlags::IRQF_SHARED))
-                == false)
+                .contains(IrqHandleFlags::IRQF_SHARED)))
                 || (old_trigger_type != (action_guard.flags().trigger_type()))
                 || ((old_guard.flags().bitxor(*action_guard.flags()))
                     .contains(IrqHandleFlags::IRQF_ONESHOT))
@@ -402,13 +399,12 @@ impl IrqManager {
             // todo: oneshot
         } else if action_guard.handler().is_some_and(|h| {
             h.type_id() == (&DefaultPrimaryIrqHandler as &dyn IrqHandler).type_id()
-        }) && desc_inner_guard
+        }) && !desc_inner_guard
             .irq_data()
             .chip_info_read_irqsave()
             .chip()
             .flags()
             .contains(IrqChipFlags::IRQCHIP_ONESHOT_SAFE)
-            == false
         {
             // 请求中断时 hander = NULL，因此我们为其使用默认的主处理程序。
             // 但它没有设置ONESHOT标志。与电平触发中断结合时，
@@ -510,15 +506,14 @@ impl IrqManager {
                 // 共享中断可能在它仍然被禁用时请求它，然后永远等待中断。
 
                 static mut WARNED: bool = false;
-                if action_guard.flags().contains(IrqHandleFlags::IRQF_SHARED) {
-                    if unsafe { !WARNED } {
-                        kwarn!(
-                            "Shared interrupt {} for {} requested but not auto enabled",
-                            irq.data(),
-                            action_guard.name()
-                        );
-                        unsafe { WARNED = true };
-                    }
+                if action_guard.flags().contains(IrqHandleFlags::IRQF_SHARED) && unsafe { !WARNED }
+                {
+                    kwarn!(
+                        "Shared interrupt {} for {} requested but not auto enabled",
+                        irq.data(),
+                        action_guard.name()
+                    );
+                    unsafe { WARNED = true };
                 }
 
                 desc_inner_guard.set_depth(1);
@@ -661,7 +656,7 @@ impl IrqManager {
                     }
                 }
                 IrqStartupResult::Managed => {
-                    self.irq_do_set_affinity(&irq_data, &desc_inner_guard, &affinity, false)
+                    self.irq_do_set_affinity(&irq_data, desc_inner_guard, &affinity, false)
                         .ok();
                     ret = self.__irq_startup(desc_inner_guard);
                 }
@@ -696,7 +691,7 @@ impl IrqManager {
 
             let chip = desc_inner_guard.irq_data().chip_info_read_irqsave().chip();
 
-            if let Err(e) = chip.irq_enable(&desc_inner_guard.irq_data()) {
+            if let Err(e) = chip.irq_enable(desc_inner_guard.irq_data()) {
                 if e == SystemError::ENOSYS {
                     self.unmask_irq(desc_inner_guard);
                 }
@@ -744,7 +739,7 @@ impl IrqManager {
 
         return self.irq_do_set_affinity(
             desc_inner_guard.irq_data(),
-            &desc_inner_guard,
+            desc_inner_guard,
             &to_set,
             false,
         );
@@ -765,22 +760,19 @@ impl IrqManager {
         // todo: 处理CPU中断隔离相关的逻辑
 
         let common_data = desc_inner_guard.common_data();
-        let r;
-        if !force && !cpumask.is_empty() {
-            r = chip.irq_set_affinity(irq_data, &cpumask, force);
-        } else if force {
-            r = chip.irq_set_affinity(irq_data, &cpumask, force);
+        let r = if force || !cpumask.is_empty() {
+            chip.irq_set_affinity(irq_data, cpumask, force)
         } else {
             return Err(SystemError::EINVAL);
-        }
+        };
 
         let mut ret = Ok(());
         if let Ok(rs) = r {
             match rs {
-                IrqChipSetMaskResult::SetMaskOk | IrqChipSetMaskResult::SetMaskOkDone => {
+                IrqChipSetMaskResult::Success | IrqChipSetMaskResult::Done => {
                     common_data.set_affinity(cpumask.clone());
                 }
-                IrqChipSetMaskResult::SetMaskOkNoChange => {
+                IrqChipSetMaskResult::NoChange => {
 
                     // irq_validate_effective_affinity(data);
                     // irq_set_thread_affinity(desc);
@@ -900,10 +892,10 @@ impl IrqManager {
         }
 
         if chip.flags().contains(IrqChipFlags::IRQCHIP_SET_TYPE_MASKED) {
-            if desc_inner_guard.common_data().status().masked() == false {
+            if !desc_inner_guard.common_data().status().masked() {
                 self.mask_irq(desc_inner_guard.irq_data());
             }
-            if desc_inner_guard.common_data().status().disabled() == false {
+            if !desc_inner_guard.common_data().status().disabled() {
                 to_unmask = true;
             }
         }
@@ -914,14 +906,14 @@ impl IrqManager {
         let ret;
         if let Ok(rs) = r {
             match rs {
-                IrqChipSetMaskResult::SetMaskOk | IrqChipSetMaskResult::SetMaskOkDone => {
+                IrqChipSetMaskResult::Success | IrqChipSetMaskResult::Done => {
                     let common_data = desc_inner_guard.common_data();
                     common_data.clear_status(IrqStatus::IRQD_TRIGGER_MASK);
                     let mut irqstatus = IrqStatus::empty();
                     irqstatus.set_trigger_type(trigger_type);
                     common_data.insert_status(irqstatus);
                 }
-                IrqChipSetMaskResult::SetMaskOkNoChange => {
+                IrqChipSetMaskResult::NoChange => {
                     let flags = desc_inner_guard.common_data().trigger_type();
                     desc_inner_guard.set_trigger_type(flags);
                     desc_inner_guard
@@ -929,7 +921,7 @@ impl IrqManager {
                         .clear_status(IrqStatus::IRQD_LEVEL);
                     desc_inner_guard.clear_level();
 
-                    if (flags & IrqLineStatus::IRQ_TYPE_LEVEL_MASK).is_empty() == false {
+                    if !(flags & IrqLineStatus::IRQ_TYPE_LEVEL_MASK).is_empty() {
                         desc_inner_guard.set_level();
                         desc_inner_guard
                             .common_data()
@@ -1008,7 +1000,7 @@ impl IrqManager {
 
     /// 解除屏蔽中断
     pub(super) fn unmask_irq(&self, desc_inner_guard: &SpinLockGuard<'_, InnerIrqDesc>) {
-        if desc_inner_guard.common_data().status().masked() == false {
+        if !desc_inner_guard.common_data().status().masked() {
             return;
         }
 
@@ -1016,7 +1008,7 @@ impl IrqManager {
             .irq_data()
             .chip_info_read_irqsave()
             .chip()
-            .irq_unmask(&desc_inner_guard.irq_data());
+            .irq_unmask(desc_inner_guard.irq_data());
 
         if let Err(e) = r {
             if e != SystemError::ENOSYS {

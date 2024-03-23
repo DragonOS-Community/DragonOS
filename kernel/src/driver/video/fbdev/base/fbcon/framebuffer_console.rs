@@ -81,10 +81,10 @@ impl BlittingFbConsole {
                    其中颜色0映射为黑色，颜色1到6映射为白色，
                    颜色7到8映射为灰色，其他颜色映射为强烈的白色。
                 */
-                if color >= 1 && color <= 6 {
+                if (1..=6).contains(&color) {
                     // 白色
                     color = 2;
-                } else if color >= 7 && color <= 8 {
+                } else if (7..=8).contains(&color) {
                     // 灰色
                     color = 1;
                 } else {
@@ -138,17 +138,16 @@ impl BlittingFbConsole {
         let byte_width = vc_data.font.width as usize / 8;
         let font_height = vc_data.font.height as usize;
         // let mut char_offset = 0;
-        for char_offset in 0..cnt as usize {
+        for (char_offset, char_item) in buf.iter().enumerate().take(cnt as usize) {
             // 在字符表中的index
-            let ch = buf[char_offset] & charmask;
+            let ch = char_item & charmask;
             // 计算出在font表中的偏移量
             let font_offset = ch as usize * cellsize as usize;
             let font_offset_end = font_offset + cellsize as usize;
             // 设置image的data
 
             let src = &vc_data.font.data[font_offset..font_offset_end];
-            let mut dst = Vec::new();
-            dst.resize(src.len(), 0);
+            let mut dst = vec![0; src.len()];
             dst.copy_from_slice(src);
 
             if !attr.is_empty() {
@@ -255,18 +254,18 @@ impl ConsoleSwitch for BlittingFbConsole {
         }
 
         let y_break = (fb_data.display.virt_rows - fb_data.display.yscroll) as usize;
-        if sy < y_break && sy + height - 1 >= y_break {
+        if sy < y_break && sy + height > y_break {
             // 分两次clear
             let b = y_break - sy;
             let _ = self.clear(
-                &vc_data,
+                vc_data,
                 fb_data.display.real_y(sy as u32),
                 sx as u32,
                 b as u32,
                 width as u32,
             );
             let _ = self.clear(
-                &vc_data,
+                vc_data,
                 fb_data.display.real_y((sy + b) as u32),
                 sx as u32,
                 (height - b) as u32,
@@ -274,7 +273,7 @@ impl ConsoleSwitch for BlittingFbConsole {
             );
         } else {
             let _ = self.clear(
-                &vc_data,
+                vc_data,
                 fb_data.display.real_y(sy as u32),
                 sx as u32,
                 height as u32,
@@ -337,6 +336,7 @@ impl ConsoleSwitch for BlittingFbConsole {
         }
     }
 
+    #[allow(clippy::if_same_then_else)]
     fn con_cursor(
         &self,
         vc_data: &VirtualConsoleData,
@@ -671,7 +671,7 @@ impl FrameBufferConsole for BlittingFbConsole {
         let attr = FbConAttr::get_attr(c, fb_info.color_depth());
         let char_offset = (c as usize & charmask) * ((w * vc_data.font.height) as usize);
 
-        if fbcon_data.cursor_state.image.data != &vc_data.font.data[char_offset..]
+        if fbcon_data.cursor_state.image.data != vc_data.font.data[char_offset..]
             || fbcon_data.cursor_reset
         {
             fbcon_data.cursor_state.image.data = vc_data.font.data[char_offset..].to_vec();

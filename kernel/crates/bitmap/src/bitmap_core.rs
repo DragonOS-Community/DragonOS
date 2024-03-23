@@ -61,8 +61,8 @@ impl<T: BitOps> BitMapCore<T> {
     pub(crate) fn first_index(&self, data: &[T]) -> Option<usize> {
         for (i, element) in data.iter().enumerate() {
             let bit = <T as BitOps>::first_index(element);
-            if bit.is_some() {
-                return Some(i * T::bit_size() + bit.unwrap());
+            if let Some(b) = bit {
+                return Some(i * T::bit_size() + b);
             }
         }
 
@@ -237,10 +237,8 @@ impl<T: BitOps> BitMapCore<T> {
                 if element == mask {
                     return true;
                 }
-            } else {
-                if element != &T::make_mask(T::bit_size()) {
-                    return false;
-                }
+            } else if element != &T::make_mask(T::bit_size()) {
+                return false;
             }
         }
 

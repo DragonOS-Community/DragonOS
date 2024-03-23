@@ -4,7 +4,7 @@ use alloc::{
     borrow::ToOwned,
     collections::BTreeMap,
     format,
-    string::String,
+    string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -99,6 +99,12 @@ impl ProcfsFilePrivateData {
     }
 }
 
+impl Default for ProcfsFilePrivateData {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// @brief procfs文件系统的Inode结构体(不包含锁)
 #[derive(Debug)]
 pub struct ProcFSInode {
@@ -135,14 +141,14 @@ impl ProcFSInode {
         // 获取该pid对应的pcb结构体
         let pid = self.fdata.pid;
         let pcb = ProcessManager::find(pid);
-        let pcb = if pcb.is_none() {
+        let pcb = if let Some(pcb) = pcb {
+            pcb
+        } else {
             kerror!(
                 "ProcFS: Cannot find pcb for pid {:?} when opening its 'status' file.",
                 pid
             );
             return Err(SystemError::ESRCH);
-        } else {
-            pcb.unwrap()
         };
         // 传入数据
         let pdata: &mut Vec<u8> = &mut pdata.data;
@@ -583,8 +589,8 @@ impl IndexNode for LockedProcFSInode {
                     atime: TimeSpec::default(),
                     mtime: TimeSpec::default(),
                     ctime: TimeSpec::default(),
-                    file_type: file_type,
-                    mode: mode,
+                    file_type,
+                    mode,
                     nlinks: 1,
                     uid: 0,
                     gid: 0,

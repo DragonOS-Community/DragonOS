@@ -71,7 +71,7 @@ impl RawSocket {
             GlobalSocketHandle::new(SOCKET_SET.lock_irqsave().add(socket));
 
         let metadata = SocketMetadata::new(
-            SocketType::RawSocket,
+            SocketType::Raw,
             Self::DEFAULT_RX_BUF_SIZE,
             Self::DEFAULT_TX_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
@@ -177,7 +177,7 @@ impl Socket for RawSocket {
                     packet.set_dst_addr(ipv4_dst);
 
                     // 设置ipv4 header的protocol字段
-                    packet.set_next_header(socket.ip_protocol().into());
+                    packet.set_next_header(socket.ip_protocol());
 
                     // 获取IP数据包的负载字段
                     let payload: &mut [u8] = packet.payload_mut();
@@ -260,7 +260,7 @@ impl UdpSocket {
             GlobalSocketHandle::new(SOCKET_SET.lock_irqsave().add(socket));
 
         let metadata = SocketMetadata::new(
-            SocketType::UdpSocket,
+            SocketType::Udp,
             Self::DEFAULT_RX_BUF_SIZE,
             Self::DEFAULT_TX_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
@@ -371,7 +371,7 @@ impl Socket for UdpSocket {
         // kdebug!("is open()={}", socket.is_open());
         if socket.can_send() {
             // kdebug!("udp write: can send");
-            match socket.send_slice(&buf, *remote_endpoint) {
+            match socket.send_slice(buf, *remote_endpoint) {
                 Ok(()) => {
                     // kdebug!("udp write: send ok");
                     drop(socket_set_guard);
@@ -505,7 +505,7 @@ impl TcpSocket {
             GlobalSocketHandle::new(SOCKET_SET.lock_irqsave().add(socket));
 
         let metadata = SocketMetadata::new(
-            SocketType::TcpSocket,
+            SocketType::Tcp,
             Self::DEFAULT_RX_BUF_SIZE,
             Self::DEFAULT_TX_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
@@ -687,7 +687,7 @@ impl Socket for TcpSocket {
             let mut inner_iface = iface.inner_iface().lock();
             // kdebug!("to connect: {ip:?}");
 
-            match socket.connect(&mut inner_iface.context(), ip, temp_port) {
+            match socket.connect(inner_iface.context(), ip, temp_port) {
                 Ok(()) => {
                     // avoid deadlock
                     drop(inner_iface);
@@ -816,7 +816,7 @@ impl Socket for TcpSocket {
                     }
 
                     let metadata = SocketMetadata::new(
-                        SocketType::TcpSocket,
+                        SocketType::Tcp,
                         Self::DEFAULT_TX_BUF_SIZE,
                         Self::DEFAULT_RX_BUF_SIZE,
                         Self::DEFAULT_METADATA_BUF_SIZE,
@@ -836,7 +836,7 @@ impl Socket for TcpSocket {
                     let item = handle_guard.remove(&old_handle.0).unwrap();
                     // 按照smoltcp行为，将新的handle绑定到原来的item
                     handle_guard.insert(new_handle.0, item);
-                    let new_item = SocketHandleItem::from_socket(&new_socket);
+                    let new_item = SocketHandleItem::from_socket(new_socket.as_ref());
                     // 插入新的item
                     handle_guard.insert(old_handle.0, new_item);
 
@@ -859,8 +859,7 @@ impl Socket for TcpSocket {
     }
 
     fn endpoint(&self) -> Option<Endpoint> {
-        let mut result: Option<Endpoint> =
-            self.local_endpoint.clone().map(|x| Endpoint::Ip(Some(x)));
+        let mut result: Option<Endpoint> = self.local_endpoint.map(|x| Endpoint::Ip(Some(x)));
 
         if result.is_none() {
             let sockets = SOCKET_SET.lock_irqsave();
@@ -914,7 +913,7 @@ impl SeqpacketSocket {
         let buffer = Vec::with_capacity(Self::DEFAULT_BUF_SIZE);
 
         let metadata = SocketMetadata::new(
-            SocketType::SeqpacketSocket,
+            SocketType::Seqpacket,
             Self::DEFAULT_BUF_SIZE,
             0,
             Self::DEFAULT_METADATA_BUF_SIZE,

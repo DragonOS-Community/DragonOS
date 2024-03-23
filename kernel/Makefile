@@ -26,7 +26,10 @@ clean:
 .PHONY: fmt
 fmt:
 	@cargo fmt --all $(FMT_CHECK)
+ifeq ($(ARCH), x86_64)
 	@cargo clippy --all-features
+endif
+
 
 .PHONY: check
 check: ECHO

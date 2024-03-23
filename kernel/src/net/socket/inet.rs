@@ -9,7 +9,7 @@ use system_error::SystemError;
 use crate::{
     driver::net::NetDriver,
     kerror, kwarn,
-    libs::{rwlock::RwLock, spinlock::SpinLock},
+    libs::rwlock::RwLock,
     net::{
         event_poll::EPollEventType, net_core::poll_ifaces, Endpoint, Protocol, ShutdownType,
         NET_DRIVERS,
@@ -18,7 +18,7 @@ use crate::{
 
 use super::{
     GlobalSocketHandle, Socket, SocketHandleItem, SocketMetadata, SocketOptions, SocketPollMethod,
-    SocketType, SocketpairOps, HANDLE_MAP, PORT_MANAGER, SOCKET_SET,
+    SocketType, HANDLE_MAP, PORT_MANAGER, SOCKET_SET,
 };
 
 /// @brief 表示原始的socket。原始套接字绕过传输层协议（如 TCP 或 UDP）并提供对网络层协议（如 IP）的直接访问。
@@ -87,15 +87,7 @@ impl RawSocket {
 }
 
 impl Socket for RawSocket {
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
-        self
-    }
-
-    fn read(&mut self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
+    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         poll_ifaces();
         loop {
             // 如何优化这里？
@@ -208,16 +200,24 @@ impl Socket for RawSocket {
         Ok(())
     }
 
-    fn metadata(&self) -> Result<SocketMetadata, SystemError> {
-        Ok(self.metadata.clone())
+    fn metadata(&self) -> SocketMetadata {
+        self.metadata.clone()
     }
 
     fn box_clone(&self) -> Box<dyn Socket> {
-        return Box::new(self.clone());
+        Box::new(self.clone())
     }
 
     fn socket_handle(&self) -> SocketHandle {
         self.handle.0
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
     }
 }
 
@@ -296,16 +296,8 @@ impl UdpSocket {
 }
 
 impl Socket for UdpSocket {
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
-        self
-    }
-
     /// @brief 在read函数执行之前，请先bind到本地的指定端口
-    fn read(&mut self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
+    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         loop {
             // kdebug!("Wait22 to Read");
             poll_ifaces();
@@ -413,10 +405,10 @@ impl Socket for UdpSocket {
     fn connect(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(_) = endpoint {
             self.remote_endpoint = Some(endpoint);
-            return Ok(());
+            Ok(())
         } else {
-            return Err(SystemError::EINVAL);
-        };
+            Err(SystemError::EINVAL)
+        }
     }
 
     fn ioctl(
@@ -429,8 +421,8 @@ impl Socket for UdpSocket {
         todo!()
     }
 
-    fn metadata(&self) -> Result<SocketMetadata, SystemError> {
-        Ok(self.metadata.clone())
+    fn metadata(&self) -> SocketMetadata {
+        self.metadata.clone()
     }
 
     fn box_clone(&self) -> Box<dyn Socket> {
@@ -464,6 +456,14 @@ impl Socket for UdpSocket {
 
     fn socket_handle(&self) -> SocketHandle {
         self.handle.0
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
     }
 }
 
@@ -519,6 +519,7 @@ impl TcpSocket {
             metadata,
         };
     }
+
     fn do_listen(
         &mut self,
         socket: &mut tcp::Socket,
@@ -548,15 +549,7 @@ impl TcpSocket {
 }
 
 impl Socket for TcpSocket {
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
-        self
-    }
-
-    fn read(&mut self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
+    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         if HANDLE_MAP
             .read_irqsave()
             .get(&self.socket_handle())
@@ -836,7 +829,7 @@ impl Socket for TcpSocket {
                     let item = handle_guard.remove(&old_handle.0).unwrap();
                     // 按照smoltcp行为，将新的handle绑定到原来的item
                     handle_guard.insert(new_handle.0, item);
-                    let new_item = SocketHandleItem::from_socket(new_socket.as_ref());
+                    let new_item = SocketHandleItem::new();
                     // 插入新的item
                     handle_guard.insert(old_handle.0, new_item);
 
@@ -877,130 +870,23 @@ impl Socket for TcpSocket {
         return socket.remote_endpoint().map(|x| Endpoint::Ip(Some(x)));
     }
 
-    fn metadata(&self) -> Result<SocketMetadata, SystemError> {
-        Ok(self.metadata.clone())
+    fn metadata(&self) -> SocketMetadata {
+        self.metadata.clone()
     }
 
     fn box_clone(&self) -> Box<dyn Socket> {
-        return Box::new(self.clone());
+        Box::new(self.clone())
     }
 
     fn socket_handle(&self) -> SocketHandle {
         self.handle.0
     }
-}
 
-/// # 表示 seqpacket socket
-#[derive(Debug, Clone)]
-#[cast_to(Socket)]
-pub struct SeqpacketSocket {
-    metadata: SocketMetadata,
-    buffer: Arc<SpinLock<Vec<u8>>>,
-    peer_buffer: Option<Arc<SpinLock<Vec<u8>>>>,
-}
-
-impl SeqpacketSocket {
-    /// 默认的元数据缓冲区大小
-    pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
-    /// 默认的缓冲区大小
-    pub const DEFAULT_BUF_SIZE: usize = 64 * 1024;
-
-    /// # 创建一个seqpacket的socket
-    ///
-    /// ## 参数
-    /// - `options`: socket的选项
-    pub fn new(options: SocketOptions) -> Self {
-        let buffer = Vec::with_capacity(Self::DEFAULT_BUF_SIZE);
-
-        let metadata = SocketMetadata::new(
-            SocketType::Seqpacket,
-            Self::DEFAULT_BUF_SIZE,
-            0,
-            Self::DEFAULT_METADATA_BUF_SIZE,
-            options,
-        );
-
-        return Self {
-            metadata,
-            buffer: Arc::new(SpinLock::new(buffer)),
-            peer_buffer: None,
-        };
-    }
-
-    fn buffer(&self) -> Arc<SpinLock<Vec<u8>>> {
-        self.buffer.clone()
-    }
-
-    fn set_peer_buffer(&mut self, peer_buffer: Arc<SpinLock<Vec<u8>>>) {
-        self.peer_buffer = Some(peer_buffer);
-    }
-}
-
-impl Socket for SeqpacketSocket {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
 
     fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
         self
-    }
-
-    fn read(&mut self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
-        let buffer = self.buffer.lock_irqsave();
-
-        let len = core::cmp::min(buf.len(), buffer.len());
-        buf[..len].copy_from_slice(&buffer[..len]);
-
-        (Ok(len), Endpoint::Unused)
-    }
-
-    fn write(&self, buf: &[u8], _to: Option<Endpoint>) -> Result<usize, SystemError> {
-        if self.peer_buffer.is_none() {
-            kwarn!("SeqpacketSocket is now just for socketpair");
-            return Err(SystemError::ENOSYS);
-        }
-
-        let binding = self.peer_buffer.clone().unwrap();
-        let mut peer_buffer = binding.lock_irqsave();
-
-        let len = buf.len();
-        if peer_buffer.capacity() - peer_buffer.len() < len {
-            return Err(SystemError::ENOBUFS);
-        }
-        peer_buffer[..len].copy_from_slice(buf);
-
-        Ok(len)
-    }
-
-    fn socketpair_ops(&self) -> Option<&'static dyn SocketpairOps> {
-        Some(&SeqpacketSocketpairOps)
-    }
-
-    fn metadata(&self) -> Result<SocketMetadata, SystemError> {
-        Ok(self.metadata.clone())
-    }
-
-    fn box_clone(&self) -> Box<dyn Socket> {
-        Box::new(self.clone())
-    }
-}
-
-struct SeqpacketSocketpairOps;
-
-impl SocketpairOps for SeqpacketSocketpairOps {
-    fn socketpair(&self, socket0: &mut Box<dyn Socket>, socket1: &mut Box<dyn Socket>) {
-        let pair0 = socket0
-            .as_mut()
-            .as_any_mut()
-            .downcast_mut::<SeqpacketSocket>()
-            .unwrap();
-
-        let pair1 = socket1
-            .as_mut()
-            .as_any_mut()
-            .downcast_mut::<SeqpacketSocket>()
-            .unwrap();
-        pair0.set_peer_buffer(pair1.buffer());
-        pair1.set_peer_buffer(pair0.buffer());
     }
 }

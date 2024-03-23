@@ -27,7 +27,10 @@ use crate::{
     },
 };
 
-use self::sockets::{RawSocket, SeqpacketSocket, TcpSocket, UdpSocket};
+use self::{
+    inet::{RawSocket, TcpSocket, UdpSocket},
+    unix::{SeqpacketSocket, StreamSocket},
+};
 
 use super::{
     event_poll::{EPollEventType, EPollItem, EventPoll},
@@ -35,7 +38,8 @@ use super::{
     Endpoint, Protocol, ShutdownType,
 };
 
-pub mod sockets;
+pub mod inet;
+pub mod unix;
 
 lazy_static! {
     /// 所有socket的集合
@@ -60,9 +64,7 @@ pub(super) fn new_socket(
 ) -> Result<Box<dyn Socket>, SystemError> {
     let socket: Box<dyn Socket> = match address_family {
         AddressFamily::Unix => match socket_type {
-            PosixSocketType::Stream => Box::new(TcpSocket::new(SocketOptions::default())),
-            PosixSocketType::Datagram => Box::new(UdpSocket::new(SocketOptions::default())),
-            PosixSocketType::Raw => Box::new(RawSocket::new(protocol, SocketOptions::default())),
+            PosixSocketType::Stream => Box::new(StreamSocket::new(SocketOptions::default())),
             PosixSocketType::SeqPacket => Box::new(SeqpacketSocket::new(SocketOptions::default())),
             _ => {
                 return Err(SystemError::EINVAL);
@@ -84,16 +86,13 @@ pub(super) fn new_socket(
 }
 
 pub trait Socket: Sync + Send + Debug + Any {
-    fn as_any_ref(&self) -> &dyn Any;
-
-    fn as_any_mut(&mut self) -> &mut dyn Any;
     /// @brief 从socket中读取数据，如果socket是阻塞的，那么直到读取到数据才返回
     ///
     /// @param buf 读取到的数据存放的缓冲区
     ///
     /// @return - 成功：(返回读取的数据的长度，读取数据的端点).
     ///         - 失败：错误码
-    fn read(&mut self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint);
+    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint);
 
     /// @brief 向socket中写入数据。如果socket是阻塞的，那么直到写入的数据全部写入socket中才返回
     ///
@@ -113,9 +112,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     /// @param endpoint 要连接的端点
     ///
     /// @return 返回连接是否成功
-    fn connect(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
-        return Err(SystemError::ENOSYS);
-    }
+    fn connect(&mut self, _endpoint: Endpoint) -> Result<(), SystemError>;
 
     /// @brief 对应于POSIX的bind函数，用于绑定到本机指定的端点
     ///
@@ -125,7 +122,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     ///
     /// @return 返回绑定是否成功
     fn bind(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
-        return Err(SystemError::ENOSYS);
+        Err(SystemError::ENOSYS)
     }
 
     /// @brief 对应于 POSIX 的 shutdown 函数，用于关闭socket。
@@ -136,7 +133,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     ///
     /// @return 返回是否成功关闭
     fn shutdown(&mut self, _type: ShutdownType) -> Result<(), SystemError> {
-        return Err(SystemError::ENOSYS);
+        Err(SystemError::ENOSYS)
     }
 
     /// @brief 对应于POSIX的listen函数，用于监听端点
@@ -145,7 +142,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     ///
     /// @return 返回监听是否成功
     fn listen(&mut self, _backlog: usize) -> Result<(), SystemError> {
-        return Err(SystemError::ENOSYS);
+        Err(SystemError::ENOSYS)
     }
 
     /// @brief 对应于POSIX的accept函数，用于接受连接
@@ -154,24 +151,20 @@ pub trait Socket: Sync + Send + Debug + Any {
     ///
     /// @return 返回接受连接是否成功
     fn accept(&mut self) -> Result<(Box<dyn Socket>, Endpoint), SystemError> {
-        return Err(SystemError::ENOSYS);
+        Err(SystemError::ENOSYS)
     }
 
     /// @brief 获取socket的端点
     ///
     /// @return 返回socket的端点
     fn endpoint(&self) -> Option<Endpoint> {
-        return None;
+        None
     }
 
     /// @brief 获取socket的对端端点
     ///
     /// @return 返回socket的对端端点
     fn peer_endpoint(&self) -> Option<Endpoint> {
-        return None;
-    }
-
-    fn socketpair_ops(&self) -> Option<&'static dyn SocketpairOps> {
         None
     }
 
@@ -187,7 +180,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     ///     The third boolean value indicates whether the socket has encountered an error condition. If it is true, then the socket is in an error state and should be closed or reset
     ///
     fn poll(&self) -> EPollEventType {
-        return EPollEventType::empty();
+        EPollEventType::empty()
     }
 
     /// @brief socket的ioctl函数
@@ -205,11 +198,11 @@ pub trait Socket: Sync + Send + Debug + Any {
         _arg1: usize,
         _arg2: usize,
     ) -> Result<usize, SystemError> {
-        return Ok(0);
+        Ok(0)
     }
 
     /// @brief 获取socket的元数据
-    fn metadata(&self) -> Result<SocketMetadata, SystemError>;
+    fn metadata(&self) -> SocketMetadata;
 
     fn box_clone(&self) -> Box<dyn Socket>;
 
@@ -227,12 +220,20 @@ pub trait Socket: Sync + Send + Debug + Any {
         _optval: &[u8],
     ) -> Result<(), SystemError> {
         kwarn!("setsockopt is not implemented");
-        return Ok(());
+        Ok(())
     }
 
     fn socket_handle(&self) -> SocketHandle {
         todo!()
     }
+
+    fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn as_any_ref(&self) -> &dyn Any;
+
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 
     fn add_epoll(&mut self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
         HANDLE_MAP
@@ -278,11 +279,6 @@ impl Clone for Box<dyn Socket> {
     }
 }
 
-pub trait SocketpairOps {
-    /// 执行socketpair
-    fn socketpair(&self, socket0: &mut Box<dyn Socket>, socket1: &mut Box<dyn Socket>);
-}
-
 /// # Socket在文件系统中的inode封装
 #[derive(Debug)]
 pub struct SocketInode(SpinLock<Box<dyn Socket>>, AtomicUsize);
@@ -294,11 +290,11 @@ impl SocketInode {
 
     #[inline]
     pub fn inner(&self) -> SpinLockGuard<Box<dyn Socket>> {
-        return self.0.lock();
+        self.0.lock()
     }
 
     pub unsafe fn inner_no_preempt(&self) -> SpinLockGuard<Box<dyn Socket>> {
-        return self.0.lock_no_preempt();
+        self.0.lock_no_preempt()
     }
 }
 
@@ -314,12 +310,12 @@ impl IndexNode for SocketInode {
             // 最后一次关闭，需要释放
             let mut socket = self.0.lock_irqsave();
 
-            if socket.metadata().unwrap().socket_type == SocketType::Seqpacket {
+            if socket.metadata().socket_type == SocketType::Unix {
                 return Ok(());
             }
 
             if let Some(Endpoint::Ip(Some(ip))) = socket.endpoint() {
-                PORT_MANAGER.unbind_port(socket.metadata().unwrap().socket_type, ip.port)?;
+                PORT_MANAGER.unbind_port(socket.metadata().socket_type, ip.port)?;
             }
 
             socket.clear_epoll()?;
@@ -339,7 +335,7 @@ impl IndexNode for SocketInode {
         buf: &mut [u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
-        return self.0.lock_no_preempt().read(&mut buf[0..len]).0;
+        self.0.lock_no_preempt().read(&mut buf[0..len]).0
     }
 
     fn write_at(
@@ -349,7 +345,7 @@ impl IndexNode for SocketInode {
         buf: &[u8],
         _data: &mut FilePrivateData,
     ) -> Result<usize, SystemError> {
-        return self.0.lock_no_preempt().write(&buf[0..len], None);
+        self.0.lock_no_preempt().write(&buf[0..len], None)
     }
 
     fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
@@ -384,11 +380,8 @@ impl IndexNode for SocketInode {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct SocketHandleItem {
-    /// socket元数据
-    metadata: SocketMetadata,
     /// shutdown状态
     pub shutdown_type: RwLock<ShutdownType>,
     /// socket的waitqueue
@@ -398,25 +391,15 @@ pub struct SocketHandleItem {
 }
 
 impl SocketHandleItem {
-    pub fn new(socket: &dyn Socket) -> Self {
+    pub fn new() -> Self {
         Self {
-            metadata: socket.metadata().unwrap(),
             shutdown_type: RwLock::new(ShutdownType::empty()),
             wait_queue: EventWaitQueue::new(),
             epitems: SpinLock::new(LinkedList::new()),
         }
     }
 
-    pub fn from_socket<A: Socket>(socket: &A) -> Self {
-        Self {
-            metadata: socket.metadata().unwrap(),
-            shutdown_type: RwLock::new(ShutdownType::empty()),
-            wait_queue: EventWaitQueue::new(),
-            epitems: SpinLock::new(LinkedList::new()),
-        }
-    }
-
-    /// ### 在socket的等待队列上睡眠
+    /// ## 在socket的等待队列上睡眠
     pub fn sleep(
         socket_handle: SocketHandle,
         events: u64,
@@ -589,8 +572,8 @@ pub enum SocketType {
     Tcp,
     /// 用于Udp通信的 Socket
     Udp,
-    /// 用于进程间通信的 Socket
-    Seqpacket,
+    /// unix域的 Socket
+    Unix,
 }
 
 bitflags! {

@@ -463,9 +463,7 @@ impl Syscall {
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
 
-        let res = fd_table_guard.drop_fd(fd as i32).map(|_| 0);
-
-        return res;
+        fd_table_guard.drop_fd(fd as i32).map(|_| 0)
     }
 
     /// @brief 发送命令到文件描述符对应的设备，

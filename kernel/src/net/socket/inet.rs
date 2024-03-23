@@ -169,7 +169,7 @@ impl Socket for RawSocket {
                     packet.set_dst_addr(ipv4_dst);
 
                     // 设置ipv4 header的protocol字段
-                    packet.set_next_header(socket.ip_protocol().into());
+                    packet.set_next_header(socket.ip_protocol());
 
                     // 获取IP数据包的负载字段
                     let payload: &mut [u8] = packet.payload_mut();
@@ -363,7 +363,7 @@ impl Socket for UdpSocket {
         // kdebug!("is open()={}", socket.is_open());
         if socket.can_send() {
             // kdebug!("udp write: can send");
-            match socket.send_slice(&buf, *remote_endpoint) {
+            match socket.send_slice(buf, *remote_endpoint) {
                 Ok(()) => {
                     // kdebug!("udp write: send ok");
                     drop(socket_set_guard);
@@ -680,7 +680,7 @@ impl Socket for TcpSocket {
             let mut inner_iface = iface.inner_iface().lock();
             // kdebug!("to connect: {ip:?}");
 
-            match socket.connect(&mut inner_iface.context(), ip, temp_port) {
+            match socket.connect(inner_iface.context(), ip, temp_port) {
                 Ok(()) => {
                     // avoid deadlock
                     drop(inner_iface);
@@ -852,8 +852,7 @@ impl Socket for TcpSocket {
     }
 
     fn endpoint(&self) -> Option<Endpoint> {
-        let mut result: Option<Endpoint> =
-            self.local_endpoint.clone().map(|x| Endpoint::Ip(Some(x)));
+        let mut result: Option<Endpoint> = self.local_endpoint.map(|x| Endpoint::Ip(Some(x)));
 
         if result.is_none() {
             let sockets = SOCKET_SET.lock_irqsave();

@@ -48,7 +48,11 @@ impl FileSystem for KernFS {
         return self.root_inode.clone();
     }
 
+<<<<<<< HEAD
     fn name(&self)->&str {
+=======
+    fn name(&self) -> &str {
+>>>>>>> refs/remotes/origin/master
         "kernfs"
     }
 }
@@ -199,7 +203,7 @@ impl IndexNode for KernFSInode {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
-    fn move_(
+    fn move_to(
         &self,
         _old_name: &str,
         _target: &Arc<dyn IndexNode>,
@@ -369,6 +373,11 @@ impl IndexNode for KernFSInode {
             .as_ref()
             .unwrap()
             .write(callback_data, &buf[..len], offset);
+    }
+
+    fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), SystemError> {
+        // 待实现
+        Err(SystemError::ENOSYS)
     }
 }
 

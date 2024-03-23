@@ -1,6 +1,14 @@
 use core::any::Any;
 use core::intrinsics::unlikely;
 
+use crate::filesystem::vfs::FSMAKER;
+use crate::{
+    driver::base::device::device_number::DeviceNumber,
+    filesystem::vfs::{core::generate_inode_id, FileType},
+    ipc::pipe::LockedPipeInode,
+    libs::spinlock::{SpinLock, SpinLockGuard},
+    time::TimeSpec,
+};
 use alloc::{
     collections::BTreeMap,
     string::String,
@@ -9,17 +17,9 @@ use alloc::{
 };
 use system_error::SystemError;
 
-use crate::{
-    driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{core::generate_inode_id, FileType},
-    ipc::pipe::LockedPipeInode,
-    libs::spinlock::{SpinLock, SpinLockGuard},
-    time::TimeSpec,
-};
-
 use super::vfs::{
-    file::FilePrivateData, syscall::ModeType, FileSystem, FsInfo, IndexNode, InodeId, Metadata,
-    SpecialNodeData,
+    file::FilePrivateData, syscall::ModeType, FileSystem, FileSystemMaker, FsInfo, IndexNode,
+    InodeId, Metadata, SpecialNodeData,
 };
 
 /// RamFS的inode名称的最大长度
@@ -77,7 +77,11 @@ impl FileSystem for RamFS {
         self
     }
 
+<<<<<<< HEAD
     fn name(&self)->&str {
+=======
+    fn name(&self) -> &str {
+>>>>>>> refs/remotes/origin/master
         "ramfs"
     }
 }
@@ -122,7 +126,18 @@ impl RamFS {
 
         return result;
     }
+
+    pub fn make_ramfs() -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        let fs = RamFS::new();
+        return Ok(fs);
+    }
 }
+
+#[distributed_slice(FSMAKER)]
+static RAMFSMAKER: FileSystemMaker = FileSystemMaker::new(
+    "ramfs",
+    &(RamFS::make_ramfs as fn() -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
+);
 
 impl IndexNode for LockedRamFSInode {
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
@@ -378,7 +393,7 @@ impl IndexNode for LockedRamFSInode {
         return Ok(());
     }
 
-    fn move_(
+    fn move_to(
         &self,
         old_name: &str,
         target: &Arc<dyn IndexNode>,
@@ -542,5 +557,21 @@ impl IndexNode for LockedRamFSInode {
 
     fn special_node(&self) -> Option<super::vfs::SpecialNodeData> {
         return self.0.lock().special_node.clone();
+    }
+
+    /// # 用于重命名内存中的文件或目录
+    fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), SystemError> {
+        let old_inode: Arc<dyn IndexNode> = self.find(_old_name)?;
+        // 在新的目录下创建一个硬链接
+        self.link(_new_name, &old_inode)?;
+
+        // 取消现有的目录下的这个硬链接
+        if let Err(err) = self.unlink(_old_name) {
+            // 如果取消失败，那就取消新的目录下的硬链接
+            self.unlink(_new_name)?;
+            return Err(err);
+        }
+
+        return Ok(());
     }
 }

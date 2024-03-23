@@ -6,7 +6,7 @@ use system_error::SystemError;
 use crate::{
     arch::{sched::sched, CurrentIrqArch, CurrentTimeArch},
     exception::InterruptArch,
-    include::bindings::bindings::{useconds_t, Cpu_tsc_freq},
+    include::bindings::bindings::useconds_t,
     process::ProcessManager,
     time::timekeeping::getnstimeofday,
 };
@@ -29,11 +29,8 @@ pub fn nanosleep(sleep_time: TimeSpec) -> Result<TimeSpec, SystemError> {
     }
     // 对于小于500us的时间，使用spin/rdtsc来进行定时
     if sleep_time.tv_nsec < 500000 && sleep_time.tv_sec == 0 {
-        let expired_tsc: u64 = unsafe {
-            CurrentTimeArch::get_cycles() as u64
-                + (sleep_time.tv_nsec as u64 * Cpu_tsc_freq) / 1000000000
-        };
-        while (CurrentTimeArch::get_cycles() as u64) < expired_tsc {
+        let expired_tsc: usize = CurrentTimeArch::cal_expire_cycles(sleep_time.tv_nsec as usize);
+        while CurrentTimeArch::get_cycles() < expired_tsc {
             spin_loop()
         }
         return Ok(TimeSpec {

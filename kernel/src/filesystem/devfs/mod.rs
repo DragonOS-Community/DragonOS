@@ -50,7 +50,11 @@ impl FileSystem for DevFS {
         };
     }
 
+<<<<<<< HEAD
     fn name(&self)->&str {
+=======
+    fn name(&self) -> &str {
+>>>>>>> refs/remotes/origin/master
         "devfs"
     }
 }

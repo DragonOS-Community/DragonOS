@@ -53,6 +53,7 @@
 #define SYS_EXIT 60
 #define SYS_WAIT4 61
 #define SYS_KILL 62
+#define SYS_UNAME 63
 
 #define SYS_FCNTL 72
 
@@ -64,13 +65,15 @@
 #define SYS_CHDIR 80
 
 #define SYS_MKDIR 83
-
 #define SYS_RMDIR 84
+
+#define SYS_LINK 86
 
 #define SYS_GETTIMEOFDAY 96
 
 #define SYS_ARCH_PRCTL 158
 
+#define SYS_MOUNT 165
 #define SYS_REBOOT 169
 
 #define SYS_GETPPID 110
@@ -83,6 +86,8 @@
 #define SYS_SET_TID_ADDR 218
 
 #define SYS_UNLINK_AT 263
+
+#define SYS_LINKAT 265
 
 #define SYS_PIPE 293
 

@@ -40,6 +40,11 @@ pub trait InterruptArch: Send + Sync {
         Ok(())
     }
 
+    /// ap启动时的中断初始化
+    fn arch_ap_early_irq_init() -> Result<(), SystemError> {
+        Ok(())
+    }
+
     /// 响应未注册的中断
     fn ack_bad_irq(irq: IrqNumber);
 }

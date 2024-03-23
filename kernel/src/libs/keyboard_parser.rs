@@ -1,11 +1,4 @@
-use core::sync::atomic::Ordering;
-
-use alloc::sync::Arc;
-
-use crate::driver::tty::{
-    tty_port::{TtyPort, TTY_PORTS},
-    virtual_terminal::virtual_console::CURRENT_VCNUM,
-};
+use crate::driver::tty::kthread::send_to_tty_refresh_thread;
 
 #[allow(dead_code)]
 pub const NUM_SCAN_CODES: u8 = 0x80;
@@ -360,12 +353,7 @@ impl TypeOneFSMState {
     #[inline(always)]
     fn emit(ch: u8) {
         // 发送到tty
-        let _ = Self::current_port().receive_buf(&[ch], &[], 1);
-    }
-
-    #[inline]
-    fn current_port() -> Arc<dyn TtyPort> {
-        TTY_PORTS[CURRENT_VCNUM.load(Ordering::SeqCst) as usize].clone()
+        send_to_tty_refresh_thread(&[ch]);
     }
 
     /// @brief 处理Prtsc按下事件

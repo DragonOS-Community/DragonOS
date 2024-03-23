@@ -12,6 +12,7 @@ use crate::{
     kdebug, kerror,
     net::net_core::net_init,
     process::{kthread::KernelThreadMechanism, process::stdio_init},
+    smp::smp_init,
 };
 
 use super::initcall::do_initcalls;
@@ -27,9 +28,8 @@ pub fn initial_kernel_thread() -> i32 {
 }
 
 fn kernel_init() -> Result<(), SystemError> {
-    kenrel_init_freeable()?;
-
     KernelThreadMechanism::init_stage2();
+    kenrel_init_freeable()?;
 
     // 由于目前加锁，速度过慢，所以先不开启双缓冲
     // scm_enable_double_buffer().expect("Failed to enable double buffer");
@@ -55,6 +55,8 @@ fn kenrel_init_freeable() -> Result<(), SystemError> {
     do_initcalls().unwrap_or_else(|err| {
         panic!("Failed to initialize subsystems: {:?}", err);
     });
+
+    smp_init();
 
     return Ok(());
 }

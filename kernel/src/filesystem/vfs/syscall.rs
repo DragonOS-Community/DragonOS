@@ -1,21 +1,19 @@
-use core::ffi::CStr;
+use core::ffi::c_void;
+use core::mem::size_of;
 
-use alloc::{
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
+use crate::producefs;
 use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
-    filesystem::vfs::file::FileDescriptorVec,
+    filesystem::vfs::{core as Vcore, file::FileDescriptorVec},
     kerror,
     libs::rwlock::RwLockWriteGuard,
     mm::{verify_area, VirtAddr},
     process::ProcessManager,
     syscall::{
-        user_access::{check_and_clone_cstr, UserBufferReader, UserBufferWriter},
+        user_access::{self, check_and_clone_cstr, UserBufferWriter},
         Syscall,
     },
     time::TimeSpec,
@@ -27,7 +25,7 @@ use super::{
     file::{File, FileMode},
     open::{do_faccessat, do_fchmodat, do_sys_open},
     utils::{rsplit_path, user_path_at},
-    Dirent, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    Dirent, FileType, IndexNode, FSMAKER, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 // use crate::kdebug;
 
@@ -86,6 +84,7 @@ bitflags! {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 /// # 文件信息结构体
 pub struct PosixKstat {
     /// 硬件设备ID
@@ -144,6 +143,182 @@ impl PosixKstat {
             blocks: 0,
             _pad: Default::default(),
         }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+/// # 文件信息结构体X
+pub struct PosixStatx {
+    /* 0x00 */
+    stx_mask: PosixStatxMask,
+    /// 文件系统块大小
+    stx_blksize: u32,
+    /// Flags conveying information about the file [uncond]
+    stx_attributes: StxAttributes,
+    /* 0x10 */
+    /// 硬链接数
+    stx_nlink: u32,
+    /// 所有者用户ID
+    stx_uid: u32,
+    /// 所有者组ID
+    stx_gid: u32,
+    /// 文件权限
+    stx_mode: ModeType,
+
+    /* 0x20 */
+    /// inode号
+    stx_inode: u64,
+    /// 文件大小
+    stx_size: i64,
+    /// 分配的512B块数
+    stx_blocks: u64,
+    /// Mask to show what's supported in stx_attributes
+    stx_attributes_mask: StxAttributes,
+
+    /* 0x40 */
+    /// 最后访问时间
+    stx_atime: TimeSpec,
+    /// 文件创建时间
+    stx_btime: TimeSpec,
+    /// 最后状态变化时间
+    stx_ctime: TimeSpec,
+    /// 最后修改时间
+    stx_mtime: TimeSpec,
+
+    /* 0x80 */
+    /// 主设备ID
+    stx_rdev_major: u32,
+    /// 次设备ID
+    stx_rdev_minor: u32,
+    /// 主硬件设备ID
+    stx_dev_major: u32,
+    /// 次硬件设备ID
+    stx_dev_minor: u32,
+
+    /* 0x90 */
+    stx_mnt_id: u64,
+    stx_dio_mem_align: u32,
+    stx_dio_offset_align: u32,
+}
+impl PosixStatx {
+    fn new() -> Self {
+        Self {
+            stx_mask: PosixStatxMask::STATX_BASIC_STATS,
+            stx_blksize: 0,
+            stx_attributes: StxAttributes::STATX_ATTR_APPEND,
+            stx_nlink: 0,
+            stx_uid: 0,
+            stx_gid: 0,
+            stx_mode: ModeType { bits: 0 },
+            stx_inode: 0,
+            stx_size: 0,
+            stx_blocks: 0,
+            stx_attributes_mask: StxAttributes::STATX_ATTR_APPEND,
+            stx_atime: TimeSpec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            stx_btime: TimeSpec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            stx_ctime: TimeSpec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            stx_mtime: TimeSpec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            stx_rdev_major: 0,
+            stx_rdev_minor: 0,
+            stx_dev_major: 0,
+            stx_dev_minor: 0,
+            stx_mnt_id: 0,
+            stx_dio_mem_align: 0,
+            stx_dio_offset_align: 0,
+        }
+    }
+}
+
+bitflags! {
+    pub struct PosixStatxMask: u32{
+        ///  Want stx_mode & S_IFMT
+        const STATX_TYPE = 0x00000001;
+
+        /// Want stx_mode & ~S_IFMT
+        const STATX_MODE = 0x00000002;
+
+        /// Want stx_nlink
+        const STATX_NLINK = 0x00000004;
+
+        /// Want stx_uid
+        const STATX_UID = 0x00000008;
+
+        /// Want stx_gid
+        const STATX_GID = 0x00000010;
+
+        /// Want stx_atime
+        const STATX_ATIME = 0x00000020;
+
+        /// Want stx_mtime
+        const STATX_MTIME = 0x00000040;
+
+        /// Want stx_ctime
+        const STATX_CTIME = 0x00000080;
+
+        /// Want stx_ino
+        const STATX_INO = 0x00000100;
+
+        /// Want stx_size
+        const STATX_SIZE = 0x00000200;
+
+        /// Want stx_blocks
+        const STATX_BLOCKS = 0x00000400;
+
+        /// [All of the above]
+        const STATX_BASIC_STATS = 0x000007ff;
+
+        /// Want stx_btime
+        const STATX_BTIME = 0x00000800;
+
+        /// The same as STATX_BASIC_STATS | STATX_BTIME.
+        /// It is deprecated and should not be used.
+        const STATX_ALL = 0x00000fff;
+
+        /// Want stx_mnt_id (since Linux 5.8)
+        const STATX_MNT_ID = 0x00001000;
+
+        /// Want stx_dio_mem_align and stx_dio_offset_align
+        /// (since Linux 6.1; support varies by filesystem)
+        const STATX_DIOALIGN = 0x00002000;
+
+        /// Reserved for future struct statx expansion
+        const STATX_RESERVED = 0x80000000;
+    }
+}
+
+bitflags! {
+    pub struct StxAttributes: u64 {
+        /// 文件被文件系统压缩
+        const STATX_ATTR_COMPRESSED = 0x00000004;
+        /// 文件被标记为不可修改
+        const STATX_ATTR_IMMUTABLE = 0x00000010;
+        /// 文件是只追加写入的
+        const STATX_ATTR_APPEND = 0x00000020;
+        /// 文件不会被备份
+        const STATX_ATTR_NODUMP = 0x00000040;
+        /// 文件需要密钥才能在文件系统中解密
+        const STATX_ATTR_ENCRYPTED = 0x00000800;
+        /// 目录是自动挂载触发器
+        const STATX_ATTR_AUTOMOUNT = 0x00001000;
+        /// 目录是挂载点的根目录
+        const STATX_ATTR_MOUNT_ROOT = 0x00002000;
+        /// 文件受到 Verity 保护
+        const STATX_ATTR_VERITY = 0x00100000;
+        /// 文件当前处于 DAX 状态 CPU直接访问
+        const STATX_ATTR_DAX = 0x00200000;
     }
 }
 
@@ -248,22 +423,34 @@ impl Syscall {
     ///
     /// @return 文件描述符编号，或者是错误码
     pub fn open(
-        path: &str,
-        flags: FileMode,
-        mode: ModeType,
+        path: *const u8,
+        o_flags: u32,
+        mode: u32,
         follow_symlink: bool,
     ) -> Result<usize, SystemError> {
-        return do_sys_open(AtFlags::AT_FDCWD.bits(), path, flags, mode, follow_symlink);
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
+        let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
+        return do_sys_open(
+            AtFlags::AT_FDCWD.bits(),
+            &path,
+            open_flags,
+            mode,
+            follow_symlink,
+        );
     }
 
     pub fn openat(
         dirfd: i32,
-        path: &str,
-        o_flags: FileMode,
-        mode: ModeType,
+        path: *const u8,
+        o_flags: u32,
+        mode: u32,
         follow_symlink: bool,
     ) -> Result<usize, SystemError> {
-        return do_sys_open(dirfd, path, o_flags, mode, follow_symlink);
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
+        let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
+        return do_sys_open(dirfd, &path, open_flags, mode, follow_symlink);
     }
 
     /// @brief 关闭文件
@@ -351,7 +538,15 @@ impl Syscall {
     ///
     /// @return Ok(usize) 调整后，文件访问指针相对于文件头部的偏移量
     /// @return Err(SystemError) 调整失败，返回posix错误码
-    pub fn lseek(fd: i32, seek: SeekFrom) -> Result<usize, SystemError> {
+    pub fn lseek(fd: i32, offset: i64, seek: u32) -> Result<usize, SystemError> {
+        let seek = match seek {
+            SEEK_SET => Ok(SeekFrom::SeekSet(offset)),
+            SEEK_CUR => Ok(SeekFrom::SeekCurrent(offset)),
+            SEEK_END => Ok(SeekFrom::SeekEnd(offset)),
+            SEEK_MAX => Ok(SeekFrom::SeekEnd(0)),
+            _ => Err(SystemError::EINVAL),
+        }?;
+
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
         let file = fd_table_guard
@@ -429,10 +624,14 @@ impl Syscall {
     ///    EFAULT    |       错误的地址      
     ///  
     /// ENAMETOOLONG |        路径过长        
-    pub fn chdir(dest_path: &str) -> Result<usize, SystemError> {
+    pub fn chdir(path: *const u8) -> Result<usize, SystemError> {
+        if path.is_null() {
+            return Err(SystemError::EFAULT);
+        }
+
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
         let proc = ProcessManager::current_pcb();
         // Copy path to kernel space to avoid some security issues
-        let path = dest_path.to_string();
         let mut new_path = String::from("");
         if path.len() > 0 {
             let cwd = match path.as_bytes()[0] {
@@ -461,8 +660,7 @@ impl Syscall {
         }
         let inode =
             match ROOT_INODE().lookup_follow_symlink(&new_path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
-                Err(e) => {
-                    kerror!("Change Directory Failed, Error = {:?}", e);
+                Err(_) => {
                     return Err(SystemError::ENOENT);
                 }
                 Ok(i) => i,
@@ -534,8 +732,115 @@ impl Syscall {
     /// @param path(r8) 路径 / mode(r9) 模式
     ///
     /// @return uint64_t 负数错误码 / 0表示成功
-    pub fn mkdir(path: &str, mode: usize) -> Result<usize, SystemError> {
-        return do_mkdir(path, FileMode::from_bits_truncate(mode as u32)).map(|x| x as usize);
+    pub fn mkdir(path: *const u8, mode: usize) -> Result<usize, SystemError> {
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        return do_mkdir(&path, FileMode::from_bits_truncate(mode as u32)).map(|x| x as usize);
+    }
+
+    /// **创建硬连接的系统调用**
+    ///    
+    /// ## 参数
+    ///
+    /// - 'oldfd': 用于解析源文件路径的文件描述符
+    /// - 'old': 源文件路径
+    /// - 'newfd': 用于解析新文件路径的文件描述符
+    /// - 'new': 新文件将创建的路径
+    /// - 'flags': 标志位，仅以位或方式包含AT_EMPTY_PATH和AT_SYMLINK_FOLLOW
+    ///
+    ///
+    pub fn do_linkat(
+        oldfd: i32,
+        old: &str,
+        newfd: i32,
+        new: &str,
+        flags: AtFlags,
+    ) -> Result<usize, SystemError> {
+        // flag包含其他未规定值时返回EINVAL
+        if !(AtFlags::AT_EMPTY_PATH | AtFlags::AT_SYMLINK_FOLLOW).contains(flags) {
+            return Err(SystemError::EINVAL);
+        }
+        // TODO AT_EMPTY_PATH标志启用时，进行调用者CAP_DAC_READ_SEARCH或相似的检查
+        let symlink_times = if flags.contains(AtFlags::AT_SYMLINK_FOLLOW) {
+            0 as usize
+        } else {
+            VFS_MAX_FOLLOW_SYMLINK_TIMES
+        };
+        let pcb = ProcessManager::current_pcb();
+
+        // 得到源路径的inode
+        let old_inode: Arc<dyn IndexNode> = if old.is_empty() {
+            if flags.contains(AtFlags::AT_EMPTY_PATH) {
+                // 在AT_EMPTY_PATH启用时，old可以为空，old_inode实际为oldfd所指文件，但该文件不能为目录。
+                let binding = pcb.fd_table();
+                let fd_table_guard = binding.read();
+                let file = fd_table_guard
+                    .get_file_by_fd(oldfd)
+                    .ok_or(SystemError::EBADF)?;
+                let old_inode = file.lock().inode();
+                old_inode
+            } else {
+                return Err(SystemError::ENONET);
+            }
+        } else {
+            let (old_begin_inode, old_remain_path) = user_path_at(&pcb, oldfd, old)?;
+            old_begin_inode.lookup_follow_symlink(&old_remain_path, symlink_times)?
+        };
+
+        // old_inode为目录时返回EPERM
+        if old_inode.metadata().unwrap().file_type == FileType::Dir {
+            return Err(SystemError::EPERM);
+        }
+
+        // 得到新创建节点的父节点
+        let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newfd, new)?;
+        let (new_name, new_parent_path) = rsplit_path(&new_remain_path);
+        let new_parent = new_begin_inode
+            .lookup_follow_symlink(&new_parent_path.unwrap_or("/"), symlink_times)?;
+
+        // 被调用者利用downcast_ref判断两inode是否为同一文件系统
+        return new_parent.link(&new_name, &old_inode).map(|_| 0);
+    }
+
+    pub fn link(old: *const u8, new: *const u8) -> Result<usize, SystemError> {
+        let get_path = |cstr: *const u8| -> Result<String, SystemError> {
+            let res = check_and_clone_cstr(cstr, Some(MAX_PATHLEN))?;
+            if res.len() >= MAX_PATHLEN {
+                return Err(SystemError::ENAMETOOLONG);
+            }
+            if res.is_empty() {
+                return Err(SystemError::ENOENT);
+            }
+            Ok(res)
+        };
+        let old = get_path(old)?;
+        let new = get_path(new)?;
+        return Self::do_linkat(
+            AtFlags::AT_FDCWD.bits() as i32,
+            &old,
+            AtFlags::AT_FDCWD.bits() as i32,
+            &new,
+            AtFlags::empty(),
+        );
+    }
+
+    pub fn linkat(
+        oldfd: i32,
+        old: *const u8,
+        newfd: i32,
+        new: *const u8,
+        flags: i32,
+    ) -> Result<usize, SystemError> {
+        let old = check_and_clone_cstr(old, Some(MAX_PATHLEN))?;
+        let new = check_and_clone_cstr(new, Some(MAX_PATHLEN))?;
+        if old.len() >= MAX_PATHLEN || new.len() >= MAX_PATHLEN {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+        // old 根据flags & AtFlags::AT_EMPTY_PATH判空
+        if new.is_empty() {
+            return Err(SystemError::ENOENT);
+        }
+        let flags = AtFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
+        Self::do_linkat(oldfd, &old, newfd, &new, flags)
     }
 
     /// **删除文件夹、取消文件的链接、删除文件的系统调用**
@@ -547,14 +852,15 @@ impl Syscall {
     /// - `flags`：标志位
     ///
     ///
-    pub fn unlinkat(dirfd: i32, pathname: &str, flags: u32) -> Result<usize, SystemError> {
+    pub fn unlinkat(dirfd: i32, path: *const u8, flags: u32) -> Result<usize, SystemError> {
         let flags = AtFlags::from_bits(flags as i32).ok_or(SystemError::EINVAL)?;
+
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
 
         if flags.contains(AtFlags::AT_REMOVEDIR) {
             // kdebug!("rmdir");
-            match do_remove_dir(dirfd, &pathname) {
+            match do_remove_dir(dirfd, &path) {
                 Err(err) => {
-                    kerror!("Failed to Remove Directory, Error Code = {:?}", err);
                     return Err(err);
                 }
                 Ok(_) => {
@@ -563,9 +869,8 @@ impl Syscall {
             }
         }
 
-        match do_unlink_at(dirfd, &pathname) {
+        match do_unlink_at(dirfd, &path) {
             Err(err) => {
-                kerror!("Failed to Remove Directory, Error Code = {:?}", err);
                 return Err(err);
             }
             Ok(_) => {
@@ -574,32 +879,59 @@ impl Syscall {
         }
     }
 
-    pub fn rmdir(pathname: *const u8) -> Result<usize, SystemError> {
-        let pathname: String = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?;
-        if pathname.len() >= MAX_PATHLEN {
-            return Err(SystemError::ENAMETOOLONG);
-        }
-        let pathname = pathname.as_str().trim();
-        return do_remove_dir(AtFlags::AT_FDCWD.bits(), pathname).map(|v| v as usize);
+    pub fn rmdir(path: *const u8) -> Result<usize, SystemError> {
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        return do_remove_dir(AtFlags::AT_FDCWD.bits(), &path).map(|v| v as usize);
     }
 
-    pub fn unlink(pathname: *const u8) -> Result<usize, SystemError> {
-        if pathname.is_null() {
-            return Err(SystemError::EFAULT);
-        }
-        let ureader = UserBufferReader::new(pathname, MAX_PATHLEN, true)?;
+    pub fn unlink(path: *const u8) -> Result<usize, SystemError> {
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        return do_unlink_at(AtFlags::AT_FDCWD.bits(), &path).map(|v| v as usize);
+    }
 
-        let buf: &[u8] = ureader.buffer(0).unwrap();
-
-        let pathname: &CStr = CStr::from_bytes_until_nul(buf).map_err(|_| SystemError::EINVAL)?;
-
-        let pathname: &str = pathname.to_str().map_err(|_| SystemError::EINVAL)?;
-        if pathname.len() >= MAX_PATHLEN {
+    /// # 修改文件名
+    ///
+    ///
+    /// ## 参数
+    ///
+    /// - oldfd: 源文件描述符
+    /// - filename_from: 源文件路径
+    /// - newfd: 目标文件描述符
+    /// - filename_to: 目标文件路径
+    /// - flags: 标志位
+    ///
+    ///
+    /// ## 返回值
+    /// - Ok(返回值类型): 返回值的说明
+    /// - Err(错误值类型): 错误的说明
+    ///
+    pub fn do_renameat2(
+        oldfd: i32,
+        filename_from: *const u8,
+        newfd: i32,
+        filename_to: *const u8,
+        _flags: u32,
+    ) -> Result<usize, SystemError> {
+        let filename_from = check_and_clone_cstr(filename_from, Some(MAX_PATHLEN)).unwrap();
+        let filename_to = check_and_clone_cstr(filename_to, Some(MAX_PATHLEN)).unwrap();
+        // 文件名过长
+        if filename_from.len() > MAX_PATHLEN as usize || filename_to.len() > MAX_PATHLEN as usize {
             return Err(SystemError::ENAMETOOLONG);
         }
-        let pathname = pathname.trim();
 
-        return do_unlink_at(AtFlags::AT_FDCWD.bits(), pathname).map(|v| v as usize);
+        //获取pcb，文件节点
+        let pcb = ProcessManager::current_pcb();
+        let (_old_inode_begin, old_remain_path) = user_path_at(&pcb, oldfd, &filename_from)?;
+        let (_new_inode_begin, new_remain_path) = user_path_at(&pcb, newfd, &filename_to)?;
+        //获取父目录
+        let (old_filename, old_parent_path) = rsplit_path(&old_remain_path);
+        let old_parent_inode = ROOT_INODE()
+            .lookup_follow_symlink(old_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        let (new_filename, new_parent_path) = rsplit_path(&new_remain_path);
+        let new_parent_inode = ROOT_INODE()
+            .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename)?;
+        return Ok(0);
     }
 
     /// @brief 根据提供的文件描述符的fd，复制对应的文件结构体，并返回新复制的文件结构体对应的fd
@@ -847,45 +1179,152 @@ impl Syscall {
     }
 
     pub fn fstat(fd: i32, usr_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
+        let mut writer = UserBufferWriter::new(usr_kstat, size_of::<PosixKstat>(), true)?;
         let kstat = Self::do_fstat(fd)?;
-        if usr_kstat.is_null() {
-            return Err(SystemError::EFAULT);
-        }
-        unsafe {
-            *usr_kstat = kstat;
-        }
+
+        writer.copy_one_to_user(&kstat, 0)?;
         return Ok(0);
     }
 
-    pub fn stat(path: &str, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
-        let fd = Self::open(path, FileMode::O_RDONLY, ModeType::empty(), true)?;
+    pub fn stat(path: *const u8, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
+        let fd = Self::open(
+            path,
+            FileMode::O_RDONLY.bits(),
+            ModeType::empty().bits(),
+            true,
+        )?;
         let r = Self::fstat(fd as i32, user_kstat);
         Self::close(fd).ok();
         return r;
     }
 
-    pub fn lstat(path: &str, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
-        let fd = Self::open(path, FileMode::O_RDONLY, ModeType::empty(), false)?;
+    pub fn lstat(path: *const u8, user_kstat: *mut PosixKstat) -> Result<usize, SystemError> {
+        let fd = Self::open(
+            path,
+            FileMode::O_RDONLY.bits(),
+            ModeType::empty().bits(),
+            false,
+        )?;
         let r = Self::fstat(fd as i32, user_kstat);
         Self::close(fd).ok();
         return r;
+    }
+
+    pub fn do_statx(
+        fd: i32,
+        path: *const u8,
+        flags: u32,
+        mask: u32,
+        usr_kstat: *mut PosixStatx,
+    ) -> Result<usize, SystemError> {
+        if usr_kstat.is_null() {
+            return Err(SystemError::EFAULT);
+        }
+
+        let mask = PosixStatxMask::from_bits_truncate(mask);
+
+        if mask.contains(PosixStatxMask::STATX_RESERVED) {
+            return Err(SystemError::ENAVAIL);
+        }
+
+        let flags = FileMode::from_bits_truncate(flags);
+        let ofd = Self::open(path, flags.bits(), ModeType::empty().bits, true)?;
+
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+        let file = fd_table_guard
+            .get_file_by_fd(ofd as i32)
+            .ok_or(SystemError::EBADF)?;
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
+        let mut writer = UserBufferWriter::new(usr_kstat, size_of::<PosixStatx>(), true)?;
+        let mut tmp: PosixStatx = PosixStatx::new();
+        // 获取文件信息
+        let metadata = file.lock().metadata()?;
+
+        tmp.stx_mask |= PosixStatxMask::STATX_BASIC_STATS;
+        tmp.stx_blksize = metadata.blk_size as u32;
+        if mask.contains(PosixStatxMask::STATX_MODE) || mask.contains(PosixStatxMask::STATX_TYPE) {
+            tmp.stx_mode = metadata.mode;
+        }
+        if mask.contains(PosixStatxMask::STATX_NLINK) {
+            tmp.stx_nlink = metadata.nlinks as u32;
+        }
+        if mask.contains(PosixStatxMask::STATX_UID) {
+            tmp.stx_uid = metadata.uid as u32;
+        }
+        if mask.contains(PosixStatxMask::STATX_GID) {
+            tmp.stx_gid = metadata.gid as u32;
+        }
+        if mask.contains(PosixStatxMask::STATX_ATIME) {
+            tmp.stx_atime.tv_sec = metadata.atime.tv_sec;
+            tmp.stx_atime.tv_nsec = metadata.atime.tv_nsec;
+        }
+        if mask.contains(PosixStatxMask::STATX_MTIME) {
+            tmp.stx_mtime.tv_sec = metadata.ctime.tv_sec;
+            tmp.stx_mtime.tv_nsec = metadata.ctime.tv_nsec;
+        }
+        if mask.contains(PosixStatxMask::STATX_CTIME) {
+            // ctime是文件上次修改状态的时间
+            tmp.stx_ctime.tv_sec = metadata.mtime.tv_sec;
+            tmp.stx_ctime.tv_nsec = metadata.mtime.tv_nsec;
+        }
+        if mask.contains(PosixStatxMask::STATX_INO) {
+            tmp.stx_inode = metadata.inode_id.into() as u64;
+        }
+        if mask.contains(PosixStatxMask::STATX_SIZE) {
+            tmp.stx_size = metadata.size;
+        }
+        if mask.contains(PosixStatxMask::STATX_BLOCKS) {
+            tmp.stx_blocks = metadata.blocks as u64;
+        }
+
+        if mask.contains(PosixStatxMask::STATX_BTIME) {
+            // btime是文件创建时间
+            tmp.stx_btime.tv_sec = metadata.ctime.tv_sec;
+            tmp.stx_btime.tv_nsec = metadata.ctime.tv_nsec;
+        }
+        if mask.contains(PosixStatxMask::STATX_ALL) {
+            tmp.stx_attributes = StxAttributes::STATX_ATTR_APPEND;
+            tmp.stx_attributes_mask |=
+                StxAttributes::STATX_ATTR_AUTOMOUNT | StxAttributes::STATX_ATTR_DAX;
+            tmp.stx_dev_major = metadata.dev_id as u32;
+            tmp.stx_dev_minor = metadata.dev_id as u32; //
+            tmp.stx_rdev_major = metadata.raw_dev.data() as u32;
+            tmp.stx_rdev_minor = metadata.raw_dev.data() as u32;
+        }
+        if mask.contains(PosixStatxMask::STATX_MNT_ID) {
+            tmp.stx_mnt_id = 0;
+        }
+        if mask.contains(PosixStatxMask::STATX_DIOALIGN) {
+            tmp.stx_dio_mem_align = 0;
+            tmp.stx_dio_offset_align = 0;
+        }
+
+        match file.lock().file_type() {
+            FileType::File => tmp.stx_mode.insert(ModeType::S_IFREG),
+            FileType::Dir => tmp.stx_mode.insert(ModeType::S_IFDIR),
+            FileType::BlockDevice => tmp.stx_mode.insert(ModeType::S_IFBLK),
+            FileType::CharDevice => tmp.stx_mode.insert(ModeType::S_IFCHR),
+            FileType::SymLink => tmp.stx_mode.insert(ModeType::S_IFLNK),
+            FileType::Socket => tmp.stx_mode.insert(ModeType::S_IFSOCK),
+            FileType::Pipe => tmp.stx_mode.insert(ModeType::S_IFIFO),
+            FileType::KvmDevice => tmp.stx_mode.insert(ModeType::S_IFCHR),
+            FileType::FramebufferDevice => tmp.stx_mode.insert(ModeType::S_IFCHR),
+        }
+
+        writer.copy_one_to_user(&tmp, 0)?;
+        Self::close(fd as usize).ok();
+        return Ok(0);
     }
 
     pub fn mknod(
-        path_ptr: *const i8,
+        path: *const u8,
         mode: ModeType,
         dev_t: DeviceNumber,
     ) -> Result<usize, SystemError> {
-        // 安全检验
-        let len = unsafe { CStr::from_ptr(path_ptr).to_bytes().len() };
-        let user_buffer = UserBufferReader::new(path_ptr, len, true)?;
-        let buf = user_buffer.read_from_user::<u8>(0)?;
-        let path = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
-
-        // 文件名过长
-        if path.len() > MAX_PATHLEN as usize {
-            return Err(SystemError::ENAMETOOLONG);
-        }
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = path.as_str().trim();
 
         let inode: Result<Arc<dyn IndexNode>, SystemError> =
             ROOT_INODE().lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
@@ -935,11 +1374,8 @@ impl Syscall {
         buf_size: usize,
     ) -> Result<usize, SystemError> {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = path.as_str().trim();
         let mut user_buf = UserBufferWriter::new(user_buf, buf_size, true)?;
-
-        if path.len() == 0 {
-            return Err(SystemError::EINVAL);
-        }
 
         let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
 
@@ -1017,6 +1453,41 @@ impl Syscall {
         kwarn!("fchmod not fully implemented");
         return Ok(0);
     }
+    /// #挂载文件系统
+    ///
+    /// 用于挂载文件系统,目前仅支持ramfs挂载
+    ///
+    /// ## 参数:
+    ///
+    /// - source       挂载设备(暂时不支持)
+    /// - target       挂载目录
+    /// - filesystemtype   文件系统
+    /// - mountflags     挂载选项（暂未实现）
+    /// - data        带数据挂载
+    ///
+    /// ## 返回值
+    /// - Ok(0): 挂载成功
+    /// - Err(SystemError) :挂载过程中出错
+    pub fn mount(
+        _source: *const u8,
+        target: *const u8,
+        filesystemtype: *const u8,
+        _mountflags: usize,
+        _data: *const c_void,
+    ) -> Result<usize, SystemError> {
+        let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?;
+
+        let filesystemtype = user_access::check_and_clone_cstr(filesystemtype, Some(MAX_PATHLEN))?;
+
+        let filesystemtype = producefs!(FSMAKER, filesystemtype)?;
+
+        return Vcore::do_mount(filesystemtype, (format!("{target}")).as_str());
+    }
+
+    // 想法：可以在VFS中实现一个文件系统分发器，流程如下：
+    // 1. 接受从上方传来的文件类型字符串
+    // 2. 将传入值与启动时准备好的字符串数组逐个比较（probe）
+    // 3. 直接在函数内调用构造方法并直接返回文件系统对象
 }
 
 #[repr(C)]

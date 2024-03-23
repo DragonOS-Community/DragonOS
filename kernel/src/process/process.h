@@ -10,7 +10,6 @@
 
 #pragma once
 #include "ptrace.h"
-#include <common/cpu.h>
 #include <common/errno.h>
 #include <common/glib.h>
 #include <syscall/syscall.h>

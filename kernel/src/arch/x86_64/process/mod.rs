@@ -20,14 +20,10 @@ use crate::{
     exception::InterruptArch,
     kerror, kwarn,
     libs::spinlock::SpinLockGuard,
-    mm::{
-        percpu::{PerCpu, PerCpuVar},
-        VirtAddr,
-    },
+    mm::VirtAddr,
     process::{
         fork::{CloneFlags, KernelCloneArgs},
-        KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager, SwitchResult,
-        SWITCH_RESULT,
+        KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager, PROCESS_SWITCH_RESULT,
     },
     syscall::Syscall,
 };
@@ -299,16 +295,7 @@ impl ProcessControlBlock {
 
 impl ProcessManager {
     pub fn arch_init() {
-        {
-            // 初始化进程切换结果 per cpu变量
-            let mut switch_res_vec: Vec<SwitchResult> = Vec::new();
-            for _ in 0..PerCpu::MAX_CPU_NUM {
-                switch_res_vec.push(SwitchResult::new());
-            }
-            unsafe {
-                SWITCH_RESULT = Some(PerCpuVar::new(switch_res_vec).unwrap());
-            }
-        }
+        // do nothing
     }
     /// fork的过程中复制线程
     ///
@@ -421,8 +408,8 @@ impl ProcessManager {
             x86::Ring::Ring0,
             next.kernel_stack().stack_max_address().data() as u64,
         );
-        SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
-        SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
+        PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
+        PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
         // kdebug!("switch tss ok");
         compiler_fence(Ordering::SeqCst);
         // 正式切换上下文

@@ -25,15 +25,11 @@ clean:
 
 .PHONY: fmt
 fmt:
-<<<<<<< Updated upstream
-	cargo fmt --all $(FMT_CHECK)
-=======
 	@cargo fmt --all $(FMT_CHECK)
 ifeq ($(ARCH), x86_64)
 	@cargo clippy --all-features
 endif
 
->>>>>>> Stashed changes
 
 .PHONY: check
 check: ECHO

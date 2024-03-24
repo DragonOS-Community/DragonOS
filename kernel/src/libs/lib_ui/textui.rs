@@ -512,7 +512,6 @@ impl TextuiCharChromatic {
                 }
 
                 unsafe {
-                    // addr = (addr.offset(byte_num_of_depth as isize)) as *mut u8;
                     addr = addr.offset(1);
                 }
             }

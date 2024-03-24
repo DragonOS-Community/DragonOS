@@ -237,9 +237,8 @@ impl Hpet {
     /// 处理HPET的中断
     pub(super) fn handle_irq(&self, timer_num: u32) {
         if timer_num == 0 {
-            assert!(CurrentIrqArch::is_irq_enabled() == false);
+            assert!(!CurrentIrqArch::is_irq_enabled());
             update_timer_jiffies(Self::HPET0_INTERVAL_USEC, Self::HPET0_INTERVAL_USEC as i64);
-
 
             if let Ok(first_expire) = timer_get_first_expire() {
                 if first_expire <= clock() {

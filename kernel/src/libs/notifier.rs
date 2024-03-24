@@ -38,7 +38,7 @@ impl<V: Clone + Copy, T> NotifierChain<V, T> {
         // 在 notifier chain中寻找第一个优先级比要插入块低的块
         for b in self.0.iter() {
             // 判断之前是否已经注册过该节点
-            if Arc::as_ptr(&block) == Arc::as_ptr(b) {
+            if Arc::ptr_eq(&block, b) {
                 kwarn!(
                     "notifier callback {:?} already registered",
                     Arc::as_ptr(&block)
@@ -65,7 +65,7 @@ impl<V: Clone + Copy, T> NotifierChain<V, T> {
 
     /// @brief 在通知链中取消注册节点
     pub fn unregister(&mut self, block: Arc<dyn NotifierBlock<V, T>>) -> Result<(), SystemError> {
-        let remove = self.0.extract_if(|b| Arc::as_ptr(&block) == Arc::as_ptr(b));
+        let remove = self.0.extract_if(|b| Arc::ptr_eq(&block, b));
         match remove.count() {
             0 => return Err(SystemError::ENOENT),
             _ => return Ok(()),
@@ -106,6 +106,12 @@ impl<V: Clone + Copy, T> NotifierChain<V, T> {
 /// @brief 原子的通知链，使用 SpinLock 进行同步
 #[derive(Debug)]
 pub struct AtomicNotifierChain<V: Clone + Copy, T>(SpinLock<NotifierChain<V, T>>);
+
+impl<V: Clone + Copy, T> Default for AtomicNotifierChain<V, T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl<V: Clone + Copy, T> AtomicNotifierChain<V, T> {
     pub fn new() -> Self {

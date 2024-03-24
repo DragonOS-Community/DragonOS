@@ -98,11 +98,11 @@ pub fn sys_dev_char_kset() -> Arc<KSet> {
     unsafe { DEV_CHAR_KSET_INSTANCE.as_ref().unwrap().clone() }
 }
 
-pub(self) unsafe fn set_sys_dev_block_kset(kset: Arc<KSet>) {
+unsafe fn set_sys_dev_block_kset(kset: Arc<KSet>) {
     DEV_BLOCK_KSET_INSTANCE = Some(kset);
 }
 
-pub(self) unsafe fn set_sys_dev_char_kset(kset: Arc<KSet>) {
+unsafe fn set_sys_dev_char_kset(kset: Arc<KSet>) {
     DEV_CHAR_KSET_INSTANCE = Some(kset);
 }
 
@@ -111,7 +111,7 @@ pub fn sys_devices_virtual_kset() -> Arc<KSet> {
     unsafe { DEVICES_VIRTUAL_KSET_INSTANCE.as_ref().unwrap().clone() }
 }
 
-pub(self) unsafe fn set_sys_devices_virtual_kset(kset: Arc<KSet>) {
+unsafe fn set_sys_devices_virtual_kset(kset: Arc<KSet>) {
     DEVICES_VIRTUAL_KSET_INSTANCE = Some(kset);
 }
 
@@ -274,7 +274,7 @@ impl IdTable {
     }
 
     pub fn device_number(&self) -> DeviceNumber {
-        return self.id.unwrap_or(DeviceNumber::default());
+        return self.id.unwrap_or_default();
     }
 }
 
@@ -307,9 +307,9 @@ pub enum DeviceError {
     UnsupportedOperation, // 不支持的操作
 }
 
-impl Into<SystemError> for DeviceError {
-    fn into(self) -> SystemError {
-        match self {
+impl From<DeviceError> for SystemError {
+    fn from(value: DeviceError) -> Self {
+        match value {
             DeviceError::DriverExists => SystemError::EEXIST,
             DeviceError::DeviceExists => SystemError::EEXIST,
             DeviceError::InitializeFailed => SystemError::EIO,
@@ -431,10 +431,8 @@ impl DeviceManager {
 
         let current_parent = device
             .parent()
-            .map(|x| x.upgrade())
-            .flatten()
-            .map(|x| x.arc_any().cast::<dyn Device>().ok())
-            .flatten();
+            .and_then(|x| x.upgrade())
+            .and_then(|x| x.arc_any().cast::<dyn Device>().ok());
 
         let actual_parent = self.get_device_parent(&device, current_parent)?;
         if let Some(actual_parent) = actual_parent {
@@ -467,7 +465,7 @@ impl DeviceManager {
         }
 
         // 通知客户端有关设备添加的信息。此调用必须在 dpm_sysfs_add() 之后且在 kobject_uevent() 之前执行。
-        if let Some(bus) = device.bus().map(|bus| bus.upgrade()).flatten() {
+        if let Some(bus) = device.bus().and_then(|bus| bus.upgrade()) {
             bus.subsystem().bus_notifier().call_chain(
                 bus::BusNotifyEvent::AddDevice,
                 Some(&device),
@@ -509,19 +507,17 @@ impl DeviceManager {
         current_parent: Option<Arc<dyn Device>>,
     ) -> Result<Option<Arc<dyn KObject>>, SystemError> {
         // kdebug!("get_device_parent() device:{:?}", device.name());
-        if let Some(_) = device.class() {
+        if device.class().is_some() {
             let parent_kobj: Arc<dyn KObject>;
             // kdebug!("current_parent:{:?}", current_parent);
-            if current_parent.is_none() {
-                parent_kobj = sys_devices_virtual_kset() as Arc<dyn KObject>;
-            } else {
-                let cp = current_parent.unwrap();
-
+            if let Some(cp) = current_parent {
                 if cp.class().is_some() {
                     return Ok(Some(cp.clone() as Arc<dyn KObject>));
                 } else {
                     parent_kobj = cp.clone() as Arc<dyn KObject>;
                 }
+            } else {
+                parent_kobj = sys_devices_virtual_kset() as Arc<dyn KObject>;
             }
 
             // 是否需要glue dir?
@@ -531,15 +527,15 @@ impl DeviceManager {
 
         // subsystems can specify a default root directory for their devices
         if current_parent.is_none() {
-            if let Some(bus) = device.bus().map(|bus| bus.upgrade()).flatten() {
-                if let Some(root) = bus.root_device().map(|x| x.upgrade()).flatten() {
+            if let Some(bus) = device.bus().and_then(|bus| bus.upgrade()) {
+                if let Some(root) = bus.root_device().and_then(|x| x.upgrade()) {
                     return Ok(Some(root as Arc<dyn KObject>));
                 }
             }
         }
 
-        if current_parent.is_some() {
-            return Ok(Some(current_parent.unwrap().clone() as Arc<dyn KObject>));
+        if let Some(current_parent) = current_parent {
+            return Ok(Some(current_parent as Arc<dyn KObject>));
         }
 
         return Ok(None);
@@ -599,10 +595,10 @@ impl DeviceManager {
         sysfs_instance().create_link(Some(&dev_kobj), &subsys_kobj, "subsystem".to_string())?;
 
         // todo: 这里需要处理class的parent逻辑, 添加device链接
-        if let Some(parent) = dev.parent().map(|x| x.upgrade()).flatten() {
+        if let Some(parent) = dev.parent().and_then(|x| x.upgrade()) {
             let parent_kobj = parent.clone() as Arc<dyn KObject>;
             sysfs_instance()
-                .create_link(Some(&dev_kobj), &&parent_kobj, "device".to_string())
+                .create_link(Some(&dev_kobj), &parent_kobj, "device".to_string())
                 .map_err(|e| {
                     err_remove_subsystem(&dev_kobj);
                     e
@@ -876,7 +872,7 @@ impl DeviceMatcher<&str> for DeviceMatchName {
 }
 
 /// Cookie to identify the device
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone)]
 pub struct DeviceId {
     data: Option<&'static str>,
     allocated: Option<String>,
@@ -915,6 +911,12 @@ impl DeviceId {
 impl PartialEq for DeviceId {
     fn eq(&self, other: &Self) -> bool {
         return self.id() == other.id();
+    }
+}
+
+impl core::hash::Hash for DeviceId {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.id().hash(state);
     }
 }
 

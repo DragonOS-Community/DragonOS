@@ -297,7 +297,6 @@ impl IndexNode for KernFSInode {
         self.children
             .lock()
             .keys()
-            .into_iter()
             .for_each(|x| keys.push(x.clone()));
 
         return Ok(keys);
@@ -650,9 +649,9 @@ pub enum KernInodeType {
     SymLink,
 }
 
-impl Into<FileType> for KernInodeType {
-    fn into(self) -> FileType {
-        match self {
+impl From<KernInodeType> for FileType {
+    fn from(val: KernInodeType) -> Self {
+        match val {
             KernInodeType::Dir => FileType::Dir,
             KernInodeType::File => FileType::File,
             KernInodeType::SymLink => FileType::SymLink,

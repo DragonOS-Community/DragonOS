@@ -115,7 +115,7 @@ impl Hpet {
         let freq = regs.frequency();
         kdebug!("HPET frequency: {} Hz", freq);
         let ticks = Self::HPET0_INTERVAL_USEC * freq / 1000000;
-        if ticks <= 0 || ticks > freq * 8 {
+        if ticks == 0 || ticks > freq * 8 {
             kerror!("HPET enable: ticks '{ticks}' is invalid");
             return Err(SystemError::EINVAL);
         }
@@ -237,7 +237,7 @@ impl Hpet {
     /// 处理HPET的中断
     pub(super) fn handle_irq(&self, timer_num: u32) {
         if timer_num == 0 {
-            assert!(CurrentIrqArch::is_irq_enabled() == false);
+            assert!(!CurrentIrqArch::is_irq_enabled());
             update_timer_jiffies(Self::HPET0_INTERVAL_USEC, Self::HPET0_INTERVAL_USEC as i64);
 
             if let Ok(first_expire) = timer_get_first_expire() {

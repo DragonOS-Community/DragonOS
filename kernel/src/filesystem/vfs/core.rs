@@ -1,6 +1,6 @@
 use core::{hint::spin_loop, sync::atomic::Ordering};
 
-use alloc::{format, string::ToString, sync::Arc};
+use alloc::{string::ToString, sync::Arc};
 use system_error::SystemError;
 
 use crate::{
@@ -82,7 +82,7 @@ pub fn vfs_init() -> Result<(), SystemError> {
     sysfs_init().expect("Failed to initialize sysfs");
 
     let root_entries = ROOT_INODE().list().expect("VFS init failed");
-    if root_entries.len() > 0 {
+    if !root_entries.is_empty() {
         kinfo!("Successfully initialized VFS!");
     }
     return Ok(());
@@ -98,21 +98,21 @@ pub fn do_migrate(
     fs: &MountFS,
 ) -> Result<(), SystemError> {
     let r = new_root_inode.find(mountpoint_name);
-    let mountpoint = if r.is_err() {
+    let mountpoint = if let Ok(r) = r {
+        r
+    } else {
         new_root_inode
             .create(
                 mountpoint_name,
                 FileType::Dir,
                 ModeType::from_bits_truncate(0o755),
             )
-            .expect(format!("Failed to create '/{mountpoint_name}' in migrating").as_str())
-    } else {
-        r.unwrap()
+            .unwrap_or_else(|_| panic!("Failed to create '/{mountpoint_name}' in migrating"))
     };
     // 迁移挂载点
     mountpoint
         .mount(fs.inner_filesystem())
-        .expect(format!("Failed to migrate {mountpoint_name} ").as_str());
+        .unwrap_or_else(|_| panic!("Failed to migrate {mountpoint_name} "));
     return Ok(());
 }
 
@@ -197,8 +197,7 @@ pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
 
     let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
 
-    if inode.is_err() {
-        let errno = inode.unwrap_err();
+    if let Err(errno) = inode {
         // 文件不存在，且需要创建
         if errno == SystemError::ENOENT {
             let (filename, parent_path) = rsplit_path(path);
@@ -292,7 +291,7 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 // @brief mount filesystem
 pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<usize, SystemError> {
     ROOT_INODE()
-        .lookup_follow_symlink(&mount_point, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
+        .lookup_follow_symlink(mount_point, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
         .mount(fs)?;
     Ok(0)
 }

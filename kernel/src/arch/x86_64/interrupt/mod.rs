@@ -1,4 +1,3 @@
-mod c_adapter;
 pub(super) mod entry;
 mod handle;
 pub mod ipi;
@@ -93,6 +92,14 @@ impl InterruptArch for X86_64InterruptArch {
     fn arch_early_irq_init() -> Result<(), SystemError> {
         arch_early_irq_init()
     }
+
+    fn arch_ap_early_irq_init() -> Result<(), SystemError> {
+        if !CurrentApic.init_current_cpu() {
+            return Err(SystemError::ENODEV);
+        }
+
+        Ok(())
+    }
 }
 
 /// 中断栈帧结构体
@@ -161,11 +168,7 @@ impl TrapFrame {
     }
 
     /// 判断当前中断是否来自用户模式
-    pub fn from_user(&self) -> bool {
-        if (self.cs & 0x3) != 0 {
-            return true;
-        } else {
-            return false;
-        }
+    pub fn is_from_user(&self) -> bool {
+        return (self.cs & 0x3) != 0;
     }
 }

@@ -21,10 +21,10 @@ const BINARY_LOADERS: [&'static dyn BinaryLoader; 1] = [&ELF_LOADER];
 
 pub trait BinaryLoader: 'static + Debug {
     /// 检查二进制文件是否为当前加载器支持的格式
-    fn probe(self: &'static Self, param: &ExecParam, buf: &[u8]) -> Result<(), ExecError>;
+    fn probe(&'static self, param: &ExecParam, buf: &[u8]) -> Result<(), ExecError>;
 
     fn load(
-        self: &'static Self,
+        &'static self,
         param: &mut ExecParam,
         head_buf: &[u8],
     ) -> Result<BinaryLoaderResult, ExecError>;
@@ -68,14 +68,13 @@ pub enum ExecError {
     BadAddress(Option<VirtAddr>),
     Other(String),
 }
-
-impl Into<SystemError> for ExecError {
-    fn into(self) -> SystemError {
-        match self {
+impl From<ExecError> for SystemError {
+    fn from(val: ExecError) -> Self {
+        match val {
             ExecError::NotExecutable => SystemError::ENOEXEC,
-            ExecError::WrongArchitecture => SystemError::EOPNOTSUPP_OR_ENOTSUP,
+            ExecError::WrongArchitecture => SystemError::ENOEXEC,
             ExecError::PermissionDenied => SystemError::EACCES,
-            ExecError::NotSupported => SystemError::EOPNOTSUPP_OR_ENOTSUP,
+            ExecError::NotSupported => SystemError::ENOSYS,
             ExecError::ParseError => SystemError::ENOEXEC,
             ExecError::OutOfMemory => SystemError::ENOMEM,
             ExecError::InvalidParemeter => SystemError::EINVAL,
@@ -269,7 +268,7 @@ impl ProcInitInfo {
 
     fn push_slice<T: Copy>(&self, ustack: &mut UserStack, slice: &[T]) -> Result<(), SystemError> {
         let mut sp = ustack.sp();
-        sp -= slice.len() * core::mem::size_of::<T>();
+        sp -= core::mem::size_of_val(slice);
         sp -= sp.data() % core::mem::align_of::<T>();
 
         unsafe { core::slice::from_raw_parts_mut(sp.data() as *mut T, slice.len()) }

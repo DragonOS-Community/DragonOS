@@ -66,7 +66,7 @@ impl Syscall {
     pub fn epoll_ctl(epfd: i32, op: usize, fd: i32, event: VirtAddr) -> Result<usize, SystemError> {
         let op = EPollCtlOption::from_op_num(op)?;
         let mut epds = EPollEvent::default();
-        if op != EPollCtlOption::EpollCtlDel {
+        if op != EPollCtlOption::Del {
             // 不为EpollCtlDel时不允许传入空指针
             if event.is_null() {
                 return Err(SystemError::EFAULT);
@@ -93,10 +93,10 @@ impl Syscall {
         epoll_event: VirtAddr,
         max_events: i32,
         timespec: i32,
-        mut sigmask: &mut SigSet,
+        sigmask: &mut SigSet,
     ) -> Result<usize, SystemError> {
         // 设置屏蔽的信号
-        set_current_sig_blocked(&mut sigmask);
+        set_current_sig_blocked(sigmask);
 
         let wait_ret = Self::epoll_wait(epfd, epoll_event, max_events, timespec);
 

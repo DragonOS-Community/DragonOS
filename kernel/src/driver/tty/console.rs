@@ -85,6 +85,7 @@ pub trait ConsoleSwitch: Sync + Send {
     /// - underline: 下划线
     /// - reverse: 颜色反转
     /// - italic: 斜体
+    #[allow(clippy::too_many_arguments)]
     fn con_build_attr(
         &self,
         _vc_data: &VirtualConsoleData,

@@ -8,6 +8,8 @@ use alloc::{collections::BTreeMap, sync::Arc};
 use crate::{driver::net::NetDriver, libs::rwlock::RwLock};
 use smoltcp::wire::IpEndpoint;
 
+use self::socket::SocketInode;
+
 pub mod event_poll;
 pub mod net_core;
 pub mod socket;
@@ -41,8 +43,8 @@ pub enum Endpoint {
     LinkLayer(LinkLayerEndpoint),
     /// 网络层端点
     Ip(Option<IpEndpoint>),
-    /// 不需要端点
-    Unused,
+    /// inode端点
+    Inode(Option<Arc<SocketInode>>),
     // todo: 增加NetLink机制后，增加NetLink端点
 }
 
@@ -124,9 +126,9 @@ impl From<u8> for Protocol {
     }
 }
 
-impl Into<u8> for Protocol {
-    fn into(self) -> u8 {
-        match self {
+impl From<Protocol> for u8 {
+    fn from(value: Protocol) -> Self {
+        match value {
             Protocol::HopByHop => 0x00,
             Protocol::Icmp => 0x01,
             Protocol::Igmp => 0x02,

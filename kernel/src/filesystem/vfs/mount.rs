@@ -48,7 +48,7 @@ impl MountFS {
         return MountFS {
             inner_filesystem: inner_fs,
             mountpoints: SpinLock::new(BTreeMap::new()),
-            self_mountpoint: self_mountpoint,
+            self_mountpoint,
             self_ref: Weak::default(),
         }
         .wrap();

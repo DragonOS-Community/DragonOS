@@ -214,23 +214,20 @@ unsafe extern "C" fn do_invalid_TSS(regs: &'static TrapFrame, error_code: u64) {
     const ERR_MSG_3: &str = "Refers to a descriptor in the current LDT.\n";
     const ERR_MSG_4: &str = "Refers to a descriptor in the GDT.\n";
 
-    let msg1: &str;
-    if (error_code & 0x1) != 0 {
-        msg1 = ERR_MSG_1;
+    let msg1: &str = if (error_code & 0x1) != 0 {
+        ERR_MSG_1
     } else {
-        msg1 = "";
-    }
+        ""
+    };
 
-    let msg2: &str;
-    if (error_code & 0x02) != 0 {
-        msg2 = ERR_MSG_2;
+    let msg2: &str = if (error_code & 0x02) != 0 {
+        ERR_MSG_2
+    } else if (error_code & 0x04) != 0 {
+        ERR_MSG_3
     } else {
-        if (error_code & 0x04) != 0 {
-            msg2 = ERR_MSG_3;
-        } else {
-            msg2 = ERR_MSG_4;
-        }
-    }
+        ERR_MSG_4
+    };
+
     kerror!(
         "do_invalid_TSS(10), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}\n{}{}",
         error_code,
@@ -281,30 +278,27 @@ unsafe extern "C" fn do_general_protection(regs: &'static TrapFrame, error_code:
     const ERR_MSG_4: &str = "Refers to a segment or gate descriptor in the LDT;\n";
     const ERR_MSG_5: &str = "Refers to a descriptor in the current GDT;\n";
 
-    let msg1: &str;
-    if (error_code & 0x1) != 0 {
-        msg1 = ERR_MSG_1;
+    let msg1: &str = if (error_code & 0x1) != 0 {
+        ERR_MSG_1
     } else {
-        msg1 = "";
-    }
+        ""
+    };
 
-    let msg2: &str;
-    if (error_code & 0x02) != 0 {
-        msg2 = ERR_MSG_2;
+    let msg2: &str = if (error_code & 0x02) != 0 {
+        ERR_MSG_2
     } else {
-        msg2 = ERR_MSG_3;
-    }
+        ERR_MSG_3
+    };
 
-    let msg3: &str;
-    if (error_code & 0x02) == 0 {
+    let msg3: &str = if (error_code & 0x02) == 0 {
         if (error_code & 0x04) != 0 {
-            msg3 = ERR_MSG_4;
+            ERR_MSG_4
         } else {
-            msg3 = ERR_MSG_5;
+            ERR_MSG_5
         }
     } else {
-        msg3 = "";
-    }
+        ""
+    };
     kerror!(
         "do_general_protection(13), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}
 {}{}{}

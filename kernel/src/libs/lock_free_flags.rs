@@ -19,6 +19,7 @@ impl<T> LockFreeFlags<T> {
         }
     }
 
+    #[allow(clippy::mut_from_ref)]
     pub fn get_mut(&self) -> &mut T {
         unsafe {
             (self.inner.get().as_ref().unwrap() as *const T as *mut T)

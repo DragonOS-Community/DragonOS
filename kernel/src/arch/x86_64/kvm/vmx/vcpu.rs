@@ -67,9 +67,9 @@ pub struct VcpuContextFrame {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum VcpuState {
-    VcpuInv = 0,
-    VcpuPend = 1,
-    VcpuAct = 2,
+    Inv = 0,
+    Pend = 1,
+    Act = 2,
 }
 
 #[derive(Debug)]
@@ -158,7 +158,7 @@ impl VmxVcpu {
                 rip: 0,
                 rflags: 0,
             },
-            vcpu_state: VcpuState::VcpuInv,
+            vcpu_state: VcpuState::Inv,
             mmu: KvmMmu::default(),
             data: VcpuData::alloc()?,
             parent_vm,
@@ -200,10 +200,10 @@ impl VmxVcpu {
         vmx_vmwrite(VmcsFields::GUEST_RFLAGS as u32, 2)?;
 
         vmx_vmwrite(VmcsFields::GUEST_GDTR_BASE as u32, 0)?;
-        vmx_vmwrite(VmcsFields::GUEST_GDTR_LIMIT as u32, 0x0000_FFFF as u64)?;
+        vmx_vmwrite(VmcsFields::GUEST_GDTR_LIMIT as u32, 0x0000_FFFF_u64)?;
 
         vmx_vmwrite(VmcsFields::GUEST_IDTR_BASE as u32, 0)?;
-        vmx_vmwrite(VmcsFields::GUEST_IDTR_LIMIT as u32, 0x0000_FFFF as u64)?;
+        vmx_vmwrite(VmcsFields::GUEST_IDTR_LIMIT as u32, 0x0000_FFFF_u64)?;
 
         vmx_vmwrite(VmcsFields::GUEST_ACTIVITY_STATE as u32, 0)?; // State = Active
         vmx_vmwrite(VmcsFields::GUEST_INTERRUPTIBILITY_STATE as u32, 0)?;
@@ -312,7 +312,7 @@ impl VmxVcpu {
         vmx_vmwrite(
             VmcsFields::HOST_TR_BASE as u32,
             get_segment_base(pseudo_descriptpr.base, pseudo_descriptpr.limit, unsafe {
-                x86::task::tr().bits().into()
+                x86::task::tr().bits()
             }),
         )?;
         vmx_vmwrite(
@@ -534,7 +534,7 @@ pub fn adjust_vmx_exit_controls() -> u32 {
 }
 
 pub fn adjust_vmx_pinbased_controls() -> u32 {
-    let mut controls: u32 = 0000_0016;
+    let mut controls: u32 = 16;
     adjust_vmx_controls(0, 0, msr::IA32_VMX_TRUE_PINBASED_CTLS, &mut controls);
     // kdebug!("adjust_vmx_pinbased_controls: {:x}", controls);
     return controls;

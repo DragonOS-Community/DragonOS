@@ -13,11 +13,11 @@ pub const TYPE1_KEYCODE_FLAG_BREAK: u8 = 0x80; // 用于判断按键是否被按
 #[derive(Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum KeyFlag {
-    NoneFlag = 0 as u8,
-    PauseBreak = 1 as u8,
-    PrintScreenPress = 2 as u8,
-    PrintScreenRelease = 4 as u8,
-    OtherKey = 8 as u8, // 除了上面两个按键以外的功能按键（不包括下面的第三类按键）
+    NoneFlag = 0_u8,
+    PauseBreak = 1_u8,
+    PrintScreenPress = 2_u8,
+    PrintScreenRelease = 4_u8,
+    OtherKey = 8_u8, // 除了上面两个按键以外的功能按键（不包括下面的第三类按键）
 }
 
 /// @brief A FSM to parse type one keyboard scan code
@@ -117,13 +117,11 @@ impl TypeOneFSMState {
         };
         if scancode != PAUSE_BREAK_SCAN_CODE[i as usize] {
             return self.handle_type3(scancode, scancode_status);
+        } else if i == 5 {
+            // 所有Pause Break扫描码都被清除
+            return TypeOneFSMState::Start;
         } else {
-            if i == 5 {
-                // 所有Pause Break扫描码都被清除
-                return TypeOneFSMState::Start;
-            } else {
-                return TypeOneFSMState::PauseBreak(i + 1);
-            }
+            return TypeOneFSMState::PauseBreak(i + 1);
         }
     }
 
@@ -244,7 +242,7 @@ impl TypeOneFSMState {
                 // 数字小键盘的 / 符号
                 scancode_status.kp_forward_slash = true;
 
-                let ch = '/' as u8;
+                let ch = b'/';
                 Self::emit(ch);
             }
             0xb5 => {
@@ -252,7 +250,7 @@ impl TypeOneFSMState {
             }
             0x1c => {
                 scancode_status.kp_enter = true;
-                Self::emit('\n' as u8);
+                Self::emit(b'\n');
             }
             0x9c => {
                 scancode_status.kp_enter = false;
@@ -266,7 +264,7 @@ impl TypeOneFSMState {
 
     fn handle_type3(&self, scancode: u8, scancode_status: &mut ScanCodeStatus) -> TypeOneFSMState {
         // 判断按键是被按下还是抬起
-        let flag_make = if (scancode & (TYPE1_KEYCODE_FLAG_BREAK as u8)) > 0 {
+        let flag_make = if (scancode & (TYPE1_KEYCODE_FLAG_BREAK)) > 0 {
             false //up
         } else {
             true //down
@@ -307,7 +305,7 @@ impl TypeOneFSMState {
                 key = KeyFlag::NoneFlag;
             }
             _ => {
-                if flag_make == false {
+                if !flag_make {
                     // kdebug!("in type3 ch is {:#x}\n",ch);
                     key = KeyFlag::NoneFlag;
                 }
@@ -319,14 +317,12 @@ impl TypeOneFSMState {
             col = true;
         }
 
-        if scancode_status.caps_lock {
-            if index >= 0x10 && index <= 0x19 {
-                col = !col;
-            } else if index >= 0x1e && index <= 0x26 {
-                col = !col;
-            } else if index >= 0x2c && index <= 0x32 {
-                col = !col;
-            }
+        if scancode_status.caps_lock
+            && ((0x10..=0x19).contains(&index)
+                || (0x1e..=0x26).contains(&index)
+                || (0x2c..=0x32).contains(&index))
+        {
+            col = !col;
         }
 
         let mut ch = TYPE1_KEY_CODE_MAPTABLE[col as usize + 2 * index as usize];
@@ -373,14 +369,12 @@ impl TypeOneFSMState {
         }
         if scancode != PRTSC_SCAN_CODE[i as usize] {
             return self.handle_type3(scancode, scancode_status);
+        } else if i == 3 {
+            // 成功解析出PrtscPress
+            return TypeOneFSMState::Start;
         } else {
-            if i == 3 {
-                // 成功解析出PrtscPress
-                return TypeOneFSMState::Start;
-            } else {
-                // 继续解析
-                return TypeOneFSMState::PrtscPress(i + 1);
-            }
+            // 继续解析
+            return TypeOneFSMState::PrtscPress(i + 1);
         }
     }
 
@@ -400,14 +394,12 @@ impl TypeOneFSMState {
         }
         if scancode != PRTSC_SCAN_CODE[i as usize] {
             return self.handle_type3(scancode, scancode_status);
+        } else if i == 3 {
+            // 成功解析出PrtscRelease
+            return TypeOneFSMState::Start;
         } else {
-            if i == 3 {
-                // 成功解析出PrtscRelease
-                return TypeOneFSMState::Start;
-            } else {
-                // 继续解析
-                return TypeOneFSMState::PrtscRelease(i + 1);
-            }
+            // 继续解析
+            return TypeOneFSMState::PrtscRelease(i + 1);
         }
     }
 }
@@ -479,51 +471,44 @@ impl ScanCodeStatus {
 
 const TYPE1_KEY_CODE_MAPTABLE: [u8; 256] = [
     /*0x00*/ 0, 0, /*0x01*/ 0, 0, // ESC
-    /*0x02*/ '1' as u8, '!' as u8, /*0x03*/ '2' as u8, '@' as u8,
-    /*0x04*/ '3' as u8, '#' as u8, /*0x05*/ '4' as u8, '$' as u8,
-    /*0x06*/ '5' as u8, '%' as u8, /*0x07*/ '6' as u8, '^' as u8,
-    /*0x08*/ '7' as u8, '&' as u8, /*0x09*/ '8' as u8, '*' as u8,
-    /*0x0a*/ '9' as u8, '(' as u8, /*0x0b*/ '0' as u8, ')' as u8,
-    /*0x0c*/ '-' as u8, '_' as u8, /*0x0d*/ '=' as u8, '+' as u8,
-    /*0x0e  \b */ 8 as u8, 8 as u8, // BACKSPACE
-    /*0x0f*/ '\t' as u8, '\t' as u8, // TAB
+    /*0x02*/ b'1', b'!', /*0x03*/ b'2', b'@', /*0x04*/ b'3', b'#',
+    /*0x05*/ b'4', b'$', /*0x06*/ b'5', b'%', /*0x07*/ b'6', b'^',
+    /*0x08*/ b'7', b'&', /*0x09*/ b'8', b'*', /*0x0a*/ b'9', b'(',
+    /*0x0b*/ b'0', b')', /*0x0c*/ b'-', b'_', /*0x0d*/ b'=', b'+',
+    /*0x0e  \b */ 8, 8, // BACKSPACE
+    /*0x0f*/ b'\t', b'\t', // TAB
     ////////////////////////character///////////////////////////
-    /*0x10*/ 'q' as u8,
-    'Q' as u8, /*0x11*/ 'w' as u8, 'W' as u8, /*0x12*/ 'e' as u8, 'E' as u8,
-    /*0x13*/ 'r' as u8, 'R' as u8, /*0x14*/ 't' as u8, 'T' as u8,
-    /*0x15*/ 'y' as u8, 'Y' as u8, /*0x16*/ 'u' as u8, 'U' as u8,
-    /*0x17*/ 'i' as u8, 'I' as u8, /*0x18*/ 'o' as u8, 'O' as u8,
-    /*0x19*/ 'p' as u8, 'P' as u8,
+    /*0x10*/ b'q', b'Q',
+    /*0x11*/ b'w', b'W', /*0x12*/ b'e', b'E', /*0x13*/ b'r', b'R',
+    /*0x14*/ b't', b'T', /*0x15*/ b'y', b'Y', /*0x16*/ b'u', b'U',
+    /*0x17*/ b'i', b'I', /*0x18*/ b'o', b'O', /*0x19*/ b'p', b'P',
     ////////////////////////character///////////////////////////
 
-    /*0x1a*/ '[' as u8,
-    '{' as u8, /*0x1b*/ ']' as u8, '}' as u8, /*0x1c*/ '\n' as u8,
-    '\n' as u8, // ENTER
+    /*0x1a*/ b'[', b'{',
+    /*0x1b*/ b']', b'}', /*0x1c*/ b'\n', b'\n', // ENTER
     /*0x1d*/ 0x1d, 0x1d, // CTRL Left
     ////////////////////////character///////////////////////////
-    /*0x1e*/ 'a' as u8,
-    'A' as u8, /*0x1f*/ 's' as u8, 'S' as u8, /*0x20*/ 'd' as u8, 'D' as u8,
-    /*0x21*/ 'f' as u8, 'F' as u8, /*0x22*/ 'g' as u8, 'G' as u8,
-    /*0x23*/ 'h' as u8, 'H' as u8, /*0x24*/ 'j' as u8, 'J' as u8,
-    /*0x25*/ 'k' as u8, 'K' as u8, /*0x26*/ 'l' as u8, 'L' as u8,
+    /*0x1e*/ b'a', b'A',
+    /*0x1f*/ b's', b'S', /*0x20*/ b'd', b'D', /*0x21*/ b'f', b'F',
+    /*0x22*/ b'g', b'G', /*0x23*/ b'h', b'H', /*0x24*/ b'j', b'J',
+    /*0x25*/ b'k', b'K', /*0x26*/ b'l', b'L',
     ////////////////////////character///////////////////////////
 
-    /*0x27*/ ';' as u8,
-    ':' as u8, /*0x28*/ '\'' as u8, '"' as u8, /*0x29*/ '`' as u8, '~' as u8,
-    /*0x2a*/ 0x2a, 0x2a, // SHIFT Left
-    /*0x2b*/ '\\' as u8, '|' as u8,
+    /*0x27*/ b';', b':',
+    /*0x28*/ b'\'', b'"', /*0x29*/ b'`', b'~', /*0x2a*/ 0x2a,
+    0x2a, // SHIFT Left
+    /*0x2b*/ b'\\', b'|',
     ////////////////////////character///////////////////////////
-    /*0x2c*/ 'z' as u8,
-    'Z' as u8, /*0x2d*/ 'x' as u8, 'X' as u8, /*0x2e*/ 'c' as u8, 'C' as u8,
-    /*0x2f*/ 'v' as u8, 'V' as u8, /*0x30*/ 'b' as u8, 'B' as u8,
-    /*0x31*/ 'n' as u8, 'N' as u8, /*0x32*/ 'm' as u8, 'M' as u8,
+    /*0x2c*/ b'z', b'Z',
+    /*0x2d*/ b'x', b'X', /*0x2e*/ b'c', b'C', /*0x2f*/ b'v', b'V',
+    /*0x30*/ b'b', b'B', /*0x31*/ b'n', b'N', /*0x32*/ b'm', b'M',
     ////////////////////////character///////////////////////////
 
-    /*0x33*/ ',' as u8,
-    '<' as u8, /*0x34*/ '.' as u8, '>' as u8, /*0x35*/ '/' as u8, '?' as u8,
-    /*0x36*/ 0x36, 0x36, // SHIFT Right
-    /*0x37*/ '*' as u8, '*' as u8, /*0x38*/ 0x38, 0x38, // ALT Left
-    /*0x39*/ ' ' as u8, ' ' as u8, /*0x3a*/ 0, 0, // CAPS LOCK
+    /*0x33*/ b',', b'<',
+    /*0x34*/ b'.', b'>', /*0x35*/ b'/', b'?', /*0x36*/ 0x36,
+    0x36, // SHIFT Right
+    /*0x37*/ b'*', b'*', /*0x38*/ 0x38, 0x38, // ALT Left
+    /*0x39*/ b' ', b' ', /*0x3a*/ 0, 0, // CAPS LOCK
     /*0x3b*/ 0, 0, // F1
     /*0x3c*/ 0, 0, // F2
     /*0x3d*/ 0, 0, // F3
@@ -536,19 +521,19 @@ const TYPE1_KEY_CODE_MAPTABLE: [u8; 256] = [
     /*0x44*/ 0, 0, // F10
     /*0x45*/ 0, 0, // NUM LOCK
     /*0x46*/ 0, 0, // SCROLL LOCK
-    /*0x47*/ '7' as u8, 0, /*PAD HONE*/
-    /*0x48*/ '8' as u8, 0, /*PAD UP*/
-    /*0x49*/ '9' as u8, 0, /*PAD PAGEUP*/
-    /*0x4a*/ '-' as u8, 0, /*PAD MINUS*/
-    /*0x4b*/ '4' as u8, 0, /*PAD LEFT*/
-    /*0x4c*/ '5' as u8, 0, /*PAD MID*/
-    /*0x4d*/ '6' as u8, 0, /*PAD RIGHT*/
-    /*0x4e*/ '+' as u8, 0, /*PAD PLUS*/
-    /*0x4f*/ '1' as u8, 0, /*PAD END*/
-    /*0x50*/ '2' as u8, 0, /*PAD DOWN*/
-    /*0x51*/ '3' as u8, 0, /*PAD PAGEDOWN*/
-    /*0x52*/ '0' as u8, 0, /*PAD INS*/
-    /*0x53*/ '.' as u8, 0, /*PAD DOT*/
+    /*0x47*/ b'7', 0, /*PAD HONE*/
+    /*0x48*/ b'8', 0, /*PAD UP*/
+    /*0x49*/ b'9', 0, /*PAD PAGEUP*/
+    /*0x4a*/ b'-', 0, /*PAD MINUS*/
+    /*0x4b*/ b'4', 0, /*PAD LEFT*/
+    /*0x4c*/ b'5', 0, /*PAD MID*/
+    /*0x4d*/ b'6', 0, /*PAD RIGHT*/
+    /*0x4e*/ b'+', 0, /*PAD PLUS*/
+    /*0x4f*/ b'1', 0, /*PAD END*/
+    /*0x50*/ b'2', 0, /*PAD DOWN*/
+    /*0x51*/ b'3', 0, /*PAD PAGEDOWN*/
+    /*0x52*/ b'0', 0, /*PAD INS*/
+    /*0x53*/ b'.', 0, /*PAD DOT*/
     /*0x54*/ 0, 0, /*0x55*/ 0, 0, /*0x56*/ 0, 0, /*0x57*/ 0, 0, // F11
     /*0x58*/ 0, 0, // F12
     /*0x59*/ 0, 0, /*0x5a*/ 0, 0, /*0x5b*/ 0, 0, /*0x5c*/ 0, 0,

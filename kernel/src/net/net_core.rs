@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     event_poll::{EPollEventType, EventPoll},
-    socket::{sockets::TcpSocket, HANDLE_MAP, SOCKET_SET},
+    socket::{inet::TcpSocket, HANDLE_MAP, SOCKET_SET},
 };
 
 /// The network poll function, which will be called by timer.
@@ -85,8 +85,7 @@ fn dhcp_query() -> Result<(), SystemError> {
                         .add_default_ipv4_route(router)
                         .unwrap();
                     let cidr = net_face.inner_iface().lock().ip_addrs().first().cloned();
-                    if cidr.is_some() {
-                        let cidr = cidr.unwrap();
+                    if let Some(cidr) = cidr {
                         kinfo!("Successfully allocated ip by Dhcpv4! Ip:{}", cidr);
                         return Ok(());
                     }
@@ -231,7 +230,7 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
         let mut handle_guard = HANDLE_MAP.write_irqsave();
         let handle_item = handle_guard.get_mut(&handle).unwrap();
         EventPoll::wakeup_epoll(
-            &mut handle_item.epitems,
+            &handle_item.epitems,
             EPollEventType::from_bits_truncate(events as u32),
         )?;
         // crate::kdebug!(

@@ -3,7 +3,6 @@ pub mod ahci_inode;
 pub mod ahcidisk;
 pub mod hba;
 
-use crate::driver::base::block::block_device::BlockDevice;
 use crate::driver::base::block::disk_info::BLK_GF_AHCI;
 // 依赖的rust工具包
 use crate::driver::pci::pci::{
@@ -23,14 +22,7 @@ use crate::{
     kdebug,
 };
 use ahci_inode::LockedAhciInode;
-use alloc::{
-    boxed::Box,
-    collections::LinkedList,
-    format,
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{boxed::Box, collections::LinkedList, format, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::compiler_fence;
 use system_error::SystemError;
 
@@ -179,31 +171,4 @@ fn _port(ctrl_num: u8, port_num: u8) -> &'static mut HbaPort {
     let port: &HbaPort = &list[ctrl_num as usize].ports[port_num as usize];
 
     return unsafe { (port as *const HbaPort as *mut HbaPort).as_mut().unwrap() };
-}
-
-/// @brief: 测试函数
-pub fn __test_ahci() {
-    let _res = ahci_init();
-    let disk: Arc<LockedAhciDisk> = get_disks_by_name("ahci_disk_0".to_string()).unwrap();
-    #[deny(overflowing_literals)]
-    let mut buf = [0u8; 3000usize];
-
-    for i in 0..2000 {
-        buf[i] = i as u8;
-    }
-
-    let _dd = disk;
-
-    // 测试1, 写两个块,读4个块
-    // _dd.write_at(123, 2, &buf).unwrap();
-    let mut read_buf = [0u8; 3000usize];
-    _dd.read_at(122, 4, &mut read_buf).unwrap();
-
-    // 测试2, 只读写一个字节
-    for i in 0..512 {
-        buf[i] = 233;
-    }
-    // _dd.write_at(123, 2, &buf).unwrap();
-    let mut read_buf2 = [0u8; 3000usize];
-    _dd.read_at(122, 4, &mut read_buf2).unwrap();
 }

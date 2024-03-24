@@ -85,6 +85,7 @@ impl KernelThreadPcbPrivate {
 ///
 /// 对于非原始类型的参数，需要使用Box包装
 #[allow(dead_code)]
+#[allow(clippy::type_complexity)]
 pub enum KernelThreadClosure {
     UsizeClosure((Box<dyn Fn(usize) -> i32 + Send + Sync>, usize)),
     StaticUsizeClosure((&'static fn(usize) -> i32, usize)),
@@ -355,7 +356,7 @@ impl KernelThreadMechanism {
     ) -> Option<Arc<ProcessControlBlock>> {
         let pcb = Self::create(func, name)?;
         ProcessManager::wakeup(&pcb)
-            .expect(format!("Failed to wakeup kthread: {:?}", pcb.pid()).as_str());
+            .unwrap_or_else(|_| panic!("Failed to wakeup kthread: {:?}", pcb.pid()));
         return Some(pcb);
     }
 

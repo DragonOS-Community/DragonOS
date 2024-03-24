@@ -8,7 +8,7 @@ use super::{interrupt::TrapFrame, CurrentIrqArch};
 
 /// 系统调用初始化
 pub fn arch_syscall_init() -> Result<(), SystemError> {
-    unimplemented!("arch_syscall_init")
+    return Ok(());
 }
 
 #[no_mangle]

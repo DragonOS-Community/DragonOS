@@ -92,8 +92,7 @@ impl PrintkWriter {
             // tty已经初始化了之后才输出到屏幕
             let port = TTY_PORTS[current_vcnum as usize].clone();
             let tty = port.port_data().tty();
-            if tty.is_some() {
-                let tty = tty.unwrap();
+            if let Some(tty) = tty {
                 let _ = tty.write(tty.core(), s.as_bytes(), s.len());
             } else {
                 let _ = textui_putstr(s, FontColor::WHITE, FontColor::BLACK);
@@ -123,7 +122,7 @@ impl Logger {
     pub fn log(&self, log_level: usize, message: fmt::Arguments) {
         if unsafe { KMSG.is_some() } {
             let timestamp: TimeSpec = TimeSpec::now();
-            let log_level = LogLevel::from(log_level.clone());
+            let log_level = LogLevel::from(log_level);
 
             let log_message = LogMessage::new(timestamp, log_level, message.to_string());
 

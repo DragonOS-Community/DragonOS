@@ -56,12 +56,18 @@ impl EventPoll {
     pub const ADD_EPOLLITEM: u32 = 0x7965;
     pub fn new() -> Self {
         Self {
-            epoll_wq: WaitQueue::INIT,
+            epoll_wq: WaitQueue::default(),
             ep_items: RBTree::new(),
             ready_list: LinkedList::new(),
             shutdown: AtomicBool::new(false),
             self_ref: None,
         }
+    }
+}
+
+impl Default for EventPoll {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -285,7 +291,7 @@ impl EventPoll {
             .ok_or(SystemError::EBADF)?;
 
         // 检查是否允许 EPOLLWAKEUP
-        if op != EPollCtlOption::EpollCtlDel {
+        if op != EPollCtlOption::Del {
             epds.events &= !EPollEventType::EPOLLWAKEUP.bits();
         }
 
@@ -298,14 +304,14 @@ impl EventPoll {
             return Err(SystemError::EINVAL);
         }
 
-        if op != EPollCtlOption::EpollCtlDel && events.contains(EPollEventType::EPOLLEXCLUSIVE) {
+        if op != EPollCtlOption::Del && events.contains(EPollEventType::EPOLLEXCLUSIVE) {
             // epoll独占模式下不允许EpollCtlMod
-            if op == EPollCtlOption::EpollCtlMod {
+            if op == EPollCtlOption::Mod {
                 return Err(SystemError::EINVAL);
             }
 
             // 不支持嵌套的独占唤醒
-            if op == EPollCtlOption::EpollCtlAdd && Self::is_epoll_file(&dst_file)
+            if op == EPollCtlOption::Add && Self::is_epoll_file(&dst_file)
                 || !events
                     .difference(EPollEventType::EPOLLEXCLUSIVE_OK_BITS)
                     .is_empty()
@@ -329,7 +335,7 @@ impl EventPoll {
                 }
             };
 
-            if op == EPollCtlOption::EpollCtlAdd {
+            if op == EPollCtlOption::Add {
                 // TODO: 循环检查是否为epoll嵌套epoll的情况，如果是则需要检测其深度
                 // 这里是需要一种检测算法的，但是目前未考虑epoll嵌套epoll的情况，所以暂时未实现
                 // Linux算法：https://code.dragonos.org.cn/xref/linux-6.1.9/fs/eventpoll.c?r=&mo=56953&fi=2057#2133
@@ -340,7 +346,7 @@ impl EventPoll {
 
             let ep_item = epoll_guard.ep_items.get(&fd);
             match op {
-                EPollCtlOption::EpollCtlAdd => {
+                EPollCtlOption::Add => {
                     // 如果已经存在，则返回错误
                     if ep_item.is_some() {
                         return Err(SystemError::EEXIST);
@@ -354,7 +360,7 @@ impl EventPoll {
                     ));
                     Self::ep_insert(&mut epoll_guard, dst_file, epitem)?;
                 }
-                EPollCtlOption::EpollCtlDel => {
+                EPollCtlOption::Del => {
                     // 不存在则返回错误
                     if ep_item.is_none() {
                         return Err(SystemError::ENOENT);
@@ -362,7 +368,7 @@ impl EventPoll {
                     // 删除
                     Self::ep_remove(&mut epoll_guard, fd, Some(dst_file))?;
                 }
-                EPollCtlOption::EpollCtlMod => {
+                EPollCtlOption::Mod => {
                     // 不存在则返回错误
                     if ep_item.is_none() {
                         return Err(SystemError::ENOENT);
@@ -372,7 +378,7 @@ impl EventPoll {
                         epds.events |=
                             EPollEventType::EPOLLERR.bits() | EPollEventType::EPOLLHUP.bits();
 
-                        Self::ep_modify(&mut epoll_guard, ep_item, &epds)?;
+                        Self::ep_modify(&mut epoll_guard, ep_item, epds)?;
                     }
                 }
             }
@@ -409,14 +415,12 @@ impl EventPoll {
         if let FilePrivateData::EPoll(epoll_data) = &ep_file.lock_irqsave().private_data {
             epolldata = Some(epoll_data.clone())
         }
-        if epolldata.is_some() {
-            let epoll_data = epolldata.unwrap();
+        if let Some(epoll_data) = epolldata {
             let epoll = epoll_data.epoll.clone();
             let epoll_guard = epoll.0.lock_irqsave();
 
             let mut timeout = false;
-            if timespec.is_some() {
-                let timespec = timespec.unwrap();
+            if let Some(timespec) = timespec {
                 if !(timespec.tv_sec > 0 || timespec.tv_nsec > 0) {
                     // 非阻塞情况
                     timeout = true;
@@ -471,8 +475,7 @@ impl EventPoll {
                 // 还未等待到事件发生，则睡眠
                 // 注册定时器
                 let mut timer = None;
-                if timespec.is_some() {
-                    let timespec = timespec.unwrap();
+                if let Some(timespec) = timespec {
                     let handle = WakeUpHelper::new(current_pcb.clone());
                     let jiffies = next_n_us_timer_jiffies(
                         (timespec.tv_sec * 1000000 + timespec.tv_nsec / 1000) as u64,
@@ -487,13 +490,13 @@ impl EventPoll {
                 sched();
                 // 被唤醒后,检查是否有事件可读
                 available = epoll.0.lock_irqsave().ep_events_available();
-                if timer.is_some() {
-                    if timer.as_ref().unwrap().timeout() {
+                if let Some(timer) = timer {
+                    if timer.as_ref().timeout() {
                         // 超时
                         timeout = true;
                     } else {
                         // 未超时，则取消计时器
-                        timer.unwrap().cancel();
+                        timer.cancel();
                     }
                 }
             }
@@ -598,11 +601,9 @@ impl EventPoll {
         }
 
         let test_poll = dst_file.lock_irqsave().poll();
-        if test_poll.is_err() {
-            if test_poll.unwrap_err() == SystemError::EOPNOTSUPP_OR_ENOTSUP {
-                // 如果目标文件不支持poll
-                return Err(SystemError::ENOSYS);
-            }
+        if test_poll.is_err() && test_poll.unwrap_err() == SystemError::EOPNOTSUPP_OR_ENOTSUP {
+            // 如果目标文件不支持poll
+            return Err(SystemError::ENOSYS);
         }
 
         epoll_guard.ep_items.insert(epitem.fd, epitem.clone());
@@ -632,8 +633,7 @@ impl EventPoll {
         fd: i32,
         dst_file: Option<Arc<SpinLock<File>>>,
     ) -> Result<(), SystemError> {
-        if dst_file.is_some() {
-            let dst_file = dst_file.unwrap();
+        if let Some(dst_file) = dst_file {
             let mut file_guard = dst_file.lock_irqsave();
 
             file_guard.remove_epoll(epoll.self_ref.as_ref().unwrap())?;
@@ -785,19 +785,19 @@ impl EPollEvent {
 #[derive(Debug, PartialEq)]
 pub enum EPollCtlOption {
     /// 注册新的文件描述符到epfd
-    EpollCtlAdd,
+    Add,
     /// 将对应的文件描述符从epfd中删除
-    EpollCtlDel,
+    Del,
     /// 修改已经注册的文件描述符的监听事件
-    EpollCtlMod,
+    Mod,
 }
 
 impl EPollCtlOption {
     pub fn from_op_num(op: usize) -> Result<Self, SystemError> {
         match op {
-            1 => Ok(Self::EpollCtlAdd),
-            2 => Ok(Self::EpollCtlDel),
-            3 => Ok(Self::EpollCtlMod),
+            1 => Ok(Self::Add),
+            2 => Ok(Self::Del),
+            3 => Ok(Self::Mod),
             _ => Err(SystemError::EINVAL),
         }
     }

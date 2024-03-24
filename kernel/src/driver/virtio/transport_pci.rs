@@ -119,6 +119,7 @@ impl PciTransport {
     /// - `device` - The PCI device structure for the VirtIO device.
     /// - `irq_handler` - An optional handler for the device's interrupt. If `None`, a default
     ///     handler `DefaultVirtioIrqHandler` will be used.
+    #[allow(clippy::extra_unused_type_parameters)]
     pub fn new<H: Hal>(
         device: &mut PciDeviceStructureGeneralDevice,
         dev_id: Arc<DeviceId>,

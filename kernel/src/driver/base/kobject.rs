@@ -180,8 +180,7 @@ impl KObjectManager {
         kobj: Arc<dyn KObject>,
         join_kset: Option<Arc<KSet>>,
     ) -> Result<(), SystemError> {
-        if join_kset.is_some() {
-            let kset = join_kset.unwrap();
+        if let Some(kset) = join_kset {
             kset.join(&kobj);
             // 如果kobject没有parent，那么就将这个kset作为parent
             if kobj.parent().is_none() {

@@ -24,7 +24,7 @@ impl Semaphore {
         if counter > 0 {
             Ok(Self {
                 counter: AtomicI32::new(counter),
-                wait_queue: WaitQueue::INIT,
+                wait_queue: WaitQueue::default(),
             })
         } else {
             return Err(SystemError::EOVERFLOW);

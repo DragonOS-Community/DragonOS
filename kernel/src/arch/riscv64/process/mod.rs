@@ -1,7 +1,17 @@
-use alloc::{string::String, sync::Arc, vec::Vec};
+use core::{arch::asm, mem::ManuallyDrop};
+
+use alloc::{
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use system_error::SystemError;
 
-use crate::process::{fork::KernelCloneArgs, KernelStack, ProcessControlBlock, ProcessManager};
+use crate::{
+    kerror,
+    mm::VirtAddr,
+    process::{fork::KernelCloneArgs, KernelStack, ProcessControlBlock, ProcessManager},
+};
 
 use super::interrupt::TrapFrame;
 
@@ -28,7 +38,7 @@ pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<Str
 
 impl ProcessManager {
     pub fn arch_init() {
-        unimplemented!("ProcessManager::arch_init")
+        // do nothing
     }
 
     /// fork的过程中复制线程
@@ -50,6 +60,7 @@ impl ProcessManager {
     /// - `prev`：上一个进程的pcb
     /// - `next`：下一个进程的pcb
     pub unsafe fn switch_process(prev: Arc<ProcessControlBlock>, next: Arc<ProcessControlBlock>) {
+        // todo: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/riscv/include/asm/switch_to.h#76
         unimplemented!("ProcessManager::switch_process")
     }
 }
@@ -57,7 +68,27 @@ impl ProcessManager {
 impl ProcessControlBlock {
     /// 获取当前进程的pcb
     pub fn arch_current_pcb() -> Arc<Self> {
-        unimplemented!("ProcessControlBlock::arch_current_pcb")
+        // 获取栈指针
+        let mut sp: usize;
+        unsafe { asm!("mv {}, sp", lateout(reg) sp, options(nostack)) };
+        let ptr = VirtAddr::new(sp);
+
+        let stack_base = VirtAddr::new(ptr.data() & (!(KernelStack::ALIGN - 1)));
+
+        // 从内核栈的最低地址处取出pcb的地址
+        let p = stack_base.data() as *const *const ProcessControlBlock;
+        if core::intrinsics::unlikely((unsafe { *p }).is_null()) {
+            kerror!("p={:p}", p);
+            panic!("current_pcb is null");
+        }
+        unsafe {
+            // 为了防止内核栈的pcb weak 指针被释放，这里需要将其包装一下
+            let weak_wrapper: ManuallyDrop<Weak<ProcessControlBlock>> =
+                ManuallyDrop::new(Weak::from_raw(*p));
+
+            let new_arc: Arc<ProcessControlBlock> = weak_wrapper.upgrade().unwrap();
+            return new_arc;
+        }
     }
 }
 
@@ -80,7 +111,7 @@ impl ArchPCBInfo {
     ///
     /// 返回一个新的ArchPCBInfo
     pub fn new(kstack: &KernelStack) -> Self {
-        unimplemented!("ArchPCBInfo::new")
+        Self {}
     }
     // ### 从另一个ArchPCBInfo处clone,但是保留部分字段不变
     pub fn clone_from(&mut self, from: &Self) {

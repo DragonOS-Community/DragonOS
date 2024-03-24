@@ -117,6 +117,10 @@ impl<T: Clone + SafeForZero, const ALIGN: usize> Clone for AlignedBox<T, ALIGN> 
 /// 一个用于表明某个类型是安全的用于零初始化的 trait
 ///
 /// 该 trait 用于表明某个类型是安全的用于零初始化的，即该类型的所有位都可以被初始化为 0 而不会出现未定义行为。
+///
+/// # Safety
+///
+/// 该 trait 是 unsafe 的，因为它要求实现者保证该类型的所有位都可以被初始化为 0 而不会出现未定义行为。
 pub unsafe trait SafeForZero {}
 
 unsafe impl<const NUM: usize> SafeForZero for [u8; NUM] {}

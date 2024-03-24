@@ -40,11 +40,10 @@ impl IrqManager {
             return Err(SystemError::EBUSY);
         }
 
-        if desc_inner_guard
+        if !desc_inner_guard
             .internal_state()
             .contains(IrqDescState::IRQS_PENDING)
-            == false
-            && inject == false
+            && !inject
         {
             return Ok(());
         }

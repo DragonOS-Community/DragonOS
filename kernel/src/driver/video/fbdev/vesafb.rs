@@ -390,14 +390,14 @@ impl FrameBufferOps for VesaFb {
             .screen_info
             .lfb_virt_base
             .ok_or(SystemError::ENODEV)?;
-        let fg;
-        if self.current_fb_fix().visual == FbVisual::TrueColor
+
+        let fg = if self.current_fb_fix().visual == FbVisual::TrueColor
             || self.current_fb_fix().visual == FbVisual::DirectColor
         {
-            fg = self.fb_data.read().pesudo_palette[rect.color as usize];
+            self.fb_data.read().pesudo_palette[rect.color as usize]
         } else {
-            fg = rect.color;
-        }
+            rect.color
+        };
 
         let bpp = self.current_fb_var().bits_per_pixel;
         // 每行像素数
@@ -556,8 +556,7 @@ impl FrameBufferOps for VesaFb {
                         }
                     }
                 } else {
-                    let mut tmp: Vec<u32> = Vec::with_capacity(size);
-                    tmp.resize(size, 0);
+                    let mut tmp: Vec<u32> = vec![0; size];
                     let mut tmp_ptr = tmp.as_mut_ptr();
 
                     // 这里是一个可以优化的点，现在为了避免指针拷贝时覆盖，统一先拷贝进入buf再拷贝到dst
@@ -674,11 +673,11 @@ impl FrameBufferInfo for VesaFb {
     }
 
     fn current_fb_var(&self) -> FbVarScreenInfo {
-        VESAFB_DEFINED.read().clone()
+        *VESAFB_DEFINED.read()
     }
 
     fn current_fb_fix(&self) -> FixedScreenInfo {
-        VESAFB_FIX_INFO.read().clone()
+        *VESAFB_FIX_INFO.read()
     }
 
     fn video_mode(&self) -> Option<&FbVideoMode> {

@@ -86,14 +86,13 @@ impl IoApic {
                     }
                     return false;
                 })
-                .map(|x| {
+                .and_then(|x| {
                     if let acpi::madt::MadtEntry::IoApic(x) = x {
                         Some(x.io_apic_address)
                     } else {
                         None
                     }
                 })
-                .flatten()
                 .unwrap();
 
             let phys_base = PhysAddr::new(io_apic_paddr as usize);
@@ -193,6 +192,7 @@ impl IoApic {
     /// * `active_high` - 是否为高电平有效
     /// * `dest_logic` - 是否为逻辑模式
     /// * `mask` - 是否屏蔽
+    #[allow(clippy::too_many_arguments)]
     pub fn install(
         &mut self,
         rte_index: u8,
@@ -335,7 +335,9 @@ impl IrqChipData for IoApicChipData {
 }
 
 impl IoApicChipData {
-    const DEFAULT: Self = Self::new(0, 0, 0, false, false, false, true);
+    const fn default() -> Self {
+        Self::new(0, 0, 0, false, false, false, true)
+    }
 
     const fn new(
         rte_index: u8,
@@ -412,7 +414,7 @@ pub fn ioapic_init(ignore: &'static [IrqNumber]) {
         let irq_data = desc.irq_data();
         let mut chip_info_guard = irq_data.chip_info_write_irqsave();
         chip_info_guard.set_chip(Some(ioapic_ir_chip()));
-        let chip_data = IoApicChipData::DEFAULT;
+        let chip_data = IoApicChipData::default();
         chip_data.inner().rte_index = IoApic::vector_rte_index(i as u8);
         chip_data.inner().vector = i as u8;
         chip_info_guard.set_chip_data(Some(Arc::new(chip_data)));
@@ -426,14 +428,13 @@ pub fn ioapic_init(ignore: &'static [IrqNumber]) {
 }
 
 fn register_handler(desc: &Arc<IrqDesc>, level_triggered: bool) {
-    let fasteoi: bool;
-    if level_triggered {
+    let fasteoi: bool = if level_triggered {
         desc.modify_status(IrqLineStatus::empty(), IrqLineStatus::IRQ_LEVEL);
-        fasteoi = true;
+        true
     } else {
         desc.modify_status(IrqLineStatus::IRQ_LEVEL, IrqLineStatus::empty());
-        fasteoi = false;
-    }
+        false
+    };
 
     let handler: &dyn IrqFlowHandler = if fasteoi {
         fast_eoi_irq_handler()
@@ -536,7 +537,7 @@ impl IrqChip for IoApicChip {
         chip_data_inner.level_triggered = level_triggered;
         chip_data_inner.sync_to_chip()?;
 
-        return Ok(IrqChipSetMaskResult::SetMaskOk);
+        return Ok(IrqChipSetMaskResult::Success);
     }
 
     fn irq_set_affinity(
@@ -560,14 +561,14 @@ impl IrqChip for IoApicChip {
         let mut chip_data_inner = chip_data.inner();
         let origin_dest = chip_data_inner.dest;
         if origin_dest == dest {
-            return Ok(IrqChipSetMaskResult::SetMaskOk);
+            return Ok(IrqChipSetMaskResult::Success);
         }
 
         chip_data_inner.dest = dest;
 
         chip_data_inner.sync_to_chip()?;
 
-        return Ok(IrqChipSetMaskResult::SetMaskOk);
+        return Ok(IrqChipSetMaskResult::Success);
     }
 
     fn irq_unmask(&self, irq: &Arc<IrqData>) -> Result<(), SystemError> {

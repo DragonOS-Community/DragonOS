@@ -47,7 +47,7 @@ impl ProcessManager {
                 })
             };
 
-            let idle_pcb = ProcessControlBlock::new_idle(i as u32, kstack);
+            let idle_pcb = ProcessControlBlock::new_idle(i, kstack);
 
             assert!(idle_pcb.basic().user_vm().is_none());
             unsafe {
@@ -74,7 +74,13 @@ impl ProcessManager {
         return VirtAddr::new(x86::current::registers::rsp() as usize);
 
         #[cfg(target_arch = "riscv64")]
-        unimplemented!("stack_ptr() is not implemented on RISC-V")
+        {
+            let stack_ptr: usize;
+            unsafe {
+                core::arch::asm!("mv {}, sp", out(reg) stack_ptr);
+            }
+            return VirtAddr::new(stack_ptr);
+        }
     }
 
     /// 获取idle进程数组的引用

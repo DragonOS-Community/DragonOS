@@ -13,14 +13,14 @@ use self::{
     render_helper::{BitIter, EndianPattern},
 };
 
-const COLOR_TABLE_8: &'static [u32] = &[
+const COLOR_TABLE_8: &[u32] = &[
     0x00000000, 0xff000000, 0x00ff0000, 0xffff0000, 0x0000ff00, 0xff00ff00, 0x00ffff00, 0xffffff00,
     0x000000ff, 0xff0000ff, 0x00ff00ff, 0xffff00ff, 0x0000ffff, 0xff00ffff, 0x00ffffff, 0xffffffff,
 ];
 
-const COLOR_TABLE_16: &'static [u32] = &[0x00000000, 0xffff0000, 0x0000ffff, 0xffffffff];
+const COLOR_TABLE_16: &[u32] = &[0x00000000, 0xffff0000, 0x0000ffff, 0xffffffff];
 
-const COLOR_TABLE_32: &'static [u32] = &[0x00000000, 0xffffffff];
+const COLOR_TABLE_32: &[u32] = &[0x00000000, 0xffffffff];
 
 pub mod fbcon;
 pub mod fbmem;
@@ -83,7 +83,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
             return;
         }
         let mut dst1 = dst1.unwrap();
-        dst1 = dst1 + VirtAddr::new(bitstart as usize);
+        dst1 += VirtAddr::new(bitstart as usize);
 
         let _ = self.fb_sync();
 
@@ -105,8 +105,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                 && start_index == 0
                 && pitch_index == 0
                 && image.width & (32 / bit_per_pixel - 1) == 0
-                && bit_per_pixel >= 8
-                && bit_per_pixel <= 32
+                && (8..=32).contains(&bit_per_pixel)
             {
                 unsafe { self.fast_imageblit(image, dst1, fg, bg) }
             } else {
@@ -136,23 +135,16 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         let mut bgx = bg;
         let ppw = 32 / bpp;
         let spitch = (image.width + 7) / 8;
-        let tab: &[u32];
         let mut color_tab: [u32; 16] = [0; 16];
 
-        match bpp {
-            8 => {
-                tab = COLOR_TABLE_8;
-            }
-            16 => {
-                tab = COLOR_TABLE_16;
-            }
-            32 => {
-                tab = COLOR_TABLE_32;
-            }
+        let tab: &[u32] = match bpp {
+            8 => COLOR_TABLE_8,
+            16 => COLOR_TABLE_16,
+            32 => COLOR_TABLE_32,
             _ => {
                 return;
             }
-        }
+        };
 
         for _ in (0..(ppw - 1)).rev() {
             fgx <<= bpp;
@@ -185,7 +177,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                     while j >= 2 {
                         *dst = color_tab[(image.data[src] as usize >> 4) & bitmask];
                         dst = dst.add(1);
-                        *dst = color_tab[(image.data[src] as usize >> 0) & bitmask];
+                        *dst = color_tab[(image.data[src] as usize) & bitmask];
                         dst = dst.add(1);
                         j -= 2;
                         src += 1;
@@ -201,7 +193,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                         dst = dst.add(1);
                         *dst = color_tab[(image.data[src] as usize >> 2) & bitmask];
                         dst = dst.add(1);
-                        *dst = color_tab[(image.data[src] as usize >> 0) & bitmask];
+                        *dst = color_tab[(image.data[src] as usize) & bitmask];
                         dst = dst.add(1);
                         src += 1;
                         j -= 4;
@@ -225,7 +217,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                         dst = dst.add(1);
                         *dst = color_tab[(image.data[src] as usize >> 1) & bitmask];
                         dst = dst.add(1);
-                        *dst = color_tab[(image.data[src] as usize >> 0) & bitmask];
+                        *dst = color_tab[(image.data[src] as usize) & bitmask];
                         dst = dst.add(1);
                         src += 1;
                         j -= 8;
@@ -234,6 +226,11 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                 _ => {}
             }
 
+            /*
+             * For image widths that are not a multiple of 8, there
+             * are trailing pixels left on the current line. Print
+             * them as well.
+             */
             while j != 0 {
                 shift -= ppw;
                 *dst = color_tab[(image.data[src] as usize >> shift) & bitmask];
@@ -242,6 +239,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                     shift = 8;
                     src += 1;
                 }
+                j -= 1;
             }
 
             dst1 += VirtAddr::new(self.current_fb_fix().line_length as usize);
@@ -457,7 +455,7 @@ pub trait FrameBufferOps {
             }
         }
 
-        let _ = self.fb_image_blit(&image);
+        self.fb_image_blit(&image);
 
         Ok(())
     }
@@ -676,20 +674,15 @@ impl Default for FbVarScreenInfo {
 ///
 /// 默认为彩色
 #[allow(dead_code)]
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub enum FbColorMode {
     /// 灰度
     GrayScale,
     /// 彩色
+    #[default]
     Color,
     /// FOURCC
     FourCC,
-}
-
-impl Default for FbColorMode {
-    fn default() -> Self {
-        FbColorMode::Color
-    }
 }
 
 /// `FbBitfield` 结构体用于描述颜色字段的位域。
@@ -700,7 +693,7 @@ impl Default for FbColorMode {
 /// 对于伪颜色：所有颜色组件的偏移和长度应该相同。
 /// 偏移指定了调色板索引在像素值中的最低有效位的位置。
 /// 长度表示可用的调色板条目的数量（即条目数 = 1 << 长度）。
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub struct FbBitfield {
     /// 位域的起始位置
     pub offset: u32,
@@ -717,16 +710,6 @@ impl FbBitfield {
             offset,
             length,
             msb_right,
-        }
-    }
-}
-
-impl Default for FbBitfield {
-    fn default() -> Self {
-        Self {
-            offset: Default::default(),
-            length: Default::default(),
-            msb_right: Default::default(),
         }
     }
 }
@@ -766,19 +749,14 @@ impl Default for FbActivateFlags {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub enum FbPixelFormat {
+    #[default]
     Standard,
     /// Hold And Modify
     HAM,
     /// order of pixels in each byte is reversed
     Reserved,
-}
-
-impl Default for FbPixelFormat {
-    fn default() -> Self {
-        FbPixelFormat::Standard
-    }
 }
 
 bitflags! {
@@ -822,9 +800,10 @@ bitflags! {
 
 /// 视频颜色空间
 #[allow(dead_code)]
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub enum V4l2Colorspace {
     /// 默认颜色空间，即让驱动程序自行判断。只能用于视频捕获。
+    #[default]
     Default = 0,
     /// SMPTE 170M：用于广播NTSC/PAL SDTV
     Smpte170m = 1,
@@ -854,12 +833,6 @@ pub enum V4l2Colorspace {
     /// Largest supported colorspace value, assigned by the compiler, used
     /// by the framework to check for invalid values.
     Last,
-}
-
-impl Default for V4l2Colorspace {
-    fn default() -> Self {
-        V4l2Colorspace::Default
-    }
 }
 
 /// `FixedScreenInfo` 结构体用于描述屏幕的固定属性。
@@ -980,17 +953,12 @@ pub enum FbVisual {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub enum FbCapability {
+    #[default]
     Default = 0,
     /// 设备支持基于FOURCC的格式。
     FourCC,
-}
-
-impl Default for FbCapability {
-    fn default() -> Self {
-        FbCapability::Default
-    }
 }
 
 /// 视频模式
@@ -1028,9 +996,10 @@ pub struct FbVideoMode {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub enum FbAccel {
     /// 没有硬件加速器
+    #[default]
     None,
 
     AtariBlitter = 1,
@@ -1092,12 +1061,6 @@ pub enum FbAccel {
     ProSavageDDR = 0x8d,
     ProSavageDDRK = 0x8e,
     // Add other accelerators here
-}
-
-impl Default for FbAccel {
-    fn default() -> Self {
-        FbAccel::None
-    }
 }
 
 #[derive(Debug, Copy, Clone)]

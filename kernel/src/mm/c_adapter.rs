@@ -82,8 +82,6 @@ fn do_kmalloc(size: usize, _zero: bool) -> usize {
     let (ptr, len, cap) = space.into_raw_parts();
     if !ptr.is_null() {
         let vaddr = VirtAddr::new(ptr as usize);
-        let len = len as usize;
-        let cap = cap as usize;
         let mut guard = C_ALLOCATION_MAP.lock();
         if unlikely(guard.contains_key(&vaddr)) {
             drop(guard);
@@ -139,8 +137,8 @@ unsafe extern "C" fn rs_mmio_create(
 ) -> i32 {
     // kdebug!("mmio_create");
     let r = mmio_pool().create_mmio(size as usize);
-    if r.is_err() {
-        return r.unwrap_err().to_posix_errno();
+    if let Err(e) = r {
+        return e.to_posix_errno();
     }
     let space_guard = r.unwrap();
     *res_vaddr = space_guard.vaddr().data() as u64;

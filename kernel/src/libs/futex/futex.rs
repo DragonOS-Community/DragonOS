@@ -69,7 +69,7 @@ impl FutexHashBucket {
     /// 进入该函数前，需要关中断
     #[inline(always)]
     pub fn sleep_no_sched(&mut self, futex_q: Arc<FutexObj>) -> Result<(), SystemError> {
-        assert!(CurrentIrqArch::is_irq_enabled() == false);
+        assert!(!CurrentIrqArch::is_irq_enabled());
         self.chain.push_back(futex_q);
 
         ProcessManager::mark_sleep(true)?;
@@ -193,7 +193,7 @@ impl PartialEq for PrivateKey {
                 .address_space
                 .as_ref()
                 .unwrap_or(&Weak::default())
-                .ptr_eq(&other.address_space.as_ref().unwrap_or(&Weak::default()))
+                .ptr_eq(other.address_space.as_ref().unwrap_or(&Weak::default()))
                 && self.address == other.address;
         }
     }
@@ -261,9 +261,7 @@ impl Futex {
         let pcb = ProcessManager::current_pcb();
         // 创建超时计时器任务
         let mut timer = None;
-        if !abs_time.is_none() {
-            let time = abs_time.unwrap();
-
+        if let Some(time) = abs_time {
             let wakeup_helper = WakeUpHelper::new(pcb.clone());
 
             let sec = time.tv_sec;
@@ -299,8 +297,8 @@ impl Futex {
             Some(bucket_mut) => {
                 if !bucket_mut.contains(&futex_q) {
                     // 取消定时器任务
-                    if timer.is_some() {
-                        timer.unwrap().cancel();
+                    if let Some(timer) = timer {
+                        timer.cancel();
                     }
                     return Ok(0);
                 }
@@ -309,20 +307,18 @@ impl Futex {
             }
             None => {
                 // 取消定时器任务
-                if timer.is_some() {
-                    timer.unwrap().cancel();
+                if let Some(timer) = timer {
+                    timer.cancel();
                 }
                 return Ok(0);
             }
         };
 
         // 如果是超时唤醒，则返回错误
-        if timer.is_some() {
-            if timer.clone().unwrap().timeout() {
-                bucket_mut.remove(futex_q);
+        if timer.is_some() && timer.clone().unwrap().timeout() {
+            bucket_mut.remove(futex_q);
 
-                return Err(SystemError::ETIMEDOUT);
-            }
+            return Err(SystemError::ETIMEDOUT);
         }
 
         // TODO: 如果没有挂起的信号，则重新判断是否满足wait要求，重新进入wait
@@ -334,12 +330,12 @@ impl Futex {
         // 需要处理信号然后重启futex系统调用
 
         // 取消定时器任务
-        if timer.is_some() {
-            let timer = timer.unwrap();
+        if let Some(timer) = timer {
             if !timer.timeout() {
                 timer.cancel();
             }
         }
+
         Ok(0)
     }
 
@@ -412,7 +408,7 @@ impl Futex {
             return Err(SystemError::EINVAL);
         }
 
-        if likely(!cmpval.is_none()) {
+        if likely(cmpval.is_some()) {
             let uval_reader =
                 UserBufferReader::new(uaddr1.as_ptr::<u32>(), core::mem::size_of::<u32>(), true)?;
             let curval = uval_reader.read_one_from_user::<u32>(0)?;
@@ -505,7 +501,7 @@ impl Futex {
         // 计算相对页的偏移量
         let offset = address & (MMArch::PAGE_SIZE - 1);
         // 判断内存对齐
-        if !(uaddr.data() & (core::mem::size_of::<u32>() - 1) == 0) {
+        if uaddr.data() & (core::mem::size_of::<u32>() - 1) != 0 {
             return Err(SystemError::EINVAL);
         }
 
@@ -555,16 +551,14 @@ impl Futex {
         let mut oparg = sign_extend32((encoded_op & 0x00fff000) >> 12, 11);
         let cmparg = sign_extend32(encoded_op & 0x00000fff, 11);
 
-        if encoded_op & (FutexOP::FUTEX_OP_OPARG_SHIFT.bits() << 28) != 0 {
-            if oparg > 31 {
-                kwarn!(
-                    "futex_wake_op: pid:{} tries to shift op by {}; fix this program",
-                    ProcessManager::current_pcb().pid().data(),
-                    oparg
-                );
+        if (encoded_op & (FutexOP::FUTEX_OP_OPARG_SHIFT.bits() << 28) != 0) && oparg > 31 {
+            kwarn!(
+                "futex_wake_op: pid:{} tries to shift op by {}; fix this program",
+                ProcessManager::current_pcb().pid().data(),
+                oparg
+            );
 
-                oparg &= 31;
-            }
+            oparg &= 31;
         }
 
         // TODO: 这个汇编似乎是有问题的，目前不好测试

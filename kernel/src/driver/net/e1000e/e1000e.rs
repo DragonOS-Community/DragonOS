@@ -155,7 +155,7 @@ impl E1000EBuffer {
         return self.length;
     }
     // 释放buffer内部的dma_pages，需要小心使用
-    pub fn free_buffer(self) -> () {
+    pub fn free_buffer(self) {
         if self.length != 0 {
             unsafe { dma_dealloc(self.paddr, self.buffer, E1000E_DMA_PAGES) };
         }
@@ -274,7 +274,7 @@ impl E1000EDevice {
             // close the interrupt
             volwrite!(interrupt_regs, imc, E1000E_IMC_CLEAR);
             let mut gcr = volread!(pcie_regs, gcr);
-            gcr = gcr | (1 << 22);
+            gcr |= 1 << 22;
             volwrite!(pcie_regs, gcr, gcr);
             compiler_fence(Ordering::AcqRel);
             // PHY Initialization 14.8.1
@@ -291,11 +291,11 @@ impl E1000EDevice {
         let ral = unsafe { volread!(ra_regs, ral0) };
         let rah = unsafe { volread!(ra_regs, rah0) };
         let mac: [u8; 6] = [
-            ((ral >> 0) & 0xFF) as u8,
+            (ral & 0xFF) as u8,
             ((ral >> 8) & 0xFF) as u8,
             ((ral >> 16) & 0xFF) as u8,
             ((ral >> 24) & 0xFF) as u8,
-            ((rah >> 0) & 0xFF) as u8,
+            (rah & 0xFF) as u8,
             ((rah >> 8) & 0xFF) as u8,
         ];
         // 初始化receive和transimit descriptor环形队列
@@ -319,17 +319,17 @@ impl E1000EDevice {
 
         // 初始化缓冲区与descriptor，descriptor 中的addr字典应当指向buffer的物理地址
         // Receive buffers of appropriate size should be allocated and pointers to these buffers should be stored in the descriptor ring.
-        for i in 0..recv_ring_length {
+        for ring in recv_desc_ring.iter_mut().take(recv_ring_length) {
             let buffer = E1000EBuffer::new(PAGE_SIZE);
-            recv_desc_ring[i].addr = buffer.as_paddr() as u64;
-            recv_desc_ring[i].status = 0;
+            ring.addr = buffer.as_paddr() as u64;
+            ring.status = 0;
             recv_buffers.push(buffer);
         }
         // Same as receive buffers
-        for i in 0..trans_ring_length {
+        for ring in trans_desc_ring.iter_mut().take(recv_ring_length) {
             let buffer = E1000EBuffer::new(PAGE_SIZE);
-            trans_desc_ring[i].addr = buffer.as_paddr() as u64;
-            trans_desc_ring[i].status = 1;
+            ring.addr = buffer.as_paddr() as u64;
+            ring.status = 1;
             trans_buffers.push(buffer);
         }
 
@@ -340,7 +340,7 @@ impl E1000EDevice {
         while mta_adress != vaddress + E1000E_MTA_REGS_END_OFFSET {
             let mta: NonNull<MTARegs> = get_register_ptr(mta_adress, 0);
             unsafe { volwrite!(mta, mta, 0) };
-            mta_adress = mta_adress + 4;
+            mta_adress += 4;
         }
         // 连续的寄存器读-写操作，放在同一个unsafe块中
         unsafe {
@@ -491,8 +491,8 @@ impl E1000EDevice {
     pub fn e1000e_intr_set(&mut self, state: bool) {
         let mut ims = unsafe { volread!(self.interrupt_regs, ims) };
         match state {
-            true => ims = ims | E1000E_IMS_RXT0,
-            false => ims = ims & !E1000E_IMS_RXT0,
+            true => ims |= E1000E_IMS_RXT0,
+            false => ims &= !E1000E_IMS_RXT0,
         }
         unsafe { volwrite!(self.interrupt_regs, ims, ims) };
     }
@@ -512,8 +512,7 @@ impl E1000EDevice {
             // close interrupt
             self.e1000e_intr_set(false);
             loop {
-                if self.napi_buffer_tail == self.napi_buffer_head && self.napi_buffer_empty == false
-                {
+                if self.napi_buffer_tail == self.napi_buffer_head && !self.napi_buffer_empty {
                     // napi缓冲队列已满，停止收包
                     // napi queue is full, stop
                     break;
@@ -593,7 +592,7 @@ pub extern "C" fn rs_e1000e_init() {
     e1000e_init();
 }
 
-pub fn e1000e_init() -> () {
+pub fn e1000e_init() {
     match e1000e_probe() {
         Ok(_code) => {
             kinfo!("Successfully init e1000e device!");

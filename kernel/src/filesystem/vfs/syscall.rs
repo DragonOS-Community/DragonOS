@@ -1,6 +1,7 @@
 use core::ffi::c_void;
 use core::mem::size_of;
 
+use alloc::string::ToString;
 use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
@@ -383,7 +384,7 @@ impl From<PosixOpenHow> for OpenHow {
     fn from(posix_open_how: PosixOpenHow) -> Self {
         let o_flags = FileMode::from_bits_truncate(posix_open_how.flags as u32);
         let mode = ModeType::from_bits_truncate(posix_open_how.mode as u32);
-        let resolve = OpenHowResolve::from_bits_truncate(posix_open_how.resolve as u64);
+        let resolve = OpenHowResolve::from_bits_truncate(posix_open_how.resolve);
         return Self::new(o_flags, mode, resolve);
     }
 }
@@ -430,7 +431,7 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
         let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
-        let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
+        let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
         return do_sys_open(
             AtFlags::AT_FDCWD.bits(),
             &path,
@@ -449,7 +450,7 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
         let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
-        let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
+        let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
         return do_sys_open(dirfd, &path, open_flags, mode, follow_symlink);
     }
 
@@ -462,9 +463,7 @@ impl Syscall {
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
 
-        let res = fd_table_guard.drop_fd(fd as i32).map(|_| 0);
-
-        return res;
+        fd_table_guard.drop_fd(fd as i32).map(|_| 0)
     }
 
     /// @brief 发送命令到文件描述符对应的设备，
@@ -633,13 +632,13 @@ impl Syscall {
         let proc = ProcessManager::current_pcb();
         // Copy path to kernel space to avoid some security issues
         let mut new_path = String::from("");
-        if path.len() > 0 {
+        if !path.is_empty() {
             let cwd = match path.as_bytes()[0] {
                 b'/' => String::from("/"),
                 _ => proc.basic().cwd(),
             };
-            let mut cwd_vec: Vec<_> = cwd.split("/").filter(|&x| x != "").collect();
-            let path_split = path.split("/").filter(|&x| x != "");
+            let mut cwd_vec: Vec<_> = cwd.split('/').filter(|&x| !x.is_empty()).collect();
+            let path_split = path.split('/').filter(|&x| !x.is_empty());
             for seg in path_split {
                 if seg == ".." {
                     cwd_vec.pop();
@@ -651,10 +650,10 @@ impl Syscall {
             }
             //proc.basic().set_path(String::from(""));
             for seg in cwd_vec {
-                new_path.push_str("/");
+                new_path.push('/');
                 new_path.push_str(seg);
             }
-            if new_path == "" {
+            if new_path.is_empty() {
                 new_path = String::from("/");
             }
         }
@@ -667,7 +666,7 @@ impl Syscall {
             };
         let metadata = inode.metadata()?;
         if metadata.file_type == FileType::Dir {
-            proc.basic_mut().set_cwd(String::from(new_path));
+            proc.basic_mut().set_cwd(new_path);
             return Ok(0);
         } else {
             return Err(SystemError::ENOTDIR);
@@ -761,7 +760,7 @@ impl Syscall {
         }
         // TODO AT_EMPTY_PATH标志启用时，进行调用者CAP_DAC_READ_SEARCH或相似的检查
         let symlink_times = if flags.contains(AtFlags::AT_SYMLINK_FOLLOW) {
-            0 as usize
+            0_usize
         } else {
             VFS_MAX_FOLLOW_SYMLINK_TIMES
         };
@@ -794,11 +793,11 @@ impl Syscall {
         // 得到新创建节点的父节点
         let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newfd, new)?;
         let (new_name, new_parent_path) = rsplit_path(&new_remain_path);
-        let new_parent = new_begin_inode
-            .lookup_follow_symlink(&new_parent_path.unwrap_or("/"), symlink_times)?;
+        let new_parent =
+            new_begin_inode.lookup_follow_symlink(new_parent_path.unwrap_or("/"), symlink_times)?;
 
         // 被调用者利用downcast_ref判断两inode是否为同一文件系统
-        return new_parent.link(&new_name, &old_inode).map(|_| 0);
+        return new_parent.link(new_name, &old_inode).map(|_| 0);
     }
 
     pub fn link(old: *const u8, new: *const u8) -> Result<usize, SystemError> {
@@ -815,9 +814,9 @@ impl Syscall {
         let old = get_path(old)?;
         let new = get_path(new)?;
         return Self::do_linkat(
-            AtFlags::AT_FDCWD.bits() as i32,
+            AtFlags::AT_FDCWD.bits(),
             &old,
-            AtFlags::AT_FDCWD.bits() as i32,
+            AtFlags::AT_FDCWD.bits(),
             &new,
             AtFlags::empty(),
         );
@@ -915,7 +914,7 @@ impl Syscall {
         let filename_from = check_and_clone_cstr(filename_from, Some(MAX_PATHLEN)).unwrap();
         let filename_to = check_and_clone_cstr(filename_to, Some(MAX_PATHLEN)).unwrap();
         // 文件名过长
-        if filename_from.len() > MAX_PATHLEN as usize || filename_to.len() > MAX_PATHLEN as usize {
+        if filename_from.len() > MAX_PATHLEN || filename_to.len() > MAX_PATHLEN {
             return Err(SystemError::ENAMETOOLONG);
         }
 
@@ -988,7 +987,7 @@ impl Syscall {
         let new_exists = fd_table_guard.get_file_by_fd(newfd).is_some();
         if new_exists {
             // close newfd
-            if let Err(_) = fd_table_guard.drop_fd(newfd) {
+            if fd_table_guard.drop_fd(newfd).is_err() {
                 // An I/O error occurred while attempting to close fildes2.
                 return Err(SystemError::EIO);
             }
@@ -1145,7 +1144,7 @@ impl Syscall {
         let mut kstat = PosixKstat::new();
         // 获取文件信息
         let metadata = file.lock().metadata()?;
-        kstat.size = metadata.size as i64;
+        kstat.size = metadata.size;
         kstat.dev_id = metadata.dev_id as u64;
         kstat.inode = metadata.inode_id.into() as u64;
         kstat.blcok_size = metadata.blk_size as i64;
@@ -1290,8 +1289,8 @@ impl Syscall {
                 StxAttributes::STATX_ATTR_AUTOMOUNT | StxAttributes::STATX_ATTR_DAX;
             tmp.stx_dev_major = metadata.dev_id as u32;
             tmp.stx_dev_minor = metadata.dev_id as u32; //
-            tmp.stx_rdev_major = metadata.raw_dev.data() as u32;
-            tmp.stx_rdev_minor = metadata.raw_dev.data() as u32;
+            tmp.stx_rdev_major = metadata.raw_dev.data();
+            tmp.stx_rdev_minor = metadata.raw_dev.data();
         }
         if mask.contains(PosixStatxMask::STATX_MNT_ID) {
             tmp.stx_mnt_id = 0;
@@ -1357,8 +1356,7 @@ impl Syscall {
         // IoVecs会进行用户态检验
         let mut iovecs = unsafe { IoVecs::from_user(iov as *const IoVec, count, true) }?;
 
-        let mut data = Vec::new();
-        data.resize(iovecs.0.iter().map(|x| x.len()).sum(), 0);
+        let mut data = vec![0; iovecs.0.iter().map(|x| x.len()).sum()];
 
         let len = Self::read(fd, &mut data)?;
 
@@ -1377,7 +1375,7 @@ impl Syscall {
         let path = path.as_str().trim();
         let mut user_buf = UserBufferWriter::new(user_buf, buf_size, true)?;
 
-        let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
+        let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
         let inode = inode.lookup(path.as_str())?;
         if inode.metadata()?.file_type != FileType::SymLink {
@@ -1481,7 +1479,7 @@ impl Syscall {
 
         let filesystemtype = producefs!(FSMAKER, filesystemtype)?;
 
-        return Vcore::do_mount(filesystemtype, (format!("{target}")).as_str());
+        return Vcore::do_mount(filesystemtype, target.to_string().as_str());
     }
 
     // 想法：可以在VFS中实现一个文件系统分发器，流程如下：

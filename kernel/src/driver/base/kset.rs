@@ -109,7 +109,7 @@ impl KSet {
     pub fn join(&self, kobj: &Arc<dyn KObject>) {
         assert!(kobj.kset().is_none());
         kobj.set_kset(self.self_ref.upgrade());
-        self.kobjects.write().push(Arc::downgrade(&kobj));
+        self.kobjects.write().push(Arc::downgrade(kobj));
     }
 
     /// 把一个kobject从当前kset中移除。

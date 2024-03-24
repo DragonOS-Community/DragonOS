@@ -14,7 +14,7 @@ impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
         ret_areas: &mut [PhysMemoryArea],
         mut res_count: usize,
     ) -> usize {
-        let info: X86_64MMBootstrapInfo = BOOTSTRAP_MM_INFO.clone().unwrap();
+        let info: X86_64MMBootstrapInfo = BOOTSTRAP_MM_INFO.unwrap();
         let load_base = info.kernel_load_base_paddr;
         let kernel_code_start = MMA::virt_2_phys(VirtAddr::new(info.kernel_code_start))
             .unwrap()

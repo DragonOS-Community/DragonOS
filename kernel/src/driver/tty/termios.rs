@@ -45,7 +45,7 @@ impl PosixTermios {
             c_oflag: termios.output_mode.bits,
             c_cflag: termios.control_mode.bits,
             c_lflag: termios.local_mode.bits,
-            c_cc: termios.control_characters.clone(),
+            c_cc: termios.control_characters,
             c_line: termios.line as u8,
             c_ispeed: termios.input_speed,
             c_ospeed: termios.output_speed,
@@ -53,14 +53,14 @@ impl PosixTermios {
     }
 
     #[allow(dead_code)]
-    pub fn to_kernel_termios(&self) -> Termios {
+    pub fn to_kernel_termios(self) -> Termios {
         // TODO：这里没有考虑非规范模式
         Termios {
             input_mode: InputMode::from_bits_truncate(self.c_iflag),
             output_mode: OutputMode::from_bits_truncate(self.c_oflag),
             control_mode: ControlMode::from_bits_truncate(self.c_cflag),
             local_mode: LocalMode::from_bits_truncate(self.c_lflag),
-            control_characters: self.c_cc.clone(),
+            control_characters: self.c_cc,
             line: LineDisciplineType::from_line(self.c_line),
             input_speed: self.c_ispeed,
             output_speed: self.c_ospeed,
@@ -126,7 +126,7 @@ lazy_static! {
                 | LocalMode::ECHOCTL
                 | LocalMode::ECHOKE
                 | LocalMode::IEXTEN,
-            control_characters: INIT_CONTORL_CHARACTERS.clone(),
+            control_characters: INIT_CONTORL_CHARACTERS,
             line: LineDisciplineType::NTty,
             input_speed: 38400,
             output_speed: 38400,

@@ -90,7 +90,7 @@ impl PlatformDeviceManager {
         let id = pdev.pdev_id().0;
         match id {
             PLATFORM_DEVID_NONE => {
-                pdev.set_name(format!("{}", pdev.pdev_name()));
+                pdev.set_name(pdev.pdev_name().to_string());
             }
             PLATFORM_DEVID_AUTO => {
                 let id = PLATFORM_DEVID_IDA.alloc().ok_or(SystemError::EOVERFLOW)?;
@@ -158,10 +158,7 @@ impl PlatformBusDevice {
     #[allow(dead_code)]
     fn is_initialized(&self) -> bool {
         let state = self.inner.lock().state;
-        match state {
-            BusState::Initialized => true,
-            _ => false,
-        }
+        matches!(state, BusState::Initialized)
     }
 
     /// @brief: 设置总线状态
@@ -237,7 +234,7 @@ impl KObject for PlatformBusDevice {
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.inner.lock().ktype.clone()
+        self.inner.lock().ktype
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {

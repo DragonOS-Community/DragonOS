@@ -25,7 +25,7 @@ use super::{
 };
 
 /// 所有的要解析的表格的解析器
-static TABLE_PARSERS: &'static [&'static TableMatcher] = &[
+static TABLE_PARSERS: &[&TableMatcher] = &[
     &TableMatcher::new(&MatchTableDragonStubPayloadEFI),
     &TableMatcher::new(&MatchTableMemoryAttributes),
     &TableMatcher::new(&MatchTableMemReserve),
@@ -362,13 +362,13 @@ impl TableMatcher {
     /// 判断配置表与当前匹配器是否匹配
     #[inline(never)]
     fn match_table(&self, table: &ConfigurationTable) -> Option<Result<(), SystemError>> {
-        if table.vendor_guid.equivalent(self.table.guid()) == false {
+        if !table.vendor_guid.equivalent(self.table.guid()) {
             return None;
         }
 
         let table_map_size = self.table.map_size();
-        let vendor_table_vaddr: Option<VirtAddr>;
-        if table_map_size > 0 {
+
+        let vendor_table_vaddr: Option<VirtAddr> = if table_map_size > 0 {
             let table_paddr: PhysAddr = PhysAddr::new(table.vendor_table as usize);
             let vaddr = EarlyIoRemap::map_not_aligned(table_paddr, table_map_size, true);
 
@@ -376,10 +376,10 @@ impl TableMatcher {
                 return Some(Err(e));
             }
 
-            vendor_table_vaddr = Some(vaddr.unwrap());
+            Some(vaddr.unwrap())
         } else {
-            vendor_table_vaddr = None;
-        }
+            None
+        };
 
         let r = self.table.post_process(vendor_table_vaddr, table);
 

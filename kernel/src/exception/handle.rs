@@ -104,7 +104,7 @@ impl IrqFlowHandler for EdgeIrqHandler {
                 .contains(IrqDescState::IRQS_PENDING)
             {
                 let status = desc_inner_guard.common_data().status();
-                if status.disabled() == false && status.masked() {
+                if !status.disabled() && status.masked() {
                     // kdebug!("re-enable irq");
                     irq_manager().unmask_irq(&desc_inner_guard);
                 }
@@ -124,10 +124,10 @@ impl IrqFlowHandler for EdgeIrqHandler {
             desc_inner_guard = irq_desc.inner();
             desc_inner_guard.common_data().clear_inprogress();
 
-            if !(desc_inner_guard
+            if !desc_inner_guard
                 .internal_state()
                 .contains(IrqDescState::IRQS_PENDING)
-                && desc_inner_guard.common_data().disabled() == false)
+                || desc_inner_guard.common_data().disabled()
             {
                 break;
             }
@@ -152,11 +152,11 @@ fn irq_may_run(desc_inner_guard: &SpinLockGuard<'_, InnerIrqDesc>) -> bool {
 pub(super) fn mask_ack_irq(irq_data: &Arc<IrqData>) {
     let chip = irq_data.chip_info_read_irqsave().chip();
     if chip.can_mask_ack() {
-        chip.irq_mask_ack(&irq_data);
+        chip.irq_mask_ack(irq_data);
         irq_data.common_data().set_masked();
     } else {
         irq_manager().mask_irq(irq_data);
-        chip.irq_ack(&irq_data);
+        chip.irq_ack(irq_data);
     }
 }
 

@@ -40,9 +40,9 @@ impl From<IpiKind> for ArchIpiKind {
     }
 }
 
-impl Into<u8> for ArchIpiKind {
-    fn into(self) -> u8 {
-        match self {
+impl From<ArchIpiKind> for u8 {
+    fn from(value: ArchIpiKind) -> Self {
+        match value {
             ArchIpiKind::KickCpu => IPI_NUM_KICK_CPU.data() as u8,
             ArchIpiKind::FlushTLB => IPI_NUM_FLUSH_TLB.data() as u8,
             ArchIpiKind::SpecVector(vec) => (vec.data() & 0xFF) as u8,
@@ -76,16 +76,14 @@ impl From<IpiTarget> for ArchIpiTarget {
     }
 }
 
-impl Into<ApicId> for ArchIpiTarget {
-    fn into(self) -> ApicId {
-        if let ArchIpiTarget::Specified(id) = self {
+impl From<ArchIpiTarget> for ApicId {
+    fn from(val: ArchIpiTarget) -> Self {
+        if let ArchIpiTarget::Specified(id) = val {
             return id;
+        } else if CurrentApic.x2apic_enabled() {
+            return x86::apic::ApicId::X2Apic(0);
         } else {
-            if CurrentApic.x2apic_enabled() {
-                return x86::apic::ApicId::X2Apic(0);
-            } else {
-                return x86::apic::ApicId::XApic(0);
-            }
+            return x86::apic::ApicId::XApic(0);
         }
     }
 }
@@ -104,16 +102,16 @@ impl ArchIpiTarget {
     #[inline(always)]
     fn cpu_id_to_apic_id(cpu_id: ProcessorId) -> x86::apic::ApicId {
         if CurrentApic.x2apic_enabled() {
-            x86::apic::ApicId::X2Apic(cpu_id.data() as u32)
+            x86::apic::ApicId::X2Apic(cpu_id.data())
         } else {
             x86::apic::ApicId::XApic(cpu_id.data() as u8)
         }
     }
 }
 
-impl Into<x86::apic::DestinationShorthand> for ArchIpiTarget {
-    fn into(self) -> x86::apic::DestinationShorthand {
-        match self {
+impl From<ArchIpiTarget> for x86::apic::DestinationShorthand {
+    fn from(val: ArchIpiTarget) -> Self {
+        match val {
             ArchIpiTarget::Specified(_) => x86::apic::DestinationShorthand::NoShorthand,
             ArchIpiTarget::Current => x86::apic::DestinationShorthand::Myself,
             ArchIpiTarget::All => x86::apic::DestinationShorthand::AllIncludingSelf,

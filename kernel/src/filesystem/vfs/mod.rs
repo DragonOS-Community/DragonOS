@@ -429,9 +429,62 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
-    /// 返回自身引用
-    fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    /// 当前抽象层挂载点下的绝对目录
+    fn _abs_path(&self) -> Result<String, SystemError> {
+        let mut inode;
+        let mut path_stack = Vec::new();
+        path_stack.push(self.key()?);
+
+        match self.parent() {
+            Err(e) => match e {
+                SystemError:: ENOENT => {
+                    return Ok(String::from("/"));
+                }
+                e => { 
+                    return Err(e);
+                }
+            },
+            Ok(o) => {
+                if self.metadata()?.inode_id == o.metadata()?.inode_id {
+                    return Ok(String::from("/"));
+                }
+                inode = o;
+                path_stack.push(inode.key()?);
+            }
+        }
+
+        while inode.metadata()?.inode_id != ROOT_INODE().metadata()?.inode_id {
+            let tmp = inode.parent();
+            match tmp {
+                Err(e) => match e {
+                    SystemError::ENOENT => {
+                        break;
+                    }
+                    e => {
+                        return Err(e);
+                    }
+                },
+                Ok(o) => {
+                    if inode.metadata()?.inode_id == o.metadata()?.inode_id {
+                        break;
+                    }
+                    inode = o;
+                    path_stack.push(inode.key()?);
+                }
+            }
+        }
+
+        if let Some(last_key) = path_stack.last() {
+            // 根目录没有目录名，弹出
+            if last_key == "" || last_key == "." || last_key == ".." {
+                path_stack.pop();
+            }
+            path_stack.reverse();
+            let mut ret = String::from("/");
+            ret.push_str(&path_stack.join("/"));
+            return Ok(ret);
+        }
+        return Ok(String::from("/"));
     }
 }
 
@@ -508,9 +561,9 @@ impl dyn IndexNode {
                 path_under = path_under.strip_prefix('/').unwrap_or(path_under);
                 // Cache record is found
                 if let Some((inode, found_path)) = root_inode.quick_lookup(fscache, path_under) {
-                    kdebug!("Found path: {}", found_path);
+                    // kdebug!("Found path: {}", found_path);
                     let mut rest_path = path_under.strip_prefix(found_path).unwrap();
-                    kdebug!("Rest path {:?}", rest_path);
+                    // kdebug!("Rest path {:?}", rest_path);
                     // no path left
                     if rest_path.is_empty() {
                         return Ok(inode);
@@ -611,17 +664,17 @@ impl dyn IndexNode {
         rest_path: &str,
         max_follow_times: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        kdebug!("walking though {}", rest_path);
+        // kdebug!("walking though {}", rest_path);
         if self.metadata()?.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
         let (child, left_path) = split_path(rest_path);
-        kdebug!("At {:?}, rest {:?}", child, left_path);
+        // kdebug!("At {:?}, rest {:?}", child, left_path);
         match self.find(child) {
             Ok(child_node) => {
                 if child_node.metadata()?.file_type == FileType::SymLink && max_follow_times > 0 {
                     // symlink wrapping problem
-                    return self.lookup_walk(
+                    return ROOT_INODE().lookup_follow_symlink(
                         &(child_node.from_symlink()? + "/" + rest_path),
                         max_follow_times - 1,
                     );
@@ -670,9 +723,8 @@ impl dyn IndexNode {
         let (key, left_rest) = rsplit_path(abs_path);
 
         let result = cache.get(key).find(|src| {
-            // kdebug!("Src: {}, {}; Lookup: {}, {}", src.key().unwrap(), src._abs_path().unwrap(), key, abs_path);
-            src.key().unwrap() == key
-                && src._abs_path().unwrap().strip_prefix('/').unwrap() == abs_path
+            // kdebug!("Src: {:?}, {:?}; Lookup: {}, {}", src.key(), src._abs_path(), key, abs_path);
+            src._abs_path().unwrap() == abs_path
         });
 
         if result.is_some() {
@@ -687,44 +739,6 @@ impl dyn IndexNode {
         return self.quick_lookup(cache, left_rest.unwrap());
     }
 
-    pub(super) fn _abs_path(&self) -> Result<String, SystemError> {
-        let mut inode = self.self_ref()?;
-        let mut path_stack = Vec::new();
-        path_stack.push(self.key()?);
-
-        while inode.metadata()?.inode_id != ROOT_INODE().metadata()?.inode_id {
-            let tmp = inode.parent();
-            match tmp {
-                Err(e) => match e {
-                    SystemError::ENOENT => {
-                        break;
-                    }
-                    e => {
-                        return Err(e);
-                    }
-                },
-                Ok(o) => {
-                    if inode.metadata()?.inode_id == o.metadata()?.inode_id {
-                        break;
-                    }
-                    inode = o;
-                }
-            }
-            path_stack.push(inode.key()?);
-        }
-
-        if let Some(last_key) = path_stack.last() {
-            // 根目录没有目录名，弹出
-            if last_key == "" || last_key == "." || last_key == ".." {
-                path_stack.pop();
-            }
-            path_stack.reverse();
-            let mut ret = String::from("/");
-            ret.push_str(&path_stack.join("/"));
-            return Ok(ret);
-        }
-        return Ok(String::from("/"));
-    }
 }
 
 /// IndexNode的元数据

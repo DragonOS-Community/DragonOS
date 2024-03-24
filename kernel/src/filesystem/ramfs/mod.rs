@@ -789,15 +789,6 @@ impl IndexNode for LockedEntry {
         }
     }
 
-    fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        Ok(self
-            .0
-            .lock()
-            .self_ref
-            .upgrade()
-            .ok_or(SystemError::ENOENT)?)
-    }
-
     /// # 用于重命名内存中的文件或目录
     fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), SystemError> {
         let old_inode: Arc<dyn IndexNode> = self.find(_old_name)?;

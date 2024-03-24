@@ -33,12 +33,12 @@ impl<'a> Iterator for SrcIter<'a> {
         let vec_here = core::mem::take(&mut self.vec);
         let mut vec_cur = vec_here.unwrap();
 
-        kdebug!("Index {}, len {}", self.idx, vec_cur.len());
-        kdebug!("Vec {:?}", vec_cur.iter().collect::<Vec<_>>());
+        // kdebug!("Index {}, len {}", self.idx, vec_cur.len());
+        // kdebug!("Vec {:?}", vec_cur.iter().collect::<Vec<_>>());
 
-        // 自动删除空节点（未测试）
+        // 自动删除空节点
         let result = loop {
-            if vec_cur.len() == self.idx {
+            if vec_cur.len() <= self.idx {
                 break None;
             }
             if let Some(c1) = vec_cur[self.idx].upgrade() {
@@ -150,7 +150,7 @@ impl LruList {
 
 /// Directory Cache 的默认实现
 /// Todo: 使用自定义优化哈希函数
-#[derive(Debug)]
+// #[derive(Debug)]
 pub struct DefaultCache<H: Hasher + Default = SipHasher> {
     /// hash index
     table: HashTable<H>,
@@ -190,7 +190,7 @@ impl<H: Hasher + Default> DefaultCache<H> {
                 return;
             }
             key => {
-                kdebug!("Cache with key {}.", key);
+                // kdebug!("Cache with key {}.", key);
                 self.table.put(key, self.deque.lock().push(src));
                 self.size.fetch_add(1, Ordering::Acquire);
                 if self.size.load(Ordering::Acquire) >= self.max_size.load(Ordering::Acquire) {
@@ -219,5 +219,11 @@ impl<H: Hasher + Default> DefaultCache<H> {
         self.size.fetch_sub(ret, Ordering::Acquire);
         kdebug!("Release {} empty entry", ret);
         ret
+    }
+}
+
+impl<H: Hasher + Default> core::fmt::Debug for DefaultCache<H> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "DefaultCache")
     }
 }

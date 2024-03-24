@@ -749,14 +749,9 @@ impl IndexNode for LockedProcFSInode {
         Ok(self.0.lock().parent.upgrade().ok_or(SystemError::ENOENT)?)
     }
 
-    fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        Ok(self
-            .0
-            .lock()
-            .self_ref
-            .upgrade()
-            .ok_or(SystemError::ENOENT)?)
-    }
+    // fn key(&self) -> Result<String, SystemError> {
+    //     Ok(self.0.lock().fdata.pid.to_string())
+    // }
 }
 
 /// @brief 向procfs注册进程

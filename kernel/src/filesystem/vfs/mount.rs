@@ -415,8 +415,9 @@ impl IndexNode for MountFSInode {
             .mountpoints
             .lock()
             .insert(metadata.inode_id, new_mount_fs.clone());
+        kdebug!("My path: {:?}", self._abs_path());
         MOUNTS_LIST().lock().insert(
-            MountPath::from(self.self_ref()?._abs_path()?.as_str()),
+            MountPath::from(self._abs_path()?.as_str()),
             new_mount_fs.clone(),
         );
         return Ok(new_mount_fs);
@@ -445,11 +446,6 @@ impl IndexNode for MountFSInode {
     #[inline]
     fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
         self.inner_inode.poll(private_data)
-    }
-
-    #[inline]
-    fn self_ref(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        Ok(self.self_ref.upgrade().ok_or(SystemError::ENOENT)?)
     }
 
     #[inline]

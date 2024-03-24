@@ -168,19 +168,20 @@ pub fn getnstimeofday() -> TimeSpec {
         tv_nsec: 0,
         tv_sec: 0,
     };
+    let nsecs;
     loop {
         match timekeeper().0.try_read_irqsave() {
             None => continue,
             Some(tk) => {
                 _xtime = tk.xtime;
                 drop(tk);
-                // nsecs = timekeeper().tk_get_ns();
+                nsecs = timekeeper().tk_get_ns();
                 // TODO 不同架构可能需要加上不同的偏移量
                 break;
             }
         }
     }
-    // xtime.tv_nsec += nsecs as i64;
+    _xtime.tv_nsec += nsecs as i64;
     let sec = __ADDED_SEC.load(Ordering::SeqCst);
     _xtime.tv_sec += sec;
     while _xtime.tv_nsec >= NSEC_PER_SEC.into() {
@@ -224,8 +225,8 @@ pub fn timekeeping_init() {
     let mut timekeeper = timekeeper().0.write_irqsave();
     timekeeper.xtime.tv_nsec = ktime_get_real_ns();
 
-     //参考https://elixir.bootlin.com/linux/v4.4/source/kernel/time/timekeeping.c#L1251 对wtm进行初始化
-     (
+    //参考https://elixir.bootlin.com/linux/v4.4/source/kernel/time/timekeeping.c#L1251 对wtm进行初始化
+    (
         timekeeper.wall_to_monotonic.tv_nsec,
         timekeeper.wall_to_monotonic.tv_sec,
     ) = (-timekeeper.xtime.tv_nsec, -timekeeper.xtime.tv_sec);

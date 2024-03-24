@@ -140,9 +140,10 @@ impl Timekeeper {
         let clock = timekeeper.clock.clone().unwrap();
         drop(timekeeper);
         let clock_now = clock.read();
-        let clcok_data = clock.clocksource_data();
-        let clock_delta = clock_now.div(clcok_data.watchdog_last).data() & clcok_data.mask.bits();
-        return clocksource_cyc2ns(CycleNum(clock_delta), clcok_data.mult, clcok_data.shift);
+        let clock_data = clock.clocksource_data();
+        let clock_delta = clock_now.div(clock_data.watchdog_last).data() & clock_data.mask.bits();
+        // clock_shift的值错误导致时间流逝速度异常，+5为临时修改以确保系统正常运作，目前追踪到的设置在DragonOS-dev/blob/fix_time/kernel/src/time/jiffies.rs#L18，但是修改无效
+        return clocksource_cyc2ns(CycleNum(clock_delta), clock_data.mult, clock_data.shift + 5);
     }
 }
 pub fn timekeeper() -> &'static Timekeeper {
@@ -163,12 +164,11 @@ pub fn timekeeper_init() {
 pub fn getnstimeofday() -> TimeSpec {
     // kdebug!("enter getnstimeofday");
 
-    // let mut nsecs: u64 = 0;0
+    let nsecs;
     let mut _xtime = TimeSpec {
         tv_nsec: 0,
         tv_sec: 0,
     };
-    let nsecs;
     loop {
         match timekeeper().0.try_read_irqsave() {
             None => continue,
@@ -182,8 +182,8 @@ pub fn getnstimeofday() -> TimeSpec {
         }
     }
     _xtime.tv_nsec += nsecs as i64;
-    let sec = __ADDED_SEC.load(Ordering::SeqCst);
-    _xtime.tv_sec += sec;
+    // let sec = __ADDED_SEC.load(Ordering::SeqCst);
+    // _xtime.tv_sec += sec;
     while _xtime.tv_nsec >= NSEC_PER_SEC.into() {
         _xtime.tv_nsec -= NSEC_PER_SEC as i64;
         _xtime.tv_sec += 1;

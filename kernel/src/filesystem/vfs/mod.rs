@@ -482,7 +482,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
             path_stack.reverse();
             let mut ret = String::from("/");
             ret.push_str(&path_stack.join("/"));
-            return Ok(ret);
+            return Ok(clean_path(&ret));
         }
         return Ok(String::from("/"));
     }
@@ -545,15 +545,10 @@ impl dyn IndexNode {
             })
             .next()
         {
-            let root_inode = fs
-                .as_any_ref()
-                .downcast_ref::<MountFS>()
-                .unwrap()
-                .inner_filesystem()
-                .root_inode();
+            let root_inode = fs.root_inode();
             if let Ok(fscache) = fs.cache() {
                 let mut path_under = abs_path.strip_prefix(root_path).unwrap();
-                kdebug!("Path under FSroot: {:?}", path_under);
+                // kdebug!("Path under FSroot: {:?}", path_under);
                 if path_under.is_empty() {
                     return Ok(root_inode);
                 }

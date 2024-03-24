@@ -1,7 +1,0 @@
-[x] Rewrite lookup functions
-[ ] INode Factory
-[x] Enhance Usability
-[x] 设计哈希表读写锁，引进锁管理
-[ ] 换根过程细节
-
-Root inode query -> query cache -> lookup and cache uncached 

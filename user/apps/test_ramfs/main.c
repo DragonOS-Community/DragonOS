@@ -6,148 +6,89 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
+#include <sys/mount.h>
 
 #define MAX_PATH_LENGTH 100
 #define MAX_DIR_DEPTH 4
 
-void createDirectories() {
-    char* path;
-    int ret = 0;
-
-    for (int i = 0; i <= MAX_DIR_DEPTH && ret == 0; i++) {
-        path = malloc((4 + 4 * i) * sizeof(char));
-        strcpy(path, "/ram");
-
-        for (int j = 0; j < i; j++) {
-            strcpy(path + (4 * j + 4) * sizeof(char), "/dir");
-        }
-
-        printf("Making Dir with path: %s\n", path);
-
-        if (i != 0) {
-            ret = mkdir(path, S_IRWXU);
-        }
-
-        free(path);
-
-        if (i == 0) {
-            continue;
-        }
-
-        if (ret == 0) {
-            puts("Making success!");
-        } else {
-            printf("Making Failed! Error: %s", strerror(errno));
-            break;
-        }
-    }
-}
-
-void createAndWriteToFile() {
-    char* file_path = malloc((4 + 4 * MAX_DIR_DEPTH + 5) * sizeof(char));
-    strcpy(file_path, "/ram");
-
-    for (int j = 0; j < MAX_DIR_DEPTH; j++) {
-        strcpy(file_path + (4 * j + 4) * sizeof(char), "/dir");
-    }
-
-    strcpy(file_path + (4 * MAX_DIR_DEPTH + 4) * sizeof(char), "/test");
-
-    int fd = open(file_path, O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR);
-
-    if (fd == -1) {
-        printf("Failed to open file for writing! Error: %s\n", strerror(errno));
-        free(file_path);
-        return;
-    }
-
-    const char* content = "Hello, World!";
-    ssize_t bytes_written = write(fd, content, strlen(content));
-
-    if (bytes_written == -1) {
-        printf("Failed to write to file! Error: %s\n", strerror(errno));
-        close(fd);
-        free(file_path);
-        return;
-    }
-
-    close(fd);
-    free(file_path);
-}
-
-void readAndDeleteFile() {
-    char* file_path = malloc((4 + 4 * MAX_DIR_DEPTH + 5) * sizeof(char));
-    strcpy(file_path, "/ram");
-
-    for (int j = 0; j < MAX_DIR_DEPTH; j++) {
-        strcpy(file_path + (4 * j + 4) * sizeof(char), "/dir");
-    }
-
-    strcpy(file_path + (4 * MAX_DIR_DEPTH + 4) * sizeof(char), "/test");
-
-    int fd = open(file_path, O_RDONLY);
-
-    if (fd == -1) {
-        printf("Failed to open file for reading! Error: %s\n", strerror(errno));
-        free(file_path);
-        return;
-    }
-
-    char buffer[MAX_PATH_LENGTH];
-    ssize_t bytes_read = read(fd, buffer, sizeof(buffer) - 1);
-
-    if (bytes_read == -1) {
-        printf("Failed to read from file! Error: %s\n", strerror(errno));
-        close(fd);
-        free(file_path);
-        return;
-    }
-
-    buffer[bytes_read] = '\0';
-    printf("Read from file: %s\n", buffer);
-
-    close(fd);
-
-    if (remove(file_path) == -1) {
-        printf("Failed to delete file! Error: %s\n", strerror(errno));
-        free(file_path);
-        return;
-    }
-
-    free(file_path);
-}
-
-void removeDirectories() {
-    char* path;
-    int ret = 0;
-
-    for (int i = MAX_DIR_DEPTH; i > 0 && ret == 0; i--) {
-        path = malloc((4 + 4 * i) * sizeof(char));
-        strcpy(path, "/ram");
-
-        for (int j = 0; j < i; j++) {
-            strcpy(path + (4 * j + 4) * sizeof(char), "/dir");
-        }
-
-        printf("Remove Dir with path: %s\n", path);
-
-        ret = rmdir(path);
-        free(path);
-
-        if (ret == 0) {
-            puts("Remove success!");
-        } else {
-            printf("Remove Failed! Error: %s", strerror(errno));
-            break;
-        }
-    }
-}
 
 int main(int argc, char const* argv[]) {
-    createDirectories();
-    createAndWriteToFile();
-    readAndDeleteFile();
-    // removeDirectories();
+    char ramfs_path[MAX_PATH_LENGTH] = "/some/ramfs";
+    char another_ramfs_path[MAX_PATH_LENGTH] = "/some/ramfs/some/another";
+
+    if (mkdir("/some", 0777) == -1) {
+        perror("Failed to create directory under /some");
+        return 1;
+    }
+
+    // Create a directory under /some/ramfs
+    if (mkdir("/some/ramfs", 0777) == -1) {
+        perror("Failed to create directory under /some/ramfs");
+        return 1;
+    }
+
+    // Mount the first ramfs at /some/ramfs
+    if (mount("", ramfs_path, "ramfs", 0, NULL) == -1) {
+        perror("Failed to mount ramfs at /some/ramfs");
+        return 1;
+    }
+
+    if (mkdir("/some/ramfs/some", 0777) == -1) {
+        perror("Failed to create directory under /some/ramfs/some");
+        return 1;
+    }
+
+    // Create a directory under /some/ramfs/some/another
+    if (mkdir("/some/ramfs/some/another", 0777) == -1) {
+        perror("Failed to create directory under /some/ramfs/some/another");
+        return 1;
+    }
+
+    // Mount the second ramfs at /some/ramfs/some/another
+    if (mount("", another_ramfs_path, "ramfs", 0, NULL) == -1) {
+        perror("Failed to mount ramfs at /some/ramfs/some/another");
+        return 1;
+    }
+
+
+    // Write files under /some/ramfs and /some/ramfs/some/another
+    FILE* file1 = fopen("/some/ramfs/file1.txt", "w");
+    if (file1 == NULL) {
+        perror("Failed to open /some/ramfs/file1.txt");
+        return 1;
+    }
+    fprintf(file1, "This is file1.txt\n");
+    fclose(file1);
+
+    FILE* file2 = fopen("/some/ramfs/some/another/file2.txt", "w");
+    if (file2 == NULL) {
+        perror("Failed to open /some/ramfs/some/another/file2.txt");
+        return 1;
+    }
+    fprintf(file2, "This is file2.txt\n");
+    fclose(file2);
+
+    // Delete files under /some/ramfs and /some/ramfs/some/another
+    if (unlink("/some/ramfs/file1.txt") == -1) {
+        perror("Failed to delete /some/ramfs/file1.txt");
+        return 1;
+    }
+
+    if (unlink("/some/ramfs/some/another/file2.txt") == -1) {
+        perror("Failed to delete /some/ramfs/some/another/file2.txt");
+        return 1;
+    }
+
+    // Remove directories under /some/ramfs and /some/ramfs/some/another
+    if (rmdir(another_ramfs_path) == -1) {
+        perror("Failed to remove directory under /some/ramfs/some/another");
+        return 1;
+    }
+    if (rmdir(ramfs_path) == -1) {
+        perror("Failed to remove directory under /some/ramfs");
+        return 1;
+    }
+
 
     return 0;
 }

@@ -70,9 +70,6 @@ pub fn vfs_init() -> Result<(), SystemError> {
     root_inode
         .create("sys", FileType::Dir, ModeType::from_bits_truncate(0o755))
         .expect("Failed to create /sys");
-    root_inode
-        .create("ram", FileType::Dir, ModeType::from_bits_truncate(0o755))
-        .expect("Failed to create /ram");
     kdebug!("dir in root:{:?}", root_inode.list());
 
     procfs_init().expect("Failed to initialize procfs");
@@ -128,8 +125,6 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     let dev: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
     let binding = ROOT_INODE().find("sys").expect("SysFs not mounted!").fs();
     let sys: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
-    let binding = ROOT_INODE().find("ram").expect("SysFs not mounted!").fs();
-    let ram: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
 
     let new_fs = MountFS::new(new_fs, None);
     // 获取新的根文件系统的根节点的引用
@@ -145,7 +140,6 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
         do_migrate(ROOT_INODE(), "proc", proc)?;
         do_migrate(ROOT_INODE(), "dev", dev)?;
         do_migrate(ROOT_INODE(), "sys", sys)?;
-        do_migrate(ROOT_INODE(), "ram", ram)?;
 
         // drop旧的Root inode
         drop(old_root_inode);
@@ -292,6 +286,6 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<usize, SystemError> {
     ROOT_INODE()
         .lookup_follow_symlink(mount_point, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
-        .mount(fs)?;
+        .mount(fs.clone())?;
     Ok(0)
 }

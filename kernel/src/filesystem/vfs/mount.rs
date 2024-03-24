@@ -450,7 +450,17 @@ impl IndexNode for MountFSInode {
 
     #[inline]
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.find("..")
+        if self.is_mountpoint_root()? {
+            match &self.mount_fs.self_mountpoint {
+                Some(inode) => {
+                    return inode.parent();
+                }
+                None => {
+                    return Ok(self.self_ref.upgrade().unwrap());
+                }
+            }
+        }
+        return self.inner_inode.parent();
     }
 
     #[inline]

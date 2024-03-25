@@ -16,7 +16,7 @@ use crate::{
     driver::base::{
         block::block_device::BlockDevice, char::CharDevice, device::device_number::DeviceNumber,
     },
-    filesystem::vfs::mount::MOUNTS_LIST,
+    filesystem::vfs::mount::{MountFSInode, MOUNTS_LIST},
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
     time::TimeSpec,
@@ -474,7 +474,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
             }
         }
         path_stack.reverse();
-        let mut path = PathBuf::new();
+        let mut path = PathBuf::from("/");
         path.extend(path_stack);
         return Ok(path);
     }
@@ -515,14 +515,8 @@ impl dyn IndexNode {
         path: &Path,
         max_follow_times: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        // kdebug!("Looking for path {:?}", path);
         // 拼接绝对路径
-        // let abs_path = if is_absolute(path)
-        //     || self.metadata()?.inode_id == ROOT_INODE().metadata()?.inode_id
-        // {
-        //     clean_path(path)
-        // } else {
-        //     self._abs_path()? + &clean_path(path)
-        // };
         let abs_path = if path.is_absolute() {
             path.clean()
         } else {
@@ -543,36 +537,40 @@ impl dyn IndexNode {
             })
             .next()
         {
-            let root_inode = fs.root_inode();
-            if let Ok(fscache) = fs.cache() {
-                let path_under = path.strip_prefix(root_path).unwrap();
-                // kdebug!("Path under FSroot: {:?}", path_under);
-                if path_under.iter().next().is_none() {
-                    return Ok(root_inode);
-                }
+            if let Some(fs) = fs.as_any_ref().downcast_ref::<MountFS>() {
+                let root_inode = fs.mountpoint_root_inode().find(".")?;
+                // kdebug!("FS: {:?}", fs);
+                // kdebug!("Root Node: {:?}", root_inode);
 
-                // Cache record is found
-                if let Some((inode, found_path)) = root_inode.quick_lookup(fscache, path_under) {
-                    // kdebug!("Found path: {:?}", found_path);
-                    let rest_path = path_under.strip_prefix(found_path).unwrap();
-                    // kdebug!("Rest path {:?}", rest_path);
-                    // no path left
-                    if rest_path.iter().next().is_none() {
-                        return Ok(inode);
+                if let Ok(fscache) = fs.cache() {
+                    let path_under = path.strip_prefix(root_path).unwrap();
+                    if path_under.iter().next().is_none() {
+                        return Ok(root_inode);
                     }
 
-                    // some path left, pop prefix '/'
-                    return inode.lookup_walk(rest_path, max_follow_times);
+                    // Cache record is found
+                    if let Some((inode, found_path)) = root_inode.quick_lookup(fscache, &abs_path, root_path) {
+                        // kdebug!("Found path: {:?}", found_path);
+                        let rest_path = abs_path.strip_prefix(found_path).unwrap();
+                        // kdebug!("Rest path {:?}", rest_path);
+                        // no path left
+                        if rest_path.iter().next().is_none() {
+                            return Ok(inode);
+                        }
+    
+                        // some path left, pop prefix '/'
+                        return inode.lookup_walk(rest_path, max_follow_times);
+                    }
+                    // kdebug!("Start lookup walk");
+                    // Cache record not found
+                    return root_inode.lookup_walk(path_under, max_follow_times);
                 }
-                // kdebug!("Start lookup walk");
-                // Cache record not found
-                return root_inode.lookup_walk(path_under, max_follow_times);
+    
+                // 在对应文件系统根开始lookup
+                return fs
+                    .root_inode()
+                    ._lookup_follow_symlink(path.as_os_str(), max_follow_times);
             }
-
-            // 在对应文件系统根开始lookup
-            return fs
-                .root_inode()
-                ._lookup_follow_symlink(path.as_os_str(), max_follow_times);
         }
 
         // Exception Normal lookup, for non-cache fs
@@ -655,12 +653,12 @@ impl dyn IndexNode {
         rest_path: &Path,
         max_follow_times: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        // kdebug!("walking though {}", rest_path);
+        // kdebug!("walking though {:?}", rest_path);
         if self.metadata()?.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
         let child = rest_path.iter().next().unwrap();
-        // kdebug!("At {:?}, rest {:?}", child, left_path);
+        // kdebug!("Lookup {:?}", child);
         match self.find(child) {
             Ok(child_node) => {
                 if child_node.metadata()?.file_type == FileType::SymLink && max_follow_times > 0 {
@@ -674,11 +672,12 @@ impl dyn IndexNode {
                 // 潜在优化可能：重复的文件系统缓存获取
                 if let Ok(cache) = self.fs().cache() {
                     // kdebug!("Calling cache put with child {}", child);
-                    cache.put(child, Arc::downgrade(&child_node));
+                    cache.put(child, child_node.clone());
                 }
 
                 if let Ok(rest) = rest_path.strip_prefix(child) {
                     if rest.iter().next().is_some() {
+                        // kdebug!("Rest {:?}", rest);
                         return child_node.lookup_walk(rest, max_follow_times);
                     }
                 }
@@ -713,21 +712,23 @@ impl dyn IndexNode {
         &'a self,
         cache: Arc<DefaultCache>,
         abs_path: &'a Path,
+        stop_path: &'a Path,
     ) -> Option<(Arc<dyn IndexNode>, &Path)> {
-        self._quick_lookup(cache, abs_path, abs_path)
+        self._quick_lookup(cache, abs_path, abs_path, stop_path)
     }
-    
+
     fn _quick_lookup<'a>(
         &'a self,
         cache: Arc<DefaultCache>,
         abs_path: &'a Path,
         rest_path: &'a Path,
+        stop_path: &'a Path,
     ) -> Option<(Arc<dyn IndexNode>, &Path)> {
-        // let (key, left_rest) = rsplit_path(abs_path);
+        // kdebug!("Quick lookup: abs {:?}, rest {:?}", abs_path, rest_path);
         let key = abs_path.file_name();
 
         let result = cache.get(key.unwrap()).find(|src| {
-            // kdebug!("Src: {:?}, {:?}; Lookup: {}, {}", src.key(), src._abs_path(), key, abs_path);
+            // kdebug!("Src: {:?}, {:?}; Lookup: {:?}, {:?}", src.key(), src._abs_path(), key, abs_path);
             src._abs_path().unwrap() == abs_path
         });
 
@@ -737,9 +738,16 @@ impl dyn IndexNode {
         }
 
         if let Some(parent) = rest_path.parent() {
-            return self._quick_lookup(cache, abs_path, parent);
+            if parent == stop_path {
+                return None;
+            }
+            return self._quick_lookup(cache, abs_path, parent, stop_path);
         }
         return None;
+    }
+
+    fn self_ref(&self) -> Arc<dyn IndexNode> {
+        self.find(".").unwrap()
     }
 
 }
@@ -817,7 +825,7 @@ impl Default for Metadata {
 
 /// @brief 所有文件系统都应该实现的trait
 pub trait FileSystem: Any + Sync + Send + Debug {
-    /// @brief 获取当前文件系统的root inode的指针
+    /// @brief 获取当前（self所指）文件系统的root inode的指针，默认为MountFS
     fn root_inode(&self) -> Arc<dyn IndexNode>;
 
     /// @brief 获取当前文件系统的信息

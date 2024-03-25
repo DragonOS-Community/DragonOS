@@ -8,6 +8,7 @@ use alloc::{
     string::String,
     sync::{Arc, Weak},
 };
+use path_base::{clean_path::Clean, Path, PathBuf};
 use system_error::SystemError;
 
 use crate::{driver::base::device::device_number::DeviceNumber, libs::spinlock::SpinLock};
@@ -19,39 +20,28 @@ use super::{
 static mut __MOUNTS_LIST: Option<Arc<SpinLock<BTreeMap<MountPath, Arc<dyn FileSystem>>>>> = None;
 
 #[derive(PartialEq, Eq, Debug)]
-pub struct MountPath {
-    path: String,
-    depth: usize,
-}
+pub struct MountPath (PathBuf);
 
 impl From<&str> for MountPath {
     fn from(value: &str) -> Self {
-        if value == "/" {
-            return Self {
-                path: String::from(value),
-                depth: 0,
-            };
-        }
-        let depth = value.chars().filter(|&c| c == '/').count();
-        Self {
-            path: String::from(value),
-            depth,
-        }
+        Self(PathBuf::from(value).clean())
     }
 }
 
-impl AsRef<str> for MountPath {
-    fn as_ref(&self) -> &str {
-        &self.path
+impl AsRef<Path> for MountPath {
+    fn as_ref(&self) -> &Path {
+        &self.0
     }
 }
 
 impl PartialOrd for MountPath {
     fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        if self.depth == other.depth {
-            Some(self.path.cmp(&other.path))
+        let self_dep = self.0.components().count();
+        let othe_dep = other.0.components().count();
+        if self_dep == othe_dep {
+            Some(self.0.cmp(&other.0))
         } else {
-            other.depth.partial_cmp(&self.depth)
+            othe_dep.partial_cmp(&self_dep)
         }
     }
 }
@@ -187,7 +177,7 @@ impl MountFSInode {
     /// 如果当前inode在父MountFS内，但不是挂载点，那么说明在这里不需要进行inode替换，因此直接返回当前inode。
     ///
     /// @return Arc<MountFSInode>
-    fn overlaid_inode(&self) -> Arc<MountFSInode> {
+    pub fn overlaid_inode(&self) -> Arc<MountFSInode> {
         let inode_id = self.metadata().unwrap().inode_id;
 
         if let Some(sub_mountfs) = self.mount_fs.mountpoints.lock().get(&inode_id) {
@@ -280,7 +270,6 @@ impl IndexNode for MountFSInode {
         file_type: FileType,
         mode: ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        kdebug!("Creating {:?} at {:?}", name, self.key());
         return Ok(MountFSInode {
             inner_inode: self.inner_inode.create(name, file_type, mode)?,
             mount_fs: self.mount_fs.clone(),
@@ -415,7 +404,8 @@ impl IndexNode for MountFSInode {
             .mountpoints
             .lock()
             .insert(metadata.inode_id, new_mount_fs.clone());
-        kdebug!("My path: {:?}", self._abs_path());
+        kdebug!("Mount Path: {:?}", self._abs_path()?.to_str().unwrap());
+        kdebug!("Mount FS: {:?}", new_mount_fs);
         MOUNTS_LIST().lock().insert(
             MountPath::from(self._abs_path()?.to_str().unwrap()),
             new_mount_fs.clone(),
@@ -471,11 +461,17 @@ impl IndexNode for MountFSInode {
 
 impl FileSystem for MountFS {
     fn root_inode(&self) -> Arc<dyn IndexNode> {
-        match &self.self_mountpoint {
-            Some(inode) => return inode.mount_fs.root_inode(),
+        return match &self.self_mountpoint {
+            Some(inode) => {
+                kdebug!("Mount point at {:?}", inode._abs_path());
+                inode.mount_fs.root_inode()
+            },
             // 当前文件系统是rootfs
-            None => self.mountpoint_root_inode(),
-        }
+            None => {
+                kdebug!("Root fs");
+                self.mountpoint_root_inode()
+            },
+        };
     }
 
     fn info(&self) -> super::FsInfo {

@@ -23,8 +23,7 @@ use crate::{
 };
 
 use super::{
-    file::FileMode,
-    utils::{rsplit_path, user_path_at},
+    file::FileMode, utils::user_path_at,
     IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
@@ -192,26 +191,49 @@ pub fn do_mkdir(path: &Path, _mode: FileMode) -> Result<u64, SystemError> {
 
     let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
 
-    if let Err(errno) = inode {
-        // 文件不存在，且需要创建
-        if errno == SystemError::ENOENT {
-            let file_name = path.file_name().unwrap();
-            let parent_path = path.parent();
-            // 查找父目录
-            let parent_inode: Arc<dyn IndexNode> =
+    // if let Err(errno) = inode {
+    //     // 文件不存在，且需要创建
+    //     if errno == SystemError::ENOENT {
+    //         let file_name = path.file_name().unwrap();
+    //         let parent_path = path.parent();
+    //         // 查找父目录
+    //         let parent_inode: Arc<dyn IndexNode> =
+    //         ROOT_INODE().lookup(parent_path.unwrap_or(Path::new("/")))?;
+    //         // 创建文件夹
+    //         let _create_inode: Arc<dyn IndexNode> = parent_inode.create(
+    //             file_name,
+    //             FileType::Dir,
+    //             ModeType::from_bits_truncate(0o755),
+    //         )?;
+    //     } else {
+    //         // 不需要创建文件，因此返回错误码
+    //         return Err(errno);
+    //     }
+    // }
+    // 
+    // return Ok(0);
+    match inode {
+        Ok(node) => {
+            kdebug!("Found {:?}", node._abs_path());
+        },
+        Err(errno) => {
+            if errno == SystemError::ENOENT {
+                let file_name = path.file_name().unwrap();
+                let parent_path = path.parent();
+                // 查找父目录
+                let parent_inode: Arc<dyn IndexNode> =
                 ROOT_INODE().lookup(parent_path.unwrap_or(Path::new("/")))?;
-            // 创建文件夹
-            let _create_inode: Arc<dyn IndexNode> = parent_inode.create(
-                file_name,
-                FileType::Dir,
-                ModeType::from_bits_truncate(0o755),
-            )?;
-        } else {
-            // 不需要创建文件，因此返回错误码
-            return Err(errno);
+                // 创建文件夹
+                let _create_inode: Arc<dyn IndexNode> = parent_inode.create(
+                    file_name,
+                    FileType::Dir,
+                    ModeType::from_bits_truncate(0o755),
+                )?;
+            } else {
+                return Err(errno);
+            }
         }
     }
-
     return Ok(0);
 }
 

@@ -4,10 +4,7 @@ use alloc::{
     vec::Vec,
 };
 use core::{
-    hash::{Hash, Hasher, SipHasher},
-    marker::PhantomData,
-    mem::size_of,
-    sync::atomic::{AtomicUsize, Ordering},
+    hash::{Hash, Hasher, SipHasher}, marker::PhantomData, mem::{size_of, swap}, sync::atomic::{AtomicUsize, Ordering}
 };
 
 use crate::libs::{
@@ -16,42 +13,39 @@ use crate::libs::{
 };
 
 use super::IndexNode;
-type Resource = Weak<dyn IndexNode>;
-type SrcPtr = Weak<Resource>;
-type SrcManage = Arc<Resource>;
+type Resource = Arc<dyn IndexNode>;
+// type SrcPtr = Weak<Resource>;
+// type SrcManage = Arc<Resource>;
 
 // not thread safe
 pub struct SrcIter<'a> {
     idx: usize,
-    vec: Option<RwLockUpgradableGuard<'a, VecDeque<SrcPtr>>>,
+    vec: Option<RwLockUpgradableGuard<'a, VecDeque<Weak<dyn IndexNode>>>>,
 }
 
 impl<'a> Iterator for SrcIter<'a> {
     type Item = Arc<dyn IndexNode>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let vec_here = core::mem::take(&mut self.vec);
+        let mut vec_here = None;
+        swap(&mut vec_here, &mut self.vec);
+        // let vec_here = core::mem::take(&mut self.vec);
         let mut vec_cur = vec_here.unwrap();
-
-        // kdebug!("Index {}, len {}", self.idx, vec_cur.len());
-        // kdebug!("Vec {:?}", vec_cur.iter().collect::<Vec<_>>());
 
         // 自动删除空节点
         let result = loop {
             if vec_cur.len() <= self.idx {
                 break None;
             }
-            if let Some(c1) = vec_cur[self.idx].upgrade() {
-                if let Some(c2) = c1.upgrade() {
-                    break Some(c2);
-                }
+            if let Some(ptr) = vec_cur[self.idx].upgrade() {
+                break Some(ptr);
             }
             let mut writer = vec_cur.upgrade();
             writer.remove(self.idx);
             vec_cur = writer.downgrade_to_upgradeable();
         };
 
-        self.vec = Some(vec_cur);
+        self.vec.replace(vec_cur);
         self.idx += 1;
 
         result
@@ -61,7 +55,7 @@ impl<'a> Iterator for SrcIter<'a> {
 #[derive(Debug)]
 struct HashTable<H: Hasher + Default> {
     _hash_type: PhantomData<H>,
-    table: Vec<RwLock<VecDeque<SrcPtr>>>,
+    table: Vec<RwLock<VecDeque<Weak<dyn IndexNode>>>>,
 }
 
 impl<H: Hasher + Default> HashTable<H> {
@@ -89,7 +83,7 @@ impl<H: Hasher + Default> HashTable<H> {
         }
     }
     /// 插入索引
-    fn put(&self, key: &str, src: SrcPtr) {
+    fn put(&self, key: &str, src: Weak<dyn IndexNode>) {
         let mut guard = self.table[self._position(key)].write();
         guard.push_back(src);
     }
@@ -97,7 +91,7 @@ impl<H: Hasher + Default> HashTable<H> {
 
 #[derive(Debug)]
 struct LruList {
-    list: LinkedList<SrcManage>,
+    list: LinkedList<Resource>,
 }
 
 impl LruList {
@@ -107,20 +101,21 @@ impl LruList {
         }
     }
 
-    fn push(&mut self, src: Resource) -> SrcPtr {
-        let to_put = Arc::new(src);
-        self.list.push_back(to_put.clone());
-        Arc::downgrade(&to_put)
+    fn push(&mut self, src: Resource) {
+        self.list.push_back(src);
+        // kdebug!("List: {:?}", self.list.iter().map(|item| item.clone().upgrade()).collect::<Vec<_>>());
+        // Arc::downgrade(&to_put)
     }
 
     fn clean(&mut self) -> usize {
+        kdebug!("Called clean.");
         if self.list.is_empty() {
             return 0;
         }
         self.list
             .extract_if(|src| {
                 // 原始指针已被销毁
-                if src.upgrade().is_none() {
+                if Arc::strong_count(&src) < 2 {
                     return true;
                 }
                 false
@@ -128,24 +123,25 @@ impl LruList {
             .count()
     }
 
-    fn release(&mut self) -> usize {
-        if self.list.is_empty() {
-            return 0;
-        }
-        self.list
-            .extract_if(|src| {
-                // 原始指针已被销毁
-                if src.upgrade().is_none() {
-                    return true;
-                }
-                // 已无外界在使用该文件
-                if src.strong_count() < 2 {
-                    return true;
-                }
-                false
-            })
-            .count()
-    }
+    // fn release(&mut self) -> usize {
+    //     kdebug!("Called release.");
+    //     if self.list.is_empty() {
+    //         return 0;
+    //     }
+    //     self.list
+    //         .extract_if(|src| {
+    //             // 原始指针已被销毁
+    //             if src.upgrade().is_none() {
+    //                 return true;
+    //             }
+    //             // 已无外界在使用该文件
+    //             if src.strong_count() < 2 {
+    //                 return true;
+    //             }
+    //             false
+    //         })
+    //         .count()
+    // }
 }
 
 /// Directory Cache 的默认实现
@@ -166,7 +162,7 @@ impl<H: Hasher + Default> DefaultCache<H> {
     const DEFAULT_MEMORY_SIZE: usize = 1024 /* K */ * 1024 /* Byte */;
     pub fn new(mem_size: Option<usize>) -> Self {
         let mem_size = mem_size.unwrap_or(Self::DEFAULT_MEMORY_SIZE);
-        let max_size = mem_size / (2 * size_of::<SrcPtr>() + size_of::<SrcManage>());
+        let max_size = mem_size / (2 * size_of::<Arc<dyn IndexNode>>() + size_of::<Weak<dyn IndexNode>>());
         let hash_table_size = max_size / 7 * 10 /* 0.7 */;
         Self {
             table: HashTable::new(hash_table_size),
@@ -191,9 +187,11 @@ impl<H: Hasher + Default> DefaultCache<H> {
             }
             key => {
                 // kdebug!("Cache with key {}.", key);
-                self.table.put(key, self.deque.lock().push(src));
+                self.table.put(key, Arc::downgrade(&src));
+                self.deque.lock().push(src);
                 self.size.fetch_add(1, Ordering::Acquire);
                 if self.size.load(Ordering::Acquire) >= self.max_size.load(Ordering::Acquire) {
+                    kdebug!("Automately clean.");
                     self.clean();
                 }
             }
@@ -213,13 +211,13 @@ impl<H: Hasher + Default> DefaultCache<H> {
         ret
     }
 
-    /// 释放未在使用的目录项与清除已删除的目录项（未测试）
-    pub fn release(&self) -> usize {
-        let ret = self.deque.lock().release();
-        self.size.fetch_sub(ret, Ordering::Acquire);
-        kdebug!("Release {} empty entry", ret);
-        ret
-    }
+    // /// 释放未在使用的目录项与清除已删除的目录项（未测试）
+    // pub fn release(&self) -> usize {
+    //     let ret = self.deque.lock().release();
+    //     self.size.fetch_sub(ret, Ordering::Acquire);
+    //     kdebug!("Release {} empty entry", ret);
+    //     ret
+    // }
 }
 
 impl<H: Hasher + Default> core::fmt::Debug for DefaultCache<H> {

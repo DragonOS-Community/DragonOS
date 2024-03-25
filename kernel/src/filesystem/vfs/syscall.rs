@@ -634,7 +634,8 @@ impl Syscall {
         let proc = ProcessManager::current_pcb();
         // Copy path to kernel space to avoid some security issues
         let path = PathBuf::from(check_and_clone_cstr(path, Some(MAX_PATHLEN))?);
-        path.clean();
+        // path = path.clean();
+        // kdebug!("chdir {:?}", path);
         let inode =
             match ROOT_INODE().lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
                 Err(_) => {

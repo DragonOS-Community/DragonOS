@@ -20,14 +20,10 @@ use crate::{
     exception::InterruptArch,
     kerror, kwarn,
     libs::spinlock::SpinLockGuard,
-    mm::{
-        percpu::{PerCpu, PerCpuVar},
-        VirtAddr,
-    },
+    mm::VirtAddr,
     process::{
         fork::{CloneFlags, KernelCloneArgs},
-        KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager, SwitchResult,
-        SWITCH_RESULT,
+        KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager, PROCESS_SWITCH_RESULT,
     },
     syscall::Syscall,
 };
@@ -257,8 +253,8 @@ impl ArchPCBInfo {
             cr2: self.cr2,
             fsbase: self.fsbase,
             gsbase: self.gsbase,
-            fs: self.fs.clone(),
-            gs: self.gs.clone(),
+            fs: self.fs,
+            gs: self.gs,
             gsdata: self.gsdata.clone(),
             fp_state: self.fp_state,
         }
@@ -299,16 +295,7 @@ impl ProcessControlBlock {
 
 impl ProcessManager {
     pub fn arch_init() {
-        {
-            // 初始化进程切换结果 per cpu变量
-            let mut switch_res_vec: Vec<SwitchResult> = Vec::new();
-            for _ in 0..PerCpu::MAX_CPU_NUM {
-                switch_res_vec.push(SwitchResult::new());
-            }
-            unsafe {
-                SWITCH_RESULT = Some(PerCpuVar::new(switch_res_vec).unwrap());
-            }
-        }
+        // do nothing
     }
     /// fork的过程中复制线程
     ///
@@ -320,7 +307,7 @@ impl ProcessManager {
         current_trapframe: &TrapFrame,
     ) -> Result<(), SystemError> {
         let clone_flags = clone_args.flags;
-        let mut child_trapframe = current_trapframe.clone();
+        let mut child_trapframe = *current_trapframe;
 
         // 子进程的返回值为0
         child_trapframe.set_return_value(0);
@@ -351,7 +338,7 @@ impl ProcessManager {
         new_arch_guard.gsbase = current_arch_guard.gsbase;
         new_arch_guard.fs = current_arch_guard.fs;
         new_arch_guard.gs = current_arch_guard.gs;
-        new_arch_guard.fp_state = current_arch_guard.fp_state.clone();
+        new_arch_guard.fp_state = current_arch_guard.fp_state;
 
         // 拷贝浮点寄存器的状态
         if let Some(fp_state) = current_arch_guard.fp_state.as_ref() {
@@ -383,7 +370,7 @@ impl ProcessManager {
     /// - `prev`：上一个进程的pcb
     /// - `next`：下一个进程的pcb
     pub unsafe fn switch_process(prev: Arc<ProcessControlBlock>, next: Arc<ProcessControlBlock>) {
-        assert!(CurrentIrqArch::is_irq_enabled() == false);
+        assert!(!CurrentIrqArch::is_irq_enabled());
 
         // 保存浮点寄存器
         prev.arch_info_irqsave().save_fp_state();
@@ -421,8 +408,8 @@ impl ProcessManager {
             x86::Ring::Ring0,
             next.kernel_stack().stack_max_address().data() as u64,
         );
-        SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
-        SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
+        PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
+        PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
         // kdebug!("switch tss ok");
         compiler_fence(Ordering::SeqCst);
         // 正式切换上下文

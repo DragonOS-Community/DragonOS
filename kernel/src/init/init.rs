@@ -30,7 +30,7 @@ use crate::{
 /// 前面可能会有一个架构相关的函数
 pub fn start_kernel() -> ! {
     // 进入内核后，中断应该是关闭的
-    assert_eq!(CurrentIrqArch::is_irq_enabled(), false);
+    assert!(!CurrentIrqArch::is_irq_enabled());
 
     do_start_kernel();
 

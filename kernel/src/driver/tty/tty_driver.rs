@@ -1,6 +1,10 @@
 use core::{fmt::Debug, sync::atomic::Ordering};
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use hashbrown::HashMap;
 use system_error::SystemError;
 
@@ -109,6 +113,7 @@ pub struct TtyDriver {
 }
 
 impl TtyDriver {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         count: u32,
         node_name: &'static str,
@@ -142,7 +147,7 @@ impl TtyDriver {
             .flags
             .contains(TtyDriverFlag::TTY_DRIVER_UNNUMBERED_NODE)
         {
-            return format!("{}", self.name);
+            return self.name.to_string();
         } else {
             return format!("{}{}", self.name, index + self.name_base);
         }
@@ -165,10 +170,7 @@ impl TtyDriver {
     #[inline]
     fn lockup_tty(&self, index: usize) -> Option<Arc<TtyCore>> {
         let device_guard = self.ttys.lock();
-        return match device_guard.get(&index) {
-            Some(tty) => Some(tty.clone()),
-            None => None,
-        };
+        return device_guard.get(&index).cloned();
     }
 
     fn standard_install(&self, tty_core: Arc<TtyCore>) -> Result<(), SystemError> {
@@ -178,7 +180,7 @@ impl TtyDriver {
         if !self.flags.contains(TtyDriverFlag::TTY_DRIVER_RESET_TERMIOS) {
             // 先查看是否有已经保存的termios
             if let Some(t) = self.saved_termios.get(tty_index) {
-                let mut termios = t.clone();
+                let mut termios = *t;
                 termios.line = self.init_termios.line;
                 tty.set_termios(termios);
             }
@@ -195,8 +197,7 @@ impl TtyDriver {
     fn driver_install_tty(driver: Arc<TtyDriver>, tty: Arc<TtyCore>) -> Result<(), SystemError> {
         let res = tty.install(driver.clone(), tty.clone());
 
-        if res.is_err() {
-            let err = res.unwrap_err();
+        if let Err(err) = res {
             if err == SystemError::ENOSYS {
                 return driver.standard_install(tty);
             } else {
@@ -236,10 +237,8 @@ impl TtyDriver {
                 // TODO: 暂时这么写，因为还没写TtyPort
                 if tty.core().port().is_none() {
                     kwarn!("{} port is None", tty.core().name());
-                } else {
-                    if tty.core().port().unwrap().state() == TtyPortState::KOPENED {
-                        return Err(SystemError::EBUSY);
-                    }
+                } else if tty.core().port().unwrap().state() == TtyPortState::KOPENED {
+                    return Err(SystemError::EBUSY);
                 }
 
                 tty.reopen()?;

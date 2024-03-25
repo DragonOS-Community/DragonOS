@@ -187,13 +187,13 @@ impl VirtualConsoleData {
             autowrap: Default::default(),
             cursor_visible: Default::default(),
             insert_mode: Default::default(),
-            private: Vt102_OP::EPecma,
+            private: Vt102_OP::Pecma,
             need_wrap: Default::default(),
             report_mouse: Default::default(),
             utf: Default::default(),
             utf_count: Default::default(),
             utf_char: Default::default(),
-            translate: TranslationMap::new(TranslationMapType::Lat1Map),
+            translate: TranslationMap::new(TranslationMapType::Lat1),
             npar: Default::default(),
             tab_stop: StaticBitmap::new(),
             par: [0; 16],
@@ -206,11 +206,11 @@ impl VirtualConsoleData {
     }
 
     pub(super) fn init(&mut self, rows: Option<usize>, cols: Option<usize>, clear: bool) {
-        if rows.is_some() {
-            self.rows = rows.unwrap();
+        if let Some(rows) = rows {
+            self.rows = rows;
         }
-        if cols.is_some() {
-            self.cols = cols.unwrap();
+        if let Some(cols) = cols {
+            self.cols = cols;
         }
 
         self.pos = self.cols * self.state.y + self.state.x;
@@ -263,7 +263,7 @@ impl VirtualConsoleData {
         self.need_wrap = false;
         self.report_mouse = 0;
         self.utf_count = 0;
-        self.translate = TranslationMap::new(TranslationMapType::Lat1Map);
+        self.translate = TranslationMap::new(TranslationMapType::Lat1);
         self.utf = true;
         self.pid = None;
         self.vc_state = VirtualConsoleState::ESnormal;
@@ -321,8 +321,8 @@ impl VirtualConsoleData {
         if self.utf && !self.display_ctrl {
             // utf模式并且不显示控制字符
             let (ret, rescan) = self.translate_unicode(*c);
-            if ret.is_some() {
-                *c = ret.unwrap();
+            if let Some(ret) = ret {
+                *c = ret;
             }
             return (ret, rescan);
         }
@@ -425,7 +425,7 @@ impl VirtualConsoleData {
     /// 但是有一些特殊的代码点是无效的或者保留给特定用途的。
     /// 这个函数的主要目的是将无效的 Unicode 代码点替换为 U+FFFD，即 Unicode 替代字符。
     fn sanitize_unicode(c: u32) -> u32 {
-        if (c >= 0xd800 && c <= 0xdfff) || c == 0xfffe || c == 0xffff {
+        if (0xd800..=0xdfff).contains(&c) || c == 0xfffe || c == 0xffff {
             return 0xfffd;
         }
         return c;
@@ -502,7 +502,7 @@ impl VirtualConsoleData {
         }
 
         let mut soft_cursor_guard = SOFTCURSOR_ORIGINAL.write_irqsave();
-        *soft_cursor_guard = Some(unsafe { VcCursor::from_bits_unchecked(i as u32) });
+        *soft_cursor_guard = Some(unsafe { VcCursor::from_bits_unchecked(i) });
 
         let soft_cursor = soft_cursor_guard.unwrap();
 
@@ -523,7 +523,7 @@ impl VirtualConsoleData {
 
         let _ =
             self.driver_funcs()
-                .con_putc(&self, i as u16, self.state.y as u32, self.state.x as u32);
+                .con_putc(self, i as u16, self.state.y as u32, self.state.x as u32);
     }
 
     pub fn hide_cursor(&mut self) {
@@ -538,7 +538,7 @@ impl VirtualConsoleData {
         if softcursor.is_some() {
             self.screen_buf[self.pos] = softcursor.unwrap().bits as u16;
             let _ = self.driver_funcs().con_putc(
-                &self,
+                self,
                 softcursor.unwrap().bits as u16,
                 self.state.y as u32,
                 self.state.x as u32,
@@ -560,12 +560,10 @@ impl VirtualConsoleData {
     fn gotoxy(&mut self, x: i32, y: i32) {
         if x < 0 {
             self.state.x = 0;
+        } else if x as usize >= self.cols {
+            self.state.x = self.cols - 1;
         } else {
-            if x as usize >= self.cols {
-                self.state.x = self.cols - 1;
-            } else {
-                self.state.x = x as usize;
-            }
+            self.state.x = x as usize;
         }
 
         let max_y;
@@ -579,9 +577,9 @@ impl VirtualConsoleData {
         }
 
         if y < min_y as i32 {
-            self.state.y = min_y as usize;
+            self.state.y = min_y;
         } else if y >= max_y as i32 {
-            self.state.y = max_y as usize;
+            self.state.y = max_y;
         } else {
             self.state.y = y as usize;
         }
@@ -635,7 +633,7 @@ impl VirtualConsoleData {
 
     /// ## 换行
     fn line_feed(&mut self) {
-        if self.state.y + 1 == self.bottom as usize {
+        if self.state.y + 1 == self.bottom {
             self.scroll(ScrollDir::Up, 1);
         } else if self.state.y < self.rows - 1 {
             self.state.y += 1;
@@ -661,7 +659,7 @@ impl VirtualConsoleData {
 
     /// ## 向上滚动虚拟终端的内容，或者将光标上移一行
     fn reverse_index(&mut self) {
-        if self.state.y == self.top as usize {
+        if self.state.y == self.top {
             self.scroll(ScrollDir::Down, 1);
         } else if self.state.y > 0 {
             self.state.y -= 1;
@@ -686,7 +684,7 @@ impl VirtualConsoleData {
     /// ## 设置当前vt的各项属性
     fn set_mode(&mut self, on_off: bool) {
         for i in 0..self.npar as usize {
-            if self.private == Vt102_OP::EPdec {
+            if self.private == Vt102_OP::Pdec {
                 match self.par[i] {
                     1 => {
                         todo!("kbd todo");
@@ -746,9 +744,9 @@ impl VirtualConsoleData {
             return;
         }
 
-        if c >= '0' && c <= '9' {
+        if c.is_ascii_digit() {
             self.par[self.npar as usize] *= 10;
-            self.par[self.npar as usize] += (c as u8 - '0' as u8) as u32;
+            self.par[self.npar as usize] += (c as u8 - b'0') as u32;
             return;
         }
 
@@ -761,19 +759,19 @@ impl VirtualConsoleData {
 
         match c {
             'h' => {
-                if self.private <= Vt102_OP::EPdec {
+                if self.private <= Vt102_OP::Pdec {
                     self.set_mode(true);
                 }
                 return;
             }
             'l' => {
-                if self.private <= Vt102_OP::EPdec {
+                if self.private <= Vt102_OP::Pdec {
                     self.set_mode(false);
                 }
                 return;
             }
             'c' => {
-                if self.private == Vt102_OP::EPdec {
+                if self.private == Vt102_OP::Pdec {
                     if self.par[0] != 0 {
                         self.cursor_type =
                             VcCursor::make_cursor(self.par[0], self.par[1], self.par[2])
@@ -784,7 +782,7 @@ impl VirtualConsoleData {
                 }
             }
             'm' => {
-                if self.private == Vt102_OP::EPdec {
+                if self.private == Vt102_OP::Pdec {
                     if self.par[0] != 0 {
                         self.complement_mask = (self.par[0] << 8 | self.par[1]) as u16;
                     } else {
@@ -794,7 +792,7 @@ impl VirtualConsoleData {
                 }
             }
             'n' => {
-                if self.private == Vt102_OP::EPecma {
+                if self.private == Vt102_OP::Pecma {
                     if self.par[0] == 5 {
                         send_to_default_serial8250_port("tty status report todo".as_bytes());
                         panic!();
@@ -808,8 +806,8 @@ impl VirtualConsoleData {
             _ => {}
         }
 
-        if self.private != Vt102_OP::EPecma {
-            self.private = Vt102_OP::EPecma;
+        if self.private != Vt102_OP::Pecma {
+            self.private = Vt102_OP::Pecma;
             return;
         }
 
@@ -930,7 +928,7 @@ impl VirtualConsoleData {
             }
             'g' => {
                 if self.par[0] == 0 && self.state.x < 256 {
-                    self.tab_stop.set(self.state.x as usize, true);
+                    self.tab_stop.set(self.state.x, true);
                 } else if self.par[0] == 3 {
                     self.tab_stop.set_all(false);
                 }
@@ -994,12 +992,12 @@ impl VirtualConsoleData {
 
                 1 => {
                     // 设置粗体
-                    self.state.intensity = VirtualConsoleIntensity::VciBold;
+                    self.state.intensity = VirtualConsoleIntensity::Bold;
                 }
 
                 2 => {
                     // 设置半亮度（半明显
-                    self.state.intensity = VirtualConsoleIntensity::VciHalfBright;
+                    self.state.intensity = VirtualConsoleIntensity::HalfBright;
                 }
 
                 3 => {
@@ -1041,7 +1039,7 @@ impl VirtualConsoleData {
 
                 22 => {
                     //  关闭粗体和半亮度，恢复正常亮度
-                    self.state.intensity = VirtualConsoleIntensity::VciNormal;
+                    self.state.intensity = VirtualConsoleIntensity::Normal;
                 }
 
                 23 => {
@@ -1068,8 +1066,7 @@ impl VirtualConsoleData {
                     // 设置前景色
                     let (idx, color) = self.t416_color(i);
                     i = idx;
-                    if color.is_some() {
-                        let color = color.unwrap();
+                    if let Some(color) = color {
                         let mut max = color.red.max(color.green);
                         max = max.max(color.blue);
 
@@ -1086,11 +1083,11 @@ impl VirtualConsoleData {
 
                         if hue == 7 && max <= 0x55 {
                             hue = 0;
-                            self.state.intensity = VirtualConsoleIntensity::VciBold;
+                            self.state.intensity = VirtualConsoleIntensity::Bold;
                         } else if max > 0xaa {
-                            self.state.intensity = VirtualConsoleIntensity::VciBold;
+                            self.state.intensity = VirtualConsoleIntensity::Bold;
                         } else {
-                            self.state.intensity = VirtualConsoleIntensity::VciNormal;
+                            self.state.intensity = VirtualConsoleIntensity::Normal;
                         }
 
                         self.state.color = (self.state.color & 0xf0) | hue;
@@ -1101,8 +1098,7 @@ impl VirtualConsoleData {
                     // 设置背景色
                     let (idx, color) = self.t416_color(i);
                     i = idx;
-                    if color.is_some() {
-                        let color = color.unwrap();
+                    if let Some(color) = color {
                         self.state.color = (self.state.color & 0x0f)
                             | ((color.red as u8 & 0x80) >> 1)
                             | ((color.green as u8 & 0x80) >> 2)
@@ -1123,7 +1119,7 @@ impl VirtualConsoleData {
                 _ => {
                     if self.par[i] >= 90 && self.par[i] <= 107 {
                         if self.par[i] < 100 {
-                            self.state.intensity = VirtualConsoleIntensity::VciBold;
+                            self.state.intensity = VirtualConsoleIntensity::Bold;
                         }
                         self.par[i] -= 60;
                     }
@@ -1241,16 +1237,18 @@ impl VirtualConsoleData {
             return (idx, None);
         }
 
-        if self.par[idx] == 5 && idx + 1 <= self.npar as usize {
+        if self.par[idx] == 5 && idx < self.npar as usize {
             // 256色
             idx += 1;
             return (idx, Some(Color::from_256(self.par[idx])));
         } else if self.par[idx] == 2 && idx + 3 <= self.npar as usize {
             // 24位
-            let mut color = Color::default();
-            color.red = self.par[idx + 1] as u16;
-            color.green = self.par[idx + 2] as u16;
-            color.blue = self.par[idx + 3] as u16;
+            let color = Color {
+                red: self.par[idx + 1] as u16,
+                green: self.par[idx + 2] as u16,
+                blue: self.par[idx + 3] as u16,
+                ..Default::default()
+            };
             idx += 3;
             return (idx, Some(color));
         } else {
@@ -1262,7 +1260,7 @@ impl VirtualConsoleData {
     #[inline(never)]
     pub(super) fn do_control(&mut self, ch: u32) {
         // 首先检查是否处于 ANSI 控制字符串状态
-        if self.vc_state.is_ansi_control_string() && ch >= 8 && ch <= 13 {
+        if self.vc_state.is_ansi_control_string() && (8..=13).contains(&ch) {
             return;
         }
 
@@ -1289,17 +1287,17 @@ impl VirtualConsoleData {
 
                 let ret = self.tab_stop.next_index(self.state.x + 1);
 
-                if ret.is_none() {
-                    self.state.x = self.cols - 1;
+                if let Some(x) = ret {
+                    self.state.x = x;
                 } else {
-                    self.state.x = ret.unwrap();
+                    self.state.x = self.cols - 1;
                 }
 
                 self.pos += self.state.x;
                 // TODO: notify
                 return;
             }
-            10 | 11 | 12 => {
+            10..=12 => {
                 // LD line feed
                 self.line_feed();
                 // TODO: 检查键盘模式
@@ -1416,25 +1414,25 @@ impl VirtualConsoleData {
 
                 match c {
                     '?' => {
-                        self.private = Vt102_OP::EPdec;
+                        self.private = Vt102_OP::Pdec;
                         return;
                     }
                     '>' => {
-                        self.private = Vt102_OP::EPgt;
+                        self.private = Vt102_OP::Pgt;
                         return;
                     }
                     '=' => {
-                        self.private = Vt102_OP::EPeq;
+                        self.private = Vt102_OP::Peq;
                         return;
                     }
                     '<' => {
-                        self.private = Vt102_OP::EPlt;
+                        self.private = Vt102_OP::Plt;
                         return;
                     }
                     _ => {}
                 }
 
-                self.private = Vt102_OP::EPecma;
+                self.private = Vt102_OP::Pecma;
                 self.do_getpars(c);
             }
             VirtualConsoleState::ESgetpars => {
@@ -1478,7 +1476,7 @@ impl VirtualConsoleData {
                 return;
             }
             VirtualConsoleState::EScsiignore => {
-                if ch >= 20 && ch <= 0x3f {
+                if (20..=0x3f).contains(&ch) {
                     return;
                 }
                 self.vc_state = VirtualConsoleState::ESnormal;
@@ -1496,7 +1494,7 @@ impl VirtualConsoleData {
                 } else if c == 'R' {
                     self.reset_palette();
                     self.vc_state = VirtualConsoleState::ESnormal;
-                } else if c >= '0' && c <= '9' {
+                } else if c.is_ascii_digit() {
                     self.vc_state = VirtualConsoleState::ESosc;
                 } else {
                     self.vc_state = VirtualConsoleState::ESnormal;
@@ -1504,7 +1502,7 @@ impl VirtualConsoleData {
             }
             VirtualConsoleState::ESpalette => {
                 let c = ch as u8 as char;
-                if c.is_digit(16) {
+                if c.is_ascii_hexdigit() {
                     self.npar += 1;
                     self.par[self.npar as usize] = c.to_digit(16).unwrap();
 
@@ -1549,10 +1547,8 @@ impl VirtualConsoleData {
         let mut width = 1;
         // 表示需不需要反转
         let mut invert = false;
-        if self.utf && !self.display_ctrl {
-            if FontDesc::is_double_width(c) {
-                width = 2;
-            }
+        if self.utf && !self.display_ctrl && FontDesc::is_double_width(c) {
+            width = 2;
         }
 
         let tmp = self.unicode_to_index(tc);
@@ -1597,7 +1593,7 @@ impl VirtualConsoleData {
             // TODO: 处理unicode screen buf
 
             if himask != 0 {
-                tc = ((if tc & 0x100 != 0 { himask as u32 } else { 0 }) | (tc & 0xff)) as u32;
+                tc = (if tc & 0x100 != 0 { himask as u32 } else { 0 }) | (tc & 0xff);
             }
 
             tc |= ((attr as u32) << 8) & (!himask as u32);
@@ -1665,12 +1661,11 @@ impl VirtualConsoleData {
     /// ## 更新虚拟控制台指定区域的显示
     fn do_update_region(&self, mut start: usize, mut count: usize) {
         let ret = self.driver_funcs().con_getxy(self, start);
-        let (mut x, mut y) = if ret.is_err() {
-            (start % self.cols, start / self.cols)
-        } else {
-            let (_, tmp_x, tmp_y) = ret.unwrap();
+        let (mut x, mut y) = if let Ok((_, tmp_x, tmp_y)) = ret {
             // start = tmp_start;
             (tmp_x, tmp_y)
+        } else {
+            (start % self.cols, start / self.cols)
         };
 
         loop {
@@ -1681,20 +1676,18 @@ impl VirtualConsoleData {
 
             while count != 0 && x < self.cols {
                 // 检查属性是否变化，如果属性变了，则将前一个字符先输出
-                if attr != (self.screen_buf[start] & 0xff00) {
-                    if size > 0 {
-                        let _ = self.driver_funcs().con_putcs(
-                            self,
-                            &self.screen_buf[start..],
-                            size,
-                            y as u32,
-                            startx as u32,
-                        );
-                        startx = x;
-                        start += size;
-                        size = 0;
-                        attr = self.screen_buf[start] & 0xff00;
-                    }
+                if attr != (self.screen_buf[start] & 0xff00) && size > 0 {
+                    let _ = self.driver_funcs().con_putcs(
+                        self,
+                        &self.screen_buf[start..],
+                        size,
+                        y as u32,
+                        startx as u32,
+                    );
+                    startx = x;
+                    start += size;
+                    size = 0;
+                    attr = self.screen_buf[start] & 0xff00;
                 }
                 size += 1;
                 x += 1;
@@ -1719,8 +1712,8 @@ impl VirtualConsoleData {
             y += 1;
 
             let ret = self.driver_funcs().con_getxy(self, start);
-            if ret.is_ok() {
-                start = ret.unwrap().0;
+            if let Ok(ret) = ret {
+                start = ret.0;
             } else {
                 return;
             }
@@ -1738,7 +1731,7 @@ impl VirtualConsoleData {
         } else if ch < 0x20 {
             // 不可打印
             return -1;
-        } else if ch == 0xfeff || (ch >= 0x200b && ch <= 0x200f) {
+        } else if ch == 0xfeff || (0x200b..=0x200f).contains(&ch) {
             // 零长空格
             return -2;
         } else if (ch & !Self::UNI_DIRECT_MAKS) == Self::UNI_DIRECT_BASE {
@@ -1771,7 +1764,7 @@ impl VirtualConsoleData {
             &self.screen_buf[draw.offset..draw.offset + draw.size],
             draw.size,
             self.state.y as u32,
-            draw.x.unwrap() as u32,
+            draw.x.unwrap(),
         );
 
         draw.x = None;
@@ -1791,8 +1784,8 @@ impl VirtualConsoleData {
             .driver_funcs()
             .con_build_attr(self, color, intensity, blink, underline, reverse, italic);
 
-        if ret.is_ok() {
-            return ret.unwrap();
+        if let Ok(ret) = ret {
+            return ret;
         }
 
         let mut ret = color;
@@ -1809,7 +1802,7 @@ impl VirtualConsoleData {
             ret = (ret & 0xf0) | self.italic_color as u8;
         } else if underline {
             ret = (ret & 0xf0) | self.underline_color as u8;
-        } else if intensity == VirtualConsoleIntensity::VciHalfBright {
+        } else if intensity == VirtualConsoleIntensity::HalfBright {
             ret = (ret & 0xf0) | self.half_color as u8;
         }
 
@@ -1821,7 +1814,7 @@ impl VirtualConsoleData {
             ret ^= 0x80;
         }
 
-        if intensity == VirtualConsoleIntensity::VciBold {
+        if intensity == VirtualConsoleIntensity::Bold {
             ret ^= 0x08;
         }
 
@@ -1845,7 +1838,7 @@ impl VirtualConsoleData {
         self.erase_char = ' ' as u16
             | ((self.build_attr(
                 self.state.color,
-                VirtualConsoleIntensity::VciNormal,
+                VirtualConsoleIntensity::Normal,
                 self.state.blink,
                 false,
                 self.screen_mode,
@@ -1855,7 +1848,7 @@ impl VirtualConsoleData {
     }
 
     fn default_attr(&mut self) {
-        self.state.intensity = VirtualConsoleIntensity::VciNormal;
+        self.state.intensity = VirtualConsoleIntensity::Normal;
         self.state.italic = false;
         self.state.underline = false;
         self.state.reverse = false;
@@ -1903,16 +1896,16 @@ impl VirtualConsoleInfo {
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub enum VirtualConsoleIntensity {
     /// 暗淡
-    VciHalfBright = 0,
+    HalfBright = 0,
     /// 正常
-    VciNormal = 1,
+    Normal = 1,
     /// 粗体
-    VciBold = 2,
+    Bold = 2,
 }
 
 impl Default for VirtualConsoleIntensity {
     fn default() -> Self {
-        Self::VciNormal
+        Self::Normal
     }
 }
 
@@ -1972,11 +1965,11 @@ impl VirtualConsoleState {
 #[derive(Debug, Clone, PartialEq, PartialOrd)]
 #[allow(non_camel_case_types)]
 pub enum Vt102_OP {
-    EPecma,
-    EPdec,
-    EPeq,
-    EPgt,
-    EPlt,
+    Pecma,
+    Pdec,
+    Peq,
+    Pgt,
+    Plt,
 }
 
 bitflags! {

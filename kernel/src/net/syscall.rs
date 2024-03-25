@@ -1,4 +1,4 @@
-use core::cmp::min;
+use core::{cmp::min, ffi::CStr};
 
 use alloc::{boxed::Box, sync::Arc};
 use num_traits::{FromPrimitive, ToPrimitive};
@@ -9,6 +9,7 @@ use crate::{
     filesystem::vfs::{
         file::{File, FileMode},
         syscall::{IoVec, IoVecs},
+        FileType,
     },
     libs::spinlock::SpinLockGuard,
     mm::{verify_area, VirtAddr},
@@ -43,10 +44,12 @@ impl Syscall {
 
         let socket = new_socket(address_family, socket_type, protocol)?;
 
-        let handle_item = SocketHandleItem::new(&socket);
-        HANDLE_MAP
-            .write_irqsave()
-            .insert(socket.socket_handle(), handle_item);
+        if address_family != AddressFamily::Unix {
+            let handle_item = SocketHandleItem::new();
+            HANDLE_MAP
+                .write_irqsave()
+                .insert(socket.socket_handle(), handle_item);
+        }
 
         let socketinode: Arc<SocketInode> = SocketInode::new(socket);
         let f = File::new(socketinode, FileMode::O_RDWR)?;
@@ -75,25 +78,25 @@ impl Syscall {
         let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
         let protocol = Protocol::from(protocol as u8);
 
-        let mut socket0 = new_socket(address_family, socket_type, protocol)?;
-        let mut socket1 = new_socket(address_family, socket_type, protocol)?;
-
-        socket0
-            .socketpair_ops()
-            .unwrap()
-            .socketpair(&mut socket0, &mut socket1);
-
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
 
-        let mut alloc_fd = |socket: Box<dyn Socket>| -> Result<i32, SystemError> {
-            let socketinode = SocketInode::new(socket);
-            let file = File::new(socketinode, FileMode::O_RDWR)?;
-            fd_table_guard.alloc_fd(file, None)
-        };
+        // 创建一对socket
+        let inode0 = SocketInode::new(new_socket(address_family, socket_type, protocol)?);
+        let inode1 = SocketInode::new(new_socket(address_family, socket_type, protocol)?);
 
-        fds[0] = alloc_fd(socket0)?;
-        fds[1] = alloc_fd(socket1)?;
+        // 进行pair
+        unsafe {
+            inode0
+                .inner_no_preempt()
+                .connect(Endpoint::Inode(Some(inode1.clone())))?;
+            inode1
+                .inner_no_preempt()
+                .connect(Endpoint::Inode(Some(inode0.clone())))?;
+        }
+
+        fds[0] = fd_table_guard.alloc_fd(File::new(inode0, FileMode::O_RDWR)?, None)?;
+        fds[1] = fd_table_guard.alloc_fd(File::new(inode1, FileMode::O_RDWR)?, None)?;
 
         drop(fd_table_guard);
         Ok(0)
@@ -150,16 +153,15 @@ impl Syscall {
                 PosixSocketOption::SO_SNDBUF => {
                     // 返回发送缓冲区大小
                     unsafe {
-                        *optval = socket.metadata()?.tx_buf_size as u32;
+                        *optval = socket.metadata().tx_buf_size as u32;
                         *optlen = core::mem::size_of::<u32>() as u32;
                     }
                     return Ok(0);
                 }
                 PosixSocketOption::SO_RCVBUF => {
-                    let optval = optval as *mut u32;
                     // 返回默认的接收缓冲区大小
                     unsafe {
-                        *optval = socket.metadata()?.rx_buf_size as u32;
+                        *optval = socket.metadata().rx_buf_size as u32;
                         *optlen = core::mem::size_of::<u32>() as u32;
                     }
                     return Ok(0);
@@ -205,9 +207,8 @@ impl Syscall {
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let mut socket = unsafe { socket.inner_no_preempt() };
-        // kdebug!("connect to {:?}...", endpoint);
         socket.connect(endpoint)?;
-        return Ok(0);
+        Ok(0)
     }
 
     /// @brief sys_bind系统调用的实际执行函数
@@ -224,7 +225,7 @@ impl Syscall {
             .ok_or(SystemError::EBADF)?;
         let mut socket = unsafe { socket.inner_no_preempt() };
         socket.bind(endpoint)?;
-        return Ok(0);
+        Ok(0)
     }
 
     /// @brief sys_sendto系统调用的实际执行函数
@@ -275,7 +276,7 @@ impl Syscall {
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let mut socket = unsafe { socket.inner_no_preempt() };
+        let socket = unsafe { socket.inner_no_preempt() };
 
         let (n, endpoint) = socket.read(buf);
         drop(socket);
@@ -306,7 +307,7 @@ impl Syscall {
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let mut socket = unsafe { socket.inner_no_preempt() };
+        let socket = unsafe { socket.inner_no_preempt() };
 
         let mut buf = iovs.new_buf(true);
         // 从socket中读取数据
@@ -573,12 +574,13 @@ impl SockAddr {
         .map_err(|_| SystemError::EFAULT)?;
 
         let addr = unsafe { addr.as_ref() }.ok_or(SystemError::EFAULT)?;
-        if len < addr.len()? {
-            return Err(SystemError::EINVAL);
-        }
         unsafe {
             match AddressFamily::try_from(addr.family)? {
                 AddressFamily::INet => {
+                    if len < addr.len()? {
+                        return Err(SystemError::EINVAL);
+                    }
+
                     let addr_in: SockAddrIn = addr.addr_in;
 
                     let ip: wire::IpAddress = wire::IpAddress::from(wire::Ipv4Address::from_bytes(
@@ -588,15 +590,35 @@ impl SockAddr {
 
                     return Ok(Endpoint::Ip(Some(wire::IpEndpoint::new(ip, port))));
                 }
+                AddressFamily::Unix => {
+                    let addr_un: SockAddrUn = addr.addr_un;
+
+                    let path = CStr::from_bytes_until_nul(&addr_un.sun_path)
+                        .map_err(|_| SystemError::EINVAL)?
+                        .to_str()
+                        .map_err(|_| SystemError::EINVAL)?;
+
+                    let fd = Syscall::open(path.as_ptr(), FileMode::O_RDWR.bits(), 0o755, true)?;
+
+                    let binding = ProcessManager::current_pcb().fd_table();
+                    let fd_table_guard = binding.read();
+
+                    let binding = fd_table_guard.get_file_by_fd(fd as i32).unwrap();
+                    let file = binding.lock();
+                    if file.file_type() != FileType::Socket {
+                        return Err(SystemError::ENOTSOCK);
+                    }
+                    let inode = file.inode();
+                    let socketinode = inode.as_any_ref().downcast_ref::<Arc<SocketInode>>();
+
+                    return Ok(Endpoint::Inode(socketinode.cloned()));
+                }
                 AddressFamily::Packet => {
                     // TODO: support packet socket
                     return Err(SystemError::EINVAL);
                 }
                 AddressFamily::Netlink => {
                     // TODO: support netlink socket
-                    return Err(SystemError::EINVAL);
-                }
-                AddressFamily::Unix => {
                     return Err(SystemError::EINVAL);
                 }
                 _ => {
@@ -666,7 +688,7 @@ impl From<Endpoint> for SockAddr {
         match value {
             Endpoint::Ip(ip_endpoint) => {
                 // 未指定地址
-                if let None = ip_endpoint {
+                if ip_endpoint.is_none() {
                     return SockAddr {
                         addr_ph: SockAddrPlaceholder {
                             family: AddressFamily::Unspecified as u16,
@@ -706,6 +728,7 @@ impl From<Endpoint> for SockAddr {
 
                 return SockAddr { addr_ll };
             }
+
             _ => {
                 // todo: support other endpoint, like Netlink...
                 unimplemented!("not support {value:?}");
@@ -802,9 +825,9 @@ impl TryFrom<u16> for PosixIpProtocol {
     }
 }
 
-impl Into<u16> for PosixIpProtocol {
-    fn into(self) -> u16 {
-        <Self as ToPrimitive>::to_u16(&self).unwrap()
+impl From<PosixIpProtocol> for u16 {
+    fn from(value: PosixIpProtocol) -> Self {
+        <PosixIpProtocol as ToPrimitive>::to_u16(&value).unwrap()
     }
 }
 
@@ -923,9 +946,9 @@ impl TryFrom<i32> for PosixSocketOption {
     }
 }
 
-impl Into<i32> for PosixSocketOption {
-    fn into(self) -> i32 {
-        <Self as ToPrimitive>::to_i32(&self).unwrap()
+impl From<PosixSocketOption> for i32 {
+    fn from(value: PosixSocketOption) -> Self {
+        <PosixSocketOption as ToPrimitive>::to_i32(&value).unwrap()
     }
 }
 
@@ -1012,8 +1035,8 @@ impl TryFrom<i32> for PosixTcpSocketOptions {
     }
 }
 
-impl Into<i32> for PosixTcpSocketOptions {
-    fn into(self) -> i32 {
-        <Self as ToPrimitive>::to_i32(&self).unwrap()
+impl From<PosixTcpSocketOptions> for i32 {
+    fn from(val: PosixTcpSocketOptions) -> Self {
+        <PosixTcpSocketOptions as ToPrimitive>::to_i32(&val).unwrap()
     }
 }

@@ -54,7 +54,11 @@ impl FileSystem for KernFS {
     }
 
     fn super_block(&self) -> super::vfs::SuperBlock {
-        SuperBlock::new(KERNELFS_MAGIC,KernFS::BLOCK_SIZE,KernFS::MAX_NAMELEN as u64)
+        SuperBlock::new(
+            KERNELFS_MAGIC,
+            KernFS::BLOCK_SIZE,
+            KernFS::MAX_NAMELEN as u64,
+        )
     }
 }
 

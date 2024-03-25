@@ -12,7 +12,8 @@ use system_error::SystemError;
 use crate::{driver::base::device::device_number::DeviceNumber, libs::spinlock::SpinLock};
 
 use super::{
-    file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId, SuperBlock,
+    file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
+    SuperBlock,
 };
 
 const BLOCK_SIZE: u64 = 1024;

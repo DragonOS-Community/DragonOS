@@ -585,7 +585,7 @@ impl Default for Metadata {
 }
 
 #[derive(Debug, Clone)]
-pub struct SuperBlock{
+pub struct SuperBlock {
     // type of filesystem
     pub magic: u64,
     // optimal transfer block size
@@ -610,21 +610,21 @@ pub struct SuperBlock{
     pub flags: u64,
 }
 
-impl SuperBlock{
-    pub fn new(magic:u64, bsize: u64,namelen: u64) -> Self {
-        Self { 
-            magic: magic,
-            bsize: bsize, 
-            blocks: 0, 
-            bfree: 0, 
-            bavail: 0, 
-            files: 0, 
-            ffree: 0, 
-            fsid: 0, 
-            namelen: namelen, 
-            frsize: 0, 
+impl SuperBlock {
+    pub fn new(magic: u64, bsize: u64, namelen: u64) -> Self {
+        Self {
+            magic,
+            bsize,
+            blocks: 0,
+            bfree: 0,
+            bavail: 0,
+            files: 0,
+            ffree: 0,
+            fsid: 0,
+            namelen,
+            frsize: 0,
             flags: 0,
-         }
+        }
     }
 }
 

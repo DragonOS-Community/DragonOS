@@ -119,7 +119,10 @@ impl RamFS {
             special_node: None,
         })));
 
-        let result: Arc<RamFS> = Arc::new(RamFS { root_inode: root, super_block: RwLock::new(super_block)});
+        let result: Arc<RamFS> = Arc::new(RamFS {
+            root_inode: root,
+            super_block: RwLock::new(super_block),
+        });
 
         // 对root inode加锁，并继续完成初始化工作
         let mut root_guard: SpinLockGuard<RamFSInode> = result.root_inode.0.lock();

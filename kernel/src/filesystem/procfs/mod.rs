@@ -19,7 +19,9 @@ use crate::{
     },
     kerror, kinfo,
     libs::{
-        once::Once, rwlock::RwLock, spinlock::{SpinLock, SpinLockGuard}
+        once::Once,
+        rwlock::RwLock,
+        spinlock::{SpinLock, SpinLockGuard},
     },
     mm::allocator::page_frame::FrameAllocator,
     process::{Pid, ProcessManager},
@@ -299,7 +301,7 @@ impl FileSystem for ProcFS {
 
 impl ProcFS {
     pub fn new() -> Arc<Self> {
-        let super_block = SuperBlock::new(PROC_MAGIC,BLOCK_SIZE,PROCFS_MAX_NAMELEN as u64);
+        let super_block = SuperBlock::new(PROC_MAGIC, BLOCK_SIZE, PROCFS_MAX_NAMELEN as u64);
         // 初始化root inode
         let root: Arc<LockedProcFSInode> =
             Arc::new(LockedProcFSInode(SpinLock::new(ProcFSInode {
@@ -330,7 +332,10 @@ impl ProcFS {
                 },
             })));
 
-        let result: Arc<ProcFS> = Arc::new(ProcFS { root_inode: root, super_block: RwLock::new(super_block)});
+        let result: Arc<ProcFS> = Arc::new(ProcFS {
+            root_inode: root,
+            super_block: RwLock::new(super_block),
+        });
 
         // 对root inode加锁，并继续完成初始化工作
         let mut root_guard: SpinLockGuard<ProcFSInode> = result.root_inode.0.lock();

@@ -38,7 +38,7 @@ impl<'a> BitIter<'a> {
             bkcolor,
             _color_pattern: color_pattern,
             _dst_pattern: dst_pattern,
-            src: src,
+            src,
             read_mask: 0b10000000,
             byte_per_pixel,
             buffer: 0,
@@ -48,7 +48,7 @@ impl<'a> BitIter<'a> {
             consumed_bit: 0,
             image_width,
         };
-        ans.current = ans.src.next().unwrap().clone();
+        ans.current = *ans.src.next().unwrap();
         return ans;
     }
 
@@ -72,7 +72,7 @@ impl<'a> BitIter<'a> {
         if self.read_mask == 0b000000000 {
             self.read_mask = 0b10000000;
             self.current = match self.src.next() {
-                Some(x) => x.clone(),
+                Some(x) => *x,
                 None => {
                     return false;
                 }
@@ -89,15 +89,16 @@ impl<'a> BitIter<'a> {
         } else {
             -1
         };
-        let mut color = self.read_bit() << self.left_byte * 8;
+        let mut color = self.read_bit() << (self.left_byte << 3);
         let mut buffer_pointer = if self._dst_pattern == self._color_pattern {
             0
         } else {
             3
         };
-        let mask = 0x000000ff << (self.byte_per_pixel - 1) * 8;
+        let mask = 0x000000ff << ((self.byte_per_pixel - 1) << 3);
         let mut temp;
-        while buffer_pointer >= 0 && buffer_pointer <= 3 {
+        // while buffer_pointer >= 0 && buffer_pointer <= 3 {
+        while (0..=3).contains(&buffer_pointer) {
             if self.consumed_bit >= self.image_width {
                 self.consumed_bit = 0;
                 return Ok(PixelLineStatus::Full(self.buffer));

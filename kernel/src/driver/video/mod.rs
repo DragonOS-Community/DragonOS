@@ -288,7 +288,7 @@ impl TimerFunction for VideoRefreshExecutor {
             let mut target_guard = target_guard.unwrap();
             unsafe {
                 p.copy_from_nonoverlapping(
-                    target_guard.as_mut_ptr() as *mut u8,
+                    target_guard.as_mut_ptr(),
                     manager.device_buffer().buf_size() as usize,
                 )
             }

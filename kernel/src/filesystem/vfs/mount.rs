@@ -48,7 +48,7 @@ impl MountFS {
         return MountFS {
             inner_filesystem: inner_fs,
             mountpoints: SpinLock::new(BTreeMap::new()),
-            self_mountpoint: self_mountpoint,
+            self_mountpoint,
             self_ref: Weak::default(),
         }
         .wrap();
@@ -253,13 +253,13 @@ impl IndexNode for MountFSInode {
     }
 
     #[inline]
-    fn move_(
+    fn move_to(
         &self,
         old_name: &str,
         target: &Arc<dyn IndexNode>,
         new_name: &str,
     ) -> Result<(), SystemError> {
-        return self.inner_inode.move_(old_name, target, new_name);
+        return self.inner_inode.move_to(old_name, target, new_name);
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -393,5 +393,9 @@ impl FileSystem for MountFS {
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+
+    fn name(&self) -> &str {
+        "mountfs"
     }
 }

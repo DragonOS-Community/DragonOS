@@ -7,7 +7,6 @@ pub mod syscall;
 mod utils;
 
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
-
 use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
@@ -287,12 +286,29 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     ///
     /// @return 成功: Ok()
     ///         失败: Err(错误码)
-    fn move_(
+    fn move_to(
         &self,
         _old_name: &str,
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
     ) -> Result<(), SystemError> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    /// # 修改文件名
+    ///
+    ///
+    /// ## 参数
+    ///
+    /// - _old_name: 源文件路径
+    /// - _new_name: 目标文件路径
+    ///
+    /// ## 返回值
+    /// - Ok(返回值类型): 返回值的说明
+    /// - Err(错误值类型): 错误的说明
+    ///
+    fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
@@ -579,6 +595,8 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// @brief 本函数用于实现动态转换。
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;
+
+    fn name(&self) -> &str;
 }
 
 impl DowncastArc for dyn FileSystem {
@@ -626,3 +644,49 @@ impl Metadata {
         }
     }
 }
+pub struct FileSystemMaker {
+    function: &'static FileSystemNewFunction,
+    name: &'static str,
+}
+
+impl FileSystemMaker {
+    pub const fn new(
+        name: &'static str,
+        function: &'static FileSystemNewFunction,
+    ) -> FileSystemMaker {
+        FileSystemMaker { function, name }
+    }
+
+    pub fn call(&self) -> Result<Arc<dyn FileSystem>, SystemError> {
+        (self.function)()
+    }
+}
+
+pub type FileSystemNewFunction = fn() -> Result<Arc<dyn FileSystem>, SystemError>;
+
+#[macro_export]
+macro_rules! define_filesystem_maker_slice {
+    ($name:ident) => {
+        #[::linkme::distributed_slice]
+        pub static $name: [FileSystemMaker] = [..];
+    };
+    () => {
+        compile_error!("define_filesystem_maker_slice! requires at least one argument: slice_name");
+    };
+}
+
+/// 调用指定数组中的所有初始化器
+#[macro_export]
+macro_rules! producefs {
+    ($initializer_slice:ident,$filesystem:ident) => {
+        match $initializer_slice.iter().find(|&m| m.name == $filesystem) {
+            Some(maker) => maker.call(),
+            None => {
+                kerror!("mismatch filesystem type : {}", $filesystem);
+                Err(SystemError::EINVAL)
+            }
+        }
+    };
+}
+
+define_filesystem_maker_slice!(FSMAKER);

@@ -4,7 +4,7 @@ use alloc::{
     borrow::ToOwned,
     collections::BTreeMap,
     format,
-    string::String,
+    string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -99,6 +99,12 @@ impl ProcfsFilePrivateData {
     }
 }
 
+impl Default for ProcfsFilePrivateData {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// @brief procfs文件系统的Inode结构体(不包含锁)
 #[derive(Debug)]
 pub struct ProcFSInode {
@@ -135,14 +141,14 @@ impl ProcFSInode {
         // 获取该pid对应的pcb结构体
         let pid = self.fdata.pid;
         let pcb = ProcessManager::find(pid);
-        let pcb = if pcb.is_none() {
+        let pcb = if let Some(pcb) = pcb {
+            pcb
+        } else {
             kerror!(
                 "ProcFS: Cannot find pcb for pid {:?} when opening its 'status' file.",
                 pid
             );
             return Err(SystemError::ESRCH);
-        } else {
-            pcb.unwrap()
         };
         // 传入数据
         let pdata: &mut Vec<u8> = &mut pdata.data;
@@ -280,6 +286,9 @@ impl FileSystem for ProcFS {
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
+    }
+    fn name(&self) -> &str {
+        "procfs"
     }
 }
 
@@ -576,8 +585,8 @@ impl IndexNode for LockedProcFSInode {
                     atime: TimeSpec::default(),
                     mtime: TimeSpec::default(),
                     ctime: TimeSpec::default(),
-                    file_type: file_type,
-                    mode: mode,
+                    file_type,
+                    mode,
                     nlinks: 1,
                     uid: 0,
                     gid: 0,
@@ -636,6 +645,7 @@ impl IndexNode for LockedProcFSInode {
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
+
         // 不允许删除当前文件夹，也不允许删除上一个目录
         if name == "." || name == ".." {
             return Err(SystemError::ENOTEMPTY);
@@ -643,14 +653,17 @@ impl IndexNode for LockedProcFSInode {
 
         // 获得要删除的文件的inode
         let to_delete = inode.children.get(name).ok_or(SystemError::ENOENT)?;
+
         // 减少硬链接计数
         to_delete.0.lock().metadata.nlinks -= 1;
+
         // 在当前目录中删除这个子目录项
         inode.children.remove(name);
+
         return Ok(());
     }
 
-    fn move_(
+    fn move_to(
         &self,
         _old_name: &str,
         _target: &Arc<dyn IndexNode>,

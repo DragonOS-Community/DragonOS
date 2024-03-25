@@ -164,7 +164,7 @@ impl MmioBuddyMemPool {
         list_guard: &mut SpinLockGuard<MmioFreeRegionList>,
     ) -> Result<MmioBuddyAddrRegion, MmioResult> {
         // 申请范围错误
-        if exp < MMIO_BUDDY_MIN_EXP || exp > MMIO_BUDDY_MAX_EXP {
+        if !(MMIO_BUDDY_MIN_EXP..=MMIO_BUDDY_MAX_EXP).contains(&exp) {
             kdebug!("query_addr_region: exp wrong");
             return Err(MmioResult::WRONGEXP);
         }
@@ -175,7 +175,7 @@ impl MmioBuddyMemPool {
             // 将大的内存块依次分成小块内存，直到能够满足exp大小，即将exp+1分成两块exp
             for e in exp + 1..MMIO_BUDDY_MAX_EXP + 1 {
                 let pop_list: &mut SpinLockGuard<MmioFreeRegionList> =
-                    &mut self.free_regions[exp2index(e) as usize].lock();
+                    &mut self.free_regions[exp2index(e)].lock();
                 if pop_list.num_free == 0 {
                     continue;
                 }
@@ -187,7 +187,7 @@ impl MmioBuddyMemPool {
                                 if e2 != exp + 1 {
                                     // 要将分裂后的内存块插入到更小的链表中
                                     let low_list_guard: &mut SpinLockGuard<MmioFreeRegionList> =
-                                        &mut self.free_regions[exp2index(e2 - 1) as usize].lock();
+                                        &mut self.free_regions[exp2index(e2 - 1)].lock();
                                     self.split_block(region, e2, low_list_guard);
                                 } else {
                                     // 由于exp对应的链表list_guard已经被锁住了 不能再加锁
@@ -201,13 +201,12 @@ impl MmioBuddyMemPool {
                             }
                         }
                     } else {
-                        match self.pop_block(&mut self.free_regions[exp2index(e2) as usize].lock())
-                        {
+                        match self.pop_block(&mut self.free_regions[exp2index(e2)].lock()) {
                             Ok(region) => {
                                 if e2 != exp + 1 {
                                     // 要将分裂后的内存块插入到更小的链表中
                                     let low_list_guard: &mut SpinLockGuard<MmioFreeRegionList> =
-                                        &mut self.free_regions[exp2index(e2 - 1) as usize].lock();
+                                        &mut self.free_regions[exp2index(e2 - 1)].lock();
                                     self.split_block(region, e2, low_list_guard);
                                 } else {
                                     // 由于exp对应的链表list_guard已经被锁住了 不能再加锁
@@ -251,7 +250,7 @@ impl MmioBuddyMemPool {
                 if e != exp - 1 {
                     match self.merge_all_exp(
                         exp,
-                        &mut self.free_regions[exp2index(exp) as usize].lock(),
+                        &mut self.free_regions[exp2index(exp)].lock(),
                         &mut self.free_regions[exp2index(exp + 1)].lock(),
                     ) {
                         Ok(_) => continue,
@@ -263,7 +262,7 @@ impl MmioBuddyMemPool {
                 } else {
                     match self.merge_all_exp(
                         exp,
-                        &mut self.free_regions[exp2index(exp) as usize].lock(),
+                        &mut self.free_regions[exp2index(exp)].lock(),
                         list_guard,
                     ) {
                         Ok(_) => continue,
@@ -346,7 +345,7 @@ impl MmioBuddyMemPool {
         exp: u32,
         list_guard: &mut SpinLockGuard<MmioFreeRegionList>,
     ) -> Result<MmioBuddyAddrRegion, MmioResult> {
-        if list_guard.list.len() == 0 {
+        if list_guard.list.is_empty() {
             return Err(MmioResult::ISEMPTY);
         } else {
             //计算伙伴块的地址
@@ -559,7 +558,7 @@ impl MmioBuddyMemPool {
 
         // 归还到buddy
         mmio_pool()
-            .give_back_block(vaddr, length.trailing_zeros() as u32)
+            .give_back_block(vaddr, length.trailing_zeros())
             .unwrap_or_else(|err| {
                 panic!("MMIO release failed: self: {self:?}, err msg: {:?}", err);
             });
@@ -585,7 +584,7 @@ impl MmioBuddyAddrRegion {
 }
 
 /// @brief 空闲页数组结构体
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct MmioFreeRegionList {
     /// 存储mmio_buddy的地址链表
     list: LinkedList<MmioBuddyAddrRegion>,
@@ -598,14 +597,6 @@ impl MmioFreeRegionList {
         return MmioFreeRegionList {
             ..Default::default()
         };
-    }
-}
-impl Default for MmioFreeRegionList {
-    fn default() -> Self {
-        MmioFreeRegionList {
-            list: Default::default(),
-            num_free: 0,
-        }
     }
 }
 

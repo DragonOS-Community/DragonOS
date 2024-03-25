@@ -17,7 +17,7 @@ impl Slab {
     pub unsafe fn new(start_addr: usize, slab_size: usize, block_size: usize) -> Slab {
         let blocks_num = slab_size / block_size;
         return Slab {
-            block_size: block_size,
+            block_size,
             free_block_list: FreeBlockList::new(start_addr, block_size, blocks_num),
         };
     }
@@ -106,7 +106,7 @@ impl FreeBlockList {
 
 impl Drop for FreeBlockList {
     fn drop(&mut self) {
-        while let Some(_) = self.pop() {}
+        while self.pop().is_some() {}
     }
 }
 

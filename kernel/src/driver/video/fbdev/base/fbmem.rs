@@ -343,7 +343,7 @@ impl Device for FbDevice {
     fn class(&self) -> Option<Arc<dyn Class>> {
         sys_class_graphics_instance().map(|ins| ins.clone() as Arc<dyn Class>)
     }
-    fn set_class(&self, _class: Option<Arc<dyn Class>>) {
+    fn set_class(&self, _class: Option<Weak<dyn Class>>) {
         // do nothing
     }
 

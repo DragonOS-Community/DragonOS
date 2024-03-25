@@ -86,7 +86,7 @@ impl EarlyIoRemapPages {
         let offset = addr.data() - start_vaddr;
         let index = offset / MMArch::PAGE_SIZE;
         if index < Self::EARLY_REMAP_PAGES_NUM {
-            assert_eq!(self.bmp.get(index).unwrap(), true);
+            assert!(self.bmp.get(index).unwrap());
             self.bmp.set(index, false);
         }
     }
@@ -203,9 +203,9 @@ pub unsafe fn pseudo_unmap_phys(vaddr: VirtAddr, count: PageFrameCount) {
 
     for i in 0..count.data() {
         let vaddr = vaddr + i * MMArch::PAGE_SIZE;
-        mapper.unmap_phys(vaddr, true).map(|(_, _, flusher)| {
+        if let Some((_, _, flusher)) = mapper.unmap_phys(vaddr, true) {
             flusher.ignore();
-        });
+        };
     }
 
     mapper.make_current();

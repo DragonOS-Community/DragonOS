@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use core::mem::size_of;
+use core::mem::{size_of, size_of_val};
 
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -19,7 +19,7 @@ pub struct VecCursor {
 impl VecCursor {
     /// @brief 新建一个游标
     pub fn new(data: Vec<u8>) -> Self {
-        return Self { data: data, pos: 0 };
+        return Self { data, pos: 0 };
     }
 
     /// @brief 创建一个全0的cursor
@@ -112,12 +112,12 @@ impl VecCursor {
     ///
     /// @param buf 目标u16数组
     pub fn read_u16_into(&mut self, buf: &mut [u16]) -> Result<(), SystemError> {
-        if self.pos + buf.len() * size_of::<u16>() > self.data.len() * size_of::<u16>() {
+        if self.pos + size_of_val(buf) > self.data.len() * size_of::<u16>() {
             return Err(SystemError::E2BIG);
         }
 
-        for i in 0..buf.len() {
-            buf[i] = self.read_u16()?;
+        for item in buf.iter_mut() {
+            *item = self.read_u16()?;
         }
 
         return Ok(());
@@ -130,22 +130,15 @@ impl VecCursor {
     /// @return Ok(新的游标位置) 调整成功，返回新的游标位置
     /// @return Err(SystemError::EOVERFLOW) 调整失败，游标超出正确的范围。（失败时游标位置不变）
     pub fn seek(&mut self, origin: SeekFrom) -> Result<usize, SystemError> {
-        let pos: i64;
-        match origin {
-            SeekFrom::SeekSet(offset) => {
-                pos = offset;
-            }
-            SeekFrom::SeekCurrent(offset) => {
-                pos = self.pos as i64 + offset;
-            }
-            SeekFrom::SeekEnd(offset) => {
-                // 请注意，此处的offset应小于等于0，否则肯定是不合法的
-                pos = self.data.len() as i64 + offset;
-            }
+        let pos = match origin {
+            SeekFrom::SeekSet(offset) => offset,
+            SeekFrom::SeekCurrent(offset) => self.pos as i64 + offset,
+            // 请注意，此处的offset应小于等于0，否则肯定是不合法的
+            SeekFrom::SeekEnd(offset) => self.data.len() as i64 + offset,
             SeekFrom::Invalid => {
                 return Err(SystemError::EINVAL);
             }
-        }
+        };
 
         if pos < 0 || pos > self.data.len() as i64 {
             return Err(SystemError::EOVERFLOW);
@@ -219,7 +212,7 @@ impl VecCursor {
             return Err(SystemError::E2BIG);
         }
 
-        self.data[self.pos..self.pos + buf.len()].copy_from_slice(&buf[..]);
+        self.data[self.pos..self.pos + buf.len()].copy_from_slice(buf);
         self.pos += buf.len();
 
         return Ok(());

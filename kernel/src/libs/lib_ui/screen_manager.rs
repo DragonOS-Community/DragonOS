@@ -47,7 +47,7 @@ pub enum ScmFramworkType {
 #[derive(Debug, Clone)]
 pub enum ScmBuffer {
     DeviceBuffer(VirtAddr),
-    DoubleBuffer(Arc<SpinLock<Box<[u32]>>>),
+    DoubleBuffer(Arc<SpinLock<Box<[u8]>>>),
 }
 
 #[derive(Debug, Clone)]
@@ -72,7 +72,7 @@ impl ScmBufferInfo {
     ///
     /// - `Result<Self, SystemError>` 创建成功返回新的帧缓冲区结构体，创建失败返回错误码
     pub fn new(mut buf_type: ScmBufferFlag) -> Result<Self, SystemError> {
-        if unlikely(SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) == false) {
+        if unlikely(!SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst)) {
             let mut device_buffer = video_refresh_manager().device_buffer().clone();
             buf_type.remove(ScmBufferFlag::SCM_BF_DB);
             buf_type.insert(ScmBufferFlag::SCM_BF_FB);
@@ -81,15 +81,15 @@ impl ScmBufferInfo {
         } else {
             let device_buffer_guard = video_refresh_manager().device_buffer();
 
-            let buf_space: Arc<SpinLock<Box<[u32]>>> = Arc::new(SpinLock::new(
-                vec![0u32; (device_buffer_guard.size / 4) as usize].into_boxed_slice(),
+            let buf_space: Arc<SpinLock<Box<[u8]>>> = Arc::new(SpinLock::new(
+                vec![0u8; (device_buffer_guard.size / 4) as usize].into_boxed_slice(),
             ));
 
             assert!(buf_type.contains(ScmBufferFlag::SCM_BF_DB));
 
             assert_eq!(
                 device_buffer_guard.size as usize,
-                buf_space.lock().len() * core::mem::size_of::<u32>()
+                buf_space.lock().len() * core::mem::size_of::<u8>()
             );
 
             // 创建双缓冲区
@@ -143,16 +143,10 @@ impl ScmBufferInfo {
     }
 
     pub fn is_double_buffer(&self) -> bool {
-        match &self.buf {
-            ScmBuffer::DoubleBuffer(_) => true,
-            _ => false,
-        }
+        matches!(&self.buf, ScmBuffer::DoubleBuffer(_))
     }
     pub fn is_device_buffer(&self) -> bool {
-        match &self.buf {
-            ScmBuffer::DeviceBuffer(_) => true,
-            _ => false,
-        }
+        matches!(&self.buf, ScmBuffer::DeviceBuffer(_))
     }
 
     pub fn copy_from_nonoverlapping(&mut self, src: &ScmBufferInfo) {
@@ -161,11 +155,11 @@ impl ScmBufferInfo {
             ScmBuffer::DeviceBuffer(vaddr) => {
                 let len = self.buf_size() / core::mem::size_of::<u32>();
                 let self_buf_guard =
-                    unsafe { core::slice::from_raw_parts_mut(vaddr.data() as *mut u32, len) };
+                    unsafe { core::slice::from_raw_parts_mut(vaddr.data() as *mut u8, len) };
                 match &src.buf {
                     ScmBuffer::DeviceBuffer(vaddr) => {
                         let src_buf_guard =
-                            unsafe { core::slice::from_raw_parts(vaddr.data() as *const u32, len) };
+                            unsafe { core::slice::from_raw_parts(vaddr.data() as *const u8, len) };
                         self_buf_guard.copy_from_slice(src_buf_guard);
                     }
                     ScmBuffer::DoubleBuffer(double_buffer) => {
@@ -179,9 +173,9 @@ impl ScmBufferInfo {
                 let mut double_buffer_guard = double_buffer.lock();
                 match &src.buf {
                     ScmBuffer::DeviceBuffer(vaddr) => {
-                        let len = src.buf_size() / core::mem::size_of::<u32>();
+                        let len = src.buf_size() / core::mem::size_of::<u8>();
                         double_buffer_guard.as_mut().copy_from_slice(unsafe {
-                            core::slice::from_raw_parts(vaddr.data() as *const u32, len)
+                            core::slice::from_raw_parts(vaddr.data() as *const u8, len)
                         });
                     }
                     ScmBuffer::DoubleBuffer(double_buffer) => {
@@ -301,7 +295,7 @@ pub fn scm_framework_enable(framework: Arc<dyn ScmUiFramework>) -> Result<i32, S
     // }
     let mut current_framework = CURRENT_FRAMEWORK.write();
 
-    if SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) == true {
+    if SCM_DOUBLE_BUFFER_ENABLED.load(Ordering::SeqCst) {
         video_refresh_manager().set_refresh_target(&metadata.buf_info)?;
     }
 
@@ -393,7 +387,7 @@ pub fn scm_disable_put_to_window() {
     // mm之前要停止往窗口打印信息时，因为没有动态内存分配(rwlock与otion依然能用，但是textui并没有往scm注册)，且使用的是textui,要直接修改textui里面的值
     if CURRENT_FRAMEWORK.read().is_none() {
         textui_disable_put_to_window();
-        assert!(textui_is_enable_put_to_window() == false);
+        assert!(!textui_is_enable_put_to_window());
     } else {
         let r = CURRENT_FRAMEWORK
             .write()

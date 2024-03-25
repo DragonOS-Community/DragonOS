@@ -36,6 +36,7 @@ use crate::{
 };
 
 use super::{
+    kthread::tty_flush_thread_init,
     termios::WindowSize,
     tty_core::{TtyCore, TtyFlag, TtyIoctlCmd},
     tty_driver::{TtyDriver, TtyDriverSubType, TtyDriverType, TtyOperation},
@@ -116,8 +117,7 @@ impl IndexNode for TtyDevice {
         });
 
         let ret = tty.open(tty.core());
-        if ret.is_err() {
-            let err = ret.unwrap_err();
+        if let Err(err) = ret {
             if err == SystemError::ENOSYS {
                 return Err(SystemError::ENODEV);
             }
@@ -425,7 +425,7 @@ impl Device for TtyDevice {
         self.inner.write().bus = bus
     }
 
-    fn set_class(&self, _class: Option<Arc<dyn crate::driver::base::class::Class>>) {
+    fn set_class(&self, _class: Option<Weak<dyn crate::driver::base::class::Class>>) {
         todo!()
     }
 
@@ -528,5 +528,7 @@ pub fn tty_init() -> Result<(), SystemError> {
     devfs_register(console.name, console)?;
 
     serial_init()?;
+
+    tty_flush_thread_init();
     return vty_init();
 }

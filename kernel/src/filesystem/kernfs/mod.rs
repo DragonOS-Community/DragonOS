@@ -47,6 +47,10 @@ impl FileSystem for KernFS {
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         return self.root_inode.clone();
     }
+
+    fn name(&self) -> &str {
+        "kernfs"
+    }
 }
 
 impl KernFS {
@@ -195,7 +199,7 @@ impl IndexNode for KernFSInode {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
-    fn move_(
+    fn move_to(
         &self,
         _old_name: &str,
         _target: &Arc<dyn IndexNode>,
@@ -293,7 +297,6 @@ impl IndexNode for KernFSInode {
         self.children
             .lock()
             .keys()
-            .into_iter()
             .for_each(|x| keys.push(x.clone()));
 
         return Ok(keys);
@@ -365,6 +368,11 @@ impl IndexNode for KernFSInode {
             .as_ref()
             .unwrap()
             .write(callback_data, &buf[..len], offset);
+    }
+
+    fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), SystemError> {
+        // 待实现
+        Err(SystemError::ENOSYS)
     }
 }
 
@@ -632,9 +640,9 @@ pub enum KernInodeType {
     SymLink,
 }
 
-impl Into<FileType> for KernInodeType {
-    fn into(self) -> FileType {
-        match self {
+impl From<KernInodeType> for FileType {
+    fn from(val: KernInodeType) -> Self {
+        match val {
             KernInodeType::Dir => FileType::Dir,
             KernInodeType::File => FileType::File,
             KernInodeType::SymLink => FileType::SymLink,

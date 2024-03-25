@@ -24,7 +24,7 @@ pub enum FcntlCommand {
     /// set record locking info (blocking)
     SetLockWait = 7,
 
-    SetLease = F_LINUX_SPECIFIC_BASE + 0,
+    SetLease = F_LINUX_SPECIFIC_BASE,
     GetLease = F_LINUX_SPECIFIC_BASE + 1,
 
     /// Request nofications on a directory.
@@ -66,6 +66,7 @@ bitflags! {
     ///  the flags can be allowed to overlap.  For example, passing AT_REMOVEDIR to
     ///  faccessat would be undefined behavior and thus treating it equivalent to
     ///  AT_EACCESS is valid undefined behavior.
+    #[allow(clippy::bad_bit_mask)]
     pub struct AtFlags: i32 {
         /// 特殊值，用于指示openat应使用当前工作目录。
         const AT_FDCWD = -100;

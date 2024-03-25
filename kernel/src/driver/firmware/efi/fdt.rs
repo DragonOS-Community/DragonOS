@@ -56,13 +56,13 @@ enum FdtPropType {
 impl FdtPropType {
     /// 获取属性对应的fdt属性名
     fn prop_name(&self) -> &'static str {
-        self.clone().into()
+        (*self).into()
     }
 }
 
-impl Into<&'static str> for FdtPropType {
-    fn into(self) -> &'static str {
-        match self {
+impl From<FdtPropType> for &'static str {
+    fn from(value: FdtPropType) -> Self {
+        match value {
             FdtPropType::SystemTable => "linux,uefi-system-table",
             FdtPropType::MMBase => "linux,uefi-mmap-start",
             FdtPropType::MMSize => "linux,uefi-mmap-size",
@@ -159,12 +159,11 @@ impl EFIManager {
         prop: &fdt::node::NodeProperty<'_>,
         target: &mut EFIFdtParams,
     ) -> Result<(), SystemError> {
-        let val: u64;
-        if prop.value.len() == 4 {
-            val = u32::from_be_bytes(prop.value[0..4].try_into().unwrap()) as u64;
+        let val = if prop.value.len() == 4 {
+            u32::from_be_bytes(prop.value[0..4].try_into().unwrap()) as u64
         } else {
-            val = u64::from_be_bytes(prop.value[0..8].try_into().unwrap());
-        }
+            u64::from_be_bytes(prop.value[0..8].try_into().unwrap())
+        };
 
         match prop_type {
             FdtPropType::SystemTable => {

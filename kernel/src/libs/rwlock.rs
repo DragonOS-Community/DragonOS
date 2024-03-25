@@ -130,13 +130,12 @@ impl<T> RwLock<T> {
     fn inner_try_read(&self) -> Option<RwLockReadGuard<T>> {
         let reader_value = self.current_reader();
         //得到自增后的reader_value, 包括了尝试获得READER守卫的进程
-        let value;
 
-        if reader_value.is_err() {
-            return None; //获取失败
+        let value = if let Ok(rv) = reader_value {
+            rv
         } else {
-            value = reader_value.unwrap();
-        }
+            return None;
+        };
 
         //判断有没有writer和upgrader
         //注意, 若upgrader存在,已经存在的读者继续占有锁,但新读者不允许获得锁

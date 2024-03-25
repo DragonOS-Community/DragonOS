@@ -1,11 +1,12 @@
 use core::{
-    ffi::{c_char, c_int, c_void, CStr},
+    ffi::{c_int, c_void},
+    ptr::null,
     sync::atomic::{AtomicBool, Ordering},
 };
 
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
-    driver::base::device::device_number::DeviceNumber,
+    filesystem::vfs::syscall::PosixStatx,
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::syscall::MremapFlags,
     net::syscall::MsgHdr,
@@ -22,19 +23,18 @@ use system_error::SystemError;
 
 use crate::{
     arch::{cpu::cpu_reset, interrupt::TrapFrame, MMArch},
-    driver::base::block::SeekFrom,
     filesystem::vfs::{
-        fcntl::FcntlCommand,
+        fcntl::{AtFlags, FcntlCommand},
         file::FileMode,
-        syscall::{ModeType, PosixKstat, SEEK_CUR, SEEK_END, SEEK_MAX, SEEK_SET},
+        syscall::{ModeType, PosixKstat},
         MAX_PATHLEN,
     },
-    include::bindings::bindings::{PAGE_2M_SIZE, PAGE_4K_SIZE},
+    include::bindings::bindings::PAGE_4K_SIZE,
     kinfo,
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
-    process::{fork::CloneFlags, Pid},
+    process::{fork::CloneFlags, syscall::PosixOldUtsName, Pid},
     time::{
         syscall::{PosixTimeZone, PosixTimeval},
         TimeSpec,
@@ -90,41 +90,51 @@ impl Syscall {
             }
             #[cfg(target_arch = "x86_64")]
             SYS_OPEN => {
-                let path: &CStr = unsafe { CStr::from_ptr(args[0] as *const c_char) };
-                let path: Result<&str, core::str::Utf8Error> = path.to_str();
-                let res = if path.is_err() {
-                    Err(SystemError::EINVAL)
-                } else {
-                    let path: &str = path.unwrap();
+                let path = args[0] as *const u8;
+                let flags = args[1] as u32;
+                let mode = args[2] as u32;
 
-                    let flags = args[1];
-                    let mode = args[2];
+                Self::open(path, flags, mode, true)
+            }
 
-                    let open_flags: FileMode = FileMode::from_bits_truncate(flags as u32);
-                    let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
-                    Self::open(path, open_flags, mode, true)
-                };
-                res
+            #[cfg(target_arch = "x86_64")]
+            SYS_RENAME => {
+                let oldname: *const u8 = args[0] as *const u8;
+                let newname: *const u8 = args[1] as *const u8;
+                Self::do_renameat2(
+                    AtFlags::AT_FDCWD.bits(),
+                    oldname,
+                    AtFlags::AT_FDCWD.bits(),
+                    newname,
+                    0,
+                )
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            SYS_RENAMEAT => {
+                let oldfd = args[0] as i32;
+                let oldname: *const u8 = args[1] as *const u8;
+                let newfd = args[2] as i32;
+                let newname: *const u8 = args[3] as *const u8;
+                Self::do_renameat2(oldfd, oldname, newfd, newname, 0)
+            }
+
+            SYS_RENAMEAT2 => {
+                let oldfd = args[0] as i32;
+                let oldname: *const u8 = args[1] as *const u8;
+                let newfd = args[2] as i32;
+                let newname: *const u8 = args[3] as *const u8;
+                let flags = args[4] as u32;
+                Self::do_renameat2(oldfd, oldname, newfd, newname, flags)
             }
 
             SYS_OPENAT => {
                 let dirfd = args[0] as i32;
-                let path: &CStr = unsafe { CStr::from_ptr(args[1] as *const c_char) };
-                let flags = args[2];
-                let mode = args[3];
+                let path = args[1] as *const u8;
+                let flags = args[2] as u32;
+                let mode = args[3] as u32;
 
-                let path: Result<&str, core::str::Utf8Error> = path.to_str();
-                let res = if path.is_err() {
-                    Err(SystemError::EINVAL)
-                } else {
-                    let path: &str = path.unwrap();
-
-                    let open_flags: FileMode =
-                        FileMode::from_bits(flags as u32).ok_or(SystemError::EINVAL)?;
-                    let mode = ModeType::from_bits(mode as u32).ok_or(SystemError::EINVAL)?;
-                    Self::openat(dirfd, path, open_flags, mode, true)
-                };
-                res
+                Self::openat(dirfd, path, flags, mode, true)
             }
             SYS_CLOSE => {
                 let fd = args[0];
@@ -134,7 +144,7 @@ impl Syscall {
                 let fd = args[0] as i32;
                 let buf_vaddr = args[1];
                 let len = args[2];
-                let from_user = frame.from_user();
+                let from_user = frame.is_from_user();
                 let mut user_buffer_writer =
                     UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)?;
 
@@ -145,7 +155,7 @@ impl Syscall {
                 let fd = args[0] as i32;
                 let buf_vaddr = args[1];
                 let len = args[2];
-                let from_user = frame.from_user();
+                let from_user = frame.is_from_user();
                 let user_buffer_reader =
                     UserBufferReader::new(buf_vaddr as *const u8, len, from_user)?;
 
@@ -158,15 +168,7 @@ impl Syscall {
                 let offset = args[1] as i64;
                 let whence = args[2] as u32;
 
-                let w = match whence {
-                    SEEK_SET => Ok(SeekFrom::SeekSet(offset)),
-                    SEEK_CUR => Ok(SeekFrom::SeekCurrent(offset)),
-                    SEEK_END => Ok(SeekFrom::SeekEnd(offset)),
-                    SEEK_MAX => Ok(SeekFrom::SeekEnd(0)),
-                    _ => Err(SystemError::EINVAL),
-                }?;
-
-                Self::lseek(fd, w)
+                Self::lseek(fd, offset, whence)
             }
 
             SYS_PREAD64 => {
@@ -176,7 +178,7 @@ impl Syscall {
                 let offset = args[3];
 
                 let mut user_buffer_writer =
-                    UserBufferWriter::new(buf_vaddr as *mut u8, len, frame.from_user())?;
+                    UserBufferWriter::new(buf_vaddr as *mut u8, len, frame.is_from_user())?;
                 let buf = user_buffer_writer.buffer(0)?;
                 Self::pread(fd, buf, len, offset)
             }
@@ -188,7 +190,7 @@ impl Syscall {
                 let offset = args[3];
 
                 let user_buffer_reader =
-                    UserBufferReader::new(buf_vaddr as *const u8, len, frame.from_user())?;
+                    UserBufferReader::new(buf_vaddr as *const u8, len, frame.is_from_user())?;
 
                 let buf = user_buffer_reader.read_from_user(0)?;
                 Self::pwrite(fd, buf, len, offset)
@@ -219,32 +221,7 @@ impl Syscall {
             SYS_REBOOT => Self::reboot(),
 
             SYS_CHDIR => {
-                // Closure for checking arguments
-                let chdir_check = |arg0: usize| {
-                    if arg0 == 0 {
-                        return Err(SystemError::EFAULT);
-                    }
-                    let path_ptr = arg0 as *const c_char;
-                    let virt_addr = VirtAddr::new(path_ptr as usize);
-                    // 权限校验
-                    if path_ptr.is_null()
-                        || (frame.from_user()
-                            && verify_area(virt_addr, PAGE_2M_SIZE as usize).is_err())
-                    {
-                        return Err(SystemError::EINVAL);
-                    }
-                    let dest_path: &CStr = unsafe { CStr::from_ptr(path_ptr) };
-                    let dest_path: &str = dest_path.to_str().map_err(|_| SystemError::EINVAL)?;
-                    if dest_path.len() == 0 {
-                        return Err(SystemError::EINVAL);
-                    } else if dest_path.len() > MAX_PATHLEN as usize {
-                        return Err(SystemError::ENAMETOOLONG);
-                    }
-
-                    return Ok(dest_path);
-                };
-
-                let r = chdir_check(args[0])?;
+                let r = args[0] as *const u8;
                 Self::chdir(r)
             }
 
@@ -256,7 +233,7 @@ impl Syscall {
                 let len = args[2];
                 let virt_addr: VirtAddr = VirtAddr::new(buf_vaddr);
                 // 判断缓冲区是否来自用户态，进行权限校验
-                let res = if frame.from_user() && verify_area(virt_addr, len as usize).is_err() {
+                let res = if frame.is_from_user() && verify_area(virt_addr, len).is_err() {
                     // 来自用户态，而buffer在内核态，这样的操作不被允许
                     Err(SystemError::EPERM)
                 } else if buf_vaddr == 0 {
@@ -279,8 +256,8 @@ impl Syscall {
                 let virt_argv_ptr = VirtAddr::new(argv_ptr);
                 let virt_env_ptr = VirtAddr::new(env_ptr);
                 // 权限校验
-                if frame.from_user()
-                    && (verify_area(virt_path_ptr, MAX_PATHLEN as usize).is_err()
+                if frame.is_from_user()
+                    && (verify_area(virt_path_ptr, MAX_PATHLEN).is_err()
                         || verify_area(virt_argv_ptr, PAGE_4K_SIZE as usize).is_err())
                     || verify_area(virt_env_ptr, PAGE_4K_SIZE as usize).is_err()
                 {
@@ -311,31 +288,10 @@ impl Syscall {
             }
             #[cfg(target_arch = "x86_64")]
             SYS_MKDIR => {
-                let path_ptr = args[0] as *const c_char;
+                let path = args[0] as *const u8;
                 let mode = args[1];
-                let virt_path_ptr = VirtAddr::new(path_ptr as usize);
-                let security_check = || {
-                    if path_ptr.is_null()
-                        || (frame.from_user()
-                            && verify_area(virt_path_ptr, PAGE_2M_SIZE as usize).is_err())
-                    {
-                        return Err(SystemError::EINVAL);
-                    }
-                    let path: &CStr = unsafe { CStr::from_ptr(path_ptr) };
-                    let path: &str = path.to_str().map_err(|_| SystemError::EINVAL)?.trim();
 
-                    if path == "" {
-                        return Err(SystemError::EINVAL);
-                    }
-                    return Ok(path);
-                };
-
-                let path = security_check();
-                if path.is_err() {
-                    Err(path.unwrap_err())
-                } else {
-                    Self::mkdir(path.unwrap(), mode)
-                }
+                Self::mkdir(path, mode)
             }
 
             SYS_NANOSLEEP => {
@@ -343,10 +299,9 @@ impl Syscall {
                 let rem = args[1] as *mut TimeSpec;
                 let virt_req = VirtAddr::new(req as usize);
                 let virt_rem = VirtAddr::new(rem as usize);
-                if frame.from_user()
-                    && (verify_area(virt_req, core::mem::size_of::<TimeSpec>() as usize).is_err()
-                        || verify_area(virt_rem, core::mem::size_of::<TimeSpec>() as usize)
-                            .is_err())
+                if frame.is_from_user()
+                    && (verify_area(virt_req, core::mem::size_of::<TimeSpec>()).is_err()
+                        || verify_area(virt_rem, core::mem::size_of::<TimeSpec>()).is_err())
                 {
                     Err(SystemError::EFAULT)
                 } else {
@@ -378,43 +333,36 @@ impl Syscall {
 
             SYS_UNLINKAT => {
                 let dirfd = args[0] as i32;
-                let pathname = args[1] as *const c_char;
+                let path = args[1] as *const u8;
                 let flags = args[2] as u32;
-                let virt_pathname = VirtAddr::new(pathname as usize);
-                if frame.from_user() && verify_area(virt_pathname, PAGE_4K_SIZE as usize).is_err() {
-                    Err(SystemError::EFAULT)
-                } else if pathname.is_null() {
-                    Err(SystemError::EFAULT)
-                } else {
-                    let get_path = || {
-                        let pathname: &CStr = unsafe { CStr::from_ptr(pathname) };
-
-                        let pathname: &str = pathname.to_str().map_err(|_| SystemError::EINVAL)?;
-                        if pathname.len() >= MAX_PATHLEN {
-                            return Err(SystemError::ENAMETOOLONG);
-                        }
-                        return Ok(pathname.trim());
-                    };
-                    let pathname = get_path();
-                    if pathname.is_err() {
-                        Err(pathname.unwrap_err())
-                    } else {
-                        // kdebug!("sys unlinkat: dirfd: {}, pathname: {}", dirfd, pathname.as_ref().unwrap());
-                        Self::unlinkat(dirfd, pathname.unwrap(), flags)
-                    }
-                }
+                Self::unlinkat(dirfd, path, flags)
             }
 
             #[cfg(target_arch = "x86_64")]
             SYS_RMDIR => {
-                let pathname = args[0] as *const u8;
-                Self::rmdir(pathname)
+                let path = args[0] as *const u8;
+                Self::rmdir(path)
+            }
+
+            SYS_LINK => {
+                let old = args[0] as *const u8;
+                let new = args[1] as *const u8;
+                return Self::link(old, new);
+            }
+
+            SYS_LINKAT => {
+                let oldfd = args[0] as i32;
+                let old = args[1] as *const u8;
+                let newfd = args[2] as i32;
+                let new = args[3] as *const u8;
+                let flags = args[4] as i32;
+                return Self::linkat(oldfd, old, newfd, new, flags);
             }
 
             #[cfg(target_arch = "x86_64")]
             SYS_UNLINK => {
-                let pathname = args[0] as *const u8;
-                Self::unlink(pathname)
+                let path = args[0] as *const u8;
+                Self::unlink(path)
             }
             SYS_KILL => {
                 let pid = Pid::new(args[0]);
@@ -427,12 +375,12 @@ impl Syscall {
                 let sig = args[0] as c_int;
                 let act = args[1];
                 let old_act = args[2];
-                Self::sigaction(sig, act, old_act, frame.from_user())
+                Self::sigaction(sig, act, old_act, frame.is_from_user())
             }
 
             SYS_GETPID => Self::getpid().map(|pid| pid.into()),
 
-            SYS_SCHED => Self::sched(frame.from_user()),
+            SYS_SCHED => Self::sched(frame.is_from_user()),
             SYS_DUP => {
                 let oldfd: i32 = args[0] as c_int;
                 Self::dup(oldfd)
@@ -448,10 +396,10 @@ impl Syscall {
             SYS_SOCKET => Self::socket(args[0], args[1], args[2]),
             SYS_SETSOCKOPT => {
                 let optval = args[3] as *const u8;
-                let optlen = args[4] as usize;
+                let optlen = args[4];
                 let virt_optval = VirtAddr::new(optval as usize);
                 // 验证optval的地址是否合法
-                if verify_area(virt_optval, optlen as usize).is_err() {
+                if verify_area(virt_optval, optlen).is_err() {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
                 } else {
@@ -472,15 +420,15 @@ impl Syscall {
                     }
 
                     // 验证optlen的地址是否合法
-                    if verify_area(virt_optlen, core::mem::size_of::<u32>() as usize).is_err() {
+                    if verify_area(virt_optlen, core::mem::size_of::<u32>()).is_err() {
                         // 地址空间超出了用户空间的范围，不合法
                         return Err(SystemError::EFAULT);
                     }
                     return Ok(());
                 };
                 let r = security_check();
-                if r.is_err() {
-                    Err(r.unwrap_err())
+                if let Err(e) = r {
+                    Err(e)
                 } else {
                     Self::getsockopt(args[0], args[1], args[2], optval, optlen as *mut u32)
                 }
@@ -488,10 +436,10 @@ impl Syscall {
 
             SYS_CONNECT => {
                 let addr = args[1] as *const SockAddr;
-                let addrlen = args[2] as usize;
+                let addrlen = args[2];
                 let virt_addr = VirtAddr::new(addr as usize);
                 // 验证addr的地址是否合法
-                if verify_area(virt_addr, addrlen as usize).is_err() {
+                if verify_area(virt_addr, addrlen).is_err() {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
                 } else {
@@ -500,10 +448,10 @@ impl Syscall {
             }
             SYS_BIND => {
                 let addr = args[1] as *const SockAddr;
-                let addrlen = args[2] as usize;
+                let addrlen = args[2];
                 let virt_addr = VirtAddr::new(addr as usize);
                 // 验证addr的地址是否合法
-                if verify_area(virt_addr, addrlen as usize).is_err() {
+                if verify_area(virt_addr, addrlen).is_err() {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
                 } else {
@@ -513,17 +461,14 @@ impl Syscall {
 
             SYS_SENDTO => {
                 let buf = args[1] as *const u8;
-                let len = args[2] as usize;
+                let len = args[2];
                 let flags = args[3] as u32;
                 let addr = args[4] as *const SockAddr;
-                let addrlen = args[5] as usize;
+                let addrlen = args[5];
                 let virt_buf = VirtAddr::new(buf as usize);
                 let virt_addr = VirtAddr::new(addr as usize);
                 // 验证buf的地址是否合法
-                if verify_area(virt_buf, len as usize).is_err() {
-                    // 地址空间超出了用户空间的范围，不合法
-                    Err(SystemError::EFAULT)
-                } else if verify_area(virt_addr, addrlen as usize).is_err() {
+                if verify_area(virt_buf, len).is_err() || verify_area(virt_addr, addrlen).is_err() {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
                 } else {
@@ -534,7 +479,7 @@ impl Syscall {
 
             SYS_RECVFROM => {
                 let buf = args[1] as *mut u8;
-                let len = args[2] as usize;
+                let len = args[2];
                 let flags = args[3] as u32;
                 let addr = args[4] as *mut SockAddr;
                 let addrlen = args[5] as *mut usize;
@@ -561,8 +506,8 @@ impl Syscall {
                     return Ok(());
                 };
                 let r = security_check();
-                if r.is_err() {
-                    Err(r.unwrap_err())
+                if let Err(e) = r {
+                    Err(e)
                 } else {
                     let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
                     Self::recvfrom(args[0], buf, flags, addr, addrlen as *mut u32)
@@ -573,8 +518,11 @@ impl Syscall {
                 let msg = args[1] as *mut MsgHdr;
                 let flags = args[2] as u32;
 
-                let mut user_buffer_writer =
-                    UserBufferWriter::new(msg, core::mem::size_of::<MsgHdr>(), frame.from_user())?;
+                let mut user_buffer_writer = UserBufferWriter::new(
+                    msg,
+                    core::mem::size_of::<MsgHdr>(),
+                    frame.is_from_user(),
+                )?;
                 let buffer = user_buffer_writer.buffer::<MsgHdr>(0)?;
 
                 let msg = &mut buffer[0];
@@ -655,8 +603,8 @@ impl Syscall {
                     return Ok(());
                 };
                 let r = security_check();
-                if r.is_err() {
-                    Err(r.unwrap_err())
+                if let Err(e) = r {
+                    Err(e)
                 } else {
                     let buf = unsafe { core::slice::from_raw_parts_mut(buf, size) };
                     Self::getcwd(buf).map(|ptr| ptr.data())
@@ -668,7 +616,7 @@ impl Syscall {
             SYS_GETPPID => Self::getppid().map(|pid| pid.into()),
             SYS_FSTAT => {
                 let fd = args[0] as i32;
-                let kstat = args[1] as *mut PosixKstat;
+                let kstat: *mut PosixKstat = args[1] as *mut PosixKstat;
                 let vaddr = VirtAddr::new(kstat as usize);
                 // FIXME 由于c中的verify_area与rust中的verify_area重名，所以在引入时加了前缀区分
                 // TODO 应该将用了c版本的verify_area都改为rust的verify_area
@@ -703,11 +651,13 @@ impl Syscall {
 
             #[cfg(target_arch = "x86_64")]
             SYS_MKNOD => {
+                use crate::driver::base::device::device_number::DeviceNumber;
+
                 let path = args[0];
                 let flags = args[1];
                 let dev_t = args[2];
                 let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
-                Self::mknod(path as *const i8, flags, DeviceNumber::from(dev_t as u32))
+                Self::mknod(path as *const u8, flags, DeviceNumber::from(dev_t as u32))
             }
 
             SYS_CLONE => {
@@ -759,42 +709,29 @@ impl Syscall {
 
             #[cfg(target_arch = "x86_64")]
             SYS_LSTAT => {
-                let path: &CStr = unsafe { CStr::from_ptr(args[0] as *const c_char) };
-                let path: Result<&str, core::str::Utf8Error> = path.to_str();
-                let res = if path.is_err() {
-                    Err(SystemError::EINVAL)
-                } else {
-                    let path: &str = path.unwrap();
-                    let kstat = args[1] as *mut PosixKstat;
-                    let vaddr = VirtAddr::new(kstat as usize);
-                    match verify_area(vaddr, core::mem::size_of::<PosixKstat>()) {
-                        Ok(_) => Self::lstat(path, kstat),
-                        Err(e) => Err(e),
-                    }
-                };
-
-                res
+                let path = args[0] as *const u8;
+                let kstat = args[1] as *mut PosixKstat;
+                Self::lstat(path, kstat)
             }
 
             #[cfg(target_arch = "x86_64")]
             SYS_STAT => {
-                let path: &CStr = unsafe { CStr::from_ptr(args[0] as *const c_char) };
-                let path: Result<&str, core::str::Utf8Error> = path.to_str();
-                let res = if path.is_err() {
-                    Err(SystemError::EINVAL)
-                } else {
-                    let path: &str = path.unwrap();
-                    let kstat = args[1] as *mut PosixKstat;
-                    let vaddr = VirtAddr::new(kstat as usize);
-                    match verify_area(vaddr, core::mem::size_of::<PosixKstat>()) {
-                        Ok(_) => Self::stat(path, kstat),
-                        Err(e) => Err(e),
-                    }
-                };
-
-                res
+                let path = args[0] as *const u8;
+                let kstat = args[1] as *mut PosixKstat;
+                Self::stat(path, kstat)
             }
 
+            SYS_STATX => {
+                let fd = args[0] as i32;
+                let path = args[1] as *const u8;
+                let flags = args[2] as u32;
+                let mask = args[3] as u32;
+                let kstat = args[4] as *mut PosixStatx;
+
+                Self::do_statx(fd, path, flags, mask, kstat)
+            }
+
+            #[cfg(target_arch = "x86_64")]
             SYS_EPOLL_CREATE => Self::epoll_create(args[0] as i32),
             SYS_EPOLL_CREATE1 => Self::epoll_create1(args[0]),
 
@@ -805,6 +742,7 @@ impl Syscall {
                 VirtAddr::new(args[3]),
             ),
 
+            #[cfg(target_arch = "x86_64")]
             SYS_EPOLL_WAIT => Self::epoll_wait(
                 args[0] as i32,
                 VirtAddr::new(args[1]),
@@ -845,7 +783,7 @@ impl Syscall {
                 let mut user_buffer_writer = UserBufferWriter::new(
                     args[3] as *mut c_int,
                     core::mem::size_of::<[c_int; 2]>(),
-                    frame.from_user(),
+                    frame.is_from_user(),
                 )?;
                 let fds = user_buffer_writer.buffer::<i32>(0)?;
                 Self::socketpair(args[0], args[1], args[2], fds)
@@ -894,7 +832,7 @@ impl Syscall {
                 let syslog_action_type = args[0];
                 let buf_vaddr = args[1];
                 let len = args[2];
-                let from_user = frame.from_user();
+                let from_user = frame.is_from_user();
                 let mut user_buffer_writer =
                     UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)?;
 
@@ -929,10 +867,10 @@ impl Syscall {
 
             SYS_READLINKAT => {
                 let dirfd = args[0] as i32;
-                let pathname = args[1] as *const u8;
+                let path = args[1] as *const u8;
                 let buf = args[2] as *mut u8;
                 let bufsiz = args[3];
-                Self::readlink_at(dirfd, pathname, buf, bufsiz)
+                Self::readlink_at(dirfd, path, buf, bufsiz)
             }
 
             SYS_PRLIMIT64 => {
@@ -1030,7 +968,29 @@ impl Syscall {
                 )
             }
 
+            SYS_FADVISE64 => {
+                // todo: 这个系统调用还没有实现
+
+                Err(SystemError::ENOSYS)
+            }
+
+            SYS_MOUNT => {
+                let source = args[0] as *const u8;
+                let target = args[1] as *const u8;
+                let filesystemtype = args[2] as *const u8;
+                return Self::mount(source, target, filesystemtype, 0, null());
+            }
+            SYS_NEWFSTATAT => {
+                // todo: 这个系统调用还没有实现
+
+                Err(SystemError::ENOSYS)
+            }
+
             SYS_SCHED_YIELD => Self::sched_yield(),
+            SYS_UNAME => {
+                let name = args[0] as *mut PosixOldUtsName;
+                Self::uname(name)
+            }
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };

@@ -5,12 +5,12 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
-    include::bindings::bindings::MAX_CPU_NUM,
     kBUG,
     libs::{
         rbtree::RBTree,
         spinlock::{SpinLock, SpinLockGuard},
     },
+    mm::percpu::PerCpu,
     process::{
         ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSchedulerInfo, ProcessState,
     },
@@ -100,6 +100,7 @@ impl CFSQueue {
         }
     }
     /// 获取运行队列的长度
+    #[allow(dead_code)]
     pub fn get_cfs_queue_size(
         queue: &SpinLockGuard<RBTree<i64, Arc<ProcessControlBlock>>>,
     ) -> usize {
@@ -121,7 +122,7 @@ impl SchedulerCFS {
         };
 
         // 为每个cpu核心创建队列，进程重构后可以直接初始化Idle_pcb？
-        for i in 0..MAX_CPU_NUM {
+        for i in 0..PerCpu::MAX_CPU_NUM {
             let idle_pcb = ProcessManager::idle_pcb()[i as usize].clone();
             result
                 .cpu_queue
@@ -210,7 +211,7 @@ impl Scheduler for SchedulerCFS {
     /// @brief 在当前cpu上进行调度。
     /// 请注意，进入该函数之前，需要关中断
     fn sched(&mut self) -> Option<Arc<ProcessControlBlock>> {
-        assert!(CurrentIrqArch::is_irq_enabled() == false);
+        assert!(!CurrentIrqArch::is_irq_enabled());
 
         ProcessManager::current_pcb()
             .flags()

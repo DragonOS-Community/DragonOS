@@ -91,11 +91,8 @@ pub fn kobj_unmap(domain: Arc<LockedKObjMap>, dev_t: DeviceNumber, range: usize)
     {
         for i in 0..range {
             let rm_dev_t = &DeviceNumber::new(dev_t.major(), dev_t.minor() + i as u32);
-            match map.get(rm_dev_t) {
-                Some(_) => {
-                    map.remove(rm_dev_t);
-                }
-                None => {}
+            if map.get(rm_dev_t).is_some() {
+                map.remove(rm_dev_t);
             }
         }
     }

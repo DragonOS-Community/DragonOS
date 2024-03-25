@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use sbi_rt::HartMask;
 
 use crate::{
     init::boot_params,
@@ -9,6 +10,9 @@ use crate::{
 
 /// 栈对齐
 pub(super) const STACK_ALIGN: usize = 16;
+
+/// RISC-V的XLEN，也就是寄存器的位宽
+pub const RISCV_XLEN: usize = core::mem::size_of::<usize>() * 8;
 
 /// 获取当前cpu的id
 #[inline]
@@ -21,7 +25,13 @@ pub fn current_cpu_id() -> ProcessorId {
 
     unsafe { (*ptr).current_cpu() }
 }
-
+impl Into<HartMask> for ProcessorId {
+    fn into(self) -> HartMask {
+        let base = self.data() as usize / RISCV_XLEN;
+        let offset = self.data() as usize & (RISCV_XLEN - 1);
+        HartMask::from_mask_base(offset, base)
+    }
+}
 /// 重置cpu
 pub unsafe fn cpu_reset() -> ! {
     sbi_rt::system_reset(sbi_rt::WarmReboot, sbi_rt::NoReason);

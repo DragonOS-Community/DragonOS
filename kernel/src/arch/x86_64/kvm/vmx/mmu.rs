@@ -53,7 +53,8 @@ pub struct KvmMmuPageRole {
 //     num_objs: u32,
 //     objs: [*mut u8; KVM_NR_MEM_OBJS as usize],
 // }
-
+pub type KvmMmuPageFaultHandler =
+    fn(vcpu: &mut VmxVcpu, gpa: u64, error_code: u32, prefault: bool) -> Result<(), SystemError>;
 #[derive(Default)]
 pub struct KvmMmu {
     pub root_hpa: u64,
@@ -62,14 +63,7 @@ pub struct KvmMmu {
     // ...还有一些变量不知道用来做什么
     pub get_cr3: Option<fn(&VmxVcpu) -> u64>,
     pub set_eptp: Option<fn(u64) -> Result<(), SystemError>>,
-    pub page_fault: Option<
-        fn(
-            vcpu: &mut VmxVcpu,
-            gpa: u64,
-            error_code: u32,
-            prefault: bool,
-        ) -> Result<(), SystemError>,
-    >,
+    pub page_fault: Option<KvmMmuPageFaultHandler>,
     // get_pdptr: Option<fn(& VmxVcpu, index:u32) -> u64>, // Page Directory Pointer Table Register?暂时不知道和CR3的区别是什么
     // inject_page_fault: Option<fn(&mut VmxVcpu, fault: &X86Exception)>,
     // gva_to_gpa: Option<fn(&mut VmxVcpu, gva: u64, access: u32, exception: &X86Exception) -> u64>,
@@ -97,7 +91,7 @@ fn tdp_get_cr3(_vcpu: &VmxVcpu) -> u64 {
 fn tdp_set_eptp(root_hpa: u64) -> Result<(), SystemError> {
     // 设置权限位，目前是写死的，可读可写可执行
     //  EPT paging-structure memory type: Uncacheable
-    let mut eptp = 0x0 as u64;
+    let mut eptp = 0x0_u64;
     // This value is 1 less than the EPT page-walk length.  3 means 4-level paging.
     eptp |= 0x3 << 3;
     eptp |= root_hpa & (PAGE_MASK as u64);
@@ -121,7 +115,7 @@ fn tdp_page_fault(
                    // fast_page_fault(vcpu, gpa, level, error_code)
                    // gfn->pfn
     let mut map_writable = false;
-    let write = error_code & ((1 as u32) << 1);
+    let write = error_code & ((1_u32) << 1);
     let pfn = mmu_gfn_to_pfn_fast(vcpu, gpa, prefault, gfn, write == 0, &mut map_writable)?;
     // direct map就是映射ept页表的过程
     __direct_map(vcpu, gpa, write, map_writable, level, gfn, pfn, prefault)?;
@@ -206,6 +200,7 @@ pub fn init_kvm_tdp_mmu(vcpu: &Mutex<VmxVcpu>) {
     // }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn __direct_map(
     vcpu: &mut VmxVcpu,
     gpa: u64,
@@ -223,11 +218,10 @@ pub fn __direct_map(
     }
     // 把gpa映射到hpa
     let mut ept_mapper = EptMapper::lock();
-    let page_flags = PageFlags::from_prot_flags(ProtFlags::from_bits_truncate(0x7 as u64), false);
+    let page_flags = PageFlags::from_prot_flags(ProtFlags::from_bits_truncate(0x7_u64), false);
     unsafe {
         assert!(ept_mapper.walk(gpa, pfn << PAGE_SHIFT, page_flags).is_ok());
     }
-    drop(ept_mapper);
     return Ok(0);
 }
 

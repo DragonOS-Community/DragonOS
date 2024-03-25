@@ -71,7 +71,12 @@ fn print_node(node: FdtNode<'_, '_>, n_spaces: usize) {
     println!("{}/", node.name);
     node.properties().for_each(|p| {
         (0..n_spaces + 4).for_each(|_| print!(" "));
-        println!("{}: {:?}", p.name, p.value);
+
+        if p.name == "compatible" {
+            println!("{}: {:?}", p.name, p.as_str());
+        } else {
+            println!("{}: {:?}", p.name, p.value);
+        }
     });
 
     for child in node.children() {

@@ -181,7 +181,7 @@ pub enum LocalApicTimerMode {
 
 impl LocalApicTimer {
     /// 定时器中断的间隔
-    pub const INTERVAL_MS: u64 = 1000 / HZ as u64;
+    pub const INTERVAL_MS: u64 = 1000 / HZ;
     pub const DIVISOR: u64 = 4;
 
     /// IoApicManager 初值为0或false
@@ -244,7 +244,7 @@ impl LocalApicTimer {
 
     fn set_divisor(&mut self, divisor: u32) {
         self.divisor = divisor;
-        CurrentApic.set_timer_divisor(divisor as u32);
+        CurrentApic.set_timer_divisor(divisor);
     }
 
     fn set_initial_cnt(&mut self, initial_count: u64) {
@@ -307,10 +307,7 @@ impl CurrentApic {
             unsafe { wrmsr(IA32_X2APIC_DIV_CONF, divisor.into()) };
         } else {
             unsafe {
-                self.write_xapic_register(
-                    XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_CLKDIV,
-                    divisor.into(),
-                )
+                self.write_xapic_register(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_CLKDIV, divisor)
             };
         }
     }
@@ -318,7 +315,7 @@ impl CurrentApic {
     fn set_timer_initial_count(&self, initial_count: u64) {
         if self.x2apic_enabled() {
             unsafe {
-                wrmsr(IA32_X2APIC_INIT_COUNT.into(), initial_count);
+                wrmsr(IA32_X2APIC_INIT_COUNT, initial_count);
             }
         } else {
             unsafe {

@@ -22,7 +22,7 @@ use super::{
     Device, DeviceManager,
 };
 
-static PROBE_WAIT_QUEUE: WaitQueue = WaitQueue::INIT;
+static PROBE_WAIT_QUEUE: WaitQueue = WaitQueue::default();
 
 impl DeviceManager {
     /// 尝试把一个设备与一个驱动匹配
@@ -84,21 +84,18 @@ impl DeviceManager {
         } else {
             let bus = dev
                 .bus()
-                .map(|bus| bus.upgrade())
-                .flatten()
+                .and_then(|bus| bus.upgrade())
                 .ok_or(SystemError::EINVAL)?;
             let mut data = DeviceAttachData::new(dev.clone(), allow_async, false);
             let mut flag = false;
             for driver in bus.subsystem().drivers().iter() {
-                let r = self.do_device_attach_driver(&driver, &mut data);
+                let r = self.do_device_attach_driver(driver, &mut data);
                 if unlikely(r.is_err()) {
                     flag = false;
                     break;
-                } else {
-                    if r.unwrap() == true {
-                        flag = true;
-                        break;
-                    }
+                } else if r.unwrap() {
+                    flag = true;
+                    break;
                 }
             }
 
@@ -145,7 +142,7 @@ impl DeviceManager {
         driver: &Arc<dyn Driver>,
         data: &mut DeviceAttachData,
     ) -> Result<bool, SystemError> {
-        if let Some(bus) = driver.bus().map(|bus| bus.upgrade()).flatten() {
+        if let Some(bus) = driver.bus().and_then(|bus| bus.upgrade()) {
             let r = bus.match_device(&data.dev, driver);
 
             if let Err(e) = r {
@@ -158,10 +155,8 @@ impl DeviceManager {
                     );
                     return Err(e);
                 }
-            } else {
-                if r.unwrap() == false {
-                    return Ok(false);
-                }
+            } else if !r.unwrap() {
+                return Ok(false);
             }
         }
 
@@ -185,11 +180,7 @@ impl DeviceManager {
     ///
     /// 如果传递的设备已成功完成对驱动程序的探测，则返回true，否则返回false。
     pub fn device_is_bound(&self, dev: &Arc<dyn Device>) -> bool {
-        if dev.driver().is_some() {
-            return true;
-        } else {
-            return false;
-        }
+        return dev.driver().is_some();
     }
 
     /// 把一个驱动绑定到设备上
@@ -211,14 +202,12 @@ impl DeviceManager {
             self.device_links_force_bind(dev);
             driver_manager().driver_bound(dev);
             return Err(e);
-        } else {
-            if let Some(bus) = dev.bus().map(|bus| bus.upgrade()).flatten() {
-                bus.subsystem().bus_notifier().call_chain(
-                    BusNotifyEvent::DriverNotBound,
-                    Some(dev),
-                    None,
-                );
-            }
+        } else if let Some(bus) = dev.bus().and_then(|bus| bus.upgrade()) {
+            bus.subsystem().bus_notifier().call_chain(
+                BusNotifyEvent::DriverNotBound,
+                Some(dev),
+                None,
+            );
         }
         return r;
     }
@@ -285,11 +274,10 @@ impl DriverManager {
     pub fn driver_attach(&self, driver: &Arc<dyn Driver>) -> Result<(), SystemError> {
         let bus = driver
             .bus()
-            .map(|bus| bus.upgrade())
-            .flatten()
+            .and_then(|bus| bus.upgrade())
             .ok_or(SystemError::EINVAL)?;
         for dev in bus.subsystem().devices().iter() {
-            if self.do_driver_attach(&dev, &driver) {
+            if self.do_driver_attach(dev, driver) {
                 // 匹配成功
                 return Ok(());
             }
@@ -301,7 +289,7 @@ impl DriverManager {
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#1134
     fn do_driver_attach(&self, device: &Arc<dyn Device>, driver: &Arc<dyn Driver>) -> bool {
         let r = self.match_device(driver, device).unwrap_or(false);
-        if r == false {
+        if !r {
             // 不匹配
             return false;
         }
@@ -328,8 +316,7 @@ impl DriverManager {
     ) -> Result<bool, SystemError> {
         return driver
             .bus()
-            .map(|bus| bus.upgrade())
-            .flatten()
+            .and_then(|bus| bus.upgrade())
             .unwrap()
             .match_device(device, driver);
     }
@@ -384,7 +371,7 @@ impl DriverManager {
         };
 
         let sysfs_failed = || {
-            if let Some(bus) = device.bus().map(|bus| bus.upgrade()).flatten() {
+            if let Some(bus) = device.bus().and_then(|bus| bus.upgrade()) {
                 bus.subsystem().bus_notifier().call_chain(
                     BusNotifyEvent::DriverNotBound,
                     Some(device),
@@ -467,10 +454,10 @@ impl DriverManager {
     fn add_to_sysfs(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
         let driver = device.driver().ok_or(SystemError::EINVAL)?;
 
-        if let Some(bus) = device.bus().map(|bus| bus.upgrade()).flatten() {
+        if let Some(bus) = device.bus().and_then(|bus| bus.upgrade()) {
             bus.subsystem().bus_notifier().call_chain(
                 BusNotifyEvent::BindDriver,
-                Some(&device),
+                Some(device),
                 None,
             );
         }
@@ -514,8 +501,7 @@ impl DriverManager {
     ) -> Result<(), SystemError> {
         let bus = device
             .bus()
-            .map(|bus| bus.upgrade())
-            .flatten()
+            .and_then(|bus| bus.upgrade())
             .ok_or(SystemError::EINVAL)?;
         let r = bus.probe(device);
         if r == Err(SystemError::EOPNOTSUPP_OR_ENOTSUP) {
@@ -566,7 +552,7 @@ impl DriverManager {
         let driver = device.driver().unwrap();
         driver.add_device(device.clone());
 
-        if let Some(bus) = device.bus().map(|bus| bus.upgrade()).flatten() {
+        if let Some(bus) = device.bus().and_then(|bus| bus.upgrade()) {
             bus.subsystem().bus_notifier().call_chain(
                 BusNotifyEvent::BoundDriver,
                 Some(device),

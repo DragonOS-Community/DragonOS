@@ -25,19 +25,18 @@
 #![cfg_attr(target_os = "none", no_std)]
 // clippy的配置
 #![deny(clippy::all)]
+#![allow(clippy::bad_bit_mask)]
 // DragonOS允许在函数中使用return语句（尤其是长函数时，我们推荐这么做）
 #![allow(clippy::let_and_return)]
 #![allow(clippy::needless_pass_by_ref_mut)]
 #![allow(clippy::needless_return)]
+#![allow(clippy::single_char_pattern)]
 #![allow(clippy::upper_case_acronyms)]
 
 #[cfg(test)]
 #[macro_use]
 extern crate std;
 
-#[allow(non_upper_case_globals)]
-#[allow(non_camel_case_types)]
-#[allow(non_snake_case)]
 use core::panic::PanicInfo;
 
 /// 导出x86_64架构相关的代码，命名为arch模块
@@ -146,6 +145,6 @@ pub fn panic(info: &PanicInfo) -> ! {
         };
     }
 
-    println!("Current PCB:\n\t{:?}", *(ProcessManager::current_pcb()));
+    println!("Current PCB:\n\t{:?}", (ProcessManager::current_pcb()));
     ProcessManager::exit(usize::MAX);
 }

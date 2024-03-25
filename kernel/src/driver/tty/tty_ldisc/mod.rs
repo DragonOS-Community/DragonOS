@@ -103,8 +103,7 @@ impl TtyLdiscManager {
         let ld = tty.ldisc();
 
         let ret = ld.open(tty);
-        if ret.is_err() {
-            let err = ret.unwrap_err();
+        if let Err(err) = ret {
             if err == SystemError::ENOSYS {
                 return Err(err);
             }

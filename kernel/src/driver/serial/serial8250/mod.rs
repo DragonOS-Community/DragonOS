@@ -249,7 +249,7 @@ impl Device for Serial8250ISADevices {
         true
     }
 
-    fn set_class(&self, _class: Option<Arc<dyn Class>>) {
+    fn set_class(&self, _class: Option<Weak<dyn Class>>) {
         todo!()
     }
 }
@@ -497,7 +497,7 @@ impl KObject for Serial8250ISADriver {
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.inner.read().kobj_type.clone()
+        self.inner.read().kobj_type
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {

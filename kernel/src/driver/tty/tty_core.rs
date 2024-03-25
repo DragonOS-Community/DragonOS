@@ -1,4 +1,7 @@
-use core::{fmt::Debug, sync::atomic::AtomicBool};
+use core::{
+    fmt::Debug,
+    sync::atomic::{AtomicBool, AtomicUsize},
+};
 
 use alloc::{collections::LinkedList, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
@@ -43,7 +46,7 @@ impl TtyCore {
             termios: RwLock::new(termios),
             name,
             flags: RwLock::new(TtyFlag::empty()),
-            count: RwLock::new(0),
+            count: AtomicUsize::new(0),
             window_size: RwLock::new(WindowSize::default()),
             read_wq: EventWaitQueue::new(),
             write_wq: EventWaitQueue::new(),
@@ -129,7 +132,7 @@ impl TtyCore {
     }
 
     pub fn tty_wakeup(&self) {
-        if self.core.flags.read().contains(TtyFlag::DO_WRITE_WAKEUP) {
+        if self.core.flags().contains(TtyFlag::DO_WRITE_WAKEUP) {
             let _ = self.ldisc().write_wakeup(self.core());
         }
 
@@ -139,18 +142,17 @@ impl TtyCore {
     }
 
     pub fn tty_mode_ioctl(tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<usize, SystemError> {
-        let real_tty;
         let core = tty.core();
-        if core.driver().tty_driver_type() == TtyDriverType::Pty
+        let real_tty = if core.driver().tty_driver_type() == TtyDriverType::Pty
             && core.driver().tty_driver_sub_type() == TtyDriverSubType::PtyMaster
         {
-            real_tty = core.link().unwrap();
+            core.link().unwrap()
         } else {
-            real_tty = tty;
-        }
+            tty
+        };
         match cmd {
             TtyIoctlCmd::TCGETS => {
-                let termios = PosixTermios::from_kernel_termios(real_tty.core.termios().clone());
+                let termios = PosixTermios::from_kernel_termios(*real_tty.core.termios());
                 let mut user_writer = UserBufferWriter::new(
                     VirtAddr::new(arg).as_ptr::<PosixTermios>(),
                     core::mem::size_of::<PosixTermios>(),
@@ -187,7 +189,7 @@ impl TtyCore {
     ) -> Result<usize, SystemError> {
         #[allow(unused_assignments)]
         // TERMIOS_TERMIO下会用到
-        let mut tmp_termios = tty.core().termios().clone();
+        let mut tmp_termios = *tty.core().termios();
 
         if opt.contains(TtySetTermiosOpt::TERMIOS_TERMIO) {
             todo!()
@@ -220,7 +222,7 @@ impl TtyCore {
     pub fn set_termios_next(tty: Arc<TtyCore>, new_termios: Termios) -> Result<(), SystemError> {
         let mut termios = tty.core().termios_write();
 
-        let old_termios = termios.clone();
+        let old_termios = *termios;
         *termios = new_termios;
         let tmp = termios.control_mode;
         termios.control_mode ^= (tmp ^ old_termios.control_mode) & ControlMode::ADDRB;
@@ -242,7 +244,7 @@ impl TtyCore {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct TtyContorlInfo {
     /// 前台进程pid
     pub session: Option<Pid>,
@@ -252,17 +254,6 @@ pub struct TtyContorlInfo {
     /// packet模式下使用，目前未用到
     pub pktstatus: u8,
     pub packet: bool,
-}
-
-impl Default for TtyContorlInfo {
-    fn default() -> Self {
-        Self {
-            session: None,
-            pgid: None,
-            pktstatus: Default::default(),
-            packet: Default::default(),
-        }
-    }
 }
 
 #[derive(Debug, Default)]
@@ -289,7 +280,7 @@ pub struct TtyCoreData {
     flags: RwLock<TtyFlag>,
     /// 在初始化时即确定不会更改，所以这里不用加锁
     index: usize,
-    count: RwLock<usize>,
+    count: AtomicUsize,
     /// 窗口大小
     window_size: RwLock<WindowSize>,
     /// 读等待队列
@@ -338,7 +329,7 @@ impl TtyCoreData {
 
     #[inline]
     pub fn flags(&self) -> TtyFlag {
-        self.flags.read().clone()
+        *self.flags.read_irqsave()
     }
 
     #[inline]
@@ -353,14 +344,14 @@ impl TtyCoreData {
 
     #[inline]
     pub fn set_termios(&self, termios: Termios) {
-        let mut termios_guard = self.termios.write_irqsave();
+        let mut termios_guard = self.termios_write();
         *termios_guard = termios;
     }
 
     #[inline]
     pub fn add_count(&self) {
-        let mut guard = self.count.write();
-        *guard += 1;
+        self.count
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     }
 
     #[inline]

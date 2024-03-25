@@ -108,7 +108,7 @@ impl TrapFrame {
     /// 中断栈帧在栈上的大小
     pub const SIZE_ON_STACK: usize = align_up(Self::SIZE, STACK_ALIGN);
     /// 判断当前中断是否来自用户模式
-    pub fn from_user(&self) -> bool {
+    pub fn is_from_user(&self) -> bool {
         self.status.spp() == riscv::register::sstatus::SPP::User
     }
 }

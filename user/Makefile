@@ -60,8 +60,7 @@ all:
 	@echo 用户态程序编译完成
 
 copy_services: dadk_run
-	@mkdir -p $(ROOT_PATH)/bin/sysroot/etc/reach/system
-	cp -r services/* $(ROOT_PATH)/bin/sysroot/etc/reach/system/
+	cp -r sysconfig/* $(ROOT_PATH)/bin/sysroot/
 
 
 .PHONY: clean

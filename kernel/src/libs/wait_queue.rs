@@ -27,7 +27,9 @@ pub struct WaitQueue(SpinLock<InnerWaitQueue>);
 
 #[allow(dead_code)]
 impl WaitQueue {
-    pub const INIT: WaitQueue = WaitQueue(SpinLock::new(InnerWaitQueue::INIT));
+    pub const fn default() -> Self {
+        WaitQueue(SpinLock::new(InnerWaitQueue::INIT))
+    }
 
     /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断
     pub fn sleep(&self) {
@@ -77,7 +79,7 @@ impl WaitQueue {
     pub unsafe fn sleep_without_schedule(&self) {
         before_sleep_check(1);
         // 安全检查：确保当前处于中断禁止状态
-        assert!(CurrentIrqArch::is_irq_enabled() == false);
+        assert!(!CurrentIrqArch::is_irq_enabled());
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
             panic!("sleep error: {:?}", e);
@@ -89,7 +91,7 @@ impl WaitQueue {
     pub unsafe fn sleep_without_schedule_uninterruptible(&self) {
         before_sleep_check(1);
         // 安全检查：确保当前处于中断禁止状态
-        assert!(CurrentIrqArch::is_irq_enabled() == false);
+        assert!(!CurrentIrqArch::is_irq_enabled());
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         ProcessManager::mark_sleep(false).unwrap_or_else(|e| {
             panic!("sleep error: {:?}", e);

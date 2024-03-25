@@ -117,9 +117,7 @@ impl SchedulerRT {
         }
         // 为每个cpu核心创建负载统计队列
         for _ in 0..PerCpu::MAX_CPU_NUM {
-            result
-                .load_list
-                .push(Box::leak(Box::new(LinkedList::new())));
+            result.load_list.push(Box::leak(Box::default()));
         }
         return result;
     }
@@ -144,7 +142,7 @@ impl SchedulerRT {
         for prio in 0..SchedulerRT::MAX_RT_PRIO {
             sum += self.cpu_queue[cpu_id.data() as usize][prio as usize].get_rt_queue_size();
         }
-        return sum as usize;
+        return sum;
     }
 
     #[allow(dead_code)]
@@ -205,7 +203,7 @@ impl Scheduler for SchedulerRT {
                     // 判断这个进程时间片是否耗尽，若耗尽则将其时间片赋初值然后入队
                     if proc.sched_info().rt_time_slice() <= 0 {
                         proc.sched_info()
-                            .set_rt_time_slice(SchedulerRT::RR_TIMESLICE as isize);
+                            .set_rt_time_slice(SchedulerRT::RR_TIMESLICE);
                         proc.flags().insert(ProcessFlags::NEED_SCHEDULE);
                         sched_enqueue(proc, false);
                     }

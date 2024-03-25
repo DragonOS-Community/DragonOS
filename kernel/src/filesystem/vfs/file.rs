@@ -61,6 +61,7 @@ bitflags! {
     ///
     /// 与Linux 5.19.10的uapi/asm-generic/fcntl.h相同
     /// https://code.dragonos.org.cn/xref/linux-5.19.10/tools/include/uapi/asm-generic/fcntl.h#19
+    #[allow(clippy::bad_bit_mask)]
     pub struct FileMode: u32{
         /* File access modes for `open' and `fcntl'.  */
         /// Open Read-only
@@ -138,13 +139,10 @@ impl File {
     pub fn new(inode: Arc<dyn IndexNode>, mode: FileMode) -> Result<Self, SystemError> {
         let mut inode = inode;
         let file_type = inode.metadata()?.file_type;
-        match file_type {
-            FileType::Pipe => {
-                if let Some(SpecialNodeData::Pipe(pipe_inode)) = inode.special_node() {
-                    inode = pipe_inode;
-                }
+        if file_type == FileType::Pipe {
+            if let Some(SpecialNodeData::Pipe(pipe_inode)) = inode.special_node() {
+                inode = pipe_inode;
             }
-            _ => {}
         }
 
         let mut f = File {
@@ -289,22 +287,17 @@ impl File {
             _ => {}
         }
 
-        let pos: i64;
-        match origin {
-            SeekFrom::SeekSet(offset) => {
-                pos = offset;
-            }
-            SeekFrom::SeekCurrent(offset) => {
-                pos = self.offset as i64 + offset;
-            }
+        let pos: i64 = match origin {
+            SeekFrom::SeekSet(offset) => offset,
+            SeekFrom::SeekCurrent(offset) => self.offset as i64 + offset,
             SeekFrom::SeekEnd(offset) => {
                 let metadata = self.metadata()?;
-                pos = metadata.size + offset;
+                metadata.size + offset
             }
             SeekFrom::Invalid => {
                 return Err(SystemError::EINVAL);
             }
-        }
+        };
         // 根据linux man page, lseek允许超出文件末尾，并且不改变文件大小
         // 当pos超出文件末尾时，read返回0。直到开始写入数据时，才会改变文件大小
         if pos < 0 {
@@ -355,7 +348,7 @@ impl File {
             return Ok(0);
         }
         let name = &self.readdir_subdirs_name[self.offset];
-        let sub_inode: Arc<dyn IndexNode> = match inode.find(&name) {
+        let sub_inode: Arc<dyn IndexNode> = match inode.find(name) {
             Ok(i) => i,
             Err(e) => {
                 kerror!(
@@ -401,9 +394,9 @@ impl File {
     pub fn try_clone(&self) -> Option<File> {
         let mut res = Self {
             inode: self.inode.clone(),
-            offset: self.offset.clone(),
-            mode: self.mode.clone(),
-            file_type: self.file_type.clone(),
+            offset: self.offset,
+            mode: self.mode,
+            file_type: self.file_type,
             readdir_subdirs_name: self.readdir_subdirs_name.clone(),
             private_data: self.private_data.clone(),
         };
@@ -573,11 +566,7 @@ impl FileDescriptorVec {
     /// @return false 不合法
     #[inline]
     pub fn validate_fd(fd: i32) -> bool {
-        if fd < 0 || fd as usize > FileDescriptorVec::PROCESS_MAX_FD {
-            return false;
-        } else {
-            return true;
-        }
+        return !(fd < 0 || fd as usize > FileDescriptorVec::PROCESS_MAX_FD);
     }
 
     /// 申请文件描述符，并把文件对象存入其中。
@@ -592,9 +581,7 @@ impl FileDescriptorVec {
     /// - `Ok(i32)` 申请成功，返回申请到的文件描述符
     /// - `Err(SystemError)` 申请失败，返回错误码，并且，file对象将被drop掉
     pub fn alloc_fd(&mut self, file: File, fd: Option<i32>) -> Result<i32, SystemError> {
-        if fd.is_some() {
-            // 指定了要申请的文件描述符编号
-            let new_fd = fd.unwrap();
+        if let Some(new_fd) = fd {
             let x = &mut self.fds[new_fd as usize];
             if x.is_none() {
                 *x = Some(Arc::new(SpinLock::new(file)));
@@ -623,7 +610,7 @@ impl FileDescriptorVec {
         if !FileDescriptorVec::validate_fd(fd) {
             return None;
         }
-        return self.fds[fd as usize].clone();
+        self.fds[fd as usize].clone()
     }
 
     /// 释放文件描述符，同时关闭文件。

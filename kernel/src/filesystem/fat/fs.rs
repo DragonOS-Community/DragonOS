@@ -1,3 +1,4 @@
+use core::cmp::Ordering;
 use core::intrinsics::unlikely;
 use core::{any::Any, fmt::Debug};
 use system_error::SystemError;
@@ -179,11 +180,11 @@ impl LockedFATInode {
         };
 
         let inode: Arc<LockedFATInode> = Arc::new(LockedFATInode(SpinLock::new(FATInode {
-            parent: parent,
+            parent,
             self_ref: Weak::default(),
             children: BTreeMap::new(),
             fs: Arc::downgrade(&fs),
-            inode_type: inode_type,
+            inode_type,
             metadata: Metadata {
                 dev_id: 0,
                 inode_id: generate_inode_id(),
@@ -197,7 +198,7 @@ impl LockedFATInode {
                 atime: TimeSpec::default(),
                 mtime: TimeSpec::default(),
                 ctime: TimeSpec::default(),
-                file_type: file_type,
+                file_type,
                 mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
                 uid: 0,
@@ -336,11 +337,11 @@ impl FATFileSystem {
         })));
 
         let result: Arc<FATFileSystem> = Arc::new(FATFileSystem {
-            partition: partition,
+            partition,
             bpb,
             first_data_sector,
             fs_info: Arc::new(LockedFATFsInfo::new(fs_info)),
-            root_inode: root_inode,
+            root_inode,
         });
 
         // 对root inode加锁，并继续完成初始化工作
@@ -390,11 +391,10 @@ impl FATFileSystem {
         // FAT表项在逻辑块内的字节偏移量
         let blk_offset = self.get_in_block_offset(fat_bytes_offset);
 
-        let mut v = Vec::<u8>::new();
-        v.resize(self.bpb.bytes_per_sector as usize, 0);
+        let mut v: Vec<u8> = vec![0; self.bpb.bytes_per_sector as usize];
         self.partition
             .disk()
-            .read_at(fat_ent_lba as usize, 1 * self.lba_per_sector(), &mut v)?;
+            .read_at(fat_ent_lba as usize, self.lba_per_sector(), &mut v)?;
 
         let mut cursor = VecCursor::new(v);
         cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
@@ -442,7 +442,7 @@ impl FATFileSystem {
                 let entry = cursor.read_u32()? & 0x0fffffff;
 
                 match entry {
-                    _n if (current_cluster >= 0x0ffffff7 && current_cluster <= 0x0fffffff) => {
+                    _n if (0x0ffffff7..=0x0fffffff).contains(&current_cluster) => {
                         // 当前簇号不是一个能被获得的簇（可能是文件系统出错了）
                         kerror!("FAT32 get fat entry: current cluster number [{}] is not an allocatable cluster number.", current_cluster);
                         FATEntry::Bad
@@ -484,11 +484,10 @@ impl FATFileSystem {
         // FAT表项在逻辑块内的字节偏移量
         let blk_offset = self.get_in_block_offset(fat_bytes_offset);
 
-        let mut v = Vec::<u8>::new();
-        v.resize(self.bpb.bytes_per_sector as usize, 0);
+        let mut v: Vec<u8> = vec![0; self.bpb.bytes_per_sector as usize];
         self.partition
             .disk()
-            .read_at(fat_ent_lba, 1 * self.lba_per_sector(), &mut v)?;
+            .read_at(fat_ent_lba, self.lba_per_sector(), &mut v)?;
 
         let mut cursor = VecCursor::new(v);
         cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
@@ -571,10 +570,7 @@ impl FATFileSystem {
         let end_cluster: Cluster = self.max_cluster_number();
         let start_cluster: Cluster = match self.bpb.fat_type {
             FATType::FAT32(_) => {
-                let next_free: u64 = match self.fs_info.0.lock().next_free() {
-                    Some(x) => x,
-                    None => 0xffffffff,
-                };
+                let next_free: u64 = self.fs_info.0.lock().next_free().unwrap_or(0xffffffff);
                 if next_free < end_cluster.cluster_num {
                     Cluster::new(next_free)
                 } else {
@@ -777,7 +773,7 @@ impl FATFileSystem {
     /// @brief 获取从start_cluster开始的簇链中，第n个簇的信息。（请注意，下标从0开始）
     #[inline]
     pub fn get_cluster_by_relative(&self, start_cluster: Cluster, n: usize) -> Option<Cluster> {
-        return self.cluster_iter(start_cluster).skip(n).next();
+        return self.cluster_iter(start_cluster).nth(n);
     }
 
     /// @brief 获取整个簇链的最后一个簇
@@ -953,8 +949,7 @@ impl FATFileSystem {
 
                 // 由于FAT12的FAT表不大于6K，因此直接读取6K
                 let num_lba = (6 * 1024) / LBA_SIZE;
-                let mut v: Vec<u8> = Vec::new();
-                v.resize(num_lba * LBA_SIZE, 0);
+                let mut v: Vec<u8> = vec![0; num_lba * LBA_SIZE];
                 self.partition.disk().read_at(lba, num_lba, &mut v)?;
 
                 let mut cursor: VecCursor = VecCursor::new(v);
@@ -968,7 +963,7 @@ impl FATFileSystem {
                         packed_val & 0x0fff
                     };
                     if val == 0 {
-                        return Ok(Cluster::new(cluster as u64));
+                        return Ok(Cluster::new(cluster));
                     }
 
                     cluster += 1;
@@ -999,8 +994,7 @@ impl FATFileSystem {
 
                     let lba = self.get_lba_from_offset(self.bytes_to_sector(part_bytes_offset));
 
-                    let mut v: Vec<u8> = Vec::new();
-                    v.resize(self.lba_per_sector() * LBA_SIZE, 0);
+                    let mut v: Vec<u8> = vec![0; self.lba_per_sector() * LBA_SIZE];
                     self.partition
                         .disk()
                         .read_at(lba, self.lba_per_sector(), &mut v)?;
@@ -1031,8 +1025,7 @@ impl FATFileSystem {
 
                     let lba = self.get_lba_from_offset(self.bytes_to_sector(part_bytes_offset));
 
-                    let mut v: Vec<u8> = Vec::new();
-                    v.resize(self.lba_per_sector() * LBA_SIZE, 0);
+                    let mut v: Vec<u8> = vec![0; self.lba_per_sector() * LBA_SIZE];
                     self.partition
                         .disk()
                         .read_at(lba, self.lba_per_sector(), &mut v)?;
@@ -1080,8 +1073,7 @@ impl FATFileSystem {
 
                 let lba = self.get_lba_from_offset(self.bytes_to_sector(fat_part_bytes_offset));
 
-                let mut v: Vec<u8> = Vec::new();
-                v.resize(LBA_SIZE, 0);
+                let mut v: Vec<u8> = vec![0; LBA_SIZE];
                 self.partition.disk().read_at(lba, 1, &mut v)?;
 
                 let mut cursor: VecCursor = VecCursor::new(v);
@@ -1113,8 +1105,7 @@ impl FATFileSystem {
 
                 let lba = self.get_lba_from_offset(self.bytes_to_sector(fat_part_bytes_offset));
 
-                let mut v: Vec<u8> = Vec::new();
-                v.resize(LBA_SIZE, 0);
+                let mut v: Vec<u8> = vec![0; LBA_SIZE];
                 self.partition.disk().read_at(lba, 1, &mut v)?;
 
                 let mut cursor: VecCursor = VecCursor::new(v);
@@ -1140,8 +1131,7 @@ impl FATFileSystem {
                     let lba = self.get_lba_from_offset(self.bytes_to_sector(f_offset));
 
                     // kdebug!("set entry, lba={lba}, in_block_offset={in_block_offset}");
-                    let mut v: Vec<u8> = Vec::new();
-                    v.resize(LBA_SIZE, 0);
+                    let mut v: Vec<u8> = vec![0; LBA_SIZE];
                     self.partition.disk().read_at(lba, 1, &mut v)?;
 
                     let mut cursor: VecCursor = VecCursor::new(v);
@@ -1228,8 +1218,7 @@ impl FATFsInfo {
         in_disk_fs_info_offset: u64,
         bytes_per_sec: usize,
     ) -> Result<Self, SystemError> {
-        let mut v = Vec::<u8>::new();
-        v.resize(bytes_per_sec, 0);
+        let mut v = vec![0; bytes_per_sec];
 
         // 计算fs_info扇区在磁盘上的字节偏移量，从磁盘读取数据
         partition
@@ -1237,9 +1226,10 @@ impl FATFsInfo {
             .read_at(in_disk_fs_info_offset as usize / LBA_SIZE, 1, &mut v)?;
         let mut cursor = VecCursor::new(v);
 
-        let mut fsinfo = FATFsInfo::default();
-
-        fsinfo.lead_sig = cursor.read_u32()?;
+        let mut fsinfo = FATFsInfo {
+            lead_sig: cursor.read_u32()?,
+            ..Default::default()
+        };
         cursor.seek(SeekFrom::SeekCurrent(480))?;
         fsinfo.struc_sig = cursor.read_u32()?;
         fsinfo.free_count = cursor.read_u32()?;
@@ -1324,8 +1314,7 @@ impl FATFsInfo {
 
             let lba = off as usize / LBA_SIZE;
 
-            let mut v: Vec<u8> = Vec::new();
-            v.resize(LBA_SIZE, 0);
+            let mut v: Vec<u8> = vec![0; LBA_SIZE];
             partition.disk().read_at(lba, 1, &mut v)?;
 
             let mut cursor: VecCursor = VecCursor::new(v);
@@ -1353,8 +1342,7 @@ impl FATFsInfo {
 
             let lba = off as usize / LBA_SIZE;
 
-            let mut v: Vec<u8> = Vec::new();
-            v.resize(LBA_SIZE, 0);
+            let mut v: Vec<u8> = vec![0; LBA_SIZE];
             partition.disk().read_at(lba, 1, &mut v)?;
             let mut cursor: VecCursor = VecCursor::new(v);
             cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
@@ -1479,25 +1467,29 @@ impl IndexNode for LockedFATInode {
         match &mut guard.inode_type {
             FATDirEntry::File(file) | FATDirEntry::VolId(file) => {
                 // 如果新的长度和旧的长度相同，那么就直接返回
-                if len == old_size {
-                    return Ok(());
-                } else if len > old_size {
-                    // 如果新的长度比旧的长度大，那么就在文件末尾添加空白
-                    let mut buf: Vec<u8> = Vec::new();
-                    let mut remain_size = len - old_size;
-                    let buf_size = remain_size;
-                    // let buf_size = core::cmp::min(remain_size, 512 * 1024);
-                    buf.resize(buf_size, 0);
-
-                    let mut offset = old_size;
-                    while remain_size > 0 {
-                        let write_size = core::cmp::min(remain_size, buf_size);
-                        file.write(fs, &buf[0..write_size], offset as u64)?;
-                        remain_size -= write_size;
-                        offset += write_size;
+                match len.cmp(&old_size) {
+                    Ordering::Equal => {
+                        return Ok(());
                     }
-                } else {
-                    file.truncate(fs, len as u64)?;
+                    Ordering::Greater => {
+                        // 如果新的长度比旧的长度大，那么就在文件末尾添加空白
+                        let mut buf: Vec<u8> = Vec::new();
+                        let mut remain_size = len - old_size;
+                        let buf_size = remain_size;
+                        // let buf_size = core::cmp::min(remain_size, 512 * 1024);
+                        buf.resize(buf_size, 0);
+
+                        let mut offset = old_size;
+                        while remain_size > 0 {
+                            let write_size = core::cmp::min(remain_size, buf_size);
+                            file.write(fs, &buf[0..write_size], offset as u64)?;
+                            remain_size -= write_size;
+                            offset += write_size;
+                        }
+                    }
+                    Ordering::Less => {
+                        file.truncate(fs, len as u64)?;
+                    }
                 }
                 guard.update_metadata();
                 return Ok(());
@@ -1539,7 +1531,7 @@ impl IndexNode for LockedFATInode {
                     let name: String = ent.name();
                     // kdebug!("name={name}");
 
-                    if guard.children.contains_key(&name.to_uppercase()) == false
+                    if !guard.children.contains_key(&name.to_uppercase())
                         && name != "."
                         && name != ".."
                     {
@@ -1587,7 +1579,7 @@ impl IndexNode for LockedFATInode {
         let nod = guard.children.remove(&name.to_uppercase());
 
         // 若删除缓存中为管道的文件，则不需要再到磁盘删除
-        if let Some(_) = nod {
+        if nod.is_some() {
             let file_type = target_guard.metadata.file_type;
             if file_type == FileType::Pipe {
                 return Ok(());
@@ -1637,16 +1629,16 @@ impl IndexNode for LockedFATInode {
         // 再从磁盘删除
         let r: Result<(), SystemError> =
             dir.remove(guard.fs.upgrade().unwrap().clone(), name, true);
-        if r.is_ok() {
-            return r;
-        } else {
-            let r = r.unwrap_err();
-            if r == SystemError::ENOTEMPTY {
-                // 如果要删除的是目录，且不为空，则删除动作未发生，重新加入缓存
-                guard.children.insert(name.to_uppercase(), target.clone());
-                drop(target_guard);
+        match r {
+            Ok(_) => return r,
+            Err(r) => {
+                if r == SystemError::ENOTEMPTY {
+                    // 如果要删除的是目录，且不为空，则删除动作未发生，重新加入缓存
+                    guard.children.insert(name.to_uppercase(), target.clone());
+                    drop(target_guard);
+                }
+                return Err(r);
             }
-            return Err(r);
         }
     }
 
@@ -1777,7 +1769,7 @@ impl IndexNode for LockedFATInode {
         // 判断需要创建的类型
         if unlikely(mode.contains(ModeType::S_IFREG)) {
             // 普通文件
-            return Ok(self.create(filename, FileType::File, mode)?);
+            return self.create(filename, FileType::File, mode);
         }
 
         let nod = LockedFATInode::new(

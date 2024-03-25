@@ -14,7 +14,7 @@ use crate::{
 ///
 /// todo: 待smp模块重构后，从smp模块获取CPU数量。
 /// 目前由于smp模块初始化时机较晚，导致大部分内核模块无法在早期初始化PerCpu变量。
-const CPU_NUM: AtomicU32 = AtomicU32::new(PerCpu::MAX_CPU_NUM);
+static CPU_NUM_ATOMIC: AtomicU32 = AtomicU32::new(PerCpu::MAX_CPU_NUM);
 
 #[derive(Debug)]
 pub struct PerCpu;
@@ -32,13 +32,14 @@ impl PerCpu {
     /// 该函数会调用`smp_get_total_cpu()`获取CPU数量，然后将其存储在`CPU_NUM`中。
     #[allow(dead_code)]
     pub fn init() {
-        if CPU_NUM.load(core::sync::atomic::Ordering::SeqCst) != 0 {
+        let cpu_num: &AtomicU32 = &CPU_NUM_ATOMIC;
+        if cpu_num.load(core::sync::atomic::Ordering::SeqCst) != 0 {
             panic!("PerCpu::init() called twice");
         }
         let cpus = smp_cpu_manager().present_cpus_count();
         assert!(cpus > 0, "PerCpu::init(): present_cpus_count() returned 0");
 
-        CPU_NUM.store(cpus, core::sync::atomic::Ordering::SeqCst);
+        CPU_NUM_ATOMIC.store(cpus, core::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -65,7 +66,7 @@ impl<T> PerCpuVar<T> {
     ///
     /// - `data` - 每个CPU的数据的初始值。 传入的Vec的长度必须等于CPU的数量，否则返回None。
     pub fn new(data: Vec<T>) -> Option<Self> {
-        let cpu_num = CPU_NUM.load(core::sync::atomic::Ordering::SeqCst);
+        let cpu_num = CPU_NUM_ATOMIC.load(core::sync::atomic::Ordering::SeqCst);
         if cpu_num == 0 {
             panic!("PerCpu::init() not called");
         }
@@ -87,6 +88,7 @@ impl<T> PerCpuVar<T> {
         &self.inner[cpu_id.data() as usize]
     }
 
+    #[allow(clippy::mut_from_ref)]
     pub fn get_mut(&self) -> &mut T {
         let cpu_id = smp_get_processor_id();
         unsafe {
@@ -98,6 +100,7 @@ impl<T> PerCpuVar<T> {
         &self.inner[cpu_id.data() as usize]
     }
 
+    #[allow(clippy::mut_from_ref)]
     pub unsafe fn force_get_mut(&self, cpu_id: ProcessorId) -> &mut T {
         &mut (self as *const Self as *mut Self).as_mut().unwrap().inner[cpu_id.data() as usize]
     }

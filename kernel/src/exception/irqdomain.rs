@@ -198,7 +198,7 @@ impl IrqDomainManager {
         irq_data_guard.set_hwirq(hwirq);
         irq_data_guard.set_domain(Some(domain.clone()));
         drop(irq_data_guard);
-        let r = domain.ops.map(&domain, hwirq, irq);
+        let r = domain.ops.map(domain, hwirq, irq);
         if let Err(e) = r {
             if e != SystemError::ENOSYS {
                 if e != SystemError::EPERM {
@@ -216,7 +216,7 @@ impl IrqDomainManager {
             domain.set_name(chip.name().to_string());
         }
 
-        self.irq_domain_set_mapping(&domain, hwirq, irq_data);
+        self.irq_domain_set_mapping(domain, hwirq, irq_data);
 
         irq_manager().irq_clear_status_flags(irq, IrqLineStatus::IRQ_NOREQUEST)?;
 
@@ -249,7 +249,7 @@ impl IrqDomainManager {
             r = self.do_activate_irq(Some(irq_data.clone()), reserve);
         }
 
-        if !r.is_ok() {
+        if r.is_err() {
             irq_data.common_data().status().set_activated();
         }
 
@@ -264,21 +264,19 @@ impl IrqDomainManager {
     ) -> Result<(), SystemError> {
         let mut r = Ok(());
 
-        if irq_data.is_some() && irq_data.as_ref().unwrap().domain().is_some() {
-            let domain = irq_data.as_ref().unwrap().domain().unwrap();
+        if let Some(irq_data) = irq_data {
+            if let Some(domain) = irq_data.domain() {
+                let parent_data = irq_data.parent_data().and_then(|x| x.upgrade());
+                if let Some(parent_data) = parent_data.clone() {
+                    r = self.do_activate_irq(Some(parent_data), reserve);
+                }
 
-            let irq_data = irq_data.unwrap();
-
-            let parent_data = irq_data.parent_data().map(|x| x.upgrade()).flatten();
-            if let Some(parent_data) = parent_data.clone() {
-                r = self.do_activate_irq(Some(parent_data), reserve);
-            }
-
-            if r.is_err() {
-                let tmpr = domain.ops.activate(&domain, &irq_data, reserve);
-                if let Err(e) = tmpr {
-                    if e != SystemError::ENOSYS && parent_data.is_some() {
-                        self.do_deactivate_irq(parent_data);
+                if r.is_err() {
+                    let tmpr = domain.ops.activate(&domain, &irq_data, reserve);
+                    if let Err(e) = tmpr {
+                        if e != SystemError::ENOSYS && parent_data.is_some() {
+                            self.do_deactivate_irq(parent_data);
+                        }
                     }
                 }
             }
@@ -286,12 +284,12 @@ impl IrqDomainManager {
 
         return r;
     }
-
+    #[allow(clippy::only_used_in_recursion)]
     fn do_deactivate_irq(&self, irq_data: Option<Arc<IrqData>>) {
         if let Some(irq_data) = irq_data {
             if let Some(domain) = irq_data.domain() {
                 domain.ops.deactivate(&domain, &irq_data);
-                let pp = irq_data.parent_data().map(|x| x.upgrade()).flatten();
+                let pp = irq_data.parent_data().and_then(|x| x.upgrade());
 
                 if pp.is_some() {
                     self.do_deactivate_irq(pp);
@@ -312,6 +310,7 @@ impl IrqDomainManager {
     /// - `handler`: 中断流处理器
     /// - `handler_data`: 中断流处理程序数据
     /// - `handler_name`: 中断处理程序名称
+    #[allow(clippy::too_many_arguments)]
     pub fn domain_set_info(
         &self,
         domain: &Arc<IrqDomain>,
@@ -385,7 +384,7 @@ impl IrqDomainManager {
             if dt.domain().is_some() && Arc::ptr_eq(dt.domain().as_ref().unwrap(), domain) {
                 return Some(dt);
             }
-            irq_data = dt.parent_data().map(|x| x.upgrade()).flatten();
+            irq_data = dt.parent_data().and_then(|x| x.upgrade());
         }
 
         return None;

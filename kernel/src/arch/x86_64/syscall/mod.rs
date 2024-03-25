@@ -64,7 +64,7 @@ macro_rules! syscall_return {
 }
 
 #[no_mangle]
-pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> () {
+pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
     let syscall_num = frame.rax as usize;
     // 防止sys_sched由于超时无法退出导致的死锁
     if syscall_num == SYS_SCHED {
@@ -152,13 +152,13 @@ pub(super) unsafe fn init_syscall_64() {
     efer |= 0x1;
     x86::msr::wrmsr(x86::msr::IA32_EFER, efer);
 
-    let syscall_base = (1 as u16) << 3;
-    let sysret_base = ((4 as u16) << 3) | 3;
+    let syscall_base = (1_u16) << 3;
+    let sysret_base = ((4_u16) << 3) | 3;
     let high = (u32::from(sysret_base) << 16) | u32::from(syscall_base);
     // 初始化STAR寄存器
     x86::msr::wrmsr(x86::msr::IA32_STAR, u64::from(high) << 32);
 
     // 初始化LSTAR,该寄存器存储syscall指令入口
-    x86::msr::wrmsr(x86::msr::IA32_LSTAR, syscall_64 as u64);
+    x86::msr::wrmsr(x86::msr::IA32_LSTAR, syscall_64 as usize as u64);
     x86::msr::wrmsr(x86::msr::IA32_FMASK, 0xfffffffe);
 }

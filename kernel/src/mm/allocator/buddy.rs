@@ -64,7 +64,7 @@ impl<A> PageList<A> {
 #[derive(Debug)]
 pub struct BuddyAllocator<A> {
     // 存放每个阶的空闲“链表”的头部地址
-    free_area: [PhysAddr; (MAX_ORDER - MIN_ORDER) as usize],
+    free_area: [PhysAddr; MAX_ORDER - MIN_ORDER],
     /// 总页数
     total: PageFrameCount,
     phantom: PhantomData<A>,
@@ -81,8 +81,8 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         kdebug!("Free pages before init buddy: {:?}", initial_free_pages);
         kdebug!("Buddy entries: {}", Self::BUDDY_ENTRIES);
 
-        let mut free_area: [PhysAddr; (MAX_ORDER - MIN_ORDER) as usize] =
-            [PhysAddr::new(0); (MAX_ORDER - MIN_ORDER) as usize];
+        let mut free_area: [PhysAddr; MAX_ORDER - MIN_ORDER] =
+            [PhysAddr::new(0); MAX_ORDER - MIN_ORDER];
 
         // Buddy初始占用的空间从bump分配
         for f in free_area.iter_mut() {
@@ -157,11 +157,10 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                     }
                 }
             }
-
             // 然后从高往低，把剩余的页面加入链表
             let mut remain_bytes = remain_pages.data() * A::PAGE_SIZE;
 
-            assert!(remain_bytes < (1 << MAX_ORDER - 1));
+            assert!(remain_bytes < (1 << MAX_ORDER) - 1);
 
             for i in (MIN_ORDER..MAX_ORDER).rev() {
                 if remain_bytes >= (1 << i) {
@@ -214,7 +213,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     /// free_area的下标
     #[inline]
     fn order2index(order: u8) -> usize {
-        (order as usize - MIN_ORDER) as usize
+        order as usize - MIN_ORDER
     }
 
     /// 从空闲链表的开头，取出1个指定阶数的伙伴块，如果没有，则返回None
@@ -239,7 +238,6 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 if !next_page_list_addr.is_null() {
                     // 此时page_list已经没有空闲伙伴块了，又因为非唯一页，需要删除该page_list
                     self.free_area[Self::order2index(spec_order)] = next_page_list_addr;
-                    drop(page_list);
                     // kdebug!("FREE: page_list_addr={:b}", page_list_addr.data());
                     unsafe {
                         self.buddy_free(page_list_addr, MMArch::PAGE_SHIFT as u8);
@@ -284,7 +282,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                     if !page_list.next_page.is_null() {
                         // 此时page_list已经没有空闲伙伴块了，又因为非唯一页，需要删除该page_list
                         self.free_area[Self::order2index(spec_order)] = page_list.next_page;
-                        drop(page_list);
+                        let _ = page_list;
                         unsafe { self.buddy_free(page_list_addr, MMArch::PAGE_SHIFT as u8) };
                     } else {
                         Self::write_page(page_list_addr, page_list);
@@ -303,7 +301,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             }
             return None;
         };
-        let result: Option<PhysAddr> = alloc_in_specific_order(order as u8);
+        let result: Option<PhysAddr> = alloc_in_specific_order(order);
         // kdebug!("result={:?}", result);
         if result.is_some() {
             return result;
@@ -352,7 +350,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     fn buddy_alloc(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         assert!(count.data().is_power_of_two());
         // 计算需要分配的阶数
-        let mut order = log2(count.data() as usize);
+        let mut order = log2(count.data());
         if count.data() & ((1 << order) - 1) != 0 {
             order += 1;
         }
@@ -426,79 +424,9 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             }
 
             // 如果没有找到伙伴块
-            if buddy_entry_virt_vaddr.is_none() {
-                assert!(
-                    page_list.entry_num <= Self::BUDDY_ENTRIES,
-                    "buddy_free: page_list.entry_num > Self::BUDDY_ENTRIES"
-                );
-
-                // 当前第一个page_list没有空间了
-                if first_page_list.entry_num == Self::BUDDY_ENTRIES {
-                    // 如果当前order是最小的，那么就把这个块当作新的page_list使用
-                    let new_page_list_addr = if order == MIN_ORDER {
-                        base
-                    } else {
-                        // 否则分配新的page_list
-                        // 请注意，分配之后，有可能当前的entry_num会减1（伙伴块分裂），造成出现整个链表为null的entry数量为Self::BUDDY_ENTRIES+1的情况
-                        // 但是不影响，我们在后面插入链表项的时候，会处理这种情况，检查链表中的第2个页是否有空位
-                        self.buddy_alloc(PageFrameCount::new(1))
-                            .expect("buddy_alloc failed: no enough memory")
-                            .0
-                    };
-
-                    // 清空这个页面
-                    core::ptr::write_bytes(
-                        A::phys_2_virt(new_page_list_addr)
-                            .expect(
-                                "Buddy free: failed to get virt address of [new_page_list_addr]",
-                            )
-                            .as_ptr::<u8>(),
-                        0,
-                        1 << order,
-                    );
-                    assert!(
-                        first_page_list_paddr == self.free_area[Self::order2index(order as u8)]
-                    );
-                    // 初始化新的page_list
-                    let new_page_list = PageList::new(0, first_page_list_paddr);
-                    Self::write_page(new_page_list_addr, new_page_list);
-                    self.free_area[Self::order2index(order as u8)] = new_page_list_addr;
-                }
-
-                // 由于上面可能更新了第一个链表页，因此需要重新获取这个值
-                let first_page_list_paddr = self.free_area[Self::order2index(order as u8)];
-                let first_page_list: PageList<A> = Self::read_page(first_page_list_paddr);
-
-                // 检查第二个page_list是否有空位
-                let second_page_list = if first_page_list.next_page.is_null() {
-                    None
-                } else {
-                    Some(Self::read_page::<PageList<A>>(first_page_list.next_page))
-                };
-
-                let (paddr, mut page_list) = if let Some(second) = second_page_list {
-                    // 第二个page_list有空位
-                    // 应当符合之前的假设：还有1个空位
-                    assert!(second.entry_num == Self::BUDDY_ENTRIES - 1);
-
-                    (first_page_list.next_page, second)
-                } else {
-                    // 在第一个page list中分配
-                    (first_page_list_paddr, first_page_list)
-                };
-
-                // kdebug!("to write entry, page_list_base={paddr:?}, page_list.entry_num={}, value={base:?}", page_list.entry_num);
-                assert!(page_list.entry_num < Self::BUDDY_ENTRIES);
-                // 把要归还的块，写入到链表项中
-                unsafe { A::write(Self::entry_virt_addr(paddr, page_list.entry_num), base) }
-                page_list.entry_num += 1;
-                Self::write_page(paddr, page_list);
-                return;
-            } else {
+            if let Some(buddy_entry_virt_addr) = buddy_entry_virt_vaddr {
                 // 如果找到了伙伴块，合并，向上递归
 
-                // 伙伴块所在的表项的虚拟地址
-                let buddy_entry_virt_addr = buddy_entry_virt_vaddr.unwrap();
                 // 伙伴块所在的page_list的物理地址
                 let buddy_entry_page_list_paddr = buddy_entry_page_list_paddr.unwrap();
 
@@ -568,6 +496,74 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                     page_list.entry_num -= 1;
                     Self::write_page(page_list_paddr, page_list);
                 }
+            } else {
+                assert!(
+                    page_list.entry_num <= Self::BUDDY_ENTRIES,
+                    "buddy_free: page_list.entry_num > Self::BUDDY_ENTRIES"
+                );
+
+                // 当前第一个page_list没有空间了
+                if first_page_list.entry_num == Self::BUDDY_ENTRIES {
+                    // 如果当前order是最小的，那么就把这个块当作新的page_list使用
+                    let new_page_list_addr = if order == MIN_ORDER {
+                        base
+                    } else {
+                        // 否则分配新的page_list
+                        // 请注意，分配之后，有可能当前的entry_num会减1（伙伴块分裂），造成出现整个链表为null的entry数量为Self::BUDDY_ENTRIES+1的情况
+                        // 但是不影响，我们在后面插入链表项的时候，会处理这种情况，检查链表中的第2个页是否有空位
+                        self.buddy_alloc(PageFrameCount::new(1))
+                            .expect("buddy_alloc failed: no enough memory")
+                            .0
+                    };
+
+                    // 清空这个页面
+                    core::ptr::write_bytes(
+                        A::phys_2_virt(new_page_list_addr)
+                            .expect(
+                                "Buddy free: failed to get virt address of [new_page_list_addr]",
+                            )
+                            .as_ptr::<u8>(),
+                        0,
+                        1 << order,
+                    );
+                    assert!(
+                        first_page_list_paddr == self.free_area[Self::order2index(order as u8)]
+                    );
+                    // 初始化新的page_list
+                    let new_page_list = PageList::new(0, first_page_list_paddr);
+                    Self::write_page(new_page_list_addr, new_page_list);
+                    self.free_area[Self::order2index(order as u8)] = new_page_list_addr;
+                }
+
+                // 由于上面可能更新了第一个链表页，因此需要重新获取这个值
+                let first_page_list_paddr = self.free_area[Self::order2index(order as u8)];
+                let first_page_list: PageList<A> = Self::read_page(first_page_list_paddr);
+
+                // 检查第二个page_list是否有空位
+                let second_page_list = if first_page_list.next_page.is_null() {
+                    None
+                } else {
+                    Some(Self::read_page::<PageList<A>>(first_page_list.next_page))
+                };
+
+                let (paddr, mut page_list) = if let Some(second) = second_page_list {
+                    // 第二个page_list有空位
+                    // 应当符合之前的假设：还有1个空位
+                    assert!(second.entry_num == Self::BUDDY_ENTRIES - 1);
+
+                    (first_page_list.next_page, second)
+                } else {
+                    // 在第一个page list中分配
+                    (first_page_list_paddr, first_page_list)
+                };
+
+                // kdebug!("to write entry, page_list_base={paddr:?}, page_list.entry_num={}, value={base:?}", page_list.entry_num);
+                assert!(page_list.entry_num < Self::BUDDY_ENTRIES);
+                // 把要归还的块，写入到链表项中
+                unsafe { A::write(Self::entry_virt_addr(paddr, page_list.entry_num), base) }
+                page_list.entry_num += 1;
+                Self::write_page(paddr, page_list);
+                return;
             }
             base = min(base, buddy_addr);
             order += 1;
@@ -597,7 +593,7 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
         if unlikely(!count.data().is_power_of_two()) {
             kwarn!("buddy free: count is not power of two");
         }
-        let mut order = log2(count.data() as usize);
+        let mut order = log2(count.data());
         if count.data() & ((1 << order) - 1) != 0 {
             order += 1;
         }

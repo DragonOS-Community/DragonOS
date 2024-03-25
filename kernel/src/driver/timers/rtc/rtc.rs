@@ -5,6 +5,7 @@ use crate::{
     exception::InterruptArch,
 };
 
+#[derive(Default)]
 pub struct RtcTime {
     pub second: i32,
     pub minute: i32,
@@ -12,19 +13,6 @@ pub struct RtcTime {
     pub day: i32,
     pub month: i32,
     pub year: i32,
-}
-
-impl Default for RtcTime {
-    fn default() -> Self {
-        Self {
-            second: (0),
-            minute: (0),
-            hour: (0),
-            day: (0),
-            month: (0),
-            year: (0),
-        }
-    }
 }
 
 impl RtcTime {
@@ -37,17 +25,10 @@ impl RtcTime {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         //0x0B
         let status_register_b: u8 = read_cmos(0x0B); // 读取状态寄存器B
-        let is_24h: bool = if (status_register_b & 0x02) != 0 {
-            true
-        } else {
-            false
-        }; // 判断是否启用24小时模式
+        let is_24h: bool = (status_register_b & 0x02) != 0;
+        // 判断是否启用24小时模式
 
-        let is_binary: bool = if (status_register_b & 0x04) != 0 {
-            true
-        } else {
-            false
-        }; // 判断是否为二进制码
+        let is_binary: bool = (status_register_b & 0x04) != 0; // 判断是否为二进制码
 
         loop {
             self.year = read_cmos(CMOSTimeSelector::Year as u8) as i32;

@@ -92,10 +92,10 @@ impl OpenFirmwareFdtDriver {
 
     /// 扫描 `/chosen` 节点
     fn early_init_scan_chosen(&self, fdt: &Fdt) -> Result<(), SystemError> {
-        const CHOSEN_NAME1: &'static str = "/chosen";
+        const CHOSEN_NAME1: &str = "/chosen";
         let mut node = fdt.find_node(CHOSEN_NAME1);
         if node.is_none() {
-            const CHOSEN_NAME2: &'static str = "/chosen@0";
+            const CHOSEN_NAME2: &str = "/chosen@0";
             node = fdt.find_node(CHOSEN_NAME2);
             if node.is_some() {
                 FDT_GLOBAL_DATA.write().chosen_node_name = Some(CHOSEN_NAME2);

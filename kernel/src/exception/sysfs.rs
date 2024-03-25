@@ -305,8 +305,7 @@ impl Attribute for AttrActions {
                 len += sysfs_emit_str(&mut buf[len..], &format!(",{}", action.inner().name()))
                     .unwrap();
             } else {
-                len +=
-                    sysfs_emit_str(&mut buf[len..], &format!("{}", action.inner().name())).unwrap();
+                len += sysfs_emit_str(&mut buf[len..], &action.inner().name().to_string()).unwrap();
             }
 
             if len >= buf.len() {

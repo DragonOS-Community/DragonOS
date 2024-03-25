@@ -122,7 +122,7 @@ impl DevFS {
         match metadata.file_type {
             // 字节设备挂载在 /dev/char
             FileType::CharDevice => {
-                if let Err(_) = dev_root_inode.find("char") {
+                if dev_root_inode.find("char").is_err() {
                     dev_root_inode.create(
                         "char",
                         FileType::Dir,
@@ -145,7 +145,7 @@ impl DevFS {
                 device.set_fs(dev_char_inode.0.lock().fs.clone());
             }
             FileType::BlockDevice => {
-                if let Err(_) = dev_root_inode.find("block") {
+                if dev_root_inode.find("block").is_err() {
                     dev_root_inode.create(
                         "block",
                         FileType::Dir,
@@ -190,7 +190,7 @@ impl DevFS {
         match device.metadata().unwrap().file_type {
             // 字节设备挂载在 /dev/char
             FileType::CharDevice => {
-                if let Err(_) = dev_root_inode.find("char") {
+                if dev_root_inode.find("char").is_err() {
                     return Err(SystemError::ENOENT);
                 }
 
@@ -203,7 +203,7 @@ impl DevFS {
                 dev_char_inode.remove(name)?;
             }
             FileType::BlockDevice => {
-                if let Err(_) = dev_root_inode.find("block") {
+                if dev_root_inode.find("block").is_err() {
                     return Err(SystemError::ENOENT);
                 }
 
@@ -255,7 +255,7 @@ impl DevFSInode {
         data_: usize,
     ) -> Self {
         return DevFSInode {
-            parent: parent,
+            parent,
             self_ref: Weak::default(),
             children: BTreeMap::new(),
             metadata: Metadata {

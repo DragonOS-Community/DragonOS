@@ -18,16 +18,15 @@ use alloc::{
 };
 use system_error::SystemError;
 
-use super::vfs::SuperBlock;
 use super::vfs::{
     file::FilePrivateData, syscall::ModeType, FileSystem, FileSystemMaker, FsInfo, IndexNode,
     InodeId, Metadata, SpecialNodeData,
 };
+use super::vfs::{Magic, SuperBlock};
 
 /// RamFS的inode名称的最大长度
 const RAMFS_MAX_NAMELEN: usize = 64;
-const RAMFS_MAGIC: u64 = 0x0102_1994;
-const BLOCK_SIZE: u64 = 4096;
+const BLOCK_SIZE: u64 = 512;
 /// @brief 内存文件系统的Inode结构体
 #[derive(Debug)]
 struct LockedRamFSInode(SpinLock<RamFSInode>);
@@ -85,14 +84,14 @@ impl FileSystem for RamFS {
         "ramfs"
     }
 
-    fn super_block(&self) -> super::vfs::SuperBlock {
+    fn super_block(&self) -> SuperBlock {
         self.super_block.read().clone()
     }
 }
 
 impl RamFS {
     pub fn new() -> Arc<Self> {
-        let super_block = SuperBlock::new(RAMFS_MAGIC, BLOCK_SIZE, RAMFS_MAX_NAMELEN as u64);
+        let super_block = SuperBlock::new(Magic::RAMFS_MAGIC, BLOCK_SIZE, RAMFS_MAX_NAMELEN as u64);
         // 初始化root inode
         let root: Arc<LockedRamFSInode> = Arc::new(LockedRamFSInode(SpinLock::new(RamFSInode {
             parent: Weak::default(),

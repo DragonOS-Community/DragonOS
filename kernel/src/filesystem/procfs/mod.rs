@@ -31,7 +31,7 @@ use crate::{
 use super::vfs::{
     file::{FileMode, FilePrivateData},
     syscall::ModeType,
-    FileSystem, FsInfo, IndexNode, InodeId, Metadata, SuperBlock,
+    FileSystem, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
 };
 
 pub mod kmsg;
@@ -77,8 +77,7 @@ pub struct InodeInfo {
 
 /// @brief procfs的inode名称的最大长度
 const PROCFS_MAX_NAMELEN: usize = 64;
-const PROC_MAGIC: u64 = 0x9fa0;
-const BLOCK_SIZE: u64 = 1024;
+const BLOCK_SIZE: u64 = 512;
 /// @brief procfs文件系统的Inode结构体
 #[derive(Debug)]
 pub struct LockedProcFSInode(SpinLock<ProcFSInode>);
@@ -294,14 +293,14 @@ impl FileSystem for ProcFS {
         "procfs"
     }
 
-    fn super_block(&self) -> super::vfs::SuperBlock {
+    fn super_block(&self) -> SuperBlock {
         self.super_block.read().clone()
     }
 }
 
 impl ProcFS {
     pub fn new() -> Arc<Self> {
-        let super_block = SuperBlock::new(PROC_MAGIC, BLOCK_SIZE, PROCFS_MAX_NAMELEN as u64);
+        let super_block = SuperBlock::new(Magic::PROC_MAGIC, BLOCK_SIZE, PROCFS_MAX_NAMELEN as u64);
         // 初始化root inode
         let root: Arc<LockedProcFSInode> =
             Arc::new(LockedProcFSInode(SpinLock::new(ProcFSInode {

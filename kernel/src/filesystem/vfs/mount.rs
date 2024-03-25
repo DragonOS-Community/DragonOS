@@ -13,10 +13,10 @@ use crate::{driver::base::device::device_number::DeviceNumber, libs::spinlock::S
 
 use super::{
     file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
-    SuperBlock,
+    Magic, SuperBlock,
 };
 
-const BLOCK_SIZE: u64 = 1024;
+const BLOCK_SIZE: u64 = 512;
 const MOUNTFS_MAX_NAMELEN: u64 = 64;
 /// @brief 挂载文件系统
 /// 挂载文件系统的时候，套了MountFS这一层，以实现文件系统的递归挂载
@@ -401,7 +401,7 @@ impl FileSystem for MountFS {
     fn name(&self) -> &str {
         "mountfs"
     }
-    fn super_block(&self) -> super::SuperBlock {
-        SuperBlock::new(61267, BLOCK_SIZE, MOUNTFS_MAX_NAMELEN)
+    fn super_block(&self) -> SuperBlock {
+        SuperBlock::new(Magic::MOUNT_MAGIC, BLOCK_SIZE, MOUNTFS_MAX_NAMELEN)
     }
 }

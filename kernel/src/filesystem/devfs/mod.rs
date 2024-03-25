@@ -6,7 +6,7 @@ use super::vfs::{
     core::{generate_inode_id, ROOT_INODE},
     file::FileMode,
     syscall::ModeType,
-    FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Metadata, SuperBlock,
+    FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
 };
 use crate::{
     driver::base::device::device_number::DeviceNumber,
@@ -25,8 +25,7 @@ use alloc::{
 };
 use system_error::SystemError;
 
-const DEVFS_MAGIC: u64 = 0x1373;
-const BLOCK_SIZE: u64 = 1024;
+const BLOCK_SIZE: u64 = 512;
 const DEVFS_MAX_NAMELEN: usize = 255;
 /// @brief dev文件系统
 #[derive(Debug)]
@@ -56,14 +55,14 @@ impl FileSystem for DevFS {
         "devfs"
     }
 
-    fn super_block(&self) -> super::vfs::SuperBlock {
+    fn super_block(&self) -> SuperBlock {
         self.super_block.clone()
     }
 }
 
 impl DevFS {
     pub fn new() -> Arc<Self> {
-        let super_block = SuperBlock::new(DEVFS_MAGIC, BLOCK_SIZE, DEVFS_MAX_NAMELEN as u64);
+        let super_block = SuperBlock::new(Magic::DEVFS_MAGIC, BLOCK_SIZE, DEVFS_MAX_NAMELEN as u64);
         // 初始化root inode
         let root: Arc<LockedDevFSInode> = Arc::new(LockedDevFSInode(SpinLock::new(
             // /dev 的权限设置为 读+执行，root 可以读写

@@ -340,10 +340,11 @@ pub struct PosixStatfs {
     f_flags: u64,
     f_spare: [u64; 4],
 }
+
 impl From<SuperBlock> for PosixStatfs {
     fn from(super_block: SuperBlock) -> Self {
         Self {
-            f_type: super_block.magic,
+            f_type: super_block.magic.bits,
             f_bsize: super_block.bsize,
             f_blocks: super_block.blocks,
             f_bfree: super_block.bfree,

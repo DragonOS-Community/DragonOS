@@ -11,7 +11,7 @@ use alloc::{
 };
 
 use crate::driver::base::device::device_number::DeviceNumber;
-use crate::filesystem::vfs::{SpecialNodeData, SuperBlock};
+use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
@@ -255,8 +255,12 @@ impl FileSystem for FATFileSystem {
         "fat"
     }
 
-    fn super_block(&self) -> crate::filesystem::vfs::SuperBlock {
-        SuperBlock::new(61267, self.bpb.bytes_per_sector.into(), FAT_MAX_NAMELEN)
+    fn super_block(&self) -> SuperBlock {
+        SuperBlock::new(
+            Magic::FAT_MAGIC,
+            self.bpb.bytes_per_sector.into(),
+            FAT_MAX_NAMELEN,
+        )
     }
 }
 

@@ -587,7 +587,7 @@ impl Default for Metadata {
 #[derive(Debug, Clone)]
 pub struct SuperBlock {
     // type of filesystem
-    pub magic: u64,
+    pub magic: Magic,
     // optimal transfer block size
     pub bsize: u64,
     // total data blocks in filesystem
@@ -611,7 +611,7 @@ pub struct SuperBlock {
 }
 
 impl SuperBlock {
-    pub fn new(magic: u64, bsize: u64, namelen: u64) -> Self {
+    pub fn new(magic: Magic, bsize: u64, namelen: u64) -> Self {
         Self {
             magic,
             bsize,
@@ -625,6 +625,16 @@ impl SuperBlock {
             frsize: 0,
             flags: 0,
         }
+    }
+}
+bitflags! {
+    pub struct Magic: u64 {
+        const DEVFS_MAGIC = 0x1373;
+        const FAT_MAGIC =  0xf2f52011;
+        const KER_MAGIC = 0x3153464b;
+        const PROC_MAGIC = 0x9fa0;
+        const RAMFS_MAGIC = 0x858458f6;
+        const MOUNT_MAGIC = 61267;
     }
 }
 

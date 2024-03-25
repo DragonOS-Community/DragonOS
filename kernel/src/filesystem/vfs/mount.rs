@@ -404,8 +404,8 @@ impl IndexNode for MountFSInode {
             .mountpoints
             .lock()
             .insert(metadata.inode_id, new_mount_fs.clone());
-        kdebug!("Mount Path: {:?}", self._abs_path()?.to_str().unwrap());
-        kdebug!("Mount FS: {:?}", new_mount_fs);
+        // kdebug!("Mount Path: {:?}", self._abs_path()?.to_str().unwrap());
+        // kdebug!("Mount FS: {:?}", new_mount_fs);
         MOUNTS_LIST().lock().insert(
             MountPath::from(self._abs_path()?.to_str().unwrap()),
             new_mount_fs.clone(),
@@ -463,12 +463,12 @@ impl FileSystem for MountFS {
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         return match &self.self_mountpoint {
             Some(inode) => {
-                kdebug!("Mount point at {:?}", inode._abs_path());
+                // kdebug!("Mount point at {:?}", inode._abs_path());
                 inode.mount_fs.root_inode()
             },
             // 当前文件系统是rootfs
             None => {
-                kdebug!("Root fs");
+                // kdebug!("Root fs");
                 self.mountpoint_root_inode()
             },
         };

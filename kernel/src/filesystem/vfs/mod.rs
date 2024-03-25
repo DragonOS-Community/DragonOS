@@ -16,7 +16,7 @@ use crate::{
     driver::base::{
         block::block_device::BlockDevice, char::CharDevice, device::device_number::DeviceNumber,
     },
-    filesystem::vfs::mount::{MountFSInode, MOUNTS_LIST},
+    filesystem::vfs::mount::MOUNTS_LIST,
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
     time::TimeSpec,
@@ -745,11 +745,6 @@ impl dyn IndexNode {
         }
         return None;
     }
-
-    fn self_ref(&self) -> Arc<dyn IndexNode> {
-        self.find(".").unwrap()
-    }
-
 }
 
 /// IndexNode的元数据

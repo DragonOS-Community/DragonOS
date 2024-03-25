@@ -11,7 +11,7 @@ use super::{
     fcntl::AtFlags,
     file::{File, FileMode},
     syscall::{ModeType, OpenHow, OpenHowResolve},
-    utils::{rsplit_path, user_path_at},
+    utils::user_path_at,
     FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 

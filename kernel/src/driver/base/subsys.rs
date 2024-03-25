@@ -99,7 +99,13 @@ impl SubSysPrivate {
     #[allow(dead_code)]
     #[inline]
     pub fn class(&self) -> Option<Weak<dyn Class>> {
-        return self.class.lock().clone();
+        let mut guard = self.class.lock();
+        if let Some(r) = guard.clone() {
+            return Some(r);
+        } else {
+            *guard = None;
+            return None;
+        }
     }
 
     pub fn set_class(&self, class: Option<Weak<dyn Class>>) {

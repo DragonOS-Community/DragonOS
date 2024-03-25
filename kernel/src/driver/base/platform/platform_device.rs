@@ -320,7 +320,7 @@ impl Device for PlatformBusDevice {
         todo!()
     }
 
-    fn set_class(&self, _class: Option<Arc<dyn Class>>) {
+    fn set_class(&self, _class: Option<Weak<dyn Class>>) {
         todo!()
     }
 }

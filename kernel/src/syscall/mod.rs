@@ -6,7 +6,7 @@ use core::{
 
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
-    filesystem::vfs::syscall::PosixStatx,
+    filesystem::vfs::syscall::{PosixStatfs, PosixStatx},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::syscall::MremapFlags,
     net::syscall::MsgHdr,

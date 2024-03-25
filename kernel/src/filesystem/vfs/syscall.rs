@@ -1147,7 +1147,7 @@ impl Syscall {
         let (_inode_begin,remain_path) = user_path_at(&pcb,fd as i32, &path)?;
         let inode = ROOT_INODE().lookup_follow_symlink(&remain_path, MAX_PATHLEN)?;
         let statfs = PosixStatfs::from(inode.fs().super_block());
-        writer.copy_one_to_user(&statfs, 0);
+        writer.copy_one_to_user(&statfs, 0)?;
         return Ok(0);
     }
 

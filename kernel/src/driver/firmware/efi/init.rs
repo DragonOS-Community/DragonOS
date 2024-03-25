@@ -1,4 +1,4 @@
-use core::{intrinsics::unlikely, mem::size_of};
+use core::{hint::spin_loop, intrinsics::unlikely, mem::size_of};
 
 use system_error::SystemError;
 use uefi_raw::table::boot::{MemoryAttribute, MemoryType};
@@ -37,7 +37,9 @@ pub fn efi_init() {
         // 所以如果我们无法访问它，那么继续进行下去就没有什么意义了
 
         kerror!("Failed to initialize early memory map");
-        loop {}
+        loop {
+            spin_loop();
+        }
     }
     // kdebug!("NNNN");
     // kwarn!("BBBB, e:{:?}", SystemError::EINVAL);
@@ -76,7 +78,7 @@ pub fn efi_init() {
         .expect("Failed to reserve memory for EFI mmap table");
 
     // 保留内核的内存
-    if let Some(info) = efi_manager().inner.read().dragonstub_load_info.clone() {
+    if let Some(info) = efi_manager().inner.read().dragonstub_load_info {
         mem_block_manager()
             .reserve_block(
                 PhysAddr::new(info.paddr as usize),

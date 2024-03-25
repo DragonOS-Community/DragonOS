@@ -425,4 +425,15 @@ impl From<Duration> for smoltcp::time::Duration {
 pub trait TimeArch {
     /// Get CPU cycles (Read from register)
     fn get_cycles() -> usize;
+
+    /// Calculate expire cycles
+    ///
+    /// # Arguments
+    ///
+    /// - `ns` - The time to expire in nanoseconds
+    ///
+    /// # Returns
+    ///
+    /// The expire cycles
+    fn cal_expire_cycles(ns: usize) -> usize;
 }

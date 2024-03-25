@@ -71,7 +71,7 @@ impl AhciDisk {
         assert!((buf.len() & 511) == 0);
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         let check_length = ((count - 1) >> 4) + 1; // prdt length
-        if count * 512 > buf.len() || check_length > 8 as usize {
+        if count * 512 > buf.len() || check_length > 8_usize {
             kerror!("ahci read: e2big");
             // 不可能的操作
             return Err(SystemError::E2BIG);
@@ -91,8 +91,7 @@ impl AhciDisk {
         #[allow(unused_unsafe)]
         let cmdheader: &mut HbaCmdHeader = unsafe {
             (phys_2_virt(
-                volatile_read!(port.clb) as usize
-                    + slot as usize * size_of::<HbaCmdHeader>() as usize,
+                volatile_read!(port.clb) as usize + slot as usize * size_of::<HbaCmdHeader>(),
             ) as *mut HbaCmdHeader)
                 .as_mut()
                 .unwrap()
@@ -109,10 +108,9 @@ impl AhciDisk {
         // 由于目前的内存管理机制无法把用户空间的内存地址转换为物理地址，所以只能先把数据拷贝到内核空间
         // TODO：在内存管理重构后，可以直接使用用户空间的内存地址
 
-        let user_buf = verify_area(VirtAddr::new(buf_ptr as usize), buf.len()).is_ok();
+        let user_buf = verify_area(VirtAddr::new(buf_ptr), buf.len()).is_ok();
         let mut kbuf = if user_buf {
-            let mut x: Vec<u8> = Vec::new();
-            x.resize(buf.len(), 0);
+            let x: Vec<u8> = vec![0; buf.len()];
             Some(x)
         } else {
             None
@@ -220,7 +218,7 @@ impl AhciDisk {
         assert!((buf.len() & 511) == 0);
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         let check_length = ((count - 1) >> 4) + 1; // prdt length
-        if count * 512 > buf.len() || check_length > 8 as usize {
+        if count * 512 > buf.len() || check_length > 8 {
             // 不可能的操作
             return Err(SystemError::E2BIG);
         } else if count == 0 {
@@ -241,8 +239,7 @@ impl AhciDisk {
         #[allow(unused_unsafe)]
         let cmdheader: &mut HbaCmdHeader = unsafe {
             (phys_2_virt(
-                volatile_read!(port.clb) as usize
-                    + slot as usize * size_of::<HbaCmdHeader>() as usize,
+                volatile_read!(port.clb) as usize + slot as usize * size_of::<HbaCmdHeader>(),
             ) as *mut HbaCmdHeader)
                 .as_mut()
                 .unwrap()
@@ -251,7 +248,7 @@ impl AhciDisk {
 
         volatile_write_bit!(
             cmdheader.cfl,
-            (1 << 5) - 1 as u8,
+            (1 << 5) - 1_u8,
             (size_of::<FisRegH2D>() / size_of::<u32>()) as u8
         ); // Command FIS size
 
@@ -264,9 +261,9 @@ impl AhciDisk {
 
         // 由于目前的内存管理机制无法把用户空间的内存地址转换为物理地址，所以只能先把数据拷贝到内核空间
         // TODO：在内存管理重构后，可以直接使用用户空间的内存地址
-        let user_buf = verify_area(VirtAddr::new(buf_ptr as usize), buf.len()).is_ok();
+        let user_buf = verify_area(VirtAddr::new(buf_ptr), buf.len()).is_ok();
         let mut kbuf = if user_buf {
-            let mut x: Vec<u8> = Vec::with_capacity(buf.len());
+            let mut x: Vec<u8> = vec![0; buf.len()];
             x.resize(buf.len(), 0);
             x.copy_from_slice(buf);
             Some(x)
@@ -401,7 +398,7 @@ impl LockedAhciDisk {
         let mut table: MbrDiskPartionTable = Default::default();
 
         // 数据缓冲区
-        let mut buf: Vec<u8> = Vec::new();
+        let mut buf: Vec<u8> = vec![0; size_of::<MbrDiskPartionTable>()];
         buf.resize(size_of::<MbrDiskPartionTable>(), 0);
 
         self.read_at_sync(0, 1, &mut buf)?;

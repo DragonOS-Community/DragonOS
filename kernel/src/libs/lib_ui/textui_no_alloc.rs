@@ -49,7 +49,7 @@ pub fn no_init_textui_putchar_window(
     if unlikely(character == '\n') {
         // 换行时还需要输出\r
         send_to_default_serial8250_port(&[b'\r']);
-        if is_put_to_window == true {
+        if is_put_to_window {
             NO_ALLOC_OPERATIONS_LINE.fetch_add(1, Ordering::SeqCst);
             NO_ALLOC_OPERATIONS_INDEX.store(0, Ordering::SeqCst);
         }
@@ -57,7 +57,7 @@ pub fn no_init_textui_putchar_window(
     }
     // 输出制表符
     else if character == '\t' {
-        if is_put_to_window == true {
+        if is_put_to_window {
             let char = TextuiCharChromatic::new(Some(' '), frcolor, bkcolor);
 
             //打印的空格数（注意将每行分成一个个表格，每个表格为8个字符）
@@ -75,7 +75,7 @@ pub fn no_init_textui_putchar_window(
     }
     // 字符 '\x08' 代表 ASCII 码中的退格字符。它在输出中的作用是将光标向左移动一个位置，并在该位置上输出后续的字符，从而实现字符的删除或替换。
     else if character == '\x08' {
-        if is_put_to_window == true {
+        if is_put_to_window {
             NO_ALLOC_OPERATIONS_INDEX.fetch_sub(1, Ordering::SeqCst);
             let op_char = NO_ALLOC_OPERATIONS_INDEX.load(Ordering::SeqCst);
             if op_char >= 0 {
@@ -98,24 +98,21 @@ pub fn no_init_textui_putchar_window(
                 }
             }
         }
-    } else {
-        if is_put_to_window == true {
-            // 输出其他字符
-            let char = TextuiCharChromatic::new(Some(character), frcolor, bkcolor);
+    } else if is_put_to_window {
+        // 输出其他字符
+        let char = TextuiCharChromatic::new(Some(character), frcolor, bkcolor);
 
-            if NO_ALLOC_OPERATIONS_INDEX.load(Ordering::SeqCst)
-                == CHAR_PER_LINE.load(Ordering::SeqCst)
-            {
-                NO_ALLOC_OPERATIONS_INDEX.store(0, Ordering::SeqCst);
-                NO_ALLOC_OPERATIONS_LINE.fetch_add(1, Ordering::SeqCst);
-            }
-            char.no_init_textui_render_chromatic(
-                LineId::new(NO_ALLOC_OPERATIONS_LINE.load(Ordering::SeqCst)),
-                LineIndex::new(NO_ALLOC_OPERATIONS_INDEX.load(Ordering::SeqCst)),
-            );
-
-            NO_ALLOC_OPERATIONS_INDEX.fetch_add(1, Ordering::SeqCst);
+        if NO_ALLOC_OPERATIONS_INDEX.load(Ordering::SeqCst) == CHAR_PER_LINE.load(Ordering::SeqCst)
+        {
+            NO_ALLOC_OPERATIONS_INDEX.store(0, Ordering::SeqCst);
+            NO_ALLOC_OPERATIONS_LINE.fetch_add(1, Ordering::SeqCst);
         }
+        char.no_init_textui_render_chromatic(
+            LineId::new(NO_ALLOC_OPERATIONS_LINE.load(Ordering::SeqCst)),
+            LineIndex::new(NO_ALLOC_OPERATIONS_INDEX.load(Ordering::SeqCst)),
+        );
+
+        NO_ALLOC_OPERATIONS_INDEX.fetch_add(1, Ordering::SeqCst);
     }
 
     return Ok(());

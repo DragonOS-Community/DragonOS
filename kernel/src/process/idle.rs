@@ -6,7 +6,7 @@ use core::{
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    mm::{percpu::PerCpu, VirtAddr, INITIAL_PROCESS_ADDRESS_SPACE},
+    mm::{percpu::PerCpu, VirtAddr, IDLE_PROCESS_ADDRESS_SPACE},
     process::KernelStack,
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
@@ -47,13 +47,13 @@ impl ProcessManager {
                 })
             };
 
-            let idle_pcb = ProcessControlBlock::new_idle(i as u32, kstack);
+            let idle_pcb = ProcessControlBlock::new_idle(i, kstack);
 
             assert!(idle_pcb.basic().user_vm().is_none());
             unsafe {
                 idle_pcb
                     .basic_mut()
-                    .set_user_vm(Some(INITIAL_PROCESS_ADDRESS_SPACE()))
+                    .set_user_vm(Some(IDLE_PROCESS_ADDRESS_SPACE()))
             };
 
             assert!(idle_pcb.sched_info().on_cpu().is_none());
@@ -74,7 +74,13 @@ impl ProcessManager {
         return VirtAddr::new(x86::current::registers::rsp() as usize);
 
         #[cfg(target_arch = "riscv64")]
-        unimplemented!("stack_ptr() is not implemented on RISC-V")
+        {
+            let stack_ptr: usize;
+            unsafe {
+                core::arch::asm!("mv {}, sp", out(reg) stack_ptr);
+            }
+            return VirtAddr::new(stack_ptr);
+        }
     }
 
     /// 获取idle进程数组的引用

@@ -412,12 +412,11 @@ impl KernFSCallback for PreallocKFOpsEmpty {
 }
 
 pub fn sysfs_emit_str(buf: &mut [u8], s: &str) -> Result<usize, SystemError> {
-    let len;
-    if buf.len() > s.len() {
-        len = s.len();
+    let len = if buf.len() > s.len() {
+        s.len()
     } else {
-        len = buf.len() - 1;
-    }
+        buf.len() - 1
+    };
     buf[..len].copy_from_slice(&s.as_bytes()[..len]);
     buf[len] = b'\0';
     return Ok(len);

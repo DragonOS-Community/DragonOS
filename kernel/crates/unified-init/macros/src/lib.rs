@@ -42,7 +42,7 @@ use uuid::Uuid;
 #[proc_macro_attribute]
 pub fn unified_init(args: TokenStream, input: TokenStream) -> TokenStream {
     do_unified_init(args, input)
-        .unwrap_or_else(|e| e.to_compile_error().into())
+        .unwrap_or_else(|e| e.to_compile_error())
         .into()
 }
 
@@ -59,7 +59,7 @@ fn do_unified_init(args: TokenStream, input: TokenStream) -> syn::Result<proc_ma
 
     // 在旁边添加一个UnifiedInitializer
     let initializer =
-        generate_unified_initializer(&function, &target_slice, function.sig.ident.to_string())?;
+        generate_unified_initializer(&function, target_slice, function.sig.ident.to_string())?;
 
     // 拼接
     let mut output = proc_macro2::TokenStream::new();
@@ -80,7 +80,7 @@ fn do_unified_init(args: TokenStream, input: TokenStream) -> syn::Result<proc_ma
 /// ```
 fn check_function_signature(function: &ItemFn) -> syn::Result<()> {
     // 检查函数签名
-    if function.sig.inputs.len() != 0 {
+    if !function.sig.inputs.is_empty() {
         return Err(syn::Error::new(
             function.sig.inputs.span(),
             "Expected no arguments",
@@ -111,7 +111,7 @@ fn check_function_signature(function: &ItemFn) -> syn::Result<()> {
                     if let syn::GenericArgument::Type(type_arg) = generic_args.args.first().unwrap()
                     {
                         if let syn::Type::Tuple(tuple) = type_arg {
-                            if tuple.elems.len() != 0 {
+                            if !tuple.elems.is_empty() {
                                 return Err(syn::Error::new(tuple.span(), "Expected empty tuple"));
                             }
                         } else {
@@ -166,7 +166,7 @@ fn generate_unified_initializer(
     let initializer_name = format!(
         "unified_initializer_{}_{}",
         raw_initializer_name,
-        Uuid::new_v4().to_simple().to_string().to_ascii_uppercase()[..8].to_string()
+        &Uuid::new_v4().to_simple().to_string().to_ascii_uppercase()[..8]
     )
     .to_ascii_uppercase();
 

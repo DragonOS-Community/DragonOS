@@ -34,6 +34,8 @@ pub struct E1000ETxToken {
 pub struct E1000EDriver {
     pub inner: Arc<SpinLock<E1000EDevice>>,
 }
+unsafe impl Send for E1000EDriver {}
+unsafe impl Sync for E1000EDriver {}
 
 /// @brief 网卡驱动的包裹器，这是为了获取网卡驱动的可变引用而设计的。
 /// 参阅virtio_net.rs
@@ -54,6 +56,7 @@ impl DerefMut for E1000EDriverWrapper {
 }
 
 impl E1000EDriverWrapper {
+    #[allow(clippy::mut_from_ref)]
     fn force_get_mut(&self) -> &mut E1000EDriver {
         unsafe { &mut *self.0.get() }
     }
@@ -76,7 +79,7 @@ impl phy::RxToken for E1000ERxToken {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let result = f(&mut self.0.as_mut_slice());
+        let result = f(self.0.as_mut_slice());
         self.0.free_buffer();
         return result;
     }
@@ -97,6 +100,7 @@ impl phy::TxToken for E1000ETxToken {
 }
 
 impl E1000EDriver {
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(device: E1000EDevice) -> Self {
         let mut iface_config = smoltcp::iface::Config::new();
 
@@ -253,11 +257,11 @@ impl NetDriver for E1000EInterface {
 
         self.iface.lock().update_ip_addrs(|addrs| {
             let dest = addrs.iter_mut().next();
-            if let None = dest {
-                addrs.push(ip_addrs[0]).expect("Push ipCidr failed: full");
-            } else {
-                let dest = dest.unwrap();
+
+            if let Some(dest) = dest {
                 *dest = ip_addrs[0];
+            } else {
+                addrs.push(ip_addrs[0]).expect("Push ipCidr failed: full");
             }
         });
         return Ok(());

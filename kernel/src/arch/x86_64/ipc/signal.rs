@@ -92,9 +92,9 @@ impl From<usize> for Signal {
     }
 }
 
-impl Into<usize> for Signal {
-    fn into(self) -> usize {
-        self as usize
+impl From<Signal> for usize {
+    fn from(val: Signal) -> Self {
+        val as usize
     }
 }
 
@@ -109,10 +109,10 @@ impl From<i32> for Signal {
     }
 }
 
-impl Into<SigSet> for Signal {
-    fn into(self) -> SigSet {
+impl From<Signal> for SigSet {
+    fn from(val: Signal) -> Self {
         SigSet {
-            bits: (1 << (self as usize - 1) as u64),
+            bits: (1 << (val as usize - 1) as u64),
         }
     }
 }
@@ -147,39 +147,39 @@ impl Signal {
             Signal::INVALID => {
                 kerror!("attempting to handler an Invalid");
             }
-            Signal::SIGHUP => sig_terminate(self.clone()),
-            Signal::SIGINT => sig_terminate(self.clone()),
-            Signal::SIGQUIT => sig_terminate_dump(self.clone()),
-            Signal::SIGILL => sig_terminate_dump(self.clone()),
-            Signal::SIGTRAP => sig_terminate_dump(self.clone()),
-            Signal::SIGABRT_OR_IOT => sig_terminate_dump(self.clone()),
-            Signal::SIGBUS => sig_terminate_dump(self.clone()),
-            Signal::SIGFPE => sig_terminate_dump(self.clone()),
-            Signal::SIGKILL => sig_terminate(self.clone()),
-            Signal::SIGUSR1 => sig_terminate(self.clone()),
-            Signal::SIGSEGV => sig_terminate_dump(self.clone()),
-            Signal::SIGUSR2 => sig_terminate(self.clone()),
-            Signal::SIGPIPE => sig_terminate(self.clone()),
-            Signal::SIGALRM => sig_terminate(self.clone()),
-            Signal::SIGTERM => sig_terminate(self.clone()),
-            Signal::SIGSTKFLT => sig_terminate(self.clone()),
-            Signal::SIGCHLD => sig_ignore(self.clone()),
-            Signal::SIGCONT => sig_continue(self.clone()),
-            Signal::SIGSTOP => sig_stop(self.clone()),
-            Signal::SIGTSTP => sig_stop(self.clone()),
-            Signal::SIGTTIN => sig_stop(self.clone()),
-            Signal::SIGTTOU => sig_stop(self.clone()),
-            Signal::SIGURG => sig_ignore(self.clone()),
-            Signal::SIGXCPU => sig_terminate_dump(self.clone()),
-            Signal::SIGXFSZ => sig_terminate_dump(self.clone()),
-            Signal::SIGVTALRM => sig_terminate(self.clone()),
-            Signal::SIGPROF => sig_terminate(self.clone()),
-            Signal::SIGWINCH => sig_ignore(self.clone()),
-            Signal::SIGIO_OR_POLL => sig_terminate(self.clone()),
-            Signal::SIGPWR => sig_terminate(self.clone()),
-            Signal::SIGSYS => sig_terminate(self.clone()),
-            Signal::SIGRTMIN => sig_terminate(self.clone()),
-            Signal::SIGRTMAX => sig_terminate(self.clone()),
+            Signal::SIGHUP => sig_terminate(*self),
+            Signal::SIGINT => sig_terminate(*self),
+            Signal::SIGQUIT => sig_terminate_dump(*self),
+            Signal::SIGILL => sig_terminate_dump(*self),
+            Signal::SIGTRAP => sig_terminate_dump(*self),
+            Signal::SIGABRT_OR_IOT => sig_terminate_dump(*self),
+            Signal::SIGBUS => sig_terminate_dump(*self),
+            Signal::SIGFPE => sig_terminate_dump(*self),
+            Signal::SIGKILL => sig_terminate(*self),
+            Signal::SIGUSR1 => sig_terminate(*self),
+            Signal::SIGSEGV => sig_terminate_dump(*self),
+            Signal::SIGUSR2 => sig_terminate(*self),
+            Signal::SIGPIPE => sig_terminate(*self),
+            Signal::SIGALRM => sig_terminate(*self),
+            Signal::SIGTERM => sig_terminate(*self),
+            Signal::SIGSTKFLT => sig_terminate(*self),
+            Signal::SIGCHLD => sig_ignore(*self),
+            Signal::SIGCONT => sig_continue(*self),
+            Signal::SIGSTOP => sig_stop(*self),
+            Signal::SIGTSTP => sig_stop(*self),
+            Signal::SIGTTIN => sig_stop(*self),
+            Signal::SIGTTOU => sig_stop(*self),
+            Signal::SIGURG => sig_ignore(*self),
+            Signal::SIGXCPU => sig_terminate_dump(*self),
+            Signal::SIGXFSZ => sig_terminate_dump(*self),
+            Signal::SIGVTALRM => sig_terminate(*self),
+            Signal::SIGPROF => sig_terminate(*self),
+            Signal::SIGWINCH => sig_ignore(*self),
+            Signal::SIGIO_OR_POLL => sig_terminate(*self),
+            Signal::SIGPWR => sig_terminate(*self),
+            Signal::SIGSYS => sig_terminate(*self),
+            Signal::SIGRTMIN => sig_terminate(*self),
+            Signal::SIGRTMAX => sig_terminate(*self),
         }
     }
 }
@@ -275,7 +275,7 @@ bitflags! {
         const SIGSYS   =  1<<30;
         const SIGRTMIN =  1<<31;
         // TODO 写上实时信号
-        const SIGRTMAX =  1<<MAX_SIG_NUM-1;
+        const SIGRTMAX =  1 << (MAX_SIG_NUM-1);
     }
 }
 
@@ -309,9 +309,9 @@ pub enum SigChildCode {
     Continued = 6,
 }
 
-impl Into<i32> for SigChildCode {
-    fn into(self) -> i32 {
-        self as i32
+impl From<SigChildCode> for i32 {
+    fn from(value: SigChildCode) -> Self {
+        value as i32
     }
 }
 
@@ -363,11 +363,11 @@ impl SigContext {
         let pcb = ProcessManager::current_pcb();
         let mut archinfo_guard = pcb.arch_info_irqsave();
         self.oldmask = *mask;
-        self.frame = frame.clone();
+        self.frame = *frame;
         // context.trap_num = unsafe { (*current_thread).trap_num };
         // context.err_code = unsafe { (*current_thread).err_code };
         // context.cr2 = unsafe { (*current_thread).cr2 };
-        self.reserved_for_x87_state = archinfo_guard.fp_state().clone();
+        self.reserved_for_x87_state = *archinfo_guard.fp_state();
 
         // 保存完毕后，清空fp_state，以免下次save的时候，出现SIMD exception
         archinfo_guard.clear_fp_state();
@@ -385,12 +385,12 @@ impl SigContext {
     pub fn restore_sigcontext(&mut self, frame: &mut TrapFrame) -> bool {
         let guard = ProcessManager::current_pcb();
         let mut arch_info = guard.arch_info_irqsave();
-        (*frame) = self.frame.clone();
+        (*frame) = self.frame;
         // (*current_thread).trap_num = (*context).trap_num;
         *arch_info.cr2_mut() = self.cr2 as usize;
         // (*current_thread).err_code = (*context).err_code;
         // 如果当前进程有fpstate，则将其恢复到pcb的fp_state中
-        *arch_info.fp_state_mut() = self.reserved_for_x87_state.clone();
+        *arch_info.fp_state_mut() = self.reserved_for_x87_state;
         arch_info.restore_fp_state();
         return true;
     }
@@ -425,7 +425,7 @@ impl SignalArch for X86_64SignalArch {
         let siginfo_read_guard = siginfo.unwrap();
 
         // 检查sigpending是否为0
-        if siginfo_read_guard.sig_pending().signal().bits() == 0 || !frame.from_user() {
+        if siginfo_read_guard.sig_pending().signal().bits() == 0 || !frame.is_from_user() {
             // 若没有正在等待处理的信号，或者将要返回到的是内核态，则返回
             return;
         }
@@ -435,7 +435,7 @@ impl SignalArch for X86_64SignalArch {
         let mut sig_number: Signal;
         let mut info: Option<SigInfo>;
         let mut sigaction: Sigaction;
-        let sig_block: SigSet = siginfo_read_guard.sig_block().clone();
+        let sig_block: SigSet = *siginfo_read_guard.sig_block();
         drop(siginfo_read_guard);
 
         let sig_guard = pcb.try_sig_struct_irqsave(5);
@@ -460,16 +460,16 @@ impl SignalArch for X86_64SignalArch {
 
             match sigaction.action() {
                 SigactionType::SaHandler(action_type) => match action_type {
-                    SaHandlerType::SigError => {
+                    SaHandlerType::Error => {
                         kerror!("Trying to handle a Sigerror on Process:{:?}", pcb.pid());
                         return;
                     }
-                    SaHandlerType::SigDefault => {
+                    SaHandlerType::Default => {
                         sigaction = Sigaction::default();
                         break;
                     }
-                    SaHandlerType::SigIgnore => continue,
-                    SaHandlerType::SigCustomized(_) => {
+                    SaHandlerType::Ignore => continue,
+                    SaHandlerType::Customized(_) => {
                         break;
                     }
                 },
@@ -478,7 +478,7 @@ impl SignalArch for X86_64SignalArch {
             // 如果当前动作是忽略这个信号，就继续循环。
         }
 
-        let oldset = siginfo_mut_guard.sig_block().clone();
+        let oldset = *siginfo_mut_guard.sig_block();
         //避免死锁
         drop(siginfo_mut_guard);
         drop(sig_guard);
@@ -557,11 +557,11 @@ fn setup_frame(
     let temp_handler: *mut c_void;
     match sigaction.action() {
         SigactionType::SaHandler(handler_type) => match handler_type {
-            SaHandlerType::SigDefault => {
+            SaHandlerType::Default => {
                 sig.handle_default();
                 return Ok(0);
             }
-            SaHandlerType::SigCustomized(handler) => {
+            SaHandlerType::Customized(handler) => {
                 // 如果handler位于内核空间
                 if handler >= MMArch::USER_END_VADDR {
                     // 如果当前是SIGSEGV,则采用默认函数处理
@@ -602,7 +602,7 @@ fn setup_frame(
                     temp_handler = handler.data() as *mut c_void;
                 }
             }
-            SaHandlerType::SigIgnore => {
+            SaHandlerType::Ignore => {
                 return Ok(0);
             }
             _ => {
@@ -615,7 +615,7 @@ fn setup_frame(
             return Err(SystemError::EINVAL);
         }
     }
-    let frame: *mut SigFrame = get_stack(&trap_frame, size_of::<SigFrame>());
+    let frame: *mut SigFrame = get_stack(trap_frame, size_of::<SigFrame>());
     // kdebug!("frame=0x{:016x}", frame as usize);
     // 要求这个frame的地址位于用户空间，因此进行校验
     let r: Result<UserBufferWriter<'_>, SystemError> =
@@ -646,7 +646,7 @@ fn setup_frame(
     unsafe {
         (*frame)
             .context
-            .setup_sigcontext(oldset, &trap_frame)
+            .setup_sigcontext(oldset, trap_frame)
             .map_err(|e: SystemError| -> SystemError {
                 let r = Syscall::kill(ProcessManager::current_pcb().pid(), Signal::SIGSEGV as i32);
                 if r.is_err() {

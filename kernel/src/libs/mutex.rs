@@ -64,8 +64,7 @@ impl<T> Mutex<T> {
             // 当前mutex已经上锁
             if inner.is_locked {
                 // 检查当前进程是否处于等待队列中,如果不在，就加到等待队列内
-                if self.check_pid_in_wait_list(&inner, ProcessManager::current_pcb().pid()) == false
-                {
+                if !self.check_pid_in_wait_list(&inner, ProcessManager::current_pcb().pid()) {
                     inner.wait_list.push_back(ProcessManager::current_pcb());
                 }
 

@@ -61,8 +61,8 @@ impl LocalAlloc for KernelAllocator {
     unsafe fn local_alloc(&self, layout: Layout) -> *mut u8 {
         return self
             .alloc_in_buddy(layout)
-            .map(|x| x.as_mut_ptr() as *mut u8)
-            .unwrap_or(core::ptr::null_mut() as *mut u8);
+            .map(|x| x.as_mut_ptr())
+            .unwrap_or(core::ptr::null_mut());
     }
 
     unsafe fn local_alloc_zeroed(&self, layout: Layout) -> *mut u8 {
@@ -73,7 +73,7 @@ impl LocalAlloc for KernelAllocator {
                 core::ptr::write_bytes(ptr, 0, x.len());
                 ptr
             })
-            .unwrap_or(core::ptr::null_mut() as *mut u8);
+            .unwrap_or(core::ptr::null_mut());
     }
 
     unsafe fn local_dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -86,11 +86,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let r = self.local_alloc_zeroed(layout);
         mm_debug_log(
-            klog_types::AllocatorLogType::Alloc(AllocLogItem::new(
-                layout.clone(),
-                Some(r as usize),
-                None,
-            )),
+            klog_types::AllocatorLogType::Alloc(AllocLogItem::new(layout, Some(r as usize), None)),
             klog_types::LogSource::Buddy,
         );
 
@@ -104,7 +100,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
 
         mm_debug_log(
             klog_types::AllocatorLogType::AllocZeroed(AllocLogItem::new(
-                layout.clone(),
+                layout,
                 Some(r as usize),
                 None,
             )),
@@ -116,11 +112,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         mm_debug_log(
-            klog_types::AllocatorLogType::Free(AllocLogItem::new(
-                layout.clone(),
-                Some(ptr as usize),
-                None,
-            )),
+            klog_types::AllocatorLogType::Free(AllocLogItem::new(layout, Some(ptr as usize), None)),
             klog_types::LogSource::Buddy,
         );
 

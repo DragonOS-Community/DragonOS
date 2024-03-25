@@ -8,7 +8,7 @@ use crate::{
     time::{sleep::nanosleep, TimeSpec},
 };
 
-use super::timekeeping::do_gettimeofday;
+use super::timekeeping::{do_gettimeofday, getnstimeofday};
 
 pub type PosixTimeT = c_longlong;
 pub type PosixSusecondsT = c_int;
@@ -142,9 +142,9 @@ impl Syscall {
         let mut tp_buf =
             UserBufferWriter::new::<TimeSpec>(tp, core::mem::size_of::<TimeSpec>(), true)?;
 
-        let posix_time = do_gettimeofday();
+        let timespec = getnstimeofday();
 
-        tp_buf.copy_one_to_user(&posix_time, 0)?;
+        tp_buf.copy_one_to_user(&timespec, 0)?;
 
         return Ok(0);
     }

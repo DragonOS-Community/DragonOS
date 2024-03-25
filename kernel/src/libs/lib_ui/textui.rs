@@ -158,20 +158,19 @@ impl Sub<i32> for LineId {
         LineId::new(self.0 - rhs)
     }
 }
-
-impl Into<i32> for LineId {
-    fn into(self) -> i32 {
-        self.0.clone()
+impl From<LineId> for i32 {
+    fn from(value: LineId) -> Self {
+        value.0
     }
 }
-impl Into<u32> for LineId {
-    fn into(self) -> u32 {
-        self.0.clone() as u32
+impl From<LineId> for u32 {
+    fn from(value: LineId) -> Self {
+        value.0 as u32
     }
 }
-impl Into<usize> for LineId {
-    fn into(self) -> usize {
-        self.0.clone() as usize
+impl From<LineId> for usize {
+    fn from(value: LineId) -> Self {
+        value.0 as usize
     }
 }
 impl Sub<LineId> for LineId {
@@ -220,19 +219,19 @@ impl Sub<i32> for LineIndex {
     }
 }
 
-impl Into<i32> for LineIndex {
-    fn into(self) -> i32 {
-        self.0.clone()
+impl From<LineIndex> for i32 {
+    fn from(val: LineIndex) -> Self {
+        val.0
     }
 }
-impl Into<u32> for LineIndex {
-    fn into(self) -> u32 {
-        self.0.clone() as u32
+impl From<LineIndex> for u32 {
+    fn from(value: LineIndex) -> Self {
+        value.0 as u32
     }
 }
-impl Into<usize> for LineIndex {
-    fn into(self) -> usize {
-        self.0.clone() as usize
+impl From<LineIndex> for usize {
+    fn from(value: LineIndex) -> Self {
+        value.0 as usize
     }
 }
 #[derive(Copy, Clone, Debug)]
@@ -260,24 +259,24 @@ impl From<u32> for FontColor {
         return Self(value & 0x00ffffff);
     }
 }
-impl Into<usize> for FontColor {
-    fn into(self) -> usize {
-        self.0.clone() as usize
+impl From<FontColor> for usize {
+    fn from(value: FontColor) -> Self {
+        value.0 as usize
     }
 }
-impl Into<u32> for FontColor {
-    fn into(self) -> u32 {
-        self.0.clone()
+impl From<FontColor> for u32 {
+    fn from(value: FontColor) -> Self {
+        value.0
     }
 }
-impl Into<u16> for FontColor {
-    fn into(self) -> u16 {
-        self.0.clone() as u16
+impl From<FontColor> for u16 {
+    fn from(value: FontColor) -> Self {
+        value.0 as u16
     }
 }
-impl Into<u64> for FontColor {
-    fn into(self) -> u64 {
-        self.0.clone() as u64
+impl From<FontColor> for u64 {
+    fn from(value: FontColor) -> Self {
+        value.0 as u64
     }
 }
 
@@ -463,7 +462,7 @@ impl TextuiCharChromatic {
                 }
 
                 unsafe {
-                    addr = (addr.offset(1)) as *mut u32;
+                    addr = addr.offset(1);
                 }
             }
         }
@@ -776,14 +775,14 @@ impl TextuiWindow {
         if character == '\n' {
             // 换行时还需要输出\r
             send_to_default_serial8250_port(&[b'\r']);
-            if is_enable_window == true {
+            if is_enable_window {
                 self.textui_new_line()?;
             }
             return Ok(());
         }
         // 输出制表符
         else if character == '\t' {
-            if is_enable_window == true {
+            if is_enable_window {
                 if let TextuiVline::Chromatic(vline) =
                     &self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
                 {
@@ -798,7 +797,7 @@ impl TextuiWindow {
         }
         // 字符 '\x08' 代表 ASCII 码中的退格字符。它在输出中的作用是将光标向左移动一个位置，并在该位置上输出后续的字符，从而实现字符的删除或替换。
         else if character == '\x08' {
-            if is_enable_window == true {
+            if is_enable_window {
                 let mut tmp = LineIndex(0);
                 if let TextuiVline::Chromatic(vline) =
                     &mut self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
@@ -853,17 +852,15 @@ impl TextuiWindow {
                     self.textui_refresh_vlines(self.top_vline, actual_line_sum)?;
                 }
             }
-        } else {
-            if is_enable_window == true {
-                if let TextuiVline::Chromatic(vline) =
-                    &self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
-                {
-                    if !vline.index.check(self.chars_per_line) {
-                        self.textui_new_line()?;
-                    }
-
-                    return self.true_textui_putchar_window(character, frcolor, bkcolor);
+        } else if is_enable_window {
+            if let TextuiVline::Chromatic(vline) =
+                &self.vlines[<LineId as Into<usize>>::into(self.vline_operating)]
+            {
+                if !vline.index.check(self.chars_per_line) {
+                    self.textui_new_line()?;
                 }
+
+                return self.true_textui_putchar_window(character, frcolor, bkcolor);
             }
         }
 
@@ -902,7 +899,7 @@ impl TextUiFramework {
         default_window: Arc<SpinLock<TextuiWindow>>,
     ) -> Self {
         let actual_line =
-            AtomicI32::new((&metadata.buf_info().height() / TEXTUI_CHAR_HEIGHT) as i32);
+            AtomicI32::new((metadata.buf_info().height() / TEXTUI_CHAR_HEIGHT) as i32);
         let inner = TextUiFramework {
             metadata: RwLock::new(metadata),
             window_list,
@@ -1001,8 +998,7 @@ pub extern "C" fn rs_textui_putchar(character: u8, fr_color: u32, bk_color: u32)
         );
         let port = TTY_PORTS[current_vcnum as usize].clone();
         let tty = port.port_data().tty();
-        if tty.is_some() {
-            let tty = tty.unwrap();
+        if let Some(tty) = tty {
             send_to_default_serial8250_port(&[character]);
             return tty
                 .write_without_serial(buf.as_bytes(), buf.len())

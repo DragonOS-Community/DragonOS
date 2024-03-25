@@ -1,7 +1,7 @@
 # 导入环境变量
-include ../env.mk
+include ./env.mk
 
-export ARCH ?= x86_64
+# export ARCH ?= x86_64
 # 如果是x86_64, 则使用x86_64-unknown-none.json作为target
 ifeq ($(ARCH), x86_64)
 	export TARGET_JSON=arch/x86_64/x86_64-unknown-none.json
@@ -25,7 +25,11 @@ clean:
 
 .PHONY: fmt
 fmt:
-	cargo fmt --all $(FMT_CHECK)
+	@cargo fmt --all $(FMT_CHECK)
+ifeq ($(ARCH), x86_64)
+	@cargo clippy --all-features
+endif
+
 
 .PHONY: check
 check: ECHO

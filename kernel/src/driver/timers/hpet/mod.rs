@@ -33,7 +33,7 @@ impl HpetRegisters {
 
     /// 获取 HPET 计数器的频率
     pub fn frequency(&self) -> u64 {
-        10000_0000_0000_000 / self.counter_clock_period()
+        1_000_000_000_000_000 / self.counter_clock_period()
     }
 
     pub fn main_counter_value(&self) -> u64 {

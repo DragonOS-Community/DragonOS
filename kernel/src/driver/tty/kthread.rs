@@ -50,8 +50,8 @@ fn tty_refresh_thread() -> i32 {
             continue;
         }
         let mut data = [0u8; TO_DEQUEUE_MAX];
-        for i in 0..to_dequeue {
-            data[i] = KEYBUF.pop().unwrap();
+        for item in data.iter_mut().take(to_dequeue) {
+            *item = KEYBUF.pop().unwrap();
         }
 
         let _ = current_tty_port().receive_buf(&data[0..to_dequeue], &[], to_dequeue);
@@ -60,7 +60,7 @@ fn tty_refresh_thread() -> i32 {
 
 /// 发送数据到tty刷新线程
 pub fn send_to_tty_refresh_thread(data: &[u8]) {
-    for i in 0..data.len() {
-        KEYBUF.push(data[i]).ok();
+    for item in data {
+        KEYBUF.push(*item).ok();
     }
 }

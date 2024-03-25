@@ -122,7 +122,7 @@ impl VesaFb {
 #[derive(Debug)]
 struct InnerVesaFb {
     bus: Option<Weak<dyn Bus>>,
-    class: Option<Arc<dyn Class>>,
+    class: Option<Weak<dyn Class>>,
     driver: Option<Weak<dyn Driver>>,
     kern_inode: Option<Arc<KernFSInode>>,
     parent: Option<Weak<dyn KObject>>,
@@ -189,8 +189,20 @@ impl Device for VesaFb {
         self.inner.lock().bus = bus;
     }
 
-    fn set_class(&self, class: Option<Arc<dyn Class>>) {
+    fn set_class(&self, class: Option<Weak<dyn Class>>) {
         self.inner.lock().class = class;
+    }
+
+    fn class(&self) -> Option<Arc<dyn Class>> {
+        let mut guard = self.inner.lock();
+
+        let r = guard.class.clone()?.upgrade();
+        if r.is_none() {
+            // 为了让弱引用失效
+            guard.class = None;
+        }
+
+        return r;
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
@@ -591,8 +603,8 @@ impl FrameBufferOps for VesaFb {
                         }
                     }
                 } else {
-                    let mut tmp: Vec<u32> = vec![0; size];
-                    let mut tmp_ptr = tmp.as_mut_ptr() as *mut u16;
+                    let mut tmp: Vec<u16> = vec![0; size];
+                    let mut tmp_ptr = tmp.as_mut_ptr();
 
                     // 这里是一个可以优化的点，现在为了避免指针拷贝时覆盖，统一先拷贝进入buf再拷贝到dst
                     unsafe {

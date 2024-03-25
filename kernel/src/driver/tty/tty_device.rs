@@ -425,7 +425,7 @@ impl Device for TtyDevice {
         self.inner.write().bus = bus
     }
 
-    fn set_class(&self, _class: Option<Arc<dyn crate::driver::base::class::Class>>) {
+    fn set_class(&self, _class: Option<Weak<dyn crate::driver::base::class::Class>>) {
         todo!()
     }
 

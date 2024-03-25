@@ -1067,8 +1067,7 @@ impl FATFileSystem {
 
                 let lba = self.get_lba_from_offset(self.bytes_to_sector(fat_part_bytes_offset));
 
-                let mut v: Vec<u8> = Vec::new();
-                v.resize(LBA_SIZE, 0);
+                let mut v: Vec<u8> = vec![0; LBA_SIZE];
                 self.partition.disk().read_at_sync(lba, 1, &mut v)?;
 
                 let mut cursor: VecCursor = VecCursor::new(v);

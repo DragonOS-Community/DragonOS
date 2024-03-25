@@ -100,7 +100,7 @@ impl BlockCache {
             }
         }
         //只要有缺块就认为cache失败，因为需要补块就需要进行io操作
-        if fail_ans.len() != 0 {
+        if !fail_ans.is_empty() {
             return Err(BlockCacheError::BlockFaultError(fail_ans));
         } else {
             return Ok(success_ans);
@@ -223,11 +223,9 @@ impl CacheSpace {
         if addr > self.frame_selector.size() {
             return Err(BlockCacheError::InsufficientCacheSpace);
         } else {
-            return Ok(
-                //CacheBlockAddr就是用于给root寻址的
-                self.root[addr.data()]
-                    .data(&mut buf[position * BLOCK_SIZE..(position + 1) * BLOCK_SIZE])?,
-            );
+            //CacheBlockAddr就是用于给root寻址的
+            return self.root[addr.data()]
+                .data(&mut buf[position * BLOCK_SIZE..(position + 1) * BLOCK_SIZE]);
         }
     }
     /// # 函数的功能

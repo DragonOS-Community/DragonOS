@@ -26,9 +26,9 @@ use alloc::{
 use system_error::SystemError;
 
 
-const DEVFS_MAGIC: u64 = 0x1cd1;
+const DEVFS_MAGIC: u64 = 0x1373;
 const BLOCK_SIZE: u64 = 1024;
-const DEVFS_MAX_NAMELEN: usize = 64;
+const DEVFS_MAX_NAMELEN: usize = 255;
 /// @brief dev文件系统
 #[derive(Debug)]
 pub struct DevFS {

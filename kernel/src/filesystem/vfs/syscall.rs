@@ -4,6 +4,7 @@ use core::mem::size_of;
 use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
+use crate::include::bindings::bindings::EBADF;
 use crate::producefs;
 use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
@@ -1139,7 +1140,7 @@ impl Syscall {
         return r;
     }
 
-    pub fn statfs(path: *const u8,user_statfs: *mut PosixStatfs) -> Result<usize,SystemError>{
+    pub fn statfs(path: *const u8,user_statfs: *mut PosixStatfs) -> Result<usize,SystemError> {
         let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
         let fd = Self::open(path, FileMode::O_RDONLY.bits(), ModeType::empty().bits(), true)?;
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN)).unwrap();
@@ -1147,6 +1148,17 @@ impl Syscall {
         let (_inode_begin,remain_path) = user_path_at(&pcb,fd as i32, &path)?;
         let inode = ROOT_INODE().lookup_follow_symlink(&remain_path, MAX_PATHLEN)?;
         let statfs = PosixStatfs::from(inode.fs().super_block());
+        writer.copy_one_to_user(&statfs, 0)?;
+        return Ok(0);
+    }
+
+    pub fn fstatfs(fd: i32,user_statfs: *mut PosixStatfs) -> Result<usize,SystemError> {
+        let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+        let file = fd_table_guard.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
+        drop(fd_table_guard);
+        let statfs = PosixStatfs::from(file.lock().inode().fs().super_block());
         writer.copy_one_to_user(&statfs, 0)?;
         return Ok(0);
     }

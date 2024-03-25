@@ -714,6 +714,12 @@ impl Syscall {
 
             }
 
+            SYS_FSTATFS => {
+                let fd = args[0] as i32;
+                let statfs = args[1] as *mut PosixStatfs;
+                Self::fstatfs(fd,statfs)
+            }
+
             SYS_STATX => {
                 let fd = args[0] as i32;
                 let path = args[1] as *const u8;

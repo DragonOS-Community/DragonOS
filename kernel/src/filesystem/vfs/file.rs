@@ -277,7 +277,7 @@ impl File {
         return self.inode.get_entry_name(ino);
     }
 
-    /// @brief 调整文件操作指针的位置
+    /// @brief 调整文件操作指针的位置.inode().fs().super_block();
     ///
     /// @param origin 调整的起始位置
     pub fn lseek(&mut self, origin: SeekFrom) -> Result<usize, SystemError> {

@@ -27,6 +27,7 @@ use super::vfs::{
 
 pub mod callback;
 
+const KERNELFS_MAGIC: u64 = 0x83c7;
 #[derive(Debug)]
 pub struct KernFS {
     root_inode: Arc<KernFSInode>,
@@ -53,7 +54,7 @@ impl FileSystem for KernFS {
     }
 
     fn super_block(&self) -> super::vfs::SuperBlock {
-        SuperBlock::new(61267,KernFS::BLOCK_SIZE,KernFS::MAX_NAMELEN as u64)
+        SuperBlock::new(KERNELFS_MAGIC,KernFS::BLOCK_SIZE,KernFS::MAX_NAMELEN as u64)
     }
 }
 

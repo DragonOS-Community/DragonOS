@@ -2,6 +2,7 @@ use core::{hint::spin_loop, sync::atomic::Ordering};
 
 use alloc::{string::ToString, sync::Arc};
 use system_error::SystemError;
+use path_base::Path;
 
 use crate::{
     driver::{base::block::disk_info::Partition, disk::ahci},
@@ -186,21 +187,22 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
 }
 
 /// @brief 创建文件/文件夹
-pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
-    let path = path.trim();
+pub fn do_mkdir(path: &Path, _mode: FileMode) -> Result<u64, SystemError> {
+    // let path = path.trim();
 
     let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
 
     if let Err(errno) = inode {
         // 文件不存在，且需要创建
         if errno == SystemError::ENOENT {
-            let (filename, parent_path) = rsplit_path(path);
+            let file_name = path.file_name().unwrap();
+            let parent_path = path.parent();
             // 查找父目录
             let parent_inode: Arc<dyn IndexNode> =
-                ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+                ROOT_INODE().lookup(parent_path.unwrap_or(Path::new("/")))?;
             // 创建文件夹
             let _create_inode: Arc<dyn IndexNode> = parent_inode.create(
-                filename,
+                file_name,
                 FileType::Dir,
                 ModeType::from_bits_truncate(0o755),
             )?;
@@ -214,41 +216,42 @@ pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
 }
 
 /// @brief 删除文件夹
-pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
-    let path = path.trim();
+pub fn do_remove_dir(dirfd: i32, path: &Path) -> Result<u64, SystemError> {
+    // let path = path.trim();
 
     let pcb = ProcessManager::current_pcb();
     let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
-    let (filename, parent_path) = rsplit_path(&remain_path);
+    let file_name = remain_path.file_name().unwrap();
+    let parent_path = remain_path.parent();
 
+    // Todo: 待添加回来
     // 最后一项文件项为.时返回EINVAL
-    if filename == "." {
-        return Err(SystemError::EINVAL);
-    }
+    // if filename == "." {
+    //     return Err(SystemError::EINVAL);
+    // }
 
     // 查找父目录
     let parent_inode: Arc<dyn IndexNode> = inode_begin
-        .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        .lookup_follow_symlink(parent_path.unwrap_or(Path::new("/")), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
     if parent_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
 
     // 在目标点为symlink时也返回ENOTDIR
-    let target_inode = parent_inode.find(filename)?;
+    let target_inode = parent_inode.find(file_name)?;
     if target_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
 
     // 删除文件夹
-    parent_inode.rmdir(filename)?;
+    parent_inode.rmdir(file_name)?;
 
     return Ok(0);
 }
 
 /// @brief 删除文件
-pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
-    let path = path.trim();
+pub fn do_unlink_at(dirfd: i32, path: &Path) -> Result<u64, SystemError> {
 
     let pcb = ProcessManager::current_pcb();
     let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
@@ -267,23 +270,25 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::EPERM);
     }
 
-    let (filename, parent_path) = rsplit_path(path);
+    // let (filename, parent_path) = rsplit_path(path);
+    let file_name = path.file_name();
+    let parent_path = path.parent();
     // 查找父目录
     let parent_inode: Arc<dyn IndexNode> = inode_begin
-        .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        .lookup_follow_symlink(parent_path.unwrap_or(&Path::new("/")), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
     if parent_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
 
     // 删除文件
-    parent_inode.unlink(filename)?;
+    parent_inode.unlink(file_name.unwrap())?;
 
     return Ok(0);
 }
 
 // @brief mount filesystem
-pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<usize, SystemError> {
+pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &Path) -> Result<usize, SystemError> {
     ROOT_INODE()
         .lookup_follow_symlink(mount_point, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
         .mount(fs.clone())?;

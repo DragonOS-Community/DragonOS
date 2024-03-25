@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use path_base::{Path, PathBuf};
 use system_error::SystemError;
 
 use crate::{
@@ -34,24 +35,24 @@ pub(super) fn do_faccessat(
 
     // let follow_symlink = flags & AtFlags::AT_SYMLINK_NOFOLLOW.bits() as u32 == 0;
 
-    let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+    let path = PathBuf::from(check_and_clone_cstr(path, Some(MAX_PATHLEN))?);
 
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
 
     // 如果找不到文件，则返回错误码ENOENT
-    let _inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let _inode = inode.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
     // todo: 接着完善（可以借鉴linux 6.1.9的do_faccessat）
     return Ok(0);
 }
 
 pub fn do_fchmodat(dirfd: i32, path: *const u8, _mode: ModeType) -> Result<usize, SystemError> {
-    let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+    let path = PathBuf::from(check_and_clone_cstr(path, Some(MAX_PATHLEN))?);
 
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
 
     // 如果找不到文件，则返回错误码ENOENT
-    let _inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let _inode = inode.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
     kwarn!("do_fchmodat: not implemented yet\n");
     // todo: 真正去改变文件的权限
@@ -61,7 +62,7 @@ pub fn do_fchmodat(dirfd: i32, path: *const u8, _mode: ModeType) -> Result<usize
 
 pub(super) fn do_sys_open(
     dfd: i32,
-    path: &str,
+    path: &Path,
     o_flags: FileMode,
     mode: ModeType,
     follow_symlink: bool,
@@ -72,12 +73,12 @@ pub(super) fn do_sys_open(
 
 fn do_sys_openat2(
     dirfd: i32,
-    path: &str,
+    path: &Path,
     how: OpenHow,
     follow_symlink: bool,
 ) -> Result<usize, SystemError> {
     // kdebug!("open: path: {}, mode: {:?}", path, mode);
-    let path = path.trim();
+    // let path = path.trim();
 
     let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
     let inode: Result<Arc<dyn IndexNode>, SystemError> = inode_begin.lookup_follow_symlink(
@@ -97,13 +98,13 @@ fn do_sys_openat2(
                 && !how.o_flags.contains(FileMode::O_DIRECTORY)
                 && errno == SystemError::ENOENT
             {
-                let (filename, parent_path) = rsplit_path(&path);
+                // let (filename, parent_path) = rsplit_path(&path);
                 // 查找父目录
                 let parent_inode: Arc<dyn IndexNode> =
-                    ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+                    ROOT_INODE().lookup(path.parent().unwrap_or(Path::new("/")))?;
                 // 创建文件
                 let inode: Arc<dyn IndexNode> = parent_inode.create(
-                    filename,
+                    path.file_name().unwrap(),
                     FileType::File,
                     ModeType::from_bits_truncate(0o755),
                 )?;

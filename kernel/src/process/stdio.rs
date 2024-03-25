@@ -1,3 +1,4 @@
+use path_base::Path;
 use system_error::SystemError;
 
 use crate::{
@@ -14,7 +15,7 @@ pub fn stdio_init() -> Result<(), SystemError> {
         return Err(SystemError::EPERM);
     }
     let tty_inode = ROOT_INODE()
-        .lookup("/dev/tty0")
+        .lookup(Path::new("/dev/tty0"))
         .expect("Init stdio: can't find tty0");
     let stdin =
         File::new(tty_inode.clone(), FileMode::O_RDONLY).expect("Init stdio: can't create stdin");

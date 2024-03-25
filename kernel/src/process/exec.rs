@@ -1,6 +1,7 @@
 use core::{fmt::Debug, ptr::null};
 
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
+use path_base::Path;
 use system_error::SystemError;
 
 use crate::{
@@ -116,7 +117,7 @@ impl ExecParam {
         vm: Arc<AddressSpace>,
         flags: ExecParamFlags,
     ) -> Result<Self, SystemError> {
-        let inode = ROOT_INODE().lookup(file_path)?;
+        let inode = ROOT_INODE().lookup(Path::new(file_path))?;
 
         // 读取文件头部，用于判断文件类型
         let file = File::new(inode, FileMode::O_RDONLY)?;

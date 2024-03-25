@@ -38,6 +38,7 @@ ida = { path = "src/libs/ida" }
 intertrait = { path = "src/libs/intertrait" }
 kdepends = { path = "crates/kdepends" }
 klog_types = { path = "crates/klog_types" }
+path_base = { path = "crates/path_base" }
 linkme = "=0.2"
 num = { version = "=0.4.0", default-features = false }
 num-derive = "=0.3"

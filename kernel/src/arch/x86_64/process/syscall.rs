@@ -6,14 +6,10 @@ use crate::{
         interrupt::TrapFrame,
         process::table::{USER_CS, USER_DS},
         CurrentIrqArch,
-    },
-    exception::InterruptArch,
-    mm::ucontext::AddressSpace,
-    process::{
+    }, exception::InterruptArch, kdebug, mm::ucontext::AddressSpace, process::{
         exec::{load_binary_file, ExecParam, ExecParamFlags},
         ProcessControlBlock, ProcessManager,
-    },
-    syscall::{user_access::UserBufferWriter, Syscall},
+    }, syscall::{user_access::UserBufferWriter, Syscall}
 };
 
 impl Syscall {
@@ -59,7 +55,6 @@ impl Syscall {
 
         // 切换到新的用户地址空间
         unsafe { address_space.read().user_mapper.utable.make_current() };
-
         drop(old_address_space);
         drop(irq_guard);
         // kdebug!("to load binary file");
@@ -74,7 +69,7 @@ impl Syscall {
         param.init_info_mut().envs = envp;
 
         // 把proc_init_info写到用户栈上
-
+        kdebug!("9");
         let (user_sp, argv_ptr) = unsafe {
             param
                 .init_info()

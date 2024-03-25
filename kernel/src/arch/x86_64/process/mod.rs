@@ -16,20 +16,14 @@ use system_error::SystemError;
 use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 
 use crate::{
-    arch::process::table::TSSManager,
-    exception::InterruptArch,
-    kerror, kwarn,
-    libs::spinlock::SpinLockGuard,
-    mm::{
+    arch::process::table::TSSManager, exception::InterruptArch, kdebug, kerror, kwarn, libs::spinlock::SpinLockGuard, mm::{
         percpu::{PerCpu, PerCpuVar},
         VirtAddr,
-    },
-    process::{
+    }, process::{
         fork::{CloneFlags, KernelCloneArgs},
         KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager, SwitchResult,
         SWITCH_RESULT,
-    },
-    syscall::Syscall,
+    }, syscall::Syscall
 };
 
 use self::{

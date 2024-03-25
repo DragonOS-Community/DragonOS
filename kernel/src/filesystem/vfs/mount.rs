@@ -417,7 +417,7 @@ impl IndexNode for MountFSInode {
             .insert(metadata.inode_id, new_mount_fs.clone());
         kdebug!("My path: {:?}", self._abs_path());
         MOUNTS_LIST().lock().insert(
-            MountPath::from(self._abs_path()?.as_str()),
+            MountPath::from(self._abs_path()?.to_str().unwrap()),
             new_mount_fs.clone(),
         );
         return Ok(new_mount_fs);

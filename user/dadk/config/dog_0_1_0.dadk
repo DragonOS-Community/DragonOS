@@ -6,9 +6,9 @@
   "task_type": {
     "BuildFromSource": {
       "Git": {
-        "url": "https://github.com/val213/dog.git",
+        "url": "https://git.mirrors.dragonos.org.cn/DragonOS-Community/dog.git",
         "branch": null,
-        "revision": "c44e9137cda5b67e6380b3d0a21a8ca244adfe13"
+        "revision": "4ad6075686"
       }
     }
   },

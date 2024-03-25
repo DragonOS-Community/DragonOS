@@ -243,7 +243,7 @@ pub trait BlockDevice: Device {
     /// @brief 返回当前磁盘上的所有分区的Arc指针数组
     fn partitions(&self) -> Vec<Arc<Partition>>;
 
-    /// # 函数的功能 
+    /// # 函数的功能
     /// 经由Cache对块设备的读操作
     fn read_at(
         &self,

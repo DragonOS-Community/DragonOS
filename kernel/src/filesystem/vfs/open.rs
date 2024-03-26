@@ -77,9 +77,6 @@ fn do_sys_openat2(
     how: OpenHow,
     follow_symlink: bool,
 ) -> Result<usize, SystemError> {
-    // kdebug!("open: path: {}, mode: {:?}", path, mode);
-    // let path = path.trim();
-
     let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
     let inode: Result<Arc<dyn IndexNode>, SystemError> = inode_begin.lookup_follow_symlink(
         &path,

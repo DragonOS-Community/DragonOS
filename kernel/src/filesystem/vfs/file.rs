@@ -610,7 +610,7 @@ impl FileDescriptorVec {
         if !FileDescriptorVec::validate_fd(fd) {
             return None;
         }
-        return self.fds[fd as usize].clone();
+        self.fds[fd as usize].clone()
     }
 
     /// 释放文件描述符，同时关闭文件。

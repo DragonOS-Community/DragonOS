@@ -1,9 +1,8 @@
 ---
 name: Bug report
 about: 创建bug报告以帮助我们改进
-title: "[BUG] "
-labels: bug
-assignees: fslongjin
+title: "[BUG REPORT] "
+labels: bug-report
 
 ---
 

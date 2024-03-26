@@ -74,7 +74,13 @@ impl ProcessManager {
         return VirtAddr::new(x86::current::registers::rsp() as usize);
 
         #[cfg(target_arch = "riscv64")]
-        unimplemented!("stack_ptr() is not implemented on RISC-V")
+        {
+            let stack_ptr: usize;
+            unsafe {
+                core::arch::asm!("mv {}, sp", out(reg) stack_ptr);
+            }
+            return VirtAddr::new(stack_ptr);
+        }
     }
 
     /// 获取idle进程数组的引用

@@ -165,7 +165,7 @@ pub trait Device: KObject {
     /// 设置当前设备所属的类
     ///
     /// 注意，如果实现了当前方法，那么必须实现`class()`方法
-    fn set_class(&self, class: Option<Arc<dyn Class>>);
+    fn set_class(&self, class: Option<Weak<dyn Class>>);
 
     /// 返回已经与当前设备匹配好的驱动程序
     fn driver(&self) -> Option<Arc<dyn Driver>>;

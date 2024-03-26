@@ -41,7 +41,12 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
-    mm::{percpu::PerCpuVar, set_IDLE_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
+    mm::{
+        percpu::{PerCpu, PerCpuVar},
+        set_IDLE_PROCESS_ADDRESS_SPACE,
+        ucontext::AddressSpace,
+        VirtAddr,
+    },
     net::socket::SocketInode,
     sched::{
         completion::Completion,
@@ -73,7 +78,7 @@ pub mod utils;
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);
 
-pub static mut SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
+pub static mut PROCESS_SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
 
 /// 一个只改变1次的全局变量，标志进程管理器是否已经初始化完成
 static mut __PROCESS_MANAGEMENT_INIT_DONE: bool = false;
@@ -118,6 +123,7 @@ impl ProcessManager {
         };
 
         ALL_PROCESS.lock_irqsave().replace(HashMap::new());
+        Self::init_switch_result();
         Self::arch_init();
         kdebug!("process arch init done.");
         Self::init_idle();
@@ -125,6 +131,16 @@ impl ProcessManager {
 
         unsafe { __PROCESS_MANAGEMENT_INIT_DONE = true };
         kinfo!("Process Manager initialized.");
+    }
+
+    fn init_switch_result() {
+        let mut switch_res_vec: Vec<SwitchResult> = Vec::new();
+        for _ in 0..PerCpu::MAX_CPU_NUM {
+            switch_res_vec.push(SwitchResult::new());
+        }
+        unsafe {
+            PROCESS_SWITCH_RESULT = Some(PerCpuVar::new(switch_res_vec).unwrap());
+        }
     }
 
     /// 判断进程管理器是否已经初始化完成
@@ -399,14 +415,14 @@ impl ProcessManager {
     /// 上下文切换完成后的钩子函数
     unsafe fn switch_finish_hook() {
         // kdebug!("switch_finish_hook");
-        let prev_pcb = SWITCH_RESULT
+        let prev_pcb = PROCESS_SWITCH_RESULT
             .as_mut()
             .unwrap()
             .get_mut()
             .prev_pcb
             .take()
             .expect("prev_pcb is None");
-        let next_pcb = SWITCH_RESULT
+        let next_pcb = PROCESS_SWITCH_RESULT
             .as_mut()
             .unwrap()
             .get_mut()

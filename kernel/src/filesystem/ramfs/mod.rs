@@ -4,6 +4,7 @@ use core::any::Any;
 use core::intrinsics::unlikely;
 
 use crate::filesystem::vfs::FSMAKER;
+use crate::libs::rwlock::RwLock;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{core::generate_inode_id, FileType},
@@ -25,15 +26,16 @@ use super::vfs::{
     cache::DefaultCache, file::FilePrivateData, syscall::ModeType, FileSystem, FileSystemMaker,
     FsInfo, IndexNode, Metadata, SpecialNodeData,
 };
+use super::vfs::{Magic, SuperBlock};
 
 /// RamFS的inode名称的最大长度
 const RAMFS_MAX_NAMELEN: usize = 64;
-
+const RAMFS_BLOCK_SIZE: u64 = 512;
 #[derive(Debug)]
 pub struct RamFS {
     root: Arc<LockedEntry>,
-    // To Add Cache
     cache: Arc<DefaultCache>,
+    super_block: RwLock<SuperBlock>,
 }
 
 impl RamFS {
@@ -53,6 +55,11 @@ impl RamFS {
         let ret = Arc::new(RamFS {
             root,
             cache: Arc::new(DefaultCache::new(None)),
+            super_block: SuperBlock::new(
+                Magic::RAMFS_MAGIC,
+                RAMFS_BLOCK_SIZE,
+                RAMFS_MAX_NAMELEN as u64,
+            ),
         });
         {
             let mut entry = ret.root.0.lock();
@@ -99,6 +106,10 @@ impl FileSystem for RamFS {
 
     fn cache(&self) -> Result<Arc<DefaultCache>, SystemError> {
         Ok(self.cache.clone())
+    }
+
+    fn super_block(&self) -> SuperBlock {
+        self.super_block.read().clone()
     }
 }
 

@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     event_poll::{EPollEventType, EventPoll},
-    socket::{sockets::TcpSocket, HANDLE_MAP, SOCKET_SET},
+    socket::{inet::TcpSocket, HANDLE_MAP, SOCKET_SET},
 };
 
 /// The network poll function, which will be called by timer.

@@ -2,6 +2,7 @@ use core::any::Any;
 use core::intrinsics::unlikely;
 
 use crate::filesystem::vfs::FSMAKER;
+use crate::libs::rwlock::RwLock;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{core::generate_inode_id, FileType},
@@ -21,10 +22,11 @@ use super::vfs::{
     file::FilePrivateData, syscall::ModeType, FileSystem, FileSystemMaker, FsInfo, IndexNode,
     InodeId, Metadata, SpecialNodeData,
 };
+use super::vfs::{Magic, SuperBlock};
 
 /// RamFS的inode名称的最大长度
 const RAMFS_MAX_NAMELEN: usize = 64;
-
+const RAMFS_BLOCK_SIZE: u64 = 512;
 /// @brief 内存文件系统的Inode结构体
 #[derive(Debug)]
 struct LockedRamFSInode(SpinLock<RamFSInode>);
@@ -34,6 +36,7 @@ struct LockedRamFSInode(SpinLock<RamFSInode>);
 pub struct RamFS {
     /// RamFS的root inode
     root_inode: Arc<LockedRamFSInode>,
+    super_block: RwLock<SuperBlock>,
 }
 
 /// @brief 内存文件系统的Inode结构体(不包含锁)
@@ -80,10 +83,19 @@ impl FileSystem for RamFS {
     fn name(&self) -> &str {
         "ramfs"
     }
+
+    fn super_block(&self) -> SuperBlock {
+        self.super_block.read().clone()
+    }
 }
 
 impl RamFS {
     pub fn new() -> Arc<Self> {
+        let super_block = SuperBlock::new(
+            Magic::RAMFS_MAGIC,
+            RAMFS_BLOCK_SIZE,
+            RAMFS_MAX_NAMELEN as u64,
+        );
         // 初始化root inode
         let root: Arc<LockedRamFSInode> = Arc::new(LockedRamFSInode(SpinLock::new(RamFSInode {
             parent: Weak::default(),
@@ -110,7 +122,10 @@ impl RamFS {
             special_node: None,
         })));
 
-        let result: Arc<RamFS> = Arc::new(RamFS { root_inode: root });
+        let result: Arc<RamFS> = Arc::new(RamFS {
+            root_inode: root,
+            super_block: RwLock::new(super_block),
+        });
 
         // 对root inode加锁，并继续完成初始化工作
         let mut root_guard: SpinLockGuard<RamFSInode> = result.root_inode.0.lock();

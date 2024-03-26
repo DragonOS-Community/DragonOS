@@ -124,8 +124,6 @@ pub struct Inode {
 #[derive(Debug)]
 pub struct LockedInode(SpinLock<Inode>);
 
-/// [WARN] [UNSAFE]
-/// Every
 #[derive(Debug)]
 pub struct Entry {
     name: String,
@@ -450,7 +448,6 @@ impl IndexNode for LockedEntry {
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
-        kdebug!("Call ramfs rmdir");
         let mut entry = self.0.lock();
         {
             let inode = entry.inode.0.lock();
@@ -479,7 +476,6 @@ impl IndexNode for LockedEntry {
         }
         // 在当前目录中删除这个子目录项
         entry.children.remove(&keyer);
-        kdebug!("Rest elements: {:?}", entry.children.keys().collect::<Vec<_>>());
         Ok(())
     }
 

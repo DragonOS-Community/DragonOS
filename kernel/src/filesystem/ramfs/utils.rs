@@ -1,8 +1,10 @@
 //! 用于展示如何在保留比较的同时支持从当前inode原地取出目录名
-use core::cmp::Ordering;
-use alloc::{string::String, sync::{Arc, Weak}};
 use super::LockedEntry;
-
+use alloc::{
+    string::String,
+    sync::{Arc, Weak},
+};
+use core::cmp::Ordering;
 
 #[derive(Debug)]
 pub struct Keyer(Weak<LockedEntry>, Option<String>);
@@ -71,48 +73,7 @@ impl Eq for Keyer {}
 // Uncheck Stable
 impl PartialOrd for Keyer {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        if self.0.ptr_eq(&other.0) {
-            kdebug!("Compare itself!");
-            return Some(Ordering::Equal);
-        }
-        if self.1.is_none() && other.1.is_none() {
-            // cmp between wrapper
-            let opt1 = self.0.upgrade();
-            let opt2 = other.0.upgrade();
-            if opt1.is_none() && opt2.is_none() {
-                kerror!("Empty Both none!");
-                panic!("All Keys None, compare error!");
-            }
-            if opt1.is_some() && opt2.is_some() {
-                return Some(
-                    opt1.unwrap()
-                        .0
-                        .lock()
-                        .name
-                        .cmp(&opt2.unwrap().0.lock().name),
-                );
-            } else {
-                kwarn!("depecated");
-                panic!("Empty Key!");
-            }
-        } else {
-            if self.1.is_none() {
-                let opt = self.0.upgrade();
-                if opt.is_none() {
-                    kwarn!("depecated");
-                    panic!("Empty Key!");
-                }
-                return Some(opt.unwrap().0.lock().name.cmp(other.1.as_ref().unwrap()));
-            } else {
-                let opt = other.0.upgrade();
-                if opt.is_none() {
-                    kwarn!("depecated");
-                    panic!("Empty Key!");
-                }
-
-                return Some(opt.unwrap().0.lock().name.cmp(self.1.as_ref().unwrap()));
-            }
-        }
+        Some(self.cmp(other))
     }
 }
 
@@ -131,34 +92,28 @@ impl Ord for Keyer {
                 kerror!("Both None!");
                 panic!("All Keys None, compare error!");
             }
-            if opt1.is_some() && opt2.is_some() {
-                return opt1
-                    .unwrap()
-                    .0
-                    .lock()
-                    .name
-                    .cmp(&opt2.unwrap().0.lock().name);
-            } else {
+            if let Some(o1) = opt1 {
+                if let Some(o2) = opt2 {
+                    return o1.0.lock().name.cmp(&o2.0.lock().name);
+                }
+            }
+            kerror!("depecated");
+            panic!("Empty Key!");
+        } else if self.1.is_none() {
+            let opt = self.0.upgrade();
+            if opt.is_none() {
                 kwarn!("depecated");
                 panic!("Empty Key!");
             }
+            return opt.unwrap().0.lock().name.cmp(other.1.as_ref().unwrap());
         } else {
-            if self.1.is_none() {
-                let opt = self.0.upgrade();
-                if opt.is_none() {
-                    kwarn!("depecated");
-                    panic!("Empty Key!");
-                }
-                return opt.unwrap().0.lock().name.cmp(other.1.as_ref().unwrap());
-            } else {
-                let opt = other.0.upgrade();
-                if opt.is_none() {
-                    kwarn!("depecated");
-                    panic!("Empty Key!");
-                }
-
-                return self.1.as_ref().unwrap().cmp(&opt.unwrap().0.lock().name);
+            let opt = other.0.upgrade();
+            if opt.is_none() {
+                kwarn!("depecated");
+                panic!("Empty Key!");
             }
+
+            return self.1.as_ref().unwrap().cmp(&opt.unwrap().0.lock().name);
         }
     }
 }

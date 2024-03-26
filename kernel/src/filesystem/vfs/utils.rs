@@ -54,7 +54,7 @@ pub fn user_path_at(
         let fd_table_guard = binding.read();
         let file = fd_table_guard
             .get_file_by_fd(dirfd)
-            .ok_or(SystemError::EBADF)?; 
+            .ok_or(SystemError::EBADF)?;
 
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);

@@ -1,8 +1,8 @@
 use core::{hint::spin_loop, sync::atomic::Ordering};
 
 use alloc::{string::ToString, sync::Arc};
-use system_error::SystemError;
 use path_base::Path;
+use system_error::SystemError;
 
 use crate::{
     driver::{base::block::disk_info::Partition, disk::ahci},
@@ -23,8 +23,7 @@ use crate::{
 };
 
 use super::{
-    file::FileMode, utils::user_path_at,
-    IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    file::FileMode, utils::user_path_at, IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 /// @brief 原子地生成新的Inode号。
@@ -187,7 +186,6 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
 
 /// @brief 创建文件/文件夹
 pub fn do_mkdir(path: &Path, _mode: FileMode) -> Result<u64, SystemError> {
-
     let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
 
     if let Err(errno) = inode {
@@ -197,7 +195,7 @@ pub fn do_mkdir(path: &Path, _mode: FileMode) -> Result<u64, SystemError> {
             let parent_path = path.parent();
             // 查找父目录
             let parent_inode: Arc<dyn IndexNode> =
-            ROOT_INODE().lookup(parent_path.unwrap_or(Path::new("/")))?;
+                ROOT_INODE().lookup(parent_path.unwrap_or(Path::new("/")))?;
             // 创建文件夹
             let _create_inode: Arc<dyn IndexNode> = parent_inode.create(
                 file_name,
@@ -209,7 +207,7 @@ pub fn do_mkdir(path: &Path, _mode: FileMode) -> Result<u64, SystemError> {
             return Err(errno);
         }
     }
-    
+
     return Ok(0);
 }
 
@@ -227,8 +225,10 @@ pub fn do_remove_dir(dirfd: i32, path: &Path) -> Result<u64, SystemError> {
     // }
 
     // 查找父目录
-    let parent_inode: Arc<dyn IndexNode> = inode_begin
-        .lookup_follow_symlink(parent_path.unwrap_or(Path::new("/")), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let parent_inode: Arc<dyn IndexNode> = inode_begin.lookup_follow_symlink(
+        parent_path.unwrap_or(Path::new("/")),
+        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    )?;
 
     if parent_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
@@ -270,8 +270,10 @@ pub fn do_unlink_at(dirfd: i32, path: &Path) -> Result<u64, SystemError> {
     let file_name = path.file_name();
     let parent_path = path.parent();
     // 查找父目录
-    let parent_inode: Arc<dyn IndexNode> = inode_begin
-        .lookup_follow_symlink(parent_path.unwrap_or(&Path::new("/")), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let parent_inode: Arc<dyn IndexNode> = inode_begin.lookup_follow_symlink(
+        parent_path.unwrap_or(Path::new("/")),
+        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    )?;
 
     if parent_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);

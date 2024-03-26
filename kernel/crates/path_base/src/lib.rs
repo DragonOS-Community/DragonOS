@@ -1558,7 +1558,8 @@ impl Path {
     #[must_use]
     pub fn file_prefix(&self) -> Option<&str> {
         self.file_name()
-            .map(split_file_at_dot).map(|(before, _after)| before)
+            .map(split_file_at_dot)
+            .map(|(before, _after)| before)
     }
 
     /// Extracts the extension (without the leading dot) of [`self.file_name`], if possible.

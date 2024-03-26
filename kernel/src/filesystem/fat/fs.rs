@@ -16,11 +16,10 @@ use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
         cache::DefaultCache,
-        Magic, SpecialNodeData, SuperBlock,
         core::generate_inode_id,
         file::{FileMode, FilePrivateData},
         syscall::ModeType,
-        FileSystem, FileType, IndexNode, InodeId, Metadata,
+        FileSystem, FileType, IndexNode, InodeId, Magic, Metadata, SpecialNodeData, SuperBlock,
     },
     kerror,
     libs::{
@@ -1828,7 +1827,6 @@ impl IndexNode for LockedFATInode {
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         Ok(self.0.lock().parent.upgrade().ok_or(SystemError::ENOENT)?)
     }
-
 }
 
 impl Default for FATFsInfo {

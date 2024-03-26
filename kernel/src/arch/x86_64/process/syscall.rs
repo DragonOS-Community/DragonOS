@@ -6,10 +6,14 @@ use crate::{
         interrupt::TrapFrame,
         process::table::{USER_CS, USER_DS},
         CurrentIrqArch,
-    }, exception::InterruptArch, mm::ucontext::AddressSpace, process::{
+    },
+    exception::InterruptArch,
+    mm::ucontext::AddressSpace,
+    process::{
         exec::{load_binary_file, ExecParam, ExecParamFlags},
         ProcessControlBlock, ProcessManager,
-    }, syscall::{user_access::UserBufferWriter, Syscall}
+    },
+    syscall::{user_access::UserBufferWriter, Syscall},
 };
 
 impl Syscall {

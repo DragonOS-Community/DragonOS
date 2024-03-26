@@ -5,8 +5,12 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+#[allow(deprecated)]
 use core::{
-    hash::{Hash, Hasher, SipHasher}, marker::PhantomData, mem::{size_of, swap}, sync::atomic::{AtomicUsize, Ordering}
+    hash::{Hash, Hasher, SipHasher},
+    marker::PhantomData,
+    mem::{size_of, swap},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use crate::libs::{
@@ -63,7 +67,7 @@ struct HashTable<H: Hasher + Default> {
 impl<H: Hasher + Default> HashTable<H> {
     fn new(size: usize) -> Self {
         let mut new = Self {
-            _hash_type: PhantomData::default(),
+            _hash_type: PhantomData,
             table: Vec::with_capacity(size),
         };
         for _ in 0..size {
@@ -117,7 +121,7 @@ impl LruList {
         self.list
             .extract_if(|src| {
                 // 原始指针已被销毁
-                if Arc::strong_count(&src) < 2 {
+                if Arc::strong_count(src) < 2 {
                     return true;
                 }
                 false
@@ -148,7 +152,7 @@ impl LruList {
 
 /// Directory Cache 的默认实现
 /// Todo: 使用自定义优化哈希函数
-// #[derive(Debug)]
+#[allow(deprecated)]
 pub struct DefaultCache<H: Hasher + Default = SipHasher> {
     /// hash index
     table: HashTable<H>,
@@ -164,7 +168,8 @@ impl<H: Hasher + Default> DefaultCache<H> {
     const DEFAULT_MEMORY_SIZE: usize = 1024 /* K */ * 1024 /* Byte */;
     pub fn new(mem_size: Option<usize>) -> Self {
         let mem_size = mem_size.unwrap_or(Self::DEFAULT_MEMORY_SIZE);
-        let max_size = mem_size / (2 * size_of::<Arc<dyn IndexNode>>() + size_of::<Weak<dyn IndexNode>>());
+        let max_size =
+            mem_size / (2 * size_of::<Arc<dyn IndexNode>>() + size_of::<Weak<dyn IndexNode>>());
         let hash_table_size = max_size / 7 * 10 /* 0.7 */;
         Self {
             table: HashTable::new(hash_table_size),

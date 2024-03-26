@@ -19,10 +19,11 @@ use super::{
 };
 
 // 维护一个挂载点的记录，以支持特定于文件系统的索引
-static mut __MOUNTS_LIST: Option<Arc<SpinLock<BTreeMap<MountPath, Arc<dyn FileSystem>>>>> = None;
+type MountListType = Option<Arc<SpinLock<BTreeMap<MountPath, Arc<dyn FileSystem>>>>>;
+static mut __MOUNTS_LIST: MountListType = None;
 
 #[derive(PartialEq, Eq, Debug)]
-pub struct MountPath (PathBuf);
+pub struct MountPath(PathBuf);
 
 impl From<&str> for MountPath {
     fn from(value: &str) -> Self {
@@ -38,13 +39,7 @@ impl AsRef<Path> for MountPath {
 
 impl PartialOrd for MountPath {
     fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        let self_dep = self.0.components().count();
-        let othe_dep = other.0.components().count();
-        if self_dep == othe_dep {
-            Some(self.0.cmp(&other.0))
-        } else {
-            othe_dep.partial_cmp(&self_dep)
-        }
+        Some(self.cmp(other))
     }
 }
 
@@ -412,7 +407,7 @@ impl IndexNode for MountFSInode {
         // kdebug!("Mount Path: {:?}", self._abs_path()?.to_str().unwrap());
         // kdebug!("Mount FS: {:?}", new_mount_fs);
         MOUNTS_LIST().lock().insert(
-            MountPath::from(self._abs_path()?.to_str().unwrap()),
+            MountPath::from(self.abs_path()?.to_str().unwrap()),
             new_mount_fs.clone(),
         );
         return Ok(new_mount_fs);
@@ -470,12 +465,12 @@ impl FileSystem for MountFS {
             Some(inode) => {
                 // kdebug!("Mount point at {:?}", inode._abs_path());
                 inode.mount_fs.root_inode()
-            },
+            }
             // 当前文件系统是rootfs
             None => {
                 // kdebug!("Root fs");
                 self.mountpoint_root_inode()
-            },
+            }
         };
     }
 

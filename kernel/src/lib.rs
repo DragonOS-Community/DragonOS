@@ -93,7 +93,7 @@ use crate::process::ProcessManager;
 
 #[cfg(all(feature = "backtrace", target_arch = "x86_64"))]
 extern crate mini_backtrace;
-
+#[allow(dead_code)]
 extern "C" {
     fn lookup_kallsyms(addr: u64, level: i32) -> i32;
 }

@@ -339,7 +339,7 @@ impl IndexNode for LockedEntry {
         if entry.children.contains_key(&Keyer::from_str(name)) {
             return Err(SystemError::EEXIST);
         }
-        
+
         // 创建Entry-inode
         let result = Arc::new(LockedEntry(SpinLock::new(Entry {
             parent: entry.self_ref.clone(),
@@ -352,10 +352,10 @@ impl IndexNode for LockedEntry {
             special_node: None,
             name: String::from(name),
         })));
-        
+
         // 初始化inode的自引用的weak指针
         result.0.lock().self_ref = Arc::downgrade(&result);
-        
+
         // 将子inode插入父inode的B树中
         entry
             .children

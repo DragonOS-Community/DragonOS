@@ -22,12 +22,7 @@ use crate::{
     time::TimeSpec,
 };
 
-use self::{
-    cache::DefaultCache,
-    core::generate_inode_id,
-    file::FileMode,
-    syscall::ModeType,
-};
+use self::{cache::DefaultCache, core::generate_inode_id, file::FileMode, syscall::ModeType};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
@@ -430,17 +425,17 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     }
 
     /// 当前抽象层挂载点下的绝对目录
-    fn _abs_path(&self) -> Result<PathBuf, SystemError> {
+    fn abs_path(&self) -> Result<PathBuf, SystemError> {
         let mut inode;
         let mut path_stack = Vec::new();
         path_stack.push(self.key()?);
 
         match self.parent() {
             Err(e) => match e {
-                SystemError:: ENOENT => {
+                SystemError::ENOENT => {
                     return Ok(PathBuf::from("/"));
                 }
-                e => { 
+                e => {
                     return Err(e);
                 }
             },
@@ -520,7 +515,7 @@ impl dyn IndexNode {
         let abs_path = if path.is_absolute() {
             path.clean()
         } else {
-            self._abs_path()?.join(path.clean())
+            self.abs_path()?.join(path.clean())
         };
 
         // 检查根目录缓存
@@ -539,8 +534,6 @@ impl dyn IndexNode {
         {
             if let Some(fs) = fs.as_any_ref().downcast_ref::<MountFS>() {
                 let root_inode = fs.mountpoint_root_inode().find(".")?;
-                // kdebug!("FS: {:?}", fs);
-                // kdebug!("Root Node: {:?}", root_inode);
 
                 if let Ok(fscache) = fs.cache() {
                     let path_under = path.strip_prefix(root_path).unwrap();
@@ -549,23 +542,21 @@ impl dyn IndexNode {
                     }
 
                     // Cache record is found
-                    if let Some((inode, found_path)) = root_inode.quick_lookup(fscache, &abs_path, root_path) {
-                        // kdebug!("Found path: {:?}", found_path);
+                    if let Some((inode, found_path)) =
+                        Self::quick_lookup(fscache, &abs_path, &abs_path, root_path)
+                    {
                         let rest_path = abs_path.strip_prefix(found_path).unwrap();
-                        // kdebug!("Rest path {:?}", rest_path);
                         // no path left
                         if rest_path.iter().next().is_none() {
                             return Ok(inode);
                         }
-    
-                        // some path left, pop prefix '/'
                         return inode.lookup_walk(rest_path, max_follow_times);
                     }
-                    // kdebug!("Start lookup walk");
+
                     // Cache record not found
                     return root_inode.lookup_walk(path_under, max_follow_times);
                 }
-    
+
                 // 在对应文件系统根开始lookup
                 return fs
                     .root_inode()
@@ -664,7 +655,7 @@ impl dyn IndexNode {
                 if child_node.metadata()?.file_type == FileType::SymLink && max_follow_times > 0 {
                     // symlink wrapping problem
                     return ROOT_INODE().lookup_follow_symlink(
-                        &child_node.from_symlink()?.join(rest_path),
+                        &child_node.convert_symlink()?.join(rest_path),
                         max_follow_times - 1,
                     );
                 }
@@ -691,7 +682,7 @@ impl dyn IndexNode {
         }
     }
 
-    fn from_symlink(&self) -> Result<PathBuf, SystemError> {
+    fn convert_symlink(&self) -> Result<PathBuf, SystemError> {
         let mut content = [0u8; 256];
         let len = self.read_at(0, 256, &mut content, &mut FilePrivateData::Unused)?;
 
@@ -709,39 +700,28 @@ impl dyn IndexNode {
     ///
     /// 缓存可能未命中
     fn quick_lookup<'a>(
-        &'a self,
-        cache: Arc<DefaultCache>,
-        abs_path: &'a Path,
-        stop_path: &'a Path,
-    ) -> Option<(Arc<dyn IndexNode>, &Path)> {
-        self._quick_lookup(cache, abs_path, abs_path, stop_path)
-    }
-
-    fn _quick_lookup<'a>(
-        &'a self,
         cache: Arc<DefaultCache>,
         abs_path: &'a Path,
         rest_path: &'a Path,
         stop_path: &'a Path,
-    ) -> Option<(Arc<dyn IndexNode>, &Path)> {
+    ) -> Option<(Arc<dyn IndexNode>, &'a Path)> {
         // kdebug!("Quick lookup: abs {:?}, rest {:?}", abs_path, rest_path);
         let key = abs_path.file_name();
 
         let result = cache.get(key.unwrap()).find(|src| {
             // kdebug!("Src: {:?}, {:?}; Lookup: {:?}, {:?}", src.key(), src._abs_path(), key, abs_path);
-            src._abs_path().unwrap() == abs_path
+            src.abs_path().unwrap() == abs_path
         });
 
-        if result.is_some() {
-            // kdebug!("Hit cache!!!");
-            return Some((result.unwrap(), abs_path));
+        if let Some(result) = result {
+            return Some((result, abs_path));
         }
 
         if let Some(parent) = rest_path.parent() {
             if parent == stop_path {
                 return None;
             }
-            return self._quick_lookup(cache, abs_path, parent, stop_path);
+            return Self::quick_lookup(cache, abs_path, parent, stop_path);
         }
         return None;
     }

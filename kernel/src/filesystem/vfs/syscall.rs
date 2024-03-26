@@ -2,8 +2,8 @@ use core::ffi::c_void;
 use core::mem::size_of;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
+use path_base::{clean_path::Clean, Path, PathBuf};
 use system_error::SystemError;
-use path_base::{Path, PathBuf, clean_path::Clean};
 
 use crate::producefs;
 use crate::{
@@ -669,13 +669,12 @@ impl Syscall {
         let path = PathBuf::from(check_and_clone_cstr(path, Some(MAX_PATHLEN))?);
         // path = path.clean();
         // kdebug!("chdir {:?}", path);
-        let inode =
-            match ROOT_INODE().lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
-                Err(_) => {
-                    return Err(SystemError::ENOENT);
-                }
-                Ok(i) => i,
-            };
+        let inode = match ROOT_INODE().lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
+            Err(_) => {
+                return Err(SystemError::ENOENT);
+            }
+            Ok(i) => i,
+        };
         let metadata = inode.metadata()?;
         if metadata.file_type == FileType::Dir {
             proc.basic_mut().set_cwd(path.into_os_string());
@@ -806,8 +805,8 @@ impl Syscall {
         let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newfd, new)?;
         let new_name = new_remain_path.file_name().unwrap();
         let new_parent_path = new_remain_path.parent();
-        let new_parent =
-            new_begin_inode.lookup_follow_symlink(new_parent_path.unwrap_or(Path::new("/")), symlink_times)?;
+        let new_parent = new_begin_inode
+            .lookup_follow_symlink(new_parent_path.unwrap_or(Path::new("/")), symlink_times)?;
 
         // 被调用者利用downcast_ref判断两inode是否为同一文件系统
         return new_parent.link(new_name, &old_inode).map(|_| 0);
@@ -883,15 +882,11 @@ impl Syscall {
         let path = PathBuf::from(path_str);
 
         if flags.contains(AtFlags::AT_REMOVEDIR) {
-            if let Err(e) = do_remove_dir(dirfd, &path) {
-                return Err(e);
-            }
-            return Ok(0);
+            return Ok(do_remove_dir(dirfd, &path)? as usize);
         }
 
-        if let Err(e) = do_unlink_at(dirfd, &path) {
-            return Err(e);
-        }
+        do_unlink_at(dirfd, &path)?;
+
         return Ok(0);
     }
 
@@ -939,18 +934,22 @@ impl Syscall {
 
         //获取pcb，文件节点
         let pcb = ProcessManager::current_pcb();
-        let (_old_inode_begin, old_remain_path) = user_path_at(&pcb, oldfd, &filename_from)?;
-        let (_new_inode_begin, new_remain_path) = user_path_at(&pcb, newfd, &filename_to)?;
+        let (_old_inode_begin, old_remain_path) = user_path_at(&pcb, oldfd, filename_from)?;
+        let (_new_inode_begin, new_remain_path) = user_path_at(&pcb, newfd, filename_to)?;
         //获取父目录
         // let (old_filename, old_parent_path) = rsplit_path(&old_remain_path);
         let old_file_name = old_remain_path.file_name().unwrap();
         let old_parent_path = old_remain_path.parent();
-        let old_parent_inode = ROOT_INODE()
-            .lookup_follow_symlink(old_parent_path.unwrap_or(Path::new("/")), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        let old_parent_inode = ROOT_INODE().lookup_follow_symlink(
+            old_parent_path.unwrap_or(Path::new("/")),
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        )?;
         let new_file_name = new_remain_path.file_name().unwrap();
         let new_parent_path = new_remain_path.parent();
-        let new_parent_inode = ROOT_INODE()
-            .lookup_follow_symlink(new_parent_path.unwrap_or(Path::new("/")), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        let new_parent_inode = ROOT_INODE().lookup_follow_symlink(
+            new_parent_path.unwrap_or(Path::new("/")),
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        )?;
         old_parent_inode.move_to(old_file_name, &new_parent_inode, new_file_name)?;
         return Ok(0);
     }
@@ -1390,8 +1389,10 @@ impl Syscall {
         let parent_path = path.parent();
 
         // 查找父目录
-        let parent_inode: Arc<dyn IndexNode> = ROOT_INODE()
-            .lookup_follow_symlink(parent_path.unwrap_or(Path::new("/")), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        let parent_inode: Arc<dyn IndexNode> = ROOT_INODE().lookup_follow_symlink(
+            parent_path.unwrap_or(Path::new("/")),
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        )?;
         // 创建nod
         parent_inode.mknod(file_name, mode, dev_t)?;
 

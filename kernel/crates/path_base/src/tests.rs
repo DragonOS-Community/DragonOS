@@ -4,10 +4,10 @@ use super::*;
 
 // use alloc::collections::hash_map::SipHasher;
 // use alloc::collections::BTreeSet;
-use core::hash::{Hash, Hasher, SipHasher};
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::sync::Arc;
+use core::hash::{Hash, Hasher, SipHasher};
 use core::hint::black_box;
 
 #[allow(unknown_lints, unused_macro_rules)]
@@ -1247,20 +1247,32 @@ pub fn test_push() {
         tp!("C:a\\b\\c", "C:d", "C:d");
         tp!("C:", r"a\b\c", r"C:a\b\c");
         tp!("C:", r"..\a", r"C:..\a");
-        tp!("\\\\server\\share\\foo", "bar", "\\\\server\\share\\foo\\bar");
+        tp!(
+            "\\\\server\\share\\foo",
+            "bar",
+            "\\\\server\\share\\foo\\bar"
+        );
         tp!("\\\\server\\share\\foo", "C:baz", "C:baz");
         tp!("\\\\?\\C:\\a\\b", "C:c\\d", "C:c\\d");
         tp!("\\\\?\\C:a\\b", "C:c\\d", "C:c\\d");
         tp!("\\\\?\\C:\\a\\b", "C:\\c\\d", "C:\\c\\d");
         tp!("\\\\?\\foo\\bar", "baz", "\\\\?\\foo\\bar\\baz");
-        tp!("\\\\?\\UNC\\server\\share\\foo", "bar", "\\\\?\\UNC\\server\\share\\foo\\bar");
+        tp!(
+            "\\\\?\\UNC\\server\\share\\foo",
+            "bar",
+            "\\\\?\\UNC\\server\\share\\foo\\bar"
+        );
         tp!("\\\\?\\UNC\\server\\share", "C:\\a", "C:\\a");
         tp!("\\\\?\\UNC\\server\\share", "C:a", "C:a");
 
         // Note: modified from old path API
         tp!("\\\\?\\UNC\\server", "foo", "\\\\?\\UNC\\server\\foo");
 
-        tp!("C:\\a", "\\\\?\\UNC\\server\\share", "\\\\?\\UNC\\server\\share");
+        tp!(
+            "C:\\a",
+            "\\\\?\\UNC\\server\\share",
+            "\\\\?\\UNC\\server\\share"
+        );
         tp!("\\\\.\\foo\\bar", "baz", "\\\\.\\foo\\bar\\baz");
         tp!("\\\\.\\foo\\bar", "C:a", "C:a");
         // again, not sure about the following, but I'm assuming \\.\ should be verbatim
@@ -1323,9 +1335,21 @@ pub fn test_pop() {
         tp!("\\\\?\\C:\\a\\b", "\\\\?\\C:\\a", true);
         tp!("\\\\?\\C:\\a", "\\\\?\\C:\\", true);
         tp!("\\\\?\\C:\\", "\\\\?\\C:\\", false);
-        tp!("\\\\?\\UNC\\server\\share\\a\\b", "\\\\?\\UNC\\server\\share\\a", true);
-        tp!("\\\\?\\UNC\\server\\share\\a", "\\\\?\\UNC\\server\\share\\", true);
-        tp!("\\\\?\\UNC\\server\\share", "\\\\?\\UNC\\server\\share", false);
+        tp!(
+            "\\\\?\\UNC\\server\\share\\a\\b",
+            "\\\\?\\UNC\\server\\share\\a",
+            true
+        );
+        tp!(
+            "\\\\?\\UNC\\server\\share\\a",
+            "\\\\?\\UNC\\server\\share\\",
+            true
+        );
+        tp!(
+            "\\\\?\\UNC\\server\\share",
+            "\\\\?\\UNC\\server\\share",
+            false
+        );
         tp!("\\\\.\\a\\b\\c", "\\\\.\\a\\b", true);
         tp!("\\\\.\\a\\b", "\\\\.\\a\\", true);
         tp!("\\\\.\\a", "\\\\.\\a", false);
@@ -1497,7 +1521,7 @@ pub fn test_compare() {
     //                  $ends_with, ends_with);
 
     //          let relative_from = path1.strip_prefix(path2)
-                                      
+
     //                                   .ok();
     //          let exp: Option<&str> = $relative_from;
     //          assert!(relative_from == exp,
@@ -1924,5 +1948,8 @@ fn fangzhen() {
     let input_path = PathBuf::from("/bin/test/some/../something/entry/./hey/the.service");
     let root = PathBuf::from("/bin/test/something");
     let clean = input_path.clean();
-    assert_eq!("entry/hey/the.service", clean.strip_prefix(root).unwrap().as_os_str());
+    assert_eq!(
+        "entry/hey/the.service",
+        clean.strip_prefix(root).unwrap().as_os_str()
+    );
 }

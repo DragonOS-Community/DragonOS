@@ -142,8 +142,7 @@ impl Timekeeper {
         let clock_now = clock.read();
         let clock_data = clock.clocksource_data();
         let clock_delta = clock_now.div(clock_data.watchdog_last).data() & clock_data.mask.bits();
-        // clock_shift的值错误导致时间流逝速度异常，+5为临时修改以确保系统正常运作，目前追踪到的设置在DragonOS-dev/blob/fix_time/kernel/src/time/jiffies.rs#L18，但是修改无效
-        return clocksource_cyc2ns(CycleNum(clock_delta), clock_data.mult, clock_data.shift + 5);
+        return clocksource_cyc2ns(CycleNum(clock_delta), clock_data.mult, clock_data.shift);
     }
 }
 pub fn timekeeper() -> &'static Timekeeper {

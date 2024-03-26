@@ -47,7 +47,7 @@ pub enum ScmFramworkType {
 #[derive(Debug, Clone)]
 pub enum ScmBuffer {
     DeviceBuffer(VirtAddr),
-    DoubleBuffer(Arc<SpinLock<Box<[u32]>>>),
+    DoubleBuffer(Arc<SpinLock<Box<[u8]>>>),
 }
 
 #[derive(Debug, Clone)]
@@ -81,15 +81,15 @@ impl ScmBufferInfo {
         } else {
             let device_buffer_guard = video_refresh_manager().device_buffer();
 
-            let buf_space: Arc<SpinLock<Box<[u32]>>> = Arc::new(SpinLock::new(
-                vec![0u32; (device_buffer_guard.size / 4) as usize].into_boxed_slice(),
+            let buf_space: Arc<SpinLock<Box<[u8]>>> = Arc::new(SpinLock::new(
+                vec![0u8; (device_buffer_guard.size / 4) as usize].into_boxed_slice(),
             ));
 
             assert!(buf_type.contains(ScmBufferFlag::SCM_BF_DB));
 
             assert_eq!(
                 device_buffer_guard.size as usize,
-                buf_space.lock().len() * core::mem::size_of::<u32>()
+                buf_space.lock().len() * core::mem::size_of::<u8>()
             );
 
             // 创建双缓冲区
@@ -155,11 +155,11 @@ impl ScmBufferInfo {
             ScmBuffer::DeviceBuffer(vaddr) => {
                 let len = self.buf_size() / core::mem::size_of::<u32>();
                 let self_buf_guard =
-                    unsafe { core::slice::from_raw_parts_mut(vaddr.data() as *mut u32, len) };
+                    unsafe { core::slice::from_raw_parts_mut(vaddr.data() as *mut u8, len) };
                 match &src.buf {
                     ScmBuffer::DeviceBuffer(vaddr) => {
                         let src_buf_guard =
-                            unsafe { core::slice::from_raw_parts(vaddr.data() as *const u32, len) };
+                            unsafe { core::slice::from_raw_parts(vaddr.data() as *const u8, len) };
                         self_buf_guard.copy_from_slice(src_buf_guard);
                     }
                     ScmBuffer::DoubleBuffer(double_buffer) => {
@@ -173,9 +173,9 @@ impl ScmBufferInfo {
                 let mut double_buffer_guard = double_buffer.lock();
                 match &src.buf {
                     ScmBuffer::DeviceBuffer(vaddr) => {
-                        let len = src.buf_size() / core::mem::size_of::<u32>();
+                        let len = src.buf_size() / core::mem::size_of::<u8>();
                         double_buffer_guard.as_mut().copy_from_slice(unsafe {
-                            core::slice::from_raw_parts(vaddr.data() as *const u32, len)
+                            core::slice::from_raw_parts(vaddr.data() as *const u8, len)
                         });
                     }
                     ScmBuffer::DoubleBuffer(double_buffer) => {

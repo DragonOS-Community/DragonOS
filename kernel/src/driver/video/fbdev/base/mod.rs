@@ -8,7 +8,10 @@ use crate::{
     mm::{ucontext::LockedVMA, PhysAddr, VirtAddr},
 };
 
-use self::fbmem::{FbDevice, FrameBufferManager};
+use self::{
+    fbmem::{FbDevice, FrameBufferManager},
+    render_helper::{BitIter, EndianPattern},
+};
 
 const COLOR_TABLE_8: &[u32] = &[
     0x00000000, 0xff000000, 0x00ff0000, 0xffff0000, 0x0000ff00, 0xff00ff00, 0x00ffff00, 0xffffff00,
@@ -23,7 +26,7 @@ pub mod fbcon;
 pub mod fbmem;
 pub mod fbsysfs;
 pub mod modedb;
-
+pub mod render_helper;
 // 帧缓冲区id
 int_like!(FbId, u32);
 
@@ -106,7 +109,14 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
             {
                 unsafe { self.fast_imageblit(image, dst1, fg, bg) }
             } else {
-                self.slow_imageblit(image, dst1, fg, bg, start_index, pitch_index)
+                self.slow_imageblit(
+                    image,
+                    dst1,
+                    fg,
+                    bg,
+                    bitstart / 4,
+                    self.current_fb_fix().line_length,
+                )
             }
         } else {
             todo!("color image blit todo");
@@ -246,25 +256,31 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         _start_index: u32,
         _pitch_index: u32,
     ) {
-        todo!();
-        // let bpp = self.current_fb_var().bits_per_pixel;
-        // let pitch = self.current_fb_fix().line_length;
-        // let null_bits = 32 - bpp;
-        // let spitch = (image.width + 7) / 8;
+        let mut dst = _dst1.as_ptr::<u32>();
+        let mut count = 0;
+        let iter = BitIter::new(
+            _fg,
+            _bg,
+            EndianPattern::Big,
+            EndianPattern::Little,
+            self.current_fb_var().bits_per_pixel / 8,
+            _image.data.iter(),
+            _image.width,
+        );
+        for (content, full) in iter {
+            unsafe {
+                *dst = content;
 
-        // // TODO：这里是需要计算的，但是目前用不到，先直接写
-        // let bswapmask = 0;
+                dst = dst.add(1);
+            }
 
-        // let dst2 = dst1;
-
-        // // 一行一行画
-        // for i in image.height..0 {
-        //     let dst = dst1;
-
-        //     if start_index > 0 {
-        //         let start_mask = !(!(0 as u32) << start_index);
-        //     }
-        // }
+            if full {
+                count += 1;
+                dst = unsafe {
+                    _dst1.as_ptr::<u8>().add((_pitch_index * count) as usize) as *mut u32
+                };
+            }
+        }
     }
 }
 

@@ -300,7 +300,11 @@ impl FileSystem for ProcFS {
 
 impl ProcFS {
     pub fn new() -> Arc<Self> {
-        let super_block = SuperBlock::new(Magic::PROC_MAGIC, PROCFS_BLOCK_SIZE, PROCFS_MAX_NAMELEN as u64);
+        let super_block = SuperBlock::new(
+            Magic::PROC_MAGIC,
+            PROCFS_BLOCK_SIZE,
+            PROCFS_MAX_NAMELEN as u64,
+        );
         // 初始化root inode
         let root: Arc<LockedProcFSInode> =
             Arc::new(LockedProcFSInode(SpinLock::new(ProcFSInode {

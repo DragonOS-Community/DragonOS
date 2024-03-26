@@ -91,7 +91,11 @@ impl FileSystem for RamFS {
 
 impl RamFS {
     pub fn new() -> Arc<Self> {
-        let super_block = SuperBlock::new(Magic::RAMFS_MAGIC, RAMFS_BLOCK_SIZE, RAMFS_MAX_NAMELEN as u64);
+        let super_block = SuperBlock::new(
+            Magic::RAMFS_MAGIC,
+            RAMFS_BLOCK_SIZE,
+            RAMFS_MAX_NAMELEN as u64,
+        );
         // 初始化root inode
         let root: Arc<LockedRamFSInode> = Arc::new(LockedRamFSInode(SpinLock::new(RamFSInode {
             parent: Weak::default(),

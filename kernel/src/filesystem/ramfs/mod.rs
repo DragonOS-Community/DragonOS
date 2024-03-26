@@ -55,11 +55,11 @@ impl RamFS {
         let ret = Arc::new(RamFS {
             root,
             cache: Arc::new(DefaultCache::new(None)),
-            super_block: SuperBlock::new(
+            super_block: RwLock::new(SuperBlock::new(
                 Magic::RAMFS_MAGIC,
                 RAMFS_BLOCK_SIZE,
                 RAMFS_MAX_NAMELEN as u64,
-            ),
+            )),
         });
         {
             let mut entry = ret.root.0.lock();

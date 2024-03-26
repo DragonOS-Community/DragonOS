@@ -1240,7 +1240,7 @@ impl Syscall {
             ModeType::empty().bits(),
             true,
         )?;
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN)).unwrap();
+        let path = PathBuf::from(check_and_clone_cstr(path, Some(MAX_PATHLEN)).unwrap());
         let pcb = ProcessManager::current_pcb();
         let (_inode_begin, remain_path) = user_path_at(&pcb, fd as i32, &path)?;
         let inode = ROOT_INODE().lookup_follow_symlink(&remain_path, MAX_PATHLEN)?;

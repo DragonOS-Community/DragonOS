@@ -25,7 +25,7 @@ use alloc::{
 };
 use system_error::SystemError;
 
-const BLOCK_SIZE: u64 = 512;
+const DEVFS_BLOCK_SIZE: u64 = 512;
 const DEVFS_MAX_NAMELEN: usize = 255;
 /// @brief dev文件系统
 #[derive(Debug)]
@@ -62,7 +62,7 @@ impl FileSystem for DevFS {
 
 impl DevFS {
     pub fn new() -> Arc<Self> {
-        let super_block = SuperBlock::new(Magic::DEVFS_MAGIC, BLOCK_SIZE, DEVFS_MAX_NAMELEN as u64);
+        let super_block = SuperBlock::new(Magic::DEVFS_MAGIC, DEVFS_BLOCK_SIZE, DEVFS_MAX_NAMELEN as u64);
         // 初始化root inode
         let root: Arc<LockedDevFSInode> = Arc::new(LockedDevFSInode(SpinLock::new(
             // /dev 的权限设置为 读+执行，root 可以读写

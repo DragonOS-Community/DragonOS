@@ -55,7 +55,7 @@ impl FileSystem for KernFS {
     fn super_block(&self) -> SuperBlock {
         SuperBlock::new(
             Magic::KER_MAGIC,
-            KernFS::BLOCK_SIZE,
+            KernFS::KERNFS_BLOCK_SIZE,
             KernFS::MAX_NAMELEN as u64,
         )
     }
@@ -63,7 +63,7 @@ impl FileSystem for KernFS {
 
 impl KernFS {
     pub const MAX_NAMELEN: usize = 4096;
-    pub const BLOCK_SIZE: u64 = 512;
+    pub const KERNFS_BLOCK_SIZE: u64 = 512;
     #[allow(dead_code)]
     pub fn new() -> Arc<Self> {
         let root_inode = Self::create_root_inode();

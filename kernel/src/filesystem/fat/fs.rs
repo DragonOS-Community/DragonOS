@@ -11,12 +11,12 @@ use alloc::{
 };
 
 use crate::driver::base::device::device_number::DeviceNumber;
-use crate::filesystem::vfs::cache::DefaultCache;
-use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
+        cache::DefaultCache,
+        Magic, SpecialNodeData, SuperBlock,
         core::generate_inode_id,
         file::{FileMode, FilePrivateData},
         syscall::ModeType,

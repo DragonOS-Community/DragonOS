@@ -18,6 +18,7 @@ use super::{
     Magic, SuperBlock,
 };
 
+// 维护一个挂载点的记录，以支持特定于文件系统的索引
 static mut __MOUNTS_LIST: Option<Arc<SpinLock<BTreeMap<MountPath, Arc<dyn FileSystem>>>>> = None;
 
 #[derive(PartialEq, Eq, Debug)]

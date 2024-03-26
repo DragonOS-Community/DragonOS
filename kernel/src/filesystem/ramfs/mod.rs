@@ -126,16 +126,17 @@ pub struct LockedInode(SpinLock<Inode>);
 
 #[derive(Debug)]
 pub struct Entry {
+    /// 目录名
     name: String,
-
+    /// 文件节点
     inode: Arc<LockedInode>,
-
+    /// 父目录
     parent: Weak<LockedEntry>,
-
+    /// 自引用
     self_ref: Weak<LockedEntry>,
-
+    /// 子目录
     children: BTreeMap<Keyer, Arc<LockedEntry>>,
-
+    /// 目录所属文件系统
     fs: Weak<RamFS>,
 
     special_node: Option<SpecialNodeData>,
@@ -237,7 +238,7 @@ impl IndexNode for LockedEntry {
         // 拷贝数据
         let src = &inode.data[start..end];
         buf[0..src.len()].copy_from_slice(src);
-        Ok(src.len())
+        return Ok(src.len());
     }
 
     fn write_at(
@@ -270,7 +271,7 @@ impl IndexNode for LockedEntry {
         let target = &mut data[offset..offset + len];
         target.copy_from_slice(&buf[0..len]);
 
-        Ok(len)
+        return Ok(len);
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -291,7 +292,7 @@ impl IndexNode for LockedEntry {
         drop(inode);
         drop(entry);
 
-        Ok(metadata)
+        return Ok(metadata);
     }
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
@@ -304,7 +305,7 @@ impl IndexNode for LockedEntry {
         inode.metadata.uid = metadata.uid;
         inode.metadata.gid = metadata.gid;
 
-        Ok(())
+        return Ok(());
     }
 
     fn resize(&self, len: usize) -> Result<(), SystemError> {
@@ -314,7 +315,7 @@ impl IndexNode for LockedEntry {
             inode.data.resize(len, 0);
             return Ok(());
         }
-        Err(SystemError::EINVAL)
+        return Err(SystemError::EINVAL);
     }
 
     fn create_with_data(
@@ -359,7 +360,7 @@ impl IndexNode for LockedEntry {
         entry
             .children
             .insert(Keyer::from_entry(&result), result.clone());
-        Ok(result)
+        return Ok(result);
     }
 
     /// Not Stable, waiting for improvement
@@ -407,11 +408,10 @@ impl IndexNode for LockedEntry {
         // 增加硬链接计数
         other_inode.metadata.nlinks += 1;
 
-        Ok(())
+        return Ok(());
     }
 
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
-        kdebug!("Call ramfs unlink");
         let mut entry = self.0.lock();
         {
             let inode = entry.inode.0.lock();
@@ -442,9 +442,8 @@ impl IndexNode for LockedEntry {
         }
         // 在当前目录中删除这个子目录项
         entry.children.remove(&Keyer::from_str(name));
-        kdebug!("Rest Items: {:?}", entry.children.keys().collect::<Vec<_>>());
 
-        Ok(())
+        return Ok(());
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
@@ -476,7 +475,7 @@ impl IndexNode for LockedEntry {
         }
         // 在当前目录中删除这个子目录项
         entry.children.remove(&keyer);
-        Ok(())
+        return Ok(());
     }
 
     fn move_to(
@@ -495,7 +494,7 @@ impl IndexNode for LockedEntry {
             target.unlink(new_name)?;
             return Err(err);
         }
-        Ok(())
+        return Ok(());
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -573,7 +572,7 @@ impl IndexNode for LockedEntry {
                 .collect(),
         );
 
-        Ok(keys)
+        return Ok(keys);
     }
 
     fn mknod(
@@ -624,7 +623,7 @@ impl IndexNode for LockedEntry {
             Keyer::from_str(String::from(filename).to_uppercase().as_str()),
             nod.clone(),
         );
-        Ok(nod)
+        return Ok(nod);
     }
 
     fn special_node(&self) -> Option<SpecialNodeData> {

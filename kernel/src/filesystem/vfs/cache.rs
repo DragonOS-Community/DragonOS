@@ -1,3 +1,5 @@
+//! 文件系统目录项缓存
+//! Todo: 更改使用的哈希
 use alloc::{
     collections::{LinkedList, VecDeque},
     sync::{Arc, Weak},

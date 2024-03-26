@@ -15,7 +15,7 @@ serial_opt.txt
 docs/_build
 draft
 cppcheck.xml
-target/
+/target/
 Cargo.lock
 .cache
 compile_commands.json

@@ -2,9 +2,8 @@ use core::ffi::c_void;
 use core::mem::size_of;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
-use path_base::clean_path::Clean;
 use system_error::SystemError;
-use path_base::{Path, PathBuf};
+use path_base::{Path, PathBuf, clean_path::Clean};
 
 use crate::producefs;
 use crate::{

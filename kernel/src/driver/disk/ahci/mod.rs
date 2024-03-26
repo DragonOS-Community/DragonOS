@@ -89,7 +89,7 @@ pub fn ahci_init() -> Result<(), SystemError> {
                 let tp = hba_mem_port.check_type();
                 match tp {
                     HbaPortType::None => {
-                        // kdebug!("<ahci_rust_init> Find a None type Disk.");
+                        kdebug!("<ahci_rust_init> Find a None type Disk.");
                     }
                     HbaPortType::Unknown(err) => {
                         kdebug!("<ahci_rust_init> Find a Unknown({:?}) type Disk.", err);

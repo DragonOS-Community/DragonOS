@@ -285,6 +285,7 @@ impl IndexNode for MountFSInode {
     /// @brief 在挂载文件系统中删除文件/文件夹
     #[inline]
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
+        kdebug!("Call Mountfs unlink: Item {}", name);
         let inode_id = self.inner_inode.find(name)?.metadata()?.inode_id;
 
         // 先检查这个inode是否为一个挂载点，如果当前inode是一个挂载点，那么就不能删除这个inode

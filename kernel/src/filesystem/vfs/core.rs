@@ -239,16 +239,14 @@ pub fn do_mkdir(path: &Path, _mode: FileMode) -> Result<u64, SystemError> {
 
 /// @brief 删除文件夹
 pub fn do_remove_dir(dirfd: i32, path: &Path) -> Result<u64, SystemError> {
-    // let path = path.trim();
-
     let pcb = ProcessManager::current_pcb();
     let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
     let file_name = remain_path.file_name().unwrap();
     let parent_path = remain_path.parent();
 
-    // Todo: 待添加回来
-    // 最后一项文件项为.时返回EINVAL
-    // if filename == "." {
+    // 不再需要下列判断，挪到上级处理
+    // // 最后一项文件项为.时返回EINVAL
+    // if file_name == "." {
     //     return Err(SystemError::EINVAL);
     // }
 
@@ -274,9 +272,9 @@ pub fn do_remove_dir(dirfd: i32, path: &Path) -> Result<u64, SystemError> {
 
 /// @brief 删除文件
 pub fn do_unlink_at(dirfd: i32, path: &Path) -> Result<u64, SystemError> {
-
     let pcb = ProcessManager::current_pcb();
-    let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
+    let tmp = user_path_at(&pcb, dirfd, path);
+    let (inode_begin, remain_path) = tmp?;
     let inode: Result<Arc<dyn IndexNode>, SystemError> =
         inode_begin.lookup_follow_symlink(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
 

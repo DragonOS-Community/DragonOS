@@ -43,37 +43,32 @@ pub fn user_path_at(
     dirfd: i32,
     path: &Path,
 ) -> Result<(Arc<dyn IndexNode>, PathBuf), SystemError> {
-    let mut inode = ROOT_INODE();
-    let ret_path;
-    // 如果path不是绝对路径，则需要拼接
-    if path.is_relative() {
-        // 如果dirfd不是AT_FDCWD，则需要检查dirfd是否是目录
-        if dirfd != AtFlags::AT_FDCWD.bits() {
-            let binding = pcb.fd_table();
-            let fd_table_guard = binding.read();
-            let file = fd_table_guard
-                .get_file_by_fd(dirfd)
-                .ok_or(SystemError::EBADF)?;
-
-            // drop guard 以避免无法调度的问题
-            drop(fd_table_guard);
-
-            let file_guard = file.lock();
-            // 如果dirfd不是目录，则返回错误码ENOTDIR
-            if file_guard.file_type() != FileType::Dir {
-                return Err(SystemError::ENOTDIR);
-            }
-
-            inode = file_guard.inode();
-            ret_path = PathBuf::from(path);
-        } else {
-            ret_path = PathBuf::from(pcb.basic().cwd()).join(path);
-        }
-    } else {
-        ret_path = PathBuf::from(path);
+    if path.is_absolute() {
+        return Ok((ROOT_INODE(), PathBuf::from(path)));
     }
 
-    return Ok((inode, ret_path));
+    // 如果path不是绝对路径，则需要拼接
+    // 如果dirfd不是AT_FDCWD，则需要检查dirfd是否是目录
+    return if dirfd != AtFlags::AT_FDCWD.bits() {
+        let binding = pcb.fd_table();
+        let fd_table_guard = binding.read();
+        let file = fd_table_guard
+            .get_file_by_fd(dirfd)
+            .ok_or(SystemError::EBADF)?; 
+
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
+
+        let file_guard = file.lock();
+        // 如果dirfd不是目录，则返回错误码ENOTDIR
+        if file_guard.file_type() != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        Ok((file_guard.inode(), PathBuf::from(path)))
+    } else {
+        Ok((ROOT_INODE(), PathBuf::from(pcb.basic().cwd()).join(path)))
+    };
 }
 
 #[allow(dead_code)]

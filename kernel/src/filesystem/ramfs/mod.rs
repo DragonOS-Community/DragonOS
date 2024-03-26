@@ -350,8 +350,6 @@ impl IndexNode for LockedEntry {
         entry
             .children
             .insert(Keyer::from_entry(&result), result.clone());
-    
-        kdebug!("I'm {:?}, creating {:?}", entry.name, name);
         Ok(result)
     }
 
@@ -404,6 +402,7 @@ impl IndexNode for LockedEntry {
     }
 
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
+        kdebug!("Call ramfs unlink");
         let mut entry = self.0.lock();
         {
             let inode = entry.inode.0.lock();
@@ -434,11 +433,13 @@ impl IndexNode for LockedEntry {
         }
         // 在当前目录中删除这个子目录项
         entry.children.remove(&Keyer::from_str(name));
+        kdebug!("Rest Items: {:?}", entry.children.keys().collect::<Vec<_>>());
 
         Ok(())
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
+        kdebug!("Call ramfs rmdir");
         let mut entry = self.0.lock();
         {
             let inode = entry.inode.0.lock();
@@ -467,6 +468,7 @@ impl IndexNode for LockedEntry {
         }
         // 在当前目录中删除这个子目录项
         entry.children.remove(&keyer);
+        kdebug!("Rest elements: {:?}", entry.children.keys().collect::<Vec<_>>());
         Ok(())
     }
 

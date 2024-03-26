@@ -841,28 +841,25 @@ impl Syscall {
     pub fn unlinkat(dirfd: i32, path: *const u8, flags: u32) -> Result<usize, SystemError> {
         let flags = AtFlags::from_bits(flags as i32).ok_or(SystemError::EINVAL)?;
 
-        let path = PathBuf::from(check_and_clone_cstr(path, Some(MAX_PATHLEN))?);
+        let path_str = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+
+        if path_str == "." || path_str == ".." {
+            return Err(SystemError::EINVAL);
+        }
+
+        let path = PathBuf::from(path_str);
 
         if flags.contains(AtFlags::AT_REMOVEDIR) {
-            // kdebug!("rmdir");
-            match do_remove_dir(dirfd, &path) {
-                Err(err) => {
-                    return Err(err);
-                }
-                Ok(_) => {
-                    return Ok(0);
-                }
+            if let Err(e) = do_remove_dir(dirfd, &path) {
+                return Err(e);
             }
+            return Ok(0);
         }
 
-        match do_unlink_at(dirfd, &path) {
-            Err(err) => {
-                return Err(err);
-            }
-            Ok(_) => {
-                return Ok(0);
-            }
+        if let Err(e) = do_unlink_at(dirfd, &path) {
+            return Err(e);
         }
+        return Ok(0);
     }
 
     pub fn rmdir(path: *const u8) -> Result<usize, SystemError> {

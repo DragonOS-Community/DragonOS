@@ -3,7 +3,7 @@ use crate::arch::mm::kernel_page_flags;
 use crate::arch::MMArch;
 
 use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::PageFlags;
+use crate::mm::page::{PageFlags, PAGE_MANAGER};
 use crate::mm::{
     allocator::page_frame::{
         allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
@@ -68,7 +68,11 @@ unsafe impl Hal for HalImpl {
         flusher.flush();
 
         unsafe {
-            deallocate_page_frames(PhysPageFrame::new(PhysAddr::new(paddr)), page_count);
+            deallocate_page_frames(
+                PhysPageFrame::new(PhysAddr::new(paddr)),
+                page_count,
+                &mut PAGE_MANAGER.lock(),
+            );
         }
         return 0;
     }

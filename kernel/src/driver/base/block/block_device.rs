@@ -17,7 +17,10 @@ use alloc::{sync::Arc, vec::Vec};
 use core::any::Any;
 use system_error::SystemError;
 
-use super::disk_info::Partition;
+use super::{
+    cache::{cached_block_device::BlockCache, BlockCacheError, BLOCK_SIZE},
+    disk_info::Partition,
+};
 
 /// 该文件定义了 Device 和 BlockDevice 的接口
 /// Notice 设备错误码使用 Posix 规定的 int32_t 的错误码表示，而不是自己定义错误enum
@@ -195,7 +198,7 @@ pub trait BlockDevice: Device {
     /// @return: 如果操作成功，返回 Ok(操作的长度) 其中单位是字节；
     ///          否则返回Err(错误码)，其中错误码为负数；
     ///          如果操作异常，但是并没有检查出什么错误，将返回Err(已操作的长度)
-    fn read_at(
+    fn read_at_sync(
         &self,
         lba_id_start: BlockId,
         count: usize,
@@ -209,7 +212,7 @@ pub trait BlockDevice: Device {
     /// @return: 如果操作成功，返回 Ok(操作的长度) 其中单位是字节；
     ///          否则返回Err(错误码)，其中错误码为负数；
     ///          如果操作异常，但是并没有检查出什么错误，将返回Err(已操作的长度)
-    fn write_at(
+    fn write_at_sync(
         &self,
         lba_id_start: BlockId,
         count: usize,
@@ -240,8 +243,71 @@ pub trait BlockDevice: Device {
     /// @brief 返回当前磁盘上的所有分区的Arc指针数组
     fn partitions(&self) -> Vec<Arc<Partition>>;
 
+    /// # 函数的功能
+    /// 经由Cache对块设备的读操作
+    fn read_at(
+        &self,
+        lba_id_start: BlockId,
+        count: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        self.cache_read(lba_id_start, count, buf)
+    }
+
+    /// # 函数的功能
+    ///  经由Cache对块设备的写操作
+    fn write_at(
+        &self,
+        lba_id_start: BlockId,
+        count: usize,
+        buf: &[u8],
+    ) -> Result<usize, SystemError> {
+        self.cache_write(lba_id_start, count, buf)
+    }
+
+    /// # 函数的功能
+    /// 其功能对外而言和read_at函数完全一致，但是加入blockcache的功能
+    fn cache_read(
+        &self,
+        lba_id_start: BlockId,
+        count: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        let cache_response = BlockCache::read(lba_id_start, count, buf);
+        match cache_response {
+            Ok(_) => return Ok(count * BLOCK_SIZE),
+            Err(x) => match x {
+                BlockCacheError::StaticParameterError => {
+                    BlockCache::init();
+                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
+                    return Ok(ans);
+                }
+                BlockCacheError::BlockFaultError(fail_vec) => {
+                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
+                    let _ = BlockCache::insert(fail_vec, buf);
+                    return Ok(ans);
+                }
+                _ => {
+                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
+                    return Ok(ans);
+                }
+            },
+        }
+    }
+
+    /// # 函数功能
+    /// 其功能对外而言和write_at函数完全一致，但是加入blockcache的功能
+    fn cache_write(
+        &self,
+        lba_id_start: BlockId,
+        count: usize,
+        buf: &[u8],
+    ) -> Result<usize, SystemError> {
+        let _cache_response = BlockCache::test_write(lba_id_start, count, buf);
+        self.write_at_sync(lba_id_start, count, buf)
+    }
+
     fn write_at_bytes(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        // assert!(len <= buf.len());
         if len > buf.len() {
             return Err(SystemError::E2BIG);
         }
@@ -272,7 +338,6 @@ pub trait BlockDevice: Device {
             }
         }
         return Ok(len);
-        //self.0.lock().write_at(lba_id_start, count, buf)
     }
 
     fn read_at_bytes(
@@ -314,11 +379,6 @@ pub trait BlockDevice: Device {
             }
         }
         return Ok(len);
-
-        // kdebug!(
-        //     "ahci read at {lba_id_start}, count={count}, lock={:?}",
-        //     self.0
-        // );
     }
 }
 

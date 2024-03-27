@@ -22,6 +22,7 @@
 #![feature(trait_upcasting)]
 #![feature(slice_ptr_get)]
 #![feature(vec_into_raw_parts)]
+#![feature(linked_list_cursors)]
 #![cfg_attr(target_os = "none", no_std)]
 // clippy的配置
 #![deny(clippy::all)]
@@ -92,7 +93,7 @@ use crate::process::ProcessManager;
 
 #[cfg(all(feature = "backtrace", target_arch = "x86_64"))]
 extern crate mini_backtrace;
-
+#[allow(dead_code)]
 extern "C" {
     fn lookup_kallsyms(addr: u64, level: i32) -> i32;
 }

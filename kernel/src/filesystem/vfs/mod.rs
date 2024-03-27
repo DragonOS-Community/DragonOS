@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod core;
 pub mod fcntl;
 pub mod file;
@@ -8,18 +9,20 @@ mod utils;
 
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};
+use path_base::{clean_path::Clean, Path, PathBuf};
 use system_error::SystemError;
 
 use crate::{
     driver::base::{
         block::block_device::BlockDevice, char::CharDevice, device::device_number::DeviceNumber,
     },
+    filesystem::vfs::mount::MOUNTS_LIST,
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
     time::TimeSpec,
 };
 
-use self::{core::generate_inode_id, file::FileMode, syscall::ModeType};
+use self::{cache::DefaultCache, core::generate_inode_id, file::FileMode, syscall::ModeType};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
@@ -276,7 +279,8 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
-    /// @brief 将指定名称的子目录项的文件内容，移动到target这个目录下。如果_old_name所指向的inode与_target的相同，那么则直接执行重命名的操作。
+    /// @brief 将指定名称的子目录项的文件内容，移动到target这个目录下。
+    /// 如果_old_name所指向的inode与_target的相同，那么则直接执行重命名的操作。
     ///
     /// @param old_name 旧的名字
     ///
@@ -409,6 +413,44 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     fn special_node(&self) -> Option<SpecialNodeData> {
         None
     }
+
+    /// 获取目录名
+    fn key(&self) -> Result<String, SystemError> {
+        self.parent()?.get_entry_name(self.metadata()?.inode_id)
+    }
+
+    /// 获取父目录
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    /// 当前抽象层挂载点下的绝对目录
+    fn abs_path(&self) -> Result<PathBuf, SystemError> {
+        let mut path_stack = Vec::new();
+        path_stack.push(self.key()?);
+
+        let init = self.parent()?;
+        if self.metadata()?.inode_id == init.metadata()?.inode_id {
+            return Ok(PathBuf::from("/"));
+        }
+
+        let mut inode = init;
+        path_stack.push(inode.key()?);
+
+        while inode.metadata()?.inode_id != ROOT_INODE().metadata()?.inode_id {
+            let tmp = inode.parent()?;
+            if inode.metadata()?.inode_id == tmp.metadata()?.inode_id {
+                break;
+            }
+            inode = tmp;
+            path_stack.push(inode.key()?);
+        }
+
+        path_stack.reverse();
+        let mut path = PathBuf::from("/");
+        path.extend(path_stack);
+        return Ok(path);
+    }
 }
 
 impl DowncastArc for dyn IndexNode {
@@ -430,8 +472,8 @@ impl dyn IndexNode {
     ///
     /// @return Ok(Arc<dyn IndexNode>) 要寻找的目录项的inode
     /// @return Err(SystemError) 错误码
-    pub fn lookup(&self, path: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return self.lookup_follow_symlink(path, 0);
+    pub fn lookup(&self, path: &Path) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.lookup_follow_symlink(path, 0)
     }
 
     /// @brief 查找文件（考虑符号链接）
@@ -442,6 +484,70 @@ impl dyn IndexNode {
     /// @return Ok(Arc<dyn IndexNode>) 要寻找的目录项的inode
     /// @return Err(SystemError) 错误码
     pub fn lookup_follow_symlink(
+        &self,
+        path: &Path,
+        max_follow_times: usize,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        // kdebug!("Looking for path {:?}", path);
+        // 拼接绝对路径
+        let abs_path = if path.is_absolute() {
+            path.clean()
+        } else {
+            self.abs_path()?.join(path.clean())
+        };
+
+        // 检查根目录缓存
+        if let Some((root_path, fs)) = MOUNTS_LIST()
+            .read()
+            .iter()
+            .filter_map(|(key, value)| {
+                let strkey = key.as_ref();
+                return if abs_path.starts_with(strkey) {
+                    Some((strkey, value))
+                } else {
+                    None
+                };
+            })
+            .next()
+        {
+            if let Some(fs) = fs.as_any_ref().downcast_ref::<MountFS>() {
+                let root_inode = fs.mountpoint_root_inode().find(".")?;
+
+                if let Ok(fscache) = fs.cache() {
+                    let path_under = path.strip_prefix(root_path).unwrap();
+                    if path_under.iter().next().is_none() {
+                        return Ok(root_inode);
+                    }
+
+                    // Cache record is found
+                    if let Some((inode, found_path)) =
+                        Self::quick_lookup(fscache, &abs_path, &abs_path, root_path)
+                    {
+                        let rest_path = abs_path.strip_prefix(found_path).unwrap();
+                        // no path left
+                        if rest_path.iter().next().is_none() {
+                            return Ok(inode);
+                        }
+                        return inode.lookup_walk(rest_path, max_follow_times);
+                    }
+
+                    // Cache record not found
+                    return root_inode.lookup_walk(path_under, max_follow_times);
+                }
+
+                // 在对应文件系统根开始lookup
+                return fs
+                    .root_inode()
+                    ._lookup_follow_symlink(path.as_os_str(), max_follow_times);
+            }
+        }
+
+        // Exception Normal lookup, for non-cache fs
+        // kdebug!("Depredecated.");
+        return self._lookup_follow_symlink(path.as_os_str(), max_follow_times);
+    }
+
+    fn _lookup_follow_symlink(
         &self,
         path: &str,
         max_follow_times: usize,
@@ -503,13 +609,99 @@ impl dyn IndexNode {
 
                 let new_path = link_path + "/" + &rest_path;
                 // 继续查找符号链接
-                return result.lookup_follow_symlink(&new_path, max_follow_times - 1);
-            } else {
-                result = inode;
+                return result._lookup_follow_symlink(&new_path, max_follow_times - 1);
             }
+            result = inode;
         }
 
-        return Ok(result);
+        Ok(result)
+    }
+
+    fn lookup_walk(
+        &self,
+        rest_path: &Path,
+        max_follow_times: usize,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        // kdebug!("walking though {:?}", rest_path);
+        if self.metadata()?.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+        let child = rest_path.iter().next().unwrap();
+        // kdebug!("Lookup {:?}", child);
+        match self.find(child) {
+            Ok(child_node) => {
+                if child_node.metadata()?.file_type == FileType::SymLink && max_follow_times > 0 {
+                    // symlink wrapping problem
+                    return ROOT_INODE().lookup_follow_symlink(
+                        &child_node.convert_symlink()?.join(rest_path),
+                        max_follow_times - 1,
+                    );
+                }
+
+                // 潜在优化可能：重复的文件系统缓存获取
+                if let Ok(cache) = self.fs().cache() {
+                    // kdebug!("Calling cache put with child {}", child);
+                    cache.put(child, child_node.clone());
+                }
+
+                if let Ok(rest) = rest_path.strip_prefix(child) {
+                    if rest.iter().next().is_some() {
+                        // kdebug!("Rest {:?}", rest);
+                        return child_node.lookup_walk(rest, max_follow_times);
+                    }
+                }
+                // kdebug!("return node {:?}", child_node);
+
+                return Ok(child_node);
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
+    }
+
+    fn convert_symlink(&self) -> Result<PathBuf, SystemError> {
+        let mut content = [0u8; 256];
+        let len = self.read_at(0, 256, &mut content, &mut FilePrivateData::Unused)?;
+
+        return Ok(PathBuf::from(
+            ::core::str::from_utf8(&content[..len]).map_err(|_| SystemError::ENOTDIR)?,
+        ));
+    }
+
+    /// @brief 缓存查询
+    ///
+    /// @param path 文件路径
+    /// @return Ok((Arc<dyn IndexNode>, &str))
+    /// 要寻找的目录项路径上最长已缓存的inode 与 该inode的绝对路径
+    /// @return Err(SystemError) 错误码
+    ///
+    /// 缓存可能未命中
+    fn quick_lookup<'a>(
+        cache: Arc<DefaultCache>,
+        abs_path: &'a Path,
+        rest_path: &'a Path,
+        stop_path: &'a Path,
+    ) -> Option<(Arc<dyn IndexNode>, &'a Path)> {
+        // kdebug!("Quick lookup: abs {:?}, rest {:?}", abs_path, rest_path);
+        let key = abs_path.file_name();
+
+        let result = cache.get(key.unwrap()).find(|src| {
+            // kdebug!("Src: {:?}, {:?}; Lookup: {:?}, {:?}", src.key(), src._abs_path(), key, abs_path);
+            src.abs_path().unwrap() == abs_path
+        });
+
+        if let Some(result) = result {
+            return Some((result, abs_path));
+        }
+
+        if let Some(parent) = rest_path.parent() {
+            if parent == stop_path {
+                return None;
+            }
+            return Self::quick_lookup(cache, abs_path, parent, stop_path);
+        }
+        return None;
     }
 }
 
@@ -640,7 +832,7 @@ bitflags! {
 
 /// @brief 所有文件系统都应该实现的trait
 pub trait FileSystem: Any + Sync + Send + Debug {
-    /// @brief 获取当前文件系统的root inode的指针
+    /// @brief 获取当前（self所指）文件系统的root inode的指针，默认为MountFS
     fn root_inode(&self) -> Arc<dyn IndexNode>;
 
     /// @brief 获取当前文件系统的信息
@@ -653,6 +845,11 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     fn name(&self) -> &str;
 
     fn super_block(&self) -> SuperBlock;
+
+    fn cache(&self) -> Result<Arc<DefaultCache>, SystemError> {
+        // 若文件系统没有实现此方法，则返回“不支持”
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
 }
 
 impl DowncastArc for dyn FileSystem {

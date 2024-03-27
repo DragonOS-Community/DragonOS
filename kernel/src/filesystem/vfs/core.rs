@@ -1,6 +1,7 @@
 use core::{hint::spin_loop, sync::atomic::Ordering};
 
 use alloc::{string::ToString, sync::Arc};
+use path_base::Path;
 use system_error::SystemError;
 
 use crate::{
@@ -11,16 +12,18 @@ use crate::{
         procfs::procfs_init,
         ramfs::RamFS,
         sysfs::sysfs_init,
-        vfs::{mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
+        vfs::{
+            mount::{MountFS, MountPath, CLEAR_MOUNTS_LIST, MOUNTS_LIST},
+            syscall::ModeType,
+            AtomicInodeId, FileSystem, FileType,
+        },
     },
     kdebug, kerror, kinfo,
     process::ProcessManager,
 };
 
 use super::{
-    file::FileMode,
-    utils::{rsplit_path, user_path_at},
-    IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    file::FileMode, utils::user_path_at, IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 /// @brief 原子地生成新的Inode号。
@@ -85,7 +88,7 @@ pub fn vfs_init() -> Result<(), SystemError> {
 ///
 /// @param mountpoint_name 在根目录下的挂载点的名称
 /// @param inode 原本的挂载点的inode
-fn do_migrate(
+pub fn do_migrate(
     new_root_inode: Arc<dyn IndexNode>,
     mountpoint_name: &str,
     fs: &MountFS,
@@ -125,20 +128,25 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     let new_fs = MountFS::new(new_fs, None);
     // 获取新的根文件系统的根节点的引用
     let new_root_inode = new_fs.root_inode();
+    CLEAR_MOUNTS_LIST();
 
-    // 把上述文件系统,迁移到新的文件系统下
-    do_migrate(new_root_inode.clone(), "proc", proc)?;
-    do_migrate(new_root_inode.clone(), "dev", dev)?;
-    do_migrate(new_root_inode.clone(), "sys", sys)?;
     unsafe {
-        // drop旧的Root inode
-        let old_root_inode = __ROOT_INODE.take().unwrap();
-        drop(old_root_inode);
-
         // 设置全局的新的ROOT Inode
+        let old_root_inode = __ROOT_INODE.take().unwrap();
         __ROOT_INODE = Some(new_root_inode);
+
+        // 把上述文件系统,迁移到新的文件系统下
+        do_migrate(ROOT_INODE(), "proc", proc)?;
+        do_migrate(ROOT_INODE(), "dev", dev)?;
+        do_migrate(ROOT_INODE(), "sys", sys)?;
+
+        // drop旧的Root inode
+        drop(old_root_inode);
     }
 
+    MOUNTS_LIST()
+        .write()
+        .insert(MountPath::from("/"), ROOT_INODE().fs());
     kinfo!("VFS: Migrate filesystems done!");
 
     return Ok(());
@@ -177,21 +185,20 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
 }
 
 /// @brief 创建文件/文件夹
-pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
-    let path = path.trim();
-
+pub fn do_mkdir(path: &Path, _mode: FileMode) -> Result<u64, SystemError> {
     let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
 
     if let Err(errno) = inode {
         // 文件不存在，且需要创建
         if errno == SystemError::ENOENT {
-            let (filename, parent_path) = rsplit_path(path);
+            let file_name = path.file_name().unwrap();
+            let parent_path = path.parent();
             // 查找父目录
             let parent_inode: Arc<dyn IndexNode> =
-                ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+                ROOT_INODE().lookup(parent_path.unwrap_or(Path::new("/")))?;
             // 创建文件夹
             let _create_inode: Arc<dyn IndexNode> = parent_inode.create(
-                filename,
+                file_name,
                 FileType::Dir,
                 ModeType::from_bits_truncate(0o755),
             )?;
@@ -205,44 +212,45 @@ pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
 }
 
 /// @brief 删除文件夹
-pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
-    let path = path.trim();
-
+pub fn do_remove_dir(dirfd: i32, path: &Path) -> Result<u64, SystemError> {
     let pcb = ProcessManager::current_pcb();
     let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
-    let (filename, parent_path) = rsplit_path(&remain_path);
+    let file_name = remain_path.file_name().unwrap();
+    let parent_path = remain_path.parent();
 
-    // 最后一项文件项为.时返回EINVAL
-    if filename == "." {
-        return Err(SystemError::EINVAL);
-    }
+    // 不再需要下列判断，挪到上级处理
+    // // 最后一项文件项为.时返回EINVAL
+    // if file_name == "." {
+    //     return Err(SystemError::EINVAL);
+    // }
 
     // 查找父目录
-    let parent_inode: Arc<dyn IndexNode> = inode_begin
-        .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let parent_inode: Arc<dyn IndexNode> = inode_begin.lookup_follow_symlink(
+        parent_path.unwrap_or(Path::new("/")),
+        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    )?;
 
     if parent_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
 
     // 在目标点为symlink时也返回ENOTDIR
-    let target_inode = parent_inode.find(filename)?;
+    let target_inode = parent_inode.find(file_name)?;
     if target_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
 
     // 删除文件夹
-    parent_inode.rmdir(filename)?;
+    parent_inode.rmdir(file_name)?;
 
     return Ok(0);
 }
 
 /// @brief 删除文件
-pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
-    let path = path.trim();
-
+pub fn do_unlink_at(dirfd: i32, path: &Path) -> Result<u64, SystemError> {
     let pcb = ProcessManager::current_pcb();
-    let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
+    let tmp = user_path_at(&pcb, dirfd, path);
+    let (inode_begin, remain_path) = tmp?;
     let inode: Result<Arc<dyn IndexNode>, SystemError> =
         inode_begin.lookup_follow_symlink(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
@@ -258,25 +266,29 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::EPERM);
     }
 
-    let (filename, parent_path) = rsplit_path(path);
+    // let (filename, parent_path) = rsplit_path(path);
+    let file_name = path.file_name();
+    let parent_path = path.parent();
     // 查找父目录
-    let parent_inode: Arc<dyn IndexNode> = inode_begin
-        .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let parent_inode: Arc<dyn IndexNode> = inode_begin.lookup_follow_symlink(
+        parent_path.unwrap_or(Path::new("/")),
+        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    )?;
 
     if parent_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
 
     // 删除文件
-    parent_inode.unlink(filename)?;
+    parent_inode.unlink(file_name.unwrap())?;
 
     return Ok(0);
 }
 
 // @brief mount filesystem
-pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<usize, SystemError> {
+pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &Path) -> Result<usize, SystemError> {
     ROOT_INODE()
         .lookup_follow_symlink(mount_point, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
-        .mount(fs)?;
+        .mount(fs.clone())?;
     Ok(0)
 }

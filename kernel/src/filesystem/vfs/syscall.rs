@@ -1,8 +1,8 @@
 use core::ffi::c_void;
 use core::mem::size_of;
 
-use alloc::string::ToString;
 use alloc::{string::String, sync::Arc, vec::Vec};
+use path_base::{clean_path::Clean, Path, PathBuf};
 use system_error::SystemError;
 
 use crate::producefs;
@@ -26,7 +26,7 @@ use super::{
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
     open::{do_faccessat, do_fchmodat, do_sys_open},
-    utils::{rsplit_path, user_path_at},
+    utils::user_path_at,
     Dirent, FileType, IndexNode, FSMAKER, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 // use crate::kdebug;
@@ -465,7 +465,7 @@ impl Syscall {
         mode: u32,
         follow_symlink: bool,
     ) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = PathBuf::from(check_and_clone_cstr(path, Some(MAX_PATHLEN))?);
         let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
         let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
         return do_sys_open(
@@ -484,7 +484,7 @@ impl Syscall {
         mode: u32,
         follow_symlink: bool,
     ) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = PathBuf::from(check_and_clone_cstr(path, Some(MAX_PATHLEN))?);
         let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
         let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
         return do_sys_open(dirfd, &path, open_flags, mode, follow_symlink);
@@ -664,45 +664,20 @@ impl Syscall {
             return Err(SystemError::EFAULT);
         }
 
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
         let proc = ProcessManager::current_pcb();
         // Copy path to kernel space to avoid some security issues
-        let mut new_path = String::from("");
-        if !path.is_empty() {
-            let cwd = match path.as_bytes()[0] {
-                b'/' => String::from("/"),
-                _ => proc.basic().cwd(),
-            };
-            let mut cwd_vec: Vec<_> = cwd.split('/').filter(|&x| !x.is_empty()).collect();
-            let path_split = path.split('/').filter(|&x| !x.is_empty());
-            for seg in path_split {
-                if seg == ".." {
-                    cwd_vec.pop();
-                } else if seg == "." {
-                    // 当前目录
-                } else {
-                    cwd_vec.push(seg);
-                }
+        let path = PathBuf::from(check_and_clone_cstr(path, Some(MAX_PATHLEN))?);
+        // path = path.clean();
+        // kdebug!("chdir {:?}", path);
+        let inode = match ROOT_INODE().lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
+            Err(_) => {
+                return Err(SystemError::ENOENT);
             }
-            //proc.basic().set_path(String::from(""));
-            for seg in cwd_vec {
-                new_path.push('/');
-                new_path.push_str(seg);
-            }
-            if new_path.is_empty() {
-                new_path = String::from("/");
-            }
-        }
-        let inode =
-            match ROOT_INODE().lookup_follow_symlink(&new_path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
-                Err(_) => {
-                    return Err(SystemError::ENOENT);
-                }
-                Ok(i) => i,
-            };
+            Ok(i) => i,
+        };
         let metadata = inode.metadata()?;
         if metadata.file_type == FileType::Dir {
-            proc.basic_mut().set_cwd(new_path);
+            proc.basic_mut().set_cwd(path.into_os_string());
             return Ok(0);
         } else {
             return Err(SystemError::ENOTDIR);
@@ -768,7 +743,7 @@ impl Syscall {
     ///
     /// @return uint64_t 负数错误码 / 0表示成功
     pub fn mkdir(path: *const u8, mode: usize) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = PathBuf::from(check_and_clone_cstr(path, Some(MAX_PATHLEN))?);
         return do_mkdir(&path, FileMode::from_bits_truncate(mode as u32)).map(|x| x as usize);
     }
 
@@ -785,9 +760,9 @@ impl Syscall {
     ///
     pub fn do_linkat(
         oldfd: i32,
-        old: &str,
+        old: &Path,
         newfd: i32,
-        new: &str,
+        new: &Path,
         flags: AtFlags,
     ) -> Result<usize, SystemError> {
         // flag包含其他未规定值时返回EINVAL
@@ -803,7 +778,7 @@ impl Syscall {
         let pcb = ProcessManager::current_pcb();
 
         // 得到源路径的inode
-        let old_inode: Arc<dyn IndexNode> = if old.is_empty() {
+        let old_inode: Arc<dyn IndexNode> = if old.iter().next().is_none() {
             if flags.contains(AtFlags::AT_EMPTY_PATH) {
                 // 在AT_EMPTY_PATH启用时，old可以为空，old_inode实际为oldfd所指文件，但该文件不能为目录。
                 let binding = pcb.fd_table();
@@ -828,9 +803,10 @@ impl Syscall {
 
         // 得到新创建节点的父节点
         let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newfd, new)?;
-        let (new_name, new_parent_path) = rsplit_path(&new_remain_path);
-        let new_parent =
-            new_begin_inode.lookup_follow_symlink(new_parent_path.unwrap_or("/"), symlink_times)?;
+        let new_name = new_remain_path.file_name().unwrap();
+        let new_parent_path = new_remain_path.parent();
+        let new_parent = new_begin_inode
+            .lookup_follow_symlink(new_parent_path.unwrap_or(Path::new("/")), symlink_times)?;
 
         // 被调用者利用downcast_ref判断两inode是否为同一文件系统
         return new_parent.link(new_name, &old_inode).map(|_| 0);
@@ -847,8 +823,8 @@ impl Syscall {
             }
             Ok(res)
         };
-        let old = get_path(old)?;
-        let new = get_path(new)?;
+        let old = PathBuf::from(get_path(old)?);
+        let new = PathBuf::from(get_path(new)?);
         return Self::do_linkat(
             AtFlags::AT_FDCWD.bits(),
             &old,
@@ -865,13 +841,20 @@ impl Syscall {
         new: *const u8,
         flags: i32,
     ) -> Result<usize, SystemError> {
-        let old = check_and_clone_cstr(old, Some(MAX_PATHLEN))?;
-        let new = check_and_clone_cstr(new, Some(MAX_PATHLEN))?;
-        if old.len() >= MAX_PATHLEN || new.len() >= MAX_PATHLEN {
-            return Err(SystemError::ENAMETOOLONG);
-        }
+        let get_path = |cstr: *const u8| -> Result<String, SystemError> {
+            let res = check_and_clone_cstr(cstr, Some(MAX_PATHLEN))?;
+            if res.len() >= MAX_PATHLEN {
+                return Err(SystemError::ENAMETOOLONG);
+            }
+            if res.is_empty() {
+                return Err(SystemError::ENOENT);
+            }
+            Ok(res)
+        };
+        let old = PathBuf::from(get_path(old)?);
+        let new = PathBuf::from(get_path(new)?);
         // old 根据flags & AtFlags::AT_EMPTY_PATH判空
-        if new.is_empty() {
+        if new.iter().next().is_none() {
             return Err(SystemError::ENOENT);
         }
         let flags = AtFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
@@ -890,37 +873,30 @@ impl Syscall {
     pub fn unlinkat(dirfd: i32, path: *const u8, flags: u32) -> Result<usize, SystemError> {
         let flags = AtFlags::from_bits(flags as i32).ok_or(SystemError::EINVAL)?;
 
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path_str = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+
+        if path_str == "." || path_str == ".." {
+            return Err(SystemError::EINVAL);
+        }
+
+        let path = PathBuf::from(path_str);
 
         if flags.contains(AtFlags::AT_REMOVEDIR) {
-            // kdebug!("rmdir");
-            match do_remove_dir(dirfd, &path) {
-                Err(err) => {
-                    return Err(err);
-                }
-                Ok(_) => {
-                    return Ok(0);
-                }
-            }
+            return Ok(do_remove_dir(dirfd, &path)? as usize);
         }
 
-        match do_unlink_at(dirfd, &path) {
-            Err(err) => {
-                return Err(err);
-            }
-            Ok(_) => {
-                return Ok(0);
-            }
-        }
+        do_unlink_at(dirfd, &path)?;
+
+        return Ok(0);
     }
 
     pub fn rmdir(path: *const u8) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = PathBuf::from(check_and_clone_cstr(path, Some(MAX_PATHLEN))?);
         return do_remove_dir(AtFlags::AT_FDCWD.bits(), &path).map(|v| v as usize);
     }
 
     pub fn unlink(path: *const u8) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = PathBuf::from(check_and_clone_cstr(path, Some(MAX_PATHLEN))?);
         return do_unlink_at(AtFlags::AT_FDCWD.bits(), &path).map(|v| v as usize);
     }
 
@@ -953,19 +929,28 @@ impl Syscall {
         if filename_from.len() > MAX_PATHLEN || filename_to.len() > MAX_PATHLEN {
             return Err(SystemError::ENAMETOOLONG);
         }
+        let filename_from = Path::new(&filename_from);
+        let filename_to = Path::new(&filename_to);
 
         //获取pcb，文件节点
         let pcb = ProcessManager::current_pcb();
-        let (_old_inode_begin, old_remain_path) = user_path_at(&pcb, oldfd, &filename_from)?;
-        let (_new_inode_begin, new_remain_path) = user_path_at(&pcb, newfd, &filename_to)?;
+        let (_old_inode_begin, old_remain_path) = user_path_at(&pcb, oldfd, filename_from)?;
+        let (_new_inode_begin, new_remain_path) = user_path_at(&pcb, newfd, filename_to)?;
         //获取父目录
-        let (old_filename, old_parent_path) = rsplit_path(&old_remain_path);
-        let old_parent_inode = ROOT_INODE()
-            .lookup_follow_symlink(old_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-        let (new_filename, new_parent_path) = rsplit_path(&new_remain_path);
-        let new_parent_inode = ROOT_INODE()
-            .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-        old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename)?;
+        // let (old_filename, old_parent_path) = rsplit_path(&old_remain_path);
+        let old_file_name = old_remain_path.file_name().unwrap();
+        let old_parent_path = old_remain_path.parent();
+        let old_parent_inode = ROOT_INODE().lookup_follow_symlink(
+            old_parent_path.unwrap_or(Path::new("/")),
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        )?;
+        let new_file_name = new_remain_path.file_name().unwrap();
+        let new_parent_path = new_remain_path.parent();
+        let new_parent_inode = ROOT_INODE().lookup_follow_symlink(
+            new_parent_path.unwrap_or(Path::new("/")),
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        )?;
+        old_parent_inode.move_to(old_file_name, &new_parent_inode, new_file_name)?;
         return Ok(0);
     }
 
@@ -1253,7 +1238,7 @@ impl Syscall {
             ModeType::empty().bits(),
             true,
         )?;
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN)).unwrap();
+        let path = PathBuf::from(check_and_clone_cstr(path, Some(MAX_PATHLEN)).unwrap());
         let pcb = ProcessManager::current_pcb();
         let (_inode_begin, remain_path) = user_path_at(&pcb, fd as i32, &path)?;
         let inode = ROOT_INODE().lookup_follow_symlink(&remain_path, MAX_PATHLEN)?;
@@ -1388,23 +1373,28 @@ impl Syscall {
         mode: ModeType,
         dev_t: DeviceNumber,
     ) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
-        let path = path.as_str().trim();
+        let path = PathBuf::from(check_and_clone_cstr(path, Some(MAX_PATHLEN))?);
+        // let path = path.as_str().trim();
+        let path = path.clean();
 
         let inode: Result<Arc<dyn IndexNode>, SystemError> =
-            ROOT_INODE().lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
+            ROOT_INODE().lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
         if inode.is_ok() {
             return Err(SystemError::EEXIST);
         }
 
-        let (filename, parent_path) = rsplit_path(path);
+        // let (filename, parent_path) = rsplit_path(path);
+        let file_name = path.file_name().unwrap();
+        let parent_path = path.parent();
 
         // 查找父目录
-        let parent_inode: Arc<dyn IndexNode> = ROOT_INODE()
-            .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        let parent_inode: Arc<dyn IndexNode> = ROOT_INODE().lookup_follow_symlink(
+            parent_path.unwrap_or(Path::new("/")),
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        )?;
         // 创建nod
-        parent_inode.mknod(filename, mode, dev_t)?;
+        parent_inode.mknod(file_name, mode, dev_t)?;
 
         return Ok(0);
     }
@@ -1437,13 +1427,13 @@ impl Syscall {
         user_buf: *mut u8,
         buf_size: usize,
     ) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
-        let path = path.as_str().trim();
+        let path = Path::new(&check_and_clone_cstr(path, Some(MAX_PATHLEN))?).clean();
+
         let mut user_buf = UserBufferWriter::new(user_buf, buf_size, true)?;
 
-        let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
+        let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
 
-        let inode = inode.lookup(path.as_str())?;
+        let inode = inode.lookup(&path)?;
         if inode.metadata()?.file_type != FileType::SymLink {
             return Err(SystemError::EINVAL);
         }
@@ -1545,7 +1535,7 @@ impl Syscall {
 
         let filesystemtype = producefs!(FSMAKER, filesystemtype)?;
 
-        return Vcore::do_mount(filesystemtype, target.to_string().as_str());
+        return Vcore::do_mount(filesystemtype, Path::new(&target));
     }
 
     // 想法：可以在VFS中实现一个文件系统分发器，流程如下：

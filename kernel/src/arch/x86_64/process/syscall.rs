@@ -59,7 +59,6 @@ impl Syscall {
 
         // 切换到新的用户地址空间
         unsafe { address_space.read().user_mapper.utable.make_current() };
-
         drop(old_address_space);
         drop(irq_guard);
         // kdebug!("to load binary file");

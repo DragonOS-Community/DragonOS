@@ -11,15 +11,15 @@ use alloc::{
 };
 
 use crate::driver::base::device::device_number::DeviceNumber;
-use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
+        cache::DefaultCache,
         core::generate_inode_id,
         file::{FileMode, FilePrivateData},
         syscall::ModeType,
-        FileSystem, FileType, IndexNode, InodeId, Metadata,
+        FileSystem, FileType, IndexNode, InodeId, Magic, Metadata, SpecialNodeData, SuperBlock,
     },
     kerror,
     libs::{
@@ -77,6 +77,8 @@ pub struct FATFileSystem {
     pub fs_info: Arc<LockedFATFsInfo>,
     /// 文件系统的根inode
     root_inode: Arc<LockedFATInode>,
+    /// 文件系统目录索引缓存
+    index_cache: Arc<DefaultCache>,
 }
 
 /// FAT文件系统的Inode
@@ -164,6 +166,11 @@ impl FATInode {
                 return Err(SystemError::ENOTDIR);
             }
         }
+    }
+
+    #[inline]
+    fn key(&self) -> Result<String, SystemError> {
+        Ok(self.inode_type.name())
     }
 }
 
@@ -262,6 +269,10 @@ impl FileSystem for FATFileSystem {
             FAT_MAX_NAMELEN,
         )
     }
+
+    fn cache(&self) -> Result<Arc<DefaultCache>, SystemError> {
+        Ok(self.index_cache.clone())
+    }
 }
 
 impl FATFileSystem {
@@ -346,6 +357,7 @@ impl FATFileSystem {
             first_data_sector,
             fs_info: Arc::new(LockedFATFsInfo::new(fs_info)),
             root_inode,
+            index_cache: Arc::new(DefaultCache::new(None)),
         });
 
         // 对root inode加锁，并继续完成初始化工作
@@ -1806,6 +1818,14 @@ impl IndexNode for LockedFATInode {
 
     fn special_node(&self) -> Option<SpecialNodeData> {
         self.0.lock().special_node.clone()
+    }
+
+    fn key(&self) -> Result<String, SystemError> {
+        self.0.lock().key()
+    }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Ok(self.0.lock().parent.upgrade().ok_or(SystemError::ENOENT)?)
     }
 }
 

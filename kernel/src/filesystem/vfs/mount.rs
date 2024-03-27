@@ -5,16 +5,78 @@ use core::{
 
 use alloc::{
     collections::BTreeMap,
+    string::String,
     sync::{Arc, Weak},
 };
+use path_base::{clean_path::Clean, Path, PathBuf};
 use system_error::SystemError;
 
-use crate::{driver::base::device::device_number::DeviceNumber, libs::spinlock::SpinLock};
+use crate::{
+    driver::base::device::device_number::DeviceNumber,
+    libs::{rwlock::RwLock, spinlock::SpinLock},
+};
 
 use super::{
     file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
     Magic, SuperBlock,
 };
+
+// 维护一个挂载点的记录，以支持特定于文件系统的索引
+type MountListType = Arc<RwLock<BTreeMap<MountPath, Arc<dyn FileSystem>>>>;
+static mut __MOUNTS_LIST: Option<MountListType> = None;
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct MountPath(PathBuf);
+
+impl From<&str> for MountPath {
+    fn from(value: &str) -> Self {
+        Self(PathBuf::from(value).clean())
+    }
+}
+
+impl AsRef<Path> for MountPath {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl PartialOrd for MountPath {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MountPath {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        let self_dep = self.0.components().count();
+        let othe_dep = other.0.components().count();
+        if self_dep == othe_dep {
+            self.0.cmp(&other.0)
+        } else {
+            othe_dep.cmp(&self_dep)
+        }
+    }
+}
+
+/// 返回MOUNT LIST
+#[inline(always)]
+#[allow(non_snake_case)]
+pub fn MOUNTS_LIST() -> MountListType {
+    unsafe {
+        if __MOUNTS_LIST.is_none() {
+            __MOUNTS_LIST = Some(Arc::new(RwLock::new(BTreeMap::new())));
+        }
+        return __MOUNTS_LIST.as_ref().unwrap().clone();
+    }
+}
+
+#[inline(always)]
+#[allow(non_snake_case)]
+pub fn CLEAR_MOUNTS_LIST() {
+    unsafe {
+        __MOUNTS_LIST = None;
+    }
+}
 
 const MOUNTFS_BLOCK_SIZE: u64 = 512;
 const MOUNTFS_MAX_NAMELEN: u64 = 64;
@@ -123,7 +185,7 @@ impl MountFSInode {
     /// 如果当前inode在父MountFS内，但不是挂载点，那么说明在这里不需要进行inode替换，因此直接返回当前inode。
     ///
     /// @return Arc<MountFSInode>
-    fn overlaid_inode(&self) -> Arc<MountFSInode> {
+    pub fn overlaid_inode(&self) -> Arc<MountFSInode> {
         let inode_id = self.metadata().unwrap().inode_id;
 
         if let Some(sub_mountfs) = self.mount_fs.mountpoints.lock().get(&inode_id) {
@@ -231,6 +293,7 @@ impl IndexNode for MountFSInode {
     /// @brief 在挂载文件系统中删除文件/文件夹
     #[inline]
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
+        kdebug!("Call Mountfs unlink: Item {}", name);
         let inode_id = self.inner_inode.find(name)?.metadata()?.inode_id;
 
         // 先检查这个inode是否为一个挂载点，如果当前inode是一个挂载点，那么就不能删除这个inode
@@ -295,12 +358,12 @@ impl IndexNode for MountFSInode {
             _ => {
                 // 直接调用当前inode所在的文件系统的find方法进行查找
                 // 由于向下查找可能会跨越文件系统的边界，因此需要尝试替换inode
-                return Ok(MountFSInode {
-                    inner_inode: self.inner_inode.find(name)?,
+                let inner_inode = self.inner_inode.find(name)?;
+                return Ok(Arc::new_cyclic(|self_ref| MountFSInode {
+                    inner_inode,
                     mount_fs: self.mount_fs.clone(),
-                    self_ref: Weak::default(),
-                }
-                .wrap()
+                    self_ref: self_ref.clone(),
+                })
                 .overlaid_inode());
             }
         }
@@ -336,7 +399,7 @@ impl IndexNode for MountFSInode {
 
     /// @brief 在当前inode下，挂载一个文件系统
     ///
-    /// @return Ok(Arc<MountFS>) 挂载成功，返回指向MountFS的指针
+    /// @return Ok(Arc<MountFS>) 挂载成功，返 回指向MountFS的指针
     fn mount(&self, fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, SystemError> {
         let metadata = self.inner_inode.metadata()?;
         if metadata.file_type != FileType::Dir {
@@ -350,6 +413,12 @@ impl IndexNode for MountFSInode {
             .mountpoints
             .lock()
             .insert(metadata.inode_id, new_mount_fs.clone());
+        // kdebug!("Mount Path: {:?}", self._abs_path()?.to_str().unwrap());
+        // kdebug!("Mount FS: {:?}", new_mount_fs);
+        MOUNTS_LIST().write().insert(
+            MountPath::from(self.abs_path()?.to_str().unwrap()),
+            new_mount_fs.clone(),
+        );
         return Ok(new_mount_fs);
     }
 
@@ -377,15 +446,41 @@ impl IndexNode for MountFSInode {
     fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
         self.inner_inode.poll(private_data)
     }
+
+    #[inline]
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if self.is_mountpoint_root()? {
+            match &self.mount_fs.self_mountpoint {
+                Some(inode) => {
+                    return inode.parent();
+                }
+                None => {
+                    return Ok(self.self_ref.upgrade().unwrap());
+                }
+            }
+        }
+        return self.inner_inode.parent();
+    }
+
+    #[inline]
+    fn key(&self) -> Result<String, SystemError> {
+        self.inner_inode.key()
+    }
 }
 
 impl FileSystem for MountFS {
     fn root_inode(&self) -> Arc<dyn IndexNode> {
-        match &self.self_mountpoint {
-            Some(inode) => return inode.mount_fs.root_inode(),
+        return match &self.self_mountpoint {
+            Some(inode) => {
+                // kdebug!("Mount point at {:?}", inode._abs_path());
+                inode.mount_fs.root_inode()
+            }
             // 当前文件系统是rootfs
-            None => self.mountpoint_root_inode(),
-        }
+            None => {
+                // kdebug!("Root fs");
+                self.mountpoint_root_inode()
+            }
+        };
     }
 
     fn info(&self) -> super::FsInfo {
@@ -403,5 +498,9 @@ impl FileSystem for MountFS {
     }
     fn super_block(&self) -> SuperBlock {
         SuperBlock::new(Magic::MOUNT_MAGIC, MOUNTFS_BLOCK_SIZE, MOUNTFS_MAX_NAMELEN)
+    }
+
+    fn cache(&self) -> Result<Arc<super::cache::DefaultCache>, SystemError> {
+        self.inner_filesystem.cache()
     }
 }

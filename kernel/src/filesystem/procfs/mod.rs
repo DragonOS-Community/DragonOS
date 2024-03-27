@@ -764,6 +764,10 @@ impl IndexNode for LockedProcFSInode {
 
         return Ok(keys);
     }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Ok(self.0.lock().parent.upgrade().ok_or(SystemError::ENOENT)?)
+    }
 }
 
 /// @brief 向procfs注册进程
@@ -811,7 +815,6 @@ pub fn procfs_init() -> Result<(), SystemError> {
             .expect("Cannot find /proc")
             .mount(procfs)
             .expect("Failed to mount proc");
-        kinfo!("ProcFS mounted.");
         result = Some(Ok(()));
     });
 

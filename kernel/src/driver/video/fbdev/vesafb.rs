@@ -25,7 +25,6 @@ use crate::{
             platform::{
                 platform_device::{platform_device_manager, PlatformDevice},
                 platform_driver::{platform_driver_manager, PlatformDriver},
-                CompatibleTable,
             },
         },
         serial::serial8250::send_to_default_serial8250_port,
@@ -157,10 +156,6 @@ impl PlatformDevice for VesaFb {
 
     fn set_pdev_id_auto(&self, id_auto: bool) {
         self.inner.lock().pdev_id_auto = id_auto;
-    }
-
-    fn compatible_table(&self) -> CompatibleTable {
-        todo!()
     }
 
     fn is_initialized(&self) -> bool {

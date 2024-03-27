@@ -4,6 +4,7 @@ use alloc::{
     string::String,
     sync::{Arc, Weak},
 };
+use driver_base_macros::get_weak_or_clear;
 use intertrait::CastFromSync;
 
 use crate::{
@@ -70,6 +71,21 @@ impl dyn KObject {
 impl DowncastArc for dyn KObject {
     fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any> {
         self
+    }
+}
+
+/// kobject的公共数据
+#[derive(Debug, Default)]
+pub struct KObjectCommonData {
+    pub kern_inode: Option<Arc<KernFSInode>>,
+    pub parent: Option<Weak<dyn KObject>>,
+    pub kset: Option<Arc<KSet>>,
+    pub kobj_type: Option<&'static dyn KObjType>,
+}
+
+impl KObjectCommonData {
+    pub fn get_parent_or_clear_weak(&mut self) -> Option<Weak<dyn KObject>> {
+        get_weak_or_clear!(self.parent)
     }
 }
 

@@ -9,7 +9,7 @@ use crate::{
         device::{bus::Bus, driver::Driver, Device, DeviceState, DeviceType, IdTable},
         kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
         kset::KSet,
-        platform::{platform_device::PlatformDevice, CompatibleTable},
+        platform::platform_device::PlatformDevice,
     },
     filesystem::kernfs::KernFSInode,
     libs::{
@@ -182,10 +182,6 @@ impl PlatformDevice for I8042PlatformDevice {
 
     fn set_pdev_id_auto(&self, id_auto: bool) {
         self.inner.lock().pdev_id_auto = id_auto;
-    }
-
-    fn compatible_table(&self) -> CompatibleTable {
-        todo!()
     }
 
     fn is_initialized(&self) -> bool {

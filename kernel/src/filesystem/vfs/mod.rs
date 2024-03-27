@@ -426,48 +426,26 @@ pub trait IndexNode: Any + Sync + Send + Debug {
 
     /// 当前抽象层挂载点下的绝对目录
     fn abs_path(&self) -> Result<PathBuf, SystemError> {
-        let mut inode;
         let mut path_stack = Vec::new();
         path_stack.push(self.key()?);
 
-        match self.parent() {
-            Err(e) => match e {
-                SystemError::ENOENT => {
-                    return Ok(PathBuf::from("/"));
-                }
-                e => {
-                    return Err(e);
-                }
-            },
-            Ok(o) => {
-                if self.metadata()?.inode_id == o.metadata()?.inode_id {
-                    return Ok(PathBuf::from("/"));
-                }
-                inode = o;
-                path_stack.push(inode.key()?);
-            }
+        let init = self.parent()?;
+        if self.metadata()?.inode_id == init.metadata()?.inode_id {
+            return Ok(PathBuf::from("/"));
         }
 
+        let mut inode = init;
+        path_stack.push(inode.key()?);
+
         while inode.metadata()?.inode_id != ROOT_INODE().metadata()?.inode_id {
-            let tmp = inode.parent();
-            match tmp {
-                Err(e) => match e {
-                    SystemError::ENOENT => {
-                        break;
-                    }
-                    e => {
-                        return Err(e);
-                    }
-                },
-                Ok(o) => {
-                    if inode.metadata()?.inode_id == o.metadata()?.inode_id {
-                        break;
-                    }
-                    inode = o;
-                    path_stack.push(inode.key()?);
-                }
+            let tmp = inode.parent()?;
+            if inode.metadata()?.inode_id == tmp.metadata()?.inode_id {
+                break;
             }
+            inode = tmp;
+            path_stack.push(inode.key()?);
         }
+
         path_stack.reverse();
         let mut path = PathBuf::from("/");
         path.extend(path_stack);
@@ -520,7 +498,7 @@ impl dyn IndexNode {
 
         // 检查根目录缓存
         if let Some((root_path, fs)) = MOUNTS_LIST()
-            .lock()
+            .read()
             .iter()
             .filter_map(|(key, value)| {
                 let strkey = key.as_ref();

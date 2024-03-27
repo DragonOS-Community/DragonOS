@@ -145,7 +145,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     }
 
     MOUNTS_LIST()
-        .lock()
+        .write()
         .insert(MountPath::from("/"), ROOT_INODE().fs());
     kinfo!("VFS: Migrate filesystems done!");
 

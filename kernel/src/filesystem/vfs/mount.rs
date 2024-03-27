@@ -11,7 +11,7 @@ use alloc::{
 use path_base::{clean_path::Clean, Path, PathBuf};
 use system_error::SystemError;
 
-use crate::{driver::base::device::device_number::DeviceNumber, libs::spinlock::SpinLock};
+use crate::{driver::base::device::device_number::DeviceNumber, libs::{rwlock::RwLock, spinlock::SpinLock}};
 
 use super::{
     file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
@@ -19,8 +19,8 @@ use super::{
 };
 
 // 维护一个挂载点的记录，以支持特定于文件系统的索引
-type MountListType = Option<Arc<SpinLock<BTreeMap<MountPath, Arc<dyn FileSystem>>>>>;
-static mut __MOUNTS_LIST: MountListType = None;
+type MountListType = Arc<RwLock<BTreeMap<MountPath, Arc<dyn FileSystem>>>>;
+static mut __MOUNTS_LIST: Option<MountListType> = None;
 
 #[derive(PartialEq, Eq, Debug)]
 pub struct MountPath(PathBuf);
@@ -45,17 +45,23 @@ impl PartialOrd for MountPath {
 
 impl Ord for MountPath {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        self.partial_cmp(other).unwrap()
+        let self_dep = self.0.components().count();
+        let othe_dep = other.0.components().count();
+        if self_dep == othe_dep {
+            self.0.cmp(&other.0)
+        } else {
+            othe_dep.cmp(&self_dep)
+        }
     }
 }
 
 /// 返回MOUNT LIST
 #[inline(always)]
 #[allow(non_snake_case)]
-pub fn MOUNTS_LIST() -> Arc<SpinLock<BTreeMap<MountPath, Arc<dyn FileSystem>>>> {
+pub fn MOUNTS_LIST() -> MountListType {
     unsafe {
         if __MOUNTS_LIST.is_none() {
-            __MOUNTS_LIST = Some(Arc::new(SpinLock::new(BTreeMap::new())));
+            __MOUNTS_LIST = Some(Arc::new(RwLock::new(BTreeMap::new())));
         }
         return __MOUNTS_LIST.as_ref().unwrap().clone();
     }
@@ -349,13 +355,14 @@ impl IndexNode for MountFSInode {
             _ => {
                 // 直接调用当前inode所在的文件系统的find方法进行查找
                 // 由于向下查找可能会跨越文件系统的边界，因此需要尝试替换inode
-                return Ok(MountFSInode {
-                    inner_inode: self.inner_inode.find(name)?,
-                    mount_fs: self.mount_fs.clone(),
-                    self_ref: Weak::default(),
-                }
-                .wrap()
-                .overlaid_inode());
+                let inner_inode = self.inner_inode.find(name)?;
+                return Ok(Arc::new_cyclic(|self_ref| {
+                    MountFSInode {
+                        inner_inode,
+                        mount_fs: self.mount_fs.clone(),
+                        self_ref: self_ref.clone(),
+                    }
+                }).overlaid_inode());
             }
         }
     }
@@ -406,7 +413,7 @@ impl IndexNode for MountFSInode {
             .insert(metadata.inode_id, new_mount_fs.clone());
         // kdebug!("Mount Path: {:?}", self._abs_path()?.to_str().unwrap());
         // kdebug!("Mount FS: {:?}", new_mount_fs);
-        MOUNTS_LIST().lock().insert(
+        MOUNTS_LIST().write().insert(
             MountPath::from(self.abs_path()?.to_str().unwrap()),
             new_mount_fs.clone(),
         );

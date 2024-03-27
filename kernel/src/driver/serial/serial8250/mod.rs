@@ -177,10 +177,6 @@ impl Serial8250ISADevices {
 }
 
 impl PlatformDevice for Serial8250ISADevices {
-    fn compatible_table(&self) -> crate::driver::base::platform::CompatibleTable {
-        unimplemented!()
-    }
-
     fn pdev_id(&self) -> (i32, bool) {
         return (
             self.id.load(Ordering::SeqCst),

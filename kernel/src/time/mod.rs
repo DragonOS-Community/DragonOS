@@ -155,26 +155,26 @@ impl Instant {
     ///
     /// 返回：给定输入日期自1970-01-01 00:00:00以来的秒数
     pub fn mktime64(year0: u32, mon0: u32, day: u32, hour: u32, min: u32, sec: u32) -> Self {
-        let mut mon: u64 = mon0.into();
+        let mut mon: i64 = mon0.into();
         let mut year: u64 = year0.into();
         let day: u64 = day.into();
         let hour: u64 = hour.into();
         let min: u64 = min.into();
         let sec: u64 = sec.into();
 
+        mon -= 2;
         /* 1..12 -> 11,12,1..10 */
-        if mon <= 2 {
+        if mon <= 0 {
             /* Puts Feb last since it has leap day */
             mon += 12;
             year -= 1;
         }
+        let mon = mon as u64;
 
         let secs = ((((year / 4 - year / 100 + year / 400 + 367 * mon / 12 + day) + year * 365
             - 719499)
-            * 24
-            + hour/* now have hours - midnight tomorrow handled here */)
-            * 60
-            + min/* now have minutes */)
+            * 24 + hour) /* now have hours - midnight tomorrow handled here */
+            * 60 + min)/* now have minutes */
             * 60
             + sec; /* finally seconds */
 

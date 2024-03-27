@@ -62,7 +62,7 @@ pub struct RtcTime {
     pub hour: i32,
     /// `mday`: 一个月中的第几天，范围从 1 到 31
     pub mday: i32,
-    /// `month`: 月份，范围从 1 到 12
+    /// `month`: 月份，范围从 0 到 11
     pub month: i32,
     /// `year`: 年份(相对于1900年)
     pub year: i32,
@@ -79,7 +79,12 @@ impl RtcTime {
     ///
     /// 例如，如果日期为2021年1月1日，则返回"2021-01-01"
     pub fn date_string(&self) -> String {
-        format!("{:04}-{:02}-{:02}", self.year_real(), self.month, self.mday)
+        format!(
+            "{:04}-{:02}-{:02}",
+            self.year_real(),
+            self.month_real(),
+            self.mday
+        )
     }
 
     /// 返回一个格式化的时间字符串
@@ -126,6 +131,10 @@ impl RtcTime {
     pub fn year_real(&self) -> i32 {
         self.year + 1900
     }
+
+    pub fn month_real(&self) -> i32 {
+        self.month + 1
+    }
 }
 
 impl From<RtcTime> for TimeSpec {
@@ -133,7 +142,7 @@ impl From<RtcTime> for TimeSpec {
         let instant = Instant::mktime64(
             val.year_real() as u32,
             (val.month + 1) as u32,
-            (val.mday + 1) as u32,
+            (val.mday) as u32,
             val.hour as u32,
             val.minute as u32,
             val.second as u32,

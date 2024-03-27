@@ -278,6 +278,8 @@ impl RtcClassOps for CmosRtcClassOps {
             res.hour = ((res.hour & 0x7f) + 12) % 24;
         } // 将十二小时制转为24小时
 
+        res.month -= 1;
+
         drop(irq_guard);
 
         return Ok(res);

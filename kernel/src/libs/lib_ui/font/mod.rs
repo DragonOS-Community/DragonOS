@@ -45,6 +45,7 @@ impl<'a> BitmapFont<'a> {
 
     #[inline(always)]
     pub fn char_map(&self, character: char) -> &'a [u8] {
+        //获得ASCII的index
         let index = self.glyph_mapping.index(character);
         let pos = index * self.bytes_per_char;
 

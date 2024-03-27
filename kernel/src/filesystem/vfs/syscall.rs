@@ -20,6 +20,7 @@ use crate::{
     time::TimeSpec,
 };
 
+use super::SuperBlock;
 use super::{
     core::{do_mkdir, do_remove_dir, do_unlink_at},
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
@@ -323,6 +324,41 @@ bitflags! {
     }
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PosixStatfs {
+    f_type: u64,
+    f_bsize: u64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: u64,
+    f_namelen: u64,
+    f_frsize: u64,
+    f_flags: u64,
+    f_spare: [u64; 4],
+}
+
+impl From<SuperBlock> for PosixStatfs {
+    fn from(super_block: SuperBlock) -> Self {
+        Self {
+            f_type: super_block.magic.bits,
+            f_bsize: super_block.bsize,
+            f_blocks: super_block.blocks,
+            f_bfree: super_block.bfree,
+            f_bavail: super_block.bavail,
+            f_files: super_block.files,
+            f_ffree: super_block.ffree,
+            f_fsid: super_block.fsid,
+            f_namelen: super_block.namelen,
+            f_frsize: super_block.frsize,
+            f_flags: super_block.flags,
+            f_spare: [0u64; 4],
+        }
+    }
+}
 ///
 ///  Arguments for how openat2(2) should open the target path. If only @flags and
 ///  @mode are non-zero, then openat2(2) operates very similarly to openat(2).
@@ -1207,6 +1243,36 @@ impl Syscall {
         let r = Self::fstat(fd as i32, user_kstat);
         Self::close(fd).ok();
         return r;
+    }
+
+    pub fn statfs(path: *const u8, user_statfs: *mut PosixStatfs) -> Result<usize, SystemError> {
+        let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
+        let fd = Self::open(
+            path,
+            FileMode::O_RDONLY.bits(),
+            ModeType::empty().bits(),
+            true,
+        )?;
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN)).unwrap();
+        let pcb = ProcessManager::current_pcb();
+        let (_inode_begin, remain_path) = user_path_at(&pcb, fd as i32, &path)?;
+        let inode = ROOT_INODE().lookup_follow_symlink(&remain_path, MAX_PATHLEN)?;
+        let statfs = PosixStatfs::from(inode.fs().super_block());
+        writer.copy_one_to_user(&statfs, 0)?;
+        return Ok(0);
+    }
+
+    pub fn fstatfs(fd: i32, user_statfs: *mut PosixStatfs) -> Result<usize, SystemError> {
+        let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+        let file = fd_table_guard
+            .get_file_by_fd(fd)
+            .ok_or(SystemError::EBADF)?;
+        drop(fd_table_guard);
+        let statfs = PosixStatfs::from(file.lock().inode().fs().super_block());
+        writer.copy_one_to_user(&statfs, 0)?;
+        return Ok(0);
     }
 
     pub fn do_statx(

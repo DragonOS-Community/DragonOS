@@ -16,7 +16,6 @@ pub mod timeconv;
 pub mod timekeep;
 pub mod timekeeping;
 pub mod timer;
-pub mod utils;
 
 /* Time structures. (Partitially taken from smoltcp)
 

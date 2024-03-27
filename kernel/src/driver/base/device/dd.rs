@@ -359,7 +359,6 @@ impl DriverManager {
     }
 
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#584
-    #[inline(always)]
     fn really_probe(
         &self,
         driver: &Arc<dyn Driver>,

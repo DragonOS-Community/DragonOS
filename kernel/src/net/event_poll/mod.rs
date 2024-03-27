@@ -866,3 +866,12 @@ bitflags! {
         const POLLFREE = 0x4000;
     }
 }
+
+/// 与C兼容的Epoll事件结构体
+#[derive(Copy, Clone, Default)]
+#[repr(C)]
+pub struct Pollfd {
+    fd: i32,
+    events: u32,
+    revents: u32,
+}

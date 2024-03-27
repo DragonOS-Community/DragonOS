@@ -1,18 +1,14 @@
+use alloc::vec::Vec;
 use system_error::SystemError;
 
 use crate::{
-    arch::ipc::signal::SigSet,
-    filesystem::vfs::file::FileMode,
-    ipc::signal::set_current_sig_blocked,
-    mm::VirtAddr,
-    syscall::{
+    arch::ipc::signal::SigSet, filesystem::vfs::file::FileMode, ipc::signal::set_current_sig_blocked, mm::VirtAddr, process::ProcessManager, syscall::{
         user_access::{UserBufferReader, UserBufferWriter},
         Syscall,
-    },
-    time::TimeSpec,
+    }, time::TimeSpec
 };
 
-use super::{EPollCtlOption, EPollEvent, EventPoll};
+use super::{EPollCtlOption, EPollEvent, EventPoll, Pollfd};
 
 impl Syscall {
     pub fn epoll_create(max_size: i32) -> Result<usize, SystemError> {
@@ -105,5 +101,66 @@ impl Syscall {
             // link：https://code.dragonos.org.cn/xref/linux-6.1.9/fs/eventpoll.c#2294
         }
         wait_ret
+    }
+
+    pub fn poll(ufds: VirtAddr,nfds: u32,timeout_msecs: i32) -> Result<usize,SystemError>{
+
+
+        let fds = {
+            let mut read_add = ufds;
+            let mut fds:Vec<Pollfd> = Vec::with_capacity(nfds as usize);
+            for _ in 0..nfds{
+                let reader = UserBufferReader::new(
+                    read_add.as_ptr::<Pollfd>(),
+                    core::mem::size_of::<Pollfd>(),
+                    true
+                )?;
+                let mut fd = Pollfd::default();
+                reader.copy_one_from_user::<Pollfd>(&mut fd, 0)?;
+                fds.push(fd);
+                read_add += core::mem::size_of::<Pollfd>();
+            }
+            fds
+        };
+
+        let mut timespec = None;
+        if timeout_msecs>=0 {
+            let sec = timeout_msecs as i64 / 1000;
+            let nsec = 1000000 *(timeout_msecs as i64 % 1000);
+            timespec = Some(TimeSpec::new(sec,nsec));
+        }
+        let nums_events = Self::do_poll(&fds,timespec)?;
+
+
+        let mut write_add = ufds;
+        
+        for fd in fds {
+            let mut writer = UserBufferWriter::new(
+            write_add.as_ptr::<Pollfd>(), 
+            core::mem::size_of::<Pollfd>(), 
+            false)?;
+            writer.copy_one_to_user(&fd, 0)?;
+            write_add += core::mem::size_of::<Pollfd>();
+        }
+        
+        Ok(nums_events)
+    }
+    pub fn do_poll(fds: &[Pollfd],timeout: Option<TimeSpec>) -> Result<usize,SystemError> {
+        loop{
+            let mut revent_nums = 0;
+            for fd in fds{
+                let binding = ProcessManager::current_pcb().fd_table();
+                let fd_table_guard = binding.read();
+                let file = fd_table_guard
+                    .get_file_by_fd(fd.fd)
+                    .ok_or(SystemError::EBADF)?.clone();
+                drop(fd_table_guard);
+                file.lock_irqsave().poll();
+            }
+
+            if(!timeout.is_none()&&timeout.unwrap().tv_sec==0&&timeout.unwrap().tv_nsec==0){
+                return Ok(0);
+            }
+        }
     }
 }

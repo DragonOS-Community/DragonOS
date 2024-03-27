@@ -812,11 +812,9 @@ pub fn procfs_init() -> Result<(), SystemError> {
         // procfs 挂载
         let _t = ROOT_INODE()
             .find("proc")
-            .expect("Cannot find /proc");
-        kdebug!("{:?}", _t);
-        _t.mount(procfs)
+            .expect("Cannot find /proc")
+            .mount(procfs)
             .expect("Failed to mount proc");
-        kinfo!("ProcFS mounted.");
         result = Some(Ok(()));
     });
 

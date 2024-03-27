@@ -11,7 +11,10 @@ use alloc::{
 use path_base::{clean_path::Clean, Path, PathBuf};
 use system_error::SystemError;
 
-use crate::{driver::base::device::device_number::DeviceNumber, libs::{rwlock::RwLock, spinlock::SpinLock}};
+use crate::{
+    driver::base::device::device_number::DeviceNumber,
+    libs::{rwlock::RwLock, spinlock::SpinLock},
+};
 
 use super::{
     file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
@@ -356,13 +359,12 @@ impl IndexNode for MountFSInode {
                 // 直接调用当前inode所在的文件系统的find方法进行查找
                 // 由于向下查找可能会跨越文件系统的边界，因此需要尝试替换inode
                 let inner_inode = self.inner_inode.find(name)?;
-                return Ok(Arc::new_cyclic(|self_ref| {
-                    MountFSInode {
-                        inner_inode,
-                        mount_fs: self.mount_fs.clone(),
-                        self_ref: self_ref.clone(),
-                    }
-                }).overlaid_inode());
+                return Ok(Arc::new_cyclic(|self_ref| MountFSInode {
+                    inner_inode,
+                    mount_fs: self.mount_fs.clone(),
+                    self_ref: self_ref.clone(),
+                })
+                .overlaid_inode());
             }
         }
     }

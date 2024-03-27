@@ -143,7 +143,6 @@ impl RamFS {
         return Ok(fs);
     }
 }
-
 #[distributed_slice(FSMAKER)]
 static RAMFSMAKER: FileSystemMaker = FileSystemMaker::new(
     "ramfs",
@@ -420,8 +419,21 @@ impl IndexNode for LockedRamFSInode {
             target.unlink(new_name)?;
             return Err(err);
         }
+        //转型为&LockedRamFSInode类型
+        let target: &LockedRamFSInode = target
+        .downcast_ref::<LockedRamFSInode>()
+        .ok_or(SystemError::EPERM)?;
+        let old_inode: &LockedRamFSInode = old_inode
+        .downcast_ref::<LockedRamFSInode>()
+        .ok_or(SystemError::EPERM)?;
+
+        //修改其对父节点的引用
+        let mut old_inode=old_inode.0.lock();
+        let target=target.0.lock();
+        old_inode.parent=target.self_ref.clone();
         return Ok(());
     }
+
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         let inode = self.0.lock();

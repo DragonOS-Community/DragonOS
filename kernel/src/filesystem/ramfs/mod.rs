@@ -7,8 +7,9 @@ use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{core::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
+    libs::casting::DowncastArc,
     libs::spinlock::{SpinLock, SpinLockGuard},
-    time::TimeSpec, libs::casting::DowncastArc
+    time::TimeSpec,
 };
 
 use alloc::{
@@ -417,12 +418,12 @@ impl IndexNode for LockedRamFSInode {
             .ok_or(SystemError::EPERM)?
             .0
             .lock()
-            .parent
-             = Arc::downgrade(&target
+            .parent = Arc::downgrade(
+            &target
                 .clone()
                 .downcast_arc::<LockedRamFSInode>()
-                .ok_or(SystemError::EPERM)?
-            );
+                .ok_or(SystemError::EPERM)?,
+        );
 
         // 在新的目录下创建一个硬链接
         target.link(new_name, &inode)?;

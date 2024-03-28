@@ -1,9 +1,14 @@
 use core::{fmt::Debug, mem::ManuallyDrop};
 
-use alloc::{rc::Weak, sync::Arc, vec::Vec};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use system_error::SystemError;
+use uefi::proto::media::file;
 
 use crate::{
-    filesystem::vfs::{FileSystem, IndexNode, Metadata},
+    filesystem::vfs::{syscall::ModeType, FileSystem, FileType, IndexNode, Metadata},
     libs::{rwlock::RwLock, spinlock::SpinLock},
 };
 
@@ -75,7 +80,7 @@ impl Debug for OSD2 {
 #[repr(C, align(1))]
 /// 磁盘中存储的inode
 pub struct Ext2Inode {
-    /// 文件类型和权限
+    /// 文件类型和权限，高四位代表文件类型，其余代表权限
     mode: u16,
     /// 文件所有者
     uid: u16,
@@ -146,14 +151,17 @@ impl LockedExt2Inode {
         return (inode * inode_size) / block_size;
     }
 }
+#[derive(Debug)]
 pub struct DataBlock {
     data: [u8; 4 * 1024],
 }
 pub struct LockedDataBlock(RwLock<DataBlock>);
 
-pub struct Indirect {
-    pub self_ref: Weak<Indirect>,
-    pub next_point: Vec<Option<Arc<Indirect>>>,
+#[derive(Debug)]
+#[repr(C, align(1))]
+pub(crate) struct Ext2Indirect {
+    pub self_ref: Weak<Ext2Indirect>,
+    pub next_point: Vec<Option<Arc<Ext2Indirect>>>,
     pub data_block: Option<Arc<DataBlock>>,
 }
 #[derive(Debug)]
@@ -163,12 +171,17 @@ pub struct LockedExt2InodeInfo(SpinLock<Ext2InodeInfo>);
 /// 存储在内存中的inode
 pub struct Ext2InodeInfo {
     // TODO 将ext2iode内容和meta联系在一起，可自行设计
+    data: Vec<Option<Ext2Indirect>>,
     meta: Metadata,
+    block_group: u32,
+    mode: ModeType,
+    file_type: FileType,
 }
 
 impl Ext2InodeInfo {
-    pub fn new(inode: Ext2Inode) -> Self {
-        // TODO 初始化inode info
+    pub fn new(inode: LockedExt2Inode) -> Self {
+        let inode_grade = inode.0.lock();
+        // let file_type = inode_grade.
         todo!()
     }
 }
@@ -204,5 +217,109 @@ impl IndexNode for LockedExt2Inode {
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
         todo!()
+    }
+}
+
+/// 文件的类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ext2FileType {
+    /// 文件系统中的 FIFO（管道）
+    FIFO = 0x1000,
+    /// 字符设备
+    CharacterDevice = 0x2000,
+    /// 目录
+    Directory = 0x4000,
+    /// 块设备
+    BlockDevice = 0x6000,
+    /// 普通文件
+    RegularFile = 0x8000,
+    /// 符号链接
+    SymbolicLink = 0xA000,
+    /// Unix 套接字
+    UnixSocket = 0xC000,
+}
+
+impl Ext2FileType {
+    pub fn get_file_type(mode: u16) -> Result<Self, SystemError> {
+        match mode & 0xF000 {
+            0x1000 => Ok(Ext2FileType::FIFO),
+            0x2000 => Ok(Ext2FileType::CharacterDevice),
+            0x4000 => Ok(Ext2FileType::Directory),
+            0x6000 => Ok(Ext2FileType::BlockDevice),
+            0x8000 => Ok(Ext2FileType::RegularFile),
+            0xA000 => Ok(Ext2FileType::SymbolicLink),
+            _ => Err(SystemError::EINVAL),
+        }
+    }
+    pub fn covert_type(&self) -> FileType {
+        match self {
+            Ext2FileType::FIFO => FileType::Pipe,
+            Ext2FileType::CharacterDevice => FileType::CharDevice,
+            Ext2FileType::Directory => FileType::Dir,
+            Ext2FileType::BlockDevice => FileType::BlockDevice,
+            Ext2FileType::RegularFile => FileType::File,
+            Ext2FileType::SymbolicLink => FileType::SymLink,
+            Ext2FileType::UnixSocket => FileType::Socket,
+        }
+    }
+}
+
+bitflags! {
+   pub struct Ext2FileMode:u16 {
+            /// 文件系统中的 FIFO（管道）
+  const  FIFO = 0x1000;
+    /// 字符设备
+  const  CHARACTER_DEVICE = 0x2000;
+    /// 目录
+ const  DIRECTORY = 0x4000;
+    /// 块设备
+const    BLOCK_DEVICE = 0x6000;
+    /// 普通文件
+ const   REGULAR_FILE = 0x8000;
+    /// 符号链接
+  const  SYMBOLIC_LINK = 0xA000;
+    /// Unix 套接字
+ const   UNIX_SOCKET = 0xC000;
+
+        /// 文件所有者具有写权限
+  const OX = 0x001;
+    /// 文件所有者具有写权限
+    const    OW = 0x002;
+    /// 文件所有者具有写权限
+    const    OR = 0x004;
+    /// 文件组所有者具有写权限
+    const   GX = 0x008;
+    /// 文件组所有者具有写权限
+    const    GW = 0x010;
+    /// 文件组所有者具有写权限
+    const   GR = 0x020;
+    /// 文件所有者具有写权限
+    const    UX = 0x040;
+    /// 文件所有者具有写权限
+    const    UW = 0x080;
+    /// 文件所有者具有写权限
+    const    UR = 0x100;
+    /// 文件所有者具有写权限
+    const    STICKY_BIT = 0x200;
+    /// 文件所有者具有写权限
+    const   SET_GROUP_ID = 0x400;
+    /// 文件所有者具有写权限
+    const   SET_USER_ID = 0x800;
+    const OXRW  =Self::OX.bits() | Self::OR.bits()  | Self::OW.bits() ;
+    const GXRW = Self::GX.bits() | Self::GR.bits() | Self::GW.bits() ;
+    const UXRW = Self::UX.bits() | Self::UR.bits() | Self::UW.bits() ;
+
+}
+
+}
+
+impl Ext2FileMode {
+    pub fn get_type(t: u16) -> Result<Ext2FileType, SystemError> {
+        Ext2FileType::get_file_type(t)
+    }
+    pub fn convert_mode(mode: u16) -> Result<ModeType, SystemError> {
+        let mut mode_type = ModeType::empty();
+        todo!()
+
     }
 }

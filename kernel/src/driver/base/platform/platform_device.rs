@@ -61,7 +61,6 @@ pub trait PlatformDevice: Device {
     /// 设置id是否为自动分配
     fn set_pdev_id_auto(&self, id_auto: bool);
 
-    fn compatible_table(&self) -> CompatibleTable;
     /// @brief: 判断设备是否初始化
     /// @parameter: None
     /// @return: 如果已经初始化，返回true，否则，返回false

@@ -33,7 +33,7 @@ pub struct I8042AuxPort {
 #[derive(Debug)]
 pub struct InnerI8042AuxPort {
     bus: Option<Weak<dyn Bus>>,
-    class: Option<Arc<dyn Class>>,
+    class: Option<Weak<dyn Class>>,
     driver: Option<Weak<dyn Driver>>,
     kern_inode: Option<Arc<KernFSInode>>,
     parent: Option<Weak<dyn KObject>>,
@@ -76,8 +76,17 @@ impl Device for I8042AuxPort {
         self.inner.lock().bus = bus;
     }
 
-    fn set_class(&self, class: Option<Arc<dyn Class>>) {
+    fn set_class(&self, class: Option<Weak<dyn Class>>) {
         self.inner.lock().class = class;
+    }
+
+    fn class(&self) -> Option<Arc<dyn Class>> {
+        let mut guard = self.inner.lock();
+        let r = guard.class.clone()?.upgrade();
+        if r.is_none() {
+            guard.class = None;
+        }
+        return r;
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {

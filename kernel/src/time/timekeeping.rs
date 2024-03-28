@@ -1,5 +1,6 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{compiler_fence, AtomicBool, AtomicI64, Ordering};
+use system_error::SystemError;
 
 use crate::{
     arch::CurrentIrqArch,
@@ -140,9 +141,10 @@ impl Timekeeper {
         let clock = timekeeper.clock.clone().unwrap();
         drop(timekeeper);
         let clock_now = clock.read();
-        let clcok_data = clock.clocksource_data();
-        let clock_delta = clock_now.div(clcok_data.watchdog_last).data() & clcok_data.mask.bits();
-        return clocksource_cyc2ns(CycleNum(clock_delta), clcok_data.mult, clcok_data.shift);
+        let clock_data = clock.clocksource_data();
+        let clock_delta = clock_now.div(clock_data.watchdog_last).data() & clock_data.mask.bits();
+        // clock_shift的值错误导致时间流逝速度异常，+5为临时修改以确保系统正常运作，目前追踪到的设置在DragonOS-dev/blob/fix_time/kernel/src/time/jiffies.rs#L18，但是修改无效
+        return clocksource_cyc2ns(CycleNum(clock_delta), clock_data.mult, clock_data.shift + 5);
     }
 }
 pub fn timekeeper() -> &'static Timekeeper {
@@ -163,7 +165,7 @@ pub fn timekeeper_init() {
 pub fn getnstimeofday() -> TimeSpec {
     // kdebug!("enter getnstimeofday");
 
-    // let mut nsecs: u64 = 0;0
+    let nsecs;
     let mut _xtime = TimeSpec {
         tv_nsec: 0,
         tv_sec: 0,
@@ -174,15 +176,15 @@ pub fn getnstimeofday() -> TimeSpec {
             Some(tk) => {
                 _xtime = tk.xtime;
                 drop(tk);
-                // nsecs = timekeeper().tk_get_ns();
+                nsecs = timekeeper().tk_get_ns();
                 // TODO 不同架构可能需要加上不同的偏移量
                 break;
             }
         }
     }
-    // xtime.tv_nsec += nsecs as i64;
-    let sec = __ADDED_SEC.load(Ordering::SeqCst);
-    _xtime.tv_sec += sec;
+    _xtime.tv_nsec += nsecs as i64;
+    // let sec = __ADDED_SEC.load(Ordering::SeqCst);
+    // _xtime.tv_sec += sec;
     while _xtime.tv_nsec >= NSEC_PER_SEC.into() {
         _xtime.tv_nsec -= NSEC_PER_SEC as i64;
         _xtime.tv_sec += 1;
@@ -206,6 +208,13 @@ pub fn do_gettimeofday() -> PosixTimeval {
     };
 }
 
+pub fn do_settimeofday64(time: TimeSpec) -> Result<(), SystemError> {
+    timekeeper().0.write_irqsave().xtime = time;
+    // todo: 模仿linux，实现时间误差校准。
+    // https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/time/timekeeping.c?fi=do_settimeofday64#1312
+    return Ok(());
+}
+
 /// # 初始化timekeeping模块
 #[inline(never)]
 pub fn timekeeping_init() {
@@ -224,15 +233,11 @@ pub fn timekeeping_init() {
     let mut timekeeper = timekeeper().0.write_irqsave();
     timekeeper.xtime.tv_nsec = ktime_get_real_ns();
 
-    // 初始化wall time到monotonic的时间
-    let mut nsec = -timekeeper.xtime.tv_nsec;
-    let mut sec = -timekeeper.xtime.tv_sec;
-    // FIXME: 这里有个奇怪的奇怪的bug
-    let num = nsec % NSEC_PER_SEC as i64;
-    nsec += num * NSEC_PER_SEC as i64;
-    sec -= num;
-    timekeeper.wall_to_monotonic.tv_nsec = nsec;
-    timekeeper.wall_to_monotonic.tv_sec = sec;
+    //参考https://elixir.bootlin.com/linux/v4.4/source/kernel/time/timekeeping.c#L1251 对wtm进行初始化
+    (
+        timekeeper.wall_to_monotonic.tv_nsec,
+        timekeeper.wall_to_monotonic.tv_sec,
+    ) = (-timekeeper.xtime.tv_nsec, -timekeeper.xtime.tv_sec);
 
     __ADDED_USEC.store(0, Ordering::SeqCst);
     __ADDED_SEC.store(0, Ordering::SeqCst);

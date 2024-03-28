@@ -2,7 +2,6 @@ use core::any::Any;
 use core::intrinsics::unlikely;
 
 use crate::filesystem::vfs::FSMAKER;
-use crate::libs::casting::DowncastArc;
 use crate::libs::rwlock::RwLock;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
@@ -418,12 +417,12 @@ impl IndexNode for LockedRamFSInode {
             .ok_or(SystemError::EPERM)?
             .0
             .lock()
-            .parent 
-        = Arc::downgrade(&target
-            .clone()
-            .downcast_arc::<LockedRamFSInode>()
-            .ok_or(SystemError::EPERM)?
-        );
+            .parent
+             = Arc::downgrade(&target
+                .clone()
+                .downcast_arc::<LockedRamFSInode>()
+                .ok_or(SystemError::EPERM)?
+            );
 
         // 在新的目录下创建一个硬链接
         target.link(new_name, &inode)?;

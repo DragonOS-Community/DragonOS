@@ -14,11 +14,12 @@ use super::{
 lazy_static! {
     pub static ref DEFAULT_CLOCK: Arc<ClocksourceJiffies> = ClocksourceJiffies::new();
 }
-pub const CLOCK_TICK_RATE: u32 = HZ as u32 * 100000;
+pub const CLOCK_TICK_RATE: u32 = 1193182;
 pub const JIFFIES_SHIFT: u32 = 8;
 pub const LATCH: u32 = (CLOCK_TICK_RATE + (HZ as u32) / 2) / HZ as u32;
 pub const ACTHZ: u32 = sh_div(CLOCK_TICK_RATE, LATCH, 8);
-pub const NSEC_PER_JIFFY: u32 = (NSEC_PER_SEC >> 3) / ACTHZ;
+//TODO 编写测试，保证始终跳动间隔与现实一致（两种时钟源进行对拍）
+pub const NSEC_PER_JIFFY: u32 = (NSEC_PER_SEC >> 4) / ACTHZ;
 pub const fn sh_div(nom: u32, den: u32, lsh: u32) -> u32 {
     (((nom) / (den)) << (lsh)) + ((((nom) % (den)) << (lsh)) + (den) / 2) / (den)
 }

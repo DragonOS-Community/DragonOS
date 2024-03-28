@@ -109,6 +109,24 @@ pub trait Driver: Sync + Send + Debug + KObject {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct DriverCommonData {
+    pub devices: Vec<Arc<dyn Device>>,
+    pub bus: Option<Weak<dyn Bus>>,
+}
+
+impl DriverCommonData {
+    pub fn push_device(&mut self, device: Arc<dyn Device>) {
+        if !self.devices.iter().any(|d| Arc::ptr_eq(d, &device)) {
+            self.devices.push(device);
+        }
+    }
+
+    pub fn delete_device(&mut self, device: &Arc<dyn Device>) {
+        self.devices.retain(|d| !Arc::ptr_eq(d, device));
+    }
+}
+
 impl dyn Driver {
     pub fn allows_async_probing(&self) -> bool {
         match self.probe_type() {

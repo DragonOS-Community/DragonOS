@@ -2,6 +2,7 @@ use core::any::Any;
 use core::intrinsics::unlikely;
 
 use crate::filesystem::vfs::FSMAKER;
+use crate::libs::casting::DowncastArc;
 use crate::libs::rwlock::RwLock;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
@@ -10,6 +11,7 @@ use crate::{
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::TimeSpec,
 };
+
 use alloc::{
     collections::BTreeMap,
     string::String,
@@ -420,17 +422,14 @@ impl IndexNode for LockedRamFSInode {
             return Err(err);
         }
         //转型为&LockedRamFSInode类型
-        let target: &LockedRamFSInode = target
-            .downcast_ref::<LockedRamFSInode>()
-            .ok_or(SystemError::EPERM)?;
+        let target = target.clone().downcast_arc::<LockedRamFSInode>().unwrap();
         let old_inode: &LockedRamFSInode = old_inode
             .downcast_ref::<LockedRamFSInode>()
             .ok_or(SystemError::EPERM)?;
 
         //修改其对父节点的引用
         let mut old_inode = old_inode.0.lock();
-        let target = target.0.lock();
-        old_inode.parent = target.self_ref.clone();
+        old_inode.parent = Arc::downgrade(&target);
         return Ok(());
     }
 

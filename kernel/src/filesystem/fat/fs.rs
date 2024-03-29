@@ -249,7 +249,11 @@ impl FileSystem for FATFileSystem {
         self
     }
 
+<<<<<<< HEAD
+    fn name(&self)->&str {
+=======
     fn name(&self) -> &str {
+>>>>>>> refs/remotes/origin/master
         "fat"
     }
 }

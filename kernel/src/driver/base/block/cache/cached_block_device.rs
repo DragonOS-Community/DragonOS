@@ -1,4 +1,8 @@
+
 use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
+use hashbrown::HashMap;
+
+use crate::libs::rwlock::RwLock;
 
 use super::{
     cache_block::{CacheBlock, CacheBlockAddr},
@@ -6,13 +10,13 @@ use super::{
     BlockCacheError, BLOCK_SIZE, BLOCK_SIZE_LOG, CACHE_THRESHOLD,
 };
 
-static mut CSPACE: Option<CacheSpace> = None;
-static mut CMAPPER: Option<CacheMapper> = None;
+static mut CSPACE: Option<LockedCacheSpace> = None;
+static mut CMAPPER: Option<LockedCacheMapper> = None;
 /// # 结构功能
 /// 该结构体向外提供BlockCache服务
 pub struct BlockCache;
 
-unsafe fn mapper() -> Result<&'static mut CacheMapper, BlockCacheError> {
+unsafe fn mapper() -> Result<&'static mut LockedCacheMapper, BlockCacheError> {
     unsafe {
         match &mut CMAPPER {
             Some(x) => return Ok(x),
@@ -21,7 +25,7 @@ unsafe fn mapper() -> Result<&'static mut CacheMapper, BlockCacheError> {
     };
 }
 
-unsafe fn space() -> Result<&'static mut CacheSpace, BlockCacheError> {
+unsafe fn space() -> Result<&'static mut LockedCacheSpace, BlockCacheError> {
     unsafe {
         match &mut CSPACE {
             Some(x) => return Ok(x),
@@ -35,8 +39,8 @@ impl BlockCache {
     /// 初始化BlockCache需要的结构体
     pub fn init() {
         unsafe {
-            CSPACE = Some(CacheSpace::new());
-            CMAPPER = Some(CacheMapper::new());
+            CSPACE = Some(LockedCacheSpace::new(CacheSpace::new()));
+            CMAPPER = Some(LockedCacheMapper::new(CacheMapper::new()));
         }
         kdebug!("BlockCache Initialized!");
     }
@@ -91,7 +95,7 @@ impl BlockCache {
             //在mapper中寻找块的lba_id，判断是否命中
             match mapper.find(i.lba_id()) {
                 Some(x) => {
-                    success_ans.push(*x);
+                    success_ans.push(x);
                     continue;
                 }
                 //缺块就放入fail_ans
@@ -186,6 +190,31 @@ impl BlockCache {
     }
 }
 
+struct LockedCacheSpace(RwLock<CacheSpace>);
+
+impl LockedCacheSpace{
+    pub fn new(space:CacheSpace)->Self{
+        LockedCacheSpace(RwLock::new(space))
+    }
+
+    pub fn read(
+        &self,
+        addr: CacheBlockAddr,
+        position: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, BlockCacheError> {
+        self.0.read().read(addr, position, buf)
+    }
+
+    pub fn _write(&mut self, _addr: CacheBlockAddr, _data: CacheBlock) -> Option<()> {
+        todo!()
+    }
+
+    pub fn insert(&mut self, lba_id: usize, data: Vec<u8>) -> Result<(), BlockCacheError>{
+        unsafe{self.0.get_mut().insert(lba_id, data)}
+    }
+}
+
 /// # 结构功能
 /// 管理Cache空间的结构体
 struct CacheSpace {
@@ -274,17 +303,39 @@ impl CacheSpace {
     }
 }
 
+struct LockedCacheMapper{
+    lock:RwLock<CacheMapper>
+}
+
+impl LockedCacheMapper{
+    pub fn new(inner:CacheMapper)->Self{
+        Self { lock: RwLock::new(inner) }
+    }
+
+    pub fn insert(&mut self, lba_id: usize, caddr: CacheBlockAddr) ->Option<()>{
+        unsafe{self.lock.get_mut().insert(lba_id, caddr)}
+    }
+
+    pub fn find(&self, lba_id: usize)->Option<CacheBlockAddr>{
+       self.lock.read().find(lba_id)
+    }
+
+    pub fn remove(&mut self, lba_id: usize){
+        unsafe{self.lock.get_mut().remove(lba_id)}
+    }
+}
+
 /// # 结构功能
 /// 该结构体用于建立lba_id到cached块的映射
 struct CacheMapper {
     //执行键值对操作的map
-    map: BTreeMap<usize, CacheBlockAddr>,
+    map: HashMap<usize, CacheBlockAddr>,
 }
 
 impl CacheMapper {
     pub fn new() -> Self {
         Self {
-            map: BTreeMap::new(),
+            map: HashMap::new(),
         }
     }
     /// # 函数的功能
@@ -296,8 +347,8 @@ impl CacheMapper {
     /// # 函数的功能
     /// 查找操作
     #[inline]
-    pub fn find(&self, lba_id: usize) -> Option<&CacheBlockAddr> {
-        self.map.get(&lba_id)
+    pub fn find(&self, lba_id: usize) -> Option<CacheBlockAddr> {
+        Some(self.map.get(&lba_id)?.clone())
     }
     /// # 函数的功能
     /// 去除操作
@@ -330,7 +381,7 @@ struct SimpleFrameSelector {
     threshold: usize,
     //表示使用过的块帧的数量
     size: usize,
-    //这里使用从头至的替换算法，其替换策略为0，1，2，...，threshold，0，1...以此类推（该算法比FIFO还要简陋，后面可以再实现别的：）
+    //这里使用从头至尾的替换算法，其替换策略为0，1，2，...，threshold，0，1...以此类推（该算法比FIFO还要简陋，后面可以再实现别的：）
     current: usize,
 }
 

@@ -43,9 +43,5 @@ pub fn pci_bus_init() -> Result<(), SystemError> {
         PCI_BUS=Some(pci_bus.clone())
     }
     let r = bus_register(pci_bus.clone() as Arc<dyn Bus>);
-    // if r.is_err(){
-    //     // device_unregister(pci_bus.clone());
-
-    // }
     return r;
 }

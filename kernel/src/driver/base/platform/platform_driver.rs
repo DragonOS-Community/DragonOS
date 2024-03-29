@@ -21,6 +21,7 @@ pub trait PlatformDriver: Driver {
     ///
     /// 如果能，则把设备的driver字段指向这个驱动。
     /// 请注意，这个函数不应该把driver加入驱动的devices列表，相关工作会在外部的函数里面处理。
+    /// 见https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/platform_device.h#208
     fn probe(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError>;
     fn remove(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError>;
     fn shutdown(&self, device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError>;

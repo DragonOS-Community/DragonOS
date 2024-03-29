@@ -75,7 +75,7 @@ static mut DEVICES_VIRTUAL_KSET_INSTANCE: Option<Arc<KSet>> = None;
 
 /// 获取`/sys/devices`的kset实例
 #[inline(always)]
-pub(super) fn sys_devices_kset() -> Arc<KSet> {
+pub fn sys_devices_kset() -> Arc<KSet> {
     unsafe { DEVICES_KSET_INSTANCE.as_ref().unwrap().clone() }
 }
 

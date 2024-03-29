@@ -6,6 +6,7 @@ use crate::driver::base::device::{bus::Bus, driver::{driver_manager, Driver}};
 use super::{pci_bus, pci_device::PciDevice};
 
 pub trait PciDriver: Driver {
+    //https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/net/wireless/realtek/rtw88/pci.c?fi=rtw_pci_probe#1731是一个实例
     fn probe(&self, device: &Arc<dyn PciDevice>) -> Result<(), SystemError>;
     fn remove(&self, device: &Arc<dyn PciDevice>) -> Result<(), SystemError>;
     fn shutdown(&self, device: &Arc<dyn PciDevice>) -> Result<(), SystemError>;

@@ -65,6 +65,7 @@ impl Syscall {
     /// ## 将随机字节填入buf
     ///
     /// ### 该系统调用与linux不一致，因为目前没有其他随机源
+    // get_random 新的实现
     pub fn get_random(buf: *mut u8, len: usize, flags: GRandFlags) -> Result<usize, SystemError> {
         if flags.bits() == (GRandFlags::GRND_INSECURE.bits() | GRandFlags::GRND_RANDOM.bits()) {
             return Err(SystemError::EINVAL);
@@ -75,11 +76,9 @@ impl Syscall {
         let mut ret = Vec::new();
         let mut count = 0;
         while count < len {
-            let rand = rand();
-            for offset in 0..4 {
-                ret.push((rand >> (offset * 2)) as u8);
-                count += 1;
-            }
+            let rand_byte = rand() as u8;
+            ret.push(rand_byte);
+            count += 1;
         }
 
         writer.copy_to_user(&ret, 0)?;

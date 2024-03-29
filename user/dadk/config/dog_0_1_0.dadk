@@ -5,7 +5,7 @@
   "rust_target": null,
   "task_type": {
     "BuildFromSource": {
-      "Git": {
+"Git": {
         "url": "https://git.mirrors.dragonos.org.cn/DragonOS-Community/dog.git",
         "branch": null,
         "revision": "4ad6075686"

@@ -25,7 +25,7 @@ use crate::{
         rwlock::{RwLock, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::page::PAGE_MANAGER,
+    mm::page::page_manager_lock_irasave,
     process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
@@ -670,7 +670,7 @@ impl Drop for UserMapper {
             deallocate_page_frames(
                 PhysPageFrame::new(self.utable.table().phys()),
                 PageFrameCount::new(1),
-                &mut PAGE_MANAGER.lock(),
+                &mut page_manager_lock_irasave(),
             )
         };
     }
@@ -951,7 +951,7 @@ impl LockedVMA {
 
         // 获取物理页的anon_vma的守卫
         let mut anon_vma_guard: SpinLockGuard<'_, crate::mm::page::PageManager> =
-            PAGE_MANAGER.lock();
+            page_manager_lock_irasave();
         for page in guard.region.pages() {
             let (paddr, _, flush) = unsafe { mapper.unmap_phys(page.virt_address(), true) }
                 .expect("Failed to unmap, beacuse of some page is not mapped");
@@ -961,8 +961,6 @@ impl LockedVMA {
             page.remove_vma(self);
 
             // 如果物理页的anon_vma链表长度为0并且不是共享页，则释放物理页.
-            // 目前由于还没有实现共享页，所以直接释放物理页也没问题。
-            // 但是在实现共享页之后，就不能直接释放物理页了，需要在anon_vma链表长度为0的时候才能释放物理页
             if page.can_deallocate() {
                 unsafe {
                     deallocate_page_frames(
@@ -1032,7 +1030,7 @@ impl LockedVMA {
         });
 
         // 重新设置before、after这两个VMA里面的物理页的anon_vma
-        let mut anon_vma_guard = PAGE_MANAGER.lock();
+        let mut anon_vma_guard = page_manager_lock_irasave();
         if let Some(before) = before.clone() {
             let virt_iter = before.lock().region.iter_pages();
             for frame in virt_iter {
@@ -1275,7 +1273,7 @@ impl VMA {
         });
 
         // 将VMA加入到anon_vma中
-        let mut anon_vma_guard = PAGE_MANAGER.lock();
+        let mut anon_vma_guard = page_manager_lock_irasave();
         cur_phy = phys;
         for _ in 0..count.data() {
             let paddr = cur_phy.phys_address();
@@ -1338,7 +1336,7 @@ impl VMA {
         // kdebug!("VMA::zeroed: flusher dropped");
 
         // 清空这些内存并将VMA加入到anon_vma中
-        let mut anon_vma_guard = PAGE_MANAGER.lock();
+        let mut anon_vma_guard = page_manager_lock_irasave();
         let virt_iter: VirtPageFrameIter =
             VirtPageFrameIter::new(destination, destination.add(page_count));
         for frame in virt_iter {

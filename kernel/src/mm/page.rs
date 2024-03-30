@@ -13,7 +13,7 @@ use crate::{
     arch::{interrupt::ipi::send_ipi, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
     kerror, kwarn,
-    libs::spinlock::SpinLock,
+    libs::spinlock::{SpinLock, SpinLockGuard},
 };
 
 use super::{
@@ -21,9 +21,23 @@ use super::{
     MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
 };
 
-lazy_static! {
 /// 全局物理页信息管理器
-    pub static ref PAGE_MANAGER: SpinLock<PageManager> = SpinLock::new(PageManager::new());
+pub static mut PAGE_MANAGER: Option<SpinLock<PageManager>> = None;
+
+/// 初始化PAGE_MANAGER
+pub fn page_manager_init() {
+    kinfo!("page_manager_init");
+    let page_manager = SpinLock::new(PageManager::new());
+
+    compiler_fence(Ordering::SeqCst);
+    unsafe { PAGE_MANAGER = Some(page_manager) };
+    compiler_fence(Ordering::SeqCst);
+
+    kinfo!("page_manager_init done");
+}
+
+pub fn page_manager_lock_irasave() -> SpinLockGuard<'static, PageManager> {
+    unsafe { PAGE_MANAGER.as_ref().unwrap().lock_irqsave() }
 }
 
 // 物理页管理器
@@ -663,7 +677,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         let phys: PhysAddr = self.frame_allocator.allocate_one()?;
         compiler_fence(Ordering::SeqCst);
 
-        PAGE_MANAGER.lock_irqsave().insert(phys, Page::new(false));
+        page_manager_lock_irasave().insert(phys, Page::new(false));
         return self.map_phys(virt, phys, flags);
     }
 

@@ -16,6 +16,7 @@ pub mod timeconv;
 pub mod timekeep;
 pub mod timekeeping;
 pub mod timer;
+
 /* Time structures. (Partitially taken from smoltcp)
 
 The `time` module contains structures used to represent both
@@ -123,6 +124,61 @@ pub struct Instant {
 #[allow(dead_code)]
 impl Instant {
     pub const ZERO: Instant = Instant::from_micros_const(0);
+
+    /// mktime64 - 将日期转换为秒。
+    ///
+    /// ## 参数
+    ///
+    /// - year0: 要转换的年份
+    /// - mon0: 要转换的月份
+    /// - day: 要转换的天
+    /// - hour: 要转换的小时
+    /// - min: 要转换的分钟
+    /// - sec: 要转换的秒
+    ///
+    /// 将公历日期转换为1970-01-01 00:00:00以来的秒数。
+    /// 假设输入为正常的日期格式，即1980-12-31 23:59:59 => 年份=1980, 月=12, 日=31, 时=23, 分=59, 秒=59。
+    ///
+    /// [For the Julian calendar（俄罗斯在1917年之前使用，英国及其殖民地在大西洋1752年之前使用，
+    /// 其他地方在1582年之前使用，某些社区仍然在使用）省略-year/100+year/400项，
+    /// 并在结果上加10。]
+    ///
+    /// 这个算法最初由高斯（我认为是）发表。
+    ///
+    /// 要表示闰秒，可以通过将sec设为60（在ISO 8601允许）来调用此函数。
+    /// 闰秒与随后的秒一样处理，因为它们在UNIX时间中不存在。
+    ///
+    /// 支持将午夜作为当日末尾的24:00:00编码 - 即明天的午夜（在ISO 8601允许）。
+    ///
+    /// ## 返回
+    ///
+    /// 返回：给定输入日期自1970-01-01 00:00:00以来的秒数
+    pub fn mktime64(year0: u32, mon0: u32, day: u32, hour: u32, min: u32, sec: u32) -> Self {
+        let mut mon: i64 = mon0.into();
+        let mut year: u64 = year0.into();
+        let day: u64 = day.into();
+        let hour: u64 = hour.into();
+        let min: u64 = min.into();
+        let sec: u64 = sec.into();
+
+        mon -= 2;
+        /* 1..12 -> 11,12,1..10 */
+        if mon <= 0 {
+            /* Puts Feb last since it has leap day */
+            mon += 12;
+            year -= 1;
+        }
+        let mon = mon as u64;
+
+        let secs = ((((year / 4 - year / 100 + year / 400 + 367 * mon / 12 + day) + year * 365
+            - 719499)
+            * 24 + hour) /* now have hours - midnight tomorrow handled here */
+            * 60 + min)/* now have minutes */
+            * 60
+            + sec; /* finally seconds */
+
+        Self::from_secs(secs as i64)
+    }
 
     /// Create a new `Instant` from a number of microseconds.
     pub fn from_micros<T: Into<i64>>(micros: T) -> Instant {

@@ -1,5 +1,4 @@
-
-use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
+use alloc::{boxed::Box, vec::Vec};
 use hashbrown::HashMap;
 
 use crate::libs::rwlock::RwLock;
@@ -192,8 +191,8 @@ impl BlockCache {
 
 struct LockedCacheSpace(RwLock<CacheSpace>);
 
-impl LockedCacheSpace{
-    pub fn new(space:CacheSpace)->Self{
+impl LockedCacheSpace {
+    pub fn new(space: CacheSpace) -> Self {
         LockedCacheSpace(RwLock::new(space))
     }
 
@@ -210,8 +209,8 @@ impl LockedCacheSpace{
         todo!()
     }
 
-    pub fn insert(&mut self, lba_id: usize, data: Vec<u8>) -> Result<(), BlockCacheError>{
-        unsafe{self.0.get_mut().insert(lba_id, data)}
+    pub fn insert(&mut self, lba_id: usize, data: Vec<u8>) -> Result<(), BlockCacheError> {
+        unsafe { self.0.get_mut().insert(lba_id, data) }
     }
 }
 
@@ -303,25 +302,27 @@ impl CacheSpace {
     }
 }
 
-struct LockedCacheMapper{
-    lock:RwLock<CacheMapper>
+struct LockedCacheMapper {
+    lock: RwLock<CacheMapper>,
 }
 
-impl LockedCacheMapper{
-    pub fn new(inner:CacheMapper)->Self{
-        Self { lock: RwLock::new(inner) }
+impl LockedCacheMapper {
+    pub fn new(inner: CacheMapper) -> Self {
+        Self {
+            lock: RwLock::new(inner),
+        }
     }
 
-    pub fn insert(&mut self, lba_id: usize, caddr: CacheBlockAddr) ->Option<()>{
-        unsafe{self.lock.get_mut().insert(lba_id, caddr)}
+    pub fn insert(&mut self, lba_id: usize, caddr: CacheBlockAddr) -> Option<()> {
+        unsafe { self.lock.get_mut().insert(lba_id, caddr) }
     }
 
-    pub fn find(&self, lba_id: usize)->Option<CacheBlockAddr>{
-       self.lock.read().find(lba_id)
+    pub fn find(&self, lba_id: usize) -> Option<CacheBlockAddr> {
+        self.lock.read().find(lba_id)
     }
 
-    pub fn remove(&mut self, lba_id: usize){
-        unsafe{self.lock.get_mut().remove(lba_id)}
+    pub fn remove(&mut self, lba_id: usize) {
+        unsafe { self.lock.get_mut().remove(lba_id) }
     }
 }
 
@@ -348,7 +349,7 @@ impl CacheMapper {
     /// 查找操作
     #[inline]
     pub fn find(&self, lba_id: usize) -> Option<CacheBlockAddr> {
-        Some(self.map.get(&lba_id)?.clone())
+        Some(*self.map.get(&lba_id)?)
     }
     /// # 函数的功能
     /// 去除操作

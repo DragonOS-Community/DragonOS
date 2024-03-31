@@ -275,7 +275,11 @@ impl UdpSocket {
     }
 
     fn do_bind(&self, socket: &mut udp::Socket, endpoint: Endpoint) -> Result<(), SystemError> {
-        if let Endpoint::Ip(Some(ip)) = endpoint {
+        if let Endpoint::Ip(Some(mut ip)) = endpoint {
+            // 端口为0则分配随机端口
+            if ip.port == 0 {
+                ip.port = PORT_MANAGER.get_ephemeral_port(self.metadata.socket_type)?;
+            }
             // 检测端口是否已被占用
             PORT_MANAGER.bind_port(self.metadata.socket_type, ip.port, self.handle.clone())?;
 
@@ -342,25 +346,6 @@ impl Socket for UdpSocket {
         let socket = socket_set_guard.get_mut::<udp::Socket>(self.handle.0);
         // kdebug!("is open()={}", socket.is_open());
         // kdebug!("socket endpoint={:?}", socket.endpoint());
-        if socket.endpoint().port == 0 {
-            let temp_port = PORT_MANAGER.get_ephemeral_port(self.metadata.socket_type)?;
-
-            let local_ep = match remote_endpoint.addr {
-                // 远程remote endpoint使用什么协议，发送的时候使用的协议是一样的吧
-                // 否则就用 self.endpoint().addr.unwrap()
-                wire::IpAddress::Ipv4(_) => Endpoint::Ip(Some(wire::IpEndpoint::new(
-                    wire::IpAddress::Ipv4(wire::Ipv4Address::UNSPECIFIED),
-                    temp_port,
-                ))),
-                wire::IpAddress::Ipv6(_) => Endpoint::Ip(Some(wire::IpEndpoint::new(
-                    wire::IpAddress::Ipv6(wire::Ipv6Address::UNSPECIFIED),
-                    temp_port,
-                ))),
-            };
-            // kdebug!("udp write: local_ep = {:?}", local_ep);
-            self.do_bind(socket, local_ep)?;
-        }
-        // kdebug!("is open()={}", socket.is_open());
         if socket.can_send() {
             // kdebug!("udp write: can send");
             match socket.send_slice(buf, *remote_endpoint) {

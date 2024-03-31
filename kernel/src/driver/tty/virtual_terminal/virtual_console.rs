@@ -26,10 +26,12 @@ lazy_static! {
     /// 是否已经添加了软光标
     pub(super) static ref SOFTCURSOR_ORIGINAL: RwLock<Option<VcCursor>> = RwLock::new(None);
 
-    pub static ref CURRENT_VCNUM: AtomicIsize = AtomicIsize::new(-1);
 
-    pub static ref CONSOLE_BLANKED: AtomicBool = AtomicBool::new(false);
 }
+
+pub static CURRENT_VCNUM: AtomicIsize = AtomicIsize::new(-1);
+
+pub static CONSOLE_BLANKED: AtomicBool = AtomicBool::new(false);
 
 /// ## 虚拟控制台的信息
 #[derive(Debug, Clone)]

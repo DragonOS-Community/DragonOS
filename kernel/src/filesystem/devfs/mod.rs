@@ -6,7 +6,7 @@ use super::vfs::{
     core::{generate_inode_id, ROOT_INODE},
     file::FileMode,
     syscall::ModeType,
-    FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Metadata,
+    FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
 };
 use crate::{
     driver::base::device::device_number::DeviceNumber,
@@ -25,13 +25,14 @@ use alloc::{
 };
 use system_error::SystemError;
 
-const DEVFS_MAX_NAMELEN: usize = 64;
-
+const DEVFS_BLOCK_SIZE: u64 = 512;
+const DEVFS_MAX_NAMELEN: usize = 255;
 /// @brief dev文件系统
 #[derive(Debug)]
 pub struct DevFS {
     // 文件系统根节点
     root_inode: Arc<LockedDevFSInode>,
+    super_block: SuperBlock,
 }
 
 impl FileSystem for DevFS {
@@ -53,10 +54,19 @@ impl FileSystem for DevFS {
     fn name(&self) -> &str {
         "devfs"
     }
+
+    fn super_block(&self) -> SuperBlock {
+        self.super_block.clone()
+    }
 }
 
 impl DevFS {
     pub fn new() -> Arc<Self> {
+        let super_block = SuperBlock::new(
+            Magic::DEVFS_MAGIC,
+            DEVFS_BLOCK_SIZE,
+            DEVFS_MAX_NAMELEN as u64,
+        );
         // 初始化root inode
         let root: Arc<LockedDevFSInode> = Arc::new(LockedDevFSInode(SpinLock::new(
             // /dev 的权限设置为 读+执行，root 可以读写
@@ -64,7 +74,10 @@ impl DevFS {
             DevFSInode::new(FileType::Dir, ModeType::from_bits_truncate(0o755), 0),
         )));
 
-        let devfs: Arc<DevFS> = Arc::new(DevFS { root_inode: root });
+        let devfs: Arc<DevFS> = Arc::new(DevFS {
+            root_inode: root,
+            super_block,
+        });
 
         // 对root inode加锁，并继续完成初始化工作
         let mut root_guard: SpinLockGuard<DevFSInode> = devfs.root_inode.0.lock();

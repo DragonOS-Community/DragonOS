@@ -404,10 +404,13 @@ impl VirtAddr {
 }
 
 unsafe fn allocator_init() {
-    let virt_offset = BOOTSTRAP_MM_INFO.unwrap().start_brk;
-    let phy_offset =
-        unsafe { MMArch::virt_2_phys(VirtAddr::new(page_align_up(virt_offset))) }.unwrap();
+    let virt_offset = VirtAddr::new(page_align_up(BOOTSTRAP_MM_INFO.unwrap().start_brk));
 
+    let phy_offset = unsafe { MMArch::virt_2_phys(virt_offset) }.unwrap();
+
+    mem_block_manager()
+        .reserve_block(PhysAddr::new(0), phy_offset.data())
+        .expect("Failed to reserve block");
     let mut bump_allocator = BumpAllocator::<X86_64MMArch>::new(phy_offset.data());
     kdebug!(
         "BumpAllocator created, offset={:?}",

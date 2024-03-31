@@ -68,7 +68,7 @@ struct LocalApicTimerIrqFlowHandler;
 
 impl IrqFlowHandler for LocalApicTimerIrqFlowHandler {
     fn handle(&self, _irq_desc: &Arc<IrqDesc>, trap_frame: &mut TrapFrame) {
-        LocalApicTimer::handle_irq(&trap_frame).ok();
+        LocalApicTimer::handle_irq(trap_frame).ok();
         CurrentApic.send_eoi();
         fence(Ordering::SeqCst)
     }

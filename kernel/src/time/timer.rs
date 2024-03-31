@@ -284,7 +284,7 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
         timer.activate();
 
         drop(irq_guard);
-        
+
         schedule(SchedMode::SM_PREEMPT);
         let time_remaining: i64 = timeout - TIMER_JIFFIES.load(Ordering::SeqCst) as i64;
         if time_remaining >= 0 {

@@ -230,7 +230,7 @@ impl LoadWeight {
         }
 
         // 这里确定了fact已经在32位内
-        fact = fact * self.inv_weight as u64;
+        fact *= self.inv_weight as u64;
 
         fact_hi = (fact >> 32) as u32;
 
@@ -250,7 +250,7 @@ impl LoadWeight {
     /// ## 将负载权重缩小到到一个小的范围中计算，相当于减小精度计算
     pub const fn scale_load_down(mut weight: u64) -> u64 {
         if weight != 0 {
-            weight = weight >> Self::SCHED_FIXEDPOINT_SHIFT;
+            weight >>= Self::SCHED_FIXEDPOINT_SHIFT;
 
             if weight < 2 {
                 weight = 2;
@@ -424,7 +424,7 @@ impl CpuRunQueue {
 
     /// 启用一个任务，将加入队列
     pub fn activate_task(&mut self, pcb: &Arc<ProcessControlBlock>, mut flags: EnqueueFlag) {
-        if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::OnRqMigrating {
+        if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Migrating {
             flags |= EnqueueFlag::ENQUEUE_MIGRATED;
         }
 
@@ -434,10 +434,11 @@ impl CpuRunQueue {
 
         self.enqueue_task(pcb.clone(), flags);
 
-        *pcb.sched_info().on_rq.lock_irqsave() = OnRq::OnRqQueued;
+        *pcb.sched_info().on_rq.lock_irqsave() = OnRq::Queued;
     }
 
     /// 检查对应的task是否可以抢占当前运行的task
+    #[allow(clippy::comparison_chain)]
     pub fn check_preempt_currnet(&mut self, pcb: &Arc<ProcessControlBlock>, flags: WakeupFlags) {
         if pcb.sched_info().policy() == self.current().sched_info().policy() {
             match self.current().sched_info().policy() {
@@ -453,7 +454,7 @@ impl CpuRunQueue {
             self.resched_current();
         }
 
-        if *self.current().sched_info().on_rq.lock_irqsave() == OnRq::OnRqQueued
+        if *self.current().sched_info().on_rq.lock_irqsave() == OnRq::Queued
             && self.current().flags().contains(ProcessFlags::NEED_SCHEDULE)
         {
             self.clock_updata_flags
@@ -464,9 +465,9 @@ impl CpuRunQueue {
     /// 禁用一个任务，将离开队列
     pub fn deactivate_task(&mut self, pcb: Arc<ProcessControlBlock>, flags: DequeueFlag) {
         *pcb.sched_info().on_rq.lock_irqsave() = if flags.contains(DequeueFlag::DEQUEUE_SLEEP) {
-            OnRq::NoOnRq
+            OnRq::None
         } else {
-            OnRq::OnRqMigrating
+            OnRq::Migrating
         };
 
         self.dequeue_task(pcb, flags);
@@ -565,10 +566,8 @@ impl CpuRunQueue {
         let prev = self.nr_running;
 
         self.nr_running = prev + nr_running;
-        if prev < 2 && self.nr_running >= 2 {
-            if !self.overload {
-                self.overload = true;
-            }
+        if prev < 2 && self.nr_running >= 2 && !self.overload {
+            self.overload = true;
         }
     }
 
@@ -744,9 +743,9 @@ bitflags! {
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum OnRq {
-    OnRqQueued,
-    OnRqMigrating,
-    NoOnRq,
+    Queued,
+    Migrating,
+    None,
 }
 
 impl ProcessManager {
@@ -905,17 +904,6 @@ pub fn __schedule(sched_mod: SchedMode) {
         );
 
         let current_pcb = ProcessManager::current_pcb();
-        if !Arc::ptr_eq(&current_pcb, &prev) {
-            kerror!(
-                "current pcb ptr {:x} pid {:?} cpu {:?} prev cpu {:?} pid {:?}",
-                Arc::downgrade(&current_pcb).as_ptr() as usize,
-                current_pcb.pid(),
-                current_pcb.sched_info().on_cpu(),
-                prev.sched_info().on_cpu(),
-                prev.pid(),
-            );
-            loop {}
-        }
         assert!(
             Arc::ptr_eq(&ProcessManager::current_pcb(), &prev),
             "{}",
@@ -973,9 +961,7 @@ pub fn sched_init() {
         CPU_IRQ_TIME
             .as_mut()
             .unwrap()
-            .resize_with(PerCpu::MAX_CPU_NUM as usize, || {
-                Box::leak(Box::new(IrqTime::default()))
-            });
+            .resize_with(PerCpu::MAX_CPU_NUM as usize, || Box::leak(Box::default()));
 
         let mut cpu_runqueue = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
         for cpu in 0..PerCpu::MAX_CPU_NUM as usize {

@@ -59,5 +59,5 @@ pub fn send_to_tty_refresh_thread(data: &[u8]) {
     for item in data {
         KEYBUF.push(*item).ok();
     }
-    let _ = ProcessManager::wakeup(unsafe { &TTY_REFRESH_THREAD.as_ref().unwrap() });
+    let _ = ProcessManager::wakeup(unsafe { TTY_REFRESH_THREAD.as_ref().unwrap() });
 }

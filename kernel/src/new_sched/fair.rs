@@ -90,7 +90,7 @@ impl FairSchedEntity {
             pcb: Weak::new(),
             cfs_rq: Weak::new(),
             my_cfs_rq: None,
-            on_rq: OnRq::NoOnRq,
+            on_rq: OnRq::None,
             slice: SYSCTL_SHCED_BASE_SLICE.load(Ordering::SeqCst),
             load: Default::default(),
             deadline: Default::default(),
@@ -118,7 +118,7 @@ impl FairSchedEntity {
 
     #[inline]
     pub fn on_rq(&self) -> bool {
-        self.on_rq != OnRq::NoOnRq
+        self.on_rq != OnRq::None
     }
 
     pub fn pcb(&self) -> Arc<ProcessControlBlock> {
@@ -142,6 +142,7 @@ impl FairSchedEntity {
         self.parent.upgrade()
     }
 
+    #[allow(clippy::mut_from_ref)]
     pub fn force_mut(&self) -> &mut Self {
         unsafe { &mut *(self as *const Self as usize as *mut Self) }
     }
@@ -266,8 +267,8 @@ impl FairSchedEntity {
 
         cfs_rq.add_task_group_propagate(gcfs_rq.prop_runnable_sum);
 
-        cfs_rq.update_task_group_util(self.self_arc(), &gcfs_rq);
-        cfs_rq.update_task_group_runnable(self.self_arc(), &gcfs_rq);
+        cfs_rq.update_task_group_util(self.self_arc(), gcfs_rq);
+        cfs_rq.update_task_group_runnable(self.self_arc(), gcfs_rq);
         cfs_rq.update_task_group_load(self.self_arc(), gcfs_rq);
 
         return true;
@@ -405,6 +406,7 @@ impl CfsRunQueue {
     }
 
     #[inline]
+    #[allow(clippy::mut_from_ref)]
     pub fn force_mut(&self) -> &mut Self {
         unsafe { &mut *(self as *const Self as usize as *mut Self) }
     }
@@ -638,8 +640,8 @@ impl CfsRunQueue {
 
         // 找到最小虚拟运行时间的调度实体
         let leftmost = self.entities.get_first();
-        if leftmost.is_some() {
-            let se = leftmost.unwrap().1;
+        if let Some(leftmost) = leftmost {
+            let se = leftmost.1;
 
             if curr.is_none() {
                 vruntime = se.vruntime;
@@ -669,7 +671,7 @@ impl CfsRunQueue {
             false
         } else {
             // 判断当前和传入的se是否相等
-            Arc::ptr_eq(&se, self.current().as_ref().unwrap())
+            Arc::ptr_eq(se, self.current().as_ref().unwrap())
         }
     }
 
@@ -753,7 +755,7 @@ impl CfsRunQueue {
                 avg -= load - 1;
             }
 
-            avg = avg / load;
+            avg /= load;
         }
 
         return self.min_vruntime + avg as u64;
@@ -767,9 +769,9 @@ impl CfsRunQueue {
     pub fn avg_vruntime_add(&mut self, se: &Arc<FairSchedEntity>) {
         let weight = LoadWeight::scale_load_down(se.load.weight);
 
-        let key = self.entity_key(&se);
+        let key = self.entity_key(se);
 
-        let avg_vruntime = self.avg_vruntime as i64 + key * weight as i64;
+        let avg_vruntime = self.avg_vruntime + key * weight as i64;
 
         self.avg_vruntime = avg_vruntime;
         self.avg_load += weight as i64;
@@ -780,7 +782,7 @@ impl CfsRunQueue {
 
         let key = self.entity_key(se);
 
-        let avg_vruntime = self.avg_vruntime as i64 - key * weight as i64;
+        let avg_vruntime = self.avg_vruntime - key * weight as i64;
 
         self.avg_vruntime = avg_vruntime;
         self.avg_load -= weight as i64;
@@ -815,7 +817,7 @@ impl CfsRunQueue {
                 load = 1;
             }
 
-            lag = lag / load;
+            lag /= load;
         }
 
         se.vruntime = vruntime - lag as u64;
@@ -971,7 +973,7 @@ impl CfsRunQueue {
             self.place_entity(se.clone(), flags);
         }
 
-        self.account_entity_enqueue(&se);
+        self.account_entity_enqueue(se);
 
         if flags.contains(EnqueueFlag::ENQUEUE_MIGRATED) {
             se.force_mut().exec_start = 0;
@@ -981,7 +983,7 @@ impl CfsRunQueue {
             self.inner_enqueue_entity(se);
         }
 
-        se.force_mut().on_rq = OnRq::OnRqQueued;
+        se.force_mut().on_rq = OnRq::Queued;
 
         if self.nr_running == 1 {
             // 只有上面加入的
@@ -992,7 +994,7 @@ impl CfsRunQueue {
     pub fn dequeue_entity(&mut self, se: &Arc<FairSchedEntity>, flags: DequeueFlag) {
         let mut action = UpdateAvgFlags::UPDATE_TG;
 
-        if se.is_task() && se.on_rq == OnRq::OnRqMigrating {
+        if se.is_task() && se.on_rq == OnRq::Migrating {
             action |= UpdateAvgFlags::DO_DETACH;
         }
 
@@ -1014,7 +1016,7 @@ impl CfsRunQueue {
             self.inner_dequeue_entity(se);
         }
 
-        se.force_mut().on_rq = OnRq::NoOnRq;
+        se.force_mut().on_rq = OnRq::None;
 
         self.account_entity_dequeue(se);
 
@@ -1051,23 +1053,22 @@ impl CfsRunQueue {
         self.clear_buddies(se);
 
         if se.on_rq() {
-            self.inner_dequeue_entity(&se);
+            self.inner_dequeue_entity(se);
             self.update_load_avg(se, UpdateAvgFlags::UPDATE_TG);
             se.force_mut().vlag = se.deadline as i64;
         }
 
-        self.set_current(Arc::downgrade(&se));
+        self.set_current(Arc::downgrade(se));
 
         se.force_mut().prev_sum_exec_runtime = se.sum_exec_runtime;
     }
 
     fn update_idle_clock_pelt(&mut self) {
-        let throttled;
-        if unlikely(self.throttled_count > 0) {
-            throttled = u64::MAX;
+        let throttled = if unlikely(self.throttled_count > 0) {
+            u64::MAX
         } else {
-            throttled = self.throttled_clock_pelt_time;
-        }
+            self.throttled_clock_pelt_time
+        };
 
         self.throttled_clock_pelt = throttled;
     }
@@ -1196,7 +1197,7 @@ impl CfsRunQueue {
         //         .map(|x| (x.0, x.1.pcb().pid()))
         //         .collect::<Vec<_>>()
         // );
-        self.avg_vruntime_sub(&se);
+        self.avg_vruntime_sub(se);
     }
 
     pub fn enqueue_load_avg(&mut self, se: Arc<FairSchedEntity>) {
@@ -1278,7 +1279,6 @@ impl CfsRunQueue {
     }
 
     pub fn update_task_group_load(&mut self, se: Arc<FairSchedEntity>, gcfs_rq: &mut CfsRunQueue) {
-        let running_sum;
         let mut runnable_sum = gcfs_rq.prop_runnable_sum;
 
         let mut load_sum = 0;
@@ -1302,7 +1302,7 @@ impl CfsRunQueue {
             runnable_sum = se.avg.load_sum.min(load_sum) as isize;
         }
 
-        running_sum = se.avg.util_sum as isize >> SCHED_CAPACITY_SHIFT;
+        let running_sum = se.avg.util_sum as isize >> SCHED_CAPACITY_SHIFT;
         runnable_sum = runnable_sum.max(running_sum);
 
         load_sum = LoadWeight::scale_load_down(se.load.weight) * runnable_sum as u64;
@@ -1337,11 +1337,7 @@ impl CfsRunQueue {
         {
             return self.next();
         }
-
-        match self.entities.get_first() {
-            Some(val) => Some(val.1.clone()),
-            None => None,
-        }
+        self.entities.get_first().map(|val| val.1.clone())
     }
 
     pub fn entity_eligible(&self, se: &Arc<FairSchedEntity>) -> bool {
@@ -1654,10 +1650,7 @@ impl Scheduler for CompletelyFairScheduler {
             }
         }
 
-        match se {
-            Some(se) => Some(se.pcb()),
-            None => None,
-        }
+        se.map(|se| se.pcb())
     }
 
     fn tick(_rq: &mut CpuRunQueue, pcb: Arc<crate::process::ProcessControlBlock>, queued: bool) {

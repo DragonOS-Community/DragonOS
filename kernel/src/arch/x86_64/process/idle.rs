@@ -3,7 +3,7 @@ use core::hint::spin_loop;
 use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
-    kBUG, kinfo,
+    kBUG,
     new_sched::{SchedMode, __schedule},
     process::{ProcessFlags, ProcessManager},
 };

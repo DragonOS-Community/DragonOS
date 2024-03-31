@@ -67,7 +67,7 @@ impl ProcessManager {
             rq.set_current(Arc::downgrade(&idle_pcb));
             rq.set_idle(Arc::downgrade(&idle_pcb));
 
-            *idle_pcb.sched_info().on_rq.lock_irqsave() = OnRq::OnRqQueued;
+            *idle_pcb.sched_info().on_rq.lock_irqsave() = OnRq::Queued;
 
             idle_pcb
                 .sched_info()

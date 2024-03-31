@@ -129,7 +129,7 @@ impl SchedulerAvg {
             local_n %= LOAD_AVG_PERIOD;
         }
 
-        (val as i128 * RUNNABLE_AVG_Y_N_INV[local_n as usize] as i128 >> 32) as u64
+        ((val as i128 * RUNNABLE_AVG_Y_N_INV[local_n as usize] as i128) >> 32) as u64
     }
 
     fn accumulate_pelt_segments(periods: u64, d1: u32, d3: u32) -> u32 {

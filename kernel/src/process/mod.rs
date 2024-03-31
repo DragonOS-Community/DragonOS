@@ -477,8 +477,6 @@ impl ProcessManager {
         let cpu_id = pcb.sched_info().on_cpu();
 
         if let Some(cpu_id) = cpu_id {
-            let cpu_id = cpu_id;
-
             if pcb.pid() == cpu_rq(cpu_id.data() as usize).current().pid() {
                 kick_cpu(cpu_id).expect("ProcessManager::kick(): Failed to kick cpu");
             }
@@ -1171,7 +1169,7 @@ impl ProcessSchedulerInfo {
             sched_stat: RwLock::new(SchedInfo::default()),
             sched_policy: RwLock::new(crate::new_sched::SchedPolicy::CFS),
             sched_entity: FairSchedEntity::new(),
-            on_rq: SpinLock::new(OnRq::NoOnRq),
+            on_rq: SpinLock::new(OnRq::None),
             prio_data: RwLock::new(PrioData::default()),
         };
     }

@@ -4,10 +4,12 @@ use alloc::{string::ToString, sync::Arc};
 use kdepends::thingbuf::StaticThingBuf;
 
 use crate::{
-    arch::sched::sched,
+    arch::CurrentIrqArch,
+    exception::InterruptArch,
+    new_sched::{schedule, SchedMode},
     process::{
         kthread::{KernelThreadClosure, KernelThreadMechanism},
-        ProcessControlBlock, ProcessFlags,
+        ProcessControlBlock, ProcessManager,
     },
 };
 
@@ -34,15 +36,9 @@ fn tty_refresh_thread() -> i32 {
     loop {
         if KEYBUF.is_empty() {
             // 如果缓冲区为空，就休眠
-            unsafe {
-                TTY_REFRESH_THREAD
-                    .as_ref()
-                    .unwrap()
-                    .flags()
-                    .insert(ProcessFlags::NEED_SCHEDULE)
-            };
-
-            sched();
+            let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+            ProcessManager::mark_sleep(true).expect("TTY_REFRESH_THREAD can not mark sleep");
+            schedule(SchedMode::SM_NONE);
         }
 
         let to_dequeue = core::cmp::min(KEYBUF.len(), TO_DEQUEUE_MAX);
@@ -63,4 +59,5 @@ pub fn send_to_tty_refresh_thread(data: &[u8]) {
     for item in data {
         KEYBUF.push(*item).ok();
     }
+    let _ = ProcessManager::wakeup(unsafe { &TTY_REFRESH_THREAD.as_ref().unwrap() });
 }

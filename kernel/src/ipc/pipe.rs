@@ -1,5 +1,5 @@
 use crate::{
-    arch::{sched::sched, CurrentIrqArch},
+    arch::CurrentIrqArch,
     exception::InterruptArch,
     filesystem::vfs::{
         core::generate_inode_id, file::FileMode, syscall::ModeType, FilePrivateData, FileSystem,
@@ -7,6 +7,7 @@ use crate::{
     },
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
     net::event_poll::{EPollEventType, EPollItem, EventPoll},
+    new_sched::{schedule, SchedMode},
     process::ProcessState,
     time::TimeSpec,
 };
@@ -192,7 +193,7 @@ impl IndexNode for LockedPipeInode {
 
                 drop(irq_guard);
             }
-            sched();
+            schedule(SchedMode::SM_NONE);
             inode = self.0.lock();
         }
 
@@ -354,7 +355,7 @@ impl IndexNode for LockedPipeInode {
                 drop(inode);
                 drop(irq_guard);
             }
-            sched();
+            schedule(SchedMode::SM_NONE);
             inode = self.0.lock();
         }
 

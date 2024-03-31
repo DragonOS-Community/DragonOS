@@ -1,8 +1,12 @@
 use core::intrinsics::unlikely;
 
+use alloc::sync::Arc;
+
+use crate::process::ProcessControlBlock;
+
 use super::{
     fair::{CfsRunQueue, FairSchedEntity},
-    CpuRunQueue, LoadWeight, SCHED_CAPACITY_SHIFT,
+    CpuRunQueue, LoadWeight, SchedPolicy, SCHED_CAPACITY_SCALE, SCHED_CAPACITY_SHIFT,
 };
 
 const RUNNABLE_AVG_Y_N_INV: [u32; 32] = [
@@ -16,7 +20,7 @@ pub const LOAD_AVG_PERIOD: u64 = 32;
 pub const LOAD_AVG_MAX: usize = 47742;
 pub const PELT_MIN_DIVIDER: usize = LOAD_AVG_MAX - 1024;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SchedulerAvg {
     /// 存储上次更新这些平均值的时间
     pub last_update_time: u64,
@@ -130,14 +134,12 @@ impl SchedulerAvg {
 
     fn accumulate_pelt_segments(periods: u64, d1: u32, d3: u32) -> u32 {
         /* y^0 == 1 */
-        let mut c1 = d3;
-        let mut c2 = d3;
-        let mut c3 = d3;
+        let c3 = d3;
 
         /*
          * c1 = d1 y^p
          */
-        c1 = Self::decay_load(d1 as u64, periods) as u32;
+        let c1 = Self::decay_load(d1 as u64, periods) as u32;
 
         /*
          *            p-1
@@ -148,7 +150,7 @@ impl SchedulerAvg {
          *    = 1024 ( \Sum y^n - \Sum y^n - y^0 )
          *              n=0        n=p
          */
-        c2 = LOAD_AVG_MAX as u32 - Self::decay_load(LOAD_AVG_MAX as u64, periods) as u32 - 1024;
+        let c2 = LOAD_AVG_MAX as u32 - Self::decay_load(LOAD_AVG_MAX as u64, periods) as u32 - 1024;
 
         return c1 + c2 + c3;
     }
@@ -160,6 +162,37 @@ impl SchedulerAvg {
         self.runnable_avg = self.runnable_sum as usize / divider;
         self.util_avg = self.util_sum as usize / divider;
     }
+
+    #[allow(dead_code)]
+    pub fn post_init_entity_util_avg(pcb: &Arc<ProcessControlBlock>) {
+        let se = pcb.sched_info().sched_entity();
+        let cfs_rq = se.cfs_rq();
+        let sa = &mut se.force_mut().avg;
+
+        // TODO: 这里和架构相关
+        let cpu_scale = SCHED_CAPACITY_SCALE;
+
+        let cap = (cpu_scale as isize - cfs_rq.avg.util_avg as isize) / 2;
+
+        if pcb.sched_info().policy() != SchedPolicy::CFS {
+            sa.last_update_time = cfs_rq.cfs_rq_clock_pelt();
+        }
+
+        if cap > 0 {
+            if cfs_rq.avg.util_avg != 0 {
+                sa.util_avg = cfs_rq.avg.util_avg * se.load.weight as usize;
+                sa.util_avg /= cfs_rq.avg.load_avg + 1;
+
+                if sa.util_avg as isize > cap {
+                    sa.util_avg = cap as usize;
+                }
+            } else {
+                sa.util_avg = cap as usize;
+            }
+        }
+
+        sa.runnable_avg = sa.util_avg;
+    }
 }
 
 impl CpuRunQueue {
@@ -169,12 +202,13 @@ impl CpuRunQueue {
 }
 
 impl CfsRunQueue {
-    pub fn cfs_rq_clock_pelt(&mut self) -> u64 {
+    pub fn cfs_rq_clock_pelt(&self) -> u64 {
         if unlikely(self.throttled_count > 0) {
             return self.throttled_clock_pelt - self.throttled_clock_pelt_time;
         }
 
-        let (rq, _guard) = self.rq().self_mut();
+        let rq = self.rq();
+        let (rq, _guard) = rq.self_lock();
 
         return rq.rq_clock_pelt() - self.throttled_clock_pelt_time;
     }

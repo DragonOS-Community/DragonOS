@@ -4,9 +4,10 @@ use alloc::{boxed::Box, sync::Arc};
 use system_error::SystemError;
 
 use crate::{
-    arch::{sched::sched, CurrentIrqArch, CurrentTimeArch},
+    arch::{CurrentIrqArch, CurrentTimeArch},
     exception::InterruptArch,
     include::bindings::bindings::useconds_t,
+    new_sched::{schedule, SchedMode},
     process::ProcessManager,
     time::timekeeping::getnstimeofday,
 };
@@ -53,7 +54,7 @@ pub fn nanosleep(sleep_time: TimeSpec) -> Result<TimeSpec, SystemError> {
     timer.activate();
 
     drop(irq_guard);
-    sched();
+    schedule(SchedMode::SM_NONE);
 
     let end_time = getnstimeofday();
     // 返回正确的剩余时间

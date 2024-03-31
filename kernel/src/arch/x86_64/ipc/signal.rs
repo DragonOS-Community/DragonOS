@@ -7,7 +7,6 @@ use crate::{
         fpu::FpState,
         interrupt::TrapFrame,
         process::table::{USER_CS, USER_DS},
-        sched::sched,
         CurrentIrqArch, MMArch,
     },
     exception::InterruptArch,
@@ -17,6 +16,7 @@ use crate::{
     },
     kerror,
     mm::MemoryManagementArch,
+    new_sched::{schedule, SchedMode},
     process::ProcessManager,
     syscall::{user_access::UserBufferWriter, Syscall},
 };
@@ -715,7 +715,7 @@ fn sig_stop(sig: Signal) {
         );
     });
     drop(guard);
-    sched();
+    schedule(SchedMode::SM_NONE);
     // TODO 暂停进程
 }
 /// 信号默认处理函数——继续进程

@@ -41,6 +41,7 @@ use super::{
     tty_core::{TtyCore, TtyFlag, TtyIoctlCmd},
     tty_driver::{TtyDriver, TtyDriverSubType, TtyDriverType, TtyOperation},
     tty_job_control::TtyJobCtrlManager,
+    tty_port::init_tty_port,
     virtual_terminal::vty_init,
 };
 
@@ -481,6 +482,7 @@ pub struct TtyFilePrivateData {
 #[unified_init(INITCALL_DEVICE)]
 #[inline(never)]
 pub fn tty_init() -> Result<(), SystemError> {
+    init_tty_port();
     let tty = TtyDevice::new(
         "tty0",
         IdTable::new(

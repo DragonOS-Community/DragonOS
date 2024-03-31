@@ -138,7 +138,7 @@ impl TtyCore {
 
         self.core()
             .write_wq
-            .wakeup(EPollEventType::EPOLLOUT.bits() as u64);
+            .wakeup_any(EPollEventType::EPOLLOUT.bits() as u64);
     }
 
     pub fn tty_mode_ioctl(tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<usize, SystemError> {

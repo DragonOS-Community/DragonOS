@@ -7,9 +7,10 @@ use alloc::{collections::LinkedList, sync::Arc};
 use system_error::SystemError;
 
 use crate::{
-    arch::{sched::sched, CurrentIrqArch},
+    arch::CurrentIrqArch,
     exception::InterruptArch,
     libs::spinlock::SpinLockGuard,
+    new_sched::{schedule, SchedMode},
     process::{Pid, ProcessControlBlock, ProcessManager},
 };
 
@@ -106,7 +107,7 @@ impl<T> Mutex<T> {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(true).ok();
         drop(irq_guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     /// @brief 放锁。

@@ -436,4 +436,6 @@ pub trait TimeArch {
     ///
     /// The expire cycles
     fn cal_expire_cycles(ns: usize) -> usize;
+
+    fn get_cycles_ns() -> usize;
 }

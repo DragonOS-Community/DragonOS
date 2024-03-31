@@ -9,7 +9,7 @@ use super::lib_ui::textui::{textui_putstr, FontColor};
 
 use crate::{
     driver::tty::{
-        tty_driver::TtyOperation, tty_port::TTY_PORTS,
+        tty_driver::TtyOperation, tty_port::tty_port,
         virtual_terminal::virtual_console::CURRENT_VCNUM,
     },
     filesystem::procfs::{
@@ -89,7 +89,7 @@ impl PrintkWriter {
         let current_vcnum = CURRENT_VCNUM.load(Ordering::SeqCst);
         if current_vcnum != -1 {
             // tty已经初始化了之后才输出到屏幕
-            let port = TTY_PORTS[current_vcnum as usize].clone();
+            let port = tty_port(current_vcnum as usize);
             let tty = port.port_data().tty();
             if let Some(tty) = tty {
                 let _ = tty.write(tty.core(), s.as_bytes(), s.len());

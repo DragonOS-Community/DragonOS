@@ -6,14 +6,16 @@ use core::{
 
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
+    driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::syscall::PosixStatx,
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::syscall::MremapFlags,
     net::syscall::MsgHdr,
+    new_sched::{schedule, SchedMode},
     process::{
         fork::KernelCloneArgs,
         resource::{RLimit64, RUsage},
-        ProcessManager,
+        ProcessFlags, ProcessManager,
     },
     syscall::user_access::check_and_clone_cstr,
 };
@@ -283,6 +285,7 @@ impl Syscall {
             }
 
             SYS_EXIT => {
+                kerror!("syscall exit");
                 let exit_code = args[0];
                 Self::exit(exit_code)
             }
@@ -380,7 +383,11 @@ impl Syscall {
 
             SYS_GETPID => Self::getpid().map(|pid| pid.into()),
 
-            SYS_SCHED => Self::sched(frame.is_from_user()),
+            SYS_SCHED => {
+                kwarn!("syscall sched");
+                schedule(SchedMode::SM_NONE);
+                Ok(0)
+            }
             SYS_DUP => {
                 let oldfd: i32 = args[0] as c_int;
                 Self::dup(oldfd)
@@ -651,8 +658,6 @@ impl Syscall {
 
             #[cfg(target_arch = "x86_64")]
             SYS_MKNOD => {
-                use crate::driver::base::device::device_number::DeviceNumber;
-
                 let path = args[0];
                 let flags = args[1];
                 let dev_t = args[2];
@@ -986,7 +991,7 @@ impl Syscall {
                 Err(SystemError::ENOSYS)
             }
 
-            SYS_SCHED_YIELD => Self::sched_yield(),
+            // SYS_SCHED_YIELD => Self::sched_yield(),
             SYS_UNAME => {
                 let name = args[0] as *mut PosixOldUtsName;
                 Self::uname(name)
@@ -994,6 +999,13 @@ impl Syscall {
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
+
+        if ProcessManager::current_pcb()
+            .flags()
+            .contains(ProcessFlags::NEED_SCHEDULE)
+        {
+            schedule(SchedMode::SM_PREEMPT);
+        }
 
         return r;
     }

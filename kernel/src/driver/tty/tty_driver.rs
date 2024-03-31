@@ -27,7 +27,7 @@ use super::{
     termios::Termios,
     tty_core::{TtyCore, TtyCoreData},
     tty_ldisc::TtyLdiscManager,
-    tty_port::TTY_PORTS,
+    tty_port::tty_port,
     virtual_terminal::virtual_console::CURRENT_VCNUM,
 };
 
@@ -218,8 +218,9 @@ impl TtyDriver {
         let core = tty.core();
 
         if core.port().is_none() {
-            TTY_PORTS[core.index()].setup_tty(Arc::downgrade(&tty));
-            tty.set_port(TTY_PORTS[core.index()].clone());
+            let port = tty_port(core.index());
+            port.setup_tty(Arc::downgrade(&tty));
+            tty.set_port(port);
         }
 
         TtyLdiscManager::ldisc_setup(tty.clone(), None)?;

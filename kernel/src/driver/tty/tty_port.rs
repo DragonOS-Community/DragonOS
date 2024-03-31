@@ -16,21 +16,29 @@ use super::{tty_core::TtyCore, virtual_terminal::virtual_console::CURRENT_VCNUM}
 
 const TTY_PORT_BUFSIZE: usize = 4096;
 
-lazy_static! {
-    pub static ref TTY_PORTS: Vec<Arc<dyn TtyPort>> = {
-        let mut v: Vec<Arc<dyn TtyPort>> = Vec::with_capacity(MAX_NR_CONSOLES as usize);
-        for _ in 0..MAX_NR_CONSOLES as usize {
-            v.push(Arc::new(DefaultTtyPort::new()))
-        }
-
-        v
-    };
-}
+static mut TTY_PORTS: Option<Vec<Arc<dyn TtyPort>>> = None;
 
 /// 获取当前tty port
 #[inline]
 pub fn current_tty_port() -> Arc<dyn TtyPort> {
-    TTY_PORTS[CURRENT_VCNUM.load(Ordering::SeqCst) as usize].clone()
+    let ports = unsafe { TTY_PORTS.as_ref().unwrap() };
+    ports[CURRENT_VCNUM.load(Ordering::SeqCst) as usize].clone()
+}
+
+pub fn init_tty_port() {
+    let mut v: Vec<Arc<dyn TtyPort>> = Vec::with_capacity(MAX_NR_CONSOLES as usize);
+    for _ in 0..MAX_NR_CONSOLES as usize {
+        v.push(Arc::new(DefaultTtyPort::new()))
+    }
+
+    unsafe {
+        TTY_PORTS = Some(v);
+    }
+}
+
+pub fn tty_port(index: usize) -> Arc<dyn TtyPort> {
+    let ports = unsafe { TTY_PORTS.as_ref().unwrap() };
+    ports[index].clone()
 }
 
 #[allow(dead_code)]

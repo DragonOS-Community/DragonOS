@@ -3,7 +3,7 @@ use core::{
     intrinsics::unlikely,
     mem::{self, MaybeUninit},
     ptr::null_mut,
-    sync::atomic::{compiler_fence, AtomicI16, Ordering},
+    sync::atomic::{compiler_fence, fence, AtomicI16, Ordering},
 };
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -16,6 +16,7 @@ use crate::{
     kdebug, kinfo,
     libs::rwlock::RwLock,
     mm::percpu::{PerCpu, PerCpuVar},
+    new_sched::cputime::IrqTime,
     process::ProcessManager,
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
     time::timer::clock,
@@ -286,6 +287,11 @@ impl<'a> Drop for RunningCountGuard<'a> {
     }
 }
 
+#[inline(never)]
 pub fn do_softirq() {
+    fence(Ordering::SeqCst);
+    IrqTime::irqtime_start();
     softirq_vectors().do_softirq();
+    IrqTime::irqtime_account_irq(ProcessManager::current_pcb());
+    fence(Ordering::SeqCst);
 }

@@ -15,7 +15,7 @@ use smoltcp::{
 use system_error::SystemError;
 
 use crate::{
-    arch::{rand::rand, sched::sched},
+    arch::rand::rand,
     filesystem::vfs::{
         file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode,
         Metadata,
@@ -25,6 +25,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::EventWaitQueue,
     },
+    new_sched::{schedule, SchedMode},
 };
 
 use self::{
@@ -413,7 +414,7 @@ impl SocketHandleItem {
                 .sleep_without_schedule(events)
         };
         drop(handle_map_guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     pub fn shutdown_type(&self) -> ShutdownType {

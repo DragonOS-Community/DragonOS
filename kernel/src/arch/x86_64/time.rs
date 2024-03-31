@@ -12,4 +12,8 @@ impl TimeArch for X86_64TimeArch {
     fn cal_expire_cycles(ns: usize) -> usize {
         Self::get_cycles() + ns * TSCManager::cpu_khz() as usize / 1000000
     }
+
+    fn get_cycles_ns() -> usize {
+        Self::get_cycles() * 1000000 / TSCManager::cpu_khz() as usize
+    }
 }

@@ -34,7 +34,7 @@ pub fn video_refresh_manager() -> &'static VideoRefreshManager {
 ///管理显示刷新变量的结构体
 pub struct VideoRefreshManager {
     device_buffer: RwLock<ScmBufferInfo>,
-    refresh_target: RwLock<Option<Arc<SpinLock<Box<[u32]>>>>>,
+    refresh_target: RwLock<Option<Arc<SpinLock<Box<[u8]>>>>>,
     running: AtomicBool,
 }
 
@@ -150,7 +150,7 @@ impl VideoRefreshManager {
     }
     #[allow(clippy::type_complexity)]
     #[allow(dead_code)]
-    pub fn refresh_target(&self) -> RwLockReadGuard<'_, Option<Arc<SpinLock<Box<[u32]>>>>> {
+    pub fn refresh_target(&self) -> RwLockReadGuard<'_, Option<Arc<SpinLock<Box<[u8]>>>>> {
         let x = self.refresh_target.read();
 
         return x;
@@ -254,7 +254,7 @@ impl TimerFunction for VideoRefreshExecutor {
             }
         };
 
-        let mut refresh_target: Option<RwLockReadGuard<'_, Option<Arc<SpinLock<Box<[u32]>>>>>> =
+        let mut refresh_target: Option<RwLockReadGuard<'_, Option<Arc<SpinLock<Box<[u8]>>>>>> =
             None;
         const TRY_TIMES: i32 = 2;
         for i in 0..TRY_TIMES {
@@ -288,7 +288,7 @@ impl TimerFunction for VideoRefreshExecutor {
             let mut target_guard = target_guard.unwrap();
             unsafe {
                 p.copy_from_nonoverlapping(
-                    target_guard.as_mut_ptr() as *mut u8,
+                    target_guard.as_mut_ptr(),
                     manager.device_buffer().buf_size() as usize,
                 )
             }

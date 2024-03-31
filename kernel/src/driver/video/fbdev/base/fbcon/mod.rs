@@ -197,7 +197,7 @@ impl Device for FbConsoleDevice {
         self.inner.lock().bus.clone()
     }
 
-    fn set_class(&self, _class: Option<Arc<dyn Class>>) {
+    fn set_class(&self, _class: Option<Weak<dyn Class>>) {
         // 不允许修改
         kwarn!("fbcon's class can not be changed");
     }

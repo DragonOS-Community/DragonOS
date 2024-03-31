@@ -11,7 +11,7 @@ use alloc::{
 };
 
 use crate::driver::base::device::device_number::DeviceNumber;
-use crate::filesystem::vfs::SpecialNodeData;
+use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
@@ -35,6 +35,8 @@ use super::{
     entry::{FATDir, FATDirEntry, FATDirIter, FATEntry},
     utils::RESERVED_CLUSTERS,
 };
+
+const FAT_MAX_NAMELEN: u64 = 255;
 
 /// FAT32文件系统的最大的文件大小
 pub const MAX_FILE_SIZE: u64 = 0xffff_ffff;
@@ -251,6 +253,14 @@ impl FileSystem for FATFileSystem {
 
     fn name(&self) -> &str {
         "fat"
+    }
+
+    fn super_block(&self) -> SuperBlock {
+        SuperBlock::new(
+            Magic::FAT_MAGIC,
+            self.bpb.bytes_per_sector.into(),
+            FAT_MAX_NAMELEN,
+        )
     }
 }
 

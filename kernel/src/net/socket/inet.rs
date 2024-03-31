@@ -276,7 +276,7 @@ impl UdpSocket {
 
     fn do_bind(&self, socket: &mut udp::Socket, endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(Some(mut ip)) = endpoint {
-            //端口为0则分配随机端口
+            // 端口为0则分配随机端口
             if ip.port == 0 {
                 ip.port = PORT_MANAGER.get_ephemeral_port(self.metadata.socket_type)?;
             }

@@ -105,8 +105,8 @@ impl ProcessManager {
     }
 
     fn switch_process_fpu(prev: &Arc<ProcessControlBlock>, next: &Arc<ProcessControlBlock>) {
-        let prev_regs = unsafe { Self::task_pt_regs(prev) };
-        let next_regs = unsafe { Self::task_pt_regs(next) };
+        let prev_regs = unsafe { Self::task_trapframe(prev) };
+        let next_regs = unsafe { Self::task_trapframe(next) };
         if unlikely(prev_regs.status.sd()) {
             prev.arch_info_irqsave().fp_state.save(prev_regs);
         }
@@ -120,7 +120,7 @@ impl ProcessManager {
             .restore(&next.arch_info_irqsave().local_context);
     }
 
-    unsafe fn task_pt_regs(task: &Arc<ProcessControlBlock>) -> &mut TrapFrame {
+    unsafe fn task_trapframe(task: &Arc<ProcessControlBlock>) -> &mut TrapFrame {
         let mut sp = task.kernel_stack().stack_max_address().data();
         sp -= core::mem::size_of::<TrapFrame>();
         return (sp as *mut TrapFrame).as_mut().unwrap();

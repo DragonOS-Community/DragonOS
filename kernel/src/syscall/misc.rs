@@ -63,9 +63,7 @@ impl Syscall {
     }
 
     /// ## 将随机字节填入buf
-    ///
     /// ### 该系统调用与linux不一致，因为目前没有其他随机源
-    // get_random 新的实现
     pub fn get_random(buf: *mut u8, len: usize, flags: GRandFlags) -> Result<usize, SystemError> {
         if flags.bits() == (GRandFlags::GRND_INSECURE.bits() | GRandFlags::GRND_RANDOM.bits()) {
             return Err(SystemError::EINVAL);

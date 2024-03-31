@@ -1,11 +1,11 @@
-use alloc::vec::Vec;
-use system_error::SystemError;
-use core::cmp::min;
 use crate::{
     arch::{mm::LockedFrameAllocator, rand::rand},
     libs::rand::GRandFlags,
     mm::allocator::page_frame::FrameAllocator,
 };
+use alloc::vec::Vec;
+use core::cmp;
+use system_error::SystemError;
 
 use super::{user_access::UserBufferWriter, Syscall};
 
@@ -76,9 +76,9 @@ impl Syscall {
         let mut ret = Vec::new();
         let mut count = 0;
         while count < len {
-            //对len-count的长度进行判断，remain_len小于4则循环次数和remain_len相等
-            let remain_len = len - count ;
-            let step = min(remain_len,4);
+            // 对 len - count 的长度进行判断，remain_len 小于4则循环次数和 remain_len 相等
+            let remain_len = len - count;
+            let step = cmp::min(remain_len, 4);
             let rand = rand();
             for offset in 0..step {
                 ret.push((rand >> (offset * 2)) as u8);

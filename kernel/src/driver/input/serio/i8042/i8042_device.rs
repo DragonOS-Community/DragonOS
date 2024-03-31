@@ -9,7 +9,7 @@ use crate::{
         device::{bus::Bus, driver::Driver, Device, DeviceState, DeviceType, IdTable},
         kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
         kset::KSet,
-        platform::{platform_device::PlatformDevice, CompatibleTable},
+        platform::platform_device::PlatformDevice,
     },
     filesystem::kernfs::KernFSInode,
     libs::{
@@ -50,7 +50,7 @@ impl I8042PlatformDevice {
 #[derive(Debug)]
 pub struct InnerI8042PlatformDevice {
     bus: Option<Weak<dyn Bus>>,
-    class: Option<Arc<dyn Class>>,
+    class: Option<Weak<dyn Class>>,
     driver: Option<Weak<dyn Driver>>,
     kern_inode: Option<Arc<KernFSInode>>,
     parent: Option<Weak<dyn KObject>>,
@@ -77,8 +77,16 @@ impl Device for I8042PlatformDevice {
     fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
         self.inner.lock().bus = bus;
     }
+    fn class(&self) -> Option<Arc<dyn Class>> {
+        let mut guard = self.inner.lock();
+        let r = guard.class.clone()?.upgrade();
+        if r.is_none() {
+            guard.class = None;
+        }
 
-    fn set_class(&self, class: Option<Arc<dyn Class>>) {
+        return r;
+    }
+    fn set_class(&self, class: Option<Weak<dyn Class>>) {
         self.inner.lock().class = class;
     }
 
@@ -174,10 +182,6 @@ impl PlatformDevice for I8042PlatformDevice {
 
     fn set_pdev_id_auto(&self, id_auto: bool) {
         self.inner.lock().pdev_id_auto = id_auto;
-    }
-
-    fn compatible_table(&self) -> CompatibleTable {
-        todo!()
     }
 
     fn is_initialized(&self) -> bool {

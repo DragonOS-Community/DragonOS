@@ -2,13 +2,16 @@ use core::any::Any;
 use core::intrinsics::unlikely;
 
 use crate::filesystem::vfs::FSMAKER;
+use crate::libs::rwlock::RwLock;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{core::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
+    libs::casting::DowncastArc,
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::TimeSpec,
 };
+
 use alloc::{
     collections::BTreeMap,
     string::String,
@@ -21,10 +24,11 @@ use super::vfs::{
     file::FilePrivateData, syscall::ModeType, FileSystem, FileSystemMaker, FsInfo, IndexNode,
     InodeId, Metadata, SpecialNodeData,
 };
+use super::vfs::{Magic, SuperBlock};
 
 /// RamFS的inode名称的最大长度
 const RAMFS_MAX_NAMELEN: usize = 64;
-
+const RAMFS_BLOCK_SIZE: u64 = 512;
 /// @brief 内存文件系统的Inode结构体
 #[derive(Debug)]
 struct LockedRamFSInode(SpinLock<RamFSInode>);
@@ -34,6 +38,7 @@ struct LockedRamFSInode(SpinLock<RamFSInode>);
 pub struct RamFS {
     /// RamFS的root inode
     root_inode: Arc<LockedRamFSInode>,
+    super_block: RwLock<SuperBlock>,
 }
 
 /// @brief 内存文件系统的Inode结构体(不包含锁)
@@ -80,10 +85,19 @@ impl FileSystem for RamFS {
     fn name(&self) -> &str {
         "ramfs"
     }
+
+    fn super_block(&self) -> SuperBlock {
+        self.super_block.read().clone()
+    }
 }
 
 impl RamFS {
     pub fn new() -> Arc<Self> {
+        let super_block = SuperBlock::new(
+            Magic::RAMFS_MAGIC,
+            RAMFS_BLOCK_SIZE,
+            RAMFS_MAX_NAMELEN as u64,
+        );
         // 初始化root inode
         let root: Arc<LockedRamFSInode> = Arc::new(LockedRamFSInode(SpinLock::new(RamFSInode {
             parent: Weak::default(),
@@ -110,7 +124,10 @@ impl RamFS {
             special_node: None,
         })));
 
-        let result: Arc<RamFS> = Arc::new(RamFS { root_inode: root });
+        let result: Arc<RamFS> = Arc::new(RamFS {
+            root_inode: root,
+            super_block: RwLock::new(super_block),
+        });
 
         // 对root inode加锁，并继续完成初始化工作
         let mut root_guard: SpinLockGuard<RamFSInode> = result.root_inode.0.lock();
@@ -128,7 +145,6 @@ impl RamFS {
         return Ok(fs);
     }
 }
-
 #[distributed_slice(FSMAKER)]
 static RAMFSMAKER: FileSystemMaker = FileSystemMaker::new(
     "ramfs",
@@ -395,16 +411,30 @@ impl IndexNode for LockedRamFSInode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
     ) -> Result<(), SystemError> {
-        let old_inode: Arc<dyn IndexNode> = self.find(old_name)?;
+        let inode: Arc<dyn IndexNode> = self.find(old_name)?;
+        // 修改其对父节点的引用
+        inode
+            .downcast_ref::<LockedRamFSInode>()
+            .ok_or(SystemError::EPERM)?
+            .0
+            .lock()
+            .parent = Arc::downgrade(
+            &target
+                .clone()
+                .downcast_arc::<LockedRamFSInode>()
+                .ok_or(SystemError::EPERM)?,
+        );
 
         // 在新的目录下创建一个硬链接
-        target.link(new_name, &old_inode)?;
+        target.link(new_name, &inode)?;
+
         // 取消现有的目录下的这个硬链接
-        if let Err(err) = self.unlink(old_name) {
-            // 如果取消失败，那就取消新的目录下的硬链接
+        if let Err(e) = self.unlink(old_name) {
+            // 当操作失败时回退操作
             target.unlink(new_name)?;
-            return Err(err);
+            return Err(e);
         }
+
         return Ok(());
     }
 

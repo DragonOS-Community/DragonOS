@@ -25,7 +25,6 @@ use crate::{
             platform::{
                 platform_device::{platform_device_manager, PlatformDevice},
                 platform_driver::{platform_driver_manager, PlatformDriver},
-                CompatibleTable,
             },
         },
         serial::serial8250::send_to_default_serial8250_port,
@@ -122,7 +121,7 @@ impl VesaFb {
 #[derive(Debug)]
 struct InnerVesaFb {
     bus: Option<Weak<dyn Bus>>,
-    class: Option<Arc<dyn Class>>,
+    class: Option<Weak<dyn Class>>,
     driver: Option<Weak<dyn Driver>>,
     kern_inode: Option<Arc<KernFSInode>>,
     parent: Option<Weak<dyn KObject>>,
@@ -159,10 +158,6 @@ impl PlatformDevice for VesaFb {
         self.inner.lock().pdev_id_auto = id_auto;
     }
 
-    fn compatible_table(&self) -> CompatibleTable {
-        todo!()
-    }
-
     fn is_initialized(&self) -> bool {
         self.inner.lock().device_state == DeviceState::Initialized
     }
@@ -189,8 +184,20 @@ impl Device for VesaFb {
         self.inner.lock().bus = bus;
     }
 
-    fn set_class(&self, class: Option<Arc<dyn Class>>) {
+    fn set_class(&self, class: Option<Weak<dyn Class>>) {
         self.inner.lock().class = class;
+    }
+
+    fn class(&self) -> Option<Arc<dyn Class>> {
+        let mut guard = self.inner.lock();
+
+        let r = guard.class.clone()?.upgrade();
+        if r.is_none() {
+            // 为了让弱引用失效
+            guard.class = None;
+        }
+
+        return r;
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
@@ -412,7 +419,30 @@ impl FrameBufferOps for VesaFb {
                     }
                 }
             }
-            _ => todo!(),
+            16 => {
+                let base = screen_base.as_ptr::<u16>();
+
+                for y in rect.dy..(rect.dy + rect.height) {
+                    for x in rect.dx..(rect.dx + rect.width) {
+                        unsafe { *base.add((y * line_offset + x) as usize) = 0x0000 };
+                    }
+                }
+            }
+            24 => {
+                let base = screen_base.as_ptr::<[u8; 3]>();
+
+                for y in rect.dy..(rect.dy + rect.height) {
+                    for x in rect.dx..(rect.dx + rect.width) {
+                        unsafe { *base.add((y * line_offset + x) as usize) = [0, 0, 0] };
+                    }
+                }
+            }
+            _ => {
+                send_to_default_serial8250_port(
+                    format!("unsupported bit depth:{}!\n\0", bpp).as_bytes(),
+                );
+                todo!()
+            }
         }
 
         Ok(())
@@ -553,7 +583,81 @@ impl FrameBufferOps for VesaFb {
                     }
                 }
             }
+            2 => {
+                let mut dst = dst.as_ptr::<u16>();
+                let mut src = src.as_ptr::<u16>();
+                let line_offset = var.xres as usize;
+
+                if s_real_x > d_real_x {
+                    // 如果src在dst下方，则可以直接拷贝不会出现指针覆盖
+                    unsafe {
+                        for _ in 0..visiable_h {
+                            core::ptr::copy(src, dst, visiable_w as usize);
+                            src = src.add(line_offset);
+                            dst = dst.add(visiable_w as usize);
+                        }
+                    }
+                } else {
+                    let mut tmp: Vec<u16> = vec![0; size];
+                    let mut tmp_ptr = tmp.as_mut_ptr();
+
+                    // 这里是一个可以优化的点，现在为了避免指针拷贝时覆盖，统一先拷贝进入buf再拷贝到dst
+                    unsafe {
+                        for _ in 0..visiable_h {
+                            core::ptr::copy(src, tmp_ptr, visiable_w as usize);
+                            src = src.add(line_offset);
+                            tmp_ptr = tmp_ptr.add(visiable_w as usize);
+                        }
+
+                        tmp_ptr = tmp_ptr.sub(size);
+                        for _ in 0..visiable_h {
+                            core::ptr::copy(tmp_ptr, dst, visiable_w as usize);
+                            dst = dst.add(line_offset);
+                            tmp_ptr = tmp_ptr.add(visiable_w as usize);
+                        }
+                    }
+                }
+            }
+            3 => {
+                let mut dst = dst.as_ptr::<[u8; 3]>();
+                let mut src = src.as_ptr::<[u8; 3]>();
+                let line_offset = var.xres as usize;
+
+                if s_real_x > d_real_x {
+                    // 如果src在dst下方，则可以直接拷贝不会出现指针覆盖
+                    unsafe {
+                        for _ in 0..visiable_h {
+                            core::ptr::copy(src, dst, visiable_w as usize);
+                            src = src.add(line_offset);
+                            dst = dst.add(visiable_w as usize);
+                        }
+                    }
+                } else {
+                    let mut tmp: Vec<u32> = vec![0; size];
+                    let mut tmp_ptr = tmp.as_mut_ptr() as *mut [u8; 3];
+
+                    // 这里是一个可以优化的点，现在为了避免指针拷贝时覆盖，统一先拷贝进入buf再拷贝到dst
+                    unsafe {
+                        for _ in 0..visiable_h {
+                            core::ptr::copy(src, tmp_ptr, visiable_w as usize);
+                            src = src.add(line_offset);
+                            tmp_ptr = tmp_ptr.add(visiable_w as usize);
+                        }
+
+                        tmp_ptr = tmp_ptr.sub(size);
+                        for _ in 0..visiable_h {
+                            core::ptr::copy(tmp_ptr, dst, visiable_w as usize);
+                            dst = dst.add(line_offset);
+                            tmp_ptr = tmp_ptr.add(visiable_w as usize);
+                        }
+                    }
+                }
+            }
+
             _ => {
+                send_to_default_serial8250_port(
+                    format!("bytes_per_pixel:{}\n\0", bytes_per_pixel).as_bytes(),
+                );
                 todo!()
             }
         }

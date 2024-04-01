@@ -2,7 +2,10 @@ use system_error::SystemError;
 
 use crate::{mm::VirtAddr, syscall::Syscall, time::TimeSpec};
 
-use super::{constant::*, futex::Futex};
+use super::{
+    constant::*,
+    futex::{Futex, RobustListHead},
+};
 
 impl Syscall {
     pub fn do_futex(
@@ -100,5 +103,19 @@ impl Syscall {
                 return Err(SystemError::ENOSYS);
             }
         }
+    }
+
+    pub fn set_robust_list(head_uaddr: VirtAddr, len: usize) -> Result<usize, SystemError> {
+        let ret = RobustListHead::set_robust_list(head_uaddr, len);
+        return ret;
+    }
+
+    pub fn get_robust_list(
+        pid: usize,
+        head_uaddr: VirtAddr,
+        len_ptr_uaddr: VirtAddr,
+    ) -> Result<usize, SystemError> {
+        let ret = RobustListHead::get_robust_list(pid, head_uaddr, len_ptr_uaddr);
+        return ret;
     }
 }

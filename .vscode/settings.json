@@ -144,7 +144,7 @@
         "*.o": "c",
         "k_log.h": "c"
     },
-    "C_Cpp.errorSquiggles": "enabled",
+    "C_Cpp.errorSquiggles": "disabled",
     "esbonio.sphinx.confDir": "",
     "rust-analyzer.checkOnSave.allTargets": false,
     "rust-analyzer.linkedProjects": [

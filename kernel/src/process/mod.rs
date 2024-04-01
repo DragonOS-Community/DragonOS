@@ -34,7 +34,7 @@ use crate::{
         casting::DowncastArc,
         futex::{
             constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
-            futex::Futex,
+            futex::{Futex, RobustListHead},
         },
         lock_free_flags::LockFreeFlags,
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
@@ -373,6 +373,8 @@ impl ProcessManager {
             unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
         }
 
+        RobustListHead::exit_robust_list(pcb.clone());
+
         // 如果是vfork出来的进程，则需要处理completion
         if thread.vfork_done.is_some() {
             thread.vfork_done.as_ref().unwrap().complete_all();
@@ -597,6 +599,9 @@ pub struct ProcessControlBlock {
 
     /// 线程信息
     thread: RwLock<ThreadInfo>,
+
+    /// 进程的robust lock列表
+    robust_list: RwLock<Option<RobustListHead>>,
 }
 
 impl ProcessControlBlock {
@@ -662,6 +667,7 @@ impl ProcessControlBlock {
             children: RwLock::new(Vec::new()),
             wait_queue: WaitQueue::default(),
             thread: RwLock::new(ThreadInfo::new()),
+            robust_list: RwLock::new(None),
         };
 
         // 初始化系统调用栈
@@ -904,6 +910,16 @@ impl ProcessControlBlock {
 
     pub fn sig_struct_irqsave(&self) -> SpinLockGuard<SignalStruct> {
         self.sig_struct.lock_irqsave()
+    }
+
+    #[inline(always)]
+    pub fn get_robust_list(&self) -> RwLockReadGuard<Option<RobustListHead>> {
+        return self.robust_list.read_irqsave();
+    }
+
+    #[inline(always)]
+    pub fn set_robust_list(&self, new_robust_list: Option<RobustListHead>) {
+        *self.robust_list.write_irqsave() = new_robust_list;
     }
 }
 

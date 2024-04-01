@@ -5,7 +5,7 @@ use alloc::{
 use core::hash::{Hash, Hasher};
 use core::{
     intrinsics::{likely, unlikely},
-    mem, ptr,
+    mem,
     sync::atomic::AtomicU64,
 };
 

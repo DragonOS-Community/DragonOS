@@ -18,11 +18,11 @@ use alloc::{
 };
 use system_error::SystemError;
 
+#[cfg(target_arch = "x86_64")]
+use crate::arch::interrupt::ipi::IPI_NUM_KICK_CPU;
+
 use crate::{
-    arch::{
-        interrupt::ipi::{send_ipi, IPI_NUM_KICK_CPU},
-        CurrentIrqArch,
-    },
+    arch::{interrupt::ipi::send_ipi, CurrentIrqArch},
     driver::serial::serial8250::send_to_default_serial8250_port,
     exception::{
         ipi::{IpiKind, IpiTarget},
@@ -884,14 +884,14 @@ pub fn __schedule(sched_mod: SchedMode) {
         //     next.pid()
         // );
 
-        send_to_default_serial8250_port(
-            format!(
-                "switch_process prev {:?} next {:?} sched_mode {sched_mod:?}\n",
-                prev.pid(),
-                next.pid()
-            )
-            .as_bytes(),
-        );
+        // send_to_default_serial8250_port(
+        //     format!(
+        //         "switch_process prev {:?} next {:?} sched_mode {sched_mod:?}\n",
+        //         prev.pid(),
+        //         next.pid()
+        //     )
+        //     .as_bytes(),
+        // );
 
         // CurrentApic.send_eoi();
         compiler_fence(Ordering::SeqCst);
@@ -903,7 +903,6 @@ pub fn __schedule(sched_mod: SchedMode) {
             prev.pid(),
         );
 
-        let current_pcb = ProcessManager::current_pcb();
         assert!(
             Arc::ptr_eq(&ProcessManager::current_pcb(), &prev),
             "{}",
@@ -976,8 +975,11 @@ pub fn sched_init() {
 
 #[inline]
 pub fn send_resched_ipi(cpu: ProcessorId) {
+    #[cfg(target_arch = "x86_64")]
     send_ipi(
         IpiKind::SpecVector(HardwareIrqNumber::new(IPI_NUM_KICK_CPU.data())),
         IpiTarget::Specified(cpu),
     );
+    #[cfg(target_arch = "riscv64")]
+    todo!()
 }

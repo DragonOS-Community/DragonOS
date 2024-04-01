@@ -9,4 +9,8 @@ impl TimeArch for RiscV64TimeArch {
     fn cal_expire_cycles(ns: usize) -> usize {
         todo!()
     }
+
+    fn get_cycles_ns() -> usize {
+        todo!()
+    }
 }

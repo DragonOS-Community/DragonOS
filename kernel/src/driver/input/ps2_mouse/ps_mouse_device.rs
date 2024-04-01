@@ -412,7 +412,7 @@ impl Ps2MouseDevice {
 #[derive(Debug)]
 struct InnerPs2MouseDevice {
     bus: Option<Weak<dyn Bus>>,
-    class: Option<Arc<dyn Class>>,
+    class: Option<Weak<dyn Class>>,
     driver: Option<Weak<dyn Driver>>,
     kern_inode: Option<Arc<KernFSInode>>,
     parent: Option<Weak<dyn KObject>>,
@@ -447,7 +447,7 @@ impl Device for Ps2MouseDevice {
         self.inner.lock_irqsave().bus = bus;
     }
 
-    fn set_class(&self, class: Option<alloc::sync::Arc<dyn Class>>) {
+    fn set_class(&self, class: Option<alloc::sync::Weak<dyn Class>>) {
         self.inner.lock_irqsave().class = class;
     }
 
@@ -474,7 +474,13 @@ impl Device for Ps2MouseDevice {
     }
 
     fn class(&self) -> Option<Arc<dyn Class>> {
-        self.inner.lock_irqsave().class.clone()
+        let mut guard = self.inner.lock_irqsave();
+        let r = guard.class.clone()?.upgrade();
+        if r.is_none() {
+            guard.class = None;
+        }
+
+        return r;
     }
 }
 

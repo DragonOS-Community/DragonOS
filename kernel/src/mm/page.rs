@@ -6,16 +6,101 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 
+use alloc::sync::Arc;
+use hashbrown::{HashMap, HashSet};
+
 use crate::{
     arch::{interrupt::ipi::send_ipi, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
     kerror, kwarn,
+    libs::spinlock::{SpinLock, SpinLockGuard},
 };
 
 use super::{
-    allocator::page_frame::FrameAllocator, syscall::ProtFlags, MemoryManagementArch, PageTableKind,
-    PhysAddr, VirtAddr,
+    allocator::page_frame::FrameAllocator, syscall::ProtFlags, ucontext::LockedVMA,
+    MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
 };
+
+/// 全局物理页信息管理器
+pub static mut PAGE_MANAGER: Option<SpinLock<PageManager>> = None;
+
+/// 初始化PAGE_MANAGER
+pub fn page_manager_init() {
+    kinfo!("page_manager_init");
+    let page_manager = SpinLock::new(PageManager::new());
+
+    compiler_fence(Ordering::SeqCst);
+    unsafe { PAGE_MANAGER = Some(page_manager) };
+    compiler_fence(Ordering::SeqCst);
+
+    kinfo!("page_manager_init done");
+}
+
+pub fn page_manager_lock_irasave() -> SpinLockGuard<'static, PageManager> {
+    unsafe { PAGE_MANAGER.as_ref().unwrap().lock_irqsave() }
+}
+
+// 物理页管理器
+pub struct PageManager {
+    phys2page: HashMap<PhysAddr, Page>,
+}
+
+impl PageManager {
+    pub fn new() -> Self {
+        Self {
+            phys2page: HashMap::new(),
+        }
+    }
+
+    pub fn get_mut(&mut self, paddr: &PhysAddr) -> &mut Page {
+        self.phys2page.get_mut(paddr).unwrap()
+    }
+
+    pub fn insert(&mut self, paddr: PhysAddr, page: Page) {
+        self.phys2page.insert(paddr, page);
+    }
+
+    pub fn remove_page(&mut self, paddr: &PhysAddr) {
+        self.phys2page.remove(paddr);
+    }
+}
+
+/// 物理页面信息
+pub struct Page {
+    /// 映射计数
+    map_count: usize,
+    /// 是否为共享页
+    shared: bool,
+    /// 映射到当前page的VMA
+    anon_vma: HashSet<Arc<LockedVMA>>,
+}
+
+impl Page {
+    pub fn new(shared: bool) -> Self {
+        Self {
+            map_count: 0,
+            shared,
+            anon_vma: HashSet::new(),
+        }
+    }
+
+    /// 将vma加入anon_vma
+    pub fn insert_vma(&mut self, vma: Arc<LockedVMA>) {
+        self.anon_vma.insert(vma);
+        self.map_count += 1;
+    }
+
+    /// 将vma从anon_vma中删去
+    pub fn remove_vma(&mut self, vma: &LockedVMA) {
+        self.anon_vma.remove(vma);
+        self.map_count -= 1;
+    }
+
+    /// 判断当前物理页是否能被回
+    pub fn can_deallocate(&self) -> bool {
+        self.map_count == 0 && !self.shared
+    }
+}
 
 #[derive(Debug)]
 pub struct PageTable<Arch> {
@@ -591,6 +676,8 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         compiler_fence(Ordering::SeqCst);
         let phys: PhysAddr = self.frame_allocator.allocate_one()?;
         compiler_fence(Ordering::SeqCst);
+
+        page_manager_lock_irasave().insert(phys, Page::new(false));
         return self.map_phys(virt, phys, flags);
     }
 

@@ -584,6 +584,60 @@ impl Default for Metadata {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SuperBlock {
+    // type of filesystem
+    pub magic: Magic,
+    // optimal transfer block size
+    pub bsize: u64,
+    // total data blocks in filesystem
+    pub blocks: u64,
+    // free block in system
+    pub bfree: u64,
+    // 可供非特权用户使用的空闲块
+    pub bavail: u64,
+    // total inodes in filesystem
+    pub files: u64,
+    // free inodes in filesystem
+    pub ffree: u64,
+    // filesysytem id
+    pub fsid: u64,
+    // Max length of filename
+    pub namelen: u64,
+    // fragment size
+    pub frsize: u64,
+    // mount flags of filesystem
+    pub flags: u64,
+}
+
+impl SuperBlock {
+    pub fn new(magic: Magic, bsize: u64, namelen: u64) -> Self {
+        Self {
+            magic,
+            bsize,
+            blocks: 0,
+            bfree: 0,
+            bavail: 0,
+            files: 0,
+            ffree: 0,
+            fsid: 0,
+            namelen,
+            frsize: 0,
+            flags: 0,
+        }
+    }
+}
+bitflags! {
+    pub struct Magic: u64 {
+        const DEVFS_MAGIC = 0x1373;
+        const FAT_MAGIC =  0xf2f52011;
+        const KER_MAGIC = 0x3153464b;
+        const PROC_MAGIC = 0x9fa0;
+        const RAMFS_MAGIC = 0x858458f6;
+        const MOUNT_MAGIC = 61267;
+    }
+}
+
 /// @brief 所有文件系统都应该实现的trait
 pub trait FileSystem: Any + Sync + Send + Debug {
     /// @brief 获取当前文件系统的root inode的指针
@@ -597,6 +651,8 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     fn as_any_ref(&self) -> &dyn Any;
 
     fn name(&self) -> &str;
+
+    fn super_block(&self) -> SuperBlock;
 }
 
 impl DowncastArc for dyn FileSystem {

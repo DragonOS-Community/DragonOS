@@ -277,16 +277,14 @@ impl DriverManager {
             .and_then(|bus| bus.upgrade())
             .ok_or(SystemError::EINVAL)?;
         for dev in bus.subsystem().devices().iter() {
-            if self.do_driver_attach(dev, driver) {
-                // 匹配成功
-                return Ok(());
-            }
+            self.do_driver_attach(dev, driver);
         }
 
         return Ok(());
     }
 
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#1134
+    #[inline(never)]
     fn do_driver_attach(&self, device: &Arc<dyn Device>, driver: &Arc<dyn Driver>) -> bool {
         let r = self.match_device(driver, device).unwrap_or(false);
         if !r {

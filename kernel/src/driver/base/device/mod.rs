@@ -165,7 +165,7 @@ pub trait Device: KObject {
     /// 设置当前设备所属的类
     ///
     /// 注意，如果实现了当前方法，那么必须实现`class()`方法
-    fn set_class(&self, class: Option<Arc<dyn Class>>);
+    fn set_class(&self, class: Option<Weak<dyn Class>>);
 
     /// 返回已经与当前设备匹配好的驱动程序
     fn driver(&self) -> Option<Arc<dyn Driver>>;
@@ -198,6 +198,51 @@ impl dyn Device {
     #[inline(always)]
     pub fn is_registered(&self) -> bool {
         self.kobj_state().contains(KObjectState::IN_SYSFS)
+    }
+}
+
+/// 实现了Device trait的设备需要拥有的数据
+#[derive(Debug)]
+pub struct DeviceCommonData {
+    pub bus: Option<Weak<dyn Bus>>,
+    pub class: Option<Weak<dyn Class>>,
+    pub driver: Option<Weak<dyn Driver>>,
+    pub dead: bool,
+    pub can_match: bool,
+}
+
+impl Default for DeviceCommonData {
+    fn default() -> Self {
+        Self {
+            bus: None,
+            class: None,
+            driver: None,
+            dead: false,
+            can_match: true,
+        }
+    }
+}
+
+impl DeviceCommonData {
+    /// 获取bus字段
+    ///
+    /// 当weak指针的strong count为0的时候，清除弱引用
+    pub fn get_bus_weak_or_clear(&mut self) -> Option<Weak<dyn Bus>> {
+        driver_base_macros::get_weak_or_clear!(self.bus)
+    }
+
+    /// 获取class字段
+    ///
+    /// 当weak指针的strong count为0的时候，清除弱引用
+    pub fn get_class_weak_or_clear(&mut self) -> Option<Weak<dyn Class>> {
+        driver_base_macros::get_weak_or_clear!(self.class)
+    }
+
+    /// 获取driver字段
+    ///
+    /// 当weak指针的strong count为0的时候，清除弱引用
+    pub fn get_driver_weak_or_clear(&mut self) -> Option<Weak<dyn Driver>> {
+        driver_base_macros::get_weak_or_clear!(self.driver)
     }
 }
 

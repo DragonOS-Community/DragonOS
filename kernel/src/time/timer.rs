@@ -148,6 +148,11 @@ impl Timer {
             .for_each(drop);
         true
     }
+
+    /// ## 更新定时器触发状态
+    pub fn restart(&self){
+        self.inner().triggered = false;
+    }
 }
 
 /// 定时器类型

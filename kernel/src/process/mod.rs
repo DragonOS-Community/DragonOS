@@ -1,9 +1,5 @@
 use core::{
-    hash::Hash,
-    hint::spin_loop,
-    intrinsics::{likely, unlikely},
-    mem::ManuallyDrop,
-    sync::atomic::{compiler_fence, AtomicBool, AtomicIsize, AtomicUsize, Ordering},
+    hash::Hash, hint::spin_loop, intrinsics::{likely, unlikely}, mem::ManuallyDrop, result, sync::atomic::{compiler_fence, AtomicBool, AtomicIsize, AtomicUsize, Ordering}
 };
 
 use alloc::{
@@ -59,6 +55,8 @@ use crate::{
     },
     syscall::{user_access::clear_user, Syscall},
 };
+use timer::{AlarmTimer, AlarmTimerFunc};
+use crate::libs::mutex::Mutex;
 
 use self::kthread::WorkerPrivate;
 
@@ -132,6 +130,7 @@ impl ProcessManager {
 
         unsafe { __PROCESS_MANAGEMENT_INIT_DONE = true };
         kinfo!("Process Manager initialized.");
+
     }
 
     fn init_switch_result() {
@@ -598,6 +597,9 @@ pub struct ProcessControlBlock {
 
     /// 线程信息
     thread: RwLock<ThreadInfo>,
+
+    ///闹钟定时器
+    alarm_timer: Mutex<AlarmTimer>,
 }
 
 impl ProcessControlBlock {
@@ -621,6 +623,16 @@ impl ProcessControlBlock {
     pub fn new_idle(cpu_id: u32, kstack: KernelStack) -> Arc<Self> {
         let name = format!("idle-{}", cpu_id);
         return Self::do_create_pcb(name, kstack, true);
+    }
+
+    //初始化目标进程的alarm定时器
+    pub fn alarm_timer_init(pid: Pid) -> Mutex<AlarmTimer> {
+        //初始化发送信号
+        let sig = Signal::SIGALRM;
+        //初始化Timerfunc
+        let timerfunc = AlarmTimerFunc::new(pid);
+        let result = AlarmTimer::new(timerfunc, 1);
+        result
     }
 
     #[inline(never)]
@@ -663,6 +675,7 @@ impl ProcessControlBlock {
             children: RwLock::new(Vec::new()),
             wait_queue: WaitQueue::default(),
             thread: RwLock::new(ThreadInfo::new()),
+            alarm_timer: ProcessControlBlock::alarm_timer_init(pid),
         };
 
         // 初始化系统调用栈

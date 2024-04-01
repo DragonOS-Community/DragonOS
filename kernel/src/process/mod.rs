@@ -919,6 +919,11 @@ impl ProcessControlBlock {
     pub fn sig_struct_irqsave(&self) -> SpinLockGuard<SignalStruct> {
         self.sig_struct.lock_irqsave()
     }
+
+    //返回闹钟定时器
+    pub fn ref_alarm_timer(&self) -> Mutex<AlarmTimer>{
+        return self.alarm_timer;
+    }
 }
 
 impl Drop for ProcessControlBlock {

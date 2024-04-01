@@ -9,10 +9,7 @@ use crate::time::timer::{clock, InnerTimer, Timer, TimerFunction};
 use crate::libs::spinlock::SpinLockGuard;
 use crate::arch::CurrentTimeArch;
 use crate::process::Pid;
-use core::{
-    ffi::c_int,
-    sync::atomic::compiler_fence,
-};
+use core::sync::atomic::compiler_fence;
 use std::sync::Mutex;
 use crate::process::SigInfo;
 #[derive(Debug)]
@@ -56,12 +53,12 @@ impl AlarmTimer {
 
     //返回闹钟定时器剩余时间
     pub fn remain(&self) -> u64{
-        // if self.timeout() {
-        //     0
-        // }
-        // else {
-        //     let now_time = clock();
-        // }
+        if self.timeout() {
+            0
+        }
+        else {
+            let now_time = clock();
+        }
         0
     }
 

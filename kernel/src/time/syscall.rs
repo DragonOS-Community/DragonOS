@@ -6,6 +6,7 @@ use system_error::SystemError;
 use crate::{
     syscall::{user_access::UserBufferWriter, Syscall},
     time::{sleep::nanosleep, TimeSpec},
+    process::ProcessManager,
 };
 
 use super::timekeeping::{do_gettimeofday, getnstimeofday};
@@ -147,5 +148,24 @@ impl Syscall {
         tp_buf.copy_one_to_user(&timespec, 0)?;
 
         return Ok(0);
+    }
+
+    pub fn alarm(second: u32) -> Result<usize, SystemError>{
+        let current_pcd = ProcessManager::current_pcb();
+        let mut alarm_timer = {
+            let pcd = current_pcd.as_ref();
+            pcd.ref_alarm_timer().lock()
+        };
+        let remain_time = alarm_timer.remain();
+        if second == 0 {
+            //clear timer
+            alarm_timer.inner().expire_jiffies = 0;
+            return Ok(remain_time as usize);
+        } 
+
+        //这里的second是以jiddies为单位
+        //Todo：秒转换成jiddies
+        alarm_timer.reset(second as u64);
+        Ok(remain_time as usize)
     }
 }

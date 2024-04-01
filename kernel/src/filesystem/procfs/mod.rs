@@ -287,11 +287,7 @@ impl FileSystem for ProcFS {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
-<<<<<<< HEAD
-    fn name(&self)->&str {
-=======
     fn name(&self) -> &str {
->>>>>>> refs/remotes/origin/master
         "procfs"
     }
 }

@@ -48,11 +48,7 @@ impl FileSystem for KernFS {
         return self.root_inode.clone();
     }
 
-<<<<<<< HEAD
-    fn name(&self)->&str {
-=======
     fn name(&self) -> &str {
->>>>>>> refs/remotes/origin/master
         "kernfs"
     }
 }

@@ -77,11 +77,7 @@ impl FileSystem for RamFS {
         self
     }
 
-<<<<<<< HEAD
-    fn name(&self)->&str {
-=======
     fn name(&self) -> &str {
->>>>>>> refs/remotes/origin/master
         "ramfs"
     }
 }

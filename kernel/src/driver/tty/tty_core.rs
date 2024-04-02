@@ -430,7 +430,7 @@ impl TtyCoreData {
         {
             // 先查看是否有已经保存的termios
             if let Some(t) = driver.saved_termios().get(tty_index) {
-                let mut termios = t.clone();
+                let mut termios = *t;
                 termios.line = driver.init_termios().line;
                 self.set_termios(termios);
             }

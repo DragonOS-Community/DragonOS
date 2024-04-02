@@ -110,8 +110,7 @@ impl TtyLdiscManager {
         }
 
         // 处理PTY
-        if o_tty.is_some() {
-            let o_tty = o_tty.unwrap();
+        if let Some(o_tty) = o_tty {
             let ld = o_tty.ldisc();
 
             let ret: Result<(), SystemError> = ld.open(o_tty.clone());

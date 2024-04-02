@@ -37,7 +37,7 @@ lazy_static! {
             Major::UNIX98_PTY_MASTER_MAJOR,
             0,
             TtyDriverType::Pty,
-            TTY_STD_TERMIOS.clone(),
+            *TTY_STD_TERMIOS,
             Arc::new(Unix98PtyDriverInner::new()),
         );
 
@@ -59,7 +59,7 @@ lazy_static! {
             Major::UNIX98_PTY_SLAVE_MAJOR,
             0,
             TtyDriverType::Pty,
-            TTY_STD_TERMIOS.clone(),
+            *TTY_STD_TERMIOS,
             Arc::new(Unix98PtyDriverInner::new()),
         );
 

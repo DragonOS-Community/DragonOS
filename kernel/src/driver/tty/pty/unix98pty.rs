@@ -158,7 +158,7 @@ impl TtyOperation for Unix98PtyDriverInner {
             return PTS_DRIVER
                 .ttys()
                 .get(&index)
-                .map(|x| x.clone())
+                .cloned()
                 .ok_or(SystemError::ENODEV);
         }
 

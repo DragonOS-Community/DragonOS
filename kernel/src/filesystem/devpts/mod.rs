@@ -243,10 +243,8 @@ impl IndexNode for LockedDevPtsFSInode {
         let mut metadata = result.metadata()?;
 
         metadata.mode.insert(ModeType::S_IFCHR);
-        metadata.raw_dev = DeviceNumber::new(
-            Major::UNIX98_PTY_SLAVE_MAJOR,
-            u32::from_str_radix(name, 10).unwrap(),
-        );
+        metadata.raw_dev =
+            DeviceNumber::new(Major::UNIX98_PTY_SLAVE_MAJOR, name.parse::<u32>().unwrap());
 
         result.set_metadata(&metadata)?;
 

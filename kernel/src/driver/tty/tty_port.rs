@@ -38,6 +38,12 @@ pub struct TtyPortData {
     internal_tty: Weak<TtyCore>,
 }
 
+impl Default for TtyPortData {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TtyPortData {
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::channel::<u8>(TTY_PORT_BUFSIZE);

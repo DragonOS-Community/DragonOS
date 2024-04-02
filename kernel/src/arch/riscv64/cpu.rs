@@ -53,7 +53,7 @@ pub(super) fn local_context() -> &'static PerCpuVar<LocalContext> {
 ///
 /// - 从用户态进入内核态时，会从sscratch寄存器加载这个结构体的地址到tp寄存器，并把sscratch寄存器清零
 /// - 从内核态进入用户态时，会将tp寄存器的值保存到sscratch寄存器
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(super) struct LocalContext {
     /// 当前cpu的id
     pub current_cpu: ProcessorId,
@@ -64,7 +64,7 @@ pub(super) struct LocalContext {
 }
 
 impl LocalContext {
-    fn new(cpu: ProcessorId) -> Self {
+    pub fn new(cpu: ProcessorId) -> Self {
         Self {
             current_cpu: cpu,
             kernel_sp: 0,
@@ -101,6 +101,13 @@ impl LocalContext {
 
         // 写入tp寄存器
         riscv::register::tp::write(ptr);
+    }
+
+    pub fn restore(&mut self, from: &LocalContext) {
+        // 不恢复cpu id
+
+        self.kernel_sp = from.kernel_sp;
+        self.user_sp = from.user_sp;
     }
 }
 

@@ -5,7 +5,7 @@ use crate::{
     driver::serial::serial8250::send_to_default_serial8250_port,
     filesystem::procfs::kmsg::kmsg_init,
     libs::printk::PrintkWriter,
-    mm::{mmio_buddy::mmio_init, page::page_manager_init},
+    mm::{allocator::slab::slab_init, mmio_buddy::mmio_init, page::page_manager_init},
 };
 
 use super::MemoryManagementArch;
@@ -42,6 +42,9 @@ pub unsafe fn mm_init() {
     }
 
     MMArch::init();
+
+    // init slab
+    slab_init();
 
     // enable mmio
     mmio_init();

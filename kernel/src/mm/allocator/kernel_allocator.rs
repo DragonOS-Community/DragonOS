@@ -13,7 +13,10 @@ use core::{
     ptr::NonNull,
 };
 
-use super::page_frame::{FrameAllocator, PageFrameCount};
+use super::{
+    page_frame::{FrameAllocator, PageFrameCount},
+    slab::{slab_init_state, SLABALLOCATOR},
+};
 
 /// 类kmalloc的分配器应当实现的trait
 pub trait LocalAlloc {
@@ -59,64 +62,133 @@ impl KernelAllocator {
 /// 为内核分配器实现LocalAlloc的trait
 impl LocalAlloc for KernelAllocator {
     unsafe fn local_alloc(&self, layout: Layout) -> *mut u8 {
-        return self
-            .alloc_in_buddy(layout)
-            .map(|x| x.as_mut_ptr())
-            .unwrap_or(core::ptr::null_mut());
+        if layout.size() > 2048 || slab_init_state() == false {
+            return self
+                .alloc_in_buddy(layout)
+                .map(|x| x.as_mut_ptr() as *mut u8)
+                .unwrap_or(core::ptr::null_mut() as *mut u8);
+        } else {
+            if let Some(ref mut slab) = *SLABALLOCATOR.lock_irqsave() {
+                return slab.allocate(layout);
+            };
+            return core::ptr::null_mut() as *mut u8;
+        }
     }
 
     unsafe fn local_alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        return self
-            .alloc_in_buddy(layout)
-            .map(|x| {
-                let ptr: *mut u8 = x.as_mut_ptr();
-                core::ptr::write_bytes(ptr, 0, x.len());
-                ptr
-            })
-            .unwrap_or(core::ptr::null_mut());
+        if layout.size() > 2048 || slab_init_state() == false {
+            return self
+                .alloc_in_buddy(layout)
+                .map(|x| {
+                    let ptr: *mut u8 = x.as_mut_ptr();
+                    core::ptr::write_bytes(ptr, 0, x.len());
+                    ptr
+                })
+                .unwrap_or(core::ptr::null_mut() as *mut u8);
+        } else {
+            if let Some(ref mut slab) = *SLABALLOCATOR.lock_irqsave() {
+                return slab.allocate(layout);
+            };
+            return core::ptr::null_mut() as *mut u8;
+        }
     }
 
     unsafe fn local_dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.free_in_buddy(ptr, layout);
+        // self.free_in_buddy(ptr, layout)
+        if layout.size() > 2048 || slab_init_state() == false {
+            self.free_in_buddy(ptr, layout)
+        } else {
+            if let Some(ref mut slab) = *SLABALLOCATOR.lock_irqsave() {
+                slab.deallocate(ptr, layout).unwrap()
+            }
+        }
     }
 }
 
 /// 为内核slab分配器实现GlobalAlloc特性
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let r = self.local_alloc_zeroed(layout);
-        mm_debug_log(
-            klog_types::AllocatorLogType::Alloc(AllocLogItem::new(layout, Some(r as usize), None)),
-            klog_types::LogSource::Buddy,
-        );
+        if layout.size() > 2048 || slab_init_state() == false {
+            let r = self.local_alloc_zeroed(layout);
+            mm_debug_log(
+                klog_types::AllocatorLogType::Alloc(AllocLogItem::new(
+                    layout.clone(),
+                    Some(r as usize),
+                    None,
+                )),
+                klog_types::LogSource::Buddy,
+            );
 
-        return r;
+            return r;
+        } else {
+            let r = self.local_alloc_zeroed(layout);
+            mm_debug_log(
+                klog_types::AllocatorLogType::Alloc(AllocLogItem::new(
+                    layout.clone(),
+                    Some(r as usize),
+                    None,
+                )),
+                klog_types::LogSource::Slab,
+            );
 
-        // self.local_alloc_zeroed(layout, 0)
+            return r;
+        }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let r = self.local_alloc_zeroed(layout);
+        if layout.size() > 2048 || slab_init_state() == false {
+            let r = self.local_alloc_zeroed(layout);
 
-        mm_debug_log(
-            klog_types::AllocatorLogType::AllocZeroed(AllocLogItem::new(
-                layout,
-                Some(r as usize),
-                None,
-            )),
-            klog_types::LogSource::Buddy,
-        );
+            mm_debug_log(
+                klog_types::AllocatorLogType::AllocZeroed(AllocLogItem::new(
+                    layout.clone(),
+                    Some(r as usize),
+                    None,
+                )),
+                klog_types::LogSource::Buddy,
+            );
 
-        return r;
+            return r;
+        } else {
+            let r = self.local_alloc_zeroed(layout);
+
+            mm_debug_log(
+                klog_types::AllocatorLogType::AllocZeroed(AllocLogItem::new(
+                    layout.clone(),
+                    Some(r as usize),
+                    None,
+                )),
+                klog_types::LogSource::Slab,
+            );
+
+            return r;
+        }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        mm_debug_log(
-            klog_types::AllocatorLogType::Free(AllocLogItem::new(layout, Some(ptr as usize), None)),
-            klog_types::LogSource::Buddy,
-        );
+        if layout.size() > 2048 || slab_init_state() == false {
+            mm_debug_log(
+                klog_types::AllocatorLogType::Free(AllocLogItem::new(
+                    layout.clone(),
+                    Some(ptr as usize),
+                    None,
+                )),
+                klog_types::LogSource::Buddy,
+            );
 
-        self.local_dealloc(ptr, layout);
+            self.local_dealloc(ptr, layout);
+        } else {
+            mm_debug_log(
+                klog_types::AllocatorLogType::Free(AllocLogItem::new(
+                    layout.clone(),
+                    Some(ptr as usize),
+                    None,
+                )),
+                klog_types::LogSource::Slab,
+            );
+
+            self.local_dealloc(ptr, layout);
+        }
     }
 }
 

@@ -1,123 +1,79 @@
 //! 当前slab分配器暂时不使用，等待后续完善后合并主线
 #![allow(dead_code)]
 
-use core::alloc::Layout;
+use core::{alloc::Layout, ptr::NonNull};
 
-// 定义Slab，用来存放空闲块
-pub struct Slab {
-    block_size: usize,
-    free_block_list: FreeBlockList,
+use alloc::boxed::Box;
+use slabmalloc::*;
+
+use crate::libs::spinlock::SpinLock;
+
+// 全局slab分配器
+pub(crate) static SLABALLOCATOR: SpinLock<Option<SlabAllocator>> = SpinLock::new(None);
+
+// slab初始化状态
+pub(crate) static mut SLABINITSTATE: bool = false;
+
+/// slab分配器，实际为一堆小的allocator，可以在里面装4K的page
+/// 利用这些allocator可以为对象分配不同大小的空间
+pub(crate) struct SlabAllocator {
+    zone: ZoneAllocator<'static>,
 }
 
-impl Slab {
-    /// @brief: 初始化一个slab
-    /// @param {usize} start_addr
-    /// @param {usize} slab_size
-    /// @param {usize} block_size
-    pub unsafe fn new(start_addr: usize, slab_size: usize, block_size: usize) -> Slab {
-        let blocks_num = slab_size / block_size;
-        return Slab {
-            block_size,
-            free_block_list: FreeBlockList::new(start_addr, block_size, blocks_num),
-        };
-    }
-
-    /// @brief: 获取slab中可用的block数
-    pub fn used_blocks(&self) -> usize {
-        return self.free_block_list.len();
-    }
-
-    /// @brief: 扩大free_block_list
-    /// @param {*} mut
-    /// @param {usize} start_addr
-    /// @param {usize} slab_size
-    pub fn grow(&mut self, start_addr: usize, slab_size: usize) {
-        let num_of_blocks = slab_size / self.block_size;
-        let mut block_list =
-            unsafe { FreeBlockList::new(start_addr, self.block_size, num_of_blocks) };
-        // 将新链表接到原链表的后面
-        while let Some(block) = block_list.pop() {
-            self.free_block_list.push(block);
+impl SlabAllocator {
+    /// 创建slab分配器
+    pub fn new() -> SlabAllocator {
+        kdebug!("trying to new a slab_allocator");
+        SlabAllocator {
+            zone: ZoneAllocator::new(),
         }
     }
-    /// @brief: 从slab中分配一个block
-    /// @return 分配的内存地址
-    pub fn allocate(&mut self, _layout: Layout) -> Option<*mut u8> {
-        match self.free_block_list.pop() {
-            Some(block) => return Some(block.addr() as *mut u8),
-            None => return None,
+
+    /// 为对象（2K以内）分配内存空间
+    pub(crate) unsafe fn allocate(&mut self, layout: Layout) -> *mut u8 {
+        match self.zone.allocate(layout) {
+            Ok(nptr) => nptr.as_ptr(),
+            Err(AllocationError::OutOfMemory) => {
+                let page = ObjectPage::new();
+                let boxed_page = Box::new(page);
+                let leaked_page = Box::leak(boxed_page);
+                self.zone
+                    .refill(layout, leaked_page)
+                    .expect("Could not refill?");
+                self.zone
+                    .allocate(layout)
+                    .expect("Should succeed after refill")
+                    .as_ptr()
+            }
+            Err(AllocationError::InvalidLayout) => panic!("Can't allocate this size"),
         }
     }
-    /// @brief: 将block归还给slab
-    pub fn free(&mut self, ptr: *mut u8) {
-        let ptr = ptr as *mut FreeBlock;
-        unsafe {
-            self.free_block_list.push(&mut *ptr);
+
+    /// 释放内存空间
+    pub(crate) unsafe fn deallocate(
+        &mut self,
+        ptr: *mut u8,
+        layout: Layout,
+    ) -> Result<(), AllocationError> {
+        if let Some(nptr) = NonNull::new(ptr) {
+            self.zone
+                .deallocate(nptr, layout)
+                .expect("Couldn't deallocate");
+            return Ok(());
+        } else {
+            return Ok(());
         }
     }
 }
-/// slab中的空闲块
-struct FreeBlockList {
-    len: usize,
-    head: Option<&'static mut FreeBlock>,
+
+/// 初始化slab分配器
+pub unsafe fn slab_init() {
+    kdebug!("trying to init a slab_allocator");
+    *SLABALLOCATOR.lock() = Some(SlabAllocator::new());
+    SLABINITSTATE = true;
 }
 
-impl FreeBlockList {
-    unsafe fn new(start_addr: usize, block_size: usize, num_of_blocks: usize) -> FreeBlockList {
-        let mut new_list = FreeBlockList::new_empty();
-        for i in (0..num_of_blocks).rev() {
-            // 从后往前分配，避免内存碎片
-            let new_block = (start_addr + i * block_size) as *mut FreeBlock;
-            new_list.push(&mut *new_block);
-        }
-        return new_list;
-    }
-
-    fn new_empty() -> FreeBlockList {
-        return FreeBlockList { len: 0, head: None };
-    }
-
-    fn len(&self) -> usize {
-        return self.len;
-    }
-
-    /// @brief: 将空闲块从链表中弹出
-    fn pop(&mut self) -> Option<&'static mut FreeBlock> {
-        // 从链表中弹出一个空闲块
-        let block = self.head.take().map(|node| {
-            self.head = node.next.take();
-            self.len -= 1;
-            node
-        });
-        return block;
-    }
-
-    /// @brief: 将空闲块压入链表
-    fn push(&mut self, free_block: &'static mut FreeBlock) {
-        free_block.next = self.head.take();
-        self.len += 1;
-        self.head = Some(free_block);
-    }
-
-    fn is_empty(&self) -> bool {
-        return self.head.is_none();
-    }
-}
-
-impl Drop for FreeBlockList {
-    fn drop(&mut self) {
-        while self.pop().is_some() {}
-    }
-}
-
-struct FreeBlock {
-    next: Option<&'static mut FreeBlock>,
-}
-
-impl FreeBlock {
-    /// @brief: 获取FreeBlock的地址
-    /// @return {*}
-    fn addr(&self) -> usize {
-        return self as *const _ as usize;
-    }
+// 查看slab初始化状态
+pub fn slab_init_state() -> bool {
+    unsafe { SLABINITSTATE }
 }

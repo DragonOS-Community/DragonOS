@@ -1,0 +1,16 @@
+[package]
+name = "slabmalloc"
+version = "0.11.0"
+edition = "2018"
+
+[features]
+unstable = []
+default = [ "unstable" ]
+
+[dependencies]
+log = "0.4"
+
+[target.'cfg(unix)'.dev-dependencies]
+rand = "0.8"
+env_logger = "0.9"
+spin = "0.9.8"

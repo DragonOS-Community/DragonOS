@@ -34,6 +34,7 @@ pub struct MountFS {
 
 /// @brief MountFS的Index Node 注意，这个IndexNode只是一个中间层。它的目的是将具体文件系统的Inode与挂载机制连接在一起。
 #[derive(Debug)]
+#[cast_to([sync] IndexNode)]
 pub struct MountFSInode {
     /// 当前挂载点对应到具体的文件系统的Inode
     inner_inode: Arc<dyn IndexNode>,
@@ -88,6 +89,10 @@ impl MountFS {
     pub fn inner_filesystem(&self) -> Arc<dyn FileSystem> {
         return self.inner_filesystem.clone();
     }
+
+    pub fn self_ref(&self) -> Arc<Self> {
+        self.self_ref.upgrade().unwrap()
+    }
 }
 
 impl MountFSInode {
@@ -131,6 +136,25 @@ impl MountFSInode {
         } else {
             return self.self_ref.upgrade().unwrap();
         }
+    }
+
+    /// 将新的挂载点-挂载文件系统添加到父级的挂载树
+    pub(super) fn do_mount(
+        &self,
+        inode_id: InodeId,
+        new_mount_fs: Arc<MountFS>,
+    ) -> Result<(), SystemError> {
+        let mut guard = self.mount_fs.mountpoints.lock();
+        if guard.contains_key(&inode_id) {
+            return Err(SystemError::EBUSY);
+        }
+        guard.insert(inode_id, new_mount_fs);
+
+        return Ok(());
+    }
+
+    pub(super) fn inode_id(&self) -> InodeId {
+        self.metadata().map(|x| x.inode_id).unwrap()
     }
 }
 
@@ -345,11 +369,7 @@ impl IndexNode for MountFSInode {
 
         // 为新的挂载点创建挂载文件系统
         let new_mount_fs: Arc<MountFS> = MountFS::new(fs, Some(self.self_ref.upgrade().unwrap()));
-        // 将新的挂载点-挂载文件系统添加到父级的挂载树
-        self.mount_fs
-            .mountpoints
-            .lock()
-            .insert(metadata.inode_id, new_mount_fs.clone());
+        self.do_mount(metadata.inode_id, new_mount_fs.clone())?;
         return Ok(new_mount_fs);
     }
 

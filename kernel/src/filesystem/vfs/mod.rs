@@ -8,6 +8,7 @@ mod utils;
 
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};
+use intertrait::CastFromSync;
 use system_error::SystemError;
 
 use crate::{
@@ -114,7 +115,7 @@ bitflags! {
     }
 }
 
-pub trait IndexNode: Any + Sync + Send + Debug {
+pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 打开文件
     ///
     /// @return 成功：Ok()

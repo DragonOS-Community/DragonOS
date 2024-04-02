@@ -29,7 +29,7 @@ use crate::{
         vfs::{file::FileMode, syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata},
     },
     init::initcall::INITCALL_DEVICE,
-    libs::rwlock::RwLock,
+    libs::rwlock::{RwLock, RwLockWriteGuard},
     mm::VirtAddr,
     net::event_poll::{EPollItem, EventPoll},
     process::ProcessManager,
@@ -38,10 +38,11 @@ use crate::{
 
 use super::{
     kthread::tty_flush_thread_init,
+    pty::unix98pty::ptmx_open,
     sysfs::sys_class_tty_instance,
     termios::WindowSize,
     tty_core::{TtyCore, TtyFlag, TtyIoctlCmd},
-    tty_driver::{TtyDriver, TtyDriverSubType, TtyDriverType, TtyOperation},
+    tty_driver::{TtyDriver, TtyDriverManager, TtyDriverSubType, TtyDriverType, TtyOperation},
     tty_job_control::TtyJobCtrlManager,
     virtual_terminal::vty_init,
 };
@@ -72,13 +73,30 @@ impl InnerTtyDevice {
             metadata: Metadata::new(FileType::CharDevice, ModeType::from_bits_truncate(0o755)),
         }
     }
+
+    pub fn metadata_mut(&mut self) -> &mut Metadata {
+        &mut self.metadata
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum TtyType {
+    Tty,
+    Pty(PtyType),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum PtyType {
+    Ptm,
+    Pts,
 }
 
 #[derive(Debug)]
 #[cast_to([sync] Device)]
 pub struct TtyDevice {
-    name: &'static str,
+    name: String,
     id_table: IdTable,
+    tty_type: TtyType,
     inner: RwLock<InnerTtyDevice>,
     kobj_state: LockedKObjectState,
     /// TTY所属的文件系统
@@ -86,7 +104,7 @@ pub struct TtyDevice {
 }
 
 impl TtyDevice {
-    pub fn new(name: &'static str, id_table: IdTable) -> Arc<TtyDevice> {
+    pub fn new(name: String, id_table: IdTable, tty_type: TtyType) -> Arc<TtyDevice> {
         let dev_num = id_table.device_number();
         let dev = TtyDevice {
             name,
@@ -94,11 +112,16 @@ impl TtyDevice {
             inner: RwLock::new(InnerTtyDevice::new()),
             kobj_state: LockedKObjectState::new(None),
             fs: RwLock::new(Weak::default()),
+            tty_type,
         };
 
         dev.inner.write().metadata.raw_dev = dev_num;
 
         Arc::new(dev)
+    }
+
+    pub fn inner_write(&self) -> RwLockWriteGuard<InnerTtyDevice> {
+        self.inner.write()
     }
 }
 
@@ -108,9 +131,15 @@ impl IndexNode for TtyDevice {
         data: &mut crate::filesystem::vfs::FilePrivateData,
         mode: &crate::filesystem::vfs::file::FileMode,
     ) -> Result<(), SystemError> {
+        if self.tty_type == TtyType::Pty(PtyType::Ptm) {
+            return ptmx_open(data, mode);
+        }
         let dev_num = self.metadata()?.raw_dev;
 
-        let tty = TtyDriver::open_tty(dev_num)?;
+        let (index, driver) =
+            TtyDriverManager::lookup_tty_driver(dev_num).ok_or(SystemError::ENODEV)?;
+
+        let tty = TtyDriver::open_tty(index, driver)?;
 
         // 设置privdata
         *data = FilePrivateData::Tty(TtyFilePrivateData {
@@ -151,7 +180,7 @@ impl IndexNode for TtyDevice {
         data: &mut crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, system_error::SystemError> {
         let (tty, mode) = if let FilePrivateData::Tty(tty_priv) = data {
-            (tty_priv.tty.clone(), tty_priv.mode)
+            (tty_priv.tty(), tty_priv.mode)
         } else {
             return Err(SystemError::EIO);
         };
@@ -192,11 +221,10 @@ impl IndexNode for TtyDevice {
     ) -> Result<usize, system_error::SystemError> {
         let mut count = len;
         let (tty, mode) = if let FilePrivateData::Tty(tty_priv) = data {
-            (tty_priv.tty.clone(), tty_priv.mode)
+            (tty_priv.tty(), tty_priv.mode)
         } else {
             return Err(SystemError::EIO);
         };
-
         let ld = tty.ldisc();
         let core = tty.core();
         let mut chunk = 2048;
@@ -239,7 +267,7 @@ impl IndexNode for TtyDevice {
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
-        todo!()
+        self
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
@@ -250,8 +278,21 @@ impl IndexNode for TtyDevice {
         Ok(self.inner.read().metadata.clone())
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
+        let mut guard = self.inner_write();
+        guard.metadata = metadata.clone();
+
         Ok(())
+    }
+
+    fn close(&self, data: &mut FilePrivateData) -> Result<(), SystemError> {
+        let (tty, _mode) = if let FilePrivateData::Tty(tty_priv) = data {
+            (tty_priv.tty(), tty_priv.mode)
+        } else {
+            return Err(SystemError::EIO);
+        };
+
+        return tty.close(tty.clone());
     }
 
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
@@ -260,7 +301,7 @@ impl IndexNode for TtyDevice {
 
     fn ioctl(&self, cmd: u32, arg: usize, data: &FilePrivateData) -> Result<usize, SystemError> {
         let (tty, _) = if let FilePrivateData::Tty(tty_priv) = data {
-            (tty_priv.tty.clone(), tty_priv.mode)
+            (tty_priv.tty(), tty_priv.mode)
         } else {
             return Err(SystemError::EIO);
         };
@@ -485,8 +526,14 @@ impl CharDevice for TtyDevice {
 
 #[derive(Debug, Clone)]
 pub struct TtyFilePrivateData {
-    tty: Arc<TtyCore>,
-    mode: FileMode,
+    pub tty: Arc<TtyCore>,
+    pub mode: FileMode,
+}
+
+impl TtyFilePrivateData {
+    pub fn tty(&self) -> Arc<TtyCore> {
+        self.tty.clone()
+    }
 }
 
 /// 初始化tty设备和console子设备
@@ -494,19 +541,21 @@ pub struct TtyFilePrivateData {
 #[inline(never)]
 pub fn tty_init() -> Result<(), SystemError> {
     let tty = TtyDevice::new(
-        "tty0",
+        "tty0".to_string(),
         IdTable::new(
             String::from("tty0"),
             Some(DeviceNumber::new(Major::TTY_MAJOR, 0)),
         ),
+        TtyType::Tty,
     );
 
     let console = TtyDevice::new(
-        "console",
+        "console".to_string(),
         IdTable::new(
             String::from("console"),
             Some(DeviceNumber::new(Major::TTYAUX_MAJOR, 1)),
         ),
+        TtyType::Tty,
     );
 
     // 注册tty设备
@@ -536,8 +585,8 @@ pub fn tty_init() -> Result<(), SystemError> {
     // 将这两个设备注册到devfs，TODO：这里console设备应该与tty在一个设备group里面
     device_register(tty.clone())?;
     device_register(console.clone())?;
-    devfs_register(tty.name, tty)?;
-    devfs_register(console.name, console)?;
+    devfs_register(&tty.name.clone(), tty)?;
+    devfs_register(&console.name.clone(), console)?;
 
     serial_init()?;
 

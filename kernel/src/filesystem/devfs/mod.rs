@@ -147,6 +147,10 @@ impl DevFS {
                 if name.starts_with("tty") && name.len() > 3 {
                     dev_root_inode.add_dev(name, device.clone())?;
                 }
+                // ptmx设备
+                if name == "ptmx" {
+                    dev_root_inode.add_dev(name, device.clone())?;
+                }
                 device.set_fs(dev_char_inode.0.lock().fs.clone());
             }
             FileType::BlockDevice => {

@@ -1,36 +1,29 @@
 use core::{fmt::Debug, sync::atomic::Ordering};
 
-use alloc::{
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::sync::{Arc, Weak};
 use kdepends::thingbuf::mpsc;
 use system_error::SystemError;
 
-use crate::{
-    driver::tty::virtual_terminal::MAX_NR_CONSOLES,
-    libs::spinlock::{SpinLock, SpinLockGuard},
+use crate::libs::spinlock::{SpinLock, SpinLockGuard};
+
+use super::{
+    tty_core::TtyCore,
+    virtual_terminal::{virtual_console::CURRENT_VCNUM, VIRT_CONSOLES},
 };
 
-use super::{tty_core::TtyCore, virtual_terminal::virtual_console::CURRENT_VCNUM};
-
 const TTY_PORT_BUFSIZE: usize = 4096;
-
-lazy_static! {
-    pub static ref TTY_PORTS: Vec<Arc<dyn TtyPort>> = {
-        let mut v: Vec<Arc<dyn TtyPort>> = Vec::with_capacity(MAX_NR_CONSOLES as usize);
-        for _ in 0..MAX_NR_CONSOLES as usize {
-            v.push(Arc::new(DefaultTtyPort::new()))
-        }
-
-        v
-    };
-}
 
 /// 获取当前tty port
 #[inline]
 pub fn current_tty_port() -> Arc<dyn TtyPort> {
-    TTY_PORTS[CURRENT_VCNUM.load(Ordering::SeqCst) as usize].clone()
+    VIRT_CONSOLES[CURRENT_VCNUM.load(Ordering::SeqCst) as usize]
+        .lock_irqsave()
+        .port()
+}
+
+#[inline]
+pub fn tty_port(index: usize) -> Arc<dyn TtyPort> {
+    VIRT_CONSOLES[index].lock_irqsave().port()
 }
 
 #[allow(dead_code)]
@@ -41,6 +34,8 @@ pub struct TtyPortData {
     sender: mpsc::Sender<u8>,
     receiver: mpsc::Receiver<u8>,
     tty: Weak<TtyCore>,
+    /// 内部tty，即与port直接相连的
+    internal_tty: Weak<TtyCore>,
 }
 
 impl TtyPortData {
@@ -52,11 +47,12 @@ impl TtyPortData {
             sender,
             receiver,
             tty: Weak::new(),
+            internal_tty: Weak::new(),
         }
     }
 
-    pub fn tty(&self) -> Option<Arc<TtyCore>> {
-        self.tty.upgrade()
+    pub fn internal_tty(&self) -> Option<Arc<TtyCore>> {
+        self.internal_tty.upgrade()
     }
 }
 
@@ -80,13 +76,13 @@ pub trait TtyPort: Sync + Send + Debug {
     }
 
     /// 为port设置tty
-    fn setup_tty(&self, tty: Weak<TtyCore>) {
-        self.port_data().tty = tty;
+    fn setup_internal_tty(&self, tty: Weak<TtyCore>) {
+        self.port_data().internal_tty = tty;
     }
 
     /// 作为客户端的tty ports接收数据
     fn receive_buf(&self, buf: &[u8], _flags: &[u8], count: usize) -> Result<usize, SystemError> {
-        let tty = self.port_data().tty.upgrade().unwrap();
+        let tty = self.port_data().internal_tty().unwrap();
 
         let ld = tty.ldisc();
 

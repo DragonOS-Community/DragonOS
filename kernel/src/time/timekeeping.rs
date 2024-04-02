@@ -1,5 +1,6 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{compiler_fence, AtomicBool, AtomicI64, Ordering};
+use system_error::SystemError;
 
 use crate::{
     arch::CurrentIrqArch,
@@ -204,6 +205,13 @@ pub fn do_gettimeofday() -> PosixTimeval {
         tv_sec: tp.tv_sec,
         tv_usec: (tp.tv_nsec / 1000) as i32,
     };
+}
+
+pub fn do_settimeofday64(time: TimeSpec) -> Result<(), SystemError> {
+    timekeeper().0.write_irqsave().xtime = time;
+    // todo: 模仿linux，实现时间误差校准。
+    // https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/time/timekeeping.c?fi=do_settimeofday64#1312
+    return Ok(());
 }
 
 /// # 初始化timekeeping模块

@@ -10,6 +10,7 @@ use crate::{
     driver::{
         base::{
             char::CharDevice,
+            class::Class,
             device::{
                 bus::Bus,
                 device_number::{DeviceNumber, Major},
@@ -37,6 +38,7 @@ use crate::{
 
 use super::{
     kthread::tty_flush_thread_init,
+    sysfs::sys_class_tty_instance,
     termios::WindowSize,
     tty_core::{TtyCore, TtyFlag, TtyIoctlCmd},
     tty_driver::{TtyDriver, TtyDriverSubType, TtyDriverType, TtyOperation},
@@ -421,12 +423,22 @@ impl Device for TtyDevice {
         self.id_table.clone()
     }
 
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
+        self.inner.read().bus.clone()
+    }
+
     fn set_bus(&self, bus: Option<alloc::sync::Weak<dyn crate::driver::base::device::bus::Bus>>) {
         self.inner.write().bus = bus
     }
 
-    fn set_class(&self, _class: Option<Arc<dyn crate::driver::base::class::Class>>) {
-        todo!()
+    fn set_class(&self, _class: Option<Weak<dyn crate::driver::base::class::Class>>) {
+        // do nothing
+    }
+
+    fn class(&self) -> Option<Arc<dyn Class>> {
+        sys_class_tty_instance()
+            .cloned()
+            .map(|x| x as Arc<dyn Class>)
     }
 
     fn driver(&self) -> Option<Arc<dyn crate::driver::base::device::driver::Driver>> {

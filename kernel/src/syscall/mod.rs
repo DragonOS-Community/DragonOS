@@ -6,7 +6,7 @@ use core::{
 
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
-    filesystem::vfs::syscall::PosixStatx,
+    filesystem::vfs::syscall::{PosixStatfs, PosixStatx},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::syscall::MremapFlags,
     net::syscall::MsgHdr,
@@ -344,6 +344,7 @@ impl Syscall {
                 Self::rmdir(path)
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_LINK => {
                 let old = args[0] as *const u8;
                 let new = args[1] as *const u8;
@@ -719,6 +720,18 @@ impl Syscall {
                 let path = args[0] as *const u8;
                 let kstat = args[1] as *mut PosixKstat;
                 Self::stat(path, kstat)
+            }
+
+            SYS_STATFS => {
+                let path = args[0] as *const u8;
+                let statfs = args[1] as *mut PosixStatfs;
+                Self::statfs(path, statfs)
+            }
+
+            SYS_FSTATFS => {
+                let fd = args[0] as i32;
+                let statfs = args[1] as *mut PosixStatfs;
+                Self::fstatfs(fd, statfs)
             }
 
             SYS_STATX => {

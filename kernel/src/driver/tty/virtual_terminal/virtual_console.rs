@@ -26,10 +26,12 @@ lazy_static! {
     /// 是否已经添加了软光标
     pub(super) static ref SOFTCURSOR_ORIGINAL: RwLock<Option<VcCursor>> = RwLock::new(None);
 
-    pub static ref CURRENT_VCNUM: AtomicIsize = AtomicIsize::new(-1);
 
-    pub static ref CONSOLE_BLANKED: AtomicBool = AtomicBool::new(false);
 }
+
+pub static CURRENT_VCNUM: AtomicIsize = AtomicIsize::new(-1);
+
+pub static CONSOLE_BLANKED: AtomicBool = AtomicBool::new(false);
 
 /// ## 虚拟控制台的信息
 #[derive(Debug, Clone)]
@@ -347,7 +349,7 @@ impl VirtualConsoleData {
     /// !!! 注意，该函数返回true时，元组的第一个数据是无效数据（未转换完成）
     fn translate_unicode(&mut self, c: u32) -> (Option<u32>, bool) {
         // 收到的字符不是首个
-        if (c & 0xc8) == 0x80 {
+        if (c & 0xc0) == 0x80 {
             // 已经不需要继续的字符了，说明这个字符是非法的
             if self.utf_count == 0 {
                 return (Some(0xfffd), false);

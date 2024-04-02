@@ -43,6 +43,8 @@ impl AlarmTimer {
         let mut timer = self.inner();
         timer.expire_jiffies = new_expired_time;
         self.timer.restart();
+        //重新插入到定时器列表
+        self.timer.activate();
         drop(timer);
     }
 
@@ -84,7 +86,7 @@ impl TimerFunction for AlarmTimerFunc {
             return Err(SystemError::EINVAL);
         }
         // 初始化signal info
-        let mut info = SigInfo::new(sig, 0, SigCode::User, SigType::Alarm(self.pid));
+        let mut info = SigInfo::new(sig, 0, SigCode::Timer, SigType::Alarm(self.pid));
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 

@@ -627,11 +627,12 @@ impl ProcessControlBlock {
 
     //初始化目标进程的alarm定时器
     pub fn alarm_timer_init(pid: Pid) -> Mutex<AlarmTimer> {
-        //初始化发送信号
-        let sig = Signal::SIGALRM;
         //初始化Timerfunc
         let timerfunc = AlarmTimerFunc::new(pid);
-        let result = AlarmTimer::new(timerfunc, 1);
+        let result = AlarmTimer::new(timerfunc, 0);
+        let alarm = result.lock();
+        alarm.activate();
+        drop(alarm);
         result
     }
 
@@ -921,8 +922,8 @@ impl ProcessControlBlock {
     }
 
     //返回闹钟定时器
-    pub fn ref_alarm_timer(&self) -> Mutex<AlarmTimer>{
-        return self.alarm_timer;
+    pub fn ref_alarm_timer(&self) -> &Mutex<AlarmTimer>{
+        return &self.alarm_timer;
     }
 }
 

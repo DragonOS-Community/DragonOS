@@ -5,12 +5,11 @@ use alloc::{
 use system_error::SystemError;
 use crate::arch::ipc::signal::{Signal,SigCode};
 use crate::ipc::signal_types::SigType;
-use crate::time::timer::{clock, InnerTimer, Timer, TimerFunction};
+use crate::time::timer::{clock, timer_jiffies_n_s, InnerTimer, Timer, TimerFunction};
 use crate::libs::spinlock::SpinLockGuard;
-use crate::arch::CurrentTimeArch;
 use crate::process::Pid;
 use core::sync::atomic::compiler_fence;
-use std::sync::Mutex;
+use crate::libs::mutex::Mutex;
 use crate::process::SigInfo;
 #[derive(Debug)]
 pub struct AlarmTimer{
@@ -39,10 +38,6 @@ impl AlarmTimer {
         return self.timer.timeout();
     }
 
-    pub fn cancel(&self) -> bool {
-        return self.timer.cancel();
-    }
-
     //重启定时器
     pub fn reset(&self, new_expired_time: u64){
         let mut timer = self.inner();
@@ -51,15 +46,18 @@ impl AlarmTimer {
         drop(timer);
     }
 
-    //返回闹钟定时器剩余时间
+    //返回闹钟定时器剩余时间（单位是jiffies）
     pub fn remain(&self) -> u64{
-        if self.timeout() {
+        if self.timeout() || self.inner().expire_jiffies == 0{
             0
         }
         else {
             let now_time = clock();
+            let end_time = self.expired_time;
+            let remain_jiffies = end_time - now_time;
+            let second = timer_jiffies_n_s(remain_jiffies);
+            second
         }
-        0
     }
 
 }
@@ -92,7 +90,7 @@ impl TimerFunction for AlarmTimerFunc {
 
         let retval = sig
             .send_signal_info(Some(&mut info), self.pid)
-            .map(|x| x as usize);
+            .map(|x| x as usize)?;
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         Ok(())

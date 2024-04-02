@@ -9,7 +9,7 @@ use crate::{
     process::ProcessManager,
 };
 
-use super::timekeeping::{do_gettimeofday, getnstimeofday};
+use super::{timekeeping::{do_gettimeofday, getnstimeofday}, timer::{next_n_ms_timer_jiffies, timer_jiffies_n_s}};
 
 pub type PosixTimeT = c_longlong;
 pub type PosixSusecondsT = c_int;
@@ -150,22 +150,20 @@ impl Syscall {
         return Ok(0);
     }
 
-    pub fn alarm(second: u32) -> Result<usize, SystemError>{
+    pub fn alarm(second: u64) -> Result<usize, SystemError>{
         let current_pcd = ProcessManager::current_pcb();
-        let mut alarm_timer = {
-            let pcd = current_pcd.as_ref();
-            pcd.ref_alarm_timer().lock()
-        };
+        let alarm_timer = current_pcd.as_ref().ref_alarm_timer().lock();
         let remain_time = alarm_timer.remain();
+        let remain_second = timer_jiffies_n_s(remain_time);
         if second == 0 {
             //clear timer
             alarm_timer.inner().expire_jiffies = 0;
-            return Ok(remain_time as usize);
+            return Ok(remain_second as usize);
         } 
-
         //这里的second是以jiddies为单位
         //Todo：秒转换成jiddies
-        alarm_timer.reset(second as u64);
-        Ok(remain_time as usize)
+        let new_expired_time = next_n_ms_timer_jiffies(second * 1_000);
+        alarm_timer.reset(new_expired_time);
+        Ok(remain_second as usize)
     }
 }

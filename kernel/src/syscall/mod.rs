@@ -1005,7 +1005,7 @@ impl Syscall {
             }
 
             SYS_ALARM => {
-                let second = args[0] as u32;
+                let second = args[0] as u64;
                 Self::alarm(second)
             }
 

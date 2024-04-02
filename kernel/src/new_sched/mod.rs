@@ -895,7 +895,12 @@ pub fn __schedule(sched_mod: SchedMode) {
 
         // CurrentApic.send_eoi();
         compiler_fence(Ordering::SeqCst);
-        unsafe { ProcessManager::switch_process(prev, next) };
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            ProcessManager::switch_process(prev, next)
+        };
+        #[cfg(target_arch = "riscv64")]
+        todo!()
     } else {
         kwarn!(
             "!!!switch_process {} {:?} to self ",

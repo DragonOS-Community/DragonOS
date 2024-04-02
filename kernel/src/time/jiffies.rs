@@ -7,14 +7,17 @@ use system_error::SystemError;
 use crate::{kerror, kinfo, libs::spinlock::SpinLock};
 
 use super::{
-    clocksource::{Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum, HZ},
+    clocksource::{
+        Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum, HZ,
+        PIT_TICK_RATE,
+    },
     timer::clock,
     NSEC_PER_SEC,
 };
 lazy_static! {
     pub static ref DEFAULT_CLOCK: Arc<ClocksourceJiffies> = ClocksourceJiffies::new();
 }
-pub const CLOCK_TICK_RATE: u32 = 1193182;
+pub const CLOCK_TICK_RATE: u32 = PIT_TICK_RATE;
 pub const JIFFIES_SHIFT: u32 = 8;
 pub const LATCH: u32 = (CLOCK_TICK_RATE + (HZ as u32) / 2) / HZ as u32;
 pub const ACTHZ: u32 = sh_div(CLOCK_TICK_RATE, LATCH, 8);

@@ -46,6 +46,8 @@ pub const WATCHDOG_INTERVAL: u64 = HZ >> 1;
 /// 最大能接受的误差大小
 pub const WATCHDOG_THRESHOLD: u32 = NSEC_PER_SEC >> 4;
 
+pub const PIT_TICK_RATE: u32 = 1193182;
+
 // 时钟周期数
 #[derive(Debug, Clone, Copy)]
 #[repr(transparent)]

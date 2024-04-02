@@ -5,6 +5,7 @@ use core::{
 
 use crate::{
     arch::{mm::LockedFrameAllocator, MMArch},
+    libs::spinlock::SpinLockGuard,
     mm::{MemoryManagementArch, PhysAddr, VirtAddr},
 };
 
@@ -348,8 +349,20 @@ pub unsafe fn allocate_page_frames(count: PageFrameCount) -> Option<(PhysAddr, P
 ///
 /// @param frame 要释放的第一个页帧
 /// @param count 要释放的页帧数量 (必须是2的n次幂)
-pub unsafe fn deallocate_page_frames(frame: PhysPageFrame, count: PageFrameCount) {
+pub unsafe fn deallocate_page_frames(
+    frame: PhysPageFrame,
+    count: PageFrameCount,
+    page_manager: &mut SpinLockGuard<'_, crate::mm::page::PageManager>,
+) {
     unsafe {
         LockedFrameAllocator.free(frame.phys_address(), count);
+    }
+
+    // 将已回收的物理页面对应的Page从PAGE_MANAGER中删去
+    let mut frame = frame;
+    for _ in 0..count.data() {
+        let paddr = frame.phys_address();
+        page_manager.remove_page(&paddr);
+        frame = frame.next();
     }
 }

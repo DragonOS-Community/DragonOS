@@ -344,6 +344,7 @@ impl Syscall {
                 Self::rmdir(path)
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_LINK => {
                 let old = args[0] as *const u8;
                 let new = args[1] as *const u8;

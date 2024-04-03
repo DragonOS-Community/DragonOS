@@ -2,11 +2,15 @@ use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
 };
+use intertrait::cast::CastArc;
+use system_error::SystemError;
 
 use crate::{
     driver::base::{device::bus::Bus, subsys::SubSysPrivate},
     filesystem::sysfs::AttributeGroup,
 };
+
+use super::{pci_device::PciDevice, pci_driver::PciDriver};
 #[derive(Debug)]
 pub struct PciBus {
     private: SubSysPrivate,
@@ -70,10 +74,29 @@ impl Bus for PciBus {
 
     fn match_device(
         &self,
-        _device: &Arc<dyn crate::driver::base::device::Device>,
-        _driver: &Arc<dyn crate::driver::base::device::driver::Driver>,
-    ) -> Result<bool, system_error::SystemError> {
-        todo!()
+        device: &Arc<dyn crate::driver::base::device::Device>,
+        driver: &Arc<dyn crate::driver::base::device::driver::Driver>,
+    ) -> Result<bool, SystemError> {
+        let pci_driver=driver.clone().cast::<dyn PciDriver>().map_err(|_|{
+            return SystemError::EINVAL;
+        })?;
+        let pci_dev=device.clone().cast::<dyn PciDevice>().map_err(|_|{
+            return SystemError::EINVAL;
+        })?;
+        for i in pci_driver.locked_dynid_list()?.iter(){
+            if i.match_dev(&pci_dev){
+                return Ok(true)
+            }
+        };
+//todo:这里似乎需要一个driver_override_only的支持，但是目前不清楚driver_override_only 的用途，故暂时参考platform总线的match方法
+//override_only相关代码在 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/pci/pci-driver.c#159
+        if let Some(driver_id_table) = driver.id_table(){
+            if driver_id_table.name().eq(&pci_dev.name()){
+                return Ok(true);
+            }
+        };
+        return Ok(pci_dev.name().eq(&pci_driver.name()));
+
     }
 }
 

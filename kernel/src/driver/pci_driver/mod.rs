@@ -13,6 +13,7 @@ use super::base::{
 pub mod pci_device;
 pub mod pci_driver;
 pub mod subsys;
+pub mod dev_id;
 static mut PCI_BUS_DEVICE: Option<Arc<PciBusDevice>> = None;
 static mut PCI_BUS: Option<Arc<PciBus>> = None;
 

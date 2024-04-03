@@ -18,7 +18,7 @@ use crate::{
 
 
 
-use super::{pci_bus_device, subsys::PciBus};
+use super::{dev_id::PciDeviceID, pci_bus_device, subsys::PciBus};
 
 
 pub struct PciDeviceManager;
@@ -45,6 +45,7 @@ impl PciDeviceManager{
 
 pub trait PciDevice: Device {
     fn pci_bus(&self) -> PciBus;
+    fn dynid(&self)->PciDeviceID;
 }
 #[derive(Debug)]
 #[cast_to([sync] Device)]

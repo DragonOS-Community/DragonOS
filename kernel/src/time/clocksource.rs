@@ -1,15 +1,29 @@
 use core::{
-    ffi::c_void,
     fmt::Debug,
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use alloc::{boxed::Box, collections::LinkedList, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::LinkedList,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use lazy_static::__Deref;
 use system_error::SystemError;
+use unified_init::macros::unified_init;
 
 use crate::{
-    include::bindings::bindings::run_watchdog_kthread, kdebug, kinfo, libs::spinlock::SpinLock,
+    arch::{sched::sched, CurrentIrqArch},
+    exception::InterruptArch,
+    init::initcall::INITCALL_LATE,
+    kdebug, kinfo,
+    libs::spinlock::SpinLock,
+    process::{
+        kthread::{KernelThreadClosure, KernelThreadMechanism},
+        ProcessControlBlock, ProcessManager,
+    },
 };
 
 use super::{
@@ -33,6 +47,8 @@ lazy_static! {
 
 }
 
+static mut WATCHDOG_KTHREAD: Option<Arc<ProcessControlBlock>> = None;
+
 /// 正在被使用时钟源
 pub static CUR_CLOCKSOURCE: SpinLock<Option<Arc<dyn Clocksource>>> = SpinLock::new(None);
 /// 是否完成加载
@@ -46,21 +62,18 @@ pub const WATCHDOG_INTERVAL: u64 = HZ >> 1;
 /// 最大能接受的误差大小
 pub const WATCHDOG_THRESHOLD: u32 = NSEC_PER_SEC >> 4;
 
-pub const PIT_TICK_RATE: u32 = 1193182;
-
 // 时钟周期数
 #[derive(Debug, Clone, Copy)]
-#[repr(transparent)]
-pub struct CycleNum(pub u64);
+pub struct CycleNum(u64);
 
 #[allow(dead_code)]
 impl CycleNum {
     #[inline(always)]
-    pub fn new(cycle: u64) -> Self {
+    pub const fn new(cycle: u64) -> Self {
         Self(cycle)
     }
     #[inline(always)]
-    pub fn data(&self) -> u64 {
+    pub const fn data(&self) -> u64 {
         self.0
     }
     #[inline(always)]
@@ -142,7 +155,7 @@ impl ClocksouceWatchdog {
     /// 启用检查器
     pub fn clocksource_start_watchdog(&mut self) {
         // 如果watchdog未被设置或者已经启用了就退出
-        let watchdog_list = &WATCHDOG_LIST.lock();
+        let watchdog_list = WATCHDOG_LIST.lock_irqsave();
         if self.is_running || self.watchdog.is_none() || watchdog_list.is_empty() {
             return;
         }
@@ -288,7 +301,7 @@ impl dyn Clocksource {
     pub fn clocksource_enqueue(&self) {
         // 根据rating由大到小排序
         let cs_data = self.clocksource_data();
-        let list_guard = &mut CLOCKSOURCE_LIST.lock();
+        let mut list_guard = CLOCKSOURCE_LIST.lock();
         let mut spilt_pos: usize = 0;
         for (pos, ele) in list_guard.iter().enumerate() {
             if ele.clocksource_data().rating < cs_data.rating {
@@ -342,12 +355,12 @@ impl dyn Clocksource {
             }
 
             // 将时钟源加入到监控队列中
-            let mut list_guard = WATCHDOG_LIST.lock();
+            let mut list_guard = WATCHDOG_LIST.lock_irqsave();
             list_guard.push_back(cs.clone());
             drop(list_guard);
 
             // 对比当前注册的时间源的精度和监视器的精度
-            let cs_watchdog = &mut CLOCKSOUCE_WATCHDOG.lock();
+            let mut cs_watchdog = CLOCKSOUCE_WATCHDOG.lock_irqsave();
             if cs_watchdog.watchdog.is_none()
                 || cs_data.rating
                     > cs_watchdog
@@ -391,7 +404,7 @@ impl dyn Clocksource {
         // 启动watchdog线程 进行后续处理
         if unsafe { FINISHED_BOOTING.load(Ordering::Relaxed) } {
             // TODO 在实现了工作队列后，将启动线程换成schedule work
-            unsafe { run_watchdog_kthread() }
+            run_watchdog_kthread();
         }
         return Ok(0);
     }
@@ -399,14 +412,14 @@ impl dyn Clocksource {
     /// # 将时间源从监视链表中弹出
     fn clocksource_dequeue_watchdog(&self) {
         let data = self.clocksource_data();
-        let mut locked_watchdog = CLOCKSOUCE_WATCHDOG.lock();
+        let mut locked_watchdog = CLOCKSOUCE_WATCHDOG.lock_irqsave();
         let watchdog = locked_watchdog
             .get_watchdog()
             .clone()
             .unwrap()
             .clocksource_data();
 
-        let mut list = WATCHDOG_LIST.lock();
+        let mut list = WATCHDOG_LIST.lock_irqsave();
         let mut size = list.len();
 
         let mut del_pos: usize = size;
@@ -656,10 +669,12 @@ pub fn clocksource_suspend() {
 /// * `Ok()` - 检查完成
 /// * `Err(SystemError)` - 错误码
 pub fn clocksource_watchdog() -> Result<(), SystemError> {
-    let mut cs_watchdog = CLOCKSOUCE_WATCHDOG.lock();
+    let mut cs_watchdog = CLOCKSOUCE_WATCHDOG.lock_irqsave();
+    // kdebug!("clocksource_watchdog start");
 
     // watchdog没有在运行的话直接退出
     if !cs_watchdog.is_running || cs_watchdog.watchdog.is_none() {
+        // kdebug!("is_running = {:?},watchdog = {:?}", cs_watchdog.is_running, cs_watchdog.watchdog);
         return Ok(());
     }
     let cur_watchdog = cs_watchdog.watchdog.as_ref().unwrap().clone();
@@ -674,7 +689,7 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
     );
     cs_watchdog.last_check = CycleNum(cur_wd_nowclock);
     drop(cs_watchdog);
-    let watchdog_list = &mut WATCHDOG_LIST.lock();
+    let watchdog_list = WATCHDOG_LIST.lock_irqsave();
     for cs in watchdog_list.iter() {
         let mut cs_data = cs.clocksource_data();
         // 判断时钟源是否已经被标记为不稳定
@@ -682,8 +697,9 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
             .flags
             .contains(ClocksourceFlags::CLOCK_SOURCE_UNSTABLE)
         {
+            // kdebug!("clocksource_watchdog unstable");
             // 启动watchdog_kthread
-            unsafe { run_watchdog_kthread() };
+            run_watchdog_kthread();
             continue;
         }
         // 读取时钟源现在的时间
@@ -694,6 +710,7 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
             .flags
             .contains(ClocksourceFlags::CLOCK_SOURCE_WATCHDOG)
         {
+            // kdebug!("clocksource_watchdog start watch");
             cs_data
                 .flags
                 .insert(ClocksourceFlags::CLOCK_SOURCE_WATCHDOG);
@@ -702,7 +719,7 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
             cs.update_clocksource_data(cs_data.clone())?;
             continue;
         }
-
+        // kdebug!("cs_data.watchdog_last = {:?},cs_now_clock = {:?}", cs_data.watchdog_last, cs_now_clock);
         // 计算时钟源的误差
         let cs_dev_nsec = clocksource_cyc2ns(
             CycleNum(cs_now_clock.div(cs_data.watchdog_last).data() & cs_data.mask.bits),
@@ -713,10 +730,12 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
         cs_data.watchdog_last = cs_now_clock;
         cs.update_clocksource_data(cs_data.clone())?;
         if cs_dev_nsec.abs_diff(wd_dev_nsec) > WATCHDOG_THRESHOLD.into() {
+            // kdebug!("set_unstable");
             // 误差过大，标记为unstable
             cs.set_unstable((cs_dev_nsec - wd_dev_nsec).try_into().unwrap())?;
             continue;
         }
+        // kdebug!("clocksource_watchdog aaa");
 
         // 判断是否要切换为高精度模式
         if !cs_data
@@ -735,22 +754,25 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
             cs.update_clocksource_data(cs_data)?;
             // TODO 通知tick机制 切换为高精度模式
         }
-        let mut cs_watchdog = CLOCKSOUCE_WATCHDOG.lock();
-        // FIXME 需要保证所有cpu时间统一
-        cs_watchdog.timer_expires += WATCHDOG_INTERVAL;
-        //创建定时器执行watchdog
-        let watchdog_func = Box::new(WatchdogTimerFunc {});
-        let watchdog_timer = Timer::new(watchdog_func, cs_watchdog.timer_expires);
-        watchdog_timer.activate();
     }
+    create_new_watchdog_timer_function();
     return Ok(());
 }
 
-/// # watchdog线程的逻辑，执行unstable的后续操作
-pub fn clocksource_watchdog_kthread() {
+fn create_new_watchdog_timer_function() {
+    let mut cs_watchdog = CLOCKSOUCE_WATCHDOG.lock_irqsave();
+
+    cs_watchdog.timer_expires += WATCHDOG_INTERVAL;
+    //创建定时器执行watchdog
+    let watchdog_func = Box::new(WatchdogTimerFunc {});
+    let watchdog_timer = Timer::new(watchdog_func, cs_watchdog.timer_expires);
+    watchdog_timer.activate();
+}
+
+fn __clocksource_watchdog_kthread() {
     let mut del_vec: Vec<usize> = Vec::new();
     let mut del_clocks: Vec<Arc<dyn Clocksource>> = Vec::new();
-    let wd_list = &mut WATCHDOG_LIST.lock();
+    let mut wd_list = WATCHDOG_LIST.lock_irqsave();
 
     // 将不稳定的时钟源弹出监视链表
     for (pos, ele) in wd_list.iter().enumerate() {
@@ -768,17 +790,48 @@ pub fn clocksource_watchdog_kthread() {
 
     // 检查是否需要停止watchdog
     CLOCKSOUCE_WATCHDOG
-        .lock()
+        .lock_irqsave()
         .clocksource_stop_watchdog(wd_list.len());
-    // 将不稳定的时钟源精度都设置为最低
+    drop(wd_list);
+    // 将不稳定的时钟源精度都设置为最低，然后删除unstable标记
     for clock in del_clocks.iter() {
         clock.clocksource_change_rating(0);
+        let mut data = clock.clocksource_data();
+        data.watchdog_last = clock.read();
+        kdebug!("kthread: watchdog_last = {:?}", data.watchdog_last);
+        data.flags.remove(ClocksourceFlags::CLOCK_SOURCE_UNSTABLE);
+        clock
+            .update_clocksource_data(data)
+            .expect("clocksource_watchdog_kthread: failed to update clocksource data");
+
+        // 重新插入监视链表
+        clock
+            .clocksource_enqueue_watchdog()
+            .expect("clocksource_watchdog_kthread: failed to enqueue watchdog list");
     }
+
+}
+
+/// # watchdog线程的逻辑，执行unstable的后续操作
+pub fn clocksource_watchdog_kthread() -> i32 {
+    // return 0;
+    loop {
+        // kdebug!("clocksource_watchdog_kthread start");
+        __clocksource_watchdog_kthread();
+        if KernelThreadMechanism::should_stop(&ProcessManager::current_pcb()) {
+            break;
+        }
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        ProcessManager::mark_sleep(true).expect("clocksource_watchdog_kthread:mark sleep failed");
+        drop(irq_guard);
+        sched();
+    }
+    return 0;
 }
 
 /// # 清空所有时钟源的watchdog标志位
 pub fn clocksource_reset_watchdog() {
-    let list_guard = WATCHDOG_LIST.lock();
+    let list_guard = WATCHDOG_LIST.lock_irqsave();
     for ele in list_guard.iter() {
         ele.clocksource_data()
             .flags
@@ -833,15 +886,28 @@ pub fn clocksource_boot_finish() {
     cur_clocksource.replace(clocksource_default_clock());
     unsafe { FINISHED_BOOTING.store(true, Ordering::Relaxed) };
     // 清除不稳定的时钟源
-    clocksource_watchdog_kthread();
+    __clocksource_watchdog_kthread();
     kdebug!("clocksource_boot_finish");
 }
 
-// ======== 以下为对C的接口 ========
+fn run_watchdog_kthread() {
+    if let Some(watchdog_kthread) = unsafe { WATCHDOG_KTHREAD.clone() } {
+        ProcessManager::wakeup(&watchdog_kthread).ok();
+    }
+}
 
-/// # 启动watchdog线程的辅助函数
-#[no_mangle]
-pub extern "C" fn rs_clocksource_watchdog_kthread(_data: c_void) -> i32 {
-    clocksource_watchdog_kthread();
-    return 0;
+#[unified_init(INITCALL_LATE)]
+pub fn init_watchdog_kthread() -> Result<(), SystemError> {
+    assert!(CurrentIrqArch::is_irq_enabled());
+    let closure = KernelThreadClosure::StaticEmptyClosure((
+        &(clocksource_watchdog_kthread as fn() -> i32),
+        (),
+    ));
+    let pcb = KernelThreadMechanism::create_and_run(closure, "clocksource watchdog".to_string())
+        .ok_or(SystemError::EPERM)?;
+    unsafe {
+        WATCHDOG_KTHREAD.replace(pcb);
+    }
+
+    return Ok(());
 }

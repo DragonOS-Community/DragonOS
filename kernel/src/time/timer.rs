@@ -6,8 +6,8 @@ use core::{
 
 use alloc::{
     boxed::Box,
-    collections::LinkedList,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use system_error::SystemError;
 
@@ -29,7 +29,7 @@ const TIMER_RUN_CYCLE_THRESHOLD: usize = 20;
 static TIMER_JIFFIES: AtomicU64 = AtomicU64::new(0);
 
 lazy_static! {
-    pub static ref TIMER_LIST: SpinLock<LinkedList<Arc<Timer>>> = SpinLock::new(LinkedList::new());
+    pub static ref TIMER_LIST: SpinLock<Vec<(u64, Arc<Timer>)>> = SpinLock::new(Vec::new());
 }
 
 /// 定时器要执行的函数的特征
@@ -96,8 +96,10 @@ impl Timer {
         // 链表为空，则直接插入
         if timer_list.is_empty() {
             // FIXME push_timer
-
-            timer_list.push_back(inner_guard.self_ref.upgrade().unwrap());
+            timer_list.push((
+                inner_guard.expire_jiffies,
+                inner_guard.self_ref.upgrade().unwrap(),
+            ));
 
             drop(inner_guard);
             drop(timer_list);
@@ -105,17 +107,21 @@ impl Timer {
 
             return;
         }
+        let expire_jiffies = inner_guard.expire_jiffies;
+        let self_arc = inner_guard.self_ref.upgrade().unwrap();
+        drop(inner_guard);
         let mut split_pos: usize = 0;
         for (pos, elt) in timer_list.iter().enumerate() {
-            if elt.inner().expire_jiffies > inner_guard.expire_jiffies {
+            if Arc::ptr_eq(&self_arc, &elt.1) {
+                kwarn!("Timer already in list");
+            }
+            if elt.0 > expire_jiffies {
                 split_pos = pos;
                 break;
             }
         }
-        let mut temp_list: LinkedList<Arc<Timer>> = timer_list.split_off(split_pos);
-        timer_list.push_back(inner_guard.self_ref.upgrade().unwrap());
-        timer_list.append(&mut temp_list);
-        drop(inner_guard);
+        timer_list.insert(split_pos, (expire_jiffies, self_arc));
+
         drop(timer_list);
     }
 
@@ -144,7 +150,7 @@ impl Timer {
         let this_arc = self.inner().self_ref.upgrade().unwrap();
         TIMER_LIST
             .lock_irqsave()
-            .extract_if(|x| Arc::ptr_eq(&this_arc, x))
+            .extract_if(|x| Arc::ptr_eq(&this_arc, &x.1))
             .for_each(drop);
         true
     }
@@ -204,26 +210,13 @@ impl SoftirqVec for DoTimerSoftirq {
                 break;
             }
 
-            let timer_list_front = timer_list.pop_front().unwrap();
+            let (front_jiffies, timer_list_front) = timer_list.first().unwrap().clone();
             // kdebug!("to lock timer_list_front");
-            let mut timer_list_front_guard = None;
-            for _ in 0..10 {
-                let x = timer_list_front.inner.try_lock_irqsave();
-                if x.is_err() {
-                    continue;
-                }
-                timer_list_front_guard = Some(x.unwrap());
-            }
-            if timer_list_front_guard.is_none() {
-                continue;
-            }
-            let timer_list_front_guard = timer_list_front_guard.unwrap();
-            if timer_list_front_guard.expire_jiffies > TIMER_JIFFIES.load(Ordering::SeqCst) {
-                drop(timer_list_front_guard);
-                timer_list.push_front(timer_list_front);
+
+            if front_jiffies >= TIMER_JIFFIES.load(Ordering::SeqCst) {
                 break;
             }
-            drop(timer_list_front_guard);
+            timer_list.remove(0);
             drop(timer_list);
             timer_list_front.run();
         }
@@ -307,7 +300,7 @@ pub fn timer_get_first_expire() -> Result<u64, SystemError> {
                     return Ok(0);
                 } else {
                     // kdebug!("timer_list not empty");
-                    return Ok(timer_list.front().unwrap().inner().expire_jiffies);
+                    return Ok(timer_list.first().unwrap().0);
                 }
             }
             // 加锁失败返回啥？？
@@ -318,8 +311,6 @@ pub fn timer_get_first_expire() -> Result<u64, SystemError> {
 }
 
 /// 更新系统时间片
-///
-/// todo: 这里的实现有问题，貌似把HPET的500us当成了500个jiffies，然后update_wall_time()里面也硬编码了这个500us
 pub fn update_timer_jiffies(add_jiffies: u64, time_us: i64) -> u64 {
     let prev = TIMER_JIFFIES.fetch_add(add_jiffies, Ordering::SeqCst);
     compiler_fence(Ordering::SeqCst);

@@ -95,7 +95,7 @@ static __always_inline void __pop_usage_stack(struct hid_parser *parser)
     if (parser->usage_size > 0)
     {
         for (int js = 0; js < parser->usage_size - 1; ++js)
-            memmove(&parser->usage_table[js], &parser->usage_table[js + 1], sizeof(struct hid_node_t));
+            c_memmove(&parser->usage_table[js], &parser->usage_table[js + 1], sizeof(struct hid_node_t));
 
         --parser->usage_size;
     }

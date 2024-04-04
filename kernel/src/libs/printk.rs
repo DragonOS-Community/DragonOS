@@ -90,7 +90,7 @@ impl PrintkWriter {
         if current_vcnum != -1 {
             // tty已经初始化了之后才输出到屏幕
             let port = tty_port(current_vcnum as usize);
-            let tty = port.port_data().tty();
+            let tty = port.port_data().internal_tty();
             if let Some(tty) = tty {
                 let _ = tty.write(tty.core(), s.as_bytes(), s.len());
             } else {

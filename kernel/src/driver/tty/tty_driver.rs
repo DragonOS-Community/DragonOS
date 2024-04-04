@@ -1,8 +1,8 @@
-use core::{fmt::Debug, sync::atomic::Ordering};
+use core::fmt::Debug;
 
 use alloc::{
     string::{String, ToString},
-    sync::Arc,
+    sync::{Arc, Weak},
     vec::Vec,
 };
 use hashbrown::HashMap;
@@ -20,38 +20,46 @@ use crate::{
         },
         tty::tty_port::TtyPortState,
     },
-    libs::spinlock::SpinLock,
+    libs::{
+        rwlock::RwLock,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
 };
 
 use super::{
     termios::Termios,
     tty_core::{TtyCore, TtyCoreData},
     tty_ldisc::TtyLdiscManager,
-    tty_port::tty_port,
-    virtual_terminal::virtual_console::CURRENT_VCNUM,
+    tty_port::{DefaultTtyPort, TtyPort},
 };
 
 lazy_static! {
-    static ref TTY_DRIVERS: SpinLock<Vec<Arc<TtyDriver>>> = SpinLock::new(Vec::new());
+    pub static ref TTY_DRIVERS: SpinLock<Vec<Arc<TtyDriver>>> = SpinLock::new(Vec::new());
+}
+
+pub enum TtyDriverPrivateData {
+    Unused,
+    /// true表示主设备 false表示从设备
+    Pty(bool),
 }
 
 pub struct TtyDriverManager;
 impl TtyDriverManager {
     pub fn lookup_tty_driver(dev_num: DeviceNumber) -> Option<(usize, Arc<TtyDriver>)> {
         let drivers_guard = TTY_DRIVERS.lock();
-        for (index, driver) in drivers_guard.iter().enumerate() {
+        for driver in drivers_guard.iter() {
             let base = DeviceNumber::new(driver.major, driver.minor_start);
             if dev_num < base || dev_num.data() > base.data() + driver.device_count {
                 continue;
             }
-            return Some((index, driver.clone()));
+            return Some(((dev_num.data() - base.data()) as usize, driver.clone()));
         }
 
         None
     }
 
     /// ## 注册驱动
-    pub fn tty_register_driver(mut driver: TtyDriver) -> Result<(), SystemError> {
+    pub fn tty_register_driver(mut driver: TtyDriver) -> Result<Arc<TtyDriver>, SystemError> {
         // 查看是否注册设备号
         if driver.major == Major::UNNAMED_MAJOR {
             let dev_num = CharDevOps::alloc_chardev_region(
@@ -69,11 +77,12 @@ impl TtyDriverManager {
         driver.flags |= TtyDriverFlag::TTY_DRIVER_INSTALLED;
 
         // 加入全局TtyDriver表
-        TTY_DRIVERS.lock().push(Arc::new(driver));
+        let driver = Arc::new(driver);
+        TTY_DRIVERS.lock().push(driver.clone());
 
         // TODO: 加入procfs?
 
-        Ok(())
+        Ok(driver)
     }
 }
 
@@ -104,11 +113,13 @@ pub struct TtyDriver {
     /// 驱动程序标志
     flags: TtyDriverFlag,
     /// pty链接此driver的入口
-    pty: Option<Arc<TtyDriver>>,
+    other_pty_driver: RwLock<Weak<TtyDriver>>,
     /// 具体类型的tty驱动方法
     driver_funcs: Arc<dyn TtyOperation>,
     /// 管理的tty设备列表
     ttys: SpinLock<HashMap<usize, Arc<TtyCore>>>,
+    /// 管理的端口列表
+    ports: RwLock<Vec<Arc<dyn TtyPort>>>,
     // procfs入口?
 }
 
@@ -124,6 +135,10 @@ impl TtyDriver {
         default_termios: Termios,
         driver_funcs: Arc<dyn TtyOperation>,
     ) -> Self {
+        let mut ports: Vec<Arc<dyn TtyPort>> = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            ports.push(Arc::new(DefaultTtyPort::new()))
+        }
         TtyDriver {
             driver_name: Default::default(),
             name: node_name,
@@ -135,10 +150,11 @@ impl TtyDriver {
             tty_driver_sub_type: Default::default(),
             init_termios: default_termios,
             flags: TtyDriverFlag::empty(),
-            pty: Default::default(),
+            other_pty_driver: Default::default(),
             driver_funcs,
             ttys: SpinLock::new(HashMap::new()),
             saved_termios: Vec::with_capacity(count as usize),
+            ports: RwLock::new(ports),
         }
     }
 
@@ -163,33 +179,64 @@ impl TtyDriver {
     }
 
     #[inline]
+    pub fn init_termios(&self) -> Termios {
+        self.init_termios
+    }
+
+    #[inline]
+    pub fn init_termios_mut(&mut self) -> &mut Termios {
+        &mut self.init_termios
+    }
+
+    #[inline]
+    pub fn other_pty_driver(&self) -> Option<Arc<TtyDriver>> {
+        self.other_pty_driver.read().upgrade()
+    }
+
+    pub fn set_other_pty_driver(&self, driver: Weak<TtyDriver>) {
+        *self.other_pty_driver.write() = driver
+    }
+
+    #[inline]
+    pub fn set_subtype(&mut self, tp: TtyDriverSubType) {
+        self.tty_driver_sub_type = tp;
+    }
+
+    #[inline]
+    pub fn ttys(&self) -> SpinLockGuard<HashMap<usize, Arc<TtyCore>>> {
+        self.ttys.lock()
+    }
+
+    #[inline]
+    pub fn saved_termios(&self) -> &Vec<Termios> {
+        &self.saved_termios
+    }
+
+    #[inline]
     pub fn flags(&self) -> TtyDriverFlag {
         self.flags
     }
 
     #[inline]
-    fn lockup_tty(&self, index: usize) -> Option<Arc<TtyCore>> {
-        let device_guard = self.ttys.lock();
-        return device_guard.get(&index).cloned();
+    fn lookup_tty(&self, index: usize) -> Option<Arc<TtyCore>> {
+        let ret = self
+            .driver_funcs()
+            .lookup(index, TtyDriverPrivateData::Unused);
+        if let Err(SystemError::ENOSYS) = ret {
+            let device_guard = self.ttys.lock();
+            return device_guard.get(&index).cloned();
+        }
+        ret.ok()
     }
 
     fn standard_install(&self, tty_core: Arc<TtyCore>) -> Result<(), SystemError> {
         let tty = tty_core.core();
-        let tty_index = tty.index();
-        // 初始化termios
-        if !self.flags.contains(TtyDriverFlag::TTY_DRIVER_RESET_TERMIOS) {
-            // 先查看是否有已经保存的termios
-            if let Some(t) = self.saved_termios.get(tty_index) {
-                let mut termios = *t;
-                termios.line = self.init_termios.line;
-                tty.set_termios(termios);
-            }
-        }
+        tty.init_termios();
         // TODO:设置termios波特率？
 
         tty.add_count();
 
-        self.ttys.lock().insert(tty_index, tty_core);
+        self.ttys.lock().insert(tty.index(), tty_core);
 
         Ok(())
     }
@@ -210,7 +257,10 @@ impl TtyDriver {
         Ok(())
     }
 
-    fn init_tty_device(driver: Arc<TtyDriver>, index: usize) -> Result<Arc<TtyCore>, SystemError> {
+    pub fn init_tty_device(
+        driver: Arc<TtyDriver>,
+        index: usize,
+    ) -> Result<Arc<TtyCore>, SystemError> {
         let tty = TtyCore::new(driver.clone(), index);
 
         Self::driver_install_tty(driver.clone(), tty.clone())?;
@@ -218,9 +268,9 @@ impl TtyDriver {
         let core = tty.core();
 
         if core.port().is_none() {
-            let port = tty_port(core.index());
-            port.setup_tty(Arc::downgrade(&tty));
-            tty.set_port(port);
+            let ports = driver.ports.read();
+            ports[core.index()].setup_internal_tty(Arc::downgrade(&tty));
+            tty.set_port(ports[core.index()].clone());
         }
 
         TtyLdiscManager::ldisc_setup(tty.clone(), None)?;
@@ -229,11 +279,8 @@ impl TtyDriver {
     }
 
     /// ## 通过设备号找到对应驱动并且初始化Tty
-    pub fn open_tty(dev_num: DeviceNumber) -> Result<Arc<TtyCore>, SystemError> {
-        let (index, driver) =
-            TtyDriverManager::lookup_tty_driver(dev_num).ok_or(SystemError::ENODEV)?;
-
-        let tty = match driver.lockup_tty(index) {
+    pub fn open_tty(index: usize, driver: Arc<TtyDriver>) -> Result<Arc<TtyCore>, SystemError> {
+        let tty = match driver.lookup_tty(index) {
             Some(tty) => {
                 // TODO: 暂时这么写，因为还没写TtyPort
                 if tty.core().port().is_none() {
@@ -248,8 +295,6 @@ impl TtyDriver {
             None => Self::init_tty_device(driver, index)?,
         };
 
-        CURRENT_VCNUM.store(index as isize, Ordering::SeqCst);
-
         return Ok(tty);
     }
 
@@ -259,10 +304,6 @@ impl TtyDriver {
 
     pub fn tty_driver_sub_type(&self) -> TtyDriverSubType {
         self.tty_driver_sub_type
-    }
-
-    pub fn init_termios(&self) -> Termios {
-        self.init_termios
     }
 }
 
@@ -369,7 +410,9 @@ pub trait TtyOperation: Sync + Send + Debug {
 
     fn flush_chars(&self, tty: &TtyCoreData);
 
-    fn put_char(&self, tty: &TtyCoreData, ch: u8) -> Result<(), SystemError>;
+    fn put_char(&self, _tty: &TtyCoreData, _ch: u8) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 
     fn start(&self, _tty: &TtyCoreData) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
@@ -392,6 +435,16 @@ pub trait TtyOperation: Sync + Send + Debug {
     fn set_termios(&self, _tty: Arc<TtyCore>, _old_termios: Termios) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
+
+    fn lookup(
+        &self,
+        _index: usize,
+        _priv_data: TtyDriverPrivateData,
+    ) -> Result<Arc<TtyCore>, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
+    fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError>;
 }
 
 #[allow(dead_code)]

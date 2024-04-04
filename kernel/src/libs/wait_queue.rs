@@ -279,11 +279,17 @@ pub struct EventWaitQueue {
     wait_list: SpinLock<Vec<(u64, Arc<ProcessControlBlock>)>>,
 }
 
+impl Default for EventWaitQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[allow(dead_code)]
 impl EventWaitQueue {
     pub fn new() -> Self {
         Self {
-            wait_list: SpinLock::new(Vec::new()),
+            wait_list: SpinLock::new(Default::default()),
         }
     }
 

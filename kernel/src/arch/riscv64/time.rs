@@ -1,5 +1,8 @@
-use crate::time::TimeArch;
+use crate::time::{clocksource::HZ, TimeArch};
 pub struct RiscV64TimeArch;
+
+/// 这个是系统jiffies时钟源的固有频率（不是调频之后的）
+pub const CLOCK_TICK_RATE: u32 = HZ as u32 * 1000000;
 
 impl TimeArch for RiscV64TimeArch {
     fn get_cycles() -> usize {
@@ -9,8 +12,9 @@ impl TimeArch for RiscV64TimeArch {
     fn cal_expire_cycles(ns: usize) -> usize {
         todo!()
     }
-
-    fn get_cycles_ns() -> usize {
+    /// 将CPU的时钟周期数转换为纳秒
+    #[inline(always)]
+    fn cycles2ns(cycles: usize) -> usize {
         todo!()
     }
 }

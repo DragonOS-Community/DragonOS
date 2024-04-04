@@ -18,7 +18,7 @@ impl SchedClock {
                 // TCS no init
                 return 0;
             }
-            return CurrentTimeArch::get_cycles_ns() as u64;
+            return CurrentTimeArch::cycles2ns(CurrentTimeArch::get_cycles()) as u64;
         }
 
         #[cfg(target_arch = "riscv64")]

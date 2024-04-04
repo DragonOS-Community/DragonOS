@@ -5,6 +5,7 @@ use kdepends::thingbuf::StaticThingBuf;
 
 use crate::{
     arch::CurrentIrqArch,
+    driver::tty::virtual_terminal::virtual_console::CURRENT_VCNUM,
     exception::InterruptArch,
     process::{
         kthread::{KernelThreadClosure, KernelThreadMechanism},
@@ -50,7 +51,12 @@ fn tty_refresh_thread() -> i32 {
             *item = KEYBUF.pop().unwrap();
         }
 
-        let _ = current_tty_port().receive_buf(&data[0..to_dequeue], &[], to_dequeue);
+        if CURRENT_VCNUM.load(core::sync::atomic::Ordering::SeqCst) != -1 {
+            let _ = current_tty_port().receive_buf(&data[0..to_dequeue], &[], to_dequeue);
+        } else {
+            // 这里由于stdio未初始化，所以无法找到port
+            // TODO: 考虑改用双端队列，能够将丢失的输入插回
+        }
     }
 }
 

@@ -1047,7 +1047,7 @@ pub extern "C" fn rs_textui_putchar(character: u8, fr_color: u32, bk_color: u32)
             character as char
         );
         let port = tty_port(current_vcnum as usize);
-        let tty = port.port_data().tty();
+        let tty = port.port_data().internal_tty();
         if let Some(tty) = tty {
             send_to_default_serial8250_port(&[character]);
             return tty

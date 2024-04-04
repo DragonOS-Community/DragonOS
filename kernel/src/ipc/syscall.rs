@@ -6,19 +6,34 @@ use core::{
 use system_error::SystemError;
 
 use crate::{
-    arch::ipc::signal::{SigCode, SigFlags, SigSet, Signal},
+    arch::{
+        ipc::signal::{SigCode, SigFlags, SigSet, Signal},
+        MMArch,
+    },
     filesystem::vfs::{
         file::{File, FileMode},
         FilePrivateData,
     },
+    ipc::shm::{shm_manager_lock, IPC_PRIVATE},
     kerror, kwarn,
-    mm::VirtAddr,
+    libs::align::page_align_up,
+    mm::{
+        allocator::page_frame::{PageFrameCount, PhysPageFrame, VirtPageFrame},
+        page::{page_manager_lock_irqsave, PageFlags, PageFlushAll},
+        syscall::ProtFlags,
+        ucontext::{AddressSpace, VMA},
+        VirtAddr, VmFlags,
+    },
     process::{Pid, ProcessManager},
-    syscall::{user_access::UserBufferWriter, Syscall},
+    syscall::{
+        user_access::{UserBufferReader, UserBufferWriter},
+        Syscall,
+    },
 };
 
 use super::{
     pipe::{LockedPipeInode, PipeFsPrivateData},
+    shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
     signal_types::{
         SaHandlerType, SigInfo, SigType, Sigaction, SigactionType, UserSigaction, USER_SIG_DFL,
         USER_SIG_ERR, USER_SIG_IGN,
@@ -227,5 +242,263 @@ impl Syscall {
             }
         }
         return retval.map(|_| 0);
+    }
+
+    /// # SYS_SHMGET系统调用函数，用于获取共享内存
+    ///
+    /// ## 参数
+    ///
+    /// - `key`: 共享内存键值
+    /// - `size`: 共享内存大小(bytes)
+    /// - `shmflg`: 共享内存标志
+    ///
+    /// ## 返回值
+    ///
+    /// 成功：共享内存id
+    /// 失败：错误码
+    pub fn shmget(key: ShmKey, size: usize, shmflg: ShmFlags) -> Result<usize, SystemError> {
+        // 暂不支持巨页
+        if shmflg.contains(ShmFlags::SHM_HUGETLB) {
+            kerror!("shmget: not support huge page");
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+
+        let mut shm_manager_guard = shm_manager_lock();
+        match key {
+            // 创建共享内存段
+            IPC_PRIVATE => shm_manager_guard.add(key, size, shmflg),
+            _ => {
+                // 查找key对应的共享内存段是否存在
+                let id = shm_manager_guard.contains_key(&key);
+                if let Some(id) = id {
+                    // 不能重复创建
+                    if shmflg.contains(ShmFlags::IPC_CREAT | ShmFlags::IPC_EXCL) {
+                        return Err(SystemError::EEXIST);
+                    }
+
+                    // key值存在，说明有对应共享内存，返回该共享内存id
+                    return Ok(id.data());
+                } else {
+                    // key不存在且shm_flags不包含IPC_CREAT创建IPC对象标志，则返回错误码
+                    if !shmflg.contains(ShmFlags::IPC_CREAT) {
+                        return Err(SystemError::ENOENT);
+                    }
+
+                    // 存在创建IPC对象标志
+                    return shm_manager_guard.add(key, size, shmflg);
+                }
+            }
+        }
+    }
+
+    /// # SYS_SHMAT系统调用函数，用于连接共享内存段
+    ///
+    /// ## 参数
+    ///
+    /// - `id`: 共享内存id
+    /// - `vaddr`: 连接共享内存的进程虚拟内存区域起始地址
+    /// - `shmflg`: 共享内存标志
+    ///
+    /// ## 返回值
+    ///
+    /// 成功：映射到共享内存的虚拟内存区域起始地址
+    /// 失败：错误码
+    pub fn shmat(id: ShmId, vaddr: VirtAddr, shmflg: ShmFlags) -> Result<usize, SystemError> {
+        let mut shm_manager_guard = shm_manager_lock();
+        let current_address_space = AddressSpace::current()?;
+        let mut address_write_guard = current_address_space.write();
+
+        let kernel_shm = shm_manager_guard.get_mut(&id).ok_or(SystemError::EINVAL)?;
+        let size = page_align_up(kernel_shm.size());
+        let mut phys = PhysPageFrame::new(kernel_shm.start_paddr());
+        let count = PageFrameCount::from_bytes(size).unwrap();
+        let r = match vaddr.data() {
+            // 找到空闲区域并映射到共享内存
+            0 => {
+                // 找到空闲区域
+                let region = address_write_guard
+                    .mappings
+                    .find_free(vaddr, size)
+                    .ok_or(SystemError::EINVAL)?;
+                let vm_flags = VmFlags::from(shmflg);
+                let destination = VirtPageFrame::new(region.start());
+                let page_flags: PageFlags<MMArch> =
+                    PageFlags::from_prot_flags(ProtFlags::from(vm_flags), true);
+                let flusher: PageFlushAll<MMArch> = PageFlushAll::new();
+
+                // 将共享内存映射到对应虚拟区域
+                let vma = VMA::physmap(
+                    phys,
+                    destination,
+                    count,
+                    vm_flags,
+                    page_flags,
+                    &mut address_write_guard.user_mapper.utable,
+                    flusher,
+                )?;
+
+                // 将VMA加入到当前进程的VMA列表中
+                address_write_guard.mappings.insert_vma(vma);
+
+                region.start().data()
+            }
+            // 指定虚拟地址
+            _ => {
+                // 获取对应vma
+                let vma = address_write_guard
+                    .mappings
+                    .contains(vaddr)
+                    .ok_or(SystemError::EINVAL)?;
+                if vma.lock().region().start() != vaddr {
+                    return Err(SystemError::EINVAL);
+                }
+
+                // 验证用户虚拟内存区域是否有效
+                let _ = UserBufferReader::new(vaddr.data() as *const u8, size, true)?;
+
+                // 必须在取消映射前获取到PageFlags
+                let page_flags = address_write_guard
+                    .user_mapper
+                    .utable
+                    .translate(vaddr)
+                    .ok_or(SystemError::EINVAL)?
+                    .1;
+
+                // 取消原映射
+                let flusher: PageFlushAll<MMArch> = PageFlushAll::new();
+                vma.unmap(&mut address_write_guard.user_mapper.utable, flusher);
+
+                // 将该虚拟内存区域映射到共享内存区域
+                let mut page_manager_guard = page_manager_lock_irqsave();
+                let mut virt = VirtPageFrame::new(vaddr);
+                for _ in 0..count.data() {
+                    let r = unsafe {
+                        address_write_guard.user_mapper.utable.map_phys(
+                            virt.virt_address(),
+                            phys.phys_address(),
+                            page_flags,
+                        )
+                    }
+                    .expect("Failed to map zero, may be OOM error");
+                    r.flush();
+
+                    // 将vma加入到对应Page的anon_vma
+                    page_manager_guard
+                        .get_mut(&phys.phys_address())
+                        .insert_vma(vma.clone());
+
+                    phys = phys.next();
+                    virt = virt.next();
+                }
+
+                // 更新vma的映射状态
+                vma.lock().set_mapped(true);
+
+                vaddr.data()
+            }
+        };
+
+        // 更新最后一次连接时间
+        kernel_shm.update_atim();
+
+        Ok(r)
+    }
+
+    /// # SYS_SHMDT系统调用函数，用于取消对共享内存的连接
+    ///
+    /// ## 参数
+    ///
+    /// - `vaddr`:  需要取消映射的虚拟内存区域起始地址
+    ///
+    /// ## 返回值
+    ///
+    /// 成功：0
+    /// 失败：错误码
+    pub fn shmdt(vaddr: VirtAddr) -> Result<usize, SystemError> {
+        let current_address_space = AddressSpace::current()?;
+        let mut address_write_guard = current_address_space.write();
+
+        // 获取vma
+        let vma = address_write_guard
+            .mappings
+            .contains(vaddr)
+            .ok_or(SystemError::EINVAL)?;
+
+        // 判断vaddr是否为起始地址
+        if vma.lock().region().start() != vaddr {
+            return Err(SystemError::EINVAL);
+        }
+
+        // 获取映射的物理地址
+        let paddr = address_write_guard
+            .user_mapper
+            .utable
+            .translate(vaddr)
+            .ok_or(SystemError::EINVAL)?
+            .0;
+
+        // 如果物理页的shm_id为None，代表不是共享页
+        let page_manager_guard = page_manager_lock_irqsave();
+        let page = page_manager_guard.get(&paddr).ok_or(SystemError::EINVAL)?;
+        let shm_id = page.shm_id().ok_or(SystemError::EINVAL)?;
+        drop(page_manager_guard);
+
+        // 获取对应共享页管理信息
+        let mut shm_manager_guard = shm_manager_lock();
+        let kernel_shm = shm_manager_guard
+            .get_mut(&shm_id)
+            .ok_or(SystemError::EINVAL)?;
+        // 更新最后一次断开连接时间
+        kernel_shm.update_dtim();
+        drop(shm_manager_guard);
+
+        // 取消映射
+        let flusher: PageFlushAll<MMArch> = PageFlushAll::new();
+        vma.unmap(&mut address_write_guard.user_mapper.utable, flusher);
+
+        return Ok(0);
+    }
+
+    /// # SYS_SHMCTL系统调用函数，用于管理共享内存段
+    ///
+    /// ## 参数
+    ///
+    /// - `id`: 共享内存id
+    /// - `cmd`: 操作码
+    /// - `user_buf`: 用户缓冲区
+    /// - `from_user`: buf_vaddr是否来自用户地址空间
+    ///
+    /// ## 返回值
+    ///
+    /// 成功：0
+    /// 失败：错误码
+    pub fn shmctl(
+        id: ShmId,
+        cmd: ShmCtlCmd,
+        user_buf: usize,
+        from_user: bool,
+    ) -> Result<usize, SystemError> {
+        let mut shm_manager_guard = shm_manager_lock();
+
+        match cmd {
+            // 查看共享内存元信息
+            ShmCtlCmd::IpcInfo => shm_manager_guard.ipc_info(user_buf, from_user),
+            // 查看共享内存使用信息
+            ShmCtlCmd::ShmInfo => shm_manager_guard.shm_info(user_buf, from_user),
+            // 查看id对应的共享内存信息
+            ShmCtlCmd::ShmStat | ShmCtlCmd::ShmtStatAny | ShmCtlCmd::IpcStat => {
+                shm_manager_guard.shm_stat(id, cmd, user_buf, from_user)
+            }
+            // 设置KernIpcPerm
+            ShmCtlCmd::IpcSet => shm_manager_guard.ipc_set(id, user_buf, from_user),
+            // 将共享内存段设置为可回收状态
+            ShmCtlCmd::IpcRmid => shm_manager_guard.ipc_rmid(id),
+            // 锁住共享内存段，不允许内存置换
+            ShmCtlCmd::ShmLock => shm_manager_guard.shm_lock(id),
+            // 解锁共享内存段，允许内存置换
+            ShmCtlCmd::ShmUnlock => shm_manager_guard.shm_unlock(id),
+            // 无效操作码
+            ShmCtlCmd::Default => Err(SystemError::EINVAL),
+        }
     }
 }

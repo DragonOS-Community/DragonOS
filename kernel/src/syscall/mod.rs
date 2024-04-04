@@ -7,6 +7,7 @@ use core::{
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
     filesystem::vfs::syscall::{PosixStatfs, PosixStatx},
+    ipc::shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::syscall::MremapFlags,
     net::syscall::MsgHdr,
@@ -1003,6 +1004,33 @@ impl Syscall {
             SYS_UNAME => {
                 let name = args[0] as *mut PosixOldUtsName;
                 Self::uname(name)
+            }
+
+            SYS_SHMGET => {
+                let key = ShmKey::new(args[0]);
+                let size = args[1];
+                let shmflg = ShmFlags::from_bits_truncate(args[2] as u32);
+
+                Self::shmget(key, size, shmflg)
+            }
+            SYS_SHMAT => {
+                let id = ShmId::new(args[0]);
+                let vaddr = VirtAddr::new(args[1]);
+                let shmflg = ShmFlags::from_bits_truncate(args[2] as u32);
+
+                Self::shmat(id, vaddr, shmflg)
+            }
+            SYS_SHMDT => {
+                let vaddr = VirtAddr::new(args[0]);
+                Self::shmdt(vaddr)
+            }
+            SYS_SHMCTL => {
+                let id = ShmId::new(args[0]);
+                let cmd = ShmCtlCmd::from(args[1]);
+                let user_buf = args[2];
+                let from_user = frame.is_from_user();
+
+                Self::shmctl(id, cmd, user_buf, from_user)
             }
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),

@@ -599,7 +599,8 @@ pub fn test_buddy() {
 pub struct LockedFrameAllocator;
 
 impl FrameAllocator for LockedFrameAllocator {
-    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
+    unsafe fn allocate(&mut self, mut count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
+        count = count.next_power_of_two();
         if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
             return allocator.allocate(count);
         } else {

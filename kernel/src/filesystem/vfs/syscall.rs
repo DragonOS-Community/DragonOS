@@ -669,12 +669,9 @@ impl Syscall {
         let path = PathBuf::from(check_and_clone_cstr(path, Some(MAX_PATHLEN))?);
         // path = path.clean();
         // kdebug!("chdir {:?}", path);
-        let inode = match ROOT_INODE().lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
-            Err(_) => {
-                return Err(SystemError::ENOENT);
-            }
-            Ok(i) => i,
-        };
+        let inode = ROOT_INODE()
+            .lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+            .map_err(|_| SystemError::ENOENT)?;
         let metadata = inode.metadata()?;
         if metadata.file_type == FileType::Dir {
             proc.basic_mut().set_cwd(path.into_os_string());

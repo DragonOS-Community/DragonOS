@@ -1,4 +1,4 @@
-use crate::time::TimeArch;
+use crate::time::{clocksource::HZ, TimeArch};
 pub struct RiscV64TimeArch;
 
 /// 这个是系统jiffies时钟源的固有频率（不是调频之后的）

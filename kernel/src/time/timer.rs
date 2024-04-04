@@ -22,7 +22,7 @@ use crate::{
     process::{ProcessControlBlock, ProcessManager},
 };
 
-use super::timekeeping::update_wall_time;
+use super::{jiffies::NSEC_PER_JIFFY, timekeeping::update_wall_time};
 
 const MAX_TIMEOUT: i64 = i64::MAX;
 const TIMER_RUN_CYCLE_THRESHOLD: usize = 20;
@@ -238,11 +238,11 @@ pub fn timer_init() {
 
 /// 计算接下来n毫秒对应的定时器时间片
 pub fn next_n_ms_timer_jiffies(expire_ms: u64) -> u64 {
-    return TIMER_JIFFIES.load(Ordering::SeqCst) + 1000 * (expire_ms);
+    return TIMER_JIFFIES.load(Ordering::SeqCst) + expire_ms * 1000000 / NSEC_PER_JIFFY as u64;
 }
 /// 计算接下来n微秒对应的定时器时间片
 pub fn next_n_us_timer_jiffies(expire_us: u64) -> u64 {
-    return TIMER_JIFFIES.load(Ordering::SeqCst) + (expire_us);
+    return TIMER_JIFFIES.load(Ordering::SeqCst) + expire_us * 1000 / NSEC_PER_JIFFY as u64;
 }
 
 /// @brief 让pcb休眠timeout个jiffies

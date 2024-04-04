@@ -963,9 +963,15 @@ impl Syscall {
             }
 
             SYS_SCHED_GETAFFINITY => {
-                // todo: 这个系统调用还没有实现
+                let pid = args[0] as i32;
+                let size = args[1];
+                let set_vaddr = args[2];
 
-                Err(SystemError::ENOSYS)
+                let mut user_buffer_writer =
+                    UserBufferWriter::new(set_vaddr as *mut u8, size, frame.is_from_user())?;
+                let set: &mut [u8] = user_buffer_writer.buffer(0)?;
+
+                Self::getaffinity(pid, set)
             }
 
             #[cfg(target_arch = "x86_64")]

@@ -13,6 +13,7 @@ use self::{
 pub mod core;
 pub mod cpu;
 pub mod init;
+mod syscall;
 
 pub fn kick_cpu(cpu_id: ProcessorId) -> Result<(), SystemError> {
     // todo: 增加对cpu_id的有效性检查

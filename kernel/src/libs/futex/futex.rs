@@ -706,11 +706,7 @@ impl RobustListHead {
         let pcb: Arc<ProcessControlBlock> = if pid == 0 {
             ProcessManager::current_pcb()
         } else {
-            let tmp: Option<Arc<ProcessControlBlock>> = ProcessManager::find(Pid::new(pid));
-            match tmp {
-                Some(pcb) => pcb,
-                None => return Err(SystemError::ESRCH),
-            }
+            ProcessManager::find(Pid::new(pid)).ok_or(SystemError::ESRCH)?
         };
 
         // TODO: 检查当前进程是否能ptrace另一个进程
@@ -720,10 +716,7 @@ impl RobustListHead {
         }
 
         //获取当前线程的robust list head 和 长度
-        let robust_list_head = match *pcb.get_robust_list() {
-            Some(rl) => rl,
-            None => return Err(SystemError::EINVAL),
-        };
+        let robust_list_head = (*pcb.get_robust_list()).ok_or(SystemError::EINVAL)?;
 
         // 将len拷贝到用户空间len_ptr
         let mut user_writer = UserBufferWriter::new(
@@ -872,20 +865,15 @@ impl<'a> Iterator for FutexIterator<'a> {
                 None
             };
 
-            let user_buffer_reader = match UserBufferReader::new(
+            let user_buffer_reader = UserBufferReader::new(
                 self.entry.as_ptr::<RobustList>(),
                 mem::size_of::<RobustList>(),
                 true,
             )
-            .ok()
-            {
-                Some(ubr) => ubr,
-                None => return None,
-            };
-            let next_entry = match user_buffer_reader.read_one_from_user::<RobustList>(0).ok() {
-                Some(rl) => rl,
-                None => return None,
-            };
+            .ok()?;
+            let next_entry = user_buffer_reader
+                .read_one_from_user::<RobustList>(0)
+                .ok()?;
 
             self.entry = next_entry.next;
 

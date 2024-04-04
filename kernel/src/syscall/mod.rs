@@ -686,9 +686,6 @@ impl Syscall {
                 let uaddr2 = VirtAddr::new(args[4]);
                 let val3 = args[5] as u32;
 
-                verify_area(uaddr, core::mem::size_of::<u32>())?;
-                verify_area(uaddr2, core::mem::size_of::<u32>())?;
-
                 let mut timespec = None;
                 if utime != 0 && operation.contains(FutexFlag::FLAGS_HAS_TIMEOUT) {
                     let reader = UserBufferReader::new(
@@ -708,9 +705,6 @@ impl Syscall {
                 let head_uaddr = VirtAddr::new(head);
                 let len = args[1];
 
-                //判断用户空间地址的合法性
-                verify_area(head_uaddr, core::mem::size_of::<u32>())?;
-
                 let ret = Self::set_robust_list(head_uaddr, len);
                 return ret;
             }
@@ -721,10 +715,6 @@ impl Syscall {
                 let head_uaddr = VirtAddr::new(head);
                 let len_ptr = args[2];
                 let len_ptr_uaddr = VirtAddr::new(len_ptr);
-
-                //判断用户空间地址的合法性
-                verify_area(head_uaddr, core::mem::size_of::<u32>())?;
-                verify_area(len_ptr_uaddr, core::mem::size_of::<u32>())?;
 
                 let ret = Self::get_robust_list(pid, head_uaddr, len_ptr_uaddr);
                 return ret;

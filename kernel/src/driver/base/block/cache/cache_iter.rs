@@ -5,15 +5,15 @@ use crate::driver::base::block::block_device::BlockId;
 #[derive(Debug)]
 pub struct BlockData {
     //表示单个块对应的lba_id
-    lba_id: usize,
+    lba_id: BlockId,
     //表示该块在buf中的起始地址，目前并没有作用（例如：若该块是第2个块，那么该数据成员值为2*BLOCK_SIZE）
-    _data_start_addr: usize,
+    _data_start_addr: BlockId,
     //表示该块的大小
     _block_size: usize,
 }
 
 impl BlockData {
-    pub fn new(lba_id: usize, data_start_addr: usize, block_size: usize) -> Self {
+    pub fn new(lba_id: BlockId, data_start_addr: BlockId, block_size: usize) -> Self {
         Self {
             lba_id,
             _data_start_addr: data_start_addr,
@@ -21,11 +21,11 @@ impl BlockData {
         }
     }
     #[inline]
-    pub fn lba_id(&self) -> usize {
+    pub fn lba_id(&self) -> BlockId {
         self.lba_id
     }
     #[inline]
-    pub fn _data_start_addr(&self) -> usize {
+    pub fn _data_start_addr(&self) -> BlockId {
         self._data_start_addr
     }
     #[inline]
@@ -49,7 +49,7 @@ pub struct BlockIter {
 }
 
 impl BlockIter {
-    pub fn new(lba_id_start: usize, count: usize, block_size: usize) -> Self {
+    pub fn new(lba_id_start: BlockId, count: usize, block_size: usize) -> Self {
         Self {
             lba_id_start,
             count,
@@ -81,17 +81,17 @@ impl Iterator for BlockIter {
 /// 表示缺块信息的数据结构，往往在读取的时候发现缺块并产生FailData，在插入的时候使用FailData
 pub struct FailData {
     //表示缺块的lba_id
-    lba_id: usize,
+    lba_id: BlockId,
     //表示缺块在buf中的位置，用于在insert的时候定位缺块数据的位置
     index: usize,
 }
 
 impl FailData {
-    pub fn new(lba_id: usize, index: usize) -> Self {
+    pub fn new(lba_id: BlockId, index: usize) -> Self {
         FailData { lba_id, index }
     }
     #[inline]
-    pub fn lba_id(&self) -> usize {
+    pub fn lba_id(&self) -> BlockId {
         self.lba_id
     }
     ///# 函数的功能

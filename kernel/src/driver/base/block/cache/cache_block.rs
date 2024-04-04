@@ -47,7 +47,7 @@ pub struct CacheBlock {
 }
 
 impl CacheBlock {
-    pub fn new(data: Box<[u8]>, flag: CacheBlockFlag, lba_id: usize) -> Self {
+    pub fn new(data: Box<[u8]>, flag: CacheBlockFlag, lba_id: BlockId) -> Self {
         CacheBlock {
             data,
             _flag: flag,
@@ -55,7 +55,7 @@ impl CacheBlock {
         }
     }
 
-    pub fn from_data(lba_id: usize, data: Vec<u8>) -> Self {
+    pub fn from_data(lba_id: BlockId, data: Vec<u8>) -> Self {
         let space_box = data.into_boxed_slice();
         CacheBlock::new(space_box, CacheBlockFlag::Unwrited, lba_id)
     }

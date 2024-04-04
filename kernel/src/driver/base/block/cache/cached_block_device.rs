@@ -1,7 +1,7 @@
 use alloc::{boxed::Box, vec::Vec};
 use hashbrown::HashMap;
 
-use crate::libs::rwlock::RwLock;
+use crate::{driver::base::block::block_device::BlockId, libs::rwlock::RwLock};
 
 use super::{
     cache_block::{CacheBlock, CacheBlockAddr},
@@ -56,7 +56,7 @@ impl BlockCache {
     /// - Err(BlockCacheError::BlockFaultError) :缺块的情况下，返回读取失败的块的数据，利用该返回值可以帮助blockcache插入读取失败的块值（见insert函数）
     /// - Err(BlockCacheError::____) :不缺块的情况往往是初始化或者其他问题，这种异常会在block_device中得到处理
     pub fn read(
-        lba_id_start: usize,
+        lba_id_start: BlockId,
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, BlockCacheError> {
@@ -160,7 +160,7 @@ impl BlockCache {
     /// ## 返回值：
     /// Ok(()):表示插入成功
     /// Err(BlockCacheError) :一般来说不会产生错误，这里产生错误的原因只有插入时还没有初始化（一般也很难发生）
-    pub fn insert_one_block(lba_id: usize, data: Vec<u8>) -> Result<(), BlockCacheError> {
+    pub fn insert_one_block(lba_id: BlockId, data: Vec<u8>) -> Result<(), BlockCacheError> {
         let space = unsafe { space()? };
         space.insert(lba_id, data)
     }
@@ -176,7 +176,7 @@ impl BlockCache {
     /// Ok(usize) :表示写入了多少个块
     /// Err(BlockCacheError) :这里产生错误的原因只有插入时还没有初始化
     pub fn test_write(
-        lba_id_start: usize,
+        lba_id_start: BlockId,
         count: usize,
         _data: &[u8],
     ) -> Result<usize, BlockCacheError> {
@@ -209,7 +209,7 @@ impl LockedCacheSpace {
         todo!()
     }
 
-    pub fn insert(&mut self, lba_id: usize, data: Vec<u8>) -> Result<(), BlockCacheError> {
+    pub fn insert(&mut self, lba_id: BlockId, data: Vec<u8>) -> Result<(), BlockCacheError> {
         unsafe { self.0.get_mut().insert(lba_id, data) }
     }
 }
@@ -270,7 +270,7 @@ impl CacheSpace {
     ///
     /// ## 返回值：
     /// Ok(())
-    pub fn insert(&mut self, lba_id: usize, data: Vec<u8>) -> Result<(), BlockCacheError> {
+    pub fn insert(&mut self, lba_id: BlockId, data: Vec<u8>) -> Result<(), BlockCacheError> {
         //CacheBlock是cached block的基本单位，这里使用data生成一个CacheBlock用于向Cache空间中插入块
         let data_block = CacheBlock::from_data(lba_id, data);
         let mapper = unsafe { mapper()? };
@@ -313,15 +313,15 @@ impl LockedCacheMapper {
         }
     }
 
-    pub fn insert(&mut self, lba_id: usize, caddr: CacheBlockAddr) -> Option<()> {
+    pub fn insert(&mut self, lba_id: BlockId, caddr: CacheBlockAddr) -> Option<()> {
         unsafe { self.lock.get_mut().insert(lba_id, caddr) }
     }
 
-    pub fn find(&self, lba_id: usize) -> Option<CacheBlockAddr> {
+    pub fn find(&self, lba_id: BlockId) -> Option<CacheBlockAddr> {
         self.lock.read().find(lba_id)
     }
 
-    pub fn remove(&mut self, lba_id: usize) {
+    pub fn remove(&mut self, lba_id: BlockId) {
         unsafe { self.lock.get_mut().remove(lba_id) }
     }
 }
@@ -330,7 +330,7 @@ impl LockedCacheMapper {
 /// 该结构体用于建立lba_id到cached块的映射
 struct CacheMapper {
     //执行键值对操作的map
-    map: HashMap<usize, CacheBlockAddr>,
+    map: HashMap<BlockId, CacheBlockAddr>,
 }
 
 impl CacheMapper {
@@ -341,19 +341,19 @@ impl CacheMapper {
     }
     /// # 函数的功能
     /// 插入操作
-    pub fn insert(&mut self, lba_id: usize, caddr: CacheBlockAddr) -> Option<()> {
+    pub fn insert(&mut self, lba_id: BlockId, caddr: CacheBlockAddr) -> Option<()> {
         self.map.insert(lba_id, caddr)?;
         Some(())
     }
     /// # 函数的功能
     /// 查找操作
     #[inline]
-    pub fn find(&self, lba_id: usize) -> Option<CacheBlockAddr> {
+    pub fn find(&self, lba_id: BlockId) -> Option<CacheBlockAddr> {
         Some(*self.map.get(&lba_id)?)
     }
     /// # 函数的功能
     /// 去除操作
-    pub fn remove(&mut self, lba_id: usize) {
+    pub fn remove(&mut self, lba_id: BlockId) {
         self.map.remove(&lba_id);
     }
 }

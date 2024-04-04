@@ -211,6 +211,14 @@ impl FairSchedEntity {
 
     /// 遍历se组，如果返回false则需要调用的函数return，
     /// 会将se指向其顶层parent
+    /// 该函数会改变se指向
+    /// 参数：
+    /// - se: 对应调度实体
+    /// - f: 对调度实体执行操作的闭包，返回值对应(no_break,should_continue),no_break为假时，退出循环，should_continue为假时表示需要将调用者return
+    ///
+    /// 返回值：
+    /// - bool: 是否需要调度者return
+    /// - Option<Arc<FairSchedEntity>>：最终se的指向
     pub fn for_each_in_group(
         se: &mut Arc<FairSchedEntity>,
         mut f: impl FnMut(Arc<FairSchedEntity>) -> (bool, bool),

@@ -23,7 +23,6 @@ use crate::arch::interrupt::ipi::IPI_NUM_KICK_CPU;
 
 use crate::{
     arch::{interrupt::ipi::send_ipi, CurrentIrqArch},
-    driver::serial::serial8250::send_to_default_serial8250_port,
     exception::{
         ipi::{IpiKind, IpiTarget},
         HardwareIrqNumber, InterruptArch,
@@ -32,7 +31,7 @@ use crate::{
         lazy_init::Lazy,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::percpu::PerCpu,
+    mm::percpu::{PerCpu, PerCpuVar},
     new_sched::idle::IdleScheduler,
     process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, SchedInfo},
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
@@ -49,7 +48,7 @@ use self::{
 static mut CPU_IRQ_TIME: Option<Vec<&'static mut IrqTime>> = None;
 
 // 这里虽然rq是percpu的，但是在负载均衡的时候需要修改对端cpu的rq，所以仍需加锁
-static CPU_RUNQUEUE: Lazy<Vec<Arc<CpuRunQueue>>> = Lazy::new();
+static CPU_RUNQUEUE: Lazy<PerCpuVar<Arc<CpuRunQueue>>> = PerCpuVar::define_lazy();
 
 /// 用于记录系统中所有 CPU 的可执行进程数量的总和。
 static CALCULATE_LOAD_TASKS: AtomicUsize = AtomicUsize::new(0);
@@ -72,7 +71,12 @@ pub fn cpu_irq_time(cpu: usize) -> &'static mut IrqTime {
 #[inline]
 pub fn cpu_rq(cpu: usize) -> Arc<CpuRunQueue> {
     CPU_RUNQUEUE.ensure();
-    CPU_RUNQUEUE.get()[cpu].clone()
+    unsafe {
+        CPU_RUNQUEUE
+            .get()
+            .force_get(ProcessorId::new(cpu as u32))
+            .clone()
+    }
 }
 
 lazy_static! {
@@ -733,10 +737,13 @@ bitflags! {
         * SM_MASK_PREEMPT for !RT has all bits set, which allows the compiler to
         * optimize the AND operation out and just check for zero.
         */
+        /// 在调度过程中不会再次进入队列，即需要手动唤醒
         const SM_NONE			= 0x0;
+        /// 重新加入队列，即当前进程被抢占，需要时钟调度
         const SM_PREEMPT		= 0x1;
+        /// rt相关
         const SM_RTLOCK_WAIT		= 0x2;
-
+        /// 默认与SM_PREEMPT相同
         const SM_MASK_PREEMPT	= Self::SM_PREEMPT.bits;
     }
 }
@@ -799,7 +806,6 @@ pub fn schedule(sched_mod: SchedMode) {
 /// ## 执行调度
 /// 此函数与schedule的区别为，该函数不会检查preempt_count
 /// 适用于时钟中断等场景
-#[inline]
 pub fn __schedule(sched_mod: SchedMode) {
     let cpu = smp_get_processor_id().data() as usize;
     let rq = cpu_rq(cpu);
@@ -974,7 +980,7 @@ pub fn sched_init() {
             cpu_runqueue.push(rq);
         }
 
-        CPU_RUNQUEUE.init(cpu_runqueue);
+        CPU_RUNQUEUE.init(PerCpuVar::new(cpu_runqueue).unwrap());
     };
 }
 

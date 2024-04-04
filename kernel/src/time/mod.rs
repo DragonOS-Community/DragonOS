@@ -492,4 +492,7 @@ pub trait TimeArch {
     ///
     /// The expire cycles
     fn cal_expire_cycles(ns: usize) -> usize;
+
+    /// 将CPU的时钟周期数转换为纳秒
+    fn cycles2ns(cycles: usize) -> usize;
 }

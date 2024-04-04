@@ -862,6 +862,10 @@ impl Syscall {
                 kwarn!("SYS_SETGID has not yet been implemented");
                 Ok(0)
             }
+            SYS_SETSID => {
+                kwarn!("SYS_SETSID has not yet been implemented");
+                Ok(0)
+            }
             SYS_GETEUID => Self::geteuid(),
             SYS_GETEGID => Self::getegid(),
             SYS_GETRUSAGE => {
@@ -944,6 +948,16 @@ impl Syscall {
                 Ok(0)
             }
 
+            SYS_SET_ROBUST_LIST => {
+                kwarn!("SYS_SET_ROBUST_LIST has not yet been implemented");
+                Ok(0)
+            }
+
+            SYS_RSEQ => {
+                kwarn!("SYS_RSEQ has not yet been implemented");
+                Ok(0)
+            }
+
             #[cfg(target_arch = "x86_64")]
             SYS_CHMOD => {
                 let pathname = args[0] as *const u8;
@@ -963,9 +977,15 @@ impl Syscall {
             }
 
             SYS_SCHED_GETAFFINITY => {
-                // todo: 这个系统调用还没有实现
+                let pid = args[0] as i32;
+                let size = args[1];
+                let set_vaddr = args[2];
 
-                Err(SystemError::ENOSYS)
+                let mut user_buffer_writer =
+                    UserBufferWriter::new(set_vaddr as *mut u8, size, frame.is_from_user())?;
+                let set: &mut [u8] = user_buffer_writer.buffer(0)?;
+
+                Self::getaffinity(pid, set)
             }
 
             #[cfg(target_arch = "x86_64")]

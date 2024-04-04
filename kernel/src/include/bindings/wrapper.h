@@ -25,6 +25,5 @@
 #include <mm/slab.h>
 #include <process/process.h>
 #include <sched/sched.h>
-#include <time/clocksource.h>
 #include <time/sleep.h>
 #include <common/errno.h>

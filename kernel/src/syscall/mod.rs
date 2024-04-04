@@ -862,6 +862,10 @@ impl Syscall {
                 kwarn!("SYS_SETGID has not yet been implemented");
                 Ok(0)
             }
+            SYS_SETSID => {
+                kwarn!("SYS_SETSID has not yet been implemented");
+                Ok(0)
+            }
             SYS_GETEUID => Self::geteuid(),
             SYS_GETEGID => Self::getegid(),
             SYS_GETRUSAGE => {
@@ -941,6 +945,16 @@ impl Syscall {
 
             SYS_FSYNC => {
                 kwarn!("SYS_FSYNC has not yet been implemented");
+                Ok(0)
+            }
+
+            SYS_SET_ROBUST_LIST => {
+                kwarn!("SYS_SET_ROBUST_LIST has not yet been implemented");
+                Ok(0)
+            }
+
+            SYS_RSEQ => {
+                kwarn!("SYS_RSEQ has not yet been implemented");
                 Ok(0)
             }
 

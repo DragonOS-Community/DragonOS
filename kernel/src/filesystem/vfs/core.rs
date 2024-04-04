@@ -19,6 +19,7 @@ use crate::{
 
 use super::{
     file::FileMode,
+    mount::MountFSInode,
     utils::{rsplit_path, user_path_at},
     IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
@@ -103,9 +104,9 @@ fn do_migrate(
             .unwrap_or_else(|_| panic!("Failed to create '/{mountpoint_name}' in migrating"))
     };
     // 迁移挂载点
-    mountpoint
-        .mount(fs.inner_filesystem())
-        .unwrap_or_else(|_| panic!("Failed to migrate {mountpoint_name} "));
+    let inode = mountpoint.arc_any().downcast::<MountFSInode>().unwrap();
+    inode.do_mount(inode.inode_id(), fs.self_ref())?;
+
     return Ok(());
 }
 

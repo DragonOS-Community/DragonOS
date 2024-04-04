@@ -433,7 +433,11 @@ impl ProcFS {
 }
 
 impl IndexNode for LockedProcFSInode {
-    fn open(&self, data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        mut data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         // 加锁
         let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
 
@@ -457,7 +461,7 @@ impl IndexNode for LockedProcFSInode {
         return Ok(());
     }
 
-    fn close(&self, data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, mut data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         let guard: SpinLockGuard<ProcFSInode> = self.0.lock();
         // 如果inode类型为文件夹，则直接返回成功
         if let FileType::Dir = guard.metadata.file_type {
@@ -474,7 +478,7 @@ impl IndexNode for LockedProcFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: &mut FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
@@ -488,8 +492,8 @@ impl IndexNode for LockedProcFSInode {
         }
 
         // 获取数据信息
-        let private_data = match data {
-            FilePrivateData::Procfs(p) => p,
+        let mut private_data = match &*data {
+            FilePrivateData::Procfs(p) => p.clone(),
             _ => {
                 panic!("ProcFS: FilePrivateData mismatch!");
             }
@@ -497,8 +501,12 @@ impl IndexNode for LockedProcFSInode {
 
         // 根据文件类型读取相应数据
         match inode.fdata.ftype {
-            ProcFileType::ProcStatus => return inode.proc_read(offset, len, buf, private_data),
-            ProcFileType::ProcMeminfo => return inode.proc_read(offset, len, buf, private_data),
+            ProcFileType::ProcStatus => {
+                return inode.proc_read(offset, len, buf, &mut private_data)
+            }
+            ProcFileType::ProcMeminfo => {
+                return inode.proc_read(offset, len, buf, &mut private_data)
+            }
             ProcFileType::ProcKmsg => (),
             ProcFileType::Default => (),
         };
@@ -523,7 +531,7 @@ impl IndexNode for LockedProcFSInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }

@@ -9,7 +9,11 @@ use bitmap::{traits::BitMapOps, StaticBitmap};
 use crate::{
     driver::{
         serial::serial8250::send_to_default_serial8250_port,
-        tty::{console::ConsoleSwitch, ConsoleFont, KDMode},
+        tty::{
+            console::ConsoleSwitch,
+            tty_port::{DefaultTtyPort, TtyPort},
+            ConsoleFont, KDMode,
+        },
     },
     libs::{font::FontDesc, rwlock::RwLock},
     process::Pid,
@@ -142,6 +146,9 @@ pub struct VirtualConsoleData {
 
     /// 对应的Console Driver funcs
     driver_funcs: Option<Weak<dyn ConsoleSwitch>>,
+
+    /// 对应端口
+    port: Arc<dyn TtyPort>,
 }
 
 impl VirtualConsoleData {
@@ -204,7 +211,13 @@ impl VirtualConsoleData {
             driver_funcs: None,
             cursor_type: VcCursor::empty(),
             num,
+            port: Arc::new(DefaultTtyPort::new()),
         }
+    }
+
+    #[inline]
+    pub fn port(&self) -> Arc<dyn TtyPort> {
+        self.port.clone()
     }
 
     pub(super) fn init(&mut self, rows: Option<usize>, cols: Option<usize>, clear: bool) {

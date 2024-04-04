@@ -27,7 +27,11 @@ use crate::{
         },
     },
     init::initcall::INITCALL_DEVICE,
-    libs::{keyboard_parser::TypeOneFSM, rwlock::RwLock, spinlock::SpinLock},
+    libs::{
+        keyboard_parser::TypeOneFSM,
+        rwlock::RwLock,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
     time::TimeSpec,
 };
 use system_error::SystemError;
@@ -115,7 +119,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
     }
@@ -125,16 +129,20 @@ impl IndexNode for LockedPS2KeyBoardInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         return Ok(());
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 

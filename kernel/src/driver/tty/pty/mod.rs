@@ -12,6 +12,7 @@ use crate::{
     },
     filesystem::devfs::devfs_register,
     init::initcall::INITCALL_DEVICE,
+    libs::lazy_init::Lazy,
     mm::VirtAddr,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
@@ -28,52 +29,65 @@ use super::{
 
 pub mod unix98pty;
 
-lazy_static! {
-    pub static ref PTM_DRIVER: Arc<TtyDriver> = {
-        let mut ptm_driver = TtyDriver::new(
-            NR_UNIX98_PTY_MAX,
-            "ptm",
-            0,
-            Major::UNIX98_PTY_MASTER_MAJOR,
-            0,
-            TtyDriverType::Pty,
-            *TTY_STD_TERMIOS,
-            Arc::new(Unix98PtyDriverInner::new()),
-        );
+static PTM_DRIVER: Lazy<Arc<TtyDriver>> = Lazy::new();
+static PTS_DRIVER: Lazy<Arc<TtyDriver>> = Lazy::new();
 
-        ptm_driver.set_subtype(TtyDriverSubType::PtyMaster);
-        let term = ptm_driver.init_termios_mut();
-        term.input_mode = InputMode::empty();
-        term.output_mode = OutputMode::empty();
-        term.control_mode = ControlMode::B38400 | ControlMode::CS8 | ControlMode::CREAD;
-        term.local_mode = LocalMode::empty();
-        term.input_speed = 38400;
-        term.output_speed = 38400;
-        TtyDriverManager::tty_register_driver(ptm_driver).unwrap()
-    };
-    pub static ref PTS_DRIVER: Arc<TtyDriver> = {
-        let mut pts_driver = TtyDriver::new(
-            NR_UNIX98_PTY_MAX,
-            "pts",
-            0,
-            Major::UNIX98_PTY_SLAVE_MAJOR,
-            0,
-            TtyDriverType::Pty,
-            *TTY_STD_TERMIOS,
-            Arc::new(Unix98PtyDriverInner::new()),
-        );
-
-        pts_driver.set_subtype(TtyDriverSubType::PtySlave);
-        let term = pts_driver.init_termios_mut();
-        term.input_mode = InputMode::empty();
-        term.output_mode = OutputMode::empty();
-        term.control_mode = ControlMode::B38400 | ControlMode::CS8 | ControlMode::CREAD;
-        term.local_mode = LocalMode::empty();
-        term.input_speed = 38400;
-        term.output_speed = 38400;
-        TtyDriverManager::tty_register_driver(pts_driver).unwrap()
-    };
+pub(super) fn ptm_driver() -> Arc<TtyDriver> {
+    PTM_DRIVER.ensure();
+    PTM_DRIVER.get().clone()
 }
+
+pub(super) fn pts_driver() -> Arc<TtyDriver> {
+    PTS_DRIVER.ensure();
+    PTS_DRIVER.get().clone()
+}
+
+// lazy_static! {
+//     pub static ref PTM_DRIVER: Arc<TtyDriver> = {
+//         let mut ptm_driver = TtyDriver::new(
+//             NR_UNIX98_PTY_MAX,
+//             "ptm",
+//             0,
+//             Major::UNIX98_PTY_MASTER_MAJOR,
+//             0,
+//             TtyDriverType::Pty,
+//             *TTY_STD_TERMIOS,
+//             Arc::new(Unix98PtyDriverInner::new()),
+//         );
+
+//         ptm_driver.set_subtype(TtyDriverSubType::PtyMaster);
+//         let term = ptm_driver.init_termios_mut();
+//         term.input_mode = InputMode::empty();
+//         term.output_mode = OutputMode::empty();
+//         term.control_mode = ControlMode::B38400 | ControlMode::CS8 | ControlMode::CREAD;
+//         term.local_mode = LocalMode::empty();
+//         term.input_speed = 38400;
+//         term.output_speed = 38400;
+//         TtyDriverManager::tty_register_driver(ptm_driver).unwrap()
+//     };
+//     pub static ref PTS_DRIVER: Arc<TtyDriver> = {
+//         let mut pts_driver = TtyDriver::new(
+//             NR_UNIX98_PTY_MAX,
+//             "pts",
+//             0,
+//             Major::UNIX98_PTY_SLAVE_MAJOR,
+//             0,
+//             TtyDriverType::Pty,
+//             *TTY_STD_TERMIOS,
+//             Arc::new(Unix98PtyDriverInner::new()),
+//         );
+
+//         pts_driver.set_subtype(TtyDriverSubType::PtySlave);
+//         let term = pts_driver.init_termios_mut();
+//         term.input_mode = InputMode::empty();
+//         term.output_mode = OutputMode::empty();
+//         term.control_mode = ControlMode::B38400 | ControlMode::CS8 | ControlMode::CREAD;
+//         term.local_mode = LocalMode::empty();
+//         term.input_speed = 38400;
+//         term.output_speed = 38400;
+//         TtyDriverManager::tty_register_driver(pts_driver).unwrap()
+//     };
+// }
 
 pub struct PtyCommon;
 
@@ -201,8 +215,10 @@ impl PtyCommon {
     }
 
     pub fn unix98pty_init() -> Result<(), SystemError> {
-        PTM_DRIVER.set_other_pty_driver(Arc::downgrade(&PTS_DRIVER));
-        PTS_DRIVER.set_other_pty_driver(Arc::downgrade(&PTM_DRIVER));
+        let ptm_driver = ptm_driver();
+        let pts_driver = pts_driver();
+        ptm_driver.set_other_pty_driver(Arc::downgrade(&pts_driver));
+        pts_driver.set_other_pty_driver(Arc::downgrade(&ptm_driver));
 
         let idt = IdTable::new(
             String::from("ptmx"),
@@ -218,8 +234,8 @@ impl PtyCommon {
         device_register(ptmx_dev.clone())?;
         devfs_register("ptmx", ptmx_dev)?;
 
-        TTY_DRIVERS.lock().push(PTM_DRIVER.clone());
-        TTY_DRIVERS.lock().push(PTS_DRIVER.clone());
+        TTY_DRIVERS.lock().push(ptm_driver);
+        TTY_DRIVERS.lock().push(pts_driver);
 
         Ok(())
     }
@@ -228,5 +244,45 @@ impl PtyCommon {
 #[unified_init(INITCALL_DEVICE)]
 #[inline(never)]
 pub fn pty_init() -> Result<(), SystemError> {
+    let mut ptm_driver = TtyDriver::new(
+        NR_UNIX98_PTY_MAX,
+        "ptm",
+        0,
+        Major::UNIX98_PTY_MASTER_MAJOR,
+        0,
+        TtyDriverType::Pty,
+        *TTY_STD_TERMIOS,
+        Arc::new(Unix98PtyDriverInner::new()),
+    );
+    ptm_driver.set_subtype(TtyDriverSubType::PtyMaster);
+    let term = ptm_driver.init_termios_mut();
+    term.input_mode = InputMode::empty();
+    term.output_mode = OutputMode::empty();
+    term.control_mode = ControlMode::B38400 | ControlMode::CS8 | ControlMode::CREAD;
+    term.local_mode = LocalMode::empty();
+    term.input_speed = 38400;
+    term.output_speed = 38400;
+    PTM_DRIVER.init(TtyDriverManager::tty_register_driver(ptm_driver).unwrap());
+
+    let mut pts_driver = TtyDriver::new(
+        NR_UNIX98_PTY_MAX,
+        "pts",
+        0,
+        Major::UNIX98_PTY_SLAVE_MAJOR,
+        0,
+        TtyDriverType::Pty,
+        *TTY_STD_TERMIOS,
+        Arc::new(Unix98PtyDriverInner::new()),
+    );
+    pts_driver.set_subtype(TtyDriverSubType::PtySlave);
+    let term = pts_driver.init_termios_mut();
+    term.input_mode = InputMode::empty();
+    term.output_mode = OutputMode::empty();
+    term.control_mode = ControlMode::B38400 | ControlMode::CS8 | ControlMode::CREAD;
+    term.local_mode = LocalMode::empty();
+    term.input_speed = 38400;
+    term.output_speed = 38400;
+    PTS_DRIVER.init(TtyDriverManager::tty_register_driver(pts_driver).unwrap());
+
     return PtyCommon::unix98pty_init();
 }

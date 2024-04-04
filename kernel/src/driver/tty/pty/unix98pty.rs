@@ -5,20 +5,23 @@ use crate::{
     driver::tty::{
         termios::Termios,
         tty_core::{TtyCore, TtyCoreData, TtyFlag, TtyIoctlCmd, TtyPacketStatus},
-        tty_device::{TtyDevice, TtyFilePrivateData},
+        tty_device::TtyFilePrivateData,
         tty_driver::{TtyDriver, TtyDriverPrivateData, TtyDriverSubType, TtyOperation},
-        tty_port::{DefaultTtyPort, TtyPort},
     },
-    filesystem::vfs::{
-        file::FileMode, syscall::ModeType, FilePrivateData, FileType, ROOT_INODE,
-        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    filesystem::{
+        devpts::DevPtsFs,
+        vfs::{
+            file::FileMode, syscall::ModeType, FilePrivateData, FileType, MountFS, ROOT_INODE,
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        },
     },
+    libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     net::event_poll::EPollEventType,
     syscall::user_access::UserBufferWriter,
 };
 
-use super::{PtyCommon, PTM_DRIVER, PTS_DRIVER};
+use super::{ptm_driver, pts_driver, PtyCommon};
 
 pub const NR_UNIX98_PTY_MAX: u32 = 128;
 
@@ -155,7 +158,7 @@ impl TtyOperation for Unix98PtyDriverInner {
         priv_data: TtyDriverPrivateData,
     ) -> Result<Arc<TtyCore>, SystemError> {
         if let TtyDriverPrivateData::Pty(false) = priv_data {
-            return PTS_DRIVER
+            return pts_driver()
                 .ttys()
                 .get(&index)
                 .cloned()
@@ -172,28 +175,31 @@ impl TtyOperation for Unix98PtyDriverInner {
         if tty.core().driver().tty_driver_sub_type() == TtyDriverSubType::PtySlave {
             let pts_root_inode =
                 ROOT_INODE().lookup_follow_symlink("/dev/pts", VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-            pts_root_inode.unlink(&tty.core().index().to_string())?;
+            let _ = pts_root_inode.unlink(&tty.core().index().to_string());
         }
 
         Ok(())
     }
 }
 
-pub fn ptmx_open(data: &mut FilePrivateData, mode: &FileMode) -> Result<(), SystemError> {
+pub fn ptmx_open(
+    mut data: SpinLockGuard<FilePrivateData>,
+    mode: &FileMode,
+) -> Result<(), SystemError> {
     let pts_root_inode =
         ROOT_INODE().lookup_follow_symlink("/dev/pts", VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-    // let fsinfo = pts_root_inode
-    //     .fs()
-    //     .downcast_arc::<MountFS>()
-    //     .unwrap()
-    //     .inner_filesystem()
-    //     .downcast_arc::<DevPtsFs>()
-    //     .unwrap();
 
-    // let index = fsinfo.alloc_index()?;
-    let index = 1;
+    let fs = pts_root_inode
+        .fs()
+        .as_any_ref()
+        .downcast_ref::<MountFS>()
+        .unwrap()
+        .inner_filesystem();
+    let fsinfo = fs.as_any_ref().downcast_ref::<DevPtsFs>().unwrap();
 
-    let tty = TtyDriver::init_tty_device(PTM_DRIVER.clone(), index)?;
+    let index = fsinfo.alloc_index()?;
+
+    let tty = TtyDriver::init_tty_device(ptm_driver(), index)?;
 
     // 设置privdata
     *data = FilePrivateData::Tty(TtyFilePrivateData {
@@ -210,7 +216,7 @@ pub fn ptmx_open(data: &mut FilePrivateData, mode: &FileMode) -> Result<(), Syst
         ModeType::from_bits_truncate(0x666),
     )?;
 
-    PTM_DRIVER.driver_funcs().open(core)?;
+    ptm_driver().driver_funcs().open(core)?;
 
     Ok(())
 }

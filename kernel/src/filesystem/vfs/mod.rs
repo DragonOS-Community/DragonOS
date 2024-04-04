@@ -16,7 +16,10 @@ use crate::{
         block::block_device::BlockDevice, char::CharDevice, device::device_number::DeviceNumber,
     },
     ipc::pipe::LockedPipeInode,
-    libs::casting::DowncastArc,
+    libs::{
+        casting::DowncastArc,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
     time::TimeSpec,
 };
 
@@ -120,7 +123,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
@@ -129,7 +136,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
@@ -148,7 +155,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
 
     /// @brief 在inode的指定偏移量开始，写入指定大小的数据（从buf的第0byte开始写入）
@@ -165,7 +172,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
 
     /// @brief 获取当前inode的状态。
@@ -495,7 +502,12 @@ impl dyn IndexNode {
             if inode.metadata()?.file_type == FileType::SymLink && max_follow_times > 0 {
                 let mut content = [0u8; 256];
                 // 读取符号链接
-                let len = inode.read_at(0, 256, &mut content, &mut FilePrivateData::Unused)?;
+                let len = inode.read_at(
+                    0,
+                    256,
+                    &mut content,
+                    SpinLock::new(FilePrivateData::Unused).lock(),
+                )?;
 
                 // 将读到的数据转换为utf8字符串（先转为str，再转为String）
                 let link_path = String::from(

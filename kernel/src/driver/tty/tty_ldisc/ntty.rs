@@ -11,7 +11,7 @@ use crate::{
     driver::tty::{
         termios::{ControlCharIndex, InputMode, LocalMode, OutputMode, Termios},
         tty_core::{EchoOperation, TtyCore, TtyCoreData, TtyFlag, TtyIoctlCmd, TtyPacketStatus},
-        tty_driver::{TtyDriverFlag, TtyDriverSubType, TtyOperation},
+        tty_driver::{TtyDriverFlag, TtyOperation},
         tty_job_control::TtyJobCtrlManager,
     },
     filesystem::vfs::file::FileMode,
@@ -1656,7 +1656,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
 
                     buf[offset] = cs.bits();
                     offset += 1;
-                    nr -= 1;
+                    // nr -= 1;
                     break;
                 }
             }

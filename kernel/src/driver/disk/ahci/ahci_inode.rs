@@ -6,6 +6,7 @@ use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{
     core::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
 };
+use crate::libs::spinlock::SpinLockGuard;
 use crate::{libs::spinlock::SpinLock, time::TimeSpec};
 use alloc::{
     string::String,
@@ -76,11 +77,15 @@ impl IndexNode for LockedAhciInode {
         self
     }
 
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
@@ -114,13 +119,13 @@ impl IndexNode for LockedAhciInode {
         offset: usize, // lba地址
         len: usize,
         buf: &mut [u8],
-        data: &mut FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
 
-        if let FilePrivateData::Unused = data {
+        if let FilePrivateData::Unused = *data {
             return self.0.lock().disk.read_at_bytes(offset, len, buf);
         }
 
@@ -133,13 +138,13 @@ impl IndexNode for LockedAhciInode {
         offset: usize, // lba地址
         len: usize,
         buf: &[u8],
-        data: &mut FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
 
-        if let FilePrivateData::Unused = data {
+        if let FilePrivateData::Unused = *data {
             return self.0.lock().disk.write_at_bytes(offset, len, buf);
         }
 

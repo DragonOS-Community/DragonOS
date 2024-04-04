@@ -822,11 +822,10 @@ impl ProcessControlBlock {
         let f = fd_table_guard.get_file_by_fd(fd)?;
         drop(fd_table_guard);
 
-        let guard = f.lock();
-        if guard.file_type() != FileType::Socket {
+        if f.file_type() != FileType::Socket {
             return None;
         }
-        let socket: Arc<SocketInode> = guard
+        let socket: Arc<SocketInode> = f
             .inode()
             .downcast_arc::<SocketInode>()
             .expect("Not a socket inode");

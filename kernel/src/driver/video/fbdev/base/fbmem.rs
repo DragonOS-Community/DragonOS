@@ -383,11 +383,15 @@ impl DeviceINode for FbDevice {
 }
 
 impl IndexNode for FbDevice {
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         Ok(())
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         Ok(())
     }
     fn read_at(
@@ -395,7 +399,7 @@ impl IndexNode for FbDevice {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let fb = self.inner.lock().fb.upgrade().unwrap();
         return fb.fb_read(&mut buf[0..len], offset);
@@ -406,7 +410,7 @@ impl IndexNode for FbDevice {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let fb = self.inner.lock().fb.upgrade().unwrap();
         return fb.fb_write(&buf[0..len], offset);

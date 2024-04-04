@@ -13,12 +13,10 @@ use crate::{
             device_number::{DeviceNumber, Major},
             device_register, IdTable,
         },
-        serial::serial8250::send_to_default_serial8250_port,
         video::fbdev::base::fbcon::framebuffer_console::BlittingFbConsole,
     },
     filesystem::devfs::devfs_register,
     libs::spinlock::SpinLock,
-    process::ProcessManager,
 };
 
 use self::virtual_console::{VirtualConsoleData, CURRENT_VCNUM};
@@ -241,7 +239,7 @@ impl TtyOperation for TtyConsoleDriverInner {
         Err(SystemError::ENOIOCTLCMD)
     }
 
-    fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
+    fn close(&self, _tty: Arc<TtyCore>) -> Result<(), SystemError> {
         Ok(())
     }
 }

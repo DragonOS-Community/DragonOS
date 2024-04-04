@@ -1,4 +1,4 @@
-use core::{fmt::Debug, sync::atomic::Ordering};
+use core::fmt::Debug;
 
 use alloc::{
     string::{String, ToString},
@@ -410,7 +410,7 @@ pub trait TtyOperation: Sync + Send + Debug {
 
     fn flush_chars(&self, tty: &TtyCoreData);
 
-    fn put_char(&self, tty: &TtyCoreData, ch: u8) -> Result<(), SystemError> {
+    fn put_char(&self, _tty: &TtyCoreData, _ch: u8) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
 

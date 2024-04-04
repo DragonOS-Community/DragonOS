@@ -6,7 +6,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use bitmap::{traits::BitMapOps, StaticBitmap};
 use ida::IdAllocator;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -17,26 +16,24 @@ use crate::{
             device_number::{DeviceNumber, Major},
             IdTable,
         },
-        serial::serial8250::send_to_default_serial8250_port,
         tty::{
             pty::unix98pty::NR_UNIX98_PTY_MAX,
             tty_device::{PtyType, TtyDevice, TtyType},
         },
     },
-    filesystem::{
-        devfs::DevFS,
-        vfs::{syscall::ModeType, FileType, ROOT_INODE},
-    },
+    filesystem::vfs::{syscall::ModeType, FileType, ROOT_INODE},
     init::initcall::INITCALL_FS,
-    libs::spinlock::SpinLock,
-    process::ProcessManager,
+    libs::spinlock::{SpinLock, SpinLockGuard},
     time::TimeSpec,
 };
 
-use super::vfs::{core::generate_inode_id, FileSystem, FsInfo, IndexNode, Metadata};
+use super::vfs::{
+    core::generate_inode_id, FilePrivateData, FileSystem, FsInfo, IndexNode, Metadata,
+};
 
 const DEV_PTYFS_MAX_NAMELEN: usize = 16;
 
+#[allow(dead_code)]
 const PTY_NR_LIMIT: usize = 4096;
 
 #[derive(Debug)]
@@ -147,7 +144,7 @@ impl PtsDevInode {
 impl IndexNode for LockedDevPtsFSInode {
     fn open(
         &self,
-        _data: &mut super::vfs::FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
         _mode: &super::vfs::file::FileMode,
     ) -> Result<(), SystemError> {
         Ok(())
@@ -160,27 +157,27 @@ impl IndexNode for LockedDevPtsFSInode {
         return Ok(metadata);
     }
 
-    fn close(&self, _data: &mut super::vfs::FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         // TODO: 回收
         Ok(())
     }
 
     fn read_at(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        _data: &mut super::vfs::FilePrivateData,
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         todo!()
     }
 
     fn write_at(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &[u8],
-        _data: &mut super::vfs::FilePrivateData,
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         todo!()
     }

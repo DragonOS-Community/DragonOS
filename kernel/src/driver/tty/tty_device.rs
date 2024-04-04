@@ -29,7 +29,10 @@ use crate::{
         vfs::{file::FileMode, syscall::ModeType, FilePrivateData, FileType, IndexNode, Metadata},
     },
     init::initcall::INITCALL_DEVICE,
-    libs::rwlock::{RwLock, RwLockWriteGuard},
+    libs::{
+        rwlock::{RwLock, RwLockWriteGuard},
+        spinlock::SpinLockGuard,
+    },
     mm::VirtAddr,
     net::event_poll::{EPollItem, EventPoll},
     process::ProcessManager,
@@ -128,10 +131,13 @@ impl TtyDevice {
 impl IndexNode for TtyDevice {
     fn open(
         &self,
-        data: &mut crate::filesystem::vfs::FilePrivateData,
+        mut data: SpinLockGuard<FilePrivateData>,
         mode: &crate::filesystem::vfs::file::FileMode,
     ) -> Result<(), SystemError> {
         if self.tty_type == TtyType::Pty(PtyType::Ptm) {
+            if let FilePrivateData::Tty(_) = &*data {
+                return Ok(());
+            }
             return ptmx_open(data, mode);
         }
         let dev_num = self.metadata()?.raw_dev;
@@ -177,13 +183,15 @@ impl IndexNode for TtyDevice {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: &mut crate::filesystem::vfs::FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
-        let (tty, mode) = if let FilePrivateData::Tty(tty_priv) = data {
+        let (tty, mode) = if let FilePrivateData::Tty(tty_priv) = &*data {
             (tty_priv.tty(), tty_priv.mode)
         } else {
             return Err(SystemError::EIO);
         };
+
+        drop(data);
 
         let ld = tty.ldisc();
         let mut offset = 0;
@@ -217,14 +225,15 @@ impl IndexNode for TtyDevice {
         _offset: usize,
         len: usize,
         buf: &[u8],
-        data: &mut crate::filesystem::vfs::FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         let mut count = len;
-        let (tty, mode) = if let FilePrivateData::Tty(tty_priv) = data {
+        let (tty, mode) = if let FilePrivateData::Tty(tty_priv) = &*data {
             (tty_priv.tty(), tty_priv.mode)
         } else {
             return Err(SystemError::EIO);
         };
+        drop(data);
         let ld = tty.ldisc();
         let core = tty.core();
         let mut chunk = 2048;
@@ -285,14 +294,14 @@ impl IndexNode for TtyDevice {
         Ok(())
     }
 
-    fn close(&self, data: &mut FilePrivateData) -> Result<(), SystemError> {
-        let (tty, _mode) = if let FilePrivateData::Tty(tty_priv) = data {
+    fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+        let (tty, _mode) = if let FilePrivateData::Tty(tty_priv) = &*data {
             (tty_priv.tty(), tty_priv.mode)
         } else {
             return Err(SystemError::EIO);
         };
-
-        return tty.close(tty.clone());
+        drop(data);
+        tty.close(tty.clone())
     }
 
     fn resize(&self, _len: usize) -> Result<(), SystemError> {

@@ -9,7 +9,10 @@ use alloc::{
 };
 use system_error::SystemError;
 
-use crate::{driver::base::device::device_number::DeviceNumber, libs::spinlock::SpinLock};
+use crate::{
+    driver::base::device::device_number::DeviceNumber,
+    libs::spinlock::{SpinLock, SpinLockGuard},
+};
 
 use super::{
     file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
@@ -159,11 +162,15 @@ impl MountFSInode {
 }
 
 impl IndexNode for MountFSInode {
-    fn open(&self, data: &mut FilePrivateData, mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        data: SpinLockGuard<FilePrivateData>,
+        mode: &FileMode,
+    ) -> Result<(), SystemError> {
         return self.inner_inode.open(data, mode);
     }
 
-    fn close(&self, data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         return self.inner_inode.close(data);
     }
 
@@ -193,7 +200,7 @@ impl IndexNode for MountFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: &mut FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return self.inner_inode.read_at(offset, len, buf, data);
     }
@@ -203,7 +210,7 @@ impl IndexNode for MountFSInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        data: &mut FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return self.inner_inode.write_at(offset, len, buf, data);
     }

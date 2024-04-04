@@ -16,7 +16,7 @@ use crate::{
     arch::{sched::sched, CurrentIrqArch},
     exception::{irqdesc::IrqAction, InterruptArch},
     init::initial_kthread::initial_kernel_thread,
-    kdebug, kinfo,
+    kinfo,
     libs::{once::Once, spinlock::SpinLock},
     process::{ProcessManager, ProcessState},
 };
@@ -439,7 +439,6 @@ impl KernelThreadMechanism {
     #[inline(never)]
     fn kthread_daemon() -> i32 {
         let current_pcb = ProcessManager::current_pcb();
-        kdebug!("kthread_daemon: pid: {:?}", current_pcb.pid());
         {
             // 初始化worker_private
             let mut worker_private_guard = current_pcb.worker_private();
@@ -454,7 +453,6 @@ impl KernelThreadMechanism {
             let mut list = KTHREAD_CREATE_LIST.lock();
             while let Some(info) = list.pop_front() {
                 drop(list);
-
                 // create a new kernel thread
                 let result: Result<Pid, SystemError> = Self::__inner_create(
                     &info,

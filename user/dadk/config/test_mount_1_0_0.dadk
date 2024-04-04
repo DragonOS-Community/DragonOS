@@ -1,5 +1,5 @@
 {
-  "name": "test-mount",
+  "name": "test_mount",
   "version": "1.0.0",
   "description": "to test user mode mount",
   "task_type": {

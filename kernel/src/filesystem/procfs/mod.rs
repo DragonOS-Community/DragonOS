@@ -257,10 +257,10 @@ impl ProcFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _pdata: &mut ProcfsFilePrivateData,
+        pdata: &mut ProcfsFilePrivateData,
     ) -> Result<usize, SystemError> {
-        let start = _pdata.data.len().min(offset);
-        let end = _pdata.data.len().min(offset + len);
+        let start = pdata.data.len().min(offset);
+        let end = pdata.data.len().min(offset + len);
 
         // buffer空间不足
         if buf.len() < (end - start) {
@@ -268,7 +268,7 @@ impl ProcFSInode {
         }
 
         // 拷贝数据
-        let src = &_pdata.data[start..end];
+        let src = &pdata.data[start..end];
         buf[0..src.len()].copy_from_slice(src);
         return Ok(src.len());
     }

@@ -809,7 +809,6 @@ fn __clocksource_watchdog_kthread() {
             .clocksource_enqueue_watchdog()
             .expect("clocksource_watchdog_kthread: failed to enqueue watchdog list");
     }
-
 }
 
 /// # watchdog线程的逻辑，执行unstable的后续操作

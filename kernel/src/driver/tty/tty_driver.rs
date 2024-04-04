@@ -218,7 +218,7 @@ impl TtyDriver {
     }
 
     #[inline]
-    fn lockup_tty(&self, index: usize) -> Option<Arc<TtyCore>> {
+    fn lookup_tty(&self, index: usize) -> Option<Arc<TtyCore>> {
         let ret = self
             .driver_funcs()
             .lookup(index, TtyDriverPrivateData::Unused);
@@ -280,7 +280,7 @@ impl TtyDriver {
 
     /// ## 通过设备号找到对应驱动并且初始化Tty
     pub fn open_tty(index: usize, driver: Arc<TtyDriver>) -> Result<Arc<TtyCore>, SystemError> {
-        let tty = match driver.lockup_tty(index) {
+        let tty = match driver.lookup_tty(index) {
             Some(tty) => {
                 // TODO: 暂时这么写，因为还没写TtyPort
                 if tty.core().port().is_none() {

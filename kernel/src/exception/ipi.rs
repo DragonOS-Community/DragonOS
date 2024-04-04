@@ -7,7 +7,7 @@ use crate::arch::driver::apic::{CurrentApic, LocalAPIC};
 use crate::{
     arch::MMArch,
     mm::MemoryManagementArch,
-    new_sched::{schedule, SchedMode},
+    sched::{SchedMode, __schedule},
     smp::cpu::ProcessorId,
 };
 
@@ -55,7 +55,7 @@ impl IrqHandler for KickCpuIpiHandler {
         CurrentApic.send_eoi();
 
         // 被其他cpu kick时应该是抢占调度
-        schedule(SchedMode::SM_PREEMPT);
+        __schedule(SchedMode::SM_PREEMPT);
         Ok(IrqReturn::Handled)
     }
 }

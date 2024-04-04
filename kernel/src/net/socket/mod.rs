@@ -25,7 +25,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::EventWaitQueue,
     },
-    new_sched::{schedule, SchedMode},
+    sched::{schedule, SchedMode},
 };
 
 use self::{

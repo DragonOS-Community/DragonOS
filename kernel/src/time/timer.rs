@@ -19,8 +19,8 @@ use crate::{
     },
     kerror, kinfo,
     libs::spinlock::{SpinLock, SpinLockGuard},
-    new_sched::{schedule, SchedMode},
     process::{ProcessControlBlock, ProcessManager},
+    sched::{schedule, SchedMode},
 };
 
 use super::timekeeping::update_wall_time;

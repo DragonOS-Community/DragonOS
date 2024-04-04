@@ -59,7 +59,7 @@ fn do_start_kernel() {
     unsafe {
         acpi_init()
     };
-    crate::new_sched::sched_init();
+    crate::sched::sched_init();
     process_init();
     early_smp_init().expect("early smp init failed");
     irq_init().expect("irq init failed");

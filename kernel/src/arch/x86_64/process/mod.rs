@@ -563,7 +563,7 @@ pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<Str
     current_pcb.flags().remove(ProcessFlags::KTHREAD);
     current_pcb.worker_private().take();
 
-    *current_pcb.sched_info().sched_policy.write_irqsave() = crate::new_sched::SchedPolicy::CFS;
+    *current_pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::CFS;
 
     let mut trap_frame = TrapFrame::new();
 

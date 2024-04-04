@@ -6,10 +6,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::libs::rbtree::RBTree;
 use crate::libs::spinlock::SpinLock;
-use crate::new_sched::clock::ClockUpdataFlag;
-use crate::new_sched::{cpu_rq, SchedFeature, SCHED_FEATURES};
 use crate::process::ProcessControlBlock;
 use crate::process::ProcessFlags;
+use crate::sched::clock::ClockUpdataFlag;
+use crate::sched::{cpu_rq, SchedFeature, SCHED_FEATURES};
 use crate::smp::core::smp_get_processor_id;
 use crate::time::jiffies::TICK_NESC;
 use crate::time::timer::clock;

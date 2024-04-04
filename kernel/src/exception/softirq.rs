@@ -16,8 +16,8 @@ use crate::{
     kdebug, kinfo,
     libs::rwlock::RwLock,
     mm::percpu::{PerCpu, PerCpuVar},
-    new_sched::cputime::IrqTime,
     process::ProcessManager,
+    sched::cputime::IrqTime,
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
     time::timer::clock,
 };

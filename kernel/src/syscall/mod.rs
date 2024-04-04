@@ -11,12 +11,12 @@ use crate::{
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::syscall::MremapFlags,
     net::syscall::MsgHdr,
-    new_sched::{schedule, SchedMode},
     process::{
         fork::KernelCloneArgs,
         resource::{RLimit64, RUsage},
         ProcessFlags, ProcessManager,
     },
+    sched::{schedule, SchedMode},
     syscall::user_access::check_and_clone_cstr,
 };
 

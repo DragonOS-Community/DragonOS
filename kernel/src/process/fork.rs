@@ -9,8 +9,8 @@ use crate::{
     ipc::signal::flush_signal_handlers,
     libs::rwlock::RwLock,
     mm::VirtAddr,
-    new_sched::{sched_cgroup_fork, sched_fork},
     process::ProcessFlags,
+    sched::{sched_cgroup_fork, sched_fork},
     smp::core::smp_get_processor_id,
     syscall::user_access::UserBufferWriter,
 };

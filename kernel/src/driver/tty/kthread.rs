@@ -6,11 +6,11 @@ use kdepends::thingbuf::StaticThingBuf;
 use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
-    new_sched::{schedule, SchedMode},
     process::{
         kthread::{KernelThreadClosure, KernelThreadMechanism},
         ProcessControlBlock, ProcessManager,
     },
+    sched::{schedule, SchedMode},
 };
 
 use super::tty_port::current_tty_port;

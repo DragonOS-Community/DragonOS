@@ -22,8 +22,8 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
-    new_sched::{schedule, SchedMode},
     process::ProcessManager,
+    sched::{schedule, SchedMode},
     time::{
         timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
         TimeSpec,

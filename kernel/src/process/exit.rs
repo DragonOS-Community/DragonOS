@@ -9,7 +9,7 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    new_sched::{schedule, SchedMode},
+    sched::{schedule, SchedMode},
     syscall::user_access::UserBufferWriter,
 };
 

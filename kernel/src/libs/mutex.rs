@@ -10,8 +10,8 @@ use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
     libs::spinlock::SpinLockGuard,
-    new_sched::{schedule, SchedMode},
     process::{Pid, ProcessControlBlock, ProcessManager},
+    sched::{schedule, SchedMode},
 };
 
 use super::spinlock::SpinLock;

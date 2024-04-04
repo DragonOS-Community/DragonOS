@@ -12,8 +12,8 @@ use crate::{
     exception::InterruptArch,
     libs::spinlock::{SpinLock, SpinLockGuard},
     mm::{ucontext::AddressSpace, MemoryManagementArch, VirtAddr},
-    new_sched::{schedule, SchedMode},
     process::{ProcessControlBlock, ProcessManager},
+    sched::{schedule, SchedMode},
     syscall::user_access::UserBufferReader,
     time::{
         timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},

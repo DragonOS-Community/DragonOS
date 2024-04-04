@@ -7,8 +7,8 @@ use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
     kerror,
-    new_sched::{schedule, SchedMode},
     process::{ProcessControlBlock, ProcessManager, ProcessState},
+    sched::{schedule, SchedMode},
 };
 
 use super::{

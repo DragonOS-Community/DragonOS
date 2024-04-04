@@ -4,8 +4,8 @@ use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
     kBUG,
-    new_sched::{SchedMode, __schedule},
     process::{ProcessFlags, ProcessManager},
+    sched::{SchedMode, __schedule},
 };
 
 impl ProcessManager {

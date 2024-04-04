@@ -55,7 +55,6 @@ mod ipc;
 mod misc;
 mod mm;
 mod net;
-mod new_sched;
 mod process;
 mod sched;
 mod smp;

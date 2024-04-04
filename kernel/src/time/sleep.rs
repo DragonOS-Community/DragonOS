@@ -7,8 +7,8 @@ use crate::{
     arch::{CurrentIrqArch, CurrentTimeArch},
     exception::InterruptArch,
     include::bindings::bindings::useconds_t,
-    new_sched::{schedule, SchedMode},
     process::ProcessManager,
+    sched::{schedule, SchedMode},
     time::timekeeping::getnstimeofday,
 };
 

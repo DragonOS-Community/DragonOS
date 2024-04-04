@@ -16,8 +16,8 @@ use crate::{
     },
     kerror,
     mm::MemoryManagementArch,
-    new_sched::{schedule, SchedMode},
     process::ProcessManager,
+    sched::{schedule, SchedMode},
     syscall::{user_access::UserBufferWriter, Syscall},
 };
 

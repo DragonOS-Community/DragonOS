@@ -3,7 +3,7 @@ use core::{
     hint::spin_loop,
     intrinsics::{likely, unlikely},
     mem::ManuallyDrop,
-    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicIsize, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -36,7 +36,7 @@ use crate::{
             futex::Futex,
         },
         lock_free_flags::LockFreeFlags,
-        rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
+        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
@@ -47,11 +47,11 @@ use crate::{
         VirtAddr,
     },
     net::socket::SocketInode,
-    new_sched::{
+    sched::completion::Completion,
+    sched::{
         cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag, EnqueueFlag, OnRq, SchedMode,
         WakeupFlags, __schedule,
     },
-    sched::{completion::Completion, SchedPriority},
     smp::{
         core::smp_get_processor_id,
         cpu::{AtomicProcessorId, ProcessorId},
@@ -1074,18 +1074,17 @@ pub struct ProcessSchedulerInfo {
     on_cpu: AtomicProcessorId,
     /// 如果当前进程等待被迁移到另一个cpu核心上（也就是flags中的PF_NEED_MIGRATE被置位），
     /// 该字段存储要被迁移到的目标处理器核心号
-    migrate_to: AtomicProcessorId,
+    // migrate_to: AtomicProcessorId,
     inner_locked: RwLock<InnerSchedInfo>,
     /// 进程的调度优先级
-    priority: SchedPriority,
+    // priority: SchedPriority,
     /// 当前进程的虚拟运行时间
-    virtual_runtime: AtomicIsize,
+    // virtual_runtime: AtomicIsize,
     /// 由实时调度器管理的时间片
-    rt_time_slice: AtomicIsize,
-
+    // rt_time_slice: AtomicIsize,
     pub sched_stat: RwLock<SchedInfo>,
     /// 调度策略
-    pub sched_policy: RwLock<crate::new_sched::SchedPolicy>,
+    pub sched_policy: RwLock<crate::sched::SchedPolicy>,
     /// cfs调度实体
     pub sched_entity: Arc<FairSchedEntity>,
     pub on_rq: SpinLock<OnRq>,
@@ -1158,16 +1157,16 @@ impl ProcessSchedulerInfo {
         let cpu_id = on_cpu.unwrap_or(ProcessorId::INVALID);
         return Self {
             on_cpu: AtomicProcessorId::new(cpu_id),
-            migrate_to: AtomicProcessorId::new(ProcessorId::INVALID),
+            // migrate_to: AtomicProcessorId::new(ProcessorId::INVALID),
             inner_locked: RwLock::new(InnerSchedInfo {
                 state: ProcessState::Blocked(false),
                 sleep: false,
             }),
-            virtual_runtime: AtomicIsize::new(0),
-            rt_time_slice: AtomicIsize::new(0),
-            priority: SchedPriority::new(100).unwrap(),
+            // virtual_runtime: AtomicIsize::new(0),
+            // rt_time_slice: AtomicIsize::new(0),
+            // priority: SchedPriority::new(100).unwrap(),
             sched_stat: RwLock::new(SchedInfo::default()),
-            sched_policy: RwLock::new(crate::new_sched::SchedPolicy::CFS),
+            sched_policy: RwLock::new(crate::sched::SchedPolicy::CFS),
             sched_entity: FairSchedEntity::new(),
             on_rq: SpinLock::new(OnRq::None),
             prio_data: RwLock::new(PrioData::default()),
@@ -1195,23 +1194,23 @@ impl ProcessSchedulerInfo {
         }
     }
 
-    pub fn migrate_to(&self) -> Option<ProcessorId> {
-        let migrate_to = self.migrate_to.load(Ordering::SeqCst);
-        if migrate_to == ProcessorId::INVALID {
-            return None;
-        } else {
-            return Some(migrate_to);
-        }
-    }
+    // pub fn migrate_to(&self) -> Option<ProcessorId> {
+    //     let migrate_to = self.migrate_to.load(Ordering::SeqCst);
+    //     if migrate_to == ProcessorId::INVALID {
+    //         return None;
+    //     } else {
+    //         return Some(migrate_to);
+    //     }
+    // }
 
-    pub fn set_migrate_to(&self, migrate_to: Option<ProcessorId>) {
-        if let Some(data) = migrate_to {
-            self.migrate_to.store(data, Ordering::SeqCst);
-        } else {
-            self.migrate_to
-                .store(ProcessorId::INVALID, Ordering::SeqCst)
-        }
-    }
+    // pub fn set_migrate_to(&self, migrate_to: Option<ProcessorId>) {
+    //     if let Some(data) = migrate_to {
+    //         self.migrate_to.store(data, Ordering::SeqCst);
+    //     } else {
+    //         self.migrate_to
+    //             .store(ProcessorId::INVALID, Ordering::SeqCst)
+    //     }
+    // }
 
     pub fn inner_lock_write_irqsave(&self) -> RwLockWriteGuard<InnerSchedInfo> {
         return self.inner_locked.write_irqsave();
@@ -1221,61 +1220,57 @@ impl ProcessSchedulerInfo {
         return self.inner_locked.read_irqsave();
     }
 
-    pub fn inner_lock_try_read_irqsave(
-        &self,
-        times: u8,
-    ) -> Option<RwLockReadGuard<InnerSchedInfo>> {
-        for _ in 0..times {
-            if let Some(r) = self.inner_locked.try_read_irqsave() {
-                return Some(r);
-            }
-        }
+    // pub fn inner_lock_try_read_irqsave(
+    //     &self,
+    //     times: u8,
+    // ) -> Option<RwLockReadGuard<InnerSchedInfo>> {
+    //     for _ in 0..times {
+    //         if let Some(r) = self.inner_locked.try_read_irqsave() {
+    //             return Some(r);
+    //         }
+    //     }
 
-        return None;
-    }
+    //     return None;
+    // }
 
-    pub fn inner_lock_try_upgradable_read_irqsave(
-        &self,
-        times: u8,
-    ) -> Option<RwLockUpgradableGuard<InnerSchedInfo>> {
-        for _ in 0..times {
-            if let Some(r) = self.inner_locked.try_upgradeable_read_irqsave() {
-                return Some(r);
-            }
-        }
+    // pub fn inner_lock_try_upgradable_read_irqsave(
+    //     &self,
+    //     times: u8,
+    // ) -> Option<RwLockUpgradableGuard<InnerSchedInfo>> {
+    //     for _ in 0..times {
+    //         if let Some(r) = self.inner_locked.try_upgradeable_read_irqsave() {
+    //             return Some(r);
+    //         }
+    //     }
 
-        return None;
-    }
+    //     return None;
+    // }
 
-    pub fn virtual_runtime(&self) -> isize {
-        return self.virtual_runtime.load(Ordering::SeqCst);
-    }
+    // pub fn virtual_runtime(&self) -> isize {
+    //     return self.virtual_runtime.load(Ordering::SeqCst);
+    // }
 
-    pub fn set_virtual_runtime(&self, virtual_runtime: isize) {
-        self.virtual_runtime
-            .store(virtual_runtime, Ordering::SeqCst);
-    }
-    pub fn increase_virtual_runtime(&self, delta: isize) {
-        self.virtual_runtime.fetch_add(delta, Ordering::SeqCst);
-    }
+    // pub fn set_virtual_runtime(&self, virtual_runtime: isize) {
+    //     self.virtual_runtime
+    //         .store(virtual_runtime, Ordering::SeqCst);
+    // }
+    // pub fn increase_virtual_runtime(&self, delta: isize) {
+    //     self.virtual_runtime.fetch_add(delta, Ordering::SeqCst);
+    // }
 
-    pub fn rt_time_slice(&self) -> isize {
-        return self.rt_time_slice.load(Ordering::SeqCst);
-    }
+    // pub fn rt_time_slice(&self) -> isize {
+    //     return self.rt_time_slice.load(Ordering::SeqCst);
+    // }
 
-    pub fn set_rt_time_slice(&self, rt_time_slice: isize) {
-        self.rt_time_slice.store(rt_time_slice, Ordering::SeqCst);
-    }
+    // pub fn set_rt_time_slice(&self, rt_time_slice: isize) {
+    //     self.rt_time_slice.store(rt_time_slice, Ordering::SeqCst);
+    // }
 
-    pub fn increase_rt_time_slice(&self, delta: isize) {
-        self.rt_time_slice.fetch_add(delta, Ordering::SeqCst);
-    }
+    // pub fn increase_rt_time_slice(&self, delta: isize) {
+    //     self.rt_time_slice.fetch_add(delta, Ordering::SeqCst);
+    // }
 
-    pub fn priority(&self) -> SchedPriority {
-        return self.priority;
-    }
-
-    pub fn policy(&self) -> crate::new_sched::SchedPolicy {
+    pub fn policy(&self) -> crate::sched::SchedPolicy {
         return *self.sched_policy.read_irqsave();
     }
 }

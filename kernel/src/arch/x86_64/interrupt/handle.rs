@@ -3,11 +3,11 @@ use core::intrinsics::likely;
 use crate::{
     arch::driver::apic::{apic_timer::APIC_TIMER_IRQ_NUM, CurrentApic, LocalAPIC},
     exception::{irqdesc::irq_desc_manager, softirq::do_softirq, IrqNumber},
-    new_sched::{SchedMode, __schedule},
     process::{
         utils::{current_pcb_flags, current_pcb_preempt_count},
         ProcessFlags,
     },
+    sched::{SchedMode, __schedule},
 };
 
 use super::TrapFrame;

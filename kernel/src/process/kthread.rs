@@ -18,8 +18,8 @@ use crate::{
     init::initial_kthread::initial_kernel_thread,
     kdebug, kinfo,
     libs::{once::Once, spinlock::SpinLock},
-    new_sched::{schedule, SchedMode},
     process::{ProcessManager, ProcessState},
+    sched::{schedule, SchedMode},
 };
 
 use super::{fork::CloneFlags, Pid, ProcessControlBlock, ProcessFlags};

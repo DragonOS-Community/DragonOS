@@ -7,8 +7,8 @@ use crate::{
     },
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
     net::event_poll::{EPollEventType, EPollItem, EventPoll},
-    new_sched::{schedule, SchedMode},
     process::ProcessState,
+    sched::{schedule, SchedMode},
     time::TimeSpec,
 };
 

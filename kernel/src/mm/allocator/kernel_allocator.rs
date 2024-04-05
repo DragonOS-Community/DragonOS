@@ -1,4 +1,4 @@
-use klog_types::AllocLogItem;
+use klog_types::{AllocLogItem, LogSource};
 
 use crate::{
     arch::mm::LockedFrameAllocator,
@@ -62,13 +62,13 @@ impl KernelAllocator {
 /// 为内核分配器实现LocalAlloc的trait
 impl LocalAlloc for KernelAllocator {
     unsafe fn local_alloc(&self, layout: Layout) -> *mut u8 {
-        if layout.size() > 2048 || !slab_init_state() {
+        if allocator_select_condition(layout) {
             return self
                 .alloc_in_buddy(layout)
                 .map(|x| x.as_mut_ptr())
                 .unwrap_or(core::ptr::null_mut());
         } else {
-            if let Some(ref mut slab) = *SLABALLOCATOR.lock_irqsave() {
+            if let Some(ref mut slab) = SLABALLOCATOR {
                 return slab.allocate(layout);
             };
             return core::ptr::null_mut();
@@ -76,7 +76,7 @@ impl LocalAlloc for KernelAllocator {
     }
 
     unsafe fn local_alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if layout.size() > 2048 || !slab_init_state() {
+        if allocator_select_condition(layout) {
             return self
                 .alloc_in_buddy(layout)
                 .map(|x| {
@@ -86,7 +86,7 @@ impl LocalAlloc for KernelAllocator {
                 })
                 .unwrap_or(core::ptr::null_mut());
         } else {
-            if let Some(ref mut slab) = *SLABALLOCATOR.lock_irqsave() {
+            if let Some(ref mut slab) = SLABALLOCATOR {
                 return slab.allocate(layout);
             };
             return core::ptr::null_mut();
@@ -97,7 +97,7 @@ impl LocalAlloc for KernelAllocator {
         // self.free_in_buddy(ptr, layout)
         if layout.size() > 2048 || !slab_init_state() {
             self.free_in_buddy(ptr, layout)
-        } else if let Some(ref mut slab) = *SLABALLOCATOR.lock_irqsave() {
+        } else if let Some(ref mut slab) = SLABALLOCATOR {
             slab.deallocate(ptr, layout).unwrap()
         }
     }
@@ -106,88 +106,51 @@ impl LocalAlloc for KernelAllocator {
 /// 为内核slab分配器实现GlobalAlloc特性
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if layout.size() > 2048 || !slab_init_state() {
-            let r = self.local_alloc_zeroed(layout);
-            mm_debug_log(
-                klog_types::AllocatorLogType::Alloc(AllocLogItem::new(
-                    layout,
-                    Some(r as usize),
-                    None,
-                )),
-                klog_types::LogSource::Buddy,
-            );
-
-            return r;
+        let r = self.local_alloc_zeroed(layout);
+        if allocator_select_condition(layout) {
+            alloc_debug_log(klog_types::LogSource::Buddy, layout, r);
         } else {
-            let r = self.local_alloc_zeroed(layout);
-            mm_debug_log(
-                klog_types::AllocatorLogType::Alloc(AllocLogItem::new(
-                    layout,
-                    Some(r as usize),
-                    None,
-                )),
-                klog_types::LogSource::Slab,
-            );
-
-            return r;
+            alloc_debug_log(klog_types::LogSource::Slab, layout, r);
         }
+        return r;
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if layout.size() > 2048 || !slab_init_state() {
-            let r = self.local_alloc_zeroed(layout);
-
-            mm_debug_log(
-                klog_types::AllocatorLogType::AllocZeroed(AllocLogItem::new(
-                    layout,
-                    Some(r as usize),
-                    None,
-                )),
-                klog_types::LogSource::Buddy,
-            );
-
-            return r;
+        let r = self.local_alloc_zeroed(layout);
+        if allocator_select_condition(layout) {
+            alloc_debug_log(klog_types::LogSource::Buddy, layout, r);
         } else {
-            let r = self.local_alloc_zeroed(layout);
-
-            mm_debug_log(
-                klog_types::AllocatorLogType::AllocZeroed(AllocLogItem::new(
-                    layout,
-                    Some(r as usize),
-                    None,
-                )),
-                klog_types::LogSource::Slab,
-            );
-
-            return r;
+            alloc_debug_log(klog_types::LogSource::Slab, layout, r);
         }
+        return r;
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if layout.size() > 2048 || !slab_init_state() {
-            mm_debug_log(
-                klog_types::AllocatorLogType::Free(AllocLogItem::new(
-                    layout,
-                    Some(ptr as usize),
-                    None,
-                )),
-                klog_types::LogSource::Buddy,
-            );
-
-            self.local_dealloc(ptr, layout);
+        if allocator_select_condition(layout) {
+            dealloc_debug_log(klog_types::LogSource::Buddy, layout, ptr);
         } else {
-            mm_debug_log(
-                klog_types::AllocatorLogType::Free(AllocLogItem::new(
-                    layout,
-                    Some(ptr as usize),
-                    None,
-                )),
-                klog_types::LogSource::Slab,
-            );
-
-            self.local_dealloc(ptr, layout);
+            dealloc_debug_log(klog_types::LogSource::Slab, layout, ptr);
         }
+        self.local_dealloc(ptr, layout);
     }
+}
+
+fn allocator_select_condition(layout: Layout) -> bool {
+    layout.size() > 2048 || !slab_init_state()
+}
+
+fn alloc_debug_log(source: LogSource, layout: Layout, ptr: *mut u8) {
+    mm_debug_log(
+        klog_types::AllocatorLogType::Alloc(AllocLogItem::new(layout, Some(ptr as usize), None)),
+        source,
+    )
+}
+
+fn dealloc_debug_log(source: LogSource, layout: Layout, ptr: *mut u8) {
+    mm_debug_log(
+        klog_types::AllocatorLogType::Free(AllocLogItem::new(layout, Some(ptr as usize), None)),
+        source,
+    )
 }
 
 /// 为内核slab分配器实现Allocator特性

@@ -1,18 +1,16 @@
 //! 当前slab分配器暂时不使用，等待后续完善后合并主线
 #![allow(dead_code)]
 
-use core::{alloc::Layout, ptr::NonNull};
+use core::{alloc::Layout, ptr::NonNull, sync::atomic::AtomicBool};
 
 use alloc::boxed::Box;
 use slabmalloc::*;
 
-use crate::libs::spinlock::SpinLock;
-
 // 全局slab分配器
-pub(crate) static SLABALLOCATOR: SpinLock<Option<SlabAllocator>> = SpinLock::new(None);
+pub(crate) static mut SLABALLOCATOR: Option<SlabAllocator> = None;
 
 // slab初始化状态
-pub(crate) static mut SLABINITSTATE: bool = false;
+pub(crate) static mut SLABINITSTATE: AtomicBool = AtomicBool::new(false);
 
 /// slab分配器，实际为一堆小的allocator，可以在里面装4K的page
 /// 利用这些allocator可以为对象分配不同大小的空间
@@ -69,11 +67,11 @@ impl SlabAllocator {
 /// 初始化slab分配器
 pub unsafe fn slab_init() {
     kdebug!("trying to init a slab_allocator");
-    *SLABALLOCATOR.lock() = Some(SlabAllocator::new());
-    SLABINITSTATE = true;
+    SLABALLOCATOR = Some(SlabAllocator::new());
+    SLABINITSTATE = true.into();
 }
 
 // 查看slab初始化状态
 pub fn slab_init_state() -> bool {
-    unsafe { SLABINITSTATE }
+    unsafe { *SLABINITSTATE.get_mut() }
 }

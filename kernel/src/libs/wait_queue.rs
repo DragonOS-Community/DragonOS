@@ -4,10 +4,11 @@ use core::intrinsics::unlikely;
 use alloc::{collections::LinkedList, sync::Arc, vec::Vec};
 
 use crate::{
-    arch::{sched::sched, CurrentIrqArch},
+    arch::CurrentIrqArch,
     exception::InterruptArch,
     kerror,
     process::{ProcessControlBlock, ProcessManager, ProcessState},
+    sched::{schedule, SchedMode},
 };
 
 use super::{
@@ -40,7 +41,7 @@ impl WaitQueue {
         });
         guard.wait_list.push_back(ProcessManager::current_pcb());
         drop(guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     /// @brief 让当前进程在等待队列上进行等待，并且,在释放waitqueue的锁之前，执行f函数闭包
@@ -59,7 +60,7 @@ impl WaitQueue {
         f();
 
         drop(guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     /// @brief 让当前进程在等待队列上进行等待. 但是，在释放waitqueue的锁之后，不会调用调度函数。
@@ -110,7 +111,7 @@ impl WaitQueue {
         drop(irq_guard);
         guard.wait_list.push_back(ProcessManager::current_pcb());
         drop(guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断。
@@ -126,7 +127,7 @@ impl WaitQueue {
         guard.wait_list.push_back(ProcessManager::current_pcb());
         drop(to_unlock);
         drop(guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断。
@@ -142,7 +143,7 @@ impl WaitQueue {
         guard.wait_list.push_back(ProcessManager::current_pcb());
         drop(to_unlock);
         drop(guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     /// @brief 让当前进程在等待队列上进行等待，并且，不允许被信号打断。
@@ -158,7 +159,7 @@ impl WaitQueue {
         guard.wait_list.push_back(ProcessManager::current_pcb());
         drop(to_unlock);
         drop(guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     /// @brief 让当前进程在等待队列上进行等待，并且，不允许被信号打断。
@@ -176,7 +177,7 @@ impl WaitQueue {
 
         drop(to_unlock);
         drop(guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     /// @brief 唤醒在队列中等待的第一个进程。
@@ -306,7 +307,7 @@ impl EventWaitQueue {
         });
         guard.push((events, ProcessManager::current_pcb()));
         drop(guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     pub unsafe fn sleep_without_schedule(&self, events: u64) {
@@ -330,7 +331,7 @@ impl EventWaitQueue {
         guard.push((events, ProcessManager::current_pcb()));
         drop(to_unlock);
         drop(guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     /// ### 唤醒该队列上等待events的进程

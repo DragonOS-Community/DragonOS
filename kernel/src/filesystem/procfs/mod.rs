@@ -168,8 +168,8 @@ impl ProcFSInode {
             .map(|cpu| cpu.data() as i32)
             .unwrap_or(-1);
 
-        let priority = sched_info_guard.priority();
-        let vrtime = sched_info_guard.virtual_runtime();
+        let priority = sched_info_guard.policy();
+        let vrtime = sched_info_guard.sched_entity.vruntime;
 
         pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
         pdata.append(
@@ -183,11 +183,7 @@ impl ProcFSInode {
                 .to_owned(),
         );
         pdata.append(&mut format!("\ncpu_id:\t{}", cpu_id).as_bytes().to_owned());
-        pdata.append(
-            &mut format!("\npriority:\t{}", priority.data())
-                .as_bytes()
-                .to_owned(),
-        );
+        pdata.append(&mut format!("\npriority:\t{:?}", priority).as_bytes().to_owned());
         pdata.append(
             &mut format!("\npreempt:\t{}", pcb.preempt_count())
                 .as_bytes()

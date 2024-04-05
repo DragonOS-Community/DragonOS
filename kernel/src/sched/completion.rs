@@ -24,7 +24,7 @@ impl Completion {
 
     /// @brief 基本函数：通用的处理wait命令的函数(即所有wait_for_completion函数最核心部分在这里)
     ///
-    /// @param timeout 非负整数
+    /// @param timeout jiffies
     /// @param interuptible 设置进程是否能被打断
     /// @return 返回剩余时间或者SystemError
     fn do_wait_for_common(&self, mut timeout: i64, interuptible: bool) -> Result<i64, SystemError> {

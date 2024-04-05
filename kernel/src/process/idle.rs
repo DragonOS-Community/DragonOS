@@ -8,6 +8,7 @@ use alloc::{sync::Arc, vec::Vec};
 use crate::{
     mm::{percpu::PerCpu, VirtAddr, IDLE_PROCESS_ADDRESS_SPACE},
     process::KernelStack,
+    sched::{cpu_rq, OnRq},
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 
@@ -58,6 +59,21 @@ impl ProcessManager {
 
             assert!(idle_pcb.sched_info().on_cpu().is_none());
             idle_pcb.sched_info().set_on_cpu(Some(ProcessorId::new(i)));
+            *idle_pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::IDLE;
+
+            let rq = cpu_rq(i as usize);
+            let (rq, _guard) = rq.self_lock();
+            rq.set_current(Arc::downgrade(&idle_pcb));
+            rq.set_idle(Arc::downgrade(&idle_pcb));
+
+            *idle_pcb.sched_info().on_rq.lock_irqsave() = OnRq::Queued;
+
+            idle_pcb
+                .sched_info()
+                .sched_entity()
+                .force_mut()
+                .set_cfs(Arc::downgrade(&rq.cfs_rq()));
+
             v.push(idle_pcb);
         }
 

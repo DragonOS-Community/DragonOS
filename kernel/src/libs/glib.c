@@ -10,7 +10,7 @@
  * @param size 大小
  * @return void* 指向目标地址的指针
  */
-void *memmove(void *dst, const void *src, uint64_t size)
+void *c_memmove(void *dst, const void *src, uint64_t size)
 {
     const char *_src = src;
 	char *_dst = dst;

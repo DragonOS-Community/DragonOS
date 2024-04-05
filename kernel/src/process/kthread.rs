@@ -1,6 +1,6 @@
 use core::{
     hint::spin_loop,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{compiler_fence, AtomicBool, Ordering},
 };
 
 use alloc::{
@@ -13,12 +13,13 @@ use atomic_enum::atomic_enum;
 use system_error::SystemError;
 
 use crate::{
-    arch::{sched::sched, CurrentIrqArch},
+    arch::CurrentIrqArch,
     exception::{irqdesc::IrqAction, InterruptArch},
     init::initial_kthread::initial_kernel_thread,
-    kdebug, kinfo,
+    kinfo,
     libs::{once::Once, spinlock::SpinLock},
     process::{ProcessManager, ProcessState},
+    sched::{schedule, SchedMode},
 };
 
 use super::{fork::CloneFlags, Pid, ProcessControlBlock, ProcessFlags};
@@ -302,6 +303,8 @@ impl KernelThreadMechanism {
             // 初始化kthreadd
             let closure = KernelThreadClosure::EmptyClosure((Box::new(Self::kthread_daemon), ()));
             let info = KernelThreadCreateInfo::new(closure, "kthreadd".to_string());
+            info.set_to_mark_sleep(false)
+                .expect("kthreadadd should be run first");
             let kthreadd_pid: Pid = Self::__inner_create(
                 &info,
                 CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGNAL,
@@ -334,6 +337,7 @@ impl KernelThreadMechanism {
             spin_loop()
         }
         KTHREAD_CREATE_LIST.lock().push_back(info.clone());
+        compiler_fence(Ordering::SeqCst);
         ProcessManager::wakeup(unsafe { KTHREAD_DAEMON_PCB.as_ref().unwrap() })
             .expect("Failed to wakeup kthread daemon");
         return info.poll_result();
@@ -439,7 +443,6 @@ impl KernelThreadMechanism {
     #[inline(never)]
     fn kthread_daemon() -> i32 {
         let current_pcb = ProcessManager::current_pcb();
-        kdebug!("kthread_daemon: pid: {:?}", current_pcb.pid());
         {
             // 初始化worker_private
             let mut worker_private_guard = current_pcb.worker_private();
@@ -454,7 +457,6 @@ impl KernelThreadMechanism {
             let mut list = KTHREAD_CREATE_LIST.lock();
             while let Some(info) = list.pop_front() {
                 drop(list);
-
                 // create a new kernel thread
                 let result: Result<Pid, SystemError> = Self::__inner_create(
                     &info,
@@ -472,7 +474,7 @@ impl KernelThreadMechanism {
             let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
             ProcessManager::mark_sleep(true).ok();
             drop(irq_guard);
-            sched();
+            schedule(SchedMode::SM_NONE);
         }
     }
 }
@@ -497,7 +499,7 @@ pub unsafe extern "C" fn kernel_thread_bootstrap_stage2(ptr: *const KernelThread
         let irq_guard = CurrentIrqArch::save_and_disable_irq();
         ProcessManager::mark_sleep(true).expect("Failed to mark sleep");
         drop(irq_guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     let mut retval = SystemError::EINTR.to_posix_errno();

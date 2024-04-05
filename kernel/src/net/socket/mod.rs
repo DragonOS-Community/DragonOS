@@ -338,8 +338,9 @@ impl IndexNode for SocketInode {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        drop(data);
         self.0.lock_no_preempt().read(&mut buf[0..len]).0
     }
 
@@ -348,8 +349,9 @@ impl IndexNode for SocketInode {
         _offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        drop(data);
         self.0.lock_no_preempt().write(&buf[0..len], None)
     }
 

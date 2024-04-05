@@ -285,7 +285,6 @@ impl Syscall {
             }
 
             SYS_EXIT => {
-                kerror!("syscall exit");
                 let exit_code = args[0];
                 Self::exit(exit_code)
             }

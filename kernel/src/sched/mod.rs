@@ -19,14 +19,11 @@ use alloc::{
 };
 use system_error::SystemError;
 
-#[cfg(target_arch = "x86_64")]
-use crate::arch::interrupt::ipi::IPI_NUM_KICK_CPU;
-
 use crate::{
     arch::{interrupt::ipi::send_ipi, CurrentIrqArch},
     exception::{
         ipi::{IpiKind, IpiTarget},
-        HardwareIrqNumber, InterruptArch,
+        InterruptArch,
     },
     libs::{
         lazy_init::Lazy,
@@ -999,11 +996,5 @@ pub fn sched_init() {
 
 #[inline]
 pub fn send_resched_ipi(cpu: ProcessorId) {
-    #[cfg(target_arch = "x86_64")]
-    send_ipi(
-        IpiKind::SpecVector(HardwareIrqNumber::new(IPI_NUM_KICK_CPU.data())),
-        IpiTarget::Specified(cpu),
-    );
-    #[cfg(target_arch = "riscv64")]
-    todo!()
+    send_ipi(IpiKind::KickCpu, IpiTarget::Specified(cpu));
 }

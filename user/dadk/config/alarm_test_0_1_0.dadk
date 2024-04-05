@@ -1,0 +1,26 @@
+{
+  "name": "alarm-test",
+  "version": "0.1.0",
+  "description": "test for alarm",
+  "rust_target": null,
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "/home/smallc/DragonProject/DragonOS/user/apps/alarm-test"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "envs": [],
+  "build_once": false,
+  "install_once": false
+}

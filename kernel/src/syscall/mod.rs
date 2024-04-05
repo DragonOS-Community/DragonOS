@@ -1006,10 +1006,11 @@ impl Syscall {
             }
 
             SYS_ALARM => {
-                let second = args[0] as u64;
-                Self::alarm(second)
+                let second = args[0] as u32;
+                //test
+                println!("call time :{}", args[0]);
+                Self::alarm(second as u64)
             }
-
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

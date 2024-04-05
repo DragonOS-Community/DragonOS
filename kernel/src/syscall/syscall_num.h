@@ -28,7 +28,7 @@
 #define SYS_DUP2 33
 
 #define SYS_NANOSLEEP 35
-
+#define SYS_ALARM 38
 #define SYS_GETPID 39
 
 #define SYS_SOCKET 41

@@ -1,0 +1,11 @@
+[package]
+name = "alarm-test"
+version = "0.1.0"
+edition = "2021"
+description = "test for alarm"
+authors = [ "smallc <2628035541@qq.com>" ]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+libc = "0.2.0"

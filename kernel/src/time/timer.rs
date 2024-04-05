@@ -151,7 +151,8 @@ impl Timer {
 
     /// ## 更新定时器触发状态
     pub fn restart(&self){
-        self.inner().triggered = false;
+        let mut timer = self.inner();
+        timer.triggered = false;
     }
 }
 

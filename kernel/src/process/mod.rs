@@ -55,10 +55,10 @@ use crate::{
     },
     syscall::{user_access::clear_user, Syscall},
 };
-use timer::{AlarmTimer, AlarmTimerFunc};
+use timer::AlarmTimer;
 use crate::libs::mutex::Mutex;
 
-use self::kthread::WorkerPrivate;
+use self::kthread::{AtomicKernelThreadCreateStatus, WorkerPrivate};
 
 pub mod abi;
 pub mod c_adapter;
@@ -453,6 +453,14 @@ impl ProcessManager {
 
         ProcessManager::current_pcb().preempt_enable();
     }
+
+    //获取目标进程的可变闹钟定时器
+     //返回闹钟定时器
+     pub fn ref_alarm_timer() -> Arc<Mutex<Option<AlarmTimer>>>{
+        let current_pcb = ProcessManager::current_pcb();
+        let alarm_timer = current_pcb.alarm_timer.clone();
+        alarm_timer
+    }
 }
 
 /// 上下文切换的钩子函数,当这个函数return的时候,将会发生上下文切换
@@ -599,7 +607,7 @@ pub struct ProcessControlBlock {
     thread: RwLock<ThreadInfo>,
 
     ///闹钟定时器
-    alarm_timer: Mutex<AlarmTimer>,
+    alarm_timer: Arc<Mutex<Option<AlarmTimer>>>,
 }
 
 impl ProcessControlBlock {
@@ -625,16 +633,6 @@ impl ProcessControlBlock {
         return Self::do_create_pcb(name, kstack, true);
     }
 
-    //初始化目标进程的alarm定时器
-    pub fn alarm_timer_init(pid: Pid) -> Mutex<AlarmTimer> {
-        //初始化Timerfunc
-        let timerfunc = AlarmTimerFunc::new(pid);
-        let result = AlarmTimer::new(timerfunc, 0);
-        let alarm = result.lock();
-        alarm.activate();
-        drop(alarm);
-        result
-    }
 
     #[inline(never)]
     fn do_create_pcb(name: String, kstack: KernelStack, is_idle: bool) -> Arc<Self> {
@@ -676,7 +674,7 @@ impl ProcessControlBlock {
             children: RwLock::new(Vec::new()),
             wait_queue: WaitQueue::default(),
             thread: RwLock::new(ThreadInfo::new()),
-            alarm_timer: ProcessControlBlock::alarm_timer_init(pid),
+            alarm_timer: Arc::new(Mutex::new(None)),
         };
 
         // 初始化系统调用栈
@@ -919,11 +917,6 @@ impl ProcessControlBlock {
 
     pub fn sig_struct_irqsave(&self) -> SpinLockGuard<SignalStruct> {
         self.sig_struct.lock_irqsave()
-    }
-
-    //返回闹钟定时器
-    pub fn ref_alarm_timer(&self) -> &Mutex<AlarmTimer>{
-        return &self.alarm_timer;
     }
 }
 

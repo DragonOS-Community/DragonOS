@@ -13,16 +13,20 @@ use kdepends::memoffset::offset_of;
 use system_error::SystemError;
 
 use crate::{
-    arch::CurrentIrqArch,
+    arch::{
+        interrupt::entry::ret_from_exception, process::kthread::kernel_thread_bootstrap_stage1,
+        CurrentIrqArch,
+    },
     exception::InterruptArch,
     kerror,
     libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{
-        fork::KernelCloneArgs, KernelStack, ProcessControlBlock, ProcessManager,
-        PROCESS_SWITCH_RESULT,
+        fork::{CloneFlags, KernelCloneArgs},
+        KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager, PROCESS_SWITCH_RESULT,
     },
     smp::cpu::ProcessorId,
+    syscall::Syscall,
 };
 
 use super::{
@@ -65,7 +69,52 @@ impl ProcessManager {
         clone_args: KernelCloneArgs,
         current_trapframe: &TrapFrame,
     ) -> Result<(), SystemError> {
-        unimplemented!("ProcessManager::copy_thread")
+        let clone_flags = clone_args.flags;
+        let mut child_trapframe = *current_trapframe;
+
+        // 子进程的返回值为0
+        child_trapframe.set_return_value(0);
+
+        // 设置子进程的栈基址（开始执行中断返回流程时的栈基址）
+        let mut new_arch_guard = unsafe { new_pcb.arch_info() };
+        let kernel_stack_guard = new_pcb.kernel_stack();
+        let trap_frame_vaddr: VirtAddr =
+            kernel_stack_guard.stack_max_address() - core::mem::size_of::<TrapFrame>();
+        new_arch_guard.set_stack(trap_frame_vaddr);
+
+        // 拷贝栈帧
+        unsafe {
+            let usp = clone_args.stack;
+            if usp != 0 {
+                child_trapframe.sp = usp;
+            }
+            let trap_frame_ptr = trap_frame_vaddr.data() as *mut TrapFrame;
+            *trap_frame_ptr = child_trapframe;
+        }
+
+        // copy arch info
+
+        let current_arch_guard = current_pcb.arch_info_irqsave();
+        // 拷贝浮点寄存器的状态
+        new_arch_guard.fp_state = current_arch_guard.fp_state;
+
+        drop(current_arch_guard);
+
+        // 设置返回地址（子进程开始执行的指令地址）
+        if new_pcb.flags().contains(ProcessFlags::KTHREAD) {
+            let kthread_bootstrap_stage1_func_addr = kernel_thread_bootstrap_stage1 as usize;
+            new_arch_guard.ra = kthread_bootstrap_stage1_func_addr;
+        } else {
+            new_arch_guard.ra = ret_from_exception as usize;
+        }
+
+        // 设置tls
+        if clone_flags.contains(CloneFlags::CLONE_SETTLS) {
+            drop(new_arch_guard);
+            todo!("set tls");
+        }
+
+        return Ok(());
     }
 
     /// 切换进程
@@ -221,7 +270,7 @@ impl ProcessControlBlock {
 }
 
 /// PCB中与架构相关的信息
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 #[repr(C)]
 pub struct ArchPCBInfo {
@@ -277,12 +326,16 @@ impl ArchPCBInfo {
     }
     // ### 从另一个ArchPCBInfo处clone,但是保留部分字段不变
     pub fn clone_from(&mut self, from: &Self) {
-        unimplemented!("ArchPCBInfo::clone_from")
+        *self = from.clone();
+    }
+
+    pub fn set_stack(&mut self, stack: VirtAddr) {
+        self.ksp = stack.data();
     }
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct FpDExtState {
     f: [u64; 32],
     fcsr: u32,

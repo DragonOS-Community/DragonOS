@@ -254,12 +254,12 @@ impl IrqFlowHandler for X86_64IpiIrqFlowHandler {
             }
             IPI_NUM_FLUSH_TLB => {
                 FlushTLBIpiHandler.handle(irq, None, None).ok();
+                CurrentApic.send_eoi();
             }
             _ => {
                 kerror!("Unknown IPI: {}", irq.data());
+                CurrentApic.send_eoi();
             }
         }
-
-        CurrentApic.send_eoi();
     }
 }

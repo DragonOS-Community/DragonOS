@@ -10,6 +10,8 @@ use crate::{
     libs::rwlock::RwLock,
     mm::VirtAddr,
     process::ProcessFlags,
+    sched::{sched_cgroup_fork, sched_fork},
+    smp::core::smp_get_processor_id,
     syscall::user_access::UserBufferWriter,
 };
 
@@ -184,6 +186,8 @@ impl ProcessManager {
                 e
             )
         });
+
+        pcb.sched_info().set_on_cpu(Some(smp_get_processor_id()));
 
         ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
             panic!(
@@ -388,6 +392,13 @@ impl ProcessManager {
             writer.copy_one_to_user(&(pcb.pid().0 as i32), 0)?;
         }
 
+        sched_fork(pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to set sched info from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.pid(), pcb.pid(), e
+            )
+        });
+
         // 拷贝标志位
         Self::copy_flags(&clone_flags, pcb).unwrap_or_else(|e| {
             panic!(
@@ -473,6 +484,8 @@ impl ProcessManager {
         }
 
         // todo: 增加线程组相关的逻辑。 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/fork.c#2437
+
+        sched_cgroup_fork(pcb);
 
         Ok(())
     }

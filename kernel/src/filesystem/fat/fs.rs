@@ -1381,7 +1381,7 @@ impl IndexNode for LockedFATInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         match &guard.inode_type {
@@ -1409,7 +1409,7 @@ impl IndexNode for LockedFATInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
@@ -1578,11 +1578,15 @@ impl IndexNode for LockedFATInode {
         return Ok(target);
     }
 
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         return Ok(());
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 

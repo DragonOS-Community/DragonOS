@@ -13,7 +13,10 @@ use system_error::SystemError;
 
 use crate::{
     driver::base::device::device_number::DeviceNumber,
-    libs::{rwlock::RwLock, spinlock::SpinLock},
+    libs::{
+        rwlock::RwLock,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
 };
 
 use super::{
@@ -31,6 +34,12 @@ pub struct MountPath(PathBuf);
 impl From<&str> for MountPath {
     fn from(value: &str) -> Self {
         Self(PathBuf::from(value).clean())
+    }
+}
+
+impl From<PathBuf> for MountPath {
+    fn from(value: PathBuf) -> Self {
+        Self(value.clean())
     }
 }
 
@@ -107,6 +116,7 @@ pub struct MountFS {
 
 /// @brief MountFS的Index Node 注意，这个IndexNode只是一个中间层。它的目的是将具体文件系统的Inode与挂载机制连接在一起。
 #[derive(Debug)]
+#[cast_to([sync] IndexNode)]
 pub struct MountFSInode {
     /// 当前挂载点对应到具体的文件系统的Inode
     inner_inode: Arc<dyn IndexNode>,
@@ -161,6 +171,10 @@ impl MountFS {
     pub fn inner_filesystem(&self) -> Arc<dyn FileSystem> {
         return self.inner_filesystem.clone();
     }
+
+    pub fn self_ref(&self) -> Arc<Self> {
+        self.self_ref.upgrade().unwrap()
+    }
 }
 
 impl MountFSInode {
@@ -205,14 +219,37 @@ impl MountFSInode {
             return self.self_ref.upgrade().unwrap();
         }
     }
+
+    /// 将新的挂载点-挂载文件系统添加到父级的挂载树
+    pub(super) fn do_mount(
+        &self,
+        inode_id: InodeId,
+        new_mount_fs: Arc<MountFS>,
+    ) -> Result<(), SystemError> {
+        let mut guard = self.mount_fs.mountpoints.lock();
+        if guard.contains_key(&inode_id) {
+            return Err(SystemError::EBUSY);
+        }
+        guard.insert(inode_id, new_mount_fs);
+
+        return Ok(());
+    }
+
+    pub(super) fn inode_id(&self) -> InodeId {
+        self.metadata().map(|x| x.inode_id).unwrap()
+    }
 }
 
 impl IndexNode for MountFSInode {
-    fn open(&self, data: &mut FilePrivateData, mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        data: SpinLockGuard<FilePrivateData>,
+        mode: &FileMode,
+    ) -> Result<(), SystemError> {
         return self.inner_inode.open(data, mode);
     }
 
-    fn close(&self, data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         return self.inner_inode.close(data);
     }
 
@@ -242,7 +279,7 @@ impl IndexNode for MountFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: &mut FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return self.inner_inode.read_at(offset, len, buf, data);
     }
@@ -252,7 +289,7 @@ impl IndexNode for MountFSInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        data: &mut FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return self.inner_inode.write_at(offset, len, buf, data);
     }
@@ -419,17 +456,15 @@ impl IndexNode for MountFSInode {
 
         // 为新的挂载点创建挂载文件系统
         let new_mount_fs: Arc<MountFS> = MountFS::new(fs, Some(self.self_ref.upgrade().unwrap()));
-        // 将新的挂载点-挂载文件系统添加到父级的挂载树
-        self.mount_fs
-            .mountpoints
-            .lock()
-            .insert(metadata.inode_id, new_mount_fs.clone());
-        // kdebug!("Mount Path: {:?}", self._abs_path()?.to_str().unwrap());
-        // kdebug!("Mount FS: {:?}", new_mount_fs);
-        MOUNT_LIST().write().insert(
-            MountPath::from(self.abs_path()?.to_str().unwrap()),
-            new_mount_fs.clone(),
-        );
+        self.do_mount(metadata.inode_id, new_mount_fs.clone())?;
+
+        // 挂载点记录暂时不记录不支持dcache（不支持key与parent方法）的文件系统
+        if self.fs().dcache().is_ok() {
+            MOUNT_LIST()
+                .write()
+                .insert(MountPath::from(self.abs_path()?), new_mount_fs.clone());
+        }
+
         return Ok(new_mount_fs);
     }
 

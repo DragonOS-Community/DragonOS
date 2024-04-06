@@ -6,7 +6,7 @@ include ./env.mk
 ifeq ($(ARCH), x86_64)
 	export TARGET_JSON=arch/x86_64/x86_64-unknown-none.json
 else ifeq ($(ARCH), riscv64)
-	export TARGET_JSON=arch/riscv64/riscv64imac-unknown-none-elf.json
+	export TARGET_JSON=riscv64gc-unknown-none-elf
 endif
 
 export CARGO_ZBUILD=-Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem
@@ -38,7 +38,7 @@ check: ECHO
 ifeq ($(ARCH), x86_64)
 	@cargo +nightly-2023-08-15 check --workspace $(CARGO_ZBUILD) --message-format=json --target ./src/$(TARGET_JSON)
 else ifeq ($(ARCH), riscv64)
-	@cargo +nightly-2023-08-15 check --workspace $(CARGO_ZBUILD) --message-format=json --target ./src/$(TARGET_JSON)
+	@cargo +nightly-2023-08-15 check --workspace $(CARGO_ZBUILD) --message-format=json --target $(TARGET_JSON)
 endif
 
 test:

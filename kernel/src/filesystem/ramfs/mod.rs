@@ -9,9 +9,11 @@ use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{core::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
-    libs::spinlock::SpinLock,
+    libs::casting::DowncastArc,
+    libs::spinlock::{SpinLock, SpinLockGuard},
     time::TimeSpec,
 };
+
 use alloc::{
     collections::BTreeMap,
     string::String,
@@ -33,14 +35,14 @@ const RAMFS_MAX_NAMELEN: usize = 64;
 const RAMFS_BLOCK_SIZE: u64 = 512;
 #[derive(Debug)]
 pub struct RamFS {
-    root: Arc<LockedEntry>,
+    root: Arc<LockedRamfsEntry>,
     cache: Arc<DefaultDCache>,
     super_block: RwLock<SuperBlock>,
 }
 
 impl RamFS {
     pub fn new() -> Arc<Self> {
-        let root = Arc::new(LockedEntry(SpinLock::new(Entry {
+        let root = Arc::new(LockedRamfsEntry(SpinLock::new(RamfsEntry {
             name: String::new(),
             inode: Arc::new(LockedInode(SpinLock::new(RamfsInode::new(
                 FileType::Dir,
@@ -125,17 +127,17 @@ pub struct RamfsInode {
 pub struct LockedInode(SpinLock<RamfsInode>);
 
 #[derive(Debug)]
-pub struct Entry {
+pub struct RamfsEntry {
     /// 目录名
     name: String,
     /// 文件节点
     inode: Arc<LockedInode>,
     /// 父目录
-    parent: Weak<LockedEntry>,
+    parent: Weak<LockedRamfsEntry>,
     /// 自引用
-    self_ref: Weak<LockedEntry>,
+    self_ref: Weak<LockedRamfsEntry>,
     /// 子目录
-    children: BTreeMap<Keyer, Arc<LockedEntry>>,
+    children: BTreeMap<Keyer, Arc<LockedRamfsEntry>>,
     /// 目录所属文件系统
     fs: Weak<RamFS>,
 
@@ -143,7 +145,7 @@ pub struct Entry {
 }
 
 #[derive(Debug)]
-pub struct LockedEntry(SpinLock<Entry>);
+pub struct LockedRamfsEntry(SpinLock<RamfsEntry>);
 
 impl RamfsInode {
     pub fn new(file_type: FileType, mode: ModeType) -> RamfsInode {
@@ -177,7 +179,7 @@ impl RamfsInode {
     }
 }
 
-impl IndexNode for LockedEntry {
+impl IndexNode for LockedRamfsEntry {
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
         let entry = self.0.lock();
         let mut inode = entry.inode.0.lock();
@@ -195,13 +197,13 @@ impl IndexNode for LockedEntry {
         Ok(())
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
-        Ok(())
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+        return Ok(());
     }
 
     fn open(
         &self,
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
         _mode: &super::vfs::file::FileMode,
     ) -> Result<(), SystemError> {
         return Ok(());
@@ -212,7 +214,7 @@ impl IndexNode for LockedEntry {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
@@ -246,7 +248,7 @@ impl IndexNode for LockedEntry {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
@@ -341,7 +343,7 @@ impl IndexNode for LockedEntry {
         }
 
         // 创建Entry-inode
-        let result = Arc::new(LockedEntry(SpinLock::new(Entry {
+        let result = Arc::new(LockedRamfsEntry(SpinLock::new(RamfsEntry {
             parent: entry.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
@@ -365,8 +367,8 @@ impl IndexNode for LockedEntry {
 
     /// Not Stable, waiting for improvement
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        let other: &LockedEntry = other
-            .downcast_ref::<LockedEntry>()
+        let other: &LockedRamfsEntry = other
+            .downcast_ref::<LockedRamfsEntry>()
             .ok_or(SystemError::EPERM)?;
 
         let mut entry = self.0.lock();
@@ -392,7 +394,7 @@ impl IndexNode for LockedEntry {
 
         // 创建新Entry指向other inode
         // 并插入子目录序列
-        let to_insert = Arc::new(LockedEntry(SpinLock::new(Entry {
+        let to_insert = Arc::new(LockedRamfsEntry(SpinLock::new(RamfsEntry {
             name: String::from(name),
             inode: other_entry.inode.clone(),
             parent: entry.self_ref.clone(),
@@ -484,16 +486,30 @@ impl IndexNode for LockedEntry {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
     ) -> Result<(), SystemError> {
-        let old_inode: Arc<dyn IndexNode> = self.find(old_name)?;
+        let inode: Arc<dyn IndexNode> = self.find(old_name)?;
+        // 修改其对父节点的引用
+        inode
+            .downcast_ref::<LockedRamfsEntry>()
+            .ok_or(SystemError::EPERM)?
+            .0
+            .lock()
+            .parent = Arc::downgrade(
+            &target
+                .clone()
+                .downcast_arc::<LockedRamfsEntry>()
+                .ok_or(SystemError::EPERM)?,
+        );
 
         // 在新的目录下创建一个硬链接
-        target.link(new_name, &old_inode)?;
+        target.link(new_name, &inode)?;
+
         // 取消现有的目录下的这个硬链接
-        if let Err(err) = self.unlink(old_name) {
-            // 如果取消失败，那就取消新的目录下的硬链接
+        if let Err(e) = self.unlink(old_name) {
+            // 当操作失败时回退操作
             target.unlink(new_name)?;
-            return Err(err);
+            return Err(e);
         }
+
         return Ok(());
     }
 
@@ -594,7 +610,7 @@ impl IndexNode for LockedEntry {
             return self.create(filename, FileType::File, mode);
         }
 
-        let nod = Arc::new(LockedEntry(SpinLock::new(Entry {
+        let nod = Arc::new(LockedRamfsEntry(SpinLock::new(RamfsEntry {
             parent: entry.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),

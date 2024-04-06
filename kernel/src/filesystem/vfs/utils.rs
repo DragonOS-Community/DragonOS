@@ -59,13 +59,12 @@ pub fn user_path_at(
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
 
-        let file_guard = file.lock();
         // 如果dirfd不是目录，则返回错误码ENOTDIR
-        if file_guard.file_type() != FileType::Dir {
+        if file.file_type() != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
 
-        return Ok((file_guard.inode(), PathBuf::from(path)));
+        return Ok((file.inode(), PathBuf::from(path)));
     } else {
         return Ok((ROOT_INODE(), PathBuf::from(pcb.basic().cwd()).join(path)));
     };

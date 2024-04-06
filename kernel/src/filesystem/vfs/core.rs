@@ -13,9 +13,7 @@ use crate::{
         ramfs::RamFS,
         sysfs::sysfs_init,
         vfs::{
-            mount::{MountFS, MountPath, CLEAR_MOUNTS_LIST, INIT_MOUNT_LIST, MOUNT_LIST},
-            syscall::ModeType,
-            AtomicInodeId, FileSystem, FileType,
+            mount::*, syscall::ModeType, utils::user_path_at, AtomicInodeId, FileSystem, FileType,
         },
     },
     kdebug, kerror, kinfo,
@@ -23,7 +21,7 @@ use crate::{
 };
 
 use super::{
-    file::FileMode, utils::user_path_at, IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    file::FileMode, mount::MountFSInode, IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 /// @brief 原子地生成新的Inode号。
@@ -107,9 +105,9 @@ fn do_migrate(
             .unwrap_or_else(|_| panic!("Failed to create '/{mountpoint_name}' in migrating"))
     };
     // 迁移挂载点
-    mountpoint
-        .mount(fs.inner_filesystem())
-        .unwrap_or_else(|_| panic!("Failed to migrate {mountpoint_name} "));
+    let inode = mountpoint.arc_any().downcast::<MountFSInode>().unwrap();
+    inode.do_mount(inode.inode_id(), fs.self_ref())?;
+
     return Ok(());
 }
 

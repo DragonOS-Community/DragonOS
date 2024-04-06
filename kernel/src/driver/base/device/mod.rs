@@ -201,6 +201,51 @@ impl dyn Device {
     }
 }
 
+/// 实现了Device trait的设备需要拥有的数据
+#[derive(Debug)]
+pub struct DeviceCommonData {
+    pub bus: Option<Weak<dyn Bus>>,
+    pub class: Option<Weak<dyn Class>>,
+    pub driver: Option<Weak<dyn Driver>>,
+    pub dead: bool,
+    pub can_match: bool,
+}
+
+impl Default for DeviceCommonData {
+    fn default() -> Self {
+        Self {
+            bus: None,
+            class: None,
+            driver: None,
+            dead: false,
+            can_match: true,
+        }
+    }
+}
+
+impl DeviceCommonData {
+    /// 获取bus字段
+    ///
+    /// 当weak指针的strong count为0的时候，清除弱引用
+    pub fn get_bus_weak_or_clear(&mut self) -> Option<Weak<dyn Bus>> {
+        driver_base_macros::get_weak_or_clear!(self.bus)
+    }
+
+    /// 获取class字段
+    ///
+    /// 当weak指针的strong count为0的时候，清除弱引用
+    pub fn get_class_weak_or_clear(&mut self) -> Option<Weak<dyn Class>> {
+        driver_base_macros::get_weak_or_clear!(self.class)
+    }
+
+    /// 获取driver字段
+    ///
+    /// 当weak指针的strong count为0的时候，清除弱引用
+    pub fn get_driver_weak_or_clear(&mut self) -> Option<Weak<dyn Driver>> {
+        driver_base_macros::get_weak_or_clear!(self.driver)
+    }
+}
+
 // 暂定是不可修改的，在初始化的时候就要确定。以后可能会包括例如硬件中断包含的信息
 #[allow(dead_code)]
 #[derive(Debug, Clone)]

@@ -80,6 +80,10 @@ impl CpuMask {
             begin: true,
         }
     }
+
+    pub fn inner(&self) -> &AllocBitmap {
+        &self.bmp
+    }
 }
 
 pub struct CpuMaskIter<'a> {

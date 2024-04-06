@@ -1,4 +1,5 @@
 use core::cell::RefCell;
+use core::sync::atomic::{fence, Ordering};
 
 use crate::arch::driver::tsc::TSCManager;
 use crate::arch::interrupt::TrapFrame;
@@ -12,7 +13,7 @@ use crate::exception::IrqNumber;
 
 use crate::kdebug;
 use crate::mm::percpu::PerCpu;
-use crate::sched::core::sched_update_jiffies;
+use crate::process::ProcessManager;
 use crate::smp::core::smp_get_processor_id;
 use crate::smp::cpu::ProcessorId;
 use crate::time::clocksource::HZ;
@@ -66,9 +67,10 @@ impl IrqHandler for LocalApicTimerHandler {
 struct LocalApicTimerIrqFlowHandler;
 
 impl IrqFlowHandler for LocalApicTimerIrqFlowHandler {
-    fn handle(&self, _irq_desc: &Arc<IrqDesc>, _trap_frame: &mut TrapFrame) {
-        LocalApicTimer::handle_irq().ok();
+    fn handle(&self, _irq_desc: &Arc<IrqDesc>, trap_frame: &mut TrapFrame) {
+        LocalApicTimer::handle_irq(trap_frame).ok();
         CurrentApic.send_eoi();
+        fence(Ordering::SeqCst)
     }
 }
 
@@ -274,8 +276,9 @@ impl LocalApicTimer {
         return (res.ecx & (1 << 24)) != 0;
     }
 
-    pub(super) fn handle_irq() -> Result<IrqReturn, SystemError> {
-        sched_update_jiffies();
+    pub(super) fn handle_irq(trap_frame: &TrapFrame) -> Result<IrqReturn, SystemError> {
+        // sched_update_jiffies();
+        ProcessManager::update_process_times(trap_frame.is_from_user());
         return Ok(IrqReturn::Handled);
     }
 }

@@ -9,6 +9,7 @@ mod utils;
 
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};
+use intertrait::CastFromSync;
 use path_base::{clean_path::Clean, Path, PathBuf};
 use system_error::SystemError;
 
@@ -18,7 +19,10 @@ use crate::{
     },
     filesystem::vfs::mount::MOUNT_LIST,
     ipc::pipe::LockedPipeInode,
-    libs::casting::DowncastArc,
+    libs::{
+        casting::DowncastArc,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
     time::TimeSpec,
 };
 
@@ -117,12 +121,16 @@ bitflags! {
     }
 }
 
-pub trait IndexNode: Any + Sync + Send + Debug {
+pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 打开文件
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
@@ -131,7 +139,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
@@ -150,7 +158,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
 
     /// @brief 在inode的指定偏移量开始，写入指定大小的数据（从buf的第0byte开始写入）
@@ -167,7 +175,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
 
     /// @brief 获取当前inode的状态。
@@ -487,13 +495,14 @@ impl dyn IndexNode {
     /// - Ok(Arc\<dyn IndexNode\>): 找到的节点
     /// - Err(SystemError::ENOENT): 未找到
     /// - Err(SystemError::ENOTDIR): 不是目录
-    pub fn lookup_follow_symlink(
+    pub fn lookup_follow_symlink<T: AsRef<Path>>(
         &self,
-        path: &Path,
+        path_any: T,
         max_follow_times: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // kdebug!("Looking for path {:?}", path);
         // 拼接绝对路径
+        let path = path_any.as_ref();
         let abs_path = if path.is_absolute() {
             path.clean()
         } else {
@@ -613,7 +622,12 @@ impl dyn IndexNode {
             if inode.metadata()?.file_type == FileType::SymLink && max_follow_times > 0 {
                 let mut content = [0u8; 256];
                 // 读取符号链接
-                let len = inode.read_at(0, 256, &mut content, &mut FilePrivateData::Unused)?;
+                let len = inode.read_at(
+                    0,
+                    256,
+                    &mut content,
+                    SpinLock::new(FilePrivateData::Unused).lock(),
+                )?;
 
                 // 将读到的数据转换为utf8字符串（先转为str，再转为String）
                 let link_path = String::from(
@@ -654,7 +668,7 @@ impl dyn IndexNode {
                 if child_node.metadata()?.file_type == FileType::SymLink && max_follow_times > 0 {
                     // symlink wrapping problem
                     return ROOT_INODE().lookup_follow_symlink(
-                        &child_node.convert_symlink()?.join(rest_path),
+                        child_node.convert_symlink()?.join(rest_path),
                         max_follow_times - 1,
                     );
                 }
@@ -687,7 +701,12 @@ impl dyn IndexNode {
     /// - Ok(PathBuf): 转换后的路径
     fn convert_symlink(&self) -> Result<PathBuf, SystemError> {
         let mut content = [0u8; 256];
-        let len = self.read_at(0, 256, &mut content, &mut FilePrivateData::Unused)?;
+        let len = self.read_at(
+            0,
+            256,
+            &mut content,
+            SpinLock::new(FilePrivateData::Unused).lock(),
+        )?;
 
         return Ok(PathBuf::from(
             ::core::str::from_utf8(&content[..len]).map_err(|_| SystemError::ENOTDIR)?,

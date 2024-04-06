@@ -1,5 +1,5 @@
 //! 用于展示如何在保留比较的同时支持从当前inode原地取出目录名
-use super::LockedEntry;
+use super::LockedRamfsEntry;
 use alloc::{
     string::String,
     sync::{Arc, Weak},
@@ -7,14 +7,14 @@ use alloc::{
 use core::cmp::Ordering;
 
 #[derive(Debug)]
-pub struct Keyer(Weak<LockedEntry>, Option<String>);
+pub struct Keyer(Weak<LockedRamfsEntry>, Option<String>);
 
 impl Keyer {
     pub fn from_str(key: &str) -> Self {
         Keyer(Weak::new(), Some(String::from(key)))
     }
 
-    pub fn from_entry(entry: &Arc<LockedEntry>) -> Self {
+    pub fn from_entry(entry: &Arc<LockedRamfsEntry>) -> Self {
         Keyer(Arc::downgrade(entry), None)
     }
 

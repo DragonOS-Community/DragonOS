@@ -1,0 +1,23 @@
+{
+  "name": "shm",
+  "version": "0.1.0",
+  "description": "共享内存",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "apps/shm"
+      }
+    }
+  },
+  "depends": [ ],
+  "build": {
+    "build_command": "make"
+  },
+  "install": {
+    "in_dragonos_path": "/bin"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "envs": []
+}

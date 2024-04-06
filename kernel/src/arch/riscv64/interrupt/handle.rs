@@ -1,8 +1,11 @@
+//! 处理中断和异常
+//!
+//! 架构相关的处理逻辑参考： https://code.dragonos.org.cn/xref/linux-6.6.21/arch/riscv/kernel/traps.c
 use core::hint::spin_loop;
 
 use system_error::SystemError;
 
-use crate::{kdebug, kerror};
+use crate::{arch::syscall::syscall_handler, kdebug, kerror};
 
 use super::TrapFrame;
 
@@ -136,11 +139,16 @@ fn do_trap_store_access_fault(_trap_frame: &mut TrapFrame) -> Result<(), SystemE
 }
 
 /// 处理环境调用异常 #8
-fn do_trap_user_env_call(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    kerror!("riscv64_do_irq: do_trap_user_env_call");
-    loop {
-        spin_loop();
+fn do_trap_user_env_call(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    if trap_frame.is_from_user() {
+        let syscall_num = trap_frame.a7;
+        trap_frame.epc += 4;
+        trap_frame.origin_a0 = trap_frame.a0;
+        syscall_handler(syscall_num, trap_frame);
+    } else {
+        panic!("do_trap_user_env_call: not from user mode")
     }
+    Ok(())
 }
 
 // 9-11 reserved

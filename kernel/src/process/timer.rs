@@ -40,20 +40,6 @@ impl AlarmTimer {
         return self.timer.timeout();
     }
 
-    //重启定时器
-    pub fn reset(&mut self, new_expired_time: u64){
-        println!("alarm ret!");
-        let mut timer = self.inner();
-        println!("old expired_jiffies: {}", timer.expire_jiffies);
-        timer.expire_jiffies = new_expired_time;
-        println!("new expired_jiffies: {}", timer.expire_jiffies);
-        self.timer.restart();
-        //重新插入到定时器列表
-        self.timer.activate();
-        drop(timer);
-        println!("alarm reset success!");
-    }
-
     //返回闹钟定时器剩余时间（单位是jiffies）
     pub fn remain(&self) -> u64{
         if self.timeout() || self.inner().expire_jiffies == 0{
@@ -107,31 +93,18 @@ impl TimerFunction for AlarmTimerFunc {
 //初始化目标进程的alarm定时器
 pub fn alarm_timer_init(pid: Pid, time_out: u64) {
     //初始化Timerfunc
-    println!("begin init alarm!");
     let timerfunc = AlarmTimerFunc::new(pid);
     let result = AlarmTimer::new(timerfunc, time_out);
     let alarm = result.lock();
     let timer = alarm.as_ref();
     match timer {
         Some(timer) => {
-            println!("alarm begin run!");
             timer.activate();
-            println!("alarm run finish");
             //把alarm存放到pcb中
             let pcb_alarm = ProcessManager::ref_alarm_timer();
             let mut pcb_alarm_guard = pcb_alarm.lock();
-            println!("clone begin");
             *pcb_alarm_guard = Some(timer.clone());
-            println!("clone finish");
-            //test
-            match pcb_alarm_guard.as_ref() {
-                Some(current_timer) => {
-                    println!("current alarm's timeout: {}", current_timer.expired_time);
-                }
-                None => {
-                    println!("alarm write in pcb wrong!");
-                }
-            }
+            drop(pcb_alarm_guard);
         }
         None => {
             println!("alarm init wrong");

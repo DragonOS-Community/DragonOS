@@ -149,11 +149,6 @@ impl Timer {
         true
     }
 
-    /// ## 更新定时器触发状态
-    pub fn restart(&self){
-        let mut timer = self.inner();
-        timer.triggered = false;
-    }
 }
 
 /// 定时器类型

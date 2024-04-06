@@ -8,7 +8,7 @@ use crate::{
     process::{timer::alarm_timer_init, ProcessControlBlock, ProcessManager}, syscall::{user_access::UserBufferWriter, Syscall}, time::{sleep::nanosleep, TimeSpec}
 };
 
-use super::{timekeeping::{do_gettimeofday, getnstimeofday}, timer::{next_n_ms_timer_jiffies, timer_jiffies_n_s}};
+use super::{timekeeping::{do_gettimeofday, getnstimeofday}, timer::next_n_ms_timer_jiffies};
 
 pub type PosixTimeT = c_longlong;
 pub type PosixSusecondsT = c_int;
@@ -149,8 +149,7 @@ impl Syscall {
         return Ok(0);
     }
 
-    pub fn alarm(second: u64) -> Result<usize, SystemError>{
-        println!("call alarm second: {}", second);
+    pub fn alarm(second: u32) -> Result<usize, SystemError>{
         //第一次调用alarm需要初始化
         let current_pid = ProcessManager::current_pid();
         let binding = ProcessManager::ref_alarm_timer();
@@ -158,34 +157,28 @@ impl Syscall {
         let alarm_timer_option = current_alarm_guard.as_mut();
         match alarm_timer_option {
             Some(alarm_timer) => {
-                println!("have old alarm");
-                let remain_time = alarm_timer.remain();
-                let remain_second = timer_jiffies_n_s(remain_time);
+                let remain_second = alarm_timer.remain();
                 if second == 0 {
-                    println!("second is 0, cancel the alarm");
-                    //clear timer
-                    //alarm_timer.inner().expire_jiffies = 0;
-                    //这里的cancel是不是只是把定时器弹出定时器列表
                     alarm_timer.cancel();
+                    //pcb_alarm初始化为none值
+                    current_alarm_guard.take();
                     return Ok(remain_second as usize);
                 }
                 //这里的second是以jiddies为单位
                 //Todo：秒转换成jiddies
-                let new_expired_time = next_n_ms_timer_jiffies(second * 1_000);
-                if remain_second == 0 {
-                    println!("because old alarm ring, begin reset!");
-                    alarm_timer.reset(new_expired_time);
-                    return Ok(remain_second as usize);
-                }else {
-                    println!("old alarm not rings.");
+                let new_expired_time = next_n_ms_timer_jiffies(second as u64 * 1_000);
+                if remain_second != 0 {
                     alarm_timer.cancel();
-                    alarm_timer.reset(new_expired_time);
-                    return Ok(remain_second as usize);
-                }    
+                }
+                //这里可以获得老的alarm定时器，可以供setitimer调用使用
+                current_alarm_guard.take();
+                drop(current_alarm_guard);
+                alarm_timer_init(current_pid, new_expired_time);
+                return Ok(remain_second as usize);   
             }
             None => {
                 drop(current_alarm_guard);
-                let new_expired_time = next_n_ms_timer_jiffies(second * 1_000);
+                let new_expired_time = next_n_ms_timer_jiffies(second as u64 * 1_000);
                 alarm_timer_init(current_pid, new_expired_time);
                 return Ok(0);
             }

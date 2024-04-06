@@ -15,7 +15,7 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    arch::{sched::sched, CurrentIrqArch},
+    arch::CurrentIrqArch,
     exception::InterruptArch,
     init::initcall::INITCALL_LATE,
     kdebug, kinfo,
@@ -24,6 +24,7 @@ use crate::{
         kthread::{KernelThreadClosure, KernelThreadMechanism},
         ProcessControlBlock, ProcessManager,
     },
+    sched::{schedule, SchedMode},
 };
 
 use super::{
@@ -823,7 +824,7 @@ pub fn clocksource_watchdog_kthread() -> i32 {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(true).expect("clocksource_watchdog_kthread:mark sleep failed");
         drop(irq_guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
     return 0;
 }

@@ -1,10 +1,14 @@
 use alloc::sync::Arc;
+use riscv::register::sstatus::SPP;
 use system_error::SystemError;
 
-use crate::process::{
-    fork::CloneFlags,
-    kthread::{KernelThreadCreateInfo, KernelThreadMechanism},
-    Pid,
+use crate::{
+    arch::interrupt::TrapFrame,
+    process::{
+        fork::CloneFlags,
+        kthread::{KernelThreadCreateInfo, KernelThreadMechanism},
+        Pid, ProcessManager,
+    },
 };
 
 impl KernelThreadMechanism {
@@ -13,11 +17,35 @@ impl KernelThreadMechanism {
     /// ## 返回值
     ///
     /// 返回创建的内核线程的pid
+    #[inline(never)]
     pub fn __inner_create(
         info: &Arc<KernelThreadCreateInfo>,
         clone_flags: CloneFlags,
     ) -> Result<Pid, SystemError> {
-        unimplemented!("KernelThreadMechanism::__inner_create")
+        // WARNING: If create failed, we must drop the info manually or it will cause memory leak. (refcount will not decrease when create failed)
+        let create_info: *const KernelThreadCreateInfo =
+            KernelThreadCreateInfo::generate_unsafe_arc_ptr(info.clone());
+
+        let mut frame = TrapFrame::new();
+        frame.a0 = create_info as usize;
+
+        // 使能中断
+        frame.status.update_sie(true);
+        frame.status.update_spp(SPP::Supervisor);
+
+        frame.ra = kernel_thread_bootstrap_stage1 as usize;
+
+        // fork失败的话，子线程不会执行。否则将导致内存安全问题。
+        let pid = ProcessManager::fork(&frame, clone_flags).map_err(|e| {
+            unsafe { KernelThreadCreateInfo::parse_unsafe_arc_ptr(create_info) };
+            e
+        })?;
+
+        ProcessManager::find(pid)
+            .unwrap()
+            .set_name(info.name().clone());
+
+        return Ok(pid);
     }
 }
 

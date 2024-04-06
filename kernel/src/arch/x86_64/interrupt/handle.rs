@@ -1,15 +1,13 @@
 use core::intrinsics::likely;
 
 use crate::{
-    arch::{
-        driver::apic::{apic_timer::APIC_TIMER_IRQ_NUM, CurrentApic, LocalAPIC},
-        sched::sched,
-    },
+    arch::driver::apic::{apic_timer::APIC_TIMER_IRQ_NUM, CurrentApic, LocalAPIC},
     exception::{irqdesc::irq_desc_manager, softirq::do_softirq, IrqNumber},
     process::{
         utils::{current_pcb_flags, current_pcb_preempt_count},
         ProcessFlags,
     },
+    sched::{SchedMode, __schedule},
 };
 
 use super::TrapFrame;
@@ -47,6 +45,6 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
     if (current_pcb_flags().contains(ProcessFlags::NEED_SCHEDULE))
         && vector == APIC_TIMER_IRQ_NUM.data()
     {
-        sched();
+        __schedule(SchedMode::SM_PREEMPT);
     }
 }

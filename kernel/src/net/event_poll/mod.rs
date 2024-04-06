@@ -11,7 +11,6 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    arch::sched::sched,
     filesystem::vfs::{
         file::{File, FileMode},
         FilePrivateData, IndexNode, Metadata,
@@ -24,6 +23,7 @@ use crate::{
         wait_queue::WaitQueue,
     },
     process::ProcessManager,
+    sched::{schedule, SchedMode},
     time::{
         timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
         TimeSpec,
@@ -489,7 +489,7 @@ impl EventPoll {
                 let guard = epoll.0.lock_irqsave();
                 unsafe { guard.epoll_wq.sleep_without_schedule() };
                 drop(guard);
-                sched();
+                schedule(SchedMode::SM_NONE);
                 // 被唤醒后,检查是否有事件可读
                 available = epoll.0.lock_irqsave().ep_events_available();
                 if let Some(timer) = timer {

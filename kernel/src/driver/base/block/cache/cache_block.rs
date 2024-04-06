@@ -1,4 +1,3 @@
-use core::cmp::Ordering;
 
 use alloc::{boxed::Box, vec::Vec};
 
@@ -14,29 +13,8 @@ pub enum CacheBlockFlag {
     Unwrited,
     Writed,
 }
-#[derive(Copy, Clone)]
-pub struct CacheBlockAddr(usize);
 
-impl CacheBlockAddr {
-    pub fn new(num: usize) -> Self {
-        Self(num)
-    }
-
-    pub fn data(&self) -> usize {
-        self.0
-    }
-}
-impl PartialEq<usize> for CacheBlockAddr {
-    fn eq(&self, other: &usize) -> bool {
-        self.0 == *other
-    }
-}
-
-impl PartialOrd<usize> for CacheBlockAddr {
-    fn partial_cmp(&self, other: &usize) -> Option<Ordering> {
-        Some(self.0.cmp(other))
-    }
-}
+pub type CacheBlockAddr = usize;
 
 /// # 结构功能
 /// 存储数据的最小单位

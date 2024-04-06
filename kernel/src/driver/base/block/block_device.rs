@@ -274,9 +274,8 @@ pub trait BlockDevice: Device {
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
         let cache_response = BlockCache::read(lba_id_start, count, buf);
-        match cache_response {
-            Ok(_) => return Ok(count * BLOCK_SIZE),
-            Err(x) => match x {
+        if let Err(e)=cache_response{
+            match e {
                 BlockCacheError::StaticParameterError => {
                     BlockCache::init();
                     let ans = self.read_at_sync(lba_id_start, count, buf)?;
@@ -291,7 +290,9 @@ pub trait BlockDevice: Device {
                     let ans = self.read_at_sync(lba_id_start, count, buf)?;
                     return Ok(ans);
                 }
-            },
+            }
+        }else{
+            return Ok(count * BLOCK_SIZE);
         }
     }
 
@@ -303,7 +304,7 @@ pub trait BlockDevice: Device {
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
-        let _cache_response = BlockCache::test_write(lba_id_start, count, buf);
+        let _cache_response = BlockCache::immediate_write(lba_id_start, count, buf);
         self.write_at_sync(lba_id_start, count, buf)
     }
 

@@ -182,7 +182,8 @@ rustInstall() {
 		rustup component add rust-src --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
 		rustup target add x86_64-unknown-none --toolchain nightly-2023-01-21-x86_64-unknown-linux-gnu
 		rustup target add x86_64-unknown-none --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
-		rustup target add x86_64-unknown-linux-musl --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu	
+		rustup target add x86_64-unknown-linux-musl --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
+
 		rustup toolchain install nightly-2023-01-21-riscv64gc-unknown-linux-gnu --force-non-host
 		rustup toolchain install nightly-2023-08-15-riscv64gc-unknown-linux-gnu --force-non-host
 		rustup target add riscv64gc-unknown-none-elf --toolchain nightly-2023-01-21-riscv64gc-unknown-linux-gnu
@@ -293,7 +294,7 @@ else
 fi
 
 # 安装rust
-rustInstall     
+rustInstall
 
 
 #  初始化DragonOS的musl交叉编译工具链

@@ -10,7 +10,7 @@ use crate::{
     arch::ipc::signal::Signal,
     driver::tty::{
         termios::{ControlCharIndex, InputMode, LocalMode, OutputMode, Termios},
-        tty_core::{EchoOperation, TtyCore, TtyCoreData, TtyFlag, TtyIoctlCmd},
+        tty_core::{EchoOperation, TtyCore, TtyCoreData, TtyFlag, TtyIoctlCmd, TtyPacketStatus},
         tty_driver::{TtyDriverFlag, TtyOperation},
         tty_job_control::TtyJobCtrlManager,
     },
@@ -812,6 +812,10 @@ impl NTtyData {
             self.read_flags.set_all(false);
             self.pushing = false;
             self.lookahead_count = 0;
+
+            if tty.core().link().is_some() {
+                self.packet_mode_flush(tty.core());
+            }
         }
     }
 
@@ -1521,6 +1525,17 @@ impl NTtyData {
         }
         Ok(1)
     }
+
+    fn packet_mode_flush(&self, tty: &TtyCoreData) {
+        let link = tty.link().unwrap();
+        if link.core().contorl_info_irqsave().packet {
+            tty.contorl_info_irqsave()
+                .pktstatus
+                .insert(TtyPacketStatus::TIOCPKT_FLUSHREAD);
+
+            link.core().read_wq().wakeup_all();
+        }
+    }
 }
 
 impl TtyLineDiscipline for NTtyLinediscipline {
@@ -1551,7 +1566,10 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         ldata.lookahead_count = 0;
 
         // todo: kick worker?
-        // todo: packet mode?
+        // packet mode?
+        if core.link().is_some() {
+            ldata.packet_mode_flush(core);
+        }
 
         Ok(())
     }
@@ -1618,12 +1636,31 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             }
         }
 
+        let packet = core.contorl_info_irqsave().packet;
         let mut ret: Result<usize, SystemError> = Ok(0);
         // 记录读取前 的tail
         let tail = ldata.read_tail;
         drop(ldata);
         while nr != 0 {
             // todo: 处理packet模式
+            if packet {
+                let link = core.link().unwrap();
+                let link = link.core();
+                let mut ctrl = link.contorl_info_irqsave();
+                if !ctrl.pktstatus.is_empty() {
+                    if offset != 0 {
+                        break;
+                    }
+                    let cs = ctrl.pktstatus;
+                    ctrl.pktstatus = TtyPacketStatus::empty();
+
+                    buf[offset] = cs.bits();
+                    offset += 1;
+                    // nr -= 1;
+                    break;
+                }
+            }
+
             let mut ldata = self.disc_data();
 
             let core = tty.core();
@@ -1676,7 +1713,11 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             } else {
                 // 非标准模式
                 // todo: 处理packet模式
-
+                if packet && offset == 0 {
+                    buf[offset] = TtyPacketStatus::TIOCPKT_DATA.bits();
+                    offset += 1;
+                    nr -= 1;
+                }
                 // 拷贝数据
                 if ldata.copy_from_read_buf(core.termios(), buf, &mut nr, &mut offset)?
                     && offset >= minimum
@@ -2025,7 +2066,14 @@ impl TtyLineDiscipline for NTtyLinediscipline {
 
         if core.contorl_info_irqsave().packet {
             let link = core.link();
-            if link.is_some() && link.unwrap().core().contorl_info_irqsave().pktstatus != 0 {
+            if link.is_some()
+                && !link
+                    .unwrap()
+                    .core()
+                    .contorl_info_irqsave()
+                    .pktstatus
+                    .is_empty()
+            {
                 event.insert(
                     EPollEventType::EPOLLPRI
                         | EPollEventType::EPOLLIN

@@ -17,6 +17,7 @@ use crate::{
     ipc::shm::{shm_manager_lock, IPC_PRIVATE},
     kerror, kwarn,
     libs::align::page_align_up,
+    libs::spinlock::SpinLock,
     mm::{
         allocator::page_frame::{PageFrameCount, PhysPageFrame, VirtPageFrame},
         page::{page_manager_lock_irqsave, PageFlags, PageFlushAll},
@@ -63,16 +64,17 @@ impl Syscall {
             pipe_ptr.clone(),
             FileMode::O_RDONLY | (flags & FileMode::O_NONBLOCK),
         )?;
-        read_file.private_data =
-            FilePrivateData::Pipefs(PipeFsPrivateData::new(FileMode::O_RDONLY));
+        read_file.private_data = SpinLock::new(FilePrivateData::Pipefs(PipeFsPrivateData::new(
+            FileMode::O_RDONLY,
+        )));
 
         let mut write_file = File::new(
             pipe_ptr.clone(),
             FileMode::O_WRONLY | (flags & (FileMode::O_NONBLOCK | FileMode::O_DIRECT)),
         )?;
-        write_file.private_data = FilePrivateData::Pipefs(PipeFsPrivateData::new(
+        write_file.private_data = SpinLock::new(FilePrivateData::Pipefs(PipeFsPrivateData::new(
             FileMode::O_WRONLY | (flags & (FileMode::O_NONBLOCK | FileMode::O_DIRECT)),
-        ));
+        )));
 
         if flags.contains(FileMode::O_CLOEXEC) {
             read_file.set_close_on_exec(true);

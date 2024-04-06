@@ -969,11 +969,6 @@ impl Syscall {
                 Ok(0)
             }
 
-            SYS_SET_ROBUST_LIST => {
-                kwarn!("SYS_SET_ROBUST_LIST has not yet been implemented");
-                Ok(0)
-            }
-
             SYS_RSEQ => {
                 kwarn!("SYS_RSEQ has not yet been implemented");
                 Ok(0)

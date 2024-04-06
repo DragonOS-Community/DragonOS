@@ -1,5 +1,9 @@
 use core::{
-    hash::Hash, hint::spin_loop, intrinsics::{likely, unlikely}, mem::ManuallyDrop, result, sync::atomic::{compiler_fence, AtomicBool, AtomicIsize, AtomicUsize, Ordering}
+    hash::Hash, 
+    hint::spin_loop, 
+    intrinsics::{likely, unlikely}, 
+    mem::ManuallyDrop, 
+    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicIsize, AtomicUsize, Ordering}
 };
 
 use alloc::{

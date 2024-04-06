@@ -49,7 +49,7 @@ pub fn user_path_at(
 
     // 如果path不是绝对路径，则需要拼接
     // 如果dirfd不是AT_FDCWD，则需要检查dirfd是否是目录
-    return if dirfd != AtFlags::AT_FDCWD.bits() {
+    if dirfd != AtFlags::AT_FDCWD.bits() {
         let binding = pcb.fd_table();
         let fd_table_guard = binding.read();
         let file = fd_table_guard
@@ -65,9 +65,9 @@ pub fn user_path_at(
             return Err(SystemError::ENOTDIR);
         }
 
-        Ok((file_guard.inode(), PathBuf::from(path)))
+        return Ok((file_guard.inode(), PathBuf::from(path)));
     } else {
-        Ok((ROOT_INODE(), PathBuf::from(pcb.basic().cwd()).join(path)))
+        return Ok((ROOT_INODE(), PathBuf::from(pcb.basic().cwd()).join(path)));
     };
 }
 

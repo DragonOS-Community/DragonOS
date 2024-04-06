@@ -13,7 +13,7 @@ use crate::{
         ramfs::RamFS,
         sysfs::sysfs_init,
         vfs::{
-            mount::{MountFS, MountPath, CLEAR_MOUNTS_LIST, MOUNTS_LIST},
+            mount::{MountFS, MountPath, CLEAR_MOUNTS_LIST, INIT_MOUNT_LIST, MOUNT_LIST},
             syscall::ModeType,
             AtomicInodeId, FileSystem, FileType,
         },
@@ -53,6 +53,7 @@ pub fn vfs_init() -> Result<(), SystemError> {
     // 使用Ramfs作为默认的根文件系统
     let ramfs = RamFS::new();
     let mount_fs = MountFS::new(ramfs, None);
+    INIT_MOUNT_LIST();
     let root_inode = mount_fs.root_inode();
 
     unsafe {
@@ -88,7 +89,7 @@ pub fn vfs_init() -> Result<(), SystemError> {
 ///
 /// @param mountpoint_name 在根目录下的挂载点的名称
 /// @param inode 原本的挂载点的inode
-pub fn do_migrate(
+fn do_migrate(
     new_root_inode: Arc<dyn IndexNode>,
     mountpoint_name: &str,
     fs: &MountFS,
@@ -144,7 +145,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
         drop(old_root_inode);
     }
 
-    MOUNTS_LIST()
+    MOUNT_LIST()
         .write()
         .insert(MountPath::from("/"), ROOT_INODE().fs());
     kinfo!("VFS: Migrate filesystems done!");

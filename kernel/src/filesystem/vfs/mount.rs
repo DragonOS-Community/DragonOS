@@ -58,23 +58,34 @@ impl Ord for MountPath {
     }
 }
 
-/// 返回MOUNT LIST
+/// # 获取挂载点的列表
 #[inline(always)]
 #[allow(non_snake_case)]
-pub fn MOUNTS_LIST() -> MountListType {
+pub fn MOUNT_LIST() -> MountListType {
     unsafe {
-        if __MOUNTS_LIST.is_none() {
-            __MOUNTS_LIST = Some(Arc::new(RwLock::new(BTreeMap::new())));
-        }
         return __MOUNTS_LIST.as_ref().unwrap().clone();
     }
 }
 
+/// # 初始化挂载点列表
+///
+/// 在VFS初始化时调用
 #[inline(always)]
 #[allow(non_snake_case)]
-pub fn CLEAR_MOUNTS_LIST() {
+pub(super) fn INIT_MOUNT_LIST() {
     unsafe {
-        __MOUNTS_LIST = None;
+        __MOUNTS_LIST = Some(Arc::new(RwLock::new(BTreeMap::new())));
+    }
+}
+
+/// # 清空挂载点列表
+///
+/// 用于迁移文件系统时清空挂载点列表
+#[inline(always)]
+#[allow(non_snake_case)]
+pub(super) fn CLEAR_MOUNTS_LIST() {
+    unsafe {
+        __MOUNTS_LIST = Some(Arc::new(RwLock::new(BTreeMap::new())));
     }
 }
 
@@ -185,7 +196,7 @@ impl MountFSInode {
     /// 如果当前inode在父MountFS内，但不是挂载点，那么说明在这里不需要进行inode替换，因此直接返回当前inode。
     ///
     /// @return Arc<MountFSInode>
-    pub fn overlaid_inode(&self) -> Arc<MountFSInode> {
+    fn overlaid_inode(&self) -> Arc<MountFSInode> {
         let inode_id = self.metadata().unwrap().inode_id;
 
         if let Some(sub_mountfs) = self.mount_fs.mountpoints.lock().get(&inode_id) {
@@ -415,7 +426,7 @@ impl IndexNode for MountFSInode {
             .insert(metadata.inode_id, new_mount_fs.clone());
         // kdebug!("Mount Path: {:?}", self._abs_path()?.to_str().unwrap());
         // kdebug!("Mount FS: {:?}", new_mount_fs);
-        MOUNTS_LIST().write().insert(
+        MOUNT_LIST().write().insert(
             MountPath::from(self.abs_path()?.to_str().unwrap()),
             new_mount_fs.clone(),
         );
@@ -500,7 +511,7 @@ impl FileSystem for MountFS {
         SuperBlock::new(Magic::MOUNT_MAGIC, MOUNTFS_BLOCK_SIZE, MOUNTFS_MAX_NAMELEN)
     }
 
-    fn cache(&self) -> Result<Arc<super::cache::DefaultCache>, SystemError> {
-        self.inner_filesystem.cache()
+    fn dcache(&self) -> Result<Arc<super::cache::DefaultDCache>, SystemError> {
+        self.inner_filesystem.dcache()
     }
 }

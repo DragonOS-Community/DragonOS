@@ -23,7 +23,7 @@ use system_error::SystemError;
 use self::utils::Keyer;
 
 use super::vfs::{
-    cache::DefaultCache, file::FilePrivateData, syscall::ModeType, FileSystem, FileSystemMaker,
+    cache::DefaultDCache, file::FilePrivateData, syscall::ModeType, FileSystem, FileSystemMaker,
     FsInfo, IndexNode, Metadata, SpecialNodeData,
 };
 use super::vfs::{Magic, SuperBlock};
@@ -34,7 +34,7 @@ const RAMFS_BLOCK_SIZE: u64 = 512;
 #[derive(Debug)]
 pub struct RamFS {
     root: Arc<LockedEntry>,
-    cache: Arc<DefaultCache>,
+    cache: Arc<DefaultDCache>,
     super_block: RwLock<SuperBlock>,
 }
 
@@ -42,7 +42,7 @@ impl RamFS {
     pub fn new() -> Arc<Self> {
         let root = Arc::new(LockedEntry(SpinLock::new(Entry {
             name: String::new(),
-            inode: Arc::new(LockedInode(SpinLock::new(Inode::new(
+            inode: Arc::new(LockedInode(SpinLock::new(RamfsInode::new(
                 FileType::Dir,
                 ModeType::from_bits_truncate(0o777),
             )))),
@@ -54,7 +54,7 @@ impl RamFS {
         })));
         let ret = Arc::new(RamFS {
             root,
-            cache: Arc::new(DefaultCache::new(None)),
+            cache: Arc::new(DefaultDCache::new(None)),
             super_block: RwLock::new(SuperBlock::new(
                 Magic::RAMFS_MAGIC,
                 RAMFS_BLOCK_SIZE,
@@ -104,7 +104,7 @@ impl FileSystem for RamFS {
         "ramfs"
     }
 
-    fn cache(&self) -> Result<Arc<DefaultCache>, SystemError> {
+    fn dcache(&self) -> Result<Arc<DefaultDCache>, SystemError> {
         Ok(self.cache.clone())
     }
 
@@ -114,7 +114,7 @@ impl FileSystem for RamFS {
 }
 
 #[derive(Debug)]
-pub struct Inode {
+pub struct RamfsInode {
     /// 元数据
     metadata: Metadata,
     /// 数据块
@@ -122,7 +122,7 @@ pub struct Inode {
 }
 
 #[derive(Debug)]
-pub struct LockedInode(SpinLock<Inode>);
+pub struct LockedInode(SpinLock<RamfsInode>);
 
 #[derive(Debug)]
 pub struct Entry {
@@ -145,16 +145,16 @@ pub struct Entry {
 #[derive(Debug)]
 pub struct LockedEntry(SpinLock<Entry>);
 
-impl Inode {
-    pub fn new(file_type: FileType, mode: ModeType) -> Inode {
-        Inode {
+impl RamfsInode {
+    pub fn new(file_type: FileType, mode: ModeType) -> RamfsInode {
+        RamfsInode {
             data: Vec::new(),
             metadata: Metadata::new(file_type, mode),
         }
     }
 
-    pub fn from(file_type: FileType, mode: ModeType, data: usize) -> Inode {
-        Inode {
+    pub fn from(file_type: FileType, mode: ModeType, data: usize) -> RamfsInode {
+        RamfsInode {
             data: Vec::new(),
 
             metadata: Metadata {
@@ -345,7 +345,7 @@ impl IndexNode for LockedEntry {
             parent: entry.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
-            inode: Arc::new(LockedInode(SpinLock::new(Inode::from(
+            inode: Arc::new(LockedInode(SpinLock::new(RamfsInode::from(
                 file_type, mode, data,
             )))),
             fs: entry.fs.clone(),
@@ -598,7 +598,10 @@ impl IndexNode for LockedEntry {
             parent: entry.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
-            inode: Arc::new(LockedInode(SpinLock::new(Inode::new(FileType::Pipe, mode)))),
+            inode: Arc::new(LockedInode(SpinLock::new(RamfsInode::new(
+                FileType::Pipe,
+                mode,
+            )))),
             fs: entry.fs.clone(),
             special_node: None,
             name: String::from(filename),

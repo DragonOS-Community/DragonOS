@@ -8,7 +8,7 @@ use crate::{
     driver::base::block::SeekFrom,
     filesystem::vfs::{
         file::{File, FileMode},
-        ROOT_INODE,
+        ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     libs::elf::ELF_LOADER,
     mm::{
@@ -117,7 +117,8 @@ impl ExecParam {
         vm: Arc<AddressSpace>,
         flags: ExecParamFlags,
     ) -> Result<Self, SystemError> {
-        let inode = ROOT_INODE().lookup(Path::new(file_path))?;
+        let inode = ROOT_INODE()
+            .lookup_follow_symlink(Path::new(file_path), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
         // 读取文件头部，用于判断文件类型
         let file = File::new(inode, FileMode::O_RDONLY)?;

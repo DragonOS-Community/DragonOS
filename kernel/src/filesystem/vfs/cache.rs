@@ -128,32 +128,12 @@ impl LruList {
             })
             .count()
     }
-
-    // fn release(&mut self) -> usize {
-    //     kdebug!("Called release.");
-    //     if self.list.is_empty() {
-    //         return 0;
-    //     }
-    //     self.list
-    //         .extract_if(|src| {
-    //             // 原始指针已被销毁
-    //             if src.upgrade().is_none() {
-    //                 return true;
-    //             }
-    //             // 已无外界在使用该文件
-    //             if src.strong_count() < 2 {
-    //                 return true;
-    //             }
-    //             false
-    //         })
-    //         .count()
-    // }
 }
 
 /// Directory Cache 的默认实现
 /// Todo: 使用自定义优化哈希函数
 #[allow(deprecated)]
-pub struct DefaultCache<H: Hasher + Default = SipHasher> {
+pub struct DefaultDCache<H: Hasher + Default = SipHasher> {
     /// hash index
     table: HashTable<H>,
     /// lru note
@@ -164,7 +144,7 @@ pub struct DefaultCache<H: Hasher + Default = SipHasher> {
     size: AtomicUsize,
 }
 
-impl<H: Hasher + Default> DefaultCache<H> {
+impl<H: Hasher + Default> DefaultDCache<H> {
     const DEFAULT_MEMORY_SIZE: usize = 1024 /* K */ * 1024 /* Byte */;
     pub fn new(mem_size: Option<usize>) -> Self {
         let mem_size = mem_size.unwrap_or(Self::DEFAULT_MEMORY_SIZE);
@@ -210,24 +190,17 @@ impl<H: Hasher + Default> DefaultCache<H> {
         self.table.get_list_iter(key)
     }
 
-    /// 清除已被删除的目录项（未测试）
+    /// 清除已被删除的目录项
     pub fn clean(&self) -> usize {
         let ret = self.deque.lock().clean();
         self.size.fetch_sub(ret, Ordering::Acquire);
         kdebug!("Clean {} empty entry", ret);
         ret
     }
-
-    // /// 释放未在使用的目录项与清除已删除的目录项（未测试）
-    // pub fn release(&self) -> usize {
-    //     let ret = self.deque.lock().release();
-    //     self.size.fetch_sub(ret, Ordering::Acquire);
-    //     kdebug!("Release {} empty entry", ret);
-    //     ret
-    // }
 }
 
-impl<H: Hasher + Default> core::fmt::Debug for DefaultCache<H> {
+impl<H: Hasher + Default> core::fmt::Debug for DefaultDCache<H> {
+    /// 避免在调试时打印过多信息
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "DefaultCache")
     }

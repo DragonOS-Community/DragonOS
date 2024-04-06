@@ -12,7 +12,7 @@ use super::{
     file::{File, FileMode},
     syscall::{ModeType, OpenHow, OpenHowResolve},
     utils::user_path_at,
-    FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    FileType, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 pub(super) fn do_faccessat(
@@ -95,10 +95,15 @@ fn do_sys_openat2(
                 && !how.o_flags.contains(FileMode::O_DIRECTORY)
                 && errno == SystemError::ENOENT
             {
-                // let (filename, parent_path) = rsplit_path(&path);
                 // 查找父目录
-                let parent_inode: Arc<dyn IndexNode> =
-                    ROOT_INODE().lookup(path.parent().unwrap_or(Path::new("/")))?;
+                let parent_inode: Arc<dyn IndexNode> = if follow_symlink {
+                    inode_begin.lookup_follow_symlink(
+                        path.parent().unwrap_or(Path::new("/")),
+                        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                    )?
+                } else {
+                    inode_begin.lookup(path.parent().unwrap_or(Path::new("/")))?
+                };
                 // 创建文件
                 let inode: Arc<dyn IndexNode> = parent_inode.create(
                     path.file_name().unwrap(),

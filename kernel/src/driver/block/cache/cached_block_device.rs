@@ -120,7 +120,7 @@ impl BlockCache {
     /// ## 返回值：
     /// - Ok(usize) :表示读取了多少个字节
     /// - Err(BlockCacheError) :如果输入的cache_block_addr超过了cache的容量，那么将返回Err（由于目前的cache不支持动态变化上限，所以可能出现这种错误;而实际上，由于Cache的地址是由frame_selector给出的,所以正确实现的frame_selector理论上不会出现这种错误）
-    pub fn read_one_block(
+    fn read_one_block(
         cache_block_addr: CacheBlockAddr,
         position: usize,
         buf: &mut [u8],
@@ -160,7 +160,7 @@ impl BlockCache {
     /// ## 返回值：
     /// Ok(()):表示插入成功
     /// Err(BlockCacheError) :一般来说不会产生错误，这里产生错误的原因只有插入时还没有初始化（一般也很难发生）
-    pub fn insert_one_block(lba_id: BlockId, data: Vec<u8>) -> Result<(), BlockCacheError> {
+    fn insert_one_block(lba_id: BlockId, data: Vec<u8>) -> Result<(), BlockCacheError> {
         let space = unsafe { space()? };
         space.insert(lba_id, data)
     }

@@ -1,14 +1,17 @@
 /// 引入Module
 use crate::{
-    driver::base::{
-        device::{
-            device_number::{DeviceNumber, Major},
-            Device, DeviceError, IdTable, BLOCKDEVS,
+    driver::{
+        base::{
+            device::{
+                device_number::{DeviceNumber, Major},
+                Device, DeviceError, IdTable, BLOCKDEVS,
+            },
+            map::{
+                DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
+                DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX,
+            },
         },
-        map::{
-            DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
-            DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX,
-        },
+        block::cache::{cached_block_device::BlockCache, BlockCacheError, BLOCK_SIZE},
     },
     kerror,
 };
@@ -17,10 +20,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::any::Any;
 use system_error::SystemError;
 
-use super::{
-    cache::{cached_block_device::BlockCache, BlockCacheError, BLOCK_SIZE},
-    disk_info::Partition,
-};
+use super::disk_info::Partition;
 
 /// 该文件定义了 Device 和 BlockDevice 的接口
 /// Notice 设备错误码使用 Posix 规定的 int32_t 的错误码表示，而不是自己定义错误enum
@@ -274,7 +274,7 @@ pub trait BlockDevice: Device {
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
         let cache_response = BlockCache::read(lba_id_start, count, buf);
-        if let Err(e)=cache_response{
+        if let Err(e) = cache_response {
             match e {
                 BlockCacheError::StaticParameterError => {
                     BlockCache::init();
@@ -291,7 +291,7 @@ pub trait BlockDevice: Device {
                     return Ok(ans);
                 }
             }
-        }else{
+        } else {
             return Ok(count * BLOCK_SIZE);
         }
     }

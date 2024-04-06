@@ -16,10 +16,10 @@ use system_error::SystemError;
 
 use crate::{
     arch::{
+        cpu::current_cpu_id,
         ipc::signal::{AtomicSignal, SigSet, Signal},
         process::ArchPCBInfo,
         CurrentIrqArch,
-        cpu::current_cpu_id,
     },
     driver::tty::tty_core::TtyCore,
     exception::InterruptArch,
@@ -231,7 +231,8 @@ impl ProcessManager {
                 // avoid deadlock
                 drop(writer);
 
-                let rq = cpu_rq(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize);
+                let rq =
+                    cpu_rq(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize);
 
                 let (rq, _guard) = rq.self_lock();
                 rq.update_rq_clock();

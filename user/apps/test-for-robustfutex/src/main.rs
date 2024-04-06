@@ -1,4 +1,5 @@
 extern crate libc;
+extern crate syscalls;
 
 use std::{
     ffi::c_void,
@@ -10,18 +11,17 @@ use std::{
     time::Duration,
 };
 
-use libc::{
-    c_int, perror, syscall, timespec, EXIT_FAILURE, MAP_ANONYMOUS, MAP_FAILED, MAP_SHARED,
-    PROT_READ, PROT_WRITE,
+use syscalls::{
+    syscall0, syscall2, syscall3, syscall6,
+    Sysno::{futex, get_robust_list, gettid, set_robust_list},
 };
 
-const SYS_FUTEX: i64 = 202;
-const SYS_SET_ROBUST_LIST: i64 = 273;
-const SYS_GET_ROBUST_LIST: i64 = 274;
-const SYS_MMAP: i64 = 9;
-const FUTEX_WAIT: u32 = 0;
-const FUTEX_WAKE: u32 = 1;
-const GETTID: i64 = 186;
+use libc::{
+    c_int, mmap, perror, EXIT_FAILURE, MAP_ANONYMOUS, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE,
+};
+
+const FUTEX_WAIT: usize = 0;
+const FUTEX_WAKE: usize = 1;
 
 // 封装futex
 #[derive(Clone, Copy, Debug)]
@@ -103,17 +103,6 @@ fn error_handle(msg: &str) -> ! {
     process::exit(EXIT_FAILURE)
 }
 
-fn futex(
-    uaddr: *mut u32,
-    futex_op: u32,
-    val: u32,
-    timeout: *const timespec,
-    uaddr2: *mut u32,
-    val3: u32,
-) -> c_int {
-    unsafe { syscall(SYS_FUTEX, uaddr, futex_op, val, timeout, uaddr2, val3) as c_int }
-}
-
 fn futex_wait(futexes: Futex, thread: &str, offset_futex: isize, lock: Lock, offset_count: isize) {
     loop {
         let atomic_count = AtomicI32::new(lock.get_val(offset_count));
@@ -124,7 +113,7 @@ fn futex_wait(futexes: Futex, thread: &str, offset_futex: isize, lock: Lock, off
             lock.set_val(0, offset_count);
 
             // 设置futex锁当前被哪个线程占用
-            let tid = unsafe { syscall(GETTID) as u32 };
+            let tid = unsafe { syscall0(gettid).unwrap() as u32 };
             futexes.set_val(futexes.get_val(offset_futex) | tid, offset_futex);
 
             break;
@@ -133,15 +122,18 @@ fn futex_wait(futexes: Futex, thread: &str, offset_futex: isize, lock: Lock, off
         println!("{} wating...", thread);
         let futex_val = futexes.get_val(offset_futex);
         futexes.set_val(futex_val | 0x8000_0000, offset_futex);
-        let ret = futex(
-            futexes.get_addr(offset_futex),
-            FUTEX_WAIT,
-            futexes.get_val(offset_futex),
-            ptr::null(),
-            ptr::null_mut(),
-            0,
-        );
-        if ret == -1 {
+        let ret = unsafe {
+            syscall6(
+                futex,
+                futexes.get_addr(offset_futex) as usize,
+                FUTEX_WAIT,
+                futexes.get_val(offset_futex) as usize,
+                0,
+                0,
+                0,
+            )
+        };
+        if ret.is_err() {
             error_handle("futex_wait failed");
         }
 
@@ -179,22 +171,25 @@ fn futex_wake(futexes: Futex, thread: &str, offset_futex: isize, lock: Lock, off
         }
 
         futexes.set_val(futex_val & !(1 << 31), offset_futex);
-        let ret = futex(
-            futexes.get_addr(offset_futex),
-            FUTEX_WAKE,
-            1,
-            ptr::null(),
-            ptr::null_mut(),
-            0,
-        );
-        if ret == -1 {
+        let ret = unsafe {
+            syscall6(
+                futex,
+                futexes.get_addr(offset_futex) as usize,
+                FUTEX_WAKE,
+                1,
+                0,
+                0,
+                0,
+            )
+        };
+        if ret.is_err() {
             error_handle("futex wake failed");
         }
         println!("{} waked", thread);
     }
 }
 
-fn set_robust_list(futexes: Futex) {
+fn set_list(futexes: Futex) {
     let head = RobustListHead {
         list: RobustList { next: ptr::null() },
         futex_offset: 44,
@@ -216,7 +211,10 @@ fn set_robust_list(futexes: Futex) {
 
         // 向内核注册robust list
         let len = mem::size_of::<*mut RobustListHead>();
-        syscall(SYS_SET_ROBUST_LIST, head, len);
+        let ret = syscall2(set_robust_list, head as usize, len);
+        if ret.is_err() {
+            println!("failed to set_robust_list, ret = {:?}", ret);
+        }
     }
 }
 
@@ -241,8 +239,7 @@ fn test01() {
     let head = NonNull::from(&head).as_ptr();
 
     let futexes = unsafe {
-        syscall(
-            SYS_MMAP,
+        mmap(
             ptr::null_mut::<c_void>(),
             (size_of::<c_int>() * 2) as libc::size_t,
             PROT_READ | PROT_WRITE,
@@ -284,9 +281,9 @@ fn test01() {
 
     unsafe {
         let len = mem::size_of::<*mut RobustListHead>();
-        let ret = syscall(SYS_SET_ROBUST_LIST, head, len);
-        if ret != 0 {
-            println!("failed to set_robust_list, ret = {}", ret);
+        let ret = syscall2(set_robust_list, head as usize, len);
+        if ret.is_err() {
+            println!("failed to set_robust_list, ret = {:?}", ret);
         }
     }
 
@@ -295,10 +292,11 @@ fn test01() {
     unsafe {
         let len: usize = 0;
         println!("len = {}", len);
-        let ret = syscall(SYS_GET_ROBUST_LIST, 0, head, &len);
+        let len_ptr = NonNull::from(&len).as_ptr();
+        let ret = syscall3(get_robust_list, 0, head as usize, len_ptr as usize);
         println!("get len = {}", len);
-        if ret != 0 {
-            println!("failed to get_robust_list, ret = {}", ret);
+        if ret.is_err() {
+            println!("failed to get_robust_list, ret = {:?}", ret);
         }
 
         println!("futex1 val: {:#x}", futexes.offset(11).read());
@@ -313,8 +311,7 @@ fn test01() {
 //测试一个线程异常退出时futex的robustness(多线程测试，目前futex还不支持多进程)
 fn test02() {
     let futexes = unsafe {
-        syscall(
-            SYS_MMAP,
+        mmap(
             ptr::null_mut::<c_void>(),
             (size_of::<c_int>() * 2) as libc::size_t,
             PROT_READ | PROT_WRITE,
@@ -327,8 +324,7 @@ fn test02() {
         error_handle("mmap failed");
     }
     let count = unsafe {
-        syscall(
-            SYS_MMAP,
+        mmap(
             ptr::null_mut::<c_void>(),
             (size_of::<c_int>() * 2) as libc::size_t,
             PROT_READ | PROT_WRITE,
@@ -363,14 +359,14 @@ fn test02() {
 
     // tid1 = 7
     let thread1 = thread::spawn(move || {
-        set_robust_list(futexes);
+        set_list(futexes);
         thread::sleep(Duration::from_secs(2));
         for i in 0..2 {
             futex_wait(futexes, "thread1", 11, locks, 0);
             println!("thread1 times: {}", i);
             thread::sleep(Duration::from_secs(3));
 
-            let tid = unsafe { syscall(GETTID) as u32 };
+            let tid = unsafe { syscall0(gettid).unwrap() as u32 };
             futexes.set_val(futexes.get_val(12) | tid, 12);
 
             if i == 1 {
@@ -383,12 +379,12 @@ fn test02() {
     });
 
     // tid2 = 6
-    set_robust_list(futexes);
+    set_list(futexes);
     for i in 0..2 {
         futex_wait(futexes, "thread2", 12, locks, 1);
         println!("thread2 times: {}", i);
 
-        let tid = unsafe { syscall(GETTID) as u32 };
+        let tid = unsafe { syscall0(gettid).unwrap() as u32 };
         futexes.set_val(futexes.get_val(11) | tid, 11);
 
         futex_wake(futexes, "thread1", 11, locks, 0);

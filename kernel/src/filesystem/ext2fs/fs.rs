@@ -211,7 +211,6 @@ impl Default for Ex2SuperBlock {
 }
 
 #[derive(Debug, Default)]
-#[repr(C, align(1))]
 ///second extended-fs super-block data in memory
 pub struct Ext2SuperBlockInfo {
     pub s_frag_size: u32,                      /* Size of a fragment in bytes */
@@ -250,11 +249,14 @@ pub struct Ext2SuperBlockInfo {
     pub s_freeblocks_counter: AtomicU32,
     pub s_freeinodes_counter: AtomicU32,
     pub s_dirs_counter: AtomicU32,
+
+    pub partition: Weak<Partition>,
     /* root of the per fs reservation window tree */
     // spinlock_t s_rsv_window_lock,
     // struct rb_root s_rsv_window_root,
     // struct ext2_reserve_window_node s_rsv_window_head,
 }
+
 impl Ext2SuperBlockInfo {
     pub fn new(partition: Arc<Partition>) -> Self {
         let sb = Ex2SuperBlock::read_superblock(partition.clone()).unwrap();
@@ -291,8 +293,24 @@ impl Ext2SuperBlockInfo {
             s_freeblocks_counter: AtomicU32::new(sb.free_block_count),
             s_freeinodes_counter: AtomicU32::new(sb.free_inode_count),
             s_dirs_counter: AtomicU32::new(1),
+            partition: Arc::downgrade(&partition.clone()),
         }
     }
+    // TODO 根据索引号获取磁盘inode
+    pub fn read_inode(&self, inode_index: u32) -> Result<Ex2Inode, SystemError>{
+        let mut inode_data = Vec::with_capacity(LBA_SIZE);
+        inode_data.resize(LBA_SIZE, 0);
+        let mut blc_data = Vec::with_capacity(LBA_SIZE);
+        blc_data.resize(LBA_SIZE, 0);
+        let mut blc_index = (inode_index - 1) * self.s_inodes_per_group + self.s_first_ino;
+
+        let mut blc_num = 0;
+        while blc_num < self.s_inodes_per_group {
+            
+        }
+        todo!()
+    }
+    // TODO 获取根结点
 }
 
 impl Ex2SuperBlock {

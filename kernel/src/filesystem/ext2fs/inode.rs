@@ -1,18 +1,21 @@
-use core::{fmt::Debug, mem::ManuallyDrop};
+use core::{
+    cmp::min,
+    fmt::Debug,
+    mem::{self, transmute, ManuallyDrop},
+};
 
 use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
 use system_error::SystemError;
-use uefi::proto::media::file;
 
+use super::fs::EXT2_SB_INFO;
 use crate::{
+    driver::base::block::{block_device::LBA_SIZE, disk_info::Partition},
     filesystem::vfs::{syscall::ModeType, FileSystem, FileType, IndexNode, Metadata},
     libs::{rwlock::RwLock, spinlock::SpinLock},
 };
-
-use super::fs::EXT2_SB_INFO;
 
 const EXT2_NDIR_BLOCKS: usize = 12;
 const EXT2_DIND_BLOCK: usize = 13;
@@ -65,7 +68,6 @@ struct HurdOsd2 {
 }
 
 /// inode中根据不同系统的保留值
-#[repr(C, align(1))]
 pub union OSD2 {
     linux: ManuallyDrop<LinuxOsd2>,
     hurd: ManuallyDrop<HurdOsd2>,
@@ -124,7 +126,9 @@ pub struct Ext2Inode {
     /// 操作系统依赖
     os_dependent_2: OSD2,
 }
-impl Ext2Inode {}
+impl Ext2Inode {
+    // TODO 刷新磁盘中的inode
+}
 
 impl LockedExt2Inode {
     pub fn get_block_group(inode: usize) -> usize {
@@ -157,12 +161,12 @@ pub struct DataBlock {
 }
 pub struct LockedDataBlock(RwLock<DataBlock>);
 
-#[derive(Debug)]
-#[repr(C, align(1))]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Ext2Indirect {
     pub self_ref: Weak<Ext2Indirect>,
     pub next_point: Vec<Option<Arc<Ext2Indirect>>>,
-    pub data_block: Option<Arc<DataBlock>>,
+    // TODO datablock应该改为block地址
+    pub data_block: Option<u32>,
 }
 #[derive(Debug)]
 pub struct LockedExt2InodeInfo(SpinLock<Ext2InodeInfo>);
@@ -171,22 +175,47 @@ pub struct LockedExt2InodeInfo(SpinLock<Ext2InodeInfo>);
 /// 存储在内存中的inode
 pub struct Ext2InodeInfo {
     // TODO 将ext2iode内容和meta联系在一起，可自行设计
-    data: Vec<Option<Ext2Indirect>>,
+    // data: Vec<Option<Ext2Indirect>>,
+    i_data: [u32; 15],
     meta: Metadata,
-    block_group: u32,
+    // block_group: u32,
     mode: ModeType,
     file_type: FileType,
+    // file_size: u32,
+    // disk_sector: u32,
 }
 
 impl Ext2InodeInfo {
     pub fn new(inode: LockedExt2Inode) -> Self {
         let inode_grade = inode.0.lock();
-        // let file_type = inode_grade.
-        todo!()
+        let mode = inode_grade.mode;
+        let file_type = Ext2FileType::get_file_type(&mode).unwrap().covert_type();
+        // TODO 根据inode mode转换modetype
+        let fs_mode = ModeType::from_bits_truncate(0o755);
+        let meta = Metadata::new(file_type, fs_mode);
+        // TODO 获取block group
+        let mut d: Vec<Option<Ext2Indirect>> = Vec::with_capacity(15);
+        for i in 0..12 as usize {
+            let mut idir = Ext2Indirect::default();
+            idir.data_block = Some(inode_grade.blocks[i]);
+            idir.self_ref = Arc::downgrade(&Arc::new(idir.clone()));
+            d[i] = Some(idir);
+        }
+        // TODO 间接地址
+        Self {
+            // data: d,
+            i_data: inode_grade.blocks,
+            meta,
+            mode: fs_mode,
+            file_type,
+        }
+
     }
+    // TODO 更新当前inode的元数据
+
 }
 
-impl IndexNode for LockedExt2Inode {
+impl IndexNode for LockedExt2InodeInfo {
     fn read_at(
         &self,
         offset: usize,
@@ -194,7 +223,143 @@ impl IndexNode for LockedExt2Inode {
         buf: &mut [u8],
         _data: &mut crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, system_error::SystemError> {
-        todo!()
+        let inode_grade = self.0.lock();
+        let superb = EXT2_SB_INFO.read();
+        // TODO 需要根据不同的文件类型，选择不同的读取方式，将读的行为集成到file type
+        match inode_grade.file_type {
+            FileType::File => {
+                // TODO 判断是否有空指针
+                // 起始读取块
+                let mut start_block = offset / LBA_SIZE;
+                // 需要读取的块
+                let read_block_num = min(len, buf.len()) / LBA_SIZE + 1;
+                // 已经读的块数
+                let mut already_read_block: usize = 0;
+                // 已经读的字节
+                let mut already_read_byte: usize = 0;
+                let mut start_pos: usize = 0;
+                // 读取的字节
+                let mut end_len: usize = min(LBA_SIZE, buf.len());
+                // 读取直接块
+                while already_read_block < read_block_num && start_block <= 11 {
+                    // 每次读一个块
+                    let r: usize = superb.partition.upgrade().unwrap().disk().read_at(
+                        inode_grade.i_data[start_block] as usize,
+                        1,
+                        &mut buf[start_pos..start_pos + end_len],
+                    )?;
+                    already_read_block += 1;
+                    start_block += 1;
+                    already_read_byte += r;
+                    start_pos += end_len;
+                    end_len = min(buf.len() - already_read_byte, LBA_SIZE);
+                }
+
+                if already_read_block == read_block_num {
+                    return Ok(already_read_byte);
+                }
+
+                // 读取一级间接块
+                // 获取地址块
+                let mut address_block: [u8; 512] = [0; 512];
+                let _ = superb.partition.upgrade().unwrap().disk().read_at(
+                    inode_grade.i_data[12] as usize,
+                    1,
+                    &mut address_block[0..],
+                );
+                let address: [u32; 128] =
+                    unsafe { mem::transmute::<[u8; 512], [u32; 128]>(address_block) };
+
+                // 读取数据块
+                while already_read_block < read_block_num && start_block <= 127 + 12 {
+                    // 每次读一个块
+                    let r: usize = superb.partition.upgrade().unwrap().disk().read_at(
+                        address[start_block - 12] as usize,
+                        1,
+                        &mut buf[start_pos..start_pos + end_len],
+                    )?;
+                    already_read_block += 1;
+                    start_block += 1;
+                    already_read_byte += r;
+                    start_pos += end_len;
+                    end_len = min(buf.len() - already_read_byte, LBA_SIZE);
+                }
+
+                if already_read_block == read_block_num {
+                    return Ok(already_read_byte);
+                }
+
+                // FIXME partition clone一下，升级成arc之后一直clone用
+                // 读取二级间接块
+                let indir_block = get_address_block(
+                    superb.partition.upgrade().unwrap(),
+                    inode_grade.i_data[13] as usize,
+                );
+
+                for i in 0..128 {
+                    // 根据二级间接块，获取读取间接块
+                    let address = get_address_block(
+                        superb.partition.upgrade().unwrap(),
+                        indir_block[i] as usize,
+                    );
+                    for j in 0..128 {
+                        if already_read_block == read_block_num {
+                            return Ok(already_read_byte);
+                        }
+
+                        let r = superb.partition.upgrade().unwrap().disk().read_at(
+                            address[j] as usize,
+                            1,
+                            &mut buf[start_pos..start_pos + end_len],
+                        )?;
+                        already_read_block += 1;
+                        start_block += 1;
+                        already_read_byte += r;
+                        start_pos += end_len;
+                        end_len = min(buf.len() - already_read_byte, LBA_SIZE);
+                    }
+                }
+
+                // 读取三级间接块
+                let thdir_block = get_address_block(
+                    superb.partition.upgrade().unwrap(),
+                    inode_grade.i_data[14] as usize,
+                );
+
+                for i in 0..128 {
+                    // 根据二级间接块，获取读取间接块
+                    let indir_block = get_address_block(
+                        superb.partition.upgrade().unwrap(),
+                        thdir_block[i] as usize,
+                    );
+                    for second in 0..128 {
+                        let address = get_address_block(
+                            superb.partition.upgrade().unwrap(),
+                            indir_block[second] as usize,
+                        );
+                        for j in 0..128 {
+                            if already_read_block == read_block_num {
+                                return Ok(already_read_byte);
+                            }
+
+                            let r = superb.partition.upgrade().unwrap().disk().read_at(
+                                address[j] as usize,
+                                1,
+                                &mut buf[start_pos..start_pos + end_len],
+                            )?;
+                            already_read_block += 1;
+                            start_block += 1;
+                            already_read_byte += r;
+                            start_pos += end_len;
+                            end_len = min(buf.len() - already_read_byte, LBA_SIZE);
+                        }
+                    }
+                }
+
+                Ok(already_read_byte)
+            }
+            _ => Err(SystemError::EINVAL),
+        }
     }
 
     fn write_at(
@@ -204,6 +369,10 @@ impl IndexNode for LockedExt2Inode {
         buf: &[u8],
         _data: &mut crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, system_error::SystemError> {
+        let inode_grade = self.0.lock();
+        let superb = EXT2_SB_INFO.read();
+        // 判断inode的文件类型
+
         todo!()
     }
 
@@ -218,6 +387,13 @@ impl IndexNode for LockedExt2Inode {
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
         todo!()
     }
+}
+
+pub fn get_address_block(partition: Arc<Partition>, ptr: usize) -> [u32; 128] {
+    let mut address_block: [u8; 512] = [0; 512];
+    let _ = partition.disk().read_at(ptr, 1, &mut address_block[0..]);
+    let address: [u32; 128] = unsafe { mem::transmute::<[u8; 512], [u32; 128]>(address_block) };
+    address
 }
 
 /// 文件的类型
@@ -240,7 +416,7 @@ pub enum Ext2FileType {
 }
 
 impl Ext2FileType {
-    pub fn get_file_type(mode: u16) -> Result<Self, SystemError> {
+    pub fn get_file_type(mode: &u16) -> Result<Self, SystemError> {
         match mode & 0xF000 {
             0x1000 => Ok(Ext2FileType::FIFO),
             0x2000 => Ok(Ext2FileType::CharacterDevice),
@@ -314,12 +490,11 @@ const    BLOCK_DEVICE = 0x6000;
 }
 
 impl Ext2FileMode {
-    pub fn get_type(t: u16) -> Result<Ext2FileType, SystemError> {
+    pub fn get_type(t: &u16) -> Result<Ext2FileType, SystemError> {
         Ext2FileType::get_file_type(t)
     }
-    pub fn convert_mode(mode: u16) -> Result<ModeType, SystemError> {
+    pub fn convert_mode(mode: &u16) -> Result<ModeType, SystemError> {
         let mut mode_type = ModeType::empty();
         todo!()
-
     }
 }

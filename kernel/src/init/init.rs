@@ -1,6 +1,7 @@
 use crate::{
     arch::{
         init::{early_setup_arch, setup_arch, setup_arch_post},
+        time::time_init,
         CurrentIrqArch, CurrentSMPArch, CurrentSchedArch,
     },
     driver::{base::init::driver_init, serial::serial_early_init, video::VideoRefreshManager},
@@ -70,6 +71,7 @@ fn do_start_kernel() {
     softirq_init().expect("softirq init failed");
     Syscall::init().expect("syscall init failed");
     timekeeping_init();
+    time_init();
     timer_init();
     kthread_init();
     clocksource_boot_finish();

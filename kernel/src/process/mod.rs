@@ -497,7 +497,8 @@ pub unsafe extern "sysv64" fn switch_finish_hook() {
     ProcessManager::switch_finish_hook();
 }
 #[cfg(target_arch = "riscv64")]
-pub unsafe extern "C" fn switch_finish_hook() {
+#[inline(always)]
+pub unsafe fn switch_finish_hook() {
     ProcessManager::switch_finish_hook();
 }
 

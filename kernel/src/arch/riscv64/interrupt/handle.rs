@@ -162,8 +162,16 @@ fn do_trap_insn_page_fault(_trap_frame: &mut TrapFrame) -> Result<(), SystemErro
 }
 
 /// 处理页加载错误异常 #13
-fn do_trap_load_page_fault(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    kerror!("riscv64_do_irq: do_trap_load_page_fault");
+fn do_trap_load_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    let vaddr = trap_frame.badaddr;
+    let cause = trap_frame.cause;
+    let epc = trap_frame.epc;
+    kerror!(
+        "riscv64_do_irq: do_trap_load_page_fault: epc: {epc:#x}, vaddr={:#x}, cause={:?}",
+        vaddr,
+        cause
+    );
+
     loop {
         spin_loop();
     }

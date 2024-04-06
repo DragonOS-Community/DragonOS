@@ -3,7 +3,6 @@ use sbi_rt::HartMask;
 
 use crate::{
     init::boot_params,
-    kdebug,
     mm::percpu::{PerCpu, PerCpuVar},
     smp::cpu::{ProcessorId, SmpCpuManager},
 };

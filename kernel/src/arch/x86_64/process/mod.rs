@@ -563,6 +563,8 @@ pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<Str
     current_pcb.flags().remove(ProcessFlags::KTHREAD);
     current_pcb.worker_private().take();
 
+    *current_pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::CFS;
+
     let mut trap_frame = TrapFrame::new();
 
     compiler_fence(Ordering::SeqCst);
@@ -591,6 +593,7 @@ unsafe extern "sysv64" fn ready_to_switch_to_user(
     new_rip: usize,
 ) -> ! {
     *(trapframe_vaddr as *mut TrapFrame) = trap_frame;
+    compiler_fence(Ordering::SeqCst);
     asm!(
         "swapgs",
         "mov rsp, {trapframe_vaddr}",
@@ -601,3 +604,35 @@ unsafe extern "sysv64" fn ready_to_switch_to_user(
     );
     unreachable!()
 }
+
+// bitflags! {
+//     pub struct ProcessThreadFlags: u32 {
+//     /*
+//     * thread information flags
+//     * - these are process state flags that various assembly files
+//     *   may need to access
+//     */
+//     const TIF_NOTIFY_RESUME	= 1 << 1;	/* callback before returning to user */
+//     const TIF_SIGPENDING	=	1 << 2;	/* signal pending */
+//     const TIF_NEED_RESCHED	= 1 << 3;	/* rescheduling necessary */
+//     const TIF_SINGLESTEP	=	1 << 4;	/* reenable singlestep on user return*/
+//     const TIF_SSBD		= 1 << 5;	/* Speculative store bypass disable */
+//     const TIF_SPEC_IB		= 1 << 9;	/* Indirect branch speculation mitigation */
+//     const TIF_SPEC_L1D_FLUSH	= 1 << 10;	/* Flush L1D on mm switches (processes) */
+//     const TIF_USER_RETURN_NOTIFY	= 1 << 11;	/* notify kernel of userspace return */
+//     const TIF_UPROBE		= 1 << 12;	/* breakpointed or singlestepping */
+//     const TIF_PATCH_PENDING	= 1 << 13;	/* pending live patching update */
+//     const TIF_NEED_FPU_LOAD	= 1 << 14;	/* load FPU on return to userspace */
+//     const TIF_NOCPUID		= 1 << 15;	/* CPUID is not accessible in userland */
+//     const TIF_NOTSC		= 1 << 16;	/* TSC is not accessible in userland */
+//     const TIF_NOTIFY_SIGNAL	= 1 << 17;	/* signal notifications exist */
+//     const TIF_MEMDIE		= 1 << 20;	/* is terminating due to OOM killer */
+//     const TIF_POLLING_NRFLAG	= 1 << 21;	/* idle is polling for TIF_NEED_RESCHED */
+//     const TIF_IO_BITMAP		= 1 << 22;	/* uses I/O bitmap */
+//     const TIF_SPEC_FORCE_UPDATE	= 1 << 23;	/* Force speculation MSR update in context switch */
+//     const TIF_FORCED_TF		= 1 << 24;	/* true if TF in eflags artificially */
+//     const TIF_BLOCKSTEP		= 1 << 25;	/* set when we want DEBUGCTLMSR_BTF */
+//     const TIF_LAZY_MMU_UPDATES	= 1 << 27;	/* task is updating the mmu lazily */
+//     const TIF_ADDR32		= 1 << 29;	/* 32-bit address space on 64 bits */
+//     }
+// }

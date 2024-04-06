@@ -15,7 +15,7 @@ use smoltcp::{
 use system_error::SystemError;
 
 use crate::{
-    arch::{rand::rand, sched::sched},
+    arch::rand::rand,
     filesystem::vfs::{
         file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode,
         Metadata,
@@ -25,6 +25,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::EventWaitQueue,
     },
+    sched::{schedule, SchedMode},
 };
 
 use self::{
@@ -337,8 +338,9 @@ impl IndexNode for SocketInode {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        drop(data);
         self.0.lock_no_preempt().read(&mut buf[0..len]).0
     }
 
@@ -347,8 +349,9 @@ impl IndexNode for SocketInode {
         _offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        drop(data);
         self.0.lock_no_preempt().write(&buf[0..len], None)
     }
 
@@ -417,7 +420,7 @@ impl SocketHandleItem {
                 .sleep_without_schedule(events)
         };
         drop(handle_map_guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     pub fn shutdown_type(&self) -> ShutdownType {

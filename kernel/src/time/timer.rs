@@ -12,7 +12,7 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    arch::{sched::sched, CurrentIrqArch},
+    arch::CurrentIrqArch,
     exception::{
         softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
         InterruptArch,
@@ -20,6 +20,7 @@ use crate::{
     kerror, kinfo,
     libs::spinlock::{SpinLock, SpinLockGuard},
     process::{ProcessControlBlock, ProcessManager},
+    sched::{schedule, SchedMode},
 };
 
 use super::{jiffies::NSEC_PER_JIFFY, timekeeping::update_wall_time};
@@ -258,7 +259,7 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(true).ok();
         drop(irq_guard);
-        sched();
+        schedule(SchedMode::SM_PREEMPT);
         return Ok(MAX_TIMEOUT);
     } else if timeout < 0 {
         kerror!("timeout can't less than 0");
@@ -277,7 +278,7 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
 
         drop(irq_guard);
 
-        sched();
+        schedule(SchedMode::SM_PREEMPT);
         let time_remaining: i64 = timeout - TIMER_JIFFIES.load(Ordering::SeqCst) as i64;
         if time_remaining >= 0 {
             // 被提前唤醒，返回剩余时间

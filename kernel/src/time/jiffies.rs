@@ -18,6 +18,7 @@ lazy_static! {
 pub const JIFFIES_SHIFT: u32 = 8;
 pub const LATCH: u32 = (CLOCK_TICK_RATE + (HZ as u32) / 2) / HZ as u32;
 pub const ACTHZ: u32 = sh_div(CLOCK_TICK_RATE, LATCH, 8);
+pub const TICK_NESC: u32 = (NSEC_PER_SEC + (HZ as u32) / 2) / HZ as u32;
 //TODO 编写测试，保证始终跳动间隔与现实一致（两种时钟源进行对拍）
 pub const NSEC_PER_JIFFY: u32 = (((NSEC_PER_SEC as u64) << 8) / ACTHZ as u64) as u32;
 pub const fn sh_div(nom: u32, den: u32, lsh: u32) -> u32 {

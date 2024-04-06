@@ -8,11 +8,12 @@ use hashbrown::HashMap;
 use system_error::SystemError;
 
 use crate::{
-    arch::{sched::sched, CurrentIrqArch, MMArch},
+    arch::{CurrentIrqArch, MMArch},
     exception::InterruptArch,
     libs::spinlock::{SpinLock, SpinLockGuard},
     mm::{ucontext::AddressSpace, MemoryManagementArch, VirtAddr},
     process::{ProcessControlBlock, ProcessManager},
+    sched::{schedule, SchedMode},
     syscall::user_access::UserBufferReader,
     time::{
         timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
@@ -287,7 +288,7 @@ impl Futex {
         })?;
         drop(futex_map_guard);
         drop(irq_guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
 
         // 被唤醒后的检查
         let mut futex_map_guard = FutexData::futex_map();

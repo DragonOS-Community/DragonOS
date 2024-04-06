@@ -12,6 +12,7 @@ use crate::{
         FilePrivateData,
     },
     kerror, kwarn,
+    libs::spinlock::SpinLock,
     mm::VirtAddr,
     process::{Pid, ProcessManager},
     syscall::{user_access::UserBufferWriter, Syscall},
@@ -48,16 +49,17 @@ impl Syscall {
             pipe_ptr.clone(),
             FileMode::O_RDONLY | (flags & FileMode::O_NONBLOCK),
         )?;
-        read_file.private_data =
-            FilePrivateData::Pipefs(PipeFsPrivateData::new(FileMode::O_RDONLY));
+        read_file.private_data = SpinLock::new(FilePrivateData::Pipefs(PipeFsPrivateData::new(
+            FileMode::O_RDONLY,
+        )));
 
         let mut write_file = File::new(
             pipe_ptr.clone(),
             FileMode::O_WRONLY | (flags & (FileMode::O_NONBLOCK | FileMode::O_DIRECT)),
         )?;
-        write_file.private_data = FilePrivateData::Pipefs(PipeFsPrivateData::new(
+        write_file.private_data = SpinLock::new(FilePrivateData::Pipefs(PipeFsPrivateData::new(
             FileMode::O_WRONLY | (flags & (FileMode::O_NONBLOCK | FileMode::O_DIRECT)),
-        ));
+        )));
 
         if flags.contains(FileMode::O_CLOEXEC) {
             read_file.set_close_on_exec(true);

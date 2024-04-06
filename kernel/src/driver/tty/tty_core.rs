@@ -1,9 +1,14 @@
 use core::{
     fmt::Debug,
-    sync::atomic::{AtomicBool, AtomicUsize},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use alloc::{collections::LinkedList, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    collections::LinkedList,
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use system_error::SystemError;
 
 use crate::{
@@ -55,7 +60,7 @@ impl TtyCore {
             ctrl: SpinLock::new(TtyContorlInfo::default()),
             closing: AtomicBool::new(false),
             flow: SpinLock::new(TtyFlowState::default()),
-            link: None,
+            link: RwLock::default(),
             epitems: SpinLock::new(LinkedList::new()),
         };
 
@@ -138,7 +143,7 @@ impl TtyCore {
 
         self.core()
             .write_wq
-            .wakeup(EPollEventType::EPOLLOUT.bits() as u64);
+            .wakeup_any(EPollEventType::EPOLLOUT.bits() as u64);
     }
 
     pub fn tty_mode_ioctl(tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<usize, SystemError> {
@@ -252,7 +257,7 @@ pub struct TtyContorlInfo {
     pub pgid: Option<Pid>,
 
     /// packet模式下使用，目前未用到
-    pub pktstatus: u8,
+    pub pktstatus: TtyPacketStatus,
     pub packet: bool,
 }
 
@@ -296,7 +301,7 @@ pub struct TtyCoreData {
     /// 流控状态
     flow: SpinLock<TtyFlowState>,
     /// 链接tty
-    link: Option<Arc<TtyCore>>,
+    link: RwLock<Weak<TtyCore>>,
     /// epitems
     epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
 }
@@ -333,6 +338,11 @@ impl TtyCoreData {
     }
 
     #[inline]
+    pub fn flags_write(&self) -> RwLockWriteGuard<'_, TtyFlag> {
+        self.flags.write_irqsave()
+    }
+
+    #[inline]
     pub fn termios(&self) -> RwLockReadGuard<'_, Termios> {
         self.termios.read_irqsave()
     }
@@ -346,6 +356,11 @@ impl TtyCoreData {
     pub fn set_termios(&self, termios: Termios) {
         let mut termios_guard = self.termios_write();
         *termios_guard = termios;
+    }
+
+    #[inline]
+    pub fn count(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
     }
 
     #[inline]
@@ -391,7 +406,36 @@ impl TtyCoreData {
 
     #[inline]
     pub fn link(&self) -> Option<Arc<TtyCore>> {
-        self.link.clone()
+        self.link.read().upgrade()
+    }
+
+    pub fn checked_link(&self) -> Result<Arc<TtyCore>, SystemError> {
+        if let Some(link) = self.link() {
+            return Ok(link);
+        }
+        return Err(SystemError::ENODEV);
+    }
+
+    pub fn set_link(&self, link: Weak<TtyCore>) {
+        *self.link.write() = link;
+    }
+
+    pub fn init_termios(&self) {
+        let tty_index = self.index();
+        let driver = self.driver();
+        // 初始化termios
+        if !driver
+            .flags()
+            .contains(super::tty_driver::TtyDriverFlag::TTY_DRIVER_RESET_TERMIOS)
+        {
+            // 先查看是否有已经保存的termios
+            if let Some(t) = driver.saved_termios().get(tty_index) {
+                let mut termios = *t;
+                termios.line = driver.init_termios().line;
+                self.set_termios(termios);
+            }
+        }
+        // TODO:设置termios波特率？
     }
 
     #[inline]
@@ -463,6 +507,10 @@ impl TtyOperation for TtyCore {
             .driver_funcs()
             .set_termios(tty, old_termios);
     }
+
+    fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
+        self.core().tty_driver.driver_funcs().close(tty)
+    }
 }
 
 bitflags! {
@@ -491,6 +539,19 @@ bitflags! {
         const LDISC_CHANGING	= 1 << 20;
         /// 终端线路驱动程序已停止
         const LDISC_HALTED	= 1 << 22;
+    }
+
+    #[derive(Default)]
+    pub struct TtyPacketStatus: u8 {
+        /* Used for packet mode */
+        const TIOCPKT_DATA		=  0;
+        const TIOCPKT_FLUSHREAD	=  1;
+        const TIOCPKT_FLUSHWRITE	=  2;
+        const TIOCPKT_STOP		=  4;
+        const TIOCPKT_START		=  8;
+        const TIOCPKT_NOSTOP		= 16;
+        const TIOCPKT_DOSTOP		= 32;
+        const TIOCPKT_IOCTL		= 64;
     }
 }
 
@@ -614,4 +675,12 @@ impl TtyIoctlCmd {
     pub const TIOCCBRK: u32 = 0x5428;
     /// Return the session ID of FD
     pub const TIOCGSID: u32 = 0x5429;
+    /// 设置ptl锁标记
+    pub const TIOCSPTLCK: u32 = 0x40045431;
+    /// 获取ptl锁标记
+    pub const TIOCGPTLCK: u32 = 0x80045439;
+    /// 获取packet标记
+    pub const TIOCGPKT: u32 = 0x80045438;
+    /// 获取pts index
+    pub const TIOCGPTN: u32 = 0x80045430;
 }

@@ -6,6 +6,7 @@ use core::{
 
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
+    driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::syscall::{PosixStatfs, PosixStatx},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::syscall::MremapFlags,
@@ -13,8 +14,9 @@ use crate::{
     process::{
         fork::KernelCloneArgs,
         resource::{RLimit64, RUsage},
-        ProcessManager,
+        ProcessFlags, ProcessManager,
     },
+    sched::{schedule, SchedMode},
     syscall::user_access::check_and_clone_cstr,
 };
 
@@ -381,7 +383,11 @@ impl Syscall {
 
             SYS_GETPID => Self::getpid().map(|pid| pid.into()),
 
-            SYS_SCHED => Self::sched(frame.is_from_user()),
+            SYS_SCHED => {
+                kwarn!("syscall sched");
+                schedule(SchedMode::SM_NONE);
+                Ok(0)
+            }
             SYS_DUP => {
                 let oldfd: i32 = args[0] as c_int;
                 Self::dup(oldfd)
@@ -652,8 +658,6 @@ impl Syscall {
 
             #[cfg(target_arch = "x86_64")]
             SYS_MKNOD => {
-                use crate::driver::base::device::device_number::DeviceNumber;
-
                 let path = args[0];
                 let flags = args[1];
                 let dev_t = args[2];
@@ -862,6 +866,10 @@ impl Syscall {
                 kwarn!("SYS_SETGID has not yet been implemented");
                 Ok(0)
             }
+            SYS_SETSID => {
+                kwarn!("SYS_SETSID has not yet been implemented");
+                Ok(0)
+            }
             SYS_GETEUID => Self::geteuid(),
             SYS_GETEGID => Self::getegid(),
             SYS_GETRUSAGE => {
@@ -944,6 +952,16 @@ impl Syscall {
                 Ok(0)
             }
 
+            SYS_SET_ROBUST_LIST => {
+                kwarn!("SYS_SET_ROBUST_LIST has not yet been implemented");
+                Ok(0)
+            }
+
+            SYS_RSEQ => {
+                kwarn!("SYS_RSEQ has not yet been implemented");
+                Ok(0)
+            }
+
             #[cfg(target_arch = "x86_64")]
             SYS_CHMOD => {
                 let pathname = args[0] as *const u8;
@@ -963,9 +981,15 @@ impl Syscall {
             }
 
             SYS_SCHED_GETAFFINITY => {
-                // todo: 这个系统调用还没有实现
+                let pid = args[0] as i32;
+                let size = args[1];
+                let set_vaddr = args[2];
 
-                Err(SystemError::ENOSYS)
+                let mut user_buffer_writer =
+                    UserBufferWriter::new(set_vaddr as *mut u8, size, frame.is_from_user())?;
+                let set: &mut [u8] = user_buffer_writer.buffer(0)?;
+
+                Self::getaffinity(pid, set)
             }
 
             #[cfg(target_arch = "x86_64")]
@@ -999,7 +1023,7 @@ impl Syscall {
                 Err(SystemError::ENOSYS)
             }
 
-            SYS_SCHED_YIELD => Self::sched_yield(),
+            // SYS_SCHED_YIELD => Self::sched_yield(),
             SYS_UNAME => {
                 let name = args[0] as *mut PosixOldUtsName;
                 Self::uname(name)
@@ -1011,6 +1035,13 @@ impl Syscall {
             }
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
+
+        if ProcessManager::current_pcb()
+            .flags()
+            .contains(ProcessFlags::NEED_SCHEDULE)
+        {
+            schedule(SchedMode::SM_PREEMPT);
+        }
 
         return r;
     }

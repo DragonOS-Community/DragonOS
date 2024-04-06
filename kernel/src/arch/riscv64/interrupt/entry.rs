@@ -242,7 +242,7 @@ unsafe extern "C" fn _save_context() -> ! {
 
 #[naked]
 #[no_mangle]
-unsafe extern "C" fn ret_from_exception() -> ! {
+pub unsafe extern "C" fn ret_from_exception() -> ! {
     asm!(
         concat!("
             ld s0, {off_status}(sp)

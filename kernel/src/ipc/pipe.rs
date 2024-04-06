@@ -1,13 +1,17 @@
 use crate::{
-    arch::{sched::sched, CurrentIrqArch},
+    arch::CurrentIrqArch,
     exception::InterruptArch,
     filesystem::vfs::{
         core::generate_inode_id, file::FileMode, syscall::ModeType, FilePrivateData, FileSystem,
         FileType, IndexNode, Metadata,
     },
-    libs::{spinlock::SpinLock, wait_queue::WaitQueue},
+    libs::{
+        spinlock::{SpinLock, SpinLockGuard},
+        wait_queue::WaitQueue,
+    },
     net::event_poll::{EPollEventType, EPollItem, EventPoll},
     process::ProcessState,
+    sched::{schedule, SchedMode},
     time::TimeSpec,
 };
 
@@ -37,7 +41,11 @@ impl PipeFsPrivateData {
 
 /// @brief 管道文件i节点(锁)
 #[derive(Debug)]
-pub struct LockedPipeInode(SpinLock<InnerPipeInode>);
+pub struct LockedPipeInode {
+    inner: SpinLock<InnerPipeInode>,
+    read_wait_queue: WaitQueue,
+    write_wait_queue: WaitQueue,
+}
 
 /// @brief 管道文件i节点(无锁)
 #[derive(Debug)]
@@ -47,8 +55,6 @@ pub struct InnerPipeInode {
     valid_cnt: i32,
     read_pos: i32,
     write_pos: i32,
-    read_wait_queue: WaitQueue,
-    write_wait_queue: WaitQueue,
     data: [u8; PIPE_BUFF_SIZE],
     /// INode 元数据
     metadata: Metadata,
@@ -107,8 +113,6 @@ impl LockedPipeInode {
             valid_cnt: 0,
             read_pos: 0,
             write_pos: 0,
-            read_wait_queue: WaitQueue::default(),
-            write_wait_queue: WaitQueue::default(),
             data: [0; PIPE_BUFF_SIZE],
 
             metadata: Metadata {
@@ -131,8 +135,12 @@ impl LockedPipeInode {
             writer: 0,
             epitems: SpinLock::new(LinkedList::new()),
         };
-        let result = Arc::new(Self(SpinLock::new(inner)));
-        let mut guard = result.0.lock();
+        let result = Arc::new(Self {
+            inner: SpinLock::new(inner),
+            read_wait_queue: WaitQueue::default(),
+            write_wait_queue: WaitQueue::default(),
+        });
+        let mut guard = result.inner.lock();
         guard.self_ref = Arc::downgrade(&result);
         // 释放锁
         drop(guard); //这一步其实不需要，只要离开作用域，guard生命周期结束，自会解锁
@@ -140,7 +148,7 @@ impl LockedPipeInode {
     }
 
     pub fn inner(&self) -> &SpinLock<InnerPipeInode> {
-        &self.0
+        &self.inner
     }
 }
 
@@ -150,11 +158,11 @@ impl IndexNode for LockedPipeInode {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: &mut FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // 获取mode
         let mode: FileMode;
-        if let FilePrivateData::Pipefs(pdata) = data {
+        if let FilePrivateData::Pipefs(pdata) = &*data {
             mode = pdata.mode;
         } else {
             return Err(SystemError::EBADF);
@@ -164,7 +172,7 @@ impl IndexNode for LockedPipeInode {
             return Err(SystemError::EINVAL);
         }
         // 加锁
-        let mut inode = self.0.lock();
+        let mut inode = self.inner.lock();
 
         // 如果管道里面没有数据，则唤醒写端，
         while inode.valid_cnt == 0 {
@@ -173,8 +181,7 @@ impl IndexNode for LockedPipeInode {
                 return Ok(0);
             }
 
-            inode
-                .write_wait_queue
+            self.write_wait_queue
                 .wakeup(Some(ProcessState::Blocked(true)));
 
             // 如果为非阻塞管道，直接返回错误
@@ -187,13 +194,12 @@ impl IndexNode for LockedPipeInode {
             unsafe {
                 let irq_guard = CurrentIrqArch::save_and_disable_irq();
 
-                inode.read_wait_queue.sleep_without_schedule();
                 drop(inode);
-
+                self.read_wait_queue.sleep_without_schedule();
                 drop(irq_guard);
             }
-            sched();
-            inode = self.0.lock();
+            schedule(SchedMode::SM_NONE);
+            inode = self.inner.lock();
         }
 
         let mut num = inode.valid_cnt as usize;
@@ -222,17 +228,15 @@ impl IndexNode for LockedPipeInode {
 
         // 读完以后如果未读完，则唤醒下一个读者
         if inode.valid_cnt > 0 {
-            inode
-                .read_wait_queue
+            self.read_wait_queue
                 .wakeup(Some(ProcessState::Blocked(true)));
         }
 
         //读完后解锁并唤醒等待在写等待队列中的进程
-        inode
-            .write_wait_queue
+        self.write_wait_queue
             .wakeup(Some(ProcessState::Blocked(true)));
 
-        let pollflag = EPollEventType::from_bits_truncate(inode.poll(data)? as u32);
+        let pollflag = EPollEventType::from_bits_truncate(inode.poll(&data)? as u32);
         // 唤醒epoll中等待的进程
         EventPoll::wakeup_epoll(&inode.epitems, pollflag)?;
 
@@ -242,10 +246,10 @@ impl IndexNode for LockedPipeInode {
 
     fn open(
         &self,
-        data: &mut FilePrivateData,
+        mut data: SpinLockGuard<FilePrivateData>,
         mode: &crate::filesystem::vfs::file::FileMode,
     ) -> Result<(), SystemError> {
-        let mut guard = self.0.lock();
+        let mut guard = self.inner.lock();
         // 不能以读写方式打开管道
         if mode.contains(FileMode::O_RDWR) {
             return Err(SystemError::EACCES);
@@ -264,21 +268,21 @@ impl IndexNode for LockedPipeInode {
     }
 
     fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
-        let inode = self.0.lock();
+        let inode = self.inner.lock();
         let mut metadata = inode.metadata.clone();
         metadata.size = inode.data.len() as i64;
 
         return Ok(metadata);
     }
 
-    fn close(&self, data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         let mode: FileMode;
-        if let FilePrivateData::Pipefs(pipe_data) = data {
+        if let FilePrivateData::Pipefs(pipe_data) = &*data {
             mode = pipe_data.mode;
         } else {
             return Err(SystemError::EBADF);
         }
-        let mut guard = self.0.lock();
+        let mut guard = self.inner.lock();
 
         // 写端关闭
         if mode.contains(FileMode::O_WRONLY) {
@@ -286,8 +290,7 @@ impl IndexNode for LockedPipeInode {
             guard.writer -= 1;
             // 如果已经没有写端了，则唤醒读端
             if guard.writer == 0 {
-                guard
-                    .read_wait_queue
+                self.read_wait_queue
                     .wakeup_all(Some(ProcessState::Blocked(true)));
             }
         }
@@ -298,8 +301,7 @@ impl IndexNode for LockedPipeInode {
             guard.reader -= 1;
             // 如果已经没有写端了，则唤醒读端
             if guard.reader == 0 {
-                guard
-                    .write_wait_queue
+                self.write_wait_queue
                     .wakeup_all(Some(ProcessState::Blocked(true)));
             }
         }
@@ -312,11 +314,11 @@ impl IndexNode for LockedPipeInode {
         _offset: usize,
         len: usize,
         buf: &[u8],
-        data: &mut FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // 获取mode
         let mode: FileMode;
-        if let FilePrivateData::Pipefs(pdata) = data {
+        if let FilePrivateData::Pipefs(pdata) = &*data {
             mode = pdata.mode;
         } else {
             return Err(SystemError::EBADF);
@@ -327,7 +329,7 @@ impl IndexNode for LockedPipeInode {
         }
         // 加锁
 
-        let mut inode = self.0.lock();
+        let mut inode = self.inner.lock();
 
         if inode.reader == 0 {
             // TODO: 如果已经没有读端存在了，则向写端进程发送SIGPIPE信号
@@ -337,8 +339,7 @@ impl IndexNode for LockedPipeInode {
 
         while len + inode.valid_cnt as usize > PIPE_BUFF_SIZE {
             // 唤醒读端
-            inode
-                .read_wait_queue
+            self.read_wait_queue
                 .wakeup(Some(ProcessState::Blocked(true)));
 
             // 如果为非阻塞管道，直接返回错误
@@ -350,12 +351,12 @@ impl IndexNode for LockedPipeInode {
             // 解锁并睡眠
             unsafe {
                 let irq_guard = CurrentIrqArch::save_and_disable_irq();
-                inode.write_wait_queue.sleep_without_schedule();
                 drop(inode);
+                self.write_wait_queue.sleep_without_schedule();
                 drop(irq_guard);
             }
-            sched();
-            inode = self.0.lock();
+            schedule(SchedMode::SM_NONE);
+            inode = self.inner.lock();
         }
 
         // 决定要输入的字节
@@ -375,17 +376,15 @@ impl IndexNode for LockedPipeInode {
 
         // 写完后还有位置，则唤醒下一个写者
         if (inode.valid_cnt as usize) < PIPE_BUFF_SIZE {
-            inode
-                .write_wait_queue
+            self.write_wait_queue
                 .wakeup(Some(ProcessState::Blocked(true)));
         }
 
         // 读完后解锁并唤醒等待在读等待队列中的进程
-        inode
-            .read_wait_queue
+        self.read_wait_queue
             .wakeup(Some(ProcessState::Blocked(true)));
 
-        let pollflag = EPollEventType::from_bits_truncate(inode.poll(data)? as u32);
+        let pollflag = EPollEventType::from_bits_truncate(inode.poll(&data)? as u32);
         // 唤醒epoll中等待的进程
         EventPoll::wakeup_epoll(&inode.epitems, pollflag)?;
 
@@ -416,6 +415,6 @@ impl IndexNode for LockedPipeInode {
     }
 
     fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        return self.0.lock().poll(private_data);
+        return self.inner.lock().poll(private_data);
     }
 }

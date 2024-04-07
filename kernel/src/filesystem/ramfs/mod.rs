@@ -23,7 +23,7 @@ use crate::{
 };
 
 use super::vfs::{
-    dcache::DefaultDCache, core::generate_inode_id, file::FilePrivateData, syscall::ModeType,
+    core::generate_inode_id, dcache::DefaultDCache, file::FilePrivateData, syscall::ModeType,
     FileSystem, FileSystemMaker, FileType, FsInfo, IndexNode, Magic, Metadata, SpecialNodeData,
     SuperBlock, FSMAKER,
 };

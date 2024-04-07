@@ -1,5 +1,5 @@
-pub mod dcache;
 pub mod core;
+pub mod dcache;
 pub mod fcntl;
 pub mod file;
 pub mod mount;
@@ -25,7 +25,7 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-use self::{dcache::DefaultDCache, core::generate_inode_id, file::FileMode, syscall::ModeType};
+use self::{core::generate_inode_id, dcache::DefaultDCache, file::FileMode, syscall::ModeType};
 pub use self::{
     core::ROOT_INODE,
     file::FilePrivateData,

@@ -39,7 +39,6 @@ impl KernelMapper {
     fn lock_cpu(cpuid: ProcessorId, mapper: PageMapper) -> Self {
         loop {
             match KERNEL_MAPPER_LOCK_OWNER.compare_exchange_weak(
-                //这里有一个lock_owner的变量，它表示一个当前拥有KernelMapper的cpu的id
                 KERNEL_MAPPER_NO_PROCESSOR,
                 cpuid,
                 Ordering::Acquire,

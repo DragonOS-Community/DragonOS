@@ -1,6 +1,6 @@
 use crate::driver::base::block::block_device::BlockId;
 
-/// #结构功能
+/// # 结构功能
 /// 一个简单的结构体，是BlockIter的输出
 #[derive(Debug)]
 pub struct BlockData {
@@ -94,7 +94,7 @@ impl FailData {
     pub fn lba_id(&self) -> BlockId {
         self.lba_id
     }
-    ///# 函数的功能
+    /// # 函数的功能
     /// 该函数返回的是缺块在buf中的位置，比如：index=1，那么我们就应该取buf\[512..1024\]
     pub fn index(&self) -> usize {
         self.index

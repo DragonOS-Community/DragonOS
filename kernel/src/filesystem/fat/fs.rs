@@ -15,7 +15,7 @@ use crate::ipc::pipe::LockedPipeInode;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
-        cache::DefaultDCache,
+        dcache::DefaultDCache,
         core::generate_inode_id,
         file::{FileMode, FilePrivateData},
         syscall::ModeType,

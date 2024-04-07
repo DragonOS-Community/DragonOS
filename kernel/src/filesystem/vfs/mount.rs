@@ -471,7 +471,7 @@ impl FileSystem for MountFS {
         SuperBlock::new(Magic::MOUNT_MAGIC, MOUNTFS_BLOCK_SIZE, MOUNTFS_MAX_NAMELEN)
     }
 
-    fn dcache(&self) -> Result<Arc<super::cache::DefaultDCache>, SystemError> {
+    fn dcache(&self) -> Result<Arc<super::dcache::DefaultDCache>, SystemError> {
         self.inner_filesystem.dcache()
     }
 }

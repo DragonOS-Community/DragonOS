@@ -520,15 +520,17 @@ impl dyn IndexNode {
                 }
 
                 // Cache record is found
-                if let Some((inode, found_path)) =
-                    Self::quick_lookup(fscache, &abs_path, &abs_path, &root_path)
-                {
-                    let rest_path = abs_path.strip_prefix(found_path).unwrap();
-                    // no path left
-                    if rest_path.iter().next().is_none() {
-                        return Ok(inode);
+                if let Some((inode, found_path)) = fscache.quick_lookup(&abs_path, &root_path) {
+                    if let Ok(rest_path) = abs_path.strip_prefix(found_path) {
+                        // no path rest
+                        if rest_path.iter().next().is_none() {
+                            return Ok(inode);
+                        }
+                        // path rest
+                        return inode.lookup_walk(rest_path, max_follow_times);
+                    } else {
+                        kwarn!("Unexpected here");
                     }
-                    return inode.lookup_walk(rest_path, max_follow_times);
                 }
 
                 // Cache record not found
@@ -693,41 +695,6 @@ impl dyn IndexNode {
         return Ok(PathBuf::from(
             ::core::str::from_utf8(&content[..len]).map_err(|_| SystemError::ENOTDIR)?,
         ));
-    }
-
-    /// 在dcache中快速查找目录项，返回 *找到的最近节点* 与 *剩余路径*
-    ///
-    /// - cache: 缓存
-    /// - abs_path: 绝对路径
-    /// - rest_path: 剩余路径
-    /// - stop_path: 停止路径
-    /// # None
-    /// 未找到
-    fn quick_lookup<'a>(
-        cache: Arc<DefaultDCache>,
-        abs_path: &'a Path,
-        rest_path: &'a Path,
-        stop_path: &'a Path,
-    ) -> Option<(Arc<dyn IndexNode>, &'a Path)> {
-        // kdebug!("Quick lookup: abs {:?}, rest {:?}", abs_path, rest_path);
-        let key = abs_path.file_name();
-
-        let result = cache.get(key.unwrap()).find(|src| {
-            // kdebug!("Src: {:?}, {:?}; Lookup: {:?}, {:?}", src.key(), src._abs_path(), key, abs_path);
-            src.abs_path().unwrap() == abs_path
-        });
-
-        if let Some(result) = result {
-            return Some((result, abs_path));
-        }
-
-        if let Some(parent) = rest_path.parent() {
-            if parent == stop_path {
-                return None;
-            }
-            return Self::quick_lookup(cache, abs_path, parent, stop_path);
-        }
-        return None;
     }
 }
 

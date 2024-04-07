@@ -80,7 +80,11 @@ impl MountList {
             .insert(MountPath::from(path.as_ref()), Arc::downgrade(fs));
     }
 
-    /// 获取 **路径`path`** 下 *最近的挂载点* 及其 *挂载点下的路径* 与 *文件系统*
+    /// 获取挂载点信息，返回
+    ///
+    /// - `最近的挂载点`
+    /// - `挂载点下的路径`
+    /// - `文件系统`
     /// # None
     /// 未找到挂载点
     pub fn get<T: AsRef<Path>>(path: T) -> Option<(PathBuf, PathBuf, Arc<MountFS>)> {

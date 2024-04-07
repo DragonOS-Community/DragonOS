@@ -12,6 +12,7 @@ use core::{
     mem::{size_of, swap},
     sync::atomic::{AtomicUsize, Ordering},
 };
+use path_base::Path;
 
 use crate::libs::{
     rwlock::{RwLock, RwLockUpgradableGuard},
@@ -196,6 +197,36 @@ impl<H: Hasher + Default> DefaultDCache<H> {
         self.size.fetch_sub(ret, Ordering::Acquire);
         kdebug!("Clean {} empty entry", ret);
         ret
+    }
+
+    /// 在dcache中快速查找目录项
+    /// - `search_path`: 搜索路径
+    /// - `stop_path`: 停止路径
+    /// - 返回值: 找到的`inode`及其`路径` 或 [`None`]
+    pub fn quick_lookup<'a>(
+        &self,
+        search_path: &'a Path,
+        stop_path: &'a Path,
+    ) -> Option<(Arc<dyn IndexNode>, &'a Path)> {
+        // kdebug!("Quick lookup: abs {:?}, rest {:?}", abs_path, rest_path);
+        let key = search_path.file_name();
+
+        let result = self.get(key.unwrap()).find(|src| {
+            // kdebug!("Src: {:?}, {:?}; Lookup: {:?}, {:?}", src.key(), src.abs_path(), key, abs_path);
+            src.abs_path().unwrap() == search_path
+        });
+
+        if let Some(inode) = result {
+            return Some((inode, search_path));
+        }
+
+        if let Some(parent) = search_path.parent() {
+            if parent == stop_path {
+                return None;
+            }
+            return self.quick_lookup(parent, stop_path);
+        }
+        return None;
     }
 }
 

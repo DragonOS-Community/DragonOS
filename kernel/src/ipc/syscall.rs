@@ -477,7 +477,7 @@ impl Syscall {
     pub fn shmctl(
         id: ShmId,
         cmd: ShmCtlCmd,
-        user_buf: usize,
+        user_buf: *const u8,
         from_user: bool,
     ) -> Result<usize, SystemError> {
         let mut shm_manager_guard = shm_manager_lock();

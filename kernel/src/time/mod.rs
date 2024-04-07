@@ -46,15 +46,15 @@ pub const FSEC_PER_SEC: u64 = 1000000000000000;
 /// 表示时间的结构体，符合POSIX标准。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]
-pub struct TimeSpec {
+pub struct PosixTimeSpec {
     pub tv_sec: i64,
     pub tv_nsec: i64,
 }
 
-impl TimeSpec {
+impl PosixTimeSpec {
     #[allow(dead_code)]
-    pub fn new(sec: i64, nsec: i64) -> TimeSpec {
-        return TimeSpec {
+    pub fn new(sec: i64, nsec: i64) -> PosixTimeSpec {
+        return PosixTimeSpec {
             tv_sec: sec,
             tv_nsec: nsec,
         };
@@ -67,7 +67,7 @@ impl TimeSpec {
             use crate::arch::driver::tsc::TSCManager;
             let khz = TSCManager::cpu_khz();
             if unlikely(khz == 0) {
-                return TimeSpec::default();
+                return PosixTimeSpec::default();
             } else {
                 return Self::from(Duration::from_millis(
                     CurrentTimeArch::get_cycles() as u64 / khz,
@@ -77,12 +77,17 @@ impl TimeSpec {
 
         #[cfg(target_arch = "riscv64")]
         {
-            return TimeSpec::new(0, 0);
+            return PosixTimeSpec::new(0, 0);
         }
+    }
+
+    /// 换算成纳秒
+    pub fn total_nanos(&self) -> i64 {
+        self.tv_sec * 1000000000 + self.tv_sec
     }
 }
 
-impl Sub for TimeSpec {
+impl Sub for PosixTimeSpec {
     type Output = Duration;
     fn sub(self, rhs: Self) -> Self::Output {
         let sec = self.tv_sec.checked_sub(rhs.tv_sec).unwrap_or(0);
@@ -91,17 +96,17 @@ impl Sub for TimeSpec {
     }
 }
 
-impl From<Duration> for TimeSpec {
+impl From<Duration> for PosixTimeSpec {
     fn from(dur: Duration) -> Self {
-        TimeSpec {
+        PosixTimeSpec {
             tv_sec: dur.total_micros() as i64 / 1000000,
             tv_nsec: (dur.total_micros() as i64 % 1000000) * 1000,
         }
     }
 }
 
-impl From<TimeSpec> for Duration {
-    fn from(val: TimeSpec) -> Self {
+impl From<PosixTimeSpec> for Duration {
+    fn from(val: PosixTimeSpec) -> Self {
         Duration::from_micros(val.tv_sec as u64 * 1000000 + val.tv_nsec as u64 / 1000)
     }
 }

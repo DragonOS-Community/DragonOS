@@ -24,7 +24,7 @@ use crate::{
     filesystem::vfs::{syscall::ModeType, FileType, ROOT_INODE},
     init::initcall::INITCALL_FS,
     libs::spinlock::{SpinLock, SpinLockGuard},
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
 use super::vfs::{
@@ -105,9 +105,9 @@ impl LockedDevPtsFSInode {
                     size: 0,
                     blk_size: 0,
                     blocks: 0,
-                    atime: TimeSpec::default(),
-                    mtime: TimeSpec::default(),
-                    ctime: TimeSpec::default(),
+                    atime: PosixTimeSpec::default(),
+                    mtime: PosixTimeSpec::default(),
+                    ctime: PosixTimeSpec::default(),
                     file_type: FileType::Dir,
                     mode: ModeType::from_bits_truncate(0x777),
                     nlinks: 1,

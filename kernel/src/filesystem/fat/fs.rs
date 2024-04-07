@@ -26,7 +26,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         vec_cursor::VecCursor,
     },
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
 use super::entry::FATFile;
@@ -195,9 +195,9 @@ impl LockedFATInode {
                 } else {
                     fs.bpb.total_sectors_16 as usize
                 },
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type,
                 mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
@@ -327,9 +327,9 @@ impl FATFileSystem {
                 } else {
                     bpb.total_sectors_16 as usize
                 },
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type: FileType::Dir,
                 mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,

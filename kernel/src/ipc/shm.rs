@@ -12,7 +12,7 @@ use crate::{
     },
     process::{Pid, ProcessManager},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 use alloc::vec::Vec;
 use core::sync::atomic::{compiler_fence, Ordering};
@@ -149,7 +149,7 @@ impl ShmManager {
         shmflg: ShmFlags,
     ) -> Result<usize, SystemError> {
         // 判断共享内存大小是否过小或溢出
-        if !(ShmMetaInfo::SHMMIN..=ShmMetaInfo::SHMMAX).contains(&size) {
+        if !(PosixShmMetaInfo::SHMMIN..=PosixShmMetaInfo::SHMMAX).contains(&size) {
             return Err(SystemError::EINVAL);
         }
 
@@ -173,9 +173,6 @@ impl ShmManager {
 
         // 创建共享内存信息结构体
         let paddr = phys_page.0;
-        let shm_cprid = ProcessManager::current_pid();
-        let time = TimeSpec::now();
-        let shm_ctim = time.tv_sec * 1000000000 + time.tv_nsec;
         let kern_ipc_perm = KernIpcPerm {
             id: shm_id,
             key,
@@ -186,7 +183,7 @@ impl ShmManager {
             mode: shmflg & ShmFlags::from_bits_truncate(ModeType::S_IRWXUGO.bits()),
             _seq: 0,
         };
-        let shm_kernel = KernelShm::new(kern_ipc_perm, paddr, size, shm_ctim, shm_cprid);
+        let shm_kernel = KernelShm::new(kern_ipc_perm, paddr, size);
 
         // 将key、id及其对应KernelShm添加到表中
         self.id2shm.insert(shm_id, shm_kernel);
@@ -212,20 +209,20 @@ impl ShmManager {
         self.id_allocator.free(id.0);
     }
 
-    pub fn ipc_info(&self, user_buf: usize, from_user: bool) -> Result<usize, SystemError> {
+    pub fn ipc_info(&self, user_buf: *const u8, from_user: bool) -> Result<usize, SystemError> {
         let mut user_buffer_writer = UserBufferWriter::new(
             user_buf as *mut u8,
-            core::mem::size_of::<ShmMetaInfo>(),
+            core::mem::size_of::<PosixShmMetaInfo>(),
             from_user,
         )?;
 
-        let shm_meta_info = ShmMetaInfo::new();
+        let shm_meta_info = PosixShmMetaInfo::new();
         user_buffer_writer.copy_one_to_user(&shm_meta_info, 0)?;
 
         return Ok(0);
     }
 
-    pub fn shm_info(&self, user_buf: usize, from_user: bool) -> Result<usize, SystemError> {
+    pub fn shm_info(&self, user_buf: *const u8, from_user: bool) -> Result<usize, SystemError> {
         // 已使用id数量
         let used_ids = self.id2shm.len().to_i32().unwrap();
         // 共享内存总和
@@ -234,11 +231,11 @@ impl ShmManager {
                 .unwrap()
                 .data()
         });
-        let shm_info = ShmInfo::new(used_ids, shm_tot, 0, 0, 0, 0);
+        let shm_info = PosixShmInfo::new(used_ids, shm_tot, 0, 0, 0, 0);
 
         let mut user_buffer_writer = UserBufferWriter::new(
             user_buf as *mut u8,
-            core::mem::size_of::<ShmInfo>(),
+            core::mem::size_of::<PosixShmInfo>(),
             from_user,
         )?;
         user_buffer_writer.copy_one_to_user(&shm_info, 0)?;
@@ -250,22 +247,22 @@ impl ShmManager {
         &self,
         id: ShmId,
         cmd: ShmCtlCmd,
-        user_buf: usize,
+        user_buf: *const u8,
         from_user: bool,
     ) -> Result<usize, SystemError> {
         let kernel_shm = self.id2shm.get(&id).ok_or(SystemError::EINVAL)?;
         let key = kernel_shm.kern_ipc_perm.key.data().to_i32().unwrap();
         let mode = kernel_shm.kern_ipc_perm.mode.bits();
 
-        let shm_perm = IpcPerm::new(key, 0, 0, 0, 0, mode);
+        let shm_perm = PosixIpcPerm::new(key, 0, 0, 0, 0, mode);
         let shm_segsz = kernel_shm.shm_size;
-        let shm_atime = kernel_shm.shm_atim;
-        let shm_dtime = kernel_shm.shm_dtim;
-        let shm_ctime = kernel_shm.shm_ctim;
+        let shm_atime = kernel_shm.shm_atim.total_nanos();
+        let shm_dtime = kernel_shm.shm_dtim.total_nanos();
+        let shm_ctime = kernel_shm.shm_ctim.total_nanos();
         let shm_cpid = kernel_shm.shm_cprid.data().to_u32().unwrap();
         let shm_lpid = kernel_shm.shm_lprid.data().to_u32().unwrap();
         let shm_map_count = kernel_shm.map_count();
-        let shm_id_ds = ShmIdDs {
+        let shm_id_ds = PosixShmIdDs {
             shm_perm,
             shm_segsz,
             shm_atime,
@@ -280,7 +277,7 @@ impl ShmManager {
 
         let mut user_buffer_writer = UserBufferWriter::new(
             user_buf as *mut u8,
-            core::mem::size_of::<ShmIdDs>(),
+            core::mem::size_of::<PosixShmIdDs>(),
             from_user,
         )?;
         user_buffer_writer.copy_one_to_user(&shm_id_ds, 0)?;
@@ -297,17 +294,17 @@ impl ShmManager {
     pub fn ipc_set(
         &mut self,
         id: ShmId,
-        user_buf: usize,
+        user_buf: *const u8,
         from_user: bool,
     ) -> Result<usize, SystemError> {
         let kernel_shm = self.id2shm.get_mut(&id).ok_or(SystemError::EINVAL)?;
 
         let user_buffer_reader = UserBufferReader::new(
             user_buf as *const u8,
-            core::mem::size_of::<ShmIdDs>(),
+            core::mem::size_of::<PosixShmIdDs>(),
             from_user,
         )?;
-        let mut shm_id_ds = ShmIdDs::default();
+        let mut shm_id_ds = PosixShmIdDs::default();
         user_buffer_reader.copy_one_from_user(&mut shm_id_ds, 0)?;
 
         kernel_shm.copy_from(shm_id_ds);
@@ -381,11 +378,11 @@ pub struct KernelShm {
     /// 共享内存大小(bytes)，注意是用户指定的大小（未经过页面对齐）
     shm_size: usize,
     /// 最后一次连接的时间
-    shm_atim: i64,
+    shm_atim: PosixTimeSpec,
     /// 最后一次断开连接的时间
-    shm_dtim: i64,
+    shm_dtim: PosixTimeSpec,
     /// 最后一次更改信息的时间
-    shm_ctim: i64,
+    shm_ctim: PosixTimeSpec,
     /// 创建者进程id
     shm_cprid: Pid,
     /// 最后操作者进程id
@@ -393,20 +390,15 @@ pub struct KernelShm {
 }
 
 impl KernelShm {
-    pub fn new(
-        kern_ipc_perm: KernIpcPerm,
-        shm_start_paddr: PhysAddr,
-        shm_size: usize,
-        shm_ctim: i64,
-        shm_cprid: Pid,
-    ) -> Self {
+    pub fn new(kern_ipc_perm: KernIpcPerm, shm_start_paddr: PhysAddr, shm_size: usize) -> Self {
+        let shm_cprid = ProcessManager::current_pid();
         KernelShm {
             kern_ipc_perm,
             shm_start_paddr,
             shm_size,
-            shm_atim: 0,
-            shm_dtim: 0,
-            shm_ctim,
+            shm_atim: PosixTimeSpec::new(0, 0),
+            shm_dtim: PosixTimeSpec::new(0, 0),
+            shm_ctim: PosixTimeSpec::now(),
             shm_cprid,
             shm_lprid: shm_cprid,
         }
@@ -423,8 +415,7 @@ impl KernelShm {
     /// 更新最后连接时间
     pub fn update_atim(&mut self) {
         // 更新最后一次连接时间
-        let time = TimeSpec::now();
-        self.shm_atim = time.tv_sec * 1000000000 + time.tv_nsec;
+        self.shm_atim = PosixTimeSpec::now();
 
         // 更新最后操作当前共享内存的进程ID
         self.shm_lprid = ProcessManager::current_pid();
@@ -433,8 +424,7 @@ impl KernelShm {
     /// 更新最后断开连接时间
     pub fn update_dtim(&mut self) {
         // 更新最后一次断开连接时间
-        let time = TimeSpec::now();
-        self.shm_dtim = time.tv_sec * 1000000000 + time.tv_nsec;
+        self.shm_dtim = PosixTimeSpec::now();
 
         // 更新最后操作当前共享内存的进程ID
         self.shm_lprid = ProcessManager::current_pid();
@@ -443,8 +433,7 @@ impl KernelShm {
     /// 更新最后一次修改信息的时间
     pub fn update_ctim(&mut self) {
         // 更新最后一次修改信息的时间
-        let time = TimeSpec::now();
-        self.shm_ctim = time.tv_sec * 1000000000 + time.tv_nsec;
+        self.shm_ctim = PosixTimeSpec::now();
     }
 
     /// 共享内存段的映射计数（有多少个不同的VMA映射）
@@ -470,7 +459,7 @@ impl KernelShm {
         return id_set.len();
     }
 
-    pub fn copy_from(&mut self, shm_id_ds: ShmIdDs) {
+    pub fn copy_from(&mut self, shm_id_ds: PosixShmIdDs) {
         self.kern_ipc_perm.uid = shm_id_ds.uid() as usize;
         self.kern_ipc_perm.gid = shm_id_ds.gid() as usize;
         self.kern_ipc_perm.mode = ShmFlags::from_bits_truncate(shm_id_ds.mode());
@@ -508,10 +497,10 @@ pub struct KernIpcPerm {
     _seq: usize,
 }
 
-/// 共享内存元信息
+/// 共享内存元信息，符合POSIX标准
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct ShmMetaInfo {
+pub struct PosixShmMetaInfo {
     /// 最大共享内存段的大小(bytes)
     shmmax: usize,
     /// 最小共享内存段的大小(bytes)
@@ -528,7 +517,7 @@ pub struct ShmMetaInfo {
     _unused4: usize,
 }
 
-impl ShmMetaInfo {
+impl PosixShmMetaInfo {
     /// 最小共享内存段的大小(bytes)
     pub const SHMMIN: usize = 1;
     /// 最大共享内存标识符数量
@@ -541,7 +530,7 @@ impl ShmMetaInfo {
     pub const SHMSEG: usize = 4096;
 
     pub fn new() -> Self {
-        ShmMetaInfo {
+        PosixShmMetaInfo {
             shmmax: Self::SHMMAX,
             shmmin: Self::SHMMIN,
             shmmni: Self::SHMMNI,
@@ -555,10 +544,10 @@ impl ShmMetaInfo {
     }
 }
 
-/// 共享内存信息
+/// 共享内存信息，符合POSIX标准
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct ShmInfo {
+pub struct PosixShmInfo {
     /// 已使用id数
     used_ids: i32,
     /// 共享内存总量(pages)
@@ -573,7 +562,7 @@ pub struct ShmInfo {
     swap_successes: usize,
 }
 
-impl ShmInfo {
+impl PosixShmInfo {
     pub fn new(
         used_ids: i32,
         shm_tot: usize,
@@ -582,7 +571,7 @@ impl ShmInfo {
         swap_attempts: usize,
         swap_successes: usize,
     ) -> Self {
-        ShmInfo {
+        PosixShmInfo {
             used_ids,
             shm_tot,
             shm_rss,
@@ -593,12 +582,12 @@ impl ShmInfo {
     }
 }
 
-/// 共享内存段属性信息
+/// 共享内存段属性信息，符合POSIX标准
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ShmIdDs {
+pub struct PosixShmIdDs {
     /// 共享内存段权限
-    shm_perm: IpcPerm,
+    shm_perm: PosixIpcPerm,
     /// 共享内存大小(bytes)
     shm_segsz: usize,
     /// 最后一次连接的时间
@@ -617,7 +606,7 @@ pub struct ShmIdDs {
     _unused2: usize,
 }
 
-impl ShmIdDs {
+impl PosixShmIdDs {
     pub fn uid(&self) -> u32 {
         self.shm_perm.uid
     }
@@ -631,10 +620,10 @@ impl ShmIdDs {
     }
 }
 
-/// 共享内存段权限
+/// 共享内存段权限，符合POSIX标准
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct IpcPerm {
+pub struct PosixIpcPerm {
     /// IPC对象键值
     key: i32,
     /// 当前用户id
@@ -654,9 +643,9 @@ pub struct IpcPerm {
     _unused2: usize,
 }
 
-impl IpcPerm {
+impl PosixIpcPerm {
     pub fn new(key: i32, uid: u32, gid: u32, cuid: u32, cgid: u32, mode: u32) -> Self {
-        IpcPerm {
+        PosixIpcPerm {
             key,
             uid,
             gid,

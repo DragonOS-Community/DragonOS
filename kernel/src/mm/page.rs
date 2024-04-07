@@ -53,7 +53,7 @@ impl PageManager {
         }
     }
 
-    pub fn contain(&self, paddr: &PhysAddr) -> bool {
+    pub fn contains(&self, paddr: &PhysAddr) -> bool {
         self.phys2page.contains_key(paddr)
     }
 
@@ -81,7 +81,7 @@ pub struct Page {
     /// 是否为共享页
     shared: bool,
     /// 映射计数为0时，是否可回收
-    dealloc_in_zero: bool,
+    free_when_zero: bool,
     /// 共享页id（如果是共享页）
     shm_id: Option<ShmId>,
     /// 映射到当前page的VMA
@@ -94,7 +94,7 @@ impl Page {
         Self {
             map_count: 0,
             shared,
-            dealloc_in_zero,
+            free_when_zero: dealloc_in_zero,
             shm_id: None,
             anon_vma: HashSet::new(),
         }
@@ -114,7 +114,7 @@ impl Page {
 
     /// 判断当前物理页是否能被回
     pub fn can_deallocate(&self) -> bool {
-        self.map_count == 0 && self.dealloc_in_zero
+        self.map_count == 0 && self.free_when_zero
     }
 
     pub fn shared(&self) -> bool {
@@ -130,7 +130,7 @@ impl Page {
     }
 
     pub fn set_dealloc_in_zero(&mut self, dealloc_in_zero: bool) {
-        self.dealloc_in_zero = dealloc_in_zero;
+        self.free_when_zero = dealloc_in_zero;
     }
 
     pub fn anon_vma(&self) -> &HashSet<Arc<LockedVMA>> {
@@ -715,7 +715,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
 
         let mut page_manager_guard: SpinLockGuard<'static, PageManager> =
             page_manager_lock_irqsave();
-        if !page_manager_guard.contain(&phys) {
+        if !page_manager_guard.contains(&phys) {
             page_manager_guard.insert(phys, Page::new(false))
         }
 

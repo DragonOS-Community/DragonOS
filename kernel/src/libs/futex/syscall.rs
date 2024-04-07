@@ -1,6 +1,6 @@
 use system_error::SystemError;
 
-use crate::{mm::VirtAddr, syscall::Syscall, time::TimeSpec};
+use crate::{mm::VirtAddr, syscall::Syscall, time::PosixTimeSpec};
 
 use super::{constant::*, futex::Futex};
 
@@ -9,7 +9,7 @@ impl Syscall {
         uaddr: VirtAddr,
         operation: FutexFlag,
         val: u32,
-        timeout: Option<TimeSpec>,
+        timeout: Option<PosixTimeSpec>,
         uaddr2: VirtAddr,
         val2: u32,
         val3: u32,

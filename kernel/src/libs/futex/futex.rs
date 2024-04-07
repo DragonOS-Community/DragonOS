@@ -17,7 +17,7 @@ use crate::{
     syscall::user_access::UserBufferReader,
     time::{
         timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
-        TimeSpec,
+        PosixTimeSpec,
     },
 };
 
@@ -215,7 +215,7 @@ impl Futex {
         uaddr: VirtAddr,
         flags: FutexFlag,
         val: u32,
-        abs_time: Option<TimeSpec>,
+        abs_time: Option<PosixTimeSpec>,
         bitset: u32,
     ) -> Result<usize, SystemError> {
         if bitset == 0 {

@@ -40,7 +40,7 @@ use crate::{
     process::{fork::CloneFlags, syscall::PosixOldUtsName, Pid},
     time::{
         syscall::{PosixTimeZone, PosixTimeval},
-        TimeSpec,
+        PosixTimeSpec,
     },
 };
 
@@ -298,13 +298,13 @@ impl Syscall {
             }
 
             SYS_NANOSLEEP => {
-                let req = args[0] as *const TimeSpec;
-                let rem = args[1] as *mut TimeSpec;
+                let req = args[0] as *const PosixTimeSpec;
+                let rem = args[1] as *mut PosixTimeSpec;
                 let virt_req = VirtAddr::new(req as usize);
                 let virt_rem = VirtAddr::new(rem as usize);
                 if frame.is_from_user()
-                    && (verify_area(virt_req, core::mem::size_of::<TimeSpec>()).is_err()
-                        || verify_area(virt_rem, core::mem::size_of::<TimeSpec>()).is_err())
+                    && (verify_area(virt_req, core::mem::size_of::<PosixTimeSpec>()).is_err()
+                        || verify_area(virt_rem, core::mem::size_of::<PosixTimeSpec>()).is_err())
                 {
                     Err(SystemError::EFAULT)
                 } else {
@@ -697,12 +697,12 @@ impl Syscall {
                 let mut timespec = None;
                 if utime != 0 && operation.contains(FutexFlag::FLAGS_HAS_TIMEOUT) {
                     let reader = UserBufferReader::new(
-                        utime as *const TimeSpec,
-                        core::mem::size_of::<TimeSpec>(),
+                        utime as *const PosixTimeSpec,
+                        core::mem::size_of::<PosixTimeSpec>(),
                         true,
                     )?;
 
-                    timespec = Some(*reader.read_one_from_user::<TimeSpec>(0)?);
+                    timespec = Some(*reader.read_one_from_user::<PosixTimeSpec>(0)?);
                 }
 
                 Self::do_futex(uaddr, operation, val, timespec, uaddr2, utime as u32, val3)
@@ -929,7 +929,7 @@ impl Syscall {
 
             SYS_CLOCK_GETTIME => {
                 let clockid = args[0] as i32;
-                let timespec = args[1] as *mut TimeSpec;
+                let timespec = args[1] as *mut PosixTimeSpec;
                 Self::clock_gettime(clockid, timespec)
             }
 
@@ -1051,7 +1051,7 @@ impl Syscall {
             SYS_SHMCTL => {
                 let id = ShmId::new(args[0]);
                 let cmd = ShmCtlCmd::from(args[1]);
-                let user_buf = args[2];
+                let user_buf = args[2] as *const u8;
                 let from_user = frame.is_from_user();
 
                 Self::shmctl(id, cmd, user_buf, from_user)

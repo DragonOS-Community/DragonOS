@@ -5,7 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     syscall::{user_access::UserBufferWriter, Syscall},
-    time::{sleep::nanosleep, TimeSpec},
+    time::{sleep::nanosleep, PosixTimeSpec},
 };
 
 use super::timekeeping::{do_gettimeofday, getnstimeofday};
@@ -70,13 +70,13 @@ impl Syscall {
     ///
     /// @return Err(SystemError) 错误码
     pub fn nanosleep(
-        sleep_time: *const TimeSpec,
-        rm_time: *mut TimeSpec,
+        sleep_time: *const PosixTimeSpec,
+        rm_time: *mut PosixTimeSpec,
     ) -> Result<usize, SystemError> {
         if sleep_time.is_null() {
             return Err(SystemError::EFAULT);
         }
-        let slt_spec = TimeSpec {
+        let slt_spec = PosixTimeSpec {
             tv_sec: unsafe { *sleep_time }.tv_sec,
             tv_nsec: unsafe { *sleep_time }.tv_nsec,
         };
@@ -131,7 +131,7 @@ impl Syscall {
         return Ok(0);
     }
 
-    pub fn clock_gettime(clock_id: c_int, tp: *mut TimeSpec) -> Result<usize, SystemError> {
+    pub fn clock_gettime(clock_id: c_int, tp: *mut PosixTimeSpec) -> Result<usize, SystemError> {
         let clock_id = PosixClockID::try_from(clock_id)?;
         if clock_id != PosixClockID::Realtime {
             kwarn!("clock_gettime: currently only support Realtime clock, but got {:?}. Defaultly return realtime!!!\n", clock_id);
@@ -140,7 +140,7 @@ impl Syscall {
             return Err(SystemError::EFAULT);
         }
         let mut tp_buf =
-            UserBufferWriter::new::<TimeSpec>(tp, core::mem::size_of::<TimeSpec>(), true)?;
+            UserBufferWriter::new::<PosixTimeSpec>(tp, core::mem::size_of::<PosixTimeSpec>(), true)?;
 
         let timespec = getnstimeofday();
 

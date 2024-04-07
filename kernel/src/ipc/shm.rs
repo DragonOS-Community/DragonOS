@@ -299,11 +299,8 @@ impl ShmManager {
     ) -> Result<usize, SystemError> {
         let kernel_shm = self.id2shm.get_mut(&id).ok_or(SystemError::EINVAL)?;
 
-        let user_buffer_reader = UserBufferReader::new(
-            user_buf as *const u8,
-            core::mem::size_of::<PosixShmIdDs>(),
-            from_user,
-        )?;
+        let user_buffer_reader =
+            UserBufferReader::new(user_buf, core::mem::size_of::<PosixShmIdDs>(), from_user)?;
         let mut shm_id_ds = PosixShmIdDs::default();
         user_buffer_reader.copy_one_from_user(&mut shm_id_ds, 0)?;
 

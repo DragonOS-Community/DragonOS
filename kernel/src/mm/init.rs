@@ -61,6 +61,7 @@ pub unsafe fn mm_init() {
             Ordering::SeqCst,
         )
         .unwrap();
+    MMArch::arch_post_init();
     kinfo!("mm init done.");
 }
 

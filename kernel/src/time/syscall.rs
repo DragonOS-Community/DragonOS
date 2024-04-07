@@ -139,8 +139,11 @@ impl Syscall {
         if tp.is_null() {
             return Err(SystemError::EFAULT);
         }
-        let mut tp_buf =
-            UserBufferWriter::new::<PosixTimeSpec>(tp, core::mem::size_of::<PosixTimeSpec>(), true)?;
+        let mut tp_buf = UserBufferWriter::new::<PosixTimeSpec>(
+            tp,
+            core::mem::size_of::<PosixTimeSpec>(),
+            true,
+        )?;
 
         let timespec = getnstimeofday();
 

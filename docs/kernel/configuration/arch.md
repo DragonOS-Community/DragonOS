@@ -9,7 +9,7 @@
 
 为了能支持vscode的调试功能，我们需要修改`.vscode/settings.json`文件的以下行：
 ```
-    "rust-analyzer.cargo.target": "riscv64imac-unknown-none-elf",
+    "rust-analyzer.cargo.target": "riscv64gc-unknown-none-elf",
     // "rust-analyzer.cargo.target": "x86_64-unknown-none",
 ```
 

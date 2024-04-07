@@ -3,7 +3,12 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use core::hash::{Hash, Hasher};
-use core::{intrinsics::likely, sync::atomic::AtomicU64};
+use core::{
+    intrinsics::{likely, unlikely},
+    mem,
+    sync::atomic::AtomicU64,
+};
+
 use hashbrown::HashMap;
 use system_error::SystemError;
 
@@ -12,9 +17,9 @@ use crate::{
     exception::InterruptArch,
     libs::spinlock::{SpinLock, SpinLockGuard},
     mm::{ucontext::AddressSpace, MemoryManagementArch, VirtAddr},
-    process::{ProcessControlBlock, ProcessManager},
+    process::{Pid, ProcessControlBlock, ProcessManager},
     sched::{schedule, SchedMode},
-    syscall::user_access::UserBufferReader,
+    syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::{
         timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
         PosixTimeSpec,
@@ -633,5 +638,253 @@ impl Futex {
         drop(guard);
 
         Ok(*oldval)
+    }
+}
+
+//用于指示在处理robust list是最多处理多少个条目
+const ROBUST_LIST_LIMIT: isize = 2048;
+
+#[derive(Debug, Copy, Clone)]
+pub struct RobustList {
+    next: VirtAddr,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct RobustListHead {
+    list: RobustList,
+    futex_offset: isize,
+    list_op_pending: VirtAddr,
+}
+
+impl RobustListHead {
+    /// # 获得futex的用户空间地址
+    pub fn futex_uaddr(&self, entry: VirtAddr) -> VirtAddr {
+        return VirtAddr::new(entry.data() + self.futex_offset as usize);
+    }
+
+    /// #获得list_op_peding的用户空间地址
+    pub fn pending_uaddr(&self) -> Option<VirtAddr> {
+        if self.list_op_pending.is_null() {
+            return None;
+        } else {
+            return Some(self.futex_uaddr(self.list_op_pending));
+        }
+    }
+
+    /// # 在内核注册robust list
+    /// ## 参数
+    /// - head_uaddr：robust list head用户空间地址
+    /// - len：robust list head的长度    
+    pub fn set_robust_list(head_uaddr: VirtAddr, len: usize) -> Result<usize, SystemError> {
+        let robust_list_head_len = mem::size_of::<&RobustListHead>();
+        if unlikely(len != robust_list_head_len) {
+            return Err(SystemError::EINVAL);
+        }
+
+        let user_buffer_reader = UserBufferReader::new(
+            head_uaddr.as_ptr::<RobustListHead>(),
+            mem::size_of::<RobustListHead>(),
+            true,
+        )?;
+        let robust_list_head = *user_buffer_reader.read_one_from_user::<RobustListHead>(0)?;
+
+        // 向内核注册robust list
+        ProcessManager::current_pcb().set_robust_list(Some(robust_list_head));
+
+        return Ok(0);
+    }
+
+    /// # 获取robust list head到用户空间
+    /// ## 参数
+    /// - pid：当前进程/线程的pid
+    /// -
+    pub fn get_robust_list(
+        pid: usize,
+        head_uaddr: VirtAddr,
+        len_ptr_uaddr: VirtAddr,
+    ) -> Result<usize, SystemError> {
+        // 获取当前进程的process control block
+        let pcb: Arc<ProcessControlBlock> = if pid == 0 {
+            ProcessManager::current_pcb()
+        } else {
+            ProcessManager::find(Pid::new(pid)).ok_or(SystemError::ESRCH)?
+        };
+
+        // TODO: 检查当前进程是否能ptrace另一个进程
+        let ptrace = true;
+        if !ptrace {
+            return Err(SystemError::EPERM);
+        }
+
+        //获取当前线程的robust list head 和 长度
+        let robust_list_head = (*pcb.get_robust_list()).ok_or(SystemError::EINVAL)?;
+
+        // 将len拷贝到用户空间len_ptr
+        let mut user_writer = UserBufferWriter::new(
+            len_ptr_uaddr.as_ptr::<usize>(),
+            core::mem::size_of::<usize>(),
+            true,
+        )?;
+        user_writer.copy_one_to_user(&mem::size_of::<RobustListHead>(), 0)?;
+        // 将head拷贝到用户空间head
+        let mut user_writer = UserBufferWriter::new(
+            head_uaddr.as_ptr::<RobustListHead>(),
+            mem::size_of::<RobustListHead>(),
+            true,
+        )?;
+        user_writer.copy_one_to_user(&robust_list_head, 0)?;
+
+        return Ok(0);
+    }
+
+    /// # 进程/线程退出时清理工作
+    /// ## 参数
+    /// - current：当前进程/线程的pcb
+    /// - pid：当前进程/线程的pid
+    pub fn exit_robust_list(pcb: Arc<ProcessControlBlock>) {
+        //指向当前进程的robust list头部的指针
+        let head = match *pcb.get_robust_list() {
+            Some(rl) => rl,
+            None => {
+                return;
+            }
+        };
+        // 遍历当前进程/线程的robust list
+        for futex_uaddr in head.futexes() {
+            let ret = Self::handle_futex_death(futex_uaddr, pcb.pid().into() as u32);
+            if ret.is_err() {
+                return;
+            }
+        }
+        pcb.set_robust_list(None);
+    }
+
+    /// # 返回robust list的迭代器，将robust list list_op_pending 放到最后（如果存在）
+    fn futexes(&self) -> FutexIterator<'_> {
+        return FutexIterator::new(self);
+    }
+
+    /// # 处理进程即将死亡时，进程已经持有的futex，唤醒其他等待该futex的线程
+    /// ## 参数
+    /// - futex_uaddr：futex的用户空间地址
+    /// - pid: 当前进程/线程的pid
+    fn handle_futex_death(futex_uaddr: VirtAddr, pid: u32) -> Result<usize, SystemError> {
+        let futex_val = {
+            if futex_uaddr.is_null() {
+                return Err(SystemError::EINVAL);
+            }
+            let user_buffer_reader = UserBufferReader::new(
+                futex_uaddr.as_ptr::<u32>(),
+                core::mem::size_of::<u32>(),
+                true,
+            )?;
+            *user_buffer_reader.read_one_from_user::<u32>(0)?
+        };
+
+        let mut uval = futex_val;
+        loop {
+            // 该futex可能被其他进程占有
+            let owner = uval & FUTEX_TID_MASK;
+            if owner != pid {
+                break;
+            }
+
+            // 判断是否有FUTEX_WAITERS和标记FUTEX_OWNER_DIED
+            let mval = (uval & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+
+            // 读取用户空间目前的futex字段，判断在此之前futex是否有被修改
+            let user_buffer_reader = UserBufferReader::new(
+                futex_uaddr.as_ptr::<u32>(),
+                core::mem::size_of::<u32>(),
+                true,
+            )?;
+            let nval = *user_buffer_reader.read_one_from_user::<u32>(0)?;
+            if nval != mval {
+                uval = nval;
+                let mut user_buffer_writer = UserBufferWriter::new(
+                    futex_uaddr.as_ptr::<u32>(),
+                    core::mem::size_of::<u32>(),
+                    true,
+                )?;
+                user_buffer_writer.copy_one_to_user(&mval, 0)?;
+                continue;
+            }
+
+            // 有等待者,进行唤醒操作
+            if nval & FUTEX_WAITERS != 0 {
+                let mut flags = FutexFlag::FLAGS_MATCH_NONE;
+                flags.insert(FutexFlag::FLAGS_SHARED);
+                Futex::futex_wake(futex_uaddr, flags, 1, FUTEX_BITSET_MATCH_ANY)?;
+            }
+            break;
+        }
+
+        return Ok(0);
+    }
+}
+
+pub struct FutexIterator<'a> {
+    robust_list_head: &'a RobustListHead,
+    entry: VirtAddr,
+    count: isize,
+}
+
+impl<'a> FutexIterator<'a> {
+    pub fn new(robust_list_head: &'a RobustListHead) -> Self {
+        return Self {
+            robust_list_head,
+            entry: robust_list_head.list.next,
+            count: 0,
+        };
+    }
+
+    fn is_end(&mut self) -> bool {
+        return self.count < 0;
+    }
+}
+
+impl<'a> Iterator for FutexIterator<'a> {
+    type Item = VirtAddr;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.is_end() {
+            return None;
+        }
+
+        while self.entry.data() != &self.robust_list_head.list as *const RobustList as usize {
+            if self.count == ROBUST_LIST_LIMIT {
+                break;
+            }
+            if self.entry.is_null() {
+                return None;
+            }
+
+            //获取futex val地址
+            let futex_uaddr = if self.entry.data() != self.robust_list_head.list_op_pending.data() {
+                Some(self.robust_list_head.futex_uaddr(self.entry))
+            } else {
+                None
+            };
+
+            let user_buffer_reader = UserBufferReader::new(
+                self.entry.as_ptr::<RobustList>(),
+                mem::size_of::<RobustList>(),
+                true,
+            )
+            .ok()?;
+            let next_entry = user_buffer_reader
+                .read_one_from_user::<RobustList>(0)
+                .ok()?;
+
+            self.entry = next_entry.next;
+
+            self.count += 1;
+
+            if futex_uaddr.is_some() {
+                return futex_uaddr;
+            }
+        }
+        self.count -= 1;
+        self.robust_list_head.pending_uaddr()
     }
 }

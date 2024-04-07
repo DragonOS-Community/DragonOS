@@ -14,7 +14,7 @@ use crate::{
 
 use super::{
     timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
-    TimeArch, PosixTimeSpec,
+    PosixTimeSpec, TimeArch,
 };
 
 /// @brief 休眠指定时间（单位：纳秒）

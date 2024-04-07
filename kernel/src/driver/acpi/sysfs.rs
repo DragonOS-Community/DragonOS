@@ -114,7 +114,18 @@ impl AcpiManager {
             acpi_table_attr_list().write().push(attr);
             self.acpi_table_data_init(&header)?;
         }
-
+        // TODO:UEVENT
+//         kobject_uevent(tables_kobj, KOBJ_ADD);
+// 532  	kobject_uevent(tables_data_kobj, KOBJ_ADD);
+// 533  	kobject_uevent(dynamic_tables_kobj, KOBJ_ADD);
+// 534  
+// 535  	return 0;
+// 536  err_dynamic_tables:
+// 537  	kobject_put(tables_data_kobj);
+// 538  err_tables_data:
+// 539  	kobject_put(tables_kobj);
+// 540  err:
+// 541  	return -ENOMEM;
         return Ok(());
     }
 

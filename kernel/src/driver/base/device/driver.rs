@@ -214,6 +214,8 @@ impl DriverManager {
         })?;
 
         // todo: 发送uevent
+        // kobject_uevent(&drv->p->kobj, KOBJ_ADD);
+        // deferred_probe_extend_timeout();
 
         return Ok(());
     }

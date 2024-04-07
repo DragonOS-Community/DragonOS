@@ -1,18 +1,8 @@
 mod utils;
 
-use core::any::Any;
-use core::intrinsics::unlikely;
+use system_error::SystemError;
 
-use crate::filesystem::vfs::FSMAKER;
-use crate::libs::rwlock::RwLock;
-use crate::{
-    driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{core::generate_inode_id, FileType},
-    ipc::pipe::LockedPipeInode,
-    libs::casting::DowncastArc,
-    libs::spinlock::{SpinLock, SpinLockGuard},
-    time::PosixTimeSpec,
-};
+use core::{any::Any, intrinsics::unlikely};
 
 use alloc::{
     collections::BTreeMap,
@@ -20,15 +10,25 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use system_error::SystemError;
 
-use self::utils::Keyer;
+use crate::{
+    driver::base::device::device_number::DeviceNumber,
+    ipc::pipe::LockedPipeInode,
+    libs::{
+        casting::DowncastArc,
+        rwlock::RwLock,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
+    time::PosixTimeSpec,
+};
 
 use super::vfs::{
-    cache::DefaultDCache, file::FilePrivateData, syscall::ModeType, FileSystem, FileSystemMaker,
-    FsInfo, IndexNode, Metadata, SpecialNodeData,
+    cache::DefaultDCache, core::generate_inode_id, file::FilePrivateData, syscall::ModeType,
+    FileSystem, FileSystemMaker, FileType, FsInfo, IndexNode, Magic, Metadata, SpecialNodeData,
+    SuperBlock, FSMAKER,
 };
-use super::vfs::{Magic, SuperBlock};
+
+use self::utils::Keyer;
 
 /// RamFS的inode名称的最大长度
 const RAMFS_MAX_NAMELEN: usize = 64;

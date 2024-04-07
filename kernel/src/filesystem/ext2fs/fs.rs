@@ -8,13 +8,16 @@ use system_error::SystemError;
 
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition},
-    filesystem::vfs::{FileSystem, IndexNode},
+    filesystem::{
+        ext2fs::inode::Ext2Inode,
+        vfs::{FileSystem, IndexNode},
+    },
     libs::{rwlock::RwLock, spinlock::SpinLock, vec_cursor::VecCursor},
 };
 
 use super::{
     block_group_desc::Ext2BlockGroupDescriptor,
-    inode::{LockedExt2Inode, LockedExt2InodeInfo},
+    inode::{Ext2InodeInfo, LockedExt2Inode, LockedExt2InodeInfo},
 };
 
 lazy_static! {
@@ -238,6 +241,7 @@ pub struct Ext2SuperBlockInfo {
     pub s_addr_per_block_bits: u32,
     /// 每个块的组描述符位数。
     pub s_desc_per_block_bits: u32,
+    /// inode大小
     pub s_inode_size: u32,
     /// 第一个可用的inode号
     pub s_first_ino: u32,
@@ -296,18 +300,43 @@ impl Ext2SuperBlockInfo {
             partition: Arc::downgrade(&partition.clone()),
         }
     }
-    // TODO 根据索引号获取磁盘inode
-    pub fn read_inode(&self, inode_index: u32) -> Result<Ex2Inode, SystemError>{
-        let mut inode_data = Vec::with_capacity(LBA_SIZE);
-        inode_data.resize(LBA_SIZE, 0);
+    /// TODO 根据索引号获取磁盘inode
+    pub fn read_inode(&self, inode_index: u32) -> Result<Ext2InodeInfo, SystemError> {
+        // Get the reference to the description table
+        let desc_table = self.group_desc_table.upgrade().unwrap();
+        // Calculate the index of the group using the inode index
+        let group_index = (inode_index - 1) / self.s_inodes_per_group;
+        // 判断index是否合法
+        if group_index >= desc_table.len() as u32 {
+            return Err(SystemError::EINVAL);
+        }
+        // 获取desc_table中group_index指向的描述符
+        let desc = &desc_table[group_index as usize];
+
+        let inode_table_size = (self.s_inodes_per_group * self.s_inode_size) as usize;
+        let mut inode_table_data: Vec<u8> = Vec::with_capacity(inode_table_size);
+        inode_table_data.resize(inode_table_size as usize, 0);
+
+        let idx = (inode_index - 1) % self.s_inodes_per_group;
+        let pt = self.partition.upgrade().unwrap();
+
+        // 读取inode table
+        pt.disk().read_at(
+            desc.inode_table_start as usize,
+            inode_table_size / LBA_SIZE,
+            &mut inode_table_data,
+        )?;
+
+        // TODO 按字节获取特定inode，获取到就跳出返回
+        let mut inode_data = Vec::with_capacity(self.s_inode_size as usize);
+        inode_data.resize(self.s_inode_size as usize, 0);
+
         let mut blc_data = Vec::with_capacity(LBA_SIZE);
         blc_data.resize(LBA_SIZE, 0);
         let mut blc_index = (inode_index - 1) * self.s_inodes_per_group + self.s_first_ino;
 
         let mut blc_num = 0;
-        while blc_num < self.s_inodes_per_group {
-            
-        }
+        while blc_num < self.s_inodes_per_group {}
         todo!()
     }
     // TODO 获取根结点
@@ -427,4 +456,3 @@ impl Ex2SuperBlock {
         Ok(decs)
     }
 }
-

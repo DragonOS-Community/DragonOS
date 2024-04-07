@@ -120,7 +120,7 @@ pub struct Logger;
 impl Logger {
     pub fn log(&self, log_level: usize, message: fmt::Arguments) {
         if unsafe { KMSG.is_some() } {
-            let timestamp: PosixTimeSpec = PosixTimeSpec::now();
+            let timestamp: PosixTimeSpec = PosixTimeSpec::now_cpu_time();
             let log_level = LogLevel::from(log_level);
 
             let log_message = LogMessage::new(timestamp, log_level, message.to_string());

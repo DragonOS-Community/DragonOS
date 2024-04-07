@@ -6,7 +6,7 @@ use core::{
 
 use crate::arch::CurrentTimeArch;
 
-use self::timekeep::ktime_get_real_ns;
+use self::{timekeep::ktime_get_real_ns, timekeeping::getnstimeofday};
 
 pub mod clocksource;
 pub mod jiffies;
@@ -61,7 +61,13 @@ impl PosixTimeSpec {
     }
 
     /// 获取当前时间
+    #[inline(always)]
     pub fn now() -> Self {
+        getnstimeofday()
+    }
+
+    /// 获取当前CPU时间(使用CPU时钟周期计算，会存在回绕问题)
+    pub fn now_cpu_time() -> Self {
         #[cfg(target_arch = "x86_64")]
         {
             use crate::arch::driver::tsc::TSCManager;
@@ -83,7 +89,7 @@ impl PosixTimeSpec {
 
     /// 换算成纳秒
     pub fn total_nanos(&self) -> i64 {
-        self.tv_sec * 1000000000 + self.tv_sec
+        self.tv_sec * 1000000000 + self.tv_nsec
     }
 }
 

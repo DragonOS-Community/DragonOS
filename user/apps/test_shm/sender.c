@@ -32,7 +32,7 @@ int main()
     int pid = fork();
     if (pid == 0)
     {
-        execl("/bin/receiver", NULL, NULL);
+        execl("/bin/test_shm_receiver", NULL, NULL);
     }
 
     waitpid(pid, NULL, 0);

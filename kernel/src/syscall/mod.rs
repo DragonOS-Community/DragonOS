@@ -690,9 +690,6 @@ impl Syscall {
                 let uaddr2 = VirtAddr::new(args[4]);
                 let val3 = args[5] as u32;
 
-                verify_area(uaddr, core::mem::size_of::<u32>())?;
-                verify_area(uaddr2, core::mem::size_of::<u32>())?;
-
                 let mut timespec = None;
                 if utime != 0 && operation.contains(FutexFlag::FLAGS_HAS_TIMEOUT) {
                     let reader = UserBufferReader::new(
@@ -705,6 +702,26 @@ impl Syscall {
                 }
 
                 Self::do_futex(uaddr, operation, val, timespec, uaddr2, utime as u32, val3)
+            }
+
+            SYS_SET_ROBUST_LIST => {
+                let head = args[0];
+                let head_uaddr = VirtAddr::new(head);
+                let len = args[1];
+
+                let ret = Self::set_robust_list(head_uaddr, len);
+                return ret;
+            }
+
+            SYS_GET_ROBUST_LIST => {
+                let pid = args[0];
+                let head = args[1];
+                let head_uaddr = VirtAddr::new(head);
+                let len_ptr = args[2];
+                let len_ptr_uaddr = VirtAddr::new(len_ptr);
+
+                let ret = Self::get_robust_list(pid, head_uaddr, len_ptr_uaddr);
+                return ret;
             }
 
             SYS_READV => Self::readv(args[0] as i32, args[1], args[2]),
@@ -949,11 +966,6 @@ impl Syscall {
 
             SYS_FSYNC => {
                 kwarn!("SYS_FSYNC has not yet been implemented");
-                Ok(0)
-            }
-
-            SYS_SET_ROBUST_LIST => {
-                kwarn!("SYS_SET_ROBUST_LIST has not yet been implemented");
                 Ok(0)
             }
 

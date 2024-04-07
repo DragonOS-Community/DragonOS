@@ -1,11 +1,6 @@
-/*
-    这个文件实现的是调度过程中设计到的时钟
-*/
-#[cfg(target_arch = "x86_64")]
-use crate::{
-    arch::{driver::tsc::TSCManager, CurrentTimeArch},
-    time::TimeArch,
-};
+//! 这个文件实现的是调度过程中涉及到的时钟
+//!
+use crate::{arch::CurrentTimeArch, time::TimeArch};
 
 pub struct SchedClock;
 
@@ -14,15 +9,17 @@ impl SchedClock {
     pub fn sched_clock_cpu(_cpu: usize) -> u64 {
         #[cfg(target_arch = "x86_64")]
         {
-            if TSCManager::cpu_khz() == 0 {
-                // TCS no init
+            if crate::arch::driver::tsc::TSCManager::cpu_khz() == 0 {
+                // TSC not calibrated yet
                 return 0;
             }
             return CurrentTimeArch::cycles2ns(CurrentTimeArch::get_cycles()) as u64;
         }
 
         #[cfg(target_arch = "riscv64")]
-        todo!()
+        {
+            return CurrentTimeArch::cycles2ns(CurrentTimeArch::get_cycles()) as u64;
+        }
     }
 }
 

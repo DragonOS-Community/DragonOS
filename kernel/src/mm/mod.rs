@@ -492,9 +492,19 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     const FIXMAP_END_VADDR: VirtAddr =
         VirtAddr::new(Self::FIXMAP_START_VADDR.data() + Self::FIXMAP_SIZE);
 
+    /// MMIO虚拟空间的基地址
+    const MMIO_BASE: VirtAddr;
+    /// MMIO虚拟空间的大小
+    const MMIO_SIZE: usize;
+    /// MMIO虚拟空间的顶端地址（不包含）
+    const MMIO_TOP: VirtAddr = VirtAddr::new(Self::MMIO_BASE.data() + Self::MMIO_SIZE);
+
     /// @brief 用于初始化内存管理模块与架构相关的信息。
     /// 该函数应调用其他模块的接口，把可用内存区域添加到memblock，提供给BumpAllocator使用
     unsafe fn init();
+
+    /// 内存管理初始化完成后，调用该函数
+    unsafe fn arch_post_init() {}
 
     /// @brief 读取指定虚拟地址的值，并假设它是类型T的指针
     #[inline(always)]

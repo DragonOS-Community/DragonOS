@@ -4,7 +4,7 @@ use system_error::SystemError;
 
 use crate::driver::rtc::interface::rtc_read_time_default;
 
-use super::TimeSpec;
+use super::PosixTimeSpec;
 
 #[allow(non_camel_case_types)]
 pub type ktime_t = i64;
@@ -20,7 +20,7 @@ fn ktime_to_ns(kt: ktime_t) -> i64 {
 /// 注意，由于当前未引入时区，因此本函数默认时区为UTC+8来计算
 fn ktime_get_real() -> Result<ktime_t, SystemError> {
     let rtc_time = rtc_read_time_default()?;
-    let time_spec: TimeSpec = rtc_time.into();
+    let time_spec: PosixTimeSpec = rtc_time.into();
     let r = time_spec.tv_sec * 1_000_000_000 + time_spec.tv_nsec;
     return Ok(r);
 }

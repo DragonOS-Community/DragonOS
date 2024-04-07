@@ -11,7 +11,7 @@ use crate::{
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
     libs::spinlock::{SpinLock, SpinLockGuard},
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
 use alloc::{
@@ -44,7 +44,7 @@ impl RamFS {
     pub fn new() -> Arc<Self> {
         let root = Arc::new(LockedRamfsEntry(SpinLock::new(RamfsEntry {
             name: String::new(),
-            inode: Arc::new(LockedInode(SpinLock::new(RamfsInode::new(
+            inode: Arc::new(LockedRamFSInode(SpinLock::new(RamFSInode::new(
                 FileType::Dir,
                 ModeType::from_bits_truncate(0o777),
             )))),
@@ -116,7 +116,7 @@ impl FileSystem for RamFS {
 }
 
 #[derive(Debug)]
-pub struct RamfsInode {
+pub struct RamFSInode {
     /// 元数据
     metadata: Metadata,
     /// 数据块
@@ -124,14 +124,14 @@ pub struct RamfsInode {
 }
 
 #[derive(Debug)]
-pub struct LockedInode(SpinLock<RamfsInode>);
+pub struct LockedRamFSInode(SpinLock<RamFSInode>);
 
 #[derive(Debug)]
 pub struct RamfsEntry {
     /// 目录名
     name: String,
     /// 文件节点
-    inode: Arc<LockedInode>,
+    inode: Arc<LockedRamFSInode>,
     /// 父目录
     parent: Weak<LockedRamfsEntry>,
     /// 自引用
@@ -147,16 +147,16 @@ pub struct RamfsEntry {
 #[derive(Debug)]
 pub struct LockedRamfsEntry(SpinLock<RamfsEntry>);
 
-impl RamfsInode {
-    pub fn new(file_type: FileType, mode: ModeType) -> RamfsInode {
-        RamfsInode {
+impl RamFSInode {
+    pub fn new(file_type: FileType, mode: ModeType) -> RamFSInode {
+        RamFSInode {
             data: Vec::new(),
             metadata: Metadata::new(file_type, mode),
         }
     }
 
-    pub fn from(file_type: FileType, mode: ModeType, data: usize) -> RamfsInode {
-        RamfsInode {
+    pub fn new_with_data(file_type: FileType, mode: ModeType, data: usize) -> RamFSInode {
+        RamFSInode {
             data: Vec::new(),
 
             metadata: Metadata {
@@ -165,9 +165,9 @@ impl RamfsInode {
                 size: 0,
                 blk_size: 0,
                 blocks: 0,
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type,
                 mode,
                 nlinks: 1,
@@ -347,7 +347,7 @@ impl IndexNode for LockedRamfsEntry {
             parent: entry.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
-            inode: Arc::new(LockedInode(SpinLock::new(RamfsInode::from(
+            inode: Arc::new(LockedRamFSInode(SpinLock::new(RamFSInode::new_with_data(
                 file_type, mode, data,
             )))),
             fs: entry.fs.clone(),
@@ -614,7 +614,7 @@ impl IndexNode for LockedRamfsEntry {
             parent: entry.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
-            inode: Arc::new(LockedInode(SpinLock::new(RamfsInode::new(
+            inode: Arc::new(LockedRamFSInode(SpinLock::new(RamFSInode::new(
                 FileType::Pipe,
                 mode,
             )))),

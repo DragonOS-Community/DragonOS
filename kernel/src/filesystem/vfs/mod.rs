@@ -23,7 +23,7 @@ use crate::{
         casting::DowncastArc,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
 use self::{cache::DefaultDCache, core::generate_inode_id, file::FileMode, syscall::ModeType};
@@ -751,13 +751,13 @@ pub struct Metadata {
     pub blocks: usize,
 
     /// inode最后一次被访问的时间
-    pub atime: TimeSpec,
+    pub atime: PosixTimeSpec,
 
     /// inode最后一次修改的时间
-    pub mtime: TimeSpec,
+    pub mtime: PosixTimeSpec,
 
     /// inode的创建时间
-    pub ctime: TimeSpec,
+    pub ctime: PosixTimeSpec,
 
     /// 文件类型
     pub file_type: FileType,
@@ -786,9 +786,9 @@ impl Default for Metadata {
             size: 0,
             blk_size: 0,
             blocks: 0,
-            atime: TimeSpec::default(),
-            mtime: TimeSpec::default(),
-            ctime: TimeSpec::default(),
+            atime: PosixTimeSpec::default(),
+            mtime: PosixTimeSpec::default(),
+            ctime: PosixTimeSpec::default(),
             file_type: FileType::File,
             mode: ModeType::empty(),
             nlinks: 1,
@@ -909,9 +909,9 @@ impl Metadata {
             size: 0,
             blk_size: 0,
             blocks: 0,
-            atime: TimeSpec::default(),
-            mtime: TimeSpec::default(),
-            ctime: TimeSpec::default(),
+            atime: PosixTimeSpec::default(),
+            mtime: PosixTimeSpec::default(),
+            ctime: PosixTimeSpec::default(),
             file_type,
             mode,
             nlinks: 1,

@@ -7,7 +7,7 @@ use crate::filesystem::vfs::{
 };
 use crate::libs::spinlock::SpinLockGuard;
 use crate::process::ProcessManager;
-use crate::{arch::KVMArch, libs::spinlock::SpinLock, time::TimeSpec};
+use crate::{arch::KVMArch, libs::spinlock::SpinLock, time::PosixTimeSpec};
 use crate::{filesystem, kdebug};
 // use crate::virt::kvm::{host_stack};
 use super::push_vm;
@@ -59,9 +59,9 @@ impl LockedKvmInode {
                 size: 0,
                 blk_size: 0,
                 blocks: 0,
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type: FileType::KvmDevice, // 文件夹，block设备，char设备
                 mode: filesystem::vfs::syscall::ModeType::S_IALLUGO,
                 nlinks: 1,

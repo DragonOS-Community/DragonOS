@@ -26,7 +26,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         vec_cursor::VecCursor,
     },
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
 use super::entry::FATFile;
@@ -202,9 +202,9 @@ impl LockedFATInode {
                 } else {
                     fs.bpb.total_sectors_16 as usize
                 },
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type,
                 mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
@@ -338,9 +338,9 @@ impl FATFileSystem {
                 } else {
                     bpb.total_sectors_16 as usize
                 },
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type: FileType::Dir,
                 mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
@@ -1013,7 +1013,7 @@ impl FATFileSystem {
                     let mut v: Vec<u8> = vec![0; self.lba_per_sector() * LBA_SIZE];
                     self.partition
                         .disk()
-                        .read_at(lba, self.lba_per_sector(), &mut v)?;
+                        .read_at_sync(lba, self.lba_per_sector(), &mut v)?;
 
                     let mut cursor: VecCursor = VecCursor::new(v);
                     cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
@@ -1044,7 +1044,7 @@ impl FATFileSystem {
                     let mut v: Vec<u8> = vec![0; self.lba_per_sector() * LBA_SIZE];
                     self.partition
                         .disk()
-                        .read_at(lba, self.lba_per_sector(), &mut v)?;
+                        .read_at_sync(lba, self.lba_per_sector(), &mut v)?;
 
                     let mut cursor: VecCursor = VecCursor::new(v);
                     cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
@@ -1090,7 +1090,7 @@ impl FATFileSystem {
                 let lba = self.get_lba_from_offset(self.bytes_to_sector(fat_part_bytes_offset));
 
                 let mut v: Vec<u8> = vec![0; LBA_SIZE];
-                self.partition.disk().read_at(lba, 1, &mut v)?;
+                self.partition.disk().read_at_sync(lba, 1, &mut v)?;
 
                 let mut cursor: VecCursor = VecCursor::new(v);
                 cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
@@ -1239,7 +1239,7 @@ impl FATFsInfo {
         // 计算fs_info扇区在磁盘上的字节偏移量，从磁盘读取数据
         partition
             .disk()
-            .read_at(in_disk_fs_info_offset as usize / LBA_SIZE, 1, &mut v)?;
+            .read_at_sync(in_disk_fs_info_offset as usize / LBA_SIZE, 1, &mut v)?;
         let mut cursor = VecCursor::new(v);
 
         let mut fsinfo = FATFsInfo {

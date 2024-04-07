@@ -17,7 +17,7 @@ use crate::{
         user_access::{self, check_and_clone_cstr, UserBufferWriter},
         Syscall,
     },
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
 use super::SuperBlock;
@@ -110,11 +110,11 @@ pub struct PosixKstat {
     /// 分配的512B块数
     blocks: u64,
     /// 最后访问时间
-    atime: TimeSpec,
+    atime: PosixTimeSpec,
     /// 最后修改时间
-    mtime: TimeSpec,
+    mtime: PosixTimeSpec,
     /// 最后状态变化时间
-    ctime: TimeSpec,
+    ctime: PosixTimeSpec,
     /// 用于填充结构体大小的空白数据
     pub _pad: [i8; 24],
 }
@@ -129,15 +129,15 @@ impl PosixKstat {
             gid: 0,
             rdev: 0,
             size: 0,
-            atime: TimeSpec {
+            atime: PosixTimeSpec {
                 tv_sec: 0,
                 tv_nsec: 0,
             },
-            mtime: TimeSpec {
+            mtime: PosixTimeSpec {
                 tv_sec: 0,
                 tv_nsec: 0,
             },
-            ctime: TimeSpec {
+            ctime: PosixTimeSpec {
                 tv_sec: 0,
                 tv_nsec: 0,
             },
@@ -180,13 +180,13 @@ pub struct PosixStatx {
 
     /* 0x40 */
     /// 最后访问时间
-    stx_atime: TimeSpec,
+    stx_atime: PosixTimeSpec,
     /// 文件创建时间
-    stx_btime: TimeSpec,
+    stx_btime: PosixTimeSpec,
     /// 最后状态变化时间
-    stx_ctime: TimeSpec,
+    stx_ctime: PosixTimeSpec,
     /// 最后修改时间
-    stx_mtime: TimeSpec,
+    stx_mtime: PosixTimeSpec,
 
     /* 0x80 */
     /// 主设备ID
@@ -217,19 +217,19 @@ impl PosixStatx {
             stx_size: 0,
             stx_blocks: 0,
             stx_attributes_mask: StxAttributes::STATX_ATTR_APPEND,
-            stx_atime: TimeSpec {
+            stx_atime: PosixTimeSpec {
                 tv_sec: 0,
                 tv_nsec: 0,
             },
-            stx_btime: TimeSpec {
+            stx_btime: PosixTimeSpec {
                 tv_sec: 0,
                 tv_nsec: 0,
             },
-            stx_ctime: TimeSpec {
+            stx_ctime: PosixTimeSpec {
                 tv_sec: 0,
                 tv_nsec: 0,
             },
-            stx_mtime: TimeSpec {
+            stx_mtime: PosixTimeSpec {
                 tv_sec: 0,
                 tv_nsec: 0,
             },

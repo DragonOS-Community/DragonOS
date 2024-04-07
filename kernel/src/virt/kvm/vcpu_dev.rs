@@ -12,7 +12,7 @@ use crate::syscall::user_access::copy_from_user;
 use crate::virt::kvm::vcpu::Vcpu;
 use crate::virt::kvm::vm;
 use crate::{filesystem, kdebug};
-use crate::{libs::spinlock::SpinLock, time::TimeSpec};
+use crate::{libs::spinlock::SpinLock, time::PosixTimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
@@ -70,9 +70,9 @@ impl LockedVcpuInode {
                 size: 0,
                 blk_size: 0,
                 blocks: 0,
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type: FileType::KvmDevice, // 文件夹，block设备，char设备
                 mode: filesystem::vfs::syscall::ModeType::S_IALLUGO,
                 nlinks: 1,

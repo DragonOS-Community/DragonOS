@@ -38,7 +38,7 @@ use crate::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
 static mut PS2_MOUSE_DEVICE: Option<Arc<Ps2MouseDevice>> = None;
@@ -199,9 +199,9 @@ impl Ps2MouseDevice {
                     size: 4096,
                     blk_size: 0,
                     blocks: 0,
-                    atime: TimeSpec::default(),
-                    mtime: TimeSpec::default(),
-                    ctime: TimeSpec::default(),
+                    atime: PosixTimeSpec::default(),
+                    mtime: PosixTimeSpec::default(),
+                    ctime: PosixTimeSpec::default(),
                     file_type: FileType::CharDevice, // 文件夹，block设备，char设备
                     mode: ModeType::from_bits_truncate(0o644),
                     nlinks: 1,

@@ -13,7 +13,7 @@ use crate::virt::kvm::host_mem::KvmUserspaceMemoryRegion;
 use crate::virt::kvm::update_vm;
 use crate::virt::kvm::vcpu_dev::LockedVcpuInode;
 use crate::virt::kvm::vm;
-use crate::{arch::KVMArch, libs::spinlock::SpinLock, time::TimeSpec};
+use crate::{arch::KVMArch, libs::spinlock::SpinLock, time::PosixTimeSpec};
 use crate::{filesystem, kdebug};
 use alloc::{
     string::String,
@@ -68,9 +68,9 @@ impl LockedVmInode {
                 size: 0,
                 blk_size: 0,
                 blocks: 0,
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type: FileType::KvmDevice, // 文件夹，block设备，char设备
                 mode: filesystem::vfs::syscall::ModeType::S_IALLUGO,
                 nlinks: 1,

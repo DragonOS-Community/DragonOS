@@ -2,7 +2,7 @@ use core::fmt::{Display, Formatter, Result};
 
 use alloc::string::String;
 
-use crate::time::TimeSpec;
+use crate::time::PosixTimeSpec;
 
 // /// 日志类型
 // #[derive(Default, Clone, Debug)]
@@ -58,7 +58,7 @@ impl From<usize> for LogLevel {
 #[derive(Default, Clone, Debug)]
 pub struct LogMessage {
     /// 时间戳
-    timestamp: TimeSpec,
+    timestamp: PosixTimeSpec,
     /// 日志级别
     level: LogLevel,
     // /// 日志类型
@@ -68,7 +68,7 @@ pub struct LogMessage {
 }
 
 impl LogMessage {
-    pub fn new(timestamp: TimeSpec, level: LogLevel, message: String) -> Self {
+    pub fn new(timestamp: PosixTimeSpec, level: LogLevel, message: String) -> Self {
         LogMessage {
             timestamp,
             level,

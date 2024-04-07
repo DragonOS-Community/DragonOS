@@ -9,7 +9,7 @@ use crate::{
         user_access::{UserBufferReader, UserBufferWriter},
         Syscall,
     },
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
 use super::{EPollCtlOption, EPollEvent, EventPoll};
@@ -42,14 +42,14 @@ impl Syscall {
 
         let mut timespec = None;
         if timeout == 0 {
-            timespec = Some(TimeSpec::new(0, 0));
+            timespec = Some(PosixTimeSpec::new(0, 0));
         }
 
         if timeout > 0 {
             let sec: i64 = timeout as i64 / 1000;
             let nsec: i64 = 1000000 * (timeout as i64 % 1000);
 
-            timespec = Some(TimeSpec::new(sec, nsec))
+            timespec = Some(PosixTimeSpec::new(sec, nsec))
         }
 
         // 从用户传入的地址中拿到epoll_events

@@ -31,7 +31,6 @@ impl Keyer {
 impl PartialEq for Keyer {
     fn eq(&self, other: &Self) -> bool {
         if self.0.ptr_eq(&other.0) {
-            kdebug!("Compare itself!");
             return true;
         }
         if self.1.is_none() && other.1.is_none() {
@@ -39,7 +38,6 @@ impl PartialEq for Keyer {
             let opt1 = self.0.upgrade();
             let opt2 = other.0.upgrade();
             if opt1.is_none() && opt2.is_none() {
-                kerror!("Empty Both none!");
                 panic!("Empty of both");
             }
             if opt1.is_none() || opt2.is_none() {
@@ -51,7 +49,7 @@ impl PartialEq for Keyer {
         if self.1.is_none() {
             let opt = self.0.upgrade();
             if opt.is_none() {
-                kwarn!("depecated");
+                // kwarn!("depecated");
                 return false;
             }
 
@@ -59,7 +57,7 @@ impl PartialEq for Keyer {
         } else {
             let opt = other.0.upgrade();
             if opt.is_none() {
-                kwarn!("depecated");
+                // kwarn!("depecated");
                 return false;
             }
 
@@ -81,7 +79,6 @@ impl Ord for Keyer {
     fn cmp(&self, other: &Self) -> Ordering {
         // let mut ret: Ordering = Ordering::Equal;
         if self.0.ptr_eq(&other.0) {
-            kdebug!("Compare itself!");
             return Ordering::Equal;
         }
         if self.1.is_none() && other.1.is_none() {
@@ -89,7 +86,6 @@ impl Ord for Keyer {
             let opt1 = self.0.upgrade();
             let opt2 = other.0.upgrade();
             if opt1.is_none() && opt2.is_none() {
-                kerror!("Both None!");
                 panic!("All Keys None, compare error!");
             }
             if let Some(o1) = opt1 {
@@ -97,19 +93,16 @@ impl Ord for Keyer {
                     return o1.0.lock().name.cmp(&o2.0.lock().name);
                 }
             }
-            kerror!("depecated");
             panic!("Empty Key!");
         } else if self.1.is_none() {
             let opt = self.0.upgrade();
             if opt.is_none() {
-                kwarn!("depecated");
                 panic!("Empty Key!");
             }
             return opt.unwrap().0.lock().name.cmp(other.1.as_ref().unwrap());
         } else {
             let opt = other.0.upgrade();
             if opt.is_none() {
-                kwarn!("depecated");
                 panic!("Empty Key!");
             }
 

@@ -1,3 +1,5 @@
+pub mod utils;
+
 use core::{
     any::Any,
     sync::atomic::{compiler_fence, Ordering},
@@ -8,15 +10,12 @@ use alloc::{
     string::String,
     sync::{Arc, Weak},
 };
-use path_base::{clean_path::Clean, Path, PathBuf};
+
 use system_error::SystemError;
 
 use crate::{
     driver::base::device::device_number::DeviceNumber,
-    libs::{
-        rwlock::RwLock,
-        spinlock::{SpinLock, SpinLockGuard},
-    },
+    libs::spinlock::{SpinLock, SpinLockGuard},
 };
 
 use super::{
@@ -24,79 +23,7 @@ use super::{
     Magic, SuperBlock,
 };
 
-// 维护一个挂载点的记录，以支持特定于文件系统的索引
-type MountListType = Arc<RwLock<BTreeMap<MountPath, Arc<dyn FileSystem>>>>;
-static mut __MOUNTS_LIST: Option<MountListType> = None;
-
-#[derive(PartialEq, Eq, Debug)]
-pub struct MountPath(PathBuf);
-
-impl From<&str> for MountPath {
-    fn from(value: &str) -> Self {
-        Self(PathBuf::from(value).clean())
-    }
-}
-
-impl From<PathBuf> for MountPath {
-    fn from(value: PathBuf) -> Self {
-        Self(value.clean())
-    }
-}
-
-impl AsRef<Path> for MountPath {
-    fn as_ref(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl PartialOrd for MountPath {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for MountPath {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        let self_dep = self.0.components().count();
-        let othe_dep = other.0.components().count();
-        if self_dep == othe_dep {
-            self.0.cmp(&other.0)
-        } else {
-            othe_dep.cmp(&self_dep)
-        }
-    }
-}
-
-/// # 获取挂载点的列表
-#[inline(always)]
-#[allow(non_snake_case)]
-pub fn MOUNT_LIST() -> MountListType {
-    unsafe {
-        return __MOUNTS_LIST.as_ref().unwrap().clone();
-    }
-}
-
-/// # 初始化挂载点列表
-///
-/// 在VFS初始化时调用
-#[inline(always)]
-#[allow(non_snake_case)]
-pub(super) fn INIT_MOUNT_LIST() {
-    unsafe {
-        __MOUNTS_LIST = Some(Arc::new(RwLock::new(BTreeMap::new())));
-    }
-}
-
-/// # 清空挂载点列表
-///
-/// 用于迁移文件系统时清空挂载点列表
-#[inline(always)]
-#[allow(non_snake_case)]
-pub(super) fn CLEAR_MOUNTS_LIST() {
-    unsafe {
-        __MOUNTS_LIST = Some(Arc::new(RwLock::new(BTreeMap::new())));
-    }
-}
+use self::utils::MountList;
 
 const MOUNTFS_BLOCK_SIZE: u64 = 512;
 const MOUNTFS_MAX_NAMELEN: u64 = 64;
@@ -447,7 +374,7 @@ impl IndexNode for MountFSInode {
 
     /// @brief 在当前inode下，挂载一个文件系统
     ///
-    /// @return Ok(Arc<MountFS>) 挂载成功，返 回指向MountFS的指针
+    /// @return Ok(Arc<MountFS>) 挂载成功，返回指向MountFS的指针
     fn mount(&self, fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, SystemError> {
         let metadata = self.inner_inode.metadata()?;
         if metadata.file_type != FileType::Dir {
@@ -460,9 +387,7 @@ impl IndexNode for MountFSInode {
 
         // 挂载点记录暂时不记录不支持dcache（不支持key与parent方法）的文件系统
         if self.fs().dcache().is_ok() {
-            MOUNT_LIST()
-                .write()
-                .insert(MountPath::from(self.abs_path()?), new_mount_fs.clone());
+            MountList::insert(self.abs_path()?, &new_mount_fs);
         }
 
         return Ok(new_mount_fs);

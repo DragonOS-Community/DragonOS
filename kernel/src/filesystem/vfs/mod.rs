@@ -10,6 +10,7 @@ mod utils;
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use intertrait::CastFromSync;
+pub use mount::utils::MountList;
 use path_base::{clean_path::Clean, Path, PathBuf};
 use system_error::SystemError;
 
@@ -17,7 +18,6 @@ use crate::{
     driver::base::{
         block::block_device::BlockDevice, char::CharDevice, device::device_number::DeviceNumber,
     },
-    filesystem::vfs::mount::MOUNT_LIST,
     ipc::pipe::LockedPipeInode,
     libs::{
         casting::DowncastArc,
@@ -474,27 +474,25 @@ impl dyn IndexNode {
         return self.as_any_ref().downcast_ref::<T>();
     }
 
-    /// # lookup
-    /// 查找文件
-    /// ## 参数
+    /// 查找文件，返回找到的节点
+    ///
     /// - path: 路径
-    /// ## 返回值
-    /// - Ok(Arc\<dyn IndexNode\>): 找到的节点
-    /// - Err(SystemError::ENOENT): 未找到
-    /// - Err(SystemError::ENOTDIR): 不是目录
+    ///
+    /// # Err
+    /// - SystemError::ENOENT: 未找到
+    /// - SystemError::ENOTDIR: 不是目录
     pub fn lookup(&self, path: &Path) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.lookup_follow_symlink(path, 0)
     }
 
-    /// # lookup_follow_symlink
-    /// 查找文件（考虑符号链接）
-    /// ## 参数
+    /// 查找文件（考虑符号链接），返回找到的节点
+    ///
     /// - path: 路径
     /// - max_follow_times: 最大跟随次数
-    /// ## 返回值
-    /// - Ok(Arc\<dyn IndexNode\>): 找到的节点
-    /// - Err(SystemError::ENOENT): 未找到
-    /// - Err(SystemError::ENOTDIR): 不是目录
+    ///
+    /// # Err
+    /// - SystemError::ENOENT: 未找到
+    /// - SystemError::ENOTDIR: 不是目录
     pub fn lookup_follow_symlink<T: AsRef<Path>>(
         &self,
         path_any: T,
@@ -510,65 +508,51 @@ impl dyn IndexNode {
         };
 
         // 检查根目录缓存
-        if let Some((root_path, fs)) = MOUNT_LIST()
-            .read()
-            .iter()
-            .filter_map(|(key, value)| {
-                let strkey = key.as_ref();
-                return if abs_path.starts_with(strkey) {
-                    Some((strkey, value))
-                } else {
-                    None
-                };
-            })
-            .next()
-        {
-            if let Some(fs) = fs.as_any_ref().downcast_ref::<MountFS>() {
-                let root_inode = fs.mountpoint_root_inode().find(".")?;
+        if let Some((root_path, path_under, fs)) = MountList::get(&abs_path) {
+            let root_inode = fs.mountpoint_root_inode().find(".")?;
 
-                if let Ok(fscache) = fs.dcache() {
-                    let path_under = path.strip_prefix(root_path).unwrap();
-                    if path_under.iter().next().is_none() {
-                        return Ok(root_inode);
-                    }
-
-                    // Cache record is found
-                    if let Some((inode, found_path)) =
-                        Self::quick_lookup(fscache, &abs_path, &abs_path, root_path)
-                    {
-                        let rest_path = abs_path.strip_prefix(found_path).unwrap();
-                        // no path left
-                        if rest_path.iter().next().is_none() {
-                            return Ok(inode);
-                        }
-                        return inode.lookup_walk(rest_path, max_follow_times);
-                    }
-
-                    // Cache record not found
-                    return root_inode.lookup_walk(path_under, max_follow_times);
+            if let Ok(fscache) = fs.dcache() {
+                if path_under.iter().next().is_none() {
+                    return Ok(root_inode);
                 }
 
-                // 在对应文件系统根开始lookup
-                return fs
-                    .root_inode()
-                    ._lookup_follow_symlink(path.as_os_str(), max_follow_times);
+                // Cache record is found
+                if let Some((inode, found_path)) =
+                    Self::quick_lookup(fscache, &abs_path, &abs_path, &root_path)
+                {
+                    let rest_path = abs_path.strip_prefix(found_path).unwrap();
+                    // no path left
+                    if rest_path.iter().next().is_none() {
+                        return Ok(inode);
+                    }
+                    return inode.lookup_walk(rest_path, max_follow_times);
+                }
+
+                // Cache record not found
+                return root_inode.lookup_walk(&path_under, max_follow_times);
             }
+
+            // 在对应文件系统根开始lookup
+            return fs
+                .root_inode()
+                ._lookup_follow_symlink(path.as_os_str(), max_follow_times);
         }
 
         // Exception Normal lookup, for non-cache fs
-        // kdebug!("Depredecated.");
+        kwarn!("Shouldn't be here.");
         return self._lookup_follow_symlink(path.as_os_str(), max_follow_times);
     }
 
-    /// # 无dcache的lookup方法
+    /// 无dcache的lookup方法，返回找到的节点
+    ///
     /// 旧有的跟随lookup方法，不使用dcache
-    /// ## 参数
+    ///
     /// - path: 路径
     /// - max_follow_times: 最大跟随次数
-    /// ## 返回值
-    /// - Ok(Arc\<dyn IndexNode\>): 找到的节点
-    /// - Err(SystemError::ENOENT): 未找到
-    /// - Err(SystemError::ENOTDIR): 不是目录
+
+    /// # Err
+    /// - SystemError::ENOENT: 未找到
+    /// - SystemError::ENOTDIR: 不是目录
     fn _lookup_follow_symlink(
         &self,
         path: &str,
@@ -644,14 +628,12 @@ impl dyn IndexNode {
         Ok(result)
     }
 
-    /// # lookup_walk
-    /// 退化到文件系统中递归查找文件，并将找到的目录项缓存到dcache中
-    /// ## 参数
+    /// 退化到文件系统中递归查找文件, 并将找到的目录项缓存到dcache中, 返回找到的节点
+    ///
     /// - rest_path: 剩余路径
     /// - max_follow_times: 最大跟随次数
-    /// ## 返回值
-    /// - Ok(Arc\<dyn IndexNode\>): 找到的节点
-    /// - Err(SystemError::ENOENT): 未找到
+    /// ## Err
+    /// - SystemError::ENOENT: 未找到
     fn lookup_walk(
         &self,
         rest_path: &Path,
@@ -695,10 +677,7 @@ impl dyn IndexNode {
         }
     }
 
-    /// # convert_symlink
     /// 将符号链接转换为路径
-    /// ## 返回值
-    /// - Ok(PathBuf): 转换后的路径
     fn convert_symlink(&self) -> Result<PathBuf, SystemError> {
         let mut content = [0u8; 256];
         let len = self.read_at(
@@ -713,16 +692,14 @@ impl dyn IndexNode {
         ));
     }
 
-    /// # quick_lookup
-    /// 在dcache中快速查找目录项
-    /// ## 参数
+    /// 在dcache中快速查找目录项，返回 *找到的最近节点* 与 *剩余路径*
+    ///
     /// - cache: 缓存
     /// - abs_path: 绝对路径
     /// - rest_path: 剩余路径
     /// - stop_path: 停止路径
-    /// ## 返回值
-    /// - Option<(Arc\<dyn IndexNode\>, &Path)>: 找到的最近节点与剩余路径
-    /// - None: 未找到
+    /// # None
+    /// 未找到
     fn quick_lookup<'a>(
         cache: Arc<DefaultDCache>,
         abs_path: &'a Path,

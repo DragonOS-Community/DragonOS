@@ -3,25 +3,22 @@ use core::{hint::spin_loop, sync::atomic::Ordering};
 use alloc::{string::ToString, sync::Arc};
 use path_base::Path;
 use system_error::SystemError;
+use utils::MountList;
 
 use crate::{
     driver::{base::block::disk_info::Partition, disk::ahci},
     filesystem::{
-        devfs::devfs_init,
-        fat::fs::FATFileSystem,
-        procfs::procfs_init,
-        ramfs::RamFS,
+        devfs::devfs_init, fat::fs::FATFileSystem, procfs::procfs_init, ramfs::RamFS,
         sysfs::sysfs_init,
-        vfs::{
-            mount::*, syscall::ModeType, utils::user_path_at, AtomicInodeId, FileSystem, FileType,
-        },
     },
     kdebug, kerror, kinfo,
+    libs::casting::DowncastArc,
     process::ProcessManager,
 };
 
 use super::{
-    file::FileMode, mount::MountFSInode, IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    file::FileMode, mount::*, syscall::ModeType, utils::user_path_at, AtomicInodeId, FileSystem,
+    FileType, IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 /// @brief 原子地生成新的Inode号。
@@ -51,7 +48,7 @@ pub fn vfs_init() -> Result<(), SystemError> {
     // 使用Ramfs作为默认的根文件系统
     let ramfs = RamFS::new();
     let mount_fs = MountFS::new(ramfs, None);
-    INIT_MOUNT_LIST();
+    MountList::init();
     let root_inode = mount_fs.root_inode();
 
     unsafe {
@@ -127,7 +124,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     let new_fs = MountFS::new(new_fs, None);
     // 获取新的根文件系统的根节点的引用
     let new_root_inode = new_fs.root_inode();
-    CLEAR_MOUNTS_LIST();
+    MountList::init();
 
     unsafe {
         // 设置全局的新的ROOT Inode
@@ -143,9 +140,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
         drop(old_root_inode);
     }
 
-    MOUNT_LIST()
-        .write()
-        .insert(MountPath::from("/"), ROOT_INODE().fs());
+    MountList::insert("/", &ROOT_INODE().fs().downcast_arc::<MountFS>().unwrap());
     kinfo!("VFS: Migrate filesystems done!");
 
     return Ok(());

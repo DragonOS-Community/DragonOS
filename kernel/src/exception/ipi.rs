@@ -1,9 +1,13 @@
 use alloc::sync::Arc;
 use system_error::SystemError;
 
+#[cfg(target_arch = "x86_64")]
+use crate::arch::driver::apic::{CurrentApic, LocalAPIC};
+
 use crate::{
-    arch::{sched::sched, MMArch},
+    arch::MMArch,
     mm::MemoryManagementArch,
+    sched::{SchedMode, __schedule},
     smp::cpu::ProcessorId,
 };
 
@@ -47,7 +51,11 @@ impl IrqHandler for KickCpuIpiHandler {
         _static_data: Option<&dyn IrqHandlerData>,
         _dynamic_data: Option<Arc<dyn IrqHandlerData>>,
     ) -> Result<IrqReturn, SystemError> {
-        sched();
+        #[cfg(target_arch = "x86_64")]
+        CurrentApic.send_eoi();
+
+        // 被其他cpu kick时应该是抢占调度
+        __schedule(SchedMode::SM_PREEMPT);
         Ok(IrqReturn::Handled)
     }
 }

@@ -2,6 +2,8 @@ use alloc::vec::Vec;
 
 pub mod console;
 pub mod kthread;
+pub mod pty;
+mod sysfs;
 pub mod termios;
 pub mod tty_core;
 pub mod tty_device;

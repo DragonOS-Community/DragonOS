@@ -36,9 +36,9 @@ use crate::{
     },
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
-        spinlock::SpinLock,
+        spinlock::{SpinLock, SpinLockGuard},
     },
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
 static mut PS2_MOUSE_DEVICE: Option<Arc<Ps2MouseDevice>> = None;
@@ -199,9 +199,9 @@ impl Ps2MouseDevice {
                     size: 4096,
                     blk_size: 0,
                     blocks: 0,
-                    atime: TimeSpec::default(),
-                    mtime: TimeSpec::default(),
-                    ctime: TimeSpec::default(),
+                    atime: PosixTimeSpec::default(),
+                    mtime: PosixTimeSpec::default(),
+                    ctime: PosixTimeSpec::default(),
                     file_type: FileType::CharDevice, // 文件夹，block设备，char设备
                     mode: ModeType::from_bits_truncate(0o644),
                     nlinks: 1,
@@ -412,7 +412,7 @@ impl Ps2MouseDevice {
 #[derive(Debug)]
 struct InnerPs2MouseDevice {
     bus: Option<Weak<dyn Bus>>,
-    class: Option<Arc<dyn Class>>,
+    class: Option<Weak<dyn Class>>,
     driver: Option<Weak<dyn Driver>>,
     kern_inode: Option<Arc<KernFSInode>>,
     parent: Option<Weak<dyn KObject>>,
@@ -447,7 +447,7 @@ impl Device for Ps2MouseDevice {
         self.inner.lock_irqsave().bus = bus;
     }
 
-    fn set_class(&self, class: Option<alloc::sync::Arc<dyn Class>>) {
+    fn set_class(&self, class: Option<alloc::sync::Weak<dyn Class>>) {
         self.inner.lock_irqsave().class = class;
     }
 
@@ -474,7 +474,13 @@ impl Device for Ps2MouseDevice {
     }
 
     fn class(&self) -> Option<Arc<dyn Class>> {
-        self.inner.lock_irqsave().class.clone()
+        let mut guard = self.inner.lock_irqsave();
+        let r = guard.class.clone()?.upgrade();
+        if r.is_none() {
+            guard.class = None;
+        }
+
+        return r;
     }
 }
 
@@ -581,7 +587,7 @@ impl DeviceINode for Ps2MouseDevice {
 impl IndexNode for Ps2MouseDevice {
     fn open(
         &self,
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
         _mode: &crate::filesystem::vfs::file::FileMode,
     ) -> Result<(), SystemError> {
         let mut guard = self.inner.lock_irqsave();
@@ -589,7 +595,7 @@ impl IndexNode for Ps2MouseDevice {
         Ok(())
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         let mut guard = self.inner.lock_irqsave();
         guard.buf.clear();
         Ok(())
@@ -600,7 +606,7 @@ impl IndexNode for Ps2MouseDevice {
         _offset: usize,
         _len: usize,
         buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let mut guard = self.inner.lock_irqsave();
 
@@ -619,7 +625,7 @@ impl IndexNode for Ps2MouseDevice {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }

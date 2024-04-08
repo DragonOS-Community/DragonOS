@@ -17,9 +17,10 @@ use crate::{
         user_access::{self, check_and_clone_cstr, UserBufferWriter},
         Syscall,
     },
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
+use super::SuperBlock;
 use super::{
     core::{do_mkdir, do_remove_dir, do_unlink_at},
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
@@ -109,11 +110,11 @@ pub struct PosixKstat {
     /// 分配的512B块数
     blocks: u64,
     /// 最后访问时间
-    atime: TimeSpec,
+    atime: PosixTimeSpec,
     /// 最后修改时间
-    mtime: TimeSpec,
+    mtime: PosixTimeSpec,
     /// 最后状态变化时间
-    ctime: TimeSpec,
+    ctime: PosixTimeSpec,
     /// 用于填充结构体大小的空白数据
     pub _pad: [i8; 24],
 }
@@ -128,15 +129,15 @@ impl PosixKstat {
             gid: 0,
             rdev: 0,
             size: 0,
-            atime: TimeSpec {
+            atime: PosixTimeSpec {
                 tv_sec: 0,
                 tv_nsec: 0,
             },
-            mtime: TimeSpec {
+            mtime: PosixTimeSpec {
                 tv_sec: 0,
                 tv_nsec: 0,
             },
-            ctime: TimeSpec {
+            ctime: PosixTimeSpec {
                 tv_sec: 0,
                 tv_nsec: 0,
             },
@@ -179,13 +180,13 @@ pub struct PosixStatx {
 
     /* 0x40 */
     /// 最后访问时间
-    stx_atime: TimeSpec,
+    stx_atime: PosixTimeSpec,
     /// 文件创建时间
-    stx_btime: TimeSpec,
+    stx_btime: PosixTimeSpec,
     /// 最后状态变化时间
-    stx_ctime: TimeSpec,
+    stx_ctime: PosixTimeSpec,
     /// 最后修改时间
-    stx_mtime: TimeSpec,
+    stx_mtime: PosixTimeSpec,
 
     /* 0x80 */
     /// 主设备ID
@@ -216,19 +217,19 @@ impl PosixStatx {
             stx_size: 0,
             stx_blocks: 0,
             stx_attributes_mask: StxAttributes::STATX_ATTR_APPEND,
-            stx_atime: TimeSpec {
+            stx_atime: PosixTimeSpec {
                 tv_sec: 0,
                 tv_nsec: 0,
             },
-            stx_btime: TimeSpec {
+            stx_btime: PosixTimeSpec {
                 tv_sec: 0,
                 tv_nsec: 0,
             },
-            stx_ctime: TimeSpec {
+            stx_ctime: PosixTimeSpec {
                 tv_sec: 0,
                 tv_nsec: 0,
             },
-            stx_mtime: TimeSpec {
+            stx_mtime: PosixTimeSpec {
                 tv_sec: 0,
                 tv_nsec: 0,
             },
@@ -323,6 +324,41 @@ bitflags! {
     }
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PosixStatfs {
+    f_type: u64,
+    f_bsize: u64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: u64,
+    f_namelen: u64,
+    f_frsize: u64,
+    f_flags: u64,
+    f_spare: [u64; 4],
+}
+
+impl From<SuperBlock> for PosixStatfs {
+    fn from(super_block: SuperBlock) -> Self {
+        Self {
+            f_type: super_block.magic.bits,
+            f_bsize: super_block.bsize,
+            f_blocks: super_block.blocks,
+            f_bfree: super_block.bfree,
+            f_bavail: super_block.bavail,
+            f_files: super_block.files,
+            f_ffree: super_block.ffree,
+            f_fsid: super_block.fsid,
+            f_namelen: super_block.namelen,
+            f_frsize: super_block.frsize,
+            f_flags: super_block.flags,
+            f_spare: [0u64; 4],
+        }
+    }
+}
 ///
 ///  Arguments for how openat2(2) should open the target path. If only @flags and
 ///  @mode are non-zero, then openat2(2) operates very similarly to openat(2).
@@ -483,8 +519,7 @@ impl Syscall {
 
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
-        let file = file.lock_no_preempt();
-        let r = file.inode().ioctl(cmd, data, &file.private_data);
+        let r = file.inode().ioctl(cmd, data, &file.private_data.lock());
         return r;
     }
 
@@ -507,7 +542,7 @@ impl Syscall {
         drop(fd_table_guard);
         let file = file.unwrap();
 
-        return file.lock_no_preempt().read(buf.len(), buf);
+        return file.read(buf.len(), buf);
     }
 
     /// @brief 根据文件描述符，向文件写入数据。尝试写入的数据长度与buf的长度相同。
@@ -527,7 +562,7 @@ impl Syscall {
 
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
-        return file.lock_no_preempt().write(buf.len(), buf);
+        return file.write(buf.len(), buf);
     }
 
     /// @brief 调整文件操作指针的位置
@@ -554,7 +589,7 @@ impl Syscall {
 
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
-        return file.lock_no_preempt().lseek(seek);
+        return file.lseek(seek);
     }
 
     /// # sys_pread64 系统调用的实际执行函数
@@ -576,7 +611,7 @@ impl Syscall {
         drop(fd_table_guard);
         let file = file.unwrap();
 
-        return file.lock_no_preempt().pread(offset, len, buf);
+        return file.pread(offset, len, buf);
     }
 
     /// # sys_pwrite64 系统调用的实际执行函数
@@ -598,7 +633,7 @@ impl Syscall {
         drop(fd_table_guard);
         let file = file.unwrap();
 
-        return file.lock_no_preempt().pwrite(offset, len, buf);
+        return file.pwrite(offset, len, buf);
     }
 
     /// @brief 切换工作目录
@@ -721,7 +756,7 @@ impl Syscall {
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
 
-        let res = file.lock_no_preempt().readdir(dirent).map(|x| x as usize);
+        let res = file.readdir(dirent).map(|x| x as usize);
 
         return res;
     }
@@ -775,7 +810,7 @@ impl Syscall {
                 let file = fd_table_guard
                     .get_file_by_fd(oldfd)
                     .ok_or(SystemError::EBADF)?;
-                let old_inode = file.lock().inode();
+                let old_inode = file.inode();
                 old_inode
             } else {
                 return Err(SystemError::ENONET);
@@ -942,10 +977,7 @@ impl Syscall {
             .get_file_by_fd(oldfd)
             .ok_or(SystemError::EBADF)?;
 
-        let new_file = old_file
-            .lock_no_preempt()
-            .try_clone()
-            .ok_or(SystemError::EBADF)?;
+        let new_file = old_file.try_clone().ok_or(SystemError::EBADF)?;
         // 申请文件描述符，并把文件对象存入其中
         let res = fd_table_guard.alloc_fd(new_file, None).map(|x| x as usize);
         return res;
@@ -996,10 +1028,7 @@ impl Syscall {
         let old_file = fd_table_guard
             .get_file_by_fd(oldfd)
             .ok_or(SystemError::EBADF)?;
-        let new_file = old_file
-            .lock_no_preempt()
-            .try_clone()
-            .ok_or(SystemError::EBADF)?;
+        let new_file = old_file.try_clone().ok_or(SystemError::EBADF)?;
         // 申请文件描述符，并把文件对象存入其中
         let res = fd_table_guard
             .alloc_fd(new_file, Some(newfd))
@@ -1038,7 +1067,7 @@ impl Syscall {
                     // drop guard 以避免无法调度的问题
                     drop(fd_table_guard);
 
-                    if file.lock().close_on_exec() {
+                    if file.close_on_exec() {
                         return Ok(FD_CLOEXEC as usize);
                     }
                 }
@@ -1054,9 +1083,9 @@ impl Syscall {
                     drop(fd_table_guard);
                     let arg = arg as u32;
                     if arg & FD_CLOEXEC != 0 {
-                        file.lock().set_close_on_exec(true);
+                        file.set_close_on_exec(true);
                     } else {
-                        file.lock().set_close_on_exec(false);
+                        file.set_close_on_exec(false);
                     }
                     return Ok(0);
                 }
@@ -1071,7 +1100,7 @@ impl Syscall {
                 if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
                     // drop guard 以避免无法调度的问题
                     drop(fd_table_guard);
-                    return Ok(file.lock_no_preempt().mode().bits() as usize);
+                    return Ok(file.mode().bits() as usize);
                 }
 
                 return Err(SystemError::EBADF);
@@ -1086,7 +1115,7 @@ impl Syscall {
                     let mode = FileMode::from_bits(arg).ok_or(SystemError::EINVAL)?;
                     // drop guard 以避免无法调度的问题
                     drop(fd_table_guard);
-                    file.lock_no_preempt().set_mode(mode)?;
+                    file.set_mode(mode)?;
                     return Ok(0);
                 }
 
@@ -1125,7 +1154,7 @@ impl Syscall {
         if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
             // drop guard 以避免无法调度的问题
             drop(fd_table_guard);
-            let r = file.lock_no_preempt().ftruncate(len).map(|_| 0);
+            let r = file.ftruncate(len).map(|_| 0);
             return r;
         }
 
@@ -1143,7 +1172,7 @@ impl Syscall {
 
         let mut kstat = PosixKstat::new();
         // 获取文件信息
-        let metadata = file.lock().metadata()?;
+        let metadata = file.metadata()?;
         kstat.size = metadata.size;
         kstat.dev_id = metadata.dev_id as u64;
         kstat.inode = metadata.inode_id.into() as u64;
@@ -1162,7 +1191,7 @@ impl Syscall {
         kstat.gid = metadata.gid as i32;
         kstat.rdev = metadata.raw_dev.data() as i64;
         kstat.mode = metadata.mode;
-        match file.lock().file_type() {
+        match file.file_type() {
             FileType::File => kstat.mode.insert(ModeType::S_IFREG),
             FileType::Dir => kstat.mode.insert(ModeType::S_IFDIR),
             FileType::BlockDevice => kstat.mode.insert(ModeType::S_IFBLK),
@@ -1209,6 +1238,36 @@ impl Syscall {
         return r;
     }
 
+    pub fn statfs(path: *const u8, user_statfs: *mut PosixStatfs) -> Result<usize, SystemError> {
+        let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
+        let fd = Self::open(
+            path,
+            FileMode::O_RDONLY.bits(),
+            ModeType::empty().bits(),
+            true,
+        )?;
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN)).unwrap();
+        let pcb = ProcessManager::current_pcb();
+        let (_inode_begin, remain_path) = user_path_at(&pcb, fd as i32, &path)?;
+        let inode = ROOT_INODE().lookup_follow_symlink(&remain_path, MAX_PATHLEN)?;
+        let statfs = PosixStatfs::from(inode.fs().super_block());
+        writer.copy_one_to_user(&statfs, 0)?;
+        return Ok(0);
+    }
+
+    pub fn fstatfs(fd: i32, user_statfs: *mut PosixStatfs) -> Result<usize, SystemError> {
+        let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+        let file = fd_table_guard
+            .get_file_by_fd(fd)
+            .ok_or(SystemError::EBADF)?;
+        drop(fd_table_guard);
+        let statfs = PosixStatfs::from(file.inode().fs().super_block());
+        writer.copy_one_to_user(&statfs, 0)?;
+        return Ok(0);
+    }
+
     pub fn do_statx(
         fd: i32,
         path: *const u8,
@@ -1239,7 +1298,7 @@ impl Syscall {
         let mut writer = UserBufferWriter::new(usr_kstat, size_of::<PosixStatx>(), true)?;
         let mut tmp: PosixStatx = PosixStatx::new();
         // 获取文件信息
-        let metadata = file.lock().metadata()?;
+        let metadata = file.metadata()?;
 
         tmp.stx_mask |= PosixStatxMask::STATX_BASIC_STATS;
         tmp.stx_blksize = metadata.blk_size as u32;
@@ -1300,7 +1359,7 @@ impl Syscall {
             tmp.stx_dio_offset_align = 0;
         }
 
-        match file.lock().file_type() {
+        match file.file_type() {
             FileType::File => tmp.stx_mode.insert(ModeType::S_IFREG),
             FileType::Dir => tmp.stx_mode.insert(ModeType::S_IFDIR),
             FileType::BlockDevice => tmp.stx_mode.insert(ModeType::S_IFBLK),
@@ -1384,7 +1443,7 @@ impl Syscall {
 
         let ubuf = user_buf.buffer::<u8>(0).unwrap();
 
-        let mut file = File::new(inode, FileMode::O_RDONLY)?;
+        let file = File::new(inode, FileMode::O_RDONLY)?;
 
         let len = file.read(buf_size, ubuf)?;
 

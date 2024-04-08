@@ -15,14 +15,14 @@ use crate::{
         rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
 use self::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 
 use super::vfs::{
     core::generate_inode_id, file::FileMode, syscall::ModeType, FilePrivateData, FileSystem,
-    FileType, FsInfo, IndexNode, InodeId, Metadata,
+    FileType, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
 };
 
 pub mod callback;
@@ -51,11 +51,19 @@ impl FileSystem for KernFS {
     fn name(&self) -> &str {
         "kernfs"
     }
+
+    fn super_block(&self) -> SuperBlock {
+        SuperBlock::new(
+            Magic::KER_MAGIC,
+            KernFS::KERNFS_BLOCK_SIZE,
+            KernFS::MAX_NAMELEN as u64,
+        )
+    }
 }
 
 impl KernFS {
     pub const MAX_NAMELEN: usize = 4096;
-
+    pub const KERNFS_BLOCK_SIZE: u64 = 512;
     #[allow(dead_code)]
     pub fn new() -> Arc<Self> {
         let root_inode = Self::create_root_inode();
@@ -82,9 +90,9 @@ impl KernFS {
             gid: 0,
             blk_size: 0,
             blocks: 0,
-            atime: TimeSpec::new(0, 0),
-            mtime: TimeSpec::new(0, 0),
-            ctime: TimeSpec::new(0, 0),
+            atime: PosixTimeSpec::new(0, 0),
+            mtime: PosixTimeSpec::new(0, 0),
+            ctime: PosixTimeSpec::new(0, 0),
             dev_id: 0,
             inode_id: generate_inode_id(),
             file_type: FileType::Dir,
@@ -146,7 +154,11 @@ impl IndexNode for KernFSInode {
         self
     }
 
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         if let Some(callback) = self.callback {
             let callback_data =
                 KernCallbackData::new(self.self_ref.upgrade().unwrap(), self.private_data.lock());
@@ -156,7 +168,7 @@ impl IndexNode for KernFSInode {
         return Ok(());
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -307,7 +319,7 @@ impl IndexNode for KernFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if self.inode_type == KernInodeType::SymLink {
             let inner = self.inner.read();
@@ -351,7 +363,7 @@ impl IndexNode for KernFSInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if self.inode_type != KernInodeType::File {
             return Err(SystemError::EISDIR);
@@ -514,9 +526,9 @@ impl KernFSInode {
             gid: 0,
             blk_size: 0,
             blocks: 0,
-            atime: TimeSpec::new(0, 0),
-            mtime: TimeSpec::new(0, 0),
-            ctime: TimeSpec::new(0, 0),
+            atime: PosixTimeSpec::new(0, 0),
+            mtime: PosixTimeSpec::new(0, 0),
+            ctime: PosixTimeSpec::new(0, 0),
             dev_id: 0,
             inode_id: generate_inode_id(),
             file_type: file_type.into(),

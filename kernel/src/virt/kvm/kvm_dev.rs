@@ -5,8 +5,9 @@ use crate::filesystem::vfs::{
     file::{File, FileMode},
     FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
 };
+use crate::libs::spinlock::SpinLockGuard;
 use crate::process::ProcessManager;
-use crate::{arch::KVMArch, libs::spinlock::SpinLock, time::TimeSpec};
+use crate::{arch::KVMArch, libs::spinlock::SpinLock, time::PosixTimeSpec};
 use crate::{filesystem, kdebug};
 // use crate::virt::kvm::{host_stack};
 use super::push_vm;
@@ -58,9 +59,9 @@ impl LockedKvmInode {
                 size: 0,
                 blk_size: 0,
                 blocks: 0,
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type: FileType::KvmDevice, // 文件夹，block设备，char设备
                 mode: filesystem::vfs::syscall::ModeType::S_IALLUGO,
                 nlinks: 1,
@@ -88,12 +89,16 @@ impl IndexNode for LockedKvmInode {
         self
     }
 
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         kdebug!("file private data:{:?}", _data);
         return Ok(());
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -158,7 +163,7 @@ impl IndexNode for LockedKvmInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
@@ -169,7 +174,7 @@ impl IndexNode for LockedKvmInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }

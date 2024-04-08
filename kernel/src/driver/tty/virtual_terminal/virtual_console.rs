@@ -9,7 +9,11 @@ use bitmap::{traits::BitMapOps, StaticBitmap};
 use crate::{
     driver::{
         serial::serial8250::send_to_default_serial8250_port,
-        tty::{console::ConsoleSwitch, ConsoleFont, KDMode},
+        tty::{
+            console::ConsoleSwitch,
+            tty_port::{DefaultTtyPort, TtyPort},
+            ConsoleFont, KDMode,
+        },
     },
     libs::{font::FontDesc, rwlock::RwLock},
     process::Pid,
@@ -26,10 +30,12 @@ lazy_static! {
     /// 是否已经添加了软光标
     pub(super) static ref SOFTCURSOR_ORIGINAL: RwLock<Option<VcCursor>> = RwLock::new(None);
 
-    pub static ref CURRENT_VCNUM: AtomicIsize = AtomicIsize::new(-1);
 
-    pub static ref CONSOLE_BLANKED: AtomicBool = AtomicBool::new(false);
 }
+
+pub static CURRENT_VCNUM: AtomicIsize = AtomicIsize::new(-1);
+
+pub static CONSOLE_BLANKED: AtomicBool = AtomicBool::new(false);
 
 /// ## 虚拟控制台的信息
 #[derive(Debug, Clone)]
@@ -140,6 +146,9 @@ pub struct VirtualConsoleData {
 
     /// 对应的Console Driver funcs
     driver_funcs: Option<Weak<dyn ConsoleSwitch>>,
+
+    /// 对应端口
+    port: Arc<dyn TtyPort>,
 }
 
 impl VirtualConsoleData {
@@ -202,7 +211,13 @@ impl VirtualConsoleData {
             driver_funcs: None,
             cursor_type: VcCursor::empty(),
             num,
+            port: Arc::new(DefaultTtyPort::new()),
         }
+    }
+
+    #[inline]
+    pub fn port(&self) -> Arc<dyn TtyPort> {
+        self.port.clone()
     }
 
     pub(super) fn init(&mut self, rows: Option<usize>, cols: Option<usize>, clear: bool) {
@@ -347,7 +362,7 @@ impl VirtualConsoleData {
     /// !!! 注意，该函数返回true时，元组的第一个数据是无效数据（未转换完成）
     fn translate_unicode(&mut self, c: u32) -> (Option<u32>, bool) {
         // 收到的字符不是首个
-        if (c & 0xc8) == 0x80 {
+        if (c & 0xc0) == 0x80 {
             // 已经不需要继续的字符了，说明这个字符是非法的
             if self.utf_count == 0 {
                 return (Some(0xfffd), false);

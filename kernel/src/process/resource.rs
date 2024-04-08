@@ -1,7 +1,7 @@
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 
-use crate::time::TimeSpec;
+use crate::time::PosixTimeSpec;
 
 use super::ProcessControlBlock;
 
@@ -9,9 +9,9 @@ use super::ProcessControlBlock;
 #[repr(C)]
 pub struct RUsage {
     /// User time used
-    pub ru_utime: TimeSpec,
+    pub ru_utime: PosixTimeSpec,
     /// System time used
-    pub ru_stime: TimeSpec,
+    pub ru_stime: PosixTimeSpec,
 
     // 以下是linux的rusage结构体扩展
     /// Maximum resident set size

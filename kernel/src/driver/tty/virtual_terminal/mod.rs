@@ -1,6 +1,10 @@
 use core::sync::atomic::Ordering;
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use system_error::SystemError;
 
 use crate::{
@@ -21,7 +25,7 @@ use super::{
     console::ConsoleSwitch,
     termios::{InputMode, TTY_STD_TERMIOS},
     tty_core::{TtyCore, TtyCoreData},
-    tty_device::TtyDevice,
+    tty_device::{TtyDevice, TtyType},
     tty_driver::{TtyDriver, TtyDriverManager, TtyDriverType, TtyOperation},
 };
 
@@ -191,8 +195,12 @@ impl TtyOperation for TtyConsoleDriverInner {
             tty_core.termios_write().input_mode.remove(InputMode::IUTF8);
         }
 
+        // 设置tty的端口为vc端口
+        vc_data.port().setup_internal_tty(Arc::downgrade(&tty));
+        tty.set_port(vc_data.port());
         // 加入sysfs？
 
+        CURRENT_VCNUM.store(tty_core.index() as isize, Ordering::SeqCst);
         Ok(())
     }
 
@@ -207,6 +215,9 @@ impl TtyOperation for TtyConsoleDriverInner {
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/tty/vt/vt.c#2894
     #[inline(never)]
     fn write(&self, tty: &TtyCoreData, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
+        // if String::from_utf8_lossy(buf) == "Hello world!\n" {
+        //     loop {}
+        // }
         let ret = self.do_write(tty, buf, nr);
         self.flush_chars(tty);
         ret
@@ -226,6 +237,10 @@ impl TtyOperation for TtyConsoleDriverInner {
     fn ioctl(&self, _tty: Arc<TtyCore>, _cmd: u32, _arg: usize) -> Result<(), SystemError> {
         // TODO
         Err(SystemError::ENOIOCTLCMD)
+    }
+
+    fn close(&self, _tty: Arc<TtyCore>) -> Result<(), SystemError> {
+        Ok(())
     }
 }
 
@@ -264,11 +279,12 @@ pub struct DrawRegion {
 pub fn vty_init() -> Result<(), SystemError> {
     // 注册虚拟终端设备并将虚拟终端设备加入到文件系统
     let vc0 = TtyDevice::new(
-        "vc0",
+        "vc0".to_string(),
         IdTable::new(
             String::from("vc0"),
             Some(DeviceNumber::new(Major::TTY_MAJOR, 0)),
         ),
+        TtyType::Tty,
     );
     // 注册tty设备
     // CharDevOps::cdev_add(

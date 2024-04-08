@@ -11,7 +11,7 @@ use alloc::{
 };
 
 use crate::driver::base::device::device_number::DeviceNumber;
-use crate::filesystem::vfs::SpecialNodeData;
+use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
@@ -26,7 +26,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         vec_cursor::VecCursor,
     },
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
 use super::entry::FATFile;
@@ -35,6 +35,8 @@ use super::{
     entry::{FATDir, FATDirEntry, FATDirIter, FATEntry},
     utils::RESERVED_CLUSTERS,
 };
+
+const FAT_MAX_NAMELEN: u64 = 255;
 
 /// FAT32文件系统的最大的文件大小
 pub const MAX_FILE_SIZE: u64 = 0xffff_ffff;
@@ -193,9 +195,9 @@ impl LockedFATInode {
                 } else {
                     fs.bpb.total_sectors_16 as usize
                 },
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type,
                 mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
@@ -251,6 +253,14 @@ impl FileSystem for FATFileSystem {
 
     fn name(&self) -> &str {
         "fat"
+    }
+
+    fn super_block(&self) -> SuperBlock {
+        SuperBlock::new(
+            Magic::FAT_MAGIC,
+            self.bpb.bytes_per_sector.into(),
+            FAT_MAX_NAMELEN,
+        )
     }
 }
 
@@ -317,9 +327,9 @@ impl FATFileSystem {
                 } else {
                     bpb.total_sectors_16 as usize
                 },
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type: FileType::Dir,
                 mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
@@ -991,7 +1001,7 @@ impl FATFileSystem {
                     let mut v: Vec<u8> = vec![0; self.lba_per_sector() * LBA_SIZE];
                     self.partition
                         .disk()
-                        .read_at(lba, self.lba_per_sector(), &mut v)?;
+                        .read_at_sync(lba, self.lba_per_sector(), &mut v)?;
 
                     let mut cursor: VecCursor = VecCursor::new(v);
                     cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
@@ -1022,7 +1032,7 @@ impl FATFileSystem {
                     let mut v: Vec<u8> = vec![0; self.lba_per_sector() * LBA_SIZE];
                     self.partition
                         .disk()
-                        .read_at(lba, self.lba_per_sector(), &mut v)?;
+                        .read_at_sync(lba, self.lba_per_sector(), &mut v)?;
 
                     let mut cursor: VecCursor = VecCursor::new(v);
                     cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
@@ -1068,7 +1078,7 @@ impl FATFileSystem {
                 let lba = self.get_lba_from_offset(self.bytes_to_sector(fat_part_bytes_offset));
 
                 let mut v: Vec<u8> = vec![0; LBA_SIZE];
-                self.partition.disk().read_at(lba, 1, &mut v)?;
+                self.partition.disk().read_at_sync(lba, 1, &mut v)?;
 
                 let mut cursor: VecCursor = VecCursor::new(v);
                 cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
@@ -1217,7 +1227,7 @@ impl FATFsInfo {
         // 计算fs_info扇区在磁盘上的字节偏移量，从磁盘读取数据
         partition
             .disk()
-            .read_at(in_disk_fs_info_offset as usize / LBA_SIZE, 1, &mut v)?;
+            .read_at_sync(in_disk_fs_info_offset as usize / LBA_SIZE, 1, &mut v)?;
         let mut cursor = VecCursor::new(v);
 
         let mut fsinfo = FATFsInfo {
@@ -1359,7 +1369,7 @@ impl IndexNode for LockedFATInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         match &guard.inode_type {
@@ -1387,7 +1397,7 @@ impl IndexNode for LockedFATInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
@@ -1556,11 +1566,15 @@ impl IndexNode for LockedFATInode {
         return Ok(target);
     }
 
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         return Ok(());
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 

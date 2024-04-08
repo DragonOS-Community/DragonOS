@@ -401,7 +401,7 @@ impl LockedAhciDisk {
         let mut buf: Vec<u8> = vec![0; size_of::<MbrDiskPartionTable>()];
         buf.resize(size_of::<MbrDiskPartionTable>(), 0);
 
-        self.read_at(0, 1, &mut buf)?;
+        self.read_at_sync(0, 1, &mut buf)?;
         // 创建 Cursor 用于按字节读取
         let mut cursor = VecCursor::new(buf);
         cursor.seek(SeekFrom::SeekCurrent(446))?;
@@ -528,7 +528,7 @@ impl Device for LockedAhciDisk {
         todo!()
     }
 
-    fn set_class(&self, _class: Option<Arc<dyn Class>>) {
+    fn set_class(&self, _class: Option<Weak<dyn Class>>) {
         todo!()
     }
 }
@@ -562,7 +562,7 @@ impl BlockDevice for LockedAhciDisk {
     }
 
     #[inline]
-    fn read_at(
+    fn read_at_sync(
         &self,
         lba_id_start: BlockId, // 起始lba编号
         count: usize,          // 读取lba的数量
@@ -572,7 +572,7 @@ impl BlockDevice for LockedAhciDisk {
     }
 
     #[inline]
-    fn write_at(
+    fn write_at_sync(
         &self,
         lba_id_start: BlockId,
         count: usize,

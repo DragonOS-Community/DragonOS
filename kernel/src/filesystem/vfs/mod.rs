@@ -8,6 +8,7 @@ mod utils;
 
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};
+use intertrait::CastFromSync;
 use system_error::SystemError;
 
 use crate::{
@@ -15,8 +16,11 @@ use crate::{
         block::block_device::BlockDevice, char::CharDevice, device::device_number::DeviceNumber,
     },
     ipc::pipe::LockedPipeInode,
-    libs::casting::DowncastArc,
-    time::TimeSpec,
+    libs::{
+        casting::DowncastArc,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
+    time::PosixTimeSpec,
 };
 
 use self::{core::generate_inode_id, file::FileMode, syscall::ModeType};
@@ -114,12 +118,16 @@ bitflags! {
     }
 }
 
-pub trait IndexNode: Any + Sync + Send + Debug {
+pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 打开文件
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
@@ -128,7 +136,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
@@ -147,7 +155,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
 
     /// @brief 在inode的指定偏移量开始，写入指定大小的数据（从buf的第0byte开始写入）
@@ -164,7 +172,7 @@ pub trait IndexNode: Any + Sync + Send + Debug {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
 
     /// @brief 获取当前inode的状态。
@@ -494,7 +502,12 @@ impl dyn IndexNode {
             if inode.metadata()?.file_type == FileType::SymLink && max_follow_times > 0 {
                 let mut content = [0u8; 256];
                 // 读取符号链接
-                let len = inode.read_at(0, 256, &mut content, &mut FilePrivateData::Unused)?;
+                let len = inode.read_at(
+                    0,
+                    256,
+                    &mut content,
+                    SpinLock::new(FilePrivateData::Unused).lock(),
+                )?;
 
                 // 将读到的数据转换为utf8字符串（先转为str，再转为String）
                 let link_path = String::from(
@@ -536,13 +549,13 @@ pub struct Metadata {
     pub blocks: usize,
 
     /// inode最后一次被访问的时间
-    pub atime: TimeSpec,
+    pub atime: PosixTimeSpec,
 
     /// inode最后一次修改的时间
-    pub mtime: TimeSpec,
+    pub mtime: PosixTimeSpec,
 
     /// inode的创建时间
-    pub ctime: TimeSpec,
+    pub ctime: PosixTimeSpec,
 
     /// 文件类型
     pub file_type: FileType,
@@ -571,9 +584,9 @@ impl Default for Metadata {
             size: 0,
             blk_size: 0,
             blocks: 0,
-            atime: TimeSpec::default(),
-            mtime: TimeSpec::default(),
-            ctime: TimeSpec::default(),
+            atime: PosixTimeSpec::default(),
+            mtime: PosixTimeSpec::default(),
+            ctime: PosixTimeSpec::default(),
             file_type: FileType::File,
             mode: ModeType::empty(),
             nlinks: 1,
@@ -581,6 +594,60 @@ impl Default for Metadata {
             gid: 0,
             raw_dev: DeviceNumber::default(),
         };
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SuperBlock {
+    // type of filesystem
+    pub magic: Magic,
+    // optimal transfer block size
+    pub bsize: u64,
+    // total data blocks in filesystem
+    pub blocks: u64,
+    // free block in system
+    pub bfree: u64,
+    // 可供非特权用户使用的空闲块
+    pub bavail: u64,
+    // total inodes in filesystem
+    pub files: u64,
+    // free inodes in filesystem
+    pub ffree: u64,
+    // filesysytem id
+    pub fsid: u64,
+    // Max length of filename
+    pub namelen: u64,
+    // fragment size
+    pub frsize: u64,
+    // mount flags of filesystem
+    pub flags: u64,
+}
+
+impl SuperBlock {
+    pub fn new(magic: Magic, bsize: u64, namelen: u64) -> Self {
+        Self {
+            magic,
+            bsize,
+            blocks: 0,
+            bfree: 0,
+            bavail: 0,
+            files: 0,
+            ffree: 0,
+            fsid: 0,
+            namelen,
+            frsize: 0,
+            flags: 0,
+        }
+    }
+}
+bitflags! {
+    pub struct Magic: u64 {
+        const DEVFS_MAGIC = 0x1373;
+        const FAT_MAGIC =  0xf2f52011;
+        const KER_MAGIC = 0x3153464b;
+        const PROC_MAGIC = 0x9fa0;
+        const RAMFS_MAGIC = 0x858458f6;
+        const MOUNT_MAGIC = 61267;
     }
 }
 
@@ -597,6 +664,8 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     fn as_any_ref(&self) -> &dyn Any;
 
     fn name(&self) -> &str;
+
+    fn super_block(&self) -> SuperBlock;
 }
 
 impl DowncastArc for dyn FileSystem {
@@ -632,9 +701,9 @@ impl Metadata {
             size: 0,
             blk_size: 0,
             blocks: 0,
-            atime: TimeSpec::default(),
-            mtime: TimeSpec::default(),
-            ctime: TimeSpec::default(),
+            atime: PosixTimeSpec::default(),
+            mtime: PosixTimeSpec::default(),
+            ctime: PosixTimeSpec::default(),
             file_type,
             mode,
             nlinks: 1,

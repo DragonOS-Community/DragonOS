@@ -100,6 +100,12 @@ trigger_files = [
 [autolabel."S-等待审查"]
 new_pr = true
 
+[autolabel."needs-triage"]
+new_issue = true
+exclude_labels = [
+    "A-diagnostics",
+]
+
 [shortcut]
 
 [no-merges]

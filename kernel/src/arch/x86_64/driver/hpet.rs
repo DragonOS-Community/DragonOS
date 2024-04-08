@@ -31,7 +31,10 @@ use crate::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         PhysAddr,
     },
-    time::timer::{clock, timer_get_first_expire, update_timer_jiffies},
+    time::{
+        jiffies::NSEC_PER_JIFFY,
+        timer::{clock, timer_get_first_expire, update_timer_jiffies},
+    },
 };
 
 static mut HPET_INSTANCE: Option<Hpet> = None;
@@ -54,8 +57,8 @@ struct InnerHpet {
 }
 
 impl Hpet {
-    /// HPET0 中断间隔为 10ms
-    pub const HPET0_INTERVAL_USEC: u64 = 10000;
+    /// HPET0 中断间隔
+    pub const HPET0_INTERVAL_USEC: u64 = NSEC_PER_JIFFY as u64 / 1000;
 
     const HPET0_IRQ: IrqNumber = IrqNumber::new(34);
 
@@ -70,6 +73,7 @@ impl Hpet {
                 .unwrap()
         };
         let tm_num = hpet.timers_num();
+        kdebug!("HPET0_INTERVAL_USEC: {}", Self::HPET0_INTERVAL_USEC);
         kinfo!("HPET has {} timers", tm_num);
         hpet_info.hpet_number = tm_num as u8;
 
@@ -238,7 +242,7 @@ impl Hpet {
     pub(super) fn handle_irq(&self, timer_num: u32) {
         if timer_num == 0 {
             assert!(!CurrentIrqArch::is_irq_enabled());
-            update_timer_jiffies(Self::HPET0_INTERVAL_USEC, Self::HPET0_INTERVAL_USEC as i64);
+            update_timer_jiffies(1, Self::HPET0_INTERVAL_USEC as i64);
 
             if let Ok(first_expire) = timer_get_first_expire() {
                 if first_expire <= clock() {

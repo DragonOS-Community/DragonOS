@@ -25,7 +25,7 @@ ifeq ("$(DADK_VERSION)", "")
 	@echo "\n\tcargo install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v$(MIN_DADK_VERSION)"
 	@echo "\n"
 	@echo "Auto installing dadk..."
-	CC=gcc AS=as AR=ar LD=ld OBJCOPY=objcopy NM=nm cargo install dadk
+	cargo install dadk
 else
 # 如果DADK版本过低，则自动更新
 	@echo "dadk version $(DADK_VERSION) installed"
@@ -33,7 +33,7 @@ else
 ifneq ($(shell printf '%s\n%s' "$(DADK_VERSION)" "$(MIN_DADK_VERSION)" | sort -V | head -n1), $(MIN_DADK_VERSION))
 	@echo "dadk version is too low, please update to $(MIN_DADK_VERSION) or higher version"
 	@echo "Updating dadk..."
-	CC=gcc AS=as AR=ar LD=ld OBJCOPY=objcopy NM=nm cargo install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v$(MIN_DADK_VERSION) || (echo "dadk update failed" && exit 1)
+	cargo install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v$(MIN_DADK_VERSION) || (echo "dadk update failed" && exit 1)
 	@echo "dadk updated"
 endif
 endif
@@ -55,13 +55,12 @@ all:
 	mkdir -p $(ROOT_PATH)/bin/sysroot
 	
 	$(MAKE) dadk_run
-	$(MAKE) copy_services
+	$(MAKE) copy_sysconfig
 
 	@echo 用户态程序编译完成
 
-copy_services: dadk_run
-	@mkdir -p $(ROOT_PATH)/bin/sysroot/etc/reach/system
-	cp -r services/* $(ROOT_PATH)/bin/sysroot/etc/reach/system/
+copy_sysconfig: dadk_run
+	cp -r sysconfig/* $(ROOT_PATH)/bin/sysroot/
 
 
 .PHONY: clean

@@ -1,7 +1,7 @@
 //! 文件系统目录项缓存
 //! Todo: 更改使用的哈希
 use alloc::{
-    collections::{LinkedList, VecDeque},
+    collections::VecDeque,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -14,10 +14,7 @@ use core::{
 };
 use path_base::Path;
 
-use crate::libs::{
-    rwlock::{RwLock, RwLockUpgradableGuard},
-    spinlock::SpinLock,
-};
+use crate::libs::rwlock::{RwLock, RwLockUpgradableGuard};
 
 use super::IndexNode;
 type Resource = Arc<dyn IndexNode>;
@@ -78,7 +75,7 @@ impl<H: Hasher + Default> HashTable<H> {
         new
     }
     /// 下标帮助函数
-    fn _position(&self, key: &str) -> usize {
+    fn position(&self, key: &str) -> usize {
         let mut hasher = H::default();
         key.hash(&mut hasher);
         hasher.finish() as usize % self.table.capacity()
@@ -87,48 +84,56 @@ impl<H: Hasher + Default> HashTable<H> {
     fn get_list_iter(&self, key: &str) -> SrcIter {
         SrcIter {
             idx: 0,
-            vec: Some(self.table[self._position(key)].upgradeable_read()),
+            vec: Some(self.table[self.position(key)].upgradeable_read()),
         }
     }
     /// 插入索引
     fn put(&self, key: &str, src: Weak<dyn IndexNode>) {
-        let mut guard = self.table[self._position(key)].write();
+        let mut guard = self.table[self.position(key)].write();
         guard.push_back(src);
     }
-}
 
-#[derive(Debug)]
-struct LruList {
-    list: LinkedList<Resource>,
-}
-
-impl LruList {
-    fn new() -> Self {
-        Self {
-            list: LinkedList::new(),
-        }
-    }
-
-    fn push(&mut self, src: Resource) {
-        self.list.push_back(src);
-        // kdebug!("List: {:?}", self.list.iter().map(|item| item.clone().upgrade()).collect::<Vec<_>>());
-        // Arc::downgrade(&to_put)
-    }
-
-    fn clean(&mut self) -> usize {
-        kdebug!("Called clean.");
-        if self.list.is_empty() {
-            return 0;
-        }
-        self.list
-            .extract_if(|src| {
-                // 原始指针已被销毁
-                if Arc::strong_count(src) < 2 {
-                    return true;
+    /// 清除失效项，返回清除数量
+    fn clean(&self) -> usize {
+        let mut count = 0;
+        self.table.iter().for_each(|queue| {
+            let mut idx = 0;
+            let mut proc = queue.upgradeable_read();
+            while idx < proc.len() {
+                if proc[idx].strong_count() == 0 {
+                    let mut writer = proc.upgrade();
+                    writer.remove(idx);
+                    proc = writer.downgrade_to_upgradeable();
+                    count += 1;
+                } else {
+                    idx += 1;
                 }
-                false
-            })
-            .count()
+            }
+        });
+        return count;
+    }
+
+    /// 清除指定数量的失效项，返回清除数量
+    fn clean_with_limit(&self, num: usize) -> usize {
+        let mut count = 0;
+        'outer: for queue in &self.table {
+            let mut idx = 0;
+            let mut proc = queue.upgradeable_read();
+            while idx < proc.len() {
+                if proc[idx].strong_count() == 0 {
+                    let mut writer = proc.upgrade();
+                    writer.remove(idx);
+                    proc = writer.downgrade_to_upgradeable();
+                    count += 1;
+                    if count >= num {
+                        break 'outer;
+                    }
+                } else {
+                    idx += 1;
+                }
+            }
+        }
+        return count;
     }
 }
 
@@ -138,11 +143,7 @@ impl LruList {
 pub struct DefaultDCache<H: Hasher + Default = SipHasher> {
     /// hash index
     table: HashTable<H>,
-    /// lru note
-    deque: SpinLock<LruList>,
-    // /// resource release
-    // source: SpinLock<CacheManager>,
-    max_size: AtomicUsize,
+    max_size: usize,
     size: AtomicUsize,
 }
 
@@ -155,7 +156,7 @@ pub trait DCache {
     /// 缓存目录项
     fn put(&self, key: &str, src: Resource);
     /// 清除失效目录项，返回清除的数量（可能的话）
-    fn clean(&self) -> Option<usize>;
+    fn clean(&self, num: Option<usize>) -> Option<usize>;
     /// 在dcache中快速查找目录项
     /// - `search_path`: 搜索路径
     /// - `stop_path`: 停止路径
@@ -167,13 +168,6 @@ pub trait DCache {
     ) -> Option<(Arc<dyn IndexNode>, &'a Path)>;
 }
 
-impl<H: Hasher + Default> DefaultDCache<H> {
-    /// 获取哈希桶迭代器
-    fn get(&self, key: &str) -> SrcIter {
-        self.table.get_list_iter(key)
-    }
-}
-
 impl<H: Hasher + Default> DCache for DefaultDCache<H> {
     fn new(mem_size: Option<usize>) -> Self {
         let mem_size = mem_size.unwrap_or(self::DEFAULT_MEMORY_SIZE);
@@ -182,9 +176,7 @@ impl<H: Hasher + Default> DCache for DefaultDCache<H> {
         let hash_table_size = max_size / 7 * 10 /* 0.7 */;
         Self {
             table: HashTable::new(hash_table_size),
-            deque: SpinLock::new(LruList::new()),
-            // source: SpinLock::new(CacheManager::new()),
-            max_size: AtomicUsize::new(max_size),
+            max_size,
             size: AtomicUsize::new(0),
         }
     }
@@ -203,21 +195,20 @@ impl<H: Hasher + Default> DCache for DefaultDCache<H> {
             key => {
                 // kdebug!("Cache with key {}.", key);
                 self.table.put(key, Arc::downgrade(&src));
-                self.deque.lock().push(src);
                 self.size.fetch_add(1, Ordering::Acquire);
-                if self.size.load(Ordering::Acquire) >= self.max_size.load(Ordering::Acquire) {
+                if self.size.load(Ordering::Acquire) >= self.max_size {
                     kdebug!("Automately clean.");
-                    self.clean();
+                    self.clean(None);
                 }
             }
         }
     }
 
-    fn clean(&self) -> Option<usize> {
-        let ret = self.deque.lock().clean();
-        self.size.fetch_sub(ret, Ordering::Acquire);
-        kdebug!("Clean {} empty entry", ret);
-        Some(ret)
+    fn clean(&self, num: Option<usize>) -> Option<usize> {
+        if let Some(num) = num {
+            return Some(self.table.clean_with_limit(num));
+        }
+        return Some(self.table.clean());
     }
 
     fn quick_lookup<'a>(
@@ -228,7 +219,7 @@ impl<H: Hasher + Default> DCache for DefaultDCache<H> {
         // kdebug!("Quick lookup: abs {:?}, rest {:?}", abs_path, rest_path);
         let key = search_path.file_name();
 
-        let result = self.get(key.unwrap()).find(|src| {
+        let result = self.table.get_list_iter(key.unwrap()).find(|src| {
             // kdebug!("Src: {:?}, {:?}; Lookup: {:?}, {:?}", src.key(), src.abs_path(), key, abs_path);
             src.abs_path().unwrap() == search_path
         });

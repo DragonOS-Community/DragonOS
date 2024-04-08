@@ -83,48 +83,48 @@ impl Debug for OSD2 {
 /// 磁盘中存储的inode
 pub struct Ext2Inode {
     /// 文件类型和权限，高四位代表文件类型，其余代表权限
-    mode: u16,
+    pub mode: u16,
     /// 文件所有者
-    uid: u16,
+    pub uid: u16,
     /// 文件大小
-    lower_size: u32,
+    pub lower_size: u32,
     /// 文件访问时间
-    access_time: u32,
+    pub access_time: u32,
     /// 文件创建时间
-    create_time: u32,
+    pub create_time: u32,
     /// 文件修改时间
-    modify_time: u32,
+    pub modify_time: u32,
     /// 文件删除时间
-    delete_time: u32,
+    pub delete_time: u32,
     /// 文件组
-    gid: u16,
+    pub gid: u16,
     /// 文件链接数
-    hard_link_num: u16,
+    pub hard_link_num: u16,
     /// 文件在磁盘上的扇区
-    disk_sector: u32,
+    pub disk_sector: u32,
     /// 文件属性
-    flags: u32,
+    pub flags: u32,
     /// 操作系统依赖
-    os_dependent_1: OSD1,
+    pub os_dependent_1: OSD1,
 
-    blocks: [u32; EXT2_BP_NUM],
+    pub blocks: [u32; EXT2_BP_NUM],
 
     /// Generation number (Primarily used for NFS)
-    generation_num: u32,
+    pub generation_num: u32,
 
     /// In Ext2 version 0, this field is reserved.
     /// In version >= 1, Extended attribute block (File ACL).
-    file_acl: u32,
+    pub file_acl: u32,
 
     /// In Ext2 version 0, this field is reserved.
     /// In version >= 1, Upper 32 bits of file size (if feature bit set) if it's a file,
     /// Directory ACL if it's a directory
-    directory_acl: u32,
+    pub directory_acl: u32,
 
     /// 片段地址
-    fragment_addr: u32,
+    pub fragment_addr: u32,
     /// 操作系统依赖
-    os_dependent_2: OSD2,
+    pub os_dependent_2: OSD2,
 }
 impl Ext2Inode {
     // TODO 刷新磁盘中的inode
@@ -209,10 +209,8 @@ impl Ext2InodeInfo {
             mode: fs_mode,
             file_type,
         }
-
     }
     // TODO 更新当前inode的元数据
-
 }
 
 impl IndexNode for LockedExt2InodeInfo {

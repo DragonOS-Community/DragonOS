@@ -326,17 +326,46 @@ impl Ext2SuperBlockInfo {
             inode_table_size / LBA_SIZE,
             &mut inode_table_data,
         )?;
+        let mut inode_data: Vec<u8> = Vec::with_capacity(self.s_inode_size as usize);
+        inode_data.resize(self.s_inode_size as usize, 0); // 读取inode table
+        pt.disk().read_at(
+            (desc.inode_table_start + idx * self.s_inode_size) as usize,
+            1,
+            &mut inode_data,
+        )?;
 
-        // TODO 按字节获取特定inode，获取到就跳出返回
-        let mut inode_data = Vec::with_capacity(self.s_inode_size as usize);
-        inode_data.resize(self.s_inode_size as usize, 0);
+        // // TODO 按字节获取特定inode，获取到就跳出返回
+        // let mut inode_data = Vec::with_capacity(self.s_inode_size as usize);
+        // inode_data.resize(self.s_inode_size as usize, 0);
+        let mut cursor = VecCursor::new(inode_data);
+        let inode = Ext2Inode{
+            mode: cursor.read_u16()?,
+            uid: cursor.read_u16()?,
+            lower_size: cursor.read_u32()?,
+            access_time: cursor.read_u32()?,
+            create_time: cursor.read_u32()?,
+            modify_time: cursor.read_u32()?,
+            delete_time: cursor.read_u32()?,
+            gid: cursor.read_u16()?,
+            hard_link_num: cursor.read_u16()?,
+            disk_sector: cursor.read_u32()?,
+            flags: cursor.read_u32()?,
+            os_dependent_1: cursor.read_u32()?,
+            blocks: cursor.read_u32()?,
+            generation_num: cursor.read_u32()?,
+            file_acl: cursor.read_u32()?,
+            directory_acl: cursor.read_u32()?,
+            fragment_addr: cursor.read_u32()?,
+            os_dependent_2: cursor.read_u16()?,
+        };
+        // for _ in 0..=idx {}
 
-        let mut blc_data = Vec::with_capacity(LBA_SIZE);
-        blc_data.resize(LBA_SIZE, 0);
-        let mut blc_index = (inode_index - 1) * self.s_inodes_per_group + self.s_first_ino;
+        // let mut blc_data = Vec::with_capacity(LBA_SIZE);
+        // blc_data.resize(LBA_SIZE, 0);
+        // let mut blc_index = (inode_index - 1) * self.s_inodes_per_group + self.s_first_ino;
 
-        let mut blc_num = 0;
-        while blc_num < self.s_inodes_per_group {}
+        // let mut blc_num = 0;
+        // while blc_num < self.s_inodes_per_group {}
         todo!()
     }
     // TODO 获取根结点

@@ -1,6 +1,4 @@
-use core::cmp::Ordering;
-use core::intrinsics::unlikely;
-use core::{any::Any, fmt::Debug};
+use core::{any::Any, cmp::Ordering, fmt::Debug, intrinsics::unlikely};
 use system_error::SystemError;
 
 use alloc::{
@@ -10,17 +8,19 @@ use alloc::{
     vec::Vec,
 };
 
-use crate::driver::base::device::device_number::DeviceNumber;
-use crate::ipc::pipe::LockedPipeInode;
 use crate::{
-    driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
+    driver::base::{
+        block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
+        device::device_number::DeviceNumber,
+    },
     filesystem::vfs::{
         core::generate_inode_id,
-        dcache::DefaultDCache,
+        dcache::{DCache, DefaultDCache},
         file::{FileMode, FilePrivateData},
         syscall::ModeType,
         FileSystem, FileType, IndexNode, InodeId, Magic, Metadata, SpecialNodeData, SuperBlock,
     },
+    ipc::pipe::LockedPipeInode,
     kerror,
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
@@ -29,10 +29,9 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-use super::entry::FATFile;
 use super::{
     bpb::{BiosParameterBlock, FATType},
-    entry::{FATDir, FATDirEntry, FATDirIter, FATEntry},
+    entry::{FATDir, FATDirEntry, FATDirIter, FATEntry, FATFile},
     utils::RESERVED_CLUSTERS,
 };
 

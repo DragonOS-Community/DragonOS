@@ -7,7 +7,7 @@ use alloc::{
 use core::cmp::Ordering;
 
 #[derive(Debug)]
-pub struct Keyer(Weak<LockedRamfsEntry>, Option<String>);
+pub(super) struct Keyer(Weak<LockedRamfsEntry>, Option<String>);
 
 impl Keyer {
     pub fn from_str(key: &str) -> Self {

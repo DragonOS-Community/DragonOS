@@ -24,7 +24,8 @@ type Resource = Arc<dyn IndexNode>;
 // type SrcPtr = Weak<Resource>;
 // type SrcManage = Arc<Resource>;
 
-// not thread safe
+/// # Safety
+/// not thread safe
 pub struct SrcIter<'a> {
     idx: usize,
     vec: Option<RwLockUpgradableGuard<'a, VecDeque<Weak<dyn IndexNode>>>>,
@@ -145,10 +146,37 @@ pub struct DefaultDCache<H: Hasher + Default = SipHasher> {
     size: AtomicUsize,
 }
 
+impl<H: Hasher + Default> DefaultDCache<H> {}
+
+const DEFAULT_MEMORY_SIZE: usize = 1024 /* K */ * 1024 /* Byte */;
+pub trait DCache {
+    /// 创建一个新的目录项缓存
+    fn new(mem_size: Option<usize>) -> Self;
+    /// 缓存目录项
+    fn put(&self, key: &str, src: Resource);
+    /// 清除失效目录项，返回清除的数量（可能的话）
+    fn clean(&self) -> Option<usize>;
+    /// 在dcache中快速查找目录项
+    /// - `search_path`: 搜索路径
+    /// - `stop_path`: 停止路径
+    /// - 返回值: 找到的`inode`及其`路径` 或 [`None`]
+    fn quick_lookup<'a>(
+        &self,
+        search_path: &'a Path,
+        stop_path: &'a Path,
+    ) -> Option<(Arc<dyn IndexNode>, &'a Path)>;
+}
+
 impl<H: Hasher + Default> DefaultDCache<H> {
-    const DEFAULT_MEMORY_SIZE: usize = 1024 /* K */ * 1024 /* Byte */;
-    pub fn new(mem_size: Option<usize>) -> Self {
-        let mem_size = mem_size.unwrap_or(Self::DEFAULT_MEMORY_SIZE);
+    /// 获取哈希桶迭代器
+    fn get(&self, key: &str) -> SrcIter {
+        self.table.get_list_iter(key)
+    }
+}
+
+impl<H: Hasher + Default> DCache for DefaultDCache<H> {
+    fn new(mem_size: Option<usize>) -> Self {
+        let mem_size = mem_size.unwrap_or(self::DEFAULT_MEMORY_SIZE);
         let max_size =
             mem_size / (2 * size_of::<Arc<dyn IndexNode>>() + size_of::<Weak<dyn IndexNode>>());
         let hash_table_size = max_size / 7 * 10 /* 0.7 */;
@@ -161,8 +189,7 @@ impl<H: Hasher + Default> DefaultDCache<H> {
         }
     }
 
-    /// 缓存目录项
-    pub fn put(&self, key: &str, src: Resource) {
+    fn put(&self, key: &str, src: Resource) {
         match key {
             "" => {
                 return;
@@ -186,24 +213,14 @@ impl<H: Hasher + Default> DefaultDCache<H> {
         }
     }
 
-    /// 获取哈希桶迭代器
-    pub fn get(&self, key: &str) -> SrcIter {
-        self.table.get_list_iter(key)
-    }
-
-    /// 清除已被删除的目录项
-    pub fn clean(&self) -> usize {
+    fn clean(&self) -> Option<usize> {
         let ret = self.deque.lock().clean();
         self.size.fetch_sub(ret, Ordering::Acquire);
         kdebug!("Clean {} empty entry", ret);
-        ret
+        Some(ret)
     }
 
-    /// 在dcache中快速查找目录项
-    /// - `search_path`: 搜索路径
-    /// - `stop_path`: 停止路径
-    /// - 返回值: 找到的`inode`及其`路径` 或 [`None`]
-    pub fn quick_lookup<'a>(
+    fn quick_lookup<'a>(
         &self,
         search_path: &'a Path,
         stop_path: &'a Path,

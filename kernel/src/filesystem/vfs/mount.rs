@@ -9,8 +9,10 @@ use alloc::{
     collections::BTreeMap,
     string::String,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 
+use path_base::PathBuf;
 use system_error::SystemError;
 
 use crate::{
@@ -20,7 +22,7 @@ use crate::{
 
 use super::{
     file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
-    Magic, SuperBlock,
+    Magic, SuperBlock, ROOT_INODE,
 };
 
 use self::utils::MountList;
@@ -436,6 +438,33 @@ impl IndexNode for MountFSInode {
     #[inline]
     fn key(&self) -> Result<String, SystemError> {
         self.inner_inode.key()
+    }
+
+    fn abs_path(&self) -> Result<PathBuf, SystemError> {
+        let mut path_stack = Vec::new();
+        path_stack.push(self.key()?);
+
+        let init = self.parent()?;
+        if self.metadata()?.inode_id == init.metadata()?.inode_id {
+            return Ok(PathBuf::from("/"));
+        }
+
+        let mut inode = init;
+        path_stack.push(inode.key()?);
+
+        while inode.metadata()?.inode_id != ROOT_INODE().metadata()?.inode_id {
+            let tmp = inode.parent()?;
+            if inode.metadata()?.inode_id == tmp.metadata()?.inode_id {
+                break;
+            }
+            inode = tmp;
+            path_stack.push(inode.key()?);
+        }
+
+        path_stack.reverse();
+        let mut path = PathBuf::from("/");
+        path.extend(path_stack);
+        return Ok(path);
     }
 }
 

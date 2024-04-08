@@ -329,6 +329,7 @@ impl ElfLoader {
         interp_elf_ex: &mut ExecParam,
         load_bias: usize,
     ) -> Result<BinaryLoaderResult, ExecError> {
+        kdebug!("loading elf interp");
         let mut head_buf = [0u8; 512];
         interp_elf_ex
             .file_mut()
@@ -360,12 +361,13 @@ impl ElfLoader {
         let mut last_bss: VirtAddr = VirtAddr::new(0);
         let mut bss_prot: Option<ProtFlags> = None;
         for section in phdr_table {
+            kdebug!("loading {:?}", section);
             if section.p_type == PT_LOAD {
                 let mut elf_type = MapFlags::MAP_PRIVATE;
                 let elf_prot = Self::make_prot(section.p_flags, true, true);
                 let vaddr = TryInto::<usize>::try_into(section.p_vaddr).unwrap();
                 if interp_hdr.e_type == ET_EXEC || load_addr_set {
-                    elf_type.insert(MapFlags::MAP_FIXED)
+                    elf_type.insert(MapFlags::MAP_FIXED) //TODO 应当为MapFlags::MAP_FIXED，暂时未支持
                 }
                 load_addr += vaddr;
                 if load_bias != 0 && interp_hdr.e_type == ET_DYN {
@@ -380,7 +382,10 @@ impl ElfLoader {
                     &elf_type,
                     total_size,
                 )
-                .map_err(|_| return ExecError::InvalidParemeter)?;
+                .map_err(|e| {
+                    kerror!("Failed to load elf interpreter :{:?}", e);
+                    return ExecError::InvalidParemeter;
+                })?;
                 if !map_addr.1 {
                     return Err(ExecError::BadAddress(Some(map_addr.0)));
                 }
@@ -453,6 +458,7 @@ impl ElfLoader {
                 load_addr + TryInto::<usize>::try_into(interp_hdr.e_entry).unwrap(),
             )));
         }
+        kdebug!("sucessfully load elf interp");
         return Ok(BinaryLoaderResult::new(load_addr));
     }
 
@@ -730,14 +736,28 @@ impl BinaryLoader for ElfLoader {
             if seg.p_filesz > 4096 || seg.p_filesz < 2 {
                 return Err(ExecError::NotExecutable);
             }
-
-            let interpreter_ptr = unsafe {
-                core::slice::from_raw_parts(
-                    seg.p_offset as *const u8,
+            kdebug!("seg:{:?}", seg);
+            let mut buffer = Vec::new();
+            buffer.resize(seg.p_filesz.try_into().unwrap(), 0);
+            let r = param
+                .file_mut()
+                .pread(
+                    seg.p_offset.try_into().unwrap(),
                     seg.p_filesz.try_into().unwrap(),
+                    buffer.as_mut_slice(),
                 )
-            };
-            let interpreter_path = core::str::from_utf8(interpreter_ptr).map_err(|e| {
+                .map_err(|e| {
+                    kerror!("Failed to load interpreter :{:?}", e);
+                    return ExecError::NotSupported;
+                })?;
+            if r != seg.p_filesz.try_into().unwrap() {
+                kerror!("Failed to load interpreter ");
+                return Err(ExecError::NotSupported);
+            }
+            let interpreter_path = core::str::from_utf8(
+                &buffer[0..TryInto::<usize>::try_into(seg.p_filesz).unwrap() - 1], //
+            )
+            .map_err(|e| {
                 ExecError::Other(format!(
                     "Failed to parse the path of dynamic linker with error {}",
                     e
@@ -745,7 +765,7 @@ impl BinaryLoader for ElfLoader {
             })?;
             kdebug!("opening interpreter at :{}", interpreter_path);
             interpreter = Some(
-                ExecParam::new(interpreter_path, param.vm().clone(), ExecParamFlags::EXEC)
+                ExecParam::new(&interpreter_path, param.vm().clone(), ExecParamFlags::EXEC)
                     .map_err(|e| {
                         kerror!("Failed to load interpreter :{:?}", e);
                         return ExecError::NotSupported;
@@ -759,8 +779,6 @@ impl BinaryLoader for ElfLoader {
             // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#950
         }
         Self::parse_gnu_property()?;
-
-        // kdebug!("loadable_sections = {:?}", loadable_sections);
 
         let mut elf_brk = VirtAddr::new(0);
         let mut elf_bss = VirtAddr::new(0);
@@ -783,7 +801,7 @@ impl BinaryLoader for ElfLoader {
             .into_iter()
             .filter(|seg| seg.p_type == elf::abi::PT_LOAD);
         for seg_to_load in loadable_sections {
-            // kdebug!("seg_to_load = {:?}", seg_to_load);
+            kdebug!("seg_to_load = {:?}", seg_to_load);
             if unlikely(elf_brk > elf_bss) {
                 // kdebug!(
                 //     "to set brk, elf_brk = {:?}, elf_bss = {:?}",
@@ -969,6 +987,7 @@ impl BinaryLoader for ElfLoader {
             // kdebug!("elf_bss = {elf_bss:?}, elf_brk = {elf_brk:?}");
             return Err(ExecError::BadAddress(Some(elf_bss)));
         }
+        drop(user_vm);
         if let Some(mut interpreter) = interpreter {
             // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#1249
             let elf_entry = Self::load_elf_interp(&mut interpreter, load_bias)?.entry_point();
@@ -984,7 +1003,7 @@ impl BinaryLoader for ElfLoader {
                 .map_err(|_| ExecError::InvalidParemeter)?;
         }
         // kdebug!("to create auxv");
-
+        let mut user_vm = binding.write();
         self.create_auxv(
             param,
             interp_load_addr.unwrap_or(program_entrypoint),

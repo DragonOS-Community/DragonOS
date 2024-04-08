@@ -85,4 +85,4 @@ debug = true   # Controls whether the compiler passes `-g`
 
 # The release profile, used for `cargo build --release`
 [profile.release]
-debug = false
+debug = true

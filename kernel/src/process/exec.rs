@@ -157,6 +157,11 @@ impl ExecParam {
     pub fn file_mut(&mut self) -> &mut File {
         &mut self.file
     }
+
+    /// 获取File的所有权，用于将动态链接器加入文件描述符表中
+    pub fn file(self) -> File {
+        self.file
+    }
 }
 
 /// ## 加载二进制文件

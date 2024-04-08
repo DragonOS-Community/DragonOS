@@ -123,7 +123,7 @@ fn do_sys_openat2(
 
     // 创建文件对象
 
-    let mut file: File = File::new(inode, how.o_flags)?;
+    let file: File = File::new(inode, how.o_flags)?;
 
     // 打开模式为“追加”
     if how.o_flags.contains(FileMode::O_APPEND) {

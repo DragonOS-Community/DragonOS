@@ -25,7 +25,7 @@ use crate::{
     },
     mm::allocator::page_frame::FrameAllocator,
     process::{Pid, ProcessManager},
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
 use super::vfs::{
@@ -168,8 +168,8 @@ impl ProcFSInode {
             .map(|cpu| cpu.data() as i32)
             .unwrap_or(-1);
 
-        let priority = sched_info_guard.priority();
-        let vrtime = sched_info_guard.virtual_runtime();
+        let priority = sched_info_guard.policy();
+        let vrtime = sched_info_guard.sched_entity.vruntime;
 
         pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
         pdata.append(
@@ -183,11 +183,7 @@ impl ProcFSInode {
                 .to_owned(),
         );
         pdata.append(&mut format!("\ncpu_id:\t{}", cpu_id).as_bytes().to_owned());
-        pdata.append(
-            &mut format!("\npriority:\t{}", priority.data())
-                .as_bytes()
-                .to_owned(),
-        );
+        pdata.append(&mut format!("\npriority:\t{:?}", priority).as_bytes().to_owned());
         pdata.append(
             &mut format!("\npreempt:\t{}", pcb.preempt_count())
                 .as_bytes()
@@ -257,10 +253,10 @@ impl ProcFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _pdata: &mut ProcfsFilePrivateData,
+        pdata: &mut ProcfsFilePrivateData,
     ) -> Result<usize, SystemError> {
-        let start = _pdata.data.len().min(offset);
-        let end = _pdata.data.len().min(offset + len);
+        let start = pdata.data.len().min(offset);
+        let end = pdata.data.len().min(offset + len);
 
         // buffer空间不足
         if buf.len() < (end - start) {
@@ -268,7 +264,7 @@ impl ProcFSInode {
         }
 
         // 拷贝数据
-        let src = &_pdata.data[start..end];
+        let src = &pdata.data[start..end];
         buf[0..src.len()].copy_from_slice(src);
         return Ok(src.len());
     }
@@ -318,9 +314,9 @@ impl ProcFS {
                     size: 0,
                     blk_size: 0,
                     blocks: 0,
-                    atime: TimeSpec::default(),
-                    mtime: TimeSpec::default(),
-                    ctime: TimeSpec::default(),
+                    atime: PosixTimeSpec::default(),
+                    mtime: PosixTimeSpec::default(),
+                    ctime: PosixTimeSpec::default(),
                     file_type: FileType::Dir,
                     mode: ModeType::from_bits_truncate(0o555),
                     nlinks: 1,
@@ -433,7 +429,11 @@ impl ProcFS {
 }
 
 impl IndexNode for LockedProcFSInode {
-    fn open(&self, data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        mut data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         // 加锁
         let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
 
@@ -457,7 +457,7 @@ impl IndexNode for LockedProcFSInode {
         return Ok(());
     }
 
-    fn close(&self, data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, mut data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         let guard: SpinLockGuard<ProcFSInode> = self.0.lock();
         // 如果inode类型为文件夹，则直接返回成功
         if let FileType::Dir = guard.metadata.file_type {
@@ -474,7 +474,7 @@ impl IndexNode for LockedProcFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: &mut FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
@@ -488,8 +488,8 @@ impl IndexNode for LockedProcFSInode {
         }
 
         // 获取数据信息
-        let private_data = match data {
-            FilePrivateData::Procfs(p) => p,
+        let mut private_data = match &*data {
+            FilePrivateData::Procfs(p) => p.clone(),
             _ => {
                 panic!("ProcFS: FilePrivateData mismatch!");
             }
@@ -497,8 +497,12 @@ impl IndexNode for LockedProcFSInode {
 
         // 根据文件类型读取相应数据
         match inode.fdata.ftype {
-            ProcFileType::ProcStatus => return inode.proc_read(offset, len, buf, private_data),
-            ProcFileType::ProcMeminfo => return inode.proc_read(offset, len, buf, private_data),
+            ProcFileType::ProcStatus => {
+                return inode.proc_read(offset, len, buf, &mut private_data)
+            }
+            ProcFileType::ProcMeminfo => {
+                return inode.proc_read(offset, len, buf, &mut private_data)
+            }
             ProcFileType::ProcKmsg => (),
             ProcFileType::Default => (),
         };
@@ -523,7 +527,7 @@ impl IndexNode for LockedProcFSInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
@@ -596,9 +600,9 @@ impl IndexNode for LockedProcFSInode {
                     size: 0,
                     blk_size: 0,
                     blocks: 0,
-                    atime: TimeSpec::default(),
-                    mtime: TimeSpec::default(),
-                    ctime: TimeSpec::default(),
+                    atime: PosixTimeSpec::default(),
+                    mtime: PosixTimeSpec::default(),
+                    ctime: PosixTimeSpec::default(),
                     file_type,
                     mode,
                     nlinks: 1,

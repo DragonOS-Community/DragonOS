@@ -603,8 +603,7 @@ impl SockAddr {
                     let binding = ProcessManager::current_pcb().fd_table();
                     let fd_table_guard = binding.read();
 
-                    let binding = fd_table_guard.get_file_by_fd(fd as i32).unwrap();
-                    let file = binding.lock();
+                    let file = fd_table_guard.get_file_by_fd(fd as i32).unwrap();
                     if file.file_type() != FileType::Socket {
                         return Err(SystemError::ENOTSOCK);
                     }

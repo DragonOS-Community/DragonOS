@@ -3,7 +3,7 @@ use core::{
     hint::spin_loop,
     intrinsics::{likely, unlikely},
     mem::ManuallyDrop,
-    sync::atomic::{compiler_fence, AtomicBool, AtomicIsize, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -16,9 +16,9 @@ use system_error::SystemError;
 
 use crate::{
     arch::{
+        cpu::current_cpu_id,
         ipc::signal::{AtomicSignal, SigSet, Signal},
         process::ArchPCBInfo,
-        sched::sched,
         CurrentIrqArch,
     },
     driver::tty::tty_core::TtyCore,
@@ -34,10 +34,10 @@ use crate::{
         casting::DowncastArc,
         futex::{
             constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
-            futex::Futex,
+            futex::{Futex, RobustListHead},
         },
         lock_free_flags::LockFreeFlags,
-        rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
+        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
@@ -48,12 +48,13 @@ use crate::{
         VirtAddr,
     },
     net::socket::SocketInode,
+    sched::completion::Completion,
     sched::{
-        completion::Completion,
-        core::{sched_enqueue, CPU_EXECUTING},
-        SchedPolicy, SchedPriority,
+        cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag, EnqueueFlag, OnRq, SchedMode,
+        WakeupFlags, __schedule,
     },
     smp::{
+        core::smp_get_processor_id,
         cpu::{AtomicProcessorId, ProcessorId},
         kick_cpu,
     },
@@ -225,10 +226,24 @@ impl ProcessManager {
             let state = writer.state();
             if state.is_blocked() {
                 writer.set_state(ProcessState::Runnable);
+                writer.set_wakeup();
+
                 // avoid deadlock
                 drop(writer);
 
-                sched_enqueue(pcb.clone(), true);
+                let rq =
+                    cpu_rq(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize);
+
+                let (rq, _guard) = rq.self_lock();
+                rq.update_rq_clock();
+                rq.activate_task(
+                    pcb,
+                    EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
+                );
+
+                rq.check_preempt_currnet(pcb, WakeupFlags::empty());
+
+                // sched_enqueue(pcb.clone(), true);
                 return Ok(());
             } else if state.is_exited() {
                 return Err(SystemError::EINVAL);
@@ -254,7 +269,18 @@ impl ProcessManager {
                 // avoid deadlock
                 drop(writer);
 
-                sched_enqueue(pcb.clone(), true);
+                let rq = cpu_rq(pcb.sched_info().on_cpu().unwrap().data() as usize);
+
+                let (rq, _guard) = rq.self_lock();
+                rq.update_rq_clock();
+                rq.activate_task(
+                    pcb,
+                    EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
+                );
+
+                rq.check_preempt_currnet(pcb, WakeupFlags::empty());
+
+                // sched_enqueue(pcb.clone(), true);
                 return Ok(());
             } else if state.is_runnable() {
                 return Ok(());
@@ -280,14 +306,14 @@ impl ProcessManager {
             !CurrentIrqArch::is_irq_enabled(),
             "interrupt must be disabled before enter ProcessManager::mark_sleep()"
         );
-
         let pcb = ProcessManager::current_pcb();
         let mut writer = pcb.sched_info().inner_lock_write_irqsave();
         if !matches!(writer.state(), ProcessState::Exited(_)) {
             writer.set_state(ProcessState::Blocked(interruptable));
+            writer.set_sleep();
             pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
+            fence(Ordering::SeqCst);
             drop(writer);
-
             return Ok(());
         }
         return Err(SystemError::EINTR);
@@ -351,13 +377,21 @@ impl ProcessManager {
     /// - `exit_code` : 进程的退出码
     pub fn exit(exit_code: usize) -> ! {
         // 关中断
-        unsafe { CurrentIrqArch::interrupt_disable() };
+        let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let pcb = ProcessManager::current_pcb();
         let pid = pcb.pid();
         pcb.sched_info
             .inner_lock_write_irqsave()
             .set_state(ProcessState::Exited(exit_code));
         pcb.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
+
+        let rq = cpu_rq(smp_get_processor_id().data() as usize);
+        let (rq, guard) = rq.self_lock();
+        rq.deactivate_task(
+            pcb.clone(),
+            DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
+        );
+        drop(guard);
 
         // 进行进程退出后的工作
         let thread = pcb.thread.write_irqsave();
@@ -373,6 +407,8 @@ impl ProcessManager {
             unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
         }
 
+        RobustListHead::exit_robust_list(pcb.clone());
+
         // 如果是vfork出来的进程，则需要处理completion
         if thread.vfork_done.is_some() {
             thread.vfork_done.as_ref().unwrap().complete_all();
@@ -381,9 +417,8 @@ impl ProcessManager {
         unsafe { pcb.basic_mut().set_user_vm(None) };
         drop(pcb);
         ProcessManager::exit_notify();
-        unsafe { CurrentIrqArch::interrupt_enable() };
-
-        sched();
+        // unsafe { CurrentIrqArch::interrupt_enable() };
+        __schedule(SchedMode::SM_NONE);
         kerror!("pid {pid:?} exited but sched again!");
         #[allow(clippy::empty_loop)]
         loop {
@@ -446,7 +481,7 @@ impl ProcessManager {
         let cpu_id = pcb.sched_info().on_cpu();
 
         if let Some(cpu_id) = cpu_id {
-            if pcb.pid() == CPU_EXECUTING.get(cpu_id) {
+            if pcb.pid() == cpu_rq(cpu_id.data() as usize).current().pid() {
                 kick_cpu(cpu_id).expect("ProcessManager::kick(): Failed to kick cpu");
             }
         }
@@ -462,7 +497,8 @@ pub unsafe extern "sysv64" fn switch_finish_hook() {
     ProcessManager::switch_finish_hook();
 }
 #[cfg(target_arch = "riscv64")]
-pub unsafe extern "C" fn switch_finish_hook() {
+#[inline(always)]
+pub unsafe fn switch_finish_hook() {
     ProcessManager::switch_finish_hook();
 }
 
@@ -597,6 +633,9 @@ pub struct ProcessControlBlock {
 
     /// 线程信息
     thread: RwLock<ThreadInfo>,
+
+    /// 进程的robust lock列表
+    robust_list: RwLock<Option<RobustListHead>>,
 }
 
 impl ProcessControlBlock {
@@ -662,6 +701,7 @@ impl ProcessControlBlock {
             children: RwLock::new(Vec::new()),
             wait_queue: WaitQueue::default(),
             thread: RwLock::new(ThreadInfo::new()),
+            robust_list: RwLock::new(None),
         };
 
         // 初始化系统调用栈
@@ -672,6 +712,10 @@ impl ProcessControlBlock {
 
         let pcb = Arc::new(pcb);
 
+        pcb.sched_info()
+            .sched_entity()
+            .force_mut()
+            .set_pcb(Arc::downgrade(&pcb));
         // 设置进程的arc指针到内核栈和系统调用栈的最低地址处
         unsafe {
             pcb.kernel_stack
@@ -822,11 +866,10 @@ impl ProcessControlBlock {
         let f = fd_table_guard.get_file_by_fd(fd)?;
         drop(fd_table_guard);
 
-        let guard = f.lock();
-        if guard.file_type() != FileType::Socket {
+        if f.file_type() != FileType::Socket {
             return None;
         }
-        let socket: Arc<SocketInode> = guard
+        let socket: Arc<SocketInode> = f
             .inode()
             .downcast_arc::<SocketInode>()
             .expect("Not a socket inode");
@@ -904,6 +947,16 @@ impl ProcessControlBlock {
 
     pub fn sig_struct_irqsave(&self) -> SpinLockGuard<SignalStruct> {
         self.sig_struct.lock_irqsave()
+    }
+
+    #[inline(always)]
+    pub fn get_robust_list(&self) -> RwLockReadGuard<Option<RobustListHead>> {
+        return self.robust_list.read_irqsave();
+    }
+
+    #[inline(always)]
+    pub fn set_robust_list(&self, new_robust_list: Option<RobustListHead>) {
+        *self.robust_list.write_irqsave() = new_robust_list;
     }
 }
 
@@ -1039,14 +1092,51 @@ pub struct ProcessSchedulerInfo {
     on_cpu: AtomicProcessorId,
     /// 如果当前进程等待被迁移到另一个cpu核心上（也就是flags中的PF_NEED_MIGRATE被置位），
     /// 该字段存储要被迁移到的目标处理器核心号
-    migrate_to: AtomicProcessorId,
+    // migrate_to: AtomicProcessorId,
     inner_locked: RwLock<InnerSchedInfo>,
     /// 进程的调度优先级
-    priority: SchedPriority,
+    // priority: SchedPriority,
     /// 当前进程的虚拟运行时间
-    virtual_runtime: AtomicIsize,
+    // virtual_runtime: AtomicIsize,
     /// 由实时调度器管理的时间片
-    rt_time_slice: AtomicIsize,
+    // rt_time_slice: AtomicIsize,
+    pub sched_stat: RwLock<SchedInfo>,
+    /// 调度策略
+    pub sched_policy: RwLock<crate::sched::SchedPolicy>,
+    /// cfs调度实体
+    pub sched_entity: Arc<FairSchedEntity>,
+    pub on_rq: SpinLock<OnRq>,
+
+    pub prio_data: RwLock<PrioData>,
+}
+
+#[derive(Debug, Default)]
+pub struct SchedInfo {
+    /// 记录任务在特定 CPU 上运行的次数
+    pub pcount: usize,
+    /// 记录任务等待在运行队列上的时间
+    pub run_delay: usize,
+    /// 记录任务上次在 CPU 上运行的时间戳
+    pub last_arrival: u64,
+    /// 记录任务上次被加入到运行队列中的时间戳
+    pub last_queued: u64,
+}
+
+#[derive(Debug)]
+pub struct PrioData {
+    pub prio: i32,
+    pub static_prio: i32,
+    pub normal_prio: i32,
+}
+
+impl Default for PrioData {
+    fn default() -> Self {
+        Self {
+            prio: MAX_PRIO - 20,
+            static_prio: MAX_PRIO - 20,
+            normal_prio: MAX_PRIO - 20,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1054,7 +1144,7 @@ pub struct InnerSchedInfo {
     /// 当前进程的状态
     state: ProcessState,
     /// 进程的调度策略
-    sched_policy: SchedPolicy,
+    sleep: bool,
 }
 
 impl InnerSchedInfo {
@@ -1066,8 +1156,16 @@ impl InnerSchedInfo {
         self.state = state;
     }
 
-    pub fn policy(&self) -> SchedPolicy {
-        return self.sched_policy;
+    pub fn set_sleep(&mut self) {
+        self.sleep = true;
+    }
+
+    pub fn set_wakeup(&mut self) {
+        self.sleep = false;
+    }
+
+    pub fn is_mark_sleep(&self) -> bool {
+        self.sleep
     }
 }
 
@@ -1077,15 +1175,24 @@ impl ProcessSchedulerInfo {
         let cpu_id = on_cpu.unwrap_or(ProcessorId::INVALID);
         return Self {
             on_cpu: AtomicProcessorId::new(cpu_id),
-            migrate_to: AtomicProcessorId::new(ProcessorId::INVALID),
+            // migrate_to: AtomicProcessorId::new(ProcessorId::INVALID),
             inner_locked: RwLock::new(InnerSchedInfo {
                 state: ProcessState::Blocked(false),
-                sched_policy: SchedPolicy::CFS,
+                sleep: false,
             }),
-            virtual_runtime: AtomicIsize::new(0),
-            rt_time_slice: AtomicIsize::new(0),
-            priority: SchedPriority::new(100).unwrap(),
+            // virtual_runtime: AtomicIsize::new(0),
+            // rt_time_slice: AtomicIsize::new(0),
+            // priority: SchedPriority::new(100).unwrap(),
+            sched_stat: RwLock::new(SchedInfo::default()),
+            sched_policy: RwLock::new(crate::sched::SchedPolicy::CFS),
+            sched_entity: FairSchedEntity::new(),
+            on_rq: SpinLock::new(OnRq::None),
+            prio_data: RwLock::new(PrioData::default()),
         };
+    }
+
+    pub fn sched_entity(&self) -> Arc<FairSchedEntity> {
+        return self.sched_entity.clone();
     }
 
     pub fn on_cpu(&self) -> Option<ProcessorId> {
@@ -1105,23 +1212,23 @@ impl ProcessSchedulerInfo {
         }
     }
 
-    pub fn migrate_to(&self) -> Option<ProcessorId> {
-        let migrate_to = self.migrate_to.load(Ordering::SeqCst);
-        if migrate_to == ProcessorId::INVALID {
-            return None;
-        } else {
-            return Some(migrate_to);
-        }
-    }
+    // pub fn migrate_to(&self) -> Option<ProcessorId> {
+    //     let migrate_to = self.migrate_to.load(Ordering::SeqCst);
+    //     if migrate_to == ProcessorId::INVALID {
+    //         return None;
+    //     } else {
+    //         return Some(migrate_to);
+    //     }
+    // }
 
-    pub fn set_migrate_to(&self, migrate_to: Option<ProcessorId>) {
-        if let Some(data) = migrate_to {
-            self.migrate_to.store(data, Ordering::SeqCst);
-        } else {
-            self.migrate_to
-                .store(ProcessorId::INVALID, Ordering::SeqCst)
-        }
-    }
+    // pub fn set_migrate_to(&self, migrate_to: Option<ProcessorId>) {
+    //     if let Some(data) = migrate_to {
+    //         self.migrate_to.store(data, Ordering::SeqCst);
+    //     } else {
+    //         self.migrate_to
+    //             .store(ProcessorId::INVALID, Ordering::SeqCst)
+    //     }
+    // }
 
     pub fn inner_lock_write_irqsave(&self) -> RwLockWriteGuard<InnerSchedInfo> {
         return self.inner_locked.write_irqsave();
@@ -1131,58 +1238,58 @@ impl ProcessSchedulerInfo {
         return self.inner_locked.read_irqsave();
     }
 
-    pub fn inner_lock_try_read_irqsave(
-        &self,
-        times: u8,
-    ) -> Option<RwLockReadGuard<InnerSchedInfo>> {
-        for _ in 0..times {
-            if let Some(r) = self.inner_locked.try_read_irqsave() {
-                return Some(r);
-            }
-        }
+    // pub fn inner_lock_try_read_irqsave(
+    //     &self,
+    //     times: u8,
+    // ) -> Option<RwLockReadGuard<InnerSchedInfo>> {
+    //     for _ in 0..times {
+    //         if let Some(r) = self.inner_locked.try_read_irqsave() {
+    //             return Some(r);
+    //         }
+    //     }
 
-        return None;
-    }
+    //     return None;
+    // }
 
-    pub fn inner_lock_try_upgradable_read_irqsave(
-        &self,
-        times: u8,
-    ) -> Option<RwLockUpgradableGuard<InnerSchedInfo>> {
-        for _ in 0..times {
-            if let Some(r) = self.inner_locked.try_upgradeable_read_irqsave() {
-                return Some(r);
-            }
-        }
+    // pub fn inner_lock_try_upgradable_read_irqsave(
+    //     &self,
+    //     times: u8,
+    // ) -> Option<RwLockUpgradableGuard<InnerSchedInfo>> {
+    //     for _ in 0..times {
+    //         if let Some(r) = self.inner_locked.try_upgradeable_read_irqsave() {
+    //             return Some(r);
+    //         }
+    //     }
 
-        return None;
-    }
+    //     return None;
+    // }
 
-    pub fn virtual_runtime(&self) -> isize {
-        return self.virtual_runtime.load(Ordering::SeqCst);
-    }
+    // pub fn virtual_runtime(&self) -> isize {
+    //     return self.virtual_runtime.load(Ordering::SeqCst);
+    // }
 
-    pub fn set_virtual_runtime(&self, virtual_runtime: isize) {
-        self.virtual_runtime
-            .store(virtual_runtime, Ordering::SeqCst);
-    }
-    pub fn increase_virtual_runtime(&self, delta: isize) {
-        self.virtual_runtime.fetch_add(delta, Ordering::SeqCst);
-    }
+    // pub fn set_virtual_runtime(&self, virtual_runtime: isize) {
+    //     self.virtual_runtime
+    //         .store(virtual_runtime, Ordering::SeqCst);
+    // }
+    // pub fn increase_virtual_runtime(&self, delta: isize) {
+    //     self.virtual_runtime.fetch_add(delta, Ordering::SeqCst);
+    // }
 
-    pub fn rt_time_slice(&self) -> isize {
-        return self.rt_time_slice.load(Ordering::SeqCst);
-    }
+    // pub fn rt_time_slice(&self) -> isize {
+    //     return self.rt_time_slice.load(Ordering::SeqCst);
+    // }
 
-    pub fn set_rt_time_slice(&self, rt_time_slice: isize) {
-        self.rt_time_slice.store(rt_time_slice, Ordering::SeqCst);
-    }
+    // pub fn set_rt_time_slice(&self, rt_time_slice: isize) {
+    //     self.rt_time_slice.store(rt_time_slice, Ordering::SeqCst);
+    // }
 
-    pub fn increase_rt_time_slice(&self, delta: isize) {
-        self.rt_time_slice.fetch_add(delta, Ordering::SeqCst);
-    }
+    // pub fn increase_rt_time_slice(&self, delta: isize) {
+    //     self.rt_time_slice.fetch_add(delta, Ordering::SeqCst);
+    // }
 
-    pub fn priority(&self) -> SchedPriority {
-        return self.priority;
+    pub fn policy(&self) -> crate::sched::SchedPolicy {
+        return *self.sched_policy.read_irqsave();
     }
 }
 

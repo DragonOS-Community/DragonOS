@@ -1,7 +1,7 @@
 use crate::{
     driver::{
         serial::serial8250::send_to_default_serial8250_port,
-        tty::{tty_port::TTY_PORTS, virtual_terminal::virtual_console::CURRENT_VCNUM},
+        tty::{tty_port::tty_port, virtual_terminal::virtual_console::CURRENT_VCNUM},
         video::video_refresh_manager,
     },
     kdebug, kinfo,
@@ -1046,8 +1046,8 @@ pub extern "C" fn rs_textui_putchar(character: u8, fr_color: u32, bk_color: u32)
             "\x1B[38;2;{fr};{fg};{fb};48;2;{br};{bg};{bb}m{}\x1B[0m",
             character as char
         );
-        let port = TTY_PORTS[current_vcnum as usize].clone();
-        let tty = port.port_data().tty();
+        let port = tty_port(current_vcnum as usize);
+        let tty = port.port_data().internal_tty();
         if let Some(tty) = tty {
             send_to_default_serial8250_port(&[character]);
             return tty

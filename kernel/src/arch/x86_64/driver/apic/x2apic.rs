@@ -1,3 +1,5 @@
+use core::sync::atomic::{fence, Ordering};
+
 use x86::msr::{
     rdmsr, wrmsr, IA32_APIC_BASE, IA32_X2APIC_APICID, IA32_X2APIC_EOI, IA32_X2APIC_SIVR,
     IA32_X2APIC_VERSION,
@@ -62,9 +64,12 @@ impl LocalAPIC for X2Apic {
 
     /// 发送 EOI (End Of Interrupt)
     fn send_eoi(&self) {
+        fence(Ordering::SeqCst);
         unsafe {
             wrmsr(IA32_X2APIC_EOI, 0);
         }
+
+        fence(Ordering::SeqCst);
     }
 
     /// 获取 x2APIC 版本

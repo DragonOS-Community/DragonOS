@@ -634,11 +634,6 @@ impl FileDescriptorVec {
     ///
     /// - `fd` 文件描述符序号
     pub fn drop_fd(&mut self, fd: i32) -> Result<(), SystemError> {
-        // 判断文件描述符的数字是否超过限制
-        if !FileDescriptorVec::validate_fd(fd) {
-            return Err(SystemError::EBADF);
-        }
-
         self.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
 
         // 把文件描述符数组对应位置设置为空

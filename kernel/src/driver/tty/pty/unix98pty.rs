@@ -3,7 +3,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::tty::{
-        termios::Termios,
+        termios::{ControlCharIndex, ControlMode, InputMode, LocalMode, Termios},
         tty_core::{TtyCore, TtyCoreData, TtyFlag, TtyIoctlCmd, TtyPacketStatus},
         tty_device::TtyFilePrivateData,
         tty_driver::{TtyDriver, TtyDriverPrivateData, TtyDriverSubType, TtyOperation},
@@ -76,7 +76,7 @@ impl TtyOperation for Unix98PtyDriverInner {
     fn ioctl(&self, tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<(), SystemError> {
         let core = tty.core();
         if core.driver().tty_driver_sub_type() != TtyDriverSubType::PtyMaster {
-            return Err(SystemError::ENOSYS);
+            return Err(SystemError::ENOIOCTLCMD);
         }
 
         match cmd {
@@ -104,12 +104,58 @@ impl TtyOperation for Unix98PtyDriverInner {
         }
     }
 
-    fn set_termios(&self, tty: Arc<TtyCore>, _old_termios: Termios) -> Result<(), SystemError> {
+    fn set_termios(&self, tty: Arc<TtyCore>, old_termios: Termios) -> Result<(), SystemError> {
         let core = tty.core();
         if core.driver().tty_driver_sub_type() != TtyDriverSubType::PtySlave {
             return Err(SystemError::ENOSYS);
         }
-        todo!()
+
+        let core = tty.core();
+        if let Some(link) = core.link() {
+            let link = link.core();
+            if link.contorl_info_irqsave().packet {
+                let curr_termios = *core.termios();
+                let extproc = old_termios.local_mode.contains(LocalMode::EXTPROC)
+                    | curr_termios.local_mode.contains(LocalMode::EXTPROC);
+
+                let old_flow = old_termios.input_mode.contains(InputMode::IXON)
+                    && old_termios.control_characters[ControlCharIndex::VSTOP] == 0o023
+                    && old_termios.control_characters[ControlCharIndex::VSTART] == 0o021;
+
+                let new_flow = curr_termios.input_mode.contains(InputMode::IXON)
+                    && curr_termios.control_characters[ControlCharIndex::VSTOP] == 0o023
+                    && curr_termios.control_characters[ControlCharIndex::VSTART] == 0o021;
+
+                if old_flow != new_flow || extproc {
+                    let mut ctrl = core.contorl_info_irqsave();
+                    if old_flow != new_flow {
+                        ctrl.pktstatus.remove(
+                            TtyPacketStatus::TIOCPKT_DOSTOP | TtyPacketStatus::TIOCPKT_NOSTOP,
+                        );
+
+                        if new_flow {
+                            ctrl.pktstatus.insert(TtyPacketStatus::TIOCPKT_DOSTOP);
+                        } else {
+                            ctrl.pktstatus.insert(TtyPacketStatus::TIOCPKT_NOSTOP);
+                        }
+                    }
+
+                    if extproc {
+                        ctrl.pktstatus.insert(TtyPacketStatus::TIOCPKT_IOCTL);
+                    }
+
+                    link.read_wq().wakeup_all();
+                }
+            }
+        }
+        let mut termois = core.termios_write();
+        termois
+            .control_mode
+            .remove(ControlMode::CSIZE | ControlMode::PARENB);
+        termois
+            .control_mode
+            .insert(ControlMode::CS8 | ControlMode::CREAD);
+        Ok(())
     }
 
     fn start(&self, core: &TtyCoreData) -> Result<(), SystemError> {
@@ -171,12 +217,30 @@ impl TtyOperation for Unix98PtyDriverInner {
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
         let driver = tty.core().driver();
 
-        driver.ttys().remove(&tty.core().index());
         if tty.core().driver().tty_driver_sub_type() == TtyDriverSubType::PtySlave {
+            driver.ttys().remove(&tty.core().index());
             let pts_root_inode =
                 ROOT_INODE().lookup_follow_symlink("/dev/pts", VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
             let _ = pts_root_inode.unlink(&tty.core().index().to_string());
         }
+
+        Ok(())
+    }
+
+    fn resize(
+        &self,
+        tty: Arc<TtyCore>,
+        winsize: crate::driver::tty::termios::WindowSize,
+    ) -> Result<(), SystemError> {
+        let core = tty.core();
+        if *core.window_size() == winsize {
+            return Ok(());
+        }
+
+        // TODO：向进程发送SIGWINCH信号
+
+        *core.window_size_write() = winsize;
+        *core.link().unwrap().core().window_size_write() = winsize;
 
         Ok(())
     }

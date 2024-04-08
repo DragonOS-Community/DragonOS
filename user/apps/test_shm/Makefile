@@ -6,18 +6,20 @@ endif
 
 CC=$(CROSS_COMPILE)gcc
 
+NAME_PREFIX=test_shm_
+
 all: sender.c receiver.c test_info.c
-	$(CC) -static -o sender sender.c
-	$(CC) -static -o receiver receiver.c
-	$(CC) -static -o info test_info.c
+	$(CC) -static -o $(NAME_PREFIX)sender sender.c
+	$(CC) -static -o $(NAME_PREFIX)receiver receiver.c
+	$(CC) -static -o $(NAME_PREFIX)info test_info.c
 
 .PHONY: install clean
 install: all
-	mv sender $(DADK_CURRENT_BUILD_DIR)/sender
-	mv receiver $(DADK_CURRENT_BUILD_DIR)/receiver
-	mv info $(DADK_CURRENT_BUILD_DIR)/info
+	mv $(NAME_PREFIX)sender $(DADK_CURRENT_BUILD_DIR)/
+	mv $(NAME_PREFIX)receiver $(DADK_CURRENT_BUILD_DIR)/
+	mv $(NAME_PREFIX)info $(DADK_CURRENT_BUILD_DIR)/
 
 clean:
-	rm receiver sender info *.o
+	rm $(NAME_PREFIX)receiver $(NAME_PREFIX)sender $(NAME_PREFIX)info *.o
 
 fmt:

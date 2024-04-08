@@ -324,7 +324,7 @@ impl ShmManager {
             // 设置共享内存物理页当映射计数等于0时可被回收
             for _ in 0..count.data() {
                 let page = page_manager_guard.get_mut(&cur_phys.phys_address());
-                page.set_dealloc_in_zero(true);
+                page.set_dealloc_when_zero(true);
 
                 cur_phys = cur_phys.next();
             }

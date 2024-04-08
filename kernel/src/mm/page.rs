@@ -95,11 +95,11 @@ pub struct Page {
 
 impl Page {
     pub fn new(shared: bool) -> Self {
-        let dealloc_in_zero = !shared;
+        let dealloc_when_zero = !shared;
         Self {
             map_count: 0,
             shared,
-            free_when_zero: dealloc_in_zero,
+            free_when_zero: dealloc_when_zero,
             shm_id: None,
             anon_vma: HashSet::new(),
         }
@@ -134,8 +134,8 @@ impl Page {
         self.shm_id = Some(shm_id);
     }
 
-    pub fn set_dealloc_in_zero(&mut self, dealloc_in_zero: bool) {
-        self.free_when_zero = dealloc_in_zero;
+    pub fn set_dealloc_when_zero(&mut self, dealloc_when_zero: bool) {
+        self.free_when_zero = dealloc_when_zero;
     }
 
     pub fn anon_vma(&self) -> &HashSet<Arc<LockedVMA>> {

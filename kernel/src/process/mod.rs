@@ -491,7 +491,7 @@ impl ProcessManager {
 
     //获取目标进程的可变闹钟定时器
      //返回闹钟定时器
-     pub fn ref_alarm_timer() -> Arc<Mutex<Option<AlarmTimer>>>{
+     pub fn ref_alarm_timer() -> Arc<AlarmTimer>{
         let current_pcb = ProcessManager::current_pcb();
         let alarm_timer = current_pcb.alarm_timer.clone();
         alarm_timer
@@ -642,7 +642,7 @@ pub struct ProcessControlBlock {
     thread: RwLock<ThreadInfo>,
 
     ///闹钟定时器
-    alarm_timer: Arc<Mutex<Option<AlarmTimer>>>,
+    alarm_timer: Arc<AlarmTimer>,
 }
 
 impl ProcessControlBlock {
@@ -709,7 +709,7 @@ impl ProcessControlBlock {
             children: RwLock::new(Vec::new()),
             wait_queue: WaitQueue::default(),
             thread: RwLock::new(ThreadInfo::new()),
-            alarm_timer: Arc::new(Mutex::new(None)),
+            alarm_timer: timer::alarm_timer_init(pid, 0),
         };
 
         // 初始化系统调用栈

@@ -8,54 +8,60 @@ use crate::ipc::signal_types::SigType;
 use crate::time::timer::{clock, timer_jiffies_n_s, InnerTimer, Timer, TimerFunction};
 use crate::libs::spinlock::SpinLockGuard;
 use crate::process::Pid;
+use core::result;
 use core::sync::atomic::compiler_fence;
 use crate::libs::mutex::Mutex;
 use crate::process::SigInfo;
 
 use super::ProcessManager;
-#[derive(Debug,Clone)]
+#[derive(Debug)]
 pub struct AlarmTimer{
-    timer: Arc<Timer>,
+    timer: Mutex<Arc<Timer>>,
     expired_time: u64,
 }
 
 impl AlarmTimer {
-    pub fn new(timer_func: Box<dyn TimerFunction>, expire_time: u64) -> Mutex<Option<Self>>{
-        let result: Mutex<Option<Self>> = Mutex::new(Some(AlarmTimer{
-            timer: Timer::new(timer_func, expire_time),
+    pub fn new(timer_func: Box<dyn TimerFunction>, expire_time: u64) -> Self{
+        let result = AlarmTimer{
+            timer: Mutex::new(Timer::new(timer_func, expire_time)),
             expired_time:  expire_time,
-        }));
+        };
         result
     }
 
-    pub fn inner(&self) -> SpinLockGuard<InnerTimer> {
-        return self.timer.inner();
-    }
-
-    pub fn activate(&self) {
-        self.timer.activate();
-    }
 
     pub fn timeout(&self) -> bool {
-        return self.timer.timeout();
+        return self.timer.lock().timeout();
     }
 
     //返回闹钟定时器剩余时间（单位是jiffies）
     pub fn remain(&self) -> u64{
-        if self.timeout() || self.inner().expire_jiffies == 0{
+        if self.timeout() {
             0
         }
         else {
             let now_time = clock();
-            let end_time = self.expired_time;
+            let end_time = self.timer.lock().inner().expire_jiffies;
             let remain_jiffies = end_time - now_time;
+            println!("remian_jiffies: {}", remain_jiffies);
             let second = timer_jiffies_n_s(remain_jiffies);
+            println!("remian_second: {}", second);
             second
         }
     }
 
     pub fn cancel(&self) {
-        self.timer.cancel();
+        self.timer.lock().cancel();
+    }
+
+    pub fn restart(&self, new_expire_jiffies: u64) {
+        let pid = ProcessManager::current_pid();
+        let timerfunc = AlarmTimerFunc::new(pid);
+        let new_timer = Timer::new(timerfunc, new_expire_jiffies);
+        new_timer.activate();
+        let mut timer = self.timer.lock();
+        *timer = new_timer;
+        drop(timer);
     }
 
 }
@@ -91,23 +97,10 @@ impl TimerFunction for AlarmTimerFunc {
 }
 
 //初始化目标进程的alarm定时器
-pub fn alarm_timer_init(pid: Pid, time_out: u64) {
+pub fn alarm_timer_init(pid: Pid, expire_jiffies: u64) -> Arc<AlarmTimer> {
     //初始化Timerfunc
     let timerfunc = AlarmTimerFunc::new(pid);
-    let result = AlarmTimer::new(timerfunc, time_out);
-    let alarm = result.lock();
-    let timer = alarm.as_ref();
-    match timer {
-        Some(timer) => {
-            timer.activate();
-            //把alarm存放到pcb中
-            let pcb_alarm = ProcessManager::ref_alarm_timer();
-            let mut pcb_alarm_guard = pcb_alarm.lock();
-            *pcb_alarm_guard = Some(timer.clone());
-            drop(pcb_alarm_guard);
-        }
-        None => {
-            println!("alarm init wrong");
-        }
-    }
+    let alarmtimer = AlarmTimer::new(timerfunc, expire_jiffies);
+    let result = Arc::new(alarmtimer);
+    result
 }

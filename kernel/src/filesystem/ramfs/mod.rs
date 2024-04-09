@@ -24,7 +24,6 @@ use crate::{
 
 use super::vfs::{
     core::generate_inode_id,
-    dcache::{DCache, DefaultDCache},
     file::FilePrivateData,
     syscall::ModeType,
     FileSystem, FileSystemMaker, FileType, FsInfo, IndexNode, Magic, Metadata, SpecialNodeData,
@@ -39,7 +38,6 @@ const RAMFS_BLOCK_SIZE: u64 = 512;
 #[derive(Debug)]
 pub struct RamFS {
     root: Arc<LockedRamfsEntry>,
-    cache: Arc<DefaultDCache>,
     super_block: RwLock<SuperBlock>,
 }
 
@@ -59,7 +57,6 @@ impl RamFS {
         })));
         let ret = Arc::new(RamFS {
             root,
-            cache: Arc::new(DefaultDCache::new(None)),
             super_block: RwLock::new(SuperBlock::new(
                 Magic::RAMFS_MAGIC,
                 RAMFS_BLOCK_SIZE,
@@ -107,10 +104,6 @@ impl FileSystem for RamFS {
 
     fn name(&self) -> &str {
         "ramfs"
-    }
-
-    fn dcache(&self) -> Result<Arc<DefaultDCache>, SystemError> {
-        Ok(self.cache.clone())
     }
 
     fn super_block(&self) -> SuperBlock {
@@ -652,15 +645,8 @@ impl IndexNode for LockedRamfsEntry {
         self.0.lock().special_node.clone()
     }
 
-    fn key(&self) -> Result<String, SystemError> {
+    fn entry_name(&self) -> Result<String, SystemError> {
         Ok(self.0.lock().name.clone())
-    }
-
-    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        match self.0.lock().parent.upgrade() {
-            Some(pptr) => Ok(pptr.clone()),
-            None => Err(SystemError::ENOENT),
-        }
     }
 
     /// # 用于重命名内存中的文件或目录

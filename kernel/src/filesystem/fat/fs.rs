@@ -15,7 +15,6 @@ use crate::{
     },
     filesystem::vfs::{
         core::generate_inode_id,
-        dcache::{DCache, DefaultDCache},
         file::{FileMode, FilePrivateData},
         syscall::ModeType,
         FileSystem, FileType, IndexNode, InodeId, Magic, Metadata, SpecialNodeData, SuperBlock,
@@ -76,8 +75,6 @@ pub struct FATFileSystem {
     pub fs_info: Arc<LockedFATFsInfo>,
     /// 文件系统的根inode
     root_inode: Arc<LockedFATInode>,
-    /// 文件系统目录索引缓存
-    index_cache: Arc<DefaultDCache>,
 }
 
 /// FAT文件系统的Inode
@@ -268,10 +265,6 @@ impl FileSystem for FATFileSystem {
             FAT_MAX_NAMELEN,
         )
     }
-
-    fn dcache(&self) -> Result<Arc<DefaultDCache>, SystemError> {
-        Ok(self.index_cache.clone())
-    }
 }
 
 impl FATFileSystem {
@@ -356,7 +349,6 @@ impl FATFileSystem {
             first_data_sector,
             fs_info: Arc::new(LockedFATFsInfo::new(fs_info)),
             root_inode,
-            index_cache: Arc::new(DefaultDCache::new(None)),
         });
 
         // 对root inode加锁，并继续完成初始化工作
@@ -1823,12 +1815,8 @@ impl IndexNode for LockedFATInode {
         self.0.lock().special_node.clone()
     }
 
-    fn key(&self) -> Result<String, SystemError> {
+    fn entry_name(&self) -> Result<String, SystemError> {
         self.0.lock().key()
-    }
-
-    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        Ok(self.0.lock().parent.upgrade().ok_or(SystemError::ENOENT)?)
     }
 }
 

@@ -1,5 +1,4 @@
 pub mod core;
-pub mod dcache;
 pub mod fcntl;
 pub mod file;
 pub mod mount;
@@ -27,14 +26,13 @@ use crate::{
 
 use self::{
     core::generate_inode_id,
-    dcache::{DCache, DefaultDCache},
     file::FileMode,
     syscall::ModeType,
 };
 pub use self::{
     core::ROOT_INODE,
     file::FilePrivateData,
-    mount::{utils::MountList, MountFS},
+    mount::{utils::MountList, MountFS, dcache::DCache},
 };
 
 /// vfs容许的最大的路径名称长度
@@ -430,18 +428,16 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         None
     }
 
-    /// 获取目录名
-    fn key(&self) -> Result<String, SystemError> {
-        return Err(SystemError::ENOSYS);
-    }
-
-    /// 获取父目录
-    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return Err(SystemError::ENOSYS);
-    }
-
-    /// 通过MountFS获取绝对路径，仅应由MountFS实现
+    /// 获取绝对路径，由MountFS实现
     fn abs_path(&self) -> Result<PathBuf, SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
+
+    /// 获取目录名
+    /// 
+    /// 应由持久化储存的文件系统实现，以下文件系统应实现
+    /// - fat
+    fn entry_name(&self) -> Result<String, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 }
@@ -494,39 +490,32 @@ impl dyn IndexNode {
 
         // 检查根目录缓存
         if let Some((root_path, path_under, fs)) = MountList::get(&abs_path) {
-            let root_inode = fs.mountpoint_root_inode().find(".")?;
-
-            if let Ok(fscache) = fs.dcache() {
-                if path_under.iter().next().is_none() {
-                    return Ok(root_inode);
-                }
-
-                // Cache record is found
-                if let Some((inode, found_path)) = fscache.quick_lookup(&abs_path, &root_path) {
-                    if let Ok(rest_path) = abs_path.strip_prefix(found_path) {
-                        // no path rest
-                        if rest_path.iter().next().is_none() {
-                            return Ok(inode);
-                        }
-                        // path rest
-                        return inode.lookup_walk(rest_path, max_follow_times);
-                    } else {
-                        kwarn!("Unexpected here");
-                    }
-                }
-
-                // Cache record not found
-                return root_inode.lookup_walk(&path_under, max_follow_times);
+            let root_inode = fs.mountpoint_root_inode();
+            
+            if path_under.iter().next().is_none() {
+                return Ok(root_inode);
             }
 
-            // 在对应文件系统根开始lookup
-            return fs
-                .root_inode()
-                ._lookup_follow_symlink(path.as_os_str(), max_follow_times);
+            // Cache record is found
+            if let Some((inode, found_path)) = fs.dcache.quick_lookup(&abs_path, &root_path) {
+                if let Ok(rest_path) = abs_path.strip_prefix(found_path) {
+                    // no path rest
+                    if rest_path.iter().next().is_none() {
+                        return Ok(inode);
+                    }
+                    // path rest
+                    return inode.lookup_walk(rest_path, max_follow_times);
+                } else {
+                    kwarn!("Unexpected here");
+                }
+            }
+
+            // Cache record not found
+            return root_inode.lookup_walk(&path_under, max_follow_times);
         }
 
         // Exception Normal lookup, for non-cache fs
-        kwarn!("Shouldn't be here.");
+        kwarn!("Error search to end of lookup follow symlink");
         return self._lookup_follow_symlink(path.as_os_str(), max_follow_times);
     }
 
@@ -613,70 +602,6 @@ impl dyn IndexNode {
         }
 
         Ok(result)
-    }
-
-    /// 退化到文件系统中递归查找文件, 并将找到的目录项缓存到dcache中, 返回找到的节点
-    ///
-    /// - rest_path: 剩余路径
-    /// - max_follow_times: 最大跟随次数
-    /// ## Err
-    /// - SystemError::ENOENT: 未找到
-    fn lookup_walk(
-        &self,
-        rest_path: &Path,
-        max_follow_times: usize,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        // kdebug!("walking though {:?}", rest_path);
-        if self.metadata()?.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-        let child = rest_path.iter().next().unwrap();
-        // kdebug!("Lookup {:?}", child);
-        match self.find(child) {
-            Ok(child_node) => {
-                if child_node.metadata()?.file_type == FileType::SymLink && max_follow_times > 0 {
-                    // symlink wrapping problem
-                    return ROOT_INODE().lookup_follow_symlink(
-                        child_node.convert_symlink()?.join(rest_path),
-                        max_follow_times - 1,
-                    );
-                }
-
-                // 潜在优化可能：重复的文件系统缓存获取
-                if let Ok(cache) = self.fs().dcache() {
-                    // kdebug!("Calling cache put with child {}", child);
-                    cache.put(child, child_node.clone());
-                }
-
-                if let Ok(rest) = rest_path.strip_prefix(child) {
-                    if rest.iter().next().is_some() {
-                        // kdebug!("Rest {:?}", rest);
-                        return child_node.lookup_walk(rest, max_follow_times);
-                    }
-                }
-                // kdebug!("return node {:?}", child_node);
-
-                return Ok(child_node);
-            }
-            Err(e) => {
-                return Err(e);
-            }
-        }
-    }
-
-    /// 将符号链接转换为路径
-    fn convert_symlink(&self) -> Result<PathBuf, SystemError> {
-        let mut content = [0u8; 256];
-        let len = self.read_at(
-            0,
-            256,
-            &mut content,
-            SpinLock::new(FilePrivateData::Unused).lock(),
-        )?;
-
-        return Ok(PathBuf::from(
-            ::core::str::from_utf8(&content[..len]).map_err(|_| SystemError::ENOTDIR)?,
-        ));
     }
 }
 
@@ -806,7 +731,7 @@ bitflags! {
 }
 
 /// @brief 所有文件系统都应该实现的trait
-pub trait FileSystem<T: DCache = DefaultDCache>: Any + Sync + Send + Debug {
+pub trait FileSystem: Any + Sync + Send + Debug {
     /// @brief 获取当前（self所指）文件系统的root inode的指针，默认为MountFS
     fn root_inode(&self) -> Arc<dyn IndexNode>;
 
@@ -820,12 +745,6 @@ pub trait FileSystem<T: DCache = DefaultDCache>: Any + Sync + Send + Debug {
     fn name(&self) -> &str;
 
     fn super_block(&self) -> SuperBlock;
-
-    /// 获取目录项缓存
-    fn dcache(&self) -> Result<Arc<T>, SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::ENOSYS);
-    }
 }
 
 impl DowncastArc for dyn FileSystem {

@@ -272,7 +272,7 @@ impl IndexNode for TtyDevice {
     }
 
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
-        todo!()
+        self.fs.read().upgrade().unwrap()
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {

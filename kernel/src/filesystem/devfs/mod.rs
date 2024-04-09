@@ -353,31 +353,30 @@ impl LockedDevFSInode {
         }
 
         // 创建inode
-        let result: Arc<LockedDevFSInode> = Arc::new(LockedDevFSInode(SpinLock::new(DevFSInode {
-            parent: guard.self_ref.clone(),
-            self_ref: Weak::default(),
-            children: BTreeMap::new(),
-            metadata: Metadata {
-                dev_id: 0,
-                inode_id: generate_inode_id(),
-                size: 0,
-                blk_size: 0,
-                blocks: 0,
-                atime: PosixTimeSpec::default(),
-                mtime: PosixTimeSpec::default(),
-                ctime: PosixTimeSpec::default(),
-                file_type,
-                mode,
-                nlinks: 1,
-                uid: 0,
-                gid: 0,
-                raw_dev: DeviceNumber::from(data as u32),
-            },
-            fs: guard.fs.clone(),
-        })));
-
-        // 初始化inode的自引用的weak指针
-        result.0.lock().self_ref = Arc::downgrade(&result);
+        let result: Arc<LockedDevFSInode> = Arc::new_cyclic(
+            |self_ref| LockedDevFSInode(SpinLock::new(DevFSInode {
+                parent: guard.self_ref.clone(),
+                self_ref: self_ref.clone(),
+                children: BTreeMap::new(),
+                metadata: Metadata {
+                    dev_id: 0,
+                    inode_id: generate_inode_id(),
+                    size: 0,
+                    blk_size: 0,
+                    blocks: 0,
+                    atime: PosixTimeSpec::default(),
+                    mtime: PosixTimeSpec::default(),
+                    ctime: PosixTimeSpec::default(),
+                    file_type,
+                    mode,
+                    nlinks: 1,
+                    uid: 0,
+                    gid: 0,
+                    raw_dev: DeviceNumber::from(data as u32),
+                },
+                fs: guard.fs.clone(),
+            }
+        )));
 
         // 将子inode插入父inode的B树中
         guard.children.insert(String::from(name), result.clone());

@@ -1,11 +1,13 @@
+use core::{any::Any, cmp::{Ord, Ordering}, fmt::Debug, hash::Hash};
 use alloc::{
     string::{String, ToString},
     sync::Arc,
 };
+use intertrait::CastFromSync;
 use path_base::{Path, PathBuf};
 use system_error::SystemError;
 
-use crate::process::ProcessControlBlock;
+use crate::{libs::casting::DowncastArc, process::ProcessControlBlock};
 
 use super::{fcntl::AtFlags, FileType, IndexNode, ROOT_INODE};
 
@@ -103,4 +105,49 @@ pub fn clean_path(path: &str) -> String {
         }
     }
     clean
+}
+
+pub trait Keyable: Any + Sync + Send + Debug {
+    fn key(&self) -> Arc<String>;
+}
+
+#[derive(Debug)]
+pub enum Key< T: Keyable> {
+    Inner(T),
+    Cmp(Arc<String>),
+}
+
+impl<T: Keyable> Key<T> {
+    pub fn unwrap(&self) -> Arc<String> {
+        match self {
+            Key::Inner(k) => k.key(),
+            Key::Cmp(k) => k.clone(),
+        }
+    }
+}
+
+impl<T: Keyable> Hash for Key<T> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.unwrap().hash(state)
+    }
+}
+
+impl<T: Keyable> PartialEq for Key<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.unwrap() == other.unwrap()
+    }
+}
+
+impl<T: Keyable> Eq for Key<T> {}
+
+impl<T: Keyable> PartialOrd for Key<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T: Keyable> Ord for Key<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.unwrap().cmp(&other.unwrap())
+    }
 }

@@ -1,0 +1,6 @@
+- lru
+- mountfsinode => dentry
+- 内存泄露问题
+- move to
+- rename
+- mount and unmount

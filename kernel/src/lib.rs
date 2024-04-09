@@ -23,6 +23,7 @@
 #![feature(slice_ptr_get)]
 #![feature(vec_into_raw_parts)]
 #![feature(linked_list_cursors)]
+#![feature(get_mut_unchecked)]
 #![cfg_attr(target_os = "none", no_std)]
 // clippy的配置
 #![deny(clippy::all)]

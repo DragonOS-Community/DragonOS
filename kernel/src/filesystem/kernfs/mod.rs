@@ -386,15 +386,6 @@ impl IndexNode for KernFSInode {
         // 待实现
         Err(SystemError::ENOSYS)
     }
-
-    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        Ok(self
-            .inner
-            .read()
-            .parent
-            .upgrade()
-            .ok_or(SystemError::ENOENT)?)
-    }
 }
 
 impl KernFSInode {

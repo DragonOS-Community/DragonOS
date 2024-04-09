@@ -466,8 +466,13 @@ impl ProcessManager {
             .expect("next_pcb is None");
 
         // 由于进程切换前使用了SpinLockGuard::leak()，所以这里需要手动释放锁
+        fence(Ordering::SeqCst);
+
         prev_pcb.arch_info.force_unlock();
+        fence(Ordering::SeqCst);
+
         next_pcb.arch_info.force_unlock();
+        fence(Ordering::SeqCst);
     }
 
     /// 如果目标进程正在目标CPU上运行，那么就让这个cpu陷入内核态
@@ -816,6 +821,10 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn kernel_stack(&self) -> RwLockReadGuard<KernelStack> {
         return self.kernel_stack.read();
+    }
+
+    pub unsafe fn kernel_stack_force_ref(&self) -> &KernelStack {
+        self.kernel_stack.force_get_ref()
     }
 
     #[inline(always)]

@@ -1,19 +1,29 @@
 use system_error::SystemError;
 
-use crate::{mm::VirtAddr, syscall::Syscall, time::TimeSpec};
+use crate::{
+    mm::{verify_area, VirtAddr},
+    syscall::Syscall,
+    time::PosixTimeSpec,
+};
 
-use super::{constant::*, futex::Futex};
+use super::{
+    constant::*,
+    futex::{Futex, RobustListHead},
+};
 
 impl Syscall {
     pub fn do_futex(
         uaddr: VirtAddr,
         operation: FutexFlag,
         val: u32,
-        timeout: Option<TimeSpec>,
+        timeout: Option<PosixTimeSpec>,
         uaddr2: VirtAddr,
         val2: u32,
         val3: u32,
     ) -> Result<usize, SystemError> {
+        verify_area(uaddr, core::mem::size_of::<u32>())?;
+        verify_area(uaddr2, core::mem::size_of::<u32>())?;
+
         let cmd = FutexArg::from_bits(operation.bits() & FutexFlag::FUTEX_CMD_MASK.bits())
             .ok_or(SystemError::ENOSYS)?;
 
@@ -100,5 +110,26 @@ impl Syscall {
                 return Err(SystemError::ENOSYS);
             }
         }
+    }
+
+    pub fn set_robust_list(head_uaddr: VirtAddr, len: usize) -> Result<usize, SystemError> {
+        //判断用户空间地址的合法性
+        verify_area(head_uaddr, core::mem::size_of::<u32>())?;
+
+        let ret = RobustListHead::set_robust_list(head_uaddr, len);
+        return ret;
+    }
+
+    pub fn get_robust_list(
+        pid: usize,
+        head_uaddr: VirtAddr,
+        len_ptr_uaddr: VirtAddr,
+    ) -> Result<usize, SystemError> {
+        //判断用户空间地址的合法性
+        verify_area(head_uaddr, core::mem::size_of::<u32>())?;
+        verify_area(len_ptr_uaddr, core::mem::size_of::<u32>())?;
+
+        let ret = RobustListHead::get_robust_list(pid, head_uaddr, len_ptr_uaddr);
+        return ret;
     }
 }

@@ -16,6 +16,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{
+        cpu::current_cpu_id,
         ipc::signal::{AtomicSignal, SigSet, Signal},
         process::ArchPCBInfo,
         CurrentIrqArch,
@@ -33,7 +34,7 @@ use crate::{
         casting::DowncastArc,
         futex::{
             constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
-            futex::Futex,
+            futex::{Futex, RobustListHead},
         },
         lock_free_flags::LockFreeFlags,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -232,7 +233,8 @@ impl ProcessManager {
                 // avoid deadlock
                 drop(writer);
 
-                let rq = cpu_rq(pcb.sched_info().on_cpu().unwrap().data() as usize);
+                let rq =
+                    cpu_rq(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize);
 
                 let (rq, _guard) = rq.self_lock();
                 rq.update_rq_clock();
@@ -407,6 +409,8 @@ impl ProcessManager {
             unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
         }
 
+        RobustListHead::exit_robust_list(pcb.clone());
+
         // 如果是vfork出来的进程，则需要处理completion
         if thread.vfork_done.is_some() {
             thread.vfork_done.as_ref().unwrap().complete_all();
@@ -503,7 +507,8 @@ pub unsafe extern "sysv64" fn switch_finish_hook() {
     ProcessManager::switch_finish_hook();
 }
 #[cfg(target_arch = "riscv64")]
-pub unsafe extern "C" fn switch_finish_hook() {
+#[inline(always)]
+pub unsafe fn switch_finish_hook() {
     ProcessManager::switch_finish_hook();
 }
 
@@ -641,6 +646,9 @@ pub struct ProcessControlBlock {
 
     ///闹钟定时器
     alarm_timer: Arc<AlarmTimer>,
+  
+    /// 进程的robust lock列表
+    robust_list: RwLock<Option<RobustListHead>>,
 }
 
 impl ProcessControlBlock {
@@ -707,6 +715,7 @@ impl ProcessControlBlock {
             wait_queue: WaitQueue::default(),
             thread: RwLock::new(ThreadInfo::new()),
             alarm_timer: timer::alarm_timer_init(pid, 0),
+            robust_list: RwLock::new(None),
         };
 
         // 初始化系统调用栈
@@ -952,6 +961,16 @@ impl ProcessControlBlock {
 
     pub fn sig_struct_irqsave(&self) -> SpinLockGuard<SignalStruct> {
         self.sig_struct.lock_irqsave()
+    }
+
+    #[inline(always)]
+    pub fn get_robust_list(&self) -> RwLockReadGuard<Option<RobustListHead>> {
+        return self.robust_list.read_irqsave();
+    }
+
+    #[inline(always)]
+    pub fn set_robust_list(&self, new_robust_list: Option<RobustListHead>) {
+        *self.robust_list.write_irqsave() = new_robust_list;
     }
 }
 

@@ -10,7 +10,7 @@ use crate::{
     time::{
         jiffies::{clocksource_default_clock, jiffies_init},
         timekeep::ktime_get_real_ns,
-        TimeSpec,
+        PosixTimeSpec,
     },
 };
 
@@ -64,10 +64,10 @@ pub struct TimekeeperData {
     ntp_error_shift: i32,
     /// NTP调整时钟乘法器
     mult: u32,
-    raw_time: TimeSpec,
-    wall_to_monotonic: TimeSpec,
-    total_sleep_time: TimeSpec,
-    xtime: TimeSpec,
+    raw_time: PosixTimeSpec,
+    wall_to_monotonic: PosixTimeSpec,
+    total_sleep_time: PosixTimeSpec,
+    xtime: PosixTimeSpec,
 }
 impl TimekeeperData {
     pub fn new() -> Self {
@@ -82,19 +82,19 @@ impl TimekeeperData {
             ntp_error: Default::default(),
             ntp_error_shift: Default::default(),
             mult: Default::default(),
-            xtime: TimeSpec {
+            xtime: PosixTimeSpec {
                 tv_nsec: 0,
                 tv_sec: 0,
             },
-            wall_to_monotonic: TimeSpec {
+            wall_to_monotonic: PosixTimeSpec {
                 tv_nsec: 0,
                 tv_sec: 0,
             },
-            total_sleep_time: TimeSpec {
+            total_sleep_time: PosixTimeSpec {
                 tv_nsec: 0,
                 tv_sec: 0,
             },
-            raw_time: TimeSpec {
+            raw_time: PosixTimeSpec {
                 tv_nsec: 0,
                 tv_sec: 0,
             },
@@ -192,11 +192,11 @@ pub fn timekeeper_init() {
 /// ## 返回值
 ///
 /// * 'TimeSpec' - 时间戳
-pub fn getnstimeofday() -> TimeSpec {
+pub fn getnstimeofday() -> PosixTimeSpec {
     // kdebug!("enter getnstimeofday");
 
     let nsecs;
-    let mut xtime: TimeSpec;
+    let mut xtime: PosixTimeSpec;
     loop {
         match timekeeper().inner.try_read_irqsave() {
             None => continue,
@@ -238,7 +238,7 @@ pub fn do_gettimeofday() -> PosixTimeval {
     };
 }
 
-pub fn do_settimeofday64(time: TimeSpec) -> Result<(), SystemError> {
+pub fn do_settimeofday64(time: PosixTimeSpec) -> Result<(), SystemError> {
     timekeeper().inner.write_irqsave().xtime = time;
     // todo: 模仿linux，实现时间误差校准。
     // https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/time/timekeeping.c?fi=do_settimeofday64#1312

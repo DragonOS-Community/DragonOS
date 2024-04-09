@@ -8,6 +8,7 @@ use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::syscall::{PosixStatfs, PosixStatx},
+    ipc::shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::syscall::MremapFlags,
     net::syscall::MsgHdr,
@@ -39,7 +40,7 @@ use crate::{
     process::{fork::CloneFlags, syscall::PosixOldUtsName, Pid},
     time::{
         syscall::{PosixTimeZone, PosixTimeval},
-        TimeSpec,
+        PosixTimeSpec,
     },
 };
 
@@ -297,13 +298,13 @@ impl Syscall {
             }
 
             SYS_NANOSLEEP => {
-                let req = args[0] as *const TimeSpec;
-                let rem = args[1] as *mut TimeSpec;
+                let req = args[0] as *const PosixTimeSpec;
+                let rem = args[1] as *mut PosixTimeSpec;
                 let virt_req = VirtAddr::new(req as usize);
                 let virt_rem = VirtAddr::new(rem as usize);
                 if frame.is_from_user()
-                    && (verify_area(virt_req, core::mem::size_of::<TimeSpec>()).is_err()
-                        || verify_area(virt_rem, core::mem::size_of::<TimeSpec>()).is_err())
+                    && (verify_area(virt_req, core::mem::size_of::<PosixTimeSpec>()).is_err()
+                        || verify_area(virt_rem, core::mem::size_of::<PosixTimeSpec>()).is_err())
                 {
                     Err(SystemError::EFAULT)
                 } else {
@@ -690,21 +691,38 @@ impl Syscall {
                 let uaddr2 = VirtAddr::new(args[4]);
                 let val3 = args[5] as u32;
 
-                verify_area(uaddr, core::mem::size_of::<u32>())?;
-                verify_area(uaddr2, core::mem::size_of::<u32>())?;
-
                 let mut timespec = None;
                 if utime != 0 && operation.contains(FutexFlag::FLAGS_HAS_TIMEOUT) {
                     let reader = UserBufferReader::new(
-                        utime as *const TimeSpec,
-                        core::mem::size_of::<TimeSpec>(),
+                        utime as *const PosixTimeSpec,
+                        core::mem::size_of::<PosixTimeSpec>(),
                         true,
                     )?;
 
-                    timespec = Some(*reader.read_one_from_user::<TimeSpec>(0)?);
+                    timespec = Some(*reader.read_one_from_user::<PosixTimeSpec>(0)?);
                 }
 
                 Self::do_futex(uaddr, operation, val, timespec, uaddr2, utime as u32, val3)
+            }
+
+            SYS_SET_ROBUST_LIST => {
+                let head = args[0];
+                let head_uaddr = VirtAddr::new(head);
+                let len = args[1];
+
+                let ret = Self::set_robust_list(head_uaddr, len);
+                return ret;
+            }
+
+            SYS_GET_ROBUST_LIST => {
+                let pid = args[0];
+                let head = args[1];
+                let head_uaddr = VirtAddr::new(head);
+                let len_ptr = args[2];
+                let len_ptr_uaddr = VirtAddr::new(len_ptr);
+
+                let ret = Self::get_robust_list(pid, head_uaddr, len_ptr_uaddr);
+                return ret;
             }
 
             SYS_READV => Self::readv(args[0] as i32, args[1], args[2]),
@@ -928,7 +946,7 @@ impl Syscall {
 
             SYS_CLOCK_GETTIME => {
                 let clockid = args[0] as i32;
-                let timespec = args[1] as *mut TimeSpec;
+                let timespec = args[1] as *mut PosixTimeSpec;
                 Self::clock_gettime(clockid, timespec)
             }
 
@@ -949,11 +967,6 @@ impl Syscall {
 
             SYS_FSYNC => {
                 kwarn!("SYS_FSYNC has not yet been implemented");
-                Ok(0)
-            }
-
-            SYS_SET_ROBUST_LIST => {
-                kwarn!("SYS_SET_ROBUST_LIST has not yet been implemented");
                 Ok(0)
             }
 
@@ -1029,10 +1042,39 @@ impl Syscall {
                 Self::uname(name)
             }
 
+
             SYS_ALARM => {
                 let second = args[0] as u32;
                 Self::alarm(second)
             }
+
+            SYS_SHMGET => {
+                let key = ShmKey::new(args[0]);
+                let size = args[1];
+                let shmflg = ShmFlags::from_bits_truncate(args[2] as u32);
+
+                Self::shmget(key, size, shmflg)
+            }
+            SYS_SHMAT => {
+                let id = ShmId::new(args[0]);
+                let vaddr = VirtAddr::new(args[1]);
+                let shmflg = ShmFlags::from_bits_truncate(args[2] as u32);
+
+                Self::shmat(id, vaddr, shmflg)
+            }
+            SYS_SHMDT => {
+                let vaddr = VirtAddr::new(args[0]);
+                Self::shmdt(vaddr)
+            }
+            SYS_SHMCTL => {
+                let id = ShmId::new(args[0]);
+                let cmd = ShmCtlCmd::from(args[1]);
+                let user_buf = args[2] as *const u8;
+                let from_user = frame.is_from_user();
+
+                Self::shmctl(id, cmd, user_buf, from_user)
+            }
+
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

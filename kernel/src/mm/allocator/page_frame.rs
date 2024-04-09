@@ -5,6 +5,7 @@ use core::{
 
 use crate::{
     arch::{mm::LockedFrameAllocator, MMArch},
+    ipc::shm::shm_manager_lock,
     libs::spinlock::SpinLockGuard,
     mm::{MemoryManagementArch, PhysAddr, VirtAddr},
 };
@@ -196,6 +197,11 @@ impl PageFrameCount {
             return Some(Self(bytes / MMArch::PAGE_SIZE));
         }
     }
+
+    #[inline(always)]
+    pub fn next_power_of_two(&self) -> Self {
+        Self::new(self.0.next_power_of_two())
+    }
 }
 
 impl Add for PageFrameCount {
@@ -352,17 +358,26 @@ pub unsafe fn allocate_page_frames(count: PageFrameCount) -> Option<(PhysAddr, P
 pub unsafe fn deallocate_page_frames(
     frame: PhysPageFrame,
     count: PageFrameCount,
-    page_manager: &mut SpinLockGuard<'_, crate::mm::page::PageManager>,
+    page_manager_guard: &mut SpinLockGuard<'_, crate::mm::page::PageManager>,
 ) {
     unsafe {
         LockedFrameAllocator.free(frame.phys_address(), count);
     }
 
-    // 将已回收的物理页面对应的Page从PAGE_MANAGER中删去
     let mut frame = frame;
     for _ in 0..count.data() {
         let paddr = frame.phys_address();
-        page_manager.remove_page(&paddr);
+        let page = page_manager_guard.get(&paddr);
+
+        if let Some(page) = page {
+            // 如果page是共享页，将其共享页信息从SHM_MANAGER中删去
+            if page.shared() {
+                shm_manager_lock().free_id(&page.shm_id().unwrap());
+            }
+        }
+
+        // 将已回收的物理页面对应的Page从PAGE_MANAGER中删去
+        page_manager_guard.remove_page(&paddr);
         frame = frame.next();
     }
 }

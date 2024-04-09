@@ -5,8 +5,7 @@ use alloc::{
 use system_error::SystemError;
 use crate::arch::ipc::signal::{Signal,SigCode};
 use crate::ipc::signal_types::SigType;
-use crate::time::timer::{clock, timer_jiffies_n_s, InnerTimer, Timer, TimerFunction};
-use crate::libs::spinlock::SpinLockGuard;
+use crate::time::timer::{clock, timer_jiffies_n_s, Timer, TimerFunction};
 use crate::process::Pid;
 use core::result;
 use core::sync::atomic::compiler_fence;
@@ -43,9 +42,7 @@ impl AlarmTimer {
             let now_time = clock();
             let end_time = self.timer.lock().inner().expire_jiffies;
             let remain_jiffies = end_time - now_time;
-            println!("remian_jiffies: {}", remain_jiffies);
             let second = timer_jiffies_n_s(remain_jiffies);
-            println!("remian_second: {}", second);
             second
         }
     }

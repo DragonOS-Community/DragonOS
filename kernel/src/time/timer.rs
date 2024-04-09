@@ -248,7 +248,7 @@ pub fn next_n_us_timer_jiffies(expire_us: u64) -> u64 {
 }
 /// 计算定时器时间片对应的秒数
 pub fn timer_jiffies_n_s(jiffies: u64) -> u64 {
-    return jiffies / 1_000 * NSEC_PER_JIFFY;
+    return jiffies / 1_000 * NSEC_PER_JIFFY as u64;
 }
 
 /// @brief 让pcb休眠timeout个jiffies

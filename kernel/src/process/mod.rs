@@ -60,7 +60,6 @@ use crate::{
     syscall::{user_access::clear_user, Syscall},
 };
 use timer::AlarmTimer;
-use crate::libs::mutex::Mutex;
 
 use self::kthread::{AtomicKernelThreadCreateStatus, WorkerPrivate};
 

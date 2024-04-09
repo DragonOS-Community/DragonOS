@@ -5,10 +5,15 @@ use system_error::SystemError;
 use x86::current;
 
 use crate::{
-    process::ProcessManager, syscall::{user_access::UserBufferWriter, Syscall}, time::{sleep::nanosleep, TimeSpec}
+    process::ProcessManager,
+    syscall::{user_access::UserBufferWriter, Syscall},
+    time::{sleep::nanosleep, TimeSpec},
 };
 
-use super::{timekeeping::{do_gettimeofday, getnstimeofday}, timer::next_n_ms_timer_jiffies};
+use super::{
+    timekeeping::{do_gettimeofday, getnstimeofday},
+    timer::next_n_ms_timer_jiffies,
+};
 
 pub type PosixTimeT = c_longlong;
 pub type PosixSusecondsT = c_int;
@@ -149,7 +154,7 @@ impl Syscall {
         return Ok(0);
     }
 
-    pub fn alarm(second: u32) -> Result<usize, SystemError>{
+    pub fn alarm(second: u32) -> Result<usize, SystemError> {
         //获得剩余时间
         let alarmtimer = ProcessManager::ref_alarm_timer();
         let remain = alarmtimer.remain();

@@ -1,44 +1,39 @@
-use alloc::{
-    boxed::Box,
-    sync::Arc,
-};
-use system_error::SystemError;
-use crate::arch::ipc::signal::{Signal,SigCode};
+use crate::arch::ipc::signal::{SigCode, Signal};
 use crate::ipc::signal_types::SigType;
-use crate::time::timer::{clock, timer_jiffies_n_s, Timer, TimerFunction};
+use crate::libs::mutex::Mutex;
 use crate::process::Pid;
+use crate::process::SigInfo;
+use crate::time::timer::{clock, timer_jiffies_n_s, Timer, TimerFunction};
+use alloc::{boxed::Box, sync::Arc};
 use core::result;
 use core::sync::atomic::compiler_fence;
-use crate::libs::mutex::Mutex;
-use crate::process::SigInfo;
+use system_error::SystemError;
 
 use super::ProcessManager;
 #[derive(Debug)]
-pub struct AlarmTimer{
+pub struct AlarmTimer {
     timer: Mutex<Arc<Timer>>,
     expired_time: u64,
 }
 
 impl AlarmTimer {
-    pub fn new(timer_func: Box<dyn TimerFunction>, expire_time: u64) -> Self{
-        let result = AlarmTimer{
+    pub fn new(timer_func: Box<dyn TimerFunction>, expire_time: u64) -> Self {
+        let result = AlarmTimer {
             timer: Mutex::new(Timer::new(timer_func, expire_time)),
-            expired_time:  expire_time,
+            expired_time: expire_time,
         };
         result
     }
-
 
     pub fn timeout(&self) -> bool {
         return self.timer.lock().timeout();
     }
 
     //返回闹钟定时器剩余时间（单位是jiffies）
-    pub fn remain(&self) -> u64{
+    pub fn remain(&self) -> u64 {
         if self.timeout() {
             0
-        }
-        else {
+        } else {
             let now_time = clock();
             let end_time = self.timer.lock().inner().expire_jiffies;
             let remain_jiffies = end_time - now_time;
@@ -60,24 +55,22 @@ impl AlarmTimer {
         *timer = new_timer;
         drop(timer);
     }
-
 }
 
 //闹钟定时器的TimerFuntion
 #[derive(Debug)]
-pub struct AlarmTimerFunc{
+pub struct AlarmTimerFunc {
     pid: Pid,
 }
 
-impl AlarmTimerFunc{
+impl AlarmTimerFunc {
     pub fn new(pid: Pid) -> Box<AlarmTimerFunc> {
-        return Box::new(AlarmTimerFunc{ 
-            pid });
+        return Box::new(AlarmTimerFunc { pid });
     }
 }
 
 impl TimerFunction for AlarmTimerFunc {
-    fn run(&mut self) -> Result<(), SystemError>{
+    fn run(&mut self) -> Result<(), SystemError> {
         let sig = Signal::SIGALRM;
         // 初始化signal info
         let mut info = SigInfo::new(sig, 0, SigCode::Timer, SigType::Alarm(self.pid));

@@ -155,7 +155,6 @@ impl Timer {
             .for_each(drop);
         true
     }
-
 }
 
 /// 定时器类型

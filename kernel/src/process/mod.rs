@@ -74,8 +74,8 @@ pub mod pid;
 pub mod resource;
 pub mod stdio;
 pub mod syscall;
-pub mod utils;
 pub mod timer;
+pub mod utils;
 
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);
@@ -133,7 +133,6 @@ impl ProcessManager {
 
         unsafe { __PROCESS_MANAGEMENT_INIT_DONE = true };
         kinfo!("Process Manager initialized.");
-
     }
 
     fn init_switch_result() {
@@ -489,8 +488,8 @@ impl ProcessManager {
     }
 
     //获取目标进程的可变闹钟定时器
-     //返回闹钟定时器
-     pub fn ref_alarm_timer() -> Arc<AlarmTimer>{
+    //返回闹钟定时器
+    pub fn ref_alarm_timer() -> Arc<AlarmTimer> {
         let current_pcb = ProcessManager::current_pcb();
         let alarm_timer = current_pcb.alarm_timer.clone();
         alarm_timer
@@ -666,7 +665,6 @@ impl ProcessControlBlock {
         let name = format!("idle-{}", cpu_id);
         return Self::do_create_pcb(name, kstack, true);
     }
-
 
     #[inline(never)]
     fn do_create_pcb(name: String, kstack: KernelStack, is_idle: bool) -> Arc<Self> {

@@ -1,12 +1,12 @@
 {
-  "name": "alarm-test",
+  "name": "test_alarm",
   "version": "0.1.0",
   "description": "test for alarm",
   "rust_target": null,
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "/home/smallc/DragonProject/sys_alarm/DragonOS/user/apps/alarm-test"
+        "path": "/home/smallc/DragonProject/sys_alarm/DragonOS/user/apps/test_alarm"
       }
     }
   },

@@ -2,7 +2,6 @@ use core::ffi::{c_int, c_longlong};
 
 use num_traits::FromPrimitive;
 use system_error::SystemError;
-use x86::current;
 
 use crate::{
     process::ProcessManager,

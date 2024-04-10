@@ -38,8 +38,8 @@ export OBJCOPY=objcopy
 if [ -d ${grub_dir_i386_efi}/bin ] && [ -d ${grub_dir_i386_legacy}/bin ] && [ -d ${grub_dir_x86_64_efi}/bin ] ; then
 	exit 0
 fi
-#仅支持Ubuntu/Debain, Arch下的自动安装
-supported_package_manager="apt-get pacman"
+#仅支持Ubuntu/Debain, Arch, Centos/RHEL8/Fedora下的自动安装
+supported_package_manager="apt-get pacman dnf"
 packages=("make binutils bison gcc gettext flex bison automake autoconf wget gawk" \
           "make binutils bison gcc gettext flex bison automake autoconf wget gawk")
 update_options=("update" \

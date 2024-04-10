@@ -6,7 +6,7 @@
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "/home/smallc/DragonProject/sys_alarm/DragonOS/user/apps/test_alarm"
+        "path": "apps/test_alarm"
       }
     }
   },

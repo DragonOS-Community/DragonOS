@@ -338,26 +338,27 @@ impl Ext2SuperBlockInfo {
         // let mut inode_data = Vec::with_capacity(self.s_inode_size as usize);
         // inode_data.resize(self.s_inode_size as usize, 0);
         let mut cursor = VecCursor::new(inode_data);
-        let inode = Ext2Inode{
-            mode: cursor.read_u16()?,
-            uid: cursor.read_u16()?,
-            lower_size: cursor.read_u32()?,
-            access_time: cursor.read_u32()?,
-            create_time: cursor.read_u32()?,
-            modify_time: cursor.read_u32()?,
-            delete_time: cursor.read_u32()?,
-            gid: cursor.read_u16()?,
-            hard_link_num: cursor.read_u16()?,
-            disk_sector: cursor.read_u32()?,
-            flags: cursor.read_u32()?,
-            os_dependent_1: cursor.read_u32()?,
-            blocks: cursor.read_u32()?,
-            generation_num: cursor.read_u32()?,
-            file_acl: cursor.read_u32()?,
-            directory_acl: cursor.read_u32()?,
-            fragment_addr: cursor.read_u32()?,
-            os_dependent_2: cursor.read_u16()?,
-        };
+        
+        // let inode = Ext2Inode{
+        //     mode: cursor.read_u16()?,
+        //     uid: cursor.read_u16()?,
+        //     lower_size: cursor.read_u32()?,
+        //     access_time: cursor.read_u32()?,
+        //     create_time: cursor.read_u32()?,
+        //     modify_time: cursor.read_u32()?,
+        //     delete_time: cursor.read_u32()?,
+        //     gid: cursor.read_u16()?,
+        //     hard_link_num: cursor.read_u16()?,
+        //     disk_sector: cursor.read_u32()?,
+        //     flags: cursor.read_u32()?,
+        //     os_dependent_1: cursor.read_u32()?,
+        //     blocks: cursor.re,
+        //     generation_num: cursor.read_u32()?,
+        //     file_acl: cursor.read_u32()?,
+        //     directory_acl: cursor.read_u32()?,
+        //     fragment_addr: cursor.read_u32()?,
+        //     os_dependent_2: cursor.read_u16()?,
+        // };
         // for _ in 0..=idx {}
 
         // let mut blc_data = Vec::with_capacity(LBA_SIZE);

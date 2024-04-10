@@ -45,43 +45,8 @@ impl Ext2BlockGroupDescriptor {
     // TODO 读取inode
 }
 
-const EXT2_NAME_LEN: usize = 255;
-pub struct Ext2DirEntry {
-    /// Inode number of the file
-    inode: u32,
-    /// Length of the directory entry record
-    record_length: u16,
-    /// Length of the name
-    name_length: u8,
-    /// File type
-    file_type: u8,
-    /// Name of the file
-    name: [u8; EXT2_NAME_LEN],
-}
 
-impl Ext2DirEntry {
-    pub fn get_name(&self) -> String {
-        String::from_utf8(self.name.to_vec()).expect("Invalid UTF-8 in entry name")
-    }
-}
-pub enum Ext2FileType {
-    /// 未定义
-    Unknown = 0,
-    /// 普通文件
-    RegularFile,
-    /// 目录
-    Directory,
-    /// 字符设备
-    CharacterDevice,
-    /// 块设备
-    BlockDevice,
-    /// 管道
-    FIFO,
-    /// 套接字
-    Socket,
-    /// 符号链接
-    Symlink,
-}
+
 
 
 

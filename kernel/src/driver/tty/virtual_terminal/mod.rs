@@ -242,6 +242,14 @@ impl TtyOperation for TtyConsoleDriverInner {
     fn close(&self, _tty: Arc<TtyCore>) -> Result<(), SystemError> {
         Ok(())
     }
+
+    fn resize(
+        &self,
+        _tty: Arc<TtyCore>,
+        _winsize: super::termios::WindowSize,
+    ) -> Result<(), SystemError> {
+        todo!()
+    }
 }
 
 #[derive(Debug, Clone)]

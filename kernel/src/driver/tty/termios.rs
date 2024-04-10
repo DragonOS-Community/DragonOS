@@ -2,7 +2,7 @@ use super::tty_ldisc::LineDisciplineType;
 
 /// ## 窗口大小
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct WindowSize {
     /// 行
     pub row: u16,

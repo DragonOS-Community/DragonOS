@@ -259,7 +259,7 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(true).ok();
         drop(irq_guard);
-        schedule(SchedMode::SM_PREEMPT);
+        schedule(SchedMode::SM_NONE);
         return Ok(MAX_TIMEOUT);
     } else if timeout < 0 {
         kerror!("timeout can't less than 0");
@@ -278,7 +278,7 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
 
         drop(irq_guard);
 
-        schedule(SchedMode::SM_PREEMPT);
+        schedule(SchedMode::SM_NONE);
         let time_remaining: i64 = timeout - TIMER_JIFFIES.load(Ordering::SeqCst) as i64;
         if time_remaining >= 0 {
             // 被提前唤醒，返回剩余时间

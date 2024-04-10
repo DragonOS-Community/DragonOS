@@ -158,11 +158,13 @@ impl IndexNode for LockedPipeInode {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data_guard: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        let data = data_guard.clone();
+        drop(data_guard);
         // 获取mode
         let mode: FileMode;
-        if let FilePrivateData::Pipefs(pdata) = &*data {
+        if let FilePrivateData::Pipefs(pdata) = &data {
             mode = pdata.mode;
         } else {
             return Err(SystemError::EBADF);

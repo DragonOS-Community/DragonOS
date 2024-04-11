@@ -1,7 +1,7 @@
 use system_error::SystemError;
 
 use crate::{
-    arch::{mm::fault::PageFaultHandler, CurrentIrqArch},
+    arch::{mm::fault::X86_64PageFault, CurrentIrqArch},
     exception::InterruptArch,
     kerror, kwarn,
     mm::VirtAddr,
@@ -411,9 +411,9 @@ unsafe extern "C" fn do_page_fault(regs: &'static TrapFrame, error_code: u64) {
     let address = VirtAddr::new(address);
     let error_code = X86PfErrorCode::from_bits_truncate(error_code as u32);
     if address.check_user() {
-        PageFaultHandler::do_user_addr_fault(regs, error_code, address);
+        X86_64PageFault::do_user_addr_fault(regs, error_code, address);
     } else {
-        PageFaultHandler::do_kern_addr_fault(regs, error_code, address);
+        X86_64PageFault::do_kern_addr_fault(regs, error_code, address);
     }
     CurrentIrqArch::interrupt_enable();
 }

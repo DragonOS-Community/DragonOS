@@ -46,11 +46,12 @@ struct ApStartStackInfo {
 #[no_mangle]
 unsafe extern "C" fn smp_ap_start() -> ! {
     CurrentIrqArch::interrupt_disable();
+
     let vaddr = if let Some(t) = smp_cpu_manager()
         .cpuhp_state(smp_get_processor_id())
         .thread()
     {
-        t.kernel_stack().stack_max_address().data() - 16
+        t.kernel_stack_force_ref().stack_max_address().data() - 16
     } else {
         // 没有设置ap核心的栈，那么就进入死循环。
         loop {
@@ -214,15 +215,16 @@ impl SMPArch for X86_64SMPArch {
     }
 
     fn start_cpu(cpu_id: ProcessorId, _cpu_hpstate: &CpuHpCpuState) -> Result<(), SystemError> {
-        kdebug!("start_cpu: cpu_id: {:#x}\n", cpu_id.data());
-
         Self::copy_smp_start_code();
 
+        fence(Ordering::SeqCst);
         ipi_send_smp_init();
         fence(Ordering::SeqCst);
         ipi_send_smp_startup(cpu_id)?;
+
         fence(Ordering::SeqCst);
         ipi_send_smp_startup(cpu_id)?;
+
         fence(Ordering::SeqCst);
 
         return Ok(());

@@ -23,7 +23,7 @@ use crate::{
 };
 
 use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::{PageEntry, PageFlags};
+use crate::mm::page::{PageEntry, PageFlags, PAGE_1G_SHIFT};
 use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr};
 use crate::{kdebug, kinfo, kwarn};
 use system_error::SystemError;
@@ -121,6 +121,9 @@ impl MemoryManagementArch for X86_64MMArch {
     const FIXMAP_START_VADDR: VirtAddr = VirtAddr::new(0xffffb00000000000);
     /// 设置FIXMAP区域大小为1M
     const FIXMAP_SIZE: usize = 256 * 4096;
+
+    const MMIO_BASE: VirtAddr = VirtAddr::new(0xffffa10000000000);
+    const MMIO_SIZE: usize = 1 << PAGE_1G_SHIFT;
 
     /// @brief 获取物理内存区域
     unsafe fn init() {
@@ -599,7 +602,8 @@ pub fn test_buddy() {
 pub struct LockedFrameAllocator;
 
 impl FrameAllocator for LockedFrameAllocator {
-    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
+    unsafe fn allocate(&mut self, mut count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
+        count = count.next_power_of_two();
         if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
             return allocator.allocate(count);
         } else {

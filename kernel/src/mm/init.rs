@@ -4,6 +4,7 @@ use crate::{
     arch::MMArch,
     driver::serial::serial8250::send_to_default_serial8250_port,
     filesystem::procfs::kmsg::kmsg_init,
+    ipc::shm::shm_manager_init,
     libs::printk::PrintkWriter,
     mm::{allocator::slab::slab_init, mmio_buddy::mmio_init, page::page_manager_init},
 };
@@ -52,6 +53,8 @@ pub unsafe fn mm_init() {
     kmsg_init();
     // enable PAGE_MANAGER
     page_manager_init();
+    // enable SHM_MANAGER
+    shm_manager_init();
 
     MM_INIT
         .compare_exchange(
@@ -61,6 +64,7 @@ pub unsafe fn mm_init() {
             Ordering::SeqCst,
         )
         .unwrap();
+    MMArch::arch_post_init();
     kinfo!("mm init done.");
 }
 

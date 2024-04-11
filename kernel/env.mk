@@ -36,7 +36,7 @@ export GLOBAL_CFLAGS := -fno-builtin -fno-stack-protector -D $(CFLAGS_DEFINE_ARC
 ifeq ($(ARCH), x86_64)
 GLOBAL_CFLAGS += -mcmodel=large -m64
 else ifeq ($(ARCH), riscv64)
-GLOBAL_CFLAGS += -mcmodel=medany -march=rv64imac -mabi=lp64
+GLOBAL_CFLAGS += -mcmodel=medany -march=rv64gc -mabi=lp64d
 endif
 
 ifeq ($(DEBUG), DEBUG)

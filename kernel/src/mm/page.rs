@@ -12,6 +12,7 @@ use hashbrown::{HashMap, HashSet};
 use crate::{
     arch::{interrupt::ipi::send_ipi, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
+    ipc::shm::ShmId,
     kerror, kwarn,
     libs::spinlock::{SpinLock, SpinLockGuard},
 };
@@ -20,6 +21,11 @@ use super::{
     allocator::page_frame::FrameAllocator, syscall::ProtFlags, ucontext::LockedVMA,
     MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
 };
+
+pub const PAGE_4K_SHIFT: usize = 12;
+#[allow(dead_code)]
+pub const PAGE_2M_SHIFT: usize = 21;
+pub const PAGE_1G_SHIFT: usize = 30;
 
 /// 全局物理页信息管理器
 pub static mut PAGE_MANAGER: Option<SpinLock<PageManager>> = None;
@@ -36,7 +42,7 @@ pub fn page_manager_init() {
     kinfo!("page_manager_init done");
 }
 
-pub fn page_manager_lock_irasave() -> SpinLockGuard<'static, PageManager> {
+pub fn page_manager_lock_irqsave() -> SpinLockGuard<'static, PageManager> {
     unsafe { PAGE_MANAGER.as_ref().unwrap().lock_irqsave() }
 }
 
@@ -50,6 +56,14 @@ impl PageManager {
         Self {
             phys2page: HashMap::new(),
         }
+    }
+
+    pub fn contains(&self, paddr: &PhysAddr) -> bool {
+        self.phys2page.contains_key(paddr)
+    }
+
+    pub fn get(&self, paddr: &PhysAddr) -> Option<&Page> {
+        self.phys2page.get(paddr)
     }
 
     pub fn get_mut(&mut self, paddr: &PhysAddr) -> &mut Page {
@@ -71,15 +85,22 @@ pub struct Page {
     map_count: usize,
     /// 是否为共享页
     shared: bool,
+    /// 映射计数为0时，是否可回收
+    free_when_zero: bool,
+    /// 共享页id（如果是共享页）
+    shm_id: Option<ShmId>,
     /// 映射到当前page的VMA
     anon_vma: HashSet<Arc<LockedVMA>>,
 }
 
 impl Page {
     pub fn new(shared: bool) -> Self {
+        let dealloc_when_zero = !shared;
         Self {
             map_count: 0,
             shared,
+            free_when_zero: dealloc_when_zero,
+            shm_id: None,
             anon_vma: HashSet::new(),
         }
     }
@@ -98,7 +119,27 @@ impl Page {
 
     /// 判断当前物理页是否能被回
     pub fn can_deallocate(&self) -> bool {
-        self.map_count == 0 && !self.shared
+        self.map_count == 0 && self.free_when_zero
+    }
+
+    pub fn shared(&self) -> bool {
+        self.shared
+    }
+
+    pub fn shm_id(&self) -> Option<ShmId> {
+        self.shm_id
+    }
+
+    pub fn set_shm_id(&mut self, shm_id: ShmId) {
+        self.shm_id = Some(shm_id);
+    }
+
+    pub fn set_dealloc_when_zero(&mut self, dealloc_when_zero: bool) {
+        self.free_when_zero = dealloc_when_zero;
+    }
+
+    pub fn anon_vma(&self) -> &HashSet<Arc<LockedVMA>> {
+        &self.anon_vma
     }
 }
 
@@ -677,7 +718,12 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         let phys: PhysAddr = self.frame_allocator.allocate_one()?;
         compiler_fence(Ordering::SeqCst);
 
-        page_manager_lock_irasave().insert(phys, Page::new(false));
+        let mut page_manager_guard: SpinLockGuard<'static, PageManager> =
+            page_manager_lock_irqsave();
+        if !page_manager_guard.contains(&phys) {
+            page_manager_guard.insert(phys, Page::new(false))
+        }
+
         return self.map_phys(virt, phys, flags);
     }
 

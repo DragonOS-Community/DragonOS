@@ -371,6 +371,11 @@ impl<T> RwLock<T> {
     pub unsafe fn get_mut(&mut self) -> &mut T {
         unsafe { &mut *self.data.get() }
     }
+
+    #[allow(dead_code)]
+    pub unsafe fn force_get_ref(&self) -> &T {
+        unsafe { &*self.data.get() }
+    }
 }
 
 impl<T: Default> Default for RwLock<T> {

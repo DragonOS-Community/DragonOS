@@ -13,13 +13,17 @@ use kdepends::memoffset::offset_of;
 use system_error::SystemError;
 
 use crate::{
-    arch::CurrentIrqArch,
+    arch::{
+        interrupt::entry::ret_from_exception, process::kthread::kernel_thread_bootstrap_stage1,
+        CurrentIrqArch,
+    },
     exception::InterruptArch,
     kerror,
     libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{
-        fork::KernelCloneArgs, KernelStack, ProcessControlBlock, ProcessManager,
+        fork::{CloneFlags, KernelCloneArgs},
+        switch_finish_hook, KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager,
         PROCESS_SWITCH_RESULT,
     },
     smp::cpu::ProcessorId,
@@ -65,7 +69,52 @@ impl ProcessManager {
         clone_args: KernelCloneArgs,
         current_trapframe: &TrapFrame,
     ) -> Result<(), SystemError> {
-        unimplemented!("ProcessManager::copy_thread")
+        let clone_flags = clone_args.flags;
+        let mut child_trapframe = *current_trapframe;
+
+        // 子进程的返回值为0
+        child_trapframe.set_return_value(0);
+
+        // 设置子进程的栈基址（开始执行中断返回流程时的栈基址）
+        let mut new_arch_guard = unsafe { new_pcb.arch_info() };
+        let kernel_stack_guard = new_pcb.kernel_stack();
+        let trap_frame_vaddr: VirtAddr =
+            kernel_stack_guard.stack_max_address() - core::mem::size_of::<TrapFrame>();
+        new_arch_guard.set_stack(trap_frame_vaddr);
+
+        // 拷贝栈帧
+        unsafe {
+            let usp = clone_args.stack;
+            if usp != 0 {
+                child_trapframe.sp = usp;
+            }
+            let trap_frame_ptr = trap_frame_vaddr.data() as *mut TrapFrame;
+            *trap_frame_ptr = child_trapframe;
+        }
+
+        // copy arch info
+
+        let current_arch_guard = current_pcb.arch_info_irqsave();
+        // 拷贝浮点寄存器的状态
+        new_arch_guard.fp_state = current_arch_guard.fp_state;
+
+        drop(current_arch_guard);
+
+        // 设置返回地址（子进程开始执行的指令地址）
+        if new_pcb.flags().contains(ProcessFlags::KTHREAD) {
+            let kthread_bootstrap_stage1_func_addr = kernel_thread_bootstrap_stage1 as usize;
+            new_arch_guard.ra = kthread_bootstrap_stage1_func_addr;
+        } else {
+            new_arch_guard.ra = ret_from_exception as usize;
+        }
+
+        // 设置tls
+        if clone_flags.contains(CloneFlags::CLONE_SETTLS) {
+            drop(new_arch_guard);
+            todo!("set tls");
+        }
+
+        return Ok(());
     }
 
     /// 切换进程
@@ -164,9 +213,9 @@ unsafe extern "C" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBI
             ld s10, {off_s10}(a1)
             ld s11, {off_s11}(a1)
             
-            // 将ra设置为标签1，并跳转到{switch_finish_hook}
+            // 将ra设置为标签1，并跳转到before_switch_finish_hook
             la ra, 1f
-            j {switch_finish_hook}
+            j {before_switch_finish_hook}
             
             1:
             ld sp, {off_sp}(a1)
@@ -189,8 +238,13 @@ unsafe extern "C" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBI
     off_s9 = const(offset_of!(ArchPCBInfo, s9)),
     off_s10 = const(offset_of!(ArchPCBInfo, s10)),
     off_s11 = const(offset_of!(ArchPCBInfo, s11)),
-    switch_finish_hook = sym crate::process::switch_finish_hook,
+    before_switch_finish_hook = sym before_switch_finish_hook,
     options(noreturn));
+}
+
+/// 在切换上下文完成后的钩子函数(必须在这里加一个跳转函数，否则会出现relocation truncated to fit: R_RISCV_JAL错误)
+unsafe extern "C" fn before_switch_finish_hook() {
+    switch_finish_hook();
 }
 
 impl ProcessControlBlock {
@@ -221,7 +275,7 @@ impl ProcessControlBlock {
 }
 
 /// PCB中与架构相关的信息
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 #[repr(C)]
 pub struct ArchPCBInfo {
@@ -277,12 +331,16 @@ impl ArchPCBInfo {
     }
     // ### 从另一个ArchPCBInfo处clone,但是保留部分字段不变
     pub fn clone_from(&mut self, from: &Self) {
-        unimplemented!("ArchPCBInfo::clone_from")
+        *self = from.clone();
+    }
+
+    pub fn set_stack(&mut self, stack: VirtAddr) {
+        self.ksp = stack.data();
     }
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct FpDExtState {
     f: [u64; 32],
     fcsr: u32,
@@ -322,73 +380,50 @@ impl FpDExtState {
             asm!("frcsr {0}", lateout(reg) self.fcsr);
             asm!(concat!(
                     "
-                fsd f0, {0}
-                fsd f1, {1}
-                fsd f2, {2}
-                fsd f3, {3}
-                fsd f4, {4}
-                fsd f5, {5}
-                fsd f6, {6}
-                fsd f7, {7}
-                fsd f8, {8}
-                fsd f9, {9}
-                fsd f10, {10}
-                fsd f11, {11}
-                fsd f12, {12}
-                fsd f13, {13}
-                fsd f14, {14}
-                fsd f15, {15}
-                fsd f16, {16}
-                fsd f17, {17}
-                fsd f18, {18}
-                fsd f19, {19}
-                fsd f20, {20}
-                fsd f21, {21}
-                fsd f22, {22}
-                fsd f23, {23}
-                fsd f24, {24}
-                fsd f25, {25}
-                fsd f26, {26}
-                fsd f27, {27}
-                fsd f28, {28}
-                fsd f29, {29}
-                fsd f30, {30}
-                fsd f31, {31}
+                // 为原来的a0寄存器的值在堆栈上分配空间
+                addi sp, sp, -8
+                sd a0, 0(sp)
+                mv a0, {0}
+
+                fsd f0, 0(a0)
+                fsd f1, 8(a0)
+                fsd f2, 16(a0)
+                fsd f3, 24(a0)
+                fsd f4, 32(a0)
+                fsd f5, 40(a0)
+                fsd f6, 48(a0)
+                fsd f7, 56(a0)
+                fsd f8, 64(a0)
+                fsd f9, 72(a0)
+                fsd f10, 80(a0)
+                fsd f11, 88(a0)
+                fsd f12, 96(a0)
+                fsd f13, 104(a0)
+                fsd f14, 112(a0)
+                fsd f15, 120(a0)
+                fsd f16, 128(a0)
+                fsd f17, 136(a0)
+                fsd f18, 144(a0)
+                fsd f19, 152(a0)
+                fsd f20, 160(a0)
+                fsd f21, 168(a0)
+                fsd f22, 176(a0)
+                fsd f23, 184(a0)
+                fsd f24, 192(a0)
+                fsd f25, 200(a0)
+                fsd f26, 208(a0)
+                fsd f27, 216(a0)
+                fsd f28, 224(a0)
+                fsd f29, 232(a0)
+                fsd f30, 240(a0)
+                fsd f31, 248(a0)
+
+                // 恢复a0寄存器的值
+                ld a0, 0(sp)
+                addi sp, sp, 8
                 "
                 ),
-                lateout(reg) self.f[0],
-                lateout(reg) self.f[1],
-                lateout(reg) self.f[2],
-                lateout(reg) self.f[3],
-                lateout(reg) self.f[4],
-                lateout(reg) self.f[5],
-                lateout(reg) self.f[6],
-                lateout(reg) self.f[7],
-                lateout(reg) self.f[8],
-                lateout(reg) self.f[9],
-                lateout(reg) self.f[10],
-                lateout(reg) self.f[11],
-                lateout(reg) self.f[12],
-                lateout(reg) self.f[13],
-                lateout(reg) self.f[14],
-                lateout(reg) self.f[15],
-                lateout(reg) self.f[16],
-                lateout(reg) self.f[17],
-                lateout(reg) self.f[18],
-                lateout(reg) self.f[19],
-                lateout(reg) self.f[20],
-                lateout(reg) self.f[21],
-                lateout(reg) self.f[22],
-                lateout(reg) self.f[23],
-                lateout(reg) self.f[24],
-                lateout(reg) self.f[25],
-                lateout(reg) self.f[26],
-                lateout(reg) self.f[27],
-                lateout(reg) self.f[28],
-                lateout(reg) self.f[29],
-                lateout(reg) self.f[30],
-                lateout(reg) self.f[31],
-
+                in (reg) &self.f as *const _,
             );
             riscv::register::sstatus::set_fs(riscv::register::sstatus::FS::Off);
         }
@@ -404,72 +439,50 @@ impl FpDExtState {
             compiler_fence(Ordering::SeqCst);
             asm!(concat!(
                     "
-                fld f0, {0}
-                fld f1, {1}
-                fld f2, {2}
-                fld f3, {3}
-                fld f4, {4}
-                fld f5, {5}
-                fld f6, {6}
-                fld f7, {7}
-                fld f8, {8}
-                fld f9, {9}
-                fld f10, {10}
-                fld f11, {11}
-                fld f12, {12}
-                fld f13, {13}
-                fld f14, {14}
-                fld f15, {15}
-                fld f16, {16}
-                fld f17, {17}
-                fld f18, {18}
-                fld f19, {19}
-                fld f20, {20}
-                fld f21, {21}
-                fld f22, {22}
-                fld f23, {23}
-                fld f24, {24}
-                fld f25, {25}
-                fld f26, {26}
-                fld f27, {27}
-                fld f28, {28}
-                fld f29, {29}
-                fld f30, {30}
-                fld f31, {31}
-                "
+            // 为原来的a0寄存器的值在堆栈上分配空间
+            addi sp, sp, -8
+            sd a0, 0(sp)
+            mv a0, {0}
+
+            fld f0, 0(a0)
+            fld f1, 8(a0)
+            fld f2, 16(a0)
+            fld f3, 24(a0)
+            fld f4, 32(a0)
+            fld f5, 40(a0)
+            fld f6, 48(a0)
+            fld f7, 56(a0)
+            fld f8, 64(a0)
+            fld f9, 72(a0)
+            fld f10, 80(a0)
+            fld f11, 88(a0)
+            fld f12, 96(a0)
+            fld f13, 104(a0)
+            fld f14, 112(a0)
+            fld f15, 120(a0)
+            fld f16, 128(a0)
+            fld f17, 136(a0)
+            fld f18, 144(a0)
+            fld f19, 152(a0)
+            fld f20, 160(a0)
+            fld f21, 168(a0)
+            fld f22, 176(a0)
+            fld f23, 184(a0)
+            fld f24, 192(a0)
+            fld f25, 200(a0)
+            fld f26, 208(a0)
+            fld f27, 216(a0)
+            fld f28, 224(a0)
+            fld f29, 232(a0)
+            fld f30, 240(a0)
+            fld f31, 248(a0)
+
+            // 恢复a0寄存器的值
+            ld a0, 0(sp)
+            addi sp, sp, 8
+            "
                 ),
-                in(reg) self.f[0],
-                in(reg) self.f[1],
-                in(reg) self.f[2],
-                in(reg) self.f[3],
-                in(reg) self.f[4],
-                in(reg) self.f[5],
-                in(reg) self.f[6],
-                in(reg) self.f[7],
-                in(reg) self.f[8],
-                in(reg) self.f[9],
-                in(reg) self.f[10],
-                in(reg) self.f[11],
-                in(reg) self.f[12],
-                in(reg) self.f[13],
-                in(reg) self.f[14],
-                in(reg) self.f[15],
-                in(reg) self.f[16],
-                in(reg) self.f[17],
-                in(reg) self.f[18],
-                in(reg) self.f[19],
-                in(reg) self.f[20],
-                in(reg) self.f[21],
-                in(reg) self.f[22],
-                in(reg) self.f[23],
-                in(reg) self.f[24],
-                in(reg) self.f[25],
-                in(reg) self.f[26],
-                in(reg) self.f[27],
-                in(reg) self.f[28],
-                in(reg) self.f[29],
-                in(reg) self.f[30],
-                in(reg) self.f[31],
+                in (reg) &self.f as *const _,
             );
             compiler_fence(Ordering::SeqCst);
             asm!("fscsr {0}", in(reg) fcsr);

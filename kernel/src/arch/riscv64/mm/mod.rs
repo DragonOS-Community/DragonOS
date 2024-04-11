@@ -24,6 +24,7 @@ use crate::{
 use self::init::riscv_mm_init;
 
 pub mod bump;
+pub mod fault;
 pub(super) mod init;
 
 pub type PageMapper = crate::mm::page::PageMapper<RiscV64MMArch, LockedFrameAllocator>;

@@ -38,3 +38,5 @@ pub use crate::arch::elf::X86_64ElfArch as CurrentElfArch;
 pub use crate::arch::smp::X86_64SMPArch as CurrentSMPArch;
 
 pub use crate::arch::sched::X86_64SchedArch as CurrentSchedArch;
+
+pub use crate::arch::mm::fault::X86_64PageFault as PageFaultArch;

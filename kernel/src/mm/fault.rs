@@ -3,7 +3,7 @@ use core::{alloc::Layout, intrinsics::unlikely, panic};
 use alloc::sync::Arc;
 
 use crate::{
-    arch::{interrupt::TrapFrame, mm::PageMapper, MMArch},
+    arch::{interrupt::TrapFrame, mm::PageMapper, MMArch, PageFaultArch},
     mm::{
         page::{page_manager_lock_irqsave, PageFlags},
         ucontext::LockedVMA,
@@ -32,6 +32,17 @@ bitflags! {
     }
 }
 
+pub trait PageFault {
+    fn vma_access_permitted(
+        _vma: Arc<LockedVMA>,
+        _write: bool,
+        _execute: bool,
+        _foreign: bool,
+    ) -> bool {
+        true
+    }
+}
+
 pub struct PageFaultHandler;
 
 impl PageFaultHandler {
@@ -46,7 +57,8 @@ impl PageFaultHandler {
         let mut guard = current_pcb.sched_info().inner_lock_write_irqsave();
         guard.set_state(ProcessState::Runnable);
 
-        if !vma.access_permitted(
+        if !PageFaultArch::vma_access_permitted(
+            vma.clone(),
             flags.contains(FaultFlags::FAULT_FLAG_WRITE),
             flags.contains(FaultFlags::FAULT_FLAG_INSTRUCTION),
             flags.contains(FaultFlags::FAULT_FLAG_REMOTE),

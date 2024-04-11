@@ -15,7 +15,7 @@ use crate::{
     exception::InterruptArch,
     kerror,
     mm::{
-        fault::{FaultFlags, PageFaultHandler},
+        fault::{FaultFlags, PageFault, PageFaultHandler},
         ucontext::{AddressSpace, LockedVMA},
         VirtAddr, VmFaultReason, VmFlags,
     },
@@ -26,9 +26,29 @@ use super::LockedFrameAllocator;
 pub type PageMapper =
     crate::mm::page::PageMapper<crate::arch::x86_64::mm::X86_64MMArch, LockedFrameAllocator>;
 
-impl LockedVMA {
-    pub fn access_error(&self, error_code: X86PfErrorCode) -> bool {
-        let vm_flags = *self.lock().vm_flags();
+pub struct X86_64PageFault;
+
+impl PageFault for X86_64PageFault {
+    fn vma_access_permitted(
+        vma: Arc<LockedVMA>,
+        write: bool,
+        execute: bool,
+        foreign: bool,
+    ) -> bool {
+        if execute {
+            return true;
+        }
+        if foreign | vma.is_foreign() {
+            return true;
+        }
+        let guard = vma.lock();
+        super::pkru::pkru_allows_pkey(guard.pkey(), write)
+    }
+}
+
+impl X86_64PageFault {
+    pub fn vma_access_error(vma: Arc<LockedVMA>, error_code: X86PfErrorCode) -> bool {
+        let vm_flags = *vma.lock().vm_flags();
         let foreign = false;
         if error_code.contains(X86PfErrorCode::X86_PF_PK) {
             return true;
@@ -38,13 +58,15 @@ impl LockedVMA {
             return true;
         }
 
-        if !self.access_permitted(
+        if !X86_64PageFault::vma_access_permitted(
+            vma.clone(),
             error_code.contains(X86PfErrorCode::X86_PF_WRITE),
             error_code.contains(X86PfErrorCode::X86_PF_INSTR),
             foreign,
         ) {
             return true;
         }
+
         if error_code.contains(X86PfErrorCode::X86_PF_WRITE) {
             if unlikely(!vm_flags.contains(VmFlags::VM_WRITE)) {
                 return true;
@@ -56,27 +78,12 @@ impl LockedVMA {
             return true;
         }
 
-        if unlikely(!self.is_accessible()) {
+        if unlikely(!vma.is_accessible()) {
             return true;
         }
         false
     }
 
-    pub fn access_permitted(&self, write: bool, execute: bool, foreign: bool) -> bool {
-        if execute {
-            return true;
-        }
-        if foreign | self.is_foreign() {
-            return true;
-        }
-        let guard = self.lock();
-        super::pkru::pkru_allows_pkey(guard.pkey(), write)
-    }
-}
-
-pub struct X86_64PageFault;
-
-impl X86_64PageFault {
     pub fn show_fault_oops(
         regs: &'static TrapFrame,
         error_code: X86PfErrorCode,
@@ -230,14 +237,14 @@ impl X86_64PageFault {
             // }
             // drop(guard);
 
-            if unlikely(vma.access_error(error_code)) {
+            if unlikely(Self::vma_access_error(vma.clone(), error_code)) {
                 panic!("vma access error");
             }
             let mapper = &mut space_guard.user_mapper.utable;
 
             fault = PageFaultHandler::handle_mm_fault(vma.clone(), mapper, address, flags, regs);
 
-            if !fault.contains(VmFaultReason::VM_FAULT_COMPLETED) {
+            if fault.contains(VmFaultReason::VM_FAULT_COMPLETED) {
                 return;
             }
 
@@ -256,11 +263,7 @@ impl X86_64PageFault {
             | VmFaultReason::VM_FAULT_FALLBACK;
 
         if likely(!fault.contains(vm_fault_error)) {
-            return;
-        }
-
-        if fault.contains(VmFaultReason::VM_FAULT_OOM) {
-            panic!("page fault out of memory");
+            panic!("{:?}", fault)
         }
     }
 }

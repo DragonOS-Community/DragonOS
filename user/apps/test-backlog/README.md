@@ -1,14 +1,9 @@
-# DragonOS Rust-Application Template
-
-您可以使用此模板来创建DragonOS应用程序。
+## 程序说明
+用于测试tcp的backlog功能的测试程序
+本程序绑定到0.0.0.0:12580端口，并在外部手动多线程请求这个端口来测试backlog功能
 
 ## 使用方法
 
-1. 使用DragonOS的tools目录下的`bootstrap.sh`脚本初始化环境
-2. 在终端输入`cargo install cargo-generate`
-3. 在终端输入`cargo generate --git https://github.com/DragonOS-Community/Rust-App-Template`即可创建项目
-如果您的网络较慢，请使用镜像站`cargo generate --git https://git.mirrors.dragonos.org/DragonOS-Community/Rust-App-Template`
-4. 使用`cargo run`来运行项目
-5. 在DragonOS的`user/dadk/config`目录下，使用`dadk new`命令，创建编译配置,安装到DragonOS的`/`目录下。 
-(在dadk的编译命令选项处，请使用Makefile里面的`make install`配置进行编译、安装)
-6. 编译DragonOS即可安装
+1. 打开系统的/bin目录
+2. 输入指令exec test-backlog即可开始测试
+3. 可以在外部使用apifox进行多次请求，当请求数目超过backlog时会有几个请求失败

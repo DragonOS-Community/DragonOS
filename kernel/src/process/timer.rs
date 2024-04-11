@@ -3,7 +3,10 @@ use crate::ipc::signal_types::SigType;
 use crate::libs::mutex::Mutex;
 use crate::process::Pid;
 use crate::process::SigInfo;
-use crate::time::timer::{clock, n_ms_jiffies, next_n_jiffies_tiemr_jiffies, next_n_us_timer_jiffies, timer_jiffies_n_ms, Timer, TimerFunction};
+use crate::time::timer::{
+    clock, n_ms_jiffies, next_n_jiffies_tiemr_jiffies, next_n_us_timer_jiffies, timer_jiffies_n_ms,
+    Timer, TimerFunction,
+};
 use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::compiler_fence;
 use core::time::Duration;
@@ -12,7 +15,9 @@ use system_error::SystemError;
 use super::ProcessManager;
 
 //Jiffies结构体表示一段时间的jiffies
-pub struct Jiffies{jiffies: u64}
+pub struct Jiffies {
+    jiffies: u64,
+}
 
 #[derive(Debug)]
 pub struct AlarmTimer {
@@ -107,17 +112,17 @@ pub fn alarm_timer_init(pid: Pid) -> Arc<AlarmTimer> {
 impl Jiffies {
     //使用一段jiffies初始化
     pub fn new_from_jiffies(jiffies: u64) -> Self {
-        let result = Jiffies{ jiffies };
+        let result = Jiffies { jiffies };
         result
     }
     //使用ms初始化
     pub fn new_from_duration(ms: Duration) -> Self {
         let jiffies = n_ms_jiffies(ms.as_micros() as u64);
-        let result = Jiffies{ jiffies };
+        let result = Jiffies { jiffies };
         result
     }
     //返回jiffies
-    pub fn inner_jiffies(&self) -> u64{
+    pub fn inner_jiffies(&self) -> u64 {
         self.jiffies
     }
     //jiffies转一段时间duration

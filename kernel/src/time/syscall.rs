@@ -1,10 +1,16 @@
-use core::{ffi::{c_int, c_longlong}, time::Duration};
+use core::{
+    ffi::{c_int, c_longlong},
+    time::Duration,
+};
 
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 use crate::{
-    process::{timer::{alarm_timer_init, Jiffies}, ProcessManager},
+    process::{
+        timer::{alarm_timer_init, Jiffies},
+        ProcessManager,
+    },
     syscall::{user_access::UserBufferWriter, Syscall},
     time::{sleep::nanosleep, PosixTimeSpec},
 };
@@ -160,7 +166,7 @@ impl Syscall {
         let pcb = ProcessManager::current_pcb();
         let pcb_alarm = pcb.ref_alarm_timer();
         let alarm = pcb_alarm.as_ref();
-        if alarm.is_none(){
+        if alarm.is_none() {
             drop(pcb_alarm);
             let pid = ProcessManager::current_pid();
             let new_alarm = Some(alarm_timer_init(pid));
@@ -169,17 +175,17 @@ impl Syscall {
         } else {
             let alarmtimer = alarm.as_ref().unwrap();
             let remain = alarmtimer.remain();
-                if second.is_zero() {
-                    alarmtimer.cancel();
-                    return Ok(remain.as_secs() as usize);
-                }
-                if !alarmtimer.timeout() {
-                    alarmtimer.cancel();
-                }
-                //重启alarm
-                let new_expired_jiffies = Jiffies::new_from_duration(second);
-                alarmtimer.restart(new_expired_jiffies);
-                Ok(remain.as_secs() as usize)
+            if second.is_zero() {
+                alarmtimer.cancel();
+                return Ok(remain.as_secs() as usize);
+            }
+            if !alarmtimer.timeout() {
+                alarmtimer.cancel();
+            }
+            //重启alarm
+            let new_expired_jiffies = Jiffies::new_from_duration(second);
+            alarmtimer.restart(new_expired_jiffies);
+            Ok(remain.as_secs() as usize)
         }
     }
 }

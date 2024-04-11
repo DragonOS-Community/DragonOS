@@ -490,7 +490,6 @@ impl ProcessManager {
 
         ProcessManager::current_pcb().preempt_enable();
     }
-
 }
 
 /// 上下文切换的钩子函数,当这个函数return的时候,将会发生上下文切换
@@ -973,7 +972,6 @@ impl ProcessControlBlock {
     pub fn set_alarm_timer(&self, new_alarm: Option<Arc<AlarmTimer>>) {
         *self.alarm_timer.write_irqsave() = new_alarm;
     }
-
 }
 
 impl Drop for ProcessControlBlock {

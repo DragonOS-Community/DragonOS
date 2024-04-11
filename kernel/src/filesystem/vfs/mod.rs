@@ -4,7 +4,7 @@ pub mod file;
 pub mod mount;
 pub mod open;
 pub mod syscall;
-mod utils;
+pub mod utils;
 
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};
@@ -23,7 +23,7 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-use self::{core::generate_inode_id, file::FileMode, syscall::ModeType};
+use self::{core::generate_inode_id, file::FileMode, syscall::ModeType, utils::DName};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
@@ -129,7 +129,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _mode: &FileMode,
     ) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     /// @brief 关闭文件
@@ -138,7 +138,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///         失败：Err(错误码)
     fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     /// @brief 在inode的指定偏移量开始，读取指定大小的数据
@@ -180,7 +180,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @return PollStatus结构体
     fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     /// @brief 获取inode的元数据
@@ -189,7 +189,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///         失败：Err(错误码)
     fn metadata(&self) -> Result<Metadata, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     /// @brief 设置inode的元数据
@@ -198,7 +198,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///         失败：Err(错误码)
     fn set_metadata(&self, _metadata: &Metadata) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     /// @brief 重新设置文件的大小
@@ -210,7 +210,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///         失败：Err(错误码)
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     /// @brief 在当前目录下创建一个新的inode
@@ -227,7 +227,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         file_type: FileType,
         mode: ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        // 若文件系统没有实现此方法，则默认调用其create_with_data方法。如果仍未实现，则会得到一个Err(-EOPNOTSUPP_OR_ENOTSUP)的返回值
+        // 若文件系统没有实现此方法，则默认调用其create_with_data方法。如果仍未实现，则会得到一个Err(-ENOSYS)的返回值
         return self.create_with_data(name, file_type, mode, 0);
     }
 
@@ -248,7 +248,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     /// @brief 在当前目录下，创建一个名为Name的硬链接，指向另一个IndexNode
@@ -260,7 +260,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///         失败：Err(错误码)
     fn link(&self, _name: &str, _other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     /// @brief 在当前目录下，删除一个名为Name的硬链接
@@ -271,7 +271,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///         失败：Err(错误码)
     fn unlink(&self, _name: &str) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     /// @brief 删除文件夹
@@ -281,7 +281,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @return 成功 Ok(())
     /// @return 失败 Err(错误码)
     fn rmdir(&self, _name: &str) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     /// @brief 将指定名称的子目录项的文件内容，移动到target这个目录下。如果_old_name所指向的inode与_target的相同，那么则直接执行重命名的操作。
@@ -301,25 +301,24 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _new_name: &str,
     ) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
-    /// # 修改文件名
-    ///
-    ///
-    /// ## 参数
-    ///
-    /// - _old_name: 源文件路径
-    /// - _new_name: 目标文件路径
-    ///
-    /// ## 返回值
-    /// - Ok(返回值类型): 返回值的说明
-    /// - Err(错误值类型): 错误的说明
-    ///
-    fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    }
+    // /// # 修改文件名
+    // ///
+    // ///
+    // /// ## 参数
+    // ///
+    // /// - _old_name: 源文件路径
+    // /// - _new_name: 目标文件路径
+    // ///
+    // /// ## 返回值
+    // /// - Ok(返回值类型): 返回值的说明
+    // /// - Err(错误值类型): 错误的说明
+    // ///
+    // fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), SystemError> {
+    //     return Err(SystemError::ENOSYS);
+    // }
 
     /// @brief 寻找一个名为Name的inode
     ///
@@ -329,7 +328,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///         失败：Err(错误码)
     fn find(&self, _name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     /// @brief 根据inode号，获取子目录项的名字
@@ -340,7 +339,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///         失败：Err(错误码)
     fn get_entry_name(&self, _ino: InodeId) -> Result<String, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     /// @brief 根据inode号，获取子目录项的名字和元数据
@@ -370,7 +369,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     /// @brief 获取inode所在的文件系统的指针
@@ -386,14 +385,18 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 在当前Inode下，挂载一个新的文件系统
     /// 请注意！该函数只能被MountFS实现，其他文件系统不应实现这个函数
     fn mount(&self, _fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
+    }
+
+    fn absolute_path(&self, _len: usize) -> Result<String, SystemError> {
+        return Err(SystemError::ENOSYS);
     }
 
     /// @brief 截断当前inode到指定的长度。如果当前文件长度小于len,则不操作。
     ///
     /// @param len 要被截断到的目标长度
     fn truncate(&self, _len: usize) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     /// @brief 将当前inode的内容同步到具体设备上
@@ -410,12 +413,21 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _mode: ModeType,
         _dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     /// ## 返回特殊文件的inode
     fn special_node(&self) -> Option<SpecialNodeData> {
         None
+    }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
+
+    /// 
+    fn dparent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        return Err(SystemError::ENOSYS);
     }
 }
 

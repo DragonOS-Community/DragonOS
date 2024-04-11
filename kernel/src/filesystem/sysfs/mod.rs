@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     driver::base::kobject::KObject,
-    filesystem::vfs::ROOT_INODE,
+    filesystem::vfs::{core::do_mount, ROOT_INODE},
     kinfo, kwarn,
     libs::{casting::DowncastArc, once::Once},
 };
@@ -42,11 +42,12 @@ pub fn sysfs_init() -> Result<(), SystemError> {
         unsafe { SYSFS_INSTANCE = Some(sysfs) };
 
         // sysfs 挂载
-        let _t = ROOT_INODE()
-            .find("sys")
-            .expect("Cannot find /sys")
-            .mount(sysfs_instance().fs().clone())
-            .expect("Failed to mount sysfs");
+        // let _t = ROOT_INODE()
+        //     .find("sys")
+        //     .expect("Cannot find /sys")
+        //     .mount(sysfs_instance().fs().clone())
+        //     .expect("Failed to mount sysfs");
+        do_mount(sysfs_instance().fs().clone(), "/sys").expect("Failed to mount sysfs");
         kinfo!("SysFS mounted.");
 
         // kdebug!("sys_bus_init result: {:?}", SYS_BUS_INODE().list());

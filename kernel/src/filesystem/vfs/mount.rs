@@ -4,19 +4,17 @@ use core::{
 };
 
 use alloc::{
-    collections::BTreeMap,
-    sync::{Arc, Weak},
+    collections::BTreeMap, string::{String, ToString}, sync::{Arc, Weak}
 };
 use system_error::SystemError;
 
 use crate::{
     driver::base::device::device_number::DeviceNumber,
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    libs::{casting::DowncastArc, rwlock::RwLock, spinlock::{SpinLock, SpinLockGuard}},
 };
 
 use super::{
-    file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
-    Magic, SuperBlock,
+    file::FileMode, syscall::ModeType, utils::DName, FilePrivateData, FileSystem, FileType, IndexNode, InodeId, Magic, SuperBlock
 };
 
 const MOUNTFS_BLOCK_SIZE: u64 = 512;
@@ -49,21 +47,24 @@ pub struct MountFSInode {
 
 impl MountFS {
     pub fn new(
-        inner_fs: Arc<dyn FileSystem>,
+        inner_filesystem: Arc<dyn FileSystem>,
         self_mountpoint: Option<Arc<MountFSInode>>,
     ) -> Arc<Self> {
-        return MountFS {
-            inner_filesystem: inner_fs,
-            mountpoints: SpinLock::new(BTreeMap::new()),
-            self_mountpoint,
-            self_ref: Weak::default(),
-        }
-        .wrap();
+        return Arc::new_cyclic(|self_ref|
+            MountFS {
+                inner_filesystem,
+                mountpoints: SpinLock::new(BTreeMap::new()),
+                self_mountpoint,
+                self_ref: self_ref.clone(),
+            }
+        );
     }
 
     /// @brief 用Arc指针包裹MountFS对象。
     /// 本函数的主要功能为，初始化MountFS对象中的自引用Weak指针
     /// 本函数只应在构造器中被调用
+    #[allow(dead_code)]
+    #[deprecated]
     fn wrap(self) -> Arc<Self> {
         // 创建Arc指针
         let mount_fs: Arc<MountFS> = Arc::new(self);
@@ -81,12 +82,13 @@ impl MountFS {
 
     /// @brief 获取挂载点的文件系统的root inode
     pub fn mountpoint_root_inode(&self) -> Arc<MountFSInode> {
-        return MountFSInode {
-            inner_inode: self.inner_filesystem.root_inode(),
-            mount_fs: self.self_ref.upgrade().unwrap(),
-            self_ref: Weak::default(),
-        }
-        .wrap();
+        return Arc::new_cyclic(|self_ref|
+            MountFSInode {
+                inner_inode: self.inner_filesystem.root_inode(),
+                mount_fs: self.self_ref.upgrade().unwrap(),
+                self_ref: self_ref.clone(),
+            }
+        );
     }
 
     pub fn inner_filesystem(&self) -> Arc<dyn FileSystem> {
@@ -96,12 +98,25 @@ impl MountFS {
     pub fn self_ref(&self) -> Arc<Self> {
         self.self_ref.upgrade().unwrap()
     }
+
+    /// 卸载文件系统
+    /// # Errors
+    /// 如果当前文件系统是根文件系统，那么将会返回`EINVAL`
+    pub fn umount(&self) -> Result<(), SystemError> {
+        if let Some(parent) = &self.self_mountpoint {
+            return parent.umount();
+        } else {
+            return Err(SystemError::EINVAL);
+        }
+    }
 }
 
 impl MountFSInode {
     /// @brief 用Arc指针包裹MountFSInode对象。
     /// 本函数的主要功能为，初始化MountFSInode对象中的自引用Weak指针
     /// 本函数只应在构造器中被调用
+    #[allow(dead_code)]
+    #[deprecated]
     fn wrap(self) -> Arc<Self> {
         // 创建Arc指针
         let inode: Arc<MountFSInode> = Arc::new(self);
@@ -159,6 +174,55 @@ impl MountFSInode {
     pub(super) fn inode_id(&self) -> InodeId {
         self.metadata().map(|x| x.inode_id).unwrap()
     }
+
+    fn umount(&self) -> Result<(), SystemError> {
+        // 移除挂载点
+        if self.metadata()?.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+        self.mount_fs
+            .mountpoints
+            .lock()
+            .remove(&self.inner_inode.metadata()?.inode_id);
+        return Ok(());
+    }
+
+    pub(super) fn _find(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
+        // 直接调用当前inode所在的文件系统的find方法进行查找
+        // 由于向下查找可能会跨越文件系统的边界，因此需要尝试替换inode
+        let inner_inode = self.inner_inode.find(name)?;
+        return Ok(Arc::new_cyclic(|self_ref|
+            MountFSInode {
+                inner_inode,
+                mount_fs: self.mount_fs.clone(),
+                self_ref: self_ref.clone(),
+            }
+        ).overlaid_inode());
+    }
+
+    pub(super) fn _parent(&self) -> Result<Arc<MountFSInode>, SystemError> {
+        if self.is_mountpoint_root()? {
+            // 当前inode是它所在的文件系统的root inode
+            match &self.mount_fs.self_mountpoint {
+                Some(inode) => {
+                    return inode._find("..");
+                }
+                None => {
+                    return Ok(self.self_ref.upgrade().unwrap());
+                }
+            }
+        } else {
+            let inner_inode = self.inner_inode.find("..")?;
+            // 向上查找时，不会跨过文件系统的边界，因此直接调用当前inode所在的文件系统的find方法进行查找
+            return Ok(Arc::new_cyclic(|self_ref| 
+                MountFSInode {
+                    inner_inode,
+                    mount_fs: self.mount_fs.clone(),
+                    self_ref: self_ref.clone(),
+                }
+            ));
+        }
+    }
 }
 
 impl IndexNode for MountFSInode {
@@ -181,14 +245,16 @@ impl IndexNode for MountFSInode {
         mode: ModeType,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return Ok(MountFSInode {
-            inner_inode: self
-                .inner_inode
-                .create_with_data(name, file_type, mode, data)?,
-            mount_fs: self.mount_fs.clone(),
-            self_ref: Weak::default(),
-        }
-        .wrap());
+        let inner_inode = self
+            .inner_inode
+            .create_with_data(name, file_type, mode,data)?;
+        return Ok(Arc::new_cyclic(|self_ref|
+            MountFSInode {
+                inner_inode,
+                mount_fs: self.mount_fs.clone(),
+                self_ref: self_ref.clone(),
+            }
+        ));
     }
 
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
@@ -247,12 +313,16 @@ impl IndexNode for MountFSInode {
         file_type: FileType,
         mode: ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return Ok(MountFSInode {
-            inner_inode: self.inner_inode.create(name, file_type, mode)?,
-            mount_fs: self.mount_fs.clone(),
-            self_ref: Weak::default(),
-        }
-        .wrap());
+        let inner_inode = self
+            .inner_inode
+            .create(name, file_type, mode)?;
+        return Ok(Arc::new_cyclic(|self_ref|
+            MountFSInode {
+                inner_inode,
+                mount_fs: self.mount_fs.clone(),
+                self_ref: self_ref.clone(),
+            }
+        ));
     }
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
@@ -299,41 +369,23 @@ impl IndexNode for MountFSInode {
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         match name {
             // 查找的是当前目录
-            "" | "." => return Ok(self.self_ref.upgrade().unwrap()),
+            "" | "." => self
+                .self_ref
+                .upgrade()
+                .map(|inode| 
+                    inode as Arc<dyn IndexNode>
+                )
+                .ok_or(SystemError::ENOENT),
             // 往父级查找
-            ".." => {
-                if self.is_mountpoint_root()? {
-                    // 当前inode是它所在的文件系统的root inode
-                    match &self.mount_fs.self_mountpoint {
-                        Some(inode) => {
-                            return inode.find(name);
-                        }
-                        None => {
-                            return Ok(self.self_ref.upgrade().unwrap());
-                        }
-                    }
-                } else {
-                    // 向上查找时，不会跨过文件系统的边界，因此直接调用当前inode所在的文件系统的find方法进行查找
-                    return Ok(MountFSInode {
-                        inner_inode: self.inner_inode.find(name)?,
-                        mount_fs: self.mount_fs.clone(),
-                        self_ref: Weak::default(),
-                    }
-                    .wrap());
-                }
-            }
+            ".." => self.dparent(),
             // 在当前目录下查找
-            _ => {
-                // 直接调用当前inode所在的文件系统的find方法进行查找
-                // 由于向下查找可能会跨越文件系统的边界，因此需要尝试替换inode
-                return Ok(MountFSInode {
-                    inner_inode: self.inner_inode.find(name)?,
-                    mount_fs: self.mount_fs.clone(),
-                    self_ref: Weak::default(),
-                }
-                .wrap()
-                .overlaid_inode());
-            }
+            // 直接调用当前inode所在的文件系统的find方法进行查找
+            // 由于向下查找可能会跨越文件系统的边界，因此需要尝试替换inode
+            _ => self
+                ._find(name)
+                .map(|inode|
+                    inode as Arc<dyn IndexNode>
+                ),
         }
     }
 
@@ -366,6 +418,8 @@ impl IndexNode for MountFSInode {
     }
 
     /// @brief 在当前inode下，挂载一个文件系统
+    /// 
+    /// 传入一个裸的具体文件系统，包装Mount信息并挂载
     ///
     /// @return Ok(Arc<MountFS>) 挂载成功，返回指向MountFS的指针
     fn mount(&self, fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, SystemError> {
@@ -375,9 +429,21 @@ impl IndexNode for MountFSInode {
         }
 
         // 为新的挂载点创建挂载文件系统
-        let new_mount_fs: Arc<MountFS> = MountFS::new(fs, Some(self.self_ref.upgrade().unwrap()));
+        // let new_mount_fs: Arc<MountFS> = MountFS::new(fs, Some(self.self_ref.upgrade().unwrap()));
+        let new_mount_fs = fs.clone()
+            .downcast_arc::<MountFS>()
+            .unwrap_or(MountFS::new(fs, Some(self.self_ref.upgrade().unwrap())));
         self.do_mount(metadata.inode_id, new_mount_fs.clone())?;
         return Ok(new_mount_fs);
+    }
+
+    fn absolute_path(&self, len: usize) -> Result<String, SystemError> {
+        let parent = self.dparent()?;
+        if self.metadata()?.inode_id == parent.metadata()?.inode_id {
+            return Ok(String::with_capacity(len));
+        }
+        let name = self.dname()?;
+        return Ok(parent.absolute_path(len + name.0.lock().len())? + &name.0.lock());
     }
 
     #[inline]
@@ -387,12 +453,14 @@ impl IndexNode for MountFSInode {
         mode: ModeType,
         dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return Ok(MountFSInode {
-            inner_inode: self.inner_inode.mknod(filename, mode, dev_t)?,
-            mount_fs: self.mount_fs.clone(),
-            self_ref: Weak::default(),
-        }
-        .wrap());
+        let inner_inode = self.inner_inode.mknod(filename, mode, dev_t)?;
+        return Ok(Arc::new_cyclic(|self_ref| 
+            MountFSInode {
+                inner_inode,
+                mount_fs: self.mount_fs.clone(),
+                self_ref: self_ref.clone(),
+            }
+        ));
     }
 
     #[inline]
@@ -403,6 +471,23 @@ impl IndexNode for MountFSInode {
     #[inline]
     fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
         self.inner_inode.poll(private_data)
+    }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        return self
+            .inner_inode
+            .dname()
+            .or(
+                self
+                    .dparent()?
+                    .get_entry_name(
+                        self.metadata()?.inode_id
+                    ).map(|name| DName::from(name))
+            );
+    }
+
+    fn dparent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        return self._parent().map(|inode| inode as Arc<dyn IndexNode>);
     }
 }
 
@@ -430,5 +515,104 @@ impl FileSystem for MountFS {
     }
     fn super_block(&self) -> SuperBlock {
         SuperBlock::new(Magic::MOUNT_MAGIC, MOUNTFS_BLOCK_SIZE, MOUNTFS_MAX_NAMELEN)
+    }
+}
+
+/// MountList
+/// 
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct MountPath(String);
+
+impl From<&str> for MountPath {
+    fn from(value: &str) -> Self {
+        Self(String::from(value))
+    }
+}
+
+impl From<String> for MountPath {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for MountPath {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialOrd for MountPath {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MountPath {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        let self_dep = self.0.chars().filter(|c| *c == '/').count();
+        let othe_dep = other.0.chars().filter(|c| *c == '/').count();
+        if self_dep == othe_dep {
+            self.0.cmp(&other.0)
+        } else {
+            othe_dep.cmp(&self_dep)
+        }
+    }
+}
+
+// 维护一个挂载点的记录，以支持特定于文件系统的索引
+type MountListType = Option<Arc<RwLock<BTreeMap<MountPath, Arc<MountFS>>>>>;
+pub struct MountList(MountListType);
+static mut __MOUNTS_LIST: MountList = MountList(None);
+
+impl MountList {
+    /// 初始化挂载点
+    pub fn init() {
+        unsafe {
+            __MOUNTS_LIST = MountList(Some(Arc::new(RwLock::new(BTreeMap::new()))));
+        }
+    }
+
+    fn instance() -> &'static Arc<RwLock<BTreeMap<MountPath, Arc<MountFS>>>> {
+        unsafe {
+            if __MOUNTS_LIST.0.is_none() {
+                MountList::init();
+            }
+            return __MOUNTS_LIST.0.as_ref().unwrap();
+        }
+    }
+
+    /// 在 **路径`path`** 下挂载 **文件系统`fs`**
+    pub fn insert<T: AsRef<str>>(path: T, fs: Arc<MountFS>) {
+        MountList::instance()
+            .write()
+            .insert(MountPath::from(path.as_ref()), fs);
+    }
+
+    /// 获取挂载点信息，返回
+    ///
+    /// - `最近的挂载点`
+    /// - `挂载点下的路径`
+    /// - `文件系统`
+    /// # None
+    /// 未找到挂载点
+    pub fn get<T: AsRef<str>>(path: T) -> Option<(String, String, Arc<MountFS>)> {
+        MountList::instance()
+            .upgradeable_read()
+            .iter()
+            .filter_map(|(key, fs)| {
+                let strkey = key.as_ref();
+                if let Some(rest) = path.as_ref().strip_prefix(strkey) {
+                    return Some((strkey.to_string(), rest.to_string(), fs.clone()));
+                }
+                None
+            })
+            .next()
+    }
+
+    pub fn remove<T: Into<MountPath>>(path: T) -> Option<Arc<MountFS>> {
+        MountList::instance()
+            .write()
+            .remove(&path.into())
     }
 }

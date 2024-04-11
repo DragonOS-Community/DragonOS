@@ -1811,6 +1811,14 @@ impl IndexNode for LockedFATInode {
     fn special_node(&self) -> Option<SpecialNodeData> {
         self.0.lock().special_node.clone()
     }
+
+    // fn dname(&self) -> Result<String, SystemError> {
+    //     self.0.lock().
+    // }
+
+    fn dparent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.0.lock().parent.upgrade().map(|item| item as Arc<dyn IndexNode> ).ok_or(SystemError::EINVAL)
+    }
 }
 
 impl Default for FATFsInfo {

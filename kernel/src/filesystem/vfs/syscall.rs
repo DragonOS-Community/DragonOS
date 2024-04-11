@@ -452,6 +452,17 @@ bitflags! {
         const RESOLVE_CACHED = 0x20;
     }
 }
+
+bitflags! {
+    pub struct UmountFlag: i32 {
+        const DEFAULT = 0;          /* Default call to umount. */
+        const MNT_FORCE = 1;        /* Force unmounting.  */
+        const MNT_DETACH = 2;       /* Just detach from the tree.  */
+        const MNT_EXPIRE = 4;       /* Mark for expiry.  */
+        const UMOUNT_NOFOLLOW = 8;  /* Don't follow symlink on umount.  */
+    }
+}
+
 impl Syscall {
     /// @brief 为当前进程打开一个文件
     ///
@@ -928,9 +939,9 @@ impl Syscall {
     ///
     /// ## 参数
     ///
-    /// - oldfd: 源文件描述符
+    /// - oldfd: 源文件夹文件描述符
     /// - filename_from: 源文件路径
-    /// - newfd: 目标文件描述符
+    /// - newfd: 目标文件夹文件描述符
     /// - filename_to: 目标文件路径
     /// - flags: 标志位
     ///
@@ -1549,6 +1560,20 @@ impl Syscall {
     // 1. 接受从上方传来的文件类型字符串
     // 2. 将传入值与启动时准备好的字符串数组逐个比较（probe）
     // 3. 直接在函数内调用构造方法并直接返回文件系统对象
+
+    /// src/linux/mount.c `umount`` & `umount2``
+    pub fn umount2(target: *const u8, flags: i32) -> Result<(), SystemError> {
+        let target = user_access::check_and_clone_cstr(
+            target,
+            Some(MAX_PATHLEN),
+        )?;
+        Vcore::do_umount2(
+            AtFlags::AT_FDCWD.bits(),
+            &target,
+            UmountFlag::from_bits(flags).ok_or(SystemError::EINVAL)?,
+        )?;
+        return Ok(());
+    }
 }
 
 #[repr(C)]

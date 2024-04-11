@@ -381,11 +381,6 @@ impl IndexNode for KernFSInode {
             .unwrap()
             .write(callback_data, &buf[..len], offset);
     }
-
-    fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), SystemError> {
-        // 待实现
-        Err(SystemError::ENOSYS)
-    }
 }
 
 impl KernFSInode {

@@ -1,7 +1,7 @@
 use core::hint::spin_loop;
 
 use alloc::{
-    string::ToString,
+    string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -30,8 +30,7 @@ use crate::{
         devfs::{devfs_register, DevFS, DeviceINode},
         kernfs::KernFSInode,
         vfs::{
-            core::generate_inode_id, syscall::ModeType, FilePrivateData, FileSystem, FileType,
-            IndexNode, Metadata,
+            core::generate_inode_id, syscall::ModeType, utils::DName, FilePrivateData, FileSystem, FileType, IndexNode, Metadata
         },
     },
     libs::{
@@ -654,6 +653,10 @@ impl IndexNode for Ps2MouseDevice {
 
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
         Ok(())
+    }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        Ok(DName::from(self.name()))
     }
 }
 

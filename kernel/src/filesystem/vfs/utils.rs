@@ -1,7 +1,13 @@
+use core::{any::Any};
+use core::fmt::Debug;
+use core::cmp::Ordering;
+use core::hash::Hash;
+
+use alloc::string::ToString;
 use alloc::{string::String, sync::Arc};
 use system_error::SystemError;
 
-use crate::process::ProcessControlBlock;
+use crate::{libs::spinlock::SpinLock, process::ProcessControlBlock};
 
 use super::{fcntl::AtFlags, FileType, IndexNode, ROOT_INODE};
 
@@ -71,4 +77,126 @@ pub fn user_path_at(
     }
 
     return Ok((inode, ret_path));
+}
+
+
+// pub trait Keyable: Any + Sync + Send + Debug {
+//     fn key(&self) -> Arc<String>;
+// }
+
+// #[derive(Debug)]
+// pub enum Key<T: Keyable> {
+//     Inner(T),
+//     Cmp(Arc<String>),
+// }
+
+// impl<T: Keyable> Key<T> {
+//     pub fn unwrap(&self) -> Arc<String> {
+//         match self {
+//             Key::Inner(k) => k.key(),
+//             Key::Cmp(k) => k.clone(),
+//         }
+//     }
+// }
+
+// impl<T: Keyable> Hash for Key<T> {
+//     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+//         self.unwrap().hash(state)
+//     }
+// }
+
+// impl<T: Keyable> PartialEq for Key<T> {
+//     fn eq(&self, other: &Self) -> bool {
+//         self.unwrap() == other.unwrap()
+//     }
+// }
+
+// impl<T: Keyable> Eq for Key<T> {}
+
+// impl<T: Keyable> PartialOrd for Key<T> {
+//     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+//         Some(self.cmp(other))
+//     }
+// }
+
+// impl<T: Keyable> Ord for Key<T> {
+//     fn cmp(&self, other: &Self) -> Ordering {
+//         self.unwrap().cmp(&other.unwrap())
+//     }
+// }
+
+#[derive(Debug)]
+pub struct DName(pub Arc<SpinLock<String>>);
+
+impl PartialEq for DName {
+    fn eq(&self, other: &Self) -> bool {
+        return *self.0.lock() == *other.0.lock()
+    }
+}
+impl Eq for DName {}
+
+impl Hash for DName {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.0.lock().hash(state)
+    }
+}
+
+impl PartialOrd for DName {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(&other))
+    }
+}
+
+impl Ord for DName {
+    fn cmp(&self, other: &Self) -> Ordering {
+        return self.0.lock().cmp(&(*other.0.lock()))
+    }
+}
+
+impl Default for DName {
+    fn default() -> Self {
+        Self(Arc::new(SpinLock::new(String::new())))
+    }
+}
+
+impl From<String> for DName {
+    fn from(value: String) -> Self {
+        Self(Arc::from(SpinLock::new(value)))
+    }
+}
+
+impl From<&str> for DName {
+    fn from(value: &str) -> Self {
+        Self(Arc::from(SpinLock::new(String::from(value))))
+    }
+}
+
+impl Clone for DName {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+// impl AsRef<String> for DName {
+//     fn as_ref(&self) -> &String {
+//         &self.0.lock()
+//     }
+// }
+
+// impl AsMut<String> for DName {
+//     fn as_mut(&mut self) -> &mut String {
+//         &mut self.0.lock()
+//     }
+// }
+
+// impl AsRef<DName> for str {
+//     fn as_ref(&self) -> &DName {
+//         &DName::from(self)
+//     }
+// }
+
+impl ToString for DName {
+    fn to_string(&self) -> String {
+        self.0.lock().clone()
+    }
 }

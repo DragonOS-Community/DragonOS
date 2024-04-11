@@ -18,10 +18,7 @@ use crate::{
 };
 
 use super::{
-    file::FileMode,
-    mount::MountFSInode,
-    utils::{rsplit_path, user_path_at},
-    IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    file::FileMode, mount::{MountFSInode, MountList}, open::do_sys_open, syscall::UmountFlag, utils::{rsplit_path, user_path_at}, IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES
 };
 
 /// @brief 原子地生成新的Inode号。
@@ -87,14 +84,13 @@ pub fn vfs_init() -> Result<(), SystemError> {
 /// @param mountpoint_name 在根目录下的挂载点的名称
 /// @param inode 原本的挂载点的inode
 fn do_migrate(
-    new_root_inode: Arc<dyn IndexNode>,
+    new_root_inode: &Arc<dyn IndexNode>,
     mountpoint_name: &str,
-    fs: &MountFS,
+    fs: Arc<dyn FileSystem>,
 ) -> Result<(), SystemError> {
-    let r = new_root_inode.find(mountpoint_name);
-    let mountpoint = if let Ok(r) = r {
-        r
-    } else {
+    new_root_inode
+        .find(mountpoint_name)
+        .unwrap_or(
         new_root_inode
             .create(
                 mountpoint_name,
@@ -102,10 +98,13 @@ fn do_migrate(
                 ModeType::from_bits_truncate(0o755),
             )
             .unwrap_or_else(|_| panic!("Failed to create '/{mountpoint_name}' in migrating"))
-    };
+    );
+
     // 迁移挂载点
-    let inode = mountpoint.arc_any().downcast::<MountFSInode>().unwrap();
-    inode.do_mount(inode.inode_id(), fs.self_ref())?;
+    // let inode = mountpoint.arc_any().downcast::<MountFSInode>().unwrap();
+    // inode.do_mount(inode.inode_id(), fs.self_ref())?;
+    // mountpoint.mount(fs.clone())?;
+    do_mount(fs, mountpoint_name)?;
 
     return Ok(());
 }
@@ -114,30 +113,29 @@ fn do_migrate(
 /// 请注意，为了避免删掉了伪文件系统内的信息，因此没有在原root inode那里调用unlink.
 fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemError> {
     kinfo!("VFS: Migrating filesystems...");
-
-    // ==== 在这里获取要被迁移的文件系统的inode ===
-    let binding = ROOT_INODE().find("proc").expect("ProcFS not mounted!").fs();
-    let proc: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
-    let binding = ROOT_INODE().find("dev").expect("DevFS not mounted!").fs();
-    let dev: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
-    let binding = ROOT_INODE().find("sys").expect("SysFs not mounted!").fs();
-    let sys: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
-
+    
     let new_fs = MountFS::new(new_fs, None);
     // 获取新的根文件系统的根节点的引用
     let new_root_inode = new_fs.root_inode();
 
-    // 把上述文件系统,迁移到新的文件系统下
-    do_migrate(new_root_inode.clone(), "proc", proc)?;
-    do_migrate(new_root_inode.clone(), "dev", dev)?;
-    do_migrate(new_root_inode.clone(), "sys", sys)?;
     unsafe {
         // drop旧的Root inode
         let old_root_inode = __ROOT_INODE.take().unwrap();
-        drop(old_root_inode);
+
+        // ==== 在这里获取要被迁移的文件系统的inode ===
+        let proc = old_root_inode.find("proc").expect("ProcFS not mounted!").fs();
+        let dev = old_root_inode.find("dev").expect("DevFS not mounted!").fs();
+        let sys = old_root_inode.find("sys").expect("SysFs not mounted!").fs();
 
         // 设置全局的新的ROOT Inode
-        __ROOT_INODE = Some(new_root_inode);
+        __ROOT_INODE = Some(new_root_inode.clone());
+
+        // 把上述文件系统,迁移到新的文件系统下
+        do_migrate(&new_root_inode, "/proc", proc)?;
+        do_migrate(&new_root_inode, "/dev", dev)?;
+        do_migrate(&new_root_inode, "/sys", sys)?;
+    
+        drop(old_root_inode);
     }
 
     kinfo!("VFS: Migrate filesystems done!");
@@ -275,9 +273,27 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 }
 
 // @brief mount filesystem
+/// 总是应该从此处挂载文件系统
 pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<usize, SystemError> {
-    ROOT_INODE()
+    let fs = ROOT_INODE()
         .lookup_follow_symlink(mount_point, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
         .mount(fs)?;
+    MountList::insert(mount_point, fs);
     Ok(0)
+}
+
+/// 总是应该从此处卸载文件系统
+pub fn do_umount2(dirfd: i32, target: &str, _flag: UmountFlag) -> Result<Arc<MountFS>, SystemError> {
+    let (work, rest) = user_path_at(&ProcessManager::current_pcb(), dirfd, &target)?;
+    let path = work.absolute_path(0)? + &rest;
+    let do_umount = || -> Result<Arc<MountFS>, SystemError> {
+        if let Some(fs) = MountList::remove(path) {
+            // Todo: 占用检测
+            // kdebug!("Umount Target found!");
+            fs.umount()?;
+            return Ok(fs);
+        }
+        return Err(SystemError::EINVAL);
+    };
+    return do_umount();
 }

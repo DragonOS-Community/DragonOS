@@ -9,13 +9,10 @@ use super::vfs::{
     FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
 };
 use crate::{
-    driver::base::device::device_number::DeviceNumber,
-    kerror, kinfo,
-    libs::{
+    driver::base::device::device_number::DeviceNumber, filesystem::vfs::core::do_mount, kerror, kinfo, libs::{
         once::Once,
         spinlock::{SpinLock, SpinLockGuard},
-    },
-    time::PosixTimeSpec,
+    }, time::PosixTimeSpec
 };
 use alloc::{
     collections::BTreeMap,
@@ -591,11 +588,12 @@ pub fn devfs_init() -> Result<(), SystemError> {
         // 创建 devfs 实例
         let devfs: Arc<DevFS> = DevFS::new();
         // devfs 挂载
-        let _t = ROOT_INODE()
-            .find("dev")
-            .expect("Cannot find /dev")
-            .mount(devfs)
-            .expect("Failed to mount devfs");
+        // let _t = ROOT_INODE()
+        //     .find("dev")
+        //     .expect("Cannot find /dev")
+        //     .mount(devfs)
+        //     .expect("Failed to mount devfs");
+        do_mount(devfs, "/dev").expect("Failed to mount devfs");
         kinfo!("DevFS mounted.");
         result = Some(Ok(()));
     });

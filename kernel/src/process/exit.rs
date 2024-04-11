@@ -6,10 +6,10 @@ use system_error::SystemError;
 use crate::{
     arch::{
         ipc::signal::{SigChildCode, Signal},
-        sched::sched,
         CurrentIrqArch,
     },
     exception::InterruptArch,
+    sched::{schedule, SchedMode},
     syscall::user_access::UserBufferWriter,
 };
 
@@ -164,7 +164,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                 }
             }
             drop(irq_guard);
-            sched();
+            schedule(SchedMode::SM_NONE);
         } else {
             // todo: 对于pgid的处理
             kwarn!("kernel_wait4: currently not support {:?}", kwo.pid_type);

@@ -7,7 +7,7 @@ use crate::filesystem::vfs::file::FileMode;
 
 use super::{
     termios::Termios,
-    tty_core::{TtyCore, TtyCoreData},
+    tty_core::{TtyCore, TtyCoreData, TtyFlag},
 };
 
 pub mod ntty;
@@ -99,7 +99,7 @@ impl TtyLdiscManager {
     /// ### 参数
     /// - tty：需要设置的tty
     /// - o_tty: other tty 用于pty pair
-    pub fn ldisc_setup(tty: Arc<TtyCore>, _o_tty: Option<Arc<TtyCore>>) -> Result<(), SystemError> {
+    pub fn ldisc_setup(tty: Arc<TtyCore>, o_tty: Option<Arc<TtyCore>>) -> Result<(), SystemError> {
         let ld = tty.ldisc();
 
         let ret = ld.open(tty);
@@ -109,7 +109,16 @@ impl TtyLdiscManager {
             }
         }
 
-        // TODO: 处理PTY
+        // 处理PTY
+        if let Some(o_tty) = o_tty {
+            let ld = o_tty.ldisc();
+
+            let ret: Result<(), SystemError> = ld.open(o_tty.clone());
+            if ret.is_err() {
+                o_tty.core().flags_write().remove(TtyFlag::LDISC_OPEN);
+                let _ = ld.close(o_tty.clone());
+            }
+        }
 
         Ok(())
     }

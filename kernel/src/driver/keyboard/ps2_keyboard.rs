@@ -27,8 +27,12 @@ use crate::{
         },
     },
     init::initcall::INITCALL_DEVICE,
-    libs::{keyboard_parser::TypeOneFSM, rwlock::RwLock, spinlock::SpinLock},
-    time::TimeSpec,
+    libs::{
+        keyboard_parser::TypeOneFSM,
+        rwlock::RwLock,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
+    time::PosixTimeSpec,
 };
 use system_error::SystemError;
 
@@ -79,9 +83,9 @@ impl LockedPS2KeyBoardInode {
                 size: 0,
                 blk_size: 0,
                 blocks: 0,
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type: FileType::CharDevice, // 文件夹，block设备，char设备
                 mode: ModeType::from_bits_truncate(0o666),
                 nlinks: 1,
@@ -115,7 +119,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
     }
@@ -125,16 +129,20 @@ impl IndexNode for LockedPS2KeyBoardInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         return Ok(());
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 

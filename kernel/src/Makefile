@@ -36,7 +36,7 @@ export ASFLAGS := --64
 LD_LIST := ""
 
 
-kernel_subdirs := common driver debug syscall libs time
+kernel_subdirs := common driver debug syscall libs
 
 
 kernel_rust:
@@ -65,7 +65,7 @@ kernel: $(kernel_subdirs) kernel_rust
 
 __link_riscv64_kernel:
 	@echo "Linking kernel..."
-	$(LD) -b elf64-littleriscv -z muldefs $(LDFLAGS_UNWIND) -o kernel $(shell find . -name "*.o") ../target/riscv64imac-unknown-none-elf/release/libdragonos_kernel.a -T arch/riscv64/link.ld --no-relax
+	$(LD) -b elf64-littleriscv -z muldefs $(LDFLAGS_UNWIND) -o kernel $(shell find . -name "*.o") ../target/riscv64gc-unknown-none-elf/release/libdragonos_kernel.a -T arch/riscv64/link.ld --no-relax
 	$(OBJCOPY) -I elf64-littleriscv -O elf64-littleriscv -R ".eh_frame" kernel ../../bin/kernel/kernel.elf
 	@rm kernel
 	$(MAKE) __dragon_stub PAYLOAD_ELF="$(shell pwd)/../../bin/kernel/kernel.elf"

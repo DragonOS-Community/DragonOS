@@ -1,6 +1,7 @@
 use crate::{
     arch::{
         init::{early_setup_arch, setup_arch, setup_arch_post},
+        time::time_init,
         CurrentIrqArch, CurrentSMPArch, CurrentSchedArch,
     },
     driver::{base::init::driver_init, serial::serial_early_init, video::VideoRefreshManager},
@@ -17,7 +18,7 @@ use crate::{
     },
     mm::init::mm_init,
     process::{kthread::kthread_init, process_init, ProcessManager},
-    sched::{core::sched_init, SchedArch},
+    sched::SchedArch,
     smp::{early_smp_init, SMPArch},
     syscall::Syscall,
     time::{
@@ -59,16 +60,18 @@ fn do_start_kernel() {
     unsafe {
         acpi_init()
     };
+    crate::sched::sched_init();
     process_init();
     early_smp_init().expect("early smp init failed");
     irq_init().expect("irq init failed");
     setup_arch().expect("setup_arch failed");
     CurrentSMPArch::prepare_cpus().expect("prepare_cpus failed");
 
-    sched_init();
+    // sched_init();
     softirq_init().expect("softirq init failed");
     Syscall::init().expect("syscall init failed");
     timekeeping_init();
+    time_init();
     timer_init();
     kthread_init();
     clocksource_boot_finish();

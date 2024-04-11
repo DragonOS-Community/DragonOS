@@ -13,7 +13,7 @@ use crate::{
         subsys::SubSysPrivate,
     },
     init::initcall::INITCALL_SUBSYS,
-    time::{timekeeping::do_settimeofday64, TimeSpec},
+    time::{timekeeping::do_settimeofday64, PosixTimeSpec},
 };
 
 use super::{interface::rtc_read_time, register_default_rtc, sysfs::RtcGeneralDevice};
@@ -96,7 +96,7 @@ fn rtc_hctosys(dev: &Arc<RtcGeneralDevice>) {
     }
 
     let time = r.unwrap();
-    let timespec64: TimeSpec = time.into();
+    let timespec64: PosixTimeSpec = time.into();
     let r = do_settimeofday64(timespec64);
     dev.set_hc2sys_result(r);
 

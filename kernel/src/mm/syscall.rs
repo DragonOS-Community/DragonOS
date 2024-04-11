@@ -5,6 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
+    ipc::shm::ShmFlags,
     kerror,
     libs::align::{check_aligned, page_align_up},
     mm::MemoryManagementArch,
@@ -107,6 +108,28 @@ impl From<ProtFlags> for VmFlags {
 
         if prot_flags.contains(ProtFlags::PROT_EXEC) {
             vm_flags |= VmFlags::VM_EXEC;
+        }
+
+        vm_flags
+    }
+}
+
+impl From<ShmFlags> for VmFlags {
+    fn from(shm_flags: ShmFlags) -> Self {
+        let mut vm_flags = VmFlags::VM_NONE;
+
+        if shm_flags.contains(ShmFlags::SHM_RDONLY) {
+            vm_flags |= VmFlags::VM_READ;
+        } else {
+            vm_flags |= VmFlags::VM_READ | VmFlags::VM_WRITE;
+        }
+
+        if shm_flags.contains(ShmFlags::SHM_EXEC) {
+            vm_flags |= VmFlags::VM_EXEC;
+        }
+
+        if shm_flags.contains(ShmFlags::SHM_HUGETLB) {
+            vm_flags |= VmFlags::VM_HUGETLB;
         }
 
         vm_flags

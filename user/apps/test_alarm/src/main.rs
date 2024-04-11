@@ -34,7 +34,7 @@ fn main() {
         println!("Remaining time for previous alarm: {}", remaining);
     }
     unsafe {
-        sleep(6);
+        sleep(8);
     }
     println!("Test 2 complete");
 

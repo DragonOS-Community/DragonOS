@@ -162,18 +162,10 @@ impl Syscall {
     pub fn alarm(expire_second: u32) -> Result<usize, SystemError> {
         //初始化second
         let second = Duration::from_secs(expire_second as u64);
-        //获得剩余时间
         let pcb = ProcessManager::current_pcb();
         let pcb_alarm = pcb.ref_alarm_timer();
         let alarm = pcb_alarm.as_ref();
-        if alarm.is_none() {
-            drop(pcb_alarm);
-            let pid = ProcessManager::current_pid();
-            let new_alarm = Some(alarm_timer_init(pid));
-            ProcessManager::current_pcb().set_alarm_timer(new_alarm);
-            Ok(0)
-        } else {
-            let alarmtimer = alarm.as_ref().unwrap();
+        if let Some(alarmtimer) = alarm {
             let remain = alarmtimer.remain();
             if second.is_zero() {
                 alarmtimer.cancel();
@@ -185,7 +177,12 @@ impl Syscall {
             //重启alarm
             let new_expired_jiffies = Jiffies::new_from_duration(second);
             alarmtimer.restart(new_expired_jiffies);
-            Ok(remain.as_secs() as usize)
-        }
+            return Ok(remain.as_secs() as usize);
+        };
+        drop(pcb_alarm);
+        let pid = ProcessManager::current_pid();
+        let new_alarm = Some(alarm_timer_init(pid));
+        ProcessManager::current_pcb().set_alarm_timer(new_alarm);
+        Ok(0)
     }
 }

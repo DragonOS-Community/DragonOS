@@ -100,13 +100,12 @@ impl TimerFunction for AlarmTimerFunc {
 }
 
 //初始化目标进程的alarm定时器
-pub fn alarm_timer_init(pid: Pid) -> Arc<AlarmTimer> {
+pub fn alarm_timer_init(pid: Pid) -> AlarmTimer {
     //初始化Timerfunc
     let timerfunc = AlarmTimerFunc::new(pid);
     let alarmtimer = AlarmTimer::new(timerfunc);
-    let result = Arc::new(alarmtimer);
-    result.activate();
-    result
+    alarmtimer.activate();
+    alarmtimer
 }
 
 impl Jiffies {

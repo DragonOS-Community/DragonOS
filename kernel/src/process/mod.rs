@@ -637,7 +637,7 @@ pub struct ProcessControlBlock {
     thread: RwLock<ThreadInfo>,
 
     ///闹钟定时器
-    alarm_timer: RwLock<Option<Arc<AlarmTimer>>>,
+    alarm_timer: RwLock<Option<AlarmTimer>>,
 
     /// 进程的robust lock列表
     robust_list: RwLock<Option<RobustListHead>>,
@@ -965,12 +965,12 @@ impl ProcessControlBlock {
         *self.robust_list.write_irqsave() = new_robust_list;
     }
 
-    pub fn ref_alarm_timer(&self) -> RwLockReadGuard<Option<Arc<AlarmTimer>>> {
-        return self.alarm_timer.read_irqsave();
+    pub fn ref_alarm_timer(&self) -> RwLockReadGuard<Option<AlarmTimer>> {
+        return self.alarm_timer.read();
     }
 
-    pub fn set_alarm_timer(&self, new_alarm: Option<Arc<AlarmTimer>>) {
-        *self.alarm_timer.write_irqsave() = new_alarm;
+    pub fn set_alarm_timer(&self, new_alarm: Option<AlarmTimer>) {
+        *self.alarm_timer.write() = new_alarm;
     }
 }
 

@@ -67,6 +67,7 @@ pub fn vfs_init() -> Result<(), SystemError> {
     root_inode
         .create("sys", FileType::Dir, ModeType::from_bits_truncate(0o755))
         .expect("Failed to create /sys");
+
     kdebug!("dir in root:{:?}", root_inode.list());
 
     procfs_init().expect("Failed to initialize procfs");
@@ -74,6 +75,8 @@ pub fn vfs_init() -> Result<(), SystemError> {
     devfs_init().expect("Failed to initialize devfs");
 
     sysfs_init().expect("Failed to initialize sysfs");
+
+   
 
     let root_entries = ROOT_INODE().list().expect("VFS init failed");
     if !root_entries.is_empty() {
@@ -122,6 +125,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     let dev: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
     let binding = ROOT_INODE().find("sys").expect("SysFs not mounted!").fs();
     let sys: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
+   
 
     let new_fs = MountFS::new(new_fs, None);
     // 获取新的根文件系统的根节点的引用
@@ -131,6 +135,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     do_migrate(new_root_inode.clone(), "proc", proc)?;
     do_migrate(new_root_inode.clone(), "dev", dev)?;
     do_migrate(new_root_inode.clone(), "sys", sys)?;
+
     unsafe {
         // drop旧的Root inode
         let old_root_inode = __ROOT_INODE.take().unwrap();

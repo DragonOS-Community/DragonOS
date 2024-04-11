@@ -324,12 +324,15 @@ impl IndexNode for SocketInode {
             }
 
             socket.clear_epoll()?;
+            
 
             HANDLE_MAP
                 .write_irqsave()
                 .remove(&socket.socket_handle())
                 .unwrap();
         }
+        
+
         Ok(())
     }
 
@@ -419,7 +422,7 @@ impl SocketHandleItem {
                 .wait_queue
                 .sleep_without_schedule(events)
         };
-        drop(handle_map_guard);
+        drop(handle_map_guard);      
         schedule(SchedMode::SM_NONE);
     }
 
@@ -455,9 +458,9 @@ impl SocketHandleItem {
 /// 如果 TCP/UDP 的 socket 绑定了某个端口，它会在对应的表中记录，以检测端口冲突。
 pub struct PortManager {
     // TCP 端口记录表
-    tcp_port_table: SpinLock<HashMap<u16, Arc<GlobalSocketHandle>>>,
+    tcp_port_table: SpinLock<HashMap<u16, Arc<dyn Socket>>>,
     // UDP 端口记录表
-    udp_port_table: SpinLock<HashMap<u16, Arc<GlobalSocketHandle>>>,
+    udp_port_table: SpinLock<HashMap<u16, Arc<dyn Socket>>>,
 }
 
 impl PortManager {
@@ -513,7 +516,7 @@ impl PortManager {
         &self,
         socket_type: SocketType,
         port: u16,
-        handle: Arc<GlobalSocketHandle>,
+        socket: impl Socket,
     ) -> Result<(), SystemError> {
         if port > 0 {
             let mut listen_table_guard = match socket_type {
@@ -523,7 +526,7 @@ impl PortManager {
             };
             match listen_table_guard.get(&port) {
                 Some(_) => return Err(SystemError::EADDRINUSE),
-                None => listen_table_guard.insert(port, handle),
+                None => listen_table_guard.insert(port, Arc::new(socket)),
             };
             drop(listen_table_guard);
         }

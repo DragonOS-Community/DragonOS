@@ -411,13 +411,13 @@ impl Syscall {
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        // kdebug!("accept: socket={:?}", socket);
+        kdebug!("accept: socket={:?}", socket);
         let mut socket = unsafe { socket.inner_no_preempt() };
         // 从socket中接收连接
         let (new_socket, remote_endpoint) = socket.accept()?;
         drop(socket);
 
-        // kdebug!("accept: new_socket={:?}", new_socket);
+        kdebug!("accept: new_socket={:?}", new_socket);
         // Insert the new socket into the file descriptor vector
         let new_socket: Arc<SocketInode> = SocketInode::new(new_socket);
 

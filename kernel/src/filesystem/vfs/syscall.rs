@@ -723,7 +723,7 @@ impl Syscall {
         let cwd_len = cwd_bytes.len();
         if cwd_len + 1 > buf.len() {
             return Err(SystemError::ENOMEM);
-        }
+        } //use get for reference
         buf[..cwd_len].copy_from_slice(cwd_bytes);
         buf[cwd_len] = 0;
 

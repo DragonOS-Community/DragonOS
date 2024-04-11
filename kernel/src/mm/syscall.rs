@@ -72,6 +72,47 @@ bitflags! {
         const MREMAP_FIXED = 2;
         const MREMAP_DONTUNMAP = 4;
     }
+
+
+    pub struct MadvFlags: u64 {
+        const MADV_NORMAL = 0;		/* no further special treatment */
+        const MADV_RANDOM = 1;		/* expect random page references */
+        const MADV_SEQUENTIAL = 2;		/* expect sequential page references */
+        const MADV_WILLNEED = 3;		/* will need these pages */
+        const MADV_DONTNEED = 4;		/* don't need these pages */
+
+        /* common parameters: try to keep these consistent across architectures */
+        const MADV_FREE = 8;		/* free pages only if memory pressure */
+        const MADV_REMOVE = 9;		/* remove these pages & resources */
+        const MADV_DONTFORK = 10;		/* don't inherit across fork */
+        const MADV_DOFORK = 11;		/* do inherit across fork */
+        const MADV_HWPOISON = 100;		/* poison a page for testing */
+        const MADV_SOFT_OFFLINE = 101;		/* soft offline page for testing */
+
+        const MADV_MERGEABLE = 12;		/* KSM may merge identical pages */
+        const MADV_UNMERGEABLE = 13;		/* KSM may not merge identical pages */
+
+        const MADV_HUGEPAGE = 14;		/* Worth backing with hugepages */
+        const MADV_NOHUGEPAGE = 15;		/* Not worth backing with hugepages */
+
+        const MADV_DONTDUMP = 16;		/* Explicity exclude from the core dump,
+                            overrides the coredump filter bits */
+        const MADV_DODUMP = 17;		/* Clear the MADV_DONTDUMP flag */
+
+        const MADV_WIPEONFORK = 18;		/* Zero memory on fork, child only */
+        const MADV_KEEPONFORK = 19;		/* Undo MADV_WIPEONFORK */
+
+        const MADV_COLD = 20;		/* deactivate these pages */
+        const MADV_PAGEOUT = 21;		/* reclaim these pages */
+
+        const MADV_POPULATE_READ = 22;	/* populate (prefault) page tables readable */
+        const MADV_POPULATE_WRITE = 23;	/* populate (prefault) page tables writable */
+
+        const MADV_DONTNEED_LOCKED = 24;	/* like DONTNEED, but drop locked pages too */
+
+        const MADV_COLLAPSE = 25;		/* Synchronous hugepage collapse */
+
+    }
 }
 
 impl From<MapFlags> for VmFlags {
@@ -265,6 +306,7 @@ impl Syscall {
             prot_flags,
             map_flags,
             true,
+            true,
         )?;
         return Ok(start_page.virt_address().data());
     }
@@ -420,6 +462,41 @@ impl Syscall {
         current_address_space
             .write()
             .mprotect(start_frame, page_count, prot_flags)
+            .map_err(|_| SystemError::EINVAL)?;
+        return Ok(0);
+    }
+
+    /// ## madvise系统调用
+    ///
+    /// ## 参数
+    ///
+    /// - `start_vaddr`：起始地址(已经对齐到页)
+    /// - `len`：长度(已经对齐到页)
+    /// - `madv_flags`：建议标志
+    pub fn madvise(
+        start_vaddr: VirtAddr,
+        len: usize,
+        madv_flags: usize,
+    ) -> Result<usize, SystemError> {
+        assert!(start_vaddr.check_aligned(MMArch::PAGE_SIZE));
+        assert!(check_aligned(len, MMArch::PAGE_SIZE));
+
+        if unlikely(verify_area(start_vaddr, len).is_err()) {
+            return Err(SystemError::EINVAL);
+        }
+        if unlikely(len == 0) {
+            return Err(SystemError::EINVAL);
+        }
+
+        let madv_flags = MadvFlags::from_bits(madv_flags as u64).ok_or(SystemError::EINVAL)?;
+
+        let current_address_space: Arc<AddressSpace> = AddressSpace::current()?;
+        let start_frame = VirtPageFrame::new(start_vaddr);
+        let page_count = PageFrameCount::new(len / MMArch::PAGE_SIZE);
+
+        current_address_space
+            .write()
+            .madvise(start_frame, page_count, madv_flags)
             .map_err(|_| SystemError::EINVAL)?;
         return Ok(0);
     }

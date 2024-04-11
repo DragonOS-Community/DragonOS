@@ -121,6 +121,7 @@ pub enum AllocatorLogType {
     Alloc(AllocLogItem),
     AllocZeroed(AllocLogItem),
     Free(AllocLogItem),
+    LazyAlloc(AllocLogItem),
 }
 
 #[repr(C)]

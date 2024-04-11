@@ -24,6 +24,7 @@ pub mod c_adapter;
 pub mod early_ioremap;
 pub mod init;
 pub mod kernel_mapper;
+pub mod madvise;
 pub mod memblock;
 pub mod mmio_buddy;
 pub mod no_init;
@@ -38,7 +39,7 @@ static mut __IDLE_PROCESS_ADDRESS_SPACE: Option<Arc<AddressSpace>> = None;
 bitflags! {
     /// Virtual memory flags
     #[allow(clippy::bad_bit_mask)]
-    pub struct VmFlags:u32{
+    pub struct VmFlags:u64{
         const VM_NONE = 0x00000000;
 
         const VM_READ = 0x00000001;
@@ -72,6 +73,24 @@ bitflags! {
         const VM_ARCH_1 = 0x01000000;
         const VM_WIPEONFORK = 0x02000000;
         const VM_DONTDUMP = 0x04000000;
+    }
+
+        pub struct VmFaultReason:u32 {
+        const VM_FAULT_OOM = 0x000001;
+        const VM_FAULT_SIGBUS = 0x000002;
+        const VM_FAULT_MAJOR = 0x000004;
+        const VM_FAULT_WRITE = 0x000008;
+        const VM_FAULT_HWPOISON = 0x000010;
+        const VM_FAULT_HWPOISON_LARGE = 0x000020;
+        const VM_FAULT_SIGSEGV = 0x000040;
+        const VM_FAULT_NOPAGE = 0x000100;
+        const VM_FAULT_LOCKED = 0x000200;
+        const VM_FAULT_RETRY = 0x000400;
+        const VM_FAULT_FALLBACK = 0x000800;
+        const VM_FAULT_DONE_COW = 0x001000;
+        const VM_FAULT_NEEDDSYNC = 0x002000;
+        const VM_FAULT_COMPLETED = 0x004000;
+        const VM_FAULT_HINDEX_MASK = 0x0f0000;
     }
 }
 
@@ -440,6 +459,8 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     const ENTRY_FLAG_DIRTY: usize;
     /// 当该位为1时，代表这个页面被处理器访问过
     const ENTRY_FLAG_ACCESSED: usize;
+    /// 当该位为1时，代表该页表项是全局的
+    const ENTRY_FLAG_GLOBAL: usize;
 
     /// 虚拟地址与物理地址的偏移量
     const PHYS_OFFSET: usize;
@@ -468,6 +489,9 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     const PAGE_ENTRY_NUM: usize = 1 << Self::PAGE_ENTRY_SHIFT;
     /// 该字段用于根据虚拟地址，获取该虚拟地址在对应的页表中是第几个页表项
     const PAGE_ENTRY_MASK: usize = Self::PAGE_ENTRY_NUM - 1;
+    /// 内核页表在顶级页表的第一个页表项的索引
+    const PAGE_KERNEL_INDEX: usize = (Self::PHYS_OFFSET & Self::PAGE_ADDRESS_MASK)
+        >> (Self::PAGE_ADDRESS_SHIFT - Self::PAGE_ENTRY_SHIFT);
 
     const PAGE_NEGATIVE_MASK: usize = !((Self::PAGE_ADDRESS_SIZE) - 1);
 

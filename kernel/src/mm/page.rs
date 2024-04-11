@@ -13,12 +13,14 @@ use crate::{
     arch::{interrupt::ipi::send_ipi, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
     ipc::shm::ShmId,
-    kerror, kwarn,
+    kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
 };
 
 use super::{
-    allocator::page_frame::FrameAllocator, syscall::ProtFlags, ucontext::LockedVMA,
+    allocator::page_frame::{FrameAllocator, PageFrameCount},
+    syscall::ProtFlags,
+    ucontext::LockedVMA,
     MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
 };
 
@@ -67,7 +69,9 @@ impl PageManager {
     }
 
     pub fn get_mut(&mut self, paddr: &PhysAddr) -> &mut Page {
-        self.phys2page.get_mut(paddr).unwrap()
+        self.phys2page
+            .get_mut(paddr)
+            .unwrap_or_else(|| panic!("{:?}", paddr))
     }
 
     pub fn insert(&mut self, paddr: PhysAddr, page: Page) {
@@ -82,7 +86,7 @@ impl PageManager {
 /// 物理页面信息
 pub struct Page {
     /// 映射计数
-    map_count: usize,
+    pub map_count: usize,
     /// 是否为共享页
     shared: bool,
     /// 映射计数为0时，是否可回收
@@ -262,7 +266,7 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
     /// ## 返回值
     ///
     /// 页表项在页表中的下标。如果addr不在当前页表所表示的虚拟地址空间中，则返回None
-    pub unsafe fn index_of(&self, addr: VirtAddr) -> Option<usize> {
+    pub fn index_of(&self, addr: VirtAddr) -> Option<usize> {
         let addr = VirtAddr::new(addr.data() & Arch::PAGE_ADDRESS_MASK);
         let shift = self.level * Arch::PAGE_ENTRY_SHIFT + Arch::PAGE_SHIFT;
 
@@ -286,6 +290,53 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
             self.entry(index)?.address().ok()?,
             self.level - 1,
         ));
+    }
+
+    // 克隆页表
+    pub unsafe fn clone(&self, allocator: &mut impl FrameAllocator) -> Option<PageTable<Arch>> {
+        // 分配新页面作为新的页表
+        let phys = allocator.allocate_one()?;
+        let frame = MMArch::phys_2_virt(phys).unwrap();
+        MMArch::write_bytes(frame, 0, MMArch::PAGE_SIZE);
+        let new_table = PageTable::new(self.base, phys, self.level);
+        if self.level == 0 {
+            for i in 0..Arch::PAGE_ENTRY_NUM {
+                if let Some(mut entry) = self.entry(i) {
+                    if entry.present() {
+                        let mut new_flags = entry.flags().set_write(false);
+                        entry.set_flags(new_flags);
+                        self.set_entry(i, entry);
+                        new_flags = new_flags.set_dirty(false);
+                        entry.set_flags(new_flags);
+                        new_table.set_entry(i, entry);
+                    }
+
+                    // if entry.present() {
+                    //     let phys = allocator.allocate_one()?;
+                    //     let mut anon_vma_guard = page_manager_lock_irqsave();
+                    //     anon_vma_guard.insert(phys, Page::new(false));
+                    //     let old_phys = entry.address().unwrap();
+                    //     let frame = MMArch::phys_2_virt(phys).unwrap().data() as *mut u8;
+                    //     frame.copy_from_nonoverlapping(
+                    //         MMArch::phys_2_virt(old_phys).unwrap().data() as *mut u8,
+                    //         MMArch::PAGE_SIZE,
+                    //     );
+                    //     new_table.set_entry(i, PageEntry::new(phys, entry.flags()));
+                    // }
+                }
+            }
+        } else {
+            // 非一级页表拷贝时，对每个页表项对应的页表都进行拷贝
+            for i in 0..MMArch::PAGE_ENTRY_NUM {
+                if let Some(next_table) = self.next_level_table(i) {
+                    let table = next_table.clone(allocator)?;
+                    let old_entry = self.entry(i).unwrap();
+                    let entry = PageEntry::new(table.phys(), old_entry.flags());
+                    new_table.set_entry(i, entry);
+                }
+            }
+        }
+        Some(new_table)
     }
 }
 
@@ -364,6 +415,22 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
     #[inline(always)]
     pub fn present(&self) -> bool {
         return self.data & Arch::ENTRY_FLAG_PRESENT != 0;
+    }
+
+    #[inline(always)]
+    pub fn empty(&self) -> bool {
+        self.data & !(Arch::ENTRY_FLAG_DIRTY & Arch::ENTRY_FLAG_ACCESSED) == 0
+    }
+
+    #[inline(always)]
+    pub fn protnone(&self) -> bool {
+        return self.data & (Arch::ENTRY_FLAG_PRESENT | Arch::ENTRY_FLAG_GLOBAL)
+            == Arch::ENTRY_FLAG_GLOBAL;
+    }
+
+    #[inline(always)]
+    pub fn write(&self) -> bool {
+        return self.data & Arch::ENTRY_FLAG_READWRITE != 0;
     }
 }
 
@@ -602,6 +669,26 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
         return self.has_flag(Arch::ENTRY_FLAG_WRITE_THROUGH);
     }
 
+    /// 设置当前页表是否为脏页
+    ///
+    /// ## 参数
+    ///
+    /// - value: 如果为true，那么将当前页表项的写穿策略设置为写穿。
+    #[inline(always)]
+    pub fn set_dirty(self, value: bool) -> Self {
+        return self.update_flags(Arch::ENTRY_FLAG_DIRTY, value);
+    }
+
+    /// 设置当前页表被访问
+    ///
+    /// ## 参数
+    ///
+    /// - value: 如果为true，那么将当前页表项的写穿策略设置为写穿。
+    #[inline(always)]
+    pub fn set_access(self, value: bool) -> Self {
+        return self.update_flags(Arch::ENTRY_FLAG_ACCESSED, value);
+    }
+
     /// MMIO内存的页表项标志
     #[inline(always)]
     pub fn mmio_flags() -> Self {
@@ -755,12 +842,6 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             let i = table.index_of(virt)?;
             assert!(i < Arch::PAGE_ENTRY_NUM);
             if table.level() == 0 {
-                // todo: 检查是否已经映射
-                // 现在不检查的原因是，刚刚启动系统时，内核会映射一些页。
-                if table.entry_mapped(i)? {
-                    kwarn!("Page {:?} already mapped", virt);
-                }
-
                 compiler_fence(Ordering::SeqCst);
 
                 table.set_entry(i, entry);
@@ -790,6 +871,192 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
                     // 获取新分配的页表
                     table = table.next_level_table(i)?;
                 }
+            }
+        }
+    }
+
+    pub unsafe fn map_huge_page(
+        &mut self,
+        virt: VirtAddr,
+        flags: PageFlags<Arch>,
+    ) -> Option<PageFlush<Arch>> {
+        // 验证虚拟地址是否对齐
+        if !(virt.check_aligned(Arch::PAGE_SIZE)) {
+            kerror!("Try to map unaligned page: virt={:?}", virt);
+            return None;
+        }
+
+        let virt = VirtAddr::new(virt.data() & (!Arch::PAGE_NEGATIVE_MASK));
+
+        // TODO： 验证flags是否合法
+
+        // 创建页表项
+        let mut table = self.table();
+        loop {
+            let i = table.index_of(virt)?;
+            assert!(i < Arch::PAGE_ENTRY_NUM);
+            let next_table = table.next_level_table(i);
+            if let Some(next_table) = next_table {
+                table = next_table;
+                // kdebug!("Mapping {:?} to next level table...", virt);
+            } else {
+                break;
+            }
+        }
+        if table.level == 0 {
+            return None;
+        }
+
+        if table.level == Arch::PAGE_LEVELS - 1 {
+            let i = table.index_of(virt)?;
+            // 分配下一级页表
+            let frame = self.frame_allocator.allocate_one()?;
+
+            // 清空这个页帧
+            MMArch::write_bytes(MMArch::phys_2_virt(frame).unwrap(), 0, MMArch::PAGE_SIZE);
+
+            // 设置页表项的flags
+            let flags: PageFlags<Arch> =
+                PageFlags::new_page_table(virt.kind() == PageTableKind::User);
+
+            table.set_entry(i, PageEntry::new(frame, flags));
+
+            // 获取新分配的页表
+            table = table.next_level_table(i)?;
+        }
+
+        let (phys, count) = self
+            .frame_allocator
+            .allocate(PageFrameCount::new(table.level * Arch::PAGE_ENTRY_NUM))?;
+
+        MMArch::write_bytes(
+            MMArch::phys_2_virt(phys).unwrap(),
+            0,
+            MMArch::PAGE_SIZE * count.data() * Arch::PAGE_ENTRY_NUM,
+        );
+
+        table.set_entry(table.index_of(virt)?, PageEntry::new(phys, flags))?;
+        Some(PageFlush::new(virt))
+    }
+
+    pub unsafe fn allocate_pde(&mut self, virt: VirtAddr, level: usize) -> Option<PageEntry<Arch>> {
+        let mut table = self.table();
+        if level == 0 || level > Arch::PAGE_LEVELS - 1 {
+            return None;
+        }
+        loop {
+            let i = table.index_of(virt)?;
+            assert!(i < Arch::PAGE_ENTRY_NUM);
+            let next_table = table.next_level_table(i);
+            if let Some(next_table) = next_table {
+                table = next_table;
+            } else {
+                let frame = self.frame_allocator.allocate_one()?;
+
+                // 清空这个页帧
+                MMArch::write_bytes(MMArch::phys_2_virt(frame).unwrap(), 0, MMArch::PAGE_SIZE);
+
+                // 设置页表项的flags
+                let flags: PageFlags<Arch> =
+                    PageFlags::new_page_table(virt.kind() == PageTableKind::User);
+
+                table.set_entry(i, PageEntry::new(frame, flags));
+                if table.level == level {
+                    return table.entry(i);
+                } else {
+                    table = table.next_level_table(i)?;
+                }
+            }
+        }
+    }
+
+    // 为当前进程分配指定层级的页表
+    pub unsafe fn allocate_table(
+        &mut self,
+        virt: VirtAddr,
+        level: usize,
+    ) -> Option<PageTable<Arch>> {
+        let table = self.get_table(virt, level + 1)?;
+        let i = table.index_of(virt)?;
+        let frame = self.frame_allocator.allocate_one()?;
+
+        // 清空这个页帧
+        MMArch::write_bytes(MMArch::phys_2_virt(frame).unwrap(), 0, MMArch::PAGE_SIZE);
+
+        // 设置页表项的flags
+        let flags: PageFlags<Arch> = PageFlags::new_page_table(virt.kind() == PageTableKind::User);
+
+        table.set_entry(i, PageEntry::new(frame, flags));
+        table.next_level_table(i)
+    }
+
+    // 获取虚拟地址的指定层级页表
+    pub fn get_table(&self, virt: VirtAddr, level: usize) -> Option<PageTable<Arch>> {
+        let mut table = self.table();
+        if level > Arch::PAGE_LEVELS - 1 {
+            return None;
+        }
+
+        unsafe {
+            loop {
+                if table.level == level {
+                    return Some(table);
+                }
+                let i = table.index_of(virt)?;
+                assert!(i < Arch::PAGE_ENTRY_NUM);
+
+                table = table.next_level_table(i)?;
+            }
+        }
+    }
+
+    //获取虚拟地址在指定层级页表的有效entry
+    pub fn get_entry(&self, virt: VirtAddr, level: usize) -> Option<PageEntry<Arch>> {
+        let table = self.get_table(virt, level)?;
+        let i = table.index_of(virt)?;
+        let entry = unsafe { table.entry(i) }?;
+
+        if !entry.empty() {
+            Some(entry)
+        } else {
+            None
+        }
+
+        // let mut table = self.table();
+        // if level > Arch::PAGE_LEVELS - 1 {
+        //     return None;
+        // }
+        // unsafe {
+        //     loop {
+        //         let i = table.index_of(virt)?;
+        //         assert!(i < Arch::PAGE_ENTRY_NUM);
+
+        //         if table.level == level {
+        //             let entry = table.entry(i)?;
+        //             if !entry.empty() {
+        //                 return Some(entry);
+        //             } else {
+        //                 return None;
+        //             }
+        //         }
+
+        //         table = table.next_level_table(i)?;
+        //     }
+        // }
+    }
+
+    // 拷贝用户空间映射
+    pub unsafe fn clone_user_mapping(&mut self, umapper: &mut Self) {
+        let old_table = umapper.table();
+        let new_table = self.table();
+        let allocator = self.allocator_mut();
+        // 顶级页表的[0, PAGE_KERNEL_INDEX)项为用户空间映射
+        for entry_index in 0..Arch::PAGE_KERNEL_INDEX {
+            if let Some(next_table) = old_table.next_level_table(entry_index) {
+                let table = next_table.clone(allocator).unwrap();
+                let old_entry = old_table.entry(entry_index).unwrap();
+                let entry = PageEntry::new(table.phys(), old_entry.flags());
+                new_table.set_entry(entry_index, entry);
             }
         }
     }

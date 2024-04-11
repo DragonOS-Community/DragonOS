@@ -1,18 +1,15 @@
-use core::ffi::{c_int, c_longlong};
+use core::{ffi::{c_int, c_longlong}, time::Duration};
 
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 use crate::{
-    process::ProcessManager,
+    process::{timer::{alarm_timer_init, Jiffies}, ProcessManager},
     syscall::{user_access::UserBufferWriter, Syscall},
     time::{sleep::nanosleep, PosixTimeSpec},
 };
 
-use super::{
-    timekeeping::{do_gettimeofday, getnstimeofday},
-    timer::next_n_ms_timer_jiffies,
-};
+use super::timekeeping::{do_gettimeofday, getnstimeofday};
 
 pub type PosixTimeT = c_longlong;
 pub type PosixSusecondsT = c_int;
@@ -156,20 +153,33 @@ impl Syscall {
         return Ok(0);
     }
 
-    pub fn alarm(second: u32) -> Result<usize, SystemError> {
+    pub fn alarm(expire_second: u32) -> Result<usize, SystemError> {
+        //初始化second
+        let second = Duration::from_secs(expire_second as u64);
         //获得剩余时间
-        let alarmtimer = ProcessManager::ref_alarm_timer();
-        let remain = alarmtimer.remain();
-        if second == 0 {
-            alarmtimer.cancel();
-            return Ok(remain as usize);
+        let pcb = ProcessManager::current_pcb();
+        let pcb_alarm = pcb.ref_alarm_timer();
+        let alarm = pcb_alarm.as_ref();
+        if alarm.is_none(){
+            drop(pcb_alarm);
+            let pid = ProcessManager::current_pid();
+            let new_alarm = Some(alarm_timer_init(pid));
+            ProcessManager::current_pcb().set_alarm_timer(new_alarm);
+            Ok(0)
+        } else {
+            let alarmtimer = alarm.as_ref().unwrap();
+            let remain = alarmtimer.remain();
+                if second.is_zero() {
+                    alarmtimer.cancel();
+                    return Ok(remain.as_secs() as usize);
+                }
+                if !alarmtimer.timeout() {
+                    alarmtimer.cancel();
+                }
+                //重启alarm
+                let new_expired_jiffies = Jiffies::new_from_duration(second);
+                alarmtimer.restart(new_expired_jiffies);
+                Ok(remain.as_secs() as usize)
         }
-        if !alarmtimer.timeout() {
-            alarmtimer.cancel();
-        }
-        //重启alarm
-        let new_expired_jiffies = next_n_ms_timer_jiffies(second as u64 * 1_000);
-        alarmtimer.restart(new_expired_jiffies);
-        Ok(remain as usize)
     }
 }

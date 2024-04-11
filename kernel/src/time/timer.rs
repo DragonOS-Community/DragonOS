@@ -245,9 +245,17 @@ pub fn next_n_ms_timer_jiffies(expire_ms: u64) -> u64 {
 pub fn next_n_us_timer_jiffies(expire_us: u64) -> u64 {
     return TIMER_JIFFIES.load(Ordering::SeqCst) + expire_us * 1000 / NSEC_PER_JIFFY as u64;
 }
-/// 计算定时器时间片对应的秒数
-pub fn timer_jiffies_n_s(jiffies: u64) -> u64 {
-    return jiffies / 1_000 * NSEC_PER_JIFFY as u64;
+/// 计算接下来njiffies对应的定时器时间片
+pub fn next_n_jiffies_tiemr_jiffies(expire_jiffies: u64) -> u64 {
+    return TIMER_JIFFIES.load(Ordering::SeqCst) + expire_jiffies;
+}
+/// 计算定时器时间片对应的微秒数
+pub fn timer_jiffies_n_ms(jiffies: u64) -> u64 {
+    return jiffies / 1_000_000 * NSEC_PER_JIFFY as u64;
+}
+/// 计算n毫秒对应的jiffies
+pub fn n_ms_jiffies(ms: u64) -> u64 {
+    return ms * 1000000 / NSEC_PER_JIFFY as u64;
 }
 
 /// @brief 让pcb休眠timeout个jiffies

@@ -27,7 +27,7 @@ fn main() {
         syscall(SYS_alarm, 5);
     }
     unsafe {
-        sleep(2);
+        sleep(1);
     }
     unsafe {
         let remaining = syscall(SYS_alarm, 5);

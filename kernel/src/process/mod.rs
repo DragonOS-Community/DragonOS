@@ -62,7 +62,7 @@ use crate::{
 };
 use timer::AlarmTimer;
 
-use self::kthread::{AtomicKernelThreadCreateStatus, WorkerPrivate};
+use self::kthread::WorkerPrivate;
 
 pub mod abi;
 pub mod c_adapter;
@@ -491,13 +491,6 @@ impl ProcessManager {
         ProcessManager::current_pcb().preempt_enable();
     }
 
-    //获取目标进程的可变闹钟定时器
-    //返回闹钟定时器
-    pub fn ref_alarm_timer() -> Arc<AlarmTimer> {
-        let current_pcb = ProcessManager::current_pcb();
-        let alarm_timer = current_pcb.alarm_timer.clone();
-        alarm_timer
-    }
 }
 
 /// 上下文切换的钩子函数,当这个函数return的时候,将会发生上下文切换
@@ -645,7 +638,7 @@ pub struct ProcessControlBlock {
     thread: RwLock<ThreadInfo>,
 
     ///闹钟定时器
-    alarm_timer: Arc<AlarmTimer>,
+    alarm_timer: RwLock<Option<Arc<AlarmTimer>>>,
 
     /// 进程的robust lock列表
     robust_list: RwLock<Option<RobustListHead>>,
@@ -714,7 +707,7 @@ impl ProcessControlBlock {
             children: RwLock::new(Vec::new()),
             wait_queue: WaitQueue::default(),
             thread: RwLock::new(ThreadInfo::new()),
-            alarm_timer: timer::alarm_timer_init(pid, 0),
+            alarm_timer: RwLock::new(None),
             robust_list: RwLock::new(None),
         };
 
@@ -972,6 +965,15 @@ impl ProcessControlBlock {
     pub fn set_robust_list(&self, new_robust_list: Option<RobustListHead>) {
         *self.robust_list.write_irqsave() = new_robust_list;
     }
+
+    pub fn ref_alarm_timer(&self) -> RwLockReadGuard<Option<Arc<AlarmTimer>>> {
+        return self.alarm_timer.read_irqsave();
+    }
+
+    pub fn set_alarm_timer(&self, new_alarm: Option<Arc<AlarmTimer>>) {
+        *self.alarm_timer.write_irqsave() = new_alarm;
+    }
+
 }
 
 impl Drop for ProcessControlBlock {

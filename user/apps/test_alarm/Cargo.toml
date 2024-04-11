@@ -1,5 +1,5 @@
 [package]
-name = "alarm-test"
+name = "test_alarm"
 version = "0.1.0"
 edition = "2021"
 description = "test for alarm"

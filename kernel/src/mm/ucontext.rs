@@ -18,11 +18,7 @@ use ida::IdAllocator;
 use system_error::SystemError;
 
 use crate::{
-    arch::{
-        interrupt::trap::X86PfErrorCode,
-        mm::{pkru::pkru_allows_pkey, PageMapper},
-        CurrentIrqArch, MMArch,
-    },
+    arch::{mm::PageMapper, CurrentIrqArch, MMArch},
     exception::InterruptArch,
     libs::{
         align::page_align_up,
@@ -1147,52 +1143,6 @@ impl LockedVMA {
             guard.self_ref.upgrade().unwrap(),
             after,
         ));
-    }
-
-    pub fn access_error(&self, error_code: X86PfErrorCode) -> bool {
-        let vm_flags = *self.lock().vm_flags();
-        let foreign = false;
-        if error_code.contains(X86PfErrorCode::X86_PF_PK) {
-            return true;
-        }
-
-        if unlikely(error_code.contains(X86PfErrorCode::X86_PF_SGX)) {
-            return true;
-        }
-
-        if !self.access_permitted(
-            error_code.contains(X86PfErrorCode::X86_PF_WRITE),
-            error_code.contains(X86PfErrorCode::X86_PF_INSTR),
-            foreign,
-        ) {
-            return true;
-        }
-        if error_code.contains(X86PfErrorCode::X86_PF_WRITE) {
-            if unlikely(!vm_flags.contains(VmFlags::VM_WRITE)) {
-                return true;
-            }
-            return false;
-        }
-
-        if unlikely(error_code.contains(X86PfErrorCode::X86_PF_PROT)) {
-            return true;
-        }
-
-        if unlikely(!self.is_accessible()) {
-            return true;
-        }
-        false
-    }
-
-    pub fn access_permitted(&self, write: bool, execute: bool, foreign: bool) -> bool {
-        if execute {
-            return true;
-        }
-        if foreign | self.is_foreign() {
-            return true;
-        }
-        let guard = self.lock();
-        pkru_allows_pkey(guard.pkey(), write)
     }
 
     pub fn is_foreign(&self) -> bool {

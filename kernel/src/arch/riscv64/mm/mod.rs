@@ -44,8 +44,6 @@ pub(self) static INNER_ALLOCATOR: SpinLock<Option<BuddyAllocator<MMArch>>> = Spi
 pub struct RiscV64MMArch;
 
 impl RiscV64MMArch {
-    pub const ENTRY_FLAG_GLOBAL: usize = 1 << 5;
-
     /// 使远程cpu的TLB中，指定地址范围的页失效
     pub fn remote_invalidate_page(
         cpu: ProcessorId,
@@ -121,6 +119,7 @@ impl MemoryManagementArch for RiscV64MMArch {
     const ENTRY_FLAG_EXEC: usize = (1 << 3);
     const ENTRY_FLAG_ACCESSED: usize = (1 << 6);
     const ENTRY_FLAG_DIRTY: usize = (1 << 7);
+    const ENTRY_FLAG_GLOBAL: usize = (1 << 5);
 
     const PHYS_OFFSET: usize = 0xffff_ffc0_0000_0000;
     const KERNEL_LINK_OFFSET: usize = 0x1000000;

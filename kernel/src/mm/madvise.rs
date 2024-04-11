@@ -1,11 +1,8 @@
 use system_error::SystemError;
 
-use crate::arch::{mm::LockedFrameAllocator, MMArch};
+use crate::arch::{mm::PageMapper, MMArch};
 
 use super::{page::Flusher, syscall::MadvFlags, ucontext::LockedVMA, VmFlags};
-
-pub type PageMapper =
-    crate::mm::page::PageMapper<crate::arch::x86_64::mm::X86_64MMArch, LockedFrameAllocator>;
 
 impl LockedVMA {
     pub fn do_advise(

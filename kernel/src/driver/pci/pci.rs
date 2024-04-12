@@ -3,6 +3,7 @@
 
 use super::pci_irq::{IrqType, PciIrqError};
 use crate::arch::{PciArch, TraitPciArch};
+use crate::driver::pci::device::pci_device_search;
 use crate::exception::IrqNumber;
 use crate::include::bindings::bindings::PAGE_2M_SIZE;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -1142,6 +1143,7 @@ pub fn pci_init() {
             HeaderType::Unrecognised(_) => {}
         }
     }
+    pci_device_search();
     kinfo!("PCI bus initialized.");
 }
 

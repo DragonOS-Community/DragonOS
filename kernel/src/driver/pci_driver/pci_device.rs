@@ -5,43 +5,47 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    driver::{base::{
-        device::{
-            bus::{Bus, BusState}, device_manager, driver::Driver, Device, DevicePrivateData, DeviceType, IdTable
+    driver::{
+        base::{
+            device::{
+                bus::{Bus, BusState},
+                device_manager,
+                driver::Driver,
+                Device, DevicePrivateData, DeviceType, IdTable,
+            },
+            kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+            kset::KSet,
         },
-        kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
-        kset::KSet,
-    }, pci_driver::{pci_bus, pci_driver::PciDriver}},
+        pci_driver::{pci_bus, pci_driver::PciDriver},
+    },
     filesystem::kernfs::KernFSInode,
     libs::{rwlock::RwLockWriteGuard, spinlock::SpinLock},
 };
 
-
-
 use super::{dev_id::PciDeviceID, pci_bus_device, subsys::PciBus};
-
 
 pub struct PciDeviceManager;
 
-pub fn pci_device_manager()->&'static PciDeviceManager{
+pub fn pci_device_manager() -> &'static PciDeviceManager {
     &PciDeviceManager
 }
 
-impl PciDeviceManager{
-    pub fn device_add(&self,pci_dev:Arc<dyn PciDevice>)->Result<(),SystemError>{
-        
-        if pci_dev.parent().is_none(){
-            pci_dev.set_parent(Some(Arc::downgrade(&(pci_bus_device() as Arc<dyn KObject>))));
+impl PciDeviceManager {
+    pub fn device_add(&self, pci_dev: Arc<dyn PciDevice>) -> Result<(), SystemError> {
+        if pci_dev.parent().is_none() {
+            pci_dev.set_parent(Some(Arc::downgrade(
+                &(pci_bus_device() as Arc<dyn KObject>),
+            )));
         }
 
         pci_dev.set_bus(Some(Arc::downgrade(&(pci_bus() as Arc<dyn Bus>))));
         //我还要实现一个bus的添加
         let r = device_manager().add_device(pci_dev.clone() as Arc<dyn Device>);
 
-        if r.is_ok(){
+        if r.is_ok() {
             //todo:这里可能还要处理一些设置成功后设备状态的变化
             return Ok(());
-        }else{
+        } else {
             //tode:这里可能有一些添加失败的处理
             return r;
         }
@@ -50,7 +54,7 @@ impl PciDeviceManager{
 
 pub trait PciDevice: Device {
     // fn pci_bus(&self) -> PciBus;
-    fn dynid(&self)->PciDeviceID;
+    fn dynid(&self) -> PciDeviceID;
 }
 #[derive(Debug)]
 #[cast_to([sync] Device)]

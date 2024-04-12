@@ -428,7 +428,10 @@ impl IndexNode for MountFSInode {
             .map(|it| it.inner_filesystem())
             .unwrap_or(fs);
         let new_mount_fs = MountFS::new(to_mount_fs, Some(self.self_ref.upgrade().unwrap()));
-        self.mount_fs.mountpoints.lock().insert(metadata.inode_id, new_mount_fs.clone());
+        self.mount_fs
+            .mountpoints
+            .lock()
+            .insert(metadata.inode_id, new_mount_fs.clone());
         // kdebug!("My inode id is: {:?}", metadata.inode_id);
         return Ok(new_mount_fs);
     }
@@ -443,7 +446,10 @@ impl IndexNode for MountFSInode {
         }
         // kdebug!("from {:?}, to {:?}", from, self);
         let new_mount_fs = from.umount()?;
-        self.mount_fs.mountpoints.lock().insert(metadata.inode_id, new_mount_fs.clone());
+        self.mount_fs
+            .mountpoints
+            .lock()
+            .insert(metadata.inode_id, new_mount_fs.clone());
         return Ok(new_mount_fs);
     }
 

@@ -388,6 +388,14 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    fn mount_from(&self, _des: Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
+
+    fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
+
     fn absolute_path(&self, _len: usize) -> Result<String, SystemError> {
         return Err(SystemError::ENOSYS);
     }
@@ -414,6 +422,18 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         return Err(SystemError::ENOSYS);
+    }
+
+    fn mkdir(
+        &self,
+        name: &str,
+        mode: ModeType,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        match self.find(name) {
+            Ok(inode) => Ok(inode),
+            Err(SystemError::ENOENT) => self.create(name, FileType::Dir, mode),
+            Err(err) => Err(err),
+        }
     }
 
     /// ## 返回特殊文件的inode

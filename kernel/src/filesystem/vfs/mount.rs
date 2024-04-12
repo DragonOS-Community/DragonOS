@@ -1,10 +1,11 @@
 use core::{
+    fmt::Debug,
     any::Any,
     sync::atomic::{compiler_fence, Ordering},
 };
 
 use alloc::{
-    collections::BTreeMap, string::{String, ToString}, sync::{Arc, Weak}
+    collections::BTreeMap, string::{String, ToString}, sync::{Arc, Weak}, vec::Vec
 };
 use system_error::SystemError;
 
@@ -102,12 +103,12 @@ impl MountFS {
     /// 卸载文件系统
     /// # Errors
     /// 如果当前文件系统是根文件系统，那么将会返回`EINVAL`
-    pub fn umount(&self) -> Result<(), SystemError> {
-        if let Some(parent) = &self.self_mountpoint {
-            return parent.umount();
-        } else {
-            return Err(SystemError::EINVAL);
-        }
+    pub fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
+        self
+            .self_mountpoint
+            .as_ref()
+            .ok_or(SystemError::EINVAL)?
+            ._umount()
     }
 }
 
@@ -175,18 +176,6 @@ impl MountFSInode {
         self.metadata().map(|x| x.inode_id).unwrap()
     }
 
-    fn umount(&self) -> Result<(), SystemError> {
-        // 移除挂载点
-        if self.metadata()?.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-        self.mount_fs
-            .mountpoints
-            .lock()
-            .remove(&self.inner_inode.metadata()?.inode_id);
-        return Ok(());
-    }
-
     pub(super) fn _find(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
         // 直接调用当前inode所在的文件系统的find方法进行查找
         // 由于向下查找可能会跨越文件系统的边界，因此需要尝试替换inode
@@ -222,6 +211,18 @@ impl MountFSInode {
                 }
             ));
         }
+    }
+
+    /// 移除挂载点下的文件系统
+    fn _umount(&self) -> Result<Arc<MountFS>, SystemError> {
+        if self.metadata()?.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+        return self.mount_fs
+            .mountpoints
+            .lock()
+            .remove(&self.inner_inode.metadata()?.inode_id)
+            .ok_or(SystemError::ENOENT);
     }
 }
 
@@ -428,13 +429,27 @@ impl IndexNode for MountFSInode {
             return Err(SystemError::ENOTDIR);
         }
 
-        // 为新的挂载点创建挂载文件系统
-        // let new_mount_fs: Arc<MountFS> = MountFS::new(fs, Some(self.self_ref.upgrade().unwrap()));
-        let new_mount_fs = fs.clone()
+        // 若已有挂载系统，保证MountFS只包一层
+        let to_mount_fs = fs.clone()
             .downcast_arc::<MountFS>()
-            .unwrap_or(MountFS::new(fs, Some(self.self_ref.upgrade().unwrap())));
+            .map(|it| it.inner_filesystem())
+            .unwrap_or(fs);
+        let new_mount_fs = MountFS::new(to_mount_fs, Some(self.self_ref.upgrade().unwrap()));
         self.do_mount(metadata.inode_id, new_mount_fs.clone())?;
         return Ok(new_mount_fs);
+    }
+
+    fn mount_from(&self, from: Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        let metadata = self.metadata()?;
+        if from.metadata()?.file_type != FileType::Dir || metadata.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+        // kdebug!("from {:?}, to {:?}", from, self);
+        return self.do_mount(metadata.inode_id, from.umount()?);
+    }    
+
+    fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
+        self.mount_fs.umount()
     }
 
     fn absolute_path(&self, len: usize) -> Result<String, SystemError> {
@@ -610,9 +625,16 @@ impl MountList {
             .next()
     }
 
+    /// 删除 **路径`path`** 的挂载点记录，并返回 *被移除的挂载点MountFS引用*
     pub fn remove<T: Into<MountPath>>(path: T) -> Option<Arc<MountFS>> {
         MountList::instance()
             .write()
             .remove(&path.into())
+    }
+}
+
+impl Debug for MountList {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_map().entries(Self::instance().read().iter()).finish()
     }
 }

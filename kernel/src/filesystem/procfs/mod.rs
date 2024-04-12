@@ -14,8 +14,7 @@ use crate::{
     arch::mm::LockedFrameAllocator,
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{
-        core::{do_mount, generate_inode_id, ROOT_INODE},
-        FileType,
+        core::{do_mount, do_mount_mkdir, generate_inode_id, ROOT_INODE}, mount::MountList, FileType
     },
     kerror, kinfo,
     libs::{
@@ -808,14 +807,11 @@ pub fn procfs_init() -> Result<(), SystemError> {
         kinfo!("Initializing ProcFS...");
         // 创建 procfs 实例
         let procfs: Arc<ProcFS> = ProcFS::new();
-
         // procfs 挂载
-        // let _t = ROOT_INODE()
-        //     .find("proc")
-        //     .expect("Cannot find /proc")
-        //     .mount(procfs)
-        //     .expect("Failed to mount proc");
-        do_mount(procfs, "proc").expect("Failed to mount proc");
+        let fs = ROOT_INODE()
+            .mkdir("proc", ModeType::from_bits_truncate(0o755)).expect("Unabled to find /proc")
+            .mount(procfs).expect("Failed to mount at /proc");
+        MountList::insert("/proc", fs);
         kinfo!("ProcFS mounted.");
         result = Some(Ok(()));
     });

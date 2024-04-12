@@ -20,9 +20,9 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-use super::SuperBlock;
 use super::{
-    core::{do_mkdir, do_remove_dir, do_unlink_at},
+    SuperBlock,
+    core::{do_mkdir_at, do_remove_dir, do_unlink_at},
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
     open::{do_faccessat, do_fchmodat, do_sys_open},
@@ -779,7 +779,8 @@ impl Syscall {
     /// @return uint64_t 负数错误码 / 0表示成功
     pub fn mkdir(path: *const u8, mode: usize) -> Result<usize, SystemError> {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
-        return do_mkdir(&path, FileMode::from_bits_truncate(mode as u32)).map(|x| x as usize);
+        do_mkdir_at(AtFlags::AT_FDCWD.bits(), &path, FileMode::from_bits_truncate(mode as u32))?;
+        return Ok(0);
     }
 
     /// **创建硬连接的系统调用**
@@ -1553,7 +1554,9 @@ impl Syscall {
 
         let filesystemtype = producefs!(FSMAKER, filesystemtype)?;
 
-        return Vcore::do_mount(filesystemtype, target.to_string().as_str());
+        Vcore::do_mount(filesystemtype, target.to_string().as_str())?;
+
+        return Ok(0);
     }
 
     // 想法：可以在VFS中实现一个文件系统分发器，流程如下：

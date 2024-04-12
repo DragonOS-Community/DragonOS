@@ -82,6 +82,8 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     let new_root_inode = new_fs.root_inode();
 
     // ==== 在这里获取要被迁移的文件系统的inode并迁移 ===
+    // 因为是换根所以路径没有变化
+    // 不需要重新注册挂载目录
     new_root_inode
         .mkdir("proc", ModeType::from_bits_truncate(0o755))
         .expect("Unable to create /proc")
@@ -156,6 +158,7 @@ pub fn do_mkdir_at(
     if let Some(parent) = parent {
         current_inode = current_inode.lookup(parent)?;
     }
+    // kdebug!("mkdir at {:?}", current_inode.metadata()?.inode_id);
     return current_inode.mkdir(name, ModeType::from_bits_truncate(mode.bits()));
 }
 
@@ -233,6 +236,7 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 /// `ENOENT`: 目录（挂载点）不存在
 pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<Arc<MountFS>, SystemError> {
     let inode = ROOT_INODE().lookup_follow_symlink(mount_point, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    // kdebug!("Going to mount at {:?}", inode.metadata()?.inode_id);
     let fs = inode.mount(fs)?;
     MountList::insert(mount_point, fs.clone());
     return Ok(fs);

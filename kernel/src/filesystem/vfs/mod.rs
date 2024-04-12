@@ -370,7 +370,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// 在当前Inode下，挂载一个已有挂载信息的文件系统，保持原有挂载信息
     /// # Behavior
     /// 该函数只能被MountFS实现，其他文件系统不应实现这个函数
-    fn mount_from(&self, _des: Arc<dyn IndexNode>) -> Result<(), SystemError> {
+    fn mount_from(&self, _des: Arc<dyn IndexNode>) -> Result<Arc<MountFS>, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 

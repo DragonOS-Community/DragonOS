@@ -417,6 +417,10 @@ impl IndexNode for MountFSInode {
             return Err(SystemError::ENOTDIR);
         }
 
+        if self.is_mountpoint_root()? {
+            return Err(SystemError::EBUSY);
+        }
+
         // 若已有挂载系统，保证MountFS只包一层
         let to_mount_fs = fs
             .clone()
@@ -424,17 +428,23 @@ impl IndexNode for MountFSInode {
             .map(|it| it.inner_filesystem())
             .unwrap_or(fs);
         let new_mount_fs = MountFS::new(to_mount_fs, Some(self.self_ref.upgrade().unwrap()));
-        self.do_mount(metadata.inode_id, new_mount_fs.clone())?;
+        self.mount_fs.mountpoints.lock().insert(metadata.inode_id, new_mount_fs.clone());
+        // kdebug!("My inode id is: {:?}", metadata.inode_id);
         return Ok(new_mount_fs);
     }
 
-    fn mount_from(&self, from: Arc<dyn IndexNode>) -> Result<(), SystemError> {
+    fn mount_from(&self, from: Arc<dyn IndexNode>) -> Result<Arc<MountFS>, SystemError> {
         let metadata = self.metadata()?;
         if from.metadata()?.file_type != FileType::Dir || metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
+        if self.is_mountpoint_root()? {
+            return Err(SystemError::EBUSY);
+        }
         // kdebug!("from {:?}, to {:?}", from, self);
-        return self.do_mount(metadata.inode_id, from.umount()?);
+        let new_mount_fs = from.umount()?;
+        self.mount_fs.mountpoints.lock().insert(metadata.inode_id, new_mount_fs.clone());
+        return Ok(new_mount_fs);
     }
 
     fn umount(&self) -> Result<Arc<MountFS>, SystemError> {

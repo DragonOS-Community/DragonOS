@@ -17,7 +17,13 @@
 
 &nbsp;
 
-&emsp;&emsp;DragonOS is an operating system running on the X86_64 Architecture. This project is currently under development!
+&emsp;&emsp;DragonOS is a 64-bit operating system designed for lightweight cloud computing scenarios, featuring a fully independent kernel and offering Linux binary compatibility. Developed using the Rust programming language, it aims to provide improved reliability. In the Rust operating system domain, DragonOS consistently ranks among the top three on GitHub nationally.
+
+&emsp;&emsp;The DragonOS open-source community was established in July 2022 and is entirely business-neutral. Our goal is to build a fully independent, open-source, high-performance, and highly reliable server operating system, fostering a digitally autonomous and controllable future!
+
+&emsp;&emsp;DragonOS boasts an excellent and comprehensive architecture design. Compared to other systems of similar scale, DragonOS supports virtualization and has certain advantages in terms of device model and调度子系统 (scheduler subsystem).Currently, significant efforts are being made to promote cloud platform support, RISC-V compatibility, and the porting of compilers and application software. The aim is to achieve large-scale application in production environments within five years.
+
+&emsp;&emsp;Driven by the community, DragonOS is currently evolving rapidly. DragonOS has already implemented about 1/4 of Linux interfaces, and in the future, we will strive to provide 100% compatibility with Linux, along with new features.
 
 [All you want to know about DragonOS is here - DragonOS](https://dragonos.org/?p=46)
 
@@ -88,8 +94,20 @@ We guarantee that all sponsorship funds and items will be used for:
 
 ### Individual Sponsor List
 
+
 - 万晓兰
 - David Wen
+- [YJwu2023](https://github.com/YJwu2023)
+- [longjin](https://github.com/fslongjin)
+- [黄铭涛](https://github.com/1037827920)
+- [许梓毫](https://github.com/Jomocool)
+- [谢润霖](https://github.com/xiaolin2004)
+- [蔡俊源](https://github.com/SMALLC04)
+- Kelly
+- [戴吕琛](https://github.com/Samuka007)
+- [杨璐玮](https://github.com/val213)
+- [何懿聪](https://github.com/GnoCiYeH)
+- [周凯韬](https://github.com/laokengwt)
 - [Seele.Clover](https://github.com/seeleclover)
 - [FindWangHao](https://github.com/FindWangHao)
 - [ferchiel](https://github.com/ferchiel)

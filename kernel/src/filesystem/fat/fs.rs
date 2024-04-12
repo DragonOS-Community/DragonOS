@@ -1,3 +1,4 @@
+use alloc::string::ToString;
 use core::cmp::Ordering;
 use core::intrinsics::unlikely;
 use core::{any::Any, fmt::Debug};
@@ -11,6 +12,7 @@ use alloc::{
 };
 
 use crate::driver::base::device::device_number::DeviceNumber;
+use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
 use crate::{
@@ -101,7 +103,7 @@ pub struct FATInode {
     self_ref: Weak<LockedFATInode>,
     /// 子Inode的B树. 该数据结构用作缓存区。其中，它的key表示inode的名称。
     /// 请注意，由于FAT的查询过程对大小写不敏感，因此我们选择让key全部是大写的，方便统一操作。
-    children: BTreeMap<String, Arc<LockedFATInode>>,
+    children: BTreeMap<DName, Arc<LockedFATInode>>,
     /// 当前inode的元数据
     metadata: Metadata,
     /// 指向inode所在的文件系统对象的指针
@@ -136,7 +138,7 @@ impl FATInode {
         match &self.inode_type {
             FATDirEntry::Dir(d) => {
                 // 尝试在缓存区查找
-                if let Some(entry) = self.children.get(&name.to_uppercase()) {
+                if let Some(entry) = self.children.get(&DName::from(name.to_uppercase())) {
                     return Ok(entry.clone());
                 }
                 // 在缓存区找不到
@@ -151,7 +153,7 @@ impl FATInode {
                 );
                 // 加入缓存区, 由于FAT文件系统的大小写不敏感问题，因此存入缓存区的key应当是全大写的
                 self.children
-                    .insert(name.to_uppercase(), entry_inode.clone());
+                    .insert(DName::from(name.to_uppercase()), entry_inode.clone());
                 return Ok(entry_inode);
             }
             FATDirEntry::UnInit => {
@@ -1535,7 +1537,9 @@ impl IndexNode for LockedFATInode {
                     let name: String = ent.name();
                     // kdebug!("name={name}");
 
-                    if !guard.children.contains_key(&name.to_uppercase())
+                    if !guard
+                        .children
+                        .contains_key(&DName::from(name.to_uppercase()))
                         && name != "."
                         && name != ".."
                     {
@@ -1548,7 +1552,7 @@ impl IndexNode for LockedFATInode {
                         // 加入缓存区, 由于FAT文件系统的大小写不敏感问题，因此存入缓存区的key应当是全大写的
                         guard
                             .children
-                            .insert(name.to_uppercase(), entry_inode.clone());
+                            .insert(DName::from(name.to_uppercase()), entry_inode.clone());
                     }
                 }
                 return Ok(ret);
@@ -1584,7 +1588,7 @@ impl IndexNode for LockedFATInode {
         // 对目标inode上锁，以防更改
         let target_guard: SpinLockGuard<FATInode> = target.0.lock();
         // 先从缓存删除
-        let nod = guard.children.remove(&name.to_uppercase());
+        let nod = guard.children.remove(&DName::from(name.to_uppercase()));
 
         // 若删除缓存中为管道的文件，则不需要再到磁盘删除
         if nod.is_some() {
@@ -1619,7 +1623,7 @@ impl IndexNode for LockedFATInode {
         // 对目标inode上锁，以防更改
         let target_guard: SpinLockGuard<FATInode> = target.0.lock();
         // 先从缓存删除
-        guard.children.remove(&name.to_uppercase());
+        guard.children.remove(&DName::from(name.to_uppercase()));
 
         let dir = match &guard.inode_type {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
@@ -1642,7 +1646,9 @@ impl IndexNode for LockedFATInode {
             Err(r) => {
                 if r == SystemError::ENOTEMPTY {
                     // 如果要删除的是目录，且不为空，则删除动作未发生，重新加入缓存
-                    guard.children.insert(name.to_uppercase(), target.clone());
+                    guard
+                        .children
+                        .insert(DName::from(name.to_uppercase()), target.clone());
                     drop(target_guard);
                 }
                 return Err(r);
@@ -1666,7 +1672,7 @@ impl IndexNode for LockedFATInode {
             let old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
             let fs = old_inode_guard.fs.upgrade().unwrap();
             // 从缓存删除
-            let _nod = guard.children.remove(&old_name.to_uppercase());
+            let _nod = guard.children.remove(&DName::from(old_name.to_uppercase()));
             let old_dir = match &guard.inode_type {
                 FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
                     return Err(SystemError::ENOTDIR);
@@ -1693,7 +1699,9 @@ impl IndexNode for LockedFATInode {
             let old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
             let fs = old_inode_guard.fs.upgrade().unwrap();
             // 从缓存删除
-            let _nod = old_guard.children.remove(&old_name.to_uppercase());
+            let _nod = old_guard
+                .children
+                .remove(&DName::from(old_name.to_uppercase()));
             let old_dir = match &old_guard.inode_type {
                 FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
                     return Err(SystemError::ENOTDIR);
@@ -1739,19 +1747,9 @@ impl IndexNode for LockedFATInode {
                 // TODO: 优化这里，这个地方性能很差！
                 let mut key: Vec<String> = guard
                     .children
-                    .keys()
-                    .filter(|k| {
-                        guard
-                            .children
-                            .get(*k)
-                            .unwrap()
-                            .metadata()
-                            .unwrap()
-                            .inode_id
-                            .into()
-                            == ino
-                    })
-                    .cloned()
+                    .iter()
+                    .filter(|(_, v)| v.0.lock().metadata.inode_id.into() == ino)
+                    .map(|(k, _)| k.to_string())
                     .collect();
 
                 match key.len() {
@@ -1802,9 +1800,10 @@ impl IndexNode for LockedFATInode {
             return Err(SystemError::EINVAL);
         }
 
-        inode
-            .children
-            .insert(String::from(filename).to_uppercase(), nod.clone());
+        inode.children.insert(
+            DName::from(String::from(filename).to_uppercase()),
+            nod.clone(),
+        );
         Ok(nod)
     }
 

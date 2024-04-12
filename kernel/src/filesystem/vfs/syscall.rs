@@ -1569,7 +1569,7 @@ impl Syscall {
     // 3. 直接在函数内调用构造方法并直接返回文件系统对象
 
     /// src/linux/mount.c `umount` & `umount2`
-    /// 
+    ///
     /// [umount(2) — Linux manual page](https://www.man7.org/linux/man-pages/man2/umount.2.html)
     pub fn umount2(target: *const u8, flags: i32) -> Result<(), SystemError> {
         let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?;

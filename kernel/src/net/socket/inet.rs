@@ -724,7 +724,7 @@ impl Socket for TcpSocket {
     /// @brief tcp socket 监听 local_endpoint 端口
     ///
     /// @param backlog 未处理的连接队列的最大长度. 由于smoltcp不支持backlog，所以这个参数目前无效
-    fn listen(&mut self, _backlog: usize) -> Result<(), SystemError> {
+    fn listen(&mut self, backlog: usize) -> Result<(), SystemError> {
         if self.is_listening {
             return Ok(());
         }
@@ -733,7 +733,7 @@ impl Socket for TcpSocket {
         let mut sockets = SOCKET_SET.lock_irqsave();
         // 获取handle的数量
         let handlen = self.handle.len();
-        let backlog = handlen.max(_backlog);
+        let backlog = handlen.max(backlog);
 
         // 添加剩余需要构建的socket
         // kdebug!("tcp socket:before listen, socket'len={}",self.handle.len());

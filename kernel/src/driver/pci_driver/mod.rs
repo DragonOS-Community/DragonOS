@@ -1,7 +1,7 @@
 use alloc::{string::ToString, sync::Arc};
 use system_error::SystemError;
 
-use self::{pci_device::PciBusDevice, subsys::PciBus};
+use self::{pci_device::PciBusDevice, subsys::PciBus, test::pt_init};
 
 use super::base::{
         device::{
@@ -14,6 +14,7 @@ pub mod pci_device;
 pub mod pci_driver;
 pub mod subsys;
 pub mod dev_id;
+pub mod test;
 static mut PCI_BUS_DEVICE: Option<Arc<PciBusDevice>> = None;
 static mut PCI_BUS: Option<Arc<PciBus>> = None;
 
@@ -44,5 +45,6 @@ pub fn pci_bus_init() -> Result<(), SystemError> {
         PCI_BUS=Some(pci_bus.clone())
     }
     let r = bus_register(pci_bus.clone() as Arc<dyn Bus>);
+    pt_init();
     return r;
 }

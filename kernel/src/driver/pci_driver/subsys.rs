@@ -44,10 +44,20 @@ impl Bus for PciBus {
 
     fn probe(
         &self,
-        _device: &Arc<dyn crate::driver::base::device::Device>,
-    ) -> Result<(), system_error::SystemError> {
-        todo!()
-        //这里需要实现一个PciDriver的cast，就是说device的driver需要被cast到PciDriver这里
+        device: &Arc<dyn crate::driver::base::device::Device>,
+    ) -> Result<(), SystemError> {
+        let drv = device.driver().ok_or(SystemError::EINVAL)?;
+        let pci_drv=drv.cast::<dyn PciDriver>().map_err(|_|{
+            kerror!("PciBus::probe() failed: device.driver() is not a PciDriver. Device: '{:?}'", device.name());
+            SystemError::EINVAL
+        })?;
+        let pci_dev=device.clone().cast::<dyn PciDevice>().map_err(|_|{
+            kerror!("PciBus::probe() failed: device is not a PciDevice. Device: '{:?}'", device.name());
+            SystemError::EINVAL
+        })?;
+        //见https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/pci/pci-driver.c#324
+        let id = pci_drv.match_dev(&pci_dev).ok_or(SystemError::EINVAL)?;
+        pci_drv.probe(&pci_dev, &id)
     }
 
     fn remove(
@@ -83,11 +93,10 @@ impl Bus for PciBus {
         let pci_dev=device.clone().cast::<dyn PciDevice>().map_err(|_|{
             return SystemError::EINVAL;
         })?;
-        for i in pci_driver.locked_dynid_list()?.iter(){
-            if i.match_dev(&pci_dev){
-                return Ok(true)
-            }
-        };
+        if let Some(id)=pci_driver.match_dev(&pci_dev){
+            return Ok(true)
+        }
+        
 //todo:这里似乎需要一个driver_override_only的支持，但是目前不清楚driver_override_only 的用途，故暂时参考platform总线的match方法
 //override_only相关代码在 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/pci/pci-driver.c#159
         if let Some(driver_id_table) = driver.id_table(){

@@ -11,7 +11,7 @@ use crate::{
         },
         kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
         kset::KSet,
-    }, pci_driver::pci_bus},
+    }, pci_driver::{pci_bus, pci_driver::PciDriver}},
     filesystem::kernfs::KernFSInode,
     libs::{rwlock::RwLockWriteGuard, spinlock::SpinLock},
 };
@@ -23,8 +23,13 @@ use super::{dev_id::PciDeviceID, pci_bus_device, subsys::PciBus};
 
 pub struct PciDeviceManager;
 
+pub fn pci_device_manager()->&'static PciDeviceManager{
+    &PciDeviceManager
+}
+
 impl PciDeviceManager{
     pub fn device_add(&self,pci_dev:Arc<dyn PciDevice>)->Result<(),SystemError>{
+        
         if pci_dev.parent().is_none(){
             pci_dev.set_parent(Some(Arc::downgrade(&(pci_bus_device() as Arc<dyn KObject>))));
         }
@@ -44,7 +49,7 @@ impl PciDeviceManager{
 }
 
 pub trait PciDevice: Device {
-    fn pci_bus(&self) -> PciBus;
+    // fn pci_bus(&self) -> PciBus;
     fn dynid(&self)->PciDeviceID;
 }
 #[derive(Debug)]

@@ -1817,7 +1817,12 @@ impl IndexNode for LockedFATInode {
     // }
 
     fn dparent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.0.lock().parent.upgrade().map(|item| item as Arc<dyn IndexNode> ).ok_or(SystemError::EINVAL)
+        self.0
+            .lock()
+            .parent
+            .upgrade()
+            .map(|item| item as Arc<dyn IndexNode>)
+            .ok_or(SystemError::EINVAL)
     }
 }
 

@@ -9,10 +9,14 @@ use super::vfs::{
     FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
 };
 use crate::{
-    driver::base::device::device_number::DeviceNumber, filesystem::vfs::{core::{do_mount, do_mount_mkdir}, mount::MountList}, kerror, kinfo, libs::{
+    driver::base::device::device_number::DeviceNumber,
+    filesystem::vfs::mount::MountList,
+    kerror, kinfo,
+    libs::{
         once::Once,
         spinlock::{SpinLock, SpinLockGuard},
-    }, time::PosixTimeSpec
+    },
+    time::PosixTimeSpec,
 };
 use alloc::{
     collections::BTreeMap,
@@ -589,8 +593,10 @@ pub fn devfs_init() -> Result<(), SystemError> {
         let devfs: Arc<DevFS> = DevFS::new();
         // devfs 挂载
         let fs = ROOT_INODE()
-            .mkdir("dev", ModeType::from_bits_truncate(0o755)).expect("Unabled to find /dev")
-            .mount(devfs).expect("Failed to mount at /dev");
+            .mkdir("dev", ModeType::from_bits_truncate(0o755))
+            .expect("Unabled to find /dev")
+            .mount(devfs)
+            .expect("Failed to mount at /dev");
         MountList::insert("/dev", fs);
         kinfo!("DevFS mounted.");
         result = Some(Ok(()));

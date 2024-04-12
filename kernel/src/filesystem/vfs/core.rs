@@ -13,12 +13,17 @@ use crate::{
         sysfs::sysfs_init,
         vfs::{mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
     },
-    kdebug, kerror, kinfo,
+    kerror, kinfo,
     process::ProcessManager,
 };
 
 use super::{
-    fcntl::AtFlags, file::FileMode, mount::MountList, syscall::UmountFlag, utils::{rsplit_path, user_path_at}, IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES
+    fcntl::AtFlags,
+    file::FileMode,
+    mount::MountList,
+    syscall::UmountFlag,
+    utils::{rsplit_path, user_path_at},
+    IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 /// @brief 原子地生成新的Inode号。
@@ -71,40 +76,37 @@ pub fn vfs_init() -> Result<(), SystemError> {
 /// 请注意，为了避免删掉了伪文件系统内的信息，因此没有在原root inode那里调用unlink.
 fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemError> {
     kinfo!("VFS: Migrating filesystems...");
-    
+
     let new_fs = MountFS::new(new_fs, None);
     // 获取新的根文件系统的根节点的引用
     let new_root_inode = new_fs.root_inode();
-    
+
     unsafe {
         // drop旧的Root inode
         let old_root_inode = __ROOT_INODE.take().unwrap();
-        
+
         // ==== 在这里获取要被迁移的文件系统的inode并迁移 ===
         new_root_inode
-            .mkdir("proc", ModeType::from_bits_truncate(0o755)).expect("Unable to create /proc")
-            .mount_from(
-                old_root_inode.find("proc").expect("proc not mounted!")
-            )
+            .mkdir("proc", ModeType::from_bits_truncate(0o755))
+            .expect("Unable to create /proc")
+            .mount_from(old_root_inode.find("proc").expect("proc not mounted!"))
             .expect("Failed to migrate filesystem of proc");
         new_root_inode
-            .mkdir("dev", ModeType::from_bits_truncate(0o755)).expect("Unable to create /dev")
-            .mount_from(
-                old_root_inode.find("dev").expect("dev not mounted!")
-            )
+            .mkdir("dev", ModeType::from_bits_truncate(0o755))
+            .expect("Unable to create /dev")
+            .mount_from(old_root_inode.find("dev").expect("dev not mounted!"))
             .expect("Failed to migrate filesystem of dev");
         new_root_inode
-            .mkdir("sys", ModeType::from_bits_truncate(0o755)).expect("Unable to create /sys")
-            .mount_from(
-                old_root_inode.find("sys").expect("sys not mounted!")
-            )
+            .mkdir("sys", ModeType::from_bits_truncate(0o755))
+            .expect("Unable to create /sys")
+            .mount_from(old_root_inode.find("sys").expect("sys not mounted!"))
             .expect("Failed to migrate filesystem of sys");
 
         // 设置全局的新的ROOT Inode
         __ROOT_INODE = Some(new_root_inode.clone());
 
         // 把上述文件系统,迁移到新的文件系统下
-    
+
         drop(old_root_inode);
     }
 
@@ -146,14 +148,19 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
 }
 
 /// @brief 创建文件/文件夹
-pub fn do_mkdir_at(dirfd: i32, path: &str, mode: FileMode) -> Result<Arc<dyn IndexNode>, SystemError> {
+pub fn do_mkdir_at(
+    dirfd: i32,
+    path: &str,
+    mode: FileMode,
+) -> Result<Arc<dyn IndexNode>, SystemError> {
     // kdebug!("Call do mkdir at");
-    let (mut current_inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path.trim())?;
+    let (mut current_inode, path) =
+        user_path_at(&ProcessManager::current_pcb(), dirfd, path.trim())?;
     let (name, parent) = rsplit_path(&path);
     if let Some(parent) = parent {
         current_inode = current_inode.lookup(parent)?;
     }
-    return current_inode.mkdir(name, ModeType::from_bits_truncate(mode.bits()));    
+    return current_inode.mkdir(name, ModeType::from_bits_truncate(mode.bits()));
 }
 
 /// @brief 删除文件夹
@@ -225,9 +232,9 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     return Ok(0);
 }
 
-/// mount filesystem
+/// 挂载文件系统
 /// # Error
-/// `ENOENT`: mount point doesn't exist
+/// `ENOENT`: 目录（挂载点）不存在
 pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<Arc<MountFS>, SystemError> {
     let inode = ROOT_INODE().lookup_follow_symlink(mount_point, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
     let fs = inode.mount(fs)?;
@@ -235,17 +242,29 @@ pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<Arc<MountF
     return Ok(fs);
 }
 
-/// mount filesystem if couldn't know if the mountpoint exist
-pub fn do_mount_mkdir(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<Arc<MountFS>, SystemError> {
-    let inode = do_mkdir_at(AtFlags::AT_FDCWD.bits(), mount_point, FileMode::from_bits_truncate(0o755))?;
+/// = mount -m "/dirname" some_filesystem
+/// 挂载文件系统到指定目录，目录不存在即创建目录
+pub fn do_mount_mkdir(
+    fs: Arc<dyn FileSystem>,
+    mount_point: &str,
+) -> Result<Arc<MountFS>, SystemError> {
+    let inode = do_mkdir_at(
+        AtFlags::AT_FDCWD.bits(),
+        mount_point,
+        FileMode::from_bits_truncate(0o755),
+    )?;
     let fs = inode.mount(fs)?;
     MountList::insert(mount_point, fs.clone());
     return Ok(fs);
 }
 
-/// 总是应该从此处卸载文件系统
-pub fn do_umount2(dirfd: i32, target: &str, _flag: UmountFlag) -> Result<Arc<MountFS>, SystemError> {
-    let (work, rest) = user_path_at(&ProcessManager::current_pcb(), dirfd, &target)?;
+/// 卸载文件系统
+pub fn do_umount2(
+    dirfd: i32,
+    target: &str,
+    _flag: UmountFlag,
+) -> Result<Arc<MountFS>, SystemError> {
+    let (work, rest) = user_path_at(&ProcessManager::current_pcb(), dirfd, target)?;
     let path = work.absolute_path(0)? + &rest;
     let do_umount = || -> Result<Arc<MountFS>, SystemError> {
         if let Some(fs) = MountList::remove(path) {

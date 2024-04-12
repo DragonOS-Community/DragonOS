@@ -1,5 +1,5 @@
-use core::fmt::Debug;
 use core::cmp::Ordering;
+use core::fmt::Debug;
 use core::hash::Hash;
 
 use alloc::string::ToString;
@@ -78,12 +78,17 @@ pub fn user_path_at(
     return Ok((inode, ret_path));
 }
 
+/// Directory Name
+/// 可以用来作为原地提取目录名及比较的
+/// Dentry的对标（x
+///
+/// 简单的生成一个新的DName，以实现简单的RCU
 #[derive(Debug)]
 pub struct DName(pub Arc<SpinLock<String>>);
 
 impl PartialEq for DName {
     fn eq(&self, other: &Self) -> bool {
-        return *self.0.lock() == *other.0.lock()
+        return *self.0.lock() == *other.0.lock();
     }
 }
 impl Eq for DName {}
@@ -96,13 +101,13 @@ impl Hash for DName {
 
 impl PartialOrd for DName {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(&other))
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for DName {
     fn cmp(&self, other: &Self) -> Ordering {
-        return self.0.lock().cmp(&(*other.0.lock()))
+        return self.0.lock().cmp(&(*other.0.lock()));
     }
 }
 

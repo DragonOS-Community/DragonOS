@@ -22,8 +22,8 @@ use alloc::{
 use system_error::SystemError;
 
 use super::vfs::{
-    file::FilePrivateData, syscall::ModeType, FileSystem, FileSystemMaker, FsInfo, IndexNode,
-    InodeId, Metadata, SpecialNodeData, utils::DName,
+    file::FilePrivateData, syscall::ModeType, utils::DName, FileSystem, FileSystemMaker, FsInfo,
+    IndexNode, InodeId, Metadata, SpecialNodeData,
 };
 use super::vfs::{Magic, SuperBlock};
 
@@ -381,7 +381,7 @@ impl IndexNode for LockedRamFSInode {
         if name == "." || name == ".." {
             return Err(SystemError::ENOTEMPTY);
         }
-        
+
         let name = DName::from(name);
         // 获得要删除的文件的inode
         let to_delete = inode.children.get(&name).ok_or(SystemError::ENOENT)?;
@@ -421,14 +421,19 @@ impl IndexNode for LockedRamFSInode {
         new_name: &str,
     ) -> Result<(), SystemError> {
         let inode_to_move: Arc<dyn IndexNode> = self.find(old_name)?;
-        
+
         // 判断是否在同一目录下
         let target_id = target.metadata()?.inode_id;
-        
+
         let mut self_inode = self.0.lock();
         if target_id == self_inode.metadata.inode_id {
             self_inode.children.remove(&DName::from(old_name));
-            self_inode.children.insert(DName::from(new_name), inode_to_move.downcast_arc::<LockedRamFSInode>().ok_or(SystemError::EINVAL)?);
+            self_inode.children.insert(
+                DName::from(new_name),
+                inode_to_move
+                    .downcast_arc::<LockedRamFSInode>()
+                    .ok_or(SystemError::EINVAL)?,
+            );
             return Ok(());
         }
         drop(self_inode);
@@ -477,7 +482,11 @@ impl IndexNode for LockedRamFSInode {
             name => {
                 // 在子目录项中查找
                 let name = DName::from(name);
-                return Ok(inode.children.get(&name).ok_or(SystemError::ENOENT)?.clone());
+                return Ok(inode
+                    .children
+                    .get(&name)
+                    .ok_or(SystemError::ENOENT)?
+                    .clone());
             }
         }
     }
@@ -513,7 +522,7 @@ impl IndexNode for LockedRamFSInode {
                             .into()
                             == ino
                     })
-                    .map(|item|item.to_string())
+                    .map(|item| item.to_string())
                     .collect();
 
                 match key.len() {
@@ -534,7 +543,15 @@ impl IndexNode for LockedRamFSInode {
         let mut keys: Vec<String> = Vec::new();
         keys.push(String::from("."));
         keys.push(String::from(".."));
-        keys.append(&mut self.0.lock().children.keys().map(|k|k.to_string()).collect());
+        keys.append(
+            &mut self
+                .0
+                .lock()
+                .children
+                .keys()
+                .map(|k| k.to_string())
+                .collect(),
+        );
 
         return Ok(keys);
     }
@@ -600,9 +617,7 @@ impl IndexNode for LockedRamFSInode {
             unimplemented!()
         }
 
-        inode
-            .children
-            .insert(filename, nod.clone());
+        inode.children.insert(filename, nod.clone());
         Ok(nod)
     }
 
@@ -615,6 +630,11 @@ impl IndexNode for LockedRamFSInode {
     }
 
     fn dparent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.0.lock().parent.upgrade().map(|item| item as Arc<dyn IndexNode> ).ok_or(SystemError::EINVAL)
+        self.0
+            .lock()
+            .parent
+            .upgrade()
+            .map(|item| item as Arc<dyn IndexNode>)
+            .ok_or(SystemError::EINVAL)
     }
 }

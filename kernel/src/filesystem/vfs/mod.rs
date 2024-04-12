@@ -424,11 +424,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
-    fn mkdir(
-        &self,
-        name: &str,
-        mode: ModeType,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    fn mkdir(&self, name: &str, mode: ModeType) -> Result<Arc<dyn IndexNode>, SystemError> {
         match self.find(name) {
             Ok(inode) => Ok(inode),
             Err(SystemError::ENOENT) => self.create(name, FileType::Dir, mode),
@@ -445,7 +441,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
-    /// 
+    ///
     fn dparent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         return Err(SystemError::ENOSYS);
     }

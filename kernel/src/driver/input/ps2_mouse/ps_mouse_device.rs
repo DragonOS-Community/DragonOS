@@ -1,7 +1,7 @@
 use core::hint::spin_loop;
 
 use alloc::{
-    string::{String, ToString},
+    string::ToString,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -30,7 +30,8 @@ use crate::{
         devfs::{devfs_register, DevFS, DeviceINode},
         kernfs::KernFSInode,
         vfs::{
-            core::generate_inode_id, syscall::ModeType, utils::DName, FilePrivateData, FileSystem, FileType, IndexNode, Metadata
+            core::generate_inode_id, syscall::ModeType, utils::DName, FilePrivateData, FileSystem,
+            FileType, IndexNode, Metadata,
         },
     },
     libs::{

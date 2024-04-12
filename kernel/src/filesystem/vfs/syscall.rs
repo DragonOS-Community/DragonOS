@@ -21,13 +21,13 @@ use crate::{
 };
 
 use super::{
-    SuperBlock,
     core::{do_mkdir_at, do_remove_dir, do_unlink_at},
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
     open::{do_faccessat, do_fchmodat, do_sys_open},
     utils::{rsplit_path, user_path_at},
-    Dirent, FileType, IndexNode, FSMAKER, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    Dirent, FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
+    VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 // use crate::kdebug;
 
@@ -779,7 +779,11 @@ impl Syscall {
     /// @return uint64_t 负数错误码 / 0表示成功
     pub fn mkdir(path: *const u8, mode: usize) -> Result<usize, SystemError> {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
-        do_mkdir_at(AtFlags::AT_FDCWD.bits(), &path, FileMode::from_bits_truncate(mode as u32))?;
+        do_mkdir_at(
+            AtFlags::AT_FDCWD.bits(),
+            &path,
+            FileMode::from_bits_truncate(mode as u32),
+        )?;
         return Ok(0);
     }
 
@@ -1566,10 +1570,7 @@ impl Syscall {
 
     /// src/linux/mount.c `umount`` & `umount2``
     pub fn umount2(target: *const u8, flags: i32) -> Result<(), SystemError> {
-        let target = user_access::check_and_clone_cstr(
-            target,
-            Some(MAX_PATHLEN),
-        )?;
+        let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?;
         Vcore::do_umount2(
             AtFlags::AT_FDCWD.bits(),
             &target,

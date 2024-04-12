@@ -627,7 +627,7 @@ impl IndexNode for Ps2MouseDevice {
         _buf: &[u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

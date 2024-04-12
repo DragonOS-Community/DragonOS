@@ -531,7 +531,7 @@ impl IndexNode for LockedProcFSInode {
         _buf: &[u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -690,7 +690,7 @@ impl IndexNode for LockedProcFSInode {
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
     ) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {

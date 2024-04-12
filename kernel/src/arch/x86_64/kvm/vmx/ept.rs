@@ -15,7 +15,7 @@ pub fn check_ept_features() -> Result<(), SystemError> {
     const MTRR_ENABLE_BIT: u64 = 1 << 11;
     let ia32_mtrr_def_type = unsafe { msr::rdmsr(msr::IA32_MTRR_DEF_TYPE) };
     if (ia32_mtrr_def_type & MTRR_ENABLE_BIT) == 0 {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     Ok(())
 }

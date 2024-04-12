@@ -183,7 +183,7 @@ impl DevFS {
                     .expect("DevFS: Failed to register /dev/fb");
             }
             _ => {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                return Err(SystemError::ENOSYS);
             }
         }
 
@@ -226,7 +226,7 @@ impl DevFS {
                 dev_block_inode.remove(name)?;
             }
             _ => {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                return Err(SystemError::ENOSYS);
             }
         }
 
@@ -489,7 +489,7 @@ impl IndexNode for LockedDevFSInode {
         _data: usize,
         _private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        Err(SystemError::ENOSYS)
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
@@ -531,7 +531,7 @@ impl IndexNode for LockedDevFSInode {
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         kerror!("DevFS: read_at is not supported!");
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        Err(SystemError::ENOSYS)
     }
 
     /// 写设备 - 应该调用设备的函数读写，而不是通过文件系统读写
@@ -542,7 +542,7 @@ impl IndexNode for LockedDevFSInode {
         _buf: &[u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        Err(SystemError::ENOSYS)
     }
 }
 

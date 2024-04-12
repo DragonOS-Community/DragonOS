@@ -139,7 +139,6 @@ pub fn poll_ifaces() {
 pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
     let mut i = 0;
     while i < times {
-        kdebug!("poll try lock i:{}",i);
         let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDriver>>> =
             NET_DRIVERS.read_irqsave();
         if guard.len() == 0 {
@@ -150,7 +149,6 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
         let sockets = SOCKET_SET.try_lock_irqsave();
         // 加锁失败，继续尝试
         if sockets.is_err() {
-            kdebug!("poll error i:{}",i);
             i += 1;
             continue;
         }
@@ -162,7 +160,6 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
         send_event(&sockets)?;
         return Ok(());
     }
-    kdebug!("poll error out ");
     // 尝试次数用完，返回错误
     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
 }

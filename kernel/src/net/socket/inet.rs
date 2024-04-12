@@ -488,17 +488,11 @@ impl TcpSocket {
     /// @return 返回创建的tcp的socket
     pub fn new(options: SocketOptions) -> Self {
 
-        //创建handles数组
+        // 创建handles数组
         let mut handles:Vec<Arc<GlobalSocketHandle>>=Vec::new();
-
-        let rx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_RX_BUF_SIZE]);
-        let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_TX_BUF_SIZE]);
-        let socket = tcp::Socket::new(rx_buffer, tx_buffer);
         
         // 把socket添加到socket集合中，并得到socket的句柄
-        handles.push(GlobalSocketHandle::new(SOCKET_SET.lock_irqsave().add(socket)));
-        // let handle: Arc<GlobalSocketHandle> =
-        //     GlobalSocketHandle::new(SOCKET_SET.lock_irqsave().add(socket));
+        handles.push(GlobalSocketHandle::new(SOCKET_SET.lock_irqsave().add(Self::create_new_socket())));
 
         let metadata = SocketMetadata::new(
             SocketType::Tcp,
@@ -507,7 +501,7 @@ impl TcpSocket {
             Self::DEFAULT_METADATA_BUF_SIZE,
             options,
         );
-        //kdebug!("when there's a new tcp socket,its'len: {}",handles.len());
+        // kdebug!("when there's a new tcp socket,its'len: {}",handles.len());
 
         return Self {
             handle:handles,
@@ -544,6 +538,13 @@ impl TcpSocket {
         };
     }
 
+    /// @brief 返回一个tcp的socket
+    fn create_new_socket() -> tcp::Socket<'static> {
+        // 初始化tcp的buffer
+        let rx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_RX_BUF_SIZE]);
+        let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_TX_BUF_SIZE]);
+        tcp::Socket::new(rx_buffer, tx_buffer)
+    }
 }
 
 impl Socket for TcpSocket {
@@ -558,7 +559,7 @@ impl Socket for TcpSocket {
             return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
         }
         // kdebug!("tcp socket: read, buf len={}", buf.len());
-        //kdebug!("tcp socket:read, socket'len={}",self.handle.len());
+        // kdebug!("tcp socket:read, socket'len={}",self.handle.len());
         loop {
             poll_ifaces();
             let mut socket_set_guard = SOCKET_SET.lock_irqsave();
@@ -627,7 +628,7 @@ impl Socket for TcpSocket {
         {
             return Err(SystemError::ENOTCONN);
         }
-        //kdebug!("tcp socket:write, socket'len={}",self.handle.len());
+        // kdebug!("tcp socket:write, socket'len={}",self.handle.len());
 
         let mut socket_set_guard = SOCKET_SET.lock_irqsave();
 
@@ -656,7 +657,7 @@ impl Socket for TcpSocket {
 
     fn poll(&self) -> EPollEventType {
         let mut socket_set_guard = SOCKET_SET.lock_irqsave();
-        //kdebug!("tcp socket:poll, socket'len={}",self.handle.len());
+        // kdebug!("tcp socket:poll, socket'len={}",self.handle.len());
 
         let socket = socket_set_guard.get_mut::<tcp::Socket>(self.handle.get(0).unwrap().0);
         return SocketPollMethod::tcp_poll(
@@ -671,7 +672,7 @@ impl Socket for TcpSocket {
 
     fn connect(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
         let mut sockets = SOCKET_SET.lock_irqsave();
-        //kdebug!("tcp socket:connect, socket'len={}",self.handle.len());
+        // kdebug!("tcp socket:connect, socket'len={}",self.handle.len());
 
         let socket = sockets.get_mut::<tcp::Socket>(self.handle.get(0).unwrap().0);
 
@@ -738,30 +739,27 @@ impl Socket for TcpSocket {
 
         let local_endpoint = self.local_endpoint.ok_or(SystemError::EINVAL)?;
         let mut sockets = SOCKET_SET.lock_irqsave();
-        //获取handle的数量
+        // 获取handle的数量
         let handlen=self.handle.len();
         let backlog =handlen.max(_backlog);
 
-        //添加剩余需要构建的socket
-        //kdebug!("tcp socket:before listen, socket'len={}",self.handle.len());
+        // 添加剩余需要构建的socket
+        // kdebug!("tcp socket:before listen, socket'len={}",self.handle.len());
         let mut handle_guard= HANDLE_MAP.write_irqsave();
         self.handle.extend((handlen..backlog).map(|_|{
-            let rx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_RX_BUF_SIZE]);
-            let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_TX_BUF_SIZE]);
-            let socket = tcp::Socket::new(rx_buffer, tx_buffer);
+            let socket = Self::create_new_socket();
             let handle=GlobalSocketHandle::new(sockets.add(socket));
             let handle_item = SocketHandleItem::new();
             handle_guard.insert(handle.0, handle_item);
             handle
         }));
-        //kdebug!("tcp socket:listen, socket'len={}",self.handle.len());
-        //kdebug!("tcp socket:listen, backlog={backlog}");
+        // kdebug!("tcp socket:listen, socket'len={}",self.handle.len());
+        // kdebug!("tcp socket:listen, backlog={backlog}");
 
-        //监听所有的socket
+        // 监听所有的socket
         for i in 0..backlog{
             let handle=self.handle.get(i).unwrap();
-            // let handle_item = SocketHandleItem::new();
-            // handle_guard.insert(handle.0, handle_item);            
+           
             let socket = sockets.get_mut::<tcp::Socket>(handle.0);
 
             if !socket.is_listening() {
@@ -781,7 +779,7 @@ impl Socket for TcpSocket {
             
             // 检测端口是否已被占用
             PORT_MANAGER.bind_port(self.metadata.socket_type, ip.port, self.clone())?;
-            kdebug!("tcp socket:bind, socket'len={}",self.handle.len());
+            // kdebug!("tcp socket:bind, socket'len={}",self.handle.len());
 
             self.local_endpoint = Some(ip);
             self.is_listening = false;
@@ -805,11 +803,11 @@ impl Socket for TcpSocket {
         loop {
             // kdebug!("tcp accept: poll_ifaces()");
             poll_ifaces();
-            //kdebug!("tcp socket:accept, socket'len={}",self.handle.len());
+            // kdebug!("tcp socket:accept, socket'len={}",self.handle.len());
 
             let mut sockets = SOCKET_SET.lock_irqsave();
            
-            //随机获取访问的socket的handle
+            // 随机获取访问的socket的handle
             let index: usize = rand()% self.handle.len();
             let handle=self.handle.get(index).unwrap();
             let socket = sockets
@@ -820,11 +818,8 @@ impl Socket for TcpSocket {
                 let remote_ep = socket.remote_endpoint().ok_or(SystemError::ENOTCONN)?;
 
                 let new_socket = {
-                    // Initialize the TCP socket's buffers.
-                    let rx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_RX_BUF_SIZE]);
-                    let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_TX_BUF_SIZE]);
                     // The new TCP socket used for sending and receiving data.
-                    let mut tcp_socket = tcp::Socket::new(rx_buffer, tx_buffer);
+                    let mut tcp_socket = Self::create_new_socket();
                     self.do_listen(&mut tcp_socket, endpoint)
                         .expect("do_listen failed");
 
@@ -849,7 +844,7 @@ impl Socket for TcpSocket {
                         is_listening: false,
                         metadata,
                     });
-                    //kdebug!("tcp socket:after accept, socket'len={}",new_socket.handle.len());
+                    // kdebug!("tcp socket:after accept, socket'len={}",new_socket.handle.len());
 
                     // 更新端口与 socket 的绑定
                     if let Some(Endpoint::Ip(Some(ip))) = self.endpoint() {
@@ -871,21 +866,18 @@ impl Socket for TcpSocket {
                     handle_guard.insert(new_handle.0, item);
                     let new_item = SocketHandleItem::new();
                     
-
                     // 插入新的item
                     handle_guard.insert(old_handle.0, new_item);
-                    
-
 
                     new_socket
                 };
-                 //kdebug!("tcp accept: new socket: {:?}", new_socket);
+                 // kdebug!("tcp accept: new socket: {:?}", new_socket);
                 drop(sockets);
                 poll_ifaces();
 
                 return Ok((new_socket, Endpoint::Ip(Some(remote_ep))));
             }
-            //kdebug!("tcp socket:before sleep, handle_guard'len={}",HANDLE_MAP.write_irqsave().len());
+            // kdebug!("tcp socket:before sleep, handle_guard'len={}",HANDLE_MAP.write_irqsave().len());
 
             drop(sockets);
             SocketHandleItem::sleep(
@@ -893,7 +885,7 @@ impl Socket for TcpSocket {
                 Self::CAN_ACCPET,
                 HANDLE_MAP.read_irqsave(),
             );
-            //kdebug!("tcp socket:after sleep, handle_guard'len={}",HANDLE_MAP.write_irqsave().len());
+            // kdebug!("tcp socket:after sleep, handle_guard'len={}",HANDLE_MAP.write_irqsave().len());
         }
     }
 
@@ -902,7 +894,7 @@ impl Socket for TcpSocket {
 
         if result.is_none() {
             let sockets = SOCKET_SET.lock_irqsave();
-            //kdebug!("tcp socket:endpoint, socket'len={}",self.handle.len());
+            // kdebug!("tcp socket:endpoint, socket'len={}",self.handle.len());
             
             let socket = sockets.get::<tcp::Socket>(self.handle.get(0).unwrap().0);
             if let Some(ep) = socket.local_endpoint() {
@@ -914,7 +906,7 @@ impl Socket for TcpSocket {
 
     fn peer_endpoint(&self) -> Option<Endpoint> {
         let sockets = SOCKET_SET.lock_irqsave();
-        //kdebug!("tcp socket:peer_endpoint, socket'len={}",self.handle.len());
+        // kdebug!("tcp socket:peer_endpoint, socket'len={}",self.handle.len());
 
         let socket = sockets.get::<tcp::Socket>(self.handle.get(0).unwrap().0);
         return socket.remote_endpoint().map(|x| Endpoint::Ip(Some(x)));
@@ -929,7 +921,7 @@ impl Socket for TcpSocket {
     }
 
     fn socket_handle(&self) -> SocketHandle {
-        //kdebug!("tcp socket:socket_handle, socket'len={}",self.handle.len());
+        // kdebug!("tcp socket:socket_handle, socket'len={}",self.handle.len());
 
         self.handle.get(0).unwrap().0
     }

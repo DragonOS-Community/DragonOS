@@ -1041,7 +1041,9 @@ impl Syscall {
                 let name = args[0] as *mut PosixOldUtsName;
                 Self::uname(name)
             }
-            SYS_PRCTL=>{
+            SYS_PRCTL => { 
+                // todo: 这个系统调用还没有实现
+                
                 Err(SystemError::EINVAL)
             }
 

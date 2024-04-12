@@ -64,3 +64,7 @@ impl TimeArch for RiscV64TimeArch {
         cycles * 1000000000 / unsafe { TIME_FREQ }
     }
 }
+
+pub fn riscv_time_base_freq() -> usize {
+    unsafe { TIME_FREQ }
+}

@@ -287,6 +287,7 @@ pub enum DeviceType {
     Intc,
     PlatformDev,
     Char,
+    Pci,
 }
 
 /// @brief: 设备标识符类型

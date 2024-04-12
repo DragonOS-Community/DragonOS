@@ -2,6 +2,7 @@ use alloc::sync::Arc;
 
 use super::pci_device::PciDevice;
 const PCI_ANY_ID:u32=0xffff_ffff;
+#[derive(Debug)]
 pub struct PciDeviceID{
     vendor:u32,
     device_id:u32,
@@ -14,6 +15,9 @@ pub struct PciDeviceID{
 }
 
 impl PciDeviceID{
+    pub fn dummpy()->Self{
+        return Self { vendor: PCI_ANY_ID, device_id: PCI_ANY_ID, subvendor:PCI_ANY_ID, subdevice: PCI_ANY_ID, class: PCI_ANY_ID, class_mask: PCI_ANY_ID, _driver_data: 0, _override_only: PCI_ANY_ID }
+    }
     pub fn match_dev(&self,dev:&Arc<dyn PciDevice>)->bool{
         let d_id=dev.dynid();
         if (self.vendor==d_id.vendor()||self.vendor==PCI_ANY_ID)&&

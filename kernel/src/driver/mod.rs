@@ -1,6 +1,7 @@
 pub mod acpi;
 pub mod base;
 pub mod block;
+pub mod clocksource;
 pub mod disk;
 pub mod firmware;
 pub mod input;

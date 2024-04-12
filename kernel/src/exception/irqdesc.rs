@@ -37,6 +37,7 @@ use super::{
     handle::bad_irq_handler,
     irqchip::IrqChip,
     irqdata::{IrqCommonData, IrqData, IrqHandlerData, IrqLineStatus, IrqStatus},
+    irqdomain::{irq_domain_manager, IrqDomain},
     sysfs::{irq_sysfs_del, IrqKObjType},
     HardwareIrqNumber, InterruptArch, IrqNumber,
 };
@@ -119,11 +120,12 @@ impl IrqDesc {
             kobj_state: LockedKObjectState::new(Some(KObjectState::INITIALIZED)),
             threads_active: AtomicI64::new(0),
         };
-
+        let irq_desc = Arc::new(irq_desc);
+        irq_desc.irq_data().set_irq_desc(Arc::downgrade(&irq_desc));
         irq_desc.set_handler(bad_irq_handler());
         irq_desc.inner().irq_data.irqd_set(irqd_flags);
 
-        return Arc::new(irq_desc);
+        return irq_desc;
     }
 
     /// 返回当前活跃的中断线程数量
@@ -984,6 +986,38 @@ impl IrqDescManager {
         drop(desc_inner);
 
         desc.set_percpu_devid_flags();
+
+        return Ok(());
+    }
+}
+
+pub struct GenericIrqHandler;
+
+#[allow(dead_code)]
+impl GenericIrqHandler {
+    /// `handle_domain_irq` - 调用属于某个中断域的硬件中断的处理程序
+    ///
+    /// # 参数
+    ///
+    /// * `domain`: 执行查找的域
+    /// * `hwirq`: 要转换为逻辑中断的硬件中断号
+    ///
+    /// # 返回
+    ///
+    /// 成功时返回 `Ok(())`，如果转换失败则返回 `Err(SystemError)`
+    ///
+    /// 此函数必须在初始化了中断寄存器的中断上下文中调用
+    ///
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/irq/irqdesc.c?fi=generic_handle_domain_irq#726
+    pub fn handle_domain_irq(
+        domain: Arc<IrqDomain>,
+        hwirq: HardwareIrqNumber,
+        trap_frame: &mut TrapFrame,
+    ) -> Result<(), SystemError> {
+        let (irq_desc, _) =
+            irq_domain_manager().resolve_irq_mapping(Some(domain.clone()), hwirq)?;
+
+        irq_desc.handler().unwrap().handle(&irq_desc, trap_frame);
 
         return Ok(());
     }

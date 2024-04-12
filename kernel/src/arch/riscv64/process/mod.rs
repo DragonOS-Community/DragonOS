@@ -18,7 +18,7 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    kerror,
+    kdebug, kerror,
     libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{
@@ -127,14 +127,22 @@ impl ProcessManager {
     /// 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/riscv/include/asm/switch_to.h#76
     pub unsafe fn switch_process(prev: Arc<ProcessControlBlock>, next: Arc<ProcessControlBlock>) {
         assert!(!CurrentIrqArch::is_irq_enabled());
+        kdebug!(
+            "riscv switch process: prev: {:?}, next: {:?}",
+            prev.pid(),
+            next.pid()
+        );
         Self::switch_process_fpu(&prev, &next);
+        kdebug!("riscv switch process: after switch_process_fpu");
         Self::switch_local_context(&prev, &next);
+        kdebug!("riscv switch process: after switch_local_context");
 
         // 切换地址空间
         let next_addr_space = next.basic().user_vm().as_ref().unwrap().clone();
         compiler_fence(Ordering::SeqCst);
 
         next_addr_space.read().user_mapper.utable.make_current();
+        kdebug!("riscv switch process: after switch addr space");
         drop(next_addr_space);
         compiler_fence(Ordering::SeqCst);
 
@@ -147,7 +155,7 @@ impl ProcessManager {
         ProcessManager::current_pcb().preempt_enable();
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
-        // kdebug!("switch tss ok");
+        kdebug!("riscv switch process: before to inner");
         compiler_fence(Ordering::SeqCst);
         // 正式切换上下文
         switch_to_inner(prev_arch, next_arch);
@@ -244,7 +252,14 @@ unsafe extern "C" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBI
 
 /// 在切换上下文完成后的钩子函数(必须在这里加一个跳转函数，否则会出现relocation truncated to fit: R_RISCV_JAL错误)
 unsafe extern "C" fn before_switch_finish_hook() {
+    let pcb = ProcessManager::current_pcb();
+    kdebug!(
+        "before_switch_finish_hook, pid: {:?}, name: {:?}",
+        pcb.pid(),
+        pcb.basic().name()
+    );
     switch_finish_hook();
+    kdebug!("after switch_finish_hook");
 }
 
 impl ProcessControlBlock {

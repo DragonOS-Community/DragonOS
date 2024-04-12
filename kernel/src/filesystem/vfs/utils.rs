@@ -84,18 +84,18 @@ pub fn user_path_at(
 ///
 /// 简单的生成一个新的DName，以实现简单的RCU
 #[derive(Debug)]
-pub struct DName(pub Arc<SpinLock<String>>);
+pub struct DName(pub Arc<String>);
 
 impl PartialEq for DName {
     fn eq(&self, other: &Self) -> bool {
-        return *self.0.lock() == *other.0.lock();
+        return *self.0 == *other.0;
     }
 }
 impl Eq for DName {}
 
 impl Hash for DName {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        self.0.lock().hash(state)
+        self.0.hash(state)
     }
 }
 
@@ -107,25 +107,25 @@ impl PartialOrd for DName {
 
 impl Ord for DName {
     fn cmp(&self, other: &Self) -> Ordering {
-        return self.0.lock().cmp(&(*other.0.lock()));
+        return self.0.cmp(&other.0);
     }
 }
 
 impl Default for DName {
     fn default() -> Self {
-        Self(Arc::new(SpinLock::new(String::new())))
+        Self(Arc::new(String::new()))
     }
 }
 
 impl From<String> for DName {
     fn from(value: String) -> Self {
-        Self(Arc::from(SpinLock::new(value)))
+        Self(Arc::from(value))
     }
 }
 
 impl From<&str> for DName {
     fn from(value: &str) -> Self {
-        Self(Arc::from(SpinLock::new(String::from(value))))
+        Self(Arc::from(String::from(value)))
     }
 }
 
@@ -137,6 +137,6 @@ impl Clone for DName {
 
 impl ToString for DName {
     fn to_string(&self) -> String {
-        self.0.lock().clone()
+        (*self.0).clone()
     }
 }

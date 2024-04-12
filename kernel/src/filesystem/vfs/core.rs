@@ -80,33 +80,29 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     let new_fs = MountFS::new(new_fs, None);
     // 获取新的根文件系统的根节点的引用
     let new_root_inode = new_fs.root_inode();
+    
+    // ==== 在这里获取要被迁移的文件系统的inode并迁移 ===
+    new_root_inode
+        .mkdir("proc", ModeType::from_bits_truncate(0o755))
+        .expect("Unable to create /proc")
+        .mount_from(ROOT_INODE().find("proc").expect("proc not mounted!"))
+        .expect("Failed to migrate filesystem of proc");
+    new_root_inode
+        .mkdir("dev", ModeType::from_bits_truncate(0o755))
+        .expect("Unable to create /dev")
+        .mount_from(ROOT_INODE().find("dev").expect("dev not mounted!"))
+        .expect("Failed to migrate filesystem of dev");
+    new_root_inode
+        .mkdir("sys", ModeType::from_bits_truncate(0o755))
+        .expect("Unable to create /sys")
+        .mount_from(ROOT_INODE().find("sys").expect("sys not mounted!"))
+        .expect("Failed to migrate filesystem of sys");
 
     unsafe {
         // drop旧的Root inode
         let old_root_inode = __ROOT_INODE.take().unwrap();
-
-        // ==== 在这里获取要被迁移的文件系统的inode并迁移 ===
-        new_root_inode
-            .mkdir("proc", ModeType::from_bits_truncate(0o755))
-            .expect("Unable to create /proc")
-            .mount_from(old_root_inode.find("proc").expect("proc not mounted!"))
-            .expect("Failed to migrate filesystem of proc");
-        new_root_inode
-            .mkdir("dev", ModeType::from_bits_truncate(0o755))
-            .expect("Unable to create /dev")
-            .mount_from(old_root_inode.find("dev").expect("dev not mounted!"))
-            .expect("Failed to migrate filesystem of dev");
-        new_root_inode
-            .mkdir("sys", ModeType::from_bits_truncate(0o755))
-            .expect("Unable to create /sys")
-            .mount_from(old_root_inode.find("sys").expect("sys not mounted!"))
-            .expect("Failed to migrate filesystem of sys");
-
         // 设置全局的新的ROOT Inode
         __ROOT_INODE = Some(new_root_inode.clone());
-
-        // 把上述文件系统,迁移到新的文件系统下
-
         drop(old_root_inode);
     }
 

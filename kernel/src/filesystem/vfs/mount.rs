@@ -438,7 +438,10 @@ impl IndexNode for MountFSInode {
     }
 
     fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
-        self.mount_fs.umount()
+        if !self.is_mountpoint_root()? {
+            return Err(SystemError::EINVAL);
+        }
+        return self.mount_fs.umount();
     }
 
     fn absolute_path(&self, len: usize) -> Result<String, SystemError> {
@@ -447,7 +450,7 @@ impl IndexNode for MountFSInode {
             return Ok(String::with_capacity(len));
         }
         let name = self.dname()?;
-        return Ok(parent.absolute_path(len + name.0.lock().len())? + &name.0.lock());
+        return Ok(parent.absolute_path(len + name.0.len())? + &name.0);
     }
 
     #[inline]
@@ -515,8 +518,14 @@ impl FileSystem for MountFS {
 }
 
 /// MountList
-///
-
+/// ```rust
+/// use alloc::collection::BTreeSet;
+/// let map = BTreeSet::from([
+///     "/sys", "/dev", "/", "/bin", "/proc"
+/// ]);
+/// assert_eq!(format!("{:?}", map), "{\"/\", \"/bin\", \"/dev\", \"/proc\", \"/sys\"}");
+/// // {"/", "/bin", "/dev", "/proc", "/sys"}
+/// ```
 #[derive(PartialEq, Eq, Debug)]
 pub struct MountPath(String);
 
@@ -549,8 +558,11 @@ impl Ord for MountPath {
         let self_dep = self.0.chars().filter(|c| *c == '/').count();
         let othe_dep = other.0.chars().filter(|c| *c == '/').count();
         if self_dep == othe_dep {
-            self.0.cmp(&other.0)
+            // 深度一样时反序来排
+            // 根目录和根目录下的文件的绝对路径都只有一个'/'
+            other.0.cmp(&self.0)
         } else {
+            // 根据深度，深度
             othe_dep.cmp(&self_dep)
         }
     }
@@ -585,7 +597,7 @@ impl MountList {
             .insert(MountPath::from(path.as_ref()), fs);
     }
 
-    /// 获取挂载点信息，返回
+    /// 获取离提供路径最近的挂载点信息，返回
     ///
     /// - `最近的挂载点`
     /// - `挂载点下的路径`

@@ -422,10 +422,10 @@ impl IndexNode for LockedRamFSInode {
     ) -> Result<(), SystemError> {
         let inode_to_move: Arc<dyn IndexNode> = self.find(old_name)?;
 
-        // 判断是否在同一目录下
         let target_id = target.metadata()?.inode_id;
 
         let mut self_inode = self.0.lock();
+        // 判断是否在同一目录下, 是则进行重命名
         if target_id == self_inode.metadata.inode_id {
             self_inode.children.remove(&DName::from(old_name));
             self_inode.children.insert(

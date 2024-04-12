@@ -284,16 +284,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
-    /// @brief 将指定名称的子目录项的文件内容，移动到target这个目录下。如果_old_name所指向的inode与_target的相同，那么则直接执行重命名的操作。
+    /// 将指定的`old_name`子目录项移动到target目录下, 并予以`new_name`。
     ///
-    /// @param old_name 旧的名字
-    ///
-    /// @param target 移动到指定的inode
-    ///
-    /// @param new_name 新的文件名
-    ///
-    /// @return 成功: Ok()
-    ///         失败: Err(错误码)
+    /// # Behavior
+    /// 如果old_name所指向的inode与target的相同，那么则直接**执行重命名的操作**。
     fn move_to(
         &self,
         _old_name: &str,
@@ -303,22 +297,6 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::ENOSYS);
     }
-
-    // /// # 修改文件名
-    // ///
-    // ///
-    // /// ## 参数
-    // ///
-    // /// - _old_name: 源文件路径
-    // /// - _new_name: 目标文件路径
-    // ///
-    // /// ## 返回值
-    // /// - Ok(返回值类型): 返回值的说明
-    // /// - Err(错误值类型): 错误的说明
-    // ///
-    // fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), SystemError> {
-    //     return Err(SystemError::ENOSYS);
-    // }
 
     /// @brief 寻找一个名为Name的inode
     ///
@@ -382,20 +360,37 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 列出当前inode下的所有目录项的名字
     fn list(&self) -> Result<Vec<String>, SystemError>;
 
-    /// @brief 在当前Inode下，挂载一个新的文件系统
-    /// 请注意！该函数只能被MountFS实现，其他文件系统不应实现这个函数
+    /// 在当前Inode下，挂载一个新的文件系统
+    /// # Behavior
+    /// 该函数只能被MountFS实现，其他文件系统不应实现这个函数
     fn mount(&self, _fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
+    /// 在当前Inode下，挂载一个已有挂载信息的文件系统
+    /// # Behavior
+    /// 该函数只能被MountFS实现，其他文件系统不应实现这个函数
     fn mount_from(&self, _des: Arc<dyn IndexNode>) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
+    /// 卸载当前Inode下的文件系统
+    /// # Behavior
+    /// 该函数只能被MountFS实现，其他文件系统不应实现这个函数
+    /// # Logic
+    /// lookup path -> 父文件系统的挂载点 -> overlaid 成子文件系统的root 
+    /// -> 判断是否是子文件系统root -> 调用父文件系统挂载点的_umount方法
     fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
+    /// 获取绝对路径
+    /// # Behavior
+    /// 该函数只能被MountFS实现，其他文件系统不应实现这个函数
+    /// # Performance Note
+    /// 这是一个O(n)的路径查询，并且在未实现DName缓存的文件系统中，性能极差；
+    /// 即使实现了DName也尽量不要用，直到
+    /// 能外部传参进来获取路径的尽量不要call这个函数，直到实现
     fn absolute_path(&self, _len: usize) -> Result<String, SystemError> {
         return Err(SystemError::ENOSYS);
     }
@@ -424,9 +419,20 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// 新建名称为`name`的目录项
+    /// # Behavior
+    /// 当目录下已有名称为`name`的文件夹，返回该目录项的引用, 
+    /// 否则新建`name`文件夹，并返回该引用
+    /// # Error
+    /// `EEXIST`: `name`目录存在且类型不为文件夹
     fn mkdir(&self, name: &str, mode: ModeType) -> Result<Arc<dyn IndexNode>, SystemError> {
         match self.find(name) {
-            Ok(inode) => Ok(inode),
+            Ok(inode) => 
+                if inode.metadata()?.file_type == FileType::Dir {
+                    Ok(inode)
+                } else {
+                    Err(SystemError::EEXIST)
+                },
             Err(SystemError::ENOENT) => self.create(name, FileType::Dir, mode),
             Err(err) => Err(err),
         }
@@ -437,11 +443,14 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         None
     }
 
+    /// 返回目录名
     fn dname(&self) -> Result<DName, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
-    ///
+    /// 返回父目录的引用
+    /// # Behavior
+    /// 当自己是当前文件系统的根目录，则返回自身的引用
     fn dparent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         return Err(SystemError::ENOSYS);
     }

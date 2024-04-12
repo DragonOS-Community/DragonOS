@@ -80,7 +80,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     let new_fs = MountFS::new(new_fs, None);
     // 获取新的根文件系统的根节点的引用
     let new_root_inode = new_fs.root_inode();
-    
+
     // ==== 在这里获取要被迁移的文件系统的inode并迁移 ===
     new_root_inode
         .mkdir("proc", ModeType::from_bits_truncate(0o755))

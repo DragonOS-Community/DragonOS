@@ -6,7 +6,7 @@ use alloc::string::ToString;
 use alloc::{string::String, sync::Arc};
 use system_error::SystemError;
 
-use crate::{libs::spinlock::SpinLock, process::ProcessControlBlock};
+use crate::process::ProcessControlBlock;
 
 use super::{fcntl::AtFlags, FileType, IndexNode, ROOT_INODE};
 

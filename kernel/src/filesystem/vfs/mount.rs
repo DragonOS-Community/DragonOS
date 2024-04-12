@@ -478,11 +478,19 @@ impl IndexNode for MountFSInode {
         self.inner_inode.poll(private_data)
     }
 
+    /// 若不支持，则调用第二种情况来从父目录获取文件名
+    /// # Performance
+    /// 应尽可能引入DName，
+    /// 在默认情况下，性能非常差！！！
     fn dname(&self) -> Result<DName, SystemError> {
-        return self.inner_inode.dname().or(self
-            .dparent()?
-            .get_entry_name(self.metadata()?.inode_id)
-            .map(DName::from));
+        match self.inner_inode.dname() {
+            Ok(name) => Ok(name),
+            Err(SystemError::ENOSYS) => self
+                .dparent()?
+                .get_entry_name(self.metadata()?.inode_id)
+                .map(DName::from),
+            Err(err) => Err(err),
+        }
     }
 
     fn dparent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {

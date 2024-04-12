@@ -367,7 +367,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
-    /// 在当前Inode下，挂载一个已有挂载信息的文件系统
+    /// 在当前Inode下，挂载一个已有挂载信息的文件系统，保持原有挂载信息
     /// # Behavior
     /// 该函数只能被MountFS实现，其他文件系统不应实现这个函数
     fn mount_from(&self, _des: Arc<dyn IndexNode>) -> Result<(), SystemError> {
@@ -378,7 +378,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// # Behavior
     /// 该函数只能被MountFS实现，其他文件系统不应实现这个函数
     /// # Logic
-    /// lookup path -> 父文件系统的挂载点 -> overlaid 成子文件系统的root 
+    /// lookup path -> 父文件系统的挂载点 -> overlaid 成子文件系统的root
     /// -> 判断是否是子文件系统root -> 调用父文件系统挂载点的_umount方法
     fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
         return Err(SystemError::ENOSYS);
@@ -421,18 +421,19 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
 
     /// 新建名称为`name`的目录项
     /// # Behavior
-    /// 当目录下已有名称为`name`的文件夹，返回该目录项的引用, 
+    /// 当目录下已有名称为`name`的文件夹，返回该目录项的引用,
     /// 否则新建`name`文件夹，并返回该引用
     /// # Error
     /// `EEXIST`: `name`目录存在且类型不为文件夹
     fn mkdir(&self, name: &str, mode: ModeType) -> Result<Arc<dyn IndexNode>, SystemError> {
         match self.find(name) {
-            Ok(inode) => 
+            Ok(inode) => {
                 if inode.metadata()?.file_type == FileType::Dir {
                     Ok(inode)
                 } else {
                     Err(SystemError::EEXIST)
-                },
+                }
+            }
             Err(SystemError::ENOENT) => self.create(name, FileType::Dir, mode),
             Err(err) => Err(err),
         }

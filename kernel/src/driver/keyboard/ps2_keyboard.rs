@@ -32,7 +32,7 @@ use crate::{
         rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 use system_error::SystemError;
 
@@ -83,9 +83,9 @@ impl LockedPS2KeyBoardInode {
                 size: 0,
                 blk_size: 0,
                 blocks: 0,
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type: FileType::CharDevice, // 文件夹，block设备，char设备
                 mode: ModeType::from_bits_truncate(0o666),
                 nlinks: 1,

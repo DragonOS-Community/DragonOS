@@ -26,7 +26,7 @@ use crate::{
     sched::{schedule, SchedMode},
     time::{
         timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
-        TimeSpec,
+        PosixTimeSpec,
     },
 };
 
@@ -394,7 +394,7 @@ impl EventPoll {
         epfd: i32,
         epoll_event: &mut [EPollEvent],
         max_events: i32,
-        timespec: Option<TimeSpec>,
+        timespec: Option<PosixTimeSpec>,
     ) -> Result<usize, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
         let fd_table = current_pcb.fd_table();

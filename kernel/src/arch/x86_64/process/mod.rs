@@ -460,9 +460,6 @@ unsafe extern "sysv64" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut Arc
         // mov fs, [rsi + {off_fs}]
         // mov gs, [rsi + {off_gs}]
 
-        push rbp
-        push rax
-
         mov [rdi + {off_rbp}], rbp
         mov rbp, [rsi + {off_rbp}]
 
@@ -509,17 +506,9 @@ unsafe extern "sysv64" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut Arc
     );
 }
 
-/// 从`switch_to_inner`返回后，执行这个函数
-///
-/// 也就是说，当进程再次被调度时，会从这里开始执行
-#[inline(never)]
-unsafe extern "sysv64" fn switch_back() {
-    asm!(concat!(
-        "
-        pop rax
-        pop rbp
-        "
-    ))
+#[naked]
+unsafe extern "sysv64" fn switch_back() -> ! {
+    asm!("ret", options(noreturn));
 }
 
 pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<String>) -> ! {

@@ -109,6 +109,44 @@ install_archlinux_pkg()
 
 }
 
+install_centos_pkg()
+{
+	echo "检测到 Centos/Fedora/RHEL 8"
+	echo "正在更新包管理器的列表..."
+	sudo dnf update -y
+	echo "正在安装所需的包"
+
+	echo "正在安装Development Tools..."
+	sudo dnf groupinstall -y "Development Tools"
+
+	echo "正在安装LLVM和Clang..."
+	sudo dnf install -y llvm-devel clang-devel
+
+	echo "正在安装Clang和GCC..."
+	sudo dnf install -y clang gcc-c++
+
+	echo "正在安装QEMU和KVM..."
+	sudo dnf install -y qemu qemu-kvm qemu-system-x86
+
+	echo "正在安装fdisk和redhat-lsb-core..."
+	sudo dnf install -y util-linux redhat-lsb-core
+
+	echo "正在安装Git..."
+	sudo dnf install -y git
+
+	echo "正在安装dosfstools..."
+	sudo dnf install -y dosfstools
+
+	echo "正在安装unzip..."
+	sudo dnf install -y unzip
+
+	echo "安装bridge utils"
+	sudo dnf install -y bridge-utils || sudo rpm -ivh http://mirror.centos.org/centos/7/os/x86_64/Packages/bridge-utils-1.5-9.el7.x86_64.rpm #Centos8 需要直接安装Binary
+
+	echo "安装dnsmasq"
+	sudo dnf install -y dnsmasq
+}
+
 install_osx_pkg()
 {
     echo "Detected OSX! 暂不支持Mac OSX的一键安装！"
@@ -274,7 +312,7 @@ else
 		install_ubuntu_debian_pkg "$defpackman"  || exit 1
 	# Fedora
 	elif hash 2>/dev/null dnf; then
-		fedora "$emulator" || exit 1
+		install_centos_pkg || exit 1
 	# Gentoo
 	elif hash 2>/dev/null emerge; then
 		gentoo "$emulator" || exit 1

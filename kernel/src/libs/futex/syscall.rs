@@ -3,7 +3,7 @@ use system_error::SystemError;
 use crate::{
     mm::{verify_area, VirtAddr},
     syscall::Syscall,
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
 use super::{
@@ -16,7 +16,7 @@ impl Syscall {
         uaddr: VirtAddr,
         operation: FutexFlag,
         val: u32,
-        timeout: Option<TimeSpec>,
+        timeout: Option<PosixTimeSpec>,
         uaddr2: VirtAddr,
         val2: u32,
         val3: u32,

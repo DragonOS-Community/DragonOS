@@ -5,7 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     libs::rwlock::RwLock,
-    time::{Instant, TimeSpec, NSEC_PER_SEC},
+    time::{Instant, PosixTimeSpec, NSEC_PER_SEC},
 };
 
 use self::sysfs::RtcGeneralDevice;
@@ -137,7 +137,7 @@ impl RtcTime {
     }
 }
 
-impl From<RtcTime> for TimeSpec {
+impl From<RtcTime> for PosixTimeSpec {
     fn from(val: RtcTime) -> Self {
         let instant = Instant::mktime64(
             val.year_real() as u32,
@@ -155,7 +155,7 @@ impl From<RtcTime> for TimeSpec {
          * 存储最接近的值会减慢同步 API 的速度。因此，这里我们存储截断的值
          * 并在后面加上 0.5s 的最佳猜测。
          */
-        TimeSpec::new(instant.secs(), (NSEC_PER_SEC >> 1).into())
+        PosixTimeSpec::new(instant.secs(), (NSEC_PER_SEC >> 1).into())
     }
 }
 

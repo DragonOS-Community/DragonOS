@@ -12,7 +12,7 @@ use crate::{
     net::event_poll::{EPollEventType, EPollItem, EventPoll},
     process::ProcessState,
     sched::{schedule, SchedMode},
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
 use alloc::{
@@ -121,9 +121,9 @@ impl LockedPipeInode {
                 size: PIPE_BUFF_SIZE as i64,
                 blk_size: 0,
                 blocks: 0,
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type: FileType::Pipe,
                 mode: ModeType::from_bits_truncate(0o666),
                 nlinks: 1,
@@ -158,11 +158,13 @@ impl IndexNode for LockedPipeInode {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data_guard: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        let data = data_guard.clone();
+        drop(data_guard);
         // 获取mode
         let mode: FileMode;
-        if let FilePrivateData::Pipefs(pdata) = &*data {
+        if let FilePrivateData::Pipefs(pdata) = &data {
             mode = pdata.mode;
         } else {
             return Err(SystemError::EBADF);

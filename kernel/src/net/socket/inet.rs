@@ -7,6 +7,7 @@ use smoltcp::{
 use system_error::SystemError;
 
 use crate::{
+    arch::rand::rand,
     driver::net::NetDriver,
     kerror, kwarn,
     libs::rwlock::RwLock,
@@ -14,14 +15,12 @@ use crate::{
         event_poll::EPollEventType, net_core::poll_ifaces, Endpoint, Protocol, ShutdownType,
         NET_DRIVERS,
     },
-    arch::rand::rand,
 };
 
 use super::{
     GlobalSocketHandle, Socket, SocketHandleItem, SocketMetadata, SocketOptions, SocketPollMethod,
     SocketType, HANDLE_MAP, PORT_MANAGER, SOCKET_SET,
 };
-
 
 /// @brief 表示原始的socket。原始套接字绕过传输层协议（如 TCP 或 UDP）并提供对网络层协议（如 IP）的直接访问。
 ///
@@ -299,13 +298,9 @@ impl UdpSocket {
             return Err(SystemError::EINVAL);
         }
     }
-
-
 }
 
 impl Socket for UdpSocket {
-
-
     /// @brief 在read函数执行之前，请先bind到本地的指定端口
     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         loop {
@@ -487,12 +482,10 @@ impl TcpSocket {
     ///
     /// @return 返回创建的tcp的socket
     pub fn new(options: SocketOptions) -> Self {
-
-        // 创建handles数组
-        let mut handles:Vec<Arc<GlobalSocketHandle>>=Vec::new();
-        
-        // 把socket添加到socket集合中，并得到socket的句柄
-        handles.push(GlobalSocketHandle::new(SOCKET_SET.lock_irqsave().add(Self::create_new_socket())));
+        // 创建handles数组并把socket添加到socket集合中，并得到socket的句柄
+        let handles: Vec<Arc<GlobalSocketHandle>> = vec![GlobalSocketHandle::new(
+            SOCKET_SET.lock_irqsave().add(Self::create_new_socket()),
+        )];
 
         let metadata = SocketMetadata::new(
             SocketType::Tcp,
@@ -504,7 +497,7 @@ impl TcpSocket {
         // kdebug!("when there's a new tcp socket,its'len: {}",handles.len());
 
         return Self {
-            handle:handles,
+            handle: handles,
             local_endpoint: None,
             is_listening: false,
             metadata,
@@ -563,7 +556,7 @@ impl Socket for TcpSocket {
         loop {
             poll_ifaces();
             let mut socket_set_guard = SOCKET_SET.lock_irqsave();
-            
+
             let socket = socket_set_guard.get_mut::<tcp::Socket>(self.handle.get(0).unwrap().0);
 
             // 如果socket已经关闭，返回错误
@@ -676,7 +669,6 @@ impl Socket for TcpSocket {
 
         let socket = sockets.get_mut::<tcp::Socket>(self.handle.get(0).unwrap().0);
 
-        
         if let Endpoint::Ip(Some(ip)) = endpoint {
             let temp_port = PORT_MANAGER.get_ephemeral_port(self.metadata.socket_type)?;
             // 检测端口是否被占用
@@ -740,15 +732,15 @@ impl Socket for TcpSocket {
         let local_endpoint = self.local_endpoint.ok_or(SystemError::EINVAL)?;
         let mut sockets = SOCKET_SET.lock_irqsave();
         // 获取handle的数量
-        let handlen=self.handle.len();
-        let backlog =handlen.max(_backlog);
+        let handlen = self.handle.len();
+        let backlog = handlen.max(_backlog);
 
         // 添加剩余需要构建的socket
         // kdebug!("tcp socket:before listen, socket'len={}",self.handle.len());
-        let mut handle_guard= HANDLE_MAP.write_irqsave();
-        self.handle.extend((handlen..backlog).map(|_|{
+        let mut handle_guard = HANDLE_MAP.write_irqsave();
+        self.handle.extend((handlen..backlog).map(|_| {
             let socket = Self::create_new_socket();
-            let handle=GlobalSocketHandle::new(sockets.add(socket));
+            let handle = GlobalSocketHandle::new(sockets.add(socket));
             let handle_item = SocketHandleItem::new();
             handle_guard.insert(handle.0, handle_item);
             handle
@@ -757,16 +749,16 @@ impl Socket for TcpSocket {
         // kdebug!("tcp socket:listen, backlog={backlog}");
 
         // 监听所有的socket
-        for i in 0..backlog{
-            let handle=self.handle.get(i).unwrap();
-           
+        for i in 0..backlog {
+            let handle = self.handle.get(i).unwrap();
+
             let socket = sockets.get_mut::<tcp::Socket>(handle.0);
 
             if !socket.is_listening() {
-            // kdebug!("Tcp Socket is already listening on {local_endpoint}");
-            self.do_listen(socket, local_endpoint)?;
+                // kdebug!("Tcp Socket is already listening on {local_endpoint}");
+                self.do_listen(socket, local_endpoint)?;
             }
-        // kdebug!("Tcp Socket  before listen, open={}", socket.is_open());
+            // kdebug!("Tcp Socket  before listen, open={}", socket.is_open());
         }
         return Ok(());
     }
@@ -776,7 +768,7 @@ impl Socket for TcpSocket {
             if ip.port == 0 {
                 ip.port = PORT_MANAGER.get_ephemeral_port(self.metadata.socket_type)?;
             }
-            
+
             // 检测端口是否已被占用
             PORT_MANAGER.bind_port(self.metadata.socket_type, ip.port, self.clone())?;
             // kdebug!("tcp socket:bind, socket'len={}",self.handle.len());
@@ -806,12 +798,11 @@ impl Socket for TcpSocket {
             // kdebug!("tcp socket:accept, socket'len={}",self.handle.len());
 
             let mut sockets = SOCKET_SET.lock_irqsave();
-           
+
             // 随机获取访问的socket的handle
-            let index: usize = rand()% self.handle.len();
-            let handle=self.handle.get(index).unwrap();
-            let socket = sockets
-            .get_mut::<tcp::Socket>(handle.0);
+            let index: usize = rand() % self.handle.len();
+            let handle = self.handle.get(index).unwrap();
+            let socket = sockets.get_mut::<tcp::Socket>(handle.0);
 
             if socket.is_active() {
                 // kdebug!("tcp accept: socket.is_active()");
@@ -828,8 +819,11 @@ impl Socket for TcpSocket {
                     // 之所以把old_handle存入new_socket, 是因为当前时刻，smoltcp已经把old_handle对应的socket与远程的endpoint关联起来了
                     // 因此需要再为当前的socket分配一个新的handle
                     let new_handle = GlobalSocketHandle::new(sockets.add(tcp_socket));
-                    let old_handle = ::core::mem::replace(&mut *self.handle.get_mut(index).unwrap(), new_handle.clone());
-                    
+                    let old_handle = ::core::mem::replace(
+                        &mut *self.handle.get_mut(index).unwrap(),
+                        new_handle.clone(),
+                    );
+
                     let metadata = SocketMetadata::new(
                         SocketType::Tcp,
                         Self::DEFAULT_TX_BUF_SIZE,
@@ -859,19 +853,19 @@ impl Socket for TcpSocket {
                     // 更新handle表
                     let mut handle_guard = HANDLE_MAP.write_irqsave();
                     // 先删除原来的
-                    
+
                     let item = handle_guard.remove(&old_handle.0).unwrap();
-                    
+
                     // 按照smoltcp行为，将新的handle绑定到原来的item
                     handle_guard.insert(new_handle.0, item);
                     let new_item = SocketHandleItem::new();
-                    
+
                     // 插入新的item
                     handle_guard.insert(old_handle.0, new_item);
 
                     new_socket
                 };
-                 // kdebug!("tcp accept: new socket: {:?}", new_socket);
+                // kdebug!("tcp accept: new socket: {:?}", new_socket);
                 drop(sockets);
                 poll_ifaces();
 
@@ -880,11 +874,7 @@ impl Socket for TcpSocket {
             // kdebug!("tcp socket:before sleep, handle_guard'len={}",HANDLE_MAP.write_irqsave().len());
 
             drop(sockets);
-            SocketHandleItem::sleep(
-                handle.0,
-                Self::CAN_ACCPET,
-                HANDLE_MAP.read_irqsave(),
-            );
+            SocketHandleItem::sleep(handle.0, Self::CAN_ACCPET, HANDLE_MAP.read_irqsave());
             // kdebug!("tcp socket:after sleep, handle_guard'len={}",HANDLE_MAP.write_irqsave().len());
         }
     }
@@ -895,7 +885,7 @@ impl Socket for TcpSocket {
         if result.is_none() {
             let sockets = SOCKET_SET.lock_irqsave();
             // kdebug!("tcp socket:endpoint, socket'len={}",self.handle.len());
-            
+
             let socket = sockets.get::<tcp::Socket>(self.handle.get(0).unwrap().0);
             if let Some(ep) = socket.local_endpoint() {
                 result = Some(Endpoint::Ip(Some(ep)));

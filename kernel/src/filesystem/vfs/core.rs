@@ -76,8 +76,6 @@ pub fn vfs_init() -> Result<(), SystemError> {
 
     sysfs_init().expect("Failed to initialize sysfs");
 
-   
-
     let root_entries = ROOT_INODE().list().expect("VFS init failed");
     if !root_entries.is_empty() {
         kinfo!("Successfully initialized VFS!");
@@ -125,7 +123,6 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     let dev: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
     let binding = ROOT_INODE().find("sys").expect("SysFs not mounted!").fs();
     let sys: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
-   
 
     let new_fs = MountFS::new(new_fs, None);
     // 获取新的根文件系统的根节点的引用

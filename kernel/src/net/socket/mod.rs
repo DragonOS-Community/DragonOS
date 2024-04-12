@@ -324,14 +324,12 @@ impl IndexNode for SocketInode {
             }
 
             socket.clear_epoll()?;
-            
 
             HANDLE_MAP
                 .write_irqsave()
                 .remove(&socket.socket_handle())
                 .unwrap();
         }
-        
 
         Ok(())
     }
@@ -422,7 +420,7 @@ impl SocketHandleItem {
                 .wait_queue
                 .sleep_without_schedule(events)
         };
-        drop(handle_map_guard);      
+        drop(handle_map_guard);
         schedule(SchedMode::SM_NONE);
     }
 

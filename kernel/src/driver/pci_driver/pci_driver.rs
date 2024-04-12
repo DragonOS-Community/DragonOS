@@ -1,32 +1,38 @@
 use alloc::{sync::Arc, vec::Vec};
 use system_error::SystemError;
 
-use crate::{driver::base::device::{bus::Bus, driver::{driver_manager, Driver}}, libs::rwlock::RwLockReadGuard};
+use crate::{
+    driver::base::device::{
+        bus::Bus,
+        driver::{driver_manager, Driver},
+    },
+    libs::rwlock::RwLockReadGuard,
+};
 
 use super::{dev_id::PciDeviceID, pci_bus, pci_device::PciDevice};
 
 pub trait PciDriver: Driver {
     //https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/net/wireless/realtek/rtw88/pci.c?fi=rtw_pci_probe#1731是一个实例
-    fn probe(&self, device: &Arc<dyn PciDevice>,id:&PciDeviceID) -> Result<(), SystemError>;
+    fn probe(&self, device: &Arc<dyn PciDevice>, id: &PciDeviceID) -> Result<(), SystemError>;
     fn remove(&self, device: &Arc<dyn PciDevice>) -> Result<(), SystemError>;
     fn shutdown(&self, device: &Arc<dyn PciDevice>) -> Result<(), SystemError>;
     fn suspend(&self, device: &Arc<dyn PciDevice>) -> Result<(), SystemError>;
     fn resume(&self, device: &Arc<dyn PciDevice>) -> Result<(), SystemError>;
-    fn add_dynid(&mut self,id:PciDeviceID)->Result<(),SystemError>;
-    fn locked_dynid_list(&self)->Option<Vec<Arc<PciDeviceID>>>;
-    fn match_dev(&self,dev:&Arc<dyn PciDevice>)->Option<Arc<PciDeviceID>>{
-        for i in self.locked_dynid_list()?.iter(){
-            if i.match_dev(&dev){
-                return Some(i.clone())
+    fn add_dynid(&mut self, id: PciDeviceID) -> Result<(), SystemError>;
+    fn locked_dynid_list(&self) -> Option<Vec<Arc<PciDeviceID>>>;
+    fn match_dev(&self, dev: &Arc<dyn PciDevice>) -> Option<Arc<PciDeviceID>> {
+        for i in self.locked_dynid_list()?.iter() {
+            if i.match_dev(&dev) {
+                return Some(i.clone());
             }
-        };
+        }
         return None;
     }
 }
 
 pub struct PciDriverManager;
 
-pub fn pci_driver_manager()->&'static PciDriverManager{
+pub fn pci_driver_manager() -> &'static PciDriverManager {
     &PciDriverManager
 }
 

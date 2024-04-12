@@ -47,12 +47,18 @@ impl Bus for PciBus {
         device: &Arc<dyn crate::driver::base::device::Device>,
     ) -> Result<(), SystemError> {
         let drv = device.driver().ok_or(SystemError::EINVAL)?;
-        let pci_drv=drv.cast::<dyn PciDriver>().map_err(|_|{
-            kerror!("PciBus::probe() failed: device.driver() is not a PciDriver. Device: '{:?}'", device.name());
+        let pci_drv = drv.cast::<dyn PciDriver>().map_err(|_| {
+            kerror!(
+                "PciBus::probe() failed: device.driver() is not a PciDriver. Device: '{:?}'",
+                device.name()
+            );
             SystemError::EINVAL
         })?;
-        let pci_dev=device.clone().cast::<dyn PciDevice>().map_err(|_|{
-            kerror!("PciBus::probe() failed: device is not a PciDevice. Device: '{:?}'", device.name());
+        let pci_dev = device.clone().cast::<dyn PciDevice>().map_err(|_| {
+            kerror!(
+                "PciBus::probe() failed: device is not a PciDevice. Device: '{:?}'",
+                device.name()
+            );
             SystemError::EINVAL
         })?;
         //见https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/pci/pci-driver.c#324
@@ -87,25 +93,24 @@ impl Bus for PciBus {
         device: &Arc<dyn crate::driver::base::device::Device>,
         driver: &Arc<dyn crate::driver::base::device::driver::Driver>,
     ) -> Result<bool, SystemError> {
-        let pci_driver=driver.clone().cast::<dyn PciDriver>().map_err(|_|{
+        let pci_driver = driver.clone().cast::<dyn PciDriver>().map_err(|_| {
             return SystemError::EINVAL;
         })?;
-        let pci_dev=device.clone().cast::<dyn PciDevice>().map_err(|_|{
+        let pci_dev = device.clone().cast::<dyn PciDevice>().map_err(|_| {
             return SystemError::EINVAL;
         })?;
-        if let Some(id)=pci_driver.match_dev(&pci_dev){
-            return Ok(true)
+        if let Some(id) = pci_driver.match_dev(&pci_dev) {
+            return Ok(true);
         }
-        
-//todo:这里似乎需要一个driver_override_only的支持，但是目前不清楚driver_override_only 的用途，故暂时参考platform总线的match方法
-//override_only相关代码在 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/pci/pci-driver.c#159
-        if let Some(driver_id_table) = driver.id_table(){
-            if driver_id_table.name().eq(&pci_dev.name()){
+
+        //todo:这里似乎需要一个driver_override_only的支持，但是目前不清楚driver_override_only 的用途，故暂时参考platform总线的match方法
+        //override_only相关代码在 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/pci/pci-driver.c#159
+        if let Some(driver_id_table) = driver.id_table() {
+            if driver_id_table.name().eq(&pci_dev.name()) {
                 return Ok(true);
             }
         };
         return Ok(pci_dev.name().eq(&pci_driver.name()));
-
     }
 }
 

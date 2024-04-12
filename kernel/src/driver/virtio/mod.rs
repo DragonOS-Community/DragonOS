@@ -14,6 +14,7 @@ pub mod transport_pci;
 #[allow(clippy::module_inception)]
 pub mod virtio;
 pub mod virtio_impl;
+pub mod driver;
 
 /// virtio 设备厂商ID
 pub const VIRTIO_VENDOR_ID: u16 = 0x1af4;

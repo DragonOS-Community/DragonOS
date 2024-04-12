@@ -1748,8 +1748,13 @@ impl IndexNode for LockedFATInode {
                 let mut key: Vec<String> = guard
                     .children
                     .iter()
-                    .filter(|(_, v)| v.0.lock().metadata.inode_id.into() == ino)
-                    .map(|(k, _)| k.to_string())
+                    .filter_map(|(k, v)| {
+                        if v.0.lock().metadata.inode_id.into() == ino {
+                            Some(k.to_string())
+                        } else {
+                            None
+                        }
+                    })
                     .collect();
 
                 match key.len() {
@@ -1815,7 +1820,7 @@ impl IndexNode for LockedFATInode {
     //     self.0.lock().
     // }
 
-    fn dparent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.0
             .lock()
             .parent

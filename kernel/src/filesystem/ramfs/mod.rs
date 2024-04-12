@@ -509,20 +509,14 @@ impl IndexNode for LockedRamFSInode {
                 // TODO: 优化这里，这个地方性能很差！
                 let mut key: Vec<String> = inode
                     .children
-                    .keys()
-                    .filter(|k| {
-                        inode
-                            .children
-                            .get(*k)
-                            .unwrap()
-                            .0
-                            .lock()
-                            .metadata
-                            .inode_id
-                            .into()
-                            == ino
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        if v.0.lock().metadata.inode_id.into() == ino {
+                            Some(k.to_string())
+                        } else {
+                            None
+                        }
                     })
-                    .map(|item| item.to_string())
                     .collect();
 
                 match key.len() {
@@ -629,7 +623,7 @@ impl IndexNode for LockedRamFSInode {
         Ok(self.0.lock().name.clone())
     }
 
-    fn dparent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.0
             .lock()
             .parent

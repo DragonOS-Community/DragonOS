@@ -452,7 +452,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// 返回父目录的引用
     /// # Behavior
     /// 当自己是当前文件系统的根目录，则返回自身的引用
-    fn dparent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 }

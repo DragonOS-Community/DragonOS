@@ -32,6 +32,7 @@ use crate::{
 use super::vfs::{
     file::{FileMode, FilePrivateData},
     syscall::ModeType,
+    utils::DName,
     FileSystem, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
 };
 
@@ -116,7 +117,7 @@ pub struct ProcFSInode {
     /// 指向自身的弱引用
     self_ref: Weak<LockedProcFSInode>,
     /// 子Inode的B树
-    children: BTreeMap<String, Arc<LockedProcFSInode>>,
+    children: BTreeMap<DName, Arc<LockedProcFSInode>>,
     /// 当前inode的数据部分
     data: Vec<u8>,
     /// 当前inode的元数据
@@ -583,8 +584,9 @@ impl IndexNode for LockedProcFSInode {
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
+        let name = DName::from(name);
         // 如果有重名的，则返回
-        if inode.children.contains_key(name) {
+        if inode.children.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
 
@@ -622,7 +624,7 @@ impl IndexNode for LockedProcFSInode {
         result.0.lock().self_ref = Arc::downgrade(&result);
 
         // 将子inode插入父inode的B树中
-        inode.children.insert(String::from(name), result.clone());
+        inode.children.insert(name, result.clone());
 
         return Ok(result);
     }
@@ -643,15 +645,15 @@ impl IndexNode for LockedProcFSInode {
         if other_locked.metadata.file_type == FileType::Dir {
             return Err(SystemError::EISDIR);
         }
-
+        let name = DName::from(name);
         // 如果当前文件夹下已经有同名文件，也报错。
-        if inode.children.contains_key(name) {
+        if inode.children.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
 
         inode
             .children
-            .insert(String::from(name), other_locked.self_ref.upgrade().unwrap());
+            .insert(name, other_locked.self_ref.upgrade().unwrap());
 
         // 增加硬链接计数
         other_locked.metadata.nlinks += 1;
@@ -669,15 +671,15 @@ impl IndexNode for LockedProcFSInode {
         if name == "." || name == ".." {
             return Err(SystemError::ENOTEMPTY);
         }
-
+        let name = DName::from(name);
         // 获得要删除的文件的inode
-        let to_delete = inode.children.get(name).ok_or(SystemError::ENOENT)?;
+        let to_delete = inode.children.get(&name).ok_or(SystemError::ENOENT)?;
 
         // 减少硬链接计数
         to_delete.0.lock().metadata.nlinks -= 1;
 
         // 在当前目录中删除这个子目录项
-        inode.children.remove(name);
+        inode.children.remove(&name);
 
         return Ok(());
     }
@@ -708,7 +710,11 @@ impl IndexNode for LockedProcFSInode {
             }
             name => {
                 // 在子目录项中查找
-                return Ok(inode.children.get(name).ok_or(SystemError::ENOENT)?.clone());
+                return Ok(inode
+                    .children
+                    .get(&DName::from(name))
+                    .ok_or(SystemError::ENOENT)?
+                    .clone());
             }
         }
     }
@@ -731,20 +737,14 @@ impl IndexNode for LockedProcFSInode {
                 // TODO: 优化这里，这个地方性能很差！
                 let mut key: Vec<String> = inode
                     .children
-                    .keys()
-                    .filter(|k| {
-                        inode
-                            .children
-                            .get(*k)
-                            .unwrap()
-                            .0
-                            .lock()
-                            .metadata
-                            .inode_id
-                            .into()
-                            == ino
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        if v.0.lock().metadata.inode_id.into() == ino {
+                            Some(k.to_string())
+                        } else {
+                            None
+                        }
                     })
-                    .cloned()
                     .collect();
 
                 match key.len() {
@@ -765,7 +765,15 @@ impl IndexNode for LockedProcFSInode {
         let mut keys: Vec<String> = Vec::new();
         keys.push(String::from("."));
         keys.push(String::from(".."));
-        keys.append(&mut self.0.lock().children.keys().cloned().collect());
+        keys.append(
+            &mut self
+                .0
+                .lock()
+                .children
+                .keys()
+                .map(ToString::to_string)
+                .collect(),
+        );
 
         return Ok(keys);
     }

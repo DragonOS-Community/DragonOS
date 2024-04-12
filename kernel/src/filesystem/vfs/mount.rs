@@ -370,7 +370,7 @@ impl IndexNode for MountFSInode {
                 .map(|inode| inode as Arc<dyn IndexNode>)
                 .ok_or(SystemError::ENOENT),
             // 往父级查找
-            ".." => self.dparent(),
+            ".." => self.parent(),
             // 在当前目录下查找
             // 直接调用当前inode所在的文件系统的find方法进行查找
             // 由于向下查找可能会跨越文件系统的边界，因此需要尝试替换inode
@@ -445,7 +445,7 @@ impl IndexNode for MountFSInode {
     }
 
     fn absolute_path(&self, len: usize) -> Result<String, SystemError> {
-        let parent = self.dparent()?;
+        let parent = self.parent()?;
         if self.metadata()?.inode_id == parent.metadata()?.inode_id {
             return Ok(String::with_capacity(len));
         }
@@ -486,14 +486,14 @@ impl IndexNode for MountFSInode {
         match self.inner_inode.dname() {
             Ok(name) => Ok(name),
             Err(SystemError::ENOSYS) => self
-                .dparent()?
+                .parent()?
                 .get_entry_name(self.metadata()?.inode_id)
                 .map(DName::from),
             Err(err) => Err(err),
         }
     }
 
-    fn dparent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         return self._parent().map(|inode| inode as Arc<dyn IndexNode>);
     }
 }

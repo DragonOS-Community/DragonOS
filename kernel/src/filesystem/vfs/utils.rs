@@ -140,3 +140,9 @@ impl ToString for DName {
         (*self.0).clone()
     }
 }
+
+impl AsRef<str> for DName {
+    fn as_ref(&self) -> &str {
+        self.0.as_str()
+    }
+}

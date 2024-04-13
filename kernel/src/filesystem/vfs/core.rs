@@ -54,7 +54,7 @@ pub fn vfs_init() -> Result<(), SystemError> {
     let ramfs = RamFS::new();
     let mount_fs = MountFS::new(ramfs, None);
     let root_inode = mount_fs.root_inode();
-
+    MountList::init();
     unsafe {
         __ROOT_INODE = Some(root_inode.clone());
     }

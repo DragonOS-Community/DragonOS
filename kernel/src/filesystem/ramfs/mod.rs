@@ -420,7 +420,14 @@ impl IndexNode for LockedRamFSInode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
     ) -> Result<(), SystemError> {
-        let inode_to_move: Arc<dyn IndexNode> = self.find(old_name)?;
+        let inode_to_move = self
+            .find(old_name)?
+            .downcast_arc::<LockedRamFSInode>()
+            .ok_or(SystemError::EINVAL)?;
+
+        let new_name = DName::from(new_name);
+
+        inode_to_move.0.lock().name = new_name.clone();
 
         let target_id = target.metadata()?.inode_id;
 
@@ -428,23 +435,13 @@ impl IndexNode for LockedRamFSInode {
         // 判断是否在同一目录下, 是则进行重命名
         if target_id == self_inode.metadata.inode_id {
             self_inode.children.remove(&DName::from(old_name));
-            self_inode.children.insert(
-                DName::from(new_name),
-                inode_to_move
-                    .downcast_arc::<LockedRamFSInode>()
-                    .ok_or(SystemError::EINVAL)?,
-            );
+            self_inode.children.insert(new_name, inode_to_move);
             return Ok(());
         }
         drop(self_inode);
 
         // 修改其对父节点的引用
-        inode_to_move
-            .downcast_ref::<LockedRamFSInode>()
-            .ok_or(SystemError::EINVAL)?
-            .0
-            .lock()
-            .parent = Arc::downgrade(
+        inode_to_move.0.lock().parent = Arc::downgrade(
             &target
                 .clone()
                 .downcast_arc::<LockedRamFSInode>()
@@ -452,12 +449,12 @@ impl IndexNode for LockedRamFSInode {
         );
 
         // 在新的目录下创建一个硬链接
-        target.link(new_name, &inode_to_move)?;
+        target.link(new_name.as_ref(), &(inode_to_move as Arc<dyn IndexNode>))?;
 
         // 取消现有的目录下的这个硬链接
         if let Err(e) = self.unlink(old_name) {
             // 当操作失败时回退操作
-            target.unlink(new_name)?;
+            target.unlink(new_name.as_ref())?;
             return Err(e);
         }
 

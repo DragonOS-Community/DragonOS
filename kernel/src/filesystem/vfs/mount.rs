@@ -178,7 +178,7 @@ impl MountFSInode {
         self.metadata().map(|x| x.inode_id).unwrap()
     }
 
-    pub(super) fn _find(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
+    fn do_find(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
         // 直接调用当前inode所在的文件系统的find方法进行查找
         // 由于向下查找可能会跨越文件系统的边界，因此需要尝试替换inode
         let inner_inode = self.inner_inode.find(name)?;
@@ -195,7 +195,7 @@ impl MountFSInode {
             // 当前inode是它所在的文件系统的root inode
             match &self.mount_fs.self_mountpoint {
                 Some(inode) => {
-                    return inode._find("..");
+                    return inode.do_find("..");
                 }
                 None => {
                     return Ok(self.self_ref.upgrade().unwrap());
@@ -374,7 +374,7 @@ impl IndexNode for MountFSInode {
             // 在当前目录下查找
             // 直接调用当前inode所在的文件系统的find方法进行查找
             // 由于向下查找可能会跨越文件系统的边界，因此需要尝试替换inode
-            _ => self._find(name).map(|inode| inode as Arc<dyn IndexNode>),
+            _ => self.do_find(name).map(|inode| inode as Arc<dyn IndexNode>),
         }
     }
 
@@ -607,9 +607,6 @@ impl MountList {
 
     fn instance() -> &'static Arc<RwLock<BTreeMap<MountPath, Arc<MountFS>>>> {
         unsafe {
-            if __MOUNTS_LIST.0.is_none() {
-                MountList::init();
-            }
             return __MOUNTS_LIST.0.as_ref().unwrap();
         }
     }

@@ -4,7 +4,7 @@
 use super::pci_irq::{IrqType, PciIrqError};
 use super::root::{pci_root_0, PciRoot};
 use crate::arch::{PciArch, TraitPciArch};
-use crate::driver::pci::device::pci_device_search;
+use crate::driver::pci::raw_device::pci_device_search;
 use crate::exception::IrqNumber;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 

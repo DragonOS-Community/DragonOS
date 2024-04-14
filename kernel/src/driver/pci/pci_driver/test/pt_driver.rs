@@ -3,7 +3,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use uefi::proto::device_path::build::hardware::Pci;
 
 use crate::{
     driver::{
@@ -12,11 +11,11 @@ use crate::{
             kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        pci_driver::{dev_id::PciDeviceID, pci_driver::PciDriver},
+        pci::pci_driver::{dev_id::PciDeviceID, device::PciDevice, driver::PciDriver},
     },
     filesystem::kernfs::KernFSInode,
     libs::{
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::SpinLock,
     },
 };
@@ -47,10 +46,7 @@ impl TestDriver {
 }
 
 impl PciDriver for TestDriver {
-    fn add_dynid(
-        &mut self,
-        id: crate::driver::pci_driver::dev_id::PciDeviceID,
-    ) -> Result<(), system_error::SystemError> {
+    fn add_dynid(&mut self, id: PciDeviceID) -> Result<(), system_error::SystemError> {
         self.inner.lock().insert_id(id);
         Ok(())
     }
@@ -61,37 +57,25 @@ impl PciDriver for TestDriver {
 
     fn probe(
         &self,
-        device: &Arc<dyn crate::driver::pci_driver::pci_device::PciDevice>,
-        id: &crate::driver::pci_driver::dev_id::PciDeviceID,
+        _device: &Arc<dyn PciDevice>,
+        _id: &PciDeviceID,
     ) -> Result<(), system_error::SystemError> {
         Ok(())
     }
 
-    fn remove(
-        &self,
-        device: &Arc<dyn crate::driver::pci_driver::pci_device::PciDevice>,
-    ) -> Result<(), system_error::SystemError> {
+    fn remove(&self, _device: &Arc<dyn PciDevice>) -> Result<(), system_error::SystemError> {
         Ok(())
     }
 
-    fn resume(
-        &self,
-        device: &Arc<dyn crate::driver::pci_driver::pci_device::PciDevice>,
-    ) -> Result<(), system_error::SystemError> {
+    fn resume(&self, _device: &Arc<dyn PciDevice>) -> Result<(), system_error::SystemError> {
         Ok(())
     }
 
-    fn shutdown(
-        &self,
-        device: &Arc<dyn crate::driver::pci_driver::pci_device::PciDevice>,
-    ) -> Result<(), system_error::SystemError> {
+    fn shutdown(&self, _device: &Arc<dyn PciDevice>) -> Result<(), system_error::SystemError> {
         Ok(())
     }
 
-    fn suspend(
-        &self,
-        device: &Arc<dyn crate::driver::pci_driver::pci_device::PciDevice>,
-    ) -> Result<(), system_error::SystemError> {
+    fn suspend(&self, _device: &Arc<dyn PciDevice>) -> Result<(), system_error::SystemError> {
         Ok(())
     }
 }

@@ -5,6 +5,7 @@ use crate::exception::{irqdesc::IrqReturn, IrqNumber};
 
 use super::base::device::{driver::Driver, Device, DeviceId};
 
+pub mod driver;
 pub(super) mod irq;
 pub mod mmio;
 pub mod sysfs;
@@ -14,7 +15,6 @@ pub mod transport_pci;
 #[allow(clippy::module_inception)]
 pub mod virtio;
 pub mod virtio_impl;
-pub mod driver;
 
 /// virtio 设备厂商ID
 pub const VIRTIO_VENDOR_ID: u16 = 0x1af4;

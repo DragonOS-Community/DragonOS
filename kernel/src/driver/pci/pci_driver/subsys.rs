@@ -10,7 +10,7 @@ use crate::{
     filesystem::sysfs::AttributeGroup,
 };
 
-use super::{pci_device::PciDevice, pci_driver::PciDriver};
+use super::{device::PciDevice, driver::PciDriver};
 #[derive(Debug)]
 pub struct PciBus {
     private: SubSysPrivate,
@@ -62,11 +62,8 @@ impl Bus for PciBus {
             SystemError::EINVAL
         })?;
         //见https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/pci/pci-driver.c#324
-        kdebug!("114514:before match");
         let id = pci_drv.match_dev(&pci_dev).ok_or(SystemError::EINVAL)?;
-        kdebug!("114514:after match");
         pci_drv.probe(&pci_dev, &id)
-        
     }
 
     fn remove(
@@ -86,7 +83,7 @@ impl Bus for PciBus {
 
     fn resume(
         &self,
-        device: &Arc<dyn crate::driver::base::device::Device>,
+        _device: &Arc<dyn crate::driver::base::device::Device>,
     ) -> Result<(), system_error::SystemError> {
         todo!()
     }
@@ -102,7 +99,7 @@ impl Bus for PciBus {
         let pci_dev = device.clone().cast::<dyn PciDevice>().map_err(|_| {
             return SystemError::EINVAL;
         })?;
-        if let Some(id) = pci_driver.match_dev(&pci_dev) {
+        if pci_driver.match_dev(&pci_dev).is_some() {
             return Ok(true);
         }
 
@@ -131,7 +128,7 @@ impl AttributeGroup for PciDeviceAttrGroup {
 
     fn is_visible(
         &self,
-        kobj: Arc<dyn crate::driver::base::kobject::KObject>,
+        _kobj: Arc<dyn crate::driver::base::kobject::KObject>,
         attr: &'static dyn crate::filesystem::sysfs::Attribute,
     ) -> Option<crate::filesystem::vfs::syscall::ModeType> {
         return Some(attr.mode());

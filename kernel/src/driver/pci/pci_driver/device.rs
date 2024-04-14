@@ -5,24 +5,21 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    driver::{
-        base::{
-            device::{
-                bus::{Bus, BusState},
-                device_manager,
-                driver::Driver,
-                Device, DevicePrivateData, DeviceType, IdTable,
-            },
-            kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
-            kset::KSet,
+    driver::base::{
+        device::{
+            bus::{Bus, BusState},
+            device_manager,
+            driver::Driver,
+            Device, DevicePrivateData, DeviceType, IdTable,
         },
-        pci_driver::{pci_bus, pci_driver::PciDriver},
+        kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+        kset::KSet,
     },
     filesystem::kernfs::KernFSInode,
     libs::{rwlock::RwLockWriteGuard, spinlock::SpinLock},
 };
 
-use super::{dev_id::PciDeviceID, pci_bus_device, subsys::PciBus};
+use super::{dev_id::PciDeviceID, pci_bus, pci_bus_device};
 
 pub struct PciDeviceManager;
 
@@ -37,7 +34,7 @@ impl PciDeviceManager {
                 &(pci_bus_device() as Arc<dyn KObject>),
             )));
         }
-        
+
         pci_dev.set_bus(Some(Arc::downgrade(&(pci_bus() as Arc<dyn Bus>))));
         device_manager().device_default_initialize(&(pci_dev.clone() as Arc<dyn Device>));
         //我还要实现一个bus的添加
@@ -63,7 +60,7 @@ pub struct PciBusDevice {
     inner: SpinLock<InnerPciBusDevice>,
     kobj_state: LockedKObjectState,
 }
-
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct InnerPciBusDevice {
     name: String,
@@ -198,11 +195,11 @@ impl Device for PciBusDevice {
         todo!()
     }
 
-    fn set_can_match(&self, can_match: bool) {
+    fn set_can_match(&self, _can_match: bool) {
         todo!()
     }
 
-    fn set_class(&self, class: Option<alloc::sync::Weak<dyn crate::driver::base::class::Class>>) {
+    fn set_class(&self, _class: Option<alloc::sync::Weak<dyn crate::driver::base::class::Class>>) {
         todo!()
     }
 

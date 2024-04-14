@@ -1,30 +1,29 @@
+use core::any::Any;
+
 use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
 };
+use system_error::SystemError;
 
 use crate::{
     driver::{
         base::{
             class::Class,
-            device::{
-                bus::Bus, driver::Driver, Device, DeviceKObjType, DeviceState, DeviceType, IdTable,
-            },
+            device::{bus::Bus, driver::Driver, Device, DeviceType, IdTable},
             kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        pci_driver::{dev_id::PciDeviceID, pci_device::PciDevice, subsys::PciBus},
+        pci::pci_driver::{dev_id::PciDeviceID, device::PciDevice},
     },
     filesystem::{
         kernfs::KernFSInode,
         sysfs::{
             file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
         },
+        vfs::syscall::ModeType,
     },
-    libs::{
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
-        spinlock::SpinLock,
-    },
+    libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 #[derive(Debug)]
 #[cast_to([sync] Device)]
@@ -50,20 +49,17 @@ impl TestDevice {
 }
 
 impl PciDevice for TestDevice {
-    fn dynid(&self) -> crate::driver::pci_driver::dev_id::PciDeviceID {
-        kdebug!("114514");
+    fn dynid(&self) -> PciDeviceID {
         PciDeviceID::dummpy()
     }
 }
 
 impl Device for TestDevice {
-    fn attribute_groups(
-        &self,
-    ) -> Option<&'static [&'static dyn crate::filesystem::sysfs::AttributeGroup]> {
+    fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
         Some(&[&HelloAttr])
     }
 
-    fn bus(&self) -> Option<alloc::sync::Weak<dyn crate::driver::base::device::bus::Bus>> {
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
         self.inner.read().bus()
     }
 
@@ -81,11 +77,11 @@ impl Device for TestDevice {
         self.inner.read().driver.clone()?.upgrade()
     }
 
-    fn dev_type(&self) -> crate::driver::base::device::DeviceType {
+    fn dev_type(&self) -> DeviceType {
         DeviceType::Pci
     }
 
-    fn id_table(&self) -> crate::driver::base::device::IdTable {
+    fn id_table(&self) -> IdTable {
         IdTable::new("testPci".to_string(), None)
     }
 
@@ -97,17 +93,19 @@ impl Device for TestDevice {
         false
     }
 
-    fn set_bus(&self, bus: Option<alloc::sync::Weak<dyn Bus>>) {
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
         self.inner.write().set_bus(bus);
     }
 
-    fn set_can_match(&self, can_match: bool) {}
+    fn set_can_match(&self, _can_match: bool) {
+        //todo
+    }
 
-    fn set_class(&self, class: Option<alloc::sync::Weak<dyn Class>>) {
+    fn set_class(&self, class: Option<Weak<dyn Class>>) {
         self.inner.write().set_class(class)
     }
 
-    fn set_driver(&self, driver: Option<alloc::sync::Weak<dyn Driver>>) {
+    fn set_driver(&self, driver: Option<Weak<dyn Driver>>) {
         self.inner.write().set_driver(driver)
     }
 
@@ -117,7 +115,7 @@ impl Device for TestDevice {
 }
 
 impl KObject for TestDevice {
-    fn as_any_ref(&self) -> &dyn core::any::Any {
+    fn as_any_ref(&self) -> &dyn Any {
         self
     }
 
@@ -176,16 +174,13 @@ impl KObject for TestDevice {
 #[derive(Debug)]
 pub struct InnerPciDevice {
     bus: Option<Weak<dyn Bus>>,
-    pub name:Option<String>,
+    pub name: Option<String>,
     pub class: Option<Weak<dyn Class>>,
     pub driver: Option<Weak<dyn Driver>>,
     pub kern_inode: Option<Arc<KernFSInode>>,
     pub parent: Option<Weak<dyn KObject>>,
     pub kset: Option<Arc<KSet>>,
     pub kobj_type: Option<&'static dyn KObjType>,
-    device_state: DeviceState,
-    pdev_id: i32,
-    pdev_id_auto: bool,
 }
 
 impl InnerPciDevice {
@@ -193,28 +188,17 @@ impl InnerPciDevice {
         Self {
             bus: None,
             class: None,
-            name:None,
+            name: None,
             driver: None,
             kern_inode: None,
             parent: None,
             kset: None,
             kobj_type: None,
-            device_state: DeviceState::UnDefined,
-            pdev_id: 0,
-            pdev_id_auto: true,
         }
     }
 
     pub fn bus(&self) -> Option<Weak<dyn Bus>> {
         self.bus.clone()
-    }
-
-    pub fn class(&self) -> Option<Weak<dyn Class>> {
-        self.class.clone()
-    }
-
-    pub fn driver(&self) -> Option<Weak<dyn Driver>> {
-        self.driver.clone()
     }
 
     pub fn set_bus(&mut self, bus: Option<Weak<dyn Bus>>) {
@@ -228,8 +212,6 @@ impl InnerPciDevice {
     pub fn set_driver(&mut self, driver: Option<Weak<dyn Driver>>) {
         self.driver = driver
     }
-
-    
 }
 
 #[derive(Debug)]
@@ -240,15 +222,15 @@ impl AttributeGroup for HelloAttr {
         return Some("TestAttr");
     }
 
-    fn attrs(&self) -> &[&'static dyn crate::filesystem::sysfs::Attribute] {
+    fn attrs(&self) -> &[&'static dyn Attribute] {
         &[&Hello]
     }
 
     fn is_visible(
         &self,
-        kobj: Arc<dyn KObject>,
-        attr: &'static dyn crate::filesystem::sysfs::Attribute,
-    ) -> Option<crate::filesystem::vfs::syscall::ModeType> {
+        _kobj: Arc<dyn KObject>,
+        attr: &'static dyn Attribute,
+    ) -> Option<ModeType> {
         return Some(attr.mode());
     }
 }
@@ -256,7 +238,7 @@ impl AttributeGroup for HelloAttr {
 pub struct Hello;
 
 impl Attribute for Hello {
-    fn mode(&self) -> crate::filesystem::vfs::syscall::ModeType {
+    fn mode(&self) -> ModeType {
         SYSFS_ATTR_MODE_RO
     }
 
@@ -264,23 +246,15 @@ impl Attribute for Hello {
         "Hello"
     }
 
-    fn show(
-        &self,
-        _kobj: Arc<dyn KObject>,
-        _buf: &mut [u8],
-    ) -> Result<usize, system_error::SystemError> {
-        return sysfs_emit_str(_buf, &format!("Hello Pci"));
+    fn show(&self, _kobj: Arc<dyn KObject>, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        return sysfs_emit_str(_buf, "Hello Pci");
     }
 
-    fn store(
-        &self,
-        _kobj: Arc<dyn KObject>,
-        _buf: &[u8],
-    ) -> Result<usize, system_error::SystemError> {
+    fn store(&self, _kobj: Arc<dyn KObject>, _buf: &[u8]) -> Result<usize, SystemError> {
         todo!()
     }
 
-    fn support(&self) -> crate::filesystem::sysfs::SysFSOpsSupport {
+    fn support(&self) -> SysFSOpsSupport {
         SysFSOpsSupport::ATTR_SHOW
     }
 }

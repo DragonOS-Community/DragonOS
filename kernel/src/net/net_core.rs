@@ -160,7 +160,6 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
         send_event(&sockets)?;
         return Ok(());
     }
-
     // 尝试次数用完，返回错误
     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
 }

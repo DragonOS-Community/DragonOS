@@ -1,3 +1,5 @@
+use alloc::boxed::Box;
+
 use crate::*;
 use core::{
     mem,
@@ -57,6 +59,9 @@ impl Bitfield for [AtomicU64] {
         layout: Layout,
         page_size: usize,
     ) -> Option<(usize, usize)> {
+        let start_offset = get_offset_for_align(layout);
+        let data_start = base_addr + start_offset;
+
         for (base_idx, b) in self.iter().enumerate() {
             let bitval = b.load(Ordering::Relaxed);
             if bitval == u64::max_value() {
@@ -74,7 +79,7 @@ impl Bitfield for [AtomicU64] {
                     return None;
                 }
 
-                let addr: usize = base_addr + offset;
+                let addr: usize = data_start + offset;
                 let alignment_ok = addr % layout.align() == 0;
                 let block_is_free = bitval & (1 << first_free) == 0;
                 if alignment_ok && block_is_free {
@@ -152,6 +157,22 @@ impl Bitfield for [AtomicU64] {
     }
 }
 
+fn get_offset_for_align(layout: Layout) -> usize {
+    let offset = match layout.size() {
+        0..=8 => 80,
+        9..=16 => 80,
+        17..=32 => 96,
+        33..=64 => 128,
+        65..=128 => 128,
+        129..=256 => 256,
+        257..=512 => 512,
+        513..=1024 => 1024,
+        1025..=2048 => 2048,
+        _ => panic!(),
+    };
+    offset
+}
+
 /// This trait is used to define a page from which objects are allocated
 /// in an `SCAllocator`.
 ///
@@ -211,7 +232,8 @@ pub trait AllocablePage {
             ptr,
             layout
         );
-        let page_offset = (ptr.as_ptr() as usize) & (Self::SIZE - 1);
+        let align_offset = get_offset_for_align(layout);
+        let page_offset = ((ptr.as_ptr() as usize) - align_offset) & (Self::SIZE - 1);
         assert!(page_offset % layout.size() == 0);
         let idx = page_offset / layout.size();
         assert!(
@@ -237,22 +259,22 @@ pub trait AllocablePage {
 /// members (e.g., dealloc does a cast to find the bitfield).
 #[repr(C)]
 pub struct ObjectPage<'a> {
-    /// Holds memory objects.
     #[allow(dead_code)]
-    data: [u8; OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD],
+    /// A bit-field to track free/allocated memory within `data`.
+    pub(crate) bitfield: [AtomicU64; 8],
 
     /// Next element in list (used by `PageList`).
     next: Rawlink<ObjectPage<'a>>,
     /// Previous element in  list (used by `PageList`)
     prev: Rawlink<ObjectPage<'a>>,
 
-    /// A bit-field to track free/allocated memory within `data`.
-    pub(crate) bitfield: [AtomicU64; 8],
+    /// Holds memory objects.
+    data: [u8; OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD],
 }
 
 impl<'a> ObjectPage<'a> {
-    pub fn new() -> ObjectPage<'a> {
-        unsafe { mem::MaybeUninit::zeroed().assume_init() }
+    pub fn new() -> Box<ObjectPage<'a>> {
+        unsafe { Box::new_uninit().assume_init() }
     }
 }
 

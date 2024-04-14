@@ -32,8 +32,7 @@ impl SlabAllocator {
         match self.zone.allocate(layout) {
             Ok(nptr) => nptr.as_ptr(),
             Err(AllocationError::OutOfMemory) => {
-                let page = ObjectPage::new();
-                let boxed_page = Box::new(page);
+                let boxed_page = ObjectPage::new();
                 let leaked_page = Box::leak(boxed_page);
                 self.zone
                     .refill(layout, leaked_page)

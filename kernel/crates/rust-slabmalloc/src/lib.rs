@@ -22,6 +22,10 @@
 #![no_std]
 #![crate_name = "slabmalloc"]
 #![crate_type = "lib"]
+#![feature(new_uninit)]
+#![feature(maybe_uninit_as_bytes)]
+
+extern crate alloc;
 
 mod pages;
 mod sc;

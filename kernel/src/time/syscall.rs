@@ -163,7 +163,7 @@ impl Syscall {
         //初始化second
         let second = Duration::from_secs(expire_second as u64);
         let pcb = ProcessManager::current_pcb();
-        let pcb_alarm = pcb.ref_alarm_timer();
+        let mut pcb_alarm = pcb.ref_alarm_timer();
         let alarm = pcb_alarm.as_ref();
         if let Some(alarmtimer) = alarm {
             let remain = alarmtimer.remain();
@@ -177,12 +177,13 @@ impl Syscall {
             //重启alarm
             let new_expired_jiffies = Jiffies::new_from_duration(second);
             alarmtimer.restart(new_expired_jiffies);
+            let runtime = alarmtimer.timer.inner().expire_jiffies;
+            kdebug!("runtime:{}", runtime);
             return Ok(remain.as_secs() as usize);
         };
-        drop(pcb_alarm);
         let pid = ProcessManager::current_pid();
         let new_alarm = Some(alarm_timer_init(pid));
-        ProcessManager::current_pcb().set_alarm_timer(new_alarm);
+        *pcb_alarm = new_alarm;
         Ok(0)
     }
 }

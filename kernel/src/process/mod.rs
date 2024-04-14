@@ -965,12 +965,8 @@ impl ProcessControlBlock {
         *self.robust_list.write_irqsave() = new_robust_list;
     }
 
-    pub fn ref_alarm_timer(&self) -> RwLockReadGuard<Option<AlarmTimer>> {
-        return self.alarm_timer.read();
-    }
-
-    pub fn set_alarm_timer(&self, new_alarm: Option<AlarmTimer>) {
-        *self.alarm_timer.write() = new_alarm;
+    pub fn ref_alarm_timer(&self) -> RwLockWriteGuard<Option<AlarmTimer>> {
+        return self.alarm_timer.write();
     }
 }
 

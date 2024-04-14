@@ -17,6 +17,7 @@ use crate::{
         softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
         InterruptArch,
     },
+    include::bindings::bindings::EDEADLK,
     kerror, kinfo,
     libs::spinlock::{SpinLock, SpinLockGuard},
     process::{ProcessControlBlock, ProcessManager},
@@ -167,7 +168,7 @@ pub struct InnerTimer {
     /// self_ref
     self_ref: Weak<Timer>,
     /// 判断该计时器是否触发
-    triggered: bool,
+    pub triggered: bool,
 }
 
 #[derive(Debug)]

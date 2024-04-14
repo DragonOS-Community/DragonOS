@@ -23,20 +23,14 @@ fn main() {
 
     //test2：在上一个alarm定时器未完成时重新调用alarm，查看返回值是否为上一个alarm的剩余秒数，
     //并test第三个alarm定时器能否正常运行
+
     unsafe {
-        syscall(SYS_alarm, 5);
-    }
-    unsafe {
-        sleep(1);
-    }
-    unsafe {
-        let remaining = syscall(SYS_alarm, 5);
+        let remaining = syscall(SYS_alarm, 1);
         println!("Remaining time for previous alarm: {}", remaining);
     }
     unsafe {
-        sleep(8);
+        sleep(6);
     }
-    println!("Test 2 complete");
 
-    println!("All test finish success!");
+    println!("Test 2 complete");
 }

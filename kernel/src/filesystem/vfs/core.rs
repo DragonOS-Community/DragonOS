@@ -67,6 +67,7 @@ pub fn vfs_init() -> Result<(), SystemError> {
     root_inode
         .create("sys", FileType::Dir, ModeType::from_bits_truncate(0o755))
         .expect("Failed to create /sys");
+
     kdebug!("dir in root:{:?}", root_inode.list());
 
     procfs_init().expect("Failed to initialize procfs");
@@ -131,6 +132,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     do_migrate(new_root_inode.clone(), "proc", proc)?;
     do_migrate(new_root_inode.clone(), "dev", dev)?;
     do_migrate(new_root_inode.clone(), "sys", sys)?;
+
     unsafe {
         // drop旧的Root inode
         let old_root_inode = __ROOT_INODE.take().unwrap();

@@ -1,10 +1,9 @@
-use core::sync::atomic::AtomicU16;
+use core::{any::Any, sync::atomic::AtomicU16};
 
 use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
 };
-use system_error::SystemError;
 
 use crate::{
     driver::{
@@ -14,15 +13,20 @@ use crate::{
             kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        pci_driver::{dev_id::{PciDeviceID, PciSpecifiedData}, pci_device::{pci_device_manager, PciDevice}, test::pt_device::InnerPciDevice}, virtio::driver::{virtio_driver_init, VirtioMatchId},
+        virtio::driver::VirtioMatchId,
     },
-    filesystem::kernfs::KernFSInode,
-    libs::
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard}
-    ,
+    filesystem::{kernfs::KernFSInode, sysfs::AttributeGroup},
+    libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
-use super::pci::{ PciDeviceStructureGeneralDevice, PciDeviceStructureHeader, PCI_DEVICE_LINKEDLIST};
+use super::{
+    pci::{PciDeviceStructureGeneralDevice, PCI_DEVICE_LINKEDLIST},
+    pci_driver::{
+        dev_id::{PciDeviceID, PciSpecifiedData},
+        device::{pci_device_manager, PciDevice},
+        test::pt_device::InnerPciDevice,
+    },
+};
 static NAME_SEQ: AtomicU16 = AtomicU16::new(0);
 #[derive(Debug)]
 #[cast_to([sync] Device)]
@@ -33,21 +37,26 @@ pub struct PciRawGeneralDevice {
     dev_id: PciDeviceID,
 }
 
-impl PciRawGeneralDevice {
-    
-}
+impl PciRawGeneralDevice {}
 
 impl From<&PciDeviceStructureGeneralDevice> for PciRawGeneralDevice {
     fn from(value: &PciDeviceStructureGeneralDevice) -> Self {
-        let value=&value.common_header;
+        let value = &value.common_header;
         let kobj_state = LockedKObjectState::new(None);
         let inner = RwLock::new(InnerPciDevice::default());
-        let mut dev_id=PciDeviceID::dummpy();
-        dev_id.set_special(PciSpecifiedData::Virtio(VirtioMatchId::new(value.class_code,value.subclass)));
-        let seq=NAME_SEQ.load(core::sync::atomic::Ordering::SeqCst);
-        let name=format!("PciRaw{:?}",seq);
-        NAME_SEQ.store(seq+1, core::sync::atomic::Ordering::SeqCst);
-        let res=Self { inner, kobj_state, dev_id};
+        let mut dev_id = PciDeviceID::dummpy();
+        dev_id.set_special(PciSpecifiedData::Virtio(VirtioMatchId::new(
+            value.class_code,
+            value.subclass,
+        )));
+        let seq = NAME_SEQ.load(core::sync::atomic::Ordering::SeqCst);
+        let name = format!("PciRaw{:?}", seq);
+        NAME_SEQ.store(seq + 1, core::sync::atomic::Ordering::SeqCst);
+        let res = Self {
+            inner,
+            kobj_state,
+            dev_id,
+        };
         res.set_name(name);
         res
     }
@@ -55,19 +64,16 @@ impl From<&PciDeviceStructureGeneralDevice> for PciRawGeneralDevice {
 
 impl PciDevice for PciRawGeneralDevice {
     fn dynid(&self) -> PciDeviceID {
-        kdebug!("114514");
         self.dev_id
     }
 }
 
 impl Device for PciRawGeneralDevice {
-    fn attribute_groups(
-        &self,
-    ) -> Option<&'static [&'static dyn crate::filesystem::sysfs::AttributeGroup]> {
+    fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
         None
     }
 
-    fn bus(&self) -> Option<alloc::sync::Weak<dyn crate::driver::base::device::bus::Bus>> {
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
         self.inner.read().bus()
     }
 
@@ -85,11 +91,11 @@ impl Device for PciRawGeneralDevice {
         self.inner.read().driver.clone()?.upgrade()
     }
 
-    fn dev_type(&self) -> crate::driver::base::device::DeviceType {
+    fn dev_type(&self) -> DeviceType {
         DeviceType::Pci
     }
 
-    fn id_table(&self) -> crate::driver::base::device::IdTable {
+    fn id_table(&self) -> IdTable {
         IdTable::new("testPci".to_string(), None)
     }
 
@@ -101,19 +107,17 @@ impl Device for PciRawGeneralDevice {
         false
     }
 
-    fn set_bus(&self, bus: Option<alloc::sync::Weak<dyn Bus>>) {
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
         self.inner.write().set_bus(bus);
     }
 
-    fn set_can_match(&self, can_match: bool) {
-        
-    }
+    fn set_can_match(&self, _can_match: bool) {}
 
-    fn set_class(&self, class: Option<alloc::sync::Weak<dyn Class>>) {
+    fn set_class(&self, class: Option<Weak<dyn Class>>) {
         self.inner.write().set_class(class)
     }
 
-    fn set_driver(&self, driver: Option<alloc::sync::Weak<dyn Driver>>) {
+    fn set_driver(&self, driver: Option<Weak<dyn Driver>>) {
         self.inner.write().set_driver(driver)
     }
 
@@ -123,7 +127,7 @@ impl Device for PciRawGeneralDevice {
 }
 
 impl KObject for PciRawGeneralDevice {
-    fn as_any_ref(&self) -> &dyn core::any::Any {
+    fn as_any_ref(&self) -> &dyn Any {
         self
     }
 
@@ -164,7 +168,7 @@ impl KObject for PciRawGeneralDevice {
     }
 
     fn set_name(&self, name: String) {
-        self.inner.write().name=Some(name)
+        self.inner.write().name = Some(name)
     }
 
     fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
@@ -181,14 +185,12 @@ impl KObject for PciRawGeneralDevice {
 }
 
 #[inline(never)]
-pub fn pci_device_search(){
-    virtio_driver_init();
-    for i in PCI_DEVICE_LINKEDLIST.read().iter(){
-        if let Some(dev) = i.as_standard_device(){
-            let raw_dev=PciRawGeneralDevice::from(dev);
-            let _ =pci_device_manager().device_add(Arc::new(raw_dev));
-            
-        }else{
+pub fn pci_device_search() {
+    for i in PCI_DEVICE_LINKEDLIST.read().iter() {
+        if let Some(dev) = i.as_standard_device() {
+            let raw_dev = PciRawGeneralDevice::from(dev);
+            let _ = pci_device_manager().device_add(Arc::new(raw_dev));
+        } else {
             continue;
         }
     }

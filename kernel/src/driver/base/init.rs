@@ -1,4 +1,4 @@
-use crate::driver::{input::serio::serio_bus_init, pci_driver::pci_bus_init};
+use crate::driver::{input::serio::serio_bus_init, pci::pci_driver::pci_bus_init};
 use system_error::SystemError;
 
 use super::{

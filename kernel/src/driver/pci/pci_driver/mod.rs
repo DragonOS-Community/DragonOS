@@ -1,19 +1,22 @@
 use alloc::{string::ToString, sync::Arc};
 use system_error::SystemError;
 
-use self::{pci_device::PciBusDevice, subsys::PciBus, test::pt_init};
-
-use super::{base::{
-    device::{
-        bus::{bus_register, Bus, BusState},
-        device_register, sys_devices_kset, DevicePrivateData, IdTable,
+use crate::driver::{
+    base::{
+        device::{
+            bus::{bus_register, Bus, BusState},
+            device_register, sys_devices_kset, DevicePrivateData, IdTable,
+        },
+        kobject::KObject,
     },
-    kobject::KObject,
-}, pci::device::pci_device_search};
+    virtio::driver::virtio_driver_init,
+};
+
+use self::{device::PciBusDevice, subsys::PciBus, test::pt_init};
 
 pub mod dev_id;
-pub mod pci_device;
-pub mod pci_driver;
+pub mod device;
+pub mod driver;
 pub mod subsys;
 pub mod test;
 static mut PCI_BUS_DEVICE: Option<Arc<PciBusDevice>> = None;
@@ -47,6 +50,7 @@ pub fn pci_bus_init() -> Result<(), SystemError> {
     let pci_bus = PciBus::new();
     unsafe { PCI_BUS = Some(pci_bus.clone()) }
     let r = bus_register(pci_bus.clone() as Arc<dyn Bus>);
-    pt_init();
+    pt_init()?;
+    virtio_driver_init()?;
     return r;
 }

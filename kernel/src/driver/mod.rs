@@ -10,7 +10,6 @@ pub mod keyboard;
 pub mod net;
 pub mod open_firmware;
 pub mod pci;
-pub mod pci_driver;
 pub mod rtc;
 pub mod serial;
 pub mod timers;

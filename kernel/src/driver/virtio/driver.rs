@@ -1,23 +1,46 @@
-use alloc::{string::{String, ToString}, sync::{Arc, Weak}, vec::Vec};
+use core::any::Any;
+
+use alloc::{
+    string::{String, ToString},
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use system_error::SystemError;
 
-use crate::{driver::{base::{device::{bus::Bus, driver::Driver, Device, IdTable}, kobject::{KObjType, KObject, KObjectState, LockedKObjectState}, kset::KSet}, pci_driver::{dev_id::{PciDeviceID, PciSpecifiedData}, pci_driver::{pci_driver_manager, PciDriver}, test::pt_driver::InnerPciDriver}}, filesystem::kernfs::KernFSInode, libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard}};
+use crate::{
+    driver::{
+        base::{
+            device::{bus::Bus, driver::Driver, Device, IdTable},
+            kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+            kset::KSet,
+        },
+        pci::pci_driver::{
+            dev_id::{PciDeviceID, PciSpecifiedData},
+            device::PciDevice,
+            driver::{pci_driver_manager, PciDriver},
+            test::pt_driver::InnerPciDriver,
+        },
+    },
+    filesystem::kernfs::KernFSInode,
+    libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+};
 
 use super::virtio::{ETHERNET_SUBCLASS, NETWORK_CLASS};
 
-pub fn virtio_driver_init()->Result<(),SystemError>{
-    let mut drv=VirtIODriver::new();
-    let mut support_id=PciDeviceID::dummpy();
-    support_id.set_special(PciSpecifiedData::Virtio(VirtioMatchId { subclass: ETHERNET_SUBCLASS, class_code: NETWORK_CLASS }));
+pub fn virtio_driver_init() -> Result<(), SystemError> {
+    let mut drv = VirtIODriver::new();
+    let mut support_id = PciDeviceID::dummpy();
+    support_id.set_special(PciSpecifiedData::Virtio(VirtioMatchId {
+        subclass: ETHERNET_SUBCLASS,
+        class_code: NETWORK_CLASS,
+    }));
     drv.add_dynid(support_id)?;
     pci_driver_manager().register(Arc::new(drv))
-
 }
-
 
 #[derive(Debug)]
 #[cast_to([sync] PciDriver)]
-pub struct VirtIODriver{
+pub struct VirtIODriver {
     inner: RwLock<InnerPciDriver>,
     kobj_state: LockedKObjectState,
 }
@@ -42,10 +65,7 @@ impl VirtIODriver {
 }
 
 impl PciDriver for VirtIODriver {
-    fn add_dynid(
-        &mut self,
-        id: crate::driver::pci_driver::dev_id::PciDeviceID,
-    ) -> Result<(), system_error::SystemError> {
+    fn add_dynid(&mut self, id: PciDeviceID) -> Result<(), system_error::SystemError> {
         self.inner.write().insert_id(id);
         Ok(())
     }
@@ -56,38 +76,27 @@ impl PciDriver for VirtIODriver {
 
     fn probe(
         &self,
-        device: &Arc<dyn crate::driver::pci_driver::pci_device::PciDevice>,
-        id: &crate::driver::pci_driver::dev_id::PciDeviceID,
+        _device: &Arc<dyn PciDevice>,
+        _id: &PciDeviceID,
     ) -> Result<(), system_error::SystemError> {
+        //todo:这里需要将virtio的probe功能搬运过来
         Ok(())
     }
 
-    fn remove(
-        &self,
-        device: &Arc<dyn crate::driver::pci_driver::pci_device::PciDevice>,
-    ) -> Result<(), system_error::SystemError> {
-        Ok(())
+    fn remove(&self, _device: &Arc<dyn PciDevice>) -> Result<(), system_error::SystemError> {
+        todo!()
     }
 
-    fn resume(
-        &self,
-        device: &Arc<dyn crate::driver::pci_driver::pci_device::PciDevice>,
-    ) -> Result<(), system_error::SystemError> {
-        Ok(())
+    fn resume(&self, _device: &Arc<dyn PciDevice>) -> Result<(), system_error::SystemError> {
+        todo!()
     }
 
-    fn shutdown(
-        &self,
-        device: &Arc<dyn crate::driver::pci_driver::pci_device::PciDevice>,
-    ) -> Result<(), system_error::SystemError> {
-        Ok(())
+    fn shutdown(&self, _device: &Arc<dyn PciDevice>) -> Result<(), system_error::SystemError> {
+        todo!()
     }
 
-    fn suspend(
-        &self,
-        device: &Arc<dyn crate::driver::pci_driver::pci_device::PciDevice>,
-    ) -> Result<(), system_error::SystemError> {
-        Ok(())
+    fn suspend(&self, _device: &Arc<dyn PciDevice>) -> Result<(), system_error::SystemError> {
+        todo!()
     }
 }
 
@@ -125,7 +134,7 @@ impl Driver for VirtIODriver {
 }
 
 impl KObject for VirtIODriver {
-    fn as_any_ref(&self) -> &dyn core::any::Any {
+    fn as_any_ref(&self) -> &dyn Any {
         self
     }
 
@@ -181,15 +190,17 @@ impl KObject for VirtIODriver {
         *self.kobj_state.write() = state;
     }
 }
-#[derive(PartialEq, Eq, PartialOrd, Ord,Debug,Copy,Clone)]
-pub struct VirtioMatchId{
-    subclass:u8,
-    class_code:u8,
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Copy, Clone)]
+pub struct VirtioMatchId {
+    subclass: u8,
+    class_code: u8,
 }
 
-impl VirtioMatchId{
-    pub fn new(class_code:u8,subclass:u8)->Self{
-        Self { subclass, class_code }
+impl VirtioMatchId {
+    pub fn new(class_code: u8, subclass: u8) -> Self {
+        Self {
+            subclass,
+            class_code,
+        }
     }
 }
-

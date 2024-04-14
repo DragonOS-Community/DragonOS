@@ -7,12 +7,12 @@ use crate::exception::{irqdesc::IrqReturn, IrqNumber};
 
 use super::base::device::DeviceId;
 
+pub mod driver;
 pub(super) mod irq;
 pub mod transport_pci;
 #[allow(clippy::module_inception)]
 pub mod virtio;
 pub mod virtio_impl;
-pub mod driver;
 
 pub trait VirtIODevice: Send + Sync + Any {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError>;

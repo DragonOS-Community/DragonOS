@@ -1,15 +1,12 @@
 use alloc::{sync::Arc, vec::Vec};
 use system_error::SystemError;
 
-use crate::{
-    driver::base::device::{
-        bus::Bus,
-        driver::{driver_manager, Driver},
-    },
-    libs::rwlock::RwLockReadGuard,
+use crate::driver::base::device::{
+    bus::Bus,
+    driver::{driver_manager, Driver},
 };
 
-use super::{dev_id::PciDeviceID, pci_bus, pci_device::PciDevice};
+use super::{dev_id::PciDeviceID, device::PciDevice, pci_bus};
 
 pub trait PciDriver: Driver {
     //https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/net/wireless/realtek/rtw88/pci.c?fi=rtw_pci_probe#1731是一个实例
@@ -22,7 +19,7 @@ pub trait PciDriver: Driver {
     fn locked_dynid_list(&self) -> Option<Vec<Arc<PciDeviceID>>>;
     fn match_dev(&self, dev: &Arc<dyn PciDevice>) -> Option<Arc<PciDeviceID>> {
         for i in self.locked_dynid_list()?.iter() {
-            if i.match_dev(&dev) {
+            if i.match_dev(dev) {
                 return Some(i.clone());
             }
         }

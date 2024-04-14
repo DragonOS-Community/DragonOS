@@ -9,9 +9,7 @@ impl ProcessManager {
     pub fn arch_idle_func() -> ! {
         loop {
             if CurrentIrqArch::is_irq_enabled() {
-                unsafe {
-                    riscv::asm::wfi();
-                }
+                riscv::asm::wfi();
             } else {
                 kBUG!("Idle process should not be scheduled with IRQs disabled.");
                 spin_loop();

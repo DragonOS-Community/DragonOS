@@ -1,4 +1,3 @@
-use acpi::address;
 use riscv::register::satp;
 use sbi_rt::{HartMask, SbiRet};
 use system_error::SystemError;
@@ -6,7 +5,6 @@ use system_error::SystemError;
 use crate::{
     arch::MMArch,
     driver::open_firmware::fdt::open_firmware_fdt_driver,
-    kdebug,
     libs::spinlock::SpinLock,
     mm::{
         allocator::{

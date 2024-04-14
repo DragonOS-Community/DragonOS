@@ -298,8 +298,16 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
         ));
     }
 
-    // 克隆页表
-    pub unsafe fn clone(&self, allocator: &mut impl FrameAllocator) -> Option<PageTable<Arch>> {
+    /// 拷贝页表
+    /// ## 参数
+    ///
+    /// - `allocator`: 物理页框分配器
+    /// - `copy_on_write`: 是否写时复制
+    pub unsafe fn clone(
+        &self,
+        allocator: &mut impl FrameAllocator,
+        copy_on_write: bool,
+    ) -> Option<PageTable<Arch>> {
         // 分配新页面作为新的页表
         let phys = allocator.allocate_one()?;
         let frame = MMArch::phys_2_virt(phys).unwrap();
@@ -309,33 +317,33 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
             for i in 0..Arch::PAGE_ENTRY_NUM {
                 if let Some(mut entry) = self.entry(i) {
                     if entry.present() {
-                        let mut new_flags = entry.flags().set_write(false);
-                        entry.set_flags(new_flags);
-                        self.set_entry(i, entry);
-                        new_flags = new_flags.set_dirty(false);
-                        entry.set_flags(new_flags);
-                        new_table.set_entry(i, entry);
+                        if copy_on_write {
+                            let mut new_flags = entry.flags().set_write(false);
+                            entry.set_flags(new_flags);
+                            self.set_entry(i, entry);
+                            new_flags = new_flags.set_dirty(false);
+                            entry.set_flags(new_flags);
+                            new_table.set_entry(i, entry);
+                        } else {
+                            let phys = allocator.allocate_one()?;
+                            let mut anon_vma_guard = page_manager_lock_irqsave();
+                            anon_vma_guard.insert(phys, Page::new(false));
+                            let old_phys = entry.address().unwrap();
+                            let frame = MMArch::phys_2_virt(phys).unwrap().data() as *mut u8;
+                            frame.copy_from_nonoverlapping(
+                                MMArch::phys_2_virt(old_phys).unwrap().data() as *mut u8,
+                                MMArch::PAGE_SIZE,
+                            );
+                            new_table.set_entry(i, PageEntry::new(phys, entry.flags()));
+                        }
                     }
-
-                    // if entry.present() {
-                    //     let phys = allocator.allocate_one()?;
-                    //     let mut anon_vma_guard = page_manager_lock_irqsave();
-                    //     anon_vma_guard.insert(phys, Page::new(false));
-                    //     let old_phys = entry.address().unwrap();
-                    //     let frame = MMArch::phys_2_virt(phys).unwrap().data() as *mut u8;
-                    //     frame.copy_from_nonoverlapping(
-                    //         MMArch::phys_2_virt(old_phys).unwrap().data() as *mut u8,
-                    //         MMArch::PAGE_SIZE,
-                    //     );
-                    //     new_table.set_entry(i, PageEntry::new(phys, entry.flags()));
-                    // }
                 }
             }
         } else {
             // 非一级页表拷贝时，对每个页表项对应的页表都进行拷贝
             for i in 0..MMArch::PAGE_ENTRY_NUM {
                 if let Some(next_table) = self.next_level_table(i) {
-                    let table = next_table.clone(allocator)?;
+                    let table = next_table.clone(allocator, copy_on_write)?;
                     let old_entry = self.entry(i).unwrap();
                     let entry = PageEntry::new(table.phys(), old_entry.flags());
                     new_table.set_entry(i, entry);
@@ -689,7 +697,7 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
     ///
     /// ## 参数
     ///
-    /// - value: 如果为true，那么将当前页表项的写穿策略设置为写穿。
+    /// - value: 如果为true，那么将当前页表项的访问标志设置为已访问。
     #[inline(always)]
     pub fn set_access(self, value: bool) -> Self {
         return self.update_flags(Arch::ENTRY_FLAG_ACCESSED, value);
@@ -1071,14 +1079,15 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
     /// ## 参数
     ///
     /// - `umapper`: 要拷贝的用户空间
-    pub unsafe fn clone_user_mapping(&mut self, umapper: &mut Self) {
+    /// - `copy_on_write`: 是否写时复制
+    pub unsafe fn clone_user_mapping(&mut self, umapper: &mut Self, copy_on_write: bool) {
         let old_table = umapper.table();
         let new_table = self.table();
         let allocator = self.allocator_mut();
         // 顶级页表的[0, PAGE_KERNEL_INDEX)项为用户空间映射
         for entry_index in 0..Arch::PAGE_KERNEL_INDEX {
             if let Some(next_table) = old_table.next_level_table(entry_index) {
-                let table = next_table.clone(allocator).unwrap();
+                let table = next_table.clone(allocator, copy_on_write).unwrap();
                 let old_entry = old_table.entry(entry_index).unwrap();
                 let entry = PageEntry::new(table.phys(), old_entry.flags());
                 new_table.set_entry(entry_index, entry);

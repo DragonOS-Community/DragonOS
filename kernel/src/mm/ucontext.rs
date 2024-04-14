@@ -160,7 +160,11 @@ impl InnerAddressSpace {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let new_addr_space = AddressSpace::new(false)?;
         let mut new_guard = new_addr_space.write();
-        unsafe { new_guard.user_mapper.clone_from(&mut self.user_mapper) };
+        unsafe {
+            new_guard
+                .user_mapper
+                .clone_from(&mut self.user_mapper, true)
+        };
 
         // 拷贝用户栈的结构体信息，但是不拷贝用户栈的内容（因为后面VMA的拷贝会拷贝用户栈的内容）
         unsafe {
@@ -708,9 +712,14 @@ impl UserMapper {
         return Self { utable };
     }
 
-    // 拷贝用户空间映射
-    pub unsafe fn clone_from(&mut self, umapper: &mut Self) {
-        self.utable.clone_user_mapping(&mut umapper.utable);
+    /// 拷贝用户空间映射
+    /// ## 参数
+    ///
+    /// - `umapper`: 要拷贝的用户空间
+    /// - `copy_on_write`: 是否写时复制
+    pub unsafe fn clone_from(&mut self, umapper: &mut Self, copy_on_write: bool) {
+        self.utable
+            .clone_user_mapping(&mut umapper.utable, copy_on_write);
     }
 }
 

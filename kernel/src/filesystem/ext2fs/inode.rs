@@ -5,15 +5,17 @@ use core::{
 };
 
 use alloc::{
-    sync::{Arc, Weak},
-    vec::Vec,
+    string::String, sync::{Arc, Weak}, vec::Vec
 };
 use system_error::SystemError;
 
 use super::{file_type::Ext2FileType, fs::EXT2_SB_INFO};
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition},
-    filesystem::vfs::{syscall::ModeType, FileSystem, FileType, IndexNode, Metadata},
+    filesystem::{
+        ext2fs::file_type,
+        vfs::{syscall::ModeType, FileSystem, FileType, IndexNode, Metadata},
+    },
     libs::{rwlock::RwLock, spinlock::SpinLock},
 };
 
@@ -169,7 +171,7 @@ pub(crate) struct Ext2Indirect {
     pub data_block: Option<u32>,
 }
 #[derive(Debug)]
-pub struct LockedExt2InodeInfo(SpinLock<Ext2InodeInfo>);
+pub struct LockedExt2InodeInfo(pub SpinLock<Ext2InodeInfo>);
 
 #[derive(Debug)]
 /// 存储在内存中的inode
@@ -181,14 +183,15 @@ pub struct Ext2InodeInfo {
     // block_group: u32,
     mode: ModeType,
     file_type: FileType,
+    i_mode: u16,
     // file_size: u32,
     // disk_sector: u32,
 }
 
 impl Ext2InodeInfo {
-    pub fn new(inode: LockedExt2Inode) -> Self {
-        let inode_grade = inode.0.lock();
-        let mode = inode_grade.mode;
+    pub fn new(inode: &Ext2Inode) -> Self {
+        // let inode_grade = inode.0.lock();
+        let mode = inode.mode;
         let file_type = Ext2FileType::type_from_mode(&mode).unwrap().covert_type();
         // TODO 根据inode mode转换modetype
         let fs_mode = ModeType::from_bits_truncate(0o755);
@@ -197,14 +200,14 @@ impl Ext2InodeInfo {
         let mut d: Vec<Option<Ext2Indirect>> = Vec::with_capacity(15);
         for i in 0..12 as usize {
             let mut idir = Ext2Indirect::default();
-            idir.data_block = Some(inode_grade.blocks[i]);
+            idir.data_block = Some(inode.blocks[i]);
             idir.self_ref = Arc::downgrade(&Arc::new(idir.clone()));
             d[i] = Some(idir);
         }
         // TODO 间接地址
         Self {
-            // data: d,
-            i_data: inode_grade.blocks,
+            i_data: inode.blocks,
+            i_mode: mode,
             meta,
             mode: fs_mode,
             file_type,
@@ -356,6 +359,10 @@ impl IndexNode for LockedExt2InodeInfo {
 
                 Ok(already_read_byte)
             }
+            FileType::Dir => {
+                // TODO 读取目录
+                unimplemented!()
+            }
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -370,7 +377,22 @@ impl IndexNode for LockedExt2InodeInfo {
         let inode_grade = self.0.lock();
         let superb = EXT2_SB_INFO.read();
         // 判断inode的文件类型
-
+        let file_type = Ext2FileType::type_from_mode(&inode_grade.i_mode);
+        if file_type.is_err() {
+            return Err(SystemError::EINVAL);
+        }
+        let file_type = file_type.unwrap();
+        // TODO 根据不用类型文件写入数据
+        match file_type {
+            Ext2FileType::FIFO => todo!(),
+            Ext2FileType::CharacterDevice => todo!(),
+            Ext2FileType::Directory => todo!(),
+            Ext2FileType::BlockDevice => todo!(),
+            Ext2FileType::RegularFile => todo!(),
+            Ext2FileType::SymbolicLink => todo!(),
+            Ext2FileType::UnixSocket => todo!(),
+        }
+        // TODO write_at
         todo!()
     }
 
@@ -383,7 +405,33 @@ impl IndexNode for LockedExt2InodeInfo {
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
-        todo!()
+        let guard = self.0.lock();
+        let file_type = Ext2FileType::type_from_mode(&guard.i_mode);
+        if file_type.is_err() {
+            kerror!("{:?}", file_type.clone().err());
+            return Err(SystemError::EINVAL);
+        }
+        let file_type = file_type.unwrap();
+        match file_type {
+            Ext2FileType::Directory=> {
+                let mut ret: Vec<String> = Vec::new();
+                // TODO 列出目录项
+                // 获取inode数据块
+
+                // 解析为entry数组
+
+                // 遍历entry数组
+
+                // 将entry添加到ret中
+                return Ok(ret);
+            }
+            _ => {
+                return Err(SystemError::ENOTDIR);
+            }
+        }
+    }
+    fn metadata(&self) -> Result<Metadata, SystemError> {
+        return Ok(self.0.lock().meta.clone());
     }
 }
 
@@ -393,4 +441,3 @@ pub fn get_address_block(partition: Arc<Partition>, ptr: usize) -> [u32; 128] {
     let address: [u32; 128] = unsafe { mem::transmute::<[u8; 512], [u32; 128]>(address_block) };
     address
 }
-

@@ -46,7 +46,6 @@ impl Ext2FileType {
     }
 }
 
-
 bitflags! {
    pub struct Ext2FileMode:u16 {
             /// 文件系统中的 FIFO（管道）
@@ -99,6 +98,9 @@ const    BLOCK_DEVICE = 0x6000;
 impl Ext2FileMode {
     pub fn type_from_mode(t: &u16) -> Result<Ext2FileType, SystemError> {
         Ext2FileType::type_from_mode(t)
+    }
+    pub fn file_type(&self) -> Result<Ext2FileType, SystemError> {
+        Ext2FileType::type_from_mode(&self.bits())
     }
     pub fn convert_mode(mode: &u16) -> Result<ModeType, SystemError> {
         let mut mode_type = ModeType::empty();

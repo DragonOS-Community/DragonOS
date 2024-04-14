@@ -15,17 +15,29 @@ pub struct Ext2DirEntry {
 }
 
 impl Ext2DirEntry {
+    pub fn new() -> Self {
+        Self {
+            inode: 0,
+            record_length: 0,
+            name_length: 0,
+            file_type: 0,
+            name: [0; EXT2_NAME_LEN],
+        }
+    }
     pub fn get_name(&self) -> String {
         String::from_utf8(self.name.to_vec()).expect("Invalid UTF-8 in entry name")
     }
     pub fn get_inode(&self) -> usize {
         self.inode as usize
     }
-    pub fn get_file_len(&self) -> usize {
-        self.record_length as usize
-    }
     pub fn get_file_type(&self) -> Ext2DirEntryType {
         Ext2DirEntryType::from(self.file_type)
+    }
+    pub fn if_used(&self) -> bool {
+        self.inode == 0
+    }
+    pub fn get_rec_len(&self) -> usize {
+        self.record_length as usize
     }
 }
 

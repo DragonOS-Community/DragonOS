@@ -43,8 +43,7 @@ pub struct Ext2FileSystem {
 // TODO 用于加载fs
 impl FileSystem for Ext2FileSystem {
     fn root_inode(&self) -> alloc::sync::Arc<dyn crate::filesystem::vfs::IndexNode> {
-        // TODO root inode位于第二个inode
-        todo!()
+        self.root_inode.clone()
     }
 
     fn info(&self) -> crate::filesystem::vfs::FsInfo {
@@ -301,7 +300,7 @@ impl Ext2SuperBlockInfo {
         }
     }
     /// TODO 根据索引号获取磁盘inode
-    pub fn read_inode(&self, inode_index: u32) -> Result<Ext2InodeInfo, SystemError> {
+    pub fn read_inode(&self, inode_index: u32) -> Result<Ext2Inode, SystemError> {
         // Get the reference to the description table
         let desc_table = self.group_desc_table.upgrade().unwrap();
         // Calculate the index of the group using the inode index
@@ -338,7 +337,7 @@ impl Ext2SuperBlockInfo {
         // let mut inode_data = Vec::with_capacity(self.s_inode_size as usize);
         // inode_data.resize(self.s_inode_size as usize, 0);
         let mut cursor = VecCursor::new(inode_data);
-        
+
         // let inode = Ext2Inode{
         //     mode: cursor.read_u16()?,
         //     uid: cursor.read_u16()?,
@@ -369,7 +368,10 @@ impl Ext2SuperBlockInfo {
         // while blc_num < self.s_inodes_per_group {}
         todo!()
     }
-    // TODO 获取根结点
+    pub fn read_root_inode(&self) -> Result<Ext2Inode, SystemError> {
+        let root_inode_index = 2;
+        self.read_inode(root_inode_index)
+    }
 }
 
 impl Ex2SuperBlock {

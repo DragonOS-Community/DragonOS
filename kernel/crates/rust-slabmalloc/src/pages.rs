@@ -158,7 +158,7 @@ impl Bitfield for [AtomicU64] {
 }
 
 fn get_offset_for_align(layout: Layout) -> usize {
-    let offset = match layout.size() {
+    match layout.size() {
         0..=8 => 80,
         9..=16 => 80,
         17..=32 => 96,
@@ -169,8 +169,7 @@ fn get_offset_for_align(layout: Layout) -> usize {
         513..=1024 => 1024,
         1025..=2048 => 2048,
         _ => panic!(),
-    };
-    offset
+    }
 }
 
 /// This trait is used to define a page from which objects are allocated

@@ -5,12 +5,13 @@ use crate::arch::{mm::PageMapper, MMArch};
 use super::{page::Flusher, syscall::MadvFlags, ucontext::LockedVMA, VmFlags};
 
 impl LockedVMA {
-    pub fn do_advise(
+    pub fn do_madvise(
         &self,
         behavior: MadvFlags,
         _mapper: &mut PageMapper,
         _flusher: impl Flusher<MMArch>,
     ) -> Result<(), SystemError> {
+        //TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/madvise.c?fi=madvise#do_madvise
         let mut vma = self.lock();
         let mut new_flags = *vma.vm_flags();
         match behavior {

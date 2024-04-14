@@ -75,42 +75,65 @@ bitflags! {
 
 
     pub struct MadvFlags: u64 {
-        const MADV_NORMAL = 0;		/* no further special treatment */
-        const MADV_RANDOM = 1;		/* expect random page references */
-        const MADV_SEQUENTIAL = 2;		/* expect sequential page references */
-        const MADV_WILLNEED = 3;		/* will need these pages */
-        const MADV_DONTNEED = 4;		/* don't need these pages */
+        /// 默认行为，系统会进行一定的预读和预写，适用于一般读取场景
+        const MADV_NORMAL = 0;
+        /// 随机访问模式，系统会尽量最小化数据读取量，适用于随机访问的场景
+        const MADV_RANDOM = 1;
+        /// 顺序访问模式，系统会进行积极的预读，访问后的页面可以尽快释放，适用于顺序读取场景
+        const MADV_SEQUENTIAL = 2;
+        /// 通知系统预读某些页面，用于应用程序提前准备数据
+        const MADV_WILLNEED = 3;
+        /// 通知系统应用程序不再需要某些页面，内核可以释放相关资源
+        const MADV_DONTNEED = 4;
 
-        /* common parameters: try to keep these consistent across architectures */
-        const MADV_FREE = 8;		/* free pages only if memory pressure */
-        const MADV_REMOVE = 9;		/* remove these pages & resources */
-        const MADV_DONTFORK = 10;		/* don't inherit across fork */
-        const MADV_DOFORK = 11;		/* do inherit across fork */
-        const MADV_HWPOISON = 100;		/* poison a page for testing */
-        const MADV_SOFT_OFFLINE = 101;		/* soft offline page for testing */
+        /// 将指定范围的页面标记为延迟释放，真正的释放会延迟至内存压力发生时
+        const MADV_FREE = 8;
+        /// 应用程序请求释放指定范围的页面和相关的后备存储
+        const MADV_REMOVE = 9;
+        /// 在 fork 时排除指定区域
+        const MADV_DONTFORK = 10;
+        /// 取消 MADV_DONTFORK 的效果，不再在 fork 时排除指定区域
+        const MADV_DOFORK = 11;
+        /// 模拟内存硬件错误，触发内存错误处理器处理
+        const MADV_HWPOISON = 100;
+        /// 尝试软下线指定的内存范围
+        const MADV_SOFT_OFFLINE = 101;
 
-        const MADV_MERGEABLE = 12;		/* KSM may merge identical pages */
-        const MADV_UNMERGEABLE = 13;		/* KSM may not merge identical pages */
+        /// 应用程序建议内核尝试合并指定范围内内容相同的页面
+        const MADV_MERGEABLE = 12;
+        /// 取消 MADV_MERGEABLE 的效果，不再合并页面
+        const MADV_UNMERGEABLE = 13;
 
-        const MADV_HUGEPAGE = 14;		/* Worth backing with hugepages */
-        const MADV_NOHUGEPAGE = 15;		/* Not worth backing with hugepages */
+        /// 应用程序希望将指定范围以透明大页方式支持
+        const MADV_HUGEPAGE = 14;
+        /// 将指定范围标记为不值得用透明大页支持
+        const MADV_NOHUGEPAGE = 15;
 
-        const MADV_DONTDUMP = 16;		/* Explicity exclude from the core dump,
-                            overrides the coredump filter bits */
-        const MADV_DODUMP = 17;		/* Clear the MADV_DONTDUMP flag */
+        /// 应用程序请求在核心转储时排除指定范围内的页面
+        const MADV_DONTDUMP = 16;
+        /// 取消 MADV_DONTDUMP 的效果，不再排除核心转储时的页面
+        const MADV_DODUMP = 17;
 
-        const MADV_WIPEONFORK = 18;		/* Zero memory on fork, child only */
-        const MADV_KEEPONFORK = 19;		/* Undo MADV_WIPEONFORK */
+        /// 在 fork 时将子进程的该区域内存填充为零
+        const MADV_WIPEONFORK = 18;
+        /// 取消 `MADV_WIPEONFORK` 的效果，不再在 fork 时填充子进程的内存
+        const MADV_KEEPONFORK = 19;
 
-        const MADV_COLD = 20;		/* deactivate these pages */
-        const MADV_PAGEOUT = 21;		/* reclaim these pages */
+        /// 应用程序不会立刻使用这些内存，内核将页面设置为非活动状态以便在内存压力发生时轻松回收
+        const MADV_COLD = 20;
+        /// 应用程序不会立刻使用这些内存，内核立即将这些页面换出
+        const MADV_PAGEOUT = 21;
 
-        const MADV_POPULATE_READ = 22;	/* populate (prefault) page tables readable */
-        const MADV_POPULATE_WRITE = 23;	/* populate (prefault) page tables writable */
+        /// 预先填充页面表，可读，通过触发读取故障
+        const MADV_POPULATE_READ = 22;
+        /// 预先填充页面表，可写，通过触发写入故障
+        const MADV_POPULATE_WRITE = 23;
 
-        const MADV_DONTNEED_LOCKED = 24;	/* like DONTNEED, but drop locked pages too */
+        /// 与 `MADV_DONTNEED` 类似，会将被锁定的页面释放
+        const MADV_DONTNEED_LOCKED = 24;
 
-        const MADV_COLLAPSE = 25;		/* Synchronous hugepage collapse */
+        /// 同步将页面合并为新的透明大页
+        const MADV_COLLAPSE = 25;
 
     }
 }

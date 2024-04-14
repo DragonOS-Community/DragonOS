@@ -86,7 +86,7 @@ impl PageManager {
 /// 物理页面信息
 pub struct Page {
     /// 映射计数
-    pub map_count: usize,
+    map_count: usize,
     /// 是否为共享页
     shared: bool,
     /// 映射计数为0时，是否可回收
@@ -142,8 +142,14 @@ impl Page {
         self.free_when_zero = dealloc_when_zero;
     }
 
+    #[inline(always)]
     pub fn anon_vma(&self) -> &HashSet<Arc<LockedVMA>> {
         &self.anon_vma
+    }
+
+    #[inline(always)]
+    pub fn map_count(&self) -> usize {
+        self.map_count
     }
 }
 
@@ -990,7 +996,15 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         table.next_level_table(i)
     }
 
-    // 获取虚拟地址的指定层级页表
+    /// 获取虚拟地址的指定层级页表
+    /// ## 参数
+    ///
+    /// - `virt`: 虚拟地址
+    /// - `level`: 指定页表层级
+    ///
+    /// ## 返回值
+    /// - Some(PageTable<Arch>): 虚拟地址对应层级的页表
+    /// - None: 对应页表不存在
     pub fn get_table(&self, virt: VirtAddr, level: usize) -> Option<PageTable<Arch>> {
         let mut table = self.table();
         if level > Arch::PAGE_LEVELS - 1 {
@@ -1010,7 +1024,15 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         }
     }
 
-    //获取虚拟地址在指定层级页表的有效entry
+    /// 获取虚拟地址在指定层级页表的PageEntry
+    /// ## 参数
+    ///
+    /// - `virt`: 虚拟地址
+    /// - `level`: 指定页表层级
+    ///
+    /// ## 返回值
+    /// - Some(PageEntry<Arch>): 虚拟地址在指定层级的页表的有效PageEntry
+    /// - None: 无对应的有效PageEntry
     pub fn get_entry(&self, virt: VirtAddr, level: usize) -> Option<PageEntry<Arch>> {
         let table = self.get_table(virt, level)?;
         let i = table.index_of(virt)?;
@@ -1045,7 +1067,10 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         // }
     }
 
-    // 拷贝用户空间映射
+    /// 拷贝用户空间映射
+    /// ## 参数
+    ///
+    /// - `umapper`: 要拷贝的用户空间
     pub unsafe fn clone_user_mapping(&mut self, umapper: &mut Self) {
         let old_table = umapper.table();
         let new_table = self.table();

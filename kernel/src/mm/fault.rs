@@ -3,7 +3,7 @@ use core::{alloc::Layout, intrinsics::unlikely, panic};
 use alloc::sync::Arc;
 
 use crate::{
-    arch::{interrupt::TrapFrame, mm::PageMapper, MMArch, PageFaultArch},
+    arch::{mm::PageMapper, MMArch, PageFaultArch},
     mm::{
         page::{page_manager_lock_irqsave, PageFlags},
         ucontext::LockedVMA,
@@ -32,7 +32,23 @@ bitflags! {
     }
 }
 
+/// # 缺页中断trait
+///
+/// 封装了处理缺页中断需要的方法和属性，需要根据架构进行不同的实现
 pub trait PageFault {
+    /// 判断一个VMA是否允许访问
+    ///
+    /// ## 参数
+    ///
+    /// - `vma`: 进行判断的VMA
+    /// - `write`: 是否需要写入权限（true 表示需要写权限）
+    /// - `execute`: 是否需要执行权限（true 表示需要执行权限）
+    /// - `foreign`: 是否是外部的（即非当前进程的）VMA
+    ///
+    /// ## 返回值
+    /// - `true`: VMA允许访问
+    /// - `false`: 错误的说明
+
     fn vma_access_permitted(
         _vma: Arc<LockedVMA>,
         _write: bool,
@@ -43,16 +59,33 @@ pub trait PageFault {
     }
 }
 
+/// # 缺页异常信息结构体
+/// 包含了页面错误处理的相关信息，例如出错的地址、VMA等
+#[derive(Debug)]
+pub struct PageFaultMessage {
+    pub vma: Arc<LockedVMA>,
+    pub address: VirtAddr,
+    pub flags: FaultFlags,
+}
+
+/// 缺页中断处理结构体
 pub struct PageFaultHandler;
 
 impl PageFaultHandler {
-    pub unsafe fn handle_mm_fault(
-        vma: Arc<LockedVMA>,
-        mapper: &mut PageMapper,
-        address: VirtAddr,
-        flags: FaultFlags,
-        _regs: &'static TrapFrame,
-    ) -> VmFaultReason {
+    /// 处理缺页异常
+    /// ## 参数
+    ///
+    /// - `vma`: VMA
+    /// - `mapper`: VMA
+    /// - `address`: VMA
+    /// - `flags`: VMA
+    ///
+    /// ## 返回值
+    /// - Some(Arc<LockedVMA>): 虚拟地址所在的或最近的下一个VMA
+    /// - None: 未找到VMA
+    pub unsafe fn handle_mm_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+        let flags = pfm.flags;
+        let vma = pfm.vma.clone();
         let current_pcb = ProcessManager::current_pcb();
         let mut guard = current_pcb.sched_info().inner_lock_write_irqsave();
         guard.set_state(ProcessState::Runnable);
@@ -70,20 +103,28 @@ impl PageFaultHandler {
         let vm_flags = *guard.vm_flags();
         drop(guard);
         if unlikely(vm_flags.contains(VmFlags::VM_HUGETLB)) {
-            //TODO: 添加handle_hugetlb_fault
+            //TODO: 添加handle_hugetlb_fault处理大页缺页异常
         } else {
-            Self::handle_normal_fault(vma.clone(), mapper, address, flags);
+            Self::handle_normal_fault(pfm, mapper);
         }
 
         VmFaultReason::VM_FAULT_COMPLETED
     }
 
+    /// 处理普通页缺页异常
+    /// ## 参数
+    ///
+    /// - `pfm`: 缺页异常信息
+    /// - `mapper`: 页表映射器
+    ///
+    /// ## 返回值
+    /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn handle_normal_fault(
-        vma: Arc<LockedVMA>,
+        pfm: PageFaultMessage,
         mapper: &mut PageMapper,
-        address: VirtAddr,
-        flags: FaultFlags,
     ) -> VmFaultReason {
+        let address = pfm.address;
+        let vma = pfm.vma.clone();
         if mapper.get_entry(address, 3).is_none() {
             mapper
                 .allocate_table(address, 2)
@@ -104,25 +145,34 @@ impl PageFaultHandler {
             }
         }
 
-        Self::handle_pte_fault(vma, mapper, address, flags)
+        Self::handle_pte_fault(pfm, mapper)
     }
 
+    /// 处理页表项异常
+    /// ## 参数
+    ///
+    /// - `pfm`: 缺页异常信息
+    /// - `mapper`: 页表映射器
+    ///
+    /// ## 返回值
+    /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn handle_pte_fault(
-        vma: Arc<LockedVMA>,
+        pfm: PageFaultMessage,
         mapper: &mut PageMapper,
-        address: VirtAddr,
-        flags: FaultFlags,
     ) -> VmFaultReason {
+        let address = pfm.address;
+        let flags = pfm.flags;
+        let vma = pfm.vma.clone();
         if let Some(mut entry) = mapper.get_entry(address, 0) {
             if !entry.present() {
-                return Self::do_swap_page(vma, mapper, address, flags);
+                return Self::do_swap_page(pfm, mapper);
             }
             if entry.protnone() && vma.is_accessible() {
-                return Self::do_numa_page(vma, mapper, address, flags);
+                return Self::do_numa_page(pfm, mapper);
             }
             if flags.intersects(FaultFlags::FAULT_FLAG_WRITE | FaultFlags::FAULT_FLAG_UNSHARE) {
                 if !entry.write() {
-                    return Self::do_wp_page(vma, mapper, address);
+                    return Self::do_wp_page(pfm, mapper);
                 } else {
                     entry.set_flags(PageFlags::from_data(MMArch::ENTRY_FLAG_DIRTY));
                 }
@@ -132,20 +182,30 @@ impl PageFaultHandler {
             entry.set_flags(entry.flags().set_access(true));
             pte_table.set_entry(i, entry);
         } else if vma.is_anonymous() {
-            return Self::do_anonymous_page(vma, mapper, address);
+            return Self::do_anonymous_page(pfm, mapper);
         } else {
-            return Self::do_fault(vma, mapper, address, flags);
+            return Self::do_fault(pfm, mapper);
         }
 
         VmFaultReason::VM_FAULT_COMPLETED
     }
 
+    /// 处理匿名映射页缺页异常
+    /// ## 参数
+    ///
+    /// - `pfm`: 缺页异常信息
+    /// - `mapper`: 页表映射器
+    ///
+    /// ## 返回值
+    /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn do_anonymous_page(
-        vma: Arc<LockedVMA>,
+        pfm: PageFaultMessage,
         mapper: &mut PageMapper,
-        address: VirtAddr,
     ) -> VmFaultReason {
-        if let Some(flush) = mapper.map(address, vma.lock().flags()) {
+        let address = pfm.address;
+        let vma = pfm.vma.clone();
+        let guard = vma.lock();
+        if let Some(flush) = mapper.map(address, guard.flags()) {
             flush.flush();
             crate::debug::klog::mm::mm_debug_log(
                 klog_types::AllocatorLogType::LazyAlloc(klog_types::AllocLogItem::new(
@@ -165,41 +225,140 @@ impl PageFaultHandler {
         }
     }
 
-    pub unsafe fn do_fault(
-        _vma: Arc<LockedVMA>,
-        _mapper: &mut PageMapper,
-        _address: VirtAddr,
-        _flags: FaultFlags,
-    ) -> VmFaultReason {
-        panic!("do_fault has not yet been implemented");
+    /// 处理文件映射页的缺页异常
+    /// ## 参数
+    ///
+    /// - `pfm`: 缺页异常信息
+    /// - `mapper`: 页表映射器
+    ///
+    /// ## 返回值
+    /// - VmFaultReason: 页面错误处理信息标志
+    #[allow(unused_variables)]
+    pub unsafe fn do_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+        panic!(
+            "do_fault has not yet been implemented, 
+        fault message: {:?}, 
+        pid: {}\n",
+            pfm,
+            crate::process::ProcessManager::current_pid().data()
+        );
+        // TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#do_fault
     }
 
-    pub unsafe fn do_swap_page(
-        _vma: Arc<LockedVMA>,
-        _mapper: &mut PageMapper,
-        _address: VirtAddr,
-        _flags: FaultFlags,
-    ) -> VmFaultReason {
-        panic!("do_swap_page has not yet been implemented");
+    /// 处理私有文件映射的写时复制
+    /// ## 参数
+    ///
+    /// - `pfm`: 缺页异常信息
+    /// - `mapper`: 页表映射器
+    ///
+    /// ## 返回值
+    /// - VmFaultReason: 页面错误处理信息标志
+    #[allow(dead_code, unused_variables)]
+    pub unsafe fn do_cow_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+        panic!(
+            "do_cow_fault has not yet been implemented, 
+        fault message: {:?}, 
+        pid: {}\n",
+            pfm,
+            crate::process::ProcessManager::current_pid().data()
+        );
+        // TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#do_cow_fault
     }
 
-    pub unsafe fn do_numa_page(
-        _vma: Arc<LockedVMA>,
-        _mapper: &mut PageMapper,
-        _address: VirtAddr,
-        _flags: FaultFlags,
-    ) -> VmFaultReason {
-        panic!("do_numa_page has not yet been implemented");
+    /// 处理文件映射页的缺页异常
+    /// ## 参数
+    ///
+    /// - `pfm`: 缺页异常信息
+    /// - `mapper`: 页表映射器
+    ///
+    /// ## 返回值
+    /// - VmFaultReason: 页面错误处理信息标志
+    #[allow(dead_code, unused_variables)]
+    pub unsafe fn do_read_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+        panic!(
+            "do_read_fault has not yet been implemented, 
+        fault message: {:?}, 
+        pid: {}\n",
+            pfm,
+            crate::process::ProcessManager::current_pid().data()
+        );
+        // TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#do_read_fault
     }
 
-    pub unsafe fn do_wp_page(
-        vma: Arc<LockedVMA>,
-        mapper: &mut PageMapper,
-        address: VirtAddr,
-    ) -> VmFaultReason {
+    /// 处理对共享文件映射区写入引起的缺页
+    /// ## 参数
+    ///
+    /// - `pfm`: 缺页异常信息
+    /// - `mapper`: 页表映射器
+    ///
+    /// ## 返回值
+    /// - VmFaultReason: 页面错误处理信息标志
+    #[allow(dead_code, unused_variables)]
+    pub unsafe fn do_shared_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+        panic!(
+            "do_shared_fault has not yet been implemented, 
+        fault message: {:?}, 
+        pid: {}\n",
+            pfm,
+            crate::process::ProcessManager::current_pid().data()
+        );
+        // TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#do_shared_fault
+    }
+
+    /// 处理被置换页面的缺页异常
+    /// ## 参数
+    ///
+    /// - `pfm`: 缺页异常信息
+    /// - `mapper`: 页表映射器
+    ///
+    /// ## 返回值
+    /// - VmFaultReason: 页面错误处理信息标志
+    #[allow(unused_variables)]
+    pub unsafe fn do_swap_page(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+        panic!(
+            "do_swap_page has not yet been implemented, 
+        fault message: {:?}, 
+        pid: {}\n",
+            pfm,
+            crate::process::ProcessManager::current_pid().data()
+        );
+        // TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#do_swap_page
+    }
+
+    /// 处理NUMA的缺页异常
+    /// ## 参数
+    ///
+    /// - `pfm`: 缺页异常信息
+    /// - `mapper`: 页表映射器
+    ///
+    /// ## 返回值
+    /// - VmFaultReason: 页面错误处理信息标志
+    #[allow(unused_variables)]
+    pub unsafe fn do_numa_page(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+        panic!(
+            "do_numa_page has not yet been implemented, 
+        fault message: {:?}, 
+        pid: {}\n",
+            pfm,
+            crate::process::ProcessManager::current_pid().data()
+        );
+        // TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#do_numa_page
+    }
+
+    /// 处理写保护页面的写保护异常
+    /// ## 参数
+    ///
+    /// - `pfm`: 缺页异常信息
+    /// - `mapper`: 页表映射器
+    ///
+    /// ## 返回值
+    /// - VmFaultReason: 页面错误处理信息标志
+    pub unsafe fn do_wp_page(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+        let address = pfm.address;
+        let vma = pfm.vma.clone();
         let old_paddr = mapper.translate(address).unwrap().0;
         let mut page_manager = page_manager_lock_irqsave();
-        let map_count = page_manager.get_mut(&old_paddr).map_count;
+        let map_count = page_manager.get_mut(&old_paddr).map_count();
         drop(page_manager);
 
         let mut entry = mapper.get_entry(address, 0).unwrap();

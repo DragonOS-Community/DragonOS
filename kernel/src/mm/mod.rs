@@ -76,6 +76,7 @@ bitflags! {
         const VM_DONTDUMP = 0x04000000;
     }
 
+    /// 描述页面错误处理过程中发生的不同情况或结果
         pub struct VmFaultReason:u32 {
         const VM_FAULT_OOM = 0x000001;
         const VM_FAULT_SIGBUS = 0x000002;
@@ -779,4 +780,17 @@ pub fn verify_area(addr: VirtAddr, size: usize) -> Result<(), SystemError> {
     }
 
     return Ok(());
+}
+
+pub trait ProtectionKeyTrait {
+    /// ProtectionKey的掩码
+    const PKEY_MASK: usize;
+
+    /// ProtectionKey的偏移量
+    const VM_PKEY_SHIFT: usize;
+
+    /// 获取vma的protection_key
+    fn vma_pkey(_vma: Arc<ucontext::LockedVMA>) -> u16 {
+        0
+    }
 }

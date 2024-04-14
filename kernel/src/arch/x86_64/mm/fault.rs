@@ -10,14 +10,14 @@ use crate::{
     arch::{
         interrupt::{trap::X86PfErrorCode, TrapFrame},
         mm::{MemoryManagementArch, X86_64MMArch},
-        CurrentIrqArch, MMArch,
+        CurrentIrqArch, MMArch, ProtectionKey,
     },
     exception::InterruptArch,
     kerror,
     mm::{
-        fault::{FaultFlags, PageFault, PageFaultHandler},
+        fault::{FaultFlags, PageFault, PageFaultHandler, PageFaultMessage},
         ucontext::{AddressSpace, LockedVMA},
-        VirtAddr, VmFaultReason, VmFlags,
+        ProtectionKeyTrait, VirtAddr, VmFaultReason, VmFlags,
     },
 };
 
@@ -41,8 +41,7 @@ impl PageFault for X86_64PageFault {
         if foreign | vma.is_foreign() {
             return true;
         }
-        let guard = vma.lock();
-        super::pkru::pkru_allows_pkey(guard.pkey(), write)
+        super::pkey::pkru_allows_pkey(ProtectionKey::vma_pkey(vma), write)
     }
 }
 
@@ -160,13 +159,35 @@ impl X86_64PageFault {
         panic!()
     }
 
+    /// 内核态缺页异常处理
+    /// ## 参数
+    ///
+    /// - `regs`: 中断栈帧
+    /// - `error_code`: 错误标志
+    /// - `address`: 发生缺页异常的虚拟地址
     pub fn do_kern_addr_fault(
         _regs: &'static TrapFrame,
-        _error_code: X86PfErrorCode,
-        _address: VirtAddr,
+        error_code: X86PfErrorCode,
+        address: VirtAddr,
     ) {
+        panic!(
+            "do_kern_addr_fault has not yet been implemented, 
+        fault address: {:#x}, 
+        error_code: {:#b}, 
+        pid: {}\n",
+            address.data(),
+            error_code,
+            crate::process::ProcessManager::current_pid().data()
+        );
+        //TODO https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/mm/fault.c#do_kern_addr_fault
     }
 
+    /// 用户态缺页异常处理
+    /// ## 参数
+    ///
+    /// - `regs`: 中断栈帧
+    /// - `error_code`: 错误标志
+    /// - `address`: 发生缺页异常的虚拟地址
     pub unsafe fn do_user_addr_fault(
         regs: &'static TrapFrame,
         error_code: X86PfErrorCode,
@@ -242,7 +263,14 @@ impl X86_64PageFault {
             }
             let mapper = &mut space_guard.user_mapper.utable;
 
-            fault = PageFaultHandler::handle_mm_fault(vma.clone(), mapper, address, flags, regs);
+            fault = PageFaultHandler::handle_mm_fault(
+                PageFaultMessage {
+                    vma: vma.clone(),
+                    address,
+                    flags,
+                },
+                mapper,
+            );
 
             if fault.contains(VmFaultReason::VM_FAULT_COMPLETED) {
                 return;

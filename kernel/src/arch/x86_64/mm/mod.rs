@@ -1,7 +1,7 @@
 pub mod barrier;
 pub mod bump;
 pub mod fault;
-pub mod pkru;
+pub mod pkey;
 
 use alloc::vec::Vec;
 use hashbrown::HashSet;

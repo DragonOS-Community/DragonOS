@@ -229,6 +229,7 @@ impl InnerAddressSpace {
     /// - `prot_flags`：保护标志
     /// - `map_flags`：映射标志
     /// - `round_to_min`：是否将`start_vaddr`对齐到`mmap_min`，如果为`true`，则当`start_vaddr`不为0时，会对齐到`mmap_min`，否则仅向下对齐到页边界
+    /// - `allocate_at_once`：是否立即分配物理空间
     ///
     /// ## 返回
     ///
@@ -598,7 +599,7 @@ impl InnerAddressSpace {
             if let Some(after) = split_result.after {
                 self.mappings.insert_vma(after);
             }
-            r.do_advise(behavior, mapper, &mut flusher)?;
+            r.do_madvise(behavior, mapper, &mut flusher)?;
             self.mappings.insert_vma(r);
         }
         Ok(())
@@ -763,9 +764,14 @@ impl UserMappings {
         return None;
     }
 
-    /// 判断当前进程的VMA内，是否有包含指定的虚拟地址的VMA。
+    /// 向下寻找距离虚拟地址最近的VMA
+    /// ## 参数
     ///
-    /// 如果有，返回包含指定虚拟地址的VMA的Arc指针，否则返回None。
+    /// - `vaddr`: 虚拟地址
+    ///
+    /// ## 返回值
+    /// - Some(Arc<LockedVMA>): 虚拟地址所在的或最近的下一个VMA
+    /// - None: 未找到VMA
     #[allow(dead_code)]
     pub fn find_nearest(&self, vaddr: VirtAddr) -> Option<Arc<LockedVMA>> {
         let mut nearest: Option<Arc<LockedVMA>> = None;
@@ -1036,27 +1042,28 @@ impl LockedVMA {
         let mut page_manager_guard: SpinLockGuard<'_, crate::mm::page::PageManager> =
             page_manager_lock_irqsave();
         for page in guard.region.pages() {
-            if mapper.translate(page.virt_address()).is_some() {
-                let (paddr, _, flush) = unsafe { mapper.unmap_phys(page.virt_address(), true) }
-                    .expect("Failed to unmap, beacuse of some page is not mapped");
-
-                // 从anon_vma中删除当前VMA
-                let page = page_manager_guard.get_mut(&paddr);
-                page.remove_vma(self);
-
-                // 如果物理页的anon_vma链表长度为0并且不是共享页，则释放物理页.
-                if page.can_deallocate() {
-                    unsafe {
-                        deallocate_page_frames(
-                            PhysPageFrame::new(paddr),
-                            PageFrameCount::new(1),
-                            &mut page_manager_guard,
-                        )
-                    };
-                }
-
-                flusher.consume(flush);
+            if mapper.translate(page.virt_address()).is_none() {
+                continue;
             }
+            let (paddr, _, flush) = unsafe { mapper.unmap_phys(page.virt_address(), true) }
+                .expect("Failed to unmap, beacuse of some page is not mapped");
+
+            // 从anon_vma中删除当前VMA
+            let page = page_manager_guard.get_mut(&paddr);
+            page.remove_vma(self);
+
+            // 如果物理页的anon_vma链表长度为0并且不是共享页，则释放物理页.
+            if page.can_deallocate() {
+                unsafe {
+                    deallocate_page_frames(
+                        PhysPageFrame::new(paddr),
+                        PageFrameCount::new(1),
+                        &mut page_manager_guard,
+                    )
+                };
+            }
+
+            flusher.consume(flush);
         }
         guard.mapped = false;
     }
@@ -1145,34 +1152,34 @@ impl LockedVMA {
         ));
     }
 
+    /// 判断VMA是否为外部（非当前进程空间）的VMA
     pub fn is_foreign(&self) -> bool {
         let guard = self.lock();
         if let Some(space) = guard.user_address_space.clone() {
             if let Some(space) = space.upgrade() {
-                if AddressSpace::is_current(&space) {
-                    return true;
-                }
+                return AddressSpace::is_current(&space);
             } else {
                 return true;
             }
         } else {
             return true;
         }
-
-        false
     }
 
+    /// 判断VMA是否可访问
     pub fn is_accessible(&self) -> bool {
         let guard = self.lock();
         let vm_access_flags: VmFlags = VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_EXEC;
         guard.vm_flags().intersects(vm_access_flags)
     }
 
+    /// 判断VMA是否为匿名映射
     pub fn is_anonymous(&self) -> bool {
         //TODO: 实现匿名映射判断逻辑，目前仅支持匿名映射
         true
     }
 
+    /// 判断VMA是否为大页映射
     pub fn is_hugepage(&self) -> bool {
         //TODO: 实现巨页映射判断逻辑，目前不支持巨页映射
         false
@@ -1488,12 +1495,6 @@ impl VMA {
         }
         // kdebug!("VMA::zeroed: done");
         return Ok(r);
-    }
-
-    pub fn pkey(&self) -> u16 {
-        let pkey_mask: u64 = 1 << 32 | 1 << 33 | 1 << 34 | 1 << 35;
-        let pkey_shift = 32;
-        ((self.vm_flags.bits() & pkey_mask) >> pkey_shift) as u16
     }
 }
 

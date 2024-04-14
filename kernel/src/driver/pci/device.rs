@@ -14,7 +14,7 @@ use crate::{
             kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        pci_driver::{dev_id::PciDeviceID, pci_device::{pci_device_manager, PciDevice}, test::pt_device::InnerPciDevice},
+        pci_driver::{dev_id::{PciDeviceID, PciSpecifiedData}, pci_device::{pci_device_manager, PciDevice}, test::pt_device::InnerPciDevice}, virtio::driver::{virtio_driver_init, VirtioMatchId},
     },
     filesystem::kernfs::KernFSInode,
     libs::
@@ -25,6 +25,8 @@ use crate::{
 use super::pci::{ PciDeviceStructureGeneralDevice, PciDeviceStructureHeader, PCI_DEVICE_LINKEDLIST};
 static NAME_SEQ: AtomicU16 = AtomicU16::new(0);
 #[derive(Debug)]
+#[cast_to([sync] Device)]
+#[cast_to([sync] PciDevice)]
 pub struct PciRawGeneralDevice {
     inner: RwLock<InnerPciDevice>,
     kobj_state: LockedKObjectState,
@@ -40,7 +42,8 @@ impl From<&PciDeviceStructureGeneralDevice> for PciRawGeneralDevice {
         let value=&value.common_header;
         let kobj_state = LockedKObjectState::new(None);
         let inner = RwLock::new(InnerPciDevice::default());
-        let dev_id=PciDeviceID::new(value.vendor_id,value.device_id,0,0,value.class_code,0,0,0);
+        let mut dev_id=PciDeviceID::dummpy();
+        dev_id.set_special(PciSpecifiedData::Virtio(VirtioMatchId::new(value.class_code,value.subclass)));
         let seq=NAME_SEQ.load(core::sync::atomic::Ordering::SeqCst);
         let name=format!("PciRaw{:?}",seq);
         NAME_SEQ.store(seq+1, core::sync::atomic::Ordering::SeqCst);
@@ -51,8 +54,9 @@ impl From<&PciDeviceStructureGeneralDevice> for PciRawGeneralDevice {
 }
 
 impl PciDevice for PciRawGeneralDevice {
-    fn dynid(&self) -> crate::driver::pci_driver::dev_id::PciDeviceID {
-        todo!()
+    fn dynid(&self) -> PciDeviceID {
+        kdebug!("114514");
+        self.dev_id
     }
 }
 
@@ -178,10 +182,12 @@ impl KObject for PciRawGeneralDevice {
 
 #[inline(never)]
 pub fn pci_device_search(){
+    virtio_driver_init();
     for i in PCI_DEVICE_LINKEDLIST.read().iter(){
         if let Some(dev) = i.as_standard_device(){
             let raw_dev=PciRawGeneralDevice::from(dev);
             let _ =pci_device_manager().device_add(Arc::new(raw_dev));
+            
         }else{
             continue;
         }

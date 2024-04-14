@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use system_error::SystemError;
 
-use crate::driver::base::device::{device_manager, Device};
+use crate::driver::{base::device::{device_manager, Device}, virtio::driver::virtio_driver_init};
 
 use self::{pt_device::TestDevice, pt_driver::TestDriver};
 
@@ -21,7 +21,7 @@ pub fn pt_init() -> Result<(), SystemError> {
     let mut drv = TestDriver::new();
     drv.add_dynid(PciDeviceID::dummpy())?;
     let tdrv = Arc::new(drv);
-    device_manager().device_default_initialize(&(tdev.clone() as Arc<dyn Device>));
+    
     let _ = pci_device_manager().device_add(tdev.clone());
     let _ = pci_driver_manager().register(tdrv.clone());
     unsafe {

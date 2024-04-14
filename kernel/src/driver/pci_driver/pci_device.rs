@@ -37,8 +37,9 @@ impl PciDeviceManager {
                 &(pci_bus_device() as Arc<dyn KObject>),
             )));
         }
-
+        
         pci_dev.set_bus(Some(Arc::downgrade(&(pci_bus() as Arc<dyn Bus>))));
+        device_manager().device_default_initialize(&(pci_dev.clone() as Arc<dyn Device>));
         //我还要实现一个bus的添加
         let r = device_manager().add_device(pci_dev.clone() as Arc<dyn Device>);
 

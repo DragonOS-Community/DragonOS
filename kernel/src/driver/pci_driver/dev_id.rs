@@ -1,8 +1,12 @@
+use core::any::Any;
+
 use alloc::sync::Arc;
+
+use crate::driver::virtio::driver::{VirtioMatchId};
 
 use super::pci_device::PciDevice;
 const PCI_ANY_ID: u32 = 0xffff_ffff;
-#[derive(Debug)]
+#[derive(Debug,Copy,Clone)]
 pub struct PciDeviceID {
     vendor: u32,
     device_id: u32,
@@ -12,29 +16,12 @@ pub struct PciDeviceID {
     class_mask: u32,
     _driver_data: u64,
     _override_only: u32,
+    special_data:Option<PciSpecifiedData>,
 }
 
 impl PciDeviceID {
-    pub fn new(
-        vendor: u16,
-        device_id: u16,
-        subvendor: u16,
-        subdevice: u16,
-        class: u8,
-        class_mask: u16,
-        driver_data: u64,
-        override_only: u32,
-    ) -> Self {
-        Self {
-            vendor: vendor as u32,
-            device_id: device_id as u32,
-            subvendor: subvendor as u32,
-            subdevice: subdevice as u32,
-            class: class as u32,
-            class_mask: class_mask as u32,
-            _driver_data: driver_data,
-            _override_only: override_only,
-        }
+    pub fn set_special(&mut self,data:PciSpecifiedData){
+        self.special_data = Some(data);
     }
 
     pub fn dummpy() -> Self {
@@ -47,15 +34,27 @@ impl PciDeviceID {
             class_mask: PCI_ANY_ID,
             _driver_data: 0,
             _override_only: PCI_ANY_ID,
+            special_data:None,
         };
     }
     pub fn match_dev(&self, dev: &Arc<dyn PciDevice>) -> bool {
-        let d_id = dev.dynid();
-        if (self.vendor == d_id.vendor() || self.vendor == PCI_ANY_ID)
-            && (self.device_id == d_id.device_id() || self.device_id == PCI_ANY_ID)
-            && (self.subvendor == d_id.subvendor() || self.subvendor == PCI_ANY_ID)
-            && (self.subdevice == d_id.subdevice() || self.subdevice == PCI_ANY_ID)
-            && self.class_check(&d_id)
+        if let Some(d_data) = &dev.dynid().special_data{
+            return d_data.match_dev(self.special_data);
+        }
+        if let Some(s_data) = &self.special_data {
+            return  s_data.match_dev(dev.dynid().special_data);
+        }else{
+            let d_id = dev.dynid();
+            return self.general_match(d_id);
+        }
+    }
+
+    pub fn general_match(&self,id:PciDeviceID)->bool{
+        if (self.vendor == id.vendor() || self.vendor == PCI_ANY_ID)
+            && (self.device_id == id.device_id() || self.device_id == PCI_ANY_ID)
+            && (self.subvendor == id.subvendor() || self.subvendor == PCI_ANY_ID)
+            && (self.subdevice == id.subdevice() || self.subdevice == PCI_ANY_ID)
+            && self.class_check(&id)
         {
             return true;
         }
@@ -92,5 +91,20 @@ impl PciDeviceID {
 
     pub fn class_mask(&self) -> u32 {
         self.class_mask
+    }
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord,Debug,Copy,Clone)]
+pub enum PciSpecifiedData{
+    Virtio(VirtioMatchId)
+}
+
+impl PciSpecifiedData{
+    pub fn match_dev(&self,data:Option<Self>)->bool{
+        if let Some(data) = data{
+            return *self==data
+        }else{
+            return false;
+        }
     }
 }

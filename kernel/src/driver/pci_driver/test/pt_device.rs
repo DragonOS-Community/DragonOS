@@ -51,6 +51,7 @@ impl TestDevice {
 
 impl PciDevice for TestDevice {
     fn dynid(&self) -> crate::driver::pci_driver::dev_id::PciDeviceID {
+        kdebug!("114514");
         PciDeviceID::dummpy()
     }
 }

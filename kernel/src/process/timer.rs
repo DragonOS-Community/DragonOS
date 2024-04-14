@@ -5,32 +5,25 @@ use crate::process::CurrentIrqArch;
 use crate::process::Pid;
 use crate::process::SigInfo;
 use crate::sched::{schedule, SchedMode};
-use crate::time::timer::{
-    clock, n_ms_jiffies, next_n_jiffies_tiemr_jiffies, next_n_us_timer_jiffies, timer_jiffies_n_ms,
-    Timer, TimerFunction,
-};
+use crate::time::timer::{clock, Jiffies, Timer, TimerFunction};
 use alloc::{boxed::Box, sync::Arc};
-use core::sync::atomic::compiler_fence;
 use core::time::Duration;
 use system_error::SystemError;
 
-use super::ProcessManager;
-
 //Jiffies结构体表示一段时间的jiffies
-pub struct Jiffies {
-    jiffies: u64,
-}
 
 #[derive(Debug)]
 pub struct AlarmTimer {
     pub timer: Arc<Timer>,
+    expired_second: u64,
 }
 
 impl AlarmTimer {
-    pub fn new(timer_func: Box<dyn TimerFunction>) -> Self {
-        let expire_jiffies = next_n_us_timer_jiffies(0);
+    pub fn new(timer_func: Box<dyn TimerFunction>, second: u64) -> Self {
+        let expired_jiffies = Jiffies::from(Duration::from_secs(second)).timer_jiffies();
         let result = AlarmTimer {
-            timer: Timer::new(timer_func, expire_jiffies),
+            timer: Timer::new(timer_func, expired_jiffies),
+            expired_second: second,
         };
         result
     }
@@ -49,11 +42,17 @@ impl AlarmTimer {
         if self.timer.timeout() {
             Duration::ZERO
         } else {
-            let now_time = clock();
-            let end_time = self.timer.inner().expire_jiffies;
-            let remain_jiffies = Jiffies::new(end_time - now_time);
-            let second = remain_jiffies.jiffies_duration();
-            second
+            let now_jiffies = clock();
+            let end_jiffies =
+                Jiffies::from(Duration::from_secs(self.expired_second)).timer_jiffies();
+            let remain_second = Duration::from(Jiffies::new(end_jiffies - now_jiffies));
+            kdebug!(
+                "end: {} - now: {} = remain: {}",
+                end_jiffies,
+                now_jiffies,
+                end_jiffies - now_jiffies
+            );
+            remain_second
         }
     }
 
@@ -61,17 +60,17 @@ impl AlarmTimer {
         self.timer.cancel();
     }
 
-    pub fn restart(&self, jiffies: Jiffies) {
-        kdebug!("now:{}", clock());
-        let new_expired_jiffies = jiffies.expire_jiffies();
-        let timer = self.timer.clone();
-        let mut innertimer = timer.inner();
-        innertimer.expire_jiffies = new_expired_jiffies;
-        innertimer.triggered = false;
-        drop(innertimer);
-        kdebug!("begin run again!");
-        timer.activate();
-    }
+    // pub fn restart(&self, jiffies: Jiffies) {
+    //     kdebug!("now:{}", clock());
+    //     let new_expired_jiffies = jiffies.expire_jiffies();
+    //     let timer = self.timer.clone();
+    //     let mut innertimer = timer.inner();
+    //     innertimer.expire_jiffies = new_expired_jiffies;
+    //     innertimer.triggered = false;
+    //     drop(innertimer);
+    //     kdebug!("begin run again!");
+    //     timer.activate();
+    // }
 }
 
 //闹钟定时器的TimerFuntion
@@ -107,39 +106,11 @@ impl TimerFunction for AlarmTimerFunc {
 }
 
 //初始化目标进程的alarm定时器
-pub fn alarm_timer_init(pid: Pid) -> AlarmTimer {
+//second是alarm设置的秒数
+pub fn alarm_timer_init(pid: Pid, second: u64) -> AlarmTimer {
     //初始化Timerfunc
     let timerfunc = AlarmTimerFunc::new(pid);
-    let alarmtimer = AlarmTimer::new(timerfunc);
+    let alarmtimer = AlarmTimer::new(timerfunc, second);
     alarmtimer.activate();
     alarmtimer
-}
-
-impl Jiffies {
-    //使用一段jiffies初始化
-    pub fn new(jiffies: u64) -> Self {
-        let result = Jiffies { jiffies };
-        result
-    }
-    //使用ms初始化
-    pub fn new_from_duration(ms: Duration) -> Self {
-        let jiffies = n_ms_jiffies(ms.as_millis() as u64);
-        let result = Jiffies { jiffies };
-        result
-    }
-    //返回jiffies
-    pub fn inner_jiffies(&self) -> u64 {
-        self.jiffies
-    }
-    //jiffies转一段时间duration
-    pub fn jiffies_duration(&self) -> Duration {
-        let ms = timer_jiffies_n_ms(self.jiffies);
-        let result = Duration::from_millis(ms);
-        result
-    }
-    //返回一段jiffies对应的定时器时间片
-    pub fn expire_jiffies(&self) -> u64 {
-        let result = next_n_jiffies_tiemr_jiffies(self.inner_jiffies());
-        result
-    }
 }

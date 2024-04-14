@@ -25,12 +25,18 @@ fn main() {
     //并test第三个alarm定时器能否正常运行
 
     unsafe {
-        let remaining = syscall(SYS_alarm, 1);
+        let remaining = syscall(SYS_alarm, 5);
+        println!("Remaining time for previous alarm: {}", remaining);
+    }
+    println!("Alarm set for 5 seconds");
+    unsafe {
+        let remaining = syscall(SYS_alarm, 3);
         println!("Remaining time for previous alarm: {}", remaining);
     }
     unsafe {
-        sleep(6);
+        sleep(4);
     }
+    println!("Alarm set for 3 seconds");
 
     println!("Test 2 complete");
 }

@@ -2,6 +2,7 @@ use core::{
     fmt::Debug,
     intrinsics::unlikely,
     sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering},
+    time::Duration,
 };
 
 use alloc::{
@@ -37,6 +38,47 @@ lazy_static! {
 /// 定时器要执行的函数的特征
 pub trait TimerFunction: Send + Sync + Debug {
     fn run(&mut self) -> Result<(), SystemError>;
+}
+
+pub struct Jiffies {
+    jiffies: u64,
+}
+
+impl Jiffies {
+    //使用一段jiffies初始化
+    pub fn new(jiffies: u64) -> Self {
+        let result = Jiffies { jiffies };
+        result
+    }
+
+    //返回jiffies
+    pub fn inner_jiffies(&self) -> u64 {
+        self.jiffies
+    }
+
+    //返回接下来的n_jiffies对应的定时器时间片
+    pub fn timer_jiffies(&self) -> u64 {
+        let result = TIMER_JIFFIES.load(Ordering::SeqCst) + self.inner_jiffies();
+        result
+    }
+}
+
+//Jiffies转Duration
+impl From<Jiffies> for Duration {
+    fn from(jiffies: Jiffies) -> Self {
+        let ms = jiffies.inner_jiffies() / 1_000_000 * NSEC_PER_JIFFY as u64;
+        let result = Duration::from_millis(ms);
+        result
+    }
+}
+
+//Duration转Jiffies
+impl From<Duration> for Jiffies {
+    fn from(ms: Duration) -> Self {
+        let jiffies = ms.as_millis() as u64 * 1_000_000 / NSEC_PER_JIFFY as u64;
+        let result = Jiffies { jiffies };
+        result
+    }
 }
 
 #[derive(Debug)]
@@ -245,18 +287,6 @@ pub fn next_n_ms_timer_jiffies(expire_ms: u64) -> u64 {
 /// 计算接下来n微秒对应的定时器时间片
 pub fn next_n_us_timer_jiffies(expire_us: u64) -> u64 {
     return TIMER_JIFFIES.load(Ordering::SeqCst) + expire_us * 1000 / NSEC_PER_JIFFY as u64;
-}
-/// 计算接下来njiffies对应的定时器时间片
-pub fn next_n_jiffies_tiemr_jiffies(expire_jiffies: u64) -> u64 {
-    return TIMER_JIFFIES.load(Ordering::SeqCst) + expire_jiffies;
-}
-/// 计算定时器时间片对应的微秒数
-pub fn timer_jiffies_n_ms(jiffies: u64) -> u64 {
-    return jiffies / 1_000_000 * NSEC_PER_JIFFY as u64;
-}
-/// 计算n毫秒对应的jiffies
-pub fn n_ms_jiffies(ms: u64) -> u64 {
-    return ms * 1000000 / NSEC_PER_JIFFY as u64;
 }
 
 /// @brief 让pcb休眠timeout个jiffies

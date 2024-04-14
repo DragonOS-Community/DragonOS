@@ -7,10 +7,7 @@ use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 use crate::{
-    process::{
-        timer::{alarm_timer_init, Jiffies},
-        ProcessManager,
-    },
+    process::{timer::alarm_timer_init, ProcessManager},
     syscall::{user_access::UserBufferWriter, Syscall},
     time::{sleep::nanosleep, PosixTimeSpec},
 };
@@ -158,32 +155,36 @@ impl Syscall {
 
         return Ok(0);
     }
-
-    pub fn alarm(expire_second: u32) -> Result<usize, SystemError> {
+    /// @brief 设置alarm（单位：秒）
+    ///
+    /// @param expired_second设置alarm的秒数
+    pub fn alarm(expired_second: u32) -> Result<usize, SystemError> {
         //初始化second
-        let second = Duration::from_secs(expire_second as u64);
+        let second = Duration::from_secs(expired_second as u64);
         let pcb = ProcessManager::current_pcb();
         let mut pcb_alarm = pcb.ref_alarm_timer();
         let alarm = pcb_alarm.as_ref();
+        if alarm.is_none() {
+            let pid = ProcessManager::current_pid();
+            let new_alarm = Some(alarm_timer_init(pid, 0));
+            *pcb_alarm = new_alarm;
+            drop(pcb_alarm);
+            return Ok(0);
+        }
+        let mut remain = Duration::ZERO;
         if let Some(alarmtimer) = alarm {
-            let remain = alarmtimer.remain();
+            remain = alarmtimer.remain();
             if second.is_zero() {
                 alarmtimer.cancel();
-                return Ok(remain.as_secs() as usize);
             }
             if !alarmtimer.timeout() {
                 alarmtimer.cancel();
             }
-            //重启alarm
-            let new_expired_jiffies = Jiffies::new_from_duration(second);
-            alarmtimer.restart(new_expired_jiffies);
-            let runtime = alarmtimer.timer.inner().expire_jiffies;
-            kdebug!("runtime:{}", runtime);
-            return Ok(remain.as_secs() as usize);
         };
         let pid = ProcessManager::current_pid();
-        let new_alarm = Some(alarm_timer_init(pid));
+        let new_alarm = Some(alarm_timer_init(pid, second.as_secs()));
         *pcb_alarm = new_alarm;
-        Ok(0)
+        drop(pcb_alarm);
+        Ok(remain.as_secs() as usize)
     }
 }

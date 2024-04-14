@@ -526,10 +526,6 @@ pub fn send_to_default_serial8250_port(s: &[u8]) {
 
     #[cfg(target_arch = "riscv64")]
     {
-        if unsafe { INITIALIZED } {
-            todo!("riscv64: send_to_default_serial8250_port")
-        } else {
-            crate::arch::driver::sbi::console_putstr(s);
-        }
+        crate::arch::driver::sbi::console_putstr(s);
     }
 }

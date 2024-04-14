@@ -11,8 +11,8 @@ use crate::{kdebug, kerror, kwarn};
 use alloc::sync::Arc;
 use alloc::{boxed::Box, collections::LinkedList};
 use virtio_drivers::transport::{DeviceType, Transport};
-const NETWORK_CLASS: u8 = 0x2;
-const ETHERNET_SUBCLASS: u8 = 0x0;
+pub const NETWORK_CLASS: u8 = 0x2;
+pub const ETHERNET_SUBCLASS: u8 = 0x0;
 
 //Virtio设备寻找过程中出现的问题
 enum VirtioError {

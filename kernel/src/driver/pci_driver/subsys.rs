@@ -62,8 +62,11 @@ impl Bus for PciBus {
             SystemError::EINVAL
         })?;
         //见https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/pci/pci-driver.c#324
+        kdebug!("114514:before match");
         let id = pci_drv.match_dev(&pci_dev).ok_or(SystemError::EINVAL)?;
+        kdebug!("114514:after match");
         pci_drv.probe(&pci_dev, &id)
+        
     }
 
     fn remove(

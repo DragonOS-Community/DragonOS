@@ -1,9 +1,22 @@
 use alloc::{string::{String, ToString}, sync::{Arc, Weak}, vec::Vec};
+use system_error::SystemError;
 
-use crate::{driver::{base::{device::{bus::Bus, driver::Driver, Device, IdTable}, kobject::{KObjType, KObject, KObjectState, LockedKObjectState}, kset::KSet}, pci_driver::{dev_id::PciDeviceID, pci_driver::PciDriver, test::pt_driver::InnerPciDriver}}, filesystem::kernfs::KernFSInode, libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard}};
+use crate::{driver::{base::{device::{bus::Bus, driver::Driver, Device, IdTable}, kobject::{KObjType, KObject, KObjectState, LockedKObjectState}, kset::KSet}, pci_driver::{dev_id::{PciDeviceID, PciSpecifiedData}, pci_driver::{pci_driver_manager, PciDriver}, test::pt_driver::InnerPciDriver}}, filesystem::kernfs::KernFSInode, libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard}};
+
+use super::virtio::{ETHERNET_SUBCLASS, NETWORK_CLASS};
+
+pub fn virtio_driver_init()->Result<(),SystemError>{
+    let mut drv=VirtIODriver::new();
+    let mut support_id=PciDeviceID::dummpy();
+    support_id.set_special(PciSpecifiedData::Virtio(VirtioMatchId { subclass: ETHERNET_SUBCLASS, class_code: NETWORK_CLASS }));
+    drv.add_dynid(support_id)?;
+    pci_driver_manager().register(Arc::new(drv))
+
+}
 
 
 #[derive(Debug)]
+#[cast_to([sync] PciDriver)]
 pub struct VirtIODriver{
     inner: RwLock<InnerPciDriver>,
     kobj_state: LockedKObjectState,
@@ -168,3 +181,15 @@ impl KObject for VirtIODriver {
         *self.kobj_state.write() = state;
     }
 }
+#[derive(PartialEq, Eq, PartialOrd, Ord,Debug,Copy,Clone)]
+pub struct VirtioMatchId{
+    subclass:u8,
+    class_code:u8,
+}
+
+impl VirtioMatchId{
+    pub fn new(class_code:u8,subclass:u8)->Self{
+        Self { subclass, class_code }
+    }
+}
+

@@ -10,6 +10,7 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 use kdepends::memoffset::offset_of;
+use riscv::register::sstatus::Sstatus;
 use system_error::SystemError;
 
 use crate::{
@@ -18,7 +19,7 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    kerror,
+    kdebug, kerror,
     libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{
@@ -127,6 +128,11 @@ impl ProcessManager {
     /// 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/riscv/include/asm/switch_to.h#76
     pub unsafe fn switch_process(prev: Arc<ProcessControlBlock>, next: Arc<ProcessControlBlock>) {
         assert!(!CurrentIrqArch::is_irq_enabled());
+        kdebug!(
+            "riscv switch process: prev: {:?}, next: {:?}",
+            prev.pid(),
+            next.pid()
+        );
         Self::switch_process_fpu(&prev, &next);
         Self::switch_local_context(&prev, &next);
 
@@ -147,7 +153,7 @@ impl ProcessManager {
         ProcessManager::current_pcb().preempt_enable();
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
-        // kdebug!("switch tss ok");
+        kdebug!("riscv switch process: before to inner");
         compiler_fence(Ordering::SeqCst);
         // 正式切换上下文
         switch_to_inner(prev_arch, next_arch);
@@ -198,6 +204,13 @@ unsafe extern "C" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBI
             sd s10, {off_s10}(a0)
             sd s11, {off_s11}(a0)
 
+            addi sp , sp, -8
+            sd a1, 0(sp)
+            csrr a0, sstatus
+            sd a0, {off_sstatus}(a1)
+            ld a1, 0(sp)
+            addi sp, sp, 8
+
 
             ld sp, {off_sp}(a1)
             ld s0, {off_s0}(a1)
@@ -212,19 +225,32 @@ unsafe extern "C" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBI
             ld s9, {off_s9}(a1)
             ld s10, {off_s10}(a1)
             ld s11, {off_s11}(a1)
+
+            // save a1 temporarily
+            addi sp , sp, -8
+            sd a1, 0(sp)
+
+            ld a0, {off_sstatus}(a1)
+            csrw sstatus, a0
             
             // 将ra设置为标签1，并跳转到before_switch_finish_hook
             la ra, 1f
             j {before_switch_finish_hook}
             
             1:
+
+            // restore a1
+            ld a1, 0(sp)
+            addi sp, sp, 8
             ld sp, {off_sp}(a1)
             ld ra, {off_ra}(a1)
+            
             ret
 
         "
     ), 
     off_ra = const(offset_of!(ArchPCBInfo, ra)),
+    off_sstatus = const(offset_of!(ArchPCBInfo, sstatus)),
     off_sp = const(offset_of!(ArchPCBInfo, ksp)),
     off_s0 = const(offset_of!(ArchPCBInfo, s0)),
     off_s1 = const(offset_of!(ArchPCBInfo, s1)),
@@ -244,7 +270,14 @@ unsafe extern "C" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBI
 
 /// 在切换上下文完成后的钩子函数(必须在这里加一个跳转函数，否则会出现relocation truncated to fit: R_RISCV_JAL错误)
 unsafe extern "C" fn before_switch_finish_hook() {
+    let pcb = ProcessManager::current_pcb();
+    kdebug!(
+        "before_switch_finish_hook, pid: {:?}, name: {:?}",
+        pcb.pid(),
+        pcb.basic().name()
+    );
     switch_finish_hook();
+    kdebug!("after switch_finish_hook");
 }
 
 impl ProcessControlBlock {
@@ -293,6 +326,7 @@ pub struct ArchPCBInfo {
     s9: usize,
     s10: usize,
     s11: usize,
+    sstatus: Sstatus,
 
     fp_state: FpDExtState,
     local_context: LocalContext,
@@ -325,6 +359,7 @@ impl ArchPCBInfo {
             s9: 0,
             s10: 0,
             s11: 0,
+            sstatus: Sstatus::from(0),
             fp_state: FpDExtState::new(),
             local_context: LocalContext::new(ProcessorId::new(0)),
         }

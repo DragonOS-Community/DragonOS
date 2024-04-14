@@ -1,15 +1,18 @@
-use alloc::sync::Arc;
-use riscv::register::sstatus::SPP;
-use system_error::SystemError;
+use core::arch::asm;
 
 use crate::{
-    arch::interrupt::TrapFrame,
+    arch::{asm::csr::CSR_SSTATUS, interrupt::TrapFrame},
     process::{
         fork::CloneFlags,
-        kthread::{KernelThreadCreateInfo, KernelThreadMechanism},
+        kthread::{kernel_thread_bootstrap_stage2, KernelThreadCreateInfo, KernelThreadMechanism},
         Pid, ProcessManager,
     },
 };
+use alloc::sync::Arc;
+use asm_macros::restore_from_x6_to_x31;
+use kdepends::memoffset::offset_of;
+use riscv::register::sstatus::SPP;
+use system_error::SystemError;
 
 impl KernelThreadMechanism {
     /// 伪造trapframe，创建内核线程
@@ -27,7 +30,7 @@ impl KernelThreadMechanism {
             KernelThreadCreateInfo::generate_unsafe_arc_ptr(info.clone());
 
         let mut frame = TrapFrame::new();
-        frame.a0 = create_info as usize;
+        frame.a2 = create_info as usize;
 
         // 使能中断
         frame.status.update_sie(true);
@@ -58,8 +61,60 @@ impl KernelThreadMechanism {
 // pub(super) unsafe extern "C" fn kernel_thread_bootstrap_stage1() {
 //     todo!()
 // }
+#[naked]
 pub(super) unsafe extern "C" fn kernel_thread_bootstrap_stage1() {
     // 这个函数要是naked的，只是因为现在还没有实现，而naked func不能打`unimplemented!()`
     // 所以先写成了普通函数
-    unimplemented!("kernel_thread_bootstrap_stage1")
+    asm!(concat!(
+        "
+            ld x3, {off_gp}(sp)
+            ld x5, {off_t0}(sp)
+
+        ",
+        restore_from_x6_to_x31!(),
+
+        "
+            ld a0, {off_status}(sp)
+            csrw {csr_status}, a0
+            mv a0, a2
+            j {stage2_func}
+        "
+    ),
+        csr_status = const CSR_SSTATUS,
+        off_status = const offset_of!(TrapFrame, status),
+        off_gp = const offset_of!(TrapFrame, gp),
+        off_t0 = const offset_of!(TrapFrame, t0),
+        off_t1 = const offset_of!(TrapFrame, t1),
+        off_t2 = const offset_of!(TrapFrame, t2),
+        off_s0 = const offset_of!(TrapFrame, s0),
+        off_s1 = const offset_of!(TrapFrame, s1),
+        off_a0 = const offset_of!(TrapFrame, a0),
+        off_a1 = const offset_of!(TrapFrame, a1),
+        off_a2 = const offset_of!(TrapFrame, a2),
+        off_a3 = const offset_of!(TrapFrame, a3),
+        off_a4 = const offset_of!(TrapFrame, a4),
+        off_a5 = const offset_of!(TrapFrame, a5),
+        off_a6 = const offset_of!(TrapFrame, a6),
+        off_a7 = const offset_of!(TrapFrame, a7),
+        off_s2 = const offset_of!(TrapFrame, s2),
+        off_s3 = const offset_of!(TrapFrame, s3),
+        off_s4 = const offset_of!(TrapFrame, s4),
+        off_s5 = const offset_of!(TrapFrame, s5),
+        off_s6 = const offset_of!(TrapFrame, s6),
+        off_s7 = const offset_of!(TrapFrame, s7),
+        off_s8 = const offset_of!(TrapFrame, s8),
+        off_s9 = const offset_of!(TrapFrame, s9),
+        off_s10 = const offset_of!(TrapFrame, s10),
+        off_s11 = const offset_of!(TrapFrame, s11),
+        off_t3 = const offset_of!(TrapFrame, t3),
+        off_t4 = const offset_of!(TrapFrame, t4),
+        off_t5 = const offset_of!(TrapFrame, t5),
+        off_t6 = const offset_of!(TrapFrame, t6),
+        stage2_func = sym jump_to_stage2,
+        options(noreturn),
+    );
+}
+
+fn jump_to_stage2(ptr: *const KernelThreadCreateInfo) {
+    unsafe { kernel_thread_bootstrap_stage2(ptr) };
 }

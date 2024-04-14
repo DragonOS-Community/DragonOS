@@ -26,6 +26,7 @@ kvm = []
 # 运行时依赖项
 [dependencies]
 acpi = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/acpi-rs.git", rev = "fb69243dcf" }
+asm_macros = { path = "crates/asm_macros" }
 atomic_enum = "=0.2.0"
 bit_field = "=0.10"
 bitfield-struct = "=0.5.3"
@@ -63,7 +64,7 @@ x86_64 = "=0.14.10"
 
 # target为riscv64时，使用下面的依赖
 [target.'cfg(target_arch = "riscv64")'.dependencies]
-riscv = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/riscv.git", revision = "bf771288c3", features = [ "s-mode" ] }
+riscv = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/riscv.git", revision = "cc4d3ea82a", features = [ "s-mode" ] }
 sbi-rt = { version = "=0.0.3", features = ["legacy"] }
 
 

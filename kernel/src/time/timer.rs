@@ -39,32 +39,44 @@ lazy_static! {
 pub trait TimerFunction: Send + Sync + Debug {
     fn run(&mut self) -> Result<(), SystemError>;
 }
-
+/// # Jiffies结构体
 pub struct Jiffies {
     jiffies: u64,
 }
 
 impl Jiffies {
-    //使用一段jiffies初始化
+    /// # Jiffies结构体初始化
+    ///
+    /// ## 参数
+    ///
+    /// jiffies: 表示一段时间的总的jiffies数（注意不是某一时刻的jiffies）
     pub fn new(jiffies: u64) -> Self {
         let result = Jiffies { jiffies };
         result
     }
 
-    //返回jiffies
+    /// # 返回jiffies
     pub fn inner_jiffies(&self) -> u64 {
         self.jiffies
     }
 
-    //返回接下来的n_jiffies对应的定时器时间片
+    /// 3 返回接下来的n_jiffies对应的定时器时间片
     pub fn timer_jiffies(&self) -> u64 {
         let result = TIMER_JIFFIES.load(Ordering::SeqCst) + self.inner_jiffies();
         result
     }
 }
 
-//Jiffies转Duration
 impl From<Jiffies> for Duration {
+    /// # Jiffies转Duration
+    ///
+    /// ## 参数
+    ///
+    /// jiffies： 一段时间的jiffies数
+    ///
+    /// ### 返回值
+    ///
+    /// Duration： 这段时间的Duration形式
     fn from(jiffies: Jiffies) -> Self {
         let ms = jiffies.inner_jiffies() / 1_000_000 * NSEC_PER_JIFFY as u64;
         let result = Duration::from_millis(ms);
@@ -72,8 +84,16 @@ impl From<Jiffies> for Duration {
     }
 }
 
-//Duration转Jiffies
 impl From<Duration> for Jiffies {
+    /// # Duration 转 Jiffies
+    ///
+    /// ## 参数
+    ///
+    /// ms： 表示一段时间的Duration类型
+    ///
+    /// ### 返回值
+    ///
+    /// Jiffies结构体： 这段时间的Jiffies数
     fn from(ms: Duration) -> Self {
         let jiffies = ms.as_millis() as u64 * 1_000_000 / NSEC_PER_JIFFY as u64;
         let result = Jiffies { jiffies };
@@ -210,7 +230,7 @@ pub struct InnerTimer {
     /// self_ref
     self_ref: Weak<Timer>,
     /// 判断该计时器是否触发
-    pub triggered: bool,
+    triggered: bool,
 }
 
 #[derive(Debug)]

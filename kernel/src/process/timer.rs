@@ -11,15 +11,29 @@ use core::sync::atomic::compiler_fence;
 use core::time::Duration;
 use system_error::SystemError;
 
-//Jiffies结构体表示一段时间的jiffies
-
+/// 闹钟结构体
 #[derive(Debug)]
 pub struct AlarmTimer {
+    /// 闹钟内置定时器
     pub timer: Arc<Timer>,
+    /// 闹钟触发时间
     expired_second: u64,
 }
 
 impl AlarmTimer {
+    /// # 创建闹钟结构体
+    ///  
+    /// 自定义定时器触发函数和截止时间来创建闹钟结构体
+    ///
+    /// ## 函数参数
+    ///
+    /// timer_func：定时器触发函数
+    ///
+    /// second：设置alarm触发的秒数
+    ///
+    /// ### 函数返回值
+    ///
+    /// Self
     pub fn new(timer_func: Box<dyn TimerFunction>, second: u64) -> Self {
         let expired_jiffies = Jiffies::from(Duration::from_secs(second)).timer_jiffies();
         let result = AlarmTimer {
@@ -28,17 +42,17 @@ impl AlarmTimer {
         };
         result
     }
-
+    /// # 启动闹钟
     pub fn activate(&self) {
         let timer = self.timer.clone();
         timer.activate();
     }
-
+    /// # 查看闹钟是否触发
     pub fn timeout(&self) -> bool {
         self.timer.timeout()
     }
 
-    //返回闹钟定时器剩余时间
+    /// # 返回闹钟定时器剩余时间
     pub fn remain(&self) -> Duration {
         if self.timer.timeout() {
             Duration::ZERO
@@ -56,13 +70,17 @@ impl AlarmTimer {
             remain_second
         }
     }
-
+    /// # 取消闹钟
     pub fn cancel(&self) {
         self.timer.cancel();
     }
 }
 
-//闹钟定时器的TimerFuntion
+/// # 闹钟TimerFuntion结构体
+///
+/// ## 结构成员
+///
+/// pid：发送消息的目标进程的pid
 #[derive(Debug)]
 pub struct AlarmTimerFunc {
     pid: Pid,
@@ -75,8 +93,18 @@ impl AlarmTimerFunc {
 }
 
 impl TimerFunction for AlarmTimerFunc {
+    /// # 闹钟触发函数
+    ///  
+    /// 闹钟触发时，向目标进程发送一个SIGALRM信号
+    ///
+    /// ## 函数参数
+    ///
+    /// expired_second：设置alarm触发的秒数
+    ///
+    /// ### 函数返回值
+    ///
+    /// Ok(()): 发送成功
     fn run(&mut self) -> Result<(), SystemError> {
-        kdebug!("run!");
         let sig = Signal::SIGALRM;
         // 初始化signal info
         let mut info = SigInfo::new(sig, 0, SigCode::Timer, SigType::Alarm(self.pid));
@@ -92,8 +120,19 @@ impl TimerFunction for AlarmTimerFunc {
     }
 }
 
-//初始化目标进程的alarm定时器
-//second是alarm设置的秒数
+/// # 初始化目标进程的alarm定时器
+///  
+/// 创建一个闹钟结构体并启动闹钟
+///
+/// ## 函数参数
+///
+/// pid：发送消息的目标进程的pid
+///
+/// second：设置alarm触发的秒数
+///
+/// ### 函数返回值
+///
+/// AlarmTimer结构体
 pub fn alarm_timer_init(pid: Pid, second: u64) -> AlarmTimer {
     //初始化Timerfunc
     let timerfunc = AlarmTimerFunc::new(pid);

@@ -155,14 +155,22 @@ impl Syscall {
 
         return Ok(0);
     }
-    /// @brief 设置alarm（单位：秒）
+    /// # alarm函数功能
+    ///  
+    /// 设置alarm（单位：秒）
     ///
-    /// @param expired_second设置alarm的秒数
+    /// ## 函数参数
+    ///
+    /// expired_second：设置alarm触发的秒数
+    ///
+    /// ### 函数返回值
+    ///
+    /// Ok(usize): 上一个alarm的剩余秒数
     pub fn alarm(expired_second: u32) -> Result<usize, SystemError> {
         //初始化second
         let second = Duration::from_secs(expired_second as u64);
         let pcb = ProcessManager::current_pcb();
-        let mut pcb_alarm = pcb.ref_alarm_timer();
+        let mut pcb_alarm = pcb.alarm_timer_write();
         let alarm = pcb_alarm.as_ref();
         //alarm第一次调用
         if alarm.is_none() {
@@ -186,6 +194,6 @@ impl Syscall {
         let new_alarm = Some(alarm_timer_init(pid, second.as_secs()));
         *pcb_alarm = new_alarm;
         drop(pcb_alarm);
-        Ok(remain.as_secs() as usize)
+        return Ok(remain.as_secs() as usize);
     }
 }

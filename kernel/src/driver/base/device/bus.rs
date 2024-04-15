@@ -134,9 +134,9 @@ pub trait Bus: Debug + Send + Sync {
     ///
     /// ## 默认实现
     ///
-    /// 如果总线不支持该操作，返回`SystemError::EOPNOTSUPP_OR_ENOTSUP`
+    /// 如果总线不支持该操作，返回`SystemError::ENOSYS`
     fn probe(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     fn remove(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError>;
     fn sync_state(&self, _device: &Arc<dyn Device>) {}
@@ -750,7 +750,7 @@ impl Attribute for DriverAttrUnbind {
                 "Intertrait casting not implemented for kobj: {}",
                 kobj.name()
             );
-            SystemError::EOPNOTSUPP_OR_ENOTSUP
+            SystemError::ENOSYS
         })?;
 
         let bus = driver
@@ -799,7 +799,7 @@ impl Attribute for DriverAttrBind {
                 "Intertrait casting not implemented for kobj: {}",
                 kobj.name()
             );
-            SystemError::EOPNOTSUPP_OR_ENOTSUP
+            SystemError::ENOSYS
         })?;
 
         let bus = driver

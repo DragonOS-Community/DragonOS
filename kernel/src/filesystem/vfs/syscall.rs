@@ -20,14 +20,14 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-use super::SuperBlock;
 use super::{
-    core::{do_mkdir, do_remove_dir, do_unlink_at},
+    core::{do_mkdir_at, do_remove_dir, do_unlink_at},
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
     open::{do_faccessat, do_fchmodat, do_sys_open},
     utils::{rsplit_path, user_path_at},
-    Dirent, FileType, IndexNode, FSMAKER, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    Dirent, FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
+    VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 // use crate::kdebug;
 
@@ -452,6 +452,17 @@ bitflags! {
         const RESOLVE_CACHED = 0x20;
     }
 }
+
+bitflags! {
+    pub struct UmountFlag: i32 {
+        const DEFAULT = 0;          /* Default call to umount. */
+        const MNT_FORCE = 1;        /* Force unmounting.  */
+        const MNT_DETACH = 2;       /* Just detach from the tree.  */
+        const MNT_EXPIRE = 4;       /* Mark for expiry.  */
+        const UMOUNT_NOFOLLOW = 8;  /* Don't follow symlink on umount.  */
+    }
+}
+
 impl Syscall {
     /// @brief 为当前进程打开一个文件
     ///
@@ -768,7 +779,12 @@ impl Syscall {
     /// @return uint64_t 负数错误码 / 0表示成功
     pub fn mkdir(path: *const u8, mode: usize) -> Result<usize, SystemError> {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
-        return do_mkdir(&path, FileMode::from_bits_truncate(mode as u32)).map(|x| x as usize);
+        do_mkdir_at(
+            AtFlags::AT_FDCWD.bits(),
+            &path,
+            FileMode::from_bits_truncate(mode as u32),
+        )?;
+        return Ok(0);
     }
 
     /// **创建硬连接的系统调用**
@@ -928,9 +944,9 @@ impl Syscall {
     ///
     /// ## 参数
     ///
-    /// - oldfd: 源文件描述符
+    /// - oldfd: 源文件夹文件描述符
     /// - filename_from: 源文件路径
-    /// - newfd: 目标文件描述符
+    /// - newfd: 目标文件夹文件描述符
     /// - filename_to: 目标文件路径
     /// - flags: 标志位
     ///
@@ -1542,13 +1558,28 @@ impl Syscall {
 
         let filesystemtype = producefs!(FSMAKER, filesystemtype)?;
 
-        return Vcore::do_mount(filesystemtype, target.to_string().as_str());
+        Vcore::do_mount(filesystemtype, target.to_string().as_str())?;
+
+        return Ok(0);
     }
 
     // 想法：可以在VFS中实现一个文件系统分发器，流程如下：
     // 1. 接受从上方传来的文件类型字符串
     // 2. 将传入值与启动时准备好的字符串数组逐个比较（probe）
     // 3. 直接在函数内调用构造方法并直接返回文件系统对象
+
+    /// src/linux/mount.c `umount` & `umount2`
+    ///
+    /// [umount(2) — Linux manual page](https://www.man7.org/linux/man-pages/man2/umount.2.html)
+    pub fn umount2(target: *const u8, flags: i32) -> Result<(), SystemError> {
+        let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?;
+        Vcore::do_umount2(
+            AtFlags::AT_FDCWD.bits(),
+            &target,
+            UmountFlag::from_bits(flags).ok_or(SystemError::EINVAL)?,
+        )?;
+        return Ok(());
+    }
 }
 
 #[repr(C)]

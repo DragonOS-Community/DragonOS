@@ -262,7 +262,7 @@ impl Syscall {
         // 暂不支持巨页
         if shmflg.contains(ShmFlags::SHM_HUGETLB) {
             kerror!("shmget: not support huge page");
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::ENOSYS);
         }
 
         let mut shm_manager_guard = shm_manager_lock();

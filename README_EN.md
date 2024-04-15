@@ -104,7 +104,7 @@ We guarantee that all sponsorship funds and items will be used for:
 - [谢润霖](https://github.com/xiaolin2004)
 - [蔡俊源](https://github.com/SMALLC04)
 - Kelly
-- [戴吕琛](https://github.com/Samuka007)
+- [Samuka007](https://github.com/Samuka007)
 - [杨璐玮](https://github.com/val213)
 - [何懿聪](https://github.com/GnoCiYeH)
 - [周凯韬](https://github.com/laokengwt)

@@ -502,7 +502,7 @@ impl DriverManager {
             .and_then(|bus| bus.upgrade())
             .ok_or(SystemError::EINVAL)?;
         let r = bus.probe(device);
-        if r == Err(SystemError::EOPNOTSUPP_OR_ENOTSUP) {
+        if r == Err(SystemError::ENOSYS) {
             kerror!(
                 "call_driver_probe: bus.probe() failed, dev: '{}', err: {:?}",
                 device.name(),
@@ -592,7 +592,7 @@ impl Attribute for DeviceAttrStateSynced {
                 "Intertrait casting not implemented for kobj: {}",
                 kobj.name()
             );
-            SystemError::EOPNOTSUPP_OR_ENOTSUP
+            SystemError::ENOSYS
         })?;
 
         let val = dev.state_synced();
@@ -627,7 +627,7 @@ impl Attribute for DeviceAttrCoredump {
                 "Intertrait casting not implemented for kobj: {}",
                 kobj.name()
             );
-            SystemError::EOPNOTSUPP_OR_ENOTSUP
+            SystemError::ENOSYS
         })?;
 
         let drv = dev.driver().ok_or(SystemError::EINVAL)?;

@@ -237,30 +237,30 @@ impl ScmUiFrameworkMetadata {
 pub trait ScmUiFramework: Sync + Send + Debug {
     // 安装ui框架的回调函数
     fn install(&self) -> Result<i32, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     // 卸载ui框架的回调函数
     fn uninstall(&self) -> Result<i32, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     // 启用ui框架的回调函数
     fn enable(&self) -> Result<i32, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     // 禁用ui框架的回调函数
     fn disable(&self) -> Result<i32, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     // 改变ui框架的帧缓冲区的回调函数
     fn change(&self, _buf: ScmBufferInfo) -> Result<i32, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     /// @brief 获取ScmUiFramework的元数据
     /// @return 成功：Ok(ScmUiFramework的元数据)
     ///         失败：Err(错误码)
     fn metadata(&self) -> Result<ScmUiFrameworkMetadata, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 }
 

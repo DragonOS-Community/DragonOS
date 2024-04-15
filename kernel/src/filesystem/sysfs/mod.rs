@@ -42,11 +42,11 @@ pub fn sysfs_init() -> Result<(), SystemError> {
         unsafe { SYSFS_INSTANCE = Some(sysfs) };
 
         // sysfs 挂载
-        let _t = ROOT_INODE()
-            .find("sys")
-            .expect("Cannot find /sys")
+        ROOT_INODE()
+            .mkdir("sys", ModeType::from_bits_truncate(0o755))
+            .expect("Unabled to find /sys")
             .mount(sysfs_instance().fs().clone())
-            .expect("Failed to mount sysfs");
+            .expect("Failed to mount at /sys");
         kinfo!("SysFS mounted.");
 
         // kdebug!("sys_bus_init result: {:?}", SYS_BUS_INODE().list());
@@ -74,7 +74,7 @@ impl SysFSKernPrivateData {
                 return Ok(len);
             }
             _ => {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                return Err(SystemError::ENOSYS);
             }
         }
     }
@@ -86,7 +86,7 @@ impl SysFSKernPrivateData {
                 return file.callback_write(buf, offset);
             }
             _ => {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                return Err(SystemError::ENOSYS);
             }
         }
     }
@@ -125,11 +125,11 @@ pub trait Attribute: Debug + Send + Sync {
     fn support(&self) -> SysFSOpsSupport;
 
     fn show(&self, _kobj: Arc<dyn KObject>, _buf: &mut [u8]) -> Result<usize, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn store(&self, _kobj: Arc<dyn KObject>, _buf: &[u8]) -> Result<usize, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 }
 
@@ -142,7 +142,7 @@ pub trait BinAttribute: Attribute {
         _buf: &[u8],
         _offset: usize,
     ) -> Result<usize, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn read(
@@ -151,7 +151,7 @@ pub trait BinAttribute: Attribute {
         _buf: &mut [u8],
         _offset: usize,
     ) -> Result<usize, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn size(&self) -> usize;

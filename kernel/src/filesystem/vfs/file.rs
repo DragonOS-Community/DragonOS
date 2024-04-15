@@ -515,7 +515,7 @@ impl File {
 
                 return socket.remove_epoll(epoll);
             }
-            _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+            _ => return Err(SystemError::ENOSYS),
         }
     }
 

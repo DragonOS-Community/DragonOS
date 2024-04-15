@@ -1,3 +1,4 @@
+use alloc::string::ToString;
 use core::cmp::Ordering;
 use core::intrinsics::unlikely;
 use core::{any::Any, fmt::Debug};
@@ -11,6 +12,7 @@ use alloc::{
 };
 
 use crate::driver::base::device::device_number::DeviceNumber;
+use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
 use crate::{
@@ -101,7 +103,7 @@ pub struct FATInode {
     self_ref: Weak<LockedFATInode>,
     /// 子Inode的B树. 该数据结构用作缓存区。其中，它的key表示inode的名称。
     /// 请注意，由于FAT的查询过程对大小写不敏感，因此我们选择让key全部是大写的，方便统一操作。
-    children: BTreeMap<String, Arc<LockedFATInode>>,
+    children: BTreeMap<DName, Arc<LockedFATInode>>,
     /// 当前inode的元数据
     metadata: Metadata,
     /// 指向inode所在的文件系统对象的指针
@@ -112,6 +114,9 @@ pub struct FATInode {
 
     /// 若该节点是特殊文件节点，该字段则为真正的文件节点
     special_node: Option<SpecialNodeData>,
+
+    /// 目录名
+    dname: DName,
 }
 
 impl FATInode {
@@ -135,8 +140,9 @@ impl FATInode {
     fn find(&mut self, name: &str) -> Result<Arc<LockedFATInode>, SystemError> {
         match &self.inode_type {
             FATDirEntry::Dir(d) => {
+                let dname = DName::from(name.to_uppercase());
                 // 尝试在缓存区查找
-                if let Some(entry) = self.children.get(&name.to_uppercase()) {
+                if let Some(entry) = self.children.get(&dname) {
                     return Ok(entry.clone());
                 }
                 // 在缓存区找不到
@@ -145,13 +151,13 @@ impl FATInode {
                     d.find_entry(name, None, None, self.fs.upgrade().unwrap())?;
                 // 创建新的inode
                 let entry_inode: Arc<LockedFATInode> = LockedFATInode::new(
+                    dname.clone(),
                     self.fs.upgrade().unwrap(),
                     self.self_ref.clone(),
                     fat_entry,
                 );
                 // 加入缓存区, 由于FAT文件系统的大小写不敏感问题，因此存入缓存区的key应当是全大写的
-                self.children
-                    .insert(name.to_uppercase(), entry_inode.clone());
+                self.children.insert(dname, entry_inode.clone());
                 return Ok(entry_inode);
             }
             FATDirEntry::UnInit => {
@@ -169,6 +175,7 @@ impl FATInode {
 
 impl LockedFATInode {
     pub fn new(
+        dname: DName,
         fs: Arc<FATFileSystem>,
         parent: Weak<LockedFATInode>,
         inode_type: FATDirEntry,
@@ -206,6 +213,7 @@ impl LockedFATInode {
                 raw_dev: DeviceNumber::default(),
             },
             special_node: None,
+            dname,
         })));
 
         inode.0.lock().self_ref = Arc::downgrade(&inode);
@@ -338,6 +346,7 @@ impl FATFileSystem {
                 raw_dev: DeviceNumber::default(),
             },
             special_node: None,
+            dname: DName::default(),
         })));
 
         let result: Arc<FATFileSystem> = Arc::new(FATFileSystem {
@@ -1442,7 +1451,7 @@ impl IndexNode for LockedFATInode {
                     return Ok(guard.find(name)?);
                 }
 
-                FileType::SymLink => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+                FileType::SymLink => return Err(SystemError::ENOSYS),
                 _ => return Err(SystemError::EINVAL),
             },
             FATDirEntry::UnInit => {
@@ -1498,7 +1507,7 @@ impl IndexNode for LockedFATInode {
                 guard.update_metadata();
                 return Ok(());
             }
-            FATDirEntry::Dir(_) => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+            FATDirEntry::Dir(_) => return Err(SystemError::ENOSYS),
             FATDirEntry::UnInit => {
                 kerror!("FATFS: param: Inode_type uninitialized.");
                 return Err(SystemError::EROFS);
@@ -1532,23 +1541,22 @@ impl IndexNode for LockedFATInode {
                     ret.push(ent.name());
 
                     // ====== 生成inode缓存，存入B树
-                    let name: String = ent.name();
+                    let name = DName::from(ent.name().to_uppercase());
                     // kdebug!("name={name}");
 
-                    if !guard.children.contains_key(&name.to_uppercase())
-                        && name != "."
-                        && name != ".."
+                    if !guard.children.contains_key(&name)
+                        && name.as_ref() != "."
+                        && name.as_ref() != ".."
                     {
                         // 创建新的inode
                         let entry_inode: Arc<LockedFATInode> = LockedFATInode::new(
+                            name.clone(),
                             guard.fs.upgrade().unwrap(),
                             guard.self_ref.clone(),
                             ent,
                         );
                         // 加入缓存区, 由于FAT文件系统的大小写不敏感问题，因此存入缓存区的key应当是全大写的
-                        guard
-                            .children
-                            .insert(name.to_uppercase(), entry_inode.clone());
+                        guard.children.insert(name, entry_inode.clone());
                     }
                 }
                 return Ok(ret);
@@ -1584,7 +1592,7 @@ impl IndexNode for LockedFATInode {
         // 对目标inode上锁，以防更改
         let target_guard: SpinLockGuard<FATInode> = target.0.lock();
         // 先从缓存删除
-        let nod = guard.children.remove(&name.to_uppercase());
+        let nod = guard.children.remove(&DName::from(name.to_uppercase()));
 
         // 若删除缓存中为管道的文件，则不需要再到磁盘删除
         if nod.is_some() {
@@ -1619,7 +1627,7 @@ impl IndexNode for LockedFATInode {
         // 对目标inode上锁，以防更改
         let target_guard: SpinLockGuard<FATInode> = target.0.lock();
         // 先从缓存删除
-        guard.children.remove(&name.to_uppercase());
+        guard.children.remove(&DName::from(name.to_uppercase()));
 
         let dir = match &guard.inode_type {
             FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
@@ -1642,7 +1650,9 @@ impl IndexNode for LockedFATInode {
             Err(r) => {
                 if r == SystemError::ENOTEMPTY {
                     // 如果要删除的是目录，且不为空，则删除动作未发生，重新加入缓存
-                    guard.children.insert(name.to_uppercase(), target.clone());
+                    guard
+                        .children
+                        .insert(DName::from(name.to_uppercase()), target.clone());
                     drop(target_guard);
                 }
                 return Err(r);
@@ -1666,7 +1676,7 @@ impl IndexNode for LockedFATInode {
             let old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
             let fs = old_inode_guard.fs.upgrade().unwrap();
             // 从缓存删除
-            let _nod = guard.children.remove(&old_name.to_uppercase());
+            let _nod = guard.children.remove(&DName::from(old_name.to_uppercase()));
             let old_dir = match &guard.inode_type {
                 FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
                     return Err(SystemError::ENOTDIR);
@@ -1693,7 +1703,9 @@ impl IndexNode for LockedFATInode {
             let old_inode_guard: SpinLockGuard<FATInode> = old_inode.0.lock();
             let fs = old_inode_guard.fs.upgrade().unwrap();
             // 从缓存删除
-            let _nod = old_guard.children.remove(&old_name.to_uppercase());
+            let _nod = old_guard
+                .children
+                .remove(&DName::from(old_name.to_uppercase()));
             let old_dir = match &old_guard.inode_type {
                 FATDirEntry::File(_) | FATDirEntry::VolId(_) => {
                     return Err(SystemError::ENOTDIR);
@@ -1739,19 +1751,14 @@ impl IndexNode for LockedFATInode {
                 // TODO: 优化这里，这个地方性能很差！
                 let mut key: Vec<String> = guard
                     .children
-                    .keys()
-                    .filter(|k| {
-                        guard
-                            .children
-                            .get(*k)
-                            .unwrap()
-                            .metadata()
-                            .unwrap()
-                            .inode_id
-                            .into()
-                            == ino
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        if v.0.lock().metadata.inode_id.into() == ino {
+                            Some(k.to_string())
+                        } else {
+                            None
+                        }
                     })
-                    .cloned()
                     .collect();
 
                 match key.len() {
@@ -1780,7 +1787,9 @@ impl IndexNode for LockedFATInode {
             return self.create(filename, FileType::File, mode);
         }
 
+        let filename = DName::from(filename.to_uppercase());
         let nod = LockedFATInode::new(
+            filename.clone(),
             inode.fs.upgrade().unwrap(),
             inode.self_ref.clone(),
             FATDirEntry::File(FATFile::default()),
@@ -1802,14 +1811,25 @@ impl IndexNode for LockedFATInode {
             return Err(SystemError::EINVAL);
         }
 
-        inode
-            .children
-            .insert(String::from(filename).to_uppercase(), nod.clone());
+        inode.children.insert(filename, nod.clone());
         Ok(nod)
     }
 
     fn special_node(&self) -> Option<SpecialNodeData> {
         self.0.lock().special_node.clone()
+    }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        Ok(self.0.lock().dname.clone())
+    }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.0
+            .lock()
+            .parent
+            .upgrade()
+            .map(|item| item as Arc<dyn IndexNode>)
+            .ok_or(SystemError::EINVAL)
     }
 }
 

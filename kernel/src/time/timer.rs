@@ -55,12 +55,12 @@ impl Jiffies {
         result
     }
 
-    /// # 返回jiffies
+    /// ## 返回jiffies
     pub fn inner_jiffies(&self) -> u64 {
         self.jiffies
     }
 
-    /// 3 返回接下来的n_jiffies对应的定时器时间片
+    /// ## 返回接下来的n_jiffies对应的定时器时间片
     pub fn timer_jiffies(&self) -> u64 {
         let result = TIMER_JIFFIES.load(Ordering::SeqCst) + self.inner_jiffies();
         result

@@ -60,7 +60,7 @@ pub fn riscv_sbi_timer_init_local() {
 
     if unsafe { INTERVAL_CNT } == 0 {
         // todo: 将来正式实现时，需要除以HZ
-        let new = riscv_time_base_freq();
+        let new = riscv_time_base_freq() / 3;
         if new == 0 {
             panic!("riscv_sbi_timer_init: failed to get timebase-frequency");
         }

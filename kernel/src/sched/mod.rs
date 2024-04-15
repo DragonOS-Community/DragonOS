@@ -914,12 +914,6 @@ pub fn __schedule(sched_mod: SchedMode) {
 
         unsafe { ProcessManager::switch_process(prev, next) };
     } else {
-        kwarn!(
-            "!!!switch_process {} {:?} to self ",
-            prev.basic().name(),
-            prev.pid(),
-        );
-
         assert!(
             Arc::ptr_eq(&ProcessManager::current_pcb(), &prev),
             "{}",

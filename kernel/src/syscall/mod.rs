@@ -1049,6 +1049,11 @@ impl Syscall {
                 let name = args[0] as *mut PosixOldUtsName;
                 Self::uname(name)
             }
+            SYS_PRCTL => {
+                // todo: 这个系统调用还没有实现
+
+                Err(SystemError::EINVAL)
+            }
 
             SYS_SHMGET => {
                 let key = ShmKey::new(args[0]);

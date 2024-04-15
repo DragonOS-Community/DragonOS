@@ -196,29 +196,29 @@ pub trait Clocksource: Send + Sync + Debug {
     fn read(&self) -> CycleNum;
     /// optional function to enable the clocksource
     fn enable(&self) -> Result<i32, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     /// optional function to disable the clocksource
     fn disable(&self) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     /// vsyscall based read
     fn vread(&self) -> Result<CycleNum, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     /// suspend function for the clocksource, if necessary
     fn suspend(&self) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     /// resume function for the clocksource, if necessary
     fn resume(&self) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     // 获取时钟源数据
     fn clocksource_data(&self) -> ClocksourceData;
 
     fn update_clocksource_data(&self, _data: ClocksourceData) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     // 获取时钟源
     fn clocksource(&self) -> Arc<dyn Clocksource>;

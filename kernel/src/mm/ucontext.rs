@@ -871,7 +871,7 @@ impl UserMappings {
 
             if flags.contains(MapFlags::MAP_FIXED) {
                 // todo: 支持MAP_FIXED标志对已有的VMA进行覆盖
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                return Err(SystemError::ENOSYS);
             }
 
             // 如果没有指定MAP_FIXED标志，那么就对地址做修正

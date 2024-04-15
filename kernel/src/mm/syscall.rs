@@ -314,13 +314,13 @@ impl Syscall {
         // 暂时不支持除匿名页以外的映射
         if !map_flags.contains(MapFlags::MAP_ANONYMOUS) {
             kerror!("mmap: not support file mapping");
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::ENOSYS);
         }
 
         // 暂时不支持巨页映射
         if map_flags.contains(MapFlags::MAP_HUGETLB) {
             kerror!("mmap: not support huge page mapping");
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::ENOSYS);
         }
         let current_address_space = AddressSpace::current()?;
         let start_page = current_address_space.write().map_anonymous(

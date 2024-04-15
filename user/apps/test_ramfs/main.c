@@ -14,68 +14,79 @@
 
 int main(int argc, char const* argv[]) {
 
-    if (mkdir("/some", 0777) == -1) {
+    if (mkdir("/SOME", 0777) == -1) {
         perror("Failed to create directory under /some");
         return 1;
     }
 
-    // Create a directory under /some/ramfs
-    if (mkdir("/some/ramfs", 0777) == -1) {
-        perror("Failed to create directory under /some/ramfs");
+    // Create a directory under /SOME/RAMFS
+    if (mkdir("/SOME/RAMFS", 0777) == -1) {
+        perror("Failed to create directory under /SOME/RAMFS");
         return 1;
     }
 
-    // Mount the first ramfs at /some/ramfs
-    if (mount("", "/some/ramfs", "ramfs", 0, NULL) == -1) {
-        perror("Failed to mount ramfs at /some/ramfs");
+    // Mount the first ramfs at /SOME/RAMFS
+    if (mount("", "/SOME/RAMFS", "ramfs", 0, NULL) == -1) {
+        perror("Failed to mount ramfs at /SOME/RAMFS");
         return 1;
     }
 
-    if (mkdir("/some/ramfs/some", 0777) == -1) {
-        perror("Failed to create directory under /some/ramfs/some");
+    if (mkdir("/SOME/RAMFS/some", 0777) == -1) {
+        perror("Failed to create directory under /SOME/RAMFS/some");
         return 1;
     }
 
-    // Create a directory under /some/ramfs/some/another
-    if (mkdir("/some/ramfs/some/another", 0777) == -1) {
-        perror("Failed to create directory under /some/ramfs/some/another");
+    puts("Success mkdir /SOME/RAMFS/some");
+
+    // Create a directory under /SOME/RAMFS/some/another
+    if (mkdir("/SOME/RAMFS/some/another", 0777) == -1) {
+        perror("Failed to create directory under /SOME/RAMFS/some/another");
         return 1;
     }
 
-    if (mount("", "/some/ramfs/some/another", "ramfs", 0, NULL) == -1) {
-        perror("Failed to mount ramfs at /some/ramfs/some/another");
-        return 1;
-    }
-    if (mkdir("/some/ramfs/some/another/just_another", 0777) == -1) {
-        perror("Failed to create directory under /some/ramfs/some/another");
-        return 1;
-    }
+    puts("Success mkdir /SOME/RAMFS/some/another");
 
-    if (mount("", "/some/ramfs/some/another/just_another", "ramfs", 0, NULL) == -1) {
-        perror("Failed to mount ramfs at /some/ramfs/some/another");
+    if (mount("", "/SOME/RAMFS/some/another", "ramfs", 0, NULL) == -1) {
+        perror("Failed to mount ramfs at /SOME/RAMFS/some/another");
         return 1;
     }
 
+    puts("Success mount on /SOME/RAMFS/some/another");
 
-    // Write files under /some/ramfs and /some/ramfs/some/another
-    FILE* file1 = fopen("/some/ramfs/file1.txt", "w");
+    if (mkdir("/SOME/RAMFS/some/another/just_another", 0777) == -1) {
+        perror("Failed to create directory under /SOME/RAMFS/some/another");
+        return 1;
+    }
+
+    puts("Success mkdir /SOME/RAMFS/some/another/just_another");
+
+    if (mount("", "/SOME/RAMFS/some/another/just_another", "ramfs", 0, NULL) == -1) {
+        perror("Failed to mount ramfs at /SOME/RAMFS/some/another");
+        return 1;
+    }
+
+    puts("Success mount on /SOME/RAMFS/some/another/just_another");
+
+    // Write files under /SOME/RAMFS and /SOME/RAMFS/some/another
+    FILE* file1 = fopen("/SOME/RAMFS/file1.txt", "w");
     if (file1 == NULL) {
-        perror("Failed to open /some/ramfs/file1.txt");
+        perror("Failed to open /SOME/RAMFS/file1.txt");
         return 1;
     }
     fprintf(file1, "This is file1.txt\n");
     fclose(file1);
 
-    FILE* file2 = fopen("/some/ramfs/some/another/file2.txt", "w");
+    FILE* file2 = fopen("/SOME/RAMFS/some/another/file2.txt", "w");
     if (file2 == NULL) {
-        perror("Failed to open /some/ramfs/some/another/file2.txt");
+        perror("Failed to open /SOME/RAMFS/some/another/file2.txt");
         return 1;
     }
+    fprintf(file2, "This is file2.txt\n");
     fclose(file2);
 
-    FILE* file3 = fopen("/some/ramfs/some/another/just_another/file3.txt", "w+");
+    FILE* file3 = fopen("/SOME/RAMFS/some/another/just_another/file3.txt", "w+");
     if (file3 == NULL) {
-        perror("Failed to open /some/ramfs/some/another/just_another/file3.txt");
+        perror("Failed to open /SOME/RAMFS/some/another/just_another/file3.txt");
         return 1;
     }
     fprintf(file3, "Multi mount behave well.\n");
@@ -87,14 +98,16 @@ int main(int argc, char const* argv[]) {
     fclose(file3);
 
     // test umount with flags ( use umount2 )
-    if (umount("/some/ramfs/some/another/just_another") == -1) {
-        perror("Failed to umount ramfs at /some/ramfs/some/another/just_another");
+    if (umount("/SOME/RAMFS/some/another/just_another") == -1) {
+        perror("Failed to umount ramfs at /SOME/RAMFS/some/another/just_another");
         return 1;
     }
 
+    puts("Successful umount /SOME/RAMFS/some/another/just_another");
+
     // delete just_another
-    if (rmdir("/some/ramfs/some/another/just_another") == -1) {
-        perror("Failed to delete /some/ramfs/some/another/just_another");
+    if (rmdir("/SOME/RAMFS/some/another/just_another") == -1) {
+        perror("Failed to delete /SOME/RAMFS/some/another/just_another");
         return 1;
     }
 

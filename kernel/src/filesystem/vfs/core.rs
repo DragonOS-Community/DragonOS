@@ -20,7 +20,7 @@ use crate::{
 use super::{
     fcntl::AtFlags,
     file::FileMode,
-    mount::MountList,
+    mount::{init_mountlist, MOUNT_LIST},
     syscall::UmountFlag,
     utils::{rsplit_path, user_path_at},
     IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
@@ -54,7 +54,7 @@ pub fn vfs_init() -> Result<(), SystemError> {
     let ramfs = RamFS::new();
     let mount_fs = MountFS::new(ramfs, None);
     let root_inode = mount_fs.root_inode();
-    MountList::init();
+    init_mountlist();
     unsafe {
         __ROOT_INODE = Some(root_inode.clone());
     }
@@ -231,19 +231,52 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     return Ok(0);
 }
 
-/// 挂载文件系统
-/// # Error
-/// `ENOENT`: 目录（挂载点）不存在
+/// # do_mount - 挂载文件系统
+///
+/// 将给定的文件系统挂载到指定的挂载点。
+///
+/// 此函数会检查是否已经挂载了相同的文件系统，如果已经挂载，则返回错误。
+/// 它还会处理符号链接，并确保挂载点是有效的。
+///
+/// ## 参数
+///
+/// - `fs`: Arc<dyn FileSystem>，要挂载的文件系统。
+/// - `mount_point`: &str，挂载点路径。
+///
+/// ## 返回值
+///
+/// - `Ok(Arc<MountFS>)`: 挂载成功后返回挂载的文件系统。
+/// - `Err(SystemError)`: 挂载失败时返回错误。
 pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<Arc<MountFS>, SystemError> {
-    let inode = ROOT_INODE().lookup_follow_symlink(mount_point, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-    // kdebug!("Going to mount at {:?}", inode.metadata()?.inode_id);
-    let fs = inode.mount(fs)?;
-    MountList::insert(mount_point, fs.clone());
-    return Ok(fs);
+    let (current_node, rest_path) = user_path_at(
+        &ProcessManager::current_pcb(),
+        AtFlags::AT_FDCWD.bits(),
+        mount_point,
+    )?;
+    let inode = current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    if let Some((_, rest, _fs)) = MOUNT_LIST().get_mount_point(mount_point) {
+        if rest.is_empty() {
+            return Err(SystemError::EBUSY);
+        }
+    }
+    // 移至IndexNode.mount()来记录
+    return inode.mount(fs);
 }
 
-/// = mount -m "/dirname" some_filesystem
-/// 挂载文件系统到指定目录，目录不存在即创建目录
+/// # do_mount_mkdir - 在指定挂载点创建目录并挂载文件系统
+///
+/// 在指定的挂载点创建一个目录，并将其挂载到文件系统中。如果挂载点已经存在，并且不是空的，
+/// 则会返回错误。成功时，会返回一个新的挂载文件系统的引用。
+///
+/// ## 参数
+///
+/// - `fs`: FileSystem - 文件系统的引用，用于创建和挂载目录。
+/// - `mount_point`: &str - 挂载点路径，用于创建和挂载目录。
+///
+/// ## 返回值
+///
+/// - `Ok(Arc<MountFS>)`: 成功挂载文件系统后，返回挂载文件系统的共享引用。
+/// - `Err(SystemError)`: 挂载失败时，返回系统错误。
 pub fn do_mount_mkdir(
     fs: Arc<dyn FileSystem>,
     mount_point: &str,
@@ -253,21 +286,41 @@ pub fn do_mount_mkdir(
         mount_point,
         FileMode::from_bits_truncate(0o755),
     )?;
-    let fs = inode.mount(fs)?;
-    MountList::insert(mount_point, fs.clone());
-    return Ok(fs);
+    if let Some((_, rest, _fs)) = MOUNT_LIST().get_mount_point(mount_point) {
+        if rest.is_empty() {
+            return Err(SystemError::EBUSY);
+        }
+    }
+    return inode.mount(fs);
 }
 
-/// 卸载文件系统
+/// # do_umount2 - 执行卸载文件系统的函数
+///
+/// 这个函数用于卸载指定的文件系统。
+///
+/// ## 参数
+///
+/// - dirfd: i32 - 目录文件描述符，用于指定要卸载的文件系统的根目录。
+/// - target: &str - 要卸载的文件系统的目标路径。
+/// - _flag: UmountFlag - 卸载标志，目前未使用。
+///
+/// ## 返回值
+///
+/// - Ok(Arc<MountFS>): 成功时返回文件系统的 Arc 引用。
+/// - Err(SystemError): 出错时返回系统错误。
+///
+/// ## 错误处理
+///
+/// 如果指定的路径没有对应的文件系统，或者在尝试卸载时发生错误，将返回错误。
 pub fn do_umount2(
     dirfd: i32,
     target: &str,
     _flag: UmountFlag,
 ) -> Result<Arc<MountFS>, SystemError> {
     let (work, rest) = user_path_at(&ProcessManager::current_pcb(), dirfd, target)?;
-    let path = work.absolute_path(0)? + &rest;
+    let path = work.absolute_path()? + &rest;
     let do_umount = || -> Result<Arc<MountFS>, SystemError> {
-        if let Some(fs) = MountList::remove(path) {
+        if let Some(fs) = MOUNT_LIST().remove(path) {
             // Todo: 占用检测
             fs.umount()?;
             return Ok(fs);

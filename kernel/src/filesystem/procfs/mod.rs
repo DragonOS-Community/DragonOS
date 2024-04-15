@@ -15,7 +15,6 @@ use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{
         core::{generate_inode_id, ROOT_INODE},
-        mount::MountList,
         FileType,
     },
     kerror, kinfo,
@@ -126,6 +125,8 @@ pub struct ProcFSInode {
     fs: Weak<ProcFS>,
     /// 储存私有信息
     fdata: InodeInfo,
+    /// 目录项
+    dname: DName,
 }
 
 /// 对ProcFSInode实现获取各类文件信息的函数
@@ -331,6 +332,7 @@ impl ProcFS {
                     pid: Pid::new(0),
                     ftype: ProcFileType::Default,
                 },
+                dname: DName::default(),
             })));
 
         let result: Arc<ProcFS> = Arc::new(ProcFS {
@@ -618,6 +620,7 @@ impl IndexNode for LockedProcFSInode {
                     pid: Pid::new(0),
                     ftype: ProcFileType::Default,
                 },
+                dname: name.clone(),
             })));
 
         // 初始化inode的自引用的weak指针
@@ -777,6 +780,10 @@ impl IndexNode for LockedProcFSInode {
 
         return Ok(keys);
     }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        Ok(self.0.lock().dname.clone())
+    }
 }
 
 /// @brief 向procfs注册进程
@@ -818,12 +825,11 @@ pub fn procfs_init() -> Result<(), SystemError> {
         // 创建 procfs 实例
         let procfs: Arc<ProcFS> = ProcFS::new();
         // procfs 挂载
-        let fs = ROOT_INODE()
+        ROOT_INODE()
             .mkdir("proc", ModeType::from_bits_truncate(0o755))
             .expect("Unabled to find /proc")
             .mount(procfs)
             .expect("Failed to mount at /proc");
-        MountList::insert("/proc", fs);
         kinfo!("ProcFS mounted.");
         result = Some(Ok(()));
     });

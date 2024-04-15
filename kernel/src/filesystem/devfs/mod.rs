@@ -6,11 +6,11 @@ use super::vfs::{
     core::{generate_inode_id, ROOT_INODE},
     file::FileMode,
     syscall::ModeType,
+    utils::DName,
     FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock,
 };
 use crate::{
     driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::mount::MountList,
     kerror, kinfo,
     libs::{
         once::Once,
@@ -246,11 +246,13 @@ pub struct DevFSInode {
     /// 指向自身的弱引用
     self_ref: Weak<LockedDevFSInode>,
     /// 子Inode的B树
-    children: BTreeMap<String, Arc<dyn IndexNode>>,
+    children: BTreeMap<DName, Arc<dyn IndexNode>>,
     /// 指向inode所在的文件系统对象的指针
     fs: Weak<DevFS>,
     /// INode 元数据
     metadata: Metadata,
+    /// 目录名
+    dname: DName,
 }
 
 impl DevFSInode {
@@ -285,6 +287,7 @@ impl DevFSInode {
                 raw_dev: DeviceNumber::from(data_ as u32),
             },
             fs: Weak::default(),
+            dname: DName::default(),
         };
     }
 }
@@ -293,7 +296,7 @@ impl LockedDevFSInode {
     pub fn add_dir(&self, name: &str) -> Result<(), SystemError> {
         let guard: SpinLockGuard<DevFSInode> = self.0.lock();
 
-        if guard.children.contains_key(name) {
+        if guard.children.contains_key(&DName::from(name)) {
             return Err(SystemError::EEXIST);
         }
 
@@ -315,12 +318,12 @@ impl LockedDevFSInode {
 
     pub fn add_dev(&self, name: &str, dev: Arc<dyn IndexNode>) -> Result<(), SystemError> {
         let mut this = self.0.lock();
-
-        if this.children.contains_key(name) {
+        let name = DName::from(name);
+        if this.children.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
 
-        this.children.insert(name.to_string(), dev);
+        this.children.insert(name, dev);
         return Ok(());
     }
 
@@ -329,7 +332,7 @@ impl LockedDevFSInode {
             .0
             .lock()
             .children
-            .remove(name)
+            .remove(&DName::from(name))
             .ok_or(SystemError::ENOENT)?;
 
         drop(x);
@@ -347,9 +350,9 @@ impl LockedDevFSInode {
         if guard.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
-
+        let name = DName::from(name);
         // 如果有重名的，则返回
-        if guard.children.contains_key(name) {
+        if guard.children.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
 
@@ -375,13 +378,14 @@ impl LockedDevFSInode {
                 raw_dev: DeviceNumber::from(data as u32),
             },
             fs: guard.fs.clone(),
+            dname: name.clone(),
         })));
 
         // 初始化inode的自引用的weak指针
         result.0.lock().self_ref = Arc::downgrade(&result);
 
         // 将子inode插入父inode的B树中
-        guard.children.insert(String::from(name), result.clone());
+        guard.children.insert(name, result.clone());
         return Ok(result);
     }
 }
@@ -432,7 +436,11 @@ impl IndexNode for LockedDevFSInode {
             }
             name => {
                 // 在子目录项中查找
-                return Ok(inode.children.get(name).ok_or(SystemError::ENOENT)?.clone());
+                return Ok(inode
+                    .children
+                    .get(&DName::from(name))
+                    .ok_or(SystemError::ENOENT)?
+                    .clone());
             }
         }
     }
@@ -459,19 +467,14 @@ impl IndexNode for LockedDevFSInode {
                 // TODO: 优化这里，这个地方性能很差！
                 let mut key: Vec<String> = inode
                     .children
-                    .keys()
-                    .filter(|k| {
-                        inode
-                            .children
-                            .get(*k)
-                            .unwrap()
-                            .metadata()
-                            .unwrap()
-                            .inode_id
-                            .into()
-                            == ino
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        if v.metadata().unwrap().inode_id.into() == ino {
+                            Some(k.to_string())
+                        } else {
+                            None
+                        }
                     })
-                    .cloned()
                     .collect();
 
                 match key.len() {
@@ -501,7 +504,15 @@ impl IndexNode for LockedDevFSInode {
         let mut keys: Vec<String> = Vec::new();
         keys.push(String::from("."));
         keys.push(String::from(".."));
-        keys.append(&mut self.0.lock().children.keys().cloned().collect());
+        keys.append(
+            &mut self
+                .0
+                .lock()
+                .children
+                .keys()
+                .map(ToString::to_string)
+                .collect(),
+        );
 
         return Ok(keys);
     }
@@ -543,6 +554,18 @@ impl IndexNode for LockedDevFSInode {
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
+    }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let me = self.0.lock();
+        Ok(me
+            .parent
+            .upgrade()
+            .unwrap_or(me.self_ref.upgrade().unwrap()))
+    }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        Ok(self.0.lock().dname.clone())
     }
 }
 
@@ -592,12 +615,11 @@ pub fn devfs_init() -> Result<(), SystemError> {
         // 创建 devfs 实例
         let devfs: Arc<DevFS> = DevFS::new();
         // devfs 挂载
-        let fs = ROOT_INODE()
+        ROOT_INODE()
             .mkdir("dev", ModeType::from_bits_truncate(0o755))
             .expect("Unabled to find /dev")
             .mount(devfs)
             .expect("Failed to mount at /dev");
-        MountList::insert("/dev", fs);
         kinfo!("DevFS mounted.");
         result = Some(Ok(()));
     });

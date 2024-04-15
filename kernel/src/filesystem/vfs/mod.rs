@@ -360,38 +360,103 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 列出当前inode下的所有目录项的名字
     fn list(&self) -> Result<Vec<String>, SystemError>;
 
-    /// 在当前Inode下，挂载一个新的文件系统
-    /// # Behavior
-    /// 该函数只能被MountFS实现，其他文件系统不应实现这个函数
+    /// # mount - 挂载文件系统
+    ///
+    /// 将给定的文件系统挂载到当前的文件系统节点上。
+    ///
+    /// 该函数是`MountFS`结构体的实例方法，用于将一个新的文件系统挂载到调用它的`MountFS`实例上。
+    ///
+    /// ## 参数
+    ///
+    /// - `fs`: `Arc<dyn FileSystem>` - 要挂载的文件系统的共享引用。
+    ///
+    /// ## 返回值
+    ///
+    /// - `Ok(Arc<MountFS>)`: 新的挂载文件系统的共享引用。
+    /// - `Err(SystemError)`: 挂载过程中出现的错误。
+    ///
+    /// ## 错误处理
+    ///
+    /// - 如果文件系统不是目录类型，则返回`SystemError::ENOTDIR`错误。
+    /// - 如果当前路径已经是挂载点，则返回`SystemError::EBUSY`错误。
+    ///
+    /// ## 副作用
+    ///
+    /// - 该函数会在`MountFS`实例上创建一个新的挂载点。
+    /// - 该函数会在全局的挂载列表中记录新的挂载关系。
     fn mount(&self, _fs: Arc<dyn FileSystem>) -> Result<Arc<MountFS>, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
-    /// 在当前Inode下，挂载一个已有挂载信息的文件系统，保持原有挂载信息
-    /// # Behavior
-    /// 该函数只能被MountFS实现，其他文件系统不应实现这个函数
+    /// # mount_from - 从给定的目录挂载已有挂载信息的文件系统
+    ///
+    /// 这个函数将一个已有挂载信息的文件系统从给定的目录挂载到当前目录。
+    ///
+    /// ## 参数
+    ///
+    /// - `from`: Arc<dyn IndexNode> - 要挂载的目录的引用。
+    ///
+    /// ## 返回值
+    ///
+    /// - Ok(Arc<MountFS>): 挂载的新文件系统的引用。
+    /// - Err(SystemError): 如果发生错误，返回系统错误。
+    ///
+    /// ## 错误处理
+    ///
+    /// - 如果给定的目录不是目录类型，返回`SystemError::ENOTDIR`。
+    /// - 如果当前目录已经是挂载点的根目录，返回`SystemError::EBUSY`。
+    ///
+    /// ## 副作用
+    ///
+    /// - 系统初始化用，其他情况不应调用此函数
     fn mount_from(&self, _des: Arc<dyn IndexNode>) -> Result<Arc<MountFS>, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
-    /// 卸载当前Inode下的文件系统
-    /// # Behavior
-    /// 该函数只能被MountFS实现，其他文件系统不应实现这个函数
-    /// # Logic
-    /// lookup path -> 父文件系统的挂载点 -> overlaid 成子文件系统的root
-    /// -> 判断是否是子文件系统root -> 调用父文件系统挂载点的_umount方法
+    /// # umount - 卸载当前Inode下的文件系统
+    ///
+    /// 该函数是特定于`MountFS`实现的，其他文件系统不应实现此函数。
+    ///
+    /// ## 参数
+    ///
+    /// 无
+    ///
+    /// ## 返回值
+    ///
+    /// - Ok(Arc<MountFS>): 卸载的文件系统的引用。
+    /// - Err(SystemError): 如果发生错误，返回系统错误。
+    ///
+    /// ## 行为
+    ///
+    /// - 查找路径
+    /// - 定位到父文件系统的挂载点
+    /// - 将挂载点与子文件系统的根进行叠加
+    /// - 判断是否为子文件系统的根
+    /// - 调用父文件系统挂载点的`_umount`方法进行卸载
     fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
-    /// 获取绝对路径
-    /// # Behavior
+    /// # absolute_path 获取目录项绝对路径
+    ///
+    /// ## 参数
+    ///
+    /// 无
+    ///
+    /// ## 返回值
+    ///
+    /// - Ok(String): 路径
+    /// - Err(SystemError): 文件系统不支持dname parent api
+    ///
+    /// ## Behavior
+    ///
     /// 该函数只能被MountFS实现，其他文件系统不应实现这个函数
-    /// # Performance Note
+    ///
+    /// # Performance
+    ///
     /// 这是一个O(n)的路径查询，并且在未实现DName缓存的文件系统中，性能极差；
-    /// 即使实现了DName也尽量不要用，直到
-    /// 能外部传参进来获取路径的尽量不要call这个函数，直到实现
-    fn absolute_path(&self, _len: usize) -> Result<String, SystemError> {
+    /// 即使实现了DName也尽量不要用。
+    fn absolute_path(&self) -> Result<String, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
@@ -419,12 +484,21 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
-    /// 新建名称为`name`的目录项
-    /// # Behavior
-    /// 当目录下已有名称为`name`的文件夹，返回该目录项的引用,
-    /// 否则新建`name`文件夹，并返回该引用
-    /// # Error
-    /// `EEXIST`: `name`目录存在且类型不为文件夹
+    /// # mkdir - 新建名称为`name`的目录项
+    ///
+    /// 当目录下已有名称为`name`的文件夹时，返回该目录项的引用；否则新建`name`文件夹，并返回该引用。
+    ///
+    /// 该函数会检查`name`目录是否已存在，如果存在但类型不为文件夹，则会返回`EEXIST`错误。
+    ///
+    /// # 参数
+    ///
+    /// - `name`: &str - 要新建的目录项的名称。
+    /// - `mode`: ModeType - 设置目录项的权限模式。
+    ///
+    /// # 返回值
+    ///
+    /// - `Ok(Arc<dyn IndexNode>)`: 成功时返回`name`目录项的共享引用。
+    /// - `Err(SystemError)`: 出错时返回错误信息。
     fn mkdir(&self, name: &str, mode: ModeType) -> Result<Arc<dyn IndexNode>, SystemError> {
         match self.find(name) {
             Ok(inode) => {
@@ -444,16 +518,35 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         None
     }
 
-    /// 返回目录名
+    /// # dname - 返回目录名
+    ///
+    /// 此函数用于返回一个目录名。
+    ///
+    /// ## 参数
+    ///
+    /// 无
+    ///
+    /// ## 返回值
+    /// - Ok(DName): 成功时返回一个目录名。
+    /// - Err(SystemError): 如果系统不支持此操作，则返回一个系统错误。
     fn dname(&self) -> Result<DName, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
-    /// 返回父目录的引用
-    /// # Behavior
-    /// 当自己是当前文件系统的根目录，则返回自身的引用
+    /// # parent - 返回父目录的引用
+    ///
+    /// 当该目录是当前文件系统的根目录时，返回自身的引用。
+    ///
+    /// ## 参数
+    ///
+    /// 无
+    ///
+    /// ## 返回值
+    ///
+    /// - Ok(Arc<dyn IndexNode>): A reference to the parent directory
+    /// - Err(SystemError): If there is an error in finding the parent directory
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return Err(SystemError::ENOSYS);
+        return self.find("..");
     }
 }
 

@@ -889,6 +889,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         }
     }
 
+    /// 进行大页映射
     pub unsafe fn map_huge_page(
         &mut self,
         virt: VirtAddr,
@@ -953,38 +954,15 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         Some(PageFlush::new(virt))
     }
 
-    pub unsafe fn allocate_pde(&mut self, virt: VirtAddr, level: usize) -> Option<PageEntry<Arch>> {
-        let mut table = self.table();
-        if level == 0 || level > Arch::PAGE_LEVELS - 1 {
-            return None;
-        }
-        loop {
-            let i = table.index_of(virt)?;
-            assert!(i < Arch::PAGE_ENTRY_NUM);
-            let next_table = table.next_level_table(i);
-            if let Some(next_table) = next_table {
-                table = next_table;
-            } else {
-                let frame = self.frame_allocator.allocate_one()?;
-
-                // 清空这个页帧
-                MMArch::write_bytes(MMArch::phys_2_virt(frame).unwrap(), 0, MMArch::PAGE_SIZE);
-
-                // 设置页表项的flags
-                let flags: PageFlags<Arch> =
-                    PageFlags::new_page_table(virt.kind() == PageTableKind::User);
-
-                table.set_entry(i, PageEntry::new(frame, flags));
-                if table.level == level {
-                    return table.entry(i);
-                } else {
-                    table = table.next_level_table(i)?;
-                }
-            }
-        }
-    }
-
-    // 为当前进程分配指定层级的页表
+    /// 为虚拟地址分配指定层级的页表
+    /// ## 参数
+    ///
+    /// - `virt`: 虚拟地址
+    /// - `level`: 指定页表层级
+    ///
+    /// ## 返回值
+    /// - Some(PageTable<Arch>): 虚拟地址对应层级的页表
+    /// - None: 对应页表不存在
     pub unsafe fn allocate_table(
         &mut self,
         virt: VirtAddr,

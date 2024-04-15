@@ -36,9 +36,43 @@ bitflags! {
 /// 包含了页面错误处理的相关信息，例如出错的地址、VMA等
 #[derive(Debug)]
 pub struct PageFaultMessage {
-    pub vma: Arc<LockedVMA>,
-    pub address: VirtAddr,
-    pub flags: FaultFlags,
+    vma: Arc<LockedVMA>,
+    address: VirtAddr,
+    flags: FaultFlags,
+}
+
+impl PageFaultMessage {
+    pub fn new(vma: Arc<LockedVMA>, address: VirtAddr, flags: FaultFlags) -> Self {
+        Self {
+            vma: vma.clone(),
+            address,
+            flags,
+        }
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub fn vma(&self) -> Arc<LockedVMA> {
+        self.vma.clone()
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub fn address(&self) -> VirtAddr {
+        self.address
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub fn address_aligned_down(&self) -> VirtAddr {
+        VirtAddr::new(crate::libs::align::page_align_down(self.address.data()))
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub fn flags(&self) -> FaultFlags {
+        self.flags
+    }
 }
 
 /// 缺页中断处理结构体
@@ -48,17 +82,14 @@ impl PageFaultHandler {
     /// 处理缺页异常
     /// ## 参数
     ///
-    /// - `vma`: VMA
-    /// - `mapper`: VMA
-    /// - `address`: VMA
-    /// - `flags`: VMA
+    /// - `pfm`: 缺页异常信息
+    /// - `mapper`: 页表映射器
     ///
     /// ## 返回值
-    /// - Some(Arc<LockedVMA>): 虚拟地址所在的或最近的下一个VMA
-    /// - None: 未找到VMA
+    /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn handle_mm_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
-        let flags = pfm.flags;
-        let vma = pfm.vma.clone();
+        let flags = pfm.flags();
+        let vma = pfm.vma();
         let current_pcb = ProcessManager::current_pcb();
         let mut guard = current_pcb.sched_info().inner_lock_write_irqsave();
         guard.set_state(ProcessState::Runnable);
@@ -96,7 +127,7 @@ impl PageFaultHandler {
         pfm: PageFaultMessage,
         mapper: &mut PageMapper,
     ) -> VmFaultReason {
-        let address = pfm.address;
+        let address = pfm.address_aligned_down();
         let vma = pfm.vma.clone();
         if mapper.get_entry(address, 3).is_none() {
             mapper
@@ -133,7 +164,7 @@ impl PageFaultHandler {
         pfm: PageFaultMessage,
         mapper: &mut PageMapper,
     ) -> VmFaultReason {
-        let address = pfm.address;
+        let address = pfm.address_aligned_down();
         let flags = pfm.flags;
         let vma = pfm.vma.clone();
         if let Some(mut entry) = mapper.get_entry(address, 0) {
@@ -175,7 +206,7 @@ impl PageFaultHandler {
         pfm: PageFaultMessage,
         mapper: &mut PageMapper,
     ) -> VmFaultReason {
-        let address = pfm.address;
+        let address = pfm.address_aligned_down();
         let vma = pfm.vma.clone();
         let guard = vma.lock();
         if let Some(flush) = mapper.map(address, guard.flags()) {
@@ -327,7 +358,7 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn do_wp_page(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
-        let address = pfm.address;
+        let address = pfm.address_aligned_down();
         let vma = pfm.vma.clone();
         let old_paddr = mapper.translate(address).unwrap().0;
         let mut page_manager = page_manager_lock_irqsave();

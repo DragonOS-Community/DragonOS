@@ -226,7 +226,6 @@ impl X86_64MMArch {
             if vma.is_none() {
                 panic!("no mapped vma");
             }
-            let address = VirtAddr::new(address.data() & MMArch::PAGE_MASK);
 
             let vma = vma.unwrap();
             // let guard = vma.lock();
@@ -245,11 +244,7 @@ impl X86_64MMArch {
             let mapper = &mut space_guard.user_mapper.utable;
 
             fault = PageFaultHandler::handle_mm_fault(
-                PageFaultMessage {
-                    vma: vma.clone(),
-                    address,
-                    flags,
-                },
+                PageFaultMessage::new(vma, address, flags),
                 mapper,
             );
 

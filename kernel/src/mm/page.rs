@@ -703,6 +703,16 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
         return self.update_flags(Arch::ENTRY_FLAG_ACCESSED, value);
     }
 
+    /// 设置指向的页是否为大页
+    ///
+    /// ## 参数
+    ///
+    /// - value: 如果为true，那么将当前页表项的访问标志设置为已访问。
+    #[inline(always)]
+    pub fn set_huge_page(self, value: bool) -> Self {
+        return self.update_flags(Arch::ENTRY_FLAG_PS, value);
+    }
+
     /// MMIO内存的页表项标志
     #[inline(always)]
     pub fn mmio_flags() -> Self {
@@ -903,9 +913,6 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
 
         let virt = VirtAddr::new(virt.data() & (!Arch::PAGE_NEGATIVE_MASK));
 
-        // TODO： 验证flags是否合法
-
-        // 创建页表项
         let mut table = self.table();
         loop {
             let i = table.index_of(virt)?;
@@ -913,44 +920,30 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             let next_table = table.next_level_table(i);
             if let Some(next_table) = next_table {
                 table = next_table;
-                // kdebug!("Mapping {:?} to next level table...", virt);
             } else {
                 break;
             }
         }
-        if table.level == 0 {
+
+        // 支持2M、1G大页，即页表层级为1、2级的页表可以映射大页，且不能为PGD（顶级页表）
+        if table.level == Arch::PAGE_LEVELS - 1 || table.level == 0 || table.level > 2 {
             return None;
         }
 
-        if table.level == Arch::PAGE_LEVELS - 1 {
-            let i = table.index_of(virt)?;
-            // 分配下一级页表
-            let frame = self.frame_allocator.allocate_one()?;
-
-            // 清空这个页帧
-            MMArch::write_bytes(MMArch::phys_2_virt(frame).unwrap(), 0, MMArch::PAGE_SIZE);
-
-            // 设置页表项的flags
-            let flags: PageFlags<Arch> =
-                PageFlags::new_page_table(virt.kind() == PageTableKind::User);
-
-            table.set_entry(i, PageEntry::new(frame, flags));
-
-            // 获取新分配的页表
-            table = table.next_level_table(i)?;
-        }
-
-        let (phys, count) = self
-            .frame_allocator
-            .allocate(PageFrameCount::new(table.level * Arch::PAGE_ENTRY_NUM))?;
+        let (phys, count) = self.frame_allocator.allocate(PageFrameCount::new(
+            Arch::PAGE_ENTRY_NUM.pow(table.level as u32),
+        ))?;
 
         MMArch::write_bytes(
             MMArch::phys_2_virt(phys).unwrap(),
             0,
-            MMArch::PAGE_SIZE * count.data() * Arch::PAGE_ENTRY_NUM,
+            MMArch::PAGE_SIZE * count.data(),
         );
 
-        table.set_entry(table.index_of(virt)?, PageEntry::new(phys, flags))?;
+        table.set_entry(
+            table.index_of(virt)?,
+            PageEntry::new(phys, flags.set_huge_page(true)),
+        )?;
         Some(PageFlush::new(virt))
     }
 

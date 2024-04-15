@@ -106,6 +106,7 @@ impl MemoryManagementArch for X86_64MMArch {
 
     const ENTRY_FLAG_ACCESSED: usize = 1 << 5;
     const ENTRY_FLAG_DIRTY: usize = 1 << 6;
+    const ENTRY_FLAG_PS: usize = 1 << 7;
     const ENTRY_FLAG_GLOBAL: usize = 1 << 8;
 
     /// 物理地址与虚拟地址的偏移量

@@ -155,7 +155,6 @@ impl File {
             readdir_subdirs_name: SpinLock::new(Vec::default()),
             private_data: SpinLock::new(FilePrivateData::default()),
         };
-        // kdebug!("inode:{:?}",f.inode);
         f.inode.open(f.private_data.lock(), &mode)?;
 
         return Ok(f);
@@ -516,7 +515,7 @@ impl File {
 
                 return socket.remove_epoll(epoll);
             }
-            _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+            _ => return Err(SystemError::ENOSYS),
         }
     }
 

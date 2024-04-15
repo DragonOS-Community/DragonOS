@@ -876,7 +876,7 @@ impl Attribute for DeviceAttrDev {
                 "Intertrait casting not implemented for kobj: {}",
                 kobj.name()
             );
-            SystemError::EOPNOTSUPP_OR_ENOTSUP
+            SystemError::ENOSYS
         })?;
 
         let device_number = dev.id_table().device_number();

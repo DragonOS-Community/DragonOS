@@ -171,7 +171,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 }
 

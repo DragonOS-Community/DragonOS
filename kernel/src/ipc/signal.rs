@@ -36,7 +36,7 @@ impl Signal {
         // 如果并无进程与指定的 pid 相匹配，那么 kill() 调用失败，同时将 errno 置为 ESRCH（“查无此进程”）
         if pid.lt(&Pid::from(0)) {
             kwarn!("Kill operation not support: pid={:?}", pid);
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::ENOSYS);
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // 检查sig是否符合要求，如果不符合要求，则退出。

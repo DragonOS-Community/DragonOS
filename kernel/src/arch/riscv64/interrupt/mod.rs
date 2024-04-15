@@ -35,6 +35,7 @@ impl InterruptArch for RiscV64InterruptArch {
 
     unsafe fn save_and_disable_irq() -> IrqFlagsGuard {
         let sie = riscv::register::sstatus::read().sie();
+        riscv::register::sstatus::clear_sie();
         IrqFlagsGuard::new(IrqFlags::new(sie.into()))
     }
 

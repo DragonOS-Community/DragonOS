@@ -3,16 +3,13 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    driver::{
-        base::{
-            device::{device_manager, Device},
-            kobject::KObject,
-            platform::{
-                platform_device::{platform_device_manager, PlatformDevice},
-                platform_driver::{platform_driver_manager, PlatformDriver},
-            },
+    driver::base::{
+        device::{device_manager, Device},
+        kobject::KObject,
+        platform::{
+            platform_device::{platform_device_manager, PlatformDevice},
+            platform_driver::{platform_driver_manager, PlatformDriver},
         },
-        input::ps2_mouse::ps_mouse_device::rs_ps2_mouse_device_init,
     },
     init::initcall::INITCALL_DEVICE,
 };
@@ -70,6 +67,9 @@ pub fn i8042_setup_aux() -> Result<(), SystemError> {
     )));
     serio_device_manager().register_port(aux_port.clone() as Arc<dyn SerioDevice>)?;
 
-    rs_ps2_mouse_device_init(aux_port.clone() as Arc<dyn KObject>)?;
+    #[cfg(target_arch = "x86_64")]
+    crate::driver::input::ps2_mouse::ps_mouse_device::rs_ps2_mouse_device_init(
+        aux_port.clone() as Arc<dyn KObject>
+    )?;
     Ok(())
 }

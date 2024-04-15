@@ -19,6 +19,7 @@ use crate::{
 
 use super::{
     file::FileMode,
+    mount::MountFSInode,
     utils::{rsplit_path, user_path_at},
     IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
@@ -66,6 +67,7 @@ pub fn vfs_init() -> Result<(), SystemError> {
     root_inode
         .create("sys", FileType::Dir, ModeType::from_bits_truncate(0o755))
         .expect("Failed to create /sys");
+
     kdebug!("dir in root:{:?}", root_inode.list());
 
     procfs_init().expect("Failed to initialize procfs");
@@ -103,9 +105,9 @@ fn do_migrate(
             .unwrap_or_else(|_| panic!("Failed to create '/{mountpoint_name}' in migrating"))
     };
     // 迁移挂载点
-    mountpoint
-        .mount(fs.inner_filesystem())
-        .unwrap_or_else(|_| panic!("Failed to migrate {mountpoint_name} "));
+    let inode = mountpoint.arc_any().downcast::<MountFSInode>().unwrap();
+    inode.do_mount(inode.inode_id(), fs.self_ref())?;
+
     return Ok(());
 }
 
@@ -130,6 +132,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     do_migrate(new_root_inode.clone(), "proc", proc)?;
     do_migrate(new_root_inode.clone(), "dev", dev)?;
     do_migrate(new_root_inode.clone(), "sys", sys)?;
+
     unsafe {
         // drop旧的Root inode
         let old_root_inode = __ROOT_INODE.take().unwrap();

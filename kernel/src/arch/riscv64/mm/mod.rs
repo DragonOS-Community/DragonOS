@@ -1,11 +1,10 @@
-use acpi::address;
 use riscv::register::satp;
 use sbi_rt::{HartMask, SbiRet};
 use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
-    kdebug,
+    driver::open_firmware::fdt::open_firmware_fdt_driver,
     libs::spinlock::SpinLock,
     mm::{
         allocator::{
@@ -13,7 +12,7 @@ use crate::{
             page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage, PhysPageFrame},
         },
         kernel_mapper::KernelMapper,
-        page::{PageEntry, PageFlags},
+        page::{PageEntry, PageFlags, PAGE_1G_SHIFT},
         ucontext::UserMapper,
         MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
     },
@@ -130,14 +129,26 @@ impl MemoryManagementArch for RiscV64MMArch {
 
     const USER_STACK_START: crate::mm::VirtAddr = VirtAddr::new(0x0000_001f_ffa0_0000);
 
-    /// 在距离sv39的顶端还有1G的位置，设置为FIXMAP的起始地址
-    const FIXMAP_START_VADDR: VirtAddr = VirtAddr::new(0xffff_ffff_8000_0000);
+    /// 在距离sv39的顶端还有64M的位置，设置为FIXMAP的起始地址
+    const FIXMAP_START_VADDR: VirtAddr = VirtAddr::new(0xffff_ffff_fc00_0000);
     /// 设置1MB的fixmap空间
     const FIXMAP_SIZE: usize = 256 * 4096;
+
+    /// 在距离sv39的顶端还有2G的位置，设置为MMIO空间的起始地址
+    const MMIO_BASE: VirtAddr = VirtAddr::new(0xffff_ffff_8000_0000);
+    /// 设置1g的MMIO空间
+    const MMIO_SIZE: usize = 1 << PAGE_1G_SHIFT;
 
     #[inline(never)]
     unsafe fn init() {
         riscv_mm_init().expect("init kernel memory management architecture failed");
+    }
+
+    unsafe fn arch_post_init() {
+        // 映射fdt
+        open_firmware_fdt_driver()
+            .map_fdt()
+            .expect("openfirmware map fdt failed");
     }
 
     unsafe fn invalidate_page(address: VirtAddr) {

@@ -53,13 +53,12 @@ pub fn user_path_at(
             // drop guard 以避免无法调度的问题
             drop(fd_table_guard);
 
-            let file_guard = file.lock();
             // 如果dirfd不是目录，则返回错误码ENOTDIR
-            if file_guard.file_type() != FileType::Dir {
+            if file.file_type() != FileType::Dir {
                 return Err(SystemError::ENOTDIR);
             }
 
-            inode = file_guard.inode();
+            inode = file.inode();
             ret_path = String::from(path);
         } else {
             let mut cwd = pcb.basic().cwd();

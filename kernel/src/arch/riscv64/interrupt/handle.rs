@@ -1,8 +1,13 @@
+//! 处理中断和异常
+//!
+//! 架构相关的处理逻辑参考： https://code.dragonos.org.cn/xref/linux-6.6.21/arch/riscv/kernel/traps.c
 use core::hint::spin_loop;
 
 use system_error::SystemError;
 
-use crate::{kdebug, kerror};
+use crate::{
+    arch::syscall::syscall_handler, driver::irqchip::riscv_intc::riscv_intc_irq, kdebug, kerror,
+};
 
 use super::TrapFrame;
 
@@ -37,11 +42,8 @@ unsafe extern "C" fn riscv64_do_irq(trap_frame: &mut TrapFrame) {
 }
 
 /// 处理中断
-fn riscv64_do_interrupt(_trap_frame: &mut TrapFrame) {
-    kdebug!("todo: riscv64_do_irq: interrupt");
-    loop {
-        spin_loop();
-    }
+fn riscv64_do_interrupt(trap_frame: &mut TrapFrame) {
+    riscv_intc_irq(trap_frame);
 }
 
 /// 处理异常
@@ -136,11 +138,16 @@ fn do_trap_store_access_fault(_trap_frame: &mut TrapFrame) -> Result<(), SystemE
 }
 
 /// 处理环境调用异常 #8
-fn do_trap_user_env_call(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    kerror!("riscv64_do_irq: do_trap_user_env_call");
-    loop {
-        spin_loop();
+fn do_trap_user_env_call(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    if trap_frame.is_from_user() {
+        let syscall_num = trap_frame.a7;
+        trap_frame.epc += 4;
+        trap_frame.origin_a0 = trap_frame.a0;
+        syscall_handler(syscall_num, trap_frame);
+    } else {
+        panic!("do_trap_user_env_call: not from user mode")
     }
+    Ok(())
 }
 
 // 9-11 reserved
@@ -154,8 +161,16 @@ fn do_trap_insn_page_fault(_trap_frame: &mut TrapFrame) -> Result<(), SystemErro
 }
 
 /// 处理页加载错误异常 #13
-fn do_trap_load_page_fault(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    kerror!("riscv64_do_irq: do_trap_load_page_fault");
+fn do_trap_load_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    let vaddr = trap_frame.badaddr;
+    let cause = trap_frame.cause;
+    let epc = trap_frame.epc;
+    kerror!(
+        "riscv64_do_irq: do_trap_load_page_fault: epc: {epc:#x}, vaddr={:#x}, cause={:?}",
+        vaddr,
+        cause
+    );
+
     loop {
         spin_loop();
     }

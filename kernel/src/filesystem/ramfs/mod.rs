@@ -7,9 +7,11 @@ use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{core::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
+    libs::casting::DowncastArc,
     libs::spinlock::{SpinLock, SpinLockGuard},
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
+
 use alloc::{
     collections::BTreeMap,
     string::String,
@@ -108,9 +110,9 @@ impl RamFS {
                 size: 0,
                 blk_size: 0,
                 blocks: 0,
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type: FileType::Dir,
                 mode: ModeType::from_bits_truncate(0o777),
                 nlinks: 1,
@@ -143,7 +145,6 @@ impl RamFS {
         return Ok(fs);
     }
 }
-
 #[distributed_slice(FSMAKER)]
 static RAMFSMAKER: FileSystemMaker = FileSystemMaker::new(
     "ramfs",
@@ -166,13 +167,13 @@ impl IndexNode for LockedRamFSInode {
         return Ok(());
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
     fn open(
         &self,
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
         _mode: &super::vfs::file::FileMode,
     ) -> Result<(), SystemError> {
         return Ok(());
@@ -183,7 +184,7 @@ impl IndexNode for LockedRamFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
@@ -215,7 +216,7 @@ impl IndexNode for LockedRamFSInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
@@ -309,9 +310,9 @@ impl IndexNode for LockedRamFSInode {
                 size: 0,
                 blk_size: 0,
                 blocks: 0,
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type,
                 mode,
                 nlinks: 1,
@@ -410,16 +411,30 @@ impl IndexNode for LockedRamFSInode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
     ) -> Result<(), SystemError> {
-        let old_inode: Arc<dyn IndexNode> = self.find(old_name)?;
+        let inode: Arc<dyn IndexNode> = self.find(old_name)?;
+        // 修改其对父节点的引用
+        inode
+            .downcast_ref::<LockedRamFSInode>()
+            .ok_or(SystemError::EPERM)?
+            .0
+            .lock()
+            .parent = Arc::downgrade(
+            &target
+                .clone()
+                .downcast_arc::<LockedRamFSInode>()
+                .ok_or(SystemError::EPERM)?,
+        );
 
         // 在新的目录下创建一个硬链接
-        target.link(new_name, &old_inode)?;
+        target.link(new_name, &inode)?;
+
         // 取消现有的目录下的这个硬链接
-        if let Err(err) = self.unlink(old_name) {
-            // 如果取消失败，那就取消新的目录下的硬链接
+        if let Err(e) = self.unlink(old_name) {
+            // 当操作失败时回退操作
             target.unlink(new_name)?;
-            return Err(err);
+            return Err(e);
         }
+
         return Ok(());
     }
 
@@ -530,9 +545,9 @@ impl IndexNode for LockedRamFSInode {
                 size: 0,
                 blk_size: 0,
                 blocks: 0,
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type: FileType::Pipe,
                 mode,
                 nlinks: 1,
@@ -569,7 +584,6 @@ impl IndexNode for LockedRamFSInode {
     fn special_node(&self) -> Option<super::vfs::SpecialNodeData> {
         return self.0.lock().special_node.clone();
     }
-
     /// # 用于重命名内存中的文件或目录
     fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), SystemError> {
         let old_inode: Arc<dyn IndexNode> = self.find(_old_name)?;

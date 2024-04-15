@@ -4,11 +4,14 @@ use alloc::{string::ToString, sync::Arc};
 use kdepends::thingbuf::StaticThingBuf;
 
 use crate::{
-    arch::sched::sched,
+    arch::CurrentIrqArch,
+    driver::tty::virtual_terminal::virtual_console::CURRENT_VCNUM,
+    exception::InterruptArch,
     process::{
         kthread::{KernelThreadClosure, KernelThreadMechanism},
-        ProcessControlBlock, ProcessFlags,
+        ProcessControlBlock, ProcessManager,
     },
+    sched::{schedule, SchedMode},
 };
 
 use super::tty_port::current_tty_port;
@@ -34,15 +37,9 @@ fn tty_refresh_thread() -> i32 {
     loop {
         if KEYBUF.is_empty() {
             // 如果缓冲区为空，就休眠
-            unsafe {
-                TTY_REFRESH_THREAD
-                    .as_ref()
-                    .unwrap()
-                    .flags()
-                    .insert(ProcessFlags::NEED_SCHEDULE)
-            };
-
-            sched();
+            let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+            ProcessManager::mark_sleep(true).expect("TTY_REFRESH_THREAD can not mark sleep");
+            schedule(SchedMode::SM_NONE);
         }
 
         let to_dequeue = core::cmp::min(KEYBUF.len(), TO_DEQUEUE_MAX);
@@ -54,7 +51,12 @@ fn tty_refresh_thread() -> i32 {
             *item = KEYBUF.pop().unwrap();
         }
 
-        let _ = current_tty_port().receive_buf(&data[0..to_dequeue], &[], to_dequeue);
+        if CURRENT_VCNUM.load(core::sync::atomic::Ordering::SeqCst) != -1 {
+            let _ = current_tty_port().receive_buf(&data[0..to_dequeue], &[], to_dequeue);
+        } else {
+            // 这里由于stdio未初始化，所以无法找到port
+            // TODO: 考虑改用双端队列，能够将丢失的输入插回
+        }
     }
 }
 
@@ -63,4 +65,5 @@ pub fn send_to_tty_refresh_thread(data: &[u8]) {
     for item in data {
         KEYBUF.push(*item).ok();
     }
+    let _ = ProcessManager::wakeup(unsafe { TTY_REFRESH_THREAD.as_ref().unwrap() });
 }

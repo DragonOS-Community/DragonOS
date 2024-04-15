@@ -261,6 +261,7 @@ impl SmpCpuManager {
         // todo: 等待CPU启动完成
 
         ProcessManager::wakeup(cpu_state.thread.as_ref().unwrap())?;
+
         CurrentSMPArch::start_cpu(cpu_id, cpu_state)?;
         assert_eq!(ProcessManager::current_pcb().preempt_count(), 0);
         self.wait_for_ap_thread(cpu_state, cpu_state.bringup);
@@ -270,7 +271,10 @@ impl SmpCpuManager {
 
     fn wait_for_ap_thread(&self, cpu_state: &mut CpuHpCpuState, bringup: bool) {
         if bringup {
-            cpu_state.comp_done_up.wait_for_completion().ok();
+            cpu_state
+                .comp_done_up
+                .wait_for_completion()
+                .expect("failed to wait ap thread");
         } else {
             todo!("wait_for_ap_thread")
         }

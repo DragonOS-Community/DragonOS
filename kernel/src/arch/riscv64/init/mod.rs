@@ -18,6 +18,7 @@ pub struct ArchBootParams {
     /// 启动时的fdt物理地址
     pub fdt_paddr: PhysAddr,
     pub fdt_vaddr: Option<VirtAddr>,
+    pub fdt_size: usize,
 
     pub boot_hartid: ProcessorId,
 }
@@ -26,6 +27,7 @@ impl ArchBootParams {
     pub const DEFAULT: Self = ArchBootParams {
         fdt_paddr: PhysAddr::new(0),
         fdt_vaddr: None,
+        fdt_size: 0,
         boot_hartid: ProcessorId::new(0),
     };
 
@@ -103,8 +105,12 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
     let hartid = unsafe { BOOT_HARTID };
     let fdt_paddr = unsafe { BOOT_FDT_PADDR };
 
+    let fdt =
+        unsafe { fdt::Fdt::from_ptr(fdt_paddr.data() as *const u8).expect("Failed to parse fdt!") };
+
     let mut arch_boot_params_guard = boot_params().write();
     arch_boot_params_guard.arch.fdt_paddr = fdt_paddr;
+    arch_boot_params_guard.arch.fdt_size = fdt.total_size();
     arch_boot_params_guard.arch.boot_hartid = ProcessorId::new(hartid);
 
     drop(arch_boot_params_guard);
@@ -116,8 +122,6 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
     );
     mm_early_init();
 
-    let fdt =
-        unsafe { fdt::Fdt::from_ptr(fdt_paddr.data() as *const u8).expect("Failed to parse fdt!") };
     print_node(fdt.find_node("/").unwrap(), 0);
 
     unsafe { parse_dtb() };

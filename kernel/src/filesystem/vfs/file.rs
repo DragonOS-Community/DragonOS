@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use alloc::{
     string::String,
     sync::{Arc, Weak},
@@ -13,7 +15,7 @@ use crate::{
     filesystem::procfs::ProcfsFilePrivateData,
     ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
     kerror,
-    libs::spinlock::SpinLock,
+    libs::{rwlock::RwLock, spinlock::SpinLock},
     net::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
         socket::SocketInode,
@@ -121,14 +123,14 @@ impl FileMode {
 pub struct File {
     inode: Arc<dyn IndexNode>,
     /// 对于文件，表示字节偏移量；对于文件夹，表示当前操作的子目录项偏移量
-    offset: usize,
+    offset: AtomicUsize,
     /// 文件的打开模式
-    mode: FileMode,
+    mode: RwLock<FileMode>,
     /// 文件类型
     file_type: FileType,
     /// readdir时候用的，暂存的本次循环中，所有子目录项的名字的数组
-    readdir_subdirs_name: Vec<String>,
-    pub private_data: FilePrivateData,
+    readdir_subdirs_name: SpinLock<Vec<String>>,
+    pub private_data: SpinLock<FilePrivateData>,
 }
 
 impl File {
@@ -145,16 +147,15 @@ impl File {
             }
         }
 
-        let mut f = File {
+        let f = File {
             inode,
-            offset: 0,
-            mode,
+            offset: AtomicUsize::new(0),
+            mode: RwLock::new(mode),
             file_type,
-            readdir_subdirs_name: Vec::new(),
-            private_data: FilePrivateData::default(),
+            readdir_subdirs_name: SpinLock::new(Vec::default()),
+            private_data: SpinLock::new(FilePrivateData::default()),
         };
-        // kdebug!("inode:{:?}",f.inode);
-        f.inode.open(&mut f.private_data, &mode)?;
+        f.inode.open(f.private_data.lock(), &mode)?;
 
         return Ok(f);
     }
@@ -166,8 +167,13 @@ impl File {
     ///
     /// @return Ok(usize) 成功读取的字节数
     /// @return Err(SystemError) 错误码
-    pub fn read(&mut self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        self.do_read(self.offset, len, buf, true)
+    pub fn read(&self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.do_read(
+            self.offset.load(core::sync::atomic::Ordering::SeqCst),
+            len,
+            buf,
+            true,
+        )
     }
 
     /// @brief 从buffer向文件写入指定的字节数的数据
@@ -177,8 +183,13 @@ impl File {
     ///
     /// @return Ok(usize) 成功写入的字节数
     /// @return Err(SystemError) 错误码
-    pub fn write(&mut self, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        self.do_write(self.offset, len, buf, true)
+    pub fn write(&self, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        self.do_write(
+            self.offset.load(core::sync::atomic::Ordering::SeqCst),
+            len,
+            buf,
+            true,
+        )
     }
 
     /// ## 从文件中指定的偏移处读取指定的字节数到buf中
@@ -190,12 +201,7 @@ impl File {
     ///
     /// ### 返回值
     /// - `Ok(usize)`: 成功读取的字节数
-    pub fn pread(
-        &mut self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-    ) -> Result<usize, SystemError> {
+    pub fn pread(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         self.do_read(offset, len, buf, false)
     }
 
@@ -208,12 +214,12 @@ impl File {
     ///
     /// ### 返回值
     /// - `Ok(usize)`: 成功写入的字节数
-    pub fn pwrite(&mut self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
+    pub fn pwrite(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
         self.do_write(offset, len, buf, false)
     }
 
     fn do_read(
-        &mut self,
+        &self,
         offset: usize,
         len: usize,
         buf: &mut [u8],
@@ -227,17 +233,18 @@ impl File {
 
         let len = self
             .inode
-            .read_at(offset, len, buf, &mut self.private_data)?;
+            .read_at(offset, len, buf, self.private_data.lock())?;
 
         if update_offset {
-            self.offset += len;
+            self.offset
+                .fetch_add(len, core::sync::atomic::Ordering::SeqCst);
         }
 
         Ok(len)
     }
 
     fn do_write(
-        &mut self,
+        &self,
         offset: usize,
         len: usize,
         buf: &[u8],
@@ -255,10 +262,11 @@ impl File {
         }
         let len = self
             .inode
-            .write_at(offset, len, buf, &mut self.private_data)?;
+            .write_at(offset, len, buf, self.private_data.lock())?;
 
         if update_offset {
-            self.offset += len;
+            self.offset
+                .fetch_add(len, core::sync::atomic::Ordering::SeqCst);
         }
 
         Ok(len)
@@ -278,7 +286,7 @@ impl File {
     /// @brief 调整文件操作指针的位置
     ///
     /// @param origin 调整的起始位置
-    pub fn lseek(&mut self, origin: SeekFrom) -> Result<usize, SystemError> {
+    pub fn lseek(&self, origin: SeekFrom) -> Result<usize, SystemError> {
         let file_type = self.inode.metadata()?.file_type;
         match file_type {
             FileType::Pipe | FileType::CharDevice => {
@@ -289,7 +297,7 @@ impl File {
 
         let pos: i64 = match origin {
             SeekFrom::SeekSet(offset) => offset,
-            SeekFrom::SeekCurrent(offset) => self.offset as i64 + offset,
+            SeekFrom::SeekCurrent(offset) => self.offset.load(Ordering::SeqCst) as i64 + offset,
             SeekFrom::SeekEnd(offset) => {
                 let metadata = self.metadata()?;
                 metadata.size + offset
@@ -303,15 +311,15 @@ impl File {
         if pos < 0 {
             return Err(SystemError::EOVERFLOW);
         }
-        self.offset = pos as usize;
-        return Ok(self.offset);
+        self.offset.store(pos as usize, Ordering::SeqCst);
+        return Ok(pos as usize);
     }
 
     /// @brief 判断当前文件是否可读
     #[inline]
     pub fn readable(&self) -> Result<(), SystemError> {
         // 暂时认为只要不是write only, 就可读
-        if self.mode == FileMode::O_WRONLY {
+        if *self.mode.read() == FileMode::O_WRONLY {
             return Err(SystemError::EPERM);
         }
 
@@ -322,7 +330,7 @@ impl File {
     #[inline]
     pub fn writeable(&self) -> Result<(), SystemError> {
         // 暂时认为只要不是read only, 就可写
-        if self.mode == FileMode::O_RDONLY {
+        if *self.mode.read() == FileMode::O_RDONLY {
             return Err(SystemError::EPERM);
         }
 
@@ -331,23 +339,24 @@ impl File {
 
     /// @biref 充填dirent结构体
     /// @return 返回dirent结构体的大小
-    pub fn readdir(&mut self, dirent: &mut Dirent) -> Result<u64, SystemError> {
+    pub fn readdir(&self, dirent: &mut Dirent) -> Result<u64, SystemError> {
         let inode: &Arc<dyn IndexNode> = &self.inode;
-
+        let mut readdir_subdirs_name = self.readdir_subdirs_name.lock();
+        let offset = self.offset.load(Ordering::SeqCst);
         // 如果偏移量为0
-        if self.offset == 0 {
+        if offset == 0 {
             // 通过list更新readdir_subdirs_name
-            self.readdir_subdirs_name = inode.list()?;
-            self.readdir_subdirs_name.sort();
+            *readdir_subdirs_name = inode.list()?;
+            readdir_subdirs_name.sort();
         }
         // kdebug!("sub_entries={sub_entries:?}");
 
         // 已经读到末尾
-        if self.offset == self.readdir_subdirs_name.len() {
-            self.offset = 0;
+        if offset == readdir_subdirs_name.len() {
+            self.offset.store(0, Ordering::SeqCst);
             return Ok(0);
         }
-        let name = &self.readdir_subdirs_name[self.offset];
+        let name = &readdir_subdirs_name[offset];
         let sub_inode: Arc<dyn IndexNode> = match inode.find(name) {
             Ok(i) => i,
             Err(e) => {
@@ -370,7 +379,7 @@ impl File {
             buf[name_bytes.len()] = 0;
         }
 
-        self.offset += 1;
+        self.offset.fetch_add(1, Ordering::SeqCst);
         dirent.d_ino = sub_inode.metadata().unwrap().inode_id.into() as u64;
         dirent.d_type = sub_inode.metadata().unwrap().file_type.get_file_type_num() as u8;
 
@@ -392,16 +401,20 @@ impl File {
     ///
     /// @return Option<File> 克隆后的文件结构体。如果克隆失败，返回None
     pub fn try_clone(&self) -> Option<File> {
-        let mut res = Self {
+        let res = Self {
             inode: self.inode.clone(),
-            offset: self.offset,
-            mode: self.mode,
+            offset: AtomicUsize::new(self.offset.load(Ordering::SeqCst)),
+            mode: RwLock::new(self.mode()),
             file_type: self.file_type,
-            readdir_subdirs_name: self.readdir_subdirs_name.clone(),
-            private_data: self.private_data.clone(),
+            readdir_subdirs_name: SpinLock::new(self.readdir_subdirs_name.lock().clone()),
+            private_data: SpinLock::new(self.private_data.lock().clone()),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
-        if self.inode.open(&mut res.private_data, &res.mode).is_err() {
+        if self
+            .inode
+            .open(res.private_data.lock(), &res.mode())
+            .is_err()
+        {
             return None;
         }
 
@@ -417,32 +430,33 @@ impl File {
     /// @brief 获取文件的打开模式
     #[inline]
     pub fn mode(&self) -> FileMode {
-        return self.mode;
+        return *self.mode.read();
     }
 
     /// 获取文件是否在execve时关闭
     #[inline]
     pub fn close_on_exec(&self) -> bool {
-        return self.mode.contains(FileMode::O_CLOEXEC);
+        return self.mode().contains(FileMode::O_CLOEXEC);
     }
 
     /// 设置文件是否在execve时关闭
     #[inline]
-    pub fn set_close_on_exec(&mut self, close_on_exec: bool) {
+    pub fn set_close_on_exec(&self, close_on_exec: bool) {
+        let mut mode_guard = self.mode.write();
         if close_on_exec {
-            self.mode.insert(FileMode::O_CLOEXEC);
+            mode_guard.insert(FileMode::O_CLOEXEC);
         } else {
-            self.mode.remove(FileMode::O_CLOEXEC);
+            mode_guard.remove(FileMode::O_CLOEXEC);
         }
     }
 
-    pub fn set_mode(&mut self, mode: FileMode) -> Result<(), SystemError> {
+    pub fn set_mode(&self, mode: FileMode) -> Result<(), SystemError> {
         // todo: 是否需要调用inode的open方法，以更新private data（假如它与mode有关的话）?
         // 也许需要加个更好的设计，让inode知晓文件的打开模式发生了变化，让它自己决定是否需要更新private data
 
         // 直接修改文件的打开模式
-        self.mode = mode;
-        self.private_data.update_mode(mode);
+        *self.mode.write() = mode;
+        self.private_data.lock().update_mode(mode);
         return Ok(());
     }
 
@@ -465,7 +479,7 @@ impl File {
     /// ## 向该文件添加一个EPollItem对象
     ///
     /// 在文件状态发生变化时，需要向epoll通知
-    pub fn add_epoll(&mut self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
+    pub fn add_epoll(&self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
         match self.file_type {
             FileType::Socket => {
                 let inode = self.inode.downcast_ref::<SocketInode>().unwrap();
@@ -481,7 +495,7 @@ impl File {
                 let r = self.inode.ioctl(
                     EventPoll::ADD_EPOLLITEM,
                     &epitem as *const Arc<EPollItem> as usize,
-                    &self.private_data,
+                    &self.private_data.lock(),
                 );
                 if r.is_err() {
                     return Err(SystemError::ENOSYS);
@@ -493,7 +507,7 @@ impl File {
     }
 
     /// ## 删除一个绑定的epoll
-    pub fn remove_epoll(&mut self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
+    pub fn remove_epoll(&self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
         match self.file_type {
             FileType::Socket => {
                 let inode = self.inode.downcast_ref::<SocketInode>().unwrap();
@@ -506,13 +520,13 @@ impl File {
     }
 
     pub fn poll(&self) -> Result<usize, SystemError> {
-        self.inode.poll(&self.private_data)
+        self.inode.poll(&self.private_data.lock())
     }
 }
 
 impl Drop for File {
     fn drop(&mut self) {
-        let r: Result<(), SystemError> = self.inode.close(&mut self.private_data);
+        let r: Result<(), SystemError> = self.inode.close(self.private_data.lock());
         // 打印错误信息
         if r.is_err() {
             kerror!(
@@ -529,7 +543,7 @@ impl Drop for File {
 #[derive(Debug)]
 pub struct FileDescriptorVec {
     /// 当前进程打开的文件描述符
-    fds: Vec<Option<Arc<SpinLock<File>>>>,
+    fds: Vec<Option<Arc<File>>>,
 }
 
 impl FileDescriptorVec {
@@ -551,8 +565,8 @@ impl FileDescriptorVec {
         let mut res = FileDescriptorVec::new();
         for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
             if let Some(file) = &self.fds[i] {
-                if let Some(file) = file.lock().try_clone() {
-                    res.fds[i] = Some(Arc::new(SpinLock::new(file)));
+                if let Some(file) = file.try_clone() {
+                    res.fds[i] = Some(Arc::new(file));
                 }
             }
         }
@@ -584,7 +598,7 @@ impl FileDescriptorVec {
         if let Some(new_fd) = fd {
             let x = &mut self.fds[new_fd as usize];
             if x.is_none() {
-                *x = Some(Arc::new(SpinLock::new(file)));
+                *x = Some(Arc::new(file));
                 return Ok(new_fd);
             } else {
                 return Err(SystemError::EBADF);
@@ -593,7 +607,7 @@ impl FileDescriptorVec {
             // 没有指定要申请的文件描述符编号
             for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
                 if self.fds[i].is_none() {
-                    self.fds[i] = Some(Arc::new(SpinLock::new(file)));
+                    self.fds[i] = Some(Arc::new(file));
                     return Ok(i as i32);
                 }
             }
@@ -606,7 +620,7 @@ impl FileDescriptorVec {
     /// ## 参数
     ///
     /// - `fd` 文件描述符序号
-    pub fn get_file_by_fd(&self, fd: i32) -> Option<Arc<SpinLock<File>>> {
+    pub fn get_file_by_fd(&self, fd: i32) -> Option<Arc<File>> {
         if !FileDescriptorVec::validate_fd(fd) {
             return None;
         }
@@ -619,11 +633,6 @@ impl FileDescriptorVec {
     ///
     /// - `fd` 文件描述符序号
     pub fn drop_fd(&mut self, fd: i32) -> Result<(), SystemError> {
-        // 判断文件描述符的数字是否超过限制
-        if !FileDescriptorVec::validate_fd(fd) {
-            return Err(SystemError::EBADF);
-        }
-
         self.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
 
         // 把文件描述符数组对应位置设置为空
@@ -641,7 +650,7 @@ impl FileDescriptorVec {
     pub fn close_on_exec(&mut self) {
         for i in 0..FileDescriptorVec::PROCESS_MAX_FD {
             if let Some(file) = &self.fds[i] {
-                let to_drop = file.lock().close_on_exec();
+                let to_drop = file.close_on_exec();
                 if to_drop {
                     if let Err(r) = self.drop_fd(i as i32) {
                         kerror!(
@@ -670,7 +679,7 @@ impl<'a> FileDescriptorIterator<'a> {
 }
 
 impl<'a> Iterator for FileDescriptorIterator<'a> {
-    type Item = (i32, Arc<SpinLock<File>>);
+    type Item = (i32, Arc<File>);
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.index < FileDescriptorVec::PROCESS_MAX_FD {

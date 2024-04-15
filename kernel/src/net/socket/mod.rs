@@ -15,7 +15,7 @@ use smoltcp::{
 use system_error::SystemError;
 
 use crate::{
-    arch::{rand::rand, sched::sched},
+    arch::rand::rand,
     filesystem::vfs::{
         file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode,
         Metadata,
@@ -25,6 +25,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::EventWaitQueue,
     },
+    sched::{schedule, SchedMode},
 };
 
 use self::{
@@ -299,12 +300,16 @@ impl SocketInode {
 }
 
 impl IndexNode for SocketInode {
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         self.1.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         let prev_ref_count = self.1.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
         if prev_ref_count == 1 {
             // 最后一次关闭，需要释放
@@ -325,6 +330,7 @@ impl IndexNode for SocketInode {
                 .remove(&socket.socket_handle())
                 .unwrap();
         }
+
         Ok(())
     }
 
@@ -333,8 +339,9 @@ impl IndexNode for SocketInode {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        drop(data);
         self.0.lock_no_preempt().read(&mut buf[0..len]).0
     }
 
@@ -343,8 +350,9 @@ impl IndexNode for SocketInode {
         _offset: usize,
         len: usize,
         buf: &[u8],
-        _data: &mut FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        drop(data);
         self.0.lock_no_preempt().write(&buf[0..len], None)
     }
 
@@ -413,7 +421,7 @@ impl SocketHandleItem {
                 .sleep_without_schedule(events)
         };
         drop(handle_map_guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     pub fn shutdown_type(&self) -> ShutdownType {
@@ -448,9 +456,9 @@ impl SocketHandleItem {
 /// 如果 TCP/UDP 的 socket 绑定了某个端口，它会在对应的表中记录，以检测端口冲突。
 pub struct PortManager {
     // TCP 端口记录表
-    tcp_port_table: SpinLock<HashMap<u16, Arc<GlobalSocketHandle>>>,
+    tcp_port_table: SpinLock<HashMap<u16, Arc<dyn Socket>>>,
     // UDP 端口记录表
-    udp_port_table: SpinLock<HashMap<u16, Arc<GlobalSocketHandle>>>,
+    udp_port_table: SpinLock<HashMap<u16, Arc<dyn Socket>>>,
 }
 
 impl PortManager {
@@ -506,7 +514,7 @@ impl PortManager {
         &self,
         socket_type: SocketType,
         port: u16,
-        handle: Arc<GlobalSocketHandle>,
+        socket: impl Socket,
     ) -> Result<(), SystemError> {
         if port > 0 {
             let mut listen_table_guard = match socket_type {
@@ -516,7 +524,7 @@ impl PortManager {
             };
             match listen_table_guard.get(&port) {
                 Some(_) => return Err(SystemError::EADDRINUSE),
-                None => listen_table_guard.insert(port, handle),
+                None => listen_table_guard.insert(port, Arc::new(socket)),
             };
             drop(listen_table_guard);
         }

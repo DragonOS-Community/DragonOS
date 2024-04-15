@@ -15,7 +15,7 @@ use crate::{
         once::Once,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 use alloc::{
     collections::BTreeMap,
@@ -147,6 +147,10 @@ impl DevFS {
                 if name.starts_with("tty") && name.len() > 3 {
                     dev_root_inode.add_dev(name, device.clone())?;
                 }
+                // ptmx设备
+                if name == "ptmx" {
+                    dev_root_inode.add_dev(name, device.clone())?;
+                }
                 device.set_fs(dev_char_inode.0.lock().fs.clone());
             }
             FileType::BlockDevice => {
@@ -269,9 +273,9 @@ impl DevFSInode {
                 size: 0,
                 blk_size: 0,
                 blocks: 0,
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type: dev_type_, // 文件夹
                 mode,
                 nlinks: 1,
@@ -359,9 +363,9 @@ impl LockedDevFSInode {
                 size: 0,
                 blk_size: 0,
                 blocks: 0,
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type,
                 mode,
                 nlinks: 1,
@@ -388,13 +392,13 @@ impl IndexNode for LockedDevFSInode {
 
     fn open(
         &self,
-        _data: &mut super::vfs::FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
         _mode: &FileMode,
     ) -> Result<(), SystemError> {
         return Ok(());
     }
 
-    fn close(&self, _data: &mut super::vfs::FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -523,7 +527,7 @@ impl IndexNode for LockedDevFSInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: &mut super::vfs::file::FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         kerror!("DevFS: read_at is not supported!");
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
@@ -535,7 +539,7 @@ impl IndexNode for LockedDevFSInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: &mut super::vfs::file::FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }

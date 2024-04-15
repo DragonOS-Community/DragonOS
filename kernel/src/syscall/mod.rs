@@ -6,15 +6,18 @@ use core::{
 
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
+    driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::syscall::{PosixStatfs, PosixStatx},
+    ipc::shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::syscall::MremapFlags,
     net::syscall::MsgHdr,
     process::{
         fork::KernelCloneArgs,
         resource::{RLimit64, RUsage},
-        ProcessManager,
+        ProcessFlags, ProcessManager,
     },
+    sched::{schedule, SchedMode},
     syscall::user_access::check_and_clone_cstr,
 };
 
@@ -37,7 +40,7 @@ use crate::{
     process::{fork::CloneFlags, syscall::PosixOldUtsName, Pid},
     time::{
         syscall::{PosixTimeZone, PosixTimeval},
-        TimeSpec,
+        PosixTimeSpec,
     },
 };
 
@@ -295,13 +298,13 @@ impl Syscall {
             }
 
             SYS_NANOSLEEP => {
-                let req = args[0] as *const TimeSpec;
-                let rem = args[1] as *mut TimeSpec;
+                let req = args[0] as *const PosixTimeSpec;
+                let rem = args[1] as *mut PosixTimeSpec;
                 let virt_req = VirtAddr::new(req as usize);
                 let virt_rem = VirtAddr::new(rem as usize);
                 if frame.is_from_user()
-                    && (verify_area(virt_req, core::mem::size_of::<TimeSpec>()).is_err()
-                        || verify_area(virt_rem, core::mem::size_of::<TimeSpec>()).is_err())
+                    && (verify_area(virt_req, core::mem::size_of::<PosixTimeSpec>()).is_err()
+                        || verify_area(virt_rem, core::mem::size_of::<PosixTimeSpec>()).is_err())
                 {
                     Err(SystemError::EFAULT)
                 } else {
@@ -344,6 +347,7 @@ impl Syscall {
                 Self::rmdir(path)
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_LINK => {
                 let old = args[0] as *const u8;
                 let new = args[1] as *const u8;
@@ -380,7 +384,11 @@ impl Syscall {
 
             SYS_GETPID => Self::getpid().map(|pid| pid.into()),
 
-            SYS_SCHED => Self::sched(frame.is_from_user()),
+            SYS_SCHED => {
+                kwarn!("syscall sched");
+                schedule(SchedMode::SM_NONE);
+                Ok(0)
+            }
             SYS_DUP => {
                 let oldfd: i32 = args[0] as c_int;
                 Self::dup(oldfd)
@@ -651,8 +659,6 @@ impl Syscall {
 
             #[cfg(target_arch = "x86_64")]
             SYS_MKNOD => {
-                use crate::driver::base::device::device_number::DeviceNumber;
-
                 let path = args[0];
                 let flags = args[1];
                 let dev_t = args[2];
@@ -685,21 +691,38 @@ impl Syscall {
                 let uaddr2 = VirtAddr::new(args[4]);
                 let val3 = args[5] as u32;
 
-                verify_area(uaddr, core::mem::size_of::<u32>())?;
-                verify_area(uaddr2, core::mem::size_of::<u32>())?;
-
                 let mut timespec = None;
                 if utime != 0 && operation.contains(FutexFlag::FLAGS_HAS_TIMEOUT) {
                     let reader = UserBufferReader::new(
-                        utime as *const TimeSpec,
-                        core::mem::size_of::<TimeSpec>(),
+                        utime as *const PosixTimeSpec,
+                        core::mem::size_of::<PosixTimeSpec>(),
                         true,
                     )?;
 
-                    timespec = Some(*reader.read_one_from_user::<TimeSpec>(0)?);
+                    timespec = Some(*reader.read_one_from_user::<PosixTimeSpec>(0)?);
                 }
 
                 Self::do_futex(uaddr, operation, val, timespec, uaddr2, utime as u32, val3)
+            }
+
+            SYS_SET_ROBUST_LIST => {
+                let head = args[0];
+                let head_uaddr = VirtAddr::new(head);
+                let len = args[1];
+
+                let ret = Self::set_robust_list(head_uaddr, len);
+                return ret;
+            }
+
+            SYS_GET_ROBUST_LIST => {
+                let pid = args[0];
+                let head = args[1];
+                let head_uaddr = VirtAddr::new(head);
+                let len_ptr = args[2];
+                let len_ptr_uaddr = VirtAddr::new(len_ptr);
+
+                let ret = Self::get_robust_list(pid, head_uaddr, len_ptr_uaddr);
+                return ret;
             }
 
             SYS_READV => Self::readv(args[0] as i32, args[1], args[2]),
@@ -864,6 +887,10 @@ impl Syscall {
                 kwarn!("SYS_SETGID has not yet been implemented");
                 Ok(0)
             }
+            SYS_SETSID => {
+                kwarn!("SYS_SETSID has not yet been implemented");
+                Ok(0)
+            }
             SYS_GETEUID => Self::geteuid(),
             SYS_GETEGID => Self::getegid(),
             SYS_GETRUSAGE => {
@@ -922,7 +949,7 @@ impl Syscall {
 
             SYS_CLOCK_GETTIME => {
                 let clockid = args[0] as i32;
-                let timespec = args[1] as *mut TimeSpec;
+                let timespec = args[1] as *mut PosixTimeSpec;
                 Self::clock_gettime(clockid, timespec)
             }
 
@@ -946,6 +973,11 @@ impl Syscall {
                 Ok(0)
             }
 
+            SYS_RSEQ => {
+                kwarn!("SYS_RSEQ has not yet been implemented");
+                Ok(0)
+            }
+
             #[cfg(target_arch = "x86_64")]
             SYS_CHMOD => {
                 let pathname = args[0] as *const u8;
@@ -965,9 +997,15 @@ impl Syscall {
             }
 
             SYS_SCHED_GETAFFINITY => {
-                // todo: 这个系统调用还没有实现
+                let pid = args[0] as i32;
+                let size = args[1];
+                let set_vaddr = args[2];
 
-                Err(SystemError::ENOSYS)
+                let mut user_buffer_writer =
+                    UserBufferWriter::new(set_vaddr as *mut u8, size, frame.is_from_user())?;
+                let set: &mut [u8] = user_buffer_writer.buffer(0)?;
+
+                Self::getaffinity(pid, set)
             }
 
             #[cfg(target_arch = "x86_64")]
@@ -1001,14 +1039,53 @@ impl Syscall {
                 Err(SystemError::ENOSYS)
             }
 
-            SYS_SCHED_YIELD => Self::sched_yield(),
+            // SYS_SCHED_YIELD => Self::sched_yield(),
             SYS_UNAME => {
                 let name = args[0] as *mut PosixOldUtsName;
                 Self::uname(name)
             }
+            SYS_PRCTL => {
+                // todo: 这个系统调用还没有实现
+
+                Err(SystemError::EINVAL)
+            }
+
+            SYS_SHMGET => {
+                let key = ShmKey::new(args[0]);
+                let size = args[1];
+                let shmflg = ShmFlags::from_bits_truncate(args[2] as u32);
+
+                Self::shmget(key, size, shmflg)
+            }
+            SYS_SHMAT => {
+                let id = ShmId::new(args[0]);
+                let vaddr = VirtAddr::new(args[1]);
+                let shmflg = ShmFlags::from_bits_truncate(args[2] as u32);
+
+                Self::shmat(id, vaddr, shmflg)
+            }
+            SYS_SHMDT => {
+                let vaddr = VirtAddr::new(args[0]);
+                Self::shmdt(vaddr)
+            }
+            SYS_SHMCTL => {
+                let id = ShmId::new(args[0]);
+                let cmd = ShmCtlCmd::from(args[1]);
+                let user_buf = args[2] as *const u8;
+                let from_user = frame.is_from_user();
+
+                Self::shmctl(id, cmd, user_buf, from_user)
+            }
 
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
+
+        if ProcessManager::current_pcb()
+            .flags()
+            .contains(ProcessFlags::NEED_SCHEDULE)
+        {
+            schedule(SchedMode::SM_PREEMPT);
+        }
 
         return r;
     }

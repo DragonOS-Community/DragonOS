@@ -177,10 +177,6 @@ impl Serial8250ISADevices {
 }
 
 impl PlatformDevice for Serial8250ISADevices {
-    fn compatible_table(&self) -> crate::driver::base::platform::CompatibleTable {
-        unimplemented!()
-    }
-
     fn pdev_id(&self) -> (i32, bool) {
         return (
             self.id.load(Ordering::SeqCst),
@@ -530,10 +526,6 @@ pub fn send_to_default_serial8250_port(s: &[u8]) {
 
     #[cfg(target_arch = "riscv64")]
     {
-        if unsafe { INITIALIZED } {
-            todo!("riscv64: send_to_default_serial8250_port")
-        } else {
-            crate::arch::driver::sbi::console_putstr(s);
-        }
+        crate::arch::driver::sbi::console_putstr(s);
     }
 }

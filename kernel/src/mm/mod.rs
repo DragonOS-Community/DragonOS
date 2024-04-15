@@ -16,7 +16,7 @@ use self::{
     allocator::page_frame::{VirtPageFrame, VirtPageFrameIter},
     memblock::MemoryAreaAttr,
     page::round_up_to_page_size,
-    ucontext::{AddressSpace, UserMapper},
+    ucontext::{AddressSpace, LockedVMA, UserMapper},
 };
 
 pub mod allocator;
@@ -525,6 +525,12 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     /// MMIO虚拟空间的顶端地址（不包含）
     const MMIO_TOP: VirtAddr = VirtAddr::new(Self::MMIO_BASE.data() + Self::MMIO_SIZE);
 
+    /// ProtectionKey的掩码
+    const PKEY_MASK: usize;
+
+    /// ProtectionKey的偏移量
+    const VM_PKEY_SHIFT: usize;
+
     /// @brief 用于初始化内存管理模块与架构相关的信息。
     /// 该函数应调用其他模块的接口，把可用内存区域添加到memblock，提供给BumpAllocator使用
     unsafe fn init();
@@ -615,6 +621,39 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     ///
     /// 页表项的值
     fn make_entry(paddr: PhysAddr, page_flags: usize) -> usize;
+
+    /// 获取vma的protection_key
+    ///
+    /// ## 参数
+    ///
+    /// - `vma`: VMA
+    ///
+    /// ## 返回值
+    /// - `u16`: vma的protection_key
+    fn vma_pkey(_vma: Arc<ucontext::LockedVMA>) -> u16 {
+        0
+    }
+
+    /// 判断一个VMA是否允许访问
+    ///
+    /// ## 参数
+    ///
+    /// - `vma`: 进行判断的VMA
+    /// - `write`: 是否需要写入权限（true 表示需要写权限）
+    /// - `execute`: 是否需要执行权限（true 表示需要执行权限）
+    /// - `foreign`: 是否是外部的（即非当前进程的）VMA
+    ///
+    /// ## 返回值
+    /// - `true`: VMA允许访问
+    /// - `false`: 错误的说明
+    fn vma_access_permitted(
+        _vma: Arc<LockedVMA>,
+        _write: bool,
+        _execute: bool,
+        _foreign: bool,
+    ) -> bool {
+        true
+    }
 }
 
 /// @brief 虚拟地址范围

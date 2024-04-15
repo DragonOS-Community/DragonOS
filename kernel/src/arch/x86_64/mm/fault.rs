@@ -10,14 +10,14 @@ use crate::{
     arch::{
         interrupt::{trap::X86PfErrorCode, TrapFrame},
         mm::{MemoryManagementArch, X86_64MMArch},
-        CurrentIrqArch, MMArch, ProtectionKey,
+        CurrentIrqArch, MMArch,
     },
     exception::InterruptArch,
     kerror,
     mm::{
-        fault::{FaultFlags, PageFault, PageFaultHandler, PageFaultMessage},
+        fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
         ucontext::{AddressSpace, LockedVMA},
-        ProtectionKeyTrait, VirtAddr, VmFaultReason, VmFlags,
+        VirtAddr, VmFaultReason, VmFlags,
     },
 };
 
@@ -26,26 +26,7 @@ use super::LockedFrameAllocator;
 pub type PageMapper =
     crate::mm::page::PageMapper<crate::arch::x86_64::mm::X86_64MMArch, LockedFrameAllocator>;
 
-pub struct X86_64PageFault;
-
-impl PageFault for X86_64PageFault {
-    fn vma_access_permitted(
-        vma: Arc<LockedVMA>,
-        write: bool,
-        execute: bool,
-        foreign: bool,
-    ) -> bool {
-        if execute {
-            return true;
-        }
-        if foreign | vma.is_foreign() {
-            return true;
-        }
-        super::pkey::pkru_allows_pkey(ProtectionKey::vma_pkey(vma), write)
-    }
-}
-
-impl X86_64PageFault {
+impl X86_64MMArch {
     pub fn vma_access_error(vma: Arc<LockedVMA>, error_code: X86PfErrorCode) -> bool {
         let vm_flags = *vma.lock().vm_flags();
         let foreign = false;
@@ -57,7 +38,7 @@ impl X86_64PageFault {
             return true;
         }
 
-        if !X86_64PageFault::vma_access_permitted(
+        if !Self::vma_access_permitted(
             vma.clone(),
             error_code.contains(X86PfErrorCode::X86_PF_WRITE),
             error_code.contains(X86PfErrorCode::X86_PF_INSTR),

@@ -3,7 +3,7 @@ use core::{alloc::Layout, intrinsics::unlikely, panic};
 use alloc::sync::Arc;
 
 use crate::{
-    arch::{mm::PageMapper, MMArch, PageFaultArch},
+    arch::{mm::PageMapper, MMArch},
     mm::{
         page::{page_manager_lock_irqsave, PageFlags},
         ucontext::LockedVMA,
@@ -29,33 +29,6 @@ bitflags! {
     const FAULT_FLAG_UNSHARE = 1 << 10;
     const FAULT_FLAG_ORIG_PTE_VALID = 1 << 11;
     const FAULT_FLAG_VMA_LOCK = 1 << 12;
-    }
-}
-
-/// # 缺页中断trait
-///
-/// 封装了处理缺页中断需要的方法和属性，需要根据架构进行不同的实现
-pub trait PageFault {
-    /// 判断一个VMA是否允许访问
-    ///
-    /// ## 参数
-    ///
-    /// - `vma`: 进行判断的VMA
-    /// - `write`: 是否需要写入权限（true 表示需要写权限）
-    /// - `execute`: 是否需要执行权限（true 表示需要执行权限）
-    /// - `foreign`: 是否是外部的（即非当前进程的）VMA
-    ///
-    /// ## 返回值
-    /// - `true`: VMA允许访问
-    /// - `false`: 错误的说明
-
-    fn vma_access_permitted(
-        _vma: Arc<LockedVMA>,
-        _write: bool,
-        _execute: bool,
-        _foreign: bool,
-    ) -> bool {
-        true
     }
 }
 
@@ -90,7 +63,7 @@ impl PageFaultHandler {
         let mut guard = current_pcb.sched_info().inner_lock_write_irqsave();
         guard.set_state(ProcessState::Runnable);
 
-        if !PageFaultArch::vma_access_permitted(
+        if !MMArch::vma_access_permitted(
             vma.clone(),
             flags.contains(FaultFlags::FAULT_FLAG_WRITE),
             flags.contains(FaultFlags::FAULT_FLAG_INSTRUCTION),

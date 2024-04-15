@@ -1,8 +1,9 @@
 pub mod barrier;
 pub mod bump;
 pub mod fault;
-pub mod pkey;
+pub mod pkru;
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashSet;
 use x86::time::rdtsc;
@@ -19,6 +20,7 @@ use crate::libs::spinlock::SpinLock;
 
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::memblock::mem_block_manager;
+use crate::mm::ucontext::LockedVMA;
 use crate::{
     arch::MMArch,
     mm::allocator::{buddy::BuddyAllocator, bump::BumpAllocator},
@@ -303,6 +305,31 @@ impl MemoryManagementArch for X86_64MMArch {
     #[inline(always)]
     fn make_entry(paddr: PhysAddr, page_flags: usize) -> usize {
         return paddr.data() | page_flags;
+    }
+
+    const VM_PKEY_SHIFT: usize = 32;
+
+    /// X86_64架构的ProtectionKey使用32、33、34、35四个比特位
+    const PKEY_MASK: usize = 1 << 32 | 1 << 33 | 1 << 34 | 1 << 35;
+
+    fn vma_pkey(vma: Arc<LockedVMA>) -> u16 {
+        let guard = vma.lock();
+        ((guard.vm_flags().bits() & Self::PKEY_MASK as u64) >> Self::VM_PKEY_SHIFT) as u16
+    }
+
+    fn vma_access_permitted(
+        vma: Arc<LockedVMA>,
+        write: bool,
+        execute: bool,
+        foreign: bool,
+    ) -> bool {
+        if execute {
+            return true;
+        }
+        if foreign | vma.is_foreign() {
+            return true;
+        }
+        pkru::pkru_allows_pkey(MMArch::vma_pkey(vma), write)
     }
 }
 

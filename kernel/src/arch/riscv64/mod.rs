@@ -29,5 +29,3 @@ pub use self::elf::RiscV64ElfArch as CurrentElfArch;
 pub use crate::arch::smp::RiscV64SMPArch as CurrentSMPArch;
 
 pub use crate::arch::sched::RiscV64SchedArch as CurrentSchedArch;
-
-pub use self::mm::fault::RiscV64PageFault as PageFaultArch;

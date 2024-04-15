@@ -1,21 +1,3 @@
-use alloc::sync::Arc;
-
-use crate::mm::{ucontext::LockedVMA, ProtectionKeyTrait};
-
-pub struct X86_64ProtectionKey;
-
-impl ProtectionKeyTrait for X86_64ProtectionKey {
-    const VM_PKEY_SHIFT: usize = 32;
-
-    /// X86_64架构的ProtectionKey使用32、33、34、35四个比特位
-    const PKEY_MASK: usize = 1 << 32 | 1 << 33 | 1 << 34 | 1 << 35;
-
-    fn vma_pkey(vma: Arc<LockedVMA>) -> u16 {
-        let guard = vma.lock();
-        ((guard.vm_flags().bits() & Self::PKEY_MASK as u64) >> Self::VM_PKEY_SHIFT) as u16
-    }
-}
-
 // TODO pkru实现参考：https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/include/asm/pkru.h
 
 const PKRU_AD_BIT: u16 = 0x1;

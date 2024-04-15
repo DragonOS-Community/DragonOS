@@ -22,7 +22,6 @@ use crate::{
 use self::init::riscv_mm_init;
 
 pub mod bump;
-pub mod fault;
 pub(super) mod init;
 
 pub type PageMapper = crate::mm::page::PageMapper<RiscV64MMArch, LockedFrameAllocator>;
@@ -239,6 +238,23 @@ impl MemoryManagementArch for RiscV64MMArch {
         let r = ((ppn & ((1 << 54) - 1)) << 10) | page_flags;
         return r;
     }
+
+    fn vma_pkey(_vma: alloc::sync::Arc<crate::mm::ucontext::LockedVMA>) -> u16 {
+        0
+    }
+
+    fn vma_access_permitted(
+        _vma: alloc::sync::Arc<crate::mm::ucontext::LockedVMA>,
+        _write: bool,
+        _execute: bool,
+        _foreign: bool,
+    ) -> bool {
+        true
+    }
+
+    const PKEY_MASK: usize = 0;
+
+    const VM_PKEY_SHIFT: usize = 0;
 }
 
 impl VirtAddr {

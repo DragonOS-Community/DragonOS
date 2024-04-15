@@ -616,11 +616,6 @@ static mut __MOUNTS_LIST: Option<Arc<MountList>> = None;
 /// ## 返回值
 ///
 /// - 无
-///
-/// ## Safety（安全性）
-///
-/// 此函数为`unsafe`函数，因为它操作了`RwLock`，并且在初始化时可能会导致数据竞争。
-/// 只有在确保其他线程不会同时初始化`MountList`时，才应该调用此函数。
 #[inline(always)]
 pub fn init_mountlist() {
     unsafe {

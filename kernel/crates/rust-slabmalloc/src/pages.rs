@@ -158,15 +158,15 @@ impl Bitfield for [AtomicU64] {
 }
 
 /// # get_offset_for_align - 根据布局大小获取page内对齐偏移量
-/// 
+///
 /// 这个函数根据给定的`Layout`大小确定一个合适的对齐偏移量。
-/// 
+///
 /// ## 参数
-/// 
+///
 /// - layout: Layout，这是需要计算对齐偏移量的布局参数。
-/// 
+///
 /// ## 返回值
-/// 
+///
 /// - usize: 成功时返回一个usize类型的对齐偏移量。
 fn get_offset_for_align(layout: Layout) -> usize {
     match layout.size() {

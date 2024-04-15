@@ -7,6 +7,7 @@ use crate::process::SigInfo;
 use crate::sched::{schedule, SchedMode};
 use crate::time::timer::{clock, Jiffies, Timer, TimerFunction};
 use alloc::{boxed::Box, sync::Arc};
+use core::sync::atomic::compiler_fence;
 use core::time::Duration;
 use system_error::SystemError;
 
@@ -46,12 +47,12 @@ impl AlarmTimer {
             let end_jiffies =
                 Jiffies::from(Duration::from_secs(self.expired_second)).timer_jiffies();
             let remain_second = Duration::from(Jiffies::new(end_jiffies - now_jiffies));
-            kdebug!(
-                "end: {} - now: {} = remain: {}",
-                end_jiffies,
-                now_jiffies,
-                end_jiffies - now_jiffies
-            );
+            // kdebug!(
+            //     "end: {} - now: {} = remain: {}",
+            //     end_jiffies,
+            //     now_jiffies,
+            //     end_jiffies - now_jiffies
+            // );
             remain_second
         }
     }
@@ -59,18 +60,6 @@ impl AlarmTimer {
     pub fn cancel(&self) {
         self.timer.cancel();
     }
-
-    // pub fn restart(&self, jiffies: Jiffies) {
-    //     kdebug!("now:{}", clock());
-    //     let new_expired_jiffies = jiffies.expire_jiffies();
-    //     let timer = self.timer.clone();
-    //     let mut innertimer = timer.inner();
-    //     innertimer.expire_jiffies = new_expired_jiffies;
-    //     innertimer.triggered = false;
-    //     drop(innertimer);
-    //     kdebug!("begin run again!");
-    //     timer.activate();
-    // }
 }
 
 //闹钟定时器的TimerFuntion
@@ -92,14 +81,12 @@ impl TimerFunction for AlarmTimerFunc {
         // 初始化signal info
         let mut info = SigInfo::new(sig, 0, SigCode::Timer, SigType::Alarm(self.pid));
 
-        //compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let _retval = sig
             .send_signal_info(Some(&mut info), self.pid)
             .map(|x| x as usize)?;
-
-        //compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        //ProcessManager::mark_sleep(true).ok();
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
         drop(irq_guard);
         Ok(())
     }

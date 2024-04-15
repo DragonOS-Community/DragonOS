@@ -164,23 +164,24 @@ impl Syscall {
         let pcb = ProcessManager::current_pcb();
         let mut pcb_alarm = pcb.ref_alarm_timer();
         let alarm = pcb_alarm.as_ref();
+        //alarm第一次调用
         if alarm.is_none() {
+            //注册alarm定时器
             let pid = ProcessManager::current_pid();
             let new_alarm = Some(alarm_timer_init(pid, 0));
             *pcb_alarm = new_alarm;
             drop(pcb_alarm);
             return Ok(0);
         }
-        let mut remain = Duration::ZERO;
-        if let Some(alarmtimer) = alarm {
-            remain = alarmtimer.remain();
-            if second.is_zero() {
-                alarmtimer.cancel();
-            }
-            if !alarmtimer.timeout() {
-                alarmtimer.cancel();
-            }
-        };
+        //查询上一个alarm的剩余时间和重新注册alarm
+        let alarmtimer = alarm.unwrap();
+        let remain = alarmtimer.remain();
+        if second.is_zero() {
+            alarmtimer.cancel();
+        }
+        if !alarmtimer.timeout() {
+            alarmtimer.cancel();
+        }
         let pid = ProcessManager::current_pid();
         let new_alarm = Some(alarm_timer_init(pid, second.as_secs()));
         *pcb_alarm = new_alarm;

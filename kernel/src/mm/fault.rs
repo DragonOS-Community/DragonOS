@@ -181,10 +181,6 @@ impl PageFaultHandler {
                     entry.set_flags(PageFlags::from_data(MMArch::ENTRY_FLAG_DIRTY));
                 }
             }
-            let pte_table = mapper.get_table(address, 0).unwrap();
-            let i = pte_table.index_of(address).unwrap();
-            entry.set_flags(entry.flags().set_access(true));
-            pte_table.set_entry(i, entry);
         } else if vma.is_anonymous() {
             return Self::do_anonymous_page(pfm, mapper);
         } else {

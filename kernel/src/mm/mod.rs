@@ -462,7 +462,7 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     /// 当该位为1时，代表这个页面被处理器访问过
     const ENTRY_FLAG_ACCESSED: usize;
     /// 标记该页表项指向的页是否为大页
-    const ENTRY_FLAG_PS: usize;
+    const ENTRY_FLAG_HUGE_PAGE: usize;
     /// 当该位为1时，代表该页表项是全局的
     const ENTRY_FLAG_GLOBAL: usize;
 

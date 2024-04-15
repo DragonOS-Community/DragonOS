@@ -138,6 +138,12 @@ impl MemoryManagementArch for RiscV64MMArch {
     /// 设置1g的MMIO空间
     const MMIO_SIZE: usize = 1 << PAGE_1G_SHIFT;
 
+    const PKEY_MASK: usize = 0;
+
+    const VM_PKEY_SHIFT: usize = 0;
+
+    const ENTRY_FLAG_HUGE_PAGE: usize = Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_READWRITE;
+
     #[inline(never)]
     unsafe fn init() {
         riscv_mm_init().expect("init kernel memory management architecture failed");
@@ -251,10 +257,6 @@ impl MemoryManagementArch for RiscV64MMArch {
     ) -> bool {
         true
     }
-
-    const PKEY_MASK: usize = 0;
-
-    const VM_PKEY_SHIFT: usize = 0;
 }
 
 impl VirtAddr {

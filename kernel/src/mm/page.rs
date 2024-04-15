@@ -710,7 +710,7 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
     /// - value: 如果为true，那么将当前页表项的访问标志设置为已访问。
     #[inline(always)]
     pub fn set_huge_page(self, value: bool) -> Self {
-        return self.update_flags(Arch::ENTRY_FLAG_PS, value);
+        return self.update_flags(Arch::ENTRY_FLAG_HUGE_PAGE, value);
     }
 
     /// MMIO内存的页表项标志
@@ -925,8 +925,8 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             }
         }
 
-        // 支持2M、1G大页，即页表层级为1、2级的页表可以映射大页，且不能为PGD（顶级页表）
-        if table.level == Arch::PAGE_LEVELS - 1 || table.level == 0 || table.level > 2 {
+        // 支持2M、1G大页，即页表层级为1、2级的页表可以映射大页
+        if table.level == 0 || table.level > 2 {
             return None;
         }
 

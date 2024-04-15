@@ -1025,6 +1025,15 @@ impl Syscall {
         newfd: i32,
         fd_table_guard: &mut RwLockWriteGuard<'_, FileDescriptorVec>,
     ) -> Result<usize, SystemError> {
+        Self::do_dup3(oldfd, newfd, FileMode::empty(), fd_table_guard)
+    }
+
+    fn do_dup3(
+        oldfd: i32,
+        newfd: i32,
+        flags: FileMode,
+        fd_table_guard: &mut RwLockWriteGuard<'_, FileDescriptorVec>,
+    ) -> Result<usize, SystemError> {
         // 确认oldfd, newid是否有效
         if !(FileDescriptorVec::validate_fd(oldfd) && FileDescriptorVec::validate_fd(newfd)) {
             return Err(SystemError::EBADF);
@@ -1047,8 +1056,12 @@ impl Syscall {
             .get_file_by_fd(oldfd)
             .ok_or(SystemError::EBADF)?;
         let new_file = old_file.try_clone().ok_or(SystemError::EBADF)?;
-        // dup2默认非cloexec
-        new_file.set_close_on_exec(false);
+
+        if flags.contains(FileMode::O_CLOEXEC) {
+            new_file.set_close_on_exec(true);
+        } else {
+            new_file.set_close_on_exec(false);
+        }
         // 申请文件描述符，并把文件对象存入其中
         let res = fd_table_guard
             .alloc_fd(new_file, Some(newfd))
@@ -1064,8 +1077,9 @@ impl Syscall {
     /// - `cmd`：命令
     /// - `arg`：参数
     pub fn fcntl(fd: i32, cmd: FcntlCommand, arg: i32) -> Result<usize, SystemError> {
+        kdebug!("fcntl ({cmd:?}) fd: {fd}, arg={arg}");
         match cmd {
-            FcntlCommand::DupFd => {
+            FcntlCommand::DupFd | FcntlCommand::DupFdCloexec => {
                 if arg < 0 || arg as usize >= FileDescriptorVec::PROCESS_MAX_FD {
                     return Err(SystemError::EBADF);
                 }
@@ -1074,7 +1088,16 @@ impl Syscall {
                     let binding = ProcessManager::current_pcb().fd_table();
                     let mut fd_table_guard = binding.write();
                     if fd_table_guard.get_file_by_fd(i as i32).is_none() {
-                        return Self::do_dup2(fd, i as i32, &mut fd_table_guard);
+                        if cmd == FcntlCommand::DupFd {
+                            return Self::do_dup2(fd, i as i32, &mut fd_table_guard);
+                        } else {
+                            return Self::do_dup3(
+                                fd,
+                                i as i32,
+                                FileMode::O_CLOEXEC,
+                                &mut fd_table_guard,
+                            );
+                        }
                     }
                 }
                 return Err(SystemError::EMFILE);
@@ -1083,12 +1106,15 @@ impl Syscall {
                 // Get file descriptor flags.
                 let binding = ProcessManager::current_pcb().fd_table();
                 let fd_table_guard = binding.read();
+
                 if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
                     // drop guard 以避免无法调度的问题
                     drop(fd_table_guard);
 
                     if file.close_on_exec() {
                         return Ok(FD_CLOEXEC as usize);
+                    } else {
+                        return Ok(0);
                     }
                 }
                 return Err(SystemError::EBADF);
@@ -1145,8 +1171,8 @@ impl Syscall {
                 // TODO: unimplemented
                 // 未实现的命令，返回0，不报错。
 
-                // kwarn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
-                return Ok(0);
+                kwarn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
+                return Err(SystemError::ENOSYS);
             }
         }
     }

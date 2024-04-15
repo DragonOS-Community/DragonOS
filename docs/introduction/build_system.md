@@ -251,3 +251,32 @@ make run-docker
 
 qemu虚拟机将在5900端口监听vnc连接。您可以使用vnc viewer或者Remmina连接至qemu虚拟机。
 :::
+
+## 7. 为riscv64编译
+
+由于目前DragonOS尚未完全移植到riscv64，因此编译需要这样做：
+
+1. 修改`env.mk`和`.vscode/settings.json`
+
+把`env.mk`里面的`ARCH`的值改为`riscv64`，并且在`setting.json`里面注释`"rust-analyzer.cargo.target": "x86_64-unknown-none",`，改为启用riscv64的那行。
+
+2. 重启rust-analyzer
+
+3. 清理编译缓存
+
+由于x86_64和riscv64架构差异，可能存在缓存导致的编译问题，确保运行前先清理缓存。
+
+```shell
+make clean
+```
+
+4. 为riscv64编译并运行
+
+```shell
+# 下载DragonStub
+git submodule update --init --recursive --force
+
+make kernel -j $(nproc) && make write_diskimage && make qemu
+```
+
+请注意，由于是在控制台运行qemu，当你想要退出的时候，输入`Ctrl+A`然后按`X`即可。

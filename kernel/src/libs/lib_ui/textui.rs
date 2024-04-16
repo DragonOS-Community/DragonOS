@@ -337,6 +337,7 @@ impl TextuiBuf<'_> {
             return self.guard.as_mut().unwrap().as_mut();
         }
     }
+
     pub fn put_color_in_pixel(&mut self, color: u32, index: usize) {
         let index = index as isize;
         match self.bit_depth {
@@ -363,7 +364,7 @@ impl TextuiBuf<'_> {
                 };
             }
             _ => {
-                panic!("不支持的位深度！")
+                panic!("bidepth unsupported!")
             }
         }
     }
@@ -373,6 +374,7 @@ impl TextuiBuf<'_> {
     pub fn get_index_by_x_y(x: usize, y: usize) -> usize {
         textui_framework().metadata.read().buf_info().width() as usize * y + x
     }
+
     pub fn get_start_index_by_lineid_lineindex(lineid: LineId, lineindex: LineIndex) -> usize {
         //   x 左上角列像素点位置
         //   y 左上角行像素点位置
@@ -622,7 +624,6 @@ impl TextuiWindow {
     /// - vline_id 要刷新的虚拟行号
     /// - start 起始字符号
     /// - count 要刷新的字符数量
-
     fn textui_refresh_characters(
         &mut self,
         vline_id: LineId,
@@ -708,7 +709,6 @@ impl TextuiWindow {
     /// ## 参数
     /// - window 窗口结构体
     /// - vline_id 虚拟行号
-
     fn textui_new_line(&mut self) -> Result<i32, SystemError> {
         // todo: 支持在两个虚拟行之间插入一个新行
         let actual_line_sum = textui_framework().actual_line.load(Ordering::SeqCst);
@@ -753,7 +753,6 @@ impl TextuiWindow {
     /// ## 参数
     /// - window
     /// - character
-
     fn true_textui_putchar_window(
         &mut self,
         character: char,

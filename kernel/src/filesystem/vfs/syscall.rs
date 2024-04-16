@@ -20,14 +20,14 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-use super::SuperBlock;
 use super::{
-    core::{do_mkdir, do_remove_dir, do_unlink_at},
+    core::{do_mkdir_at, do_remove_dir, do_unlink_at},
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
     open::{do_faccessat, do_fchmodat, do_sys_open},
     utils::{rsplit_path, user_path_at},
-    Dirent, FileType, IndexNode, FSMAKER, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    Dirent, FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
+    VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 // use crate::kdebug;
 
@@ -452,6 +452,17 @@ bitflags! {
         const RESOLVE_CACHED = 0x20;
     }
 }
+
+bitflags! {
+    pub struct UmountFlag: i32 {
+        const DEFAULT = 0;          /* Default call to umount. */
+        const MNT_FORCE = 1;        /* Force unmounting.  */
+        const MNT_DETACH = 2;       /* Just detach from the tree.  */
+        const MNT_EXPIRE = 4;       /* Mark for expiry.  */
+        const UMOUNT_NOFOLLOW = 8;  /* Don't follow symlink on umount.  */
+    }
+}
+
 impl Syscall {
     /// @brief 为当前进程打开一个文件
     ///
@@ -768,7 +779,12 @@ impl Syscall {
     /// @return uint64_t 负数错误码 / 0表示成功
     pub fn mkdir(path: *const u8, mode: usize) -> Result<usize, SystemError> {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
-        return do_mkdir(&path, FileMode::from_bits_truncate(mode as u32)).map(|x| x as usize);
+        do_mkdir_at(
+            AtFlags::AT_FDCWD.bits(),
+            &path,
+            FileMode::from_bits_truncate(mode as u32),
+        )?;
+        return Ok(0);
     }
 
     /// **创建硬连接的系统调用**
@@ -928,9 +944,9 @@ impl Syscall {
     ///
     /// ## 参数
     ///
-    /// - oldfd: 源文件描述符
+    /// - oldfd: 源文件夹文件描述符
     /// - filename_from: 源文件路径
-    /// - newfd: 目标文件描述符
+    /// - newfd: 目标文件夹文件描述符
     /// - filename_to: 目标文件路径
     /// - flags: 标志位
     ///
@@ -978,6 +994,8 @@ impl Syscall {
             .ok_or(SystemError::EBADF)?;
 
         let new_file = old_file.try_clone().ok_or(SystemError::EBADF)?;
+        // dup默认非cloexec
+        new_file.set_close_on_exec(false);
         // 申请文件描述符，并把文件对象存入其中
         let res = fd_table_guard.alloc_fd(new_file, None).map(|x| x as usize);
         return res;
@@ -1007,6 +1025,15 @@ impl Syscall {
         newfd: i32,
         fd_table_guard: &mut RwLockWriteGuard<'_, FileDescriptorVec>,
     ) -> Result<usize, SystemError> {
+        Self::do_dup3(oldfd, newfd, FileMode::empty(), fd_table_guard)
+    }
+
+    fn do_dup3(
+        oldfd: i32,
+        newfd: i32,
+        flags: FileMode,
+        fd_table_guard: &mut RwLockWriteGuard<'_, FileDescriptorVec>,
+    ) -> Result<usize, SystemError> {
         // 确认oldfd, newid是否有效
         if !(FileDescriptorVec::validate_fd(oldfd) && FileDescriptorVec::validate_fd(newfd)) {
             return Err(SystemError::EBADF);
@@ -1029,6 +1056,12 @@ impl Syscall {
             .get_file_by_fd(oldfd)
             .ok_or(SystemError::EBADF)?;
         let new_file = old_file.try_clone().ok_or(SystemError::EBADF)?;
+
+        if flags.contains(FileMode::O_CLOEXEC) {
+            new_file.set_close_on_exec(true);
+        } else {
+            new_file.set_close_on_exec(false);
+        }
         // 申请文件描述符，并把文件对象存入其中
         let res = fd_table_guard
             .alloc_fd(new_file, Some(newfd))
@@ -1044,8 +1077,9 @@ impl Syscall {
     /// - `cmd`：命令
     /// - `arg`：参数
     pub fn fcntl(fd: i32, cmd: FcntlCommand, arg: i32) -> Result<usize, SystemError> {
+        // kdebug!("fcntl ({cmd:?}) fd: {fd}, arg={arg}");
         match cmd {
-            FcntlCommand::DupFd => {
+            FcntlCommand::DupFd | FcntlCommand::DupFdCloexec => {
                 if arg < 0 || arg as usize >= FileDescriptorVec::PROCESS_MAX_FD {
                     return Err(SystemError::EBADF);
                 }
@@ -1054,7 +1088,16 @@ impl Syscall {
                     let binding = ProcessManager::current_pcb().fd_table();
                     let mut fd_table_guard = binding.write();
                     if fd_table_guard.get_file_by_fd(i as i32).is_none() {
-                        return Self::do_dup2(fd, i as i32, &mut fd_table_guard);
+                        if cmd == FcntlCommand::DupFd {
+                            return Self::do_dup2(fd, i as i32, &mut fd_table_guard);
+                        } else {
+                            return Self::do_dup3(
+                                fd,
+                                i as i32,
+                                FileMode::O_CLOEXEC,
+                                &mut fd_table_guard,
+                            );
+                        }
                     }
                 }
                 return Err(SystemError::EMFILE);
@@ -1063,12 +1106,15 @@ impl Syscall {
                 // Get file descriptor flags.
                 let binding = ProcessManager::current_pcb().fd_table();
                 let fd_table_guard = binding.read();
+
                 if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
                     // drop guard 以避免无法调度的问题
                     drop(fd_table_guard);
 
                     if file.close_on_exec() {
                         return Ok(FD_CLOEXEC as usize);
+                    } else {
+                        return Ok(0);
                     }
                 }
                 return Err(SystemError::EBADF);
@@ -1125,8 +1171,8 @@ impl Syscall {
                 // TODO: unimplemented
                 // 未实现的命令，返回0，不报错。
 
-                // kwarn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
-                return Ok(0);
+                kwarn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
+                return Err(SystemError::ENOSYS);
             }
         }
     }
@@ -1538,13 +1584,28 @@ impl Syscall {
 
         let filesystemtype = producefs!(FSMAKER, filesystemtype)?;
 
-        return Vcore::do_mount(filesystemtype, target.to_string().as_str());
+        Vcore::do_mount(filesystemtype, target.to_string().as_str())?;
+
+        return Ok(0);
     }
 
     // 想法：可以在VFS中实现一个文件系统分发器，流程如下：
     // 1. 接受从上方传来的文件类型字符串
     // 2. 将传入值与启动时准备好的字符串数组逐个比较（probe）
     // 3. 直接在函数内调用构造方法并直接返回文件系统对象
+
+    /// src/linux/mount.c `umount` & `umount2`
+    ///
+    /// [umount(2) — Linux manual page](https://www.man7.org/linux/man-pages/man2/umount.2.html)
+    pub fn umount2(target: *const u8, flags: i32) -> Result<(), SystemError> {
+        let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?;
+        Vcore::do_umount2(
+            AtFlags::AT_FDCWD.bits(),
+            &target,
+            UmountFlag::from_bits(flags).ok_or(SystemError::EINVAL)?,
+        )?;
+        return Ok(());
+    }
 }
 
 #[repr(C)]

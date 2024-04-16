@@ -21,7 +21,7 @@ use crate::{
             tty_device::{PtyType, TtyDevice, TtyType},
         },
     },
-    filesystem::vfs::{syscall::ModeType, FileType, ROOT_INODE},
+    filesystem::vfs::{core::do_mount_mkdir, syscall::ModeType, FileType},
     init::initcall::INITCALL_FS,
     libs::spinlock::{SpinLock, SpinLockGuard},
     time::PosixTimeSpec,
@@ -274,16 +274,10 @@ impl IndexNode for LockedDevPtsFSInode {
 #[unified_init(INITCALL_FS)]
 #[inline(never)]
 pub fn devpts_init() -> Result<(), SystemError> {
-    let dev_inode = ROOT_INODE().find("dev")?;
-
-    let pts_inode = dev_inode.create("pts", FileType::Dir, ModeType::from_bits_truncate(0o755))?;
-
     // 创建 devptsfs 实例
     let ptsfs: Arc<DevPtsFs> = DevPtsFs::new();
 
-    // let mountfs = dev_inode.mount(ptsfs).expect("Failed to mount DevPtsFS");
-
-    pts_inode.mount(ptsfs).expect("Failed to mount DevPtsFS");
+    do_mount_mkdir(ptsfs, "/dev/pts").expect("Failed to mount DevPtsFS");
     kinfo!("DevPtsFs mounted.");
 
     Ok(())

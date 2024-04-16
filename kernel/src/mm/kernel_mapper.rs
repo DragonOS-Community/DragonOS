@@ -124,6 +124,7 @@ impl KernelMapper {
             vaddr += MMArch::PAGE_SIZE;
             paddr += MMArch::PAGE_SIZE;
         }
+        compiler_fence(Ordering::SeqCst);
         return Ok(());
     }
 }

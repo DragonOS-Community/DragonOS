@@ -300,13 +300,14 @@ unsafe extern "C" fn do_general_protection(regs: &'static TrapFrame, error_code:
         ""
     };
     kerror!(
-        "do_general_protection(13), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}
+        "do_general_protection(13), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t rflags: {:#x}\t CPU: {}, \tpid: {:?}
 {}{}{}
 Segment Selector Index: {:#x}\n
 ",
         error_code,
         regs.rsp,
         regs.rip,
+        regs.rflags,
         smp_get_processor_id().data(),
         ProcessManager::current_pid(),
         msg1, msg2, msg3,

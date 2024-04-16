@@ -3,6 +3,7 @@
 // 2022/01/20
 
 #include "common/asm.h"
+#include <asm/apu_boot.h>
 
 // 以下是来自 multiboot2 规范的定义
 //  How many bytes from the start of the file we search for the header.
@@ -249,7 +250,6 @@ ENTRY(_start64)
     lidt IDT_POINTER(%rip)
     //lidt $IDT_POINTER
     movq GDT_POINTER(%rip), %r12
-    movq head_stack_start(%rip), %rsp
 
     // 分支，判断是否为apu
     movq	$0x1b,	%rcx		// 根据IA32_APIC_BASE.BSP[8]标志位判断处理器是否为apu
@@ -257,6 +257,9 @@ ENTRY(_start64)
 	bt	$8,	%rax
 	jnc	load_apu_cr3
 
+    // BSP处理器
+    movq head_stack_start(%rip), %rsp
+    
     // 2. 设置临时页表
     // 最高级
     mov $__PML4E, %eax
@@ -318,11 +321,11 @@ load_cr3:
 load_apu_cr3:
     // 由于内存管理模块重置了页表，因此ap核心初始化的时候，需要使用新的内核页表。
     // 这个页表的值由smp模块设置到__APU_START_CR3变量中
-
     // 加载__APU_START_CR3中的值
     movq $__APU_START_CR3, %rax
     movq 0(%rax), %rax
     movq %rax, %cr3
+    movq _apu_boot_tmp_stack_top_addr(%rip), %rsp
     jmp to_switch_seg
 
 to_switch_seg:
@@ -348,7 +351,21 @@ entry64:
     movq %rax, %gs
     movq %rax, %ss
 
-    movq head_stack_start(%rip), %rsp //rsp的地址
+    // 分支，判断是否为apu,然后设置栈指针·
+    movq	$0x1b,	%rcx		// 根据IA32_APIC_BASE.BSP[8]标志位判断处理器是否为apu
+	rdmsr
+	bt	$8,	%rax
+	jnc	__set_ap_tmp_stack_start2
+__set_bsp_stack_start2:
+    movq head_stack_start(%rip), %rsp
+    jmp __set_stack_start2_ok
+__set_ap_tmp_stack_start2:
+    // 设置ap核心的临时栈
+    movq _apu_boot_tmp_stack_top_addr(%rip), %rsp
+    jmp __set_stack_start2_ok
+
+__set_stack_start2_ok:
+
     
     // 重新加载GDT和IDT，加载到高地址
     leaq GDT_Table(%rip), %r8
@@ -484,6 +501,9 @@ go_to_ignore_int:
 
 ENTRY(head_stack_start)
     .quad BSP_IDLE_STACK_SPACE + 32768
+
+ENTRY(_apu_boot_tmp_stack_top_addr)
+    .quad _apu_boot_tmp_stack_start + APU_BOOT_TMP_STACK_SIZE
 
 // 初始化页表
 .align 0x1000 //设置为4k对齐

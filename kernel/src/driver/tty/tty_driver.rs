@@ -27,7 +27,7 @@ use crate::{
 };
 
 use super::{
-    termios::Termios,
+    termios::{Termios, WindowSize},
     tty_core::{TtyCore, TtyCoreData},
     tty_ldisc::TtyLdiscManager,
     tty_port::{DefaultTtyPort, TtyPort},
@@ -273,7 +273,7 @@ impl TtyDriver {
             tty.set_port(ports[core.index()].clone());
         }
 
-        TtyLdiscManager::ldisc_setup(tty.clone(), None)?;
+        TtyLdiscManager::ldisc_setup(tty.clone(), tty.core().link())?;
 
         Ok(tty)
     }
@@ -445,6 +445,8 @@ pub trait TtyOperation: Sync + Send + Debug {
     }
 
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError>;
+
+    fn resize(&self, _tty: Arc<TtyCore>, _winsize: WindowSize) -> Result<(), SystemError>;
 }
 
 #[allow(dead_code)]

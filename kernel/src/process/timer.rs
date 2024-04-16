@@ -47,6 +47,28 @@ impl AlarmTimer {
         let timer = self.timer.clone();
         timer.activate();
     }
+
+    /// # 初始化目标进程的alarm定时器
+    ///  
+    /// 创建一个闹钟结构体并启动闹钟
+    ///
+    /// ## 函数参数
+    ///
+    /// pid：发送消息的目标进程的pid
+    ///
+    /// second：设置alarm触发的秒数
+    ///
+    /// ### 函数返回值
+    ///
+    /// AlarmTimer结构体
+    pub fn alarm_timer_init(pid: Pid, second: u64) -> AlarmTimer {
+        //初始化Timerfunc
+        let timerfunc = AlarmTimerFunc::new(pid);
+        let alarmtimer = AlarmTimer::new(timerfunc, second);
+        alarmtimer.activate();
+        alarmtimer
+    }
+
     /// # 查看闹钟是否触发
     pub fn timeout(&self) -> bool {
         self.timer.timeout()
@@ -118,25 +140,4 @@ impl TimerFunction for AlarmTimerFunc {
         drop(irq_guard);
         Ok(())
     }
-}
-
-/// # 初始化目标进程的alarm定时器
-///  
-/// 创建一个闹钟结构体并启动闹钟
-///
-/// ## 函数参数
-///
-/// pid：发送消息的目标进程的pid
-///
-/// second：设置alarm触发的秒数
-///
-/// ### 函数返回值
-///
-/// AlarmTimer结构体
-pub fn alarm_timer_init(pid: Pid, second: u64) -> AlarmTimer {
-    //初始化Timerfunc
-    let timerfunc = AlarmTimerFunc::new(pid);
-    let alarmtimer = AlarmTimer::new(timerfunc, second);
-    alarmtimer.activate();
-    alarmtimer
 }

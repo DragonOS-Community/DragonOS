@@ -7,7 +7,7 @@ use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 use crate::{
-    process::{timer::alarm_timer_init, ProcessManager},
+    process::{timer::AlarmTimer, ProcessManager},
     syscall::{user_access::UserBufferWriter, Syscall},
     time::{sleep::nanosleep, PosixTimeSpec},
 };
@@ -170,13 +170,13 @@ impl Syscall {
         //初始化second
         let second = Duration::from_secs(expired_second as u64);
         let pcb = ProcessManager::current_pcb();
-        let mut pcb_alarm = pcb.alarm_timer_write();
+        let mut pcb_alarm = pcb.alarm_timer_irqsave();
         let alarm = pcb_alarm.as_ref();
         //alarm第一次调用
         if alarm.is_none() {
             //注册alarm定时器
             let pid = ProcessManager::current_pid();
-            let new_alarm = Some(alarm_timer_init(pid, 0));
+            let new_alarm = Some(AlarmTimer::alarm_timer_init(pid, 0));
             *pcb_alarm = new_alarm;
             drop(pcb_alarm);
             return Ok(0);
@@ -191,7 +191,7 @@ impl Syscall {
             alarmtimer.cancel();
         }
         let pid = ProcessManager::current_pid();
-        let new_alarm = Some(alarm_timer_init(pid, second.as_secs()));
+        let new_alarm = Some(AlarmTimer::alarm_timer_init(pid, second.as_secs()));
         *pcb_alarm = new_alarm;
         drop(pcb_alarm);
         return Ok(remain.as_secs() as usize);

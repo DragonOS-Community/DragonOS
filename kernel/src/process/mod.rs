@@ -637,7 +637,7 @@ pub struct ProcessControlBlock {
     thread: RwLock<ThreadInfo>,
 
     ///闹钟定时器
-    alarm_timer: RwLock<Option<AlarmTimer>>,
+    alarm_timer: SpinLock<Option<AlarmTimer>>,
 
     /// 进程的robust lock列表
     robust_list: RwLock<Option<RobustListHead>>,
@@ -706,7 +706,7 @@ impl ProcessControlBlock {
             children: RwLock::new(Vec::new()),
             wait_queue: WaitQueue::default(),
             thread: RwLock::new(ThreadInfo::new()),
-            alarm_timer: RwLock::new(None),
+            alarm_timer: SpinLock::new(None),
             robust_list: RwLock::new(None),
         };
 
@@ -965,8 +965,8 @@ impl ProcessControlBlock {
         *self.robust_list.write_irqsave() = new_robust_list;
     }
 
-    pub fn alarm_timer_write(&self) -> RwLockWriteGuard<Option<AlarmTimer>> {
-        return self.alarm_timer.write();
+    pub fn alarm_timer_irqsave(&self) -> SpinLockGuard<Option<AlarmTimer>> {
+        return self.alarm_timer.lock_irqsave();
     }
 }
 

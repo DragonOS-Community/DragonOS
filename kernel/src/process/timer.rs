@@ -35,7 +35,8 @@ impl AlarmTimer {
     ///
     /// Self
     pub fn new(timer_func: Box<dyn TimerFunction>, second: u64) -> Self {
-        let expired_jiffies = Jiffies::from(Duration::from_secs(second)).timer_jiffies();
+        let expired_jiffies =
+            <Jiffies as From<Duration>>::from(Duration::from_secs(second)).timer_jiffies();
         let result = AlarmTimer {
             timer: Timer::new(timer_func, expired_jiffies),
             expired_second: second,
@@ -81,7 +82,8 @@ impl AlarmTimer {
         } else {
             let now_jiffies = clock();
             let end_jiffies =
-                Jiffies::from(Duration::from_secs(self.expired_second)).timer_jiffies();
+                <Jiffies as From<Duration>>::from(Duration::from_secs(self.expired_second))
+                    .timer_jiffies();
             let remain_second = Duration::from(Jiffies::new(end_jiffies - now_jiffies));
             // kdebug!(
             //     "end: {} - now: {} = remain: {}",

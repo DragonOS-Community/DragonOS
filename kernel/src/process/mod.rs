@@ -60,6 +60,7 @@ use crate::{
     },
     syscall::{user_access::clear_user, Syscall},
 };
+use timer::AlarmTimer;
 
 use self::kthread::WorkerPrivate;
 
@@ -74,6 +75,7 @@ pub mod pid;
 pub mod resource;
 pub mod stdio;
 pub mod syscall;
+pub mod timer;
 pub mod utils;
 
 /// 系统中所有进程的pcb
@@ -639,6 +641,9 @@ pub struct ProcessControlBlock {
     /// 线程信息
     thread: RwLock<ThreadInfo>,
 
+    ///闹钟定时器
+    alarm_timer: SpinLock<Option<AlarmTimer>>,
+
     /// 进程的robust lock列表
     robust_list: RwLock<Option<RobustListHead>>,
 }
@@ -706,6 +711,7 @@ impl ProcessControlBlock {
             children: RwLock::new(Vec::new()),
             wait_queue: WaitQueue::default(),
             thread: RwLock::new(ThreadInfo::new()),
+            alarm_timer: SpinLock::new(None),
             robust_list: RwLock::new(None),
         };
 
@@ -966,6 +972,10 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn set_robust_list(&self, new_robust_list: Option<RobustListHead>) {
         *self.robust_list.write_irqsave() = new_robust_list;
+    }
+
+    pub fn alarm_timer_irqsave(&self) -> SpinLockGuard<Option<AlarmTimer>> {
+        return self.alarm_timer.lock_irqsave();
     }
 }
 

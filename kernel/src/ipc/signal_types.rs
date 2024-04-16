@@ -333,6 +333,7 @@ impl SigInfo {
 #[derive(Copy, Clone, Debug)]
 pub enum SigType {
     Kill(Pid),
+    Alarm(Pid),
     // 后续完善下列中的具体字段
     // Timer,
     // Rt,

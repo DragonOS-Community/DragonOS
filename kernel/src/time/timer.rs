@@ -39,7 +39,7 @@ lazy_static! {
 pub trait TimerFunction: Send + Sync + Debug {
     fn run(&mut self) -> Result<(), SystemError>;
 }
-// # Jiffies结构体
+// # Jiffies结构体（注意这是一段时间的jiffies数而不是某一时刻的定时器时间片）
 
 int_like!(Jiffies, u64);
 

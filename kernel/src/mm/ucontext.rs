@@ -163,7 +163,7 @@ impl InnerAddressSpace {
         unsafe {
             new_guard
                 .user_mapper
-                .clone_from(&mut self.user_mapper, true)
+                .clone_from(&mut self.user_mapper, MMArch::PAGE_FAULT_ENABLED)
         };
 
         // 拷贝用户栈的结构体信息，但是不拷贝用户栈的内容（因为后面VMA的拷贝会拷贝用户栈的内容）
@@ -247,7 +247,11 @@ impl InnerAddressSpace {
         round_to_min: bool,
         allocate_at_once: bool,
     ) -> Result<VirtPageFrame, SystemError> {
-        // let allocate_at_once = true;
+        let allocate_at_once = if MMArch::PAGE_FAULT_ENABLED {
+            allocate_at_once
+        } else {
+            true
+        };
         // 用于对齐hint的函数
         let round_hint_to_min = |hint: VirtAddr| {
             // 先把hint向下对齐到页边界

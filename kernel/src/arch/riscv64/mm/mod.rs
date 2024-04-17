@@ -83,6 +83,9 @@ const KERNEL_TOP_PAGE_ENTRY_NO: usize = (RiscV64MMArch::PHYS_OFFSET
     >> (RiscV64MMArch::ENTRY_ADDRESS_SHIFT - RiscV64MMArch::PAGE_ENTRY_SHIFT);
 
 impl MemoryManagementArch for RiscV64MMArch {
+    /// riscv64暂不支持缺页中断
+    const PAGE_FAULT_ENABLED: bool = false;
+
     const PAGE_SHIFT: usize = 12;
 
     const PAGE_ENTRY_SHIFT: usize = 9;

@@ -428,6 +428,8 @@ impl Default for PhysMemoryArea {
 }
 
 pub trait MemoryManagementArch: Clone + Copy + Debug {
+    /// 是否支持缺页中断
+    const PAGE_FAULT_ENABLED: bool;
     /// 页面大小的shift（假如页面4K，那么这个值就是12,因为2^12=4096）
     const PAGE_SHIFT: usize;
     /// 每个页表的页表项数目。（以2^n次幂来表示）假如有512个页表项，那么这个值就是9

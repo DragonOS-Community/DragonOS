@@ -70,6 +70,8 @@ pub struct X86_64MMArch;
 static XD_RESERVED: AtomicBool = AtomicBool::new(false);
 
 impl MemoryManagementArch for X86_64MMArch {
+    /// X86目前支持缺页中断
+    const PAGE_FAULT_ENABLED: bool = true;
     /// 4K页
     const PAGE_SHIFT: usize = 12;
 

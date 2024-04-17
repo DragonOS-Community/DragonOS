@@ -14,6 +14,17 @@ pub struct WindowSize {
     pub ypixel: u16,
 }
 
+impl WindowSize {
+    pub fn new(row: u16, col: u16, xpixel: u16, ypixel: u16) -> Self {
+        Self {
+            row,
+            col,
+            xpixel,
+            ypixel,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Termios {
     pub input_mode: InputMode,

@@ -236,9 +236,8 @@ impl VirtualConsoleData {
         self.underline_color = 3; // cyan
         self.half_color = 0x08; // grey
 
-        self.reset(clear);
-
         self.screen_buf.resize(self.cols * self.rows, 0);
+        self.reset(clear);
     }
 
     pub fn should_update(&self) -> bool {

@@ -501,8 +501,9 @@ impl Syscall {
         len: usize,
         madv_flags: usize,
     ) -> Result<usize, SystemError> {
-        assert!(start_vaddr.check_aligned(MMArch::PAGE_SIZE));
-        assert!(check_aligned(len, MMArch::PAGE_SIZE));
+        if !start_vaddr.check_aligned(MMArch::PAGE_SIZE) || !check_aligned(len, MMArch::PAGE_SIZE) {
+            return Err(SystemError::EINVAL);
+        }
 
         if unlikely(verify_area(start_vaddr, len).is_err()) {
             return Err(SystemError::EINVAL);

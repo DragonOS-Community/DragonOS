@@ -310,16 +310,6 @@ impl MemoryManagementArch for X86_64MMArch {
         return paddr.data() | page_flags;
     }
 
-    const VM_PKEY_SHIFT: usize = 32;
-
-    /// X86_64架构的ProtectionKey使用32、33、34、35四个比特位
-    const PKEY_MASK: usize = 1 << 32 | 1 << 33 | 1 << 34 | 1 << 35;
-
-    fn vma_pkey(vma: Arc<LockedVMA>) -> u16 {
-        let guard = vma.lock();
-        ((guard.vm_flags().bits() & Self::PKEY_MASK as u64) >> Self::VM_PKEY_SHIFT) as u16
-    }
-
     fn vma_access_permitted(
         vma: Arc<LockedVMA>,
         write: bool,
@@ -332,7 +322,7 @@ impl MemoryManagementArch for X86_64MMArch {
         if foreign | vma.is_foreign() {
             return true;
         }
-        pkru::pkru_allows_pkey(MMArch::vma_pkey(vma), write)
+        pkru::pkru_allows_pkey(pkru::vma_pkey(vma), write)
     }
 }
 

@@ -141,10 +141,6 @@ impl MemoryManagementArch for RiscV64MMArch {
     /// 设置1g的MMIO空间
     const MMIO_SIZE: usize = 1 << PAGE_1G_SHIFT;
 
-    const PKEY_MASK: usize = 0;
-
-    const VM_PKEY_SHIFT: usize = 0;
-
     const ENTRY_FLAG_HUGE_PAGE: usize = Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_READWRITE;
 
     #[inline(never)]
@@ -246,10 +242,6 @@ impl MemoryManagementArch for RiscV64MMArch {
         let ppn = PhysPageFrame::new(paddr).ppn();
         let r = ((ppn & ((1 << 54) - 1)) << 10) | page_flags;
         return r;
-    }
-
-    fn vma_pkey(_vma: alloc::sync::Arc<crate::mm::ucontext::LockedVMA>) -> u16 {
-        0
     }
 
     fn vma_access_permitted(

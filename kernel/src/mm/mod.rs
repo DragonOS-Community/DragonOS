@@ -529,12 +529,6 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     /// MMIO虚拟空间的顶端地址（不包含）
     const MMIO_TOP: VirtAddr = VirtAddr::new(Self::MMIO_BASE.data() + Self::MMIO_SIZE);
 
-    /// ProtectionKey的掩码
-    const PKEY_MASK: usize;
-
-    /// ProtectionKey的偏移量
-    const VM_PKEY_SHIFT: usize;
-
     /// @brief 用于初始化内存管理模块与架构相关的信息。
     /// 该函数应调用其他模块的接口，把可用内存区域添加到memblock，提供给BumpAllocator使用
     unsafe fn init();
@@ -625,18 +619,6 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     ///
     /// 页表项的值
     fn make_entry(paddr: PhysAddr, page_flags: usize) -> usize;
-
-    /// 获取vma的protection_key
-    ///
-    /// ## 参数
-    ///
-    /// - `vma`: VMA
-    ///
-    /// ## 返回值
-    /// - `u16`: vma的protection_key
-    fn vma_pkey(_vma: Arc<ucontext::LockedVMA>) -> u16 {
-        0
-    }
 
     /// 判断一个VMA是否允许访问
     ///
@@ -823,17 +805,4 @@ pub fn verify_area(addr: VirtAddr, size: usize) -> Result<(), SystemError> {
     }
 
     return Ok(());
-}
-
-pub trait ProtectionKeyTrait {
-    /// ProtectionKey的掩码
-    const PKEY_MASK: usize;
-
-    /// ProtectionKey的偏移量
-    const VM_PKEY_SHIFT: usize;
-
-    /// 获取vma的protection_key
-    fn vma_pkey(_vma: Arc<ucontext::LockedVMA>) -> u16 {
-        0
-    }
 }

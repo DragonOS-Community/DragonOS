@@ -203,18 +203,21 @@ impl InnerAddressSpace {
         return Ok(new_addr_space);
     }
 
+    /// 拓展用户栈
+    /// ## 参数
+    ///
+    /// - `bytes`: 拓展大小
     #[allow(dead_code)]
     pub fn extend_stack(&mut self, mut bytes: usize) -> Result<(), SystemError> {
+        // kdebug!("extend user stack");
         let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
-        let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
+        let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_GROWSDOWN;
         let stack = self.user_stack.as_mut().unwrap();
 
         bytes = page_align_up(bytes);
         stack.mapped_size += bytes;
         let len = stack.stack_bottom - stack.mapped_size;
-
         self.map_anonymous(len, bytes, prot_flags, map_flags, false, false)?;
-
         return Ok(());
     }
 
@@ -1570,8 +1573,10 @@ impl UserStack {
         let actual_stack_bottom = stack_bottom - guard_size;
 
         let mut prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
-        let map_flags =
-            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE;
+        let map_flags = MapFlags::MAP_PRIVATE
+            | MapFlags::MAP_ANONYMOUS
+            | MapFlags::MAP_FIXED_NOREPLACE
+            | MapFlags::MAP_GROWSDOWN;
         // kdebug!(
         //     "map anonymous stack: {:?} {}",
         //     actual_stack_bottom,
@@ -1624,7 +1629,7 @@ impl UserStack {
         mut bytes: usize,
     ) -> Result<(), SystemError> {
         let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
-        let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
+        let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_GROWSDOWN;
 
         bytes = page_align_up(bytes);
         self.mapped_size += bytes;

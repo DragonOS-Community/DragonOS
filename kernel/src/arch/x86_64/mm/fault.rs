@@ -197,7 +197,12 @@ impl X86_64MMArch {
         }
 
         if unlikely(error_code.contains(X86PfErrorCode::X86_PF_RSVD)) {
-            panic!("Bad pagetable");
+            // TODO https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/mm/fault.c#pgtable_bad
+            panic!(
+                "Reserved bits are never expected to be set, error_code: {:#b}, address: {:#x}",
+                error_code,
+                address.data()
+            );
         }
 
         if regs.is_from_user() {
@@ -221,30 +226,52 @@ impl X86_64MMArch {
         let mut space_guard = current_address_space.write();
         let mut fault;
         loop {
-            // let vma = space_guard.mappings.find_nearest(address);
-            let vma = space_guard.mappings.contains(address);
-            if vma.is_none() {
-                panic!("no mapped vma");
+            let vma = space_guard.mappings.find_nearest(address);
+            // let vma = space_guard.mappings.contains(address);
+
+            let vma = vma.unwrap_or_else(|| {
+                panic!(
+                    "can not find nearest vma, error_code: {:#b}, address: {:#x}",
+                    error_code,
+                    address.data(),
+                )
+            });
+            let guard = vma.lock();
+            let region = *guard.region();
+            let vm_flags = *guard.vm_flags();
+            drop(guard);
+
+            if !region.contains(address) {
+                if vm_flags.contains(VmFlags::VM_GROWSDOWN) {
+                    space_guard
+                        .extend_stack(region.start() - address)
+                        .unwrap_or_else(|_| {
+                            panic!(
+                                "user stack extend failed, error_code: {:#b}, address: {:#x}",
+                                error_code,
+                                address.data(),
+                            )
+                        });
+                } else {
+                    panic!(
+                        "No mapped vma, error_code: {:#b}, address: {:#x}",
+                        error_code,
+                        address.data(),
+                    )
+                }
             }
 
-            let vma = vma.unwrap();
-            // let guard = vma.lock();
-
-            // if !guard.region().contains(address) && guard.vm_flags().contains(VmFlags::VM_GROWSDOWN)
-            // {
-            //     space_guard
-            //         .extend_stack(guard.region().start() - address)
-            //         .expect("User stack extend failed");
-            // }
-            // drop(guard);
-
             if unlikely(Self::vma_access_error(vma.clone(), error_code)) {
-                panic!("vma access error");
+                panic!(
+                    "vma access error, error_code: {:#b}, address: {:#x}",
+                    error_code,
+                    address.data(),
+                );
             }
             let mapper = &mut space_guard.user_mapper.utable;
 
             fault = PageFaultHandler::handle_mm_fault(
-                PageFaultMessage::new(vma, address, flags),
+                PageFaultMessage::new(vma.clone(), address, flags),
                 mapper,
             );
 
@@ -267,7 +294,7 @@ impl X86_64MMArch {
             | VmFaultReason::VM_FAULT_FALLBACK;
 
         if likely(!fault.contains(vm_fault_error)) {
-            panic!("{:?}", fault)
+            panic!("fault error: {:?}", fault)
         }
     }
 }

@@ -60,6 +60,10 @@ impl TtyPortData {
     pub fn internal_tty(&self) -> Option<Arc<TtyCore>> {
         self.internal_tty.upgrade()
     }
+
+    pub fn tty(&self) -> Option<Arc<TtyCore>> {
+        self.tty.upgrade()
+    }
 }
 
 #[allow(dead_code)]

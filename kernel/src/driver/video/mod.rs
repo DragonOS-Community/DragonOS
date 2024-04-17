@@ -19,6 +19,7 @@ use crate::{
 use alloc::{boxed::Box, sync::Arc};
 use system_error::SystemError;
 
+pub mod console;
 pub mod fbdev;
 
 static mut __MAMAGER: Option<VideoRefreshManager> = None;

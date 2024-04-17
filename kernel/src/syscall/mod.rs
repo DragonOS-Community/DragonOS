@@ -1060,6 +1060,11 @@ impl Syscall {
                 Err(SystemError::EINVAL)
             }
 
+            SYS_ALARM => {
+                let second = args[0] as u32;
+                Self::alarm(second)
+            }
+
             SYS_SHMGET => {
                 let key = ShmKey::new(args[0]);
                 let size = args[1];

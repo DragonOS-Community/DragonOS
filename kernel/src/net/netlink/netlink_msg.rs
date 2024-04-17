@@ -1,1 +1,0 @@
-//在这个文件中，你需要定义Netlink消息的结构体，如nlmsghdr和genlmsghdr，以及用于封包和解包消息的函数。

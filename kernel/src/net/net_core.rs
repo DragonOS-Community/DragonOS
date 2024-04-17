@@ -241,3 +241,7 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
     }
     Ok(())
 }
+
+// 参考https://code.dragonos.org.cn/xref/linux-6.1.9/net/core/scok.c#3853
+// proto_register
+// proto_unregister

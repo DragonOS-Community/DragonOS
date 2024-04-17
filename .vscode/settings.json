@@ -159,4 +159,5 @@
         "check",
         
     ],
+    "rust-analyzer.showUnlinkedFileNotification": false,
 }

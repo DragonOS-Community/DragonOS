@@ -1,6 +1,8 @@
 //参考https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c
 use std::alloc::{alloc, Layout};
 use std::error::Error;
+use std::sync::{Mutex, Arc};
+use std::{error, fmt, result};
 
 // netlink_proto结构体
 static mut NETLINK_PROTO: netlink_proto::NetlinkProto = netlink_proto::NetlinkProto {
@@ -63,7 +65,7 @@ struct NetlinkSocket {
     rcu: libc::rcu_head,
     work: workqueue::Work,
 }
-
+// NetlinkTable how to design? a struct or use NetlinkTableEntry as struct?
 struct NetlinkTable {
     hash: rhash_table,
     mc_list: std::collections::HashList<libc::sockaddr_nl>,
@@ -175,7 +177,52 @@ fn main() {
 //Linux：core_initcall(netlink_proto_init);
 
 
+//https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#672
 
-pub fn netlink_create(){
+enum Error {
+    SocketTypeNotSupported,
+    ProtocolNotSupported,
+}
 
+fn netlink_create(net: &Net, socket: &mut Socket, protocol: i32, _kern: bool) -> Result<(), Error> {
+    let mut module: Option<Box<Module>> = None;
+    let mut cb_mutex: Mutex;
+    let mut nlk = NetlinkSock::new();
+    let mut bind: Option<fn(&Net, usize)> = None;
+    let mut unbind: Option<fn(&Net, usize)> = None;
+
+    // 假设我们有一个类型来跟踪协议最大值
+    const MAX_LINKS: i32 = 1024;
+
+    if socket.type_ != SocketType::Raw && socket.type_ != SocketType::Dgram {
+        return Err(Error::SocketTypeNotSupported);
+    }
+
+    if protocol < 0 || protocol >= MAX_LINKS {
+        return Err(Error::ProtocolNotSupported);
+    }
+
+    // 安全的数组索引封装
+    let protocol = protocol as usize;
+
+    // 这里简化了锁和模块加载逻辑
+
+    // 假设成功加载了模块和相关函数
+    module = Some(Box::new(Module));
+    bind = Some(bind_function);
+    unbind = Some(unbind_function);
+
+    // 继续其他的逻辑
+    // ...
+
+    Ok(())
+}
+
+// 假设的绑定和解绑函数
+fn bind_function(net: &Net, group: usize) {
+    // 实现细节
+}
+
+fn unbind_function(net: &Net, group: usize) {
+    // 实现细节
 }

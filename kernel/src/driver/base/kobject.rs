@@ -281,3 +281,7 @@ impl KObjType for DynamicKObjKType {
         None
     }
 }
+
+
+//https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c?fi=kobject_uevent#457
+//kobject_uevent->kobject_uevent_env

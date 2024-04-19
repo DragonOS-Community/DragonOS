@@ -1,0 +1,10 @@
+/home/val213/DragonOS/user/apps/test-backlog/target/x86_64-unknown-linux-musl/release/deps/idna-c6a579a3ca6a777d.rmeta: /home/val213/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/idna-0.5.0/src/lib.rs /home/val213/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/idna-0.5.0/src/punycode.rs /home/val213/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/idna-0.5.0/src/uts46.rs /home/val213/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/idna-0.5.0/src/uts46_mapping_table.rs
+
+/home/val213/DragonOS/user/apps/test-backlog/target/x86_64-unknown-linux-musl/release/deps/libidna-c6a579a3ca6a777d.rlib: /home/val213/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/idna-0.5.0/src/lib.rs /home/val213/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/idna-0.5.0/src/punycode.rs /home/val213/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/idna-0.5.0/src/uts46.rs /home/val213/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/idna-0.5.0/src/uts46_mapping_table.rs
+
+/home/val213/DragonOS/user/apps/test-backlog/target/x86_64-unknown-linux-musl/release/deps/idna-c6a579a3ca6a777d.d: /home/val213/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/idna-0.5.0/src/lib.rs /home/val213/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/idna-0.5.0/src/punycode.rs /home/val213/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/idna-0.5.0/src/uts46.rs /home/val213/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/idna-0.5.0/src/uts46_mapping_table.rs
+
+/home/val213/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/idna-0.5.0/src/lib.rs:
+/home/val213/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/idna-0.5.0/src/punycode.rs:
+/home/val213/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/idna-0.5.0/src/uts46.rs:
+/home/val213/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/idna-0.5.0/src/uts46_mapping_table.rs:

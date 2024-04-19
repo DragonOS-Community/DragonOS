@@ -79,6 +79,14 @@ pub(super) fn new_socket(
                 return Err(SystemError::EINVAL);
             }
         },
+        //https://www.man7.org/linux/man-pages/man7/netlink.7.html
+        AddressFamily::Netlink => match socket_type {
+            PosixSocketType::Raw => Box::new(RawSocket::new(protocol, SocketOptions::default())),
+            PosixSocketType::Datagram => Box::new(UdpSocket::new(SocketOptions::default())),
+            _ => {
+                return Err(SystemError::EINVAL);
+            }
+        },
         _ => {
             return Err(SystemError::EAFNOSUPPORT);
         }

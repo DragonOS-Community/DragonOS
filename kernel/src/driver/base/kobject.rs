@@ -252,7 +252,6 @@ impl KObjectManager {
         }
 
         // todo: 发送uevent: KOBJ_REMOVE
-        
 
         sysfs_instance().remove_dir(&kobj);
         kobj.update_kobj_state(None, Some(KObjectState::IN_SYSFS));
@@ -281,7 +280,3 @@ impl KObjType for DynamicKObjKType {
         None
     }
 }
-
-
-//https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c?fi=kobject_uevent#457
-//kobject_uevent->kobject_uevent_env

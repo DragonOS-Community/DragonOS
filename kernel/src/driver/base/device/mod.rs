@@ -519,7 +519,6 @@ impl DeviceManager {
         }
 
         // todo: 发送uevent: KOBJ_ADD
-        
 
         // probe drivers for a new device
         bus_probe_device(&device);

@@ -1,8 +1,8 @@
 //! PCI transport for VirtIO.
-use crate::arch::{PciArch, TraitPciArch};
+
 use crate::driver::base::device::DeviceId;
 use crate::driver::pci::pci::{
-    BusDeviceFunction, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,
+    pci_root_0, BusDeviceFunction, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,
     PciStandardDeviceBar, PCI_CAP_ID_VNDR,
 };
 
@@ -169,15 +169,17 @@ impl PciTransport {
                 continue;
             }
             let struct_info = VirtioCapabilityInfo {
-                bar: PciArch::read_config(&bus_device_function, capability.offset + CAP_BAR_OFFSET)
-                    as u8,
-                offset: PciArch::read_config(
-                    &bus_device_function,
-                    capability.offset + CAP_BAR_OFFSET_OFFSET,
+                bar: pci_root_0().read_config(
+                    bus_device_function,
+                    (capability.offset + CAP_BAR_OFFSET).into(),
+                ) as u8,
+                offset: pci_root_0().read_config(
+                    bus_device_function,
+                    (capability.offset + CAP_BAR_OFFSET_OFFSET).into(),
                 ),
-                length: PciArch::read_config(
-                    &bus_device_function,
-                    capability.offset + CAP_LENGTH_OFFSET,
+                length: pci_root_0().read_config(
+                    bus_device_function,
+                    (capability.offset + CAP_LENGTH_OFFSET).into(),
                 ),
             };
 
@@ -187,9 +189,9 @@ impl PciTransport {
                 }
                 VIRTIO_PCI_CAP_NOTIFY_CFG if cap_len >= 20 && notify_cfg.is_none() => {
                     notify_cfg = Some(struct_info);
-                    notify_off_multiplier = PciArch::read_config(
-                        &bus_device_function,
-                        capability.offset + CAP_NOTIFY_OFF_MULTIPLIER_OFFSET,
+                    notify_off_multiplier = pci_root_0().read_config(
+                        bus_device_function,
+                        (capability.offset + CAP_NOTIFY_OFF_MULTIPLIER_OFFSET).into(),
                     );
                 }
                 VIRTIO_PCI_CAP_ISR_CFG if isr_cfg.is_none() => {

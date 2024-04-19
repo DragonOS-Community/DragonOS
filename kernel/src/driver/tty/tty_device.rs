@@ -134,10 +134,10 @@ impl IndexNode for TtyDevice {
         mut data: SpinLockGuard<FilePrivateData>,
         mode: &crate::filesystem::vfs::file::FileMode,
     ) -> Result<(), SystemError> {
+        if let FilePrivateData::Tty(_) = &*data {
+            return Ok(());
+        }
         if self.tty_type == TtyType::Pty(PtyType::Ptm) {
-            if let FilePrivateData::Tty(_) = &*data {
-                return Ok(());
-            }
             return ptmx_open(data, mode);
         }
         let dev_num = self.metadata()?.raw_dev;
@@ -359,6 +359,23 @@ impl IndexNode for TtyDevice {
                     return Err(SystemError::EFAULT);
                 }
                 return Ok(0);
+            }
+            TtyIoctlCmd::TIOCSWINSZ => {
+                let reader = UserBufferReader::new(
+                    arg as *const (),
+                    core::mem::size_of::<WindowSize>(),
+                    true,
+                )?;
+
+                let user_winsize = reader.read_one_from_user::<WindowSize>(0)?;
+
+                let ret = tty.resize(tty.clone(), *user_winsize);
+
+                if ret != Err(SystemError::ENOSYS) {
+                    return ret.map(|_| 0);
+                } else {
+                    return tty.tty_do_resize(*user_winsize).map(|_| 0);
+                }
             }
             _ => match TtyJobCtrlManager::job_ctrl_ioctl(tty.clone(), cmd, arg) {
                 Ok(_) => {

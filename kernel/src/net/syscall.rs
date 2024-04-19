@@ -19,7 +19,7 @@ use crate::{
 };
 
 use super::{
-    socket::{new_socket, PosixSocketType, Socket, SocketHandleItem, SocketInode, HANDLE_MAP},
+    socket::{new_socket, PosixSocketType, Socket, SocketInode},
     Endpoint, Protocol, ShutdownType,
 };
 
@@ -43,13 +43,6 @@ impl Syscall {
         let protocol = Protocol::from(protocol as u8);
 
         let socket = new_socket(address_family, socket_type, protocol)?;
-
-        if address_family != AddressFamily::Unix {
-            let handle_item = SocketHandleItem::new();
-            HANDLE_MAP
-                .write_irqsave()
-                .insert(socket.socket_handle(), handle_item);
-        }
 
         let socketinode: Arc<SocketInode> = SocketInode::new(socket);
         let f = File::new(socketinode, FileMode::O_RDWR)?;

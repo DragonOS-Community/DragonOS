@@ -122,7 +122,7 @@ pub struct NTtyData {
     read_flags: StaticBitmap<NTTY_BUFSIZE>,
     char_map: StaticBitmap<256>,
 
-    tty: Option<Weak<TtyCore>>,
+    tty: Weak<TtyCore>,
 }
 
 impl NTtyData {
@@ -151,7 +151,7 @@ impl NTtyData {
             echo_buf: [0; NTTY_BUFSIZE],
             read_flags: StaticBitmap::new(),
             char_map: StaticBitmap::new(),
-            tty: None,
+            tty: Weak::default(),
             no_room: false,
         }
     }
@@ -1168,7 +1168,7 @@ impl NTtyData {
         nr: usize,
     ) -> Result<usize, SystemError> {
         let mut nr = nr;
-        let tty = self.tty.clone().unwrap().upgrade().unwrap();
+        let tty = self.tty.upgrade().unwrap();
         let space = tty.write_room(tty.core());
 
         // 如果读取数量大于了可用空间，则取最小的为真正的写入数量
@@ -1541,7 +1541,7 @@ impl NTtyData {
 impl TtyLineDiscipline for NTtyLinediscipline {
     fn open(&self, tty: Arc<TtyCore>) -> Result<(), system_error::SystemError> {
         // 反向绑定tty到disc
-        self.disc_data().tty = Some(Arc::downgrade(&tty));
+        self.disc_data().tty = Arc::downgrade(&tty);
         // 特定的tty设备在这里可能需要取消端口节流
         return self.set_termios(tty, None);
     }

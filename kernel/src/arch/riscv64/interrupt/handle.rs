@@ -5,7 +5,9 @@ use core::hint::spin_loop;
 
 use system_error::SystemError;
 
-use crate::{arch::syscall::syscall_handler, kdebug, kerror};
+use crate::{
+    arch::syscall::syscall_handler, driver::irqchip::riscv_intc::riscv_intc_irq, kdebug, kerror,
+};
 
 use super::TrapFrame;
 
@@ -40,11 +42,8 @@ unsafe extern "C" fn riscv64_do_irq(trap_frame: &mut TrapFrame) {
 }
 
 /// 处理中断
-fn riscv64_do_interrupt(_trap_frame: &mut TrapFrame) {
-    kdebug!("todo: riscv64_do_irq: interrupt");
-    loop {
-        spin_loop();
-    }
+fn riscv64_do_interrupt(trap_frame: &mut TrapFrame) {
+    riscv_intc_irq(trap_frame);
 }
 
 /// 处理异常

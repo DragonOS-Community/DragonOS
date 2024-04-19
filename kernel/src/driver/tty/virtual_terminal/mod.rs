@@ -1,4 +1,4 @@
-use core::sync::atomic::Ordering;
+use core::{fmt::Formatter, sync::atomic::Ordering};
 
 use alloc::{
     string::{String, ToString},
@@ -8,12 +8,9 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    driver::{
-        base::device::{
-            device_number::{DeviceNumber, Major},
-            device_register, IdTable,
-        },
-        video::fbdev::base::fbcon::framebuffer_console::BlittingFbConsole,
+    driver::base::device::{
+        device_number::{DeviceNumber, Major},
+        device_register, IdTable,
     },
     filesystem::devfs::devfs_register,
     libs::spinlock::SpinLock,
@@ -95,16 +92,29 @@ impl Color {
     }
 }
 
-#[derive(Debug)]
 pub struct TtyConsoleDriverInner {
-    console: Arc<BlittingFbConsole>,
+    console: Arc<dyn ConsoleSwitch>,
+}
+
+impl core::fmt::Debug for TtyConsoleDriverInner {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        write!(f, "TtyConsoleDriverInner")
+    }
 }
 
 impl TtyConsoleDriverInner {
     pub fn new() -> Result<Self, SystemError> {
-        Ok(Self {
-            console: Arc::new(BlittingFbConsole::new()?),
-        })
+        let console = {
+            #[cfg(not(target_arch = "riscv64"))]
+            {
+                Arc::new(crate::driver::video::fbdev::base::fbcon::framebuffer_console::BlittingFbConsole::new()?)
+            }
+
+            #[cfg(target_arch = "riscv64")]
+            crate::driver::video::console::dummycon::dummy_console()
+        };
+
+        Ok(Self { console })
     }
 
     fn do_write(&self, tty: &TtyCoreData, buf: &[u8], mut nr: usize) -> Result<usize, SystemError> {
@@ -241,6 +251,14 @@ impl TtyOperation for TtyConsoleDriverInner {
 
     fn close(&self, _tty: Arc<TtyCore>) -> Result<(), SystemError> {
         Ok(())
+    }
+
+    fn resize(
+        &self,
+        _tty: Arc<TtyCore>,
+        _winsize: super::termios::WindowSize,
+    ) -> Result<(), SystemError> {
+        todo!()
     }
 }
 

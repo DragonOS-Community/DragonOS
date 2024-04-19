@@ -809,7 +809,7 @@ pub fn scheduler_tick() {
 #[inline]
 pub fn schedule(sched_mod: SchedMode) {
     let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    assert!(ProcessManager::current_pcb().preempt_count() == 0);
+    assert_eq!(ProcessManager::current_pcb().preempt_count(), 0);
     __schedule(sched_mod);
 }
 
@@ -911,19 +911,9 @@ pub fn __schedule(sched_mod: SchedMode) {
 
         // CurrentApic.send_eoi();
         compiler_fence(Ordering::SeqCst);
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            ProcessManager::switch_process(prev, next)
-        };
-        #[cfg(target_arch = "riscv64")]
-        todo!()
-    } else {
-        kwarn!(
-            "!!!switch_process {} {:?} to self ",
-            prev.basic().name(),
-            prev.pid(),
-        );
 
+        unsafe { ProcessManager::switch_process(prev, next) };
+    } else {
         assert!(
             Arc::ptr_eq(&ProcessManager::current_pcb(), &prev),
             "{}",

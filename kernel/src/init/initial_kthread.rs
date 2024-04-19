@@ -33,8 +33,8 @@ fn kernel_init() -> Result<(), SystemError> {
 
     // 由于目前加锁，速度过慢，所以先不开启双缓冲
     // scm_enable_double_buffer().expect("Failed to enable double buffer");
-    stdio_init().expect("Failed to initialize stdio");
 
+    #[cfg(target_arch = "x86_64")]
     ahci_init().expect("Failed to initialize AHCI");
 
     mount_root_fs().expect("Failed to mount root fs");
@@ -55,7 +55,7 @@ fn kenrel_init_freeable() -> Result<(), SystemError> {
     do_initcalls().unwrap_or_else(|err| {
         panic!("Failed to initialize subsystems: {:?}", err);
     });
-
+    stdio_init().expect("Failed to initialize stdio");
     smp_init();
 
     return Ok(());

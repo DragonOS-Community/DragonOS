@@ -1,2 +1,0 @@
-cargo:rerun-if-changed=build/probe.rs
-cargo:rustc-cfg=error_generic_member_access

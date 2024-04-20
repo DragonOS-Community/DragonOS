@@ -58,6 +58,15 @@ fn x86_64_pci_init() -> Result<(), SystemError> {
     return Ok(());
 }
 
+/// # discover_ecam_root - 发现使用ECAM的PCI root device
+///
+/// 该函数用于从ACPI管理器获取MCFG表，并从中发现使用ECAM的PCI root device。
+/// 然后，本函数将这些信息添加到pci_ecam_root_info_manager
+///
+/// ## 返回值
+///
+/// - Ok(()): 成功发现并添加了所有ECAM根信息
+/// - Err(PciError): 在获取ACPI管理器表或发现MCFG表时发生错误
 fn discover_ecam_root() -> Result<(), PciError> {
     let mcfg = acpi_manager()
         .tables()

@@ -141,10 +141,18 @@ impl PciRoot {
         assert!(address & 0x3 == 0);
         address
     }
-    /// @brief 通过bus_device_function和offset读取相应位置寄存器的值（32位）
-    /// @param bus_device_function 在同一个group中pci设备的唯一标识符
-    /// @param register_offset 寄存器在设备中的offset
-    /// @return u32 寄存器读值结果
+    /// # read_config - 通过bus_device_function和offset读取相应位置寄存器的值（32位）
+    ///
+    /// 此函数用于通过指定的bus_device_function和register_offset读取PCI设备中相应位置的寄存器值。
+    ///
+    /// ## 参数
+    ///
+    /// - `bus_device_function`: 在同一个group中pci设备的唯一标识符
+    /// - `register_offset`: 寄存器在设备中的offset
+    ///
+    /// ## 返回值
+    ///
+    /// - `u32`: 寄存器读值结果
     pub fn read_config(&self, bus_device_function: BusDeviceFunction, register_offset: u16) -> u32 {
         let address = self.cam_offset(bus_device_function, register_offset);
         unsafe {
@@ -155,10 +163,15 @@ impl PciRoot {
         }
     }
 
-    /// @brief 通过bus_device_function和offset写入相应位置寄存器值（32位）
-    /// @param bus_device_function 在同一个group中pci设备的唯一标识符
-    /// @param register_offset 寄存器在设备中的offset
-    /// @param data 要写入的值
+    /// # write_config - 通过bus_device_function和offset写入相应位置寄存器值（32位）
+    ///
+    /// 此函数用于通过指定的bus_device_function和register_offset，向PCI设备写入一个32位的寄存器值。
+    ///
+    /// ## 参数
+    ///
+    /// - `bus_device_function`: 在同一个group中pci设备的唯一标识符
+    /// - `register_offset`: 寄存器在设备中的offset
+    /// - `data`: 要写入的数据
     pub fn write_config(
         &self,
         bus_device_function: BusDeviceFunction,
@@ -211,6 +224,13 @@ impl PciRootManager {
         }
     }
 
+    /// # 添加PciRoot - 向PciRootManager中添加一个PciRoot
+    ///
+    /// 向PciRootManager中添加一个新的PciRoot，通过其segment_group_number进行标识。
+    ///
+    /// ## 参数
+    ///
+    /// - `pci_root`: Arc<PciRoot>，要添加的PciRoot的Arc指针
     pub fn add_pci_root(&self, pci_root: Arc<PciRoot>) {
         let mut inner = self.inner.lock();
         inner
@@ -218,6 +238,18 @@ impl PciRootManager {
             .insert(pci_root.segment_group_number, pci_root);
     }
 
+    /// # 检查是否存在PciRoot - 检查PciRootManager中是否存在指定segment_group_number的PciRoot
+    ///
+    /// 检查PciRootManager中是否存在segment_group_number对应的PciRoot。
+    ///
+    /// ## 参数
+    ///
+    /// - `segement_group_number`: SegmentGroupNumber，要检查的segment_group_number。
+    ///
+    /// ## 返回值
+    ///
+    /// - `true`: 如果存在对应的PciRoot。
+    /// - `false`: 如果不存在对应的PciRoot。
     pub fn has_root(&self, segement_group_number: SegmentGroupNumber) -> bool {
         self.inner
             .lock()
@@ -225,6 +257,18 @@ impl PciRootManager {
             .contains_key(&segement_group_number)
     }
 
+    /// # 获取PciRoot - 从PciRootManager中获取指定segment_group_number的PciRoot
+    ///
+    /// 从PciRootManager中获取segment_group_number对应的PciRoot。
+    ///
+    /// ## 参数
+    ///
+    /// - `segement_group_number`: SegmentGroupNumber，要获取的PciRoot的segment_group_number。
+    ///
+    /// ## 返回值
+    ///
+    /// - `Some(Arc<PciRoot>)`: 如果找到对应的PciRoot，返回其引用。
+    /// - `None`: 如果没有找到对应的PciRoot。
     pub fn get_pci_root(&self, segement_group_number: SegmentGroupNumber) -> Option<Arc<PciRoot>> {
         self.inner
             .lock()
@@ -233,6 +277,9 @@ impl PciRootManager {
             .cloned()
     }
 
+    /// # PciRoot迭代器 - 创建一个新的PciRoot迭代器
+    ///
+    /// 创建一个新的迭代器，用于遍历PciRootManager中的所有PciRoot。
     #[allow(dead_code)]
     pub fn iter(&self) -> PciRootIterator<'_> {
         PciRootIterator {

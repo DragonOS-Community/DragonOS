@@ -10,8 +10,6 @@ use crate::{
     mm::PhysAddr,
 };
 
-// static PCI_ECAM_HOST
-
 pub(super) fn pci_host_ecam_driver_init(fdt: &Fdt<'_>) -> Result<(), SystemError> {
     let do_check = |node: FdtNode| -> Result<(), SystemError> {
         let reg = node

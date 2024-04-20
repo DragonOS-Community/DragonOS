@@ -1,8 +1,8 @@
 use crate::arch::TraitPciArch;
 use crate::driver::acpi::acpi_manager;
 use crate::driver::pci::pci::{
-    BusDeviceFunction, PciAddr, PciError, PciRoot, SegmentGroupNumber, PORT_PCI_CONFIG_ADDRESS,
-    PORT_PCI_CONFIG_DATA,
+    BusDeviceFunction, PciAddr, PciCam, PciError, PciRoot, SegmentGroupNumber,
+    PORT_PCI_CONFIG_ADDRESS, PORT_PCI_CONFIG_DATA,
 };
 use crate::include::bindings::bindings::{io_in32, io_out32};
 use crate::mm::PhysAddr;
@@ -57,6 +57,7 @@ impl TraitPciArch for X86_64PciArch {
                     segement_group_number: segement,
                     bus_begin: mcfg_entry.bus_number_start,
                     bus_end: mcfg_entry.bus_number_end,
+                    cam: PciCam::Ecam,
                 });
             }
         }

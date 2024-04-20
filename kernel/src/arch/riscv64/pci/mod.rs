@@ -10,7 +10,7 @@ impl TraitPciArch for RiscV64PciArch {
     }
 
     fn write_config(bus_device_function: &BusDeviceFunction, offset: u8, data: u32) {
-        unimplemented!("RiscV64PciArch::write_config")
+        unimplemented!("RiscV64pci_root_0().write_config")
     }
 
     fn address_pci_to_physical(pci_address: PciAddr) -> crate::mm::PhysAddr {

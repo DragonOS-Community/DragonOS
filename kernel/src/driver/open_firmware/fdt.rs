@@ -381,6 +381,20 @@ impl OpenFirmwareFdtDriver {
 
         return mem_block_manager().reserve_block(base, size);
     }
+
+    pub fn find_node_by_compatible<'b>(
+        &self,
+        fdt: &'b Fdt<'b>,
+        compatible: &'b str,
+    ) -> impl Iterator<Item = fdt::node::FdtNode<'b, 'b>> + 'b {
+        // compatible = compatible.trim();
+        let r = fdt.all_nodes().filter(move |x| {
+            x.compatible()
+                .is_some_and(|x| x.all().any(|x| x == compatible))
+        });
+
+        return r;
+    }
 }
 
 #[allow(dead_code)]

@@ -5,7 +5,6 @@ use x86::dtables::DescriptorTablePointer;
 
 use crate::{
     arch::{interrupt::trap::arch_trap_init, process::table::TSSManager},
-    driver::pci::pci::pci_init,
     init::init::start_kernel,
     kdebug,
     mm::{MemoryManagementArch, PhysAddr},
@@ -88,8 +87,6 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
 /// 架构相关的初始化
 #[inline(never)]
 pub fn setup_arch() -> Result<(), SystemError> {
-    // todo: 将来pci接入设备驱动模型之后，删掉这里。
-    pci_init();
     return Ok(());
 }
 

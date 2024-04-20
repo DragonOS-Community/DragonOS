@@ -27,6 +27,9 @@ pub const PAGE_4K_SHIFT: usize = 12;
 pub const PAGE_2M_SHIFT: usize = 21;
 pub const PAGE_1G_SHIFT: usize = 30;
 
+pub const PAGE_4K_SIZE: usize = 1 << PAGE_4K_SHIFT;
+pub const PAGE_2M_SIZE: usize = 1 << PAGE_2M_SHIFT;
+
 /// 全局物理页信息管理器
 pub static mut PAGE_MANAGER: Option<SpinLock<PageManager>> = None;
 

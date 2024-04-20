@@ -8,7 +8,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-use super::pci::{pci_root_0, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError};
+use super::pci::{PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError};
+use super::root::pci_root_0;
 use crate::arch::msi::{arch_msi_message_address, arch_msi_message_data};
 
 use crate::driver::base::device::DeviceId;

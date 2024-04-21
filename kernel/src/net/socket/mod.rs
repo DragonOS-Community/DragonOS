@@ -10,7 +10,7 @@ use alloc::{
 use hashbrown::HashMap;
 use smoltcp::{
     iface::SocketSet,
-    socket::{self, tcp, udp},
+    socket::{self, raw, tcp, udp},
 };
 use system_error::SystemError;
 
@@ -756,6 +756,7 @@ impl SocketPollMethod {
         match socket {
             socket::Socket::Udp(udp) => Self::udp_poll(udp, shutdown),
             socket::Socket::Tcp(tcp) => Self::tcp_poll(tcp, shutdown),
+            socket::Socket::Raw(raw) => Self::raw_poll(raw, shutdown),
             _ => todo!(),
         }
     }
@@ -835,6 +836,41 @@ impl SocketPollMethod {
             todo!()
         }
 
+        return event;
+    }
+
+    pub fn raw_poll(socket: &raw::Socket, shutdown: ShutdownType) -> EPollEventType {
+        //kdebug!("enter raw_poll!");
+        let mut event = EPollEventType::empty();
+
+        if shutdown.contains(ShutdownType::RCV_SHUTDOWN) {
+            event.insert(
+                EPollEventType::EPOLLRDHUP | EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+            );
+        }
+        if shutdown.contains(ShutdownType::SHUTDOWN_MASK) {
+            event.insert(EPollEventType::EPOLLHUP);
+        }
+
+        if socket.can_recv() {
+            //kdebug!("poll can recv!");
+            event.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
+        } else {
+            //kdebug!("poll can not recv!");
+        }
+
+        if socket.can_send() {
+            //kdebug!("poll can send!");
+            event.insert(
+                EPollEventType::EPOLLOUT
+                    | EPollEventType::EPOLLWRNORM
+                    | EPollEventType::EPOLLWRBAND,
+            );
+        } else {
+            //kdebug!("poll can not send!");
+            // TODO: 缓冲区空间不够，需要使用信号处理
+            todo!()
+        }
         return event;
     }
 }

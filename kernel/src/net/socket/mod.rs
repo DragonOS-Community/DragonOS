@@ -756,7 +756,7 @@ impl SocketPollMethod {
         match socket {
             socket::Socket::Udp(udp) => Self::udp_poll(udp, shutdown),
             socket::Socket::Tcp(tcp) => Self::tcp_poll(tcp, shutdown),
-            socket::Socket::Raw(Raw) => Self::raw_poll(Raw, shutdown),
+            socket::Socket::Raw(raw) => Self::raw_poll(raw, shutdown),
             _ => todo!(),
         }
     }

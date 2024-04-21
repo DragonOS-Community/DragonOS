@@ -15,29 +15,38 @@ labels:
 - name: remove ambiguous
   content:
   regexes: '[Rr]emove (?:[Ll]abels? |)(?:`|)ambiguous(?:`|)'
-# `DragonOS Team`
-- name: DragonOS Team
-  mode:
-    add: [pull_request_target, issues]
-  author_association:
-  - "MEMBER"
-
 # `feature`
 - name: enhance
   content: enhancement
   regexes: '[Ff]eat(?:\([a-zA-Z]*\))?[\:\.\,]'
+  skip-if:
+  - skip all
+  remove-if:
+  - remove all
 # `Bug fix`
 - name: bug-fix
   content: Bug fix
   regexes: '[Ff]ix(?:\([a-zA-Z]*\))?[\:\.\,]'
+  skip-if:
+  - skip all
+  remove-if:
+  - remove all
 # `document`
 - name: doc
   content: documentation
   regexes: '[Dd]ocs(?:\([a-zA-Z]*\))?[\:\.\,]'
+  skip-if:
+  - skip all
+  remove-if:
+  - remove all
 # `test`
 - name: test
   content: test
   regexes: '[Tt]est(?:\([a-zA-Z]*\))?[\:\.\,]'
+  skip-if:
+  - skip all
+  remove-if:
+  - remove all
 # `ambiguous`
 - name: pr-ambiguous
   # 不符合 commitizen 的 PR

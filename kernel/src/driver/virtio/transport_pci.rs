@@ -276,10 +276,11 @@ impl Transport for PciTransport {
         }
     }
 
-    fn max_queue_size(&self) -> u32 {
-        // Safe because the common config pointer is valid and we checked in get_bar_region that it
-        // was aligned.
-        unsafe { volread!(self.common_cfg, queue_size) }.into()
+    fn max_queue_size(&mut self, queue: u16) -> u32 {
+        unsafe {
+            volwrite!(self.common_cfg, queue_select, queue);
+            volread!(self.common_cfg, queue_size).into()
+        }
     }
 
     fn notify(&mut self, queue: u16) {
@@ -302,6 +303,12 @@ impl Transport for PciTransport {
         unsafe {
             volwrite!(self.common_cfg, device_status, status.bits() as u8);
         }
+    }
+
+    fn get_status(&self) -> DeviceStatus {
+        // Safe because the common config pointer is valid and we checked in get_bar_region that it
+        // was aligned.
+        unsafe { DeviceStatus::from_bits_truncate(volread!(self.common_cfg, device_status).into()) }
     }
 
     fn set_guest_page_size(&mut self, _guest_page_size: u32) {

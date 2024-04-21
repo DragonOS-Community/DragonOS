@@ -47,7 +47,7 @@ num-traits = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/num
 smoltcp = { version = "=0.11.0", default-features = false, features = ["log", "alloc",  "socket-raw", "socket-udp", "socket-tcp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-ipv4", "proto-ipv6"]}
 system_error = { path = "crates/system_error" }
 unified-init = { path = "crates/unified-init" }
-virtio-drivers = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers.git", rev = "f1d1cbb" }
+virtio-drivers = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers.git", rev = "61ece509c4" }
 fdt = "=0.1.5"
 uefi = { version = "=0.26.0", features = ["alloc"] }
 uefi-raw = "=0.5.0"

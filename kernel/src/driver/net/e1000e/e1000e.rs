@@ -587,11 +587,6 @@ impl Drop for E1000EDevice {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn rs_e1000e_init() {
-    e1000e_init();
-}
-
 pub fn e1000e_init() {
     match e1000e_probe() {
         Ok(_code) => {

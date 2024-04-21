@@ -1,7 +1,20 @@
+use system_error::SystemError;
+use unified_init::macros::unified_init;
+
 use crate::{
     arch::TraitPciArch,
-    driver::pci::pci::{BusDeviceFunction, PciAddr, PciError, PciRoot, SegmentGroupNumber},
+    driver::{
+        open_firmware::fdt::open_firmware_fdt_driver,
+        pci::pci::{pci_init, BusDeviceFunction, PciAddr, PciError, SegmentGroupNumber},
+    },
+    init::{boot_params, initcall::INITCALL_SUBSYS},
+    kwarn,
+    mm::PhysAddr,
 };
+
+use self::pci_host_ecam::pci_host_ecam_driver_init;
+
+mod pci_host_ecam;
 
 pub struct RiscV64PciArch;
 impl TraitPciArch for RiscV64PciArch {
@@ -14,10 +27,16 @@ impl TraitPciArch for RiscV64PciArch {
     }
 
     fn address_pci_to_physical(pci_address: PciAddr) -> crate::mm::PhysAddr {
-        unimplemented!("RiscV64PciArch::address_pci_to_physical")
+        return PhysAddr::new(pci_address.data());
     }
+}
 
-    fn ecam_root(segement: SegmentGroupNumber) -> Result<PciRoot, PciError> {
-        unimplemented!("RiscV64PciArch::ecam_root")
-    }
+#[unified_init(INITCALL_SUBSYS)]
+fn riscv_pci_init() -> Result<(), SystemError> {
+    let fdt = open_firmware_fdt_driver().fdt_ref()?;
+
+    pci_host_ecam_driver_init(&fdt)?;
+    pci_init();
+
+    return Ok(());
 }

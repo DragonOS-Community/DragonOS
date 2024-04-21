@@ -2,11 +2,12 @@
 
 use crate::driver::base::device::DeviceId;
 use crate::driver::pci::pci::{
-    pci_root_0, BusDeviceFunction, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,
+    BusDeviceFunction, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,
     PciStandardDeviceBar, PCI_CAP_ID_VNDR,
 };
 
 use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqMsg, IRQ};
+use crate::driver::pci::root::pci_root_0;
 use crate::driver::virtio::irq::virtio_irq_manager;
 use crate::exception::irqdata::IrqHandlerData;
 use crate::exception::irqdesc::{IrqHandler, IrqReturn};

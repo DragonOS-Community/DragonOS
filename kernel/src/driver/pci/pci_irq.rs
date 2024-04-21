@@ -9,8 +9,8 @@ use alloc::vec::Vec;
 use system_error::SystemError;
 
 use super::pci::{PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError};
+use super::root::pci_root_0;
 use crate::arch::msi::{arch_msi_message_address, arch_msi_message_data};
-use crate::arch::{PciArch, TraitPciArch};
 
 use crate::driver::base::device::DeviceId;
 use crate::exception::irqdesc::{IrqHandleFlags, IrqHandler};
@@ -158,15 +158,19 @@ pub trait PciInterrupt: PciDeviceStructure {
         // MSIX中断优先
         if flag.contains(IRQ::PCI_IRQ_MSIX) {
             if let Some(cap_offset) = self.msix_capability_offset() {
-                let data =
-                    PciArch::read_config(&self.common_header().bus_device_function, cap_offset);
+                let data = pci_root_0()
+                    .read_config(self.common_header().bus_device_function, cap_offset.into());
                 let irq_max_num = ((data >> 16) & 0x7ff) as u16 + 1;
-                let data =
-                    PciArch::read_config(&self.common_header().bus_device_function, cap_offset + 4);
+                let data = pci_root_0().read_config(
+                    self.common_header().bus_device_function,
+                    (cap_offset + 4).into(),
+                );
                 let msix_table_bar = (data & 0x07) as u8;
                 let msix_table_offset = data & (!0x07);
-                let data =
-                    PciArch::read_config(&self.common_header().bus_device_function, cap_offset + 8);
+                let data = pci_root_0().read_config(
+                    self.common_header().bus_device_function,
+                    (cap_offset + 8).into(),
+                );
                 let pending_table_bar = (data & 0x07) as u8;
                 let pending_table_offset = data & (!0x07);
                 *self.irq_type_mut()? = IrqType::Msix {
@@ -190,8 +194,8 @@ pub trait PciInterrupt: PciDeviceStructure {
         // 其次MSI
         if flag.contains(IRQ::PCI_IRQ_MSI) {
             if let Some(cap_offset) = self.msi_capability_offset() {
-                let data =
-                    PciArch::read_config(&self.common_header().bus_device_function, cap_offset);
+                let data = pci_root_0()
+                    .read_config(self.common_header().bus_device_function, cap_offset.into());
                 let message_control = (data >> 16) as u16;
                 let maskable = (message_control & 0x0100) != 0;
                 let address_64 = (message_control & 0x0080) != 0;
@@ -247,16 +251,16 @@ pub trait PciInterrupt: PciDeviceStructure {
         if let Some(irq_type) = self.irq_type_mut() {
             match *irq_type {
                 IrqType::Msix { cap_offset, .. } => {
-                    let mut message =
-                        PciArch::read_config(&self.common_header().bus_device_function, cap_offset);
+                    let mut message = pci_root_0()
+                        .read_config(self.common_header().bus_device_function, cap_offset.into());
                     if enable {
                         message |= 1 << 31;
                     } else {
                         message &= !(1 << 31);
                     }
-                    PciArch::write_config(
-                        &self.common_header().bus_device_function,
-                        cap_offset,
+                    pci_root_0().write_config(
+                        self.common_header().bus_device_function,
+                        cap_offset.into(),
                         message,
                     );
                     return Ok(0);
@@ -278,16 +282,16 @@ pub trait PciInterrupt: PciDeviceStructure {
         if let Some(irq_type) = self.irq_type_mut() {
             match *irq_type {
                 IrqType::Msi { cap_offset, .. } => {
-                    let mut message =
-                        PciArch::read_config(&self.common_header().bus_device_function, cap_offset);
+                    let mut message = pci_root_0()
+                        .read_config(self.common_header().bus_device_function, cap_offset.into());
                     if enable {
                         message |= 1 << 16;
                     } else {
                         message &= !(1 << 16);
                     }
-                    PciArch::write_config(
-                        &self.common_header().bus_device_function,
-                        cap_offset,
+                    pci_root_0().write_config(
+                        self.common_header().bus_device_function,
+                        cap_offset.into(),
                         message,
                     );
                     return Ok(0);
@@ -404,84 +408,84 @@ pub trait PciInterrupt: PciDeviceStructure {
                         let msg_data = arch_msi_message_data(irq_num.data() as u16, 0, trigger);
                         // 写入Message Data和Message Address
                         if address_64 {
-                            PciArch::write_config(
-                                &self.common_header().bus_device_function,
-                                cap_offset + 4,
+                            pci_root_0().write_config(
+                                self.common_header().bus_device_function,
+                                (cap_offset + 4).into(),
                                 msg_address,
                             );
-                            PciArch::write_config(
-                                &self.common_header().bus_device_function,
-                                cap_offset + 8,
+                            pci_root_0().write_config(
+                                self.common_header().bus_device_function,
+                                (cap_offset + 8).into(),
                                 0,
                             );
-                            PciArch::write_config(
-                                &self.common_header().bus_device_function,
-                                cap_offset + 12,
+                            pci_root_0().write_config(
+                                self.common_header().bus_device_function,
+                                (cap_offset + 12).into(),
                                 msg_data,
                             );
                         } else {
-                            PciArch::write_config(
-                                &self.common_header().bus_device_function,
-                                cap_offset + 4,
+                            pci_root_0().write_config(
+                                self.common_header().bus_device_function,
+                                (cap_offset + 4).into(),
                                 msg_address,
                             );
-                            PciArch::write_config(
-                                &self.common_header().bus_device_function,
-                                cap_offset + 8,
+                            pci_root_0().write_config(
+                                self.common_header().bus_device_function,
+                                (cap_offset + 8).into(),
                                 msg_data,
                             );
                         }
-                        let data = PciArch::read_config(
-                            &self.common_header().bus_device_function,
-                            cap_offset,
+                        let data = pci_root_0().read_config(
+                            self.common_header().bus_device_function,
+                            cap_offset.into(),
                         );
                         let message_control = (data >> 16) as u16;
                         match self.irq_vector_mut().unwrap().len() {
                             1 => {
                                 let temp = message_control & (!0x0070);
-                                PciArch::write_config(
-                                    &self.common_header().bus_device_function,
-                                    cap_offset,
+                                pci_root_0().write_config(
+                                    self.common_header().bus_device_function,
+                                    cap_offset.into(),
                                     (temp as u32) << 16,
                                 );
                             }
                             2 => {
                                 let temp = message_control & (!0x0070);
-                                PciArch::write_config(
-                                    &self.common_header().bus_device_function,
-                                    cap_offset,
+                                pci_root_0().write_config(
+                                    self.common_header().bus_device_function,
+                                    cap_offset.into(),
                                     ((temp | (0x0001 << 4)) as u32) << 16,
                                 );
                             }
                             4 => {
                                 let temp = message_control & (!0x0070);
-                                PciArch::write_config(
-                                    &self.common_header().bus_device_function,
-                                    cap_offset,
+                                pci_root_0().write_config(
+                                    self.common_header().bus_device_function,
+                                    cap_offset.into(),
                                     ((temp | (0x0002 << 4)) as u32) << 16,
                                 );
                             }
                             8 => {
                                 let temp = message_control & (!0x0070);
-                                PciArch::write_config(
-                                    &self.common_header().bus_device_function,
-                                    cap_offset,
+                                pci_root_0().write_config(
+                                    self.common_header().bus_device_function,
+                                    cap_offset.into(),
                                     ((temp | (0x0003 << 4)) as u32) << 16,
                                 );
                             }
                             16 => {
                                 let temp = message_control & (!0x0070);
-                                PciArch::write_config(
-                                    &self.common_header().bus_device_function,
-                                    cap_offset,
+                                pci_root_0().write_config(
+                                    self.common_header().bus_device_function,
+                                    cap_offset.into(),
                                     ((temp | (0x0004 << 4)) as u32) << 16,
                                 );
                             }
                             32 => {
                                 let temp = message_control & (!0x0070);
-                                PciArch::write_config(
-                                    &self.common_header().bus_device_function,
-                                    cap_offset,
+                                pci_root_0().write_config(
+                                    self.common_header().bus_device_function,
+                                    cap_offset.into(),
                                     ((temp | (0x0005 << 4)) as u32) << 16,
                                 );
                             }
@@ -629,21 +633,25 @@ pub trait PciInterrupt: PciDeviceStructure {
                         let irq = IrqNumber::new((*vector).into());
                         irq_manager().free_irq(irq, None);
                     }
-                    PciArch::write_config(&self.common_header().bus_device_function, cap_offset, 0);
-                    PciArch::write_config(
-                        &self.common_header().bus_device_function,
-                        cap_offset + 4,
+                    pci_root_0().write_config(
+                        self.common_header().bus_device_function,
+                        cap_offset.into(),
                         0,
                     );
-                    PciArch::write_config(
-                        &self.common_header().bus_device_function,
-                        cap_offset + 8,
+                    pci_root_0().write_config(
+                        self.common_header().bus_device_function,
+                        (cap_offset + 4).into(),
+                        0,
+                    );
+                    pci_root_0().write_config(
+                        self.common_header().bus_device_function,
+                        (cap_offset + 8).into(),
                         0,
                     );
                     if address_64 {
-                        PciArch::write_config(
-                            &self.common_header().bus_device_function,
-                            cap_offset + 12,
+                        pci_root_0().write_config(
+                            self.common_header().bus_device_function,
+                            (cap_offset + 12).into(),
                             0,
                         );
                     }
@@ -675,7 +683,11 @@ pub trait PciInterrupt: PciDeviceStructure {
                         let irq = IrqNumber::new((*vector).into());
                         irq_manager().free_irq(irq, None);
                     }
-                    PciArch::write_config(&self.common_header().bus_device_function, cap_offset, 0);
+                    pci_root_0().write_config(
+                        self.common_header().bus_device_function,
+                        cap_offset.into(),
+                        0,
+                    );
                     let pcistandardbar = self
                         .bar()
                         .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))
@@ -750,26 +762,26 @@ pub trait PciInterrupt: PciDeviceStructure {
                     if maskable {
                         match address_64 {
                             true => {
-                                let mut mask = PciArch::read_config(
-                                    &self.common_header().bus_device_function,
-                                    cap_offset + 16,
+                                let mut mask = pci_root_0().read_config(
+                                    self.common_header().bus_device_function,
+                                    (cap_offset + 16).into(),
                                 );
                                 mask |= 1 << irq_index;
-                                PciArch::write_config(
-                                    &self.common_header().bus_device_function,
-                                    cap_offset,
+                                pci_root_0().write_config(
+                                    self.common_header().bus_device_function,
+                                    cap_offset.into(),
                                     mask,
                                 );
                             }
                             false => {
-                                let mut mask = PciArch::read_config(
-                                    &self.common_header().bus_device_function,
-                                    cap_offset + 12,
+                                let mut mask = pci_root_0().read_config(
+                                    self.common_header().bus_device_function,
+                                    (cap_offset + 12).into(),
                                 );
                                 mask |= 1 << irq_index;
-                                PciArch::write_config(
-                                    &self.common_header().bus_device_function,
-                                    cap_offset,
+                                pci_root_0().write_config(
+                                    self.common_header().bus_device_function,
+                                    cap_offset.into(),
                                     mask,
                                 );
                             }
@@ -871,26 +883,26 @@ pub trait PciInterrupt: PciDeviceStructure {
                     if maskable {
                         match address_64 {
                             true => {
-                                let mut mask = PciArch::read_config(
-                                    &self.common_header().bus_device_function,
-                                    cap_offset + 16,
+                                let mut mask = pci_root_0().read_config(
+                                    self.common_header().bus_device_function,
+                                    (cap_offset + 16).into(),
                                 );
                                 mask &= !(1 << irq_index);
-                                PciArch::write_config(
-                                    &self.common_header().bus_device_function,
-                                    cap_offset,
+                                pci_root_0().write_config(
+                                    self.common_header().bus_device_function,
+                                    cap_offset.into(),
                                     mask,
                                 );
                             }
                             false => {
-                                let mut mask = PciArch::read_config(
-                                    &self.common_header().bus_device_function,
-                                    cap_offset + 12,
+                                let mut mask = pci_root_0().read_config(
+                                    self.common_header().bus_device_function,
+                                    (cap_offset + 12).into(),
                                 );
                                 mask &= !(1 << irq_index);
-                                PciArch::write_config(
-                                    &self.common_header().bus_device_function,
-                                    cap_offset,
+                                pci_root_0().write_config(
+                                    self.common_header().bus_device_function,
+                                    cap_offset.into(),
                                     mask,
                                 );
                             }
@@ -993,17 +1005,17 @@ pub trait PciInterrupt: PciDeviceStructure {
                     if maskable {
                         match address_64 {
                             true => {
-                                let mut pend = PciArch::read_config(
-                                    &self.common_header().bus_device_function,
-                                    cap_offset + 20,
+                                let mut pend = pci_root_0().read_config(
+                                    self.common_header().bus_device_function,
+                                    (cap_offset + 20).into(),
                                 );
                                 pend &= 1 << irq_index;
                                 return Ok(pend != 0);
                             }
                             false => {
-                                let mut pend = PciArch::read_config(
-                                    &self.common_header().bus_device_function,
-                                    cap_offset + 16,
+                                let mut pend = pci_root_0().read_config(
+                                    self.common_header().bus_device_function,
+                                    (cap_offset + 16).into(),
                                 );
                                 pend &= 1 << irq_index;
                                 return Ok(pend != 0);

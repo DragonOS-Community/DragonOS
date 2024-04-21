@@ -112,7 +112,7 @@ impl Socket for RawSocket {
                         })),
                     );
                 }
-                Err(raw::RecvError::Exhausted) => {
+                Err(_) => {
                     if !self.metadata.options.contains(SocketOptions::BLOCK) {
                         // 如果是非阻塞的socket，就返回错误
                         return (Err(SystemError::EAGAIN_OR_EWOULDBLOCK), Endpoint::Ip(None));
@@ -327,10 +327,10 @@ impl Socket for UdpSocket {
             // kdebug!("Wait to Read");
 
             if socket.can_recv() {
-                if let Ok((size, remote_endpoint)) = socket.recv_slice(buf) {
+                if let Ok((size, metadata)) = socket.recv_slice(buf) {
                     drop(socket_set_guard);
                     poll_ifaces();
-                    return (Ok(size), Endpoint::Ip(Some(remote_endpoint)));
+                    return (Ok(size), Endpoint::Ip(Some(metadata.endpoint)));
                 }
             } else {
                 // 如果socket没有连接，则忙等
@@ -592,37 +592,33 @@ impl Socket for TcpSocket {
             }
 
             if socket.may_recv() {
-                let recv_res = socket.recv_slice(buf);
+                match socket.recv_slice(buf) {
+                    Ok(size) => {
+                        if size > 0 {
+                            let endpoint = if let Some(p) = socket.remote_endpoint() {
+                                p
+                            } else {
+                                return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
+                            };
 
-                if let Ok(size) = recv_res {
-                    if size > 0 {
-                        let endpoint = if let Some(p) = socket.remote_endpoint() {
-                            p
-                        } else {
-                            return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
-                        };
-
-                        drop(socket_set_guard);
-                        poll_ifaces();
-                        return (Ok(size), Endpoint::Ip(Some(endpoint)));
+                            drop(socket_set_guard);
+                            poll_ifaces();
+                            return (Ok(size), Endpoint::Ip(Some(endpoint)));
+                        }
                     }
-                } else {
-                    let err = recv_res.unwrap_err();
-                    match err {
-                        tcp::RecvError::InvalidState => {
-                            kwarn!("Tcp Socket Read Error, InvalidState");
-                            return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
-                        }
-                        tcp::RecvError::Finished => {
-                            // 对端写端已关闭，我们应该关闭读端
-                            HANDLE_MAP
-                                .write_irqsave()
-                                .get_mut(&self.socket_handle())
-                                .unwrap()
-                                .shutdown_type_writer()
-                                .insert(ShutdownType::RCV_SHUTDOWN);
-                            return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
-                        }
+                    Err(tcp::RecvError::InvalidState) => {
+                        kwarn!("Tcp Socket Read Error, InvalidState");
+                        return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
+                    }
+                    Err(tcp::RecvError::Finished) => {
+                        // 对端写端已关闭，我们应该关闭读端
+                        HANDLE_MAP
+                            .write_irqsave()
+                            .get_mut(&self.socket_handle())
+                            .unwrap()
+                            .shutdown_type_writer()
+                            .insert(ShutdownType::RCV_SHUTDOWN);
+                        return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
                     }
                 }
             } else {

@@ -22,6 +22,7 @@ use super::{
         driver::Driver,
         Device,
     },
+    kobject::KObject,
     kset::KSet,
 };
 
@@ -80,6 +81,10 @@ impl SubSysPrivate {
             interfaces,
             bus_notifier: AtomicNotifierChain::new(),
         };
+    }
+
+    pub fn name(&self) -> String {
+        return self.subsys.name();
     }
 
     pub fn subsys(&self) -> Arc<KSet> {

@@ -7,12 +7,12 @@ use system_error::SystemError;
 
 use crate::{
     arch::rand::rand,
-    driver::net::NetDriver,
+    driver::net::NetDevice,
     kerror, kwarn,
     libs::rwlock::RwLock,
     net::{
         event_poll::EPollEventType, net_core::poll_ifaces, Endpoint, Protocol, ShutdownType,
-        NET_DRIVERS,
+        NET_DEVICES,
     },
 };
 
@@ -151,7 +151,7 @@ impl Socket for RawSocket {
                     socket_set_guard.get_mut::<raw::Socket>(self.handle.smoltcp_handle().unwrap());
 
                 // 暴力解决方案：只考虑0号网卡。 TODO：考虑多网卡的情况！！！
-                let iface = NET_DRIVERS.read_irqsave().get(&0).unwrap().clone();
+                let iface = NET_DEVICES.read_irqsave().get(&0).unwrap().clone();
 
                 // 构造IP头
                 let ipv4_src_addr: Option<wire::Ipv4Address> =
@@ -700,7 +700,7 @@ impl Socket for TcpSocket {
             PORT_MANAGER.bind_port(self.metadata.socket_type, temp_port, self.clone())?;
 
             // kdebug!("temp_port: {}", temp_port);
-            let iface: Arc<dyn NetDriver> = NET_DRIVERS.write_irqsave().get(&0).unwrap().clone();
+            let iface: Arc<dyn NetDevice> = NET_DEVICES.write_irqsave().get(&0).unwrap().clone();
             let mut inner_iface = iface.inner_iface().lock();
             // kdebug!("to connect: {ip:?}");
 

@@ -4,14 +4,15 @@ use crate::{
     arch::rand::rand,
     driver::{
         base::{
-            device::{bus::Bus, driver::Driver, Device, IdTable},
+            class::Class,
+            device::{bus::Bus, driver::Driver, Device, DeviceType, IdTable},
             kobject::{KObjType, KObject, KObjectState},
         },
-        net::NetDriver,
+        net::NetDevice,
     },
     kinfo,
     libs::spinlock::SpinLock,
-    net::{generate_iface_id, NET_DRIVERS},
+    net::{generate_iface_id, NET_DEVICES},
     time::Instant,
 };
 use alloc::{
@@ -205,33 +206,49 @@ impl Debug for E1000EInterface {
     }
 }
 
-impl Driver for E1000EInterface {
-    fn id_table(&self) -> Option<IdTable> {
+impl Device for E1000EInterface {
+    fn dev_type(&self) -> DeviceType {
         todo!()
     }
 
-    fn add_device(&self, _device: Arc<dyn Device>) {
-        todo!()
-    }
-
-    fn delete_device(&self, _device: &Arc<dyn Device>) {
-        todo!()
-    }
-
-    fn devices(&self) -> alloc::vec::Vec<Arc<dyn Device>> {
-        todo!()
-    }
-
-    fn bus(&self) -> Option<Weak<dyn Bus>> {
+    fn id_table(&self) -> IdTable {
         todo!()
     }
 
     fn set_bus(&self, _bus: Option<Weak<dyn Bus>>) {
         todo!()
     }
+
+    fn set_class(&self, _class: Option<Weak<dyn Class>>) {
+        todo!()
+    }
+
+    fn driver(&self) -> Option<Arc<dyn Driver>> {
+        todo!()
+    }
+
+    fn set_driver(&self, _driver: Option<Weak<dyn Driver>>) {
+        todo!()
+    }
+
+    fn is_dead(&self) -> bool {
+        todo!()
+    }
+
+    fn can_match(&self) -> bool {
+        todo!()
+    }
+
+    fn set_can_match(&self, _can_match: bool) {
+        todo!()
+    }
+
+    fn state_synced(&self) -> bool {
+        todo!()
+    }
 }
 
-impl NetDriver for E1000EInterface {
+impl NetDevice for E1000EInterface {
     fn mac(&self) -> smoltcp::wire::EthernetAddress {
         let mac = self.driver.inner.lock().mac_address();
         return smoltcp::wire::EthernetAddress::from_bytes(&mac);
@@ -347,7 +364,7 @@ pub fn e1000e_driver_init(device: E1000EDevice) {
     let driver = E1000EDriver::new(device);
     let iface = E1000EInterface::new(driver);
     // 将网卡的接口信息注册到全局的网卡接口信息表中
-    NET_DRIVERS
+    NET_DEVICES
         .write_irqsave()
         .insert(iface.nic_id(), iface.clone());
     kinfo!("e1000e driver init successfully!\tMAC: [{}]", mac);

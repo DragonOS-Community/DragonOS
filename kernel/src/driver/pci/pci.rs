@@ -95,11 +95,45 @@ impl PciDeviceLinkedList {
     }
 }
 
-/// @brief 在链表中寻找满足条件的PCI设备结构体并返回其可变引用
-/// @param list 链表的写锁守卫  
-/// @param class_code 寄存器值
-/// @param subclass 寄存器值，与class_code一起确定设备类型
-/// @return Vec<&'a mut Box<(dyn PciDeviceStructure)  包含链表中所有满足条件的PCI结构体的可变引用的容器
+/// # 获取具有特定供应商ID的PCI设备结构的引用
+///
+/// 这个函数通过供应商ID搜索PCI设备结构列表，并返回匹配该ID的所有设备结构的引用。
+///
+/// ## 参数
+///
+/// - list: 一个可变的PCI设备结构链表，类型为`&'a mut RwLockWriteGuard<'_, LinkedList<Box<dyn PciDeviceStructure>>>`。
+/// - vendor_id: 要查找的PCI供应商ID，类型为`u16`。
+///
+/// ## 返回值
+///
+/// - 返回匹配的供应商ID的PCI设备结构的引用。
+pub fn get_pci_device_structures_mut_by_vendor_id<'a>(
+    list: &'a mut RwLockWriteGuard<'_, LinkedList<Box<dyn PciDeviceStructure>>>,
+    vendor_id: u16,
+) -> Vec<&'a mut Box<(dyn PciDeviceStructure)>> {
+    let mut result = Vec::new();
+    for box_pci_device_structure in list.iter_mut() {
+        let common_header = (*box_pci_device_structure).common_header();
+        if common_header.vendor_id == vendor_id {
+            result.push(box_pci_device_structure);
+        }
+    }
+    result
+}
+
+/// # get_pci_device_structure_mut - 在链表中寻找满足条件的PCI设备结构体并返回其可变引用
+///
+/// 该函数遍历给定的PCI设备链表，寻找其common_header中class_code和subclass字段与给定值匹配的设备结构体。
+/// 对于每一个匹配的设备结构体，函数返回一个可变引用。
+///
+/// ## 参数
+///
+/// - list: &'a mut RwLockWriteGuard<'_, LinkedList<Box<dyn PciDeviceStructure>>> — 链表的写锁守卫，用于访问和遍历PCI设备链表。
+/// - class_code: u8 — PCI设备class code寄存器值，用于分类设备的功能。
+/// - subclass: u8 — PCI设备subclass寄存器值，与class_code一起确定设备的子类型。
+///
+/// ## 返回值
+/// - 包含链表中所有满足条件的PCI结构体的可变引用的容器。
 pub fn get_pci_device_structure_mut<'a>(
     list: &'a mut RwLockWriteGuard<'_, LinkedList<Box<dyn PciDeviceStructure>>>,
     class_code: u8,
@@ -114,11 +148,20 @@ pub fn get_pci_device_structure_mut<'a>(
     }
     result
 }
-/// @brief 在链表中寻找满足条件的PCI设备结构体并返回其不可变引用
-/// @param list 链表的读锁守卫  
-/// @param class_code 寄存器值
-/// @param subclass 寄存器值，与class_code一起确定设备类型
-/// @return Vec<&'a Box<(dyn PciDeviceStructure)  包含链表中所有满足条件的PCI结构体的不可变引用的容器
+
+/// # get_pci_device_structure - 在链表中寻找满足条件的PCI设备结构体并返回其不可变引用
+///
+/// 该函数遍历给定的PCI设备链表，寻找其common_header中class_code和subclass字段与给定值匹配的设备结构体。
+/// 对于每一个匹配的设备结构体，函数返回一个可变引用。
+///
+/// ## 参数
+///
+/// - list: &'a mut RwLockWriteGuard<'_, LinkedList<Box<dyn PciDeviceStructure>>> — 链表的写锁守卫，用于访问和遍历PCI设备链表。
+/// - class_code: u8 — PCI设备class code寄存器值，用于分类设备的功能。
+/// - subclass: u8 — PCI设备subclass寄存器值，与class_code一起确定设备的子类型。
+///
+/// ## 返回值
+/// - 包含链表中所有满足条件的PCI结构体的不可变引用的容器。
 #[allow(clippy::borrowed_box)]
 pub fn get_pci_device_structure<'a>(
     list: &'a mut RwLockReadGuard<'_, LinkedList<Box<dyn PciDeviceStructure>>>,

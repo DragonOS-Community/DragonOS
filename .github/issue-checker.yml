@@ -22,23 +22,27 @@ labels:
   author_association:
   - "MEMBER"
 
+# `feature`
 - name: enhance
   content: enhancement
-  regexes: '[Ff]eat'
+  regexes: '[Ff]eat(?:\([a-zA-Z]*\))?[\:\.\,]'
+# `Bug fix`
 - name: bug-fix
   content: Bug fix
-  regexes: '[Ff]ix'
+  regexes: '[Ff]ix(?:\([a-zA-Z]*\))?[\:\.\,]'
+# `document`
 - name: doc
   content: documentation
-  regexes: '[Dd]ocs'
+  regexes: '[Dd]ocs(?:\([a-zA-Z]*\))?[\:\.\,]'
+# `test`
 - name: test
   content: test
-  regexes: '[Tt]est'
+  regexes: '[Tt]est(?:\([a-zA-Z]*\))?[\:\.\,]'
 # `ambiguous`
 - name: pr-ambiguous
   # 不符合 commitizen 的 PR
   content: ambiguous
-  regexes: '^(?!(?:build|chore|ci|docs?|feat|fix|perf|refactor|rft|style|test)(?:\([a-zA-Z]*\))[\:\.\(\,]|[Rr]evert|[Rr]elease)'
+  regexes: '^(?!(?:build|chore|ci|docs?|feat|fix|perf|refactor|rft|style|test)(?:\([a-zA-Z]*\))?[\:\.\(\,]|[Rr]evert|[Rr]elease)'
   mode:
     pull_request_target:
   skip-if:

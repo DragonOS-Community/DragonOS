@@ -10,7 +10,7 @@ use crate::{
     filesystem::vfs::syscall::{PosixStatfs, PosixStatx},
     ipc::shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
-    mm::syscall::MremapFlags,
+    mm::{page::PAGE_4K_SIZE, syscall::MremapFlags},
     net::syscall::MsgHdr,
     process::{
         fork::KernelCloneArgs,
@@ -32,7 +32,6 @@ use crate::{
         syscall::{ModeType, PosixKstat},
         MAX_PATHLEN,
     },
-    include::bindings::bindings::PAGE_4K_SIZE,
     kinfo,
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
@@ -261,8 +260,8 @@ impl Syscall {
                 // 权限校验
                 if frame.is_from_user()
                     && (verify_area(virt_path_ptr, MAX_PATHLEN).is_err()
-                        || verify_area(virt_argv_ptr, PAGE_4K_SIZE as usize).is_err())
-                    || verify_area(virt_env_ptr, PAGE_4K_SIZE as usize).is_err()
+                        || verify_area(virt_argv_ptr, PAGE_4K_SIZE).is_err())
+                    || verify_area(virt_env_ptr, PAGE_4K_SIZE).is_err()
                 {
                     Err(SystemError::EFAULT)
                 } else {
@@ -422,7 +421,7 @@ impl Syscall {
                 let virt_optlen = VirtAddr::new(optlen as usize);
                 let security_check = || {
                     // 验证optval的地址是否合法
-                    if verify_area(virt_optval, PAGE_4K_SIZE as usize).is_err() {
+                    if verify_area(virt_optval, PAGE_4K_SIZE).is_err() {
                         // 地址空间超出了用户空间的范围，不合法
                         return Err(SystemError::EFAULT);
                     }
@@ -1053,6 +1052,11 @@ impl Syscall {
                 // todo: 这个系统调用还没有实现
 
                 Err(SystemError::EINVAL)
+            }
+
+            SYS_ALARM => {
+                let second = args[0] as u32;
+                Self::alarm(second)
             }
 
             SYS_SHMGET => {

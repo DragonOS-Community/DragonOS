@@ -8,11 +8,12 @@ use alloc::{
     string::String,
     sync::{Arc, Weak},
 };
-use smoltcp::{phy, wire};
+use smoltcp::{iface, phy, wire};
 use virtio_drivers::{device::net::VirtIONet, transport::Transport};
 
 use super::NetDriver;
 use crate::{
+    arch::rand::rand,
     driver::{
         base::{
             device::{bus::Bus, driver::Driver, Device, DeviceId, IdTable},
@@ -77,7 +78,7 @@ impl<T: Transport> Debug for VirtioNICDriver<T> {
 pub struct VirtioInterface<T: Transport> {
     driver: VirtioNICDriverWrapper<T>,
     iface_id: usize,
-    iface: SpinLock<smoltcp::iface::Interface>,
+    iface: SpinLock<iface::Interface>,
     name: String,
     dev_id: Arc<DeviceId>,
 }
@@ -96,16 +97,12 @@ impl<T: Transport> Debug for VirtioInterface<T> {
 impl<T: Transport> VirtioInterface<T> {
     pub fn new(mut driver: VirtioNICDriver<T>, dev_id: Arc<DeviceId>) -> Arc<Self> {
         let iface_id = generate_iface_id();
-        let mut iface_config = smoltcp::iface::Config::new();
-
-        // todo: 随机设定这个值。
-        // 参见 https://docs.rs/smoltcp/latest/smoltcp/iface/struct.Config.html#structfield.random_seed
-        iface_config.random_seed = 12345;
-
-        iface_config.hardware_addr = Some(wire::HardwareAddress::Ethernet(
-            smoltcp::wire::EthernetAddress(driver.inner.lock().mac_address()),
+        let mut iface_config = iface::Config::new(wire::HardwareAddress::Ethernet(
+            wire::EthernetAddress(driver.inner.lock().mac_address()),
         ));
-        let iface = smoltcp::iface::Interface::new(iface_config, &mut driver);
+        iface_config.random_seed = rand() as u64;
+
+        let iface = iface::Interface::new(iface_config, &mut driver, Instant::now().into());
 
         let driver: VirtioNICDriverWrapper<T> = VirtioNICDriverWrapper(UnsafeCell::new(driver));
         let result = Arc::new(VirtioInterface {
@@ -140,15 +137,11 @@ impl<T: Transport> Drop for VirtioInterface<T> {
 
 impl<T: 'static + Transport> VirtioNICDriver<T> {
     pub fn new(driver_net: VirtIONet<HalImpl, T, 2>) -> Self {
-        let mut iface_config = smoltcp::iface::Config::new();
-
-        // todo: 随机设定这个值。
-        // 参见 https://docs.rs/smoltcp/latest/smoltcp/iface/struct.Config.html#structfield.random_seed
-        iface_config.random_seed = 12345;
-
-        iface_config.hardware_addr = Some(wire::HardwareAddress::Ethernet(
-            smoltcp::wire::EthernetAddress(driver_net.mac_address()),
+        let mut iface_config = iface::Config::new(wire::HardwareAddress::Ethernet(
+            wire::EthernetAddress(driver_net.mac_address()),
         ));
+
+        iface_config.random_seed = rand() as u64;
 
         let inner: Arc<SpinLock<VirtIONet<HalImpl, T, 2>>> = Arc::new(SpinLock::new(driver_net));
         let result = VirtioNICDriver { inner };
@@ -255,7 +248,7 @@ pub fn virtio_net<T: Transport + 'static>(transport: T, dev_id: Arc<DeviceId>) {
                 return;
             }
         };
-    let mac = smoltcp::wire::EthernetAddress::from_bytes(&driver_net.mac_address());
+    let mac = wire::EthernetAddress::from_bytes(&driver_net.mac_address());
     let driver: VirtioNICDriver<T> = VirtioNICDriver::new(driver_net);
     let iface = VirtioInterface::new(driver, dev_id);
     let name = iface.name.clone();
@@ -301,9 +294,9 @@ impl<T: Transport + 'static> Driver for VirtioInterface<T> {
 }
 
 impl<T: Transport + 'static> NetDriver for VirtioInterface<T> {
-    fn mac(&self) -> smoltcp::wire::EthernetAddress {
+    fn mac(&self) -> wire::EthernetAddress {
         let mac: [u8; 6] = self.driver.inner.lock().mac_address();
-        return smoltcp::wire::EthernetAddress::from_bytes(&mac);
+        return wire::EthernetAddress::from_bytes(&mac);
     }
 
     #[inline]
@@ -327,13 +320,15 @@ impl<T: Transport + 'static> NetDriver for VirtioInterface<T> {
             if let Some(dest) = dest {
                 *dest = ip_addrs[0];
             } else {
-                addrs.push(ip_addrs[0]).expect("Push ipCidr failed: full");
+                addrs
+                    .push(ip_addrs[0])
+                    .expect("Push wire::IpCidr failed: full");
             }
         });
         return Ok(());
     }
 
-    fn poll(&self, sockets: &mut smoltcp::iface::SocketSet) -> Result<(), SystemError> {
+    fn poll(&self, sockets: &mut iface::SocketSet) -> Result<(), SystemError> {
         let timestamp: smoltcp::time::Instant = Instant::now().into();
         let mut guard = self.iface.lock();
         let poll_res = guard.poll(timestamp, self.driver.force_get_mut(), sockets);
@@ -346,7 +341,7 @@ impl<T: Transport + 'static> NetDriver for VirtioInterface<T> {
     }
 
     #[inline(always)]
-    fn inner_iface(&self) -> &SpinLock<smoltcp::iface::Interface> {
+    fn inner_iface(&self) -> &SpinLock<iface::Interface> {
         return &self.iface;
     }
     // fn as_any_ref(&'static self) -> &'static dyn core::any::Any {

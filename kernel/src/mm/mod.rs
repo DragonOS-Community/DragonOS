@@ -16,14 +16,16 @@ use self::{
     allocator::page_frame::{VirtPageFrame, VirtPageFrameIter},
     memblock::MemoryAreaAttr,
     page::round_up_to_page_size,
-    ucontext::{AddressSpace, UserMapper},
+    ucontext::{AddressSpace, LockedVMA, UserMapper},
 };
 
 pub mod allocator;
 pub mod c_adapter;
 pub mod early_ioremap;
+pub mod fault;
 pub mod init;
 pub mod kernel_mapper;
+pub mod madvise;
 pub mod memblock;
 pub mod mmio_buddy;
 pub mod no_init;
@@ -38,7 +40,7 @@ static mut __IDLE_PROCESS_ADDRESS_SPACE: Option<Arc<AddressSpace>> = None;
 bitflags! {
     /// Virtual memory flags
     #[allow(clippy::bad_bit_mask)]
-    pub struct VmFlags:u32{
+    pub struct VmFlags:u64{
         const VM_NONE = 0x00000000;
 
         const VM_READ = 0x00000001;
@@ -72,6 +74,25 @@ bitflags! {
         const VM_ARCH_1 = 0x01000000;
         const VM_WIPEONFORK = 0x02000000;
         const VM_DONTDUMP = 0x04000000;
+    }
+
+    /// 描述页面错误处理过程中发生的不同情况或结果
+        pub struct VmFaultReason:u32 {
+        const VM_FAULT_OOM = 0x000001;
+        const VM_FAULT_SIGBUS = 0x000002;
+        const VM_FAULT_MAJOR = 0x000004;
+        const VM_FAULT_WRITE = 0x000008;
+        const VM_FAULT_HWPOISON = 0x000010;
+        const VM_FAULT_HWPOISON_LARGE = 0x000020;
+        const VM_FAULT_SIGSEGV = 0x000040;
+        const VM_FAULT_NOPAGE = 0x000100;
+        const VM_FAULT_LOCKED = 0x000200;
+        const VM_FAULT_RETRY = 0x000400;
+        const VM_FAULT_FALLBACK = 0x000800;
+        const VM_FAULT_DONE_COW = 0x001000;
+        const VM_FAULT_NEEDDSYNC = 0x002000;
+        const VM_FAULT_COMPLETED = 0x004000;
+        const VM_FAULT_HINDEX_MASK = 0x0f0000;
     }
 }
 
@@ -407,6 +428,8 @@ impl Default for PhysMemoryArea {
 }
 
 pub trait MemoryManagementArch: Clone + Copy + Debug {
+    /// 是否支持缺页中断
+    const PAGE_FAULT_ENABLED: bool;
     /// 页面大小的shift（假如页面4K，那么这个值就是12,因为2^12=4096）
     const PAGE_SHIFT: usize;
     /// 每个页表的页表项数目。（以2^n次幂来表示）假如有512个页表项，那么这个值就是9
@@ -440,6 +463,10 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     const ENTRY_FLAG_DIRTY: usize;
     /// 当该位为1时，代表这个页面被处理器访问过
     const ENTRY_FLAG_ACCESSED: usize;
+    /// 标记该页表项指向的页是否为大页
+    const ENTRY_FLAG_HUGE_PAGE: usize;
+    /// 当该位为1时，代表该页表项是全局的
+    const ENTRY_FLAG_GLOBAL: usize;
 
     /// 虚拟地址与物理地址的偏移量
     const PHYS_OFFSET: usize;
@@ -468,6 +495,9 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     const PAGE_ENTRY_NUM: usize = 1 << Self::PAGE_ENTRY_SHIFT;
     /// 该字段用于根据虚拟地址，获取该虚拟地址在对应的页表中是第几个页表项
     const PAGE_ENTRY_MASK: usize = Self::PAGE_ENTRY_NUM - 1;
+    /// 内核页表在顶级页表的第一个页表项的索引
+    const PAGE_KERNEL_INDEX: usize = (Self::PHYS_OFFSET & Self::PAGE_ADDRESS_MASK)
+        >> (Self::PAGE_ADDRESS_SHIFT - Self::PAGE_ENTRY_SHIFT);
 
     const PAGE_NEGATIVE_MASK: usize = !((Self::PAGE_ADDRESS_SIZE) - 1);
 
@@ -589,6 +619,27 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     ///
     /// 页表项的值
     fn make_entry(paddr: PhysAddr, page_flags: usize) -> usize;
+
+    /// 判断一个VMA是否允许访问
+    ///
+    /// ## 参数
+    ///
+    /// - `vma`: 进行判断的VMA
+    /// - `write`: 是否需要写入权限（true 表示需要写权限）
+    /// - `execute`: 是否需要执行权限（true 表示需要执行权限）
+    /// - `foreign`: 是否是外部的（即非当前进程的）VMA
+    ///
+    /// ## 返回值
+    /// - `true`: VMA允许访问
+    /// - `false`: 错误的说明
+    fn vma_access_permitted(
+        _vma: Arc<LockedVMA>,
+        _write: bool,
+        _execute: bool,
+        _foreign: bool,
+    ) -> bool {
+        true
+    }
 }
 
 /// @brief 虚拟地址范围

@@ -855,10 +855,15 @@ impl Syscall {
             }
 
             SYS_MADVISE => {
-                // 这个太吵了，总是打印，先注释掉
-                // kwarn!("SYS_MADVISE has not yet been implemented");
-                Ok(0)
+                let addr = args[0];
+                let len = page_align_up(args[1]);
+                if addr & (MMArch::PAGE_SIZE - 1) != 0 {
+                    Err(SystemError::EINVAL)
+                } else {
+                    Self::madvise(VirtAddr::new(addr), len, args[2])
+                }
             }
+
             SYS_GETTID => Self::gettid().map(|tid| tid.into()),
             SYS_GETUID => Self::getuid(),
 

@@ -131,6 +131,7 @@ impl ElfLoader {
                 prot_flags,
                 MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE,
                 false,
+                true,
             );
             if r.is_err() {
                 kerror!("set_elf_brk: map_anonymous failed, err={:?}", r);
@@ -256,7 +257,7 @@ impl ElfLoader {
             // kdebug!("total_size={}", total_size);
 
             map_addr = user_vm_guard
-                .map_anonymous(addr_to_map, total_size, tmp_prot, *map_flags, false)
+                .map_anonymous(addr_to_map, total_size, tmp_prot, *map_flags, false, true)
                 .map_err(map_err_handler)?
                 .virt_address();
             // kdebug!("map ok: addr_to_map={:?}", addr_to_map);
@@ -288,7 +289,7 @@ impl ElfLoader {
             // kdebug!("total size = 0");
 
             map_addr = user_vm_guard
-                .map_anonymous(addr_to_map, map_size, tmp_prot, *map_flags, false)?
+                .map_anonymous(addr_to_map, map_size, tmp_prot, *map_flags, false, true)?
                 .virt_address();
             // kdebug!(
             //     "map ok: addr_to_map={:?}, map_addr={map_addr:?},beginning_page_offset={beginning_page_offset:?}",

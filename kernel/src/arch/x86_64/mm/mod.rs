@@ -1,6 +1,9 @@
 pub mod barrier;
 pub mod bump;
+pub mod fault;
+pub mod pkru;
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashSet;
 use x86::time::rdtsc;
@@ -17,6 +20,7 @@ use crate::libs::spinlock::SpinLock;
 
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::memblock::mem_block_manager;
+use crate::mm::ucontext::LockedVMA;
 use crate::{
     arch::MMArch,
     mm::allocator::{buddy::BuddyAllocator, bump::BumpAllocator},
@@ -44,10 +48,6 @@ pub type PageMapper =
 /// 初始的CR3寄存器的值，用于内存管理初始化时，创建的第一个内核页表的位置
 static mut INITIAL_CR3_VALUE: PhysAddr = PhysAddr::new(0);
 
-/// 内核的第一个页表在pml4中的索引
-/// 顶级页表的[256, 512)项是内核的页表
-static KERNEL_PML4E_NO: usize = (X86_64MMArch::PHYS_OFFSET & ((1 << 48) - 1)) >> 39;
-
 static INNER_ALLOCATOR: SpinLock<Option<BuddyAllocator<MMArch>>> = SpinLock::new(None);
 
 #[derive(Clone, Copy, Debug)]
@@ -70,6 +70,8 @@ pub struct X86_64MMArch;
 static XD_RESERVED: AtomicBool = AtomicBool::new(false);
 
 impl MemoryManagementArch for X86_64MMArch {
+    /// X86目前支持缺页中断
+    const PAGE_FAULT_ENABLED: bool = true;
     /// 4K页
     const PAGE_SHIFT: usize = 12;
 
@@ -104,8 +106,10 @@ impl MemoryManagementArch for X86_64MMArch {
     /// x86_64不存在EXEC标志位，只有NO_EXEC（XD）标志位
     const ENTRY_FLAG_EXEC: usize = 0;
 
-    const ENTRY_FLAG_ACCESSED: usize = 0;
-    const ENTRY_FLAG_DIRTY: usize = 0;
+    const ENTRY_FLAG_ACCESSED: usize = 1 << 5;
+    const ENTRY_FLAG_DIRTY: usize = 1 << 6;
+    const ENTRY_FLAG_HUGE_PAGE: usize = 1 << 7;
+    const ENTRY_FLAG_GLOBAL: usize = 1 << 8;
 
     /// 物理地址与虚拟地址的偏移量
     /// 0xffff_8000_0000_0000
@@ -237,7 +241,7 @@ impl MemoryManagementArch for X86_64MMArch {
         };
 
         // 复制内核的映射
-        for pml4_entry_no in KERNEL_PML4E_NO..512 {
+        for pml4_entry_no in MMArch::PAGE_KERNEL_INDEX..MMArch::PAGE_ENTRY_NUM {
             copy_mapping(pml4_entry_no);
         }
 
@@ -261,6 +265,9 @@ impl MemoryManagementArch for X86_64MMArch {
     const PAGE_ENTRY_NUM: usize = 1 << Self::PAGE_ENTRY_SHIFT;
 
     const PAGE_ENTRY_MASK: usize = Self::PAGE_ENTRY_NUM - 1;
+
+    const PAGE_KERNEL_INDEX: usize = (Self::PHYS_OFFSET & Self::PAGE_ADDRESS_MASK)
+        >> (Self::PAGE_ADDRESS_SHIFT - Self::PAGE_ENTRY_SHIFT);
 
     const PAGE_NEGATIVE_MASK: usize = !((Self::PAGE_ADDRESS_SIZE) - 1);
 
@@ -301,6 +308,21 @@ impl MemoryManagementArch for X86_64MMArch {
     #[inline(always)]
     fn make_entry(paddr: PhysAddr, page_flags: usize) -> usize {
         return paddr.data() | page_flags;
+    }
+
+    fn vma_access_permitted(
+        vma: Arc<LockedVMA>,
+        write: bool,
+        execute: bool,
+        foreign: bool,
+    ) -> bool {
+        if execute {
+            return true;
+        }
+        if foreign | vma.is_foreign() {
+            return true;
+        }
+        pkru::pkru_allows_pkey(pkru::vma_pkey(vma), write)
     }
 }
 

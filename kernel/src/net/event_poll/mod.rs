@@ -1,5 +1,7 @@
 use core::{
-    cell::Cell, fmt::Debug, sync::atomic::{AtomicBool, Ordering}
+    cell::Cell,
+    fmt::Debug,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use alloc::{
@@ -866,19 +868,17 @@ bitflags! {
     }
 }
 
-
-
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
-struct CPollfd{
+struct CPollfd {
     fd: i32,
     events: i16,
     revents: i16,
 }
 
-impl Default for CPollfd{
+impl Default for CPollfd {
     fn default() -> Self {
-        Self{
+        Self {
             fd: 0,
             events: 0,
             revents: 0,
@@ -893,58 +893,50 @@ pub struct Pollfd {
     revents: Cell<EPollEventType>,
 }
 
-impl Pollfd{
-    pub fn new(fd: Option<i32>,events: EPollEventType) -> Self{
+impl Pollfd {
+    pub fn new(fd: Option<i32>, events: EPollEventType) -> Self {
         let revents = Cell::new(EPollEventType::empty());
-        Self{
+        Self {
             fd,
             events,
             revents,
         }
     }
 
-    pub fn fd(&self) -> Option<i32>{
+    pub fn fd(&self) -> Option<i32> {
         self.fd
     }
 
-    pub fn events(&self) -> EPollEventType{
+    pub fn events(&self) -> EPollEventType {
         self.events
     }
 
-    pub fn revents(&self) -> &Cell<EPollEventType>{
+    pub fn revents(&self) -> &Cell<EPollEventType> {
         &self.revents
     }
 }
 
-impl From<CPollfd> for Pollfd{
-    fn from(from: CPollfd) -> Self{
-        let fd = if from.fd>=0{
-            Some(from.fd)
-        }else{
-            None
-        };
+impl From<CPollfd> for Pollfd {
+    fn from(from: CPollfd) -> Self {
+        let fd = if from.fd >= 0 { Some(from.fd) } else { None };
         let events = EPollEventType::from_bits_truncate(from.events as u32);
         let revents = Cell::new(EPollEventType::from_bits_truncate(from.revents as u32));
-        Self { 
-            fd, 
-            events, 
+        Self {
+            fd,
+            events,
             revents,
-         }
+        }
     }
 }
 
-impl From<Pollfd> for CPollfd{
-    fn from(from: Pollfd) -> Self{
-        let fd = if let Some(fd) = from.fd(){
-            fd
-        }else{
-            -1
-        };
+impl From<Pollfd> for CPollfd {
+    fn from(from: Pollfd) -> Self {
+        let fd = if let Some(fd) = from.fd() { fd } else { -1 };
         let events = from.events().bits() as i16;
         let revents = from.revents().get().bits() as i16;
-        Self { 
+        Self {
             fd,
-            events, 
+            events,
             revents,
         }
     }

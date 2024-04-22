@@ -35,6 +35,7 @@ pub fn mm_debug_log(log_type: AllocatorLogType, source: LogSource) {
         Some(ProcessManager::current_pcb().pid())
     };
     MMDebugLogManager::log(log_type, source, pid);
+    return;
 }
 
 #[derive(Debug)]

@@ -6,7 +6,7 @@ use crate::{
     filesystem::procfs::kmsg::kmsg_init,
     ipc::shm::shm_manager_init,
     libs::printk::PrintkWriter,
-    mm::{mmio_buddy::mmio_init, page::page_manager_init},
+    mm::{allocator::slab::slab_init, mmio_buddy::mmio_init, page::page_manager_init},
 };
 
 use super::MemoryManagementArch;
@@ -43,6 +43,9 @@ pub unsafe fn mm_init() {
     }
 
     MMArch::init();
+
+    // init slab
+    slab_init();
 
     // enable mmio
     mmio_init();

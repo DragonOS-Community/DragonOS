@@ -419,7 +419,7 @@ impl Vcpu for VmxVcpu {
             }
             Err(e) => {
                 kdebug!("[-] CPU does not support Intel VMX: {:?}", e);
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                return Err(SystemError::ENOSYS);
             }
         };
 
@@ -429,7 +429,7 @@ impl Vcpu for VmxVcpu {
             }
             Err(_) => {
                 kdebug!("[-] VMX operation is not supported on this processor.");
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                return Err(SystemError::ENOSYS);
             }
         }
 
@@ -574,12 +574,12 @@ pub fn has_intel_vmx_support() -> Result<(), SystemError> {
     let cpuid = CpuId::new();
     if let Some(vi) = cpuid.get_vendor_info() {
         if vi.as_str() != "GenuineIntel" {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::ENOSYS);
         }
     }
     if let Some(fi) = cpuid.get_feature_info() {
         if !fi.has_vmx() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::ENOSYS);
         }
     }
     Ok(())

@@ -34,6 +34,7 @@ fn kernel_init() -> Result<(), SystemError> {
     // 由于目前加锁，速度过慢，所以先不开启双缓冲
     // scm_enable_double_buffer().expect("Failed to enable double buffer");
 
+    #[cfg(target_arch = "x86_64")]
     ahci_init().expect("Failed to initialize AHCI");
 
     mount_root_fs().expect("Failed to mount root fs");

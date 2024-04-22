@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     event_poll::{EPollEventType, EventPoll},
-    socket::{inet::TcpSocket, HANDLE_MAP, SOCKET_SET},
+    socket::{handle::GlobalSocketHandle, inet::TcpSocket, HANDLE_MAP, SOCKET_SET},
 };
 
 /// The network poll function, which will be called by timer.
@@ -188,7 +188,8 @@ pub fn poll_ifaces_try_lock_onetime() -> Result<(), SystemError> {
 fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
     for (handle, socket_type) in sockets.iter() {
         let handle_guard = HANDLE_MAP.read_irqsave();
-        let item = handle_guard.get(&handle);
+        let global_handle = GlobalSocketHandle::new_smoltcp_handle(handle);
+        let item = handle_guard.get(&global_handle);
         if item.is_none() {
             continue;
         }
@@ -203,7 +204,7 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
         match socket_type {
             smoltcp::socket::Socket::Raw(_) | smoltcp::socket::Socket::Udp(_) => {
                 handle_guard
-                    .get(&handle)
+                    .get(&global_handle)
                     .unwrap()
                     .wait_queue
                     .wakeup_any(events);
@@ -217,7 +218,7 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
                     events |= TcpSocket::CAN_CONNECT;
                 }
                 handle_guard
-                    .get(&handle)
+                    .get(&global_handle)
                     .unwrap()
                     .wait_queue
                     .wakeup_any(events);
@@ -227,7 +228,7 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
         }
         drop(handle_guard);
         let mut handle_guard = HANDLE_MAP.write_irqsave();
-        let handle_item = handle_guard.get_mut(&handle).unwrap();
+        let handle_item = handle_guard.get_mut(&global_handle).unwrap();
         EventPoll::wakeup_epoll(
             &handle_item.epitems,
             EPollEventType::from_bits_truncate(events as u32),

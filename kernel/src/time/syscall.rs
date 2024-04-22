@@ -1,9 +1,13 @@
-use core::ffi::{c_int, c_longlong};
+use core::{
+    ffi::{c_int, c_longlong},
+    time::Duration,
+};
 
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 use crate::{
+    process::{timer::AlarmTimer, ProcessManager},
     syscall::{user_access::UserBufferWriter, Syscall},
     time::{sleep::nanosleep, PosixTimeSpec},
 };
@@ -150,5 +154,46 @@ impl Syscall {
         tp_buf.copy_one_to_user(&timespec, 0)?;
 
         return Ok(0);
+    }
+    /// # alarm函数功能
+    ///  
+    /// 设置alarm（单位：秒）
+    ///
+    /// ## 函数参数
+    ///
+    /// expired_second：设置alarm触发的秒数
+    ///
+    /// ### 函数返回值
+    ///
+    /// Ok(usize): 上一个alarm的剩余秒数
+    pub fn alarm(expired_second: u32) -> Result<usize, SystemError> {
+        //初始化second
+        let second = Duration::from_secs(expired_second as u64);
+        let pcb = ProcessManager::current_pcb();
+        let mut pcb_alarm = pcb.alarm_timer_irqsave();
+        let alarm = pcb_alarm.as_ref();
+        //alarm第一次调用
+        if alarm.is_none() {
+            //注册alarm定时器
+            let pid = ProcessManager::current_pid();
+            let new_alarm = Some(AlarmTimer::alarm_timer_init(pid, 0));
+            *pcb_alarm = new_alarm;
+            drop(pcb_alarm);
+            return Ok(0);
+        }
+        //查询上一个alarm的剩余时间和重新注册alarm
+        let alarmtimer = alarm.unwrap();
+        let remain = alarmtimer.remain();
+        if second.is_zero() {
+            alarmtimer.cancel();
+        }
+        if !alarmtimer.timeout() {
+            alarmtimer.cancel();
+        }
+        let pid = ProcessManager::current_pid();
+        let new_alarm = Some(AlarmTimer::alarm_timer_init(pid, second.as_secs()));
+        *pcb_alarm = new_alarm;
+        drop(pcb_alarm);
+        return Ok(remain.as_secs() as usize);
     }
 }

@@ -2,6 +2,7 @@ use core::{
     fmt::Debug,
     intrinsics::unlikely,
     sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering},
+    time::Duration,
 };
 
 use alloc::{
@@ -36,6 +37,51 @@ lazy_static! {
 /// 定时器要执行的函数的特征
 pub trait TimerFunction: Send + Sync + Debug {
     fn run(&mut self) -> Result<(), SystemError>;
+}
+// # Jiffies结构体（注意这是一段时间的jiffies数而不是某一时刻的定时器时间片）
+
+int_like!(Jiffies, u64);
+
+impl Jiffies {
+    /// ## 返回接下来的n_jiffies对应的定时器时间片
+    pub fn timer_jiffies(&self) -> u64 {
+        let result = TIMER_JIFFIES.load(Ordering::SeqCst) + self.data();
+        result
+    }
+}
+
+impl From<Jiffies> for Duration {
+    /// # Jiffies转Duration
+    ///
+    /// ## 参数
+    ///
+    /// jiffies： 一段时间的jiffies数
+    ///
+    /// ### 返回值
+    ///
+    /// Duration： 这段时间的Duration形式
+    fn from(jiffies: Jiffies) -> Self {
+        let ms = jiffies.data() / 1_000_000 * NSEC_PER_JIFFY as u64;
+        let result = Duration::from_millis(ms);
+        result
+    }
+}
+
+impl From<Duration> for Jiffies {
+    /// # Duration 转 Jiffies
+    ///
+    /// ## 参数
+    ///
+    /// ms： 表示一段时间的Duration类型
+    ///
+    /// ### 返回值
+    ///
+    /// Jiffies结构体： 这段时间的Jiffies数
+    fn from(ms: Duration) -> Self {
+        let jiffies = ms.as_millis() as u64 * 1_000_000 / NSEC_PER_JIFFY as u64;
+        let result = Jiffies::new(jiffies);
+        result
+    }
 }
 
 #[derive(Debug)]

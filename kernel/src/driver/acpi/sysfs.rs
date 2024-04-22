@@ -205,11 +205,11 @@ impl AttrAcpiTable {
 
 impl Attribute for AttrAcpiTable {
     fn show(&self, _kobj: Arc<dyn KObject>, _buf: &mut [u8]) -> Result<usize, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn store(&self, _kobj: Arc<dyn KObject>, _buf: &[u8]) -> Result<usize, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn name(&self) -> &str {
@@ -235,7 +235,7 @@ impl BinAttribute for AttrAcpiTable {
         _buf: &[u8],
         _offset: usize,
     ) -> Result<usize, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     /// 展示 ACPI 表的内容

@@ -195,7 +195,7 @@ impl Syscall {
                 return Ok(0);
             }
 
-            if !timespec.is_none() && timespec.unwrap().tv_sec == 0 {
+            if timespec.is_some() && timespec.unwrap().tv_sec == 0 {
                 return Ok(0);
             }
 

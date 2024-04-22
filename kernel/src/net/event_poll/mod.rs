@@ -868,22 +868,12 @@ bitflags! {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 struct CPollfd {
     fd: i32,
     events: i16,
     revents: i16,
-}
-
-impl Default for CPollfd {
-    fn default() -> Self {
-        Self {
-            fd: 0,
-            events: 0,
-            revents: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

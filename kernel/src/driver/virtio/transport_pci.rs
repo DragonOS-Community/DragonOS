@@ -32,9 +32,7 @@ use virtio_drivers::{
     Error, Hal, PhysAddr,
 };
 
-/// The PCI vendor ID for VirtIO devices.
-/// PCI Virtio设备的vendor ID
-const VIRTIO_VENDOR_ID: u16 = 0x1af4;
+use super::VIRTIO_VENDOR_ID;
 
 /// The offset to add to a VirtIO device ID to get the corresponding PCI device ID.
 /// PCI Virtio设备的DEVICE_ID 的offset

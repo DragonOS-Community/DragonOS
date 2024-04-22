@@ -6,10 +6,10 @@ use crate::{
         user_access::{UserBufferReader, UserBufferWriter},
         Syscall,
     },
-    time::PosixTimeSpec,
+    time::{timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper}, PosixTimeSpec},
 };
 
-use super::{EPollCtlOption, EPollEvent, EventPoll, Pollfd};
+use super::{CPollfd, EPollCtlOption, EPollEvent, EPollEventType, EventPoll, Pollfd};
 
 impl Syscall {
     pub fn epoll_create(max_size: i32) -> Result<usize, SystemError> {
@@ -112,14 +112,17 @@ impl Syscall {
             let mut fds:Vec<Pollfd> = Vec::with_capacity(nfds as usize);
             for _ in 0..nfds{
                 let reader = UserBufferReader::new(
-                    read_add.as_ptr::<Pollfd>(),
-                    core::mem::size_of::<Pollfd>(),
+                    read_add.as_ptr::<CPollfd>(),
+                    core::mem::size_of::<CPollfd>(),
                     true
                 )?;
-                let mut fd = Pollfd::default();
-                reader.copy_one_from_user::<Pollfd>(&mut fd, 0)?;
+                let mut cfd =CPollfd::default();
+                reader.copy_one_from_user::<CPollfd>( &mut cfd, 0)?;
+                // kdebug!("{:?}",cfd);
+                let fd = Pollfd::from(cfd);
+                // kdebug!("{:?}",fd);
                 fds.push(fd);
-                read_add += core::mem::size_of::<Pollfd>();
+                read_add += core::mem::size_of::<CPollfd>();
             }
             fds
         };
@@ -128,39 +131,82 @@ impl Syscall {
         if timeout_msecs>=0 {
             let sec = timeout_msecs as i64 / 1000;
             let nsec = 1000000 *(timeout_msecs as i64 % 1000);
-            timespec = Some(TimeSpec::new(sec,nsec));
+            timespec = Some(PosixTimeSpec::new(sec,nsec));
         }
-        let nums_events = Self::do_poll(&fds,timespec)?;
 
+        let nums_events = Self::do_poll(&fds,timespec)?;
 
         let mut write_add = ufds;
         
         for fd in fds {
+            let cfd = CPollfd::from(fd);
             let mut writer = UserBufferWriter::new(
-            write_add.as_ptr::<Pollfd>(), 
-            core::mem::size_of::<Pollfd>(), 
+            write_add.as_ptr::<CPollfd>(), 
+            core::mem::size_of::<CPollfd>(), 
             false)?;
-            writer.copy_one_to_user(&fd, 0)?;
-            write_add += core::mem::size_of::<Pollfd>();
+            writer.copy_one_to_user(&cfd, 0)?;
+            write_add += core::mem::size_of::<CPollfd>();
         }
         
         Ok(nums_events)
     }
-    pub fn do_poll(fds: &[Pollfd],timeout: Option<TimeSpec>) -> Result<usize,SystemError> {
+    pub fn do_poll(poll_fds: &[Pollfd],timespec: Option<PosixTimeSpec>) -> Result<usize,SystemError> {
+        let mut timer = None;
+        let mut timeout =false;
         loop{
             let mut revent_nums = 0;
-            for fd in fds{
-                let binding = ProcessManager::current_pcb().fd_table();
-                let fd_table_guard = binding.read();
-                let file = fd_table_guard
-                    .get_file_by_fd(fd.fd)
-                    .ok_or(SystemError::EBADF)?.clone();
-                drop(fd_table_guard);
-                file.lock_irqsave().poll();
+            for poll_fd in poll_fds{
+               
+                let fd = match poll_fd.fd(){
+                    Some(fd) => fd,
+                    None => continue,
+                };
+                if fd > 0{
+                    let current_pcb = ProcessManager::current_pcb();
+                    let fd_table = current_pcb.fd_table();
+                    let fd_table_guard = fd_table.read();
+                    let file = fd_table_guard
+                        .get_file_by_fd(fd)
+                        .ok_or(SystemError::EBADF)?.clone();
+                    drop(fd_table_guard);
+                    let revents = EPollEventType::from_bits_truncate(file.poll()? as u32);
+                    if !revents.is_empty() {
+                    poll_fd.revents().set(revents);
+                    revent_nums += 1;
+                    }
+
+                }        
+            }
+            // kdebug!("{:?}",revent_nums);
+            if revent_nums > 0 {
+                return Ok(revent_nums);
             }
 
-            if(!timeout.is_none()&&timeout.unwrap().tv_sec==0&&timeout.unwrap().tv_nsec==0){
+            if timeout{
                 return Ok(0);
+            }
+
+            if !timespec.is_none()&&timespec.unwrap().tv_sec==0 {
+                return Ok(0);
+            }
+
+            // 若无事件发生，则注册定时器，超时后直接返回0
+            if let Some(timespec) = timespec {
+                if timer.is_none(){
+                    let handle = WakeUpHelper::new(ProcessManager::current_pcb());
+                let jiffies = next_n_us_timer_jiffies(
+                    (timespec.tv_sec * 1000000 + timespec.tv_nsec / 1000) as u64
+                );
+                let inner = Timer::new(handle,jiffies);
+                inner.activate();
+                timer = Some(inner);
+                }
+            }
+            if let Some(ref timer) = timer {
+                if timer.timeout(){
+                    // 超时
+                    timeout = true;
+                }
             }
         }
     }

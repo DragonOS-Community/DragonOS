@@ -5,18 +5,22 @@ use core::{
 };
 
 use alloc::{
-    string::String, sync::{Arc, Weak}, vec::Vec
+    fmt,
+    string::{String, ToString},
+    sync::{Arc, Weak},
+    vec::Vec,
 };
 use system_error::SystemError;
+use uefi::data_types;
 
-use super::{file_type::Ext2FileType, fs::EXT2_SB_INFO};
+use super::{entry::Ext2DirEntry, file_type::Ext2FileType, fs::EXT2_SB_INFO};
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition},
     filesystem::{
         ext2fs::file_type,
-        vfs::{syscall::ModeType, FileSystem, FileType, IndexNode, Metadata},
+        vfs::{syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, Metadata},
     },
-    libs::{rwlock::RwLock, spinlock::SpinLock},
+    libs::{rwlock::RwLock, spinlock::SpinLock, vec_cursor::VecCursor},
 };
 
 const EXT2_NDIR_BLOCKS: usize = 12;
@@ -27,18 +31,6 @@ const EXT2_BP_NUM: usize = 15;
 #[derive(Debug)]
 pub struct LockedExt2Inode(SpinLock<Ext2Inode>);
 
-/// inode中根据不同系统的保留值
-#[repr(C, align(1))]
-pub union OSD1 {
-    linux_reserved: u32,
-    hurd_tanslator: u32,
-    masix_reserved: u32,
-}
-impl Debug for OSD1 {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "OSD1:{}", unsafe { self.linux_reserved })
-    }
-}
 #[derive(Debug)]
 #[repr(C, align(1))]
 struct MasixOsd2 {
@@ -69,18 +61,7 @@ struct HurdOsd2 {
     author: u32,
 }
 
-/// inode中根据不同系统的保留值
-pub union OSD2 {
-    linux: ManuallyDrop<LinuxOsd2>,
-    hurd: ManuallyDrop<HurdOsd2>,
-    masix: ManuallyDrop<MasixOsd2>,
-}
-impl Debug for OSD2 {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "OSD2:{:?}", unsafe { &self.linux })
-    }
-}
-#[derive(Debug)]
+#[derive(Default)]
 #[repr(C, align(1))]
 /// 磁盘中存储的inode
 pub struct Ext2Inode {
@@ -107,7 +88,7 @@ pub struct Ext2Inode {
     /// 文件属性
     pub flags: u32,
     /// 操作系统依赖
-    pub os_dependent_1: OSD1,
+    pub _os_dependent_1: [u8; 4],
 
     pub blocks: [u32; EXT2_BP_NUM],
 
@@ -126,12 +107,88 @@ pub struct Ext2Inode {
     /// 片段地址
     pub fragment_addr: u32,
     /// 操作系统依赖
-    pub os_dependent_2: OSD2,
+    pub _os_dependent_2: [u8; 12],
 }
 impl Ext2Inode {
-    // TODO 刷新磁盘中的inode
+    pub fn new() -> Self {
+        Self {
+            hard_link_num: 1,
+            ..Default::default()
+        }
+    }
+    pub fn new_from_bytes(data: &Vec<u8>) -> Result<Ext2Inode, SystemError> {
+        let mut cursor = VecCursor::new(data.to_vec());
+
+        let inode = Ext2Inode {
+            mode: cursor.read_u16()?,
+            uid: cursor.read_u16()?,
+            lower_size: cursor.read_u32()?,
+            access_time: cursor.read_u32()?,
+            create_time: cursor.read_u32()?,
+            modify_time: cursor.read_u32()?,
+            delete_time: cursor.read_u32()?,
+            gid: cursor.read_u16()?,
+            hard_link_num: cursor.read_u16()?,
+            disk_sector: cursor.read_u32()?,
+            flags: cursor.read_u32()?,
+            _os_dependent_1: {
+                let mut data = [0u8; 4];
+                cursor.read_exact(&mut data)?;
+                data
+            },
+            blocks: {
+                let mut data = [0u8; EXT2_BP_NUM * 4];
+                cursor.read_exact(&mut data)?;
+                let mut ret = [0u32; EXT2_BP_NUM];
+                let mut start: usize = 0;
+                for i in 0..EXT2_BP_NUM {
+                    ret[i] = u32::from_be_bytes(data[start..start + 4].try_into().unwrap());
+                    start += 4;
+                }
+                ret
+            },
+            generation_num: cursor.read_u32()?,
+            file_acl: cursor.read_u32()?,
+            directory_acl: cursor.read_u32()?,
+            fragment_addr: cursor.read_u32()?,
+            _os_dependent_2: {
+                let mut data = [0u8; 12];
+                cursor.read_exact(&mut data)?;
+                data
+            },
+        };
+        Ok(inode)
+    }
+    pub fn flush(&self) {
+        // TODO 刷新磁盘中的inode
+        todo!()
+    }
 }
 
+impl Debug for Ext2Inode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Inode")
+            .field("mode", &self.mode)
+            .field("uid", &self.uid)
+            .field("lower_size", &self.lower_size)
+            .field("access_time", &self.access_time)
+            .field("create_time", &self.create_time)
+            .field("modify_time", &self.modify_time)
+            .field("delete_time", &self.delete_time)
+            .field("gid", &self.gid)
+            .field("hard_link_num", &self.hard_link_num)
+            .field("disk_sector", &self.disk_sector)
+            .field("flags", &self.flags)
+            .field("_os_dependent_1", &self._os_dependent_1)
+            .field("blocks", &self.blocks)
+            .field("generation_num", &self.generation_num)
+            .field("file_acl", &self.file_acl)
+            .field("directory_acl", &self.directory_acl)
+            .field("fragment_addr", &self.fragment_addr)
+            .field("_os_dependent_2", &self._os_dependent_2)
+            .finish()
+    }
+}
 impl LockedExt2Inode {
     pub fn get_block_group(inode: usize) -> usize {
         let sb = &EXT2_SB_INFO.read().ext2_super_block.upgrade().unwrap();
@@ -177,6 +234,7 @@ pub struct LockedExt2InodeInfo(pub SpinLock<Ext2InodeInfo>);
 /// 存储在内存中的inode
 pub struct Ext2InodeInfo {
     // TODO 将ext2iode内容和meta联系在一起，可自行设计
+    entry: Ext2DirEntry,
     // data: Vec<Option<Ext2Indirect>>,
     i_data: [u32; 15],
     meta: Metadata,
@@ -190,7 +248,6 @@ pub struct Ext2InodeInfo {
 
 impl Ext2InodeInfo {
     pub fn new(inode: &Ext2Inode) -> Self {
-        // let inode_grade = inode.0.lock();
         let mode = inode.mode;
         let file_type = Ext2FileType::type_from_mode(&mode).unwrap().covert_type();
         // TODO 根据inode mode转换modetype
@@ -211,6 +268,7 @@ impl Ext2InodeInfo {
             meta,
             mode: fs_mode,
             file_type,
+            entry: todo!(),
         }
     }
     // TODO 更新当前inode的元数据
@@ -228,8 +286,7 @@ impl IndexNode for LockedExt2InodeInfo {
         let superb = EXT2_SB_INFO.read();
         // TODO 需要根据不同的文件类型，选择不同的读取方式，将读的行为集成到file type
         match inode_grade.file_type {
-            FileType::File => {
-                // TODO 判断是否有空指针
+            FileType::File | FileType::Dir => {
                 // 起始读取块
                 let mut start_block = offset / LBA_SIZE;
                 // 需要读取的块
@@ -243,6 +300,9 @@ impl IndexNode for LockedExt2InodeInfo {
                 let mut end_len: usize = min(LBA_SIZE, buf.len());
                 // 读取直接块
                 while already_read_block < read_block_num && start_block <= 11 {
+                    if inode_grade.i_data[start_block] == 0 {
+                        return Ok(already_read_byte);
+                    }
                     // 每次读一个块
                     let r: usize = superb.partition.upgrade().unwrap().disk().read_at(
                         inode_grade.i_data[start_block] as usize,
@@ -256,7 +316,7 @@ impl IndexNode for LockedExt2InodeInfo {
                     end_len = min(buf.len() - already_read_byte, LBA_SIZE);
                 }
 
-                if already_read_block == read_block_num {
+                if already_read_block == read_block_num || inode_grade.i_data[12] == 0 {
                     return Ok(already_read_byte);
                 }
 
@@ -286,10 +346,9 @@ impl IndexNode for LockedExt2InodeInfo {
                     end_len = min(buf.len() - already_read_byte, LBA_SIZE);
                 }
 
-                if already_read_block == read_block_num {
+                if inode_grade.i_data[13] == 0 || already_read_block == read_block_num {
                     return Ok(already_read_byte);
                 }
-
                 // FIXME partition clone一下，升级成arc之后一直clone用
                 // 读取二级间接块
                 let indir_block = get_address_block(
@@ -321,6 +380,9 @@ impl IndexNode for LockedExt2InodeInfo {
                     }
                 }
 
+                if inode_grade.i_data[14] == 0 || already_read_block == read_block_num {
+                    return Ok(already_read_byte);
+                }
                 // 读取三级间接块
                 let thdir_block = get_address_block(
                     superb.partition.upgrade().unwrap(),
@@ -359,10 +421,6 @@ impl IndexNode for LockedExt2InodeInfo {
 
                 Ok(already_read_byte)
             }
-            FileType::Dir => {
-                // TODO 读取目录
-                unimplemented!()
-            }
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -382,11 +440,13 @@ impl IndexNode for LockedExt2InodeInfo {
             return Err(SystemError::EINVAL);
         }
         let file_type = file_type.unwrap();
-        // TODO 根据不用类型文件写入数据
+        // TODO 根据不同类型文件写入数据
         match file_type {
-            Ext2FileType::FIFO => todo!(),
+            Ext2FileType::FIFO | Ext2FileType::Directory => {
+                let mut start_block = offset / LBA_SIZE;
+                todo!()
+            }
             Ext2FileType::CharacterDevice => todo!(),
-            Ext2FileType::Directory => todo!(),
             Ext2FileType::BlockDevice => todo!(),
             Ext2FileType::RegularFile => todo!(),
             Ext2FileType::SymbolicLink => todo!(),
@@ -412,18 +472,41 @@ impl IndexNode for LockedExt2InodeInfo {
             return Err(SystemError::EINVAL);
         }
         let file_type = file_type.unwrap();
+        let mut names: Vec<String> = Vec::new();
         match file_type {
-            Ext2FileType::Directory=> {
-                let mut ret: Vec<String> = Vec::new();
-                // TODO 列出目录项
+            Ext2FileType::Directory => {
                 // 获取inode数据块
-
+                let i_info = self.0.lock();
                 // 解析为entry数组
-
+                let meta = &i_info.meta;
+                let size = meta.size as usize;
+                let mut data_block: Vec<u8> = Vec::with_capacity(size);
+                let _read_size = self.read_at(
+                    0,
+                    size,
+                    data_block.as_mut_slice(),
+                    &mut FilePrivateData::Unused,
+                )?;
                 // 遍历entry数组
-
+                let mut begin_pos = 0;
+                loop {
+                    if begin_pos >= size {
+                        break;
+                    }
+                    begin_pos += mem::size_of::<u32>();
+                    let rc_len: u16 = u16::from_be_bytes(
+                        data_block[begin_pos..begin_pos + 2].try_into().unwrap(),
+                    );
+                    let name_len: u8 = u8::from_be(data_block[begin_pos + 2]);
+                    let name_pos = begin_pos + 8;
+                    let name = String::from_utf8_lossy(
+                        &data_block[name_pos..name_pos + name_len as usize],
+                    );
+                    names.push(name.to_string());
+                    begin_pos += rc_len as usize - mem::size_of::<u32>();
+                }
                 // 将entry添加到ret中
-                return Ok(ret);
+                return Ok(names);
             }
             _ => {
                 return Err(SystemError::ENOTDIR);
@@ -432,6 +515,14 @@ impl IndexNode for LockedExt2InodeInfo {
     }
     fn metadata(&self) -> Result<Metadata, SystemError> {
         return Ok(self.0.lock().meta.clone());
+    }
+    fn create(
+        &self,
+        name: &str,
+        file_type: FileType,
+        mode: ModeType,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        todo!()
     }
 }
 

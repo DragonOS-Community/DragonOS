@@ -1,4 +1,4 @@
-use core::sync::atomic::AtomicU32;
+use core::{mem, sync::atomic::AtomicU32};
 
 use alloc::{
     sync::{Arc, Weak},
@@ -21,7 +21,8 @@ use super::{
 };
 
 lazy_static! {
-    pub static ref EXT2_SUPER_BLOCK: RwLock<Ex2SuperBlock> = RwLock::new(Ex2SuperBlock::default());
+    pub static ref EXT2_SUPER_BLOCK: RwLock<Ext2SuperBlock> =
+        RwLock::new(Ext2SuperBlock::default());
     pub static ref EXT2_SB_INFO: RwLock<Ext2SuperBlockInfo> =
         RwLock::new(Ext2SuperBlockInfo::default());
 }
@@ -31,6 +32,7 @@ pub struct LockedExt2SBInfo(SpinLock<Ext2SuperBlockInfo>);
 
 #[derive(Debug)]
 pub struct Ext2FileSystem {
+    // TODO 考虑将group descriptor table也放在里面
     /// 当前文件系统所在的分区
     pub partition: Arc<Partition>,
     /// 当前文件系统的第一个数据扇区（相对分区开始位置）
@@ -54,6 +56,40 @@ impl FileSystem for Ext2FileSystem {
         self
     }
 }
+
+impl Ext2FileSystem {
+    pub fn new(partition: Arc<Partition>) -> Result<Arc<Ext2FileSystem>, SystemError> {
+        // TODO 冗余
+        // let sb = Ext2SuperBlock::read_superblock(partition.clone())
+        //     .map_err(|err| {
+        //         kerror!("ext2 mount failed, because read superblock failed");
+        //         return Err(err);
+        //     })
+        //     .unwrap();
+        // let gpd_table = sb.read_group_descs(partition.clone()).map_err(|err| {
+        //     kerror!("ext2 mount failed, because read group descs failed");
+        //     return Err(err);
+        // });
+
+        // TODO 读取superblock，实现挂载
+
+        let sb_info = Ext2SuperBlockInfo::new(partition.clone());
+        let root_inode = sb_info.read_root_inode();
+        if root_inode.is_err() {
+            kerror!("ext2 mount failed, because read root inode failed");
+            return Err(root_inode.err().unwrap());
+        }
+
+        let root_inode = root_inode.unwrap();
+        let r_info = Ext2InodeInfo::new(&root_inode);
+        return Ok(Arc::new(Self {
+            partition,
+            first_data_sector: 0,
+            sb_info: Arc::new(LockedExt2SBInfo(SpinLock::new(sb_info))),
+            root_inode: Arc::new(LockedExt2InodeInfo(SpinLock::new(r_info))),
+        }));
+    }
+}
 pub enum OSType {
     Linux,
     HURD,
@@ -65,7 +101,7 @@ pub enum OSType {
 // ext2超级块,大小为1024bytes
 #[derive(Debug)]
 #[repr(C, align(1))]
-pub struct Ex2SuperBlock {
+pub struct Ext2SuperBlock {
     /// 总节点数量
     pub inode_count: u32,
     /// 总数据块数量
@@ -156,7 +192,7 @@ pub struct Ex2SuperBlock {
     padding2: Vec<u32>,
 }
 
-impl Default for Ex2SuperBlock {
+impl Default for Ext2SuperBlock {
     fn default() -> Self {
         let uuid: Vec<u8> = vec![0; 16];
         let volume_name: Vec<u8> = vec![0; 16];
@@ -215,19 +251,19 @@ impl Default for Ex2SuperBlock {
 #[derive(Debug, Default)]
 ///second extended-fs super-block data in memory
 pub struct Ext2SuperBlockInfo {
-    pub s_frag_size: u32,                      /* Size of a fragment in bytes */
-    pub s_frags_per_block: u32,                /* Number of fragments per block */
-    pub s_inodes_per_block: u32,               /* Number of inodes per block */
-    pub s_frags_per_group: u32,                /* Number of fragments in a group */
-    pub s_blocks_per_group: u32,               /* Number of blocks in a group */
-    pub s_inodes_per_group: u32,               /* Number of inodes in a group */
-    pub s_itb_per_group: u32,                  /* Number of inode table blocks per group */
-    pub s_gdb_count: u32,                      /* Number of group descriptor blocks */
-    pub s_desc_per_block: u32,                 /* Number of group descriptors per block */
-    pub s_groups_count: u32,                   /* Number of groups in the fs */
-    pub s_overhead_last: u32,                  /* Last calculated overhead */
-    pub s_blocks_last: u32,                    /* Last seen block count */
-    pub ext2_super_block: Weak<Ex2SuperBlock>, /* Pointer to the super block in the buffer */
+    pub s_frag_size: u32,                       /* Size of a fragment in bytes */
+    pub s_frags_per_block: u32,                 /* Number of fragments per block */
+    pub s_inodes_per_block: u32,                /* Number of inodes per block */
+    pub s_frags_per_group: u32,                 /* Number of fragments in a group */
+    pub s_blocks_per_group: u32,                /* Number of blocks in a group */
+    pub s_inodes_per_group: u32,                /* Number of inodes in a group */
+    pub s_itb_per_group: u32,                   /* Number of inode table blocks per group */
+    pub s_gdb_count: u32,                       /* Number of group descriptor blocks */
+    pub s_desc_per_block: u32,                  /* Number of group descriptors per block */
+    pub s_groups_count: u32,                    /* Number of groups in the fs */
+    pub s_overhead_last: u32,                   /* Last calculated overhead */
+    pub s_blocks_last: u32,                     /* Last seen block count */
+    pub ext2_super_block: Weak<Ext2SuperBlock>, /* Pointer to the super block in the buffer */
 
     pub group_desc_table: Weak<Vec<Ext2BlockGroupDescriptor>>,
     pub s_mount_opt: u32,
@@ -262,8 +298,8 @@ pub struct Ext2SuperBlockInfo {
 
 impl Ext2SuperBlockInfo {
     pub fn new(partition: Arc<Partition>) -> Self {
-        let sb = Ex2SuperBlock::read_superblock(partition.clone()).unwrap();
-        let global_sb = Ex2SuperBlock::read_superblock(partition.clone()).unwrap();
+        let sb = Ext2SuperBlock::read_superblock(partition.clone()).unwrap();
+        let global_sb = Ext2SuperBlock::read_superblock(partition.clone()).unwrap();
         let dec_table = sb.read_group_descs(partition.clone()).unwrap();
         Self {
             s_frag_size: sb.fragment_size,
@@ -299,7 +335,8 @@ impl Ext2SuperBlockInfo {
             partition: Arc::downgrade(&partition.clone()),
         }
     }
-    /// TODO 根据索引号获取磁盘inode
+    ///  根据索引号获取磁盘inode
+    ///
     pub fn read_inode(&self, inode_index: u32) -> Result<Ext2Inode, SystemError> {
         // Get the reference to the description table
         let desc_table = self.group_desc_table.upgrade().unwrap();
@@ -332,51 +369,18 @@ impl Ext2SuperBlockInfo {
             1,
             &mut inode_data,
         )?;
-
-        // // TODO 按字节获取特定inode，获取到就跳出返回
-        // let mut inode_data = Vec::with_capacity(self.s_inode_size as usize);
-        // inode_data.resize(self.s_inode_size as usize, 0);
-        let mut cursor = VecCursor::new(inode_data);
-
-        // let inode = Ext2Inode{
-        //     mode: cursor.read_u16()?,
-        //     uid: cursor.read_u16()?,
-        //     lower_size: cursor.read_u32()?,
-        //     access_time: cursor.read_u32()?,
-        //     create_time: cursor.read_u32()?,
-        //     modify_time: cursor.read_u32()?,
-        //     delete_time: cursor.read_u32()?,
-        //     gid: cursor.read_u16()?,
-        //     hard_link_num: cursor.read_u16()?,
-        //     disk_sector: cursor.read_u32()?,
-        //     flags: cursor.read_u32()?,
-        //     os_dependent_1: cursor.read_u32()?,
-        //     blocks: cursor.re,
-        //     generation_num: cursor.read_u32()?,
-        //     file_acl: cursor.read_u32()?,
-        //     directory_acl: cursor.read_u32()?,
-        //     fragment_addr: cursor.read_u32()?,
-        //     os_dependent_2: cursor.read_u16()?,
-        // };
-        // for _ in 0..=idx {}
-
-        // let mut blc_data = Vec::with_capacity(LBA_SIZE);
-        // blc_data.resize(LBA_SIZE, 0);
-        // let mut blc_index = (inode_index - 1) * self.s_inodes_per_group + self.s_first_ino;
-
-        // let mut blc_num = 0;
-        // while blc_num < self.s_inodes_per_group {}
-        todo!()
+        Ext2Inode::new_from_bytes(&inode_data)
     }
+
     pub fn read_root_inode(&self) -> Result<Ext2Inode, SystemError> {
         let root_inode_index = 2;
         self.read_inode(root_inode_index)
     }
 }
 
-impl Ex2SuperBlock {
+impl Ext2SuperBlock {
     // TODO 需要有个函数在加载的时候read superblock and read des table ，并且读root inode
-    pub fn read_superblock(partition: Arc<Partition>) -> Result<Ex2SuperBlock, SystemError> {
+    pub fn read_superblock(partition: Arc<Partition>) -> Result<Ext2SuperBlock, SystemError> {
         let mut blc_data = Vec::with_capacity(LBA_SIZE * 2);
         blc_data.resize(LBA_SIZE * 2, 0);
 
@@ -386,7 +390,7 @@ impl Ex2SuperBlock {
             2,
             &mut blc_data,
         )?;
-        let mut super_block = Ex2SuperBlock::default();
+        let mut super_block = Ext2SuperBlock::default();
 
         let mut cursor = VecCursor::new(blc_data);
 
@@ -455,7 +459,7 @@ impl Ex2SuperBlock {
         let des_per_block = Ext2BlockGroupDescriptor::get_des_per_blc();
         (group_count + des_per_block - 1) / des_per_block
     }
-    fn read_group_descs(
+    pub fn read_group_descs(
         &self,
         partition: Arc<Partition>,
     ) -> Result<Vec<Ext2BlockGroupDescriptor>, SystemError> {

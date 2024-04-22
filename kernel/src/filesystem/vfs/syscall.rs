@@ -1020,6 +1020,16 @@ impl Syscall {
         return Self::do_dup2(oldfd, newfd, &mut fd_table_guard);
     }
 
+    pub fn dup3(oldfd: i32, newfd: i32, flags: u32) -> Result<usize, SystemError> {
+        let flags: FileMode = FileMode::from_bits(flags).ok_or(SystemError::EINVAL)?;
+        if flags != FileMode::O_CLOEXEC {
+            return Err(SystemError::EINVAL);
+        }
+        let binding = ProcessManager::current_pcb().fd_table();
+        let mut fd_table_guard = binding.write();
+        return Self::do_dup3(oldfd, newfd, flags, &mut fd_table_guard);
+    }
+
     fn do_dup2(
         oldfd: i32,
         newfd: i32,

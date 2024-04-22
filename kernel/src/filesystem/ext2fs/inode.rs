@@ -61,7 +61,7 @@ struct HurdOsd2 {
     author: u32,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 #[repr(C, align(1))]
 /// 磁盘中存储的inode
 pub struct Ext2Inode {
@@ -190,21 +190,25 @@ impl Debug for Ext2Inode {
     }
 }
 impl LockedExt2Inode {
+    // TODO EXT2_SB_INFO要改
     pub fn get_block_group(inode: usize) -> usize {
-        let sb = &EXT2_SB_INFO.read().ext2_super_block.upgrade().unwrap();
+        let binding = EXT2_SB_INFO.read();
+        let sb = binding.ext2_super_block.as_ref().unwrap();
         let inodes_per_group = sb.inodes_per_group;
         return ((inode as u32 - 1) / inodes_per_group) as usize;
     }
 
     pub fn get_index_in_group(inode: usize) -> usize {
-        let sb = &EXT2_SB_INFO.read().ext2_super_block.upgrade().unwrap();
+        let binding = EXT2_SB_INFO.read();
+        let sb = &binding.ext2_super_block.as_ref().unwrap();
 
         let inodes_per_group = sb.inodes_per_group;
         return ((inode as u32 - 1) % inodes_per_group) as usize;
     }
 
     pub fn get_block_addr(inode: usize) -> usize {
-        let sb = &EXT2_SB_INFO.read().ext2_super_block.upgrade().unwrap();
+        let binding = EXT2_SB_INFO.read();
+        let sb = &binding.ext2_super_block.as_ref().unwrap();
         let mut inode_size = sb.inode_size as usize;
         let block_size = sb.block_size as usize;
 
@@ -234,7 +238,7 @@ pub struct LockedExt2InodeInfo(pub SpinLock<Ext2InodeInfo>);
 /// 存储在内存中的inode
 pub struct Ext2InodeInfo {
     // TODO 将ext2iode内容和meta联系在一起，可自行设计
-    entry: Ext2DirEntry,
+    // entry: Ext2DirEntry,
     // data: Vec<Option<Ext2Indirect>>,
     i_data: [u32; 15],
     meta: Metadata,
@@ -248,27 +252,26 @@ pub struct Ext2InodeInfo {
 
 impl Ext2InodeInfo {
     pub fn new(inode: &Ext2Inode) -> Self {
+        kinfo!("begin Ext2InodeInfo new");
         let mode = inode.mode;
         let file_type = Ext2FileType::type_from_mode(&mode).unwrap().covert_type();
+        kinfo!("file_type = {:?}", file_type);
+
         // TODO 根据inode mode转换modetype
-        let fs_mode = ModeType::from_bits_truncate(0o755);
+        let fs_mode = ModeType::from_bits_truncate(mode as u32);
         let meta = Metadata::new(file_type, fs_mode);
         // TODO 获取block group
-        let mut d: Vec<Option<Ext2Indirect>> = Vec::with_capacity(15);
-        for i in 0..12 as usize {
-            let mut idir = Ext2Indirect::default();
-            idir.data_block = Some(inode.blocks[i]);
-            idir.self_ref = Arc::downgrade(&Arc::new(idir.clone()));
-            d[i] = Some(idir);
-        }
+
         // TODO 间接地址
+        kinfo!("end Ext2InodeInfo new");
+
         Self {
             i_data: inode.blocks,
             i_mode: mode,
             meta,
             mode: fs_mode,
             file_type,
-            entry: todo!(),
+            // entry: todo!(),
         }
     }
     // TODO 更新当前inode的元数据
@@ -282,6 +285,7 @@ impl IndexNode for LockedExt2InodeInfo {
         buf: &mut [u8],
         _data: &mut crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, system_error::SystemError> {
+        kinfo!("begin LockedExt2InodeInfo read_at");
         let inode_grade = self.0.lock();
         let superb = EXT2_SB_INFO.read();
         // TODO 需要根据不同的文件类型，选择不同的读取方式，将读的行为集成到file type
@@ -289,6 +293,8 @@ impl IndexNode for LockedExt2InodeInfo {
             FileType::File | FileType::Dir => {
                 // 起始读取块
                 let mut start_block = offset / LBA_SIZE;
+                kdebug!("start_block = {start_block}");
+
                 // 需要读取的块
                 let read_block_num = min(len, buf.len()) / LBA_SIZE + 1;
                 // 已经读的块数
@@ -304,7 +310,8 @@ impl IndexNode for LockedExt2InodeInfo {
                         return Ok(already_read_byte);
                     }
                     // 每次读一个块
-                    let r: usize = superb.partition.upgrade().unwrap().disk().read_at(
+                    let r: usize = superb.partition.as_ref().unwrap().disk().read_at(
+                        // TODO 将地址换成id
                         inode_grade.i_data[start_block] as usize,
                         1,
                         &mut buf[start_pos..start_pos + end_len],
@@ -323,7 +330,7 @@ impl IndexNode for LockedExt2InodeInfo {
                 // 读取一级间接块
                 // 获取地址块
                 let mut address_block: [u8; 512] = [0; 512];
-                let _ = superb.partition.upgrade().unwrap().disk().read_at(
+                let _ = superb.partition.as_ref().unwrap().disk().read_at(
                     inode_grade.i_data[12] as usize,
                     1,
                     &mut address_block[0..],
@@ -334,7 +341,8 @@ impl IndexNode for LockedExt2InodeInfo {
                 // 读取数据块
                 while already_read_block < read_block_num && start_block <= 127 + 12 {
                     // 每次读一个块
-                    let r: usize = superb.partition.upgrade().unwrap().disk().read_at(
+                    let r: usize = superb.partition.clone().unwrap().disk().read_at(
+                        // TODO 将地址换成id
                         address[start_block - 12] as usize,
                         1,
                         &mut buf[start_pos..start_pos + end_len],
@@ -352,14 +360,14 @@ impl IndexNode for LockedExt2InodeInfo {
                 // FIXME partition clone一下，升级成arc之后一直clone用
                 // 读取二级间接块
                 let indir_block = get_address_block(
-                    superb.partition.upgrade().unwrap(),
+                    superb.partition.clone().unwrap(),
                     inode_grade.i_data[13] as usize,
                 );
 
                 for i in 0..128 {
                     // 根据二级间接块，获取读取间接块
                     let address = get_address_block(
-                        superb.partition.upgrade().unwrap(),
+                        superb.partition.clone().unwrap(),
                         indir_block[i] as usize,
                     );
                     for j in 0..128 {
@@ -367,7 +375,8 @@ impl IndexNode for LockedExt2InodeInfo {
                             return Ok(already_read_byte);
                         }
 
-                        let r = superb.partition.upgrade().unwrap().disk().read_at(
+                        let r = superb.partition.clone().unwrap().disk().read_at(
+                            // TODO 将地址换成id
                             address[j] as usize,
                             1,
                             &mut buf[start_pos..start_pos + end_len],
@@ -385,19 +394,19 @@ impl IndexNode for LockedExt2InodeInfo {
                 }
                 // 读取三级间接块
                 let thdir_block = get_address_block(
-                    superb.partition.upgrade().unwrap(),
+                    superb.partition.clone().unwrap(),
                     inode_grade.i_data[14] as usize,
                 );
 
                 for i in 0..128 {
                     // 根据二级间接块，获取读取间接块
                     let indir_block = get_address_block(
-                        superb.partition.upgrade().unwrap(),
+                        superb.partition.clone().unwrap(),
                         thdir_block[i] as usize,
                     );
                     for second in 0..128 {
                         let address = get_address_block(
-                            superb.partition.upgrade().unwrap(),
+                            superb.partition.clone().unwrap(),
                             indir_block[second] as usize,
                         );
                         for j in 0..128 {
@@ -405,7 +414,7 @@ impl IndexNode for LockedExt2InodeInfo {
                                 return Ok(already_read_byte);
                             }
 
-                            let r = superb.partition.upgrade().unwrap().disk().read_at(
+                            let r = superb.partition.as_ref().unwrap().disk().read_at(
                                 address[j] as usize,
                                 1,
                                 &mut buf[start_pos..start_pos + end_len],
@@ -418,6 +427,7 @@ impl IndexNode for LockedExt2InodeInfo {
                         }
                     }
                 }
+                kinfo!("end LockedExt2InodeInfo read_at:file/dir");
 
                 Ok(already_read_byte)
             }

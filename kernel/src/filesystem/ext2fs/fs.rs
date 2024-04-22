@@ -1,13 +1,17 @@
 use core::{mem, sync::atomic::AtomicU32};
 
 use alloc::{
+    fmt,
     sync::{Arc, Weak},
     vec::Vec,
 };
 use system_error::SystemError;
 
 use crate::{
-    driver::base::block::{block_device::LBA_SIZE, disk_info::Partition},
+    driver::base::block::{
+        block_device::{__bytes_to_lba, LBA_SIZE},
+        disk_info::Partition,
+    },
     filesystem::{
         ext2fs::inode::Ext2Inode,
         vfs::{FileSystem, IndexNode},
@@ -19,13 +23,14 @@ use super::{
     block_group_desc::Ext2BlockGroupDescriptor,
     inode::{Ext2InodeInfo, LockedExt2Inode, LockedExt2InodeInfo},
 };
-
+use core::fmt::Debug;
 lazy_static! {
-    pub static ref EXT2_SUPER_BLOCK: RwLock<Ext2SuperBlock> =
-        RwLock::new(Ext2SuperBlock::default());
+    // pub static ref EXT2_SUPER_BLOCK: RwLock<Ext2SuperBlock> =
+    //     RwLock::new(Ext2SuperBlock::default());
     pub static ref EXT2_SB_INFO: RwLock<Ext2SuperBlockInfo> =
         RwLock::new(Ext2SuperBlockInfo::default());
 }
+// pub static ref EXT2_FS: RwLock<Ext2FileSystem> = unsafe{U};
 
 #[derive(Debug)]
 pub struct LockedExt2SBInfo(SpinLock<Ext2SuperBlockInfo>);
@@ -72,7 +77,7 @@ impl Ext2FileSystem {
         // });
 
         // TODO 读取superblock，实现挂载
-
+        kdebug!("begin mount Ext2FS");
         let sb_info = Ext2SuperBlockInfo::new(partition.clone());
         let root_inode = sb_info.read_root_inode();
         if root_inode.is_err() {
@@ -81,7 +86,10 @@ impl Ext2FileSystem {
         }
 
         let root_inode = root_inode.unwrap();
+        kdebug!("new the Ext2InodeInfo");
         let r_info = Ext2InodeInfo::new(&root_inode);
+        kdebug!("end mount Ext2FS");
+
         return Ok(Arc::new(Self {
             partition,
             first_data_sector: 0,
@@ -99,7 +107,7 @@ pub enum OSType {
 }
 
 // ext2超级块,大小为1024bytes
-#[derive(Debug)]
+#[derive(Clone)]
 #[repr(C, align(1))]
 pub struct Ext2SuperBlock {
     /// 总节点数量
@@ -117,7 +125,7 @@ pub struct Ext2SuperBlock {
     /// 块大小
     pub block_size: u32,
     /// 片段大小
-    pub fragment_size: u32,
+    pub fragment_size: i32,
     /// 每组中块数量
     pub blocks_per_group: u32,
     /// 每组中片段数量
@@ -251,21 +259,22 @@ impl Default for Ext2SuperBlock {
 #[derive(Debug, Default)]
 ///second extended-fs super-block data in memory
 pub struct Ext2SuperBlockInfo {
-    pub s_frag_size: u32,                       /* Size of a fragment in bytes */
-    pub s_frags_per_block: u32,                 /* Number of fragments per block */
-    pub s_inodes_per_block: u32,                /* Number of inodes per block */
-    pub s_frags_per_group: u32,                 /* Number of fragments in a group */
-    pub s_blocks_per_group: u32,                /* Number of blocks in a group */
-    pub s_inodes_per_group: u32,                /* Number of inodes in a group */
-    pub s_itb_per_group: u32,                   /* Number of inode table blocks per group */
-    pub s_gdb_count: u32,                       /* Number of group descriptor blocks */
-    pub s_desc_per_block: u32,                  /* Number of group descriptors per block */
-    pub s_groups_count: u32,                    /* Number of groups in the fs */
-    pub s_overhead_last: u32,                   /* Last calculated overhead */
-    pub s_blocks_last: u32,                     /* Last seen block count */
-    pub ext2_super_block: Weak<Ext2SuperBlock>, /* Pointer to the super block in the buffer */
+    pub s_frag_size: u32, /* Size of a fragment in bytes */
+    pub s_block_size: u32,
+    pub s_frags_per_block: u32,  /* Number of fragments per block */
+    pub s_inodes_per_block: u32, /* Number of inodes per block */
+    pub s_frags_per_group: u32,  /* Number of fragments in a group */
+    pub s_blocks_per_group: u32, /* Number of blocks in a group */
+    pub s_inodes_per_group: u32, /* Number of inodes in a group */
+    pub s_itb_per_group: u32,    /* Number of inode table blocks per group */
+    pub s_gdb_count: u32,        /* Number of group descriptor blocks */
+    pub s_desc_per_block: u32,   /* Number of group descriptors per block */
+    pub s_groups_count: u32,     /* Number of groups in the fs */
+    pub s_overhead_last: u32,    /* Last calculated overhead */
+    pub s_blocks_last: u32,      /* Last seen block count */
+    pub ext2_super_block: Option<Arc<Ext2SuperBlock>>, /* Pointer to the super block in the buffer */
 
-    pub group_desc_table: Weak<Vec<Ext2BlockGroupDescriptor>>,
+    pub group_desc_table: Option<Arc<Vec<Ext2BlockGroupDescriptor>>>,
     pub s_mount_opt: u32,
     pub s_sb_block: u32,
     pub s_resuid: u16,
@@ -289,23 +298,40 @@ pub struct Ext2SuperBlockInfo {
     pub s_freeinodes_counter: AtomicU32,
     pub s_dirs_counter: AtomicU32,
 
-    pub partition: Weak<Partition>,
-    /* root of the per fs reservation window tree */
-    // spinlock_t s_rsv_window_lock,
-    // struct rb_root s_rsv_window_root,
-    // struct ext2_reserve_window_node s_rsv_window_head,
+    pub partition: Option<Arc<Partition>>, /* root of the per fs reservation window tree */
+                                           // spinlock_t s_rsv_window_lock,
+                                           // struct rb_root s_rsv_window_root,
+                                           // struct ext2_reserve_window_node s_rsv_window_head,
 }
 
 impl Ext2SuperBlockInfo {
     pub fn new(partition: Arc<Partition>) -> Self {
         let sb = Ext2SuperBlock::read_superblock(partition.clone()).unwrap();
-        let global_sb = Ext2SuperBlock::read_superblock(partition.clone()).unwrap();
+        // let global_sb = Ext2SuperBlock::read_superblock(partition.clone()).unwrap();
+        let global_sb = sb.clone();
         let dec_table = sb.read_group_descs(partition.clone()).unwrap();
-        Self {
-            s_frag_size: sb.fragment_size,
+        let block_size: u32 = 1024 << sb.block_size;
+        let fragment_size: u32 = if sb.fragment_size >= 0 {
+            1024 << sb.fragment_size
+        } else {
+            1024 >> -sb.fragment_size
+        };
+        kdebug!(
+            "fragment_size = {}.s_frags_per_block = {}",
+            fragment_size,
+            block_size
+        );
+        kdebug!(
+            "s_inodes_per_block = {}.s_frags_per_block = {}",
+            block_size / sb.inode_size as u32,
+            block_size / fragment_size
+        );
+        let ret = Self {
+            s_frag_size: fragment_size as u32,
             // TODO 计算
-            s_frags_per_block: sb.block_size / sb.fragment_size,
-            s_inodes_per_block: sb.block_size / sb.inode_size as u32,
+            s_block_size: block_size as u32,
+            s_frags_per_block: block_size / fragment_size,
+            s_inodes_per_block: block_size / sb.inode_size as u32,
             s_frags_per_group: sb.fragments_per_group,
             s_blocks_per_group: sb.blocks_per_group,
             s_inodes_per_group: sb.inodes_per_group,
@@ -315,8 +341,8 @@ impl Ext2SuperBlockInfo {
             s_groups_count: 0,
             s_overhead_last: 0,
             s_blocks_last: 0,
-            ext2_super_block: Arc::downgrade(&Arc::new(global_sb)),
-            group_desc_table: Arc::downgrade(&Arc::new(dec_table)),
+            ext2_super_block: Some(Arc::new(global_sb)),
+            group_desc_table: Some(Arc::new(dec_table)),
             s_mount_opt: 0,
             s_sb_block: sb.first_data_block,
             s_resuid: sb.def_resuid,
@@ -332,14 +358,22 @@ impl Ext2SuperBlockInfo {
             s_freeblocks_counter: AtomicU32::new(sb.free_block_count),
             s_freeinodes_counter: AtomicU32::new(sb.free_inode_count),
             s_dirs_counter: AtomicU32::new(1),
-            partition: Arc::downgrade(&partition.clone()),
-        }
+            partition: Some(partition.clone()),
+        };
+        kdebug!("end build super block info");
+        ret
     }
     ///  根据索引号获取磁盘inode
     ///
     pub fn read_inode(&self, inode_index: u32) -> Result<Ext2Inode, SystemError> {
+        kinfo!("begin read inode");
         // Get the reference to the description table
-        let desc_table = self.group_desc_table.upgrade().unwrap();
+        let desc_table = self.group_desc_table.clone();
+        if desc_table.is_none() {
+            kdebug!("descriptor table is empty");
+            return Err(SystemError::EINVAL);
+        }
+        let desc_table = desc_table.as_ref().unwrap();
         // Calculate the index of the group using the inode index
         let group_index = (inode_index - 1) / self.s_inodes_per_group;
         // 判断index是否合法
@@ -349,47 +383,71 @@ impl Ext2SuperBlockInfo {
         // 获取desc_table中group_index指向的描述符
         let desc = &desc_table[group_index as usize];
 
-        let inode_table_size = (self.s_inodes_per_group * self.s_inode_size) as usize;
-        let mut inode_table_data: Vec<u8> = Vec::with_capacity(inode_table_size);
-        inode_table_data.resize(inode_table_size as usize, 0);
+        // inode table 起始块号
+        let mut inode_table_lba_id = desc.inode_table_start as usize * 2;
+        let idx = ((inode_index - 1) % self.s_inodes_per_group) as usize;
+        inode_table_lba_id += idx * 2 / (self.s_inodes_per_block as usize);
+        // inode table 块数量
+        let mut read_lba_num = self.s_inodes_per_group as usize / self.s_inodes_per_block as usize;
 
-        let idx = (inode_index - 1) % self.s_inodes_per_group;
-        let pt = self.partition.upgrade().unwrap();
+        if self.s_inodes_per_group as usize % self.s_inodes_per_block as usize != 0 {
+            read_lba_num += 1;
+        }
+        read_lba_num *= 2;
 
-        // 读取inode table
-        pt.disk().read_at(
-            desc.inode_table_start as usize,
-            inode_table_size / LBA_SIZE,
-            &mut inode_table_data,
-        )?;
-        let mut inode_data: Vec<u8> = Vec::with_capacity(self.s_inode_size as usize);
-        inode_data.resize(self.s_inode_size as usize, 0); // 读取inode table
-        pt.disk().read_at(
-            (desc.inode_table_start + idx * self.s_inode_size) as usize,
+        kdebug!("read_lba_num = {read_lba_num}");
+        // inode table 数据，存储的是inode数组
+        let mut inode_table_data: Vec<u8> = Vec::with_capacity(LBA_SIZE);
+        inode_table_data.resize(LBA_SIZE, 0);
+
+        let pt = self.partition.as_ref().unwrap();
+        let ret = pt.disk().read_at(
+            inode_table_lba_id,
+            // read_lba_num,
             1,
-            &mut inode_data,
-        )?;
-        Ext2Inode::new_from_bytes(&inode_data)
+            inode_table_data.as_mut_slice(),
+        );
+        if ret.is_err() {
+            kerror!("read ext2 {inode_index} inode failed");
+            return Err(ret.err().unwrap());
+        }
+
+        let inode_data: Vec<Ext2Inode> =
+            unsafe { core::mem::transmute::<Vec<u8>, Vec<Ext2Inode>>(inode_table_data) };
+        let inode = inode_data[idx % 4 as usize].clone();
+        kdebug!("{:?}", inode);
+        kinfo!("end read inode");
+
+        return Ok(inode);
     }
 
     pub fn read_root_inode(&self) -> Result<Ext2Inode, SystemError> {
+        kinfo!("begin read root inode");
         let root_inode_index = 2;
-        self.read_inode(root_inode_index)
+        // let root_inode = self.read_inode(root_inode_index);
+        match self.read_inode(root_inode_index) {
+            Ok(root_inode) => {
+                kdebug!("{:?}", root_inode);
+                kinfo!("end read root inode");
+                return Ok(root_inode);
+            }
+            Err(err) => {
+                kerror!("failed to read root index,{:?}", err);
+                return Err(err);
+            }
+        }
     }
 }
 
 impl Ext2SuperBlock {
     // TODO 需要有个函数在加载的时候read superblock and read des table ，并且读root inode
     pub fn read_superblock(partition: Arc<Partition>) -> Result<Ext2SuperBlock, SystemError> {
+        kdebug!("begin read superblock");
         let mut blc_data = Vec::with_capacity(LBA_SIZE * 2);
         blc_data.resize(LBA_SIZE * 2, 0);
 
         // super_block起始于volume的1024byte,并占用1024bytes
-        partition.disk().read_at(
-            (partition.lba_start + LBA_SIZE as u64 * 2) as usize,
-            2,
-            &mut blc_data,
-        )?;
+        partition.disk().read_at(2usize, 2, &mut blc_data)?;
         let mut super_block = Ext2SuperBlock::default();
 
         let mut cursor = VecCursor::new(blc_data);
@@ -402,7 +460,9 @@ impl Ext2SuperBlock {
         super_block.free_inode_count = cursor.read_u32()?;
         super_block.first_data_block = cursor.read_u32()?;
         super_block.block_size = cursor.read_u32()?;
-        super_block.fragment_size = cursor.read_u32()?;
+        let mut log_f_size = [0u8; 4];
+        cursor.read_exact(&mut log_f_size)?;
+        super_block.fragment_size = i32::from_be_bytes(log_f_size);
         super_block.blocks_per_group = cursor.read_u32()?;
         super_block.fragments_per_group = cursor.read_u32()?;
         super_block.inodes_per_group = cursor.read_u32()?;
@@ -442,8 +502,10 @@ impl Ext2SuperBlock {
         cursor.read_exact(&mut super_block.journal_uuid)?;
         super_block.journal_inode = cursor.read_u32()?;
         super_block.journal_device = cursor.read_u32()?;
-        // FIXME 不知道会不会有问题，因为是指针，有可能需要u64
+
         super_block.last_orphan = cursor.read_u32()?;
+        kdebug!("{:?}", super_block);
+        kdebug!("end read superblock");
 
         Ok(super_block)
     }
@@ -463,6 +525,8 @@ impl Ext2SuperBlock {
         &self,
         partition: Arc<Partition>,
     ) -> Result<Vec<Ext2BlockGroupDescriptor>, SystemError> {
+        kdebug!("begin read group descriptors");
+
         // 先确定块数，再遍历块，再n个字节n个字节读
         let db_count = self.get_db_count();
         let des_per_block = Ext2BlockGroupDescriptor::get_des_per_blc();
@@ -472,11 +536,7 @@ impl Ext2SuperBlock {
         let mut blc_data = Vec::with_capacity(LBA_SIZE * db_count);
         blc_data.resize(LBA_SIZE * db_count, 0);
 
-        partition.disk().read_at(
-            (partition.lba_start + (LBA_SIZE * db_count) as u64) as usize,
-            db_count,
-            &mut blc_data,
-        )?;
+        partition.disk().read_at(4usize, db_count, &mut blc_data)?;
         let mut cursor = VecCursor::new(blc_data);
         for _ in 0..db_count {
             let mut d = Ext2BlockGroupDescriptor::new();
@@ -486,9 +546,59 @@ impl Ext2SuperBlock {
             d.free_blocks_num = cursor.read_u16()?;
             d.free_inodes_num = cursor.read_u16()?;
             d.dir_num = cursor.read_u16()?;
-
+            kdebug!("{:?}", d);
             decs.push(d);
         }
+        kdebug!("end read group descriptors");
+
         Ok(decs)
+    }
+}
+
+impl Debug for Ext2SuperBlock {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Ext2SuperBlock")
+            .field("inode_count", &self.inode_count)
+            .field("block_count", &self.block_count)
+            .field("reserved_block_count", &self.reserved_block_count)
+            .field("free_block_count", &self.free_block_count)
+            .field("free_inode_count", &self.free_inode_count)
+            .field("first_data_block", &self.first_data_block)
+            .field("block_size", &self.block_size)
+            .field("fragment_size", &self.fragment_size)
+            .field("blocks_per_group", &self.blocks_per_group)
+            .field("fragments_per_group", &self.fragments_per_group)
+            .field("inodes_per_group", &self.inodes_per_group)
+            .field("mount_time", &self.mount_time)
+            .field("write_time", &self.write_time)
+            .field("mount_count", &self.mount_count)
+            .field("max_mount_count", &self.max_mount_count)
+            .field("magic_signatrue", &self.magic_signatrue)
+            .field("state", &self.state)
+            .field("error_action", &self.error_action)
+            .field("minor_version", &self.minor_version)
+            .field("last_check_time", &self.last_check_time)
+            .field("check_interval", &self.check_interval)
+            .field("os_id", &self.os_id)
+            .field("major_version", &self.major_version)
+            .field("def_resuid", &self.def_resuid)
+            .field("def_resgid", &self.def_resgid)
+            .field("first_ino", &self.first_ino)
+            .field("inode_size", &self.inode_size)
+            .field("super_block_group", &self.super_block_group)
+            .field("feature_compat", &self.feature_compat)
+            .field("feature_incompat", &self.feature_incompat)
+            .field("feature_ro_compat", &self.feature_ro_compat)
+            .field("uuid", &self.uuid)
+            .field("volume_name", &self.volume_name)
+            .field("last_mounted_path", &self.last_mounted_path)
+            .field("algorithm_usage_bitmap", &self.algorithm_usage_bitmap)
+            .field("prealloc_blocks", &self.prealloc_blocks)
+            .field("prealloc_dir_blocks", &self.prealloc_dir_blocks)
+            .field("journal_uuid", &self.journal_uuid)
+            .field("journal_inode", &self.journal_inode)
+            .field("journal_device", &self.journal_device)
+            .field("last_orphan", &self.last_orphan)
+            .finish()
     }
 }

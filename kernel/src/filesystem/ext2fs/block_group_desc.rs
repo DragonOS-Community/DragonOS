@@ -1,14 +1,11 @@
 use core::mem::{self, size_of};
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{fmt, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
-use crate::{
-    driver::base::block::{block_device::LBA_SIZE, disk_info::Partition},
-};
-
+use crate::driver::base::block::{block_device::LBA_SIZE, disk_info::Partition};
+use core::fmt::Debug;
 /// 块组描述符表(位于superblock之后)
-#[derive(Debug)]
 #[repr(C, align(1))]
 pub struct Ext2BlockGroupDescriptor {
     /// 块位图的地址
@@ -45,8 +42,15 @@ impl Ext2BlockGroupDescriptor {
     // TODO 读取inode
 }
 
-
-
-
-
-
+impl Debug for Ext2BlockGroupDescriptor {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Ext2BlockGroupDescriptor")
+            .field("block_bitmap_address", &self.block_bitmap_address)
+            .field("inode_bitmap_address", &self.inode_bitmap_address)
+            .field("inode_table_start", &self.inode_table_start)
+            .field("free_blocks_num", &self.free_blocks_num)
+            .field("free_inodes_num", &self.free_inodes_num)
+            .field("dir_num", &self.dir_num)
+            .finish()
+    }
+}

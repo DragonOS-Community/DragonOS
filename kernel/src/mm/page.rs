@@ -676,6 +676,11 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
         return self.update_flags(Arch::ENTRY_FLAG_WRITE_THROUGH, value);
     }
 
+    #[inline(always)]
+    pub fn set_page_global(self, value: bool) -> Self {
+        return self.update_flags(MMArch::ENTRY_FLAG_GLOBAL, value);
+    }
+
     /// 获取当前页表项的写穿策略
     ///
     /// ## 返回值
@@ -724,7 +729,8 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
             .set_write(true)
             .set_execute(true)
             .set_page_cache_disable(true)
-            .set_page_write_through(true);
+            .set_page_write_through(true)
+            .set_page_global(true);
     }
 }
 
@@ -1099,6 +1105,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         return self
             .visit(virt, |p1, i| {
                 let mut entry = p1.entry(i)?;
+
                 entry.set_flags(flags);
                 p1.set_entry(i, entry);
                 Some(PageFlush::new(virt))

@@ -128,6 +128,7 @@ impl Debug for VirtIONicDeviceInner {
 }
 
 #[cast_to([sync] VirtIODevice)]
+#[cast_to([sync] Device)]
 pub struct VirtioInterface {
     device_inner: VirtIONicDeviceInnerWrapper,
     iface_id: usize,
@@ -293,7 +294,7 @@ impl Device for VirtioInterface {
     }
 
     fn can_match(&self) -> bool {
-        true
+        self.inner().device_common.can_match
     }
 
     fn set_can_match(&self, can_match: bool) {
@@ -552,8 +553,10 @@ fn virtio_net_driver_init() -> Result<(), SystemError> {
 
     return Ok(());
 }
+
 #[derive(Debug)]
 #[cast_to([sync] VirtIODriver)]
+#[cast_to([sync] Driver)]
 struct VirtIONetDriver {
     inner: SpinLock<InnerVirtIODriver>,
     kobj_state: LockedKObjectState,

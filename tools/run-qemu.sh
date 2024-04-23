@@ -76,7 +76,7 @@ QEMU_SERIAL="-serial file:../serial_opt.txt"
 QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none"
 QEMU_ACCELARATE=""
 QEMU_ARGUMENT=""
-QEMU_DEVICES=
+QEMU_DEVICES=""
 
 # 如果qemu_accel不为空
 if [ -n "${qemu_accel}" ]; then

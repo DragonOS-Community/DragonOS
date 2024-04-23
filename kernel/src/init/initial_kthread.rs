@@ -5,9 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::process::arch_switch_to_user,
-    driver::{
-        disk::ahci::ahci_init, net::e1000e::e1000e::e1000e_init, virtio::virtio::virtio_probe,
-    },
+    driver::{net::e1000e::e1000e::e1000e_init, virtio::virtio::virtio_probe},
     filesystem::vfs::core::mount_root_fs,
     kdebug, kerror,
     net::net_core::net_init,
@@ -35,11 +33,11 @@ fn kernel_init() -> Result<(), SystemError> {
     // scm_enable_double_buffer().expect("Failed to enable double buffer");
 
     #[cfg(target_arch = "x86_64")]
-    ahci_init().expect("Failed to initialize AHCI");
-
-    mount_root_fs().expect("Failed to mount root fs");
+    crate::driver::disk::ahci::ahci_init().expect("Failed to initialize AHCI");
 
     virtio_probe();
+    mount_root_fs().expect("Failed to mount root fs");
+
     e1000e_init();
     net_init().unwrap_or_else(|err| {
         kerror!("Failed to initialize network: {:?}", err);

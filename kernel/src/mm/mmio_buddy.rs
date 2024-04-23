@@ -676,6 +676,7 @@ impl MMIOSpaceGuard {
         }
 
         let flags = PageFlags::mmio_flags();
+
         let mut kernel_mapper = KernelMapper::lock();
         let r = kernel_mapper.map_phys_with_size(self.vaddr, paddr, length, flags, true);
         return r;

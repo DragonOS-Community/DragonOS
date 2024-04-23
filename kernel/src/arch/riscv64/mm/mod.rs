@@ -110,7 +110,7 @@ impl MemoryManagementArch for RiscV64MMArch {
     const ENTRY_FLAG_READWRITE: usize = (1 << 2) | (1 << 1);
 
     const ENTRY_FLAG_USER: usize = (1 << 4);
-
+    const ENTRY_ADDRESS_MASK: usize = Self::ENTRY_ADDRESS_SIZE - (1 << 10);
     const ENTRY_FLAG_WRITE_THROUGH: usize = (2 << 61);
 
     const ENTRY_FLAG_CACHE_DISABLE: usize = (2 << 61);

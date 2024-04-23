@@ -6,7 +6,6 @@ use core::{
 
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
-    driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::syscall::{PosixStatfs, PosixStatx},
     ipc::shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
@@ -662,7 +661,11 @@ impl Syscall {
                 let flags = args[1];
                 let dev_t = args[2];
                 let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
-                Self::mknod(path as *const u8, flags, DeviceNumber::from(dev_t as u32))
+                Self::mknod(
+                    path as *const u8,
+                    flags,
+                    crate::driver::base::device::device_number::DeviceNumber::from(dev_t as u32),
+                )
             }
 
             SYS_CLONE => {
@@ -1059,6 +1062,7 @@ impl Syscall {
                 Err(SystemError::EINVAL)
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_ALARM => {
                 let second = args[0] as u32;
                 Self::alarm(second)

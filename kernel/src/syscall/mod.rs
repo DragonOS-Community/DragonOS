@@ -1,7 +1,7 @@
 use core::{
     ffi::{c_int, c_void},
     ptr::null,
-    sync::atomic::{AtomicBool, Ordering}, u32,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use crate::{

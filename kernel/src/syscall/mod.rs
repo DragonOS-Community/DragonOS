@@ -1,7 +1,7 @@
 use core::{
     ffi::{c_int, c_void},
     ptr::null,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, Ordering}, u32,
 };
 
 use crate::{
@@ -400,7 +400,6 @@ impl Syscall {
                 Self::dup2(oldfd, newfd)
             }
 
-            #[cfg(target_arch = "x86_64")]
             SYS_DUP3 => {
                 let oldfd: i32 = args[0] as c_int;
                 let newfd: i32 = args[1] as c_int;

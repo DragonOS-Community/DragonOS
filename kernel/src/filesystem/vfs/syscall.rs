@@ -1021,10 +1021,15 @@ impl Syscall {
     }
 
     pub fn dup3(oldfd: i32, newfd: i32, flags: u32) -> Result<usize, SystemError> {
-        let flags: FileMode = FileMode::from_bits(flags).ok_or(SystemError::EINVAL)?;
-        if flags != FileMode::O_CLOEXEC {
+        let flags = FileMode::from_bits_truncate(flags);
+        if (flags.bits() & !FileMode::O_CLOEXEC.bits()) != 0 {
             return Err(SystemError::EINVAL);
         }
+
+        if oldfd == newfd {
+            return Err(SystemError::EINVAL);
+        }
+
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
         return Self::do_dup3(oldfd, newfd, flags, &mut fd_table_guard);

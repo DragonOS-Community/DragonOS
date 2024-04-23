@@ -399,6 +399,13 @@ impl Syscall {
                 Self::dup2(oldfd, newfd)
             }
 
+            SYS_DUP3 => {
+                let oldfd: i32 = args[0] as c_int;
+                let newfd: i32 = args[1] as c_int;
+                let flags: u32 = args[2] as u32;
+                Self::dup3(oldfd, newfd, flags)
+            }
+
             SYS_SOCKET => Self::socket(args[0], args[1], args[2]),
             SYS_SETSOCKOPT => {
                 let optval = args[3] as *const u8;

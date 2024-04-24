@@ -316,14 +316,19 @@ impl Ext2SuperBlockInfo {
         } else {
             1024 >> -sb.fragment_size
         };
+        let inode_size = if sb.inode_size > 0 {
+            sb.inode_size
+        } else {
+            128
+        };
         kdebug!(
-            "fragment_size = {}.s_frags_per_block = {}",
+            "fragment_size = {},block_size = {}",
             fragment_size,
             block_size
         );
         kdebug!(
             "s_inodes_per_block = {}.s_frags_per_block = {}",
-            block_size / sb.inode_size as u32,
+            block_size / inode_size as u32,
             block_size / fragment_size
         );
         let ret = Self {
@@ -331,7 +336,7 @@ impl Ext2SuperBlockInfo {
             // TODO 计算
             s_block_size: block_size as u32,
             s_frags_per_block: block_size / fragment_size,
-            s_inodes_per_block: block_size / sb.inode_size as u32,
+            s_inodes_per_block: block_size / inode_size as u32,
             s_frags_per_group: sb.fragments_per_group,
             s_blocks_per_group: sb.blocks_per_group,
             s_inodes_per_group: sb.inodes_per_group,
@@ -351,7 +356,7 @@ impl Ext2SuperBlockInfo {
             s_pad: 0,
             s_addr_per_block_bits: 0,
             s_desc_per_block_bits: 0,
-            s_inode_size: sb.inode_size as u32,
+            s_inode_size: inode_size as u32,
             s_first_ino: sb.first_ino,
             s_next_generation: 0,
             s_dir_count: 0,
@@ -411,12 +416,22 @@ impl Ext2SuperBlockInfo {
             kerror!("read ext2 {inode_index} inode failed");
             return Err(ret.err().unwrap());
         }
-
-        let inode_data: Vec<Ext2Inode> =
-            unsafe { core::mem::transmute::<Vec<u8>, Vec<Ext2Inode>>(inode_table_data) };
-        let inode = inode_data[idx % 4 as usize].clone();
-        kdebug!("{:?}", inode);
+        let new_pos = (idx % 4) * self.s_inode_size as usize;
+        let inode = Ext2Inode::new_from_bytes(
+            &inode_table_data[new_pos..new_pos + self.s_inode_size as usize].to_vec(),
+        );
+        if inode.is_err() {
+            kerror!("ext2 {inode_index} inode Ext2Inode::new_from_bytes failed");
+            return Err(inode.err().unwrap());
+        }
+        let inode = inode.unwrap();
+        // let inode_data: Vec<Ext2Inode> =
+        //     unsafe { core::mem::transmute::<Vec<u8>, Vec<Ext2Inode>>(inode_table_data) };
+        // let inode = inode_data[idx % 4 as usize].clone();
+        // drop(inode_data);
         kinfo!("end read inode");
+
+        kdebug!("{:?}", inode);
 
         return Ok(inode);
     }
@@ -427,7 +442,7 @@ impl Ext2SuperBlockInfo {
         // let root_inode = self.read_inode(root_inode_index);
         match self.read_inode(root_inode_index) {
             Ok(root_inode) => {
-                kdebug!("{:?}", root_inode);
+                kdebug!("root inode = {:?}", root_inode);
                 kinfo!("end read root inode");
                 return Ok(root_inode);
             }
@@ -512,14 +527,23 @@ impl Ext2SuperBlock {
 
     /// block group的数量
     pub fn get_group_count(&self) -> usize {
-        return ((self.block_count - self.first_data_block - 1) / self.blocks_per_group + 1)
-            as usize;
+        kdebug!(
+            "block_count = {},blocks_per_group = {}",
+            self.block_count,
+            self.blocks_per_group
+        );
+        return (self.block_count / self.blocks_per_group) as usize;
     }
     /// 块描述符所需要的块数
     pub fn get_db_count(&self) -> usize {
         let group_count = self.get_group_count();
-        let des_per_block = Ext2BlockGroupDescriptor::get_des_per_blc();
-        (group_count + des_per_block - 1) / des_per_block
+        // let des_per_block = Ext2BlockGroupDescriptor::get_des_per_blc();
+        let block_size: usize = 1024 << self.block_size;
+        let des_per_block = block_size / mem::size_of::<Ext2BlockGroupDescriptor>() as usize;
+        let size = mem::size_of::<Ext2BlockGroupDescriptor>() as usize;
+        kdebug!("group_count = {group_count},des_per_block = {des_per_block},size = {size}");
+        // (group_count + des_per_block - 1) / des_per_block
+        (group_count * size) / block_size
     }
     pub fn read_group_descs(
         &self,
@@ -528,24 +552,46 @@ impl Ext2SuperBlock {
         kdebug!("begin read group descriptors");
 
         // 先确定块数，再遍历块，再n个字节n个字节读
-        let db_count = self.get_db_count();
-        let des_per_block = Ext2BlockGroupDescriptor::get_des_per_blc();
+        let group_count = (self.block_count / self.blocks_per_group) as usize;
+        let block_size: usize = 1024 << self.block_size;
+        let size = mem::size_of::<Ext2BlockGroupDescriptor>() as usize;
+        let des_per_block = block_size / size;
+        kdebug!(
+            "group_count = {},des_per_block = {des_per_block},size = {size}",
+            group_count + 1
+        );
+
+        let mut db_count = (group_count * size) / block_size;
+        if (group_count * size) % block_size != 0 {
+            db_count += 1;
+        }
+        // let des_per_block = Ext2BlockGroupDescriptor::get_des_per_blc();
+
+        let total_des = des_per_block * db_count;
         // 需要确定读多少个
         let mut decs: Vec<Ext2BlockGroupDescriptor> = Vec::with_capacity(db_count * des_per_block);
 
-        let mut blc_data = Vec::with_capacity(LBA_SIZE * db_count);
-        blc_data.resize(LBA_SIZE * db_count, 0);
-
-        partition.disk().read_at(4usize, db_count, &mut blc_data)?;
+        let mut blc_data = Vec::with_capacity(block_size * db_count);
+        blc_data.resize(block_size * db_count, 0);
+        kdebug!("dbcount = {db_count},block_size = {block_size},des_per_block = {des_per_block},total_des = {total_des},blc_data.len={:?}",blc_data.len());
+        partition
+            .disk()
+            .read_at(4usize, db_count * 2, &mut blc_data)?;
         let mut cursor = VecCursor::new(blc_data);
-        for _ in 0..db_count {
+        for _ in 0..total_des {
             let mut d = Ext2BlockGroupDescriptor::new();
             d.block_bitmap_address = cursor.read_u32()?;
             d.inode_bitmap_address = cursor.read_u32()?;
             d.inode_table_start = cursor.read_u32()?;
+            if d.inode_table_start == 0 {
+                break;
+            }
             d.free_blocks_num = cursor.read_u16()?;
             d.free_inodes_num = cursor.read_u16()?;
             d.dir_num = cursor.read_u16()?;
+            let mut bg_flags = [0u8; 14];
+            cursor.read_exact(&mut bg_flags)?;
+
             kdebug!("{:?}", d);
             decs.push(d);
         }
@@ -558,47 +604,147 @@ impl Ext2SuperBlock {
 impl Debug for Ext2SuperBlock {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Ext2SuperBlock")
-            .field("inode_count", &self.inode_count)
-            .field("block_count", &self.block_count)
-            .field("reserved_block_count", &self.reserved_block_count)
-            .field("free_block_count", &self.free_block_count)
-            .field("free_inode_count", &self.free_inode_count)
-            .field("first_data_block", &self.first_data_block)
-            .field("block_size", &self.block_size)
-            .field("fragment_size", &self.fragment_size)
-            .field("blocks_per_group", &self.blocks_per_group)
-            .field("fragments_per_group", &self.fragments_per_group)
-            .field("inodes_per_group", &self.inodes_per_group)
-            .field("mount_time", &self.mount_time)
-            .field("write_time", &self.write_time)
-            .field("mount_count", &self.mount_count)
-            .field("max_mount_count", &self.max_mount_count)
-            .field("magic_signatrue", &self.magic_signatrue)
-            .field("state", &self.state)
-            .field("error_action", &self.error_action)
-            .field("minor_version", &self.minor_version)
-            .field("last_check_time", &self.last_check_time)
-            .field("check_interval", &self.check_interval)
-            .field("os_id", &self.os_id)
-            .field("major_version", &self.major_version)
-            .field("def_resuid", &self.def_resuid)
-            .field("def_resgid", &self.def_resgid)
-            .field("first_ino", &self.first_ino)
-            .field("inode_size", &self.inode_size)
-            .field("super_block_group", &self.super_block_group)
-            .field("feature_compat", &self.feature_compat)
-            .field("feature_incompat", &self.feature_incompat)
-            .field("feature_ro_compat", &self.feature_ro_compat)
-            .field("uuid", &self.uuid)
-            .field("volume_name", &self.volume_name)
-            .field("last_mounted_path", &self.last_mounted_path)
-            .field("algorithm_usage_bitmap", &self.algorithm_usage_bitmap)
-            .field("prealloc_blocks", &self.prealloc_blocks)
-            .field("prealloc_dir_blocks", &self.prealloc_dir_blocks)
-            .field("journal_uuid", &self.journal_uuid)
-            .field("journal_inode", &self.journal_inode)
-            .field("journal_device", &self.journal_device)
-            .field("last_orphan", &self.last_orphan)
+            .field("inode_count", &format_args!("{}\n", &self.inode_count))
+            .field("block_count", &format_args!("{}\n", &self.block_count))
+            .field(
+                "reserved_block_count",
+                &format_args!("{}\n", &self.reserved_block_count),
+            )
+            .field(
+                "free_block_count",
+                &format_args!("{}\n", &self.free_block_count),
+            )
+            .field(
+                "free_inode_count",
+                &format_args!("{}\n", &self.free_inode_count),
+            )
+            .field(
+                "first_data_block",
+                &format_args!("{}\n", &self.first_data_block),
+            )
+            .field("block_size", &format_args!("{}\n", &self.block_size))
+            .field("fragment_size", &format_args!("{}\n", &self.fragment_size))
+            .field(
+                "blocks_per_group",
+                &format_args!("{}\n", &self.blocks_per_group),
+            )
+            .field(
+                "fragments_per_group",
+                &format_args!("{}\n", &self.fragments_per_group),
+            )
+            .field(
+                "inodes_per_group",
+                &format_args!("{}\n", &self.inodes_per_group),
+            )
+            .field("mount_time", &format_args!("{}\n", &self.mount_time))
+            .field("write_time", &format_args!("{}\n", &self.write_time))
+            .field("mount_count", &format_args!("{}\n", &self.mount_count))
+            .field(
+                "max_mount_count",
+                &format_args!("{}\n", &self.max_mount_count),
+            )
+            .field(
+                "magic_signatrue",
+                &format_args!("{}\n", &self.magic_signatrue),
+            )
+            .field("state", &format_args!("{}\n", &self.state))
+            .field("error_action", &format_args!("{}\n", &self.error_action))
+            .field("minor_version", &format_args!("{}\n", &self.minor_version))
+            .field(
+                "last_check_time",
+                &format_args!("{}\n", &self.last_check_time),
+            )
+            .field(
+                "check_interval",
+                &format_args!("{}\n", &self.check_interval),
+            )
+            .field("os_id", &format_args!("{}\n", &self.os_id))
+            .field("major_version", &format_args!("{}\n", &self.major_version))
+            .field("def_resuid", &format_args!("{}\n", &self.def_resuid))
+            .field("def_resgid", &format_args!("{}\n", &self.def_resgid))
+            .field("first_ino", &format_args!("{}\n", &self.first_ino))
+            .field("inode_size", &format_args!("{}\n", &self.inode_size))
+            .field(
+                "super_block_group",
+                &format_args!("{}\n", &self.super_block_group),
+            )
+            .field(
+                "feature_compat",
+                &format_args!("{}\n", &self.feature_compat),
+            )
+            .field(
+                "feature_incompat",
+                &format_args!("{}\n", &self.feature_incompat),
+            )
+            .field(
+                "feature_ro_compat",
+                &format_args!("{}\n", &self.feature_ro_compat),
+            )
+            .field("uuid", &format_args!("\n{:?}", &self.uuid))
+            .field("volume_name", &format_args!("\n{:?}", &self.volume_name))
+            .field(
+                "last_mounted_path",
+                &format_args!("\n{:?}", &self.last_mounted_path),
+            )
+            .field(
+                "algorithm_usage_bitmap",
+                &format_args!("{}\n", &self.algorithm_usage_bitmap),
+            )
+            .field(
+                "prealloc_blocks",
+                &format_args!("{}\n", &self.prealloc_blocks),
+            )
+            .field(
+                "prealloc_dir_blocks",
+                &format_args!("{}\n", &self.prealloc_dir_blocks),
+            )
+            .field("journal_uuid", &format_args!("\n{:?}", &self.journal_uuid))
+            .field("journal_inode", &format_args!("{}\n", &self.journal_inode))
+            .field(
+                "journal_device",
+                &format_args!("{}\n", &self.journal_device),
+            )
+            .field("last_orphan", &format_args!("{}\n", &self.last_orphan))
+            // .field("block_count", &self.block_count)
+            // .field("reserved_block_count", &self.reserved_block_count)
+            // .field("free_block_count", &self.free_block_count)
+            // .field("free_inode_count", &self.free_inode_count)
+            // .field("first_data_block", &self.first_data_block)
+            // .field("block_size", &self.block_size)
+            // .field("fragment_size", &self.fragment_size)
+            // .field("blocks_per_group", &self.blocks_per_group)
+            // .field("fragments_per_group", &self.fragments_per_group)
+            // .field("inodes_per_group", &self.inodes_per_group)
+            // .field("mount_time", &self.mount_time)
+            // .field("write_time", &self.write_time)
+            // .field("mount_count", &self.mount_count)
+            // .field("max_mount_count", &self.max_mount_count)
+            // .field("magic_signatrue", &self.magic_signatrue)
+            // .field("state", &self.state)
+            // .field("error_action", &self.error_action)
+            // .field("minor_version", &self.minor_version)
+            // .field("last_check_time", &self.last_check_time)
+            // .field("check_interval", &self.check_interval)
+            // .field("os_id", &self.os_id)
+            // .field("major_version", &self.major_version)
+            // .field("def_resuid", &self.def_resuid)
+            // .field("def_resgid", &self.def_resgid)
+            // .field("first_ino", &self.first_ino)
+            // .field("inode_size", &self.inode_size)
+            // .field("super_block_group", &self.super_block_group)
+            // .field("feature_compat", &self.feature_compat)
+            // .field("feature_incompat", &self.feature_incompat)
+            // .field("feature_ro_compat", &self.feature_ro_compat)
+            // .field("uuid", &self.uuid)
+            // .field("volume_name", &self.volume_name)
+            // .field("last_mounted_path", &self.last_mounted_path)
+            // .field("algorithm_usage_bitmap", &self.algorithm_usage_bitmap)
+            // .field("prealloc_blocks", &self.prealloc_blocks)
+            // .field("prealloc_dir_blocks", &self.prealloc_dir_blocks)
+            // .field("journal_uuid", &self.journal_uuid)
+            // .field("journal_inode", &self.journal_inode)
+            // .field("journal_device", &self.journal_device)
+            // .field("last_orphan", &self.last_orphan)
             .finish()
     }
 }

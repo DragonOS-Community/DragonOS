@@ -21,7 +21,7 @@ pub struct Ext2BlockGroupDescriptor {
     /// 目录数
     pub dir_num: u16,
     /// 填充
-    padding: Vec<u8>,
+    _padding: [u8;14],
 }
 
 impl Ext2BlockGroupDescriptor {
@@ -33,7 +33,7 @@ impl Ext2BlockGroupDescriptor {
             free_blocks_num: 0,
             free_inodes_num: 0,
             dir_num: 0,
-            padding: vec![0; 14],
+            _padding: [0; 14],
         }
     }
     pub fn get_des_per_blc() -> usize {
@@ -45,12 +45,27 @@ impl Ext2BlockGroupDescriptor {
 impl Debug for Ext2BlockGroupDescriptor {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Ext2BlockGroupDescriptor")
-            .field("block_bitmap_address", &self.block_bitmap_address)
-            .field("inode_bitmap_address", &self.inode_bitmap_address)
-            .field("inode_table_start", &self.inode_table_start)
-            .field("free_blocks_num", &self.free_blocks_num)
-            .field("free_inodes_num", &self.free_inodes_num)
-            .field("dir_num", &self.dir_num)
+            .field(
+                "block_bitmap_address",
+                &format_args!("{:?}\n", &self.block_bitmap_address),
+            )
+            .field(
+                "inode_bitmap_address",
+                &format_args!("{:?}\n", &self.inode_bitmap_address),
+            )
+            .field(
+                "inode_table_start",
+                &format_args!("{:?}\n", &self.inode_table_start),
+            )
+            .field(
+                "free_blocks_num",
+                &format_args!("{:?}\n", &self.free_blocks_num),
+            )
+            .field(
+                "free_inodes_num",
+                &format_args!("{:?}\n", &self.free_inodes_num),
+            )
+            .field("dir_num", &format_args!("{:?}\n", &self.dir_num))
             .finish()
     }
 }

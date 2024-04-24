@@ -15,7 +15,10 @@ use uefi::data_types;
 
 use super::{entry::Ext2DirEntry, file_type::Ext2FileType, fs::EXT2_SB_INFO};
 use crate::{
-    driver::base::block::{block_device::LBA_SIZE, disk_info::Partition},
+    driver::base::block::{
+        block_device::{__bytes_to_lba, LBA_SIZE},
+        disk_info::Partition,
+    },
     filesystem::{
         ext2fs::file_type,
         vfs::{syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, Metadata},
@@ -168,24 +171,42 @@ impl Ext2Inode {
 impl Debug for Ext2Inode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Inode")
-            .field("mode", &self.mode)
-            .field("uid", &self.uid)
-            .field("lower_size", &self.lower_size)
-            .field("access_time", &self.access_time)
-            .field("create_time", &self.create_time)
-            .field("modify_time", &self.modify_time)
-            .field("delete_time", &self.delete_time)
-            .field("gid", &self.gid)
-            .field("hard_link_num", &self.hard_link_num)
-            .field("disk_sector", &self.disk_sector)
-            .field("flags", &self.flags)
-            .field("_os_dependent_1", &self._os_dependent_1)
-            .field("blocks", &self.blocks)
-            .field("generation_num", &self.generation_num)
-            .field("file_acl", &self.file_acl)
-            .field("directory_acl", &self.directory_acl)
-            .field("fragment_addr", &self.fragment_addr)
-            .field("_os_dependent_2", &self._os_dependent_2)
+            .field("mode", &format_args!("{:?}\n", &self.mode))
+            .field("uid", &format_args!("{:?}\n", &self.uid))
+            .field("lower_size", &format_args!("{:?}\n", &self.lower_size))
+            .field("access_time", &format_args!("{:?}\n", &self.access_time))
+            .field("create_time", &format_args!("{:?}\n", &self.create_time))
+            .field("modify_time", &format_args!("{:?}\n", &self.modify_time))
+            .field("delete_time", &format_args!("{:?}\n", &self.delete_time))
+            .field("gid", &format_args!("{:?}\n", &self.gid))
+            .field(
+                "hard_link_num",
+                &format_args!("{:?}\n", &self.hard_link_num),
+            )
+            .field("disk_sector", &format_args!("{:?}\n", &self.disk_sector))
+            .field("flags", &format_args!("{:?}\n", &self.flags))
+            .field(
+                "_os_dependent_1",
+                &format_args!("{:?}\n", &self._os_dependent_1),
+            )
+            .field("blocks", &format_args!("{:?}\n", &self.blocks))
+            .field(
+                "generation_num",
+                &format_args!("{:?}\n", &self.generation_num),
+            )
+            .field("file_acl", &format_args!("{:?}\n", &self.file_acl))
+            .field(
+                "directory_acl",
+                &format_args!("{:?}\n", &self.directory_acl),
+            )
+            .field(
+                "fragment_addr",
+                &format_args!("{:?}\n", &self.fragment_addr),
+            )
+            .field(
+                "_os_dependent_2",
+                &format_args!("{:?}\n", &self._os_dependent_2),
+            )
             .finish()
     }
 }
@@ -278,6 +299,14 @@ impl Ext2InodeInfo {
 }
 
 impl IndexNode for LockedExt2InodeInfo {
+    fn open(
+        &self,
+        _data: &mut FilePrivateData,
+        _mode: &crate::filesystem::vfs::file::FileMode,
+    ) -> Result<(), SystemError> {
+        kdebug!("open inode");
+        Ok(())
+    }
     fn read_at(
         &self,
         offset: usize,
@@ -293,7 +322,6 @@ impl IndexNode for LockedExt2InodeInfo {
             FileType::File | FileType::Dir => {
                 // 起始读取块
                 let mut start_block = offset / LBA_SIZE;
-                kdebug!("start_block = {start_block}");
 
                 // 需要读取的块
                 let read_block_num = min(len, buf.len()) / LBA_SIZE + 1;
@@ -305,6 +333,7 @@ impl IndexNode for LockedExt2InodeInfo {
                 // 读取的字节
                 let mut end_len: usize = min(LBA_SIZE, buf.len());
                 // 读取直接块
+                kdebug!("read direct, start_block = {start_block}");
                 while already_read_block < read_block_num && start_block <= 11 {
                     if inode_grade.i_data[start_block] == 0 {
                         return Ok(already_read_byte);
@@ -312,7 +341,7 @@ impl IndexNode for LockedExt2InodeInfo {
                     // 每次读一个块
                     let r: usize = superb.partition.as_ref().unwrap().disk().read_at(
                         // TODO 将地址换成id
-                        inode_grade.i_data[start_block] as usize,
+                        __bytes_to_lba(inode_grade.i_data[start_block] as usize, LBA_SIZE),
                         1,
                         &mut buf[start_pos..start_pos + end_len],
                     )?;
@@ -324,14 +353,17 @@ impl IndexNode for LockedExt2InodeInfo {
                 }
 
                 if already_read_block == read_block_num || inode_grade.i_data[12] == 0 {
+                    kdebug!("end read direct,end LockedExt2InodeInfo read_at, start_block = {start_block}");
                     return Ok(already_read_byte);
                 }
+
+                kdebug!("read indirect, start_block = {start_block}");
 
                 // 读取一级间接块
                 // 获取地址块
                 let mut address_block: [u8; 512] = [0; 512];
                 let _ = superb.partition.as_ref().unwrap().disk().read_at(
-                    inode_grade.i_data[12] as usize,
+                    __bytes_to_lba(inode_grade.i_data[12] as usize, LBA_SIZE),
                     1,
                     &mut address_block[0..],
                 );
@@ -343,7 +375,7 @@ impl IndexNode for LockedExt2InodeInfo {
                     // 每次读一个块
                     let r: usize = superb.partition.clone().unwrap().disk().read_at(
                         // TODO 将地址换成id
-                        address[start_block - 12] as usize,
+                        __bytes_to_lba(address[start_block - 12] as usize, LBA_SIZE),
                         1,
                         &mut buf[start_pos..start_pos + end_len],
                     )?;
@@ -355,8 +387,11 @@ impl IndexNode for LockedExt2InodeInfo {
                 }
 
                 if inode_grade.i_data[13] == 0 || already_read_block == read_block_num {
+                    kdebug!("end read indirect,end LockedExt2InodeInfo read_at, start_block = {start_block}");
                     return Ok(already_read_byte);
                 }
+                kdebug!("read secondly direct, start_block = {start_block}");
+
                 // FIXME partition clone一下，升级成arc之后一直clone用
                 // 读取二级间接块
                 let indir_block = get_address_block(
@@ -377,7 +412,7 @@ impl IndexNode for LockedExt2InodeInfo {
 
                         let r = superb.partition.clone().unwrap().disk().read_at(
                             // TODO 将地址换成id
-                            address[j] as usize,
+                            __bytes_to_lba(address[j] as usize, LBA_SIZE),
                             1,
                             &mut buf[start_pos..start_pos + end_len],
                         )?;
@@ -390,8 +425,11 @@ impl IndexNode for LockedExt2InodeInfo {
                 }
 
                 if inode_grade.i_data[14] == 0 || already_read_block == read_block_num {
+                    kdebug!("end read secondly direct,end LockedExt2InodeInfo read_at, start_block = {start_block}");
                     return Ok(already_read_byte);
                 }
+                kdebug!("read thirdly direct, start_block = {start_block}");
+
                 // 读取三级间接块
                 let thdir_block = get_address_block(
                     superb.partition.clone().unwrap(),
@@ -415,7 +453,7 @@ impl IndexNode for LockedExt2InodeInfo {
                             }
 
                             let r = superb.partition.as_ref().unwrap().disk().read_at(
-                                address[j] as usize,
+                                __bytes_to_lba(address[j] as usize, LBA_SIZE),
                                 1,
                                 &mut buf[start_pos..start_pos + end_len],
                             )?;
@@ -427,7 +465,9 @@ impl IndexNode for LockedExt2InodeInfo {
                         }
                     }
                 }
-                kinfo!("end LockedExt2InodeInfo read_at:file/dir");
+                kdebug!(
+                    "end read thirdly direct,end LockedExt2InodeInfo read_at, start_block = {start_block}"
+                );
 
                 Ok(already_read_byte)
             }
@@ -463,7 +503,6 @@ impl IndexNode for LockedExt2InodeInfo {
             Ext2FileType::UnixSocket => todo!(),
         }
         // TODO write_at
-        todo!()
     }
 
     fn fs(&self) -> alloc::sync::Arc<dyn FileSystem> {
@@ -491,6 +530,7 @@ impl IndexNode for LockedExt2InodeInfo {
                 let meta = &i_info.meta;
                 let size = meta.size as usize;
                 let mut data_block: Vec<u8> = Vec::with_capacity(size);
+                data_block.resize(size, 0);
                 let _read_size = self.read_at(
                     0,
                     size,
@@ -537,8 +577,12 @@ impl IndexNode for LockedExt2InodeInfo {
 }
 
 pub fn get_address_block(partition: Arc<Partition>, ptr: usize) -> [u32; 128] {
+    kinfo!("begin get address block");
     let mut address_block: [u8; 512] = [0; 512];
-    let _ = partition.disk().read_at(ptr, 1, &mut address_block[0..]);
+    let _ = partition
+        .disk()
+        .read_at(__bytes_to_lba(ptr, LBA_SIZE), 1, &mut address_block[0..]);
     let address: [u32; 128] = unsafe { mem::transmute::<[u8; 512], [u32; 128]>(address_block) };
+    kinfo!("end get address block");
     address
 }

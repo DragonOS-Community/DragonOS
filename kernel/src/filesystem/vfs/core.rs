@@ -2,14 +2,18 @@ use core::{hint::spin_loop, sync::atomic::Ordering};
 
 use alloc::{format, string::ToString, sync::Arc};
 use system_error::SystemError;
+use uefi::proto::media::partition;
 
 use crate::{
-    driver::{
-        base::block::disk_info::Partition,
-        disk::ahci,
-    },
+    driver::{base::block::disk_info::Partition, disk::ahci},
     filesystem::{
-        devfs::devfs_init, ext2fs::fs::Ext2FileSystem, fat::fs::FATFileSystem, procfs::procfs_init, ramfs::RamFS, sysfs::sysfs_init, vfs::{mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType}
+        devfs::devfs_init,
+        ext2fs::fs::Ext2FileSystem,
+        fat::fs::FATFileSystem,
+        procfs::procfs_init,
+        ramfs::RamFS,
+        sysfs::sysfs_init,
+        vfs::{mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
     },
     kdebug, kerror, kinfo,
     process::ProcessManager,
@@ -171,6 +175,7 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     }
     kinfo!("Successfully migrate rootfs to FAT32!");
 
+    // ======== mount ext2 ========
     let partiton1 = ahci::get_disks_by_name("ahci_disk_1".to_string());
     if partiton1.is_err() {
         kerror!("Failed to find ahci_disk_1");
@@ -187,8 +192,14 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
             spin_loop();
         }
     }
-    let _ext2fs: Arc<Ext2FileSystem> = ext2fs.unwrap();
+    let ext2fs: Arc<Ext2FileSystem> = ext2fs.unwrap();
+    let root_i = ROOT_INODE();
+    root_i
+        .create("ext2", FileType::Dir, ModeType::from_bits_truncate(0o755))
+        .expect("Failed to create /ext2");
+    root_i.mount(ext2fs)?;
     kinfo!("Successfully mount EXT2");
+    // ======== mount ext2 ========
 
     return Ok(());
 }

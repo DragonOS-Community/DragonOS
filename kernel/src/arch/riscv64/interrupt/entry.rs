@@ -160,7 +160,8 @@ unsafe extern "C" fn _save_context() -> ! {
         off_cause = const offset_of!(TrapFrame, cause),
         off_tp = const offset_of!(TrapFrame, tp),
         off_epc = const offset_of!(TrapFrame, epc),
-        sr_sum_and_fsvs = const (SR_FS_VS | SR_SUM),
+        sr_sum_and_fsvs = const (0), // 暂时在内核中不禁用FPU和Vector，以及不禁用用户内存访问
+        // sr_sum_and_fsvs = const (SR_FS_VS | SR_SUM),
         csr_status = const CSR_SSTATUS,
         csr_epc = const CSR_SEPC,
         csr_tval = const CSR_STVAL,

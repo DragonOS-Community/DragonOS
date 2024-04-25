@@ -2,7 +2,7 @@
 pub mod nr;
 use system_error::SystemError;
 
-use crate::{exception::InterruptArch, process::ProcessManager, syscall::Syscall};
+use crate::{exception::InterruptArch, kdebug, process::ProcessManager, syscall::Syscall};
 
 use super::{interrupt::TrapFrame, CurrentIrqArch};
 
@@ -29,6 +29,7 @@ macro_rules! syscall_return {
 }
 
 pub(super) fn syscall_handler(syscall_num: usize, frame: &mut TrapFrame) -> () {
+    // kdebug!("syscall_handler: syscall_num: {}", syscall_num);
     unsafe {
         CurrentIrqArch::interrupt_enable();
     }

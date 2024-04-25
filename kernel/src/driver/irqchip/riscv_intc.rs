@@ -162,7 +162,7 @@ pub unsafe fn riscv_intc_init() -> Result<(), SystemError> {
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/irqchip/irq-riscv-intc.c#23
 pub fn riscv_intc_irq(trap_frame: &mut TrapFrame) {
     let hwirq = HardwareIrqNumber::new(trap_frame.cause.code() as u32);
-    kdebug!("riscv64_do_irq: interrupt {hwirq:?}");
+    // kdebug!("riscv64_do_irq: interrupt {hwirq:?}");
     GenericIrqHandler::handle_domain_irq(riscv_intc_domain().clone().unwrap(), hwirq, trap_frame)
         .ok();
     if hwirq.data() == RiscVSbiTimer::TIMER_IRQ.data() {

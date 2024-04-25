@@ -39,7 +39,7 @@ Function
 */
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::driver::base::kobject::KObjectState;
+use crate::driver::base::kobject::{KObjectState,UEVENT_SUPPRESS};
 use crate::net::socket::Socket;
 use super::KobjectAction;
 use super::KObject;
@@ -133,7 +133,7 @@ kobject_action_type，将enum kobject_action类型的Action，转换为字符串
         };
         
         let kset = kobj.kset().unwrap();
-        let parent = kobj.parent();
+        let subsystem: String;
 
         let action_string = match action {
             KobjectAction::KOBJADD => "add",
@@ -160,9 +160,6 @@ kobject_action_type，将enum kobject_action类型的Action，转换为字符串
         //let top_kobj = kobj;
         let top_kobj = Arc::new(kobj); // assuming kobj is of type dyn KObject
 
-        // while !top_kobj.parent().is_none() && top_kobj.kset().is_none(){
-        //     top_kobj = Weak::upgrade(&top_kobj.parent().unwrap()).unwrap();
-        // }
         let weak_parent = Arc::downgrade(&top_kobj);
 
         while let Some(parent_arc) = weak_parent.upgrade() {
@@ -174,17 +171,17 @@ kobject_action_type，将enum kobject_action类型的Action，转换为字符串
         }
         /*
         struct kset_uevent_ops {
-	    int (* const filter)(struct kobject *kobj);
-	    const char *(* const name)(struct kobject *kobj);
-	    int (* const uevent)(struct kobject *kobj, struct kobj_uevent_env *env);
-};
+            int (* const filter)(struct kobject *kobj);
+            const char *(* const name)(struct kobject *kobj);
+            int (* const uevent)(struct kobject *kobj, struct kobj_uevent_env *env);
+        };
          */
         if top_kobj.kset().is_none() {
             if kset.uevent_ops().is_none() {
-                return Err("kset has no uevent_ops");
+                kdebug!("kset has no uevent_ops")
             }
             if kset.uevent_ops().unwrap().filter().is_none() {
-                return Err("kset has no uevent_ops->filter");
+                kdebug!("kset uevent_ops has no filter")
             }
             if kset.uevent_ops().unwrap().filter().unwrap()(kobj, action) {
                 return Ok(());
@@ -194,14 +191,22 @@ kobject_action_type，将enum kobject_action类型的Action，转换为字符串
         let uevent_ops = kset.uevent_ops().unwrap();
 
         /* skip the event, if uevent_suppress is set*/
-        if kobj.uevent_suppress() {
+        /* 
+        if (kobj->uevent_suppress) {
+            pr_debug("kobject: '%s' (%p): %s: uevent_suppress "
+                    "caused the event to drop!\n",
+                    kobject_name(kobj), kobj, __func__);
+            return 0;
+        }
+         */
+        if UEVENT_SUPPRESS == 1 {
+            kdebug!("uevent_suppress caused the event to drop!");
             return Ok(());
         }
 
         /* skip the event, if the filter returns zero. */
-        if uevent_ops && uevent_ops.filter{
-            if uevent_ops.filter(kobj) {
-            }
+        if uevent_ops.filter.is_some() && uevent_ops.filter.unwrap()(kobj) {
+            kdebug!("filter caused the event to drop!");
             return Ok(());
         }
 
@@ -210,10 +215,10 @@ kobject_action_type，将enum kobject_action类型的Action，转换为字符串
             let subsystem = uevent_ops.name(kobj);
         }
         else {
-            //let subsystem = kobj_name(kset->kobj);
+            let subsystem = kset.name();
         }
-        if !subsystem{
-            Err("unset subsystem caused the event to drop!")
+        if subsystem.is_empty() {
+            kdebug!("unset sussystem caused the event to drop!");
         }
 
         /* environment buffer */

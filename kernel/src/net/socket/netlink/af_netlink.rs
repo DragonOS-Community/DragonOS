@@ -13,13 +13,8 @@ static mut NETLINK_PROTO: netlink_proto::NetlinkProto = netlink_proto::NetlinkPr
 
 // SPDX-License-Identifier: GPL-2.0
 
-use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, Once};
-use std::thread::sleep;
-use std::time::Duration;
+
 use crossbeam_utils::atomic::AtomicCell;
-use libc::{self, SOCK_NONBLOCK, AF_NETLINK};
 
 // Flags constants
 const NETLINK_F_KERNEL_SOCKET: u32 = 0x1;
@@ -48,21 +43,26 @@ struct NetlinkSocket {
     subscriptions: u32,
     ngroups: u32,
     groups: Vec<u32>,
+    //struct
     state: u32,
     max_recvmsg_len: usize,
+    //no std
     wait: crossbeam_utils::atomic::AtomicCell<std::sync::Mutex<std::wait::WakeUp>>,
     bound: bool,
     cb_running: bool,
     dump_done_errno: i32,
     cb: Option<Box<dyn FnMut(libc::sockaddr_nl, &[u8])>>,
+    //todo
     cb_mutex: Mutex<()>,
     cb_def_mutex: Mutex<()>,
     netlink_rcv: Box<dyn FnMut(Vec<u8>)>,
+    // trait method
     netlink_bind: Option<Box<dyn FnMut(libc::sockaddr_nl, u32) -> bool>>,
     netlink_unbind: Option<Box<dyn FnMut(libc::sockaddr_nl, u32)>>,
     module: Option<std::ffi::c_void>,
     node: crossbeam_utils::atomic::AtomicCell<libc::rhashtable_node>,
-    rcu: libc::rcu_head,
+    // no libc
+    //rcu: libc::rcu_head,
     work: workqueue::Work,
 }
 // NetlinkTable how to design? a struct or use NetlinkTableEntry as struct?

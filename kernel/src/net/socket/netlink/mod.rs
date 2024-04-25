@@ -10,7 +10,4 @@ genetlink.c
 policy.c	
 */
 // Top-level module defining the public API for Netlink
-mod netlink {
-    // ... public structs, traits, and methods
-    
-}
+mod netlink;

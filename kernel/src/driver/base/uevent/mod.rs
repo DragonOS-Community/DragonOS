@@ -1,19 +1,40 @@
 // include/linux/kobject.h
 // lib/kobject_uevent.c
+
+/*
+    UEVENT_HELPER_PATH_LEN
+    UEVENT_NUM_ENVP
+    _KOBJECT_H_
+
+Variable
+
+    __randomize_layout
+
+Enum
+
+    kobject_action
+
+Struct
+
+    kobj_attribute
+    kobj_type
+    kobj_uevent_env
+    kobject
+    kset
+    kset_uevent_ops
+
+Function
+
+    get_ktype
+    kobject_name
+    kset_get
+    kset_put
+    to_kset
+*/
 use crate::driver::base::kobject::KObject;
 use alloc::string::String;
-use alloc::vec::Vec;
-// static const char *kobject_actions[] = {
-// 	[KOBJ_ADD] =		"add",
-// 	[KOBJ_REMOVE] =		"remove",
-// 	[KOBJ_CHANGE] =		"change",
-// 	[KOBJ_MOVE] =		"move",
-// 	[KOBJ_ONLINE] =		"online",
-// 	[KOBJ_OFFLINE] =	"offline",
-// 	[KOBJ_BIND] =		"bind",
-// 	[KOBJ_UNBIND] =		"unbind",
-// };
 
+mod kobject_uevent;
 // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c?fi=kobject_uevent#457
 // kobject_action
 pub enum KobjectAction {
@@ -29,6 +50,19 @@ pub enum KobjectAction {
 const UEVENT_NUM_ENVP: usize = 64;
 const UEVENT_BUFFER_SIZE: usize = 2048;
 const UEVENT_HELPER_PATH_LEN: usize = 256;
+
+/*
+    @parament: 
+    
+    envp，指针数组，用于保存每个环境变量的地址，最多可支持的环境变量数量为UEVENT_NUM_ENVP。
+
+    envp_idx，用于访问环境变量指针数组的index。
+
+    buf，保存环境变量的buffer，最大为UEVENT_BUFFER_SIZE。
+
+    buflen，访问buf的变量。
+
+*/
 struct KobjUeventEnv {
 argv: [Option<String>; 3],
 envp: [Option<String>; UEVENT_NUM_ENVP],
@@ -36,62 +70,13 @@ envp_idx: i32,
 buf: [char; UEVENT_BUFFER_SIZE],
 buflen: i32,
 }
-    //kobject_uevent->kobject_uevent_env
-    pub fn kobject_uevent(kobj: &mut dyn KObject, action: KobjectAction) -> Result<(), &'static str> {
-        match kobject_uevent_env(kobj, action, None) {
-            Ok(_) => Ok(()), // return Ok(()) on success
-            Err(e) => Err(e), // return the error on failure
-        }
-    }
-    pub fn kobject_uevent_env(kobj: &mut dyn KObject, action: KobjectAction, envp_ext: Option<Vec<String>>) -> Result<(), &'static str> {
-        // maybe we can have a better way to handle this
-        let action_string = match action {
-            KobjectAction::KOBJADD => "add",
-            KobjectAction::KOBJREMOVE => "remove",
-            KobjectAction::KOBJCHANGE => "change",
-            KobjectAction::KOBJMOVE => "move",
-            KobjectAction::KOBJONLINE => "online",
-            KobjectAction::KOBJOFFLINE => "offline",
-            KobjectAction::KOBJBIND => "bind",
-            KobjectAction::KOBJUNBIND => "unbind",
-        };
-        // failed to init because of the envp: [None; UEVENT_NUM_ENVP],
-        // let mut env = KobjUeventEnv {
-        //         argv: [None, None, None],
-        //         envp: [None; UEVENT_NUM_ENVP],
-        //         envp_idx: 0,
-        //         buf: ['\0'; UEVENT_BUFFER_SIZE],
-        //         buflen: 0,
-        // };
 
-        match action {
-                KobjectAction::KOBJREMOVE => {
-                        //TODO: kobj.state_remove_uevent_sent = true;
-                },
-                _ => {}
-        }
-    
-        // ... more code omitted ...
-    
-        if let Some(env_ext) = envp_ext {
-            for var in env_ext {
-                // ... use var ...
-            }
-        }
-    
-        // ... more code omitted ...
-    
-        match action {
-            KobjectAction::KOBJADD => {
-                //kobj.state_add_uevent_sent = true;
-            },
-            KobjectAction::KOBJUNBIND => {
-                // ... code omitted ...
-            },
-            _ => {}
-        }
-    
-        // ... more code omitted ...
-    
-        Ok(())
-    }
+//kset_uevent_ops是为kset量身订做的一个数据结构，里面包含filter和uevent两个回调函数，用处如下： 
+/*
+    filter，当任何Kobject需要上报uevent时，它所属的kset可以通过该接口过滤，阻止不希望上报的event，从而达到从整体上管理的目的。
+
+    name，该接口可以返回kset的名称。如果一个kset没有合法的名称，则其下的所有Kobject将不允许上报uvent
+
+    uevent，当任何Kobject需要上报uevent时，它所属的kset可以通过该接口统一为这些event添加环境变量。因为很多时候上报uevent时的环境变量都是相同的，因此可以由kset统一处理，就不需要让每个Kobject独自添加了。
+
+*/

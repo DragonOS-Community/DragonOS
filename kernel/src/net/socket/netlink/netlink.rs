@@ -1,13 +1,9 @@
-//定义Netlink消息的结构体，如nlmsghdr和genlmsghdr(拓展的netlink消息头)，以及用于封包和解包消息的函数。
+//定义Netlink消息的结构体，如NLmsghdr和geNLmsghdr(拓展的netlink消息头)，以及用于封包和解包消息的函数。
 //参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/netlink.h
 // SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
 // Ensure the header is only included once
-use libc::{consts::libc::SA_FAMILY_T, socket};
 use core::mem;
-#[allow(non_upper_case_globals)]
-#[allow(dead_code)]
-#[allow(unused)]
-pub mod netlink {
+use crate::libs::mutex::Mutex;
     pub const NETLINK_ROUTE: u32 = 0;
     pub const NETLINK_UNUSED: u32 = 1;
     pub const NETLINK_USERSOCK: u32 = 2;
@@ -41,7 +37,7 @@ pub mod netlink {
 
     //netlink消息报头
     /**
-     * struct nlmsghdr - fixed format metadata header of Netlink messages
+     * struct NLmsghdr - fixed format metadata header of Netlink messages
      * @nlmsg_len:   Length of message including header
      * @nlmsg_type:  Message content type
      * @nlmsg_flags: Additional flags
@@ -49,8 +45,8 @@ pub mod netlink {
      * @nlmsg_pid:   Sending process port ID
      */
     #[repr(C)]
-    pub struct nlmsghdr {
-        pub nlmsg_len: u32,
+    pub struct NLmsghdr {
+        pub nlmsg_len: usize,
         pub nlmsg_type: u16,
         pub nlmsg_flags: u16,
         pub nlmsg_seq: u32,
@@ -92,50 +88,48 @@ pub mod netlink {
 
     const NLMSG_ALIGNTO: usize = 4;
 
-    fn NLMSG_ALIGN(len: usize) -> usize {
-        ((len + NLMSG_ALIGNTO - 1) & !(NLMSG_ALIGNTO - 1))
+    fn nlmsg_align(len: usize) -> usize {
+        (len + NLMSG_ALIGNTO - 1) & !(NLMSG_ALIGNTO - 1)
     }
 
-    fn NLMSG_HDRLEN() -> usize {
-        mem::size_of::<nlmsghdr>()
+    fn nlmsg_hdrlen() -> usize {
+        nlmsg_align(mem::size_of::<NLmsghdr>())
     }
 
-    fn NLMSG_LENGTH(len: usize) -> usize {
-        len + NLMSG_HDRLEN()
+    fn nlmsg_length(len: usize) -> usize {
+        len + nlmsg_hdrlen()
     }
 
-    fn NLMSG_SPACE(len: usize) -> usize {
-        NLMSG_ALIGN(NLMSG_LENGTH(len))
+    fn nlmsg_space(len: usize) -> usize {
+        nlmsg_align(nlmsg_length(len))
     }
 
-    fn NLMSG_DATA(nlh: &nlmsghdr) -> *mut libc::c_void {
-        ((nlh as *const nlmsghdr) as *mut libc::c_void).add(NLMSG_LENGTH(0))
+    unsafe fn nlmsg_data(nlh: &NLmsghdr) -> *mut u8 {
+        ((nlh as *const NLmsghdr) as *mut u8).add(nlmsg_length(0))
     }
 
-    fn NLMSG_NEXT(nlh: &nlmsghdr, len: usize) -> *mut nlmsghdr {
-        let nlmsg_len = nlh.nlmsg_len;
-        let new_len = len - NLMSG_ALIGN(nlmsg_len);
-        ((nlh as *const nlmsghdr) as *mut nlmsghdr).add(NLMSG_ALIGN(nlmsg_len))
+    unsafe fn nlmsg_next(nlh: *mut NLmsghdr, len: usize) -> *mut NLmsghdr {
+        let nlmsg_len = (*nlh).nlmsg_len;
+        let new_len = len - nlmsg_align(nlmsg_len) as usize;
+        nlh.add(nlmsg_align(nlmsg_len) as usize)
     }
 
-    fn NLMSG_OK(nlh: &nlmsghdr, len: usize) -> bool {
-        len >= mem::size_of::<nlmsghdr>() &&
-        nlh.nlmsg_len >= mem::size_of::<nlmsghdr>() &&
+    fn nlmsg_ok(nlh: &NLmsghdr, len: usize) -> bool {
+        len >= nlmsg_hdrlen() &&
+        nlh.nlmsg_len >= nlmsg_hdrlen()&&
         nlh.nlmsg_len <= len
     }
 
-    fn NLMSG_PAYLOAD(nlh: &nlmsghdr, len: usize) -> usize {
-        nlh.nlmsg_len - NLMSG_SPACE(len)
+    fn nlmsg_payload(nlh: &NLmsghdr, len: usize) -> usize {
+        (nlh.nlmsg_len - nlmsg_space(len)) as usize
     }
-
-    // 请注意，这里我们假设 `nlmsghdr` 和相关的类型和函数已经在其他地方定义好了，
-    // 且使用 `libc` 作为跨平台的C兼容层来获取C类型的指针。
 
     //struct netlink_kernel_cfg,该结构包含了内核netlink的可选参数:
     struct NetlinkKernelCfg {
         groups: u32,
         flags: u32,
-        cb_mutex: *mut mutex,
+        //todo
+        cb_mutex: *mut Mutex<()>,
     }
     impl NetlinkKernelCfg{
         fn input(){
@@ -153,13 +147,13 @@ pub mod netlink {
         fn compare(){
 
         }
-    }
 
 
+
+}
     //https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/netlink.h#229
     //netlink属性头
-    pub struct nlattr {
+    pub struct NLattr {
         pub nla_len: u16,
         pub nla_type: u16,
     }
-}

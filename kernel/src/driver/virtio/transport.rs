@@ -1,15 +1,17 @@
 use virtio_drivers::transport::Transport;
 
-use super::transport_pci::PciTransport;
+use super::{transport_mmio::VirtIOMmioTransport, transport_pci::PciTransport};
 
 pub enum VirtIOTransport {
     Pci(PciTransport),
+    Mmio(VirtIOMmioTransport),
 }
 
 impl core::fmt::Debug for VirtIOTransport {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             VirtIOTransport::Pci(_) => write!(f, "VirtIOTransport::Pci"),
+            VirtIOTransport::Mmio(_) => write!(f, "VirtIOTransport::Mmio"),
         }
     }
 }
@@ -19,6 +21,7 @@ impl Transport for VirtIOTransport {
     fn finish_init(&mut self) {
         match self {
             VirtIOTransport::Pci(transport) => transport.finish_init(),
+            VirtIOTransport::Mmio(transport) => transport.finish_init(),
         }
     }
 
@@ -26,6 +29,7 @@ impl Transport for VirtIOTransport {
     fn device_type(&self) -> virtio_drivers::transport::DeviceType {
         match self {
             VirtIOTransport::Pci(transport) => transport.device_type(),
+            VirtIOTransport::Mmio(transport) => transport.device_type(),
         }
     }
 
@@ -33,6 +37,7 @@ impl Transport for VirtIOTransport {
     fn read_device_features(&mut self) -> u64 {
         match self {
             VirtIOTransport::Pci(transport) => transport.read_device_features(),
+            VirtIOTransport::Mmio(transport) => transport.read_device_features(),
         }
     }
 
@@ -40,6 +45,7 @@ impl Transport for VirtIOTransport {
     fn write_driver_features(&mut self, driver_features: u64) {
         match self {
             VirtIOTransport::Pci(transport) => transport.write_driver_features(driver_features),
+            VirtIOTransport::Mmio(transport) => transport.write_driver_features(driver_features),
         }
     }
 
@@ -47,6 +53,7 @@ impl Transport for VirtIOTransport {
     fn max_queue_size(&mut self, queue: u16) -> u32 {
         match self {
             VirtIOTransport::Pci(transport) => transport.max_queue_size(queue),
+            VirtIOTransport::Mmio(transport) => transport.max_queue_size(queue),
         }
     }
 
@@ -54,6 +61,7 @@ impl Transport for VirtIOTransport {
     fn notify(&mut self, queue: u16) {
         match self {
             VirtIOTransport::Pci(transport) => transport.notify(queue),
+            VirtIOTransport::Mmio(transport) => transport.notify(queue),
         }
     }
 
@@ -61,6 +69,7 @@ impl Transport for VirtIOTransport {
     fn get_status(&self) -> virtio_drivers::transport::DeviceStatus {
         match self {
             VirtIOTransport::Pci(transport) => transport.get_status(),
+            VirtIOTransport::Mmio(transport) => transport.get_status(),
         }
     }
 
@@ -68,6 +77,7 @@ impl Transport for VirtIOTransport {
     fn set_status(&mut self, status: virtio_drivers::transport::DeviceStatus) {
         match self {
             VirtIOTransport::Pci(transport) => transport.set_status(status),
+            VirtIOTransport::Mmio(transport) => transport.set_status(status),
         }
     }
 
@@ -75,6 +85,7 @@ impl Transport for VirtIOTransport {
     fn set_guest_page_size(&mut self, guest_page_size: u32) {
         match self {
             VirtIOTransport::Pci(transport) => transport.set_guest_page_size(guest_page_size),
+            VirtIOTransport::Mmio(transport) => transport.set_guest_page_size(guest_page_size),
         }
     }
 
@@ -82,6 +93,7 @@ impl Transport for VirtIOTransport {
     fn requires_legacy_layout(&self) -> bool {
         match self {
             VirtIOTransport::Pci(transport) => transport.requires_legacy_layout(),
+            VirtIOTransport::Mmio(transport) => transport.requires_legacy_layout(),
         }
     }
 
@@ -98,6 +110,9 @@ impl Transport for VirtIOTransport {
             VirtIOTransport::Pci(transport) => {
                 transport.queue_set(queue, size, descriptors, driver_area, device_area)
             }
+            VirtIOTransport::Mmio(transport) => {
+                transport.queue_set(queue, size, descriptors, driver_area, device_area)
+            }
         }
     }
 
@@ -105,6 +120,7 @@ impl Transport for VirtIOTransport {
     fn queue_unset(&mut self, queue: u16) {
         match self {
             VirtIOTransport::Pci(transport) => transport.queue_unset(queue),
+            VirtIOTransport::Mmio(transport) => transport.queue_unset(queue),
         }
     }
 
@@ -112,6 +128,7 @@ impl Transport for VirtIOTransport {
     fn queue_used(&mut self, queue: u16) -> bool {
         match self {
             VirtIOTransport::Pci(transport) => transport.queue_used(queue),
+            VirtIOTransport::Mmio(transport) => transport.queue_used(queue),
         }
     }
 
@@ -119,6 +136,7 @@ impl Transport for VirtIOTransport {
     fn ack_interrupt(&mut self) -> bool {
         match self {
             VirtIOTransport::Pci(transport) => transport.ack_interrupt(),
+            VirtIOTransport::Mmio(transport) => transport.ack_interrupt(),
         }
     }
 
@@ -126,6 +144,7 @@ impl Transport for VirtIOTransport {
     fn config_space<T: 'static>(&self) -> virtio_drivers::Result<core::ptr::NonNull<T>> {
         match self {
             VirtIOTransport::Pci(transport) => transport.config_space(),
+            VirtIOTransport::Mmio(transport) => transport.config_space(),
         }
     }
 }

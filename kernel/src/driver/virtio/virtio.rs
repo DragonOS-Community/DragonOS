@@ -2,6 +2,7 @@ use super::mmio::virtio_probe_mmio;
 use super::transport_pci::PciTransport;
 use super::virtio_impl::HalImpl;
 use crate::driver::base::device::DeviceId;
+use crate::driver::block::virtio_blk::virtio_blk;
 use crate::driver::net::virtio_net::virtio_net;
 use crate::driver::pci::pci::{
     get_pci_device_structures_mut_by_vendor_id, PciDeviceStructure,
@@ -17,10 +18,12 @@ use virtio_drivers::transport::{DeviceType, Transport};
 
 ///@brief 寻找并加载所有virtio设备的驱动（目前只有virtio-net，但其他virtio设备也可添加）
 pub fn virtio_probe() {
+    #[cfg(not(target_arch = "riscv64"))]
     virtio_probe_pci();
     virtio_probe_mmio();
 }
 
+#[allow(dead_code)]
 fn virtio_probe_pci() {
     let mut list = PCI_DEVICE_LINKEDLIST.write();
     let virtio_list = virtio_device_search(&mut list);
@@ -45,11 +48,9 @@ fn virtio_probe_pci() {
 }
 
 ///@brief 为virtio设备寻找对应的驱动进行初始化
-fn virtio_device_init(transport: VirtIOTransport, dev_id: Arc<DeviceId>) {
+pub(super) fn virtio_device_init(transport: VirtIOTransport, dev_id: Arc<DeviceId>) {
     match transport.device_type() {
-        DeviceType::Block => {
-            kwarn!("Not support virtio_block device for now");
-        }
+        DeviceType::Block => virtio_blk(transport, dev_id),
         DeviceType::GPU => {
             kwarn!("Not support virtio_gpu device for now");
         }

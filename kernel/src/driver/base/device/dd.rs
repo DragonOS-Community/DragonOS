@@ -72,6 +72,10 @@ impl DeviceManager {
 
         if dev.driver().is_some() {
             if self.device_is_bound(dev) {
+                kdebug!(
+                    "do_device_attach: device '{}' is already bound.",
+                    dev.name()
+                );
                 return Ok(true);
             }
 
@@ -82,6 +86,7 @@ impl DeviceManager {
                 return Ok(false);
             }
         } else {
+            kdebug!("do_device_attach: device '{}' is not bound.", dev.name());
             let bus = dev
                 .bus()
                 .and_then(|bus| bus.upgrade())
@@ -198,20 +203,22 @@ impl DeviceManager {
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#496
     pub fn device_bind_driver(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
         let r = driver_manager().driver_sysfs_add(dev);
-        if let Err(e) = r {
-            kerror!(
-                "device_bind_driver: driver_sysfs_add failed, dev: '{}', err: {:?}",
-                dev.name(),
-                e
-            );
+        if r.is_ok() {
             self.device_links_force_bind(dev);
             driver_manager().driver_bound(dev);
-            return Err(e);
         } else if let Some(bus) = dev.bus().and_then(|bus| bus.upgrade()) {
             bus.subsystem().bus_notifier().call_chain(
                 BusNotifyEvent::DriverNotBound,
                 Some(dev),
                 None,
+            );
+        }
+
+        if let Err(e) = r.as_ref() {
+            kerror!(
+                "device_bind_driver: driver_sysfs_add failed, dev: '{}', err: {:?}",
+                dev.name(),
+                e
             );
         }
         return r;

@@ -5,10 +5,9 @@ use crate::{
     arch::TraitPciArch,
     driver::{
         open_firmware::fdt::open_firmware_fdt_driver,
-        pci::pci::{pci_init, BusDeviceFunction, PciAddr, PciError, SegmentGroupNumber},
+        pci::pci::{pci_init, BusDeviceFunction, PciAddr},
     },
-    init::{boot_params, initcall::INITCALL_SUBSYS},
-    kwarn,
+    init::initcall::INITCALL_SUBSYS,
     mm::PhysAddr,
 };
 
@@ -18,11 +17,11 @@ mod pci_host_ecam;
 
 pub struct RiscV64PciArch;
 impl TraitPciArch for RiscV64PciArch {
-    fn read_config(bus_device_function: &BusDeviceFunction, offset: u8) -> u32 {
+    fn read_config(_bus_device_function: &BusDeviceFunction, _offset: u8) -> u32 {
         unimplemented!("RiscV64PciArch::read_config")
     }
 
-    fn write_config(bus_device_function: &BusDeviceFunction, offset: u8, data: u32) {
+    fn write_config(_bus_device_function: &BusDeviceFunction, _offset: u8, _data: u32) {
         unimplemented!("RiscV64pci_root_0().write_config")
     }
 

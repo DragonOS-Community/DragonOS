@@ -9,6 +9,7 @@ pub(super) mod irq;
 pub mod mmio;
 pub mod sysfs;
 pub mod transport;
+pub mod transport_mmio;
 pub mod transport_pci;
 #[allow(clippy::module_inception)]
 pub mod virtio;

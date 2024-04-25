@@ -1,0 +1,22 @@
+{
+  "name": "test_dup3",
+  "version": "0.1.0",
+  "description": "测试dup3",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "apps/test_dup3"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "install": {
+    "in_dragonos_path": "/bin"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  }
+}

@@ -112,140 +112,140 @@ kobject_action_type，将enum kobject_action类型的Action，转换为字符串
 */
 
 
-    //kobject_uevent->kobject_uevent_env
-    pub fn kobject_uevent(kobj: &dyn KObject, action: KobjectAction) -> Result<(), &'static str> {
-        // kobject_uevent和kobject_uevent_env功能一样，只是没有指定任何的环境变量
-        match kobject_uevent_env(kobj, action, None) {
-            Ok(_) => Ok(()), // return Ok(()) on success
-            Err(e) => Err(e), // return the error on failure
-        }
+//kobject_uevent->kobject_uevent_env
+pub fn kobject_uevent(kobj: &dyn KObject, action: KobjectAction) -> Result<(), &'static str> {
+    // kobject_uevent和kobject_uevent_env功能一样，只是没有指定任何的环境变量
+    match kobject_uevent_env(kobj, action, None) {
+        Ok(_) => Ok(()), // return Ok(()) on success
+        Err(e) => Err(e), // return the error on failure
     }
-    pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: Option<Vec<String>>) -> Result<(), &'static str> {
-        
-        // todo: 定义一些常量和变量
-        // init uevent env
-        let env = KobjUeventEnv {
-            argv: [None, None, None],
-            envp: [None; UEVENT_NUM_ENVP],
-            envp_idx: 0,
-            buf: [0; UEVENT_BUFFER_SIZE],
-            buflen: 0,
-        };
-        
-        let kset = kobj.kset().unwrap();
-        let subsystem: String;
+}
+pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: Option<Vec<String>>) -> Result<(), &'static str> {
+    
+    // todo: 定义一些常量和变量
+    // init uevent env
+    let env = KobjUeventEnv {
+        argv: [None, None, None],
+        envp: [None; UEVENT_NUM_ENVP],
+        envp_idx: 0,
+        buf: [0; UEVENT_BUFFER_SIZE],
+        buflen: 0,
+    };
+    
+    let kset = kobj.kset().unwrap();
+    let subsystem: String;
 
-        let action_string = match action {
-            KobjectAction::KOBJADD => "add",
-            KobjectAction::KOBJREMOVE => "remove",
-            KobjectAction::KOBJCHANGE => "change",
-            KobjectAction::KOBJMOVE => "move",
-            KobjectAction::KOBJONLINE => "online",
-            KobjectAction::KOBJOFFLINE => "offline",
-            KobjectAction::KOBJBIND => "bind",
-            KobjectAction::KOBJUNBIND => "unbind",
-        };
+    let action_string = match action {
+        KobjectAction::KOBJADD => "add",
+        KobjectAction::KOBJREMOVE => "remove",
+        KobjectAction::KOBJCHANGE => "change",
+        KobjectAction::KOBJMOVE => "move",
+        KobjectAction::KOBJONLINE => "online",
+        KobjectAction::KOBJOFFLINE => "offline",
+        KobjectAction::KOBJBIND => "bind",
+        KobjectAction::KOBJUNBIND => "unbind",
+    };
 
 
-        let mut state = KObjectState::empty();
+    let mut state = KObjectState::empty();
 
-        match action {
-            KobjectAction::KOBJREMOVE => {
-                state.insert(KObjectState::REMOVE_UEVENT_SENT);
-            },
-            _ => {}
+    match action {
+        KobjectAction::KOBJREMOVE => {
+            state.insert(KObjectState::REMOVE_UEVENT_SENT);
+        },
+        _ => {}
+    }
+
+    /* search the kset we belong to */
+    //let top_kobj = kobj;
+    let top_kobj = Arc::new(kobj); // assuming kobj is of type dyn KObject
+
+    let weak_parent = Arc::downgrade(&top_kobj);
+
+    while let Some(parent_arc) = weak_parent.upgrade() {
+        let kset = top_kobj.kset();
+        if !kset.is_some() {
+            break;
         }
-
-        /* search the kset we belong to */
-        //let top_kobj = kobj;
-        let top_kobj = Arc::new(kobj); // assuming kobj is of type dyn KObject
-
-        let weak_parent = Arc::downgrade(&top_kobj);
-
-        while let Some(parent_arc) = weak_parent.upgrade() {
-            let kset = top_kobj.kset();
-            if !kset.is_some() {
-                break;
-            }
-            top_kobj = parent_arc;
+        top_kobj = parent_arc;
+    }
+    /*
+    struct kset_uevent_ops {
+        int (* const filter)(struct kobject *kobj);
+        const char *(* const name)(struct kobject *kobj);
+        int (* const uevent)(struct kobject *kobj, struct kobj_uevent_env *env);
+    };
+        */
+    if top_kobj.kset().is_none() {
+        if kset.uevent_ops().is_none() {
+            kdebug!("kset has no uevent_ops");
         }
-        /*
-        struct kset_uevent_ops {
-            int (* const filter)(struct kobject *kobj);
-            const char *(* const name)(struct kobject *kobj);
-            int (* const uevent)(struct kobject *kobj, struct kobj_uevent_env *env);
-        };
-         */
-        if top_kobj.kset().is_none() {
-            if kset.uevent_ops().is_none() {
-                kdebug!("kset has no uevent_ops");
-            }
-            if kset.uevent_ops().unwrap().filter().is_none() {
-                kdebug!("kset uevent_ops has no filter");
-            }
-            if kset.uevent_ops().unwrap().filter().unwrap()(kobj, action) {
-                return Ok(());
-            }
+        if kset.uevent_ops().unwrap().filter().is_none() {
+            kdebug!("kset uevent_ops has no filter");
         }
-        let kset = top_kobj.kset().unwrap();
-        let uevent_ops = kset.uevent_ops().unwrap();
-
-        /* skip the event, if uevent_suppress is set*/
-        /* 
-        if (kobj->uevent_suppress) {
-            pr_debug("kobject: '%s' (%p): %s: uevent_suppress "
-                    "caused the event to drop!\n",
-                    kobject_name(kobj), kobj, __func__);
-            return 0;
-        }
-         */
-        if UEVENT_SUPPRESS == 1 {
-            kdebug!("uevent_suppress caused the event to drop!");
+        if kset.uevent_ops().unwrap().filter().unwrap()(kobj, action) {
             return Ok(());
         }
-
-        /* skip the event, if the filter returns zero. */
-        if uevent_ops.filter.is_some() && uevent_ops.filter.unwrap()(kobj) {
-            kdebug!("filter caused the event to drop!");
-            return Ok(());
-        }
-
-        /* originating subsystem */
-        if uevent_ops && uevent_ops.name {
-            let subsystem = uevent_ops.name(kobj);
-        }
-        else {
-            let subsystem = kset.name();
-        }
-        if subsystem.is_empty() {
-            kdebug!("unset sussystem caused the event to drop!");
-        }
-
-        /* environment buffer */
-        // env = kzalloc(sizeof(struct kobj_uevent_env), GFP_KERNEL);
-        // if (!env)
-        // 	return -ENOMEM;
-
-
-
-        if let Some(env_ext) = envp_ext {
-            for var in env_ext {
-                // todo
-            }
-        }
-    
-    
-        match action {
-            KobjectAction::KOBJADD => {
-                state.insert(KObjectState::ADD_UEVENT_SENT);
-            },
-            KobjectAction::KOBJUNBIND => {
-                //zap_modalias_env(env);
-            },
-            _ => {}
-        }
-    
-        // ... more code omitted ...
-    
-        Ok(())
     }
+    let kset = top_kobj.kset().unwrap();
+    let uevent_ops = kset.uevent_ops().unwrap();
+
+    /* skip the event, if uevent_suppress is set*/
+    /* 
+    if (kobj->uevent_suppress) {
+        pr_debug("kobject: '%s' (%p): %s: uevent_suppress "
+                "caused the event to drop!\n",
+                kobject_name(kobj), kobj, __func__);
+        return 0;
+    }
+        */
+    if UEVENT_SUPPRESS == 1 {
+        kdebug!("uevent_suppress caused the event to drop!");
+        return Ok(());
+    }
+
+    /* skip the event, if the filter returns zero. */
+    if uevent_ops.filter.is_some() && uevent_ops.filter.unwrap()(kobj) {
+        kdebug!("filter caused the event to drop!");
+        return Ok(());
+    }
+
+    /* originating subsystem */
+    if uevent_ops && uevent_ops.name {
+        let subsystem = uevent_ops.name(kobj);
+    }
+    else {
+        let subsystem = kset.name();
+    }
+    if subsystem.is_empty() {
+        kdebug!("unset sussystem caused the event to drop!");
+    }
+
+    /* environment buffer */
+    // env = kzalloc(sizeof(struct kobj_uevent_env), GFP_KERNEL);
+    // if (!env)
+    // 	return -ENOMEM;
+
+
+
+    if let Some(env_ext) = envp_ext {
+        for var in env_ext {
+            // todo
+        }
+    }
+
+
+    match action {
+        KobjectAction::KOBJADD => {
+            state.insert(KObjectState::ADD_UEVENT_SENT);
+        },
+        KobjectAction::KOBJUNBIND => {
+            //zap_modalias_env(env);
+        },
+        _ => {}
+    }
+
+    // ... more code omitted ...
+
+    Ok(())
+}

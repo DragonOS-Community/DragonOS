@@ -6,14 +6,16 @@ use alloc::{
 
 use core::hash::Hash;
 
-use super::kobject::{
-    DynamicKObjKType, KObjType, KObject, KObjectManager, KObjectState, LockedKObjectState,
+use super::{kobject::{
+    DynamicKObjKType, KObjType, KObject, KObjectManager, KObjectState, LockedKObjectState,},
+    uevent::KobjUeventEnv,
 };
 use crate::{
     filesystem::kernfs::KernFSInode,
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 use system_error::SystemError;
+
 
 #[derive(Debug)]
 pub struct KSet {
@@ -232,3 +234,18 @@ impl InnerKSet {
         }
     }
 }
+pub trait KsetUeventOps {
+    fn filter(&self, kobj: &impl KObject) -> i32;
+    fn name(&self, kobj: &impl KObject) -> &str;
+    //fn uevent<T>(&self, kobj: &impl KObject, env: &mut KobjUeventEnv<T>) -> i32;
+}
+
+#[derive(Debug)]
+pub struct KsetUeventOpsImpl {}
+
+impl KsetUeventOpsImpl {
+    // 构造函数
+}
+
+
+

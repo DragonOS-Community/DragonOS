@@ -47,9 +47,6 @@ pub enum KobjectAction {
         KOBJBIND,
         KOBJUNBIND,
     }
-const UEVENT_NUM_ENVP: usize = 64;
-const UEVENT_BUFFER_SIZE: usize = 2048;
-const UEVENT_HELPER_PATH_LEN: usize = 256;
 
 /*
     @parament: 
@@ -63,12 +60,18 @@ const UEVENT_HELPER_PATH_LEN: usize = 256;
     buflen，访问buf的变量。
 
 */
-struct KobjUeventEnv {
-argv: [Option<String>; 3],
-envp: [Option<String>; UEVENT_NUM_ENVP],
-envp_idx: i32,
-buf: [char; UEVENT_BUFFER_SIZE],
-buflen: i32,
+
+//https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/kobject.h#31
+
+pub const UEVENT_NUM_ENVP :usize = 64;
+pub const UEVENT_BUFFER_SIZE:usize= 2048;
+pub const UEVENT_HELPER_PATH_LEN:usize = 256;
+pub struct KobjUeventEnv<T> {
+    argv: [Option<T>; 3],
+    envp: [Option<T>; UEVENT_NUM_ENVP],
+    envp_idx: u32,
+    buf: [u8; UEVENT_BUFFER_SIZE],
+    buflen: u32,
 }
 
 //kset_uevent_ops是为kset量身订做的一个数据结构，里面包含filter和uevent两个回调函数，用处如下： 

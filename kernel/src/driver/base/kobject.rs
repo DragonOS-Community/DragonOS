@@ -103,6 +103,7 @@ bitflags! {
         const ADD_UEVENT_SENT = 1 << 1;
         const REMOVE_UEVENT_SENT = 1 << 2;
         const INITIALIZED = 1 << 3;
+        const UEVENT_SUPPRESS = 1 << 4;
     }
 
 }

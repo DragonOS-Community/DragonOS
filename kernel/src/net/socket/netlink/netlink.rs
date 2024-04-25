@@ -4,35 +4,39 @@
 // Ensure the header is only included once
 use core::mem;
 use crate::libs::mutex::Mutex;
-    pub const NETLINK_ROUTE: u32 = 0;
-    pub const NETLINK_UNUSED: u32 = 1;
-    pub const NETLINK_USERSOCK: u32 = 2;
-    pub const NETLINK_FIREWALL: u32 = 3;
-    pub const NETLINK_SOCK_DIAG: u32 = 4;
-    pub const NETLINK_NFLOG: u32 = 5;
-    pub const NETLINK_XFRM: u32 = 6;
-    pub const NETLINK_SELINUX: u32 = 7;
-    pub const NETLINK_ISCSI: u32 = 8;
-    pub const NETLINK_AUDIT: u32 = 9;
-    pub const NETLINK_FIB_LOOKUP: u32 = 10;
-    pub const NETLINK_CONNECTOR: u32 = 11;
-    pub const NETLINK_NETFILTER: u32 = 12;
-    pub const NETLINK_IP6_FW: u32 = 13;
-    pub const NETLINK_DNRTMSG: u32 = 14;
-    //implemente uevent needed
-    pub const NETLINK_KOBJECT_UEVENT: u32 = 15;
-    pub const NETLINK_GENERIC: u32 = 16;
-    // pub const NETLINK_DM: u32 = 17; // Assuming DM Events is unused, not defined
-    pub const NETLINK_SCSITRANSPORT: u32 = 18;
-    pub const NETLINK_ECRYPTFS: u32 = 19;
-    pub const NETLINK_RDMA: u32 = 20;
-    pub const NETLINK_CRYPTO: u32 = 21;
-    pub const NETLINK_SMC: u32 = 22;
+bitflags! {
+    pub struct NetlinkFlags :u32 {
+        const NETLINK_ROUTE = 0;
+        const NETLINK_UNUSED = 1;
+        const NETLINK_USERSOCK = 2;
+        const NETLINK_FIREWALL = 3;
+        const NETLINK_SOCK_DIAG = 4;
+        const NETLINK_NFLOG = 5;
+        const NETLINK_XFRM = 6;
+        const NETLINK_SELINUX = 7;
+        const NETLINK_ISCSI = 8;
+        const NETLINK_AUDIT = 9;
+        const NETLINK_FIB_LOOKUP = 10;
+        const NETLINK_CONNECTOR = 11;
+        const NETLINK_NETFILTER = 12;
+        const NETLINK_IP6_FW = 13;
+        const NETLINK_DNRTMSG = 14;
+        // implemente uevent needed
+        const NETLINK_KOBJECT_UEVENT = 15;
+        const NETLINK_GENERIC = 16;
+        // const NETLINK_DM = 17; // Assuming DM Events is unused, not defined
+        const NETLINK_SCSITRANSPORT = 18;
+        const NETLINK_ECRYPTFS = 19;
+        const NETLINK_RDMA = 20;
+        const NETLINK_CRYPTO = 21;
+        const NETLINK_SMC = 22;
 
-    pub const NETLINK_INET_DIAG: u32 = NETLINK_SOCK_DIAG;
+        //const NETLINK_INET_DIAG = NETLINK_SOCK_DIAG;
+        const NETLINK_INET_DIAG = 4;
 
-    pub const MAX_LINKS: usize = 32;
-
+        const MAX_LINKS = 32;
+    }
+    
 
 
     //netlink消息报头
@@ -44,48 +48,60 @@ use crate::libs::mutex::Mutex;
      * @nlmsg_seq:   Sequence number
      * @nlmsg_pid:   Sending process port ID
      */
-    #[repr(C)]
-    pub struct NLmsghdr {
-        pub nlmsg_len: usize,
-        pub nlmsg_type: u16,
-        pub nlmsg_flags: u16,
-        pub nlmsg_seq: u32,
-        pub nlmsg_pid: u32,
-    }
-    /* Flags values */
-
 
     //四种通用的消息类型 nlmsg_type
-    pub const NLMSG_NOOP: u8 = 0x1; /* Nothing.     */
-    pub const NLMSG_ERROR: u8 = 0x2; /* Error       */
-    pub const NLMSG_DONE: u8 = 0x3; /* End of a dump    */
-    pub const NLMSG_OVERRUN: u8 = 0x4; /* Data lost     */
+    pub struct NLmsgType: u8 {
+        const NLMSG_NOOP = 0x1; /* Nothing.     */
+        const NLMSG_ERROR = 0x2; /* Error       */
+        const NLMSG_DONE = 0x3; /* End of a dump    */
+        const NLMSG_OVERRUN = 0x4; /* Data lost     */
+    }
 
     //消息标记 nlmsg_flags
-    // pub const NLM_F_REQUEST: u32 = 1; /* It is request message.     */
-    // pub const NLM_F_MULTI: u32 = 2; /* Multipart message, terminated by NLMSG_DONE */
-    // pub const NLM_F_ACK: u32 = 4; /* Reply with ack, with zero or error code */
-    // pub const NLM_F_ECHO: u32 = 8; /* Echo this request         */
-    // pub const NLM_F_DUMP_INTR: u32 = 16; /* Dump was inconsistent due to sequence change */
-    pub const NLM_F_REQUEST: u16 = 0x01;
-    pub const NLM_F_MULTI: u16 = 0x02;
-    pub const NLM_F_ACK: u16 = 0x04;
-    pub const NLM_F_ECHO: u16 = 0x08;
-    pub const NLM_F_DUMP_INTR: u16 = 0x10;
-    pub const NLM_F_DUMP_FILTERED: u16 = 0x20;
+    //  const NLM_F_REQUEST = 1; /* It is request message.     */
+    //  const NLM_F_MULTI = 2; /* Multipart message, terminated by NLMSG_DONE */
+    //  const NLM_F_ACK = 4; /* Reply with ack, with zero or error code */
+    //  const NLM_F_ECHO = 8; /* Echo this request         */
+    //  const NLM_F_DUMP_INTR = 16; /* Dump was inconsistent due to sequence change */
+    pub struct NLmsgFlags: u16 {
+        /* Flags values */
+        const NLM_F_REQUEST = 0x01;
+        const NLM_F_MULTI = 0x02;
+        const NLM_F_ACK = 0x04;
+        const NLM_F_ECHO = 0x08;
+        const NLM_F_DUMP_INTR = 0x10;
+        const NLM_F_DUMP_FILTERED = 0x20;
 
-    /* Modifiers to GET request */
-    pub const NLM_F_ROOT: u32 = 0x100; /* specify tree root    */
-    pub const NLM_F_MATCH: u32 = 0x200; /* return all matching    */
-    pub const NLM_F_ATOMIC: u32 = 0x400; /* atomic GET        */
-    pub const NLM_F_DUMP: u32 = NLM_F_ROOT | NLM_F_MATCH;
+        /* Modifiers to GET request */
+        const NLM_F_ROOT = 0x100; /* specify tree root    */
+        const NLM_F_MATCH = 0x200; /* return all matching    */
+        const NLM_F_ATOMIC = 0x400; /* atomic GET        */
+        //const NLM_F_DUMP = NLM_F_ROOT | NLM_F_MATCH;
+        const NLM_F_DUMP = 0x100 | 0x200;
 
-    /* Modifiers to NEW request */
-    pub const NLM_F_REPLACE: u32 = 0x100; /* Override existing        */
-    pub const NLM_F_EXCL: u32 = 0x200; /* Do not touch, if it exists    */
-    pub const NLM_F_CREATE: u32 = 0x400; /* Create, if it does not exist    */
-    pub const NLM_F_APPEND: u32 = 0x800; /* Add to end of list        */
+        /* Modifiers to NEW request */
+        const NLM_F_REPLACE = 0x100; /* Override existing        */
+        const NLM_F_EXCL = 0x200; /* Do not touch, if it exists    */
+        const NLM_F_CREATE = 0x400; /* Create, if it does not exist    */
+        const NLM_F_APPEND = 0x800; /* Add to end of list        */
 
+        /* Modifiers to DELETE request */
+        const NLM_F_NONREC = 0x100;	/* Do not delete recursively	*/
+
+         /* Flags for ACK message */
+        const NLM_F_CAPPED = 0x100;	/* request was capped */
+        const NLM_F_ACK_TLVS = 0x200;	/* extended ACK TVLs were included */
+    }
+    }
+    
+    struct NLmsghdr {
+        nlmsg_len: usize,
+        nlmsg_type: u16,
+        nlmsg_flags: u16,
+        nlmsg_seq: u32,
+        nlmsg_pid: u32,
+   }
+   
     const NLMSG_ALIGNTO: usize = 4;
 
     fn nlmsg_align(len: usize) -> usize {
@@ -126,9 +142,9 @@ use crate::libs::mutex::Mutex;
 
     //struct netlink_kernel_cfg,该结构包含了内核netlink的可选参数:
     struct NetlinkKernelCfg {
-        groups: u32,
-        flags: u32,
-        //todo
+        groups: usize,
+        flags: usize,
+        //todo about mutex
         cb_mutex: *mut Mutex<()>,
     }
     impl NetlinkKernelCfg{
@@ -153,7 +169,7 @@ use crate::libs::mutex::Mutex;
 }
     //https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/netlink.h#229
     //netlink属性头
-    pub struct NLattr {
-        pub nla_len: u16,
-        pub nla_type: u16,
+     struct NLattr {
+         nla_len: u16,
+         nla_type: u16,
     }

@@ -299,6 +299,10 @@ impl Ext2InodeInfo {
 }
 
 impl IndexNode for LockedExt2InodeInfo {
+    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+        kdebug!("close inode");
+        Ok(())
+    }
     fn open(
         &self,
         _data: &mut FilePrivateData,
@@ -339,6 +343,7 @@ impl IndexNode for LockedExt2InodeInfo {
                         return Ok(already_read_byte);
                     }
                     // 每次读一个块
+                    // TODO 调整架构
                     let r: usize = superb.partition.as_ref().unwrap().disk().read_at(
                         // TODO 将地址换成id
                         __bytes_to_lba(inode_grade.i_data[start_block] as usize, LBA_SIZE),
@@ -514,6 +519,7 @@ impl IndexNode for LockedExt2InodeInfo {
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
+        kdebug!("begin ext2 list");
         let guard = self.0.lock();
         let file_type = Ext2FileType::type_from_mode(&guard.i_mode);
         if file_type.is_err() {
@@ -521,16 +527,18 @@ impl IndexNode for LockedExt2InodeInfo {
             return Err(SystemError::EINVAL);
         }
         let file_type = file_type.unwrap();
+        kdebug!("file type = {file_type:?}");
         let mut names: Vec<String> = Vec::new();
         match file_type {
             Ext2FileType::Directory => {
                 // 获取inode数据块
-                let i_info = self.0.lock();
                 // 解析为entry数组
-                let meta = &i_info.meta;
+                let meta = &guard.meta;
                 let size = meta.size as usize;
                 let mut data_block: Vec<u8> = Vec::with_capacity(size);
                 data_block.resize(size, 0);
+                drop(guard);
+                kdebug!("enter read at");
                 let _read_size = self.read_at(
                     0,
                     size,
@@ -555,6 +563,8 @@ impl IndexNode for LockedExt2InodeInfo {
                     names.push(name.to_string());
                     begin_pos += rc_len as usize - mem::size_of::<u32>();
                 }
+                kdebug!("end ext2 list");
+
                 // 将entry添加到ret中
                 return Ok(names);
             }

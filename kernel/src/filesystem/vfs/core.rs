@@ -194,10 +194,14 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     }
     let ext2fs: Arc<Ext2FileSystem> = ext2fs.unwrap();
     let root_i = ROOT_INODE();
-    root_i
+    let mount_inode = root_i
         .create("ext2", FileType::Dir, ModeType::from_bits_truncate(0o755))
         .expect("Failed to create /ext2");
-    root_i.mount(ext2fs)?;
+
+    mount_inode.mount(ext2fs)?;
+    if let Err(err) = root_i.lookup("/ext2") {
+        kdebug!("look up ext2 failed: {err:?}");
+    };
     kinfo!("Successfully mount EXT2");
     // ======== mount ext2 ========
 

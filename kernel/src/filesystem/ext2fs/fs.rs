@@ -14,7 +14,7 @@ use crate::{
     },
     filesystem::{
         ext2fs::inode::Ext2Inode,
-        vfs::{FileSystem, IndexNode},
+        vfs::{FileSystem, IndexNode, ROOT_INODE},
     },
     libs::{rwlock::RwLock, spinlock::SpinLock, vec_cursor::VecCursor},
 };
@@ -89,7 +89,6 @@ impl Ext2FileSystem {
         kdebug!("new the Ext2InodeInfo");
         let r_info = Ext2InodeInfo::new(&root_inode);
         kdebug!("end mount Ext2FS");
-
         return Ok(Arc::new(Self {
             partition,
             first_data_sector: 0,

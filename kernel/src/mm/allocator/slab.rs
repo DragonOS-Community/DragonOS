@@ -1,7 +1,7 @@
 //! 当前slab分配器暂时不使用，等待后续完善后合并主线
 #![allow(dead_code)]
 
-use core::{alloc::Layout, ptr::NonNull, sync::atomic::AtomicBool};
+use core::{alloc::Layout, panic, ptr::NonNull, sync::atomic::AtomicBool};
 
 use alloc::boxed::Box;
 use slabmalloc::*;
@@ -60,6 +60,15 @@ impl SlabAllocator {
         } else {
             return Ok(());
         }
+    }
+}
+
+/// 获取slab中的空闲空间
+pub unsafe fn slab_usage() -> u64 {
+    if let Some(ref mut slab) = SLABALLOCATOR {
+        slab.zone.usage()
+    } else {
+        panic!("slab hasn't been initialized")
     }
 }
 

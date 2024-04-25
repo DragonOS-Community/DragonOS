@@ -178,7 +178,6 @@ impl MemoryManagementArch for RiscV64MMArch {
         let ppn = PhysPageFrame::new(table).ppn();
         riscv::asm::sfence_vma_all();
         satp::set(satp::Mode::Sv39, 0, ppn);
-        riscv::asm::sfence_vma_all();
     }
 
     fn virt_is_valid(virt: VirtAddr) -> bool {

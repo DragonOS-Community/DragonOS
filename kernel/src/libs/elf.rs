@@ -18,7 +18,7 @@ use crate::{
     arch::{CurrentElfArch, MMArch},
     driver::base::block::SeekFrom,
     filesystem::vfs::file::File,
-    kdebug, kerror,
+    kerror,
     libs::align::page_align_up,
     mm::{
         allocator::page_frame::{PageFrameCount, VirtPageFrame},
@@ -629,11 +629,11 @@ impl BinaryLoader for ElfLoader {
         for seg_to_load in loadable_sections {
             // kdebug!("seg_to_load = {:?}", seg_to_load);
             if unlikely(elf_brk > elf_bss) {
-                kdebug!(
-                    "to set brk, elf_brk = {:?}, elf_bss = {:?}",
-                    elf_brk,
-                    elf_bss
-                );
+                // kdebug!(
+                //     "to set brk, elf_brk = {:?}, elf_bss = {:?}",
+                //     elf_brk,
+                //     elf_bss
+                // );
                 self.set_elf_brk(
                     &mut user_vm,
                     elf_bss + load_bias,

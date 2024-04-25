@@ -3,7 +3,7 @@ use core::{
     marker::PhantomData,
     mem,
     ops::Add,
-    sync::atomic::{compiler_fence, fence, Ordering},
+    sync::atomic::{compiler_fence, Ordering},
 };
 
 use alloc::sync::Arc;
@@ -915,7 +915,6 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
 
                     // 清空这个页帧
                     MMArch::write_bytes(MMArch::phys_2_virt(frame).unwrap(), 0, MMArch::PAGE_SIZE);
-                    fence(Ordering::SeqCst);
                     // 设置页表项的flags
                     let flags: PageFlags<Arch> =
                         PageFlags::new_page_table(virt.kind() == PageTableKind::User);

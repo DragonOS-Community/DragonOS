@@ -5,8 +5,7 @@ use core::{
 };
 
 use crate::{
-    arch::{cpu::current_cpu_id, ipc::signal::SigSet, syscall::nr::*, CurrentIrqArch},
-    exception::InterruptArch,
+    arch::{ipc::signal::SigSet, syscall::nr::*},
     filesystem::vfs::syscall::{PosixStatfs, PosixStatx},
     ipc::shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
@@ -17,7 +16,7 @@ use crate::{
         resource::{RLimit64, RUsage},
         ProcessFlags, ProcessManager,
     },
-    sched::{cpu_rq, fair::CompletelyFairScheduler, schedule, SchedMode, Scheduler},
+    sched::{schedule, SchedMode},
     syscall::user_access::check_and_clone_cstr,
 };
 
@@ -1008,30 +1007,7 @@ impl Syscall {
                 Self::fchmodat(dirfd, pathname, mode)
             }
 
-            SYS_SCHED_YIELD => {
-                // 禁用中断
-                let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-
-                let pcb = ProcessManager::current_pcb();
-                let rq =
-                    cpu_rq(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize);
-                let (rq, guard) = rq.self_lock();
-
-                // TODO: schedstat_inc(rq->yld_count);
-
-                CompletelyFairScheduler::yield_task(rq);
-
-                pcb.preempt_disable();
-
-                drop(guard);
-                drop(irq_guard);
-
-                pcb.preempt_enable(); // sched_preempt_enable_no_resched();
-
-                schedule(SchedMode::SM_NONE);
-
-                Ok(0)
-            }
+            SYS_SCHED_YIELD => Self::do_sched_yield(),
 
             SYS_SCHED_GETAFFINITY => {
                 let pid = args[0] as i32;

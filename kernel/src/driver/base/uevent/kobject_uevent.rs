@@ -178,10 +178,10 @@ kobject_action_type，将enum kobject_action类型的Action，转换为字符串
          */
         if top_kobj.kset().is_none() {
             if kset.uevent_ops().is_none() {
-                kdebug!("kset has no uevent_ops")
+                kdebug!("kset has no uevent_ops");
             }
             if kset.uevent_ops().unwrap().filter().is_none() {
-                kdebug!("kset uevent_ops has no filter")
+                kdebug!("kset uevent_ops has no filter");
             }
             if kset.uevent_ops().unwrap().filter().unwrap()(kobj, action) {
                 return Ok(());

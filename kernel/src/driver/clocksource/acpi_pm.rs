@@ -2,7 +2,6 @@ use crate::{
     alloc::string::ToString,
     arch::{
         io::PortIOArch,
-        x86_64::{asm::mach_timer::CALIBRATE_LATCH, driver::tsc::PIT_TICK_RATE},
         CurrentPortIOArch,
     },
     driver::acpi::pmtmr::{ACPI_PM_MASK, PMTMR_TICKS_PER_SEC},
@@ -14,6 +13,8 @@ use crate::{
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU32, Ordering};
 use system_error::SystemError;
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86_64::{asm::mach_timer::CALIBRATE_LATCH, driver::tsc::PIT_TICK_RATE};
 
 // 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/clocksource/acpi_pm.c
 

@@ -19,7 +19,7 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    kdebug, kerror,
+    kerror,
     libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{
@@ -53,7 +53,7 @@ static BSP_IDLE_STACK_SPACE: InitProcUnion = InitProcUnion {
     idle_stack: [0; 32768],
 };
 
-pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<String>) -> ! {
+pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
     // 以下代码不能发生中断
     CurrentIrqArch::interrupt_disable();
 
@@ -69,27 +69,11 @@ pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<Str
     arch_guard.ra = new_pc.data();
     drop(arch_guard);
 
-    // 删除kthread的标志
-    current_pcb.flags().remove(ProcessFlags::KTHREAD);
-    current_pcb.worker_private().take();
+    drop(current_pcb);
 
-    *current_pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::CFS;
-
-    let mut trap_frame = TrapFrame::new();
-
-    compiler_fence(Ordering::SeqCst);
-    Syscall::do_execve(path, argv, envp, &mut trap_frame).unwrap_or_else(|e| {
-        panic!(
-            "arch_switch_to_user(): pid: {pid:?}, Failed to execve: , error: {e:?}",
-            pid = current_pcb.pid(),
-            e = e
-        );
-    });
     compiler_fence(Ordering::SeqCst);
 
     // 重要！在这里之后，一定要保证上面的引用计数变量、动态申请的变量、锁的守卫都被drop了，否则可能导致内存安全问题！
-
-    drop(current_pcb);
 
     *(trap_frame_vaddr.data() as *mut TrapFrame) = trap_frame;
 

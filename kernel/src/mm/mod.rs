@@ -447,6 +447,8 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     const ENTRY_FLAG_PRESENT: usize;
     /// 页表项为read only时的值
     const ENTRY_FLAG_READONLY: usize;
+    /// 页表项的write bit
+    const ENTRY_FLAG_WRITEABLE: usize;
     /// 页表项为可读写状态的值
     const ENTRY_FLAG_READWRITE: usize;
     /// 页面项标记页面为user page的值

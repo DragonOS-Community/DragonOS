@@ -69,6 +69,8 @@ pub(super) unsafe fn riscv_mm_init() -> Result<(), SystemError> {
     mem_block_manager()
         .reserve_block(KERNEL_BEGIN_PA, KERNEL_END_PA - KERNEL_BEGIN_PA)
         .expect("Failed to reserve kernel memory");
+    // 开启S-mode User Memory Access，允许内核访问用户空间
+    riscv::register::sstatus::set_sum();
 
     let mut bump_allocator = BumpAllocator::<RiscV64MMArch>::new(0);
     let _old_page_table = MMArch::table(PageTableKind::Kernel);
@@ -76,7 +78,7 @@ pub(super) unsafe fn riscv_mm_init() -> Result<(), SystemError> {
 
     // 使用bump分配器，把所有的内存页都映射到页表
     {
-        kdebug!("to create new page table");
+        // kdebug!("to create new page table");
         // 用bump allocator创建新的页表
         let mut mapper: crate::mm::page::PageMapper<MMArch, &mut BumpAllocator<MMArch>> =
             crate::mm::page::PageMapper::<MMArch, _>::create(
@@ -85,7 +87,7 @@ pub(super) unsafe fn riscv_mm_init() -> Result<(), SystemError> {
             )
             .expect("Failed to create page mapper");
         new_page_table = mapper.table().phys();
-        kdebug!("PageMapper created");
+        // kdebug!("PageMapper created");
 
         // 取消最开始时候，在head.S中指定的映射(暂时不刷新TLB)
         {

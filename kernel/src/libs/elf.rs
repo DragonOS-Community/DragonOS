@@ -123,7 +123,7 @@ impl ElfLoader {
     ) -> Result<(), ExecError> {
         let start = self.elf_page_start(start);
         let end = self.elf_page_align_up(end);
-
+        // kdebug!("set_elf_brk: start={:?}, end={:?}", start, end);
         if end > start {
             let r = user_vm_guard.map_anonymous(
                 start,
@@ -133,6 +133,7 @@ impl ElfLoader {
                 false,
                 true,
             );
+            // kdebug!("set_elf_brk: map_anonymous: r={:?}", r);
             if r.is_err() {
                 kerror!("set_elf_brk: map_anonymous failed, err={:?}", r);
                 return Err(ExecError::OutOfMemory);
@@ -254,18 +255,14 @@ impl ElfLoader {
         if total_size != 0 {
             let total_size = self.elf_page_align_up(VirtAddr::new(total_size)).data();
 
-            // kdebug!("total_size={}", total_size);
-
             map_addr = user_vm_guard
                 .map_anonymous(addr_to_map, total_size, tmp_prot, *map_flags, false, true)
                 .map_err(map_err_handler)?
                 .virt_address();
-            // kdebug!("map ok: addr_to_map={:?}", addr_to_map);
 
             let to_unmap = map_addr + map_size;
             let to_unmap_size = total_size - map_size;
 
-            // kdebug!("to_unmap={:?}, to_unmap_size={}", to_unmap, to_unmap_size);
             user_vm_guard.munmap(
                 VirtPageFrame::new(to_unmap),
                 PageFrameCount::from_bytes(to_unmap_size).unwrap(),
@@ -554,6 +551,7 @@ impl BinaryLoader for ElfLoader {
             if seg.p_type != PT_INTERP {
                 continue;
             }
+
             // 接下来处理这个 .interpreter 段以及动态链接器
             // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#881
 
@@ -582,8 +580,6 @@ impl BinaryLoader for ElfLoader {
         }
         Self::parse_gnu_property()?;
 
-        // kdebug!("loadable_sections = {:?}", loadable_sections);
-
         let mut elf_brk = VirtAddr::new(0);
         let mut elf_bss = VirtAddr::new(0);
         let mut start_code: Option<VirtAddr> = None;
@@ -606,6 +602,7 @@ impl BinaryLoader for ElfLoader {
         let loadable_sections = phdr_table
             .into_iter()
             .filter(|seg| seg.p_type == elf::abi::PT_LOAD);
+
         for seg_to_load in loadable_sections {
             min_address = min(
                 min_address,
@@ -695,7 +692,7 @@ impl BinaryLoader for ElfLoader {
             }
 
             // 加载这个段到用户空间
-
+            // kdebug!("to load elf segment");
             let e = self
                 .load_elf_segment(
                     &mut user_vm,
@@ -706,10 +703,13 @@ impl BinaryLoader for ElfLoader {
                     &elf_map_flags,
                     total_size,
                 )
-                .map_err(|e| match e {
-                    SystemError::EFAULT => ExecError::BadAddress(None),
-                    SystemError::ENOMEM => ExecError::OutOfMemory,
-                    _ => ExecError::Other(format!("load_elf_segment failed: {:?}", e)),
+                .map_err(|e| {
+                    kerror!("load_elf_segment failed: {:?}", e);
+                    match e {
+                        SystemError::EFAULT => ExecError::BadAddress(None),
+                        SystemError::ENOMEM => ExecError::OutOfMemory,
+                        _ => ExecError::Other(format!("load_elf_segment failed: {:?}", e)),
+                    }
                 })?;
 
             // 如果地址不对，那么就报错

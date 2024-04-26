@@ -5,9 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::process::arch_switch_to_user,
-    driver::{
-        disk::ahci::ahci_init, net::e1000e::e1000e::e1000e_init, virtio::virtio::virtio_probe,
-    },
+    driver::{net::e1000e::e1000e::e1000e_init, virtio::virtio::virtio_probe},
     filesystem::vfs::core::mount_root_fs,
     kdebug, kerror,
     net::net_core::net_init,
@@ -34,11 +32,12 @@ fn kernel_init() -> Result<(), SystemError> {
     // 由于目前加锁，速度过慢，所以先不开启双缓冲
     // scm_enable_double_buffer().expect("Failed to enable double buffer");
 
-    ahci_init().expect("Failed to initialize AHCI");
-
-    mount_root_fs().expect("Failed to mount root fs");
+    #[cfg(target_arch = "x86_64")]
+    crate::driver::disk::ahci::ahci_init().expect("Failed to initialize AHCI");
 
     virtio_probe();
+    mount_root_fs().expect("Failed to mount root fs");
+
     e1000e_init();
     net_init().unwrap_or_else(|err| {
         kerror!("Failed to initialize network: {:?}", err);
@@ -62,8 +61,9 @@ fn kenrel_init_freeable() -> Result<(), SystemError> {
 
 /// 切换到用户态
 fn switch_to_user() {
-    let path = String::from("/bin/dragonreach");
-    let argv = vec![String::from("/bin/dragonreach")];
+    const INIT_PROGRAM: &str = "/bin/dragonreach";
+    let path = String::from(INIT_PROGRAM);
+    let argv = vec![path.clone()];
     let envp = vec![String::from("PATH=/")];
 
     unsafe { arch_switch_to_user(path, argv, envp) };

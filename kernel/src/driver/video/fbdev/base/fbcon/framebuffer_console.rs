@@ -40,11 +40,11 @@ impl BlittingFbConsole {
         })
     }
 
-    pub fn fb(&self) -> Arc<dyn FrameBuffer> {
+    fn fb(&self) -> Arc<dyn FrameBuffer> {
         self.fb.lock().clone().unwrap()
     }
 
-    pub fn get_color(&self, vc_data: &VirtualConsoleData, c: u16, is_fg: bool) -> u32 {
+    fn get_color(&self, vc_data: &VirtualConsoleData, c: u16, is_fg: bool) -> u32 {
         let fb_info = self.fb();
         let mut color = 0;
 
@@ -104,7 +104,7 @@ impl BlittingFbConsole {
     }
 
     /// ## 计算单色调的函数
-    pub fn mono_color(&self) -> u32 {
+    fn mono_color(&self) -> u32 {
         let fb_info = self.fb();
         let mut max_len = fb_info
             .current_fb_var()
@@ -117,7 +117,7 @@ impl BlittingFbConsole {
         return (!(0xfff << max_len)) & 0xff;
     }
 
-    pub fn bit_put_string(
+    fn bit_put_string(
         &self,
         vc_data: &VirtualConsoleData,
         buf: &[u16],

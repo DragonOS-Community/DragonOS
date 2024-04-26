@@ -35,6 +35,7 @@ impl KernelThreadMechanism {
         // 使能中断
         frame.status.update_sie(true);
         frame.status.update_spp(SPP::Supervisor);
+        frame.status.update_sum(true);
 
         frame.ra = kernel_thread_bootstrap_stage1 as usize;
 

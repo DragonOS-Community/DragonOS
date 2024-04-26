@@ -46,6 +46,7 @@ pub trait SerioDriver: Driver {
 
 ///todo: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/serio.c#810
 
+#[allow(dead_code)]
 #[inline(always)]
 pub fn serio_driver_manager() -> &'static SerioDriverManager {
     &SerioDriverManager

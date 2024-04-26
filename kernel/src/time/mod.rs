@@ -6,7 +6,7 @@ use core::{
 
 use crate::arch::CurrentTimeArch;
 
-use self::{timekeep::ktime_get_real_ns, timekeeping::getnstimeofday};
+use self::timekeeping::getnstimeofday;
 
 pub mod clocksource;
 pub mod jiffies;
@@ -225,7 +225,8 @@ impl Instant {
 
     /// Create a new `Instant` from the current time
     pub fn now() -> Instant {
-        Self::from_micros(ktime_get_real_ns() / 1000)
+        let tm = getnstimeofday();
+        Self::from_micros(tm.tv_sec * 1000000 + tm.tv_nsec / 1000)
     }
 
     /// The fractional number of milliseconds that have passed

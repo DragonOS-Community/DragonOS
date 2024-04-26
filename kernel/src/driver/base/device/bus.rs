@@ -147,12 +147,12 @@ pub trait Bus: Debug + Send + Sync {
 
     fn resume(&self, device: &Arc<dyn Device>) -> Result<(), SystemError>;
 
-    /// match platform device to platform driver.
+    /// match device to driver.
     ///
     /// ## 参数
     ///
-    /// * `device` - platform device
-    /// * `driver` - platform driver
+    /// * `device` - device
+    /// * `driver` - driver
     ///
     /// ## 返回
     ///

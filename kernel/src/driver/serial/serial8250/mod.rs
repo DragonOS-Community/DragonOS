@@ -94,6 +94,10 @@ impl Serial8250Manager {
         // todo: 把驱动注册到uart层、tty层
         uart_manager().register_driver(&(serial8250_isa_driver.clone() as Arc<dyn UartDriver>))?;
 
+        // 把驱动注册到platform总线
+        platform_driver_manager()
+            .register(serial8250_isa_driver.clone() as Arc<dyn PlatformDriver>)?;
+
         // 注册isa设备到platform总线
         platform_device_manager()
             .device_add(serial8250_isa_dev.clone() as Arc<dyn PlatformDevice>)
@@ -103,10 +107,6 @@ impl Serial8250Manager {
                 }
                 return e;
             })?;
-
-        // 把驱动注册到platform总线
-        platform_driver_manager()
-            .register(serial8250_isa_driver.clone() as Arc<dyn PlatformDriver>)?;
 
         unsafe {
             INITIALIZED = true;

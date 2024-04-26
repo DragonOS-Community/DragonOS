@@ -44,20 +44,14 @@ trigger_labels = [
     "regression-from-stable-to-nightly",
     "I-unsound",
 ]
-exclude_labels = [
-    "P-*",
-    "T-release",
-    "requires-nightly",
-]
+exclude_labels = ["P-*", "T-release", "requires-nightly"]
 
 [autolabel."T-doc"]
 trigger_files = [
     # Source code
     "doc",
 ]
-exclude_labels = [
-    "T-*",
-]
+exclude_labels = ["T-*"]
 
 
 [autolabel."A-meta"]
@@ -70,19 +64,13 @@ trigger_files = [
 ]
 
 [autolabel."A-fs"]
-trigger_files = [
-    "kernel/src/filesystem",
-]
+trigger_files = ["kernel/src/filesystem"]
 
 [autolabel."O-x86_64"]
-trigger_files = [
-    "kernel/src/arch/x86_64",
-]
+trigger_files = ["kernel/src/arch/x86_64"]
 
 [autolabel."O-riscv64"]
-trigger_files = [
-    "kernel/src/arch/riscv64",
-]
+trigger_files = ["kernel/src/arch/riscv64"]
 
 [autolabel."T-driver"]
 trigger_files = [
@@ -92,25 +80,20 @@ trigger_files = [
 ]
 
 [autolabel."T-virtulization"]
-trigger_files = [
-    "kernel/src/virt",
-    "kernel/src/arch/x86_64/kvm"
-]
+trigger_files = ["kernel/src/virt", "kernel/src/arch/x86_64/kvm"]
 
 [autolabel."S-等待审查"]
 new_pr = true
 
 [autolabel."needs-triage"]
 new_issue = true
-exclude_labels = [
-    "A-diagnostics",
-]
+exclude_labels = ["A-diagnostics"]
 
 [shortcut]
 
 [no-merges]
 exclude_titles = ["Rollup of", "subtree update", "Subtree update"]
-labels = ["S-等待作者修改"]
+labels = ["S-等待作者修改", "ambiguous"]
 
 [mentions."triagebot.toml"]
 message = "`triagebot.toml` has been modified, there may have been changes to the review queue."
@@ -133,47 +116,29 @@ users_on_vacation = []
 [assign.adhoc_groups]
 
 # 驱动程序
-driver = [
-    "@fslongjin",
-    "@YJwu2023",
-    "@GnoCiYeH"
-]
+driver = ["@fslongjin", "@YJwu2023", "@GnoCiYeH"]
 
 # 虚拟化
-virtulization = [
-    "@fslongjin",
-    "@ZXXYy"
-]
+virtulization = ["@fslongjin", "@ZXXYy"]
 
-filesystem = [
-    "@fslongjin"
-]
+filesystem = ["@fslongjin"]
 
-riscv64 = [
-    "@fslongjin"
-]
+riscv64 = ["@fslongjin"]
 
-x86_64 = [
-    "@fslongjin",
-    "@GnoCiYeH",
-    "@Chiichen",
-]
+x86_64 = ["@fslongjin", "@GnoCiYeH", "@Chiichen"]
 
 # CI/CD
-infra-ci = [
-    "@fslongjin"
-]
+infra-ci = ["@fslongjin", "@Chiichen"]
 
-bootstrap = [
-    "@fslongjin"
-]
+bootstrap = ["@fslongjin"]
 
 [assign.owners]
-"/.github/workflows" =                                   ["infra-ci"]
-"/kernel/src/driver" =                                   ["driver"]
-"/kernel/src/filesystem" =                               ["filesystem"]
-"/kernel/src/virt" =                                     ["virtulization"]
-"/kernel/src/arch/x86_64/kvm" =                          ["virtulization"]
-"/kernel/src/arch/x86_64"   =                            ["x86_64"]
-"/kernel/src/arch/riscv64"   =                           ["riscv64"]
-
+"/.github/workflows" = ["infra-ci"]
+"/triagebot.toml" = ["infra-ci"]
+"/kernel/src/driver" = ["driver"]
+"/kernel/src/filesystem" = ["filesystem"]
+"/kernel/src/virt" = ["virtulization"]
+"/kernel/src/arch/x86_64/kvm" = ["virtulization"]
+"/kernel/src/arch/x86_64" = ["x86_64"]
+"/kernel/src/arch/riscv64" = ["riscv64"]
+"/tools" = ["bootstrap"]

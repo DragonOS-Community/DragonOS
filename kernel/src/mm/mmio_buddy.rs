@@ -3,7 +3,6 @@ use crate::mm::kernel_mapper::KernelMapper;
 use crate::mm::page::{PAGE_1G_SHIFT, PAGE_4K_SHIFT};
 use crate::process::ProcessManager;
 use crate::{
-    include::bindings::bindings::PAGE_4K_SIZE,
     kdebug,
     mm::{MMArch, MemoryManagementArch},
 };
@@ -14,7 +13,7 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
 use system_error::SystemError;
 
-use super::page::PageFlags;
+use super::page::{PageFlags, PAGE_4K_SIZE};
 use super::{PhysAddr, VirtAddr};
 
 // 最大的伙伴块的幂
@@ -495,7 +494,7 @@ impl MmioBuddyMemPool {
         // 对齐要申请的空间大小
         // 如果要申请的空间大小小于4k，则分配4k
         if size_exp < PAGE_4K_SHIFT as u32 {
-            new_size = PAGE_4K_SIZE as usize;
+            new_size = PAGE_4K_SIZE;
             size_exp = PAGE_4K_SHIFT as u32;
         } else if (new_size & (!(1 << size_exp))) != 0 {
             // 向左对齐空间大小
@@ -677,6 +676,7 @@ impl MMIOSpaceGuard {
         }
 
         let flags = PageFlags::mmio_flags();
+
         let mut kernel_mapper = KernelMapper::lock();
         let r = kernel_mapper.map_phys_with_size(self.vaddr, paddr, length, flags, true);
         return r;

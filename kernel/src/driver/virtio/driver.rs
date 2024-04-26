@@ -25,18 +25,6 @@ use crate::{
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
-use super::virtio::{ETHERNET_SUBCLASS, NETWORK_CLASS};
-
-pub fn virtio_driver_init() -> Result<(), SystemError> {
-    let mut drv = VirtIODriver::new();
-    let mut support_id = PciDeviceID::dummpy();
-    support_id.set_special(PciSpecifiedData::Virtio(VirtioMatchId {
-        subclass: ETHERNET_SUBCLASS,
-        class_code: NETWORK_CLASS,
-    }));
-    drv.add_dynid(support_id)?;
-    pci_driver_manager().register(Arc::new(drv))
-}
 
 #[derive(Debug)]
 #[cast_to([sync] PciDriver)]

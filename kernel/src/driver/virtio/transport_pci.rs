@@ -1,5 +1,5 @@
 //! PCI transport for VirtIO.
-use crate::arch::{PciArch, TraitPciArch};
+
 use crate::driver::base::device::DeviceId;
 use crate::driver::pci::pci::{
     BusDeviceFunction, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,
@@ -7,6 +7,7 @@ use crate::driver::pci::pci::{
 };
 
 use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqMsg, IRQ};
+use crate::driver::pci::root::pci_root_0;
 use crate::driver::virtio::irq::virtio_irq_manager;
 use crate::exception::irqdata::IrqHandlerData;
 use crate::exception::irqdesc::{IrqHandler, IrqReturn};
@@ -31,9 +32,7 @@ use virtio_drivers::{
     Error, Hal, PhysAddr,
 };
 
-/// The PCI vendor ID for VirtIO devices.
-/// PCI Virtio设备的vendor ID
-const VIRTIO_VENDOR_ID: u16 = 0x1af4;
+use super::VIRTIO_VENDOR_ID;
 
 /// The offset to add to a VirtIO device ID to get the corresponding PCI device ID.
 /// PCI Virtio设备的DEVICE_ID 的offset
@@ -169,15 +168,17 @@ impl PciTransport {
                 continue;
             }
             let struct_info = VirtioCapabilityInfo {
-                bar: PciArch::read_config(&bus_device_function, capability.offset + CAP_BAR_OFFSET)
-                    as u8,
-                offset: PciArch::read_config(
-                    &bus_device_function,
-                    capability.offset + CAP_BAR_OFFSET_OFFSET,
+                bar: pci_root_0().read_config(
+                    bus_device_function,
+                    (capability.offset + CAP_BAR_OFFSET).into(),
+                ) as u8,
+                offset: pci_root_0().read_config(
+                    bus_device_function,
+                    (capability.offset + CAP_BAR_OFFSET_OFFSET).into(),
                 ),
-                length: PciArch::read_config(
-                    &bus_device_function,
-                    capability.offset + CAP_LENGTH_OFFSET,
+                length: pci_root_0().read_config(
+                    bus_device_function,
+                    (capability.offset + CAP_LENGTH_OFFSET).into(),
                 ),
             };
 
@@ -187,9 +188,9 @@ impl PciTransport {
                 }
                 VIRTIO_PCI_CAP_NOTIFY_CFG if cap_len >= 20 && notify_cfg.is_none() => {
                     notify_cfg = Some(struct_info);
-                    notify_off_multiplier = PciArch::read_config(
-                        &bus_device_function,
-                        capability.offset + CAP_NOTIFY_OFF_MULTIPLIER_OFFSET,
+                    notify_off_multiplier = pci_root_0().read_config(
+                        bus_device_function,
+                        (capability.offset + CAP_NOTIFY_OFF_MULTIPLIER_OFFSET).into(),
                     );
                 }
                 VIRTIO_PCI_CAP_ISR_CFG if isr_cfg.is_none() => {
@@ -273,10 +274,11 @@ impl Transport for PciTransport {
         }
     }
 
-    fn max_queue_size(&self) -> u32 {
-        // Safe because the common config pointer is valid and we checked in get_bar_region that it
-        // was aligned.
-        unsafe { volread!(self.common_cfg, queue_size) }.into()
+    fn max_queue_size(&mut self, queue: u16) -> u32 {
+        unsafe {
+            volwrite!(self.common_cfg, queue_select, queue);
+            volread!(self.common_cfg, queue_size).into()
+        }
     }
 
     fn notify(&mut self, queue: u16) {
@@ -299,6 +301,12 @@ impl Transport for PciTransport {
         unsafe {
             volwrite!(self.common_cfg, device_status, status.bits() as u8);
         }
+    }
+
+    fn get_status(&self) -> DeviceStatus {
+        // Safe because the common config pointer is valid and we checked in get_bar_region that it
+        // was aligned.
+        unsafe { DeviceStatus::from_bits_truncate(volread!(self.common_cfg, device_status).into()) }
     }
 
     fn set_guest_page_size(&mut self, _guest_page_size: u32) {

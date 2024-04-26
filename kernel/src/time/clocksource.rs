@@ -57,9 +57,11 @@ pub static mut FINISHED_BOOTING: AtomicBool = AtomicBool::new(false);
 
 /// Interval: 0.5sec Threshold: 0.0625s
 /// 系统节拍率
-pub const HZ: u64 = 4;
+pub const HZ: u64 = 250;
+// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/time/clocksource.c#101
 /// watchdog检查间隔
 pub const WATCHDOG_INTERVAL: u64 = HZ >> 1;
+// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/time/clocksource.c#108
 /// 最大能接受的误差大小
 pub const WATCHDOG_THRESHOLD: u32 = NSEC_PER_SEC >> 4;
 

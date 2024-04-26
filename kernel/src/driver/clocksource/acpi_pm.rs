@@ -1,21 +1,25 @@
 use crate::{
     alloc::string::ToString,
     arch::{io::PortIOArch, CurrentPortIOArch},
-    driver::acpi::pmtmr::{ACPI_PM_MASK, PMTMR_TICKS_PER_SEC},
+    driver::acpi::{
+        acpi_manager,
+        pmtmr::{ACPI_PM_MASK, PMTMR_TICKS_PER_SEC},
+    },
     libs::spinlock::SpinLock,
     time::clocksource::{
         Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum,
     },
 };
-use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicU32, Ordering};
-use system_error::SystemError;
-#[cfg(target_arch="riscv64")]
+#[cfg(target_arch = "riscv64")]
 use crate::{
-    arch::riscv64::asm::mach_timer::{mach_prepare_counter,mach_countup,CALIBRATE_LATCH},
+    arch::riscv64::asm::mach_timer::{mach_countup, mach_prepare_counter, CALIBRATE_LATCH},
     time::PIT_TICK_RATE,
 };
-
+use acpi::fadt::Fadt;
+use alloc::sync::{Arc, Weak};
+use core::intrinsics::unlikely;
+use core::sync::atomic::{AtomicU32, Ordering};
+use system_error::SystemError;
 
 // 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/clocksource/acpi_pm.c
 
@@ -29,6 +33,7 @@ fn read_pmtmr() -> u32 {
         & ACPI_PM_MASK as u32;
 }
 
+//参考： https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/clocksource/acpi_pm.c#41
 /// # 读取acpi_pmtmr的值，并进行多次读取以保证获取正确的值
 ///
 /// ## 返回值
@@ -43,7 +48,7 @@ pub fn acpi_pm_read_verified() -> u32 {
         v2 = read_pmtmr();
         let v3 = read_pmtmr();
 
-        if !((v2 > v3 || v1 < v3) && v1 > v2 || v1 < v3 && v2 > v3) {
+        if !(unlikely((v2 > v3 || v1 < v3) && v1 > v2 || v1 < v3 && v2 > v3)) {
             break;
         }
     }
@@ -59,12 +64,10 @@ fn acpi_pm_read() -> u64 {
     return read_pmtmr() as u64;
 }
 
-lazy_static! {
-    pub static ref CLOCKSOURCE_ACPI_PM: Arc<Acpipm> = Acpipm::new();
-}
+pub static mut CLOCKSOURCE_ACPI_PM: Option<Arc<Acpipm>> = None;
 
 pub fn clocksource_acpi_pm() -> Arc<Acpipm> {
-    return CLOCKSOURCE_ACPI_PM.clone();
+    return unsafe { CLOCKSOURCE_ACPI_PM.as_ref().unwrap().clone() };
 }
 
 #[derive(Debug)]
@@ -164,9 +167,37 @@ fn verify_pmtmr_rate() -> i32 {
 const ACPI_PM_MONOTONIC_CHECKS: u32 = 10;
 const ACPI_PM_READ_CHECKS: u32 = 10000;
 
+/// # 解析fadt
+fn acpi_parse_fadt() -> Result<(), SystemError> {
+    let fadt = acpi_manager()
+        .tables()
+        .unwrap()
+        .find_table::<Fadt>()
+        .expect("failed to find FADT table");
+    let pm_timer_block = fadt.pm_timer_block().map_err(|_| SystemError::ENODEV)?;
+    let pm_timer_block = pm_timer_block.ok_or(SystemError::ENODEV)?;
+    let pmtmr_addr = pm_timer_block.address;
+    unsafe {
+        PMTMR_IO_PORT.store(pmtmr_addr as u32, Ordering::SeqCst);
+    }
+    kinfo!("apic_pmtmr I/O port: {}", unsafe {
+        PMTMR_IO_PORT.load(Ordering::SeqCst)
+    });
+
+    return Ok(());
+}
+
 /// # 初始化ACPI PM Timer作为系统时钟源
 // #[unified_init(INITCALL_FS)]
 pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
+    let acpi_pm = Acpipm::new();
+    unsafe {
+        CLOCKSOURCE_ACPI_PM = Some(acpi_pm);
+    }
+
+    // 解析fadt
+    acpi_parse_fadt()?;
+
     // 检查pmtmr_io_port是否被设置
     if unsafe { PMTMR_IO_PORT.load(Ordering::SeqCst) } == 0 {
         return Err(SystemError::ENODEV);

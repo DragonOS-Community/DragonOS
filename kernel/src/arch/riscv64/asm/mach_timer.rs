@@ -1,4 +1,7 @@
-use crate::{arch::{io::PortIOArch, CurrentPortIOArch}, time::PIT_TICK_RATE};
+use crate::{
+    arch::{io::PortIOArch, CurrentPortIOArch},
+    time::PIT_TICK_RATE,
+};
 
 // 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/include/asm/mach_timer.h?fi=mach_prepare_counter
 

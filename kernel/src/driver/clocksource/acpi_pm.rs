@@ -136,9 +136,9 @@ const PMTMR_EXPECTED_RATE: u64 =
 fn verify_pmtmr_rate() -> i32 {
     let mut count: u32 = 0;
 
-    crate::arch::x86_64::mach_timer::mach_prepare_counter();
+    crate::arch::x86_64::asm::mach_timer::mach_prepare_counter();
     let value1 = clocksource_acpi_pm().read().data();
-    crate::arch::x86_64::mach_timer::mach_countup(&mut count);
+    crate::arch::x86_64::asm::mach_timer::mach_countup(&mut count);
     let value2 = clocksource_acpi_pm().read().data();
     let delta = (value2 - value1) & ACPI_PM_MASK;
 

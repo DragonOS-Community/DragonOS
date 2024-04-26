@@ -1,5 +1,3 @@
-#[cfg(target_arch = "x86_64")]
-use crate::arch::x86_64::{asm::mach_timer::CALIBRATE_LATCH, driver::tsc::PIT_TICK_RATE};
 use crate::{
     alloc::string::ToString,
     arch::{io::PortIOArch, CurrentPortIOArch},
@@ -12,6 +10,12 @@ use crate::{
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU32, Ordering};
 use system_error::SystemError;
+#[cfg(target_arch="riscv64")]
+use crate::{
+    arch::riscv64::asm::mach_timer::{mach_prepare_counter,mach_countup,CALIBRATE_LATCH},
+    time::PIT_TICK_RATE,
+};
+
 
 // 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/clocksource/acpi_pm.c
 
@@ -124,7 +128,7 @@ impl Clocksource for Acpipm {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(target_arch = "riscv64")]
 const PMTMR_EXPECTED_RATE: u64 =
     (CALIBRATE_LATCH * (PMTMR_TICKS_PER_SEC >> 10)) / (PIT_TICK_RATE >> 10);
 
@@ -136,9 +140,9 @@ const PMTMR_EXPECTED_RATE: u64 =
 fn verify_pmtmr_rate() -> i32 {
     let mut count: u32 = 0;
 
-    crate::arch::x86_64::asm::mach_timer::mach_prepare_counter();
+    mach_prepare_counter();
     let value1 = clocksource_acpi_pm().read().data();
-    crate::arch::x86_64::asm::mach_timer::mach_countup(&mut count);
+    mach_countup(&mut count);
     let value2 = clocksource_acpi_pm().read().data();
     let delta = (value2 - value1) & ACPI_PM_MASK;
 

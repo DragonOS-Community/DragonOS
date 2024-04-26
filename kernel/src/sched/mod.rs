@@ -5,6 +5,7 @@ pub mod fair;
 pub mod idle;
 pub mod pelt;
 pub mod prio;
+pub mod syscall;
 
 use core::{
     intrinsics::{likely, unlikely},

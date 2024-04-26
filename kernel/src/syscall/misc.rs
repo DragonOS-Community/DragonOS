@@ -42,7 +42,7 @@ impl Syscall {
         sysinfo.uptime = 0;
         sysinfo.loads = [0; 3];
         sysinfo.totalram = mem.total().bytes() as u64;
-        sysinfo.freeram = mem.free().bytes() as u64 + slab_free;
+        sysinfo.freeram = mem.free().bytes() as u64 + slab_free.free;
         sysinfo.sharedram = 0;
         sysinfo.bufferram = 0;
         sysinfo.totalswap = 0;

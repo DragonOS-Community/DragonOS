@@ -125,7 +125,7 @@ impl<'a> ZoneAllocator<'a> {
     }
 
     /// 获取scallocator中的还未被分配的空间
-    pub fn usage(&mut self) -> u64 {
+    pub fn free_space(&mut self) -> u64 {
         // 记录空闲空间
         let mut free = 0;
         // scallocator的数量

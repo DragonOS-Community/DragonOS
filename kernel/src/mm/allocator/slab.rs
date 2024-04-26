@@ -63,15 +63,6 @@ impl SlabAllocator {
     }
 }
 
-/// 获取slab中的空闲空间
-pub unsafe fn slab_free_space() -> u64 {
-    if let Some(ref mut slab) = SLABALLOCATOR {
-        slab.zone.usage()
-    } else {
-        return 0;
-    }
-}
-
 /// 初始化slab分配器
 pub unsafe fn slab_init() {
     kdebug!("trying to init a slab_allocator");
@@ -82,4 +73,26 @@ pub unsafe fn slab_init() {
 // 查看slab初始化状态
 pub fn slab_init_state() -> bool {
     unsafe { *SLABINITSTATE.get_mut() }
+}
+
+/// slab空闲空间
+pub struct SlabFreeSpace {
+    pub free: u64,
+}
+
+impl SlabFreeSpace {
+    /// @brief: 初始化SlabFreeSpace
+    /// @param u64 free slab中空闲的bytes数
+    pub fn new(free: u64) -> SlabFreeSpace {
+        return Self { free };
+    }
+}
+
+/// 获取slab中的空闲空间
+pub unsafe fn slab_free_space() -> SlabFreeSpace {
+    if let Some(ref mut slab) = SLABALLOCATOR {
+        SlabFreeSpace::new(slab.zone.free_space())
+    } else {
+        SlabFreeSpace::new(0)
+    }
 }

@@ -64,11 +64,11 @@ impl SlabAllocator {
 }
 
 /// 获取slab中的空闲空间
-pub unsafe fn slab_usage() -> u64 {
+pub unsafe fn slab_free_space() -> u64 {
     if let Some(ref mut slab) = SLABALLOCATOR {
         slab.zone.usage()
     } else {
-        panic!("slab hasn't been initialized")
+        return 0;
     }
 }
 

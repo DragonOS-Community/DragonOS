@@ -59,7 +59,7 @@ impl<'a> ZoneAllocator<'a> {
     pub const MAX_BASE_ALLOC_SIZE: usize = 1 << 11;
 
     /// How many allocators of type SCAllocator<ObjectPage> we have.
-    const MAX_BASE_SIZE_CLASSES: usize = 9;
+    pub const MAX_BASE_SIZE_CLASSES: usize = 9;
 
     #[cfg(feature = "unstable")]
     pub const fn new() -> ZoneAllocator<'a> {
@@ -132,7 +132,7 @@ impl<'a> ZoneAllocator<'a> {
         let mut count = 0;
 
         // 遍历所有scallocator
-        while count < 9 {
+        while count < ZoneAllocator::MAX_BASE_SIZE_CLASSES {
             // 获取scallocator
             let scallocator = &mut self.small_slabs[count];
             // 遍历scallocator中的部分分配的page(partial_page)

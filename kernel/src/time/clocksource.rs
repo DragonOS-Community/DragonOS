@@ -63,7 +63,7 @@ pub const WATCHDOG_INTERVAL: u64 = HZ >> 1;
 /// 最大能接受的误差大小
 pub const WATCHDOG_THRESHOLD: u32 = NSEC_PER_SEC >> 4;
 
-pub const MAX_SKEW_USEC:u64 = 125 * WATCHDOG_INTERVAL / HZ;
+pub const MAX_SKEW_USEC: u64 = 125 * WATCHDOG_INTERVAL / HZ;
 pub const WATCHDOG_MAX_SKEW: u32 = MAX_SKEW_USEC as u32 * NSEC_PER_USEC;
 
 // 时钟周期数
@@ -281,12 +281,12 @@ impl dyn Clocksource {
     }
 
     /// # 计算时钟源的mult和shift，以便将一个时钟源的频率转换为另一个时钟源的频率
-    fn clocks_calc_mult_shift(&self, from:u32, to:u32, maxsec:u32) -> Result<(), SystemError>{
-        let mut sftacc:u32 = 32;
+    fn clocks_calc_mult_shift(&self, from: u32, to: u32, maxsec: u32) -> Result<(), SystemError> {
+        let mut sftacc: u32 = 32;
         let mut sft = 1;
-        
+
         // 计算限制转换范围的shift
-        let mut tmp = (maxsec*from) as u64 >> 32;
+        let mut tmp = (maxsec * from) as u64 >> 32;
         while tmp != 0 {
             tmp >>= 1;
             sftacc -= 1;
@@ -295,7 +295,7 @@ impl dyn Clocksource {
         // 找到最佳的mult和shift
         for i in (1..=32).rev() {
             sft = i;
-            tmp = (to as u64)  << sft;
+            tmp = (to as u64) << sft;
             tmp += from as u64 / 2;
             tmp /= from as u64;
             if (tmp >> sftacc) == 0 {
@@ -309,23 +309,23 @@ impl dyn Clocksource {
         self.update_clocksource_data(cs_data)?;
 
         return Ok(());
-    } 
+    }
 
     /// # 计算时钟源可以进行的最大调整量
     fn clocksource_max_adjustment(&self) -> u32 {
         let cs_data = self.clocksource_data();
         let ret = cs_data.mult * 11 / 100;
-        
+
         return ret;
     }
 
     /// # 更新时钟源频率，初始化mult/shift 和 max_idle_ns
-    fn clocksource_update_freq_scale(&self, scale: u32, freq: u32) -> Result<(), SystemError>{
+    fn clocksource_update_freq_scale(&self, scale: u32, freq: u32) -> Result<(), SystemError> {
         let mut cs_data = self.clocksource_data();
-        
+
         if freq != 0 {
-            let mut sec:u64 = cs_data.mask.bits();
-            
+            let mut sec: u64 = cs_data.mask.bits();
+
             sec /= freq as u64;
             sec /= scale as u64;
             if sec == 0 {
@@ -338,7 +338,7 @@ impl dyn Clocksource {
         }
 
         if scale != 0 && freq != 0 && cs_data.uncertainty_margin == 0 {
-            cs_data.set_uncertainty_margin(NSEC_PER_SEC / (scale*freq));
+            cs_data.set_uncertainty_margin(NSEC_PER_SEC / (scale * freq));
             if cs_data.uncertainty_margin < 2 * WATCHDOG_MAX_SKEW {
                 cs_data.set_uncertainty_margin(2 * WATCHDOG_MAX_SKEW);
             }
@@ -358,9 +358,9 @@ impl dyn Clocksource {
     }
 
     /// # 注册时钟源
-    /// 
+    ///
     /// ## 参数
-    /// 
+    ///
     /// - scale: 如果freq单位为0或hz，此值为1，如果为khz,此值为1000
     /// - freq: 时钟源的频率，jiffies注册时此值为0
     ///
@@ -654,13 +654,14 @@ pub struct ClocksourceData {
     pub flags: ClocksourceFlags,
     pub watchdog_last: CycleNum,
     // 用于描述时钟源的不确定性边界，时钟源读取的时间可能存在的不确定性和误差范围
-    pub uncertainty_margin:u32, 
+    pub uncertainty_margin: u32,
     // 最大的时间调整量
-    pub maxadj:u32,
+    pub maxadj: u32,
 }
 
 impl ClocksourceData {
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
         rating: i32,
@@ -669,8 +670,8 @@ impl ClocksourceData {
         shift: u32,
         max_idle_ns: u32,
         flags: ClocksourceFlags,
-        uncertainty_margin:u32,
-        maxadj:u32,
+        uncertainty_margin: u32,
+        maxadj: u32,
     ) -> Self {
         let csd = ClocksourceData {
             name,
@@ -831,8 +832,8 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
         if cs_dev_nsec.abs_diff(wd_dev_nsec) > WATCHDOG_THRESHOLD.into() {
             // kdebug!("set_unstable");
             // 误差过大，标记为unstable
-            kinfo!("cs_dev_nsec = {}",cs_dev_nsec);
-            kinfo!("wd_dev_nsec = {}",wd_dev_nsec);
+            kinfo!("cs_dev_nsec = {}", cs_dev_nsec);
+            kinfo!("wd_dev_nsec = {}", wd_dev_nsec);
             cs.set_unstable((cs_dev_nsec - wd_dev_nsec).try_into().unwrap())?;
             continue;
         }

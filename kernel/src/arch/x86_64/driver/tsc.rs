@@ -1,6 +1,6 @@
 use crate::{
     arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch, CurrentTimeArch},
-    driver::acpi::pmtmr::{ACPI_PM_OVERRUN, PMTMR_TICKS_PER_SEC, acpi_pm_read_early},
+    driver::acpi::pmtmr::{acpi_pm_read_early, ACPI_PM_OVERRUN, PMTMR_TICKS_PER_SEC},
     exception::InterruptArch,
     kdebug, kerror, kinfo, kwarn,
     time::TimeArch,
@@ -11,7 +11,7 @@ use core::{
 };
 use system_error::SystemError;
 
-use super::hpet::{hpet_instance,is_hpet_enabled};
+use super::hpet::{hpet_instance, is_hpet_enabled};
 
 /// The clock frequency of the i8253/i8254 PIT
 pub const PIT_TICK_RATE: u64 = 1193182;

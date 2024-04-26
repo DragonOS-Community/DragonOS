@@ -1,37 +1,38 @@
 use crate::{
-    alloc::string::ToString, 
+    alloc::string::ToString,
     arch::{
-        io::PortIOArch, 
-        CurrentPortIOArch,x86_64::{
-            driver::tsc::PIT_TICK_RATE, 
-            asm::mach_timer::CALIBRATE_LATCH,
-        }
-    }, 
+        io::PortIOArch,
+        x86_64::{asm::mach_timer::CALIBRATE_LATCH, driver::tsc::PIT_TICK_RATE},
+        CurrentPortIOArch,
+    },
+    driver::acpi::pmtmr::{ACPI_PM_MASK, PMTMR_TICKS_PER_SEC},
     libs::spinlock::SpinLock,
-    time::clocksource::{Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum},
-    driver::acpi::pmtmr::{PMTMR_TICKS_PER_SEC,ACPI_PM_MASK}, 
+    time::clocksource::{
+        Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum,
+    },
 };
-use system_error::SystemError;
-use core::sync::atomic::{AtomicU32,Ordering};
 use alloc::sync::{Arc, Weak};
+use core::sync::atomic::{AtomicU32, Ordering};
+use system_error::SystemError;
 
 // 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/clocksource/acpi_pm.c
 
 /// acpi_pmtmr所在的I/O端口
-pub static mut PMTMR_IO_PORT:AtomicU32 = AtomicU32::new(0);
+pub static mut PMTMR_IO_PORT: AtomicU32 = AtomicU32::new(0);
 
 /// # 读取acpi_pmtmr当前值，并对齐进行掩码操作
 #[inline(always)]
 fn read_pmtmr() -> u32 {
-    return unsafe{ CurrentPortIOArch::in32(PMTMR_IO_PORT.load(Ordering::SeqCst) as u16)} & ACPI_PM_MASK as u32;
+    return unsafe { CurrentPortIOArch::in32(PMTMR_IO_PORT.load(Ordering::SeqCst) as u16) }
+        & ACPI_PM_MASK as u32;
 }
 
 /// # 读取acpi_pmtmr的值，并进行多次读取以保证获取正确的值
-/// 
+///
 /// ## 返回值
 /// - u32: 读取到的acpi_pmtmr值
 pub fn acpi_pm_read_verified() -> u32 {
-    let mut v2:u32;
+    let mut v2: u32;
 
     // 因为某些损坏芯片组（如ICH4、PIIX4和PIIX4E）可能导致APCI PM时钟源未锁存
     // 因此需要多次读取以保证获取正确的值
@@ -40,7 +41,7 @@ pub fn acpi_pm_read_verified() -> u32 {
         v2 = read_pmtmr();
         let v3 = read_pmtmr();
 
-        if !(v1 > v2 && v1 < v3) && !(v2 > v3 && v2 < v1) && !(v3 > v1 && v3 < v2) {
+        if !((v2 > v3 || v1 < v3) && v1 > v2 || v1 < v3 && v2 > v3) {
             break;
         }
     }
@@ -49,7 +50,7 @@ pub fn acpi_pm_read_verified() -> u32 {
 }
 
 /// # 作为时钟源的读取函数
-/// 
+///
 /// ## 返回值
 /// - u64: acpi_pmtmr的当前值
 fn acpi_pm_read() -> u64 {
@@ -101,7 +102,7 @@ impl Clocksource for Acpipm {
     fn read(&self) -> CycleNum {
         return CycleNum::new(acpi_pm_read());
     }
-    
+
     fn clocksource_data(&self) -> ClocksourceData {
         let inner = self.0.lock_irqsave();
         return inner.data.clone();
@@ -111,7 +112,7 @@ impl Clocksource for Acpipm {
         return self.0.lock_irqsave().self_reaf.upgrade().unwrap();
     }
 
-    fn update_clocksource_data(&self, _data: ClocksourceData) -> Result<(), SystemError>{
+    fn update_clocksource_data(&self, _data: ClocksourceData) -> Result<(), SystemError> {
         let d = &mut self.0.lock_irqsave().data;
         d.set_flags(_data.flags);
         d.set_mask(_data.mask);
@@ -126,24 +127,28 @@ impl Clocksource for Acpipm {
 }
 
 #[allow(dead_code)]
-const PMTMR_EXPECTED_RATE:u64 = (CALIBRATE_LATCH*(PMTMR_TICKS_PER_SEC>>10))/(PIT_TICK_RATE>>10);
+const PMTMR_EXPECTED_RATE: u64 =
+    (CALIBRATE_LATCH * (PMTMR_TICKS_PER_SEC >> 10)) / (PIT_TICK_RATE >> 10);
 
 /// # 验证ACPI PM Timer的运行速率是否在预期范围内(在x86_64架构以外的情况下验证)
-/// 
+///
 /// ## 返回值
 /// - i32：如果为0则表示在预期范围内，否则不在
 #[cfg(target_arch = "riscv64")]
 fn verify_pmtmr_rate() -> i32 {
-    let mut count:u32      = 0;
+    let mut count: u32 = 0;
 
-    crate::asm::mach_timer::mach_prepare_counter();
+    crate::asm::riscv64::mach_timer::mach_prepare_counter();
     let value1 = clocksource_acpi_pm().read().data();
-    crate::asm::mach_timer::mach_countup(&mut count);
+    crate::asm::riscv64::mach_timer::mach_countup(&mut count);
     let value2 = clocksource_acpi_pm().read().data();
     let delta = (value2 - value1) & ACPI_PM_MASK;
 
-    if (delta < (PMTMR_EXPECTED_RATE*19)/20) || (delta > (PMTMR_EXPECTED_RATE*21)/20) {
-        kinfo!("PM Timer running at invalid rate: {}", 100*delta/PMTMR_EXPECTED_RATE);
+    if (delta < (PMTMR_EXPECTED_RATE * 19) / 20) || (delta > (PMTMR_EXPECTED_RATE * 21) / 20) {
+        kinfo!(
+            "PM Timer running at invalid rate: {}",
+            100 * delta / PMTMR_EXPECTED_RATE
+        );
         return -1;
     }
 
@@ -155,7 +160,7 @@ fn verify_pmtmr_rate() -> i32 {
 }
 
 const ACPI_PM_MONOTONIC_CHECKS: u32 = 10;
-const ACPI_PM_READ_CHECKS:u32 = 10000;
+const ACPI_PM_READ_CHECKS: u32 = 10000;
 
 /// # 初始化ACPI PM Timer作为系统时钟源
 // #[unified_init(INITCALL_FS)]
@@ -167,7 +172,7 @@ pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
 
     // 验证ACPI PM Timer作为时钟源的稳定性和一致性
     for j in 0..ACPI_PM_MONOTONIC_CHECKS {
-        let mut cnt = 100*j;
+        let mut cnt = 100 * j;
         while cnt > 0 {
             cnt -= 1;
         }
@@ -187,14 +192,14 @@ pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
                 break;
             }
             kinfo!("PM Timer had inconsistens results: {} {}", value1, value2);
-            unsafe { 
+            unsafe {
                 PMTMR_IO_PORT.store(0, Ordering::SeqCst);
             }
             return Err(SystemError::EINVAL);
         }
         if i == ACPI_PM_READ_CHECKS {
             kinfo!("PM Timer failed consistency check: {}", value1);
-            unsafe { 
+            unsafe {
                 PMTMR_IO_PORT.store(0, Ordering::SeqCst);
             }
             return Err(SystemError::EINVAL);
@@ -212,7 +217,8 @@ pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
     // 没有实现clocksource_selecet_watchdog函数，所以这里设置为false
     let tsc_clocksource_watchdog_disabled = false;
     if tsc_clocksource_watchdog_disabled {
-        clocksource_acpi_pm().0.lock_irqsave().data.flags |= ClocksourceFlags::CLOCK_SOURCE_MUST_VERIFY;
+        clocksource_acpi_pm().0.lock_irqsave().data.flags |=
+            ClocksourceFlags::CLOCK_SOURCE_MUST_VERIFY;
     }
 
     // 注册ACPI PM Timer
@@ -221,7 +227,7 @@ pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
         Ok(_) => {
             kinfo!("ACPI PM Timer registered as clocksource sccessfully");
             return Ok(());
-        },
+        }
         Err(_) => {
             kinfo!("ACPI PM Timer init registered failed");
             return Err(SystemError::ENOSYS);

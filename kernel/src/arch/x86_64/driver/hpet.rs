@@ -262,9 +262,8 @@ impl Hpet {
 }
 
 pub fn hpet_init() -> Result<(), SystemError> {
-    let hpet_info = HpetInfo::new(acpi_manager().tables().unwrap()).map_err(|_| {
-        SystemError::ENODEV
-    })?;
+    let hpet_info =
+        HpetInfo::new(acpi_manager().tables().unwrap()).map_err(|_| SystemError::ENODEV)?;
 
     let hpet_instance = Hpet::new(hpet_info)?;
     unsafe {

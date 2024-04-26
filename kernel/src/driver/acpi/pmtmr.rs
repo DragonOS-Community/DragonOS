@@ -1,4 +1,4 @@
-use crate::driver::clocksource::acpi_pm::{PMTMR_IO_PORT, acpi_pm_read_verified};
+use crate::driver::clocksource::acpi_pm::{acpi_pm_read_verified, PMTMR_IO_PORT};
 use core::sync::atomic::Ordering;
 
 pub const ACPI_PM_OVERRUN: u64 = 1 << 24;
@@ -7,7 +7,7 @@ pub const ACPI_PM_OVERRUN: u64 = 1 << 24;
 pub const PMTMR_TICKS_PER_SEC: u64 = 3579545;
 
 /// 用于掩码ACPI_PM_READ_ERALY返回值的前24位
-pub const ACPI_PM_MASK:u64 = 0xffffff;
+pub const ACPI_PM_MASK: u64 = 0xffffff;
 
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]

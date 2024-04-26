@@ -1,6 +1,6 @@
 use crate::{
     driver::open_firmware::fdt::open_firmware_fdt_driver,
-    kinfo,
+    kdebug, kinfo,
     time::{clocksource::HZ, TimeArch},
 };
 pub struct RiscV64TimeArch;
@@ -14,10 +14,12 @@ static mut TIME_FREQ: usize = 0;
 ///
 /// todo: 支持从acpi中获取
 fn init_time_freq() {
+    kdebug!("init_time_freq: init");
     let fdt = open_firmware_fdt_driver().fdt_ref();
     if fdt.is_err() {
         panic!("init_time_freq: failed to get fdt");
     }
+    kdebug!("init_time_freq: get fdt");
     let fdt = fdt.unwrap();
     let cpu_node = fdt.find_node("/cpus");
     if cpu_node.is_none() {

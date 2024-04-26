@@ -15,7 +15,7 @@ impl ProcessManager {
                 spin_loop();
             }
 
-            kdebug!("idle loop");
+            // kdebug!("idle loop");
         }
     }
 }

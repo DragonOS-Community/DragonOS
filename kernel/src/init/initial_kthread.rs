@@ -61,8 +61,9 @@ fn kenrel_init_freeable() -> Result<(), SystemError> {
 
 /// 切换到用户态
 fn switch_to_user() {
-    let path = String::from("/bin/dragonreach");
-    let argv = vec![String::from("/bin/dragonreach")];
+    const INIT_PROGRAM: &str = "/bin/dragonreach";
+    let path = String::from(INIT_PROGRAM);
+    let argv = vec![path.clone()];
     let envp = vec![String::from("PATH=/")];
 
     unsafe { arch_switch_to_user(path, argv, envp) };

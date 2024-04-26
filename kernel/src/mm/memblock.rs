@@ -352,6 +352,11 @@ impl MemBlockManager {
         return self.set_or_clear_flags(base, size, true, MemoryAreaAttr::NOMAP);
     }
 
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/mm/memblock.c?fi=memblock_mark_mirror#940
+    pub fn mark_mirror(&self, base: PhysAddr, size: usize) -> Result<(), SystemError> {
+        return self.set_or_clear_flags(base, size, true, MemoryAreaAttr::MIRROR);
+    }
+
     fn set_or_clear_flags(
         &self,
         mut base: PhysAddr,

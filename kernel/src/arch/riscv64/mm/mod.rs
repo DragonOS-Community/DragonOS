@@ -105,7 +105,9 @@ impl MemoryManagementArch for RiscV64MMArch {
 
     const ENTRY_FLAG_PRESENT: usize = 1 << 0;
 
-    const ENTRY_FLAG_READONLY: usize = 0;
+    const ENTRY_FLAG_READONLY: usize = (1 << 1);
+
+    const ENTRY_FLAG_WRITEABLE: usize = (1 << 2);
 
     const ENTRY_FLAG_READWRITE: usize = (1 << 2) | (1 << 1);
 

@@ -34,11 +34,11 @@ impl RiscVSbiTimer {
 
     fn handle_irq(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
         // 更新下一次中断时间
-        kdebug!(
-            "riscv_sbi_timer: handle_irq: cpu_id: {}, time: {}",
-            smp_get_processor_id().data(),
-            CurrentTimeArch::get_cycles() as u64
-        );
+        // kdebug!(
+        //     "riscv_sbi_timer: handle_irq: cpu_id: {}, time: {}",
+        //     smp_get_processor_id().data(),
+        //     CurrentTimeArch::get_cycles() as u64
+        // );
         sbi_rt::set_timer(CurrentTimeArch::get_cycles() as u64 + unsafe { INTERVAL_CNT } as u64);
         ProcessManager::update_process_times(trap_frame.is_from_user());
         Ok(())

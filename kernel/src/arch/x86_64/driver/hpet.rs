@@ -44,6 +44,14 @@ pub fn hpet_instance() -> &'static Hpet {
     unsafe { HPET_INSTANCE.as_ref().unwrap() }
 }
 
+#[inline(always)]
+pub fn is_hpet_enabled() -> bool {
+    if unsafe { HPET_INSTANCE.as_ref().is_some() } {
+        return unsafe { HPET_INSTANCE.as_ref().unwrap().enabled() };
+    }
+    return false;
+}
+
 pub struct Hpet {
     info: HpetInfo,
     _mmio_guard: MMIOSpaceGuard,
@@ -254,8 +262,7 @@ impl Hpet {
 }
 
 pub fn hpet_init() -> Result<(), SystemError> {
-    let hpet_info = HpetInfo::new(acpi_manager().tables().unwrap()).map_err(|e| {
-        kerror!("Failed to get HPET info: {:?}", e);
+    let hpet_info = HpetInfo::new(acpi_manager().tables().unwrap()).map_err(|_| {
         SystemError::ENODEV
     })?;
 

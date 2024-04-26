@@ -1,6 +1,6 @@
 use crate::{
     arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch, CurrentTimeArch},
-    driver::acpi::pmtmr::{ACPI_PM_OVERRUN, PMTMR_TICKS_PER_SEC},
+    driver::acpi::pmtmr::{ACPI_PM_OVERRUN, PMTMR_TICKS_PER_SEC, acpi_pm_read_early},
     exception::InterruptArch,
     kdebug, kerror, kinfo, kwarn,
     time::TimeArch,
@@ -11,10 +11,10 @@ use core::{
 };
 use system_error::SystemError;
 
-use super::hpet::hpet_instance;
+use super::hpet::{hpet_instance,is_hpet_enabled};
 
 /// The clock frequency of the i8253/i8254 PIT
-const PIT_TICK_RATE: u64 = 1193182;
+pub const PIT_TICK_RATE: u64 = 1193182;
 
 #[derive(Debug)]
 pub struct TSCManager;
@@ -104,7 +104,7 @@ impl TSCManager {
     ///
     /// 使用pit、hpet、ptimer来测量CPU总线的频率
     fn calibrate_cpu_by_pit_hpet_ptimer() -> Result<u64, SystemError> {
-        let hpet = hpet_instance().enabled();
+        let hpet = is_hpet_enabled();
         kdebug!(
             "Calibrating TSC with {}",
             if hpet { "HPET" } else { "PMTIMER" }
@@ -321,7 +321,7 @@ impl TSCManager {
             if hpet_enabled {
                 ref_ret = hpet_instance().main_counter_value();
             } else {
-                todo!("read pmtimer")
+                ref_ret = acpi_pm_read_early() as u64;
             }
             let t2 = CurrentTimeArch::get_cycles() as u64;
             if (t2 - t1) < thresh {

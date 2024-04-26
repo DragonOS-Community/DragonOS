@@ -1,10 +1,18 @@
 use system_error::SystemError;
-
-use crate::{driver::acpi::acpi_manager, kinfo, mm::percpu::PerCpu, smp::cpu::ProcessorId};
-
+use crate::{
+    driver::{ acpi::acpi_manager, clocksource::acpi_pm::PMTMR_IO_PORT},
+    kinfo,
+    mm::percpu::PerCpu,
+    smp::cpu::ProcessorId,
+};
+use acpi::fadt::Fadt;
+use core::sync::atomic::Ordering;
 use super::smp::SMP_BOOT_DATA;
 
 pub(super) fn early_acpi_boot_init() -> Result<(), SystemError> {
+    // 解析fadt
+    acpi_parse_fadt()?;
+
     // 在这里解析madt，初始化smp boot data
 
     let platform_info = acpi_manager().platform_info().ok_or(SystemError::ENODEV)?;
@@ -32,5 +40,22 @@ pub(super) fn early_acpi_boot_init() -> Result<(), SystemError> {
     );
 
     // todo!("early_acpi_boot_init")
+    return Ok(());
+}
+
+/// # 解析fadt
+fn acpi_parse_fadt() -> Result<(), SystemError>{
+    // TODO：前面还有一些解析fadt的操作
+    let fadt = acpi_manager().tables().unwrap().find_table::<Fadt>().expect("failed to find FADT table");
+    let pm_timer_block = fadt.pm_timer_block().map_err(|_|{
+        SystemError::ENODEV
+    })?;
+    let pm_timer_block = pm_timer_block.ok_or(SystemError::ENODEV)?;
+    let pmtmr_addr = pm_timer_block.address;
+    unsafe {
+        PMTMR_IO_PORT.store(pmtmr_addr as u32, Ordering::SeqCst);
+    }
+    kinfo!("apic_pmtmr I/O port: {}", unsafe { PMTMR_IO_PORT.load(Ordering::SeqCst) });
+    
     return Ok(());
 }

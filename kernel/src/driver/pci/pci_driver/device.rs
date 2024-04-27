@@ -6,14 +6,12 @@ use system_error::SystemError;
 
 use crate::{
     driver::base::{
-        device::{
+        class::Class, device::{
             bus::{Bus, BusState},
             device_manager,
             driver::Driver,
             Device, DevicePrivateData, DeviceType, IdTable,
-        },
-        kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
-        kset::KSet,
+        }, kobject::{KObjType, KObject, KObjectState, LockedKObjectState}, kset::KSet
     },
     filesystem::kernfs::KernFSInode,
     libs::{rwlock::RwLockWriteGuard, spinlock::SpinLock},
@@ -207,5 +205,49 @@ impl Device for PciBusDevice {
 
     fn state_synced(&self) -> bool {
         todo!()
+    }
+}
+
+
+#[derive(Debug)]
+pub struct InnerPciDevice {
+    bus: Option<Weak<dyn Bus>>,
+    pub name: Option<String>,
+    pub class: Option<Weak<dyn Class>>,
+    pub driver: Option<Weak<dyn Driver>>,
+    pub kern_inode: Option<Arc<KernFSInode>>,
+    pub parent: Option<Weak<dyn KObject>>,
+    pub kset: Option<Arc<KSet>>,
+    pub kobj_type: Option<&'static dyn KObjType>,
+}
+
+impl InnerPciDevice {
+    pub fn default() -> Self {
+        Self {
+            bus: None,
+            class: None,
+            name: None,
+            driver: None,
+            kern_inode: None,
+            parent: None,
+            kset: None,
+            kobj_type: None,
+        }
+    }
+
+    pub fn bus(&self) -> Option<Weak<dyn Bus>> {
+        self.bus.clone()
+    }
+
+    pub fn set_bus(&mut self, bus: Option<Weak<dyn Bus>>) {
+        self.bus = bus
+    }
+
+    pub fn set_class(&mut self, class: Option<Weak<dyn Class>>) {
+        self.class = class
+    }
+
+    pub fn set_driver(&mut self, driver: Option<Weak<dyn Driver>>) {
+        self.driver = driver
     }
 }

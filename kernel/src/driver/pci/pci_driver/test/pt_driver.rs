@@ -11,7 +11,7 @@ use crate::{
             kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        pci::pci_driver::{dev_id::PciDeviceID, device::PciDevice, driver::PciDriver},
+        pci::pci_driver::{dev_id::PciDeviceID, device::PciDevice, driver::{InnerPciDriver, PciDriver}},
     },
     filesystem::kernfs::KernFSInode,
     libs::{
@@ -36,7 +36,6 @@ impl TestDriver {
                 kernfs_inode: None,
                 devices: Vec::new(),
                 bus: None,
-                self_ref: Weak::new(),
                 locked_dynid_list: Vec::new(),
             }),
 
@@ -170,25 +169,4 @@ impl KObject for TestDriver {
         *self.kobj_state.write() = state;
     }
 }
-#[derive(Debug)]
-pub struct InnerPciDriver {
-    pub ktype: Option<&'static dyn KObjType>,
-    pub kset: Option<Arc<KSet>>,
-    pub parent: Option<Weak<dyn KObject>>,
-    pub kernfs_inode: Option<Arc<KernFSInode>>,
-    pub devices: Vec<Arc<dyn Device>>,
-    pub bus: Option<Weak<dyn Bus>>,
-    pub self_ref: Weak<TestDriver>,
-    pub locked_dynid_list: Vec<Arc<PciDeviceID>>,
-}
 
-impl InnerPciDriver {
-    pub fn id_list(&self) -> &Vec<Arc<PciDeviceID>> {
-        &self.locked_dynid_list
-    }
-
-    pub fn insert_id(&mut self, id: PciDeviceID) {
-        let arc = Arc::new(id);
-        self.locked_dynid_list.push(arc);
-    }
-}

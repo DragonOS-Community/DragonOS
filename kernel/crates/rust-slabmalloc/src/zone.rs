@@ -218,18 +218,18 @@ pub struct SlabUsage {
 impl SlabUsage {
     /// 初始化SlabUsage
     pub fn new(total: u64, free: u64) -> Self {
-        return Self { total, free };
+        Self { total, free }
     }
 
     pub fn total(&self) -> u64 {
-        return self.total;
+        self.total
     }
 
     pub fn used(&self) -> u64 {
-        return self.total - self.free;
+        self.total - self.free
     }
 
     pub fn free(&self) -> u64 {
-        return self.free;
+        self.free
     }
 }

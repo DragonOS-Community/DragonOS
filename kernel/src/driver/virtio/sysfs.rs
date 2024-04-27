@@ -164,7 +164,7 @@ impl VirtIODeviceManager {
 
         let virtio_drv = drv.cast::<dyn VirtIODriver>().map_err(|_| {
             kerror!(
-                "VirtIODeviceManager::device_add() faiFled: device.driver() is not a VirtioDriver. Device: '{:?}'",
+                "VirtIODeviceManager::device_add() failed: device.driver() is not a VirtioDriver. Device: '{:?}'",
                 dev.name()
             );
             SystemError::EINVAL

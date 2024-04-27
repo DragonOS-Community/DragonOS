@@ -6,11 +6,14 @@ use intertrait::cast::CastArc;
 use system_error::SystemError;
 
 use crate::{
-    driver::base::{device::bus::Bus, subsys::SubSysPrivate},
+    driver::base::{device::{bus::Bus, driver::Driver, Device}, subsys::SubSysPrivate},
     filesystem::sysfs::AttributeGroup,
 };
 
 use super::{device::PciDevice, driver::PciDriver};
+/// # 结构功能
+/// 该结构为Pci总线，由于总线也属于设备，故设此结构；
+/// 此结构对应/sys/bus/pci
 #[derive(Debug)]
 pub struct PciBus {
     private: SubSysPrivate,
@@ -44,7 +47,7 @@ impl Bus for PciBus {
 
     fn probe(
         &self,
-        device: &Arc<dyn crate::driver::base::device::Device>,
+        device: &Arc<dyn Device>,
     ) -> Result<(), SystemError> {
         let drv = device.driver().ok_or(SystemError::EINVAL)?;
         let pci_drv = drv.cast::<dyn PciDriver>().map_err(|_| {
@@ -68,37 +71,40 @@ impl Bus for PciBus {
 
     fn remove(
         &self,
-        _device: &Arc<dyn crate::driver::base::device::Device>,
-    ) -> Result<(), system_error::SystemError> {
+        _device: &Arc<dyn Device>,
+    ) -> Result<(), SystemError> {
         todo!()
     }
 
-    fn sync_state(&self, _device: &Arc<dyn crate::driver::base::device::Device>) {
+    fn sync_state(&self, _device: &Arc<dyn Device>) {
         todo!()
     }
 
-    fn shutdown(&self, _device: &Arc<dyn crate::driver::base::device::Device>) {
+    fn shutdown(&self, _device: &Arc<dyn Device>) {
         todo!()
     }
 
     fn resume(
         &self,
-        _device: &Arc<dyn crate::driver::base::device::Device>,
-    ) -> Result<(), system_error::SystemError> {
+        _device: &Arc<dyn Device>,
+    ) -> Result<(), SystemError> {
         todo!()
     }
 
     fn match_device(
         &self,
-        device: &Arc<dyn crate::driver::base::device::Device>,
-        driver: &Arc<dyn crate::driver::base::device::driver::Driver>,
+        device: &Arc<dyn Device>,
+        driver: &Arc<dyn Driver>,
     ) -> Result<bool, SystemError> {
+        //首先将设备和驱动映射为pci设备和pci驱动
         let pci_driver = driver.clone().cast::<dyn PciDriver>().map_err(|_| {
             return SystemError::EINVAL;
         })?;
         let pci_dev = device.clone().cast::<dyn PciDevice>().map_err(|_| {
             return SystemError::EINVAL;
         })?;
+        //pci_driver需要实现一个match_dev函数，即driver需要识别是否支持给定的pci设备
+        //这是主要的match方式
         if pci_driver.match_dev(&pci_dev).is_some() {
             return Ok(true);
         }

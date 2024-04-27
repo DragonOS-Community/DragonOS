@@ -1,15 +1,30 @@
-use alloc::{sync::{Arc, Weak}, vec::Vec};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use system_error::SystemError;
 
-use crate::{driver::base::{device::{
-    bus::Bus,
-    driver::{driver_manager, Driver}, Device,
-}, kobject::{KObjType, KObject}, kset::KSet}, filesystem::kernfs::KernFSInode};
+use crate::{
+    driver::base::{
+        device::{
+            bus::Bus,
+            driver::{driver_manager, Driver},
+            Device,
+        },
+        kobject::{KObjType, KObject},
+        kset::KSet,
+    },
+    filesystem::kernfs::KernFSInode,
+};
 
 use super::{dev_id::PciDeviceID, device::PciDevice, pci_bus};
 
+/// # trait功能
+/// Pci驱动应该实现的trait
 pub trait PciDriver: Driver {
     //https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/net/wireless/realtek/rtw88/pci.c?fi=rtw_pci_probe#1731是一个实例
+    /// # 函数的功能
+    /// 
     fn probe(&self, device: &Arc<dyn PciDevice>, id: &PciDeviceID) -> Result<(), SystemError>;
     fn remove(&self, device: &Arc<dyn PciDevice>) -> Result<(), SystemError>;
     fn shutdown(&self, device: &Arc<dyn PciDevice>) -> Result<(), SystemError>;
@@ -26,7 +41,6 @@ pub trait PciDriver: Driver {
         return None;
     }
 }
-
 
 #[derive(Debug)]
 pub struct InnerPciDriver {

@@ -14,7 +14,10 @@ use crate::{
             kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        pci::pci_driver::{dev_id::PciDeviceID, device::{InnerPciDevice, PciDevice}},
+        pci::pci_driver::{
+            dev_id::PciDeviceID,
+            device::{InnerPciDevice, PciDevice},
+        },
     },
     filesystem::{
         kernfs::KernFSInode,
@@ -187,7 +190,6 @@ impl KObject for TestDevice {
         *self.kobj_state.write() = state;
     }
 }
-
 
 #[derive(Debug)]
 pub struct HelloAttr;

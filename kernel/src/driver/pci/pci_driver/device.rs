@@ -6,12 +6,15 @@ use system_error::SystemError;
 
 use crate::{
     driver::base::{
-        class::Class, device::{
+        class::Class,
+        device::{
             bus::{Bus, BusState},
             device_manager,
             driver::Driver,
             Device, DevicePrivateData, DeviceType, IdTable,
-        }, kobject::{KObjType, KObject, KObjectState, LockedKObjectState}, kset::KSet
+        },
+        kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+        kset::KSet,
     },
     filesystem::kernfs::KernFSInode,
     libs::{rwlock::RwLockWriteGuard, spinlock::SpinLock},
@@ -19,6 +22,8 @@ use crate::{
 
 use super::{dev_id::PciDeviceID, pci_bus, pci_bus_device};
 
+/// # 结构功能
+/// 该结构为Pci设备的管理器，使用该结构可以将pci设备添加到sysfs中
 pub struct PciDeviceManager;
 
 pub fn pci_device_manager() -> &'static PciDeviceManager {
@@ -26,40 +31,71 @@ pub fn pci_device_manager() -> &'static PciDeviceManager {
 }
 
 impl PciDeviceManager {
+    /// #函数的功能
+    /// 将pci设备注册到sysfs中
+    /// 
+    /// ## 参数：
+    /// - 'pci_dev':需要添加的pci设备
+    /// 
+    /// ## 返回值：
+    /// - OK(()) :表示成功
+    /// - Err(e) :失败原因 
     pub fn device_add(&self, pci_dev: Arc<dyn PciDevice>) -> Result<(), SystemError> {
+        // pci设备一般放置在/sys/device/pci:xxxx下
         if pci_dev.parent().is_none() {
             pci_dev.set_parent(Some(Arc::downgrade(
                 &(pci_bus_device() as Arc<dyn KObject>),
             )));
         }
+        // 设置设备的总线
         pci_dev.set_bus(Some(Arc::downgrade(&(pci_bus() as Arc<dyn Bus>))));
+        // 对设备进行默认的初始化
         device_manager().device_default_initialize(&(pci_dev.clone() as Arc<dyn Device>));
-        //我还要实现一个bus的添加
+        // 使用设备管理器注册设备，当设备被注册后，会根据它的总线字段，在对应的总线上扫描驱动，并尝试进行匹配
         let r = device_manager().add_device(pci_dev.clone() as Arc<dyn Device>);
 
         if r.is_ok() {
             //todo:这里可能还要处理一些设置成功后设备状态的变化
             return Ok(());
         } else {
-            //tode:这里可能有一些添加失败的处理
+            //todo:这里可能有一些添加失败的处理
             return r;
         }
     }
 }
 
+/// #trait功能
+/// 要进入sysfs的Pci设备应当实现的trait
 pub trait PciDevice: Device {
+    /// # 函数的功能
+    /// 返回本设备的PciDeviceID，该ID用于driver和device之间的匹配
+    /// 
+    /// ## 返回值
+    /// - 'PciDeviceID' :本设备的PciDeviceID
     fn dynid(&self) -> PciDeviceID;
+
+    /// # 函数的功能
+    /// 返回本设备的供应商（vendor）ID
+    /// 
+    /// ## 返回值
+    /// - u16 :表示供应商ID
     fn vendor(&self) -> u16;
     fn device_id(&self) -> u16;
     fn subsystem_vendor(&self) -> u16;
     fn subsystem_device(&self) -> u16;
 }
+
+/// #结构功能
+/// 由于Pci总线本身就属于一个设备，故该结构代表Pci总线（控制器）本身
+/// 它对应/sys/device/pci
 #[derive(Debug)]
 #[cast_to([sync] Device)]
 pub struct PciBusDevice {
     inner: SpinLock<InnerPciBusDevice>,
     kobj_state: LockedKObjectState,
 }
+
+
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct InnerPciBusDevice {
@@ -209,11 +245,17 @@ impl Device for PciBusDevice {
 }
 
 
+/// #结构功能
+/// 由于每个PciDevice都需要一些共有的结构，所以这里将其抽象出来作为一个结构
 #[derive(Debug)]
 pub struct InnerPciDevice {
+    /// 设备所在的总线
     bus: Option<Weak<dyn Bus>>,
+    /// 设备的名称
     pub name: Option<String>,
+    /// 设备的类
     pub class: Option<Weak<dyn Class>>,
+    /// 设备绑定的驱动
     pub driver: Option<Weak<dyn Driver>>,
     pub kern_inode: Option<Arc<KernFSInode>>,
     pub parent: Option<Weak<dyn KObject>>,

@@ -5,11 +5,7 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 
-use alloc::{
-    string::String,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::sync::{Arc, Weak};
 
 use kdepends::memoffset::offset_of;
 use system_error::SystemError;
@@ -511,7 +507,7 @@ unsafe extern "sysv64" fn switch_back() -> ! {
     asm!("ret", options(noreturn));
 }
 
-pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<String>) -> ! {
+pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
     // 以下代码不能发生中断
     CurrentIrqArch::interrupt_disable();
 
@@ -520,7 +516,6 @@ pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<Str
         current_pcb.kernel_stack().stack_max_address().data() - core::mem::size_of::<TrapFrame>(),
     );
     // kdebug!("trap_frame_vaddr: {:?}", trap_frame_vaddr);
-    let new_rip = VirtAddr::new(ret_from_intr as usize);
 
     assert!(
         (x86::current::registers::rsp() as usize) < trap_frame_vaddr.data(),
@@ -531,6 +526,7 @@ pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<Str
         trap_frame_vaddr.data()
     );
 
+    let new_rip = VirtAddr::new(ret_from_intr as usize);
     let mut arch_guard = current_pcb.arch_info_irqsave();
     arch_guard.rsp = trap_frame_vaddr.data();
 
@@ -548,27 +544,10 @@ pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<Str
 
     drop(arch_guard);
 
-    // 删除kthread的标志
-    current_pcb.flags().remove(ProcessFlags::KTHREAD);
-    current_pcb.worker_private().take();
-
-    *current_pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::CFS;
-
-    let mut trap_frame = TrapFrame::new();
-
-    compiler_fence(Ordering::SeqCst);
-    Syscall::do_execve(path, argv, envp, &mut trap_frame).unwrap_or_else(|e| {
-        panic!(
-            "arch_switch_to_user(): pid: {pid:?}, Failed to execve: , error: {e:?}",
-            pid = current_pcb.pid(),
-            e = e
-        );
-    });
+    drop(current_pcb);
     compiler_fence(Ordering::SeqCst);
 
     // 重要！在这里之后，一定要保证上面的引用计数变量、动态申请的变量、锁的守卫都被drop了，否则可能导致内存安全问题！
-
-    drop(current_pcb);
 
     compiler_fence(Ordering::SeqCst);
     ready_to_switch_to_user(trap_frame, trap_frame_vaddr.data(), new_rip.data());

@@ -33,8 +33,10 @@ Function
 */
 use crate::driver::base::kobject::KObject;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 mod kobject_uevent;
+
 // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c?fi=kobject_uevent#457
 // kobject_action
 pub enum KobjectAction {
@@ -66,11 +68,11 @@ pub enum KobjectAction {
 pub const UEVENT_NUM_ENVP :usize = 64;
 pub const UEVENT_BUFFER_SIZE:usize= 2048;
 pub const UEVENT_HELPER_PATH_LEN:usize = 256;
-pub struct KobjUeventEnv<T> {
-    argv: [Option<T>; 3],
-    envp: [Option<T>; UEVENT_NUM_ENVP],
+pub struct KobjUeventEnv {
+    argv: Vec<Option<String>>,
+    envp: Vec<Option<String>>,
     envp_idx: u32,
-    buf: [u8; UEVENT_BUFFER_SIZE],
+    buf: Vec<u8>,
     buflen: u32,
 }
 

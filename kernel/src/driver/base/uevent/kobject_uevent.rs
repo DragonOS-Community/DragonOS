@@ -44,12 +44,13 @@ use crate::net::socket::Socket;
 use super::KobjectAction;
 use super::KObject;
 use super::KobjUeventEnv;
+use crate::driver::base::kset::{KSet,KSetUeventOps};
 use super::{UEVENT_NUM_ENVP,UEVENT_BUFFER_SIZE};
 use crate::libs::mutex::Mutex;
 use alloc::sync::Arc;
 use alloc::sync::Weak;
-
-
+use system_error::SystemError;
+use crate::mm::c_adapter::kzalloc;
 
 
 // u64 uevent_seqnum;
@@ -91,12 +92,12 @@ pub struct UeventSock {
 
     查找kobj本身或者其parent是否从属于某个kset，如果不是，则报错返回（注2：由此可以说明，如果一个kobject没有加入kset，是不允许上报uevent的）
     查看kobj->uevent_suppress是否设置，如果设置，则忽略所有的uevent上报并返回（注3：由此可知，可以通过Kobject的uevent_suppress标志，管控Kobject的uevent的上报）
-    如果所属的kset有uevent_ops->filter函数，则调用该函数，过滤此次上报（注4：这佐证了3.2小节有关filter接口的说明，kset可以通过filter接口过滤不希望上报的event，从而达到整体的管理效果）
+    如果所属的kset有kset->filter函数，则调用该函数，过滤此次上报（注4：这佐证了3.2小节有关filter接口的说明，kset可以通过filter接口过滤不希望上报的event，从而达到整体的管理效果）
     判断所属的kset是否有合法的名称（称作subsystem，和前期的内核版本有区别），否则不允许上报uevent
     分配一个用于此次上报的、存储环境变量的buffer（结果保存在env指针中），并获得该Kobject在sysfs中路径信息（用户空间软件需要依据该路径信息在sysfs中访问它）
     调用add_uevent_var接口（下面会介绍），将Action、路径信息、subsystem等信息，添加到env指针中
     如果传入的envp不空，则解析传入的环境变量中，同样调用add_uevent_var接口，添加到env指针中
-    如果所属的kset存在uevent_ops->uevent接口，调用该接口，添加kset统一的环境变量到env指针
+    如果所属的kset存在kset->uevent接口，调用该接口，添加kset统一的环境变量到env指针
     根据ACTION的类型，设置kobj->state_add_uevent_sent和kobj->state_remove_uevent_sent变量，以记录正确的状态
     调用add_uevent_var接口，添加格式为"SEQNUM=%llu”的序列号
     如果定义了"CONFIG_NET”，则使用netlink发送该uevent
@@ -113,42 +114,42 @@ kobject_action_type，将enum kobject_action类型的Action，转换为字符串
 
 
 //kobject_uevent->kobject_uevent_env
-pub fn kobject_uevent(kobj: &dyn KObject, action: KobjectAction) -> Result<(), &'static str> {
+pub fn kobject_uevent(kobj: &dyn KObject, action: KobjectAction) -> Result<(), SystemError>  {
     // kobject_uevent和kobject_uevent_env功能一样，只是没有指定任何的环境变量
     match kobject_uevent_env(kobj, action, None) {
         Ok(_) => Ok(()), // return Ok(()) on success
         Err(e) => Err(e), // return the error on failure
     }
 }
-pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: Option<Vec<String>>) -> Result<(), &'static str> {
+pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: Option<Vec<String>>) -> Result<(), SystemError>  {
     
     // todo: 定义一些常量和变量
     // init uevent env
     let env = KobjUeventEnv {
-        argv: [None, None, None],
-        envp: [None; UEVENT_NUM_ENVP],
+        argv: Vec::with_capacity(UEVENT_NUM_ENVP),
+        envp: Vec::with_capacity(UEVENT_NUM_ENVP),
         envp_idx: 0,
-        buf: [0; UEVENT_BUFFER_SIZE],
+        buf: Vec::with_capacity(UEVENT_BUFFER_SIZE),
         buflen: 0,
     };
     
-    let kset = kobj.kset().unwrap();
+    //let mut kset = kobj.kset();
     let subsystem: String;
-
-    let action_string = match action {
-        KobjectAction::KOBJADD => "add",
-        KobjectAction::KOBJREMOVE => "remove",
-        KobjectAction::KOBJCHANGE => "change",
-        KobjectAction::KOBJMOVE => "move",
-        KobjectAction::KOBJONLINE => "online",
-        KobjectAction::KOBJOFFLINE => "offline",
-        KobjectAction::KOBJBIND => "bind",
-        KobjectAction::KOBJUNBIND => "unbind",
-    };
-
-
     let mut state = KObjectState::empty();
-
+    let action_string = match action {
+    KobjectAction::KOBJADD => "add",
+    KobjectAction::KOBJREMOVE => "remove",
+    KobjectAction::KOBJCHANGE => "change",
+    KobjectAction::KOBJMOVE => "move",
+    KobjectAction::KOBJONLINE => "online",
+    KobjectAction::KOBJOFFLINE => "offline",
+    KobjectAction::KOBJBIND => "bind",
+    KobjectAction::KOBJUNBIND => "unbind",
+    };
+    /*
+	 * Mark "remove" event done regardless of result, for some subsystems
+	 * do not want to re-trigger "remove" event via automatic cleanup.
+	 */
     match action {
         KobjectAction::KOBJREMOVE => {
             state.insert(KObjectState::REMOVE_UEVENT_SENT);
@@ -157,38 +158,20 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
     }
 
     /* search the kset we belong to */
-    //let top_kobj = kobj;
-    let top_kobj = Arc::new(kobj); // assuming kobj is of type dyn KObject
+    
+    // let mut top_kobj = Arc::new(kobj);
+    // let weak_parent = Arc::downgrade(&top_kobj);
+    // while let Some(parent_arc) = weak_parent.upgrade().parent() {
+    //     top_kobj = Arc::clone(&parent_arc);
+    // }
+    // 由于引用类型的原因，上面的逻辑无法实现，是否能直接调用kset()方法找到kset？
+    if kobj.kset().is_none() {
+        kdebug!("attempted to send uevent without kset!\n");
+        return Err(SystemError::EINVAL);
+    } 
 
-    let weak_parent = Arc::downgrade(&top_kobj);
-
-    while let Some(parent_arc) = weak_parent.upgrade() {
-        let kset = top_kobj.kset();
-        if !kset.is_some() {
-            break;
-        }
-        top_kobj = parent_arc;
-    }
-    /*
-    struct kset_uevent_ops {
-        int (* const filter)(struct kobject *kobj);
-        const char *(* const name)(struct kobject *kobj);
-        int (* const uevent)(struct kobject *kobj, struct kobj_uevent_env *env);
-    };
-        */
-    if top_kobj.kset().is_none() {
-        if kset.uevent_ops().is_none() {
-            kdebug!("kset has no uevent_ops");
-        }
-        if kset.uevent_ops().unwrap().filter().is_none() {
-            kdebug!("kset uevent_ops has no filter");
-        }
-        if kset.uevent_ops().unwrap().filter().unwrap()(kobj, action) {
-            return Ok(());
-        }
-    }
-    let kset = top_kobj.kset().unwrap();
-    let uevent_ops = kset.uevent_ops().unwrap();
+    let kset = kobj.kset();
+    
 
     /* skip the event, if uevent_suppress is set*/
     /* 
@@ -198,34 +181,46 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
                 kobject_name(kobj), kobj, __func__);
         return 0;
     }
-        */
+    */
     if UEVENT_SUPPRESS == 1 {
         kdebug!("uevent_suppress caused the event to drop!");
         return Ok(());
     }
+        /*
+    struct kset_kset {
+        int (* const filter)(struct kobject *kobj);
+        const char *(* const name)(struct kobject *kobj);
+        int (* const uevent)(struct kobject *kobj, struct kobj_uevent_env *env);
+    };
+    */
+
 
     /* skip the event, if the filter returns zero. */
-    if uevent_ops.filter.is_some() && uevent_ops.filter.unwrap()(kobj) {
+    if kset.as_ref().unwrap().uevent_ops.is_some() && kset.as_ref().unwrap().uevent_ops.as_ref().unwrap().filter() == None {
         kdebug!("filter caused the event to drop!");
         return Ok(());
     }
 
     /* originating subsystem */
-    if uevent_ops && uevent_ops.name {
-        let subsystem = uevent_ops.name(kobj);
-    }
-    else {
-        let subsystem = kset.name();
+    if  kset.as_ref().unwrap().uevent_ops.is_some() && kset.as_ref().unwrap().uevent_ops.as_ref().unwrap().uevent_name() != "" {
+        subsystem = kset.as_ref().unwrap().uevent_ops.as_ref().unwrap().uevent_name();
+    } else {
+        subsystem = kobj.name();
     }
     if subsystem.is_empty() {
         kdebug!("unset sussystem caused the event to drop!");
     }
 
     /* environment buffer */
-    // env = kzalloc(sizeof(struct kobj_uevent_env), GFP_KERNEL);
-    // if (!env)
-    // 	return -ENOMEM;
+    unsafe {
 
+    env = kzalloc(sizeof(struct KobjUeventEnv), GFP_KERNEL);
+    if (env)
+    {
+        return -ENOMEM;
+    }
+    	
+}
 
 
     if let Some(env_ext) = envp_ext {

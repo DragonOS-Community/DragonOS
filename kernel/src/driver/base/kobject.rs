@@ -105,7 +105,7 @@ bitflags! {
         const INITIALIZED = 1 << 3;
     }
 }
-pub const UEVENT_SUPPRESS: u32 = 1;
+pub const UEVENT_SUPPRESS: i32 = 1;
 #[derive(Debug)]
 pub struct LockedKObjectState(RwLock<KObjectState>);
 

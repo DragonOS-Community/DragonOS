@@ -28,6 +28,8 @@ pub struct KSet {
     /// 与父节点有关的一些信息
     parent_data: RwLock<KSetParentData>,
     self_ref: Weak<KSet>,
+    /// kset用于发送uevent的操作函数集。kset能够发送它所包含的各种子kobj、孙kobj的消息，即kobj或其父辈、爷爷辈，都可以发送消息；优先父辈，然后是爷爷辈，以此类推
+    pub uevent_ops: Option<Arc<dyn KSetUeventOps>>,
 }
 
 impl Hash for KSet {
@@ -53,6 +55,7 @@ impl KSet {
             kobj_state: LockedKObjectState::new(None),
             parent_data: RwLock::new(KSetParentData::new(None, None)),
             self_ref: Weak::default(),
+            uevent_ops: Some(Arc::new(KSetUeventOpsDefault)),
         };
 
         let r = Arc::new(r);
@@ -234,17 +237,28 @@ impl InnerKSet {
         }
     }
 }
-pub trait KsetUeventOps {
-    fn filter(&self, kobj: &impl KObject) -> i32;
-    fn name(&self, kobj: &impl KObject) -> &str;
-    //fn uevent<T>(&self, kobj: &impl KObject, env: &mut KobjUeventEnv<T>) -> i32;
+//https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/kobject.h#137
+use core::fmt::Debug;
+pub trait KSetUeventOps : Debug + Send + Sync{
+    fn filter(&self) -> Option<i32>;
+    fn uevent_name(&self) -> String;
+    fn uevent(&self, env: &mut KobjUeventEnv) -> i32;
 }
-
 #[derive(Debug)]
-pub struct KsetUeventOpsImpl {}
+pub struct KSetUeventOpsDefault;
 
-impl KsetUeventOpsImpl {
-    // 构造函数
+impl KSetUeventOps for KSetUeventOpsDefault{
+    fn filter(&self) -> Option<i32> {
+        Some(0)
+    }
+
+    fn uevent_name(&self) -> String {
+        String::new()
+    }
+
+    fn uevent(&self, env: &mut KobjUeventEnv) -> i32 {
+        0
+    }
 }
 
 

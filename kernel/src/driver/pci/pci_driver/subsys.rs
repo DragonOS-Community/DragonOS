@@ -6,7 +6,10 @@ use intertrait::cast::CastArc;
 use system_error::SystemError;
 
 use crate::{
-    driver::base::{device::{bus::Bus, driver::Driver, Device}, subsys::SubSysPrivate},
+    driver::base::{
+        device::{bus::Bus, driver::Driver, Device},
+        subsys::SubSysPrivate,
+    },
     filesystem::sysfs::AttributeGroup,
 };
 
@@ -45,10 +48,7 @@ impl Bus for PciBus {
         return &self.private;
     }
 
-    fn probe(
-        &self,
-        device: &Arc<dyn Device>,
-    ) -> Result<(), SystemError> {
+    fn probe(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
         let drv = device.driver().ok_or(SystemError::EINVAL)?;
         let pci_drv = drv.cast::<dyn PciDriver>().map_err(|_| {
             kerror!(
@@ -69,10 +69,7 @@ impl Bus for PciBus {
         pci_drv.probe(&pci_dev, &id)
     }
 
-    fn remove(
-        &self,
-        _device: &Arc<dyn Device>,
-    ) -> Result<(), SystemError> {
+    fn remove(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
         todo!()
     }
 
@@ -84,10 +81,7 @@ impl Bus for PciBus {
         todo!()
     }
 
-    fn resume(
-        &self,
-        _device: &Arc<dyn Device>,
-    ) -> Result<(), SystemError> {
+    fn resume(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
         todo!()
     }
 

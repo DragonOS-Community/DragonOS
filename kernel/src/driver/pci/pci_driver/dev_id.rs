@@ -2,6 +2,10 @@ use alloc::sync::Arc;
 
 use super::device::PciDevice;
 const PCI_ANY_ID: u32 = 0xffff_ffff;
+
+/// # 结构功能
+/// 该结构用于驱动和设备之间的识别，驱动会有一个支持的设备ID列表，而设备会自带一个ID，如果设备的ID在驱动的支持列表中，则驱动和设备就可以识别了
+/// 见https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/mod_devicetable.h#43
 #[derive(Debug, Copy, Clone)]
 pub struct PciDeviceID {
     vendor: u32,
@@ -12,6 +16,9 @@ pub struct PciDeviceID {
     class_mask: u32,
     _driver_data: u64,
     _override_only: u32,
+    /// 可能有些设备的识别方式比较特殊，那么可以通过设置该字段进行自定义的识别方式，只需要在PciSpecifiedData枚举中加入一个类型即可
+    /// 若该字段不为None，则优先使用special_data进行识别；
+    /// 该字段是为了增加灵活性
     special_data: Option<PciSpecifiedData>,
 }
 

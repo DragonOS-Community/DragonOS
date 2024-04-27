@@ -11,7 +11,11 @@ use crate::{
             kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        pci::pci_driver::{dev_id::PciDeviceID, device::PciDevice, driver::{InnerPciDriver, PciDriver}},
+        pci::pci_driver::{
+            dev_id::PciDeviceID,
+            device::PciDevice,
+            driver::{InnerPciDriver, PciDriver},
+        },
     },
     filesystem::kernfs::KernFSInode,
     libs::{
@@ -169,4 +173,3 @@ impl KObject for TestDriver {
         *self.kobj_state.write() = state;
     }
 }
-

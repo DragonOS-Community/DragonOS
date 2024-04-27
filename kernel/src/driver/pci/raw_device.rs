@@ -1,4 +1,4 @@
-use core::{any::Any, sync::atomic::AtomicU16};
+use core::any::Any;
 
 use alloc::{
     string::{String, ToString},
@@ -6,71 +6,79 @@ use alloc::{
 };
 
 use crate::{
-    driver::{
-        base::{
-            class::Class,
-            device::{bus::Bus, driver::Driver, Device, DeviceType, IdTable},
-            kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
-            kset::KSet,
-        },
-        virtio::driver::VirtioMatchId,
+    driver::base::{
+        class::Class,
+        device::{bus::Bus, driver::Driver, Device, DeviceType, IdTable},
+        kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+        kset::KSet,
     },
     filesystem::{kernfs::KernFSInode, sysfs::AttributeGroup},
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
 use super::{
-    pci::{PciDeviceStructureGeneralDevice, PCI_DEVICE_LINKEDLIST},
+    pci::PciDeviceStructureGeneralDevice,
     pci_driver::{
+        attr::BasicPciReadOnlyAttrs,
         dev_id::{PciDeviceID, PciSpecifiedData},
-        device::{pci_device_manager, PciDevice},
+        device::PciDevice,
         test::pt_device::InnerPciDevice,
     },
 };
-static NAME_SEQ: AtomicU16 = AtomicU16::new(0);
 #[derive(Debug)]
 #[cast_to([sync] Device)]
 #[cast_to([sync] PciDevice)]
-pub struct PciRawGeneralDevice {
+pub struct PciGeneralDevice {
     inner: RwLock<InnerPciDevice>,
     kobj_state: LockedKObjectState,
     dev_id: PciDeviceID,
+    header: Arc<PciDeviceStructureGeneralDevice>,
 }
 
-impl PciRawGeneralDevice {}
-
-impl From<&PciDeviceStructureGeneralDevice> for PciRawGeneralDevice {
+impl From<&PciDeviceStructureGeneralDevice> for PciGeneralDevice {
     fn from(value: &PciDeviceStructureGeneralDevice) -> Self {
-        let value = &value.common_header;
+        let value = Arc::new(value.clone());
+        let name: String = value.common_header.bus_device_function.into();
         let kobj_state = LockedKObjectState::new(None);
         let inner = RwLock::new(InnerPciDevice::default());
         let mut dev_id = PciDeviceID::dummpy();
-        dev_id.set_special(PciSpecifiedData::Virtio(VirtioMatchId::new(
-            value.class_code,
-            value.subclass,
-        )));
-        let seq = NAME_SEQ.load(core::sync::atomic::Ordering::SeqCst);
-        let name = format!("PciRaw{:?}", seq);
-        NAME_SEQ.store(seq + 1, core::sync::atomic::Ordering::SeqCst);
+        dev_id.set_special(PciSpecifiedData::Virtio());
         let res = Self {
             inner,
             kobj_state,
             dev_id,
+            header: value,
         };
         res.set_name(name);
         res
     }
 }
 
-impl PciDevice for PciRawGeneralDevice {
+impl PciDevice for PciGeneralDevice {
     fn dynid(&self) -> PciDeviceID {
         self.dev_id
     }
+
+    fn vendor(&self) -> u16 {
+        self.header.common_header.vendor_id
+    }
+
+    fn device_id(&self) -> u16 {
+        self.header.common_header.device_id
+    }
+
+    fn subsystem_vendor(&self) -> u16 {
+        self.header.subsystem_vendor_id
+    }
+
+    fn subsystem_device(&self) -> u16 {
+        self.header.subsystem_id
+    }
 }
 
-impl Device for PciRawGeneralDevice {
+impl Device for PciGeneralDevice {
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
-        None
+        Some(&[&BasicPciReadOnlyAttrs])
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {
@@ -126,7 +134,7 @@ impl Device for PciRawGeneralDevice {
     }
 }
 
-impl KObject for PciRawGeneralDevice {
+impl KObject for PciGeneralDevice {
     fn as_any_ref(&self) -> &dyn Any {
         self
     }
@@ -181,17 +189,5 @@ impl KObject for PciRawGeneralDevice {
 
     fn set_kobj_state(&self, state: KObjectState) {
         *self.kobj_state.write() = state;
-    }
-}
-
-#[inline(never)]
-pub fn pci_device_search() {
-    for i in PCI_DEVICE_LINKEDLIST.read().iter() {
-        if let Some(dev) = i.as_standard_device() {
-            let raw_dev = PciRawGeneralDevice::from(dev);
-            let _ = pci_device_manager().device_add(Arc::new(raw_dev));
-        } else {
-            continue;
-        }
     }
 }

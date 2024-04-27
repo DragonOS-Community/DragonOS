@@ -1,10 +1,11 @@
 #![allow(dead_code)]
 // 目前仅支持单主桥单Segment
 
+use super::pci_driver::device::pci_device_manager;
 use super::pci_irq::{IrqType, PciIrqError};
+use super::raw_device::PciGeneralDevice;
 use super::root::{pci_root_0, PciRoot};
 use crate::arch::{PciArch, TraitPciArch};
-use crate::driver::pci::raw_device::pci_device_search;
 use crate::exception::IrqNumber;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -12,6 +13,7 @@ use crate::mm::mmio_buddy::{mmio_pool, MMIOSpaceGuard};
 
 use crate::mm::VirtAddr;
 use crate::{kdebug, kerror, kinfo, kwarn};
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::{boxed::Box, collections::LinkedList};
@@ -717,11 +719,14 @@ fn pci_read_header(
     };
     match HeaderType::from(header_type & 0x7f) {
         HeaderType::Standard => {
-            let general_device = pci_read_general_device_header(header, &bus_device_function);
-            let box_general_device = Box::new(general_device);
+            let general_device: PciDeviceStructureGeneralDevice =
+                pci_read_general_device_header(header, &bus_device_function);
+            let box_general_device = Box::new(general_device.clone());
             let box_general_device_clone = box_general_device.clone();
             if add_to_list {
                 PCI_DEVICE_LINKEDLIST.add(box_general_device);
+                let raw = PciGeneralDevice::from(&general_device);
+                let _ = pci_device_manager().device_add(Arc::new(raw));
             }
             Ok(box_general_device_clone)
         }
@@ -1091,7 +1096,6 @@ pub fn pci_init() {
             HeaderType::Unrecognised(_) => {}
         }
     }
-    pci_device_search();
     kinfo!("PCI bus initialized.");
 }
 
@@ -1114,6 +1118,15 @@ impl BusDeviceFunction {
     #[allow(dead_code)]
     pub fn valid(&self) -> bool {
         self.device < 32 && self.function < 8
+    }
+}
+
+impl From<BusDeviceFunction> for String {
+    fn from(value: BusDeviceFunction) -> Self {
+        format!(
+            "0000:{:02x}:{:02x}.{}",
+            value.bus, value.device, value.function
+        )
     }
 }
 ///实现BusDeviceFunction的Display trait，使其可以直接输出

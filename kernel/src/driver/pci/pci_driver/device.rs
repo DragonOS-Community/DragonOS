@@ -34,7 +34,6 @@ impl PciDeviceManager {
                 &(pci_bus_device() as Arc<dyn KObject>),
             )));
         }
-
         pci_dev.set_bus(Some(Arc::downgrade(&(pci_bus() as Arc<dyn Bus>))));
         device_manager().device_default_initialize(&(pci_dev.clone() as Arc<dyn Device>));
         //我还要实现一个bus的添加
@@ -51,8 +50,11 @@ impl PciDeviceManager {
 }
 
 pub trait PciDevice: Device {
-    // fn pci_bus(&self) -> PciBus;
     fn dynid(&self) -> PciDeviceID;
+    fn vendor(&self) -> u16;
+    fn device_id(&self) -> u16;
+    fn subsystem_vendor(&self) -> u16;
+    fn subsystem_device(&self) -> u16;
 }
 #[derive(Debug)]
 #[cast_to([sync] Device)]

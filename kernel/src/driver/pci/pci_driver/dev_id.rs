@@ -1,7 +1,5 @@
 use alloc::sync::Arc;
 
-use crate::driver::virtio::driver::VirtioMatchId;
-
 use super::device::PciDevice;
 const PCI_ANY_ID: u32 = 0xffff_ffff;
 #[derive(Debug, Copy, Clone)]
@@ -90,7 +88,7 @@ impl PciDeviceID {
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Copy, Clone)]
 pub enum PciSpecifiedData {
-    Virtio(VirtioMatchId),
+    Virtio(),
 }
 
 impl PciSpecifiedData {

@@ -725,6 +725,10 @@ fn pci_read_header(
             let box_general_device_clone = box_general_device.clone();
             if add_to_list {
                 PCI_DEVICE_LINKEDLIST.add(box_general_device);
+                //这里实际上不应该使用clone，因为raw是用于sysfs的结构，但是实际上pci设备是在PCI_DEVICE_LINKEDLIST链表上的，
+                //这就导致sysfs呈现的对pci设备的操控接口实际上操控的是pci设备描述符是一个副本
+                //但是无奈这里没有使用Arc
+                //todo：修改pci设备描述符在静态链表中存在的方式，并修改这里的clone操作
                 let raw = PciGeneralDevice::from(&general_device);
                 let _ = pci_device_manager().device_add(Arc::new(raw));
             }
@@ -1122,7 +1126,11 @@ impl BusDeviceFunction {
 }
 
 impl From<BusDeviceFunction> for String {
+    /// # 函数的功能
+    /// 这里提供一个由BusDeviceFunction到dddd:bb:vv.f字符串的转换函数，主要用于转换成设备的名称（pci设备的名称一般是诸如0000:00:00.1这种)
     fn from(value: BusDeviceFunction) -> Self {
+        //需要注意，这里的0000应该是所谓的“域号”（Domain ID），但是尚不知道是如何获得的，故硬编码在这里
+        //todo：实现域号的获取
         format!(
             "0000:{:02x}:{:02x}.{}",
             value.bus, value.device, value.function

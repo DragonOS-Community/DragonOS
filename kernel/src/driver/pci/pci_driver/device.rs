@@ -33,13 +33,13 @@ pub fn pci_device_manager() -> &'static PciDeviceManager {
 impl PciDeviceManager {
     /// #函数的功能
     /// 将pci设备注册到sysfs中
-    /// 
+    ///
     /// ## 参数：
     /// - 'pci_dev':需要添加的pci设备
-    /// 
+    ///
     /// ## 返回值：
     /// - OK(()) :表示成功
-    /// - Err(e) :失败原因 
+    /// - Err(e) :失败原因
     pub fn device_add(&self, pci_dev: Arc<dyn PciDevice>) -> Result<(), SystemError> {
         // pci设备一般放置在/sys/device/pci:xxxx下
         if pci_dev.parent().is_none() {
@@ -69,14 +69,14 @@ impl PciDeviceManager {
 pub trait PciDevice: Device {
     /// # 函数的功能
     /// 返回本设备的PciDeviceID，该ID用于driver和device之间的匹配
-    /// 
+    ///
     /// ## 返回值
     /// - 'PciDeviceID' :本设备的PciDeviceID
     fn dynid(&self) -> PciDeviceID;
 
     /// # 函数的功能
     /// 返回本设备的供应商（vendor）ID
-    /// 
+    ///
     /// ## 返回值
     /// - u16 :表示供应商ID
     fn vendor(&self) -> u16;
@@ -94,7 +94,6 @@ pub struct PciBusDevice {
     inner: SpinLock<InnerPciBusDevice>,
     kobj_state: LockedKObjectState,
 }
-
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -243,7 +242,6 @@ impl Device for PciBusDevice {
         todo!()
     }
 }
-
 
 /// #结构功能
 /// 由于每个PciDevice都需要一些共有的结构，所以这里将其抽象出来作为一个结构

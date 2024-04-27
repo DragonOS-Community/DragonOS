@@ -21,8 +21,7 @@ use super::{
     pci_driver::{
         attr::BasicPciReadOnlyAttrs,
         dev_id::{PciDeviceID, PciSpecifiedData},
-        device::PciDevice,
-        test::pt_device::InnerPciDevice,
+        device::{InnerPciDevice, PciDevice},
     },
 };
 #[derive(Debug)]

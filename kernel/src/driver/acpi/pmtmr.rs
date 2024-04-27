@@ -24,7 +24,7 @@ pub fn acpi_pm_read_early() -> u32 {
 }
 
 #[inline(always)]
-#[cfg(target_arch = "riscv64")]
+#[cfg(not(target_arch = "x86_64"))]
 pub fn acpi_pm_read_early() -> u32 {
     return 0;
 }

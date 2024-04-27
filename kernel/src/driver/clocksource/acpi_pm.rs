@@ -6,14 +6,10 @@ use crate::{
         pmtmr::{ACPI_PM_MASK, PMTMR_TICKS_PER_SEC},
     },
     libs::spinlock::SpinLock,
-    time::clocksource::{
-        Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum,
+    time::{
+        clocksource::{Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum},
+        PIT_TICK_RATE,
     },
-};
-#[cfg(target_arch = "riscv64")]
-use crate::{
-    arch::riscv64::asm::mach_timer::{mach_countup, mach_prepare_counter, CALIBRATE_LATCH},
-    time::PIT_TICK_RATE,
 };
 use acpi::fadt::Fadt;
 use alloc::sync::{Arc, Weak};
@@ -117,21 +113,52 @@ impl Clocksource for Acpipm {
         return self.0.lock_irqsave().self_reaf.upgrade().unwrap();
     }
 
-    fn update_clocksource_data(&self, _data: ClocksourceData) -> Result<(), SystemError> {
+    fn update_clocksource_data(&self, data: ClocksourceData) -> Result<(), SystemError> {
         let d = &mut self.0.lock_irqsave().data;
-        d.set_flags(_data.flags);
-        d.set_mask(_data.mask);
-        d.set_max_idle_ns(_data.max_idle_ns);
-        d.set_mult(_data.mult);
-        d.set_name(_data.name);
-        d.set_rating(_data.rating);
-        d.set_shift(_data.shift);
-        d.watchdog_last = _data.watchdog_last;
+        d.set_flags(data.flags);
+        d.set_mask(data.mask);
+        d.set_max_idle_ns(data.max_idle_ns);
+        d.set_mult(data.mult);
+        d.set_name(data.name);
+        d.set_rating(data.rating);
+        d.set_shift(data.shift);
+        d.watchdog_last = data.watchdog_last;
         return Ok(());
     }
 }
 
-#[cfg(target_arch = "riscv64")]
+// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/include/asm/mach_timer.h?fi=mach_prepare_counter
+#[allow(dead_code)]
+pub const CALIBRATE_TIME_MSEC: u64 = 30;
+pub const CALIBRATE_LATCH: u64 = (PIT_TICK_RATE * CALIBRATE_TIME_MSEC + 1000 / 2) / 1000;
+
+#[inline(always)]
+#[allow(dead_code)]
+pub fn mach_prepare_counter() {
+    unsafe {
+        // 将Gate位设置为高电平，从而禁用扬声器
+        CurrentPortIOArch::out8(0x61, (CurrentPortIOArch::in8(0x61) & !0x02) | 0x01);
+
+        // 针对计数器/定时器控制器的通道2进行配置，设置为模式0，二进制计数
+        CurrentPortIOArch::out8(0x43, 0xb0);
+        CurrentPortIOArch::out8(0x42, (CALIBRATE_LATCH & 0xff) as u8);
+        CurrentPortIOArch::out8(0x42, (CALIBRATE_LATCH >> 8) as u8);
+    }
+}
+
+#[allow(dead_code)]
+pub fn mach_countup(count: &mut u32) {
+    let mut tmp: u32 = 0;
+    loop {
+        tmp += 1;
+        if (unsafe { CurrentPortIOArch::in8(0x61) } & 0x20) != 0 {
+            break;
+        }
+    }
+    *count = tmp;
+}
+
+#[allow(dead_code)]
 const PMTMR_EXPECTED_RATE: u64 =
     (CALIBRATE_LATCH * (PMTMR_TICKS_PER_SEC >> 10)) / (PIT_TICK_RATE >> 10);
 
@@ -139,8 +166,8 @@ const PMTMR_EXPECTED_RATE: u64 =
 ///
 /// ## 返回值
 /// - i32：如果为0则表示在预期范围内，否则不在
-#[cfg(target_arch = "riscv64")]
-fn verify_pmtmr_rate() -> i32 {
+#[cfg(not(target_arch = "x86_64"))]
+fn verify_pmtmr_rate() -> bool {
     let mut count: u32 = 0;
 
     mach_prepare_counter();
@@ -154,14 +181,14 @@ fn verify_pmtmr_rate() -> i32 {
             "PM Timer running at invalid rate: {}",
             100 * delta / PMTMR_EXPECTED_RATE
         );
-        return -1;
+        return false;
     }
 
-    return 0;
+    return true;
 }
 #[cfg(target_arch = "x86_64")]
-fn verify_pmtmr_rate() -> i32 {
-    return 0;
+fn verify_pmtmr_rate() -> bool {
+    return true;
 }
 
 const ACPI_PM_MONOTONIC_CHECKS: u32 = 10;
@@ -213,15 +240,17 @@ pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
         let value1 = clocksource_acpi_pm().read().data();
         let mut i = 0;
         for _ in 0..ACPI_PM_READ_CHECKS {
-            i += 1;
             let value2 = clocksource_acpi_pm().read().data();
             if value2 == value1 {
+                i += 1;
                 continue;
             }
             if value2 > value1 {
+                i += 1;
                 break;
             }
             if (value2 < value1) && (value2 < 0xfff) {
+                i += 1;
                 break;
             }
             kinfo!("PM Timer had inconsistens results: {} {}", value1, value2);
@@ -240,7 +269,7 @@ pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
     }
 
     // 检查ACPI PM Timer的频率是否正确
-    if verify_pmtmr_rate() != 0 {
+    if !verify_pmtmr_rate() {
         unsafe {
             PMTMR_IO_PORT.store(0, Ordering::SeqCst);
         }

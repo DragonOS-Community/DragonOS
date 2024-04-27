@@ -283,42 +283,37 @@ impl dyn Clocksource {
     }
 
     /// # 计算时钟源的mult和shift，以便将一个时钟源的频率转换为另一个时钟源的频率
-    fn clocks_calc_mult_shift(&self, from: u32, to: u32, maxsec: u32) -> Result<(), SystemError> {
+    fn clocks_calc_mult_shift(&self, from: u32, to: u32, maxsec: u32) -> (u32, u32) {
         let mut sftacc: u32 = 32;
         let mut sft = 1;
 
         // 计算限制转换范围的shift
-        let mut tmp = (maxsec * from) as u64 >> 32;
-        while tmp != 0 {
-            tmp >>= 1;
+        let mut mult = (maxsec as u64 * from as u64) >> 32;
+        while mult != 0 {
+            mult >>= 1;
             sftacc -= 1;
         }
 
         // 找到最佳的mult和shift
         for i in (1..=32).rev() {
             sft = i;
-            tmp = (to as u64) << sft;
-            tmp += from as u64 / 2;
-            tmp /= from as u64;
-            if (tmp >> sftacc) == 0 {
+            mult = (to as u64) << sft;
+            mult += from as u64 / 2;
+            mult /= from as u64;
+            if (mult >> sftacc) == 0 {
                 break;
             }
         }
 
-        let mut cs_data = self.clocksource_data();
-        cs_data.set_mult(tmp as u32);
-        cs_data.set_shift(sft);
-        self.update_clocksource_data(cs_data)?;
-
-        return Ok(());
+        return (mult as u32, sft);
     }
 
     /// # 计算时钟源可以进行的最大调整量
     fn clocksource_max_adjustment(&self) -> u32 {
         let cs_data = self.clocksource_data();
-        let ret = cs_data.mult * 11 / 100;
+        let ret = cs_data.mult as u64 * 11 / 100;
 
-        return ret;
+        return ret as u32;
     }
 
     /// # 更新时钟源频率，初始化mult/shift 和 max_idle_ns
@@ -336,7 +331,10 @@ impl dyn Clocksource {
                 sec = 600;
             }
 
-            self.clocks_calc_mult_shift(freq, NSEC_PER_SEC / scale, sec as u32 * scale)?;
+            let (mult, shift) =
+                self.clocks_calc_mult_shift(freq, NSEC_PER_SEC / scale, sec as u32 * scale);
+            cs_data.set_mult(mult);
+            cs_data.set_shift(shift);
         }
 
         if scale != 0 && freq != 0 && cs_data.uncertainty_margin == 0 {

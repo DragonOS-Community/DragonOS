@@ -2,7 +2,7 @@
 pub mod nr;
 use system_error::SystemError;
 
-use crate::{exception::InterruptArch, kdebug, process::ProcessManager, syscall::Syscall};
+use crate::{exception::InterruptArch, process::ProcessManager, syscall::Syscall};
 
 use super::{interrupt::TrapFrame, CurrentIrqArch};
 

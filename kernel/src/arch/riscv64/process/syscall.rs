@@ -1,11 +1,10 @@
 use alloc::{string::String, vec::Vec};
-use riscv::register::sstatus::{Sstatus, FS, SPP};
+use riscv::register::sstatus::{FS, SPP};
 use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, CurrentIrqArch},
     exception::InterruptArch,
-    kdebug,
     mm::ucontext::AddressSpace,
     process::{
         exec::{load_binary_file, ExecParam, ExecParamFlags},
@@ -64,8 +63,7 @@ impl Syscall {
         let mut param = ExecParam::new(path.as_str(), address_space.clone(), ExecParamFlags::EXEC)?;
 
         // 加载可执行文件
-        let load_result = load_binary_file(&mut param)
-            .unwrap_or_else(|e| panic!("Failed to load binary file: {:?}, path: {:?}", e, path));
+        let load_result = load_binary_file(&mut param)?;
         // kdebug!("load binary file done");
         // kdebug!("argv: {:?}, envp: {:?}", argv, envp);
         param.init_info_mut().args = argv;

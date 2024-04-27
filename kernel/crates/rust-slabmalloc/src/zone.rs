@@ -25,6 +25,7 @@ macro_rules! new_zone {
                 SCAllocator::new(1 << 10), // 1024
                 SCAllocator::new(1 << 11), // 2048            ],
             ],
+            total: 0,
         }
     };
 }
@@ -39,6 +40,7 @@ macro_rules! new_zone {
 /// to provide the underlying `SCAllocator` with more memory in case it runs out.
 pub struct ZoneAllocator<'a> {
     small_slabs: [SCAllocator<'a, ObjectPage<'a>>; ZoneAllocator::MAX_BASE_SIZE_CLASSES],
+    total: u64,
 }
 
 impl<'a> Default for ZoneAllocator<'a> {
@@ -155,6 +157,11 @@ impl<'a> ZoneAllocator<'a> {
         }
         free as u64
     }
+
+    pub fn usage(&mut self) -> SlabUsage {
+        let free_num = self.free_space();
+        SlabUsage::new(self.total, free_num)
+    }
 }
 
 unsafe impl<'a> crate::Allocator<'a> for ZoneAllocator<'a> {
@@ -191,9 +198,38 @@ unsafe impl<'a> crate::Allocator<'a> for ZoneAllocator<'a> {
         match ZoneAllocator::get_slab(layout.size()) {
             Slab::Base(idx) => {
                 self.small_slabs[idx].refill(new_page);
+                // 每refill一个page就为slab的总空间统计加上4KB
+                self.total += 4096;
                 Ok(())
             }
             Slab::Unsupported => Err(AllocationError::InvalidLayout),
         }
+    }
+}
+
+/// Slab内存空间使用情况
+pub struct SlabUsage {
+    // slab总共使用的内存空间
+    total: u64,
+    // slab的空闲空间
+    free: u64,
+}
+
+impl SlabUsage {
+    /// 初始化SlabUsage
+    pub fn new(total: u64, free: u64) -> Self {
+        return Self { total, free };
+    }
+
+    pub fn total(&self) -> u64 {
+        return self.total;
+    }
+
+    pub fn used(&self) -> u64 {
+        return self.total - self.free;
+    }
+
+    pub fn free(&self) -> u64 {
+        return self.free;
     }
 }

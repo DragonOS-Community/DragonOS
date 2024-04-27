@@ -75,24 +75,10 @@ pub fn slab_init_state() -> bool {
     unsafe { *SLABINITSTATE.get_mut() }
 }
 
-/// slab空闲空间
-pub struct SlabFreeSpace {
-    pub free: u64,
-}
-
-impl SlabFreeSpace {
-    /// @brief: 初始化SlabFreeSpace
-    /// @param u64 free slab中空闲的bytes数
-    pub fn new(free: u64) -> SlabFreeSpace {
-        return Self { free };
-    }
-}
-
-/// 获取slab中的空闲空间
-pub unsafe fn slab_free_space() -> SlabFreeSpace {
+pub unsafe fn slab_usage() -> SlabUsage {
     if let Some(ref mut slab) = SLABALLOCATOR {
-        SlabFreeSpace::new(slab.zone.free_space())
+        slab.zone.usage()
     } else {
-        SlabFreeSpace::new(0)
+        SlabUsage::new(0, 0)
     }
 }

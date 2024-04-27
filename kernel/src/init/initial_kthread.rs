@@ -24,8 +24,6 @@ pub fn initial_kernel_thread() -> i32 {
     });
 
     switch_to_user();
-
-    unreachable!();
 }
 
 fn kernel_init() -> Result<(), SystemError> {
@@ -63,7 +61,8 @@ fn kenrel_init_freeable() -> Result<(), SystemError> {
 }
 
 /// 切换到用户态
-fn switch_to_user() {
+#[inline(never)]
+fn switch_to_user() -> ! {
     let current_pcb = ProcessManager::current_pcb();
 
     // 删除kthread的标志
@@ -73,18 +72,23 @@ fn switch_to_user() {
     *current_pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::CFS;
     drop(current_pcb);
 
+    let mut trap_frame = TrapFrame::new();
     // 逐个尝试运行init进程
 
-    if try_to_run_init_process("/bin/dragonreach").is_err()
-        && try_to_run_init_process("/bin/init").is_err()
-        && try_to_run_init_process("/bin/sh").is_err()
+    if try_to_run_init_process("/bin/dragonreach", &mut trap_frame).is_err()
+        && try_to_run_init_process("/bin/init", &mut trap_frame).is_err()
+        && try_to_run_init_process("/bin/sh", &mut trap_frame).is_err()
     {
         panic!("Failed to run init process: No working init found.");
     }
+
+    // 需要确保执行到这里之后，上面所有的资源都已经释放（比如arc之类的）
+
+    unsafe { arch_switch_to_user(trap_frame) };
 }
 
-fn try_to_run_init_process(path: &str) -> Result<(), SystemError> {
-    if let Err(e) = run_init_process(path.to_string()) {
+fn try_to_run_init_process(path: &str, trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    if let Err(e) = run_init_process(path.to_string(), trap_frame) {
         if e != SystemError::ENOENT {
             kerror!(
                 "Failed to run init process: {path} exists but couldn't execute it (error {:?})",
@@ -94,19 +98,15 @@ fn try_to_run_init_process(path: &str) -> Result<(), SystemError> {
         return Err(e);
     }
 
-    unreachable!();
+    Ok(())
 }
 
-#[inline(never)]
-fn run_init_process(path: String) -> Result<(), SystemError> {
+fn run_init_process(path: String, trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
     let argv = vec![path.clone()];
     let envp = vec![String::from("PATH=/")];
-    let mut trap_frame = TrapFrame::new();
 
     compiler_fence(Ordering::SeqCst);
-    Syscall::do_execve(path, argv, envp, &mut trap_frame)?;
+    Syscall::do_execve(path, argv, envp, trap_frame)?;
 
-    // 需要确保执行到这里之后，上面所有的资源都已经释放（比如arc之类的）
-
-    unsafe { arch_switch_to_user(trap_frame) };
+    Ok(())
 }

@@ -92,7 +92,7 @@ pub struct Ext2Inode {
     pub flags: u32,
     /// 操作系统依赖
     pub _os_dependent_1: [u8; 4],
-
+    /// 数组块指针
     pub blocks: [u32; EXT2_BP_NUM],
 
     /// Generation number (Primarily used for NFS)

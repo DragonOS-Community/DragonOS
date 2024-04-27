@@ -11,7 +11,6 @@ use crate::{
     process::ProcessManager,
     syscall::{Syscall, SYS_SCHED},
 };
-use alloc::string::String;
 use system_error::SystemError;
 
 use super::{
@@ -131,19 +130,6 @@ pub fn arch_syscall_init() -> Result<(), SystemError> {
     unsafe { set_system_trap_gate(0x80, 0, VirtAddr::new(syscall_int as usize)) }; // 系统调用门
     unsafe { init_syscall_64() };
     return Ok(());
-}
-
-/// 执行第一个用户进程的函数（只应该被调用一次）
-///
-/// 当进程管理重构完成后，这个函数应该被删除。调整为别的函数。
-#[no_mangle]
-pub extern "C" fn rs_exec_init_process(frame: &mut TrapFrame) -> usize {
-    let path = String::from("/bin/shell.elf");
-    let argv = vec![String::from("/bin/shell.elf")];
-    let envp = vec![String::from("PATH=/bin")];
-    let r = Syscall::do_execve(path, argv, envp, frame);
-    // kdebug!("rs_exec_init_process: r: {:?}\n", r);
-    return r.map(|_| 0).unwrap_or_else(|e| e.to_posix_errno() as usize);
 }
 
 /// syscall指令初始化函数

@@ -5,7 +5,6 @@ use crate::exception::{irqdesc::IrqReturn, IrqNumber};
 
 use super::base::device::{driver::Driver, Device, DeviceId};
 
-pub mod driver;
 pub(super) mod irq;
 pub mod mmio;
 pub mod sysfs;

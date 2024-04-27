@@ -52,6 +52,22 @@ impl PciDevice for TestDevice {
     fn dynid(&self) -> PciDeviceID {
         PciDeviceID::dummpy()
     }
+
+    fn vendor(&self) -> u16 {
+        return 0xffff;
+    }
+
+    fn device_id(&self) -> u16 {
+        return 0xffff;
+    }
+
+    fn subsystem_vendor(&self) -> u16 {
+        return 0xffff;
+    }
+
+    fn subsystem_device(&self) -> u16 {
+        return 0xffff;
+    }
 }
 
 impl Device for TestDevice {

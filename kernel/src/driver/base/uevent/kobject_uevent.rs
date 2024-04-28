@@ -37,9 +37,10 @@ Function
     zap_modalias_env
     
 */
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use crate::driver::base::kobject::{KObjectState,UEVENT_SUPPRESS};
+use num::Zero;
+use crate::driver::base::kobject::{KObjectManager, KObjectState, UEVENT_SUPPRESS};
 use crate::net::socket::Socket;
 use super::KobjectAction;
 use super::KObject;
@@ -50,8 +51,8 @@ use crate::libs::mutex::Mutex;
 use alloc::sync::Arc;
 use alloc::sync::Weak;
 use system_error::SystemError;
-use crate::mm::c_adapter::kzalloc;
-
+use crate::mm::c_adapter::{kfree, kzalloc};
+use alloc::boxed::Box;
 
 // u64 uevent_seqnum;
 // #ifdef CONFIG_UEVENT_HELPER
@@ -121,30 +122,34 @@ pub fn kobject_uevent(kobj: &dyn KObject, action: KobjectAction) -> Result<(), S
         Err(e) => Err(e), // return the error on failure
     }
 }
-pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: Option<Vec<String>>) -> Result<(), SystemError>  {
+pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: Option<Vec<String>>) -> Result<i32, SystemError>  {
     
     // todo: 定义一些常量和变量
     // init uevent env
-    let env = KobjUeventEnv {
-        argv: Vec::with_capacity(UEVENT_NUM_ENVP),
-        envp: Vec::with_capacity(UEVENT_NUM_ENVP),
-        envp_idx: 0,
-        buf: Vec::with_capacity(UEVENT_BUFFER_SIZE),
-        buflen: 0,
-    };
+    // let env = KobjUeventEnv {
+    //     argv: Vec::with_capacity(UEVENT_NUM_ENVP),
+    //     envp: Vec::with_capacity(UEVENT_NUM_ENVP),
+    //     envp_idx: 0,
+    //     buf: Vec::with_capacity(UEVENT_BUFFER_SIZE),
+    //     buflen: 0,
+    // };
     
     //let mut kset = kobj.kset();
     let subsystem: String;
     let mut state = KObjectState::empty();
+    let devpath: String;
+    let mut top_kobj = kobj;
+    let kset = kobj.kset();
+    let mut retval: i32 = 0;
     let action_string = match action {
-    KobjectAction::KOBJADD => "add",
-    KobjectAction::KOBJREMOVE => "remove",
-    KobjectAction::KOBJCHANGE => "change",
-    KobjectAction::KOBJMOVE => "move",
-    KobjectAction::KOBJONLINE => "online",
-    KobjectAction::KOBJOFFLINE => "offline",
-    KobjectAction::KOBJBIND => "bind",
-    KobjectAction::KOBJUNBIND => "unbind",
+    KobjectAction::KOBJADD => "add".to_string(),
+    KobjectAction::KOBJREMOVE => "remove".to_string(),
+    KobjectAction::KOBJCHANGE => "change".to_string(),
+    KobjectAction::KOBJMOVE => "move".to_string(),
+    KobjectAction::KOBJONLINE => "online".to_string(),
+    KobjectAction::KOBJOFFLINE => "offline".to_string(),
+    KobjectAction::KOBJBIND => "bind".to_string(),
+    KobjectAction::KOBJUNBIND => "unbind".to_string(),
     };
     /*
 	 * Mark "remove" event done regardless of result, for some subsystems
@@ -159,18 +164,17 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
 
     /* search the kset we belong to */
     
-    // let mut top_kobj = Arc::new(kobj);
-    // let weak_parent = Arc::downgrade(&top_kobj);
-    // while let Some(parent_arc) = weak_parent.upgrade().parent() {
-    //     top_kobj = Arc::clone(&parent_arc);
+    // while let Some(weak_parent) = top_kobj.parent() {
+    //     if let Some(strong_parent) = weak_parent.upgrade() {
+    //         top_kobj = strong_parent.as_ref();
+    //     }
     // }
-    // 由于引用类型的原因，上面的逻辑无法实现，是否能直接调用kset()方法找到kset？
-    if kobj.kset().is_none() {
+
+    if top_kobj.kset().is_none() {
         kdebug!("attempted to send uevent without kset!\n");
         return Err(SystemError::EINVAL);
     } 
 
-    let kset = kobj.kset();
     
 
     /* skip the event, if uevent_suppress is set*/
@@ -184,9 +188,9 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
     */
     if UEVENT_SUPPRESS == 1 {
         kdebug!("uevent_suppress caused the event to drop!");
-        return Ok(());
+        return Ok(0);
     }
-        /*
+    /*
     struct kset_kset {
         int (* const filter)(struct kobject *kobj);
         const char *(* const name)(struct kobject *kobj);
@@ -198,7 +202,7 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
     /* skip the event, if the filter returns zero. */
     if kset.as_ref().unwrap().uevent_ops.is_some() && kset.as_ref().unwrap().uevent_ops.as_ref().unwrap().filter() == None {
         kdebug!("filter caused the event to drop!");
-        return Ok(());
+        return Ok(0);
     }
 
     /* originating subsystem */
@@ -212,35 +216,206 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
     }
 
     /* environment buffer */
-    unsafe {
+    // 创建一个用于环境变量的缓冲区
 
-    env = kzalloc(sizeof(struct KobjUeventEnv), GFP_KERNEL);
-    if (env)
-    {
-        return -ENOMEM;
+    // HELP_NEEDED: linux使用的是kzalloc，这里使用Box::new ？
+    let env = Box::new(KobjUeventEnv {
+            argv: Vec::with_capacity(UEVENT_NUM_ENVP),
+            envp: Vec::with_capacity(UEVENT_NUM_ENVP),
+            envp_idx: 0,
+            buf: Vec::with_capacity(UEVENT_BUFFER_SIZE),
+            buflen: 0,
+        }) ;
+    if env.buf.is_empty(){
+        return Err(SystemError::ENOMEM);
     }
-    	
-}
+       
 
+    //获取设备的完整对象路径
+	/* complete object path */
+	// devpath = kobject_get_path(kobj, GFP_KERNEL);
+	// if (!devpath) {
+	// 	retval = -ENOENT;
+	// 	{};
+	// }
+    devpath = KObjectManager::kobject_get_path(kobj);
+    if devpath.is_empty() {
+        retval = SystemError::ENOENT.to_posix_errno();
+        // goto exit
+        drop(devpath);
+        drop(env);
+        return Ok(retval);
+    }
+    /*
+    /* default keys */
+	retval = add_uevent_var(env, "ACTION=%s", action_string);
+	if retval
+		{};
+	retval = add_uevent_var(env, "DEVPATH=%s", devpath);
+	if retval
+		{};
+	retval = add_uevent_var(env, "SUBSYSTEM=%s", subsystem);
+	if retval
+		{};
+    */
+    retval = add_uevent_var(&env, "ACTION=%s", &action_string).unwrap();
+	if retval.is_zero(){
+        // goto exit 
+        // 这里的goto目标代码较少，暂时直接复制使用，不仿写goto逻辑
+        // drop替代了kfree
+        drop(devpath);
+        drop(env);
+        return Ok(retval);
+        };
+	retval = add_uevent_var(&env, "DEVPATH=%s", &devpath).unwrap();
+	if retval.is_zero(){
+        drop(devpath);
+        drop(env);
+        return Ok(retval);
+    };
+	retval = add_uevent_var(&env, "SUBSYSTEM=%s", &subsystem).unwrap();
+	if retval.is_zero(){
+        drop(devpath);
+        drop(env);
+        return Ok(retval);
+    };
+       
+    /*
+	/* keys passed in from the caller */
+	if (envp_ext) {
+		for (i = 0; envp_ext[i]; i++) {
+			retval = add_uevent_var(env, "%s", envp_ext[i]);
+			if retval
+				{};
+		}
+	}
+     */
 
+    /* keys passed in from the caller */
     if let Some(env_ext) = envp_ext {
         for var in env_ext {
             // todo
+            let retval = add_uevent_var(&env, "%s", &var).unwrap();
+            if retval.is_zero(){
+                // goto exit
+                drop(devpath);
+                drop(env);
+                return Ok(retval);
+            }
         }
     }
-
-
+    if kset.as_ref().unwrap().uevent_ops.is_some() && kset.as_ref().unwrap().uevent_ops.as_ref().unwrap().uevent(&env) != 0 {
+        retval = kset.as_ref().unwrap().uevent_ops.as_ref().unwrap().uevent(&env);
+        if retval.is_zero(){
+            kdebug!("kset uevent caused the event to drop!");
+            // goto exit
+            drop(devpath);
+            drop(env);
+            return Ok(retval);
+        }
+    }
     match action {
         KobjectAction::KOBJADD => {
             state.insert(KObjectState::ADD_UEVENT_SENT);
         },
         KobjectAction::KOBJUNBIND => {
-            //zap_modalias_env(env);
+            zap_modalias_env(&env);
         },
         _ => {}
     }
 
-    // ... more code omitted ...
+    /*
+    mutex_lock(&uevent_sock_mutex);
+	/* we will send an event, so request a new sequence number */
+	retval = add_uevent_var(env, "SEQNUM=%llu", ++uevent_seqnum);
+	if (retval) {
+		mutex_unlock(&uevent_sock_mutex);
+		goto exit;
+	}
+	retval = kobject_uevent_net_broadcast(kobj, env, action_string,
+					      devpath);
+	mutex_unlock(&uevent_sock_mutex);
 
-    Ok(())
+#ifdef CONFIG_UEVENT_HELPER
+	/* call uevent_helper, usually only enabled during early boot */
+	if (uevent_helper[0] && !kobj_usermode_filter(kobj)) {
+		struct subprocess_info *info;
+
+		retval = add_uevent_var(env, "HOME=/");
+		if (retval)
+			goto exit;
+		retval = add_uevent_var(env,
+					"PATH=/sbin:/bin:/usr/sbin:/usr/bin");
+		if (retval)
+			goto exit;
+		retval = init_uevent_argv(env, subsystem);
+		if (retval)
+			goto exit;
+
+		retval = -ENOMEM;
+		info = call_usermodehelper_setup(env->argv[0], env->argv,
+						 env->envp, GFP_KERNEL,
+						 NULL, cleanup_uevent_env, env);
+		if (info) {
+			retval = call_usermodehelper_exec(info, UMH_NO_WAIT);
+			env = NULL;	/* freed by cleanup_uevent_env */
+		}
+	}
+#endif
+
+     */
+
+    Ok(0)
+}
+
+pub fn add_uevent_var(env: &Box<KobjUeventEnv>, format: &str, args: &String) -> Result<i32, SystemError>{
+    //todo
+    // let len: usize;
+
+    // if env.envp_idx >= env.envp.len() {
+    //     println!("add_uevent_var: too many keys");
+    //     return Err(SystemError::ENOMEM);
+    // }
+
+    // len = env.buf[env.buflen..].write_fmt(format, args).unwrap();
+
+    // if len >= env.buf.len() - env.buflen {
+    //     println!("add_uevent_var: buffer size too small");
+    //     return Err(SystemError::ENOMEM);
+    // }
+
+    // env.envp[env.envp_idx] = &env.buf[env.buflen];
+    // env.envp_idx += 1;
+    // env.buflen += len + 1;
+
+    Ok(0)
+}
+
+fn zap_modalias_env(env: &Box<KobjUeventEnv>)
+{
+    // todo
+	// static const char modalias_prefix[] = "MODALIAS=";
+	// size_t len;
+	// int i, j;
+
+	// for (i = 0; i < env->envp_idx;) {
+	// 	if (strncmp(env->envp[i], modalias_prefix,
+	// 		    sizeof(modalias_prefix) - 1)) {
+	// 		i++;
+	// 		continue;
+	// 	}
+
+	// 	len = strlen(env->envp[i]) + 1;
+
+	// 	if (i != env->envp_idx - 1) {
+	// 		memmove(env->envp[i], env->envp[i + 1],
+	// 			env->buflen - len);
+
+	// 		for (j = i; j < env->envp_idx - 1; j++)
+	// 			env->envp[j] = env->envp[j + 1] - len;
+	// 	}
+
+	// 	env->envp_idx--;
+	// 	env->buflen -= len;
+	// }
 }

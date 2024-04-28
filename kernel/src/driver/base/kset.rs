@@ -1,7 +1,5 @@
 use alloc::{
-    string::String,
-    sync::{Arc, Weak},
-    vec::Vec,
+    boxed::Box, string::String, sync::{Arc, Weak}, vec::Vec
 };
 
 use core::hash::Hash;
@@ -242,7 +240,7 @@ use core::fmt::Debug;
 pub trait KSetUeventOps : Debug + Send + Sync{
     fn filter(&self) -> Option<i32>;
     fn uevent_name(&self) -> String;
-    fn uevent(&self, env: &mut KobjUeventEnv) -> i32;
+    fn uevent(&self, env: &Box<KobjUeventEnv>) -> i32;
 }
 #[derive(Debug)]
 pub struct KSetUeventOpsDefault;
@@ -256,7 +254,7 @@ impl KSetUeventOps for KSetUeventOpsDefault{
         String::new()
     }
 
-    fn uevent(&self, env: &mut KobjUeventEnv) -> i32 {
+    fn uevent(&self, env: &Box<KobjUeventEnv>) -> i32 {
         0
     }
 }

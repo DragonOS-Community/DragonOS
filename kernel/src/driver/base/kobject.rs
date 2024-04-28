@@ -11,12 +11,10 @@ use crate::{
     filesystem::{
         kernfs::KernFSInode,
         sysfs::{sysfs_instance, Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport},
-    },
-    kerror,
-    libs::{
+    }, include::bindings::bindings::kzalloc, kerror, libs::{
         casting::DowncastArc,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
-    },
+    }
 };
 
 use system_error::SystemError;
@@ -260,6 +258,71 @@ impl KObjectManager {
         }
         kobj.set_parent(None);
     }
+
+    fn get_kobj_path_length(kobj: &dyn KObject) -> usize {
+        let mut length = 1;
+        let mut parent = kobj.parent().unwrap().upgrade().unwrap();
+        /* walk up the ancestors until we hit the one pointing to the
+        * root.
+        * Add 1 to strlen for leading '/' of each level.
+        */
+        loop {
+            if parent.name().is_empty() {
+                break;
+            }
+            length += parent.name().len() + 1;
+            if let Some(weak_parent) = parent.parent() {
+                parent= weak_parent.upgrade().unwrap();
+            }
+        }
+        return length;
+    }
+
+    /*
+    static void fill_kobj_path(struct kobject *kobj, char *path, int length)
+{
+	struct kobject *parent;
+
+	--length;
+	for (parent = kobj; parent; parent = parent->parent) {
+		int cur = strlen(kobject_name(parent));
+		/* back up enough to print this name with '/' */
+		length -= cur;
+		memcpy(path + length, kobject_name(parent), cur);
+		*(path + --length) = '/';
+	}
+
+	pr_debug("kobject: '%s' (%p): %s: path = '%s'\n", kobject_name(kobj),
+		 kobj, __func__, path);
+}
+     */
+    fn fill_kobj_path(kobj: &dyn KObject, path: *mut u8, length: usize) {
+        let mut parent = kobj.parent().unwrap().upgrade().unwrap();
+        let mut length = length;
+        length -= 1;
+        loop {
+            let cur = parent.name().len();
+            length -= cur;
+            unsafe {
+                core::ptr::copy_nonoverlapping(parent.name().as_ptr(), path.add(length), cur);
+                *path.add(length - 1) = b'/';
+            }
+            if let Some(weak_parent) = parent.parent() {
+                parent= weak_parent.upgrade().unwrap();
+            }
+        }
+    }
+    // TODO: 实现kobject_get_path
+    // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject.c#139
+        pub fn kobject_get_path(kobj: &dyn KObject) -> String {
+            let length = Self::get_kobj_path_length(kobj);
+            let path = unsafe { kzalloc(length, 0) } as *mut u8;
+            Self::fill_kobj_path(kobj, path, length);
+            let path_string = unsafe { String::from_raw_parts(path, length, length) };
+            path_string
+        }
+
+
 }
 
 /// 动态创建的kobject对象的ktype

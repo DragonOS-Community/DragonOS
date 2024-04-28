@@ -118,8 +118,9 @@ impl<'a> ZoneAllocator<'a> {
     {
         for i in 0..ZoneAllocator::MAX_BASE_SIZE_CLASSES {
             let slab = &mut self.small_slabs[i];
+            // reclaim的page数
             let just_reclaimed = slab.try_reclaim_pages(to_reclaim, &mut dealloc);
-            self.total -= just_reclaimed as u64;
+            self.total -= (just_reclaimed * OBJECT_PAGE_SIZE) as u64;
             to_reclaim = to_reclaim.saturating_sub(just_reclaimed);
             if to_reclaim == 0 {
                 break;

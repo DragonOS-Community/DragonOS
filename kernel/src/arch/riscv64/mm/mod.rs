@@ -19,7 +19,7 @@ use crate::{
     smp::cpu::ProcessorId,
 };
 
-use self::init::riscv_mm_init;
+use self::init::{riscv_mm_init, INITIAL_PGTABLE_VALUE};
 
 pub mod bump;
 pub(super) mod init;
@@ -105,7 +105,9 @@ impl MemoryManagementArch for RiscV64MMArch {
 
     const ENTRY_FLAG_PRESENT: usize = 1 << 0;
 
-    const ENTRY_FLAG_READONLY: usize = 0;
+    const ENTRY_FLAG_READONLY: usize = (1 << 1);
+
+    const ENTRY_FLAG_WRITEABLE: usize = (1 << 2);
 
     const ENTRY_FLAG_READWRITE: usize = (1 << 2) | (1 << 1);
 
@@ -183,7 +185,7 @@ impl MemoryManagementArch for RiscV64MMArch {
     }
 
     fn initial_page_table() -> PhysAddr {
-        todo!()
+        unsafe { INITIAL_PGTABLE_VALUE }
     }
 
     fn setup_new_usermapper() -> Result<UserMapper, SystemError> {

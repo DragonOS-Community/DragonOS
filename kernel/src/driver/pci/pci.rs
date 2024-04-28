@@ -1069,7 +1069,7 @@ pub fn pci_init() {
                 );
             }
             HeaderType::PciPciBridge if common_header.status & 0x10 != 0 => {
-                kinfo!("Found pci-to-pci bridge device with class code ={} subclass={} status={:#x} cap_pointer={:#x}", common_header.class_code, common_header.subclass, common_header.status, box_pci_device.as_standard_device().unwrap().capabilities_pointer);
+                kinfo!("Found pci-to-pci bridge device with class code ={} subclass={} status={:#x} cap_pointer={:#x}", common_header.class_code, common_header.subclass, common_header.status, box_pci_device.as_pci_to_pci_bridge_device().unwrap().capability_pointer);
             }
             HeaderType::PciPciBridge => {
                 kinfo!(

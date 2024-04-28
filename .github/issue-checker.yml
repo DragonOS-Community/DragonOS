@@ -18,7 +18,7 @@ labels:
 # `feature`
 - name: enhance
   content: enhancement
-  regexes: '[Ff]eat(?:\([a-zA-Z]*\))?[\:\.\,]'
+  regexes: '[Ff]eat(?:\([a-zA-Z]*/?[a-zA-Z]*\))?[\:\.\,]'
   skip-if:
   - skip all
   remove-if:
@@ -26,7 +26,7 @@ labels:
 # `Bug fix`
 - name: bug-fix
   content: Bug fix
-  regexes: '[Ff]ix(?:\([a-zA-Z]*\))?[\:\.\,]'
+  regexes: '[Ff]ix(?:\([a-zA-Z]*/?[a-zA-Z]*\))?[\:\.\,]'
   skip-if:
   - skip all
   remove-if:
@@ -34,7 +34,7 @@ labels:
 # `document`
 - name: doc
   content: documentation
-  regexes: '[Dd]ocs(?:\([a-zA-Z]*\))?[\:\.\,]'
+  regexes: '[Dd]ocs(?:\([a-zA-Z]*/?[a-zA-Z]*\))?[\:\.\,]'
   skip-if:
   - skip all
   remove-if:
@@ -42,7 +42,7 @@ labels:
 # `test`
 - name: test
   content: test
-  regexes: '[Tt]est(?:\([a-zA-Z]*\))?[\:\.\,]'
+  regexes: '[Tt]est(?:\([a-zA-Z]*/?[a-zA-Z]*\))?[\:\.\,]'
   skip-if:
   - skip all
   remove-if:

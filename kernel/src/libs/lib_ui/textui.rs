@@ -512,9 +512,8 @@ impl TextuiCharChromatic {
                         )
                     };
                 }
-
                 unsafe {
-                    addr = addr.offset(1);
+                    addr = addr.add(byte_num_of_depth);
                 }
             }
         }

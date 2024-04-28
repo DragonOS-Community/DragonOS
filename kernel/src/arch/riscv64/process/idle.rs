@@ -1,8 +1,6 @@
 use core::hint::spin_loop;
 
-use crate::{
-    arch::CurrentIrqArch, exception::InterruptArch, kBUG, kdebug, process::ProcessManager,
-};
+use crate::{arch::CurrentIrqArch, exception::InterruptArch, kBUG, process::ProcessManager};
 
 impl ProcessManager {
     /// 每个核的idle进程
@@ -15,7 +13,7 @@ impl ProcessManager {
                 spin_loop();
             }
 
-            kdebug!("idle loop");
+            // kdebug!("idle loop");
         }
     }
 }

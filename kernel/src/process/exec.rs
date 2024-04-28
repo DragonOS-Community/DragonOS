@@ -188,7 +188,7 @@ pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, Sys
         .load(param, &head_buf)
         .unwrap_or_else(|e| panic!("load_binary_file failed: error: {e:?}, param: {param:?}"));
 
-    // kdebug!("load_binary_file: load success");
+    // kdebug!("load_binary_file: load success: {result:?}");
     return Ok(result);
 }
 

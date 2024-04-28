@@ -5,6 +5,7 @@ pub mod fair;
 pub mod idle;
 pub mod pelt;
 pub mod prio;
+pub mod syscall;
 
 use core::{
     intrinsics::{likely, unlikely},
@@ -432,7 +433,7 @@ impl CpuRunQueue {
             SchedPolicy::CFS => CompletelyFairScheduler::dequeue(self, pcb, flags),
             SchedPolicy::FIFO => todo!(),
             SchedPolicy::RT => todo!(),
-            SchedPolicy::IDLE => todo!(),
+            SchedPolicy::IDLE => IdleScheduler::dequeue(self, pcb, flags),
         }
     }
 

@@ -22,7 +22,13 @@
   "clean": {
     "clean_command": "make clean"
   },
-  "envs": [],
+  "envs": [
+    {
+      "key": "CC",
+      "value": "x86_64-linux-musl-gcc"
+    }
+  ],
   "build_once": false,
-  "install_once": false
+  "install_once": false,
+  "target_arch": ["x86_64"]
 }

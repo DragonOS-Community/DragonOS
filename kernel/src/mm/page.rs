@@ -530,9 +530,18 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
                     Self::from_data(Arch::ENTRY_FLAG_DEFAULT_TABLE)
                 }
             };
-            if user {
-                r.set_user(true)
-            } else {
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                if user {
+                    r.set_user(true)
+                } else {
+                    r
+                }
+            }
+
+            #[cfg(target_arch = "riscv64")]
+            {
                 r
             }
         };
@@ -607,7 +616,9 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
             if value {
                 return self.update_flags(Arch::ENTRY_FLAG_READWRITE, true);
             } else {
-                return self.update_flags(Arch::ENTRY_FLAG_READONLY, true);
+                return self
+                    .update_flags(Arch::ENTRY_FLAG_READONLY, true)
+                    .update_flags(Arch::ENTRY_FLAG_WRITEABLE, false);
             }
         }
     }
@@ -724,13 +735,25 @@ impl<Arch: MemoryManagementArch> PageFlags<Arch> {
     /// MMIO内存的页表项标志
     #[inline(always)]
     pub fn mmio_flags() -> Self {
-        return Self::new()
-            .set_user(false)
-            .set_write(true)
-            .set_execute(true)
-            .set_page_cache_disable(true)
-            .set_page_write_through(true)
-            .set_page_global(true);
+        #[cfg(target_arch = "x86_64")]
+        {
+            Self::new()
+                .set_user(false)
+                .set_write(true)
+                .set_execute(true)
+                .set_page_cache_disable(true)
+                .set_page_write_through(true)
+                .set_page_global(true)
+        }
+
+        #[cfg(target_arch = "riscv64")]
+        {
+            Self::new()
+                .set_user(false)
+                .set_write(true)
+                .set_execute(true)
+                .set_page_global(true)
+        }
     }
 }
 
@@ -873,6 +896,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         let mut table = self.table();
         loop {
             let i = table.index_of(virt)?;
+
             assert!(i < Arch::PAGE_ENTRY_NUM);
             if table.level() == 0 {
                 compiler_fence(Ordering::SeqCst);
@@ -891,12 +915,9 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
 
                     // 清空这个页帧
                     MMArch::write_bytes(MMArch::phys_2_virt(frame).unwrap(), 0, MMArch::PAGE_SIZE);
-
                     // 设置页表项的flags
                     let flags: PageFlags<Arch> =
                         PageFlags::new_page_table(virt.kind() == PageTableKind::User);
-
-                    // kdebug!("Flags: {:?}", flags);
 
                     // 把新分配的页表映射到当前页表
                     table.set_entry(i, PageEntry::new(frame, flags));

@@ -1,11 +1,12 @@
 {
-  "name": "test_ramfs",
+  "name": "riscv_init",
   "version": "0.1.0",
-  "description": "ramfs test bench",
+  "description": "临时的riscv下的初始化程序",
+  "rust_target": null,
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "apps/test_ramfs"
+        "path": "apps/riscv_init"
       }
     }
   },
@@ -20,5 +21,7 @@
     "clean_command": "make clean"
   },
   "envs": [],
-  "target_arch": ["x86_64"]
+  "build_once": false,
+  "install_once": false,
+  "target_arch": ["riscv64"]
 }

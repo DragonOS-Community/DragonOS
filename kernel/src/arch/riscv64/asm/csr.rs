@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 pub const CSR_SSTATUS: usize = 0x100;
 pub const CSR_SSCRATCH: usize = 0x140;
 pub const CSR_SEPC: usize = 0x141;

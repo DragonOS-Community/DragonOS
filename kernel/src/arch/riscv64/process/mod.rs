@@ -1,8 +1,4 @@
-use alloc::{
-    string::String,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::sync::{Arc, Weak};
 use core::{
     arch::asm,
     intrinsics::unlikely,
@@ -28,7 +24,6 @@ use crate::{
         PROCESS_SWITCH_RESULT,
     },
     smp::cpu::ProcessorId,
-    syscall::Syscall,
 };
 
 use super::{
@@ -61,12 +56,12 @@ pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
     let trap_frame_vaddr = VirtAddr::new(
         current_pcb.kernel_stack().stack_max_address().data() - core::mem::size_of::<TrapFrame>(),
     );
+
     let new_pc = VirtAddr::new(ret_from_exception as usize);
 
     let mut arch_guard = current_pcb.arch_info_irqsave();
     arch_guard.ksp = trap_frame_vaddr.data();
 
-    arch_guard.ra = new_pc.data();
     drop(arch_guard);
 
     drop(current_pcb);
@@ -315,12 +310,6 @@ unsafe extern "C" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBI
 
 /// 在切换上下文完成后的钩子函数(必须在这里加一个跳转函数，否则会出现relocation truncated to fit: R_RISCV_JAL错误)
 unsafe extern "C" fn before_switch_finish_hook() {
-    let pcb = ProcessManager::current_pcb();
-    // kdebug!(
-    //     "before_switch_finish_hook, pid: {:?}, name: {:?}",
-    //     pcb.pid(),
-    //     pcb.basic().name()
-    // );
     switch_finish_hook();
 }
 

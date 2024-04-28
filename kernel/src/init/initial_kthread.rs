@@ -74,7 +74,6 @@ fn switch_to_user() -> ! {
 
     let mut trap_frame = TrapFrame::new();
     // 逐个尝试运行init进程
-
     if try_to_run_init_process("/bin/dragonreach", &mut trap_frame).is_err()
         && try_to_run_init_process("/bin/init", &mut trap_frame).is_err()
         && try_to_run_init_process("/bin/sh", &mut trap_frame).is_err()
@@ -83,6 +82,7 @@ fn switch_to_user() -> ! {
     }
 
     // 需要确保执行到这里之后，上面所有的资源都已经释放（比如arc之类的）
+    compiler_fence(Ordering::SeqCst);
 
     unsafe { arch_switch_to_user(trap_frame) };
 }

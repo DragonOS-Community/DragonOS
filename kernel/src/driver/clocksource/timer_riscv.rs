@@ -19,7 +19,7 @@ use crate::{
     mm::percpu::PerCpu,
     process::ProcessManager,
     smp::core::smp_get_processor_id,
-    time::TimeArch,
+    time::{clocksource::HZ, TimeArch},
 };
 
 pub struct RiscVSbiTimer;
@@ -48,6 +48,7 @@ impl RiscVSbiTimer {
         unsafe { riscv::register::sie::set_stimer() };
     }
 
+    #[allow(dead_code)]
     fn disable() {
         unsafe { riscv::register::sie::clear_stimer() };
     }
@@ -59,8 +60,7 @@ pub fn riscv_sbi_timer_init_local() {
     assert_eq!(CurrentIrqArch::is_irq_enabled(), false);
 
     if unsafe { INTERVAL_CNT } == 0 {
-        // todo: 将来正式实现时，需要除以HZ
-        let new = riscv_time_base_freq() / 3;
+        let new = riscv_time_base_freq() / HZ as usize;
         if new == 0 {
             panic!("riscv_sbi_timer_init: failed to get timebase-frequency");
         }

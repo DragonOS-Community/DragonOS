@@ -102,7 +102,6 @@ impl Syscall {
         regs.epc = load_result.entry_point().data();
         regs.status.update_spp(SPP::User);
         regs.status.update_fs(FS::Clean);
-        regs.status.update_sie(true);
         regs.status.update_sum(true);
 
         drop(param);
@@ -111,7 +110,8 @@ impl Syscall {
     }
 
     /// ## 用于控制和查询与体系结构相关的进程特定选项
-    pub fn arch_prctl(option: usize, arg2: usize) -> Result<usize, SystemError> {
+    #[allow(dead_code)]
+    pub fn arch_prctl(_option: usize, _arg2: usize) -> Result<usize, SystemError> {
         unimplemented!("Syscall::arch_prctl")
     }
 }

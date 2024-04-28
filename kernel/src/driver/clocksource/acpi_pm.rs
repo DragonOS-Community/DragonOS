@@ -34,6 +34,7 @@ fn read_pmtmr() -> u32 {
 ///
 /// ## 返回值
 /// - u32: 读取到的acpi_pmtmr值
+#[allow(dead_code)]
 pub fn acpi_pm_read_verified() -> u32 {
     let mut v2: u32;
 
@@ -167,6 +168,7 @@ const PMTMR_EXPECTED_RATE: u64 =
 /// ## 返回值
 /// - i32：如果为0则表示在预期范围内，否则不在
 #[cfg(not(target_arch = "x86_64"))]
+#[allow(dead_code)]
 fn verify_pmtmr_rate() -> bool {
     let mut count: u32 = 0;
 
@@ -216,6 +218,8 @@ fn find_acpi_pm_clock() -> Result<(), SystemError> {
 
 /// # 初始化ACPI PM Timer作为系统时钟源
 // #[unified_init(INITCALL_FS)]
+#[inline(never)]
+#[allow(dead_code)]
 pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
     let acpi_pm = Acpipm::new();
     unsafe {

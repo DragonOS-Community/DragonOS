@@ -1,6 +1,4 @@
-use crate::driver::clocksource::acpi_pm::{acpi_pm_read_verified, PMTMR_IO_PORT};
-use core::sync::atomic::Ordering;
-
+#[allow(dead_code)]
 pub const ACPI_PM_OVERRUN: u64 = 1 << 24;
 
 /// Number of PMTMR ticks expected during calibration run
@@ -12,6 +10,8 @@ pub const ACPI_PM_MASK: u64 = 0xffffff;
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
 pub fn acpi_pm_read_early() -> u32 {
+    use crate::driver::clocksource::acpi_pm::{acpi_pm_read_verified, PMTMR_IO_PORT};
+    use core::sync::atomic::Ordering;
     let port = unsafe { PMTMR_IO_PORT.load(Ordering::SeqCst) };
 
     // 如果端口为零直接返回
@@ -25,6 +25,7 @@ pub fn acpi_pm_read_early() -> u32 {
 
 #[inline(always)]
 #[cfg(not(target_arch = "x86_64"))]
+#[allow(dead_code)]
 pub fn acpi_pm_read_early() -> u32 {
     return 0;
 }

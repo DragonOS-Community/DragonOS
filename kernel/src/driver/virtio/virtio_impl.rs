@@ -79,8 +79,8 @@ unsafe impl Hal for HalImpl {
     /// @brief mmio物理地址转换为虚拟地址，不需要使用
     /// @param paddr 起始物理地址
     /// @return NonNull<u8> 虚拟地址的指针
-    unsafe fn mmio_phys_to_virt(_paddr: virtio_drivers::PhysAddr, _size: usize) -> NonNull<u8> {
-        NonNull::new((0) as _).unwrap()
+    unsafe fn mmio_phys_to_virt(paddr: virtio_drivers::PhysAddr, _size: usize) -> NonNull<u8> {
+        NonNull::new((MMArch::phys_2_virt(PhysAddr::new(paddr))).unwrap().data() as _).unwrap()
     }
     /// @brief 与真实物理设备共享
     /// @param buffer 要共享的buffer _direction：设备到driver或driver到设备

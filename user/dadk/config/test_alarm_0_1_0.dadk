@@ -22,5 +22,6 @@
   },
   "envs": [],
   "build_once": false,
-  "install_once": false
+  "install_once": false,
+  "target_arch": ["x86_64"]
 }

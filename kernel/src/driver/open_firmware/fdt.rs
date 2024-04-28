@@ -76,7 +76,7 @@ impl OpenFirmwareFdtDriver {
 
     /// 获取FDT的引用
     pub fn fdt_ref(&self) -> Result<Fdt<'static>, SystemError> {
-        let fdt_vaddr = boot_params().read().fdt().unwrap();
+        let fdt_vaddr = boot_params().read().fdt().ok_or(SystemError::ENODEV)?;
         let fdt: Fdt<'_> = unsafe {
             fdt::Fdt::from_ptr(fdt_vaddr.as_ptr()).map_err(|e| {
                 kerror!("failed to parse fdt, err={:?}", e);
@@ -213,10 +213,7 @@ impl OpenFirmwareFdtDriver {
         use crate::{
             arch::MMArch,
             libs::align::page_align_down,
-            mm::{
-                memblock::{mem_block_manager, MemBlockManager},
-                MemoryManagementArch, PhysAddr,
-            },
+            mm::{memblock::MemBlockManager, MemoryManagementArch},
         };
 
         let mut base = base as usize;

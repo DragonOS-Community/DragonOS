@@ -7,7 +7,7 @@ GARBAGE := $(foreach DIR,$(DIRS),$(addprefix $(DIR)/,$(GARBAGE_PATTERNS)))
 
 DADK_VERSION=$(shell dadk -V | awk 'END {print $$2}')
 # 最小的DADK版本
-MIN_DADK_VERSION = 0.1.10
+MIN_DADK_VERSION = 0.1.11
 DADK_CACHE_DIR = $(ROOT_PATH)/bin/dadk_cache
 
 ECHO:

@@ -1,8 +1,4 @@
-use alloc::{
-    string::String,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::sync::{Arc, Weak};
 use core::{
     arch::asm,
     intrinsics::unlikely,
@@ -19,7 +15,7 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    kdebug, kerror,
+    kerror,
     libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{
@@ -52,8 +48,49 @@ static BSP_IDLE_STACK_SPACE: InitProcUnion = InitProcUnion {
     idle_stack: [0; 32768],
 };
 
-pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<String>) -> ! {
-    unimplemented!("RiscV64 arch_switch_to_user")
+pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
+    // 以下代码不能发生中断
+    CurrentIrqArch::interrupt_disable();
+
+    let current_pcb = ProcessManager::current_pcb();
+    let trap_frame_vaddr = VirtAddr::new(
+        current_pcb.kernel_stack().stack_max_address().data() - core::mem::size_of::<TrapFrame>(),
+    );
+
+    let new_pc = VirtAddr::new(ret_from_exception as usize);
+
+    let mut arch_guard = current_pcb.arch_info_irqsave();
+    arch_guard.ksp = trap_frame_vaddr.data();
+
+    drop(arch_guard);
+
+    drop(current_pcb);
+
+    compiler_fence(Ordering::SeqCst);
+
+    // 重要！在这里之后，一定要保证上面的引用计数变量、动态申请的变量、锁的守卫都被drop了，否则可能导致内存安全问题！
+
+    *(trap_frame_vaddr.data() as *mut TrapFrame) = trap_frame;
+
+    compiler_fence(Ordering::SeqCst);
+    ready_to_switch_to_user(trap_frame_vaddr.data(), new_pc.data());
+}
+
+#[naked]
+unsafe extern "C" fn ready_to_switch_to_user(trap_frame: usize, new_pc: usize) -> ! {
+    asm!(
+        concat!(
+            "
+            // 设置trap frame
+            mv sp, a0
+            // 设置返回地址
+            
+            jr a1
+            
+            "
+        ),
+        options(noreturn)
+    );
 }
 
 impl ProcessManager {
@@ -98,6 +135,7 @@ impl ProcessManager {
         let current_arch_guard = current_pcb.arch_info_irqsave();
         // 拷贝浮点寄存器的状态
         new_arch_guard.fp_state = current_arch_guard.fp_state;
+        new_arch_guard.sstatus = current_arch_guard.sstatus;
 
         drop(current_arch_guard);
 
@@ -128,11 +166,11 @@ impl ProcessManager {
     /// 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/riscv/include/asm/switch_to.h#76
     pub unsafe fn switch_process(prev: Arc<ProcessControlBlock>, next: Arc<ProcessControlBlock>) {
         assert!(!CurrentIrqArch::is_irq_enabled());
-        kdebug!(
-            "riscv switch process: prev: {:?}, next: {:?}",
-            prev.pid(),
-            next.pid()
-        );
+        // kdebug!(
+        //     "riscv switch process: prev: {:?}, next: {:?}",
+        //     prev.pid(),
+        //     next.pid()
+        // );
         Self::switch_process_fpu(&prev, &next);
         Self::switch_local_context(&prev, &next);
 
@@ -144,6 +182,8 @@ impl ProcessManager {
         drop(next_addr_space);
         compiler_fence(Ordering::SeqCst);
 
+        // kdebug!("current sum={}, prev sum={}, next_sum={}", riscv::register::sstatus::read().sum(), prev.arch_info_irqsave().sstatus.sum(), next.arch_info_irqsave().sstatus.sum());
+
         // 获取arch info的锁，并强制泄露其守卫（切换上下文后，在switch_finish_hook中会释放锁）
         let next_arch = SpinLockGuard::leak(next.arch_info_irqsave()) as *mut ArchPCBInfo;
         let prev_arch = SpinLockGuard::leak(prev.arch_info_irqsave()) as *mut ArchPCBInfo;
@@ -153,7 +193,7 @@ impl ProcessManager {
         ProcessManager::current_pcb().preempt_enable();
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
-        kdebug!("riscv switch process: before to inner");
+        // kdebug!("riscv switch process: before to inner");
         compiler_fence(Ordering::SeqCst);
         // 正式切换上下文
         switch_to_inner(prev_arch, next_arch);
@@ -206,8 +246,8 @@ unsafe extern "C" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBI
 
             addi sp , sp, -8
             sd a1, 0(sp)
-            csrr a0, sstatus
-            sd a0, {off_sstatus}(a1)
+            csrr a1, sstatus
+            sd a1, {off_sstatus}(a0)
             ld a1, 0(sp)
             addi sp, sp, 8
 
@@ -270,14 +310,7 @@ unsafe extern "C" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBI
 
 /// 在切换上下文完成后的钩子函数(必须在这里加一个跳转函数，否则会出现relocation truncated to fit: R_RISCV_JAL错误)
 unsafe extern "C" fn before_switch_finish_hook() {
-    let pcb = ProcessManager::current_pcb();
-    kdebug!(
-        "before_switch_finish_hook, pid: {:?}, name: {:?}",
-        pcb.pid(),
-        pcb.basic().name()
-    );
     switch_finish_hook();
-    kdebug!("after switch_finish_hook");
 }
 
 impl ProcessControlBlock {
@@ -344,6 +377,8 @@ impl ArchPCBInfo {
     ///
     /// 返回一个新的ArchPCBInfo
     pub fn new(kstack: &KernelStack) -> Self {
+        let mut sstatus = Sstatus::from(0);
+        sstatus.update_sum(true);
         Self {
             ra: 0,
             ksp: kstack.stack_max_address().data(),
@@ -359,7 +394,7 @@ impl ArchPCBInfo {
             s9: 0,
             s10: 0,
             s11: 0,
-            sstatus: Sstatus::from(0),
+            sstatus,
             fp_state: FpDExtState::new(),
             local_context: LocalContext::new(ProcessorId::new(0)),
         }

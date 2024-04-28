@@ -1,8 +1,12 @@
 use system_error::SystemError;
 
 use crate::{
-    arch::CurrentIrqArch, exception::InterruptArch, kerror, kwarn, mm::VirtAddr, print,
-    process::ProcessManager, smp::core::smp_get_processor_id,
+    arch::{CurrentIrqArch, MMArch},
+    exception::InterruptArch,
+    kerror, kwarn,
+    mm::VirtAddr,
+    process::ProcessManager,
+    smp::core::smp_get_processor_id,
 };
 
 use super::{
@@ -31,6 +35,46 @@ extern "C" {
     fn trap_machine_check();
     fn trap_SIMD_exception();
     fn trap_virtualization_exception();
+}
+
+bitflags! {
+    pub struct TrapNr: u64 {
+        const X86_TRAP_DE = 0;
+        const X86_TRAP_DB = 1;
+        const X86_TRAP_NMI = 2;
+        const X86_TRAP_BP = 3;
+        const X86_TRAP_OF = 4;
+        const X86_TRAP_BR = 5;
+        const X86_TRAP_UD = 6;
+        const X86_TRAP_NM = 7;
+        const X86_TRAP_DF = 8;
+        const X86_TRAP_OLD_MF = 9;
+        const X86_TRAP_TS = 10;
+        const X86_TRAP_NP = 11;
+        const X86_TRAP_SS = 12;
+        const X86_TRAP_GP = 13;
+        const X86_TRAP_PF = 14;
+        const X86_TRAP_SPURIOUS = 15;
+        const X86_TRAP_MF = 16;
+        const X86_TRAP_AC = 17;
+        const X86_TRAP_MC = 18;
+        const X86_TRAP_XF = 19;
+        const X86_TRAP_VE = 20;
+        const X86_TRAP_CP = 21;
+        const X86_TRAP_VC = 29;
+        const X86_TRAP_IRET = 32;
+    }
+
+        pub struct X86PfErrorCode : u32{
+        const X86_PF_PROT = 1 << 0;
+        const X86_PF_WRITE = 1 << 1;
+        const X86_PF_USER = 1 << 2;
+        const X86_PF_RSVD = 1 << 3;
+        const X86_PF_INSTR = 1 << 4;
+        const X86_PF_PK = 1 << 5;
+        const X86_PF_SHSTK = 1 << 6;
+        const X86_PF_SGX = 1 << 15;
+    }
 }
 
 #[inline(never)]
@@ -319,42 +363,59 @@ Segment Selector Index: {:#x}\n
 /// 处理页错误 14 #PF
 #[no_mangle]
 unsafe extern "C" fn do_page_fault(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
-        "do_page_fault(14), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}, \nFault Address: {:#x}",
-        error_code,
-        regs.rsp,
-        regs.rip,
-        smp_get_processor_id().data(),
-        ProcessManager::current_pid(),
-        x86::controlregs::cr2()
-    );
+    // kerror!(
+    //     "do_page_fault(14), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}, \nFault Address: {:#x}",
+    //     error_code,
+    //     regs.rsp,
+    //     regs.rip,
+    //     smp_get_processor_id().data(),
+    //     ProcessManager::current_pid(),
+    //     x86::controlregs::cr2()
+    // );
 
-    if (error_code & 0x01) == 0 {
-        print!("Page Not Present,\t");
-    }
-    if (error_code & 0x02) != 0 {
-        print!("Write Access,\t");
+    // if (error_code & 0x01) == 0 {
+    //     print!("Page Not Present,\t");
+    // }
+    // if (error_code & 0x02) != 0 {
+    //     print!("Write Access,\t");
+    // } else {
+    //     print!("Read Access,\t");
+    // }
+
+    // if (error_code & 0x04) != 0 {
+    //     print!("Fault in user(3),\t");
+    // } else {
+    //     print!("Fault in supervisor(0,1,2),\t");
+    // }
+
+    // if (error_code & 0x08) != 0 {
+    //     print!("Reserved bit violation cause fault,\t");
+    // }
+
+    // if (error_code & 0x10) != 0 {
+    //     print!("Instruction fetch cause fault,\t");
+    // }
+    // print!("\n");
+
+    // CurrentIrqArch::interrupt_enable();
+    // panic!("Page Fault");
+    CurrentIrqArch::interrupt_disable();
+    let address = x86::controlregs::cr2();
+    // crate::kinfo!(
+    //     "fault address: {:#x}, error_code: {:#b}, pid: {}\n",
+    //     address,
+    //     error_code,
+    //     ProcessManager::current_pid().data()
+    // );
+
+    let address = VirtAddr::new(address);
+    let error_code = X86PfErrorCode::from_bits_truncate(error_code as u32);
+    if address.check_user() {
+        MMArch::do_user_addr_fault(regs, error_code, address);
     } else {
-        print!("Read Access,\t");
+        MMArch::do_kern_addr_fault(regs, error_code, address);
     }
-
-    if (error_code & 0x04) != 0 {
-        print!("Fault in user(3),\t");
-    } else {
-        print!("Fault in supervisor(0,1,2),\t");
-    }
-
-    if (error_code & 0x08) != 0 {
-        print!("Reserved bit violation cause fault,\t");
-    }
-
-    if (error_code & 0x10) != 0 {
-        print!("Instruction fetch cause fault,\t");
-    }
-    print!("\n");
-
     CurrentIrqArch::interrupt_enable();
-    panic!("Page Fault");
 }
 
 /// 处理x87 FPU错误 16 #MF

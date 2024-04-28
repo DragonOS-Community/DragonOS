@@ -276,7 +276,7 @@ make clean
 # 下载DragonStub
 git submodule update --init --recursive --force
 
-make kernel -j $(nproc) && make write_diskimage && make qemu
+make run
 ```
 
 请注意，由于是在控制台运行qemu，当你想要退出的时候，输入`Ctrl+A`然后按`X`即可。

@@ -43,6 +43,9 @@ pub const NSEC_PER_SEC: u32 = 1000000000;
 #[allow(dead_code)]
 pub const FSEC_PER_SEC: u64 = 1000000000000000;
 
+/// The clock frequency of the i8253/i8254 PIT
+pub const PIT_TICK_RATE: u64 = 1193182;
+
 /// 表示时间的结构体，符合POSIX标准。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]

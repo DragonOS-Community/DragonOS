@@ -17,7 +17,7 @@ impl SMPArch for RiscV64SMPArch {
         Ok(())
     }
 
-    fn start_cpu(cpu_id: ProcessorId, hp_state: &CpuHpCpuState) -> Result<(), SystemError> {
+    fn start_cpu(_cpu_id: ProcessorId, _hp_state: &CpuHpCpuState) -> Result<(), SystemError> {
         kwarn!("RiscV64SMPArch::start_cpu() is not implemented");
         Ok(())
     }

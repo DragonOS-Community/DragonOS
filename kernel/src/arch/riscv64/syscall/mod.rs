@@ -29,6 +29,7 @@ macro_rules! syscall_return {
 }
 
 pub(super) fn syscall_handler(syscall_num: usize, frame: &mut TrapFrame) -> () {
+    // kdebug!("syscall_handler: syscall_num: {}", syscall_num);
     unsafe {
         CurrentIrqArch::interrupt_enable();
     }

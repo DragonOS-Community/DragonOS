@@ -19,7 +19,7 @@ use crate::{
     smp::cpu::ProcessorId,
 };
 
-use self::init::riscv_mm_init;
+use self::init::{riscv_mm_init, INITIAL_PGTABLE_VALUE};
 
 pub mod bump;
 pub(super) mod init;
@@ -42,8 +42,6 @@ pub(self) static INNER_ALLOCATOR: SpinLock<Option<BuddyAllocator<MMArch>>> = Spi
 pub struct RiscV64MMArch;
 
 impl RiscV64MMArch {
-    pub const ENTRY_FLAG_GLOBAL: usize = 1 << 5;
-
     /// 使远程cpu的TLB中，指定地址范围的页失效
     pub fn remote_invalidate_page(
         cpu: ProcessorId,
@@ -85,6 +83,9 @@ const KERNEL_TOP_PAGE_ENTRY_NO: usize = (RiscV64MMArch::PHYS_OFFSET
     >> (RiscV64MMArch::ENTRY_ADDRESS_SHIFT - RiscV64MMArch::PAGE_ENTRY_SHIFT);
 
 impl MemoryManagementArch for RiscV64MMArch {
+    /// riscv64暂不支持缺页中断
+    const PAGE_FAULT_ENABLED: bool = false;
+
     const PAGE_SHIFT: usize = 12;
 
     const PAGE_ENTRY_SHIFT: usize = 9;
@@ -104,12 +105,14 @@ impl MemoryManagementArch for RiscV64MMArch {
 
     const ENTRY_FLAG_PRESENT: usize = 1 << 0;
 
-    const ENTRY_FLAG_READONLY: usize = 0;
+    const ENTRY_FLAG_READONLY: usize = (1 << 1);
+
+    const ENTRY_FLAG_WRITEABLE: usize = (1 << 2);
 
     const ENTRY_FLAG_READWRITE: usize = (1 << 2) | (1 << 1);
 
     const ENTRY_FLAG_USER: usize = (1 << 4);
-
+    const ENTRY_ADDRESS_MASK: usize = Self::ENTRY_ADDRESS_SIZE - (1 << 10);
     const ENTRY_FLAG_WRITE_THROUGH: usize = (2 << 61);
 
     const ENTRY_FLAG_CACHE_DISABLE: usize = (2 << 61);
@@ -119,6 +122,7 @@ impl MemoryManagementArch for RiscV64MMArch {
     const ENTRY_FLAG_EXEC: usize = (1 << 3);
     const ENTRY_FLAG_ACCESSED: usize = (1 << 6);
     const ENTRY_FLAG_DIRTY: usize = (1 << 7);
+    const ENTRY_FLAG_GLOBAL: usize = (1 << 5);
 
     const PHYS_OFFSET: usize = 0xffff_ffc0_0000_0000;
     const KERNEL_LINK_OFFSET: usize = 0x1000000;
@@ -138,6 +142,8 @@ impl MemoryManagementArch for RiscV64MMArch {
     const MMIO_BASE: VirtAddr = VirtAddr::new(0xffff_ffff_8000_0000);
     /// 设置1g的MMIO空间
     const MMIO_SIZE: usize = 1 << PAGE_1G_SHIFT;
+
+    const ENTRY_FLAG_HUGE_PAGE: usize = Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_READWRITE;
 
     #[inline(never)]
     unsafe fn init() {
@@ -179,7 +185,7 @@ impl MemoryManagementArch for RiscV64MMArch {
     }
 
     fn initial_page_table() -> PhysAddr {
-        todo!()
+        unsafe { INITIAL_PGTABLE_VALUE }
     }
 
     fn setup_new_usermapper() -> Result<UserMapper, SystemError> {
@@ -238,6 +244,15 @@ impl MemoryManagementArch for RiscV64MMArch {
         let ppn = PhysPageFrame::new(paddr).ppn();
         let r = ((ppn & ((1 << 54) - 1)) << 10) | page_flags;
         return r;
+    }
+
+    fn vma_access_permitted(
+        _vma: alloc::sync::Arc<crate::mm::ucontext::LockedVMA>,
+        _write: bool,
+        _execute: bool,
+        _foreign: bool,
+    ) -> bool {
+        true
     }
 }
 

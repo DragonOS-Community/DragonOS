@@ -20,7 +20,9 @@ use crate::{
 };
 
 use super::{
-    guid::{EFI_MEMORY_ATTRIBUTES_TABLE_GUID, EFI_MEMRESERVE_TABLE_GUID},
+    guid::{
+        EFI_MEMORY_ATTRIBUTES_TABLE_GUID, EFI_MEMRESERVE_TABLE_GUID, EFI_SYSTEM_RESOURCE_TABLE_GUID,
+    },
     EFIManager,
 };
 
@@ -29,6 +31,7 @@ static TABLE_PARSERS: &[&TableMatcher] = &[
     &TableMatcher::new(&MatchTableDragonStubPayloadEFI),
     &TableMatcher::new(&MatchTableMemoryAttributes),
     &TableMatcher::new(&MatchTableMemReserve),
+    &TableMatcher::new(&MatchTableEsrt),
 ];
 
 impl EFIManager {
@@ -99,7 +102,7 @@ impl EFIManager {
         }
 
         // 如果存在mem reserve table
-        if let Some(mem_reserve) = efi_manager().inner.read().memreserve_table_paddr {
+        if let Some(mem_reserve) = efi_manager().inner_read().memreserve_table_paddr {
             let mut prev_paddr = mem_reserve;
             while !prev_paddr.is_null() {
                 let vaddr = EarlyIoRemap::map_not_aligned(prev_paddr, MMArch::PAGE_SIZE, true)
@@ -283,7 +286,7 @@ impl MatchTable for MatchTableDragonStubPayloadEFI {
         let vendor_table_vaddr = vendor_table_vaddr.unwrap();
         let data = unsafe { *(vendor_table_vaddr.data() as *const DragonStubPayloadEFI) };
 
-        efi_manager().inner.write().dragonstub_load_info = Some(data);
+        efi_manager().inner_write().dragonstub_load_info = Some(data);
 
         return Ok(());
     }
@@ -345,6 +348,33 @@ impl MatchTable for MatchTableMemReserve {
             "memreserve_table_paddr: {:#x}",
             table_raw.vendor_table as usize
         );
+        return Ok(());
+    }
+}
+
+struct MatchTableEsrt;
+
+impl MatchTable for MatchTableEsrt {
+    fn name(&self) -> &'static str {
+        "ESRT"
+    }
+
+    fn guid(&self) -> &'static uefi_raw::Guid {
+        &EFI_SYSTEM_RESOURCE_TABLE_GUID
+    }
+
+    fn map_size(&self) -> usize {
+        0
+    }
+
+    fn post_process(
+        &self,
+        _vendor_table_vaddr: Option<VirtAddr>,
+        table_raw: &ConfigurationTable,
+    ) -> Result<(), SystemError> {
+        efi_manager().inner.write_irqsave().esrt_table_paddr =
+            Some(PhysAddr::new(table_raw.vendor_table as usize));
+        kdebug!("esrt_table_paddr: {:#x}", table_raw.vendor_table as usize);
         return Ok(());
     }
 }

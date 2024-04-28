@@ -21,7 +21,7 @@ pub struct PhysPageFrame {
 impl PhysPageFrame {
     pub fn new(paddr: PhysAddr) -> Self {
         return Self {
-            number: paddr.data() / MMArch::PAGE_SIZE,
+            number: paddr.data() >> MMArch::PAGE_SHIFT,
         };
     }
 

@@ -124,9 +124,9 @@ pub struct Ext2SuperBlock {
     pub free_inode_count: u32,
     /// 包含超级块的数据块
     pub first_data_block: u32,
-    /// 块大小
+    /// 块大小偏移量 1024 << block_size
     pub block_size: u32,
-    /// 片段大小
+    /// 片段大小偏移量 1024 << fragment_size
     pub fragment_size: i32,
     /// 每组中块数量
     pub blocks_per_group: u32,
@@ -167,23 +167,23 @@ pub struct Ext2SuperBlock {
     // major version >= 1
     /// First non-reserved inode
     pub first_ino: u32,
-    /* size of inode structure */
+    /// inode大小
     pub inode_size: u16,
-    /* block group # of this superblock */
+    /// block group # of this superblock 
     pub super_block_group: u16,
-    /* compatible feature set */
+    /// 兼容功能集
     pub feature_compat: u32,
-    /* incompatible feature set */
+    /// 不兼容的功能集
     pub feature_incompat: u32,
-    /* readonly-compatible feature set */
+    /// 只读兼容功能集
     pub feature_ro_compat: u32,
-    /* 128-bit uuid for volume 16*/
+    /// 卷的uuid
     pub uuid: Vec<u8>,
-    /* volume name 16*/
+    /// 卷名
     pub volume_name: Vec<u8>,
-    /* directory where last mounted  64bytes*/
+    /// 上一次挂载的路径
     pub last_mounted_path: Vec<u8>,
-    /// algorithm for compression
+    /// 压缩算法位图
     pub algorithm_usage_bitmap: u32,
     /// 为文件预分配的块数
     pub prealloc_blocks: u8,
@@ -196,7 +196,7 @@ pub struct Ext2SuperBlock {
     pub journal_inode: u32,
     /// 日志设备
     pub journal_device: u32,
-    /// start of list of inodes to delete
+    /// 要删除的inode链表头
     pub last_orphan: u32,
     /// 凑成1024B
     padding2: Vec<u32>,

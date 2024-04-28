@@ -69,7 +69,7 @@ struct HurdOsd2 {
 /// 磁盘中存储的inode
 pub struct Ext2Inode {
     /// 文件类型和权限，高四位代表文件类型，其余代表权限
-    pub mode: u16,
+    pub mode: u16
     /// 文件所有者
     pub uid: u16,
     /// 文件大小
@@ -92,7 +92,7 @@ pub struct Ext2Inode {
     pub flags: u32,
     /// 操作系统依赖
     pub _os_dependent_1: [u8; 4],
-
+    /// 数组块指针
     pub blocks: [u32; EXT2_BP_NUM],
 
     /// Generation number (Primarily used for NFS)

@@ -1,10 +1,10 @@
 use core::{hint::spin_loop, sync::atomic::Ordering};
 
-use alloc::{string::ToString, sync::Arc};
+use alloc::sync::Arc;
 use system_error::SystemError;
 
 use crate::{
-    driver::{base::block::disk_info::Partition, disk::ahci},
+    driver::base::block::disk_info::Partition,
     filesystem::{
         devfs::devfs_init,
         fat::fs::FATFileSystem,
@@ -116,7 +116,8 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
 fn root_partition() -> Arc<Partition> {
     #[cfg(target_arch = "x86_64")]
     {
-        return ahci::get_disks_by_name("ahci_disk_0".to_string())
+        use alloc::string::ToString;
+        return crate::driver::disk::ahci::get_disks_by_name("ahci_disk_0".to_string())
             .unwrap()
             .0
             .lock()

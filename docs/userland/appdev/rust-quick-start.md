@@ -39,4 +39,3 @@ cargo generate --git https://git.mirrors.dragonos.org/DragonOS-Community/Rust-Ap
 如果您需要移植别的库/程序到DragonOS，请参考模板内的配置。
 
 由于DragonOS目前不支持动态链接，因此目前需要在RUSTFLAGS里面指定`-C target-feature=+crt-static -C link-arg=-no-pie`
-并且需要使用上文提到的工具链`nightly-2023-08-15-x86_64-unknown-linux_dragonos-gnu`

@@ -19,7 +19,6 @@ use crate::{
         irqdata::IrqHandlerData,
         irqdesc::{IrqHandleFlags, IrqHandler, IrqReturn},
         manage::irq_manager,
-        softirq::{softirq_vectors, SoftirqNumber},
         InterruptArch, IrqNumber,
     },
     kdebug, kerror, kinfo,
@@ -33,7 +32,7 @@ use crate::{
     },
     time::{
         jiffies::NSEC_PER_JIFFY,
-        timer::{clock, timer_get_first_expire, update_timer_jiffies},
+        timer::{try_raise_timer_softirq, update_timer_jiffies},
     },
 };
 
@@ -252,11 +251,7 @@ impl Hpet {
             assert!(!CurrentIrqArch::is_irq_enabled());
             update_timer_jiffies(1, Self::HPET0_INTERVAL_USEC as i64);
 
-            if let Ok(first_expire) = timer_get_first_expire() {
-                if first_expire <= clock() {
-                    softirq_vectors().raise_softirq(SoftirqNumber::TIMER);
-                }
-            }
+            try_raise_timer_softirq();
         }
     }
 }

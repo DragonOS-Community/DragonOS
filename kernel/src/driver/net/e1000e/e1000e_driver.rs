@@ -1,16 +1,18 @@
 //这个文件的绝大部分内容是copy virtio_net.rs的，考虑到所有的驱动都要用操作系统提供的协议栈，我觉得可以把这些内容抽象出来
 
 use crate::{
+    arch::rand::rand,
     driver::{
         base::{
-            device::{bus::Bus, driver::Driver, Device, IdTable},
+            class::Class,
+            device::{bus::Bus, driver::Driver, Device, DeviceType, IdTable},
             kobject::{KObjType, KObject, KObjectState},
         },
-        net::NetDriver,
+        net::NetDevice,
     },
     kinfo,
     libs::spinlock::SpinLock,
-    net::{generate_iface_id, NET_DRIVERS},
+    net::{generate_iface_id, NET_DEVICES},
     time::Instant,
 };
 use alloc::{
@@ -22,7 +24,10 @@ use core::{
     fmt::Debug,
     ops::{Deref, DerefMut},
 };
-use smoltcp::{phy, wire};
+use smoltcp::{
+    phy,
+    wire::{self, HardwareAddress},
+};
 use system_error::SystemError;
 
 use super::e1000e::{E1000EBuffer, E1000EDevice};
@@ -102,15 +107,11 @@ impl phy::TxToken for E1000ETxToken {
 impl E1000EDriver {
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(device: E1000EDevice) -> Self {
-        let mut iface_config = smoltcp::iface::Config::new();
-
-        // todo: 随机设定这个值。
-        // 参见 https://docs.rs/smoltcp/latest/smoltcp/iface/struct.Config.html#structfield.random_seed
-        iface_config.random_seed = 12345;
-
-        iface_config.hardware_addr = Some(wire::HardwareAddress::Ethernet(
+        let mut iface_config = smoltcp::iface::Config::new(HardwareAddress::Ethernet(
             smoltcp::wire::EthernetAddress(device.mac_address()),
         ));
+
+        iface_config.random_seed = rand() as u64;
 
         let inner: Arc<SpinLock<E1000EDevice>> = Arc::new(SpinLock::new(device));
         let result = E1000EDriver { inner };
@@ -175,16 +176,13 @@ impl phy::Device for E1000EDriver {
 impl E1000EInterface {
     pub fn new(mut driver: E1000EDriver) -> Arc<Self> {
         let iface_id = generate_iface_id();
-        let mut iface_config = smoltcp::iface::Config::new();
-
-        // todo: 随机设定这个值。
-        // 参见 https://docs.rs/smoltcp/latest/smoltcp/iface/struct.Config.html#structfield.random_seed
-        iface_config.random_seed = 12345;
-
-        iface_config.hardware_addr = Some(wire::HardwareAddress::Ethernet(
+        let mut iface_config = smoltcp::iface::Config::new(HardwareAddress::Ethernet(
             smoltcp::wire::EthernetAddress(driver.inner.lock().mac_address()),
         ));
-        let iface = smoltcp::iface::Interface::new(iface_config, &mut driver);
+        iface_config.random_seed = rand() as u64;
+
+        let iface =
+            smoltcp::iface::Interface::new(iface_config, &mut driver, Instant::now().into());
 
         let driver: E1000EDriverWrapper = E1000EDriverWrapper(UnsafeCell::new(driver));
         let result = Arc::new(E1000EInterface {
@@ -208,33 +206,49 @@ impl Debug for E1000EInterface {
     }
 }
 
-impl Driver for E1000EInterface {
-    fn id_table(&self) -> Option<IdTable> {
+impl Device for E1000EInterface {
+    fn dev_type(&self) -> DeviceType {
         todo!()
     }
 
-    fn add_device(&self, _device: Arc<dyn Device>) {
-        todo!()
-    }
-
-    fn delete_device(&self, _device: &Arc<dyn Device>) {
-        todo!()
-    }
-
-    fn devices(&self) -> alloc::vec::Vec<Arc<dyn Device>> {
-        todo!()
-    }
-
-    fn bus(&self) -> Option<Weak<dyn Bus>> {
+    fn id_table(&self) -> IdTable {
         todo!()
     }
 
     fn set_bus(&self, _bus: Option<Weak<dyn Bus>>) {
         todo!()
     }
+
+    fn set_class(&self, _class: Option<Weak<dyn Class>>) {
+        todo!()
+    }
+
+    fn driver(&self) -> Option<Arc<dyn Driver>> {
+        todo!()
+    }
+
+    fn set_driver(&self, _driver: Option<Weak<dyn Driver>>) {
+        todo!()
+    }
+
+    fn is_dead(&self) -> bool {
+        todo!()
+    }
+
+    fn can_match(&self) -> bool {
+        todo!()
+    }
+
+    fn set_can_match(&self, _can_match: bool) {
+        todo!()
+    }
+
+    fn state_synced(&self) -> bool {
+        todo!()
+    }
 }
 
-impl NetDriver for E1000EInterface {
+impl NetDevice for E1000EInterface {
     fn mac(&self) -> smoltcp::wire::EthernetAddress {
         let mac = self.driver.inner.lock().mac_address();
         return smoltcp::wire::EthernetAddress::from_bytes(&mac);
@@ -350,7 +364,7 @@ pub fn e1000e_driver_init(device: E1000EDevice) {
     let driver = E1000EDriver::new(device);
     let iface = E1000EInterface::new(driver);
     // 将网卡的接口信息注册到全局的网卡接口信息表中
-    NET_DRIVERS
+    NET_DEVICES
         .write_irqsave()
         .insert(iface.nic_id(), iface.clone());
     kinfo!("e1000e driver init successfully!\tMAC: [{}]", mac);

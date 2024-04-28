@@ -155,7 +155,6 @@ impl File {
             readdir_subdirs_name: SpinLock::new(Vec::default()),
             private_data: SpinLock::new(FilePrivateData::default()),
         };
-        // kdebug!("inode:{:?}",f.inode);
         f.inode.open(f.private_data.lock(), &mode)?;
 
         return Ok(f);
@@ -516,7 +515,7 @@ impl File {
 
                 return socket.remove_epoll(epoll);
             }
-            _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+            _ => return Err(SystemError::ENOSYS),
         }
     }
 
@@ -634,11 +633,6 @@ impl FileDescriptorVec {
     ///
     /// - `fd` 文件描述符序号
     pub fn drop_fd(&mut self, fd: i32) -> Result<(), SystemError> {
-        // 判断文件描述符的数字是否超过限制
-        if !FileDescriptorVec::validate_fd(fd) {
-            return Err(SystemError::EBADF);
-        }
-
         self.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
 
         // 把文件描述符数组对应位置设置为空

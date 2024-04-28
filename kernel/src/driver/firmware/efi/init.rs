@@ -5,7 +5,10 @@ use uefi_raw::table::boot::{MemoryAttribute, MemoryType};
 
 use crate::{
     arch::MMArch,
-    driver::{firmware::efi::EFIInitFlags, open_firmware::fdt::open_firmware_fdt_driver},
+    driver::{
+        firmware::efi::{esrt::efi_esrt_init, EFIInitFlags},
+        open_firmware::fdt::open_firmware_fdt_driver,
+    },
     libs::align::{page_align_down, page_align_up},
     mm::{
         allocator::page_frame::PhysPageFrame, early_ioremap::EarlyIoRemap,
@@ -66,6 +69,11 @@ pub fn efi_init() {
     // todo: 模仿Linux的行为，做好接下来的几步工作：
     // 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/firmware/efi/efi-init.c#217
 
+    // todo: early_init_dt_check_for_usable_mem_range
+
+    efi_find_mirror();
+    efi_esrt_init();
+
     // 保留mmap table的内存
     let base = page_align_down(data_from_fdt.mmap_base.unwrap() as usize);
     let offset = data_from_fdt.mmap_base.unwrap() as usize - base;
@@ -78,7 +86,7 @@ pub fn efi_init() {
         .expect("Failed to reserve memory for EFI mmap table");
 
     // 保留内核的内存
-    if let Some(info) = efi_manager().inner.read().dragonstub_load_info {
+    if let Some(info) = efi_manager().inner_read().dragonstub_load_info {
         mem_block_manager()
             .reserve_block(
                 PhysAddr::new(info.paddr as usize),
@@ -90,6 +98,31 @@ pub fn efi_init() {
     // todo: Initialize screen info
 
     kinfo!("UEFI init done!");
+}
+
+fn efi_find_mirror() {
+    let efi_guard = efi_manager().inner_read();
+    let mut total_size = 0;
+    let mut mirror_size = 0;
+    for md in efi_guard.mmap.iter() {
+        let start = PhysAddr::new(md.phys_start as usize);
+        let size = (md.page_count << (MMArch::PAGE_SHIFT as u64)) as usize;
+
+        if md.att.contains(MemoryAttribute::MORE_RELIABLE) {
+            mem_block_manager().mark_mirror(start, size).unwrap();
+            mirror_size += size;
+        }
+
+        total_size += size;
+    }
+
+    if mirror_size > 0 {
+        kinfo!(
+            "Memory: {}M/{}M mirrored memory",
+            mirror_size >> 20,
+            total_size >> 20
+        );
+    }
 }
 
 #[inline(never)]
@@ -142,7 +175,7 @@ fn uefi_init(system_table: PhysAddr) -> Result<(), SystemError> {
     let st_ref = unsafe { st_ptr.as_ref().unwrap() };
 
     let runtime_service_paddr = efi_vaddr_2_paddr(st_ref.runtime_services as usize);
-    let mut inner_write_guard = efi_manager().inner.write();
+    let mut inner_write_guard = efi_manager().inner_write();
     inner_write_guard.runtime_paddr = Some(runtime_service_paddr);
     inner_write_guard.runtime_service_version = Some(st_ref.header.revision);
 
@@ -189,7 +222,7 @@ fn uefi_init(system_table: PhysAddr) -> Result<(), SystemError> {
 ///
 /// 在进入该函数前，请不要持有`efi_manager().inner`的写锁
 fn efi_vaddr_2_paddr(efi_vaddr: usize) -> PhysAddr {
-    let guard = efi_manager().inner.read();
+    let guard = efi_manager().inner_read();
     let mmap = &guard.mmap;
 
     let efi_vaddr: u64 = efi_vaddr as u64;
@@ -236,6 +269,11 @@ fn reserve_memory_regions() {
         if md.is_memory() {
             open_firmware_fdt_driver().early_init_dt_add_memory(phys_start as u64, size as u64);
             if !md.is_usable_memory() {
+                // kdebug!(
+                //     "Marking non-usable memory as nomap: {:#x}-{:#x}",
+                //     phys_start,
+                //     phys_start + size
+                // );
                 mem_block_manager()
                     .mark_nomap(PhysAddr::new(phys_start), size)
                     .unwrap();

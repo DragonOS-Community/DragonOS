@@ -17,11 +17,14 @@
 
 &nbsp;
 
-&emsp;&emsp;DragonOS龙操作系统（以下简称“DragonOS”）是一个面向服务器领域的，从0开发内核及用户态环境，并提供Linux兼容性的64位操作系统。它使用Rust与C语言进行编写，并正在逐步淘汰原有的C代码，以在将来提供更好的安全性与可靠性。
+&emsp;&emsp;DragonOS龙操作系统是一个面向云计算轻量化场景的，完全自主内核的，提供Linux二进制兼容性的64位操作系统。它使用Rust语言进行开发，以提供更好的可靠性。目前在Rust操作系统领域，DragonOS在Github排行全国稳居前三位。
 
-&emsp;&emsp;DragonOS的目标是，构建一个完全独立自主的、开源的、高性能及高可靠性的服务器操作系统，为国家数字基础设施建设提供完全独立自主的底层核心动力。
+&emsp;&emsp;DragonOS开源社区成立于2022年7月，它完全商业中立。我们的目标是，构建一个完全独立自主的、开源的、高性能及高可靠性的服务器操作系统，打造完全自主可控的数字化未来！
 
-&emsp;&emsp;作为一个社区驱动的开源操作系统，为了促进其发展，避免让其遭受一些不遵守开源协议的商业公司的侵权，我们决定使用GPLv2协议开放源代码，以严格的开源协议来保护DragonOS。
+&emsp;&emsp;DragonOS具有优秀的、完善的架构设计。相比于同体量的其他系统，DragonOS支持虚拟化，并在设备模型、调度子系统等方面具有一定优势。当前正在大力推进云平台支持、riscv支持等工作，以及编译器、应用软件的移植。力求在5年内实现生产环境大规模应用。
+
+&emsp;&emsp;DragonOS目前在社区驱动下正在快速发展中，目前DragonOS已经实现了约1/4的Linux接口，在未来我们将提供对Linux的100%兼容性，并且提供新特性。
+
 
 [关于DragonOS，你想了解的都在这儿 - DragonOS](https://dragonos.org/?p=46)
 
@@ -55,7 +58,7 @@
 
 ## 如何加入？
 
-&emsp;&emsp;如果你愿意加入我们，你可以访问DragonOS的论坛，了解开发动态、开发任务： [https://bbs.dragonos.org.cn](https://bbs.dragonos.org.cn)
+&emsp;&emsp;如果你愿意加入我们，你可以查看issue，并在issue下发表讨论、想法，或者访问DragonOS的论坛，了解开发动态、开发任务： [https://bbs.dragonos.org.cn](https://bbs.dragonos.org.cn)
 
 &emsp;&emsp;你也可以带着你的创意与想法，和社区的小伙伴一起讨论，为DragonOS创造一些新的功能。
 
@@ -102,6 +105,17 @@
 
 - 万晓兰
 - David Wen
+- [YJwu2023](https://github.com/YJwu2023)
+- [longjin](https://github.com/fslongjin)
+- [黄铭涛](https://github.com/1037827920)
+- [许梓毫](https://github.com/Jomocool)
+- [谢润霖](https://github.com/xiaolin2004)
+- [蔡俊源](https://github.com/SMALLC04)
+- Kelly
+- [Samuka007](https://github.com/Samuka007)
+- [杨璐玮](https://github.com/val213)
+- [何懿聪](https://github.com/GnoCiYeH)
+- [周凯韬](https://github.com/laokengwt)
 - [Seele.Clover](https://github.com/seeleclover)
 - [FindWangHao](https://github.com/FindWangHao)
 - [ferchiel](https://github.com/ferchiel)

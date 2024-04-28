@@ -5,7 +5,7 @@ use core::{
 
 use alloc::{collections::BTreeMap, sync::Arc};
 
-use crate::{driver::net::NetDriver, libs::rwlock::RwLock};
+use crate::{driver::net::NetDevice, libs::rwlock::RwLock};
 use smoltcp::wire::IpEndpoint;
 
 use self::socket::SocketInode;
@@ -18,7 +18,7 @@ pub mod syscall;
 lazy_static! {
     /// # 所有网络接口的列表
     /// 这个列表在中断上下文会使用到，因此需要irqsave
-    pub static ref NET_DRIVERS: RwLock<BTreeMap<usize, Arc<dyn NetDriver>>> = RwLock::new(BTreeMap::new());
+    pub static ref NET_DEVICES: RwLock<BTreeMap<usize, Arc<dyn NetDevice>>> = RwLock::new(BTreeMap::new());
 }
 
 /// 生成网络接口的id (全局自增)

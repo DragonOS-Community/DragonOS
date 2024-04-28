@@ -5,7 +5,9 @@ use core::hint::spin_loop;
 
 use system_error::SystemError;
 
-use crate::{arch::syscall::syscall_handler, kdebug, kerror};
+use crate::{
+    arch::syscall::syscall_handler, driver::irqchip::riscv_intc::riscv_intc_irq, kdebug, kerror,
+};
 
 use super::TrapFrame;
 
@@ -40,19 +42,12 @@ unsafe extern "C" fn riscv64_do_irq(trap_frame: &mut TrapFrame) {
 }
 
 /// 处理中断
-fn riscv64_do_interrupt(_trap_frame: &mut TrapFrame) {
-    kdebug!("todo: riscv64_do_irq: interrupt");
-    loop {
-        spin_loop();
-    }
+fn riscv64_do_interrupt(trap_frame: &mut TrapFrame) {
+    riscv_intc_irq(trap_frame);
 }
 
 /// 处理异常
 fn riscv64_do_exception(trap_frame: &mut TrapFrame) {
-    kdebug!(
-        "riscv64_do_exception: from_user: {}",
-        trap_frame.is_from_user()
-    );
     let code = trap_frame.cause.code();
 
     if code < EXCEPTION_HANDLERS.len() {
@@ -154,8 +149,16 @@ fn do_trap_user_env_call(trap_frame: &mut TrapFrame) -> Result<(), SystemError> 
 // 9-11 reserved
 
 /// 处理指令页错误异常 #12
-fn do_trap_insn_page_fault(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    kerror!("riscv64_do_irq: do_insn_page_fault");
+fn do_trap_insn_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    let vaddr = trap_frame.badaddr;
+    let cause = trap_frame.cause;
+    let epc = trap_frame.epc;
+    kerror!(
+        "riscv64_do_irq: do_insn_page_fault vaddr: {:#x}, cause: {:?} epc: {:#x}",
+        vaddr,
+        cause,
+        epc
+    );
     loop {
         spin_loop();
     }
@@ -180,8 +183,13 @@ fn do_trap_load_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError
 // 14 reserved
 
 /// 处理页存储错误异常 #15
-fn do_trap_store_page_fault(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    kerror!("riscv64_do_irq: do_trap_store_page_fault");
+fn do_trap_store_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    kerror!(
+        "riscv64_do_irq: do_trap_store_page_fault: epc: {:#x}, vaddr={:#x}, cause={:?}",
+        trap_frame.epc,
+        trap_frame.badaddr,
+        trap_frame.cause
+    );
     loop {
         spin_loop();
     }

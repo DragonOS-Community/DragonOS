@@ -1,10 +1,16 @@
-use alloc::sync::Arc;
+use core::hint::spin_loop;
+
+use alloc::{string::ToString, sync::Arc};
 use system_error::SystemError;
 
-use crate::{filesystem::{
-    ext2fs::fs::Ext2FileSystem,
-    vfs::ROOT_INODE,
-}, libs::once::Once};
+use crate::{
+    driver::disk::ahci,
+    filesystem::{
+        ext2fs::fs::Ext2FileSystem,
+        vfs::{syscall::ModeType, FileType, ROOT_INODE},
+    },
+    libs::once::Once,
+};
 
 pub mod block_group_desc;
 pub mod entry;
@@ -12,32 +18,56 @@ pub mod file_type;
 pub mod fs;
 pub mod inode;
 
-// /// 全局的sysfs实例
-// pub(self) static mut EXT2FS_INSTANCE: Option<Ext2FileSystem> = None;
+/// 全局的sysfs实例
+pub(self) static mut EXT2FS_INSTANCE: Option<Arc<Ext2FileSystem>> = None;
 
-// #[inline(always)]
-// pub fn sysfs_instance() -> &'static Ext2FileSystem {
-//     unsafe {
-//         return &EXT2FS_INSTANCE.as_ref().unwrap();
-//     }
-// }
-// pub fn procfs_init() -> Result<(), SystemError> {
-//     static INIT: Once = Once::new();
-//     let mut result = None;
-//     INIT.call_once(|| {
-//         kinfo!("Initializing Ext2FS...");
-//         // 创建 Ext2FileSystem 实例
-//         let procfs: Arc<Ext2FileSystem> = Ext2FileSystem::new(partition);
+#[inline(always)]
+pub fn ext2fs_instance() -> Arc<Ext2FileSystem> {
+    unsafe {
+        return EXT2FS_INSTANCE.as_ref().unwrap().clone();
+    }
+}
+pub fn ext2fs_init() -> Result<(), SystemError> {
+    static INIT: Once = Once::new();
+    let mut result = None;
+    INIT.call_once(|| {
+        kinfo!("Initializing Ext2FS...");
+        let partiton1 = ahci::get_disks_by_name("ahci_disk_1".to_string());
+        if partiton1.is_err() {
+            kerror!("Failed to find ahci_disk_1");
+            result = Some(Err(SystemError::ENODEV));
+            return;
+        }
+        let p1 = partiton1.unwrap().0.lock().partitions[0].clone();
+        let ext2fs: Result<Arc<Ext2FileSystem>, SystemError> = Ext2FileSystem::new(p1);
+        if ext2fs.is_err() {
+            kerror!(
+                "Failed to initialize ext2fs, code={:?}",
+                ext2fs.as_ref().err()
+            );
+            loop {
+                spin_loop();
+            }
+        }
+        let ext2fs: Arc<Ext2FileSystem> = ext2fs.unwrap();
+        unsafe { EXT2FS_INSTANCE = Some(ext2fs) };
 
-//         // procfs 挂载
-//         let _t = ROOT_INODE()
-//             .find("ext2")
-//             .expect("Cannot find /ext2")
-//             .mount(procfs)
-//             .expect("Failed to mount ext2");
-//         kinfo!("Ext2FS mounted.");
-//         result = Some(Ok(()));
-//     });
+        let root_i = ROOT_INODE();
+        let mount_inode = root_i
+            .create("ext2", FileType::Dir, ModeType::from_bits_truncate(0o755))
+            .expect("Failed to create /ext2");
 
-//     return result.unwrap();
-// }
+        if let Err(err) = mount_inode.mount(ext2fs_instance()) {
+            result = Some(Err(err));
+            return;
+        };
+
+        if let Err(err) = root_i.lookup("/ext2") {
+            kdebug!("look up ext2 failed: {err:?}");
+        };
+        kinfo!("Successfully mount EXT2");
+        result = Some(Ok(()));
+    });
+
+    return result.unwrap();
+}

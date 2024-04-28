@@ -20,7 +20,7 @@ use crate::{
         disk_info::Partition,
     },
     filesystem::{
-        ext2fs::file_type,
+        ext2fs::{ext2fs_instance, file_type, inode},
         vfs::{syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, Metadata},
     },
     libs::{rwlock::RwLock, spinlock::SpinLock, vec_cursor::VecCursor},
@@ -145,7 +145,7 @@ impl Ext2Inode {
                 let mut ret = [0u32; EXT2_BP_NUM];
                 let mut start: usize = 0;
                 for i in 0..EXT2_BP_NUM {
-                    ret[i] = u32::from_be_bytes(data[start..start + 4].try_into().unwrap());
+                    ret[i] = u32::from_le_bytes(data[start..start + 4].try_into().unwrap());
                     start += 4;
                 }
                 ret
@@ -267,8 +267,8 @@ pub struct Ext2InodeInfo {
     mode: ModeType,
     file_type: FileType,
     i_mode: u16,
-    // file_size: u32,
-    // disk_sector: u32,
+    inode: Ext2Inode, // file_size: u32,
+                      // disk_sector: u32,
 }
 
 impl Ext2InodeInfo {
@@ -287,6 +287,7 @@ impl Ext2InodeInfo {
         kinfo!("end Ext2InodeInfo new");
 
         Self {
+            inode: inode.clone(),
             i_data: inode.blocks,
             i_mode: mode,
             meta,
@@ -299,6 +300,10 @@ impl Ext2InodeInfo {
 }
 
 impl IndexNode for LockedExt2InodeInfo {
+    fn find(&self, _name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        // TODO 获取inode
+        return Ok(ext2fs_instance().root_inode());
+    }
     fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
         kdebug!("close inode");
         Ok(())
@@ -320,7 +325,8 @@ impl IndexNode for LockedExt2InodeInfo {
     ) -> Result<usize, system_error::SystemError> {
         kinfo!("begin LockedExt2InodeInfo read_at");
         let inode_grade = self.0.lock();
-        let superb = EXT2_SB_INFO.read();
+        let binding = ext2fs_instance();
+        let superb = binding.sb_info.0.lock();
         // TODO 需要根据不同的文件类型，选择不同的读取方式，将读的行为集成到file type
         match inode_grade.file_type {
             FileType::File | FileType::Dir => {
@@ -336,28 +342,45 @@ impl IndexNode for LockedExt2InodeInfo {
                 let mut start_pos: usize = 0;
                 // 读取的字节
                 let mut end_len: usize = min(LBA_SIZE, buf.len());
+                kdebug!("read_block_num:{read_block_num},buf_len:{}", buf.len());
+                let mut read_buf_size = len;
+                if len % superb.s_block_size as usize != 0 {
+                    read_buf_size +=
+                        superb.s_block_size as usize - len % superb.s_block_size as usize;
+                }
+                kinfo!("read_buf_size = {read_buf_size}");
+                let mut read_buf: Vec<u8> = Vec::with_capacity(read_buf_size);
+                read_buf.resize(read_buf_size, 0);
                 // 读取直接块
                 kdebug!("read direct, start_block = {start_block}");
-                while already_read_block < read_block_num && start_block <= 11 {
+                while start_block <= 11 {
                     if inode_grade.i_data[start_block] == 0 {
+                        buf.copy_from_slice(&read_buf[..len]);
                         return Ok(already_read_byte);
                     }
+                    let start_addr =
+                        (inode_grade.i_data[start_block] * superb.s_block_size) as usize;
+                    kdebug!(
+                        "already_read_byte:{already_read_byte},start_pos:{start_pos},start_addr:{start_addr},lbaid:{},block_num:{}",
+                        __bytes_to_lba(start_addr, LBA_SIZE),inode_grade.i_data[start_block],
+                    );
                     // 每次读一个块
                     // TODO 调整架构
                     let r: usize = superb.partition.as_ref().unwrap().disk().read_at(
-                        // TODO 将地址换成id
-                        __bytes_to_lba(inode_grade.i_data[start_block] as usize, LBA_SIZE),
-                        1,
-                        &mut buf[start_pos..start_pos + end_len],
+                        __bytes_to_lba(start_addr, LBA_SIZE),
+                        superb.s_block_size as usize / LBA_SIZE,
+                        &mut read_buf[start_pos..start_pos + superb.s_block_size as usize],
                     )?;
+                    kinfo!("r={r},superb.s_block_size={}", superb.s_block_size);
                     already_read_block += 1;
                     start_block += 1;
                     already_read_byte += r;
                     start_pos += end_len;
-                    end_len = min(buf.len() - already_read_byte, LBA_SIZE);
+                    // end_len = min(buf.len() - already_read_byte, LBA_SIZE);
                 }
 
                 if already_read_block == read_block_num || inode_grade.i_data[12] == 0 {
+                    buf.copy_from_slice(&read_buf[..len]);
                     kdebug!("end read direct,end LockedExt2InodeInfo read_at, start_block = {start_block}");
                     return Ok(already_read_byte);
                 }
@@ -511,7 +534,7 @@ impl IndexNode for LockedExt2InodeInfo {
     }
 
     fn fs(&self) -> alloc::sync::Arc<dyn FileSystem> {
-        todo!()
+        ext2fs_instance()
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
@@ -531,10 +554,15 @@ impl IndexNode for LockedExt2InodeInfo {
         let mut names: Vec<String> = Vec::new();
         match file_type {
             Ext2FileType::Directory => {
-                // 获取inode数据块
+                // 获取inode数据
+                // kinfo!("list inode : {:?}", guard.inode);
+                let inode = &guard.inode;
                 // 解析为entry数组
                 let meta = &guard.meta;
-                let size = meta.size as usize;
+                // BUG 获取文件大小失败。
+                let size: usize =
+                    ((inode.directory_acl as usize) << 32usize) + inode.lower_size as usize;
+                kinfo!("size = {size}");
                 let mut data_block: Vec<u8> = Vec::with_capacity(size);
                 data_block.resize(size, 0);
                 drop(guard);
@@ -551,15 +579,22 @@ impl IndexNode for LockedExt2InodeInfo {
                     if begin_pos >= size {
                         break;
                     }
+                    let inode_num = u32::from_le_bytes(
+                        data_block[begin_pos..begin_pos + 4].try_into().unwrap(),
+                    );
+                    if inode_num == 0 {
+                        break;
+                    }
+                    let name_pos = begin_pos + 8;
                     begin_pos += mem::size_of::<u32>();
-                    let rc_len: u16 = u16::from_be_bytes(
+                    let rc_len: u16 = u16::from_le_bytes(
                         data_block[begin_pos..begin_pos + 2].try_into().unwrap(),
                     );
-                    let name_len: u8 = u8::from_be(data_block[begin_pos + 2]);
-                    let name_pos = begin_pos + 8;
+                    let name_len: u8 = u8::from_le(data_block[begin_pos + 2]);
                     let name = String::from_utf8_lossy(
                         &data_block[name_pos..name_pos + name_len as usize],
                     );
+                    kinfo!("rc_len:{rc_len},name_len:{name_len},name_pos:{name_pos},name:{name}");
                     names.push(name.to_string());
                     begin_pos += rc_len as usize - mem::size_of::<u32>();
                 }

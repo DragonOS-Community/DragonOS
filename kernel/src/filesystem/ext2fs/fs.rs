@@ -33,7 +33,7 @@ lazy_static! {
 // pub static ref EXT2_FS: RwLock<Ext2FileSystem> = unsafe{U};
 
 #[derive(Debug)]
-pub struct LockedExt2SBInfo(SpinLock<Ext2SuperBlockInfo>);
+pub struct LockedExt2SBInfo(pub SpinLock<Ext2SuperBlockInfo>);
 
 #[derive(Debug)]
 pub struct Ext2FileSystem {
@@ -95,6 +95,9 @@ impl Ext2FileSystem {
             sb_info: Arc::new(LockedExt2SBInfo(SpinLock::new(sb_info))),
             root_inode: Arc::new(LockedExt2InodeInfo(SpinLock::new(r_info))),
         }));
+    }
+    pub fn super_block(&self) -> Arc<LockedExt2SBInfo> {
+        self.sb_info.clone()
     }
 }
 pub enum OSType {

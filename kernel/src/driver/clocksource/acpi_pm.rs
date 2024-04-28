@@ -195,7 +195,7 @@ const ACPI_PM_MONOTONIC_CHECKS: u32 = 10;
 const ACPI_PM_READ_CHECKS: u32 = 10000;
 
 /// # 解析fadt
-fn acpi_parse_fadt() -> Result<(), SystemError> {
+fn find_acpi_pm_clock() -> Result<(), SystemError> {
     let fadt = acpi_manager()
         .tables()
         .unwrap()
@@ -223,7 +223,7 @@ pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
     }
 
     // 解析fadt
-    acpi_parse_fadt()?;
+    find_acpi_pm_clock()?;
 
     // 检查pmtmr_io_port是否被设置
     if unsafe { PMTMR_IO_PORT.load(Ordering::SeqCst) } == 0 {
@@ -246,11 +246,9 @@ pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
                 continue;
             }
             if value2 > value1 {
-                i += 1;
                 break;
             }
             if (value2 < value1) && (value2 < 0xfff) {
-                i += 1;
                 break;
             }
             kinfo!("PM Timer had inconsistens results: {} {}", value1, value2);

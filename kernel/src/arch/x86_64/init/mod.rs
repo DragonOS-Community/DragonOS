@@ -5,6 +5,7 @@ use x86::dtables::DescriptorTablePointer;
 
 use crate::{
     arch::{interrupt::trap::arch_trap_init, process::table::TSSManager},
+    driver::clocksource::acpi_pm::init_acpi_pm_clocksource,
     init::init::start_kernel,
     kdebug,
     mm::{MemoryManagementArch, PhysAddr},
@@ -93,8 +94,12 @@ pub fn setup_arch() -> Result<(), SystemError> {
 /// 架构相关的初始化（在IDLE的最后一个阶段）
 #[inline(never)]
 pub fn setup_arch_post() -> Result<(), SystemError> {
-    hpet_init().expect("hpet init failed");
-    hpet_instance().hpet_enable().expect("hpet enable failed");
+    let ret = hpet_init();
+    if ret.is_ok() {
+        hpet_instance().hpet_enable().expect("hpet enable failed");
+    } else {
+        init_acpi_pm_clocksource().expect("acpi_pm_timer inits failed");
+    }
     TSCManager::init().expect("tsc init failed");
 
     return Ok(());

@@ -433,7 +433,7 @@ impl CpuRunQueue {
             SchedPolicy::CFS => CompletelyFairScheduler::dequeue(self, pcb, flags),
             SchedPolicy::FIFO => todo!(),
             SchedPolicy::RT => todo!(),
-            SchedPolicy::IDLE => todo!(),
+            SchedPolicy::IDLE => IdleScheduler::dequeue(self, pcb, flags),
         }
     }
 

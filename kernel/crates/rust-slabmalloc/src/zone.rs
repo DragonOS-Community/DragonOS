@@ -119,6 +119,7 @@ impl<'a> ZoneAllocator<'a> {
         for i in 0..ZoneAllocator::MAX_BASE_SIZE_CLASSES {
             let slab = &mut self.small_slabs[i];
             let just_reclaimed = slab.try_reclaim_pages(to_reclaim, &mut dealloc);
+            self.total -= just_reclaimed as u64;
             to_reclaim = to_reclaim.saturating_sub(just_reclaimed);
             if to_reclaim == 0 {
                 break;
@@ -199,7 +200,7 @@ unsafe impl<'a> crate::Allocator<'a> for ZoneAllocator<'a> {
             Slab::Base(idx) => {
                 self.small_slabs[idx].refill(new_page);
                 // 每refill一个page就为slab的总空间统计加上4KB
-                self.total += 4096;
+                self.total += OBJECT_PAGE_SIZE as u64;
                 Ok(())
             }
             Slab::Unsupported => Err(AllocationError::InvalidLayout),

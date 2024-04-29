@@ -340,10 +340,6 @@ impl Socket for UdpSocket {
                 // return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
             }
             drop(socket_set_guard);
-            kdebug!(
-                "[UDP] [Read] sleeping socket with handle: {:?}",
-                self.handle
-            );
             SocketHandleItem::sleep(
                 self.socket_handle(),
                 EPollEventType::EPOLLIN.bits() as u64,

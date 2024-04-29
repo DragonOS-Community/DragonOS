@@ -69,7 +69,7 @@ struct HurdOsd2 {
 /// 磁盘中存储的inode
 pub struct Ext2Inode {
     /// 文件类型和权限，高四位代表文件类型，其余代表权限
-    pub mode: u16
+    pub mode: u16,
     /// 文件所有者
     pub uid: u16,
     /// 文件大小
@@ -273,10 +273,10 @@ pub struct Ext2InodeInfo {
 
 impl Ext2InodeInfo {
     pub fn new(inode: &Ext2Inode) -> Self {
-        kinfo!("begin Ext2InodeInfo new");
+        // kinfo!("begin Ext2InodeInfo new");
         let mode = inode.mode;
         let file_type = Ext2FileType::type_from_mode(&mode).unwrap().covert_type();
-        kinfo!("file_type = {:?}", file_type);
+        // kinfo!("file_type = {:?}", file_type);
 
         // TODO 根据inode mode转换modetype
         let fs_mode = ModeType::from_bits_truncate(mode as u32);
@@ -284,7 +284,7 @@ impl Ext2InodeInfo {
         // TODO 获取block group
 
         // TODO 间接地址
-        kinfo!("end Ext2InodeInfo new");
+        // kinfo!("end Ext2InodeInfo new");
 
         Self {
             inode: inode.clone(),
@@ -301,11 +301,54 @@ impl Ext2InodeInfo {
 
 impl IndexNode for LockedExt2InodeInfo {
     fn find(&self, _name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        // TODO 获取inode
-        return Ok(ext2fs_instance().root_inode());
+        // kinfo!("begin LockedExt2InodeInfo find");
+        let guard = self.0.lock();
+        let inode = &guard.inode;
+        if Ext2FileType::type_from_mode(&inode.mode).unwrap() != Ext2FileType::Directory {
+            return Err(SystemError::ENOTDIR);
+        }
+        let size: usize = ((inode.directory_acl as usize) << 32usize) + inode.lower_size as usize;
+        let mut data_block: Vec<u8> = Vec::with_capacity(size);
+        data_block.resize(size, 0);
+        drop(guard);
+        self.read_at(
+            0,
+            size,
+            data_block.as_mut_slice(),
+            &mut FilePrivateData::Unused,
+        )?;
+        let mut begin_pos = 0;
+        loop {
+            if begin_pos >= size {
+                break;
+            }
+            let inode_num =
+                u32::from_le_bytes(data_block[begin_pos..begin_pos + 4].try_into().unwrap());
+            if inode_num == 0 {
+                break;
+            }
+            let name_pos = begin_pos + 8;
+            begin_pos += mem::size_of::<u32>();
+            let rc_len: u16 =
+                u16::from_le_bytes(data_block[begin_pos..begin_pos + 2].try_into().unwrap());
+            let name_len: u8 = u8::from_le(data_block[begin_pos + 2]);
+            let name = String::from_utf8_lossy(&data_block[name_pos..name_pos + name_len as usize]);
+            if name == _name {
+                let ext2 = ext2fs_instance();
+                let sb = ext2.sb_info.0.lock();
+                let i = sb.read_inode(inode_num).unwrap();
+                return Ok(Arc::new(LockedExt2InodeInfo(SpinLock::new(
+                    Ext2InodeInfo::new(&i),
+                ))));
+            }
+            begin_pos += rc_len as usize - mem::size_of::<u32>();
+        }
+        // kinfo!("end LockedExt2InodeInfo find");
+
+        return Err(SystemError::EINVAL);
     }
     fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
-        kdebug!("close inode");
+        // kdebug!("close inode");
         Ok(())
     }
     fn open(
@@ -313,7 +356,7 @@ impl IndexNode for LockedExt2InodeInfo {
         _data: &mut FilePrivateData,
         _mode: &crate::filesystem::vfs::file::FileMode,
     ) -> Result<(), SystemError> {
-        kdebug!("open inode");
+        // kdebug!("open inode");
         Ok(())
     }
     fn read_at(
@@ -323,16 +366,24 @@ impl IndexNode for LockedExt2InodeInfo {
         buf: &mut [u8],
         _data: &mut crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, system_error::SystemError> {
-        kinfo!("begin LockedExt2InodeInfo read_at");
+        // TODO 需要根据不同的文件类型，选择不同的读取方式，将读的行为集成到file type
+        // kinfo!("begin LockedExt2InodeInfo read_at");
         let inode_grade = self.0.lock();
         let binding = ext2fs_instance();
         let superb = binding.sb_info.0.lock();
-        // TODO 需要根据不同的文件类型，选择不同的读取方式，将读的行为集成到file type
         match inode_grade.file_type {
             FileType::File | FileType::Dir => {
+                // kinfo!("i data ={:?}", inode_grade.i_data);/
+                let inode = &inode_grade.inode;
+                // 计算文件大小
+                let file_size =
+                    ((inode.directory_acl as usize) << 32usize) + inode.lower_size as usize;
+                // kinfo!("offset = {offset}");
+                if offset >= file_size {
+                    return Ok(0usize);
+                }
                 // 起始读取块
                 let mut start_block = offset / LBA_SIZE;
-
                 // 需要读取的块
                 let read_block_num = min(len, buf.len()) / LBA_SIZE + 1;
                 // 已经读的块数
@@ -341,163 +392,239 @@ impl IndexNode for LockedExt2InodeInfo {
                 let mut already_read_byte: usize = 0;
                 let mut start_pos: usize = 0;
                 // 读取的字节
-                let mut end_len: usize = min(LBA_SIZE, buf.len());
-                kdebug!("read_block_num:{read_block_num},buf_len:{}", buf.len());
+                // let mut end_len: usize = min(LBA_SIZE, buf.len());
+                // kdebug!(
+                //     "read_block_num:{read_block_num},buf_len:{},len:{}",
+                //     buf.len(),
+                //     len
+                // );
+                // 需要读取的字节大小
                 let mut read_buf_size = len;
                 if len % superb.s_block_size as usize != 0 {
                     read_buf_size +=
                         superb.s_block_size as usize - len % superb.s_block_size as usize;
                 }
-                kinfo!("read_buf_size = {read_buf_size}");
+                // kinfo!("read_buf_size = {read_buf_size}");
                 let mut read_buf: Vec<u8> = Vec::with_capacity(read_buf_size);
                 read_buf.resize(read_buf_size, 0);
                 // 读取直接块
-                kdebug!("read direct, start_block = {start_block}");
+                // kdebug!("read direct, start_block = {start_block}");
                 while start_block <= 11 {
                     if inode_grade.i_data[start_block] == 0 {
-                        buf.copy_from_slice(&read_buf[..len]);
-                        return Ok(already_read_byte);
+                        // if inode_grade.inode.lower_size == 28 {
+                        // kinfo!("{:?}", String::from_utf8(read_buf[..file_size].to_vec()).unwrap());
+                        // }
+                        // kinfo!("end LockedExt2InodeInforead_at");
+                        buf.copy_from_slice(&read_buf[..buf.len()]);
+                        return Ok(min(file_size, len));
                     }
                     let start_addr =
                         (inode_grade.i_data[start_block] * superb.s_block_size) as usize;
-                    kdebug!(
-                        "already_read_byte:{already_read_byte},start_pos:{start_pos},start_addr:{start_addr},lbaid:{},block_num:{}",
-                        __bytes_to_lba(start_addr, LBA_SIZE),inode_grade.i_data[start_block],
-                    );
+
                     // 每次读一个块
-                    // TODO 调整架构
                     let r: usize = superb.partition.as_ref().unwrap().disk().read_at(
                         __bytes_to_lba(start_addr, LBA_SIZE),
                         superb.s_block_size as usize / LBA_SIZE,
                         &mut read_buf[start_pos..start_pos + superb.s_block_size as usize],
                     )?;
-                    kinfo!("r={r},superb.s_block_size={}", superb.s_block_size);
+                    // kinfo!("r={r},superb.s_block_size={}", superb.s_block_size);
                     already_read_block += 1;
                     start_block += 1;
                     already_read_byte += r;
-                    start_pos += end_len;
-                    // end_len = min(buf.len() - already_read_byte, LBA_SIZE);
+                    start_pos += superb.s_block_size as usize;
+                    // kdebug!(
+                    //     "already_read_byte:{already_read_byte},start_pos:{start_pos},start_addr:{start_addr},lbaid:{},block_num:{}",
+                    //     __bytes_to_lba(start_addr, LBA_SIZE),inode_grade.i_data[start_block],
+                    // );
                 }
 
                 if already_read_block == read_block_num || inode_grade.i_data[12] == 0 {
                     buf.copy_from_slice(&read_buf[..len]);
                     kdebug!("end read direct,end LockedExt2InodeInfo read_at, start_block = {start_block}");
-                    return Ok(already_read_byte);
+                    return Ok(min(file_size, len));
                 }
 
                 kdebug!("read indirect, start_block = {start_block}");
 
                 // 读取一级间接块
                 // 获取地址块
-                let mut address_block: [u8; 512] = [0; 512];
+                let start_addr = (inode_grade.i_data[start_block] * superb.s_block_size) as usize;
+                let mut address_block: Vec<u8> = Vec::with_capacity(superb.s_block_size as usize);
+                address_block.resize(superb.s_block_size as usize, 0);
                 let _ = superb.partition.as_ref().unwrap().disk().read_at(
-                    __bytes_to_lba(inode_grade.i_data[12] as usize, LBA_SIZE),
-                    1,
-                    &mut address_block[0..],
+                    __bytes_to_lba(start_addr, LBA_SIZE),
+                    superb.s_block_size as usize / LBA_SIZE,
+                    &mut address_block[..],
                 );
-                let address: [u32; 128] =
-                    unsafe { mem::transmute::<[u8; 512], [u32; 128]>(address_block) };
+                let mut address: Vec<u32> = Vec::with_capacity(address_block.len() / 4);
+                address = unsafe { core::mem::transmute_copy(&address_block) };
+                let ever_read_count = superb.s_block_size as usize / LBA_SIZE;
 
                 // 读取数据块
                 while already_read_block < read_block_num && start_block <= 127 + 12 {
+                    if address[start_block - 12] == 0 {
+                        // kinfo!("end LockedExt2InodeInfo read_at");
+                        buf.copy_from_slice(&read_buf[..len]);
+                        return Ok(min(file_size, len));
+                    }
                     // 每次读一个块
                     let r: usize = superb.partition.clone().unwrap().disk().read_at(
-                        // TODO 将地址换成id
-                        __bytes_to_lba(address[start_block - 12] as usize, LBA_SIZE),
-                        1,
-                        &mut buf[start_pos..start_pos + end_len],
+                        //  address[start_block - 12]里面可能是块号
+                        __bytes_to_lba(
+                            address[start_block - 12] as usize * superb.s_block_size as usize,
+                            LBA_SIZE,
+                        ),
+                        ever_read_count,
+                        &mut read_buf[start_pos..start_pos + superb.s_block_size as usize],
                     )?;
                     already_read_block += 1;
                     start_block += 1;
                     already_read_byte += r;
-                    start_pos += end_len;
-                    end_len = min(buf.len() - already_read_byte, LBA_SIZE);
+                    start_pos += superb.s_block_size as usize;
                 }
 
                 if inode_grade.i_data[13] == 0 || already_read_block == read_block_num {
+                    buf.copy_from_slice(&read_buf[..len]);
                     kdebug!("end read indirect,end LockedExt2InodeInfo read_at, start_block = {start_block}");
-                    return Ok(already_read_byte);
+                    return Ok(min(file_size, len));
                 }
                 kdebug!("read secondly direct, start_block = {start_block}");
 
-                // FIXME partition clone一下，升级成arc之后一直clone用
                 // 读取二级间接块
-                let indir_block = get_address_block(
-                    superb.partition.clone().unwrap(),
-                    inode_grade.i_data[13] as usize,
+
+                let start_addr = (inode_grade.i_data[13] * superb.s_block_size) as usize;
+                let mut address_block: Vec<u8> = Vec::with_capacity(superb.s_block_size as usize);
+                address_block.resize(superb.s_block_size as usize, 0);
+                let _ = superb.partition.as_ref().unwrap().disk().read_at(
+                    __bytes_to_lba(start_addr, LBA_SIZE),
+                    superb.s_block_size as usize / LBA_SIZE,
+                    &mut address_block[..],
                 );
+                let mut indir_block: Vec<u32> = Vec::with_capacity(address_block.len() / 4);
+                indir_block = unsafe { core::mem::transmute_copy(&address_block) };
 
                 for i in 0..128 {
                     // 根据二级间接块，获取读取间接块
-                    let address = get_address_block(
-                        superb.partition.clone().unwrap(),
-                        indir_block[i] as usize,
+
+                    let mut addr_data: Vec<u8> = Vec::with_capacity(superb.s_block_size as usize);
+                    addr_data.resize(superb.s_block_size as usize, 0);
+                    let _ = superb.partition.as_ref().unwrap().disk().read_at(
+                        // indir block 里面可能也是块号
+                        __bytes_to_lba(
+                            indir_block[i] as usize * superb.s_block_size as usize,
+                            LBA_SIZE,
+                        ),
+                        ever_read_count,
+                        addr_data.as_mut_slice(),
                     );
+                    let mut data_address: Vec<u32> = Vec::with_capacity(addr_data.len() / 4);
+                    data_address = unsafe { core::mem::transmute_copy(&addr_data) };
+
                     for j in 0..128 {
                         if already_read_block == read_block_num {
-                            return Ok(already_read_byte);
+                            buf.copy_from_slice(&read_buf[..len]);
+                            return Ok(min(file_size, len));
                         }
 
                         let r = superb.partition.clone().unwrap().disk().read_at(
-                            // TODO 将地址换成id
-                            __bytes_to_lba(address[j] as usize, LBA_SIZE),
-                            1,
-                            &mut buf[start_pos..start_pos + end_len],
+                            __bytes_to_lba(
+                                data_address[j] as usize * superb.s_block_size as usize,
+                                LBA_SIZE,
+                            ),
+                            ever_read_count,
+                            &mut read_buf[start_pos..start_pos + superb.s_block_size as usize],
                         )?;
+
                         already_read_block += 1;
                         start_block += 1;
                         already_read_byte += r;
-                        start_pos += end_len;
-                        end_len = min(buf.len() - already_read_byte, LBA_SIZE);
+                        start_pos += superb.s_block_size as usize;
                     }
                 }
 
                 if inode_grade.i_data[14] == 0 || already_read_block == read_block_num {
                     kdebug!("end read secondly direct,end LockedExt2InodeInfo read_at, start_block = {start_block}");
-                    return Ok(already_read_byte);
+                    buf.copy_from_slice(&read_buf[..len]);
+                    return Ok(min(file_size, len));
                 }
                 kdebug!("read thirdly direct, start_block = {start_block}");
 
                 // 读取三级间接块
-                let thdir_block = get_address_block(
-                    superb.partition.clone().unwrap(),
-                    inode_grade.i_data[14] as usize,
+
+                let start_addr = (inode_grade.i_data[14] * superb.s_block_size) as usize;
+                let mut address_block: Vec<u8> = Vec::with_capacity(superb.s_block_size as usize);
+                address_block.resize(superb.s_block_size as usize, 0);
+                let _ = superb.partition.as_ref().unwrap().disk().read_at(
+                    __bytes_to_lba(start_addr, LBA_SIZE),
+                    superb.s_block_size as usize / LBA_SIZE,
+                    &mut address_block[..],
                 );
+                let mut thdir_block: Vec<u32> = Vec::with_capacity(address_block.len() / 4);
+                thdir_block = unsafe { core::mem::transmute_copy(&address_block) };
 
                 for i in 0..128 {
                     // 根据二级间接块，获取读取间接块
-                    let indir_block = get_address_block(
-                        superb.partition.clone().unwrap(),
-                        thdir_block[i] as usize,
+                    // let indir_block = get_address_block(
+                    //     superb.partition.clone().unwrap(),
+                    //     thdir_block[i] as usize,
+                    // );
+
+                    let mut block: Vec<u8> = Vec::with_capacity(superb.s_block_size as usize);
+                    block.resize(superb.s_block_size as usize, 0);
+                    let _ = superb.partition.as_ref().unwrap().disk().read_at(
+                        // indir block 里面可能也是块号
+                        __bytes_to_lba(
+                            thdir_block[i] as usize * superb.s_block_size as usize,
+                            LBA_SIZE,
+                        ),
+                        ever_read_count,
+                        &mut block[..],
                     );
+                    let mut indir_block: Vec<u32> = Vec::with_capacity(block.len() / 4);
+                    indir_block = unsafe { core::mem::transmute_copy(&block) };
+
                     for second in 0..128 {
-                        let address = get_address_block(
-                            superb.partition.clone().unwrap(),
-                            indir_block[second] as usize,
+                        let mut dir_data: Vec<u8> =
+                            Vec::with_capacity(superb.s_block_size as usize);
+                        dir_data.resize(superb.s_block_size as usize, 0);
+                        let _ = superb.partition.as_ref().unwrap().disk().read_at(
+                            // indir block 里面可能也是块号
+                            __bytes_to_lba(
+                                indir_block[second] as usize * superb.s_block_size as usize,
+                                LBA_SIZE,
+                            ),
+                            ever_read_count,
+                            &mut dir_data[..],
                         );
+                        let mut dir_block: Vec<u32> = Vec::with_capacity(block.len() / 4);
+                        dir_block = unsafe { core::mem::transmute_copy(&block) };
+
                         for j in 0..128 {
                             if already_read_block == read_block_num {
-                                return Ok(already_read_byte);
+                                buf.copy_from_slice(&read_buf[..len]);
+                                return Ok(min(file_size, len));
                             }
 
                             let r = superb.partition.as_ref().unwrap().disk().read_at(
-                                __bytes_to_lba(address[j] as usize, LBA_SIZE),
-                                1,
-                                &mut buf[start_pos..start_pos + end_len],
+                                __bytes_to_lba(
+                                    dir_block[j] as usize * superb.s_block_size as usize,
+                                    LBA_SIZE,
+                                ),
+                                ever_read_count,
+                                &mut read_buf[start_pos..start_pos + superb.s_block_size as usize],
                             )?;
                             already_read_block += 1;
                             start_block += 1;
                             already_read_byte += r;
-                            start_pos += end_len;
-                            end_len = min(buf.len() - already_read_byte, LBA_SIZE);
+                            start_pos += superb.s_block_size as usize;
                         }
                     }
                 }
                 kdebug!(
                     "end read thirdly direct,end LockedExt2InodeInfo read_at, start_block = {start_block}"
                 );
-
-                Ok(already_read_byte)
+                buf.copy_from_slice(&read_buf[..len]);
+                Ok(min(file_size, len))
             }
             _ => Err(SystemError::EINVAL),
         }
@@ -555,14 +682,14 @@ impl IndexNode for LockedExt2InodeInfo {
         match file_type {
             Ext2FileType::Directory => {
                 // 获取inode数据
-                // kinfo!("list inode : {:?}", guard.inode);
+                // // kinfo!("list inode : {:?}", guard.inode);
                 let inode = &guard.inode;
                 // 解析为entry数组
                 let meta = &guard.meta;
                 // BUG 获取文件大小失败。
                 let size: usize =
                     ((inode.directory_acl as usize) << 32usize) + inode.lower_size as usize;
-                kinfo!("size = {size}");
+                // kinfo!("size = {size}");
                 let mut data_block: Vec<u8> = Vec::with_capacity(size);
                 data_block.resize(size, 0);
                 drop(guard);
@@ -594,7 +721,7 @@ impl IndexNode for LockedExt2InodeInfo {
                     let name = String::from_utf8_lossy(
                         &data_block[name_pos..name_pos + name_len as usize],
                     );
-                    kinfo!("rc_len:{rc_len},name_len:{name_len},name_pos:{name_pos},name:{name}");
+                    // kinfo!("rc_len:{rc_len},name_len:{name_len},name_pos:{name_pos},name:{name}");
                     names.push(name.to_string());
                     begin_pos += rc_len as usize - mem::size_of::<u32>();
                 }
@@ -622,12 +749,12 @@ impl IndexNode for LockedExt2InodeInfo {
 }
 
 pub fn get_address_block(partition: Arc<Partition>, ptr: usize) -> [u32; 128] {
-    kinfo!("begin get address block");
+    // kinfo!("begin get address block");
     let mut address_block: [u8; 512] = [0; 512];
     let _ = partition
         .disk()
         .read_at(__bytes_to_lba(ptr, LBA_SIZE), 1, &mut address_block[0..]);
     let address: [u32; 128] = unsafe { mem::transmute::<[u8; 512], [u32; 128]>(address_block) };
-    kinfo!("end get address block");
+    // kinfo!("end get address block");
     address
 }

@@ -77,7 +77,7 @@ impl Ext2FileSystem {
         // });
 
         // TODO 读取superblock，实现挂载
-        kdebug!("begin mount Ext2FS");
+        // kdebug!("begin mount Ext2FS");
         let sb_info = Ext2SuperBlockInfo::new(partition.clone());
         let root_inode = sb_info.read_root_inode();
         if root_inode.is_err() {
@@ -86,9 +86,9 @@ impl Ext2FileSystem {
         }
 
         let root_inode = root_inode.unwrap();
-        kdebug!("new the Ext2InodeInfo");
+        // kdebug!("new the Ext2InodeInfo");
         let r_info = Ext2InodeInfo::new(&root_inode);
-        kdebug!("end mount Ext2FS");
+        // kdebug!("end mount Ext2FS");
         return Ok(Arc::new(Self {
             partition,
             first_data_sector: 0,
@@ -367,17 +367,17 @@ impl Ext2SuperBlockInfo {
             s_dirs_counter: AtomicU32::new(1),
             partition: Some(partition.clone()),
         };
-        kdebug!("end build super block info");
+        // kdebug!("end build super block info");
         ret
     }
     ///  根据索引号获取磁盘inode
     ///
     pub fn read_inode(&self, inode_index: u32) -> Result<Ext2Inode, SystemError> {
-        kinfo!("begin read inode");
+        // kinfo!("begin read inode");
         // Get the reference to the description table
         let desc_table = self.group_desc_table.clone();
         if desc_table.is_none() {
-            kdebug!("descriptor table is empty");
+            // kdebug!("descriptor table is empty");
             return Err(SystemError::EINVAL);
         }
         let desc_table = desc_table.as_ref().unwrap();
@@ -402,7 +402,7 @@ impl Ext2SuperBlockInfo {
         }
         read_lba_num *= 2;
 
-        kdebug!("read_lba_num = {read_lba_num}");
+        // // kdebug!("read_lba_num = {read_lba_num}");
         // inode table 数据，存储的是inode数组
         let mut inode_table_data: Vec<u8> = Vec::with_capacity(LBA_SIZE);
         inode_table_data.resize(LBA_SIZE, 0);
@@ -431,21 +431,21 @@ impl Ext2SuperBlockInfo {
         //     unsafe { core::mem::transmute::<Vec<u8>, Vec<Ext2Inode>>(inode_table_data) };
         // let inode = inode_data[idx % 4 as usize].clone();
         // drop(inode_data);
-        kinfo!("end read inode");
+        // kinfo!("end read inode");
 
-        kdebug!("{:?}", inode);
+        // // kdebug!("{:?}", inode);
 
         return Ok(inode);
     }
 
     pub fn read_root_inode(&self) -> Result<Ext2Inode, SystemError> {
-        kinfo!("begin read root inode");
+        // kinfo!("begin read root inode");
         let root_inode_index = 2;
         // let root_inode = self.read_inode(root_inode_index);
         match self.read_inode(root_inode_index) {
             Ok(root_inode) => {
-                kdebug!("root inode = {:?}", root_inode);
-                kinfo!("end read root inode");
+                // kdebug!("root inode = {:?}", root_inode);
+                // kinfo!("end read root inode");
                 return Ok(root_inode);
             }
             Err(err) => {
@@ -459,7 +459,7 @@ impl Ext2SuperBlockInfo {
 impl Ext2SuperBlock {
     // TODO 需要有个函数在加载的时候read superblock and read des table ，并且读root inode
     pub fn read_superblock(partition: Arc<Partition>) -> Result<Ext2SuperBlock, SystemError> {
-        kdebug!("begin read superblock");
+        // kdebug!("begin read superblock");
         let mut blc_data = Vec::with_capacity(LBA_SIZE * 2);
         blc_data.resize(LBA_SIZE * 2, 0);
 
@@ -521,8 +521,8 @@ impl Ext2SuperBlock {
         super_block.journal_device = cursor.read_u32()?;
 
         super_block.last_orphan = cursor.read_u32()?;
-        kdebug!("{:?}", super_block);
-        kdebug!("end read superblock");
+        // kdebug!("{:?}", super_block);
+        // kdebug!("end read superblock");
 
         Ok(super_block)
     }
@@ -543,7 +543,7 @@ impl Ext2SuperBlock {
         let block_size: usize = 1024 << self.block_size;
         let des_per_block = block_size / mem::size_of::<Ext2BlockGroupDescriptor>() as usize;
         let size = mem::size_of::<Ext2BlockGroupDescriptor>() as usize;
-        kdebug!("group_count = {group_count},des_per_block = {des_per_block},size = {size}");
+        // kdebug!("group_count = {group_count},des_per_block = {des_per_block},size = {size}");
         // (group_count + des_per_block - 1) / des_per_block
         (group_count * size) / block_size
     }
@@ -551,7 +551,7 @@ impl Ext2SuperBlock {
         &self,
         partition: Arc<Partition>,
     ) -> Result<Vec<Ext2BlockGroupDescriptor>, SystemError> {
-        kdebug!("begin read group descriptors");
+        // kdebug!("begin read group descriptors");
 
         // 先确定块数，再遍历块，再n个字节n个字节读
         let group_count = (self.block_count / self.blocks_per_group) as usize;
@@ -575,7 +575,7 @@ impl Ext2SuperBlock {
 
         let mut blc_data = Vec::with_capacity(block_size * db_count);
         blc_data.resize(block_size * db_count, 0);
-        kdebug!("dbcount = {db_count},block_size = {block_size},des_per_block = {des_per_block},total_des = {total_des},blc_data.len={:?}",blc_data.len());
+        // kdebug!("dbcount = {db_count},block_size = {block_size},des_per_block = {des_per_block},total_des = {total_des},blc_data.len={:?}",blc_data.len());
         partition
             .disk()
             .read_at(4usize, db_count * 2, &mut blc_data)?;
@@ -594,10 +594,10 @@ impl Ext2SuperBlock {
             let mut bg_flags = [0u8; 14];
             cursor.read_exact(&mut bg_flags)?;
 
-            kdebug!("{:?}", d);
+            // kdebug!("{:?}", d);
             decs.push(d);
         }
-        kdebug!("end read group descriptors");
+        // kdebug!("end read group descriptors");
 
         Ok(decs)
     }
@@ -707,46 +707,7 @@ impl Debug for Ext2SuperBlock {
                 &format_args!("{}\n", &self.journal_device),
             )
             .field("last_orphan", &format_args!("{}\n", &self.last_orphan))
-            // .field("block_count", &self.block_count)
-            // .field("reserved_block_count", &self.reserved_block_count)
-            // .field("free_block_count", &self.free_block_count)
-            // .field("free_inode_count", &self.free_inode_count)
-            // .field("first_data_block", &self.first_data_block)
-            // .field("block_size", &self.block_size)
-            // .field("fragment_size", &self.fragment_size)
-            // .field("blocks_per_group", &self.blocks_per_group)
-            // .field("fragments_per_group", &self.fragments_per_group)
-            // .field("inodes_per_group", &self.inodes_per_group)
-            // .field("mount_time", &self.mount_time)
-            // .field("write_time", &self.write_time)
-            // .field("mount_count", &self.mount_count)
-            // .field("max_mount_count", &self.max_mount_count)
-            // .field("magic_signatrue", &self.magic_signatrue)
-            // .field("state", &self.state)
-            // .field("error_action", &self.error_action)
-            // .field("minor_version", &self.minor_version)
-            // .field("last_check_time", &self.last_check_time)
-            // .field("check_interval", &self.check_interval)
-            // .field("os_id", &self.os_id)
-            // .field("major_version", &self.major_version)
-            // .field("def_resuid", &self.def_resuid)
-            // .field("def_resgid", &self.def_resgid)
-            // .field("first_ino", &self.first_ino)
-            // .field("inode_size", &self.inode_size)
-            // .field("super_block_group", &self.super_block_group)
-            // .field("feature_compat", &self.feature_compat)
-            // .field("feature_incompat", &self.feature_incompat)
-            // .field("feature_ro_compat", &self.feature_ro_compat)
-            // .field("uuid", &self.uuid)
-            // .field("volume_name", &self.volume_name)
-            // .field("last_mounted_path", &self.last_mounted_path)
-            // .field("algorithm_usage_bitmap", &self.algorithm_usage_bitmap)
-            // .field("prealloc_blocks", &self.prealloc_blocks)
-            // .field("prealloc_dir_blocks", &self.prealloc_dir_blocks)
-            // .field("journal_uuid", &self.journal_uuid)
-            // .field("journal_inode", &self.journal_inode)
-            // .field("journal_device", &self.journal_device)
-            // .field("last_orphan", &self.last_orphan)
+
             .finish()
     }
 }

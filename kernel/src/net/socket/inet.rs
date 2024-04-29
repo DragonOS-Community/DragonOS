@@ -1,19 +1,23 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use smoltcp::{
-    socket::{ raw, tcp, udp},
+    socket::{raw, tcp, udp},
     wire,
 };
 use system_error::SystemError;
 
 use crate::{
-    driver::net::NetDevice, kerror, kwarn, libs::rwlock::RwLock, net::{
+    driver::net::NetDevice,
+    kerror, kwarn,
+    libs::rwlock::RwLock,
+    net::{
         event_poll::EPollEventType, net_core::poll_ifaces, Endpoint, Protocol, ShutdownType,
         NET_DEVICES,
-    }
+    },
 };
 
 use super::{
-    handle::GlobalSocketHandle, Socket, SocketHandleItem, SocketMetadata, SocketOptions, SocketPollMethod, SocketType, HANDLE_MAP, PORT_MANAGER, SOCKET_SET
+    handle::GlobalSocketHandle, Socket, SocketHandleItem, SocketMetadata, SocketOptions,
+    SocketPollMethod, SocketType, HANDLE_MAP, PORT_MANAGER, SOCKET_SET,
 };
 
 /// @brief 表示原始的socket。原始套接字绕过传输层协议（如 TCP 或 UDP）并提供对网络层协议（如 IP）的直接访问。
@@ -115,7 +119,10 @@ impl Socket for RawSocket {
                 }
             }
             drop(socket_set_guard);
-            kdebug!("[UDP] [Read] sleeping socket with handle: {:?}", self.handle);
+            kdebug!(
+                "[UDP] [Read] sleeping socket with handle: {:?}",
+                self.handle
+            );
             SocketHandleItem::sleep(
                 self.socket_handle(),
                 EPollEventType::EPOLLIN.bits() as u64,
@@ -333,7 +340,10 @@ impl Socket for UdpSocket {
                 // return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
             }
             drop(socket_set_guard);
-            kdebug!("[UDP] [Read] sleeping socket with handle: {:?}", self.handle);
+            kdebug!(
+                "[UDP] [Read] sleeping socket with handle: {:?}",
+                self.handle
+            );
             SocketHandleItem::sleep(
                 self.socket_handle(),
                 EPollEventType::EPOLLIN.bits() as u64,
@@ -559,11 +569,15 @@ impl Socket for TcpSocket {
             {
                 let mut socket_set_guard = SOCKET_SET.lock_irqsave();
                 let smoltcp_handle = handle.smoltcp_handle().unwrap();
-                socket_set_guard.get_mut::<smoltcp::socket::tcp::Socket>(smoltcp_handle).close();
+                socket_set_guard
+                    .get_mut::<smoltcp::socket::tcp::Socket>(smoltcp_handle)
+                    .close();
                 drop(socket_set_guard);
             }
             poll_ifaces();
-            SOCKET_SET.lock_irqsave().remove(handle.smoltcp_handle().unwrap());
+            SOCKET_SET
+                .lock_irqsave()
+                .remove(handle.smoltcp_handle().unwrap());
             // kdebug!("[Socket] [TCP] Close: {:?}", handle);
         }
     }
@@ -830,35 +844,39 @@ impl Socket for TcpSocket {
             // kdebug!("tcp accept: poll_ifaces()");
             poll_ifaces();
             // kdebug!("tcp socket:accept, socket'len={}", self.handle_list.len());
-            
+
             let mut sockset = SOCKET_SET.lock_irqsave();
 
             // Get the corresponding activated handler
             for handle in self.handles.iter_mut() {
-                let con_smol_sock = sockset.get_mut::<tcp::Socket>(handle.smoltcp_handle().unwrap());
+                let con_smol_sock =
+                    sockset.get_mut::<tcp::Socket>(handle.smoltcp_handle().unwrap());
                 if con_smol_sock.is_active() {
                     // kdebug!("[Socket] [TCP] Accept: {:?}", handle);
                     // handle is connected socket's handle
-                    let remote_ep = con_smol_sock.remote_endpoint().ok_or(SystemError::ENOTCONN)?;
-    
+                    let remote_ep = con_smol_sock
+                        .remote_endpoint()
+                        .ok_or(SystemError::ENOTCONN)?;
+
                     let mut tcp_socket = Self::create_new_socket();
                     // self.do_listen(&mut tcp_socket, endpoint).espect;
                     if if endpoint.addr.is_unspecified() {
                         tcp_socket.listen(endpoint.port)
                     } else {
                         tcp_socket.listen(endpoint)
-                    }.is_err()
+                    }
+                    .is_err()
                     {
                         return Err(SystemError::EINVAL);
                     }
                     self.is_listening = true;
-    
+
                     let new_handle =
                         GlobalSocketHandle::new_smoltcp_handle(sockset.add(tcp_socket));
-    
+
                     // let handle in TcpSock be the new empty handle, and return the old connected handle
                     let old_handle = core::mem::replace(handle, new_handle);
-                    
+
                     let metadata = SocketMetadata::new(
                         SocketType::Tcp,
                         Self::DEFAULT_TX_BUF_SIZE,
@@ -899,12 +917,12 @@ impl Socket for TcpSocket {
                 }
             }
             drop(sockset);
-            
+
             // kdebug!("[TCP] [Accept] sleeping socket with handle: {:?}", self.handles.get(0).unwrap().smoltcp_handle().unwrap());
             SocketHandleItem::sleep(
                 self.socket_handle(), // NOTICE
                 Self::CAN_ACCPET,
-                HANDLE_MAP.read_irqsave()
+                HANDLE_MAP.read_irqsave(),
             );
             // kdebug!("tcp socket:after sleep, handle_guard'len={}",HANDLE_MAP.write_irqsave().len());
         }

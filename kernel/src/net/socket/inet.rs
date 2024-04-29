@@ -838,76 +838,69 @@ impl Socket for TcpSocket {
             // kdebug!("tcp socket:accept, socket'len={}", self.handle_list.len());
 
             let mut sockset = SOCKET_SET.lock_irqsave();
-
             // Get the corresponding activated handler
-            for handle in self.handles.iter_mut() {
-                let con_smol_sock =
-                    sockset.get_mut::<tcp::Socket>(handle.smoltcp_handle().unwrap());
-                if con_smol_sock.is_active() {
-                    // kdebug!("[Socket] [TCP] Accept: {:?}", handle);
-                    // handle is connected socket's handle
-                    let remote_ep = con_smol_sock
-                        .remote_endpoint()
-                        .ok_or(SystemError::ENOTCONN)?;
+            let global_handle_index = self.handles.iter().position(|handle| {
+                let con_smol_sock = sockset.get::<tcp::Socket>(handle.smoltcp_handle().unwrap());
+                con_smol_sock.is_active()
+            });
 
-                    let mut tcp_socket = Self::create_new_socket();
-                    // self.do_listen(&mut tcp_socket, endpoint).espect;
-                    if if endpoint.addr.is_unspecified() {
-                        tcp_socket.listen(endpoint.port)
-                    } else {
-                        tcp_socket.listen(endpoint)
-                    }
-                    .is_err()
-                    {
-                        return Err(SystemError::EINVAL);
-                    }
-                    self.is_listening = true;
+            if let Some(handle_index) = global_handle_index {
+                let con_smol_sock = sockset
+                    .get::<tcp::Socket>(self.handles[handle_index].smoltcp_handle().unwrap());
 
-                    let new_handle =
-                        GlobalSocketHandle::new_smoltcp_handle(sockset.add(tcp_socket));
+                // kdebug!("[Socket] [TCP] Accept: {:?}", handle);
+                // handle is connected socket's handle
+                let remote_ep = con_smol_sock
+                    .remote_endpoint()
+                    .ok_or(SystemError::ENOTCONN)?;
 
-                    // let handle in TcpSock be the new empty handle, and return the old connected handle
-                    let old_handle = core::mem::replace(handle, new_handle);
+                let mut tcp_socket = Self::create_new_socket();
+                self.do_listen(&mut tcp_socket, endpoint)?;
 
-                    let metadata = SocketMetadata::new(
-                        SocketType::Tcp,
-                        Self::DEFAULT_TX_BUF_SIZE,
-                        Self::DEFAULT_RX_BUF_SIZE,
-                        Self::DEFAULT_METADATA_BUF_SIZE,
-                        self.metadata.options,
-                    );
+                let new_handle = GlobalSocketHandle::new_smoltcp_handle(sockset.add(tcp_socket));
 
-                    let sock_ret = Box::new(TcpSocket {
-                        handles: vec![old_handle],
-                        local_endpoint: self.local_endpoint,
-                        is_listening: false,
-                        metadata,
-                    });
+                // let handle in TcpSock be the new empty handle, and return the old connected handle
+                let old_handle = core::mem::replace(&mut self.handles[handle_index], new_handle);
 
-                    // 更新端口与 socket 的绑定
-                    if let Some(Endpoint::Ip(Some(ip))) = self.endpoint() {
-                        PORT_MANAGER.unbind_port(self.metadata.socket_type, ip.port)?; // NOTICE
-                        PORT_MANAGER.bind_port(
-                            self.metadata.socket_type,
-                            ip.port,
-                            *(sock_ret.clone()),
-                        )?;
-                    }
-                    {
-                        let mut handle_guard = HANDLE_MAP.write_irqsave();
-                        // 先删除原来的
-                        let item = handle_guard.remove(&old_handle).unwrap();
+                let metadata = SocketMetadata::new(
+                    SocketType::Tcp,
+                    Self::DEFAULT_TX_BUF_SIZE,
+                    Self::DEFAULT_RX_BUF_SIZE,
+                    Self::DEFAULT_METADATA_BUF_SIZE,
+                    self.metadata.options,
+                );
 
-                        // 按照smoltcp行为，将新的handle绑定到原来的item
-                        let new_item = SocketHandleItem::new(None);
-                        handle_guard.insert(old_handle, new_item);
-                        // 插入新的item
-                        handle_guard.insert(new_handle, item);
-                        drop(handle_guard);
-                    }
-                    return Ok((sock_ret, Endpoint::Ip(Some(remote_ep))));
+                let sock_ret = Box::new(TcpSocket {
+                    handles: vec![old_handle],
+                    local_endpoint: self.local_endpoint,
+                    is_listening: false,
+                    metadata,
+                });
+
+                // 更新端口与 socket 的绑定
+                if let Some(Endpoint::Ip(Some(ip))) = self.endpoint() {
+                    PORT_MANAGER.unbind_port(self.metadata.socket_type, ip.port)?; // NOTICE
+                    PORT_MANAGER.bind_port(
+                        self.metadata.socket_type,
+                        ip.port,
+                        *(sock_ret.clone()),
+                    )?;
                 }
+                {
+                    let mut handle_guard = HANDLE_MAP.write_irqsave();
+                    // 先删除原来的
+                    let item = handle_guard.remove(&old_handle).unwrap();
+
+                    // 按照smoltcp行为，将新的handle绑定到原来的item
+                    let new_item = SocketHandleItem::new(None);
+                    handle_guard.insert(old_handle, new_item);
+                    // 插入新的item
+                    handle_guard.insert(new_handle, item);
+                    drop(handle_guard);
+                }
+                return Ok((sock_ret, Endpoint::Ip(Some(remote_ep))));
             }
+
             drop(sockset);
 
             // kdebug!("[TCP] [Accept] sleeping socket with handle: {:?}", self.handles.get(0).unwrap().smoltcp_handle().unwrap());

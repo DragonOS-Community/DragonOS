@@ -1,12 +1,14 @@
+use core::fmt::Write;
+
 //https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c
 /*
 
 Variable
 
-    kobject_actions
+    kobject_actions √
     uevent_helper
     uevent_net_ops
-    uevent_seqnum
+    uevent_seqnum   √
 
 Struct
 
@@ -23,10 +25,10 @@ Function
     kobject_action_args
     kobject_action_type
     kobject_synth_uevent
-    kobject_uevent
-    kobject_uevent_env
+    kobject_uevent  √
+    kobject_uevent_env  √
     kobject_uevent_init
-    kobject_uevent_net_broadcast
+    kobject_uevent_net_broadcast    √
     uevent_net_broadcast
     uevent_net_broadcast_tagged
     uevent_net_broadcast_untagged
@@ -34,27 +36,26 @@ Function
     uevent_net_init
     uevent_net_rcv
     uevent_net_rcv_skb
-    zap_modalias_env
+    zap_modalias_env    √
     
 */
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use num::Zero;
-use crate::driver::base::kobject::{KObjectManager, KObjectState, UEVENT_SUPPRESS};
+use crate::driver::base::kobject::{KObjectManager, KObjectState};
 use crate::net::socket::Socket;
 use super::KobjectAction;
 use super::KObject;
 use super::KobjUeventEnv;
-use crate::driver::base::kset::{KSet,KSetUeventOps};
 use super::{UEVENT_NUM_ENVP,UEVENT_BUFFER_SIZE};
 use crate::libs::mutex::Mutex;
 use alloc::sync::Arc;
-use alloc::sync::Weak;
 use system_error::SystemError;
-use crate::mm::c_adapter::{kfree, kzalloc};
 use alloc::boxed::Box;
 
-// u64 uevent_seqnum;
+// 存放需要用到的全局变量
+pub static UEVENT_SEQNUM: u64 = 0;
+pub static UEVENT_SUPPRESS: i32 = 1;
 // #ifdef CONFIG_UEVENT_HELPER
 // char uevent_helper[UEVENT_HELPER_PATH_LEN] = CONFIG_UEVENT_HELPER_PATH;
 // #endif
@@ -118,29 +119,17 @@ kobject_action_type，将enum kobject_action类型的Action，转换为字符串
 pub fn kobject_uevent(kobj: &dyn KObject, action: KobjectAction) -> Result<(), SystemError>  {
     // kobject_uevent和kobject_uevent_env功能一样，只是没有指定任何的环境变量
     match kobject_uevent_env(kobj, action, None) {
-        Ok(_) => Ok(()), // return Ok(()) on success
-        Err(e) => Err(e), // return the error on failure
+        Ok(_) => Ok(()), 
+        Err(e) => Err(e),
     }
 }
 pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: Option<Vec<String>>) -> Result<i32, SystemError>  {
     
-    // todo: 定义一些常量和变量
-    // init uevent env
-    // let env = KobjUeventEnv {
-    //     argv: Vec::with_capacity(UEVENT_NUM_ENVP),
-    //     envp: Vec::with_capacity(UEVENT_NUM_ENVP),
-    //     envp_idx: 0,
-    //     buf: Vec::with_capacity(UEVENT_BUFFER_SIZE),
-    //     buflen: 0,
-    // };
-    
-    //let mut kset = kobj.kset();
     let subsystem: String;
     let mut state = KObjectState::empty();
     let devpath: String;
-    let mut top_kobj = kobj;
-    let kset = kobj.kset();
-    let mut retval: i32 = 0;
+    let mut top_kobj = kobj.parent().unwrap().upgrade().unwrap();
+    let mut retval: i32;
     let action_string = match action {
     KobjectAction::KOBJADD => "add".to_string(),
     KobjectAction::KOBJREMOVE => "remove".to_string(),
@@ -163,20 +152,16 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
     }
 
     /* search the kset we belong to */
-    
-    // while let Some(weak_parent) = top_kobj.parent() {
-    //     if let Some(strong_parent) = weak_parent.upgrade() {
-    //         top_kobj = strong_parent.as_ref();
-    //     }
-    // }
+    while let Some(weak_parent) = top_kobj.parent() {
+        top_kobj= weak_parent.upgrade().unwrap();
+    }
 
     if top_kobj.kset().is_none() {
         kdebug!("attempted to send uevent without kset!\n");
         return Err(SystemError::EINVAL);
     } 
 
-    
-
+    let kset = top_kobj.kset();
     /* skip the event, if uevent_suppress is set*/
     /* 
     if (kobj->uevent_suppress) {
@@ -219,7 +204,7 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
     // 创建一个用于环境变量的缓冲区
 
     // HELP_NEEDED: linux使用的是kzalloc，这里使用Box::new ？
-    let env = Box::new(KobjUeventEnv {
+    let mut env = Box::new(KobjUeventEnv {
             argv: Vec::with_capacity(UEVENT_NUM_ENVP),
             envp: Vec::with_capacity(UEVENT_NUM_ENVP),
             envp_idx: 0,
@@ -258,7 +243,7 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
 	if retval
 		{};
     */
-    retval = add_uevent_var(&env, "ACTION=%s", &action_string).unwrap();
+    retval = add_uevent_var(&mut env, "ACTION=%s", &action_string).unwrap();
 	if retval.is_zero(){
         // goto exit 
         // 这里的goto目标代码较少，暂时直接复制使用，不仿写goto逻辑
@@ -267,13 +252,13 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
         drop(env);
         return Ok(retval);
         };
-	retval = add_uevent_var(&env, "DEVPATH=%s", &devpath).unwrap();
+	retval = add_uevent_var(&mut env, "DEVPATH=%s", &devpath).unwrap();
 	if retval.is_zero(){
         drop(devpath);
         drop(env);
         return Ok(retval);
     };
-	retval = add_uevent_var(&env, "SUBSYSTEM=%s", &subsystem).unwrap();
+	retval = add_uevent_var(&mut env, "SUBSYSTEM=%s", &subsystem).unwrap();
 	if retval.is_zero(){
         drop(devpath);
         drop(env);
@@ -294,10 +279,8 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
     /* keys passed in from the caller */
     if let Some(env_ext) = envp_ext {
         for var in env_ext {
-            // todo
-            let retval = add_uevent_var(&env, "%s", &var).unwrap();
+            let retval = add_uevent_var(&mut env, "%s", &var).unwrap();
             if retval.is_zero(){
-                // goto exit
                 drop(devpath);
                 drop(env);
                 return Ok(retval);
@@ -319,103 +302,162 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
             state.insert(KObjectState::ADD_UEVENT_SENT);
         },
         KobjectAction::KOBJUNBIND => {
-            zap_modalias_env(&env);
+            zap_modalias_env(&mut env);
         },
         _ => {}
     }
 
-    /*
-    mutex_lock(&uevent_sock_mutex);
+    
+    //mutex_lock(&uevent_sock_mutex);
 	/* we will send an event, so request a new sequence number */
-	retval = add_uevent_var(env, "SEQNUM=%llu", ++uevent_seqnum);
-	if (retval) {
-		mutex_unlock(&uevent_sock_mutex);
-		goto exit;
-	}
-	retval = kobject_uevent_net_broadcast(kobj, env, action_string,
-					      devpath);
-	mutex_unlock(&uevent_sock_mutex);
+    retval = add_uevent_var(&mut env, "SEQNUM=%llu", &(UEVENT_SEQNUM+1).to_string()).unwrap();
+    if retval.is_zero(){
+        drop(devpath);
+        drop(env);
+        return Ok(retval);
+    }
+	retval = kobject_uevent_net_broadcast(kobj, &env, &action_string, &devpath);
+    //mutex_unlock(&uevent_sock_mutex);
 
-#ifdef CONFIG_UEVENT_HELPER
-	/* call uevent_helper, usually only enabled during early boot */
-	if (uevent_helper[0] && !kobj_usermode_filter(kobj)) {
-		struct subprocess_info *info;
+    #[cfg(feature = "UEVENT_HELPER")]
+    fn handle_uevent_helper() {
+        // TODO
+        // 在特性 `UEVENT_HELPER` 开启的情况下，这里的代码会执行
+        // 	/* call uevent_helper, usually only enabled during early boot */
+        // 	if (uevent_helper[0] && !kobj_usermode_filter(kobj)) {
+        // 		struct subprocess_info *info;
 
-		retval = add_uevent_var(env, "HOME=/");
-		if (retval)
-			goto exit;
-		retval = add_uevent_var(env,
-					"PATH=/sbin:/bin:/usr/sbin:/usr/bin");
-		if (retval)
-			goto exit;
-		retval = init_uevent_argv(env, subsystem);
-		if (retval)
-			goto exit;
+        // 		retval = add_uevent_var(env, "HOME=/");
+        // 		if (retval)
+        // 			goto exit;
+        // 		retval = add_uevent_var(env,
+        // 					"PATH=/sbin:/bin:/usr/sbin:/usr/bin");
+        // 		if (retval)
+        // 			goto exit;
+        // 		retval = init_uevent_argv(env, subsystem);
+        // 		if (retval)
+        // 			goto exit;
 
-		retval = -ENOMEM;
-		info = call_usermodehelper_setup(env->argv[0], env->argv,
-						 env->envp, GFP_KERNEL,
-						 NULL, cleanup_uevent_env, env);
-		if (info) {
-			retval = call_usermodehelper_exec(info, UMH_NO_WAIT);
-			env = NULL;	/* freed by cleanup_uevent_env */
-		}
-	}
-#endif
+        // 		retval = -ENOMEM;
+        // 		info = call_usermodehelper_setup(env->argv[0], env->argv,
+        // 						 env->envp, GFP_KERNEL,
+        // 						 NULL, cleanup_uevent_env, env);
+        // 		if (info) {
+        // 			retval = call_usermodehelper_exec(info, UMH_NO_WAIT);
+        // 			env = NULL;	/* freed by cleanup_uevent_env */
+        // 		}
+        // 	}
+    }
+    #[cfg(not(feature = "UEVENT_HELPER"))]
+    fn handle_uevent_helper() {
+        // 在特性 `UEVENT_HELPER` 关闭的情况下，这里的代码会执行
+    }
+    handle_uevent_helper();
+    drop(devpath);
+    drop(env);
+    return Ok(retval);
+}
 
-     */
+pub fn add_uevent_var(env: &mut Box<KobjUeventEnv>, format: &str, args: &String) -> Result<i32, SystemError>{
+    if env.envp_idx >= env.envp.len() {
+        kdebug!("add_uevent_var: too many keys");
+        return Err(SystemError::ENOMEM);
+    }
+
+    let mut buffer = String::with_capacity(env.buf.len()-env.buflen);
+    write!(&mut buffer,"{} {}", format.to_string(), args).map_err(|_| SystemError::ENOMEM)?;
+    let len = buffer.len();
+
+    if len >= env.buf.len() - env.buflen {
+        kdebug!("add_uevent_var: buffer size too small");
+        return Err(SystemError::ENOMEM);
+    }
+
+    env.envp[env.envp_idx].replace(buffer);
+    env.envp_idx += 1;
+    env.buflen += len + 1;
 
     Ok(0)
 }
 
-pub fn add_uevent_var(env: &Box<KobjUeventEnv>, format: &str, args: &String) -> Result<i32, SystemError>{
-    //todo
-    // let len: usize;
-
-    // if env.envp_idx >= env.envp.len() {
-    //     println!("add_uevent_var: too many keys");
-    //     return Err(SystemError::ENOMEM);
-    // }
-
-    // len = env.buf[env.buflen..].write_fmt(format, args).unwrap();
-
-    // if len >= env.buf.len() - env.buflen {
-    //     println!("add_uevent_var: buffer size too small");
-    //     return Err(SystemError::ENOMEM);
-    // }
-
-    // env.envp[env.envp_idx] = &env.buf[env.buflen];
-    // env.envp_idx += 1;
-    // env.buflen += len + 1;
-
-    Ok(0)
-}
-
-fn zap_modalias_env(env: &Box<KobjUeventEnv>)
+// 用于处理设备树中与模块相关的环境变量
+fn zap_modalias_env(env: &mut Box<KobjUeventEnv>)
 {
-    // todo
-	// static const char modalias_prefix[] = "MODALIAS=";
-	// size_t len;
-	// int i, j;
+    // 定义一个静态字符串
+    const MODALIAS_PREFIX: &str = "MODALIAS=";
+	let mut len :usize;
 
-	// for (i = 0; i < env->envp_idx;) {
-	// 	if (strncmp(env->envp[i], modalias_prefix,
-	// 		    sizeof(modalias_prefix) - 1)) {
-	// 		i++;
-	// 		continue;
-	// 	}
+    for i in 0..env.envp_idx {
+        // 如果存在而且是以MODALIAS=开头的字符串
+        if env.envp[i].is_some() && env.envp[i].as_ref().unwrap().starts_with("MODALIAS=") {
+            len = env.envp[i].as_ref().unwrap().len() + 1;
+            // 如果不是最后一个元素
+            if i != env.envp_idx - 1 {
+                // 将下一个环境变量移动到当前的位置，这样可以覆盖掉"MODALIAS="前缀的环境变量。
+                let next_envp = env.envp[i+1].as_ref().unwrap().clone();
+                env.envp[i].replace(next_envp);
+                // 更新数组中后续元素的位置，以反映它们被移动后的位置
+                for j in i..env.envp_idx - 1 {
+                    let next_envp = env.envp[j+1].as_ref().unwrap().clone();
+                    env.envp[j].replace(next_envp);
+                }
+            }
+            // 减少环境变量数组的索引，因为一个变量已经被移除
+            env.envp_idx -= 1;
+            // 减少环境变量的总长度
+            env.buflen -= len;
+        }
+    
+    }
+}
 
-	// 	len = strlen(env->envp[i]) + 1;
+// 用于处理网络相关的uevent（通用事件）广播
+#[cfg(feature = "NET")]
+pub fn kobject_uevent_net_broadcast(
+    kobj: &dyn KObject,
+    env: &Box<KobjUeventEnv>,
+    action_string: &String,
+    devpath: &String,
+)->i32
+{
+    let mut ret = 0;
+    //let net:Net = None;
+    let mut ops = kobj_ns_ops(kobj);
 
-	// 	if (i != env->envp_idx - 1) {
-	// 		memmove(env->envp[i], env->envp[i + 1],
-	// 			env->buflen - len);
+	if (!ops && kobj.kset().is_some()) {
+		let ksobj:KObject = &kobj.kset().kobj();
 
-	// 		for (j = i; j < env->envp_idx - 1; j++)
-	// 			env->envp[j] = env->envp[j + 1] - len;
-	// 	}
+		if (ksobj.parent() != NULL){
+            ops = kobj_ns_ops(ksobj.parent());
+        }
+			
+	}
+    // TODO: net结构体？
+    // https://code.dragonos.org.cn/xref/linux-6.1.9/include/net/net_namespace.h#60
+	/* kobjects currently only carry network namespace tags and they
+	 * are the only tag relevant here since we want to decide which
+	 * network namespaces to broadcast the uevent into.
+	 */
+	// if (ops && ops.netlink_ns() && kobj.ktype().namespace())
+	// 	if (ops.type() == KOBJ_NS_TYPE_NET)
+	// 		net = kobj.ktype().namespace(kobj);
+    if !net.is_none() {
+        ret = uevent_net_broadcast_tagged(net.unwrap().sk, env, action_string, devpath);
+    } else {
+        ret = uevent_net_broadcast_untagged(env, action_string, devpath);
+    }
+    ret
+}
 
-	// 	env->envp_idx--;
-	// 	env->buflen -= len;
-	// }
+#[cfg(not(feature = "NET"))]
+#[allow(unused_variables)]
+pub fn kobject_uevent_net_broadcast(
+    kobj: &dyn KObject,
+    env: &Box<KobjUeventEnv>,
+    action_string: &String,
+    devpath: &String,
+)->i32
+{
+    let ret = 0;
+    ret
 }

@@ -68,12 +68,24 @@ pub enum KobjectAction {
 pub const UEVENT_NUM_ENVP :usize = 64;
 pub const UEVENT_BUFFER_SIZE:usize= 2048;
 pub const UEVENT_HELPER_PATH_LEN:usize = 256;
+
+/// Represents the environment for handling kernel object uevents.
+/*
+    envp，指针数组，用于保存每个环境变量的地址，最多可支持的环境变量数量为UEVENT_NUM_ENVP。
+
+    envp_idx，用于访问环境变量指针数组的index。
+
+    buf，保存环境变量的buffer，最大为UEVENT_BUFFER_SIZE。
+
+    buflen，访问buf的变量。
+
+*/
 pub struct KobjUeventEnv {
     argv: Vec<Option<String>>,
     envp: Vec<Option<String>>,
-    envp_idx: u32,
-    buf: Vec<u8>,
-    buflen: u32,
+    envp_idx: usize,
+    buf: Vec<Option<String>>,
+    buflen: usize,
 }
 
 //kset_uevent_ops是为kset量身订做的一个数据结构，里面包含filter和uevent两个回调函数，用处如下： 

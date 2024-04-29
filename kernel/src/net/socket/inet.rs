@@ -119,10 +119,6 @@ impl Socket for RawSocket {
                 }
             }
             drop(socket_set_guard);
-            kdebug!(
-                "[UDP] [Read] sleeping socket with handle: {:?}",
-                self.handle
-            );
             SocketHandleItem::sleep(
                 self.socket_handle(),
                 EPollEventType::EPOLLIN.bits() as u64,

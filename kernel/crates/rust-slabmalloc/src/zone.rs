@@ -142,7 +142,7 @@ impl<'a> ZoneAllocator<'a> {
                 // 统计page中还可以分配多少个object
                 let mut free_obj_count = 0;
                 // 遍历page中的bitfield(用来统计内存分配情况的u64数组)
-                for (_base_idx, b) in slab_page.bitfield().iter().enumerate() {
+                for b in slab_page.bitfield().iter() {
                     let bitval = b.load(Ordering::Relaxed);
                     let free_count = bitval.count_zeros() as usize;
                     free_obj_count += free_count;

@@ -444,6 +444,7 @@ impl ElfLoader {
                     bss_prot,
                     MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE,
                     false,
+                    true,
                 )
                 .map_err(|e| match e {
                     SystemError::EINVAL => ExecError::InvalidParemeter,
@@ -878,12 +879,12 @@ impl BinaryLoader for ElfLoader {
                 total_size,
             )
             .map_err(|e| {
-                    kerror!("load_elf_segment failed: {:?}", e);
-                    match e {
+                kerror!("load_elf_segment failed: {:?}", e);
+                match e {
                     SystemError::EFAULT => ExecError::BadAddress(None),
                     SystemError::ENOMEM => ExecError::OutOfMemory,
                     _ => ExecError::Other(format!("load_elf_segment failed: {:?}", e)),
-                    }
+                }
             })?;
 
             // 如果地址不对，那么就报错

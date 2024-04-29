@@ -85,7 +85,7 @@ pub(super) fn new_socket(
         }
     };
 
-    let handle_item = SocketHandleItem::new();
+    let handle_item = SocketHandleItem::new(None);
     HANDLE_MAP
         .write_irqsave()
         .insert(socket.socket_handle(), handle_item);
@@ -400,16 +400,16 @@ pub struct SocketHandleItem {
     /// shutdown状态
     pub shutdown_type: RwLock<ShutdownType>,
     /// socket的waitqueue
-    pub wait_queue: EventWaitQueue,
+    pub wait_queue: Arc<EventWaitQueue>,
     /// epitems，考虑写在这是否是最优解？
     pub epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
 }
 
 impl SocketHandleItem {
-    pub fn new() -> Self {
+    pub fn new(wait_queue: Option<Arc<EventWaitQueue>>) -> Self {
         Self {
             shutdown_type: RwLock::new(ShutdownType::empty()),
-            wait_queue: EventWaitQueue::new(),
+            wait_queue: wait_queue.unwrap_or(Arc::new(EventWaitQueue::new())),
             epitems: SpinLock::new(LinkedList::new()),
         }
     }

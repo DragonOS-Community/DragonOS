@@ -1,24 +1,19 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use smoltcp::{
-    socket::{raw, tcp, udp, AnySocket},
+    socket::{ raw, tcp, udp},
     wire,
 };
 use system_error::SystemError;
 
 use crate::{
-    arch::rand::rand,
-    driver::net::NetDevice,
-    kerror, kwarn,
-    libs::rwlock::RwLock,
-    net::{
+    driver::net::NetDevice, kerror, kwarn, libs::rwlock::RwLock, net::{
         event_poll::EPollEventType, net_core::poll_ifaces, Endpoint, Protocol, ShutdownType,
         NET_DEVICES,
-    },
+    }
 };
 
 use super::{
-    handle::GlobalSocketHandle, Socket, SocketHandleItem, SocketMetadata, SocketOptions,
-    SocketPollMethod, SocketType, HANDLE_MAP, PORT_MANAGER, SOCKET_SET,
+    handle::GlobalSocketHandle, Socket, SocketHandleItem, SocketMetadata, SocketOptions, SocketPollMethod, SocketType, HANDLE_MAP, PORT_MANAGER, SOCKET_SET
 };
 
 /// @brief 表示原始的socket。原始套接字绕过传输层协议（如 TCP 或 UDP）并提供对网络层协议（如 IP）的直接访问。
@@ -120,6 +115,7 @@ impl Socket for RawSocket {
                 }
             }
             drop(socket_set_guard);
+            kdebug!("[UDP] [Read] sleeping socket with handle: {:?}", self.handle);
             SocketHandleItem::sleep(
                 self.socket_handle(),
                 EPollEventType::EPOLLIN.bits() as u64,
@@ -337,6 +333,7 @@ impl Socket for UdpSocket {
                 // return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
             }
             drop(socket_set_guard);
+            kdebug!("[UDP] [Read] sleeping socket with handle: {:?}", self.handle);
             SocketHandleItem::sleep(
                 self.socket_handle(),
                 EPollEventType::EPOLLIN.bits() as u64,
@@ -559,11 +556,16 @@ impl TcpSocket {
 impl Socket for TcpSocket {
     fn close(&mut self) {
         for handle in self.handles.iter() {
-            let mut socket_set_guard = SOCKET_SET.lock_irqsave();
-            socket_set_guard.remove(handle.smoltcp_handle().unwrap()); // 删除的时候，会发送一条FINISH的信息？
-            drop(socket_set_guard);
+            {
+                let mut socket_set_guard = SOCKET_SET.lock_irqsave();
+                let smoltcp_handle = handle.smoltcp_handle().unwrap();
+                socket_set_guard.get_mut::<smoltcp::socket::tcp::Socket>(smoltcp_handle).close();
+                drop(socket_set_guard);
+            }
+            poll_ifaces();
+            SOCKET_SET.lock_irqsave().remove(handle.smoltcp_handle().unwrap());
+            // kdebug!("[Socket] [TCP] Close: {:?}", handle);
         }
-        poll_ifaces();
     }
 
     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
@@ -627,7 +629,7 @@ impl Socket for TcpSocket {
             drop(socket_set_guard);
             SocketHandleItem::sleep(
                 self.socket_handle(),
-                EPollEventType::EPOLLIN.bits() as u64,
+                (EPollEventType::EPOLLIN.bits() | EPollEventType::EPOLLHUP.bits()) as u64,
                 HANDLE_MAP.read_irqsave(),
             );
         }
@@ -750,7 +752,7 @@ impl Socket for TcpSocket {
 
     /// @brief tcp socket 监听 local_endpoint 端口
     ///
-    /// @param backlog 未处理的连接队列的最大长度. 由于smoltcp不支持backlog，所以这个参数目前无效
+    /// @param backlog 未处理的连接队列的最大长度
     fn listen(&mut self, backlog: usize) -> Result<(), SystemError> {
         if self.is_listening {
             return Ok(());
@@ -763,12 +765,14 @@ impl Socket for TcpSocket {
         let backlog = handlen.max(backlog);
 
         // 添加剩余需要构建的socket
-        // kdebug!("tcp socket:before listen, socket'len={}",self.handle.len());
+        // kdebug!("tcp socket:before listen, socket'len={}", self.handle_list.len());
         let mut handle_guard = HANDLE_MAP.write_irqsave();
+        let wait_queue = Arc::clone(&handle_guard.get(&self.socket_handle()).unwrap().wait_queue);
+
         self.handles.extend((handlen..backlog).map(|_| {
             let socket = Self::create_new_socket();
             let handle = GlobalSocketHandle::new_smoltcp_handle(sockets.add(socket));
-            let handle_item = SocketHandleItem::new();
+            let handle_item = SocketHandleItem::new(Some(wait_queue.clone()));
             handle_guard.insert(handle, handle_item);
             handle
         }));
@@ -818,100 +822,90 @@ impl Socket for TcpSocket {
     }
 
     fn accept(&mut self) -> Result<(Box<dyn Socket>, Endpoint), SystemError> {
+        if !self.is_listening {
+            return Err(SystemError::EINVAL);
+        }
         let endpoint = self.local_endpoint.ok_or(SystemError::EINVAL)?;
         loop {
             // kdebug!("tcp accept: poll_ifaces()");
             poll_ifaces();
-            // kdebug!("tcp socket:accept, socket'len={}",self.handle.len());
+            // kdebug!("tcp socket:accept, socket'len={}", self.handle_list.len());
+            
+            let mut sockset = SOCKET_SET.lock_irqsave();
 
-            let mut sockets = SOCKET_SET.lock_irqsave();
+            // Get the corresponding activated handler
+            for handle in self.handles.iter_mut() {
+                let con_smol_sock = sockset.get_mut::<tcp::Socket>(handle.smoltcp_handle().unwrap());
+                if con_smol_sock.is_active() {
+                    // kdebug!("[Socket] [TCP] Accept: {:?}", handle);
+                    // handle is connected socket's handle
+                    let remote_ep = con_smol_sock.remote_endpoint().ok_or(SystemError::ENOTCONN)?;
+    
+                    let mut tcp_socket = Self::create_new_socket();
+                    // self.do_listen(&mut tcp_socket, endpoint).espect;
+                    if if endpoint.addr.is_unspecified() {
+                        tcp_socket.listen(endpoint.port)
+                    } else {
+                        tcp_socket.listen(endpoint)
+                    }.is_err()
+                    {
+                        return Err(SystemError::EINVAL);
+                    }
+                    self.is_listening = true;
+    
+                    let new_handle =
+                        GlobalSocketHandle::new_smoltcp_handle(sockset.add(tcp_socket));
+    
+                    // let handle in TcpSock be the new empty handle, and return the old connected handle
+                    let old_handle = core::mem::replace(handle, new_handle);
+                    
+                    let metadata = SocketMetadata::new(
+                        SocketType::Tcp,
+                        Self::DEFAULT_TX_BUF_SIZE,
+                        Self::DEFAULT_RX_BUF_SIZE,
+                        Self::DEFAULT_METADATA_BUF_SIZE,
+                        self.metadata.options,
+                    );
 
-            // 随机获取访问的socket的handle
-            let index: usize = rand() % self.handles.len();
-            let handle = self.handles.get(index).unwrap();
+                    let sock_ret = Box::new(TcpSocket {
+                        handles: vec![old_handle],
+                        local_endpoint: self.local_endpoint,
+                        is_listening: false,
+                        metadata,
+                    });
 
-            let socket = sockets
-                .iter_mut()
-                .find(|y| {
-                    tcp::Socket::downcast(y.1)
-                        .map(|y| y.is_active())
-                        .unwrap_or(false)
-                })
-                .map(|y| tcp::Socket::downcast_mut(y.1).unwrap());
-            if let Some(socket) = socket {
-                if socket.is_active() {
-                    // kdebug!("tcp accept: socket.is_active()");
-                    let remote_ep = socket.remote_endpoint().ok_or(SystemError::ENOTCONN)?;
-
-                    let new_socket = {
-                        // The new TCP socket used for sending and receiving data.
-                        let mut tcp_socket = Self::create_new_socket();
-                        self.do_listen(&mut tcp_socket, endpoint)
-                            .expect("do_listen failed");
-
-                        // tcp_socket.listen(endpoint).unwrap();
-
-                        // 之所以把old_handle存入new_socket, 是因为当前时刻，smoltcp已经把old_handle对应的socket与远程的endpoint关联起来了
-                        // 因此需要再为当前的socket分配一个新的handle
-                        let new_handle =
-                            GlobalSocketHandle::new_smoltcp_handle(sockets.add(tcp_socket));
-                        let old_handle = ::core::mem::replace(
-                            &mut *self.handles.get_mut(index).unwrap(),
-                            new_handle,
-                        );
-
-                        let metadata = SocketMetadata::new(
-                            SocketType::Tcp,
-                            Self::DEFAULT_TX_BUF_SIZE,
-                            Self::DEFAULT_RX_BUF_SIZE,
-                            Self::DEFAULT_METADATA_BUF_SIZE,
-                            self.metadata.options,
-                        );
-
-                        let new_socket = Box::new(TcpSocket {
-                            handles: vec![old_handle],
-                            local_endpoint: self.local_endpoint,
-                            is_listening: false,
-                            metadata,
-                        });
-                        // kdebug!("tcp socket:after accept, socket'len={}",new_socket.handle.len());
-
-                        // 更新端口与 socket 的绑定
-                        if let Some(Endpoint::Ip(Some(ip))) = self.endpoint() {
-                            PORT_MANAGER.unbind_port(self.metadata.socket_type, ip.port)?;
-                            PORT_MANAGER.bind_port(
-                                self.metadata.socket_type,
-                                ip.port,
-                                *new_socket.clone(),
-                            )?;
-                        }
-
-                        // 更新handle表
+                    // 更新端口与 socket 的绑定
+                    if let Some(Endpoint::Ip(Some(ip))) = self.endpoint() {
+                        PORT_MANAGER.unbind_port(self.metadata.socket_type, ip.port)?; // NOTICE
+                        PORT_MANAGER.bind_port(
+                            self.metadata.socket_type,
+                            ip.port,
+                            *(sock_ret.clone()),
+                        )?;
+                    }
+                    {
                         let mut handle_guard = HANDLE_MAP.write_irqsave();
                         // 先删除原来的
-
                         let item = handle_guard.remove(&old_handle).unwrap();
 
                         // 按照smoltcp行为，将新的handle绑定到原来的item
-                        handle_guard.insert(new_handle, item);
-                        let new_item = SocketHandleItem::new();
-
-                        // 插入新的item
+                        let new_item = SocketHandleItem::new(None);
                         handle_guard.insert(old_handle, new_item);
-
-                        new_socket
-                    };
-                    // kdebug!("tcp accept: new socket: {:?}", new_socket);
-                    drop(sockets);
-                    poll_ifaces();
-
-                    return Ok((new_socket, Endpoint::Ip(Some(remote_ep))));
+                        // 插入新的item
+                        handle_guard.insert(new_handle, item);
+                        drop(handle_guard);
+                    }
+                    return Ok((sock_ret, Endpoint::Ip(Some(remote_ep))));
                 }
             }
-            // kdebug!("tcp socket:before sleep, handle_guard'len={}",HANDLE_MAP.write_irqsave().len());
-
-            drop(sockets);
-            SocketHandleItem::sleep(*handle, Self::CAN_ACCPET, HANDLE_MAP.read_irqsave());
+            drop(sockset);
+            
+            // kdebug!("[TCP] [Accept] sleeping socket with handle: {:?}", self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+            SocketHandleItem::sleep(
+                self.socket_handle(), // NOTICE
+                Self::CAN_ACCPET,
+                HANDLE_MAP.read_irqsave()
+            );
             // kdebug!("tcp socket:after sleep, handle_guard'len={}",HANDLE_MAP.write_irqsave().len());
         }
     }

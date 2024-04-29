@@ -228,20 +228,20 @@ rustInstall() {
 		fi
         echo "正在安装DragonOS所需的rust组件...首次安装需要一些时间来更新索引，请耐心等待..."
         cargo install cargo-binutils
-		rustup toolchain install nightly-2023-01-21-x86_64-unknown-linux-gnu
 		rustup toolchain install nightly-2023-08-15-x86_64-unknown-linux-gnu
-		rustup component add rust-src --toolchain nightly-2023-01-21-x86_64-unknown-linux-gnu
+		rustup toolchain install nightly-2024-04-25-x86_64-unknown-linux-gnu
 		rustup component add rust-src --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
-		rustup target add x86_64-unknown-none --toolchain nightly-2023-01-21-x86_64-unknown-linux-gnu
+		rustup component add rust-src --toolchain nightly-2024-04-25-x86_64-unknown-linux-gnu
 		rustup target add x86_64-unknown-none --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
-		rustup target add x86_64-unknown-linux-musl --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
+		rustup target add x86_64-unknown-none --toolchain nightly-2024-04-25-x86_64-unknown-linux-gnu
+		rustup target add x86_64-unknown-linux-musl --toolchain nightly-2024-04-25-x86_64-unknown-linux-gnu
 
-		rustup toolchain install nightly-2023-01-21-riscv64gc-unknown-linux-gnu --force-non-host
 		rustup toolchain install nightly-2023-08-15-riscv64gc-unknown-linux-gnu --force-non-host
-		rustup target add riscv64gc-unknown-none-elf --toolchain nightly-2023-01-21-riscv64gc-unknown-linux-gnu
-		rustup target add riscv64imac-unknown-none-elf --toolchain nightly-2023-01-21-riscv64gc-unknown-linux-gnu
+		rustup toolchain install nightly-2024-04-25-riscv64gc-unknown-linux-gnu --force-non-host
 		rustup target add riscv64gc-unknown-none-elf --toolchain nightly-2023-08-15-riscv64gc-unknown-linux-gnu
 		rustup target add riscv64imac-unknown-none-elf --toolchain nightly-2023-08-15-riscv64gc-unknown-linux-gnu
+		rustup target add riscv64gc-unknown-none-elf --toolchain nightly-2024-04-25-riscv64gc-unknown-linux-gnu
+		rustup target add riscv64imac-unknown-none-elf --toolchain nightly-2024-04-25-riscv64gc-unknown-linux-gnu
         
 		rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
 		rustup component add rust-src
@@ -256,13 +256,13 @@ rustInstall() {
 # 初始化DragonOS的musl交叉编译工具链
 # 主要是把musl交叉编译工具链的rcrt1.o替换为crt1.o (因为rust的rcrt1.o会使用动态链接的解释器，但是DragonOS目前尚未把它加载进来)
 #
-# 为DragonOS开发应用的时候，请使用 `cargo +nightly-2023-08-15-x86_64-unknown-linux-gnu build --target x86_64-unknown-linux-musl` 来编译
+# 为DragonOS开发应用的时候，请使用 `cargo +nightly-2024-04-25-x86_64-unknown-linux-gnu build --target x86_64-unknown-linux-musl` 来编译
 # 	这样编译出来的应用将能二进制兼容DragonOS 
 ####################################################################################
 initialize_userland_musl_toolchain()
 {
-	fork_toolchain_from="nightly-2023-08-15-x86_64-unknown-linux-gnu"
-	custom_toolchain="nightly-2023-08-15-x86_64-unknown-linux_dragonos-gnu"
+	fork_toolchain_from="nightly-2024-04-25-x86_64-unknown-linux-gnu"
+	custom_toolchain="nightly-2024-04-25-x86_64-unknown-linux_dragonos-gnu"
 	custom_toolchain_dir="$(dirname $(rustc --print sysroot))/${custom_toolchain}"
 	# 如果目录为空
 	if [ ! -d "${custom_toolchain_dir}" ]; then

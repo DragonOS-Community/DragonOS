@@ -51,19 +51,19 @@ jobs:
 
             cargo install cargo-binutils
             rustup toolchain install nightly-x86_64-unknown-linux-gnu
-            rustup toolchain install nightly-2023-01-21-x86_64-unknown-linux-gnu
             rustup toolchain install nightly-2023-08-15-x86_64-unknown-linux-gnu
-            rustup component add rust-src --toolchain nightly-2023-01-21-x86_64-unknown-linux-gnu
+            rustup toolchain install nightly-2024-04-25-x86_64-unknown-linux-gnu
             rustup component add rust-src --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
-            rustup target add x86_64-unknown-none --toolchain nightly-2023-01-21-x86_64-unknown-linux-gnu
+            rustup component add rust-src --toolchain nightly-2024-04-25-x86_64-unknown-linux-gnu
             rustup target add x86_64-unknown-none --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
+            rustup target add x86_64-unknown-none --toolchain nightly-2024-04-25-x86_64-unknown-linux-gnu
 
-            rustup toolchain install nightly-2023-01-21-riscv64gc-unknown-linux-gnu --force-non-host
             rustup toolchain install nightly-2023-08-15-riscv64gc-unknown-linux-gnu --force-non-host
-            rustup target add riscv64gc-unknown-none-elf --toolchain nightly-2023-01-21-riscv64gc-unknown-linux-gnu
-            rustup target add riscv64imac-unknown-none-elf --toolchain nightly-2023-01-21-riscv64gc-unknown-linux-gnu
+            rustup toolchain install nightly-2024-04-25-riscv64gc-unknown-linux-gnu --force-non-host
             rustup target add riscv64gc-unknown-none-elf --toolchain nightly-2023-08-15-riscv64gc-unknown-linux-gnu
             rustup target add riscv64imac-unknown-none-elf --toolchain nightly-2023-08-15-riscv64gc-unknown-linux-gnu
+            rustup target add riscv64gc-unknown-none-elf --toolchain nightly-2024-04-25-riscv64gc-unknown-linux-gnu
+            rustup target add riscv64imac-unknown-none-elf --toolchain nightly-2024-04-25-riscv64gc-unknown-linux-gnu
                 
             rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
             rustup component add rust-src
@@ -71,17 +71,17 @@ jobs:
 
             rustup component add rustfmt
             rustup component add rustfmt --toolchain nightly-x86_64-unknown-linux-gnu
-            rustup component add rustfmt --toolchain nightly-2023-01-21-x86_64-unknown-linux-gnu
             rustup component add rustfmt --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
-            rustup component add rustfmt --toolchain nightly-2023-01-21-riscv64gc-unknown-linux-gnu
+            rustup component add rustfmt --toolchain nightly-2024-04-25-x86_64-unknown-linux-gnu
             rustup component add rustfmt --toolchain nightly-2023-08-15-riscv64gc-unknown-linux-gnu
+            rustup component add rustfmt --toolchain nightly-2024-04-25-riscv64gc-unknown-linux-gnu
 
             rustup default nightly
 
             cargo install dadk --version 0.1.11
           
 
-            userapp_musl_toolchain="nightly-2023-08-15-x86_64-unknown-linux-gnu"
+            userapp_musl_toolchain="nightly-2024-04-25-x86_64-unknown-linux-gnu"
             
             rustup toolchain install ${userapp_musl_toolchain}
             rustup component add --toolchain ${userapp_musl_toolchain} rust-src

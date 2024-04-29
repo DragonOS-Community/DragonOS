@@ -132,30 +132,27 @@ impl<'a> ZoneAllocator<'a> {
     pub fn free_space(&mut self) -> u64 {
         // 记录空闲空间
         let mut free = 0;
-        // scallocator的数量
-        let mut count = 0;
-
         // 遍历所有scallocator
-        while count < ZoneAllocator::MAX_BASE_SIZE_CLASSES {
+        for count in 0..ZoneAllocator::MAX_BASE_SIZE_CLASSES {
             // 获取scallocator
             let scallocator = &mut self.small_slabs[count];
+
             // 遍历scallocator中的部分分配的page(partial_page)
             for slab_page in scallocator.slabs.iter_mut() {
-                // 每个page的obj_per_page，即每个page的最大object数，这里用来赋值给obj_count
-                // 用来统计page中还可以分配多少个object
-                let mut obj_count = scallocator.obj_per_page;
+                // 统计page中还可以分配多少个object
+                let mut free_obj_count = 0;
                 // 遍历page中的bitfield(用来统计内存分配情况的u64数组)
                 for (_base_idx, b) in slab_page.bitfield().iter().enumerate() {
                     let bitval = b.load(Ordering::Relaxed);
-                    let negated = !bitval;
-                    let allocated_count = negated.trailing_zeros() as usize;
-                    // 减去已分配的object数
-                    obj_count -= allocated_count;
+                    let free_count = bitval.count_zeros() as usize;
+                    free_obj_count += free_count;
                 }
                 // 剩余可分配object数乘上page中规定的每个object的大小，即空闲空间
-                free += obj_count * scallocator.size();
+                free += free_obj_count * scallocator.size();
             }
-            count -= 1;
+            // 遍历scallocator中的empty_page，把空页空间也加上去
+            free +=
+                scallocator.empty_slabs.elements * (scallocator.obj_per_page * scallocator.size());
         }
         free as u64
     }

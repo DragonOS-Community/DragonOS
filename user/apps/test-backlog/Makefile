@@ -55,5 +55,3 @@ test-release:
 .PHONY: install
 install:
 	RUSTFLAGS=$(RUSTFLAGS) cargo $(TOOLCHAIN) install --target $(RUST_TARGET) --path . --no-track --root $(INSTALL_DIR) --force
-
-$(warning	test envs $(DADK_CURRENT_BUILD_DIR))

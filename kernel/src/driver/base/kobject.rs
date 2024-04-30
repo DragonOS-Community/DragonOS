@@ -146,7 +146,7 @@ impl SysFSOps for KObjectSysFSOps {
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
         let r = attr.show(kobj, buf).map_err(|e| {
-            if e == SystemError::EOPNOTSUPP_OR_ENOTSUP {
+            if e == SystemError::ENOSYS {
                 SystemError::EIO
             } else {
                 e
@@ -163,7 +163,7 @@ impl SysFSOps for KObjectSysFSOps {
         buf: &[u8],
     ) -> Result<usize, SystemError> {
         let r = attr.store(kobj, buf).map_err(|e| {
-            if e == SystemError::EOPNOTSUPP_OR_ENOTSUP {
+            if e == SystemError::ENOSYS {
                 SystemError::EIO
             } else {
                 e

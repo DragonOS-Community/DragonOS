@@ -30,7 +30,7 @@ use crate::{
 use super::{
     jiffies::clocksource_default_clock,
     timer::{clock, Timer, TimerFunction},
-    NSEC_PER_SEC,
+    NSEC_PER_SEC, NSEC_PER_USEC,
 };
 
 lazy_static! {
@@ -58,10 +58,15 @@ pub static mut FINISHED_BOOTING: AtomicBool = AtomicBool::new(false);
 /// Interval: 0.5sec Threshold: 0.0625s
 /// 系统节拍率
 pub const HZ: u64 = 250;
+// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/time/clocksource.c#101
 /// watchdog检查间隔
 pub const WATCHDOG_INTERVAL: u64 = HZ >> 1;
+// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/time/clocksource.c#108
 /// 最大能接受的误差大小
 pub const WATCHDOG_THRESHOLD: u32 = NSEC_PER_SEC >> 4;
+
+pub const MAX_SKEW_USEC: u64 = 125 * WATCHDOG_INTERVAL / HZ;
+pub const WATCHDOG_MAX_SKEW: u32 = MAX_SKEW_USEC as u32 * NSEC_PER_USEC;
 
 // 时钟周期数
 #[derive(Debug, Clone, Copy)]
@@ -196,29 +201,29 @@ pub trait Clocksource: Send + Sync + Debug {
     fn read(&self) -> CycleNum;
     /// optional function to enable the clocksource
     fn enable(&self) -> Result<i32, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     /// optional function to disable the clocksource
     fn disable(&self) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     /// vsyscall based read
     fn vread(&self) -> Result<CycleNum, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     /// suspend function for the clocksource, if necessary
     fn suspend(&self) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     /// resume function for the clocksource, if necessary
     fn resume(&self) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     // 获取时钟源数据
     fn clocksource_data(&self) -> ClocksourceData;
 
     fn update_clocksource_data(&self, _data: ClocksourceData) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     // 获取时钟源
     fn clocksource(&self) -> Arc<dyn Clocksource>;
@@ -266,6 +271,7 @@ impl dyn Clocksource {
         let cs_data_guard = self.clocksource_data();
 
         let mut max_cycles: u64;
+        // 这里我有问题，不知道要不要修改，暂时不修改它
         max_cycles = (1 << (63 - (log2(cs_data_guard.mult) + 1))) as u64;
         max_cycles = max_cycles.min(cs_data_guard.mask.bits);
         let max_nsecs = clocksource_cyc2ns(
@@ -276,17 +282,95 @@ impl dyn Clocksource {
         return max_nsecs - (max_nsecs >> 5);
     }
 
+    /// # 计算时钟源的mult和shift，以便将一个时钟源的频率转换为另一个时钟源的频率
+    fn clocks_calc_mult_shift(&self, from: u32, to: u32, maxsec: u32) -> (u32, u32) {
+        let mut sftacc: u32 = 32;
+        let mut sft = 1;
+
+        // 计算限制转换范围的shift
+        let mut mult = (maxsec as u64 * from as u64) >> 32;
+        while mult != 0 {
+            mult >>= 1;
+            sftacc -= 1;
+        }
+
+        // 找到最佳的mult和shift
+        for i in (1..=32).rev() {
+            sft = i;
+            mult = (to as u64) << sft;
+            mult += from as u64 / 2;
+            mult /= from as u64;
+            if (mult >> sftacc) == 0 {
+                break;
+            }
+        }
+
+        return (mult as u32, sft);
+    }
+
+    /// # 计算时钟源可以进行的最大调整量
+    fn clocksource_max_adjustment(&self) -> u32 {
+        let cs_data = self.clocksource_data();
+        let ret = cs_data.mult as u64 * 11 / 100;
+
+        return ret as u32;
+    }
+
+    /// # 更新时钟源频率，初始化mult/shift 和 max_idle_ns
+    fn clocksource_update_freq_scale(&self, scale: u32, freq: u32) -> Result<(), SystemError> {
+        let mut cs_data = self.clocksource_data();
+
+        if freq != 0 {
+            let mut sec: u64 = cs_data.mask.bits();
+
+            sec /= freq as u64;
+            sec /= scale as u64;
+            if sec == 0 {
+                sec = 1;
+            } else if sec > 600 && cs_data.mask.bits() > u32::MAX as u64 {
+                sec = 600;
+            }
+
+            let (mult, shift) =
+                self.clocks_calc_mult_shift(freq, NSEC_PER_SEC / scale, sec as u32 * scale);
+            cs_data.set_mult(mult);
+            cs_data.set_shift(shift);
+        }
+
+        if scale != 0 && freq != 0 && cs_data.uncertainty_margin == 0 {
+            cs_data.set_uncertainty_margin(NSEC_PER_SEC / (scale * freq));
+            if cs_data.uncertainty_margin < 2 * WATCHDOG_MAX_SKEW {
+                cs_data.set_uncertainty_margin(2 * WATCHDOG_MAX_SKEW);
+            }
+        } else if cs_data.uncertainty_margin == 0 {
+            cs_data.set_uncertainty_margin(WATCHDOG_THRESHOLD);
+        }
+
+        // 确保时钟源没有太大的mult值造成溢出
+        cs_data.set_maxadj(self.clocksource_max_adjustment());
+
+        let ns = self.clocksource_max_deferment();
+        cs_data.set_max_idle_ns(ns as u32);
+
+        self.update_clocksource_data(cs_data)?;
+
+        return Ok(());
+    }
+
     /// # 注册时钟源
+    ///
+    /// ## 参数
+    ///
+    /// - scale: 如果freq单位为0或hz，此值为1，如果为khz,此值为1000
+    /// - freq: 时钟源的频率，jiffies注册时此值为0
     ///
     /// ## 返回值
     ///
     /// * `Ok(0)` - 时钟源注册成功。
     /// * `Err(SystemError)` - 时钟源注册失败。
-    pub fn register(&self) -> Result<i32, SystemError> {
-        let ns = self.clocksource_max_deferment();
-        let mut cs_data = self.clocksource_data();
-        cs_data.max_idle_ns = ns as u32;
-        self.update_clocksource_data(cs_data)?;
+    pub fn register(&self, scale: u32, freq: u32) -> Result<(), SystemError> {
+        self.clocksource_update_freq_scale(scale, freq)?;
+
         // 将时钟源加入到时钟源队列中
         self.clocksource_enqueue();
         // 将时钟源加入到监视队列中
@@ -295,7 +379,7 @@ impl dyn Clocksource {
         // 选择一个最好的时钟源
         clocksource_select();
         kdebug!("clocksource_register successfully");
-        return Ok(0);
+        return Ok(());
     }
 
     /// # 将时钟源插入时钟源队列
@@ -569,10 +653,15 @@ pub struct ClocksourceData {
     pub max_idle_ns: u32,
     pub flags: ClocksourceFlags,
     pub watchdog_last: CycleNum,
+    // 用于描述时钟源的不确定性边界，时钟源读取的时间可能存在的不确定性和误差范围
+    pub uncertainty_margin: u32,
+    // 最大的时间调整量
+    pub maxadj: u32,
 }
 
 impl ClocksourceData {
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
         rating: i32,
@@ -581,6 +670,8 @@ impl ClocksourceData {
         shift: u32,
         max_idle_ns: u32,
         flags: ClocksourceFlags,
+        uncertainty_margin: u32,
+        maxadj: u32,
     ) -> Self {
         let csd = ClocksourceData {
             name,
@@ -591,6 +682,8 @@ impl ClocksourceData {
             max_idle_ns,
             flags,
             watchdog_last: CycleNum(0),
+            uncertainty_margin,
+            maxadj,
         };
         return csd;
     }
@@ -623,6 +716,12 @@ impl ClocksourceData {
     #[allow(dead_code)]
     pub fn insert_flags(&mut self, flags: ClocksourceFlags) {
         self.flags.insert(flags)
+    }
+    pub fn set_uncertainty_margin(&mut self, uncertainty_margin: u32) {
+        self.uncertainty_margin = uncertainty_margin;
+    }
+    pub fn set_maxadj(&mut self, maxadj: u32) {
+        self.maxadj = maxadj;
     }
 }
 
@@ -733,6 +832,8 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
         if cs_dev_nsec.abs_diff(wd_dev_nsec) > WATCHDOG_THRESHOLD.into() {
             // kdebug!("set_unstable");
             // 误差过大，标记为unstable
+            kinfo!("cs_dev_nsec = {}", cs_dev_nsec);
+            kinfo!("wd_dev_nsec = {}", wd_dev_nsec);
             cs.set_unstable((cs_dev_nsec - wd_dev_nsec).try_into().unwrap())?;
             continue;
         }

@@ -31,6 +31,7 @@ use crate::{
 use super::vfs::{
     file::{FileMode, FilePrivateData},
     syscall::ModeType,
+    utils::DName,
     FileSystem, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
 };
 
@@ -115,7 +116,7 @@ pub struct ProcFSInode {
     /// 指向自身的弱引用
     self_ref: Weak<LockedProcFSInode>,
     /// 子Inode的B树
-    children: BTreeMap<String, Arc<LockedProcFSInode>>,
+    children: BTreeMap<DName, Arc<LockedProcFSInode>>,
     /// 当前inode的数据部分
     data: Vec<u8>,
     /// 当前inode的元数据
@@ -124,6 +125,8 @@ pub struct ProcFSInode {
     fs: Weak<ProcFS>,
     /// 储存私有信息
     fdata: InodeInfo,
+    /// 目录项
+    dname: DName,
 }
 
 /// 对ProcFSInode实现获取各类文件信息的函数
@@ -329,6 +332,7 @@ impl ProcFS {
                     pid: Pid::new(0),
                     ftype: ProcFileType::Default,
                 },
+                dname: DName::default(),
             })));
 
         let result: Arc<ProcFS> = Arc::new(ProcFS {
@@ -529,7 +533,7 @@ impl IndexNode for LockedProcFSInode {
         _buf: &[u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -582,8 +586,9 @@ impl IndexNode for LockedProcFSInode {
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
+        let name = DName::from(name);
         // 如果有重名的，则返回
-        if inode.children.contains_key(name) {
+        if inode.children.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
 
@@ -615,13 +620,14 @@ impl IndexNode for LockedProcFSInode {
                     pid: Pid::new(0),
                     ftype: ProcFileType::Default,
                 },
+                dname: name.clone(),
             })));
 
         // 初始化inode的自引用的weak指针
         result.0.lock().self_ref = Arc::downgrade(&result);
 
         // 将子inode插入父inode的B树中
-        inode.children.insert(String::from(name), result.clone());
+        inode.children.insert(name, result.clone());
 
         return Ok(result);
     }
@@ -642,15 +648,15 @@ impl IndexNode for LockedProcFSInode {
         if other_locked.metadata.file_type == FileType::Dir {
             return Err(SystemError::EISDIR);
         }
-
+        let name = DName::from(name);
         // 如果当前文件夹下已经有同名文件，也报错。
-        if inode.children.contains_key(name) {
+        if inode.children.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
 
         inode
             .children
-            .insert(String::from(name), other_locked.self_ref.upgrade().unwrap());
+            .insert(name, other_locked.self_ref.upgrade().unwrap());
 
         // 增加硬链接计数
         other_locked.metadata.nlinks += 1;
@@ -668,15 +674,15 @@ impl IndexNode for LockedProcFSInode {
         if name == "." || name == ".." {
             return Err(SystemError::ENOTEMPTY);
         }
-
+        let name = DName::from(name);
         // 获得要删除的文件的inode
-        let to_delete = inode.children.get(name).ok_or(SystemError::ENOENT)?;
+        let to_delete = inode.children.get(&name).ok_or(SystemError::ENOENT)?;
 
         // 减少硬链接计数
         to_delete.0.lock().metadata.nlinks -= 1;
 
         // 在当前目录中删除这个子目录项
-        inode.children.remove(name);
+        inode.children.remove(&name);
 
         return Ok(());
     }
@@ -687,7 +693,7 @@ impl IndexNode for LockedProcFSInode {
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
     ) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -707,7 +713,11 @@ impl IndexNode for LockedProcFSInode {
             }
             name => {
                 // 在子目录项中查找
-                return Ok(inode.children.get(name).ok_or(SystemError::ENOENT)?.clone());
+                return Ok(inode
+                    .children
+                    .get(&DName::from(name))
+                    .ok_or(SystemError::ENOENT)?
+                    .clone());
             }
         }
     }
@@ -730,20 +740,14 @@ impl IndexNode for LockedProcFSInode {
                 // TODO: 优化这里，这个地方性能很差！
                 let mut key: Vec<String> = inode
                     .children
-                    .keys()
-                    .filter(|k| {
-                        inode
-                            .children
-                            .get(*k)
-                            .unwrap()
-                            .0
-                            .lock()
-                            .metadata
-                            .inode_id
-                            .into()
-                            == ino
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        if v.0.lock().metadata.inode_id.into() == ino {
+                            Some(k.to_string())
+                        } else {
+                            None
+                        }
                     })
-                    .cloned()
                     .collect();
 
                 match key.len() {
@@ -764,9 +768,21 @@ impl IndexNode for LockedProcFSInode {
         let mut keys: Vec<String> = Vec::new();
         keys.push(String::from("."));
         keys.push(String::from(".."));
-        keys.append(&mut self.0.lock().children.keys().cloned().collect());
+        keys.append(
+            &mut self
+                .0
+                .lock()
+                .children
+                .keys()
+                .map(ToString::to_string)
+                .collect(),
+        );
 
         return Ok(keys);
+    }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        Ok(self.0.lock().dname.clone())
     }
 }
 
@@ -808,13 +824,12 @@ pub fn procfs_init() -> Result<(), SystemError> {
         kinfo!("Initializing ProcFS...");
         // 创建 procfs 实例
         let procfs: Arc<ProcFS> = ProcFS::new();
-
         // procfs 挂载
-        let _t = ROOT_INODE()
-            .find("proc")
-            .expect("Cannot find /proc")
+        ROOT_INODE()
+            .mkdir("proc", ModeType::from_bits_truncate(0o755))
+            .expect("Unabled to find /proc")
             .mount(procfs)
-            .expect("Failed to mount proc");
+            .expect("Failed to mount at /proc");
         kinfo!("ProcFS mounted.");
         result = Some(Ok(()));
     });

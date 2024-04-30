@@ -12,7 +12,7 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    driver::serial::serial8250::send_to_default_serial8250_port,
+    driver::{serial::serial8250::send_to_default_serial8250_port, tty::pty::ptm_driver},
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
@@ -40,6 +40,14 @@ pub struct TtyCore {
     core: TtyCoreData,
     /// 线路规程函数集
     line_discipline: Arc<dyn TtyLineDiscipline>,
+}
+
+impl Drop for TtyCore {
+    fn drop(&mut self) {
+        if self.core.driver().tty_driver_sub_type() == TtyDriverSubType::PtySlave {
+            ptm_driver().ttys().remove(&self.core().index);
+        }
+    }
 }
 
 impl TtyCore {
@@ -232,7 +240,9 @@ impl TtyCore {
         let tmp = termios.control_mode;
         termios.control_mode ^= (tmp ^ old_termios.control_mode) & ControlMode::ADDRB;
 
+        drop(termios);
         let ret = tty.set_termios(tty.clone(), old_termios);
+        let mut termios = tty.core().termios_write();
         if ret.is_err() {
             termios.control_mode &= ControlMode::HUPCL | ControlMode::CREAD | ControlMode::CLOCAL;
             termios.control_mode |= old_termios.control_mode
@@ -245,6 +255,12 @@ impl TtyCore {
         let ld = tty.ldisc();
         ld.set_termios(tty, Some(old_termios))?;
 
+        Ok(())
+    }
+
+    pub fn tty_do_resize(&self, windowsize: WindowSize) -> Result<(), SystemError> {
+        // TODO: 向前台进程发送信号
+        *self.core.window_size_write() = windowsize;
         Ok(())
     }
 }
@@ -395,6 +411,11 @@ impl TtyCoreData {
     }
 
     #[inline]
+    pub fn window_size_write(&self) -> RwLockWriteGuard<WindowSize> {
+        self.window_size.write()
+    }
+
+    #[inline]
     pub fn is_closing(&self) -> bool {
         self.closing.load(core::sync::atomic::Ordering::SeqCst)
     }
@@ -510,6 +531,10 @@ impl TtyOperation for TtyCore {
 
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
         self.core().tty_driver.driver_funcs().close(tty)
+    }
+
+    fn resize(&self, tty: Arc<TtyCore>, winsize: WindowSize) -> Result<(), SystemError> {
+        self.core.tty_driver.driver_funcs().resize(tty, winsize)
     }
 }
 

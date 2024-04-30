@@ -11,14 +11,17 @@ use system_error::SystemError;
 use crate::{
     driver::{base::device::Device, open_firmware::device_node::DeviceNode},
     exception::{irqdata::IrqLineStatus, irqdesc::irq_desc_manager, manage::irq_manager},
-    libs::{rwlock::RwLock, spinlock::SpinLock},
+    libs::{
+        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        spinlock::SpinLock,
+    },
 };
 
 use super::{
     dummychip::no_irq_chip,
     irqchip::{IrqChip, IrqChipData, IrqChipGeneric, IrqGcFlags},
     irqdata::{IrqData, IrqHandlerData},
-    irqdesc::IrqFlowHandler,
+    irqdesc::{IrqDesc, IrqFlowHandler},
     HardwareIrqNumber, IrqNumber,
 };
 
@@ -389,6 +392,48 @@ impl IrqDomainManager {
 
         return None;
     }
+
+    /// `resolve_irq_mapping` - 从硬件中断号找到中断号。
+    ///
+    /// ## 参数
+    ///
+    /// - `domain`: 拥有此硬件中断的域
+    /// - `hwirq`: 该域空间中的硬件中断号
+    /// - `irq`: 如果需要，可选的指针以返回Linux中断
+    ///
+    /// ## 返回
+    ///
+    /// 返回一个元组，包含中断描述符和中断号
+    pub fn resolve_irq_mapping(
+        &self,
+        mut domain: Option<Arc<IrqDomain>>,
+        hwirq: HardwareIrqNumber,
+    ) -> Result<(Arc<IrqDesc>, IrqNumber), SystemError> {
+        if domain.is_none() {
+            domain = Some(self.default_domain().ok_or(SystemError::EINVAL)?);
+        }
+
+        let domain = domain.unwrap();
+
+        if domain.no_map() {
+            if hwirq < domain.revmap_read_irqsave().hwirq_max {
+                let irq_desc = irq_desc_manager()
+                    .lookup(IrqNumber::new(hwirq.data()))
+                    .ok_or(SystemError::EINVAL)?;
+                if irq_desc.irq_data().hardware_irq() == hwirq {
+                    let irq = irq_desc.irq_data().irq();
+                    return Ok((irq_desc, irq));
+                }
+            }
+
+            return Err(SystemError::EINVAL);
+        }
+
+        let revmap = domain.revmap_read_irqsave();
+        let irq_data = revmap.lookup(hwirq).ok_or(SystemError::EINVAL)?;
+        let irq_desc = irq_data.irq_desc().unwrap();
+        return Ok((irq_desc, irq_data.irq()));
+    }
 }
 
 struct InnerIrqDomainManager {
@@ -481,8 +526,18 @@ impl IrqDomain {
     }
 
     #[allow(dead_code)]
+    fn revmap_read_irqsave(&self) -> RwLockReadGuard<IrqDomainRevMap> {
+        self.revmap.read_irqsave()
+    }
+
+    #[allow(dead_code)]
+    fn revmap_write_irqsave(&self) -> RwLockWriteGuard<IrqDomainRevMap> {
+        self.revmap.write_irqsave()
+    }
+
+    #[allow(dead_code)]
     fn set_hwirq_max(&self, hwirq_max: HardwareIrqNumber) {
-        self.revmap.write_irqsave().hwirq_max = hwirq_max;
+        self.revmap_write_irqsave().hwirq_max = hwirq_max;
     }
 
     pub fn name(&self) -> Option<String> {
@@ -498,7 +553,7 @@ impl IrqDomain {
 
     /// The number of mapped interrupts
     pub fn map_count(&self) -> u32 {
-        self.revmap.read().map.len() as u32
+        self.revmap_read_irqsave().map.len() as u32
     }
 
     pub fn host_data(&self) -> Option<Arc<dyn IrqChipData>> {

@@ -9,8 +9,8 @@ use alloc::{
 };
 use hashbrown::HashMap;
 use smoltcp::{
-    iface::{SocketHandle, SocketSet},
-    socket::{self, tcp, udp},
+    iface::SocketSet,
+    socket::{self, raw, tcp, udp},
 };
 use system_error::SystemError;
 
@@ -29,16 +29,17 @@ use crate::{
 };
 
 use self::{
+    handle::GlobalSocketHandle,
     inet::{RawSocket, TcpSocket, UdpSocket},
     unix::{SeqpacketSocket, StreamSocket},
 };
 
 use super::{
     event_poll::{EPollEventType, EPollItem, EventPoll},
-    net_core::poll_ifaces,
     Endpoint, Protocol, ShutdownType,
 };
 
+pub mod handle;
 pub mod inet;
 pub mod unix;
 
@@ -48,7 +49,7 @@ lazy_static! {
     pub static ref SOCKET_SET: SpinLock<SocketSet<'static >> = SpinLock::new(SocketSet::new(vec![]));
     /// SocketHandle表，每个SocketHandle对应一个SocketHandleItem，
     /// 注意！：在网卡中断中需要拿到这张表的🔓，在获取读锁时应该确保关中断避免死锁
-    pub static ref HANDLE_MAP: RwLock<HashMap<SocketHandle, SocketHandleItem>> = RwLock::new(HashMap::new());
+    pub static ref HANDLE_MAP: RwLock<HashMap<GlobalSocketHandle, SocketHandleItem>> = RwLock::new(HashMap::new());
     /// 端口管理器
     pub static ref PORT_MANAGER: PortManager = PortManager::new();
 }
@@ -83,6 +84,11 @@ pub(super) fn new_socket(
             return Err(SystemError::EAFNOSUPPORT);
         }
     };
+
+    let handle_item = SocketHandleItem::new();
+    HANDLE_MAP
+        .write_irqsave()
+        .insert(socket.socket_handle(), handle_item);
     Ok(socket)
 }
 
@@ -224,9 +230,7 @@ pub trait Socket: Sync + Send + Debug + Any {
         Ok(())
     }
 
-    fn socket_handle(&self) -> SocketHandle {
-        todo!()
-    }
+    fn socket_handle(&self) -> GlobalSocketHandle;
 
     fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
         todo!()
@@ -272,6 +276,8 @@ pub trait Socket: Sync + Send + Debug + Any {
 
         Ok(())
     }
+
+    fn close(&mut self);
 }
 
 impl Clone for Box<dyn Socket> {
@@ -329,7 +335,9 @@ impl IndexNode for SocketInode {
                 .write_irqsave()
                 .remove(&socket.socket_handle())
                 .unwrap();
+            socket.close();
         }
+
         Ok(())
     }
 
@@ -408,9 +416,9 @@ impl SocketHandleItem {
 
     /// ## 在socket的等待队列上睡眠
     pub fn sleep(
-        socket_handle: SocketHandle,
+        socket_handle: GlobalSocketHandle,
         events: u64,
-        handle_map_guard: RwLockReadGuard<'_, HashMap<SocketHandle, SocketHandleItem>>,
+        handle_map_guard: RwLockReadGuard<'_, HashMap<GlobalSocketHandle, SocketHandleItem>>,
     ) {
         unsafe {
             handle_map_guard
@@ -455,9 +463,9 @@ impl SocketHandleItem {
 /// 如果 TCP/UDP 的 socket 绑定了某个端口，它会在对应的表中记录，以检测端口冲突。
 pub struct PortManager {
     // TCP 端口记录表
-    tcp_port_table: SpinLock<HashMap<u16, Arc<GlobalSocketHandle>>>,
+    tcp_port_table: SpinLock<HashMap<u16, Arc<dyn Socket>>>,
     // UDP 端口记录表
-    udp_port_table: SpinLock<HashMap<u16, Arc<GlobalSocketHandle>>>,
+    udp_port_table: SpinLock<HashMap<u16, Arc<dyn Socket>>>,
 }
 
 impl PortManager {
@@ -513,7 +521,7 @@ impl PortManager {
         &self,
         socket_type: SocketType,
         port: u16,
-        handle: Arc<GlobalSocketHandle>,
+        socket: impl Socket,
     ) -> Result<(), SystemError> {
         if port > 0 {
             let mut listen_table_guard = match socket_type {
@@ -523,7 +531,7 @@ impl PortManager {
             };
             match listen_table_guard.get(&port) {
                 Some(_) => return Err(SystemError::EADDRINUSE),
-                None => listen_table_guard.insert(port, handle),
+                None => listen_table_guard.insert(port, Arc::new(socket)),
             };
             drop(listen_table_guard);
         }
@@ -540,33 +548,6 @@ impl PortManager {
         listen_table_guard.remove(&port);
         drop(listen_table_guard);
         return Ok(());
-    }
-}
-
-/// # socket的句柄管理组件
-/// 它在smoltcp的SocketHandle上封装了一层，增加更多的功能。
-/// 比如，在socket被关闭时，自动释放socket的资源，通知系统的其他组件。
-#[derive(Debug)]
-pub struct GlobalSocketHandle(SocketHandle);
-
-impl GlobalSocketHandle {
-    pub fn new(handle: SocketHandle) -> Arc<Self> {
-        return Arc::new(Self(handle));
-    }
-}
-
-impl Clone for GlobalSocketHandle {
-    fn clone(&self) -> Self {
-        Self(self.0)
-    }
-}
-
-impl Drop for GlobalSocketHandle {
-    fn drop(&mut self) {
-        let mut socket_set_guard = SOCKET_SET.lock_irqsave();
-        socket_set_guard.remove(self.0); // 删除的时候，会发送一条FINISH的信息？
-        drop(socket_set_guard);
-        poll_ifaces();
     }
 }
 
@@ -775,6 +756,7 @@ impl SocketPollMethod {
         match socket {
             socket::Socket::Udp(udp) => Self::udp_poll(udp, shutdown),
             socket::Socket::Tcp(tcp) => Self::tcp_poll(tcp, shutdown),
+            socket::Socket::Raw(raw) => Self::raw_poll(raw, shutdown),
             _ => todo!(),
         }
     }
@@ -854,6 +836,41 @@ impl SocketPollMethod {
             todo!()
         }
 
+        return event;
+    }
+
+    pub fn raw_poll(socket: &raw::Socket, shutdown: ShutdownType) -> EPollEventType {
+        //kdebug!("enter raw_poll!");
+        let mut event = EPollEventType::empty();
+
+        if shutdown.contains(ShutdownType::RCV_SHUTDOWN) {
+            event.insert(
+                EPollEventType::EPOLLRDHUP | EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+            );
+        }
+        if shutdown.contains(ShutdownType::SHUTDOWN_MASK) {
+            event.insert(EPollEventType::EPOLLHUP);
+        }
+
+        if socket.can_recv() {
+            //kdebug!("poll can recv!");
+            event.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
+        } else {
+            //kdebug!("poll can not recv!");
+        }
+
+        if socket.can_send() {
+            //kdebug!("poll can send!");
+            event.insert(
+                EPollEventType::EPOLLOUT
+                    | EPollEventType::EPOLLWRNORM
+                    | EPollEventType::EPOLLWRBAND,
+            );
+        } else {
+            //kdebug!("poll can not send!");
+            // TODO: 缓冲区空间不够，需要使用信号处理
+            todo!()
+        }
         return event;
     }
 }

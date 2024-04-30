@@ -19,7 +19,6 @@ use crate::{
         irqdata::IrqHandlerData,
         irqdesc::{IrqHandleFlags, IrqHandler, IrqReturn},
         manage::irq_manager,
-        softirq::{softirq_vectors, SoftirqNumber},
         InterruptArch, IrqNumber,
     },
     kdebug, kerror, kinfo,
@@ -33,7 +32,7 @@ use crate::{
     },
     time::{
         jiffies::NSEC_PER_JIFFY,
-        timer::{clock, timer_get_first_expire, update_timer_jiffies},
+        timer::{try_raise_timer_softirq, update_timer_jiffies},
     },
 };
 
@@ -42,6 +41,14 @@ static mut HPET_INSTANCE: Option<Hpet> = None;
 #[inline(always)]
 pub fn hpet_instance() -> &'static Hpet {
     unsafe { HPET_INSTANCE.as_ref().unwrap() }
+}
+
+#[inline(always)]
+pub fn is_hpet_enabled() -> bool {
+    if unsafe { HPET_INSTANCE.as_ref().is_some() } {
+        return unsafe { HPET_INSTANCE.as_ref().unwrap().enabled() };
+    }
+    return false;
 }
 
 pub struct Hpet {
@@ -244,20 +251,14 @@ impl Hpet {
             assert!(!CurrentIrqArch::is_irq_enabled());
             update_timer_jiffies(1, Self::HPET0_INTERVAL_USEC as i64);
 
-            if let Ok(first_expire) = timer_get_first_expire() {
-                if first_expire <= clock() {
-                    softirq_vectors().raise_softirq(SoftirqNumber::TIMER);
-                }
-            }
+            try_raise_timer_softirq();
         }
     }
 }
 
 pub fn hpet_init() -> Result<(), SystemError> {
-    let hpet_info = HpetInfo::new(acpi_manager().tables().unwrap()).map_err(|e| {
-        kerror!("Failed to get HPET info: {:?}", e);
-        SystemError::ENODEV
-    })?;
+    let hpet_info =
+        HpetInfo::new(acpi_manager().tables().unwrap()).map_err(|_| SystemError::ENODEV)?;
 
     let hpet_instance = Hpet::new(hpet_info)?;
     unsafe {

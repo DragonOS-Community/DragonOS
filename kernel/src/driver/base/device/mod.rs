@@ -806,7 +806,7 @@ impl DeviceManager {
 
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c?fi=device_links_force_bind#1226
     pub fn device_links_force_bind(&self, _dev: &Arc<dyn Device>) {
-        todo!("device_links_force_bind")
+        kwarn!("device_links_force_bind not implemented");
     }
 
     /// 把device对象的一些结构进行默认初始化
@@ -875,7 +875,7 @@ impl Attribute for DeviceAttrDev {
                 "Intertrait casting not implemented for kobj: {}",
                 kobj.name()
             );
-            SystemError::EOPNOTSUPP_OR_ENOTSUP
+            SystemError::ENOSYS
         })?;
 
         let device_number = dev.id_table().device_number();

@@ -3,16 +3,16 @@ use smoltcp::{socket::dhcpv4, wire};
 use system_error::SystemError;
 
 use crate::{
-    driver::net::NetDriver,
+    driver::net::NetDevice,
     kdebug, kinfo, kwarn,
     libs::rwlock::RwLockReadGuard,
-    net::{socket::SocketPollMethod, NET_DRIVERS},
+    net::{socket::SocketPollMethod, NET_DEVICES},
     time::timer::{next_n_ms_timer_jiffies, Timer, TimerFunction},
 };
 
 use super::{
     event_poll::{EPollEventType, EventPoll},
-    socket::{inet::TcpSocket, HANDLE_MAP, SOCKET_SET},
+    socket::{handle::GlobalSocketHandle, inet::TcpSocket, HANDLE_MAP, SOCKET_SET},
 };
 
 /// The network poll function, which will be called by timer.
@@ -41,7 +41,7 @@ pub fn net_init() -> Result<(), SystemError> {
 }
 
 fn dhcp_query() -> Result<(), SystemError> {
-    let binding = NET_DRIVERS.write_irqsave();
+    let binding = NET_DEVICES.write_irqsave();
 
     let net_face = binding.get(&0).ok_or(SystemError::ENODEV)?.clone();
 
@@ -119,7 +119,7 @@ fn dhcp_query() -> Result<(), SystemError> {
 }
 
 pub fn poll_ifaces() {
-    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDriver>>> = NET_DRIVERS.read_irqsave();
+    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDevice>>> = NET_DEVICES.read_irqsave();
     if guard.len() == 0 {
         kwarn!("poll_ifaces: No net driver found!");
         return;
@@ -139,8 +139,8 @@ pub fn poll_ifaces() {
 pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
     let mut i = 0;
     while i < times {
-        let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDriver>>> =
-            NET_DRIVERS.read_irqsave();
+        let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDevice>>> =
+            NET_DEVICES.read_irqsave();
         if guard.len() == 0 {
             kwarn!("poll_ifaces: No net driver found!");
             // 没有网卡，返回错误
@@ -160,7 +160,6 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
         send_event(&sockets)?;
         return Ok(());
     }
-
     // 尝试次数用完，返回错误
     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
 }
@@ -171,7 +170,7 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
 /// @return 加锁超时，返回SystemError::EAGAIN_OR_EWOULDBLOCK
 /// @return 没有网卡，返回SystemError::ENODEV
 pub fn poll_ifaces_try_lock_onetime() -> Result<(), SystemError> {
-    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDriver>>> = NET_DRIVERS.read_irqsave();
+    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDevice>>> = NET_DEVICES.read_irqsave();
     if guard.len() == 0 {
         kwarn!("poll_ifaces: No net driver found!");
         // 没有网卡，返回错误
@@ -189,7 +188,8 @@ pub fn poll_ifaces_try_lock_onetime() -> Result<(), SystemError> {
 fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
     for (handle, socket_type) in sockets.iter() {
         let handle_guard = HANDLE_MAP.read_irqsave();
-        let item = handle_guard.get(&handle);
+        let global_handle = GlobalSocketHandle::new_smoltcp_handle(handle);
+        let item = handle_guard.get(&global_handle);
         if item.is_none() {
             continue;
         }
@@ -204,7 +204,7 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
         match socket_type {
             smoltcp::socket::Socket::Raw(_) | smoltcp::socket::Socket::Udp(_) => {
                 handle_guard
-                    .get(&handle)
+                    .get(&global_handle)
                     .unwrap()
                     .wait_queue
                     .wakeup_any(events);
@@ -218,7 +218,7 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
                     events |= TcpSocket::CAN_CONNECT;
                 }
                 handle_guard
-                    .get(&handle)
+                    .get(&global_handle)
                     .unwrap()
                     .wait_queue
                     .wakeup_any(events);
@@ -228,7 +228,7 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
         }
         drop(handle_guard);
         let mut handle_guard = HANDLE_MAP.write_irqsave();
-        let handle_item = handle_guard.get_mut(&handle).unwrap();
+        let handle_item = handle_guard.get_mut(&global_handle).unwrap();
         EventPoll::wakeup_epoll(
             &handle_item.epitems,
             EPollEventType::from_bits_truncate(events as u32),

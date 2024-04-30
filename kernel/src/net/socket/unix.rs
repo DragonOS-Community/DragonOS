@@ -3,13 +3,16 @@ use system_error::SystemError;
 
 use crate::{libs::spinlock::SpinLock, net::Endpoint};
 
-use super::{Socket, SocketInode, SocketMetadata, SocketOptions, SocketType};
+use super::{
+    handle::GlobalSocketHandle, Socket, SocketInode, SocketMetadata, SocketOptions, SocketType,
+};
 
 #[derive(Debug, Clone)]
 pub struct StreamSocket {
     metadata: SocketMetadata,
     buffer: Arc<SpinLock<Vec<u8>>>,
     peer_inode: Option<Arc<SocketInode>>,
+    handle: GlobalSocketHandle,
 }
 
 impl StreamSocket {
@@ -37,11 +40,18 @@ impl StreamSocket {
             metadata,
             buffer,
             peer_inode: None,
+            handle: GlobalSocketHandle::new_kernel_handle(),
         }
     }
 }
 
 impl Socket for StreamSocket {
+    fn socket_handle(&self) -> GlobalSocketHandle {
+        self.handle
+    }
+
+    fn close(&mut self) {}
+
     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         let mut buffer = self.buffer.lock_irqsave();
 
@@ -110,6 +120,7 @@ pub struct SeqpacketSocket {
     metadata: SocketMetadata,
     buffer: Arc<SpinLock<Vec<u8>>>,
     peer_inode: Option<Arc<SocketInode>>,
+    handle: GlobalSocketHandle,
 }
 
 impl SeqpacketSocket {
@@ -137,11 +148,14 @@ impl SeqpacketSocket {
             metadata,
             buffer,
             peer_inode: None,
+            handle: GlobalSocketHandle::new_kernel_handle(),
         }
     }
 }
 
 impl Socket for SeqpacketSocket {
+    fn close(&mut self) {}
+
     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         let mut buffer = self.buffer.lock_irqsave();
 
@@ -186,6 +200,10 @@ impl Socket for SeqpacketSocket {
         buffer.extend_from_slice(buf);
 
         Ok(len)
+    }
+
+    fn socket_handle(&self) -> GlobalSocketHandle {
+        self.handle
     }
 
     fn metadata(&self) -> SocketMetadata {

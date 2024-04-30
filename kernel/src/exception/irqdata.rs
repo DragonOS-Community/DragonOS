@@ -11,6 +11,7 @@ use crate::libs::{
 
 use super::{
     irqchip::{IrqChip, IrqChipData},
+    irqdesc::IrqDesc,
     irqdomain::IrqDomain,
     msi::MsiDesc,
     HardwareIrqNumber, IrqNumber,
@@ -43,7 +44,7 @@ impl IrqData {
             inner: SpinLock::new(InnerIrqData {
                 hwirq,
                 common_data,
-
+                desc: Weak::new(),
                 domain: None,
                 parent_data: None,
             }),
@@ -69,6 +70,18 @@ impl IrqData {
 
     pub fn irq(&self) -> IrqNumber {
         self.irq
+    }
+
+    pub fn irq_desc(&self) -> Option<Arc<IrqDesc>> {
+        self.inner.lock_irqsave().desc.upgrade()
+    }
+
+    pub fn set_irq_desc(&self, desc: Weak<IrqDesc>) {
+        self.inner.lock_irqsave().desc = desc;
+    }
+
+    pub fn clear_irq_desc(&self) {
+        self.inner.lock_irqsave().desc = Weak::new();
     }
 
     pub fn hardware_irq(&self) -> HardwareIrqNumber {
@@ -132,6 +145,8 @@ pub struct InnerIrqData {
     hwirq: HardwareIrqNumber,
     /// 涉及的所有irqchip之间共享的数据
     common_data: Arc<IrqCommonData>,
+
+    desc: Weak<IrqDesc>,
 
     /// 中断域
     domain: Option<Arc<IrqDomain>>,
@@ -409,6 +424,7 @@ impl IrqLineStatus {
     ///
     /// - 如果不是电平触发类型，则返回None
     /// - 如果是电平触发类型，则返回Some(bool)，当为true时表示高电平触发
+    #[allow(dead_code)]
     pub fn is_level_high(&self) -> Option<bool> {
         if !self.is_level_type() {
             return None;

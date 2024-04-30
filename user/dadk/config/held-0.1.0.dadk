@@ -19,5 +19,6 @@
   },
   "install": {
     "in_dragonos_path": "/"
-  }
+  },
+  "target_arch": ["x86_64"]
 }

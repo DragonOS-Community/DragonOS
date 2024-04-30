@@ -1,13 +1,20 @@
 use alloc::{string::ToString, sync::Arc};
 use system_error::SystemError;
 
-use crate::exception::{
-    handle::PerCpuDevIdIrqHandler,
-    irqchip::{IrqChip, IrqChipFlags},
-    irqdata::IrqData,
-    irqdesc::irq_desc_manager,
-    irqdomain::{irq_domain_manager, IrqDomain, IrqDomainOps},
-    HardwareIrqNumber, IrqNumber,
+use crate::{
+    arch::interrupt::TrapFrame,
+    driver::clocksource::timer_riscv::{riscv_sbi_timer_irq_desc_init, RiscVSbiTimer},
+    exception::{
+        handle::PerCpuDevIdIrqHandler,
+        irqchip::{IrqChip, IrqChipFlags},
+        irqdata::IrqData,
+        irqdesc::{irq_desc_manager, GenericIrqHandler},
+        irqdomain::{irq_domain_manager, IrqDomain, IrqDomainOps},
+        softirq::do_softirq,
+        HardwareIrqNumber, IrqNumber,
+    },
+    libs::spinlock::{SpinLock, SpinLockGuard},
+    sched::{SchedMode, __schedule},
 };
 
 static mut RISCV_INTC_DOMAIN: Option<Arc<IrqDomain>> = None;
@@ -24,7 +31,9 @@ fn riscv_intc_chip() -> Option<&'static Arc<RiscvIntcChip>> {
 }
 
 #[derive(Debug)]
-struct RiscvIntcChip;
+struct RiscvIntcChip {
+    inner: SpinLock<InnerIrqChip>,
+}
 
 impl IrqChip for RiscvIntcChip {
     fn name(&self) -> &'static str {
@@ -43,9 +52,7 @@ impl IrqChip for RiscvIntcChip {
         Ok(())
     }
 
-    fn irq_ack(&self, irq: &Arc<IrqData>) {
-        todo!()
-    }
+    fn irq_ack(&self, _irq: &Arc<IrqData>) {}
 
     fn can_mask_ack(&self) -> bool {
         false
@@ -75,8 +82,26 @@ impl IrqChip for RiscvIntcChip {
     }
 
     fn flags(&self) -> IrqChipFlags {
-        todo!()
+        self.inner().flags
     }
+}
+
+impl RiscvIntcChip {
+    fn new() -> Self {
+        Self {
+            inner: SpinLock::new(InnerIrqChip {
+                flags: IrqChipFlags::empty(),
+            }),
+        }
+    }
+    fn inner(&self) -> SpinLockGuard<InnerIrqChip> {
+        self.inner.lock_irqsave()
+    }
+}
+
+#[derive(Debug)]
+struct InnerIrqChip {
+    flags: IrqChipFlags,
 }
 
 #[derive(Debug)]
@@ -104,14 +129,14 @@ impl IrqDomainOps for RiscvIntcDomainOps {
         return Ok(());
     }
 
-    fn unmap(&self, irq_domain: &Arc<IrqDomain>, virq: IrqNumber) {
+    fn unmap(&self, _irq_domain: &Arc<IrqDomain>, _virq: IrqNumber) {
         todo!("riscv_intc_domain_ops::unmap");
     }
 }
 
 #[inline(never)]
 pub unsafe fn riscv_intc_init() -> Result<(), SystemError> {
-    let intc_chip = Arc::new(RiscvIntcChip);
+    let intc_chip = Arc::new(RiscvIntcChip::new());
 
     unsafe {
         RISCV_INTC_CHIP = Some(intc_chip);
@@ -130,5 +155,19 @@ pub unsafe fn riscv_intc_init() -> Result<(), SystemError> {
         RISCV_INTC_DOMAIN = Some(intc_domain);
     }
 
+    riscv_sbi_timer_irq_desc_init();
+
     return Ok(());
+}
+
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/irqchip/irq-riscv-intc.c#23
+pub fn riscv_intc_irq(trap_frame: &mut TrapFrame) {
+    let hwirq = HardwareIrqNumber::new(trap_frame.cause.code() as u32);
+    // kdebug!("riscv64_do_irq: interrupt {hwirq:?}");
+    GenericIrqHandler::handle_domain_irq(riscv_intc_domain().clone().unwrap(), hwirq, trap_frame)
+        .ok();
+    do_softirq();
+    if hwirq.data() == RiscVSbiTimer::TIMER_IRQ.data() {
+        __schedule(SchedMode::SM_PREEMPT);
+    }
 }

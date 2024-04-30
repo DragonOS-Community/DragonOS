@@ -1,0 +1,12 @@
+[package]
+name = "test-backlog"
+version = "0.1.0"
+edition = "2021"
+description = "test the tcp backlog"
+authors = [ "saga" ]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+actix-web={ version = "3.0.0",default-features = false,features=["rust-tls"] }
+

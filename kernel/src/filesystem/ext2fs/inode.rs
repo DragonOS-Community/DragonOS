@@ -23,7 +23,11 @@ use crate::{
         ext2fs::{ext2fs_instance, file_type, inode},
         vfs::{syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, Metadata},
     },
-    libs::{rwlock::RwLock, spinlock::SpinLock, vec_cursor::VecCursor},
+    libs::{
+        rwlock::RwLock,
+        spinlock::{SpinLock, SpinLockGuard},
+        vec_cursor::VecCursor,
+    },
 };
 
 const EXT2_NDIR_BLOCKS: usize = 12;
@@ -315,7 +319,7 @@ impl IndexNode for LockedExt2InodeInfo {
             0,
             size,
             data_block.as_mut_slice(),
-            &mut FilePrivateData::Unused,
+            SpinLock::new(FilePrivateData::Unused).lock(),
         )?;
         let mut begin_pos = 0;
         loop {
@@ -347,13 +351,13 @@ impl IndexNode for LockedExt2InodeInfo {
 
         return Err(SystemError::EINVAL);
     }
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<'_, FilePrivateData>) -> Result<(), SystemError> {
         // kdebug!("close inode");
         Ok(())
     }
     fn open(
         &self,
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<'_, FilePrivateData>,
         _mode: &crate::filesystem::vfs::file::FileMode,
     ) -> Result<(), SystemError> {
         // kdebug!("open inode");
@@ -364,7 +368,7 @@ impl IndexNode for LockedExt2InodeInfo {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: &mut crate::filesystem::vfs::FilePrivateData,
+        _data: SpinLockGuard<'_, FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         // TODO 需要根据不同的文件类型，选择不同的读取方式，将读的行为集成到file type
         // kinfo!("begin LockedExt2InodeInfo read_at");
@@ -635,7 +639,7 @@ impl IndexNode for LockedExt2InodeInfo {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: &mut crate::filesystem::vfs::FilePrivateData,
+        _data: SpinLockGuard<'_, FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         let inode_grade = self.0.lock();
         let superb = EXT2_SB_INFO.read();
@@ -682,7 +686,7 @@ impl IndexNode for LockedExt2InodeInfo {
         match file_type {
             Ext2FileType::Directory => {
                 // 获取inode数据
-                // // kinfo!("list inode : {:?}", guard.inode);
+                // kinfo!("list inode : {:?}", guard.inode);
                 let inode = &guard.inode;
                 // 解析为entry数组
                 let meta = &guard.meta;
@@ -698,7 +702,7 @@ impl IndexNode for LockedExt2InodeInfo {
                     0,
                     size,
                     data_block.as_mut_slice(),
-                    &mut FilePrivateData::Unused,
+                    SpinLock::new(FilePrivateData::Unused).lock(),
                 )?;
                 // 遍历entry数组
                 let mut begin_pos = 0;

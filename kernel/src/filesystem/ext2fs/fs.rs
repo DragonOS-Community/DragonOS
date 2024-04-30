@@ -60,6 +60,14 @@ impl FileSystem for Ext2FileSystem {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
+    
+    fn name(&self) -> &str {
+        todo!()
+    }
+    
+    fn super_block(&self) -> crate::filesystem::vfs::SuperBlock {
+        todo!()
+    }
 }
 
 impl Ext2FileSystem {

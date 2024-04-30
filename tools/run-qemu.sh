@@ -87,7 +87,7 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     QEMU_MACHINE=" -machine q35,memory-backend=${QEMU_MEMORY_BACKEND} "
     QEMU_CPU_FEATURES+="-cpu IvyBridge,apic,x2apic,+fpu,check,+vmx,${allflags}"
     QEMU_RTC_CLOCK+=" -rtc clock=host,base=localtime"
-    QEMU_DEVICES_DISK="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 "
+    QEMU_DEVICES_DISK="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -device ide-hd,drive=ext2-disk,bus=ahci.1 "
 else
     QEMU_MACHINE=" -machine virt,memory-backend=${QEMU_MEMORY_BACKEND} -cpu sifive-u54 "
     QEMU_DEVICES_DISK="-device virtio-blk-device,drive=disk "

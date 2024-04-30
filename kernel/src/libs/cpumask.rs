@@ -1,3 +1,5 @@
+use core::ops::BitAnd;
+
 use bitmap::{traits::BitMapOps, AllocBitmap};
 
 use crate::{mm::percpu::PerCpu, smp::cpu::ProcessorId};
@@ -83,6 +85,15 @@ impl CpuMask {
 
     pub fn inner(&self) -> &AllocBitmap {
         &self.bmp
+    }
+}
+
+impl BitAnd for CpuMask {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        let bmp = self.bmp & rhs.bmp;
+        Self { bmp }
     }
 }
 

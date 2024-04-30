@@ -16,6 +16,7 @@ pub use self::riscv64::*; // 公开riscv64架构下的函数，使外界接口�
 pub mod io;
 
 /// TraitPciArch Pci架构相关函数，任何架构都应独立实现trait里的函数
+#[allow(dead_code)]
 pub trait TraitPciArch {
     /// @brief 读取寄存器值，x86_64架构通过读取两个特定io端口实现
     /// @param bus_device_function 设备的唯一标识符

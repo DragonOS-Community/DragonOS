@@ -397,6 +397,7 @@ impl SigContext {
 }
 /// @brief 信号处理备用栈的信息
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct SigStack {
     pub sp: *mut c_void,
     pub flags: u32,

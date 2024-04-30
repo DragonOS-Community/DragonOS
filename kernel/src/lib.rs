@@ -1,4 +1,6 @@
 #![no_main] // <1>
+
+#![allow(internal_features)]
 #![feature(alloc_error_handler)]
 #![feature(allocator_api)]
 #![feature(arbitrary_self_types)]
@@ -7,13 +9,11 @@
 #![feature(const_for)]
 #![feature(const_mut_refs)]
 #![feature(const_trait_impl)]
-#![feature(const_transmute_copy)]
 #![feature(const_refs_to_cell)]
 #![feature(core_intrinsics)]
 #![feature(c_void_variant)]
 #![feature(extract_if)]
 #![feature(fn_align)]
-#![feature(inline_const)]
 #![feature(naked_functions)]
 #![feature(new_uninit)]
 #![feature(panic_info_message)]

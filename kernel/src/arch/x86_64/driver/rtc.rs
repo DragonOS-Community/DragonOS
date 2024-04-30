@@ -42,7 +42,7 @@ struct CmosRtcDevice {
 }
 
 impl CmosRtcDevice {
-    const NAME: &str = "rtc_cmos";
+    const NAME: &'static str = "rtc_cmos";
     pub fn new() -> Arc<Self> {
         let r = CmosRtcDevice {
             inner: SpinLock::new(InnerCmosRtc {

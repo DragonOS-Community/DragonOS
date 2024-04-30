@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::arch::kvm::vmx::vmcs::VmcsFields;
 use crate::arch::kvm::vmx::vmx_asm_wrapper::{vmx_vmlaunch, vmx_vmread};
 use crate::libs::mutex::Mutex;

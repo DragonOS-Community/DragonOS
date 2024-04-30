@@ -68,14 +68,14 @@ pub struct InnerSignalStruct {
     pub cnt: AtomicI64,
     /// 如果对应linux，这部分会有一个引用计数，但是没发现在哪里有用到需要计算引用的地方，因此
     /// 暂时删掉，不然这个Arc会导致其他地方的代码十分丑陋
-    pub handlers: [Sigaction; MAX_SIG_NUM as usize],
+    pub handlers: [Sigaction; MAX_SIG_NUM],
 }
 
 impl SignalStruct {
     #[inline(never)]
     pub fn new() -> Self {
         Self {
-            inner: Box::new(InnerSignalStruct::default()),
+            inner: Box::<InnerSignalStruct>::default(),
         }
     }
 }
@@ -98,7 +98,7 @@ impl Default for InnerSignalStruct {
     fn default() -> Self {
         Self {
             cnt: Default::default(),
-            handlers: [Sigaction::default(); MAX_SIG_NUM as usize],
+            handlers: [Sigaction::default(); MAX_SIG_NUM],
         }
     }
 }
@@ -123,32 +123,32 @@ impl SigactionType {
     ///
     /// [`SigIgnore`]: SaHandlerType::SigIgnore
     pub fn is_ignore(&self) -> bool {
-        return matches!(self, Self::SaHandler(SaHandlerType::SigIgnore));
+        return matches!(self, Self::SaHandler(SaHandlerType::Ignore));
     }
     /// Returns `true` if the sa handler type is [`SaHandler(SaHandlerType::SigCustomized(_))`].
     ///
     /// [`SigCustomized`]: SaHandlerType::SigCustomized(_)
     pub fn is_customized(&self) -> bool {
-        return matches!(self, Self::SaHandler(SaHandlerType::SigCustomized(_)));
+        return matches!(self, Self::SaHandler(SaHandlerType::Customized(_)));
     }
 }
 
 #[derive(Debug, Copy, Clone)]
 #[allow(dead_code)]
 pub enum SaHandlerType {
-    SigError, // 暂时没有用上
-    SigDefault,
-    SigIgnore,
-    SigCustomized(VirtAddr),
+    Error, // 暂时没有用上
+    Default,
+    Ignore,
+    Customized(VirtAddr),
 }
 
-impl Into<usize> for SaHandlerType {
-    fn into(self) -> usize {
-        match self {
-            Self::SigError => 2 as usize,
-            Self::SigIgnore => 1 as usize,
-            Self::SigDefault => 0 as usize,
-            Self::SigCustomized(handler) => handler.data(),
+impl From<SaHandlerType> for usize {
+    fn from(value: SaHandlerType) -> Self {
+        match value {
+            SaHandlerType::Error => 2,
+            SaHandlerType::Ignore => 1,
+            SaHandlerType::Default => 0,
+            SaHandlerType::Customized(handler) => handler.data(),
         }
     }
 }
@@ -158,21 +158,21 @@ impl SaHandlerType {
     ///
     /// [`SigDefault`]: SaHandlerType::SigDefault
     pub fn is_sig_default(&self) -> bool {
-        matches!(self, Self::SigDefault)
+        matches!(self, Self::Default)
     }
 
     /// Returns `true` if the sa handler type is [`SigIgnore`].
     ///
     /// [`SigIgnore`]: SaHandlerType::SigIgnore
     pub fn is_sig_ignore(&self) -> bool {
-        matches!(self, Self::SigIgnore)
+        matches!(self, Self::Ignore)
     }
 
     /// Returns `true` if the sa handler type is [`SigError`].
     ///
     /// [`SigError`]: SaHandlerType::SigError
     pub fn is_sig_error(&self) -> bool {
-        matches!(self, Self::SigError)
+        matches!(self, Self::Error)
     }
 }
 
@@ -190,7 +190,7 @@ pub struct Sigaction {
 impl Default for Sigaction {
     fn default() -> Self {
         Self {
-            action: SigactionType::SaHandler(SaHandlerType::SigDefault),
+            action: SigactionType::SaHandler(SaHandlerType::Default),
             flags: Default::default(),
             mask: Default::default(),
             restorer: Default::default(),
@@ -260,7 +260,7 @@ impl Sigaction {
 
     /// 默认信号处理程序占位符（用于在sighand结构体中的action数组中占位）
     pub const DEFAULT_SIGACTION: Sigaction = Sigaction {
-        action: SigactionType::SaHandler(SaHandlerType::SigDefault),
+        action: SigactionType::SaHandler(SaHandlerType::Default),
         flags: SigFlags::empty(),
         mask: SigSet::from_bits_truncate(0),
         restorer: None,
@@ -268,7 +268,7 @@ impl Sigaction {
 
     /// 默认的“忽略信号”的sigaction
     pub const DEFAULT_SIGACTION_IGNORE: Sigaction = Sigaction {
-        action: SigactionType::SaHandler(SaHandlerType::SigIgnore),
+        action: SigactionType::SaHandler(SaHandlerType::Ignore),
         flags: SigFlags::empty(),
         mask: SigSet::from_bits_truncate(0),
         restorer: None,
@@ -333,6 +333,7 @@ impl SigInfo {
 #[derive(Copy, Clone, Debug)]
 pub enum SigType {
     Kill(Pid),
+    Alarm(Pid),
     // 后续完善下列中的具体字段
     // Timer,
     // Rt,
@@ -353,19 +354,10 @@ impl SigInfo {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SigPending {
     signal: SigSet,
     queue: SigQueue,
-}
-
-impl Default for SigPending {
-    fn default() -> Self {
-        SigPending {
-            signal: SigSet::default(),
-            queue: SigQueue::default(),
-        }
-    }
 }
 
 impl SigPending {
@@ -425,8 +417,8 @@ impl SigPending {
             self.signal_mut().remove(sig.into());
         }
 
-        if info.is_some() {
-            return info.unwrap();
+        if let Some(info) = info {
+            return info;
         } else {
             // 信号不在sigqueue中，这意味着当前信号是来自快速路径，因此直接把siginfo设置为0即可。
             let mut ret = SigInfo::new(sig, 0, SigCode::User, SigType::Kill(Pid::from(0)));
@@ -442,13 +434,12 @@ impl SigPending {
         // 获取下一个要处理的信号的编号
         let sig = self.next_signal(sig_mask);
 
-        let info: Option<SigInfo>;
-        if sig != Signal::INVALID {
+        let info: Option<SigInfo> = if sig != Signal::INVALID {
             // 如果下一个要处理的信号是合法的，则收集其siginfo
-            info = Some(self.collect_signal(sig));
+            Some(self.collect_signal(sig))
         } else {
-            info = None;
-        }
+            None
+        };
 
         // 当一个进程具有多个线程之后，在这里需要重新计算线程的flag中的TIF_SIGPENDING位
         // recalc_sigpending();
@@ -463,7 +454,7 @@ impl SigPending {
 }
 
 /// @brief 进程接收到的信号的队列
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SigQueue {
     pub q: Vec<SigInfo>,
 }
@@ -533,14 +524,6 @@ impl SigQueue {
         let sq = p as *mut SigQueue;
         let sq = unsafe { sq.as_mut::<'static>() }.unwrap();
         return sq;
-    }
-}
-
-impl Default for SigQueue {
-    fn default() -> Self {
-        Self {
-            q: Default::default(),
-        }
     }
 }
 

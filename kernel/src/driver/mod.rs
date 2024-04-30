@@ -1,12 +1,16 @@
 pub mod acpi;
 pub mod base;
+pub mod block;
+pub mod clocksource;
 pub mod disk;
 pub mod firmware;
 pub mod input;
+pub mod irqchip;
 pub mod keyboard;
 pub mod net;
 pub mod open_firmware;
 pub mod pci;
+pub mod rtc;
 pub mod serial;
 pub mod timers;
 pub mod tty;

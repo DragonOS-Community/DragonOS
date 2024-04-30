@@ -6,9 +6,10 @@ use core::{
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    mm::{percpu::PerCpu, VirtAddr, INITIAL_PROCESS_ADDRESS_SPACE},
+    mm::{percpu::PerCpu, VirtAddr, IDLE_PROCESS_ADDRESS_SPACE},
     process::KernelStack,
-    smp::core::smp_get_processor_id,
+    sched::{cpu_rq, OnRq},
+    smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 
 use super::{ProcessControlBlock, ProcessManager};
@@ -27,10 +28,10 @@ impl ProcessManager {
         }
 
         assert!(
-            smp_get_processor_id() == 0,
+            smp_get_processor_id() == ProcessorId::new(0),
             "Idle process must be initialized on the first processor"
         );
-        let mut v: Vec<Arc<ProcessControlBlock>> = Vec::with_capacity(PerCpu::MAX_CPU_NUM);
+        let mut v: Vec<Arc<ProcessControlBlock>> = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
 
         for i in 0..PerCpu::MAX_CPU_NUM {
             let kstack = if unlikely(i == 0) {
@@ -47,17 +48,32 @@ impl ProcessManager {
                 })
             };
 
-            let idle_pcb = ProcessControlBlock::new_idle(i as u32, kstack);
+            let idle_pcb = ProcessControlBlock::new_idle(i, kstack);
 
             assert!(idle_pcb.basic().user_vm().is_none());
             unsafe {
                 idle_pcb
                     .basic_mut()
-                    .set_user_vm(Some(INITIAL_PROCESS_ADDRESS_SPACE()))
+                    .set_user_vm(Some(IDLE_PROCESS_ADDRESS_SPACE()))
             };
 
             assert!(idle_pcb.sched_info().on_cpu().is_none());
-            idle_pcb.sched_info().set_on_cpu(Some(i as u32));
+            idle_pcb.sched_info().set_on_cpu(Some(ProcessorId::new(i)));
+            *idle_pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::IDLE;
+
+            let rq = cpu_rq(i as usize);
+            let (rq, _guard) = rq.self_lock();
+            rq.set_current(Arc::downgrade(&idle_pcb));
+            rq.set_idle(Arc::downgrade(&idle_pcb));
+
+            *idle_pcb.sched_info().on_rq.lock_irqsave() = OnRq::Queued;
+
+            idle_pcb
+                .sched_info()
+                .sched_entity()
+                .force_mut()
+                .set_cfs(Arc::downgrade(&rq.cfs_rq()));
+
             v.push(idle_pcb);
         }
 
@@ -74,7 +90,13 @@ impl ProcessManager {
         return VirtAddr::new(x86::current::registers::rsp() as usize);
 
         #[cfg(target_arch = "riscv64")]
-        unimplemented!("stack_ptr() is not implemented on RISC-V")
+        {
+            let stack_ptr: usize;
+            unsafe {
+                core::arch::asm!("mv {}, sp", out(reg) stack_ptr);
+            }
+            return VirtAddr::new(stack_ptr);
+        }
     }
 
     /// 获取idle进程数组的引用

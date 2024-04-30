@@ -1,15 +1,16 @@
-use core::sync::atomic::Ordering;
+use core::{fmt::Formatter, sync::atomic::Ordering};
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use system_error::SystemError;
 
 use crate::{
-    driver::{
-        base::device::{
-            device_number::{DeviceNumber, Major},
-            device_register, IdTable,
-        },
-        video::fbdev::base::fbcon::framebuffer_console::BlittingFbConsole,
+    driver::base::device::{
+        device_number::{DeviceNumber, Major},
+        device_register, IdTable,
     },
     filesystem::devfs::devfs_register,
     libs::spinlock::SpinLock,
@@ -21,7 +22,7 @@ use super::{
     console::ConsoleSwitch,
     termios::{InputMode, TTY_STD_TERMIOS},
     tty_core::{TtyCore, TtyCoreData},
-    tty_device::TtyDevice,
+    tty_device::{TtyDevice, TtyType},
     tty_driver::{TtyDriver, TtyDriverManager, TtyDriverType, TtyOperation},
 };
 
@@ -44,7 +45,7 @@ pub const DEFAULT_BLUE: [u16; 16] = [
     0x00, 0x00, 0x00, 0x00, 0xaa, 0xaa, 0xaa, 0xaa, 0x55, 0x55, 0x55, 0x55, 0xff, 0xff, 0xff, 0xff,
 ];
 
-pub const COLOR_TABLE: &'static [u8] = &[0, 4, 2, 6, 1, 5, 3, 7, 8, 12, 10, 14, 9, 13, 11, 15];
+pub const COLOR_TABLE: &[u8] = &[0, 4, 2, 6, 1, 5, 3, 7, 8, 12, 10, 14, 9, 13, 11, 15];
 
 lazy_static! {
     pub static ref VIRT_CONSOLES: Vec<Arc<SpinLock<VirtualConsoleData>>> = {
@@ -91,75 +92,32 @@ impl Color {
     }
 }
 
-#[derive(Debug)]
 pub struct TtyConsoleDriverInner {
-    console: Arc<BlittingFbConsole>,
+    console: Arc<dyn ConsoleSwitch>,
 }
 
-unsafe impl Sync for TtyConsoleDriverInner {}
+impl core::fmt::Debug for TtyConsoleDriverInner {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        write!(f, "TtyConsoleDriverInner")
+    }
+}
 
 impl TtyConsoleDriverInner {
     pub fn new() -> Result<Self, SystemError> {
-        Ok(Self {
-            console: Arc::new(BlittingFbConsole::new()?),
-        })
-    }
-}
+        let console = {
+            #[cfg(not(target_arch = "riscv64"))]
+            {
+                Arc::new(crate::driver::video::fbdev::base::fbcon::framebuffer_console::BlittingFbConsole::new()?)
+            }
 
-impl TtyOperation for TtyConsoleDriverInner {
-    fn install(&self, _driver: Arc<TtyDriver>, tty: Arc<TtyCore>) -> Result<(), SystemError> {
-        let tty_core = tty.core();
-        let mut vc_data = VIRT_CONSOLES[tty_core.index()].lock();
+            #[cfg(target_arch = "riscv64")]
+            crate::driver::video::console::dummycon::dummy_console()
+        };
 
-        self.console.con_init(&mut vc_data, true)?;
-        if vc_data.complement_mask == 0 {
-            vc_data.complement_mask = if vc_data.color_mode { 0x7700 } else { 0x0800 };
-        }
-        vc_data.s_complement_mask = vc_data.complement_mask;
-        // vc_data.bytes_per_row = vc_data.cols << 1;
-        vc_data.index = tty_core.index();
-        vc_data.bottom = vc_data.rows;
-        vc_data.set_driver_funcs(Arc::downgrade(
-            &(self.console.clone() as Arc<dyn ConsoleSwitch>),
-        ));
-
-        // todo: unicode字符集处理？
-
-        if vc_data.cols > VC_MAXCOL || vc_data.rows > VC_MAXROW {
-            return Err(SystemError::EINVAL);
-        }
-
-        vc_data.init(None, None, true);
-        vc_data.update_attr();
-
-        let window_size = tty_core.window_size_upgradeable();
-        if window_size.col == 0 && window_size.row == 0 {
-            let mut window_size = window_size.upgrade();
-            window_size.col = vc_data.cols as u16;
-            window_size.row = vc_data.rows as u16;
-        }
-
-        if vc_data.utf {
-            tty_core.termios_write().input_mode.insert(InputMode::IUTF8);
-        } else {
-            tty_core.termios_write().input_mode.remove(InputMode::IUTF8);
-        }
-
-        // 加入sysfs？
-
-        Ok(())
+        Ok(Self { console })
     }
 
-    fn open(&self, _tty: &TtyCoreData) -> Result<(), SystemError> {
-        Ok(())
-    }
-
-    fn write_room(&self, _tty: &TtyCoreData) -> usize {
-        32768
-    }
-
-    /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/tty/vt/vt.c#2894
-    fn write(&self, tty: &TtyCoreData, buf: &[u8], mut nr: usize) -> Result<usize, SystemError> {
+    fn do_write(&self, tty: &TtyCoreData, buf: &[u8], mut nr: usize) -> Result<usize, SystemError> {
         // 关闭中断
         let mut vc_data = tty.vc_data_irqsave();
 
@@ -206,7 +164,76 @@ impl TtyOperation for TtyConsoleDriverInner {
         // TODO: notify update
         return Ok(offset);
     }
+}
 
+impl TtyOperation for TtyConsoleDriverInner {
+    fn install(&self, _driver: Arc<TtyDriver>, tty: Arc<TtyCore>) -> Result<(), SystemError> {
+        let tty_core = tty.core();
+        let mut vc_data = VIRT_CONSOLES[tty_core.index()].lock();
+
+        self.console.con_init(&mut vc_data, true)?;
+        if vc_data.complement_mask == 0 {
+            vc_data.complement_mask = if vc_data.color_mode { 0x7700 } else { 0x0800 };
+        }
+        vc_data.s_complement_mask = vc_data.complement_mask;
+        // vc_data.bytes_per_row = vc_data.cols << 1;
+        vc_data.index = tty_core.index();
+        vc_data.bottom = vc_data.rows;
+        vc_data.set_driver_funcs(Arc::downgrade(
+            &(self.console.clone() as Arc<dyn ConsoleSwitch>),
+        ));
+
+        // todo: unicode字符集处理？
+
+        if vc_data.cols > VC_MAXCOL || vc_data.rows > VC_MAXROW {
+            return Err(SystemError::EINVAL);
+        }
+
+        vc_data.init(None, None, true);
+        vc_data.update_attr();
+
+        let window_size = tty_core.window_size_upgradeable();
+        if window_size.col == 0 && window_size.row == 0 {
+            let mut window_size = window_size.upgrade();
+            window_size.col = vc_data.cols as u16;
+            window_size.row = vc_data.rows as u16;
+        }
+
+        if vc_data.utf {
+            tty_core.termios_write().input_mode.insert(InputMode::IUTF8);
+        } else {
+            tty_core.termios_write().input_mode.remove(InputMode::IUTF8);
+        }
+
+        // 设置tty的端口为vc端口
+        vc_data.port().setup_internal_tty(Arc::downgrade(&tty));
+        tty.set_port(vc_data.port());
+        // 加入sysfs？
+
+        CURRENT_VCNUM.store(tty_core.index() as isize, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn open(&self, _tty: &TtyCoreData) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn write_room(&self, _tty: &TtyCoreData) -> usize {
+        32768
+    }
+
+    /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/tty/vt/vt.c#2894
+    #[inline(never)]
+    fn write(&self, tty: &TtyCoreData, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
+        // if String::from_utf8_lossy(buf) == "Hello world!\n" {
+        //     loop {}
+        // }
+        let ret = self.do_write(tty, buf, nr);
+        self.flush_chars(tty);
+        ret
+    }
+
+    #[inline(never)]
     fn flush_chars(&self, tty: &TtyCoreData) {
         let mut vc_data = tty.vc_data_irqsave();
         vc_data.set_cursor();
@@ -220,6 +247,18 @@ impl TtyOperation for TtyConsoleDriverInner {
     fn ioctl(&self, _tty: Arc<TtyCore>, _cmd: u32, _arg: usize) -> Result<(), SystemError> {
         // TODO
         Err(SystemError::ENOIOCTLCMD)
+    }
+
+    fn close(&self, _tty: Arc<TtyCore>) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn resize(
+        &self,
+        _tty: Arc<TtyCore>,
+        _winsize: super::termios::WindowSize,
+    ) -> Result<(), SystemError> {
+        todo!()
     }
 }
 
@@ -258,11 +297,12 @@ pub struct DrawRegion {
 pub fn vty_init() -> Result<(), SystemError> {
     // 注册虚拟终端设备并将虚拟终端设备加入到文件系统
     let vc0 = TtyDevice::new(
-        "vc0",
+        "vc0".to_string(),
         IdTable::new(
             String::from("vc0"),
             Some(DeviceNumber::new(Major::TTY_MAJOR, 0)),
         ),
+        TtyType::Tty,
     );
     // 注册tty设备
     // CharDevOps::cdev_add(
@@ -287,7 +327,7 @@ pub fn vty_init() -> Result<(), SystemError> {
         Major::TTY_MAJOR,
         0,
         TtyDriverType::Console,
-        TTY_STD_TERMIOS.clone(),
+        *TTY_STD_TERMIOS,
         Arc::new(TtyConsoleDriverInner::new()?),
     );
 

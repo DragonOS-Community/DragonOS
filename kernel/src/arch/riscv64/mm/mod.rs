@@ -1,20 +1,25 @@
 use riscv::register::satp;
+use sbi_rt::{HartMask, SbiRet};
 use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
+    driver::open_firmware::fdt::open_firmware_fdt_driver,
     libs::spinlock::SpinLock,
     mm::{
         allocator::{
             buddy::BuddyAllocator,
             page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage, PhysPageFrame},
         },
-        page::PageFlags,
+        kernel_mapper::KernelMapper,
+        page::{PageEntry, PageFlags, PAGE_1G_SHIFT},
+        ucontext::UserMapper,
         MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
     },
+    smp::cpu::ProcessorId,
 };
 
-use self::init::riscv_mm_init;
+use self::init::{riscv_mm_init, INITIAL_PGTABLE_VALUE};
 
 pub mod bump;
 pub(super) mod init;
@@ -37,9 +42,50 @@ pub(self) static INNER_ALLOCATOR: SpinLock<Option<BuddyAllocator<MMArch>>> = Spi
 pub struct RiscV64MMArch;
 
 impl RiscV64MMArch {
-    pub const ENTRY_FLAG_GLOBAL: usize = 1 << 5;
+    /// 使远程cpu的TLB中，指定地址范围的页失效
+    pub fn remote_invalidate_page(
+        cpu: ProcessorId,
+        address: VirtAddr,
+        size: usize,
+    ) -> Result<(), SbiRet> {
+        let r = sbi_rt::remote_sfence_vma(Into::into(cpu), address.data(), size);
+        if r.is_ok() {
+            return Ok(());
+        } else {
+            return Err(r);
+        }
+    }
+
+    /// 使指定远程cpu的TLB中，所有范围的页失效
+    pub fn remote_invalidate_all(cpu: ProcessorId) -> Result<(), SbiRet> {
+        let r = Self::remote_invalidate_page(
+            cpu,
+            VirtAddr::new(0),
+            1 << RiscV64MMArch::ENTRY_ADDRESS_SHIFT,
+        );
+
+        return r;
+    }
+
+    pub fn remote_invalidate_all_with_mask(mask: HartMask) -> Result<(), SbiRet> {
+        let r = sbi_rt::remote_sfence_vma(mask, 0, 1 << RiscV64MMArch::ENTRY_ADDRESS_SHIFT);
+        if r.is_ok() {
+            return Ok(());
+        } else {
+            return Err(r);
+        }
+    }
 }
+
+/// 内核空间起始地址在顶层页表中的索引
+const KERNEL_TOP_PAGE_ENTRY_NO: usize = (RiscV64MMArch::PHYS_OFFSET
+    & ((1 << RiscV64MMArch::ENTRY_ADDRESS_SHIFT) - 1))
+    >> (RiscV64MMArch::ENTRY_ADDRESS_SHIFT - RiscV64MMArch::PAGE_ENTRY_SHIFT);
+
 impl MemoryManagementArch for RiscV64MMArch {
+    /// riscv64暂不支持缺页中断
+    const PAGE_FAULT_ENABLED: bool = false;
+
     const PAGE_SHIFT: usize = 12;
 
     const PAGE_ENTRY_SHIFT: usize = 9;
@@ -59,12 +105,14 @@ impl MemoryManagementArch for RiscV64MMArch {
 
     const ENTRY_FLAG_PRESENT: usize = 1 << 0;
 
-    const ENTRY_FLAG_READONLY: usize = 0;
+    const ENTRY_FLAG_READONLY: usize = (1 << 1);
+
+    const ENTRY_FLAG_WRITEABLE: usize = (1 << 2);
 
     const ENTRY_FLAG_READWRITE: usize = (1 << 2) | (1 << 1);
 
     const ENTRY_FLAG_USER: usize = (1 << 4);
-
+    const ENTRY_ADDRESS_MASK: usize = Self::ENTRY_ADDRESS_SIZE - (1 << 10);
     const ENTRY_FLAG_WRITE_THROUGH: usize = (2 << 61);
 
     const ENTRY_FLAG_CACHE_DISABLE: usize = (2 << 61);
@@ -74,6 +122,7 @@ impl MemoryManagementArch for RiscV64MMArch {
     const ENTRY_FLAG_EXEC: usize = (1 << 3);
     const ENTRY_FLAG_ACCESSED: usize = (1 << 6);
     const ENTRY_FLAG_DIRTY: usize = (1 << 7);
+    const ENTRY_FLAG_GLOBAL: usize = (1 << 5);
 
     const PHYS_OFFSET: usize = 0xffff_ffc0_0000_0000;
     const KERNEL_LINK_OFFSET: usize = 0x1000000;
@@ -84,14 +133,28 @@ impl MemoryManagementArch for RiscV64MMArch {
 
     const USER_STACK_START: crate::mm::VirtAddr = VirtAddr::new(0x0000_001f_ffa0_0000);
 
-    /// 在距离sv39的顶端还有1G的位置，设置为FIXMAP的起始地址
-    const FIXMAP_START_VADDR: VirtAddr = VirtAddr::new(0xffff_ffff_8000_0000);
+    /// 在距离sv39的顶端还有64M的位置，设置为FIXMAP的起始地址
+    const FIXMAP_START_VADDR: VirtAddr = VirtAddr::new(0xffff_ffff_fc00_0000);
     /// 设置1MB的fixmap空间
     const FIXMAP_SIZE: usize = 256 * 4096;
+
+    /// 在距离sv39的顶端还有2G的位置，设置为MMIO空间的起始地址
+    const MMIO_BASE: VirtAddr = VirtAddr::new(0xffff_ffff_8000_0000);
+    /// 设置1g的MMIO空间
+    const MMIO_SIZE: usize = 1 << PAGE_1G_SHIFT;
+
+    const ENTRY_FLAG_HUGE_PAGE: usize = Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_READWRITE;
 
     #[inline(never)]
     unsafe fn init() {
         riscv_mm_init().expect("init kernel memory management architecture failed");
+    }
+
+    unsafe fn arch_post_init() {
+        // 映射fdt
+        open_firmware_fdt_driver()
+            .map_fdt()
+            .expect("openfirmware map fdt failed");
     }
 
     unsafe fn invalidate_page(address: VirtAddr) {
@@ -117,16 +180,35 @@ impl MemoryManagementArch for RiscV64MMArch {
         satp::set(satp::Mode::Sv39, 0, ppn);
     }
 
-    fn virt_is_valid(virt: crate::mm::VirtAddr) -> bool {
+    fn virt_is_valid(virt: VirtAddr) -> bool {
         virt.is_canonical()
     }
 
-    fn initial_page_table() -> crate::mm::PhysAddr {
-        todo!()
+    fn initial_page_table() -> PhysAddr {
+        unsafe { INITIAL_PGTABLE_VALUE }
     }
 
-    fn setup_new_usermapper() -> Result<crate::mm::ucontext::UserMapper, SystemError> {
-        todo!()
+    fn setup_new_usermapper() -> Result<UserMapper, SystemError> {
+        let new_umapper: crate::mm::page::PageMapper<MMArch, LockedFrameAllocator> = unsafe {
+            PageMapper::create(PageTableKind::User, LockedFrameAllocator)
+                .ok_or(SystemError::ENOMEM)?
+        };
+
+        let current_ktable: KernelMapper = KernelMapper::lock();
+        let copy_mapping = |pml4_entry_no| unsafe {
+            let entry: PageEntry<RiscV64MMArch> = current_ktable
+                .table()
+                .entry(pml4_entry_no)
+                .unwrap_or_else(|| panic!("entry {} not found", pml4_entry_no));
+            new_umapper.table().set_entry(pml4_entry_no, entry)
+        };
+
+        // 复制内核的映射
+        for pml4_entry_no in KERNEL_TOP_PAGE_ENTRY_NO..512 {
+            copy_mapping(pml4_entry_no);
+        }
+
+        return Ok(crate::mm::ucontext::UserMapper::new(new_umapper));
     }
 
     unsafe fn phys_2_virt(phys: PhysAddr) -> Option<VirtAddr> {
@@ -162,6 +244,15 @@ impl MemoryManagementArch for RiscV64MMArch {
         let ppn = PhysPageFrame::new(paddr).ppn();
         let r = ((ppn & ((1 << 54) - 1)) << 10) | page_flags;
         return r;
+    }
+
+    fn vma_access_permitted(
+        _vma: alloc::sync::Arc<crate::mm::ucontext::LockedVMA>,
+        _write: bool,
+        _execute: bool,
+        _foreign: bool,
+    ) -> bool {
+        true
     }
 }
 

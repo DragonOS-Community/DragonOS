@@ -1,7 +1,9 @@
 pub mod barrier;
 pub mod bump;
-mod c_adapter;
+pub mod fault;
+pub mod pkru;
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashSet;
 use x86::time::rdtsc;
@@ -18,13 +20,14 @@ use crate::libs::spinlock::SpinLock;
 
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::memblock::mem_block_manager;
+use crate::mm::ucontext::LockedVMA;
 use crate::{
     arch::MMArch,
     mm::allocator::{buddy::BuddyAllocator, bump::BumpAllocator},
 };
 
 use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::{PageEntry, PageFlags};
+use crate::mm::page::{PageEntry, PageFlags, PAGE_1G_SHIFT};
 use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr};
 use crate::{kdebug, kinfo, kwarn};
 use system_error::SystemError;
@@ -44,10 +47,6 @@ pub type PageMapper =
 
 /// 初始的CR3寄存器的值，用于内存管理初始化时，创建的第一个内核页表的位置
 static mut INITIAL_CR3_VALUE: PhysAddr = PhysAddr::new(0);
-
-/// 内核的第一个页表在pml4中的索引
-/// 顶级页表的[256, 512)项是内核的页表
-static KERNEL_PML4E_NO: usize = (X86_64MMArch::PHYS_OFFSET & ((1 << 48) - 1)) >> 39;
 
 static INNER_ALLOCATOR: SpinLock<Option<BuddyAllocator<MMArch>>> = SpinLock::new(None);
 
@@ -71,6 +70,8 @@ pub struct X86_64MMArch;
 static XD_RESERVED: AtomicBool = AtomicBool::new(false);
 
 impl MemoryManagementArch for X86_64MMArch {
+    /// X86目前支持缺页中断
+    const PAGE_FAULT_ENABLED: bool = true;
     /// 4K页
     const PAGE_SHIFT: usize = 12;
 
@@ -93,6 +94,7 @@ impl MemoryManagementArch for X86_64MMArch {
 
     const ENTRY_FLAG_READONLY: usize = 0;
 
+    const ENTRY_FLAG_WRITEABLE: usize = 1 << 1;
     const ENTRY_FLAG_READWRITE: usize = 1 << 1;
 
     const ENTRY_FLAG_USER: usize = 1 << 2;
@@ -105,8 +107,10 @@ impl MemoryManagementArch for X86_64MMArch {
     /// x86_64不存在EXEC标志位，只有NO_EXEC（XD）标志位
     const ENTRY_FLAG_EXEC: usize = 0;
 
-    const ENTRY_FLAG_ACCESSED: usize = 0;
-    const ENTRY_FLAG_DIRTY: usize = 0;
+    const ENTRY_FLAG_ACCESSED: usize = 1 << 5;
+    const ENTRY_FLAG_DIRTY: usize = 1 << 6;
+    const ENTRY_FLAG_HUGE_PAGE: usize = 1 << 7;
+    const ENTRY_FLAG_GLOBAL: usize = 1 << 8;
 
     /// 物理地址与虚拟地址的偏移量
     /// 0xffff_8000_0000_0000
@@ -122,6 +126,9 @@ impl MemoryManagementArch for X86_64MMArch {
     const FIXMAP_START_VADDR: VirtAddr = VirtAddr::new(0xffffb00000000000);
     /// 设置FIXMAP区域大小为1M
     const FIXMAP_SIZE: usize = 256 * 4096;
+
+    const MMIO_BASE: VirtAddr = VirtAddr::new(0xffffa10000000000);
+    const MMIO_SIZE: usize = 1 << PAGE_1G_SHIFT;
 
     /// @brief 获取物理内存区域
     unsafe fn init() {
@@ -159,6 +166,7 @@ impl MemoryManagementArch for X86_64MMArch {
 
         // 初始化内存管理器
         unsafe { allocator_init() };
+
         send_to_default_serial8250_port("x86 64 init done\n\0".as_bytes());
     }
 
@@ -181,11 +189,10 @@ impl MemoryManagementArch for X86_64MMArch {
     unsafe fn table(table_kind: PageTableKind) -> PhysAddr {
         match table_kind {
             PageTableKind::Kernel | PageTableKind::User => {
-                let paddr: usize;
                 compiler_fence(Ordering::SeqCst);
-                asm!("mov {}, cr3", out(reg) paddr, options(nomem, nostack, preserves_flags));
+                let cr3 = x86::controlregs::cr3() as usize;
                 compiler_fence(Ordering::SeqCst);
-                return PhysAddr::new(paddr);
+                return PhysAddr::new(cr3);
             }
             PageTableKind::EPT => {
                 let eptp =
@@ -235,7 +242,7 @@ impl MemoryManagementArch for X86_64MMArch {
         };
 
         // 复制内核的映射
-        for pml4_entry_no in KERNEL_PML4E_NO..512 {
+        for pml4_entry_no in MMArch::PAGE_KERNEL_INDEX..MMArch::PAGE_ENTRY_NUM {
             copy_mapping(pml4_entry_no);
         }
 
@@ -259,6 +266,9 @@ impl MemoryManagementArch for X86_64MMArch {
     const PAGE_ENTRY_NUM: usize = 1 << Self::PAGE_ENTRY_SHIFT;
 
     const PAGE_ENTRY_MASK: usize = Self::PAGE_ENTRY_NUM - 1;
+
+    const PAGE_KERNEL_INDEX: usize = (Self::PHYS_OFFSET & Self::PAGE_ADDRESS_MASK)
+        >> (Self::PAGE_ADDRESS_SHIFT - Self::PAGE_ENTRY_SHIFT);
 
     const PAGE_NEGATIVE_MASK: usize = !((Self::PAGE_ADDRESS_SIZE) - 1);
 
@@ -299,6 +309,21 @@ impl MemoryManagementArch for X86_64MMArch {
     #[inline(always)]
     fn make_entry(paddr: PhysAddr, page_flags: usize) -> usize {
         return paddr.data() | page_flags;
+    }
+
+    fn vma_access_permitted(
+        vma: Arc<LockedVMA>,
+        write: bool,
+        execute: bool,
+        foreign: bool,
+    ) -> bool {
+        if execute {
+            return true;
+        }
+        if foreign | vma.is_foreign() {
+            return true;
+        }
+        pkru::pkru_allows_pkey(pkru::vma_pkey(vma), write)
     }
 }
 
@@ -341,26 +366,26 @@ impl X86_64MMArch {
         let mb2_count = mb2_count as usize;
         let mut areas_count = 0usize;
         let mut total_mem_size = 0usize;
-        for i in 0..mb2_count {
+        for info_entry in mb2_mem_info.iter().take(mb2_count) {
             // Only use the memory area if its type is 1 (RAM)
-            if mb2_mem_info[i].type_ == 1 {
+            if info_entry.type_ == 1 {
                 // Skip the memory area if its len is 0
-                if mb2_mem_info[i].len == 0 {
+                if info_entry.len == 0 {
                     continue;
                 }
 
-                total_mem_size += mb2_mem_info[i].len as usize;
+                total_mem_size += info_entry.len as usize;
 
                 mem_block_manager()
                     .add_block(
-                        PhysAddr::new(mb2_mem_info[i].addr as usize),
-                        mb2_mem_info[i].len as usize,
+                        PhysAddr::new(info_entry.addr as usize),
+                        info_entry.len as usize,
                     )
                     .unwrap_or_else(|e| {
                         kwarn!(
                             "Failed to add memory block: base={:#x}, size={:#x}, error={:?}",
-                            mb2_mem_info[i].addr,
-                            mb2_mem_info[i].len,
+                            info_entry.addr,
+                            info_entry.len,
                             e
                         );
                     });
@@ -405,10 +430,13 @@ impl VirtAddr {
 }
 
 unsafe fn allocator_init() {
-    let virt_offset = BOOTSTRAP_MM_INFO.unwrap().start_brk;
-    let phy_offset =
-        unsafe { MMArch::virt_2_phys(VirtAddr::new(page_align_up(virt_offset))) }.unwrap();
+    let virt_offset = VirtAddr::new(page_align_up(BOOTSTRAP_MM_INFO.unwrap().start_brk));
 
+    let phy_offset = unsafe { MMArch::virt_2_phys(virt_offset) }.unwrap();
+
+    mem_block_manager()
+        .reserve_block(PhysAddr::new(0), phy_offset.data())
+        .expect("Failed to reserve block");
     let mut bump_allocator = BumpAllocator::<X86_64MMArch>::new(phy_offset.data());
     kdebug!(
         "BumpAllocator created, offset={:?}",
@@ -461,9 +489,6 @@ unsafe fn allocator_init() {
                 flusher.ignore();
             }
         }
-
-        // 添加低地址的映射（在smp完成初始化之前，需要使用低地址的映射.初始化之后需要取消这一段映射）
-        LowAddressRemapping::remap_at_low_address(&mut mapper);
     }
 
     unsafe {
@@ -525,7 +550,7 @@ pub fn test_buddy() {
             let mut random_size = 0u64;
             unsafe { x86::random::rdrand64(&mut random_size) };
             // 一次最多申请4M
-            random_size = random_size % (1024 * 4096);
+            random_size %= 1024 * 4096;
             if random_size == 0 {
                 continue;
             }
@@ -555,19 +580,19 @@ pub fn test_buddy() {
                     allocated_frame_count.data() * MMArch::PAGE_SIZE,
                 )
             };
-            for i in 0..slice.len() {
-                slice[i] = ((i + unsafe { rdtsc() } as usize) % 256) as u8;
+            for (i, item) in slice.iter_mut().enumerate() {
+                *item = ((i + unsafe { rdtsc() } as usize) % 256) as u8;
             }
 
             // 随机释放一个内存块
-            if v.len() > 0 {
+            if !v.is_empty() {
                 let mut random_index = 0u64;
                 unsafe { x86::random::rdrand64(&mut random_index) };
                 // 70%概率释放
                 if random_index % 10 > 7 {
                     continue;
                 }
-                random_index = random_index % v.len() as u64;
+                random_index %= v.len() as u64;
                 let random_index = random_index as usize;
                 let (paddr, allocated_frame_count) = v.remove(random_index);
                 assert!(addr_set.remove(&paddr));
@@ -600,7 +625,8 @@ pub fn test_buddy() {
 pub struct LockedFrameAllocator;
 
 impl FrameAllocator for LockedFrameAllocator {
-    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
+    unsafe fn allocate(&mut self, mut count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
+        count = count.next_power_of_two();
         if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
             return allocator.allocate(count);
         } else {
@@ -626,7 +652,7 @@ impl FrameAllocator for LockedFrameAllocator {
 
 /// 获取内核地址默认的页面标志
 pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> PageFlags<A> {
-    let info: X86_64MMBootstrapInfo = BOOTSTRAP_MM_INFO.clone().unwrap();
+    let info: X86_64MMBootstrapInfo = BOOTSTRAP_MM_INFO.unwrap();
 
     if virt.data() >= info.kernel_code_start && virt.data() < info.kernel_code_end {
         // Remap kernel code  execute
@@ -659,9 +685,7 @@ impl LowAddressRemapping {
     // 映射64M
     const REMAP_SIZE: usize = 64 * 1024 * 1024;
 
-    pub unsafe fn remap_at_low_address(
-        mapper: &mut crate::mm::page::PageMapper<MMArch, &mut BumpAllocator<MMArch>>,
-    ) {
+    pub unsafe fn remap_at_low_address(mapper: &mut PageMapper) {
         for i in 0..(Self::REMAP_SIZE / MMArch::PAGE_SIZE) {
             let paddr = PhysAddr::new(i * MMArch::PAGE_SIZE);
             let vaddr = VirtAddr::new(i * MMArch::PAGE_SIZE);
@@ -676,17 +700,13 @@ impl LowAddressRemapping {
     }
 
     /// 取消低地址的映射
-    pub unsafe fn unmap_at_low_address(flush: bool) {
-        let mut mapper = KernelMapper::lock();
-        assert!(mapper.as_mut().is_some());
+    pub unsafe fn unmap_at_low_address(mapper: &mut PageMapper, flush: bool) {
         for i in 0..(Self::REMAP_SIZE / MMArch::PAGE_SIZE) {
             let vaddr = VirtAddr::new(i * MMArch::PAGE_SIZE);
             let (_, _, flusher) = mapper
-                .as_mut()
-                .unwrap()
                 .unmap_phys(vaddr, true)
                 .expect("Failed to unmap frame");
-            if flush == false {
+            if !flush {
                 flusher.ignore();
             }
         }

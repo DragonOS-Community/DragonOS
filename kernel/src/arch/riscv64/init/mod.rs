@@ -8,21 +8,27 @@ use crate::{
     kdebug, kinfo,
     mm::{memblock::mem_block_manager, PhysAddr, VirtAddr},
     print, println,
+    smp::cpu::ProcessorId,
 };
 
-use super::driver::sbi::console_putstr;
+use super::{cpu::init_local_context, interrupt::entry::handle_exception};
 
 #[derive(Debug)]
 pub struct ArchBootParams {
     /// 启动时的fdt物理地址
     pub fdt_paddr: PhysAddr,
     pub fdt_vaddr: Option<VirtAddr>,
+    pub fdt_size: usize,
+
+    pub boot_hartid: ProcessorId,
 }
 
 impl ArchBootParams {
     pub const DEFAULT: Self = ArchBootParams {
         fdt_paddr: PhysAddr::new(0),
         fdt_vaddr: None,
+        fdt_size: 0,
+        boot_hartid: ProcessorId::new(0),
     };
 
     pub fn arch_fdt(&self) -> VirtAddr {
@@ -34,7 +40,7 @@ impl ArchBootParams {
     }
 }
 
-static mut BOOT_HARTID: usize = 0;
+static mut BOOT_HARTID: u32 = 0;
 static mut BOOT_FDT_PADDR: PhysAddr = PhysAddr::new(0);
 
 #[no_mangle]
@@ -42,11 +48,23 @@ unsafe extern "C" fn kernel_main(hartid: usize, fdt_paddr: usize) -> ! {
     let fdt_paddr = PhysAddr::new(fdt_paddr);
 
     unsafe {
-        BOOT_HARTID = hartid;
+        BOOT_HARTID = hartid as u32;
         BOOT_FDT_PADDR = fdt_paddr;
     }
-
+    setup_trap_vector();
     start_kernel();
+}
+
+/// 设置中断、异常处理函数
+fn setup_trap_vector() {
+    let ptr = handle_exception as *const () as usize;
+
+    unsafe {
+        riscv::register::stvec::write(ptr, riscv::register::stvec::TrapMode::Direct);
+        // Set sup0 scratch register to 0, indicating to exception vector that
+        // we are presently executing in kernel.
+        riscv::register::sscratch::write(0);
+    }
 }
 
 #[inline(never)]
@@ -55,7 +73,12 @@ fn print_node(node: FdtNode<'_, '_>, n_spaces: usize) {
     println!("{}/", node.name);
     node.properties().for_each(|p| {
         (0..n_spaces + 4).for_each(|_| print!(" "));
-        println!("{}: {:?}", p.name, p.value);
+
+        if p.name == "compatible" {
+            println!("{}: {:?}", p.name, p.as_str());
+        } else {
+            println!("{}: {:?}", p.name, p.value);
+        }
     });
 
     for child in node.children() {
@@ -79,9 +102,18 @@ unsafe fn parse_dtb() {
 #[inline(never)]
 pub fn early_setup_arch() -> Result<(), SystemError> {
     SbiDriver::early_init();
-    let hartid: usize = unsafe { BOOT_HARTID };
+    let hartid = unsafe { BOOT_HARTID };
     let fdt_paddr = unsafe { BOOT_FDT_PADDR };
-    boot_params().write().arch.fdt_paddr = fdt_paddr;
+
+    let fdt =
+        unsafe { fdt::Fdt::from_ptr(fdt_paddr.data() as *const u8).expect("Failed to parse fdt!") };
+
+    let mut arch_boot_params_guard = boot_params().write();
+    arch_boot_params_guard.arch.fdt_paddr = fdt_paddr;
+    arch_boot_params_guard.arch.fdt_size = fdt.total_size();
+    arch_boot_params_guard.arch.boot_hartid = ProcessorId::new(hartid);
+    // kdebug!("fdt_paddr: {:?}, fdt_size: {}", fdt_paddr, fdt.total_size());
+    drop(arch_boot_params_guard);
 
     kinfo!(
         "DragonOS kernel is running on hart {}, fdt address:{:?}",
@@ -90,8 +122,6 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
     );
     mm_early_init();
 
-    let fdt =
-        unsafe { fdt::Fdt::from_ptr(fdt_paddr.data() as *const u8).expect("Failed to parse fdt!") };
     print_node(fdt.find_node("/").unwrap(), 0);
 
     unsafe { parse_dtb() };
@@ -109,7 +139,7 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
 
 #[inline(never)]
 pub fn setup_arch() -> Result<(), SystemError> {
-    // todo
+    init_local_context();
     return Ok(());
 }
 

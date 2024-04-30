@@ -6,7 +6,8 @@ use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{
     core::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
 };
-use crate::{libs::spinlock::SpinLock, time::TimeSpec};
+use crate::libs::spinlock::SpinLockGuard;
+use crate::{libs::spinlock::SpinLock, time::PosixTimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
@@ -39,16 +40,16 @@ impl LockedAhciInode {
             // uuid: Uuid::new_v5(),
             self_ref: Weak::default(),
             fs: Weak::default(),
-            disk: disk,
+            disk,
             metadata: Metadata {
                 dev_id: 1,
                 inode_id: generate_inode_id(),
                 size: 0,
                 blk_size: 0,
                 blocks: 0,
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type: FileType::BlockDevice, // 文件夹，block设备，char设备
                 mode: ModeType::from_bits_truncate(0o666),
                 nlinks: 1,
@@ -76,12 +77,16 @@ impl IndexNode for LockedAhciInode {
         self
     }
 
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    fn open(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
@@ -93,7 +98,7 @@ impl IndexNode for LockedAhciInode {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        Err(SystemError::ENOSYS)
     }
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
@@ -114,13 +119,13 @@ impl IndexNode for LockedAhciInode {
         offset: usize, // lba地址
         len: usize,
         buf: &mut [u8],
-        data: &mut FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
 
-        if let FilePrivateData::Unused = data {
+        if let FilePrivateData::Unused = *data {
             return self.0.lock().disk.read_at_bytes(offset, len, buf);
         }
 
@@ -133,13 +138,13 @@ impl IndexNode for LockedAhciInode {
         offset: usize, // lba地址
         len: usize,
         buf: &[u8],
-        data: &mut FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
 
-        if let FilePrivateData::Unused = data {
+        if let FilePrivateData::Unused = *data {
             return self.0.lock().disk.write_at_bytes(offset, len, buf);
         }
 

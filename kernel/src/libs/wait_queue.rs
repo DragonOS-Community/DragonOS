@@ -1,13 +1,14 @@
-#![allow(dead_code)]
+// #![allow(dead_code)]
 use core::intrinsics::unlikely;
 
 use alloc::{collections::LinkedList, sync::Arc, vec::Vec};
 
 use crate::{
-    arch::{sched::sched, CurrentIrqArch},
+    arch::CurrentIrqArch,
     exception::InterruptArch,
     kerror,
     process::{ProcessControlBlock, ProcessManager, ProcessState},
+    sched::{schedule, SchedMode},
 };
 
 use super::{
@@ -25,8 +26,11 @@ struct InnerWaitQueue {
 #[derive(Debug)]
 pub struct WaitQueue(SpinLock<InnerWaitQueue>);
 
+#[allow(dead_code)]
 impl WaitQueue {
-    pub const INIT: WaitQueue = WaitQueue(SpinLock::new(InnerWaitQueue::INIT));
+    pub const fn default() -> Self {
+        WaitQueue(SpinLock::new(InnerWaitQueue::INIT))
+    }
 
     /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断
     pub fn sleep(&self) {
@@ -37,7 +41,7 @@ impl WaitQueue {
         });
         guard.wait_list.push_back(ProcessManager::current_pcb());
         drop(guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     /// @brief 让当前进程在等待队列上进行等待，并且,在释放waitqueue的锁之前，执行f函数闭包
@@ -56,7 +60,7 @@ impl WaitQueue {
         f();
 
         drop(guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     /// @brief 让当前进程在等待队列上进行等待. 但是，在释放waitqueue的锁之后，不会调用调度函数。
@@ -76,7 +80,7 @@ impl WaitQueue {
     pub unsafe fn sleep_without_schedule(&self) {
         before_sleep_check(1);
         // 安全检查：确保当前处于中断禁止状态
-        assert!(CurrentIrqArch::is_irq_enabled() == false);
+        assert!(!CurrentIrqArch::is_irq_enabled());
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
             panic!("sleep error: {:?}", e);
@@ -86,9 +90,9 @@ impl WaitQueue {
     }
 
     pub unsafe fn sleep_without_schedule_uninterruptible(&self) {
-        before_sleep_check(0);
+        before_sleep_check(1);
         // 安全检查：确保当前处于中断禁止状态
-        assert!(CurrentIrqArch::is_irq_enabled() == false);
+        assert!(!CurrentIrqArch::is_irq_enabled());
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
         ProcessManager::mark_sleep(false).unwrap_or_else(|e| {
             panic!("sleep error: {:?}", e);
@@ -107,7 +111,7 @@ impl WaitQueue {
         drop(irq_guard);
         guard.wait_list.push_back(ProcessManager::current_pcb());
         drop(guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断。
@@ -123,7 +127,7 @@ impl WaitQueue {
         guard.wait_list.push_back(ProcessManager::current_pcb());
         drop(to_unlock);
         drop(guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断。
@@ -139,7 +143,7 @@ impl WaitQueue {
         guard.wait_list.push_back(ProcessManager::current_pcb());
         drop(to_unlock);
         drop(guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     /// @brief 让当前进程在等待队列上进行等待，并且，不允许被信号打断。
@@ -155,7 +159,7 @@ impl WaitQueue {
         guard.wait_list.push_back(ProcessManager::current_pcb());
         drop(to_unlock);
         drop(guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     /// @brief 让当前进程在等待队列上进行等待，并且，不允许被信号打断。
@@ -173,7 +177,7 @@ impl WaitQueue {
 
         drop(to_unlock);
         drop(guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     /// @brief 唤醒在队列中等待的第一个进程。
@@ -263,7 +267,7 @@ fn before_sleep_check(max_preempt: usize) {
     if unlikely(pcb.preempt_count() > max_preempt) {
         kwarn!(
             "Process {:?}: Try to sleep when preempt count is {}",
-            pcb.pid(),
+            pcb.pid().data(),
             pcb.preempt_count()
         );
     }
@@ -275,10 +279,17 @@ pub struct EventWaitQueue {
     wait_list: SpinLock<Vec<(u64, Arc<ProcessControlBlock>)>>,
 }
 
+impl Default for EventWaitQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[allow(dead_code)]
 impl EventWaitQueue {
     pub fn new() -> Self {
         Self {
-            wait_list: SpinLock::new(Vec::new()),
+            wait_list: SpinLock::new(Default::default()),
         }
     }
 
@@ -296,7 +307,7 @@ impl EventWaitQueue {
         });
         guard.push((events, ProcessManager::current_pcb()));
         drop(guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     pub unsafe fn sleep_without_schedule(&self, events: u64) {
@@ -320,7 +331,7 @@ impl EventWaitQueue {
         guard.push((events, ProcessManager::current_pcb()));
         drop(to_unlock);
         drop(guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     /// ### 唤醒该队列上等待events的进程
@@ -338,12 +349,12 @@ impl EventWaitQueue {
                 // 有感兴趣的事件
                 if ProcessManager::wakeup(pcb).is_ok() {
                     ret += 1;
-                    return true;
-                } else {
                     return false;
+                } else {
+                    return true;
                 }
             } else {
-                return false;
+                return true;
             }
         });
         ret
@@ -363,12 +374,12 @@ impl EventWaitQueue {
                 // 有感兴趣的事件
                 if ProcessManager::wakeup(pcb).is_ok() {
                     ret += 1;
-                    return true;
-                } else {
                     return false;
+                } else {
+                    return true;
                 }
             } else {
-                return false;
+                return true;
             }
         });
         ret

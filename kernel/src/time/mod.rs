@@ -6,7 +6,7 @@ use core::{
 
 use crate::arch::CurrentTimeArch;
 
-use self::timekeep::ktime_get_real_ns;
+use self::timekeeping::getnstimeofday;
 
 pub mod clocksource;
 pub mod jiffies;
@@ -16,6 +16,7 @@ pub mod timeconv;
 pub mod timekeep;
 pub mod timekeeping;
 pub mod timer;
+
 /* Time structures. (Partitially taken from smoltcp)
 
 The `time` module contains structures used to represent both
@@ -42,31 +43,40 @@ pub const NSEC_PER_SEC: u32 = 1000000000;
 #[allow(dead_code)]
 pub const FSEC_PER_SEC: u64 = 1000000000000000;
 
+/// The clock frequency of the i8253/i8254 PIT
+pub const PIT_TICK_RATE: u64 = 1193182;
+
 /// 表示时间的结构体，符合POSIX标准。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]
-pub struct TimeSpec {
+pub struct PosixTimeSpec {
     pub tv_sec: i64,
     pub tv_nsec: i64,
 }
 
-impl TimeSpec {
+impl PosixTimeSpec {
     #[allow(dead_code)]
-    pub fn new(sec: i64, nsec: i64) -> TimeSpec {
-        return TimeSpec {
+    pub fn new(sec: i64, nsec: i64) -> PosixTimeSpec {
+        return PosixTimeSpec {
             tv_sec: sec,
             tv_nsec: nsec,
         };
     }
 
     /// 获取当前时间
+    #[inline(always)]
     pub fn now() -> Self {
+        getnstimeofday()
+    }
+
+    /// 获取当前CPU时间(使用CPU时钟周期计算，会存在回绕问题)
+    pub fn now_cpu_time() -> Self {
         #[cfg(target_arch = "x86_64")]
         {
             use crate::arch::driver::tsc::TSCManager;
             let khz = TSCManager::cpu_khz();
             if unlikely(khz == 0) {
-                return TimeSpec::default();
+                return PosixTimeSpec::default();
             } else {
                 return Self::from(Duration::from_millis(
                     CurrentTimeArch::get_cycles() as u64 / khz,
@@ -76,12 +86,17 @@ impl TimeSpec {
 
         #[cfg(target_arch = "riscv64")]
         {
-            return TimeSpec::new(0, 0);
+            return PosixTimeSpec::new(0, 0);
         }
+    }
+
+    /// 换算成纳秒
+    pub fn total_nanos(&self) -> i64 {
+        self.tv_sec * 1000000000 + self.tv_nsec
     }
 }
 
-impl Sub for TimeSpec {
+impl Sub for PosixTimeSpec {
     type Output = Duration;
     fn sub(self, rhs: Self) -> Self::Output {
         let sec = self.tv_sec.checked_sub(rhs.tv_sec).unwrap_or(0);
@@ -90,18 +105,18 @@ impl Sub for TimeSpec {
     }
 }
 
-impl From<Duration> for TimeSpec {
+impl From<Duration> for PosixTimeSpec {
     fn from(dur: Duration) -> Self {
-        TimeSpec {
+        PosixTimeSpec {
             tv_sec: dur.total_micros() as i64 / 1000000,
             tv_nsec: (dur.total_micros() as i64 % 1000000) * 1000,
         }
     }
 }
 
-impl Into<Duration> for TimeSpec {
-    fn into(self) -> Duration {
-        Duration::from_micros(self.tv_sec as u64 * 1000000 + self.tv_nsec as u64 / 1000)
+impl From<PosixTimeSpec> for Duration {
+    fn from(val: PosixTimeSpec) -> Self {
+        Duration::from_micros(val.tv_sec as u64 * 1000000 + val.tv_nsec as u64 / 1000)
     }
 }
 
@@ -123,6 +138,61 @@ pub struct Instant {
 #[allow(dead_code)]
 impl Instant {
     pub const ZERO: Instant = Instant::from_micros_const(0);
+
+    /// mktime64 - 将日期转换为秒。
+    ///
+    /// ## 参数
+    ///
+    /// - year0: 要转换的年份
+    /// - mon0: 要转换的月份
+    /// - day: 要转换的天
+    /// - hour: 要转换的小时
+    /// - min: 要转换的分钟
+    /// - sec: 要转换的秒
+    ///
+    /// 将公历日期转换为1970-01-01 00:00:00以来的秒数。
+    /// 假设输入为正常的日期格式，即1980-12-31 23:59:59 => 年份=1980, 月=12, 日=31, 时=23, 分=59, 秒=59。
+    ///
+    /// [For the Julian calendar（俄罗斯在1917年之前使用，英国及其殖民地在大西洋1752年之前使用，
+    /// 其他地方在1582年之前使用，某些社区仍然在使用）省略-year/100+year/400项，
+    /// 并在结果上加10。]
+    ///
+    /// 这个算法最初由高斯（我认为是）发表。
+    ///
+    /// 要表示闰秒，可以通过将sec设为60（在ISO 8601允许）来调用此函数。
+    /// 闰秒与随后的秒一样处理，因为它们在UNIX时间中不存在。
+    ///
+    /// 支持将午夜作为当日末尾的24:00:00编码 - 即明天的午夜（在ISO 8601允许）。
+    ///
+    /// ## 返回
+    ///
+    /// 返回：给定输入日期自1970-01-01 00:00:00以来的秒数
+    pub fn mktime64(year0: u32, mon0: u32, day: u32, hour: u32, min: u32, sec: u32) -> Self {
+        let mut mon: i64 = mon0.into();
+        let mut year: u64 = year0.into();
+        let day: u64 = day.into();
+        let hour: u64 = hour.into();
+        let min: u64 = min.into();
+        let sec: u64 = sec.into();
+
+        mon -= 2;
+        /* 1..12 -> 11,12,1..10 */
+        if mon <= 0 {
+            /* Puts Feb last since it has leap day */
+            mon += 12;
+            year -= 1;
+        }
+        let mon = mon as u64;
+
+        let secs = ((((year / 4 - year / 100 + year / 400 + 367 * mon / 12 + day) + year * 365
+            - 719499)
+            * 24 + hour) /* now have hours - midnight tomorrow handled here */
+            * 60 + min)/* now have minutes */
+            * 60
+            + sec; /* finally seconds */
+
+        Self::from_secs(secs as i64)
+    }
 
     /// Create a new `Instant` from a number of microseconds.
     pub fn from_micros<T: Into<i64>>(micros: T) -> Instant {
@@ -158,7 +228,8 @@ impl Instant {
 
     /// Create a new `Instant` from the current time
     pub fn now() -> Instant {
-        Self::from_micros(ktime_get_real_ns() / 1000)
+        let tm = getnstimeofday();
+        Self::from_micros(tm.tv_sec * 1000000 + tm.tv_nsec / 1000)
     }
 
     /// The fractional number of milliseconds that have passed
@@ -403,9 +474,9 @@ impl From<smoltcp::time::Instant> for Instant {
     }
 }
 
-impl Into<smoltcp::time::Instant> for Instant {
-    fn into(self) -> smoltcp::time::Instant {
-        smoltcp::time::Instant::from_millis(self.millis())
+impl From<Instant> for smoltcp::time::Instant {
+    fn from(val: Instant) -> Self {
+        smoltcp::time::Instant::from_millis(val.millis())
     }
 }
 
@@ -416,13 +487,27 @@ impl From<smoltcp::time::Duration> for Duration {
     }
 }
 
-impl Into<smoltcp::time::Duration> for Duration {
-    fn into(self) -> smoltcp::time::Duration {
-        smoltcp::time::Duration::from_millis(self.millis())
+impl From<Duration> for smoltcp::time::Duration {
+    fn from(val: Duration) -> Self {
+        smoltcp::time::Duration::from_millis(val.millis())
     }
 }
 
 pub trait TimeArch {
     /// Get CPU cycles (Read from register)
     fn get_cycles() -> usize;
+
+    /// Calculate expire cycles
+    ///
+    /// # Arguments
+    ///
+    /// - `ns` - The time to expire in nanoseconds
+    ///
+    /// # Returns
+    ///
+    /// The expire cycles
+    fn cal_expire_cycles(ns: usize) -> usize;
+
+    /// 将CPU的时钟周期数转换为纳秒
+    fn cycles2ns(cycles: usize) -> usize;
 }

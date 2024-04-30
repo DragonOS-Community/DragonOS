@@ -18,6 +18,12 @@ impl Major {
     /// /dev/fb* framebuffers
     pub const FB_MAJOR: Self = Self::new(29);
 
+    /// Pty
+    pub const UNIX98_PTY_MASTER_MAJOR: Self = Self::new(128);
+    pub const UNIX98_PTY_MAJOR_COUNT: Self = Self::new(8);
+    pub const UNIX98_PTY_SLAVE_MAJOR: Self =
+        Self::new(Self::UNIX98_PTY_MASTER_MAJOR.0 + Self::UNIX98_PTY_MAJOR_COUNT.0);
+
     pub const fn new(x: u32) -> Self {
         Major(x)
     }
@@ -33,7 +39,7 @@ pub struct DeviceNumber {
 
 impl DeviceNumber {
     pub const MINOR_BITS: u32 = 20;
-    pub const MINOR_MASK: u32 = 1 << Self::MINOR_BITS - 1;
+    pub const MINOR_MASK: u32 = (1 << Self::MINOR_BITS) - 1;
 
     pub const fn new(major: Major, minor: u32) -> Self {
         Self {

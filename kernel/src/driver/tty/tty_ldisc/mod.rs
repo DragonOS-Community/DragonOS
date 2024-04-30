@@ -7,7 +7,7 @@ use crate::filesystem::vfs::file::FileMode;
 
 use super::{
     termios::Termios,
-    tty_core::{TtyCore, TtyCoreData},
+    tty_core::{TtyCore, TtyCoreData, TtyFlag},
 };
 
 pub mod ntty;
@@ -48,7 +48,7 @@ pub trait TtyLineDiscipline: Sync + Send + Debug {
     /// - old: 之前的termios，如果为None则表示第一次设置
     fn set_termios(&self, tty: Arc<TtyCore>, old: Option<Termios>) -> Result<(), SystemError>;
 
-    fn poll(&self, tty: Arc<TtyCore>) -> Result<(), SystemError>;
+    fn poll(&self, tty: Arc<TtyCore>) -> Result<usize, SystemError>;
     fn hangup(&self, tty: Arc<TtyCore>) -> Result<(), SystemError>;
 
     /// ## 接收数据
@@ -99,18 +99,26 @@ impl TtyLdiscManager {
     /// ### 参数
     /// - tty：需要设置的tty
     /// - o_tty: other tty 用于pty pair
-    pub fn ldisc_setup(tty: Arc<TtyCore>, _o_tty: Option<Arc<TtyCore>>) -> Result<(), SystemError> {
+    pub fn ldisc_setup(tty: Arc<TtyCore>, o_tty: Option<Arc<TtyCore>>) -> Result<(), SystemError> {
         let ld = tty.ldisc();
 
         let ret = ld.open(tty);
-        if ret.is_err() {
-            let err = ret.unwrap_err();
+        if let Err(err) = ret {
             if err == SystemError::ENOSYS {
                 return Err(err);
             }
         }
 
-        // TODO: 处理PTY
+        // 处理PTY
+        if let Some(o_tty) = o_tty {
+            let ld = o_tty.ldisc();
+
+            let ret: Result<(), SystemError> = ld.open(o_tty.clone());
+            if ret.is_err() {
+                o_tty.core().flags_write().remove(TtyFlag::LDISC_OPEN);
+                let _ = ld.close(o_tty.clone());
+            }
+        }
 
         Ok(())
     }

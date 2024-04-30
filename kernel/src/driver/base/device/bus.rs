@@ -134,9 +134,9 @@ pub trait Bus: Debug + Send + Sync {
     ///
     /// ## 默认实现
     ///
-    /// 如果总线不支持该操作，返回`SystemError::EOPNOTSUPP_OR_ENOTSUP`
+    /// 如果总线不支持该操作，返回`SystemError::ENOSYS`
     fn probe(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     fn remove(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError>;
     fn sync_state(&self, _device: &Arc<dyn Device>) {}
@@ -147,12 +147,12 @@ pub trait Bus: Debug + Send + Sync {
 
     fn resume(&self, device: &Arc<dyn Device>) -> Result<(), SystemError>;
 
-    /// match platform device to platform driver.
+    /// match device to driver.
     ///
     /// ## 参数
     ///
-    /// * `device` - platform device
-    /// * `driver` - platform driver
+    /// * `device` - device
+    /// * `driver` - driver
     ///
     /// ## 返回
     ///
@@ -191,7 +191,7 @@ impl dyn Bus {
         let subsys = self.subsystem();
         let guard = subsys.devices();
         for dev in guard.iter() {
-            if matcher.match_device(&dev, data) {
+            if matcher.match_device(dev, data) {
                 return Some(dev.clone());
             }
         }
@@ -221,7 +221,7 @@ impl dyn Bus {
         let subsys = self.subsystem();
         let guard = subsys.drivers();
         for drv in guard.iter() {
-            if matcher.match_driver(&drv, data) {
+            if matcher.match_driver(drv, data) {
                 return Some(drv.clone());
             }
         }
@@ -262,7 +262,7 @@ impl BusManager {
     ///
     /// - `dev` - 要被添加的设备
     pub fn add_device(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
-        let bus = dev.bus().map(|bus| bus.upgrade()).flatten();
+        let bus = dev.bus().and_then(|bus| bus.upgrade());
         if let Some(bus) = bus {
             device_manager().add_groups(dev, bus.dev_groups())?;
 
@@ -280,7 +280,7 @@ impl BusManager {
             )?;
             sysfs_instance().create_link(
                 Some(&dev_kobj),
-                &(&bus.subsystem().subsys().as_kobject()),
+                &bus.subsystem().subsys().as_kobject(),
                 "subsystem".to_string(),
             )?;
             bus.subsystem().add_device_to_vec(dev)?;
@@ -294,8 +294,7 @@ impl BusManager {
     pub fn add_driver(&self, driver: &Arc<dyn Driver>) -> Result<(), SystemError> {
         let bus = driver
             .bus()
-            .map(|bus| bus.upgrade())
-            .flatten()
+            .and_then(|bus| bus.upgrade())
             .ok_or(SystemError::EINVAL)?;
         kdebug!("bus '{}' add driver '{}'", bus.name(), driver.name());
 
@@ -314,25 +313,25 @@ impl BusManager {
 
         driver_manager()
             .add_groups(driver, bus.drv_groups())
-            .or_else(|e| {
+            .map_err(|e| {
                 kerror!(
                     "BusManager::add_driver: driver '{:?}' add_groups failed, err: '{:?}",
                     driver.name(),
                     e
                 );
-                Err(e)
+                e
             })
             .ok();
 
         if !driver.suppress_bind_attrs() {
             self.add_bind_files(driver)
-                .or_else(|e| {
+                .map_err(|e| {
                     kerror!(
                         "BusManager::add_driver: driver '{:?}' add_bind_files failed, err: '{:?}",
                         driver.name(),
                         e
                     );
-                    Err(e)
+                    e
                 })
                 .ok();
         }
@@ -423,7 +422,7 @@ impl BusManager {
 
     /// 根据bus的kset找到bus实例
     fn get_bus_by_kset(&self, kset: &Arc<KSet>) -> Option<Arc<dyn Bus>> {
-        return self.kset_bus_map.read().get(kset).map(|bus| bus.clone());
+        return self.kset_bus_map.read().get(kset).cloned();
     }
 
     /// 为bus上的设备选择可能的驱动程序
@@ -445,7 +444,7 @@ impl BusManager {
     ///
     /// Automatically probe for a driver if the bus allows it.
     pub fn probe_device(&self, dev: &Arc<dyn Device>) {
-        let bus = dev.bus().map(|bus| bus.upgrade()).flatten();
+        let bus = dev.bus().and_then(|bus| bus.upgrade());
         if bus.is_none() {
             return;
         }
@@ -498,7 +497,7 @@ fn rescan_devices_helper(dev: &Arc<dyn Device>) -> Result<(), SystemError> {
             // todo: lock device parent
             unimplemented!()
         }
-        device_manager().device_attach(&dev)?;
+        device_manager().device_attach(dev)?;
     }
     return Ok(());
 }
@@ -641,7 +640,7 @@ impl Attribute for BusAttrDriversAutoprobe {
 
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?r=&mo=5649&fi=241#231
     fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {
-        if buf.len() == 0 {
+        if buf.is_empty() {
             return Ok(0);
         }
 
@@ -650,7 +649,7 @@ impl Attribute for BusAttrDriversAutoprobe {
             .get_bus_by_kset(&kset)
             .ok_or(SystemError::EINVAL)?;
 
-        if buf[0] == '0' as u8 {
+        if buf[0] == b'0' {
             bus.subsystem().set_drivers_autoprobe(false);
         } else {
             bus.subsystem().set_drivers_autoprobe(true);
@@ -751,13 +750,12 @@ impl Attribute for DriverAttrUnbind {
                 "Intertrait casting not implemented for kobj: {}",
                 kobj.name()
             );
-            SystemError::EOPNOTSUPP_OR_ENOTSUP
+            SystemError::ENOSYS
         })?;
 
         let bus = driver
             .bus()
-            .map(|bus| bus.upgrade())
-            .flatten()
+            .and_then(|bus| bus.upgrade())
             .ok_or(SystemError::ENODEV)?;
 
         let s = CStr::from_bytes_with_nul(buf)
@@ -801,13 +799,12 @@ impl Attribute for DriverAttrBind {
                 "Intertrait casting not implemented for kobj: {}",
                 kobj.name()
             );
-            SystemError::EOPNOTSUPP_OR_ENOTSUP
+            SystemError::ENOSYS
         })?;
 
         let bus = driver
             .bus()
-            .map(|bus| bus.upgrade())
-            .flatten()
+            .and_then(|bus| bus.upgrade())
             .ok_or(SystemError::ENODEV)?;
         let device = bus
             .find_device_by_name(

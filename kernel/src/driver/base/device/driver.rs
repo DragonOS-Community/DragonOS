@@ -3,10 +3,14 @@ use super::{
     Device, DeviceMatchName, DeviceMatcher, IdTable,
 };
 use crate::{
-    driver::base::kobject::KObject,
+    driver::base::{
+        device::{bus::BusNotifyEvent, dd::DeviceAttrCoredump, device_manager},
+        kobject::KObject,
+    },
     filesystem::sysfs::{sysfs_instance, Attribute, AttributeGroup},
 };
 use alloc::{
+    string::ToString,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -24,9 +28,9 @@ pub enum DriverError {
     UnInitialized,         // 未初始化
 }
 
-impl Into<SystemError> for DriverError {
-    fn into(self) -> SystemError {
-        match self {
+impl From<DriverError> for SystemError {
+    fn from(value: DriverError) -> Self {
+        match value {
             DriverError::ProbeError => SystemError::ENODEV,
             DriverError::RegisterError => SystemError::ENODEV,
             DriverError::AllocateResourceError => SystemError::EIO,
@@ -50,7 +54,7 @@ pub fn driver_manager() -> &'static DriverManager {
 /// 否则在运行时会报错
 pub trait Driver: Sync + Send + Debug + KObject {
     fn coredump(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        Err(SystemError::ENOSYS)
     }
 
     /// @brief: 获取驱动标识符
@@ -109,6 +113,24 @@ pub trait Driver: Sync + Send + Debug + KObject {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct DriverCommonData {
+    pub devices: Vec<Arc<dyn Device>>,
+    pub bus: Option<Weak<dyn Bus>>,
+}
+
+impl DriverCommonData {
+    pub fn push_device(&mut self, device: Arc<dyn Device>) {
+        if !self.devices.iter().any(|d| Arc::ptr_eq(d, &device)) {
+            self.devices.push(device);
+        }
+    }
+
+    pub fn delete_device(&mut self, device: &Arc<dyn Device>) {
+        self.devices.retain(|d| !Arc::ptr_eq(d, device));
+    }
+}
+
 impl dyn Driver {
     pub fn allows_async_probing(&self) -> bool {
         match self.probe_type() {
@@ -138,13 +160,9 @@ impl dyn Driver {
         matcher: &dyn DeviceMatcher<T>,
         data: T,
     ) -> Option<Arc<dyn Device>> {
-        for dev in self.devices() {
-            if matcher.match_device(&dev, data) {
-                return Some(dev);
-            }
-        }
-
-        return None;
+        self.devices()
+            .into_iter()
+            .find(|dev| matcher.match_device(dev, data))
     }
 
     /// 根据设备名称查找绑定到驱动的设备
@@ -174,17 +192,13 @@ impl DriverManager {
     ///
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/driver.c#222
     pub fn register(&self, driver: Arc<dyn Driver>) -> Result<(), SystemError> {
-        let bus = driver
-            .bus()
-            .map(|bus| bus.upgrade())
-            .flatten()
-            .ok_or_else(|| {
-                kerror!(
-                    "DriverManager::register() failed: driver.bus() is None. Driver: '{:?}'",
-                    driver.name()
-                );
-                SystemError::EINVAL
-            })?;
+        let bus = driver.bus().and_then(|bus| bus.upgrade()).ok_or_else(|| {
+            kerror!(
+                "DriverManager::register() failed: driver.bus() is None. Driver: '{:?}'",
+                driver.name()
+            );
+            SystemError::EINVAL
+        })?;
 
         let drv_name = driver.name();
         let other = bus.find_driver_by_name(&drv_name);
@@ -216,8 +230,38 @@ impl DriverManager {
     }
 
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#434
-    pub fn driver_sysfs_add(&self, _dev: &Arc<dyn Device>) -> Result<(), SystemError> {
-        todo!("DriverManager::driver_sysfs_add()");
+    pub fn driver_sysfs_add(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
+        if let Some(bus) = dev.bus().and_then(|bus| bus.upgrade()) {
+            bus.subsystem()
+                .bus_notifier()
+                .call_chain(BusNotifyEvent::BindDriver, Some(dev), None);
+        }
+        let driver_kobj = dev.driver().unwrap() as Arc<dyn KObject>;
+        let device_kobj = dev.clone() as Arc<dyn KObject>;
+
+        let err_remove_device = |e| {
+            sysfs_instance().remove_link(&driver_kobj, dev.name());
+            Err(e)
+        };
+
+        let err_remove_driver = |e| {
+            sysfs_instance().remove_link(&device_kobj, "driver".to_string());
+            err_remove_device(e)
+        };
+
+        sysfs_instance().create_link(Some(&driver_kobj), &device_kobj, device_kobj.name())?;
+
+        if let Err(e) =
+            sysfs_instance().create_link(Some(&device_kobj), &driver_kobj, "driver".to_string())
+        {
+            return err_remove_device(e);
+        }
+
+        if let Err(e) = device_manager().create_file(dev, &DeviceAttrCoredump) {
+            return err_remove_driver(e);
+        }
+
+        return Ok(());
     }
 
     pub fn add_groups(
@@ -287,9 +331,9 @@ impl DriverMatcher<&str> for DriverMatchName {
 }
 
 /// enum probe_type - device driver probe type to try
-///	Device drivers may opt in for special handling of their
-///	respective probe routines. This tells the core what to
-///	expect and prefer.
+/// Device drivers may opt in for special handling of their
+/// respective probe routines. This tells the core what to
+/// expect and prefer.
 ///
 /// Note that the end goal is to switch the kernel to use asynchronous
 /// probing by default, so annotating drivers with
@@ -297,26 +341,21 @@ impl DriverMatcher<&str> for DriverMatchName {
 /// to speed up boot process while we are validating the rest of the
 /// drivers.
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub enum DriverProbeType {
-    /// Used by drivers that work equally well
-    ///	whether probed synchronously or asynchronously.
-    DefaultStrategy,
-
     /// Drivers for "slow" devices which
-    ///	probing order is not essential for booting the system may
-    ///	opt into executing their probes asynchronously.
+    /// probing order is not essential for booting the system may
+    /// opt into executing their probes asynchronously.
     PreferAsync,
 
     /// Use this to annotate drivers that need
-    ///	their probe routines to run synchronously with driver and
-    ///	device registration (with the exception of -EPROBE_DEFER
-    ///	handling - re-probing always ends up being done asynchronously).
+    /// their probe routines to run synchronously with driver and
+    /// device registration (with the exception of -EPROBE_DEFER
+    /// handling - re-probing always ends up being done asynchronously).
     ForceSync,
-}
 
-impl Default for DriverProbeType {
-    fn default() -> Self {
-        DriverProbeType::DefaultStrategy
-    }
+    #[default]
+    /// Used by drivers that work equally well
+    /// whether probed synchronously or asynchronously.
+    DefaultStrategy,
 }

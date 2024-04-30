@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use alloc::{sync::Arc, vec::Vec};
+use alloc::sync::Arc;
 use system_error::SystemError;
 
 use crate::{
@@ -220,13 +220,12 @@ impl BiosParameterBlockFAT32 {
 
 impl BiosParameterBlock {
     pub fn new(partition: Arc<Partition>) -> Result<BiosParameterBlock, SystemError> {
-        let mut v = Vec::with_capacity(LBA_SIZE);
-        v.resize(LBA_SIZE, 0);
+        let mut v = vec![0; LBA_SIZE];
 
         // 读取分区的引导扇区
         partition
             .disk()
-            .read_at(partition.lba_start as usize, 1, &mut v)?;
+            .read_at_sync(partition.lba_start as usize, 1, &mut v)?;
 
         // 获取指针对象
         let mut cursor = VecCursor::new(v);
@@ -248,19 +247,20 @@ impl BiosParameterBlock {
         bpb.hidden_sectors = cursor.read_u32()?;
         bpb.total_sectors_32 = cursor.read_u32()?;
 
-        let mut bpb32 = BiosParameterBlockFAT32::default();
-        bpb32.fat_size_32 = cursor.read_u32()?;
-        bpb32.ext_flags = cursor.read_u16()?;
-        bpb32.fs_version = cursor.read_u16()?;
-        bpb32.root_cluster = cursor.read_u32()?;
-        bpb32.fs_info = cursor.read_u16()?;
-        bpb32.backup_boot_sec = cursor.read_u16()?;
-
+        let mut bpb32 = BiosParameterBlockFAT32 {
+            fat_size_32: cursor.read_u32()?,
+            ext_flags: cursor.read_u16()?,
+            fs_version: cursor.read_u16()?,
+            root_cluster: cursor.read_u32()?,
+            fs_info: cursor.read_u16()?,
+            backup_boot_sec: cursor.read_u16()?,
+            drive_num: cursor.read_u8()?,
+            reserved1: cursor.read_u8()?,
+            boot_sig: cursor.read_u8()?,
+            volume_id: cursor.read_u32()?,
+            ..Default::default()
+        };
         cursor.read_exact(&mut bpb32.reserved0)?;
-        bpb32.drive_num = cursor.read_u8()?;
-        bpb32.reserved1 = cursor.read_u8()?;
-        bpb32.boot_sig = cursor.read_u8()?;
-        bpb32.volume_id = cursor.read_u32()?;
         cursor.read_exact(&mut bpb32.volume_label)?;
         cursor.read_exact(&mut bpb32.filesystem_type)?;
 

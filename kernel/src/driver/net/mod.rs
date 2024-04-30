@@ -4,15 +4,16 @@ use smoltcp::{
     wire::{self, EthernetAddress},
 };
 
-use super::base::device::driver::Driver;
+use super::base::device::Device;
 use crate::libs::spinlock::SpinLock;
 use system_error::SystemError;
 
 mod dma;
 pub mod e1000e;
+pub mod irq_handle;
 pub mod virtio_net;
 
-pub trait NetDriver: Driver {
+pub trait NetDevice: Device {
     /// @brief 获取网卡的MAC地址
     fn mac(&self) -> EthernetAddress;
 

@@ -1,7 +1,6 @@
 use super::{_port, hba::HbaCmdTable, virt_2_phys};
 use crate::driver::base::block::block_device::{BlockDevice, BlockId};
 use crate::driver::base::block::disk_info::Partition;
-use crate::driver::base::block::SeekFrom;
 use crate::driver::base::class::Class;
 use crate::driver::base::device::bus::Bus;
 
@@ -14,9 +13,8 @@ use crate::driver::disk::ahci::HBA_PxIS_TFES;
 use crate::filesystem::kernfs::KernFSInode;
 use crate::filesystem::mbr::MbrDiskPartionTable;
 
-use crate::kdebug;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
-use crate::libs::{spinlock::SpinLock, vec_cursor::VecCursor};
+use crate::libs::spinlock::SpinLock;
 use crate::mm::{phys_2_virt, verify_area, VirtAddr};
 use crate::{
     driver::disk::ahci::hba::{
@@ -69,9 +67,9 @@ impl AhciDisk {
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
         assert!((buf.len() & 511) == 0);
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        compiler_fence(Ordering::SeqCst);
         let check_length = ((count - 1) >> 4) + 1; // prdt length
-        if count * 512 > buf.len() || check_length > 8 as usize {
+        if count * 512 > buf.len() || check_length > 8_usize {
             kerror!("ahci read: e2big");
             // 不可能的操作
             return Err(SystemError::E2BIG);
@@ -91,8 +89,7 @@ impl AhciDisk {
         #[allow(unused_unsafe)]
         let cmdheader: &mut HbaCmdHeader = unsafe {
             (phys_2_virt(
-                volatile_read!(port.clb) as usize
-                    + slot as usize * size_of::<HbaCmdHeader>() as usize,
+                volatile_read!(port.clb) as usize + slot as usize * size_of::<HbaCmdHeader>(),
             ) as *mut HbaCmdHeader)
                 .as_mut()
                 .unwrap()
@@ -109,10 +106,9 @@ impl AhciDisk {
         // 由于目前的内存管理机制无法把用户空间的内存地址转换为物理地址，所以只能先把数据拷贝到内核空间
         // TODO：在内存管理重构后，可以直接使用用户空间的内存地址
 
-        let user_buf = verify_area(VirtAddr::new(buf_ptr as usize), buf.len()).is_ok();
+        let user_buf = verify_area(VirtAddr::new(buf_ptr), buf.len()).is_ok();
         let mut kbuf = if user_buf {
-            let mut x: Vec<u8> = Vec::new();
-            x.resize(buf.len(), 0);
+            let x: Vec<u8> = vec![0; buf.len()];
             Some(x)
         } else {
             None
@@ -206,7 +202,7 @@ impl AhciDisk {
             buf.copy_from_slice(kbuf.as_ref().unwrap());
         }
 
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        compiler_fence(Ordering::SeqCst);
         // successfully read
         return Ok(count * 512);
     }
@@ -218,9 +214,9 @@ impl AhciDisk {
         buf: &[u8],
     ) -> Result<usize, SystemError> {
         assert!((buf.len() & 511) == 0);
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        compiler_fence(Ordering::SeqCst);
         let check_length = ((count - 1) >> 4) + 1; // prdt length
-        if count * 512 > buf.len() || check_length > 8 as usize {
+        if count * 512 > buf.len() || check_length > 8 {
             // 不可能的操作
             return Err(SystemError::E2BIG);
         } else if count == 0 {
@@ -237,21 +233,20 @@ impl AhciDisk {
             return Err(SystemError::EIO);
         }
 
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        compiler_fence(Ordering::SeqCst);
         #[allow(unused_unsafe)]
         let cmdheader: &mut HbaCmdHeader = unsafe {
             (phys_2_virt(
-                volatile_read!(port.clb) as usize
-                    + slot as usize * size_of::<HbaCmdHeader>() as usize,
+                volatile_read!(port.clb) as usize + slot as usize * size_of::<HbaCmdHeader>(),
             ) as *mut HbaCmdHeader)
                 .as_mut()
                 .unwrap()
         };
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        compiler_fence(Ordering::SeqCst);
 
         volatile_write_bit!(
             cmdheader.cfl,
-            (1 << 5) - 1 as u8,
+            (1 << 5) - 1_u8,
             (size_of::<FisRegH2D>() / size_of::<u32>()) as u8
         ); // Command FIS size
 
@@ -259,14 +254,14 @@ impl AhciDisk {
         volatile_write!(cmdheader.prdtl, check_length as u16); // PRDT entries count
 
         // 设置数据存放地址
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        compiler_fence(Ordering::SeqCst);
         let mut buf_ptr = buf as *const [u8] as *mut usize as usize;
 
         // 由于目前的内存管理机制无法把用户空间的内存地址转换为物理地址，所以只能先把数据拷贝到内核空间
         // TODO：在内存管理重构后，可以直接使用用户空间的内存地址
-        let user_buf = verify_area(VirtAddr::new(buf_ptr as usize), buf.len()).is_ok();
+        let user_buf = verify_area(VirtAddr::new(buf_ptr), buf.len()).is_ok();
         let mut kbuf = if user_buf {
-            let mut x: Vec<u8> = Vec::with_capacity(buf.len());
+            let mut x: Vec<u8> = vec![0; buf.len()];
             x.resize(buf.len(), 0);
             x.copy_from_slice(buf);
             Some(x)
@@ -285,7 +280,7 @@ impl AhciDisk {
                 .unwrap()
         };
         let mut tmp_count = count;
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        compiler_fence(Ordering::SeqCst);
 
         unsafe {
             // 清空整个table的旧数据
@@ -346,7 +341,7 @@ impl AhciDisk {
             }
         }
 
-        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        compiler_fence(Ordering::SeqCst);
         // successfully read
         return Ok(count * 512);
     }
@@ -365,70 +360,29 @@ impl LockedAhciDisk {
         port_num: u8,
     ) -> Result<Arc<LockedAhciDisk>, SystemError> {
         // 构建磁盘结构体
-        let result: Arc<LockedAhciDisk> = Arc::new(LockedAhciDisk(SpinLock::new(AhciDisk {
-            name,
-            flags,
-            partitions: Default::default(),
-            ctrl_num,
-            port_num,
-            self_ref: Weak::default(),
-        })));
-
+        let result: Arc<LockedAhciDisk> = Arc::new_cyclic(|self_ref| {
+            LockedAhciDisk(SpinLock::new(AhciDisk {
+                name,
+                flags,
+                partitions: Default::default(),
+                ctrl_num,
+                port_num,
+                self_ref: self_ref.clone(),
+            }))
+        });
         let table: MbrDiskPartionTable = result.read_mbr_table()?;
 
         // 求出有多少可用分区
-        for i in 0..4 {
-            compiler_fence(Ordering::SeqCst);
-            if table.dpte[i].part_type != 0 {
-                let w = Arc::downgrade(&result);
-                result.0.lock().partitions.push(Partition::new(
-                    table.dpte[i].starting_sector() as u64,
-                    table.dpte[i].starting_lba as u64,
-                    table.dpte[i].total_sectors as u64,
-                    w,
-                    i as u16,
-                ));
-            }
-        }
-
-        result.0.lock().self_ref = Arc::downgrade(&result);
+        let partitions = table.partitions(Arc::downgrade(&result) as Weak<dyn BlockDevice>);
+        result.0.lock().partitions = partitions;
 
         return Ok(result);
     }
 
-    /// @brief: 从磁盘中读取 MBR 分区表结构体 TODO: Cursor
+    /// @brief: 从磁盘中读取 MBR 分区表结构体
     pub fn read_mbr_table(&self) -> Result<MbrDiskPartionTable, SystemError> {
-        let mut table: MbrDiskPartionTable = Default::default();
-
-        // 数据缓冲区
-        let mut buf: Vec<u8> = Vec::new();
-        buf.resize(size_of::<MbrDiskPartionTable>(), 0);
-
-        self.read_at(0, 1, &mut buf)?;
-        // 创建 Cursor 用于按字节读取
-        let mut cursor = VecCursor::new(buf);
-        cursor.seek(SeekFrom::SeekCurrent(446))?;
-
-        for i in 0..4 {
-            kdebug!("infomation of partition {}:\n", i);
-
-            table.dpte[i].flags = cursor.read_u8()?;
-            table.dpte[i].starting_head = cursor.read_u8()?;
-            table.dpte[i].starting_sector_cylinder = cursor.read_u16()?;
-            table.dpte[i].part_type = cursor.read_u8()?;
-            table.dpte[i].ending_head = cursor.read_u8()?;
-            table.dpte[i].ending_sector_cylingder = cursor.read_u16()?;
-            table.dpte[i].starting_lba = cursor.read_u32()?;
-            table.dpte[i].total_sectors = cursor.read_u32()?;
-
-            kdebug!("dpte[i] = {:?}", table.dpte[i]);
-        }
-        table.bs_trailsig = cursor.read_u16()?;
-        // kdebug!("bs_trailsig = {}", unsafe {
-        //     read_unaligned(addr_of!(table.bs_trailsig))
-        // });
-
-        return Ok(table);
+        let disk = self.0.lock().self_ref.upgrade().unwrap() as Arc<dyn BlockDevice>;
+        MbrDiskPartionTable::from_disk(disk)
     }
 }
 
@@ -531,7 +485,7 @@ impl Device for LockedAhciDisk {
         todo!()
     }
 
-    fn set_class(&self, _class: Option<Arc<dyn Class>>) {
+    fn set_class(&self, _class: Option<Weak<dyn Class>>) {
         todo!()
     }
 }
@@ -565,7 +519,7 @@ impl BlockDevice for LockedAhciDisk {
     }
 
     #[inline]
-    fn read_at(
+    fn read_at_sync(
         &self,
         lba_id_start: BlockId, // 起始lba编号
         count: usize,          // 读取lba的数量
@@ -575,7 +529,7 @@ impl BlockDevice for LockedAhciDisk {
     }
 
     #[inline]
-    fn write_at(
+    fn write_at_sync(
         &self,
         lba_id_start: BlockId,
         count: usize,

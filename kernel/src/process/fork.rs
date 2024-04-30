@@ -10,6 +10,8 @@ use crate::{
     libs::rwlock::RwLock,
     mm::VirtAddr,
     process::ProcessFlags,
+    sched::{sched_cgroup_fork, sched_fork},
+    smp::core::smp_get_processor_id,
     syscall::user_access::UserBufferWriter,
 };
 
@@ -151,7 +153,7 @@ impl ProcessManager {
     ///
     /// - fork失败的话，子线程不会执行。
     pub fn fork(
-        current_trapframe: &mut TrapFrame,
+        current_trapframe: &TrapFrame,
         clone_flags: CloneFlags,
     ) -> Result<Pid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
@@ -165,8 +167,15 @@ impl ProcessManager {
         let mut args = KernelCloneArgs::new();
         args.flags = clone_flags;
         args.exit_signal = Signal::SIGCHLD;
-
-        Self::copy_process(&current_pcb, &pcb, args, current_trapframe)?;
+        Self::copy_process(&current_pcb, &pcb, args, current_trapframe).map_err(|e| {
+            kerror!(
+                "fork: Failed to copy process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.pid(),
+                pcb.pid(),
+                e
+            );
+            e
+        })?;
         ProcessManager::add_pcb(pcb.clone());
 
         // 向procfs注册进程
@@ -177,6 +186,8 @@ impl ProcessManager {
                 e
             )
         });
+
+        pcb.sched_info().set_on_cpu(Some(smp_get_processor_id()));
 
         ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
             panic!(
@@ -196,7 +207,7 @@ impl ProcessManager {
         if clone_flags.contains(CloneFlags::CLONE_VM) {
             new_pcb.flags().insert(ProcessFlags::VFORK);
         }
-        *new_pcb.flags.get_mut() = ProcessManager::current_pcb().flags().clone();
+        *new_pcb.flags.get_mut() = *ProcessManager::current_pcb().flags();
         return Ok(());
     }
 
@@ -275,8 +286,7 @@ impl ProcessManager {
         }
 
         if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
-            (*new_pcb.sig_struct_irqsave()).handlers =
-                current_pcb.sig_struct_irqsave().handlers.clone();
+            new_pcb.sig_struct_irqsave().handlers = current_pcb.sig_struct_irqsave().handlers;
         }
         return Ok(());
     }
@@ -300,7 +310,7 @@ impl ProcessManager {
         current_pcb: &Arc<ProcessControlBlock>,
         pcb: &Arc<ProcessControlBlock>,
         clone_args: KernelCloneArgs,
-        current_trapframe: &mut TrapFrame,
+        current_trapframe: &TrapFrame,
     ) -> Result<(), SystemError> {
         let clone_flags = clone_args.flags;
         // 不允许与不同namespace的进程共享根目录
@@ -329,10 +339,10 @@ impl ProcessManager {
 
         // 如果新进程使用不同的 pid 或 namespace，
         // 则不允许它与分叉任务共享线程组。
-        if clone_flags.contains(CloneFlags::CLONE_THREAD) {
-            if clone_flags.contains(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWPID) {
-                return Err(SystemError::EINVAL);
-            }
+        if clone_flags.contains(CloneFlags::CLONE_THREAD)
+            && clone_flags.contains(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWPID)
+        {
+            return Err(SystemError::EINVAL);
             // TODO: 判断新进程与当前进程namespace是否相同，不同则返回错误
         }
 
@@ -363,12 +373,12 @@ impl ProcessManager {
 
         // 设置clear_child_tid，在线程结束时将其置0以通知父进程
         if clone_flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
-            pcb.thread.write().clear_child_tid = Some(clone_args.child_tid);
+            pcb.thread.write_irqsave().clear_child_tid = Some(clone_args.child_tid);
         }
 
         // 设置child_tid，意味着子线程能够知道自己的id
         if clone_flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
-            pcb.thread.write().set_child_tid = Some(clone_args.child_tid);
+            pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
         }
 
         // 将子进程/线程的id存储在用户态传进的地址中
@@ -382,8 +392,15 @@ impl ProcessManager {
             writer.copy_one_to_user(&(pcb.pid().0 as i32), 0)?;
         }
 
+        sched_fork(pcb).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to set sched info from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.pid(), pcb.pid(), e
+            )
+        });
+
         // 拷贝标志位
-        Self::copy_flags(&clone_flags, &pcb).unwrap_or_else(|e| {
+        Self::copy_flags(&clone_flags, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy flags from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e
@@ -391,7 +408,7 @@ impl ProcessManager {
         });
 
         // 拷贝用户地址空间
-        Self::copy_mm(&clone_flags, &current_pcb, &pcb).unwrap_or_else(|e| {
+        Self::copy_mm(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy mm from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e
@@ -399,7 +416,7 @@ impl ProcessManager {
         });
 
         // 拷贝文件描述符表
-        Self::copy_files(&clone_flags, &current_pcb, &pcb).unwrap_or_else(|e| {
+        Self::copy_files(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy files from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e
@@ -407,15 +424,15 @@ impl ProcessManager {
         });
 
         // 拷贝信号相关数据
-        Self::copy_sighand(&clone_flags, &current_pcb, &pcb).map_err(|e| {
+        Self::copy_sighand(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy sighand from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e
             )
-        })?;
+        });
 
         // 拷贝线程
-        Self::copy_thread(&current_pcb, &pcb, clone_args,&current_trapframe).unwrap_or_else(|e| {
+        Self::copy_thread(current_pcb, pcb, clone_args,current_trapframe).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy thread from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e
@@ -424,13 +441,14 @@ impl ProcessManager {
 
         // 设置线程组id、组长
         if clone_flags.contains(CloneFlags::CLONE_THREAD) {
-            pcb.thread.write().group_leader = current_pcb.thread.read().group_leader.clone();
+            pcb.thread.write_irqsave().group_leader =
+                current_pcb.thread.read_irqsave().group_leader.clone();
             unsafe {
                 let ptr = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
                 (*ptr).tgid = current_pcb.tgid;
             }
         } else {
-            pcb.thread.write().group_leader = Arc::downgrade(&pcb);
+            pcb.thread.write_irqsave().group_leader = Arc::downgrade(pcb);
             unsafe {
                 let ptr = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
                 (*ptr).tgid = pcb.tgid;
@@ -439,12 +457,13 @@ impl ProcessManager {
 
         // CLONE_PARENT re-uses the old parent
         if clone_flags.contains(CloneFlags::CLONE_PARENT | CloneFlags::CLONE_THREAD) {
-            *pcb.real_parent_pcb.write() = current_pcb.real_parent_pcb.read().clone();
+            *pcb.real_parent_pcb.write_irqsave() =
+                current_pcb.real_parent_pcb.read_irqsave().clone();
 
             if clone_flags.contains(CloneFlags::CLONE_THREAD) {
                 pcb.exit_signal.store(Signal::INVALID, Ordering::SeqCst);
             } else {
-                let leader = current_pcb.thread.read().group_leader();
+                let leader = current_pcb.thread.read_irqsave().group_leader();
                 if unlikely(leader.is_none()) {
                     panic!(
                         "fork: Failed to get leader of current process, current pid: [{:?}]",
@@ -459,12 +478,14 @@ impl ProcessManager {
             }
         } else {
             // 新创建的进程，设置其父进程为当前进程
-            *pcb.real_parent_pcb.write() = Arc::downgrade(&current_pcb);
+            *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
             pcb.exit_signal
                 .store(clone_args.exit_signal, Ordering::SeqCst);
         }
 
         // todo: 增加线程组相关的逻辑。 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/fork.c#2437
+
+        sched_cgroup_fork(pcb);
 
         Ok(())
     }

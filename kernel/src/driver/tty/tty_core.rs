@@ -1,18 +1,27 @@
-use core::{fmt::Debug, sync::atomic::AtomicBool};
+use core::{
+    fmt::Debug,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{
+    collections::LinkedList,
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use system_error::SystemError;
 
 use crate::{
+    driver::{serial::serial8250::send_to_default_serial8250_port, tty::pty::ptm_driver},
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::EventWaitQueue,
     },
     mm::VirtAddr,
-    net::event_poll::EPollEventType,
+    net::event_poll::{EPollEventType, EPollItem},
     process::Pid,
-    syscall::user_access::UserBufferWriter,
+    syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
 use super::{
@@ -33,6 +42,14 @@ pub struct TtyCore {
     line_discipline: Arc<dyn TtyLineDiscipline>,
 }
 
+impl Drop for TtyCore {
+    fn drop(&mut self) {
+        if self.core.driver().tty_driver_sub_type() == TtyDriverSubType::PtySlave {
+            ptm_driver().ttys().remove(&self.core().index);
+        }
+    }
+}
+
 impl TtyCore {
     pub fn new(driver: Arc<TtyDriver>, index: usize) -> Arc<Self> {
         let name = driver.tty_line_name(index);
@@ -42,7 +59,7 @@ impl TtyCore {
             termios: RwLock::new(termios),
             name,
             flags: RwLock::new(TtyFlag::empty()),
-            count: RwLock::new(0),
+            count: AtomicUsize::new(0),
             window_size: RwLock::new(WindowSize::default()),
             read_wq: EventWaitQueue::new(),
             write_wq: EventWaitQueue::new(),
@@ -51,6 +68,8 @@ impl TtyCore {
             ctrl: SpinLock::new(TtyContorlInfo::default()),
             closing: AtomicBool::new(false),
             flow: SpinLock::new(TtyFlowState::default()),
+            link: RwLock::default(),
+            epitems: SpinLock::new(LinkedList::new()),
         };
 
         return Arc::new(Self {
@@ -69,6 +88,13 @@ impl TtyCore {
     #[inline]
     pub fn ldisc(&self) -> Arc<dyn TtyLineDiscipline> {
         self.line_discipline.clone()
+    }
+
+    pub fn write_without_serial(&self, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
+        self.core
+            .driver()
+            .driver_funcs()
+            .write(self.core(), buf, nr)
     }
 
     pub fn reopen(&self) -> Result<(), SystemError> {
@@ -119,24 +145,27 @@ impl TtyCore {
     }
 
     pub fn tty_wakeup(&self) {
-        if self.core.flags.read().contains(TtyFlag::DO_WRITE_WAKEUP) {
+        if self.core.flags().contains(TtyFlag::DO_WRITE_WAKEUP) {
             let _ = self.ldisc().write_wakeup(self.core());
         }
 
         self.core()
             .write_wq
-            .wakeup(EPollEventType::EPOLLOUT.bits() as u64);
+            .wakeup_any(EPollEventType::EPOLLOUT.bits() as u64);
     }
 
-    pub fn tty_mode_ioctl(
-        &self,
-        tty: Arc<TtyCore>,
-        cmd: u32,
-        arg: usize,
-    ) -> Result<usize, SystemError> {
+    pub fn tty_mode_ioctl(tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<usize, SystemError> {
+        let core = tty.core();
+        let real_tty = if core.driver().tty_driver_type() == TtyDriverType::Pty
+            && core.driver().tty_driver_sub_type() == TtyDriverSubType::PtyMaster
+        {
+            core.link().unwrap()
+        } else {
+            tty
+        };
         match cmd {
             TtyIoctlCmd::TCGETS => {
-                let termios = PosixTermios::from_kernel_termios(self.core.termios().clone());
+                let termios = PosixTermios::from_kernel_termios(*real_tty.core.termios());
                 let mut user_writer = UserBufferWriter::new(
                     VirtAddr::new(arg).as_ptr::<PosixTermios>(),
                     core::mem::size_of::<PosixTermios>(),
@@ -146,9 +175,16 @@ impl TtyCore {
                 user_writer.copy_one_to_user(&termios, 0)?;
                 return Ok(0);
             }
+            TtyIoctlCmd::TCSETS => {
+                return TtyCore::core_set_termios(
+                    real_tty,
+                    VirtAddr::new(arg),
+                    TtySetTermiosOpt::TERMIOS_OLD,
+                );
+            }
             TtyIoctlCmd::TCSETSW => {
-                return self.core_set_termios(
-                    tty,
+                return TtyCore::core_set_termios(
+                    real_tty,
                     VirtAddr::new(arg),
                     TtySetTermiosOpt::TERMIOS_WAIT | TtySetTermiosOpt::TERMIOS_OLD,
                 );
@@ -160,27 +196,31 @@ impl TtyCore {
     }
 
     pub fn core_set_termios(
-        &self,
         tty: Arc<TtyCore>,
         arg: VirtAddr,
         opt: TtySetTermiosOpt,
     ) -> Result<usize, SystemError> {
-        let tmp_termios = self.core().termios().clone();
+        #[allow(unused_assignments)]
+        // TERMIOS_TERMIO下会用到
+        let mut tmp_termios = *tty.core().termios();
 
         if opt.contains(TtySetTermiosOpt::TERMIOS_TERMIO) {
             todo!()
         } else {
-            let mut user_writer = UserBufferWriter::new(
+            let user_reader = UserBufferReader::new(
                 arg.as_ptr::<PosixTermios>(),
                 core::mem::size_of::<PosixTermios>(),
                 true,
             )?;
 
-            user_writer.copy_one_to_user(&tmp_termios, 0)?;
+            let mut term = PosixTermios::default();
+            user_reader.copy_one_from_user(&mut term, 0)?;
+
+            tmp_termios = term.to_kernel_termios();
         }
 
         if opt.contains(TtySetTermiosOpt::TERMIOS_FLUSH) {
-            let ld = self.ldisc();
+            let ld = tty.ldisc();
             let _ = ld.flush_buffer(tty.clone());
         }
 
@@ -188,25 +228,21 @@ impl TtyCore {
             // TODO
         }
 
-        self.set_termios_next(tty, tmp_termios)?;
+        TtyCore::set_termios_next(tty, tmp_termios)?;
         Ok(0)
     }
 
-    pub fn set_termios_next(
-        &self,
-        tty: Arc<TtyCore>,
-        new_termios: Termios,
-    ) -> Result<(), SystemError> {
-        let mut termios = self.core().termios_write();
+    pub fn set_termios_next(tty: Arc<TtyCore>, new_termios: Termios) -> Result<(), SystemError> {
+        let mut termios = tty.core().termios_write();
 
-        let old_termios = termios.clone();
-
+        let old_termios = *termios;
         *termios = new_termios;
-
         let tmp = termios.control_mode;
         termios.control_mode ^= (tmp ^ old_termios.control_mode) & ControlMode::ADDRB;
 
-        let ret = self.set_termios(tty.clone(), old_termios);
+        drop(termios);
+        let ret = tty.set_termios(tty.clone(), old_termios);
+        let mut termios = tty.core().termios_write();
         if ret.is_err() {
             termios.control_mode &= ControlMode::HUPCL | ControlMode::CREAD | ControlMode::CLOCAL;
             termios.control_mode |= old_termios.control_mode
@@ -216,14 +252,20 @@ impl TtyCore {
         }
 
         drop(termios);
-        let ld = self.ldisc();
+        let ld = tty.ldisc();
         ld.set_termios(tty, Some(old_termios))?;
 
         Ok(())
     }
+
+    pub fn tty_do_resize(&self, windowsize: WindowSize) -> Result<(), SystemError> {
+        // TODO: 向前台进程发送信号
+        *self.core.window_size_write() = windowsize;
+        Ok(())
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct TtyContorlInfo {
     /// 前台进程pid
     pub session: Option<Pid>,
@@ -231,19 +273,8 @@ pub struct TtyContorlInfo {
     pub pgid: Option<Pid>,
 
     /// packet模式下使用，目前未用到
-    pub pktstatus: u8,
+    pub pktstatus: TtyPacketStatus,
     pub packet: bool,
-}
-
-impl Default for TtyContorlInfo {
-    fn default() -> Self {
-        Self {
-            session: None,
-            pgid: None,
-            pktstatus: Default::default(),
-            packet: Default::default(),
-        }
-    }
 }
 
 #[derive(Debug, Default)]
@@ -270,7 +301,7 @@ pub struct TtyCoreData {
     flags: RwLock<TtyFlag>,
     /// 在初始化时即确定不会更改，所以这里不用加锁
     index: usize,
-    count: RwLock<usize>,
+    count: AtomicUsize,
     /// 窗口大小
     window_size: RwLock<WindowSize>,
     /// 读等待队列
@@ -285,6 +316,10 @@ pub struct TtyCoreData {
     closing: AtomicBool,
     /// 流控状态
     flow: SpinLock<TtyFlowState>,
+    /// 链接tty
+    link: RwLock<Weak<TtyCore>>,
+    /// epitems
+    epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
 }
 
 impl TtyCoreData {
@@ -315,29 +350,39 @@ impl TtyCoreData {
 
     #[inline]
     pub fn flags(&self) -> TtyFlag {
-        self.flags.read().clone()
+        *self.flags.read_irqsave()
+    }
+
+    #[inline]
+    pub fn flags_write(&self) -> RwLockWriteGuard<'_, TtyFlag> {
+        self.flags.write_irqsave()
     }
 
     #[inline]
     pub fn termios(&self) -> RwLockReadGuard<'_, Termios> {
-        self.termios.read()
+        self.termios.read_irqsave()
     }
 
     #[inline]
     pub fn termios_write(&self) -> RwLockWriteGuard<Termios> {
-        self.termios.write()
+        self.termios.write_irqsave()
     }
 
     #[inline]
     pub fn set_termios(&self, termios: Termios) {
-        let mut termios_guard = self.termios.write();
+        let mut termios_guard = self.termios_write();
         *termios_guard = termios;
     }
 
     #[inline]
+    pub fn count(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+
+    #[inline]
     pub fn add_count(&self) {
-        let mut guard = self.count.write();
-        *guard += 1;
+        self.count
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     }
 
     #[inline]
@@ -366,6 +411,11 @@ impl TtyCoreData {
     }
 
     #[inline]
+    pub fn window_size_write(&self) -> RwLockWriteGuard<WindowSize> {
+        self.window_size.write()
+    }
+
+    #[inline]
     pub fn is_closing(&self) -> bool {
         self.closing.load(core::sync::atomic::Ordering::SeqCst)
     }
@@ -373,6 +423,45 @@ impl TtyCoreData {
     #[inline]
     pub fn vc_data_irqsave(&self) -> SpinLockGuard<VirtualConsoleData> {
         VIRT_CONSOLES[self.index].lock_irqsave()
+    }
+
+    #[inline]
+    pub fn link(&self) -> Option<Arc<TtyCore>> {
+        self.link.read().upgrade()
+    }
+
+    pub fn checked_link(&self) -> Result<Arc<TtyCore>, SystemError> {
+        if let Some(link) = self.link() {
+            return Ok(link);
+        }
+        return Err(SystemError::ENODEV);
+    }
+
+    pub fn set_link(&self, link: Weak<TtyCore>) {
+        *self.link.write() = link;
+    }
+
+    pub fn init_termios(&self) {
+        let tty_index = self.index();
+        let driver = self.driver();
+        // 初始化termios
+        if !driver
+            .flags()
+            .contains(super::tty_driver::TtyDriverFlag::TTY_DRIVER_RESET_TERMIOS)
+        {
+            // 先查看是否有已经保存的termios
+            if let Some(t) = driver.saved_termios().get(tty_index) {
+                let mut termios = *t;
+                termios.line = driver.init_termios().line;
+                self.set_termios(termios);
+            }
+        }
+        // TODO:设置termios波特率？
+    }
+
+    #[inline]
+    pub fn add_epitem(&self, epitem: Arc<EPollItem>) {
+        self.epitems.lock().push_back(epitem)
     }
 }
 
@@ -392,6 +481,7 @@ impl TtyOperation for TtyCore {
 
     #[inline]
     fn write(&self, tty: &TtyCoreData, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
+        send_to_default_serial8250_port(buf);
         return self.core().tty_driver.driver_funcs().write(tty, buf, nr);
     }
 
@@ -438,6 +528,14 @@ impl TtyOperation for TtyCore {
             .driver_funcs()
             .set_termios(tty, old_termios);
     }
+
+    fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
+        self.core().tty_driver.driver_funcs().close(tty)
+    }
+
+    fn resize(&self, tty: Arc<TtyCore>, winsize: WindowSize) -> Result<(), SystemError> {
+        self.core.tty_driver.driver_funcs().resize(tty, winsize)
+    }
 }
 
 bitflags! {
@@ -466,6 +564,19 @@ bitflags! {
         const LDISC_CHANGING	= 1 << 20;
         /// 终端线路驱动程序已停止
         const LDISC_HALTED	= 1 << 22;
+    }
+
+    #[derive(Default)]
+    pub struct TtyPacketStatus: u8 {
+        /* Used for packet mode */
+        const TIOCPKT_DATA		=  0;
+        const TIOCPKT_FLUSHREAD	=  1;
+        const TIOCPKT_FLUSHWRITE	=  2;
+        const TIOCPKT_STOP		=  4;
+        const TIOCPKT_START		=  8;
+        const TIOCPKT_NOSTOP		= 16;
+        const TIOCPKT_DOSTOP		= 32;
+        const TIOCPKT_IOCTL		= 64;
     }
 }
 
@@ -589,4 +700,12 @@ impl TtyIoctlCmd {
     pub const TIOCCBRK: u32 = 0x5428;
     /// Return the session ID of FD
     pub const TIOCGSID: u32 = 0x5429;
+    /// 设置ptl锁标记
+    pub const TIOCSPTLCK: u32 = 0x40045431;
+    /// 获取ptl锁标记
+    pub const TIOCGPTLCK: u32 = 0x80045439;
+    /// 获取packet标记
+    pub const TIOCGPKT: u32 = 0x80045438;
+    /// 获取pts index
+    pub const TIOCGPTN: u32 = 0x80045430;
 }

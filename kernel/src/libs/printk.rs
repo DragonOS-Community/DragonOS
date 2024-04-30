@@ -4,22 +4,20 @@ use core::{
 };
 
 use alloc::string::ToString;
+use log::{info, Log};
 
 use super::lib_ui::textui::{textui_putstr, FontColor};
 
 use crate::{
-    driver::{
-        serial::serial8250::send_to_default_serial8250_port,
-        tty::{
-            tty_driver::TtyOperation, tty_port::TTY_PORTS,
-            virtual_terminal::virtual_console::CURRENT_VCNUM,
-        },
+    driver::tty::{
+        tty_driver::TtyOperation, tty_port::tty_port,
+        virtual_terminal::virtual_console::CURRENT_VCNUM,
     },
     filesystem::procfs::{
         kmsg::KMSG,
         log::{LogLevel, LogMessage},
     },
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
 #[macro_export]
@@ -33,18 +31,6 @@ macro_rules! println {
         $crate::print!("\n");
     };
     ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
-}
-
-/// 指定颜色，彩色输出
-/// @param FRcolor 前景色
-/// @param BKcolor 背景色
-#[macro_export]
-macro_rules! printk_color {
-
-    ($FRcolor:expr, $BKcolor:expr, $($arg:tt)*) => {
-        use alloc;
-        $crate::libs::printk::PrintkWriter.__write_string_color($FRcolor, $BKcolor, alloc::fmt::format(format_args!($($arg)*)).as_str())
-    };
 }
 
 #[macro_export]
@@ -104,12 +90,10 @@ impl PrintkWriter {
         let current_vcnum = CURRENT_VCNUM.load(Ordering::SeqCst);
         if current_vcnum != -1 {
             // tty已经初始化了之后才输出到屏幕
-            let port = TTY_PORTS[current_vcnum as usize].clone();
-            let tty = port.port_data().tty();
-            if tty.is_some() {
-                let tty = tty.unwrap();
+            let port = tty_port(current_vcnum as usize);
+            let tty = port.port_data().internal_tty();
+            if let Some(tty) = tty {
                 let _ = tty.write(tty.core(), s.as_bytes(), s.len());
-                send_to_default_serial8250_port(s.as_bytes());
             } else {
                 let _ = textui_putstr(s, FontColor::WHITE, FontColor::BLACK);
             }
@@ -137,12 +121,51 @@ pub struct Logger;
 impl Logger {
     pub fn log(&self, log_level: usize, message: fmt::Arguments) {
         if unsafe { KMSG.is_some() } {
-            let timestamp: TimeSpec = TimeSpec::now();
-            let log_level = LogLevel::from(log_level.clone());
+            let timestamp: PosixTimeSpec = PosixTimeSpec::now_cpu_time();
+            let log_level = LogLevel::from(log_level);
 
             let log_message = LogMessage::new(timestamp, log_level, message.to_string());
 
             unsafe { KMSG.as_ref().unwrap().lock_irqsave().push(log_message) };
         }
     }
+}
+
+/// 内核自定义日志器
+///
+/// todo: 完善他的功能，并且逐步把kinfo等宏，迁移到这个logger上面来。
+struct CustomLogger;
+
+impl Log for CustomLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        // 这里可以自定义日志过滤规则
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            // todo: 接入kmsg
+
+            writeln!(
+                PrintkWriter,
+                "[ {} ] {} ({}:{}) {}",
+                record.level(),
+                record.target(),
+                record.file().unwrap_or(""),
+                record.line().unwrap_or(0),
+                record.args()
+            )
+            .unwrap();
+        }
+    }
+
+    fn flush(&self) {
+        // 如果需要的话，可以在这里实现缓冲区刷新逻辑
+    }
+}
+
+pub fn early_init_logging() {
+    log::set_logger(&CustomLogger).unwrap();
+    log::set_max_level(log::LevelFilter::Debug);
+    info!("Logging initialized");
 }

@@ -5,8 +5,7 @@ use x86::dtables::DescriptorTablePointer;
 
 use crate::{
     arch::{interrupt::trap::arch_trap_init, process::table::TSSManager},
-    driver::pci::pci::pci_init,
-    include::bindings::bindings::cpu_init,
+    driver::clocksource::acpi_pm::init_acpi_pm_clocksource,
     init::init::start_kernel,
     kdebug,
     mm::{MemoryManagementArch, PhysAddr},
@@ -33,7 +32,6 @@ extern "C" {
     fn head_stack_start();
 
     fn multiboot2_init(mb2_info: u64, mb2_magic: u32) -> bool;
-    fn __init_set_cpu_stack_start(cpu: u32, stack_start: u64);
 }
 
 #[no_mangle]
@@ -51,9 +49,10 @@ unsafe extern "C" fn kernel_main(
     gdtp.base = gdt_vaddr.data() as *const usize;
     gdtp.limit = bsp_gdt_size as u16 - 1;
 
-    let mut idtp = DescriptorTablePointer::<usize>::default();
-    idtp.base = idt_vaddr.data() as *const usize;
-    idtp.limit = bsp_idt_size as u16 - 1;
+    let idtp = DescriptorTablePointer::<usize> {
+        base: idt_vaddr.data() as *const usize,
+        limit: bsp_idt_size as u16 - 1,
+    };
 
     x86::dtables::lgdt(&gdtp);
     x86::dtables::lidt(&idtp);
@@ -81,7 +80,6 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
 
     set_current_core_tss(stack_start, 0);
     unsafe { TSSManager::load_tr() };
-    unsafe { __init_set_cpu_stack_start(0, stack_start as u64) };
     arch_trap_init().expect("arch_trap_init failed");
 
     return Ok(());
@@ -90,20 +88,18 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
 /// 架构相关的初始化
 #[inline(never)]
 pub fn setup_arch() -> Result<(), SystemError> {
-    unsafe {
-        cpu_init();
-    }
-
-    // todo: 将来pci接入设备驱动模型之后，删掉这里。
-    pci_init();
     return Ok(());
 }
 
 /// 架构相关的初始化（在IDLE的最后一个阶段）
 #[inline(never)]
 pub fn setup_arch_post() -> Result<(), SystemError> {
-    hpet_init().expect("hpet init failed");
-    hpet_instance().hpet_enable().expect("hpet enable failed");
+    let ret = hpet_init();
+    if ret.is_ok() {
+        hpet_instance().hpet_enable().expect("hpet enable failed");
+    } else {
+        init_acpi_pm_clocksource().expect("acpi_pm_timer inits failed");
+    }
     TSCManager::init().expect("tsc init failed");
 
     return Ok(());

@@ -5,11 +5,7 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 
-use alloc::{
-    string::String,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::sync::{Arc, Weak};
 
 use kdepends::memoffset::offset_of;
 use system_error::SystemError;
@@ -20,14 +16,10 @@ use crate::{
     exception::InterruptArch,
     kerror, kwarn,
     libs::spinlock::SpinLockGuard,
-    mm::{
-        percpu::{PerCpu, PerCpuVar},
-        VirtAddr,
-    },
+    mm::VirtAddr,
     process::{
         fork::{CloneFlags, KernelCloneArgs},
-        KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager, SwitchResult,
-        SWITCH_RESULT,
+        KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager, PROCESS_SWITCH_RESULT,
     },
     syscall::Syscall,
 };
@@ -257,8 +249,8 @@ impl ArchPCBInfo {
             cr2: self.cr2,
             fsbase: self.fsbase,
             gsbase: self.gsbase,
-            fs: self.fs.clone(),
-            gs: self.gs.clone(),
+            fs: self.fs,
+            gs: self.gs,
             gsdata: self.gsdata.clone(),
             fp_state: self.fp_state,
         }
@@ -299,16 +291,7 @@ impl ProcessControlBlock {
 
 impl ProcessManager {
     pub fn arch_init() {
-        {
-            // 初始化进程切换结果 per cpu变量
-            let mut switch_res_vec: Vec<SwitchResult> = Vec::new();
-            for _ in 0..PerCpu::MAX_CPU_NUM {
-                switch_res_vec.push(SwitchResult::new());
-            }
-            unsafe {
-                SWITCH_RESULT = Some(PerCpuVar::new(switch_res_vec).unwrap());
-            }
-        }
+        // do nothing
     }
     /// fork的过程中复制线程
     ///
@@ -320,7 +303,7 @@ impl ProcessManager {
         current_trapframe: &TrapFrame,
     ) -> Result<(), SystemError> {
         let clone_flags = clone_args.flags;
-        let mut child_trapframe = current_trapframe.clone();
+        let mut child_trapframe = *current_trapframe;
 
         // 子进程的返回值为0
         child_trapframe.set_return_value(0);
@@ -351,7 +334,7 @@ impl ProcessManager {
         new_arch_guard.gsbase = current_arch_guard.gsbase;
         new_arch_guard.fs = current_arch_guard.fs;
         new_arch_guard.gs = current_arch_guard.gs;
-        new_arch_guard.fp_state = current_arch_guard.fp_state.clone();
+        new_arch_guard.fp_state = current_arch_guard.fp_state;
 
         // 拷贝浮点寄存器的状态
         if let Some(fp_state) = current_arch_guard.fp_state.as_ref() {
@@ -383,7 +366,7 @@ impl ProcessManager {
     /// - `prev`：上一个进程的pcb
     /// - `next`：下一个进程的pcb
     pub unsafe fn switch_process(prev: Arc<ProcessControlBlock>, next: Arc<ProcessControlBlock>) {
-        assert!(CurrentIrqArch::is_irq_enabled() == false);
+        assert!(!CurrentIrqArch::is_irq_enabled());
 
         // 保存浮点寄存器
         prev.arch_info_irqsave().save_fp_state();
@@ -421,8 +404,8 @@ impl ProcessManager {
             x86::Ring::Ring0,
             next.kernel_stack().stack_max_address().data() as u64,
         );
-        SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
-        SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
+        PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
+        PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
         // kdebug!("switch tss ok");
         compiler_fence(Ordering::SeqCst);
         // 正式切换上下文
@@ -473,9 +456,6 @@ unsafe extern "sysv64" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut Arc
         // mov fs, [rsi + {off_fs}]
         // mov gs, [rsi + {off_gs}]
 
-        push rbp
-        push rax
-
         mov [rdi + {off_rbp}], rbp
         mov rbp, [rsi + {off_rbp}]
 
@@ -522,20 +502,12 @@ unsafe extern "sysv64" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut Arc
     );
 }
 
-/// 从`switch_to_inner`返回后，执行这个函数
-///
-/// 也就是说，当进程再次被调度时，会从这里开始执行
-#[inline(never)]
-unsafe extern "sysv64" fn switch_back() {
-    asm!(concat!(
-        "
-        pop rax
-        pop rbp
-        "
-    ))
+#[naked]
+unsafe extern "sysv64" fn switch_back() -> ! {
+    asm!("ret", options(noreturn));
 }
 
-pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<String>) -> ! {
+pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
     // 以下代码不能发生中断
     CurrentIrqArch::interrupt_disable();
 
@@ -544,7 +516,6 @@ pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<Str
         current_pcb.kernel_stack().stack_max_address().data() - core::mem::size_of::<TrapFrame>(),
     );
     // kdebug!("trap_frame_vaddr: {:?}", trap_frame_vaddr);
-    let new_rip = VirtAddr::new(ret_from_intr as usize);
 
     assert!(
         (x86::current::registers::rsp() as usize) < trap_frame_vaddr.data(),
@@ -555,6 +526,7 @@ pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<Str
         trap_frame_vaddr.data()
     );
 
+    let new_rip = VirtAddr::new(ret_from_intr as usize);
     let mut arch_guard = current_pcb.arch_info_irqsave();
     arch_guard.rsp = trap_frame_vaddr.data();
 
@@ -572,25 +544,10 @@ pub unsafe fn arch_switch_to_user(path: String, argv: Vec<String>, envp: Vec<Str
 
     drop(arch_guard);
 
-    // 删除kthread的标志
-    current_pcb.flags().remove(ProcessFlags::KTHREAD);
-    current_pcb.worker_private().take();
-
-    let mut trap_frame = TrapFrame::new();
-
-    compiler_fence(Ordering::SeqCst);
-    Syscall::do_execve(path, argv, envp, &mut trap_frame).unwrap_or_else(|e| {
-        panic!(
-            "arch_switch_to_user(): pid: {pid:?}, Failed to execve: , error: {e:?}",
-            pid = current_pcb.pid(),
-            e = e
-        );
-    });
+    drop(current_pcb);
     compiler_fence(Ordering::SeqCst);
 
     // 重要！在这里之后，一定要保证上面的引用计数变量、动态申请的变量、锁的守卫都被drop了，否则可能导致内存安全问题！
-
-    drop(current_pcb);
 
     compiler_fence(Ordering::SeqCst);
     ready_to_switch_to_user(trap_frame, trap_frame_vaddr.data(), new_rip.data());
@@ -604,6 +561,7 @@ unsafe extern "sysv64" fn ready_to_switch_to_user(
     new_rip: usize,
 ) -> ! {
     *(trapframe_vaddr as *mut TrapFrame) = trap_frame;
+    compiler_fence(Ordering::SeqCst);
     asm!(
         "swapgs",
         "mov rsp, {trapframe_vaddr}",
@@ -614,3 +572,35 @@ unsafe extern "sysv64" fn ready_to_switch_to_user(
     );
     unreachable!()
 }
+
+// bitflags! {
+//     pub struct ProcessThreadFlags: u32 {
+//     /*
+//     * thread information flags
+//     * - these are process state flags that various assembly files
+//     *   may need to access
+//     */
+//     const TIF_NOTIFY_RESUME	= 1 << 1;	/* callback before returning to user */
+//     const TIF_SIGPENDING	=	1 << 2;	/* signal pending */
+//     const TIF_NEED_RESCHED	= 1 << 3;	/* rescheduling necessary */
+//     const TIF_SINGLESTEP	=	1 << 4;	/* reenable singlestep on user return*/
+//     const TIF_SSBD		= 1 << 5;	/* Speculative store bypass disable */
+//     const TIF_SPEC_IB		= 1 << 9;	/* Indirect branch speculation mitigation */
+//     const TIF_SPEC_L1D_FLUSH	= 1 << 10;	/* Flush L1D on mm switches (processes) */
+//     const TIF_USER_RETURN_NOTIFY	= 1 << 11;	/* notify kernel of userspace return */
+//     const TIF_UPROBE		= 1 << 12;	/* breakpointed or singlestepping */
+//     const TIF_PATCH_PENDING	= 1 << 13;	/* pending live patching update */
+//     const TIF_NEED_FPU_LOAD	= 1 << 14;	/* load FPU on return to userspace */
+//     const TIF_NOCPUID		= 1 << 15;	/* CPUID is not accessible in userland */
+//     const TIF_NOTSC		= 1 << 16;	/* TSC is not accessible in userland */
+//     const TIF_NOTIFY_SIGNAL	= 1 << 17;	/* signal notifications exist */
+//     const TIF_MEMDIE		= 1 << 20;	/* is terminating due to OOM killer */
+//     const TIF_POLLING_NRFLAG	= 1 << 21;	/* idle is polling for TIF_NEED_RESCHED */
+//     const TIF_IO_BITMAP		= 1 << 22;	/* uses I/O bitmap */
+//     const TIF_SPEC_FORCE_UPDATE	= 1 << 23;	/* Force speculation MSR update in context switch */
+//     const TIF_FORCED_TF		= 1 << 24;	/* true if TF in eflags artificially */
+//     const TIF_BLOCKSTEP		= 1 << 25;	/* set when we want DEBUGCTLMSR_BTF */
+//     const TIF_LAZY_MMU_UPDATES	= 1 << 27;	/* task is updating the mmu lazily */
+//     const TIF_ADDR32		= 1 << 29;	/* 32-bit address space on 64 bits */
+//     }
+// }

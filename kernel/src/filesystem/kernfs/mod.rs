@@ -15,14 +15,14 @@ use crate::{
         rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
 use self::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 
 use super::vfs::{
     core::generate_inode_id, file::FileMode, syscall::ModeType, FilePrivateData, FileSystem,
-    FileType, FsInfo, IndexNode, InodeId, Metadata,
+    FileType, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
 };
 
 pub mod callback;
@@ -47,11 +47,23 @@ impl FileSystem for KernFS {
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         return self.root_inode.clone();
     }
+
+    fn name(&self) -> &str {
+        "kernfs"
+    }
+
+    fn super_block(&self) -> SuperBlock {
+        SuperBlock::new(
+            Magic::KER_MAGIC,
+            KernFS::KERNFS_BLOCK_SIZE,
+            KernFS::MAX_NAMELEN as u64,
+        )
+    }
 }
 
 impl KernFS {
     pub const MAX_NAMELEN: usize = 4096;
-
+    pub const KERNFS_BLOCK_SIZE: u64 = 512;
     #[allow(dead_code)]
     pub fn new() -> Arc<Self> {
         let root_inode = Self::create_root_inode();
@@ -78,9 +90,9 @@ impl KernFS {
             gid: 0,
             blk_size: 0,
             blocks: 0,
-            atime: TimeSpec::new(0, 0),
-            mtime: TimeSpec::new(0, 0),
-            ctime: TimeSpec::new(0, 0),
+            atime: PosixTimeSpec::new(0, 0),
+            mtime: PosixTimeSpec::new(0, 0),
+            ctime: PosixTimeSpec::new(0, 0),
             dev_id: 0,
             inode_id: generate_inode_id(),
             file_type: FileType::Dir,
@@ -142,7 +154,11 @@ impl IndexNode for KernFSInode {
         self
     }
 
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         if let Some(callback) = self.callback {
             let callback_data =
                 KernCallbackData::new(self.self_ref.upgrade().unwrap(), self.private_data.lock());
@@ -152,7 +168,7 @@ impl IndexNode for KernFSInode {
         return Ok(());
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -162,7 +178,7 @@ impl IndexNode for KernFSInode {
 
     fn set_metadata(&self, _metadata: &Metadata) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
@@ -177,32 +193,32 @@ impl IndexNode for KernFSInode {
         _data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 应当通过kernfs的其它方法来创建文件，而不能从用户态直接调用此方法。
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn link(&self, _name: &str, _other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
         // 应当通过kernfs的其它方法来操作文件，而不能从用户态直接调用此方法。
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn unlink(&self, _name: &str) -> Result<(), SystemError> {
         // 应当通过kernfs的其它方法来操作文件，而不能从用户态直接调用此方法。
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn rmdir(&self, _name: &str) -> Result<(), SystemError> {
         // 应当通过kernfs的其它方法来操作文件，而不能从用户态直接调用此方法。
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
-    fn move_(
+    fn move_to(
         &self,
         _old_name: &str,
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
     ) -> Result<(), SystemError> {
         // 应当通过kernfs的其它方法来操作文件，而不能从用户态直接调用此方法。
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -265,12 +281,12 @@ impl IndexNode for KernFSInode {
         _private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn truncate(&self, _len: usize) -> Result<(), SystemError> {
         // 应当通过kernfs的其它方法来操作文件，而不能从用户态直接调用此方法。
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn sync(&self) -> Result<(), SystemError> {
@@ -293,7 +309,6 @@ impl IndexNode for KernFSInode {
         self.children
             .lock()
             .keys()
-            .into_iter()
             .for_each(|x| keys.push(x.clone()));
 
         return Ok(keys);
@@ -304,7 +319,7 @@ impl IndexNode for KernFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if self.inode_type == KernInodeType::SymLink {
             let inner = self.inner.read();
@@ -331,7 +346,7 @@ impl IndexNode for KernFSInode {
 
         if self.callback.is_none() {
             kwarn!("kernfs: callback is none");
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::ENOSYS);
         }
 
         let callback_data =
@@ -348,14 +363,14 @@ impl IndexNode for KernFSInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if self.inode_type != KernInodeType::File {
             return Err(SystemError::EISDIR);
         }
 
         if self.callback.is_none() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::ENOSYS);
         }
 
         let callback_data =
@@ -506,9 +521,9 @@ impl KernFSInode {
             gid: 0,
             blk_size: 0,
             blocks: 0,
-            atime: TimeSpec::new(0, 0),
-            mtime: TimeSpec::new(0, 0),
-            ctime: TimeSpec::new(0, 0),
+            atime: PosixTimeSpec::new(0, 0),
+            mtime: PosixTimeSpec::new(0, 0),
+            ctime: PosixTimeSpec::new(0, 0),
             dev_id: 0,
             inode_id: generate_inode_id(),
             file_type: file_type.into(),
@@ -632,9 +647,9 @@ pub enum KernInodeType {
     SymLink,
 }
 
-impl Into<FileType> for KernInodeType {
-    fn into(self) -> FileType {
-        match self {
+impl From<KernInodeType> for FileType {
+    fn from(val: KernInodeType) -> Self {
+        match val {
             KernInodeType::Dir => FileType::Dir,
             KernInodeType::File => FileType::File,
             KernInodeType::SymLink => FileType::SymLink,

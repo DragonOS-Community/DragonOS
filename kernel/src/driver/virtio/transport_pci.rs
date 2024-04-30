@@ -1,30 +1,38 @@
 //! PCI transport for VirtIO.
-use crate::arch::{PciArch, TraitPciArch};
+
+use crate::driver::base::device::DeviceId;
 use crate::driver::pci::pci::{
     BusDeviceFunction, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,
     PciStandardDeviceBar, PCI_CAP_ID_VNDR,
 };
 
 use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqMsg, IRQ};
-use crate::include::bindings::bindings::pt_regs;
+use crate::driver::pci::root::pci_root_0;
+use crate::driver::virtio::irq::virtio_irq_manager;
+use crate::exception::irqdata::IrqHandlerData;
+use crate::exception::irqdesc::{IrqHandler, IrqReturn};
+
+use crate::exception::IrqNumber;
+
 use crate::libs::volatile::{
     volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
 };
 use crate::mm::VirtAddr;
-use crate::net::net_core::poll_ifaces_try_lock_onetime;
+
+use alloc::string::ToString;
+use alloc::sync::Arc;
 use core::{
     fmt::{self, Display, Formatter},
     mem::{align_of, size_of},
     ptr::{self, addr_of_mut, NonNull},
 };
+use system_error::SystemError;
 use virtio_drivers::{
     transport::{DeviceStatus, DeviceType, Transport},
     Error, Hal, PhysAddr,
 };
 
-/// The PCI vendor ID for VirtIO devices.
-/// PCI Virtio设备的vendor ID
-const VIRTIO_VENDOR_ID: u16 = 0x1af4;
+use super::VIRTIO_VENDOR_ID;
 
 /// The offset to add to a VirtIO device ID to get the corresponding PCI device ID.
 /// PCI Virtio设备的DEVICE_ID 的offset
@@ -57,7 +65,7 @@ const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 
 /// Virtio设备接收中断的设备号
-const VIRTIO_RECV_VECTOR: u16 = 56;
+const VIRTIO_RECV_VECTOR: IrqNumber = IrqNumber::new(56);
 /// Virtio设备接收中断的设备号的表项号
 const VIRTIO_RECV_VECTOR_INDEX: u16 = 0;
 // 接收的queue号
@@ -82,6 +90,7 @@ fn device_type(pci_device_id: u16) -> DeviceType {
 /// PCI transport for VirtIO.
 ///
 /// Ref: 4.1 Virtio Over PCI Bus
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PciTransport {
     device_type: DeviceType,
@@ -96,21 +105,25 @@ pub struct PciTransport {
     isr_status: NonNull<Volatile<u8>>,
     /// The VirtIO device-specific configuration within some BAR.
     config_space: Option<NonNull<[u32]>>,
-}
-
-unsafe extern "C" fn virtio_irq_hander(_irq_num: u64, _irq_paramer: u64, _regs: *mut pt_regs) {
-    // kdebug!("12345");
-    poll_ifaces_try_lock_onetime().ok();
+    irq: IrqNumber,
+    dev_id: Arc<DeviceId>,
 }
 
 impl PciTransport {
     /// Construct a new PCI VirtIO device driver for the given device function on the given PCI
     /// root controller.
     ///
+    /// ## 参数
     ///
+    /// - `device` - The PCI device structure for the VirtIO device.
+    /// - `irq_handler` - An optional handler for the device's interrupt. If `None`, a default
+    ///     handler `DefaultVirtioIrqHandler` will be used.
+    #[allow(clippy::extra_unused_type_parameters)]
     pub fn new<H: Hal>(
         device: &mut PciDeviceStructureGeneralDevice,
+        dev_id: Arc<DeviceId>,
     ) -> Result<Self, VirtioPciError> {
+        let irq = VIRTIO_RECV_VECTOR;
         let header = &device.common_header;
         let bus_device_function = header.bus_device_function;
         if header.vendor_id != VIRTIO_VENDOR_ID {
@@ -128,7 +141,7 @@ impl PciTransport {
         let standard_device = device.as_standard_device_mut().unwrap();
         // 目前缺少对PCI设备中断号的统一管理，所以这里需要指定一个中断号。不能与其他中断重复
         let irq_vector = standard_device.irq_vector_mut().unwrap();
-        irq_vector.push(VIRTIO_RECV_VECTOR);
+        irq_vector.push(irq);
         standard_device
             .irq_init(IRQ::PCI_IRQ_MSIX)
             .expect("IRQ init failed");
@@ -136,10 +149,9 @@ impl PciTransport {
         let msg = PciIrqMsg {
             irq_common_message: IrqCommonMsg::init_from(
                 0,
-                "Virtio_Recv_IRQ",
-                0,
-                virtio_irq_hander,
-                None,
+                "Virtio_IRQ".to_string(),
+                &DefaultVirtioIrqHandler,
+                dev_id.clone(),
             ),
             irq_specific_message: IrqSpecificMsg::msi_default(),
         };
@@ -156,15 +168,17 @@ impl PciTransport {
                 continue;
             }
             let struct_info = VirtioCapabilityInfo {
-                bar: PciArch::read_config(&bus_device_function, capability.offset + CAP_BAR_OFFSET)
-                    as u8,
-                offset: PciArch::read_config(
-                    &bus_device_function,
-                    capability.offset + CAP_BAR_OFFSET_OFFSET,
+                bar: pci_root_0().read_config(
+                    bus_device_function,
+                    (capability.offset + CAP_BAR_OFFSET).into(),
+                ) as u8,
+                offset: pci_root_0().read_config(
+                    bus_device_function,
+                    (capability.offset + CAP_BAR_OFFSET_OFFSET).into(),
                 ),
-                length: PciArch::read_config(
-                    &bus_device_function,
-                    capability.offset + CAP_LENGTH_OFFSET,
+                length: pci_root_0().read_config(
+                    bus_device_function,
+                    (capability.offset + CAP_LENGTH_OFFSET).into(),
                 ),
             };
 
@@ -174,9 +188,9 @@ impl PciTransport {
                 }
                 VIRTIO_PCI_CAP_NOTIFY_CFG if cap_len >= 20 && notify_cfg.is_none() => {
                     notify_cfg = Some(struct_info);
-                    notify_off_multiplier = PciArch::read_config(
-                        &bus_device_function,
-                        capability.offset + CAP_NOTIFY_OFF_MULTIPLIER_OFFSET,
+                    notify_off_multiplier = pci_root_0().read_config(
+                        bus_device_function,
+                        (capability.offset + CAP_NOTIFY_OFF_MULTIPLIER_OFFSET).into(),
                     );
                 }
                 VIRTIO_PCI_CAP_ISR_CFG if isr_cfg.is_none() => {
@@ -222,6 +236,8 @@ impl PciTransport {
             notify_off_multiplier,
             isr_status,
             config_space,
+            irq,
+            dev_id,
         })
     }
 }
@@ -258,10 +274,11 @@ impl Transport for PciTransport {
         }
     }
 
-    fn max_queue_size(&self) -> u32 {
-        // Safe because the common config pointer is valid and we checked in get_bar_region that it
-        // was aligned.
-        unsafe { volread!(self.common_cfg, queue_size) }.into()
+    fn max_queue_size(&mut self, queue: u16) -> u32 {
+        unsafe {
+            volwrite!(self.common_cfg, queue_select, queue);
+            volread!(self.common_cfg, queue_size).into()
+        }
     }
 
     fn notify(&mut self, queue: u16) {
@@ -284,6 +301,12 @@ impl Transport for PciTransport {
         unsafe {
             volwrite!(self.common_cfg, device_status, status.bits() as u8);
         }
+    }
+
+    fn get_status(&self) -> DeviceStatus {
+        // Safe because the common config pointer is valid and we checked in get_bar_region that it
+        // was aligned.
+        unsafe { DeviceStatus::from_bits_truncate(volread!(self.common_cfg, device_status).into()) }
     }
 
     fn set_guest_page_size(&mut self, _guest_page_size: u32) {
@@ -374,7 +397,9 @@ impl Transport for PciTransport {
 impl Drop for PciTransport {
     fn drop(&mut self) {
         // Reset the device when the transport is dropped.
-        self.set_status(DeviceStatus::empty())
+        self.set_status(DeviceStatus::empty());
+
+        // todo: 调用pci的中断释放函数，并且在virtio_irq_manager里面删除对应的设备的中断
     }
 }
 
@@ -543,4 +568,37 @@ fn get_bar_region_slice<T>(
 
 fn nonnull_slice_from_raw_parts<T>(data: NonNull<T>, len: usize) -> NonNull<[T]> {
     NonNull::new(ptr::slice_from_raw_parts_mut(data.as_ptr(), len)).unwrap()
+}
+
+/// `DefaultVirtioIrqHandler` 是一个默认的virtio设备中断处理程序。
+///
+/// 当虚拟设备产生中断时，该处理程序会被调用。
+///
+/// 它首先检查设备ID是否存在，然后尝试查找与设备ID关联的设备。
+/// 如果找到设备，它会调用设备的 `handle_irq` 方法来处理中断。
+/// 如果没有找到设备，它会记录一条警告并返回 `IrqReturn::NotHandled`，表示中断未被处理。
+#[derive(Debug)]
+struct DefaultVirtioIrqHandler;
+
+impl IrqHandler for DefaultVirtioIrqHandler {
+    fn handle(
+        &self,
+        irq: IrqNumber,
+        _static_data: Option<&dyn IrqHandlerData>,
+        dev_id: Option<Arc<dyn IrqHandlerData>>,
+    ) -> Result<IrqReturn, SystemError> {
+        let dev_id = dev_id.ok_or(SystemError::EINVAL)?;
+        let dev_id = dev_id
+            .arc_any()
+            .downcast::<DeviceId>()
+            .map_err(|_| SystemError::EINVAL)?;
+
+        if let Some(dev) = virtio_irq_manager().lookup_device(&dev_id) {
+            return dev.handle_irq(irq);
+        } else {
+            // 未绑定具体设备，因此无法处理中断
+
+            return Ok(IrqReturn::NotHandled);
+        }
+    }
 }

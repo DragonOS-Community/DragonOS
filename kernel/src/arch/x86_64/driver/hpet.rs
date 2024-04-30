@@ -1,5 +1,4 @@
 use core::{
-    ffi::c_void,
     intrinsics::unlikely,
     mem::size_of,
     ptr::NonNull,
@@ -7,6 +6,7 @@ use core::{
 };
 
 use acpi::HpetInfo;
+use alloc::{string::ToString, sync::Arc};
 use system_error::SystemError;
 
 use crate::{
@@ -16,8 +16,10 @@ use crate::{
         timers::hpet::{HpetRegisters, HpetTimerRegisters},
     },
     exception::{
-        softirq::{softirq_vectors, SoftirqNumber},
-        InterruptArch,
+        irqdata::IrqHandlerData,
+        irqdesc::{IrqHandleFlags, IrqHandler, IrqReturn},
+        manage::irq_manager,
+        InterruptArch, IrqNumber,
     },
     kdebug, kerror, kinfo,
     libs::{
@@ -28,18 +30,25 @@ use crate::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         PhysAddr,
     },
-    time::timer::{clock, timer_get_first_expire, update_timer_jiffies},
+    time::{
+        jiffies::NSEC_PER_JIFFY,
+        timer::{try_raise_timer_softirq, update_timer_jiffies},
+    },
 };
-
-extern "C" {
-    fn c_hpet_register_irq() -> c_void;
-}
 
 static mut HPET_INSTANCE: Option<Hpet> = None;
 
 #[inline(always)]
 pub fn hpet_instance() -> &'static Hpet {
     unsafe { HPET_INSTANCE.as_ref().unwrap() }
+}
+
+#[inline(always)]
+pub fn is_hpet_enabled() -> bool {
+    if unsafe { HPET_INSTANCE.as_ref().is_some() } {
+        return unsafe { HPET_INSTANCE.as_ref().unwrap().enabled() };
+    }
+    return false;
 }
 
 pub struct Hpet {
@@ -55,8 +64,10 @@ struct InnerHpet {
 }
 
 impl Hpet {
-    /// HPET0 中断间隔为 10ms
-    pub const HPET0_INTERVAL_USEC: u64 = 10000;
+    /// HPET0 中断间隔
+    pub const HPET0_INTERVAL_USEC: u64 = NSEC_PER_JIFFY as u64 / 1000;
+
+    const HPET0_IRQ: IrqNumber = IrqNumber::new(34);
 
     fn new(mut hpet_info: HpetInfo) -> Result<Self, SystemError> {
         let paddr = PhysAddr::new(hpet_info.base_address);
@@ -69,6 +80,7 @@ impl Hpet {
                 .unwrap()
         };
         let tm_num = hpet.timers_num();
+        kdebug!("HPET0_INTERVAL_USEC: {}", Self::HPET0_INTERVAL_USEC);
         kinfo!("HPET has {} timers", tm_num);
         hpet_info.hpet_number = tm_num as u8;
 
@@ -107,12 +119,14 @@ impl Hpet {
 
     /// 使能HPET
     pub fn hpet_enable(&self) -> Result<(), SystemError> {
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
         // ！！！这里是临时糊代码的，需要在apic重构的时候修改！！！
         let (inner_guard, regs) = unsafe { self.hpet_regs_mut() };
         let freq = regs.frequency();
         kdebug!("HPET frequency: {} Hz", freq);
         let ticks = Self::HPET0_INTERVAL_USEC * freq / 1000000;
-        if ticks <= 0 || ticks > freq * 8 {
+        if ticks == 0 || ticks > freq * 8 {
             kerror!("HPET enable: ticks '{ticks}' is invalid");
             return Err(SystemError::EINVAL);
         }
@@ -135,8 +149,14 @@ impl Hpet {
         }
         drop(inner_guard);
 
-        // todo!("register irq in C");
-        unsafe { c_hpet_register_irq() };
+        irq_manager().request_irq(
+            Self::HPET0_IRQ,
+            "HPET0".to_string(),
+            &HpetIrqHandler,
+            IrqHandleFlags::IRQF_TRIGGER_RISING,
+            None,
+        )?;
+
         self.enabled.store(true, Ordering::SeqCst);
 
         let (inner_guard, regs) = unsafe { self.hpet_regs_mut() };
@@ -147,6 +167,8 @@ impl Hpet {
         drop(inner_guard);
 
         kinfo!("HPET enabled");
+
+        drop(irq_guard);
         return Ok(());
     }
 
@@ -226,23 +248,17 @@ impl Hpet {
     /// 处理HPET的中断
     pub(super) fn handle_irq(&self, timer_num: u32) {
         if timer_num == 0 {
-            assert!(CurrentIrqArch::is_irq_enabled() == false);
-            update_timer_jiffies(Self::HPET0_INTERVAL_USEC, Self::HPET0_INTERVAL_USEC as i64);
+            assert!(!CurrentIrqArch::is_irq_enabled());
+            update_timer_jiffies(1, Self::HPET0_INTERVAL_USEC as i64);
 
-            if let Ok(first_expire) = timer_get_first_expire() {
-                if first_expire <= clock() {
-                    softirq_vectors().raise_softirq(SoftirqNumber::TIMER);
-                }
-            }
+            try_raise_timer_softirq();
         }
     }
 }
 
 pub fn hpet_init() -> Result<(), SystemError> {
-    let hpet_info = HpetInfo::new(acpi_manager().tables().unwrap()).map_err(|e| {
-        kerror!("Failed to get HPET info: {:?}", e);
-        SystemError::ENODEV
-    })?;
+    let hpet_info =
+        HpetInfo::new(acpi_manager().tables().unwrap()).map_err(|_| SystemError::ENODEV)?;
 
     let hpet_instance = Hpet::new(hpet_info)?;
     unsafe {
@@ -250,4 +266,19 @@ pub fn hpet_init() -> Result<(), SystemError> {
     }
 
     return Ok(());
+}
+
+#[derive(Debug)]
+struct HpetIrqHandler;
+
+impl IrqHandler for HpetIrqHandler {
+    fn handle(
+        &self,
+        _irq: IrqNumber,
+        _static_data: Option<&dyn IrqHandlerData>,
+        _dynamic_data: Option<Arc<dyn IrqHandlerData>>,
+    ) -> Result<IrqReturn, SystemError> {
+        hpet_instance().handle_irq(0);
+        return Ok(IrqReturn::Handled);
+    }
 }

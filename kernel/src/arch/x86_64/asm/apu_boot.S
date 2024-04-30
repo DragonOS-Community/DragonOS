@@ -1,4 +1,5 @@
 #include "../common/asm.h"
+#include <asm/apu_boot.h>
 
 
 .align 0x1000  // 按照4k对齐
@@ -20,7 +21,7 @@ _apu_boot_base = .
 
     // 设置栈指针
     movl $(_apu_boot_tmp_stack_end - _apu_boot_base), %esp
-    
+
     // 计算ap处理器引导程序的基地址
     mov %cs, %ax
     movzx %ax, %esi
@@ -112,9 +113,9 @@ _apu_code64_vector:
 	.long	_apu_code64 - _apu_boot_base
 	.word	0x18,0	
 
-.align 0x1000 
-_apu_boot_tmp_stack_start:
-//	.org	0x400
+.align 0x1000
+ENTRY(_apu_boot_tmp_stack_start)
+	.skip	APU_BOOT_TMP_STACK_SIZE
 _apu_boot_tmp_stack_end:
 
 ENTRY(_apu_boot_end)

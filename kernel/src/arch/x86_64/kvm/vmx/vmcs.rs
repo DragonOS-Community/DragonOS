@@ -204,7 +204,7 @@ pub enum VmcsFields {
     GUEST_ACTIVITY_STATE = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT32, 19) as isize,
     GUEST_SMBASE = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT32, 20) as isize,
     GUEST_SYSENTER_CS = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::BIT32, 21) as isize,
-    GUEST_VMX_PREEMPT_TIMER_VALUE = 0x482E as isize,
+    GUEST_VMX_PREEMPT_TIMER_VALUE = 0x482E_isize,
     // natural guest fields
     GUEST_CR0 = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::NATURAL, 0) as isize,
     GUEST_CR3 = encode_vmcs_field_full(VmcsType::GUEST, VmcsWidth::NATURAL, 1) as isize,
@@ -519,10 +519,8 @@ const fn encode_vmcs_field(
     index: u32,
 ) -> u32 {
     let mut encoding: u32 = 0;
-    encoding |= (access_type as u32)
-        | (index as u32) << 1
-        | (vmcs_type as u32) << 10
-        | (vmcs_width as u32) << 13;
+    encoding |=
+        (access_type as u32) | (index) << 1 | (vmcs_type as u32) << 10 | (vmcs_width as u32) << 13;
     return encoding;
 }
 

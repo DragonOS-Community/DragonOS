@@ -6,10 +6,10 @@ use system_error::SystemError;
 use crate::{
     arch::{
         ipc::signal::{SigChildCode, Signal},
-        sched::sched,
         CurrentIrqArch,
     },
     exception::InterruptArch,
+    sched::{schedule, SchedMode},
     syscall::user_access::UserBufferWriter,
 };
 
@@ -120,11 +120,10 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
 
             if !kwo.options.contains(WaitOption::WNOHANG) {
                 retval = Err(SystemError::ERESTARTSYS);
-                if ProcessManager::current_pcb()
+                if !ProcessManager::current_pcb()
                     .sig_info_irqsave()
                     .sig_pending()
                     .has_pending()
-                    == false
                 {
                     // todo: 增加子进程退出的回调后，这里可以直接等待在自身的child_wait等待队列上。
                     continue;
@@ -141,8 +140,8 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
             // 获取weak引用，以便于在do_waitpid中能正常drop pcb
             let child_weak = Arc::downgrade(&child_pcb);
             let r = do_waitpid(child_pcb, kwo);
-            if r.is_some() {
-                return r.unwrap();
+            if let Some(r) = r {
+                return r;
             } else {
                 child_weak.upgrade().unwrap().wait_queue.sleep();
             }
@@ -158,14 +157,14 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                 if state.is_exited() {
                     kwo.ret_status = state.exit_code().unwrap() as i32;
                     drop(pcb);
-                    unsafe { ProcessManager::release(pid.clone()) };
-                    return Ok(pid.clone().into());
+                    unsafe { ProcessManager::release(*pid) };
+                    return Ok((*pid).into());
                 } else {
                     unsafe { pcb.wait_queue.sleep_without_schedule() };
                 }
             }
             drop(irq_guard);
-            sched();
+            schedule(SchedMode::SM_NONE);
         } else {
             // todo: 对于pgid的处理
             kwarn!("kernel_wait4: currently not support {:?}", kwo.pid_type);

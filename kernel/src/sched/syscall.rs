@@ -1,40 +1,37 @@
 use system_error::SystemError;
 
-use crate::{
-    arch::CurrentIrqArch, exception::InterruptArch, process::ProcessManager,
-    smp::core::smp_get_processor_id, syscall::Syscall,
-};
+use crate::arch::cpu::current_cpu_id;
+use crate::exception::InterruptArch;
+use crate::process::ProcessManager;
+use crate::sched::CurrentIrqArch;
+use crate::sched::Scheduler;
+use crate::syscall::Syscall;
 
-use super::core::{do_sched, CPU_EXECUTING};
+use super::fair::CompletelyFairScheduler;
+use super::{cpu_rq, schedule, SchedMode};
 
 impl Syscall {
-    /// @brief 让系统立即运行调度器的系统调用
-    /// 请注意，该系统调用不能由ring3的程序发起
-    #[inline(always)]
-    pub fn sched(from_user: bool) -> Result<usize, SystemError> {
+    pub fn do_sched_yield() -> Result<usize, SystemError> {
+        // 禁用中断
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
-        // 进行权限校验，拒绝用户态发起调度
-        if from_user {
-            return Err(SystemError::EPERM);
-        }
-        // 根据调度结果统一进行切换
-        let pcb = do_sched();
+        let pcb = ProcessManager::current_pcb();
+        let rq = cpu_rq(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize);
+        let (rq, guard) = rq.self_lock();
 
-        if pcb.is_some() {
-            let next_pcb = pcb.unwrap();
-            let current_pcb = ProcessManager::current_pcb();
-            // kdebug!("sched: current_pcb: {:?}, next_pcb: {:?}\n", current_pcb, next_pcb);
-            if current_pcb.pid() != next_pcb.pid() {
-                CPU_EXECUTING.set(smp_get_processor_id(), next_pcb.pid());
-                unsafe { ProcessManager::switch_process(current_pcb, next_pcb) };
-            }
-        }
+        // TODO: schedstat_inc(rq->yld_count);
+
+        CompletelyFairScheduler::yield_task(rq);
+
+        pcb.preempt_disable();
+
+        drop(guard);
         drop(irq_guard);
-        return Ok(0);
-    }
 
-    pub fn sched_yield() -> Result<usize, SystemError> {
-        return Syscall::sched(false);
+        pcb.preempt_enable(); // sched_preempt_enable_no_resched();
+
+        schedule(SchedMode::SM_NONE);
+
+        Ok(0)
     }
 }

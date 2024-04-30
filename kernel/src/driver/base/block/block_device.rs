@@ -1,14 +1,17 @@
 /// 引入Module
 use crate::{
-    driver::base::{
-        device::{
-            device_number::{DeviceNumber, Major},
-            Device, DeviceError, IdTable, BLOCKDEVS,
+    driver::{
+        base::{
+            device::{
+                device_number::{DeviceNumber, Major},
+                Device, DeviceError, IdTable, BLOCKDEVS,
+            },
+            map::{
+                DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
+                DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX,
+            },
         },
-        map::{
-            DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
-            DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX,
-        },
+        block::cache::{cached_block_device::BlockCache, BlockCacheError, BLOCK_SIZE},
     },
     kerror,
 };
@@ -62,7 +65,7 @@ impl BlockIter {
         return BlockIter {
             begin: start_addr,
             end: end_addr,
-            blk_size_log2: blk_size_log2,
+            blk_size_log2,
             multiblock: false,
         };
     }
@@ -70,7 +73,8 @@ impl BlockIter {
         return BlockIter {
             begin: start_addr,
             end: end_addr,
-            blk_size_log2: blk_size_log2,
+
+            blk_size_log2,
             multiblock: true,
         };
     }
@@ -92,9 +96,9 @@ impl BlockIter {
         return BlockRange {
             lba_start: lba_id,
             lba_end: lba_id + 1,
-            begin: begin,
-            end: end,
-            blk_size_log2: blk_size_log2,
+            begin,
+            end,
+            blk_size_log2,
         };
     }
 
@@ -119,11 +123,11 @@ impl BlockIter {
         self.begin += end - begin;
 
         return BlockRange {
-            lba_start: lba_start,
-            lba_end: lba_end,
-            begin: begin,
-            end: end,
-            blk_size_log2: blk_size_log2,
+            lba_start,
+            lba_end,
+            begin,
+            end,
+            blk_size_log2,
         };
     }
 }
@@ -194,7 +198,7 @@ pub trait BlockDevice: Device {
     /// @return: 如果操作成功，返回 Ok(操作的长度) 其中单位是字节；
     ///          否则返回Err(错误码)，其中错误码为负数；
     ///          如果操作异常，但是并没有检查出什么错误，将返回Err(已操作的长度)
-    fn read_at(
+    fn read_at_sync(
         &self,
         lba_id_start: BlockId,
         count: usize,
@@ -208,7 +212,7 @@ pub trait BlockDevice: Device {
     /// @return: 如果操作成功，返回 Ok(操作的长度) 其中单位是字节；
     ///          否则返回Err(错误码)，其中错误码为负数；
     ///          如果操作异常，但是并没有检查出什么错误，将返回Err(已操作的长度)
-    fn write_at(
+    fn write_at_sync(
         &self,
         lba_id_start: BlockId,
         count: usize,
@@ -239,8 +243,72 @@ pub trait BlockDevice: Device {
     /// @brief 返回当前磁盘上的所有分区的Arc指针数组
     fn partitions(&self) -> Vec<Arc<Partition>>;
 
+    /// # 函数的功能
+    /// 经由Cache对块设备的读操作
+    fn read_at(
+        &self,
+        lba_id_start: BlockId,
+        count: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        self.cache_read(lba_id_start, count, buf)
+    }
+
+    /// # 函数的功能
+    ///  经由Cache对块设备的写操作
+    fn write_at(
+        &self,
+        lba_id_start: BlockId,
+        count: usize,
+        buf: &[u8],
+    ) -> Result<usize, SystemError> {
+        self.cache_write(lba_id_start, count, buf)
+    }
+
+    /// # 函数的功能
+    /// 其功能对外而言和read_at函数完全一致，但是加入blockcache的功能
+    fn cache_read(
+        &self,
+        lba_id_start: BlockId,
+        count: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        let cache_response = BlockCache::read(lba_id_start, count, buf);
+        if let Err(e) = cache_response {
+            match e {
+                BlockCacheError::StaticParameterError => {
+                    BlockCache::init();
+                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
+                    return Ok(ans);
+                }
+                BlockCacheError::BlockFaultError(fail_vec) => {
+                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
+                    let _ = BlockCache::insert(fail_vec, buf);
+                    return Ok(ans);
+                }
+                _ => {
+                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
+                    return Ok(ans);
+                }
+            }
+        } else {
+            return Ok(count * BLOCK_SIZE);
+        }
+    }
+
+    /// # 函数功能
+    /// 其功能对外而言和write_at函数完全一致，但是加入blockcache的功能
+    fn cache_write(
+        &self,
+        lba_id_start: BlockId,
+        count: usize,
+        buf: &[u8],
+    ) -> Result<usize, SystemError> {
+        let _cache_response = BlockCache::immediate_write(lba_id_start, count, buf);
+        self.write_at_sync(lba_id_start, count, buf)
+    }
+
     fn write_at_bytes(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        // assert!(len <= buf.len());
         if len > buf.len() {
             return Err(SystemError::E2BIG);
         }
@@ -252,7 +320,7 @@ pub trait BlockDevice: Device {
             let buf_begin = range.origin_begin() - offset; // 本次读操作的起始位置/已经读了这么多字节
             let buf_end = range.origin_end() - offset;
             let buf_slice = &buf[buf_begin..buf_end];
-            let count: usize = (range.lba_end - range.lba_start).try_into().unwrap();
+            let count: usize = range.lba_end - range.lba_start;
             let full = multi && range.is_multi() || !multi && range.is_full();
 
             if full {
@@ -262,17 +330,15 @@ pub trait BlockDevice: Device {
                     return Err(SystemError::E2BIG);
                 }
 
-                let mut temp = Vec::new();
-                temp.resize(1usize << self.blk_size_log2(), 0);
+                let mut temp = vec![0; 1usize << self.blk_size_log2()];
                 // 由于块设备每次读写都是整块的，在不完整写入之前，必须把不完整的地方补全
                 self.read_at(range.lba_start, 1, &mut temp[..])?;
                 // 把数据从临时buffer复制到目标buffer
-                temp[range.begin..range.end].copy_from_slice(&buf_slice);
+                temp[range.begin..range.end].copy_from_slice(buf_slice);
                 self.write_at(range.lba_start, 1, &temp[..])?;
             }
         }
         return Ok(len);
-        //self.0.lock().write_at(lba_id_start, count, buf)
     }
 
     fn read_at_bytes(
@@ -293,7 +359,7 @@ pub trait BlockDevice: Device {
             let buf_begin = range.origin_begin() - offset; // 本次读操作的起始位置/已经读了这么多字节
             let buf_end = range.origin_end() - offset;
             let buf_slice = &mut buf[buf_begin..buf_end];
-            let count: usize = (range.lba_end - range.lba_start).try_into().unwrap();
+            let count: usize = range.lba_end - range.lba_start;
             let full = multi && range.is_multi() || !multi && range.is_full();
 
             // 读取整个block作为有效数据
@@ -306,8 +372,7 @@ pub trait BlockDevice: Device {
                     return Err(SystemError::E2BIG);
                 }
 
-                let mut temp = Vec::new();
-                temp.resize(1usize << self.blk_size_log2(), 0);
+                let mut temp = vec![0; 1usize << self.blk_size_log2()];
                 self.read_at(range.lba_start, 1, &mut temp[..])?;
 
                 // 把数据从临时buffer复制到目标buffer
@@ -315,11 +380,6 @@ pub trait BlockDevice: Device {
             }
         }
         return Ok(len);
-
-        // kdebug!(
-        //     "ahci read at {lba_id_start}, count={count}, lock={:?}",
-        //     self.0
-        // );
     }
 }
 
@@ -332,7 +392,7 @@ impl BlockDeviceOps {
     /// @return: 返回下标
     #[allow(dead_code)]
     fn major_to_index(major: Major) -> usize {
-        return (major.data() % DEV_MAJOR_HASH_SIZE as u32) as usize;
+        return (major.data() % DEV_MAJOR_HASH_SIZE) as usize;
     }
 
     /// @brief: 动态获取主设备号
@@ -353,11 +413,10 @@ impl BlockDeviceOps {
         for index in
             ((DEV_MAJOR_DYN_EXT_END.data() + 1)..(DEV_MAJOR_DYN_EXT_START.data() + 1)).rev()
         {
-            if let Some(blockdevss) = blockdevs.get(Self::major_to_index(Major::new(index as u32)))
-            {
+            if let Some(blockdevss) = blockdevs.get(Self::major_to_index(Major::new(index))) {
                 let mut flag = true;
                 for item in blockdevss {
-                    if item.device_number().major() == Major::new(index as u32) {
+                    if item.device_number().major() == Major::new(index) {
                         flag = false;
                         break;
                     }

@@ -9,13 +9,13 @@ use alloc::{
 };
 use hashbrown::HashMap;
 use smoltcp::{
-    iface::{SocketHandle, SocketSet},
-    socket::{self, tcp, udp},
+    iface::SocketSet,
+    socket::{self, raw, tcp, udp},
 };
 use system_error::SystemError;
 
 use crate::{
-    arch::{rand::rand, sched::sched},
+    arch::rand::rand,
     filesystem::vfs::{
         file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode,
         Metadata,
@@ -25,17 +25,23 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::EventWaitQueue,
     },
+    sched::{schedule, SchedMode},
 };
 
-use self::sockets::{RawSocket, SeqpacketSocket, TcpSocket, UdpSocket};
+use self::{
+    handle::GlobalSocketHandle,
+    inet::{RawSocket, TcpSocket, UdpSocket},
+    unix::{SeqpacketSocket, StreamSocket},
+};
 
 use super::{
     event_poll::{EPollEventType, EPollItem, EventPoll},
-    net_core::poll_ifaces,
     Endpoint, Protocol, ShutdownType,
 };
 
-pub mod sockets;
+pub mod handle;
+pub mod inet;
+pub mod unix;
 
 lazy_static! {
     /// 所有socket的集合
@@ -43,7 +49,7 @@ lazy_static! {
     pub static ref SOCKET_SET: SpinLock<SocketSet<'static >> = SpinLock::new(SocketSet::new(vec![]));
     /// SocketHandle表，每个SocketHandle对应一个SocketHandleItem，
     /// 注意！：在网卡中断中需要拿到这张表的🔓，在获取读锁时应该确保关中断避免死锁
-    pub static ref HANDLE_MAP: RwLock<HashMap<SocketHandle, SocketHandleItem>> = RwLock::new(HashMap::new());
+    pub static ref HANDLE_MAP: RwLock<HashMap<GlobalSocketHandle, SocketHandleItem>> = RwLock::new(HashMap::new());
     /// 端口管理器
     pub static ref PORT_MANAGER: PortManager = PortManager::new();
 }
@@ -60,9 +66,7 @@ pub(super) fn new_socket(
 ) -> Result<Box<dyn Socket>, SystemError> {
     let socket: Box<dyn Socket> = match address_family {
         AddressFamily::Unix => match socket_type {
-            PosixSocketType::Stream => Box::new(TcpSocket::new(SocketOptions::default())),
-            PosixSocketType::Datagram => Box::new(UdpSocket::new(SocketOptions::default())),
-            PosixSocketType::Raw => Box::new(RawSocket::new(protocol, SocketOptions::default())),
+            PosixSocketType::Stream => Box::new(StreamSocket::new(SocketOptions::default())),
             PosixSocketType::SeqPacket => Box::new(SeqpacketSocket::new(SocketOptions::default())),
             _ => {
                 return Err(SystemError::EINVAL);
@@ -80,20 +84,22 @@ pub(super) fn new_socket(
             return Err(SystemError::EAFNOSUPPORT);
         }
     };
+
+    let handle_item = SocketHandleItem::new();
+    HANDLE_MAP
+        .write_irqsave()
+        .insert(socket.socket_handle(), handle_item);
     Ok(socket)
 }
 
 pub trait Socket: Sync + Send + Debug + Any {
-    fn as_any_ref(&self) -> &dyn Any;
-
-    fn as_any_mut(&mut self) -> &mut dyn Any;
     /// @brief 从socket中读取数据，如果socket是阻塞的，那么直到读取到数据才返回
     ///
     /// @param buf 读取到的数据存放的缓冲区
     ///
     /// @return - 成功：(返回读取的数据的长度，读取数据的端点).
     ///         - 失败：错误码
-    fn read(&mut self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint);
+    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint);
 
     /// @brief 向socket中写入数据。如果socket是阻塞的，那么直到写入的数据全部写入socket中才返回
     ///
@@ -113,9 +119,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     /// @param endpoint 要连接的端点
     ///
     /// @return 返回连接是否成功
-    fn connect(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
-        return Err(SystemError::ENOSYS);
-    }
+    fn connect(&mut self, _endpoint: Endpoint) -> Result<(), SystemError>;
 
     /// @brief 对应于POSIX的bind函数，用于绑定到本机指定的端点
     ///
@@ -125,7 +129,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     ///
     /// @return 返回绑定是否成功
     fn bind(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
-        return Err(SystemError::ENOSYS);
+        Err(SystemError::ENOSYS)
     }
 
     /// @brief 对应于 POSIX 的 shutdown 函数，用于关闭socket。
@@ -136,7 +140,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     ///
     /// @return 返回是否成功关闭
     fn shutdown(&mut self, _type: ShutdownType) -> Result<(), SystemError> {
-        return Err(SystemError::ENOSYS);
+        Err(SystemError::ENOSYS)
     }
 
     /// @brief 对应于POSIX的listen函数，用于监听端点
@@ -145,7 +149,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     ///
     /// @return 返回监听是否成功
     fn listen(&mut self, _backlog: usize) -> Result<(), SystemError> {
-        return Err(SystemError::ENOSYS);
+        Err(SystemError::ENOSYS)
     }
 
     /// @brief 对应于POSIX的accept函数，用于接受连接
@@ -154,24 +158,20 @@ pub trait Socket: Sync + Send + Debug + Any {
     ///
     /// @return 返回接受连接是否成功
     fn accept(&mut self) -> Result<(Box<dyn Socket>, Endpoint), SystemError> {
-        return Err(SystemError::ENOSYS);
+        Err(SystemError::ENOSYS)
     }
 
     /// @brief 获取socket的端点
     ///
     /// @return 返回socket的端点
     fn endpoint(&self) -> Option<Endpoint> {
-        return None;
+        None
     }
 
     /// @brief 获取socket的对端端点
     ///
     /// @return 返回socket的对端端点
     fn peer_endpoint(&self) -> Option<Endpoint> {
-        return None;
-    }
-
-    fn socketpair_ops(&self) -> Option<&'static dyn SocketpairOps> {
         None
     }
 
@@ -187,7 +187,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     ///     The third boolean value indicates whether the socket has encountered an error condition. If it is true, then the socket is in an error state and should be closed or reset
     ///
     fn poll(&self) -> EPollEventType {
-        return EPollEventType::empty();
+        EPollEventType::empty()
     }
 
     /// @brief socket的ioctl函数
@@ -205,11 +205,11 @@ pub trait Socket: Sync + Send + Debug + Any {
         _arg1: usize,
         _arg2: usize,
     ) -> Result<usize, SystemError> {
-        return Ok(0);
+        Ok(0)
     }
 
     /// @brief 获取socket的元数据
-    fn metadata(&self) -> Result<SocketMetadata, SystemError>;
+    fn metadata(&self) -> SocketMetadata;
 
     fn box_clone(&self) -> Box<dyn Socket>;
 
@@ -227,12 +227,18 @@ pub trait Socket: Sync + Send + Debug + Any {
         _optval: &[u8],
     ) -> Result<(), SystemError> {
         kwarn!("setsockopt is not implemented");
-        return Ok(());
+        Ok(())
     }
 
-    fn socket_handle(&self) -> SocketHandle {
+    fn socket_handle(&self) -> GlobalSocketHandle;
+
+    fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
         todo!()
     }
+
+    fn as_any_ref(&self) -> &dyn Any;
+
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 
     fn add_epoll(&mut self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
         HANDLE_MAP
@@ -270,17 +276,14 @@ pub trait Socket: Sync + Send + Debug + Any {
 
         Ok(())
     }
+
+    fn close(&mut self);
 }
 
 impl Clone for Box<dyn Socket> {
     fn clone(&self) -> Box<dyn Socket> {
         self.box_clone()
     }
-}
-
-pub trait SocketpairOps {
-    /// 执行socketpair
-    fn socketpair(&self, socket0: &mut Box<dyn Socket>, socket1: &mut Box<dyn Socket>);
 }
 
 /// # Socket在文件系统中的inode封装
@@ -294,32 +297,36 @@ impl SocketInode {
 
     #[inline]
     pub fn inner(&self) -> SpinLockGuard<Box<dyn Socket>> {
-        return self.0.lock();
+        self.0.lock()
     }
 
     pub unsafe fn inner_no_preempt(&self) -> SpinLockGuard<Box<dyn Socket>> {
-        return self.0.lock_no_preempt();
+        self.0.lock_no_preempt()
     }
 }
 
 impl IndexNode for SocketInode {
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         self.1.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         let prev_ref_count = self.1.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
         if prev_ref_count == 1 {
             // 最后一次关闭，需要释放
             let mut socket = self.0.lock_irqsave();
 
-            if socket.metadata().unwrap().socket_type == SocketType::SeqpacketSocket {
+            if socket.metadata().socket_type == SocketType::Unix {
                 return Ok(());
             }
 
             if let Some(Endpoint::Ip(Some(ip))) = socket.endpoint() {
-                PORT_MANAGER.unbind_port(socket.metadata().unwrap().socket_type, ip.port)?;
+                PORT_MANAGER.unbind_port(socket.metadata().socket_type, ip.port)?;
             }
 
             socket.clear_epoll()?;
@@ -328,7 +335,9 @@ impl IndexNode for SocketInode {
                 .write_irqsave()
                 .remove(&socket.socket_handle())
                 .unwrap();
+            socket.close();
         }
+
         Ok(())
     }
 
@@ -337,9 +346,10 @@ impl IndexNode for SocketInode {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        return self.0.lock_no_preempt().read(&mut buf[0..len]).0;
+        drop(data);
+        self.0.lock_no_preempt().read(&mut buf[0..len]).0
     }
 
     fn write_at(
@@ -347,9 +357,10 @@ impl IndexNode for SocketInode {
         _offset: usize,
         len: usize,
         buf: &[u8],
-        _data: &mut FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        return self.0.lock_no_preempt().write(&buf[0..len], None);
+        drop(data);
+        self.0.lock_no_preempt().write(&buf[0..len], None)
     }
 
     fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
@@ -384,11 +395,8 @@ impl IndexNode for SocketInode {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct SocketHandleItem {
-    /// socket元数据
-    metadata: SocketMetadata,
     /// shutdown状态
     pub shutdown_type: RwLock<ShutdownType>,
     /// socket的waitqueue
@@ -398,29 +406,19 @@ pub struct SocketHandleItem {
 }
 
 impl SocketHandleItem {
-    pub fn new(socket: &Box<dyn Socket>) -> Self {
+    pub fn new() -> Self {
         Self {
-            metadata: socket.metadata().unwrap(),
             shutdown_type: RwLock::new(ShutdownType::empty()),
             wait_queue: EventWaitQueue::new(),
             epitems: SpinLock::new(LinkedList::new()),
         }
     }
 
-    pub fn from_socket<A: Socket>(socket: &Box<A>) -> Self {
-        Self {
-            metadata: socket.metadata().unwrap(),
-            shutdown_type: RwLock::new(ShutdownType::empty()),
-            wait_queue: EventWaitQueue::new(),
-            epitems: SpinLock::new(LinkedList::new()),
-        }
-    }
-
-    /// ### 在socket的等待队列上睡眠
+    /// ## 在socket的等待队列上睡眠
     pub fn sleep(
-        socket_handle: SocketHandle,
+        socket_handle: GlobalSocketHandle,
         events: u64,
-        handle_map_guard: RwLockReadGuard<'_, HashMap<SocketHandle, SocketHandleItem>>,
+        handle_map_guard: RwLockReadGuard<'_, HashMap<GlobalSocketHandle, SocketHandleItem>>,
     ) {
         unsafe {
             handle_map_guard
@@ -430,11 +428,11 @@ impl SocketHandleItem {
                 .sleep_without_schedule(events)
         };
         drop(handle_map_guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     pub fn shutdown_type(&self) -> ShutdownType {
-        self.shutdown_type.read().clone()
+        *self.shutdown_type.read()
     }
 
     pub fn shutdown_type_writer(&mut self) -> RwLockWriteGuard<ShutdownType> {
@@ -465,9 +463,9 @@ impl SocketHandleItem {
 /// 如果 TCP/UDP 的 socket 绑定了某个端口，它会在对应的表中记录，以检测端口冲突。
 pub struct PortManager {
     // TCP 端口记录表
-    tcp_port_table: SpinLock<HashMap<u16, Arc<GlobalSocketHandle>>>,
+    tcp_port_table: SpinLock<HashMap<u16, Arc<dyn Socket>>>,
     // UDP 端口记录表
-    udp_port_table: SpinLock<HashMap<u16, Arc<GlobalSocketHandle>>>,
+    udp_port_table: SpinLock<HashMap<u16, Arc<dyn Socket>>>,
 }
 
 impl PortManager {
@@ -496,18 +494,18 @@ impl PortManager {
                 if EPHEMERAL_PORT == 65535 {
                     EPHEMERAL_PORT = 49152;
                 } else {
-                    EPHEMERAL_PORT = EPHEMERAL_PORT + 1;
+                    EPHEMERAL_PORT += 1;
                 }
                 port = EPHEMERAL_PORT;
             }
 
             // 使用 ListenTable 检查端口是否被占用
             let listen_table_guard = match socket_type {
-                SocketType::UdpSocket => self.udp_port_table.lock(),
-                SocketType::TcpSocket => self.tcp_port_table.lock(),
+                SocketType::Udp => self.udp_port_table.lock(),
+                SocketType::Tcp => self.tcp_port_table.lock(),
                 _ => panic!("{:?} cann't get a port", socket_type),
             };
-            if let None = listen_table_guard.get(&port) {
+            if listen_table_guard.get(&port).is_none() {
                 drop(listen_table_guard);
                 return Ok(port);
             }
@@ -523,17 +521,17 @@ impl PortManager {
         &self,
         socket_type: SocketType,
         port: u16,
-        handle: Arc<GlobalSocketHandle>,
+        socket: impl Socket,
     ) -> Result<(), SystemError> {
         if port > 0 {
             let mut listen_table_guard = match socket_type {
-                SocketType::UdpSocket => self.udp_port_table.lock(),
-                SocketType::TcpSocket => self.tcp_port_table.lock(),
+                SocketType::Udp => self.udp_port_table.lock(),
+                SocketType::Tcp => self.tcp_port_table.lock(),
                 _ => panic!("{:?} cann't bind a port", socket_type),
             };
             match listen_table_guard.get(&port) {
                 Some(_) => return Err(SystemError::EADDRINUSE),
-                None => listen_table_guard.insert(port, handle),
+                None => listen_table_guard.insert(port, Arc::new(socket)),
             };
             drop(listen_table_guard);
         }
@@ -543,8 +541,8 @@ impl PortManager {
     /// @brief 在对应的端口记录表中将端口和 socket 解绑
     pub fn unbind_port(&self, socket_type: SocketType, port: u16) -> Result<(), SystemError> {
         let mut listen_table_guard = match socket_type {
-            SocketType::UdpSocket => self.udp_port_table.lock(),
-            SocketType::TcpSocket => self.tcp_port_table.lock(),
+            SocketType::Udp => self.udp_port_table.lock(),
+            SocketType::Tcp => self.tcp_port_table.lock(),
             _ => return Ok(()),
         };
         listen_table_guard.remove(&port);
@@ -553,44 +551,17 @@ impl PortManager {
     }
 }
 
-/// # socket的句柄管理组件
-/// 它在smoltcp的SocketHandle上封装了一层，增加更多的功能。
-/// 比如，在socket被关闭时，自动释放socket的资源，通知系统的其他组件。
-#[derive(Debug)]
-pub struct GlobalSocketHandle(SocketHandle);
-
-impl GlobalSocketHandle {
-    pub fn new(handle: SocketHandle) -> Arc<Self> {
-        return Arc::new(Self(handle));
-    }
-}
-
-impl Clone for GlobalSocketHandle {
-    fn clone(&self) -> Self {
-        Self(self.0)
-    }
-}
-
-impl Drop for GlobalSocketHandle {
-    fn drop(&mut self) {
-        let mut socket_set_guard = SOCKET_SET.lock_irqsave();
-        socket_set_guard.remove(self.0); // 删除的时候，会发送一条FINISH的信息？
-        drop(socket_set_guard);
-        poll_ifaces();
-    }
-}
-
 /// @brief socket的类型
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SocketType {
     /// 原始的socket
-    RawSocket,
+    Raw,
     /// 用于Tcp通信的 Socket
-    TcpSocket,
+    Tcp,
     /// 用于Udp通信的 Socket
-    UdpSocket,
-    /// 用于进程间通信的 Socket
-    SeqpacketSocket,
+    Udp,
+    /// unix域的 Socket
+    Unix,
 }
 
 bitflags! {
@@ -750,7 +721,7 @@ impl TryFrom<u16> for AddressFamily {
     type Error = SystemError;
     fn try_from(x: u16) -> Result<Self, Self::Error> {
         use num_traits::FromPrimitive;
-        return <Self as FromPrimitive>::from_u16(x).ok_or_else(|| SystemError::EINVAL);
+        return <Self as FromPrimitive>::from_u16(x).ok_or(SystemError::EINVAL);
     }
 }
 
@@ -770,7 +741,7 @@ impl TryFrom<u8> for PosixSocketType {
     type Error = SystemError;
     fn try_from(x: u8) -> Result<Self, Self::Error> {
         use num_traits::FromPrimitive;
-        return <Self as FromPrimitive>::from_u8(x).ok_or_else(|| SystemError::EINVAL);
+        return <Self as FromPrimitive>::from_u8(x).ok_or(SystemError::EINVAL);
     }
 }
 
@@ -785,6 +756,7 @@ impl SocketPollMethod {
         match socket {
             socket::Socket::Udp(udp) => Self::udp_poll(udp, shutdown),
             socket::Socket::Tcp(tcp) => Self::tcp_poll(tcp, shutdown),
+            socket::Socket::Raw(raw) => Self::raw_poll(raw, shutdown),
             _ => todo!(),
         }
     }
@@ -864,6 +836,41 @@ impl SocketPollMethod {
             todo!()
         }
 
+        return event;
+    }
+
+    pub fn raw_poll(socket: &raw::Socket, shutdown: ShutdownType) -> EPollEventType {
+        //kdebug!("enter raw_poll!");
+        let mut event = EPollEventType::empty();
+
+        if shutdown.contains(ShutdownType::RCV_SHUTDOWN) {
+            event.insert(
+                EPollEventType::EPOLLRDHUP | EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+            );
+        }
+        if shutdown.contains(ShutdownType::SHUTDOWN_MASK) {
+            event.insert(EPollEventType::EPOLLHUP);
+        }
+
+        if socket.can_recv() {
+            //kdebug!("poll can recv!");
+            event.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
+        } else {
+            //kdebug!("poll can not recv!");
+        }
+
+        if socket.can_send() {
+            //kdebug!("poll can send!");
+            event.insert(
+                EPollEventType::EPOLLOUT
+                    | EPollEventType::EPOLLWRNORM
+                    | EPollEventType::EPOLLWRBAND,
+            );
+        } else {
+            //kdebug!("poll can not send!");
+            // TODO: 缓冲区空间不够，需要使用信号处理
+            todo!()
+        }
         return event;
     }
 }

@@ -4,6 +4,7 @@ use alloc::{
     string::String,
     sync::{Arc, Weak},
 };
+use driver_base_macros::get_weak_or_clear;
 use intertrait::CastFromSync;
 
 use crate::{
@@ -73,6 +74,21 @@ impl DowncastArc for dyn KObject {
     }
 }
 
+/// kobject的公共数据
+#[derive(Debug, Default)]
+pub struct KObjectCommonData {
+    pub kern_inode: Option<Arc<KernFSInode>>,
+    pub parent: Option<Weak<dyn KObject>>,
+    pub kset: Option<Arc<KSet>>,
+    pub kobj_type: Option<&'static dyn KObjType>,
+}
+
+impl KObjectCommonData {
+    pub fn get_parent_or_clear_weak(&mut self) -> Option<Weak<dyn KObject>> {
+        get_weak_or_clear!(self.parent)
+    }
+}
+
 pub trait KObjType: Debug + Send + Sync {
     /// 当指定的kobject被释放时，设备驱动模型会调用此方法
     fn release(&self, _kobj: Arc<dyn KObject>) {}
@@ -130,7 +146,7 @@ impl SysFSOps for KObjectSysFSOps {
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
         let r = attr.show(kobj, buf).map_err(|e| {
-            if e == SystemError::EOPNOTSUPP_OR_ENOTSUP {
+            if e == SystemError::ENOSYS {
                 SystemError::EIO
             } else {
                 e
@@ -147,7 +163,7 @@ impl SysFSOps for KObjectSysFSOps {
         buf: &[u8],
     ) -> Result<usize, SystemError> {
         let r = attr.store(kobj, buf).map_err(|e| {
-            if e == SystemError::EOPNOTSUPP_OR_ENOTSUP {
+            if e == SystemError::ENOSYS {
                 SystemError::EIO
             } else {
                 e
@@ -180,8 +196,7 @@ impl KObjectManager {
         kobj: Arc<dyn KObject>,
         join_kset: Option<Arc<KSet>>,
     ) -> Result<(), SystemError> {
-        if join_kset.is_some() {
-            let kset = join_kset.unwrap();
+        if let Some(kset) = join_kset {
             kset.join(&kobj);
             // 如果kobject没有parent，那么就将这个kset作为parent
             if kobj.parent().is_none() {

@@ -36,10 +36,6 @@ pub(super) fn do_faccessat(
 
     let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
 
-    if path.len() == 0 {
-        return Err(SystemError::EINVAL);
-    }
-
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
 
     // 如果找不到文件，则返回错误码ENOENT
@@ -51,10 +47,6 @@ pub(super) fn do_faccessat(
 
 pub fn do_fchmodat(dirfd: i32, path: *const u8, _mode: ModeType) -> Result<usize, SystemError> {
     let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
-
-    if path.len() == 0 {
-        return Err(SystemError::EINVAL);
-    }
 
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
 
@@ -84,11 +76,9 @@ fn do_sys_openat2(
     how: OpenHow,
     follow_symlink: bool,
 ) -> Result<usize, SystemError> {
-    // kdebug!("open: path: {}, mode: {:?}", path, mode);
-    // 文件名过长
-    if path.len() > MAX_PATHLEN as usize {
-        return Err(SystemError::ENAMETOOLONG);
-    }
+    // kdebug!("open path: {}, how: {:?}", path, how);
+    let path = path.trim();
+
     let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
     let inode: Result<Arc<dyn IndexNode>, SystemError> = inode_begin.lookup_follow_symlink(
         &path,
@@ -99,30 +89,30 @@ fn do_sys_openat2(
         },
     );
 
-    let inode: Arc<dyn IndexNode> = if inode.is_err() {
-        let errno = inode.unwrap_err();
-        // 文件不存在，且需要创建
-        if how.o_flags.contains(FileMode::O_CREAT)
-            && !how.o_flags.contains(FileMode::O_DIRECTORY)
-            && errno == SystemError::ENOENT
-        {
-            let (filename, parent_path) = rsplit_path(&path);
-            // 查找父目录
-            let parent_inode: Arc<dyn IndexNode> =
-                ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
-            // 创建文件
-            let inode: Arc<dyn IndexNode> = parent_inode.create(
-                filename,
-                FileType::File,
-                ModeType::from_bits_truncate(0o755),
-            )?;
-            inode
-        } else {
-            // 不需要创建文件，因此返回错误码
-            return Err(errno);
+    let inode: Arc<dyn IndexNode> = match inode {
+        Ok(inode) => inode,
+        Err(errno) => {
+            // 文件不存在，且需要创建
+            if how.o_flags.contains(FileMode::O_CREAT)
+                && !how.o_flags.contains(FileMode::O_DIRECTORY)
+                && errno == SystemError::ENOENT
+            {
+                let (filename, parent_path) = rsplit_path(&path);
+                // 查找父目录
+                let parent_inode: Arc<dyn IndexNode> =
+                    ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+                // 创建文件
+                let inode: Arc<dyn IndexNode> = parent_inode.create(
+                    filename,
+                    FileType::File,
+                    ModeType::from_bits_truncate(0o755),
+                )?;
+                inode
+            } else {
+                // 不需要创建文件，因此返回错误码
+                return Err(errno);
+            }
         }
-    } else {
-        inode.unwrap()
     };
 
     let file_type: FileType = inode.metadata()?.file_type;
@@ -133,7 +123,7 @@ fn do_sys_openat2(
 
     // 创建文件对象
 
-    let mut file: File = File::new(inode, how.o_flags)?;
+    let file: File = File::new(inode, how.o_flags)?;
 
     // 打开模式为“追加”
     if how.o_flags.contains(FileMode::O_APPEND) {

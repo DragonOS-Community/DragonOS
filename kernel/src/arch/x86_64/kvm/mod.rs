@@ -34,14 +34,14 @@ impl X86_64KVMArch {
         // Check to see if CPU is Intel (“GenuineIntel”).
         if let Some(vi) = cpuid.get_vendor_info() {
             if vi.as_str() != "GenuineIntel" {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                return Err(SystemError::ENOSYS);
             }
         }
         // Check processor supports for Virtual Machine Extension (VMX) technology
         // CPUID.1:ECX.VMX[bit 5] = 1 (Intel Manual: 24.6 Discovering Support for VMX)
         if let Some(fi) = cpuid.get_feature_info() {
             if !fi.has_vmx() {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                return Err(SystemError::ENOSYS);
             }
         }
         Ok(())
@@ -52,13 +52,10 @@ impl X86_64KVMArch {
         Ok(())
     }
 
+    #[deny(clippy::match_single_binding)]
     pub fn kvm_arch_dev_ioctl(cmd: u32, _arg: usize) -> Result<usize, SystemError> {
-        match cmd {
-            _ => {
-                kerror!("unknown kvm ioctl cmd: {}", cmd);
-                return Err(SystemError::EINVAL);
-            }
-        }
+        kerror!("unknown kvm ioctl cmd: {}", cmd);
+        return Err(SystemError::EINVAL);
     }
 
     pub fn kvm_arch_vcpu_create(id: u32) -> Result<Arc<Mutex<VmxVcpu>>, SystemError> {

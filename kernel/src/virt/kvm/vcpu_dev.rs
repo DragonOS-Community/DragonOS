@@ -6,12 +6,13 @@ use crate::filesystem::vfs::{
     core::generate_inode_id, file::FileMode, FilePrivateData, FileSystem, FileType, IndexNode,
     Metadata,
 };
+use crate::libs::spinlock::SpinLockGuard;
 use crate::mm::VirtAddr;
 use crate::syscall::user_access::copy_from_user;
 use crate::virt::kvm::vcpu::Vcpu;
 use crate::virt::kvm::vm;
 use crate::{filesystem, kdebug};
-use crate::{libs::spinlock::SpinLock, time::TimeSpec};
+use crate::{libs::spinlock::SpinLock, time::PosixTimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
@@ -69,9 +70,9 @@ impl LockedVcpuInode {
                 size: 0,
                 blk_size: 0,
                 blocks: 0,
-                atime: TimeSpec::default(),
-                mtime: TimeSpec::default(),
-                ctime: TimeSpec::default(),
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
                 file_type: FileType::KvmDevice, // 文件夹，block设备，char设备
                 mode: filesystem::vfs::syscall::ModeType::S_IALLUGO,
                 nlinks: 1,
@@ -96,12 +97,16 @@ impl IndexNode for LockedVcpuInode {
         self
     }
 
-    fn open(&self, _data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         kdebug!("file private data:{:?}", _data);
         return Ok(());
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -114,7 +119,7 @@ impl IndexNode for LockedVcpuInode {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        Err(SystemError::ENOSYS)
     }
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
@@ -197,9 +202,9 @@ impl IndexNode for LockedVcpuInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        Err(SystemError::ENOSYS)
     }
 
     /// 写设备 - 应该调用设备的函数读写，而不是通过文件系统读写
@@ -208,8 +213,8 @@ impl IndexNode for LockedVcpuInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        Err(SystemError::ENOSYS)
     }
 }

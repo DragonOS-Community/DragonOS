@@ -36,7 +36,7 @@ impl Signal {
         // 如果并无进程与指定的 pid 相匹配，那么 kill() 调用失败，同时将 errno 置为 ESRCH（“查无此进程”）
         if pid.lt(&Pid::from(0)) {
             kwarn!("Kill operation not support: pid={:?}", pid);
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::ENOSYS);
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // 检查sig是否符合要求，如果不符合要求，则退出。
@@ -86,7 +86,7 @@ impl Signal {
             return Err(SystemError::EINVAL);
         }
         // kdebug!("force send={}", force_send);
-        let pcb_info = pcb.sig_info();
+        let pcb_info = pcb.sig_info_irqsave();
         let pending = if matches!(pt, PidType::PID) {
             pcb_info.sig_shared_pending()
         } else {
@@ -100,7 +100,7 @@ impl Signal {
             self.complete_signal(pcb.clone(), pt);
         }
         // 如果不是实时信号的话，同一时刻信号队列里只会有一个待处理的信号，如果重复接收就不做处理
-        else if !self.is_rt_signal() && pending.queue().find(self.clone()).0.is_some() {
+        else if !self.is_rt_signal() && pending.queue().find(*self).0.is_some() {
             return Ok(0);
         } else {
             // TODO signalfd_notify 完善 signalfd 机制
@@ -108,12 +108,12 @@ impl Signal {
             let new_sig_info = match info {
                 Some(siginfo) => {
                     // 已经显式指定了siginfo，则直接使用它。
-                    (*siginfo).clone()
+                    *siginfo
                 }
                 None => {
                     // 不需要显示指定siginfo，因此设置为默认值
                     SigInfo::new(
-                        self.clone(),
+                        *self,
                         0,
                         SigCode::User,
                         SigType::Kill(ProcessManager::current_pcb().pid()),
@@ -127,7 +127,7 @@ impl Signal {
                 .q
                 .push(new_sig_info);
 
-            if pt == PidType::PGID || pt == PidType::SID {}
+            // if pt == PidType::PGID || pt == PidType::SID {}
             self.complete_signal(pcb.clone(), pt);
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -139,6 +139,7 @@ impl Signal {
     /// @param sig 信号
     /// @param pcb 目标pcb
     /// @param pt siginfo结构体中，pid字段代表的含义
+    #[allow(clippy::if_same_then_else)]
     fn complete_signal(&self, pcb: Arc<ProcessControlBlock>, pt: PidType) {
         // kdebug!("complete_signal");
 
@@ -158,7 +159,7 @@ impl Signal {
             pcb.sig_info_mut()
                 .sig_pending_mut()
                 .signal_mut()
-                .insert(self.clone().into());
+                .insert((*self).into());
             target_pcb = Some(pcb.clone());
         } else if pt == PidType::PID {
             /*
@@ -189,7 +190,7 @@ impl Signal {
     #[inline]
     fn wants_signal(&self, pcb: Arc<ProcessControlBlock>) -> bool {
         // 如果改进程屏蔽了这个signal，则不能接收
-        if pcb.sig_info().sig_block().contains(self.clone().into()) {
+        if pcb.sig_info_irqsave().sig_block().contains((*self).into()) {
             return false;
         }
 
@@ -202,18 +203,14 @@ impl Signal {
             return true;
         }
         let state = pcb.sched_info().inner_lock_read_irqsave().state();
-        if state.is_blocked() && (state.is_blocked_interruptable() == false) {
+        if state.is_blocked() && (!state.is_blocked_interruptable()) {
             return false;
         }
 
         // todo: 检查目标进程是否正在一个cpu上执行，如果是，则返回true，否则继续检查下一项
 
         // 检查目标进程是否有信号正在等待处理，如果是，则返回false，否则返回true
-        if pcb.sig_info().sig_pending().signal().bits() == 0 {
-            return true;
-        } else {
-            return false;
-        }
+        return pcb.sig_info_irqsave().sig_pending().signal().bits() == 0;
     }
 
     /// @brief 判断signal的处理是否可能使得整个进程组退出
@@ -221,7 +218,7 @@ impl Signal {
     #[allow(dead_code)]
     #[inline]
     fn sig_fatal(&self, pcb: Arc<ProcessControlBlock>) -> bool {
-        let action = pcb.sig_struct().handlers[self.clone() as usize - 1].action();
+        let action = pcb.sig_struct().handlers[*self as usize - 1].action();
         // 如果handler是空，采用默认函数，signal处理可能会导致进程退出。
         match action {
             SigactionType::SaHandler(handler) => handler.is_sig_default(),
@@ -263,10 +260,14 @@ impl Signal {
         }
 
         // 一个被阻塞了的信号肯定是要被处理的
-        if pcb.sig_info().sig_block().contains(self.into_sigset()) {
+        if pcb
+            .sig_info_irqsave()
+            .sig_block()
+            .contains(self.into_sigset())
+        {
             return true;
         }
-        return !pcb.sig_struct().handlers[self.clone() as usize - 1].is_ignore();
+        return !pcb.sig_struct().handlers[*self as usize - 1].is_ignore();
 
         //TODO 仿照 linux 中的prepare signal完善逻辑，linux 中还会根据例如当前进程状态(Existing)进行判断，现在的信号能否发出就只是根据 ignored 来判断
     }
@@ -313,12 +314,10 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, _guard: SpinLockGuard<SignalStr
 
     if wakeup_ok {
         ProcessManager::kick(&pcb);
-    } else {
-        if fatal {
-            let _r = ProcessManager::wakeup(&pcb).map(|_| {
-                ProcessManager::kick(&pcb);
-            });
-        }
+    } else if fatal {
+        let _r = ProcessManager::wakeup(&pcb).map(|_| {
+            ProcessManager::kick(&pcb);
+        });
     }
 }
 
@@ -339,7 +338,7 @@ pub fn flush_signal_handlers(pcb: Arc<ProcessControlBlock>, force_default: bool)
 
     for sigaction in actions.iter_mut() {
         if force_default || !sigaction.is_ignore() {
-            sigaction.set_action(SigactionType::SaHandler(SaHandlerType::SigDefault));
+            sigaction.set_action(SigactionType::SaHandler(SaHandlerType::Default));
         }
         // 清除flags中，除了DFL和IGN以外的所有标志
         sigaction.set_restorer(None);
@@ -368,9 +367,8 @@ pub(super) fn do_sigaction(
 
     // 保存原有的 sigaction
     let old_act: Option<&mut Sigaction> = {
-        if old_act.is_some() {
-            let oa = old_act.unwrap();
-            *(oa) = (*action).clone();
+        if let Some(oa) = old_act {
+            *(oa) = *action;
             Some(oa)
         } else {
             None
@@ -378,8 +376,7 @@ pub(super) fn do_sigaction(
     };
     // 清除所有的脏的sa_flags位（也就是清除那些未使用的）
     let act = {
-        if act.is_some() {
-            let ac = act.unwrap();
+        if let Some(ac) = act {
             *ac.flags_mut() &= SigFlags::SA_ALL;
             Some(ac)
         } else {
@@ -387,15 +384,14 @@ pub(super) fn do_sigaction(
         }
     };
 
-    if old_act.is_some() {
-        *old_act.unwrap().flags_mut() &= SigFlags::SA_ALL;
+    if let Some(act) = old_act {
+        *act.flags_mut() &= SigFlags::SA_ALL;
     }
 
-    if act.is_some() {
-        let ac = act.unwrap();
+    if let Some(ac) = act {
         // 将act.sa_mask的SIGKILL SIGSTOP的屏蔽清除
         ac.mask_mut()
-            .remove(SigSet::from(Signal::SIGKILL.into()) | SigSet::from(Signal::SIGSTOP.into()));
+            .remove(<Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into());
 
         // 将新的sigaction拷贝到进程的action中
         *action = *ac;
@@ -422,7 +418,9 @@ pub(super) fn do_sigaction(
 ///
 /// - `new_set` 新的屏蔽信号bitmap的值
 pub fn set_current_sig_blocked(new_set: &mut SigSet) {
-    new_set.remove(SigSet::from(Signal::SIGKILL.into()) | SigSet::from(Signal::SIGSTOP.into()));
+    let to_remove: SigSet =
+        <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
+    new_set.remove(to_remove);
     //TODO 把这个散装函数用 sigsetops 替换掉
     let pcb = ProcessManager::current_pcb();
 
@@ -430,7 +428,7 @@ pub fn set_current_sig_blocked(new_set: &mut SigSet) {
         如果当前pcb的sig_blocked和新的相等，那么就不用改变它。
         请注意，一个进程的sig_blocked字段不能被其他进程修改！
     */
-    if pcb.sig_info().sig_block().eq(new_set) {
+    if pcb.sig_info_irqsave().sig_block().eq(new_set) {
         return;
     }
 

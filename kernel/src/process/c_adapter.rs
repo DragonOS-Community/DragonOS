@@ -18,7 +18,7 @@ unsafe extern "C" fn rs_get_idle_stack_top(cpu_id: u32) -> usize {
 
 #[no_mangle]
 unsafe extern "C" fn rs_current_pcb_cpuid() -> u32 {
-    return smp_get_processor_id();
+    return smp_get_processor_id().data();
 }
 
 #[no_mangle]

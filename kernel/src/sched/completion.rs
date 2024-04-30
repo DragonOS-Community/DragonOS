@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+
 use system_error::SystemError;
 
 use crate::{
@@ -23,7 +24,7 @@ impl Completion {
 
     /// @brief 基本函数：通用的处理wait命令的函数(即所有wait_for_completion函数最核心部分在这里)
     ///
-    /// @param timeout 非负整数
+    /// @param timeout jiffies
     /// @param interuptible 设置进程是否能被打断
     /// @return 返回剩余时间或者SystemError
     fn do_wait_for_common(&self, mut timeout: i64, interuptible: bool) -> Result<i64, SystemError> {
@@ -91,7 +92,7 @@ impl Completion {
     pub fn complete(&self) {
         let mut inner = self.inner.lock_irqsave();
         if inner.done != COMPLETE_ALL {
-            inner.done += 1;
+            inner.done = inner.done.saturating_add(1);
         }
         inner.wait_queue.wakeup(None);
         // 脱离生命周期，自动释放guard
@@ -148,7 +149,7 @@ impl InnerCompletion {
     pub const fn new() -> Self {
         Self {
             done: 0,
-            wait_queue: WaitQueue::INIT,
+            wait_queue: WaitQueue::default(),
         }
     }
 }

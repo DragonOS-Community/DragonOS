@@ -1,4 +1,5 @@
 pub mod devfs;
+pub mod devpts;
 pub mod fat;
 pub mod kernfs;
 pub mod mbr;

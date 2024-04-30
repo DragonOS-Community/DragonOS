@@ -61,7 +61,6 @@ pub trait PlatformDevice: Device {
     /// 设置id是否为自动分配
     fn set_pdev_id_auto(&self, id_auto: bool);
 
-    fn compatible_table(&self) -> CompatibleTable;
     /// @brief: 判断设备是否初始化
     /// @parameter: None
     /// @return: 如果已经初始化，返回true，否则，返回false
@@ -90,7 +89,7 @@ impl PlatformDeviceManager {
         let id = pdev.pdev_id().0;
         match id {
             PLATFORM_DEVID_NONE => {
-                pdev.set_name(format!("{}", pdev.pdev_name()));
+                pdev.set_name(pdev.pdev_name().to_string());
             }
             PLATFORM_DEVID_AUTO => {
                 let id = PLATFORM_DEVID_IDA.alloc().ok_or(SystemError::EOVERFLOW)?;
@@ -158,10 +157,7 @@ impl PlatformBusDevice {
     #[allow(dead_code)]
     fn is_initialized(&self) -> bool {
         let state = self.inner.lock().state;
-        match state {
-            BusState::Initialized => true,
-            _ => false,
-        }
+        matches!(state, BusState::Initialized)
     }
 
     /// @brief: 设置总线状态
@@ -237,7 +233,7 @@ impl KObject for PlatformBusDevice {
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.inner.lock().ktype.clone()
+        self.inner.lock().ktype
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
@@ -323,7 +319,7 @@ impl Device for PlatformBusDevice {
         todo!()
     }
 
-    fn set_class(&self, _class: Option<Arc<dyn Class>>) {
+    fn set_class(&self, _class: Option<Weak<dyn Class>>) {
         todo!()
     }
 }

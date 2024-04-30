@@ -1,6 +1,6 @@
 use core::{hint::spin_loop, sync::atomic::Ordering};
 
-use alloc::{format, string::ToString, sync::Arc};
+use alloc::sync::Arc;
 use system_error::SystemError;
 use uefi::proto::media::partition;
 
@@ -15,14 +15,17 @@ use crate::{
         sysfs::sysfs_init,
         vfs::{mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
     },
-    kdebug, kerror, kinfo,
+    kerror, kinfo,
     process::ProcessManager,
 };
 
 use super::{
+    fcntl::AtFlags,
     file::FileMode,
+    mount::{init_mountlist, MOUNT_LIST},
+    syscall::UmountFlag,
     utils::{rsplit_path, user_path_at},
-    IndexNode, InodeId, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 /// @brief 原子地生成新的Inode号。
@@ -53,22 +56,10 @@ pub fn vfs_init() -> Result<(), SystemError> {
     let ramfs = RamFS::new();
     let mount_fs = MountFS::new(ramfs, None);
     let root_inode = mount_fs.root_inode();
-
+    init_mountlist();
     unsafe {
         __ROOT_INODE = Some(root_inode.clone());
     }
-
-    // 创建文件夹
-    root_inode
-        .create("proc", FileType::Dir, ModeType::from_bits_truncate(0o755))
-        .expect("Failed to create /proc");
-    root_inode
-        .create("dev", FileType::Dir, ModeType::from_bits_truncate(0o755))
-        .expect("Failed to create /dev");
-    root_inode
-        .create("sys", FileType::Dir, ModeType::from_bits_truncate(0o755))
-        .expect("Failed to create /sys");
-    kdebug!("dir in root:{:?}", root_inode.list());
 
     procfs_init().expect("Failed to initialize procfs");
 
@@ -77,37 +68,9 @@ pub fn vfs_init() -> Result<(), SystemError> {
     sysfs_init().expect("Failed to initialize sysfs");
 
     let root_entries = ROOT_INODE().list().expect("VFS init failed");
-    if root_entries.len() > 0 {
+    if !root_entries.is_empty() {
         kinfo!("Successfully initialized VFS!");
     }
-    return Ok(());
-}
-
-/// @brief 真正执行伪文件系统迁移的过程
-///
-/// @param mountpoint_name 在根目录下的挂载点的名称
-/// @param inode 原本的挂载点的inode
-fn do_migrate(
-    new_root_inode: Arc<dyn IndexNode>,
-    mountpoint_name: &str,
-    fs: &MountFS,
-) -> Result<(), SystemError> {
-    let r = new_root_inode.find(mountpoint_name);
-    let mountpoint = if r.is_err() {
-        new_root_inode
-            .create(
-                mountpoint_name,
-                FileType::Dir,
-                ModeType::from_bits_truncate(0o755),
-            )
-            .expect(format!("Failed to create '/{mountpoint_name}' in migrating").as_str())
-    } else {
-        r.unwrap()
-    };
-    // 迁移挂载点
-    mountpoint
-        .mount(fs.inner_filesystem())
-        .expect(format!("Failed to migrate {mountpoint_name} ").as_str());
     return Ok(());
 }
 
@@ -116,29 +79,35 @@ fn do_migrate(
 fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemError> {
     kinfo!("VFS: Migrating filesystems...");
 
-    // ==== 在这里获取要被迁移的文件系统的inode ===
-    let binding = ROOT_INODE().find("proc").expect("ProcFS not mounted!").fs();
-    let proc: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
-    let binding = ROOT_INODE().find("dev").expect("DevFS not mounted!").fs();
-    let dev: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
-    let binding = ROOT_INODE().find("sys").expect("SysFs not mounted!").fs();
-    let sys: &MountFS = binding.as_any_ref().downcast_ref::<MountFS>().unwrap();
-
     let new_fs = MountFS::new(new_fs, None);
     // 获取新的根文件系统的根节点的引用
     let new_root_inode = new_fs.root_inode();
 
-    // 把上述文件系统,迁移到新的文件系统下
-    do_migrate(new_root_inode.clone(), "proc", proc)?;
-    do_migrate(new_root_inode.clone(), "dev", dev)?;
-    do_migrate(new_root_inode.clone(), "sys", sys)?;
+    // ==== 在这里获取要被迁移的文件系统的inode并迁移 ===
+    // 因为是换根所以路径没有变化
+    // 不需要重新注册挂载目录
+    new_root_inode
+        .mkdir("proc", ModeType::from_bits_truncate(0o755))
+        .expect("Unable to create /proc")
+        .mount_from(ROOT_INODE().find("proc").expect("proc not mounted!"))
+        .expect("Failed to migrate filesystem of proc");
+    new_root_inode
+        .mkdir("dev", ModeType::from_bits_truncate(0o755))
+        .expect("Unable to create /dev")
+        .mount_from(ROOT_INODE().find("dev").expect("dev not mounted!"))
+        .expect("Failed to migrate filesystem of dev");
+    new_root_inode
+        .mkdir("sys", ModeType::from_bits_truncate(0o755))
+        .expect("Unable to create /sys")
+        .mount_from(ROOT_INODE().find("sys").expect("sys not mounted!"))
+        .expect("Failed to migrate filesystem of sys");
+
     unsafe {
         // drop旧的Root inode
         let old_root_inode = __ROOT_INODE.take().unwrap();
-        drop(old_root_inode);
-
         // 设置全局的新的ROOT Inode
-        __ROOT_INODE = Some(new_root_inode);
+        __ROOT_INODE = Some(new_root_inode.clone());
+        drop(old_root_inode);
     }
 
     kinfo!("VFS: Migrate filesystems done!");
@@ -146,14 +115,37 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     return Ok(());
 }
 
+fn root_partition() -> Arc<Partition> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use alloc::string::ToString;
+        return crate::driver::disk::ahci::get_disks_by_name("ahci_disk_0".to_string())
+            .unwrap()
+            .0
+            .lock()
+            .partitions[0]
+            .clone();
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        use crate::driver::base::block::block_device::BlockDevice;
+
+        let virtio0 = crate::driver::block::virtio_blk::virtio_blk_0();
+        if virtio0.is_none() {
+            kerror!("Failed to get virtio_blk_0");
+            loop {
+                spin_loop();
+            }
+        }
+
+        let virtio0 = virtio0.unwrap();
+        return virtio0.partitions()[0].clone();
+    }
+}
 pub fn mount_root_fs() -> Result<(), SystemError> {
     kinfo!("Try to mount FAT32 as root fs...");
-    let partiton: Arc<Partition> = ahci::get_disks_by_name("ahci_disk_0".to_string())
-        .unwrap()
-        .0
-        .lock()
-        .partitions[0]
-        .clone();
+    let partiton: Arc<Partition> = root_partition();
 
     let fatfs: Result<Arc<FATFileSystem>, SystemError> = FATFileSystem::new(partiton);
     if fatfs.is_err() {
@@ -214,59 +206,35 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
 }
 
 /// @brief 创建文件/文件夹
-pub fn do_mkdir(path: &str, _mode: FileMode) -> Result<u64, SystemError> {
-    // 文件名过长
-    if path.len() > MAX_PATHLEN as usize {
-        return Err(SystemError::ENAMETOOLONG);
+pub fn do_mkdir_at(
+    dirfd: i32,
+    path: &str,
+    mode: FileMode,
+) -> Result<Arc<dyn IndexNode>, SystemError> {
+    // kdebug!("Call do mkdir at");
+    let (mut current_inode, path) =
+        user_path_at(&ProcessManager::current_pcb(), dirfd, path.trim())?;
+    let (name, parent) = rsplit_path(&path);
+    if let Some(parent) = parent {
+        current_inode = current_inode.lookup(parent)?;
     }
-
-    let inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().lookup(path);
-
-    if inode.is_err() {
-        let errno = inode.unwrap_err();
-        // 文件不存在，且需要创建
-        if errno == SystemError::ENOENT {
-            let (filename, parent_path) = rsplit_path(path);
-            // 查找父目录
-            let parent_inode: Arc<dyn IndexNode> =
-                ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
-            // 创建文件夹
-            let _create_inode: Arc<dyn IndexNode> = parent_inode.create(
-                filename,
-                FileType::Dir,
-                ModeType::from_bits_truncate(0o755),
-            )?;
-        } else {
-            // 不需要创建文件，因此返回错误码
-            return Err(errno);
-        }
-    }
-
-    return Ok(0);
+    // kdebug!("mkdir at {:?}", current_inode.metadata()?.inode_id);
+    return current_inode.mkdir(name, ModeType::from_bits_truncate(mode.bits()));
 }
 
 /// @brief 删除文件夹
 pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
-    // 文件名过长
-    if path.len() > MAX_PATHLEN as usize {
-        return Err(SystemError::ENAMETOOLONG);
-    }
+    let path = path.trim();
 
     let pcb = ProcessManager::current_pcb();
     let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
+    let (filename, parent_path) = rsplit_path(&remain_path);
 
-    let inode: Result<Arc<dyn IndexNode>, SystemError> =
-        inode_begin.lookup_follow_symlink(remain_path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES);
-
-    if inode.is_err() {
-        let errno = inode.unwrap_err();
-        // 文件不存在
-        if errno == SystemError::ENOENT {
-            return Err(SystemError::ENOENT);
-        }
+    // 最后一项文件项为.时返回EINVAL
+    if filename == "." {
+        return Err(SystemError::EINVAL);
     }
 
-    let (filename, parent_path) = rsplit_path(&remain_path);
     // 查找父目录
     let parent_inode: Arc<dyn IndexNode> = inode_begin
         .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
@@ -275,7 +243,8 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::ENOTDIR);
     }
 
-    let target_inode: Arc<dyn IndexNode> = parent_inode.find(filename)?;
+    // 在目标点为symlink时也返回ENOTDIR
+    let target_inode = parent_inode.find(filename)?;
     if target_inode.metadata()?.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
@@ -288,13 +257,10 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 
 /// @brief 删除文件
 pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
-    // 文件名过长
-    if path.len() > MAX_PATHLEN as usize {
-        return Err(SystemError::ENAMETOOLONG);
-    }
+    let path = path.trim();
+
     let pcb = ProcessManager::current_pcb();
     let (inode_begin, remain_path) = user_path_at(&pcb, dirfd, path)?;
-
     let inode: Result<Arc<dyn IndexNode>, SystemError> =
         inode_begin.lookup_follow_symlink(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
@@ -323,4 +289,103 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     parent_inode.unlink(filename)?;
 
     return Ok(0);
+}
+
+/// # do_mount - 挂载文件系统
+///
+/// 将给定的文件系统挂载到指定的挂载点。
+///
+/// 此函数会检查是否已经挂载了相同的文件系统，如果已经挂载，则返回错误。
+/// 它还会处理符号链接，并确保挂载点是有效的。
+///
+/// ## 参数
+///
+/// - `fs`: Arc<dyn FileSystem>，要挂载的文件系统。
+/// - `mount_point`: &str，挂载点路径。
+///
+/// ## 返回值
+///
+/// - `Ok(Arc<MountFS>)`: 挂载成功后返回挂载的文件系统。
+/// - `Err(SystemError)`: 挂载失败时返回错误。
+pub fn do_mount(fs: Arc<dyn FileSystem>, mount_point: &str) -> Result<Arc<MountFS>, SystemError> {
+    let (current_node, rest_path) = user_path_at(
+        &ProcessManager::current_pcb(),
+        AtFlags::AT_FDCWD.bits(),
+        mount_point,
+    )?;
+    let inode = current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    if let Some((_, rest, _fs)) = MOUNT_LIST().get_mount_point(mount_point) {
+        if rest.is_empty() {
+            return Err(SystemError::EBUSY);
+        }
+    }
+    // 移至IndexNode.mount()来记录
+    return inode.mount(fs);
+}
+
+/// # do_mount_mkdir - 在指定挂载点创建目录并挂载文件系统
+///
+/// 在指定的挂载点创建一个目录，并将其挂载到文件系统中。如果挂载点已经存在，并且不是空的，
+/// 则会返回错误。成功时，会返回一个新的挂载文件系统的引用。
+///
+/// ## 参数
+///
+/// - `fs`: FileSystem - 文件系统的引用，用于创建和挂载目录。
+/// - `mount_point`: &str - 挂载点路径，用于创建和挂载目录。
+///
+/// ## 返回值
+///
+/// - `Ok(Arc<MountFS>)`: 成功挂载文件系统后，返回挂载文件系统的共享引用。
+/// - `Err(SystemError)`: 挂载失败时，返回系统错误。
+pub fn do_mount_mkdir(
+    fs: Arc<dyn FileSystem>,
+    mount_point: &str,
+) -> Result<Arc<MountFS>, SystemError> {
+    let inode = do_mkdir_at(
+        AtFlags::AT_FDCWD.bits(),
+        mount_point,
+        FileMode::from_bits_truncate(0o755),
+    )?;
+    if let Some((_, rest, _fs)) = MOUNT_LIST().get_mount_point(mount_point) {
+        if rest.is_empty() {
+            return Err(SystemError::EBUSY);
+        }
+    }
+    return inode.mount(fs);
+}
+
+/// # do_umount2 - 执行卸载文件系统的函数
+///
+/// 这个函数用于卸载指定的文件系统。
+///
+/// ## 参数
+///
+/// - dirfd: i32 - 目录文件描述符，用于指定要卸载的文件系统的根目录。
+/// - target: &str - 要卸载的文件系统的目标路径。
+/// - _flag: UmountFlag - 卸载标志，目前未使用。
+///
+/// ## 返回值
+///
+/// - Ok(Arc<MountFS>): 成功时返回文件系统的 Arc 引用。
+/// - Err(SystemError): 出错时返回系统错误。
+///
+/// ## 错误处理
+///
+/// 如果指定的路径没有对应的文件系统，或者在尝试卸载时发生错误，将返回错误。
+pub fn do_umount2(
+    dirfd: i32,
+    target: &str,
+    _flag: UmountFlag,
+) -> Result<Arc<MountFS>, SystemError> {
+    let (work, rest) = user_path_at(&ProcessManager::current_pcb(), dirfd, target)?;
+    let path = work.absolute_path()? + &rest;
+    let do_umount = || -> Result<Arc<MountFS>, SystemError> {
+        if let Some(fs) = MOUNT_LIST().remove(path) {
+            // Todo: 占用检测
+            fs.umount()?;
+            return Ok(fs);
+        }
+        return Err(SystemError::EINVAL);
+    };
+    return do_umount();
 }

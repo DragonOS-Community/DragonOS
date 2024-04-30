@@ -9,9 +9,9 @@
       }
     }
   },
-  "depends": [ ],
+  "depends": [],
   "build": {
-    "build_command": "make"
+    "build_command": "make install -j $(nproc)"
   },
   "install": {
     "in_dragonos_path": "/bin"
@@ -19,5 +19,6 @@
   "clean": {
     "clean_command": "make clean"
   },
-  "envs": []
+  "envs": [],
+  "target_arch": ["x86_64"]
 }

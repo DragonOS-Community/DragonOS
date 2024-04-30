@@ -1,5 +1,5 @@
 use crate::{
-    driver::pci::pci::{BusDeviceFunction, PciAddr, PciError, PciRoot, SegmentGroupNumber},
+    driver::pci::pci::{BusDeviceFunction, PciAddr},
     mm::PhysAddr,
 };
 
@@ -31,8 +31,4 @@ pub trait TraitPciArch {
     /// @param address PCI域地址
     /// @return usize 转换结果
     fn address_pci_to_physical(pci_address: PciAddr) -> PhysAddr;
-    /// @brief 获取Segement的root地址,x86_64架构为acpi mcfg表中读取
-    /// @param segement 组id
-    /// @return  Result<PciRoot, PciError> 转换结果或出错原因
-    fn ecam_root(segement: SegmentGroupNumber) -> Result<PciRoot, PciError>;
 }

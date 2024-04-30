@@ -5,6 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
+    ipc::shm::ShmFlags,
     kerror,
     libs::align::{check_aligned, page_align_up},
     mm::MemoryManagementArch,
@@ -71,6 +72,70 @@ bitflags! {
         const MREMAP_FIXED = 2;
         const MREMAP_DONTUNMAP = 4;
     }
+
+
+    pub struct MadvFlags: u64 {
+        /// 默认行为，系统会进行一定的预读和预写，适用于一般读取场景
+        const MADV_NORMAL = 0;
+        /// 随机访问模式，系统会尽量最小化数据读取量，适用于随机访问的场景
+        const MADV_RANDOM = 1;
+        /// 顺序访问模式，系统会进行积极的预读，访问后的页面可以尽快释放，适用于顺序读取场景
+        const MADV_SEQUENTIAL = 2;
+        /// 通知系统预读某些页面，用于应用程序提前准备数据
+        const MADV_WILLNEED = 3;
+        /// 通知系统应用程序不再需要某些页面，内核可以释放相关资源
+        const MADV_DONTNEED = 4;
+
+        /// 将指定范围的页面标记为延迟释放，真正的释放会延迟至内存压力发生时
+        const MADV_FREE = 8;
+        /// 应用程序请求释放指定范围的页面和相关的后备存储
+        const MADV_REMOVE = 9;
+        /// 在 fork 时排除指定区域
+        const MADV_DONTFORK = 10;
+        /// 取消 MADV_DONTFORK 的效果，不再在 fork 时排除指定区域
+        const MADV_DOFORK = 11;
+        /// 模拟内存硬件错误，触发内存错误处理器处理
+        const MADV_HWPOISON = 100;
+        /// 尝试软下线指定的内存范围
+        const MADV_SOFT_OFFLINE = 101;
+
+        /// 应用程序建议内核尝试合并指定范围内内容相同的页面
+        const MADV_MERGEABLE = 12;
+        /// 取消 MADV_MERGEABLE 的效果，不再合并页面
+        const MADV_UNMERGEABLE = 13;
+
+        /// 应用程序希望将指定范围以透明大页方式支持
+        const MADV_HUGEPAGE = 14;
+        /// 将指定范围标记为不值得用透明大页支持
+        const MADV_NOHUGEPAGE = 15;
+
+        /// 应用程序请求在核心转储时排除指定范围内的页面
+        const MADV_DONTDUMP = 16;
+        /// 取消 MADV_DONTDUMP 的效果，不再排除核心转储时的页面
+        const MADV_DODUMP = 17;
+
+        /// 在 fork 时将子进程的该区域内存填充为零
+        const MADV_WIPEONFORK = 18;
+        /// 取消 `MADV_WIPEONFORK` 的效果，不再在 fork 时填充子进程的内存
+        const MADV_KEEPONFORK = 19;
+
+        /// 应用程序不会立刻使用这些内存，内核将页面设置为非活动状态以便在内存压力发生时轻松回收
+        const MADV_COLD = 20;
+        /// 应用程序不会立刻使用这些内存，内核立即将这些页面换出
+        const MADV_PAGEOUT = 21;
+
+        /// 预先填充页面表，可读，通过触发读取故障
+        const MADV_POPULATE_READ = 22;
+        /// 预先填充页面表，可写，通过触发写入故障
+        const MADV_POPULATE_WRITE = 23;
+
+        /// 与 `MADV_DONTNEED` 类似，会将被锁定的页面释放
+        const MADV_DONTNEED_LOCKED = 24;
+
+        /// 同步将页面合并为新的透明大页
+        const MADV_COLLAPSE = 25;
+
+    }
 }
 
 impl From<MapFlags> for VmFlags {
@@ -113,39 +178,65 @@ impl From<ProtFlags> for VmFlags {
     }
 }
 
-impl Into<MapFlags> for VmFlags {
-    fn into(self) -> MapFlags {
+impl From<ShmFlags> for VmFlags {
+    fn from(shm_flags: ShmFlags) -> Self {
+        let mut vm_flags = VmFlags::VM_NONE;
+
+        if shm_flags.contains(ShmFlags::SHM_RDONLY) {
+            vm_flags |= VmFlags::VM_READ;
+        } else {
+            vm_flags |= VmFlags::VM_READ | VmFlags::VM_WRITE;
+        }
+
+        if shm_flags.contains(ShmFlags::SHM_EXEC) {
+            vm_flags |= VmFlags::VM_EXEC;
+        }
+
+        if shm_flags.contains(ShmFlags::SHM_HUGETLB) {
+            vm_flags |= VmFlags::VM_HUGETLB;
+        }
+
+        vm_flags
+    }
+}
+
+impl From<VmFlags> for MapFlags {
+    fn from(value: VmFlags) -> Self {
         let mut map_flags = MapFlags::MAP_NONE;
 
-        if self.contains(VmFlags::VM_GROWSDOWN) {
+        if value.contains(VmFlags::VM_GROWSDOWN) {
             map_flags |= MapFlags::MAP_GROWSDOWN;
         }
 
-        if self.contains(VmFlags::VM_LOCKED) {
+        if value.contains(VmFlags::VM_LOCKED) {
             map_flags |= MapFlags::MAP_LOCKED;
         }
 
-        if self.contains(VmFlags::VM_SYNC) {
+        if value.contains(VmFlags::VM_SYNC) {
             map_flags |= MapFlags::MAP_SYNC;
+        }
+
+        if value.contains(VmFlags::VM_MAYSHARE) {
+            map_flags |= MapFlags::MAP_SHARED;
         }
 
         map_flags
     }
 }
 
-impl Into<ProtFlags> for VmFlags {
-    fn into(self) -> ProtFlags {
+impl From<VmFlags> for ProtFlags {
+    fn from(value: VmFlags) -> Self {
         let mut prot_flags = ProtFlags::PROT_NONE;
 
-        if self.contains(VmFlags::VM_READ) {
+        if value.contains(VmFlags::VM_READ) {
             prot_flags |= ProtFlags::PROT_READ;
         }
 
-        if self.contains(VmFlags::VM_WRITE) {
+        if value.contains(VmFlags::VM_WRITE) {
             prot_flags |= ProtFlags::PROT_WRITE;
         }
 
-        if self.contains(VmFlags::VM_EXEC) {
+        if value.contains(VmFlags::VM_EXEC) {
             prot_flags |= ProtFlags::PROT_EXEC;
         }
 
@@ -223,13 +314,13 @@ impl Syscall {
         // 暂时不支持除匿名页以外的映射
         if !map_flags.contains(MapFlags::MAP_ANONYMOUS) {
             kerror!("mmap: not support file mapping");
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::ENOSYS);
         }
 
         // 暂时不支持巨页映射
         if map_flags.contains(MapFlags::MAP_HUGETLB) {
             kerror!("mmap: not support huge page mapping");
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::ENOSYS);
         }
         let current_address_space = AddressSpace::current()?;
         let start_page = current_address_space.write().map_anonymous(
@@ -237,6 +328,7 @@ impl Syscall {
             len,
             prot_flags,
             map_flags,
+            true,
             true,
         )?;
         return Ok(start_page.virt_address().data());
@@ -298,7 +390,7 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
         let vma = vma.unwrap();
-        let vm_flags = vma.lock().vm_flags().clone();
+        let vm_flags = *vma.lock().vm_flags();
 
         // 暂时不支持巨页映射
         if vm_flags.contains(VmFlags::VM_HUGETLB) {
@@ -393,6 +485,42 @@ impl Syscall {
         current_address_space
             .write()
             .mprotect(start_frame, page_count, prot_flags)
+            .map_err(|_| SystemError::EINVAL)?;
+        return Ok(0);
+    }
+
+    /// ## madvise系统调用
+    ///
+    /// ## 参数
+    ///
+    /// - `start_vaddr`：起始地址(已经对齐到页)
+    /// - `len`：长度(已经对齐到页)
+    /// - `madv_flags`：建议标志
+    pub fn madvise(
+        start_vaddr: VirtAddr,
+        len: usize,
+        madv_flags: usize,
+    ) -> Result<usize, SystemError> {
+        if !start_vaddr.check_aligned(MMArch::PAGE_SIZE) || !check_aligned(len, MMArch::PAGE_SIZE) {
+            return Err(SystemError::EINVAL);
+        }
+
+        if unlikely(verify_area(start_vaddr, len).is_err()) {
+            return Err(SystemError::EINVAL);
+        }
+        if unlikely(len == 0) {
+            return Err(SystemError::EINVAL);
+        }
+
+        let madv_flags = MadvFlags::from_bits(madv_flags as u64).ok_or(SystemError::EINVAL)?;
+
+        let current_address_space: Arc<AddressSpace> = AddressSpace::current()?;
+        let start_frame = VirtPageFrame::new(start_vaddr);
+        let page_count = PageFrameCount::new(len / MMArch::PAGE_SIZE);
+
+        current_address_space
+            .write()
+            .madvise(start_frame, page_count, madv_flags)
             .map_err(|_| SystemError::EINVAL)?;
         return Ok(0);
     }

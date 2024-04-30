@@ -6,7 +6,7 @@ use x86::{apic::Icr, msr::IA32_APIC_BASE};
 
 use crate::{
     arch::{
-        driver::apic::{ioapic::ioapic_init, x2apic::X2Apic, xapic::XApic},
+        driver::apic::{hw_irq::ApicId, x2apic::X2Apic, xapic::XApic},
         io::PortIOArch,
         CurrentPortIOArch,
     },
@@ -22,7 +22,9 @@ use self::{
 
 pub mod apic_timer;
 mod c_adapter;
+pub mod hw_irq;
 pub mod ioapic;
+pub mod lapic_vector;
 pub mod x2apic;
 pub mod xapic;
 
@@ -63,7 +65,7 @@ pub trait LocalAPIC {
     fn max_lvt_entry(&self) -> u8;
 
     /// @brief 获取当前处理器的APIC ID
-    fn id(&self) -> u32;
+    fn id(&self) -> ApicId;
 
     /// @brief 设置LVT寄存器
     ///
@@ -116,9 +118,9 @@ pub enum LVTRegister {
     ErrorReg = 0x837,
 }
 
-impl Into<u32> for LVTRegister {
-    fn into(self) -> u32 {
-        self as u32
+impl From<LVTRegister> for u32 {
+    fn from(val: LVTRegister) -> Self {
+        val as u32
     }
 }
 
@@ -452,9 +454,9 @@ impl CurrentApic {
     }
 
     pub(self) unsafe fn write_xapic_register(&self, reg: XApicOffset, value: u32) {
-        current_xapic_instance().borrow_mut().as_mut().map(|xapic| {
+        if let Some(xapic) = current_xapic_instance().borrow_mut().as_mut() {
             xapic.write(reg, value);
-        });
+        }
     }
 
     /// 屏蔽类8259A芯片
@@ -481,20 +483,20 @@ impl LocalAPIC for CurrentApic {
 
     fn init_current_cpu(&mut self) -> bool {
         let cpu_id = smp_get_processor_id();
-        if cpu_id == 0 {
+        if cpu_id.data() == 0 {
             unsafe {
                 self.mask8259a();
             }
         }
-        kinfo!("Initializing apic for cpu {}", cpu_id);
+        kinfo!("Initializing apic for cpu {:?}", cpu_id);
         if X2Apic::support() && X2Apic.init_current_cpu() {
-            if cpu_id == 0 {
+            if cpu_id.data() == 0 {
                 LOCAL_APIC_ENABLE_TYPE.store(LocalApicEnableType::X2Apic, Ordering::SeqCst);
             }
-            kinfo!("x2APIC initialized for cpu {}", cpu_id);
+            kinfo!("x2APIC initialized for cpu {:?}", cpu_id);
         } else {
             kinfo!("x2APIC not supported or failed to initialize, fallback to xAPIC.");
-            if cpu_id == 0 {
+            if cpu_id.data() == 0 {
                 LOCAL_APIC_ENABLE_TYPE.store(LocalApicEnableType::XApic, Ordering::SeqCst);
             }
             let apic_base =
@@ -512,11 +514,9 @@ impl LocalAPIC for CurrentApic {
                 xapic.init_current_cpu();
             }
 
-            kinfo!("xAPIC initialized for cpu {}", cpu_id);
+            kinfo!("xAPIC initialized for cpu {:?}", cpu_id);
         }
-        if cpu_id == 0 {
-            ioapic_init();
-        }
+
         kinfo!("Apic initialized.");
         return true;
     }
@@ -524,10 +524,8 @@ impl LocalAPIC for CurrentApic {
     fn send_eoi(&self) {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             X2Apic.send_eoi();
-        } else {
-            current_xapic_instance().borrow().as_ref().map(|xapic| {
-                xapic.send_eoi();
-            });
+        } else if let Some(xapic) = current_xapic_instance().borrow().as_ref() {
+            xapic.send_eoi();
         }
     }
 
@@ -567,7 +565,7 @@ impl LocalAPIC for CurrentApic {
         }
     }
 
-    fn id(&self) -> u32 {
+    fn id(&self) -> ApicId {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             return X2Apic.id();
         } else {
@@ -575,17 +573,15 @@ impl LocalAPIC for CurrentApic {
                 .borrow()
                 .as_ref()
                 .map(|xapic| xapic.id())
-                .unwrap_or(0);
+                .unwrap_or(ApicId::new(0));
         }
     }
 
     fn set_lvt(&mut self, lvt: LVT) {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             X2Apic.set_lvt(lvt);
-        } else {
-            current_xapic_instance().borrow_mut().as_mut().map(|xapic| {
-                xapic.set_lvt(lvt);
-            });
+        } else if let Some(xapic) = current_xapic_instance().borrow_mut().as_mut() {
+            xapic.set_lvt(lvt);
         }
     }
 
@@ -604,20 +600,16 @@ impl LocalAPIC for CurrentApic {
     fn mask_all_lvt(&mut self) {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             X2Apic.mask_all_lvt();
-        } else {
-            current_xapic_instance().borrow_mut().as_mut().map(|xapic| {
-                xapic.mask_all_lvt();
-            });
+        } else if let Some(xapic) = current_xapic_instance().borrow_mut().as_mut() {
+            xapic.mask_all_lvt();
         }
     }
 
     fn write_icr(&self, icr: Icr) {
         if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
             X2Apic.write_icr(icr);
-        } else {
-            current_xapic_instance().borrow().as_ref().map(|xapic| {
-                xapic.write_icr(icr);
-            });
+        } else if let Some(xapic) = current_xapic_instance().borrow().as_ref() {
+            xapic.write_icr(icr);
         }
     }
 }

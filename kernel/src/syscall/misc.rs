@@ -1,11 +1,11 @@
-use alloc::vec::Vec;
-use system_error::SystemError;
-
 use crate::{
     arch::{mm::LockedFrameAllocator, rand::rand},
     libs::rand::GRandFlags,
-    mm::allocator::page_frame::FrameAllocator,
+    mm::allocator::{page_frame::FrameAllocator, slab::slab_usage},
 };
+use alloc::vec::Vec;
+use core::cmp;
+use system_error::SystemError;
 
 use super::{user_access::UserBufferWriter, Syscall};
 
@@ -38,10 +38,11 @@ impl Syscall {
         let mut sysinfo = SysInfo::default();
 
         let mem = unsafe { LockedFrameAllocator.usage() };
+        let slab_usage = unsafe { slab_usage() };
         sysinfo.uptime = 0;
         sysinfo.loads = [0; 3];
         sysinfo.totalram = mem.total().bytes() as u64;
-        sysinfo.freeram = mem.free().bytes() as u64;
+        sysinfo.freeram = mem.free().bytes() as u64 + slab_usage.free();
         sysinfo.sharedram = 0;
         sysinfo.bufferram = 0;
         sysinfo.totalswap = 0;
@@ -63,7 +64,6 @@ impl Syscall {
     }
 
     /// ## 将随机字节填入buf
-    ///
     /// ### 该系统调用与linux不一致，因为目前没有其他随机源
     pub fn get_random(buf: *mut u8, len: usize, flags: GRandFlags) -> Result<usize, SystemError> {
         if flags.bits() == (GRandFlags::GRND_INSECURE.bits() | GRandFlags::GRND_RANDOM.bits()) {
@@ -75,9 +75,12 @@ impl Syscall {
         let mut ret = Vec::new();
         let mut count = 0;
         while count < len {
+            // 对 len - count 的长度进行判断，remain_len 小于4则循环次数和 remain_len 相等
+            let remain_len = len - count;
+            let step = cmp::min(remain_len, 4);
             let rand = rand();
-            for offset in 0..4 {
-                ret.push((rand >> offset * 2) as u8);
+            for offset in 0..step {
+                ret.push((rand >> (offset * 2)) as u8);
                 count += 1;
             }
         }

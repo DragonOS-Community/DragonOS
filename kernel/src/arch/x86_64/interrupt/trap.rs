@@ -1,8 +1,12 @@
 use system_error::SystemError;
 
 use crate::{
-    arch::CurrentIrqArch, exception::InterruptArch, kerror, kwarn, mm::VirtAddr, print,
-    process::ProcessManager, smp::core::smp_get_processor_id,
+    arch::{CurrentIrqArch, MMArch},
+    exception::InterruptArch,
+    kerror, kwarn,
+    mm::VirtAddr,
+    process::ProcessManager,
+    smp::core::smp_get_processor_id,
 };
 
 use super::{
@@ -31,6 +35,46 @@ extern "C" {
     fn trap_machine_check();
     fn trap_SIMD_exception();
     fn trap_virtualization_exception();
+}
+
+bitflags! {
+    pub struct TrapNr: u64 {
+        const X86_TRAP_DE = 0;
+        const X86_TRAP_DB = 1;
+        const X86_TRAP_NMI = 2;
+        const X86_TRAP_BP = 3;
+        const X86_TRAP_OF = 4;
+        const X86_TRAP_BR = 5;
+        const X86_TRAP_UD = 6;
+        const X86_TRAP_NM = 7;
+        const X86_TRAP_DF = 8;
+        const X86_TRAP_OLD_MF = 9;
+        const X86_TRAP_TS = 10;
+        const X86_TRAP_NP = 11;
+        const X86_TRAP_SS = 12;
+        const X86_TRAP_GP = 13;
+        const X86_TRAP_PF = 14;
+        const X86_TRAP_SPURIOUS = 15;
+        const X86_TRAP_MF = 16;
+        const X86_TRAP_AC = 17;
+        const X86_TRAP_MC = 18;
+        const X86_TRAP_XF = 19;
+        const X86_TRAP_VE = 20;
+        const X86_TRAP_CP = 21;
+        const X86_TRAP_VC = 29;
+        const X86_TRAP_IRET = 32;
+    }
+
+        pub struct X86PfErrorCode : u32{
+        const X86_PF_PROT = 1 << 0;
+        const X86_PF_WRITE = 1 << 1;
+        const X86_PF_USER = 1 << 2;
+        const X86_PF_RSVD = 1 << 3;
+        const X86_PF_INSTR = 1 << 4;
+        const X86_PF_PK = 1 << 5;
+        const X86_PF_SHSTK = 1 << 6;
+        const X86_PF_SGX = 1 << 15;
+    }
 }
 
 #[inline(never)]
@@ -73,7 +117,7 @@ unsafe extern "C" fn do_divide_error(regs: &'static TrapFrame, error_code: u64) 
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Divide Error");
@@ -87,7 +131,7 @@ unsafe extern "C" fn do_debug(regs: &'static TrapFrame, error_code: u64) {
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Debug Exception");
@@ -101,7 +145,7 @@ unsafe extern "C" fn do_nmi(regs: &'static TrapFrame, error_code: u64) {
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("NMI Interrupt");
@@ -115,7 +159,7 @@ unsafe extern "C" fn do_int3(regs: &'static TrapFrame, error_code: u64) {
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Int3");
@@ -129,7 +173,7 @@ unsafe extern "C" fn do_overflow(regs: &'static TrapFrame, error_code: u64) {
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Overflow Exception");
@@ -143,7 +187,7 @@ unsafe extern "C" fn do_bounds(regs: &'static TrapFrame, error_code: u64) {
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Bounds Check");
@@ -157,7 +201,7 @@ unsafe extern "C" fn do_undefined_opcode(regs: &'static TrapFrame, error_code: u
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Undefined Opcode");
@@ -171,7 +215,7 @@ unsafe extern "C" fn do_dev_not_avaliable(regs: &'static TrapFrame, error_code: 
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Device Not Available");
@@ -185,7 +229,7 @@ unsafe extern "C" fn do_double_fault(regs: &'static TrapFrame, error_code: u64) 
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Double Fault");
@@ -199,7 +243,7 @@ unsafe extern "C" fn do_coprocessor_segment_overrun(regs: &'static TrapFrame, er
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Coprocessor Segment Overrun");
@@ -214,29 +258,26 @@ unsafe extern "C" fn do_invalid_TSS(regs: &'static TrapFrame, error_code: u64) {
     const ERR_MSG_3: &str = "Refers to a descriptor in the current LDT.\n";
     const ERR_MSG_4: &str = "Refers to a descriptor in the GDT.\n";
 
-    let msg1: &str;
-    if (error_code & 0x1) != 0 {
-        msg1 = ERR_MSG_1;
+    let msg1: &str = if (error_code & 0x1) != 0 {
+        ERR_MSG_1
     } else {
-        msg1 = "";
-    }
+        ""
+    };
 
-    let msg2: &str;
-    if (error_code & 0x02) != 0 {
-        msg2 = ERR_MSG_2;
+    let msg2: &str = if (error_code & 0x02) != 0 {
+        ERR_MSG_2
+    } else if (error_code & 0x04) != 0 {
+        ERR_MSG_3
     } else {
-        if (error_code & 0x04) != 0 {
-            msg2 = ERR_MSG_3;
-        } else {
-            msg2 = ERR_MSG_4;
-        }
-    }
+        ERR_MSG_4
+    };
+
     kerror!(
         "do_invalid_TSS(10), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}\n{}{}",
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid(),
         msg1,
         msg2
@@ -252,7 +293,7 @@ unsafe extern "C" fn do_segment_not_exists(regs: &'static TrapFrame, error_code:
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Segment Not Exists");
@@ -266,7 +307,7 @@ unsafe extern "C" fn do_stack_segment_fault(regs: &'static TrapFrame, error_code
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Stack Segment Fault");
@@ -281,39 +322,37 @@ unsafe extern "C" fn do_general_protection(regs: &'static TrapFrame, error_code:
     const ERR_MSG_4: &str = "Refers to a segment or gate descriptor in the LDT;\n";
     const ERR_MSG_5: &str = "Refers to a descriptor in the current GDT;\n";
 
-    let msg1: &str;
-    if (error_code & 0x1) != 0 {
-        msg1 = ERR_MSG_1;
+    let msg1: &str = if (error_code & 0x1) != 0 {
+        ERR_MSG_1
     } else {
-        msg1 = "";
-    }
+        ""
+    };
 
-    let msg2: &str;
-    if (error_code & 0x02) != 0 {
-        msg2 = ERR_MSG_2;
+    let msg2: &str = if (error_code & 0x02) != 0 {
+        ERR_MSG_2
     } else {
-        msg2 = ERR_MSG_3;
-    }
+        ERR_MSG_3
+    };
 
-    let msg3: &str;
-    if (error_code & 0x02) == 0 {
+    let msg3: &str = if (error_code & 0x02) == 0 {
         if (error_code & 0x04) != 0 {
-            msg3 = ERR_MSG_4;
+            ERR_MSG_4
         } else {
-            msg3 = ERR_MSG_5;
+            ERR_MSG_5
         }
     } else {
-        msg3 = "";
-    }
+        ""
+    };
     kerror!(
-        "do_general_protection(13), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}
+        "do_general_protection(13), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t rflags: {:#x}\t CPU: {}, \tpid: {:?}
 {}{}{}
 Segment Selector Index: {:#x}\n
 ",
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        regs.rflags,
+        smp_get_processor_id().data(),
         ProcessManager::current_pid(),
         msg1, msg2, msg3,
         error_code & 0xfff8
@@ -324,42 +363,59 @@ Segment Selector Index: {:#x}\n
 /// 处理页错误 14 #PF
 #[no_mangle]
 unsafe extern "C" fn do_page_fault(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
-        "do_page_fault(14), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}, \nFault Address: {:#x}",
-        error_code,
-        regs.rsp,
-        regs.rip,
-        smp_get_processor_id(),
-        ProcessManager::current_pid(),
-        x86::controlregs::cr2()
-    );
+    // kerror!(
+    //     "do_page_fault(14), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}, \nFault Address: {:#x}",
+    //     error_code,
+    //     regs.rsp,
+    //     regs.rip,
+    //     smp_get_processor_id().data(),
+    //     ProcessManager::current_pid(),
+    //     x86::controlregs::cr2()
+    // );
 
-    if (error_code & 0x01) == 0 {
-        print!("Page Not Present,\t");
-    }
-    if (error_code & 0x02) != 0 {
-        print!("Write Access,\t");
+    // if (error_code & 0x01) == 0 {
+    //     print!("Page Not Present,\t");
+    // }
+    // if (error_code & 0x02) != 0 {
+    //     print!("Write Access,\t");
+    // } else {
+    //     print!("Read Access,\t");
+    // }
+
+    // if (error_code & 0x04) != 0 {
+    //     print!("Fault in user(3),\t");
+    // } else {
+    //     print!("Fault in supervisor(0,1,2),\t");
+    // }
+
+    // if (error_code & 0x08) != 0 {
+    //     print!("Reserved bit violation cause fault,\t");
+    // }
+
+    // if (error_code & 0x10) != 0 {
+    //     print!("Instruction fetch cause fault,\t");
+    // }
+    // print!("\n");
+
+    // CurrentIrqArch::interrupt_enable();
+    // panic!("Page Fault");
+    CurrentIrqArch::interrupt_disable();
+    let address = x86::controlregs::cr2();
+    // crate::kinfo!(
+    //     "fault address: {:#x}, error_code: {:#b}, pid: {}\n",
+    //     address,
+    //     error_code,
+    //     ProcessManager::current_pid().data()
+    // );
+
+    let address = VirtAddr::new(address);
+    let error_code = X86PfErrorCode::from_bits_truncate(error_code as u32);
+    if address.check_user() {
+        MMArch::do_user_addr_fault(regs, error_code, address);
     } else {
-        print!("Read Access,\t");
+        MMArch::do_kern_addr_fault(regs, error_code, address);
     }
-
-    if (error_code & 0x04) != 0 {
-        print!("Fault in user(3),\t");
-    } else {
-        print!("Fault in supervisor(0,1,2),\t");
-    }
-
-    if (error_code & 0x08) != 0 {
-        print!("Reserved bit violation cause fault,\t");
-    }
-
-    if (error_code & 0x10) != 0 {
-        print!("Instruction fetch cause fault,\t");
-    }
-    print!("\n");
-
     CurrentIrqArch::interrupt_enable();
-    panic!("Page Fault");
 }
 
 /// 处理x87 FPU错误 16 #MF
@@ -370,7 +426,7 @@ unsafe extern "C" fn do_x87_FPU_error(regs: &'static TrapFrame, error_code: u64)
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("x87 FPU Error");
@@ -384,7 +440,7 @@ unsafe extern "C" fn do_alignment_check(regs: &'static TrapFrame, error_code: u6
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Alignment Check");
@@ -398,7 +454,7 @@ unsafe extern "C" fn do_machine_check(regs: &'static TrapFrame, error_code: u64)
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Machine Check");
@@ -412,7 +468,7 @@ unsafe extern "C" fn do_SIMD_exception(regs: &'static TrapFrame, error_code: u64
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("SIMD Exception");
@@ -426,7 +482,7 @@ unsafe extern "C" fn do_virtualization_exception(regs: &'static TrapFrame, error
         error_code,
         regs.rsp,
         regs.rip,
-        smp_get_processor_id(),
+        smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
     panic!("Virtualization Exception");

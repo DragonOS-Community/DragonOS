@@ -78,7 +78,7 @@ impl EarlyIoRemap {
         size: usize,
         read_only: bool,
     ) -> Result<(VirtAddr, usize), SystemError> {
-        if phys.check_aligned(MMArch::PAGE_SIZE) == false {
+        if !phys.check_aligned(MMArch::PAGE_SIZE) {
             return Err(SystemError::EINVAL);
         }
 
@@ -175,7 +175,7 @@ impl EarlyIoRemap {
 
         let idx = idx.ok_or(SystemError::EINVAL)?;
 
-        let vaddr = Self::idx_to_virt(idx as usize);
+        let vaddr = Self::idx_to_virt(idx);
         let count = PageFrameCount::from_bytes(slot_guard[idx].size as usize).unwrap();
 
         // 取消映射

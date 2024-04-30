@@ -1,0 +1,27 @@
+{
+  "name": "riscv_init",
+  "version": "0.1.0",
+  "description": "临时的riscv下的初始化程序",
+  "rust_target": null,
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "apps/riscv_init"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "install": {
+    "in_dragonos_path": "/bin"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "envs": [],
+  "build_once": false,
+  "install_once": false,
+  "target_arch": ["riscv64"]
+}

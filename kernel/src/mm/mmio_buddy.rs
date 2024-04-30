@@ -1,8 +1,8 @@
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::kernel_mapper::KernelMapper;
+use crate::mm::page::{PAGE_1G_SHIFT, PAGE_4K_SHIFT};
 use crate::process::ProcessManager;
 use crate::{
-    include::bindings::bindings::{PAGE_1G_SHIFT, PAGE_4K_SHIFT, PAGE_4K_SIZE},
     kdebug,
     mm::{MMArch, MemoryManagementArch},
 };
@@ -10,21 +10,18 @@ use crate::{kerror, kinfo, kwarn};
 use alloc::{collections::LinkedList, vec::Vec};
 use core::mem;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use system_error::SystemError;
 
-use super::page::PageFlags;
+use super::page::{PageFlags, PAGE_4K_SIZE};
 use super::{PhysAddr, VirtAddr};
 
 // 最大的伙伴块的幂
-const MMIO_BUDDY_MAX_EXP: u32 = PAGE_1G_SHIFT;
+const MMIO_BUDDY_MAX_EXP: u32 = PAGE_1G_SHIFT as u32;
 // 最小的伙伴块的幂
-const MMIO_BUDDY_MIN_EXP: u32 = PAGE_4K_SHIFT;
+const MMIO_BUDDY_MIN_EXP: u32 = PAGE_4K_SHIFT as u32;
 // 内存池数组的范围
 const MMIO_BUDDY_REGION_COUNT: u32 = MMIO_BUDDY_MAX_EXP - MMIO_BUDDY_MIN_EXP + 1;
-
-const MMIO_BASE: VirtAddr = VirtAddr::new(0xffffa10000000000);
-const MMIO_TOP: VirtAddr = VirtAddr::new(0xffffa20000000000);
 
 const PAGE_1G_SIZE: usize = 1 << 30;
 
@@ -65,26 +62,35 @@ impl MmioBuddyMemPool {
         };
 
         let pool = MmioBuddyMemPool {
-            pool_start_addr: MMIO_BASE,
-            pool_size: MMIO_TOP - MMIO_BASE,
+            pool_start_addr: MMArch::MMIO_BASE,
+            pool_size: MMArch::MMIO_SIZE,
             free_regions,
         };
+
+        assert!(pool.pool_start_addr.data() % PAGE_1G_SIZE == 0);
         kdebug!("MMIO buddy pool init: created");
 
-        let cnt_1g_blocks = (MMIO_TOP - MMIO_BASE) >> 30;
-        let mut vaddr_base = MMIO_BASE;
-        kdebug!("total 1G blocks: {cnt_1g_blocks}");
-        for _i in 0..cnt_1g_blocks {
-            compiler_fence(Ordering::SeqCst);
-            match pool.give_back_block(vaddr_base, PAGE_1G_SHIFT) {
-                Ok(_) => {
-                    vaddr_base += PAGE_1G_SIZE;
-                }
-                Err(_) => {
+        let mut vaddr_base = MMArch::MMIO_BASE;
+        let mut remain_size = MMArch::MMIO_SIZE;
+        kdebug!(
+            "BASE: {:?}, TOP: {:?}, size: {:?}",
+            MMArch::MMIO_BASE,
+            MMArch::MMIO_TOP,
+            MMArch::MMIO_SIZE
+        );
+
+        for shift in (PAGE_4K_SHIFT..=PAGE_1G_SHIFT).rev() {
+            if remain_size & (1 << shift) != 0 {
+                let ok = pool.give_back_block(vaddr_base, shift as u32).is_ok();
+                if ok {
+                    vaddr_base += 1 << shift;
+                    remain_size -= 1 << shift;
+                } else {
                     panic!("MMIO buddy pool init failed");
                 }
             }
         }
+
         kdebug!("MMIO buddy pool init success");
         return pool;
     }
@@ -164,7 +170,7 @@ impl MmioBuddyMemPool {
         list_guard: &mut SpinLockGuard<MmioFreeRegionList>,
     ) -> Result<MmioBuddyAddrRegion, MmioResult> {
         // 申请范围错误
-        if exp < MMIO_BUDDY_MIN_EXP || exp > MMIO_BUDDY_MAX_EXP {
+        if !(MMIO_BUDDY_MIN_EXP..=MMIO_BUDDY_MAX_EXP).contains(&exp) {
             kdebug!("query_addr_region: exp wrong");
             return Err(MmioResult::WRONGEXP);
         }
@@ -175,7 +181,7 @@ impl MmioBuddyMemPool {
             // 将大的内存块依次分成小块内存，直到能够满足exp大小，即将exp+1分成两块exp
             for e in exp + 1..MMIO_BUDDY_MAX_EXP + 1 {
                 let pop_list: &mut SpinLockGuard<MmioFreeRegionList> =
-                    &mut self.free_regions[exp2index(e) as usize].lock();
+                    &mut self.free_regions[exp2index(e)].lock();
                 if pop_list.num_free == 0 {
                     continue;
                 }
@@ -187,7 +193,7 @@ impl MmioBuddyMemPool {
                                 if e2 != exp + 1 {
                                     // 要将分裂后的内存块插入到更小的链表中
                                     let low_list_guard: &mut SpinLockGuard<MmioFreeRegionList> =
-                                        &mut self.free_regions[exp2index(e2 - 1) as usize].lock();
+                                        &mut self.free_regions[exp2index(e2 - 1)].lock();
                                     self.split_block(region, e2, low_list_guard);
                                 } else {
                                     // 由于exp对应的链表list_guard已经被锁住了 不能再加锁
@@ -201,13 +207,12 @@ impl MmioBuddyMemPool {
                             }
                         }
                     } else {
-                        match self.pop_block(&mut self.free_regions[exp2index(e2) as usize].lock())
-                        {
+                        match self.pop_block(&mut self.free_regions[exp2index(e2)].lock()) {
                             Ok(region) => {
                                 if e2 != exp + 1 {
                                     // 要将分裂后的内存块插入到更小的链表中
                                     let low_list_guard: &mut SpinLockGuard<MmioFreeRegionList> =
-                                        &mut self.free_regions[exp2index(e2 - 1) as usize].lock();
+                                        &mut self.free_regions[exp2index(e2 - 1)].lock();
                                     self.split_block(region, e2, low_list_guard);
                                 } else {
                                     // 由于exp对应的链表list_guard已经被锁住了 不能再加锁
@@ -251,7 +256,7 @@ impl MmioBuddyMemPool {
                 if e != exp - 1 {
                     match self.merge_all_exp(
                         exp,
-                        &mut self.free_regions[exp2index(exp) as usize].lock(),
+                        &mut self.free_regions[exp2index(exp)].lock(),
                         &mut self.free_regions[exp2index(exp + 1)].lock(),
                     ) {
                         Ok(_) => continue,
@@ -263,7 +268,7 @@ impl MmioBuddyMemPool {
                 } else {
                     match self.merge_all_exp(
                         exp,
-                        &mut self.free_regions[exp2index(exp) as usize].lock(),
+                        &mut self.free_regions[exp2index(exp)].lock(),
                         list_guard,
                     ) {
                         Ok(_) => continue,
@@ -298,9 +303,9 @@ impl MmioBuddyMemPool {
     /// @return Ok(MmioBuddyAddrRegion)符合要求的内存块信息结构体。
     /// @return Err(MmioResult) 没有满足要求的内存块时，返回__query_addr_region的错误码。
     fn mmio_buddy_query_addr_region(&self, exp: u32) -> Result<MmioBuddyAddrRegion, MmioResult> {
-        let list_guard: &mut SpinLockGuard<MmioFreeRegionList> =
-            &mut self.free_regions[exp2index(exp)].lock();
-        match self.query_addr_region(exp, list_guard) {
+        let mut list_guard: SpinLockGuard<MmioFreeRegionList> =
+            self.free_regions[exp2index(exp)].lock();
+        match self.query_addr_region(exp, &mut list_guard) {
             Ok(ret) => return Ok(ret),
             Err(err) => {
                 kdebug!("mmio_buddy_query_addr_region failed");
@@ -346,7 +351,7 @@ impl MmioBuddyMemPool {
         exp: u32,
         list_guard: &mut SpinLockGuard<MmioFreeRegionList>,
     ) -> Result<MmioBuddyAddrRegion, MmioResult> {
-        if list_guard.list.len() == 0 {
+        if list_guard.list.is_empty() {
             return Err(MmioResult::ISEMPTY);
         } else {
             //计算伙伴块的地址
@@ -488,9 +493,9 @@ impl MmioBuddyMemPool {
         let mut new_size = size;
         // 对齐要申请的空间大小
         // 如果要申请的空间大小小于4k，则分配4k
-        if size_exp < PAGE_4K_SHIFT {
-            new_size = PAGE_4K_SIZE as usize;
-            size_exp = PAGE_4K_SHIFT;
+        if size_exp < PAGE_4K_SHIFT as u32 {
+            new_size = PAGE_4K_SIZE;
+            size_exp = PAGE_4K_SHIFT as u32;
         } else if (new_size & (!(1 << size_exp))) != 0 {
             // 向左对齐空间大小
             size_exp += 1;
@@ -559,7 +564,7 @@ impl MmioBuddyMemPool {
 
         // 归还到buddy
         mmio_pool()
-            .give_back_block(vaddr, length.trailing_zeros() as u32)
+            .give_back_block(vaddr, length.trailing_zeros())
             .unwrap_or_else(|err| {
                 panic!("MMIO release failed: self: {self:?}, err msg: {:?}", err);
             });
@@ -585,7 +590,7 @@ impl MmioBuddyAddrRegion {
 }
 
 /// @brief 空闲页数组结构体
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct MmioFreeRegionList {
     /// 存储mmio_buddy的地址链表
     list: LinkedList<MmioBuddyAddrRegion>,
@@ -598,14 +603,6 @@ impl MmioFreeRegionList {
         return MmioFreeRegionList {
             ..Default::default()
         };
-    }
-}
-impl Default for MmioFreeRegionList {
-    fn default() -> Self {
-        MmioFreeRegionList {
-            list: Default::default(),
-            num_free: 0,
-        }
     }
 }
 
@@ -639,7 +636,8 @@ impl MMIOSpaceGuard {
             "MMIO space vaddr must be aligned with size"
         );
         assert!(
-            vaddr.data() >= MMIO_BASE.data() && vaddr.data() + size <= MMIO_TOP.data(),
+            vaddr.data() >= MMArch::MMIO_BASE.data()
+                && vaddr.data() + size <= MMArch::MMIO_TOP.data(),
             "MMIO space must be in MMIO region"
         );
 
@@ -678,6 +676,7 @@ impl MMIOSpaceGuard {
         }
 
         let flags = PageFlags::mmio_flags();
+
         let mut kernel_mapper = KernelMapper::lock();
         let r = kernel_mapper.map_phys_with_size(self.vaddr, paddr, length, flags, true);
         return r;

@@ -1,0 +1,12 @@
+[package]
+name = "test-for-robustfutex"
+version = "0.1.0"
+edition = "2021"
+description = "some tests for robust futex"
+authors = [ "hmt <1037827920@qq.com>" ]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+syscalls = '0.6.18'
+libc = '0.2.153'

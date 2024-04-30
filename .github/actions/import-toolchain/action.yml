@@ -23,7 +23,7 @@ runs:
         uses: actions/cache@v3
         env:
             cache-name: cache-build-tools
-            dadk_version: 0.1.6
+            dadk_version: 0.1.11
         with:
           path: |
             ~/.cargo

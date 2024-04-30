@@ -10,7 +10,7 @@ use crate::{
     arch::{io::PortIOArch, CurrentPortIOArch},
     driver::{
         base::{
-            device::{bus::Bus, driver::Driver, Device, IdTable},
+            device::{bus::Bus, driver::Driver, Device, DeviceId, IdTable},
             kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
             kset::KSet,
         },
@@ -18,6 +18,12 @@ use crate::{
             serio_device::SerioDevice,
             serio_driver::{serio_driver_manager, SerioDriver},
         },
+    },
+    exception::{
+        irqdata::IrqHandlerData,
+        irqdesc::{IrqHandleFlags, IrqHandler, IrqReturn},
+        manage::irq_manager,
+        IrqNumber,
     },
     filesystem::kernfs::KernFSInode,
     init::initcall::INITCALL_DEVICE,
@@ -29,18 +35,30 @@ use crate::{
 
 use super::ps_mouse_device::{ps2_mouse_device, Ps2MouseDevice};
 
-extern "C" {
-    fn c_ps2_mouse_init();
-}
+const PS2_MOUSE_IRQ_NUM: IrqNumber = IrqNumber::new(0x2c);
 
 #[no_mangle]
-unsafe extern "C" fn ps2_mouse_driver_interrupt() {
-    if let Some(psmouse_device) = ps2_mouse_device() {
-        ps2_mouse_driver()
-            .interrupt(&(psmouse_device as Arc<dyn SerioDevice>), 0, 0)
-            .ok();
-    } else {
-        unsafe { CurrentPortIOArch::in8(0x60) };
+unsafe extern "C" fn ps2_mouse_driver_interrupt() {}
+
+#[derive(Debug)]
+struct Ps2MouseIrqHandler;
+
+impl IrqHandler for Ps2MouseIrqHandler {
+    fn handle(
+        &self,
+        _irq: IrqNumber,
+        _static_data: Option<&dyn IrqHandlerData>,
+        _dev_id: Option<Arc<dyn IrqHandlerData>>,
+    ) -> Result<IrqReturn, SystemError> {
+        if let Some(psmouse_device) = ps2_mouse_device() {
+            return Ok(ps2_mouse_driver()
+                .interrupt(&(psmouse_device as Arc<dyn SerioDevice>), 0, 0)
+                .map(|_| IrqReturn::Handled)
+                .unwrap_or_else(|_| IrqReturn::NotHandled));
+        } else {
+            unsafe { CurrentPortIOArch::in8(0x60) };
+            return Ok(IrqReturn::NotHandled);
+        }
     }
 }
 
@@ -226,7 +244,13 @@ impl SerioDriver for Ps2MouseDriver {
         device.set_driver(Some(self.inner.lock_irqsave().self_ref.clone()));
 
         device.init()?;
-        unsafe { c_ps2_mouse_init() };
+        irq_manager().request_irq(
+            PS2_MOUSE_IRQ_NUM,
+            "psmouse".to_string(),
+            &Ps2MouseIrqHandler,
+            IrqHandleFlags::IRQF_SHARED | IrqHandleFlags::IRQF_TRIGGER_RISING,
+            Some(DeviceId::new(Some(Self::NAME), None).unwrap()),
+        )?;
         return Ok(());
     }
 
@@ -252,9 +276,10 @@ impl SerioDriver for Ps2MouseDriver {
 
 #[unified_init(INITCALL_DEVICE)]
 fn ps2_mouse_driver_init() -> Result<(), SystemError> {
-    kdebug!("Ps2_mouse_drive initing...");
+    kdebug!("Ps2_mouse_drive initializing...");
     let driver = Ps2MouseDriver::new();
     serio_driver_manager().register(driver.clone())?;
     unsafe { PS2_MOUSE_DRIVER = Some(driver) };
+    kdebug!("Ps2_mouse_drive initialized!");
     return Ok(());
 }

@@ -1,11 +1,13 @@
+use core::sync::atomic::{fence, Ordering};
+
 use x86::msr::{
     rdmsr, wrmsr, IA32_APIC_BASE, IA32_X2APIC_APICID, IA32_X2APIC_EOI, IA32_X2APIC_SIVR,
     IA32_X2APIC_VERSION,
 };
 
-use crate::{kdebug, kinfo};
+use crate::kinfo;
 
-use super::{LVTRegister, LocalAPIC, LVT};
+use super::{hw_irq::ApicId, LVTRegister, LocalAPIC, LVT};
 
 #[derive(Debug)]
 pub struct X2Apic;
@@ -22,13 +24,10 @@ impl LocalAPIC for X2Apic {
     fn init_current_cpu(&mut self) -> bool {
         unsafe {
             // 设置 x2APIC 使能位
-            wrmsr(
-                IA32_APIC_BASE.into(),
-                rdmsr(IA32_APIC_BASE.into()) | 1 << 10,
-            );
+            wrmsr(IA32_APIC_BASE, rdmsr(IA32_APIC_BASE) | 1 << 10);
 
             assert!(
-                (rdmsr(IA32_APIC_BASE.into()) & 0xc00) == 0xc00,
+                (rdmsr(IA32_APIC_BASE) & 0xc00) == 0xc00,
                 "x2APIC enable failed."
             );
 
@@ -40,52 +39,55 @@ impl LocalAPIC for X2Apic {
                     1 << 8
                 };
 
-                wrmsr(IA32_X2APIC_SIVR.into(), val);
+                wrmsr(IA32_X2APIC_SIVR, val);
 
                 assert!(
-                    (rdmsr(IA32_X2APIC_SIVR.into()) & 0x100) == 0x100,
+                    (rdmsr(IA32_X2APIC_SIVR) & 0x100) == 0x100,
                     "x2APIC software enable failed."
                 );
                 kinfo!("x2APIC software enabled.");
 
                 if self.support_eoi_broadcast_suppression() {
                     assert!(
-                        (rdmsr(IA32_X2APIC_SIVR.into()) & 0x1000) == 0x1000,
+                        (rdmsr(IA32_X2APIC_SIVR) & 0x1000) == 0x1000,
                         "x2APIC EOI broadcast suppression enable failed."
                     );
                     kinfo!("x2APIC EOI broadcast suppression enabled.");
                 }
             }
-            kdebug!("x2apic: to mask all lvt");
+            // kdebug!("x2apic: to mask all lvt");
             self.mask_all_lvt();
-            kdebug!("x2apic: all lvt masked");
+            // kdebug!("x2apic: all lvt masked");
         }
         true
     }
 
     /// 发送 EOI (End Of Interrupt)
     fn send_eoi(&self) {
+        fence(Ordering::SeqCst);
         unsafe {
-            wrmsr(IA32_X2APIC_EOI.into(), 0);
+            wrmsr(IA32_X2APIC_EOI, 0);
         }
+
+        fence(Ordering::SeqCst);
     }
 
     /// 获取 x2APIC 版本
     fn version(&self) -> u8 {
-        unsafe { (rdmsr(IA32_X2APIC_VERSION.into()) & 0xff) as u8 }
+        unsafe { (rdmsr(IA32_X2APIC_VERSION) & 0xff) as u8 }
     }
 
     fn support_eoi_broadcast_suppression(&self) -> bool {
-        unsafe { ((rdmsr(IA32_X2APIC_VERSION.into()) >> 24) & 1) == 1 }
+        unsafe { ((rdmsr(IA32_X2APIC_VERSION) >> 24) & 1) == 1 }
     }
 
     fn max_lvt_entry(&self) -> u8 {
-        unsafe { ((rdmsr(IA32_X2APIC_VERSION.into()) >> 16) & 0xff) as u8 + 1 }
+        unsafe { ((rdmsr(IA32_X2APIC_VERSION) >> 16) & 0xff) as u8 + 1 }
     }
 
     /// 获取 x2APIC 的 APIC ID
-    fn id(&self) -> u32 {
-        unsafe { rdmsr(IA32_X2APIC_APICID.into()) as u32 }
+    fn id(&self) -> ApicId {
+        unsafe { ApicId::new(rdmsr(IA32_X2APIC_APICID) as u32) }
     }
 
     /// 设置 Local Vector Table (LVT) 寄存器

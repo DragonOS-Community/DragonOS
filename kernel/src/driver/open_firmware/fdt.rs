@@ -9,12 +9,14 @@ use system_error::SystemError;
 use crate::{
     init::boot_params,
     libs::rwlock::RwLock,
-    mm::{memblock::mem_block_manager, PhysAddr},
+    mm::{memblock::mem_block_manager, mmio_buddy::MMIOSpaceGuard, PhysAddr},
 };
+
+static OPEN_FIRMWARE_FDT_DRIVER: OpenFirmwareFdtDriver = OpenFirmwareFdtDriver::new();
 
 #[inline(always)]
 pub fn open_firmware_fdt_driver() -> &'static OpenFirmwareFdtDriver {
-    &OpenFirmwareFdtDriver
+    &OPEN_FIRMWARE_FDT_DRIVER
 }
 
 static FDT_GLOBAL_DATA: RwLock<FdtGlobalData> = RwLock::new(FdtGlobalData::new());
@@ -40,22 +42,48 @@ impl FdtGlobalData {
     }
 }
 
-pub struct OpenFirmwareFdtDriver;
+#[allow(dead_code)]
+pub struct OpenFirmwareFdtDriver {
+    inner: RwLock<InnerOpenFirmwareFdtDriver>,
+}
+
+#[allow(dead_code)]
+pub struct InnerOpenFirmwareFdtDriver {
+    /// FDT自身映射的MMIO空间
+    fdt_map_guard: Option<MMIOSpaceGuard>,
+}
 
 impl OpenFirmwareFdtDriver {
+    const fn new() -> Self {
+        Self {
+            inner: RwLock::new(InnerOpenFirmwareFdtDriver {
+                fdt_map_guard: None,
+            }),
+        }
+    }
+
     #[allow(dead_code)]
     pub fn early_scan_device_tree(&self) -> Result<(), SystemError> {
-        let fdt_vaddr = boot_params().read().fdt().unwrap();
-        let fdt = unsafe {
+        let fdt = self.fdt_ref()?;
+        self.early_init_scan_nodes(&fdt);
+
+        return Ok(());
+    }
+
+    pub unsafe fn set_fdt_map_guard(&self, guard: Option<MMIOSpaceGuard>) {
+        self.inner.write().fdt_map_guard = guard;
+    }
+
+    /// 获取FDT的引用
+    pub fn fdt_ref(&self) -> Result<Fdt<'static>, SystemError> {
+        let fdt_vaddr = boot_params().read().fdt().ok_or(SystemError::ENODEV)?;
+        let fdt: Fdt<'_> = unsafe {
             fdt::Fdt::from_ptr(fdt_vaddr.as_ptr()).map_err(|e| {
                 kerror!("failed to parse fdt, err={:?}", e);
                 SystemError::EINVAL
             })
         }?;
-
-        self.early_init_scan_nodes(&fdt);
-
-        return Ok(());
+        Ok(fdt)
     }
 
     fn early_init_scan_nodes(&self, fdt: &Fdt) {
@@ -92,10 +120,10 @@ impl OpenFirmwareFdtDriver {
 
     /// 扫描 `/chosen` 节点
     fn early_init_scan_chosen(&self, fdt: &Fdt) -> Result<(), SystemError> {
-        const CHOSEN_NAME1: &'static str = "/chosen";
+        const CHOSEN_NAME1: &str = "/chosen";
         let mut node = fdt.find_node(CHOSEN_NAME1);
         if node.is_none() {
-            const CHOSEN_NAME2: &'static str = "/chosen@0";
+            const CHOSEN_NAME2: &str = "/chosen@0";
             node = fdt.find_node(CHOSEN_NAME2);
             if node.is_some() {
                 FDT_GLOBAL_DATA.write().chosen_node_name = Some(CHOSEN_NAME2);
@@ -185,10 +213,7 @@ impl OpenFirmwareFdtDriver {
         use crate::{
             arch::MMArch,
             libs::align::page_align_down,
-            mm::{
-                memblock::{mem_block_manager, MemBlockManager},
-                MemoryManagementArch, PhysAddr,
-            },
+            mm::{memblock::MemBlockManager, MemoryManagementArch},
         };
 
         let mut base = base as usize;
@@ -352,6 +377,20 @@ impl OpenFirmwareFdtDriver {
         }
 
         return mem_block_manager().reserve_block(base, size);
+    }
+
+    pub fn find_node_by_compatible<'b>(
+        &self,
+        fdt: &'b Fdt<'b>,
+        compatible: &'b str,
+    ) -> impl Iterator<Item = fdt::node::FdtNode<'b, 'b>> + 'b {
+        // compatible = compatible.trim();
+        let r = fdt.all_nodes().filter(move |x| {
+            x.compatible()
+                .is_some_and(|x| x.all().any(|x| x == compatible))
+        });
+
+        return r;
     }
 }
 

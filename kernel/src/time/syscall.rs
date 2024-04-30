@@ -1,17 +1,18 @@
 use core::{
     ffi::{c_int, c_longlong},
-    ptr::null_mut,
+    time::Duration,
 };
 
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 use crate::{
+    process::{timer::AlarmTimer, ProcessManager},
     syscall::{user_access::UserBufferWriter, Syscall},
-    time::{sleep::nanosleep, TimeSpec},
+    time::{sleep::nanosleep, PosixTimeSpec},
 };
 
-use super::timekeeping::do_gettimeofday;
+use super::timekeeping::{do_gettimeofday, getnstimeofday};
 
 pub type PosixTimeT = c_longlong;
 pub type PosixSusecondsT = c_int;
@@ -73,19 +74,19 @@ impl Syscall {
     ///
     /// @return Err(SystemError) 错误码
     pub fn nanosleep(
-        sleep_time: *const TimeSpec,
-        rm_time: *mut TimeSpec,
+        sleep_time: *const PosixTimeSpec,
+        rm_time: *mut PosixTimeSpec,
     ) -> Result<usize, SystemError> {
-        if sleep_time == null_mut() {
+        if sleep_time.is_null() {
             return Err(SystemError::EFAULT);
         }
-        let slt_spec = TimeSpec {
+        let slt_spec = PosixTimeSpec {
             tv_sec: unsafe { *sleep_time }.tv_sec,
             tv_nsec: unsafe { *sleep_time }.tv_nsec,
         };
 
         let r: Result<usize, SystemError> = nanosleep(slt_spec).map(|slt_spec| {
-            if rm_time != null_mut() {
+            if !rm_time.is_null() {
                 unsafe { *rm_time }.tv_sec = slt_spec.tv_sec;
                 unsafe { *rm_time }.tv_nsec = slt_spec.tv_nsec;
             }
@@ -134,7 +135,7 @@ impl Syscall {
         return Ok(0);
     }
 
-    pub fn clock_gettime(clock_id: c_int, tp: *mut TimeSpec) -> Result<usize, SystemError> {
+    pub fn clock_gettime(clock_id: c_int, tp: *mut PosixTimeSpec) -> Result<usize, SystemError> {
         let clock_id = PosixClockID::try_from(clock_id)?;
         if clock_id != PosixClockID::Realtime {
             kwarn!("clock_gettime: currently only support Realtime clock, but got {:?}. Defaultly return realtime!!!\n", clock_id);
@@ -142,13 +143,57 @@ impl Syscall {
         if tp.is_null() {
             return Err(SystemError::EFAULT);
         }
-        let mut tp_buf =
-            UserBufferWriter::new::<TimeSpec>(tp, core::mem::size_of::<TimeSpec>(), true)?;
+        let mut tp_buf = UserBufferWriter::new::<PosixTimeSpec>(
+            tp,
+            core::mem::size_of::<PosixTimeSpec>(),
+            true,
+        )?;
 
-        let posix_time = do_gettimeofday();
+        let timespec = getnstimeofday();
 
-        tp_buf.copy_one_to_user(&posix_time, 0)?;
+        tp_buf.copy_one_to_user(&timespec, 0)?;
 
         return Ok(0);
+    }
+    /// # alarm函数功能
+    ///  
+    /// 设置alarm（单位：秒）
+    ///
+    /// ## 函数参数
+    ///
+    /// expired_second：设置alarm触发的秒数
+    ///
+    /// ### 函数返回值
+    ///
+    /// Ok(usize): 上一个alarm的剩余秒数
+    pub fn alarm(expired_second: u32) -> Result<usize, SystemError> {
+        //初始化second
+        let second = Duration::from_secs(expired_second as u64);
+        let pcb = ProcessManager::current_pcb();
+        let mut pcb_alarm = pcb.alarm_timer_irqsave();
+        let alarm = pcb_alarm.as_ref();
+        //alarm第一次调用
+        if alarm.is_none() {
+            //注册alarm定时器
+            let pid = ProcessManager::current_pid();
+            let new_alarm = Some(AlarmTimer::alarm_timer_init(pid, 0));
+            *pcb_alarm = new_alarm;
+            drop(pcb_alarm);
+            return Ok(0);
+        }
+        //查询上一个alarm的剩余时间和重新注册alarm
+        let alarmtimer = alarm.unwrap();
+        let remain = alarmtimer.remain();
+        if second.is_zero() {
+            alarmtimer.cancel();
+        }
+        if !alarmtimer.timeout() {
+            alarmtimer.cancel();
+        }
+        let pid = ProcessManager::current_pid();
+        let new_alarm = Some(AlarmTimer::alarm_timer_init(pid, second.as_secs()));
+        *pcb_alarm = new_alarm;
+        drop(pcb_alarm);
+        return Ok(remain.as_secs() as usize);
     }
 }

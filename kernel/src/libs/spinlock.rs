@@ -71,8 +71,8 @@ impl<T> SpinLock<T> {
     pub fn lock(&self) -> SpinLockGuard<T> {
         loop {
             let res = self.try_lock();
-            if res.is_ok() {
-                return res.unwrap();
+            if let Ok(res) = res {
+                return res;
             }
             spin_loop();
         }
@@ -166,6 +166,10 @@ impl<T> SpinLock<T> {
     fn unlock(&self) {
         self.lock.store(false, Ordering::SeqCst);
         ProcessManager::preempt_enable();
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.lock.load(Ordering::SeqCst)
     }
 }
 

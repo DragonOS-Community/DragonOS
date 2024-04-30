@@ -3,6 +3,7 @@ use core::hint::spin_loop;
 use alloc::{
     string::ToString,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use kdepends::ringbuffer::{AllocRingBuffer, RingBuffer};
 use system_error::SystemError;
@@ -29,15 +30,15 @@ use crate::{
         devfs::{devfs_register, DevFS, DeviceINode},
         kernfs::KernFSInode,
         vfs::{
-            core::generate_inode_id, syscall::ModeType, FilePrivateData, FileSystem, FileType,
-            IndexNode, Metadata,
+            core::generate_inode_id, syscall::ModeType, utils::DName, FilePrivateData, FileSystem,
+            FileType, IndexNode, Metadata,
         },
     },
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
-        spinlock::SpinLock,
+        spinlock::{SpinLock, SpinLockGuard},
     },
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
 static mut PS2_MOUSE_DEVICE: Option<Arc<Ps2MouseDevice>> = None;
@@ -94,14 +95,14 @@ enum PsMouseCommand {
     SetSampleRate,
 }
 
-impl Into<u8> for PsMouseCommand {
-    fn into(self) -> u8 {
-        match self {
-            Self::SampleRate(x) => x,
-            Self::EnablePacketStreaming => 0xf4,
-            Self::InitKeyboard => 0x47,
-            Self::GetMouseId => 0xf2,
-            Self::SetSampleRate => 0xf3,
+impl From<PsMouseCommand> for u8 {
+    fn from(val: PsMouseCommand) -> Self {
+        match val {
+            PsMouseCommand::SampleRate(x) => x,
+            PsMouseCommand::EnablePacketStreaming => 0xf4,
+            PsMouseCommand::InitKeyboard => 0x47,
+            PsMouseCommand::GetMouseId => 0xf2,
+            PsMouseCommand::SetSampleRate => 0xf3,
         }
     }
 }
@@ -198,9 +199,9 @@ impl Ps2MouseDevice {
                     size: 4096,
                     blk_size: 0,
                     blocks: 0,
-                    atime: TimeSpec::default(),
-                    mtime: TimeSpec::default(),
-                    ctime: TimeSpec::default(),
+                    atime: PosixTimeSpec::default(),
+                    mtime: PosixTimeSpec::default(),
+                    ctime: PosixTimeSpec::default(),
                     file_type: FileType::CharDevice, // 文件夹，block设备，char设备
                     mode: ModeType::from_bits_truncate(0o644),
                     nlinks: 1,
@@ -301,13 +302,13 @@ impl Ps2MouseDevice {
                 guard.current_state.flags = flags;
             }
             1 => {
-                let flags = guard.current_state.flags.clone();
+                let flags = guard.current_state.flags;
                 if !flags.contains(MouseFlags::X_OVERFLOW) {
                     guard.current_state.x = self.get_x_movement(packet, flags);
                 }
             }
             2 => {
-                let flags = guard.current_state.flags.clone();
+                let flags = guard.current_state.flags;
                 if !flags.contains(MouseFlags::Y_OVERFLOW) {
                     guard.current_state.y = self.get_y_movement(packet, flags);
                 }
@@ -411,7 +412,7 @@ impl Ps2MouseDevice {
 #[derive(Debug)]
 struct InnerPs2MouseDevice {
     bus: Option<Weak<dyn Bus>>,
-    class: Option<Arc<dyn Class>>,
+    class: Option<Weak<dyn Class>>,
     driver: Option<Weak<dyn Driver>>,
     kern_inode: Option<Arc<KernFSInode>>,
     parent: Option<Weak<dyn KObject>>,
@@ -446,7 +447,7 @@ impl Device for Ps2MouseDevice {
         self.inner.lock_irqsave().bus = bus;
     }
 
-    fn set_class(&self, class: Option<alloc::sync::Arc<dyn Class>>) {
+    fn set_class(&self, class: Option<alloc::sync::Weak<dyn Class>>) {
         self.inner.lock_irqsave().class = class;
     }
 
@@ -473,7 +474,13 @@ impl Device for Ps2MouseDevice {
     }
 
     fn class(&self) -> Option<Arc<dyn Class>> {
-        self.inner.lock_irqsave().class.clone()
+        let mut guard = self.inner.lock_irqsave();
+        let r = guard.class.clone()?.upgrade();
+        if r.is_none() {
+            guard.class = None;
+        }
+
+        return r;
     }
 }
 
@@ -545,7 +552,7 @@ impl KObject for Ps2MouseDevice {
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.inner.lock_irqsave().kobj_type.clone()
+        self.inner.lock_irqsave().kobj_type
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
@@ -580,7 +587,7 @@ impl DeviceINode for Ps2MouseDevice {
 impl IndexNode for Ps2MouseDevice {
     fn open(
         &self,
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
         _mode: &crate::filesystem::vfs::file::FileMode,
     ) -> Result<(), SystemError> {
         let mut guard = self.inner.lock_irqsave();
@@ -588,7 +595,7 @@ impl IndexNode for Ps2MouseDevice {
         Ok(())
     }
 
-    fn close(&self, _data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         let mut guard = self.inner.lock_irqsave();
         guard.buf.clear();
         Ok(())
@@ -599,13 +606,13 @@ impl IndexNode for Ps2MouseDevice {
         _offset: usize,
         _len: usize,
         buf: &mut [u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let mut guard = self.inner.lock_irqsave();
 
         if guard.buf.len() >= 3 {
-            for i in 0..3 {
-                buf[i] = guard.buf.dequeue().unwrap();
+            for item in buf.iter_mut().take(3) {
+                *item = guard.buf.dequeue().unwrap();
             }
             return Ok(3);
         } else {
@@ -618,9 +625,9 @@ impl IndexNode for Ps2MouseDevice {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -637,7 +644,7 @@ impl IndexNode for Ps2MouseDevice {
         self
     }
 
-    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
+    fn list(&self) -> Result<Vec<alloc::string::String>, SystemError> {
         todo!()
     }
 
@@ -647,6 +654,10 @@ impl IndexNode for Ps2MouseDevice {
 
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
         Ok(())
+    }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        Ok(DName::from(self.name()))
     }
 }
 

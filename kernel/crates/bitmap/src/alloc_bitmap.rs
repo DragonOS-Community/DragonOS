@@ -1,7 +1,10 @@
+use core::ops::BitAnd;
+
 use alloc::vec::Vec;
 
 use crate::{bitmap_core::BitMapCore, traits::BitMapOps};
 
+#[derive(Clone)]
 pub struct AllocBitmap {
     elements: usize,
     data: Vec<usize>,
@@ -105,5 +108,17 @@ impl BitMapOps<usize> for AllocBitmap {
 
     fn set_all(&mut self, value: bool) {
         self.core.set_all(self.elements, &mut self.data, value);
+    }
+}
+
+impl BitAnd for AllocBitmap {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        let mut result = AllocBitmap::new(self.elements);
+        for i in 0..rhs.data.len() {
+            result.data[i] = self.data[i] & rhs.data[i];
+        }
+        result
     }
 }

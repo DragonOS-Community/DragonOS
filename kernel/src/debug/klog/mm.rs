@@ -1,6 +1,9 @@
 extern crate klog_types;
 
-use core::intrinsics::unlikely;
+use core::{
+    intrinsics::unlikely,
+    sync::atomic::{compiler_fence, Ordering},
+};
 
 use klog_types::{AllocatorLog, AllocatorLogType, LogSource, MMLogChannel};
 
@@ -64,13 +67,18 @@ impl MMDebugLogManager {
 
         let mut log = log;
         loop {
+            compiler_fence(Ordering::SeqCst);
             let r = __MM_ALLOCATOR_LOG_CHANNEL.buf.push(log);
+            compiler_fence(Ordering::SeqCst);
             if let Err(r) = r {
                 // 如果日志通道满了，就把最早的日志丢弃
                 if __MM_ALLOCATOR_LOG_CHANNEL.buf.remaining() == 0 {
+                    compiler_fence(Ordering::SeqCst);
                     __MM_ALLOCATOR_LOG_CHANNEL.buf.pop();
+                    compiler_fence(Ordering::SeqCst);
                 }
                 log = r.into_inner();
+                compiler_fence(Ordering::SeqCst);
             } else {
                 break;
             }

@@ -1,6 +1,7 @@
-mod c_adapter;
 pub(super) mod entry;
+mod handle;
 pub mod ipi;
+pub mod msi;
 pub mod trap;
 
 use core::{
@@ -16,11 +17,9 @@ use crate::{
     kerror,
 };
 
-use self::entry::setup_interrupt_gate;
-
 use super::{
     asm::irqflags::{local_irq_restore, local_irq_save},
-    driver::apic::{CurrentApic, LocalAPIC},
+    driver::apic::{lapic_vector::arch_early_irq_init, CurrentApic, LocalAPIC},
 };
 
 /// @brief 关闭中断
@@ -45,8 +44,7 @@ impl InterruptArch for X86_64InterruptArch {
     #[inline(never)]
     unsafe fn arch_irq_init() -> Result<(), SystemError> {
         CurrentIrqArch::interrupt_disable();
-        setup_interrupt_gate();
-        CurrentApic.init_current_cpu();
+
         return Ok(());
     }
     unsafe fn interrupt_enable() {
@@ -89,6 +87,18 @@ impl InterruptArch for X86_64InterruptArch {
     fn ack_bad_irq(irq: IrqNumber) {
         kerror!("Unexpected IRQ trap at vector {}", irq.data());
         CurrentApic.send_eoi();
+    }
+
+    fn arch_early_irq_init() -> Result<(), SystemError> {
+        arch_early_irq_init()
+    }
+
+    fn arch_ap_early_irq_init() -> Result<(), SystemError> {
+        if !CurrentApic.init_current_cpu() {
+            return Err(SystemError::ENODEV);
+        }
+
+        Ok(())
     }
 }
 
@@ -158,11 +168,7 @@ impl TrapFrame {
     }
 
     /// 判断当前中断是否来自用户模式
-    pub fn from_user(&self) -> bool {
-        if (self.cs & 0x3) != 0 {
-            return true;
-        } else {
-            return false;
-        }
+    pub fn is_from_user(&self) -> bool {
+        return (self.cs & 0x3) != 0;
     }
 }

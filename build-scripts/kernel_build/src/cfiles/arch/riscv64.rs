@@ -31,8 +31,9 @@ impl CFilesArch for RiscV64CFilesArch {
         // // c.flag("-march=rv64imafdc");
         // c.no_default_flags(true);
         c.flag("-mcmodel=medany");
-        c.flag("-mabi=lp64");
-        c.flag("-march=rv64imac");
+
+        c.flag("-mabi=lp64d");
+        c.flag("-march=rv64gc");
     }
 }
 

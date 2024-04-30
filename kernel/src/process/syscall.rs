@@ -29,12 +29,57 @@ use crate::{
     },
 };
 
+//参考资料：https://code.dragonos.org.cn/xref/linux-6.1.9/include/uapi/linux/utsname.h#17
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PosixOldUtsName {
+    pub sysname: [u8; 65],
+    pub nodename: [u8; 65],
+    pub release: [u8; 65],
+    pub version: [u8; 65],
+    pub machine: [u8; 65],
+}
+
+impl PosixOldUtsName {
+    pub fn new() -> Self {
+        const SYS_NAME: &[u8] = b"DragonOS";
+        const NODENAME: &[u8] = b"DragonOS";
+        const RELEASE: &[u8] = env!("CARGO_PKG_VERSION").as_bytes();
+        const VERSION: &[u8] = env!("CARGO_PKG_VERSION").as_bytes();
+
+        #[cfg(target_arch = "x86_64")]
+        const MACHINE: &[u8] = b"x86_64";
+
+        #[cfg(target_arch = "aarch64")]
+        const MACHINE: &[u8] = b"aarch64";
+
+        #[cfg(target_arch = "riscv64")]
+        const MACHINE: &[u8] = b"riscv64";
+
+        let mut r = Self {
+            sysname: [0; 65],
+            nodename: [0; 65],
+            release: [0; 65],
+            version: [0; 65],
+            machine: [0; 65],
+        };
+
+        r.sysname[0..SYS_NAME.len()].copy_from_slice(SYS_NAME);
+        r.nodename[0..NODENAME.len()].copy_from_slice(NODENAME);
+        r.release[0..RELEASE.len()].copy_from_slice(RELEASE);
+        r.version[0..VERSION.len()].copy_from_slice(VERSION);
+        r.machine[0..MACHINE.len()].copy_from_slice(MACHINE);
+
+        return r;
+    }
+}
+
 impl Syscall {
-    pub fn fork(frame: &mut TrapFrame) -> Result<usize, SystemError> {
+    pub fn fork(frame: &TrapFrame) -> Result<usize, SystemError> {
         ProcessManager::fork(frame, CloneFlags::empty()).map(|pid| pid.into())
     }
 
-    pub fn vfork(frame: &mut TrapFrame) -> Result<usize, SystemError> {
+    pub fn vfork(frame: &TrapFrame) -> Result<usize, SystemError> {
         // 由于Linux vfork需要保证子进程先运行（除非子进程调用execve或者exit），
         // 而我们目前没有实现这个特性，所以暂时使用fork代替vfork（linux文档表示这样也是也可以的）
         Self::fork(frame)
@@ -171,7 +216,7 @@ impl Syscall {
     }
 
     pub fn clone(
-        current_trapframe: &mut TrapFrame,
+        current_trapframe: &TrapFrame,
         clone_args: KernelCloneArgs,
     ) -> Result<usize, SystemError> {
         let flags = clone_args.flags;
@@ -202,11 +247,11 @@ impl Syscall {
         });
 
         if flags.contains(CloneFlags::CLONE_VFORK) {
-            pcb.thread.write().vfork_done = Some(vfork.clone());
+            pcb.thread.write_irqsave().vfork_done = Some(vfork.clone());
         }
 
-        if pcb.thread.read().set_child_tid.is_some() {
-            let addr = pcb.thread.read().set_child_tid.unwrap();
+        if pcb.thread.read_irqsave().set_child_tid.is_some() {
+            let addr = pcb.thread.read_irqsave().set_child_tid.unwrap();
             let mut writer =
                 UserBufferWriter::new(addr.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
             writer.copy_one_to_user(&(pcb.pid().data() as i32), 0)?;
@@ -234,7 +279,7 @@ impl Syscall {
             .map_err(|_| SystemError::EFAULT)?;
 
         let pcb = ProcessManager::current_pcb();
-        pcb.thread.write().clear_child_tid = Some(VirtAddr::new(ptr));
+        pcb.thread.write_irqsave().clear_child_tid = Some(VirtAddr::new(ptr));
         Ok(pcb.pid.0)
     }
 
@@ -340,5 +385,13 @@ impl Syscall {
                 return Err(SystemError::ENOSYS);
             }
         }
+    }
+
+    pub fn uname(name: *mut PosixOldUtsName) -> Result<usize, SystemError> {
+        let mut writer =
+            UserBufferWriter::new(name, core::mem::size_of::<PosixOldUtsName>(), true)?;
+        writer.copy_one_to_user(&PosixOldUtsName::new(), 0)?;
+
+        return Ok(0);
     }
 }

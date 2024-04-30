@@ -2,6 +2,7 @@
 #![feature(core_intrinsics)]
 #![allow(incomplete_features)] // for const generics
 #![feature(generic_const_exprs)]
+#![allow(clippy::needless_return)]
 
 #[macro_use]
 extern crate alloc;

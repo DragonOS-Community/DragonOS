@@ -5,8 +5,10 @@ use core::{
 
 use alloc::{collections::BTreeMap, sync::Arc};
 
-use crate::{driver::net::NetDriver, libs::rwlock::RwLock};
+use crate::{driver::net::NetDevice, libs::rwlock::RwLock};
 use smoltcp::wire::IpEndpoint;
+
+use self::socket::SocketInode;
 
 pub mod event_poll;
 pub mod net_core;
@@ -16,7 +18,7 @@ pub mod syscall;
 lazy_static! {
     /// # 所有网络接口的列表
     /// 这个列表在中断上下文会使用到，因此需要irqsave
-    pub static ref NET_DRIVERS: RwLock<BTreeMap<usize, Arc<dyn NetDriver>>> = RwLock::new(BTreeMap::new());
+    pub static ref NET_DEVICES: RwLock<BTreeMap<usize, Arc<dyn NetDevice>>> = RwLock::new(BTreeMap::new());
 }
 
 /// 生成网络接口的id (全局自增)
@@ -41,8 +43,8 @@ pub enum Endpoint {
     LinkLayer(LinkLayerEndpoint),
     /// 网络层端点
     Ip(Option<IpEndpoint>),
-    /// 不需要端点
-    Unused,
+    /// inode端点
+    Inode(Option<Arc<SocketInode>>),
     // todo: 增加NetLink机制后，增加NetLink端点
 }
 
@@ -124,9 +126,9 @@ impl From<u8> for Protocol {
     }
 }
 
-impl Into<u8> for Protocol {
-    fn into(self) -> u8 {
-        match self {
+impl From<Protocol> for u8 {
+    fn from(value: Protocol) -> Self {
+        match value {
             Protocol::HopByHop => 0x00,
             Protocol::Icmp => 0x01,
             Protocol::Igmp => 0x02,

@@ -66,26 +66,33 @@ impl Syscall {
         let mut param = ExecParam::new(path.as_str(), address_space.clone(), ExecParamFlags::EXEC)?;
 
         // 加载可执行文件
-        let load_result = load_binary_file(&mut param)
-            .unwrap_or_else(|e| panic!("Failed to load binary file: {:?}, path: {:?}", e, path));
+        let load_result = load_binary_file(&mut param)?;
         // kdebug!("load binary file done");
         // kdebug!("argv: {:?}, envp: {:?}", argv, envp);
         param.init_info_mut().args = argv;
         param.init_info_mut().envs = envp;
 
         // 把proc_init_info写到用户栈上
-
+        let mut ustack_message = unsafe {
+            address_space
+                .write()
+                .user_stack_mut()
+                .expect("No user stack found")
+                .clone_info_only()
+        };
         let (user_sp, argv_ptr) = unsafe {
             param
                 .init_info()
                 .push_at(
-                    address_space
-                        .write()
-                        .user_stack_mut()
-                        .expect("No user stack found"),
+                    // address_space
+                    //     .write()
+                    //     .user_stack_mut()
+                    //     .expect("No user stack found"),
+                    &mut ustack_message,
                 )
                 .expect("Failed to push proc_init_info to user stack")
         };
+        address_space.write().user_stack = Some(ustack_message);
 
         // kdebug!("write proc_init_info to user stack done");
 

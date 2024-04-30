@@ -11,7 +11,6 @@ use crate::{
     process::ProcessManager,
     syscall::{Syscall, SYS_SCHED},
 };
-use alloc::string::String;
 use system_error::SystemError;
 
 use super::{
@@ -64,7 +63,7 @@ macro_rules! syscall_return {
 }
 
 #[no_mangle]
-pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> () {
+pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
     let syscall_num = frame.rax as usize;
     // 防止sys_sched由于超时无法退出导致的死锁
     if syscall_num == SYS_SCHED {
@@ -88,7 +87,7 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) -> () {
     mfence();
     let pid = ProcessManager::current_pcb().pid();
     let show = false;
-    // let show = if syscall_num != SYS_SCHED && pid.data() > 3 {
+    // let show = if syscall_num != SYS_SCHED && pid.data() >= 7 {
     //     true
     // } else {
     //     false
@@ -133,32 +132,19 @@ pub fn arch_syscall_init() -> Result<(), SystemError> {
     return Ok(());
 }
 
-/// 执行第一个用户进程的函数（只应该被调用一次）
-///
-/// 当进程管理重构完成后，这个函数应该被删除。调整为别的函数。
-#[no_mangle]
-pub extern "C" fn rs_exec_init_process(frame: &mut TrapFrame) -> usize {
-    let path = String::from("/bin/shell.elf");
-    let argv = vec![String::from("/bin/shell.elf")];
-    let envp = vec![String::from("PATH=/bin")];
-    let r = Syscall::do_execve(path, argv, envp, frame);
-    // kdebug!("rs_exec_init_process: r: {:?}\n", r);
-    return r.map(|_| 0).unwrap_or_else(|e| e.to_posix_errno() as usize);
-}
-
 /// syscall指令初始化函数
 pub(super) unsafe fn init_syscall_64() {
     let mut efer = x86::msr::rdmsr(x86::msr::IA32_EFER);
     efer |= 0x1;
     x86::msr::wrmsr(x86::msr::IA32_EFER, efer);
 
-    let syscall_base = (1 as u16) << 3;
-    let sysret_base = ((4 as u16) << 3) | 3;
+    let syscall_base = (1_u16) << 3;
+    let sysret_base = ((4_u16) << 3) | 3;
     let high = (u32::from(sysret_base) << 16) | u32::from(syscall_base);
     // 初始化STAR寄存器
     x86::msr::wrmsr(x86::msr::IA32_STAR, u64::from(high) << 32);
 
     // 初始化LSTAR,该寄存器存储syscall指令入口
-    x86::msr::wrmsr(x86::msr::IA32_LSTAR, syscall_64 as u64);
+    x86::msr::wrmsr(x86::msr::IA32_LSTAR, syscall_64 as usize as u64);
     x86::msr::wrmsr(x86::msr::IA32_FMASK, 0xfffffffe);
 }

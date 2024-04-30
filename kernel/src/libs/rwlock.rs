@@ -130,13 +130,12 @@ impl<T> RwLock<T> {
     fn inner_try_read(&self) -> Option<RwLockReadGuard<T>> {
         let reader_value = self.current_reader();
         //得到自增后的reader_value, 包括了尝试获得READER守卫的进程
-        let value;
 
-        if reader_value.is_err() {
-            return None; //获取失败
+        let value = if let Ok(rv) = reader_value {
+            rv
         } else {
-            value = reader_value.unwrap();
-        }
+            return None;
+        };
 
         //判断有没有writer和upgrader
         //注意, 若upgrader存在,已经存在的读者继续占有锁,但新读者不允许获得锁
@@ -217,6 +216,23 @@ impl<T> RwLock<T> {
 
         return r;
     } //当架构为arm时,有些代码需要作出调整compare_exchange=>compare_exchange_weak
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    #[allow(dead_code)]
+    #[inline]
+    pub fn try_write_irqsave(&self) -> Option<RwLockWriteGuard<T>> {
+        ProcessManager::preempt_disable();
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let r = self.inner_try_write().map(|mut g| {
+            g.irq_guard = Some(irq_guard);
+            g
+        });
+        if r.is_none() {
+            ProcessManager::preempt_enable();
+        }
+
+        return r;
+    }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     #[allow(dead_code)]
@@ -354,6 +370,11 @@ impl<T> RwLock<T> {
     #[allow(dead_code)]
     pub unsafe fn get_mut(&mut self) -> &mut T {
         unsafe { &mut *self.data.get() }
+    }
+
+    #[allow(dead_code)]
+    pub unsafe fn force_get_ref(&self) -> &T {
+        unsafe { &*self.data.get() }
     }
 }
 

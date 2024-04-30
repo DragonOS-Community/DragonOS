@@ -12,3 +12,4 @@
    the-development-process
    c-coding-style
    rust-coding-style
+   conventional-commit

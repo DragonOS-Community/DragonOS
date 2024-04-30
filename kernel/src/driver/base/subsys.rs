@@ -22,6 +22,7 @@ use super::{
         driver::Driver,
         Device,
     },
+    kobject::KObject,
     kset::KSet,
 };
 
@@ -82,6 +83,10 @@ impl SubSysPrivate {
         };
     }
 
+    pub fn name(&self) -> String {
+        return self.subsys.name();
+    }
+
     pub fn subsys(&self) -> Arc<KSet> {
         return self.subsys.clone();
     }
@@ -99,7 +104,13 @@ impl SubSysPrivate {
     #[allow(dead_code)]
     #[inline]
     pub fn class(&self) -> Option<Weak<dyn Class>> {
-        return self.class.lock().clone();
+        let mut guard = self.class.lock();
+        if let Some(r) = guard.clone() {
+            return Some(r);
+        } else {
+            *guard = None;
+            return None;
+        }
     }
 
     pub fn set_class(&self, class: Option<Weak<dyn Class>>) {
@@ -195,7 +206,7 @@ pub trait SubSysInterface: Debug + Send + Sync {
     fn bus(&self) -> Option<Weak<dyn Bus>>;
     fn set_bus(&self, bus: Option<Weak<dyn Bus>>);
     fn add_device(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
     fn remove_device(&self, device: &Arc<dyn Device>);
 }

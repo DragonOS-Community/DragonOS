@@ -7,10 +7,11 @@ use alloc::{collections::LinkedList, sync::Arc};
 use system_error::SystemError;
 
 use crate::{
-    arch::{sched::sched, CurrentIrqArch},
+    arch::CurrentIrqArch,
     exception::InterruptArch,
     libs::spinlock::SpinLockGuard,
     process::{Pid, ProcessControlBlock, ProcessManager},
+    sched::{schedule, SchedMode},
 };
 
 use super::spinlock::SpinLock;
@@ -64,8 +65,7 @@ impl<T> Mutex<T> {
             // 当前mutex已经上锁
             if inner.is_locked {
                 // 检查当前进程是否处于等待队列中,如果不在，就加到等待队列内
-                if self.check_pid_in_wait_list(&inner, ProcessManager::current_pcb().pid()) == false
-                {
+                if !self.check_pid_in_wait_list(&inner, ProcessManager::current_pcb().pid()) {
                     inner.wait_list.push_back(ProcessManager::current_pcb());
                 }
 
@@ -107,7 +107,7 @@ impl<T> Mutex<T> {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(true).ok();
         drop(irq_guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     /// @brief 放锁。

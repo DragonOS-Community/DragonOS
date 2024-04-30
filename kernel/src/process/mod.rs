@@ -1,9 +1,9 @@
 use core::{
-    hash::{Hash, Hasher},
+    hash::Hash,
     hint::spin_loop,
     intrinsics::{likely, unlikely},
     mem::ManuallyDrop,
-    sync::atomic::{compiler_fence, AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -16,9 +16,9 @@ use system_error::SystemError;
 
 use crate::{
     arch::{
+        cpu::current_cpu_id,
         ipc::signal::{AtomicSignal, SigSet, Signal},
         process::ArchPCBInfo,
-        sched::sched,
         CurrentIrqArch,
     },
     driver::tty::tty_core::TtyCore,
@@ -34,23 +34,33 @@ use crate::{
         casting::DowncastArc,
         futex::{
             constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
-            futex::Futex,
+            futex::{Futex, RobustListHead},
         },
         lock_free_flags::LockFreeFlags,
-        rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
+        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
-    mm::{percpu::PerCpuVar, set_INITIAL_PROCESS_ADDRESS_SPACE, ucontext::AddressSpace, VirtAddr},
-    net::socket::SocketInode,
-    sched::{
-        completion::Completion,
-        core::{sched_enqueue, CPU_EXECUTING},
-        SchedPolicy, SchedPriority,
+    mm::{
+        percpu::{PerCpu, PerCpuVar},
+        set_IDLE_PROCESS_ADDRESS_SPACE,
+        ucontext::AddressSpace,
+        VirtAddr,
     },
-    smp::kick_cpu,
+    net::socket::SocketInode,
+    sched::completion::Completion,
+    sched::{
+        cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag, EnqueueFlag, OnRq, SchedMode,
+        WakeupFlags, __schedule,
+    },
+    smp::{
+        core::smp_get_processor_id,
+        cpu::{AtomicProcessorId, ProcessorId},
+        kick_cpu,
+    },
     syscall::{user_access::clear_user, Syscall},
 };
+use timer::AlarmTimer;
 
 use self::kthread::WorkerPrivate;
 
@@ -62,14 +72,16 @@ pub mod fork;
 pub mod idle;
 pub mod kthread;
 pub mod pid;
-pub mod process;
 pub mod resource;
+pub mod stdio;
 pub mod syscall;
+pub mod timer;
+pub mod utils;
 
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<Pid, Arc<ProcessControlBlock>>>> = SpinLock::new(None);
 
-pub static mut SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
+pub static mut PROCESS_SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
 
 /// 一个只改变1次的全局变量，标志进程管理器是否已经初始化完成
 static mut __PROCESS_MANAGEMENT_INIT_DONE: bool = false;
@@ -106,7 +118,7 @@ impl ProcessManager {
             compiler_fence(Ordering::SeqCst);
             kdebug!("To create address space for INIT process.");
             // test_buddy();
-            set_INITIAL_PROCESS_ADDRESS_SPACE(
+            set_IDLE_PROCESS_ADDRESS_SPACE(
                 AddressSpace::new(true).expect("Failed to create address space for INIT process."),
             );
             kdebug!("INIT process address space created.");
@@ -114,6 +126,7 @@ impl ProcessManager {
         };
 
         ALL_PROCESS.lock_irqsave().replace(HashMap::new());
+        Self::init_switch_result();
         Self::arch_init();
         kdebug!("process arch init done.");
         Self::init_idle();
@@ -121,6 +134,16 @@ impl ProcessManager {
 
         unsafe { __PROCESS_MANAGEMENT_INIT_DONE = true };
         kinfo!("Process Manager initialized.");
+    }
+
+    fn init_switch_result() {
+        let mut switch_res_vec: Vec<SwitchResult> = Vec::new();
+        for _ in 0..PerCpu::MAX_CPU_NUM {
+            switch_res_vec.push(SwitchResult::new());
+        }
+        unsafe {
+            PROCESS_SWITCH_RESULT = Some(PerCpuVar::new(switch_res_vec).unwrap());
+        }
     }
 
     /// 判断进程管理器是否已经初始化完成
@@ -205,10 +228,24 @@ impl ProcessManager {
             let state = writer.state();
             if state.is_blocked() {
                 writer.set_state(ProcessState::Runnable);
+                writer.set_wakeup();
+
                 // avoid deadlock
                 drop(writer);
 
-                sched_enqueue(pcb.clone(), true);
+                let rq =
+                    cpu_rq(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize);
+
+                let (rq, _guard) = rq.self_lock();
+                rq.update_rq_clock();
+                rq.activate_task(
+                    pcb,
+                    EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
+                );
+
+                rq.check_preempt_currnet(pcb, WakeupFlags::empty());
+
+                // sched_enqueue(pcb.clone(), true);
                 return Ok(());
             } else if state.is_exited() {
                 return Err(SystemError::EINVAL);
@@ -234,7 +271,18 @@ impl ProcessManager {
                 // avoid deadlock
                 drop(writer);
 
-                sched_enqueue(pcb.clone(), true);
+                let rq = cpu_rq(pcb.sched_info().on_cpu().unwrap().data() as usize);
+
+                let (rq, _guard) = rq.self_lock();
+                rq.update_rq_clock();
+                rq.activate_task(
+                    pcb,
+                    EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
+                );
+
+                rq.check_preempt_currnet(pcb, WakeupFlags::empty());
+
+                // sched_enqueue(pcb.clone(), true);
                 return Ok(());
             } else if state.is_runnable() {
                 return Ok(());
@@ -256,19 +304,18 @@ impl ProcessManager {
     /// - 进入当前函数之前，必须关闭中断
     /// - 进入当前函数之后必须保证逻辑的正确性，避免被重复加入调度队列
     pub fn mark_sleep(interruptable: bool) -> Result<(), SystemError> {
-        assert_eq!(
-            CurrentIrqArch::is_irq_enabled(),
-            false,
+        assert!(
+            !CurrentIrqArch::is_irq_enabled(),
             "interrupt must be disabled before enter ProcessManager::mark_sleep()"
         );
-
         let pcb = ProcessManager::current_pcb();
         let mut writer = pcb.sched_info().inner_lock_write_irqsave();
         if !matches!(writer.state(), ProcessState::Exited(_)) {
             writer.set_state(ProcessState::Blocked(interruptable));
+            writer.set_sleep();
             pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
+            fence(Ordering::SeqCst);
             drop(writer);
-
             return Ok(());
         }
         return Err(SystemError::EINTR);
@@ -281,9 +328,8 @@ impl ProcessManager {
     /// - 进入当前函数之前，不能持有sched_info的锁
     /// - 进入当前函数之前，必须关闭中断
     pub fn mark_stop() -> Result<(), SystemError> {
-        assert_eq!(
-            CurrentIrqArch::is_irq_enabled(),
-            false,
+        assert!(
+            !CurrentIrqArch::is_irq_enabled(),
             "interrupt must be disabled before enter ProcessManager::mark_stop()"
         );
 
@@ -308,7 +354,7 @@ impl ProcessManager {
                     .adopt_childen()
                     .unwrap_or_else(|e| panic!("adopte_childen failed: error: {e:?}"))
             };
-            let r = current.parent_pcb.read().upgrade();
+            let r = current.parent_pcb.read_irqsave().upgrade();
             if r.is_none() {
                 return;
             }
@@ -333,15 +379,24 @@ impl ProcessManager {
     /// - `exit_code` : 进程的退出码
     pub fn exit(exit_code: usize) -> ! {
         // 关中断
-        unsafe { CurrentIrqArch::interrupt_disable() };
+        let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let pcb = ProcessManager::current_pcb();
+        let pid = pcb.pid();
         pcb.sched_info
             .inner_lock_write_irqsave()
             .set_state(ProcessState::Exited(exit_code));
         pcb.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
 
+        let rq = cpu_rq(smp_get_processor_id().data() as usize);
+        let (rq, guard) = rq.self_lock();
+        rq.deactivate_task(
+            pcb.clone(),
+            DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
+        );
+        drop(guard);
+
         // 进行进程退出后的工作
-        let thread = pcb.thread.write();
+        let thread = pcb.thread.write_irqsave();
         if let Some(addr) = thread.set_child_tid {
             unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
         }
@@ -354,6 +409,8 @@ impl ProcessManager {
             unsafe { clear_user(addr, core::mem::size_of::<i32>()).expect("clear tid failed") };
         }
 
+        RobustListHead::exit_robust_list(pcb.clone());
+
         // 如果是vfork出来的进程，则需要处理completion
         if thread.vfork_done.is_some() {
             thread.vfork_done.as_ref().unwrap().complete_all();
@@ -362,10 +419,13 @@ impl ProcessManager {
         unsafe { pcb.basic_mut().set_user_vm(None) };
         drop(pcb);
         ProcessManager::exit_notify();
-        unsafe { CurrentIrqArch::interrupt_enable() };
-
-        sched();
-        loop {}
+        // unsafe { CurrentIrqArch::interrupt_enable() };
+        __schedule(SchedMode::SM_NONE);
+        kerror!("pid {pid:?} exited but sched again!");
+        #[allow(clippy::empty_loop)]
+        loop {
+            spin_loop();
+        }
     }
 
     pub unsafe fn release(pid: Pid) {
@@ -392,14 +452,14 @@ impl ProcessManager {
     /// 上下文切换完成后的钩子函数
     unsafe fn switch_finish_hook() {
         // kdebug!("switch_finish_hook");
-        let prev_pcb = SWITCH_RESULT
+        let prev_pcb = PROCESS_SWITCH_RESULT
             .as_mut()
             .unwrap()
             .get_mut()
             .prev_pcb
             .take()
             .expect("prev_pcb is None");
-        let next_pcb = SWITCH_RESULT
+        let next_pcb = PROCESS_SWITCH_RESULT
             .as_mut()
             .unwrap()
             .get_mut()
@@ -408,8 +468,13 @@ impl ProcessManager {
             .expect("next_pcb is None");
 
         // 由于进程切换前使用了SpinLockGuard::leak()，所以这里需要手动释放锁
+        fence(Ordering::SeqCst);
+
         prev_pcb.arch_info.force_unlock();
+        fence(Ordering::SeqCst);
+
         next_pcb.arch_info.force_unlock();
+        fence(Ordering::SeqCst);
     }
 
     /// 如果目标进程正在目标CPU上运行，那么就让这个cpu陷入内核态
@@ -423,9 +488,7 @@ impl ProcessManager {
         let cpu_id = pcb.sched_info().on_cpu();
 
         if let Some(cpu_id) = cpu_id {
-            let cpu_id = cpu_id;
-
-            if pcb.pid() == CPU_EXECUTING.get(cpu_id) {
+            if pcb.pid() == cpu_rq(cpu_id.data() as usize).current().pid() {
                 kick_cpu(cpu_id).expect("ProcessManager::kick(): Failed to kick cpu");
             }
         }
@@ -436,24 +499,20 @@ impl ProcessManager {
 
 /// 上下文切换的钩子函数,当这个函数return的时候,将会发生上下文切换
 #[cfg(target_arch = "x86_64")]
+#[inline(never)]
 pub unsafe extern "sysv64" fn switch_finish_hook() {
     ProcessManager::switch_finish_hook();
 }
 #[cfg(target_arch = "riscv64")]
-pub unsafe extern "C" fn switch_finish_hook() {
+#[inline(always)]
+pub unsafe fn switch_finish_hook() {
     ProcessManager::switch_finish_hook();
 }
 
 int_like!(Pid, AtomicPid, usize, AtomicUsize);
 
-impl Hash for Pid {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-
-impl Pid {
-    pub fn to_string(&self) -> String {
+impl ToString for Pid {
+    fn to_string(&self) -> String {
         self.0.to_string()
     }
 }
@@ -581,6 +640,12 @@ pub struct ProcessControlBlock {
 
     /// 线程信息
     thread: RwLock<ThreadInfo>,
+
+    ///闹钟定时器
+    alarm_timer: SpinLock<Option<AlarmTimer>>,
+
+    /// 进程的robust lock列表
+    robust_list: RwLock<Option<RobustListHead>>,
 }
 
 impl ProcessControlBlock {
@@ -625,7 +690,7 @@ impl ProcessControlBlock {
 
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find(ppid)
             .map(|p| Arc::downgrade(&p))
-            .unwrap_or_else(|| Weak::new());
+            .unwrap_or_default();
 
         let pcb = Self {
             pid,
@@ -644,8 +709,10 @@ impl ProcessControlBlock {
             parent_pcb: RwLock::new(ppcb.clone()),
             real_parent_pcb: RwLock::new(ppcb),
             children: RwLock::new(Vec::new()),
-            wait_queue: WaitQueue::INIT,
+            wait_queue: WaitQueue::default(),
             thread: RwLock::new(ThreadInfo::new()),
+            alarm_timer: SpinLock::new(None),
+            robust_list: RwLock::new(None),
         };
 
         // 初始化系统调用栈
@@ -656,6 +723,10 @@ impl ProcessControlBlock {
 
         let pcb = Arc::new(pcb);
 
+        pcb.sched_info()
+            .sched_entity()
+            .force_mut()
+            .set_pcb(Arc::downgrade(&pcb));
         // 设置进程的arc指针到内核栈和系统调用栈的最低地址处
         unsafe {
             pcb.kernel_stack
@@ -671,7 +742,7 @@ impl ProcessControlBlock {
 
         // 将当前pcb加入父进程的子进程哈希表中
         if pcb.pid() > Pid(1) {
-            if let Some(ppcb_arc) = pcb.parent_pcb.read().upgrade() {
+            if let Some(ppcb_arc) = pcb.parent_pcb.read_irqsave().upgrade() {
                 let mut children = ppcb_arc.children.write_irqsave();
                 children.push(pcb.pid());
             } else {
@@ -721,7 +792,7 @@ impl ProcessControlBlock {
     /// 否则会导致死锁
     #[inline(always)]
     pub fn basic(&self) -> RwLockReadGuard<ProcessBasicInfo> {
-        return self.basic.read();
+        return self.basic.read_irqsave();
     }
 
     #[inline(always)]
@@ -756,6 +827,10 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn kernel_stack(&self) -> RwLockReadGuard<KernelStack> {
         return self.kernel_stack.read();
+    }
+
+    pub unsafe fn kernel_stack_force_ref(&self) -> &KernelStack {
+        self.kernel_stack.force_get_ref()
     }
 
     #[inline(always)]
@@ -806,11 +881,10 @@ impl ProcessControlBlock {
         let f = fd_table_guard.get_file_by_fd(fd)?;
         drop(fd_table_guard);
 
-        let guard = f.lock();
-        if guard.file_type() != FileType::Socket {
+        if f.file_type() != FileType::Socket {
             return None;
         }
-        let socket: Arc<SocketInode> = guard
+        let socket: Arc<SocketInode> = f
             .inode()
             .downcast_arc::<SocketInode>()
             .expect("Not a socket inode");
@@ -844,17 +918,13 @@ impl ProcessControlBlock {
         return name;
     }
 
-    pub fn sig_info(&self) -> RwLockReadGuard<ProcessSignalInfo> {
-        self.sig_info.read()
-    }
-
     pub fn sig_info_irqsave(&self) -> RwLockReadGuard<ProcessSignalInfo> {
         self.sig_info.read_irqsave()
     }
 
-    pub fn try_siginfo(&self, times: u8) -> Option<RwLockReadGuard<ProcessSignalInfo>> {
+    pub fn try_siginfo_irqsave(&self, times: u8) -> Option<RwLockReadGuard<ProcessSignalInfo>> {
         for _ in 0..times {
-            if let Some(r) = self.sig_info.try_read() {
+            if let Some(r) = self.sig_info.try_read_irqsave() {
                 return Some(r);
             }
         }
@@ -868,7 +938,7 @@ impl ProcessControlBlock {
 
     pub fn try_siginfo_mut(&self, times: u8) -> Option<RwLockWriteGuard<ProcessSignalInfo>> {
         for _ in 0..times {
-            if let Some(r) = self.sig_info.try_write() {
+            if let Some(r) = self.sig_info.try_write_irqsave() {
                 return Some(r);
             }
         }
@@ -877,10 +947,10 @@ impl ProcessControlBlock {
     }
 
     pub fn sig_struct(&self) -> SpinLockGuard<SignalStruct> {
-        self.sig_struct.lock()
+        self.sig_struct.lock_irqsave()
     }
 
-    pub fn try_sig_struct_irq(&self, times: u8) -> Option<SpinLockGuard<SignalStruct>> {
+    pub fn try_sig_struct_irqsave(&self, times: u8) -> Option<SpinLockGuard<SignalStruct>> {
         for _ in 0..times {
             if let Ok(r) = self.sig_struct.try_lock_irqsave() {
                 return Some(r);
@@ -893,17 +963,36 @@ impl ProcessControlBlock {
     pub fn sig_struct_irqsave(&self) -> SpinLockGuard<SignalStruct> {
         self.sig_struct.lock_irqsave()
     }
+
+    #[inline(always)]
+    pub fn get_robust_list(&self) -> RwLockReadGuard<Option<RobustListHead>> {
+        return self.robust_list.read_irqsave();
+    }
+
+    #[inline(always)]
+    pub fn set_robust_list(&self, new_robust_list: Option<RobustListHead>) {
+        *self.robust_list.write_irqsave() = new_robust_list;
+    }
+
+    pub fn alarm_timer_irqsave(&self) -> SpinLockGuard<Option<AlarmTimer>> {
+        return self.alarm_timer.lock_irqsave();
+    }
 }
 
 impl Drop for ProcessControlBlock {
     fn drop(&mut self) {
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         // 在ProcFS中,解除进程的注册
         procfs_unregister_pid(self.pid())
             .unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));
 
-        if let Some(ppcb) = self.parent_pcb.read().upgrade() {
-            ppcb.children.write().retain(|pid| *pid != self.pid());
+        if let Some(ppcb) = self.parent_pcb.read_irqsave().upgrade() {
+            ppcb.children
+                .write_irqsave()
+                .retain(|pid| *pid != self.pid());
         }
+
+        drop(irq_guard);
     }
 }
 
@@ -1019,17 +1108,54 @@ impl ProcessBasicInfo {
 #[derive(Debug)]
 pub struct ProcessSchedulerInfo {
     /// 当前进程所在的cpu
-    on_cpu: AtomicI32,
+    on_cpu: AtomicProcessorId,
     /// 如果当前进程等待被迁移到另一个cpu核心上（也就是flags中的PF_NEED_MIGRATE被置位），
     /// 该字段存储要被迁移到的目标处理器核心号
-    migrate_to: AtomicI32,
+    // migrate_to: AtomicProcessorId,
     inner_locked: RwLock<InnerSchedInfo>,
     /// 进程的调度优先级
-    priority: SchedPriority,
+    // priority: SchedPriority,
     /// 当前进程的虚拟运行时间
-    virtual_runtime: AtomicIsize,
+    // virtual_runtime: AtomicIsize,
     /// 由实时调度器管理的时间片
-    rt_time_slice: AtomicIsize,
+    // rt_time_slice: AtomicIsize,
+    pub sched_stat: RwLock<SchedInfo>,
+    /// 调度策略
+    pub sched_policy: RwLock<crate::sched::SchedPolicy>,
+    /// cfs调度实体
+    pub sched_entity: Arc<FairSchedEntity>,
+    pub on_rq: SpinLock<OnRq>,
+
+    pub prio_data: RwLock<PrioData>,
+}
+
+#[derive(Debug, Default)]
+pub struct SchedInfo {
+    /// 记录任务在特定 CPU 上运行的次数
+    pub pcount: usize,
+    /// 记录任务等待在运行队列上的时间
+    pub run_delay: usize,
+    /// 记录任务上次在 CPU 上运行的时间戳
+    pub last_arrival: u64,
+    /// 记录任务上次被加入到运行队列中的时间戳
+    pub last_queued: u64,
+}
+
+#[derive(Debug)]
+pub struct PrioData {
+    pub prio: i32,
+    pub static_prio: i32,
+    pub normal_prio: i32,
+}
+
+impl Default for PrioData {
+    fn default() -> Self {
+        Self {
+            prio: MAX_PRIO - 20,
+            static_prio: MAX_PRIO - 20,
+            normal_prio: MAX_PRIO - 20,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1037,7 +1163,7 @@ pub struct InnerSchedInfo {
     /// 当前进程的状态
     state: ProcessState,
     /// 进程的调度策略
-    sched_policy: SchedPolicy,
+    sleep: bool,
 }
 
 impl InnerSchedInfo {
@@ -1049,64 +1175,79 @@ impl InnerSchedInfo {
         self.state = state;
     }
 
-    pub fn policy(&self) -> SchedPolicy {
-        return self.sched_policy;
+    pub fn set_sleep(&mut self) {
+        self.sleep = true;
+    }
+
+    pub fn set_wakeup(&mut self) {
+        self.sleep = false;
+    }
+
+    pub fn is_mark_sleep(&self) -> bool {
+        self.sleep
     }
 }
 
 impl ProcessSchedulerInfo {
     #[inline(never)]
-    pub fn new(on_cpu: Option<u32>) -> Self {
-        let cpu_id = match on_cpu {
-            Some(cpu_id) => cpu_id as i32,
-            None => -1,
-        };
+    pub fn new(on_cpu: Option<ProcessorId>) -> Self {
+        let cpu_id = on_cpu.unwrap_or(ProcessorId::INVALID);
         return Self {
-            on_cpu: AtomicI32::new(cpu_id),
-            migrate_to: AtomicI32::new(-1),
+            on_cpu: AtomicProcessorId::new(cpu_id),
+            // migrate_to: AtomicProcessorId::new(ProcessorId::INVALID),
             inner_locked: RwLock::new(InnerSchedInfo {
                 state: ProcessState::Blocked(false),
-                sched_policy: SchedPolicy::CFS,
+                sleep: false,
             }),
-            virtual_runtime: AtomicIsize::new(0),
-            rt_time_slice: AtomicIsize::new(0),
-            priority: SchedPriority::new(100).unwrap(),
+            // virtual_runtime: AtomicIsize::new(0),
+            // rt_time_slice: AtomicIsize::new(0),
+            // priority: SchedPriority::new(100).unwrap(),
+            sched_stat: RwLock::new(SchedInfo::default()),
+            sched_policy: RwLock::new(crate::sched::SchedPolicy::CFS),
+            sched_entity: FairSchedEntity::new(),
+            on_rq: SpinLock::new(OnRq::None),
+            prio_data: RwLock::new(PrioData::default()),
         };
     }
 
-    pub fn on_cpu(&self) -> Option<u32> {
+    pub fn sched_entity(&self) -> Arc<FairSchedEntity> {
+        return self.sched_entity.clone();
+    }
+
+    pub fn on_cpu(&self) -> Option<ProcessorId> {
         let on_cpu = self.on_cpu.load(Ordering::SeqCst);
-        if on_cpu == -1 {
+        if on_cpu == ProcessorId::INVALID {
             return None;
         } else {
-            return Some(on_cpu as u32);
+            return Some(on_cpu);
         }
     }
 
-    pub fn set_on_cpu(&self, on_cpu: Option<u32>) {
+    pub fn set_on_cpu(&self, on_cpu: Option<ProcessorId>) {
         if let Some(cpu_id) = on_cpu {
-            self.on_cpu.store(cpu_id as i32, Ordering::SeqCst);
+            self.on_cpu.store(cpu_id, Ordering::SeqCst);
         } else {
-            self.on_cpu.store(-1, Ordering::SeqCst);
+            self.on_cpu.store(ProcessorId::INVALID, Ordering::SeqCst);
         }
     }
 
-    pub fn migrate_to(&self) -> Option<u32> {
-        let migrate_to = self.migrate_to.load(Ordering::SeqCst);
-        if migrate_to == -1 {
-            return None;
-        } else {
-            return Some(migrate_to as u32);
-        }
-    }
+    // pub fn migrate_to(&self) -> Option<ProcessorId> {
+    //     let migrate_to = self.migrate_to.load(Ordering::SeqCst);
+    //     if migrate_to == ProcessorId::INVALID {
+    //         return None;
+    //     } else {
+    //         return Some(migrate_to);
+    //     }
+    // }
 
-    pub fn set_migrate_to(&self, migrate_to: Option<u32>) {
-        if let Some(data) = migrate_to {
-            self.migrate_to.store(data as i32, Ordering::SeqCst);
-        } else {
-            self.migrate_to.store(-1, Ordering::SeqCst)
-        }
-    }
+    // pub fn set_migrate_to(&self, migrate_to: Option<ProcessorId>) {
+    //     if let Some(data) = migrate_to {
+    //         self.migrate_to.store(data, Ordering::SeqCst);
+    //     } else {
+    //         self.migrate_to
+    //             .store(ProcessorId::INVALID, Ordering::SeqCst)
+    //     }
+    // }
 
     pub fn inner_lock_write_irqsave(&self) -> RwLockWriteGuard<InnerSchedInfo> {
         return self.inner_locked.write_irqsave();
@@ -1116,58 +1257,58 @@ impl ProcessSchedulerInfo {
         return self.inner_locked.read_irqsave();
     }
 
-    pub fn inner_lock_try_read_irqsave(
-        &self,
-        times: u8,
-    ) -> Option<RwLockReadGuard<InnerSchedInfo>> {
-        for _ in 0..times {
-            if let Some(r) = self.inner_locked.try_read_irqsave() {
-                return Some(r);
-            }
-        }
+    // pub fn inner_lock_try_read_irqsave(
+    //     &self,
+    //     times: u8,
+    // ) -> Option<RwLockReadGuard<InnerSchedInfo>> {
+    //     for _ in 0..times {
+    //         if let Some(r) = self.inner_locked.try_read_irqsave() {
+    //             return Some(r);
+    //         }
+    //     }
 
-        return None;
-    }
+    //     return None;
+    // }
 
-    pub fn inner_lock_try_upgradable_read_irqsave(
-        &self,
-        times: u8,
-    ) -> Option<RwLockUpgradableGuard<InnerSchedInfo>> {
-        for _ in 0..times {
-            if let Some(r) = self.inner_locked.try_upgradeable_read_irqsave() {
-                return Some(r);
-            }
-        }
+    // pub fn inner_lock_try_upgradable_read_irqsave(
+    //     &self,
+    //     times: u8,
+    // ) -> Option<RwLockUpgradableGuard<InnerSchedInfo>> {
+    //     for _ in 0..times {
+    //         if let Some(r) = self.inner_locked.try_upgradeable_read_irqsave() {
+    //             return Some(r);
+    //         }
+    //     }
 
-        return None;
-    }
+    //     return None;
+    // }
 
-    pub fn virtual_runtime(&self) -> isize {
-        return self.virtual_runtime.load(Ordering::SeqCst);
-    }
+    // pub fn virtual_runtime(&self) -> isize {
+    //     return self.virtual_runtime.load(Ordering::SeqCst);
+    // }
 
-    pub fn set_virtual_runtime(&self, virtual_runtime: isize) {
-        self.virtual_runtime
-            .store(virtual_runtime, Ordering::SeqCst);
-    }
-    pub fn increase_virtual_runtime(&self, delta: isize) {
-        self.virtual_runtime.fetch_add(delta, Ordering::SeqCst);
-    }
+    // pub fn set_virtual_runtime(&self, virtual_runtime: isize) {
+    //     self.virtual_runtime
+    //         .store(virtual_runtime, Ordering::SeqCst);
+    // }
+    // pub fn increase_virtual_runtime(&self, delta: isize) {
+    //     self.virtual_runtime.fetch_add(delta, Ordering::SeqCst);
+    // }
 
-    pub fn rt_time_slice(&self) -> isize {
-        return self.rt_time_slice.load(Ordering::SeqCst);
-    }
+    // pub fn rt_time_slice(&self) -> isize {
+    //     return self.rt_time_slice.load(Ordering::SeqCst);
+    // }
 
-    pub fn set_rt_time_slice(&self, rt_time_slice: isize) {
-        self.rt_time_slice.store(rt_time_slice, Ordering::SeqCst);
-    }
+    // pub fn set_rt_time_slice(&self, rt_time_slice: isize) {
+    //     self.rt_time_slice.store(rt_time_slice, Ordering::SeqCst);
+    // }
 
-    pub fn increase_rt_time_slice(&self, delta: isize) {
-        self.rt_time_slice.fetch_add(delta, Ordering::SeqCst);
-    }
+    // pub fn increase_rt_time_slice(&self, delta: isize) {
+    //     self.rt_time_slice.fetch_add(delta, Ordering::SeqCst);
+    // }
 
-    pub fn priority(&self) -> SchedPriority {
-        return self.priority;
+    pub fn policy(&self) -> crate::sched::SchedPolicy {
+        return *self.sched_policy.read_irqsave();
     }
 }
 
@@ -1195,7 +1336,7 @@ impl KernelStack {
     ///
     /// 仅仅用于BSP启动时，为idle进程构造内核栈。其他时候使用这个函数，很可能造成错误！
     pub unsafe fn from_existed(base: VirtAddr) -> Result<Self, SystemError> {
-        if base.is_null() || base.check_aligned(Self::ALIGN) == false {
+        if base.is_null() || !base.check_aligned(Self::ALIGN) {
             return Err(SystemError::EFAULT);
         }
 
@@ -1276,7 +1417,7 @@ impl KernelStack {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        if !self.stack.is_none() {
+        if self.stack.is_some() {
             let ptr = self.stack.as_ref().unwrap().as_ptr() as *const *const ProcessControlBlock;
             if unsafe { !(*ptr).is_null() } {
                 let pcb_ptr: Weak<ProcessControlBlock> = unsafe { Weak::from_raw(*ptr) };

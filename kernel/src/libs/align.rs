@@ -117,6 +117,10 @@ impl<T: Clone + SafeForZero, const ALIGN: usize> Clone for AlignedBox<T, ALIGN> 
 /// 一个用于表明某个类型是安全的用于零初始化的 trait
 ///
 /// 该 trait 用于表明某个类型是安全的用于零初始化的，即该类型的所有位都可以被初始化为 0 而不会出现未定义行为。
+///
+/// # Safety
+///
+/// 该 trait 是 unsafe 的，因为它要求实现者保证该类型的所有位都可以被初始化为 0 而不会出现未定义行为。
 pub unsafe trait SafeForZero {}
 
 unsafe impl<const NUM: usize> SafeForZero for [u8; NUM] {}
@@ -126,14 +130,24 @@ unsafe impl<const NUM: usize> SafeForZero for [u8; NUM] {}
 /// 参数 `addr`：要对齐的地址。
 ///
 /// 返回值：对齐后的地址。
-pub fn page_align_up(addr: usize) -> usize {
+pub const fn page_align_up(addr: usize) -> usize {
     let page_size = MMArch::PAGE_SIZE;
     return (addr + page_size - 1) & (!(page_size - 1));
 }
 
-pub fn page_align_down(addr: usize) -> usize {
+pub const fn page_align_down(addr: usize) -> usize {
     let page_size = MMArch::PAGE_SIZE;
     return addr & (!(page_size - 1));
+}
+
+pub const fn align_up(addr: usize, align: usize) -> usize {
+    assert!(align != 0 && align.is_power_of_two());
+    return (addr + align - 1) & (!(align - 1));
+}
+
+pub const fn align_down(addr: usize, align: usize) -> usize {
+    assert!(align != 0 && align.is_power_of_two());
+    return addr & (!(align - 1));
 }
 
 /// ## 检查是否对齐

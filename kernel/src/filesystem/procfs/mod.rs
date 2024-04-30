@@ -4,7 +4,7 @@ use alloc::{
     borrow::ToOwned,
     collections::BTreeMap,
     format,
-    string::String,
+    string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -20,17 +20,19 @@ use crate::{
     kerror, kinfo,
     libs::{
         once::Once,
+        rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::allocator::page_frame::FrameAllocator,
     process::{Pid, ProcessManager},
-    time::TimeSpec,
+    time::PosixTimeSpec,
 };
 
 use super::vfs::{
     file::{FileMode, FilePrivateData},
     syscall::ModeType,
-    FileSystem, FsInfo, IndexNode, InodeId, Metadata,
+    utils::DName,
+    FileSystem, FsInfo, IndexNode, InodeId, Magic, Metadata, SuperBlock,
 };
 
 pub mod kmsg;
@@ -76,7 +78,7 @@ pub struct InodeInfo {
 
 /// @brief procfs的inode名称的最大长度
 const PROCFS_MAX_NAMELEN: usize = 64;
-
+const PROCFS_BLOCK_SIZE: u64 = 512;
 /// @brief procfs文件系统的Inode结构体
 #[derive(Debug)]
 pub struct LockedProcFSInode(SpinLock<ProcFSInode>);
@@ -86,6 +88,7 @@ pub struct LockedProcFSInode(SpinLock<ProcFSInode>);
 pub struct ProcFS {
     /// procfs的root inode
     root_inode: Arc<LockedProcFSInode>,
+    super_block: RwLock<SuperBlock>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +102,12 @@ impl ProcfsFilePrivateData {
     }
 }
 
+impl Default for ProcfsFilePrivateData {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// @brief procfs文件系统的Inode结构体(不包含锁)
 #[derive(Debug)]
 pub struct ProcFSInode {
@@ -107,7 +116,7 @@ pub struct ProcFSInode {
     /// 指向自身的弱引用
     self_ref: Weak<LockedProcFSInode>,
     /// 子Inode的B树
-    children: BTreeMap<String, Arc<LockedProcFSInode>>,
+    children: BTreeMap<DName, Arc<LockedProcFSInode>>,
     /// 当前inode的数据部分
     data: Vec<u8>,
     /// 当前inode的元数据
@@ -116,6 +125,8 @@ pub struct ProcFSInode {
     fs: Weak<ProcFS>,
     /// 储存私有信息
     fdata: InodeInfo,
+    /// 目录项
+    dname: DName,
 }
 
 /// 对ProcFSInode实现获取各类文件信息的函数
@@ -135,14 +146,14 @@ impl ProcFSInode {
         // 获取该pid对应的pcb结构体
         let pid = self.fdata.pid;
         let pcb = ProcessManager::find(pid);
-        let pcb = if pcb.is_none() {
+        let pcb = if let Some(pcb) = pcb {
+            pcb
+        } else {
             kerror!(
                 "ProcFS: Cannot find pcb for pid {:?} when opening its 'status' file.",
                 pid
             );
             return Err(SystemError::ESRCH);
-        } else {
-            pcb.unwrap()
         };
         // 传入数据
         let pdata: &mut Vec<u8> = &mut pdata.data;
@@ -157,11 +168,11 @@ impl ProcFSInode {
         let state = sched_info_guard.inner_lock_read_irqsave().state();
         let cpu_id = sched_info_guard
             .on_cpu()
-            .map(|cpu| cpu as i32)
+            .map(|cpu| cpu.data() as i32)
             .unwrap_or(-1);
 
-        let priority = sched_info_guard.priority();
-        let vrtime = sched_info_guard.virtual_runtime();
+        let priority = sched_info_guard.policy();
+        let vrtime = sched_info_guard.sched_entity.vruntime;
 
         pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
         pdata.append(
@@ -175,11 +186,7 @@ impl ProcFSInode {
                 .to_owned(),
         );
         pdata.append(&mut format!("\ncpu_id:\t{}", cpu_id).as_bytes().to_owned());
-        pdata.append(
-            &mut format!("\npriority:\t{}", priority.data())
-                .as_bytes()
-                .to_owned(),
-        );
+        pdata.append(&mut format!("\npriority:\t{:?}", priority).as_bytes().to_owned());
         pdata.append(
             &mut format!("\npreempt:\t{}", pcb.preempt_count())
                 .as_bytes()
@@ -249,10 +256,10 @@ impl ProcFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _pdata: &mut ProcfsFilePrivateData,
+        pdata: &mut ProcfsFilePrivateData,
     ) -> Result<usize, SystemError> {
-        let start = _pdata.data.len().min(offset);
-        let end = _pdata.data.len().min(offset + len);
+        let start = pdata.data.len().min(offset);
+        let end = pdata.data.len().min(offset + len);
 
         // buffer空间不足
         if buf.len() < (end - start) {
@@ -260,7 +267,7 @@ impl ProcFSInode {
         }
 
         // 拷贝数据
-        let src = &_pdata.data[start..end];
+        let src = &pdata.data[start..end];
         buf[0..src.len()].copy_from_slice(src);
         return Ok(src.len());
     }
@@ -281,10 +288,22 @@ impl FileSystem for ProcFS {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
+    fn name(&self) -> &str {
+        "procfs"
+    }
+
+    fn super_block(&self) -> SuperBlock {
+        self.super_block.read().clone()
+    }
 }
 
 impl ProcFS {
     pub fn new() -> Arc<Self> {
+        let super_block = SuperBlock::new(
+            Magic::PROC_MAGIC,
+            PROCFS_BLOCK_SIZE,
+            PROCFS_MAX_NAMELEN as u64,
+        );
         // 初始化root inode
         let root: Arc<LockedProcFSInode> =
             Arc::new(LockedProcFSInode(SpinLock::new(ProcFSInode {
@@ -298,9 +317,9 @@ impl ProcFS {
                     size: 0,
                     blk_size: 0,
                     blocks: 0,
-                    atime: TimeSpec::default(),
-                    mtime: TimeSpec::default(),
-                    ctime: TimeSpec::default(),
+                    atime: PosixTimeSpec::default(),
+                    mtime: PosixTimeSpec::default(),
+                    ctime: PosixTimeSpec::default(),
                     file_type: FileType::Dir,
                     mode: ModeType::from_bits_truncate(0o555),
                     nlinks: 1,
@@ -313,9 +332,13 @@ impl ProcFS {
                     pid: Pid::new(0),
                     ftype: ProcFileType::Default,
                 },
+                dname: DName::default(),
             })));
 
-        let result: Arc<ProcFS> = Arc::new(ProcFS { root_inode: root });
+        let result: Arc<ProcFS> = Arc::new(ProcFS {
+            root_inode: root,
+            super_block: RwLock::new(super_block),
+        });
 
         // 对root inode加锁，并继续完成初始化工作
         let mut root_guard: SpinLockGuard<ProcFSInode> = result.root_inode.0.lock();
@@ -410,7 +433,11 @@ impl ProcFS {
 }
 
 impl IndexNode for LockedProcFSInode {
-    fn open(&self, data: &mut FilePrivateData, _mode: &FileMode) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        mut data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
         // 加锁
         let mut inode: SpinLockGuard<ProcFSInode> = self.0.lock();
 
@@ -434,7 +461,7 @@ impl IndexNode for LockedProcFSInode {
         return Ok(());
     }
 
-    fn close(&self, data: &mut FilePrivateData) -> Result<(), SystemError> {
+    fn close(&self, mut data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         let guard: SpinLockGuard<ProcFSInode> = self.0.lock();
         // 如果inode类型为文件夹，则直接返回成功
         if let FileType::Dir = guard.metadata.file_type {
@@ -451,7 +478,7 @@ impl IndexNode for LockedProcFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: &mut FilePrivateData,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
@@ -465,8 +492,8 @@ impl IndexNode for LockedProcFSInode {
         }
 
         // 获取数据信息
-        let private_data = match data {
-            FilePrivateData::Procfs(p) => p,
+        let mut private_data = match &*data {
+            FilePrivateData::Procfs(p) => p.clone(),
             _ => {
                 panic!("ProcFS: FilePrivateData mismatch!");
             }
@@ -474,8 +501,12 @@ impl IndexNode for LockedProcFSInode {
 
         // 根据文件类型读取相应数据
         match inode.fdata.ftype {
-            ProcFileType::ProcStatus => return inode.proc_read(offset, len, buf, private_data),
-            ProcFileType::ProcMeminfo => return inode.proc_read(offset, len, buf, private_data),
+            ProcFileType::ProcStatus => {
+                return inode.proc_read(offset, len, buf, &mut private_data)
+            }
+            ProcFileType::ProcMeminfo => {
+                return inode.proc_read(offset, len, buf, &mut private_data)
+            }
             ProcFileType::ProcKmsg => (),
             ProcFileType::Default => (),
         };
@@ -500,9 +531,9 @@ impl IndexNode for LockedProcFSInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: &mut FilePrivateData,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -555,8 +586,9 @@ impl IndexNode for LockedProcFSInode {
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
+        let name = DName::from(name);
         // 如果有重名的，则返回
-        if inode.children.contains_key(name) {
+        if inode.children.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
 
@@ -573,11 +605,11 @@ impl IndexNode for LockedProcFSInode {
                     size: 0,
                     blk_size: 0,
                     blocks: 0,
-                    atime: TimeSpec::default(),
-                    mtime: TimeSpec::default(),
-                    ctime: TimeSpec::default(),
-                    file_type: file_type,
-                    mode: mode,
+                    atime: PosixTimeSpec::default(),
+                    mtime: PosixTimeSpec::default(),
+                    ctime: PosixTimeSpec::default(),
+                    file_type,
+                    mode,
                     nlinks: 1,
                     uid: 0,
                     gid: 0,
@@ -588,13 +620,14 @@ impl IndexNode for LockedProcFSInode {
                     pid: Pid::new(0),
                     ftype: ProcFileType::Default,
                 },
+                dname: name.clone(),
             })));
 
         // 初始化inode的自引用的weak指针
         result.0.lock().self_ref = Arc::downgrade(&result);
 
         // 将子inode插入父inode的B树中
-        inode.children.insert(String::from(name), result.clone());
+        inode.children.insert(name, result.clone());
 
         return Ok(result);
     }
@@ -615,15 +648,15 @@ impl IndexNode for LockedProcFSInode {
         if other_locked.metadata.file_type == FileType::Dir {
             return Err(SystemError::EISDIR);
         }
-
+        let name = DName::from(name);
         // 如果当前文件夹下已经有同名文件，也报错。
-        if inode.children.contains_key(name) {
+        if inode.children.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
 
         inode
             .children
-            .insert(String::from(name), other_locked.self_ref.upgrade().unwrap());
+            .insert(name, other_locked.self_ref.upgrade().unwrap());
 
         // 增加硬链接计数
         other_locked.metadata.nlinks += 1;
@@ -636,27 +669,31 @@ impl IndexNode for LockedProcFSInode {
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
+
         // 不允许删除当前文件夹，也不允许删除上一个目录
         if name == "." || name == ".." {
             return Err(SystemError::ENOTEMPTY);
         }
-
+        let name = DName::from(name);
         // 获得要删除的文件的inode
-        let to_delete = inode.children.get(name).ok_or(SystemError::ENOENT)?;
+        let to_delete = inode.children.get(&name).ok_or(SystemError::ENOENT)?;
+
         // 减少硬链接计数
         to_delete.0.lock().metadata.nlinks -= 1;
+
         // 在当前目录中删除这个子目录项
-        inode.children.remove(name);
+        inode.children.remove(&name);
+
         return Ok(());
     }
 
-    fn move_(
+    fn move_to(
         &self,
         _old_name: &str,
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
     ) -> Result<(), SystemError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        return Err(SystemError::ENOSYS);
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -676,7 +713,11 @@ impl IndexNode for LockedProcFSInode {
             }
             name => {
                 // 在子目录项中查找
-                return Ok(inode.children.get(name).ok_or(SystemError::ENOENT)?.clone());
+                return Ok(inode
+                    .children
+                    .get(&DName::from(name))
+                    .ok_or(SystemError::ENOENT)?
+                    .clone());
             }
         }
     }
@@ -699,20 +740,14 @@ impl IndexNode for LockedProcFSInode {
                 // TODO: 优化这里，这个地方性能很差！
                 let mut key: Vec<String> = inode
                     .children
-                    .keys()
-                    .filter(|k| {
-                        inode
-                            .children
-                            .get(*k)
-                            .unwrap()
-                            .0
-                            .lock()
-                            .metadata
-                            .inode_id
-                            .into()
-                            == ino
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        if v.0.lock().metadata.inode_id.into() == ino {
+                            Some(k.to_string())
+                        } else {
+                            None
+                        }
                     })
-                    .cloned()
                     .collect();
 
                 match key.len() {
@@ -733,9 +768,21 @@ impl IndexNode for LockedProcFSInode {
         let mut keys: Vec<String> = Vec::new();
         keys.push(String::from("."));
         keys.push(String::from(".."));
-        keys.append(&mut self.0.lock().children.keys().cloned().collect());
+        keys.append(
+            &mut self
+                .0
+                .lock()
+                .children
+                .keys()
+                .map(ToString::to_string)
+                .collect(),
+        );
 
         return Ok(keys);
+    }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        Ok(self.0.lock().dname.clone())
     }
 }
 
@@ -777,13 +824,12 @@ pub fn procfs_init() -> Result<(), SystemError> {
         kinfo!("Initializing ProcFS...");
         // 创建 procfs 实例
         let procfs: Arc<ProcFS> = ProcFS::new();
-
         // procfs 挂载
-        let _t = ROOT_INODE()
-            .find("proc")
-            .expect("Cannot find /proc")
+        ROOT_INODE()
+            .mkdir("proc", ModeType::from_bits_truncate(0o755))
+            .expect("Unabled to find /proc")
             .mount(procfs)
-            .expect("Failed to mount proc");
+            .expect("Failed to mount at /proc");
         kinfo!("ProcFS mounted.");
         result = Some(Ok(()));
     });

@@ -1,6 +1,6 @@
 use core::{
     hint::spin_loop,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{compiler_fence, AtomicBool, Ordering},
 };
 
 use alloc::{
@@ -13,12 +13,13 @@ use atomic_enum::atomic_enum;
 use system_error::SystemError;
 
 use crate::{
-    arch::{sched::sched, CurrentIrqArch},
-    exception::InterruptArch,
+    arch::CurrentIrqArch,
+    exception::{irqdesc::IrqAction, InterruptArch},
     init::initial_kthread::initial_kernel_thread,
-    kdebug, kinfo,
+    kinfo,
     libs::{once::Once, spinlock::SpinLock},
     process::{ProcessManager, ProcessState},
+    sched::{schedule, SchedMode},
 };
 
 use super::{fork::CloneFlags, Pid, ProcessControlBlock, ProcessFlags};
@@ -85,17 +86,34 @@ impl KernelThreadPcbPrivate {
 ///
 /// 对于非原始类型的参数，需要使用Box包装
 #[allow(dead_code)]
+#[allow(clippy::type_complexity)]
 pub enum KernelThreadClosure {
     UsizeClosure((Box<dyn Fn(usize) -> i32 + Send + Sync>, usize)),
+    StaticUsizeClosure((&'static fn(usize) -> i32, usize)),
     EmptyClosure((Box<dyn Fn() -> i32 + Send + Sync>, ())),
+    StaticEmptyClosure((&'static fn() -> i32, ())),
+    IrqThread(
+        (
+            &'static dyn Fn(Arc<IrqAction>) -> Result<(), SystemError>,
+            Arc<IrqAction>,
+        ),
+    ),
     // 添加其他类型入参的闭包，返回值必须是i32
 }
+
+unsafe impl Send for KernelThreadClosure {}
+unsafe impl Sync for KernelThreadClosure {}
 
 impl KernelThreadClosure {
     pub fn run(self) -> i32 {
         match self {
             Self::UsizeClosure((func, arg)) => func(arg),
             Self::EmptyClosure((func, _arg)) => func(),
+            Self::StaticUsizeClosure((func, arg)) => func(arg),
+            Self::StaticEmptyClosure((func, _arg)) => func(),
+            Self::IrqThread((func, arg)) => {
+                func(arg).map(|_| 0).unwrap_or_else(|e| e.to_posix_errno())
+            }
         }
     }
 }
@@ -285,6 +303,8 @@ impl KernelThreadMechanism {
             // 初始化kthreadd
             let closure = KernelThreadClosure::EmptyClosure((Box::new(Self::kthread_daemon), ()));
             let info = KernelThreadCreateInfo::new(closure, "kthreadd".to_string());
+            info.set_to_mark_sleep(false)
+                .expect("kthreadadd should be run first");
             let kthreadd_pid: Pid = Self::__inner_create(
                 &info,
                 CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGNAL,
@@ -295,7 +315,7 @@ impl KernelThreadMechanism {
             unsafe {
                 KTHREAD_DAEMON_PCB.replace(pcb);
             }
-            kinfo!("Initializing kernel thread mechanism stage2 complete");
+            kinfo!("Initialize kernel thread mechanism stage2 complete");
         });
     }
 
@@ -317,6 +337,7 @@ impl KernelThreadMechanism {
             spin_loop()
         }
         KTHREAD_CREATE_LIST.lock().push_back(info.clone());
+        compiler_fence(Ordering::SeqCst);
         ProcessManager::wakeup(unsafe { KTHREAD_DAEMON_PCB.as_ref().unwrap() })
             .expect("Failed to wakeup kthread daemon");
         return info.poll_result();
@@ -339,7 +360,7 @@ impl KernelThreadMechanism {
     ) -> Option<Arc<ProcessControlBlock>> {
         let pcb = Self::create(func, name)?;
         ProcessManager::wakeup(&pcb)
-            .expect(format!("Failed to wakeup kthread: {:?}", pcb.pid()).as_str());
+            .unwrap_or_else(|_| panic!("Failed to wakeup kthread: {:?}", pcb.pid()));
         return Some(pcb);
     }
 
@@ -419,9 +440,9 @@ impl KernelThreadMechanism {
     }
 
     /// A daemon thread which creates other kernel threads
+    #[inline(never)]
     fn kthread_daemon() -> i32 {
         let current_pcb = ProcessManager::current_pcb();
-        kdebug!("kthread_daemon: pid: {:?}", current_pcb.pid());
         {
             // 初始化worker_private
             let mut worker_private_guard = current_pcb.worker_private();
@@ -436,11 +457,11 @@ impl KernelThreadMechanism {
             let mut list = KTHREAD_CREATE_LIST.lock();
             while let Some(info) = list.pop_front() {
                 drop(list);
-
                 // create a new kernel thread
-                let result: Result<Pid, SystemError> =
-                    Self::__inner_create(&info, CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGNAL);
-
+                let result: Result<Pid, SystemError> = Self::__inner_create(
+                    &info,
+                    CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGNAL,
+                );
                 if result.is_err() {
                     // 创建失败
                     info.created
@@ -453,7 +474,7 @@ impl KernelThreadMechanism {
             let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
             ProcessManager::mark_sleep(true).ok();
             drop(irq_guard);
-            sched();
+            schedule(SchedMode::SM_NONE);
         }
     }
 }
@@ -478,7 +499,7 @@ pub unsafe extern "C" fn kernel_thread_bootstrap_stage2(ptr: *const KernelThread
         let irq_guard = CurrentIrqArch::save_and_disable_irq();
         ProcessManager::mark_sleep(true).expect("Failed to mark sleep");
         drop(irq_guard);
-        sched();
+        schedule(SchedMode::SM_NONE);
     }
 
     let mut retval = SystemError::EINTR.to_posix_errno();

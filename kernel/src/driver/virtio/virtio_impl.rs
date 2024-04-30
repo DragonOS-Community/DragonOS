@@ -3,7 +3,7 @@ use crate::arch::mm::kernel_page_flags;
 use crate::arch::MMArch;
 
 use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::PageFlags;
+use crate::mm::page::{page_manager_lock_irqsave, PageFlags};
 use crate::mm::{
     allocator::page_frame::{
         allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
@@ -59,7 +59,7 @@ unsafe impl Hal for HalImpl {
         );
 
         // 恢复页面属性
-        let vaddr = VirtAddr::new(vaddr.as_ptr() as *mut u8 as usize);
+        let vaddr = VirtAddr::new(vaddr.as_ptr() as usize);
         let mut kernel_mapper = KernelMapper::lock();
         let kernel_mapper = kernel_mapper.as_mut().unwrap();
         let flusher = kernel_mapper
@@ -68,15 +68,19 @@ unsafe impl Hal for HalImpl {
         flusher.flush();
 
         unsafe {
-            deallocate_page_frames(PhysPageFrame::new(PhysAddr::new(paddr)), page_count);
+            deallocate_page_frames(
+                PhysPageFrame::new(PhysAddr::new(paddr)),
+                page_count,
+                &mut page_manager_lock_irqsave(),
+            );
         }
         return 0;
     }
     /// @brief mmio物理地址转换为虚拟地址，不需要使用
     /// @param paddr 起始物理地址
     /// @return NonNull<u8> 虚拟地址的指针
-    unsafe fn mmio_phys_to_virt(_paddr: virtio_drivers::PhysAddr, _size: usize) -> NonNull<u8> {
-        NonNull::new((0) as _).unwrap()
+    unsafe fn mmio_phys_to_virt(paddr: virtio_drivers::PhysAddr, _size: usize) -> NonNull<u8> {
+        NonNull::new((MMArch::phys_2_virt(PhysAddr::new(paddr))).unwrap().data() as _).unwrap()
     }
     /// @brief 与真实物理设备共享
     /// @param buffer 要共享的buffer _direction：设备到driver或driver到设备

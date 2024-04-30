@@ -14,15 +14,15 @@ use crate::{
     smp::core::smp_get_processor_id,
 };
 
-use super::{LVTRegister, LocalAPIC, LVT};
+use super::{hw_irq::ApicId, LVTRegister, LocalAPIC, LVT};
 
 /// per-cpu的xAPIC的MMIO空间起始地址
-static mut XAPIC_INSTANCES: [RefCell<Option<XApic>>; PerCpu::MAX_CPU_NUM] =
-    [const { RefCell::new(None) }; PerCpu::MAX_CPU_NUM];
+static mut XAPIC_INSTANCES: [RefCell<Option<XApic>>; PerCpu::MAX_CPU_NUM as usize] =
+    [const { RefCell::new(None) }; PerCpu::MAX_CPU_NUM as usize];
 
 #[inline(always)]
 pub(super) fn current_xapic_instance() -> &'static RefCell<Option<XApic>> {
-    unsafe { &XAPIC_INSTANCES.as_ref()[smp_get_processor_id() as usize] }
+    unsafe { &XAPIC_INSTANCES.as_ref()[smp_get_processor_id().data() as usize] }
 }
 
 /// TODO：统一变量
@@ -91,9 +91,9 @@ pub enum XApicOffset {
     LOCAL_APIC_OFFSET_Local_APIC_CLKDIV = 0x3e0,
 }
 
-impl Into<u32> for XApicOffset {
-    fn into(self) -> u32 {
-        self as u32
+impl From<XApicOffset> for u32 {
+    fn from(val: XApicOffset) -> Self {
+        val as u32
     }
 }
 
@@ -223,14 +223,11 @@ impl LocalAPIC for XApic {
                 return false;
             }
             // 设置 Spurious Interrupt Vector Register
-            let val = self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR.into());
+            let val = self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR);
 
-            self.write(
-                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR.into(),
-                val | ENABLE,
-            );
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR, val | ENABLE);
 
-            let val = self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR.into());
+            let val = self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR);
             if val & ENABLE == 0 {
                 kerror!("xAPIC software enable failed.");
 
@@ -246,23 +243,19 @@ impl LocalAPIC for XApic {
             self.mask_all_lvt();
 
             // 清除错误状态寄存器（需要连续写入两次）
-            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR.into(), 0);
-            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR.into(), 0);
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR, 0);
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ESR, 0);
 
             // 确认任何未完成的中断
-            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_EOI.into(), 0);
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_EOI, 0);
 
             // 发送 Init Level De-Assert 信号以同步仲裁ID
+            self.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_63_32, 0);
             self.write(
-                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_63_32.into(),
-                0,
-            );
-            self.write(
-                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into(),
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0,
                 BCAST | INIT | LEVEL,
             );
-            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into()) & DELIVS != 0
-            {
+            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0) & DELIVS != 0 {
                 spin_loop();
             }
         }
@@ -274,34 +267,28 @@ impl LocalAPIC for XApic {
     fn send_eoi(&self) {
         unsafe {
             let s = self as *const Self as *mut Self;
-            (*s).write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_EOI.into(), 0);
+            (*s).write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_EOI, 0);
         }
     }
 
     /// 获取版本号
     fn version(&self) -> u8 {
-        unsafe {
-            (self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) & 0xff) as u8
-        }
+        unsafe { (self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version) & 0xff) as u8 }
     }
 
     fn support_eoi_broadcast_suppression(&self) -> bool {
-        unsafe {
-            ((self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) >> 24) & 1) == 1
-        }
+        unsafe { ((self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version) >> 24) & 1) == 1 }
     }
 
     fn max_lvt_entry(&self) -> u8 {
         unsafe {
-            ((self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version.into()) >> 16) & 0xff)
-                as u8
-                + 1
+            ((self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_Version) >> 16) & 0xff) as u8 + 1
         }
     }
 
     /// 获取ID
-    fn id(&self) -> u32 {
-        unsafe { self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ID.into()) >> 24 }
+    fn id(&self) -> ApicId {
+        unsafe { ApicId::new(self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ID) >> 24) }
     }
 
     /// 设置LVT寄存器的值
@@ -315,7 +302,7 @@ impl LocalAPIC for XApic {
         unsafe {
             LVT::new(
                 reg,
-                self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER.into()),
+                self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_LVT_TIMER),
             )
             .unwrap()
         }
@@ -334,23 +321,21 @@ impl LocalAPIC for XApic {
     fn write_icr(&self, icr: x86::apic::Icr) {
         unsafe {
             // Wait for any previous send to finish
-            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into()) & DELIVS != 0
-            {
+            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0) & DELIVS != 0 {
                 spin_loop();
             }
 
             self.write(
-                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_63_32.into(),
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_63_32,
                 icr.upper(),
             );
             self.write(
-                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into(),
+                XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0,
                 icr.lower(),
             );
 
             // Wait for send to finish
-            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0.into()) & DELIVS != 0
-            {
+            while self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0) & DELIVS != 0 {
                 spin_loop();
             }
         }

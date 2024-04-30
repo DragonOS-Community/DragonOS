@@ -3,6 +3,7 @@
 //! The ZoneAllocator achieves this by having many `SCAllocator`
 
 use crate::*;
+use core::sync::atomic::Ordering;
 
 /// Creates an instance of a zone, we do this in a macro because we
 /// re-use the code in const and non-const functions
@@ -24,6 +25,7 @@ macro_rules! new_zone {
                 SCAllocator::new(1 << 10), // 1024
                 SCAllocator::new(1 << 11), // 2048            ],
             ],
+            total: 0,
         }
     };
 }
@@ -38,6 +40,7 @@ macro_rules! new_zone {
 /// to provide the underlying `SCAllocator` with more memory in case it runs out.
 pub struct ZoneAllocator<'a> {
     small_slabs: [SCAllocator<'a, ObjectPage<'a>>; ZoneAllocator::MAX_BASE_SIZE_CLASSES],
+    total: u64,
 }
 
 impl<'a> Default for ZoneAllocator<'a> {
@@ -52,17 +55,13 @@ enum Slab {
 }
 
 impl<'a> ZoneAllocator<'a> {
-    /// Maximum size that allocated within LargeObjectPages (2 MiB).
-    /// This is also the maximum object size that this allocator can handle.
-    pub const MAX_ALLOC_SIZE: usize = 1 << 11;
-
     /// Maximum size which is allocated with ObjectPages (4 KiB pages).
     ///
     /// e.g. this is 4 KiB - 80 bytes of meta-data.
-    pub const MAX_BASE_ALLOC_SIZE: usize = 256;
+    pub const MAX_BASE_ALLOC_SIZE: usize = 1 << 11;
 
     /// How many allocators of type SCAllocator<ObjectPage> we have.
-    const MAX_BASE_SIZE_CLASSES: usize = 9;
+    pub const MAX_BASE_SIZE_CLASSES: usize = 9;
 
     #[cfg(feature = "unstable")]
     pub const fn new() -> ZoneAllocator<'a> {
@@ -119,12 +118,48 @@ impl<'a> ZoneAllocator<'a> {
     {
         for i in 0..ZoneAllocator::MAX_BASE_SIZE_CLASSES {
             let slab = &mut self.small_slabs[i];
+            // reclaim的page数
             let just_reclaimed = slab.try_reclaim_pages(to_reclaim, &mut dealloc);
+            self.total -= (just_reclaimed * OBJECT_PAGE_SIZE) as u64;
             to_reclaim = to_reclaim.saturating_sub(just_reclaimed);
             if to_reclaim == 0 {
                 break;
             }
         }
+    }
+
+    /// 获取scallocator中的还未被分配的空间
+    pub fn free_space(&mut self) -> u64 {
+        // 记录空闲空间
+        let mut free = 0;
+        // 遍历所有scallocator
+        for count in 0..ZoneAllocator::MAX_BASE_SIZE_CLASSES {
+            // 获取scallocator
+            let scallocator = &mut self.small_slabs[count];
+
+            // 遍历scallocator中的部分分配的page(partial_page)
+            for slab_page in scallocator.slabs.iter_mut() {
+                // 统计page中还可以分配多少个object
+                let mut free_obj_count = 0;
+                // 遍历page中的bitfield(用来统计内存分配情况的u64数组)
+                for b in slab_page.bitfield().iter() {
+                    let bitval = b.load(Ordering::Relaxed);
+                    let free_count = bitval.count_zeros() as usize;
+                    free_obj_count += free_count;
+                }
+                // 剩余可分配object数乘上page中规定的每个object的大小，即空闲空间
+                free += free_obj_count * scallocator.size();
+            }
+            // 遍历scallocator中的empty_page，把空页空间也加上去
+            free +=
+                scallocator.empty_slabs.elements * (scallocator.obj_per_page * scallocator.size());
+        }
+        free as u64
+    }
+
+    pub fn usage(&mut self) -> SlabUsage {
+        let free_num = self.free_space();
+        SlabUsage::new(self.total, free_num)
     }
 }
 
@@ -162,9 +197,38 @@ unsafe impl<'a> crate::Allocator<'a> for ZoneAllocator<'a> {
         match ZoneAllocator::get_slab(layout.size()) {
             Slab::Base(idx) => {
                 self.small_slabs[idx].refill(new_page);
+                // 每refill一个page就为slab的总空间统计加上4KB
+                self.total += OBJECT_PAGE_SIZE as u64;
                 Ok(())
             }
             Slab::Unsupported => Err(AllocationError::InvalidLayout),
         }
+    }
+}
+
+/// Slab内存空间使用情况
+pub struct SlabUsage {
+    // slab总共使用的内存空间
+    total: u64,
+    // slab的空闲空间
+    free: u64,
+}
+
+impl SlabUsage {
+    /// 初始化SlabUsage
+    pub fn new(total: u64, free: u64) -> Self {
+        Self { total, free }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    pub fn used(&self) -> u64 {
+        self.total - self.free
+    }
+
+    pub fn free(&self) -> u64 {
+        self.free
     }
 }

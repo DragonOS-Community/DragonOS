@@ -207,6 +207,10 @@ impl VirtIODevice for VirtioInterface {
         return Ok(IrqReturn::Handled);
     }
 
+    fn irq(&self) -> Option<IrqNumber> {
+        None
+    }
+
     fn dev_id(&self) -> &Arc<DeviceId> {
         return &self.dev_id;
     }

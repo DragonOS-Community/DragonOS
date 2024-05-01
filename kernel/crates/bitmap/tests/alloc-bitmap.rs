@@ -663,3 +663,23 @@ fn test_alloc_bitmap_bitand_128() {
     assert_eq!(bitmap3.first_false_index(), Some(2));
     assert_eq!(bitmap3.last_index(), Some(67));
 }
+
+#[test]
+fn test_alloc_bitmap_bitand_assign_128() {
+    let mut bitmap = AllocBitmap::new(128);
+    bitmap.set_all(true);
+
+    let mut bitmap2 = AllocBitmap::new(128);
+
+    bitmap2.set(0, true);
+    bitmap2.set(1, true);
+    bitmap2.set(67, true);
+
+    bitmap.bitand_assign(&bitmap2);
+
+    assert_eq!(bitmap.len(), 128);
+    assert_eq!(bitmap.size(), 16);
+    assert_eq!(bitmap.first_index(), Some(0));
+    assert_eq!(bitmap.first_false_index(), Some(2));
+    assert_eq!(bitmap.last_index(), Some(67));
+}

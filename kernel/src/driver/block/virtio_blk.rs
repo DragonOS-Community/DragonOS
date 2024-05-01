@@ -32,6 +32,7 @@ use crate::{
             VirtIODevice, VirtIODeviceIndex, VirtIODriver, VIRTIO_VENDOR_ID,
         },
     },
+    exception::{irqdesc::IrqReturn, IrqNumber},
     filesystem::{kernfs::KernFSInode, mbr::MbrDiskPartionTable},
     init::initcall::INITCALL_POSTCORE,
     libs::{
@@ -85,15 +86,15 @@ unsafe impl Sync for VirtIOBlkDevice {}
 
 impl VirtIOBlkDevice {
     pub fn new(transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {
+        let irq = transport.irq().map(|irq| IrqNumber::new(irq.data()));
         let device_inner = VirtIOBlk::<HalImpl, VirtIOTransport>::new(transport);
         if let Err(e) = device_inner {
             kerror!("VirtIOBlkDevice '{dev_id:?}' create failed: {:?}", e);
             return None;
         }
-        // !!!! 在这里临时测试virtio-blk的读写功能，后续需要删除 !!!!
-        // 目前read会报错 `NotReady`
-        let device_inner: VirtIOBlk<HalImpl, VirtIOTransport> = device_inner.unwrap();
 
+        let mut device_inner: VirtIOBlk<HalImpl, VirtIOTransport> = device_inner.unwrap();
+        device_inner.enable_interrupts();
         let dev = Arc::new_cyclic(|self_ref| Self {
             self_ref: self_ref.clone(),
             dev_id,
@@ -104,6 +105,7 @@ impl VirtIOBlkDevice {
                 virtio_index: None,
                 device_common: DeviceCommonData::default(),
                 kobject_common: KObjectCommonData::default(),
+                irq,
             }),
         });
 
@@ -190,6 +192,7 @@ struct InnerVirtIOBlkDevice {
     virtio_index: Option<VirtIODeviceIndex>,
     device_common: DeviceCommonData,
     kobject_common: KObjectCommonData,
+    irq: Option<IrqNumber>,
 }
 
 impl Debug for InnerVirtIOBlkDevice {
@@ -199,11 +202,16 @@ impl Debug for InnerVirtIOBlkDevice {
 }
 
 impl VirtIODevice for VirtIOBlkDevice {
+    fn irq(&self) -> Option<IrqNumber> {
+        self.inner().irq
+    }
+
     fn handle_irq(
         &self,
         _irq: crate::exception::IrqNumber,
-    ) -> Result<crate::exception::irqdesc::IrqReturn, system_error::SystemError> {
-        todo!("VirtIOBlkDevice::handle_irq")
+    ) -> Result<IrqReturn, system_error::SystemError> {
+        // todo: handle virtio blk irq
+        Ok(crate::exception::irqdesc::IrqReturn::Handled)
     }
 
     fn dev_id(&self) -> &Arc<DeviceId> {

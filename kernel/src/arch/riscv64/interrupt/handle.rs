@@ -5,9 +5,7 @@ use core::hint::spin_loop;
 
 use system_error::SystemError;
 
-use crate::{
-    arch::syscall::syscall_handler, driver::irqchip::riscv_intc::riscv_intc_irq, kdebug, kerror,
-};
+use crate::{arch::syscall::syscall_handler, driver::irqchip::riscv_intc::riscv_intc_irq, kerror};
 
 use super::TrapFrame;
 

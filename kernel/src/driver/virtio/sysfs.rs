@@ -8,16 +8,20 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    driver::base::{
-        device::{
-            bus::{bus_manager, Bus},
-            device_manager,
-            driver::{driver_manager, Driver},
-            Device,
+    driver::{
+        base::{
+            device::{
+                bus::{bus_manager, Bus},
+                device_manager,
+                driver::{driver_manager, Driver},
+                Device,
+            },
+            kobject::KObject,
+            subsys::SubSysPrivate,
         },
-        kobject::KObject,
-        subsys::SubSysPrivate,
+        virtio::irq::{virtio_irq_manager, DefaultVirtioIrqHandler},
     },
+    exception::{irqdesc::IrqHandleFlags, manage::irq_manager},
     filesystem::{
         sysfs::{
             file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
@@ -175,7 +179,47 @@ impl VirtIODeviceManager {
         virtio_drv.probe(&dev)?;
 
         device_manager().add_device(dev.clone() as Arc<dyn Device>)?;
-        device_manager().add_groups(&(dev as Arc<dyn Device>), &[&VirtIODeviceAttrGroup])
+        let r = device_manager()
+            .add_groups(&(dev.clone() as Arc<dyn Device>), &[&VirtIODeviceAttrGroup]);
+
+        self.setup_irq(&dev).ok();
+
+        return r;
+    }
+
+    /// # setup_irq - 设置中断
+    ///
+    /// 为virtio设备设置中断。
+    fn setup_irq(&self, dev: &Arc<dyn VirtIODevice>) -> Result<(), SystemError> {
+        let irq = dev.irq().ok_or(SystemError::EINVAL)?;
+        if let Err(e) = irq_manager().request_irq(
+            irq,
+            dev.device_name(),
+            &DefaultVirtioIrqHandler,
+            IrqHandleFlags::IRQF_SHARED,
+            Some(dev.dev_id().clone()),
+        ) {
+            kerror!(
+                "Failed to request irq for virtio device '{}': irq: {:?}, error {:?}",
+                dev.device_name(),
+                irq,
+                e
+            );
+            return Err(e);
+        }
+
+        virtio_irq_manager()
+            .register_device(dev.clone())
+            .map_err(|e| {
+                kerror!(
+                    "Failed to register virtio device's irq, dev: '{}', irq: {:?}, error {:?}",
+                    dev.device_name(),
+                    irq,
+                    e
+                );
+                e
+            })?;
+        return Ok(());
     }
 
     #[allow(dead_code)]

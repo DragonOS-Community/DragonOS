@@ -16,6 +16,21 @@ impl CpuMask {
         Self { bmp }
     }
 
+    /// # from_cpu - 从指定的CPU创建CPU掩码
+    ///
+    /// 该函数用于根据给定的CPU标识创建一个CPU掩码，只有指定的CPU被设置为激活状态。
+    ///
+    /// ## 参数
+    /// - `cpu`: `ProcessorId`，指定要设置为激活状态的CPU。
+    ///
+    /// ## 返回值
+    /// - `Self`: 返回一个新的`CpuMask`实例，其中只有指定的CPU被设置为激活状态。
+    pub fn from_cpu(cpu: ProcessorId) -> Self {
+        let mut mask = Self::new();
+        mask.set(cpu, true);
+        mask
+    }
+
     /// 获取CpuMask中的第一个cpu
     pub fn first(&self) -> Option<ProcessorId> {
         self.bmp
@@ -86,14 +101,24 @@ impl CpuMask {
     pub fn inner(&self) -> &AllocBitmap {
         &self.bmp
     }
+
+    pub fn bitand_assign(&mut self, rhs: &CpuMask) {
+        self.bmp.bitand_assign(&rhs.bmp);
+    }
 }
 
-impl BitAnd for CpuMask {
-    type Output = Self;
+impl BitAnd for &CpuMask {
+    type Output = CpuMask;
 
-    fn bitand(self, rhs: Self) -> Self::Output {
-        let bmp = self.bmp & rhs.bmp;
-        Self { bmp }
+    fn bitand(self, rhs: &CpuMask) -> Self::Output {
+        let bmp = &self.bmp & &rhs.bmp;
+        CpuMask { bmp }
+    }
+}
+
+impl Default for CpuMask {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

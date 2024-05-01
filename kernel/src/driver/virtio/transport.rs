@@ -1,10 +1,21 @@
 use virtio_drivers::transport::Transport;
 
+use crate::exception::HardwareIrqNumber;
+
 use super::{transport_mmio::VirtIOMmioTransport, transport_pci::PciTransport};
 
 pub enum VirtIOTransport {
     Pci(PciTransport),
     Mmio(VirtIOMmioTransport),
+}
+
+impl VirtIOTransport {
+    pub fn irq(&self) -> Option<HardwareIrqNumber> {
+        match self {
+            VirtIOTransport::Mmio(transport) => Some(transport.irq()),
+            _ => None,
+        }
+    }
 }
 
 impl core::fmt::Debug for VirtIOTransport {

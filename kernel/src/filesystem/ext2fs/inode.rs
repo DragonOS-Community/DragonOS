@@ -4,16 +4,11 @@ use core::{
     mem::{self, transmute, ManuallyDrop},
 };
 
-use alloc::{
-    fmt,
-    string::{String, ToString},
-    sync::{Arc, Weak},
-    vec::Vec,
+use super::{
+    entry::Ext2DirEntry,
+    file_type::{Ext2FileMode, Ext2FileType},
+    fs::EXT2_SB_INFO,
 };
-use system_error::SystemError;
-use uefi::data_types;
-
-use super::{entry::Ext2DirEntry, file_type::Ext2FileType, fs::EXT2_SB_INFO};
 use crate::{
     driver::base::block::{
         block_device::{__bytes_to_lba, LBA_SIZE},
@@ -28,7 +23,17 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         vec_cursor::VecCursor,
     },
+    time::PosixTimeSpec,
 };
+use alloc::{
+    fmt,
+    string::{String, ToString},
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use elf::endian::LittleEndian;
+use system_error::SystemError;
+use uefi::data_types;
 
 const EXT2_NDIR_BLOCKS: usize = 12;
 const EXT2_DIND_BLOCK: usize = 13;
@@ -117,9 +122,15 @@ pub struct Ext2Inode {
     pub _os_dependent_2: [u8; 12],
 }
 impl Ext2Inode {
-    pub fn new() -> Self {
+    pub fn new(mode: u16) -> Self {
+        let now = PosixTimeSpec::now().tv_sec as u32;
         Self {
             hard_link_num: 1,
+            access_time: now,
+            create_time: now,
+            modify_time: now,
+            mode,
+
             ..Default::default()
         }
     }
@@ -166,9 +177,30 @@ impl Ext2Inode {
         };
         Ok(inode)
     }
-    pub fn flush(&self) {
-        // TODO 刷新磁盘中的inode
-        todo!()
+    pub fn to_bytes(&self) -> Vec<u8> {
+        // TODO 优化
+        let mut data = Vec::with_capacity(mem::size_of::<Ext2Inode>());
+        data.extend_from_slice(&self.mode.to_le_bytes());
+        data.extend_from_slice(&self.uid.to_le_bytes());
+        data.extend_from_slice(&self.lower_size.to_le_bytes());
+        data.extend_from_slice(&self.access_time.to_le_bytes());
+        data.extend_from_slice(&self.create_time.to_le_bytes());
+        data.extend_from_slice(&self.modify_time.to_le_bytes());
+        data.extend_from_slice(&self.delete_time.to_le_bytes());
+        data.extend_from_slice(&self.gid.to_le_bytes());
+        data.extend_from_slice(&self.hard_link_num.to_le_bytes());
+        data.extend_from_slice(&self.disk_sector.to_le_bytes());
+        data.extend_from_slice(&self.flags.to_le_bytes());
+        data.extend_from_slice(&self._os_dependent_1);
+        for i in self.blocks.iter() {
+            data.extend_from_slice(&i.to_le_bytes());
+        }
+        data.extend_from_slice(&self.generation_num.to_le_bytes());
+        data.extend_from_slice(&self.file_acl.to_le_bytes());
+        data.extend_from_slice(&self.directory_acl.to_le_bytes());
+        data.extend_from_slice(&self.fragment_addr.to_le_bytes());
+        data.extend_from_slice(&self._os_dependent_2);
+        data
     }
 }
 
@@ -271,12 +303,14 @@ pub struct Ext2InodeInfo {
     mode: ModeType,
     file_type: FileType,
     i_mode: u16,
-    inode: Ext2Inode, // file_size: u32,
-                      // disk_sector: u32,
+    inode: Ext2Inode,
+    // file_size: u32,
+    // disk_sector: u32,
+    inode_num: u32,
 }
 
 impl Ext2InodeInfo {
-    pub fn new(inode: &Ext2Inode) -> Self {
+    pub fn new(inode: &Ext2Inode, inode_num: u32) -> Self {
         // kinfo!("begin Ext2InodeInfo new");
         let mode = inode.mode;
         let file_type = Ext2FileType::type_from_mode(&mode).unwrap().covert_type();
@@ -284,7 +318,7 @@ impl Ext2InodeInfo {
 
         // TODO 根据inode mode转换modetype
         let fs_mode = ModeType::from_bits_truncate(mode as u32);
-        let meta = Metadata::new(file_type, fs_mode);
+        let mut meta = Metadata::new(file_type, fs_mode);
         // TODO 获取block group
 
         // TODO 间接地址
@@ -297,6 +331,7 @@ impl Ext2InodeInfo {
             meta,
             mode: fs_mode,
             file_type,
+            inode_num,
             // entry: todo!(),
         }
     }
@@ -305,7 +340,7 @@ impl Ext2InodeInfo {
 
 impl IndexNode for LockedExt2InodeInfo {
     fn find(&self, _name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        // kinfo!("begin LockedExt2InodeInfo find");
+        kinfo!("begin LockedExt2InodeInfo find");
         let guard = self.0.lock();
         let inode = &guard.inode;
         if Ext2FileType::type_from_mode(&inode.mode).unwrap() != Ext2FileType::Directory {
@@ -342,17 +377,17 @@ impl IndexNode for LockedExt2InodeInfo {
                 let sb = ext2.sb_info.0.lock();
                 let i = sb.read_inode(inode_num).unwrap();
                 return Ok(Arc::new(LockedExt2InodeInfo(SpinLock::new(
-                    Ext2InodeInfo::new(&i),
+                    Ext2InodeInfo::new(&i, inode_num),
                 ))));
             }
             begin_pos += rc_len as usize - mem::size_of::<u32>();
         }
-        // kinfo!("end LockedExt2InodeInfo find");
+        kinfo!("end LockedExt2InodeInfo find");
 
         return Err(SystemError::EINVAL);
     }
     fn close(&self, _data: SpinLockGuard<'_, FilePrivateData>) -> Result<(), SystemError> {
-        // kdebug!("close inode");
+        kdebug!("close inode");
         Ok(())
     }
     fn open(
@@ -360,7 +395,7 @@ impl IndexNode for LockedExt2InodeInfo {
         _data: SpinLockGuard<'_, FilePrivateData>,
         _mode: &crate::filesystem::vfs::file::FileMode,
     ) -> Result<(), SystemError> {
-        // kdebug!("open inode");
+        kdebug!("open inode");
         Ok(())
     }
     fn read_at(
@@ -415,10 +450,7 @@ impl IndexNode for LockedExt2InodeInfo {
                 // kdebug!("read direct, start_block = {start_block}");
                 while start_block <= 11 {
                     if inode_grade.i_data[start_block] == 0 {
-                        // if inode_grade.inode.lower_size == 28 {
-                        // kinfo!("{:?}", String::from_utf8(read_buf[..file_size].to_vec()).unwrap());
-                        // }
-                        // kinfo!("end LockedExt2InodeInforead_at");
+                        // TODO 修改拷贝的起点为 offset % block_size
                         buf.copy_from_slice(&read_buf[..buf.len()]);
                         return Ok(min(file_size, len));
                     }
@@ -748,7 +780,140 @@ impl IndexNode for LockedExt2InodeInfo {
         file_type: FileType,
         mode: ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        todo!()
+        let guard = self.0.lock();
+
+        // TODO 写descriptor
+
+        // 获取descriptor
+
+        // TODO 写entry
+        let inode_num = guard.inode_num;
+        let inode = &guard.inode;
+        let e_file_t = Ext2FileType::from_file_type(&file_type)?;
+
+        let new_inode_num = 0;
+        let new_entry = Ext2DirEntry::new(new_inode_num, e_file_t.into(), name)?;
+        // 读entry
+
+        // TODO 调用write at追加entry
+
+
+        let binding = ext2fs_instance();
+        let sb: SpinLockGuard<super::fs::Ext2SuperBlockInfo> = binding.sb_info.0.lock();
+        let group_id = (guard.inode_num - 1) / sb.s_inodes_per_group;
+        // let inode_index = guard.inode_num % sb.s_inodes_per_group;
+        let block_size = sb.s_block_size as usize;
+
+        let mut descriptor = &sb.group_desc_table.as_ref().unwrap()[group_id as usize];
+
+        let i_bitmap = (descriptor.inode_bitmap_address as usize * block_size) / LBA_SIZE;
+        // 读inode bitmap
+        let bitmap_count =
+            (((sb.s_inodes_per_group as usize / 8) / block_size) + 1) * (block_size / LBA_SIZE);
+        let mut bitmap_buf: Vec<u8> = Vec::with_capacity(bitmap_count * LBA_SIZE);
+        bitmap_buf.resize(bitmap_count * LBA_SIZE, 0);
+        let _ = ext2fs_instance().partition.disk().read_at(
+            i_bitmap,
+            bitmap_count,
+            bitmap_buf.as_mut_slice(),
+        );
+
+        // 获取新的inode index
+        let mut bpos = 0usize;
+        let mut new_bm = 0u8;
+        let mut new_inode_index = group_id as usize * sb.s_inodes_per_group as usize;
+        let mut index_offset = 0usize;
+        for (p, i) in bitmap_buf.iter().enumerate() {
+            if i == &0xFFu8 {
+                if i & 0xF0 == 0xF0 {
+                    // 1111 0000
+                    let mut mask = 0b1000_0000u8;
+                    for j in 0..4 {
+                        if i & mask == 0 {
+                            new_inode_index = p * 8 + j;
+                            index_offset = p * 8 + j;
+                            bpos = p;
+                            new_bm = i | mask;
+                            break;
+                        }
+                        mask >>= 1;
+                    }
+                } else if i & 0x0F == 0x0F {
+                    // 0000 1111
+                    let mut mask = 0b0000_1000u8;
+                    for j in 4..8 {
+                        if i & mask == 0 {
+                            new_inode_index = p * 8 + j;
+                            index_offset = p * 8 + j;
+                            bpos = p;
+                            new_bm = i | mask;
+                            break;
+                        }
+                        mask >>= 1;
+                    }
+                } else {
+                    let mut mask = 0b1000_0000u8;
+                    for j in 0..8 {
+                        if i & mask == 0 {
+                            new_inode_index = p * 8 + j;
+                            index_offset = p * 8 + j;
+                            bpos = p;
+                            new_bm = i | mask;
+                            break;
+                        }
+                        mask >>= 1;
+                    }
+                }
+            }
+        }
+
+        let mb = Ext2FileMode::from_common_type(mode)?;
+        //  创建inode
+        let new_inode = Ext2Inode::new(mb.bits());
+        // 新inode所在块号，跟据inode table的起始位置+inode block offset
+        let block_id = (descriptor.inode_table_start as usize
+            + (index_offset * sb.s_inode_size as usize) / block_size)
+            * (block_size / LBA_SIZE);
+        // inode table所占块数
+        // let table_block_num = {
+        //     let size = sb.s_inodes_per_group * sb.s_inode_size;
+        //     if size % sb.s_block_size == 0 {
+        //         (size / sb.s_block_size) as usize * (sb.s_block_size as usize / LBA_SIZE)
+        //     } else {
+        //         (size / sb.s_block_size + 1) as usize * (sb.s_block_size as usize / LBA_SIZE)
+        //     }
+        // };
+        // 读inode table
+        let mut table_buf: Vec<u8> = Vec::with_capacity(block_size / LBA_SIZE);
+        table_buf.resize(block_size / LBA_SIZE, 0);
+        let _ = ext2fs_instance().partition.disk().read_at(
+            block_id,
+            block_size / LBA_SIZE,
+            table_buf.as_mut_slice(),
+        );
+
+        let in_block_offset = (index_offset * sb.s_inode_size as usize) % block_size;
+        table_buf[in_block_offset..in_block_offset + mem::size_of::<Ext2Inode>()]
+            .copy_from_slice(&new_inode.to_bytes());
+        // 写inode table
+        let _ = ext2fs_instance().partition.disk().write_at(
+            block_id,
+            block_size / LBA_SIZE,
+            table_buf.as_slice(),
+        );
+        //  写inode bitmap
+        bitmap_buf[bpos] = new_bm;
+        let _ = ext2fs_instance().partition.disk().write_at(
+            i_bitmap,
+            bitmap_count,
+            bitmap_buf.as_slice(),
+        );
+        // TODO 修改
+        // descriptor.free_inodes_num-=1;
+        descriptor.flush(&ext2fs_instance().partition, group_id as usize, block_size)?;
+        Ok(Arc::new(LockedExt2InodeInfo(SpinLock::new(
+            Ext2InodeInfo::new(&new_inode, new_inode_index.try_into().unwrap()),
+        ))))
     }
 }
 

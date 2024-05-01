@@ -7,7 +7,7 @@ const EXT2_NAME_LEN: usize = 255;
 #[repr(C, align(1))]
 pub struct Ext2DirEntry {
     /// Inode number of the file
-    inode: u32,
+    inode_num: u32,
     /// Length of the directory entry record
     record_length: u16,
     /// Length of the name
@@ -19,9 +19,9 @@ pub struct Ext2DirEntry {
 }
 
 impl Ext2DirEntry {
-    pub fn new(inode: u32, file_type: u8, file_name: &str) -> Result<Self, SystemError> {
+    pub fn new(inode_num: u32, file_type: u8, file_name: &str) -> Result<Self, SystemError> {
         if file_name.len() > EXT2_NAME_LEN
-            || inode == 0
+            || inode_num == 0
             || Ext2DirEntryType::is_valid(file_type) == false
         {
             return Err(SystemError::EINVAL);
@@ -33,7 +33,7 @@ impl Ext2DirEntry {
         let mut name = [0u8; EXT2_NAME_LEN];
         name[..file_name.len()].copy_from_slice(file_name.as_bytes());
         Ok(Self {
-            inode,
+            inode_num,
             record_length,
             name_length: file_name.len() as u8,
             file_type,
@@ -44,13 +44,13 @@ impl Ext2DirEntry {
         String::from_utf8(self.name.to_vec()).expect("Invalid UTF-8 in entry name")
     }
     pub fn get_inode(&self) -> usize {
-        self.inode as usize
+        self.inode_num as usize
     }
     pub fn get_file_type(&self) -> Ext2DirEntryType {
         Ext2DirEntryType::from(self.file_type)
     }
     pub fn if_used(&self) -> bool {
-        self.inode == 0
+        self.inode_num == 0
     }
     pub fn get_rec_len(&self) -> usize {
         self.record_length as usize
@@ -59,7 +59,7 @@ impl Ext2DirEntry {
 impl Debug for Ext2DirEntry {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Ext2DirEntry")
-            .field("inode", &self.inode)
+            .field("inode_num", &self.inode_num)
             .field("record_length", &self.record_length)
             .field("name_length", &self.name_length)
             .field("file_type", &Ext2DirEntryType::from(self.file_type))

@@ -21,7 +21,7 @@ pub struct Ext2BlockGroupDescriptor {
     /// 目录数
     pub dir_num: u16,
     /// 填充
-    _padding: [u8;14],
+    _padding: [u8; 14],
 }
 
 impl Ext2BlockGroupDescriptor {
@@ -40,6 +40,35 @@ impl Ext2BlockGroupDescriptor {
         LBA_SIZE / mem::size_of::<Ext2BlockGroupDescriptor>()
     }
     // TODO 读取inode
+    pub fn flush(
+        &self,
+        partition: &Arc<Partition>,
+        group_id: usize,
+        block_size: usize,
+    ) -> Result<(), SystemError> {
+        let offset = group_id * mem::size_of::<Ext2BlockGroupDescriptor>();
+        let count = block_size / LBA_SIZE;
+        let start_block = ((2048 + offset) / block_size) * count;
+        let mut des_data: Vec<u8> = Vec::with_capacity(LBA_SIZE * count);
+        des_data.resize(LBA_SIZE * count, 0);
+        let _ = partition.disk().read_at(start_block, count, &mut des_data);
+        let offset_in_block = offset % block_size;
+        des_data[offset_in_block..offset_in_block + mem::size_of::<Ext2BlockGroupDescriptor>()]
+            .copy_from_slice(self.to_bytes().as_slice());
+        let _ = partition.disk().write_at(start_block, count, &mut des_data);
+
+        Ok(())
+    }
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(mem::size_of::<Ext2BlockGroupDescriptor>());
+        bytes.extend_from_slice(&self.block_bitmap_address.to_le_bytes());
+        bytes.extend_from_slice(&self.inode_bitmap_address.to_le_bytes());
+        bytes.extend_from_slice(&self.inode_table_start.to_le_bytes());
+        bytes.extend_from_slice(&self.free_blocks_num.to_le_bytes());
+        bytes.extend_from_slice(&self.free_inodes_num.to_le_bytes());
+        bytes.extend_from_slice(&self.dir_num.to_le_bytes());
+        bytes
+    }
 }
 
 impl Debug for Ext2BlockGroupDescriptor {
@@ -68,4 +97,11 @@ impl Debug for Ext2BlockGroupDescriptor {
             .field("dir_num", &format_args!("{:?}\n", &self.dir_num))
             .finish()
     }
+}
+
+pub fn get_group_id(inode_num: usize, i_per_group: usize) -> usize {
+    inode_num / i_per_group
+}
+pub fn get_index_in_group(inode_num: usize, i_per_group: usize) -> usize {
+    inode_num % i_per_group
 }

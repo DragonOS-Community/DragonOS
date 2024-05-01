@@ -60,11 +60,11 @@ impl FileSystem for Ext2FileSystem {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
-    
+
     fn name(&self) -> &str {
         todo!()
     }
-    
+
     fn super_block(&self) -> crate::filesystem::vfs::SuperBlock {
         todo!()
     }
@@ -95,7 +95,7 @@ impl Ext2FileSystem {
 
         let root_inode = root_inode.unwrap();
         // kdebug!("new the Ext2InodeInfo");
-        let r_info = Ext2InodeInfo::new(&root_inode);
+        let r_info = Ext2InodeInfo::new(&root_inode,2);
         // kdebug!("end mount Ext2FS");
         return Ok(Arc::new(Self {
             partition,
@@ -106,6 +106,9 @@ impl Ext2FileSystem {
     }
     pub fn super_block(&self) -> Arc<LockedExt2SBInfo> {
         self.sb_info.clone()
+    }
+    pub fn get_block_size(&self) -> usize {
+        self.sb_info.0.lock().s_block_size as usize
     }
 }
 pub enum OSType {
@@ -177,7 +180,7 @@ pub struct Ext2SuperBlock {
     pub first_ino: u32,
     /// inode大小
     pub inode_size: u16,
-    /// block group # of this superblock 
+    /// block group # of this superblock
     pub super_block_group: u16,
     /// 兼容功能集
     pub feature_compat: u32,
@@ -265,7 +268,11 @@ impl Default for Ext2SuperBlock {
         superblock
     }
 }
-
+impl Ext2SuperBlock {
+    pub fn get_block_size(&self) -> usize {
+        1024usize << self.block_size
+    }
+}
 #[derive(Debug, Default)]
 ///second extended-fs super-block data in memory
 pub struct Ext2SuperBlockInfo {
@@ -715,7 +722,6 @@ impl Debug for Ext2SuperBlock {
                 &format_args!("{}\n", &self.journal_device),
             )
             .field("last_orphan", &format_args!("{}\n", &self.last_orphan))
-
             .finish()
     }
 }

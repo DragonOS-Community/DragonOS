@@ -30,6 +30,7 @@ impl Ext2FileType {
             0x6000 => Ok(Ext2FileType::BlockDevice),
             0x8000 => Ok(Ext2FileType::RegularFile),
             0xA000 => Ok(Ext2FileType::SymbolicLink),
+            0xC000 => Ok(Ext2FileType::UnixSocket),
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -44,27 +45,46 @@ impl Ext2FileType {
             Ext2FileType::UnixSocket => FileType::Socket,
         }
     }
+    pub fn from_file_type(file_type: &FileType) -> Result<Self, SystemError> {
+        match file_type {
+            FileType::Pipe => Ok(Ext2FileType::FIFO),
+            FileType::CharDevice | FileType::FramebufferDevice | FileType::KvmDevice => {
+                Ok(Ext2FileType::CharacterDevice)
+            }
+            FileType::Dir => Ok(Ext2FileType::Directory),
+            FileType::BlockDevice => Ok(Ext2FileType::BlockDevice),
+            FileType::File => Ok(Ext2FileType::RegularFile),
+            FileType::SymLink => Ok(Ext2FileType::SymbolicLink),
+            FileType::Socket => Ok(Ext2FileType::UnixSocket),
+            _ => Err(SystemError::EINVAL),
+        }
+    }
+}
+impl Into<u8> for Ext2FileType {
+    fn into(self) -> u8 {
+        self as u8
+    }
 }
 
 bitflags! {
    pub struct Ext2FileMode:u16 {
             /// 文件系统中的 FIFO（管道）
-  const  FIFO = 0x1000;
-    /// 字符设备
-  const  CHARACTER_DEVICE = 0x2000;
-    /// 目录
- const  DIRECTORY = 0x4000;
-    /// 块设备
-const    BLOCK_DEVICE = 0x6000;
-    /// 普通文件
- const   REGULAR_FILE = 0x8000;
-    /// 符号链接
-  const  SYMBOLIC_LINK = 0xA000;
-    /// Unix 套接字
- const   UNIX_SOCKET = 0xC000;
+    const  FIFO = 0x1000;
+        /// 字符设备
+    const  CHARACTER_DEVICE = 0x2000;
+        /// 目录
+    const  DIRECTORY = 0x4000;
+        /// 块设备
+    const    BLOCK_DEVICE = 0x6000;
+        /// 普通文件
+    const   REGULAR_FILE = 0x8000;
+        /// 符号链接
+    const  SYMBOLIC_LINK = 0xA000;
+        /// Unix 套接字
+    const   UNIX_SOCKET = 0xC000;
 
         /// 文件所有者具有写权限
-  const OX = 0x001;
+    const OX = 0x001;
     /// 文件所有者具有写权限
     const    OW = 0x002;
     /// 文件所有者具有写权限
@@ -105,5 +125,11 @@ impl Ext2FileMode {
     pub fn convert_mode(mode: &u16) -> Result<ModeType, SystemError> {
         let mut mode_type = ModeType::empty();
         todo!()
+    }
+    pub fn from_common_type(mode: ModeType) -> Result<Self, SystemError> {
+        match Ext2FileMode::from_bits(mode.bits() as u16) {
+            Some(v) => Ok(v),
+            None => Err(SystemError::EINVAL),
+        }
     }
 }

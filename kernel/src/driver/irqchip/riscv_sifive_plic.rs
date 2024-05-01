@@ -557,9 +557,6 @@ fn associate_irq_with_plic_domain(
 
     for node in nodes {
         if let Some(irq) = node.interrupts().and_then(|mut x| x.next()) {
-            if irq == 5 {
-                continue;
-            }
             let irq = irq as u32;
             let virq = IrqNumber::new(irq);
             let hwirq = HardwareIrqNumber::new(irq);

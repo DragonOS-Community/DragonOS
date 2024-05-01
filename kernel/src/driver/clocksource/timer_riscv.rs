@@ -6,14 +6,17 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, time::riscv_time_base_freq, CurrentIrqArch, CurrentTimeArch},
-    driver::base::device::DeviceId,
+    driver::{
+        base::device::DeviceId,
+        irqchip::riscv_intc::{riscv_intc_assicate_irq, riscv_intc_hwirq_to_virq},
+    },
     exception::{
         irqdata::{IrqHandlerData, IrqLineStatus},
         irqdesc::{
             irq_desc_manager, IrqDesc, IrqFlowHandler, IrqHandleFlags, IrqHandler, IrqReturn,
         },
         manage::irq_manager,
-        InterruptArch, IrqNumber,
+        HardwareIrqNumber, InterruptArch, IrqNumber,
     },
     libs::spinlock::SpinLock,
     mm::percpu::PerCpu,
@@ -42,7 +45,7 @@ static mut HART0_NSEC_PASSED: usize = 0;
 static mut HART0_LAST_UPDATED: u64 = 0;
 
 impl RiscVSbiTimer {
-    pub const TIMER_IRQ: IrqNumber = IrqNumber::from(5);
+    pub const TIMER_IRQ: HardwareIrqNumber = HardwareIrqNumber::new(5);
 
     fn handle_irq(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
         // 更新下一次中断时间
@@ -117,7 +120,7 @@ pub fn riscv_sbi_timer_init_local() {
 
     irq_manager()
         .request_irq(
-            RiscVSbiTimer::TIMER_IRQ,
+            riscv_intc_hwirq_to_virq(RiscVSbiTimer::TIMER_IRQ).unwrap(),
             "riscv_clocksource".to_string(),
             &RiscvSbiTimerHandler,
             IrqHandleFlags::IRQF_SHARED | IrqHandleFlags::IRQF_PERCPU,
@@ -136,7 +139,8 @@ pub fn riscv_sbi_timer_init_local() {
 
 #[inline(never)]
 pub fn riscv_sbi_timer_irq_desc_init() {
-    let desc = irq_desc_manager().lookup(RiscVSbiTimer::TIMER_IRQ).unwrap();
+    let virq = riscv_intc_assicate_irq(RiscVSbiTimer::TIMER_IRQ).unwrap();
+    let desc = irq_desc_manager().lookup(virq).unwrap();
 
     desc.modify_status(IrqLineStatus::IRQ_LEVEL, IrqLineStatus::empty());
     desc.set_handler(&RiscvSbiTimerIrqFlowHandler);

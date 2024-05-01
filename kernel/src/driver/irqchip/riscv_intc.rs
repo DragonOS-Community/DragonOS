@@ -32,6 +32,9 @@ fn riscv_intc_chip() -> Option<&'static Arc<RiscvIntcChip>> {
     unsafe { RISCV_INTC_CHIP.as_ref() }
 }
 
+/// RISC-V INTC虚拟中断号的起始值（192映射物理的0）
+pub const RISCV_INTC_VIRQ_START: u32 = 192;
+
 #[derive(Debug)]
 struct RiscvIntcChip {
     inner: SpinLock<InnerIrqChip>,
@@ -161,15 +164,48 @@ pub unsafe fn riscv_intc_init() -> Result<(), SystemError> {
     unsafe {
         RISCV_INTC_DOMAIN = Some(intc_domain.clone());
     }
-    // 关联剩余的中断
-    for i in 0..RiscvIntcChip::IRQ_SIZE {
-        irq_domain_manager()
-            .domain_associate(&intc_domain, IrqNumber::new(i), HardwareIrqNumber::new(i))
-            .ok();
-    }
+
     riscv_sbi_timer_irq_desc_init();
 
     return Ok(());
+}
+
+/// 把硬件中断号转换为riscv intc芯片的中断域的虚拟中断号
+pub const fn riscv_intc_hwirq_to_virq(hwirq: HardwareIrqNumber) -> Option<IrqNumber> {
+    if hwirq.data() < RiscvIntcChip::IRQ_SIZE {
+        Some(IrqNumber::new(hwirq.data() + RISCV_INTC_VIRQ_START))
+    } else {
+        None
+    }
+}
+
+/// 把riscv intc芯片的的中断域的虚拟中断号转换为硬件中断号
+#[allow(dead_code)]
+pub const fn riscv_intc_virq_to_hwirq(virq: IrqNumber) -> Option<HardwareIrqNumber> {
+    if virq.data() >= RISCV_INTC_VIRQ_START
+        && virq.data() < RISCV_INTC_VIRQ_START + RiscvIntcChip::IRQ_SIZE
+    {
+        Some(HardwareIrqNumber::new(virq.data() - RISCV_INTC_VIRQ_START))
+    } else {
+        None
+    }
+}
+
+/// 将硬件中断号与riscv intc芯片的虚拟中断号关联
+pub fn riscv_intc_assicate_irq(hwirq: HardwareIrqNumber) -> Option<IrqNumber> {
+    let virq = riscv_intc_hwirq_to_virq(hwirq)?;
+    irq_domain_manager()
+        .domain_associate(
+            riscv_intc_domain().as_ref().or_else(|| {
+                kerror!("riscv_intc_domain is None");
+                None
+            })?,
+            virq,
+            hwirq,
+        )
+        .ok();
+
+    Some(virq)
 }
 
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/irqchip/irq-riscv-intc.c#23

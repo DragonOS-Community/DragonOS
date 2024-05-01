@@ -110,8 +110,6 @@ impl IrqDomainManager {
 
         self.add_domain(domain.clone());
 
-        self.domain_associate_many(&domain, first_irq, first_hwirq, irq_size);
-
         return Some(domain);
     }
 
@@ -248,6 +246,10 @@ impl IrqDomainManager {
     /// 这是调用 domain_ops->activate 以编程中断控制器的第二步，以便中断实际上可以被传递。
     pub fn activate_irq(&self, irq_data: &Arc<IrqData>, reserve: bool) -> Result<(), SystemError> {
         let mut r = Ok(());
+        // kdebug!(
+        //     "activate_irq: irq_data.common_data().status().is_activated()={}",
+        //     irq_data.common_data().status().is_activated()
+        // );
         if !irq_data.common_data().status().is_activated() {
             r = self.do_activate_irq(Some(irq_data.clone()), reserve);
         }
@@ -268,7 +270,9 @@ impl IrqDomainManager {
         let mut r = Ok(());
 
         if let Some(irq_data) = irq_data {
+            // kdebug!("do_activate_irq: irq_data={:?}", irq_data);
             if let Some(domain) = irq_data.domain() {
+                // kdebug!("do_activate_irq: domain={:?}", domain.name());
                 let parent_data = irq_data.parent_data().and_then(|x| x.upgrade());
                 if let Some(parent_data) = parent_data.clone() {
                     r = self.do_activate_irq(Some(parent_data), reserve);

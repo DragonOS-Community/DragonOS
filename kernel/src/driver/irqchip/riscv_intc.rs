@@ -17,6 +17,8 @@ use crate::{
     sched::{SchedMode, __schedule},
 };
 
+use super::riscv_sifive_plic::do_plic_irq;
+
 static mut RISCV_INTC_DOMAIN: Option<Arc<IrqDomain>> = None;
 static mut RISCV_INTC_CHIP: Option<Arc<RiscvIntcChip>> = None;
 
@@ -87,6 +89,7 @@ impl IrqChip for RiscvIntcChip {
 }
 
 impl RiscvIntcChip {
+    const IRQ_SIZE: u32 = 64;
     fn new() -> Self {
         Self {
             inner: SpinLock::new(InnerIrqChip {
@@ -143,7 +146,11 @@ pub unsafe fn riscv_intc_init() -> Result<(), SystemError> {
     }
 
     let intc_domain = irq_domain_manager()
-        .create_and_add_linear("riscv-intc".to_string(), &RiscvIntcDomainOps, 64)
+        .create_and_add_linear(
+            "riscv-intc".to_string(),
+            &RiscvIntcDomainOps,
+            RiscvIntcChip::IRQ_SIZE,
+        )
         .ok_or_else(|| {
             kerror!("Failed to create riscv-intc domain");
             SystemError::ENXIO
@@ -152,9 +159,14 @@ pub unsafe fn riscv_intc_init() -> Result<(), SystemError> {
     irq_domain_manager().set_default_domain(intc_domain.clone());
 
     unsafe {
-        RISCV_INTC_DOMAIN = Some(intc_domain);
+        RISCV_INTC_DOMAIN = Some(intc_domain.clone());
     }
-
+    // 关联剩余的中断
+    for i in 0..RiscvIntcChip::IRQ_SIZE {
+        irq_domain_manager()
+            .domain_associate(&intc_domain, IrqNumber::new(i), HardwareIrqNumber::new(i))
+            .ok();
+    }
     riscv_sbi_timer_irq_desc_init();
 
     return Ok(());
@@ -163,9 +175,17 @@ pub unsafe fn riscv_intc_init() -> Result<(), SystemError> {
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/irqchip/irq-riscv-intc.c#23
 pub fn riscv_intc_irq(trap_frame: &mut TrapFrame) {
     let hwirq = HardwareIrqNumber::new(trap_frame.cause.code() as u32);
-    // kdebug!("riscv64_do_irq: interrupt {hwirq:?}");
-    GenericIrqHandler::handle_domain_irq(riscv_intc_domain().clone().unwrap(), hwirq, trap_frame)
+    if hwirq.data() == 9 {
+        // external interrupt
+        do_plic_irq(trap_frame);
+    } else {
+        GenericIrqHandler::handle_domain_irq(
+            riscv_intc_domain().clone().unwrap(),
+            hwirq,
+            trap_frame,
+        )
         .ok();
+    }
     do_softirq();
     if hwirq.data() == RiscVSbiTimer::TIMER_IRQ.data() {
         __schedule(SchedMode::SM_PREEMPT);

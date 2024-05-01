@@ -1191,20 +1191,22 @@ impl LockedVMA {
         if let Some(before) = before.clone() {
             let virt_iter = before.lock().region.iter_pages();
             for frame in virt_iter {
-                let paddr = utable.translate(frame.virt_address()).unwrap().0;
-                let page = page_manager_guard.get_mut(&paddr);
-                page.insert_vma(before.clone());
-                page.remove_vma(self);
+                if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
+                    let page = page_manager_guard.get_mut(&paddr);
+                    page.insert_vma(before.clone());
+                    page.remove_vma(self);
+                }
             }
         }
 
         if let Some(after) = after.clone() {
             let virt_iter = after.lock().region.iter_pages();
             for frame in virt_iter {
-                let paddr = utable.translate(frame.virt_address()).unwrap().0;
-                let page = page_manager_guard.get_mut(&paddr);
-                page.insert_vma(after.clone());
-                page.remove_vma(self);
+                if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
+                    let page = page_manager_guard.get_mut(&paddr);
+                    page.insert_vma(after.clone());
+                    page.remove_vma(self);
+                }
             }
         }
 

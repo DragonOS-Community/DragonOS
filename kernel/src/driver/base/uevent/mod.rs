@@ -35,7 +35,7 @@ use crate::driver::base::kobject::KObject;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-mod kobject_uevent;
+pub mod kobject_uevent;
 
 // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c?fi=kobject_uevent#457
 // kobject_action
@@ -80,6 +80,7 @@ pub const UEVENT_HELPER_PATH_LEN:usize = 256;
     buflen，访问buf的变量。
 
 */
+// 表示一个待发送的uevent
 pub struct KobjUeventEnv {
     argv: Vec<Option<String>>,
     envp: Vec<Option<String>>,

@@ -12,7 +12,8 @@ use alloc::{
 };
 use core::fmt::Debug;
 use system_error::SystemError;
-
+use crate::driver::base::uevent::kobject_uevent::kobject_uevent;
+use crate::driver::base::uevent::KobjectAction;
 /// @brief: Driver error
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -213,8 +214,8 @@ impl DriverManager {
             e
         })?;
 
-        // todo: 发送uevent
-        // kobject_uevent(&drv->p->kobj, KOBJ_ADD);
+        // todo: 发送uevent，类型问题
+        // kobject_uevent(driver, KobjectAction::KOBJADD);
         // deferred_probe_extend_timeout();
 
         return Ok(());

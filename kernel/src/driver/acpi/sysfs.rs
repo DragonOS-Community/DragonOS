@@ -21,7 +21,8 @@ use alloc::{
 use system_error::SystemError;
 
 use super::{acpi_kset, AcpiManager};
-
+use crate::driver::base::uevent::kobject_uevent::kobject_uevent;
+use crate::driver::base::uevent::KobjectAction;
 static mut __HOTPLUG_KSET_INSTANCE: Option<Arc<KSet>> = None;
 static mut __ACPI_TABLES_KSET_INSTANCE: Option<Arc<KSet>> = None;
 static mut __ACPI_TABLES_DATA_KSET_INSTANCE: Option<Arc<KSet>> = None;
@@ -115,17 +116,9 @@ impl AcpiManager {
             self.acpi_table_data_init(&header)?;
         }
         // TODO:UEVENT
-        //         kobject_uevent(tables_kobj, KOBJ_ADD);
-        // 532  	kobject_uevent(tables_data_kobj, KOBJ_ADD);
-        // 533  	kobject_uevent(dynamic_tables_kobj, KOBJ_ADD);
-        // 534
-        // 535  	return 0;
-        // 536  err_dynamic_tables:
-        // 537  	kobject_put(tables_data_kobj);
-        // 538  err_tables_data:
-        // 539  	kobject_put(tables_kobj);
-        // 540  err:
-        // 541  	return -ENOMEM;
+        // kobject_uevent(tables_kobj, KobjectAction::KOBJADD);
+        // kobject_uevent(tables_data_kobj, KobjectAction::KOBJADD);
+        // kobject_uevent(dynamic_tables_kobj, KobjectAction::KOBJADD);
         return Ok(());
     }
 

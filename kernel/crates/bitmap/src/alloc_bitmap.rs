@@ -128,3 +128,11 @@ impl BitAnd for &AllocBitmap {
         result
     }
 }
+
+impl BitAnd for AllocBitmap {
+    type Output = AllocBitmap;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        &self & &rhs
+    }
+}

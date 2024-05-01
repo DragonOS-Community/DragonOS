@@ -675,7 +675,7 @@ fn test_alloc_bitmap_bitand_assign_128() {
     bitmap2.set(1, true);
     bitmap2.set(67, true);
 
-    bitmap &= bitmap2;
+    bitmap.bitand_assign(&bitmap2);
 
     assert_eq!(bitmap.len(), 128);
     assert_eq!(bitmap.size(), 16);

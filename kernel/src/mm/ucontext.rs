@@ -1189,9 +1189,11 @@ impl LockedVMA {
         // 重新设置before、after这两个VMA里面的物理页的anon_vma
         let mut page_manager_guard = page_manager_lock_irqsave();
         if let Some(before) = before.clone() {
-            let virt_iter = before.lock().region.iter_pages();
-            for frame in virt_iter {
-                if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
+            let before_guard = before.lock();
+            if before_guard.mapped {
+                let virt_iter = before_guard.region.iter_pages();
+                for frame in virt_iter {
+                    let paddr = utable.translate(frame.virt_address()).unwrap().0;
                     let page = page_manager_guard.get_mut(&paddr);
                     page.insert_vma(before.clone());
                     page.remove_vma(self);
@@ -1200,9 +1202,11 @@ impl LockedVMA {
         }
 
         if let Some(after) = after.clone() {
-            let virt_iter = after.lock().region.iter_pages();
-            for frame in virt_iter {
-                if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
+            let after_guard = after.lock();
+            if after_guard.mapped {
+                let virt_iter = after_guard.region.iter_pages();
+                for frame in virt_iter {
+                    let paddr = utable.translate(frame.virt_address()).unwrap().0;
                     let page = page_manager_guard.get_mut(&paddr);
                     page.insert_vma(after.clone());
                     page.remove_vma(self);

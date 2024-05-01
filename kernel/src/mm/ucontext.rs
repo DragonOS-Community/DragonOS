@@ -299,18 +299,12 @@ impl InnerAddressSpace {
                 prot_flags,
                 map_flags,
                 move |page, count, flags, _mapper, _flusher| {
-                    Ok(LockedVMA::new(VMA {
-                        region: VirtRegion::new(
-                            page.virt_address(),
-                            count.data() * MMArch::PAGE_SIZE,
-                        ),
+                    Ok(LockedVMA::new(VMA::new(
+                        VirtRegion::new(page.virt_address(), count.data() * MMArch::PAGE_SIZE),
                         vm_flags,
                         flags,
-                        mapped: true,
-                        user_address_space: None,
-                        self_ref: Weak::default(),
-                        provider: Provider::Allocated,
-                    }))
+                        false,
+                    )))
                 },
             )?
         };
@@ -1033,7 +1027,6 @@ impl LockedVMA {
         mut flusher: impl Flusher<MMArch>,
     ) -> Result<(), SystemError> {
         let mut guard = self.lock();
-        assert!(guard.mapped);
         for page in guard.region.pages() {
             // 暂时要求所有的页帧都已经映射到页表
             // TODO: 引入Lazy Mapping, 通过缺页中断来映射页帧，这里就不必要求所有的页帧都已经映射到页表了
@@ -1052,7 +1045,6 @@ impl LockedVMA {
         // todo: 如果当前vma与文件相关，完善文件相关的逻辑
 
         let mut guard = self.lock();
-        assert!(guard.mapped);
 
         // 获取物理页的anon_vma的守卫
         let mut page_manager_guard: SpinLockGuard<'_, crate::mm::page::PageManager> =
@@ -1347,7 +1339,6 @@ impl VMA {
         mapper: &mut PageMapper,
         mut flusher: impl Flusher<MMArch>,
     ) -> Result<(), SystemError> {
-        assert!(self.mapped);
         for page in self.region.pages() {
             // kdebug!("remap page {:?}", page.virt_address());
             if mapper.translate(page.virt_address()).is_some() {
@@ -1477,18 +1468,15 @@ impl VMA {
             flusher.consume(r);
             cur_dest = cur_dest.next();
         }
-        let r = LockedVMA::new(VMA {
-            region: VirtRegion::new(
+        let r = LockedVMA::new(VMA::new(
+            VirtRegion::new(
                 destination.virt_address(),
                 page_count.data() * MMArch::PAGE_SIZE,
             ),
             vm_flags,
             flags,
-            mapped: true,
-            user_address_space: None,
-            self_ref: Weak::default(),
-            provider: Provider::Allocated,
-        });
+            true,
+        ));
         drop(flusher);
         // kdebug!("VMA::zeroed: flusher dropped");
 

@@ -75,6 +75,16 @@ impl PageFaultMessage {
     }
 }
 
+impl Clone for PageFaultMessage {
+    fn clone(&self) -> Self {
+        Self {
+            vma: self.vma.clone(),
+            address: self.address,
+            flags: self.flags,
+        }
+    }
+}
+
 /// 缺页中断处理结构体
 pub struct PageFaultHandler;
 
@@ -167,27 +177,30 @@ impl PageFaultHandler {
         let address = pfm.address_aligned_down();
         let flags = pfm.flags;
         let vma = pfm.vma.clone();
+        let mut ret = VmFaultReason::VM_FAULT_COMPLETED;
         if let Some(mut entry) = mapper.get_entry(address, 0) {
             if !entry.present() {
-                return Self::do_swap_page(pfm, mapper);
+                ret = Self::do_swap_page(pfm.clone(), mapper);
             }
             if entry.protnone() && vma.is_accessible() {
-                return Self::do_numa_page(pfm, mapper);
+                ret = Self::do_numa_page(pfm.clone(), mapper);
             }
             if flags.intersects(FaultFlags::FAULT_FLAG_WRITE | FaultFlags::FAULT_FLAG_UNSHARE) {
                 if !entry.write() {
-                    return Self::do_wp_page(pfm, mapper);
+                    ret = Self::do_wp_page(pfm.clone(), mapper);
                 } else {
                     entry.set_flags(PageFlags::from_data(MMArch::ENTRY_FLAG_DIRTY));
                 }
             }
         } else if vma.is_anonymous() {
-            return Self::do_anonymous_page(pfm, mapper);
+            ret = Self::do_anonymous_page(pfm.clone(), mapper);
         } else {
-            return Self::do_fault(pfm, mapper);
+            ret = Self::do_fault(pfm.clone(), mapper);
         }
 
-        VmFaultReason::VM_FAULT_COMPLETED
+        vma.lock().set_mapped(true);
+
+        return ret;
     }
 
     /// 处理匿名映射页缺页异常

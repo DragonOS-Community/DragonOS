@@ -1,51 +1,94 @@
-use alloc::{string::String, sync::Arc};
+use core::mem::MaybeUninit;
 
-use crate::{
-    process::{Pid, ProcessManager},
-    smp::cpu::ProcessorId,
+use alloc::{
+    alloc::Global,
+    boxed::Box,
+    string::String,
+    sync::{Arc, Weak},
 };
 
-use super::{KvmMemSlots, Vm};
+use crate::{
+    arch::{
+        vm::{kvm_host::vcpu::VirCpuRequest, vmx::VmxVCpuPriv},
+        VirtCpuArch,
+    },
+    libs::{
+        lazy_init::Lazy,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
+    process::{Pid, ProcessManager},
+    smp::cpu::ProcessorId,
+    virt::vm::{kvm_host::check_stack_usage, user_api::UapiKvmRun},
+};
 
-pub struct VirtCpu {
-    cpu: ProcessorId,
-    kvm: Arc<Vm>,
-    vcpu_id: usize,
-    pid: Option<Pid>,
-    preempted: bool,
-    ready: bool,
-    last_used_slot: Option<Arc<KvmMemSlots>>,
-    stats_id: String,
+use super::{
+    mem::{GfnToHvaCache, KvmMemSlot, PfnCacheUsage},
+    LockedVm, Vm,
+};
+
+#[derive(Debug)]
+pub struct LockedVirtCpu {
+    inner: SpinLock<VirtCpu>,
 }
 
-impl VirtCpu {
-    /// ### 创建一个vcpu，并且初始化部分数据
-    pub fn create(vm: Arc<Vm>, id: usize) -> Self {
+impl LockedVirtCpu {
+    pub fn new(vcpu: VirtCpu) -> Self {
         Self {
-            cpu: ProcessorId::INVALID,
-            kvm: vm,
-            vcpu_id: id,
-            pid: None,
-            preempted: false,
-            ready: false,
-            last_used_slot: None,
-            stats_id: format!("kvm-{}/vcpu-{}", ProcessManager::current_pid().data(), id),
+            inner: SpinLock::new(vcpu),
         }
+    }
+
+    pub fn lock(&self) -> SpinLockGuard<VirtCpu> {
+        self.inner.lock()
     }
 }
 
-/// ## 多处理器状态（有些状态在某些架构并不合法）
-#[derive(Debug, Clone, Copy)]
-pub enum MutilProcessorState {
-    Runnable,
-    Uninitialized,
-    InitReceived,
-    Halted,
-    SipiReceived,
-    Stopped,
-    CheckStop,
-    Operating,
-    Load,
-    ApResetHold,
-    Suspended,
+#[derive(Debug)]
+pub struct VirtCpu {
+    pub cpu: ProcessorId,
+    pub kvm: Option<Weak<LockedVm>>,
+    /// 从用户层获取
+    pub vcpu_id: usize,
+    /// id alloctor获取
+    pub vcpu_idx: usize,
+    pub pid: Option<Pid>,
+    pub preempted: bool,
+    pub ready: bool,
+    pub last_used_slot: Option<Arc<KvmMemSlot>>,
+    pub stats_id: String,
+    pub pv_time: GfnToHvaCache,
+    pub arch: VirtCpuArch,
+
+    pub guest_debug: GuestDebug,
+
+    #[cfg(target_arch = "x86_64")]
+    pub private: Option<VmxVCpuPriv>,
+
+    /// 记录请求
+    pub request: VirCpuRequest,
+    pub run: Option<Box<UapiKvmRun>>,
+}
+
+impl VirtCpu {
+    #[inline]
+    pub fn kvm(&self) -> Arc<LockedVm> {
+        self.kvm.as_ref().unwrap().upgrade().unwrap()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn vmx(&self) -> &VmxVCpuPriv {
+        self.private.as_ref().unwrap()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn vmx_mut(&mut self) -> &mut VmxVCpuPriv {
+        self.private.as_mut().unwrap()
+    }
+}
+
+bitflags! {
+    pub struct GuestDebug: usize {
+        const ENABLE = 0x00000001;
+        const SINGLESTEP = 0x00000002;
+    }
 }

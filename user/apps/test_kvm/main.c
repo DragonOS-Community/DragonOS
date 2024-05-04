@@ -19,11 +19,14 @@
 #include <stdio.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <string.h>
 
-#define KVM_CREATE_VCPU 0x00
-#define KVM_SET_USER_MEMORY_REGION 0x01
+#define KVM_CREATE_VM 0xAE01
+#define KVM_CREATE_VCPU 0xAE41
+#define KVM_SET_USER_MEMORY_REGION 0xAE46
 
-#define KVM_RUN 0x00
+#define KVM_RUN 0xAE80
 #define KVM_GET_REGS 0x01
 #define KVM_SET_REGS 0x02
 
@@ -64,7 +67,7 @@ int main()
     printf("Test kvm running...\n");
     printf("Open /dev/kvm\n");
     int kvm_fd = open("/dev/kvm", O_RDWR|O_CLOEXEC);
-    int vmfd = ioctl(kvm_fd, 0x01, 0);
+    int vmfd = ioctl(kvm_fd, KVM_CREATE_VM, 0);
     printf("vmfd=%d\n", vmfd);
 
     /*
@@ -84,16 +87,17 @@ int main()
         0xf4,             /* hlt */
     };
 
-    size_t mem_size = 0x4000; // size of user memory you want to assign
+    size_t mem_size = 0x1000; // size of user memory you want to assign
     printf("code=%p\n", code);
-    // void *mem = mmap(0, mem_size, 0x7, -1, 0);
-    // memcpy(mem, code, sizeof(code));
+    void *mem = mmap((void*)65536, mem_size, 0x7, 0x20, 0,0);
+    memcpy(mem, code, sizeof(code));
+    printf("map mem=%p\n", mem);
     struct kvm_userspace_memory_region region = {
         .slot = 0,
         .flags = 0,
         .guest_phys_addr = 0,
         .memory_size = mem_size,
-        .userspace_addr = (size_t)code
+        .userspace_addr = (size_t)mem
     };
     ioctl(vmfd, KVM_SET_USER_MEMORY_REGION, &region);
 

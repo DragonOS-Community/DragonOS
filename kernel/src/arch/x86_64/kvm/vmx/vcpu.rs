@@ -503,7 +503,7 @@ pub fn get_segment_base(gdt_base: *const u64, gdt_size: u16, segment_selector: u
 // }
 pub fn adjust_vmx_controls(ctl_min: u32, ctl_opt: u32, msr: u32, result: &mut u32) {
     let vmx_msr_low: u32 = unsafe { (msr::rdmsr(msr) & 0x0000_0000_FFFF_FFFF) as u32 };
-    let vmx_msr_high: u32 = unsafe { (msr::rdmsr(msr) << 32) as u32 };
+    let vmx_msr_high: u32 = unsafe { (msr::rdmsr(msr) >> 32) as u32 };
     let mut ctl: u32 = ctl_min | ctl_opt;
     ctl &= vmx_msr_high; /* bit == 0 in high word ==> must be zero */
     ctl |= vmx_msr_low; /* bit == 1 in low word  ==> must be one  */

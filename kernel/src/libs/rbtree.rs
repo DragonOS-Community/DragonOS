@@ -831,6 +831,15 @@ impl<K: Ord + Debug, V: Debug> IntoIterator for RBTree<K, V> {
     }
 }
 
+impl<K: Ord + Debug, V: Debug> Default for RBTree<K, V> {
+    fn default() -> Self {
+        RBTree {
+            root: NodePtr::null(),
+            len: 0,
+        }
+    }
+}
+
 impl<K: Ord + Debug, V: Debug> RBTree<K, V> {
     /// Creates an empty `RBTree`.
     pub fn new() -> RBTree<K, V> {

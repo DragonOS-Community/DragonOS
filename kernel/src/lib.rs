@@ -22,6 +22,8 @@
 #![feature(trait_upcasting)]
 #![feature(slice_ptr_get)]
 #![feature(vec_into_raw_parts)]
+// match语句中能够使用范围
+#![feature(exclusive_range_pattern)]
 #![cfg_attr(target_os = "none", no_std)]
 // clippy的配置
 #![deny(clippy::all)]

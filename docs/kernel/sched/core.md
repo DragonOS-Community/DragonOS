@@ -27,12 +27,11 @@
 &emsp;&emsp;
 
 ## 重要结构
-- ### ``Scheduler``
+- ``Scheduler:``
 &emsp;&emsp;``Scheduler``是各个调度算法提供给上层的接口，实现不同的调度算法，只需要向外提供这样一组接口即可。
 
-- ### ``CpuRunQueue``
+- ``CpuRunQueue:``
 &emsp;&emsp;``CpuRunQueue``为总的CPU运行队列，他会根据不同的调度策略来进行调度。他作为调度子系统的根节点来组织调度。
-
 	- **重要字段**
 		- ``lock``: 过程锁，因为在深入到具体调度策略后的调度过程中还会需要访问``CpuRunQueue``中的信息，在cfs中保存了``CpuRunQueue``对象，我们需要确保在整体过程上锁后，子对象中不需要二次加锁即可访问，所以过程锁比较适合这个场景，若使用对象锁，则在对应调度策略中想要访问``CpuRunQueue``中的信息时需要加锁，但是最外层已经将``CpuRunQueue``对象上锁，会导致内层永远拿不到锁。对于该字段，详见[CpuRunQueue的self_lock方法及其注释](https://code.dragonos.org.cn/xref/DragonOS/kernel/src/sched/mod.rs?r=dd8e74ef0d7f91a141bd217736bef4fe7dc6df3d#360)。
 		- ``cfs``: Cfs调度器的根节点，往下伸展为一棵子树，详见完全公平调度文档。

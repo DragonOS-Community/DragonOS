@@ -6,6 +6,7 @@ use system_error::SystemError;
 use crate::driver::base::block::{block_device::LBA_SIZE, disk_info::Partition};
 use core::fmt::Debug;
 /// 块组描述符表(位于superblock之后)
+#[derive(Clone, Copy)]
 #[repr(C, align(1))]
 pub struct Ext2BlockGroupDescriptor {
     /// 块位图的地址
@@ -69,8 +70,24 @@ impl Ext2BlockGroupDescriptor {
         bytes.extend_from_slice(&self.dir_num.to_le_bytes());
         bytes
     }
+    pub fn alloc_one_block(&self, bitmap: &[u8], group_id: usize, block_per_group: usize) -> usize {
+        // TODO 可能要修改desc
+        for (pos, value) in bitmap.iter().enumerate() {
+            if *value != 0xFFu8 {
+                let bitmap_byte = !(*value);
+                let mut mask = 0b1000_0000u8;
+                for i in 0..8 {
+                    if bitmap_byte & mask == mask {
+                        let block_num = group_id * block_per_group + pos * 8 + i;
+                        return block_num;
+                    }
+                    mask >>= 1;
+                }
+            }
+        }
+        0
+    }
 }
-
 impl Debug for Ext2BlockGroupDescriptor {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Ext2BlockGroupDescriptor")

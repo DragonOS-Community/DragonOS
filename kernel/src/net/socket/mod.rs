@@ -15,14 +15,18 @@ use smoltcp::{
 use system_error::SystemError;
 
 use crate::{
-    arch::rand::rand, filesystem::vfs::{
+    arch::rand::rand,
+    filesystem::vfs::{
         file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode,
         Metadata,
-    }, libs::{
+    },
+    libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::EventWaitQueue,
-    }, process::{Pid, ProcessManager}, sched::{schedule, SchedMode}
+    },
+    process::{Pid, ProcessManager},
+    sched::{schedule, SchedMode},
 };
 
 use self::{
@@ -514,11 +518,7 @@ impl PortManager {
     /// @brief 检测给定端口是否已被占用，如果未被占用则在 TCP/UDP 对应的表中记录
     ///
     /// TODO: 增加支持端口复用的逻辑
-    pub fn bind_port(
-        &self,
-        socket_type: SocketType,
-        port: u16,
-    ) -> Result<(), SystemError> {
+    pub fn bind_port(&self, socket_type: SocketType, port: u16) -> Result<(), SystemError> {
         if port > 0 {
             let mut listen_table_guard = match socket_type {
                 SocketType::Udp => self.udp_port_table.lock(),
@@ -542,7 +542,7 @@ impl PortManager {
             SocketType::Tcp => self.tcp_port_table.lock(),
             _ => {
                 return;
-            },
+            }
         };
         listen_table_guard.remove(&port);
         drop(listen_table_guard);

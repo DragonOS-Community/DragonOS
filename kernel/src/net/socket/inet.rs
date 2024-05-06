@@ -288,7 +288,7 @@ impl UdpSocket {
                 ip.port = PORT_MANAGER.get_ephemeral_port(self.metadata.socket_type)?;
             }
             // 检测端口是否已被占用
-            PORT_MANAGER.bind_port(self.metadata.socket_type, ip.port, self.clone())?;
+            PORT_MANAGER.bind_port(self.metadata.socket_type, ip.port)?;
 
             let bind_res = if ip.addr.is_unspecified() {
                 socket.bind(ip.port)
@@ -705,7 +705,7 @@ impl Socket for TcpSocket {
         if let Endpoint::Ip(Some(ip)) = endpoint {
             let temp_port = PORT_MANAGER.get_ephemeral_port(self.metadata.socket_type)?;
             // 检测端口是否被占用
-            PORT_MANAGER.bind_port(self.metadata.socket_type, temp_port, self.clone())?;
+            PORT_MANAGER.bind_port(self.metadata.socket_type, temp_port)?;
 
             // kdebug!("temp_port: {}", temp_port);
             let iface: Arc<dyn NetDevice> = NET_DEVICES.write_irqsave().get(&0).unwrap().clone();
@@ -807,7 +807,7 @@ impl Socket for TcpSocket {
             }
 
             // 检测端口是否已被占用
-            PORT_MANAGER.bind_port(self.metadata.socket_type, ip.port, self.clone())?;
+            PORT_MANAGER.bind_port(self.metadata.socket_type, ip.port)?;
             // kdebug!("tcp socket:bind, socket'len={}",self.handle.len());
 
             self.local_endpoint = Some(ip);
@@ -877,15 +877,6 @@ impl Socket for TcpSocket {
                     metadata,
                 });
 
-                // 更新端口与 socket 的绑定
-                if let Some(Endpoint::Ip(Some(ip))) = self.endpoint() {
-                    PORT_MANAGER.unbind_port(self.metadata.socket_type, ip.port)?; // NOTICE
-                    PORT_MANAGER.bind_port(
-                        self.metadata.socket_type,
-                        ip.port,
-                        *(sock_ret.clone()),
-                    )?;
-                }
                 {
                     let mut handle_guard = HANDLE_MAP.write_irqsave();
                     // 先删除原来的

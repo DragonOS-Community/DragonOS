@@ -15,17 +15,14 @@ use smoltcp::{
 use system_error::SystemError;
 
 use crate::{
-    arch::rand::rand,
-    filesystem::vfs::{
+    arch::rand::rand, filesystem::vfs::{
         file::FileMode, syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode,
         Metadata,
-    },
-    libs::{
+    }, libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::EventWaitQueue,
-    },
-    sched::{schedule, SchedMode},
+    }, process::{Pid, ProcessManager}, sched::{schedule, SchedMode}
 };
 
 use self::{
@@ -326,7 +323,7 @@ impl IndexNode for SocketInode {
             }
 
             if let Some(Endpoint::Ip(Some(ip))) = socket.endpoint() {
-                PORT_MANAGER.unbind_port(socket.metadata().socket_type, ip.port)?;
+                PORT_MANAGER.unbind_port(socket.metadata().socket_type, ip.port);
             }
 
             socket.clear_epoll()?;
@@ -463,9 +460,9 @@ impl SocketHandleItem {
 /// 如果 TCP/UDP 的 socket 绑定了某个端口，它会在对应的表中记录，以检测端口冲突。
 pub struct PortManager {
     // TCP 端口记录表
-    tcp_port_table: SpinLock<HashMap<u16, Arc<dyn Socket>>>,
+    tcp_port_table: SpinLock<HashMap<u16, Pid>>,
     // UDP 端口记录表
-    udp_port_table: SpinLock<HashMap<u16, Arc<dyn Socket>>>,
+    udp_port_table: SpinLock<HashMap<u16, Pid>>,
 }
 
 impl PortManager {
@@ -521,7 +518,6 @@ impl PortManager {
         &self,
         socket_type: SocketType,
         port: u16,
-        socket: impl Socket,
     ) -> Result<(), SystemError> {
         if port > 0 {
             let mut listen_table_guard = match socket_type {
@@ -531,7 +527,7 @@ impl PortManager {
             };
             match listen_table_guard.get(&port) {
                 Some(_) => return Err(SystemError::EADDRINUSE),
-                None => listen_table_guard.insert(port, Arc::new(socket)),
+                None => listen_table_guard.insert(port, ProcessManager::current_pid()),
             };
             drop(listen_table_guard);
         }
@@ -539,15 +535,17 @@ impl PortManager {
     }
 
     /// @brief 在对应的端口记录表中将端口和 socket 解绑
-    pub fn unbind_port(&self, socket_type: SocketType, port: u16) -> Result<(), SystemError> {
+    /// should call this function when socket is closed or aborted
+    pub fn unbind_port(&self, socket_type: SocketType, port: u16) {
         let mut listen_table_guard = match socket_type {
             SocketType::Udp => self.udp_port_table.lock(),
             SocketType::Tcp => self.tcp_port_table.lock(),
-            _ => return Ok(()),
+            _ => {
+                return;
+            },
         };
         listen_table_guard.remove(&port);
         drop(listen_table_guard);
-        return Ok(());
     }
 }
 

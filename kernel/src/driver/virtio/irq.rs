@@ -3,7 +3,16 @@ use hashbrown::HashMap;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
-use crate::{driver::base::device::DeviceId, init::initcall::INITCALL_CORE, libs::rwlock::RwLock};
+use crate::{
+    driver::base::device::DeviceId,
+    exception::{
+        irqdata::IrqHandlerData,
+        irqdesc::{IrqHandler, IrqReturn},
+        IrqNumber,
+    },
+    init::initcall::INITCALL_CORE,
+    libs::rwlock::RwLock,
+};
 
 use super::VirtIODevice;
 
@@ -82,4 +91,37 @@ fn init_virtio_irq_manager() -> Result<(), SystemError> {
         VIRTIO_IRQ_MANAGER = Some(manager);
     }
     return Ok(());
+}
+
+/// `DefaultVirtioIrqHandler` 是一个默认的virtio设备中断处理程序。
+///
+/// 当虚拟设备产生中断时，该处理程序会被调用。
+///
+/// 它首先检查设备ID是否存在，然后尝试查找与设备ID关联的设备。
+/// 如果找到设备，它会调用设备的 `handle_irq` 方法来处理中断。
+/// 如果没有找到设备，它会记录一条警告并返回 `IrqReturn::NotHandled`，表示中断未被处理。
+#[derive(Debug)]
+pub(super) struct DefaultVirtioIrqHandler;
+
+impl IrqHandler for DefaultVirtioIrqHandler {
+    fn handle(
+        &self,
+        irq: IrqNumber,
+        _static_data: Option<&dyn IrqHandlerData>,
+        dev_id: Option<Arc<dyn IrqHandlerData>>,
+    ) -> Result<IrqReturn, SystemError> {
+        let dev_id = dev_id.ok_or(SystemError::EINVAL)?;
+        let dev_id = dev_id
+            .arc_any()
+            .downcast::<DeviceId>()
+            .map_err(|_| SystemError::EINVAL)?;
+
+        if let Some(dev) = virtio_irq_manager().lookup_device(&dev_id) {
+            return dev.handle_irq(irq);
+        } else {
+            // 未绑定具体设备，因此无法处理中断
+            kwarn!("No device found for IRQ: {:?}", irq);
+            return Ok(IrqReturn::NotHandled);
+        }
+    }
 }

@@ -36,6 +36,13 @@ pub trait VirtIODevice: Device {
 
     /// virtio 设备厂商
     fn vendor(&self) -> u32;
+
+    /// virtio设备的中断号
+    fn irq(&self) -> Option<IrqNumber>;
+
+    fn set_irq_number(&self, _irq: IrqNumber) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 }
 
 pub trait VirtIODriver: Driver {

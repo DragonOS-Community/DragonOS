@@ -37,27 +37,27 @@ use super::{
 pub trait IrqChip: Sync + Send + Any + Debug {
     fn name(&self) -> &'static str;
     /// start up the interrupt (defaults to ->enable if ENOSYS)
-    fn irq_startup(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
+    fn irq_startup(&self, _irq_data: &Arc<IrqData>) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
 
     /// shut down the interrupt (defaults to ->disable if ENOSYS)
-    fn irq_shutdown(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
+    fn irq_shutdown(&self, _irq_data: &Arc<IrqData>) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
 
     /// enable the interrupt
     ///
     /// (defaults to ->unmask if ENOSYS)
-    fn irq_enable(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
+    fn irq_enable(&self, _irq_data: &Arc<IrqData>) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
 
     /// disable the interrupt
-    fn irq_disable(&self, irq: &Arc<IrqData>);
+    fn irq_disable(&self, irq_data: &Arc<IrqData>);
 
     /// start of a new interrupt
-    fn irq_ack(&self, irq: &Arc<IrqData>);
+    fn irq_ack(&self, irq_data: &Arc<IrqData>);
 
     /// mask an interrupt source
     ///
@@ -66,7 +66,7 @@ pub trait IrqChip: Sync + Send + Any + Debug {
     /// 如果返回ENOSYS，则表明irq_mask()不支持. 那么中断机制代码将调用irq_disable()。
     ///
     /// 如果返回错误，那么中断的屏蔽状态将不会改变。
-    fn irq_mask(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
+    fn irq_mask(&self, _irq_data: &Arc<IrqData>) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
 
@@ -74,18 +74,18 @@ pub trait IrqChip: Sync + Send + Any + Debug {
     fn can_mask_ack(&self) -> bool;
 
     /// ack and mask an interrupt source
-    fn irq_mask_ack(&self, _irq: &Arc<IrqData>) {}
+    fn irq_mask_ack(&self, _irq_data: &Arc<IrqData>) {}
 
     /// unmask an interrupt source
     ///
     /// 用于取消屏蔽中断
     ///
     /// 如果返回ENOSYS，则表明irq_unmask()不支持.
-    fn irq_unmask(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
+    fn irq_unmask(&self, _irq_data: &Arc<IrqData>) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
     /// end of interrupt
-    fn irq_eoi(&self, _irq: &Arc<IrqData>) {}
+    fn irq_eoi(&self, _irq_data: &Arc<IrqData>) {}
 
     /// 指示当前芯片是否可以设置中断亲和性。
     fn can_set_affinity(&self) -> bool;
@@ -96,7 +96,7 @@ pub trait IrqChip: Sync + Send + Any + Debug {
     /// 不需要对提供的亲和性掩码进行完整性检查。这用于CPU热插拔，其中目标CPU尚未在cpu_online_mask中设置。
     fn irq_set_affinity(
         &self,
-        _irq: &Arc<IrqData>,
+        _irq_data: &Arc<IrqData>,
         _cpu: &CpuMask,
         _force: bool,
     ) -> Result<IrqChipSetMaskResult, SystemError> {
@@ -104,7 +104,7 @@ pub trait IrqChip: Sync + Send + Any + Debug {
     }
 
     /// retrigger an IRQ to the CPU
-    fn retrigger(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
+    fn retrigger(&self, _irq_data: &Arc<IrqData>) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
 
@@ -119,65 +119,65 @@ pub trait IrqChip: Sync + Send + Any + Debug {
     ///
     fn irq_set_type(
         &self,
-        _irq: &Arc<IrqData>,
+        _irq_data: &Arc<IrqData>,
         _flow_type: IrqLineStatus,
     ) -> Result<IrqChipSetMaskResult, SystemError> {
         Err(SystemError::ENOSYS)
     }
 
     /// enable/disable power management wake-on of an interrupt
-    fn irq_set_wake(&self, _irq: &Arc<IrqData>, _on: bool) -> Result<(), SystemError> {
+    fn irq_set_wake(&self, _irq_data: &Arc<IrqData>, _on: bool) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
 
     /// function to lock access to slow bus (i2c) chips
-    fn irq_bus_lock(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
+    fn irq_bus_lock(&self, _irq_data: &Arc<IrqData>) -> Result<(), SystemError> {
         Ok(())
     }
 
     /// function to sync and unlock slow bus (i2c) chips
-    fn irq_bus_sync_unlock(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
+    fn irq_bus_sync_unlock(&self, _irq_data: &Arc<IrqData>) -> Result<(), SystemError> {
         Ok(())
     }
 
     /// function called from core code on suspend once per
     /// chip, when one or more interrupts are installed
-    fn irq_suspend(&self, _irq: &Arc<IrqData>) {}
+    fn irq_suspend(&self, _irq_data: &Arc<IrqData>) {}
 
     /// function called from core code on resume once per chip,
     /// when one ore more interrupts are installed
-    fn irq_resume(&self, _irq: &Arc<IrqData>) {}
+    fn irq_resume(&self, _irq_data: &Arc<IrqData>) {}
 
     /// function called from core code on shutdown once per chip
-    fn irq_pm_shutdown(&self, _irq: &Arc<IrqData>) {}
+    fn irq_pm_shutdown(&self, _irq_data: &Arc<IrqData>) {}
 
     /// Optional function to set irq_data.mask for special cases
-    fn irq_calc_mask(&self, _irq: &Arc<IrqData>) {}
+    fn irq_calc_mask(&self, _irq_data: &Arc<IrqData>) {}
 
     // todo: print chip
 
     /// optional to request resources before calling
     /// any other callback related to this irq
-    fn irq_request_resources(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
+    fn irq_request_resources(&self, _irq_data: &Arc<IrqData>) -> Result<(), SystemError> {
         Ok(())
     }
 
     /// optional to release resources acquired with
     /// irq_request_resources
-    fn irq_release_resources(&self, _irq: &Arc<IrqData>) {}
+    fn irq_release_resources(&self, _irq_data: &Arc<IrqData>) {}
 
     /// optional to compose message content for MSI
     ///
     /// 组装MSI消息并返回到msg中
-    fn irq_compose_msi_msg(&self, _irq: &Arc<IrqData>, _msg: &mut MsiMsg) {}
+    fn irq_compose_msi_msg(&self, _irq_data: &Arc<IrqData>, _msg: &mut MsiMsg) {}
 
     /// optional to write message content for MSI
-    fn irq_write_msi_msg(&self, _irq: &Arc<IrqData>, _msg: &MsiMsg) {}
+    fn irq_write_msi_msg(&self, _irq_data: &Arc<IrqData>, _msg: &MsiMsg) {}
 
     /// return the internal state of an interrupt
     fn irqchip_state(
         &self,
-        _irq: &Arc<IrqData>,
+        _irq_data: &Arc<IrqData>,
         _which: IrqChipState,
     ) -> Result<bool, SystemError> {
         Err(SystemError::ENOSYS)
@@ -186,7 +186,7 @@ pub trait IrqChip: Sync + Send + Any + Debug {
     /// set the internal state of an interrupt
     fn set_irqchip_state(
         &self,
-        _irq: &Arc<IrqData>,
+        _irq_data: &Arc<IrqData>,
         _which: IrqChipState,
         _state: bool,
     ) -> Result<(), SystemError> {
@@ -196,17 +196,17 @@ pub trait IrqChip: Sync + Send + Any + Debug {
     // todo: set vcpu affinity
 
     /// send a single IPI to destination cpus
-    fn send_single_ipi(&self, _irq: &Arc<IrqData>, _cpu: u32) {}
+    fn send_single_ipi(&self, _irq_data: &Arc<IrqData>, _cpu: u32) {}
 
     // todo: send ipi with cpu mask
 
     /// function called from core code before enabling an NMI
-    fn irq_nmi_setup(&self, _irq: &Arc<IrqData>) -> Result<(), SystemError> {
+    fn irq_nmi_setup(&self, _irq_data: &Arc<IrqData>) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
 
     /// function called from core code after disabling an NMI
-    fn irq_nmi_teardown(&self, _irq: &Arc<IrqData>) {}
+    fn irq_nmi_teardown(&self, _irq_data: &Arc<IrqData>) {}
 
     fn flags(&self) -> IrqChipFlags;
 }

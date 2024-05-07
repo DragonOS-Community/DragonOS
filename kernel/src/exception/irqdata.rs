@@ -80,6 +80,7 @@ impl IrqData {
         self.inner.lock_irqsave().desc = desc;
     }
 
+    #[allow(dead_code)]
     pub fn clear_irq_desc(&self) {
         self.inner.lock_irqsave().desc = Weak::new();
     }
@@ -210,6 +211,7 @@ impl IrqCommonData {
             handler_data: None,
             msi_desc: None,
             affinity: CpuMask::new(),
+            effective_affinity: CpuMask::new(),
         };
         return IrqCommonData {
             inner: SpinLock::new(inner),
@@ -304,6 +306,10 @@ impl IrqCommonData {
         self.inner.lock_irqsave().affinity = affinity;
     }
 
+    pub fn set_effective_affinity(&self, affinity: CpuMask) {
+        self.inner.lock_irqsave().effective_affinity = affinity;
+    }
+
     pub fn inner(&self) -> SpinLockGuard<InnerIrqCommonData> {
         self.inner.lock_irqsave()
     }
@@ -318,6 +324,7 @@ pub struct InnerIrqCommonData {
     handler_data: Option<Arc<dyn IrqHandlerData>>,
     msi_desc: Option<Arc<MsiDesc>>,
     affinity: CpuMask,
+    effective_affinity: CpuMask,
 }
 
 impl InnerIrqCommonData {
@@ -337,6 +344,10 @@ impl InnerIrqCommonData {
     #[allow(dead_code)]
     pub fn handler_data(&self) -> Option<Arc<dyn IrqHandlerData>> {
         self.handler_data.clone()
+    }
+
+    pub fn effective_affinity(&self) -> &CpuMask {
+        &self.effective_affinity
     }
 }
 

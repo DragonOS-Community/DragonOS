@@ -8,9 +8,6 @@ use crate::driver::pci::pci::{
 
 use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqMsg, IRQ};
 use crate::driver::pci::root::pci_root_0;
-use crate::driver::virtio::irq::virtio_irq_manager;
-use crate::exception::irqdata::IrqHandlerData;
-use crate::exception::irqdesc::{IrqHandler, IrqReturn};
 
 use crate::exception::IrqNumber;
 
@@ -26,12 +23,12 @@ use core::{
     mem::{align_of, size_of},
     ptr::{self, addr_of_mut, NonNull},
 };
-use system_error::SystemError;
 use virtio_drivers::{
     transport::{DeviceStatus, DeviceType, Transport},
     Error, Hal, PhysAddr,
 };
 
+use super::irq::DefaultVirtioIrqHandler;
 use super::VIRTIO_VENDOR_ID;
 
 /// The offset to add to a VirtIO device ID to get the corresponding PCI device ID.
@@ -568,37 +565,4 @@ fn get_bar_region_slice<T>(
 
 fn nonnull_slice_from_raw_parts<T>(data: NonNull<T>, len: usize) -> NonNull<[T]> {
     NonNull::new(ptr::slice_from_raw_parts_mut(data.as_ptr(), len)).unwrap()
-}
-
-/// `DefaultVirtioIrqHandler` 是一个默认的virtio设备中断处理程序。
-///
-/// 当虚拟设备产生中断时，该处理程序会被调用。
-///
-/// 它首先检查设备ID是否存在，然后尝试查找与设备ID关联的设备。
-/// 如果找到设备，它会调用设备的 `handle_irq` 方法来处理中断。
-/// 如果没有找到设备，它会记录一条警告并返回 `IrqReturn::NotHandled`，表示中断未被处理。
-#[derive(Debug)]
-struct DefaultVirtioIrqHandler;
-
-impl IrqHandler for DefaultVirtioIrqHandler {
-    fn handle(
-        &self,
-        irq: IrqNumber,
-        _static_data: Option<&dyn IrqHandlerData>,
-        dev_id: Option<Arc<dyn IrqHandlerData>>,
-    ) -> Result<IrqReturn, SystemError> {
-        let dev_id = dev_id.ok_or(SystemError::EINVAL)?;
-        let dev_id = dev_id
-            .arc_any()
-            .downcast::<DeviceId>()
-            .map_err(|_| SystemError::EINVAL)?;
-
-        if let Some(dev) = virtio_irq_manager().lookup_device(&dev_id) {
-            return dev.handle_irq(irq);
-        } else {
-            // 未绑定具体设备，因此无法处理中断
-
-            return Ok(IrqReturn::NotHandled);
-        }
-    }
 }

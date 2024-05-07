@@ -1,7 +1,5 @@
 use crate::arch::{
-    asm::csr::{
-        CSR_SCAUSE, CSR_SEPC, CSR_SSCRATCH, CSR_SSTATUS, CSR_STVAL, SR_FS_VS, SR_SPP, SR_SUM,
-    },
+    asm::csr::{CSR_SCAUSE, CSR_SEPC, CSR_SSCRATCH, CSR_SSTATUS, CSR_STVAL, SR_SPP},
     cpu::LocalContext,
     interrupt::TrapFrame,
 };

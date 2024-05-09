@@ -3,10 +3,9 @@
   "version": "0.1.0",
   "description": "init程序",
   "task_type": {
-    "BuildFromSource": {
-      "Git": {
-        "url" : "https://git.mirrors.dragonos.org.cn/DragonOS-Community/DragonReach.git",
-        "revision": "01cdc56863"
+     "BuildFromSource": {
+      "Local": {
+        "path": "apps/DragonReach_0_1_0"
       }
     }
   },

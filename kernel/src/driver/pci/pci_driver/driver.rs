@@ -21,8 +21,9 @@ use super::{dev_id::PciDeviceID, device::PciDevice, pci_bus};
 
 /// # trait功能
 /// Pci驱动应该实现的trait
+///
+/// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/pci.h#907
 pub trait PciDriver: Driver {
-    //https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/net/wireless/realtek/rtw88/pci.c?fi=rtw_pci_probe#1731是一个实例
     /// # 函数的功能
     /// 对设备进行probe操作
     ///
@@ -56,7 +57,7 @@ pub trait PciDriver: Driver {
     /// - 'None':未能获取列表
     fn locked_dynid_list(&self) -> Option<Vec<Arc<PciDeviceID>>>;
     /// # 函数的功能
-    /// 检测一个设备是否支持
+    /// 检测当前驱动是否支持目标设备
     ///
     /// ## 参数:
     /// - 'dev' :要检测的设备

@@ -87,7 +87,11 @@ impl RawSocket {
 impl Socket for RawSocket {
     fn close(&mut self) {
         let mut socket_set_guard = SOCKET_SET.lock_irqsave();
-        socket_set_guard.remove(self.handle.smoltcp_handle().unwrap()); // 删除的时候，会发送一条FINISH的信息？
+        if let smoltcp::socket::Socket::Udp(mut sock) =
+            socket_set_guard.remove(self.handle.smoltcp_handle().unwrap())
+        {
+            sock.close();
+        }
         drop(socket_set_guard);
         poll_ifaces();
     }
@@ -309,7 +313,11 @@ impl UdpSocket {
 impl Socket for UdpSocket {
     fn close(&mut self) {
         let mut socket_set_guard = SOCKET_SET.lock_irqsave();
-        socket_set_guard.remove(self.handle.smoltcp_handle().unwrap()); // 删除的时候，会发送一条FINISH的信息？
+        if let smoltcp::socket::Socket::Udp(mut sock) =
+            socket_set_guard.remove(self.handle.smoltcp_handle().unwrap())
+        {
+            sock.close();
+        }
         drop(socket_set_guard);
         poll_ifaces();
     }

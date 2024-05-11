@@ -306,6 +306,15 @@ impl SocketInode {
     }
 }
 
+impl Drop for SocketInode {
+    fn drop(&mut self) {
+        let mut socket = self.0.lock_no_preempt();
+        for _ in 0..self.1.load(core::sync::atomic::Ordering::SeqCst) {
+            socket.close();
+        }
+    }
+}
+
 impl IndexNode for SocketInode {
     fn open(
         &self,

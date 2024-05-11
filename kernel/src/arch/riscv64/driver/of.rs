@@ -3,7 +3,6 @@ use system_error::SystemError;
 use crate::{
     driver::open_firmware::fdt::OpenFirmwareFdtDriver,
     init::boot_params,
-    kdebug,
     libs::align::page_align_up,
     mm::{mmio_buddy::mmio_pool, MemoryManagementArch, PhysAddr},
 };

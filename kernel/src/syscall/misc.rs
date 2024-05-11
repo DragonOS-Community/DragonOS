@@ -1,7 +1,7 @@
 use crate::{
     arch::{mm::LockedFrameAllocator, rand::rand},
     libs::rand::GRandFlags,
-    mm::allocator::page_frame::FrameAllocator,
+    mm::allocator::{page_frame::FrameAllocator, slab::slab_usage},
 };
 use alloc::vec::Vec;
 use core::cmp;
@@ -38,10 +38,11 @@ impl Syscall {
         let mut sysinfo = SysInfo::default();
 
         let mem = unsafe { LockedFrameAllocator.usage() };
+        let slab_usage = unsafe { slab_usage() };
         sysinfo.uptime = 0;
         sysinfo.loads = [0; 3];
         sysinfo.totalram = mem.total().bytes() as u64;
-        sysinfo.freeram = mem.free().bytes() as u64;
+        sysinfo.freeram = mem.free().bytes() as u64 + slab_usage.free();
         sysinfo.sharedram = 0;
         sysinfo.bufferram = 0;
         sysinfo.totalswap = 0;

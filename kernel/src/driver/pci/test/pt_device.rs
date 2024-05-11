@@ -14,7 +14,7 @@ use crate::{
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        pci::pci_driver::{dev_id::PciDeviceID, device::PciDevice},
+        pci::{dev_id::PciDeviceID, device::PciDevice},
     },
     filesystem::{
         kernfs::KernFSInode,
@@ -28,10 +28,10 @@ use crate::{
 #[derive(Debug)]
 #[cast_to([sync] Device)]
 #[cast_to([sync] PciDevice)]
+/// # 结构功能
 /// 这是一个测试用的PciDevice，也可以作为新PciDevice的参考
 /// 它需要实现KObject PciDevice Device这些接口
 /// 并通过函数pci_device_manager().device_add（）来将设备进行接入
-///
 pub struct TestDevice {
     device_data: RwLock<DeviceCommonData>,
     kobj_data: RwLock<KObjectCommonData>,

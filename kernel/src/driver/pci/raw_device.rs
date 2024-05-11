@@ -17,8 +17,8 @@ use crate::{
 };
 
 use super::{
+    attr::BasicPciReadOnlyAttrs, dev_id::PciDeviceID, device::PciDevice,
     pci::PciDeviceStructureGeneralDevice,
-    pci_driver::{attr::BasicPciReadOnlyAttrs, dev_id::PciDeviceID, device::PciDevice},
 };
 #[derive(Debug)]
 #[cast_to([sync] Device)]

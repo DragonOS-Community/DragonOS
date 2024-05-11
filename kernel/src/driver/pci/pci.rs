@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 // 目前仅支持单主桥单Segment
 
-use super::pci_driver::device::pci_device_manager;
+use super::device::pci_device_manager;
 use super::pci_irq::{IrqType, PciIrqError};
 use super::raw_device::PciGeneralDevice;
 use super::root::{pci_root_0, PciRoot};
 use crate::arch::{PciArch, TraitPciArch};
-use crate::driver::pci::pci_driver::pci_bus_init;
+use crate::driver::pci::pci_bus_init;
 use crate::exception::IrqNumber;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -1103,7 +1103,6 @@ pub fn pci_init() {
         }
     }
 
-    
     kinfo!("PCI bus initialized.");
 }
 

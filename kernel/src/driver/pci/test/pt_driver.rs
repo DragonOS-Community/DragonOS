@@ -15,7 +15,7 @@ use crate::{
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        pci::pci_driver::{dev_id::PciDeviceID, device::PciDevice, driver::PciDriver},
+        pci::{dev_id::PciDeviceID, device::PciDevice, driver::PciDriver},
     },
     filesystem::kernfs::KernFSInode,
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -29,6 +29,9 @@ pub struct TestDriver {
     pub locked_dynid_list: RwLock<Vec<Arc<PciDeviceID>>>,
 }
 
+/// # 结构功能
+/// 本结构体是测试用的驱动，目前暂时保留，否则将出现大量dead code
+/// 在编写了实际的pci驱动后，可将该驱动删除
 impl TestDriver {
     pub fn new() -> Self {
         Self {

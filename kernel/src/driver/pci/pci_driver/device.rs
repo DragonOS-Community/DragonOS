@@ -6,14 +6,10 @@ use system_error::SystemError;
 
 use crate::{
     driver::base::{
-        class::Class,
         device::{
-            bus::{Bus, BusState},
-            device_manager,
-            driver::Driver,
-            Device, DevicePrivateData, DeviceType, IdTable,
+            bus::Bus, device_manager, driver::Driver, Device, DeviceCommonData, DeviceType, IdTable,
         },
-        kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+        kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,
     },
     filesystem::kernfs::KernFSInode,
@@ -91,49 +87,25 @@ pub trait PciDevice: Device {
 #[derive(Debug)]
 #[cast_to([sync] Device)]
 pub struct PciBusDevice {
-    inner: SpinLock<InnerPciBusDevice>,
+    // inner: SpinLock<InnerPciBusDevice>,
+    device_data: SpinLock<DeviceCommonData>,
+    kobj_data: SpinLock<KObjectCommonData>,
     kobj_state: LockedKObjectState,
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct InnerPciBusDevice {
     name: String,
-    data: DevicePrivateData,
-    state: BusState,
-    parent: Option<Weak<dyn KObject>>,
-
-    kernfs_inode: Option<Arc<KernFSInode>>,
-
-    bus: Option<Weak<dyn Bus>>,
-    driver: Option<Weak<dyn Driver>>,
-
-    ktype: Option<&'static dyn KObjType>,
-    kset: Option<Arc<KSet>>,
-}
-
-impl InnerPciBusDevice {
-    pub fn new(data: DevicePrivateData, parent: Option<Weak<dyn KObject>>) -> Self {
-        Self {
-            data,
-            name: "pci".to_string(),
-            state: BusState::NotInitialized,
-            parent,
-            kernfs_inode: None,
-            bus: None,
-            driver: None,
-            ktype: None,
-            kset: None,
-        }
-    }
 }
 
 impl PciBusDevice {
-    pub fn new(data: DevicePrivateData, parent: Option<Weak<dyn KObject>>) -> Arc<Self> {
-        return Arc::new(Self {
-            inner: SpinLock::new(InnerPciBusDevice::new(data, parent)),
+    pub fn new(parent: Option<Weak<dyn KObject>>) -> Arc<Self> {
+        let common_device = DeviceCommonData::default();
+        let common_kobj = KObjectCommonData::default();
+        let bus_device = Self {
+            device_data: SpinLock::new(common_device),
+            kobj_data: SpinLock::new(common_kobj),
             kobj_state: LockedKObjectState::new(None),
-        });
+            name: "pci".to_string(),
+        };
+        bus_device.set_parent(parent);
+        return Arc::new(bus_device);
     }
 }
 
@@ -143,27 +115,27 @@ impl KObject for PciBusDevice {
     }
 
     fn parent(&self) -> Option<alloc::sync::Weak<dyn KObject>> {
-        self.inner.lock().parent.clone()
+        self.kobj_data.lock().parent.clone()
     }
 
     fn inode(&self) -> Option<Arc<KernFSInode>> {
-        self.inner.lock().kernfs_inode.clone()
+        self.kobj_data.lock().kern_inode.clone()
     }
 
     fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
-        self.inner.lock().kernfs_inode = inode;
+        self.kobj_data.lock().kern_inode = inode;
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.inner.lock().ktype
+        self.kobj_data.lock().kobj_type
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
-        self.inner.lock().ktype = ktype
+        self.kobj_data.lock().kobj_type = ktype
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {
-        self.inner.lock().kset.clone()
+        self.kobj_data.lock().kset.clone()
     }
 
     fn kobj_state(
@@ -181,19 +153,19 @@ impl KObject for PciBusDevice {
     }
 
     fn name(&self) -> String {
-        self.inner.lock().name.clone()
+        self.name.clone()
     }
 
-    fn set_name(&self, name: String) {
-        self.inner.lock().name = name;
+    fn set_name(&self, _name: String) {
+        //do nothing; it's not supposed to change this struct's name
     }
 
     fn set_kset(&self, kset: Option<Arc<KSet>>) {
-        self.inner.lock().kset = kset;
+        self.kobj_data.lock().kset = kset;
     }
 
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
-        self.inner.lock().parent = parent;
+        self.kobj_data.lock().parent = parent;
     }
 }
 
@@ -207,15 +179,15 @@ impl Device for PciBusDevice {
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {
-        self.inner.lock().bus.clone()
+        self.device_data.lock().bus.clone()
     }
 
     fn set_bus(&self, bus: Option<alloc::sync::Weak<dyn Bus>>) {
-        self.inner.lock().bus = bus
+        self.device_data.lock().bus = bus
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
-        self.inner.lock().driver.clone()?.upgrade()
+        self.device_data.lock().driver.clone()?.upgrade()
     }
 
     fn is_dead(&self) -> bool {
@@ -223,7 +195,7 @@ impl Device for PciBusDevice {
     }
 
     fn set_driver(&self, driver: Option<alloc::sync::Weak<dyn Driver>>) {
-        self.inner.lock().driver = driver;
+        self.device_data.lock().driver = driver;
     }
 
     fn can_match(&self) -> bool {
@@ -240,54 +212,5 @@ impl Device for PciBusDevice {
 
     fn state_synced(&self) -> bool {
         todo!()
-    }
-}
-
-/// #结构功能
-/// 由于每个PciDevice都需要一些共有的结构，所以这里将其抽象出来作为一个结构
-#[derive(Debug)]
-pub struct InnerPciDevice {
-    /// 设备所在的总线
-    bus: Option<Weak<dyn Bus>>,
-    /// 设备的名称
-    pub name: Option<String>,
-    /// 设备的类
-    pub class: Option<Weak<dyn Class>>,
-    /// 设备绑定的驱动
-    pub driver: Option<Weak<dyn Driver>>,
-    pub kern_inode: Option<Arc<KernFSInode>>,
-    pub parent: Option<Weak<dyn KObject>>,
-    pub kset: Option<Arc<KSet>>,
-    pub kobj_type: Option<&'static dyn KObjType>,
-}
-
-impl InnerPciDevice {
-    pub fn default() -> Self {
-        Self {
-            bus: None,
-            class: None,
-            name: None,
-            driver: None,
-            kern_inode: None,
-            parent: None,
-            kset: None,
-            kobj_type: None,
-        }
-    }
-
-    pub fn bus(&self) -> Option<Weak<dyn Bus>> {
-        self.bus.clone()
-    }
-
-    pub fn set_bus(&mut self, bus: Option<Weak<dyn Bus>>) {
-        self.bus = bus
-    }
-
-    pub fn set_class(&mut self, class: Option<Weak<dyn Class>>) {
-        self.class = class
-    }
-
-    pub fn set_driver(&mut self, driver: Option<Weak<dyn Driver>>) {
-        self.driver = driver
     }
 }

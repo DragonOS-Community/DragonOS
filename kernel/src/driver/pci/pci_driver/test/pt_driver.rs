@@ -7,55 +7,48 @@ use alloc::{
 use crate::{
     driver::{
         base::{
-            device::{bus::Bus, driver::Driver, Device, IdTable},
-            kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+            device::{
+                bus::Bus,
+                driver::{Driver, DriverCommonData},
+                Device, IdTable,
+            },
+            kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        pci::pci_driver::{
-            dev_id::PciDeviceID,
-            device::PciDevice,
-            driver::{InnerPciDriver, PciDriver},
-        },
+        pci::pci_driver::{dev_id::PciDeviceID, device::PciDevice, driver::PciDriver},
     },
     filesystem::kernfs::KernFSInode,
-    libs::{
-        rwlock::{RwLockReadGuard, RwLockWriteGuard},
-        spinlock::SpinLock,
-    },
+    libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 #[derive(Debug)]
 #[cast_to([sync] PciDriver)]
 pub struct TestDriver {
-    inner: SpinLock<InnerPciDriver>,
+    driver_data: RwLock<DriverCommonData>,
+    kobj_data: RwLock<KObjectCommonData>,
     kobj_state: LockedKObjectState,
+    pub locked_dynid_list: RwLock<Vec<Arc<PciDeviceID>>>,
 }
 
 impl TestDriver {
     pub fn new() -> Self {
         Self {
-            inner: SpinLock::new(InnerPciDriver {
-                ktype: None,
-                kset: None,
-                parent: None,
-                kernfs_inode: None,
-                devices: Vec::new(),
-                bus: None,
-                locked_dynid_list: Vec::new(),
-            }),
-
+            driver_data: RwLock::new(DriverCommonData::default()),
+            kobj_data: RwLock::new(KObjectCommonData::default()),
             kobj_state: LockedKObjectState::new(None),
+            locked_dynid_list: RwLock::new(vec![]),
         }
     }
 }
 
 impl PciDriver for TestDriver {
     fn add_dynid(&mut self, id: PciDeviceID) -> Result<(), system_error::SystemError> {
-        self.inner.lock().insert_id(id);
+        let id = Arc::new(id);
+        self.locked_dynid_list.write().push(id);
         Ok(())
     }
 
     fn locked_dynid_list(&self) -> Option<Vec<Arc<PciDeviceID>>> {
-        Some(self.inner.lock().id_list().clone())
+        Some(self.locked_dynid_list.read().clone())
     }
 
     fn probe(
@@ -89,11 +82,11 @@ impl Driver for TestDriver {
     }
 
     fn devices(&self) -> Vec<Arc<dyn Device>> {
-        self.inner.lock().devices.clone()
+        self.driver_data.read().devices.clone()
     }
 
     fn add_device(&self, device: Arc<dyn Device>) {
-        let mut guard = self.inner.lock();
+        let mut guard = self.driver_data.write();
         // check if the device is already in the list
         if guard.devices.iter().any(|dev| Arc::ptr_eq(dev, &device)) {
             return;
@@ -103,16 +96,16 @@ impl Driver for TestDriver {
     }
 
     fn delete_device(&self, device: &Arc<dyn Device>) {
-        let mut guard = self.inner.lock();
+        let mut guard = self.driver_data.write();
         guard.devices.retain(|dev| !Arc::ptr_eq(dev, device));
     }
 
     fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
-        self.inner.lock().bus = bus;
+        self.driver_data.write().bus = bus;
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {
-        self.inner.lock().bus.clone()
+        self.driver_data.read().bus.clone()
     }
 }
 
@@ -122,35 +115,35 @@ impl KObject for TestDriver {
     }
 
     fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
-        self.inner.lock().kernfs_inode = inode;
+        self.kobj_data.write().kern_inode = inode;
     }
 
     fn inode(&self) -> Option<Arc<KernFSInode>> {
-        self.inner.lock().kernfs_inode.clone()
+        self.kobj_data.read().kern_inode.clone()
     }
 
     fn parent(&self) -> Option<Weak<dyn KObject>> {
-        self.inner.lock().parent.clone()
+        self.kobj_data.read().parent.clone()
     }
 
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
-        self.inner.lock().parent = parent;
+        self.kobj_data.write().parent = parent;
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {
-        self.inner.lock().kset.clone()
+        self.kobj_data.read().kset.clone()
     }
 
     fn set_kset(&self, kset: Option<Arc<KSet>>) {
-        self.inner.lock().kset = kset;
+        self.kobj_data.write().kset = kset;
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.inner.lock().ktype
+        self.kobj_data.read().kobj_type
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
-        self.inner.lock().ktype = ktype;
+        self.kobj_data.write().kobj_type = ktype;
     }
 
     fn name(&self) -> String {

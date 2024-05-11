@@ -10,14 +10,11 @@ use crate::{
     driver::{
         base::{
             class::Class,
-            device::{bus::Bus, driver::Driver, Device, DeviceType, IdTable},
-            kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+            device::{bus::Bus, driver::Driver, Device, DeviceCommonData, DeviceType, IdTable},
+            kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        pci::pci_driver::{
-            dev_id::PciDeviceID,
-            device::{InnerPciDevice, PciDevice},
-        },
+        pci::pci_driver::{dev_id::PciDeviceID, device::PciDevice},
     },
     filesystem::{
         kernfs::KernFSInode,
@@ -36,16 +33,18 @@ use crate::{
 /// 并通过函数pci_device_manager().device_add（）来将设备进行接入
 ///
 pub struct TestDevice {
-    inner: RwLock<InnerPciDevice>,
+    device_data: RwLock<DeviceCommonData>,
+    kobj_data: RwLock<KObjectCommonData>,
     kobj_state: LockedKObjectState,
 }
 
 impl TestDevice {
     pub fn new() -> Self {
-        let inner = RwLock::new(InnerPciDevice::default());
-
+        let common_dev = RwLock::new(DeviceCommonData::default());
+        let common_kobj = RwLock::new(KObjectCommonData::default());
         Self {
-            inner,
+            device_data: common_dev,
+            kobj_data: common_kobj,
             kobj_state: LockedKObjectState::new(None),
         }
     }
@@ -79,11 +78,11 @@ impl Device for TestDevice {
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {
-        self.inner.read().bus()
+        self.device_data.read().bus.clone()
     }
 
     fn class(&self) -> Option<Arc<dyn Class>> {
-        let mut guard = self.inner.write();
+        let mut guard = self.device_data.write();
         let r = guard.class.clone()?.upgrade();
         if r.is_none() {
             guard.class = None;
@@ -93,7 +92,7 @@ impl Device for TestDevice {
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
-        self.inner.read().driver.clone()?.upgrade()
+        self.device_data.read().driver.clone()?.upgrade()
     }
 
     fn dev_type(&self) -> DeviceType {
@@ -113,7 +112,7 @@ impl Device for TestDevice {
     }
 
     fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
-        self.inner.write().set_bus(bus);
+        self.device_data.write().bus = bus
     }
 
     fn set_can_match(&self, _can_match: bool) {
@@ -121,11 +120,11 @@ impl Device for TestDevice {
     }
 
     fn set_class(&self, class: Option<Weak<dyn Class>>) {
-        self.inner.write().set_class(class)
+        self.device_data.write().class = class
     }
 
     fn set_driver(&self, driver: Option<Weak<dyn Driver>>) {
-        self.inner.write().set_driver(driver)
+        self.device_data.write().driver = driver
     }
 
     fn state_synced(&self) -> bool {
@@ -139,35 +138,35 @@ impl KObject for TestDevice {
     }
 
     fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
-        self.inner.write().kern_inode = inode;
+        self.kobj_data.write().kern_inode = inode;
     }
 
     fn inode(&self) -> Option<Arc<KernFSInode>> {
-        self.inner.read().kern_inode.clone()
+        self.kobj_data.read().kern_inode.clone()
     }
 
     fn parent(&self) -> Option<Weak<dyn KObject>> {
-        self.inner.read().parent.clone()
+        self.kobj_data.read().parent.clone()
     }
 
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
-        self.inner.write().parent = parent;
+        self.kobj_data.write().parent = parent;
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {
-        self.inner.read().kset.clone()
+        self.kobj_data.read().kset.clone()
     }
 
     fn set_kset(&self, kset: Option<Arc<KSet>>) {
-        self.inner.write().kset = kset;
+        self.kobj_data.write().kset = kset;
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.inner.read().kobj_type
+        self.kobj_data.read().kobj_type
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
-        self.inner.write().kobj_type = ktype;
+        self.kobj_data.write().kobj_type = ktype;
     }
 
     fn name(&self) -> String {

@@ -1,10 +1,10 @@
-use alloc::{string::ToString, sync::Arc};
+use alloc::sync::Arc;
 use system_error::SystemError;
 
 use crate::driver::base::{
     device::{
-        bus::{bus_register, Bus, BusState},
-        device_register, sys_devices_kset, DevicePrivateData, IdTable,
+        bus::{bus_register, Bus},
+        device_register, sys_devices_kset,
     },
     kobject::KObject,
 };
@@ -33,13 +33,9 @@ pub fn pci_bus() -> Arc<PciBus> {
 }
 
 pub fn pci_bus_init() -> Result<(), SystemError> {
-    let pci_bus_device: Arc<PciBusDevice> = PciBusDevice::new(
-        DevicePrivateData::new(
-            IdTable::new("pci".to_string(), None),
-            BusState::NotInitialized.into(),
-        ),
-        Some(Arc::downgrade(&(sys_devices_kset() as Arc<dyn KObject>))),
-    );
+    let pci_bus_device: Arc<PciBusDevice> = PciBusDevice::new(Some(Arc::downgrade(
+        &(sys_devices_kset() as Arc<dyn KObject>),
+    )));
     unsafe {
         PCI_BUS_DEVICE = Some(pci_bus_device.clone());
     }

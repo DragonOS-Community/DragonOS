@@ -1,20 +1,9 @@
-use alloc::{
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::{sync::Arc, vec::Vec};
 use system_error::SystemError;
 
-use crate::{
-    driver::base::{
-        device::{
-            bus::Bus,
-            driver::{driver_manager, Driver},
-            Device,
-        },
-        kobject::{KObjType, KObject},
-        kset::KSet,
-    },
-    filesystem::kernfs::KernFSInode,
+use crate::driver::base::device::{
+    bus::Bus,
+    driver::{driver_manager, Driver},
 };
 
 use super::{dev_id::PciDeviceID, device::PciDevice, pci_bus};
@@ -75,27 +64,6 @@ pub trait PciDriver: Driver {
     }
 }
 
-#[derive(Debug)]
-pub struct InnerPciDriver {
-    pub ktype: Option<&'static dyn KObjType>,
-    pub kset: Option<Arc<KSet>>,
-    pub parent: Option<Weak<dyn KObject>>,
-    pub kernfs_inode: Option<Arc<KernFSInode>>,
-    pub devices: Vec<Arc<dyn Device>>,
-    pub bus: Option<Weak<dyn Bus>>,
-    pub locked_dynid_list: Vec<Arc<PciDeviceID>>,
-}
-
-impl InnerPciDriver {
-    pub fn id_list(&self) -> &Vec<Arc<PciDeviceID>> {
-        &self.locked_dynid_list
-    }
-
-    pub fn insert_id(&mut self, id: PciDeviceID) {
-        let arc = Arc::new(id);
-        self.locked_dynid_list.push(arc);
-    }
-}
 pub struct PciDriverManager;
 
 pub fn pci_driver_manager() -> &'static PciDriverManager {

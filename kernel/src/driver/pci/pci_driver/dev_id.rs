@@ -23,6 +23,7 @@ pub struct PciDeviceID {
 }
 
 impl PciDeviceID {
+    #[allow(dead_code)]
     pub fn set_special(&mut self, data: PciSpecifiedData) {
         self.special_data = Some(data);
     }
@@ -95,9 +96,7 @@ impl PciDeviceID {
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Copy, Clone)]
-pub enum PciSpecifiedData {
-    Virtio(),
-}
+pub enum PciSpecifiedData {}
 
 impl PciSpecifiedData {
     pub fn match_dev(&self, data: Option<Self>) -> bool {

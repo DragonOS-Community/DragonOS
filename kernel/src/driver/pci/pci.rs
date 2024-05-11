@@ -1056,6 +1056,7 @@ fn pci_check_bus(bus: u8) -> Result<u8, PciError> {
 #[inline(never)]
 pub fn pci_init() {
     kinfo!("Initializing PCI bus...");
+    pci_bus_init().expect("Failed to init pci bus subsystem");
     if let Err(e) = pci_check_all_buses() {
         kerror!("pci init failed when checking bus because of error: {}", e);
         return;
@@ -1102,7 +1103,7 @@ pub fn pci_init() {
         }
     }
 
-    pci_bus_init().expect("Failed to init pci bus subsystem");
+    
     kinfo!("PCI bus initialized.");
 }
 

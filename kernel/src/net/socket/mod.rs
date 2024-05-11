@@ -304,28 +304,8 @@ impl SocketInode {
     pub unsafe fn inner_no_preempt(&self) -> SpinLockGuard<Box<dyn Socket>> {
         self.0.lock_no_preempt()
     }
-}
 
-impl Drop for SocketInode {
-    fn drop(&mut self) {
-        let mut socket = self.0.lock_no_preempt();
-        for _ in 0..self.1.load(core::sync::atomic::Ordering::SeqCst) {
-            socket.close();
-        }
-    }
-}
-
-impl IndexNode for SocketInode {
-    fn open(
-        &self,
-        _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
-    ) -> Result<(), SystemError> {
-        self.1.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn do_close(&self) -> Result<(), SystemError> {
         let prev_ref_count = self.1.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
         if prev_ref_count == 1 {
             // 最后一次关闭，需要释放
@@ -349,6 +329,29 @@ impl IndexNode for SocketInode {
         }
 
         Ok(())
+    }
+}
+
+impl Drop for SocketInode {
+    fn drop(&mut self) {
+        for _ in 0..self.1.load(core::sync::atomic::Ordering::SeqCst) {
+            let _ = self.do_close();
+        }
+    }
+}
+
+impl IndexNode for SocketInode {
+    fn open(
+        &self,
+        _data: SpinLockGuard<FilePrivateData>,
+        _mode: &FileMode,
+    ) -> Result<(), SystemError> {
+        self.1.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+        self.do_close()
     }
 
     fn read_at(

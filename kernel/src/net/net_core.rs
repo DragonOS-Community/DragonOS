@@ -217,6 +217,9 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
                 if inner_socket.state() == smoltcp::socket::tcp::State::Established {
                     events |= TcpSocket::CAN_CONNECT;
                 }
+                if inner_socket.state() == smoltcp::socket::tcp::State::CloseWait {
+                    events |= EPollEventType::EPOLLHUP.bits() as u64;
+                }
                 handle_guard
                     .get(&global_handle)
                     .unwrap()
@@ -226,13 +229,11 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
             smoltcp::socket::Socket::Dhcpv4(_) => {}
             smoltcp::socket::Socket::Dns(_) => unimplemented!("Dns socket hasn't unimplemented"),
         }
-        drop(handle_guard);
-        let mut handle_guard = HANDLE_MAP.write_irqsave();
-        let handle_item = handle_guard.get_mut(&global_handle).unwrap();
         EventPoll::wakeup_epoll(
             &handle_item.epitems,
             EPollEventType::from_bits_truncate(events as u32),
         )?;
+        drop(handle_guard);
         // crate::kdebug!(
         //     "{} send_event {:?}",
         //     handle,

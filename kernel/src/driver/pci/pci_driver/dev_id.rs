@@ -52,6 +52,7 @@ impl PciDeviceID {
         }
     }
 
+    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/pci/pci.h?fi=pci_match_one_device#195
     pub fn general_match(&self, id: PciDeviceID) -> bool {
         if (self.vendor == id.vendor() || self.vendor == PCI_ANY_ID)
             && (self.device_id == id.device_id() || self.device_id == PCI_ANY_ID)

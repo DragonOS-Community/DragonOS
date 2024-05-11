@@ -1,4 +1,4 @@
-use crate::driver::{input::serio::serio_bus_init, pci::pci_driver::pci_bus_init};
+use crate::driver::input::serio::serio_bus_init;
 use system_error::SystemError;
 
 use super::{
@@ -19,7 +19,6 @@ pub fn driver_init() -> Result<(), SystemError> {
     firmware_init()?;
     hypervisor_init()?;
     platform_bus_init()?;
-    pci_bus_init()?;
     serio_bus_init()?;
     cpu_device_manager().init()?;
 

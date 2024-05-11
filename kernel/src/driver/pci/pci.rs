@@ -6,6 +6,7 @@ use super::pci_irq::{IrqType, PciIrqError};
 use super::raw_device::PciGeneralDevice;
 use super::root::{pci_root_0, PciRoot};
 use crate::arch::{PciArch, TraitPciArch};
+use crate::driver::pci::pci_driver::pci_bus_init;
 use crate::exception::IrqNumber;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -1100,6 +1101,8 @@ pub fn pci_init() {
             HeaderType::Unrecognised(_) => {}
         }
     }
+
+    pci_bus_init().expect("Failed to init pci bus subsystem");
     kinfo!("PCI bus initialized.");
 }
 

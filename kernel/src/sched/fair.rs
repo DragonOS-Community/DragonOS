@@ -1,6 +1,7 @@
 use core::intrinsics::likely;
 use core::intrinsics::unlikely;
 use core::mem::swap;
+use core::ptr;
 use core::sync::atomic::fence;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -150,7 +151,9 @@ impl FairSchedEntity {
     /// 判断是否是进程持有的调度实体
     #[inline]
     pub fn is_task(&self) -> bool {
-        // TODO: 调度组
+        #[cfg(CONFIG_FAIR_GROUP_SCHED)]
+        return self.my_cfs_rq.is_none();
+        #[cfg(not(CONFIG_FAIR_GROUP_SCHED))]
         true
     }
 
@@ -248,14 +251,22 @@ impl FairSchedEntity {
     }
 
     pub fn runnable(&self) -> u64 {
-        if self.is_task() {
+        #[cfg(CONFIG_FAIR_GROUP_SCHED)]
+        {
+            if self.is_task() {
+                return self.on_rq as u64;
+            } else {
+                self.runnable_weight
+            }
+        }
+        #[cfg(not(CONFIG_FAIR_GROUP_SCHED))]
+        {
             return self.on_rq as u64;
-        } else {
-            self.runnable_weight
         }
     }
 
     /// 更新task和其cfsrq的负载均值
+    #[cfg(CONFIG_FAIR_GROUP_SCHED)]
     pub fn propagate_entity_load_avg(&mut self) -> bool {
         if self.is_task() {
             return false;
@@ -279,7 +290,15 @@ impl FairSchedEntity {
         cfs_rq.update_task_group_runnable(self.self_arc(), gcfs_rq);
         cfs_rq.update_task_group_load(self.self_arc(), gcfs_rq);
 
+        // TODO: trace_pelt_cfs_tp
+        // TODO: trace_pelt_se_tp
+
         return true;
+    }
+
+    #[cfg(not(CONFIG_FAIR_GROUP_SCHED))]
+    pub fn propagate_entity_load_avg(&mut self) -> bool {
+        false
     }
 
     /// 更新runnable_weight
@@ -295,6 +314,42 @@ impl FairSchedEntity {
 
         if self.is_task() {
             self.avg.load_avg = LoadWeight::scale_load_down(self.load.weight) as usize;
+        }
+    }
+
+    #[allow(dead_code)]
+    fn attach_entity_cfs_rq(se: Arc<FairSchedEntity>) {
+        let binding = se.cfs_rq();
+        let cfs_rq = binding.force_mut();
+
+        // TODO(pelt): High sched_feat(ATTACH_AGE_LOAD)
+        cfs_rq.update_load_avg(&se, UpdateAvgFlags::ZERO);
+        cfs_rq.attach_entity_load_avg(&se);
+        cfs_rq.update_tg_load_avg();
+        se.propagate_entity_cfs_rq();
+    }
+
+    #[allow(dead_code)]
+    fn detach_entity_cfs_rq(self: &Arc<Self>) {
+        let se = self.clone();
+        let binding = se.cfs_rq();
+        let cfs_rq = binding.force_mut();
+
+        cfs_rq.update_load_avg(&se, UpdateAvgFlags::ZERO);
+        cfs_rq.detach_entity_load_avg(&se);
+        cfs_rq.update_tg_load_avg();
+        se.propagate_entity_cfs_rq();
+    }
+
+    #[allow(dead_code)]
+    fn propagate_entity_cfs_rq(&self) {
+        #[cfg(CONFIG_FAIR_GROUP_SCHED)]
+        {
+            // TODO
+        }
+        #[cfg(not(CONFIG_FAIR_GROUP_SCHED))]
+        {
+            return;
         }
     }
 }
@@ -842,20 +897,24 @@ impl CfsRunQueue {
         let now = self.cfs_rq_clock_pelt();
 
         if se.avg.last_update_time > 0 && !flags.contains(UpdateAvgFlags::SKIP_AGE_LOAD) {
-            se.force_mut().update_load_avg(self, now);
+            se.force_mut().update_self_load_avg(self, now);
         }
 
         let mut decayed = self.update_self_load_avg(now);
         decayed |= se.force_mut().propagate_entity_load_avg() as u32;
 
         if se.avg.last_update_time > 0 && flags.contains(UpdateAvgFlags::DO_ATTACH) {
-            todo!()
-        } else if flags.contains(UpdateAvgFlags::DO_ATTACH) {
+            self.attach_entity_load_avg(se);
+            self.update_tg_load_avg();
+        } else if flags.contains(UpdateAvgFlags::DO_DETACH) {
             self.detach_entity_load_avg(se);
+            self.update_tg_load_avg();
         } else if decayed > 0 {
-            // cfs_rq_util_change
+            self.cfs_rq_util_change(0);
 
-            todo!()
+            if flags.contains(UpdateAvgFlags::UPDATE_TG) {
+                self.update_tg_load_avg();
+            }
         }
     }
 
@@ -880,19 +939,71 @@ impl CfsRunQueue {
             .runnable_sum
             .max((self.avg.runnable_avg * PELT_MIN_DIVIDER) as u64);
 
-        self.propagate = 1;
-        self.prop_runnable_sum += se.avg.load_sum as isize;
+        self.add_tg_cfs_propagate(-(se.avg.load_sum as isize));
+
+        self.cfs_rq_util_change(0);
+
+        // TODO: trace_pelt_cfs_tp
     }
 
-    fn update_self_load_avg(&mut self, now: u64) -> u32 {
+    fn attach_entity_load_avg(&mut self, se: &Arc<FairSchedEntity>) {
+        let divider = self.avg.get_pelt_divider();
+
+        let binding = se.clone();
+        let se = binding.force_mut();
+
+        se.avg.last_update_time = self.avg.last_update_time;
+        se.avg.period_contrib = self.avg.period_contrib;
+
+        se.avg.util_sum = (se.avg.util_avg * divider) as u64;
+
+        se.avg.runnable_sum = (se.avg.runnable_avg * divider) as u64;
+
+        se.avg.load_sum = (se.avg.load_avg * divider) as u64;
+
+        if LoadWeight::scale_load_down(se.load.weight) < se.avg.load_sum {
+            se.avg.load_sum = se
+                .avg
+                .load_sum
+                .checked_div(LoadWeight::scale_load_down(se.load.weight))
+                .unwrap_or(0);
+        } else {
+            se.avg.load_sum = 1;
+        }
+
+        self.enqueue_load_avg(binding.clone());
+        self.avg.util_avg += se.avg.util_avg;
+        self.avg.util_sum += se.avg.util_sum;
+        self.avg.runnable_avg += se.avg.runnable_avg;
+        self.avg.runnable_sum += se.avg.runnable_sum;
+
+        self.add_tg_cfs_propagate(se.avg.load_sum as isize);
+
+        self.cfs_rq_util_change(0);
+
+        // TODO: trace_pelt_cfs_tp
+    }
+
+    #[inline]
+    pub fn load_avg(&self) -> usize {
+        self.avg.load_avg
+    }
+
+    #[inline]
+    pub fn runnable_avg(&self) -> usize {
+        self.avg.runnable_avg
+    }
+
+    #[inline]
+    pub(crate) fn update_self_load_avg(&mut self, now: u64) -> u32 {
         let mut removed_load = 0;
         let mut removed_util = 0;
         let mut removed_runnable = 0;
 
         let mut decayed = 0;
 
-        if self.removed.lock().nr > 0 {
-            let mut removed_guard = self.removed.lock();
+        let mut removed_guard = self.removed.lock();
+        if removed_guard.nr > 0 {
             let divider = self.avg.get_pelt_divider();
 
             swap::<usize>(&mut removed_guard.util_avg, &mut removed_util);
@@ -900,12 +1011,11 @@ impl CfsRunQueue {
             swap::<usize>(&mut removed_guard.runnable_avg, &mut removed_runnable);
 
             removed_guard.nr = 0;
+            drop(removed_guard);
 
             let mut r = removed_load;
-
             sub_positive(&mut self.avg.load_avg, r);
             sub_positive(&mut (self.avg.load_sum as usize), r * divider);
-
             self.avg.load_sum = self
                 .avg
                 .load_sum
@@ -927,19 +1037,43 @@ impl CfsRunQueue {
                 .runnable_sum
                 .max((self.avg.runnable_avg * PELT_MIN_DIVIDER) as u64);
 
-            drop(removed_guard);
             self.add_task_group_propagate(
                 -(removed_runnable as isize * divider as isize) >> SCHED_CAPACITY_SHIFT,
             );
 
             decayed = 1;
+        } else {
+            drop(removed_guard);
         }
 
         decayed |= self.__update_load_avg(now) as u32;
-
-        self.last_update_time_copy = self.avg.last_update_time;
+        // if CONFIG_64BIT: do nothing
+        // self.last_update_time_copy = self.avg.last_update_time;
 
         return decayed;
+    }
+
+    #[cfg(not(CONFIG_FAIR_GROUP_SCHED))]
+    #[inline]
+    fn update_tg_load_avg(&self) {}
+
+    #[cfg(CONFIG_FAIR_GROUP_SCHED)]
+    #[inline]
+    fn add_tg_cfs_propagate(&self, runnable_sum: isize) {
+        self.propagate = 1;
+        self.prop_runnable_sum += runnable_sum;
+    }
+
+    #[cfg(not(CONFIG_FAIR_GROUP_SCHED))]
+    #[inline]
+    fn add_tg_cfs_propagate(&self, _runnable_sum: isize) {}
+
+    #[inline]
+    fn cfs_rq_util_change(&self, flags: u32) {
+        let rq = self.rq();
+        if ptr::eq(rq.cfs_rq().as_ref(), self) {
+            rq.cpufreq_update_util(flags)
+        }
     }
 
     fn __update_load_avg(&mut self, now: u64) -> bool {
@@ -956,10 +1090,16 @@ impl CfsRunQueue {
         return false;
     }
 
+    #[cfg(CONFIG_FAIR_GROUP_SCHED)]
+    #[inline]
     fn add_task_group_propagate(&mut self, runnable_sum: isize) {
         self.propagate = 1;
         self.prop_runnable_sum += runnable_sum;
     }
+
+    #[cfg(not(CONFIG_FAIR_GROUP_SCHED))]
+    #[inline]
+    fn add_task_group_propagate(&mut self, _runnable_sum: isize) {}
 
     /// 将实体加入队列
     pub fn enqueue_entity(&mut self, se: &Arc<FairSchedEntity>, flags: EnqueueFlag) {
@@ -1050,7 +1190,9 @@ impl CfsRunQueue {
         }
 
         if prev.on_rq() {
+            // TODO: update_stats_wait_start_fair
             self.inner_enqueue_entity(&prev);
+            self.update_load_avg(&prev, UpdateAvgFlags::ZERO);
         }
 
         self.set_current(Weak::default());
@@ -1061,6 +1203,7 @@ impl CfsRunQueue {
         self.clear_buddies(se);
 
         if se.on_rq() {
+            // TODO: update_stats_wait_start_fair
             self.inner_dequeue_entity(se);
             self.update_load_avg(se, UpdateAvgFlags::UPDATE_TG);
             se.force_mut().vlag = se.deadline as i64;
@@ -1364,6 +1507,12 @@ impl CfsRunQueue {
 
         return avg >= self.entity_key(se) * load;
     }
+
+    #[cfg(not(CONFIG_NO_HZ_COMMON))]
+    #[inline]
+    pub(crate) fn cfs_rq_has_blocked(&self) -> bool {
+        false
+    }
 }
 
 pub struct CompletelyFairScheduler;
@@ -1388,6 +1537,25 @@ impl CompletelyFairScheduler {
             *se = se.parent().unwrap();
             *pse = pse.parent().unwrap();
         }
+    }
+
+    pub(crate) fn task_dead(p: Arc<ProcessControlBlock>) {
+        p.sched_info()
+            .sched_entity()
+            .force_mut()
+            .remove_entity_load_avg()
+    }
+
+    #[allow(dead_code)]
+    fn migrate_task_rq(p: Arc<ProcessControlBlock>, _new_cpu: x86::cpuid::CpuId) {
+        // TODO
+
+        p.sched_info()
+            .sched_entity()
+            .force_mut()
+            .remove_entity_load_avg();
+
+        // TODO
     }
 }
 

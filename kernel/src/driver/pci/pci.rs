@@ -1,9 +1,13 @@
 #![allow(dead_code)]
 // 目前仅支持单主桥单Segment
 
+use super::device::pci_device_manager;
 use super::pci_irq::{IrqType, PciIrqError};
+use super::raw_device::PciGeneralDevice;
 use super::root::{pci_root_0, PciRoot};
+
 use crate::arch::{PciArch, TraitPciArch};
+use crate::driver::pci::subsys::pci_bus_subsys_init;
 use crate::exception::IrqNumber;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -11,6 +15,7 @@ use crate::mm::mmio_buddy::{mmio_pool, MMIOSpaceGuard};
 
 use crate::mm::VirtAddr;
 use crate::{kdebug, kerror, kinfo, kwarn};
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::{boxed::Box, collections::LinkedList};
@@ -716,11 +721,18 @@ fn pci_read_header(
     };
     match HeaderType::from(header_type & 0x7f) {
         HeaderType::Standard => {
-            let general_device = pci_read_general_device_header(header, &bus_device_function);
-            let box_general_device = Box::new(general_device);
+            let general_device: PciDeviceStructureGeneralDevice =
+                pci_read_general_device_header(header, &bus_device_function);
+            let box_general_device = Box::new(general_device.clone());
             let box_general_device_clone = box_general_device.clone();
             if add_to_list {
                 PCI_DEVICE_LINKEDLIST.add(box_general_device);
+                //这里实际上不应该使用clone，因为raw是用于sysfs的结构，但是实际上pci设备是在PCI_DEVICE_LINKEDLIST链表上的，
+                //这就导致sysfs呈现的对pci设备的操控接口实际上操控的是pci设备描述符是一个副本
+                //但是无奈这里没有使用Arc
+                //todo：修改pci设备描述符在静态链表中存在的方式，并修改这里的clone操作
+                let raw = PciGeneralDevice::from(&general_device);
+                let _ = pci_device_manager().device_add(Arc::new(raw));
             }
             Ok(box_general_device_clone)
         }
@@ -1045,6 +1057,7 @@ fn pci_check_bus(bus: u8) -> Result<u8, PciError> {
 #[inline(never)]
 pub fn pci_init() {
     kinfo!("Initializing PCI bus...");
+    pci_bus_subsys_init().expect("Failed to init pci bus subsystem");
     if let Err(e) = pci_check_all_buses() {
         kerror!("pci init failed when checking bus because of error: {}", e);
         return;
@@ -1090,6 +1103,7 @@ pub fn pci_init() {
             HeaderType::Unrecognised(_) => {}
         }
     }
+
     kinfo!("PCI bus initialized.");
 }
 
@@ -1112,6 +1126,19 @@ impl BusDeviceFunction {
     #[allow(dead_code)]
     pub fn valid(&self) -> bool {
         self.device < 32 && self.function < 8
+    }
+}
+
+impl From<BusDeviceFunction> for String {
+    /// # 函数的功能
+    /// 这里提供一个由BusDeviceFunction到dddd:bb:vv.f字符串的转换函数，主要用于转换成设备的名称（pci设备的名称一般是诸如0000:00:00.1这种)
+    fn from(value: BusDeviceFunction) -> Self {
+        //需要注意，这里的0000应该是所谓的“域号”（Domain ID），但是尚不知道是如何获得的，故硬编码在这里
+        //todo：实现域号的获取
+        format!(
+            "0000:{:02x}:{:02x}.{}",
+            value.bus, value.device, value.function
+        )
     }
 }
 ///实现BusDeviceFunction的Display trait，使其可以直接输出

@@ -4,6 +4,7 @@ use core::{
 };
 
 use alloc::string::ToString;
+use log::{info, Log};
 
 use super::lib_ui::textui::{textui_putstr, FontColor};
 
@@ -128,4 +129,43 @@ impl Logger {
             unsafe { KMSG.as_ref().unwrap().lock_irqsave().push(log_message) };
         }
     }
+}
+
+/// 内核自定义日志器
+///
+/// todo: 完善他的功能，并且逐步把kinfo等宏，迁移到这个logger上面来。
+struct CustomLogger;
+
+impl Log for CustomLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        // 这里可以自定义日志过滤规则
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            // todo: 接入kmsg
+
+            writeln!(
+                PrintkWriter,
+                "[ {} ] {} ({}:{}) {}",
+                record.level(),
+                record.target(),
+                record.file().unwrap_or(""),
+                record.line().unwrap_or(0),
+                record.args()
+            )
+            .unwrap();
+        }
+    }
+
+    fn flush(&self) {
+        // 如果需要的话，可以在这里实现缓冲区刷新逻辑
+    }
+}
+
+pub fn early_init_logging() {
+    log::set_logger(&CustomLogger).unwrap();
+    log::set_max_level(log::LevelFilter::Debug);
+    info!("Logging initialized");
 }

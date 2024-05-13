@@ -227,16 +227,23 @@ pub fn x86_vector_domain() -> &'static Arc<IrqDomain> {
 
 #[inline(never)]
 pub fn arch_early_irq_init() -> Result<(), SystemError> {
+    const IRQ_SIZE: u32 = 223;
     let vec_domain = irq_domain_manager()
         .create_and_add(
             "VECTOR".to_string(),
             &X86VectorDomainOps,
             IrqNumber::new(32),
             HardwareIrqNumber::new(32),
-            223,
+            IRQ_SIZE,
         )
         .ok_or(SystemError::ENOMEM)?;
     irq_domain_manager().set_default_domain(vec_domain.clone());
+    irq_domain_manager().domain_associate_many(
+        &vec_domain,
+        IrqNumber::new(0),
+        HardwareIrqNumber::new(0),
+        IRQ_SIZE,
+    );
     unsafe { X86_VECTOR_DOMAIN = Some(vec_domain) };
 
     let apic_chip = Arc::new(LocalApicChip::new());

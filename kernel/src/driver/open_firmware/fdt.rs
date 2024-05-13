@@ -76,7 +76,7 @@ impl OpenFirmwareFdtDriver {
 
     /// 获取FDT的引用
     pub fn fdt_ref(&self) -> Result<Fdt<'static>, SystemError> {
-        let fdt_vaddr = boot_params().read().fdt().unwrap();
+        let fdt_vaddr = boot_params().read().fdt().ok_or(SystemError::ENODEV)?;
         let fdt: Fdt<'_> = unsafe {
             fdt::Fdt::from_ptr(fdt_vaddr.as_ptr()).map_err(|e| {
                 kerror!("failed to parse fdt, err={:?}", e);
@@ -213,10 +213,7 @@ impl OpenFirmwareFdtDriver {
         use crate::{
             arch::MMArch,
             libs::align::page_align_down,
-            mm::{
-                memblock::{mem_block_manager, MemBlockManager},
-                MemoryManagementArch, PhysAddr,
-            },
+            mm::{memblock::MemBlockManager, MemoryManagementArch},
         };
 
         let mut base = base as usize;
@@ -380,6 +377,20 @@ impl OpenFirmwareFdtDriver {
         }
 
         return mem_block_manager().reserve_block(base, size);
+    }
+
+    pub fn find_node_by_compatible<'b>(
+        &self,
+        fdt: &'b Fdt<'b>,
+        compatible: &'b str,
+    ) -> impl Iterator<Item = fdt::node::FdtNode<'b, 'b>> + 'b {
+        // compatible = compatible.trim();
+        let r = fdt.all_nodes().filter(move |x| {
+            x.compatible()
+                .is_some_and(|x| x.all().any(|x| x == compatible))
+        });
+
+        return r;
     }
 }
 

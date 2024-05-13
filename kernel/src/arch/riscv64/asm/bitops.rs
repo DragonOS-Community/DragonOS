@@ -4,6 +4,7 @@
 /// @param x 目标u64
 /// @return i32 bit-number(0..63) of the first (least significant) zero bit.
 #[inline]
+#[allow(dead_code)]
 pub fn ffz(x: u64) -> i32 {
     (!x).trailing_zeros() as i32
 }

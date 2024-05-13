@@ -5,7 +5,7 @@ use x86::msr::{
     IA32_X2APIC_VERSION,
 };
 
-use crate::{kdebug, kinfo};
+use crate::kinfo;
 
 use super::{hw_irq::ApicId, LVTRegister, LocalAPIC, LVT};
 
@@ -55,9 +55,9 @@ impl LocalAPIC for X2Apic {
                     kinfo!("x2APIC EOI broadcast suppression enabled.");
                 }
             }
-            kdebug!("x2apic: to mask all lvt");
+            // kdebug!("x2apic: to mask all lvt");
             self.mask_all_lvt();
-            kdebug!("x2apic: all lvt masked");
+            // kdebug!("x2apic: all lvt masked");
         }
         true
     }

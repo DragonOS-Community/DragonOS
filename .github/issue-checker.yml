@@ -1,0 +1,62 @@
+default-mode:
+  add:
+  remove: [pull_request_target, issues]
+labels:
+# skips and removes
+- name: skip all
+  content:
+  regexes: '[Ss]kip (?:[Aa]ll |)[Ll]abels?'
+- name: remove all
+  content:
+  regexes: '[Rr]emove (?:[Aa]ll |)[Ll]abels?'
+- name: skip ambiguous
+  content:
+  regexes: '[Ss]kip (?:[Ll]abels? |)(?:`|)ambiguous(?:`|)'
+- name: remove ambiguous
+  content:
+  regexes: '[Rr]emove (?:[Ll]abels? |)(?:`|)ambiguous(?:`|)'
+# `feature`
+- name: enhance
+  content: enhancement
+  regexes: '[Ff]eat(?:\([a-zA-Z]*/?[a-zA-Z]*\))?[\:\.\,]'
+  skip-if:
+  - skip all
+  remove-if:
+  - remove all
+# `Bug fix`
+- name: bug-fix
+  content: Bug fix
+  regexes: '[Ff]ix(?:\([a-zA-Z]*/?[a-zA-Z]*\))?[\:\.\,]'
+  skip-if:
+  - skip all
+  remove-if:
+  - remove all
+# `document`
+- name: doc
+  content: documentation
+  regexes: '[Dd]ocs(?:\([a-zA-Z]*/?[a-zA-Z]*\))?[\:\.\,]'
+  skip-if:
+  - skip all
+  remove-if:
+  - remove all
+# `test`
+- name: test
+  content: test
+  regexes: '[Tt]est(?:\([a-zA-Z]*/?[a-zA-Z]*\))?[\:\.\,]'
+  skip-if:
+  - skip all
+  remove-if:
+  - remove all
+# `ambiguous`
+- name: pr-ambiguous
+  # 不符合 commitizen 的 PR
+  content: ambiguous
+  regexes: '^(?!(?:build|chore|ci|docs?|feat|fix|perf|refactor|rft|style|test)(?:\([a-zA-Z]*\))?[\:\.\(\,]|[Rr]evert|[Rr]elease)'
+  mode:
+    pull_request_target:
+  skip-if:
+  - skip all
+  - skip ambiguous
+  remove-if:
+  - remove all
+  - remove ambiguous

@@ -28,6 +28,7 @@ impl OpenFirmwareFdtDriver {
 
         // drop the boot params guard in order to avoid deadlock
         drop(bp_guard);
+        // kdebug!("map_fdt: map fdt to {:?}, size: {}", map_paddr, map_size);
         mmio_guard.map_phys(map_paddr, map_size)?;
         let mut bp_guard = boot_params().write();
         let vaddr = mmio_guard.vaddr() + offset;

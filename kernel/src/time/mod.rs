@@ -6,7 +6,7 @@ use core::{
 
 use crate::arch::CurrentTimeArch;
 
-use self::{timekeep::ktime_get_real_ns, timekeeping::getnstimeofday};
+use self::timekeeping::getnstimeofday;
 
 pub mod clocksource;
 pub mod jiffies;
@@ -42,6 +42,9 @@ pub const USEC_PER_SEC: u32 = 1000000;
 pub const NSEC_PER_SEC: u32 = 1000000000;
 #[allow(dead_code)]
 pub const FSEC_PER_SEC: u64 = 1000000000000000;
+
+/// The clock frequency of the i8253/i8254 PIT
+pub const PIT_TICK_RATE: u64 = 1193182;
 
 /// 表示时间的结构体，符合POSIX标准。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -225,7 +228,8 @@ impl Instant {
 
     /// Create a new `Instant` from the current time
     pub fn now() -> Instant {
-        Self::from_micros(ktime_get_real_ns() / 1000)
+        let tm = getnstimeofday();
+        Self::from_micros(tm.tv_sec * 1000000 + tm.tv_nsec / 1000)
     }
 
     /// The fractional number of milliseconds that have passed

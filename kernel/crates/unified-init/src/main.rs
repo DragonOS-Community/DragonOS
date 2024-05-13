@@ -7,6 +7,13 @@ fn main() {
     todo!()
 }
 
+#[cfg(target_os = "none")]
+#[panic_handler]
+#[no_mangle]
+pub fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+
 #[cfg(test)]
 mod tests {
     use system_error::SystemError;

@@ -112,7 +112,7 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
     arch_boot_params_guard.arch.fdt_paddr = fdt_paddr;
     arch_boot_params_guard.arch.fdt_size = fdt.total_size();
     arch_boot_params_guard.arch.boot_hartid = ProcessorId::new(hartid);
-
+    // kdebug!("fdt_paddr: {:?}, fdt_size: {}", fdt_paddr, fdt.total_size());
     drop(arch_boot_params_guard);
 
     kinfo!(

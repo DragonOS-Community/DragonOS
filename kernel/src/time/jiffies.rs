@@ -75,6 +75,8 @@ impl ClocksourceJiffies {
             max_idle_ns: Default::default(),
             flags: ClocksourceFlags::new(0),
             watchdog_last: CycleNum::new(0),
+            uncertainty_margin: 0,
+            maxadj: 0,
         };
         let jiffies = Arc::new(ClocksourceJiffies(SpinLock::new(InnerJiffies {
             data,
@@ -92,7 +94,7 @@ pub fn clocksource_default_clock() -> Arc<ClocksourceJiffies> {
 pub fn jiffies_init() {
     //注册jiffies
     let jiffies = clocksource_default_clock() as Arc<dyn Clocksource>;
-    match jiffies.register() {
+    match jiffies.register(1, 0) {
         Ok(_) => {
             kinfo!("jiffies_init sccessfully");
         }

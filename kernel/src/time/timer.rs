@@ -357,6 +357,15 @@ pub fn timer_get_first_expire() -> Result<u64, SystemError> {
     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
 }
 
+/// 检查是否需要触发定时器软中断，如果需要则触发
+pub fn try_raise_timer_softirq() {
+    if let Ok(first_expire) = timer_get_first_expire() {
+        if first_expire <= clock() {
+            softirq_vectors().raise_softirq(SoftirqNumber::TIMER);
+        }
+    }
+}
+
 /// 更新系统时间片
 pub fn update_timer_jiffies(add_jiffies: u64, time_us: i64) -> u64 {
     let prev = TIMER_JIFFIES.fetch_add(add_jiffies, Ordering::SeqCst);

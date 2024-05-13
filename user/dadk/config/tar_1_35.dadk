@@ -20,5 +20,6 @@
   "clean": {
     "clean_command": null
   },
-  "envs": []
+  "envs": [],
+  "target_arch": ["x86_64"]
 }

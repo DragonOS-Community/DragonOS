@@ -16,7 +16,10 @@ use crate::{
     libs::{rwlock::RwLockWriteGuard, spinlock::SpinLock},
 };
 
-use super::{dev_id::PciDeviceID, pci_bus, pci_bus_device};
+use super::{
+    dev_id::PciDeviceID,
+    subsys::{pci_bus, pci_bus_device},
+};
 
 /// # 结构功能
 /// 该结构为Pci设备的管理器，使用该结构可以将pci设备添加到sysfs中

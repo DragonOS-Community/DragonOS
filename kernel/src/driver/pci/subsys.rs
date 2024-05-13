@@ -7,13 +7,51 @@ use system_error::SystemError;
 
 use crate::{
     driver::base::{
-        device::{bus::Bus, driver::Driver, Device},
+        device::{
+            bus::{bus_register, Bus},
+            device_register,
+            driver::Driver,
+            sys_devices_kset, Device,
+        },
+        kobject::KObject,
         subsys::SubSysPrivate,
     },
     filesystem::sysfs::AttributeGroup,
 };
 
-use super::{device::PciDevice, driver::PciDriver};
+use super::{
+    device::{PciBusDevice, PciDevice},
+    driver::PciDriver,
+    test::pt_init,
+};
+
+static mut PCI_BUS_DEVICE: Option<Arc<PciBusDevice>> = None;
+static mut PCI_BUS: Option<Arc<PciBus>> = None;
+
+pub(super) fn set_pci_bus_device(device: Arc<PciBusDevice>) {
+    unsafe {
+        PCI_BUS_DEVICE = Some(device);
+    }
+}
+
+pub(super) fn set_pci_bus(bus: Arc<PciBus>) {
+    unsafe {
+        PCI_BUS = Some(bus);
+    }
+}
+
+pub fn pci_bus_device() -> Arc<PciBusDevice> {
+    unsafe {
+        return PCI_BUS_DEVICE.clone().unwrap();
+    }
+}
+
+pub fn pci_bus() -> Arc<PciBus> {
+    unsafe {
+        return PCI_BUS.clone().unwrap();
+    }
+}
+
 /// # 结构功能
 /// 该结构为Pci总线，由于总线也属于设备，故设此结构；
 /// 此结构对应/sys/bus/pci
@@ -133,4 +171,20 @@ impl AttributeGroup for PciDeviceAttrGroup {
     ) -> Option<crate::filesystem::vfs::syscall::ModeType> {
         return Some(attr.mode());
     }
+}
+
+pub(super) fn pci_bus_subsys_init() -> Result<(), SystemError> {
+    let pci_bus_device: Arc<PciBusDevice> = PciBusDevice::new(Some(Arc::downgrade(
+        &(sys_devices_kset() as Arc<dyn KObject>),
+    )));
+
+    set_pci_bus_device(pci_bus_device.clone());
+
+    device_register(pci_bus_device.clone())?;
+    let pci_bus = PciBus::new();
+
+    set_pci_bus(pci_bus.clone());
+    let r = bus_register(pci_bus.clone() as Arc<dyn Bus>);
+    pt_init()?;
+    return r;
 }

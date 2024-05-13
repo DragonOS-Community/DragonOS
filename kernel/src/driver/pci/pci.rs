@@ -5,8 +5,9 @@ use super::device::pci_device_manager;
 use super::pci_irq::{IrqType, PciIrqError};
 use super::raw_device::PciGeneralDevice;
 use super::root::{pci_root_0, PciRoot};
+
 use crate::arch::{PciArch, TraitPciArch};
-use crate::driver::pci::pci_bus_init;
+use crate::driver::pci::subsys::pci_bus_subsys_init;
 use crate::exception::IrqNumber;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -1056,7 +1057,7 @@ fn pci_check_bus(bus: u8) -> Result<u8, PciError> {
 #[inline(never)]
 pub fn pci_init() {
     kinfo!("Initializing PCI bus...");
-    pci_bus_init().expect("Failed to init pci bus subsystem");
+    pci_bus_subsys_init().expect("Failed to init pci bus subsystem");
     if let Err(e) = pci_check_all_buses() {
         kerror!("pci init failed when checking bus because of error: {}", e);
         return;

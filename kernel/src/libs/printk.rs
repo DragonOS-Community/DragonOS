@@ -161,7 +161,7 @@ impl CustomLogger {
             Level::Debug|Level::Info =>{
                 write!(
                     PrintkWriter,
-                    "[ {} ]",
+                    "[ {} ] ",
                     record.level(),
                 )
             },
@@ -183,7 +183,7 @@ impl CustomLogger {
         }.unwrap();
         writeln!(
             PrintkWriter,
-            "({}:{}) {}",
+            "({}:{})\t {}",
                 record.file().unwrap_or(""),
                 record.line().unwrap_or(0),
                 record.args()

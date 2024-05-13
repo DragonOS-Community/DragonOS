@@ -1,5 +1,5 @@
 use super::smp::SMP_BOOT_DATA;
-use crate::{driver::acpi::acpi_manager, kinfo, mm::percpu::PerCpu, smp::cpu::ProcessorId};
+use crate::{driver::acpi::acpi_manager, mm::percpu::PerCpu, smp::cpu::ProcessorId};
 use log::info;
 use system_error::SystemError;
 

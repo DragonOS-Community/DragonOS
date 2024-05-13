@@ -14,7 +14,6 @@ use system_error::SystemError;
 use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
-    kdebug, kinfo,
     libs::rwlock::RwLock,
     mm::percpu::{PerCpu, PerCpuVar},
     process::ProcessManager,

@@ -11,7 +11,6 @@ use crate::exception::irqdesc::{
 use crate::exception::manage::irq_manager;
 use crate::exception::IrqNumber;
 
-use crate::kdebug;
 use crate::mm::percpu::PerCpu;
 use crate::process::ProcessManager;
 use crate::smp::core::smp_get_processor_id;
@@ -224,8 +223,7 @@ impl LocalApicTimer {
     fn install_periodic_mode(&mut self, initial_count: u64, divisor: u32) {
         debug!(
             "install_periodic_mode: initial_count = {}, divisor = {}",
-            initial_count,
-            divisor
+            initial_count, divisor
         );
         self.mode = LocalApicTimerMode::Periodic;
         self.set_divisor(divisor);

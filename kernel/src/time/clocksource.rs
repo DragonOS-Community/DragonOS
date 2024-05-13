@@ -18,7 +18,7 @@ use unified_init::macros::unified_init;
 use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
-    init::initcall::INITCALL_LATE, kinfo,
+    init::initcall::INITCALL_LATE,
     libs::spinlock::SpinLock,
     process::{
         kthread::{KernelThreadClosure, KernelThreadMechanism},
@@ -475,8 +475,7 @@ impl dyn Clocksource {
         // 打印出unstable的时钟源信息
         debug!(
             "clocksource :{:?} is unstable, its delta is {:?}",
-            cs_data.name,
-            delta
+            cs_data.name, delta
         );
         cs_data.flags.remove(
             ClocksourceFlags::CLOCK_SOURCE_VALID_FOR_HRES | ClocksourceFlags::CLOCK_SOURCE_WATCHDOG,

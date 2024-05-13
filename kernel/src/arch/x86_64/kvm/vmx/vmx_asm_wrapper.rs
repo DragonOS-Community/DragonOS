@@ -1,5 +1,5 @@
 use super::vmcs::VmcsFields;
-use crate::kdebug;
+
 use core::arch::asm;
 use log::debug;
 use system_error::SystemError;

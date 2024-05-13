@@ -12,13 +12,13 @@ use elf::{
     file::FileHeader,
     segment::ProgramHeader,
 };
+use log::error;
 use system_error::SystemError;
 
 use crate::{
     arch::{CurrentElfArch, MMArch},
     driver::base::block::SeekFrom,
     filesystem::vfs::file::File,
-    kerror,
     libs::align::page_align_up,
     mm::{
         allocator::page_frame::{PageFrameCount, VirtPageFrame},
@@ -135,7 +135,7 @@ impl ElfLoader {
             );
             // debug!("set_elf_brk: map_anonymous: r={:?}", r);
             if r.is_err() {
-                kerror!("set_elf_brk: map_anonymous failed, err={:?}", r);
+                error!("set_elf_brk: map_anonymous failed, err={:?}", r);
                 return Err(ExecError::OutOfMemory);
             }
         }
@@ -228,7 +228,7 @@ impl ElfLoader {
 
         let map_err_handler = |err: SystemError| {
             if err == SystemError::EEXIST {
-                kerror!(
+                error!(
                     "Pid: {:?}, elf segment at {:p} overlaps with existing mapping",
                     ProcessManager::current_pcb().pid(),
                     addr_to_map.as_ptr::<u8>()
@@ -704,7 +704,7 @@ impl BinaryLoader for ElfLoader {
                     total_size,
                 )
                 .map_err(|e| {
-                    kerror!("load_elf_segment failed: {:?}", e);
+                    error!("load_elf_segment failed: {:?}", e);
                     match e {
                         SystemError::EFAULT => ExecError::BadAddress(None),
                         SystemError::ENOMEM => ExecError::OutOfMemory,

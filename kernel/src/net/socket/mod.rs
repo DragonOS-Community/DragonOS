@@ -8,6 +8,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use log::warn;
 use smoltcp::{
     iface::SocketSet,
     socket::{self, raw, tcp, udp},
@@ -227,7 +228,7 @@ pub trait Socket: Sync + Send + Debug + Any {
         _optname: usize,
         _optval: &[u8],
     ) -> Result<(), SystemError> {
-        kwarn!("setsockopt is not implemented");
+        warn!("setsockopt is not implemented");
         Ok(())
     }
 

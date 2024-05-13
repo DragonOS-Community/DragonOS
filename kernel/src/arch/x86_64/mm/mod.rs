@@ -6,7 +6,7 @@ pub mod pkru;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashSet;
-use log::{debug, info};
+use log::{debug, info, warn};
 use x86::time::rdtsc;
 use x86_64::registers::model_specific::EferFlags;
 
@@ -30,7 +30,7 @@ use crate::{
 use crate::mm::kernel_mapper::KernelMapper;
 use crate::mm::page::{PageEntry, PageFlags, PAGE_1G_SHIFT};
 use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr};
-use crate::{kdebug, kinfo, kwarn};
+
 use system_error::SystemError;
 
 use core::arch::asm;
@@ -383,11 +383,9 @@ impl X86_64MMArch {
                         info_entry.len as usize,
                     )
                     .unwrap_or_else(|e| {
-                        kwarn!(
+                        warn!(
                             "Failed to add memory block: base={:#x}, size={:#x}, error={:?}",
-                            info_entry.addr,
-                            info_entry.len,
-                            e
+                            info_entry.addr, info_entry.len, e
                         );
                     });
                 areas_count += 1;

@@ -326,7 +326,7 @@ impl ProcessControlBlock {
         // 从内核栈的最低地址处取出pcb的地址
         let p = stack_base.data() as *const *const ProcessControlBlock;
         if core::intrinsics::unlikely((unsafe { *p }).is_null()) {
-            kerror!("p={:p}", p);
+            error!("p={:p}", p);
             panic!("current_pcb is null");
         }
         unsafe {

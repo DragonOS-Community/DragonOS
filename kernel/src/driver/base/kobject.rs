@@ -6,14 +6,13 @@ use alloc::{
 };
 use driver_base_macros::get_weak_or_clear;
 use intertrait::CastFromSync;
-use log::debug;
+use log::{debug, error};
 
 use crate::{
     filesystem::{
         kernfs::KernFSInode,
         sysfs::{sysfs_instance, Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport},
     },
-    kerror,
     libs::{
         casting::DowncastArc,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -214,7 +213,7 @@ impl KObjectManager {
             }
             kobj.set_parent(None);
             if e == SystemError::EEXIST {
-                kerror!("KObjectManager::add_kobj() failed with error: {e:?}, kobj:{kobj:?}");
+                error!("KObjectManager::add_kobj() failed with error: {e:?}, kobj:{kobj:?}");
             }
 
             return Err(e);

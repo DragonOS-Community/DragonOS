@@ -14,13 +14,13 @@ use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::mm::mmio_buddy::{mmio_pool, MMIOSpaceGuard};
 
 use crate::mm::VirtAddr;
-use crate::{kdebug, kerror, kinfo, kwarn};
+
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::{boxed::Box, collections::LinkedList};
 use bitflags::bitflags;
-use log::{debug, info};
+use log::{debug, error, info, warn};
 
 use core::{
     convert::TryFrom,
@@ -1029,8 +1029,7 @@ fn pci_check_device(bus: u8, device: u8) -> Result<u8, PciError> {
     if common_header.header_type & 0x80 != 0 {
         debug!(
             "Detected multi func device in bus{},device{}",
-            busdevicefunction.bus,
-            busdevicefunction.device
+            busdevicefunction.bus, busdevicefunction.device
         );
         // 这是一个多function的设备，因此查询剩余的function
         for function in 1..8 {
@@ -1060,7 +1059,7 @@ pub fn pci_init() {
     info!("Initializing PCI bus...");
     pci_bus_subsys_init().expect("Failed to init pci bus subsystem");
     if let Err(e) = pci_check_all_buses() {
-        kerror!("pci init failed when checking bus because of error: {}", e);
+        error!("pci init failed when checking bus because of error: {}", e);
         return;
     }
     info!(
@@ -1077,9 +1076,7 @@ pub fn pci_init() {
             HeaderType::Standard => {
                 info!(
                     "Found pci standard device with class code ={} subclass={} status={:#x} ",
-                    common_header.class_code,
-                    common_header.subclass,
-                    common_header.status
+                    common_header.class_code, common_header.subclass, common_header.status
                 );
             }
             HeaderType::PciPciBridge if common_header.status & 0x10 != 0 => {
@@ -1088,17 +1085,13 @@ pub fn pci_init() {
             HeaderType::PciPciBridge => {
                 info!(
                     "Found pci-to-pci bridge device with class code ={} subclass={} status={:#x} ",
-                    common_header.class_code,
-                    common_header.subclass,
-                    common_header.status
+                    common_header.class_code, common_header.subclass, common_header.status
                 );
             }
             HeaderType::PciCardbusBridge => {
                 info!(
                     "Found pcicardbus bridge device with class code ={} subclass={} status={:#x} ",
-                    common_header.class_code,
-                    common_header.subclass,
-                    common_header.status
+                    common_header.class_code, common_header.subclass, common_header.status
                 );
             }
             HeaderType::Unrecognised(_) => {}
@@ -1455,7 +1448,7 @@ impl Iterator for CapabilityIterator {
         self.next_capability_offset = if next_offset == 0 {
             None
         } else if next_offset < 64 || next_offset & 0x3 != 0 {
-            kwarn!("Invalid next capability offset {:#04x}", next_offset);
+            warn!("Invalid next capability offset {:#04x}", next_offset);
             None
         } else {
             Some(next_offset)
@@ -1503,7 +1496,7 @@ impl<'a> Iterator for ExternalCapabilityIterator<'a> {
         self.next_capability_offset = if next_offset == 0 {
             None
         } else if next_offset < 0x100 || next_offset & 0x3 != 0 {
-            kwarn!("Invalid next capability offset {:#04x}", next_offset);
+            warn!("Invalid next capability offset {:#04x}", next_offset);
             None
         } else {
             Some(next_offset)

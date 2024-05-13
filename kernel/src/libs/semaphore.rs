@@ -3,8 +3,6 @@ use core::sync::atomic::{AtomicI32, Ordering};
 use log::debug;
 use system_error::SystemError;
 
-
-
 use crate::process::ProcessManager;
 
 use super::wait_queue::WaitQueue;

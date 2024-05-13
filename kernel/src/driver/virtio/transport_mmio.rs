@@ -70,7 +70,7 @@ impl VirtIOMmioTransport {
                 })
             }
             Err(_) => {
-                // kwarn!("MmioTransport::new failed: {:?}", e);
+                // warn!("MmioTransport::new failed: {:?}", e);
                 Err(SystemError::EINVAL)
             }
         }

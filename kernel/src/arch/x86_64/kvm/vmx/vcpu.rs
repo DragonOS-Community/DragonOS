@@ -9,15 +9,15 @@ use crate::arch::kvm::vmx::{VcpuRegIndex, X86_CR0};
 use crate::arch::mm::{LockedFrameAllocator, PageMapper};
 use crate::arch::x86_64::mm::X86_64MMArch;
 use crate::arch::MMArch;
-use crate::kdebug;
+
 use crate::mm::{phys_2_virt, VirtAddr};
 use crate::mm::{MemoryManagementArch, PageTableKind};
 use crate::virt::kvm::vcpu::Vcpu;
 use crate::virt::kvm::vm::Vm;
 use alloc::alloc::Global;
 use alloc::boxed::Box;
-use log::debug;
 use core::slice;
+use log::debug;
 use raw_cpuid::CpuId;
 use system_error::SystemError;
 use x86;

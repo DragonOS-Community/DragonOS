@@ -1,4 +1,4 @@
-use log::debug;
+use log::{debug, warn};
 
 /// @Author: longjin@dragonos.org
 /// @Author: kongweichao@dragonos.org
@@ -9,7 +9,7 @@ use crate::arch::MMArch;
 use crate::mm::allocator::bump::BumpAllocator;
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::{MemoryManagementArch, PhysAddr, PhysMemoryArea, VirtAddr};
-use crate::kwarn;
+
 use core::cmp::min;
 use core::fmt::Debug;
 use core::intrinsics::{likely, unlikely};
@@ -593,7 +593,7 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
     unsafe fn free(&mut self, base: PhysAddr, count: PageFrameCount) {
         // 要求count是2的幂
         if unlikely(!count.data().is_power_of_two()) {
-            kwarn!("buddy free: count is not power of two");
+            warn!("buddy free: count is not power of two");
         }
         let mut order = log2(count.data());
         if count.data() & ((1 << order) - 1) != 0 {

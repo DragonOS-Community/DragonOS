@@ -6,7 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
-use log::info;
+use log::{info, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -158,7 +158,7 @@ impl IrqDomainManager {
     ) {
         for i in 0..count {
             if let Err(e) = self.domain_associate(domain, first_irq + i, first_hwirq + i) {
-                kwarn!("domain associate failed: {:?}, domain '{:?}' didn't like hwirq {} to virq {} mapping.", e, domain.name(), (first_hwirq + i).data(), (first_irq + i).data());
+                warn!("domain associate failed: {:?}, domain '{:?}' didn't like hwirq {} to virq {} mapping.", e, domain.name(), (first_hwirq + i).data(), (first_irq + i).data());
             }
         }
     }
@@ -173,7 +173,7 @@ impl IrqDomainManager {
         hwirq: HardwareIrqNumber,
     ) -> Result<(), SystemError> {
         if hwirq >= domain.revmap.read_irqsave().hwirq_max {
-            kwarn!(
+            warn!(
                 "hwirq {} is out of range for domain {:?}",
                 hwirq.data(),
                 domain.name()
@@ -183,12 +183,12 @@ impl IrqDomainManager {
         let irq_data = irq_desc_manager()
             .lookup(irq)
             .ok_or_else(|| {
-                kwarn!("irq_desc not found for irq {}", irq.data());
+                warn!("irq_desc not found for irq {}", irq.data());
                 SystemError::EINVAL
             })?
             .irq_data();
         if irq_data.domain().is_some() {
-            kwarn!(
+            warn!(
                 "irq {} is already associated with domain {:?}",
                 irq.data(),
                 irq_data.domain().unwrap().name()

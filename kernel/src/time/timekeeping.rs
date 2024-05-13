@@ -1,11 +1,11 @@
 use alloc::sync::Arc;
-use log::{debug, info};
 use core::sync::atomic::{compiler_fence, AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use log::{debug, info};
 use system_error::SystemError;
 
 use crate::{
     arch::{CurrentIrqArch, CurrentTimeArch},
-    exception::InterruptArch, kinfo,
+    exception::InterruptArch,
     libs::rwlock::{RwLock, RwLockReadGuard},
     time::{
         jiffies::{clocksource_default_clock, jiffies_init},

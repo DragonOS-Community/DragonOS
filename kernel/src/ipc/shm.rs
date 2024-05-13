@@ -15,10 +15,10 @@ use crate::{
     time::PosixTimeSpec,
 };
 use alloc::vec::Vec;
-use log::info;
 use core::sync::atomic::{compiler_fence, Ordering};
 use hashbrown::{HashMap, HashSet};
 use ida::IdAllocator;
+use log::info;
 use num::ToPrimitive;
 use system_error::SystemError;
 

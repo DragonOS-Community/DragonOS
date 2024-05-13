@@ -4,10 +4,9 @@ use core::{
     ptr::{read_volatile, write_volatile},
 };
 
-use log::{debug, info};
+use log::{debug, error, info};
 
 use crate::{
-    kdebug, kerror, kinfo,
     mm::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         percpu::PerCpu,
@@ -221,7 +220,7 @@ impl LocalAPIC for XApic {
             x86::msr::wrmsr(x86::msr::APIC_BASE, (self.xapic_base.data() | 0x800) as u64);
             let val = x86::msr::rdmsr(x86::msr::APIC_BASE);
             if val & 0x800 != 0x800 {
-                kerror!("xAPIC enable failed: APIC_BASE & 0x800 != 0x800");
+                error!("xAPIC enable failed: APIC_BASE & 0x800 != 0x800");
                 return false;
             }
             // 设置 Spurious Interrupt Vector Register
@@ -231,7 +230,7 @@ impl LocalAPIC for XApic {
 
             let val = self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_SVR);
             if val & ENABLE == 0 {
-                kerror!("xAPIC software enable failed.");
+                error!("xAPIC software enable failed.");
 
                 return false;
             } else {

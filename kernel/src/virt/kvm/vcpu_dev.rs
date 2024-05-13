@@ -1,6 +1,7 @@
 use crate::arch::kvm::vmx::vcpu::VcpuContextFrame;
 use crate::arch::KVMArch;
 use crate::driver::base::device::device_number::DeviceNumber;
+use crate::filesystem;
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
     core::generate_inode_id, file::FileMode, FilePrivateData, FileSystem, FileType, IndexNode,
@@ -11,7 +12,6 @@ use crate::mm::VirtAddr;
 use crate::syscall::user_access::copy_from_user;
 use crate::virt::kvm::vcpu::Vcpu;
 use crate::virt::kvm::vm;
-use crate::filesystem;
 use crate::{libs::spinlock::SpinLock, time::PosixTimeSpec};
 use alloc::{
     string::String,
@@ -180,10 +180,7 @@ impl IndexNode for LockedVcpuInode {
                 }
                 debug!(
                     "rip={:x}, rflags={:x}, rsp={:x}, rax={:x}",
-                    kvm_regs.rip,
-                    kvm_regs.rflags,
-                    kvm_regs.regs[6],
-                    kvm_regs.regs[0],
+                    kvm_regs.rip, kvm_regs.rflags, kvm_regs.regs[6], kvm_regs.regs[0],
                 );
 
                 let vcpu = vm(0).unwrap().vcpu[0].clone();

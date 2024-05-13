@@ -2,14 +2,14 @@ use crate::libs::align::{page_align_down, page_align_up};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::kernel_mapper::KernelMapper;
 use crate::mm::page::{PAGE_1G_SHIFT, PAGE_4K_SHIFT};
-use crate::process::ProcessManager;
 use crate::mm::{MMArch, MemoryManagementArch};
-use crate::{kerror, kinfo, kwarn};
+use crate::process::ProcessManager;
+
 use alloc::{collections::LinkedList, vec::Vec};
-use log::{debug, info};
 use core::mem;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
+use log::{debug, error, info, warn};
 use system_error::SystemError;
 
 use super::page::{PageFlags, PAGE_4K_SIZE};
@@ -507,7 +507,7 @@ impl MmioBuddyMemPool {
                 return Ok(space_guard);
             }
             Err(_) => {
-                kerror!(
+                error!(
                     "failed to create mmio. pid = {:?}",
                     ProcessManager::current_pcb().pid()
                 );
@@ -541,7 +541,7 @@ impl MmioBuddyMemPool {
         let mut bindings = KernelMapper::lock();
         let mut kernel_mapper = bindings.as_mut();
         if kernel_mapper.is_none() {
-            kwarn!("release_mmio: kernel_mapper is read only");
+            warn!("release_mmio: kernel_mapper is read only");
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
 

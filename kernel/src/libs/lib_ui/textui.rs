@@ -3,7 +3,7 @@ use crate::{
         serial::serial8250::send_to_default_serial8250_port,
         tty::{tty_port::tty_port, virtual_terminal::virtual_console::CURRENT_VCNUM},
         video::video_refresh_manager,
-    }, kinfo,
+    },
     libs::{
         lib_ui::font::FONT_8x16,
         rwlock::RwLock,
@@ -12,7 +12,6 @@ use crate::{
 };
 use alloc::{boxed::Box, collections::LinkedList, string::ToString};
 use alloc::{sync::Arc, vec::Vec};
-use log::{debug, info};
 use core::{
     fmt::Debug,
     intrinsics::unlikely,
@@ -20,6 +19,7 @@ use core::{
     ptr::copy_nonoverlapping,
     sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
 };
+use log::{debug, info};
 use system_error::SystemError;
 
 use super::{

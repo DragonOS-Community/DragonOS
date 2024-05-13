@@ -1,6 +1,7 @@
 use core::intrinsics::likely;
 
 use alloc::sync::Arc;
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -69,11 +70,11 @@ pub fn kernel_wait4(
         pidtype = PidType::MAX;
     } else if pid < 0 {
         pidtype = PidType::PGID;
-        kwarn!("kernel_wait4: currently not support pgid, default to wait for pid\n");
+        warn!("kernel_wait4: currently not support pgid, default to wait for pid\n");
         pid = -pid;
     } else if pid == 0 {
         pidtype = PidType::PGID;
-        kwarn!("kernel_wait4: currently not support pgid, default to wait for pid\n");
+        warn!("kernel_wait4: currently not support pgid, default to wait for pid\n");
         pid = ProcessManager::current_pcb().pid().data() as i64;
     } else {
         pidtype = PidType::PID;
@@ -167,7 +168,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
             schedule(SchedMode::SM_NONE);
         } else {
             // todo: 对于pgid的处理
-            kwarn!("kernel_wait4: currently not support {:?}", kwo.pid_type);
+            warn!("kernel_wait4: currently not support {:?}", kwo.pid_type);
             return Err(SystemError::EINVAL);
         }
     }

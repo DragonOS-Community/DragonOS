@@ -6,8 +6,6 @@ use x86::msr::{
     IA32_X2APIC_VERSION,
 };
 
-use crate::kinfo;
-
 use super::{hw_irq::ApicId, LVTRegister, LocalAPIC, LVT};
 
 #[derive(Debug)]

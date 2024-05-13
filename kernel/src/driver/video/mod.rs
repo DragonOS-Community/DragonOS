@@ -3,7 +3,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::{
     arch::MMArch,
     init::boot_params,
-    kinfo,
     libs::{
         align::page_align_up,
         lib_ui::screen_manager::{ScmBuffer, ScmBufferFlag, ScmBufferInfo},

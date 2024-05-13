@@ -1,6 +1,6 @@
 use core::{hint::spin_loop, intrinsics::unlikely, mem::size_of};
 
-use log::info;
+use log::{error, info, warn};
 use system_error::SystemError;
 use uefi_raw::table::boot::{MemoryAttribute, MemoryType};
 
@@ -28,7 +28,7 @@ pub fn efi_init() {
         .expect("Failed to get fdt params");
 
     if data_from_fdt.systable.is_none() {
-        kerror!("Failed to get systable from fdt");
+        error!("Failed to get systable from fdt");
         return;
     }
 
@@ -40,23 +40,23 @@ pub fn efi_init() {
         // 那么 UEFI memory map 就是我们拥有的关于内存的唯一描述，
         // 所以如果我们无法访问它，那么继续进行下去就没有什么意义了
 
-        kerror!("Failed to initialize early memory map");
+        error!("Failed to initialize early memory map");
         loop {
             spin_loop();
         }
     }
     // debug!("NNNN");
-    // kwarn!("BBBB, e:{:?}", SystemError::EINVAL);
+    // warn!("BBBB, e:{:?}", SystemError::EINVAL);
 
     let desc_version = efi_manager().desc_version();
 
     if unlikely(desc_version != 1) {
-        kwarn!("Unexpected EFI memory map version: {}", desc_version);
+        warn!("Unexpected EFI memory map version: {}", desc_version);
     }
 
     let r = uefi_init(PhysAddr::new(data_from_fdt.systable.unwrap() as usize));
     if let Err(e) = r {
-        kerror!("Failed to initialize UEFI: {:?}", e);
+        error!("Failed to initialize UEFI: {:?}", e);
         efi_manager().efi_memmap_unmap();
         return;
     }
@@ -134,7 +134,7 @@ fn uefi_init(system_table: PhysAddr) -> Result<(), SystemError> {
     let err_unmap_systable = |st_vaddr: VirtAddr| {
         EarlyIoRemap::unmap(st_vaddr)
             .map_err(|e| {
-                kerror!("Failed to unmap system table: {e:?}");
+                error!("Failed to unmap system table: {e:?}");
             })
             .ok();
     };
@@ -144,7 +144,7 @@ fn uefi_init(system_table: PhysAddr) -> Result<(), SystemError> {
     let st_size = size_of::<uefi_raw::table::system::SystemTable>();
 
     let st_vaddr = EarlyIoRemap::map_not_aligned(system_table, st_size, true).map_err(|e| {
-        kwarn!("Unable to map EFI system table, e:{e:?}");
+        warn!("Unable to map EFI system table, e:{e:?}");
         e
     })?;
 
@@ -196,7 +196,7 @@ fn uefi_init(system_table: PhysAddr) -> Result<(), SystemError> {
             true,
         )
         .map_err(|e| {
-            kwarn!("Unable to map EFI configuration table, e:{e:?}");
+            warn!("Unable to map EFI configuration table, e:{e:?}");
             err_unmap_systable(st_vaddr);
             e
         })?;

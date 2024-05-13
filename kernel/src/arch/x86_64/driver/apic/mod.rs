@@ -11,7 +11,6 @@ use crate::{
         io::PortIOArch,
         CurrentPortIOArch,
     },
-    kdebug, kinfo,
     mm::PhysAddr,
     smp::core::smp_get_processor_id,
 };

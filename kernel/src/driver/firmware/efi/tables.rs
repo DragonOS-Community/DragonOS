@@ -1,7 +1,7 @@
 use core::{ffi::CStr, mem::size_of};
 
 use hashbrown::Equivalent;
-use log::{debug, info};
+use log::{debug, error, info, warn};
 use system_error::SystemError;
 use uefi_raw::table::{
     boot::{MemoryAttribute, MemoryType},
@@ -67,11 +67,11 @@ impl EFIManager {
             }
 
             EarlyIoRemap::unmap(fw_ptr).map_err(|e|{
-                kerror!("report systable header: failed to unmap systable header, fw_ptr: {fw_ptr:?}, err: {e:?}");
+                error!("report systable header: failed to unmap systable header, fw_ptr: {fw_ptr:?}, err: {e:?}");
                 e
             }).ok();
         } else {
-            kwarn!("report systable header: failed to map systable header, err: {fw_ptr:?}");
+            warn!("report systable header: failed to map systable header, err: {fw_ptr:?}");
         }
 
         let s = CStr::from_bytes_with_nul(&tmp_buf)
@@ -87,7 +87,7 @@ impl EFIManager {
                 if let Some(r) = parser.match_table(table) {
                     // 有匹配结果
                     if let Err(e) = r {
-                        kwarn!(
+                        warn!(
                             "Failed to parse cfg table: '{}', err: {e:?}",
                             parser.table.name()
                         );
@@ -98,7 +98,7 @@ impl EFIManager {
             }
 
             if !flag {
-                kwarn!("Cannot find parser for guid: {:?}", table.vendor_guid);
+                warn!("Cannot find parser for guid: {:?}", table.vendor_guid);
             }
         }
 
@@ -108,7 +108,7 @@ impl EFIManager {
             while !prev_paddr.is_null() {
                 let vaddr = EarlyIoRemap::map_not_aligned(prev_paddr, MMArch::PAGE_SIZE, true)
                     .map_err(|e| {
-                        kerror!(
+                        error!(
                             "Failed to map UEFI memreserve table, paddr: {prev_paddr:?}, err: {e:?}"
                         );
 
@@ -130,7 +130,7 @@ impl EFIManager {
                             + size_of::<LinuxEFIMemReserveEntry>() * psize,
                     )
                     .map_err(|e| {
-                        kerror!("Failed to reserve block, paddr: {prev_paddr:?}, err: {e:?}");
+                        error!("Failed to reserve block, paddr: {prev_paddr:?}, err: {e:?}");
                         EarlyIoRemap::unmap(vaddr).unwrap();
                         e
                     })?;
@@ -147,7 +147,7 @@ impl EFIManager {
                     mem_block_manager()
                         .reserve_block(PhysAddr::new(entry.base), entry.size)
                         .map_err(|e| {
-                            kerror!("Failed to reserve block, paddr: {prev_paddr:?}, err: {e:?}");
+                            error!("Failed to reserve block, paddr: {prev_paddr:?}, err: {e:?}");
                             EarlyIoRemap::unmap(vaddr).unwrap();
                             e
                         })?;

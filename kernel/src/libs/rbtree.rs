@@ -24,8 +24,6 @@ use core::ptr;
 use alloc::boxed::Box;
 use log::debug;
 
-
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Color {
     Red,

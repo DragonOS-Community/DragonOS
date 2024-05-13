@@ -12,7 +12,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
-use log::{debug, info};
+use log::{debug, error, info, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -28,7 +28,7 @@ use crate::{
         procfs::procfs_unregister_pid,
         vfs::{file::FileDescriptorVec, FileType},
     },
-    ipc::signal_types::{SigInfo, SigPending, SignalStruct}, kinfo,
+    ipc::signal_types::{SigInfo, SigPending, SignalStruct},
     libs::{
         align::AlignedBox,
         casting::DowncastArc,
@@ -155,7 +155,7 @@ impl ProcessManager {
     /// 获取当前进程的pcb
     pub fn current_pcb() -> Arc<ProcessControlBlock> {
         if unlikely(unsafe { !__PROCESS_MANAGEMENT_INIT_DONE }) {
-            kerror!("unsafe__PROCESS_MANAGEMENT_INIT_DONE == false");
+            error!("unsafe__PROCESS_MANAGEMENT_INIT_DONE == false");
             loop {
                 spin_loop();
             }
@@ -362,7 +362,7 @@ impl ProcessManager {
             let parent_pcb = r.unwrap();
             let r = Syscall::kill(parent_pcb.pid(), Signal::SIGCHLD as i32);
             if r.is_err() {
-                kwarn!(
+                warn!(
                     "failed to send kill signal to {:?}'s parent pcb {:?}",
                     current.pid(),
                     parent_pcb.pid()
@@ -422,7 +422,7 @@ impl ProcessManager {
         ProcessManager::exit_notify();
         // unsafe { CurrentIrqArch::interrupt_enable() };
         __schedule(SchedMode::SM_NONE);
-        kerror!("pid {pid:?} exited but sched again!");
+        error!("pid {pid:?} exited but sched again!");
         #[allow(clippy::empty_loop)]
         loop {
             spin_loop();
@@ -442,7 +442,7 @@ impl ProcessManager {
             // } else {
             //     // 如果不为1就panic
             //     let msg = format!("pcb '{:?}' is still referenced, strong count={}",pcb.pid(),  Arc::strong_count(&pcb));
-            //     kerror!("{}", msg);
+            //     error!("{}", msg);
             //     panic!()
             // }
 
@@ -1368,7 +1368,7 @@ impl KernelStack {
 
         // 如果内核栈的最低地址处已经有了一个pcb，那么，这里就不再设置,直接返回错误
         if unlikely(unsafe { !(*stack_bottom_ptr).is_null() }) {
-            kerror!("kernel stack bottom is not null: {:p}", *stack_bottom_ptr);
+            error!("kernel stack bottom is not null: {:p}", *stack_bottom_ptr);
             return Err(SystemError::EPERM);
         }
         // 将pcb的地址放到内核栈的最低地址处

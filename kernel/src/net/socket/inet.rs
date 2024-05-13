@@ -1,4 +1,5 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use log::{error, warn};
 use smoltcp::{
     socket::{raw, tcp, udp},
     wire,
@@ -7,7 +8,6 @@ use system_error::SystemError;
 
 use crate::{
     driver::net::NetDevice,
-    kerror, kwarn,
     libs::rwlock::RwLock,
     net::{
         event_poll::EPollEventType, net_core::poll_ifaces, Endpoint, Protocol, ShutdownType,
@@ -197,7 +197,7 @@ impl Socket for RawSocket {
                     drop(socket_set_guard);
                     return Ok(len);
                 } else {
-                    kwarn!("Unsupport Ip protocol type!");
+                    warn!("Unsupport Ip protocol type!");
                     return Err(SystemError::EINVAL);
                 }
             } else {
@@ -623,7 +623,7 @@ impl Socket for TcpSocket {
                         }
                     }
                     Err(tcp::RecvError::InvalidState) => {
-                        kwarn!("Tcp Socket Read Error, InvalidState");
+                        warn!("Tcp Socket Read Error, InvalidState");
                         return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
                     }
                     Err(tcp::RecvError::Finished) => {
@@ -675,7 +675,7 @@ impl Socket for TcpSocket {
                         return Ok(size);
                     }
                     Err(e) => {
-                        kerror!("Tcp Socket Write Error {e:?}");
+                        error!("Tcp Socket Write Error {e:?}");
                         return Err(SystemError::ENOBUFS);
                     }
                 }
@@ -752,7 +752,7 @@ impl Socket for TcpSocket {
                     }
                 }
                 Err(e) => {
-                    // kerror!("Tcp Socket Connect Error {e:?}");
+                    // error!("Tcp Socket Connect Error {e:?}");
                     match e {
                         tcp::ConnectError::InvalidState => return Err(SystemError::EISCONN),
                         tcp::ConnectError::Unaddressable => return Err(SystemError::EADDRNOTAVAIL),

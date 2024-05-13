@@ -63,8 +63,7 @@ pub(super) fn pci_host_ecam_driver_init(fdt: &Fdt<'_>) -> Result<(), SystemError
         if let Err(err) = do_check(node) {
             debug!(
                 "pci_host_ecam_driver_init(): check {} error: {:?}",
-                node.name,
-                err
+                node.name, err
             );
         }
     }

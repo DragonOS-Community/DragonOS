@@ -1,11 +1,10 @@
 #![allow(dead_code)]
 use core::{cmp::min, intrinsics::unlikely};
-use log::debug;
+use log::{debug, warn};
 use system_error::SystemError;
 
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, SeekFrom},
-    kwarn,
     libs::vec_cursor::VecCursor,
 };
 use alloc::{
@@ -266,7 +265,7 @@ impl FATFile {
             let last_cluster = if let Some(c) = fs.get_last_cluster(self.first_cluster) {
                 c
             } else {
-                kwarn!("FAT: last cluster not found, File = {self:?}");
+                warn!("FAT: last cluster not found, File = {self:?}");
                 return Err(SystemError::EINVAL);
             };
             // 申请簇

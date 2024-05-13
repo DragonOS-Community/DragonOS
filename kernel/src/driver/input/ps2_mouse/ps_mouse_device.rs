@@ -6,7 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use kdepends::ringbuffer::{AllocRingBuffer, RingBuffer};
-use log::debug;
+use log::{debug, error};
 use system_error::SystemError;
 
 use crate::{
@@ -230,7 +230,7 @@ impl Ps2MouseDevice {
 
         self.send_command_to_ps2mouse(PsMouseCommand::EnablePacketStreaming)
             .map_err(|e| {
-                kerror!("ps2 mouse init error: {:?}", e);
+                error!("ps2 mouse init error: {:?}", e);
                 e
             })?;
         self.read_data_port().ok();
@@ -673,7 +673,7 @@ pub fn rs_ps2_mouse_device_init(parent: Arc<dyn KObject>) -> Result<(), SystemEr
     serio_device_manager().register_port(psmouse.clone() as Arc<dyn SerioDevice>)?;
 
     devfs_register(&psmouse.name(), psmouse.clone()).map_err(|e| {
-        kerror!(
+        error!(
             "register psmouse device '{}' to devfs failed: {:?}",
             psmouse.name(),
             e

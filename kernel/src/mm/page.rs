@@ -8,13 +8,12 @@ use core::{
 
 use alloc::sync::Arc;
 use hashbrown::{HashMap, HashSet};
-use log::info;
+use log::{error, info};
 
 use crate::{
     arch::{interrupt::ipi::send_ipi, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
     ipc::shm::ShmId,
-    kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
 };
 
@@ -880,10 +879,9 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
     ) -> Option<PageFlush<Arch>> {
         // 验证虚拟地址和物理地址是否对齐
         if !(virt.check_aligned(Arch::PAGE_SIZE) && phys.check_aligned(Arch::PAGE_SIZE)) {
-            kerror!(
+            error!(
                 "Try to map unaligned page: virt={:?}, phys={:?}",
-                virt,
-                phys
+                virt, phys
             );
             return None;
         }
@@ -938,7 +936,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
     ) -> Option<PageFlush<Arch>> {
         // 验证虚拟地址是否对齐
         if !(virt.check_aligned(Arch::PAGE_SIZE)) {
-            kerror!("Try to map unaligned page: virt={:?}", virt);
+            error!("Try to map unaligned page: virt={:?}", virt);
             return None;
         }
 
@@ -1185,7 +1183,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         unmap_parents: bool,
     ) -> Option<(PhysAddr, PageFlags<Arch>, PageFlush<Arch>)> {
         if !virt.check_aligned(Arch::PAGE_SIZE) {
-            kerror!("Try to unmap unaligned page: virt={:?}", virt);
+            error!("Try to unmap unaligned page: virt={:?}", virt);
             return None;
         }
 

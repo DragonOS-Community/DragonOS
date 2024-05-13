@@ -4,12 +4,12 @@
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use log::{debug, info};
 use core::intrinsics::unlikely;
 use core::mem::size_of;
 use core::ptr::NonNull;
 use core::slice::{from_raw_parts, from_raw_parts_mut};
 use core::sync::atomic::{compiler_fence, Ordering};
+use log::{debug, info};
 
 use super::e1000e_driver::e1000e_driver_init;
 use crate::driver::base::device::DeviceId;
@@ -23,8 +23,6 @@ use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, Pc
 use crate::exception::IrqNumber;
 
 use crate::libs::volatile::{ReadOnly, Volatile, WriteOnly};
-
-use crate::{kdebug, kinfo};
 
 const PAGE_SIZE: usize = 4096;
 const NETWORK_CLASS: u8 = 0x2;

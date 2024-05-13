@@ -10,7 +10,6 @@ use crate::{
         },
         net::NetDevice,
     },
-    kinfo,
     libs::spinlock::SpinLock,
     net::{generate_iface_id, NET_DEVICES},
     time::Instant,
@@ -19,12 +18,12 @@ use alloc::{
     string::String,
     sync::{Arc, Weak},
 };
-use log::info;
 use core::{
     cell::UnsafeCell,
     fmt::Debug,
     ops::{Deref, DerefMut},
 };
+use log::info;
 use smoltcp::{
     phy,
     wire::{self, HardwareAddress},

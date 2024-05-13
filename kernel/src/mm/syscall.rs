@@ -1,12 +1,12 @@
 use core::intrinsics::unlikely;
 
 use alloc::sync::Arc;
+use log::error;
 use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
     ipc::shm::ShmFlags,
-    kerror,
     libs::align::{check_aligned, page_align_up},
     mm::MemoryManagementArch,
     syscall::Syscall,
@@ -305,7 +305,7 @@ impl Syscall {
         if start_vaddr < VirtAddr::new(DEFAULT_MMAP_MIN_ADDR)
             && map_flags.contains(MapFlags::MAP_FIXED)
         {
-            kerror!(
+            error!(
                 "mmap: MAP_FIXED is not supported for address below {}",
                 DEFAULT_MMAP_MIN_ADDR
             );
@@ -313,13 +313,13 @@ impl Syscall {
         }
         // 暂时不支持除匿名页以外的映射
         if !map_flags.contains(MapFlags::MAP_ANONYMOUS) {
-            kerror!("mmap: not support file mapping");
+            error!("mmap: not support file mapping");
             return Err(SystemError::ENOSYS);
         }
 
         // 暂时不支持巨页映射
         if map_flags.contains(MapFlags::MAP_HUGETLB) {
-            kerror!("mmap: not support huge page mapping");
+            error!("mmap: not support huge page mapping");
             return Err(SystemError::ENOSYS);
         }
         let current_address_space = AddressSpace::current()?;
@@ -394,7 +394,7 @@ impl Syscall {
 
         // 暂时不支持巨页映射
         if vm_flags.contains(VmFlags::VM_HUGETLB) {
-            kerror!("mmap: not support huge page mapping");
+            error!("mmap: not support huge page mapping");
             return Err(SystemError::ENOSYS);
         }
 

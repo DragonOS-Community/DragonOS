@@ -8,7 +8,6 @@ use crate::{
     arch::{interrupt::trap::arch_trap_init, process::table::TSSManager},
     driver::clocksource::acpi_pm::init_acpi_pm_clocksource,
     init::init::start_kernel,
-    kdebug,
     mm::{MemoryManagementArch, PhysAddr},
 };
 
@@ -110,8 +109,7 @@ fn set_current_core_tss(stack_start: usize, ist0: usize) {
     let current_tss = unsafe { TSSManager::current_tss() };
     debug!(
         "set_current_core_tss: stack_start={:#x}, ist0={:#x}\n",
-        stack_start,
-        ist0
+        stack_start, ist0
     );
     current_tss.set_rsp(x86::Ring::Ring0, stack_start as u64);
     current_tss.set_ist(0, ist0 as u64);

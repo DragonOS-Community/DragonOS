@@ -16,7 +16,7 @@ pub fn process(flags: &HashSet<Flag>, paths: Vec<Path>, input: DeriveInput) -> T
     } = input;
     let generated = if generics.lt_token.is_some() {
         quote_spanned! {
-            generics.span() => compile_error!("#[cast_to(..)] can't be used on a generic type definition");
+            generics.span() => compile_kerror!("#[cast_to(..)] can't be used on a generic type definition");
         }
     } else {
         paths

@@ -1,7 +1,7 @@
 use core::{hint::spin_loop, sync::atomic::Ordering};
 
 use alloc::sync::Arc;
-use log::info;
+use log::{error, info};
 use system_error::SystemError;
 
 use crate::{
@@ -14,7 +14,6 @@ use crate::{
         sysfs::sysfs_init,
         vfs::{mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
     },
-    kerror, kinfo,
     process::ProcessManager,
 };
 
@@ -132,7 +131,7 @@ fn root_partition() -> Arc<Partition> {
 
         let virtio0 = crate::driver::block::virtio_blk::virtio_blk_0();
         if virtio0.is_none() {
-            kerror!("Failed to get virtio_blk_0");
+            error!("Failed to get virtio_blk_0");
             loop {
                 spin_loop();
             }
@@ -148,7 +147,7 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
 
     let fatfs: Result<Arc<FATFileSystem>, SystemError> = FATFileSystem::new(partiton);
     if fatfs.is_err() {
-        kerror!(
+        error!(
             "Failed to initialize fatfs, code={:?}",
             fatfs.as_ref().err()
         );
@@ -159,7 +158,7 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     let fatfs: Arc<FATFileSystem> = fatfs.unwrap();
     let r = migrate_virtual_filesystem(fatfs);
     if r.is_err() {
-        kerror!("Failed to migrate virtual filesystem to FAT32!");
+        error!("Failed to migrate virtual filesystem to FAT32!");
         loop {
             spin_loop();
         }

@@ -5,7 +5,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use log::debug;
+use log::{debug, error};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 use virtio_drivers::device::blk::VirtIOBlk;
@@ -90,7 +90,7 @@ impl VirtIOBlkDevice {
         let irq = transport.irq().map(|irq| IrqNumber::new(irq.data()));
         let device_inner = VirtIOBlk::<HalImpl, VirtIOTransport>::new(transport);
         if let Err(e) = device_inner {
-            kerror!("VirtIOBlkDevice '{dev_id:?}' create failed: {:?}", e);
+            error!("VirtIOBlkDevice '{dev_id:?}' create failed: {:?}", e);
             return None;
         }
 
@@ -135,10 +135,9 @@ impl BlockDevice for VirtIOBlkDevice {
             .device_inner
             .read_blocks(lba_id_start, &mut buf[..count * LBA_SIZE])
             .map_err(|e| {
-                kerror!(
+                error!(
                     "VirtIOBlkDevice '{:?}' read_at_sync failed: {:?}",
-                    self.dev_id,
-                    e
+                    self.dev_id, e
                 );
                 SystemError::EIO
             })?;
@@ -417,7 +416,7 @@ impl VirtIODriver for VirtIOBlkDriver {
             .arc_any()
             .downcast::<VirtIOBlkDevice>()
             .map_err(|_| {
-                kerror!(
+                error!(
                 "VirtIOBlkDriver::probe() failed: device is not a VirtIO block device. Device: '{:?}'",
                 device.name()
             );

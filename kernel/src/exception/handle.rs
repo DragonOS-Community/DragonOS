@@ -1,7 +1,7 @@
 use core::{intrinsics::unlikely, ops::BitAnd};
 
 use alloc::sync::Arc;
-use log::debug;
+use log::{debug, error, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -325,7 +325,7 @@ fn cond_unmask_eoi_irq(
         debug!("eoi irq {}", desc_inner_guard.irq_data().irq().data());
         chip.irq_eoi(desc_inner_guard.irq_data());
     } else {
-        kwarn!(
+        warn!(
             "irq {} eoi failed",
             desc_inner_guard.irq_data().irq().data()
         );
@@ -341,7 +341,7 @@ fn warn_no_thread(irq: IrqNumber, action_inner: &mut SpinLockGuard<'_, InnerIrqA
         return;
     }
 
-    kwarn!(
+    warn!(
         "irq {}, device {} returned IRQ_WAKE_THREAD, but no threaded handler",
         irq.data(),
         action_inner.name()
@@ -403,7 +403,7 @@ impl IrqFlowHandler for PerCpuDevIdIrqHandler {
             static ONCE: Once = Once::new();
 
             ONCE.call_once(|| {
-                kerror!(
+                error!(
                     "Spurious percpu irq {} on cpu {:?}, enabled: {}",
                     irq.data(),
                     cpu,

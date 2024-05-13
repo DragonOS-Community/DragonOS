@@ -17,7 +17,6 @@ use crate::{
         manage::irq_manager,
         IrqNumber,
     },
-    kdebug, kinfo,
     libs::{
         cpumask::CpuMask,
         once::Once,

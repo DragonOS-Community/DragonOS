@@ -7,7 +7,7 @@ use core::{
 
 use acpi::HpetInfo;
 use alloc::{string::ToString, sync::Arc};
-use log::{debug, info};
+use log::{debug, error, info};
 use system_error::SystemError;
 
 use crate::{
@@ -22,7 +22,6 @@ use crate::{
         manage::irq_manager,
         InterruptArch, IrqNumber,
     },
-    kdebug, kerror, kinfo,
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         volatile::volwrite,
@@ -128,7 +127,7 @@ impl Hpet {
         debug!("HPET frequency: {} Hz", freq);
         let ticks = Self::HPET0_INTERVAL_USEC * freq / 1000000;
         if ticks == 0 || ticks > freq * 8 {
-            kerror!("HPET enable: ticks '{ticks}' is invalid");
+            error!("HPET enable: ticks '{ticks}' is invalid");
             return Err(SystemError::EINVAL);
         }
         if unlikely(regs.timers_num() == 0) {

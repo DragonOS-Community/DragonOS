@@ -1,5 +1,6 @@
 use core::intrinsics::unlikely;
 
+use log::error;
 use system_error::SystemError;
 
 use crate::libs::{
@@ -88,7 +89,7 @@ impl MemBlockManager {
             .expect("Failed to count blocks to add!");
 
         if inner.initial_memory_regions_num + blocks_to_add > INITIAL_MEMORY_REGIONS_NUM {
-            kerror!("Too many memory regions!");
+            error!("Too many memory regions!");
             return Err(SystemError::ENOMEM);
         }
 

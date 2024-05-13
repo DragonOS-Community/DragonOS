@@ -1,6 +1,6 @@
 use super::vmcs::{VmcsFields, VmxExitReason};
 use super::vmx_asm_wrapper::{vmx_vmread, vmx_vmwrite};
-use crate::kdebug;
+
 use crate::virt::kvm::vm;
 use core::arch::asm;
 use log::debug;

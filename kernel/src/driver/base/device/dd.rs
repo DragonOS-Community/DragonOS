@@ -2,7 +2,7 @@ use core::intrinsics::unlikely;
 
 use alloc::{string::ToString, sync::Arc};
 use intertrait::cast::CastArc;
-use log::debug;
+use log::{debug, error, warn};
 
 use crate::{
     driver::base::kobject::KObject,
@@ -60,13 +60,13 @@ impl DeviceManager {
     ) -> Result<bool, SystemError> {
         if unlikely(allow_async) {
             // todo!("do_device_attach: allow_async")
-            kwarn!("do_device_attach: allow_async is true, but currently not supported");
+            warn!("do_device_attach: allow_async is true, but currently not supported");
         }
         if dev.is_dead() {
             return Ok(false);
         }
 
-        kwarn!("do_device_attach: dev: '{}'", dev.name());
+        warn!("do_device_attach: dev: '{}'", dev.name());
 
         let mut do_async = false;
         let mut r = Ok(false);
@@ -216,7 +216,7 @@ impl DeviceManager {
         }
 
         if let Err(e) = r.as_ref() {
-            kerror!(
+            error!(
                 "device_bind_driver: driver_sysfs_add failed, dev: '{}', err: {:?}",
                 dev.name(),
                 e
@@ -402,7 +402,7 @@ impl DriverManager {
         device.set_driver(Some(Arc::downgrade(driver)));
 
         self.add_to_sysfs(device).map_err(|e| {
-            kerror!(
+            error!(
                 "really_probe: add_to_sysfs failed, dev: '{}', err: {:?}",
                 device.name(),
                 e
@@ -413,7 +413,7 @@ impl DriverManager {
         })?;
 
         self.call_driver_probe(device, driver).map_err(|e| {
-            kerror!(
+            error!(
                 "really_probe: call_driver_probe failed, dev: '{}', err: {:?}",
                 device.name(),
                 e
@@ -428,7 +428,7 @@ impl DriverManager {
         device_manager()
             .add_groups(device, driver.dev_groups())
             .map_err(|e| {
-                kerror!(
+                error!(
                     "really_probe: add_groups failed, dev: '{}', err: {:?}",
                     device.name(),
                     e
@@ -444,7 +444,7 @@ impl DriverManager {
         device_manager()
             .create_file(device, &DeviceAttrStateSynced)
             .map_err(|e| {
-                kerror!(
+                error!(
                     "really_probe: create_file failed, dev: '{}', err: {:?}",
                     device.name(),
                     e
@@ -516,7 +516,7 @@ impl DriverManager {
             .ok_or(SystemError::EINVAL)?;
         let r = bus.probe(device);
         if r == Err(SystemError::ENOSYS) {
-            kerror!(
+            error!(
                 "call_driver_probe: bus.probe() failed, dev: '{}', err: {:?}",
                 device.name(),
                 r
@@ -540,7 +540,7 @@ impl DriverManager {
             }
 
             _ => {
-                kwarn!(
+                warn!(
                     "driver'{}': probe of {} failed with error {:?}",
                     driver.name(),
                     device.name(),
@@ -556,7 +556,7 @@ impl DriverManager {
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#393
     fn driver_bound(&self, device: &Arc<dyn Device>) {
         if self.driver_is_bound(device) {
-            kwarn!("driver_bound: device '{}' is already bound.", device.name());
+            warn!("driver_bound: device '{}' is already bound.", device.name());
             return;
         }
 
@@ -601,7 +601,7 @@ impl Attribute for DeviceAttrStateSynced {
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
         let dev = kobj.cast::<dyn Device>().map_err(|kobj| {
-            kerror!(
+            error!(
                 "Intertrait casting not implemented for kobj: {}",
                 kobj.name()
             );
@@ -636,7 +636,7 @@ impl Attribute for DeviceAttrCoredump {
 
     fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {
         let dev = kobj.cast::<dyn Device>().map_err(|kobj| {
-            kerror!(
+            error!(
                 "Intertrait casting not implemented for kobj: {}",
                 kobj.name()
             );

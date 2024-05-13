@@ -10,7 +10,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use log::debug;
+use log::{debug, error};
 use smoltcp::{iface, phy, wire};
 use unified_init::macros::unified_init;
 use virtio_drivers::device::net::VirtIONet;
@@ -40,7 +40,6 @@ use crate::{
     exception::{irqdesc::IrqReturn, IrqNumber},
     filesystem::kernfs::KernFSInode,
     init::initcall::INITCALL_POSTCORE,
-    kerror,
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
@@ -419,7 +418,7 @@ pub fn virtio_net(transport: VirtIOTransport, dev_id: Arc<DeviceId>) {
         match VirtIONet::<HalImpl, VirtIOTransport, 2>::new(transport, 4096) {
             Ok(net) => net,
             Err(_) => {
-                kerror!("VirtIONet init failed");
+                error!("VirtIONet init failed");
                 return;
             }
         };
@@ -597,7 +596,7 @@ impl VirtIODriver for VirtIONetDriver {
             .arc_any()
             .downcast::<VirtioInterface>()
             .map_err(|_| {
-                kerror!(
+                error!(
                 "VirtIONetDriver::probe() failed: device is not a VirtioInterface. Device: '{:?}'",
                 device.name()
             );

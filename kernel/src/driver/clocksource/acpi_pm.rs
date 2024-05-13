@@ -13,9 +13,9 @@ use crate::{
 };
 use acpi::fadt::Fadt;
 use alloc::sync::{Arc, Weak};
-use log::info;
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicU32, Ordering};
+use log::info;
 use system_error::SystemError;
 
 // 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/clocksource/acpi_pm.c

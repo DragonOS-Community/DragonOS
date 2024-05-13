@@ -9,11 +9,10 @@ use super::{
 use crate::{
     driver::base::kobject::KObject,
     filesystem::vfs::ROOT_INODE,
-    kinfo, kwarn,
     libs::{casting::DowncastArc, once::Once},
 };
 use alloc::sync::Arc;
-use log::info;
+use log::{info, warn};
 use system_error::SystemError;
 
 pub mod dir;
@@ -228,6 +227,6 @@ impl SysFS {
     /// 警告：重复的sysfs entry
     pub(self) fn warn_duplicate(&self, parent: &Arc<KernFSInode>, name: &str) {
         let path = self.kernfs_path(parent);
-        kwarn!("duplicate sysfs entry: {path}/{name}");
+        warn!("duplicate sysfs entry: {path}/{name}");
     }
 }

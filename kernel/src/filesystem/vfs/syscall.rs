@@ -3,6 +3,7 @@ use core::mem::size_of;
 
 use alloc::string::ToString;
 use alloc::{string::String, sync::Arc, vec::Vec};
+use log::warn;
 use system_error::SystemError;
 
 use crate::producefs;
@@ -29,7 +30,6 @@ use super::{
     Dirent, FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
-// use crate::kdebug;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -1186,7 +1186,7 @@ impl Syscall {
                 // TODO: unimplemented
                 // 未实现的命令，返回0，不报错。
 
-                kwarn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
+                warn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
                 return Err(SystemError::ENOSYS);
             }
         }
@@ -1568,7 +1568,7 @@ impl Syscall {
 
         // fchmod没完全实现，因此不修改文件的权限
         // todo: 实现fchmod
-        kwarn!("fchmod not fully implemented");
+        warn!("fchmod not fully implemented");
         return Ok(0);
     }
     /// #挂载文件系统

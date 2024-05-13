@@ -11,7 +11,6 @@ use super::vfs::{
 };
 use crate::{
     driver::base::device::device_number::DeviceNumber,
-    kerror, kinfo,
     libs::{
         once::Once,
         spinlock::{SpinLock, SpinLockGuard},
@@ -24,7 +23,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use log::info;
+use log::{error, info};
 use system_error::SystemError;
 
 const DEVFS_BLOCK_SIZE: u64 = 512;
@@ -542,7 +541,7 @@ impl IndexNode for LockedDevFSInode {
         _buf: &mut [u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        kerror!("DevFS: read_at is not supported!");
+        error!("DevFS: read_at is not supported!");
         Err(SystemError::ENOSYS)
     }
 
@@ -581,7 +580,7 @@ macro_rules! devfs_exact_ref {
     () => {{
         let devfs_inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().find("dev");
         if let Err(e) = devfs_inode {
-            kerror!("failed to get DevFS ref. errcode = {:?}", e);
+            error!("failed to get DevFS ref. errcode = {:?}", e);
             return Err(SystemError::ENOENT);
         }
 

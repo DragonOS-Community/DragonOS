@@ -240,7 +240,7 @@ impl IrqChip for PlicIrqChip {
         "SiFive PLIC"
     }
     fn irq_enable(&self, irq_data: &Arc<IrqData>) -> Result<(), SystemError> {
-        // kwarn!("plic: irq_enable");
+        // warn!("plic: irq_enable");
         let common_data = irq_data.common_data();
         let inner_guard = common_data.inner();
         let mask = inner_guard.effective_affinity();
@@ -252,7 +252,7 @@ impl IrqChip for PlicIrqChip {
     }
 
     fn irq_unmask(&self, irq_data: &Arc<IrqData>) -> Result<(), SystemError> {
-        // kwarn!("plic: irq_unmask");
+        // warn!("plic: irq_unmask");
 
         let chip_data = irq_data
             .chip_info_read_irqsave()
@@ -423,7 +423,7 @@ pub fn riscv_sifive_plic_init() -> Result<(), SystemError> {
     });
     for node in all_plics {
         if let Err(e) = do_riscv_sifive_plic_init(&node) {
-            kwarn!("Failed to init SiFive PLIC: node: {node:?} {e:?}");
+            warn!("Failed to init SiFive PLIC: node: {node:?} {e:?}");
         }
     }
 
@@ -506,7 +506,7 @@ fn do_riscv_sifive_plic_init(fdt_node: &FdtNode) -> Result<(), SystemError> {
         let cpu = ProcessorId::new(i as u32);
         let handler = unsafe { plic_handlers().force_get(cpu) };
         if handler.present() {
-            kwarn!("plic: handler {i} already present.");
+            warn!("plic: handler {i} already present.");
             handler.set_threshold(PlicIrqChip::PLIC_ENABLE_THRESHOLD);
             loop_done_setup(handler);
             continue;
@@ -613,7 +613,7 @@ impl IrqDomainOps for PlicIrqDomainOps {
         _irq_data: &Arc<IrqData>,
         _reserve: bool,
     ) -> Result<(), SystemError> {
-        kwarn!("plic: activate");
+        warn!("plic: activate");
         loop {}
     }
 
@@ -652,7 +652,7 @@ pub(super) fn do_plic_irq(trap_frame: &mut TrapFrame) {
 
         let hwirq = HardwareIrqNumber::new(claim);
         if let Err(e) = GenericIrqHandler::handle_domain_irq(domain.clone(), hwirq, trap_frame) {
-            kwarn!("plic: can't find mapping for hwirq {hwirq:?}, {e:?}");
+            warn!("plic: can't find mapping for hwirq {hwirq:?}, {e:?}");
         }
     }
 }

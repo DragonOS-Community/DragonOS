@@ -871,7 +871,9 @@ macro_rules! define_filesystem_maker_slice {
         pub static $name: [FileSystemMaker] = [..];
     };
     () => {
-        compile_error!("define_filesystem_maker_slice! requires at least one argument: slice_name");
+        compile_kerror!(
+            "define_filesystem_maker_slice! requires at least one argument: slice_name"
+        );
     };
 }
 

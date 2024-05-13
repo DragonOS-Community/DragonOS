@@ -1,9 +1,9 @@
 use core::{
-    fmt::{self, Write},
+    fmt::{self, Arguments, Write},
     sync::atomic::Ordering,
 };
 
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use log::{info, Level, Log};
 
 use super::lib_ui::textui::{textui_putstr, FontColor};
@@ -155,34 +155,81 @@ impl Log for CustomLogger {
     }
 }
 
-impl CustomLogger{
-    fn iodisplay(record: &log::Record){
+impl CustomLogger {
+    fn iodisplay(record: &log::Record) {
+        match record.level(){
+            Level::Debug|Level::Info =>{
+                write!(
+                    PrintkWriter,
+                    "[ {} ]",
+                    record.level(),
+                )
+            },
+            Level::Error=>{
+                write!(
+                    PrintkWriter,
+                    "\x1B[41m[ ERROR ] \x1B[0m",
+                )
+            },
+            Level::Warn=>{
+                write!(
+                    PrintkWriter,
+                    "\x1B[1;33m[ WARN ] \x1B[0m",
+                )
+            },
+            Level::Trace=>{
+                todo!()
+            }
+        }.unwrap();
         writeln!(
             PrintkWriter,
-            "[ {} ] ({}:{}) {}",
-            record.level(),
-            record.file().unwrap_or(""),
-            record.line().unwrap_or(0),
-            record.args()
+            "({}:{}) {}",
+                record.file().unwrap_or(""),
+                record.line().unwrap_or(0),
+                record.args()
         )
         .unwrap();
     }
-    
-    fn kernel_log(record: &log::Record){
-        match record.level(){
-            Level::Debug=>{
-                Logger.log(7, format_args!("({}:{})\t {}\n",record.file().unwrap_or(""),record.line().unwrap_or(0),record.args()))
-            },
-            Level::Error=>{
-                Logger.log(3, format_args!("({}:{})\t {}\n",record.file().unwrap_or(""),record.line().unwrap_or(0),record.args()))
-            },
-            Level::Info=>{
-                Logger.log(6, format_args!("({}:{})\t {}\n",record.file().unwrap_or(""),record.line().unwrap_or(0),record.args()))
-            },
-            Level::Warn=>{
-                Logger.log(4, format_args!("({}:{})\t {}\n",record.file().unwrap_or(""),record.line().unwrap_or(0),record.args()))
-            },
-            Level::Trace=>{
+
+    fn kernel_log(record: &log::Record) {
+        match record.level() {
+            Level::Debug => Logger.log(
+                7,
+                format_args!(
+                    "({}:{})\t {}\n",
+                    record.file().unwrap_or(""),
+                    record.line().unwrap_or(0),
+                    record.args()
+                ),
+            ),
+            Level::Error => Logger.log(
+                3,
+                format_args!(
+                    "({}:{})\t {}\n",
+                    record.file().unwrap_or(""),
+                    record.line().unwrap_or(0),
+                    record.args()
+                ),
+            ),
+            Level::Info => Logger.log(
+                6,
+                format_args!(
+                    "({}:{})\t {}\n",
+                    record.file().unwrap_or(""),
+                    record.line().unwrap_or(0),
+                    record.args()
+                ),
+            ),
+            Level::Warn => Logger.log(
+                4,
+                format_args!(
+                    "({}:{})\t {}\n",
+                    record.file().unwrap_or(""),
+                    record.line().unwrap_or(0),
+                    record.args()
+                ),
+            ),
+            Level::Trace => {
                 todo!()
             }
         }

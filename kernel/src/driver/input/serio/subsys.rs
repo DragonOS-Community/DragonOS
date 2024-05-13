@@ -3,6 +3,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use intertrait::cast::CastArc;
+use log::error;
 use system_error::SystemError;
 
 use crate::{
@@ -59,7 +60,7 @@ impl Bus for SerioBus {
     fn probe(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
         let drv = device.driver().ok_or(SystemError::EINVAL)?;
         let pdrv = drv.cast::<dyn SerioDriver>().map_err(|_| {
-            kerror!(
+            error!(
                 "SerioBus::probe() failed: device.driver() is not a SerioDriver. Device: '{:?}'",
                 device.name()
             );
@@ -67,7 +68,7 @@ impl Bus for SerioBus {
         })?;
 
         let pdev = device.clone().cast::<dyn SerioDevice>().map_err(|_| {
-            kerror!(
+            error!(
                 "SerioBus::probe() failed: device is not a SerioDevice. Device: '{:?}'",
                 device.name()
             );

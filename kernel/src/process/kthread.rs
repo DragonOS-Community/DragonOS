@@ -17,7 +17,6 @@ use crate::{
     arch::CurrentIrqArch,
     exception::{irqdesc::IrqAction, InterruptArch},
     init::initial_kthread::initial_kernel_thread,
-    kinfo,
     libs::{once::Once, spinlock::SpinLock},
     process::{ProcessManager, ProcessState},
     sched::{schedule, SchedMode},

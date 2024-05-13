@@ -1,5 +1,6 @@
 use core::{intrinsics::unlikely, mem::size_of};
 
+use log::error;
 use system_error::SystemError;
 
 use crate::{
@@ -130,7 +131,7 @@ impl EFIManager {
         }
 
         if inner_guard.mmap.vaddr.is_none() {
-            kerror!("Cannot map the EFI memory map!");
+            error!("Cannot map the EFI memory map!");
             return Err(SystemError::ENOMEM);
         }
 

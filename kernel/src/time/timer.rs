@@ -10,7 +10,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use log::info;
+use log::{error, info, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -19,7 +19,6 @@ use crate::{
         softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
         InterruptArch,
     },
-    kerror, kinfo,
     libs::spinlock::{SpinLock, SpinLockGuard},
     process::{ProcessControlBlock, ProcessManager},
     sched::{schedule, SchedMode},
@@ -161,7 +160,7 @@ impl Timer {
         let mut split_pos: usize = 0;
         for (pos, elt) in timer_list.iter().enumerate() {
             if Arc::ptr_eq(&self_arc, &elt.1) {
-                kwarn!("Timer already in list");
+                warn!("Timer already in list");
             }
             if elt.0 > expire_jiffies {
                 split_pos = pos;
@@ -181,7 +180,7 @@ impl Timer {
         drop(timer);
         let r = func.map(|mut f| f.run()).unwrap_or(Ok(()));
         if unlikely(r.is_err()) {
-            kerror!(
+            error!(
                 "Failed to run timer function: {self:?} {:?}",
                 r.as_ref().err().unwrap()
             );
@@ -309,7 +308,7 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
         schedule(SchedMode::SM_NONE);
         return Ok(MAX_TIMEOUT);
     } else if timeout < 0 {
-        kerror!("timeout can't less than 0");
+        error!("timeout can't less than 0");
         return Err(SystemError::EINVAL);
     } else {
         // 禁用中断，防止在这段期间发生调度，造成死锁

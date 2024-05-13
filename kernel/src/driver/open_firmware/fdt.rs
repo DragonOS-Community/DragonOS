@@ -4,7 +4,7 @@ use fdt::{
     node::{FdtNode, NodeProperty},
     Fdt,
 };
-use log::debug;
+use log::{debug, error, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -80,7 +80,7 @@ impl OpenFirmwareFdtDriver {
         let fdt_vaddr = boot_params().read().fdt().ok_or(SystemError::ENODEV)?;
         let fdt: Fdt<'_> = unsafe {
             fdt::Fdt::from_ptr(fdt_vaddr.as_ptr()).map_err(|e| {
-                kerror!("failed to parse fdt, err={:?}", e);
+                error!("failed to parse fdt, err={:?}", e);
                 SystemError::EINVAL
             })
         }?;
@@ -92,7 +92,7 @@ impl OpenFirmwareFdtDriver {
             .expect("Failed to scan fdt root node.");
 
         self.early_init_scan_chosen(fdt).unwrap_or_else(|_| {
-            kwarn!("No `chosen` node found");
+            warn!("No `chosen` node found");
         });
 
         self.early_init_scan_memory(fdt);
@@ -211,6 +211,8 @@ impl OpenFirmwareFdtDriver {
 
     #[cfg(not(target_arch = "x86_64"))]
     pub fn early_init_dt_add_memory(&self, base: u64, size: u64) {
+        use log::warn;
+
         use crate::{
             arch::MMArch,
             libs::align::page_align_down,
@@ -221,7 +223,7 @@ impl OpenFirmwareFdtDriver {
         let mut size = size as usize;
 
         if size < (MMArch::PAGE_SIZE - (base & (!MMArch::PAGE_MASK))) {
-            kwarn!("Ignoring memory block {:#x}-{:#x}", base, base + size);
+            warn!("Ignoring memory block {:#x}-{:#x}", base, base + size);
         }
 
         if PhysAddr::new(base).check_aligned(MMArch::PAGE_SIZE) == false {
@@ -232,11 +234,11 @@ impl OpenFirmwareFdtDriver {
         size = page_align_down(size);
 
         if base > MemBlockManager::MAX_MEMBLOCK_ADDR.data() {
-            kwarn!("Ignoring memory block {:#x}-{:#x}", base, base + size);
+            warn!("Ignoring memory block {:#x}-{:#x}", base, base + size);
         }
 
         if base + size - 1 > MemBlockManager::MAX_MEMBLOCK_ADDR.data() {
-            kwarn!(
+            warn!(
                 "Ignoring memory range {:#x}-{:#x}",
                 MemBlockManager::MAX_MEMBLOCK_ADDR.data() + 1,
                 base + size
@@ -245,13 +247,13 @@ impl OpenFirmwareFdtDriver {
         }
 
         if base + size < MemBlockManager::MIN_MEMBLOCK_ADDR.data() {
-            kwarn!("Ignoring memory range {:#x}-{:#x}", base, base + size);
+            warn!("Ignoring memory range {:#x}-{:#x}", base, base + size);
             return;
         }
 
         if base < MemBlockManager::MIN_MEMBLOCK_ADDR.data() {
             {
-                kwarn!(
+                warn!(
                     "Ignoring memory range {:#x}-{:#x}",
                     base,
                     MemBlockManager::MIN_MEMBLOCK_ADDR.data()
@@ -407,7 +409,7 @@ fn reserved_mem_reserve_reg(node: &FdtNode<'_, '_>) -> Result<(), SystemError> {
 
     let mut reg_size = reg.value.len();
     if reg_size > 0 && reg_size % t_len != 0 {
-        kerror!(
+        error!(
             "Reserved memory: invalid reg property in '{}', skipping node.",
             node.name
         );
@@ -434,16 +436,12 @@ fn reserved_mem_reserve_reg(node: &FdtNode<'_, '_>) -> Result<(), SystemError> {
         {
             debug!(
                 "Reserved memory: base={:#x}, size={:#x}, nomap={}",
-                base,
-                size,
-                nomap
+                base, size, nomap
             );
         } else {
-            kerror!(
+            error!(
                 "Failed to reserve memory: base={:#x}, size={:#x}, nomap={}",
-                base,
-                size,
-                nomap
+                base, size, nomap
             );
         }
 

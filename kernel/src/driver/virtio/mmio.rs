@@ -1,4 +1,5 @@
 use fdt::node::FdtNode;
+use log::error;
 use system_error::SystemError;
 
 use crate::driver::{
@@ -9,7 +10,7 @@ use super::{transport::VirtIOTransport, virtio::virtio_device_init};
 
 pub(super) fn virtio_probe_mmio() {
     if let Err(e) = do_probe_virtio_mmio() {
-        kerror!("virtio_probe_mmio failed: {:?}", e);
+        error!("virtio_probe_mmio failed: {:?}", e);
     }
 }
 

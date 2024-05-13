@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -345,7 +346,7 @@ impl IndexNode for KernFSInode {
         }
 
         if self.callback.is_none() {
-            kwarn!("kernfs: callback is none");
+            warn!("kernfs: callback is none");
             return Err(SystemError::ENOSYS);
         }
 

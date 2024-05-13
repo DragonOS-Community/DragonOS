@@ -4,11 +4,11 @@ use core::intrinsics::unlikely;
 
 use alloc::vec::Vec;
 use hashbrown::HashMap;
+use log::error;
 use system_error::SystemError;
 
 use crate::{
     include::bindings::bindings::{gfp_t, PAGE_U_S},
-    kerror,
     libs::{align::page_align_up, spinlock::SpinLock},
     mm::MMArch,
 };
@@ -109,7 +109,7 @@ pub unsafe extern "C" fn kfree(vaddr: usize) -> usize {
     drop(guard);
 
     if p.is_none() {
-        kerror!("kfree: vaddr {:?} not found in C Allocation Map", vaddr);
+        error!("kfree: vaddr {:?} not found in C Allocation Map", vaddr);
         return SystemError::EINVAL.to_posix_errno() as i64 as usize;
     }
     let (vaddr, len, cap) = p.unwrap();

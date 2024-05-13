@@ -117,8 +117,7 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
 
     info!(
         "DragonOS kernel is running on hart {}, fdt address:{:?}",
-        hartid,
-        fdt_paddr
+        hartid, fdt_paddr
     );
     mm_early_init();
 

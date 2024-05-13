@@ -1,5 +1,6 @@
 use core::intrinsics::size_of;
 
+use ::log::{error, info};
 use alloc::{
     borrow::ToOwned,
     collections::BTreeMap,
@@ -8,7 +9,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use ::log::info;
 use system_error::SystemError;
 
 use crate::{
@@ -18,7 +18,6 @@ use crate::{
         core::{generate_inode_id, ROOT_INODE},
         FileType,
     },
-    kerror, kinfo,
     libs::{
         once::Once,
         rwlock::RwLock,
@@ -150,7 +149,7 @@ impl ProcFSInode {
         let pcb = if let Some(pcb) = pcb {
             pcb
         } else {
-            kerror!(
+            error!(
                 "ProcFS: Cannot find pcb for pid {:?} when opening its 'status' file.",
                 pid
             );

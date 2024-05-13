@@ -1,7 +1,7 @@
 use core::sync::atomic::AtomicU32;
 
 use alloc::{sync::Arc, vec::Vec};
-use log::{debug, info};
+use log::{debug, error, info};
 use system_error::SystemError;
 
 use crate::{
@@ -206,7 +206,7 @@ impl SmpCpuManager {
             debug!("Bring up CPU {}", cpu_id.data());
 
             if let Err(e) = self.cpu_up(cpu_id, CpuHpState::Online) {
-                kerror!("Failed to bring up CPU {}: {:?}", cpu_id.data(), e);
+                error!("Failed to bring up CPU {}: {:?}", cpu_id.data(), e);
             }
         }
 

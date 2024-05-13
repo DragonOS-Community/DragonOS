@@ -22,10 +22,10 @@ use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
 };
-use log::{debug, info};
 use core::{ffi::CStr, fmt::Debug, intrinsics::unlikely};
 use hashbrown::HashMap;
 use intertrait::cast::CastArc;
+use log::{debug, error, info};
 use system_error::SystemError;
 
 /// `/sys/bus`的kset
@@ -315,7 +315,7 @@ impl BusManager {
         driver_manager()
             .add_groups(driver, bus.drv_groups())
             .map_err(|e| {
-                kerror!(
+                error!(
                     "BusManager::add_driver: driver '{:?}' add_groups failed, err: '{:?}",
                     driver.name(),
                     e
@@ -327,7 +327,7 @@ impl BusManager {
         if !driver.suppress_bind_attrs() {
             self.add_bind_files(driver)
                 .map_err(|e| {
-                    kerror!(
+                    error!(
                         "BusManager::add_driver: driver '{:?}' add_bind_files failed, err: '{:?}",
                         driver.name(),
                         e
@@ -747,7 +747,7 @@ impl Attribute for DriverAttrUnbind {
 
     fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {
         let driver = kobj.cast::<dyn Driver>().map_err(|kobj| {
-            kerror!(
+            error!(
                 "Intertrait casting not implemented for kobj: {}",
                 kobj.name()
             );
@@ -796,7 +796,7 @@ impl Attribute for DriverAttrBind {
      */
     fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {
         let driver = kobj.cast::<dyn Driver>().map_err(|kobj| {
-            kerror!(
+            error!(
                 "Intertrait casting not implemented for kobj: {}",
                 kobj.name()
             );

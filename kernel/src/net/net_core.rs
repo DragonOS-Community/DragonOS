@@ -1,10 +1,10 @@
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
-use log::{debug, info};
+use log::{debug, info, warn};
 use smoltcp::{socket::dhcpv4, wire};
 use system_error::SystemError;
 
 use crate::{
-    driver::net::NetDevice, kinfo, kwarn,
+    driver::net::NetDevice,
     libs::rwlock::RwLockReadGuard,
     net::{socket::SocketPollMethod, NET_DEVICES},
     time::timer::{next_n_ms_timer_jiffies, Timer, TimerFunction},
@@ -121,7 +121,7 @@ fn dhcp_query() -> Result<(), SystemError> {
 pub fn poll_ifaces() {
     let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDevice>>> = NET_DEVICES.read_irqsave();
     if guard.len() == 0 {
-        kwarn!("poll_ifaces: No net driver found!");
+        warn!("poll_ifaces: No net driver found!");
         return;
     }
     let mut sockets = SOCKET_SET.lock_irqsave();
@@ -142,7 +142,7 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
         let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDevice>>> =
             NET_DEVICES.read_irqsave();
         if guard.len() == 0 {
-            kwarn!("poll_ifaces: No net driver found!");
+            warn!("poll_ifaces: No net driver found!");
             // 没有网卡，返回错误
             return Err(SystemError::ENODEV);
         }
@@ -172,7 +172,7 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
 pub fn poll_ifaces_try_lock_onetime() -> Result<(), SystemError> {
     let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDevice>>> = NET_DEVICES.read_irqsave();
     if guard.len() == 0 {
-        kwarn!("poll_ifaces: No net driver found!");
+        warn!("poll_ifaces: No net driver found!");
         // 没有网卡，返回错误
         return Err(SystemError::ENODEV);
     }

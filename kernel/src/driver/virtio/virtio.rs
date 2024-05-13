@@ -10,11 +10,11 @@ use crate::driver::pci::pci::{
 };
 use crate::driver::virtio::transport::VirtIOTransport;
 use crate::libs::rwlock::RwLockWriteGuard;
-use crate::{kerror, kwarn};
+
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::{boxed::Box, collections::LinkedList};
-use log::debug;
+use log::{debug, error, warn};
 use virtio_drivers::transport::{DeviceType, Transport};
 
 ///@brief 寻找并加载所有virtio设备的驱动（目前只有virtio-net，但其他virtio设备也可添加）
@@ -42,7 +42,7 @@ fn virtio_probe_pci() {
                 virtio_device_init(transport, dev_id);
             }
             Err(err) => {
-                kerror!("Pci transport create failed because of error: {}", err);
+                error!("Pci transport create failed because of error: {}", err);
             }
         }
     }
@@ -53,14 +53,14 @@ pub(super) fn virtio_device_init(transport: VirtIOTransport, dev_id: Arc<DeviceI
     match transport.device_type() {
         DeviceType::Block => virtio_blk(transport, dev_id),
         DeviceType::GPU => {
-            kwarn!("Not support virtio_gpu device for now");
+            warn!("Not support virtio_gpu device for now");
         }
         DeviceType::Input => {
-            kwarn!("Not support virtio_input device for now");
+            warn!("Not support virtio_input device for now");
         }
         DeviceType::Network => virtio_net(transport, dev_id),
         t => {
-            kwarn!("Unrecognized virtio device: {:?}", t);
+            warn!("Unrecognized virtio device: {:?}", t);
         }
     }
 }

@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use log::error;
 use system_error::SystemError;
 use x86::apic::ApicId;
 
@@ -13,7 +14,6 @@ use crate::{
         irqdesc::{irq_desc_manager, IrqDesc, IrqFlowHandler, IrqHandler},
         HardwareIrqNumber, IrqNumber,
     },
-    kerror,
     smp::cpu::ProcessorId,
 };
 
@@ -257,7 +257,7 @@ impl IrqFlowHandler for X86_64IpiIrqFlowHandler {
                 CurrentApic.send_eoi();
             }
             _ => {
-                kerror!("Unknown IPI: {}", irq.data());
+                error!("Unknown IPI: {}", irq.data());
                 CurrentApic.send_eoi();
             }
         }

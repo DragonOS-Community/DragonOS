@@ -2,12 +2,11 @@ use core::{fmt::Debug, hint::spin_loop, ptr::NonNull};
 
 use acpi::{AcpiHandler, AcpiTables, PlatformInfo};
 use alloc::{string::ToString, sync::Arc};
-use log::info;
+use log::{error, info};
 
 use crate::{
     arch::MMArch,
     driver::base::firmware::sys_firmware_kset,
-    kinfo,
     libs::align::{page_align_down, page_align_up, AlignedBox},
     mm::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
@@ -96,7 +95,7 @@ impl AcpiManager {
             }
             // 如果rsdpv1和rsdpv2都无法获取到acpi_table，说明有问题，打印报错信息后进入死循环
             Err(e2) => {
-                kerror!("acpi_init(): failed to parse acpi tables, error: (rsdpv1: {:?}) or (rsdpv2: {:?})", e1, e2);
+                error!("acpi_init(): failed to parse acpi tables, error: (rsdpv1: {:?}) or (rsdpv2: {:?})", e1, e2);
                 Self::drop_rsdp_tmp_box();
                 loop {
                     spin_loop();
@@ -162,7 +161,7 @@ impl AcpiManager {
     pub fn platform_info(&self) -> Option<PlatformInfo<'_, alloc::alloc::Global>> {
         let r = self.tables()?.platform_info();
         if let Err(ref e) = r {
-            kerror!(
+            error!(
                 "AcpiManager::platform_info(): failed to get platform info, error: {:?}",
                 e
             );

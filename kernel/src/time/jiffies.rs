@@ -2,10 +2,10 @@ use alloc::{
     string::ToString,
     sync::{Arc, Weak},
 };
-use log::info;
+use log::{error, info};
 use system_error::SystemError;
 
-use crate::{arch::time::CLOCK_TICK_RATE, kerror, kinfo, libs::spinlock::SpinLock};
+use crate::{arch::time::CLOCK_TICK_RATE, libs::spinlock::SpinLock};
 
 use super::{
     clocksource::{Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum, HZ},
@@ -100,7 +100,7 @@ pub fn jiffies_init() {
             info!("jiffies_init sccessfully");
         }
         Err(_) => {
-            kerror!("jiffies_init failed, no default clock running");
+            error!("jiffies_init failed, no default clock running");
         }
     };
 }

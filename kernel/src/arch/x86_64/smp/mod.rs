@@ -11,7 +11,6 @@ use system_error::SystemError;
 use crate::{
     arch::{mm::LowAddressRemapping, process::table::TSSManager, MMArch},
     exception::InterruptArch,
-    kdebug,
     libs::{cpumask::CpuMask, rwlock::RwLock},
     mm::{percpu::PerCpu, MemoryManagementArch, PhysAddr, VirtAddr, IDLE_PROCESS_ADDRESS_SPACE},
     process::ProcessManager,

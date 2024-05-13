@@ -1,3 +1,4 @@
+use log::{error, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -90,15 +91,14 @@ impl EFIManager {
         min_major: u16,
     ) -> Result<(), SystemError> {
         if header.signature != uefi_raw::table::system::SystemTable::SIGNATURE {
-            kerror!("System table signature mismatch!");
+            error!("System table signature mismatch!");
             return Err(SystemError::EINVAL);
         }
 
         if header.revision.major() < min_major {
-            kwarn!(
+            warn!(
                 "System table version: {:?}, expected {}.00 or greater!",
-                header.revision,
-                min_major
+                header.revision, min_major
             );
         }
 

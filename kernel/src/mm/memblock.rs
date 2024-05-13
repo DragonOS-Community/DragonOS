@@ -204,7 +204,7 @@ impl MemBlockManager {
 
                 if this.base + this.size != next_base || this.flags != next_flags {
                     if unlikely(this.base + this.size > next_base) {
-                        kBUG!("this->base + this->size > next->base");
+                        panic!("this->base + this->size > next->base");
                     }
                     i += 1;
                     continue;

@@ -206,7 +206,7 @@ impl OpenFirmwareFdtDriver {
 
     #[cfg(target_arch = "x86_64")]
     pub fn early_init_dt_add_memory(&self, _base: u64, _size: u64) {
-        kBUG!("x86_64 should not call early_init_dt_add_memory");
+        panic!("x86_64 should not call early_init_dt_add_memory");
     }
 
     #[cfg(not(target_arch = "x86_64"))]

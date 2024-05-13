@@ -1,9 +1,9 @@
 use core::{
-    fmt::{self, Arguments, Write},
+    fmt::{self, Write},
     sync::atomic::Ordering,
 };
 
-use alloc::string::{String, ToString};
+use alloc::string::ToString;
 use log::{info, Level, Log};
 
 use super::lib_ui::textui::{textui_putstr, FontColor};
@@ -31,49 +31,6 @@ macro_rules! println {
         $crate::print!("\n");
     };
     ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
-}
-
-#[macro_export]
-macro_rules! kdebug {
-    ($($arg:tt)*) => {
-        $crate::libs::printk::Logger.log(7,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ DEBUG ] ({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)))
-    }
-}
-
-#[macro_export]
-macro_rules! kinfo {
-    ($($arg:tt)*) => {
-        $crate::libs::printk::Logger.log(6,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ INFO ] ({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)))
-    }
-}
-
-#[macro_export]
-macro_rules! kwarn {
-    ($($arg:tt)*) => {
-        $crate::libs::printk::Logger.log(4,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("\x1B[1;33m[ WARN ] \x1B[0m"));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-    }
-}
-
-#[macro_export]
-macro_rules! kerror {
-    ($($arg:tt)*) => {
-        $crate::libs::printk::Logger.log(3,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("\x1B[41m[ ERROR ] \x1B[0m"));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-    }
-}
-
-#[macro_export]
-macro_rules! kBUG {
-    ($($arg:tt)*) => {
-        $crate::libs::printk::Logger.log(1,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("\x1B[41m[ BUG ] \x1B[0m"));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-    }
 }
 
 pub struct PrintkWriter;
@@ -157,36 +114,27 @@ impl Log for CustomLogger {
 
 impl CustomLogger {
     fn iodisplay(record: &log::Record) {
-        match record.level(){
-            Level::Debug|Level::Info =>{
-                write!(
-                    PrintkWriter,
-                    "[ {} ] ",
-                    record.level(),
-                )
-            },
-            Level::Error=>{
-                write!(
-                    PrintkWriter,
-                    "\x1B[41m[ ERROR ] \x1B[0m",
-                )
-            },
-            Level::Warn=>{
-                write!(
-                    PrintkWriter,
-                    "\x1B[1;33m[ WARN ] \x1B[0m",
-                )
-            },
-            Level::Trace=>{
+        match record.level() {
+            Level::Debug | Level::Info => {
+                write!(PrintkWriter, "[ {} ] ", record.level(),)
+            }
+            Level::Error => {
+                write!(PrintkWriter, "\x1B[41m[ ERROR ] \x1B[0m",)
+            }
+            Level::Warn => {
+                write!(PrintkWriter, "\x1B[1;33m[ WARN ] \x1B[0m",)
+            }
+            Level::Trace => {
                 todo!()
             }
-        }.unwrap();
+        }
+        .unwrap();
         writeln!(
             PrintkWriter,
             "({}:{})\t {}",
-                record.file().unwrap_or(""),
-                record.line().unwrap_or(0),
-                record.args()
+            record.file().unwrap_or(""),
+            record.line().unwrap_or(0),
+            record.args()
         )
         .unwrap();
     }

@@ -3,9 +3,10 @@
 //! 架构相关的处理逻辑参考： https://code.dragonos.org.cn/xref/linux-6.6.21/arch/riscv/kernel/traps.c
 use core::hint::spin_loop;
 
+use log::error;
 use system_error::SystemError;
 
-use crate::{arch::syscall::syscall_handler, driver::irqchip::riscv_intc::riscv_intc_irq, kerror};
+use crate::{arch::syscall::syscall_handler, driver::irqchip::riscv_intc::riscv_intc_irq};
 
 use super::TrapFrame;
 

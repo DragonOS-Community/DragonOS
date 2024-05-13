@@ -1,11 +1,11 @@
 use fdt::node::FdtNode;
+use log::{debug, info};
 use system_error::SystemError;
 
 use crate::{
     arch::{driver::sbi::SbiDriver, mm::init::mm_early_init},
     driver::{firmware::efi::init::efi_init, open_firmware::fdt::open_firmware_fdt_driver},
     init::{boot_params, init::start_kernel},
-    kdebug, kinfo,
     mm::{memblock::mem_block_manager, PhysAddr, VirtAddr},
     print, println,
     smp::cpu::ProcessorId,

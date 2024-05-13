@@ -1,4 +1,5 @@
 use alloc::sync::{Arc, Weak};
+use log::error;
 use core::{
     arch::asm,
     intrinsics::unlikely,
@@ -15,7 +16,6 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    kerror,
     libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{

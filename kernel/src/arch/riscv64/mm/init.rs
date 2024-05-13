@@ -1,5 +1,6 @@
 use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
+use log::{debug, info};
 use system_error::SystemError;
 
 use crate::{
@@ -11,7 +12,6 @@ use crate::{
         MMArch,
     },
     driver::firmware::efi::efi_manager,
-    kdebug, kinfo,
     libs::lib_ui::screen_manager::scm_disable_put_to_window,
     mm::{
         allocator::{buddy::BuddyAllocator, bump::BumpAllocator, page_frame::FrameAllocator},

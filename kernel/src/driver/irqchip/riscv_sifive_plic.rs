@@ -25,6 +25,7 @@ use alloc::{
 };
 use bitmap::AllocBitmap;
 use fdt::node::FdtNode;
+use log::{debug, warn};
 use system_error::SystemError;
 
 use crate::{

@@ -1,6 +1,7 @@
+use log::{debug, info};
+
 use crate::{
     driver::open_firmware::fdt::open_firmware_fdt_driver,
-    kdebug, kinfo,
     time::{clocksource::HZ, TimeArch},
 };
 pub struct RiscV64TimeArch;

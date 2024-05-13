@@ -1,7 +1,8 @@
+use log::error;
+
 use crate::{
     arch::{sched::sched, CurrentIrqArch},
     exception::InterruptArch,
-    kerror,
     process::ProcessManager,
 };
 

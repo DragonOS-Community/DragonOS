@@ -18,7 +18,7 @@ macro_rules! syscall_return {
 
         if $show {
             let pid = ProcessManager::current_pcb().pid();
-            crate::debug!("syscall return:pid={:?},ret= {:?}\n", pid, ret as isize);
+            log::debug!("syscall return:pid={:?},ret= {:?}\n", pid, ret as isize);
         }
 
         unsafe {

@@ -1,12 +1,10 @@
+use log::warn;
 use system_error::SystemError;
 
-use crate::{
-    kwarn,
-    smp::{
+use crate::smp::{
         cpu::{CpuHpCpuState, ProcessorId},
         SMPArch,
-    },
-};
+    };
 
 pub struct RiscV64SMPArch;
 

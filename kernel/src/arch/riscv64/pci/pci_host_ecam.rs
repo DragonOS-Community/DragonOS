@@ -1,4 +1,5 @@
 use fdt::{node::FdtNode, Fdt};
+use log::debug;
 use system_error::SystemError;
 
 use crate::{
@@ -6,7 +7,6 @@ use crate::{
         open_firmware::fdt::open_firmware_fdt_driver,
         pci::ecam::{pci_ecam_root_info_manager, EcamRootInfo},
     },
-    kdebug,
     mm::PhysAddr,
 };
 

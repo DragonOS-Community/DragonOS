@@ -228,12 +228,12 @@ impl LocalApicTimer {
         );
         self.mode = LocalApicTimerMode::Periodic;
         self.set_divisor(divisor);
-        self.set_initial_cnt(initial_count);
         self.setup_lvt(
             APIC_TIMER_IRQ_NUM.data() as u8,
             true,
             LocalApicTimerMode::Periodic,
         );
+        self.set_initial_cnt(initial_count);
     }
 
     fn setup_lvt(&mut self, vector: u8, mask: bool, mode: LocalApicTimerMode) {

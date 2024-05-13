@@ -13,6 +13,7 @@ use crate::{
     libs::{casting::DowncastArc, once::Once},
 };
 use alloc::sync::Arc;
+use log::info;
 use system_error::SystemError;
 
 pub mod dir;
@@ -34,7 +35,7 @@ pub fn sysfs_init() -> Result<(), SystemError> {
     static INIT: Once = Once::new();
     let mut result = None;
     INIT.call_once(|| {
-        kinfo!("Initializing SysFS...");
+        info!("Initializing SysFS...");
 
         // 创建 sysfs 实例
         // let sysfs: Arc<OldSysFS> = OldSysFS::new();
@@ -47,9 +48,9 @@ pub fn sysfs_init() -> Result<(), SystemError> {
             .expect("Unabled to find /sys")
             .mount(sysfs_instance().fs().clone())
             .expect("Failed to mount at /sys");
-        kinfo!("SysFS mounted.");
+        info!("SysFS mounted.");
 
-        // kdebug!("sys_bus_init result: {:?}", SYS_BUS_INODE().list());
+        // debug!("sys_bus_init result: {:?}", SYS_BUS_INODE().list());
         result = Some(Ok(()));
     });
 

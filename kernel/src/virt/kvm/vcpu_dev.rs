@@ -11,13 +11,14 @@ use crate::mm::VirtAddr;
 use crate::syscall::user_access::copy_from_user;
 use crate::virt::kvm::vcpu::Vcpu;
 use crate::virt::kvm::vm;
-use crate::{filesystem, kdebug};
+use crate::filesystem;
 use crate::{libs::spinlock::SpinLock, time::PosixTimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::debug;
 use system_error::SystemError;
 
 // pub const KVM_API_VERSION:u32 = 12;
@@ -102,7 +103,7 @@ impl IndexNode for LockedVcpuInode {
         _data: SpinLockGuard<FilePrivateData>,
         _mode: &FileMode,
     ) -> Result<(), SystemError> {
-        kdebug!("file private data:{:?}", _data);
+        debug!("file private data:{:?}", _data);
         return Ok(());
     }
 
@@ -149,11 +150,11 @@ impl IndexNode for LockedVcpuInode {
     ) -> Result<usize, SystemError> {
         match cmd {
             0xdeadbeef => {
-                kdebug!("kvm_cpu ioctl");
+                debug!("kvm_cpu ioctl");
                 Ok(0)
             }
             KVM_RUN => {
-                kdebug!("kvm_cpu ioctl");
+                debug!("kvm_cpu ioctl");
                 // let guest_stack = vec![0xCC; GUEST_STACK_SIZE];
                 // let host_stack = vec![0xCC; HOST_STACK_SIZE];
                 // let guest_rsp = guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64;
@@ -177,7 +178,7 @@ impl IndexNode for LockedVcpuInode {
                         VirtAddr::new(data),
                     )?;
                 }
-                kdebug!(
+                debug!(
                     "rip={:x}, rflags={:x}, rsp={:x}, rax={:x}",
                     kvm_regs.rip,
                     kvm_regs.rflags,
@@ -191,7 +192,7 @@ impl IndexNode for LockedVcpuInode {
                 Ok(0)
             }
             _ => {
-                kdebug!("kvm_cpu ioctl");
+                debug!("kvm_cpu ioctl");
                 Ok(usize::MAX)
             }
         }

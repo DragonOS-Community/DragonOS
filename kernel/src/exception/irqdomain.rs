@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use log::info;
 use system_error::SystemError;
 
 use crate::{
@@ -203,7 +204,7 @@ impl IrqDomainManager {
         if let Err(e) = r {
             if e != SystemError::ENOSYS {
                 if e != SystemError::EPERM {
-                    kinfo!("domain associate failed: {:?}, domain '{:?}' didn't like hwirq {} to virq {} mapping.", e, domain.name(), hwirq.data(), irq.data());
+                    info!("domain associate failed: {:?}, domain '{:?}' didn't like hwirq {} to virq {} mapping.", e, domain.name(), hwirq.data(), irq.data());
                 }
                 let mut irq_data_guard = irq_data.inner();
                 irq_data_guard.set_domain(None);
@@ -246,7 +247,7 @@ impl IrqDomainManager {
     /// 这是调用 domain_ops->activate 以编程中断控制器的第二步，以便中断实际上可以被传递。
     pub fn activate_irq(&self, irq_data: &Arc<IrqData>, reserve: bool) -> Result<(), SystemError> {
         let mut r = Ok(());
-        // kdebug!(
+        // debug!(
         //     "activate_irq: irq_data.common_data().status().is_activated()={}",
         //     irq_data.common_data().status().is_activated()
         // );
@@ -270,9 +271,9 @@ impl IrqDomainManager {
         let mut r = Ok(());
 
         if let Some(irq_data) = irq_data {
-            // kdebug!("do_activate_irq: irq_data={:?}", irq_data);
+            // debug!("do_activate_irq: irq_data={:?}", irq_data);
             if let Some(domain) = irq_data.domain() {
-                // kdebug!("do_activate_irq: domain={:?}", domain.name());
+                // debug!("do_activate_irq: domain={:?}", domain.name());
                 let parent_data = irq_data.parent_data().and_then(|x| x.upgrade());
                 if let Some(parent_data) = parent_data.clone() {
                     r = self.do_activate_irq(Some(parent_data), reserve);

@@ -225,7 +225,7 @@ fn do_waitpid(
         }
         ProcessState::Exited(status) => {
             let pid = child_pcb.pid();
-            // kdebug!("wait4: child exited, pid: {:?}, status: {status}\n", pid);
+            // debug!("wait4: child exited, pid: {:?}, status: {status}\n", pid);
 
             if likely(!kwo.options.contains(WaitOption::WEXITED)) {
                 return None;
@@ -244,7 +244,7 @@ fn do_waitpid(
             kwo.ret_status = status as i32;
 
             drop(child_pcb);
-            // kdebug!("wait4: to release {pid:?}");
+            // debug!("wait4: to release {pid:?}");
             unsafe { ProcessManager::release(pid) };
             return Some(Ok(pid.into()));
         }

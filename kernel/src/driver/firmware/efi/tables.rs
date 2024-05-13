@@ -1,6 +1,7 @@
 use core::{ffi::CStr, mem::size_of};
 
 use hashbrown::Equivalent;
+use log::{debug, info};
 use system_error::SystemError;
 use uefi_raw::table::{
     boot::{MemoryAttribute, MemoryType},
@@ -75,7 +76,7 @@ impl EFIManager {
 
         let s = CStr::from_bytes_with_nul(&tmp_buf)
             .unwrap_or_else(|_| CStr::from_bytes_with_nul(b"Unknown\0").unwrap());
-        kinfo!("EFI version: {:?}, vendor: {:?}", header.revision, s);
+        info!("EFI version: {:?}, vendor: {:?}", header.revision, s);
     }
 
     /// 解析EFI config table
@@ -344,7 +345,7 @@ impl MatchTable for MatchTableMemReserve {
     ) -> Result<(), SystemError> {
         efi_manager().inner.write_irqsave().memreserve_table_paddr =
             Some(PhysAddr::new(table_raw.vendor_table as usize));
-        kdebug!(
+        debug!(
             "memreserve_table_paddr: {:#x}",
             table_raw.vendor_table as usize
         );
@@ -374,7 +375,7 @@ impl MatchTable for MatchTableEsrt {
     ) -> Result<(), SystemError> {
         efi_manager().inner.write_irqsave().esrt_table_paddr =
             Some(PhysAddr::new(table_raw.vendor_table as usize));
-        kdebug!("esrt_table_paddr: {:#x}", table_raw.vendor_table as usize);
+        debug!("esrt_table_paddr: {:#x}", table_raw.vendor_table as usize);
         return Ok(());
     }
 }

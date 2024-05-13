@@ -6,6 +6,7 @@ use alloc::{
 };
 use driver_base_macros::get_weak_or_clear;
 use intertrait::CastFromSync;
+use log::debug;
 
 use crate::{
     filesystem::{
@@ -269,7 +270,7 @@ pub struct DynamicKObjKType;
 
 impl KObjType for DynamicKObjKType {
     fn release(&self, kobj: Arc<dyn KObject>) {
-        kdebug!("DynamicKObjKType::release() kobj:{:?}", kobj.name());
+        debug!("DynamicKObjKType::release() kobj:{:?}", kobj.name());
     }
 
     fn sysfs_ops(&self) -> Option<&dyn SysFSOps> {

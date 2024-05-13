@@ -4,6 +4,7 @@ use fdt::{
     node::{FdtNode, NodeProperty},
     Fdt,
 };
+use log::debug;
 use system_error::SystemError;
 
 use crate::{
@@ -106,13 +107,13 @@ impl OpenFirmwareFdtDriver {
         if let Some(prop) = node.property("#size-cells") {
             guard.root_size_cells = prop.as_usize().unwrap() as u32;
 
-            // kdebug!("fdt_root_size_cells={}", guard.root_size_cells);
+            // debug!("fdt_root_size_cells={}", guard.root_size_cells);
         }
 
         if let Some(prop) = node.property("#address-cells") {
             guard.root_addr_cells = prop.as_usize().unwrap() as u32;
 
-            // kdebug!("fdt_root_addr_cells={}", guard.root_addr_cells);
+            // debug!("fdt_root_addr_cells={}", guard.root_addr_cells);
         }
 
         return Ok(());
@@ -144,7 +145,7 @@ impl OpenFirmwareFdtDriver {
 
         // TODO: 拼接内核自定义的command line参数
 
-        kdebug!("Command line: {}", boot_params().read().boot_cmdline_str());
+        debug!("Command line: {}", boot_params().read().boot_cmdline_str());
         return Ok(());
     }
 
@@ -194,7 +195,7 @@ impl OpenFirmwareFdtDriver {
                     continue;
                 }
 
-                kdebug!("Found memory: base={:#x}, size={:#x}", base, size);
+                debug!("Found memory: base={:#x}, size={:#x}", base, size);
                 self.early_init_dt_add_memory(base, size);
                 found_memory = true;
             }
@@ -312,7 +313,7 @@ impl OpenFirmwareFdtDriver {
             if node.size() != 0 {
                 let address = PhysAddr::new(node.address() as usize);
                 let size = node.size();
-                kdebug!("Reserve memory: {:?}-{:?}", address, address + size);
+                debug!("Reserve memory: {:?}-{:?}", address, address + size);
                 mem_block_manager().reserve_block(address, size).unwrap();
             }
         }
@@ -431,7 +432,7 @@ fn reserved_mem_reserve_reg(node: &FdtNode<'_, '_>) -> Result<(), SystemError> {
                 .early_init_dt_reserve_memory(PhysAddr::new(base as usize), size as usize, nomap)
                 .is_ok()
         {
-            kdebug!(
+            debug!(
                 "Reserved memory: base={:#x}, size={:#x}, nomap={}",
                 base,
                 size,

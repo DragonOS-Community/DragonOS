@@ -18,6 +18,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
+use log::debug;
 use system_error::SystemError;
 
 use super::{acpi_kset, AcpiManager};
@@ -109,7 +110,7 @@ impl AcpiManager {
         let tables = self.tables().unwrap();
         let headers = tables.headers();
         for header in headers {
-            kdebug!("ACPI header: {:?}", header);
+            debug!("ACPI header: {:?}", header);
             let attr = AttrAcpiTable::new(&header)?;
             acpi_table_attr_list().write().push(attr);
             self.acpi_table_data_init(&header)?;

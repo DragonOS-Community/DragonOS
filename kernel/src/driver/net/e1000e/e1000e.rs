@@ -4,6 +4,7 @@
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use log::{debug, info};
 use core::intrinsics::unlikely;
 use core::mem::size_of;
 use core::ptr::NonNull;
@@ -284,7 +285,7 @@ impl E1000EDevice {
             volwrite!(general_regs, ctrl, ctrl | E1000E_CTRL_SLU);
         }
         let status = unsafe { volread!(general_regs, status) };
-        kdebug!("Status: {status:#X}");
+        debug!("Status: {status:#X}");
 
         // 读取设备的mac地址
         // Read mac address
@@ -442,7 +443,7 @@ impl E1000EDevice {
         buffer.set_length(desc.len as usize);
         rdt = index;
         unsafe { volwrite!(self.receive_regs, rdt0, rdt as u32) };
-        // kdebug!("e1000e: receive packet");
+        // debug!("e1000e: receive packet");
         return Some(buffer);
     }
 
@@ -559,7 +560,7 @@ impl Drop for E1000EDevice {
     fn drop(&mut self) {
         // 释放已分配的所有dma页
         // free all dma pages we have allocated
-        kdebug!("droping...");
+        debug!("droping...");
         let recv_ring_length = PAGE_SIZE / size_of::<E1000ERecvDesc>();
         let trans_ring_length = PAGE_SIZE / size_of::<E1000ETransDesc>();
         unsafe {
@@ -590,10 +591,10 @@ impl Drop for E1000EDevice {
 pub fn e1000e_init() {
     match e1000e_probe() {
         Ok(_code) => {
-            kinfo!("Successfully init e1000e device!");
+            info!("Successfully init e1000e device!");
         }
         Err(_error) => {
-            kinfo!("Error occurred!");
+            info!("Error occurred!");
         }
     }
 }
@@ -610,7 +611,7 @@ pub fn e1000e_probe() -> Result<u64, E1000EPciError> {
         if header.vendor_id == 0x8086 {
             // intel
             if E1000E_DEVICE_ID.contains(&header.device_id) {
-                kdebug!(
+                debug!(
                     "Detected e1000e PCI device with device id {:#x}",
                     header.device_id
                 );

@@ -590,7 +590,7 @@ impl KernFSInode {
         target: &Arc<KernFSInode>,
         target_absolute_path: String,
     ) -> Result<Arc<KernFSInode>, SystemError> {
-        // kdebug!("kernfs add link: name:{name}, target path={target_absolute_path}");
+        // debug!("kernfs add link: name:{name}, target path={target_absolute_path}");
         let inode = self.inner_create(
             name,
             KernInodeType::SymLink,

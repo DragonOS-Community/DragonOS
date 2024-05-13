@@ -3,13 +3,13 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use alloc::string::{String, ToString};
+use log::debug;
 use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, process::arch_switch_to_user},
     driver::{net::e1000e::e1000e::e1000e_init, virtio::virtio::virtio_probe},
-    filesystem::vfs::core::mount_root_fs,
-    kdebug, kerror,
+    filesystem::vfs::core::mount_root_fs, kerror,
     net::net_core::net_init,
     process::{kthread::KernelThreadMechanism, stdio::stdio_init, ProcessFlags, ProcessManager},
     smp::smp_init,
@@ -44,7 +44,7 @@ fn kernel_init() -> Result<(), SystemError> {
         kerror!("Failed to initialize network: {:?}", err);
     });
 
-    kdebug!("initial kernel thread done.");
+    debug!("initial kernel thread done.");
 
     return Ok(());
 }

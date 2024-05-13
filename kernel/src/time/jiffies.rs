@@ -2,6 +2,7 @@ use alloc::{
     string::ToString,
     sync::{Arc, Weak},
 };
+use log::info;
 use system_error::SystemError;
 
 use crate::{arch::time::CLOCK_TICK_RATE, kerror, kinfo, libs::spinlock::SpinLock};
@@ -96,7 +97,7 @@ pub fn jiffies_init() {
     let jiffies = clocksource_default_clock() as Arc<dyn Clocksource>;
     match jiffies.register(1, 0) {
         Ok(_) => {
-            kinfo!("jiffies_init sccessfully");
+            info!("jiffies_init sccessfully");
         }
         Err(_) => {
             kerror!("jiffies_init failed, no default clock running");

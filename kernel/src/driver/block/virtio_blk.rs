@@ -5,6 +5,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::debug;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 use virtio_drivers::device::blk::VirtIOBlk;
@@ -63,7 +64,7 @@ pub fn virtio_blk_0() -> Option<Arc<VirtIOBlkDevice>> {
 pub fn virtio_blk(transport: VirtIOTransport, dev_id: Arc<DeviceId>) {
     let device = VirtIOBlkDevice::new(transport, dev_id);
     if let Some(device) = device {
-        kdebug!("VirtIOBlkDevice '{:?}' created", device.dev_id);
+        debug!("VirtIOBlkDevice '{:?}' created", device.dev_id);
         virtio_device_manager()
             .device_add(device.clone() as Arc<dyn VirtIODevice>)
             .expect("Add virtio blk failed");

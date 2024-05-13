@@ -9,6 +9,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::info;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -1006,7 +1007,7 @@ fn vesa_fb_device_init() -> Result<(), SystemError> {
 
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        kinfo!("vesa fb device init");
+        info!("vesa fb device init");
         let device = Arc::new(VesaFb::new());
 
         let mut fb_fix = VESAFB_FIX_INFO.write_irqsave();

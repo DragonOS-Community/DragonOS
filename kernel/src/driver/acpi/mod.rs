@@ -2,6 +2,7 @@ use core::{fmt::Debug, hint::spin_loop, ptr::NonNull};
 
 use acpi::{AcpiHandler, AcpiTables, PlatformInfo};
 use alloc::{string::ToString, sync::Arc};
+use log::info;
 
 use crate::{
     arch::MMArch,
@@ -57,7 +58,7 @@ impl AcpiManager {
     ///
     /// https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/acpi/bus.c#1390
     pub fn init(&self, rsdp_vaddr1: u64, rsdp_vaddr2: u64) -> Result<(), SystemError> {
-        kinfo!("Initializing Acpi Manager...");
+        info!("Initializing Acpi Manager...");
 
         // 初始化`/sys/firmware/acpi`的kset
         let kset = KSet::new("acpi".to_string());
@@ -67,7 +68,7 @@ impl AcpiManager {
         }
         self.map_tables(rsdp_vaddr1, rsdp_vaddr2)?;
         self.bus_init()?;
-        kinfo!("Acpi Manager initialized.");
+        info!("Acpi Manager initialized.");
         return Ok(());
     }
 

@@ -4,7 +4,7 @@ use core::{
 };
 
 use alloc::string::ToString;
-use log::{info, Log};
+use log::{info, Level, Log};
 
 use super::lib_ui::textui::{textui_putstr, FontColor};
 
@@ -145,22 +145,47 @@ impl Log for CustomLogger {
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
             // todo: 接入kmsg
-
-            writeln!(
-                PrintkWriter,
-                "[ {} ] {} ({}:{}) {}",
-                record.level(),
-                record.target(),
-                record.file().unwrap_or(""),
-                record.line().unwrap_or(0),
-                record.args()
-            )
-            .unwrap();
+            Self::kernel_log(record);
+            Self::iodisplay(record)
         }
     }
 
     fn flush(&self) {
         // 如果需要的话，可以在这里实现缓冲区刷新逻辑
+    }
+}
+
+impl CustomLogger{
+    fn iodisplay(record: &log::Record){
+        writeln!(
+            PrintkWriter,
+            "[ {} ] ({}:{}) {}",
+            record.level(),
+            record.file().unwrap_or(""),
+            record.line().unwrap_or(0),
+            record.args()
+        )
+        .unwrap();
+    }
+    
+    fn kernel_log(record: &log::Record){
+        match record.level(){
+            Level::Debug=>{
+                Logger.log(7, format_args!("({}:{})\t {}\n",record.file().unwrap_or(""),record.line().unwrap_or(0),record.args()))
+            },
+            Level::Error=>{
+                Logger.log(3, format_args!("({}:{})\t {}\n",record.file().unwrap_or(""),record.line().unwrap_or(0),record.args()))
+            },
+            Level::Info=>{
+                Logger.log(6, format_args!("({}:{})\t {}\n",record.file().unwrap_or(""),record.line().unwrap_or(0),record.args()))
+            },
+            Level::Warn=>{
+                Logger.log(4, format_args!("({}:{})\t {}\n",record.file().unwrap_or(""),record.line().unwrap_or(0),record.args()))
+            },
+            Level::Trace=>{
+                todo!()
+            }
+        }
     }
 }
 

@@ -20,6 +20,7 @@ use crate::{
     syscall::user_access::check_and_clone_cstr,
 };
 
+use log::info;
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 
@@ -69,9 +70,9 @@ impl Syscall {
         if prev {
             panic!("Cannot initialize syscall more than once!");
         }
-        kinfo!("Initializing syscall...");
+        info!("Initializing syscall...");
         let r = crate::arch::syscall::arch_syscall_init();
-        kinfo!("Syscall init successfully!");
+        info!("Syscall init successfully!");
 
         return r;
     }
@@ -369,7 +370,7 @@ impl Syscall {
             SYS_KILL => {
                 let pid = Pid::new(args[0]);
                 let sig = args[1] as c_int;
-                // kdebug!("KILL SYSCALL RECEIVED");
+                // debug!("KILL SYSCALL RECEIVED");
                 Self::kill(pid, sig)
             }
 
@@ -650,7 +651,7 @@ impl Syscall {
                     Err(SystemError::EINVAL)
                 };
 
-                // kdebug!("FCNTL: fd: {}, cmd: {:?}, arg: {}, res: {:?}", fd, cmd, arg, res);
+                // debug!("FCNTL: fd: {}, cmd: {:?}, arg: {}, res: {:?}", fd, cmd, arg, res);
                 res
             }
 
@@ -658,7 +659,7 @@ impl Syscall {
                 let fd = args[0] as i32;
                 let len = args[1];
                 let res = Self::ftruncate(fd, len);
-                // kdebug!("FTRUNCATE: fd: {}, len: {}, res: {:?}", fd, len, res);
+                // debug!("FTRUNCATE: fd: {}, len: {}, res: {:?}", fd, len, res);
                 res
             }
 

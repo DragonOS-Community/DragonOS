@@ -10,6 +10,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use atomic_enum::atomic_enum;
+use log::info;
 use system_error::SystemError;
 
 use crate::{
@@ -258,7 +259,7 @@ pub struct KernelThreadMechanism;
 impl KernelThreadMechanism {
     pub fn init_stage1() {
         assert!(ProcessManager::current_pcb().pid() == Pid::new(0));
-        kinfo!("Initializing kernel thread mechanism stage1...");
+        info!("Initializing kernel thread mechanism stage1...");
 
         // 初始化第一个内核线程
 
@@ -290,7 +291,7 @@ impl KernelThreadMechanism {
             .remove(ProcessFlags::KTHREAD);
 
         drop(irq_guard);
-        kinfo!("Initializing kernel thread mechanism stage1 complete");
+        info!("Initializing kernel thread mechanism stage1 complete");
     }
 
     pub fn init_stage2() {
@@ -299,7 +300,7 @@ impl KernelThreadMechanism {
             .contains(ProcessFlags::KTHREAD));
         static INIT: Once = Once::new();
         INIT.call_once(|| {
-            kinfo!("Initializing kernel thread mechanism stage2...");
+            info!("Initializing kernel thread mechanism stage2...");
             // 初始化kthreadd
             let closure = KernelThreadClosure::EmptyClosure((Box::new(Self::kthread_daemon), ()));
             let info = KernelThreadCreateInfo::new(closure, "kthreadd".to_string());
@@ -315,7 +316,7 @@ impl KernelThreadMechanism {
             unsafe {
                 KTHREAD_DAEMON_PCB.replace(pcb);
             }
-            kinfo!("Initialize kernel thread mechanism stage2 complete");
+            info!("Initialize kernel thread mechanism stage2 complete");
         });
     }
 

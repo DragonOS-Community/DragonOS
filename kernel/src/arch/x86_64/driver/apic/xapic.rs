@@ -4,6 +4,8 @@ use core::{
     ptr::{read_volatile, write_volatile},
 };
 
+use log::{debug, info};
+
 use crate::{
     kdebug, kerror, kinfo,
     mm::{
@@ -157,7 +159,7 @@ impl XApic {
         g.map_phys(paddr, 4096).expect("Fail to map MMIO for XAPIC");
         let addr = g.vaddr() + offset;
 
-        kdebug!(
+        debug!(
             "XAPIC: {:#x} -> {:#x}, offset={offset}",
             xapic_base.data(),
             addr.data()
@@ -233,11 +235,11 @@ impl LocalAPIC for XApic {
 
                 return false;
             } else {
-                kinfo!("xAPIC software enabled.");
+                info!("xAPIC software enabled.");
             }
 
             if val & 0x1000 != 0 {
-                kinfo!("xAPIC EOI broadcast suppression enabled.");
+                info!("xAPIC EOI broadcast suppression enabled.");
             }
 
             self.mask_all_lvt();

@@ -11,6 +11,7 @@ use crate::{
     process::ProcessManager,
     syscall::{Syscall, SYS_SCHED},
 };
+use log::debug;
 use system_error::SystemError;
 
 use super::{
@@ -52,7 +53,7 @@ macro_rules! syscall_return {
 
         if $show {
             let pid = ProcessManager::current_pcb().pid();
-            crate::kdebug!("syscall return:pid={:?},ret= {:?}\n", pid, ret as isize);
+            debug!("syscall return:pid={:?},ret= {:?}\n", pid, ret as isize);
         }
 
         unsafe {
@@ -94,7 +95,7 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
     // };
 
     if show {
-        crate::kdebug!("syscall: pid: {:?}, num={:?}\n", pid, syscall_num);
+        debug!("syscall: pid: {:?}, num={:?}\n", pid, syscall_num);
     }
 
     // Arch specific syscall
@@ -126,7 +127,7 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
 
 /// 系统调用初始化
 pub fn arch_syscall_init() -> Result<(), SystemError> {
-    // kinfo!("arch_syscall_init\n");
+    // info!("arch_syscall_init\n");
     unsafe { set_system_trap_gate(0x80, 0, VirtAddr::new(syscall_int as usize)) }; // 系统调用门
     unsafe { init_syscall_64() };
     return Ok(());

@@ -10,6 +10,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::info;
 use system_error::SystemError;
 
 use crate::{
@@ -246,7 +247,7 @@ impl SoftirqVec for DoTimerSoftirq {
         }
         // 最多只处理TIMER_RUN_CYCLE_THRESHOLD个计时器
         for _ in 0..TIMER_RUN_CYCLE_THRESHOLD {
-            // kdebug!("DoTimerSoftirq run");
+            // debug!("DoTimerSoftirq run");
             let timer_list = TIMER_LIST.try_lock_irqsave();
             if timer_list.is_err() {
                 continue;
@@ -258,7 +259,7 @@ impl SoftirqVec for DoTimerSoftirq {
             }
 
             let (front_jiffies, timer_list_front) = timer_list.first().unwrap().clone();
-            // kdebug!("to lock timer_list_front");
+            // debug!("to lock timer_list_front");
 
             if front_jiffies >= TIMER_JIFFIES.load(Ordering::SeqCst) {
                 break;
@@ -280,7 +281,7 @@ pub fn timer_init() {
     softirq_vectors()
         .register_softirq(SoftirqNumber::TIMER, do_timer_softirq)
         .expect("Failed to register timer softirq");
-    kinfo!("timer initialized successfully");
+    info!("timer initialized successfully");
 }
 
 /// 计算接下来n毫秒对应的定时器时间片
@@ -300,7 +301,7 @@ pub fn next_n_us_timer_jiffies(expire_us: u64) -> u64 {
 ///
 /// @return Err(SystemError) 错误码
 pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
-    // kdebug!("schedule_timeout");
+    // debug!("schedule_timeout");
     if timeout == MAX_TIMEOUT {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(true).ok();
@@ -337,16 +338,16 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
 
 pub fn timer_get_first_expire() -> Result<u64, SystemError> {
     // FIXME
-    // kdebug!("rs_timer_get_first_expire,timer_jif = {:?}", TIMER_JIFFIES);
+    // debug!("rs_timer_get_first_expire,timer_jif = {:?}", TIMER_JIFFIES);
     for _ in 0..10 {
         match TIMER_LIST.try_lock_irqsave() {
             Ok(timer_list) => {
-                // kdebug!("rs_timer_get_first_expire TIMER_LIST lock successfully");
+                // debug!("rs_timer_get_first_expire TIMER_LIST lock successfully");
                 if timer_list.is_empty() {
-                    // kdebug!("timer_list is empty");
+                    // debug!("timer_list is empty");
                     return Ok(0);
                 } else {
-                    // kdebug!("timer_list not empty");
+                    // debug!("timer_list not empty");
                     return Ok(timer_list.first().unwrap().0);
                 }
             }

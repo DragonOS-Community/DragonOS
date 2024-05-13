@@ -430,7 +430,7 @@ impl SigPending {
     /// @brief 从当前进程的sigpending中取出下一个待处理的signal，并返回给调用者。（调用者应当处理这个信号）
     /// 请注意，进入本函数前，当前进程应当持有current_pcb().sighand.siglock
     pub fn dequeue_signal(&mut self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {
-        // kdebug!("dequeue signal");
+        // debug!("dequeue signal");
         // 获取下一个要处理的信号的编号
         let sig = self.next_signal(sig_mask);
 

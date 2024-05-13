@@ -173,7 +173,7 @@ impl Syscall {
             }
 
             // TODO 如果为空，赋默认值？
-            // kdebug!("new_ka={:?}", new_ka);
+            // debug!("new_ka={:?}", new_ka);
             // 如果用户手动给了sa_restorer，那么就置位SA_FLAG_RESTORER，否则报错。（用户必须手动指定restorer）
             if new_ka.restorer().is_some() {
                 new_ka.flags_mut().insert(SigFlags::SA_RESTORER);

@@ -2,9 +2,10 @@ use crate::arch::kvm::vmx::vcpu::VmxVcpu;
 use crate::arch::MMArch;
 use crate::libs::mutex::Mutex;
 use crate::mm::MemoryManagementArch;
-use crate::{arch::KVMArch, kdebug};
+use crate::arch::KVMArch;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use log::debug;
 use system_error::SystemError;
 
 // use super::HOST_STACK_SIZE;
@@ -48,10 +49,10 @@ impl Vm {
         &mut self,
         mem: &KvmUserspaceMemoryRegion,
     ) -> Result<(), SystemError> {
-        kdebug!("set_user_memory_region");
+        debug!("set_user_memory_region");
         let id: u16 = mem.slot as u16; // slot id
         let as_id = mem.slot >> 16; // address space id
-        kdebug!("id={}, as_id={}", id, as_id);
+        debug!("id={}, as_id={}", id, as_id);
 
         // 检查slot是否合法
         if mem.slot as usize >= self.nr_mem_slots as usize {

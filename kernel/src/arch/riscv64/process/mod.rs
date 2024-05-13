@@ -166,7 +166,7 @@ impl ProcessManager {
     /// 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/riscv/include/asm/switch_to.h#76
     pub unsafe fn switch_process(prev: Arc<ProcessControlBlock>, next: Arc<ProcessControlBlock>) {
         assert!(!CurrentIrqArch::is_irq_enabled());
-        // kdebug!(
+        // debug!(
         //     "riscv switch process: prev: {:?}, next: {:?}",
         //     prev.pid(),
         //     next.pid()
@@ -182,7 +182,7 @@ impl ProcessManager {
         drop(next_addr_space);
         compiler_fence(Ordering::SeqCst);
 
-        // kdebug!("current sum={}, prev sum={}, next_sum={}", riscv::register::sstatus::read().sum(), prev.arch_info_irqsave().sstatus.sum(), next.arch_info_irqsave().sstatus.sum());
+        // debug!("current sum={}, prev sum={}, next_sum={}", riscv::register::sstatus::read().sum(), prev.arch_info_irqsave().sstatus.sum(), next.arch_info_irqsave().sstatus.sum());
 
         // 获取arch info的锁，并强制泄露其守卫（切换上下文后，在switch_finish_hook中会释放锁）
         let next_arch = SpinLockGuard::leak(next.arch_info_irqsave()) as *mut ArchPCBInfo;
@@ -193,7 +193,7 @@ impl ProcessManager {
         ProcessManager::current_pcb().preempt_enable();
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
-        // kdebug!("riscv switch process: before to inner");
+        // debug!("riscv switch process: before to inner");
         compiler_fence(Ordering::SeqCst);
         // 正式切换上下文
         switch_to_inner(prev_arch, next_arch);

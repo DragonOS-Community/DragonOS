@@ -17,6 +17,7 @@ use crate::{
     time::timer::{Timer, TimerFunction},
 };
 use alloc::{boxed::Box, sync::Arc};
+use log::info;
 use system_error::SystemError;
 
 pub mod console;
@@ -78,7 +79,7 @@ impl VideoRefreshManager {
      * 将帧缓存区映射到地址SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE处
      */
     fn init_frame_buffer(&self) {
-        kinfo!("Re-mapping VBE frame buffer...");
+        info!("Re-mapping VBE frame buffer...");
         let buf_vaddr = boot_params()
             .read_irqsave()
             .screen_info
@@ -115,7 +116,7 @@ impl VideoRefreshManager {
             }
         }
 
-        kinfo!("VBE frame buffer successfully Re-mapped!");
+        info!("VBE frame buffer successfully Re-mapped!");
     }
 
     /**

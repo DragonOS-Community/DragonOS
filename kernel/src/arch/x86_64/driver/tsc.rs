@@ -9,6 +9,7 @@ use core::{
     cmp::{max, min},
     intrinsics::unlikely,
 };
+use log::{debug, info};
 use system_error::SystemError;
 
 use super::hpet::{hpet_instance, is_hpet_enabled};
@@ -83,12 +84,12 @@ impl TSCManager {
             return Err(SystemError::ENODEV);
         }
 
-        kinfo!(
+        info!(
             "Detected {}.{} MHz processor",
             Self::cpu_khz() / 1000,
             Self::cpu_khz() % 1000
         );
-        kinfo!(
+        info!(
             "Detected {}.{} MHz TSC",
             Self::tsc_khz() / 1000,
             Self::tsc_khz() % 1000
@@ -102,7 +103,7 @@ impl TSCManager {
     /// 使用pit、hpet、ptimer来测量CPU总线的频率
     fn calibrate_cpu_by_pit_hpet_ptimer() -> Result<u64, SystemError> {
         let hpet = is_hpet_enabled();
-        kdebug!(
+        debug!(
             "Calibrating TSC with {}",
             if hpet { "HPET" } else { "PMTIMER" }
         );
@@ -143,7 +144,7 @@ impl TSCManager {
 
             // HPET或者PTIMER可能是不可用的
             if ref1 == ref2 {
-                kdebug!("HPET/PMTIMER not available");
+                debug!("HPET/PMTIMER not available");
                 continue;
             }
 
@@ -169,7 +170,7 @@ impl TSCManager {
             // 如果误差在10%以内，那么认为测量成功
             // 返回参考值，因为它是更精确的
             if (90..=110).contains(&delta) {
-                kinfo!(
+                info!(
                     "PIT calibration matches {}. {} loops",
                     if hpet { "HPET" } else { "PMTIMER" },
                     i + 1
@@ -198,7 +199,7 @@ impl TSCManager {
                 return Err(SystemError::ENODEV);
             }
 
-            kinfo!(
+            info!(
                 "Using {} reference calibration",
                 if hpet { "HPET" } else { "PMTIMER" }
             );
@@ -207,7 +208,7 @@ impl TSCManager {
 
         // We don't have an alternative source, use the PIT calibration value
         if (!hpet) && (global_ref1 == 0) && (global_ref2 == 0) {
-            kinfo!("Using PIT calibration value");
+            info!("Using PIT calibration value");
             return Ok(tsc_pit_min);
         }
 
@@ -227,7 +228,7 @@ impl TSCManager {
             tsc_ref_min
         );
 
-        kinfo!("Using PIT calibration value");
+        info!("Using PIT calibration value");
         return Ok(tsc_pit_min);
     }
 

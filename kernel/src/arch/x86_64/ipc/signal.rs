@@ -616,7 +616,7 @@ fn setup_frame(
         }
     }
     let frame: *mut SigFrame = get_stack(trap_frame, size_of::<SigFrame>());
-    // kdebug!("frame=0x{:016x}", frame as usize);
+    // debug!("frame=0x{:016x}", frame as usize);
     // 要求这个frame的地址位于用户空间，因此进行校验
     let r: Result<UserBufferWriter<'_>, SystemError> =
         UserBufferWriter::new(frame, size_of::<SigFrame>(), true);

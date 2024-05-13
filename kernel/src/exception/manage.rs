@@ -2,6 +2,7 @@ use core::ops::{BitXor, Deref, DerefMut};
 
 use alloc::{string::String, sync::Arc};
 
+use log::debug;
 use system_error::SystemError;
 
 use crate::{
@@ -155,7 +156,7 @@ impl IrqManager {
         *action_guard.flags_mut() = flags;
         *action_guard.dev_id_mut() = dev_id;
         drop(action_guard);
-        kdebug!("to inner_setup_irq");
+        debug!("to inner_setup_irq");
         return self.inner_setup_irq(irq, irqaction, desc);
     }
 
@@ -370,7 +371,7 @@ impl IrqManager {
                 || ((old_guard.flags().bitxor(*action_guard.flags()))
                     .contains(IrqHandleFlags::IRQF_ONESHOT))
             {
-                kdebug!(
+                debug!(
                     "Flags mismatch for irq {} (name: {}, flags: {:?}). old action name: {}, old flags: {:?}",
                     irq.data(),
                     action_guard.name(),
@@ -392,7 +393,7 @@ impl IrqManager {
             if *old_guard.flags() & IrqHandleFlags::IRQF_PERCPU
                 != *action_guard.flags() & IrqHandleFlags::IRQF_PERCPU
             {
-                kdebug!(
+                debug!(
                     "Per-cpu mismatch for irq {} (name: {}, flags: {:?})",
                     irq.data(),
                     action_guard.name(),
@@ -451,7 +452,7 @@ impl IrqManager {
                 if let Err(e) =
                     self.do_set_irq_trigger(desc.clone(), &mut desc_inner_guard, trigger_type)
                 {
-                    kdebug!(
+                    debug!(
                         "Failed to set trigger type for irq {} (name: {}, flags: {:?}), error {:?}",
                         irq.data(),
                         action_guard.name(),
@@ -467,10 +468,10 @@ impl IrqManager {
                     ));
                 }
             }
-            kdebug!("to irq_activate");
+            debug!("to irq_activate");
             // 激活中断。这种激活必须独立于IRQ_NOAUTOEN进行*desc_inner_guard.internal_state_mut() |= IrqDescState::IRQS_NOREQUEST;uest.
             if let Err(e) = self.irq_activate(&desc, &mut desc_inner_guard) {
-                kdebug!(
+                debug!(
                     "Failed to activate irq {} (name: {}, flags: {:?}), error {:?}",
                     irq.data(),
                     action_guard.name(),
@@ -628,7 +629,7 @@ impl IrqManager {
         desc_inner_guard: &mut SpinLockGuard<'_, InnerIrqDesc>,
         resend: bool,
     ) -> Result<(), SystemError> {
-        kdebug!(
+        debug!(
             "irq_activate_and_startup: irq: {}, name: {:?}",
             desc.irq().data(),
             desc_inner_guard.name()
@@ -659,7 +660,7 @@ impl IrqManager {
         resend: bool,
         force: bool,
     ) -> Result<(), SystemError> {
-        kdebug!(
+        debug!(
             "irq_startup: irq: {}, name: {:?}",
             desc_inner_guard.irq_data().irq().data(),
             desc_inner_guard.name()
@@ -930,7 +931,7 @@ impl IrqManager {
         let mut to_unmask = false;
 
         if !chip.can_set_flow_type() {
-            // kdebug!(
+            // debug!(
             //     "No set_irq_type function for irq {}, chip {}",
             //     desc_inner_guard.irq_data().irq().data(),
             //     chip.name()

@@ -613,7 +613,7 @@ impl FATFileSystem {
 
         // 如果这个空闲簇不是簇链的第一个簇，那么把当前簇跟前一个簇连上。
         if let Some(prev_cluster) = prev_cluster {
-            // kdebug!("set entry, prev ={prev_cluster:?}, next = {free_cluster:?}");
+            // debug!("set entry, prev ={prev_cluster:?}, next = {free_cluster:?}");
             self.set_entry(prev_cluster, FATEntry::Next(free_cluster))?;
         }
         // 清空新获取的这个簇
@@ -1136,14 +1136,14 @@ impl FATFileSystem {
                 } else {
                     self.bpb.num_fats as u64
                 };
-                // kdebug!("set entry, bound={bound}, fat_size={fat_size}");
+                // debug!("set entry, bound={bound}, fat_size={fat_size}");
                 for i in 0..bound {
                     // 当前操作的FAT表在磁盘上的字节偏移量
                     let f_offset: u64 = fat_part_bytes_offset + i * fat_size;
                     let in_block_offset: u64 = self.get_in_block_offset(f_offset);
                     let lba = self.get_lba_from_offset(self.bytes_to_sector(f_offset));
 
-                    // kdebug!("set entry, lba={lba}, in_block_offset={in_block_offset}");
+                    // debug!("set entry, lba={lba}, in_block_offset={in_block_offset}");
                     let mut v: Vec<u8> = vec![0; LBA_SIZE];
                     self.partition.disk().read_at(lba, 1, &mut v)?;
 
@@ -1175,7 +1175,7 @@ impl FATFileSystem {
                     // 恢复保留位
                     raw_val |= old_bits;
 
-                    // kdebug!("sent entry, raw_val={raw_val}");
+                    // debug!("sent entry, raw_val={raw_val}");
 
                     cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
                     cursor.write_u32(raw_val)?;
@@ -1542,7 +1542,7 @@ impl IndexNode for LockedFATInode {
 
                     // ====== 生成inode缓存，存入B树
                     let name = DName::from(ent.name().to_uppercase());
-                    // kdebug!("name={name}");
+                    // debug!("name={name}");
 
                     if !guard.children.contains_key(&name)
                         && name.as_ref() != "."

@@ -2,6 +2,7 @@ use core::intrinsics::unlikely;
 
 use alloc::{string::ToString, sync::Arc};
 use intertrait::cast::CastArc;
+use log::debug;
 
 use crate::{
     driver::base::kobject::KObject,
@@ -72,7 +73,7 @@ impl DeviceManager {
 
         if dev.driver().is_some() {
             if self.device_is_bound(dev) {
-                kdebug!(
+                debug!(
                     "do_device_attach: device '{}' is already bound.",
                     dev.name()
                 );
@@ -86,7 +87,7 @@ impl DeviceManager {
                 return Ok(false);
             }
         } else {
-            kdebug!("do_device_attach: device '{}' is not bound.", dev.name());
+            debug!("do_device_attach: device '{}' is not bound.", dev.name());
             let bus = dev
                 .bus()
                 .and_then(|bus| bus.upgrade())
@@ -116,7 +117,7 @@ impl DeviceManager {
                 // try them.
 
                 do_async = true;
-                kdebug!(
+                debug!(
                     "do_device_attach: try scheduling asynchronous probe for device: {}",
                     dev.name()
                 );
@@ -153,7 +154,7 @@ impl DeviceManager {
             if let Err(e) = r {
                 // 如果不是ENOSYS，则总线出错
                 if e != SystemError::ENOSYS {
-                    kdebug!(
+                    debug!(
                         "do_device_attach_driver: bus.match_device() failed, dev: '{}', err: {:?}",
                         data.dev.name(),
                         e
@@ -530,7 +531,7 @@ impl DriverManager {
         let err = r.unwrap_err();
         match err {
             SystemError::ENODEV | SystemError::ENXIO => {
-                kdebug!(
+                debug!(
                     "driver'{}': probe of {} rejects match {:?}",
                     driver.name(),
                     device.name(),

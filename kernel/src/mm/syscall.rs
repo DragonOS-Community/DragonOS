@@ -246,7 +246,7 @@ impl From<VmFlags> for ProtFlags {
 
 impl Syscall {
     pub fn brk(new_addr: VirtAddr) -> Result<VirtAddr, SystemError> {
-        // kdebug!("brk: new_addr={:?}", new_addr);
+        // debug!("brk: new_addr={:?}", new_addr);
         let address_space = AddressSpace::current()?;
         let mut address_space = address_space.write();
 

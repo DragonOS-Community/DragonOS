@@ -116,7 +116,7 @@ pub fn check_and_clone_cstr_array(user: *const *const u8) -> Result<Vec<String>,
     if user.is_null() {
         Ok(Vec::new())
     } else {
-        // kdebug!("check_and_clone_cstr_array: {:p}\n", user);
+        // debug!("check_and_clone_cstr_array: {:p}\n", user);
         let mut buffer = Vec::new();
         for i in 0.. {
             let addr = unsafe { user.add(i) };
@@ -129,7 +129,7 @@ pub fn check_and_clone_cstr_array(user: *const *const u8) -> Result<Vec<String>,
                 let dst = core::mem::transmute::<[u8; size_of::<usize>()], [usize; 1]>(dst);
                 str_ptr = dst[0] as *const u8;
 
-                // kdebug!("str_ptr: {:p}, addr:{addr:?}\n", str_ptr);
+                // debug!("str_ptr: {:p}, addr:{addr:?}\n", str_ptr);
             }
 
             if str_ptr.is_null() {

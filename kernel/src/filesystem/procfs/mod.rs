@@ -8,6 +8,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use ::log::info;
 use system_error::SystemError;
 
 use crate::{
@@ -821,7 +822,7 @@ pub fn procfs_init() -> Result<(), SystemError> {
     static INIT: Once = Once::new();
     let mut result = None;
     INIT.call_once(|| {
-        kinfo!("Initializing ProcFS...");
+        info!("Initializing ProcFS...");
         // 创建 procfs 实例
         let procfs: Arc<ProcFS> = ProcFS::new();
         // procfs 挂载
@@ -830,7 +831,7 @@ pub fn procfs_init() -> Result<(), SystemError> {
             .expect("Unabled to find /proc")
             .mount(procfs)
             .expect("Failed to mount at /proc");
-        kinfo!("ProcFS mounted.");
+        info!("ProcFS mounted.");
         result = Some(Ok(()));
     });
 

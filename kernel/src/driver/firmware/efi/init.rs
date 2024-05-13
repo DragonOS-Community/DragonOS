@@ -1,5 +1,6 @@
 use core::{hint::spin_loop, intrinsics::unlikely, mem::size_of};
 
+use log::info;
 use system_error::SystemError;
 use uefi_raw::table::boot::{MemoryAttribute, MemoryType};
 
@@ -21,7 +22,7 @@ use super::efi_manager;
 #[allow(dead_code)]
 #[inline(never)]
 pub fn efi_init() {
-    kinfo!("Initializing efi...");
+    info!("Initializing efi...");
     let data_from_fdt = efi_manager()
         .get_fdt_params()
         .expect("Failed to get fdt params");
@@ -31,7 +32,7 @@ pub fn efi_init() {
         return;
     }
 
-    // kdebug!("to map memory table");
+    // debug!("to map memory table");
 
     // 映射mmap table
     if efi_manager().memmap_init_early(&data_from_fdt).is_err() {
@@ -44,7 +45,7 @@ pub fn efi_init() {
             spin_loop();
         }
     }
-    // kdebug!("NNNN");
+    // debug!("NNNN");
     // kwarn!("BBBB, e:{:?}", SystemError::EINVAL);
 
     let desc_version = efi_manager().desc_version();
@@ -97,7 +98,7 @@ pub fn efi_init() {
 
     // todo: Initialize screen info
 
-    kinfo!("UEFI init done!");
+    info!("UEFI init done!");
 }
 
 fn efi_find_mirror() {
@@ -117,7 +118,7 @@ fn efi_find_mirror() {
     }
 
     if mirror_size > 0 {
-        kinfo!(
+        info!(
             "Memory: {}M/{}M mirrored memory",
             mirror_size >> 20,
             total_size >> 20
@@ -265,11 +266,11 @@ fn reserve_memory_regions() {
         let phys_start = page_align_down(md.phys_start as usize);
         let size = (page_count << (MMArch::PAGE_SHIFT as u64)) as usize;
 
-        // kdebug!("Reserve memory region: {:#x}-{:#x}({:#x}), is_memory: {}, is_usable_memory:{}, type: {:?}, att: {:?}", phys_start, phys_start + size, page_count, md.is_memory(), md.is_usable_memory(), md.ty, md.att);
+        // debug!("Reserve memory region: {:#x}-{:#x}({:#x}), is_memory: {}, is_usable_memory:{}, type: {:?}, att: {:?}", phys_start, phys_start + size, page_count, md.is_memory(), md.is_usable_memory(), md.ty, md.att);
         if md.is_memory() {
             open_firmware_fdt_driver().early_init_dt_add_memory(phys_start as u64, size as u64);
             if !md.is_usable_memory() {
-                // kdebug!(
+                // debug!(
                 //     "Marking non-usable memory as nomap: {:#x}-{:#x}",
                 //     phys_start,
                 //     phys_start + size

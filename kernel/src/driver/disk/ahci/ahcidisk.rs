@@ -130,7 +130,7 @@ impl AhciDisk {
             // 清空整个table的旧数据
             write_bytes(cmdtbl, 0, 1);
         }
-        // kdebug!("cmdheader.prdtl={}", volatile_read!(cmdheader.prdtl));
+        // debug!("cmdheader.prdtl={}", volatile_read!(cmdheader.prdtl));
 
         // 8K bytes (16 sectors) per PRDT
         for i in 0..((volatile_read!(cmdheader.prdtl) - 1) as usize) {
@@ -186,7 +186,7 @@ impl AhciDisk {
         }
 
         volatile_set_bit!(port.ci, 1 << slot, true); // Issue command
-                                                     // kdebug!("To wait ahci read complete.");
+                                                     // debug!("To wait ahci read complete.");
                                                      // 等待操作完成
         loop {
             if (volatile_read!(port.ci) & (1 << slot)) == 0 {

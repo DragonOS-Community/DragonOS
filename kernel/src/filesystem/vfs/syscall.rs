@@ -908,7 +908,7 @@ impl Syscall {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
 
         if flags.contains(AtFlags::AT_REMOVEDIR) {
-            // kdebug!("rmdir");
+            // debug!("rmdir");
             match do_remove_dir(dirfd, &path) {
                 Err(err) => {
                     return Err(err);
@@ -1092,7 +1092,7 @@ impl Syscall {
     /// - `cmd`：命令
     /// - `arg`：参数
     pub fn fcntl(fd: i32, cmd: FcntlCommand, arg: i32) -> Result<usize, SystemError> {
-        // kdebug!("fcntl ({cmd:?}) fd: {fd}, arg={arg}");
+        // debug!("fcntl ({cmd:?}) fd: {fd}, arg={arg}");
         match cmd {
             FcntlCommand::DupFd | FcntlCommand::DupFdCloexec => {
                 if arg < 0 || arg as usize >= FileDescriptorVec::PROCESS_MAX_FD {

@@ -22,6 +22,7 @@ use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
 };
+use log::{debug, info};
 use core::{ffi::CStr, fmt::Debug, intrinsics::unlikely};
 use hashbrown::HashMap;
 use intertrait::cast::CastArc;
@@ -296,7 +297,7 @@ impl BusManager {
             .bus()
             .and_then(|bus| bus.upgrade())
             .ok_or(SystemError::EINVAL)?;
-        kdebug!("bus '{}' add driver '{}'", bus.name(), driver.name());
+        debug!("bus '{}' add driver '{}'", bus.name(), driver.name());
 
         driver.set_kobj_type(Some(&BusDriverKType));
         let kobj = driver.clone() as Arc<dyn KObject>;
@@ -580,7 +581,7 @@ pub fn bus_add_device(dev: &Arc<dyn Device>) -> Result<(), SystemError> {
 ///
 /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/bus.c?fi=bus_probe_device#478
 pub fn bus_probe_device(dev: &Arc<dyn Device>) {
-    kinfo!("bus_probe_device: dev: {:?}", dev.name());
+    info!("bus_probe_device: dev: {:?}", dev.name());
     bus_manager().probe_device(dev);
 }
 

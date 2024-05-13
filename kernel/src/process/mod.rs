@@ -12,6 +12,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use log::{debug, info};
 use system_error::SystemError;
 
 use crate::{
@@ -27,8 +28,7 @@ use crate::{
         procfs::procfs_unregister_pid,
         vfs::{file::FileDescriptorVec, FileType},
     },
-    ipc::signal_types::{SigInfo, SigPending, SignalStruct},
-    kdebug, kinfo,
+    ipc::signal_types::{SigInfo, SigPending, SignalStruct}, kinfo,
     libs::{
         align::AlignedBox,
         casting::DowncastArc,
@@ -116,24 +116,24 @@ impl ProcessManager {
 
         unsafe {
             compiler_fence(Ordering::SeqCst);
-            kdebug!("To create address space for INIT process.");
+            debug!("To create address space for INIT process.");
             // test_buddy();
             set_IDLE_PROCESS_ADDRESS_SPACE(
                 AddressSpace::new(true).expect("Failed to create address space for INIT process."),
             );
-            kdebug!("INIT process address space created.");
+            debug!("INIT process address space created.");
             compiler_fence(Ordering::SeqCst);
         };
 
         ALL_PROCESS.lock_irqsave().replace(HashMap::new());
         Self::init_switch_result();
         Self::arch_init();
-        kdebug!("process arch init done.");
+        debug!("process arch init done.");
         Self::init_idle();
-        kdebug!("process idle init done.");
+        debug!("process idle init done.");
 
         unsafe { __PROCESS_MANAGEMENT_INIT_DONE = true };
-        kinfo!("Process Manager initialized.");
+        info!("Process Manager initialized.");
     }
 
     fn init_switch_result() {
@@ -452,7 +452,7 @@ impl ProcessManager {
 
     /// 上下文切换完成后的钩子函数
     unsafe fn switch_finish_hook() {
-        // kdebug!("switch_finish_hook");
+        // debug!("switch_finish_hook");
         let prev_pcb = PROCESS_SWITCH_RESULT
             .as_mut()
             .unwrap()

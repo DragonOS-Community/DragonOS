@@ -110,7 +110,7 @@ impl EFIManager {
             let offset = paddr.data() - page_align_down(paddr.data());
             let map_size = data.mmap_size.unwrap() as usize + offset;
 
-            // kdebug!("do_efi_memmap_init: map_size={map_size:#x}");
+            // debug!("do_efi_memmap_init: map_size={map_size:#x}");
 
             // 映射内存
             let mut vaddr = EarlyIoRemap::map(

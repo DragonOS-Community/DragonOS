@@ -39,7 +39,7 @@ pub(super) fn pci_host_ecam_driver_init(fdt: &Fdt<'_>) -> Result<(), SystemError
             _ => panic!("Unexpected linux,pci-domain length"),
         };
 
-        kdebug!(
+        debug!(
             "pci_host_ecam_driver_init(): {} paddr: {:#x} size: {:#x} bus-range: {}-{} segement_group_number: {}",
             node.name,
             paddr,
@@ -61,7 +61,7 @@ pub(super) fn pci_host_ecam_driver_init(fdt: &Fdt<'_>) -> Result<(), SystemError
 
     for node in open_firmware_fdt_driver().find_node_by_compatible(&fdt, "pci-host-ecam-generic") {
         if let Err(err) = do_check(node) {
-            kdebug!(
+            debug!(
                 "pci_host_ecam_driver_init(): check {} error: {:?}",
                 node.name,
                 err

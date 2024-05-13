@@ -482,7 +482,7 @@ impl DeviceManager {
 
         let actual_parent = self.get_device_parent(&device, current_parent)?;
         if let Some(actual_parent) = actual_parent {
-            // kdebug!(
+            // debug!(
             //     "device '{}' parent is '{}', strong_count: {}",
             //     device.name().to_string(),
             //     actual_parent.name(),
@@ -552,10 +552,10 @@ impl DeviceManager {
         device: &Arc<dyn Device>,
         current_parent: Option<Arc<dyn Device>>,
     ) -> Result<Option<Arc<dyn KObject>>, SystemError> {
-        // kdebug!("get_device_parent() device:{:?}", device.name());
+        // debug!("get_device_parent() device:{:?}", device.name());
         if device.class().is_some() {
             let parent_kobj: Arc<dyn KObject>;
-            // kdebug!("current_parent:{:?}", current_parent);
+            // debug!("current_parent:{:?}", current_parent);
             if let Some(cp) = current_parent {
                 if cp.class().is_some() {
                     return Ok(Some(cp.clone() as Arc<dyn KObject>));

@@ -19,6 +19,7 @@ use alloc::{
     string::String,
     sync::{Arc, Weak},
 };
+use log::info;
 use core::{
     cell::UnsafeCell,
     fmt::Debug,
@@ -367,5 +368,5 @@ pub fn e1000e_driver_init(device: E1000EDevice) {
     NET_DEVICES
         .write_irqsave()
         .insert(iface.nic_id(), iface.clone());
-    kinfo!("e1000e driver init successfully!\tMAC: [{}]", mac);
+    info!("e1000e driver init successfully!\tMAC: [{}]", mac);
 }

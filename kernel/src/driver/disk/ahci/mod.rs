@@ -24,6 +24,7 @@ use crate::{
 };
 use ahci_inode::LockedAhciInode;
 use alloc::{boxed::Box, collections::LinkedList, format, string::String, sync::Arc, vec::Vec};
+use log::debug;
 use core::sync::atomic::compiler_fence;
 use system_error::SystemError;
 
@@ -90,13 +91,13 @@ pub fn ahci_init() -> Result<(), SystemError> {
                 let tp = hba_mem_port.check_type();
                 match tp {
                     HbaPortType::None => {
-                        kdebug!("<ahci_rust_init> Find a None type Disk.");
+                        debug!("<ahci_rust_init> Find a None type Disk.");
                     }
                     HbaPortType::Unknown(err) => {
-                        kdebug!("<ahci_rust_init> Find a Unknown({:?}) type Disk.", err);
+                        debug!("<ahci_rust_init> Find a Unknown({:?}) type Disk.", err);
                     }
                     _ => {
-                        kdebug!("<ahci_rust_init> Find a {:?} type Disk.", tp);
+                        debug!("<ahci_rust_init> Find a {:?} type Disk.", tp);
 
                         // 计算地址
                         let fb = virt_2_phys(ahci_port_base_vaddr + (32 << 10) + (j << 8));
@@ -122,7 +123,7 @@ pub fn ahci_init() -> Result<(), SystemError> {
                         )?);
                         id += 1; // ID 从0开始
 
-                        kdebug!("start register ahci device");
+                        debug!("start register ahci device");
 
                         // 挂载到devfs上面去
                         let ret = devfs_register(

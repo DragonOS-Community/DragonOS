@@ -24,6 +24,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::info;
 use system_error::SystemError;
 
 const DEVFS_BLOCK_SIZE: u64 = 512;
@@ -97,7 +98,7 @@ impl DevFS {
             .expect("DevFS: Failed to create /dev/block");
         devfs.register_bultinin_device();
 
-        // kdebug!("ls /dev: {:?}", root.list());
+        // debug!("ls /dev: {:?}", root.list());
         return devfs;
     }
 
@@ -611,7 +612,7 @@ pub fn devfs_init() -> Result<(), SystemError> {
     static INIT: Once = Once::new();
     let mut result = None;
     INIT.call_once(|| {
-        kinfo!("Initializing DevFS...");
+        info!("Initializing DevFS...");
         // 创建 devfs 实例
         let devfs: Arc<DevFS> = DevFS::new();
         // devfs 挂载
@@ -620,7 +621,7 @@ pub fn devfs_init() -> Result<(), SystemError> {
             .expect("Unabled to find /dev")
             .mount(devfs)
             .expect("Failed to mount at /dev");
-        kinfo!("DevFS mounted.");
+        info!("DevFS mounted.");
         result = Some(Ok(()));
     });
 

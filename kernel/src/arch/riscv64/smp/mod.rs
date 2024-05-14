@@ -2,9 +2,9 @@ use log::warn;
 use system_error::SystemError;
 
 use crate::smp::{
-        cpu::{CpuHpCpuState, ProcessorId},
-        SMPArch,
-    };
+    cpu::{CpuHpCpuState, ProcessorId},
+    SMPArch,
+};
 
 pub struct RiscV64SMPArch;
 

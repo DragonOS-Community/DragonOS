@@ -23,11 +23,11 @@ pub fn process(flags: &HashSet<Flag>, input: ItemImpl) -> TokenStream {
 
     let generated = match trait_ {
         None => quote_spanned! {
-            self_ty.span() => compile_kerror!("#[cast_to] should only be on an impl of a trait");
+            self_ty.span() => compile_error!("#[cast_to] should only be on an impl of a trait");
         },
         Some(trait_) => match trait_ {
             (Some(bang), _, _) => quote_spanned! {
-                bang.span() => compile_kerror!("#[cast_to] is not for !Trait impl");
+                bang.span() => compile_error!("#[cast_to] is not for !Trait impl");
             },
             (None, path, _) => {
                 let path = fully_bound_trait(path, items);

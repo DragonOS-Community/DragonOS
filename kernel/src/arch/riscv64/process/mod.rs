@@ -1,5 +1,4 @@
 use alloc::sync::{Arc, Weak};
-use log::error;
 use core::{
     arch::asm,
     intrinsics::unlikely,
@@ -7,6 +6,7 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 use kdepends::memoffset::offset_of;
+use log::error;
 use riscv::register::sstatus::Sstatus;
 use system_error::SystemError;
 

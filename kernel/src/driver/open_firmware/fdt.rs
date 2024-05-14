@@ -211,7 +211,6 @@ impl OpenFirmwareFdtDriver {
 
     #[cfg(not(target_arch = "x86_64"))]
     pub fn early_init_dt_add_memory(&self, base: u64, size: u64) {
-
         use crate::{
             arch::MMArch,
             libs::align::page_align_down,

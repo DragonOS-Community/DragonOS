@@ -433,11 +433,13 @@ pub fn uevent_net_broadcast_untagged(
 )->i32
 {
     let mut retval = 0;
+    // "666" tobe replaced
     let mut skb: raw::PacketBuffer = raw::PacketBuffer::new(
         vec![raw::PacketMetadata::EMPTY; 666],
         vec![0; 666],) ;
     let mut ue_sk: UeventSock;
 
+    // 发送uevent message
     for ue_sk in &uevent_sock_list {
         let uevent_sock = &ue_sk.sk;
         // todo: netlink_has_listeners

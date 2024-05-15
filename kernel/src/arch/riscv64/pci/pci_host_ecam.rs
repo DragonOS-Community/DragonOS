@@ -6,7 +6,7 @@ use crate::{
         open_firmware::fdt::open_firmware_fdt_driver,
         pci::ecam::{pci_ecam_root_info_manager, EcamRootInfo},
     },
-    kdebug,
+    kdebug, kerror,
     mm::PhysAddr,
 };
 

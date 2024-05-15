@@ -638,6 +638,8 @@ impl PciDeviceStructure for PciDeviceStructurePciToCardbusBridge {
 /// 用于访问PCI设备的功能配置空间的一组机制。
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum PciCam {
+    /// PortIO配置访问机制
+    Portiocam,
     /// PCI内存映射配置访问机制
     ///
     /// 为每个设备功能提供256字节的配置空间访问。
@@ -652,6 +654,7 @@ impl PciCam {
     /// Returns the total size in bytes of the memory-mapped region.
     pub const fn size(self) -> u32 {
         match self {
+            Self::Portiocam => 0x100000,
             Self::MmioCam => 0x1000000,
             Self::Ecam => 0x10000000,
         }

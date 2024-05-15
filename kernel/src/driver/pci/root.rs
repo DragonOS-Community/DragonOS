@@ -33,8 +33,10 @@ pub struct PciRoot {
     pub mmio_guard: Option<Arc<MMIOSpaceGuard>>, //映射后的虚拟地址，为方便访问数据这里转化成指针
     /// 配置空间访问机制
     pub cam: PciCam,
-    pub bus_begin: u8, //bus起始位置
-    pub bus_end: u8,   //bus结束位置
+    /// bus起始位置
+    pub bus_begin: u8,
+    /// bus结束位置
+    pub bus_end: u8, 
 }
 
 ///线程间共享需要，该结构体只需要在初始化时写入数据，无需读写锁保证线程安全
@@ -46,7 +48,7 @@ impl core::fmt::Display for PciRoot {
         if let Some(ecam_root_info) = &self.ecam_root_info {
             write!(
                     f,
-                    "PCI Eacm Root with segement:{}, bus begin at {}, bus end at {}, physical address at {:?},mapped at {:?}",
+                    "PCI Eacm Root with segment:{}, bus begin at {}, bus end at {}, physical address at {:?},mapped at {:?}",
                     ecam_root_info.segment_group_number, ecam_root_info.bus_begin, ecam_root_info.bus_end, ecam_root_info.physical_address_base, self.mmio_guard
                 )
         } else {

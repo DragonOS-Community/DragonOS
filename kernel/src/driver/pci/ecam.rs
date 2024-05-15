@@ -13,10 +13,14 @@ pub fn pci_ecam_root_info_manager() -> &'static EcamRootInfoManager {
 /// Ecam pci root info
 #[derive(Clone, Debug, Copy)]
 pub struct EcamRootInfo {
-    pub segment_group_number: SegmentGroupNumber, //段组号
-    pub bus_begin: u8,                            //该分组中的最小bus
-    pub bus_end: u8,                              //该分组中的最大bus
-    pub physical_address_base: PhysAddr,          //物理基地址
+    /// 段组号
+    pub segment_group_number: SegmentGroupNumber,
+    /// 该分组中的最小bus
+    pub bus_begin: u8,
+    /// 该分组中的最大bus
+    pub bus_end: u8,                       
+    /// 物理基地址       
+    pub physical_address_base: PhysAddr,          
 }
 
 impl EcamRootInfo {

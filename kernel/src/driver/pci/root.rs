@@ -36,7 +36,7 @@ pub struct PciRoot {
     /// bus起始位置
     pub bus_begin: u8,
     /// bus结束位置
-    pub bus_end: u8, 
+    pub bus_end: u8,
 }
 
 ///线程间共享需要，该结构体只需要在初始化时写入数据，无需读写锁保证线程安全

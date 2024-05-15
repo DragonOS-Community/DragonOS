@@ -18,9 +18,9 @@ pub struct EcamRootInfo {
     /// 该分组中的最小bus
     pub bus_begin: u8,
     /// 该分组中的最大bus
-    pub bus_end: u8,                       
+    pub bus_end: u8,
     /// 物理基地址       
-    pub physical_address_base: PhysAddr,          
+    pub physical_address_base: PhysAddr,
 }
 
 impl EcamRootInfo {

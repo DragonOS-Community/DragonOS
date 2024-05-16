@@ -49,7 +49,7 @@ impl RiscVSbiTimer {
 
     fn handle_irq(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
         // 更新下一次中断时间
-        // kdebug!(
+        // debug!(
         //     "riscv_sbi_timer: handle_irq: cpu_id: {}, time: {}",
         //     smp_get_processor_id().data(),
         //     CurrentTimeArch::get_cycles() as u64

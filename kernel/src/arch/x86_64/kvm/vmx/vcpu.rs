@@ -9,7 +9,7 @@ use crate::arch::kvm::vmx::{VcpuRegIndex, X86_CR0};
 use crate::arch::mm::{LockedFrameAllocator, PageMapper};
 use crate::arch::x86_64::mm::X86_64MMArch;
 use crate::arch::MMArch;
-use crate::kdebug;
+
 use crate::mm::{phys_2_virt, VirtAddr};
 use crate::mm::{MemoryManagementArch, PageTableKind};
 use crate::virt::kvm::vcpu::Vcpu;
@@ -17,6 +17,7 @@ use crate::virt::kvm::vm::Vm;
 use alloc::alloc::Global;
 use alloc::boxed::Box;
 use core::slice;
+use log::debug;
 use raw_cpuid::CpuId;
 use system_error::SystemError;
 use x86;
@@ -132,13 +133,13 @@ impl VcpuData {
         // Get the Virtual Machine Control Structure revision identifier (VMCS revision ID)
         // (Intel Manual: 25.11.5 VMXON Region)
         let revision_id = unsafe { (msr::rdmsr(msr::IA32_VMX_BASIC) as u32) & 0x7FFF_FFFF };
-        kdebug!("[+] VMXON Region Virtual Address: {:p}", self.vmxon_region);
-        kdebug!(
+        debug!("[+] VMXON Region Virtual Address: {:p}", self.vmxon_region);
+        debug!(
             "[+] VMXON Region Physical Addresss: 0x{:x}",
             self.vmxon_region_physical_address
         );
-        kdebug!("[+] VMCS Region Virtual Address: {:p}", self.vmcs_region);
-        kdebug!(
+        debug!("[+] VMCS Region Virtual Address: {:p}", self.vmcs_region);
+        debug!(
             "[+] VMCS Region Physical Address1: 0x{:x}",
             self.vmcs_region_physical_address
         );
@@ -150,7 +151,7 @@ impl VcpuData {
 
 impl VmxVcpu {
     pub fn new(vcpu_id: u32, parent_vm: Vm) -> Result<Self, SystemError> {
-        kdebug!("Creating processor {}", vcpu_id);
+        debug!("Creating processor {}", vcpu_id);
         let instance = Self {
             vcpu_id,
             vcpu_ctx: VcpuContextFrame {
@@ -251,8 +252,8 @@ impl VmxVcpu {
             self.vcpu_ctx.regs[VcpuRegIndex::Rsp as usize] as u64,
         )?;
         vmx_vmwrite(VmcsFields::GUEST_RIP as u32, self.vcpu_ctx.rip as u64)?;
-        kdebug!("vmcs init guest rip: {:#x}", self.vcpu_ctx.rip as u64);
-        kdebug!(
+        debug!("vmcs init guest rip: {:#x}", self.vcpu_ctx.rip as u64);
+        debug!(
             "vmcs init guest rsp: {:#x}",
             self.vcpu_ctx.regs[VcpuRegIndex::Rsp as usize] as u64
         );
@@ -338,7 +339,7 @@ impl VmxVcpu {
         })?;
 
         // vmx_vmwrite(VmcsFields::HOST_RIP as u32, vmx_return as *const () as u64)?;
-        // kdebug!("vmcs init host rip: {:#x}", vmx_return as *const () as u64);
+        // debug!("vmcs init host rip: {:#x}", vmx_return as *const () as u64);
 
         Ok(())
     }
@@ -388,7 +389,7 @@ impl VmxVcpu {
     }
 
     fn kvm_mmu_load(&mut self) -> Result<(), SystemError> {
-        kdebug!("kvm_mmu_load!");
+        debug!("kvm_mmu_load!");
         // 申请并创建新的页表
         let mapper: crate::mm::page::PageMapper<X86_64MMArch, LockedFrameAllocator> = unsafe {
             PageMapper::create(PageTableKind::EPT, LockedFrameAllocator)
@@ -399,7 +400,7 @@ impl VmxVcpu {
         let set_eptp_fn = self.mmu.set_eptp.unwrap();
         set_eptp_fn(ept_root_hpa.data() as u64)?;
         self.mmu.root_hpa = ept_root_hpa.data() as u64;
-        kdebug!("ept_root_hpa:{:x}!", ept_root_hpa.data() as u64);
+        debug!("ept_root_hpa:{:x}!", ept_root_hpa.data() as u64);
 
         return Ok(());
     }
@@ -415,33 +416,33 @@ impl Vcpu for VmxVcpu {
     fn virtualize_cpu(&mut self) -> Result<(), SystemError> {
         match has_intel_vmx_support() {
             Ok(_) => {
-                kdebug!("[+] CPU supports Intel VMX");
+                debug!("[+] CPU supports Intel VMX");
             }
             Err(e) => {
-                kdebug!("[-] CPU does not support Intel VMX: {:?}", e);
+                debug!("[-] CPU does not support Intel VMX: {:?}", e);
                 return Err(SystemError::ENOSYS);
             }
         };
 
         match enable_vmx_operation() {
             Ok(_) => {
-                kdebug!("[+] Enabling Virtual Machine Extensions (VMX)");
+                debug!("[+] Enabling Virtual Machine Extensions (VMX)");
             }
             Err(_) => {
-                kdebug!("[-] VMX operation is not supported on this processor.");
+                debug!("[-] VMX operation is not supported on this processor.");
                 return Err(SystemError::ENOSYS);
             }
         }
 
         vmxon(self.data.vmxon_region_physical_address)?;
-        kdebug!("[+] VMXON successful!");
+        debug!("[+] VMXON successful!");
         vmx_vmclear(self.data.vmcs_region_physical_address)?;
         vmx_vmptrld(self.data.vmcs_region_physical_address)?;
-        kdebug!("[+] VMPTRLD successful!");
+        debug!("[+] VMPTRLD successful!");
         self.vmcs_init().expect("vncs_init fail");
-        kdebug!("[+] VMCS init!");
-        // kdebug!("vmcs init host rip: {:#x}", vmx_return as *const () as u64);
-        // kdebug!("vmcs init host rsp: {:#x}", x86::bits64::registers::rsp());
+        debug!("[+] VMCS init!");
+        // debug!("vmcs init host rip: {:#x}", vmx_return as *const () as u64);
+        // debug!("vmcs init host rsp: {:#x}", x86::bits64::registers::rsp());
         // vmx_vmwrite(VmcsFields::HOST_RSP as u32, x86::bits64::registers::rsp())?;
         // vmx_vmwrite(VmcsFields::HOST_RIP as u32, vmx_return as *const () as u64)?;
         // vmx_vmwrite(VmcsFields::HOST_RSP as u32,  x86::bits64::registers::rsp())?;
@@ -476,7 +477,7 @@ pub fn get_segment_base(gdt_base: *const u64, gdt_size: u16, segment_selector: u
     let virtaddr = phys_2_virt(segment_base.try_into().unwrap())
         .try_into()
         .unwrap();
-    kdebug!(
+    debug!(
         "segment_base={:x}",
         phys_2_virt(segment_base.try_into().unwrap())
     );
@@ -536,7 +537,7 @@ pub fn adjust_vmx_exit_controls() -> u32 {
 pub fn adjust_vmx_pinbased_controls() -> u32 {
     let mut controls: u32 = 16;
     adjust_vmx_controls(0, 0, msr::IA32_VMX_TRUE_PINBASED_CTLS, &mut controls);
-    // kdebug!("adjust_vmx_pinbased_controls: {:x}", controls);
+    // debug!("adjust_vmx_pinbased_controls: {:x}", controls);
     return controls;
 }
 
@@ -593,11 +594,11 @@ pub fn enable_vmx_operation() -> Result<(), SystemError> {
     unsafe { controlregs::cr4_write(cr4) };
 
     set_lock_bit()?;
-    kdebug!("[+] Lock bit set via IA32_FEATURE_CONTROL");
+    debug!("[+] Lock bit set via IA32_FEATURE_CONTROL");
     set_cr0_bits();
-    kdebug!("[+] Mandatory bits in CR0 set/cleared");
+    debug!("[+] Mandatory bits in CR0 set/cleared");
     set_cr4_bits();
-    kdebug!("[+] Mandatory bits in CR4 set/cleared");
+    debug!("[+] Mandatory bits in CR4 set/cleared");
 
     Ok(())
 }

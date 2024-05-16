@@ -11,7 +11,6 @@ use crate::exception::irqdesc::{
 use crate::exception::manage::irq_manager;
 use crate::exception::IrqNumber;
 
-use crate::kdebug;
 use crate::mm::percpu::PerCpu;
 use crate::process::ProcessManager;
 use crate::smp::core::smp_get_processor_id;
@@ -20,6 +19,7 @@ use crate::time::clocksource::HZ;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 pub use drop;
+use log::debug;
 use system_error::SystemError;
 use x86::cpuid::cpuid;
 use x86::msr::{wrmsr, IA32_X2APIC_DIV_CONF, IA32_X2APIC_INIT_COUNT};
@@ -105,7 +105,7 @@ pub(super) fn local_apic_timer_irq_desc_init() {
 /// 初始化BSP的APIC定时器
 ///
 fn init_bsp_apic_timer() {
-    kdebug!("init_bsp_apic_timer");
+    debug!("init_bsp_apic_timer");
     assert!(smp_get_processor_id().data() == 0);
     let mut local_apic_timer = local_apic_timer_instance_mut(ProcessorId::new(0));
     local_apic_timer.init(
@@ -113,11 +113,11 @@ fn init_bsp_apic_timer() {
         LocalApicTimer::periodic_default_initial_count(),
         LocalApicTimer::DIVISOR as u32,
     );
-    kdebug!("init_bsp_apic_timer done");
+    debug!("init_bsp_apic_timer done");
 }
 
 fn init_ap_apic_timer() {
-    kdebug!("init_ap_apic_timer");
+    debug!("init_ap_apic_timer");
     let cpu_id = smp_get_processor_id();
     assert!(cpu_id.data() != 0);
 
@@ -127,14 +127,14 @@ fn init_ap_apic_timer() {
         LocalApicTimer::periodic_default_initial_count(),
         LocalApicTimer::DIVISOR as u32,
     );
-    kdebug!("init_ap_apic_timer done");
+    debug!("init_ap_apic_timer done");
 }
 
 pub(super) struct LocalApicTimerIntrController;
 
 impl LocalApicTimerIntrController {
     pub(super) fn install(&self) {
-        kdebug!("LocalApicTimerIntrController::install");
+        debug!("LocalApicTimerIntrController::install");
         if smp_get_processor_id().data() == 0 {
             init_bsp_apic_timer();
         } else {
@@ -150,7 +150,7 @@ impl LocalApicTimerIntrController {
     }
 
     pub(super) fn enable(&self) {
-        kdebug!("LocalApicTimerIntrController::enable");
+        debug!("LocalApicTimerIntrController::enable");
         let cpu_id = smp_get_processor_id();
         let mut local_apic_timer = local_apic_timer_instance_mut(cpu_id);
         local_apic_timer.start_current();
@@ -221,10 +221,9 @@ impl LocalApicTimer {
     }
 
     fn install_periodic_mode(&mut self, initial_count: u64, divisor: u32) {
-        kdebug!(
+        debug!(
             "install_periodic_mode: initial_count = {}, divisor = {}",
-            initial_count,
-            divisor
+            initial_count, divisor
         );
         self.mode = LocalApicTimerMode::Periodic;
         self.set_divisor(divisor);

@@ -341,7 +341,7 @@ pub trait FrameBufferInfo: FrameBufferOps {
         //         && var.green.offset == var.blue.offset
         //         && var.green.offset == var.red.offset
         //     {
-        //         kerror!("return {}", var.green.length);
+        //         error!("return {}", var.green.length);
         //         return var.green.length;
         //     } else {
         //         return var.green.length + var.blue.length + var.red.length;

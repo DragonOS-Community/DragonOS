@@ -2,11 +2,11 @@ use core::{fmt::Debug, hint::spin_loop, ptr::NonNull};
 
 use acpi::{AcpiHandler, AcpiTables, PlatformInfo};
 use alloc::{string::ToString, sync::Arc};
+use log::{error, info};
 
 use crate::{
     arch::MMArch,
     driver::base::firmware::sys_firmware_kset,
-    kinfo,
     libs::align::{page_align_down, page_align_up, AlignedBox},
     mm::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
@@ -57,7 +57,7 @@ impl AcpiManager {
     ///
     /// https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/acpi/bus.c#1390
     pub fn init(&self, rsdp_vaddr1: u64, rsdp_vaddr2: u64) -> Result<(), SystemError> {
-        kinfo!("Initializing Acpi Manager...");
+        info!("Initializing Acpi Manager...");
 
         // 初始化`/sys/firmware/acpi`的kset
         let kset = KSet::new("acpi".to_string());
@@ -67,7 +67,7 @@ impl AcpiManager {
         }
         self.map_tables(rsdp_vaddr1, rsdp_vaddr2)?;
         self.bus_init()?;
-        kinfo!("Acpi Manager initialized.");
+        info!("Acpi Manager initialized.");
         return Ok(());
     }
 
@@ -95,7 +95,7 @@ impl AcpiManager {
             }
             // 如果rsdpv1和rsdpv2都无法获取到acpi_table，说明有问题，打印报错信息后进入死循环
             Err(e2) => {
-                kerror!("acpi_init(): failed to parse acpi tables, error: (rsdpv1: {:?}) or (rsdpv2: {:?})", e1, e2);
+                error!("acpi_init(): failed to parse acpi tables, error: (rsdpv1: {:?}) or (rsdpv2: {:?})", e1, e2);
                 Self::drop_rsdp_tmp_box();
                 loop {
                     spin_loop();
@@ -161,7 +161,7 @@ impl AcpiManager {
     pub fn platform_info(&self) -> Option<PlatformInfo<'_, alloc::alloc::Global>> {
         let r = self.tables()?.platform_info();
         if let Err(ref e) = r {
-            kerror!(
+            error!(
                 "AcpiManager::platform_info(): failed to get platform info, error: {:?}",
                 e
             );

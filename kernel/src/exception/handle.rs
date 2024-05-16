@@ -1,6 +1,7 @@
 use core::{intrinsics::unlikely, ops::BitAnd};
 
 use alloc::sync::Arc;
+use log::{debug, error, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -100,7 +101,7 @@ impl IrqFlowHandler for EdgeIrqHandler {
     fn handle(&self, irq_desc: &Arc<IrqDesc>, _trap_frame: &mut TrapFrame) {
         let mut desc_inner_guard: SpinLockGuard<'_, InnerIrqDesc> = irq_desc.inner();
         if !irq_may_run(&desc_inner_guard) {
-            // kdebug!("!irq_may_run");
+            // debug!("!irq_may_run");
             desc_inner_guard
                 .internal_state_mut()
                 .insert(IrqDescState::IRQS_PENDING);
@@ -109,7 +110,7 @@ impl IrqFlowHandler for EdgeIrqHandler {
         }
 
         if desc_inner_guard.common_data().disabled() {
-            // kdebug!("desc_inner_guard.common_data().disabled()");
+            // debug!("desc_inner_guard.common_data().disabled()");
             desc_inner_guard
                 .internal_state_mut()
                 .insert(IrqDescState::IRQS_PENDING);
@@ -123,7 +124,7 @@ impl IrqFlowHandler for EdgeIrqHandler {
 
         loop {
             if unlikely(desc_inner_guard.actions().is_empty()) {
-                kdebug!("no action for irq {}", irq_data.irq().data());
+                debug!("no action for irq {}", irq_data.irq().data());
                 irq_manager().mask_irq(&irq_data);
                 return;
             }
@@ -136,12 +137,12 @@ impl IrqFlowHandler for EdgeIrqHandler {
             {
                 let status = desc_inner_guard.common_data().status();
                 if !status.disabled() && status.masked() {
-                    // kdebug!("re-enable irq");
+                    // debug!("re-enable irq");
                     irq_manager().unmask_irq(&desc_inner_guard);
                 }
             }
 
-            // kdebug!("handle_irq_event");
+            // debug!("handle_irq_event");
 
             desc_inner_guard = handle_irq_event(irq_desc, desc_inner_guard);
 
@@ -268,7 +269,7 @@ fn do_handle_irq_event(desc: &Arc<IrqDesc>) -> Result<(), SystemError> {
 
     for action in actions {
         let mut action_inner: SpinLockGuard<'_, InnerIrqAction> = action.inner();
-        // kdebug!("do_handle_irq_event: action: {:?}", action_inner.name());
+        // debug!("do_handle_irq_event: action: {:?}", action_inner.name());
         let dynamic_data = action_inner
             .dev_id()
             .clone()
@@ -314,17 +315,17 @@ fn cond_unmask_eoi_irq(
         && desc_inner_guard.common_data().masked()
         && desc_inner_guard.threads_oneshot() == 0
     {
-        kdebug!(
+        debug!(
             "eoi unmask irq {}",
             desc_inner_guard.irq_data().irq().data()
         );
         chip.irq_eoi(desc_inner_guard.irq_data());
         unmask_irq(desc_inner_guard.irq_data());
     } else if !chip.flags().contains(IrqChipFlags::IRQCHIP_EOI_THREADED) {
-        kdebug!("eoi irq {}", desc_inner_guard.irq_data().irq().data());
+        debug!("eoi irq {}", desc_inner_guard.irq_data().irq().data());
         chip.irq_eoi(desc_inner_guard.irq_data());
     } else {
-        kwarn!(
+        warn!(
             "irq {} eoi failed",
             desc_inner_guard.irq_data().irq().data()
         );
@@ -340,7 +341,7 @@ fn warn_no_thread(irq: IrqNumber, action_inner: &mut SpinLockGuard<'_, InnerIrqA
         return;
     }
 
-    kwarn!(
+    warn!(
         "irq {}, device {} returned IRQ_WAKE_THREAD, but no threaded handler",
         irq.data(),
         action_inner.name()
@@ -402,7 +403,7 @@ impl IrqFlowHandler for PerCpuDevIdIrqHandler {
             static ONCE: Once = Once::new();
 
             ONCE.call_once(|| {
-                kerror!(
+                error!(
                     "Spurious percpu irq {} on cpu {:?}, enabled: {}",
                     irq.data(),
                     cpu,

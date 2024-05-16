@@ -13,16 +13,14 @@ use crate::driver::disk::ahci::HBA_PxIS_TFES;
 use crate::filesystem::kernfs::KernFSInode;
 use crate::filesystem::mbr::MbrDiskPartionTable;
 
+use crate::driver::disk::ahci::hba::{
+    FisRegH2D, FisType, HbaCmdHeader, ATA_CMD_READ_DMA_EXT, ATA_CMD_WRITE_DMA_EXT, ATA_DEV_BUSY,
+    ATA_DEV_DRQ,
+};
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::spinlock::SpinLock;
 use crate::mm::{phys_2_virt, verify_area, VirtAddr};
-use crate::{
-    driver::disk::ahci::hba::{
-        FisRegH2D, FisType, HbaCmdHeader, ATA_CMD_READ_DMA_EXT, ATA_CMD_WRITE_DMA_EXT,
-        ATA_DEV_BUSY, ATA_DEV_DRQ,
-    },
-    kerror,
-};
+use log::error;
 use system_error::SystemError;
 
 use alloc::sync::Weak;
@@ -70,7 +68,7 @@ impl AhciDisk {
         compiler_fence(Ordering::SeqCst);
         let check_length = ((count - 1) >> 4) + 1; // prdt length
         if count * 512 > buf.len() || check_length > 8_usize {
-            kerror!("ahci read: e2big");
+            error!("ahci read: e2big");
             // 不可能的操作
             return Err(SystemError::E2BIG);
         } else if count == 0 {
@@ -130,7 +128,7 @@ impl AhciDisk {
             // 清空整个table的旧数据
             write_bytes(cmdtbl, 0, 1);
         }
-        // kdebug!("cmdheader.prdtl={}", volatile_read!(cmdheader.prdtl));
+        // debug!("cmdheader.prdtl={}", volatile_read!(cmdheader.prdtl));
 
         // 8K bytes (16 sectors) per PRDT
         for i in 0..((volatile_read!(cmdheader.prdtl) - 1) as usize) {
@@ -181,19 +179,19 @@ impl AhciDisk {
         }
 
         if spin_count == SPIN_LIMIT {
-            kerror!("Port is hung");
+            error!("Port is hung");
             return Err(SystemError::EIO);
         }
 
         volatile_set_bit!(port.ci, 1 << slot, true); // Issue command
-                                                     // kdebug!("To wait ahci read complete.");
+                                                     // debug!("To wait ahci read complete.");
                                                      // 等待操作完成
         loop {
             if (volatile_read!(port.ci) & (1 << slot)) == 0 {
                 break;
             }
             if (volatile_read!(port.is) & HBA_PxIS_TFES) > 0 {
-                kerror!("Read disk error");
+                error!("Read disk error");
                 return Err(SystemError::EIO);
             }
         }
@@ -336,7 +334,7 @@ impl AhciDisk {
                 break;
             }
             if (volatile_read!(port.is) & HBA_PxIS_TFES) > 0 {
-                kerror!("Write disk error");
+                error!("Write disk error");
                 return Err(SystemError::EIO);
             }
         }

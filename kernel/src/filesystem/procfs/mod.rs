@@ -1,5 +1,6 @@
 use core::intrinsics::size_of;
 
+use ::log::{error, info};
 use alloc::{
     borrow::ToOwned,
     collections::BTreeMap,
@@ -17,7 +18,6 @@ use crate::{
         core::{generate_inode_id, ROOT_INODE},
         FileType,
     },
-    kerror, kinfo,
     libs::{
         once::Once,
         rwlock::RwLock,
@@ -149,7 +149,7 @@ impl ProcFSInode {
         let pcb = if let Some(pcb) = pcb {
             pcb
         } else {
-            kerror!(
+            error!(
                 "ProcFS: Cannot find pcb for pid {:?} when opening its 'status' file.",
                 pid
             );
@@ -821,7 +821,7 @@ pub fn procfs_init() -> Result<(), SystemError> {
     static INIT: Once = Once::new();
     let mut result = None;
     INIT.call_once(|| {
-        kinfo!("Initializing ProcFS...");
+        info!("Initializing ProcFS...");
         // 创建 procfs 实例
         let procfs: Arc<ProcFS> = ProcFS::new();
         // procfs 挂载
@@ -830,7 +830,7 @@ pub fn procfs_init() -> Result<(), SystemError> {
             .expect("Unabled to find /proc")
             .mount(procfs)
             .expect("Failed to mount at /proc");
-        kinfo!("ProcFS mounted.");
+        info!("ProcFS mounted.");
         result = Some(Ok(()));
     });
 

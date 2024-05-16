@@ -75,11 +75,10 @@ fn do_start_kernel() {
     time_init();
     timer_init();
     kthread_init();
+    setup_arch_post().expect("setup_arch_post failed");
     clocksource_boot_finish();
 
     Futex::init();
-
-    setup_arch_post().expect("setup_arch_post failed");
 
     #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
     crate::virt::kvm::kvm_init();

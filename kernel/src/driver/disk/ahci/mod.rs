@@ -10,21 +10,19 @@ use crate::driver::pci::pci::{
     get_pci_device_structure_mut, PciDeviceStructure, PCI_DEVICE_LINKEDLIST,
 };
 use crate::filesystem::devfs::devfs_register;
-use crate::kerror;
+
+use crate::driver::disk::ahci::{
+    ahcidisk::LockedAhciDisk,
+    hba::HbaMem,
+    hba::{HbaPort, HbaPortType},
+};
 use crate::libs::rwlock::RwLockWriteGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::virt_2_phys;
-use crate::{
-    driver::disk::ahci::{
-        ahcidisk::LockedAhciDisk,
-        hba::HbaMem,
-        hba::{HbaPort, HbaPortType},
-    },
-    kdebug,
-};
 use ahci_inode::LockedAhciInode;
 use alloc::{boxed::Box, collections::LinkedList, format, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::compiler_fence;
+use log::{debug, error};
 use system_error::SystemError;
 
 // 仅module内可见 全局数据区  hbr_port, disks
@@ -90,13 +88,13 @@ pub fn ahci_init() -> Result<(), SystemError> {
                 let tp = hba_mem_port.check_type();
                 match tp {
                     HbaPortType::None => {
-                        kdebug!("<ahci_rust_init> Find a None type Disk.");
+                        debug!("<ahci_rust_init> Find a None type Disk.");
                     }
                     HbaPortType::Unknown(err) => {
-                        kdebug!("<ahci_rust_init> Find a Unknown({:?}) type Disk.", err);
+                        debug!("<ahci_rust_init> Find a Unknown({:?}) type Disk.", err);
                     }
                     _ => {
-                        kdebug!("<ahci_rust_init> Find a {:?} type Disk.", tp);
+                        debug!("<ahci_rust_init> Find a {:?} type Disk.", tp);
 
                         // 计算地址
                         let fb = virt_2_phys(ahci_port_base_vaddr + (32 << 10) + (j << 8));
@@ -122,7 +120,7 @@ pub fn ahci_init() -> Result<(), SystemError> {
                         )?);
                         id += 1; // ID 从0开始
 
-                        kdebug!("start register ahci device");
+                        debug!("start register ahci device");
 
                         // 挂载到devfs上面去
                         let ret = devfs_register(
@@ -130,7 +128,7 @@ pub fn ahci_init() -> Result<(), SystemError> {
                             LockedAhciInode::new(disks_list.last().unwrap().clone()),
                         );
                         if let Err(err) = ret {
-                            kerror!(
+                            error!(
                                 "Ahci_{} ctrl = {}, port = {} failed to register, error code = {:?}",
                                 id,
                                 hba_mem_index as u8,

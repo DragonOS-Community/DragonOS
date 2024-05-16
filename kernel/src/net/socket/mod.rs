@@ -8,6 +8,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use log::warn;
 use smoltcp::{
     iface::SocketSet,
     socket::{self, raw, tcp, udp},
@@ -36,7 +37,7 @@ use self::{
 };
 
 use super::{
-    event_poll::{EPollEventType, EPollItem, EventPoll}, syscall::PosixSocketOption as SockOpt, Endpoint, Protocol, ShutdownType, SOL
+    event_poll::{EPollEventType, EPollItem, EventPoll}, Endpoint, Protocol, ShutdownType, SOL
 };
 
 pub mod handle;
@@ -230,7 +231,8 @@ pub trait Socket: Sync + Send + Debug + Any {
         _optname: usize,
         _optval: &[u8],
     ) -> Result<(), SystemError> {
-        return Err(SystemError::ENOPROTOOPT);
+        warn!("setsockopt is not implemented");
+        Ok(())
     }
 
     fn socket_handle(&self) -> GlobalSocketHandle;
@@ -852,7 +854,7 @@ impl SocketPollMethod {
     }
 
     pub fn raw_poll(socket: &raw::Socket, shutdown: ShutdownType) -> EPollEventType {
-        //kdebug!("enter raw_poll!");
+        //debug!("enter raw_poll!");
         let mut event = EPollEventType::empty();
 
         if shutdown.contains(ShutdownType::RCV_SHUTDOWN) {
@@ -865,21 +867,21 @@ impl SocketPollMethod {
         }
 
         if socket.can_recv() {
-            //kdebug!("poll can recv!");
+            //debug!("poll can recv!");
             event.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
         } else {
-            //kdebug!("poll can not recv!");
+            //debug!("poll can not recv!");
         }
 
         if socket.can_send() {
-            //kdebug!("poll can send!");
+            //debug!("poll can send!");
             event.insert(
                 EPollEventType::EPOLLOUT
                     | EPollEventType::EPOLLWRNORM
                     | EPollEventType::EPOLLWRBAND,
             );
         } else {
-            //kdebug!("poll can not send!");
+            //debug!("poll can not send!");
             // TODO: 缓冲区空间不够，需要使用信号处理
             todo!()
         }

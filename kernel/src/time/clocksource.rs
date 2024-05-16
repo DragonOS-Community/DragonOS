@@ -53,7 +53,7 @@ static mut WATCHDOG_KTHREAD: Option<Arc<ProcessControlBlock>> = None;
 /// 正在被使用时钟源
 pub static CUR_CLOCKSOURCE: SpinLock<Option<Arc<dyn Clocksource>>> = SpinLock::new(None);
 /// 是否完成加载
-pub static mut FINISHED_BOOTING: AtomicBool = AtomicBool::new(false);
+pub static FINISHED_BOOTING: AtomicBool = AtomicBool::new(false);
 
 /// Interval: 0.5sec Threshold: 0.0625s
 /// 系统节拍率
@@ -487,7 +487,7 @@ impl dyn Clocksource {
         self.update_clocksource_data(cs_data)?;
 
         // 启动watchdog线程 进行后续处理
-        if unsafe { FINISHED_BOOTING.load(Ordering::Relaxed) } {
+        if FINISHED_BOOTING.load(Ordering::Relaxed) {
             // TODO 在实现了工作队列后，将启动线程换成schedule work
             run_watchdog_kthread();
         }
@@ -948,7 +948,7 @@ pub fn clocksource_resume_watchdog() {
 /// # 根据精度选择最优的时钟源，或者接受用户指定的时间源
 pub fn clocksource_select() {
     let list_guard = CLOCKSOURCE_LIST.lock();
-    if unsafe { FINISHED_BOOTING.load(Ordering::Relaxed) } || list_guard.is_empty() {
+    if FINISHED_BOOTING.load(Ordering::Relaxed) || list_guard.is_empty() {
         return;
     }
     let mut best = list_guard.front().unwrap().clone();
@@ -971,21 +971,21 @@ pub fn clocksource_select() {
         if cur_clocksource.clocksource_data().name.ne(best_name) {
             kinfo!("Switching to the clocksource {:?}\n", best_name);
             drop(cur_clocksource);
-            CUR_CLOCKSOURCE.lock().replace(best);
+            CUR_CLOCKSOURCE.lock().replace(best.clone());
             // TODO 通知timerkeeping 切换了时间源
         }
     } else {
         // 当前时钟源为空
-        CUR_CLOCKSOURCE.lock().replace(best);
+        CUR_CLOCKSOURCE.lock().replace(best.clone());
     }
-    kdebug!(" clocksource_select finish");
+    kdebug!("clocksource_select finish, CUR_CLOCKSOURCE = {best:?}");
 }
 
 /// # clocksource模块加载完成
 pub fn clocksource_boot_finish() {
     let mut cur_clocksource = CUR_CLOCKSOURCE.lock();
     cur_clocksource.replace(clocksource_default_clock());
-    unsafe { FINISHED_BOOTING.store(true, Ordering::Relaxed) };
+    FINISHED_BOOTING.store(true, Ordering::Relaxed);
     // 清除不稳定的时钟源
     __clocksource_watchdog_kthread();
     kdebug!("clocksource_boot_finish");

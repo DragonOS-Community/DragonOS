@@ -1,4 +1,5 @@
 use core::{
+    cell::Cell,
     fmt::Debug,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -864,5 +865,69 @@ bitflags! {
 
         /// 表示epoll已经被释放，但是在目前的设计中未用到
         const POLLFREE = 0x4000;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct CPollfd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+#[derive(Debug, Clone)]
+pub struct Pollfd {
+    fd: Option<i32>,
+    events: EPollEventType,
+    revents: Cell<EPollEventType>,
+}
+
+impl Pollfd {
+    pub fn new(fd: Option<i32>, events: EPollEventType) -> Self {
+        let revents = Cell::new(EPollEventType::empty());
+        Self {
+            fd,
+            events,
+            revents,
+        }
+    }
+
+    pub fn fd(&self) -> Option<i32> {
+        self.fd
+    }
+
+    pub fn events(&self) -> EPollEventType {
+        self.events
+    }
+
+    pub fn revents(&self) -> &Cell<EPollEventType> {
+        &self.revents
+    }
+}
+
+impl From<CPollfd> for Pollfd {
+    fn from(from: CPollfd) -> Self {
+        let fd = if from.fd >= 0 { Some(from.fd) } else { None };
+        let events = EPollEventType::from_bits_truncate(from.events as u32);
+        let revents = Cell::new(EPollEventType::from_bits_truncate(from.revents as u32));
+        Self {
+            fd,
+            events,
+            revents,
+        }
+    }
+}
+
+impl From<Pollfd> for CPollfd {
+    fn from(from: Pollfd) -> Self {
+        let fd = if let Some(fd) = from.fd() { fd } else { -1 };
+        let events = from.events().bits() as i16;
+        let revents = from.revents().get().bits() as i16;
+        Self {
+            fd,
+            events,
+            revents,
+        }
     }
 }

@@ -834,10 +834,7 @@ impl Syscall {
             }
 
             #[cfg(target_arch = "x86_64")]
-            SYS_POLL => {
-                kwarn!("SYS_POLL has not yet been implemented");
-                Ok(0)
-            }
+            SYS_POLL => Self::poll(VirtAddr::new(args[0]), args[1] as u32, args[2] as i32),
 
             SYS_SETPGID => {
                 kwarn!("SYS_SETPGID has not yet been implemented");

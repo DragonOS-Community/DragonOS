@@ -15,7 +15,7 @@ use crate::{
         disk_info::Partition,
     },
     filesystem::{
-        ext2fs::{ext2fs_instance, file_type, inode},
+        ext2fs::{block_group_desc::Ext2BlockGroupDescriptor, ext2fs_instance, file_type, inode},
         vfs::{syscall::ModeType, FilePrivateData, FileSystem, FileType, IndexNode, Metadata},
     },
     libs::{
@@ -690,6 +690,7 @@ impl IndexNode for LockedExt2InodeInfo {
 
                 let mut block_offset = offset / block_size;
                 let inode = &inode_grade.inode;
+                let mut inode_clone = inode.clone();
                 let group_id = (inode_grade.inode_num / super_block.s_inodes_per_group) as usize;
                 let mut group_desc =
                     &super_block.group_desc_table.as_ref().unwrap()[group_id].clone();
@@ -699,30 +700,59 @@ impl IndexNode for LockedExt2InodeInfo {
 
                 // 读block bitmap
                 let count = (super_block.s_blocks_per_group as usize / 8) / block_size;
-                let mut buf: Vec<u8> = Vec::with_capacity(count * block_size);
-                buf.resize(count * block_size, 0);
+                let mut bitmap_buf: Vec<u8> = Vec::with_capacity(count * block_size);
+                bitmap_buf.resize(count * block_size, 0);
                 let _ = partition.disk().read_at(
                     group_desc.block_bitmap_address as usize,
                     count * (block_size / LBA_SIZE),
-                    buf.as_mut_slice(),
+                    bitmap_buf.as_mut_slice(),
                 );
+
+                let mut start_buf_offset = 0usize;
+                let mut inode_flush = false;
                 // 通过file size 判断是否要分配新的块
                 'lp: loop {
                     // TODO 如果是要分配新块，就不找块号。直接找bitmap，写块。
 
                     // TODO 判断block_offset对应的块存不存在，如果不存在就分配
+                    let write_len = min(block_size, len);
+
                     // 找到起始要插入的块
                     if block_offset < 12 {
                         block_id = inode.blocks[block_offset] as usize;
                         if block_id == 0 {
+                            inode_flush = true;
                             // TODO 分配新块，将新块id写到inode中
-                            // let new_block = group_desc.alloc_one_block(bitmap, group_id, block_per_group)
+                            let new_block = group_desc.alloc_one_block(
+                                bitmap_buf.as_slice(),
+                                group_id,
+                                block_size / mem::size_of::<Ext2BlockGroupDescriptor>(),
+                            );
+                            inode_clone.blocks[block_offset] = new_block as u32;
+                            block_id = new_block;
                         }
+                        let count = if write_len % LBA_SIZE != 0 {
+                            write_len / LBA_SIZE + 1
+                        } else {
+                            write_len / LBA_SIZE
+                        };
+                        partition.disk().write_at(
+                            block_id * block_size / LBA_SIZE,
+                            count,
+                            &buf[start_buf_offset..start_buf_offset + write_len],
+                        )?;
                     } else if block_offset < id_per_block + 12 {
                         // 一级间接
-                        let id = inode.blocks[12] as usize;
+                        let mut id = inode.blocks[12] as usize;
                         if id == 0 {
                             // TODO 分配新块 作为地址块 并修改id 将id写到inode中
+                            let new_block = group_desc.alloc_one_block(
+                                bitmap_buf.as_slice(),
+                                group_id,
+                                block_size / mem::size_of::<Ext2BlockGroupDescriptor>(),
+                            );
+                            inode_clone.blocks[12] = new_block as u32;
+                            id = new_block;
                         }
                         let mut address_block: Vec<u8> = Vec::with_capacity(block_size);
                         address_block.resize(block_size, 0);
@@ -736,10 +766,29 @@ impl IndexNode for LockedExt2InodeInfo {
                         block_id = address_block_data[block_offset - 12] as usize;
                         if block_id == 0 {
                             // TODO 分配新块 将新块id写到address_block中
-
+                            let new_block = group_desc.alloc_one_block(
+                                bitmap_buf.as_slice(),
+                                group_id,
+                                block_size / mem::size_of::<Ext2BlockGroupDescriptor>(),
+                            );
                             // TODO 将数据写到新块中
-
+                            let count = if write_len % LBA_SIZE != 0 {
+                                write_len / LBA_SIZE + 1
+                            } else {
+                                write_len / LBA_SIZE
+                            };
+                            partition.disk().write_at(
+                                new_block * block_size / LBA_SIZE,
+                                count,
+                                &buf[start_buf_offset..start_buf_offset + write_len],
+                            )?;
                             // TODO address_block写回磁盘
+                            address_block_data[block_offset - 12] = new_block as u32;
+                            partition.disk().write_at(
+                                id * block_size / LBA_SIZE,
+                                block_size / LBA_SIZE,
+                                unsafe { core::mem::transmute(address_block_data.as_slice()) },
+                            )?;
                         }
                     } else if block_offset < id_per_block.pow(2) + 12 {
                         // 二级间接
@@ -840,11 +889,12 @@ impl IndexNode for LockedExt2InodeInfo {
                             // TODO address_block写回磁盘
                         }
                     }
-                    // TODO 写一个块 更新offset
+                    // // TODO 写一个块 更新offset
 
-                    // TODO 写块：1. 写直接块
+                    // // TODO 写块：1. 写直接块
 
                     // TODO 判断是否写inode
+                    if inode_flush {}
                 }
                 // let start_block_id = offset
 

@@ -90,10 +90,10 @@ impl Logger {
 
 /// 内核自定义日志器
 ///
-/// todo: 完善他的功能，并且逐步把kinfo等宏，迁移到这个logger上面来。
-struct CustomLogger;
+/// todo: https://github.com/DragonOS-Community/DragonOS/issues/762
+struct KernelLogger;
 
-impl Log for CustomLogger {
+impl Log for KernelLogger {
     fn enabled(&self, _metadata: &log::Metadata) -> bool {
         // 这里可以自定义日志过滤规则
         true
@@ -112,10 +112,10 @@ impl Log for CustomLogger {
     }
 }
 
-impl CustomLogger {
+impl KernelLogger {
     fn iodisplay(record: &log::Record) {
         match record.level() {
-            Level::Debug | Level::Info => {
+            Level::Debug | Level::Info | Level::Trace => {
                 write!(PrintkWriter, "[ {} ] ", record.level(),)
             }
             Level::Error => {
@@ -123,9 +123,6 @@ impl CustomLogger {
             }
             Level::Warn => {
                 write!(PrintkWriter, "\x1B[1;33m[ WARN ] \x1B[0m",)
-            }
-            Level::Trace => {
-                todo!()
             }
         }
         .unwrap();
@@ -185,7 +182,7 @@ impl CustomLogger {
 }
 
 pub fn early_init_logging() {
-    log::set_logger(&CustomLogger).unwrap();
+    log::set_logger(&KernelLogger).unwrap();
     log::set_max_level(log::LevelFilter::Debug);
     info!("Logging initialized");
 }

@@ -1,6 +1,3 @@
-//! 当前slab分配器暂时不使用，等待后续完善后合并主线
-#![allow(dead_code)]
-
 use core::{alloc::Layout, ptr::NonNull, sync::atomic::AtomicBool};
 
 use alloc::boxed::Box;
@@ -73,4 +70,12 @@ pub unsafe fn slab_init() {
 // 查看slab初始化状态
 pub fn slab_init_state() -> bool {
     unsafe { *SLABINITSTATE.get_mut() }
+}
+
+pub unsafe fn slab_usage() -> SlabUsage {
+    if let Some(ref mut slab) = SLABALLOCATOR {
+        slab.zone.usage()
+    } else {
+        SlabUsage::new(0, 0)
+    }
 }

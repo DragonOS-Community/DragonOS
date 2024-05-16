@@ -7,7 +7,6 @@ use crate::{
     driver::{base::init::driver_init, serial::serial_early_init, video::VideoRefreshManager},
     exception::{init::irq_init, softirq::softirq_init, InterruptArch},
     filesystem::vfs::core::vfs_init,
-    include::bindings::bindings::acpi_init,
     init::init_intertrait,
     libs::{
         futex::futex::Futex,
@@ -15,6 +14,7 @@ use crate::{
             screen_manager::{scm_init, scm_reinit},
             textui::textui_init,
         },
+        printk::early_init_logging,
     },
     mm::init::mm_init,
     process::{kthread::kthread_init, process_init, ProcessManager},
@@ -45,6 +45,7 @@ pub fn start_kernel() -> ! {
 #[inline(never)]
 fn do_start_kernel() {
     init_before_mem_init();
+    early_init_logging();
 
     early_setup_arch().expect("setup_arch failed");
     unsafe { mm_init() };
@@ -58,7 +59,7 @@ fn do_start_kernel() {
 
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        acpi_init()
+        crate::include::bindings::bindings::acpi_init()
     };
     crate::sched::sched_init();
     process_init();
@@ -74,11 +75,10 @@ fn do_start_kernel() {
     time_init();
     timer_init();
     kthread_init();
+    setup_arch_post().expect("setup_arch_post failed");
     clocksource_boot_finish();
 
     Futex::init();
-
-    setup_arch_post().expect("setup_arch_post failed");
 
     #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
     crate::virt::kvm::kvm_init();

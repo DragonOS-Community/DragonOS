@@ -48,6 +48,7 @@ bash bootstrap.sh  # 这里请不要加上sudo, 因为需要安装的开发依�
 一键配置脚本目前只支持以下系统：
 
 - Ubuntu/Debian/Deepin/UOS 等基于Debian的衍生版本
+- Gentoo 由于Gentoo系统的特性 当gentoo出现USE或循环依赖问题时 请根据emerge提示信息进行对应的处理 官方的依赖处理实例[GentooWiki](https://wiki.gentoo.org/wiki/Handbook:AMD64/Full/Working/zh-cn#.E5.BD.93_Portage_.E6.8A.A5.E9.94.99.E7.9A.84.E6.97.B6.E5.80.99)
 
 欢迎您为其他的系统完善构建脚本！
 :::
@@ -276,7 +277,7 @@ make clean
 # 下载DragonStub
 git submodule update --init --recursive --force
 
-make kernel -j $(nproc) && make write_diskimage && make qemu
+make run
 ```
 
 请注意，由于是在控制台运行qemu，当你想要退出的时候，输入`Ctrl+A`然后按`X`即可。

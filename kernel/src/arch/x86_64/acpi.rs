@@ -1,8 +1,6 @@
-use system_error::SystemError;
-
-use crate::{driver::acpi::acpi_manager, kinfo, mm::percpu::PerCpu, smp::cpu::ProcessorId};
-
 use super::smp::SMP_BOOT_DATA;
+use crate::{driver::acpi::acpi_manager, kinfo, mm::percpu::PerCpu, smp::cpu::ProcessorId};
+use system_error::SystemError;
 
 pub(super) fn early_acpi_boot_init() -> Result<(), SystemError> {
     // 在这里解析madt，初始化smp boot data

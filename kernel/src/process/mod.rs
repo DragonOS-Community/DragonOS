@@ -147,6 +147,7 @@ impl ProcessManager {
     }
 
     /// 判断进程管理器是否已经初始化完成
+    #[allow(dead_code)]
     pub fn initialized() -> bool {
         unsafe { __PROCESS_MANAGEMENT_INIT_DONE }
     }

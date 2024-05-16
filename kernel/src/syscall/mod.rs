@@ -6,7 +6,6 @@ use core::{
 
 use crate::{
     arch::{ipc::signal::SigSet, syscall::nr::*},
-    driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::syscall::{PosixStatfs, PosixStatx},
     ipc::shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
@@ -400,6 +399,13 @@ impl Syscall {
                 Self::dup2(oldfd, newfd)
             }
 
+            SYS_DUP3 => {
+                let oldfd: i32 = args[0] as c_int;
+                let newfd: i32 = args[1] as c_int;
+                let flags: u32 = args[2] as u32;
+                Self::dup3(oldfd, newfd, flags)
+            }
+
             SYS_SOCKET => Self::socket(args[0], args[1], args[2]),
             SYS_SETSOCKOPT => {
                 let optval = args[3] as *const u8;
@@ -662,7 +668,11 @@ impl Syscall {
                 let flags = args[1];
                 let dev_t = args[2];
                 let flags: ModeType = ModeType::from_bits_truncate(flags as u32);
-                Self::mknod(path as *const u8, flags, DeviceNumber::from(dev_t as u32))
+                Self::mknod(
+                    path as *const u8,
+                    flags,
+                    crate::driver::base::device::device_number::DeviceNumber::from(dev_t as u32),
+                )
             }
 
             SYS_CLONE => {
@@ -852,10 +862,15 @@ impl Syscall {
             }
 
             SYS_MADVISE => {
-                // 这个太吵了，总是打印，先注释掉
-                // kwarn!("SYS_MADVISE has not yet been implemented");
-                Ok(0)
+                let addr = args[0];
+                let len = page_align_up(args[1]);
+                if addr & (MMArch::PAGE_SIZE - 1) != 0 {
+                    Err(SystemError::EINVAL)
+                } else {
+                    Self::madvise(VirtAddr::new(addr), len, args[2])
+                }
             }
+
             SYS_GETTID => Self::gettid().map(|tid| tid.into()),
             SYS_GETUID => Self::getuid(),
 
@@ -989,6 +1004,8 @@ impl Syscall {
                 Self::fchmodat(dirfd, pathname, mode)
             }
 
+            SYS_SCHED_YIELD => Self::do_sched_yield(),
+
             SYS_SCHED_GETAFFINITY => {
                 let pid = args[0] as i32;
                 let size = args[1];
@@ -1051,6 +1068,7 @@ impl Syscall {
                 Err(SystemError::EINVAL)
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_ALARM => {
                 let second = args[0] as u32;
                 Self::alarm(second)

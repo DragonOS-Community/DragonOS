@@ -23,5 +23,6 @@
   "envs": [],
   "build_once": true,
 
-  "install_once": true
+  "install_once": true,
+  "target_arch": ["x86_64"]
 }

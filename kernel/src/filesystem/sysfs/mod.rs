@@ -107,7 +107,13 @@ pub trait AttributeGroup: Debug + Send + Sync {
     ///
     /// 如果返回Some，则使用返回的权限。
     /// 如果要标识属性不可见，则返回Some(ModeType::empty())
-    fn is_visible(&self, kobj: Arc<dyn KObject>, attr: &'static dyn Attribute) -> Option<ModeType>;
+    fn is_visible(
+        &self,
+        _kobj: Arc<dyn KObject>,
+        attr: &'static dyn Attribute,
+    ) -> Option<ModeType> {
+        return Some(attr.mode());
+    }
 }
 
 /// sysfs只读属性文件的权限

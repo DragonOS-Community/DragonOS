@@ -1,8 +1,7 @@
 use core::{any::Any, fmt::Debug, hash::Hash, ops::Deref};
 
 use alloc::{
-    string::String,
-    sync::{Arc, Weak},
+    boxed::Box, string::String, sync::{Arc, Weak}
 };
 use driver_base_macros::get_weak_or_clear;
 use intertrait::CastFromSync;
@@ -317,7 +316,8 @@ impl KObjectManager {
     // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject.c#139
         pub fn kobject_get_path(kobj: &dyn KObject) -> String {
             let length = Self::get_kobj_path_length(kobj);
-            let path = unsafe { kzalloc(length, 0) } as *mut u8;
+            let path_raw = vec![0u8; length].into_boxed_slice();
+            let path = Box::into_raw(path_raw) as *mut u8;
             Self::fill_kobj_path(kobj, path, length);
             let path_string = unsafe { String::from_raw_parts(path, length, length) };
             path_string

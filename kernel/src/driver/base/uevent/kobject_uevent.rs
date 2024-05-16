@@ -165,21 +165,21 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
     }
 
     if top_kobj.kset().is_none() {
-        kdebug!("attempted to send uevent without kset!\n");
+        log::info!("attempted to send uevent without kset!\n");
         return Err(SystemError::EINVAL);
     } 
 
     let kset = top_kobj.kset();
     /* skip the event, if uevent_suppress is set*/
     if UEVENT_SUPPRESS == 1 {
-        kdebug!("uevent_suppress caused the event to drop!");
+        log::info!("uevent_suppress caused the event to drop!");
         return Ok(0);
     }
 
 
     /* skip the event, if the filter returns zero. */
     if kset.as_ref().unwrap().uevent_ops.is_some() && kset.as_ref().unwrap().uevent_ops.as_ref().unwrap().filter() == None {
-        kdebug!("filter caused the event to drop!");
+        log::info!("filter caused the event to drop!");
         return Ok(0);
     }
 
@@ -190,7 +190,7 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
         subsystem = kobj.name();
     }
     if subsystem.is_empty() {
-        kdebug!("unset sussystem caused the event to drop!");
+        log::info!("unset sussystem caused the event to drop!");
     }
 
     /* environment buffer */
@@ -253,7 +253,7 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
     if kset.as_ref().unwrap().uevent_ops.is_some() && kset.as_ref().unwrap().uevent_ops.as_ref().unwrap().uevent(&env) != 0 {
         retval = kset.as_ref().unwrap().uevent_ops.as_ref().unwrap().uevent(&env);
         if retval.is_zero(){
-            kdebug!("kset uevent caused the event to drop!");
+            log::info!("kset uevent caused the event to drop!");
             // goto exit
             drop(devpath);
             drop(env);
@@ -324,7 +324,7 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
 
 pub fn add_uevent_var(env: &mut Box<KobjUeventEnv>, format: &str, args: &String) -> Result<i32, SystemError>{
     if env.envp_idx >= env.envp.len() {
-        kdebug!("add_uevent_var: too many keys");
+        log::info!("add_uevent_var: too many keys");
         return Err(SystemError::ENOMEM);
     }
 
@@ -333,7 +333,7 @@ pub fn add_uevent_var(env: &mut Box<KobjUeventEnv>, format: &str, args: &String)
     let len = buffer.len();
 
     if len >= env.buf.len() - env.buflen {
-        kdebug!("add_uevent_var: buffer size too small");
+        log::info!("add_uevent_var: buffer size too small");
         return Err(SystemError::ENOMEM);
     }
 

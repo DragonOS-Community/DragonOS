@@ -1,6 +1,7 @@
 use core::{intrinsics::unlikely, sync::atomic::Ordering};
 
 use alloc::{string::ToString, sync::Arc};
+use log::error;
 use system_error::SystemError;
 
 use crate::{
@@ -168,7 +169,7 @@ impl ProcessManager {
         args.flags = clone_flags;
         args.exit_signal = Signal::SIGCHLD;
         Self::copy_process(&current_pcb, &pcb, args, current_trapframe).map_err(|e| {
-            kerror!(
+            error!(
                 "fork: Failed to copy process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(),
                 pcb.pid(),

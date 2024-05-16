@@ -5,6 +5,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -433,7 +434,7 @@ impl IrqManager {
                  * 则放弃。
                  */
                 if unlikely(is_chained) {
-                    kwarn!(
+                    warn!(
                         "Chained handler for irq {} is not supported",
                         dt.irq().data()
                     );
@@ -453,7 +454,7 @@ impl IrqManager {
                         &no_irq_chip(),
                     ),
             ) {
-                kwarn!("No irq chip for irq {}", desc_inner.irq_data().irq().data());
+                warn!("No irq chip for irq {}", desc_inner.irq_data().irq().data());
                 return;
             }
         }
@@ -572,7 +573,7 @@ impl IrqHandler for ChainedActionHandler {
     ) -> Result<IrqReturn, SystemError> {
         static ONCE: Once = Once::new();
         ONCE.call_once(|| {
-            kwarn!("Chained irq {} should not call an action.", irq.data());
+            warn!("Chained irq {} should not call an action.", irq.data());
         });
 
         Ok(IrqReturn::NotHandled)

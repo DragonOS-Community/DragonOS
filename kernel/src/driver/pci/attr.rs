@@ -1,5 +1,6 @@
 use alloc::sync::Arc;
 use intertrait::cast::CastArc;
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -50,7 +51,7 @@ impl Attribute for Vendor {
         let dev = _kobj
             .cast::<dyn PciDevice>()
             .map_err(|e: Arc<dyn KObject>| {
-                kwarn!("device:{:?} is not a pci device!", e);
+                warn!("device:{:?} is not a pci device!", e);
                 SystemError::EINVAL
             })?;
         return sysfs_emit_str(_buf, &format!("0x{:04x}", dev.vendor()));
@@ -81,7 +82,7 @@ impl Attribute for DeviceID {
         let dev = _kobj
             .cast::<dyn PciDevice>()
             .map_err(|e: Arc<dyn KObject>| {
-                kwarn!("device:{:?} is not a pci device!", e);
+                warn!("device:{:?} is not a pci device!", e);
                 SystemError::EINVAL
             })?;
         return sysfs_emit_str(_buf, &format!("0x{:04x}", dev.device_id()));
@@ -112,7 +113,7 @@ impl Attribute for SubsystemVendor {
         let dev = _kobj
             .cast::<dyn PciDevice>()
             .map_err(|e: Arc<dyn KObject>| {
-                kwarn!("device:{:?} is not a pci device!", e);
+                warn!("device:{:?} is not a pci device!", e);
                 SystemError::EINVAL
             })?;
         return sysfs_emit_str(_buf, &format!("0x{:04x}", dev.subsystem_vendor()));
@@ -143,7 +144,7 @@ impl Attribute for SubsystemDevice {
         let dev = _kobj
             .cast::<dyn PciDevice>()
             .map_err(|e: Arc<dyn KObject>| {
-                kwarn!("device:{:?} is not a pci device!", e);
+                warn!("device:{:?} is not a pci device!", e);
                 SystemError::EINVAL
             })?;
         return sysfs_emit_str(_buf, &format!("0x{:04x}", dev.subsystem_device()));

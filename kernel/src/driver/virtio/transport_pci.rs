@@ -211,7 +211,7 @@ impl PciTransport {
                 notify_off_multiplier,
             ));
         }
-        //kdebug!("notify.offset={},notify.length={}",notify_cfg.offset,notify_cfg.length);
+        //debug!("notify.offset={},notify.length={}",notify_cfg.offset,notify_cfg.length);
         let notify_region = get_bar_region_slice::<_>(&device.standard_device_bar, &notify_cfg)?;
         let isr_status = get_bar_region::<_>(
             &device.standard_device_bar,
@@ -532,7 +532,7 @@ fn get_bar_region<T>(
     {
         return Err(VirtioPciError::BarOffsetOutOfRange);
     }
-    //kdebug!("Chossed bar ={},used={}",struct_info.bar,struct_info.offset + struct_info.length);
+    //debug!("Chossed bar ={},used={}",struct_info.bar,struct_info.offset + struct_info.length);
     let vaddr = (bar_info
         .virtual_address()
         .ok_or(VirtioPciError::BarGetVaddrFailed)?)

@@ -84,7 +84,7 @@ impl AlarmTimer {
                 <Jiffies as From<Duration>>::from(Duration::from_secs(self.expired_second))
                     .timer_jiffies();
             let remain_second = Duration::from(Jiffies::new(end_jiffies - now_jiffies));
-            // kdebug!(
+            // debug!(
             //     "end: {} - now: {} = remain: {}",
             //     end_jiffies,
             //     now_jiffies,

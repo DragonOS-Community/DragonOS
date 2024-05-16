@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -345,7 +346,7 @@ impl IndexNode for KernFSInode {
         }
 
         if self.callback.is_none() {
-            kwarn!("kernfs: callback is none");
+            warn!("kernfs: callback is none");
             return Err(SystemError::ENOSYS);
         }
 
@@ -590,7 +591,7 @@ impl KernFSInode {
         target: &Arc<KernFSInode>,
         target_absolute_path: String,
     ) -> Result<Arc<KernFSInode>, SystemError> {
-        // kdebug!("kernfs add link: name:{name}, target path={target_absolute_path}");
+        // debug!("kernfs add link: name:{name}, target path={target_absolute_path}");
         let inode = self.inner_create(
             name,
             KernInodeType::SymLink,

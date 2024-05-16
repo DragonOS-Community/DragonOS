@@ -3,13 +3,13 @@ use core::mem::size_of;
 
 use alloc::string::ToString;
 use alloc::{string::String, sync::Arc, vec::Vec};
+use log::warn;
 use system_error::SystemError;
 
 use crate::producefs;
 use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
     filesystem::vfs::{core as Vcore, file::FileDescriptorVec},
-    kerror,
     libs::rwlock::RwLockWriteGuard,
     mm::{verify_area, VirtAddr},
     process::ProcessManager,
@@ -29,7 +29,6 @@ use super::{
     Dirent, FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
-// use crate::kdebug;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -908,7 +907,7 @@ impl Syscall {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
 
         if flags.contains(AtFlags::AT_REMOVEDIR) {
-            // kdebug!("rmdir");
+            // debug!("rmdir");
             match do_remove_dir(dirfd, &path) {
                 Err(err) => {
                     return Err(err);
@@ -1092,7 +1091,7 @@ impl Syscall {
     /// - `cmd`：命令
     /// - `arg`：参数
     pub fn fcntl(fd: i32, cmd: FcntlCommand, arg: i32) -> Result<usize, SystemError> {
-        // kdebug!("fcntl ({cmd:?}) fd: {fd}, arg={arg}");
+        // debug!("fcntl ({cmd:?}) fd: {fd}, arg={arg}");
         match cmd {
             FcntlCommand::DupFd | FcntlCommand::DupFdCloexec => {
                 if arg < 0 || arg as usize >= FileDescriptorVec::PROCESS_MAX_FD {
@@ -1186,7 +1185,7 @@ impl Syscall {
                 // TODO: unimplemented
                 // 未实现的命令，返回0，不报错。
 
-                kwarn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
+                warn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
                 return Err(SystemError::ENOSYS);
             }
         }
@@ -1568,7 +1567,7 @@ impl Syscall {
 
         // fchmod没完全实现，因此不修改文件的权限
         // todo: 实现fchmod
-        kwarn!("fchmod not fully implemented");
+        warn!("fchmod not fully implemented");
         return Ok(0);
     }
     /// #挂载文件系统

@@ -882,7 +882,7 @@ macro_rules! producefs {
         match $initializer_slice.iter().find(|&m| m.name == $filesystem) {
             Some(maker) => maker.call(),
             None => {
-                kerror!("mismatch filesystem type : {}", $filesystem);
+                log::error!("mismatch filesystem type : {}", $filesystem);
                 Err(SystemError::EINVAL)
             }
         }

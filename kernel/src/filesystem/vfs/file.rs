@@ -5,6 +5,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::error;
 use system_error::SystemError;
 
 use crate::{
@@ -14,7 +15,6 @@ use crate::{
     },
     filesystem::procfs::ProcfsFilePrivateData,
     ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
-    kerror,
     libs::{rwlock::RwLock, spinlock::SpinLock},
     net::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
@@ -349,7 +349,7 @@ impl File {
             *readdir_subdirs_name = inode.list()?;
             readdir_subdirs_name.sort();
         }
-        // kdebug!("sub_entries={sub_entries:?}");
+        // debug!("sub_entries={sub_entries:?}");
 
         // 已经读到末尾
         if offset == readdir_subdirs_name.len() {
@@ -360,7 +360,7 @@ impl File {
         let sub_inode: Arc<dyn IndexNode> = match inode.find(name) {
             Ok(i) => i,
             Err(e) => {
-                kerror!(
+                error!(
                     "Readdir error: Failed to find sub inode:{name:?}, file={self:?}, error={e:?}"
                 );
                 return Err(e);
@@ -529,7 +529,7 @@ impl Drop for File {
         let r: Result<(), SystemError> = self.inode.close(self.private_data.lock());
         // 打印错误信息
         if r.is_err() {
-            kerror!(
+            error!(
                 "pid: {:?} failed to close file: {:?}, errno={:?}",
                 ProcessManager::current_pcb().pid(),
                 self,
@@ -653,7 +653,7 @@ impl FileDescriptorVec {
                 let to_drop = file.close_on_exec();
                 if to_drop {
                     if let Err(r) = self.drop_fd(i as i32) {
-                        kerror!(
+                        error!(
                             "Failed to close file: pid = {:?}, fd = {}, error = {:?}",
                             ProcessManager::current_pcb().pid(),
                             i,

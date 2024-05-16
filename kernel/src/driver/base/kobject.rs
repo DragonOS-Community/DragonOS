@@ -6,12 +6,14 @@ use alloc::{
 };
 use driver_base_macros::get_weak_or_clear;
 use intertrait::CastFromSync;
+use log::{debug, error};
 
 use crate::{
     filesystem::{
         kernfs::KernFSInode,
         sysfs::{sysfs_instance, Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport},
-    }, include::bindings::bindings::kzalloc, kerror, libs::{
+    },
+    libs::{
         casting::DowncastArc,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
     }
@@ -209,7 +211,7 @@ impl KObjectManager {
             }
             kobj.set_parent(None);
             if e == SystemError::EEXIST {
-                kerror!("KObjectManager::add_kobj() failed with error: {e:?}, kobj:{kobj:?}");
+                error!("KObjectManager::add_kobj() failed with error: {e:?}, kobj:{kobj:?}");
             }
 
             return Err(e);
@@ -330,7 +332,7 @@ pub struct DynamicKObjKType;
 
 impl KObjType for DynamicKObjKType {
     fn release(&self, kobj: Arc<dyn KObject>) {
-        kdebug!("DynamicKObjKType::release() kobj:{:?}", kobj.name());
+        debug!("DynamicKObjKType::release() kobj:{:?}", kobj.name());
     }
 
     fn sysfs_ops(&self) -> Option<&dyn SysFSOps> {

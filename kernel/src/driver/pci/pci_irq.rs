@@ -6,6 +6,7 @@ use core::ptr::NonNull;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use log::error;
 use system_error::SystemError;
 
 use super::pci::{PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError};
@@ -385,7 +386,7 @@ pub trait PciInterrupt: PciDeviceStructure {
                         }
 
                         Err(_) => {
-                            kerror!(
+                            error!(
                                 "Failed to request pci irq {} for device {}",
                                 irq_num.data(),
                                 &common_msg.irq_name
@@ -548,7 +549,7 @@ pub trait PciInterrupt: PciDeviceStructure {
                         }
 
                         Err(_) => {
-                            kerror!(
+                            error!(
                                 "Failed to request pci irq {} for device {}",
                                 irq_num.data(),
                                 &common_msg.irq_name

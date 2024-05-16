@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use kdepends::ringbuffer::{AllocRingBuffer, RingBuffer};
+use log::{debug, error};
 use system_error::SystemError;
 
 use crate::{
@@ -229,7 +230,7 @@ impl Ps2MouseDevice {
 
         self.send_command_to_ps2mouse(PsMouseCommand::EnablePacketStreaming)
             .map_err(|e| {
-                kerror!("ps2 mouse init error: {:?}", e);
+                error!("ps2 mouse init error: {:?}", e);
                 e
             })?;
         self.read_data_port().ok();
@@ -313,7 +314,7 @@ impl Ps2MouseDevice {
                     guard.current_state.y = self.get_y_movement(packet, flags);
                 }
 
-                // kdebug!(
+                // debug!(
                 //     "Ps2MouseDevice packet : flags:{}, x:{}, y:{}\n",
                 //     guard.current_state.flags.bits,
                 //     guard.current_state.x,
@@ -664,7 +665,7 @@ impl IndexNode for Ps2MouseDevice {
 impl Ps2Device for Ps2MouseDevice {}
 
 pub fn rs_ps2_mouse_device_init(parent: Arc<dyn KObject>) -> Result<(), SystemError> {
-    kdebug!("ps2_mouse_device initializing...");
+    debug!("ps2_mouse_device initializing...");
     let psmouse = Arc::new(Ps2MouseDevice::new());
 
     device_manager().device_default_initialize(&(psmouse.clone() as Arc<dyn Device>));
@@ -672,7 +673,7 @@ pub fn rs_ps2_mouse_device_init(parent: Arc<dyn KObject>) -> Result<(), SystemEr
     serio_device_manager().register_port(psmouse.clone() as Arc<dyn SerioDevice>)?;
 
     devfs_register(&psmouse.name(), psmouse.clone()).map_err(|e| {
-        kerror!(
+        error!(
             "register psmouse device '{}' to devfs failed: {:?}",
             psmouse.name(),
             e

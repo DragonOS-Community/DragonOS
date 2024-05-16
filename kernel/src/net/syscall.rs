@@ -404,13 +404,13 @@ impl Syscall {
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        // kdebug!("accept: socket={:?}", socket);
+        // debug!("accept: socket={:?}", socket);
         let mut socket = unsafe { socket.inner_no_preempt() };
         // 从socket中接收连接
         let (new_socket, remote_endpoint) = socket.accept()?;
         drop(socket);
 
-        // kdebug!("accept: new_socket={:?}", new_socket);
+        // debug!("accept: new_socket={:?}", new_socket);
         // Insert the new socket into the file descriptor vector
         let new_socket: Arc<SocketInode> = SocketInode::new(new_socket);
 
@@ -426,9 +426,9 @@ impl Syscall {
             .fd_table()
             .write()
             .alloc_fd(File::new(new_socket, file_mode)?, None)?;
-        // kdebug!("accept: new_fd={}", new_fd);
+        // debug!("accept: new_fd={}", new_fd);
         if !addr.is_null() {
-            // kdebug!("accept: write remote_endpoint to user");
+            // debug!("accept: write remote_endpoint to user");
             // 将对端地址写入用户空间
             let sockaddr_in = SockAddr::from(remote_endpoint);
             unsafe {

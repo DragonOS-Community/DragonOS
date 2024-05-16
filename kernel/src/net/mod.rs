@@ -143,3 +143,50 @@ impl From<Protocol> for u8 {
         }
     }
 }
+
+bitflags! {
+    pub struct SOL: u32 {
+        const SOL_IP = 0;
+        // const SOL_ICMP = 1; // No-no-no! Due to Linux :-) we cannot
+        const SOL_SOCKET = 1;
+        const SOL_TCP = 6;
+        const SOL_UDP = 17;
+        const SOL_IPV6 = 41;
+        const SOL_ICMPV6 = 58;
+        const SOL_SCTP = 132;
+        const SOL_UDPLITE = 136; // UDP-Lite (RFC 3828)
+        const SOL_RAW = 255;
+        const SOL_IPX = 256;
+        const SOL_AX25 = 257;
+        const SOL_ATALK = 258;
+        const SOL_NETROM = 259;
+        const SOL_ROSE = 260;
+        const SOL_DECNET = 261;
+        const SOL_X25 = 262;
+        const SOL_PACKET = 263;
+        const SOL_ATM = 264; // ATM layer (cell level)
+        const SOL_AAL = 265; // ATM Adaption Layer (packet level)
+        const SOL_IRDA = 266;
+        const SOL_NETBEUI = 267;
+        const SOL_LLC = 268;
+        const SOL_DCCP = 269;
+        const SOL_NETLINK = 270;
+        const SOL_TIPC = 271;
+        const SOL_RXRPC = 272;
+        const SOL_PPPOL2TP = 273;
+        const SOL_BLUETOOTH = 274;
+        const SOL_PNPIPE = 275;
+        const SOL_RDS = 276;
+        const SOL_IUCV = 277;
+        const SOL_CAIF = 278;
+        const SOL_ALG = 279;
+        const SOL_NFC = 280;
+        const SOL_KCM = 281;
+        const SOL_TLS = 282;
+        const SOL_XDP = 283;
+        const SOL_MPTCP = 284;
+        const SOL_MCTP = 285;
+        const SOL_SMC = 286;
+        const SOL_VSOCK = 287;
+    }
+}

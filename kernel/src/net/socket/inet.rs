@@ -10,8 +10,7 @@ use crate::{
     kerror, kwarn,
     libs::rwlock::RwLock,
     net::{
-        event_poll::EPollEventType, net_core::poll_ifaces, Endpoint, Protocol, ShutdownType,
-        NET_DEVICES,
+        event_poll::EPollEventType, net_core::poll_ifaces, socket::tcp_def::TcpOptions, syscall::PosixSocketOption, Endpoint, Protocol, ShutdownType, NET_DEVICES, SOL
     },
 };
 
@@ -41,6 +40,8 @@ impl RawSocket {
     pub const DEFAULT_RX_BUF_SIZE: usize = 64 * 1024;
     /// 默认的发送缓冲区的大小 transmiss
     pub const DEFAULT_TX_BUF_SIZE: usize = 64 * 1024;
+
+    pub const ICMP_FILTER: usize = 1;
 
     /// @brief 创建一个原始的socket
     ///
@@ -219,6 +220,28 @@ impl Socket for RawSocket {
         Box::new(self.clone())
     }
 
+    /// @brief 设置socket的选项
+    ///
+    /// @param level 选项的层次
+    /// @param optname 选项的名称
+    /// @param optval 选项的值
+    ///
+    /// @return 返回设置是否成功, 如果不支持该选项，返回ENOSYS
+    /// 
+    /// ## See
+    /// https://code.dragonos.org.cn/s?refs=sk_setsockopt&project=linux-6.6.21
+    fn setsockopt(
+        &self,
+        _level: SOL,
+        optname: usize,
+        _optval: &[u8],
+    ) -> Result<(), SystemError> {
+        if optname == Self::ICMP_FILTER {
+            todo!("setsockopt ICMP_FILTER");
+        }
+        return Err(SystemError::ENOPROTOOPT);
+    }
+
     fn socket_handle(&self) -> GlobalSocketHandle {
         self.handle
     }
@@ -229,6 +252,34 @@ impl Socket for RawSocket {
 
     fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
         self
+    }
+}
+
+bitflags! {
+    pub struct UdpSocketOptions: u32 {
+        const ZERO = 0;        /* No UDP options */
+        const UDP_CORK = 1;         /* Never send partially complete segments */
+        const UDP_ENCAP = 100;      /* Set the socket to accept encapsulated packets */
+        const UDP_NO_CHECK6_TX = 101; /* Disable sending checksum for UDP6X */
+        const UDP_NO_CHECK6_RX = 102; /* Disable accepting checksum for UDP6 */
+        const UDP_SEGMENT = 103;    /* Set GSO segmentation size */
+        const UDP_GRO = 104;        /* This socket can receive UDP GRO packets */
+
+        const UDPLITE_SEND_CSCOV = 10; /* sender partial coverage (as sent)      */
+        const UDPLITE_RECV_CSCOV = 11; /* receiver partial coverage (threshold ) */
+    }
+}
+
+bitflags! {
+    pub struct UdpEncapTypes: u8 {
+        const ZERO = 0;
+        const ESPINUDP_NON_IKE = 1;     // draft-ietf-ipsec-nat-t-ike-00/01
+        const ESPINUDP = 2;             // draft-ietf-ipsec-udp-encaps-06
+        const L2TPINUDP = 3;            // rfc2661
+        const GTP0 = 4;                 // GSM TS 09.60
+        const GTP1U = 5;                // 3GPP TS 29.060
+        const RXRPC = 6;
+        const ESPINTCP = 7;             // Yikes, this is really xfrm encap types.
     }
 }
 
@@ -307,6 +358,272 @@ impl UdpSocket {
         } else {
             return Err(SystemError::EINVAL);
         }
+    }
+
+    fn sk_setsockopt(
+        &self,
+        _socket: &mut udp::Socket,
+        _level: SOL,
+        optname: PosixSocketOption,
+        _optval: &[u8],
+    ) -> Result<(), SystemError> {
+        use PosixSocketOption::*;
+        use SystemError::*;
+
+        if optname == SO_BINDTODEVICE {
+            todo!("SO_BINDTODEVICE");
+        }
+
+        match optname {
+            SO_DEBUG => {
+                todo!("SO_DEBUG");
+            }
+            SO_REUSEADDR => {
+                todo!("SO_REUSEADDR");
+            }
+            SO_REUSEPORT => {
+                todo!("SO_REUSEPORT");
+            }
+            SO_TYPE => {}
+            SO_PROTOCOL => {}
+            SO_DOMAIN => {}
+            SO_ERROR => {
+                return Err(ENOPROTOOPT);
+            }
+            SO_DONTROUTE => {
+                todo!("SO_DONTROUTE");
+            }
+            SO_BROADCAST => {
+                todo!("SO_BROADCAST");
+            }
+            SO_SNDBUF => {
+                todo!("SO_SNDBUF");
+            }
+            SO_SNDBUFFORCE => {
+                todo!("SO_SNDBUFFORCE");
+            }
+            SO_RCVBUF => {
+                todo!("SO_RCVBUF");
+            }
+            SO_RCVBUFFORCE => {
+                todo!("SO_RCVBUFFORCE");
+            }
+            SO_KEEPALIVE => {
+                todo!("SO_KEEPALIVE");
+            }
+            SO_OOBINLINE => {
+                todo!("SO_OOBINLINE");
+            }
+            SO_NO_CHECK => {
+                todo!("SO_NO_CHECK");
+            }
+            SO_PRIORITY => {
+                todo!("SO_PRIORITY");
+            }
+            SO_LINGER => {
+                todo!("SO_LINGER");
+            }
+            SO_BSDCOMPAT => {
+                todo!("SO_BSDCOMPAT");
+            }
+            SO_PASSCRED => {
+                todo!("SO_PASSCRED");
+            }
+            SO_PASSPIDFD => {
+                todo!("SO_PASSPIDFD");
+            }
+            SO_TIMESTAMP_OLD => {}
+            SO_TIMESTAMP_NEW => {}
+            SO_TIMESTAMPNS_OLD => {}
+            SO_TIMESTAMPNS_NEW => {
+                todo!("SO_TIMESTAMPNS_NEW");
+            }
+            SO_TIMESTAMPING_OLD => {}
+            SO_TIMESTAMPING_NEW => {
+                todo!("SO_TIMESTAMPING_NEW");
+            }
+            SO_RCVLOWAT => {
+                todo!("SO_RCVLOWAT");
+            }
+            SO_RCVTIMEO_OLD => {}
+            SO_RCVTIMEO_NEW => {
+                todo!("SO_RCVTIMEO_NEW");
+            }
+            SO_SNDTIMEO_OLD => {}
+            SO_SNDTIMEO_NEW => {
+                todo!("SO_SNDTIMEO_NEW");
+            }
+            SO_ATTACH_FILTER => {
+                todo!("SO_ATTACH_FILTER");
+            }
+            SO_ATTACH_BPF => {
+                todo!("SO_ATTACH_BPF");
+            }
+            SO_ATTACH_REUSEPORT_CBPF => {
+                todo!("SO_ATTACH_REUSEPORT_CBPF");
+            }
+            SO_ATTACH_REUSEPORT_EBPF => {
+                todo!("SO_ATTACH_REUSEPORT_EBPF");
+            }
+            SO_DETACH_REUSEPORT_BPF => {
+                todo!("SO_DETACH_REUSEPORT_BPF");
+            }
+            SO_DETACH_FILTER => {
+                todo!("SO_DETACH_FILTER");
+            }
+            SO_LOCK_FILTER => {
+                todo!("SO_LOCK_FILTER");
+            }
+            SO_PASSSEC => {
+                todo!("SO_PASSSEC");
+            }
+            SO_MARK => {
+                todo!("SO_MARK");
+            }
+            SO_RCVMARK => {
+                todo!("SO_RCVMARK");
+            }
+            SO_RXQ_OVFL => {
+                todo!("SO_RXQ_OVFL");
+            }
+            SO_WIFI_STATUS => {
+                todo!("SO_WIFI_STATUS");
+            }
+            SO_PEEK_OFF => {
+                todo!("SO_PEEK_OFF");
+            }
+            SO_NOFCS => {
+                todo!("SO_NOFCS");
+            }
+            SO_SELECT_ERR_QUEUE => {
+                todo!("SO_SELECT_ERR_QUEUE");
+            }
+            // if define CONFIG_NET_RX_BUSY_POLL
+            SO_BUSY_POLL => {
+                todo!("SO_BUSY_POLL");
+            }
+            SO_PREFER_BUSY_POLL => {
+                todo!("SO_PREFER_BUSY_POLL");
+            }
+            SO_BUSY_POLL_BUDGET => {
+                todo!("SO_BUSY_POLL_BUDGET");
+            }
+            // end if
+            SO_MAX_PACING_RATE => {
+                todo!("SO_MAX_PACING_RATE");
+            }
+            SO_INCOMING_CPU => {
+                todo!("SO_INCOMING_CPU");
+            }
+            SO_CNX_ADVICE => {
+                todo!("SO_CNX_ADVICE");
+            }
+            SO_ZEROCOPY => {
+                todo!("SO_ZEROCOPY");
+            }
+            SO_TXTIME => {
+                todo!("SO_TXTIME");
+            }
+            SO_BINDTOIFINDEX => {
+                todo!("SO_BINDTOIFINDEX");
+            }
+            SO_BUF_LOCK => {
+                todo!("SO_BUF_LOCK");
+            }
+            SO_RESERVE_MEM => {
+                todo!("SO_RESERVE_MEM");
+            }
+            SO_TXREHASH => {
+                todo!("SO_TXREHASH");
+            }
+            _ => {
+                return Err(ENOPROTOOPT);
+            }
+        }
+        return Err(ENOPROTOOPT);
+    }
+
+    fn udp_lib_setsockopt(
+        &self,
+        level: SOL,
+        optname: usize,
+        optval: &[u8],
+    ) -> Result<(), SystemError> {
+        use PosixSocketOption::*;
+
+        let mut socket_set_guard = SOCKET_SET.lock_irqsave();
+        let socket = socket_set_guard.get_mut::<udp::Socket>(self.handle.smoltcp_handle().unwrap());
+
+        let so_opt_name = 
+            PosixSocketOption::try_from(optname as i32)
+                .map_err(|_| SystemError::ENOPROTOOPT)?;
+
+        if level == SOL::SOL_SOCKET {
+            self.sk_setsockopt(socket, level, so_opt_name, optval)?;
+            if so_opt_name == SO_RCVBUF || so_opt_name == SO_RCVBUFFORCE {
+                todo!("SO_RCVBUF");
+            }
+        }
+
+        match UdpSocketOptions::from_bits_truncate(optname as u32) {
+            UdpSocketOptions::UDP_CORK => {
+                todo!("UDP_CORK");
+            }
+            UdpSocketOptions::UDP_ENCAP => {
+                match UdpEncapTypes::from_bits_truncate(optval[0]) {
+                    UdpEncapTypes::ESPINUDP_NON_IKE => {
+                        todo!("ESPINUDP_NON_IKE");
+                    }
+                    UdpEncapTypes::ESPINUDP => {
+                        todo!("ESPINUDP");
+                    }
+                    UdpEncapTypes::L2TPINUDP => {
+                        todo!("L2TPINUDP");
+                    }
+                    UdpEncapTypes::GTP0 => {
+                        todo!("GTP0");
+                    }
+                    UdpEncapTypes::GTP1U => {
+                        todo!("GTP1U");
+                    }
+                    UdpEncapTypes::RXRPC => {
+                        todo!("RXRPC");
+                    }
+                    UdpEncapTypes::ESPINTCP => {
+                        todo!("ESPINTCP");
+                    }
+                    UdpEncapTypes::ZERO => {}
+                    _ => {
+                        return Err(SystemError::ENOPROTOOPT);
+                    }
+                }
+            }
+            UdpSocketOptions::UDP_NO_CHECK6_TX => {
+                todo!("UDP_NO_CHECK6_TX");
+            }
+            UdpSocketOptions::UDP_NO_CHECK6_RX => {
+                todo!("UDP_NO_CHECK6_RX");
+            }
+            UdpSocketOptions::UDP_SEGMENT => {
+                todo!("UDP_SEGMENT");
+            }
+            UdpSocketOptions::UDP_GRO => {
+                todo!("UDP_GRO");
+            }
+
+            UdpSocketOptions::UDPLITE_RECV_CSCOV => {
+                todo!("UDPLITE_RECV_CSCOV");
+            }
+            UdpSocketOptions::UDPLITE_SEND_CSCOV => {
+                todo!("UDPLITE_SEND_CSCOV");
+            }
+
+            UdpSocketOptions::ZERO => {}
+            _ => {
+                return Err(SystemError::ENOPROTOOPT);
+            }
+        }
+        return Ok(());
     }
 }
 
@@ -437,6 +754,18 @@ impl Socket for UdpSocket {
         return Box::new(self.clone());
     }
 
+    fn setsockopt(
+            &self,
+            level: SOL,
+            optname: usize,
+            optval: &[u8],
+        ) -> Result<(), SystemError> {
+        if level == SOL::SOL_UDP || level == SOL::SOL_UDPLITE || level == SOL::SOL_SOCKET {
+            return self.udp_lib_setsockopt(level, optname, optval);
+        }
+        todo!("ip_setsockopt");
+    }
+
     fn endpoint(&self) -> Option<Endpoint> {
         let sockets = SOCKET_SET.lock_irqsave();
         let socket = sockets.get::<udp::Socket>(self.handle.smoltcp_handle().unwrap());
@@ -560,6 +889,235 @@ impl TcpSocket {
         let rx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_RX_BUF_SIZE]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_TX_BUF_SIZE]);
         tcp::Socket::new(rx_buffer, tx_buffer)
+    }
+
+    fn sk_setsockopt(
+        &self,
+        _socket: &mut tcp::Socket,
+        _level: SOL,
+        optname: PosixSocketOption,
+        _optval: &[u8],
+    ) -> Result<(), SystemError> {
+        use PosixSocketOption::*;
+        use SystemError::*;
+
+        if optname == SO_BINDTODEVICE {
+            todo!("SO_BINDTODEVICE");
+        }
+
+        match optname {
+            SO_DEBUG => {
+                todo!("SO_DEBUG");
+            }
+            SO_REUSEADDR => {
+                todo!("SO_REUSEADDR");
+            }
+            SO_REUSEPORT => {
+                todo!("SO_REUSEPORT");
+            }
+            SO_TYPE => {}
+            SO_PROTOCOL => {}
+            SO_DOMAIN => {}
+            SO_ERROR => {
+                return Err(ENOPROTOOPT);
+            }
+            SO_DONTROUTE => {
+                todo!("SO_DONTROUTE");
+            }
+            SO_BROADCAST => {
+                todo!("SO_BROADCAST");
+            }
+            SO_SNDBUF => {
+                todo!("SO_SNDBUF");
+            }
+            SO_SNDBUFFORCE => {
+                todo!("SO_SNDBUFFORCE");
+            }
+            SO_RCVBUF => {
+                todo!("SO_RCVBUF");
+            }
+            SO_RCVBUFFORCE => {
+                todo!("SO_RCVBUFFORCE");
+            }
+            SO_KEEPALIVE => {
+                todo!("SO_KEEPALIVE");
+            }
+            SO_OOBINLINE => {
+                todo!("SO_OOBINLINE");
+            }
+            SO_NO_CHECK => {
+                todo!("SO_NO_CHECK");
+            }
+            SO_PRIORITY => {
+                todo!("SO_PRIORITY");
+            }
+            SO_LINGER => {
+                todo!("SO_LINGER");
+            }
+            SO_BSDCOMPAT => {
+                todo!("SO_BSDCOMPAT");
+            }
+            SO_PASSCRED => {
+                todo!("SO_PASSCRED");
+            }
+            SO_PASSPIDFD => {
+                todo!("SO_PASSPIDFD");
+            }
+            SO_TIMESTAMP_OLD => {}
+            SO_TIMESTAMP_NEW => {}
+            SO_TIMESTAMPNS_OLD => {}
+            SO_TIMESTAMPNS_NEW => {
+                todo!("SO_TIMESTAMPNS_NEW");
+            }
+            SO_TIMESTAMPING_OLD => {}
+            SO_TIMESTAMPING_NEW => {
+                todo!("SO_TIMESTAMPING_NEW");
+            }
+            SO_RCVLOWAT => {
+                todo!("SO_RCVLOWAT");
+            }
+            SO_RCVTIMEO_OLD => {}
+            SO_RCVTIMEO_NEW => {
+                todo!("SO_RCVTIMEO_NEW");
+            }
+            SO_SNDTIMEO_OLD => {}
+            SO_SNDTIMEO_NEW => {
+                todo!("SO_SNDTIMEO_NEW");
+            }
+            SO_ATTACH_FILTER => {
+                todo!("SO_ATTACH_FILTER");
+            }
+            SO_ATTACH_BPF => {
+                todo!("SO_ATTACH_BPF");
+            }
+            SO_ATTACH_REUSEPORT_CBPF => {
+                todo!("SO_ATTACH_REUSEPORT_CBPF");
+            }
+            SO_ATTACH_REUSEPORT_EBPF => {
+                todo!("SO_ATTACH_REUSEPORT_EBPF");
+            }
+            SO_DETACH_REUSEPORT_BPF => {
+                todo!("SO_DETACH_REUSEPORT_BPF");
+            }
+            SO_DETACH_FILTER => {
+                todo!("SO_DETACH_FILTER");
+            }
+            SO_LOCK_FILTER => {
+                todo!("SO_LOCK_FILTER");
+            }
+            SO_PASSSEC => {
+                todo!("SO_PASSSEC");
+            }
+            SO_MARK => {
+                todo!("SO_MARK");
+            }
+            SO_RCVMARK => {
+                todo!("SO_RCVMARK");
+            }
+            SO_RXQ_OVFL => {
+                todo!("SO_RXQ_OVFL");
+            }
+            SO_WIFI_STATUS => {
+                todo!("SO_WIFI_STATUS");
+            }
+            SO_PEEK_OFF => {
+                todo!("SO_PEEK_OFF");
+            }
+            SO_NOFCS => {
+                todo!("SO_NOFCS");
+            }
+            SO_SELECT_ERR_QUEUE => {
+                todo!("SO_SELECT_ERR_QUEUE");
+            }
+            // if define CONFIG_NET_RX_BUSY_POLL
+            SO_BUSY_POLL => {
+                todo!("SO_BUSY_POLL");
+            }
+            SO_PREFER_BUSY_POLL => {
+                todo!("SO_PREFER_BUSY_POLL");
+            }
+            SO_BUSY_POLL_BUDGET => {
+                todo!("SO_BUSY_POLL_BUDGET");
+            }
+            // end if
+            SO_MAX_PACING_RATE => {
+                todo!("SO_MAX_PACING_RATE");
+            }
+            SO_INCOMING_CPU => {
+                todo!("SO_INCOMING_CPU");
+            }
+            SO_CNX_ADVICE => {
+                todo!("SO_CNX_ADVICE");
+            }
+            SO_ZEROCOPY => {
+                todo!("SO_ZEROCOPY");
+            }
+            SO_TXTIME => {
+                todo!("SO_TXTIME");
+            }
+            SO_BINDTOIFINDEX => {
+                todo!("SO_BINDTOIFINDEX");
+            }
+            SO_BUF_LOCK => {
+                todo!("SO_BUF_LOCK");
+            }
+            SO_RESERVE_MEM => {
+                todo!("SO_RESERVE_MEM");
+            }
+            SO_TXREHASH => {
+                todo!("SO_TXREHASH");
+            }
+            _ => {
+                return Err(ENOPROTOOPT);
+            }
+        }
+        return Err(ENOPROTOOPT);
+    }
+
+    fn do_tcp_setsockopt(
+        &self,
+        level: SOL,
+        optname: usize,
+        optval: &[u8],
+    ) -> Result<(), SystemError> {
+
+        let mut socket_set_guard = SOCKET_SET.lock_irqsave();
+        let socket = socket_set_guard.get_mut::<tcp::Socket>(self.handles[0].smoltcp_handle().unwrap());
+
+        if level == SOL::SOL_SOCKET {
+            self.sk_setsockopt(socket, level, PosixSocketOption::try_from(optname as i32)?, optval)?;
+        }
+
+        let boolval = optval[0] != 0;
+
+        match TcpOptions::from_bits_truncate(optname as u32) {
+            TcpOptions::TCP_CONGESTION => {
+                todo!("TCP_CONGESTION");
+            }
+            TcpOptions::TCP_QUICKACK => {
+                if boolval {
+                    socket.set_ack_delay(None);
+                } else {
+                    socket.set_ack_delay(Some(smoltcp::time::Duration::from_millis(10)));
+                }
+            }
+            TcpOptions::TCP_NODELAY => {
+                socket.set_nagle_enabled(boolval);
+            }
+            TcpOptions::TCP_USER_TIMEOUT => {
+                let duration = u32::from_ne_bytes(optval.try_into().map_err(|_| SystemError::EINVAL)?) as u64;
+                socket.set_timeout(Some(smoltcp::time::Duration::from_millis(duration)));
+            }
+            TcpOptions::TCP_KEEPINTVL => {
+                let duration = u32::from_ne_bytes(optval.try_into().map_err(|_| SystemError::EINVAL)?) as u64;
+                socket.set_keep_alive(Some(smoltcp::time::Duration::from_millis(duration)));
+            }
+            // TcpOptions::TCP_NL
+            _ => {
+                return Err(SystemError::ENOPROTOOPT);
+            }
+        }
+        return Ok(());
     }
 }
 
@@ -943,6 +1501,18 @@ impl Socket for TcpSocket {
 
     fn box_clone(&self) -> Box<dyn Socket> {
         Box::new(self.clone())
+    }
+
+    fn setsockopt(
+        &self,
+        level: SOL,
+        optname: usize,
+        optval: &[u8],
+    ) -> Result<(), SystemError> {
+        if level != SOL::SOL_TCP {
+            todo!("icsk_setsockopt");
+        }
+        return self.do_tcp_setsockopt(level, optname, optval);
     }
 
     fn socket_handle(&self) -> GlobalSocketHandle {

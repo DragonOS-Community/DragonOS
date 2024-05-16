@@ -15,6 +15,7 @@ use acpi::fadt::Fadt;
 use alloc::sync::{Arc, Weak};
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicU32, Ordering};
+use log::info;
 use system_error::SystemError;
 
 // 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/clocksource/acpi_pm.c
@@ -170,6 +171,8 @@ const PMTMR_EXPECTED_RATE: u64 =
 #[cfg(not(target_arch = "x86_64"))]
 #[allow(dead_code)]
 fn verify_pmtmr_rate() -> bool {
+    use log::info;
+
     let mut count: u32 = 0;
 
     mach_prepare_counter();
@@ -179,7 +182,7 @@ fn verify_pmtmr_rate() -> bool {
     let delta = (value2 - value1) & ACPI_PM_MASK;
 
     if (delta < (PMTMR_EXPECTED_RATE * 19) / 20) || (delta > (PMTMR_EXPECTED_RATE * 21) / 20) {
-        kinfo!(
+        info!(
             "PM Timer running at invalid rate: {}",
             100 * delta / PMTMR_EXPECTED_RATE
         );
@@ -209,7 +212,7 @@ fn find_acpi_pm_clock() -> Result<(), SystemError> {
 
     PMTMR_IO_PORT.store(pmtmr_addr as u32, Ordering::SeqCst);
 
-    kinfo!(
+    info!(
         "apic_pmtmr I/O port: {}",
         PMTMR_IO_PORT.load(Ordering::SeqCst)
     );
@@ -257,14 +260,14 @@ pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
             if (value2 < value1) && (value2 < 0xfff) {
                 break;
             }
-            kinfo!("PM Timer had inconsistens results: {} {}", value1, value2);
+            info!("PM Timer had inconsistens results: {} {}", value1, value2);
 
             PMTMR_IO_PORT.store(0, Ordering::SeqCst);
 
             return Err(SystemError::EINVAL);
         }
         if i == ACPI_PM_READ_CHECKS {
-            kinfo!("PM Timer failed consistency check: {}", value1);
+            info!("PM Timer failed consistency check: {}", value1);
 
             PMTMR_IO_PORT.store(0, Ordering::SeqCst);
 
@@ -289,11 +292,11 @@ pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
     let acpi_pmtmr = clocksource_acpi_pm() as Arc<dyn Clocksource>;
     match acpi_pmtmr.register(100, PMTMR_TICKS_PER_SEC as u32) {
         Ok(_) => {
-            kinfo!("ACPI PM Timer registered as clocksource sccessfully");
+            info!("ACPI PM Timer registered as clocksource sccessfully");
             return Ok(());
         }
         Err(_) => {
-            kinfo!("ACPI PM Timer init registered failed");
+            info!("ACPI PM Timer init registered failed");
             return Err(SystemError::ENOSYS);
         }
     };

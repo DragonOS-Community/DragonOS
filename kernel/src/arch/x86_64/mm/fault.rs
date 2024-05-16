@@ -4,6 +4,7 @@ use core::{
 };
 
 use alloc::sync::Arc;
+use log::error;
 use x86::{bits64::rflags::RFlags, controlregs::Cr4};
 
 use crate::{
@@ -13,7 +14,6 @@ use crate::{
         CurrentIrqArch, MMArch,
     },
     exception::InterruptArch,
-    kerror,
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
         ucontext::{AddressSpace, LockedVMA},
@@ -74,27 +74,27 @@ impl X86_64MMArch {
         if let Some(entry) = mapper.get_entry(address, 0) {
             if entry.present() {
                 if !entry.flags().has_execute() {
-                    kerror!("kernel tried to execute NX-protected page - exploit attempt?");
+                    error!("kernel tried to execute NX-protected page - exploit attempt?");
                 } else if mapper.table().phys().data() & MMArch::ENTRY_FLAG_USER != 0
                     && unsafe { x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_SMEP) }
                 {
-                    kerror!("unable to execute userspace code (SMEP?)");
+                    error!("unable to execute userspace code (SMEP?)");
                 }
             }
         }
         if address.data() < X86_64MMArch::PAGE_SIZE && !regs.is_from_user() {
-            kerror!(
+            error!(
                 "BUG: kernel NULL pointer dereference, address: {:#x}",
                 address.data()
             );
         } else {
-            kerror!(
+            error!(
                 "BUG: unable to handle page fault for address: {:#x}",
                 address.data()
             );
         }
 
-        kerror!(
+        error!(
             "#PF: {} {} in {} mode\n",
             if error_code.contains(X86PfErrorCode::X86_PF_USER) {
                 "user"
@@ -114,7 +114,7 @@ impl X86_64MMArch {
                 "kernel"
             }
         );
-        kerror!(
+        error!(
             "#PF: error_code({:#04x}) - {}\n",
             error_code,
             if !error_code.contains(X86PfErrorCode::X86_PF_PROT) {

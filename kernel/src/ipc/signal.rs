@@ -1,12 +1,12 @@
 use core::sync::atomic::compiler_fence;
 
 use alloc::sync::Arc;
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigCode, SigFlags, SigSet, Signal},
     ipc::signal_types::SigactionType,
-    kwarn,
     libs::spinlock::SpinLockGuard,
     process::{pid::PidType, Pid, ProcessControlBlock, ProcessFlags, ProcessManager},
 };
@@ -35,7 +35,7 @@ impl Signal {
         // 如果 pid 等于 -1，那么信号的发送范围是：调用进程有权将信号发往的每个目标进程，除去 init（进程 ID 为 1）和调用进程自身。如果特权级进程发起这一调用，那么会发送信号给系统中的所有进程，上述两个进程除外。显而易见，有时也将这种信号发送方式称之为广播信号
         // 如果并无进程与指定的 pid 相匹配，那么 kill() 调用失败，同时将 errno 置为 ESRCH（“查无此进程”）
         if pid.lt(&Pid::from(0)) {
-            kwarn!("Kill operation not support: pid={:?}", pid);
+            warn!("Kill operation not support: pid={:?}", pid);
             return Err(SystemError::ENOSYS);
         }
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -47,7 +47,7 @@ impl Signal {
         let pcb = ProcessManager::find(pid);
 
         if pcb.is_none() {
-            kwarn!("No such process.");
+            warn!("No such process.");
             return retval;
         }
 
@@ -85,7 +85,7 @@ impl Signal {
         if !self.prepare_sianal(pcb.clone(), force_send) {
             return Err(SystemError::EINVAL);
         }
-        // kdebug!("force send={}", force_send);
+        // debug!("force send={}", force_send);
         let pcb_info = pcb.sig_info_irqsave();
         let pending = if matches!(pt, PidType::PID) {
             pcb_info.sig_shared_pending()
@@ -141,7 +141,7 @@ impl Signal {
     /// @param pt siginfo结构体中，pid字段代表的含义
     #[allow(clippy::if_same_then_else)]
     fn complete_signal(&self, pcb: Arc<ProcessControlBlock>, pt: PidType) {
-        // kdebug!("complete_signal");
+        // debug!("complete_signal");
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // ===== 寻找需要wakeup的目标进程 =====
@@ -284,14 +284,14 @@ impl Signal {
 fn signal_wake_up(pcb: Arc<ProcessControlBlock>, _guard: SpinLockGuard<SignalStruct>, fatal: bool) {
     // 如果是 fatal 的话就唤醒 stop 和 block 的进程来响应，因为唤醒后就会终止
     // 如果不是 fatal 的就只唤醒 stop 的进程来响应
-    // kdebug!("signal_wake_up");
+    // debug!("signal_wake_up");
     // 如果目标进程已经在运行，则发起一个ipi，使得它陷入内核
     let state = pcb.sched_info().inner_lock_read_irqsave().state();
     let mut wakeup_ok = true;
     if state.is_blocked_interruptable() {
         ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
             wakeup_ok = false;
-            kwarn!(
+            warn!(
                 "Current pid: {:?}, signal_wake_up target {:?} error: {:?}",
                 ProcessManager::current_pcb().pid(),
                 pcb.pid(),
@@ -301,7 +301,7 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, _guard: SpinLockGuard<SignalStr
     } else if state.is_stopped() {
         ProcessManager::wakeup_stop(&pcb).unwrap_or_else(|e| {
             wakeup_ok = false;
-            kwarn!(
+            warn!(
                 "Current pid: {:?}, signal_wake_up target {:?} error: {:?}",
                 ProcessManager::current_pcb().pid(),
                 pcb.pid(),
@@ -333,7 +333,7 @@ fn recalc_sigpending() {
 /// @param force_default 是否强制将sigaction恢复成默认状态
 pub fn flush_signal_handlers(pcb: Arc<ProcessControlBlock>, force_default: bool) {
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    // kdebug!("hand=0x{:018x}", hand as *const sighand_struct as usize);
+    // debug!("hand=0x{:018x}", hand as *const sighand_struct as usize);
     let actions = &mut pcb.sig_struct_irqsave().handlers;
 
     for sigaction in actions.iter_mut() {

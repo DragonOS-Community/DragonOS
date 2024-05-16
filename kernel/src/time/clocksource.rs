@@ -11,6 +11,7 @@ use alloc::{
     vec::Vec,
 };
 use lazy_static::__Deref;
+use log::{debug, info};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -18,7 +19,6 @@ use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
     init::initcall::INITCALL_LATE,
-    kdebug, kinfo,
     libs::spinlock::SpinLock,
     process::{
         kthread::{KernelThreadClosure, KernelThreadMechanism},
@@ -378,7 +378,7 @@ impl dyn Clocksource {
             .expect("register: failed to enqueue watchdog list");
         // 选择一个最好的时钟源
         clocksource_select();
-        kdebug!("clocksource_register successfully");
+        debug!("clocksource_register successfully");
         return Ok(());
     }
 
@@ -398,7 +398,7 @@ impl dyn Clocksource {
         let cs = self.clocksource();
         list_guard.push_back(cs);
         list_guard.append(&mut temp_list);
-        // kdebug!(
+        // debug!(
         //     "CLOCKSOURCE_LIST len = {:?},clocksource_enqueue sccessfully",
         //     list_guard.len()
         // );
@@ -473,10 +473,9 @@ impl dyn Clocksource {
     pub fn set_unstable(&self, delta: i64) -> Result<i32, SystemError> {
         let mut cs_data = self.clocksource_data();
         // 打印出unstable的时钟源信息
-        kdebug!(
+        debug!(
             "clocksource :{:?} is unstable, its delta is {:?}",
-            cs_data.name,
-            delta
+            cs_data.name, delta
         );
         cs_data.flags.remove(
             ClocksourceFlags::CLOCK_SOURCE_VALID_FOR_HRES | ClocksourceFlags::CLOCK_SOURCE_WATCHDOG,
@@ -740,7 +739,7 @@ pub fn clocksource_resume() {
         match ele.resume() {
             Ok(_) => continue,
             Err(_) => {
-                kdebug!("clocksource {:?} resume failed", data.name);
+                debug!("clocksource {:?} resume failed", data.name);
             }
         }
     }
@@ -756,7 +755,7 @@ pub fn clocksource_suspend() {
         match ele.suspend() {
             Ok(_) => continue,
             Err(_) => {
-                kdebug!("clocksource {:?} suspend failed", data.name);
+                debug!("clocksource {:?} suspend failed", data.name);
             }
         }
     }
@@ -770,11 +769,11 @@ pub fn clocksource_suspend() {
 /// * `Err(SystemError)` - 错误码
 pub fn clocksource_watchdog() -> Result<(), SystemError> {
     let mut cs_watchdog = CLOCKSOUCE_WATCHDOG.lock_irqsave();
-    // kdebug!("clocksource_watchdog start");
+    // debug!("clocksource_watchdog start");
 
     // watchdog没有在运行的话直接退出
     if !cs_watchdog.is_running || cs_watchdog.watchdog.is_none() {
-        // kdebug!("is_running = {:?},watchdog = {:?}", cs_watchdog.is_running, cs_watchdog.watchdog);
+        // debug!("is_running = {:?},watchdog = {:?}", cs_watchdog.is_running, cs_watchdog.watchdog);
         return Ok(());
     }
     let cur_watchdog = cs_watchdog.watchdog.as_ref().unwrap().clone();
@@ -797,7 +796,7 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
             .flags
             .contains(ClocksourceFlags::CLOCK_SOURCE_UNSTABLE)
         {
-            // kdebug!("clocksource_watchdog unstable");
+            // debug!("clocksource_watchdog unstable");
             // 启动watchdog_kthread
             run_watchdog_kthread();
             continue;
@@ -810,7 +809,7 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
             .flags
             .contains(ClocksourceFlags::CLOCK_SOURCE_WATCHDOG)
         {
-            // kdebug!("clocksource_watchdog start watch");
+            // debug!("clocksource_watchdog start watch");
             cs_data
                 .flags
                 .insert(ClocksourceFlags::CLOCK_SOURCE_WATCHDOG);
@@ -819,7 +818,7 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
             cs.update_clocksource_data(cs_data.clone())?;
             continue;
         }
-        // kdebug!("cs_data.watchdog_last = {:?},cs_now_clock = {:?}", cs_data.watchdog_last, cs_now_clock);
+        // debug!("cs_data.watchdog_last = {:?},cs_now_clock = {:?}", cs_data.watchdog_last, cs_now_clock);
         // 计算时钟源的误差
         let cs_dev_nsec = clocksource_cyc2ns(
             CycleNum(cs_now_clock.div(cs_data.watchdog_last).data() & cs_data.mask.bits),
@@ -830,14 +829,14 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
         cs_data.watchdog_last = cs_now_clock;
         cs.update_clocksource_data(cs_data.clone())?;
         if cs_dev_nsec.abs_diff(wd_dev_nsec) > WATCHDOG_THRESHOLD.into() {
-            // kdebug!("set_unstable");
+            // debug!("set_unstable");
             // 误差过大，标记为unstable
-            kinfo!("cs_dev_nsec = {}", cs_dev_nsec);
-            kinfo!("wd_dev_nsec = {}", wd_dev_nsec);
+            info!("cs_dev_nsec = {}", cs_dev_nsec);
+            info!("wd_dev_nsec = {}", wd_dev_nsec);
             cs.set_unstable((cs_dev_nsec - wd_dev_nsec).try_into().unwrap())?;
             continue;
         }
-        // kdebug!("clocksource_watchdog aaa");
+        // debug!("clocksource_watchdog aaa");
 
         // 判断是否要切换为高精度模式
         if !cs_data
@@ -900,7 +899,7 @@ fn __clocksource_watchdog_kthread() {
         clock.clocksource_change_rating(0);
         let mut data = clock.clocksource_data();
         data.watchdog_last = clock.read();
-        kdebug!("kthread: watchdog_last = {:?}", data.watchdog_last);
+        debug!("kthread: watchdog_last = {:?}", data.watchdog_last);
         data.flags.remove(ClocksourceFlags::CLOCK_SOURCE_UNSTABLE);
         clock
             .update_clocksource_data(data)
@@ -917,7 +916,7 @@ fn __clocksource_watchdog_kthread() {
 pub fn clocksource_watchdog_kthread() -> i32 {
     // return 0;
     loop {
-        // kdebug!("clocksource_watchdog_kthread start");
+        // debug!("clocksource_watchdog_kthread start");
         __clocksource_watchdog_kthread();
         if KernelThreadMechanism::should_stop(&ProcessManager::current_pcb()) {
             break;
@@ -969,7 +968,7 @@ pub fn clocksource_select() {
         let cur_clocksource = CUR_CLOCKSOURCE.lock().as_ref().unwrap().clone();
         let best_name = &best.clocksource_data().name;
         if cur_clocksource.clocksource_data().name.ne(best_name) {
-            kinfo!("Switching to the clocksource {:?}\n", best_name);
+            info!("Switching to the clocksource {:?}\n", best_name);
             drop(cur_clocksource);
             CUR_CLOCKSOURCE.lock().replace(best.clone());
             // TODO 通知timerkeeping 切换了时间源
@@ -978,7 +977,7 @@ pub fn clocksource_select() {
         // 当前时钟源为空
         CUR_CLOCKSOURCE.lock().replace(best.clone());
     }
-    kdebug!("clocksource_select finish, CUR_CLOCKSOURCE = {best:?}");
+    debug!("clocksource_select finish, CUR_CLOCKSOURCE = {best:?}");
 }
 
 /// # clocksource模块加载完成
@@ -988,7 +987,7 @@ pub fn clocksource_boot_finish() {
     FINISHED_BOOTING.store(true, Ordering::Relaxed);
     // 清除不稳定的时钟源
     __clocksource_watchdog_kthread();
-    kdebug!("clocksource_boot_finish");
+    debug!("clocksource_boot_finish");
 }
 
 fn run_watchdog_kthread() {

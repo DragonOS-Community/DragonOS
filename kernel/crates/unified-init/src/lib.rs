@@ -40,7 +40,7 @@ macro_rules! define_unified_initializer_slice {
         static $name: [::unified_init::UnifiedInitializer] = [..];
     };
     () => {
-        compile_error!(
+        compile_kerror!(
             "define_unified_initializer_slice! requires at least one argument: slice_name"
         );
     };
@@ -54,7 +54,7 @@ macro_rules! define_public_unified_initializer_slice {
         pub static $name: [::unified_init::UnifiedInitializer] = [..];
     };
     () => {
-        compile_error!(
+        compile_kerror!(
             "define_unified_initializer_slice! requires at least one argument: slice_name"
         );
     };
@@ -66,7 +66,7 @@ macro_rules! unified_init {
     ($initializer_slice:ident) => {
         for initializer in $initializer_slice.iter() {
             initializer.call().unwrap_or_else(|e| {
-                kerror!("Failed to call initializer {}: {:?}", initializer.name(), e);
+                log::error!("Failed to call initializer {}: {:?}", initializer.name(), e);
             });
         }
     };

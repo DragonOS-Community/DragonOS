@@ -91,7 +91,7 @@ impl PciRoot {
     /// @brief  完成物理地址到虚拟地址的映射，并将虚拟地址加入mmio_base变量
     /// @return 返回错误或Ok(0)
     fn map(&mut self) -> Result<u8, PciError> {
-        //kdebug!("bus_begin={},bus_end={}", self.bus_begin,self.bus_end);
+        //debug!("bus_begin={},bus_end={}", self.bus_begin,self.bus_end);
         let bus_number = (self.bus_end - self.bus_begin) as u32 + 1;
         let bus_number_double = (bus_number - 1) / 2 + 1; //一个bus占据1MB空间，计算全部bus占据空间相对于2MB空间的个数
 

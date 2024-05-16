@@ -6,10 +6,11 @@ use crate::driver::pci::pci::{
 };
 use crate::include::bindings::bindings::{io_in32, io_out32};
 use crate::init::initcall::INITCALL_SUBSYS;
-use crate::kerror;
+
 use crate::mm::PhysAddr;
 
 use acpi::mcfg::Mcfg;
+use log::error;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -51,7 +52,7 @@ impl TraitPciArch for X86_64PciArch {
 #[unified_init(INITCALL_SUBSYS)]
 fn x86_64_pci_init() -> Result<(), SystemError> {
     if let Err(e) = discover_ecam_root() {
-        kerror!("x86_64_pci_init(): discover_ecam_root error: {:?}", e);
+        error!("x86_64_pci_init(): discover_ecam_root error: {:?}", e);
     }
     pci_init();
 

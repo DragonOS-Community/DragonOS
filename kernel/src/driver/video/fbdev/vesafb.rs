@@ -9,6 +9,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::{info, warn};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -390,7 +391,7 @@ impl FrameBufferOps for VesaFb {
 
     /// ## 填充矩形
     fn fb_fillrect(&self, rect: super::base::FillRectData) -> Result<(), SystemError> {
-        // kwarn!("rect {rect:?}");
+        // warn!("rect {rect:?}");
 
         let boot_param = boot_params().read();
         let screen_base = boot_param
@@ -1006,7 +1007,7 @@ fn vesa_fb_device_init() -> Result<(), SystemError> {
 
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        kinfo!("vesa fb device init");
+        info!("vesa fb device init");
         let device = Arc::new(VesaFb::new());
 
         let mut fb_fix = VESAFB_FIX_INFO.write_irqsave();
@@ -1068,7 +1069,7 @@ fn vesa_fb_device_init() -> Result<(), SystemError> {
         // 加入全局fb表
         let mut guard = FRAME_BUFFER_SET.write();
         if guard.get(device.fb_id().data() as usize).unwrap().is_some() {
-            kwarn!(
+            warn!(
                 "vesa_fb_device_init: There is already an element {:?} in the FRAME_BUFFER_SET",
                 device.fb_id()
             );

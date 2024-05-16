@@ -1,5 +1,6 @@
 use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
+use log::{debug, info};
 use system_error::SystemError;
 
 use crate::{
@@ -11,7 +12,6 @@ use crate::{
         MMArch,
     },
     driver::firmware::efi::efi_manager,
-    kdebug, kinfo,
     libs::lib_ui::screen_manager::scm_disable_put_to_window,
     mm::{
         allocator::{buddy::BuddyAllocator, bump::BumpAllocator, page_frame::FrameAllocator},
@@ -56,7 +56,7 @@ unsafe fn init_kernel_addr() {
     KERNEL_BEGIN_VA = VirtAddr::new(boot_text_start_pa as usize);
     KERNEL_END_VA = VirtAddr::new(_end as usize);
 
-    kdebug!(
+    debug!(
         "init_kernel_addr: \n\tKERNEL_BEGIN_PA: {KERNEL_BEGIN_PA:?}
         \tKERNEL_END_PA: {KERNEL_END_PA:?}
         \tKERNEL_BEGIN_VA: {KERNEL_BEGIN_VA:?}
@@ -78,7 +78,7 @@ pub(super) unsafe fn riscv_mm_init() -> Result<(), SystemError> {
 
     // 使用bump分配器，把所有的内存页都映射到页表
     {
-        // kdebug!("to create new page table");
+        // debug!("to create new page table");
         // 用bump allocator创建新的页表
         let mut mapper: crate::mm::page::PageMapper<MMArch, &mut BumpAllocator<MMArch>> =
             crate::mm::page::PageMapper::<MMArch, _>::create(
@@ -87,7 +87,7 @@ pub(super) unsafe fn riscv_mm_init() -> Result<(), SystemError> {
             )
             .expect("Failed to create page mapper");
         new_page_table = mapper.table().phys();
-        // kdebug!("PageMapper created");
+        // debug!("PageMapper created");
 
         // 取消最开始时候，在head.S中指定的映射(暂时不刷新TLB)
         {
@@ -99,12 +99,12 @@ pub(super) unsafe fn riscv_mm_init() -> Result<(), SystemError> {
                     .expect("Failed to empty page table entry");
             }
         }
-        kdebug!("Successfully emptied page table");
+        debug!("Successfully emptied page table");
 
         let total_num = mem_block_manager().total_initial_memory_regions();
         for i in 0..total_num {
             let area = mem_block_manager().get_initial_memory_region(i).unwrap();
-            // kdebug!("area: base={:?}, size={:#x}, end={:?}", area.base, area.size, area.base + area.size);
+            // debug!("area: base={:?}, size={:#x}, end={:?}", area.base, area.size, area.base + area.size);
             for i in 0..((area.size + MMArch::PAGE_SIZE - 1) / MMArch::PAGE_SIZE) {
                 let paddr = area.base.add(i * MMArch::PAGE_SIZE);
                 let vaddr = unsafe { MMArch::phys_2_virt(paddr) }.unwrap();
@@ -125,7 +125,7 @@ pub(super) unsafe fn riscv_mm_init() -> Result<(), SystemError> {
     unsafe {
         INITIAL_PGTABLE_VALUE = new_page_table;
     }
-    kdebug!(
+    debug!(
         "After mapping all physical memory, DragonOS used: {} KB",
         bump_allocator.usage().used().bytes() / 1024
     );
@@ -134,7 +134,7 @@ pub(super) unsafe fn riscv_mm_init() -> Result<(), SystemError> {
     let buddy_allocator = unsafe { BuddyAllocator::<MMArch>::new(bump_allocator).unwrap() };
     // 设置全局的页帧分配器
     unsafe { set_inner_allocator(buddy_allocator) };
-    kinfo!("Successfully initialized buddy allocator");
+    info!("Successfully initialized buddy allocator");
     // 关闭显示输出
     scm_disable_put_to_window();
 
@@ -142,7 +142,7 @@ pub(super) unsafe fn riscv_mm_init() -> Result<(), SystemError> {
     {
         let mut binding = INNER_ALLOCATOR.lock();
         let mut allocator_guard = binding.as_mut().unwrap();
-        kdebug!("To enable new page table.");
+        debug!("To enable new page table.");
         compiler_fence(Ordering::SeqCst);
         let mapper = crate::mm::page::PageMapper::<MMArch, _>::new(
             PageTableKind::Kernel,
@@ -152,10 +152,10 @@ pub(super) unsafe fn riscv_mm_init() -> Result<(), SystemError> {
         compiler_fence(Ordering::SeqCst);
         mapper.make_current();
         compiler_fence(Ordering::SeqCst);
-        // kdebug!("New page table enabled");
+        // debug!("New page table enabled");
     }
-    kdebug!("Successfully enabled new page table");
-    kinfo!("riscv mm init done");
+    debug!("Successfully enabled new page table");
+    info!("riscv mm init done");
 
     return Ok(());
 }

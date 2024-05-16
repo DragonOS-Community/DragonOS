@@ -871,7 +871,9 @@ macro_rules! define_filesystem_maker_slice {
         pub static $name: [FileSystemMaker] = [..];
     };
     () => {
-        compile_error!("define_filesystem_maker_slice! requires at least one argument: slice_name");
+        compile_kerror!(
+            "define_filesystem_maker_slice! requires at least one argument: slice_name"
+        );
     };
 }
 
@@ -882,7 +884,7 @@ macro_rules! producefs {
         match $initializer_slice.iter().find(|&m| m.name == $filesystem) {
             Some(maker) => maker.call(),
             None => {
-                kerror!("mismatch filesystem type : {}", $filesystem);
+                log::error!("mismatch filesystem type : {}", $filesystem);
                 Err(SystemError::EINVAL)
             }
         }

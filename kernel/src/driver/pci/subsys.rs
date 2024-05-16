@@ -3,6 +3,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use intertrait::cast::CastArc;
+use log::error;
 use system_error::SystemError;
 
 use crate::{
@@ -89,14 +90,14 @@ impl Bus for PciBus {
     fn probe(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
         let drv = device.driver().ok_or(SystemError::EINVAL)?;
         let pci_drv = drv.cast::<dyn PciDriver>().map_err(|_| {
-            kerror!(
+            error!(
                 "PciBus::probe() failed: device.driver() is not a PciDriver. Device: '{:?}'",
                 device.name()
             );
             SystemError::EINVAL
         })?;
         let pci_dev = device.clone().cast::<dyn PciDevice>().map_err(|_| {
-            kerror!(
+            error!(
                 "PciBus::probe() failed: device is not a PciDevice. Device: '{:?}'",
                 device.name()
             );

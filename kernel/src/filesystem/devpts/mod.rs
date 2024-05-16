@@ -7,6 +7,7 @@ use alloc::{
     vec::Vec,
 };
 use ida::IdAllocator;
+use log::info;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -278,7 +279,7 @@ pub fn devpts_init() -> Result<(), SystemError> {
     let ptsfs: Arc<DevPtsFs> = DevPtsFs::new();
 
     do_mount_mkdir(ptsfs, "/dev/pts").expect("Failed to mount DevPtsFS");
-    kinfo!("DevPtsFs mounted.");
+    info!("DevPtsFs mounted.");
 
     Ok(())
 }

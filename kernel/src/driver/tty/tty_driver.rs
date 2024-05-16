@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -284,7 +285,7 @@ impl TtyDriver {
             Some(tty) => {
                 // TODO: 暂时这么写，因为还没写TtyPort
                 if tty.core().port().is_none() {
-                    kwarn!("{} port is None", tty.core().name());
+                    warn!("{} port is None", tty.core().name());
                 } else if tty.core().port().unwrap().state() == TtyPortState::KOPENED {
                     return Err(SystemError::EBUSY);
                 }

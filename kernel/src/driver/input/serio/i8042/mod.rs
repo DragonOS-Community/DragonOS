@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use log::debug;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -33,7 +34,7 @@ pub fn i8042_platform_device() -> Arc<I8042PlatformDevice> {
 // TODO: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/i8042.c#1612
 #[unified_init(INITCALL_DEVICE)]
 pub fn i8042_init() -> Result<(), SystemError> {
-    kdebug!("i8042 initializing...");
+    debug!("i8042 initializing...");
     let i8042_device = Arc::new(I8042PlatformDevice::new());
     device_manager().device_default_initialize(&(i8042_device.clone() as Arc<dyn Device>));
     platform_device_manager().device_add(i8042_device.clone() as Arc<dyn PlatformDevice>)?;

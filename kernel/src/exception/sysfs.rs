@@ -1,4 +1,5 @@
 use alloc::{string::ToString, sync::Arc};
+use log::warn;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -117,7 +118,7 @@ fn irq_sysfs_add(irq: &IrqNumber, desc: &Arc<IrqDesc>) {
 
     let kset = sys_kernel_irq_kset();
     KObjectManager::add_kobj(desc.clone() as Arc<dyn KObject>, Some(kset)).unwrap_or_else(|e| {
-        kwarn!("Failed to add irq({irq:?}) kobject to sysfs: {:?}", e);
+        warn!("Failed to add irq({irq:?}) kobject to sysfs: {:?}", e);
     });
 
     desc.mark_in_sysfs();

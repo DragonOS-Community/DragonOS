@@ -1,3 +1,5 @@
+use log::{error, warn};
+
 use crate::mm::PhysAddr;
 
 use super::{
@@ -56,13 +58,13 @@ impl EcamRootInfoManager {
             );
 
             if let Err(err) = root {
-                kerror!("add_ecam_root_info(): failed to create PciRoot: {:?}", err);
+                error!("add_ecam_root_info(): failed to create PciRoot: {:?}", err);
                 return;
             }
 
             pci_root_manager().add_pci_root(root.unwrap());
         } else {
-            kwarn!(
+            warn!(
                 "add_ecam_root_info(): root {} already exists",
                 ecam_root_info.segement_group_number
             );

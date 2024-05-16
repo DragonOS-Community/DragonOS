@@ -456,7 +456,7 @@ impl IndexNode for MountFSInode {
         if self.is_mountpoint_root()? {
             return Err(SystemError::EBUSY);
         }
-        // kdebug!("from {:?}, to {:?}", from, self);
+        // debug!("from {:?}, to {:?}", from, self);
         let new_mount_fs = from.umount()?;
         self.mount_fs
             .mountpoints

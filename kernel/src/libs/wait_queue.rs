@@ -2,11 +2,11 @@
 use core::intrinsics::unlikely;
 
 use alloc::{collections::LinkedList, sync::Arc, vec::Vec};
+use log::{error, warn};
 
 use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
-    kerror,
     process::{ProcessControlBlock, ProcessManager, ProcessState},
     sched::{schedule, SchedMode},
 };
@@ -237,7 +237,7 @@ impl WaitQueue {
 
             if wake {
                 ProcessManager::wakeup(&to_wakeup).unwrap_or_else(|e| {
-                    kerror!("wakeup pid: {:?} error: {:?}", to_wakeup.pid(), e);
+                    error!("wakeup pid: {:?} error: {:?}", to_wakeup.pid(), e);
                 });
                 continue;
             } else {
@@ -265,7 +265,7 @@ impl InnerWaitQueue {
 fn before_sleep_check(max_preempt: usize) {
     let pcb = ProcessManager::current_pcb();
     if unlikely(pcb.preempt_count() > max_preempt) {
-        kwarn!(
+        warn!(
             "Process {:?}: Try to sleep when preempt count is {}",
             pcb.pid().data(),
             pcb.preempt_count()

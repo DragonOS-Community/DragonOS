@@ -8,10 +8,10 @@ use crate::driver::pci::pci::{
 use crate::driver::pci::root::{pci_root_manager, PciRoot};
 use crate::include::bindings::bindings::{io_in32, io_in8, io_out32};
 use crate::init::initcall::INITCALL_SUBSYS;
-use crate::kwarn;
 use crate::mm::PhysAddr;
 
 use acpi::mcfg::Mcfg;
+use log::{error, warn};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -82,7 +82,7 @@ fn x86_64_pci_init() -> Result<(), SystemError> {
             let root = PciRoot::new(None, PciCam::Portiocam, bus_begin, bus_end);
             pci_root_manager().add_pci_root(root.unwrap());
         } else {
-            kwarn!("x86_64_pci_init(): pci_root_manager {}", bus_begin);
+            warn!("x86_64_pci_init(): pci_root_manager {}", bus_begin);
         }
     }
     pci_init();

@@ -2,6 +2,7 @@ use alloc::string::ToString;
 use core::cmp::Ordering;
 use core::intrinsics::unlikely;
 use core::{any::Any, fmt::Debug};
+use log::error;
 use system_error::SystemError;
 
 use alloc::{
@@ -23,7 +24,6 @@ use crate::{
         syscall::ModeType,
         FileSystem, FileType, IndexNode, InodeId, Metadata,
     },
-    kerror,
     libs::{
         spinlock::{SpinLock, SpinLockGuard},
         vec_cursor::VecCursor,
@@ -131,7 +131,7 @@ impl FATInode {
                 self.metadata.size = d.size(&self.fs.upgrade().unwrap().clone()) as i64;
             }
             FATDirEntry::UnInit => {
-                kerror!("update_metadata: Uninitialized FATDirEntry: {:?}", self);
+                error!("update_metadata: Uninitialized FATDirEntry: {:?}", self);
                 return;
             }
         };
@@ -309,7 +309,7 @@ impl FATFileSystem {
             match bpb.fat_type {
                 FATType::FAT32(x) => x.fat_size_32 as u64,
                 _ => {
-                    kerror!("FAT12 and FAT16 volumes should have non-zero BPB_FATSz16");
+                    error!("FAT12 and FAT16 volumes should have non-zero BPB_FATSz16");
                     return Err(SystemError::EINVAL);
                 }
             }
@@ -457,7 +457,7 @@ impl FATFileSystem {
                 match entry {
                     _n if (0x0ffffff7..=0x0fffffff).contains(&current_cluster) => {
                         // 当前簇号不是一个能被获得的簇（可能是文件系统出错了）
-                        kerror!("FAT32 get fat entry: current cluster number [{}] is not an allocatable cluster number.", current_cluster);
+                        error!("FAT32 get fat entry: current cluster number [{}] is not an allocatable cluster number.", current_cluster);
                         FATEntry::Bad
                     }
                     0 => FATEntry::Unused,
@@ -613,7 +613,7 @@ impl FATFileSystem {
 
         // 如果这个空闲簇不是簇链的第一个簇，那么把当前簇跟前一个簇连上。
         if let Some(prev_cluster) = prev_cluster {
-            // kdebug!("set entry, prev ={prev_cluster:?}, next = {free_cluster:?}");
+            // debug!("set entry, prev ={prev_cluster:?}, next = {free_cluster:?}");
             self.set_entry(prev_cluster, FATEntry::Next(free_cluster))?;
         }
         // 清空新获取的这个簇
@@ -647,7 +647,7 @@ impl FATFileSystem {
             return Ok(());
         } else {
             // 不能释放坏簇
-            kerror!("Bad clusters cannot be freed.");
+            error!("Bad clusters cannot be freed.");
             return Err(SystemError::EFAULT);
         }
     }
@@ -1136,14 +1136,14 @@ impl FATFileSystem {
                 } else {
                     self.bpb.num_fats as u64
                 };
-                // kdebug!("set entry, bound={bound}, fat_size={fat_size}");
+                // debug!("set entry, bound={bound}, fat_size={fat_size}");
                 for i in 0..bound {
                     // 当前操作的FAT表在磁盘上的字节偏移量
                     let f_offset: u64 = fat_part_bytes_offset + i * fat_size;
                     let in_block_offset: u64 = self.get_in_block_offset(f_offset);
                     let lba = self.get_lba_from_offset(self.bytes_to_sector(f_offset));
 
-                    // kdebug!("set entry, lba={lba}, in_block_offset={in_block_offset}");
+                    // debug!("set entry, lba={lba}, in_block_offset={in_block_offset}");
                     let mut v: Vec<u8> = vec![0; LBA_SIZE];
                     self.partition.disk().read_at(lba, 1, &mut v)?;
 
@@ -1157,7 +1157,7 @@ impl FATFileSystem {
                         && cluster.cluster_num >= 0x0ffffff7
                         && cluster.cluster_num <= 0x0fffffff
                     {
-                        kerror!(
+                        error!(
                             "FAT32: Reserved Cluster {:?} cannot be marked as free",
                             cluster
                         );
@@ -1175,7 +1175,7 @@ impl FATFileSystem {
                     // 恢复保留位
                     raw_val |= old_bits;
 
-                    // kdebug!("sent entry, raw_val={raw_val}");
+                    // debug!("sent entry, raw_val={raw_val}");
 
                     cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
                     cursor.write_u32(raw_val)?;
@@ -1206,7 +1206,7 @@ impl Drop for FATFileSystem {
     fn drop(&mut self) {
         let r = self.umount();
         if r.is_err() {
-            kerror!(
+            error!(
                 "Umount FAT filesystem failed: errno={:?}, FS detail:{self:?}",
                 r.as_ref().unwrap_err()
             );
@@ -1257,7 +1257,7 @@ impl FATFsInfo {
         if fsinfo.is_valid() {
             return Ok(fsinfo);
         } else {
-            kerror!("Error occurred while parsing FATFsInfo.");
+            error!("Error occurred while parsing FATFsInfo.");
             return Err(SystemError::EINVAL);
         }
     }
@@ -1395,7 +1395,7 @@ impl IndexNode for LockedFATInode {
                 return Err(SystemError::EISDIR);
             }
             FATDirEntry::UnInit => {
-                kerror!("FATFS: param: Inode_type uninitialized.");
+                error!("FATFS: param: Inode_type uninitialized.");
                 return Err(SystemError::EROFS);
             }
         }
@@ -1421,7 +1421,7 @@ impl IndexNode for LockedFATInode {
                 return Err(SystemError::EISDIR);
             }
             FATDirEntry::UnInit => {
-                kerror!("FATFS: param: Inode_type uninitialized.");
+                error!("FATFS: param: Inode_type uninitialized.");
                 return Err(SystemError::EROFS);
             }
         }
@@ -1455,7 +1455,7 @@ impl IndexNode for LockedFATInode {
                 _ => return Err(SystemError::EINVAL),
             },
             FATDirEntry::UnInit => {
-                kerror!("FATFS: param: Inode_type uninitialized.");
+                error!("FATFS: param: Inode_type uninitialized.");
                 return Err(SystemError::EROFS);
             }
         }
@@ -1509,7 +1509,7 @@ impl IndexNode for LockedFATInode {
             }
             FATDirEntry::Dir(_) => return Err(SystemError::ENOSYS),
             FATDirEntry::UnInit => {
-                kerror!("FATFS: param: Inode_type uninitialized.");
+                error!("FATFS: param: Inode_type uninitialized.");
                 return Err(SystemError::EROFS);
             }
         }
@@ -1542,7 +1542,7 @@ impl IndexNode for LockedFATInode {
 
                     // ====== 生成inode缓存，存入B树
                     let name = DName::from(ent.name().to_uppercase());
-                    // kdebug!("name={name}");
+                    // debug!("name={name}");
 
                     if !guard.children.contains_key(&name)
                         && name.as_ref() != "."
@@ -1562,7 +1562,7 @@ impl IndexNode for LockedFATInode {
                 return Ok(ret);
             }
             FATDirEntry::UnInit => {
-                kerror!("FATFS: param: Inode_type uninitialized.");
+                error!("FATFS: param: Inode_type uninitialized.");
                 return Err(SystemError::EROFS);
             }
         }
@@ -1608,7 +1608,7 @@ impl IndexNode for LockedFATInode {
             }
             FATDirEntry::Dir(d) => d,
             FATDirEntry::UnInit => {
-                kerror!("FATFS: param: Inode_type uninitialized.");
+                error!("FATFS: param: Inode_type uninitialized.");
                 return Err(SystemError::EROFS);
             }
         };
@@ -1635,7 +1635,7 @@ impl IndexNode for LockedFATInode {
             }
             FATDirEntry::Dir(d) => d,
             FATDirEntry::UnInit => {
-                kerror!("FATFS: param: Inode_type uninitialized.");
+                error!("FATFS: param: Inode_type uninitialized.");
                 return Err(SystemError::EROFS);
             }
         };
@@ -1683,7 +1683,7 @@ impl IndexNode for LockedFATInode {
                 }
                 FATDirEntry::Dir(d) => d,
                 FATDirEntry::UnInit => {
-                    kerror!("FATFS: param: Inode_type uninitialized.");
+                    error!("FATFS: param: Inode_type uninitialized.");
                     return Err(SystemError::EROFS);
                 }
             };
@@ -1712,7 +1712,7 @@ impl IndexNode for LockedFATInode {
                 }
                 FATDirEntry::Dir(d) => d,
                 FATDirEntry::UnInit => {
-                    kerror!("FATFS: param: Inode_type uninitialized.");
+                    error!("FATFS: param: Inode_type uninitialized.");
                     return Err(SystemError::EROFS);
                 }
             };
@@ -1722,7 +1722,7 @@ impl IndexNode for LockedFATInode {
                 }
                 FATDirEntry::Dir(d) => d,
                 FATDirEntry::UnInit => {
-                    kerror!("FATFA: param: Inode_type uninitialized.");
+                    error!("FATFA: param: Inode_type uninitialized.");
                     return Err(SystemError::EROFS);
                 }
             };

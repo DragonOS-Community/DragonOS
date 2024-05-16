@@ -5,12 +5,12 @@ use core::{
 };
 
 use kdepends::memoffset::offset_of;
+use log::debug;
 use system_error::SystemError;
 
 use crate::{
     arch::{mm::LowAddressRemapping, process::table::TSSManager, MMArch},
     exception::InterruptArch,
-    kdebug,
     libs::{cpumask::CpuMask, rwlock::RwLock},
     mm::{percpu::PerCpu, MemoryManagementArch, PhysAddr, VirtAddr, IDLE_PROCESS_ADDRESS_SPACE},
     process::ProcessManager,
@@ -77,7 +77,7 @@ unsafe extern "sysv64" fn smp_init_switch_stack(st: &ApStartStackInfo) -> ! {
 
 unsafe extern "C" fn smp_ap_start_stage1() -> ! {
     let id = smp_get_processor_id();
-    kdebug!("smp_ap_start_stage1: id: {}\n", id.data());
+    debug!("smp_ap_start_stage1: id: {}\n", id.data());
     let current_idle = ProcessManager::idle_pcb()[smp_get_processor_id().data() as usize].clone();
 
     let tss = TSSManager::current_tss();
@@ -187,7 +187,7 @@ fn print_cpus(s: &str, mask: &CpuMask) {
         v.push(cpu.data());
     }
 
-    kdebug!("{s}: cpus: {v:?}\n");
+    debug!("{s}: cpus: {v:?}\n");
 }
 
 pub struct X86_64SMPArch;

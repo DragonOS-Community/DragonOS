@@ -3,13 +3,13 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use alloc::string::{String, ToString};
+use log::{debug, error};
 use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, process::arch_switch_to_user},
     driver::{net::e1000e::e1000e::e1000e_init, virtio::virtio::virtio_probe},
     filesystem::vfs::core::mount_root_fs,
-    kdebug, kerror,
     net::net_core::net_init,
     process::{kthread::KernelThreadMechanism, stdio::stdio_init, ProcessFlags, ProcessManager},
     smp::smp_init,
@@ -41,10 +41,10 @@ fn kernel_init() -> Result<(), SystemError> {
 
     e1000e_init();
     net_init().unwrap_or_else(|err| {
-        kerror!("Failed to initialize network: {:?}", err);
+        error!("Failed to initialize network: {:?}", err);
     });
 
-    kdebug!("initial kernel thread done.");
+    debug!("initial kernel thread done.");
 
     return Ok(());
 }
@@ -90,7 +90,7 @@ fn switch_to_user() -> ! {
 fn try_to_run_init_process(path: &str, trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
     if let Err(e) = run_init_process(path.to_string(), trap_frame) {
         if e != SystemError::ENOENT {
-            kerror!(
+            error!(
                 "Failed to run init process: {path} exists but couldn't execute it (error {:?})",
                 e
             );

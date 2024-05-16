@@ -12,13 +12,13 @@ use elf::{
     file::FileHeader,
     segment::ProgramHeader,
 };
+use log::error;
 use system_error::SystemError;
 
 use crate::{
     arch::{CurrentElfArch, MMArch},
     driver::base::block::SeekFrom,
     filesystem::vfs::file::File,
-    kerror,
     libs::align::page_align_up,
     mm::{
         allocator::page_frame::{PageFrameCount, VirtPageFrame},
@@ -123,7 +123,7 @@ impl ElfLoader {
     ) -> Result<(), ExecError> {
         let start = self.elf_page_start(start);
         let end = self.elf_page_align_up(end);
-        // kdebug!("set_elf_brk: start={:?}, end={:?}", start, end);
+        // debug!("set_elf_brk: start={:?}, end={:?}", start, end);
         if end > start {
             let r = user_vm_guard.map_anonymous(
                 start,
@@ -133,9 +133,9 @@ impl ElfLoader {
                 false,
                 true,
             );
-            // kdebug!("set_elf_brk: map_anonymous: r={:?}", r);
+            // debug!("set_elf_brk: map_anonymous: r={:?}", r);
             if r.is_err() {
-                kerror!("set_elf_brk: map_anonymous failed, err={:?}", r);
+                error!("set_elf_brk: map_anonymous failed, err={:?}", r);
                 return Err(ExecError::OutOfMemory);
             }
         }
@@ -207,7 +207,7 @@ impl ElfLoader {
         map_flags: &MapFlags,
         total_size: usize,
     ) -> Result<(VirtAddr, bool), SystemError> {
-        // kdebug!("load_elf_segment: addr_to_map={:?}", addr_to_map);
+        // debug!("load_elf_segment: addr_to_map={:?}", addr_to_map);
 
         // 映射位置的偏移量（页内偏移）
         let beginning_page_offset = self.elf_page_offset(addr_to_map);
@@ -228,7 +228,7 @@ impl ElfLoader {
 
         let map_err_handler = |err: SystemError| {
             if err == SystemError::EEXIST {
-                kerror!(
+                error!(
                     "Pid: {:?}, elf segment at {:p} overlaps with existing mapping",
                     ProcessManager::current_pcb().pid(),
                     addr_to_map.as_ptr::<u8>()
@@ -283,12 +283,12 @@ impl ElfLoader {
                 )?;
             }
         } else {
-            // kdebug!("total size = 0");
+            // debug!("total size = 0");
 
             map_addr = user_vm_guard
                 .map_anonymous(addr_to_map, map_size, tmp_prot, *map_flags, false, true)?
                 .virt_address();
-            // kdebug!(
+            // debug!(
             //     "map ok: addr_to_map={:?}, map_addr={map_addr:?},beginning_page_offset={beginning_page_offset:?}",
             //     addr_to_map
             // );
@@ -309,7 +309,7 @@ impl ElfLoader {
                 )?;
             }
         }
-        // kdebug!("load_elf_segment OK: map_addr={:?}", map_addr);
+        // debug!("load_elf_segment OK: map_addr={:?}", map_addr);
         return Ok((map_addr, true));
     }
 
@@ -342,7 +342,7 @@ impl ElfLoader {
         while remain > 0 {
             let read_size = min(remain, buf_size);
             file.read(read_size, &mut buf[..read_size])?;
-            // kdebug!("copy_to_user: vaddr={:?}, read_size = {read_size}", vaddr);
+            // debug!("copy_to_user: vaddr={:?}, read_size = {read_size}", vaddr);
             unsafe {
                 copy_to_user(vaddr, &buf[..read_size]).map_err(|_| SystemError::EFAULT)?;
             }
@@ -528,14 +528,14 @@ impl BinaryLoader for ElfLoader {
         // https://code.dragonos.org.cn/xref/linux-5.19.10/fs/binfmt_elf.c?r=&mo=22652&fi=824#1034
 
         let elf_type = ElfType::from(ehdr.e_type);
-        // kdebug!("ehdr = {:?}", ehdr);
+        // debug!("ehdr = {:?}", ehdr);
 
         let binding = param.vm().clone();
         let mut user_vm = binding.write();
 
         // todo: 增加对user stack上的内存是否具有可执行权限的处理（方法：寻找phdr里面的PT_GNU_STACK段）
 
-        // kdebug!("to parse segments");
+        // debug!("to parse segments");
         // 加载ELF文件并映射到用户空间
         let mut phdr_buf = Vec::new();
         let phdr_table = Self::parse_segments(param, &ehdr, &mut phdr_buf)
@@ -627,9 +627,9 @@ impl BinaryLoader for ElfLoader {
             .into_iter()
             .filter(|seg| seg.p_type == elf::abi::PT_LOAD);
         for seg_to_load in loadable_sections {
-            // kdebug!("seg_to_load = {:?}", seg_to_load);
+            // debug!("seg_to_load = {:?}", seg_to_load);
             if unlikely(elf_brk > elf_bss) {
-                // kdebug!(
+                // debug!(
                 //     "to set brk, elf_brk = {:?}, elf_bss = {:?}",
                 //     elf_brk,
                 //     elf_bss
@@ -692,7 +692,7 @@ impl BinaryLoader for ElfLoader {
             }
 
             // 加载这个段到用户空间
-            // kdebug!("to load elf segment");
+            // debug!("to load elf segment");
             let e = self
                 .load_elf_segment(
                     &mut user_vm,
@@ -704,7 +704,7 @@ impl BinaryLoader for ElfLoader {
                     total_size,
                 )
                 .map_err(|e| {
-                    kerror!("load_elf_segment failed: {:?}", e);
+                    error!("load_elf_segment failed: {:?}", e);
                     match e {
                         SystemError::EFAULT => ExecError::BadAddress(None),
                         SystemError::ENOMEM => ExecError::OutOfMemory,
@@ -732,9 +732,9 @@ impl BinaryLoader for ElfLoader {
                 }
             }
 
-            // kdebug!("seg_to_load.p_offset={}", seg_to_load.p_offset);
-            // kdebug!("e_phoff={}", ehdr.e_phoff);
-            // kdebug!("seg_to_load.p_filesz={}", seg_to_load.p_filesz);
+            // debug!("seg_to_load.p_offset={}", seg_to_load.p_offset);
+            // debug!("e_phoff={}", ehdr.e_phoff);
+            // debug!("seg_to_load.p_filesz={}", seg_to_load.p_filesz);
             // Figure out which segment in the file contains the Program Header Table,
             // and map to the associated virtual address.
             if (seg_to_load.p_offset <= ehdr.e_phoff)
@@ -764,7 +764,7 @@ impl BinaryLoader for ElfLoader {
                 || self.elf_page_align_up(p_vaddr + seg_to_load.p_memsz as usize)
                     >= MMArch::USER_END_VADDR
             {
-                // kdebug!("ERR:     p_vaddr={p_vaddr:?}");
+                // debug!("ERR:     p_vaddr={p_vaddr:?}");
                 return Err(ExecError::InvalidParemeter);
             }
 
@@ -797,7 +797,7 @@ impl BinaryLoader for ElfLoader {
                 elf_brk = seg_end_vaddr;
             }
         }
-        // kdebug!("elf load: phdr_vaddr={phdr_vaddr:?}");
+        // debug!("elf load: phdr_vaddr={phdr_vaddr:?}");
         let program_entrypoint = VirtAddr::new(ehdr.e_entry as usize + load_bias);
         let phdr_vaddr = phdr_vaddr.map(|phdr_vaddr| phdr_vaddr + load_bias);
 
@@ -808,7 +808,7 @@ impl BinaryLoader for ElfLoader {
         start_data = start_data.map(|v| v + load_bias);
         end_data = end_data.map(|v| v + load_bias);
 
-        // kdebug!(
+        // debug!(
         //     "to set brk: elf_bss: {:?}, elf_brk: {:?}, bss_prot_flags: {:?}",
         //     elf_bss,
         //     elf_brk,
@@ -817,25 +817,25 @@ impl BinaryLoader for ElfLoader {
         self.set_elf_brk(&mut user_vm, elf_bss, elf_brk, bss_prot_flags)?;
 
         if likely(elf_bss != elf_brk) && unlikely(self.pad_zero(elf_bss).is_err()) {
-            // kdebug!("elf_bss = {elf_bss:?}, elf_brk = {elf_brk:?}");
+            // debug!("elf_bss = {elf_bss:?}, elf_brk = {elf_brk:?}");
             return Err(ExecError::BadAddress(Some(elf_bss)));
         }
         if interpreter.is_some() {
             // TODO 添加对动态加载器的处理
             // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#1249
         }
-        // kdebug!("to create auxv");
+        // debug!("to create auxv");
 
         self.create_auxv(param, program_entrypoint, phdr_vaddr, &ehdr)?;
 
-        // kdebug!("auxv create ok");
+        // debug!("auxv create ok");
         user_vm.start_code = start_code.unwrap_or(VirtAddr::new(0));
         user_vm.end_code = end_code.unwrap_or(VirtAddr::new(0));
         user_vm.start_data = start_data.unwrap_or(VirtAddr::new(0));
         user_vm.end_data = end_data.unwrap_or(VirtAddr::new(0));
 
         let result = BinaryLoaderResult::new(program_entrypoint);
-        // kdebug!("elf load OK!!!");
+        // debug!("elf load OK!!!");
         return Ok(result);
     }
 }

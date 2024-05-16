@@ -6,6 +6,7 @@ pub mod pkru;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashSet;
+use log::{debug, info, warn};
 use x86::time::rdtsc;
 use x86_64::registers::model_specific::EferFlags;
 
@@ -29,7 +30,7 @@ use crate::{
 use crate::mm::kernel_mapper::KernelMapper;
 use crate::mm::page::{PageEntry, PageFlags, PAGE_1G_SHIFT};
 use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr};
-use crate::{kdebug, kinfo, kwarn};
+
 use system_error::SystemError;
 
 use core::arch::asm;
@@ -159,8 +160,8 @@ impl MemoryManagementArch for X86_64MMArch {
         // 初始化物理内存区域(从multiboot2中获取)
         Self::init_memory_area_from_multiboot2().expect("init memory area failed");
 
-        kdebug!("bootstrap info: {:?}", unsafe { BOOTSTRAP_MM_INFO });
-        kdebug!("phys[0]=virt[0x{:x}]", unsafe {
+        debug!("bootstrap info: {:?}", unsafe { BOOTSTRAP_MM_INFO });
+        debug!("phys[0]=virt[0x{:x}]", unsafe {
             MMArch::phys_2_virt(PhysAddr::new(0)).unwrap().data()
         });
 
@@ -382,18 +383,16 @@ impl X86_64MMArch {
                         info_entry.len as usize,
                     )
                     .unwrap_or_else(|e| {
-                        kwarn!(
+                        warn!(
                             "Failed to add memory block: base={:#x}, size={:#x}, error={:?}",
-                            info_entry.addr,
-                            info_entry.len,
-                            e
+                            info_entry.addr, info_entry.len, e
                         );
                     });
                 areas_count += 1;
             }
         }
         send_to_default_serial8250_port("init_memory_area_from_multiboot2 end\n\0".as_bytes());
-        kinfo!("Total memory size: {} MB, total areas from multiboot2: {mb2_count}, valid areas: {areas_count}", total_mem_size / 1024 / 1024);
+        info!("Total memory size: {} MB, total areas from multiboot2: {mb2_count}, valid areas: {areas_count}", total_mem_size / 1024 / 1024);
         return Ok(areas_count);
     }
 
@@ -402,7 +401,7 @@ impl X86_64MMArch {
         let efer: EferFlags = x86_64::registers::model_specific::Efer::read();
         if !efer.contains(EferFlags::NO_EXECUTE_ENABLE) {
             // NO_EXECUTE_ENABLE是false，那么就设置xd_reserved为true
-            kdebug!("NO_EXECUTE_ENABLE is false, set XD_RESERVED to true");
+            debug!("NO_EXECUTE_ENABLE is false, set XD_RESERVED to true");
             XD_RESERVED.store(true, Ordering::Relaxed);
         }
         compiler_fence(Ordering::SeqCst);
@@ -438,7 +437,7 @@ unsafe fn allocator_init() {
         .reserve_block(PhysAddr::new(0), phy_offset.data())
         .expect("Failed to reserve block");
     let mut bump_allocator = BumpAllocator::<X86_64MMArch>::new(phy_offset.data());
-    kdebug!(
+    debug!(
         "BumpAllocator created, offset={:?}",
         bump_allocator.offset()
     );
@@ -459,7 +458,7 @@ unsafe fn allocator_init() {
             )
             .expect("Failed to create page mapper");
         new_page_table = mapper.table().phys();
-        kdebug!("PageMapper created");
+        debug!("PageMapper created");
 
         // 取消最开始时候，在head.S中指定的映射(暂时不刷新TLB)
         {
@@ -471,12 +470,12 @@ unsafe fn allocator_init() {
                     .expect("Failed to empty page table entry");
             }
         }
-        kdebug!("Successfully emptied page table");
+        debug!("Successfully emptied page table");
 
         let total_num = mem_block_manager().total_initial_memory_regions();
         for i in 0..total_num {
             let area = mem_block_manager().get_initial_memory_region(i).unwrap();
-            // kdebug!("area: base={:?}, size={:#x}, end={:?}", area.base, area.size, area.base + area.size);
+            // debug!("area: base={:?}, size={:#x}, end={:?}", area.base, area.size, area.base + area.size);
             for i in 0..((area.size + MMArch::PAGE_SIZE - 1) / MMArch::PAGE_SIZE) {
                 let paddr = area.base.add(i * MMArch::PAGE_SIZE);
                 let vaddr = unsafe { MMArch::phys_2_virt(paddr) }.unwrap();
@@ -494,7 +493,7 @@ unsafe fn allocator_init() {
     unsafe {
         INITIAL_CR3_VALUE = new_page_table;
     }
-    kdebug!(
+    debug!(
         "After mapping all physical memory, DragonOS used: {} KB",
         bump_allocator.offset() / 1024
     );
@@ -503,7 +502,7 @@ unsafe fn allocator_init() {
     let buddy_allocator = unsafe { BuddyAllocator::<X86_64MMArch>::new(bump_allocator).unwrap() };
     // 设置全局的页帧分配器
     unsafe { set_inner_allocator(buddy_allocator) };
-    kinfo!("Successfully initialized buddy allocator");
+    info!("Successfully initialized buddy allocator");
     // 关闭显示输出
     scm_disable_put_to_window();
 
@@ -511,7 +510,7 @@ unsafe fn allocator_init() {
     {
         let mut binding = INNER_ALLOCATOR.lock();
         let mut allocator_guard = binding.as_mut().unwrap();
-        kdebug!("To enable new page table.");
+        debug!("To enable new page table.");
         compiler_fence(Ordering::SeqCst);
         let mapper = crate::mm::page::PageMapper::<MMArch, _>::new(
             PageTableKind::Kernel,
@@ -521,9 +520,9 @@ unsafe fn allocator_init() {
         compiler_fence(Ordering::SeqCst);
         mapper.make_current();
         compiler_fence(Ordering::SeqCst);
-        kdebug!("New page table enabled");
+        debug!("New page table enabled");
     }
-    kdebug!("Successfully enabled new page table");
+    debug!("Successfully enabled new page table");
 }
 
 #[no_mangle]
@@ -536,7 +535,7 @@ pub fn test_buddy() {
     const TOTAL_SIZE: usize = 200 * 1024 * 1024;
 
     for i in 0..10 {
-        kdebug!("Test buddy, round: {i}");
+        debug!("Test buddy, round: {i}");
         // 存放申请的内存块
         let mut v: Vec<(PhysAddr, PageFrameCount)> = Vec::with_capacity(60 * 1024);
         // 存放已经申请的内存块的地址（用于检查重复）
@@ -601,14 +600,14 @@ pub fn test_buddy() {
             }
         }
 
-        kdebug!(
+        debug!(
             "Allocated {} MB memory, release: {} MB, no release: {} bytes",
             allocated / 1024 / 1024,
             free_count / 1024 / 1024,
             (allocated - free_count)
         );
 
-        kdebug!("Now, to release buddy memory");
+        debug!("Now, to release buddy memory");
         // 释放所有的内存
         for (paddr, allocated_frame_count) in v {
             unsafe { LockedFrameAllocator.free(paddr, allocated_frame_count) };
@@ -616,7 +615,7 @@ pub fn test_buddy() {
             free_count += allocated_frame_count.data() * MMArch::PAGE_SIZE;
         }
 
-        kdebug!("release done!, allocated: {allocated}, free_count: {free_count}");
+        debug!("release done!, allocated: {allocated}, free_count: {free_count}");
     }
 }
 

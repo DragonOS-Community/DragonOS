@@ -14,12 +14,13 @@ use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::mm::mmio_buddy::{mmio_pool, MMIOSpaceGuard};
 
 use crate::mm::VirtAddr;
-use crate::{kdebug, kerror, kinfo, kwarn};
+
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::{boxed::Box, collections::LinkedList};
 use bitflags::bitflags;
+use log::{debug, error, info, warn};
 
 use core::{
     convert::TryFrom,
@@ -965,7 +966,7 @@ fn pci_read_pci_to_cardbus_bridge_header(
 /// @brief 检查所有bus上的设备并将其加入链表
 /// @return 成功返回ok(),失败返回失败原因
 fn pci_check_all_buses() -> Result<u8, PciError> {
-    kinfo!("Checking all devices in PCI bus...");
+    info!("Checking all devices in PCI bus...");
     let busdevicefunction = BusDeviceFunction {
         bus: 0,
         device: 0,
@@ -984,7 +985,7 @@ fn pci_check_all_buses() -> Result<u8, PciError> {
 /// @brief 检查特定设备并将其加入链表
 /// @return 成功返回ok(),失败返回失败原因
 fn pci_check_function(busdevicefunction: BusDeviceFunction) -> Result<u8, PciError> {
-    //kdebug!("PCI check function {}", busdevicefunction.function);
+    //debug!("PCI check function {}", busdevicefunction.function);
     let header = match pci_read_header(busdevicefunction, true) {
         Ok(header) => header,
         Err(PciError::GetWrongHeader) => {
@@ -1010,7 +1011,7 @@ fn pci_check_function(busdevicefunction: BusDeviceFunction) -> Result<u8, PciErr
 /// @brief 检查device上的设备并将其加入链表
 /// @return 成功返回ok(),失败返回失败原因
 fn pci_check_device(bus: u8, device: u8) -> Result<u8, PciError> {
-    //kdebug!("PCI check device {}", device);
+    //debug!("PCI check device {}", device);
     let busdevicefunction = BusDeviceFunction {
         bus,
         device,
@@ -1029,10 +1030,9 @@ fn pci_check_device(bus: u8, device: u8) -> Result<u8, PciError> {
     pci_check_function(busdevicefunction)?;
     let common_header = header.common_header();
     if common_header.header_type & 0x80 != 0 {
-        kdebug!(
+        debug!(
             "Detected multi func device in bus{},device{}",
-            busdevicefunction.bus,
-            busdevicefunction.device
+            busdevicefunction.bus, busdevicefunction.device
         );
         // 这是一个多function的设备，因此查询剩余的function
         for function in 1..8 {
@@ -1049,7 +1049,7 @@ fn pci_check_device(bus: u8, device: u8) -> Result<u8, PciError> {
 /// @brief 检查该bus上的设备并将其加入链表
 /// @return 成功返回ok(),失败返回失败原因
 fn pci_check_bus(bus: u8) -> Result<u8, PciError> {
-    //kdebug!("PCI check bus {}", bus);
+    //debug!("PCI check bus {}", bus);
     for device in 0..32 {
         pci_check_device(bus, device)?;
     }
@@ -1059,13 +1059,13 @@ fn pci_check_bus(bus: u8) -> Result<u8, PciError> {
 /// pci初始化函数
 #[inline(never)]
 pub fn pci_init() {
-    kinfo!("Initializing PCI bus...");
+    info!("Initializing PCI bus...");
     pci_bus_subsys_init().expect("Failed to init pci bus subsystem");
     if let Err(e) = pci_check_all_buses() {
-        kerror!("pci init failed when checking bus because of error: {}", e);
+        error!("pci init failed when checking bus because of error: {}", e);
         return;
     }
-    kinfo!(
+    info!(
         "Total pci device and function num = {}",
         PCI_DEVICE_LINKEDLIST.num()
     );
@@ -1074,40 +1074,34 @@ pub fn pci_init() {
         let common_header = box_pci_device.common_header();
         match box_pci_device.header_type() {
             HeaderType::Standard if common_header.status & 0x10 != 0 => {
-                kinfo!("Found pci standard device with class code ={} subclass={} status={:#x} cap_pointer={:#x}  vendor={:#x}, device id={:#x},bdf={}", common_header.class_code, common_header.subclass, common_header.status, box_pci_device.as_standard_device().unwrap().capabilities_pointer,common_header.vendor_id, common_header.device_id,common_header.bus_device_function);
+                info!("Found pci standard device with class code ={} subclass={} status={:#x} cap_pointer={:#x}  vendor={:#x}, device id={:#x},bdf={}", common_header.class_code, common_header.subclass, common_header.status, box_pci_device.as_standard_device().unwrap().capabilities_pointer,common_header.vendor_id, common_header.device_id,common_header.bus_device_function);
             }
             HeaderType::Standard => {
-                kinfo!(
+                info!(
                     "Found pci standard device with class code ={} subclass={} status={:#x} ",
-                    common_header.class_code,
-                    common_header.subclass,
-                    common_header.status
+                    common_header.class_code, common_header.subclass, common_header.status
                 );
             }
             HeaderType::PciPciBridge if common_header.status & 0x10 != 0 => {
-                kinfo!("Found pci-to-pci bridge device with class code ={} subclass={} status={:#x} cap_pointer={:#x}", common_header.class_code, common_header.subclass, common_header.status, box_pci_device.as_pci_to_pci_bridge_device().unwrap().capability_pointer);
+                info!("Found pci-to-pci bridge device with class code ={} subclass={} status={:#x} cap_pointer={:#x}", common_header.class_code, common_header.subclass, common_header.status, box_pci_device.as_pci_to_pci_bridge_device().unwrap().capability_pointer);
             }
             HeaderType::PciPciBridge => {
-                kinfo!(
+                info!(
                     "Found pci-to-pci bridge device with class code ={} subclass={} status={:#x} ",
-                    common_header.class_code,
-                    common_header.subclass,
-                    common_header.status
+                    common_header.class_code, common_header.subclass, common_header.status
                 );
             }
             HeaderType::PciCardbusBridge => {
-                kinfo!(
+                info!(
                     "Found pcicardbus bridge device with class code ={} subclass={} status={:#x} ",
-                    common_header.class_code,
-                    common_header.subclass,
-                    common_header.status
+                    common_header.class_code, common_header.subclass, common_header.status
                 );
             }
             HeaderType::Unrecognised(_) => {}
         }
     }
 
-    kinfo!("PCI bus initialized.");
+    info!("PCI bus initialized.");
 }
 
 /// An identifier for a PCI bus, device and function.
@@ -1343,7 +1337,7 @@ pub fn pci_bar_init(
         // A wrapping add is necessary to correctly handle the case of unused BARs, which read back
         // as 0, and should be treated as size 0.
         let size = (!(size_mask & 0xfffffff0)).wrapping_add(1);
-        //kdebug!("bar_orig:{:#x},size: {:#x}", bar_orig,size);
+        //debug!("bar_orig:{:#x},size: {:#x}", bar_orig,size);
         // Restore the original value.
         pci_root_0().write_config(
             bus_device_function,
@@ -1383,7 +1377,7 @@ pub fn pci_bar_init(
                     .create_mmio(size_want)
                     .map_err(|_| PciError::CreateMmioError)?;
                 space_guard = Arc::new(tmp);
-                //kdebug!("Pci bar init: mmio space: {space_guard:?}, paddr={paddr:?}, size_want={size_want}");
+                //debug!("Pci bar init: mmio space: {space_guard:?}, paddr={paddr:?}, size_want={size_want}");
                 assert!(
                     space_guard.map_phys(paddr, size_want).is_ok(),
                     "pci_bar_init: map_phys failed"
@@ -1419,7 +1413,7 @@ pub fn pci_bar_init(
             _ => {}
         }
     }
-    //kdebug!("pci_device_bar:{}", device_bar);
+    //debug!("pci_device_bar:{}", device_bar);
     return Ok(device_bar);
 }
 
@@ -1457,7 +1451,7 @@ impl Iterator for CapabilityIterator {
         self.next_capability_offset = if next_offset == 0 {
             None
         } else if next_offset < 64 || next_offset & 0x3 != 0 {
-            kwarn!("Invalid next capability offset {:#04x}", next_offset);
+            warn!("Invalid next capability offset {:#04x}", next_offset);
             None
         } else {
             Some(next_offset)
@@ -1505,7 +1499,7 @@ impl<'a> Iterator for ExternalCapabilityIterator<'a> {
         self.next_capability_offset = if next_offset == 0 {
             None
         } else if next_offset < 0x100 || next_offset & 0x3 != 0 {
-            kwarn!("Invalid next capability offset {:#04x}", next_offset);
+            warn!("Invalid next capability offset {:#04x}", next_offset);
             None
         } else {
             Some(next_offset)

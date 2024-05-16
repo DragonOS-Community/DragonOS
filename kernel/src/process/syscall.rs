@@ -98,13 +98,13 @@ impl Syscall {
         envp: *const *const u8,
         frame: &mut TrapFrame,
     ) -> Result<(), SystemError> {
-        // kdebug!(
+        // debug!(
         //     "execve path: {:?}, argv: {:?}, envp: {:?}\n",
         //     path,
         //     argv,
         //     envp
         // );
-        // kdebug!(
+        // debug!(
         //     "before execve: strong count: {}",
         //     Arc::strong_count(&ProcessManager::current_pcb())
         // );
@@ -133,7 +133,7 @@ impl Syscall {
         // 关闭设置了O_CLOEXEC的文件描述符
         let fd_table = ProcessManager::current_pcb().fd_table();
         fd_table.write().close_on_exec();
-        // kdebug!(
+        // debug!(
         //     "after execve: strong count: {}",
         //     Arc::strong_count(&ProcessManager::current_pcb())
         // );

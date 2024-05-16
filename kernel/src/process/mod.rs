@@ -12,6 +12,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use log::{debug, error, info, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -28,7 +29,6 @@ use crate::{
         vfs::{file::FileDescriptorVec, FileType},
     },
     ipc::signal_types::{SigInfo, SigPending, SignalStruct},
-    kdebug, kinfo,
     libs::{
         align::AlignedBox,
         casting::DowncastArc,
@@ -116,24 +116,24 @@ impl ProcessManager {
 
         unsafe {
             compiler_fence(Ordering::SeqCst);
-            kdebug!("To create address space for INIT process.");
+            debug!("To create address space for INIT process.");
             // test_buddy();
             set_IDLE_PROCESS_ADDRESS_SPACE(
                 AddressSpace::new(true).expect("Failed to create address space for INIT process."),
             );
-            kdebug!("INIT process address space created.");
+            debug!("INIT process address space created.");
             compiler_fence(Ordering::SeqCst);
         };
 
         ALL_PROCESS.lock_irqsave().replace(HashMap::new());
         Self::init_switch_result();
         Self::arch_init();
-        kdebug!("process arch init done.");
+        debug!("process arch init done.");
         Self::init_idle();
-        kdebug!("process idle init done.");
+        debug!("process idle init done.");
 
         unsafe { __PROCESS_MANAGEMENT_INIT_DONE = true };
-        kinfo!("Process Manager initialized.");
+        info!("Process Manager initialized.");
     }
 
     fn init_switch_result() {
@@ -155,7 +155,7 @@ impl ProcessManager {
     /// 获取当前进程的pcb
     pub fn current_pcb() -> Arc<ProcessControlBlock> {
         if unlikely(unsafe { !__PROCESS_MANAGEMENT_INIT_DONE }) {
-            kerror!("unsafe__PROCESS_MANAGEMENT_INIT_DONE == false");
+            error!("unsafe__PROCESS_MANAGEMENT_INIT_DONE == false");
             loop {
                 spin_loop();
             }
@@ -362,7 +362,7 @@ impl ProcessManager {
             let parent_pcb = r.unwrap();
             let r = Syscall::kill(parent_pcb.pid(), Signal::SIGCHLD as i32);
             if r.is_err() {
-                kwarn!(
+                warn!(
                     "failed to send kill signal to {:?}'s parent pcb {:?}",
                     current.pid(),
                     parent_pcb.pid()
@@ -422,7 +422,7 @@ impl ProcessManager {
         ProcessManager::exit_notify();
         // unsafe { CurrentIrqArch::interrupt_enable() };
         __schedule(SchedMode::SM_NONE);
-        kerror!("pid {pid:?} exited but sched again!");
+        error!("pid {pid:?} exited but sched again!");
         #[allow(clippy::empty_loop)]
         loop {
             spin_loop();
@@ -442,7 +442,7 @@ impl ProcessManager {
             // } else {
             //     // 如果不为1就panic
             //     let msg = format!("pcb '{:?}' is still referenced, strong count={}",pcb.pid(),  Arc::strong_count(&pcb));
-            //     kerror!("{}", msg);
+            //     error!("{}", msg);
             //     panic!()
             // }
 
@@ -452,7 +452,7 @@ impl ProcessManager {
 
     /// 上下文切换完成后的钩子函数
     unsafe fn switch_finish_hook() {
-        // kdebug!("switch_finish_hook");
+        // debug!("switch_finish_hook");
         let prev_pcb = PROCESS_SWITCH_RESULT
             .as_mut()
             .unwrap()
@@ -1368,7 +1368,7 @@ impl KernelStack {
 
         // 如果内核栈的最低地址处已经有了一个pcb，那么，这里就不再设置,直接返回错误
         if unlikely(unsafe { !(*stack_bottom_ptr).is_null() }) {
-            kerror!("kernel stack bottom is not null: {:p}", *stack_bottom_ptr);
+            error!("kernel stack bottom is not null: {:p}", *stack_bottom_ptr);
             return Err(SystemError::EPERM);
         }
         // 将pcb的地址放到内核栈的最低地址处

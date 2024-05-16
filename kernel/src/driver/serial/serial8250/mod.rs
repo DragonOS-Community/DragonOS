@@ -8,6 +8,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::error;
 use system_error::SystemError;
 
 use crate::{
@@ -410,7 +411,7 @@ impl PlatformDriver for Serial8250ISADriver {
             .arc_any()
             .downcast::<Serial8250ISADevices>()
             .map_err(|_| {
-                kerror!("Serial8250ISADriver::probe: device is not a Serial8250ISADevices");
+                error!("Serial8250ISADriver::probe: device is not a Serial8250ISADevices");
                 SystemError::EINVAL
             })?;
         isa_dev.set_driver(Some(self.self_ref.clone()));

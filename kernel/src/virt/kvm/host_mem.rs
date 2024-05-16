@@ -1,10 +1,8 @@
+use log::debug;
 use system_error::SystemError;
 
 use super::{vcpu::Vcpu, vm};
-use crate::{
-    kdebug,
-    mm::{kernel_mapper::KernelMapper, page::PageFlags, VirtAddr},
-};
+use crate::mm::{kernel_mapper::KernelMapper, page::PageFlags, VirtAddr};
 
 /*
  * Address types:
@@ -87,7 +85,7 @@ pub fn kvm_vcpu_memslots(_vcpu: &mut dyn Vcpu) -> KvmMemorySlots {
 }
 
 fn __gfn_to_memslot(slots: KvmMemorySlots, gfn: u64) -> Option<KvmMemorySlot> {
-    kdebug!("__gfn_to_memslot");
+    debug!("__gfn_to_memslot");
     // TODO: 使用二分查找的方式优化
     for i in 0..slots.used_slots {
         let memslot = slots.memslots[i as usize];
@@ -107,7 +105,7 @@ fn __gfn_to_hva_many(
     nr_pages: Option<&mut u64>,
     write: bool,
 ) -> Result<u64, SystemError> {
-    kdebug!("__gfn_to_hva_many");
+    debug!("__gfn_to_hva_many");
     if slot.is_none() {
         return Err(SystemError::KVM_HVA_ERR_BAD);
     }
@@ -141,10 +139,10 @@ fn __gfn_to_hva_many(
 // host端虚拟地址到物理地址的转换，有两种方式，hva_to_pfn_fast、hva_to_pfn_slow
 // 正确性待验证
 fn hva_to_pfn(addr: u64, _atomic: bool, _writable: &mut bool) -> Result<u64, SystemError> {
-    kdebug!("hva_to_pfn");
+    debug!("hva_to_pfn");
     unsafe {
         let raw = addr as *const i32;
-        kdebug!("raw={:x}", *raw);
+        debug!("raw={:x}", *raw);
     }
     // let hpa = MMArch::virt_2_phys(VirtAddr::new(addr)).unwrap().data() as u64;
     let hva = VirtAddr::new(addr as usize);
@@ -167,11 +165,11 @@ pub fn __gfn_to_pfn(
     write: bool,
     writable: &mut bool,
 ) -> Result<u64, SystemError> {
-    kdebug!("__gfn_to_pfn");
+    debug!("__gfn_to_pfn");
     let mut nr_pages = 0;
     let addr = __gfn_to_hva_many(slot, gfn, Some(&mut nr_pages), write)?;
     let pfn = hva_to_pfn(addr, atomic, writable)?;
-    kdebug!("hva={}, pfn={}", addr, pfn);
+    debug!("hva={}, pfn={}", addr, pfn);
     return Ok(pfn);
 }
 

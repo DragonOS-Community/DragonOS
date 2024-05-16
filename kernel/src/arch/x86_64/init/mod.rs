@@ -1,5 +1,6 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
+use log::debug;
 use system_error::SystemError;
 use x86::dtables::DescriptorTablePointer;
 
@@ -7,7 +8,6 @@ use crate::{
     arch::{interrupt::trap::arch_trap_init, process::table::TSSManager},
     driver::clocksource::acpi_pm::init_acpi_pm_clocksource,
     init::init::start_kernel,
-    kdebug,
     mm::{MemoryManagementArch, PhysAddr},
 };
 
@@ -68,14 +68,14 @@ unsafe extern "C" fn kernel_main(
 #[inline(never)]
 pub fn early_setup_arch() -> Result<(), SystemError> {
     let stack_start = unsafe { *(head_stack_start as *const u64) } as usize;
-    kdebug!("head_stack_start={:#x}\n", stack_start);
+    debug!("head_stack_start={:#x}\n", stack_start);
     unsafe {
         let gdt_vaddr =
             MMArch::phys_2_virt(PhysAddr::new(&GDT_Table as *const usize as usize)).unwrap();
         let idt_vaddr =
             MMArch::phys_2_virt(PhysAddr::new(&IDT_Table as *const usize as usize)).unwrap();
 
-        kdebug!("GDT_Table={:?}, IDT_Table={:?}\n", gdt_vaddr, idt_vaddr);
+        debug!("GDT_Table={:?}, IDT_Table={:?}\n", gdt_vaddr, idt_vaddr);
     }
 
     set_current_core_tss(stack_start, 0);
@@ -107,10 +107,9 @@ pub fn setup_arch_post() -> Result<(), SystemError> {
 
 fn set_current_core_tss(stack_start: usize, ist0: usize) {
     let current_tss = unsafe { TSSManager::current_tss() };
-    kdebug!(
+    debug!(
         "set_current_core_tss: stack_start={:#x}, ist0={:#x}\n",
-        stack_start,
-        ist0
+        stack_start, ist0
     );
     current_tss.set_rsp(x86::Ring::Ring0, stack_start as u64);
     current_tss.set_ist(0, ist0 as u64);

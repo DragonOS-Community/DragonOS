@@ -566,7 +566,7 @@ impl EventPoll {
             // 记数加一
             res += 1;
 
-            // crate::kdebug!("ep send {event:?}");
+            // crate::debug!("ep send {event:?}");
 
             if ep_events.contains(EPollEventType::EPOLLONESHOT) {
                 let mut event_writer = epitem.event.write();

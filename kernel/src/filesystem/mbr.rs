@@ -4,6 +4,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::debug;
 use system_error::SystemError;
 
 use crate::{
@@ -105,10 +106,10 @@ impl MbrDiskPartionTable {
             table.dpte[i].starting_lba = cursor.read_u32()?;
             table.dpte[i].total_sectors = cursor.read_u32()?;
 
-            kdebug!("dpte[{i}] = {:?}", table.dpte[i]);
+            debug!("dpte[{i}] = {:?}", table.dpte[i]);
         }
         table.bs_trailsig = cursor.read_u16()?;
-        // kdebug!("bs_trailsig = {}", unsafe {
+        // debug!("bs_trailsig = {}", unsafe {
         //     read_unaligned(addr_of!(table.bs_trailsig))
         // });
 

@@ -1,4 +1,5 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use log::{error, warn};
 use smoltcp::{
     socket::{raw, tcp, udp},
     wire,
@@ -7,7 +8,6 @@ use system_error::SystemError;
 
 use crate::{
     driver::net::NetDevice,
-    kerror, kwarn,
     libs::rwlock::RwLock,
     net::{
         event_poll::EPollEventType, net_core::poll_ifaces, Endpoint, Protocol, ShutdownType,
@@ -197,7 +197,7 @@ impl Socket for RawSocket {
                     drop(socket_set_guard);
                     return Ok(len);
                 } else {
-                    kwarn!("Unsupport Ip protocol type!");
+                    warn!("Unsupport Ip protocol type!");
                     return Err(SystemError::EINVAL);
                 }
             } else {
@@ -325,13 +325,13 @@ impl Socket for UdpSocket {
     /// @brief 在read函数执行之前，请先bind到本地的指定端口
     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         loop {
-            // kdebug!("Wait22 to Read");
+            // debug!("Wait22 to Read");
             poll_ifaces();
             let mut socket_set_guard = SOCKET_SET.lock_irqsave();
             let socket =
                 socket_set_guard.get_mut::<udp::Socket>(self.handle.smoltcp_handle().unwrap());
 
-            // kdebug!("Wait to Read");
+            // debug!("Wait to Read");
 
             if socket.can_recv() {
                 if let Ok((size, metadata)) = socket.recv_slice(buf) {
@@ -353,7 +353,7 @@ impl Socket for UdpSocket {
     }
 
     fn write(&self, buf: &[u8], to: Option<Endpoint>) -> Result<usize, SystemError> {
-        // kdebug!("udp to send: {:?}, len={}", to, buf.len());
+        // debug!("udp to send: {:?}, len={}", to, buf.len());
         let remote_endpoint: &wire::IpEndpoint = {
             if let Some(Endpoint::Ip(Some(ref endpoint))) = to {
                 endpoint
@@ -363,28 +363,28 @@ impl Socket for UdpSocket {
                 return Err(SystemError::ENOTCONN);
             }
         };
-        // kdebug!("udp write: remote = {:?}", remote_endpoint);
+        // debug!("udp write: remote = {:?}", remote_endpoint);
 
         let mut socket_set_guard = SOCKET_SET.lock_irqsave();
         let socket = socket_set_guard.get_mut::<udp::Socket>(self.handle.smoltcp_handle().unwrap());
-        // kdebug!("is open()={}", socket.is_open());
-        // kdebug!("socket endpoint={:?}", socket.endpoint());
+        // debug!("is open()={}", socket.is_open());
+        // debug!("socket endpoint={:?}", socket.endpoint());
         if socket.can_send() {
-            // kdebug!("udp write: can send");
+            // debug!("udp write: can send");
             match socket.send_slice(buf, *remote_endpoint) {
                 Ok(()) => {
-                    // kdebug!("udp write: send ok");
+                    // debug!("udp write: send ok");
                     drop(socket_set_guard);
                     poll_ifaces();
                     return Ok(buf.len());
                 }
                 Err(_) => {
-                    // kdebug!("udp write: send err");
+                    // debug!("udp write: send err");
                     return Err(SystemError::ENOBUFS);
                 }
             }
         } else {
-            // kdebug!("udp write: can not send");
+            // debug!("udp write: can not send");
             return Err(SystemError::ENOBUFS);
         };
     }
@@ -392,7 +392,7 @@ impl Socket for UdpSocket {
     fn bind(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
         let mut sockets = SOCKET_SET.lock_irqsave();
         let socket = sockets.get_mut::<udp::Socket>(self.handle.smoltcp_handle().unwrap());
-        // kdebug!("UDP Bind to {:?}", endpoint);
+        // debug!("UDP Bind to {:?}", endpoint);
         return self.do_bind(socket, endpoint);
     }
 
@@ -516,7 +516,7 @@ impl TcpSocket {
             Self::DEFAULT_METADATA_BUF_SIZE,
             options,
         );
-        // kdebug!("when there's a new tcp socket,its'len: {}",handles.len());
+        // debug!("when there's a new tcp socket,its'len: {}",handles.len());
 
         return Self {
             handles,
@@ -532,15 +532,15 @@ impl TcpSocket {
         local_endpoint: wire::IpEndpoint,
     ) -> Result<(), SystemError> {
         let listen_result = if local_endpoint.addr.is_unspecified() {
-            // kdebug!("Tcp Socket Listen on port {}", local_endpoint.port);
+            // debug!("Tcp Socket Listen on port {}", local_endpoint.port);
             socket.listen(local_endpoint.port)
         } else {
-            // kdebug!("Tcp Socket Listen on {local_endpoint}");
+            // debug!("Tcp Socket Listen on {local_endpoint}");
             socket.listen(local_endpoint)
         };
         return match listen_result {
             Ok(()) => {
-                // kdebug!(
+                // debug!(
                 //     "Tcp Socket Listen on {local_endpoint}, open?:{}",
                 //     socket.is_open()
                 // );
@@ -578,7 +578,7 @@ impl Socket for TcpSocket {
             SOCKET_SET
                 .lock_irqsave()
                 .remove(handle.smoltcp_handle().unwrap());
-            // kdebug!("[Socket] [TCP] Close: {:?}", handle);
+            // debug!("[Socket] [TCP] Close: {:?}", handle);
         }
     }
 
@@ -592,8 +592,8 @@ impl Socket for TcpSocket {
         {
             return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
         }
-        // kdebug!("tcp socket: read, buf len={}", buf.len());
-        // kdebug!("tcp socket:read, socket'len={}",self.handle.len());
+        // debug!("tcp socket: read, buf len={}", buf.len());
+        // debug!("tcp socket:read, socket'len={}",self.handle.len());
         loop {
             poll_ifaces();
             let mut socket_set_guard = SOCKET_SET.lock_irqsave();
@@ -603,7 +603,7 @@ impl Socket for TcpSocket {
 
             // 如果socket已经关闭，返回错误
             if !socket.is_active() {
-                // kdebug!("Tcp Socket Read Error, socket is closed");
+                // debug!("Tcp Socket Read Error, socket is closed");
                 return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
             }
 
@@ -623,7 +623,7 @@ impl Socket for TcpSocket {
                         }
                     }
                     Err(tcp::RecvError::InvalidState) => {
-                        kwarn!("Tcp Socket Read Error, InvalidState");
+                        warn!("Tcp Socket Read Error, InvalidState");
                         return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
                     }
                     Err(tcp::RecvError::Finished) => {
@@ -659,7 +659,7 @@ impl Socket for TcpSocket {
         {
             return Err(SystemError::ENOTCONN);
         }
-        // kdebug!("tcp socket:write, socket'len={}",self.handle.len());
+        // debug!("tcp socket:write, socket'len={}",self.handle.len());
 
         let mut socket_set_guard = SOCKET_SET.lock_irqsave();
 
@@ -675,7 +675,7 @@ impl Socket for TcpSocket {
                         return Ok(size);
                     }
                     Err(e) => {
-                        kerror!("Tcp Socket Write Error {e:?}");
+                        error!("Tcp Socket Write Error {e:?}");
                         return Err(SystemError::ENOBUFS);
                     }
                 }
@@ -689,7 +689,7 @@ impl Socket for TcpSocket {
 
     fn poll(&self) -> EPollEventType {
         let mut socket_set_guard = SOCKET_SET.lock_irqsave();
-        // kdebug!("tcp socket:poll, socket'len={}",self.handle.len());
+        // debug!("tcp socket:poll, socket'len={}",self.handle.len());
 
         let socket = socket_set_guard
             .get_mut::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
@@ -705,7 +705,7 @@ impl Socket for TcpSocket {
 
     fn connect(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
         let mut sockets = SOCKET_SET.lock_irqsave();
-        // kdebug!("tcp socket:connect, socket'len={}",self.handle.len());
+        // debug!("tcp socket:connect, socket'len={}",self.handle.len());
 
         let socket =
             sockets.get_mut::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
@@ -715,10 +715,10 @@ impl Socket for TcpSocket {
             // 检测端口是否被占用
             PORT_MANAGER.bind_port(self.metadata.socket_type, temp_port)?;
 
-            // kdebug!("temp_port: {}", temp_port);
+            // debug!("temp_port: {}", temp_port);
             let iface: Arc<dyn NetDevice> = NET_DEVICES.write_irqsave().get(&0).unwrap().clone();
             let mut inner_iface = iface.inner_iface().lock();
-            // kdebug!("to connect: {ip:?}");
+            // debug!("to connect: {ip:?}");
 
             match socket.connect(inner_iface.context(), ip, temp_port) {
                 Ok(()) => {
@@ -752,7 +752,7 @@ impl Socket for TcpSocket {
                     }
                 }
                 Err(e) => {
-                    // kerror!("Tcp Socket Connect Error {e:?}");
+                    // error!("Tcp Socket Connect Error {e:?}");
                     match e {
                         tcp::ConnectError::InvalidState => return Err(SystemError::EISCONN),
                         tcp::ConnectError::Unaddressable => return Err(SystemError::EADDRNOTAVAIL),
@@ -779,7 +779,7 @@ impl Socket for TcpSocket {
         let backlog = handlen.max(backlog);
 
         // 添加剩余需要构建的socket
-        // kdebug!("tcp socket:before listen, socket'len={}", self.handle_list.len());
+        // debug!("tcp socket:before listen, socket'len={}", self.handle_list.len());
         let mut handle_guard = HANDLE_MAP.write_irqsave();
         let wait_queue = Arc::clone(&handle_guard.get(&self.socket_handle()).unwrap().wait_queue);
 
@@ -790,8 +790,8 @@ impl Socket for TcpSocket {
             handle_guard.insert(handle, handle_item);
             handle
         }));
-        // kdebug!("tcp socket:listen, socket'len={}",self.handle.len());
-        // kdebug!("tcp socket:listen, backlog={backlog}");
+        // debug!("tcp socket:listen, socket'len={}",self.handle.len());
+        // debug!("tcp socket:listen, backlog={backlog}");
 
         // 监听所有的socket
         for i in 0..backlog {
@@ -800,10 +800,10 @@ impl Socket for TcpSocket {
             let socket = sockets.get_mut::<tcp::Socket>(handle.smoltcp_handle().unwrap());
 
             if !socket.is_listening() {
-                // kdebug!("Tcp Socket is already listening on {local_endpoint}");
+                // debug!("Tcp Socket is already listening on {local_endpoint}");
                 self.do_listen(socket, local_endpoint)?;
             }
-            // kdebug!("Tcp Socket  before listen, open={}", socket.is_open());
+            // debug!("Tcp Socket  before listen, open={}", socket.is_open());
         }
         return Ok(());
     }
@@ -816,7 +816,7 @@ impl Socket for TcpSocket {
 
             // 检测端口是否已被占用
             PORT_MANAGER.bind_port(self.metadata.socket_type, ip.port)?;
-            // kdebug!("tcp socket:bind, socket'len={}",self.handle.len());
+            // debug!("tcp socket:bind, socket'len={}",self.handle.len());
 
             self.local_endpoint = Some(ip);
             self.is_listening = false;
@@ -841,9 +841,9 @@ impl Socket for TcpSocket {
         }
         let endpoint = self.local_endpoint.ok_or(SystemError::EINVAL)?;
         loop {
-            // kdebug!("tcp accept: poll_ifaces()");
+            // debug!("tcp accept: poll_ifaces()");
             poll_ifaces();
-            // kdebug!("tcp socket:accept, socket'len={}", self.handle_list.len());
+            // debug!("tcp socket:accept, socket'len={}", self.handle_list.len());
 
             let mut sockset = SOCKET_SET.lock_irqsave();
             // Get the corresponding activated handler
@@ -856,7 +856,7 @@ impl Socket for TcpSocket {
                 let con_smol_sock = sockset
                     .get::<tcp::Socket>(self.handles[handle_index].smoltcp_handle().unwrap());
 
-                // kdebug!("[Socket] [TCP] Accept: {:?}", handle);
+                // debug!("[Socket] [TCP] Accept: {:?}", handle);
                 // handle is connected socket's handle
                 let remote_ep = con_smol_sock
                     .remote_endpoint()
@@ -902,13 +902,13 @@ impl Socket for TcpSocket {
 
             drop(sockset);
 
-            // kdebug!("[TCP] [Accept] sleeping socket with handle: {:?}", self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+            // debug!("[TCP] [Accept] sleeping socket with handle: {:?}", self.handles.get(0).unwrap().smoltcp_handle().unwrap());
             SocketHandleItem::sleep(
                 self.socket_handle(), // NOTICE
                 Self::CAN_ACCPET,
                 HANDLE_MAP.read_irqsave(),
             );
-            // kdebug!("tcp socket:after sleep, handle_guard'len={}",HANDLE_MAP.write_irqsave().len());
+            // debug!("tcp socket:after sleep, handle_guard'len={}",HANDLE_MAP.write_irqsave().len());
         }
     }
 
@@ -917,7 +917,7 @@ impl Socket for TcpSocket {
 
         if result.is_none() {
             let sockets = SOCKET_SET.lock_irqsave();
-            // kdebug!("tcp socket:endpoint, socket'len={}",self.handle.len());
+            // debug!("tcp socket:endpoint, socket'len={}",self.handle.len());
 
             let socket =
                 sockets.get::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
@@ -930,7 +930,7 @@ impl Socket for TcpSocket {
 
     fn peer_endpoint(&self) -> Option<Endpoint> {
         let sockets = SOCKET_SET.lock_irqsave();
-        // kdebug!("tcp socket:peer_endpoint, socket'len={}",self.handle.len());
+        // debug!("tcp socket:peer_endpoint, socket'len={}",self.handle.len());
 
         let socket =
             sockets.get::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
@@ -946,7 +946,7 @@ impl Socket for TcpSocket {
     }
 
     fn socket_handle(&self) -> GlobalSocketHandle {
-        // kdebug!("tcp socket:socket_handle, socket'len={}",self.handle.len());
+        // debug!("tcp socket:socket_handle, socket'len={}",self.handle.len());
 
         *self.handles.get(0).unwrap()
     }

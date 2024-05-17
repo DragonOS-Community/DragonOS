@@ -74,7 +74,7 @@ else
 	exit 0
 fi
 
-下载grub2.06
+#下载grub2.06
 if [ ! -f "grub-2.06.tar.xz" ]; then
     echo "开始下载grub2.06"
     wget https://mirrors.ustc.edu.cn/gnu/grub/grub-2.06.tar.xz || exit 1

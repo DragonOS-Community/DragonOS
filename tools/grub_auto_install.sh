@@ -35,9 +35,9 @@ export OBJCOPY=objcopy
 
 
 #检测grub是否已经安装
-# if [ -d ${grub_dir_i386_efi}/bin ] && [ -d ${grub_dir_i386_legacy}/bin ] && [ -d ${grub_dir_x86_64_efi}/bin ] ; then
-# 	exit 0
-# fi
+if [ -d ${grub_dir_i386_efi}/bin ] && [ -d ${grub_dir_i386_legacy}/bin ] && [ -d ${grub_dir_x86_64_efi}/bin ] ; then
+	exit 0
+fi
 #仅支持Ubuntu/Debain, Arch, Centos/RHEL8/Fedora下的自动安装
 supported_package_manager="apt-get pacman dnf yum emerge"
 packages=("make binutils bison gcc gettext flex bison automake autoconf wget gawk" \

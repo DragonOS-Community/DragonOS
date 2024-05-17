@@ -1,22 +1,35 @@
 //参考https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c
-use std::alloc::{alloc, Layout};
-use std::error::Error;
-use std::sync::{Mutex, Arc};
-use std::{error, fmt, result};
 
 // netlink_proto结构体
-static mut NETLINK_PROTO: netlink_proto::NetlinkProto = netlink_proto::NetlinkProto {
-    name: String::from("NETLINK"),
-    owner: std::sync::Arc::downgrade(THIS_MODULE),
-    obj_size: std::mem::size_of::<netlink_sock>(),
-};
+// static mut NETLINK_PROTO: netlink_proto::NetlinkProto = netlink_proto::NetlinkProto {
+//     name: String::from("NETLINK"),
+//     owner: std::sync::Arc::downgrade(THIS_MODULE),
+//     obj_size: std::mem::size_of::<netlink_sock>(),
+// };
 
 // SPDX-License-Identifier: GPL-2.0
 
+use core::{any::Any, fmt::Debug, hash::Hash, ops::Deref};
 
-use crossbeam_utils::atomic::AtomicCell;
-use crate::net::sock::sock;
+use alloc::{
+    string::String,
+    sync::{Arc, Weak},
+};
+use driver_base_macros::get_weak_or_clear;
+use intertrait::CastFromSync;
+use system_error::SystemError;
 
+use crate::{
+    filesystem::{
+        kernfs::KernFSInode,
+        sysfs::{sysfs_instance, Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport},
+    }, include::bindings::bindings::kzalloc, libs::{
+        casting::DowncastArc, mutex::Mutex, rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard}
+    }, net::socket::SocketType
+};use alloc::{boxed::Box, vec::Vec};
+
+use crate::net::socket::Socket;
+use lazy_static::lazy_static;
 // Flags constants
 bitflags! {
     pub struct NetlinkFlags: u32 {
@@ -28,40 +41,80 @@ bitflags! {
         const CAP_ACK = 0x20;
         const EXT_ACK = 0x40;
         const STRICT_CHK = 0x80;
+        const NETLINK_F_KERNEL_SOCKET = 0x100;
     }
 }
 
 pub struct sockaddr_nl {
-    pub nl_family: SA_FAMILY_T,
+    // pub nl_family: SA_FAMILY_T,
     pub nl_pad: u16,
     pub nl_pid: u32,
     pub nl_groups: u32,
 }
 
 trait NetlinkSocket {
-    fn send(&self, msg: &[u8]) -> Result<(), Box<dyn Error>>;
-    fn recv(&self) -> Result<Vec<u8>, Box<dyn Error>>;
-    fn bind(&self, addr: libc::sockaddr_nl) -> Result<(), Box<dyn Error>>;
-    fn unbind(&self, addr: libc::sockaddr_nl) -> Result<(), Box<dyn Error>>;
+    fn send(&self, msg: &[u8]) -> Result<(),SystemError>;
+    fn recv(&self) -> Result<Vec<u8>,SystemError>;
+    fn bind(&self) -> Result<(),SystemError>;
+    fn unbind(&self) -> Result<(),SystemError>;
     fn register(&self, listener: Box<dyn NetlinkMessageHandler>);
     fn unregister(&self, listener: Box<dyn NetlinkMessageHandler>);
 
 }
 // NetlinkTable how to design? a struct or use NetlinkTableEntry as struct?
-trait NetlinkTable {
-    fn hash(&self)->RhashTable;
-    fn mc_list(&self)->hlist_head;
-    fn listeners(&self)->RCuListeners;
-    fn flags(&self)->u32;
-    fn groups(&self)->u32;
-    fn cb_mutex(&self)->Mutex;
-    fn module(&self)->Module;
-    fn bind(net:Net, group: u32);
-    fn unbind(net:Net, group: u32);
-    fn compare(net:Net, sock:sock);
-    fn registed(&self)->u32;
+pub struct NetlinkTable {
+    listeners: Option<listeners>,
+    registed: u32,
+    flags: u32,
+    groups: u32,
+}
+impl NetlinkTable{
+    fn new() -> NetlinkTable {
+        NetlinkTable {
+            listeners: Some(listeners {
+                masks: Vec::new(),
+            }),
+            registed: 0,
+            flags: 0,
+            groups: 0,
+        }
+    }
+    // fn hash(&self)->RhashTable;
+    fn listeners(&self)->RCuListeners{
+        RCuListeners::new()
+    }
+    fn flags(&self)->u32{
+        0
+    }
+    fn groups(&self)->u32{
+        0
+    }
+    // fn cb_mutex(&self)->Mutex;
+    // fn module(&self)->Module;
+    // fn bind(net:Net, group: u32);
+    // fn unbind(net:Net, group: u32);
+    // fn compare(net:Net, sock:sock);
+    fn registed(&self)->u32{
+        0
+    }
+    // fn bind(&self, net: &Net, group: u32) {
+    //     // Implementation of bind
+    // }
+    // fn unbind(&self, net: &Net, group: u32) {
+    //     // Implementation of unbind
+    // }
+    // fn compare(&self, net: &Net, sock: &sock) {
+    //     // Implementation of compare
+    // }
 }
 
+pub struct LockedNetlinkTable(RwLock<NetlinkTable>);
+
+impl LockedNetlinkTable {
+    pub fn new(netlinktable: NetlinkTable) ->LockedNetlinkTable  {
+        LockedNetlinkTable(RwLock::new(netlinktable))
+    }
+}
 // You would need to implement the actual methods for the traits and the bind/unbind functions.
 trait NetlinkMessageHandler {
     fn handle_message(&mut self, msg: &[u8]) {
@@ -95,7 +148,7 @@ impl RCuListeners {
 
 const MAX_LINKS: usize = 32;
 
-fn netlink_proto_init() -> Result<(), Box<dyn Error>> {
+fn netlink_proto_init() -> Result<(),SystemError> {
 
     // 条件编译，类似于C语言中的#if defined(...)
     // #[cfg(all(feature = "CONFIG_BPF_SYSCALL", feature = "CONFIG_PROC_FS"))]
@@ -138,8 +191,6 @@ fn main() {
     // 调用初始化函数，并处理可能的错误
     if let Err(e) = netlink_proto_init() {
         // 如果出现错误，打印错误信息并退出
-        eprintln!("Failed to initialize netlink protocol: {:?}", e);
-        std::process::exit(1);
     }
 }
 
@@ -165,130 +216,84 @@ enum Error {
     SocketTypeNotSupported,
     ProtocolNotSupported,
 }
-trait sock{
+pub struct sock{
+    sk_protocol: u16,
+    sk_family: i32,
+    sk_state: i32,
+    sk_flags: u32,
+    sk_type: SocketType,
+    // sk_prot: dyn proto,
+    // sk_net: Net,
+    sk_bound_dev_if: i32,
+    
+}
+pub trait socktrait{
     fn sk(&self) -> &sock;
-    fn sk_prot(&self) -> &proto;
+    // fn sk_prot(&self) -> &dyn proto;
     fn sk_family(&self) -> i32;
     fn sk_state(&self) -> i32;
+    fn sk_protocol(&self) -> u16;
+    fn is_kernel(&self) -> bool;
+}
+impl socktrait for sock{
+    fn sk(&self) -> &sock{
+        self
+    }
+    // fn sk_prot(&self) -> &dyn proto;
+    fn sk_family(&self) -> i32{
+        0
+    }
+    fn sk_state(&self) -> i32{
+        0
+    }
+    fn sk_protocol(&self) -> u16{
+        self.sk_protocol
+    }
+    fn is_kernel(&self) -> bool{
+        true
+    }
 }
 
-trait NetlinkSockTrait: sock {
+trait NetlinkSock:{
     fn portid(&self) -> u32;
     fn dst_portid(&self) -> u32;
     fn dst_group(&self) -> u32;
     fn flags(&self) -> u32;
-    fn is_kernel(&self) -> bool;
     fn subscriptions(&self) -> u32;
     fn ngroups(&self) -> u32;
     fn groups(&self) -> &[u64];
     fn state(&self) -> u64;
-    fn max_recvmsg_len(&self) -> size_t;
-    fn wait(&self) -> &wait_queue_head_t;
+    fn max_recvmsg_len(&self) -> usize;
+    // fn wait(&self) -> &wait_queue_head_t;
     fn bound(&self) -> bool;
     fn cb_running(&self) -> bool;
-    fn dump_done_errno(&self) -> int;
-    fn cb(&self) -> &struct_netlink_callback;
-    fn cb_mutex(&self) -> &struct_mutex;
-    fn cb_def_mutex(&self) -> &struct_mutex;
-    fn netlink_rcv(&self, skb: &struct_sk_buff) -> void;
-    fn netlink_bind(&self, net: &struct_net, group: int) -> int;
-    fn netlink_unbind(&self, net: &struct_net, group: int) -> void;
-    fn module(&self) -> &struct_module;
-    fn node(&self) -> &struct_rhash_head;
-    fn rcu(&self) -> &struct_rcu_head;
-    fn work(&self) -> &struct_work_struct;
+    fn dump_done_errno(&self) -> i32;
+    // fn cb(&self) -> &struct_netlink_callback;
+    // fn cb_mutex(&self) -> &struct_mutex;
+    // fn cb_def_mutex(&self) -> &struct_mutex;
+    // fn netlink_rcv(&self, skb: &struct_sk_buff) -> void;
+    // fn netlink_bind(&self, net: &struct_net, group: int) -> int;
+    // fn netlink_unbind(&self, net: &struct_net, group: int) -> void;
+    // fn module(&self) -> &struct_module;
+    // fn node(&self) -> &struct_rhash_head;
+    // fn rcu(&self) -> &struct_rcu_head;
+    // fn work(&self) -> &struct_work_struct;
 }
 /* linux：struct sock has to be the first member of netlink_sock */
-impl NetlinkSockTrait for netlink_sock {
-    fn sk(&self) -> &sock {
-        &self.sk
-    }
-    fn portid(&self) -> u32 {
-        self.portid
-    }
-    fn dst_portid(&self) -> u32 {
-        self.dst_portid
-    }
-    fn dst_group(&self) -> u32 {
-        self.dst_group
-    }
-    fn flags(&self) -> u32 {
-        self.flags
-    }
-    fn is_kernel(&self) -> bool {
-        self.flags & NETLINK_F_KERNEL_SOCKET != 0
-    }
-    fn subscriptions(&self) -> u32 {
-        self.subscriptions
-    }
-    fn ngroups(&self) -> u32 {
-        self.ngroups
-    }
-    fn groups(&self) -> &[u64] {
-        &self.groups
-    }
-    fn state(&self) -> u64 {
-        self.state
-    }
-    fn max_recvmsg_len(&self) -> size_t {
-        self.max_recvmsg_len
-    }
-    fn wait(&self) -> &wait_queue_head_t {
-        &self.wait
-    }
-    fn bound(&self) -> bool {
-        self.bound
-    }
-    fn cb_running(&self) -> bool {
-        self.cb_running
-    }
-    fn dump_done_errno(&self) -> int {
-        self.dump_done_errno
-    }
-    fn cb(&self) -> &struct_netlink_callback {
-        &self.cb
-    }
-    fn cb_mutex(&self) -> &struct_mutex {
-        &self.cb_mutex
-    }
-    fn cb_def_mutex(&self) -> &struct_mutex {
-        &self.cb_def_mutex
-    }
-    fn netlink_rcv(&self, skb: &struct_sk_buff) -> void {
-        self.netlink_rcv(skb)
-    }
-    fn netlink_bind(&self, net: &struct_net, group: int) -> int {
-        self.netlink_bind(net, group)
-    }
-    fn netlink_unbind(&self, net: &struct_net, group: int) -> void {
-        self.netlink_unbind(net, group)
-    }
-    fn module(&self) -> &struct_module {
-        &self.module
-    }
-    fn node(&self) -> &struct_rhash_head {
-        &self.node
-    }
-    fn rcu(&self) -> &struct_rcu_head {
-        &self.rcu
-    }
-    fn work(&self) -> &struct_work_struct {
-        &self.work
-    }
+impl dyn NetlinkSock {
+   
 }
-fn netlink_create(net: &Net, socket: &mut Socket, protocol: i32, _kern: bool) -> Result<(), Error> {
-    let mut module: Option<Box<Module>> = None;
-    let mut cb_mutex: Mutex;
-    let mut nlk = NetlinkSock::new();
-    let mut bind: Option<fn(&Net, usize)> = None;
-    let mut unbind: Option<fn(&Net, usize)> = None;
+// https://code.dragonos.org.cn/s?refs=netlink_create&project=linux-6.1.9
+fn netlink_create(socket: &mut dyn Socket, protocol: i32, _kern: bool) -> Result<(), Error> {
+
+
 
     // 假设我们有一个类型来跟踪协议最大值
     const MAX_LINKS: i32 = 1024;
 
-    if socket.type_ != SocketType::Raw && socket.type_ != SocketType::Dgram {
-        return Err(Error::SocketTypeNotSupported);
-    }
+    // if socket.type_ != SocketType::Raw && socket.type_ != SocketType::Dgram {
+    //     return Err(Error::SocketTypeNotSupported);
+    // }
 
     if protocol < 0 || protocol >= MAX_LINKS {
         return Err(Error::ProtocolNotSupported);
@@ -300,9 +305,7 @@ fn netlink_create(net: &Net, socket: &mut Socket, protocol: i32, _kern: bool) ->
     // 这里简化了锁和模块加载逻辑
 
     // 假设成功加载了模块和相关函数
-    module = Some(Box::new(Module));
-    bind = Some(bind_function);
-    unbind = Some(unbind_function);
+
 
     // 继续其他的逻辑
     // ...
@@ -311,33 +314,45 @@ fn netlink_create(net: &Net, socket: &mut Socket, protocol: i32, _kern: bool) ->
 }
 
 // 假设的绑定和解绑函数
-fn bind_function(net: &Net, group: usize) {
-    // 实现细节
-}
+// fn bind_function(net: &Net, group: usize) {
+//     // 实现细节
+// }
 
-fn unbind_function(net: &Net, group: usize) {
-    // 实现细节
+// fn unbind_function(net: &Net, group: usize) {
+//     // 实现细节
+// }
+struct callback_head {
+    next: Option<Box<callback_head>>,
 }
-
-trait callback_head {
-    fn next(&self) -> Option<&callback_head>;
-    fn func(callback_head: &callback_head);
+impl callback_head {
+    fn next(&self) -> &Option<Box<callback_head>> {
+        &self.next
+    }
+    fn func(&self) -> Option<Box<dyn Fn() -> i32>> {
+        None
+    }
 }
 
 struct listeners {
     // Recursive Wakeup Unlocking?
-	rcu: callback_head,
 	masks:Vec<u64>,
 }
+impl listeners{
+    fn masks(&self)->Vec<u64>{
+        Vec::new()
+    }
+}
 
-fn netlink_has_listeners(sk: &sock, group: u64) -> i32 {
+lazy_static! {
+    static ref NL_TABLE: RwLock<Vec<NetlinkTable>> = RwLock::new(vec![NetlinkTable::new()]);
+}
+pub fn netlink_has_listeners(sk: &sock, group: u32) -> i32 {
     let mut res = 0;
-    let listeners:listeners= listeners::new();
-    // 判断是否是内核socket
-    assert!(sk.is_kernel(), "sk is not a kernel socket");
-    let my_data = Mutex::new(my_shared_data);
-    // 读锁保护下读取nl_table[sk->sk_protocol].listeners
-
+    let nl_table = NL_TABLE.read();
+    if let Some(listeners) = &nl_table[sk.sk_protocol as usize].listeners {
+        if group - 1 < nl_table[sk.sk_protocol as usize].groups {
+            res = listeners.masks[group as usize - 1]as i32;
+        }
+    }
     res
-    
 }

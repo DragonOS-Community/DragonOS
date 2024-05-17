@@ -1,6 +1,4 @@
 use core::fmt::Write;
-
-use alloc::collections::VecDeque;
 // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c
 /*
 
@@ -55,7 +53,9 @@ use crate::libs::mutex::Mutex;
 use alloc::sync::Arc;
 use system_error::SystemError;
 use alloc::boxed::Box;
-
+use crate::net::socket::netlink::af_netlink::netlink_has_listeners;
+use crate::net::socket::netlink::af_netlink::sock;
+use crate::net::socket::netlink::af_netlink::socktrait;
 // 存放需要用到的全局变量
 pub static UEVENT_SEQNUM: u64 = 0;
 pub static UEVENT_SUPPRESS: i32 = 1;
@@ -82,9 +82,21 @@ pub struct ListHead {
 // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c#38
 pub struct UeventSock {
     list: Vec<ListHead>,
-    sk: Box<dyn Socket>,
+    sk: sock,
 }
+impl UeventSock {
+    fn new(sk: sock) -> Self {
+        Self {
+            list: Vec::new(),
+            sk,
+        }
+    }
+}
+trait UeventSocktrait {
+}
+impl UeventSocktrait for dyn socktrait {
 
+}
 // static const char *kobject_actions[] = {
 // 	[KOBJ_ADD] =		"add",
 // 	[KOBJ_REMOVE] =		"remove",
@@ -425,7 +437,7 @@ pub fn uevent_net_broadcast_tagged(
     let ret = 0;
     ret
 }
-static uevent_sock_list: VecDeque<UeventSock> = VecDeque::new();
+static uevent_sock_list: Vec<UeventSock> = Vec::new();
 pub fn uevent_net_broadcast_untagged(
     env: &Box<KobjUeventEnv>,
     action_string: &String,
@@ -442,10 +454,9 @@ pub fn uevent_net_broadcast_untagged(
     // 发送uevent message
     for ue_sk in &uevent_sock_list {
         let uevent_sock = &ue_sk.sk;
-        // todo: netlink_has_listeners
-        // if !netlink_has_listeners(uevent_sock, 1) {
-        //     continue;
-        // }
+        if !(crate::net::socket::netlink::af_netlink::netlink_has_listeners(uevent_sock, 1) != 0) {
+            continue;
+        }
 
         if skb.is_empty() {
             retval = SystemError::ENOMEM.to_posix_errno();

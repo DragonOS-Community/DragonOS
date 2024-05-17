@@ -10,4 +10,5 @@ genetlink.c
 policy.c	
 */
 // Top-level module defining the public API for Netlink
-mod netlink;
+pub mod netlink;
+pub mod af_netlink;

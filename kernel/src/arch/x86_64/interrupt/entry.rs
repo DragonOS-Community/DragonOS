@@ -568,8 +568,7 @@ pub unsafe fn set_system_trap_gate(irq: u32, ist: u8, vaddr: VirtAddr) {
 
 unsafe fn get_idt_entry(irq: u32) -> &'static mut [u64] {
     assert!(irq < 256);
-    let mut idt_vaddr =
-        MMArch::phys_2_virt(PhysAddr::new(addr_of!(IDT_Table) as usize)).unwrap();
+    let mut idt_vaddr = MMArch::phys_2_virt(PhysAddr::new(addr_of!(IDT_Table) as usize)).unwrap();
 
     idt_vaddr += irq as usize * 16;
 

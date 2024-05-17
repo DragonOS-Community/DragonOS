@@ -377,6 +377,7 @@ pub trait FrameBufferInfo: FrameBufferOps {
 /// 帧缓冲区操作
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/fb.h#237
+#[allow(dead_code)]
 pub trait FrameBufferOps {
     fn fb_open(&self, user: bool);
     fn fb_release(&self, user: bool);

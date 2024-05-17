@@ -1,5 +1,4 @@
 #![no_main] // <1>
-
 #![allow(internal_features)]
 #![feature(alloc_error_handler)]
 #![feature(allocator_api)]
@@ -21,6 +20,7 @@
 #![feature(ptr_to_from_bits)]
 #![feature(trait_upcasting)]
 #![feature(slice_ptr_get)]
+#![feature(strict_provenance)]
 #![feature(vec_into_raw_parts)]
 #![cfg_attr(target_os = "none", no_std)]
 // clippy的配置

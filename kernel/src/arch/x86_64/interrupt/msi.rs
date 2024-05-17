@@ -27,6 +27,7 @@ pub struct X86MsiDataNormal {
 
 #[derive(Debug)]
 pub struct X86MsiDataDmar {
+    #[allow(dead_code)]
     pub dmar_subhandle: u32,
 }
 

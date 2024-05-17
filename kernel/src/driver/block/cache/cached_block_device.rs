@@ -1,3 +1,5 @@
+use core::ptr::addr_of_mut;
+
 use alloc::{boxed::Box, vec::Vec};
 use hashbrown::HashMap;
 use log::debug;
@@ -18,7 +20,7 @@ pub struct BlockCache;
 
 unsafe fn mapper() -> Result<&'static mut LockedCacheMapper, BlockCacheError> {
     unsafe {
-        match &mut CMAPPER {
+        match addr_of_mut!(CMAPPER).as_mut().unwrap() {
             Some(x) => return Ok(x),
             None => return Err(BlockCacheError::StaticParameterError),
         }
@@ -27,7 +29,7 @@ unsafe fn mapper() -> Result<&'static mut LockedCacheMapper, BlockCacheError> {
 
 unsafe fn space() -> Result<&'static mut LockedCacheSpace, BlockCacheError> {
     unsafe {
-        match &mut CSPACE {
+        match addr_of_mut!(CSPACE).as_mut().unwrap() {
             Some(x) => return Ok(x),
             None => return Err(BlockCacheError::StaticParameterError),
         }

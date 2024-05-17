@@ -159,6 +159,7 @@ impl IrqDesc {
     /// ## Safety
     ///
     /// 需要保证irq_data和chip是当前irqdesc的
+    #[allow(dead_code)]
     pub fn set_handler_no_lock_inner(
         &self,
         handler: &'static dyn IrqFlowHandler,
@@ -275,6 +276,7 @@ impl IrqDesc {
             .ok();
     }
 
+    #[allow(dead_code)]
     pub fn set_percpu_devid_flags(&self) {
         self.modify_status(
             IrqLineStatus::empty(),
@@ -286,10 +288,12 @@ impl IrqDesc {
         );
     }
 
+    #[allow(dead_code)]
     pub fn set_probe(&self) {
         self.modify_status(IrqLineStatus::IRQ_NOPROBE, IrqLineStatus::empty());
     }
 
+    #[allow(dead_code)]
     pub fn set_noprobe(&self) {
         self.modify_status(IrqLineStatus::empty(), IrqLineStatus::IRQ_NOPROBE);
     }

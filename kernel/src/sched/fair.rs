@@ -142,7 +142,6 @@ impl FairSchedEntity {
         self.parent.upgrade()
     }
 
-    #[allow(clippy::mut_from_ref)]
     pub fn force_mut(&self) -> &mut Self {
         unsafe { &mut *(self as *const Self as usize as *mut Self) }
     }

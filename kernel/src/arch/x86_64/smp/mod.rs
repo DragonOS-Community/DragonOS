@@ -1,7 +1,5 @@
 use core::{
-    arch::asm,
-    hint::spin_loop,
-    sync::atomic::{compiler_fence, fence, AtomicBool, Ordering},
+    arch::asm, hint::spin_loop, ptr::addr_of_mut, sync::atomic::{compiler_fence, fence, AtomicBool, Ordering}
 };
 
 use kdepends::memoffset::offset_of;
@@ -269,7 +267,7 @@ impl SmpCpuManager {
             .table()
             .phys();
         let vaddr = unsafe {
-            MMArch::phys_2_virt(PhysAddr::new(&mut __APU_START_CR3 as *mut u64 as usize)).unwrap()
+            MMArch::phys_2_virt(PhysAddr::new(addr_of_mut!(__APU_START_CR3).addr())).unwrap()
         };
         let ptr = vaddr.data() as *mut u64;
         unsafe { *ptr = addr.data() as u64 };

@@ -1141,6 +1141,7 @@ pub struct ProcessSchedulerInfo {
     pub prio_data: RwLock<PrioData>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct SchedInfo {
     /// 记录任务在特定 CPU 上运行的次数
@@ -1153,6 +1154,7 @@ pub struct SchedInfo {
     pub last_queued: u64,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct PrioData {
     pub prio: i32,

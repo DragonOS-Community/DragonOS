@@ -43,6 +43,7 @@ pub trait IrqChip: Sync + Send + Any + Debug {
     }
 
     /// shut down the interrupt (defaults to ->disable if ENOSYS)
+    #[allow(dead_code)]
     fn irq_shutdown(&self, _irq_data: &Arc<IrqData>) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }

@@ -1,4 +1,7 @@
-use core::{ptr::addr_of, sync::atomic::{compiler_fence, Ordering}};
+use core::{
+    ptr::addr_of,
+    sync::atomic::{compiler_fence, Ordering},
+};
 
 use log::debug;
 use system_error::SystemError;
@@ -42,10 +45,8 @@ unsafe extern "C" fn kernel_main(
     bsp_idt_size: u64,
 ) -> ! {
     let mut gdtp = DescriptorTablePointer::<usize>::default();
-    let gdt_vaddr =
-        MMArch::phys_2_virt(PhysAddr::new(addr_of!(GDT_Table) as usize)).unwrap();
-    let idt_vaddr =
-        MMArch::phys_2_virt(PhysAddr::new(addr_of!(IDT_Table) as usize)).unwrap();
+    let gdt_vaddr = MMArch::phys_2_virt(PhysAddr::new(addr_of!(GDT_Table) as usize)).unwrap();
+    let idt_vaddr = MMArch::phys_2_virt(PhysAddr::new(addr_of!(IDT_Table) as usize)).unwrap();
     gdtp.base = gdt_vaddr.data() as *const usize;
     gdtp.limit = bsp_gdt_size as u16 - 1;
 
@@ -70,10 +71,8 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
     let stack_start = unsafe { *(head_stack_start as *const u64) } as usize;
     debug!("head_stack_start={:#x}\n", stack_start);
     unsafe {
-        let gdt_vaddr =
-            MMArch::phys_2_virt(PhysAddr::new(addr_of!(GDT_Table) as usize)).unwrap();
-        let idt_vaddr =
-            MMArch::phys_2_virt(PhysAddr::new(addr_of!(IDT_Table) as usize)).unwrap();
+        let gdt_vaddr = MMArch::phys_2_virt(PhysAddr::new(addr_of!(GDT_Table) as usize)).unwrap();
+        let idt_vaddr = MMArch::phys_2_virt(PhysAddr::new(addr_of!(IDT_Table) as usize)).unwrap();
 
         debug!("GDT_Table={:?}, IDT_Table={:?}\n", gdt_vaddr, idt_vaddr);
     }

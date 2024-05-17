@@ -2,6 +2,7 @@
 
 use core::{
     hint::spin_loop,
+    ptr::addr_of,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -25,7 +26,10 @@ impl Serial8250Manager {
         uart_driver: &Arc<Serial8250ISADriver>,
         devs: &Arc<Serial8250ISADevices>,
     ) {
-        for port in unsafe { &PIO_PORTS }.iter().flatten() {
+        for port in unsafe { addr_of!(PIO_PORTS).as_ref().unwrap() }
+            .iter()
+            .flatten()
+        {
             port.set_device(Some(devs));
             self.uart_add_one_port(uart_driver, port).ok();
         }
@@ -251,6 +255,7 @@ impl Serial8250PIOPortInner {
         Self { device: None }
     }
 
+    #[allow(dead_code)]
     pub fn device(&self) -> Option<Arc<Serial8250ISADevices>> {
         if let Some(device) = self.device.as_ref() {
             return device.upgrade();

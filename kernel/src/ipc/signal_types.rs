@@ -65,6 +65,7 @@ pub struct SignalStruct {
 
 #[derive(Debug)]
 pub struct InnerSignalStruct {
+    #[allow(dead_code)]
     pub cnt: AtomicI64,
     /// 如果对应linux，这部分会有一个引用计数，但是没发现在哪里有用到需要计算引用的地方，因此
     /// 暂时删掉，不然这个Arc会导致其他地方的代码十分丑陋

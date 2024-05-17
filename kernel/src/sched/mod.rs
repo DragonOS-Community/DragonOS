@@ -112,6 +112,7 @@ pub trait Scheduler {
     );
 
     /// ## 选择接下来最适合运行的任务
+    #[allow(dead_code)]
     fn pick_task(rq: &mut CpuRunQueue) -> Option<Arc<ProcessControlBlock>>;
 
     /// ## 选择接下来最适合运行的任务
@@ -272,6 +273,7 @@ pub trait SchedArch {
     /// 开启当前核心的调度
     fn enable_sched_local();
     /// 关闭当前核心的调度
+    #[allow(dead_code)]
     fn disable_sched_local();
 
     /// 在第一次开启调度之前，进行初始化工作。

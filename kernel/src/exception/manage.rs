@@ -623,6 +623,7 @@ impl IrqManager {
             .ok();
     }
 
+    #[allow(dead_code)]
     pub(super) fn irq_activate_and_startup(
         &self,
         desc: &Arc<IrqDesc>,
@@ -785,6 +786,7 @@ impl IrqManager {
         );
     }
 
+    #[allow(dead_code)]
     pub fn irq_set_affinity(
         &self,
         irq_data: &Arc<IrqData>,

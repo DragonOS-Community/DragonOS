@@ -1,3 +1,5 @@
+use core::ptr::addr_of;
+
 use x86::{current::task::TaskStateSegment, segmentation::SegmentSelector, Ring};
 
 use crate::{
@@ -61,7 +63,7 @@ impl TSSManager {
 
     unsafe fn set_tss_descriptor(index: u16, vaddr: VirtAddr) {
         const LIMIT: u64 = 103;
-        let gdt_vaddr = VirtAddr::new(&GDT_Table as *const _ as usize);
+        let gdt_vaddr = VirtAddr::new(addr_of!(GDT_Table).addr());
 
         let gdt: &mut [u64] = core::slice::from_raw_parts_mut(gdt_vaddr.data() as *mut u64, 512);
 

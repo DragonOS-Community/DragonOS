@@ -35,17 +35,28 @@ export OBJCOPY=objcopy
 
 
 #检测grub是否已经安装
-if [ -d ${grub_dir_i386_efi}/bin ] && [ -d ${grub_dir_i386_legacy}/bin ] && [ -d ${grub_dir_x86_64_efi}/bin ] ; then
-	exit 0
-fi
+# if [ -d ${grub_dir_i386_efi}/bin ] && [ -d ${grub_dir_i386_legacy}/bin ] && [ -d ${grub_dir_x86_64_efi}/bin ] ; then
+# 	exit 0
+# fi
 #仅支持Ubuntu/Debain, Arch, Centos/RHEL8/Fedora下的自动安装
-supported_package_manager="apt-get pacman dnf"
+supported_package_manager="apt-get pacman dnf yum emerge"
 packages=("make binutils bison gcc gettext flex bison automake autoconf wget gawk" \
-          "make binutils bison gcc gettext flex bison automake autoconf wget gawk")
-update_options=("update" \
-                "-Sy")
+              "make binutils bison gcc gettext flex bison automake autoconf wget gawk" \
+	      "make binutils bison gcc gettext flex bison automake autoconf wget gawk" \
+	      "make binutils bison gcc gettext flex bison automake autoconf wget gawk" \
+	      "dev-build/make sys-devel/binutils sys-devel/bison sys-devel/gcc sys-devel/gettext sys-devel/flex dev-build/automake dev-build/autoconf net-misc/wget sys-apps/gawk")
+update_options=("update" \ 
+                    "-Sy" \
+		    "update" \
+		    "update" \
+		    "--sync"
+	       )
 install_options=("install -y" \
-                 "-S --needed --noconfirm")
+                     "-S --needed --noconfirm" \
+		     "install -y" \
+		     "install -y" \
+		     ""
+		)
 found_pm=0
 pm_index=0
 for pm in ${supported_package_manager}; do
@@ -63,7 +74,7 @@ else
 	exit 0
 fi
 
-#下载grub2.06
+下载grub2.06
 if [ ! -f "grub-2.06.tar.xz" ]; then
     echo "开始下载grub2.06"
     wget https://mirrors.ustc.edu.cn/gnu/grub/grub-2.06.tar.xz || exit 1

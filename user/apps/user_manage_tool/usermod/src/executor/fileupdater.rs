@@ -69,10 +69,7 @@ impl FileUpdater {
 
     /// 更新/etc/group文件中各用户组中的用户
     fn update_group_file(&self) {
-        let r = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/etc/group");
+        let r = OpenOptions::new().read(true).write(true).open("/etc/group");
 
         match r {
             Ok(mut file) => {

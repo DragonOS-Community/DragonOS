@@ -78,7 +78,10 @@ impl Check {
                     let field = line.split(":").collect::<Vec<&str>>();
                     if field[3] == gid {
                         ErrorHandler::error_handle(
-                            format!("groupdel failed: group is main group of user:[{}]", field[0]),
+                            format!(
+                                "groupdel failed: group is main group of user:[{}]",
+                                field[0]
+                            ),
                             crate::error::ExitStatus::InvalidArg,
                         )
                     }

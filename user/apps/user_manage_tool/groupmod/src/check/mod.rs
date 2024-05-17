@@ -16,10 +16,10 @@ pub struct Check;
 
 impl Check {
     /// **校验解析后的groupadd命令**
-    /// 
+    ///
     /// ## 参数
     /// - `cmd`: 解析后的groupadd命令
-    /// 
+    ///
     /// ## 返回
     /// - `Info`: 校验后的信息
     pub fn check(cmd: GModCommand) -> Info {

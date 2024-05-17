@@ -21,10 +21,7 @@ impl FileUpdaer {
 
     /// 更新/etc/group文件: 更新用户组信息
     fn update_group_file(&self) {
-        let r = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/etc/group");
+        let r = OpenOptions::new().read(true).write(true).open("/etc/group");
         match r {
             Ok(mut file) => {
                 let mut content = String::new();

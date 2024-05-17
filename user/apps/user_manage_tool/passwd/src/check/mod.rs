@@ -98,10 +98,10 @@ impl Check {
     }
 
     /// **获取uid对应的用户名**
-    /// 
+    ///
     /// ## 参数
     /// - `uid`: 用户id
-    /// 
+    ///
     /// ## 返回
     /// 用户名
     fn cur_username(uid: String) -> String {

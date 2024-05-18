@@ -1,3 +1,4 @@
+use core::cell::RefCell;
 use core::fmt::Write;
 // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c
 /*
@@ -41,7 +42,8 @@ Function
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use num::Zero;
-use smoltcp::socket::raw;
+use smoltcp::socket::raw::PacketBuffer;
+use smoltcp::socket::raw::PacketMetadata;
 
 use crate::driver::base::kobject::{KObjectManager, KObjectState};
 use crate::net::socket::Socket;
@@ -56,6 +58,7 @@ use alloc::boxed::Box;
 use crate::net::socket::netlink::af_netlink::netlink_has_listeners;
 use crate::net::socket::netlink::af_netlink::sock;
 use crate::net::socket::netlink::af_netlink::socktrait;
+use crate::net::socket::netlink::af_netlink::netlink_broadcast;
 // 存放需要用到的全局变量
 pub static UEVENT_SEQNUM: u64 = 0;
 pub static UEVENT_SUPPRESS: i32 = 1;
@@ -81,7 +84,7 @@ pub struct ListHead {
 }
 // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c#38
 pub struct UeventSock {
-    list: Vec<ListHead>,
+    list: Vec<Box<ListHead>>,
     sk: sock,
 }
 impl UeventSock {
@@ -92,10 +95,24 @@ impl UeventSock {
         }
     }
 }
-trait UeventSocktrait {
-}
-impl UeventSocktrait for dyn socktrait {
 
+impl socktrait for UeventSock {
+    fn sk(&self) -> &sock{
+        &self.sk
+    }
+    fn sk_family(&self) -> i32{
+        0
+    }
+    fn sk_state(&self) -> i32{
+        0
+    }
+    fn sk_protocol(&self) -> usize{
+        0
+    }
+    fn is_kernel(&self) -> bool{
+        true
+    }
+    
 }
 // static const char *kobject_actions[] = {
 // 	[KOBJ_ADD] =		"add",
@@ -438,6 +455,17 @@ pub fn uevent_net_broadcast_tagged(
     ret
 }
 static uevent_sock_list: Vec<UeventSock> = Vec::new();
+pub fn alloc_uevent_skb<'a>(
+    env: &'a Box<KobjUeventEnv>,
+    action_string: &'a String,
+    devpath: &'a String,
+)->PacketBuffer<'a>
+{
+    let skb: PacketBuffer = PacketBuffer::new(
+        vec![PacketMetadata::EMPTY; 666],
+        vec![0; 666],) ;
+    skb
+}
 pub fn uevent_net_broadcast_untagged(
     env: &Box<KobjUeventEnv>,
     action_string: &String,
@@ -445,11 +473,18 @@ pub fn uevent_net_broadcast_untagged(
 )->i32
 {
     let mut retval = 0;
-    // "666" tobe replaced
-    let mut skb: raw::PacketBuffer = raw::PacketBuffer::new(
-        vec![raw::PacketMetadata::EMPTY; 666],
-        vec![0; 666],) ;
-    let mut ue_sk: UeventSock;
+    let Buffersize: usize = 666;
+    let mut skb: PacketBuffer = PacketBuffer::new(
+        vec![PacketMetadata::EMPTY; Buffersize],
+        vec![0; 666],);
+    // 将 PacketBuffer 包装在 Arc 中，以便可以跨线程安全地共享
+    let shared_skb: Arc<RefCell<PacketBuffer>> = Arc::new(RefCell::new(skb));
+
+    // 模拟 skb_get 行为，增加引用并返回引用
+    fn get_packet_buffer(shared_skb: Arc<RefCell<PacketBuffer>>) -> Arc<RefCell<PacketBuffer>> {
+        // Rc::clone 会增加内部引用计数
+        shared_skb.clone()
+    }
 
     // 发送uevent message
     for ue_sk in &uevent_sock_list {
@@ -460,14 +495,18 @@ pub fn uevent_net_broadcast_untagged(
 
         if skb.is_empty() {
             retval = SystemError::ENOMEM.to_posix_errno();
-            // todo: alloc_uevent_skb
-            //skb = alloc_uevent_skb(env, action_string, devpath);
+            skb = alloc_uevent_skb(env, action_string, devpath);
             if skb.is_empty() {
                 continue;
             }
         }
 
-        // retval = netlink_broadcast(uevent_sock, skb.get(), 0, 1, GFP_KERNEL);
+
+        // GFP_KERNEL暂且保留但是搁置
+        retval = match netlink_broadcast(uevent_sock, get_packet_buffer(shared_skb.clone()), 0, 1,1 ) {
+            Ok(_) => 0,
+            Err(err) => err.to_posix_errno(),
+        };
 
         // ENOBUFS should be handled in userspace
         if retval == SystemError::ENOBUFS.to_posix_errno() || retval == SystemError::ESRCH.to_posix_errno() {

@@ -164,9 +164,10 @@ impl Timekeeper {
 
     #[inline]
     fn do_read_cpu_cycle_ns(&self) -> usize {
+        let prev = self.last_update_cpu_cycle.load(Ordering::SeqCst);
         CurrentTimeArch::cycles2ns(
             CurrentTimeArch::get_cycles()
-                .wrapping_sub(self.last_update_cpu_cycle.load(Ordering::SeqCst)),
+                .wrapping_sub(prev),
         )
     }
 
@@ -205,7 +206,7 @@ pub fn getnstimeofday() -> PosixTimeSpec {
                 drop(tk);
                 // 提供基于cpu周期数的ns时间，以便在两次update_wall_time之间提供更好的精度
                 let cpu_delta_ns = timekeeper().do_read_cpu_cycle_ns() as u64;
-
+                
                 // 尚未同步到xtime的时间
                 let tmp_delta_ns = __ADDED_USEC.load(Ordering::SeqCst) as u64 * 1000;
 

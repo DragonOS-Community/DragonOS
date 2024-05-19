@@ -157,12 +157,17 @@ impl ProcFSInode {
         };
         // 传入数据
         let pdata: &mut Vec<u8> = &mut pdata.data;
-
+	// name
         pdata.append(
             &mut format!("Name:\t{}", pcb.basic().name())
                 .as_bytes()
                 .to_owned(),
         );
+
+	// Umask
+	pdata.append(
+	    &mut format!("\nUmask:\t{}", pcb.umask()).into()
+	);
 
         let sched_info_guard = pcb.sched_info();
         let state = sched_info_guard.inner_lock_read_irqsave().state();
@@ -174,24 +179,84 @@ impl ProcFSInode {
         let priority = sched_info_guard.policy();
         let vrtime = sched_info_guard.sched_entity.vruntime;
 
+	//State
         pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
+
+	//Tgid
+	pdata.append(
+	    &mut format!("\nTgid:\t{}", pcb.tgid().into()).into()
+	);
+
+	//Ngid
+	pdata.append(
+	    &mut format!("\nNgid:\t{}", pcb.ngid().into()).into()
+	);
+
+	// pid
         pdata.append(
             &mut format!("\nPid:\t{}", pcb.pid().into())
                 .as_bytes()
                 .to_owned(),
         );
+
+	//ppid
         pdata.append(
             &mut format!("\nPpid:\t{}", pcb.basic().ppid().into())
                 .as_bytes()
                 .to_owned(),
         );
-        pdata.append(&mut format!("\ncpu_id:\t{}", cpu_id).as_bytes().to_owned());
+
+	//tracerpid
+	pdata.append(
+            &mut format!("\nTracerPid:\t{}", pcb.tracer_pid().into()).into()
+        );
+
+	//uid
+	pdata.append(
+            &mut format!("\nUid:\t{}\t{}\t{}\t{}", pcb.uid()[0],
+			 pcb.uid()[1],
+			 pcb.uid()[2],
+			 pcb.uid()[3]
+	    ).into()
+        );
+
+	//gid
+	pdata.append(
+            &mut format!("\nGid:\t{}\t{}\t{}\t{}", pcb.gid()[0],
+			 pcb.gid()[1],
+			 pcb.gid()[2],
+			 pcb.gid()[3]
+	    ).into()
+        );
+
+	//fdsize
+	pdata.append(
+            &mut format!("\nFDSize:\t{}", pcb.fdsize()).into()
+        );
+
+	//groups
+	pdata.append(
+            &mut format!("\ngroups:\t{}", pcb.groups()).into()
+        );
+
+	//kthread
+	pdata.append(
+	    &mut format!("\nKthread:\t{}", pcb.kthread()).into()
+	);
+	//
+	
+	
+
+	
+	pdata.append(&mut format!("\ncpu_id:\t{}", cpu_id).as_bytes().to_owned());
         pdata.append(&mut format!("\npriority:\t{:?}", priority).as_bytes().to_owned());
         pdata.append(
             &mut format!("\npreempt:\t{}", pcb.preempt_count())
                 .as_bytes()
                 .to_owned(),
         );
+
+	//
         pdata.append(&mut format!("\nvrtime:\t{}", vrtime).as_bytes().to_owned());
 
         if let Some(user_vm) = pcb.basic().user_vm() {

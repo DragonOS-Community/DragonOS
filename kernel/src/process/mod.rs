@@ -604,7 +604,30 @@ pub struct ProcessControlBlock {
     pid: Pid,
     /// 当前进程的线程组id（这个值在同一个线程组内永远不变）
     tgid: Pid,
+    /// Numa Groud Id
+    ngid: Pid,
 
+    ///进程默认权限掩码
+    umask: usize,
+
+    ///跟踪进程PID
+    tracer_pid: Pid,
+    ///用户id
+    uid: [usize;4],
+
+    ///组id
+    gid: [usize;4],
+
+    ///文件描述符数量
+    fdsize: usize,
+
+    ///附加组
+    groups: usize,
+
+    ///是否是内核进程
+    kthread: usize,
+
+    
     basic: RwLock<ProcessBasicInfo>,
     /// 当前进程的自旋锁持有计数
     preempt_count: AtomicUsize,
@@ -672,8 +695,55 @@ impl ProcessControlBlock {
         return Self::do_create_pcb(name, kstack, true);
     }
 
+    ///返回进程的umask 依赖于SYS_UMASK
+    pub fn umask(&self) ->usize {
+	return self.umask;
+    }
+
+    ///返回进程拥有的描述符数量
+    pub fn fdsize(&self) ->usize {
+	return (*self.basic().fd_table().unwrap().read()).size();
+    }
+
+    ///返回进程的uid
+    pub fn uid(&self) -> [usize;4] {
+	return self.uid;
+    }
+
+    ///返回进程的gid
+    pub fn gid(&self) -> [usize;4] {
+	return self.gid;
+    }
+    ///返回numa group id 一般为0
+    pub fn ngid(&self) -> Pid {
+	return self.ngid;
+    }
+    ///返回追踪进程pid
+    pub fn tracer_pid(&self) -> Pid {
+	return self.tracer_pid;
+    }
+
+    ///若该进程是内核进程返回1 否则0
+    pub fn kthread(&self) -> usize {
+	let flag = self.flags();
+	if flag == &mut ProcessFlags::KTHREAD {
+	    return 1;
+	}
+	return 0;
+    }
+
     #[inline(never)]
     fn do_create_pcb(name: String, kstack: KernelStack, is_idle: bool) -> Arc<Self> {
+	let groups = 0;
+	let kthread = 0;
+	let fdsize:usize = 0;
+	let tracer_pid = Pid(0);
+	//uid和gid默认为0
+	//用户
+	let (uid,gid) = ([0;4],[0;4]);
+	// umask默认为0022
+	//ptrace完成后需要修改 目前默认返回0
+	let umask: usize  = Syscall::umask(0022).unwrap();
         let (pid, ppid, cwd) = if is_idle {
             (Pid(0), Pid(0), "/".to_string())
         } else {
@@ -681,6 +751,7 @@ impl ProcessControlBlock {
             let cwd = ProcessManager::current_pcb().basic().cwd();
             (Self::generate_pid(), ppid, cwd)
         };
+	let ngid = Pid(0);
 
         let basic_info = ProcessBasicInfo::new(Pid(0), ppid, name, cwd, None);
         let preempt_count = AtomicUsize::new(0);
@@ -694,7 +765,15 @@ impl ProcessControlBlock {
             .unwrap_or_default();
 
         let pcb = Self {
+	    groups,
+	    fdsize,
+	    kthread,
             pid,
+	    uid,
+	    gid,
+	    ngid,
+	    umask,
+	    tracer_pid,
             tgid: pid,
             basic: basic_info,
             preempt_count,
@@ -765,6 +844,10 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn preempt_count(&self) -> usize {
         return self.preempt_count.load(Ordering::SeqCst);
+    }
+
+    pub fn groups(&self) -> usize {
+	return self.groups;
     }
 
     /// 增加当前进程的锁持有计数
@@ -1036,6 +1119,8 @@ pub struct ProcessBasicInfo {
     /// 进程的名字
     name: String,
 
+
+
     /// 当前进程的工作目录
     cwd: String,
 
@@ -1104,6 +1189,8 @@ impl ProcessBasicInfo {
     pub fn set_fd_table(&mut self, fd_table: Option<Arc<RwLock<FileDescriptorVec>>>) {
         self.fd_table = fd_table;
     }
+
+
 }
 
 #[derive(Debug)]

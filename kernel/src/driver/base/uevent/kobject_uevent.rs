@@ -42,7 +42,6 @@ Function
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use num::Zero;
-use smoltcp::socket::raw::PacketBuffer;
 use smoltcp::socket::raw::PacketMetadata;
 
 use crate::driver::base::kobject::{KObjectManager, KObjectState};
@@ -59,6 +58,7 @@ use crate::net::socket::netlink::af_netlink::netlink_has_listeners;
 use crate::net::socket::netlink::af_netlink::sock;
 use crate::net::socket::netlink::af_netlink::socktrait;
 use crate::net::socket::netlink::af_netlink::netlink_broadcast;
+use crate::net::socket::netlink::af_netlink::SkBuff;
 // 存放需要用到的全局变量
 pub static UEVENT_SEQNUM: u64 = 0;
 pub static UEVENT_SUPPRESS: i32 = 1;
@@ -78,6 +78,8 @@ pub static UEVENT_SUPPRESS: i32 = 1;
 // /* This lock protects uevent_seqnum and uevent_sock_list */
 // static DEFINE_MUTEX(uevent_sock_mutex);
 
+// to be adjust
+pub const BUFFERSIZE: usize = 666;
 pub struct ListHead {
     next: Option<Box<ListHead>>,
     prev: Option<Box<ListHead>>,
@@ -459,11 +461,9 @@ pub fn alloc_uevent_skb<'a>(
     env: &'a Box<KobjUeventEnv>,
     action_string: &'a String,
     devpath: &'a String,
-)->PacketBuffer<'a>
+)->SkBuff<'a>
 {
-    let skb: PacketBuffer = PacketBuffer::new(
-        vec![PacketMetadata::EMPTY; 666],
-        vec![0; 666],) ;
+    let skb: SkBuff = SkBuff::new() ;
     skb
 }
 pub fn uevent_net_broadcast_untagged(
@@ -473,15 +473,12 @@ pub fn uevent_net_broadcast_untagged(
 )->i32
 {
     let mut retval = 0;
-    let Buffersize: usize = 666;
-    let mut skb: PacketBuffer = PacketBuffer::new(
-        vec![PacketMetadata::EMPTY; Buffersize],
-        vec![0; 666],);
-    // 将 PacketBuffer 包装在 Arc 中，以便可以跨线程安全地共享
-    let shared_skb: Arc<RefCell<PacketBuffer>> = Arc::new(RefCell::new(skb));
-
+    let mut skb: SkBuff = SkBuff::new();
+    // 将 SkBuff 包装在 Arc 中，以便可以跨线程安全地共享
+    let shared_skb: Arc<RefCell<SkBuff>> = Arc::new(RefCell::new(skb));
+    let mut skb = shared_skb.borrow_mut();
     // 模拟 skb_get 行为，增加引用并返回引用
-    fn get_packet_buffer(shared_skb: Arc<RefCell<PacketBuffer>>) -> Arc<RefCell<PacketBuffer>> {
+    fn get_packet_buffer(shared_skb: Arc<RefCell<SkBuff>>) -> Arc<RefCell<SkBuff>> {
         // Rc::clone 会增加内部引用计数
         shared_skb.clone()
     }
@@ -495,7 +492,7 @@ pub fn uevent_net_broadcast_untagged(
 
         if skb.is_empty() {
             retval = SystemError::ENOMEM.to_posix_errno();
-            skb = alloc_uevent_skb(env, action_string, devpath);
+            *skb = alloc_uevent_skb(env, action_string, devpath);
             if skb.is_empty() {
                 continue;
             }

@@ -379,6 +379,33 @@ pub fn netlink_has_listeners(sk: &sock, group: u32) -> i32 {
     }
     res
 }
+pub struct SkBuff<'a> {
+    inner: PacketBuffer<'a>,
+}
+
+impl<'a> SkBuff<'a> {
+    pub fn new() -> Self {
+        Self {
+            inner: PacketBuffer::new(vec![PacketMetadata::EMPTY; 666],
+                vec![0; 666],) 
+        }
+    }
+    pub fn inner(&self) -> &PacketBuffer<'a> {
+        &self.inner
+    }
+    pub fn inner_mut(&mut self) -> &mut PacketBuffer<'a> {
+        &mut self.inner
+    }
+    pub fn clone_with_new_inner(&self) -> Self {
+        Self {
+            inner: PacketBuffer::new(vec![PacketMetadata::EMPTY; 666],
+                vec![0; 666],) 
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
 struct NetlinkBroadcastData<'a> {
 	exclude_sk:&'a sock,
     // net: &'a Net,
@@ -389,13 +416,19 @@ struct NetlinkBroadcastData<'a> {
 	congested:i32,
 	delivered:i32,
     allocation:u32,
-	skb:Arc<RefCell<PacketBuffer<'a>>>,
-    skb_2:Arc<RefCell<PacketBuffer<'a>>>,
+	skb:Arc<RefCell<SkBuff<'a>>>,
+    skb_2:Arc<RefCell<SkBuff<'a>>>,
+}
+impl<'a> NetlinkBroadcastData<'a> {
+    pub fn copy_skb_to_skb_2(&mut self){
+        let skb = self.skb.borrow().clone_with_new_inner();
+        *self.skb_2.borrow_mut() = skb;
+    }
 }
 fn sk_for_each_bound(sk: &sock, mc_list: &HListHead<NetlinkSock>) {
     let mut node = mc_list.first.as_ref();
     while let Some(n) = node {
-        let data = n.data;
+        let data = &n.data;
         if data.sk.sk_protocol == sk.sk_protocol {
             // Implementation of the function
         }
@@ -485,7 +518,7 @@ fn do_one_broadcast(sk: &sock, info: &NetlinkBroadcastData) {
     }
 
 }
-pub fn netlink_broadcast(ssk: &sock, skb: Arc<RefCell<PacketBuffer>>, portid: u32, group: u32, allocation: u32) -> Result<(), SystemError> {
+pub fn netlink_broadcast<'a>(ssk: &'a sock, skb: Arc<RefCell<SkBuff<'a>>>, portid: u32, group: u32, allocation: u32) -> Result<(), SystemError> {
     // let net = sock_net(ssk);
     let mut info = NetlinkBroadcastData {
         exclude_sk: ssk,
@@ -498,14 +531,15 @@ pub fn netlink_broadcast(ssk: &sock, skb: Arc<RefCell<PacketBuffer>>, portid: u3
         delivered: 0,
         allocation,
         skb,
-        skb_2:skb,
+        skb_2: Arc::new(RefCell::new(SkBuff::new())),
     };
-    let sk: &sock;
 
     // While we sleep in clone, do not allow to change socket list
     let nl_table = NL_TABLE.read();
-    sk_for_each_bound(sk, &nl_table[ssk.sk_protocol].mc_list);
+    for sk in &nl_table[ssk.sk_protocol].mc_list {
         do_one_broadcast(sk, &info);
+    }
+    
 
     // consume_skb(skb);
 

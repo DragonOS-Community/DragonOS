@@ -382,12 +382,12 @@ pub struct InnerIrqDesc {
     threads_oneshot: u64,
 }
 
+#[allow(dead_code)]
 impl InnerIrqDesc {
     pub fn name(&self) -> Option<&String> {
         self.name.as_ref()
     }
 
-    #[allow(dead_code)]
     pub fn set_name(&mut self, name: Option<String>) {
         self.name = name;
     }
@@ -396,22 +396,18 @@ impl InnerIrqDesc {
         !self.line_status.contains(IrqLineStatus::IRQ_NOREQUEST)
     }
 
-    #[allow(dead_code)]
     pub fn set_norequest(&mut self) {
         self.line_status.insert(IrqLineStatus::IRQ_NOREQUEST);
     }
 
-    #[allow(dead_code)]
     pub fn clear_norequest(&mut self) {
         self.line_status.remove(IrqLineStatus::IRQ_NOREQUEST);
     }
 
-    #[allow(dead_code)]
     pub fn set_noprobe(&mut self) {
         self.line_status.insert(IrqLineStatus::IRQ_NOPROBE);
     }
 
-    #[allow(dead_code)]
     pub fn clear_noprobe(&mut self) {
         self.line_status.remove(IrqLineStatus::IRQ_NOPROBE);
     }
@@ -432,12 +428,10 @@ impl InnerIrqDesc {
         self.line_status.insert(IrqLineStatus::IRQ_PER_CPU);
     }
 
-    #[allow(dead_code)]
     pub fn line_status_clear_per_cpu(&mut self) {
         self.line_status.remove(IrqLineStatus::IRQ_PER_CPU);
     }
 
-    #[allow(dead_code)]
     pub fn line_status(&self) -> &IrqLineStatus {
         &self.line_status
     }
@@ -446,7 +440,6 @@ impl InnerIrqDesc {
         self.line_status.insert(IrqLineStatus::IRQ_NO_BALANCING);
     }
 
-    #[allow(dead_code)]
     pub fn line_status_clear_no_debug(&mut self) {
         self.line_status.remove(IrqLineStatus::IRQ_NO_BALANCING);
     }
@@ -919,7 +912,6 @@ impl IrqDescManager {
     }
 
     /// 查找中断描述符并锁定总线(没有对irqdesc进行加锁)
-    #[allow(dead_code)]
     pub fn lookup_and_lock_bus(
         &self,
         irq: IrqNumber,
@@ -973,6 +965,7 @@ impl IrqDescManager {
     }
 
     /// 设置指定irq的可用cpu为所有cpu
+    #[allow(dead_code)]
     pub fn set_percpu_devid_all(&self, irq: IrqNumber) -> Result<(), SystemError> {
         self.set_percpu_devid(irq, None)
     }
@@ -980,6 +973,7 @@ impl IrqDescManager {
     /// 设置指定irq的可用cpu
     ///
     /// 如果affinity为None，则表示设置为所有cpu
+    #[allow(dead_code)]
     pub fn set_percpu_devid(
         &self,
         irq: IrqNumber,

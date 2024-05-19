@@ -54,6 +54,7 @@ pub struct InnerOpenFirmwareFdtDriver {
     fdt_map_guard: Option<MMIOSpaceGuard>,
 }
 
+#[allow(dead_code)]
 impl OpenFirmwareFdtDriver {
     const fn new() -> Self {
         Self {

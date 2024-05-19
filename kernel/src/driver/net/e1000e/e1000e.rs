@@ -795,6 +795,7 @@ pub enum E1000EPciError {
     // BAR的大小与预期不符(128KB)
     // Size of BAR is not 128KB
     UnexpectedBarSize,
+    #[allow(dead_code)]
     Pci(PciError),
 }
 

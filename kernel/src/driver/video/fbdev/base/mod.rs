@@ -301,6 +301,7 @@ impl FrameBufferInfoData {
 }
 
 /// 帧缓冲区信息
+#[allow(dead_code)]
 pub trait FrameBufferInfo: FrameBufferOps {
     fn framebuffer_info_data(&self) -> &RwLock<FrameBufferInfoData>;
 
@@ -1066,7 +1067,9 @@ pub enum FbAccel {
 
 #[derive(Debug, Copy, Clone)]
 pub struct BootTimeScreenInfo {
+    #[allow(dead_code)]
     pub origin_x: u8,
+    #[allow(dead_code)]
     pub origin_y: u8,
     /// text mode时，每行的字符数
     pub origin_video_cols: u8,

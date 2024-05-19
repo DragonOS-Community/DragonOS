@@ -1207,6 +1207,7 @@ impl Drop for LockedVMA {
 /// VMA切分结果
 pub struct VMASplitResult {
     pub prev: Option<Arc<LockedVMA>>,
+    #[allow(dead_code)]
     pub middle: Arc<LockedVMA>,
     pub after: Option<Arc<LockedVMA>>,
 }

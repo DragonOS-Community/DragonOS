@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
+use alloc::{collections::BTreeMap, sync::Arc};
 use log::{debug, info, warn};
 use smoltcp::{socket::dhcpv4, wire};
 use system_error::SystemError;
@@ -7,29 +7,12 @@ use crate::{
     driver::net::NetDevice,
     libs::rwlock::RwLockReadGuard,
     net::{socket::SocketPollMethod, NET_DEVICES},
-    time::timer::{next_n_ms_timer_jiffies, Timer, TimerFunction},
 };
 
 use super::{
     event_poll::{EPollEventType, EventPoll},
     socket::{handle::GlobalSocketHandle, inet::TcpSocket, HANDLE_MAP, SOCKET_SET},
 };
-
-/// The network poll function, which will be called by timer.
-///
-/// The main purpose of this function is to poll all network interfaces.
-#[derive(Debug)]
-struct NetWorkPollFunc;
-
-impl TimerFunction for NetWorkPollFunc {
-    fn run(&mut self) -> Result<(), SystemError> {
-        poll_ifaces_try_lock(10).ok();
-        let next_time = next_n_ms_timer_jiffies(10);
-        let timer = Timer::new(Box::new(NetWorkPollFunc), next_time);
-        timer.activate();
-        return Ok(());
-    }
-}
 
 pub fn net_init() -> Result<(), SystemError> {
     dhcp_query()?;
@@ -136,6 +119,7 @@ pub fn poll_ifaces() {
 /// @return 轮询成功，返回Ok(())
 /// @return 加锁超时，返回SystemError::EAGAIN_OR_EWOULDBLOCK
 /// @return 没有网卡，返回SystemError::ENODEV
+#[allow(dead_code)]
 pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
     let mut i = 0;
     while i < times {

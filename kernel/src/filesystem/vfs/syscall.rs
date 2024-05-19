@@ -390,6 +390,7 @@ impl PosixOpenHow {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct OpenHow {
     pub o_flags: FileMode,

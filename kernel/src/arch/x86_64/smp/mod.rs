@@ -1,5 +1,8 @@
 use core::{
-    arch::asm, hint::spin_loop, ptr::addr_of_mut, sync::atomic::{compiler_fence, fence, AtomicBool, Ordering}
+    arch::asm,
+    hint::spin_loop,
+    ptr::addr_of_mut,
+    sync::atomic::{compiler_fence, fence, AtomicBool, Ordering},
 };
 
 use kdepends::memoffset::offset_of;

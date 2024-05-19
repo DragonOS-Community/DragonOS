@@ -338,6 +338,7 @@ impl InnerIrqCommonData {
         self.state.remove(status);
     }
 
+    #[allow(dead_code)]
     pub fn set_handler_data(&mut self, handler_data: Option<Arc<dyn IrqHandlerData>>) {
         self.handler_data = handler_data;
     }

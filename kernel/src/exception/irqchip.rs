@@ -35,6 +35,7 @@ use super::{
 };
 
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irq.h#506
+#[allow(dead_code)]
 pub trait IrqChip: Sync + Send + Any + Debug {
     fn name(&self) -> &'static str;
     /// start up the interrupt (defaults to ->enable if ENOSYS)
@@ -282,6 +283,7 @@ struct InnerIrqChipGeneric {
     chip_types: Vec<IrqChipType>,
 }
 
+#[allow(dead_code)]
 pub trait IrqChipGenericOps: Debug + Send + Sync {
     /// Alternate I/O accessor (defaults to readl if NULL)
     unsafe fn reg_readl(&self, addr: VirtAddr) -> u32;
@@ -514,6 +516,7 @@ impl IrqManager {
         return;
     }
 
+    #[allow(dead_code)]
     pub fn irq_set_handler_data(
         &self,
         irq: IrqNumber,

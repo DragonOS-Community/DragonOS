@@ -1,4 +1,5 @@
 /// @brief 由bindgen生成的结构体转换成rust原生定义的结构体的特性
+#[allow(dead_code)]
 pub trait FFIBind2Rust<T> {
     /// 转换为不可变引用
     fn convert_ref(src: *const T) -> Option<&'static Self>;

@@ -181,6 +181,7 @@ impl FrameBufferManager {
     }
 
     /// 根据id查找帧缓冲区
+    #[allow(dead_code)]
     pub fn find_fb_by_id(&self, id: FbId) -> Result<Option<Arc<dyn FrameBuffer>>, SystemError> {
         if unlikely(!id.is_valid()) {
             return Err(SystemError::EINVAL);

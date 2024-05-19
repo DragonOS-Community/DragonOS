@@ -25,6 +25,7 @@ pub struct Vm {
     pub nr_mem_slots: u32, /* Number of memory slots in each address space */
     pub memslots: [KvmMemorySlots; KVM_ADDRESS_SPACE_NUM],
     // arch related config
+    #[allow(dead_code)]
     pub arch: KVMArch,
 }
 

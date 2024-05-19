@@ -343,6 +343,7 @@ impl Attribute for AttrCursorBlink {
 #[derive(Debug, Default)]
 pub struct FrameBufferConsoleData {
     /// 光标闪烁间隔
+    #[allow(dead_code)]
     pub cursor_blink_jiffies: i64,
     /// 是否刷新光标
     pub cursor_flash: bool,

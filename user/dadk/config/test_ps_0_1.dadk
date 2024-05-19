@@ -1,0 +1,28 @@
+{
+  "name": "test_ps",
+  "version": "0.1",
+  "description": "a simple procps",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "/home/rustup/DragonOS/user/apps/test_ps"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "install": {
+    "in_dragonos_path": "/bin"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "envs": [],
+  "build_once": false,
+  "install_once": false,
+  "target_arch": [
+    "x86_64"
+  ]
+}

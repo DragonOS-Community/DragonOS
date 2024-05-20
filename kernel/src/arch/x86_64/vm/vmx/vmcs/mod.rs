@@ -1,6 +1,14 @@
 use alloc::{boxed::Box, collections::LinkedList, sync::Arc, vec::Vec};
 use bitmap::{traits::BitMapOps, AllocBitmap};
 use system_error::SystemError;
+use x86::{
+    controlregs::Cr4,
+    vmx::vmcs::{
+        control::{self, PrimaryControls},
+        guest,
+    },
+};
+use x86_64::registers::control::{Cr3, Cr3Flags};
 
 use crate::{
     arch::{vm::asm::VmxAsm, MMArch},
@@ -106,10 +114,10 @@ impl LockedVMControlStructure {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct VmcsHostState {
-    pub cr3: usize,
-    pub cr4: usize,
+    pub cr3: Cr3Flags,
+    pub cr4: Cr4,
     pub gs_base: usize,
     pub fs_base: usize,
     pub rsp: usize,
@@ -120,6 +128,23 @@ pub struct VmcsHostState {
     pub rs_sel: u16,
 }
 
+impl Default for VmcsHostState {
+    fn default() -> Self {
+        Self {
+            cr3: Cr3Flags::empty(),
+            cr4: Cr4::empty(),
+            gs_base: 0,
+            fs_base: 0,
+            rsp: 0,
+            fs_sel: 0,
+            gs_sel: 0,
+            ldt_sel: 0,
+            ds_sel: 0,
+            rs_sel: 0,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct VmcsControlsShadow {
     vm_entry: u32,
@@ -127,7 +152,7 @@ pub struct VmcsControlsShadow {
     pin: u32,
     exec: u32,
     secondary_exec: u32,
-    tertiary_exec: u32,
+    tertiary_exec: u64,
 }
 
 #[derive(Debug)]
@@ -142,7 +167,7 @@ pub struct LoadedVmcs {
     /// Hypervisor 定时器是否被软禁用
     hv_timer_soft_disabled: bool,
     /// 支持 vnmi-less CPU 的字段，指示 VNMI 是否被软阻止
-    soft_vnmi_blocked: bool,
+    pub soft_vnmi_blocked: bool,
     /// 记录 VM 进入时间
     entry_time: u64,
     /// 记录 VNMI 被阻止的时间
@@ -150,14 +175,100 @@ pub struct LoadedVmcs {
     /// msr位图
     pub msr_bitmap: VmxMsrBitmap,
     /// 保存 VMCS 主机状态的结构体
-    host_state: VmcsHostState,
+    pub host_state: VmcsHostState,
     /// 保存 VMCS 控制字段的shadow状态的结构体。
     controls_shadow: VmcsControlsShadow,
+}
+
+impl LoadedVmcs {
+    pub fn controls_set(&mut self, ctl_type: ControlsType, value: u64) {
+        match ctl_type {
+            ControlsType::VmEntry => {
+                if self.controls_shadow.vm_entry != value as u32 {
+                    VmxAsm::vmx_vmwrite(control::VMENTRY_CONTROLS, value);
+                    self.controls_shadow.vm_entry = value as u32;
+                }
+            }
+            ControlsType::VmExit => {
+                if self.controls_shadow.vm_exit != value as u32 {
+                    VmxAsm::vmx_vmwrite(control::VMEXIT_CONTROLS, value);
+                    self.controls_shadow.vm_exit = value as u32;
+                }
+            }
+            ControlsType::Pin => {
+                if self.controls_shadow.pin != value as u32 {
+                    VmxAsm::vmx_vmwrite(control::PINBASED_EXEC_CONTROLS, value);
+                    self.controls_shadow.pin = value as u32;
+                }
+            }
+            ControlsType::Exec => {
+                if self.controls_shadow.exec != value as u32 {
+                    VmxAsm::vmx_vmwrite(control::PRIMARY_PROCBASED_EXEC_CONTROLS, value);
+                    self.controls_shadow.exec = value as u32;
+                }
+            }
+            ControlsType::SecondaryExec => {
+                if self.controls_shadow.secondary_exec != value as u32 {
+                    VmxAsm::vmx_vmwrite(control::SECONDARY_PROCBASED_EXEC_CONTROLS, value);
+                    self.controls_shadow.secondary_exec = value as u32;
+                }
+            }
+            ControlsType::TertiaryExec => {
+                if self.controls_shadow.tertiary_exec != value {
+                    VmxAsm::vmx_vmwrite(0x2034, value);
+                    self.controls_shadow.tertiary_exec = value;
+                }
+            }
+        }
+    }
+
+    pub fn controls_get(&self, ctl_type: ControlsType) -> u64 {
+        match ctl_type {
+            ControlsType::VmEntry => self.controls_shadow.vm_entry as u64,
+            ControlsType::VmExit => self.controls_shadow.vm_exit as u64,
+            ControlsType::Pin => self.controls_shadow.pin as u64,
+            ControlsType::Exec => self.controls_shadow.exec as u64,
+            ControlsType::SecondaryExec => self.controls_shadow.secondary_exec as u64,
+            ControlsType::TertiaryExec => self.controls_shadow.tertiary_exec,
+        }
+    }
+
+    pub fn controls_setbit(&mut self, ctl_type: ControlsType, value: u64) {
+        let val = self.controls_get(ctl_type) | value;
+        self.controls_set(ctl_type, val)
+    }
+
+    pub fn controls_clearbit(&mut self, ctl_type: ControlsType, value: u64) {
+        let val = self.controls_get(ctl_type) & (!value);
+        self.controls_set(ctl_type, val)
+    }
+
+    pub fn msr_write_intercepted(&mut self, msr: u32) -> bool {
+        if PrimaryControls::from_bits_truncate(self.controls_get(ControlsType::Exec) as u32)
+            .contains(PrimaryControls::USE_MSR_BITMAPS)
+        {
+            return true;
+        }
+
+        return self
+            .msr_bitmap
+            .ctl(msr, VmxMsrBitmapAction::Test, VmxMsrBitmapAccess::Write);
+    }
 }
 
 #[derive(Debug)]
 pub struct LockedLoadedVmcs {
     inner: SpinLock<LoadedVmcs>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ControlsType {
+    VmEntry,
+    VmExit,
+    Pin,
+    Exec,
+    SecondaryExec,
+    TertiaryExec,
 }
 
 impl LockedLoadedVmcs {
@@ -198,6 +309,7 @@ impl LockedLoadedVmcs {
 #[derive(Debug)]
 pub struct VmxMsrBitmap {
     data: AllocBitmap,
+    phys_addr: usize,
 }
 
 pub enum VmxMsrBitmapAction {
@@ -224,7 +336,16 @@ impl VmxMsrBitmap {
     pub fn new(init_val: bool, size: usize) -> Self {
         let mut data = AllocBitmap::new(size);
         data.set_all(init_val);
-        Self { data }
+
+        let addr = data.data() as *const [usize] as *const usize as usize;
+        Self {
+            data,
+            phys_addr: virt_2_phys(addr),
+        }
+    }
+
+    pub fn phys_addr(&self) -> usize {
+        self.phys_addr
     }
 
     pub fn ctl(

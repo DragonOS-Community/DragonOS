@@ -1,60 +1,80 @@
-use core::intrinsics::unlikely;
+use core::{arch::x86_64::_xsetbv, intrinsics::unlikely};
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use bitmap::{traits::BitMapOps, AllocBitmap, StaticBitmap};
+use bitmap::{traits::BitMapOps, AllocBitmap, BitMapCore, StaticBitmap};
 use raw_cpuid::CpuId;
 use system_error::SystemError;
 use x86::{
     bits64::rflags::RFlags,
-    controlregs::{Cr0, Cr4},
+    controlregs::{Cr0, Cr4, Xcr0},
+    dtables::DescriptorTablePointer,
     msr::{
-        IA32_APIC_BASE, IA32_CSTAR, IA32_FS_BASE, IA32_GS_BASE, IA32_KERNEL_GSBASE, IA32_LSTAR,
-        IA32_SYSENTER_EIP, IA32_SYSENTER_ESP, IA32_TSC_AUX,
+        self, wrmsr, IA32_APIC_BASE, IA32_CSTAR, IA32_FS_BASE, IA32_GS_BASE, IA32_KERNEL_GSBASE,
+        IA32_LSTAR, IA32_SYSENTER_EIP, IA32_SYSENTER_ESP, IA32_TSC_AUX,
     },
+    vmx::vmcs::control::SecondaryControls,
 };
-use x86_64::registers::control::EferFlags;
+use x86_64::registers::{control::EferFlags, xcontrol::XCr0Flags};
 
 use crate::{
     arch::{
         kvm_arch_ops,
         vm::{
-            asm::{KvmX86Asm, MiscEnable, MsrData},
+            asm::{
+                hyperv, kvm_msr, KvmX86Asm, MiscEnable, MsrData, SegmentCacheField, VcpuSegment,
+            },
             cpuid::KvmCpuidEntry2,
             kvm_host::KvmReg,
             mmu::{KvmMmu, LockedKvmMmu},
-            vmx::vmcs::LoadedVmcs,
+            uapi::{UapiKvmSegmentRegs, KVM_SYNC_X86_VALID_FIELDS},
+            vmx::{
+                vmcs::{ControlsType, LoadedVmcs},
+                vmx_info, VmxVCpuPriv,
+            },
             x86_kvm_manager, x86_kvm_manager_mut, x86_kvm_ops,
         },
     },
     kdebug, kerror,
     mm::{PhysAddr, VirtAddr},
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
-    virt::vm::kvm_host::{
-        mem::GfnToHvaCache,
-        vcpu::{GuestDebug, VirtCpu},
-        LockedVm, MutilProcessorState, Vm,
+    virt::vm::{
+        kvm_host::{
+            mem::GfnToHvaCache,
+            vcpu::{GuestDebug, VirtCpu},
+            LockedVm, MutilProcessorState, Vm,
+        },
+        user_api::{UapiKvmRun, UapiKvmSegment},
     },
 };
 
-use super::{HFlags, KvmCommonRegs, KvmIrqChipMode};
+use super::{lapic::KvmLapic, HFlags, KvmCommonRegs, KvmIrqChipMode};
 
 #[derive(Debug)]
 pub struct X86VcpuArch {
     /// 最近一次尝试进入虚拟机的主机cpu
     last_vmentry_cpu: ProcessorId,
-    /// 可用寄存器数量
+    /// 可用寄存器位图
     regs_avail: AllocBitmap,
-    /// 脏寄存器数量
+    /// 脏寄存器位图
     regs_dirty: AllocBitmap,
     /// 多处理器状态
     mp_state: MutilProcessorState,
     pub apic_base: u64,
     /// apic
-    pub apic: Option<()>,
+    pub apic: Option<KvmLapic>,
     /// 主机pkru寄存器
     host_pkru: u32,
+    pkru: u32,
     /// hflag
     hflags: HFlags,
+
+    pub microcode_version: u64,
+
+    arch_capabilities: u64,
+
+    perf_capabilities: u64,
+
+    ia32_xss: u64,
 
     pub guest_state_protected: bool,
 
@@ -63,6 +83,9 @@ pub struct X86VcpuArch {
     pub exception: KvmQueuedException,
     pub exception_vmexit: KvmQueuedException,
     pub apf: KvmAsyncPageFault,
+
+    pub emulate_regs_need_sync_from_vcpu: bool,
+    pub emulate_regs_need_sync_to_vcpu: bool,
 
     pub smbase: u64,
 
@@ -78,17 +101,21 @@ pub struct X86VcpuArch {
 
     pub max_phyaddr: usize,
 
+    pub pat: u64,
+
     pub regs: [u64; KvmReg::NrVcpuRegs as usize],
 
     pub cr0: Cr0,
     pub cr0_guest_owned_bits: Cr0,
-    pub cr2: usize,
-    pub cr3: usize,
+    pub cr2: u64,
+    pub cr3: u64,
     pub cr4: Cr4,
     pub cr4_guest_owned_bits: Cr4,
-    pub cr4_guest_rsvd_bits: usize,
-    pub cr8: usize,
+    pub cr4_guest_rsvd_bits: Cr4,
+    pub cr8: u64,
     pub efer: EferFlags,
+
+    pub xcr0: Xcr0,
 
     pub dr6: usize,
     pub dr7: usize,
@@ -105,6 +132,8 @@ pub struct X86VcpuArch {
     pub nmi_pending: u32,
     pub nmi_injected: bool,
 
+    pub xfd_no_write_intercept: bool,
+
     pub db: [usize; Self::KVM_NR_DB_REGS],
 }
 
@@ -118,7 +147,17 @@ impl X86VcpuArch {
         ret.regs_avail = AllocBitmap::new(32);
         ret.regs_dirty = AllocBitmap::new(32);
         ret.mp_state = MutilProcessorState::Runnable;
+
+        ret.apic = None;
         *ret
+    }
+
+    pub fn clear_dirty(&mut self) {
+        self.regs_dirty.set_all(false);
+    }
+
+    pub fn vcpu_apicv_active(&self) -> bool {
+        self.lapic_in_kernel() && self.lapic().apicv_active
     }
 
     pub fn lapic_in_kernel(&self) -> bool {
@@ -126,6 +165,21 @@ impl X86VcpuArch {
             return self.apic.is_some();
         }
         true
+    }
+
+    pub fn is_bsp(&self) -> bool {
+        return self.apic_base & IA32_APIC_BASE as u64 != 0;
+    }
+
+    #[inline]
+    pub fn lapic(&self) -> &KvmLapic {
+        self.apic.as_ref().unwrap()
+    }
+
+    pub fn queue_interrupt(&mut self, vec: u8, soft: bool) {
+        self.interrupt.injected = true;
+        self.interrupt.soft = soft;
+        self.interrupt.nr = vec;
     }
 
     pub fn read_cr0_bits(&mut self, mask: Cr0) -> Cr0 {
@@ -165,6 +219,14 @@ impl X86VcpuArch {
         return self.cr4 & mask;
     }
 
+    pub fn get_cr8(&self) -> u64 {
+        if self.lapic_in_kernel() {
+            todo!()
+        } else {
+            return self.cr8;
+        }
+    }
+
     #[inline]
     pub fn is_smm(&self) -> bool {
         self.hflags.contains(HFlags::HF_SMM_MASK)
@@ -173,6 +235,16 @@ impl X86VcpuArch {
     #[inline]
     pub fn is_guest_mode(&self) -> bool {
         self.hflags.contains(HFlags::HF_GUEST_MASK)
+    }
+
+    #[inline]
+    pub fn is_long_mode(&self) -> bool {
+        self.efer.contains(EferFlags::LONG_MODE_ACTIVE)
+    }
+
+    #[inline]
+    pub fn is_portected_mode(&mut self) -> bool {
+        !self.read_cr0_bits(Cr0::CR0_PROTECTED_MODE).is_empty()
     }
 
     #[inline]
@@ -187,40 +259,6 @@ impl X86VcpuArch {
         self.exception_vmexit.pending = false;
     }
 
-    pub fn set_msr(&mut self, index: u32, data: u64, host_initiated: bool) {
-        match index {
-            IA32_FS_BASE | IA32_GS_BASE | IA32_KERNEL_GSBASE | IA32_CSTAR | IA32_LSTAR => {
-                if VirtAddr::new(data as usize).is_canonical() {
-                    return;
-                }
-            }
-
-            IA32_SYSENTER_EIP | IA32_SYSENTER_ESP => {
-                // 需要将Data转为合法地址，但是现在先这样写
-                assert!(VirtAddr::new(data as usize).is_canonical());
-            }
-            IA32_TSC_AUX => {
-                if x86_kvm_manager()
-                    .find_user_return_msr_idx(IA32_TSC_AUX)
-                    .is_none()
-                {
-                    return;
-                }
-
-                todo!()
-            }
-            _ => {}
-        }
-
-        let msr_data = MsrData {
-            host_initiated,
-            index,
-            data,
-        };
-
-        return kvm_arch_ops().set_msr(self, msr_data);
-    }
-
     pub fn update_cpuid_runtime(&mut self, entries: &Vec<KvmCpuidEntry2>) {
         let cpuid = CpuId::new();
         let feat = cpuid.get_feature_info().unwrap();
@@ -233,29 +271,44 @@ impl X86VcpuArch {
     }
 
     #[inline]
-    fn mark_register_dirty(&mut self, reg: KvmReg) {
+    pub fn mark_register_dirty(&mut self, reg: KvmReg) {
         self.regs_avail.set(reg as usize, true);
         self.regs_dirty.set(reg as usize, true);
     }
 
     #[inline]
-    fn write_reg(&mut self, reg: KvmReg, data: u64) {
+    pub fn mark_register_available(&mut self, reg: KvmReg) {
+        self.regs_avail.set(reg as usize, true);
+    }
+
+    #[inline]
+    pub fn is_register_dirty(&self, reg: KvmReg) -> bool {
+        self.regs_dirty.get(reg as usize).unwrap()
+    }
+
+    #[inline]
+    pub fn is_register_available(&self, reg: KvmReg) -> bool {
+        self.regs_avail.get(reg as usize).unwrap()
+    }
+
+    #[inline]
+    pub fn write_reg(&mut self, reg: KvmReg, data: u64) {
         self.regs[reg as usize] = data;
     }
 
     #[inline]
-    fn write_reg_raw(&mut self, reg: KvmReg, data: u64) {
+    pub fn write_reg_raw(&mut self, reg: KvmReg, data: u64) {
         self.regs[reg as usize] = data;
         self.mark_register_dirty(reg);
     }
 
     #[inline]
-    fn read_reg(&self, reg: KvmReg) -> u64 {
+    pub fn read_reg(&self, reg: KvmReg) -> u64 {
         return self.regs[reg as usize];
     }
 
     #[inline]
-    fn read_reg_raw(&self, reg: KvmReg) -> u64 {
+    pub fn read_reg_raw(&mut self, reg: KvmReg) -> u64 {
         if self.regs_avail.get(reg as usize) == Some(true) {
             kvm_arch_ops().cache_reg(self, reg);
         }
@@ -270,10 +323,236 @@ impl X86VcpuArch {
         }
         return self.read_reg_raw(KvmReg::VcpuRegsRip);
     }
+
+    pub fn set_msr_common(&mut self, msr_info: &MsrData) {
+        let msr = msr_info.index;
+        let data = msr_info.data;
+
+        match msr {
+            // MSR_AMD64_NB_CFG
+            0xc001001f => {
+                return;
+            }
+            // MSR_VM_HSAVE_PA
+            0xc0010117 => {
+                return;
+            }
+            // MSR_AMD64_PATCH_LOADER
+            0xc0010020 => {
+                return;
+            }
+            // MSR_AMD64_BU_CFG2
+            0xc001102a => {
+                return;
+            }
+            // MSR_AMD64_DC_CFG
+            0xc0011022 => {
+                return;
+            }
+            // MSR_AMD64_TW_CFG
+            0xc0011023 => {
+                return;
+            }
+            // MSR_F15H_EX_CFG
+            0xc001102c => {
+                return;
+            }
+            msr::IA32_BIOS_UPDT_TRIG => {
+                return;
+            }
+            msr::IA32_BIOS_SIGN_ID => {
+                // MSR_IA32_UCODE_REV
+                if msr_info.host_initiated {
+                    self.microcode_version = data;
+                }
+                return;
+            }
+            // MSR_IA32_ARCH_CAPABILITIES
+            0x0000010a => {
+                if !msr_info.host_initiated {
+                    return;
+                }
+
+                self.arch_capabilities = data;
+            }
+            msr::MSR_PERF_CAPABILITIES => {
+                if !msr_info.host_initiated {
+                    return;
+                }
+
+                if data & (!x86_kvm_manager().kvm_caps.supported_perf_cap) != 0 {
+                    return;
+                }
+
+                if self.perf_capabilities == data {
+                    return;
+                }
+
+                self.perf_capabilities = data;
+                // todo: kvm_pmu_refresh
+                return;
+            }
+            // MSR_IA32_FLUSH_CMD
+            0x0000010b => {
+                todo!()
+            }
+            msr::IA32_EFER => {
+                todo!()
+            }
+            // MSR_K7_HWCR
+            0xc0010015 => {
+                todo!()
+            }
+            // MSR_FAM10H_MMIO_CONF_BASE
+            0xc0010058 => {
+                todo!()
+            }
+            msr::IA32_PAT => {
+                todo!()
+            }
+            // MTRRphysBase_MSR(0) ... MSR_MTRRfix4K_F8000 | MSR_MTRRdefType
+            0x200..=0x26f | 0x2ff => {
+                todo!()
+            }
+            msr::APIC_BASE => {
+                todo!()
+            }
+            // APIC_BASE_MSR ... APIC_BASE_MSR + 0xff
+            0x800..=0x8ff => {
+                todo!()
+            }
+            msr::IA32_TSC_DEADLINE => {
+                todo!()
+            }
+            msr::IA32_TSC_ADJUST => {
+                todo!()
+            }
+            msr::IA32_MISC_ENABLE => {
+                todo!()
+            }
+            msr::IA32_SMBASE => {
+                todo!()
+            }
+            msr::TSC => {
+                todo!()
+            }
+            // MSR_IA32_XSS
+            msr::MSR_C5_PMON_BOX_CTRL => {
+                if !msr_info.host_initiated {
+                    return;
+                }
+                if data & (!x86_kvm_manager().kvm_caps.supported_xss) != 0 {
+                    return;
+                }
+
+                self.ia32_xss = data;
+                // TODO:kvm_update_cpuid_runtime
+                return;
+            }
+            msr::MSR_SMI_COUNT => {
+                todo!()
+            }
+            kvm_msr::MSR_KVM_WALL_CLOCK_NEW => {
+                todo!()
+            }
+            kvm_msr::MSR_KVM_WALL_CLOCK => {
+                todo!()
+            }
+            kvm_msr::MSR_KVM_SYSTEM_TIME => {
+                todo!()
+            }
+            kvm_msr::MSR_KVM_ASYNC_PF_EN => {
+                todo!()
+            }
+            kvm_msr::MSR_KVM_ASYNC_PF_INT => {
+                todo!()
+            }
+            kvm_msr::MSR_KVM_ASYNC_PF_ACK => {
+                todo!()
+            }
+            kvm_msr::MSR_KVM_STEAL_TIME => {
+                todo!()
+            }
+            kvm_msr::MSR_KVM_PV_EOI_EN => {
+                todo!()
+            }
+            kvm_msr::MSR_KVM_POLL_CONTROL => {
+                todo!()
+            }
+            msr::MCG_CTL
+            | msr::MCG_STATUS
+            | msr::MC0_CTL..=msr::MSR_MC26_MISC
+            | msr::IA32_MC0_CTL2..=msr::IA32_MC21_CTL2 => {
+                todo!()
+            }
+            // MSR_K7_PERFCTR0 ... MSR_K7_PERFCTR3
+            // MSR_K7_PERFCTR0 ... MSR_K7_PERFCTR3
+            // MSR_K7_EVNTSEL0 ... MSR_K7_EVNTSEL3
+            // MSR_P6_EVNTSEL0 ... MSR_P6_EVNTSEL1
+            0xc0010004..=0xc0010007
+            | 0xc1..=0xc2
+            | 0xc0010000..=0xc0010003
+            | 0x00000186..=0x00000187 => {
+                todo!()
+            }
+
+            // MSR_K7_CLK_CTL
+            0xc001001b => {
+                return;
+            }
+
+            hyperv::HV_X64_MSR_GUEST_OS_ID..=hyperv::HV_REGISTER_SINT15
+            | hyperv::HV_X64_MSR_SYNDBG_CONTROL..=hyperv::HV_X64_MSR_SYNDBG_PENDING_BUFFER
+            | hyperv::HV_X64_MSR_SYNDBG_OPTIONS
+            | hyperv::HV_REGISTER_CRASH_P0..=hyperv::HV_REGISTER_CRASH_P4
+            | hyperv::HV_REGISTER_CRASH_CTL
+            | hyperv::HV_REGISTER_STIMER0_CONFIG..=hyperv::HV_REGISTER_STIMER3_COUNT
+            | hyperv::HV_X64_MSR_REENLIGHTENMENT_CONTROL
+            | hyperv::HV_X64_MSR_TSC_EMULATION_CONTROL
+            | hyperv::HV_X64_MSR_TSC_EMULATION_STATUS
+            | hyperv::HV_X64_MSR_TSC_INVARIANT_CONTROL => {
+                todo!()
+            }
+
+            msr::MSR_BBL_CR_CTL3 => {
+                todo!()
+            }
+
+            // MSR_AMD64_OSVW_ID_LENGTH
+            0xc0010140 => {
+                todo!()
+            }
+            // MSR_AMD64_OSVW_STATUS
+            0xc0010141 => {
+                todo!()
+            }
+
+            msr::MSR_PLATFORM_INFO => {
+                todo!()
+            }
+            // MSR_MISC_FEATURES_ENABLES
+            0x00000140 => {
+                todo!()
+            }
+            // MSR_IA32_XFD
+            0x000001c4 => {
+                todo!()
+            }
+            // MSR_IA32_XFD_ERR
+            0x000001c5 => {
+                todo!()
+            }
+            _ => {
+                todo!()
+            }
+        }
+    }
 }
 
 impl VirtCpu {
-    pub fn init_arch(&mut self, vm: &Vm) {
+    pub fn init_arch(&mut self, vm: &mut Vm, id: usize) -> Result<(), SystemError> {
+        vm.vcpu_precreate(id)?;
+
         self.arch.last_vmentry_cpu = ProcessorId::INVALID;
         self.arch.regs_avail.set_all(true);
         self.arch.regs_dirty.set_all(true);
@@ -295,12 +574,31 @@ impl VirtCpu {
         x86_kvm_ops().vcpu_create(self, vm);
 
         self.load();
-        self.vcpu_reset(false);
+        self.vcpu_reset(vm, false)?;
         self.arch.kvm_init_mmu();
+
+        Ok(())
+    }
+
+    pub fn kvm_run(&self) -> &Box<UapiKvmRun> {
+        self.run.as_ref().unwrap()
     }
 
     pub fn run(&mut self) -> Result<usize, SystemError> {
         self.load();
+
+        if unlikely(self.arch.mp_state == MutilProcessorState::Uninitialized) {
+            todo!()
+        }
+
+        let kvm_run = self.kvm_run();
+
+        if kvm_run.kvm_valid_regs & !KVM_SYNC_X86_VALID_FIELDS != 0
+            || kvm_run.kvm_dirty_regs & !KVM_SYNC_X86_VALID_FIELDS != 0
+        {
+            return Err(SystemError::EINVAL);
+        }
+
         todo!()
     }
 
@@ -331,15 +629,53 @@ impl VirtCpu {
         self.request.insert(req);
     }
 
-    pub fn vcpu_reset(&mut self, init_event: bool) {
+    pub fn set_msr(
+        &mut self,
+        index: u32,
+        data: u64,
+        host_initiated: bool,
+    ) -> Result<(), SystemError> {
+        match index {
+            IA32_FS_BASE | IA32_GS_BASE | IA32_KERNEL_GSBASE | IA32_CSTAR | IA32_LSTAR => {
+                if VirtAddr::new(data as usize).is_canonical() {
+                    return Ok(());
+                }
+            }
+
+            IA32_SYSENTER_EIP | IA32_SYSENTER_ESP => {
+                // 需要将Data转为合法地址，但是现在先这样写
+                assert!(VirtAddr::new(data as usize).is_canonical());
+            }
+            IA32_TSC_AUX => {
+                if x86_kvm_manager()
+                    .find_user_return_msr_idx(IA32_TSC_AUX)
+                    .is_none()
+                {
+                    return Ok(());
+                }
+
+                todo!()
+            }
+            _ => {}
+        }
+
+        let msr_data = MsrData {
+            host_initiated,
+            index,
+            data,
+        };
+
+        return kvm_arch_ops().set_msr(self, msr_data);
+    }
+
+    pub fn vcpu_reset(&mut self, vm: &Vm, init_event: bool) -> Result<(), SystemError> {
         let old_cr0 = self.arch.read_cr0_bits(Cr0::all());
 
         if self.arch.is_guest_mode() {
             todo!()
         }
 
-        // ：TODO
-        // self.lapic_reset(init_event);
+        self.lapic_reset(vm, init_event);
 
         self.arch.hflags = HFlags::empty();
 
@@ -395,7 +731,7 @@ impl VirtCpu {
 
             // TODO: __kvm_set_xcr(vcpu, 0, XFEATURE_MASK_FP);
             // 0xda0: MSR_IA32_XSS
-            self.arch.set_msr(0xda0, 0, true);
+            self.set_msr(0xda0, 0, true)?;
         }
 
         for reg in &mut self.arch.regs {
@@ -412,7 +748,7 @@ impl VirtCpu {
         };
         self.arch.write_reg(KvmReg::VcpuRegsRdx, val as u64);
 
-        kvm_arch_ops().vcpu_reset(self, init_event);
+        kvm_arch_ops().vcpu_reset(self, vm, init_event);
 
         self.set_rflags(RFlags::FLAGS_A1);
         self.arch.write_reg_raw(KvmReg::VcpuRegsRip, 0xfff0);
@@ -427,7 +763,7 @@ impl VirtCpu {
             new_cr0.insert(Cr0::CR0_NOT_WRITE_THROUGH | Cr0::CR0_CACHE_DISABLE);
         }
 
-        kvm_arch_ops().set_cr0(self, new_cr0);
+        kvm_arch_ops().set_cr0(vm, self, new_cr0);
         kvm_arch_ops().set_cr4(self, Cr4::empty());
         kvm_arch_ops().set_efer(self, EferFlags::empty());
         kvm_arch_ops().update_exception_bitmap(self);
@@ -440,6 +776,8 @@ impl VirtCpu {
         if init_event {
             self.request(VirCpuRequest::KVM_REQ_TLB_FLUSH_GUEST);
         }
+
+        Ok(())
     }
 
     fn set_rflags(&mut self, rflags: RFlags) {
@@ -457,7 +795,7 @@ impl VirtCpu {
         kvm_arch_ops().set_rflags(self, rflags);
     }
 
-    fn get_rflags(&self) -> RFlags {
+    fn get_rflags(&mut self) -> RFlags {
         let mut rflags = kvm_arch_ops().get_rflags(self);
         if self.guest_debug.contains(GuestDebug::SINGLESTEP) {
             rflags.insert(RFlags::FLAGS_TF);
@@ -474,7 +812,7 @@ impl VirtCpu {
         return self._get_regs();
     }
 
-    fn _get_regs(&self) -> KvmCommonRegs {
+    fn _get_regs(&mut self) -> KvmCommonRegs {
         KvmCommonRegs {
             rax: self.arch.read_reg(KvmReg::VcpuRegsRax),
             rbx: self.arch.read_reg(KvmReg::VcpuRegsRbx),
@@ -496,6 +834,323 @@ impl VirtCpu {
             rflags: self.get_rflags().bits(),
         }
     }
+
+    pub fn get_segment_regs(&mut self) -> UapiKvmSegmentRegs {
+        self.load();
+        return self._get_segment_regs();
+    }
+
+    fn _get_segment_regs(&mut self) -> UapiKvmSegmentRegs {
+        let mut sregs = self._get_segment_regs_common();
+
+        if self.arch.guest_state_protected {
+            return sregs;
+        }
+
+        if self.arch.interrupt.injected && !self.arch.interrupt.soft {
+            BitMapCore::new().set(
+                sregs.interrupt_bitmap.len() * core::mem::size_of::<u64>(),
+                &mut sregs.interrupt_bitmap,
+                self.arch.interrupt.nr as usize,
+                true,
+            );
+        }
+
+        return sregs;
+    }
+
+    fn read_cr3(&mut self) -> u64 {
+        if !self.arch.is_register_available(KvmReg::VcpuExregCr3) {
+            x86_kvm_ops().cache_reg(&mut self.arch, KvmReg::VcpuExregCr3);
+        }
+
+        return self.arch.cr3;
+    }
+
+    fn kvm_get_segment(&mut self, segment: &mut UapiKvmSegment, seg: VcpuSegment) {
+        *segment = x86_kvm_ops().get_segment(self, *segment, seg);
+    }
+
+    fn _get_segment_regs_common(&mut self) -> UapiKvmSegmentRegs {
+        let mut sregs = UapiKvmSegmentRegs::default();
+
+        if !self.arch.guest_state_protected {
+            let mut dt = DescriptorTablePointer::default();
+
+            self.kvm_get_segment(&mut sregs.cs, VcpuSegment::CS);
+            self.kvm_get_segment(&mut sregs.ds, VcpuSegment::DS);
+            self.kvm_get_segment(&mut sregs.es, VcpuSegment::ES);
+            self.kvm_get_segment(&mut sregs.fs, VcpuSegment::FS);
+            self.kvm_get_segment(&mut sregs.gs, VcpuSegment::GS);
+            self.kvm_get_segment(&mut sregs.ss, VcpuSegment::SS);
+
+            self.kvm_get_segment(&mut sregs.tr, VcpuSegment::TR);
+            self.kvm_get_segment(&mut sregs.ldt, VcpuSegment::LDTR);
+
+            x86_kvm_ops().get_idt(self, &mut dt);
+            sregs.idt.limit = dt.limit;
+            sregs.idt.base = dt.base as usize as u64;
+
+            x86_kvm_ops().get_gdt(self, &mut dt);
+            sregs.gdt.limit = dt.limit;
+            sregs.gdt.base = dt.base as usize as u64;
+
+            sregs.cr2 = self.arch.cr2;
+            sregs.cr3 = self.read_cr3();
+        }
+
+        sregs.cr0 = self.arch.read_cr0_bits(Cr0::all()).bits() as u64;
+        sregs.cr4 = self.arch.read_cr4_bits(Cr4::all()).bits() as u64;
+        sregs.cr8 = self.arch.get_cr8();
+        sregs.efer = self.arch.efer.bits();
+        sregs.apic_base = self.arch.apic_base;
+
+        return sregs;
+    }
+
+    pub fn set_segment_regs(&mut self, sregs: &mut UapiKvmSegmentRegs) -> Result<(), SystemError> {
+        self.load();
+        kdebug!("set_segment_regs sregs{sregs:?}");
+        self._set_segmenet_regs(&self.kvm().lock(), sregs)?;
+        Ok(())
+    }
+
+    fn _set_segmenet_regs(
+        &mut self,
+        vm: &Vm,
+        sregs: &mut UapiKvmSegmentRegs,
+    ) -> Result<(), SystemError> {
+        let mut mmu_reset_needed = false;
+        self._set_segmenet_regs_common(vm, sregs, &mut mmu_reset_needed, true)?;
+
+        if mmu_reset_needed {
+            todo!()
+        }
+
+        // KVM_NR_INTERRUPTS
+        let max_bits = 256;
+
+        let pending_vec = BitMapCore::new().first_index(&sregs.interrupt_bitmap);
+        if let Some(pending) = pending_vec {
+            if pending < max_bits {
+                self.arch.queue_interrupt(pending as u8, false);
+
+                self.request(VirCpuRequest::KVM_REQ_EVENT);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 设置段寄存器
+    fn _set_segmenet_regs_common(
+        &mut self,
+        vm: &Vm,
+        sregs: &mut UapiKvmSegmentRegs,
+        mmu_reset_needed: &mut bool,
+        update_pdptrs: bool,
+    ) -> Result<(), SystemError> {
+        let mut apic_base_msr = MsrData::default();
+
+        if !self.is_valid_segment_regs(sregs) {
+            return Err(SystemError::EINVAL);
+        }
+
+        apic_base_msr.data = sregs.apic_base;
+        apic_base_msr.host_initiated = true;
+
+        // TODO: kvm_set_apic_base
+
+        if self.arch.guest_state_protected {
+            return Ok(());
+        }
+
+        let mut dt: DescriptorTablePointer<u8> = DescriptorTablePointer::default();
+
+        dt.limit = sregs.idt.limit;
+        dt.base = sregs.idt.base as usize as *const u8;
+        x86_kvm_ops().set_idt(self, &dt);
+
+        dt.limit = sregs.gdt.limit;
+        dt.base = sregs.gdt.base as usize as *const u8;
+        x86_kvm_ops().set_gdt(self, &dt);
+
+        self.arch.cr2 = sregs.cr2;
+        *mmu_reset_needed |= self.read_cr3() != sregs.cr3;
+
+        self.arch.cr3 = sregs.cr3;
+
+        self.arch.mark_register_dirty(KvmReg::VcpuExregCr3);
+
+        x86_kvm_ops().post_set_cr3(&self, sregs.cr3);
+
+        self.kvm_set_cr8(sregs.cr8);
+
+        let efer = EferFlags::from_bits_truncate(sregs.efer);
+        *mmu_reset_needed |= self.arch.efer != efer;
+        x86_kvm_ops().set_efer(self, efer);
+
+        let cr0 = Cr0::from_bits_truncate(sregs.cr0 as usize);
+        *mmu_reset_needed |= self.arch.cr0 != cr0;
+        x86_kvm_ops().set_cr0(vm, self, cr0);
+        self.arch.cr0 = cr0;
+
+        let cr4 = Cr4::from_bits_truncate(sregs.cr4 as usize);
+        *mmu_reset_needed |= self.arch.read_cr4_bits(Cr4::all()) != cr4;
+        x86_kvm_ops().set_cr4(self, cr4);
+
+        if update_pdptrs {
+            todo!()
+        }
+
+        x86_kvm_ops().set_segment(self, &mut sregs.cs, VcpuSegment::CS);
+        x86_kvm_ops().set_segment(self, &mut sregs.ds, VcpuSegment::DS);
+        x86_kvm_ops().set_segment(self, &mut sregs.es, VcpuSegment::ES);
+        x86_kvm_ops().set_segment(self, &mut sregs.fs, VcpuSegment::FS);
+        x86_kvm_ops().set_segment(self, &mut sregs.gs, VcpuSegment::GS);
+        x86_kvm_ops().set_segment(self, &mut sregs.ss, VcpuSegment::SS);
+
+        x86_kvm_ops().set_segment(self, &mut sregs.tr, VcpuSegment::TR);
+        x86_kvm_ops().set_segment(self, &mut sregs.ldt, VcpuSegment::LDTR);
+
+        // TODO: update_cr8_intercept
+
+        if self.arch.is_bsp()
+            && self.arch.read_reg_raw(KvmReg::VcpuRegsRip) == 0xfff0
+            && sregs.cs.selector == 0xf000
+            && sregs.cs.base == 0xffff0000
+            && !self.arch.is_portected_mode()
+        {
+            self.arch.mp_state = MutilProcessorState::Runnable;
+        }
+
+        Ok(())
+    }
+
+    pub fn kvm_set_cr8(&mut self, cr8: u64) {
+        // 先这样写
+        self.arch.cr8 = cr8;
+    }
+
+    fn is_valid_segment_regs(&self, sregs: &UapiKvmSegmentRegs) -> bool {
+        let efer = EferFlags::from_bits_truncate(sregs.efer);
+        let cr4 = Cr4::from_bits_truncate(sregs.cr4 as usize);
+        let cr0 = Cr0::from_bits_truncate(sregs.cr0 as usize);
+
+        if efer.contains(EferFlags::LONG_MODE_ENABLE) && cr0.contains(Cr0::CR0_ENABLE_PAGING) {
+            if !cr4.contains(Cr4::CR4_ENABLE_PAE) || !efer.contains(EferFlags::LONG_MODE_ACTIVE) {
+                return false;
+            }
+
+            // TODO: legal gpa?
+        } else {
+            if efer.contains(EferFlags::LONG_MODE_ACTIVE) || sregs.cs.l != 0 {
+                return false;
+            }
+        }
+
+        return self.kvm_is_vaild_cr0(cr0) && self.kvm_is_vaild_cr4(cr4);
+    }
+
+    fn kvm_is_vaild_cr0(&self, cr0: Cr0) -> bool {
+        if cr0.contains(Cr0::CR0_NOT_WRITE_THROUGH) && !cr0.contains(Cr0::CR0_CACHE_DISABLE) {
+            return false;
+        }
+
+        if cr0.contains(Cr0::CR0_ENABLE_PAGING) && !cr0.contains(Cr0::CR0_PROTECTED_MODE) {
+            return false;
+        }
+
+        return x86_kvm_ops().is_vaild_cr0(self, cr0);
+    }
+
+    fn __kvm_is_valid_cr4(&self, cr4: Cr4) -> bool {
+        if cr4.contains(self.arch.cr4_guest_rsvd_bits) {
+            return false;
+        }
+
+        return true;
+    }
+
+    fn kvm_is_vaild_cr4(&self, cr4: Cr4) -> bool {
+        return self.__kvm_is_valid_cr4(cr4) && x86_kvm_ops().is_vaild_cr4(self, cr4);
+    }
+
+    pub fn is_unrestricted_guest(&self) -> bool {
+        let guard = self.vmx().loaded_vmcs();
+        return vmx_info().enable_unrestricted_guest
+            && (!self.arch.is_guest_mode()
+                || SecondaryControls::from_bits_truncate(
+                    guard.controls_get(ControlsType::SecondaryExec) as u32,
+                )
+                .contains(SecondaryControls::UNRESTRICTED_GUEST));
+    }
+
+    pub fn set_regs(&mut self, regs: &KvmCommonRegs) -> Result<(), SystemError> {
+        self.load();
+        self._set_regs(regs);
+        Ok(())
+    }
+
+    fn _set_regs(&mut self, regs: &KvmCommonRegs) {
+        self.arch.emulate_regs_need_sync_from_vcpu = true;
+        self.arch.emulate_regs_need_sync_to_vcpu = false;
+
+        self.arch.write_reg(KvmReg::VcpuRegsRax, regs.rax);
+        self.arch.write_reg(KvmReg::VcpuRegsRbx, regs.rbx);
+        self.arch.write_reg(KvmReg::VcpuRegsRcx, regs.rcx);
+        self.arch.write_reg(KvmReg::VcpuRegsRdx, regs.rdx);
+        self.arch.write_reg(KvmReg::VcpuRegsRsi, regs.rsi);
+        self.arch.write_reg(KvmReg::VcpuRegsRdi, regs.rdi);
+        self.arch.write_reg(KvmReg::VcpuRegsRsp, regs.rsp);
+        self.arch.write_reg(KvmReg::VcpuRegsRbp, regs.rbp);
+
+        self.arch.write_reg(KvmReg::VcpuRegsR8, regs.r8);
+        self.arch.write_reg(KvmReg::VcpuRegsR9, regs.r9);
+        self.arch.write_reg(KvmReg::VcpuRegsR10, regs.r10);
+        self.arch.write_reg(KvmReg::VcpuRegsR11, regs.r11);
+        self.arch.write_reg(KvmReg::VcpuRegsR12, regs.r12);
+        self.arch.write_reg(KvmReg::VcpuRegsR13, regs.r13);
+        self.arch.write_reg(KvmReg::VcpuRegsR14, regs.r14);
+        self.arch.write_reg(KvmReg::VcpuRegsR15, regs.r15);
+
+        self.arch.write_reg_raw(KvmReg::VcpuRegsRip, regs.rip);
+
+        self.set_rflags(RFlags::from_bits_truncate(regs.rflags) | RFlags::FLAGS_A1);
+
+        self.arch.exception.pending = false;
+        self.arch.exception_vmexit.pending = false;
+
+        self.request(VirCpuRequest::KVM_REQ_EVENT);
+    }
+
+    pub fn load_guest_xsave_state(&mut self) {
+        if self.arch.guest_state_protected {
+            return;
+        }
+
+        if !self.arch.read_cr4_bits(Cr4::CR4_ENABLE_OS_XSAVE).is_empty() {
+            if self.arch.xcr0 != x86_kvm_manager().host_xcr0 {
+                unsafe { _xsetbv(0, self.arch.xcr0.bits()) };
+            }
+
+            if self.arch.ia32_xss != x86_kvm_manager().host_xss {
+                // XSS
+                unsafe { wrmsr(0xda0, self.arch.ia32_xss) };
+            }
+        }
+
+        if CpuId::new().get_extended_feature_info().unwrap().has_pku()
+            && self.arch.pkru != self.arch.host_pkru
+            && (self.arch.xcr0.contains(Xcr0::XCR0_PKRU_STATE)
+                || !self
+                    .arch
+                    .read_cr4_bits(Cr4::CR4_ENABLE_PROTECTION_KEY)
+                    .is_empty())
+        {
+            KvmX86Asm::write_pkru(self.arch.pkru);
+        }
+    }
 }
 
 bitflags! {
@@ -505,6 +1160,7 @@ bitflags! {
         const KVM_REQUEST_NO_ACTION = 1 << 2;
         const KVM_REQ_EVENT = 1 << 6;
         const KVM_REQ_STEAL_UPDATE = 1 << 8;
+        const KVM_REQ_APIC_PAGE_RELOAD = 1 << 17 | Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits;
         const KVM_REQ_TLB_FLUSH_GUEST = 1 << 27 | Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits;
         const KVM_REQ_TLB_FLUSH = 1 | Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits;
     }

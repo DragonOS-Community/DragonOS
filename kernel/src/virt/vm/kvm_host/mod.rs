@@ -15,7 +15,7 @@ use x86::bits64::registers::rsp;
 
 use crate::{
     arch::{
-        vm::{kvm_host::vcpu::VirCpuRequest, x86_kvm_manager},
+        vm::{kvm_host::vcpu::VirCpuRequest, vmx::KvmVmx, x86_kvm_manager},
         CurrentKvmManager, KvmArch, VirtCpuArch,
     },
     filesystem::vfs::file::{File, FileMode},
@@ -87,6 +87,9 @@ impl LockedVm {
             dirty_ring_size: 0,
             dirty_ring_with_bitmap: false,
             vcpus: HashMap::new(),
+            #[cfg(target_arch = "x86_64")]
+            kvm_vmx: KvmVmx::default(),
+            nr_memslots_dirty_logging: 0,
         };
 
         let ret = Arc::new(Self {
@@ -133,21 +136,16 @@ pub struct Vm {
     pub arch: KvmArch,
 
     pub dirty_ring_size: u32,
+    pub nr_memslots_dirty_logging: u32,
     dirty_ring_with_bitmap: bool,
-}
 
-#[inline]
-pub fn check_stack_usage() {
-    let rsp = rsp() as usize;
-    let free = rsp & (KernelStack::ALIGN - 1);
-    let usage = KernelStack::SIZE - free;
-    kdebug!("current rsp {rsp:x} stack use {usage} free {free}");
+    #[cfg(target_arch = "x86_64")]
+    pub kvm_vmx: KvmVmx,
 }
 
 impl Vm {
     #[inline(never)]
     pub fn create_vcpu(&mut self, id: usize) -> Result<usize, SystemError> {
-        check_stack_usage();
         if id >= self.max_vcpus {
             return Err(SystemError::EINVAL);
         }
@@ -158,7 +156,7 @@ impl Vm {
 
         self.created_vcpus += 1;
 
-        let vcpu = self._create_vcpu(id);
+        let vcpu = self._create_vcpu(id)?;
         if self.dirty_ring_size != 0 {
             todo!()
         }
@@ -183,14 +181,12 @@ impl Vm {
 
     /// ### 创建一个vcpu，并且初始化部分数据
     #[inline(never)]
-    pub fn _create_vcpu(&self, id: usize) -> Arc<LockedVirtCpu> {
-        check_stack_usage();
-
+    pub fn _create_vcpu(&mut self, id: usize) -> Result<Arc<LockedVirtCpu>, SystemError> {
         let mut vcpu = self.new_vcpu(id);
 
-        vcpu.init_arch(self);
+        vcpu.init_arch(self, id)?;
 
-        Arc::new(LockedVirtCpu::new(vcpu))
+        Ok(Arc::new(LockedVirtCpu::new(vcpu)))
     }
 
     #[inline(never)]
@@ -213,10 +209,20 @@ impl Vm {
             vcpu_idx: 0,
         };
     }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn kvm_vmx_mut(&mut self) -> &mut KvmVmx {
+        &mut self.kvm_vmx
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn kvm_vmx(&self) -> &KvmVmx {
+        &self.kvm_vmx
+    }
 }
 
 /// ## 多处理器状态（有些状态在某些架构并不合法）
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MutilProcessorState {
     Runnable,
     Uninitialized,

@@ -1,8 +1,10 @@
+use core::arch::x86_64::{_xgetbv, _XCR_XFEATURE_ENABLED_MASK};
+
 use alloc::vec::Vec;
 use raw_cpuid::CpuId;
 use system_error::SystemError;
 use x86::{
-    controlregs::Xcr0,
+    controlregs::{xcr0, Cr0, Cr4, Xcr0},
     msr::{
         rdmsr, IA32_BIOS_SIGN_ID, IA32_CSTAR, IA32_EFER, IA32_FEATURE_CONTROL, IA32_FMASK,
         IA32_KERNEL_GSBASE, IA32_LSTAR, IA32_MCG_CTL, IA32_MCG_STATUS, IA32_MISC_ENABLE, IA32_PAT,
@@ -20,6 +22,10 @@ use x86::{
         MSR_PLATFORM_INFO, MSR_POWER_CTL, MSR_SMI_COUNT,
     },
 };
+use x86_64::registers::{
+    control::{Efer, EferFlags},
+    xcontrol::{XCr0, XCr0Flags},
+};
 
 use crate::{
     arch::vm::vmx::{VmxL1dFlushState, L1TF_VMX_MITIGATION},
@@ -29,7 +35,7 @@ use crate::{
 };
 
 use self::{
-    asm::{hyperv::*, kvm_msr::*, ArchCapabilities, KvmMsrEntry},
+    asm::{hyperv::*, kvm_msr::*, ArchCapabilities, VmxMsrEntry},
     kvm_host::{KvmFunc, KvmInitFunc},
 };
 
@@ -40,6 +46,7 @@ mod cpuid;
 pub mod kvm_host;
 pub mod mem;
 mod mmu;
+pub mod uapi;
 pub mod vmx;
 
 static mut KVM_X86_MANAGER: Option<KvmArchManager> = None;
@@ -59,7 +66,7 @@ pub fn x86_kvm_manager_mut() -> &'static mut KvmArchManager {
 pub fn init_kvm_arch() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| unsafe {
-        KVM_X86_MANAGER = Some(KvmArchManager::default());
+        KVM_X86_MANAGER = Some(KvmArchManager::init());
 
         let mut user_return_msrs = Vec::new();
         user_return_msrs.resize(PerCpu::MAX_CPU_NUM as usize, KvmUserReturnMsrs::default());
@@ -68,11 +75,11 @@ pub fn init_kvm_arch() {
 }
 
 /// fixme：这些成员是否需要加锁呢？?
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct KvmArchManager {
     funcs: Option<&'static dyn KvmFunc>,
-    host_xcr0: u64,
-    host_efer: u64,
+    host_xcr0: Xcr0,
+    host_efer: EferFlags,
     host_xss: u64,
     host_arch_capabilities: u64,
     kvm_uret_msrs_list: Vec<u32>,
@@ -85,9 +92,54 @@ pub struct KvmArchManager {
     has_noapic_vcpu: bool,
 
     enable_pmu: bool,
+
+    // 只读
+    possible_cr0_guest: Cr0,
+    possible_cr4_guest: Cr4,
+    cr4_tlbflush_bits: Cr4,
+    cr4_pdptr_bits: Cr4,
 }
 
 impl KvmArchManager {
+    pub fn init() -> Self {
+        Self {
+            possible_cr0_guest: Cr0::CR0_TASK_SWITCHED | Cr0::CR0_WRITE_PROTECT,
+            possible_cr4_guest: Cr4::CR4_VIRTUAL_INTERRUPTS
+                | Cr4::CR4_DEBUGGING_EXTENSIONS
+                | Cr4::CR4_ENABLE_PPMC
+                | Cr4::CR4_ENABLE_SSE
+                | Cr4::CR4_UNMASKED_SSE
+                | Cr4::CR4_ENABLE_GLOBAL_PAGES
+                | Cr4::CR4_TIME_STAMP_DISABLE
+                | Cr4::CR4_ENABLE_FSGSBASE,
+
+            cr4_tlbflush_bits: Cr4::CR4_ENABLE_GLOBAL_PAGES
+                | Cr4::CR4_ENABLE_PCID
+                | Cr4::CR4_ENABLE_PAE
+                | Cr4::CR4_ENABLE_SMEP,
+
+            cr4_pdptr_bits: Cr4::CR4_ENABLE_GLOBAL_PAGES
+                | Cr4::CR4_ENABLE_PSE
+                | Cr4::CR4_ENABLE_PAE
+                | Cr4::CR4_ENABLE_SMEP,
+
+            host_xcr0: Xcr0::empty(),
+
+            funcs: Default::default(),
+            host_efer: EferFlags::empty(),
+            host_xss: Default::default(),
+            host_arch_capabilities: Default::default(),
+            kvm_uret_msrs_list: Default::default(),
+            kvm_caps: Default::default(),
+            max_tsc_khz: Default::default(),
+            msrs_to_save: Default::default(),
+            emulated_msrs: Default::default(),
+            msr_based_features: Default::default(),
+            has_noapic_vcpu: Default::default(),
+            enable_pmu: Default::default(),
+        }
+    }
+
     #[inline]
     pub fn set_runtime_func(&mut self, funcs: &'static dyn KvmFunc) {
         self.funcs = Some(funcs);
@@ -106,6 +158,11 @@ impl KvmArchManager {
         }
 
         None
+    }
+
+    pub fn mpx_supported(&self) -> bool {
+        self.kvm_caps.supported_xcr0 & (Xcr0::XCR0_BNDREG_STATE | Xcr0::XCR0_BNDCSR_STATE)
+            == (Xcr0::XCR0_BNDREG_STATE | Xcr0::XCR0_BNDREG_STATE)
     }
 
     pub const KVM_MAX_VCPUS: usize = 1024;
@@ -290,11 +347,11 @@ impl KvmArchManager {
 
         // TODO：mmu vendor init
         if cpu_feature.has_xsave() {
-            // fixme：这里会UD，后续再修
-            // self.host_xcr0 = unsafe { _xgetbv(_XCR_XFEATURE_ENABLED_MASK) };
+            self.host_xcr0 = unsafe { xcr0() };
+            self.kvm_caps.supported_xcr0 = self.host_xcr0;
         }
         // 保存efer
-        self.host_efer = unsafe { rdmsr(IA32_EFER) };
+        self.host_efer = Efer::read();
 
         // 保存xss
         if cpu_extend.has_xsaves_xrstors() {
@@ -431,7 +488,7 @@ impl KvmArchManager {
     }
 
     fn kvm_prove_feature_msr(&mut self, index: u32) {
-        let mut msr = KvmMsrEntry {
+        let mut msr = VmxMsrEntry {
             index,
             reserved: Default::default(),
             data: Default::default(),
@@ -444,7 +501,7 @@ impl KvmArchManager {
         self.msr_based_features.push(index);
     }
 
-    fn get_msr_feature(&self, msr: &mut KvmMsrEntry) -> bool {
+    fn get_msr_feature(&self, msr: &mut VmxMsrEntry) -> bool {
         match msr.index {
             0x10a => {
                 // MSR_IA32_ARCH_CAPABILITIES,

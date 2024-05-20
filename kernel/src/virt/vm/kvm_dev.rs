@@ -8,7 +8,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{
-        vm::{kvm_host::KvmCommonRegs, x86_kvm_manager},
+        vm::{kvm_host::KvmCommonRegs, uapi::UapiKvmSegmentRegs, x86_kvm_manager},
         MMArch,
     },
     driver::base::device::device_number::DeviceNumber,
@@ -26,10 +26,7 @@ use crate::{
     process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::PosixTimeSpec,
-    virt::vm::{
-        kvm_host::check_stack_usage,
-        user_api::{KvmUserspaceMemoryRegion, PosixKvmUserspaceMemoryRegion},
-    },
+    virt::vm::user_api::{KvmUserspaceMemoryRegion, PosixKvmUserspaceMemoryRegion},
 };
 
 use super::kvm_host::{
@@ -237,12 +234,11 @@ impl IndexNode for KvmInstance {
         arg: usize,
         _private_data: &crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, SystemError> {
-        kdebug!("ioctl");
-        check_stack_usage();
+        kdebug!("kvm instance ioctl cmd {cmd:x}");
         match cmd {
             Self::KVM_CREATE_VCPU => {
                 let ret = self.kvm.lock().create_vcpu(arg);
-                kwarn!("!!!###$$");
+                kdebug!("[KVM] create vcpu fd {ret:?}");
                 return ret;
             }
 
@@ -318,6 +314,8 @@ impl IndexNode for KvmInstance {
 #[derive(Debug)]
 pub struct KvmVcpuDev {
     vcpu: Arc<LockedVirtCpu>,
+    /// INode 元数据
+    metadata: Metadata,
 }
 
 impl KvmVcpuDev {
@@ -328,7 +326,25 @@ impl KvmVcpuDev {
     const KVM_SET_SREGS: u32 = 0xAE84;
 
     pub fn new(vcpu: Arc<LockedVirtCpu>) -> Arc<Self> {
-        Arc::new(Self { vcpu })
+        Arc::new(Self {
+            vcpu,
+            metadata: Metadata {
+                dev_id: 1,
+                inode_id: generate_inode_id(),
+                size: 0,
+                blk_size: 0,
+                blocks: 0,
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
+                file_type: FileType::KvmDevice, // 文件夹，block设备，char设备
+                mode: ModeType::S_IALLUGO,
+                nlinks: 1,
+                uid: 0,
+                gid: 0,
+                raw_dev: DeviceNumber::default(), // 这里用来作为device number
+            },
+        })
     }
 }
 
@@ -354,8 +370,12 @@ impl IndexNode for KvmVcpuDev {
         arg: usize,
         _private_data: &crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, SystemError> {
+        kdebug!("vcpu ioctl cmd {cmd:x}");
         match cmd {
             Self::KVM_RUN => {
+                if arg != 0  {
+                    return Err(SystemError::EINVAL);
+                }
                 let mut vcpu = self.vcpu.lock();
                 let oldpid = vcpu.pid;
                 if unlikely(oldpid != Some(ProcessManager::current_pid())) {
@@ -365,9 +385,7 @@ impl IndexNode for KvmVcpuDev {
                 return vcpu.run();
             }
             Self::KVM_GET_REGS => {
-                kdebug!("KVM_GET_REGS");
                 let kvm_regs = self.vcpu.lock().get_regs();
-                kdebug!("get regs {kvm_regs:?}");
                 let mut user_writer = UserBufferWriter::new(
                     arg as *const KvmCommonRegs as *mut KvmCommonRegs,
                     core::mem::size_of::<KvmCommonRegs>(),
@@ -377,6 +395,50 @@ impl IndexNode for KvmVcpuDev {
                 user_writer.copy_one_to_user(&kvm_regs, 0)?;
                 return Ok(0);
             }
+
+            Self::KVM_SET_REGS => {
+                let user_reader = UserBufferReader::new(
+                    arg as *const KvmCommonRegs,
+                    core::mem::size_of::<KvmCommonRegs>(),
+                    true,
+                )?;
+
+                let regs = user_reader.read_one_from_user::<KvmCommonRegs>(0)?;
+
+                self.vcpu.lock().set_regs(regs)?;
+
+                return Ok(0);
+            }
+
+            Self::KVM_GET_SREGS => {
+                let sregs = self.vcpu.lock().get_segment_regs();
+
+                let mut writer = UserBufferWriter::new(
+                    arg as *const UapiKvmSegmentRegs as *mut UapiKvmSegmentRegs,
+                    core::mem::size_of::<UapiKvmSegmentRegs>(),
+                    true,
+                )?;
+
+                writer.copy_one_to_user(&sregs, 0)?;
+
+                return Ok(0);
+            }
+
+            Self::KVM_SET_SREGS => {
+                let user_reader = UserBufferReader::new(
+                    arg as *const UapiKvmSegmentRegs,
+                    core::mem::size_of::<UapiKvmSegmentRegs>(),
+                    true,
+                )?;
+
+                let mut sreg = UapiKvmSegmentRegs::default();
+                user_reader.copy_one_from_user(&mut sreg, 0)?;
+
+                self.vcpu.lock().set_segment_regs(&mut sreg)?;
+
+                return Ok(0);
+            }
+
             _ => {
                 // arch ioctl
                 kwarn!("[KVM-VCPU] unknown ioctl cmd {cmd:x}");
@@ -384,6 +446,10 @@ impl IndexNode for KvmVcpuDev {
         }
 
         Ok(0)
+    }
+
+    fn metadata(&self) -> Result<Metadata, SystemError> {
+        Ok(self.metadata.clone())
     }
 
     fn read_at(

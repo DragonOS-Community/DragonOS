@@ -1,5 +1,6 @@
 use alloc::{sync::Arc, vec::Vec};
 use bitfield_struct::bitfield;
+use raw_cpuid::CpuId;
 use x86::controlregs::{Cr0, Cr4};
 use x86_64::registers::control::EferFlags;
 
@@ -17,9 +18,23 @@ const PT32_ROOT_LEVEL: usize = 2;
 const PT32E_ROOT_LEVEL: usize = 3;
 
 static mut TDP_ENABLED: bool = false;
+static mut TDP_MMU_ENABLED: bool = true;
+static mut TDP_MMU_ALLOWED: bool = unsafe { TDP_MMU_ENABLED };
+
 static mut TDP_ROOT_LEVEL: usize = 0;
 static mut MAX_TDP_LEVEL: usize = 0;
 static mut SHADOW_ACCESSED_MASK: usize = 0;
+
+static mut MAX_HUGE_PAGE_LEVEL: PageLevel = PageLevel::None;
+
+pub enum PageLevel {
+    None,
+    Level4k,
+    Level2M,
+    Level1G,
+    Level512G,
+    LevelNum,
+}
 
 #[derive(Debug)]
 pub struct LockedKvmMmu {
@@ -73,6 +88,34 @@ impl KvmMmu {
     #[inline]
     pub fn ad_enabled() -> bool {
         unsafe { SHADOW_ACCESSED_MASK != 0 }
+    }
+
+    /// 初始化mmu的配置，因为其是无锁的，所以该函数只能在初始化vmx时调用
+    pub fn kvm_configure_mmu(
+        enable_tdp: bool,
+        tdp_forced_root_level: usize,
+        tdp_max_root_level: usize,
+        tdp_huge_page_level: PageLevel,
+    ) {
+        unsafe {
+            TDP_ENABLED = enable_tdp;
+            TDP_ROOT_LEVEL = tdp_forced_root_level;
+            MAX_TDP_LEVEL = tdp_max_root_level;
+
+            TDP_MMU_ENABLED = TDP_MMU_ALLOWED && TDP_ENABLED;
+
+            if TDP_ENABLED {
+                MAX_HUGE_PAGE_LEVEL = tdp_huge_page_level;
+            } else if CpuId::new()
+                .get_extended_processor_and_feature_identifiers()
+                .unwrap()
+                .has_1gib_pages()
+            {
+                MAX_HUGE_PAGE_LEVEL = PageLevel::Level1G;
+            } else {
+                MAX_HUGE_PAGE_LEVEL = PageLevel::Level2M;
+            }
+        }
     }
 }
 

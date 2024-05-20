@@ -1,8 +1,12 @@
-use core::{
-    mem::MaybeUninit,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use core::intrinsics::unlikely;
+use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::arch::vm::mmu::KvmMmu;
+use crate::arch::vm::uapi::{
+    AC_VECTOR, BP_VECTOR, DB_VECTOR, GP_VECTOR, MC_VECTOR, NM_VECTOR, PF_VECTOR, UD_VECTOR,
+};
+use crate::libs::spinlock::SpinLockGuard;
+use crate::virt::vm::kvm_host::vcpu::GuestDebug;
 use crate::{
     arch::{
         vm::{
@@ -10,45 +14,50 @@ use crate::{
             kvm_host::{vcpu::VirCpuRequest, X86KvmArch},
             vmx::vmcs::vmx_area,
         },
-        CurrentIrqArch, VirtCpuArch,
+        CurrentIrqArch, MMArch, VirtCpuArch,
     },
     exception::InterruptArch,
     kdebug,
-    libs::{once::Once, spinlock::SpinLock},
+    libs::spinlock::SpinLock,
     mm::{
         percpu::{PerCpu, PerCpuVar},
-        virt_2_phys, PhysAddr,
+        virt_2_phys, MemoryManagementArch, PhysAddr,
     },
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
-    virt::vm::{kvm_dev::kvm_init, kvm_host::vcpu::VirtCpu},
+    virt::vm::{kvm_dev::kvm_init, kvm_host::vcpu::VirtCpu, user_api::UapiKvmSegment},
 };
 use alloc::{alloc::Global, boxed::Box, collections::LinkedList, sync::Arc, vec::Vec};
+use bitfield_struct::bitfield;
 use bitmap::{traits::BitMapOps, AllocBitmap, StaticBitmap};
 use raw_cpuid::CpuId;
 use system_error::SystemError;
+use x86::controlregs::{cr2, cr2_write};
+use x86::irq::PageFaultError;
+use x86::msr::wrmsr;
 use x86::{
-    controlregs::Xcr0,
+    bits64::rflags::RFlags,
+    controlregs::{cr0, cr3, cr4, Cr0, Cr4, Xcr0},
     msr::{
-        rdmsr, IA32_CSTAR, IA32_EFER, IA32_FMASK, IA32_FS_BASE, IA32_GS_BASE, IA32_KERNEL_GSBASE,
-        IA32_LSTAR, IA32_SMBASE, IA32_STAR, IA32_SYSENTER_CS, IA32_SYSENTER_EIP, IA32_SYSENTER_ESP,
-        IA32_TIME_STAMP_COUNTER, IA32_TSC_AUX, IA32_VMX_BASIC, IA32_VMX_CR0_FIXED0,
-        IA32_VMX_CR0_FIXED1, IA32_VMX_CR4_FIXED0, IA32_VMX_CR4_FIXED1, IA32_VMX_ENTRY_CTLS,
-        IA32_VMX_EPT_VPID_CAP, IA32_VMX_EXIT_CTLS, IA32_VMX_MISC, IA32_VMX_PINBASED_CTLS,
-        IA32_VMX_PROCBASED_CTLS, IA32_VMX_PROCBASED_CTLS2, IA32_VMX_TRUE_ENTRY_CTLS,
-        IA32_VMX_TRUE_EXIT_CTLS, IA32_VMX_TRUE_PINBASED_CTLS, IA32_VMX_TRUE_PROCBASED_CTLS,
-        IA32_VMX_VMCS_ENUM, IA32_VMX_VMFUNC, MSR_CORE_C1_RESIDENCY, MSR_CORE_C3_RESIDENCY,
-        MSR_CORE_C6_RESIDENCY, MSR_CORE_C7_RESIDENCY, MSR_IA32_ADDR0_START, MSR_IA32_ADDR3_END,
-        MSR_IA32_CR3_MATCH, MSR_IA32_RTIT_OUTPUT_BASE, MSR_IA32_RTIT_OUTPUT_MASK_PTRS,
-        MSR_IA32_RTIT_STATUS, MSR_IA32_TSX_CTRL, MSR_LASTBRANCH_TOS, MSR_LBR_SELECT,
+        self, rdmsr, IA32_CSTAR, IA32_EFER, IA32_FMASK, IA32_FS_BASE, IA32_GS_BASE,
+        IA32_KERNEL_GSBASE, IA32_LSTAR, IA32_SMBASE, IA32_STAR, IA32_SYSENTER_CS,
+        IA32_SYSENTER_EIP, IA32_SYSENTER_ESP, IA32_TIME_STAMP_COUNTER, IA32_TSC_AUX,
+        IA32_VMX_BASIC, IA32_VMX_EPT_VPID_CAP, IA32_VMX_MISC, IA32_VMX_VMFUNC,
+        MSR_CORE_C1_RESIDENCY, MSR_CORE_C3_RESIDENCY, MSR_CORE_C6_RESIDENCY, MSR_CORE_C7_RESIDENCY,
+        MSR_IA32_ADDR0_START, MSR_IA32_ADDR3_END, MSR_IA32_CR3_MATCH, MSR_IA32_RTIT_OUTPUT_BASE,
+        MSR_IA32_RTIT_OUTPUT_MASK_PTRS, MSR_IA32_RTIT_STATUS, MSR_IA32_TSX_CTRL,
+        MSR_LASTBRANCH_TOS, MSR_LBR_SELECT,
     },
+    segmentation::{self, cs},
     vmx::vmcs::{
         control::{
-            EntryControls, ExitControls, PrimaryControls, SecondaryControls, PINBASED_EXEC_CONTROLS,
+            self, EntryControls, ExitControls, PinbasedControls, PrimaryControls, SecondaryControls,
         },
-        host,
+        guest, host,
     },
 };
-use x86_64::instructions::tables::sidt;
+use x86_64::registers::control::Cr3;
+use x86_64::structures::idt::PageFaultErrorCode;
+use x86_64::{instructions::tables::sidt, registers::control::EferFlags};
 
 use crate::{
     arch::{
@@ -56,30 +65,39 @@ use crate::{
         KvmArch,
     },
     kerror, kwarn,
-    libs::{lazy_init::Lazy, rwlock::RwLock},
+    libs::rwlock::RwLock,
     virt::vm::kvm_host::Vm,
 };
 
+use self::vmcs::LoadedVmcs;
 use self::{
-    capabilities::{NestedVmxMsrs, ProcessorTraceMode, VmcsConfig, VmxCapability},
+    capabilities::{ProcessorTraceMode, VmcsConfig, VmxCapability},
     vmcs::{
-        current_loaded_vmcs_list_mut, current_vmcs, current_vmcs_mut, LockedLoadedVmcs,
-        VMControlStructure, VmxMsrBitmapAccess, VmxMsrBitmapAction, PERCPU_LOADED_VMCS_LIST,
-        PERCPU_VMCS, VMXAREA,
+        current_loaded_vmcs_list_mut, current_vmcs, current_vmcs_mut, ControlsType,
+        LockedLoadedVmcs, VMControlStructure, VmxMsrBitmapAccess, VmxMsrBitmapAction,
+        PERCPU_LOADED_VMCS_LIST, PERCPU_VMCS, VMXAREA,
     },
 };
 
+use super::asm::SegmentCacheField;
+use super::kvm_host::RMODE_TSS_SIZE;
+use super::x86_kvm_ops;
 use super::{
-    asm::VmxAsm,
+    asm::{VcpuSegment, VmxAsm, VmxMsrEntry},
     init_kvm_arch,
-    kvm_host::{KvmFunc, KvmInitFunc, MsrFilterType},
-    x86_kvm_manager, KvmArchManager, CPU_BASED_ALWAYSON_WITHOUT_TRUE_MSR,
-    PIN_BASED_ALWAYSON_WITHOUT_TRUE_MSR, VM_ENTRY_ALWAYSON_WITHOUT_TRUE_MSR,
-    VM_EXIT_ALWAYSON_WITHOUT_TRUE_MSR,
+    kvm_host::{
+        vcpu, KvmFunc, KvmInitFunc, KvmIrqChipMode, KvmReg, MsrFilterType, NotifyVmExitFlags,
+    },
+    x86_kvm_manager, KvmArchManager,
 };
 
 pub mod capabilities;
 pub mod vmcs;
+
+extern "C" {
+    fn vmx_vmexit();
+}
+
 pub struct VmxKvmInitFunc;
 
 impl VmxKvmInitFunc {
@@ -112,6 +130,9 @@ impl KvmInitFunc for VmxKvmInitFunc {
                 .map_err(|_| SystemError::ENOMEM)?
                 .assume_init()
         };
+
+        vmx_init.init();
+
         vmx_init.host_idt_base = idt.base.as_u64();
         Vmx::set_up_user_return_msrs();
 
@@ -207,7 +228,7 @@ impl KvmInitFunc for VmxKvmInitFunc {
         kvm_cap.has_bus_lock_exit = vmx_init.has_bus_lock_detection();
         kvm_cap.has_notify_vmexit = vmx_init.has_notify_vmexit();
 
-        vmx_init.vpid_bitmap.lock().set_all(false);
+        // vmx_init.vpid_bitmap.lock().set_all(false);
 
         if vmx_init.enable_ept {
             // TODO: mmu_set_ept_masks
@@ -216,7 +237,12 @@ impl KvmInitFunc for VmxKvmInitFunc {
 
         kwarn!("vmx_setup_me_spte_mask TODO!");
 
-        kwarn!("kvm_configure_mmu TODO!");
+        KvmMmu::kvm_configure_mmu(
+            vmx_init.enable_ept,
+            0,
+            vmx_init.get_max_ept_level(),
+            vmx_init.ept_cap_to_lpage_level(),
+        );
 
         if !vmx_init.enable_ept || !vmx_init.enable_ept_ad || !vmx_init.has_pml() {
             vmx_init.enable_pml = false;
@@ -366,6 +392,21 @@ impl VmxKvmFunc {
             todo!()
         }
     }
+
+    pub fn seg_setup(&self, seg: VcpuSegment) {
+        let seg_field = &KVM_VMX_SEGMENT_FIELDS[seg as usize];
+
+        VmxAsm::vmx_vmwrite(seg_field.selector, 0);
+        VmxAsm::vmx_vmwrite(seg_field.base, 0);
+        VmxAsm::vmx_vmwrite(seg_field.limit, 0xffff);
+
+        let mut ar = 0x93;
+        if seg == VcpuSegment::CS {
+            ar |= 0x08;
+        }
+
+        VmxAsm::vmx_vmwrite(seg_field.ar_bytes, ar);
+    }
 }
 
 impl KvmFunc for VmxKvmFunc {
@@ -407,8 +448,45 @@ impl KvmFunc for VmxKvmFunc {
         // TODO: vmx_vcpu_pi_load
     }
 
-    fn cache_reg(&self, vcpu: &VirtCpuArch, reg: super::kvm_host::KvmReg) {
-        todo!()
+    fn cache_reg(&self, vcpu: &mut VirtCpuArch, reg: KvmReg) {
+        vcpu.mark_register_available(reg);
+
+        match reg {
+            KvmReg::VcpuRegsRsp => {
+                vcpu.regs[reg as usize] = VmxAsm::vmx_vmread(guest::RSP);
+            }
+            KvmReg::VcpuRegsRip => {
+                vcpu.regs[reg as usize] = VmxAsm::vmx_vmread(guest::RIP);
+            }
+            // VCPU_EXREG_PDPTR
+            KvmReg::NrVcpuRegs => {
+                if vmx_info().enable_ept {
+                    todo!()
+                }
+            }
+            KvmReg::VcpuExregCr0 => {
+                let guest_owned = vcpu.cr0_guest_owned_bits;
+
+                vcpu.cr0.remove(guest_owned);
+                vcpu.cr0.insert(
+                    Cr0::from_bits_truncate(VmxAsm::vmx_vmread(guest::CR0) as usize) & guest_owned,
+                );
+            }
+            KvmReg::VcpuExregCr3 => {
+                todo!()
+            }
+            KvmReg::VcpuExregCr4 => {
+                let guest_owned = vcpu.cr4_guest_owned_bits;
+
+                vcpu.cr4.remove(guest_owned);
+                vcpu.cr4.insert(
+                    Cr4::from_bits_truncate(VmxAsm::vmx_vmread(guest::CR4) as usize) & guest_owned,
+                );
+            }
+            _ => {
+                todo!()
+            }
+        }
     }
 
     fn apicv_pre_state_restore(&self, vcpu: &mut VirtCpu) {
@@ -417,32 +495,387 @@ impl KvmFunc for VmxKvmFunc {
         // todo!()
     }
 
-    fn set_msr(&self, vcpu: &mut VirtCpuArch, msr: super::asm::MsrData) {
-        todo!()
+    fn set_msr(&self, vcpu: &mut VirtCpu, msr: super::asm::MsrData) -> Result<(), SystemError> {
+        let vmx = vcpu.vmx_mut();
+        let msr_index = msr.index;
+        let data = msr.data;
+
+        match msr_index {
+            msr::IA32_EFER => {
+                todo!("IA32_EFER")
+            }
+
+            msr::IA32_FS_BASE => {
+                todo!("IA32_FS_BASE")
+            }
+
+            msr::IA32_GS_BASE => {
+                todo!("IA32_GS_BASE")
+            }
+
+            msr::IA32_KERNEL_GSBASE => {
+                todo!("IA32_KERNEL_GSBASE")
+            }
+
+            0x000001c4 => {
+                todo!("MSR_IA32_XFD")
+            }
+
+            msr::IA32_SYSENTER_CS => {
+                todo!("IA32_SYSENTER_CS")
+            }
+
+            msr::IA32_SYSENTER_EIP => {
+                todo!("IA32_SYSENTER_EIP")
+            }
+
+            msr::IA32_SYSENTER_ESP => {
+                todo!("IA32_SYSENTER_ESP")
+            }
+
+            msr::IA32_DEBUGCTL => {
+                todo!("IA32_DEBUGCTL")
+            }
+
+            msr::MSR_C1_PMON_EVNT_SEL0 => {
+                todo!("MSR_IA32_BNDCFGS")
+            }
+
+            0xe1 => {
+                todo!("MSR_IA32_UMWAIT_CONTROL	")
+            }
+
+            0x48 => {
+                todo!("MSR_IA32_SPEC_CTRL")
+            }
+
+            msr::MSR_IA32_TSX_CTRL => {
+                todo!("MSR_IA32_TSX_CTRL")
+            }
+
+            msr::IA32_PAT => {
+                todo!("IA32_PAT")
+            }
+
+            0x4d0 => {
+                todo!("MSR_IA32_MCG_EXT_CTL")
+            }
+
+            msr::IA32_FEATURE_CONTROL => {
+                todo!("IA32_FEATURE_CONTROL")
+            }
+
+            0x8c..=0x8f => {
+                todo!("MSR_IA32_SGXLEPUBKEYHASH0 ... MSR_IA32_SGXLEPUBKEYHASH3 {msr_index}")
+            }
+
+            msr::IA32_VMX_BASIC..=msr::IA32_VMX_VMFUNC => {
+                todo!("msr::IA32_VMX_BASIC..=msr::IA32_VMX_VMFUNC")
+            }
+
+            msr::MSR_IA32_RTIT_CTL => {
+                todo!("MSR_IA32_RTIT_CTL")
+            }
+
+            msr::MSR_IA32_RTIT_STATUS => {
+                todo!("MSR_IA32_RTIT_STATUS")
+            }
+
+            msr::MSR_IA32_RTIT_OUTPUT_BASE => {
+                todo!("MSR_IA32_RTIT_OUTPUT_BASE")
+            }
+
+            0x572 => {
+                todo!("MSR_IA32_RTIT_CR3_MATCH")
+            }
+
+            msr::MSR_IA32_RTIT_OUTPUT_MASK_PTRS => {
+                todo!("MSR_IA32_RTIT_OUTPUT_MASK_PTRS")
+            }
+
+            msr::MSR_IA32_ADDR0_START..=msr::MSR_IA32_ADDR3_END => {
+                todo!("msr::MSR_IA32_ADDR0_START..=msr::MSR_IA32_ADDR3_END")
+            }
+
+            msr::MSR_PERF_CAPABILITIES => {
+                todo!("MSR_PERF_CAPABILITIES")
+            }
+
+            _ => {
+                let uret_msr = vmx.find_uret_msr(msr_index);
+
+                if let Some(msr) = uret_msr {
+                    let mut tmp_msr = VmxUretMsr::from(*msr);
+                    vmx.set_guest_uret_msr(&mut tmp_msr, data)?;
+                    vmx.set_uret_msr(msr_index, data);
+                } else {
+                    vcpu.arch.set_msr_common(&msr);
+                };
+            }
+        }
+
+        if msr_index == 0x10a {
+            // MSR_IA32_ARCH_CAPABILITIES
+            todo!()
+        }
+
+        Ok(())
     }
 
-    fn vcpu_reset(&self, vcpu: &mut VirtCpu, init_event: bool) {
-        todo!()
+    fn vcpu_reset(&self, vcpu: &mut VirtCpu, vm: &Vm, init_event: bool) {
+        if !init_event {
+            vmx_info_mut().vmx_reset_vcpu(vcpu, vm)
+        }
+        vcpu.kvm_set_cr8(0);
+
+        let vmx = vcpu.vmx_mut();
+        vmx.rmode.vm86_active = false;
+        vmx.spec_ctrl = 0;
+        vmx.msr_ia32_umwait_control = 0;
+        vmx.hv_deadline_tsc = u64::MAX;
+
+        vmx.segment_cache_clear();
+
+        vcpu.arch.mark_register_available(KvmReg::VcpuExregSegments);
+
+        self.seg_setup(VcpuSegment::CS);
+        VmxAsm::vmx_vmwrite(guest::CS_SELECTOR, 0xf000);
+        VmxAsm::vmx_vmwrite(guest::CS_BASE, 0xffff0000);
+
+        self.seg_setup(VcpuSegment::DS);
+        self.seg_setup(VcpuSegment::ES);
+        self.seg_setup(VcpuSegment::FS);
+        self.seg_setup(VcpuSegment::GS);
+        self.seg_setup(VcpuSegment::SS);
+
+        VmxAsm::vmx_vmwrite(guest::TR_SELECTOR, 0);
+        VmxAsm::vmx_vmwrite(guest::TR_BASE, 0);
+        VmxAsm::vmx_vmwrite(guest::TR_LIMIT, 0xffff);
+        VmxAsm::vmx_vmwrite(guest::TR_ACCESS_RIGHTS, 0x008b);
+
+        VmxAsm::vmx_vmwrite(guest::LDTR_SELECTOR, 0);
+        VmxAsm::vmx_vmwrite(guest::LDTR_BASE, 0);
+        VmxAsm::vmx_vmwrite(guest::LDTR_LIMIT, 0xffff);
+        VmxAsm::vmx_vmwrite(guest::LDTR_ACCESS_RIGHTS, 0x00082);
+
+        VmxAsm::vmx_vmwrite(guest::GDTR_BASE, 0);
+        VmxAsm::vmx_vmwrite(guest::GDTR_LIMIT, 0xffff);
+
+        VmxAsm::vmx_vmwrite(guest::IDTR_BASE, 0);
+        VmxAsm::vmx_vmwrite(guest::IDTR_LIMIT, 0xffff);
+
+        VmxAsm::vmx_vmwrite(guest::ACTIVITY_STATE, 0);
+        VmxAsm::vmx_vmwrite(guest::INTERRUPTIBILITY_STATE, 0);
+        VmxAsm::vmx_vmwrite(guest::PENDING_DBG_EXCEPTIONS, 0);
+
+        if x86_kvm_manager().mpx_supported() {
+            VmxAsm::vmx_vmwrite(guest::IA32_BNDCFGS_FULL, 0);
+        }
+
+        VmxAsm::vmx_vmwrite(control::VMENTRY_INTERRUPTION_INFO_FIELD, 0);
+
+        vcpu.request(VirCpuRequest::KVM_REQ_APIC_PAGE_RELOAD);
+
+        vmx_info().vpid_sync_context(vcpu.vmx().vpid);
+
+        kwarn!("TODO: vmx_update_fb_clear_dis");
     }
 
-    fn set_rflags(&self, vcpu: &mut VirtCpu, rflags: x86::bits64::rflags::RFlags) {
-        todo!()
+    fn set_rflags(&self, vcpu: &mut VirtCpu, mut rflags: x86::bits64::rflags::RFlags) {
+        if vcpu.is_unrestricted_guest() {
+            vcpu.arch.mark_register_available(KvmReg::VcpuExregRflags);
+            vcpu.vmx_mut().rflags = rflags;
+            VmxAsm::vmx_vmwrite(guest::RFLAGS, rflags.bits());
+            return;
+        }
+
+        let old_rflags = self.get_rflags(vcpu);
+
+        let vmx = vcpu.vmx_mut();
+
+        vmx.rflags = rflags;
+        if vmx.rmode.vm86_active {
+            vmx.rmode.save_rflags = rflags;
+            rflags.insert(RFlags::FLAGS_IOPL3 | RFlags::FLAGS_VM);
+        }
+
+        VmxAsm::vmx_vmwrite(guest::RFLAGS, rflags.bits());
+
+        if (old_rflags ^ vmx.rflags).contains(RFlags::FLAGS_VM) {
+            drop(vmx);
+            let emulation_required = vmx_info().emulation_required(vcpu);
+            vcpu.vmx_mut().emulation_required = emulation_required;
+        }
     }
 
-    fn set_cr0(&self, vcpu: &mut VirtCpu, cr0: x86::controlregs::Cr0) {
-        todo!()
+    fn set_cr0(&self, vm: &Vm, vcpu: &mut VirtCpu, cr0: x86::controlregs::Cr0) {
+        let old_cr0_pg = vcpu.arch.read_cr0_bits(Cr0::CR0_ENABLE_PAGING);
+        let mut hw_cr0 = cr0 & (!(Cr0::CR0_NOT_WRITE_THROUGH | Cr0::CR0_CACHE_DISABLE));
+
+        if vmx_info().enable_unrestricted_guest {
+            hw_cr0.insert(Cr0::CR0_NUMERIC_ERROR);
+        } else {
+            hw_cr0
+                .insert(Cr0::CR0_NUMERIC_ERROR | Cr0::CR0_ENABLE_PAGING | Cr0::CR0_PROTECTED_MODE);
+
+            if !vmx_info().enable_ept {
+                hw_cr0.insert(Cr0::CR0_WRITE_PROTECT);
+            }
+
+            if vcpu.vmx().rmode.vm86_active && cr0.contains(Cr0::CR0_PROTECTED_MODE) {
+                vmx_info().enter_pmode(vcpu);
+            }
+
+            if !vcpu.vmx().rmode.vm86_active && !cr0.contains(Cr0::CR0_PROTECTED_MODE) {
+                vmx_info().enter_rmode(vcpu, vm);
+            }
+        }
+
+        VmxAsm::vmx_vmwrite(control::CR0_READ_SHADOW, cr0.bits() as u64);
+        VmxAsm::vmx_vmwrite(guest::CR0, hw_cr0.bits() as u64);
+
+        vcpu.arch.cr0 = cr0;
+
+        vcpu.arch.mark_register_available(KvmReg::VcpuExregCr0);
+
+        if vcpu.arch.efer.contains(EferFlags::LONG_MODE_ENABLE) {
+            if old_cr0_pg.is_empty() && cr0.contains(Cr0::CR0_ENABLE_PAGING) {
+                todo!("enter lmode todo");
+            } else if !old_cr0_pg.is_empty() && !cr0.contains(Cr0::CR0_ENABLE_PAGING) {
+                todo!("exit lmode todo");
+            }
+        }
+
+        if vmx_info().enable_ept && !vmx_info().enable_unrestricted_guest {
+            todo!()
+        }
+
+        vcpu.vmx_mut().emulation_required = vmx_info().emulation_required(vcpu);
     }
 
-    fn set_cr4(&self, vcpu: &mut VirtCpu, cr4: x86::controlregs::Cr4) {
-        todo!()
+    fn set_cr4(&self, vcpu: &mut VirtCpu, cr4_flags: x86::controlregs::Cr4) {
+        let old_cr4 = vcpu.arch.read_cr4_bits(Cr4::all());
+
+        let mut hw_cr4 = (unsafe { cr4() } & Cr4::CR4_ENABLE_MACHINE_CHECK)
+            | (cr4_flags & (!Cr4::CR4_ENABLE_MACHINE_CHECK));
+
+        if vmx_info().enable_unrestricted_guest {
+            hw_cr4.insert(Cr4::CR4_ENABLE_VMX);
+        } else if vcpu.vmx().rmode.vm86_active {
+            hw_cr4.insert(Cr4::CR4_ENABLE_PAE | Cr4::CR4_ENABLE_VMX | Cr4::CR4_ENABLE_VME);
+        } else {
+            hw_cr4.insert(Cr4::CR4_ENABLE_PAE | Cr4::CR4_ENABLE_VMX);
+        }
+
+        if vmx_info().vmx_umip_emulated() {
+            if cr4_flags.contains(Cr4::CR4_ENABLE_UMIP) {
+                vcpu.vmx().loaded_vmcs().controls_set(
+                    ControlsType::SecondaryExec,
+                    SecondaryControls::DTABLE_EXITING.bits() as u64,
+                );
+                hw_cr4.remove(Cr4::CR4_ENABLE_UMIP);
+            } else if !vcpu.arch.is_guest_mode() {
+                vcpu.vmx().loaded_vmcs().controls_clearbit(
+                    ControlsType::SecondaryExec,
+                    SecondaryControls::DTABLE_EXITING.bits() as u64,
+                );
+            }
+        }
+
+        vcpu.arch.cr4 = cr4_flags;
+        vcpu.arch.mark_register_available(KvmReg::VcpuExregCr4);
+
+        if !vmx_info().enable_unrestricted_guest {
+            if vmx_info().enable_ept {
+                if vcpu.arch.read_cr0_bits(Cr0::CR0_ENABLE_PAGING).is_empty() {
+                    hw_cr4.remove(Cr4::CR4_ENABLE_PAE);
+                    hw_cr4.insert(Cr4::CR4_ENABLE_PSE);
+                } else if !cr4_flags.contains(Cr4::CR4_ENABLE_PAE) {
+                    hw_cr4.remove(Cr4::CR4_ENABLE_PAE);
+                }
+            }
+
+            if vcpu.arch.read_cr0_bits(Cr0::CR0_ENABLE_PAGING).is_empty() {
+                hw_cr4.remove(
+                    Cr4::CR4_ENABLE_SMEP | Cr4::CR4_ENABLE_SMAP | Cr4::CR4_ENABLE_PROTECTION_KEY,
+                );
+            }
+        }
+
+        VmxAsm::vmx_vmwrite(control::CR4_READ_SHADOW, cr4_flags.bits() as u64);
+        VmxAsm::vmx_vmwrite(guest::CR4, hw_cr4.bits() as u64);
+
+        if (cr4_flags ^ old_cr4).contains(Cr4::CR4_ENABLE_OS_XSAVE | Cr4::CR4_ENABLE_PROTECTION_KEY)
+        {
+            // TODO: update_cpuid_runtime
+        }
     }
 
     fn set_efer(&self, vcpu: &mut VirtCpu, efer: x86_64::registers::control::EferFlags) {
-        todo!()
+        if vcpu.vmx().find_uret_msr(msr::IA32_EFER).is_none() {
+            return;
+        }
+
+        vcpu.arch.efer = efer;
+        if efer.contains(EferFlags::LONG_MODE_ACTIVE) {
+            vcpu.vmx().loaded_vmcs().controls_setbit(
+                ControlsType::VmEntry,
+                EntryControls::IA32E_MODE_GUEST.bits().into(),
+            );
+        } else {
+            vcpu.vmx().loaded_vmcs().controls_clearbit(
+                ControlsType::VmEntry,
+                EntryControls::IA32E_MODE_GUEST.bits().into(),
+            );
+        }
+
+        vmx_info().setup_uret_msrs(vcpu);
     }
 
     fn update_exception_bitmap(&self, vcpu: &mut VirtCpu) {
-        todo!()
+        let mut eb = (1u32 << PF_VECTOR)
+            | (1 << UD_VECTOR)
+            | (1 << MC_VECTOR)
+            | (1 << DB_VECTOR)
+            | (1 << AC_VECTOR);
+
+        if vmx_info().enable_vmware_backdoor {
+            eb |= 1 << GP_VECTOR;
+        }
+
+        if vcpu.guest_debug & (GuestDebug::ENABLE | GuestDebug::USE_SW_BP)
+            == (GuestDebug::ENABLE | GuestDebug::USE_SW_BP)
+        {
+            eb |= 1 << BP_VECTOR;
+        }
+
+        if vcpu.vmx().rmode.vm86_active {
+            eb = !0;
+        }
+
+        if !vmx_info().vmx_need_pf_intercept(&vcpu) {
+            eb &= !(1 << PF_VECTOR);
+        }
+
+        if vcpu.arch.is_guest_mode() {
+            todo!()
+        } else {
+            let mut mask = PageFaultErr::empty();
+            let mut match_code = PageFaultErr::empty();
+            if vmx_info().enable_ept && (eb & (1 << PF_VECTOR) != 0) {
+                mask = PageFaultErr::PFERR_PRESENT | PageFaultErr::PFERR_RSVD;
+                match_code = PageFaultErr::PFERR_PRESENT;
+            }
+
+            VmxAsm::vmx_vmwrite(control::PAGE_FAULT_ERR_CODE_MASK, mask.bits);
+            VmxAsm::vmx_vmwrite(control::PAGE_FAULT_ERR_CODE_MATCH, match_code.bits);
+        }
+
+        if vcpu.arch.xfd_no_write_intercept {
+            eb |= 1 << NM_VECTOR;
+        }
+
+        VmxAsm::vmx_vmwrite(control::EXCEPTION_BITMAP, eb as u64);
     }
 
     fn has_emulated_msr(&self, msr: u32) -> bool {
@@ -467,7 +900,7 @@ impl KvmFunc for VmxKvmFunc {
         }
     }
 
-    fn get_msr_feature(&self, msr: &mut super::asm::KvmMsrEntry) -> bool {
+    fn get_msr_feature(&self, msr: &mut super::asm::VmxMsrEntry) -> bool {
         match msr.index {
             IA32_VMX_BASIC..=IA32_VMX_VMFUNC => {
                 if !vmx_info().nested {
@@ -490,7 +923,148 @@ impl KvmFunc for VmxKvmFunc {
         }
     }
 
-    fn get_rflags(&self, vcpu: &VirtCpu) -> x86::bits64::rflags::RFlags {
+    fn get_rflags(&self, vcpu: &mut VirtCpu) -> x86::bits64::rflags::RFlags {
+        if !vcpu.arch.is_register_available(KvmReg::VcpuExregRflags) {
+            vcpu.arch.mark_register_available(KvmReg::VcpuExregRflags);
+            let mut rflags = RFlags::from_bits_truncate(VmxAsm::vmx_vmread(guest::RFLAGS));
+            if vcpu.vmx_mut().rmode.vm86_active {
+                rflags.remove(RFlags::FLAGS_IOPL3 | RFlags::FLAGS_VM);
+                let save_rflags = vcpu.vmx_mut().rmode.save_rflags;
+                rflags.insert(save_rflags & !(RFlags::FLAGS_IOPL3 | RFlags::FLAGS_VM));
+            }
+
+            vcpu.vmx_mut().rflags = rflags;
+        }
+
+        return vcpu.vmx_mut().rflags;
+    }
+
+    fn vcpu_precreate(&self, vm: &mut Vm) -> Result<(), SystemError> {
+        if vm.arch.irqchip_mode != KvmIrqChipMode::None || !vmx_info().enable_ipiv {
+            return Ok(());
+        }
+
+        let kvm_vmx = vm.kvm_vmx_mut();
+
+        if kvm_vmx.pid_table.is_some() {
+            return Ok(());
+        }
+
+        kvm_vmx.pid_table = Some(unsafe { Box::new_zeroed().assume_init() });
+        Ok(())
+    }
+
+    fn set_segment(&self, vcpu: &mut VirtCpu, var: &mut UapiKvmSegment, seg: VcpuSegment) {
+        vcpu.vmx_mut().emulation_required = vmx_info().emulation_required(vcpu);
+        *var = vmx_info()._vmx_set_segment(vcpu, *var, seg);
+    }
+
+    fn get_segment(
+        &self,
+        vcpu: &mut VirtCpu,
+        var: UapiKvmSegment,
+        seg: VcpuSegment,
+    ) -> UapiKvmSegment {
+        return vmx_info().vmx_get_segment(vcpu, var, seg);
+    }
+
+    fn get_idt(&self, _vcpu: &mut VirtCpu, dt: &mut x86::dtables::DescriptorTablePointer<u8>) {
+        dt.limit = VmxAsm::vmx_vmread(guest::IDTR_LIMIT) as u16;
+        dt.base = VmxAsm::vmx_vmread(guest::IDTR_BASE) as usize as *const _;
+    }
+
+    fn set_idt(&self, _vcpu: &mut VirtCpu, dt: &x86::dtables::DescriptorTablePointer<u8>) {
+        VmxAsm::vmx_vmwrite(guest::IDTR_LIMIT, dt.limit as u64);
+        VmxAsm::vmx_vmwrite(guest::IDTR_BASE, dt.base as usize as u64);
+    }
+
+    fn get_gdt(&self, _vcpu: &mut VirtCpu, dt: &mut x86::dtables::DescriptorTablePointer<u8>) {
+        dt.limit = VmxAsm::vmx_vmread(guest::GDTR_LIMIT) as u16;
+        dt.base = VmxAsm::vmx_vmread(guest::GDTR_BASE) as usize as *const _;
+    }
+
+    fn set_gdt(&self, _vcpu: &mut VirtCpu, dt: &x86::dtables::DescriptorTablePointer<u8>) {
+        VmxAsm::vmx_vmwrite(guest::GDTR_LIMIT, dt.limit as u64);
+        VmxAsm::vmx_vmwrite(guest::GDTR_BASE, dt.base as usize as u64);
+    }
+
+    fn is_vaild_cr0(&self, vcpu: &VirtCpu, cr0: Cr0) -> bool {
+        if vcpu.arch.is_guest_mode() {
+            todo!()
+        }
+
+        // TODO: 判断vmx->nested->vmxon
+
+        true
+    }
+
+    fn is_vaild_cr4(&self, vcpu: &VirtCpu, cr4: Cr4) -> bool {
+        if cr4.contains(Cr4::CR4_ENABLE_VMX) && vcpu.arch.is_smm() {
+            return false;
+        }
+
+        // TODO: 判断vmx->nested->vmxon
+
+        return true;
+    }
+
+    fn post_set_cr3(&self, vcpu: &VirtCpu, cr3: u64) {
+        // Nothing
+    }
+
+    fn vcpu_run(&self, vcpu: &mut VirtCpu) {
+        if unlikely(vmx_info().enable_vnmi && vcpu.vmx().loaded_vmcs().soft_vnmi_blocked) {
+            todo!()
+        }
+
+        if unlikely(vcpu.vmx().emulation_required) {
+            todo!()
+        }
+
+        if vcpu.vmx().ple_window_dirty {
+            vcpu.vmx_mut().ple_window_dirty = false;
+            VmxAsm::vmx_vmwrite(control::PLE_WINDOW, vcpu.vmx().ple_window as u64);
+        }
+
+        if vcpu.arch.is_register_dirty(KvmReg::VcpuRegsRsp) {
+            VmxAsm::vmx_vmwrite(guest::RSP, vcpu.arch.regs[KvmReg::VcpuRegsRsp as usize]);
+        }
+        if vcpu.arch.is_register_dirty(KvmReg::VcpuRegsRip) {
+            VmxAsm::vmx_vmwrite(guest::RIP, vcpu.arch.regs[KvmReg::VcpuRegsRip as usize]);
+        }
+
+        vcpu.arch.clear_dirty();
+
+        let cr3 = Cr3::read().1;
+        if unlikely(cr3 != vcpu.vmx().loaded_vmcs().host_state.cr3) {
+            VmxAsm::vmx_vmwrite(host::CR3, cr3.bits());
+            vcpu.vmx().loaded_vmcs().host_state.cr3 = cr3;
+        }
+
+        let cr4 = unsafe { cr4() };
+        if unlikely(cr4 != vcpu.vmx().loaded_vmcs().host_state.cr4) {
+            VmxAsm::vmx_vmwrite(host::CR4, cr4.bits() as u64);
+            vcpu.vmx().loaded_vmcs().host_state.cr4 = cr4;
+        }
+
+        // TODO: set_debugreg
+
+        if vcpu.guest_debug.contains(GuestDebug::SINGLESTEP) {
+            todo!()
+        }
+
+        vcpu.load_guest_xsave_state();
+
+        // TODO: pt_guest_enter
+
+        // TODO: atomic_switch_perf_msrs
+
+        if vmx_info().enable_preemption_timer {
+            todo!()
+        }
+
+        Vmx::vmx_vcpu_enter_exit(vcpu, vcpu.vmx().vmx_vcpu_run_flags());
+
         todo!()
     }
 }
@@ -500,6 +1074,11 @@ static mut VMX: Option<Vmx> = None;
 #[inline]
 pub fn vmx_info() -> &'static Vmx {
     unsafe { VMX.as_ref().unwrap() }
+}
+
+#[inline]
+pub fn vmx_info_mut() -> &'static mut Vmx {
+    unsafe { VMX.as_mut().unwrap() }
 }
 
 #[inline(never)]
@@ -520,7 +1099,7 @@ pub struct Vmx {
     pub host_idt_base: u64,
     pub vmcs_config: VmcsConfig,
     pub vmx_cap: VmxCapability,
-    pub vpid_bitmap: SpinLock<StaticBitmap<{ 1 << 16 }>>,
+    pub vpid_bitmap: SpinLock<AllocBitmap>,
     pub enable_vpid: bool,
     pub enable_ept: bool,
     pub enable_ept_ad: bool,
@@ -534,6 +1113,8 @@ pub struct Vmx {
     pub enable_pml: bool,
     pub enable_preemption_timer: bool,
 
+    pub enable_vmware_backdoor: bool,
+
     pub nested: bool,
 
     pub ple_gap: u32,
@@ -545,35 +1126,39 @@ pub struct Vmx {
     pub pt_mode: ProcessorTraceMode,
 }
 
-impl Default for Vmx {
-    fn default() -> Self {
-        Self {
-            host_idt_base: Default::default(),
-            vmcs_config: Default::default(),
-            vmx_cap: Default::default(),
-            vpid_bitmap: SpinLock::new(StaticBitmap::new()),
-            enable_vpid: true,
-            enable_ept: true,
-            enable_ept_ad: true,
-            enable_unrestricted_guest: true,
-            enable_flexpriority: true,
-            enable_vnmi: true,
-            enable_sgx: true,
-            ple_gap: 128,
-            ple_window: 4096,
-            ple_window_grow: 2,
-            ple_window_max: u32::MAX,
-            ple_window_shrink: 0,
-            enable_apicv: true,
-            enable_ipiv: true,
-            enable_pml: true,
-            enable_preemption_timer: true,
-            pt_mode: ProcessorTraceMode::System,
-            emulate_invalid_guest_state: true,
+impl Vmx {
+    fn init(&mut self) {
+        let mut bitmap = AllocBitmap::new(1 << 16);
 
-            // 目前先不管嵌套虚拟化，后续再实现
-            nested: true,
-        }
+        // 0为vpid的非法值
+        bitmap.set(0, true);
+
+        self.host_idt_base = Default::default();
+        self.vmcs_config = Default::default();
+        self.vmx_cap = Default::default();
+        self.vpid_bitmap = SpinLock::new(bitmap);
+        self.enable_vpid = true;
+        self.enable_ept = true;
+        self.enable_ept_ad = true;
+        self.enable_unrestricted_guest = true;
+        self.enable_flexpriority = true;
+        self.enable_vnmi = true;
+        self.enable_sgx = true;
+        self.ple_gap = 128;
+        self.ple_window = 4096;
+        self.ple_window_grow = 2;
+        self.ple_window_max = u32::MAX;
+        self.ple_window_shrink = 0;
+        self.enable_apicv = true;
+        self.enable_ipiv = true;
+        self.enable_pml = true;
+        self.enable_preemption_timer = true;
+        self.pt_mode = ProcessorTraceMode::System;
+        self.emulate_invalid_guest_state = true;
+
+        // 目前先不管嵌套虚拟化，后续再实现
+        self.nested = false;
+        self.enable_vmware_backdoor = false;
     }
 }
 
@@ -869,6 +1454,14 @@ impl Vmx {
         }
     }
 
+    pub fn vpid_sync_context(&self, vpid: u16) {
+        if self.has_invvpid_single() {
+            VmxAsm::sync_vcpu_single(vpid);
+        } else if vpid != 0 {
+            VmxAsm::sync_vcpu_global();
+        }
+    }
+
     pub fn possible_passthrough_msr_slot(msr: u32) -> Option<usize> {
         for (idx, val) in Self::VMX_POSSIBLE_PASSTHROUGH_MSRS.iter().enumerate() {
             if *val == msr {
@@ -887,6 +1480,899 @@ impl Vmx {
         // TODO:先这样写
         *L1TF_VMX_MITIGATION.write() = VmxL1dFlushState::FlushNotRequired;
     }
+
+    fn vmx_reset_vcpu(&mut self, vcpu: &mut VirtCpu, vm: &Vm) {
+        self.init_vmcs(vcpu, vm);
+
+        if self.nested {
+            todo!()
+        }
+
+        // TODO: vcpu_setup_sgx_lepubkeyhash
+
+        // TODO: nested
+
+        vcpu.arch.microcode_version = 0x100000000;
+
+        let vmx = vcpu.vmx_mut();
+        vmx.msr_ia32_feature_control_valid_bits = 1 << 0;
+
+        vmx.post_intr_desc.control.set_nv(0xf2);
+        vmx.post_intr_desc.control.set_sn(true);
+    }
+
+    fn init_vmcs(&mut self, vcpu: &mut VirtCpu, vm: &Vm) {
+        let kvm_vmx = vm.kvm_vmx();
+        if vmx_info().nested {
+            todo!()
+        }
+
+        if vmx_info().has_msr_bitmap() {
+            VmxAsm::vmx_vmwrite(
+                control::MSR_BITMAPS_ADDR_FULL,
+                vcpu.vmx().vmcs01.lock().msr_bitmap.phys_addr() as u64,
+            )
+        }
+
+        VmxAsm::vmx_vmwrite(guest::LINK_PTR_FULL, u64::MAX);
+
+        let mut loaded_vmcs = vcpu.vmx().loaded_vmcs.lock();
+
+        loaded_vmcs.controls_set(
+            ControlsType::Pin,
+            self.get_pin_based_exec_controls(vcpu).bits() as u64,
+        );
+
+        loaded_vmcs.controls_set(
+            ControlsType::Exec,
+            self.get_exec_controls(vcpu, &vm.arch).bits() as u64,
+        );
+
+        if self.has_sceondary_exec_ctrls() {
+            loaded_vmcs.controls_set(
+                ControlsType::SecondaryExec,
+                self.get_secondary_exec_controls(vcpu, vm).bits() as u64,
+            )
+        }
+
+        if self.has_tertiary_exec_ctrls() {
+            todo!()
+        }
+
+        drop(loaded_vmcs);
+
+        if self.enable_apicv && vcpu.arch.lapic_in_kernel() {
+            VmxAsm::vmx_vmwrite(control::EOI_EXIT0_FULL, 0);
+            VmxAsm::vmx_vmwrite(control::EOI_EXIT1_FULL, 0);
+            VmxAsm::vmx_vmwrite(control::EOI_EXIT2_FULL, 0);
+            VmxAsm::vmx_vmwrite(control::EOI_EXIT3_FULL, 0);
+
+            VmxAsm::vmx_vmwrite(guest::INTERRUPT_STATUS, 0);
+
+            VmxAsm::vmx_vmwrite(control::POSTED_INTERRUPT_NOTIFICATION_VECTOR, 0xf2);
+            VmxAsm::vmx_vmwrite(
+                control::POSTED_INTERRUPT_DESC_ADDR_FULL,
+                virt_2_phys(&vcpu.vmx().post_intr_desc as *const _ as usize) as u64,
+            )
+        }
+
+        if self.enable_apicv && vcpu.arch.lapic_in_kernel() {
+            // PID_POINTER_TABLE
+            VmxAsm::vmx_vmwrite(
+                0x2042,
+                virt_2_phys(kvm_vmx.pid_table().as_ptr() as usize) as u64,
+            );
+            // LAST_PID_POINTER_INDEX
+            VmxAsm::vmx_vmwrite(0x08, vm.arch.max_vcpu_ids as u64 - 1);
+        }
+
+        if !vm.arch.pause_in_guest {
+            VmxAsm::vmx_vmwrite(control::PLE_GAP, self.ple_gap as u64);
+            vcpu.vmx_mut().ple_window = self.ple_window;
+            vcpu.vmx_mut().ple_window_dirty = true;
+        }
+
+        if vm
+            .arch
+            .notify_vmexit_flags
+            .contains(NotifyVmExitFlags::KVM_X86_NOTIFY_VMEXIT_ENABLED)
+        {
+            // NOTIFY_WINDOW
+            VmxAsm::vmx_vmwrite(0x4024, vm.arch.notify_window as u64);
+        }
+
+        VmxAsm::vmx_vmwrite(control::PAGE_FAULT_ERR_CODE_MASK, 0);
+        VmxAsm::vmx_vmwrite(control::PAGE_FAULT_ERR_CODE_MATCH, 0);
+        VmxAsm::vmx_vmwrite(control::CR3_TARGET_COUNT, 0);
+
+        VmxAsm::vmx_vmwrite(host::FS_SELECTOR, 0);
+        VmxAsm::vmx_vmwrite(host::GS_SELECTOR, 0);
+        self.set_constant_host_state(vcpu);
+
+        VmxAsm::vmx_vmwrite(host::FS_BASE, 0);
+        VmxAsm::vmx_vmwrite(host::GS_BASE, 0);
+
+        if self.has_vmfunc() {
+            VmxAsm::vmx_vmwrite(control::VM_FUNCTION_CONTROLS_FULL, 0);
+        }
+
+        VmxAsm::vmx_vmwrite(control::VMEXIT_MSR_STORE_COUNT, 0);
+        VmxAsm::vmx_vmwrite(control::VMEXIT_MSR_LOAD_COUNT, 0);
+        VmxAsm::vmx_vmwrite(
+            control::VMEXIT_MSR_LOAD_ADDR_FULL,
+            virt_2_phys(vcpu.vmx().msr_autoload.host.val.as_ptr() as *const _ as usize) as u64,
+        );
+        VmxAsm::vmx_vmwrite(control::VMENTRY_MSR_LOAD_COUNT, 0);
+        VmxAsm::vmx_vmwrite(
+            control::VMENTRY_MSR_LOAD_ADDR_FULL,
+            virt_2_phys(vcpu.vmx().msr_autoload.guest.val.as_ptr() as usize) as u64,
+        );
+
+        if self
+            .vmcs_config
+            .vmentry_ctrl
+            .contains(EntryControls::LOAD_IA32_PAT)
+        {
+            VmxAsm::vmx_vmwrite(guest::IA32_PAT_FULL, vcpu.arch.pat)
+        }
+
+        let mut loaded_vmcs = vcpu.vmx().loaded_vmcs.lock();
+        loaded_vmcs.controls_set(
+            ControlsType::VmExit,
+            self.get_vmexit_controls().bits() as u64,
+        );
+
+        loaded_vmcs.controls_set(
+            ControlsType::VmEntry,
+            self.get_vmentry_controls().bits() as u64,
+        );
+
+        drop(loaded_vmcs);
+
+        vcpu.arch.cr0_guest_owned_bits = self.l1_guest_owned_cr0_bits();
+        VmxAsm::vmx_vmwrite(
+            control::CR0_GUEST_HOST_MASK,
+            (!vcpu.arch.cr0_guest_owned_bits).bits() as u64,
+        );
+
+        self.set_cr4_guest_host_mask(&mut vcpu.arch);
+
+        if vcpu.vmx().vpid != 0 {
+            VmxAsm::vmx_vmwrite(control::VPID, vcpu.vmx().vpid as u64);
+        }
+
+        if self.has_xsaves() {
+            VmxAsm::vmx_vmwrite(control::XSS_EXITING_BITMAP_FULL, 0);
+        }
+
+        if self.enable_pml {
+            VmxAsm::vmx_vmwrite(
+                control::PML_ADDR_FULL,
+                virt_2_phys(vcpu.vmx().pml_pg.as_ref().as_ptr() as usize) as u64,
+            );
+
+            VmxAsm::vmx_vmwrite(guest::PML_INDEX, VmxVCpuPriv::PML_ENTITY_NUM as u64 - 1);
+        }
+
+        // TODO: vmx_write_encls_bitmap
+
+        if self.pt_mode == ProcessorTraceMode::HostGuest {
+            todo!()
+        }
+
+        VmxAsm::vmx_vmwrite(guest::IA32_SYSENTER_CS, 0);
+        VmxAsm::vmx_vmwrite(guest::IA32_SYSENTER_ESP, 0);
+        VmxAsm::vmx_vmwrite(guest::IA32_SYSENTER_EIP, 0);
+        VmxAsm::vmx_vmwrite(guest::IA32_DEBUGCTL_FULL, 0);
+
+        if self.has_tpr_shadow() {
+            VmxAsm::vmx_vmwrite(control::VIRT_APIC_ADDR_FULL, 0);
+            if vcpu.arch.lapic_in_kernel() {
+                VmxAsm::vmx_vmwrite(
+                    control::VIRT_APIC_ADDR_FULL,
+                    virt_2_phys(vcpu.arch.lapic().regs.as_ptr() as usize) as u64,
+                );
+            }
+
+            VmxAsm::vmx_vmwrite(control::TPR_THRESHOLD, 0);
+        }
+
+        self.setup_uret_msrs(vcpu);
+    }
+
+    fn setup_uret_msrs(&self, vcpu: &mut VirtCpu) {
+        // 是否加载syscall相关msr
+        let load_syscall_msrs =
+            vcpu.arch.is_long_mode() && vcpu.arch.efer.contains(EferFlags::SYSTEM_CALL_EXTENSIONS);
+
+        self.setup_uret_msr(vcpu, msr::IA32_STAR, load_syscall_msrs);
+        self.setup_uret_msr(vcpu, msr::IA32_LSTAR, load_syscall_msrs);
+        self.setup_uret_msr(vcpu, msr::IA32_FMASK, load_syscall_msrs);
+
+        let load_efer = self.update_transition_efer(vcpu);
+        self.setup_uret_msr(vcpu, msr::IA32_EFER, load_efer);
+
+        // TODO: MSR_TSC_AUX
+
+        self.setup_uret_msr(
+            vcpu,
+            msr::MSR_IA32_TSX_CTRL,
+            CpuId::default()
+                .get_extended_feature_info()
+                .unwrap()
+                .has_rtm(),
+        );
+
+        vcpu.vmx_mut().guest_uret_msrs_loaded = false;
+    }
+
+    fn setup_uret_msr(&self, vcpu: &mut VirtCpu, msr: u32, load_into_hardware: bool) {
+        let uret_msr = vcpu.vmx_mut().find_uret_msr_mut(msr);
+
+        if let Some(msr) = uret_msr {
+            msr.load_into_hardware = load_into_hardware;
+        }
+    }
+
+    fn update_transition_efer(&self, vcpu: &mut VirtCpu) -> bool {
+        let mut guest_efer = vcpu.arch.efer;
+        let mut ignore_efer = EferFlags::empty();
+        if !self.enable_ept {
+            guest_efer.insert(EferFlags::NO_EXECUTE_ENABLE);
+        }
+
+        ignore_efer.insert(EferFlags::SYSTEM_CALL_EXTENSIONS);
+
+        ignore_efer.insert(EferFlags::LONG_MODE_ACTIVE | EferFlags::LONG_MODE_ENABLE);
+
+        if guest_efer.contains(EferFlags::LONG_MODE_ACTIVE) {
+            ignore_efer.remove(EferFlags::SYSTEM_CALL_EXTENSIONS);
+        }
+
+        if self.has_load_ia32_efer()
+            || (self.enable_ept
+                && (vcpu.arch.efer ^ x86_kvm_manager().host_efer)
+                    .contains(EferFlags::NO_EXECUTE_ENABLE))
+        {
+            if !guest_efer.contains(EferFlags::LONG_MODE_ACTIVE) {
+                guest_efer.remove(EferFlags::LONG_MODE_ENABLE);
+            }
+
+            if guest_efer != x86_kvm_manager().host_efer {
+                vcpu.vmx_mut().add_atomic_switch_msr(
+                    msr::IA32_EFER,
+                    guest_efer.bits().into(),
+                    x86_kvm_manager().host_efer.bits().into(),
+                    false,
+                );
+            } else {
+                vcpu.vmx_mut().clear_atomic_switch_msr(msr::IA32_EFER);
+            }
+
+            return false;
+        }
+
+        let idx = x86_kvm_manager().find_user_return_msr_idx(msr::IA32_EFER);
+        if let Some(i) = idx {
+            vcpu.vmx_mut().clear_atomic_switch_msr(msr::IA32_EFER);
+
+            guest_efer.remove(ignore_efer);
+            guest_efer.insert(x86_kvm_manager().host_efer & ignore_efer);
+
+            vcpu.vmx_mut().guest_uret_msrs[i].data = guest_efer.bits().into();
+            vcpu.vmx_mut().guest_uret_msrs[i].mask = (!ignore_efer).bits().into();
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    fn set_cr4_guest_host_mask(&self, arch: &mut VirtCpuArch) {
+        arch.cr4_guest_owned_bits =
+            x86_kvm_manager().possible_cr4_guest & (!arch.cr4_guest_rsvd_bits);
+
+        if !self.enable_ept {
+            arch.cr4_guest_owned_bits
+                .remove(x86_kvm_manager().cr4_tlbflush_bits);
+            arch.cr4_guest_owned_bits
+                .remove(x86_kvm_manager().cr4_pdptr_bits);
+        }
+
+        if arch.is_guest_mode() {
+            // 嵌套todo
+            todo!()
+        }
+
+        VmxAsm::vmx_vmwrite(
+            control::CR4_GUEST_HOST_MASK,
+            (!arch.cr4_guest_owned_bits).bits() as u64,
+        );
+    }
+
+    fn l1_guest_owned_cr0_bits(&self) -> Cr0 {
+        let mut cr0 = x86_kvm_manager().possible_cr0_guest;
+
+        if !self.enable_ept {
+            cr0.remove(Cr0::CR0_WRITE_PROTECT)
+        }
+
+        return cr0;
+    }
+
+    /// 设置在guest生命周期中host不变的部分
+    fn set_constant_host_state(&self, vcpu: &mut VirtCpu) {
+        let loaded_vmcs_host_state = &mut vcpu.vmx().loaded_vmcs.lock().host_state;
+
+        VmxAsm::vmx_vmwrite(host::CR0, unsafe { cr0() }.bits() as u64);
+
+        let cr3 = Cr3::read().1;
+        VmxAsm::vmx_vmwrite(host::CR3, cr3.bits());
+        loaded_vmcs_host_state.cr3 = cr3;
+
+        let cr4 = unsafe { cr4() };
+        VmxAsm::vmx_vmwrite(host::CR4, cr4.bits() as u64);
+        loaded_vmcs_host_state.cr4 = cr4;
+
+        VmxAsm::vmx_vmwrite(
+            host::CS_SELECTOR,
+            (segmentation::cs().bits() & (!0x07)).into(),
+        );
+
+        VmxAsm::vmx_vmwrite(host::DS_SELECTOR, 0);
+        VmxAsm::vmx_vmwrite(host::ES_SELECTOR, 0);
+
+        VmxAsm::vmx_vmwrite(
+            host::SS_SELECTOR,
+            (segmentation::ds().bits() & (!0x07)).into(),
+        );
+        VmxAsm::vmx_vmwrite(
+            host::TR_SELECTOR,
+            (unsafe { x86::task::tr().bits() } & (!0x07)).into(),
+        );
+
+        VmxAsm::vmx_vmwrite(host::IDTR_BASE, self.host_idt_base);
+        VmxAsm::vmx_vmwrite(host::RIP, vmx_vmexit as u64);
+
+        let val = unsafe { rdmsr(msr::IA32_SYSENTER_CS) };
+
+        // low32
+        VmxAsm::vmx_vmwrite(host::IA32_SYSENTER_CS, (val << 32) >> 32);
+
+        // VmxAsm::vmx_vmwrite(host::IA32_SYSENTER_ESP, 0);
+
+        let tmp = unsafe { rdmsr(msr::IA32_SYSENTER_EIP) };
+        VmxAsm::vmx_vmwrite(host::IA32_SYSENTER_EIP, (tmp << 32) >> 32);
+
+        if self
+            .vmcs_config
+            .vmexit_ctrl
+            .contains(ExitControls::LOAD_IA32_PAT)
+        {
+            VmxAsm::vmx_vmwrite(host::IA32_PAT_FULL, unsafe { rdmsr(msr::IA32_PAT) });
+        }
+
+        if self.has_load_ia32_efer() {
+            VmxAsm::vmx_vmwrite(
+                host::IA32_EFER_FULL,
+                x86_kvm_manager().host_efer.bits() as u64,
+            );
+        }
+    }
+
+    fn get_pin_based_exec_controls(&self, vcpu: &VirtCpu) -> PinbasedControls {
+        let mut ctrls = self.vmcs_config.pin_based_exec_ctrl;
+
+        if vcpu.arch.vcpu_apicv_active() {
+            ctrls.remove(PinbasedControls::POSTED_INTERRUPTS);
+        }
+
+        if !self.enable_vnmi {
+            ctrls.remove(PinbasedControls::VIRTUAL_NMIS);
+        }
+
+        if !self.enable_preemption_timer {
+            ctrls.remove(PinbasedControls::VMX_PREEMPTION_TIMER);
+        }
+
+        return ctrls;
+    }
+
+    fn get_exec_controls(&self, vcpu: &VirtCpu, vmarch: &KvmArch) -> PrimaryControls {
+        let mut ctrls = self.vmcs_config.cpu_based_exec_ctrl;
+
+        ctrls.remove(
+            PrimaryControls::RDTSC_EXITING
+                | PrimaryControls::USE_IO_BITMAPS
+                | PrimaryControls::MONITOR_TRAP_FLAG
+                | PrimaryControls::PAUSE_EXITING,
+        );
+
+        ctrls.remove(
+            PrimaryControls::NMI_WINDOW_EXITING | PrimaryControls::INTERRUPT_WINDOW_EXITING,
+        );
+
+        ctrls.remove(PrimaryControls::MOV_DR_EXITING);
+
+        if vcpu.arch.lapic_in_kernel() && self.has_tpr_shadow() {
+            ctrls.remove(PrimaryControls::USE_TPR_SHADOW);
+        }
+
+        if ctrls.contains(PrimaryControls::USE_TPR_SHADOW) {
+            ctrls.remove(PrimaryControls::CR8_LOAD_EXITING | PrimaryControls::CR8_STORE_EXITING);
+        } else {
+            ctrls.insert(PrimaryControls::CR8_LOAD_EXITING | PrimaryControls::CR8_STORE_EXITING);
+        }
+
+        if self.enable_ept {
+            ctrls.remove(
+                PrimaryControls::CR3_LOAD_EXITING
+                    | PrimaryControls::CR3_STORE_EXITING
+                    | PrimaryControls::INVLPG_EXITING,
+            );
+        }
+
+        if vmarch.mwait_in_guest {
+            ctrls.remove(PrimaryControls::MWAIT_EXITING | PrimaryControls::MONITOR_EXITING);
+        }
+
+        if vmarch.hlt_in_guest {
+            ctrls.remove(PrimaryControls::HLT_EXITING);
+        }
+
+        return ctrls;
+    }
+
+    fn get_secondary_exec_controls(&mut self, vcpu: &VirtCpu, vm: &Vm) -> SecondaryControls {
+        let mut ctrls = self.vmcs_config.cpu_based_2nd_exec_ctrl;
+
+        if self.pt_mode == ProcessorTraceMode::System {
+            ctrls.remove(
+                SecondaryControls::INTEL_PT_GUEST_PHYSICAL | SecondaryControls::CONCEAL_VMX_FROM_PT,
+            );
+        }
+
+        if !(self.enable_flexpriority && vcpu.arch.lapic_in_kernel()) {
+            ctrls.remove(SecondaryControls::VIRTUALIZE_APIC)
+        }
+
+        if vcpu.vmx().vpid == 0 {
+            ctrls.remove(SecondaryControls::ENABLE_VPID);
+        }
+
+        if !self.enable_ept {
+            ctrls.remove(SecondaryControls::ENABLE_EPT);
+            self.enable_unrestricted_guest = false;
+        }
+
+        if !self.enable_unrestricted_guest {
+            ctrls.remove(SecondaryControls::UNRESTRICTED_GUEST);
+        }
+
+        if vm.arch.pause_in_guest {
+            ctrls.remove(SecondaryControls::PAUSE_LOOP_EXITING);
+        }
+        if !vcpu.arch.vcpu_apicv_active() {
+            ctrls.remove(
+                SecondaryControls::VIRTUALIZE_APIC_REGISTER
+                    | SecondaryControls::VIRTUAL_INTERRUPT_DELIVERY,
+            );
+        }
+
+        ctrls.remove(SecondaryControls::VIRTUALIZE_X2APIC);
+
+        ctrls.remove(SecondaryControls::ENABLE_VM_FUNCTIONS);
+
+        ctrls.remove(SecondaryControls::DTABLE_EXITING);
+
+        ctrls.remove(SecondaryControls::VMCS_SHADOWING);
+
+        if !self.enable_pml || vm.nr_memslots_dirty_logging == 0 {
+            ctrls.remove(SecondaryControls::ENABLE_PML);
+        }
+
+        // TODO: vmx_adjust_sec_exec_feature
+
+        if self.has_rdtscp() {
+            kwarn!("adjust RDTSCP todo!");
+            // todo!()
+        }
+
+        return ctrls;
+    }
+
+    fn get_vmexit_controls(&self) -> ExitControls {
+        let mut ctrls = self.vmcs_config.vmexit_ctrl;
+
+        ctrls.remove(
+            ExitControls::SAVE_IA32_PAT
+                | ExitControls::SAVE_IA32_EFER
+                | ExitControls::SAVE_VMX_PREEMPTION_TIMER,
+        );
+
+        if self.pt_mode == ProcessorTraceMode::System {
+            ctrls.remove(ExitControls::CONCEAL_VMX_FROM_PT | ExitControls::CLEAR_IA32_RTIT_CTL);
+        }
+
+        // todo: cpu_has_perf_global_ctrl_bug
+
+        ctrls.remove(ExitControls::LOAD_IA32_PERF_GLOBAL_CTRL | ExitControls::LOAD_IA32_EFER);
+
+        ctrls
+    }
+
+    fn get_vmentry_controls(&self) -> EntryControls {
+        let mut ctrls = self.vmcs_config.vmentry_ctrl;
+
+        if self.pt_mode == ProcessorTraceMode::System {
+            ctrls.remove(EntryControls::CONCEAL_VMX_FROM_PT | EntryControls::LOAD_IA32_RTIT_CTL);
+        }
+
+        ctrls.remove(
+            EntryControls::LOAD_IA32_PERF_GLOBAL_CTRL
+                | EntryControls::LOAD_IA32_EFER
+                | EntryControls::IA32E_MODE_GUEST,
+        );
+
+        // todo: cpu_has_perf_global_ctrl_bug
+
+        ctrls
+    }
+
+    pub fn emulation_required(&self, vcpu: &mut VirtCpu) -> bool {
+        return self.emulate_invalid_guest_state && !self.guest_state_valid(vcpu);
+    }
+
+    pub fn guest_state_valid(&self, vcpu: &mut VirtCpu) -> bool {
+        return vcpu.is_unrestricted_guest() || self.__guest_state_valid(vcpu);
+    }
+
+    pub fn __guest_state_valid(&self, vcpu: &mut VirtCpu) -> bool {
+        if vcpu.arch.is_portected_mode()
+            || x86_kvm_ops().get_rflags(vcpu).contains(RFlags::FLAGS_VM)
+        {
+            if !self.rmode_segment_valid(vcpu, VcpuSegment::CS) {
+                return false;
+            }
+            if !self.rmode_segment_valid(vcpu, VcpuSegment::SS) {
+                return false;
+            }
+            if !self.rmode_segment_valid(vcpu, VcpuSegment::DS) {
+                return false;
+            }
+            if !self.rmode_segment_valid(vcpu, VcpuSegment::ES) {
+                return false;
+            }
+            if !self.rmode_segment_valid(vcpu, VcpuSegment::FS) {
+                return false;
+            }
+            if !self.rmode_segment_valid(vcpu, VcpuSegment::GS) {
+                return false;
+            }
+        } else {
+            todo!("protected mode guest state checks todo");
+        }
+
+        return true;
+    }
+
+    pub fn vmx_get_segment(
+        &self,
+        vcpu: &mut VirtCpu,
+        mut var: UapiKvmSegment,
+        seg: VcpuSegment,
+    ) -> UapiKvmSegment {
+        if vcpu.vmx().rmode.vm86_active && seg != VcpuSegment::LDTR {
+            var = vcpu.vmx().rmode.segs[seg as usize];
+            if seg == VcpuSegment::TR || var.selector == Vmx::vmx_read_guest_seg_selector(vcpu, seg)
+            {
+                return var;
+            }
+
+            var.base = Vmx::vmx_read_guest_seg_base(vcpu, seg);
+            var.selector = Vmx::vmx_read_guest_seg_selector(vcpu, seg);
+            return var;
+        }
+
+        var.base = Vmx::vmx_read_guest_seg_base(vcpu, seg);
+        var.limit = Vmx::vmx_read_guest_seg_limit(vcpu, seg);
+        var.selector = Vmx::vmx_read_guest_seg_selector(vcpu, seg);
+
+        let ar = Vmx::vmx_read_guest_seg_ar(vcpu, seg);
+
+        var.unusable = ((ar >> 16) & 1) as u8;
+        var.type_ = (ar & 15) as u8;
+        var.s = ((ar >> 4) & 1) as u8;
+        var.dpl = ((ar >> 5) & 3) as u8;
+
+        var.present = !var.unusable;
+        var.avl = ((ar >> 12) & 1) as u8;
+        var.l = ((ar >> 13) & 1) as u8;
+        var.db = ((ar >> 14) & 1) as u8;
+        var.g = ((ar >> 15) & 1) as u8;
+
+        return var;
+    }
+
+    pub fn _vmx_set_segment(
+        &self,
+        vcpu: &mut VirtCpu,
+        mut var: UapiKvmSegment,
+        seg: VcpuSegment,
+    ) -> UapiKvmSegment {
+        let sf = &KVM_VMX_SEGMENT_FIELDS[seg as usize];
+
+        vcpu.vmx_mut().segment_cache_clear();
+
+        if vcpu.vmx().rmode.vm86_active && seg != VcpuSegment::LDTR {
+            vcpu.vmx_mut().rmode.segs[seg as usize] = var;
+            if seg == VcpuSegment::TR {
+                VmxAsm::vmx_vmwrite(sf.selector, var.selector as u64);
+            } else if var.s != 0 {
+                Vmx::fix_rmode_seg(seg, &vcpu.vmx().rmode.segs[seg as usize]);
+            }
+            return var;
+        }
+
+        VmxAsm::vmx_vmwrite(sf.base, var.base);
+        VmxAsm::vmx_vmwrite(sf.limit, var.limit as u64);
+        VmxAsm::vmx_vmwrite(sf.selector, var.selector as u64);
+
+        if vcpu.is_unrestricted_guest() && seg != VcpuSegment::LDTR {
+            var.type_ |= 0x1;
+        }
+
+        VmxAsm::vmx_vmwrite(sf.ar_bytes, var.vmx_segment_access_rights() as u64);
+        return var;
+    }
+
+    pub fn rmode_segment_valid(&self, vcpu: &mut VirtCpu, seg: VcpuSegment) -> bool {
+        let mut var = UapiKvmSegment::default();
+        var = self.vmx_get_segment(vcpu, var, seg);
+
+        var.dpl = 0x3;
+
+        if seg == VcpuSegment::CS {
+            var.type_ = 0x3;
+        }
+
+        let ar = var.vmx_segment_access_rights();
+
+        if var.base != ((var.selector as u64) << 4) {
+            return false;
+        }
+
+        if var.limit != 0xffff {
+            return false;
+        }
+
+        if ar != 0xf3 {
+            return false;
+        }
+
+        true
+    }
+
+    pub fn fix_rmode_seg(seg: VcpuSegment, save: &UapiKvmSegment) {
+        let sf = &KVM_VMX_SEGMENT_FIELDS[seg as usize];
+
+        let mut var = *save;
+        var.dpl = 0x3;
+        if seg == VcpuSegment::CS {
+            var.type_ = 0x3;
+        }
+
+        if !vmx_info().emulate_invalid_guest_state {
+            var.selector = (var.base >> 4) as u16;
+            var.base = var.base & 0xffff0;
+            var.limit = 0xffff;
+            var.g = 0;
+            var.db = 0;
+            var.present = 1;
+            var.s = 1;
+            var.l = 0;
+            var.unusable = 0;
+            var.type_ = 0x3;
+            var.avl = 0;
+            if save.base & 0xf != 0 {
+                kwarn!("segment base is not paragraph aligned when entering protected mode (seg={seg:?})");
+            }
+        }
+
+        VmxAsm::vmx_vmwrite(sf.selector, var.selector as u64);
+        VmxAsm::vmx_vmwrite(sf.base, var.base);
+        VmxAsm::vmx_vmwrite(sf.limit, var.limit as u64);
+        VmxAsm::vmx_vmwrite(sf.ar_bytes, var.vmx_segment_access_rights() as u64);
+    }
+
+    pub fn fix_pmode_seg(
+        &self,
+        vcpu: &mut VirtCpu,
+        seg: VcpuSegment,
+        mut save: UapiKvmSegment,
+    ) -> UapiKvmSegment {
+        if self.emulate_invalid_guest_state {
+            if seg == VcpuSegment::CS || seg == VcpuSegment::SS {
+                save.selector &= !0x3;
+            }
+
+            save.dpl = (save.selector & 0x3) as u8;
+            save.s = 1;
+        }
+
+        self._vmx_set_segment(vcpu, save, seg);
+
+        return save;
+    }
+
+    pub fn enter_pmode(&self, vcpu: &mut VirtCpu) {
+        self.get_segment_with_rmode(vcpu, VcpuSegment::ES);
+        self.get_segment_with_rmode(vcpu, VcpuSegment::DS);
+        self.get_segment_with_rmode(vcpu, VcpuSegment::FS);
+        self.get_segment_with_rmode(vcpu, VcpuSegment::GS);
+        self.get_segment_with_rmode(vcpu, VcpuSegment::SS);
+        self.get_segment_with_rmode(vcpu, VcpuSegment::CS);
+
+        vcpu.vmx_mut().rmode.vm86_active = false;
+
+        self.set_segment_with_rmode(vcpu, VcpuSegment::TR);
+
+        let mut flags = RFlags::from_bits_truncate(VmxAsm::vmx_vmread(guest::RFLAGS));
+
+        flags.remove(RFlags::FLAGS_IOPL3 | RFlags::FLAGS_VM);
+
+        flags.insert(vcpu.vmx().rmode.save_rflags & (RFlags::FLAGS_IOPL3 | RFlags::FLAGS_VM));
+
+        VmxAsm::vmx_vmwrite(guest::RFLAGS, flags.bits());
+
+        let cr4 = (Cr4::from_bits_truncate(VmxAsm::vmx_vmread(guest::CR4) as usize)
+            & (!Cr4::CR4_ENABLE_VME))
+            | (Cr4::from_bits_truncate(VmxAsm::vmx_vmread(control::CR4_READ_SHADOW) as usize)
+                & Cr4::CR4_ENABLE_VME);
+        VmxAsm::vmx_vmwrite(guest::CR4, cr4.bits() as u64);
+
+        VmxKvmFunc.update_exception_bitmap(vcpu);
+
+        self.fix_pmode_seg_with_rmode(vcpu, VcpuSegment::CS);
+        self.fix_pmode_seg_with_rmode(vcpu, VcpuSegment::SS);
+        self.fix_pmode_seg_with_rmode(vcpu, VcpuSegment::ES);
+        self.fix_pmode_seg_with_rmode(vcpu, VcpuSegment::DS);
+        self.fix_pmode_seg_with_rmode(vcpu, VcpuSegment::FS);
+        self.fix_pmode_seg_with_rmode(vcpu, VcpuSegment::GS);
+    }
+
+    fn fix_pmode_seg_with_rmode(&self, vcpu: &mut VirtCpu, seg: VcpuSegment) {
+        let segment = vcpu.vmx().rmode.segs[seg as usize];
+        vcpu.vmx_mut().rmode.segs[seg as usize] = self.fix_pmode_seg(vcpu, seg, segment);
+    }
+
+    fn get_segment_with_rmode(&self, vcpu: &mut VirtCpu, seg: VcpuSegment) {
+        let segment = vcpu.vmx().rmode.segs[seg as usize];
+        vcpu.vmx_mut().rmode.segs[seg as usize] = self.vmx_get_segment(vcpu, segment, seg);
+    }
+
+    fn set_segment_with_rmode(&self, vcpu: &mut VirtCpu, seg: VcpuSegment) {
+        let segment = vcpu.vmx().rmode.segs[seg as usize];
+        vcpu.vmx_mut().rmode.segs[seg as usize] = self._vmx_set_segment(vcpu, segment, seg);
+    }
+
+    pub fn enter_rmode(&self, vcpu: &mut VirtCpu, vm: &Vm) {
+        let kvm_vmx = vm.kvm_vmx();
+
+        self.get_segment_with_rmode(vcpu, VcpuSegment::TR);
+        self.get_segment_with_rmode(vcpu, VcpuSegment::ES);
+        self.get_segment_with_rmode(vcpu, VcpuSegment::DS);
+        self.get_segment_with_rmode(vcpu, VcpuSegment::FS);
+        self.get_segment_with_rmode(vcpu, VcpuSegment::GS);
+        self.get_segment_with_rmode(vcpu, VcpuSegment::SS);
+        self.get_segment_with_rmode(vcpu, VcpuSegment::CS);
+
+        vcpu.vmx_mut().rmode.vm86_active = true;
+
+        vcpu.vmx_mut().segment_cache_clear();
+
+        VmxAsm::vmx_vmwrite(guest::TR_BASE, kvm_vmx.tss_addr as u64);
+        VmxAsm::vmx_vmwrite(guest::TR_LIMIT, RMODE_TSS_SIZE as u64 - 1);
+        VmxAsm::vmx_vmwrite(guest::TR_ACCESS_RIGHTS, 0x008b);
+
+        let mut flags = RFlags::from_bits_truncate(VmxAsm::vmx_vmread(guest::RFLAGS));
+        vcpu.vmx_mut().rmode.save_rflags = flags;
+
+        flags.insert(RFlags::FLAGS_IOPL3 | RFlags::FLAGS_VM);
+
+        VmxAsm::vmx_vmwrite(guest::RFLAGS, flags.bits());
+        VmxAsm::vmx_vmwrite(
+            guest::CR4,
+            VmxAsm::vmx_vmread(guest::CR4) | Cr4::CR4_ENABLE_VME.bits() as u64,
+        );
+
+        VmxKvmFunc.update_exception_bitmap(vcpu);
+
+        self.fix_rmode_seg_with_rmode(vcpu, VcpuSegment::SS);
+        self.fix_rmode_seg_with_rmode(vcpu, VcpuSegment::CS);
+        self.fix_rmode_seg_with_rmode(vcpu, VcpuSegment::ES);
+        self.fix_rmode_seg_with_rmode(vcpu, VcpuSegment::DS);
+        self.fix_rmode_seg_with_rmode(vcpu, VcpuSegment::GS);
+        self.fix_rmode_seg_with_rmode(vcpu, VcpuSegment::FS);
+    }
+
+    fn fix_rmode_seg_with_rmode(&self, vcpu: &VirtCpu, seg: VcpuSegment) {
+        Vmx::fix_rmode_seg(seg, &vcpu.vmx().rmode.segs[seg as usize]);
+    }
+
+    pub fn vmx_read_guest_seg_ar(vcpu: &mut VirtCpu, seg: VcpuSegment) -> u32 {
+        if !Vmx::vmx_segment_cache_test_set(vcpu, seg, SegmentCacheField::AR) {
+            vcpu.vmx_mut().segment_cache.seg[seg as usize].ar =
+                VmxAsm::vmx_vmread(KVM_VMX_SEGMENT_FIELDS[seg as usize].ar_bytes) as u32;
+        }
+
+        return vcpu.vmx().segment_cache.seg[seg as usize].ar;
+    }
+
+    pub fn vmx_read_guest_seg_selector(vcpu: &mut VirtCpu, seg: VcpuSegment) -> u16 {
+        if !Vmx::vmx_segment_cache_test_set(vcpu, seg, SegmentCacheField::SEL) {
+            vcpu.vmx_mut().segment_cache.seg[seg as usize].selector =
+                VmxAsm::vmx_vmread(KVM_VMX_SEGMENT_FIELDS[seg as usize].selector) as u16;
+        }
+
+        return vcpu.vmx().segment_cache.seg[seg as usize].selector;
+    }
+
+    pub fn vmx_read_guest_seg_base(vcpu: &mut VirtCpu, seg: VcpuSegment) -> u64 {
+        if !Vmx::vmx_segment_cache_test_set(vcpu, seg, SegmentCacheField::BASE) {
+            vcpu.vmx_mut().segment_cache.seg[seg as usize].base =
+                VmxAsm::vmx_vmread(KVM_VMX_SEGMENT_FIELDS[seg as usize].base);
+        }
+
+        return vcpu.vmx().segment_cache.seg[seg as usize].base;
+    }
+
+    pub fn vmx_read_guest_seg_limit(vcpu: &mut VirtCpu, seg: VcpuSegment) -> u32 {
+        if !Vmx::vmx_segment_cache_test_set(vcpu, seg, SegmentCacheField::LIMIT) {
+            vcpu.vmx_mut().segment_cache.seg[seg as usize].limit =
+                VmxAsm::vmx_vmread(KVM_VMX_SEGMENT_FIELDS[seg as usize].limit) as u32;
+        }
+
+        return vcpu.vmx().segment_cache.seg[seg as usize].limit;
+    }
+
+    fn vmx_segment_cache_test_set(
+        vcpu: &mut VirtCpu,
+        seg: VcpuSegment,
+        field: SegmentCacheField,
+    ) -> bool {
+        let mask = 1u32 << (seg as usize * SegmentCacheField::NR as usize + field as usize);
+
+        if !vcpu.arch.is_register_available(KvmReg::VcpuExregSegments) {
+            vcpu.arch.mark_register_available(KvmReg::VcpuExregSegments);
+            vcpu.vmx_mut().segment_cache_clear();
+        }
+
+        let ret = vcpu.vmx().segment_cache.bitmask & mask;
+
+        vcpu.vmx_mut().segment_cache.bitmask |= mask;
+
+        return ret != 0;
+    }
+
+    pub fn vmx_vcpu_enter_exit(vcpu: &mut VirtCpu, flags: VmxRunFlag) {
+        // TODO: vmx_l1d_should_flush and mmio_stale_data_clear
+
+        // TODO: vmx_disable_fb_clear
+
+        if vcpu.arch.cr2 != unsafe { cr2() } as u64 {
+            unsafe { cr2_write(vcpu.arch.cr2) };
+        }
+
+        let fail =
+            unsafe { __vmx_vcpu_run(vcpu.vmx(), vcpu.arch.regs.as_ptr(), flags.bits as u32) };
+        vcpu.vmx_mut().fail = fail as u8;
+
+        todo!()
+    }
+}
+
+extern "C" {
+    fn __vmx_vcpu_run(vmx: &VmxVCpuPriv, regs: *const u64, flags: u32) -> i32;
 }
 
 struct VmcsEntryExitPair {
@@ -900,6 +2386,28 @@ impl VmcsEntryExitPair {
     }
 }
 
+#[derive(Debug, Default)]
+#[repr(C, align(64))]
+pub struct PostedIntrDesc {
+    pir: [u32; 8],
+    control: PostedIntrDescControl,
+    // 保留位
+    rsvd: [u32; 6],
+}
+
+#[bitfield(u64)]
+pub struct PostedIntrDescControl {
+    #[bits(1)]
+    on: bool,
+    #[bits(1)]
+    sn: bool,
+    #[bits(14)]
+    rsvd_1: u16,
+    nv: u8,
+    rsvd_2: u8,
+    ndst: u32,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VmxUretMsr {
     load_into_hardware: bool,
@@ -907,31 +2415,154 @@ pub struct VmxUretMsr {
     mask: u64,
 }
 
+#[derive(Debug, Default)]
+pub struct VmxMsrs {
+    nr: usize,
+    val: [VmxMsrEntry; Self::MAX_NR_LOADSTORE_MSRS],
+}
+
+impl VmxMsrs {
+    pub const MAX_NR_LOADSTORE_MSRS: usize = 8;
+
+    pub fn find_loadstore_msr_slot(&self, msr: u32) -> Option<usize> {
+        for i in 0..self.nr {
+            if self.val[i].index == msr {
+                return Some(i);
+            }
+        }
+
+        None
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct VmxMsrAutoLoad {
+    guest: VmxMsrs,
+    host: VmxMsrs,
+}
+
+#[derive(Debug)]
+pub struct VmxRMode {
+    pub vm86_active: bool,
+    pub save_rflags: RFlags,
+    pub segs: [UapiKvmSegment; 8],
+}
+
+impl Default for VmxRMode {
+    fn default() -> Self {
+        Self {
+            vm86_active: false,
+            save_rflags: RFlags::empty(),
+            segs: [UapiKvmSegment::default(); 8],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VmxSaveSegment {
+    selector: u16,
+    base: u64,
+    limit: u32,
+    ar: u32,
+}
+
+#[derive(Debug, Default)]
+pub struct VmxSegmentCache {
+    pub bitmask: u32,
+    pub seg: [VmxSaveSegment; 8],
+}
+
 #[derive(Debug)]
 pub struct VmxVCpuPriv {
-    vpid: Option<usize>,
+    vpid: u16,
+
+    fail: u8,
+
     vmcs01: Arc<LockedLoadedVmcs>,
     loaded_vmcs: Arc<LockedLoadedVmcs>,
     guest_uret_msrs: [VmxUretMsr; KvmArchManager::KVM_MAX_NR_USER_RETURN_MSRS],
+    guest_uret_msrs_loaded: bool,
+
+    post_intr_desc: PostedIntrDesc,
 
     shadow_msr_intercept_read: AllocBitmap,
     shadow_msr_intercept_write: AllocBitmap,
+
+    msr_ia32_feature_control: u64,
+    msr_ia32_feature_control_valid_bits: u64,
+
+    emulation_required: bool,
+
+    rflags: RFlags,
+
+    ple_window: u32,
+    ple_window_dirty: bool,
+
+    msr_autoload: VmxMsrAutoLoad,
+
+    pml_pg: Box<[u8; MMArch::PAGE_SIZE]>,
+
+    rmode: VmxRMode,
+
+    spec_ctrl: u64,
+    msr_ia32_umwait_control: u32,
+    hv_deadline_tsc: u64,
+
+    segment_cache: VmxSegmentCache,
+}
+
+#[derive(Debug, Default)]
+pub struct KvmVmx {
+    tss_addr: usize,
+    ept_identity_pagetable_done: bool,
+    ept_identity_map_addr: u64,
+    pid_table: Option<Box<[u64; MMArch::PAGE_SIZE]>>,
+}
+
+impl KvmVmx {
+    pub fn pid_table(&self) -> &[u64; MMArch::PAGE_SIZE] {
+        self.pid_table.as_ref().unwrap().as_ref()
+    }
 }
 
 impl VmxVCpuPriv {
+    pub const PML_ENTITY_NUM: usize = 512;
+
+    pub fn loaded_vmcs(&self) -> SpinLockGuard<LoadedVmcs> {
+        self.loaded_vmcs.lock()
+    }
+
     /// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/vmx/vmx.c#7452
     pub fn init(vcpu: &mut VirtCpu, vm: &Vm) {
         let vmcs = LockedLoadedVmcs::new();
+
+        // TODO: 改堆分配
         let mut vmx = Self {
-            vpid: None,
+            vpid: 0,
+            fail: 0,
             vmcs01: vmcs.clone(),
             loaded_vmcs: vmcs,
             guest_uret_msrs: [VmxUretMsr::default(); KvmArchManager::KVM_MAX_NR_USER_RETURN_MSRS],
             shadow_msr_intercept_read: AllocBitmap::new(16),
             shadow_msr_intercept_write: AllocBitmap::new(16),
+            post_intr_desc: PostedIntrDesc::default(),
+            ple_window: 0,
+            ple_window_dirty: false,
+            msr_autoload: VmxMsrAutoLoad::default(),
+            pml_pg: unsafe { Box::new_zeroed().assume_init() },
+            guest_uret_msrs_loaded: false,
+            msr_ia32_feature_control: 0,
+            msr_ia32_feature_control_valid_bits: 0,
+            rmode: VmxRMode::default(),
+            spec_ctrl: 0,
+            msr_ia32_umwait_control: 0,
+            hv_deadline_tsc: u64::MAX,
+            segment_cache: VmxSegmentCache::default(),
+            emulation_required: false,
+            rflags: RFlags::empty(),
         };
 
-        vmx.vpid = vmx_info().alloc_vpid();
+        vmx.vpid = vmx_info().alloc_vpid().unwrap_or_default() as u16;
 
         for i in 0..x86_kvm_manager().kvm_uret_msrs_list.len() {
             vmx.guest_uret_msrs[i].mask = u64::MAX;
@@ -991,6 +2622,12 @@ impl VmxVCpuPriv {
         }
     }
 
+    fn set_uret_msr(&mut self, msr: u32, data: u64) {
+        if let Some(msr) = self.find_uret_msr_mut(msr) {
+            msr.data = data;
+        }
+    }
+
     pub fn find_uret_msr_mut(&mut self, msr: u32) -> Option<&mut VmxUretMsr> {
         let idx = x86_kvm_manager().find_user_return_msr_idx(msr);
         if let Some(index) = idx {
@@ -998,6 +2635,14 @@ impl VmxVCpuPriv {
         } else {
             return None;
         }
+    }
+
+    fn set_guest_uret_msr(&mut self, msr: &VmxUretMsr, data: u64) -> Result<(), SystemError> {
+        if msr.load_into_hardware {
+            todo!()
+        }
+
+        Ok(())
     }
 
     /// ## 禁用对特定的 MSR 的拦截
@@ -1044,6 +2689,175 @@ impl VmxVCpuPriv {
             msr_bitmap.ctl(msr, VmxMsrBitmapAction::Clear, VmxMsrBitmapAccess::Write);
         }
     }
+
+    #[inline]
+    pub fn segment_cache_clear(&mut self) {
+        self.segment_cache.bitmask = 0;
+    }
+
+    pub fn clear_atomic_switch_msr(&mut self, msr: u32) {
+        match msr {
+            msr::IA32_EFER => {
+                if vmx_info().has_load_ia32_efer() {
+                    self.clear_stomic_switch_msr_special(
+                        EntryControls::LOAD_IA32_EFER.bits().into(),
+                        ExitControls::LOAD_IA32_EFER.bits().into(),
+                    );
+                    return;
+                }
+            }
+
+            msr::MSR_PERF_GLOBAL_CTRL => {
+                if vmx_info().has_load_perf_global_ctrl() {
+                    self.clear_stomic_switch_msr_special(
+                        EntryControls::LOAD_IA32_PERF_GLOBAL_CTRL.bits().into(),
+                        ExitControls::LOAD_IA32_PERF_GLOBAL_CTRL.bits().into(),
+                    );
+                    return;
+                }
+            }
+            _ => {}
+        }
+
+        let m = &mut self.msr_autoload;
+        let i = m.guest.find_loadstore_msr_slot(msr);
+
+        if let Some(i) = i {
+            m.guest.nr -= 1;
+            m.guest.val[i] = m.guest.val[m.guest.nr];
+            VmxAsm::vmx_vmwrite(control::VMENTRY_MSR_LOAD_COUNT, m.guest.nr as u64);
+        }
+
+        let i = m.host.find_loadstore_msr_slot(msr);
+        if let Some(i) = i {
+            m.host.nr -= 1;
+            m.host.val[i] = m.host.val[m.host.nr];
+            VmxAsm::vmx_vmwrite(control::VMEXIT_MSR_LOAD_COUNT, m.host.nr as u64);
+        }
+    }
+
+    fn clear_stomic_switch_msr_special(&self, entry: u64, exit: u64) {
+        let mut guard = self.loaded_vmcs.lock();
+        guard.controls_clearbit(ControlsType::VmEntry, entry);
+        guard.controls_clearbit(ControlsType::VmExit, exit);
+    }
+
+    pub fn add_atomic_switch_msr(
+        &mut self,
+        msr: u32,
+        guest_val: u64,
+        host_val: u64,
+        entry_only: bool,
+    ) {
+        match msr {
+            msr::IA32_EFER => {
+                if vmx_info().has_load_ia32_efer() {
+                    self.add_atomic_switch_msr_special(
+                        EntryControls::LOAD_IA32_EFER.bits() as u64,
+                        ExitControls::LOAD_IA32_EFER.bits() as u64,
+                        guest::IA32_EFER_FULL,
+                        host::IA32_EFER_FULL,
+                        guest_val,
+                        host_val,
+                    );
+                    return;
+                }
+            }
+            msr::MSR_PERF_GLOBAL_CTRL => {
+                if vmx_info().has_load_perf_global_ctrl() {
+                    self.add_atomic_switch_msr_special(
+                        EntryControls::LOAD_IA32_PERF_GLOBAL_CTRL.bits().into(),
+                        ExitControls::LOAD_IA32_PERF_GLOBAL_CTRL.bits().into(),
+                        guest::IA32_PERF_GLOBAL_CTRL_FULL,
+                        host::IA32_PERF_GLOBAL_CTRL_FULL,
+                        guest_val,
+                        host_val,
+                    );
+                    return;
+                }
+            }
+            msr::MSR_PEBS_ENABLE => {
+                unsafe { wrmsr(msr::MSR_PEBS_ENABLE, 0) };
+            }
+
+            _ => {}
+        }
+
+        let m = &mut self.msr_autoload;
+        let mut i = m.guest.find_loadstore_msr_slot(msr);
+        let j = if !entry_only {
+            m.host.find_loadstore_msr_slot(msr)
+        } else {
+            Some(0)
+        };
+
+        if (i.is_none() && m.guest.nr == VmxMsrs::MAX_NR_LOADSTORE_MSRS)
+            || (j.is_none() && m.host.nr == VmxMsrs::MAX_NR_LOADSTORE_MSRS)
+        {
+            kwarn!("Not enough msr switch entries. Can't add msr {:x}", msr);
+            return;
+        }
+
+        let i = if i.is_none() {
+            m.guest.nr += 1;
+            VmxAsm::vmx_vmwrite(control::VMENTRY_MSR_LOAD_COUNT, m.guest.nr as u64);
+            m.guest.nr
+        } else {
+            i.unwrap()
+        };
+
+        m.guest.val[i].index = msr;
+        m.guest.val[i].data = guest_val;
+
+        if entry_only {
+            return;
+        }
+
+        let j = if j.is_none() {
+            m.host.nr += 1;
+            VmxAsm::vmx_vmwrite(control::VMEXIT_MSR_LOAD_COUNT, m.host.nr as u64);
+            m.host.nr
+        } else {
+            j.unwrap()
+        };
+
+        m.host.val[i].index = msr;
+        m.host.val[i].data = host_val;
+    }
+
+    fn add_atomic_switch_msr_special(
+        &self,
+        entry: u64,
+        exit: u64,
+        guest_val_vmcs: u32,
+        host_val_vmcs: u32,
+        guest_val: u64,
+        host_val: u64,
+    ) {
+        VmxAsm::vmx_vmwrite(guest_val_vmcs, guest_val);
+        if host_val_vmcs != host::IA32_EFER_FULL {
+            VmxAsm::vmx_vmwrite(host_val_vmcs, host_val);
+        }
+
+        let mut guard = self.loaded_vmcs.lock();
+        guard.controls_setbit(ControlsType::VmEntry, entry);
+        guard.controls_setbit(ControlsType::VmExit, exit);
+    }
+
+    pub fn vmx_vcpu_run_flags(&self) -> VmxRunFlag {
+        let mut flags = VmxRunFlag::empty();
+
+        if self.loaded_vmcs().launched {
+            flags.insert(VmxRunFlag::VMRESUME);
+        }
+
+        // MSR_IA32_SPEC_CTRL
+        if !self.loaded_vmcs().msr_write_intercepted(0x48) {
+            flags.insert(VmxRunFlag::SAVE_SPEC_CTRL);
+        }
+
+        flags
+    }
 }
 
 bitflags! {
@@ -1051,6 +2865,24 @@ bitflags! {
         const READ = 1;
         const WRITE = 2;
         const RW = 3;
+    }
+
+    pub struct PageFaultErr: u64 {
+        const PFERR_PRESENT = 1 << 0;
+        const PFERR_WRITE = 1 << 1;
+        const PFERR_USER = 1 << 2;
+        const PFERR_RSVD = 1 << 3;
+        const PFERR_FETCH = 1 << 4;
+        const PFERR_PK = 1 << 5;
+        const PFERR_SGX = 1 << 15;
+        const PFERR_GUEST_FINAL = 1 << 32;
+        const PFERR_GUEST_PAGE = 1 << 33;
+        const PFERR_IMPLICIT_ACCESS = 1 << 48;
+    }
+
+    pub struct VmxRunFlag: u8 {
+        const VMRESUME = 1 << 0;
+        const SAVE_SPEC_CTRL = 1 << 1;
     }
 }
 
@@ -1062,6 +2894,209 @@ pub enum VmxL1dFlushState {
     FlushAlways,
     FlushEptDisabled,
     FlushNotRequired,
+}
+
+pub struct VmxSegmentField {
+    selector: u32,
+    base: u32,
+    limit: u32,
+    ar_bytes: u32,
+}
+
+pub const KVM_VMX_SEGMENT_FIELDS: &'static [VmxSegmentField] = &[
+    // CS
+    VmxSegmentField {
+        selector: guest::CS_SELECTOR,
+        base: guest::CS_BASE,
+        limit: guest::CS_LIMIT,
+        ar_bytes: guest::CS_ACCESS_RIGHTS,
+    },
+    // DS
+    VmxSegmentField {
+        selector: guest::DS_SELECTOR,
+        base: guest::DS_BASE,
+        limit: guest::DS_LIMIT,
+        ar_bytes: guest::DS_ACCESS_RIGHTS,
+    },
+    // ES
+    VmxSegmentField {
+        selector: guest::ES_SELECTOR,
+        base: guest::ES_BASE,
+        limit: guest::ES_LIMIT,
+        ar_bytes: guest::ES_ACCESS_RIGHTS,
+    },
+    // FS
+    VmxSegmentField {
+        selector: guest::FS_SELECTOR,
+        base: guest::FS_BASE,
+        limit: guest::FS_LIMIT,
+        ar_bytes: guest::FS_ACCESS_RIGHTS,
+    },
+    // GS
+    VmxSegmentField {
+        selector: guest::GS_SELECTOR,
+        base: guest::GS_BASE,
+        limit: guest::GS_LIMIT,
+        ar_bytes: guest::GS_ACCESS_RIGHTS,
+    },
+    // SS
+    VmxSegmentField {
+        selector: guest::SS_SELECTOR,
+        base: guest::SS_BASE,
+        limit: guest::SS_LIMIT,
+        ar_bytes: guest::SS_ACCESS_RIGHTS,
+    },
+    // TR
+    VmxSegmentField {
+        selector: guest::TR_SELECTOR,
+        base: guest::TR_BASE,
+        limit: guest::TR_LIMIT,
+        ar_bytes: guest::TR_ACCESS_RIGHTS,
+    },
+    // LDTR
+    VmxSegmentField {
+        selector: guest::LDTR_SELECTOR,
+        base: guest::LDTR_BASE,
+        limit: guest::LDTR_LIMIT,
+        ar_bytes: guest::LDTR_ACCESS_RIGHTS,
+    },
+];
+
+#[derive(FromPrimitive)]
+#[allow(non_camel_case_types)]
+pub enum VmxExitReason {
+    EXCEPTION_OR_NMI = 0,
+    EXTERNAL_INTERRUPT = 1,
+    TRIPLE_FAULT = 2,
+    INIT_SIGNAL = 3,
+    SIPI = 4,
+    IO_SMI = 5,
+    OTHER_SMI = 6,
+    INTERRUPT_WINDOW = 7,
+    NMI_WINDOW = 8,
+    TASK_SWITCH = 9,
+    CPUID = 10,
+    GETSEC = 11,
+    HLT = 12,
+    INVD = 13,
+    INVLPG = 14,
+    RDPMC = 15,
+    RDTSC = 16,
+    RSM = 17,
+    VMCALL = 18,
+    VMCLEAR = 19,
+    VMLAUNCH = 20,
+    VMPTRLD = 21,
+    VMPTRST = 22,
+    VMREAD = 23,
+    VMRESUME = 24,
+    VMWRITE = 25,
+    VMXOFF = 26,
+    VMXON = 27,
+    CR_ACCESS = 28,
+    DR_ACCESS = 29,
+    IO_INSTRUCTION = 30,
+    RDMSR = 31,
+    WRMSR = 32,
+    VM_ENTRY_FAILURE_INVALID_GUEST_STATE = 33,
+    VM_ENTRY_FAILURE_MSR_LOADING = 34,
+    MWAIT = 36,
+    MONITOR_TRAP_FLAG = 37,
+    MONITOR = 39,
+    PAUSE = 40,
+    VM_ENTRY_FAILURE_MACHINE_CHECK_EVENT = 41,
+    TPR_BELOW_THRESHOLD = 43,
+    APIC_ACCESS = 44,
+    VIRTUALIZED_EOI = 45,
+    ACCESS_GDTR_OR_IDTR = 46,
+    ACCESS_LDTR_OR_TR = 47,
+    EPT_VIOLATION = 48,
+    EPT_MISCONFIG = 49,
+    INVEPT = 50,
+    RDTSCP = 51,
+    VMX_PREEMPTION_TIMER_EXPIRED = 52,
+    INVVPID = 53,
+    WBINVD = 54,
+    XSETBV = 55,
+    APIC_WRITE = 56,
+    RDRAND = 57,
+    INVPCID = 58,
+    VMFUNC = 59,
+    ENCLS = 60,
+    RDSEED = 61,
+    PML_FULL = 62,
+    XSAVES = 63,
+    XRSTORS = 64,
+}
+
+impl From<i32> for VmxExitReason {
+    fn from(num: i32) -> Self {
+        match num {
+            0 => VmxExitReason::EXCEPTION_OR_NMI,
+            1 => VmxExitReason::EXTERNAL_INTERRUPT,
+            2 => VmxExitReason::TRIPLE_FAULT,
+            3 => VmxExitReason::INIT_SIGNAL,
+            4 => VmxExitReason::SIPI,
+            5 => VmxExitReason::IO_SMI,
+            6 => VmxExitReason::OTHER_SMI,
+            7 => VmxExitReason::INTERRUPT_WINDOW,
+            8 => VmxExitReason::NMI_WINDOW,
+            9 => VmxExitReason::TASK_SWITCH,
+            10 => VmxExitReason::CPUID,
+            11 => VmxExitReason::GETSEC,
+            12 => VmxExitReason::HLT,
+            13 => VmxExitReason::INVD,
+            14 => VmxExitReason::INVLPG,
+            15 => VmxExitReason::RDPMC,
+            16 => VmxExitReason::RDTSC,
+            17 => VmxExitReason::RSM,
+            18 => VmxExitReason::VMCALL,
+            19 => VmxExitReason::VMCLEAR,
+            20 => VmxExitReason::VMLAUNCH,
+            21 => VmxExitReason::VMPTRLD,
+            22 => VmxExitReason::VMPTRST,
+            23 => VmxExitReason::VMREAD,
+            24 => VmxExitReason::VMRESUME,
+            25 => VmxExitReason::VMWRITE,
+            26 => VmxExitReason::VMXOFF,
+            27 => VmxExitReason::VMXON,
+            28 => VmxExitReason::CR_ACCESS,
+            29 => VmxExitReason::DR_ACCESS,
+            30 => VmxExitReason::IO_INSTRUCTION,
+            31 => VmxExitReason::RDMSR,
+            32 => VmxExitReason::WRMSR,
+            33 => VmxExitReason::VM_ENTRY_FAILURE_INVALID_GUEST_STATE,
+            34 => VmxExitReason::VM_ENTRY_FAILURE_MSR_LOADING,
+            36 => VmxExitReason::MWAIT,
+            37 => VmxExitReason::MONITOR_TRAP_FLAG,
+            39 => VmxExitReason::MONITOR,
+            40 => VmxExitReason::PAUSE,
+            41 => VmxExitReason::VM_ENTRY_FAILURE_MACHINE_CHECK_EVENT,
+            43 => VmxExitReason::TPR_BELOW_THRESHOLD,
+            44 => VmxExitReason::APIC_ACCESS,
+            45 => VmxExitReason::VIRTUALIZED_EOI,
+            46 => VmxExitReason::ACCESS_GDTR_OR_IDTR,
+            47 => VmxExitReason::ACCESS_LDTR_OR_TR,
+            48 => VmxExitReason::EPT_VIOLATION,
+            49 => VmxExitReason::EPT_MISCONFIG,
+            50 => VmxExitReason::INVEPT,
+            51 => VmxExitReason::RDTSCP,
+            52 => VmxExitReason::VMX_PREEMPTION_TIMER_EXPIRED,
+            53 => VmxExitReason::INVVPID,
+            54 => VmxExitReason::WBINVD,
+            55 => VmxExitReason::XSETBV,
+            56 => VmxExitReason::APIC_WRITE,
+            57 => VmxExitReason::RDRAND,
+            58 => VmxExitReason::INVPCID,
+            59 => VmxExitReason::VMFUNC,
+            60 => VmxExitReason::ENCLS,
+            61 => VmxExitReason::RDSEED,
+            62 => VmxExitReason::PML_FULL,
+            63 => VmxExitReason::XSAVES,
+            64 => VmxExitReason::XRSTORS,
+            _ => panic!("Invalid VmxExitReason number: {}", num),
+        }
+    }
 }
 
 pub static L1TF_VMX_MITIGATION: RwLock<VmxL1dFlushState> = RwLock::new(VmxL1dFlushState::FlushAuto);
@@ -1081,4 +3116,21 @@ pub fn vmx_init() -> Result<(), SystemError> {
 
     kvm_init()?;
     Ok(())
+}
+
+#[no_mangle]
+unsafe extern "C" fn vmx_update_host_rsp(vcpu_vmx: &VmxVCpuPriv, host_rsp: usize) {
+    let mut guard = vcpu_vmx.loaded_vmcs.lock();
+    if unlikely(host_rsp != guard.host_state.rsp) {
+        guard.host_state.rsp = host_rsp;
+        VmxAsm::vmx_vmwrite(host::RSP, host_rsp as u64);
+    }
+
+    return;
+}
+
+#[no_mangle]
+unsafe extern "C" fn vmx_spec_ctrl_restore_host(vcpu_vmx: &VmxVCpuPriv, flags: u32) {
+    // TODO
+    return;
 }

@@ -18,6 +18,10 @@ impl AllocBitmap {
             core: BitMapCore::new(),
         }
     }
+
+    pub fn data(&self) -> &[usize] {
+        &self.data
+    }
 }
 
 impl BitMapOps<usize> for AllocBitmap {

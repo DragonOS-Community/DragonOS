@@ -1,6 +1,7 @@
 use core::arch::asm;
 
 use alloc::slice;
+use bitfield_struct::bitfield;
 use raw_cpuid::CpuId;
 use system_error::SystemError;
 use x86::{
@@ -11,10 +12,11 @@ use x86::{
         IA32_VMX_CR4_FIXED0, IA32_VMX_CR4_FIXED1,
     },
 };
+use x86_64::registers::xcontrol::XCr0;
 
 use crate::{
     arch::mm::barrier,
-    kdebug,
+    kdebug, kwarn,
     mm::{phys_2_virt, PhysAddr},
 };
 
@@ -29,6 +31,15 @@ impl KvmX86Asm {
             }
         }
         return 0;
+    }
+
+    pub fn write_pkru(val: u32) {
+        let cpuid = CpuId::new();
+        if let Some(feat) = cpuid.get_extended_feature_info() {
+            if feat.has_ospke() {
+                todo!();
+            }
+        }
     }
 
     fn rdpkru() -> u32 {
@@ -102,6 +113,11 @@ impl VmxAsm {
         }
     }
 
+    /// vmread the current VMCS.
+    pub fn vmx_vmread(vmcs_field: u32) -> u64 {
+        unsafe { x86::bits64::vmx::vmread(vmcs_field).expect("vmx_read fail: ") }
+    }
+
     pub fn kvm_cpu_vmxon(phys_addr: PhysAddr) -> Result<(), SystemError> {
         unsafe {
             let mut cr4 = cr4();
@@ -119,6 +135,52 @@ impl VmxAsm {
 
             Ok(())
         }
+    }
+
+    const VMX_VPID_EXTENT_INDIVIDUAL_ADDR: u64 = 0;
+    const VMX_VPID_EXTENT_SINGLE_CONTEXT: u64 = 1;
+    const VMX_VPID_EXTENT_ALL_CONTEXT: u64 = 2;
+    const VMX_VPID_EXTENT_SINGLE_NON_GLOBAL: u64 = 3;
+
+    pub fn sync_vcpu_single(vpid: u16) {
+        if vpid == 0 {
+            return;
+        }
+
+        Self::invvpid(Self::VMX_VPID_EXTENT_SINGLE_CONTEXT, vpid, 0)
+    }
+
+    pub fn sync_vcpu_global() {
+        Self::invvpid(Self::VMX_VPID_EXTENT_ALL_CONTEXT, 0, 0);
+    }
+
+    #[inline(always)]
+    fn invvpid(ext: u64, vpid: u16, gva: u64) {
+        // 定义包含指令操作数的结构体
+        #[bitfield(u128)]
+        struct Operand {
+            #[bits(16)]
+            vpid: u64,
+            #[bits(48)]
+            rsvd: u64,
+            gva: u64,
+        }
+
+        // 构造操作数
+        let mut operand = Operand::new();
+        operand.set_vpid(vpid as u64);
+        operand.set_gva(gva);
+
+        // 定义嵌入汇编块
+
+        kwarn!("TODO: asm invvpid");
+        // unsafe {
+        //     asm!(
+        //         "invvpid {0} {1}",
+        //         inlateout(reg) ext => _,
+        //         inlateout(reg) &operand => _,
+        //     );
+        // }
     }
 
     /// Set the mandatory bits in CR4 and clear bits that are mandatory zero
@@ -274,15 +336,16 @@ bitflags! {
     }
 }
 
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct MsrData {
     pub host_initiated: bool,
     pub index: u32,
     pub data: u64,
 }
 
+#[repr(C, align(16))]
 #[derive(Debug, Default, Copy, Clone)]
-pub struct KvmMsrEntry {
+pub struct VmxMsrEntry {
     pub index: u32,
     pub reserved: u32,
     pub data: u64,
@@ -433,4 +496,25 @@ pub mod kvm_msr {
     pub const CPU_BASED_ALWAYSON_WITHOUT_TRUE_MSR: u64 = 0x0401e172;
     pub const VM_EXIT_ALWAYSON_WITHOUT_TRUE_MSR: u64 = 0x00036dff;
     pub const VM_ENTRY_ALWAYSON_WITHOUT_TRUE_MSR: u64 = 0x000011ff;
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum VcpuSegment {
+    ES,
+    CS,
+    SS,
+    DS,
+    FS,
+    GS,
+    TR,
+    LDTR,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum SegmentCacheField {
+    SEL = 0,
+    BASE = 1,
+    LIMIT = 2,
+    AR = 3,
+    NR = 4,
 }

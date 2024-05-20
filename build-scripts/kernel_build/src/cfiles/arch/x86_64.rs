@@ -45,6 +45,7 @@ impl CFilesArch for X86_64CFilesArch {
         files.push(PathBuf::from("src/arch/x86_64/asm/head.S"));
         files.push(PathBuf::from("src/arch/x86_64/asm/entry.S"));
         files.push(PathBuf::from("src/arch/x86_64/asm/apu_boot.S"));
+        files.push(PathBuf::from("src/arch/x86_64/vm/vmx/vmenter.S"));
     }
 
     fn setup_global_flags(&self, c: &mut Build) {

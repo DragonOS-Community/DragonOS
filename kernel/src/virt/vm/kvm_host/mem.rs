@@ -18,7 +18,7 @@ use crate::{
     virt::vm::{kvm_host::KVM_ADDRESS_SPACE_NUM, user_api::KvmUserspaceMemoryRegion},
 };
 
-use super::{check_stack_usage, LockedVm, Vm};
+use super::{LockedVm, Vm};
 
 pub const KVM_USER_MEM_SLOTS: u16 = u16::MAX;
 pub const KVM_INTERNAL_MEM_SLOTS: u16 = 3;

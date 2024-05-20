@@ -7,39 +7,58 @@ use system_error::SystemError;
 use x86::{
     bits64::rflags::RFlags,
     controlregs::{Cr0, Cr4},
+    dtables::DescriptorTablePointer,
 };
 use x86_64::registers::control::EferFlags;
 
 use crate::{
     smp::cpu::ProcessorId,
-    virt::vm::kvm_host::{
-        vcpu::VirtCpu, Vm, KVM_IRQFD_RESAMPLE_IRQ_SOURCE_ID, KVM_USERSAPCE_IRQ_SOURCE_ID,
+    virt::vm::{
+        kvm_host::{
+            vcpu::VirtCpu, Vm, KVM_IRQFD_RESAMPLE_IRQ_SOURCE_ID, KVM_USERSAPCE_IRQ_SOURCE_ID,
+        },
+        user_api::UapiKvmSegment,
     },
 };
 
 use crate::arch::VirtCpuArch;
 
 use super::{
-    asm::{KvmMsrEntry, MsrData},
-    vmx::vmx_info,
+    asm::{MsrData, VcpuSegment, VmxMsrEntry},
+    uapi::UapiKvmDtable,
+    vmx::{vmx_info, VmxVCpuPriv},
     x86_kvm_manager, x86_kvm_ops,
 };
 
 pub mod lapic;
 pub mod vcpu;
 
+pub const TSS_IOPB_BASE_OFFSET: usize = 0x66;
+pub const TSS_BASE_SIZE: usize = 0x68;
+pub const TSS_IOPB_SIZE: usize = (65536 / 8);
+pub const TSS_REDIRECTION_SIZE: usize = (256 / 8);
+pub const RMODE_TSS_SIZE: usize = (TSS_BASE_SIZE + TSS_REDIRECTION_SIZE + TSS_IOPB_SIZE + 1);
+
 #[derive(Debug, Default)]
 pub struct X86KvmArch {
     /// 中断芯片模式
-    irqchip_mode: KvmIrqChipMode,
+    pub irqchip_mode: KvmIrqChipMode,
     /// 负责引导(bootstrap)kvm的vcpu_id
     bsp_vcpu_id: usize,
     pub pause_in_guest: bool,
     pub cstate_in_guest: bool,
+    pub mwait_in_guest: bool,
+    pub hlt_in_guest: bool,
+    pub bus_lock_detection_enabled: bool,
     irq_sources_bitmap: u64,
     default_tsc_khz: u64,
     guest_can_read_msr_platform_info: bool,
     apicv_inhibit_reasons: usize,
+
+    pub max_vcpu_ids: usize,
+
+    pub notify_vmexit_flags: NotifyVmExitFlags,
+    pub notify_window: u32,
 
     msr_fliter: Option<Box<KvmX86MsrFilter>>,
 }
@@ -129,33 +148,61 @@ pub trait KvmFunc: Send + Sync + Debug {
 
     fn vm_init(&self) -> X86KvmArch;
 
+    fn vcpu_precreate(&self, vm: &mut Vm) -> Result<(), SystemError>;
+
     fn vcpu_create(&self, vcpu: &mut VirtCpu, vm: &Vm);
 
     fn vcpu_load(&self, vcpu: &mut VirtCpu, cpu: ProcessorId);
 
-    fn cache_reg(&self, vcpu: &VirtCpuArch, reg: KvmReg);
+    fn cache_reg(&self, vcpu: &mut VirtCpuArch, reg: KvmReg);
 
     fn apicv_pre_state_restore(&self, vcpu: &mut VirtCpu);
 
-    fn set_msr(&self, vcpu: &mut VirtCpuArch, msr: MsrData);
+    fn set_msr(&self, vcpu: &mut VirtCpu, msr: MsrData) -> Result<(), SystemError>;
 
     fn set_rflags(&self, vcpu: &mut VirtCpu, rflags: RFlags);
 
-    fn get_rflags(&self, vcpu: &VirtCpu) -> RFlags;
+    fn get_rflags(&self, vcpu: &mut VirtCpu) -> RFlags;
 
-    fn set_cr0(&self, vcpu: &mut VirtCpu, cr0: Cr0);
+    fn set_cr0(&self, vm: &Vm, vcpu: &mut VirtCpu, cr0: Cr0);
+
+    fn is_vaild_cr0(&self, vcpu: &VirtCpu, cr0: Cr0) -> bool;
 
     fn set_cr4(&self, vcpu: &mut VirtCpu, cr4: Cr4);
 
+    fn post_set_cr3(&self, vcpu: &VirtCpu, cr3: u64);
+
+    fn is_vaild_cr4(&self, vcpu: &VirtCpu, cr4: Cr4) -> bool;
+
     fn set_efer(&self, vcpu: &mut VirtCpu, efer: EferFlags);
+
+    fn set_segment(&self, vcpu: &mut VirtCpu, var: &mut UapiKvmSegment, seg: VcpuSegment);
+
+    fn get_segment(
+        &self,
+        vcpu: &mut VirtCpu,
+        var: UapiKvmSegment,
+        seg: VcpuSegment,
+    ) -> UapiKvmSegment;
+
+    /// 这个函数不会用到VCPU，这里拿到只是为了确保上一层拿到锁
+    fn get_idt(&self, _vcpu: &mut VirtCpu, dt: &mut DescriptorTablePointer<u8>);
+
+    fn set_idt(&self, _vcpu: &mut VirtCpu, dt: &DescriptorTablePointer<u8>);
+
+    fn get_gdt(&self, _vcpu: &mut VirtCpu, dt: &mut DescriptorTablePointer<u8>);
+
+    fn set_gdt(&self, _vcpu: &mut VirtCpu, dt: &DescriptorTablePointer<u8>);
 
     fn update_exception_bitmap(&self, vcpu: &mut VirtCpu);
 
-    fn vcpu_reset(&self, vcpu: &mut VirtCpu, init_event: bool);
+    fn vcpu_reset(&self, vcpu: &mut VirtCpu, vm: &Vm, init_event: bool);
 
     fn has_emulated_msr(&self, msr: u32) -> bool;
 
-    fn get_msr_feature(&self, msr: &mut KvmMsrEntry) -> bool;
+    fn get_msr_feature(&self, msr: &mut VmxMsrEntry) -> bool;
+
+    fn vcpu_run(&self, vcpu: &mut VirtCpu);
 }
 
 /// ## 中断抑制的原因位
@@ -231,6 +278,17 @@ bitflags! {
         const KVM_MSR_FILTER_READ  = 1 << 0;
         const KVM_MSR_FILTER_WRITE = 1 << 1;
     }
+
+    pub struct NotifyVmExitFlags: u8 {
+        const KVM_X86_NOTIFY_VMEXIT_ENABLED = 1 << 0;
+        const KVM_X86_NOTIFY_VMEXIT_USER = 1 << 1;
+    }
+}
+
+impl Default for NotifyVmExitFlags {
+    fn default() -> Self {
+        NotifyVmExitFlags::empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -295,4 +353,18 @@ pub struct KvmCommonRegs {
     r15: u64,
     rip: u64,
     rflags: u64,
+}
+
+impl Vm {
+    pub fn vcpu_precreate(&mut self, id: usize) -> Result<(), SystemError> {
+        if self.arch.max_vcpu_ids == 0 {
+            self.arch.max_vcpu_ids = 1024 * 4;
+        }
+
+        if id >= self.arch.max_vcpu_ids {
+            return Err(SystemError::EINVAL);
+        }
+
+        return x86_kvm_ops().vcpu_precreate(self);
+    }
 }

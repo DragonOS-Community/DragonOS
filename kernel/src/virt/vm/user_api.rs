@@ -9,6 +9,42 @@ use crate::mm::{PhysAddr, VirtAddr};
 
 use super::kvm_host::mem::UserMemRegionFlag;
 
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, PartialEq)]
+pub struct UapiKvmSegment {
+    pub base: u64,
+    pub limit: u32,
+    pub selector: u16,
+    pub type_: u8,
+    pub present: u8,
+    pub dpl: u8,
+    pub db: u8,
+    pub s: u8,
+    pub l: u8,
+    pub g: u8,
+    pub avl: u8,
+    pub unusable: u8,
+    pub padding: u8,
+}
+
+impl UapiKvmSegment {
+    pub fn vmx_segment_access_rights(&self) -> u32 {
+        let mut ar = self.type_ as u32 & 15;
+        ar |= (self.s as u32 & 1) << 4;
+        ar |= (self.dpl as u32 & 3) << 5;
+        ar |= (self.present as u32 & 1) << 7;
+        ar |= (self.avl as u32 & 1) << 12;
+        ar |= (self.l as u32 & 1) << 13;
+        ar |= (self.db as u32 & 1) << 14;
+        ar |= (self.g as u32 & 1) << 15;
+
+        let b = self.unusable != 0 || self.present == 0;
+        ar |= (b as u32) << 16;
+
+        return ar;
+    }
+}
+
 /// 通过这个结构可以将虚拟机的物理地址对应到用户进程的虚拟地址
 /// 用来表示虚拟机的一段物理内存
 #[repr(C)]

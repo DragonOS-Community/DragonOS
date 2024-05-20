@@ -18,7 +18,7 @@ use crate::{
     },
     process::{Pid, ProcessManager},
     smp::cpu::ProcessorId,
-    virt::vm::{kvm_host::check_stack_usage, user_api::UapiKvmRun},
+    virt::vm::user_api::UapiKvmRun,
 };
 
 use super::{
@@ -90,5 +90,6 @@ bitflags! {
     pub struct GuestDebug: usize {
         const ENABLE = 0x00000001;
         const SINGLESTEP = 0x00000002;
+        const USE_SW_BP = 0x00010000;
     }
 }

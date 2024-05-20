@@ -1,3 +1,4 @@
+use raw_cpuid::CpuId;
 use x86::{
     msr::{
         IA32_VMX_BASIC, IA32_VMX_CR0_FIXED0, IA32_VMX_CR0_FIXED1, IA32_VMX_CR4_FIXED0,
@@ -11,9 +12,12 @@ use x86::{
     },
 };
 
-use crate::arch::vm::{
-    CPU_BASED_ALWAYSON_WITHOUT_TRUE_MSR, PIN_BASED_ALWAYSON_WITHOUT_TRUE_MSR,
-    VM_ENTRY_ALWAYSON_WITHOUT_TRUE_MSR, VM_EXIT_ALWAYSON_WITHOUT_TRUE_MSR,
+use crate::{
+    arch::vm::{
+        mmu::PageLevel, CPU_BASED_ALWAYSON_WITHOUT_TRUE_MSR, PIN_BASED_ALWAYSON_WITHOUT_TRUE_MSR,
+        VM_ENTRY_ALWAYSON_WITHOUT_TRUE_MSR, VM_EXIT_ALWAYSON_WITHOUT_TRUE_MSR,
+    },
+    virt::vm::kvm_host::vcpu::VirtCpu,
 };
 
 use super::{vmcs::feat::VmxFeat, Vmx};
@@ -181,7 +185,7 @@ pub struct VmxCapability {
     pub vpid: VpidFlag,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ProcessorTraceMode {
     System,
     HostGuest,
@@ -368,6 +372,30 @@ impl Vmx {
         return self.vmx_cap.ept.contains(EptFlag::EPT_PAGE_WALK_4);
     }
 
+    /// 是否支持5级页表
+    #[inline]
+    pub fn has_ept_5levels(&self) -> bool {
+        return self.vmx_cap.ept.contains(EptFlag::EPT_PAGE_WALK_5);
+    }
+
+    pub fn get_max_ept_level(&self) -> usize {
+        if self.has_ept_5levels() {
+            return 5;
+        }
+        return 4;
+    }
+
+    pub fn ept_cap_to_lpage_level(&self) -> PageLevel {
+        if self.vmx_cap.ept.contains(EptFlag::EPT_1GB_PAGE) {
+            return PageLevel::Level1G;
+        }
+        if self.vmx_cap.ept.contains(EptFlag::EPT_2MB_PAGE) {
+            return PageLevel::Level2M;
+        }
+
+        return PageLevel::Level4k;
+    }
+
     /// 判断mt(Memory type)是否为write back
     #[inline]
     pub fn has_ept_mt_wb(&self) -> bool {
@@ -498,6 +526,50 @@ impl Vmx {
     }
 
     #[inline]
+    pub fn has_sceondary_exec_ctrls(&self) -> bool {
+        self.vmcs_config
+            .cpu_based_exec_ctrl
+            .contains(PrimaryControls::SECONDARY_CONTROLS)
+    }
+
+    #[inline]
+    pub fn has_rdtscp(&self) -> bool {
+        self.vmcs_config
+            .cpu_based_2nd_exec_ctrl
+            .contains(SecondaryControls::ENABLE_RDTSCP)
+    }
+
+    #[inline]
+    pub fn has_vmfunc(&self) -> bool {
+        self.vmcs_config
+            .cpu_based_2nd_exec_ctrl
+            .contains(SecondaryControls::ENABLE_VM_FUNCTIONS)
+    }
+
+    #[inline]
+    pub fn has_xsaves(&self) -> bool {
+        self.vmcs_config
+            .cpu_based_2nd_exec_ctrl
+            .contains(SecondaryControls::ENABLE_XSAVES_XRSTORS)
+    }
+
+    #[inline]
+    pub fn vmx_umip_emulated(&self) -> bool {
+        let feat = CpuId::new().get_extended_feature_info().unwrap().has_umip();
+
+        return !feat
+            && (self
+                .vmcs_config
+                .cpu_based_2nd_exec_ctrl
+                .contains(SecondaryControls::DTABLE_EXITING));
+    }
+
+    #[inline]
+    pub fn has_tertiary_exec_ctrls(&self) -> bool {
+        false
+    }
+
+    #[inline]
     pub fn has_bus_lock_detection(&self) -> bool {
         false
     }
@@ -505,5 +577,11 @@ impl Vmx {
     #[inline]
     pub fn has_notify_vmexit(&self) -> bool {
         false
+    }
+
+    /// 是否需要拦截页面故障
+    #[inline]
+    pub fn vmx_need_pf_intercept(&self, _vcpu: &VirtCpu) -> bool {
+        true
     }
 }

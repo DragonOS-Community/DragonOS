@@ -192,7 +192,7 @@ impl AttrAcpiTable {
         if r.instance > 1 || (r.instance == 1 && has_multiple_instances) {
             r.filename = format!("{}{}", r.name, r.instance);
         } else {
-            r.filename = r.name.clone();
+            r.filename.clone_from(&r.name);
         }
 
         let result = Arc::new(r);

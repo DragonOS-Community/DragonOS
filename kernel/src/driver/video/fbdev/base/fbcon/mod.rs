@@ -347,7 +347,6 @@ pub struct FrameBufferConsoleData {
     pub cursor_blink_jiffies: i64,
     /// 是否刷新光标
     pub cursor_flash: bool,
-    ///
     pub display: FbConsoleDisplay,
     /// 光标状态
     pub cursor_state: FbCursor,

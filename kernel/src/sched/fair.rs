@@ -1633,7 +1633,7 @@ impl Scheduler for CompletelyFairScheduler {
 
         let mut se;
         loop {
-            let cfs = cfs_rq.unwrap();
+            let cfs = cfs_rq.clone().unwrap();
             let cfs = cfs.force_mut();
             let curr = cfs.current();
             if let Some(curr) = curr {
@@ -1646,7 +1646,7 @@ impl Scheduler for CompletelyFairScheduler {
 
             se = cfs.pick_next_entity();
             match se.clone() {
-                Some(val) => cfs_rq = val.my_cfs_rq.clone(),
+                Some(val) => cfs_rq.clone_from(&val.my_cfs_rq),
                 None => {
                     break;
                 }

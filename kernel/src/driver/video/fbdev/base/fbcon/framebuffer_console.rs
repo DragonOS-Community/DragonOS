@@ -785,7 +785,7 @@ impl FrameBufferConsole for BlittingFbConsole {
         }
 
         if !attr.is_empty() {
-            cursor.image.data = fbcon_data.cursor_data.clone();
+            cursor.image.data.clone_from(&fbcon_data.cursor_data);
         } else {
             cursor.image.data = vc_data.font.data
                 [char_offset..char_offset + (w as usize * vc_data.font.height as usize)]
@@ -799,7 +799,7 @@ impl FrameBufferConsole for BlittingFbConsole {
         cursor.image.width = fbcon_data.cursor_state.image.width;
         cursor.hot_x = fbcon_data.cursor_state.hot_x;
         cursor.hot_y = fbcon_data.cursor_state.hot_y;
-        cursor.mask = fbcon_data.cursor_state.mask.clone();
+        cursor.mask.clone_from(&fbcon_data.cursor_state.mask);
         cursor.enable = fbcon_data.cursor_state.enable;
         cursor.image.depth = 1;
         cursor.rop = true;

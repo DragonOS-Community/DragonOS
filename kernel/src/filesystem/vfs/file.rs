@@ -575,12 +575,12 @@ impl FileDescriptorVec {
 
     ///返回文件描述符的数量
     pub fn size(&self) -> usize {
-	let mut index:usize = 0;
-	let mut size:usize = 0;
-	while self.fds[index].is_some() {
-	    index += 1;
-	    size += 1;
-	}
+        let mut index: usize = 0;
+        let mut size: usize = 0;
+        while self.fds[index].is_some() {
+            index += 1;
+            size += 1;
+        }
         return size;
     }
 

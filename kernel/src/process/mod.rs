@@ -672,18 +672,24 @@ impl ProcessControlBlock {
         return Self::do_create_pcb(name, kstack, true);
     }
 
-    ///返回进程拥有的描述符数量
+    /// # 函数的功能
+    ///
+    /// 返回此进程打开的文件描述符的数量
     pub fn fdsize(&self) -> usize {
-        return (*self.basic().fd_table().unwrap().read()).size();
+        let fd_table = self.fd_table();
+        let size = fd_table.read().size();
+        return size;
     }
 
-    ///若该进程是内核进程返回1 否则0
-    pub fn kthread(&self) -> usize {
-        let flag = self.flags();
-        if flag == &mut ProcessFlags::KTHREAD {
-            return 1;
-        }
-        return 0;
+    /// # 函数的功能
+    ///
+    /// 返回此函数是否是内核进程
+    ///
+    /// # 返回值
+    ///
+    /// 若进程是内核进程则返回true 否则返回false
+    pub fn kthread(&self) -> bool {
+        return matches!(self.flags(), &mut ProcessFlags::KTHREAD);
     }
 
     #[inline(never)]

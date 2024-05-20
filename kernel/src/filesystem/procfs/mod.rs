@@ -174,10 +174,10 @@ impl ProcFSInode {
         let priority = sched_info_guard.policy();
         let vrtime = sched_info_guard.sched_entity.vruntime;
 
-        //State
+        // State
         pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
 
-        //Tgid
+        // Tgid
         pdata.append(&mut format!("\nTgid:\t{}", pcb.tgid().into()).into());
 
         // pid
@@ -187,17 +187,17 @@ impl ProcFSInode {
                 .to_owned(),
         );
 
-        //ppid
+        // ppid
         pdata.append(
             &mut format!("\nPpid:\t{}", pcb.basic().ppid().into())
                 .as_bytes()
                 .to_owned(),
         );
 
-        //fdsize
+        // fdsize
         pdata.append(&mut format!("\nFDSize:\t{}", pcb.fdsize()).into());
 
-        //kthread
+        // kthread
         pdata.append(&mut format!("\nKthread:\t{}", pcb.kthread()).into());
 
         pdata.append(&mut format!("\ncpu_id:\t{}", cpu_id).as_bytes().to_owned());

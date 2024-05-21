@@ -692,7 +692,7 @@ impl IndexNode for LockedExt2InodeInfo {
                 let inode = &inode_grade.inode;
                 let mut inode_clone = inode.clone();
                 let group_id = (inode_grade.inode_num / super_block.s_inodes_per_group) as usize;
-                let mut group_desc =
+                let  group_desc =
                     &super_block.group_desc_table.as_ref().unwrap()[group_id].clone();
 
                 let mut block_id = 0usize;
@@ -711,7 +711,7 @@ impl IndexNode for LockedExt2InodeInfo {
                 let mut start_buf_offset = 0usize;
                 let mut inode_flush = false;
                 // 通过file size 判断是否要分配新的块
-                'lp: loop {
+                while start_buf_offset < len {
                     // TODO 如果是要分配新块，就不找块号。直接找bitmap，写块。
 
                     // TODO 判断block_offset对应的块存不存在，如果不存在就分配
@@ -792,9 +792,16 @@ impl IndexNode for LockedExt2InodeInfo {
                         }
                     } else if block_offset < id_per_block.pow(2) + 12 {
                         // 二级间接
-                        let id = inode.blocks[13] as usize;
+                        let mut id = inode.blocks[13] as usize;
                         if id == 0 {
                             // TODO 分配新块 作为地址块 并修改id 将id写到inode中
+                            let new_block = group_desc.alloc_one_block(
+                                bitmap_buf.as_slice(),
+                                group_id,
+                                block_size / mem::size_of::<Ext2BlockGroupDescriptor>(),
+                            );
+                            inode_clone.blocks[13] = new_block as u32;
+                            id = new_block;
                         }
                         let mut address_block: Vec<u8> = Vec::with_capacity(block_size);
                         address_block.resize(block_size, 0);
@@ -805,13 +812,24 @@ impl IndexNode for LockedExt2InodeInfo {
                         );
                         let mut address_block_data: Vec<u32> = Vec::with_capacity(block_size / 4);
                         address_block_data = unsafe { core::mem::transmute_copy(&address_block) };
+                        // BUG 应该除 id_per_block的平方
                         let id = address_block_data
                             [(block_offset - id_per_block - 12) / id_per_block]
                             as usize;
                         if id == 0 {
                             // TODO 分配新块 将新块id写到address_block中
-
-                            // TODO address_block写回磁盘
+                            let new_block = group_desc.alloc_one_block(
+                                bitmap_buf.as_slice(),
+                                group_id,
+                                block_size / mem::size_of::<Ext2BlockGroupDescriptor>(),
+                            );
+                            address_block_data[(block_offset - id_per_block - 12) / id_per_block] =
+                                new_block as u32;
+                            partition.disk().write_at(
+                                id * block_size / LBA_SIZE,
+                                block_size / LBA_SIZE,
+                                unsafe { core::mem::transmute(address_block_data.as_slice()) },
+                            )?;
                         }
                         address_block.clear();
                         address_block.resize(block_size, 0);
@@ -826,16 +844,44 @@ impl IndexNode for LockedExt2InodeInfo {
                         block_id = address_block_data[id_in_block] as usize;
                         if block_id == 0 {
                             // TODO 分配新块 将新块id写到address_block中
-
-                            // TODO 将数据写到新块中
+                            let new_block = group_desc.alloc_one_block(
+                                bitmap_buf.as_slice(),
+                                group_id,
+                                block_size / mem::size_of::<Ext2BlockGroupDescriptor>(),
+                            );
+                            // TODO address_block写回磁盘
+                            let count = if write_len % LBA_SIZE != 0 {
+                                write_len / LBA_SIZE + 1
+                            } else {
+                                write_len / LBA_SIZE
+                            };
+                            partition.disk().write_at(
+                                new_block * block_size / LBA_SIZE,
+                                count,
+                                &buf[start_buf_offset..start_buf_offset + write_len],
+                            )?;
 
                             // TODO address_block写回磁盘
+                            address_block_data[(block_offset - id_per_block - 12) / id_per_block] =
+                                new_block as u32;
+                            partition.disk().write_at(
+                                id * block_size / LBA_SIZE,
+                                block_size / LBA_SIZE,
+                                unsafe { core::mem::transmute(address_block_data.as_slice()) },
+                            )?;
                         }
                     } else {
                         // 三级间接
-                        let id = inode.blocks[14] as usize;
+                        let mut id = inode.blocks[14] as usize;
                         if id == 0 {
                             // TODO 分配新块 作为地址块 并修改id 将id写到inode中
+                            let new_block = group_desc.alloc_one_block(
+                                bitmap_buf.as_slice(),
+                                group_id,
+                                block_size / mem::size_of::<Ext2BlockGroupDescriptor>(),
+                            );
+                            inode_clone.blocks[14] = new_block as u32;
+                            id = new_block;
                         }
                         let mut address_block: Vec<u8> = Vec::with_capacity(block_size);
                         address_block.resize(block_size, 0);
@@ -846,13 +892,31 @@ impl IndexNode for LockedExt2InodeInfo {
                         );
                         let mut address_block_data: Vec<u32> = Vec::with_capacity(block_size / 4);
                         address_block_data = unsafe { core::mem::transmute_copy(&address_block) };
-                        let id = address_block_data
-                            [(block_offset - id_per_block - 12) / id_per_block.pow(2)]
-                            as usize;
+                        let id = address_block_data[(block_offset
+                            - id_per_block
+                            - 12
+                            - id_per_block.pow(2))
+                            / id_per_block.pow(2)] as usize;
                         if id == 0 {
                             // TODO 分配新块 将新块id写到address_block中
-
+                            let new_block = group_desc.alloc_one_block(
+                                bitmap_buf.as_slice(),
+                                group_id,
+                                block_size / mem::size_of::<Ext2BlockGroupDescriptor>(),
+                            );
                             // TODO address_block写回磁盘
+
+                            address_block_data[(block_offset
+                                - id_per_block
+                                - 12
+                                - id_per_block.pow(2))
+                                / id_per_block.pow(2)] = new_block as u32;
+
+                            partition.disk().write_at(
+                                id * block_size / LBA_SIZE,
+                                block_size / LBA_SIZE,
+                                unsafe { core::mem::transmute(address_block_data.as_slice()) },
+                            )?;
                         }
                         address_block.clear();
                         address_block.resize(block_size, 0);
@@ -863,13 +927,29 @@ impl IndexNode for LockedExt2InodeInfo {
                         );
                         address_block_data.clear();
                         address_block_data = unsafe { core::mem::transmute_copy(&address_block) };
-                        let id = address_block_data
-                            [(block_offset - id_per_block - 12) / id_per_block]
-                            as usize;
+                        let id = address_block_data[(block_offset
+                            - id_per_block
+                            - 12
+                            - id_per_block.pow(2))
+                            / id_per_block] as usize;
                         if id == 0 {
                             // TODO 分配新块 将新块id写到address_block中
-
+                            let new_block = group_desc.alloc_one_block(
+                                bitmap_buf.as_slice(),
+                                group_id,
+                                block_size / mem::size_of::<Ext2BlockGroupDescriptor>(),
+                            );
                             // TODO address_block写回磁盘
+                            address_block_data[(block_offset
+                                - id_per_block
+                                - 12
+                                - id_per_block.pow(2))
+                                / id_per_block] = new_block as u32;
+                            partition.disk().write_at(
+                                id * block_size / LBA_SIZE,
+                                block_size / LBA_SIZE,
+                                unsafe { core::mem::transmute(address_block_data.as_slice()) },
+                            )?;
                         }
                         address_block.clear();
                         address_block.resize(block_size, 0);
@@ -880,25 +960,78 @@ impl IndexNode for LockedExt2InodeInfo {
                         );
                         address_block_data.clear();
                         address_block_data = unsafe { core::mem::transmute_copy(&address_block) };
-                        block_id = address_block_data[block_offset - id_per_block - 12] as usize;
+                        block_id = address_block_data
+                            [block_offset - id_per_block - 12 - id_per_block.pow(2)]
+                            as usize;
                         if block_id == 0 {
                             // TODO 分配新块 将新块id写到address_block中
+                            let new_block = group_desc.alloc_one_block(
+                                bitmap_buf.as_slice(),
+                                group_id,
+                                block_size / mem::size_of::<Ext2BlockGroupDescriptor>(),
+                            );
+                            // BUG 将数据写到新块中
+                            let count = if write_len % LBA_SIZE != 0 {
+                                write_len / LBA_SIZE + 1
+                            } else {
+                                write_len / LBA_SIZE
+                            };
+                            partition.disk().write_at(
+                                new_block * block_size / LBA_SIZE,
+                                count,
+                                &buf[start_buf_offset..start_buf_offset + write_len],
+                            )?;
 
-                            // TODO 将数据写到新块中
-
+                            address_block_data
+                                [block_offset - id_per_block - 12 - id_per_block.pow(2)] =
+                                new_block as u32;
+                            partition.disk().write_at(
+                                id * block_size / LBA_SIZE,
+                                block_size / LBA_SIZE,
+                                unsafe { core::mem::transmute(address_block_data.as_slice()) },
+                            )?;
                             // TODO address_block写回磁盘
                         }
                     }
                     // // TODO 写一个块 更新offset
 
                     // // TODO 写块：1. 写直接块
-
-                    // TODO 判断是否写inode
-                    if inode_flush {}
+                    block_offset += 1;
+                    start_buf_offset += write_len;
                 }
-                // let start_block_id = offset
+                if inode_flush {
+                    // 写inode表
+                    let mut table_num = group_desc.inode_table_start as usize;
+                    let inode_per_block = block_size / mem::size_of::<Ext2BlockGroupDescriptor>();
+                    let inode_id = inode_grade.inode_num as usize;
+                    let block_offset = (inode_id - 1) / inode_per_block;
+                    let inode_offset = (inode_id - 1) % inode_per_block;
+                    table_num += block_offset;
+                    let mut table_data: Vec<u8> = Vec::with_capacity(block_size);
+                    table_data.resize(block_size, 0);
+                    partition.disk().read_at(
+                        table_num * block_size / LBA_SIZE,
+                        block_size / LBA_SIZE,
+                        &mut table_data,
+                    )?;
+                    let inode_byte = inode_clone.to_bytes();
+                    // table_data[inode_offset + mem::size_of::<Ext2Inode>()
+                    //     ..inode_offset + mem::size_of::<Ext2Inode>()] = inode_byte;
+                    table_data.splice(
+                        inode_offset * mem::size_of::<Ext2Inode>()
+                            ..inode_offset * mem::size_of::<Ext2Inode>()
+                                + mem::size_of::<Ext2Inode>(),
+                        inode_byte,
+                    );
 
-                todo!()
+                    partition.disk().write_at(
+                        table_num * block_size / LBA_SIZE,
+                        block_size / LBA_SIZE,
+                        &mut table_data,
+                    )?;
+                }
+                return Ok(start_buf_offset);
+                // let start_block_id = offset
             }
             Ext2FileType::CharacterDevice => todo!(),
             Ext2FileType::BlockDevice => todo!(),

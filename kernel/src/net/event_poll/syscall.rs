@@ -163,30 +163,44 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         let mut timer = None;
         let mut timeout = false;
+        kdebug!("{:?}", poll_fds);
         loop {
             let mut revent_nums = 0;
             for poll_fd in poll_fds {
                 let fd = match poll_fd.fd() {
-                    Some(fd) => fd,
-                    None => continue,
+                    Some(fd) if fd != 0 => fd,
+                    _ => continue,
                 };
-                if fd > 0 {
-                    let current_pcb = ProcessManager::current_pcb();
-                    let fd_table = current_pcb.fd_table();
-                    let fd_table_guard = fd_table.read();
-                    let file = fd_table_guard
-                        .get_file_by_fd(fd)
-                        .ok_or(SystemError::EBADF)?
-                        .clone();
-                    drop(fd_table_guard);
-                    let revents = EPollEventType::from_bits_truncate(file.poll()? as u32);
-                    if !revents.is_empty() {
-                        poll_fd.revents().set(revents);
-                        revent_nums += 1;
-                    }
+
+                let current_pcb = ProcessManager::current_pcb();
+                let fd_table = current_pcb.fd_table();
+                let fd_table_guard = fd_table.read();
+                let file = fd_table_guard
+                    .get_file_by_fd(fd)
+                    .ok_or(SystemError::EBADF)?;
+                drop(fd_table_guard);
+
+                // let flag = EPollEventType::EPOLLIN;
+                let flag_to_check1 = EPollEventType::EPOLLOUT
+                    | EPollEventType::EPOLLWRNORM
+                    | EPollEventType::EPOLLERR;
+                // let flag_to_check2 =  EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM;
+
+                let revents =
+                    EPollEventType::from_bits_truncate(file.poll()? as u32) & !flag_to_check1;
+                // kdebug!("{:?}",poll_fd);
+
+                if !revents.is_empty() {
+                    kdebug!("{:?}", poll_fd);
+
+                    revent_nums += 1;
+                    // kdebug!("after:{:?}",revent_nums);
+                    poll_fd.revents().set(revents | flag_to_check1);
                 }
+                // poll_fd.revents().set(revents | flag_to_check1);
             }
             // kdebug!("{:?}",revent_nums);
+            // kdebug!("{:?}", poll_fds);
             if revent_nums > 0 {
                 return Ok(revent_nums);
             }

@@ -308,6 +308,23 @@ impl IndexNode for TtyDevice {
         Ok(())
     }
 
+    fn kernel_ioctl(
+        &self,
+        arg: Arc<dyn crate::net::event_poll::KernelIoctlData>,
+        tty: Arc<TtyCore>,
+    ) -> Result<usize, SystemError> {
+        let epitem = arg
+            .arc_any()
+            .downcast::<EPollItem>()
+            .map_err(|_| SystemError::EFAULT)?;
+
+        let core = tty.core();
+
+        core.add_epitem(epitem.clone());
+
+        return Ok(0);
+    }
+
     fn ioctl(&self, cmd: u32, arg: usize, data: &FilePrivateData) -> Result<usize, SystemError> {
         let (tty, _) = if let FilePrivateData::Tty(tty_priv) = data {
             (tty_priv.tty(), tty_priv.mode)
@@ -334,9 +351,7 @@ impl IndexNode for TtyDevice {
                 )?;
                 let epitem = unsafe { &*(arg as *const Arc<EPollItem>) };
 
-                let core = tty.core();
-
-                core.add_epitem(epitem.clone());
+                self.kernel_ioctl(epitem.clone(), tty)?;
 
                 return Ok(0);
             }

@@ -25,7 +25,7 @@ use crate::{
         sysfs::{sysfs_instance, Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport},
     }, include::bindings::bindings::kzalloc, libs::{
         casting::DowncastArc, mutex::Mutex, rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard}
-    }, net::socket::SocketType
+    }, net::{net_core::consume_skb, socket::SocketType}
 };use alloc::{boxed::Box, vec::Vec};
 
 use crate::net::socket::Socket;
@@ -72,6 +72,32 @@ pub struct HListNode<T> {
     data: T,
     next: Option<Box<HListNode<T>>>,
 }
+impl<T> HListHead<T> {
+    fn iter(&self) -> HListHeadIter<T> {
+        HListHeadIter {
+            current: self.first.as_ref(),
+        }
+    }
+}
+
+struct HListHeadIter<'a, T> {
+    current: Option<&'a Box<HListNode<T>>>,
+}
+
+impl<'a, T> Iterator for HListHeadIter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.current {
+            Some(node) => {
+                self.current = node.next.as_ref();
+                Some(&node.data)
+            },
+            None => None,
+        }
+    }
+}
+
 
 pub struct NetlinkTable {
     listeners: Option<listeners>,
@@ -536,19 +562,19 @@ pub fn netlink_broadcast<'a>(ssk: &'a sock, skb: Arc<RefCell<SkBuff<'a>>>, porti
 
     // While we sleep in clone, do not allow to change socket list
     let nl_table = NL_TABLE.read();
-    for sk in &nl_table[ssk.sk_protocol].mc_list {
-        do_one_broadcast(sk, &info);
+    for sk in &mut nl_table[ssk.sk_protocol].mc_list.iter() {
+        do_one_broadcast(sk.sk(), &info);
     }
     
 
-    // consume_skb(skb);
+    consume_skb(info.skb);
 
 
     if info.delivery_failure != 0 {
         drop(info.skb_2);
         return Err(SystemError::ENOBUFS);
     }
-    // consume_skb(info.skb_2);
+    consume_skb(info.skb_2);
 
     // if info.delivered != 0 {
     //     if info.congested != 0 && gfpflags_allow_blocking(allocation) != 0 {

@@ -1,3 +1,5 @@
+use core::cell::RefCell;
+
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
 use log::{debug, info, warn};
 use smoltcp::{socket::dhcpv4, wire};
@@ -12,7 +14,7 @@ use crate::{
 
 use super::{
     event_poll::{EPollEventType, EventPoll},
-    socket::{handle::GlobalSocketHandle, inet::TcpSocket, HANDLE_MAP, SOCKET_SET},
+    socket::{handle::GlobalSocketHandle, inet::TcpSocket, netlink::af_netlink::SkBuff, HANDLE_MAP, SOCKET_SET},
 };
 
 /// The network poll function, which will be called by timer.
@@ -246,3 +248,9 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
 // 参考https://code.dragonos.org.cn/xref/linux-6.1.9/net/core/scok.c#3853
 // proto_register
 // proto_unregister
+
+// https://code.dragonos.org.cn/xref/linux-6.1.9/net/core/skbuff.c#1027
+pub fn consume_skb<'a>(skb: Arc<RefCell<SkBuff<'a>>>){
+    // 释放skb
+    drop(skb);
+}

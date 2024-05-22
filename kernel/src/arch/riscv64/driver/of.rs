@@ -3,7 +3,6 @@ use system_error::SystemError;
 use crate::{
     driver::open_firmware::fdt::OpenFirmwareFdtDriver,
     init::boot_params,
-    kdebug,
     libs::align::page_align_up,
     mm::{mmio_buddy::mmio_pool, MemoryManagementArch, PhysAddr},
 };
@@ -18,7 +17,7 @@ impl OpenFirmwareFdtDriver {
         let offset = fdt_paddr.data() & crate::arch::MMArch::PAGE_OFFSET_MASK;
         let map_size = page_align_up(fdt_size + offset);
         let map_paddr = PhysAddr::new(fdt_paddr.data() & crate::arch::MMArch::PAGE_MASK);
-        // kdebug!(
+        // debug!(
         //     "map_fdt paddr: {:?}, map_pa: {:?},fdt_size: {},  size: {:?}",
         //     fdt_paddr,
         //     map_paddr,
@@ -29,7 +28,7 @@ impl OpenFirmwareFdtDriver {
 
         // drop the boot params guard in order to avoid deadlock
         drop(bp_guard);
-        // kdebug!("map_fdt: map fdt to {:?}, size: {}", map_paddr, map_size);
+        // debug!("map_fdt: map fdt to {:?}, size: {}", map_paddr, map_size);
         mmio_guard.map_phys(map_paddr, map_size)?;
         let mut bp_guard = boot_params().write();
         let vaddr = mmio_guard.vaddr() + offset;

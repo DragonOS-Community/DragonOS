@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 use core::{cmp::min, intrinsics::unlikely};
+use log::{debug, warn};
 use system_error::SystemError;
 
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, SeekFrom},
-    kwarn,
     libs::vec_cursor::VecCursor,
 };
 use alloc::{
@@ -265,7 +265,7 @@ impl FATFile {
             let last_cluster = if let Some(c) = fs.get_last_cluster(self.first_cluster) {
                 c
             } else {
-                kwarn!("FAT: last cluster not found, File = {self:?}");
+                warn!("FAT: last cluster not found, File = {self:?}");
                 return Err(SystemError::EINVAL);
             };
             // 申请簇
@@ -450,7 +450,7 @@ impl FATDir {
 
                     free += 1;
                     if free == num_free {
-                        // kdebug!("first_free = {first_free:?}, current_free = ({current_cluster:?}, {offset})");
+                        // debug!("first_free = {first_free:?}, current_free = ({current_cluster:?}, {offset})");
                         return Ok(first_free);
                     }
                 }
@@ -472,7 +472,7 @@ impl FATDir {
                 / fs.bytes_per_cluster();
         let mut first_cluster = Cluster::default();
         let mut prev_cluster = current_cluster;
-        // kdebug!(
+        // debug!(
         //     "clusters_required={clusters_required}, prev_cluster={prev_cluster:?}, free ={free}"
         // );
         // 申请簇
@@ -592,7 +592,7 @@ impl FATDir {
     pub fn create_dir(&self, name: &str, fs: &Arc<FATFileSystem>) -> Result<FATDir, SystemError> {
         let r: Result<FATDirEntryOrShortName, SystemError> =
             self.check_existence(name, Some(true), fs.clone());
-        // kdebug!("check existence ok");
+        // debug!("check existence ok");
         // 检查错误码，如果能够表明目录项已经存在，则返回-EEXIST
         if let Err(err_val) = r {
             if err_val == (SystemError::EISDIR) || err_val == (SystemError::ENOTDIR) {
@@ -639,7 +639,7 @@ impl FATDir {
 
                 dot_dot_entry.flush(fs, fs.cluster_bytes_offset(first_cluster) + offset)?;
 
-                // kdebug!("to create dentries");
+                // debug!("to create dentries");
                 // 在当前目录下创建目标目录项
                 let res = self
                     .create_dir_entries(
@@ -652,7 +652,7 @@ impl FATDir {
                         fs.clone(),
                     )
                     .map(|e| e.to_dir())?;
-                // kdebug!("create dentries ok");
+                // debug!("create dentries ok");
                 return res;
             }
             FATDirEntryOrShortName::DirEntry(_) => {
@@ -732,7 +732,7 @@ impl FATDir {
             LongNameEntryGenerator::new(long_name, short_dentry.checksum());
         let num_entries = long_name_gen.num_entries() as u64;
 
-        // kdebug!("to find free entries");
+        // debug!("to find free entries");
         let free_entries: Option<(Cluster, u64)> =
             self.find_free_entries(num_entries, fs.clone())?;
         // 目录项开始位置
@@ -1119,7 +1119,7 @@ impl LongDirEntry {
                 | '^' | '#' | '&' => {}
                 '+' | ',' | ';' | '=' | '[' | ']' | '.' | ' ' => {}
                 _ => {
-                    kdebug!("error char: {}", c);
+                    debug!("error char: {}", c);
                     return Err(SystemError::EILSEQ);
                 }
             }
@@ -1574,7 +1574,7 @@ impl FATDirIter {
                             }
                         }
                     }
-                    // kdebug!("collect dentries done. long_name_entries={long_name_entries:?}");
+                    // debug!("collect dentries done. long_name_entries={long_name_entries:?}");
                     let dir_entry: Result<FATDirEntry, SystemError> = FATDirEntry::new(
                         long_name_entries,
                         (
@@ -1582,16 +1582,16 @@ impl FATDirIter {
                             (self.current_cluster, self.offset),
                         ),
                     );
-                    // kdebug!("dir_entry={:?}", dir_entry);
+                    // debug!("dir_entry={:?}", dir_entry);
                     match dir_entry {
                         Ok(d) => {
-                            // kdebug!("dir_entry ok");
+                            // debug!("dir_entry ok");
                             self.offset += FATRawDirEntry::DIR_ENTRY_LEN;
                             return Ok((self.current_cluster, self.offset, Some(d)));
                         }
 
                         Err(_) => {
-                            // kdebug!("dir_entry err,  e={}", e);
+                            // debug!("dir_entry err,  e={}", e);
                             self.offset += FATRawDirEntry::DIR_ENTRY_LEN;
                         }
                     }
@@ -2411,7 +2411,7 @@ pub fn get_raw_dir_entry(
     // let step1 = fs.get_in_partition_bytes_offset(in_disk_bytes_offset);
     // let step2 = fs.bytes_to_sector(step1);
     // let lba = fs.get_lba_from_offset(step2);
-    // kdebug!("step1={step1}, step2={step2}, lba={lba}");
+    // debug!("step1={step1}, step2={step2}, lba={lba}");
     let mut v: Vec<u8> = vec![0; LBA_SIZE];
 
     fs.partition.disk().read_at(lba, 1, &mut v)?;

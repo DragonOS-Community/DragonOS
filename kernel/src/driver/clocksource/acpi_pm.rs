@@ -15,12 +15,13 @@ use acpi::fadt::Fadt;
 use alloc::sync::{Arc, Weak};
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicU32, Ordering};
+use log::info;
 use system_error::SystemError;
 
 // 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/clocksource/acpi_pm.c
 
 /// acpi_pmtmr所在的I/O端口
-pub static mut PMTMR_IO_PORT: AtomicU32 = AtomicU32::new(0);
+pub static PMTMR_IO_PORT: AtomicU32 = AtomicU32::new(0);
 
 /// # 读取acpi_pmtmr当前值，并对齐进行掩码操作
 #[inline(always)]
@@ -170,6 +171,8 @@ const PMTMR_EXPECTED_RATE: u64 =
 #[cfg(not(target_arch = "x86_64"))]
 #[allow(dead_code)]
 fn verify_pmtmr_rate() -> bool {
+    use log::info;
+
     let mut count: u32 = 0;
 
     mach_prepare_counter();
@@ -179,7 +182,7 @@ fn verify_pmtmr_rate() -> bool {
     let delta = (value2 - value1) & ACPI_PM_MASK;
 
     if (delta < (PMTMR_EXPECTED_RATE * 19) / 20) || (delta > (PMTMR_EXPECTED_RATE * 21) / 20) {
-        kinfo!(
+        info!(
             "PM Timer running at invalid rate: {}",
             100 * delta / PMTMR_EXPECTED_RATE
         );
@@ -206,12 +209,13 @@ fn find_acpi_pm_clock() -> Result<(), SystemError> {
     let pm_timer_block = fadt.pm_timer_block().map_err(|_| SystemError::ENODEV)?;
     let pm_timer_block = pm_timer_block.ok_or(SystemError::ENODEV)?;
     let pmtmr_addr = pm_timer_block.address;
-    unsafe {
-        PMTMR_IO_PORT.store(pmtmr_addr as u32, Ordering::SeqCst);
-    }
-    kinfo!("apic_pmtmr I/O port: {}", unsafe {
+
+    PMTMR_IO_PORT.store(pmtmr_addr as u32, Ordering::SeqCst);
+
+    info!(
+        "apic_pmtmr I/O port: {}",
         PMTMR_IO_PORT.load(Ordering::SeqCst)
-    });
+    );
 
     return Ok(());
 }
@@ -222,16 +226,17 @@ fn find_acpi_pm_clock() -> Result<(), SystemError> {
 #[allow(dead_code)]
 pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
     let acpi_pm = Acpipm::new();
-    unsafe {
-        CLOCKSOURCE_ACPI_PM = Some(acpi_pm);
-    }
 
     // 解析fadt
     find_acpi_pm_clock()?;
 
     // 检查pmtmr_io_port是否被设置
-    if unsafe { PMTMR_IO_PORT.load(Ordering::SeqCst) } == 0 {
+    if PMTMR_IO_PORT.load(Ordering::SeqCst) == 0 {
         return Err(SystemError::ENODEV);
+    }
+
+    unsafe {
+        CLOCKSOURCE_ACPI_PM = Some(acpi_pm);
     }
 
     // 验证ACPI PM Timer作为时钟源的稳定性和一致性
@@ -255,26 +260,24 @@ pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
             if (value2 < value1) && (value2 < 0xfff) {
                 break;
             }
-            kinfo!("PM Timer had inconsistens results: {} {}", value1, value2);
-            unsafe {
-                PMTMR_IO_PORT.store(0, Ordering::SeqCst);
-            }
+            info!("PM Timer had inconsistens results: {} {}", value1, value2);
+
+            PMTMR_IO_PORT.store(0, Ordering::SeqCst);
+
             return Err(SystemError::EINVAL);
         }
         if i == ACPI_PM_READ_CHECKS {
-            kinfo!("PM Timer failed consistency check: {}", value1);
-            unsafe {
-                PMTMR_IO_PORT.store(0, Ordering::SeqCst);
-            }
+            info!("PM Timer failed consistency check: {}", value1);
+
+            PMTMR_IO_PORT.store(0, Ordering::SeqCst);
+
             return Err(SystemError::EINVAL);
         }
     }
 
     // 检查ACPI PM Timer的频率是否正确
     if !verify_pmtmr_rate() {
-        unsafe {
-            PMTMR_IO_PORT.store(0, Ordering::SeqCst);
-        }
+        PMTMR_IO_PORT.store(0, Ordering::SeqCst);
     }
 
     // 检查TSC时钟源的监视器是否被禁用，如果被禁用则将时钟源的标志设置为CLOCK_SOURCE_MUST_VERIFY
@@ -289,11 +292,11 @@ pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
     let acpi_pmtmr = clocksource_acpi_pm() as Arc<dyn Clocksource>;
     match acpi_pmtmr.register(100, PMTMR_TICKS_PER_SEC as u32) {
         Ok(_) => {
-            kinfo!("ACPI PM Timer registered as clocksource sccessfully");
+            info!("ACPI PM Timer registered as clocksource sccessfully");
             return Ok(());
         }
         Err(_) => {
-            kinfo!("ACPI PM Timer init registered failed");
+            info!("ACPI PM Timer init registered failed");
             return Err(SystemError::ENOSYS);
         }
     };

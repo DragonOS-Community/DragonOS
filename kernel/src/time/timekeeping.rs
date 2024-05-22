@@ -1,11 +1,11 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{compiler_fence, AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use log::{debug, info};
 use system_error::SystemError;
 
 use crate::{
     arch::{CurrentIrqArch, CurrentTimeArch},
     exception::InterruptArch,
-    kdebug, kinfo,
     libs::rwlock::{RwLock, RwLockReadGuard},
     time::{
         jiffies::{clocksource_default_clock, jiffies_init},
@@ -120,7 +120,7 @@ impl Timekeeper {
         let mut clock_data = clock.clocksource_data();
         clock_data.watchdog_last = clock.read();
         if clock.update_clocksource_data(clock_data).is_err() {
-            kdebug!("timekeeper_setup_internals:update_clocksource_data run failed");
+            debug!("timekeeper_setup_internals:update_clocksource_data run failed");
         }
         timekeeper.clock.replace(clock.clone());
 
@@ -164,10 +164,8 @@ impl Timekeeper {
 
     #[inline]
     fn do_read_cpu_cycle_ns(&self) -> usize {
-        CurrentTimeArch::cycles2ns(
-            CurrentTimeArch::get_cycles()
-                .wrapping_sub(self.last_update_cpu_cycle.load(Ordering::SeqCst)),
-        )
+        let prev = self.last_update_cpu_cycle.load(Ordering::SeqCst);
+        CurrentTimeArch::cycles2ns(CurrentTimeArch::get_cycles().wrapping_sub(prev))
     }
 
     fn mark_update_wall_time_ok(&self) {
@@ -193,7 +191,7 @@ pub fn timekeeper_init() {
 ///
 /// * 'TimeSpec' - 时间戳
 pub fn getnstimeofday() -> PosixTimeSpec {
-    // kdebug!("enter getnstimeofday");
+    // debug!("enter getnstimeofday");
 
     let nsecs;
     let mut xtime: PosixTimeSpec;
@@ -218,7 +216,7 @@ pub fn getnstimeofday() -> PosixTimeSpec {
     xtime.tv_nsec += nsecs as i64;
     xtime.tv_sec += xtime.tv_nsec / NSEC_PER_SEC as i64;
     xtime.tv_nsec %= NSEC_PER_SEC as i64;
-    // kdebug!("getnstimeofday: xtime = {:?}, nsecs = {:}", xtime, nsecs);
+    // debug!("getnstimeofday: xtime = {:?}, nsecs = {:}", xtime, nsecs);
 
     // TODO 将xtime和当前时间源的时间相加
 
@@ -248,7 +246,7 @@ pub fn do_settimeofday64(time: PosixTimeSpec) -> Result<(), SystemError> {
 /// # 初始化timekeeping模块
 #[inline(never)]
 pub fn timekeeping_init() {
-    kinfo!("Initializing timekeeping module...");
+    info!("Initializing timekeeping module...");
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     timekeeper_init();
 
@@ -274,12 +272,12 @@ pub fn timekeeping_init() {
     drop(irq_guard);
     drop(timekeeper);
     jiffies_init();
-    kinfo!("timekeeping_init successfully");
+    info!("timekeeping_init successfully");
 }
 
 /// # 使用当前时钟源增加wall time
 pub fn update_wall_time(delta_us: i64) {
-    // kdebug!("enter update_wall_time, stack_use = {:}",stack_use);
+    // debug!("enter update_wall_time, stack_use = {:}",stack_use);
     compiler_fence(Ordering::SeqCst);
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     // 如果在休眠那就不更新

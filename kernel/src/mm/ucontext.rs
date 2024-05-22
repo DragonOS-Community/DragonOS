@@ -143,7 +143,7 @@ impl InnerAddressSpace {
             end_data: VirtAddr(0),
         };
         if create_stack {
-            // kdebug!("to create user stack.");
+            // debug!("to create user stack.");
             result.new_user_stack(UserStack::DEFAULT_USER_STACK_SIZE)?;
         }
 
@@ -183,7 +183,7 @@ impl InnerAddressSpace {
             // 仅拷贝VMA信息并添加反向映射，因为UserMapper克隆时已经分配了新的物理页
             let new_vma = LockedVMA::new(vma_guard.clone_info_only());
             new_guard.mappings.vmas.insert(new_vma.clone());
-            // kdebug!("new vma: {:x?}", new_vma);
+            // debug!("new vma: {:x?}", new_vma);
             let new_vma_guard = new_vma.lock();
             let new_mapper = &new_guard.user_mapper.utable;
             let mut anon_vma_guard = page_manager_lock_irqsave();
@@ -209,7 +209,7 @@ impl InnerAddressSpace {
     /// - `bytes`: 拓展大小
     #[allow(dead_code)]
     pub fn extend_stack(&mut self, mut bytes: usize) -> Result<(), SystemError> {
-        // kdebug!("extend user stack");
+        // debug!("extend user stack");
         let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
         let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_GROWSDOWN;
         let stack = self.user_stack.as_mut().unwrap();
@@ -259,7 +259,7 @@ impl InnerAddressSpace {
         let round_hint_to_min = |hint: VirtAddr| {
             // 先把hint向下对齐到页边界
             let addr = hint.data() & (!MMArch::PAGE_OFFSET_MASK);
-            // kdebug!("map_anonymous: hint = {:?}, addr = {addr:#x}", hint);
+            // debug!("map_anonymous: hint = {:?}, addr = {addr:#x}", hint);
             // 如果hint不是0，且hint小于DEFAULT_MMAP_MIN_ADDR，则对齐到DEFAULT_MMAP_MIN_ADDR
             if (addr != 0) && round_to_min && (addr < DEFAULT_MMAP_MIN_ADDR) {
                 Some(VirtAddr::new(page_align_up(DEFAULT_MMAP_MIN_ADDR)))
@@ -269,8 +269,8 @@ impl InnerAddressSpace {
                 Some(VirtAddr::new(addr))
             }
         };
-        // kdebug!("map_anonymous: start_vaddr = {:?}", start_vaddr);
-        // kdebug!("map_anonymous: len(no align) = {}", len);
+        // debug!("map_anonymous: start_vaddr = {:?}", start_vaddr);
+        // debug!("map_anonymous: len(no align) = {}", len);
 
         let len = page_align_up(len);
 
@@ -280,7 +280,7 @@ impl InnerAddressSpace {
             | VmFlags::VM_MAYWRITE
             | VmFlags::VM_MAYEXEC;
 
-        // kdebug!("map_anonymous: len = {}", len);
+        // debug!("map_anonymous: len = {}", len);
 
         let start_page: VirtPageFrame = if allocate_at_once {
             self.mmap(
@@ -299,18 +299,12 @@ impl InnerAddressSpace {
                 prot_flags,
                 map_flags,
                 move |page, count, flags, _mapper, _flusher| {
-                    Ok(LockedVMA::new(VMA {
-                        region: VirtRegion::new(
-                            page.virt_address(),
-                            count.data() * MMArch::PAGE_SIZE,
-                        ),
+                    Ok(LockedVMA::new(VMA::new(
+                        VirtRegion::new(page.virt_address(), count.data() * MMArch::PAGE_SIZE),
                         vm_flags,
                         flags,
-                        mapped: true,
-                        user_address_space: None,
-                        self_ref: Weak::default(),
-                        provider: Provider::Allocated,
-                    }))
+                        false,
+                    )))
                 },
             )?
         };
@@ -354,7 +348,7 @@ impl InnerAddressSpace {
         if page_count == PageFrameCount::new(0) {
             return Err(SystemError::EINVAL);
         }
-        // kdebug!("mmap: addr: {addr:?}, page_count: {page_count:?}, prot_flags: {prot_flags:?}, map_flags: {map_flags:?}");
+        // debug!("mmap: addr: {addr:?}, page_count: {page_count:?}, prot_flags: {prot_flags:?}, map_flags: {map_flags:?}");
 
         // 找到未使用的区域
         let region = match addr {
@@ -370,7 +364,7 @@ impl InnerAddressSpace {
 
         let page = VirtPageFrame::new(region.start());
 
-        // kdebug!("mmap: page: {:?}, region={region:?}", page.virt_address());
+        // debug!("mmap: page: {:?}, region={region:?}", page.virt_address());
 
         compiler_fence(Ordering::SeqCst);
         let (mut active, mut inactive);
@@ -516,7 +510,7 @@ impl InnerAddressSpace {
         page_count: PageFrameCount,
         prot_flags: ProtFlags,
     ) -> Result<(), SystemError> {
-        // kdebug!(
+        // debug!(
         //     "mprotect: start_page: {:?}, page_count: {:?}, prot_flags:{prot_flags:?}",
         //     start_page,
         //     page_count
@@ -532,13 +526,13 @@ impl InnerAddressSpace {
 
         let mapper = &mut self.user_mapper.utable;
         let region = VirtRegion::new(start_page.virt_address(), page_count.bytes());
-        // kdebug!("mprotect: region: {:?}", region);
+        // debug!("mprotect: region: {:?}", region);
 
         let regions = self.mappings.conflicts(region).collect::<Vec<_>>();
-        // kdebug!("mprotect: regions: {:?}", regions);
+        // debug!("mprotect: regions: {:?}", regions);
 
         for r in regions {
-            // kdebug!("mprotect: r: {:?}", r);
+            // debug!("mprotect: r: {:?}", r);
             let r = *r.lock().region();
             let r = self.mappings.remove_vma(&r).unwrap();
 
@@ -1033,7 +1027,6 @@ impl LockedVMA {
         mut flusher: impl Flusher<MMArch>,
     ) -> Result<(), SystemError> {
         let mut guard = self.lock();
-        assert!(guard.mapped);
         for page in guard.region.pages() {
             // 暂时要求所有的页帧都已经映射到页表
             // TODO: 引入Lazy Mapping, 通过缺页中断来映射页帧，这里就不必要求所有的页帧都已经映射到页表了
@@ -1052,7 +1045,6 @@ impl LockedVMA {
         // todo: 如果当前vma与文件相关，完善文件相关的逻辑
 
         let mut guard = self.lock();
-        assert!(guard.mapped);
 
         // 获取物理页的anon_vma的守卫
         let mut page_manager_guard: SpinLockGuard<'_, crate::mm::page::PageManager> =
@@ -1347,9 +1339,8 @@ impl VMA {
         mapper: &mut PageMapper,
         mut flusher: impl Flusher<MMArch>,
     ) -> Result<(), SystemError> {
-        assert!(self.mapped);
         for page in self.region.pages() {
-            // kdebug!("remap page {:?}", page.virt_address());
+            // debug!("remap page {:?}", page.virt_address());
             if mapper.translate(page.virt_address()).is_some() {
                 let r = unsafe {
                     mapper
@@ -1358,8 +1349,8 @@ impl VMA {
                 };
                 flusher.consume(r);
             }
-            // kdebug!("consume page {:?}", page.virt_address());
-            // kdebug!("remap page {:?} done", page.virt_address());
+            // debug!("consume page {:?}", page.virt_address());
+            // debug!("remap page {:?} done", page.virt_address());
         }
         self.flags = flags;
         return Ok(());
@@ -1460,12 +1451,12 @@ impl VMA {
         mut flusher: impl Flusher<MMArch>,
     ) -> Result<Arc<LockedVMA>, SystemError> {
         let mut cur_dest: VirtPageFrame = destination;
-        // kdebug!(
+        // debug!(
         //     "VMA::zeroed: page_count = {:?}, destination={destination:?}",
         //     page_count
         // );
         for _ in 0..page_count.data() {
-            // kdebug!(
+            // debug!(
             //     "VMA::zeroed: cur_dest={cur_dest:?}, vaddr = {:?}",
             //     cur_dest.virt_address()
             // );
@@ -1477,20 +1468,17 @@ impl VMA {
             flusher.consume(r);
             cur_dest = cur_dest.next();
         }
-        let r = LockedVMA::new(VMA {
-            region: VirtRegion::new(
+        let r = LockedVMA::new(VMA::new(
+            VirtRegion::new(
                 destination.virt_address(),
                 page_count.data() * MMArch::PAGE_SIZE,
             ),
             vm_flags,
             flags,
-            mapped: true,
-            user_address_space: None,
-            self_ref: Weak::default(),
-            provider: Provider::Allocated,
-        });
+            true,
+        ));
         drop(flusher);
-        // kdebug!("VMA::zeroed: flusher dropped");
+        // debug!("VMA::zeroed: flusher dropped");
 
         // 清空这些内存并将VMA加入到anon_vma中
         let mut page_manager_guard = page_manager_lock_irqsave();
@@ -1509,7 +1497,7 @@ impl VMA {
                 MMArch::write_bytes(vaddr, 0, MMArch::PAGE_SIZE);
             }
         }
-        // kdebug!("VMA::zeroed: done");
+        // debug!("VMA::zeroed: done");
         return Ok(r);
     }
 }
@@ -1577,7 +1565,7 @@ impl UserStack {
             | MapFlags::MAP_ANONYMOUS
             | MapFlags::MAP_FIXED_NOREPLACE
             | MapFlags::MAP_GROWSDOWN;
-        // kdebug!(
+        // debug!(
         //     "map anonymous stack: {:?} {}",
         //     actual_stack_bottom,
         //     guard_size
@@ -1593,7 +1581,7 @@ impl UserStack {
         // test_buddy();
         // 设置保护页只读
         prot_flags.remove(ProtFlags::PROT_WRITE);
-        // kdebug!(
+        // debug!(
         //     "to mprotect stack guard pages: {:?} {}",
         //     actual_stack_bottom,
         //     guard_size
@@ -1604,7 +1592,7 @@ impl UserStack {
             prot_flags,
         )?;
 
-        // kdebug!(
+        // debug!(
         //     "mprotect stack guard pages done: {:?} {}",
         //     actual_stack_bottom,
         //     guard_size
@@ -1616,10 +1604,10 @@ impl UserStack {
             current_sp: actual_stack_bottom - guard_size,
         };
 
-        // kdebug!("extend user stack: {:?} {}", stack_bottom, stack_size);
+        // debug!("extend user stack: {:?} {}", stack_bottom, stack_size);
         // 分配用户栈
         user_stack.initial_extend(vm, stack_size)?;
-        // kdebug!("user stack created: {:?} {}", stack_bottom, stack_size);
+        // debug!("user stack created: {:?} {}", stack_bottom, stack_size);
         return Ok(user_stack);
     }
 

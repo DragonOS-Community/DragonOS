@@ -7,13 +7,13 @@ use core::{
 };
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use log::{debug, info};
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 use crate::{
     arch::CurrentIrqArch,
     exception::InterruptArch,
-    kdebug, kinfo,
     libs::rwlock::RwLock,
     mm::percpu::{PerCpu, PerCpuVar},
     process::ProcessManager,
@@ -35,7 +35,7 @@ pub extern "C" fn rs_softirq_init() {
 
 #[inline(never)]
 pub fn softirq_init() -> Result<(), SystemError> {
-    kinfo!("Initializing softirq...");
+    info!("Initializing softirq...");
     unsafe {
         __SORTIRQ_VECTORS = Box::leak(Box::new(Softirq::new()));
         __CPU_PENDING = Some(Box::new(
@@ -46,7 +46,7 @@ pub fn softirq_init() -> Result<(), SystemError> {
             cpu_pending[i as usize] = VecStatus::default();
         }
     }
-    kinfo!("Softirq initialized.");
+    info!("Softirq initialized.");
     return Ok(());
 }
 
@@ -143,20 +143,20 @@ impl Softirq {
         softirq_num: SoftirqNumber,
         handler: Arc<dyn SoftirqVec>,
     ) -> Result<i32, SystemError> {
-        // kdebug!("register_softirq softirq_num = {:?}", softirq_num as u64);
+        // debug!("register_softirq softirq_num = {:?}", softirq_num as u64);
 
         // let self = &mut SOFTIRQ_VECTORS.lock();
         // 判断该软中断向量是否已经被注册
         let mut table_guard = self.table.write_irqsave();
         if table_guard[softirq_num as usize].is_some() {
-            // kdebug!("register_softirq failed");
+            // debug!("register_softirq failed");
 
             return Err(SystemError::EINVAL);
         }
         table_guard[softirq_num as usize] = Some(handler);
         drop(table_guard);
 
-        // kdebug!(
+        // debug!(
         //     "register_softirq successfully, softirq_num = {:?}",
         //     softirq_num as u64
         // );
@@ -169,7 +169,7 @@ impl Softirq {
     /// @param irq_num 中断向量号码  
     #[allow(dead_code)]
     pub fn unregister_softirq(&self, softirq_num: SoftirqNumber) {
-        // kdebug!("unregister_softirq softirq_num = {:?}", softirq_num as u64);
+        // debug!("unregister_softirq softirq_num = {:?}", softirq_num as u64);
         let mut table_guard = self.table.write_irqsave();
         // 将软中断向量清空
         table_guard[softirq_num as usize] = None;
@@ -219,7 +219,7 @@ impl Softirq {
 
                     softirq_func.as_ref().unwrap().run();
                     if unlikely(prev_count != ProcessManager::current_pcb().preempt_count()) {
-                        kdebug!(
+                        debug!(
                             "entered softirq {:?} with preempt_count {:?},exited with {:?}",
                             i,
                             prev_count,
@@ -255,7 +255,7 @@ impl Softirq {
         compiler_fence(Ordering::SeqCst);
 
         drop(guard);
-        // kdebug!("raise_softirq exited");
+        // debug!("raise_softirq exited");
     }
 
     #[allow(dead_code)]

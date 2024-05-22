@@ -4,20 +4,25 @@ use alloc::{
 };
 use ida::IdAllocator;
 use intertrait::cast::CastArc;
+use log::error;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    driver::base::{
-        device::{
-            bus::{bus_manager, Bus},
-            device_manager,
-            driver::{driver_manager, Driver},
-            Device,
+    driver::{
+        base::{
+            device::{
+                bus::{bus_manager, Bus},
+                device_manager,
+                driver::{driver_manager, Driver},
+                Device,
+            },
+            kobject::KObject,
+            subsys::SubSysPrivate,
         },
-        kobject::KObject,
-        subsys::SubSysPrivate,
+        virtio::irq::{virtio_irq_manager, DefaultVirtioIrqHandler},
     },
+    exception::{irqdesc::IrqHandleFlags, manage::irq_manager},
     filesystem::{
         sysfs::{
             file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
@@ -74,7 +79,7 @@ impl Bus for VirtIOBus {
     fn probe(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
         let drv = device.driver().ok_or(SystemError::EINVAL)?;
         let virtio_drv = drv.cast::<dyn VirtIODriver>().map_err(|_| {
-            kerror!(
+            error!(
                 "VirtIOBus::probe() failed: device.driver() is not a VirtioDriver. Device: '{:?}'",
                 device.name()
             );
@@ -82,7 +87,7 @@ impl Bus for VirtIOBus {
         })?;
 
         let virtio_dev = device.clone().cast::<dyn VirtIODevice>().map_err(|_| {
-            kerror!(
+            error!(
                 "VirtIOBus::probe() failed: device is not a VirtIODevice. Device: '{:?}'",
                 device.name()
             );
@@ -163,7 +168,7 @@ impl VirtIODeviceManager {
         let drv = dev.driver().ok_or(SystemError::EINVAL)?;
 
         let virtio_drv = drv.cast::<dyn VirtIODriver>().map_err(|_| {
-            kerror!(
+            error!(
                 "VirtIODeviceManager::device_add() failed: device.driver() is not a VirtioDriver. Device: '{:?}'",
                 dev.name()
             );
@@ -175,7 +180,47 @@ impl VirtIODeviceManager {
         virtio_drv.probe(&dev)?;
 
         device_manager().add_device(dev.clone() as Arc<dyn Device>)?;
-        device_manager().add_groups(&(dev as Arc<dyn Device>), &[&VirtIODeviceAttrGroup])
+        let r = device_manager()
+            .add_groups(&(dev.clone() as Arc<dyn Device>), &[&VirtIODeviceAttrGroup]);
+
+        self.setup_irq(&dev).ok();
+
+        return r;
+    }
+
+    /// # setup_irq - 设置中断
+    ///
+    /// 为virtio设备设置中断。
+    fn setup_irq(&self, dev: &Arc<dyn VirtIODevice>) -> Result<(), SystemError> {
+        let irq = dev.irq().ok_or(SystemError::EINVAL)?;
+        if let Err(e) = irq_manager().request_irq(
+            irq,
+            dev.device_name(),
+            &DefaultVirtioIrqHandler,
+            IrqHandleFlags::IRQF_SHARED,
+            Some(dev.dev_id().clone()),
+        ) {
+            error!(
+                "Failed to request irq for virtio device '{}': irq: {:?}, error {:?}",
+                dev.device_name(),
+                irq,
+                e
+            );
+            return Err(e);
+        }
+
+        virtio_irq_manager()
+            .register_device(dev.clone())
+            .map_err(|e| {
+                error!(
+                    "Failed to register virtio device's irq, dev: '{}', irq: {:?}, error {:?}",
+                    dev.device_name(),
+                    irq,
+                    e
+                );
+                e
+            })?;
+        return Ok(());
     }
 
     #[allow(dead_code)]
@@ -258,7 +303,7 @@ impl Attribute for AttrDevice {
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
         let dev = kobj.cast::<dyn VirtIODevice>().map_err(|_| {
-            kerror!("AttrDevice::show() failed: kobj is not a VirtIODevice");
+            error!("AttrDevice::show() failed: kobj is not a VirtIODevice");
             SystemError::EINVAL
         })?;
         let device_type_id = dev.device_type_id();
@@ -285,7 +330,7 @@ impl Attribute for AttrVendor {
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
         let dev = kobj.cast::<dyn VirtIODevice>().map_err(|_| {
-            kerror!("AttrVendor::show() failed: kobj is not a VirtIODevice");
+            error!("AttrVendor::show() failed: kobj is not a VirtIODevice");
             SystemError::EINVAL
         })?;
         let vendor = dev.vendor();

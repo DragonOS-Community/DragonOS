@@ -9,12 +9,12 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 
+use log::error;
 use system_error::SystemError;
 
 use crate::{
     arch::CurrentIrqArch,
     exception::{InterruptArch, IrqFlags, IrqFlagsGuard, IrqNumber},
-    kerror,
 };
 
 use super::{
@@ -85,7 +85,7 @@ impl InterruptArch for X86_64InterruptArch {
     }
 
     fn ack_bad_irq(irq: IrqNumber) {
-        kerror!("Unexpected IRQ trap at vector {}", irq.data());
+        error!("Unexpected IRQ trap at vector {}", irq.data());
         CurrentApic.send_eoi();
     }
 

@@ -1,6 +1,7 @@
 use core::sync::atomic::AtomicU32;
 
 use alloc::{sync::Arc, vec::Vec};
+use log::{debug, error, info};
 use system_error::SystemError;
 
 use crate::{
@@ -64,6 +65,7 @@ impl CpuHpCpuState {
         }
     }
 
+    #[allow(dead_code)]
     pub const fn thread(&self) -> &Option<Arc<ProcessControlBlock>> {
         &self.thread
     }
@@ -201,14 +203,14 @@ impl SmpCpuManager {
                 continue;
             }
 
-            kdebug!("Bring up CPU {}", cpu_id.data());
+            debug!("Bring up CPU {}", cpu_id.data());
 
             if let Err(e) = self.cpu_up(cpu_id, CpuHpState::Online) {
-                kerror!("Failed to bring up CPU {}: {:?}", cpu_id.data(), e);
+                error!("Failed to bring up CPU {}: {:?}", cpu_id.data(), e);
             }
         }
 
-        kinfo!("All non-boot CPUs have been brought up");
+        info!("All non-boot CPUs have been brought up");
     }
 
     fn cpu_up(&self, cpu_id: ProcessorId, target_state: CpuHpState) -> Result<(), SystemError> {
@@ -217,7 +219,7 @@ impl SmpCpuManager {
         }
 
         let cpu_state = self.cpuhp_state(cpu_id).state;
-        kdebug!(
+        debug!(
             "cpu_up: cpu_id: {}, cpu_state: {:?}, target_state: {:?}",
             cpu_id.data(),
             cpu_state,
@@ -305,6 +307,7 @@ pub fn smp_cpu_manager_init(boot_cpu: ProcessorId) {
     }
 
     unsafe { smp_cpu_manager().set_possible_cpu(boot_cpu, true) };
+    unsafe { smp_cpu_manager().set_present_cpu(boot_cpu, true) };
 
     SmpCpuManager::arch_init(boot_cpu);
 }

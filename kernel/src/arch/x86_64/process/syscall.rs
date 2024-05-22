@@ -26,7 +26,7 @@ impl Syscall {
         // 关中断，防止在设置地址空间的时候，发生中断，然后进调度器，出现错误。
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let pcb = ProcessManager::current_pcb();
-        // crate::kdebug!(
+        // crate::debug!(
         //     "pid: {:?}  do_execve: path: {:?}, argv: {:?}, envp: {:?}\n",
         //     pcb.pid(),
         //     path,
@@ -55,20 +55,20 @@ impl Syscall {
             AddressSpace::is_current(&address_space),
             "Failed to set address space"
         );
-        // kdebug!("Switch to new address space");
+        // debug!("Switch to new address space");
 
         // 切换到新的用户地址空间
         unsafe { address_space.read().user_mapper.utable.make_current() };
 
         drop(old_address_space);
         drop(irq_guard);
-        // kdebug!("to load binary file");
+        // debug!("to load binary file");
         let mut param = ExecParam::new(path.as_str(), address_space.clone(), ExecParamFlags::EXEC)?;
 
         // 加载可执行文件
         let load_result = load_binary_file(&mut param)?;
-        // kdebug!("load binary file done");
-        // kdebug!("argv: {:?}, envp: {:?}", argv, envp);
+        // debug!("load binary file done");
+        // debug!("argv: {:?}, envp: {:?}", argv, envp);
         param.init_info_mut().args = argv;
         param.init_info_mut().envs = envp;
 
@@ -94,7 +94,7 @@ impl Syscall {
         };
         address_space.write().user_stack = Some(ustack_message);
 
-        // kdebug!("write proc_init_info to user stack done");
+        // debug!("write proc_init_info to user stack done");
 
         // （兼容旧版libc）把argv的指针写到寄存器内
         // TODO: 改写旧版libc，不再需要这个兼容
@@ -116,9 +116,9 @@ impl Syscall {
 
         drop(param);
 
-        // kdebug!("regs: {:?}\n", regs);
+        // debug!("regs: {:?}\n", regs);
 
-        // crate::kdebug!(
+        // crate::debug!(
         //     "tmp_rs_execve: done, load_result.entry_point()={:?}",
         //     load_result.entry_point()
         // );

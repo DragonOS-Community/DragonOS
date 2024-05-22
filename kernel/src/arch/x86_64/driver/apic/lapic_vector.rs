@@ -2,6 +2,7 @@ use core::intrinsics::unlikely;
 
 use alloc::{string::ToString, sync::Arc};
 use intertrait::CastFrom;
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -25,7 +26,6 @@ use crate::{
         msi::MsiMsg,
         HardwareIrqNumber, IrqNumber,
     },
-    kwarn,
     libs::spinlock::{SpinLock, SpinLockGuard},
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
@@ -206,7 +206,7 @@ pub(super) fn irq_msi_compose_msg(cfg: &HardwareIrqConfig, msg: &mut MsiMsg, dma
         // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/apic/apic.c?fi=__irq_msi_compose_msg#2580
         address_lo.set_virt_destid_8_14(cfg.apic_id.data() >> 8);
     } else if unlikely(cfg.apic_id.data() > 0xff) {
-        kwarn!(
+        warn!(
             "irq_msi_compose_msg: Invalid APIC ID: {}",
             cfg.apic_id.data()
         );
@@ -227,16 +227,23 @@ pub fn x86_vector_domain() -> &'static Arc<IrqDomain> {
 
 #[inline(never)]
 pub fn arch_early_irq_init() -> Result<(), SystemError> {
+    const IRQ_SIZE: u32 = 223;
     let vec_domain = irq_domain_manager()
         .create_and_add(
             "VECTOR".to_string(),
             &X86VectorDomainOps,
             IrqNumber::new(32),
             HardwareIrqNumber::new(32),
-            223,
+            IRQ_SIZE,
         )
         .ok_or(SystemError::ENOMEM)?;
     irq_domain_manager().set_default_domain(vec_domain.clone());
+    irq_domain_manager().domain_associate_many(
+        &vec_domain,
+        IrqNumber::new(0),
+        HardwareIrqNumber::new(0),
+        IRQ_SIZE,
+    );
     unsafe { X86_VECTOR_DOMAIN = Some(vec_domain) };
 
     let apic_chip = Arc::new(LocalApicChip::new());
@@ -245,7 +252,7 @@ pub fn arch_early_irq_init() -> Result<(), SystemError> {
 
     // todo: add vector matrix
     // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/apic/vector.c#803
-    kwarn!("arch_early_irq_init: todo: add vector matrix");
+    warn!("arch_early_irq_init: todo: add vector matrix");
 
     local_apic_timer_irq_desc_init();
     arch_ipi_handler_init();

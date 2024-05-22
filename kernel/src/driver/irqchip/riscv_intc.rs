@@ -1,4 +1,5 @@
 use alloc::{string::ToString, sync::Arc};
+use log::error;
 use system_error::SystemError;
 
 use crate::{
@@ -17,6 +18,8 @@ use crate::{
     sched::{SchedMode, __schedule},
 };
 
+use super::riscv_sifive_plic::do_plic_irq;
+
 static mut RISCV_INTC_DOMAIN: Option<Arc<IrqDomain>> = None;
 static mut RISCV_INTC_CHIP: Option<Arc<RiscvIntcChip>> = None;
 
@@ -29,6 +32,9 @@ pub fn riscv_intc_domain() -> &'static Option<Arc<IrqDomain>> {
 fn riscv_intc_chip() -> Option<&'static Arc<RiscvIntcChip>> {
     unsafe { RISCV_INTC_CHIP.as_ref() }
 }
+
+/// RISC-V INTC虚拟中断号的起始值（192映射物理的0）
+pub const RISCV_INTC_VIRQ_START: u32 = 192;
 
 #[derive(Debug)]
 struct RiscvIntcChip {
@@ -87,6 +93,7 @@ impl IrqChip for RiscvIntcChip {
 }
 
 impl RiscvIntcChip {
+    const IRQ_SIZE: u32 = 64;
     fn new() -> Self {
         Self {
             inner: SpinLock::new(InnerIrqChip {
@@ -143,16 +150,20 @@ pub unsafe fn riscv_intc_init() -> Result<(), SystemError> {
     }
 
     let intc_domain = irq_domain_manager()
-        .create_and_add_linear("riscv-intc".to_string(), &RiscvIntcDomainOps, 64)
+        .create_and_add_linear(
+            "riscv-intc".to_string(),
+            &RiscvIntcDomainOps,
+            RiscvIntcChip::IRQ_SIZE,
+        )
         .ok_or_else(|| {
-            kerror!("Failed to create riscv-intc domain");
+            error!("Failed to create riscv-intc domain");
             SystemError::ENXIO
         })?;
 
     irq_domain_manager().set_default_domain(intc_domain.clone());
 
     unsafe {
-        RISCV_INTC_DOMAIN = Some(intc_domain);
+        RISCV_INTC_DOMAIN = Some(intc_domain.clone());
     }
 
     riscv_sbi_timer_irq_desc_init();
@@ -160,12 +171,58 @@ pub unsafe fn riscv_intc_init() -> Result<(), SystemError> {
     return Ok(());
 }
 
+/// 把硬件中断号转换为riscv intc芯片的中断域的虚拟中断号
+pub const fn riscv_intc_hwirq_to_virq(hwirq: HardwareIrqNumber) -> Option<IrqNumber> {
+    if hwirq.data() < RiscvIntcChip::IRQ_SIZE {
+        Some(IrqNumber::new(hwirq.data() + RISCV_INTC_VIRQ_START))
+    } else {
+        None
+    }
+}
+
+/// 把riscv intc芯片的的中断域的虚拟中断号转换为硬件中断号
+#[allow(dead_code)]
+pub const fn riscv_intc_virq_to_hwirq(virq: IrqNumber) -> Option<HardwareIrqNumber> {
+    if virq.data() >= RISCV_INTC_VIRQ_START
+        && virq.data() < RISCV_INTC_VIRQ_START + RiscvIntcChip::IRQ_SIZE
+    {
+        Some(HardwareIrqNumber::new(virq.data() - RISCV_INTC_VIRQ_START))
+    } else {
+        None
+    }
+}
+
+/// 将硬件中断号与riscv intc芯片的虚拟中断号关联
+pub fn riscv_intc_assicate_irq(hwirq: HardwareIrqNumber) -> Option<IrqNumber> {
+    let virq = riscv_intc_hwirq_to_virq(hwirq)?;
+    irq_domain_manager()
+        .domain_associate(
+            riscv_intc_domain().as_ref().or_else(|| {
+                error!("riscv_intc_domain is None");
+                None
+            })?,
+            virq,
+            hwirq,
+        )
+        .ok();
+
+    Some(virq)
+}
+
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/irqchip/irq-riscv-intc.c#23
 pub fn riscv_intc_irq(trap_frame: &mut TrapFrame) {
     let hwirq = HardwareIrqNumber::new(trap_frame.cause.code() as u32);
-    // kdebug!("riscv64_do_irq: interrupt {hwirq:?}");
-    GenericIrqHandler::handle_domain_irq(riscv_intc_domain().clone().unwrap(), hwirq, trap_frame)
+    if hwirq.data() == 9 {
+        // external interrupt
+        do_plic_irq(trap_frame);
+    } else {
+        GenericIrqHandler::handle_domain_irq(
+            riscv_intc_domain().clone().unwrap(),
+            hwirq,
+            trap_frame,
+        )
         .ok();
+    }
     do_softirq();
     if hwirq.data() == RiscVSbiTimer::TIMER_IRQ.data() {
         __schedule(SchedMode::SM_PREEMPT);

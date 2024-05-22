@@ -165,7 +165,7 @@ pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, Sys
     let mut head_buf = [0u8; 512];
     param.file_mut().lseek(SeekFrom::SeekSet(0))?;
     let _bytes = param.file_mut().read(512, &mut head_buf)?;
-    // kdebug!("load_binary_file: read {} bytes", _bytes);
+    // debug!("load_binary_file: read {} bytes", _bytes);
 
     let mut loader = None;
     for bl in BINARY_LOADERS.iter() {
@@ -175,20 +175,20 @@ pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, Sys
             break;
         }
     }
-    // kdebug!("load_binary_file: loader: {:?}", loader);
+    // debug!("load_binary_file: loader: {:?}", loader);
     if loader.is_none() {
         return Err(SystemError::ENOEXEC);
     }
 
     let loader: &&dyn BinaryLoader = loader.unwrap();
     assert!(param.vm().is_current());
-    // kdebug!("load_binary_file: to load with param: {:?}", param);
+    // debug!("load_binary_file: to load with param: {:?}", param);
 
     let result: BinaryLoaderResult = loader
         .load(param, &head_buf)
         .unwrap_or_else(|e| panic!("load_binary_file failed: error: {e:?}, param: {param:?}"));
 
-    // kdebug!("load_binary_file: load success: {result:?}");
+    // debug!("load_binary_file: load success: {result:?}");
     return Ok(result);
 }
 

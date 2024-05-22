@@ -233,6 +233,8 @@ int main(int argc, char const *argv[])
         // 关闭客户端连接
         close(new_socket);
     }
+    // 关闭tcp socket
+    close(server_fd);
 
     return 0;
 }

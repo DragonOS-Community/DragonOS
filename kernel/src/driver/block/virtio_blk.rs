@@ -5,6 +5,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::{debug, error};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 use virtio_drivers::device::blk::VirtIOBlk;
@@ -32,6 +33,7 @@ use crate::{
             VirtIODevice, VirtIODeviceIndex, VirtIODriver, VIRTIO_VENDOR_ID,
         },
     },
+    exception::{irqdesc::IrqReturn, IrqNumber},
     filesystem::{kernfs::KernFSInode, mbr::MbrDiskPartionTable},
     init::initcall::INITCALL_POSTCORE,
     libs::{
@@ -62,7 +64,7 @@ pub fn virtio_blk_0() -> Option<Arc<VirtIOBlkDevice>> {
 pub fn virtio_blk(transport: VirtIOTransport, dev_id: Arc<DeviceId>) {
     let device = VirtIOBlkDevice::new(transport, dev_id);
     if let Some(device) = device {
-        kdebug!("VirtIOBlkDevice '{:?}' created", device.dev_id);
+        debug!("VirtIOBlkDevice '{:?}' created", device.dev_id);
         virtio_device_manager()
             .device_add(device.clone() as Arc<dyn VirtIODevice>)
             .expect("Add virtio blk failed");
@@ -85,15 +87,15 @@ unsafe impl Sync for VirtIOBlkDevice {}
 
 impl VirtIOBlkDevice {
     pub fn new(transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {
+        let irq = transport.irq().map(|irq| IrqNumber::new(irq.data()));
         let device_inner = VirtIOBlk::<HalImpl, VirtIOTransport>::new(transport);
         if let Err(e) = device_inner {
-            kerror!("VirtIOBlkDevice '{dev_id:?}' create failed: {:?}", e);
+            error!("VirtIOBlkDevice '{dev_id:?}' create failed: {:?}", e);
             return None;
         }
-        // !!!! 在这里临时测试virtio-blk的读写功能，后续需要删除 !!!!
-        // 目前read会报错 `NotReady`
-        let device_inner: VirtIOBlk<HalImpl, VirtIOTransport> = device_inner.unwrap();
 
+        let mut device_inner: VirtIOBlk<HalImpl, VirtIOTransport> = device_inner.unwrap();
+        device_inner.enable_interrupts();
         let dev = Arc::new_cyclic(|self_ref| Self {
             self_ref: self_ref.clone(),
             dev_id,
@@ -104,6 +106,7 @@ impl VirtIOBlkDevice {
                 virtio_index: None,
                 device_common: DeviceCommonData::default(),
                 kobject_common: KObjectCommonData::default(),
+                irq,
             }),
         });
 
@@ -132,10 +135,9 @@ impl BlockDevice for VirtIOBlkDevice {
             .device_inner
             .read_blocks(lba_id_start, &mut buf[..count * LBA_SIZE])
             .map_err(|e| {
-                kerror!(
+                error!(
                     "VirtIOBlkDevice '{:?}' read_at_sync failed: {:?}",
-                    self.dev_id,
-                    e
+                    self.dev_id, e
                 );
                 SystemError::EIO
             })?;
@@ -190,6 +192,7 @@ struct InnerVirtIOBlkDevice {
     virtio_index: Option<VirtIODeviceIndex>,
     device_common: DeviceCommonData,
     kobject_common: KObjectCommonData,
+    irq: Option<IrqNumber>,
 }
 
 impl Debug for InnerVirtIOBlkDevice {
@@ -199,11 +202,16 @@ impl Debug for InnerVirtIOBlkDevice {
 }
 
 impl VirtIODevice for VirtIOBlkDevice {
+    fn irq(&self) -> Option<IrqNumber> {
+        self.inner().irq
+    }
+
     fn handle_irq(
         &self,
         _irq: crate::exception::IrqNumber,
-    ) -> Result<crate::exception::irqdesc::IrqReturn, system_error::SystemError> {
-        todo!("VirtIOBlkDevice::handle_irq")
+    ) -> Result<IrqReturn, system_error::SystemError> {
+        // todo: handle virtio blk irq
+        Ok(crate::exception::irqdesc::IrqReturn::Handled)
     }
 
     fn dev_id(&self) -> &Arc<DeviceId> {
@@ -408,7 +416,7 @@ impl VirtIODriver for VirtIOBlkDriver {
             .arc_any()
             .downcast::<VirtIOBlkDevice>()
             .map_err(|_| {
-                kerror!(
+                error!(
                 "VirtIOBlkDriver::probe() failed: device is not a VirtIO block device. Device: '{:?}'",
                 device.name()
             );

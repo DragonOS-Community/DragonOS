@@ -43,6 +43,7 @@ pub struct RiscV64MMArch;
 
 impl RiscV64MMArch {
     /// 使远程cpu的TLB中，指定地址范围的页失效
+    #[allow(dead_code)]
     pub fn remote_invalidate_page(
         cpu: ProcessorId,
         address: VirtAddr,
@@ -57,6 +58,7 @@ impl RiscV64MMArch {
     }
 
     /// 使指定远程cpu的TLB中，所有范围的页失效
+    #[allow(dead_code)]
     pub fn remote_invalidate_all(cpu: ProcessorId) -> Result<(), SbiRet> {
         let r = Self::remote_invalidate_page(
             cpu,

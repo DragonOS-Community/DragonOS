@@ -1,10 +1,10 @@
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
+use log::{debug, info, warn};
 use smoltcp::{socket::dhcpv4, wire};
 use system_error::SystemError;
 
 use crate::{
     driver::net::NetDevice,
-    kdebug, kinfo, kwarn,
     libs::rwlock::RwLockReadGuard,
     net::{socket::SocketPollMethod, NET_DEVICES},
     time::timer::{next_n_ms_timer_jiffies, Timer, TimerFunction},
@@ -60,7 +60,7 @@ fn dhcp_query() -> Result<(), SystemError> {
 
     const DHCP_TRY_ROUND: u8 = 10;
     for i in 0..DHCP_TRY_ROUND {
-        kdebug!("DHCP try round: {}", i);
+        debug!("DHCP try round: {}", i);
         net_face.poll(&mut SOCKET_SET.lock_irqsave()).ok();
         let mut binding = SOCKET_SET.lock_irqsave();
         let event = binding.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
@@ -69,9 +69,9 @@ fn dhcp_query() -> Result<(), SystemError> {
             None => {}
 
             Some(dhcpv4::Event::Configured(config)) => {
-                // kdebug!("Find Config!! {config:?}");
-                // kdebug!("Find ip address: {}", config.address);
-                // kdebug!("iface.ip_addrs={:?}", net_face.inner_iface.ip_addrs());
+                // debug!("Find Config!! {config:?}");
+                // debug!("Find ip address: {}", config.address);
+                // debug!("iface.ip_addrs={:?}", net_face.inner_iface.ip_addrs());
 
                 net_face
                     .update_ip_addrs(&[wire::IpCidr::Ipv4(config.address)])
@@ -86,7 +86,7 @@ fn dhcp_query() -> Result<(), SystemError> {
                         .unwrap();
                     let cidr = net_face.inner_iface().lock().ip_addrs().first().cloned();
                     if let Some(cidr) = cidr {
-                        kinfo!("Successfully allocated ip by Dhcpv4! Ip:{}", cidr);
+                        info!("Successfully allocated ip by Dhcpv4! Ip:{}", cidr);
                         return Ok(());
                     }
                 } else {
@@ -99,7 +99,7 @@ fn dhcp_query() -> Result<(), SystemError> {
             }
 
             Some(dhcpv4::Event::Deconfigured) => {
-                kdebug!("Dhcp v4 deconfigured");
+                debug!("Dhcp v4 deconfigured");
                 net_face
                     .update_ip_addrs(&[smoltcp::wire::IpCidr::Ipv4(wire::Ipv4Cidr::new(
                         wire::Ipv4Address::UNSPECIFIED,
@@ -121,7 +121,7 @@ fn dhcp_query() -> Result<(), SystemError> {
 pub fn poll_ifaces() {
     let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDevice>>> = NET_DEVICES.read_irqsave();
     if guard.len() == 0 {
-        kwarn!("poll_ifaces: No net driver found!");
+        warn!("poll_ifaces: No net driver found!");
         return;
     }
     let mut sockets = SOCKET_SET.lock_irqsave();
@@ -142,7 +142,7 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
         let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDevice>>> =
             NET_DEVICES.read_irqsave();
         if guard.len() == 0 {
-            kwarn!("poll_ifaces: No net driver found!");
+            warn!("poll_ifaces: No net driver found!");
             // 没有网卡，返回错误
             return Err(SystemError::ENODEV);
         }
@@ -172,7 +172,7 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
 pub fn poll_ifaces_try_lock_onetime() -> Result<(), SystemError> {
     let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDevice>>> = NET_DEVICES.read_irqsave();
     if guard.len() == 0 {
-        kwarn!("poll_ifaces: No net driver found!");
+        warn!("poll_ifaces: No net driver found!");
         // 没有网卡，返回错误
         return Err(SystemError::ENODEV);
     }
@@ -217,6 +217,9 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
                 if inner_socket.state() == smoltcp::socket::tcp::State::Established {
                     events |= TcpSocket::CAN_CONNECT;
                 }
+                if inner_socket.state() == smoltcp::socket::tcp::State::CloseWait {
+                    events |= EPollEventType::EPOLLHUP.bits() as u64;
+                }
                 handle_guard
                     .get(&global_handle)
                     .unwrap()
@@ -226,14 +229,12 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
             smoltcp::socket::Socket::Dhcpv4(_) => {}
             smoltcp::socket::Socket::Dns(_) => unimplemented!("Dns socket hasn't unimplemented"),
         }
-        drop(handle_guard);
-        let mut handle_guard = HANDLE_MAP.write_irqsave();
-        let handle_item = handle_guard.get_mut(&global_handle).unwrap();
         EventPoll::wakeup_epoll(
             &handle_item.epitems,
             EPollEventType::from_bits_truncate(events as u32),
         )?;
-        // crate::kdebug!(
+        drop(handle_guard);
+        // crate::debug!(
         //     "{} send_event {:?}",
         //     handle,
         //     EPollEventType::from_bits_truncate(events as u32)

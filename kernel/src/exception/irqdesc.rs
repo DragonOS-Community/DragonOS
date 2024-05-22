@@ -114,6 +114,7 @@ impl IrqDesc {
                 kern_inode: None,
                 kset: None,
                 parent_kobj: None,
+                threads_oneshot: 0,
             }),
             request_mutex: Mutex::new(()),
             handler: RwLock::new(None),
@@ -285,6 +286,14 @@ impl IrqDesc {
         );
     }
 
+    pub fn set_probe(&self) {
+        self.modify_status(IrqLineStatus::IRQ_NOPROBE, IrqLineStatus::empty());
+    }
+
+    pub fn set_noprobe(&self) {
+        self.modify_status(IrqLineStatus::empty(), IrqLineStatus::IRQ_NOPROBE);
+    }
+
     pub fn modify_status(&self, clear: IrqLineStatus, set: IrqLineStatus) {
         let mut desc_guard = self.inner();
         desc_guard.line_status.remove(clear);
@@ -365,6 +374,8 @@ pub struct InnerIrqDesc {
     /// per-cpu affinity
     percpu_affinity: Option<CpuMask>,
     // wait_for_threads: EventWaitQueue
+    /// bitfield to handle shared oneshot threads
+    threads_oneshot: u64,
 }
 
 impl InnerIrqDesc {
@@ -442,6 +453,10 @@ impl InnerIrqDesc {
 
     pub fn can_thread(&self) -> bool {
         !self.line_status.contains(IrqLineStatus::IRQ_NOTHREAD)
+    }
+
+    pub fn threads_oneshot(&self) -> u64 {
+        self.threads_oneshot
     }
 
     /// 中断是否可以设置CPU亲和性

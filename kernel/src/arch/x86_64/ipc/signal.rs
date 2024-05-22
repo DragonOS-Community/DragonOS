@@ -1,5 +1,6 @@
 use core::{ffi::c_void, intrinsics::unlikely, mem::size_of};
 
+use log::error;
 use system_error::SystemError;
 
 use crate::{
@@ -14,7 +15,6 @@ use crate::{
         signal::set_current_sig_blocked,
         signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch},
     },
-    kerror,
     mm::MemoryManagementArch,
     process::ProcessManager,
     sched::{schedule, SchedMode},
@@ -86,7 +86,7 @@ impl From<usize> for Signal {
             let ret: Signal = unsafe { core::mem::transmute(value) };
             return ret;
         } else {
-            kerror!("Try to convert an invalid number to Signal");
+            error!("Try to convert an invalid number to Signal");
             return Signal::INVALID;
         }
     }
@@ -101,7 +101,7 @@ impl From<Signal> for usize {
 impl From<i32> for Signal {
     fn from(value: i32) -> Self {
         if value < 0 {
-            kerror!("Try to convert an invalid number to Signal");
+            error!("Try to convert an invalid number to Signal");
             return Signal::INVALID;
         } else {
             return Self::from(value as usize);
@@ -145,7 +145,7 @@ impl Signal {
     pub fn handle_default(&self) {
         match self {
             Signal::INVALID => {
-                kerror!("attempting to handler an Invalid");
+                error!("attempting to handler an Invalid");
             }
             Signal::SIGHUP => sig_terminate(*self),
             Signal::SIGINT => sig_terminate(*self),
@@ -461,7 +461,7 @@ impl SignalArch for X86_64SignalArch {
             match sigaction.action() {
                 SigactionType::SaHandler(action_type) => match action_type {
                     SaHandlerType::Error => {
-                        kerror!("Trying to handle a Sigerror on Process:{:?}", pcb.pid());
+                        error!("Trying to handle a Sigerror on Process:{:?}", pcb.pid());
                         return;
                     }
                     SaHandlerType::Default => {
@@ -488,7 +488,7 @@ impl SignalArch for X86_64SignalArch {
         let res: Result<i32, SystemError> =
             handle_signal(sig_number, &mut sigaction, &info.unwrap(), &oldset, frame);
         if res.is_err() {
-            kerror!(
+            error!(
                 "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
                 sig_number as i32,
                 ProcessManager::current_pcb().pid(),
@@ -502,7 +502,7 @@ impl SignalArch for X86_64SignalArch {
 
         // 如果当前的rsp不来自用户态，则认为产生了错误（或被SROP攻击）
         if UserBufferWriter::new(frame, size_of::<SigFrame>(), true).is_err() {
-            kerror!("rsp doesn't from user level");
+            error!("rsp doesn't from user level");
             let _r = Syscall::kill(ProcessManager::current_pcb().pid(), Signal::SIGSEGV as i32)
                 .map_err(|e| e.to_posix_errno());
             return trap_frame.rax;
@@ -511,7 +511,7 @@ impl SignalArch for X86_64SignalArch {
         set_current_sig_blocked(&mut sigmask);
         // 从用户栈恢复sigcontext
         if !unsafe { &mut (*frame).context }.restore_sigcontext(trap_frame) {
-            kerror!("unable to restore sigcontext");
+            error!("unable to restore sigcontext");
             let _r = Syscall::kill(ProcessManager::current_pcb().pid(), Signal::SIGSEGV as i32)
                 .map_err(|e| e.to_posix_errno());
             // 如果这里返回 err 值的话会丢失上一个系统调用的返回值
@@ -569,7 +569,7 @@ fn setup_frame(
                         sig.handle_default();
                         return Ok(0);
                     } else {
-                        kerror!("attempting  to execute a signal handler from kernel");
+                        error!("attempting  to execute a signal handler from kernel");
                         sig.handle_default();
                         return Err(SystemError::EINVAL);
                     }
@@ -578,7 +578,7 @@ fn setup_frame(
                     if sigaction.flags().contains(SigFlags::SA_RESTORER) {
                         ret_code_ptr = sigaction.restorer().unwrap().data() as *mut c_void;
                     } else {
-                        kerror!(
+                        error!(
                             "pid-{:?} forgot to set SA_FLAG_RESTORER for signal {:?}",
                             ProcessManager::current_pcb().pid(),
                             sig as i32
@@ -588,12 +588,12 @@ fn setup_frame(
                             Signal::SIGSEGV as i32,
                         );
                         if r.is_err() {
-                            kerror!("In setup_sigcontext: generate SIGSEGV signal failed");
+                            error!("In setup_sigcontext: generate SIGSEGV signal failed");
                         }
                         return Err(SystemError::EINVAL);
                     }
                     if sigaction.restorer().is_none() {
-                        kerror!(
+                        error!(
                             "restorer in process:{:?} is not defined",
                             ProcessManager::current_pcb().pid()
                         );
@@ -611,12 +611,12 @@ fn setup_frame(
         },
         SigactionType::SaSigaction(_) => {
             //TODO 这里应该是可以恢复栈的，等后续来做
-            kerror!("trying to recover from sigaction type instead of handler");
+            error!("trying to recover from sigaction type instead of handler");
             return Err(SystemError::EINVAL);
         }
     }
     let frame: *mut SigFrame = get_stack(trap_frame, size_of::<SigFrame>());
-    // kdebug!("frame=0x{:016x}", frame as usize);
+    // debug!("frame=0x{:016x}", frame as usize);
     // 要求这个frame的地址位于用户空间，因此进行校验
     let r: Result<UserBufferWriter<'_>, SystemError> =
         UserBufferWriter::new(frame, size_of::<SigFrame>(), true);
@@ -625,9 +625,9 @@ fn setup_frame(
         // todo: 生成一个sigsegv
         let r = Syscall::kill(ProcessManager::current_pcb().pid(), Signal::SIGSEGV as i32);
         if r.is_err() {
-            kerror!("In setup frame: generate SIGSEGV signal failed");
+            error!("In setup frame: generate SIGSEGV signal failed");
         }
-        kerror!("In setup frame: access check failed");
+        error!("In setup frame: access check failed");
         return Err(SystemError::EFAULT);
     }
 
@@ -636,7 +636,7 @@ fn setup_frame(
         .map_err(|e| -> SystemError {
             let r = Syscall::kill(ProcessManager::current_pcb().pid(), Signal::SIGSEGV as i32);
             if r.is_err() {
-                kerror!("In copy_siginfo_to_user: generate SIGSEGV signal failed");
+                error!("In copy_siginfo_to_user: generate SIGSEGV signal failed");
             }
             return e;
         })?;
@@ -650,7 +650,7 @@ fn setup_frame(
             .map_err(|e: SystemError| -> SystemError {
                 let r = Syscall::kill(ProcessManager::current_pcb().pid(), Signal::SIGSEGV as i32);
                 if r.is_err() {
-                    kerror!("In setup_sigcontext: generate SIGSEGV signal failed");
+                    error!("In setup_sigcontext: generate SIGSEGV signal failed");
                 }
                 return e;
             })?
@@ -707,7 +707,7 @@ fn sig_terminate_dump(sig: Signal) {
 fn sig_stop(sig: Signal) {
     let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     ProcessManager::mark_stop().unwrap_or_else(|e| {
-        kerror!(
+        error!(
             "sleep error :{:?},failed to sleep process :{:?}, with signal :{:?}",
             e,
             ProcessManager::current_pcb(),
@@ -721,7 +721,7 @@ fn sig_stop(sig: Signal) {
 /// 信号默认处理函数——继续进程
 fn sig_continue(sig: Signal) {
     ProcessManager::wakeup_stop(&ProcessManager::current_pcb()).unwrap_or_else(|_| {
-        kerror!(
+        error!(
             "Failed to wake up process pid = {:?} with signal :{:?}",
             ProcessManager::current_pcb().pid(),
             sig

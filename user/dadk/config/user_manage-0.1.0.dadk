@@ -1,0 +1,24 @@
+{
+  "name": "user_manage_tool",
+  "version": "0.1.0",
+  "description": "用户管理工具",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "apps/user-manage"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "envs": [],
+  "target_arch": ["x86_64"]
+}

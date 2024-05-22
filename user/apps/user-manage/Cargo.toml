@@ -1,0 +1,36 @@
+[package]
+name = "user_manage_tool"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "useradd"
+path = "src/main.rs"
+
+[[bin]]
+name = "userdel"
+path = "src/main.rs"
+
+[[bin]]
+name = "usermod"
+path = "src/main.rs"
+
+[[bin]]
+name = "passwd"
+path = "src/main.rs"
+
+[[bin]]
+name = "groupadd"
+path = "src/main.rs"
+
+[[bin]]
+name = "groupdel"
+path = "src/main.rs"
+
+[[bin]]
+name = "groupmod"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2.153"
+lazy_static = "1.4.0"

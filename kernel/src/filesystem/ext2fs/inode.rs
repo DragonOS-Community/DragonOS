@@ -32,6 +32,7 @@ use alloc::{
     vec::Vec,
 };
 use elf::endian::LittleEndian;
+use log::{debug, error, info};
 use system_error::SystemError;
 use uefi::data_types;
 
@@ -311,10 +312,10 @@ pub struct Ext2InodeInfo {
 
 impl Ext2InodeInfo {
     pub fn new(inode: &Ext2Inode, inode_num: u32) -> Self {
-        // kinfo!("begin Ext2InodeInfo new");
+        // info!("begin Ext2InodeInfo new");
         let mode = inode.mode;
         let file_type = Ext2FileType::type_from_mode(&mode).unwrap().covert_type();
-        // kinfo!("file_type = {:?}", file_type);
+        // info!("file_type = {:?}", file_type);
 
         // TODO 根据inode mode转换modetype
         let fs_mode = ModeType::from_bits_truncate(mode as u32);
@@ -322,7 +323,7 @@ impl Ext2InodeInfo {
         // TODO 获取block group
 
         // TODO 间接地址
-        // kinfo!("end Ext2InodeInfo new");
+        // info!("end Ext2InodeInfo new");
 
         Self {
             inode: inode.clone(),
@@ -340,7 +341,7 @@ impl Ext2InodeInfo {
 
 impl IndexNode for LockedExt2InodeInfo {
     fn find(&self, _name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        kinfo!("begin LockedExt2InodeInfo find");
+        info!("begin LockedExt2InodeInfo find");
         let guard = self.0.lock();
         let inode = &guard.inode;
         if Ext2FileType::type_from_mode(&inode.mode).unwrap() != Ext2FileType::Directory {
@@ -382,12 +383,12 @@ impl IndexNode for LockedExt2InodeInfo {
             }
             begin_pos += rc_len as usize - mem::size_of::<u32>();
         }
-        kinfo!("end LockedExt2InodeInfo find");
+        info!("end LockedExt2InodeInfo find");
 
         return Err(SystemError::EINVAL);
     }
     fn close(&self, _data: SpinLockGuard<'_, FilePrivateData>) -> Result<(), SystemError> {
-        kdebug!("close inode");
+        debug!("close inode");
         Ok(())
     }
     fn open(
@@ -395,7 +396,7 @@ impl IndexNode for LockedExt2InodeInfo {
         _data: SpinLockGuard<'_, FilePrivateData>,
         _mode: &crate::filesystem::vfs::file::FileMode,
     ) -> Result<(), SystemError> {
-        kdebug!("open inode");
+        debug!("open inode");
         Ok(())
     }
     fn read_at(
@@ -406,18 +407,18 @@ impl IndexNode for LockedExt2InodeInfo {
         _data: SpinLockGuard<'_, FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         // TODO 需要根据不同的文件类型，选择不同的读取方式，将读的行为集成到file type
-        // kinfo!("begin LockedExt2InodeInfo read_at");
+        // info!("begin LockedExt2InodeInfo read_at");
         let inode_grade = self.0.lock();
         let binding = ext2fs_instance();
         let superb = binding.sb_info.0.lock();
         match inode_grade.file_type {
             FileType::File | FileType::Dir => {
-                // kinfo!("i data ={:?}", inode_grade.i_data);/
+                // info!("i data ={:?}", inode_grade.i_data);/
                 let inode = &inode_grade.inode;
                 // 计算文件大小
                 let file_size =
                     ((inode.directory_acl as usize) << 32usize) + inode.lower_size as usize;
-                // kinfo!("offset = {offset}");
+                // info!("offset = {offset}");
                 if offset >= file_size {
                     return Ok(0usize);
                 }
@@ -432,7 +433,7 @@ impl IndexNode for LockedExt2InodeInfo {
                 let mut start_pos: usize = 0;
                 // 读取的字节
                 // let mut end_len: usize = min(LBA_SIZE, buf.len());
-                // kdebug!(
+                // debug!(
                 //     "read_block_num:{read_block_num},buf_len:{},len:{}",
                 //     buf.len(),
                 //     len
@@ -443,11 +444,11 @@ impl IndexNode for LockedExt2InodeInfo {
                     read_buf_size +=
                         superb.s_block_size as usize - len % superb.s_block_size as usize;
                 }
-                // kinfo!("read_buf_size = {read_buf_size}");
+                // info!("read_buf_size = {read_buf_size}");
                 let mut read_buf: Vec<u8> = Vec::with_capacity(read_buf_size);
                 read_buf.resize(read_buf_size, 0);
                 // 读取直接块
-                // kdebug!("read direct, start_block = {start_block}");
+                // debug!("read direct, start_block = {start_block}");
                 while start_block <= 11 {
                     if inode_grade.i_data[start_block] == 0 {
                         // TODO 修改拷贝的起点为 offset % block_size
@@ -463,12 +464,12 @@ impl IndexNode for LockedExt2InodeInfo {
                         superb.s_block_size as usize / LBA_SIZE,
                         &mut read_buf[start_pos..start_pos + superb.s_block_size as usize],
                     )?;
-                    // kinfo!("r={r},superb.s_block_size={}", superb.s_block_size);
+                    // info!("r={r},superb.s_block_size={}", superb.s_block_size);
                     already_read_block += 1;
                     start_block += 1;
                     already_read_byte += r;
                     start_pos += superb.s_block_size as usize;
-                    // kdebug!(
+                    // debug!(
                     //     "already_read_byte:{already_read_byte},start_pos:{start_pos},start_addr:{start_addr},lbaid:{},block_num:{}",
                     //     __bytes_to_lba(start_addr, LBA_SIZE),inode_grade.i_data[start_block],
                     // );
@@ -476,11 +477,11 @@ impl IndexNode for LockedExt2InodeInfo {
 
                 if already_read_block == read_block_num || inode_grade.i_data[12] == 0 {
                     buf.copy_from_slice(&read_buf[..len]);
-                    kdebug!("end read direct,end LockedExt2InodeInfo read_at, start_block = {start_block}");
+                    debug!("end read direct,end LockedExt2InodeInfo read_at, start_block = {start_block}");
                     return Ok(min(file_size, len));
                 }
 
-                kdebug!("read indirect, start_block = {start_block}");
+                debug!("read indirect, start_block = {start_block}");
 
                 // 读取一级间接块
                 // 获取地址块
@@ -499,7 +500,7 @@ impl IndexNode for LockedExt2InodeInfo {
                 // 读取数据块
                 while already_read_block < read_block_num && start_block <= 127 + 12 {
                     if address[start_block - 12] == 0 {
-                        // kinfo!("end LockedExt2InodeInfo read_at");
+                        // info!("end LockedExt2InodeInfo read_at");
                         buf.copy_from_slice(&read_buf[..len]);
                         return Ok(min(file_size, len));
                     }
@@ -521,10 +522,10 @@ impl IndexNode for LockedExt2InodeInfo {
 
                 if inode_grade.i_data[13] == 0 || already_read_block == read_block_num {
                     buf.copy_from_slice(&read_buf[..len]);
-                    kdebug!("end read indirect,end LockedExt2InodeInfo read_at, start_block = {start_block}");
+                    debug!("end read indirect,end LockedExt2InodeInfo read_at, start_block = {start_block}");
                     return Ok(min(file_size, len));
                 }
-                kdebug!("read secondly direct, start_block = {start_block}");
+                debug!("read secondly direct, start_block = {start_block}");
 
                 // 读取二级间接块
 
@@ -579,11 +580,11 @@ impl IndexNode for LockedExt2InodeInfo {
                 }
 
                 if inode_grade.i_data[14] == 0 || already_read_block == read_block_num {
-                    kdebug!("end read secondly direct,end LockedExt2InodeInfo read_at, start_block = {start_block}");
+                    debug!("end read secondly direct,end LockedExt2InodeInfo read_at, start_block = {start_block}");
                     buf.copy_from_slice(&read_buf[..len]);
                     return Ok(min(file_size, len));
                 }
-                kdebug!("read thirdly direct, start_block = {start_block}");
+                debug!("read thirdly direct, start_block = {start_block}");
 
                 // 读取三级间接块
 
@@ -656,7 +657,7 @@ impl IndexNode for LockedExt2InodeInfo {
                         }
                     }
                 }
-                kdebug!(
+                debug!(
                     "end read thirdly direct,end LockedExt2InodeInfo read_at, start_block = {start_block}"
                 );
                 buf.copy_from_slice(&read_buf[..len]);
@@ -1050,31 +1051,31 @@ impl IndexNode for LockedExt2InodeInfo {
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
-        kdebug!("begin ext2 list");
+        debug!("begin ext2 list");
         let guard = self.0.lock();
         let file_type = Ext2FileType::type_from_mode(&guard.i_mode);
         if file_type.is_err() {
-            kerror!("{:?}", file_type.clone().err());
+            error!("{:?}", file_type.clone().err());
             return Err(SystemError::EINVAL);
         }
         let file_type = file_type.unwrap();
-        kdebug!("file type = {file_type:?}");
+        debug!("file type = {file_type:?}");
         let mut names: Vec<String> = Vec::new();
         match file_type {
             Ext2FileType::Directory => {
                 // 获取inode数据
-                // kinfo!("list inode : {:?}", guard.inode);
+                // info!("list inode : {:?}", guard.inode);
                 let inode = &guard.inode;
                 // 解析为entry数组
                 let meta = &guard.meta;
                 // BUG 获取文件大小失败。
                 let size: usize =
                     ((inode.directory_acl as usize) << 32usize) + inode.lower_size as usize;
-                // kinfo!("size = {size}");
+                // info!("size = {size}");
                 let mut data_block: Vec<u8> = Vec::with_capacity(size);
                 data_block.resize(size, 0);
                 drop(guard);
-                kdebug!("enter read at");
+                debug!("enter read at");
                 let _read_size = self.read_at(
                     0,
                     size,
@@ -1102,11 +1103,11 @@ impl IndexNode for LockedExt2InodeInfo {
                     let name = String::from_utf8_lossy(
                         &data_block[name_pos..name_pos + name_len as usize],
                     );
-                    // kinfo!("rc_len:{rc_len},name_len:{name_len},name_pos:{name_pos},name:{name}");
+                    // info!("rc_len:{rc_len},name_len:{name_len},name_pos:{name_pos},name:{name}");
                     names.push(name.to_string());
                     begin_pos += rc_len as usize - mem::size_of::<u32>();
                 }
-                kdebug!("end ext2 list");
+                debug!("end ext2 list");
 
                 // 将entry添加到ret中
                 return Ok(names);
@@ -1125,7 +1126,7 @@ impl IndexNode for LockedExt2InodeInfo {
         file_type: FileType,
         mode: ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        kdebug!("begin ext2 create");
+        debug!("begin ext2 create");
         let guard = self.0.lock();
 
         let ext2fs = ext2fs_instance();
@@ -1142,7 +1143,7 @@ impl IndexNode for LockedExt2InodeInfo {
             (((sb.s_inodes_per_group as usize / 8) / block_size) + 1) * (block_size / LBA_SIZE);
         let mut bitmap_buf: Vec<u8> = Vec::with_capacity(bitmap_count * LBA_SIZE);
         bitmap_buf.resize(bitmap_count * LBA_SIZE, 0);
-        kdebug!("get bitmap");
+        debug!("get bitmap");
 
         let _ = ext2fs_instance().partition.disk().read_at(
             i_bitmap,
@@ -1155,7 +1156,7 @@ impl IndexNode for LockedExt2InodeInfo {
         let mut new_bm = 0u8;
         let mut new_inode_index = group_id as usize * sb.s_inodes_per_group as usize;
         let mut index_offset = 0usize;
-        kdebug!("alloc ext2 inode");
+        debug!("alloc ext2 inode");
 
         for (p, i) in bitmap_buf.iter().enumerate() {
             if i == &0xFFu8 {
@@ -1202,7 +1203,7 @@ impl IndexNode for LockedExt2InodeInfo {
         }
 
         let mb = Ext2FileMode::from_common_type(mode)?;
-        kdebug!("create ext2 inode");
+        debug!("create ext2 inode");
 
         //  创建inode
         let new_inode = Ext2Inode::new(mb.bits());
@@ -1232,7 +1233,7 @@ impl IndexNode for LockedExt2InodeInfo {
         table_buf[in_block_offset..in_block_offset + mem::size_of::<Ext2Inode>()]
             .copy_from_slice(&new_inode.to_bytes());
         // 写inode table
-        kdebug!("write inode table");
+        debug!("write inode table");
 
         let _ = ext2fs_instance().partition.disk().write_at(
             block_id,
@@ -1240,7 +1241,7 @@ impl IndexNode for LockedExt2InodeInfo {
             table_buf.as_slice(),
         );
         //  写inode bitmap
-        kdebug!("write inode bitmap");
+        debug!("write inode bitmap");
 
         bitmap_buf[bpos] = new_bm;
         let _ = ext2fs_instance().partition.disk().write_at(
@@ -1278,7 +1279,7 @@ impl IndexNode for LockedExt2InodeInfo {
             SpinLock::new(FilePrivateData::Unused).lock(),
         )?;
         // TODO 调用write at追加entry
-        kdebug!("end ext2 create");
+        debug!("end ext2 create");
 
         Ok(Arc::new(LockedExt2InodeInfo(SpinLock::new(
             Ext2InodeInfo::new(&new_inode, new_inode_index.try_into().unwrap()),
@@ -1287,12 +1288,12 @@ impl IndexNode for LockedExt2InodeInfo {
 }
 
 pub fn get_address_block(partition: Arc<Partition>, ptr: usize) -> [u32; 128] {
-    // kinfo!("begin get address block");
+    // info!("begin get address block");
     let mut address_block: [u8; 512] = [0; 512];
     let _ = partition
         .disk()
         .read_at(__bytes_to_lba(ptr, LBA_SIZE), 1, &mut address_block[0..]);
     let address: [u32; 128] = unsafe { mem::transmute::<[u8; 512], [u32; 128]>(address_block) };
-    // kinfo!("end get address block");
+    // info!("end get address block");
     address
 }

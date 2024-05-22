@@ -165,9 +165,9 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
             spin_loop();
         }
     }
-    kinfo!("Successfully migrate rootfs to FAT32!");
+    info!("Successfully migrate rootfs to FAT32!");
     if let Err(err) = ext2fs_init() {
-        kerror!("Failed to init ext2fs,{:?}", err);
+        error!("Failed to init ext2fs,{:?}", err);
         loop {
             spin_loop();
         }

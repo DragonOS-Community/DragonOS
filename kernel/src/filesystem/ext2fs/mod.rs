@@ -1,6 +1,7 @@
 use core::hint::spin_loop;
 
 use alloc::{string::ToString, sync::Arc};
+use log::{debug, error, info};
 use system_error::SystemError;
 
 use crate::{
@@ -31,17 +32,17 @@ pub fn ext2fs_init() -> Result<(), SystemError> {
     static INIT: Once = Once::new();
     let mut result = None;
     INIT.call_once(|| {
-        kinfo!("Initializing Ext2FS...");
+        info!("Initializing Ext2FS...");
         let partiton1 = ahci::get_disks_by_name("ahci_disk_1".to_string());
         if partiton1.is_err() {
-            kerror!("Failed to find ahci_disk_1");
+            error!("Failed to find ahci_disk_1");
             result = Some(Err(SystemError::ENODEV));
             return;
         }
         let p1 = partiton1.unwrap().0.lock().partitions[0].clone();
         let ext2fs: Result<Arc<Ext2FileSystem>, SystemError> = Ext2FileSystem::new(p1);
         if ext2fs.is_err() {
-            kerror!(
+            error!(
                 "Failed to initialize ext2fs, code={:?}",
                 ext2fs.as_ref().err()
             );
@@ -63,9 +64,9 @@ pub fn ext2fs_init() -> Result<(), SystemError> {
         };
 
         if let Err(err) = root_i.lookup("/ext2") {
-            kdebug!("look up ext2 failed: {err:?}");
+            debug!("look up ext2 failed: {err:?}");
         };
-        kinfo!("Successfully mount EXT2");
+        info!("Successfully mount EXT2");
         result = Some(Ok(()));
     });
 

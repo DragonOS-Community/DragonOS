@@ -1,4 +1,4 @@
-use alloc::{fmt, string::String};
+use alloc::{fmt, string::String, vec::Vec};
 use core::fmt::Debug;
 use system_error::SystemError;
 const EXT2_NAME_LEN: usize = 255;
@@ -54,6 +54,15 @@ impl Ext2DirEntry {
     }
     pub fn get_rec_len(&self) -> usize {
         self.record_length as usize
+    }
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes[0..4].copy_from_slice(&self.inode_num.to_le_bytes());
+        bytes[4..6].copy_from_slice(&self.record_length.to_le_bytes());
+        bytes[6..7].copy_from_slice(&self.name_length.to_le_bytes());
+        bytes[7..8].copy_from_slice(&self.file_type.to_le_bytes());
+        bytes.extend_from_slice(&self.name[0..self.name_length as usize]);
+        bytes
     }
 }
 impl Debug for Ext2DirEntry {

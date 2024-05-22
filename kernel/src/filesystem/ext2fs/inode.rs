@@ -692,8 +692,7 @@ impl IndexNode for LockedExt2InodeInfo {
                 let inode = &inode_grade.inode;
                 let mut inode_clone = inode.clone();
                 let group_id = (inode_grade.inode_num / super_block.s_inodes_per_group) as usize;
-                let  group_desc =
-                    &super_block.group_desc_table.as_ref().unwrap()[group_id].clone();
+                let group_desc = &super_block.group_desc_table.as_ref().unwrap()[group_id].clone();
 
                 let mut block_id = 0usize;
                 let id_per_block = block_size / mem::size_of::<u32>();
@@ -1126,25 +1125,11 @@ impl IndexNode for LockedExt2InodeInfo {
         file_type: FileType,
         mode: ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        kdebug!("begin ext2 create");
         let guard = self.0.lock();
 
-        // TODO 写descriptor
-
-        // 获取descriptor
-
-        // TODO 写entry
-        let inode_num = guard.inode_num;
-        let inode = &guard.inode;
-        let e_file_t = Ext2FileType::from_file_type(&file_type)?;
-
-        let new_inode_num = 0;
-        let new_entry = Ext2DirEntry::new(new_inode_num, e_file_t.into(), name)?;
-        // 读entry
-
-        // TODO 调用write at追加entry
-
-        let binding = ext2fs_instance();
-        let sb: SpinLockGuard<super::fs::Ext2SuperBlockInfo> = binding.sb_info.0.lock();
+        let ext2fs = ext2fs_instance();
+        let sb: SpinLockGuard<super::fs::Ext2SuperBlockInfo> = ext2fs.sb_info.0.lock();
         let group_id = (guard.inode_num - 1) / sb.s_inodes_per_group;
         // let inode_index = guard.inode_num % sb.s_inodes_per_group;
         let block_size = sb.s_block_size as usize;
@@ -1157,6 +1142,8 @@ impl IndexNode for LockedExt2InodeInfo {
             (((sb.s_inodes_per_group as usize / 8) / block_size) + 1) * (block_size / LBA_SIZE);
         let mut bitmap_buf: Vec<u8> = Vec::with_capacity(bitmap_count * LBA_SIZE);
         bitmap_buf.resize(bitmap_count * LBA_SIZE, 0);
+        kdebug!("get bitmap");
+
         let _ = ext2fs_instance().partition.disk().read_at(
             i_bitmap,
             bitmap_count,
@@ -1168,6 +1155,8 @@ impl IndexNode for LockedExt2InodeInfo {
         let mut new_bm = 0u8;
         let mut new_inode_index = group_id as usize * sb.s_inodes_per_group as usize;
         let mut index_offset = 0usize;
+        kdebug!("alloc ext2 inode");
+
         for (p, i) in bitmap_buf.iter().enumerate() {
             if i == &0xFFu8 {
                 if i & 0xF0 == 0xF0 {
@@ -1175,7 +1164,7 @@ impl IndexNode for LockedExt2InodeInfo {
                     let mut mask = 0b1000_0000u8;
                     for j in 0..4 {
                         if i & mask == 0 {
-                            new_inode_index = p * 8 + j;
+                            new_inode_index += p * 8 + j;
                             index_offset = p * 8 + j;
                             bpos = p;
                             new_bm = i | mask;
@@ -1188,7 +1177,7 @@ impl IndexNode for LockedExt2InodeInfo {
                     let mut mask = 0b0000_1000u8;
                     for j in 4..8 {
                         if i & mask == 0 {
-                            new_inode_index = p * 8 + j;
+                            new_inode_index += p * 8 + j;
                             index_offset = p * 8 + j;
                             bpos = p;
                             new_bm = i | mask;
@@ -1200,7 +1189,7 @@ impl IndexNode for LockedExt2InodeInfo {
                     let mut mask = 0b1000_0000u8;
                     for j in 0..8 {
                         if i & mask == 0 {
-                            new_inode_index = p * 8 + j;
+                            new_inode_index += p * 8 + j;
                             index_offset = p * 8 + j;
                             bpos = p;
                             new_bm = i | mask;
@@ -1213,6 +1202,8 @@ impl IndexNode for LockedExt2InodeInfo {
         }
 
         let mb = Ext2FileMode::from_common_type(mode)?;
+        kdebug!("create ext2 inode");
+
         //  创建inode
         let new_inode = Ext2Inode::new(mb.bits());
         // 新inode所在块号，跟据inode table的起始位置+inode block offset
@@ -1241,12 +1232,16 @@ impl IndexNode for LockedExt2InodeInfo {
         table_buf[in_block_offset..in_block_offset + mem::size_of::<Ext2Inode>()]
             .copy_from_slice(&new_inode.to_bytes());
         // 写inode table
+        kdebug!("write inode table");
+
         let _ = ext2fs_instance().partition.disk().write_at(
             block_id,
             block_size / LBA_SIZE,
             table_buf.as_slice(),
         );
         //  写inode bitmap
+        kdebug!("write inode bitmap");
+
         bitmap_buf[bpos] = new_bm;
         let _ = ext2fs_instance().partition.disk().write_at(
             i_bitmap,
@@ -1256,6 +1251,35 @@ impl IndexNode for LockedExt2InodeInfo {
         // TODO 修改
         // descriptor.free_inodes_num-=1;
         descriptor.flush(&ext2fs_instance().partition, group_id as usize, block_size)?;
+
+        // TODO 写descriptor
+
+        // 获取descriptor
+
+        // TODO 写entry
+
+        let inode = &guard.inode;
+        let e_file_t = Ext2FileType::from_file_type(&file_type)?;
+
+        // let new_inode_num = 0;
+        let new_entry = Ext2DirEntry::new(new_inode_index as u32, e_file_t.into(), name)?;
+        // 读entry
+        let file_size = if sb.major_version == 1 {
+            ((inode.directory_acl as usize) << 32usize) + inode.lower_size as usize
+        } else {
+            inode.lower_size as usize
+        };
+        drop(guard);
+        let entry_buf = new_entry.to_bytes();
+        self.write_at(
+            file_size,
+            entry_buf.len(),
+            &entry_buf,
+            SpinLock::new(FilePrivateData::Unused).lock(),
+        )?;
+        // TODO 调用write at追加entry
+        kdebug!("end ext2 create");
+
         Ok(Arc::new(LockedExt2InodeInfo(SpinLock::new(
             Ext2InodeInfo::new(&new_inode, new_inode_index.try_into().unwrap()),
         ))))

@@ -319,6 +319,7 @@ pub struct Ext2SuperBlockInfo {
                                            // spinlock_t s_rsv_window_lock,
                                            // struct rb_root s_rsv_window_root,
                                            // struct ext2_reserve_window_node s_rsv_window_head,
+    pub major_version:u32,
 }
 
 impl Ext2SuperBlockInfo {
@@ -381,6 +382,7 @@ impl Ext2SuperBlockInfo {
             s_freeinodes_counter: AtomicU32::new(sb.free_inode_count),
             s_dirs_counter: AtomicU32::new(1),
             partition: Some(partition.clone()),
+            major_version: sb.major_version,
         };
         // kdebug!("end build super block info");
         ret

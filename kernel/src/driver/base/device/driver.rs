@@ -2,6 +2,8 @@ use super::{
     bus::{bus_manager, Bus},
     Device, DeviceMatchName, DeviceMatcher, IdTable,
 };
+use crate::driver::base::uevent::kobject_uevent::kobject_uevent;
+use crate::driver::base::uevent::KobjectAction;
 use crate::{
     driver::base::{
         device::{bus::BusNotifyEvent, dd::DeviceAttrCoredump, device_manager},
@@ -17,8 +19,6 @@ use alloc::{
 use core::fmt::Debug;
 use log::error;
 use system_error::SystemError;
-use crate::driver::base::uevent::kobject_uevent::kobject_uevent;
-use crate::driver::base::uevent::KobjectAction;
 /// @brief: Driver error
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]

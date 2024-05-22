@@ -1,11 +1,16 @@
 use alloc::{
-    boxed::Box, string::String, sync::{Arc, Weak}, vec::Vec
+    boxed::Box,
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
 };
 
 use core::hash::Hash;
 
-use super::{kobject::{
-    DynamicKObjKType, KObjType, KObject, KObjectManager, KObjectState, LockedKObjectState,},
+use super::{
+    kobject::{
+        DynamicKObjKType, KObjType, KObject, KObjectManager, KObjectState, LockedKObjectState,
+    },
     uevent::KobjUeventEnv,
 };
 use crate::{
@@ -13,7 +18,6 @@ use crate::{
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 use system_error::SystemError;
-
 
 #[derive(Debug)]
 pub struct KSet {
@@ -237,15 +241,15 @@ impl InnerKSet {
 }
 //https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/kobject.h#137
 use core::fmt::Debug;
-pub trait KSetUeventOps : Debug + Send + Sync{
+pub trait KSetUeventOps: Debug + Send + Sync {
     fn filter(&self) -> Option<i32>;
     fn uevent_name(&self) -> String;
-    fn uevent(&self, env: &Box<KobjUeventEnv>) -> i32;
+    fn uevent(&self, env: &KobjUeventEnv) -> i32;
 }
 #[derive(Debug)]
 pub struct KSetUeventOpsDefault;
 
-impl KSetUeventOps for KSetUeventOpsDefault{
+impl KSetUeventOps for KSetUeventOpsDefault {
     fn filter(&self) -> Option<i32> {
         Some(0)
     }
@@ -254,10 +258,7 @@ impl KSetUeventOps for KSetUeventOpsDefault{
         String::new()
     }
 
-    fn uevent(&self, env: &Box<KobjUeventEnv>) -> i32 {
+    fn uevent(&self, env: &KobjUeventEnv) -> i32 {
         0
     }
 }
-
-
-

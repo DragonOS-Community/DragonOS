@@ -37,28 +37,29 @@ Function
     uevent_net_rcv
     uevent_net_rcv_skb
     zap_modalias_env    √
-    
+
 */
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use num::Zero;
 use smoltcp::socket::raw::PacketMetadata;
 
-use crate::driver::base::kobject::{KObjectManager, KObjectState};
-use crate::net::socket::Socket;
-use super::KobjectAction;
 use super::KObject;
 use super::KobjUeventEnv;
-use super::{UEVENT_NUM_ENVP,UEVENT_BUFFER_SIZE};
+use super::KobjectAction;
+use super::{UEVENT_BUFFER_SIZE, UEVENT_NUM_ENVP};
+use crate::driver::base::kobject::{KObjectManager, KObjectState};
 use crate::libs::mutex::Mutex;
-use alloc::sync::Arc;
-use system_error::SystemError;
-use alloc::boxed::Box;
+use crate::net::net_core::consume_skb;
+use crate::net::socket::netlink::af_netlink::netlink_broadcast;
 use crate::net::socket::netlink::af_netlink::netlink_has_listeners;
 use crate::net::socket::netlink::af_netlink::sock;
 use crate::net::socket::netlink::af_netlink::socktrait;
-use crate::net::socket::netlink::af_netlink::netlink_broadcast;
 use crate::net::socket::netlink::af_netlink::SkBuff;
+use crate::net::socket::Socket;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use system_error::SystemError;
 // 存放需要用到的全局变量
 pub static UEVENT_SEQNUM: u64 = 0;
 pub static UEVENT_SUPPRESS: i32 = 1;
@@ -86,7 +87,7 @@ pub struct ListHead {
 }
 // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c#38
 pub struct UeventSock {
-    list: Vec<Box<ListHead>>,
+    list: Vec<ListHead>,
     sk: sock,
 }
 impl UeventSock {
@@ -99,22 +100,21 @@ impl UeventSock {
 }
 
 impl socktrait for UeventSock {
-    fn sk(&self) -> &sock{
+    fn sk(&self) -> &sock {
         &self.sk
     }
-    fn sk_family(&self) -> i32{
+    fn sk_family(&self) -> i32 {
         0
     }
-    fn sk_state(&self) -> i32{
+    fn sk_state(&self) -> i32 {
         0
     }
-    fn sk_protocol(&self) -> usize{
+    fn sk_protocol(&self) -> usize {
         0
     }
-    fn is_kernel(&self) -> bool{
+    fn is_kernel(&self) -> bool {
         true
     }
-    
 }
 // static const char *kobject_actions[] = {
 // 	[KOBJ_ADD] =		"add",
@@ -126,7 +126,6 @@ impl socktrait for UeventSock {
 // 	[KOBJ_BIND] =		"bind",
 // 	[KOBJ_UNBIND] =		"unbind",
 // };
-
 
 /*
  kobject_uevent_env，以envp为环境变量，上报一个指定action的uevent。环境变量的作用是为执行用户空间程序指定运行环境。具体动作如下：
@@ -153,52 +152,49 @@ add_uevent_var，以格式化字符的形式（类似printf、printk等），将
 kobject_action_type，将enum kobject_action类型的Action，转换为字符串
 */
 
-
 //kobject_uevent->kobject_uevent_env
-pub fn kobject_uevent(kobj: &dyn KObject, action: KobjectAction) -> Result<(), SystemError>  {
+pub fn kobject_uevent(kobj: &dyn KObject, action: KobjectAction) -> Result<(), SystemError> {
     // kobject_uevent和kobject_uevent_env功能一样，只是没有指定任何的环境变量
     match kobject_uevent_env(kobj, action, None) {
-        Ok(_) => Ok(()), 
+        Ok(_) => Ok(()),
         Err(e) => Err(e),
     }
 }
-pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: Option<Vec<String>>) -> Result<i32, SystemError>  {
-    
-    let subsystem: String;
+pub fn kobject_uevent_env(
+    kobj: &dyn KObject,
+    action: KobjectAction,
+    envp_ext: Option<Vec<String>>,
+) -> Result<i32, SystemError> {
     let mut state = KObjectState::empty();
-    let devpath: String;
     let mut top_kobj = kobj.parent().unwrap().upgrade().unwrap();
     let mut retval: i32;
     let action_string = match action {
-    KobjectAction::KOBJADD => "add".to_string(),
-    KobjectAction::KOBJREMOVE => "remove".to_string(),
-    KobjectAction::KOBJCHANGE => "change".to_string(),
-    KobjectAction::KOBJMOVE => "move".to_string(),
-    KobjectAction::KOBJONLINE => "online".to_string(),
-    KobjectAction::KOBJOFFLINE => "offline".to_string(),
-    KobjectAction::KOBJBIND => "bind".to_string(),
-    KobjectAction::KOBJUNBIND => "unbind".to_string(),
+        KobjectAction::KOBJADD => "add".to_string(),
+        KobjectAction::KOBJREMOVE => "remove".to_string(),
+        KobjectAction::KOBJCHANGE => "change".to_string(),
+        KobjectAction::KOBJMOVE => "move".to_string(),
+        KobjectAction::KOBJONLINE => "online".to_string(),
+        KobjectAction::KOBJOFFLINE => "offline".to_string(),
+        KobjectAction::KOBJBIND => "bind".to_string(),
+        KobjectAction::KOBJUNBIND => "unbind".to_string(),
     };
     /*
-	 * Mark "remove" event done regardless of result, for some subsystems
-	 * do not want to re-trigger "remove" event via automatic cleanup.
-	 */
-    match action {
-        KobjectAction::KOBJREMOVE => {
-            state.insert(KObjectState::REMOVE_UEVENT_SENT);
-        },
-        _ => {}
+     * Mark "remove" event done regardless of result, for some subsystems
+     * do not want to re-trigger "remove" event via automatic cleanup.
+     */
+    if let KobjectAction::KOBJREMOVE = action {
+        state.insert(KObjectState::REMOVE_UEVENT_SENT);
     }
 
     /* search the kset we belong to */
     while let Some(weak_parent) = top_kobj.parent() {
-        top_kobj= weak_parent.upgrade().unwrap();
+        top_kobj = weak_parent.upgrade().unwrap();
     }
 
     if top_kobj.kset().is_none() {
         log::info!("attempted to send uevent without kset!\n");
         return Err(SystemError::EINVAL);
-    } 
+    }
 
     let kset = top_kobj.kset();
     /* skip the event, if uevent_suppress is set*/
@@ -207,19 +203,34 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
         return Ok(0);
     }
 
-
     /* skip the event, if the filter returns zero. */
-    if kset.as_ref().unwrap().uevent_ops.is_some() && kset.as_ref().unwrap().uevent_ops.as_ref().unwrap().filter() == None {
+    if kset.as_ref().unwrap().uevent_ops.is_some()
+        && kset.as_ref().unwrap().uevent_ops.as_ref().unwrap().filter() == None
+    {
         log::info!("filter caused the event to drop!");
         return Ok(0);
     }
 
     /* originating subsystem */
-    if  kset.as_ref().unwrap().uevent_ops.is_some() && kset.as_ref().unwrap().uevent_ops.as_ref().unwrap().uevent_name() != "" {
-        subsystem = kset.as_ref().unwrap().uevent_ops.as_ref().unwrap().uevent_name();
+    let subsystem: String = if kset.as_ref().unwrap().uevent_ops.is_some()
+        && kset
+            .as_ref()
+            .unwrap()
+            .uevent_ops
+            .as_ref()
+            .unwrap()
+            .uevent_name()
+            != ""
+    {
+        kset.as_ref()
+            .unwrap()
+            .uevent_ops
+            .as_ref()
+            .unwrap()
+            .uevent_name()
     } else {
-        subsystem = kobj.name();
-    }
+        kobj.name()
+    };
     if subsystem.is_empty() {
         log::info!("unset sussystem caused the event to drop!");
     }
@@ -227,20 +238,19 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
     /* environment buffer */
     // 创建一个用于环境变量的缓冲区
     let mut env = Box::new(KobjUeventEnv {
-            argv: Vec::with_capacity(UEVENT_NUM_ENVP),
-            envp: Vec::with_capacity(UEVENT_NUM_ENVP),
-            envp_idx: 0,
-            buf: Vec::with_capacity(UEVENT_BUFFER_SIZE),
-            buflen: 0,
-        }) ;
-    if env.buf.is_empty(){
+        argv: Vec::with_capacity(UEVENT_NUM_ENVP),
+        envp: Vec::with_capacity(UEVENT_NUM_ENVP),
+        envp_idx: 0,
+        buf: Vec::with_capacity(UEVENT_BUFFER_SIZE),
+        buflen: 0,
+    });
+    if env.buf.is_empty() {
         return Err(SystemError::ENOMEM);
     }
-       
 
     //获取设备的完整对象路径
-	/* complete object path */
-    devpath = KObjectManager::kobject_get_path(kobj);
+    /* complete object path */
+    let devpath: String = KObjectManager::kobject_get_path(kobj);
     if devpath.is_empty() {
         retval = SystemError::ENOENT.to_posix_errno();
         // goto exit
@@ -249,41 +259,56 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
         return Ok(retval);
     }
     retval = add_uevent_var(&mut env, "ACTION=%s", &action_string).unwrap();
-	if retval.is_zero(){
-        // goto exit 
+    if retval.is_zero() {
+        // goto exit
         // 这里的goto目标代码较少，暂时直接复制使用，不仿写goto逻辑
         // drop替代了kfree
         drop(devpath);
         drop(env);
         return Ok(retval);
-        };
-	retval = add_uevent_var(&mut env, "DEVPATH=%s", &devpath).unwrap();
-	if retval.is_zero(){
+    };
+    retval = add_uevent_var(&mut env, "DEVPATH=%s", &devpath).unwrap();
+    if retval.is_zero() {
         drop(devpath);
         drop(env);
         return Ok(retval);
     };
-	retval = add_uevent_var(&mut env, "SUBSYSTEM=%s", &subsystem).unwrap();
-	if retval.is_zero(){
+    retval = add_uevent_var(&mut env, "SUBSYSTEM=%s", &subsystem).unwrap();
+    if retval.is_zero() {
         drop(devpath);
         drop(env);
         return Ok(retval);
     };
-       
+
     /* keys passed in from the caller */
     if let Some(env_ext) = envp_ext {
         for var in env_ext {
             let retval = add_uevent_var(&mut env, "%s", &var).unwrap();
-            if retval.is_zero(){
+            if retval.is_zero() {
                 drop(devpath);
                 drop(env);
                 return Ok(retval);
             }
         }
     }
-    if kset.as_ref().unwrap().uevent_ops.is_some() && kset.as_ref().unwrap().uevent_ops.as_ref().unwrap().uevent(&env) != 0 {
-        retval = kset.as_ref().unwrap().uevent_ops.as_ref().unwrap().uevent(&env);
-        if retval.is_zero(){
+    if kset.as_ref().unwrap().uevent_ops.is_some()
+        && kset
+            .as_ref()
+            .unwrap()
+            .uevent_ops
+            .as_ref()
+            .unwrap()
+            .uevent(&env)
+            != 0
+    {
+        retval = kset
+            .as_ref()
+            .unwrap()
+            .uevent_ops
+            .as_ref()
+            .unwrap()
+            .uevent(&env);
+        if retval.is_zero() {
             log::info!("kset uevent caused the event to drop!");
             // goto exit
             drop(devpath);
@@ -294,23 +319,22 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
     match action {
         KobjectAction::KOBJADD => {
             state.insert(KObjectState::ADD_UEVENT_SENT);
-        },
+        }
         KobjectAction::KOBJUNBIND => {
             zap_modalias_env(&mut env);
-        },
+        }
         _ => {}
     }
 
-    
     //mutex_lock(&uevent_sock_mutex);
-	/* we will send an event, so request a new sequence number */
-    retval = add_uevent_var(&mut env, "SEQNUM=%llu", &(UEVENT_SEQNUM+1).to_string()).unwrap();
-    if retval.is_zero(){
+    /* we will send an event, so request a new sequence number */
+    retval = add_uevent_var(&mut env, "SEQNUM=%llu", &(UEVENT_SEQNUM + 1).to_string()).unwrap();
+    if retval.is_zero() {
         drop(devpath);
         drop(env);
         return Ok(retval);
     }
-	retval = kobject_uevent_net_broadcast(kobj, &env, &action_string, &devpath);
+    retval = kobject_uevent_net_broadcast(kobj, &env, &action_string, &devpath);
     //mutex_unlock(&uevent_sock_mutex);
 
     #[cfg(feature = "UEVENT_HELPER")]
@@ -353,14 +377,18 @@ pub fn kobject_uevent_env(kobj: &dyn KObject, action: KobjectAction, envp_ext: O
     return Ok(retval);
 }
 
-pub fn add_uevent_var(env: &mut Box<KobjUeventEnv>, format: &str, args: &String) -> Result<i32, SystemError>{
+pub fn add_uevent_var(
+    env: &mut Box<KobjUeventEnv>,
+    format: &str,
+    args: &String,
+) -> Result<i32, SystemError> {
     if env.envp_idx >= env.envp.len() {
         log::info!("add_uevent_var: too many keys");
         return Err(SystemError::ENOMEM);
     }
 
-    let mut buffer = String::with_capacity(env.buf.len()-env.buflen);
-    write!(&mut buffer,"{} {}", format.to_string(), args).map_err(|_| SystemError::ENOMEM)?;
+    let mut buffer = String::with_capacity(env.buf.len() - env.buflen);
+    write!(&mut buffer, "{} {}", format, args).map_err(|_| SystemError::ENOMEM)?;
     let len = buffer.len();
 
     if len >= env.buf.len() - env.buflen {
@@ -376,11 +404,10 @@ pub fn add_uevent_var(env: &mut Box<KobjUeventEnv>, format: &str, args: &String)
 }
 
 // 用于处理设备树中与模块相关的环境变量
-fn zap_modalias_env(env: &mut Box<KobjUeventEnv>)
-{
+fn zap_modalias_env(env: &mut Box<KobjUeventEnv>) {
     // 定义一个静态字符串
     const MODALIAS_PREFIX: &str = "MODALIAS=";
-	let mut len :usize;
+    let mut len: usize;
 
     for i in 0..env.envp_idx {
         // 如果存在而且是以MODALIAS=开头的字符串
@@ -389,11 +416,11 @@ fn zap_modalias_env(env: &mut Box<KobjUeventEnv>)
             // 如果不是最后一个元素
             if i != env.envp_idx - 1 {
                 // 将下一个环境变量移动到当前的位置，这样可以覆盖掉"MODALIAS="前缀的环境变量。
-                let next_envp = env.envp[i+1].as_ref().unwrap().clone();
+                let next_envp = env.envp[i + 1].as_ref().unwrap().clone();
                 env.envp[i].replace(next_envp);
                 // 更新数组中后续元素的位置，以反映它们被移动后的位置
                 for j in i..env.envp_idx - 1 {
-                    let next_envp = env.envp[j+1].as_ref().unwrap().clone();
+                    let next_envp = env.envp[j + 1].as_ref().unwrap().clone();
                     env.envp[j].replace(next_envp);
                 }
             }
@@ -402,7 +429,6 @@ fn zap_modalias_env(env: &mut Box<KobjUeventEnv>)
             // 减少环境变量的总长度
             env.buflen -= len;
         }
-    
     }
 }
 
@@ -410,32 +436,31 @@ fn zap_modalias_env(env: &mut Box<KobjUeventEnv>)
 
 pub fn kobject_uevent_net_broadcast(
     kobj: &dyn KObject,
-    env: &Box<KobjUeventEnv>,
-    action_string: &String,
-    devpath: &String,
-)->i32
-{
+    env: &KobjUeventEnv,
+    action_string: &str,
+    devpath: &str,
+) -> i32 {
     let mut ret = 0;
     // let net:Net = None;
     // let mut ops = kobj_ns_ops(kobj);
 
-	// if (!ops && kobj.kset().is_some()) {
-	// 	let ksobj:KObject = &kobj.kset().kobj();
+    // if (!ops && kobj.kset().is_some()) {
+    // 	let ksobj:KObject = &kobj.kset().kobj();
 
-	// 	if (ksobj.parent() != NULL){
+    // 	if (ksobj.parent() != NULL){
     //         ops = kobj_ns_ops(ksobj.parent());
     //     }
-			
-	// }
+
+    // }
     // TODO: net结构体？
     // https://code.dragonos.org.cn/xref/linux-6.1.9/include/net/net_namespace.h#60
-	/* kobjects currently only carry network namespace tags and they
-	 * are the only tag relevant here since we want to decide which
-	 * network namespaces to broadcast the uevent into.
-	 */
-	// if (ops && ops.netlink_ns() && kobj.ktype().namespace())
-	// 	if (ops.type() == KOBJ_NS_TYPE_NET)
-	// 		net = kobj.ktype().namespace(kobj);
+    /* kobjects currently only carry network namespace tags and they
+     * are the only tag relevant here since we want to decide which
+     * network namespaces to broadcast the uevent into.
+     */
+    // if (ops && ops.netlink_ns() && kobj.ktype().namespace())
+    // 	if (ops.type() == KOBJ_NS_TYPE_NET)
+    // 		net = kobj.ktype().namespace(kobj);
     // 如果有网络命名空间，则广播标记的uevent；如果没有，则广播未标记的uevent
     // if !net.is_none() {
     //     ret = uevent_net_broadcast_tagged(net.unwrap().sk, env, action_string, devpath);
@@ -445,38 +470,32 @@ pub fn kobject_uevent_net_broadcast(
     ret
 }
 
-
 pub fn uevent_net_broadcast_tagged(
     sk: &dyn Socket,
-    env: &Box<KobjUeventEnv>,
-    action_string: &String,
-    devpath: &String,
-)->i32
-{
+    env: &KobjUeventEnv,
+    action_string: &str,
+    devpath: &str,
+) -> i32 {
     let ret = 0;
     ret
 }
 static uevent_sock_list: Vec<UeventSock> = Vec::new();
 pub fn alloc_uevent_skb<'a>(
-    env: &'a Box<KobjUeventEnv>,
-    action_string: &'a String,
-    devpath: &'a String,
-)->SkBuff<'a>
-{
-    let skb: SkBuff = SkBuff::new() ;
+    env: &'a KobjUeventEnv,
+    action_string: &'a str,
+    devpath: &'a str,
+) -> Arc<RefCell<SkBuff<'a>>> {
+    let skb = Arc::new(RefCell::new(SkBuff::new()));
     skb
 }
 pub fn uevent_net_broadcast_untagged(
-    env: &Box<KobjUeventEnv>,
+    env: &KobjUeventEnv,
     action_string: &String,
     devpath: &String,
-)->i32
-{
+) -> i32 {
     let mut retval = 0;
-    let mut skb: SkBuff = SkBuff::new();
-    // 将 SkBuff 包装在 Arc 中，以便可以跨线程安全地共享
-    let shared_skb: Arc<RefCell<SkBuff>> = Arc::new(RefCell::new(skb));
-    let mut skb = shared_skb.borrow_mut();
+    let skb = Arc::new(RefCell::new(SkBuff::new()));
+
     // 模拟 skb_get 行为，增加引用并返回引用
     fn get_packet_buffer(shared_skb: Arc<RefCell<SkBuff>>) -> Arc<RefCell<SkBuff>> {
         // Rc::clone 会增加内部引用计数
@@ -486,31 +505,31 @@ pub fn uevent_net_broadcast_untagged(
     // 发送uevent message
     for ue_sk in &uevent_sock_list {
         let uevent_sock = &ue_sk.sk;
-        if !(crate::net::socket::netlink::af_netlink::netlink_has_listeners(uevent_sock, 1) != 0) {
+        if !(netlink_has_listeners(uevent_sock, 1) != 0) {
             continue;
         }
 
-        if skb.is_empty() {
+        if skb.borrow().is_empty() {
             retval = SystemError::ENOMEM.to_posix_errno();
-            *skb = alloc_uevent_skb(env, action_string, devpath);
-            if skb.is_empty() {
+            let skb = alloc_uevent_skb(env, action_string, devpath);
+            if skb.borrow().is_empty() {
                 continue;
             }
         }
 
-
         // GFP_KERNEL暂且保留但是搁置
-        retval = match netlink_broadcast(uevent_sock, get_packet_buffer(shared_skb.clone()), 0, 1,1 ) {
+        retval = match netlink_broadcast(uevent_sock, get_packet_buffer(skb.clone()), 0, 1, 1) {
             Ok(_) => 0,
             Err(err) => err.to_posix_errno(),
         };
 
         // ENOBUFS should be handled in userspace
-        if retval == SystemError::ENOBUFS.to_posix_errno() || retval == SystemError::ESRCH.to_posix_errno() {
+        if retval == SystemError::ENOBUFS.to_posix_errno()
+            || retval == SystemError::ESRCH.to_posix_errno()
+        {
             retval = 0;
         }
     }
-    // todo: consume_skb
-    // consume_skb(skb);
+    consume_skb(skb);
     retval
 }

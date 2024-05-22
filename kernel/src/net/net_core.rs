@@ -14,7 +14,10 @@ use crate::{
 
 use super::{
     event_poll::{EPollEventType, EventPoll},
-    socket::{handle::GlobalSocketHandle, inet::TcpSocket, netlink::af_netlink::SkBuff, HANDLE_MAP, SOCKET_SET},
+    socket::{
+        handle::GlobalSocketHandle, inet::TcpSocket, netlink::af_netlink::SkBuff, HANDLE_MAP,
+        SOCKET_SET,
+    },
 };
 
 /// The network poll function, which will be called by timer.
@@ -250,7 +253,7 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
 // proto_unregister
 
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/core/skbuff.c#1027
-pub fn consume_skb<'a>(skb: Arc<RefCell<SkBuff<'a>>>){
+pub fn consume_skb(skb: Arc<RefCell<SkBuff>>) {
     // 释放skb
     drop(skb);
 }

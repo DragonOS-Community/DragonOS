@@ -40,19 +40,19 @@ pub mod kobject_uevent;
 // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c?fi=kobject_uevent#457
 // kobject_action
 pub enum KobjectAction {
-        KOBJADD, 
-        KOBJREMOVE, //Kobject（或上层数据结构）的添加/移除事件
-        KOBJCHANGE, //Kobject（或上层数据结构）的状态或者内容发生改变; 如果设备驱动需要上报的事件不再上面事件的范围内，或者是自定义的事件，可以使用该event，并携带相应的参数。
-        KOBJMOVE, //Kobject（或上层数据结构）更改名称或者更改Parent（意味着在sysfs中更改了目录结构）
-        KOBJONLINE,
-        KOBJOFFLINE, //Kobject（或上层数据结构）的上线/下线事件，其实是是否使能
-        KOBJBIND,
-        KOBJUNBIND,
-    }
+    KOBJADD,
+    KOBJREMOVE, //Kobject（或上层数据结构）的添加/移除事件
+    KOBJCHANGE, //Kobject（或上层数据结构）的状态或者内容发生改变; 如果设备驱动需要上报的事件不再上面事件的范围内，或者是自定义的事件，可以使用该event，并携带相应的参数。
+    KOBJMOVE,   //Kobject（或上层数据结构）更改名称或者更改Parent（意味着在sysfs中更改了目录结构）
+    KOBJONLINE,
+    KOBJOFFLINE, //Kobject（或上层数据结构）的上线/下线事件，其实是是否使能
+    KOBJBIND,
+    KOBJUNBIND,
+}
 
 /*
-    @parament: 
-    
+    @parament:
+
     envp，指针数组，用于保存每个环境变量的地址，最多可支持的环境变量数量为UEVENT_NUM_ENVP。
 
     envp_idx，用于访问环境变量指针数组的index。
@@ -65,9 +65,9 @@ pub enum KobjectAction {
 
 //https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/kobject.h#31
 
-pub const UEVENT_NUM_ENVP :usize = 64;
-pub const UEVENT_BUFFER_SIZE:usize= 2048;
-pub const UEVENT_HELPER_PATH_LEN:usize = 256;
+pub const UEVENT_NUM_ENVP: usize = 64;
+pub const UEVENT_BUFFER_SIZE: usize = 2048;
+pub const UEVENT_HELPER_PATH_LEN: usize = 256;
 
 /// Represents the environment for handling kernel object uevents.
 /*
@@ -89,7 +89,7 @@ pub struct KobjUeventEnv {
     buflen: usize,
 }
 
-//kset_uevent_ops是为kset量身订做的一个数据结构，里面包含filter和uevent两个回调函数，用处如下： 
+//kset_uevent_ops是为kset量身订做的一个数据结构，里面包含filter和uevent两个回调函数，用处如下：
 /*
     filter，当任何Kobject需要上报uevent时，它所属的kset可以通过该接口过滤，阻止不希望上报的event，从而达到从整体上管理的目的。
 

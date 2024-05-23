@@ -353,7 +353,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn kernel_ioctl(
         &self,
         _arg: Arc<dyn crate::net::event_poll::KernelIoctlData>,
-        _tty: Arc<crate::driver::tty::tty_core::TtyCore>,
+        _data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
     }

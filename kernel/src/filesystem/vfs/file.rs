@@ -584,7 +584,6 @@ impl FileDescriptorVec {
         return size;
     }
 
-
     /// @brief 判断文件描述符序号是否合法
     ///
     /// @return true 合法

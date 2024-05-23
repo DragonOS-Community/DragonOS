@@ -296,6 +296,7 @@ impl IndexNode for MountFSInode {
 
     #[inline]
     fn fs(&self) -> Arc<dyn FileSystem> {
+        kdebug!("{}", self.inner_inode.fs().name());
         return self.mount_fs.clone();
     }
 

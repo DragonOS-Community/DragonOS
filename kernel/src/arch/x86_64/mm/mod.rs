@@ -27,7 +27,7 @@ use crate::{
 };
 
 use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::{PageEntry, PageFlags, PAGE_1G_SHIFT};
+use crate::mm::page::{PageEntry, EntryFlags, PAGE_1G_SHIFT};
 use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr};
 use crate::{kdebug, kinfo, kwarn};
 use system_error::SystemError;
@@ -651,17 +651,17 @@ impl FrameAllocator for LockedFrameAllocator {
 }
 
 /// 获取内核地址默认的页面标志
-pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> PageFlags<A> {
+pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> EntryFlags<A> {
     let info: X86_64MMBootstrapInfo = BOOTSTRAP_MM_INFO.unwrap();
 
     if virt.data() >= info.kernel_code_start && virt.data() < info.kernel_code_end {
         // Remap kernel code  execute
-        return PageFlags::new().set_execute(true).set_write(true);
+        return EntryFlags::new().set_execute(true).set_write(true);
     } else if virt.data() >= info.kernel_data_end && virt.data() < info.kernel_rodata_end {
         // Remap kernel rodata read only
-        return PageFlags::new().set_execute(true);
+        return EntryFlags::new().set_execute(true);
     } else {
-        return PageFlags::new().set_write(true).set_execute(true);
+        return EntryFlags::new().set_write(true).set_execute(true);
     }
 }
 

@@ -20,6 +20,7 @@ use system_error::SystemError;
 use crate::{
     arch::{mm::PageMapper, CurrentIrqArch, MMArch},
     exception::InterruptArch,
+    filesystem::vfs::file::File,
     libs::{
         align::page_align_up,
         rwlock::RwLock,
@@ -34,7 +35,7 @@ use super::{
     allocator::page_frame::{
         deallocate_page_frames, PageFrameCount, PhysPageFrame, VirtPageFrame, VirtPageFrameIter,
     },
-    page::{Flusher, InactiveFlusher, PageFlags, PageFlushAll},
+    page::{EntryFlags, Flusher, InactiveFlusher, PageFlushAll},
     syscall::{MadvFlags, MapFlags, MremapFlags, ProtFlags},
     MemoryManagementArch, PageTableKind, VirtAddr, VirtRegion, VmFlags,
 };
@@ -333,7 +334,7 @@ impl InnerAddressSpace {
         F: FnOnce(
             VirtPageFrame,
             PageFrameCount,
-            PageFlags<MMArch>,
+            EntryFlags<MMArch>,
             &mut PageMapper,
             &mut dyn Flusher<MMArch>,
         ) -> Result<Arc<LockedVMA>, SystemError>,
@@ -380,7 +381,7 @@ impl InnerAddressSpace {
         self.mappings.insert_vma(map_func(
             page,
             page_count,
-            PageFlags::from_prot_flags(prot_flags, true),
+            EntryFlags::from_prot_flags(prot_flags, true),
             &mut self.user_mapper.utable,
             flusher,
         )?);
@@ -556,7 +557,7 @@ impl InnerAddressSpace {
                 return Err(SystemError::EACCES);
             }
 
-            let new_flags: PageFlags<MMArch> = r_guard
+            let new_flags: EntryFlags<MMArch> = r_guard
                 .flags()
                 .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))
                 .set_write(prot_flags.contains(ProtFlags::PROT_WRITE));
@@ -1022,7 +1023,7 @@ impl LockedVMA {
     ///
     pub fn remap(
         &self,
-        flags: PageFlags<MMArch>,
+        flags: EntryFlags<MMArch>,
         mapper: &mut PageMapper,
         mut flusher: impl Flusher<MMArch>,
     ) -> Result<(), SystemError> {
@@ -1229,12 +1230,16 @@ pub struct VMA {
     /// 虚拟内存区域标志
     vm_flags: VmFlags,
     /// VMA内的页帧的标志
-    flags: PageFlags<MMArch>,
+    flags: EntryFlags<MMArch>,
     /// VMA内的页帧是否已经映射到页表
     mapped: bool,
     /// VMA所属的用户地址空间
     user_address_space: Option<Weak<AddressSpace>>,
     self_ref: Weak<LockedVMA>,
+
+    vm_file: Option<Arc<File>>,
+    /// VMA映射的文件部分相对于整个文件的偏移页数
+    file_pgoff: Option<usize>,
 
     provider: Provider,
 }
@@ -1258,7 +1263,7 @@ impl VMA {
     pub fn new(
         region: VirtRegion,
         vm_flags: VmFlags,
-        flags: PageFlags<MMArch>,
+        flags: EntryFlags<MMArch>,
         mapped: bool,
     ) -> Self {
         VMA {
@@ -1269,6 +1274,8 @@ impl VMA {
             user_address_space: None,
             self_ref: Weak::default(),
             provider: Provider::Allocated,
+            file_pgoff: None,
+            vm_file: None,
         }
     }
 
@@ -1278,6 +1285,10 @@ impl VMA {
 
     pub fn vm_flags(&self) -> &VmFlags {
         return &self.vm_flags;
+    }
+
+    pub fn vm_file(&self) -> Option<Arc<File>> {
+        return self.vm_file.clone();
     }
 
     pub fn set_vm_flags(&mut self, vm_flags: VmFlags) {
@@ -1306,6 +1317,8 @@ impl VMA {
             user_address_space: self.user_address_space.clone(),
             self_ref: self.self_ref.clone(),
             provider: Provider::Allocated,
+            file_pgoff: self.file_pgoff,
+            vm_file: self.vm_file.clone(),
         };
     }
 
@@ -1318,12 +1331,19 @@ impl VMA {
             user_address_space: None,
             self_ref: Weak::default(),
             provider: Provider::Allocated,
+            file_pgoff: self.file_pgoff,
+            vm_file: self.vm_file.clone(),
         };
     }
 
     #[inline(always)]
-    pub fn flags(&self) -> PageFlags<MMArch> {
+    pub fn flags(&self) -> EntryFlags<MMArch> {
         return self.flags;
+    }
+
+    #[inline(always)]
+    pub fn file_page_offset(&self) -> Option<usize> {
+        return self.file_pgoff;
     }
 
     pub fn pages(&self) -> VirtPageFrameIter {
@@ -1335,7 +1355,7 @@ impl VMA {
 
     pub fn remap(
         &mut self,
-        flags: PageFlags<MMArch>,
+        flags: EntryFlags<MMArch>,
         mapper: &mut PageMapper,
         mut flusher: impl Flusher<MMArch>,
     ) -> Result<(), SystemError> {
@@ -1388,7 +1408,7 @@ impl VMA {
         destination: VirtPageFrame,
         count: PageFrameCount,
         vm_flags: VmFlags,
-        flags: PageFlags<MMArch>,
+        flags: EntryFlags<MMArch>,
         mapper: &mut PageMapper,
         mut flusher: impl Flusher<MMArch>,
     ) -> Result<Arc<LockedVMA>, SystemError> {
@@ -1410,15 +1430,12 @@ impl VMA {
             cur_dest = cur_dest.next();
         }
 
-        let r: Arc<LockedVMA> = LockedVMA::new(VMA {
-            region: VirtRegion::new(destination.virt_address(), count.data() * MMArch::PAGE_SIZE),
+        let r: Arc<LockedVMA> = LockedVMA::new(VMA::new(
+            VirtRegion::new(destination.virt_address(), count.data() * MMArch::PAGE_SIZE),
             vm_flags,
             flags,
-            mapped: true,
-            user_address_space: None,
-            self_ref: Weak::default(),
-            provider: Provider::Allocated,
-        });
+            true,
+        ));
 
         // 将VMA加入到anon_vma中
         let mut page_manager_guard = page_manager_lock_irqsave();
@@ -1446,7 +1463,7 @@ impl VMA {
         destination: VirtPageFrame,
         page_count: PageFrameCount,
         vm_flags: VmFlags,
-        flags: PageFlags<MMArch>,
+        flags: EntryFlags<MMArch>,
         mapper: &mut PageMapper,
         mut flusher: impl Flusher<MMArch>,
     ) -> Result<Arc<LockedVMA>, SystemError> {

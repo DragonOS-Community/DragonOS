@@ -3,7 +3,7 @@ use system_error::SystemError;
 use super::{vcpu::Vcpu, vm};
 use crate::{
     kdebug,
-    mm::{kernel_mapper::KernelMapper, page::PageFlags, VirtAddr},
+    mm::{kernel_mapper::KernelMapper, page::EntryFlags, VirtAddr},
 };
 
 /*
@@ -154,7 +154,7 @@ fn hva_to_pfn(addr: u64, _atomic: bool, _writable: &mut bool) -> Result<u64, Sys
         return Ok(hpa.data() as u64 >> PAGE_SHIFT);
     }
     unsafe {
-        mapper.map(hva, PageFlags::mmio_flags());
+        mapper.map(hva, EntryFlags::mmio_flags());
     }
     let (hpa, _) = mapper.translate(hva).unwrap();
     return Ok(hpa.data() as u64 >> PAGE_SHIFT);

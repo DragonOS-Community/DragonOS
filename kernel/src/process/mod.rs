@@ -674,10 +674,10 @@ impl ProcessControlBlock {
 
     /// # 函数的功能
     ///
-    /// 返回此进程打开的文件描述符的数量
-    pub fn fdsize(&self) -> usize {
+    /// 返回此进程 `打开的文件描述符` 的数量
+    pub fn fd_open_count(&self) -> usize {
         let fd_table = self.fd_table();
-        let size = fd_table.read().size();
+        let size = fd_table.read().fd_open_count();
         return size;
     }
 

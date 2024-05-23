@@ -573,8 +573,8 @@ impl FileDescriptorVec {
         return res;
     }
 
-    /// 返回文件描述符的数量
-    pub fn size(&self) -> usize {
+    /// 返回 `已经打开的` 文件描述符的数量
+    pub fn fd_open_count(&self) -> usize {
         let mut size = 0;
         for fd in &self.fds {
             if fd.is_some() {
@@ -583,6 +583,7 @@ impl FileDescriptorVec {
         }
         return size;
     }
+
 
     /// @brief 判断文件描述符序号是否合法
     ///

@@ -43,6 +43,7 @@ use crate::{
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
+        unsafecell_wrapper::UnsafeCellWrapper,
     },
     net::{generate_iface_id, net_core::poll_ifaces_try_lock_onetime, NET_DEVICES},
     time::Instant,
@@ -84,30 +85,6 @@ impl DerefMut for VirtIoNetImpl {
 unsafe impl Send for VirtIoNetImpl {}
 unsafe impl Sync for VirtIoNetImpl {}
 
-#[derive(Debug)]
-struct VirtIONicDeviceInnerWrapper(UnsafeCell<VirtIONicDeviceInner>);
-unsafe impl Send for VirtIONicDeviceInnerWrapper {}
-unsafe impl Sync for VirtIONicDeviceInnerWrapper {}
-
-impl Deref for VirtIONicDeviceInnerWrapper {
-    type Target = VirtIONicDeviceInner;
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.0.get() }
-    }
-}
-impl DerefMut for VirtIONicDeviceInnerWrapper {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.0.get() }
-    }
-}
-
-#[allow(clippy::mut_from_ref)]
-impl VirtIONicDeviceInnerWrapper {
-    fn force_get_mut(&self) -> &mut <VirtIONicDeviceInnerWrapper as Deref>::Target {
-        unsafe { &mut *self.0.get() }
-    }
-}
-
 /// Virtio网络设备驱动(加锁)
 pub struct VirtIONicDeviceInner {
     pub inner: Arc<SpinLock<VirtIoNetImpl>>,
@@ -130,7 +107,7 @@ impl Debug for VirtIONicDeviceInner {
 #[cast_to([sync] VirtIODevice)]
 #[cast_to([sync] Device)]
 pub struct VirtioInterface {
-    device_inner: VirtIONicDeviceInnerWrapper,
+    device_inner: UnsafeCellWrapper<VirtIONicDeviceInner>,
     iface_id: usize,
     iface_name: String,
     dev_id: Arc<DeviceId>,
@@ -170,7 +147,7 @@ impl VirtioInterface {
         let iface = iface::Interface::new(iface_config, &mut device_inner, Instant::now().into());
 
         let result = Arc::new(VirtioInterface {
-            device_inner: VirtIONicDeviceInnerWrapper(UnsafeCell::new(device_inner)),
+            device_inner: UnsafeCellWrapper(UnsafeCell::new(device_inner)),
             iface_id,
             locked_kobj_state: LockedKObjectState::default(),
             iface: SpinLock::new(iface),

@@ -10,7 +10,7 @@ use crate::{
         },
         net::NetDevice,
     },
-    libs::spinlock::SpinLock,
+    libs::{spinlock::SpinLock, unsafecell_wrapper::UnsafeCellWrapper},
     net::{generate_iface_id, NET_DEVICES},
     time::Instant,
 };
@@ -18,11 +18,7 @@ use alloc::{
     string::String,
     sync::{Arc, Weak},
 };
-use core::{
-    cell::UnsafeCell,
-    fmt::Debug,
-    ops::{Deref, DerefMut},
-};
+use core::{cell::UnsafeCell, fmt::Debug};
 use log::info;
 use smoltcp::{
     phy,
@@ -42,39 +38,14 @@ pub struct E1000EDriver {
 unsafe impl Send for E1000EDriver {}
 unsafe impl Sync for E1000EDriver {}
 
-/// @brief 网卡驱动的包裹器，这是为了获取网卡驱动的可变引用而设计的。
-/// 参阅virtio_net.rs
-struct E1000EDriverWrapper(UnsafeCell<E1000EDriver>);
-unsafe impl Send for E1000EDriverWrapper {}
-unsafe impl Sync for E1000EDriverWrapper {}
-
-impl Deref for E1000EDriverWrapper {
-    type Target = E1000EDriver;
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.0.get() }
-    }
-}
-impl DerefMut for E1000EDriverWrapper {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.0.get() }
-    }
-}
-
-impl E1000EDriverWrapper {
-    #[allow(clippy::mut_from_ref)]
-    fn force_get_mut(&self) -> &mut E1000EDriver {
-        unsafe { &mut *self.0.get() }
-    }
-}
-
-impl Debug for E1000EDriverWrapper {
+impl Debug for UnsafeCellWrapper<E1000EDriver> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("E1000ENICDriver").finish()
     }
 }
 
 pub struct E1000EInterface {
-    driver: E1000EDriverWrapper,
+    driver: UnsafeCellWrapper<E1000EDriver>,
     iface_id: usize,
     iface: SpinLock<smoltcp::iface::Interface>,
     name: String,
@@ -184,7 +155,7 @@ impl E1000EInterface {
         let iface =
             smoltcp::iface::Interface::new(iface_config, &mut driver, Instant::now().into());
 
-        let driver: E1000EDriverWrapper = E1000EDriverWrapper(UnsafeCell::new(driver));
+        let driver = UnsafeCellWrapper(UnsafeCell::new(driver));
         let result = Arc::new(E1000EInterface {
             driver,
             iface_id,

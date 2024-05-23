@@ -384,8 +384,9 @@ impl IndexNode for LockedExt2InodeInfo {
             begin_pos += rc_len as usize - mem::size_of::<u32>();
         }
         info!("end LockedExt2InodeInfo find");
+        // return self.create_with_data(_name, FileType::File, ModeType::all(), 0);
 
-        return Err(SystemError::EINVAL);
+        return Err(SystemError::ENOENT);
     }
     fn close(&self, _data: SpinLockGuard<'_, FilePrivateData>) -> Result<(), SystemError> {
         debug!("close inode");
@@ -399,6 +400,7 @@ impl IndexNode for LockedExt2InodeInfo {
         debug!("open inode");
         Ok(())
     }
+
     fn read_at(
         &self,
         offset: usize,
@@ -1120,6 +1122,19 @@ impl IndexNode for LockedExt2InodeInfo {
     fn metadata(&self) -> Result<Metadata, SystemError> {
         return Ok(self.0.lock().meta.clone());
     }
+    fn create_with_data(
+        &self,
+        _name: &str,
+        _file_type: FileType,
+        _mode: ModeType,
+        _data: usize,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if _data == 0 {
+            debug!("create_with_data to create");
+            return self.create(_name, _file_type, _mode);
+        }
+        return Err(SystemError::EINVAL);
+    }
     fn create(
         &self,
         name: &str,
@@ -1221,8 +1236,11 @@ impl IndexNode for LockedExt2InodeInfo {
         //     }
         // };
         // 读inode table
+        // BUG 内存分配错误
+
         let mut table_buf: Vec<u8> = Vec::with_capacity(block_size / LBA_SIZE);
         table_buf.resize(block_size / LBA_SIZE, 0);
+        debug!("read inode table");
         let _ = ext2fs_instance().partition.disk().read_at(
             block_id,
             block_size / LBA_SIZE,

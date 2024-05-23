@@ -1236,10 +1236,9 @@ impl IndexNode for LockedExt2InodeInfo {
         //     }
         // };
         // 读inode table
-        // BUG 内存分配错误
 
-        let mut table_buf: Vec<u8> = Vec::with_capacity(block_size / LBA_SIZE);
-        table_buf.resize(block_size / LBA_SIZE, 0);
+        let mut table_buf: Vec<u8> = Vec::with_capacity(block_size);
+        table_buf.resize(block_size, 0);
         debug!("read inode table");
         let _ = ext2fs_instance().partition.disk().read_at(
             block_id,
@@ -1269,6 +1268,7 @@ impl IndexNode for LockedExt2InodeInfo {
         );
         // TODO 修改
         // descriptor.free_inodes_num-=1;
+        debug!("descriptor flush");
         descriptor.flush(&ext2fs_instance().partition, group_id as usize, block_size)?;
 
         // TODO 写descriptor

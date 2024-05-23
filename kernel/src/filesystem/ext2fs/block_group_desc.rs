@@ -54,6 +54,7 @@ impl Ext2BlockGroupDescriptor {
         des_data.resize(LBA_SIZE * count, 0);
         let _ = partition.disk().read_at(start_block, count, &mut des_data);
         let offset_in_block = offset % block_size;
+        // BUG 错误：	source slice length (18) does not match destination slice length (32)
         des_data[offset_in_block..offset_in_block + mem::size_of::<Ext2BlockGroupDescriptor>()]
             .copy_from_slice(self.to_bytes().as_slice());
         let _ = partition.disk().write_at(start_block, count, &mut des_data);

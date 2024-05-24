@@ -5,7 +5,7 @@ use alloc::sync::Arc;
 use crate::process::ProcessControlBlock;
 
 use super::{
-    fair::{CfsRunQueue, FairSchedEntity},
+    fair::{CfsRunQueue, FairSchedEntityInner},
     CpuRunQueue, LoadWeight, SchedPolicy, SCHED_CAPACITY_SCALE, SCHED_CAPACITY_SHIFT,
 };
 
@@ -167,7 +167,7 @@ impl SchedulerAvg {
     pub fn post_init_entity_util_avg(pcb: &Arc<ProcessControlBlock>) {
         let se = pcb.sched_info().sched_entity();
         let cfs_rq = se.cfs_rq();
-        let sa = &mut se.force_mut().avg;
+        let sa = &mut se.force_get_mut().avg;
 
         // TODO: 这里和架构相关
         let cpu_scale = SCHED_CAPACITY_SCALE;
@@ -214,7 +214,7 @@ impl CfsRunQueue {
     }
 }
 
-impl FairSchedEntity {
+impl FairSchedEntityInner {
     pub fn update_load_avg(&mut self, cfs_rq: &mut CfsRunQueue, now: u64) -> bool {
         if self.avg.update_load_sum(
             now,

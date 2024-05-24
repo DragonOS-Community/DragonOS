@@ -5,7 +5,13 @@ use core::{
 };
 
 #[derive(Debug)]
-pub struct UnsafeCellWrapper<T>(pub UnsafeCell<T>);
+pub struct UnsafeCellWrapper<T>(UnsafeCell<T>);
+
+impl<T> UnsafeCellWrapper<T> {
+    pub fn new(inner: T) -> UnsafeCellWrapper<T> {
+        Self(UnsafeCell::new(inner))
+    }
+}
 
 unsafe impl<T> Sync for UnsafeCellWrapper<T> {}
 unsafe impl<T> Send for UnsafeCellWrapper<T> {}

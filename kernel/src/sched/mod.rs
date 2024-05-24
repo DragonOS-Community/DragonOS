@@ -943,7 +943,7 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 
     pcb.sched_info()
         .sched_entity()
-        .force_mut()
+        .force_get_mut()
         .init_entity_runnable_average();
 
     Ok(())
@@ -963,7 +963,7 @@ fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
     // TODO: Fixme There is not implement group sched;
     let se = pcb.sched_info().sched_entity();
     let rq = cpu_rq(cpu.data() as usize);
-    se.force_mut().set_cfs(Arc::downgrade(&rq.cfs));
+    se.force_get_mut().set_cfs(Arc::downgrade(&rq.cfs));
 }
 
 #[inline(never)]

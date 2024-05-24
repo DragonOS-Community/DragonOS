@@ -48,10 +48,9 @@ use crate::{
         VirtAddr,
     },
     net::socket::SocketInode,
-    sched::completion::Completion,
     sched::{
-        cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag, EnqueueFlag, OnRq, SchedMode,
-        WakeupFlags, __schedule,
+        completion::Completion, cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag,
+        EnqueueFlag, OnRq, SchedMode, SchedPolicy, WakeupFlags, __schedule,
     },
     smp::{
         core::smp_get_processor_id,
@@ -737,7 +736,7 @@ impl ProcessControlBlock {
 
         pcb.sched_info()
             .sched_entity()
-            .force_mut()
+            .force_get_mut()
             .set_pcb(Arc::downgrade(&pcb));
         // 设置进程的arc指针到内核栈和系统调用栈的最低地址处
         unsafe {
@@ -1133,7 +1132,7 @@ pub struct ProcessSchedulerInfo {
     // rt_time_slice: AtomicIsize,
     pub sched_stat: RwLock<SchedInfo>,
     /// 调度策略
-    pub sched_policy: RwLock<crate::sched::SchedPolicy>,
+    pub sched_policy: RwLock<SchedPolicy>,
     /// cfs调度实体
     pub sched_entity: Arc<FairSchedEntity>,
     pub on_rq: SpinLock<OnRq>,

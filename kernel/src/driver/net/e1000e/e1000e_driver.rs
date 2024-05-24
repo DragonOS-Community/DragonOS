@@ -18,7 +18,7 @@ use alloc::{
     string::String,
     sync::{Arc, Weak},
 };
-use core::{cell::UnsafeCell, fmt::Debug};
+use core::fmt::Debug;
 use log::info;
 use smoltcp::{
     phy,
@@ -155,7 +155,7 @@ impl E1000EInterface {
         let iface =
             smoltcp::iface::Interface::new(iface_config, &mut driver, Instant::now().into());
 
-        let driver = UnsafeCellWrapper(UnsafeCell::new(driver));
+        let driver = UnsafeCellWrapper::new(driver);
         let result = Arc::new(E1000EInterface {
             driver,
             iface_id,

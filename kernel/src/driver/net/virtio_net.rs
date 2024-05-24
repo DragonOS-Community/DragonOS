@@ -1,6 +1,5 @@
 use core::{
     any::Any,
-    cell::UnsafeCell,
     fmt::Debug,
     ops::{Deref, DerefMut},
 };
@@ -147,7 +146,7 @@ impl VirtioInterface {
         let iface = iface::Interface::new(iface_config, &mut device_inner, Instant::now().into());
 
         let result = Arc::new(VirtioInterface {
-            device_inner: UnsafeCellWrapper(UnsafeCell::new(device_inner)),
+            device_inner: UnsafeCellWrapper::new(device_inner),
             iface_id,
             locked_kobj_state: LockedKObjectState::default(),
             iface: SpinLock::new(iface),

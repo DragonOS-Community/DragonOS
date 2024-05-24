@@ -21,6 +21,7 @@ use alloc::sync::{Arc, Weak};
 
 use super::idle::IdleScheduler;
 use super::pelt::{add_positive, sub_positive, SchedulerAvg, UpdateAvgFlags, PELT_MIN_DIVIDER};
+use super::CpuRunQueueInner;
 use super::{
     CpuRunQueue, DequeueFlag, EnqueueFlag, LoadWeight, OnRq, SchedPolicy, Scheduler, TaskGroup,
     WakeupFlags, SCHED_CAPACITY_SHIFT,
@@ -1438,7 +1439,7 @@ impl CompletelyFairScheduler {
 
 impl Scheduler for CompletelyFairScheduler {
     fn enqueue(
-        rq: &mut CpuRunQueue,
+        rq: &mut CpuRunQueueInner,
         pcb: Arc<crate::process::ProcessControlBlock>,
         mut flags: EnqueueFlag,
     ) {
@@ -1500,7 +1501,7 @@ impl Scheduler for CompletelyFairScheduler {
     }
 
     fn dequeue(
-        rq: &mut CpuRunQueue,
+        rq: &mut CpuRunQueueInner,
         pcb: Arc<crate::process::ProcessControlBlock>,
         mut flags: DequeueFlag,
     ) {
@@ -1572,7 +1573,7 @@ impl Scheduler for CompletelyFairScheduler {
         }
     }
 
-    fn yield_task(rq: &mut CpuRunQueue) {
+    fn yield_task(rq: &mut CpuRunQueueInner) {
         let curr = rq.current();
         let se = curr.sched_info().sched_entity();
         let binding = se.cfs_rq();
@@ -1594,7 +1595,7 @@ impl Scheduler for CompletelyFairScheduler {
     }
 
     fn check_preempt_currnet(
-        rq: &mut CpuRunQueue,
+        rq: &mut CpuRunQueueInner,
         pcb: &Arc<crate::process::ProcessControlBlock>,
         wake_flags: WakeupFlags,
     ) {
@@ -1706,7 +1707,11 @@ impl Scheduler for CompletelyFairScheduler {
         se.map(|se| se.pcb())
     }
 
-    fn tick(_rq: &mut CpuRunQueue, pcb: Arc<crate::process::ProcessControlBlock>, queued: bool) {
+    fn tick(
+        _rq: &mut CpuRunQueueInner,
+        pcb: Arc<crate::process::ProcessControlBlock>,
+        queued: bool,
+    ) {
         let mut se = pcb.sched_info().sched_entity();
 
         FairSchedEntity::for_each_in_group(&mut se, |se| {
@@ -1738,7 +1743,7 @@ impl Scheduler for CompletelyFairScheduler {
     }
 
     fn pick_next_task(
-        rq: &mut CpuRunQueue,
+        rq: &mut CpuRunQueueInner,
         prev: Option<Arc<ProcessControlBlock>>,
     ) -> Option<Arc<ProcessControlBlock>> {
         let mut cfs_rq = rq.cfs_rq();
@@ -1833,7 +1838,7 @@ impl Scheduler for CompletelyFairScheduler {
         }
     }
 
-    fn put_prev_task(_rq: &mut CpuRunQueue, prev: Arc<ProcessControlBlock>) {
+    fn put_prev_task(_rq: &mut CpuRunQueueInner, prev: Arc<ProcessControlBlock>) {
         let mut se = prev.sched_info().sched_entity();
 
         FairSchedEntity::for_each_in_group(&mut se, |se| {

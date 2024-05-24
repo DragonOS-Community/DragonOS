@@ -6,7 +6,7 @@ use crate::process::ProcessControlBlock;
 
 use super::{
     fair::{CfsRunQueueInner, FairSchedEntityInner},
-    CpuRunQueue, LoadWeight, SchedPolicy, SCHED_CAPACITY_SCALE, SCHED_CAPACITY_SHIFT,
+    CpuRunQueueInner, LoadWeight, SchedPolicy, SCHED_CAPACITY_SCALE, SCHED_CAPACITY_SHIFT,
 };
 
 const RUNNABLE_AVG_Y_N_INV: [u32; 32] = [
@@ -195,7 +195,7 @@ impl SchedulerAvg {
     }
 }
 
-impl CpuRunQueue {
+impl CpuRunQueueInner {
     pub fn rq_clock_pelt(&self) -> u64 {
         self.clock_pelt - self.lost_idle_time
     }

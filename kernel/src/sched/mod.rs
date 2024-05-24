@@ -9,6 +9,7 @@ pub mod syscall;
 
 use core::{
     intrinsics::{likely, unlikely},
+    ops::{Deref, DerefMut},
     sync::atomic::{compiler_fence, fence, AtomicUsize, Ordering},
 };
 
@@ -29,6 +30,7 @@ use crate::{
     libs::{
         lazy_init::Lazy,
         spinlock::{SpinLock, SpinLockGuard},
+        unsafecell_wrapper::UnsafeCellWrapper,
     },
     mm::percpu::{PerCpu, PerCpuVar},
     process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, SchedInfo},
@@ -96,17 +98,17 @@ lazy_static! {
 
 pub trait Scheduler {
     /// ## 加入当任务进入可运行状态时调用。它将调度实体（任务）放到红黑树中，增加nr_running变量的值。
-    fn enqueue(rq: &mut CpuRunQueue, pcb: Arc<ProcessControlBlock>, flags: EnqueueFlag);
+    fn enqueue(rq: &mut CpuRunQueueInner, pcb: Arc<ProcessControlBlock>, flags: EnqueueFlag);
 
     /// ## 当任务不再可运行时被调用，对应的调度实体被移出红黑树。它减少nr_running变量的值。
-    fn dequeue(rq: &mut CpuRunQueue, pcb: Arc<ProcessControlBlock>, flags: DequeueFlag);
+    fn dequeue(rq: &mut CpuRunQueueInner, pcb: Arc<ProcessControlBlock>, flags: DequeueFlag);
 
     /// ## 主动让出cpu，这个函数的行为基本上是出队，紧接着入队
-    fn yield_task(rq: &mut CpuRunQueue);
+    fn yield_task(rq: &mut CpuRunQueueInner);
 
     /// ## 检查进入可运行状态的任务能否抢占当前正在运行的任务
     fn check_preempt_currnet(
-        rq: &mut CpuRunQueue,
+        rq: &mut CpuRunQueueInner,
         pcb: &Arc<ProcessControlBlock>,
         flags: WakeupFlags,
     );
@@ -117,17 +119,17 @@ pub trait Scheduler {
 
     /// ## 选择接下来最适合运行的任务
     fn pick_next_task(
-        rq: &mut CpuRunQueue,
+        rq: &mut CpuRunQueueInner,
         pcb: Option<Arc<ProcessControlBlock>>,
     ) -> Option<Arc<ProcessControlBlock>>;
 
     /// ## 被时间滴答函数调用，它可能导致进程切换。驱动了运行时抢占。
-    fn tick(rq: &mut CpuRunQueue, pcb: Arc<ProcessControlBlock>, queued: bool);
+    fn tick(rq: &mut CpuRunQueueInner, pcb: Arc<ProcessControlBlock>, queued: bool);
 
     /// ## 在进程fork时，如需加入cfs，则调用
     fn task_fork(pcb: Arc<ProcessControlBlock>);
 
-    fn put_prev_task(rq: &mut CpuRunQueue, prev: Arc<ProcessControlBlock>);
+    fn put_prev_task(rq: &mut CpuRunQueueInner, prev: Arc<ProcessControlBlock>);
 }
 
 /// 调度策略
@@ -282,10 +284,72 @@ pub trait SchedArch {
     fn initial_setup_sched_local() {}
 }
 
+pub struct CpuRunQueue(UnsafeCellWrapper<CpuRunQueueInner>);
+
+impl Deref for CpuRunQueue {
+    type Target = UnsafeCellWrapper<CpuRunQueueInner>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for CpuRunQueue {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl CpuRunQueue {
+    pub fn new(cpu: usize) -> Self {
+        let inner = CpuRunQueueInner {
+            lock: SpinLock::new(()),
+            lock_on_who: AtomicUsize::new(usize::MAX),
+            cpu,
+            clock_task: 0,
+            clock: 0,
+            prev_irq_time: 0,
+            clock_updata_flags: ClockUpdataFlag::empty(),
+            overload: false,
+            next_balance: 0,
+            nr_running: 0,
+            nr_uninterruptible: 0,
+            cala_load_update: (clock() + (5 * HZ + 1)) as usize,
+            cala_load_active: 0,
+            cfs: Arc::new(CfsRunQueue::new()),
+            clock_pelt: 0,
+            lost_idle_time: 0,
+            clock_idle: 0,
+            cfs_tasks: LinkedList::new(),
+            sched_info: SchedInfo::default(),
+            current: Weak::new(),
+            idle: Weak::new(),
+        };
+
+        Self(UnsafeCellWrapper::new(inner))
+    }
+
+    /// 此函数只能在关中断的情况下使用！！！
+    /// 获取到rq的可变引用，需要注意的是返回的第二个值需要确保其生命周期
+    /// 所以可以说这个函数是unsafe的，需要确保正确性
+    /// 在中断上下文，关中断的情况下，此函数是安全的
+    pub fn self_lock(&self) -> (&mut CpuRunQueueInner, Option<SpinLockGuard<()>>) {
+        if self.lock.is_locked()
+            && smp_get_processor_id().data() as usize == self.lock_on_who.load(Ordering::SeqCst)
+        {
+            // 在本cpu已上锁则可以直接拿
+            (self.force_get_mut(), None)
+        } else {
+            // 否则先上锁再拿
+            let guard = self.lock();
+            (self.force_get_mut(), Some(guard))
+        }
+    }
+}
+
 /// ## PerCpu的运行队列，其中维护了各个调度器对应的rq
 #[allow(dead_code)]
 #[derive(Debug)]
-pub struct CpuRunQueue {
+pub struct CpuRunQueueInner {
     lock: SpinLock<()>,
     lock_on_who: AtomicUsize,
 
@@ -328,56 +392,7 @@ pub struct CpuRunQueue {
     idle: Weak<ProcessControlBlock>,
 }
 
-impl CpuRunQueue {
-    pub fn new(cpu: usize) -> Self {
-        Self {
-            lock: SpinLock::new(()),
-            lock_on_who: AtomicUsize::new(usize::MAX),
-            cpu,
-            clock_task: 0,
-            clock: 0,
-            prev_irq_time: 0,
-            clock_updata_flags: ClockUpdataFlag::empty(),
-            overload: false,
-            next_balance: 0,
-            nr_running: 0,
-            nr_uninterruptible: 0,
-            cala_load_update: (clock() + (5 * HZ + 1)) as usize,
-            cala_load_active: 0,
-            cfs: Arc::new(CfsRunQueue::new()),
-            clock_pelt: 0,
-            lost_idle_time: 0,
-            clock_idle: 0,
-            cfs_tasks: LinkedList::new(),
-            sched_info: SchedInfo::default(),
-            current: Weak::new(),
-            idle: Weak::new(),
-        }
-    }
-
-    /// 此函数只能在关中断的情况下使用！！！
-    /// 获取到rq的可变引用，需要注意的是返回的第二个值需要确保其生命周期
-    /// 所以可以说这个函数是unsafe的，需要确保正确性
-    /// 在中断上下文，关中断的情况下，此函数是安全的
-    pub fn self_lock(&self) -> (&mut Self, Option<SpinLockGuard<()>>) {
-        if self.lock.is_locked()
-            && smp_get_processor_id().data() as usize == self.lock_on_who.load(Ordering::SeqCst)
-        {
-            // 在本cpu已上锁则可以直接拿
-            (
-                unsafe { &mut *(self as *const Self as usize as *mut Self) },
-                None,
-            )
-        } else {
-            // 否则先上锁再拿
-            let guard = self.lock();
-            (
-                unsafe { &mut *(self as *const Self as usize as *mut Self) },
-                Some(guard),
-            )
-        }
-    }
-
+impl CpuRunQueueInner {
     fn lock(&self) -> SpinLockGuard<()> {
         let guard = self.lock.lock_irqsave();
 

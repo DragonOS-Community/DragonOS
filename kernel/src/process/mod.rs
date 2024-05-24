@@ -511,9 +511,9 @@ pub unsafe fn switch_finish_hook() {
 
 int_like!(Pid, AtomicPid, usize, AtomicUsize);
 
-impl ToString for Pid {
-    fn to_string(&self) -> String {
-        self.0.to_string()
+impl core::fmt::Display for Pid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 

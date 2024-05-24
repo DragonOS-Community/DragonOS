@@ -4,7 +4,7 @@ pub struct IdleScheduler;
 
 impl Scheduler for IdleScheduler {
     fn enqueue(
-        _rq: &mut super::CpuRunQueue,
+        _rq: &mut super::CpuRunQueueInner,
         _pcb: alloc::sync::Arc<crate::process::ProcessControlBlock>,
         _flags: super::EnqueueFlag,
     ) {
@@ -12,16 +12,16 @@ impl Scheduler for IdleScheduler {
     }
 
     fn dequeue(
-        _rq: &mut super::CpuRunQueue,
+        _rq: &mut super::CpuRunQueueInner,
         _pcb: alloc::sync::Arc<crate::process::ProcessControlBlock>,
         _flags: super::DequeueFlag,
     ) {
     }
 
-    fn yield_task(_rq: &mut super::CpuRunQueue) {}
+    fn yield_task(_rq: &mut super::CpuRunQueueInner) {}
 
     fn check_preempt_currnet(
-        rq: &mut super::CpuRunQueue,
+        rq: &mut super::CpuRunQueueInner,
         _pcb: &alloc::sync::Arc<crate::process::ProcessControlBlock>,
         _flags: super::WakeupFlags,
     ) {
@@ -38,7 +38,7 @@ impl Scheduler for IdleScheduler {
     ///
     /// 主要做一些统计工作
     fn pick_next_task(
-        _rq: &mut super::CpuRunQueue,
+        _rq: &mut super::CpuRunQueueInner,
         _pcb: Option<alloc::sync::Arc<crate::process::ProcessControlBlock>>,
     ) -> Option<alloc::sync::Arc<crate::process::ProcessControlBlock>> {
         // TODO: Fixme
@@ -47,7 +47,7 @@ impl Scheduler for IdleScheduler {
     }
 
     fn tick(
-        _rq: &mut super::CpuRunQueue,
+        _rq: &mut super::CpuRunQueueInner,
         _pcb: alloc::sync::Arc<crate::process::ProcessControlBlock>,
         _queued: bool,
     ) {
@@ -59,7 +59,7 @@ impl Scheduler for IdleScheduler {
     }
 
     fn put_prev_task(
-        _rq: &mut super::CpuRunQueue,
+        _rq: &mut super::CpuRunQueueInner,
         _prev: alloc::sync::Arc<crate::process::ProcessControlBlock>,
     ) {
         // Nothing todo

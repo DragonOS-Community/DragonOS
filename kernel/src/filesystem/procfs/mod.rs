@@ -195,7 +195,7 @@ impl ProcFSInode {
         );
 
         // fdsize
-        pdata.append(&mut format!("\nFDSize:\t{}", pcb.fd_open_count()).into());
+        pdata.append(&mut format!("\nFDSize:\t{}", pcb.fd_table().read().fd_open_count()).into());
 
         // kthread
         pdata.append(&mut format!("\nKthread:\t{}", pcb.kthread()).into());

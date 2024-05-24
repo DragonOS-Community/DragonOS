@@ -674,15 +674,6 @@ impl ProcessControlBlock {
 
     /// # 函数的功能
     ///
-    /// 返回此进程 `打开的文件描述符` 的数量
-    pub fn fd_open_count(&self) -> usize {
-        let fd_table = self.fd_table();
-        let size = fd_table.read().fd_open_count();
-        return size;
-    }
-
-    /// # 函数的功能
-    ///
     /// 返回此函数是否是内核进程
     ///
     /// # 返回值

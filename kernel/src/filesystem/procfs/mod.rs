@@ -198,7 +198,7 @@ impl ProcFSInode {
         pdata.append(&mut format!("\nFDSize:\t{}", pcb.fd_table().read().fd_open_count()).into());
 
         // kthread
-        pdata.append(&mut format!("\nKthread:\t{}", pcb.kthread()).into());
+        pdata.append(&mut format!("\nKthread:\t{}", pcb.kthread() as usize).into());
 
         pdata.append(&mut format!("\ncpu_id:\t{}", cpu_id).as_bytes().to_owned());
         pdata.append(&mut format!("\npriority:\t{:?}", priority).as_bytes().to_owned());

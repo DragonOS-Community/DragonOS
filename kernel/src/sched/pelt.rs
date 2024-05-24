@@ -5,7 +5,7 @@ use alloc::sync::Arc;
 use crate::process::ProcessControlBlock;
 
 use super::{
-    fair::{CfsRunQueue, FairSchedEntityInner},
+    fair::{CfsRunQueueInner, FairSchedEntityInner},
     CpuRunQueue, LoadWeight, SchedPolicy, SCHED_CAPACITY_SCALE, SCHED_CAPACITY_SHIFT,
 };
 
@@ -201,7 +201,7 @@ impl CpuRunQueue {
     }
 }
 
-impl CfsRunQueue {
+impl CfsRunQueueInner {
     pub fn cfs_rq_clock_pelt(&self) -> u64 {
         if unlikely(self.throttled_count > 0) {
             return self.throttled_clock_pelt - self.throttled_clock_pelt_time;
@@ -215,7 +215,7 @@ impl CfsRunQueue {
 }
 
 impl FairSchedEntityInner {
-    pub fn update_load_avg(&mut self, cfs_rq: &mut CfsRunQueue, now: u64) -> bool {
+    pub fn update_load_avg(&mut self, cfs_rq: &mut CfsRunQueueInner, now: u64) -> bool {
         if self.avg.update_load_sum(
             now,
             self.on_rq as u32,

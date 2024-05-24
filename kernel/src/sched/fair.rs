@@ -233,7 +233,7 @@ impl FairSchedEntityInner {
 
         FairSchedEntity::for_each_in_group(&mut se, |se| {
             let binding = se.cfs_rq();
-            let cfs_rq = binding.force_mut();
+            let cfs_rq = binding.force_get_mut();
 
             if let Some(next) = cfs_rq.next.upgrade() {
                 if !Arc::ptr_eq(&next, &se) {
@@ -262,7 +262,7 @@ impl FairSchedEntityInner {
         if unlikely(self.load.weight != shares) {
             // TODO: reweight
             self.cfs_rq()
-                .force_mut()
+                .force_get_mut()
                 .reweight_entity(self.self_arc(), shares);
         }
     }
@@ -282,7 +282,7 @@ impl FairSchedEntityInner {
         }
 
         let binding = self.my_cfs_rq.clone().unwrap();
-        let gcfs_rq = binding.force_mut();
+        let gcfs_rq = binding.force_get_mut();
 
         if gcfs_rq.propagate == 0 {
             return false;
@@ -291,7 +291,7 @@ impl FairSchedEntityInner {
         gcfs_rq.propagate = 0;
 
         let binding = self.cfs_rq();
-        let cfs_rq = binding.force_mut();
+        let cfs_rq = binding.force_get_mut();
 
         cfs_rq.add_task_group_propagate(gcfs_rq.prop_runnable_sum);
 
@@ -319,10 +319,64 @@ impl FairSchedEntityInner {
     }
 }
 
+#[derive(Debug)]
+pub struct CfsRunQueue(UnsafeCellWrapper<CfsRunQueueInner>);
+
+impl Deref for CfsRunQueue {
+    type Target = UnsafeCellWrapper<CfsRunQueueInner>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for CfsRunQueue {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl CfsRunQueue {
+    pub fn new() -> Self {
+        let inner = CfsRunQueueInner {
+            load: LoadWeight::default(),
+            nr_running: 0,
+            h_nr_running: 0,
+            exec_clock: 0,
+            min_vruntime: 1 << 20,
+            entities: RBTree::new(),
+            idle: 0,
+            idle_nr_running: 0,
+            idle_h_nr_running: 0,
+            current: Weak::new(),
+            next: Weak::new(),
+            last: Weak::new(),
+            skip: Weak::new(),
+            avg_load: 0,
+            avg_vruntime: 0,
+            last_update_time_copy: 0,
+            avg: SchedulerAvg::default(),
+            rq: Weak::new(),
+            task_group: Weak::new(),
+            throttled_clock: 0,
+            throttled_clock_pelt: 0,
+            throttled_clock_pelt_time: 0,
+            throttled_pelt_idle: 0,
+            throttled: false,
+            throttled_count: 0,
+            removed: SpinLock::new(CfsRemoved::default()),
+            propagate: 0,
+            prop_runnable_sum: 0,
+            runtime_remaining: 0,
+        };
+
+        Self(UnsafeCellWrapper::new(inner))
+    }
+}
+
 /// CFS的运行队列，这个队列需确保是percpu的
 #[allow(dead_code)]
 #[derive(Debug)]
-pub struct CfsRunQueue {
+pub struct CfsRunQueueInner {
     load: LoadWeight,
 
     /// 全局运行的调度实体计数器，用于负载均衡
@@ -388,41 +442,7 @@ pub struct CfsRemoved {
     pub runnable_avg: usize,
 }
 
-impl CfsRunQueue {
-    pub fn new() -> Self {
-        Self {
-            load: LoadWeight::default(),
-            nr_running: 0,
-            h_nr_running: 0,
-            exec_clock: 0,
-            min_vruntime: 1 << 20,
-            entities: RBTree::new(),
-            idle: 0,
-            idle_nr_running: 0,
-            idle_h_nr_running: 0,
-            current: Weak::new(),
-            next: Weak::new(),
-            last: Weak::new(),
-            skip: Weak::new(),
-            avg_load: 0,
-            avg_vruntime: 0,
-            last_update_time_copy: 0,
-            avg: SchedulerAvg::default(),
-            rq: Weak::new(),
-            task_group: Weak::new(),
-            throttled_clock: 0,
-            throttled_clock_pelt: 0,
-            throttled_clock_pelt_time: 0,
-            throttled_pelt_idle: 0,
-            throttled: false,
-            throttled_count: 0,
-            removed: SpinLock::new(CfsRemoved::default()),
-            propagate: 0,
-            prop_runnable_sum: 0,
-            runtime_remaining: 0,
-        }
-    }
-
+impl CfsRunQueueInner {
     #[inline]
     pub fn rq(&self) -> Arc<CpuRunQueue> {
         self.rq.upgrade().unwrap()
@@ -431,12 +451,6 @@ impl CfsRunQueue {
     #[inline]
     pub fn set_rq(&mut self, rq: Weak<CpuRunQueue>) {
         self.rq = rq;
-    }
-
-    #[inline]
-    #[allow(clippy::mut_from_ref)]
-    pub fn force_mut(&self) -> &mut Self {
-        unsafe { &mut *(self as *const Self as usize as *mut Self) }
     }
 
     #[inline]
@@ -506,11 +520,14 @@ impl CfsRunQueue {
         // 比如有任务组 A ，有进程B，B属于A任务组，那么B的时间分配依赖于A组的权重以及B进程自己的权重
         FairSchedEntity::for_each_in_group(&mut entity, |se| {
             if unlikely(!se.on_rq()) {
-                se.cfs_rq().force_mut().load.update_load_add(se.load.weight);
+                se.cfs_rq()
+                    .force_get_mut()
+                    .load
+                    .update_load_add(se.load.weight);
             }
             slice = se
                 .cfs_rq()
-                .force_mut()
+                .force_get_mut()
                 .load
                 .calculate_delta(slice, se.load.weight);
 
@@ -1254,7 +1271,7 @@ impl CfsRunQueue {
             .max((self.avg.load_avg * PELT_MIN_DIVIDER) as u64)
     }
 
-    pub fn update_task_group_util(&mut self, se: Arc<FairSchedEntity>, gcfs_rq: &CfsRunQueue) {
+    pub fn update_task_group_util(&mut self, se: Arc<FairSchedEntity>, gcfs_rq: &CfsRunQueueInner) {
         let mut delta_sum = gcfs_rq.avg.load_avg as isize - se.avg.load_avg as isize;
         let delta_avg = delta_sum;
 
@@ -1280,7 +1297,11 @@ impl CfsRunQueue {
             .max((self.avg.util_avg * PELT_MIN_DIVIDER) as u64);
     }
 
-    pub fn update_task_group_runnable(&mut self, se: Arc<FairSchedEntity>, gcfs_rq: &CfsRunQueue) {
+    pub fn update_task_group_runnable(
+        &mut self,
+        se: Arc<FairSchedEntity>,
+        gcfs_rq: &CfsRunQueueInner,
+    ) {
         let mut delta_sum = gcfs_rq.avg.runnable_avg as isize - se.avg.runnable_avg as isize;
         let delta_avg = delta_sum;
 
@@ -1306,7 +1327,11 @@ impl CfsRunQueue {
             .max((self.avg.runnable_avg * PELT_MIN_DIVIDER) as u64);
     }
 
-    pub fn update_task_group_load(&mut self, se: Arc<FairSchedEntity>, gcfs_rq: &mut CfsRunQueue) {
+    pub fn update_task_group_load(
+        &mut self,
+        se: Arc<FairSchedEntity>,
+        gcfs_rq: &mut CfsRunQueueInner,
+    ) {
         let mut runnable_sum = gcfs_rq.prop_runnable_sum;
 
         let mut load_sum = 0;
@@ -1425,7 +1450,7 @@ impl Scheduler for CompletelyFairScheduler {
             }
 
             let binding = se.cfs_rq();
-            let cfs_rq = binding.force_mut();
+            let cfs_rq = binding.force_get_mut();
             cfs_rq.enqueue_entity(&se, flags);
 
             cfs_rq.h_nr_running += 1;
@@ -1449,7 +1474,7 @@ impl Scheduler for CompletelyFairScheduler {
         if let Some(mut se) = se {
             FairSchedEntity::for_each_in_group(&mut se, |se| {
                 let binding = se.cfs_rq();
-                let cfs_rq = binding.force_mut();
+                let cfs_rq = binding.force_get_mut();
 
                 cfs_rq.update_load_avg(&se, UpdateAvgFlags::UPDATE_TG);
 
@@ -1486,7 +1511,7 @@ impl Scheduler for CompletelyFairScheduler {
 
         let (should_continue, se) = FairSchedEntity::for_each_in_group(&mut se, |se| {
             let binding = se.cfs_rq();
-            let cfs_rq = binding.force_mut();
+            let cfs_rq = binding.force_get_mut();
             cfs_rq.dequeue_entity(&se, flags);
 
             cfs_rq.h_nr_running -= 1;
@@ -1518,7 +1543,7 @@ impl Scheduler for CompletelyFairScheduler {
         if let Some(mut se) = se {
             FairSchedEntity::for_each_in_group(&mut se, |se| {
                 let binding = se.cfs_rq();
-                let cfs_rq = binding.force_mut();
+                let cfs_rq = binding.force_get_mut();
 
                 cfs_rq.update_load_avg(&se, UpdateAvgFlags::UPDATE_TG);
 
@@ -1551,7 +1576,7 @@ impl Scheduler for CompletelyFairScheduler {
         let curr = rq.current();
         let se = curr.sched_info().sched_entity();
         let binding = se.cfs_rq();
-        let cfs_rq = binding.force_mut();
+        let cfs_rq = binding.force_get_mut();
 
         if unlikely(rq.nr_running == 1) {
             return;
@@ -1595,7 +1620,7 @@ impl Scheduler for CompletelyFairScheduler {
                     return (false, true);
                 }
 
-                se.cfs_rq().force_mut().next = Arc::downgrade(&se);
+                se.cfs_rq().force_get_mut().next = Arc::downgrade(&se);
 
                 return (true, true);
             });
@@ -1636,7 +1661,7 @@ impl Scheduler for CompletelyFairScheduler {
         }
 
         let cfs_rq = se.cfs_rq();
-        cfs_rq.force_mut().update_current();
+        cfs_rq.force_get_mut().update_current();
 
         if let Some((_, pick_se)) = cfs_rq.entities.get_first() {
             if Arc::ptr_eq(pick_se, &pse) {
@@ -1655,7 +1680,7 @@ impl Scheduler for CompletelyFairScheduler {
         let mut se;
         loop {
             let cfs = cfs_rq.clone().unwrap();
-            let cfs = cfs.force_mut();
+            let cfs = cfs.force_get_mut();
             let curr = cfs.current();
             if let Some(curr) = curr {
                 if curr.on_rq() {
@@ -1687,7 +1712,7 @@ impl Scheduler for CompletelyFairScheduler {
         FairSchedEntity::for_each_in_group(&mut se, |se| {
             let binding = se.clone();
             let binding = binding.cfs_rq();
-            let cfs_rq = binding.force_mut();
+            let cfs_rq = binding.force_get_mut();
 
             cfs_rq.entity_tick(se, queued);
             (true, true)
@@ -1703,7 +1728,7 @@ impl Scheduler for CompletelyFairScheduler {
         rq.update_rq_clock();
 
         let binding = se.cfs_rq();
-        let cfs_rq = binding.force_mut();
+        let cfs_rq = binding.force_get_mut();
 
         if cfs_rq.current().is_some() {
             cfs_rq.update_current();
@@ -1739,7 +1764,7 @@ impl Scheduler for CompletelyFairScheduler {
                     None => return None,
                 }
 
-                cfs_rq.force_mut().set_next_entity(&se);
+                cfs_rq.force_get_mut().set_next_entity(&se);
 
                 match &se.my_cfs_rq {
                     Some(q) => cfs_rq = q.clone(),
@@ -1758,9 +1783,9 @@ impl Scheduler for CompletelyFairScheduler {
                 let curr = cfs_rq.current();
                 if let Some(current) = curr {
                     if current.on_rq() {
-                        cfs_rq.force_mut().update_current()
+                        cfs_rq.force_get_mut().update_current()
                     } else {
-                        cfs_rq.force_mut().set_current(Weak::default());
+                        cfs_rq.force_get_mut().set_current(Weak::default());
                     }
                 }
 
@@ -1788,18 +1813,18 @@ impl Scheduler for CompletelyFairScheduler {
                     let pse_depth = pse.depth;
 
                     if se_depth <= pse_depth {
-                        pse.cfs_rq().force_mut().put_prev_entity(pse.clone());
+                        pse.cfs_rq().force_get_mut().put_prev_entity(pse.clone());
                         pse = pse.parent().unwrap();
                     }
 
                     if se_depth >= pse_depth {
-                        se.cfs_rq().force_mut().set_next_entity(&se);
+                        se.cfs_rq().force_get_mut().set_next_entity(&se);
                         se = se.parent().unwrap();
                     }
                 }
 
-                cfs_rq.force_mut().put_prev_entity(pse);
-                cfs_rq.force_mut().set_next_entity(&se);
+                cfs_rq.force_get_mut().put_prev_entity(pse);
+                cfs_rq.force_get_mut().set_next_entity(&se);
             }
 
             return Some(p);
@@ -1813,7 +1838,7 @@ impl Scheduler for CompletelyFairScheduler {
 
         FairSchedEntity::for_each_in_group(&mut se, |se| {
             let cfs = se.cfs_rq();
-            cfs.force_mut().put_prev_entity(se);
+            cfs.force_get_mut().put_prev_entity(se);
 
             return (true, true);
         });

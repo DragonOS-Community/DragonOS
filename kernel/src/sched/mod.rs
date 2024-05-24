@@ -979,7 +979,7 @@ pub fn sched_init() {
         let mut cpu_runqueue = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
         for cpu in 0..PerCpu::MAX_CPU_NUM as usize {
             let rq = Arc::new(CpuRunQueue::new(cpu));
-            rq.cfs.force_mut().set_rq(Arc::downgrade(&rq));
+            rq.cfs.force_get_mut().set_rq(Arc::downgrade(&rq));
             cpu_runqueue.push(rq);
         }
 

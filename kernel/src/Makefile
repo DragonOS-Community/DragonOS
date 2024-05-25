@@ -40,7 +40,7 @@ kernel_subdirs := common driver debug syscall libs
 
 
 kernel_rust:
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-04-25 $(CARGO_ZBUILD) build --release --target $(TARGET_JSON)
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-05-14 $(CARGO_ZBUILD) build --release --target $(TARGET_JSON)
 
 
 all: kernel

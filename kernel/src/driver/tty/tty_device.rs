@@ -34,7 +34,7 @@ use crate::{
         spinlock::SpinLockGuard,
     },
     mm::VirtAddr,
-    net::event_poll::{EPollItem, EventPoll, KernelIoctlData},
+    net::event_poll::{EPollItem, KernelIoctlData},
     process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
@@ -354,11 +354,6 @@ impl IndexNode for TtyDevice {
                 if cmd != TtyIoctlCmd::TIOCCBRK {
                     todo!()
                 }
-            }
-            EventPoll::ADD_EPOLLITEM => {
-                self.kernel_ioctl(unsafe { &*(arg as *const Arc<EPollItem>) }.clone(), data)?;
-
-                return Ok(0);
             }
             _ => {}
         }

@@ -12,7 +12,7 @@ use crate::{
             page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage, PhysPageFrame},
         },
         kernel_mapper::KernelMapper,
-        page::{PageEntry, EntryFlags, PAGE_1G_SHIFT},
+        page::{EntryFlags, PageEntry, PAGE_1G_SHIFT},
         ucontext::UserMapper,
         MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
     },

@@ -13,7 +13,7 @@ use crate::{
         base::{block::SeekFrom, device::DevicePrivateData},
         tty::tty_device::TtyFilePrivateData,
     },
-    filesystem::{fat::fs::LockedFATInode, procfs::ProcfsFilePrivateData},
+    filesystem::procfs::ProcfsFilePrivateData,
     ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
     kerror,
     libs::{rwlock::RwLock, spinlock::SpinLock},
@@ -25,7 +25,7 @@ use crate::{
     process::ProcessManager,
 };
 
-use super::{mount::MountFSInode, Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
+use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
@@ -121,6 +121,7 @@ impl FileMode {
     }
 }
 
+#[allow(dead_code)]
 pub struct PageCache {
     inode_ref: Weak<dyn IndexNode>,
     map: HashMap<usize, Arc<Page>>,
@@ -134,12 +135,12 @@ impl PageCache {
         }
     }
 
-    pub fn set_page(&mut self, offset: usize, page: Arc<Page>) {
+    pub fn add_page(&mut self, offset: usize, page: Arc<Page>) {
         self.map.insert(offset, page);
     }
 
     pub fn get_page(&self, offset: usize) -> Option<Arc<Page>> {
-        self.map.get(&offset).map(|page| page.clone())
+        self.map.get(&offset).cloned()
     }
 
     // pub fn get_pages(&self, start_pgoff: usize, end_pgoff: usize) -> Vec<Arc<Page>> {
@@ -156,16 +157,6 @@ impl PageCache {
 pub trait PageCacheOperations: IndexNode {
     fn write_page(&self, page: Page);
     fn read_ahead(&self);
-}
-
-impl PageCacheOperations for LockedFATInode {
-    fn write_page(&self, page: Page) {
-        todo!()
-    }
-
-    fn read_ahead(&self) {
-        todo!()
-    }
 }
 
 /// @brief 抽象文件结构体

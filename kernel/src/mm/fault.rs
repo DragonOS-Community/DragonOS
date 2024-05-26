@@ -1,6 +1,6 @@
 use core::{alloc::Layout, cmp::min, intrinsics::unlikely, panic};
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
     arch::{mm::PageMapper, MMArch},
@@ -15,7 +15,8 @@ use crate::{
 use crate::mm::MemoryManagementArch;
 
 use super::{
-    page::{self, PageFlags},
+    allocator::page_frame::{FrameAllocator, PhysPageFrame},
+    page::{Page, PageFlags},
     phys_2_virt,
 };
 
@@ -309,19 +310,20 @@ impl PageFaultHandler {
     /// - VmFaultReason: 页面错误处理信息标志
     #[allow(dead_code, unused_variables)]
     pub unsafe fn do_read_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
-        panic!(
-            "do_read_fault has not yet been implemented, 
-        fault message: {:?}, 
-        pid: {}\n",
-            pfm,
-            crate::process::ProcessManager::current_pid().data()
-        );
+        // panic!(
+        //     "do_read_fault has not yet been implemented,
+        // fault message: {:?},
+        // pid: {}\n",
+        //     pfm,
+        //     crate::process::ProcessManager::current_pid().data()
+        // );
 
         // TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#do_read_fault
-        let mut ret = VmFaultReason::empty();
-        ret = Self::do_fault_around(pfm, mapper);
-        ret = Self::filemap_fault(pfm, mapper);
-        return ret;
+        let ret = Self::do_fault_around(pfm.clone(), mapper);
+        if !ret.is_empty() {
+            return ret;
+        }
+        return Self::filemap_fault(pfm.clone(), mapper);
     }
 
     /// 处理对共享文件映射区写入引起的缺页
@@ -433,20 +435,24 @@ impl PageFaultHandler {
     }
 
     pub unsafe fn do_fault_around(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
-        mapper
-            .allocate_table(*pfm.address(), 0)
-            .expect("failed to allocate pte table");
+        if mapper.get_table(*pfm.address(), 0).is_none() {
+            mapper
+                .allocate_table(*pfm.address(), 0)
+                .expect("failed to allocate pte table");
+        }
         let vma = pfm.vma();
         let vma_guard = vma.lock();
         let vma_region = vma_guard.region();
         // 缺页在VMA中的偏移量
         let vm_pgoff = (*pfm.address() - vma_region.start()) >> MMArch::PAGE_SHIFT;
+
         // 缺页在PTE中的偏移量
-        let pte_pgoff = (pfm.address().data() >> MMArch::PAGE_SHIFT) & (1 << MMArch::PAGE_SIZE);
+        let pte_pgoff =
+            (pfm.address().data() >> MMArch::PAGE_SHIFT) & (1 << MMArch::PAGE_ENTRY_SHIFT);
 
         let vma_pages_count = (vma_region.end() - vma_region.start()) >> MMArch::PAGE_SHIFT;
 
-        // 开始位置不能超出当前pte和vma头部的最小值
+        // 开始位置不能超出当前pte和vma头部
         let from_pte = pte_pgoff - min(vm_pgoff, pte_pgoff);
 
         let fault_around_page_number = 16;
@@ -464,11 +470,11 @@ impl PageFaultHandler {
         );
 
         // 预先分配pte页表（如果不存在）
-        if mapper.get_table(*pfm.address(), 0).is_none() {
-            if mapper.allocate_table(*pfm.address(), 0).is_none() {
-                return VmFaultReason::VM_FAULT_OOM;
-            }
-        };
+        if mapper.get_table(*pfm.address(), 0).is_none()
+            && mapper.allocate_table(*pfm.address(), 0).is_none()
+        {
+            return VmFaultReason::VM_FAULT_OOM;
+        }
 
         // from_pte - pte_pgoff得出预读起始pte相对缺失页的偏移，加上pfm.file_pgoff（缺失页在文件中的偏移）得出起始页在文件中的偏移，结束pte同理
         Self::filemap_map_pages(
@@ -515,7 +521,7 @@ impl PageFaultHandler {
                     let frame = virt as *mut u8;
                     let new_frame =
                         phys_2_virt(mapper.translate(address).unwrap().0.data()) as *mut u8;
-                    frame.copy_from_nonoverlapping(new_frame, MMArch::PAGE_SIZE);
+                    new_frame.copy_from_nonoverlapping(frame, MMArch::PAGE_SIZE);
                 }
             }
         }
@@ -526,22 +532,44 @@ impl PageFaultHandler {
         let vma = pfm.vma();
         let vma_guard = vma.lock();
         let file = vma_guard.vm_file().expect("no vm_file in vma");
-        let page_cache = file.inode().page_cache().unwrap();
+        let mut page_cache = file.inode().page_cache().unwrap();
 
         if let Some(page) = page_cache.get_page(pfm.file_pgoff) {
             // TODO 异步从磁盘中预读页面进PageCache
             let address = vma_guard.region().start
-                + (pfm.file_pgoff
+                + ((pfm.file_pgoff
                     - vma_guard
                         .file_page_offset()
-                        .expect("file_page_offset is none")
+                        .expect("file_page_offset is none"))
                     << MMArch::PAGE_SHIFT);
             mapper.map(address, vma_guard.flags()).unwrap().flush();
             let frame = phys_2_virt(page.phys_frame().phys_address().data()) as *mut u8;
             let new_frame = phys_2_virt(mapper.translate(address).unwrap().0.data()) as *mut u8;
-            frame.copy_from_nonoverlapping(new_frame, MMArch::PAGE_SIZE);
+            new_frame.copy_from_nonoverlapping(frame, MMArch::PAGE_SIZE);
         } else {
             // TODO 同步预读
+            let mut buf: Vec<u8> = vec![0; MMArch::PAGE_SIZE];
+            file.pread(
+                pfm.file_pgoff * MMArch::PAGE_SIZE,
+                MMArch::PAGE_SIZE,
+                &mut buf[..],
+            )
+            .unwrap();
+            let allocator = mapper.allocator_mut();
+
+            // 分配一个物理页面作为加入PageCache的新页
+            let new_cache_page = allocator.allocate_one().unwrap();
+            (phys_2_virt(new_cache_page.data()) as *mut u8)
+                .copy_from_nonoverlapping(buf.as_mut_ptr(), MMArch::PAGE_SIZE);
+            page_cache.add_page(
+                pfm.file_pgoff,
+                Arc::new(Page::new(false, PhysPageFrame::new(new_cache_page))),
+            );
+
+            // 分配空白页并映射到缺页地址
+            mapper.map(pfm.address, vma_guard.flags()).unwrap().flush();
+            let new_frame = phys_2_virt(mapper.translate(pfm.address).unwrap().0.data());
+            (new_frame as *mut u8).copy_from_nonoverlapping(buf.as_mut_ptr(), MMArch::PAGE_SIZE);
         }
         VmFaultReason::VM_FAULT_COMPLETED
     }

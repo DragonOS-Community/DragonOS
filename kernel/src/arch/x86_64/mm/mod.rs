@@ -27,7 +27,7 @@ use crate::{
 };
 
 use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::{PageEntry, EntryFlags, PAGE_1G_SHIFT};
+use crate::mm::page::{EntryFlags, PageEntry, PAGE_1G_SHIFT};
 use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr};
 use crate::{kdebug, kinfo, kwarn};
 use system_error::SystemError;

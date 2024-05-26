@@ -495,6 +495,12 @@ pub struct EntryFlags<Arch> {
     phantom: PhantomData<Arch>,
 }
 
+impl<Arch: MemoryManagementArch> Default for EntryFlags<Arch> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[allow(dead_code)]
 impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
     #[inline(always)]

@@ -7,7 +7,9 @@
 //     obj_size: std::mem::size_of::<netlink_sock>(),
 // };
 
-// SPDX-License-Identifier: GPL-2.0
+macro_rules! container_of {
+    ($ptr:expr, $type:ty, $($f:tt)*) => { ... };
+}
 
 use core::{cell::RefCell, fmt::Debug, hash::Hash, ops::Deref};
 
@@ -515,9 +517,65 @@ fn do_one_broadcast(sk: &sock, info: &NetlinkBroadcastData) {
     let mut sk = sk;
     let mut info = info;
     let ret: i32;
+    let nlk:NetlinkSock = NetlinkSock::from_sk(sk);
     if info.exclude_sk == sk {
         return;
     }
+    if nlk.portid == info.portid || info.group - 1 >= nlk.ngroups || !nlk.groups.contains(&(info.group - 1)) {
+        return;
+    }
+    // if !net_eq(sock_net(sk), info.net) {
+    //     if !(nlk.flags & NetlinkFlags::LISTEN_ALL_NSID.bits()) {
+    //         return;
+    //     }
+    //     if !peernet_has_id(sock_net(sk), info.net) {
+    //         return;
+    //     }
+    //     if !file_ns_capable(sk.sk_socket.file, info.net.user_ns, CAP_NET_BROADCAST) {
+    //         return;
+    //     }
+    // }
+    if info.failure != 0 {
+        netlink_overrun(sk);
+        return;
+    }
+    sock_hold(sk);
+    if info.skb_2.borrow().is_empty() {
+        if skb_shared(info.skb) {
+            info.copy_skb_to_skb_2();
+        } else {
+            info.skb_2 = info.skb.clone();
+            skb_orphan(info.skb_2);
+        }
+    }
+    if info.skb_2.borrow().is_empty() {
+        netlink_overrun(sk);
+        info.failure = 1;
+        if nlk.flags & NetlinkFlags::BROADCAST_SEND_ERROR.bits() {
+            info.delivery_failure = 1;
+        }
+        return;
+    }
+    if sk_filter(sk, info.skb_2) {
+        info.skb_2 = info.skb.clone();
+        return;
+    }
+    NETLINK_CB(info.skb_2).nsid = peernet2id(sock_net(sk), info.net);
+    if NETLINK_CB(info.skb_2).nsid != NETNSA_NSID_NOT_ASSIGNED {
+        NETLINK_CB(info.skb_2).nsid_is_set = true;
+    }
+    ret = netlink_broadcast_deliver(sk, info.skb_2);
+    if ret < 0 {
+        netlink_overrun(sk);
+        if nlk.flags & NetlinkFlags::BROADCAST_SEND_ERROR.bits() {
+            info.delivery_failure = 1;
+        }
+    } else {
+        info.congested |= ret;
+        info.delivered = 1;
+        info.skb_2 = info.skb.clone();
+    }
+    sock_put(sk);
 }
 pub fn netlink_broadcast<'a>(
     ssk: &'a sock,
@@ -562,4 +620,27 @@ pub fn netlink_broadcast<'a>(
         return Ok(());
     }
     return Err(SystemError::ESRCH);
+}
+
+fn netlink_overrun(sk: &sock) {
+    // Implementation of the function
+}
+
+fn skb_shared(skb: Arc<RefCell<SkBuff>>) -> bool {
+    // Implementation of the function
+    false
+}
+
+fn skb_orphan(skb: Arc<RefCell<SkBuff>>) {
+    // Implementation of the function
+}
+
+fn skb_clone(skb: Arc<RefCell<SkBuff>>, allocation: u32) -> Arc<RefCell<SkBuff>> {
+    // Implementation of the function
+    Arc::new(RefCell::new(SkBuff::new()))
+}
+
+fn skb_get(skb: Arc<RefCell<SkBuff>>) -> Arc<RefCell<SkBuff>> {
+    // Implementation of the function
+    Arc::new(RefCell::new(SkBuff::new()))
 }

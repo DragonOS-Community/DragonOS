@@ -465,7 +465,7 @@ pub fn kobject_uevent_net_broadcast(
     // if !net.is_none() {
     //     ret = uevent_net_broadcast_tagged(net.unwrap().sk, env, action_string, devpath);
     // } else {
-    //     ret = uevent_net_broadcast_untagged(env, action_string, devpath);
+        ret = uevent_net_broadcast_untagged(env, action_string, devpath);
     // }
     ret
 }
@@ -490,8 +490,8 @@ pub fn alloc_uevent_skb<'a>(
 }
 pub fn uevent_net_broadcast_untagged(
     env: &KobjUeventEnv,
-    action_string: &String,
-    devpath: &String,
+    action_string: &str,
+    devpath: &str,
 ) -> i32 {
     let mut retval = 0;
     let skb = Arc::new(RefCell::new(SkBuff::new()));
@@ -517,7 +517,6 @@ pub fn uevent_net_broadcast_untagged(
             }
         }
 
-        // GFP_KERNEL暂且保留但是搁置
         retval = match netlink_broadcast(uevent_sock, get_packet_buffer(skb.clone()), 0, 1, 1) {
             Ok(_) => 0,
             Err(err) => err.to_posix_errno(),

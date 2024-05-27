@@ -679,7 +679,7 @@ impl ProcessControlBlock {
     /// # 返回值
     ///
     /// 若进程是内核进程则返回true 否则返回false
-    pub fn kthread(&self) -> bool {
+    pub fn is_kthread(&self) -> bool {
         return matches!(self.flags(), &mut ProcessFlags::KTHREAD);
     }
 
@@ -692,7 +692,6 @@ impl ProcessControlBlock {
             let cwd = ProcessManager::current_pcb().basic().cwd();
             (Self::generate_pid(), ppid, cwd)
         };
-        let ngid = Pid(0);
 
         let basic_info = ProcessBasicInfo::new(Pid(0), ppid, name, cwd, None);
         let preempt_count = AtomicUsize::new(0);

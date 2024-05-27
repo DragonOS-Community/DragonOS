@@ -58,6 +58,8 @@ impl Clocksource for ClocksourceJiffies {
         d.set_rating(_data.rating);
         d.set_shift(_data.shift);
         d.watchdog_last = _data.watchdog_last;
+        d.cs_last = _data.cs_last;
+        d.cycle_last = _data.cycle_last;
         return Ok(());
     }
 
@@ -76,8 +78,10 @@ impl ClocksourceJiffies {
             max_idle_ns: Default::default(),
             flags: ClocksourceFlags::new(0),
             watchdog_last: CycleNum::new(0),
+            cs_last: CycleNum::new(0),
             uncertainty_margin: 0,
             maxadj: 0,
+            cycle_last: CycleNum::new(0),
         };
         let jiffies = Arc::new(ClocksourceJiffies(SpinLock::new(InnerJiffies {
             data,

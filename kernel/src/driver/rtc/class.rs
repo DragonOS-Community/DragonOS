@@ -107,4 +107,5 @@ fn rtc_hctosys(dev: &Arc<RtcGeneralDevice>) {
         time.time_string(),
         timespec64.tv_sec
     );
+    // loop {}
 }

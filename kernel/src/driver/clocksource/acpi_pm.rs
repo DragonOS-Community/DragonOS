@@ -88,8 +88,10 @@ impl Acpipm {
             max_idle_ns: Default::default(),
             flags: ClocksourceFlags::CLOCK_SOURCE_IS_CONTINUOUS,
             watchdog_last: CycleNum::new(0),
+            cs_last: CycleNum::new(0),
             uncertainty_margin: 0,
             maxadj: 0,
+            cycle_last: CycleNum::new(0),
         };
         let acpi_pm = Arc::new(Acpipm(SpinLock::new(InnerAcpipm {
             data,
@@ -125,6 +127,8 @@ impl Clocksource for Acpipm {
         d.set_rating(data.rating);
         d.set_shift(data.shift);
         d.watchdog_last = data.watchdog_last;
+        d.cs_last = data.cs_last;
+        d.cycle_last = data.cycle_last;
         return Ok(());
     }
 }

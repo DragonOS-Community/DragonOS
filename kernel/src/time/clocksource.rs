@@ -652,10 +652,14 @@ pub struct ClocksourceData {
     pub max_idle_ns: u32,
     pub flags: ClocksourceFlags,
     pub watchdog_last: CycleNum,
+    /// 用于watchdog机制中的字段，记录主时钟源上一次被读取的周期数
+    pub cs_last: CycleNum,
     // 用于描述时钟源的不确定性边界，时钟源读取的时间可能存在的不确定性和误差范围
     pub uncertainty_margin: u32,
     // 最大的时间调整量
     pub maxadj: u32,
+    /// 上一次读取时钟源时的周期数
+    pub cycle_last: CycleNum,
 }
 
 impl ClocksourceData {
@@ -681,8 +685,10 @@ impl ClocksourceData {
             max_idle_ns,
             flags,
             watchdog_last: CycleNum(0),
+            cs_last: CycleNum(0),
             uncertainty_margin,
             maxadj,
+            cycle_last: CycleNum(0),
         };
         return csd;
     }
@@ -814,19 +820,21 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
                 .flags
                 .insert(ClocksourceFlags::CLOCK_SOURCE_WATCHDOG);
             // 记录此次检查的时刻
-            cs_data.watchdog_last = cs_now_clock;
+            cs_data.watchdog_last = CycleNum::new(cur_wd_nowclock);
+            cs_data.cs_last = cs_now_clock;
             cs.update_clocksource_data(cs_data.clone())?;
             continue;
         }
         // debug!("cs_data.watchdog_last = {:?},cs_now_clock = {:?}", cs_data.watchdog_last, cs_now_clock);
         // 计算时钟源的误差
         let cs_dev_nsec = clocksource_cyc2ns(
-            CycleNum(cs_now_clock.div(cs_data.watchdog_last).data() & cs_data.mask.bits),
+            CycleNum(cs_now_clock.div(cs_data.cs_last).data() & cs_data.mask.bits),
             cs_data.mult,
             cs_data.shift,
         );
         // 记录此次检查的时刻
-        cs_data.watchdog_last = cs_now_clock;
+        cs_data.watchdog_last = CycleNum::new(cur_wd_nowclock);
+        cs_data.cs_last = cs_now_clock;
         cs.update_clocksource_data(cs_data.clone())?;
         if cs_dev_nsec.abs_diff(wd_dev_nsec) > WATCHDOG_THRESHOLD.into() {
             // debug!("set_unstable");

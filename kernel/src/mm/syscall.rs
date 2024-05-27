@@ -329,7 +329,7 @@ impl Syscall {
             prot_flags,
             map_flags,
             true,
-            true,
+            false,
         )?;
         return Ok(start_page.virt_address().data());
     }

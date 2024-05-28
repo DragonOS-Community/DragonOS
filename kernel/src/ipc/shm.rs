@@ -165,7 +165,7 @@ impl ShmManager {
         let mut page_manager_guard = page_manager_lock_irqsave();
         let mut cur_phys = PhysPageFrame::new(phys_page.0);
         for _ in 0..page_count.data() {
-            let mut page = Page::new(true);
+            let mut page = Page::new(true, cur_phys);
             page.set_shm_id(shm_id);
             let paddr = cur_phys.phys_address();
             page_manager_guard.insert(paddr, page);

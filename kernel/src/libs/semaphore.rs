@@ -1,8 +1,9 @@
 use core::sync::atomic::{AtomicI32, Ordering};
 
+use log::debug;
 use system_error::SystemError;
 
-use crate::{kdebug, process::ProcessManager};
+use crate::process::ProcessManager;
 
 use super::wait_queue::WaitQueue;
 
@@ -51,7 +52,7 @@ impl Semaphore {
             //尝试唤醒
             if !self.wait_queue.wakeup(None) {
                 //如果唤醒失败,打印错误信息
-                kdebug!(
+                debug!(
                     "Semaphore wakeup failed: current pid= {}, semaphore={:?}",
                     ProcessManager::current_pcb().pid().into(),
                     self

@@ -15,6 +15,7 @@ use alloc::{
     vec::Vec,
 };
 use core::fmt::Debug;
+use log::error;
 use system_error::SystemError;
 
 /// @brief: Driver error
@@ -193,7 +194,7 @@ impl DriverManager {
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/driver.c#222
     pub fn register(&self, driver: Arc<dyn Driver>) -> Result<(), SystemError> {
         let bus = driver.bus().and_then(|bus| bus.upgrade()).ok_or_else(|| {
-            kerror!(
+            error!(
                 "DriverManager::register() failed: driver.bus() is None. Driver: '{:?}'",
                 driver.name()
             );
@@ -203,7 +204,7 @@ impl DriverManager {
         let drv_name = driver.name();
         let other = bus.find_driver_by_name(&drv_name);
         if other.is_some() {
-            kerror!(
+            error!(
                 "DriverManager::register() failed: driver '{}' already registered",
                 drv_name
             );

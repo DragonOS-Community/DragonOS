@@ -4,7 +4,6 @@ use crate::{
         tty::{tty_port::tty_port, virtual_terminal::virtual_console::CURRENT_VCNUM},
         video::video_refresh_manager,
     },
-    kdebug, kinfo,
     libs::{
         lib_ui::font::FONT_8x16,
         rwlock::RwLock,
@@ -20,6 +19,7 @@ use core::{
     ptr::copy_nonoverlapping,
     sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
 };
+use log::{debug, info};
 use system_error::SystemError;
 
 use super::{
@@ -73,9 +73,9 @@ pub fn textui_framework() -> Arc<TextUiFramework> {
 /// 初始化TEXTUI_FRAMEWORK
 fn textui_framwork_init() {
     if unsafe { __TEXTUI_FRAMEWORK.is_none() } {
-        kinfo!("textuiframework init");
+        info!("textuiframework init");
         let metadata = ScmUiFrameworkMetadata::new("TextUI".to_string(), ScmFramworkType::Text);
-        kdebug!("textui metadata: {:?}", metadata);
+        debug!("textui metadata: {:?}", metadata);
         // 为textui框架生成第一个窗口
         let vlines_num = (metadata.buf_info().height() / TEXTUI_CHAR_HEIGHT) as usize;
 
@@ -106,7 +106,7 @@ fn textui_framwork_init() {
         };
 
         scm_register(textui_framework()).expect("register textui framework failed");
-        kdebug!("textui framework init success");
+        debug!("textui framework init success");
 
         send_to_default_serial8250_port("\ntext ui initialized\n\0".as_bytes());
         unsafe { TEXTUI_IS_INIT = true };
@@ -989,8 +989,8 @@ impl ScmUiFramework for TextUiFramework {
         let mut new_buf = textui_framework().metadata.read().buf_info();
 
         new_buf.copy_from_nonoverlapping(&old_buf);
-        kdebug!("textui change buf_info: old: {:?}", old_buf);
-        kdebug!("textui change buf_info: new: {:?}", new_buf);
+        debug!("textui change buf_info: old: {:?}", old_buf);
+        debug!("textui change buf_info: new: {:?}", new_buf);
 
         return Ok(0);
     }

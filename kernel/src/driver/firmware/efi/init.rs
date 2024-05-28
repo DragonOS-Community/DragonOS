@@ -1,5 +1,6 @@
 use core::{hint::spin_loop, intrinsics::unlikely, mem::size_of};
 
+use log::{error, info, warn};
 use system_error::SystemError;
 use uefi_raw::table::boot::{MemoryAttribute, MemoryType};
 
@@ -21,17 +22,17 @@ use super::efi_manager;
 #[allow(dead_code)]
 #[inline(never)]
 pub fn efi_init() {
-    kinfo!("Initializing efi...");
+    info!("Initializing efi...");
     let data_from_fdt = efi_manager()
         .get_fdt_params()
         .expect("Failed to get fdt params");
 
     if data_from_fdt.systable.is_none() {
-        kerror!("Failed to get systable from fdt");
+        error!("Failed to get systable from fdt");
         return;
     }
 
-    // kdebug!("to map memory table");
+    // debug!("to map memory table");
 
     // 映射mmap table
     if efi_manager().memmap_init_early(&data_from_fdt).is_err() {
@@ -39,23 +40,23 @@ pub fn efi_init() {
         // 那么 UEFI memory map 就是我们拥有的关于内存的唯一描述，
         // 所以如果我们无法访问它，那么继续进行下去就没有什么意义了
 
-        kerror!("Failed to initialize early memory map");
+        error!("Failed to initialize early memory map");
         loop {
             spin_loop();
         }
     }
-    // kdebug!("NNNN");
-    // kwarn!("BBBB, e:{:?}", SystemError::EINVAL);
+    // debug!("NNNN");
+    // warn!("BBBB, e:{:?}", SystemError::EINVAL);
 
     let desc_version = efi_manager().desc_version();
 
     if unlikely(desc_version != 1) {
-        kwarn!("Unexpected EFI memory map version: {}", desc_version);
+        warn!("Unexpected EFI memory map version: {}", desc_version);
     }
 
     let r = uefi_init(PhysAddr::new(data_from_fdt.systable.unwrap() as usize));
     if let Err(e) = r {
-        kerror!("Failed to initialize UEFI: {:?}", e);
+        error!("Failed to initialize UEFI: {:?}", e);
         efi_manager().efi_memmap_unmap();
         return;
     }
@@ -97,7 +98,7 @@ pub fn efi_init() {
 
     // todo: Initialize screen info
 
-    kinfo!("UEFI init done!");
+    info!("UEFI init done!");
 }
 
 fn efi_find_mirror() {
@@ -117,7 +118,7 @@ fn efi_find_mirror() {
     }
 
     if mirror_size > 0 {
-        kinfo!(
+        info!(
             "Memory: {}M/{}M mirrored memory",
             mirror_size >> 20,
             total_size >> 20
@@ -133,7 +134,7 @@ fn uefi_init(system_table: PhysAddr) -> Result<(), SystemError> {
     let err_unmap_systable = |st_vaddr: VirtAddr| {
         EarlyIoRemap::unmap(st_vaddr)
             .map_err(|e| {
-                kerror!("Failed to unmap system table: {e:?}");
+                error!("Failed to unmap system table: {e:?}");
             })
             .ok();
     };
@@ -143,7 +144,7 @@ fn uefi_init(system_table: PhysAddr) -> Result<(), SystemError> {
     let st_size = size_of::<uefi_raw::table::system::SystemTable>();
 
     let st_vaddr = EarlyIoRemap::map_not_aligned(system_table, st_size, true).map_err(|e| {
-        kwarn!("Unable to map EFI system table, e:{e:?}");
+        warn!("Unable to map EFI system table, e:{e:?}");
         e
     })?;
 
@@ -195,7 +196,7 @@ fn uefi_init(system_table: PhysAddr) -> Result<(), SystemError> {
             true,
         )
         .map_err(|e| {
-            kwarn!("Unable to map EFI configuration table, e:{e:?}");
+            warn!("Unable to map EFI configuration table, e:{e:?}");
             err_unmap_systable(st_vaddr);
             e
         })?;
@@ -265,11 +266,11 @@ fn reserve_memory_regions() {
         let phys_start = page_align_down(md.phys_start as usize);
         let size = (page_count << (MMArch::PAGE_SHIFT as u64)) as usize;
 
-        // kdebug!("Reserve memory region: {:#x}-{:#x}({:#x}), is_memory: {}, is_usable_memory:{}, type: {:?}, att: {:?}", phys_start, phys_start + size, page_count, md.is_memory(), md.is_usable_memory(), md.ty, md.att);
+        // debug!("Reserve memory region: {:#x}-{:#x}({:#x}), is_memory: {}, is_usable_memory:{}, type: {:?}, att: {:?}", phys_start, phys_start + size, page_count, md.is_memory(), md.is_usable_memory(), md.ty, md.att);
         if md.is_memory() {
             open_firmware_fdt_driver().early_init_dt_add_memory(phys_start as u64, size as u64);
             if !md.is_usable_memory() {
-                // kdebug!(
+                // debug!(
                 //     "Marking non-usable memory as nomap: {:#x}-{:#x}",
                 //     phys_start,
                 //     phys_start + size

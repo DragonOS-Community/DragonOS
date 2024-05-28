@@ -567,7 +567,7 @@ impl CfsRunQueue {
 
         fence(Ordering::SeqCst);
         if unlikely(now <= curr.exec_start) {
-            // kwarn!(
+            // warn!(
             //     "update_current return now <= curr.exec_start now {now} execstart {}",
             //     curr.exec_start
             // );
@@ -596,11 +596,11 @@ impl CfsRunQueue {
     fn account_cfs_rq_runtime(&mut self, delta_exec: u64) {
         if likely(self.runtime_remaining > delta_exec) {
             self.runtime_remaining -= delta_exec;
-            // kerror!("runtime_remaining {}", self.runtime_remaining);
+            // error!("runtime_remaining {}", self.runtime_remaining);
             return;
         }
 
-        // kwarn!(
+        // warn!(
         //     "runtime_remaining {} delta exec {delta_exec} nr_running {}",
         //     self.runtime_remaining,
         //     self.nr_running
@@ -609,14 +609,14 @@ impl CfsRunQueue {
         self.runtime_remaining = 5000 * NSEC_PER_MSEC as u64;
 
         if likely(self.current().is_some()) && self.nr_running > 1 {
-            // kerror!("account_cfs_rq_runtime");
+            // error!("account_cfs_rq_runtime");
             self.rq().resched_current();
         }
     }
 
     /// 计算deadline，如果vruntime到期会重调度
     pub fn update_deadline(&mut self, se: &Arc<FairSchedEntity>) {
-        // kerror!("vruntime {} deadline {}", se.vruntime, se.deadline);
+        // error!("vruntime {} deadline {}", se.vruntime, se.deadline);
         if se.vruntime < se.deadline {
             return;
         }
@@ -1131,7 +1131,7 @@ impl CfsRunQueue {
         self.avg_vruntime_add(se);
         se.force_mut().min_deadline = se.deadline;
         self.entities.insert(se.vruntime, se.clone());
-        // kwarn!(
+        // warn!(
         //     "enqueue pcb {:?} cfsrq {:?}",
         //     se.pcb().pid(),
         //     self.entities
@@ -1153,7 +1153,7 @@ impl CfsRunQueue {
     }
 
     fn inner_dequeue_entity(&mut self, se: &Arc<FairSchedEntity>) {
-        // kwarn!(
+        // warn!(
         //     "before dequeue pcb {:?} cfsrq {:?}",
         //     se.pcb().pid(),
         //     self.entities
@@ -1196,7 +1196,7 @@ impl CfsRunQueue {
         //     )
         //     .as_bytes(),
         // );
-        // kwarn!(
+        // warn!(
         //     "after dequeue pcb {:?}(real: {:?}) cfsrq {:?}",
         //     se.pcb().pid(),
         //     remove.pcb().pid(),

@@ -90,7 +90,7 @@ unsafe impl Hal for HalImpl {
         _direction: BufferDirection,
     ) -> virtio_drivers::PhysAddr {
         let vaddr = VirtAddr::new(buffer.as_ptr() as *mut u8 as usize);
-        //kdebug!("virt:{:x}", vaddr);
+        //debug!("virt:{:x}", vaddr);
         // Nothing to do, as the host already has access to all memory.
         return MMArch::virt_2_phys(vaddr).unwrap().data();
     }

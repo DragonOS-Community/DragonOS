@@ -22,8 +22,7 @@ use core::ops::Index;
 use core::ptr;
 
 use alloc::boxed::Box;
-
-use crate::kdebug;
+use log::debug;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Color {
@@ -303,7 +302,7 @@ impl<K: Ord + Clone + Debug, V: Clone + Debug> NodePtr<K, V> {
 ///
 /// // check for a specific one.
 /// if !book_reviews.contains_key(&"Les Misérables") {
-///     kdebug!(
+///     debug!(
 ///         "We've got {} reviews, but Les Misérables ain't one.",
 ///         book_reviews.len()
 ///     );
@@ -316,14 +315,14 @@ impl<K: Ord + Clone + Debug, V: Clone + Debug> NodePtr<K, V> {
 /// let to_find = ["Pride and Prejudice", "Alice's Adventure in Wonderland"];
 /// for book in &to_find {
 ///     match book_reviews.get(book) {
-///         Some(review) => kdebug!("{}: {}", book, review),
-///         None => kdebug!("{} is unreviewed.", book),
+///         Some(review) => debug!("{}: {}", book, review),
+///         None => debug!("{} is unreviewed.", book),
 ///     }
 /// }
 ///
 /// // iterate over everything.
 /// for (book, review) in book_reviews.iter() {
-///     kdebug!("{}: \"{}\"", book, review);
+///     debug!("{}: \"{}\"", book, review);
 /// }
 ///
 /// book_reviews.print_tree();
@@ -386,12 +385,12 @@ impl<K: Ord + Debug, V: Debug> RBTree<K, V> {
         }
         if direction == 0 {
             unsafe {
-                kdebug!("'{:?}' is root node", (*node.0));
+                debug!("'{:?}' is root node", (*node.0));
             }
         } else {
             let direct = if direction == -1 { "left" } else { "right" };
             unsafe {
-                kdebug!(
+                debug!(
                     "{:?} is {:?}'s {:?} child ",
                     (*node.0),
                     *node.parent().0,
@@ -405,12 +404,12 @@ impl<K: Ord + Debug, V: Debug> RBTree<K, V> {
 
     pub fn print_tree(&self) {
         if self.root.is_null() {
-            kdebug!("This is a empty tree");
+            debug!("This is a empty tree");
             return;
         }
-        kdebug!("This tree size = {:?}, begin:-------------", self.len());
+        debug!("This tree size = {:?}, begin:-------------", self.len());
         self.tree_print(self.root, 0);
-        kdebug!("end--------------------------");
+        debug!("end--------------------------");
     }
 }
 
@@ -720,7 +719,7 @@ impl<'a, K: Ord + Debug + 'a, V: Debug + 'a> Iterator for Iter<'a, K, V> {
 impl<'a, K: Ord + Debug + 'a, V: Debug + 'a> DoubleEndedIterator for Iter<'a, K, V> {
     #[inline]
     fn next_back(&mut self) -> Option<(&'a K, &'a V)> {
-        // kdebug!("len = {:?}", self.len);
+        // debug!("len = {:?}", self.len);
         if self.len == 0 {
             return None;
         }

@@ -1,11 +1,10 @@
 use core::sync::atomic::{fence, Ordering};
 
+use log::info;
 use x86::msr::{
     rdmsr, wrmsr, IA32_APIC_BASE, IA32_X2APIC_APICID, IA32_X2APIC_EOI, IA32_X2APIC_SIVR,
     IA32_X2APIC_VERSION,
 };
-
-use crate::kinfo;
 
 use super::{hw_irq::ApicId, LVTRegister, LocalAPIC, LVT};
 
@@ -45,19 +44,19 @@ impl LocalAPIC for X2Apic {
                     (rdmsr(IA32_X2APIC_SIVR) & 0x100) == 0x100,
                     "x2APIC software enable failed."
                 );
-                kinfo!("x2APIC software enabled.");
+                info!("x2APIC software enabled.");
 
                 if self.support_eoi_broadcast_suppression() {
                     assert!(
                         (rdmsr(IA32_X2APIC_SIVR) & 0x1000) == 0x1000,
                         "x2APIC EOI broadcast suppression enable failed."
                     );
-                    kinfo!("x2APIC EOI broadcast suppression enabled.");
+                    info!("x2APIC EOI broadcast suppression enabled.");
                 }
             }
-            // kdebug!("x2apic: to mask all lvt");
+            // debug!("x2apic: to mask all lvt");
             self.mask_all_lvt();
-            // kdebug!("x2apic: all lvt masked");
+            // debug!("x2apic: all lvt masked");
         }
         true
     }

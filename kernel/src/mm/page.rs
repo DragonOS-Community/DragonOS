@@ -8,12 +8,12 @@ use core::{
 
 use alloc::sync::Arc;
 use hashbrown::{HashMap, HashSet};
+use log::{error, info};
 
 use crate::{
     arch::{interrupt::ipi::send_ipi, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
     ipc::shm::ShmId,
-    kerror,
     libs::spinlock::{SpinLock, SpinLockGuard},
 };
 
@@ -37,14 +37,14 @@ pub static mut PAGE_MANAGER: Option<SpinLock<PageManager>> = None;
 
 /// 初始化PAGE_MANAGER
 pub fn page_manager_init() {
-    kinfo!("page_manager_init");
+    info!("page_manager_init");
     let page_manager = SpinLock::new(PageManager::new());
 
     compiler_fence(Ordering::SeqCst);
     unsafe { PAGE_MANAGER = Some(page_manager) };
     compiler_fence(Ordering::SeqCst);
 
-    kinfo!("page_manager_init done");
+    info!("page_manager_init done");
 }
 
 pub fn page_manager_lock_irqsave() -> SpinLockGuard<'static, PageManager> {
@@ -904,6 +904,11 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         let phys: PhysAddr = self.frame_allocator.allocate_one()?;
         compiler_fence(Ordering::SeqCst);
 
+        unsafe {
+            let vaddr = MMArch::phys_2_virt(phys).unwrap();
+            MMArch::write_bytes(vaddr, 0, MMArch::PAGE_SIZE);
+        }
+
         let mut page_manager_guard: SpinLockGuard<'static, PageManager> =
             page_manager_lock_irqsave();
         if !page_manager_guard.contains(&phys) {
@@ -922,10 +927,9 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
     ) -> Option<PageFlush<Arch>> {
         // 验证虚拟地址和物理地址是否对齐
         if !(virt.check_aligned(Arch::PAGE_SIZE) && phys.check_aligned(Arch::PAGE_SIZE)) {
-            kerror!(
+            error!(
                 "Try to map unaligned page: virt={:?}, phys={:?}",
-                virt,
-                phys
+                virt, phys
             );
             return None;
         }
@@ -951,7 +955,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
                 let next_table = table.next_level_table(i);
                 if let Some(next_table) = next_table {
                     table = next_table;
-                    // kdebug!("Mapping {:?} to next level table...", virt);
+                    // debug!("Mapping {:?} to next level table...", virt);
                 } else {
                     // 分配下一级页表
                     let frame = self.frame_allocator.allocate_one()?;
@@ -980,7 +984,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
     ) -> Option<PageFlush<Arch>> {
         // 验证虚拟地址是否对齐
         if !(virt.check_aligned(Arch::PAGE_SIZE)) {
-            kerror!("Try to map unaligned page: virt={:?}", virt);
+            error!("Try to map unaligned page: virt={:?}", virt);
             return None;
         }
 
@@ -1228,7 +1232,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         unmap_parents: bool,
     ) -> Option<(PhysAddr, EntryFlags<Arch>, PageFlush<Arch>)> {
         if !virt.check_aligned(Arch::PAGE_SIZE) {
-            kerror!("Try to unmap unaligned page: virt={:?}", virt);
+            error!("Try to unmap unaligned page: virt={:?}", virt);
             return None;
         }
 

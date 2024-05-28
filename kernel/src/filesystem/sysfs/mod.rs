@@ -9,10 +9,10 @@ use super::{
 use crate::{
     driver::base::kobject::KObject,
     filesystem::vfs::ROOT_INODE,
-    kinfo, kwarn,
     libs::{casting::DowncastArc, once::Once},
 };
 use alloc::sync::Arc;
+use log::{info, warn};
 use system_error::SystemError;
 
 pub mod dir;
@@ -34,7 +34,7 @@ pub fn sysfs_init() -> Result<(), SystemError> {
     static INIT: Once = Once::new();
     let mut result = None;
     INIT.call_once(|| {
-        kinfo!("Initializing SysFS...");
+        info!("Initializing SysFS...");
 
         // 创建 sysfs 实例
         // let sysfs: Arc<OldSysFS> = OldSysFS::new();
@@ -47,9 +47,9 @@ pub fn sysfs_init() -> Result<(), SystemError> {
             .expect("Unabled to find /sys")
             .mount(sysfs_instance().fs().clone())
             .expect("Failed to mount at /sys");
-        kinfo!("SysFS mounted.");
+        info!("SysFS mounted.");
 
-        // kdebug!("sys_bus_init result: {:?}", SYS_BUS_INODE().list());
+        // debug!("sys_bus_init result: {:?}", SYS_BUS_INODE().list());
         result = Some(Ok(()));
     });
 
@@ -227,6 +227,6 @@ impl SysFS {
     /// 警告：重复的sysfs entry
     pub(self) fn warn_duplicate(&self, parent: &Arc<KernFSInode>, name: &str) {
         let path = self.kernfs_path(parent);
-        kwarn!("duplicate sysfs entry: {path}/{name}");
+        warn!("duplicate sysfs entry: {path}/{name}");
     }
 }

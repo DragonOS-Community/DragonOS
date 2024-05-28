@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{compiler_fence, Ordering};
 use hashbrown::{HashMap, HashSet};
 use ida::IdAllocator;
+use log::info;
 use num::ToPrimitive;
 use system_error::SystemError;
 
@@ -28,14 +29,14 @@ pub const IPC_PRIVATE: ShmKey = ShmKey::new(0);
 
 /// 初始化SHM_MANAGER
 pub fn shm_manager_init() {
-    kinfo!("shm_manager_init");
+    info!("shm_manager_init");
     let shm_manager = SpinLock::new(ShmManager::new());
 
     compiler_fence(Ordering::SeqCst);
     unsafe { SHM_MANAGER = Some(shm_manager) };
     compiler_fence(Ordering::SeqCst);
 
-    kinfo!("shm_manager_init done");
+    info!("shm_manager_init done");
 }
 
 pub fn shm_manager_lock() -> SpinLockGuard<'static, ShmManager> {

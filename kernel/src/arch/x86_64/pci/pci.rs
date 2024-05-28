@@ -2,18 +2,40 @@ use crate::arch::TraitPciArch;
 use crate::driver::acpi::acpi_manager;
 use crate::driver::pci::ecam::{pci_ecam_root_info_manager, EcamRootInfo};
 use crate::driver::pci::pci::{
-    pci_init, BusDeviceFunction, PciAddr, PciError, PORT_PCI_CONFIG_ADDRESS, PORT_PCI_CONFIG_DATA,
+    pci_init, BusDeviceFunction, PciAddr, PciCam, PciError, PORT_PCI_CONFIG_ADDRESS,
+    PORT_PCI_CONFIG_DATA,
 };
-use crate::include::bindings::bindings::{io_in32, io_out32};
+use crate::driver::pci::root::{pci_root_manager, PciRoot};
+use crate::include::bindings::bindings::{io_in32, io_in8, io_out32};
 use crate::init::initcall::INITCALL_SUBSYS;
-use crate::kerror;
 use crate::mm::PhysAddr;
 
 use acpi::mcfg::Mcfg;
+use log::{error, warn};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 pub struct X86_64PciArch;
+
+impl X86_64PciArch {
+    /// # 在早期引导阶段直接访问PCI配置空间的函数
+    /// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/pci/early.c?fi=read_pci_config_byte#19
+    fn read_config_early(bus: u8, slot: u8, func: u8, offset: u8) -> u8 {
+        unsafe {
+            io_out32(
+                PORT_PCI_CONFIG_ADDRESS,
+                0x80000000
+                    | ((bus as u32) << 16)
+                    | ((slot as u32) << 11)
+                    | ((func as u32) << 8)
+                    | offset as u32,
+            );
+        }
+        let value = unsafe { io_in8(PORT_PCI_CONFIG_DATA + (offset & 3) as u16) };
+        return value;
+    }
+}
+
 impl TraitPciArch for X86_64PciArch {
     fn read_config(bus_device_function: &BusDeviceFunction, offset: u8) -> u32 {
         // 构造pci配置空间地址
@@ -50,8 +72,18 @@ impl TraitPciArch for X86_64PciArch {
 
 #[unified_init(INITCALL_SUBSYS)]
 fn x86_64_pci_init() -> Result<(), SystemError> {
-    if let Err(e) = discover_ecam_root() {
-        kerror!("x86_64_pci_init(): discover_ecam_root error: {:?}", e);
+    if discover_ecam_root().is_err() {
+        // ecam初始化失败，使用portio访问pci配置空间
+        // 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/pci/broadcom_bus.c#27
+        let bus_begin = X86_64PciArch::read_config_early(0, 0, 0, 0x44);
+        let bus_end = X86_64PciArch::read_config_early(0, 0, 0, 0x45);
+
+        if !pci_root_manager().has_root(bus_begin as u16) {
+            let root = PciRoot::new(None, PciCam::Portiocam, bus_begin, bus_end);
+            pci_root_manager().add_pci_root(root.unwrap());
+        } else {
+            warn!("x86_64_pci_init(): pci_root_manager {}", bus_begin);
+        }
     }
     pci_init();
 

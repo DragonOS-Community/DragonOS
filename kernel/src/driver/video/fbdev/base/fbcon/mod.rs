@@ -3,6 +3,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -165,7 +166,7 @@ impl KObject for FbConsoleDevice {
 
     fn set_name(&self, _name: String) {
         // 不允许修改
-        kwarn!("fbcon name can not be changed");
+        warn!("fbcon name can not be changed");
     }
 
     fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
@@ -199,7 +200,7 @@ impl Device for FbConsoleDevice {
 
     fn set_class(&self, _class: Option<Weak<dyn Class>>) {
         // 不允许修改
-        kwarn!("fbcon's class can not be changed");
+        warn!("fbcon's class can not be changed");
     }
 
     fn class(&self) -> Option<Arc<dyn Class>> {
@@ -279,13 +280,13 @@ impl Attribute for AttrRotate {
 
     /// https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/video/fbdev/core/fbcon.c#3226
     fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
-        kwarn!("fbcon rotate show not implemented");
+        warn!("fbcon rotate show not implemented");
         return sysfs_emit_str(buf, "0\n");
     }
 
     /// https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/video/fbdev/core/fbcon.c#3182
     fn store(&self, _kobj: Arc<dyn KObject>, _buf: &[u8]) -> Result<usize, SystemError> {
-        kwarn!("fbcon rotate store not implemented");
+        warn!("fbcon rotate store not implemented");
         return Err(SystemError::ENOSYS);
     }
 }
@@ -308,7 +309,7 @@ impl Attribute for AttrRotateAll {
 
     /// https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/video/fbdev/core/fbcon.c#3204
     fn store(&self, _kobj: Arc<dyn KObject>, _buf: &[u8]) -> Result<usize, SystemError> {
-        kwarn!("fbcon rotate_all store not implemented");
+        warn!("fbcon rotate_all store not implemented");
         return Err(SystemError::ENOSYS);
     }
 }

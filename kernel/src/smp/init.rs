@@ -1,3 +1,5 @@
+use log::info;
+
 use crate::{
     arch::{syscall::arch_syscall_init, CurrentIrqArch, CurrentSchedArch},
     exception::InterruptArch,
@@ -22,6 +24,6 @@ pub fn smp_ap_start_stage2() -> ! {
 
 #[inline(never)]
 fn do_ap_start_stage2() {
-    kinfo!("Successfully started AP {}", smp_get_processor_id().data());
+    info!("Successfully started AP {}", smp_get_processor_id().data());
     arch_syscall_init().expect("AP core failed to initialize syscall");
 }

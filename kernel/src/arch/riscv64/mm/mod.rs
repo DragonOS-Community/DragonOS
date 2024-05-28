@@ -12,7 +12,7 @@ use crate::{
             page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage, PhysPageFrame},
         },
         kernel_mapper::KernelMapper,
-        page::{PageEntry, PageFlags, PAGE_1G_SHIFT},
+        page::{EntryFlags, PageEntry, PAGE_1G_SHIFT},
         ucontext::UserMapper,
         MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
     },
@@ -270,8 +270,8 @@ impl VirtAddr {
 }
 
 /// 获取内核地址默认的页面标志
-pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(_virt: VirtAddr) -> PageFlags<A> {
-    PageFlags::from_data(RiscV64MMArch::ENTRY_FLAG_DEFAULT_PAGE)
+pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(_virt: VirtAddr) -> EntryFlags<A> {
+    EntryFlags::from_data(RiscV64MMArch::ENTRY_FLAG_DEFAULT_PAGE)
         .set_user(false)
         .set_execute(true)
 }

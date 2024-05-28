@@ -1,9 +1,15 @@
-use core::{alloc::Layout, cmp::min, intrinsics::unlikely, panic};
+use core::{
+    alloc::Layout,
+    cmp::{max, min},
+    intrinsics::unlikely,
+    panic,
+};
 
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
     arch::{mm::PageMapper, MMArch},
+    libs::align::align_down,
     mm::{
         page::{page_manager_lock_irqsave, EntryFlags},
         ucontext::LockedVMA,
@@ -49,17 +55,22 @@ pub struct PageFaultMessage {
     /// 异常处理标志
     flags: FaultFlags,
     /// 缺页的文件页在文件中的偏移量
-    file_pgoff: usize,
+    file_pgoff: Option<usize>,
 }
 
 impl PageFaultMessage {
     pub fn new(vma: Arc<LockedVMA>, address: VirtAddr, flags: FaultFlags) -> Self {
+        let guard = vma.lock();
+        let file_pgoff = if let Some(file_page_offset) = guard.file_page_offset() {
+            Some(((address - guard.region().start()) >> MMArch::PAGE_SHIFT) + file_page_offset)
+        } else {
+            None
+        };
         Self {
             vma: vma.clone(),
             address,
             flags,
-            file_pgoff: ((address - vma.lock().region().start()) >> MMArch::PAGE_SHIFT)
-                + vma.lock().file_page_offset().unwrap(),
+            file_pgoff,
         }
     }
 
@@ -450,12 +461,18 @@ impl PageFaultHandler {
         let pte_pgoff =
             (pfm.address().data() >> MMArch::PAGE_SHIFT) & (1 << MMArch::PAGE_ENTRY_SHIFT);
 
+        // 缺页在文件中的偏移量
+        let file_pgoff = pfm.file_pgoff.expect("no file_pgoff");
+
         let vma_pages_count = (vma_region.end() - vma_region.start()) >> MMArch::PAGE_SHIFT;
 
-        // 开始位置不能超出当前pte和vma头部
-        let from_pte = pte_pgoff - min(vm_pgoff, pte_pgoff);
-
         let fault_around_page_number = 16;
+
+        // 开始位置不能超出当前pte和vma头部
+        let from_pte = max(
+            align_down(pte_pgoff, fault_around_page_number),
+            pte_pgoff - min(vm_pgoff, pte_pgoff),
+        );
 
         // pte结束位置不能超过：
         // 1.最大预读上限（默认16）
@@ -480,8 +497,8 @@ impl PageFaultHandler {
         Self::filemap_map_pages(
             pfm.clone(),
             mapper,
-            pfm.file_pgoff + (from_pte - pte_pgoff),
-            pfm.file_pgoff + (to_pte - pte_pgoff),
+            file_pgoff + (from_pte - pte_pgoff),
+            file_pgoff + (to_pte - pte_pgoff),
         );
 
         VmFaultReason::empty()
@@ -533,11 +550,12 @@ impl PageFaultHandler {
         let vma_guard = vma.lock();
         let file = vma_guard.vm_file().expect("no vm_file in vma");
         let mut page_cache = file.inode().page_cache().unwrap();
+        let file_pgoff = pfm.file_pgoff.expect("no file_pgoff");
 
-        if let Some(page) = page_cache.get_page(pfm.file_pgoff) {
+        if let Some(page) = page_cache.get_page(file_pgoff) {
             // TODO 异步从磁盘中预读页面进PageCache
             let address = vma_guard.region().start
-                + ((pfm.file_pgoff
+                + ((file_pgoff
                     - vma_guard
                         .file_page_offset()
                         .expect("file_page_offset is none"))
@@ -550,7 +568,7 @@ impl PageFaultHandler {
             // TODO 同步预读
             let mut buf: Vec<u8> = vec![0; MMArch::PAGE_SIZE];
             file.pread(
-                pfm.file_pgoff * MMArch::PAGE_SIZE,
+                file_pgoff * MMArch::PAGE_SIZE,
                 MMArch::PAGE_SIZE,
                 &mut buf[..],
             )
@@ -562,7 +580,7 @@ impl PageFaultHandler {
             (phys_2_virt(new_cache_page.data()) as *mut u8)
                 .copy_from_nonoverlapping(buf.as_mut_ptr(), MMArch::PAGE_SIZE);
             page_cache.add_page(
-                pfm.file_pgoff,
+                file_pgoff,
                 Arc::new(Page::new(false, PhysPageFrame::new(new_cache_page))),
             );
 

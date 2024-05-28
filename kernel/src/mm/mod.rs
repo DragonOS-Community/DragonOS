@@ -610,7 +610,7 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
 
     /// 创建页表项
     ///
-    /// 这是一个低阶api，用于根据物理地址以及指定好的EntryFlags，创建页表项
+    /// 这是一个低阶api，用于根据物理地址以及指定好的pageflags，创建页表项
     ///
     /// ## 参数
     ///

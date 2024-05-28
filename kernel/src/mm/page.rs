@@ -18,7 +18,7 @@ use crate::{
 };
 
 use super::{
-    allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame},
+    allocator::page_frame::{FrameAllocator, PageFrameCount},
     syscall::ProtFlags,
     ucontext::LockedVMA,
     MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
@@ -86,27 +86,6 @@ impl PageManager {
     }
 }
 
-bitflags! {
-    pub struct PageFlags: u64 {
-        const PG_LOCKED = 1 << 0;
-        const PG_WRITEBACK = 1 << 1;
-        const PG_REFERENCED = 1 << 2;
-        const PG_UPTODATE = 1 << 3;
-        const PG_DIRTY = 1 << 4;
-        const PG_LRU = 1 << 5;
-        const PG_HEAD = 1 << 6;
-        const PG_WAITERS = 1 << 7;
-        const PG_ACTIVE = 1 << 8;
-        const PG_WORKINGSET = 1 << 9;
-        const PG_ERROR = 1 << 10;
-        const PG_SLAB = 1 << 11;
-        const PG_RESERVED = 1 << 14;
-        const PG_PRIVATE = 1 << 15;
-        const PG_RECLAIM = 1 << 18;
-        const PG_SWAPBACKED = 1 << 19;
-    }
-}
-
 /// 物理页面信息
 pub struct Page {
     /// 映射计数
@@ -119,14 +98,10 @@ pub struct Page {
     shm_id: Option<ShmId>,
     /// 映射到当前page的VMA
     anon_vma: HashSet<Arc<LockedVMA>>,
-    /// 标志
-    flags: PageFlags,
-    /// 页所在的物理页帧号
-    phys_frame: PhysPageFrame,
 }
 
 impl Page {
-    pub fn new(shared: bool, phys_frame: PhysPageFrame) -> Self {
+    pub fn new(shared: bool) -> Self {
         let dealloc_when_zero = !shared;
         Self {
             map_count: 0,
@@ -134,8 +109,6 @@ impl Page {
             free_when_zero: dealloc_when_zero,
             shm_id: None,
             anon_vma: HashSet::new(),
-            flags: PageFlags::empty(),
-            phys_frame,
         }
     }
 
@@ -180,16 +153,6 @@ impl Page {
     #[inline(always)]
     pub fn map_count(&self) -> usize {
         self.map_count
-    }
-
-    #[inline(always)]
-    pub fn flags(&self) -> &PageFlags {
-        &self.flags
-    }
-
-    #[inline(always)]
-    pub fn phys_frame(&self) -> &PhysPageFrame {
-        &self.phys_frame
     }
 }
 
@@ -367,7 +330,7 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
                         } else {
                             let phys = allocator.allocate_one()?;
                             let mut anon_vma_guard = page_manager_lock_irqsave();
-                            anon_vma_guard.insert(phys, Page::new(false, PhysPageFrame::new(phys)));
+                            anon_vma_guard.insert(phys, Page::new(false));
                             let old_phys = entry.address().unwrap();
                             let frame = MMArch::phys_2_virt(phys).unwrap().data() as *mut u8;
                             frame.copy_from_nonoverlapping(
@@ -409,7 +372,7 @@ impl<Arch> Debug for PageEntry<Arch> {
 
 impl<Arch: MemoryManagementArch> PageEntry<Arch> {
     #[inline(always)]
-    pub fn new(paddr: PhysAddr, flags: EntryFlags<Arch>) -> Self {
+    pub fn new(paddr: PhysAddr, flags: PageFlags<Arch>) -> Self {
         Self {
             data: MMArch::make_entry(paddr, flags.data()),
             phantom: PhantomData,
@@ -457,12 +420,12 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
     }
 
     #[inline(always)]
-    pub fn flags(&self) -> EntryFlags<Arch> {
-        unsafe { EntryFlags::from_data(self.data & Arch::ENTRY_FLAGS_MASK) }
+    pub fn flags(&self) -> PageFlags<Arch> {
+        unsafe { PageFlags::from_data(self.data & Arch::ENTRY_FLAGS_MASK) }
     }
 
     #[inline(always)]
-    pub fn set_flags(&mut self, flags: EntryFlags<Arch>) {
+    pub fn set_flags(&mut self, flags: PageFlags<Arch>) {
         self.data = (self.data & !Arch::ENTRY_FLAGS_MASK) | flags.data();
     }
 
@@ -490,19 +453,13 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
 
 /// 页表项的标志位
 #[derive(Copy, Clone, Hash)]
-pub struct EntryFlags<Arch> {
+pub struct PageFlags<Arch> {
     data: usize,
     phantom: PhantomData<Arch>,
 }
 
-impl<Arch: MemoryManagementArch> Default for EntryFlags<Arch> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[allow(dead_code)]
-impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
+impl<Arch: MemoryManagementArch> PageFlags<Arch> {
     #[inline(always)]
     pub fn new() -> Self {
         let mut r = unsafe {
@@ -523,14 +480,14 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
         return r;
     }
 
-    /// 根据ProtFlags生成EntryFlags
+    /// 根据ProtFlags生成PageFlags
     ///
     /// ## 参数
     ///
     /// - prot_flags: 页的保护标志
     /// - user: 用户空间是否可访问
-    pub fn from_prot_flags(prot_flags: ProtFlags, user: bool) -> EntryFlags<Arch> {
-        let flags: EntryFlags<Arch> = EntryFlags::new()
+    pub fn from_prot_flags(prot_flags: ProtFlags, user: bool) -> PageFlags<Arch> {
+        let flags: PageFlags<Arch> = PageFlags::new()
             .set_user(user)
             .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))
             .set_write(prot_flags.contains(ProtFlags::PROT_WRITE));
@@ -800,9 +757,9 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
     }
 }
 
-impl<Arch: MemoryManagementArch> fmt::Debug for EntryFlags<Arch> {
+impl<Arch: MemoryManagementArch> fmt::Debug for PageFlags<Arch> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("EntryFlags")
+        f.debug_struct("PageFlags")
             .field("bits", &format_args!("{:#0x}", self.data))
             .field("present", &self.present())
             .field("has_write", &self.has_write())
@@ -898,7 +855,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
     pub unsafe fn map(
         &mut self,
         virt: VirtAddr,
-        flags: EntryFlags<Arch>,
+        flags: PageFlags<Arch>,
     ) -> Option<PageFlush<Arch>> {
         compiler_fence(Ordering::SeqCst);
         let phys: PhysAddr = self.frame_allocator.allocate_one()?;
@@ -912,7 +869,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         let mut page_manager_guard: SpinLockGuard<'static, PageManager> =
             page_manager_lock_irqsave();
         if !page_manager_guard.contains(&phys) {
-            page_manager_guard.insert(phys, Page::new(false, PhysPageFrame::new(phys)))
+            page_manager_guard.insert(phys, Page::new(false))
         }
 
         return self.map_phys(virt, phys, flags);
@@ -923,7 +880,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         &mut self,
         virt: VirtAddr,
         phys: PhysAddr,
-        flags: EntryFlags<Arch>,
+        flags: PageFlags<Arch>,
     ) -> Option<PageFlush<Arch>> {
         // 验证虚拟地址和物理地址是否对齐
         if !(virt.check_aligned(Arch::PAGE_SIZE) && phys.check_aligned(Arch::PAGE_SIZE)) {
@@ -963,8 +920,8 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
                     // 清空这个页帧
                     MMArch::write_bytes(MMArch::phys_2_virt(frame).unwrap(), 0, MMArch::PAGE_SIZE);
                     // 设置页表项的flags
-                    let flags: EntryFlags<Arch> =
-                        EntryFlags::new_page_table(virt.kind() == PageTableKind::User);
+                    let flags: PageFlags<Arch> =
+                        PageFlags::new_page_table(virt.kind() == PageTableKind::User);
 
                     // 把新分配的页表映射到当前页表
                     table.set_entry(i, PageEntry::new(frame, flags));
@@ -980,7 +937,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
     pub unsafe fn map_huge_page(
         &mut self,
         virt: VirtAddr,
-        flags: EntryFlags<Arch>,
+        flags: PageFlags<Arch>,
     ) -> Option<PageFlush<Arch>> {
         // 验证虚拟地址是否对齐
         if !(virt.check_aligned(Arch::PAGE_SIZE)) {
@@ -1046,8 +1003,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         MMArch::write_bytes(MMArch::phys_2_virt(frame).unwrap(), 0, MMArch::PAGE_SIZE);
 
         // 设置页表项的flags
-        let flags: EntryFlags<Arch> =
-            EntryFlags::new_page_table(virt.kind() == PageTableKind::User);
+        let flags: PageFlags<Arch> = PageFlags::new_page_table(virt.kind() == PageTableKind::User);
 
         table.set_entry(i, PageEntry::new(frame, flags));
         table.next_level_table(i)
@@ -1149,7 +1105,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
     pub unsafe fn map_linearly(
         &mut self,
         phys: PhysAddr,
-        flags: EntryFlags<Arch>,
+        flags: PageFlags<Arch>,
     ) -> Option<(VirtAddr, PageFlush<Arch>)> {
         let virt: VirtAddr = Arch::phys_2_virt(phys)?;
         return self.map_phys(virt, phys, flags).map(|flush| (virt, flush));
@@ -1169,7 +1125,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
     pub unsafe fn remap(
         &mut self,
         virt: VirtAddr,
-        flags: EntryFlags<Arch>,
+        flags: PageFlags<Arch>,
     ) -> Option<PageFlush<Arch>> {
         return self
             .visit(virt, |p1, i| {
@@ -1191,7 +1147,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
     /// ## 返回值
     ///
     /// 如果查找成功，返回物理地址和页表项的flags，否则返回None
-    pub fn translate(&self, virt: VirtAddr) -> Option<(PhysAddr, EntryFlags<Arch>)> {
+    pub fn translate(&self, virt: VirtAddr) -> Option<(PhysAddr, PageFlags<Arch>)> {
         let entry: PageEntry<Arch> = self.visit(virt, |p1, i| unsafe { p1.entry(i) })??;
         let paddr = entry.address().ok()?;
         let flags = entry.flags();
@@ -1230,7 +1186,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         &mut self,
         virt: VirtAddr,
         unmap_parents: bool,
-    ) -> Option<(PhysAddr, EntryFlags<Arch>, PageFlush<Arch>)> {
+    ) -> Option<(PhysAddr, PageFlags<Arch>, PageFlush<Arch>)> {
         if !virt.check_aligned(Arch::PAGE_SIZE) {
             error!("Try to unmap unaligned page: virt={:?}", virt);
             return None;
@@ -1278,7 +1234,7 @@ unsafe fn unmap_phys_inner<Arch: MemoryManagementArch>(
     table: &PageTable<Arch>,
     unmap_parents: bool,
     allocator: &mut impl FrameAllocator,
-) -> Option<(PhysAddr, EntryFlags<Arch>)> {
+) -> Option<(PhysAddr, PageFlags<Arch>)> {
     // 获取页表项的索引
     let i = table.index_of(vaddr)?;
 

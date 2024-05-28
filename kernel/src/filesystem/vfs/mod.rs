@@ -23,12 +23,7 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-use self::{
-    core::generate_inode_id,
-    file::{FileMode, PageCache},
-    syscall::ModeType,
-    utils::DName,
-};
+use self::{core::generate_inode_id, file::FileMode, syscall::ModeType, utils::DName};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
@@ -552,10 +547,6 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// - Err(SystemError): If there is an error in finding the parent directory
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         return self.find("..");
-    }
-
-    fn page_cache(&self) -> Option<PageCache> {
-        None
     }
 }
 

@@ -5,7 +5,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use hashbrown::HashMap;
 use log::error;
 use system_error::SystemError;
 
@@ -17,7 +16,6 @@ use crate::{
     filesystem::procfs::ProcfsFilePrivateData,
     ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
     libs::{rwlock::RwLock, spinlock::SpinLock},
-    mm::page::Page,
     net::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
         socket::SocketInode,
@@ -120,45 +118,6 @@ impl FileMode {
         return self.bits() & FileMode::O_ACCMODE.bits();
     }
 }
-
-#[allow(dead_code)]
-pub struct PageCache {
-    inode_ref: Weak<dyn IndexNode>,
-    map: HashMap<usize, Arc<Page>>,
-}
-
-impl PageCache {
-    pub fn new(inode_ref: Weak<dyn IndexNode>) -> PageCache {
-        Self {
-            inode_ref,
-            map: HashMap::new(),
-        }
-    }
-
-    pub fn add_page(&mut self, offset: usize, page: Arc<Page>) {
-        self.map.insert(offset, page);
-    }
-
-    pub fn get_page(&self, offset: usize) -> Option<Arc<Page>> {
-        self.map.get(&offset).cloned()
-    }
-
-    // pub fn get_pages(&self, start_pgoff: usize, end_pgoff: usize) -> Vec<Arc<Page>> {
-    //     let mut vec = Vec::new();
-    //     for pgoff in start_pgoff..=end_pgoff {
-    //         if let Some(page) = self.map.get(&pgoff) {
-    //             vec.push(page.clone());
-    //         }
-    //     }
-    //     vec
-    // }
-}
-
-pub trait PageCacheOperations: IndexNode {
-    fn write_page(&self, page: Page);
-    fn read_ahead(&self);
-}
-
 /// @brief 抽象文件结构体
 #[derive(Debug)]
 pub struct File {

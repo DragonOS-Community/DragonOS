@@ -861,6 +861,11 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         let phys: PhysAddr = self.frame_allocator.allocate_one()?;
         compiler_fence(Ordering::SeqCst);
 
+        unsafe {
+            let vaddr = MMArch::phys_2_virt(phys).unwrap();
+            MMArch::write_bytes(vaddr, 0, MMArch::PAGE_SIZE);
+        }
+
         let mut page_manager_guard: SpinLockGuard<'static, PageManager> =
             page_manager_lock_irqsave();
         if !page_manager_guard.contains(&phys) {

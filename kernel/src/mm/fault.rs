@@ -61,11 +61,9 @@ pub struct PageFaultMessage {
 impl PageFaultMessage {
     pub fn new(vma: Arc<LockedVMA>, address: VirtAddr, flags: FaultFlags) -> Self {
         let guard = vma.lock();
-        let file_pgoff = if let Some(file_page_offset) = guard.file_page_offset() {
-            Some(((address - guard.region().start()) >> MMArch::PAGE_SHIFT) + file_page_offset)
-        } else {
-            None
-        };
+        let file_pgoff = guard.file_page_offset().map(|file_page_offset| {
+            ((address - guard.region().start()) >> MMArch::PAGE_SHIFT) + file_page_offset
+        });
         Self {
             vma: vma.clone(),
             address,

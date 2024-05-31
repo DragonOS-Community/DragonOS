@@ -1,4 +1,5 @@
 use core::{
+    any::Any,
     fmt::Debug,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -8,6 +9,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use intertrait::CastFromSync;
 use system_error::SystemError;
 
 use crate::{
@@ -129,6 +131,10 @@ impl EPollItem {
         return EPollEventType::empty();
     }
 }
+
+pub trait KernelIoctlData: Send + Sync + Any + Debug + CastFromSync {}
+
+impl KernelIoctlData for EPollItem {}
 
 /// ### Epoll文件的私有信息
 #[derive(Debug, Clone)]

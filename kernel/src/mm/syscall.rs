@@ -296,8 +296,8 @@ impl Syscall {
         len: usize,
         prot_flags: usize,
         map_flags: usize,
-        _fd: i32,
-        _offset: usize,
+        fd: i32,
+        offset: usize,
     ) -> Result<usize, SystemError> {
         let map_flags = MapFlags::from_bits_truncate(map_flags as u64);
         let prot_flags = ProtFlags::from_bits_truncate(prot_flags as u64);
@@ -312,10 +312,10 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
         // 暂时不支持除匿名页以外的映射
-        if !map_flags.contains(MapFlags::MAP_ANONYMOUS) {
-            error!("mmap: not support file mapping");
-            return Err(SystemError::ENOSYS);
-        }
+        // if !map_flags.contains(MapFlags::MAP_ANONYMOUS) {
+        //     error!("mmap: not support file mapping");
+        //     return Err(SystemError::ENOSYS);
+        // }
 
         // 暂时不支持巨页映射
         if map_flags.contains(MapFlags::MAP_HUGETLB) {
@@ -323,14 +323,35 @@ impl Syscall {
             return Err(SystemError::ENOSYS);
         }
         let current_address_space = AddressSpace::current()?;
-        let start_page = current_address_space.write().map_anonymous(
-            start_vaddr,
-            len,
-            prot_flags,
-            map_flags,
-            true,
-            false,
-        )?;
+        let start_page = if map_flags.contains(MapFlags::MAP_ANONYMOUS) {
+            current_address_space.write().map_anonymous(
+                start_vaddr,
+                len,
+                prot_flags,
+                map_flags,
+                true,
+                false,
+            )?
+        } else {
+            current_address_space.write().file_mapping(
+                start_vaddr,
+                len,
+                prot_flags,
+                map_flags,
+                fd,
+                offset,
+                true,
+                false,
+            )?
+        };
+        // let start_page = current_address_space.write().map_anonymous(
+        //     start_vaddr,
+        //     len,
+        //     prot_flags,
+        //     map_flags,
+        //     true,
+        //     false,
+        // )?;
         return Ok(start_page.virt_address().data());
     }
 

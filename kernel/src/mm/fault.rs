@@ -197,6 +197,9 @@ impl PageFaultHandler {
         pfm: PageFaultMessage,
         mapper: &mut PageMapper,
     ) -> VmFaultReason {
+        if pfm.address.data() == 0x10000 {
+            log::info!("handle_pte_fault: {:?}", pfm);
+        }
         let address = pfm.address_aligned_down();
         let flags = pfm.flags;
         let vma = pfm.vma.clone();
@@ -271,6 +274,7 @@ impl PageFaultHandler {
     /// - VmFaultReason: 页面错误处理信息标志
     #[allow(unused_variables)]
     pub unsafe fn do_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+        log::info!("do_fault");
         // panic!(
         //     "do_fault has not yet been implemented,
         // fault message: {:?},
@@ -328,6 +332,7 @@ impl PageFaultHandler {
         // );
 
         // TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#do_read_fault
+        log::info!("do_read_fault");
         let ret = Self::do_fault_around(pfm.clone(), mapper);
         if !ret.is_empty() {
             return ret;
@@ -510,7 +515,11 @@ impl PageFaultHandler {
     ) -> VmFaultReason {
         let vma = pfm.vma();
         let vma_guard = vma.lock();
-        let file = vma_guard.vm_file().expect("no vm_file in vma");
+        let file = vma_guard
+            .vm_file()
+            .expect("no vm_file in vma")
+            .upgrade()
+            .expect("struct file not exist");
         let page_cache = file.inode().page_cache().unwrap();
 
         // 起始页地址
@@ -544,9 +553,14 @@ impl PageFaultHandler {
     }
 
     pub unsafe fn filemap_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+        log::info!("filemap_fault");
         let vma = pfm.vma();
         let vma_guard = vma.lock();
-        let file = vma_guard.vm_file().expect("no vm_file in vma");
+        let file = vma_guard
+            .vm_file()
+            .expect("no vm_file in vma")
+            .upgrade()
+            .expect("struct file not exist");
         let mut page_cache = file.inode().page_cache().unwrap();
         let file_pgoff = pfm.file_pgoff.expect("no file_pgoff");
 

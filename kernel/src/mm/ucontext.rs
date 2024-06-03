@@ -290,7 +290,7 @@ impl InnerAddressSpace {
                 prot_flags,
                 map_flags,
                 move |page, count, flags, mapper, flusher| {
-                    VMA::zeroed(page, count, vm_flags, flags, mapper, flusher)
+                    VMA::zeroed(page, count, vm_flags, flags, mapper, flusher, None, None)
                 },
             )?
         } else {
@@ -304,12 +304,130 @@ impl InnerAddressSpace {
                         VirtRegion::new(page.virt_address(), count.data() * MMArch::PAGE_SIZE),
                         vm_flags,
                         flags,
+                        None,
+                        None,
                         false,
                     )))
                 },
             )?
         };
 
+        return Ok(start_page);
+    }
+
+    /// 进行文件页映射
+    ///
+    /// ## 参数
+    ///
+    /// - `start_vaddr`：映射的起始地址
+    /// - `len`：映射的长度
+    /// - `prot_flags`：保护标志
+    /// - `map_flags`：映射标志
+    /// - `round_to_min`：是否将`start_vaddr`对齐到`mmap_min`，如果为`true`，则当`start_vaddr`不为0时，会对齐到`mmap_min`，否则仅向下对齐到页边界
+    /// - `allocate_at_once`：是否立即分配物理空间
+    ///
+    /// ## 返回
+    ///
+    /// 返回映射的起始虚拟页帧
+    pub fn file_mapping(
+        &mut self,
+        start_vaddr: VirtAddr,
+        len: usize,
+        prot_flags: ProtFlags,
+        map_flags: MapFlags,
+        fd: i32,
+        offset: usize,
+        round_to_min: bool,
+        allocate_at_once: bool,
+    ) -> Result<VirtPageFrame, SystemError> {
+        log::info!("file_mapping");
+        let allocate_at_once = if MMArch::PAGE_FAULT_ENABLED {
+            allocate_at_once
+        } else {
+            true
+        };
+        // 用于对齐hint的函数
+        let round_hint_to_min = |hint: VirtAddr| {
+            // 先把hint向下对齐到页边界
+            let addr = hint.data() & (!MMArch::PAGE_OFFSET_MASK);
+            // debug!("map_anonymous: hint = {:?}, addr = {addr:#x}", hint);
+            // 如果hint不是0，且hint小于DEFAULT_MMAP_MIN_ADDR，则对齐到DEFAULT_MMAP_MIN_ADDR
+            if (addr != 0) && round_to_min && (addr < DEFAULT_MMAP_MIN_ADDR) {
+                Some(VirtAddr::new(page_align_up(DEFAULT_MMAP_MIN_ADDR)))
+            } else if addr == 0 {
+                None
+            } else {
+                Some(VirtAddr::new(addr))
+            }
+        };
+        // debug!("map_anonymous: start_vaddr = {:?}", start_vaddr);
+        // debug!("map_anonymous: len(no align) = {}", len);
+
+        let len = page_align_up(len);
+
+        let vm_flags = VmFlags::from(prot_flags)
+            | VmFlags::from(map_flags)
+            | VmFlags::VM_MAYREAD
+            | VmFlags::VM_MAYWRITE
+            | VmFlags::VM_MAYEXEC;
+
+        // debug!("map_anonymous: len = {}", len);
+
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+
+        let file = fd_table_guard.get_file_by_fd(fd);
+        if file.is_none() {
+            return Err(SystemError::EBADF);
+        }
+        // drop guard 以避免无法调度的问题
+        drop(fd_table_guard);
+
+        let file = Arc::downgrade(&file.unwrap());
+
+        // offset需要4K对齐
+        if !offset & (MMArch::PAGE_SIZE - 1) == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let pgoff = offset >> MMArch::PAGE_SHIFT;
+
+        let start_page: VirtPageFrame = if allocate_at_once {
+            self.mmap(
+                round_hint_to_min(start_vaddr),
+                PageFrameCount::from_bytes(len).unwrap(),
+                prot_flags,
+                map_flags,
+                move |page, count, flags, mapper, flusher| {
+                    VMA::zeroed(
+                        page,
+                        count,
+                        vm_flags,
+                        flags,
+                        mapper,
+                        flusher,
+                        Some(file),
+                        Some(pgoff),
+                    )
+                },
+            )?
+        } else {
+            self.mmap(
+                round_hint_to_min(start_vaddr),
+                PageFrameCount::from_bytes(len).unwrap(),
+                prot_flags,
+                map_flags,
+                move |page, count, flags, _mapper, _flusher| {
+                    Ok(LockedVMA::new(VMA::new(
+                        VirtRegion::new(page.virt_address(), count.data() * MMArch::PAGE_SIZE),
+                        vm_flags,
+                        flags,
+                        Some(file),
+                        Some(pgoff),
+                        false,
+                    )))
+                },
+            )?
+        };
         return Ok(start_page);
     }
 
@@ -1188,8 +1306,8 @@ impl LockedVMA {
 
     /// 判断VMA是否为匿名映射
     pub fn is_anonymous(&self) -> bool {
-        //TODO: 实现匿名映射判断逻辑，目前仅支持匿名映射
-        true
+        let guard = self.lock();
+        guard.vm_file.is_none()
     }
 
     /// 判断VMA是否为大页映射
@@ -1241,7 +1359,7 @@ pub struct VMA {
     user_address_space: Option<Weak<AddressSpace>>,
     self_ref: Weak<LockedVMA>,
 
-    vm_file: Option<Arc<File>>,
+    vm_file: Option<Weak<File>>,
     /// VMA映射的文件部分相对于整个文件的偏移页数
     file_pgoff: Option<usize>,
 
@@ -1268,6 +1386,8 @@ impl VMA {
         region: VirtRegion,
         vm_flags: VmFlags,
         flags: EntryFlags<MMArch>,
+        file: Option<Weak<File>>,
+        pgoff: Option<usize>,
         mapped: bool,
     ) -> Self {
         VMA {
@@ -1278,8 +1398,8 @@ impl VMA {
             user_address_space: None,
             self_ref: Weak::default(),
             provider: Provider::Allocated,
-            file_pgoff: None,
-            vm_file: None,
+            vm_file: file,
+            file_pgoff: pgoff,
         }
     }
 
@@ -1291,7 +1411,7 @@ impl VMA {
         return &self.vm_flags;
     }
 
-    pub fn vm_file(&self) -> Option<Arc<File>> {
+    pub fn vm_file(&self) -> Option<Weak<File>> {
         return self.vm_file.clone();
     }
 
@@ -1438,6 +1558,8 @@ impl VMA {
             VirtRegion::new(destination.virt_address(), count.data() * MMArch::PAGE_SIZE),
             vm_flags,
             flags,
+            None,
+            None,
             true,
         ));
 
@@ -1470,6 +1592,8 @@ impl VMA {
         flags: EntryFlags<MMArch>,
         mapper: &mut PageMapper,
         mut flusher: impl Flusher<MMArch>,
+        file: Option<Weak<File>>,
+        pgoff: Option<usize>,
     ) -> Result<Arc<LockedVMA>, SystemError> {
         let mut cur_dest: VirtPageFrame = destination;
         // debug!(
@@ -1496,6 +1620,8 @@ impl VMA {
             ),
             vm_flags,
             flags,
+            file,
+            pgoff,
             true,
         ));
         drop(flusher);

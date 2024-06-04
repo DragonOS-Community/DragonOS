@@ -34,7 +34,7 @@ use crate::{
         spinlock::SpinLockGuard,
     },
     mm::VirtAddr,
-    net::event_poll::{EPollItem, EventPoll},
+    net::event_poll::{EPollItem, KernelIoctlData},
     process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
@@ -308,6 +308,35 @@ impl IndexNode for TtyDevice {
         Ok(())
     }
 
+    fn kernel_ioctl(
+        &self,
+        arg: Arc<dyn KernelIoctlData>,
+        data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        let epitem = arg
+            .arc_any()
+            .downcast::<EPollItem>()
+            .map_err(|_| SystemError::EFAULT)?;
+
+        let _ = UserBufferReader::new(
+            &epitem as *const Arc<EPollItem>,
+            core::mem::size_of::<Arc<EPollItem>>(),
+            false,
+        )?;
+
+        let (tty, _) = if let FilePrivateData::Tty(tty_priv) = data {
+            (tty_priv.tty(), tty_priv.mode)
+        } else {
+            return Err(SystemError::EIO);
+        };
+
+        let core = tty.core();
+
+        core.add_epitem(epitem.clone());
+
+        return Ok(0);
+    }
+
     fn ioctl(&self, cmd: u32, arg: usize, data: &FilePrivateData) -> Result<usize, SystemError> {
         let (tty, _) = if let FilePrivateData::Tty(tty_priv) = data {
             (tty_priv.tty(), tty_priv.mode)
@@ -325,20 +354,6 @@ impl IndexNode for TtyDevice {
                 if cmd != TtyIoctlCmd::TIOCCBRK {
                     todo!()
                 }
-            }
-            EventPoll::ADD_EPOLLITEM => {
-                let _ = UserBufferReader::new(
-                    arg as *const Arc<EPollItem>,
-                    core::mem::size_of::<Arc<EPollItem>>(),
-                    false,
-                )?;
-                let epitem = unsafe { &*(arg as *const Arc<EPollItem>) };
-
-                let core = tty.core();
-
-                core.add_epitem(epitem.clone());
-
-                return Ok(0);
             }
             _ => {}
         }

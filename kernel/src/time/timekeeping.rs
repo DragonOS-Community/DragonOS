@@ -453,7 +453,7 @@ pub fn update_wall_time() {
 pub fn timekeeping_update() {
     // TODO：如果clearntp为true，则会清除NTP错误并调用ntp_clear()
 
-    // 更新实时时钟偏移量，用于跟踪硬件时钟与系统时间的差异，以便进行实践交郑
+    // 更新实时时钟偏移量，用于跟踪硬件时钟与系统时间的差异，以便进行时间校正
     update_rt_offset();
 }
 

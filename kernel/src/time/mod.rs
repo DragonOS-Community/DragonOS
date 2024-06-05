@@ -12,6 +12,7 @@ pub mod clocksource;
 pub mod jiffies;
 pub mod sleep;
 pub mod syscall;
+pub mod tick_common;
 pub mod timeconv;
 pub mod timekeep;
 pub mod timekeeping;

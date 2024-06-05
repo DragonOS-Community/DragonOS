@@ -1,0 +1,36 @@
+[package]
+name = "user_manage_tool"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "useradd"
+path = "src/cmd/useradd.rs"
+
+[[bin]]
+name = "userdel"
+path = "src/cmd/userdel.rs"
+
+[[bin]]
+name = "usermod"
+path = "src/cmd/usermod.rs"
+
+[[bin]]
+name = "passwd"
+path = "src/cmd/passwd.rs"
+
+[[bin]]
+name = "groupadd"
+path = "src/cmd/groupadd.rs"
+
+[[bin]]
+name = "groupdel"
+path = "src/cmd/groupdel.rs"
+
+[[bin]]
+name = "groupmod"
+path = "src/cmd/groupmod.rs"
+
+[dependencies]
+libc = "0.2.153"
+lazy_static = "1.4.0"

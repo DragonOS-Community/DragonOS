@@ -29,7 +29,7 @@ fn main() {
 
     if args.len() < 2 {
         ErrorHandler::error_handle(
-            "usage: useradd [options] username".to_string(),
+            format!("usage: {} [options] username", args[0]),
             ExitStatus::InvalidCmdSyntax,
         );
     }

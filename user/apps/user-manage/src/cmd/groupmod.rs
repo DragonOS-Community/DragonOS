@@ -29,7 +29,7 @@ fn main() {
 
     if args.len() < 2 {
         ErrorHandler::error_handle(
-            "usage: groupmod [options] groupname".to_string(),
+            format!("usage: {} [options] groupname", args[0]),
             ExitStatus::InvalidCmdSyntax,
         );
     }

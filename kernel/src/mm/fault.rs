@@ -449,6 +449,7 @@ impl PageFaultHandler {
     }
 
     pub unsafe fn do_fault_around(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+        log::info!("do_fault_around");
         if mapper.get_table(*pfm.address(), 0).is_none() {
             mapper
                 .allocate_table(*pfm.address(), 0)
@@ -456,7 +457,9 @@ impl PageFaultHandler {
         }
         let vma = pfm.vma();
         let vma_guard = vma.lock();
-        let vma_region = vma_guard.region();
+        let vma_region = *vma_guard.region();
+        drop(vma_guard);
+
         // 缺页在VMA中的偏移量
         let vm_pgoff = (*pfm.address() - vma_region.start()) >> MMArch::PAGE_SHIFT;
 

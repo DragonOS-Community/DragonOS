@@ -106,7 +106,7 @@ bitflags! {
         const PG_SWAPBACKED = 1 << 19;
     }
 }
-
+#[derive(Debug)]
 /// 物理页面信息
 pub struct Page {
     /// 映射计数

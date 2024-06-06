@@ -520,6 +520,10 @@ impl IndexNode for MountFSInode {
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         return self.do_parent().map(|inode| inode as Arc<dyn IndexNode>);
     }
+
+    fn page_cache(&self) -> Option<super::file::PageCache> {
+        self.inner_inode.page_cache()
+    }
 }
 
 impl FileSystem for MountFS {

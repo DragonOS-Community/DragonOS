@@ -13,6 +13,7 @@ use alloc::{
 };
 
 use crate::driver::base::device::device_number::DeviceNumber;
+use crate::filesystem::vfs::file::PageCache;
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
@@ -117,6 +118,9 @@ pub struct FATInode {
 
     /// 目录名
     dname: DName,
+
+    /// 页缓存
+    page_cache: PageCache,
 }
 
 impl FATInode {
@@ -214,6 +218,7 @@ impl LockedFATInode {
             },
             special_node: None,
             dname,
+            page_cache: PageCache::default(),
         })));
 
         inode.0.lock().self_ref = Arc::downgrade(&inode);
@@ -347,6 +352,7 @@ impl FATFileSystem {
             },
             special_node: None,
             dname: DName::default(),
+            page_cache: PageCache::default(),
         })));
 
         let result: Arc<FATFileSystem> = Arc::new(FATFileSystem {

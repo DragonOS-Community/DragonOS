@@ -122,15 +122,14 @@ impl FileMode {
 }
 
 #[allow(dead_code)]
+#[derive(Debug)]
 pub struct PageCache {
-    inode_ref: Weak<dyn IndexNode>,
     map: HashMap<usize, Arc<Page>>,
 }
 
 impl PageCache {
-    pub fn new(inode_ref: Weak<dyn IndexNode>) -> PageCache {
+    pub fn new() -> PageCache {
         Self {
-            inode_ref,
             map: HashMap::new(),
         }
     }
@@ -152,6 +151,12 @@ impl PageCache {
     //     }
     //     vec
     // }
+}
+
+impl Default for PageCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub trait PageCacheOperations: IndexNode {

@@ -120,7 +120,7 @@ pub struct FATInode {
     dname: DName,
 
     /// 页缓存
-    page_cache: PageCache,
+    page_cache: Arc<PageCache>,
 }
 
 impl FATInode {
@@ -218,7 +218,7 @@ impl LockedFATInode {
             },
             special_node: None,
             dname,
-            page_cache: PageCache::default(),
+            page_cache: Arc::new(PageCache::default()),
         })));
 
         inode.0.lock().self_ref = Arc::downgrade(&inode);
@@ -352,7 +352,7 @@ impl FATFileSystem {
             },
             special_node: None,
             dname: DName::default(),
-            page_cache: PageCache::default(),
+            page_cache: Arc::new(PageCache::default()),
         })));
 
         let result: Arc<FATFileSystem> = Arc::new(FATFileSystem {
@@ -1836,6 +1836,10 @@ impl IndexNode for LockedFATInode {
             .upgrade()
             .map(|item| item as Arc<dyn IndexNode>)
             .ok_or(SystemError::EINVAL)
+    }
+
+    fn page_cache(&self) -> Option<Arc<PageCache>> {
+        Some(self.0.lock().page_cache.clone())
     }
 }
 

@@ -22,8 +22,10 @@ use crate::{
 };
 
 use super::{
-    file::FileMode, syscall::ModeType, utils::DName, FilePrivateData, FileSystem, FileType,
-    IndexNode, InodeId, Magic, SuperBlock,
+    file::{FileMode, PageCache},
+    syscall::ModeType,
+    utils::DName,
+    FilePrivateData, FileSystem, FileType, IndexNode, InodeId, Magic, SuperBlock,
 };
 
 const MOUNTFS_BLOCK_SIZE: u64 = 512;
@@ -521,7 +523,7 @@ impl IndexNode for MountFSInode {
         return self.do_parent().map(|inode| inode as Arc<dyn IndexNode>);
     }
 
-    fn page_cache(&self) -> Option<super::file::PageCache> {
+    fn page_cache(&self) -> Option<Arc<PageCache>> {
         self.inner_inode.page_cache()
     }
 }

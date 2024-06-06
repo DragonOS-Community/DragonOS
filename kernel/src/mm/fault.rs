@@ -518,11 +518,7 @@ impl PageFaultHandler {
     ) -> VmFaultReason {
         let vma = pfm.vma();
         let vma_guard = vma.lock();
-        let file = vma_guard
-            .vm_file()
-            .expect("no vm_file in vma")
-            .upgrade()
-            .expect("struct file not exist");
+        let file = vma_guard.vm_file().expect("no vm_file in vma");
         let page_cache = file.inode().page_cache().unwrap();
 
         // 起始页地址
@@ -559,12 +555,8 @@ impl PageFaultHandler {
         log::info!("filemap_fault");
         let vma = pfm.vma();
         let vma_guard = vma.lock();
-        let file = vma_guard
-            .vm_file()
-            .expect("no vm_file in vma")
-            .upgrade()
-            .expect("struct file not exist");
-        let mut page_cache = file.inode().page_cache().unwrap();
+        let file = vma_guard.vm_file().expect("no vm_file in vma");
+        let page_cache = file.inode().page_cache().unwrap();
         let file_pgoff = pfm.file_pgoff.expect("no file_pgoff");
 
         if let Some(page) = page_cache.get_page(file_pgoff) {

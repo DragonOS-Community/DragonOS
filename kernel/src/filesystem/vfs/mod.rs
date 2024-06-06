@@ -554,8 +554,8 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return self.find("..");
     }
 
-    fn page_cache(&self) -> Option<PageCache> {
-        None
+    fn page_cache(&self) -> Option<Arc<PageCache>> {
+        panic!("function page_cache() has not yet been implemented");
     }
 }
 

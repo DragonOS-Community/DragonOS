@@ -124,22 +124,22 @@ impl FileMode {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct PageCache {
-    map: HashMap<usize, Arc<Page>>,
+    map: RwLock<HashMap<usize, Arc<Page>>>,
 }
 
 impl PageCache {
     pub fn new() -> PageCache {
         Self {
-            map: HashMap::new(),
+            map: RwLock::new(HashMap::new()),
         }
     }
 
-    pub fn add_page(&mut self, offset: usize, page: Arc<Page>) {
-        self.map.insert(offset, page);
+    pub fn add_page(&self, offset: usize, page: Arc<Page>) {
+        self.map.write().insert(offset, page);
     }
 
     pub fn get_page(&self, offset: usize) -> Option<Arc<Page>> {
-        self.map.get(&offset).cloned()
+        self.map.read().get(&offset).cloned()
     }
 
     // pub fn get_pages(&self, start_pgoff: usize, end_pgoff: usize) -> Vec<Arc<Page>> {
@@ -693,9 +693,8 @@ impl FileDescriptorVec {
         self.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
 
         // 把文件描述符数组对应位置设置为空
-        let file = self.fds[fd as usize].take().unwrap();
+        self.fds[fd as usize].take().unwrap();
 
-        assert!(Arc::strong_count(&file) == 1);
         return Ok(());
     }
 

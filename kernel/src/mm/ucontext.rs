@@ -383,8 +383,6 @@ impl InnerAddressSpace {
         // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
 
-        let file = Arc::downgrade(&file.unwrap());
-
         // offset需要4K对齐
         if !offset & (MMArch::PAGE_SIZE - 1) == 0 {
             return Err(SystemError::EINVAL);
@@ -405,7 +403,7 @@ impl InnerAddressSpace {
                         flags,
                         mapper,
                         flusher,
-                        Some(file),
+                        file,
                         Some(pgoff),
                     )
                 },
@@ -421,7 +419,7 @@ impl InnerAddressSpace {
                         VirtRegion::new(page.virt_address(), count.data() * MMArch::PAGE_SIZE),
                         vm_flags,
                         flags,
-                        Some(file),
+                        file,
                         Some(pgoff),
                         false,
                     )))
@@ -1359,7 +1357,7 @@ pub struct VMA {
     user_address_space: Option<Weak<AddressSpace>>,
     self_ref: Weak<LockedVMA>,
 
-    vm_file: Option<Weak<File>>,
+    vm_file: Option<Arc<File>>,
     /// VMA映射的文件部分相对于整个文件的偏移页数
     file_pgoff: Option<usize>,
 
@@ -1386,7 +1384,7 @@ impl VMA {
         region: VirtRegion,
         vm_flags: VmFlags,
         flags: EntryFlags<MMArch>,
-        file: Option<Weak<File>>,
+        file: Option<Arc<File>>,
         pgoff: Option<usize>,
         mapped: bool,
     ) -> Self {
@@ -1411,7 +1409,7 @@ impl VMA {
         return &self.vm_flags;
     }
 
-    pub fn vm_file(&self) -> Option<Weak<File>> {
+    pub fn vm_file(&self) -> Option<Arc<File>> {
         return self.vm_file.clone();
     }
 
@@ -1592,7 +1590,7 @@ impl VMA {
         flags: EntryFlags<MMArch>,
         mapper: &mut PageMapper,
         mut flusher: impl Flusher<MMArch>,
-        file: Option<Weak<File>>,
+        file: Option<Arc<File>>,
         pgoff: Option<usize>,
     ) -> Result<Arc<LockedVMA>, SystemError> {
         let mut cur_dest: VirtPageFrame = destination;

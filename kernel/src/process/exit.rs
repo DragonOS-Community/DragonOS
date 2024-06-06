@@ -249,6 +249,7 @@ fn do_waitpid(
             unsafe { ProcessManager::release(pid) };
             return Some(Ok(pid.into()));
         }
+        _ => {}
     };
 
     return None;

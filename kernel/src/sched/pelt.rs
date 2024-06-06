@@ -2,7 +2,9 @@ use core::intrinsics::unlikely;
 
 use alloc::sync::Arc;
 
-use crate::process::ProcessControlBlock;
+use crate::exception::InterruptArch;
+use crate::sched::CompletelyFairScheduler;
+use crate::{arch::CurrentIrqArch, process::ProcessControlBlock};
 
 use super::{
     fair::{CfsRunQueue, FairSchedEntity},
@@ -73,6 +75,7 @@ impl SchedulerAvg {
         self.accumulate_sum(delta, load, runnable, running) != 0
     }
 
+    #[inline]
     pub fn accumulate_sum(
         &mut self,
         mut delta: u64,
@@ -196,12 +199,15 @@ impl SchedulerAvg {
 }
 
 impl CpuRunQueue {
+    #[inline]
     pub fn rq_clock_pelt(&self) -> u64 {
+        // TODO assert_clock_updated
         self.clock_pelt - self.lost_idle_time
     }
 }
 
 impl CfsRunQueue {
+    #[cfg(CONFIG_CFS_BANDWIDTH)]
     pub fn cfs_rq_clock_pelt(&self) -> u64 {
         if unlikely(self.throttled_count > 0) {
             return self.throttled_clock_pelt - self.throttled_clock_pelt_time;
@@ -212,10 +218,31 @@ impl CfsRunQueue {
 
         return rq.rq_clock_pelt() - self.throttled_clock_pelt_time;
     }
+
+    #[cfg(not(CONFIG_CFS_BANDWIDTH))]
+    pub fn cfs_rq_clock_pelt(&self) -> u64 {
+        let rq = self.rq();
+        return rq.rq_clock_pelt();
+    }
+}
+
+impl CompletelyFairScheduler {
+    #[cfg(not(CONFIG_FAIR_GROUP_SCHED))]
+    #[allow(dead_code)]
+    fn self_update_blocked(rq: &mut CpuRunQueue, done: &mut bool) -> bool {
+        let binding = rq.cfs_rq();
+        let cfs = binding.force_mut();
+
+        let decayed = cfs.update_self_load_avg(cfs.cfs_rq_clock_pelt()) != 0;
+        if cfs.cfs_rq_has_blocked() {
+            *done = false;
+        }
+        return decayed;
+    }
 }
 
 impl FairSchedEntity {
-    pub fn update_load_avg(&mut self, cfs_rq: &mut CfsRunQueue, now: u64) -> bool {
+    pub fn update_self_load_avg(&mut self, cfs_rq: &mut CfsRunQueue, now: u64) -> bool {
         if self.avg.update_load_sum(
             now,
             self.on_rq as u32,
@@ -224,16 +251,53 @@ impl FairSchedEntity {
         ) {
             self.avg
                 .update_load_avg(LoadWeight::scale_load_down(self.load.weight));
-
+            // TODO(util_est): cfs_se_util_change
+            // TODO: trace_pelt_se_tp
             return true;
         }
 
         return false;
     }
+
+    #[allow(dead_code)]
+    fn self_update_load_avg_blocked_se(&mut self, now: u64) -> bool {
+        if self.avg.update_load_sum(now, 0, 0, 0) {
+            self.avg
+                .update_load_avg(LoadWeight::scale_load_down(self.load.weight));
+            // TODO: trace_pelt_se_tp
+            return true;
+        }
+
+        return false;
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn remove_entity_load_avg(&mut self) {
+        let cfs = self.cfs_rq();
+
+        self.sync_entity_load_avg();
+
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let mut removed_guard = cfs.removed.lock();
+        removed_guard.nr += 1;
+        removed_guard.util_avg += self.avg.util_avg;
+        removed_guard.load_avg += self.avg.load_avg;
+        removed_guard.runnable_avg += self.avg.runnable_avg;
+        drop(removed_guard);
+        drop(irq_guard);
+    }
+
+    fn sync_entity_load_avg(&mut self) {
+        let cfs = self.cfs_rq();
+        // config CONFIG_64BIT: do return cfs.avg.last_update_time
+        let last_update_time = cfs.avg.last_update_time;
+        self.self_update_load_avg_blocked_se(last_update_time);
+    }
 }
 
 bitflags! {
     pub struct UpdateAvgFlags: u8 {
+        const ZERO = 0x0;
         /// 更新任务组（task group）信息
         const UPDATE_TG	= 0x1;
 
@@ -246,6 +310,7 @@ bitflags! {
     }
 }
 
+#[allow(dead_code)]
 pub fn add_positive(x: &mut isize, y: isize) {
     let res = *x + y;
     *x = res.max(0);

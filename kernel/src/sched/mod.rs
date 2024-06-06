@@ -677,6 +677,10 @@ impl CpuRunQueue {
 
         todo!()
     }
+
+    #[cfg(not(CONFIG_CPU_FREQ))]
+    #[inline]
+    fn cpufreq_update_util(&self, _flags: u32) {}
 }
 
 bitflags! {

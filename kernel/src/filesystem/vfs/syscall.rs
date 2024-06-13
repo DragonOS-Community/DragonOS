@@ -7,6 +7,7 @@ use log::warn;
 use system_error::SystemError;
 
 use crate::producefs;
+use crate::syscall::user_access::UserBufferReader;
 use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
     filesystem::vfs::{core as Vcore, file::FileDescriptorVec},
@@ -1644,9 +1645,9 @@ impl Syscall {
         let times = if times.is_null() {
             None
         } else {
-            let atime = unsafe { times.read() };
-            let mtime = unsafe { times.add(1).read() };
-            Some([atime, mtime])
+            let times_reader = UserBufferReader::new(times, size_of::<PosixTimeSpec>() * 2, true)?;
+            let times = times_reader.read_from_user::<PosixTimeSpec>(0)?;
+            Some([times[0], times[1]])
         };
         do_utimensat(dirfd, pathname, times, flags)
     }
@@ -1659,9 +1660,9 @@ impl Syscall {
         let times = if times.is_null() {
             None
         } else {
-            let atime = unsafe { times.read() };
-            let mtime = unsafe { times.add(1).read() };
-            Some([atime, mtime])
+            let times_reader = UserBufferReader::new(times, size_of::<PosixTimeval>() * 2, true)?;
+            let times = times_reader.read_from_user::<PosixTimeval>(0)?;
+            Some([times[0], times[1]])
         };
         do_utimes(&pathname, times)
     }

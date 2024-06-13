@@ -5,6 +5,7 @@ use core::{
 };
 
 use crate::arch::CurrentTimeArch;
+use crate::time::syscall::PosixTimeval;
 
 use self::timekeeping::getnstimeofday;
 
@@ -110,6 +111,15 @@ impl From<Duration> for PosixTimeSpec {
         PosixTimeSpec {
             tv_sec: dur.total_micros() as i64 / 1000000,
             tv_nsec: (dur.total_micros() as i64 % 1000000) * 1000,
+        }
+    }
+}
+
+impl From<PosixTimeval> for PosixTimeSpec {
+    fn from(value: PosixTimeval) -> Self {
+        PosixTimeSpec {
+            tv_sec: value.tv_sec,
+            tv_nsec: value.tv_usec as i64 * 1000,
         }
     }
 }

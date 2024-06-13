@@ -11,7 +11,7 @@ use crate::init::initcall::INITCALL_SUBSYS;
 use crate::mm::PhysAddr;
 
 use acpi::mcfg::Mcfg;
-use log::{error, warn};
+use log::warn;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 

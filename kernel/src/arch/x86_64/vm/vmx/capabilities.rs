@@ -1,12 +1,6 @@
 use raw_cpuid::CpuId;
 use x86::{
-    msr::{
-        IA32_VMX_BASIC, IA32_VMX_CR0_FIXED0, IA32_VMX_CR0_FIXED1, IA32_VMX_CR4_FIXED0,
-        IA32_VMX_CR4_FIXED1, IA32_VMX_ENTRY_CTLS, IA32_VMX_EPT_VPID_CAP, IA32_VMX_EXIT_CTLS,
-        IA32_VMX_MISC, IA32_VMX_PINBASED_CTLS, IA32_VMX_PROCBASED_CTLS, IA32_VMX_PROCBASED_CTLS2,
-        IA32_VMX_TRUE_ENTRY_CTLS, IA32_VMX_TRUE_EXIT_CTLS, IA32_VMX_TRUE_PINBASED_CTLS,
-        IA32_VMX_TRUE_PROCBASED_CTLS, IA32_VMX_VMCS_ENUM, IA32_VMX_VMFUNC,
-    },
+    msr,
     vmx::vmcs::control::{
         EntryControls, ExitControls, PinbasedControls, PrimaryControls, SecondaryControls,
     },
@@ -108,68 +102,68 @@ impl NestedVmxMsrs {
 
     pub fn get_vmx_msr(&self, msr_index: u32) -> Option<u64> {
         match msr_index {
-            IA32_VMX_BASIC => {
+            msr::IA32_VMX_BASIC => {
                 return Some(self.basic);
             }
-            IA32_VMX_TRUE_PINBASED_CTLS | IA32_VMX_PINBASED_CTLS => {
+            msr::IA32_VMX_TRUE_PINBASED_CTLS | msr::IA32_VMX_PINBASED_CTLS => {
                 let mut data =
                     NestedVmxMsrs::control_msr(self.pinbased_ctls_low, self.pinbased_ctls_high);
-                if msr_index == IA32_VMX_PINBASED_CTLS {
+                if msr_index == msr::IA32_VMX_PINBASED_CTLS {
                     data |= PIN_BASED_ALWAYSON_WITHOUT_TRUE_MSR;
                 }
                 return Some(data);
             }
-            IA32_VMX_TRUE_PROCBASED_CTLS | IA32_VMX_PROCBASED_CTLS => {
+            msr::IA32_VMX_TRUE_PROCBASED_CTLS | msr::IA32_VMX_PROCBASED_CTLS => {
                 let mut data =
                     NestedVmxMsrs::control_msr(self.procbased_ctls_low, self.procbased_ctls_high);
-                if msr_index == IA32_VMX_PROCBASED_CTLS {
+                if msr_index == msr::IA32_VMX_PROCBASED_CTLS {
                     data |= CPU_BASED_ALWAYSON_WITHOUT_TRUE_MSR;
                 }
                 return Some(data);
             }
-            IA32_VMX_TRUE_EXIT_CTLS | IA32_VMX_EXIT_CTLS => {
+            msr::IA32_VMX_TRUE_EXIT_CTLS | msr::IA32_VMX_EXIT_CTLS => {
                 let mut data = NestedVmxMsrs::control_msr(self.exit_ctls_low, self.exit_ctls_high);
-                if msr_index == IA32_VMX_EXIT_CTLS {
+                if msr_index == msr::IA32_VMX_EXIT_CTLS {
                     data |= VM_EXIT_ALWAYSON_WITHOUT_TRUE_MSR;
                 }
                 return Some(data);
             }
-            IA32_VMX_TRUE_ENTRY_CTLS | IA32_VMX_ENTRY_CTLS => {
+            msr::IA32_VMX_TRUE_ENTRY_CTLS | msr::IA32_VMX_ENTRY_CTLS => {
                 let mut data =
                     NestedVmxMsrs::control_msr(self.entry_ctls_low, self.entry_ctls_high);
-                if msr_index == IA32_VMX_ENTRY_CTLS {
+                if msr_index == msr::IA32_VMX_ENTRY_CTLS {
                     data |= VM_ENTRY_ALWAYSON_WITHOUT_TRUE_MSR;
                 }
                 return Some(data);
             }
-            IA32_VMX_MISC => {
+            msr::IA32_VMX_MISC => {
                 return Some(NestedVmxMsrs::control_msr(self.misc_low, self.misc_high));
             }
-            IA32_VMX_CR0_FIXED0 => {
+            msr::IA32_VMX_CR0_FIXED0 => {
                 return Some(self.cr0_fixed0);
             }
-            IA32_VMX_CR0_FIXED1 => {
+            msr::IA32_VMX_CR0_FIXED1 => {
                 return Some(self.cr0_fixed1);
             }
-            IA32_VMX_CR4_FIXED0 => {
+            msr::IA32_VMX_CR4_FIXED0 => {
                 return Some(self.cr4_fixed0);
             }
-            IA32_VMX_CR4_FIXED1 => {
+            msr::IA32_VMX_CR4_FIXED1 => {
                 return Some(self.cr4_fixed1);
             }
-            IA32_VMX_VMCS_ENUM => {
+            msr::IA32_VMX_VMCS_ENUM => {
                 return Some(self.vmcs_enum);
             }
-            IA32_VMX_PROCBASED_CTLS2 => {
+            msr::IA32_VMX_PROCBASED_CTLS2 => {
                 return Some(NestedVmxMsrs::control_msr(
                     self.secondary_ctls_low,
                     self.secondary_ctls_high,
                 ));
             }
-            IA32_VMX_EPT_VPID_CAP => {
+            msr::IA32_VMX_EPT_VPID_CAP => {
                 return Some(self.ept_caps as u64 | ((self.vpid_caps as u64) << 32));
             }
-            IA32_VMX_VMFUNC => {
+            msr::IA32_VMX_VMFUNC => {
                 return Some(self.vmfunc_controls);
             }
             _ => {
@@ -243,6 +237,7 @@ impl VmxCapability {
 impl Vmx {
     /// 检查处理器是否支持VMX基本控制结构的输入输出功能
     #[inline]
+    #[allow(dead_code)]
     pub fn has_basic_inout(&self) -> bool {
         return ((self.vmcs_config.basic_cap as u64) << 32) & VmxFeat::VMX_BASIC_INOUT != 0;
     }
@@ -400,6 +395,11 @@ impl Vmx {
     #[inline]
     pub fn has_ept_mt_wb(&self) -> bool {
         return self.vmx_cap.ept.contains(EptFlag::EPTP_WB);
+    }
+
+    #[inline]
+    pub fn has_vmx_invept_context(&self) -> bool {
+        self.vmx_cap.ept.contains(EptFlag::EPT_EXTENT_CONTEXT)
     }
 
     /// EPT是否支持全局拓展

@@ -1,7 +1,4 @@
-use core::mem::MaybeUninit;
-
 use alloc::{
-    alloc::Global,
     boxed::Box,
     string::String,
     sync::{Arc, Weak},
@@ -9,21 +6,18 @@ use alloc::{
 
 use crate::{
     arch::{
-        vm::{kvm_host::vcpu::VirCpuRequest, vmx::VmxVCpuPriv},
+        vm::{kvm_host::vcpu::VirtCpuRequest, vmx::VmxVCpuPriv},
         VirtCpuArch,
     },
-    libs::{
-        lazy_init::Lazy,
-        spinlock::{SpinLock, SpinLockGuard},
-    },
-    process::{Pid, ProcessManager},
+    libs::spinlock::{SpinLock, SpinLockGuard},
+    process::Pid,
     smp::cpu::ProcessorId,
     virt::vm::user_api::UapiKvmRun,
 };
 
 use super::{
-    mem::{GfnToHvaCache, KvmMemSlot, PfnCacheUsage},
-    LockedVm, Vm,
+    mem::{GfnToHvaCache, KvmMemSlot},
+    LockedVm,
 };
 
 #[derive(Debug)]
@@ -43,6 +37,15 @@ impl LockedVirtCpu {
     }
 }
 
+#[derive(Debug, PartialEq)]
+#[allow(dead_code)]
+pub enum VcpuMode {
+    OutsideGuestMode,
+    InGuestMode,
+    ExitingGuestMode,
+    ReadingShadowPageTables,
+}
+
 #[derive(Debug)]
 pub struct VirtCpu {
     pub cpu: ProcessorId,
@@ -59,13 +62,15 @@ pub struct VirtCpu {
     pub pv_time: GfnToHvaCache,
     pub arch: VirtCpuArch,
 
+    pub mode: VcpuMode,
+
     pub guest_debug: GuestDebug,
 
     #[cfg(target_arch = "x86_64")]
     pub private: Option<VmxVCpuPriv>,
 
     /// 记录请求
-    pub request: VirCpuRequest,
+    pub request: VirtCpuRequest,
     pub run: Option<Box<UapiKvmRun>>,
 }
 

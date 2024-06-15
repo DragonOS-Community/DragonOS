@@ -1,16 +1,20 @@
+use crate::{arch::mm::X86_64MMArch, kdebug};
 use alloc::{sync::Arc, vec::Vec};
 use bitfield_struct::bitfield;
+use core::intrinsics::likely;
 use raw_cpuid::CpuId;
+use system_error::SystemError;
 use x86::controlregs::{Cr0, Cr4};
 use x86_64::registers::control::EferFlags;
 
 use crate::{
-    arch::{MMArch, VirtCpuArch},
+    arch::{mm::LockedFrameAllocator, MMArch, VirtCpuArch},
     libs::spinlock::{SpinLock, SpinLockGuard},
-    mm::MemoryManagementArch,
+    mm::{page::PageMapper, MemoryManagementArch, PageTableKind},
+    virt::vm::kvm_host::{vcpu::VirtCpu, Vm},
 };
 
-use super::vmx::vmx_info;
+use super::{vmx::vmx_info, x86_kvm_ops};
 
 const PT64_ROOT_5LEVEL: usize = 5;
 const PT64_ROOT_4LEVEL: usize = 4;
@@ -27,6 +31,7 @@ static mut SHADOW_ACCESSED_MASK: usize = 0;
 
 static mut MAX_HUGE_PAGE_LEVEL: PageLevel = PageLevel::None;
 
+#[allow(dead_code)]
 pub enum PageLevel {
     None,
     Level4k,
@@ -54,10 +59,11 @@ impl LockedKvmMmu {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct KvmMmu {
-    root: KvmMmuRootInfo,
-    cpu_role: KvmCpuRole,
-    root_role: KvmMmuPageRole,
+    pub root: KvmMmuRootInfo,
+    pub cpu_role: KvmCpuRole,
+    pub root_role: KvmMmuPageRole,
 
     pkru_mask: u32,
 
@@ -68,7 +74,7 @@ pub struct KvmMmu {
 
 impl KvmMmu {
     const KVM_MMU_NUM_PREV_ROOTS: usize = 3;
-    const INVALID_PAGE: u64 = u64::MAX;
+    pub const INVALID_PAGE: u64 = u64::MAX;
 
     #[inline]
     pub fn tdp_enabled() -> bool {
@@ -121,8 +127,8 @@ impl KvmMmu {
 
 #[derive(Debug, Default)]
 pub struct KvmMmuRootInfo {
-    pgd: u64,
-    hpa: u64,
+    pub pgd: u64,
+    pub hpa: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -381,6 +387,11 @@ impl VirtCpuArch {
         self.root_mmu.as_ref().unwrap()
     }
 
+    #[inline]
+    pub fn mmu(&self) -> SpinLockGuard<KvmMmu> {
+        self.mmu.as_ref().unwrap().lock()
+    }
+
     fn calc_tdp_mmu_root_page_role(&self, cpu_role: KvmCpuRole) -> KvmMmuPageRole {
         let mut role = KvmMmuPageRole::default();
 
@@ -395,5 +406,90 @@ impl VirtCpuArch {
         role.set_has_4_byte_gpte(false);
 
         role
+    }
+}
+
+impl VirtCpu {
+    pub fn kvm_mmu_reload(&mut self, vm: &Vm) -> Result<(), SystemError> {
+        if likely(self.arch.mmu().root.hpa != KvmMmu::INVALID_PAGE) {
+            return Ok(());
+        }
+
+        return self.kvm_mmu_load(vm);
+    }
+
+    pub fn kvm_mmu_load(&mut self, vm: &Vm) -> Result<(), SystemError> {
+        let direct = self.arch.mmu().root_role.direct();
+        self.mmu_topup_memory_caches(!direct)?;
+        self.mmu_alloc_special_roots()?;
+
+        if direct {
+            self.mmu_alloc_direct_roots()?;
+        } else {
+            self.mmu_alloc_shadow_roots()?;
+        }
+
+        // TODO: kvm_mmu_sync_roots
+
+        self.kvm_mmu_load_pgd(vm);
+
+        Ok(())
+    }
+
+    pub fn kvm_mmu_load_pgd(&mut self, vm: &Vm) {
+        let root_hpa = self.arch.mmu().root.hpa;
+
+        if root_hpa == KvmMmu::INVALID_PAGE {
+            return;
+        }
+
+        let level = self.arch.mmu().root_role.level();
+        x86_kvm_ops().load_mmu_pgd(self, vm, root_hpa, level);
+    }
+
+    fn mmu_topup_memory_caches(&mut self, _maybe_indirect: bool) -> Result<(), SystemError> {
+        // TODO
+        Ok(())
+    }
+
+    fn mmu_alloc_special_roots(&mut self) -> Result<(), SystemError> {
+        // TODO
+        Ok(())
+    }
+
+    fn mmu_alloc_direct_roots(&mut self) -> Result<(), SystemError> {
+        // let shadow_root_level = self.arch.mmu().root_role.level();
+
+        // if KvmMmu::tdp_enabled() {
+        //     todo!()
+        // } else if shadow_root_level >= PT64_ROOT_4LEVEL as u32 {
+        //     todo!()
+        // } else if shadow_root_level == PT32E_ROOT_LEVEL as u32 {
+        //     todo!()
+        // } else {
+        //     kerror!("Bad TDP root level = {}", shadow_root_level);
+        //     return Err(SystemError::EIO);
+        // }
+
+        // self.arch.mmu().root.pgd = 0;
+        // Ok(())
+
+        // 申请并创建新的页表
+        let mapper: crate::mm::page::PageMapper<X86_64MMArch, LockedFrameAllocator> = unsafe {
+            PageMapper::create(PageTableKind::EPT, LockedFrameAllocator)
+                .ok_or(SystemError::ENOMEM)?
+        };
+
+        let ept_root_hpa = mapper.table().phys();
+
+        self.arch.mmu().root.hpa = ept_root_hpa.data() as u64;
+
+        kdebug!("ept_root_hpa:{:x}!", ept_root_hpa.data() as u64);
+
+        Ok(())
+    }
+
+    fn mmu_alloc_shadow_roots(&mut self) -> Result<(), SystemError> {
+        todo!();
     }
 }

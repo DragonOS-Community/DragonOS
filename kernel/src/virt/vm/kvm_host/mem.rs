@@ -1,20 +1,20 @@
 use alloc::{
     boxed::Box,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use bitmap::AllocBitmap;
 use hashbrown::HashMap;
 use system_error::SystemError;
-use x86::bits64::registers::rbp;
 
 use crate::{
-    arch::{kvm_arch_ops, MMArch},
+    arch::MMArch,
     libs::{
         rbtree::RBTree,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::{MemoryManagementArch, PhysAddr, VirtAddr},
+    mm::{MemoryManagementArch, VirtAddr},
     virt::vm::{kvm_host::KVM_ADDRESS_SPACE_NUM, user_api::KvmUserspaceMemoryRegion},
 };
 
@@ -24,6 +24,44 @@ pub const KVM_USER_MEM_SLOTS: u16 = u16::MAX;
 pub const KVM_INTERNAL_MEM_SLOTS: u16 = 3;
 pub const KVM_MEM_SLOTS_NUM: u16 = KVM_USER_MEM_SLOTS - KVM_INTERNAL_MEM_SLOTS;
 pub const KVM_MEM_MAX_NR_PAGES: usize = (1 << 31) - 1;
+
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+pub struct KvmMmuMemoryCache {
+    gfp_zero: u32,
+    gfp_custom: u32,
+    capacity: usize,
+    nobjs: usize,
+    objects: Option<Box<Vec<u8>>>,
+}
+impl KvmMmuMemoryCache {
+    #[allow(dead_code)]
+    pub fn kvm_mmu_totup_memory_cache(
+        &mut self,
+        _capacity: usize,
+        _min: usize,
+    ) -> Result<(), SystemError> {
+        // let gfp = if self.gfp_custom != 0 {
+        //     self.gfp_custom
+        // } else {
+        //     todo!();
+        // };
+
+        // if self.nobjs >= min {
+        //     return Ok(());
+        // }
+
+        // if unlikely(self.objects.is_none()) {
+        //     if self.capacity == 0 {
+        //         return Err(SystemError::EIO);
+        //     }
+
+        //     // self.objects = Some(Box::new)
+        // }
+
+        Ok(())
+    }
+}
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
 pub struct AddrRange {
@@ -127,6 +165,7 @@ impl LockedVmMemSlotSet {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct GfnToHvaCache {
     generation: u64,
     /// 客户机对应物理地址（Guest Physical Address）

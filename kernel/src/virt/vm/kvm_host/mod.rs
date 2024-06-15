@@ -4,24 +4,22 @@ use core::{
 };
 
 use alloc::{
-    alloc::Global,
     boxed::Box,
     sync::{Arc, Weak},
     vec::Vec,
 };
 use hashbrown::HashMap;
 use system_error::SystemError;
-use x86::bits64::registers::rsp;
 
 use crate::{
     arch::{
-        vm::{kvm_host::vcpu::VirCpuRequest, vmx::KvmVmx, x86_kvm_manager},
+        vm::{kvm_host::vcpu::VirtCpuRequest, vmx::KvmVmx, x86_kvm_manager},
         CurrentKvmManager, KvmArch, VirtCpuArch,
     },
     filesystem::vfs::file::{File, FileMode},
     libs::spinlock::{SpinLock, SpinLockGuard},
     mm::ucontext::AddressSpace,
-    process::{KernelStack, ProcessManager},
+    process::ProcessManager,
     smp::cpu::ProcessorId,
     virt::vm::{
         kvm_dev::KvmVcpuDev,
@@ -31,7 +29,7 @@ use crate::{
 
 use self::{
     mem::{GfnToHvaCache, KvmMemSlotSet, LockedVmMemSlotSet, PfnCacheUsage},
-    vcpu::GuestDebug,
+    vcpu::{GuestDebug, VcpuMode},
 };
 
 pub mod mem;
@@ -117,6 +115,7 @@ impl LockedVm {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct Vm {
     lock_vm_ref: Weak<LockedVm>,
     mm: Arc<AddressSpace>,
@@ -203,10 +202,11 @@ impl Vm {
             pv_time: GfnToHvaCache::init(self.lock_vm_ref.clone(), PfnCacheUsage::HOST_USES_PFN),
             arch: VirtCpuArch::new(),
             private: None,
-            request: VirCpuRequest::empty(),
+            request: VirtCpuRequest::empty(),
             guest_debug: GuestDebug::empty(),
             run: unsafe { Some(Box::new_zeroed().assume_init()) },
             vcpu_idx: 0,
+            mode: VcpuMode::OutsideGuestMode,
         };
     }
 
@@ -223,6 +223,7 @@ impl Vm {
 
 /// ## 多处理器状态（有些状态在某些架构并不合法）
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub enum MutilProcessorState {
     Runnable,
     Uninitialized,

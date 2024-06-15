@@ -1,14 +1,11 @@
-use core::{
-    intrinsics::unlikely,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use core::intrinsics::unlikely;
 
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
 use crate::{
     arch::{
-        vm::{kvm_host::KvmCommonRegs, uapi::UapiKvmSegmentRegs, x86_kvm_manager},
+        vm::{kvm_host::KvmCommonRegs, uapi::UapiKvmSegmentRegs},
         MMArch,
     },
     driver::base::device::device_number::DeviceNumber,
@@ -29,10 +26,7 @@ use crate::{
     virt::vm::user_api::{KvmUserspaceMemoryRegion, PosixKvmUserspaceMemoryRegion},
 };
 
-use super::kvm_host::{
-    vcpu::{LockedVirtCpu, VirtCpu},
-    LockedVm, Vm,
-};
+use super::kvm_host::{vcpu::LockedVirtCpu, LockedVm};
 
 #[derive(Debug)]
 pub struct KvmInode {
@@ -269,9 +263,9 @@ impl IndexNode for KvmInstance {
 
     fn read_at(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
         _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         todo!()
@@ -279,9 +273,9 @@ impl IndexNode for KvmInstance {
 
     fn write_at(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &[u8],
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
         _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         todo!()
@@ -370,10 +364,9 @@ impl IndexNode for KvmVcpuDev {
         arg: usize,
         _private_data: &crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, SystemError> {
-        kdebug!("vcpu ioctl cmd {cmd:x}");
         match cmd {
             Self::KVM_RUN => {
-                if arg != 0  {
+                if arg != 0 {
                     return Err(SystemError::EINVAL);
                 }
                 let mut vcpu = self.vcpu.lock();
@@ -454,9 +447,9 @@ impl IndexNode for KvmVcpuDev {
 
     fn read_at(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
         _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         todo!()
@@ -464,9 +457,9 @@ impl IndexNode for KvmVcpuDev {
 
     fn write_at(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &[u8],
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
         _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         todo!()

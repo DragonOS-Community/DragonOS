@@ -1,7 +1,6 @@
 use core::arch::asm;
 
 use alloc::slice;
-use bitfield_struct::bitfield;
 use raw_cpuid::CpuId;
 use system_error::SystemError;
 use x86::{
@@ -11,14 +10,16 @@ use x86::{
         rdmsr, wrmsr, IA32_FEATURE_CONTROL, IA32_VMX_CR0_FIXED0, IA32_VMX_CR0_FIXED1,
         IA32_VMX_CR4_FIXED0, IA32_VMX_CR4_FIXED1,
     },
+    vmx::vmcs::ro,
 };
-use x86_64::registers::xcontrol::XCr0;
 
 use crate::{
     arch::mm::barrier,
-    kdebug, kwarn,
+    kdebug, kerror,
     mm::{phys_2_virt, PhysAddr},
 };
+
+use super::vmx::vmx_info;
 
 pub struct KvmX86Asm;
 
@@ -33,7 +34,7 @@ impl KvmX86Asm {
         return 0;
     }
 
-    pub fn write_pkru(val: u32) {
+    pub fn write_pkru(_val: u32) {
         let cpuid = CpuId::new();
         if let Some(feat) = cpuid.get_extended_feature_info() {
             if feat.has_ospke() {
@@ -45,13 +46,13 @@ impl KvmX86Asm {
     fn rdpkru() -> u32 {
         let ecx: u32 = 0;
         let pkru: u32;
-        let edx: u32;
+        let _edx: u32;
 
         unsafe {
             asm!(
                 "rdpkru",
                 out("eax") pkru,
-                out("edx") edx,
+                out("edx") _edx,
                 in("ecx") ecx,
             );
         }
@@ -137,10 +138,28 @@ impl VmxAsm {
         }
     }
 
+    #[allow(dead_code)]
     const VMX_VPID_EXTENT_INDIVIDUAL_ADDR: u64 = 0;
     const VMX_VPID_EXTENT_SINGLE_CONTEXT: u64 = 1;
+    #[allow(dead_code)]
     const VMX_VPID_EXTENT_ALL_CONTEXT: u64 = 2;
     const VMX_VPID_EXTENT_SINGLE_NON_GLOBAL: u64 = 3;
+
+    const VMX_EPT_EXTENT_CONTEXT: u64 = 1;
+    const VMX_EPT_EXTENT_GLOBAL: u64 = 2;
+    const VMX_EPT_EXTENT_SHIFT: u64 = 24;
+
+    pub fn ept_sync_global() {
+        Self::invept(Self::VMX_EPT_EXTENT_GLOBAL, 0, 0);
+    }
+
+    pub fn ept_sync_context(eptp: u64) {
+        if vmx_info().has_vmx_invept_context() {
+            Self::invept(Self::VMX_EPT_EXTENT_CONTEXT, eptp, 0);
+        } else {
+            Self::ept_sync_global();
+        }
+    }
 
     pub fn sync_vcpu_single(vpid: u16) {
         if vpid == 0 {
@@ -155,32 +174,44 @@ impl VmxAsm {
     }
 
     #[inline(always)]
+    fn invept(ext: u64, eptp: u64, gpa: u64) {
+        #[repr(C)]
+        struct InveptDescriptor {
+            eptp: u64,
+            gpa: u64,
+        }
+
+        let descriptor = InveptDescriptor { eptp, gpa };
+
+        unsafe {
+            asm!(
+                "invept {0}, [{1}]",
+                in(reg) ext,
+                in(reg) &descriptor,
+                options(nostack)
+            );
+        }
+    }
+
+    #[inline(always)]
     fn invvpid(ext: u64, vpid: u16, gva: u64) {
-        // 定义包含指令操作数的结构体
-        #[bitfield(u128)]
-        struct Operand {
-            #[bits(16)]
-            vpid: u64,
-            #[bits(48)]
+        #[repr(C)]
+        struct InvvpidDescriptor {
+            vpid: u16,
             rsvd: u64,
             gva: u64,
         }
 
-        // 构造操作数
-        let mut operand = Operand::new();
-        operand.set_vpid(vpid as u64);
-        operand.set_gva(gva);
+        let descriptor = InvvpidDescriptor { vpid, rsvd: 0, gva };
 
-        // 定义嵌入汇编块
-
-        kwarn!("TODO: asm invvpid");
-        // unsafe {
-        //     asm!(
-        //         "invvpid {0} {1}",
-        //         inlateout(reg) ext => _,
-        //         inlateout(reg) &operand => _,
-        //     );
-        // }
+        unsafe {
+            asm!(
+                "invvpid {0}, [{1}]",
+                in(reg) ext,
+                in(reg) &descriptor,
+                options(nostack)
+            );
+        }
     }
 
     /// Set the mandatory bits in CR4 and clear bits that are mandatory zero
@@ -234,7 +265,46 @@ impl VmxAsm {
     }
 }
 
+#[no_mangle]
+unsafe extern "C" fn vmx_vmlaunch() {
+    if let Err(e) = x86::bits64::vmx::vmlaunch() {
+        kerror!(
+            "vmx_launch fail: {:?}, err code {}",
+            e,
+            VmxAsm::vmx_vmread(ro::VM_INSTRUCTION_ERROR)
+        );
+    }
+}
+
 bitflags! {
+    pub struct IntrInfo: u32 {
+        const INTR_INFO_VECTOR_MASK = 0xff;
+        const INTR_INFO_INTR_TYPE_MASK = 0x700;
+        const INTR_INFO_DELIVER_CODE_MASK = 0x800;
+        const INTR_INFO_UNBLOCK_NMI = 0x1000;
+        const INTR_INFO_VALID_MASK = 0x80000000;
+        const INTR_INFO_RESVD_BITS_MASK = 0x7ffff000;
+    }
+
+    pub struct IntrType: u32 {
+        /// external interrupt
+        const INTR_TYPE_EXT_INTR = (0 << 8);
+        /// reserved
+        const INTR_TYPE_RESERVED = (1 << 8);
+        /// NMI
+        const INTR_TYPE_NMI_INTR = (2 << 8);
+        /// processor exception
+        const INTR_TYPE_HARD_EXCEPTION = (3 << 8);
+        /// software interrupt
+        const INTR_TYPE_SOFT_INTR = (4 << 8);
+        /// ICE breakpoint - undocumented
+        const INTR_TYPE_PRIV_SW_EXCEPTION = (5 << 8);
+        /// software exception
+        const INTR_TYPE_SOFT_EXCEPTION = (6 << 8);
+        /// other even
+        const INTR_TYPE_OTHER_EVENT = (7 << 8);
+    }
+
     pub struct MiscEnable: u64 {
         const MSR_IA32_MISC_ENABLE_FAST_STRING = 1 << 0;
         const MSR_IA32_MISC_ENABLE_TCC = 1 << 1;
@@ -351,6 +421,7 @@ pub struct VmxMsrEntry {
     pub data: u64,
 }
 
+#[allow(dead_code)]
 pub mod hyperv {
     /* Hyper-V specific model specific registers (MSRs) */
 
@@ -477,6 +548,7 @@ pub mod hyperv {
     pub const HV_X64_MSR_SYNDBG_OPTIONS: u32 = 0x400000FF;
 }
 
+#[allow(dead_code)]
 pub mod kvm_msr {
     pub const MSR_KVM_WALL_CLOCK: u32 = 0x11;
     pub const MSR_KVM_SYSTEM_TIME: u32 = 0x12;

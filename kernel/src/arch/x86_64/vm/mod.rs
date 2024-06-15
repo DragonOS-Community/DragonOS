@@ -1,35 +1,15 @@
-use core::arch::x86_64::{_xgetbv, _XCR_XFEATURE_ENABLED_MASK};
-
 use alloc::vec::Vec;
 use raw_cpuid::CpuId;
 use system_error::SystemError;
 use x86::{
-    controlregs::{xcr0, Cr0, Cr4, Xcr0},
-    msr::{
-        rdmsr, IA32_BIOS_SIGN_ID, IA32_CSTAR, IA32_EFER, IA32_FEATURE_CONTROL, IA32_FMASK,
-        IA32_KERNEL_GSBASE, IA32_LSTAR, IA32_MCG_CTL, IA32_MCG_STATUS, IA32_MISC_ENABLE, IA32_PAT,
-        IA32_PERFEVTSEL0, IA32_PERFEVTSEL7, IA32_PERF_CAPABILITIES, IA32_PMC0, IA32_PMC7,
-        IA32_SMBASE, IA32_STAR, IA32_SYSENTER_CS, IA32_SYSENTER_EIP, IA32_SYSENTER_ESP,
-        IA32_TIME_STAMP_COUNTER, IA32_TSC_ADJUST, IA32_TSC_AUX, IA32_TSC_DEADLINE, IA32_VMX_BASIC,
-        IA32_VMX_CR0_FIXED0, IA32_VMX_CR4_FIXED0, IA32_VMX_EPT_VPID_CAP, IA32_VMX_MISC,
-        IA32_VMX_PROCBASED_CTLS2, IA32_VMX_TRUE_ENTRY_CTLS, IA32_VMX_TRUE_EXIT_CTLS,
-        IA32_VMX_TRUE_PINBASED_CTLS, IA32_VMX_TRUE_PROCBASED_CTLS, IA32_VMX_VMCS_ENUM,
-        IA32_VMX_VMFUNC, MSR_C1_PMON_EVNT_SEL0, MSR_C5_PMON_BOX_CTRL, MSR_IA32_ADDR0_END,
-        MSR_IA32_ADDR0_START, MSR_IA32_ADDR1_END, MSR_IA32_ADDR1_START, MSR_IA32_ADDR2_END,
-        MSR_IA32_ADDR2_START, MSR_IA32_ADDR3_END, MSR_IA32_ADDR3_START, MSR_IA32_CR3_MATCH,
-        MSR_IA32_RTIT_CTL, MSR_IA32_RTIT_OUTPUT_BASE, MSR_IA32_RTIT_OUTPUT_MASK_PTRS,
-        MSR_IA32_RTIT_STATUS, MSR_IA32_TSX_CTRL, MSR_PERF_FIXED_CTR0, MSR_PERF_FIXED_CTR2,
-        MSR_PLATFORM_INFO, MSR_POWER_CTL, MSR_SMI_COUNT,
-    },
+    controlregs::{cr4, xcr0, Cr0, Cr4, Xcr0},
+    msr::{self, rdmsr, wrmsr},
 };
-use x86_64::registers::{
-    control::{Efer, EferFlags},
-    xcontrol::{XCr0, XCr0Flags},
-};
+use x86_64::registers::control::{Efer, EferFlags};
 
 use crate::{
     arch::vm::vmx::{VmxL1dFlushState, L1TF_VMX_MITIGATION},
-    kdebug, kerror,
+    kerror, kwarn,
     libs::once::Once,
     mm::percpu::{PerCpu, PerCpuVar},
 };
@@ -43,6 +23,7 @@ use super::driver::tsc::TSCManager;
 
 mod asm;
 mod cpuid;
+pub(super) mod exit;
 pub mod kvm_host;
 pub mod mem;
 mod mmu;
@@ -169,35 +150,35 @@ impl KvmArchManager {
     pub const KVM_MAX_NR_USER_RETURN_MSRS: usize = 7;
 
     const MSRS_TO_SAVE_BASE: &[u32] = &[
-        IA32_SYSENTER_CS,
-        IA32_SYSENTER_ESP,
-        IA32_SYSENTER_EIP,
-        IA32_STAR,
-        IA32_CSTAR,
-        IA32_KERNEL_GSBASE,
-        IA32_FMASK,
-        IA32_LSTAR,
-        IA32_TIME_STAMP_COUNTER,
-        IA32_PAT,
+        msr::IA32_SYSENTER_CS,
+        msr::IA32_SYSENTER_ESP,
+        msr::IA32_SYSENTER_EIP,
+        msr::IA32_STAR,
+        msr::IA32_CSTAR,
+        msr::IA32_KERNEL_GSBASE,
+        msr::IA32_FMASK,
+        msr::IA32_LSTAR,
+        msr::IA32_TIME_STAMP_COUNTER,
+        msr::IA32_PAT,
         0xc0010117, // MSR_VM_HSAVE_PA?
-        IA32_FEATURE_CONTROL,
-        MSR_C1_PMON_EVNT_SEL0,
-        IA32_TSC_AUX,
+        msr::IA32_FEATURE_CONTROL,
+        msr::MSR_C1_PMON_EVNT_SEL0,
+        msr::IA32_TSC_AUX,
         0x48, // MSR_IA32_SPEC_CTRL
-        MSR_IA32_TSX_CTRL,
-        MSR_IA32_RTIT_CTL,
-        MSR_IA32_RTIT_STATUS,
-        MSR_IA32_CR3_MATCH,
-        MSR_IA32_RTIT_OUTPUT_BASE,
-        MSR_IA32_RTIT_OUTPUT_MASK_PTRS,
-        MSR_IA32_ADDR0_START,
-        MSR_IA32_ADDR0_END,
-        MSR_IA32_ADDR1_START,
-        MSR_IA32_ADDR1_END,
-        MSR_IA32_ADDR2_START,
-        MSR_IA32_ADDR2_END,
-        MSR_IA32_ADDR3_START,
-        MSR_IA32_ADDR3_END,
+        msr::MSR_IA32_TSX_CTRL,
+        msr::MSR_IA32_RTIT_CTL,
+        msr::MSR_IA32_RTIT_STATUS,
+        msr::MSR_IA32_CR3_MATCH,
+        msr::MSR_IA32_RTIT_OUTPUT_BASE,
+        msr::MSR_IA32_RTIT_OUTPUT_MASK_PTRS,
+        msr::MSR_IA32_ADDR0_START,
+        msr::MSR_IA32_ADDR0_END,
+        msr::MSR_IA32_ADDR1_START,
+        msr::MSR_IA32_ADDR1_END,
+        msr::MSR_IA32_ADDR2_START,
+        msr::MSR_IA32_ADDR2_END,
+        msr::MSR_IA32_ADDR3_START,
+        msr::MSR_IA32_ADDR3_END,
         0xe1,  // MSR_IA32_UMWAIT_CONTROL
         0x1c4, // MSR_IA32_XFD
         0x1c5, // MSR_IA32_XFD_ERR
@@ -241,22 +222,22 @@ impl KvmArchManager {
         MSR_KVM_PV_EOI_EN,
         MSR_KVM_ASYNC_PF_INT,
         MSR_KVM_ASYNC_PF_ACK,
-        IA32_TSC_ADJUST,
-        IA32_TSC_DEADLINE,
-        IA32_PERF_CAPABILITIES,
+        msr::IA32_TSC_ADJUST,
+        msr::IA32_TSC_DEADLINE,
+        msr::IA32_PERF_CAPABILITIES,
         0x10a, // MSR_IA32_ARCH_CAPABILITIES,
-        IA32_MISC_ENABLE,
-        IA32_MCG_STATUS,
-        IA32_MCG_CTL,
+        msr::IA32_MISC_ENABLE,
+        msr::IA32_MCG_STATUS,
+        msr::IA32_MCG_CTL,
         0x4d0, // MSR_IA32_MCG_EXT_CTL,
-        IA32_SMBASE,
-        MSR_SMI_COUNT,
-        MSR_PLATFORM_INFO,
+        msr::IA32_SMBASE,
+        msr::MSR_SMI_COUNT,
+        msr::MSR_PLATFORM_INFO,
         0x140,      // MSR_MISC_FEATURES_ENABLES,
         0xc001011f, // MSR_AMD64_VIRT_SPEC_CTRL,
         0xc0000104, // MSR_AMD64_TSC_RATIO,
-        MSR_POWER_CTL,
-        IA32_BIOS_SIGN_ID, // MSR_IA32_UCODE_REV,
+        msr::MSR_POWER_CTL,
+        msr::IA32_BIOS_SIGN_ID, // MSR_IA32_UCODE_REV,
         /*
          * KVM always supports the "true" VMX control MSRs, even if the host
          * does not.  The VMX MSRs as a whole are considered "emulated" as KVM
@@ -264,27 +245,27 @@ impl KvmArchManager {
          * KVM would refuse to load in the first place if the core set of MSRs
          * aren't supported).
          */
-        IA32_VMX_BASIC,
-        IA32_VMX_TRUE_PINBASED_CTLS,
-        IA32_VMX_TRUE_PROCBASED_CTLS,
-        IA32_VMX_TRUE_EXIT_CTLS,
-        IA32_VMX_TRUE_ENTRY_CTLS,
-        IA32_VMX_MISC,
-        IA32_VMX_CR0_FIXED0,
-        IA32_VMX_CR4_FIXED0,
-        IA32_VMX_VMCS_ENUM,
-        IA32_VMX_PROCBASED_CTLS2,
-        IA32_VMX_EPT_VPID_CAP,
-        IA32_VMX_VMFUNC,
+        msr::IA32_VMX_BASIC,
+        msr::IA32_VMX_TRUE_PINBASED_CTLS,
+        msr::IA32_VMX_TRUE_PROCBASED_CTLS,
+        msr::IA32_VMX_TRUE_EXIT_CTLS,
+        msr::IA32_VMX_TRUE_ENTRY_CTLS,
+        msr::IA32_VMX_MISC,
+        msr::IA32_VMX_CR0_FIXED0,
+        msr::IA32_VMX_CR4_FIXED0,
+        msr::IA32_VMX_VMCS_ENUM,
+        msr::IA32_VMX_PROCBASED_CTLS2,
+        msr::IA32_VMX_EPT_VPID_CAP,
+        msr::IA32_VMX_VMFUNC,
         0xc0010015, // MSR_K7_HWCR,
         MSR_KVM_POLL_CONTROL,
     ];
 
     const MSR_BASED_FEATURES_ALL_EXCEPT_VMX: &[u32] = &[
-        0xc0011029,        // MSR_AMD64_DE_CFG
-        IA32_BIOS_SIGN_ID, // MSR_IA32_UCODE_REV
-        0x10a,             // MSR_IA32_ARCH_CAPABILITIES,
-        IA32_PERF_CAPABILITIES,
+        0xc0011029,             // MSR_AMD64_DE_CFG
+        msr::IA32_BIOS_SIGN_ID, // MSR_IA32_UCODE_REV
+        0x10a,                  // MSR_IA32_ARCH_CAPABILITIES,
+        msr::IA32_PERF_CAPABILITIES,
     ];
 
     pub fn arch_hardware_enable(&self) -> Result<(), SystemError> {
@@ -338,7 +319,7 @@ impl KvmArchManager {
         // https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/x86.c#9472
 
         // 读取主机page attribute table（页属性表）
-        let host_pat = unsafe { rdmsr(IA32_PAT) };
+        let host_pat = unsafe { rdmsr(msr::IA32_PAT) };
         // PAT[0]是否为write back类型，即判断低三位是否为0b110(0x06)
         if host_pat & 0b111 != 0b110 {
             kerror!("[KVM] host PAT[0] is not WB");
@@ -346,16 +327,17 @@ impl KvmArchManager {
         }
 
         // TODO：mmu vendor init
-        if cpu_feature.has_xsave() {
+        if cpu_feature.has_xsave() && unsafe { cr4() }.contains(Cr4::CR4_ENABLE_OS_XSAVE) {
             self.host_xcr0 = unsafe { xcr0() };
             self.kvm_caps.supported_xcr0 = self.host_xcr0;
         }
+
         // 保存efer
         self.host_efer = Efer::read();
 
         // 保存xss
         if cpu_extend.has_xsaves_xrstors() {
-            self.host_xss = unsafe { rdmsr(MSR_C5_PMON_BOX_CTRL) };
+            self.host_xss = unsafe { rdmsr(msr::MSR_C5_PMON_BOX_CTRL) };
         }
 
         // TODO: 初始化性能监视单元（PMU）
@@ -389,6 +371,8 @@ impl KvmArchManager {
 
         kvm_caps.default_tsc_scaling_ratio = 1 << kvm_caps.tsc_scaling_ratio_frac_bits;
         self.kvm_init_msr_lists();
+
+        kwarn!("vendor init over");
         Ok(())
     }
 
@@ -412,7 +396,7 @@ impl KvmArchManager {
             self.emulated_msrs.push(*msr);
         }
 
-        for msr in IA32_VMX_BASIC..=IA32_VMX_VMFUNC {
+        for msr in msr::IA32_VMX_BASIC..=msr::IA32_VMX_VMFUNC {
             self.kvm_prove_feature_msr(msr)
         }
 
@@ -427,13 +411,13 @@ impl KvmArchManager {
         let cpu_extend = cpuid.get_extended_feature_info().unwrap();
 
         match msr {
-            MSR_C1_PMON_EVNT_SEL0 => {
+            msr::MSR_C1_PMON_EVNT_SEL0 => {
                 if !cpu_extend.has_mpx() {
                     return;
                 }
             }
 
-            IA32_TSC_AUX => {
+            msr::IA32_TSC_AUX => {
                 if !cpu_feat.has_tsc() {
                     return;
                 }
@@ -444,39 +428,39 @@ impl KvmArchManager {
                     return;
                 }
             }
-            MSR_IA32_RTIT_CTL | MSR_IA32_RTIT_STATUS => {
+            msr::MSR_IA32_RTIT_CTL | msr::MSR_IA32_RTIT_STATUS => {
                 if !cpu_extend.has_processor_trace() {
                     return;
                 }
             }
-            MSR_IA32_CR3_MATCH => {
+            msr::MSR_IA32_CR3_MATCH => {
                 // TODO: 判断intel_pt_validate_hw_cap(PT_CAP_cr3_filtering)
                 if !cpu_extend.has_processor_trace() {
                     return;
                 }
             }
-            MSR_IA32_RTIT_OUTPUT_BASE | MSR_IA32_RTIT_OUTPUT_MASK_PTRS => {
+            msr::MSR_IA32_RTIT_OUTPUT_BASE | msr::MSR_IA32_RTIT_OUTPUT_MASK_PTRS => {
                 // TODO: 判断!intel_pt_validate_hw_cap(PT_CAP_topa_output) &&!intel_pt_validate_hw_cap(PT_CAP_single_range_output)
                 if !cpu_extend.has_processor_trace() {
                     return;
                 }
             }
-            MSR_IA32_ADDR0_START..MSR_IA32_ADDR3_END => {
+            msr::MSR_IA32_ADDR0_START..msr::MSR_IA32_ADDR3_END => {
                 // TODO: 判断msr_index - MSR_IA32_RTIT_ADDR0_A >= intel_pt_validate_hw_cap(PT_CAP_num_address_ranges) * 2)
                 if !cpu_extend.has_processor_trace() {
                     return;
                 }
             }
-            IA32_PMC0..IA32_PMC7 => {
+            msr::IA32_PMC0..msr::IA32_PMC7 => {
                 // TODO: 判断msr是否符合配置
             }
-            IA32_PERFEVTSEL0..IA32_PERFEVTSEL7 => {
+            msr::IA32_PERFEVTSEL0..msr::IA32_PERFEVTSEL7 => {
                 // TODO: 判断msr是否符合配置
             }
-            MSR_PERF_FIXED_CTR0..MSR_PERF_FIXED_CTR2 => {
+            msr::MSR_PERF_FIXED_CTR0..msr::MSR_PERF_FIXED_CTR2 => {
                 // TODO: 判断msr是否符合配置
             }
-            MSR_IA32_TSX_CTRL => {
+            msr::MSR_IA32_TSX_CTRL => {
                 // TODO: !(kvm_get_arch_capabilities() & ARCH_CAP_TSX_CTRL_MSR)
                 // 这个寄存器目前不支持，现在先return
                 // return;
@@ -507,10 +491,10 @@ impl KvmArchManager {
                 // MSR_IA32_ARCH_CAPABILITIES,
                 msr.data = self.get_arch_capabilities();
             }
-            IA32_PERF_CAPABILITIES => {
+            msr::IA32_PERF_CAPABILITIES => {
                 msr.data = self.kvm_caps.supported_perf_cap;
             }
-            IA32_BIOS_SIGN_ID => {
+            msr::IA32_BIOS_SIGN_ID => {
                 // MSR_IA32_UCODE_REV
                 msr.data = unsafe { rdmsr(msr.index) };
             }
@@ -523,9 +507,6 @@ impl KvmArchManager {
     }
 
     fn get_arch_capabilities(&self) -> u64 {
-        let cpuid = CpuId::new();
-        let extend_feat = cpuid.get_extended_feature_info().unwrap();
-
         let mut data = ArchCapabilities::from_bits_truncate(self.host_arch_capabilities)
             & ArchCapabilities::KVM_SUPPORTED_ARCH_CAP;
         data.insert(ArchCapabilities::ARCH_CAP_PSCHANGE_MC_NO);
@@ -560,6 +541,23 @@ impl KvmArchManager {
 
         // TODO:此处未完成
         Ok(())
+    }
+
+    pub fn kvm_set_user_return_msr(&self, slot: usize, mut value: u64, mask: u64) {
+        let msrs = user_return_msrs().get_mut();
+
+        value = (value & mask) | (msrs.values[slot].host & !mask);
+        if value == msrs.values[slot].curr {
+            return;
+        }
+
+        unsafe { wrmsr(self.kvm_uret_msrs_list[slot], value) };
+
+        msrs.values[slot].curr = value;
+
+        if !msrs.registered {
+            msrs.registered = true;
+        }
     }
 }
 

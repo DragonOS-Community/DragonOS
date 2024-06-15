@@ -1,47 +1,44 @@
+use core::intrinsics::likely;
 use core::{arch::x86_64::_xsetbv, intrinsics::unlikely};
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use bitmap::{traits::BitMapOps, AllocBitmap, BitMapCore, StaticBitmap};
+use bitmap::{traits::BitMapOps, AllocBitmap, BitMapCore};
 use raw_cpuid::CpuId;
 use system_error::SystemError;
 use x86::{
     bits64::rflags::RFlags,
     controlregs::{Cr0, Cr4, Xcr0},
     dtables::DescriptorTablePointer,
-    msr::{
-        self, wrmsr, IA32_APIC_BASE, IA32_CSTAR, IA32_FS_BASE, IA32_GS_BASE, IA32_KERNEL_GSBASE,
-        IA32_LSTAR, IA32_SYSENTER_EIP, IA32_SYSENTER_ESP, IA32_TSC_AUX,
-    },
+    msr::{self, wrmsr},
     vmx::vmcs::control::SecondaryControls,
 };
-use x86_64::registers::{control::EferFlags, xcontrol::XCr0Flags};
+use x86_64::registers::control::EferFlags;
 
+use crate::arch::vm::vmx::exit::ExitFastpathCompletion;
+use crate::kwarn;
+use crate::virt::vm::kvm_host::mem::KvmMmuMemoryCache;
+use crate::virt::vm::kvm_host::vcpu::VcpuMode;
 use crate::{
     arch::{
         kvm_arch_ops,
+        mm::barrier,
         vm::{
-            asm::{
-                hyperv, kvm_msr, KvmX86Asm, MiscEnable, MsrData, SegmentCacheField, VcpuSegment,
-            },
+            asm::{hyperv, kvm_msr, KvmX86Asm, MiscEnable, MsrData, VcpuSegment},
             cpuid::KvmCpuidEntry2,
             kvm_host::KvmReg,
-            mmu::{KvmMmu, LockedKvmMmu},
+            mmu::LockedKvmMmu,
             uapi::{UapiKvmSegmentRegs, KVM_SYNC_X86_VALID_FIELDS},
-            vmx::{
-                vmcs::{ControlsType, LoadedVmcs},
-                vmx_info, VmxVCpuPriv,
-            },
+            vmx::{vmcs::ControlsType, vmx_info},
             x86_kvm_manager, x86_kvm_manager_mut, x86_kvm_ops,
         },
     },
-    kdebug, kerror,
-    mm::{PhysAddr, VirtAddr},
+    mm::VirtAddr,
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
     virt::vm::{
         kvm_host::{
             mem::GfnToHvaCache,
             vcpu::{GuestDebug, VirtCpu},
-            LockedVm, MutilProcessorState, Vm,
+            MutilProcessorState, Vm,
         },
         user_api::{UapiKvmRun, UapiKvmSegment},
     },
@@ -52,11 +49,11 @@ use super::{lapic::KvmLapic, HFlags, KvmCommonRegs, KvmIrqChipMode};
 #[derive(Debug)]
 pub struct X86VcpuArch {
     /// 最近一次尝试进入虚拟机的主机cpu
-    last_vmentry_cpu: ProcessorId,
+    pub last_vmentry_cpu: ProcessorId,
     /// 可用寄存器位图
-    regs_avail: AllocBitmap,
+    pub regs_avail: AllocBitmap,
     /// 脏寄存器位图
-    regs_dirty: AllocBitmap,
+    pub regs_dirty: AllocBitmap,
     /// 多处理器状态
     mp_state: MutilProcessorState,
     pub apic_base: u64,
@@ -99,6 +96,11 @@ pub struct X86VcpuArch {
     pub walk_mmu: Option<Arc<LockedKvmMmu>>,
     pub nested_mmu: Option<Arc<LockedKvmMmu>>,
 
+    pub mmu_pte_list_desc_cache: KvmMmuMemoryCache,
+    pub mmu_shadow_page_cache: KvmMmuMemoryCache,
+    pub mmu_shadowed_info_cache: KvmMmuMemoryCache,
+    pub mmu_page_header_cache: KvmMmuMemoryCache,
+
     pub max_phyaddr: usize,
 
     pub pat: u64,
@@ -134,6 +136,10 @@ pub struct X86VcpuArch {
 
     pub xfd_no_write_intercept: bool,
 
+    pub l1tf_flush_l1d: bool,
+
+    pub at_instruction_boundary: bool,
+
     pub db: [usize; Self::KVM_NR_DB_REGS],
 }
 
@@ -168,7 +174,7 @@ impl X86VcpuArch {
     }
 
     pub fn is_bsp(&self) -> bool {
-        return self.apic_base & IA32_APIC_BASE as u64 != 0;
+        return self.apic_base & msr::IA32_APIC_BASE as u64 != 0;
     }
 
     #[inline]
@@ -259,15 +265,23 @@ impl X86VcpuArch {
         self.exception_vmexit.pending = false;
     }
 
+    #[allow(dead_code)]
     pub fn update_cpuid_runtime(&mut self, entries: &Vec<KvmCpuidEntry2>) {
         let cpuid = CpuId::new();
         let feat = cpuid.get_feature_info().unwrap();
         let base = KvmCpuidEntry2::find(entries, 1, None);
-        if let Some(base) = base {
+        if let Some(_base) = base {
             if feat.has_xsave() {}
         }
 
         todo!()
+    }
+
+    #[inline]
+    pub fn test_and_mark_available(&mut self, reg: KvmReg) -> bool {
+        let old = self.regs_avail.get(reg as usize).unwrap_or_default();
+        self.regs_avail.set(reg as usize, true);
+        return old;
     }
 
     #[inline]
@@ -580,8 +594,14 @@ impl VirtCpu {
         Ok(())
     }
 
+    #[inline]
     pub fn kvm_run(&self) -> &Box<UapiKvmRun> {
         self.run.as_ref().unwrap()
+    }
+
+    #[inline]
+    pub fn kvm_run_mut(&mut self) -> &mut Box<UapiKvmRun> {
+        self.run.as_mut().unwrap()
     }
 
     pub fn run(&mut self) -> Result<usize, SystemError> {
@@ -591,15 +611,288 @@ impl VirtCpu {
             todo!()
         }
 
-        let kvm_run = self.kvm_run();
-
-        if kvm_run.kvm_valid_regs & !KVM_SYNC_X86_VALID_FIELDS != 0
-            || kvm_run.kvm_dirty_regs & !KVM_SYNC_X86_VALID_FIELDS != 0
+        if self.kvm_run().kvm_valid_regs & !KVM_SYNC_X86_VALID_FIELDS != 0
+            || self.kvm_run().kvm_dirty_regs & !KVM_SYNC_X86_VALID_FIELDS != 0
         {
             return Err(SystemError::EINVAL);
         }
 
-        todo!()
+        if self.kvm_run().kvm_dirty_regs != 0 {
+            todo!()
+        }
+
+        if !self.arch.lapic_in_kernel() {
+            self.kvm_set_cr8(self.kvm_run().cr8);
+        }
+
+        // TODO: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/x86.c#11174 - 11196
+
+        if self.kvm_run().immediate_exit != 0 {
+            return Err(SystemError::EINTR);
+        }
+
+        // vmx_vcpu_pre_run
+
+        self.vcpu_run(&self.kvm().lock())?;
+
+        Ok(0)
+    }
+
+    fn vcpu_run(&mut self, vm: &Vm) -> Result<(), SystemError> {
+        self.arch.l1tf_flush_l1d = true;
+
+        loop {
+            self.arch.at_instruction_boundary = false;
+            if self.can_running() {
+                self.enter_guest(vm)?;
+            } else {
+                todo!()
+            };
+        }
+    }
+
+    fn enter_guest(&mut self, vm: &Vm) -> Result<(), SystemError> {
+        let req_immediate_exit = false;
+
+        kwarn!("request {:?}", self.request);
+        if !self.request.is_empty() {
+            if self.check_request(VirtCpuRequest::KVM_REQ_VM_DEAD) {
+                return Err(SystemError::EIO);
+            }
+
+            // TODO: kvm_dirty_ring_check_request
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_MMU_FREE_OBSOLETE_ROOTS) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_MIGRATE_TIMER) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_MASTERCLOCK_UPDATE) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_GLOBAL_CLOCK_UPDATE) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_CLOCK_UPDATE) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_MMU_SYNC) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_LOAD_MMU_PGD) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_TLB_FLUSH) {
+                self.flush_tlb_all();
+            }
+
+            self.service_local_tlb_flush_requests();
+
+            // TODO: KVM_REQ_HV_TLB_FLUSH) && kvm_hv_vcpu_flush_tlb(vcpu)
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_REPORT_TPR_ACCESS) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_TRIPLE_FAULT) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_STEAL_UPDATE) {
+                // todo!()
+                kwarn!("VirtCpuRequest::KVM_REQ_STEAL_UPDATE TODO!");
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_SMI) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_NMI) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_PMU) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_PMI) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_IOAPIC_EOI_EXIT) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_SCAN_IOAPIC) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_LOAD_EOI_EXITMAP) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_APIC_PAGE_RELOAD) {
+                // todo!()
+                kwarn!("VirtCpuRequest::KVM_REQ_APIC_PAGE_RELOAD TODO!");
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_HV_CRASH) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_HV_RESET) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_HV_EXIT) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_HV_STIMER) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_APICV_UPDATE) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_APF_READY) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_MSR_FILTER_CHANGED) {
+                todo!()
+            }
+
+            if self.check_request(VirtCpuRequest::KVM_REQ_UPDATE_CPU_DIRTY_LOGGING) {
+                todo!()
+            }
+        }
+
+        // TODO: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/x86.c#10661
+        if self.check_request(VirtCpuRequest::KVM_REQ_EVENT) {
+            // TODO
+        }
+
+        self.kvm_mmu_reload(vm)?;
+
+        x86_kvm_ops().prepare_switch_to_guest(self);
+        // kwarn!(
+        //     "mode {:?} req {:?} mode_cond {} !is_empty {} cond {}",
+        //     self.mode,
+        //     self.request,
+        //     self.mode == VcpuMode::ExitingGuestMode,
+        //     !self.request.is_empty(),
+        //     (self.mode == VcpuMode::ExitingGuestMode) || (!self.request.is_empty())
+        // );
+        kwarn!(
+            "req bit {} empty bit {}",
+            self.request.bits,
+            VirtCpuRequest::empty().bits
+        );
+        // TODO: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/x86.c#10730
+        if self.mode == VcpuMode::ExitingGuestMode || !self.request.is_empty() {
+            self.mode = VcpuMode::OutsideGuestMode;
+            return Err(SystemError::EINVAL);
+        }
+
+        if req_immediate_exit {
+            self.request(VirtCpuRequest::KVM_REQ_EVENT);
+            todo!();
+        }
+
+        // TODO: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/x86.c#10749 - 10766
+
+        let exit_fastpath;
+        loop {
+            exit_fastpath = x86_kvm_ops().vcpu_run(self);
+            if likely(exit_fastpath != ExitFastpathCompletion::ExitHandled) {
+                break;
+            }
+
+            todo!();
+        }
+
+        // TODO: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/x86.c#10799 - 10814
+
+        self.arch.last_vmentry_cpu = self.cpu;
+
+        // TODO: last_guest_tsc
+
+        self.mode = VcpuMode::OutsideGuestMode;
+
+        barrier::mfence();
+
+        // TODO: xfd
+
+        x86_kvm_ops().handle_exit_irqoff(self);
+
+        // todo: xfd
+
+        // TODO: 一些中断或者tsc操作
+
+        return x86_kvm_ops().handle_exit(self, exit_fastpath);
+    }
+
+    fn flush_tlb_all(&mut self) {
+        x86_kvm_ops().flush_tlb_all(self);
+        self.clear_request(VirtCpuRequest::KVM_REQ_TLB_FLUSH_CURRENT);
+    }
+
+    fn service_local_tlb_flush_requests(&mut self) {
+        if self.check_request(VirtCpuRequest::KVM_REQ_TLB_FLUSH_CURRENT) {
+            todo!()
+        }
+
+        if self.check_request(VirtCpuRequest::KVM_REQ_TLB_FLUSH_GUEST) {
+            todo!()
+        }
+    }
+
+    pub fn request(&mut self, req: VirtCpuRequest) {
+        // self.request.set(
+        //     (req.bits() & VirtCpuRequest::KVM_REQUEST_MASK.bits()) as usize,
+        //     true,
+        // );
+        self.request.insert(req);
+    }
+
+    fn check_request(&mut self, req: VirtCpuRequest) -> bool {
+        if self.test_request(req) {
+            self.clear_request(req);
+
+            barrier::mfence();
+            return true;
+        }
+
+        return false;
+    }
+
+    fn test_request(&self, req: VirtCpuRequest) -> bool {
+        // self.request
+        //     .get((req.bits & VirtCpuRequest::KVM_REQUEST_MASK.bits) as usize)
+        //     .unwrap_or_default()
+        self.request.contains(req)
+    }
+
+    fn clear_request(&mut self, req: VirtCpuRequest) {
+        // self.request.set(
+        //     (req.bits & VirtCpuRequest::KVM_REQUEST_MASK.bits) as usize,
+        //     false,
+        // );
+        self.request.remove(req);
+    }
+
+    pub fn can_running(&self) -> bool {
+        return self.arch.mp_state == MutilProcessorState::Runnable && !self.arch.apf.halted;
     }
 
     #[inline]
@@ -622,11 +915,7 @@ impl VirtCpu {
             self.cpu = cpu;
         }
 
-        self.request(VirCpuRequest::KVM_REQ_STEAL_UPDATE)
-    }
-
-    pub fn request(&mut self, req: VirCpuRequest) {
-        self.request.insert(req);
+        self.request(VirtCpuRequest::KVM_REQ_STEAL_UPDATE)
     }
 
     pub fn set_msr(
@@ -636,19 +925,23 @@ impl VirtCpu {
         host_initiated: bool,
     ) -> Result<(), SystemError> {
         match index {
-            IA32_FS_BASE | IA32_GS_BASE | IA32_KERNEL_GSBASE | IA32_CSTAR | IA32_LSTAR => {
+            msr::IA32_FS_BASE
+            | msr::IA32_GS_BASE
+            | msr::IA32_KERNEL_GSBASE
+            | msr::IA32_CSTAR
+            | msr::IA32_LSTAR => {
                 if VirtAddr::new(data as usize).is_canonical() {
                     return Ok(());
                 }
             }
 
-            IA32_SYSENTER_EIP | IA32_SYSENTER_ESP => {
+            msr::IA32_SYSENTER_EIP | msr::IA32_SYSENTER_ESP => {
                 // 需要将Data转为合法地址，但是现在先这样写
                 assert!(VirtAddr::new(data as usize).is_canonical());
             }
-            IA32_TSC_AUX => {
+            msr::IA32_TSC_AUX => {
                 if x86_kvm_manager()
-                    .find_user_return_msr_idx(IA32_TSC_AUX)
+                    .find_user_return_msr_idx(msr::IA32_TSC_AUX)
                     .is_none()
                 {
                     return Ok(());
@@ -703,7 +996,7 @@ impl VirtCpu {
 
         self.arch.cr2 = 0;
 
-        self.request(VirCpuRequest::KVM_REQ_EVENT);
+        self.request(VirtCpuRequest::KVM_REQ_EVENT);
 
         self.arch.apf.msr_en_val = 0;
         self.arch.apf.msr_int_val = 0;
@@ -769,12 +1062,12 @@ impl VirtCpu {
         kvm_arch_ops().update_exception_bitmap(self);
 
         if old_cr0.contains(Cr0::CR0_ENABLE_PAGING) {
-            self.request(VirCpuRequest::KVM_REQ_TLB_FLUSH_GUEST);
+            self.request(VirtCpuRequest::MAKE_KVM_REQ_TLB_FLUSH_GUEST);
             self.arch.reset_mmu_context();
         }
 
         if init_event {
-            self.request(VirCpuRequest::KVM_REQ_TLB_FLUSH_GUEST);
+            self.request(VirtCpuRequest::MAKE_KVM_REQ_TLB_FLUSH_GUEST);
         }
 
         Ok(())
@@ -782,7 +1075,7 @@ impl VirtCpu {
 
     fn set_rflags(&mut self, rflags: RFlags) {
         self._set_rflags(rflags);
-        self.request(VirCpuRequest::KVM_REQ_EVENT);
+        self.request(VirtCpuRequest::KVM_REQ_EVENT);
     }
 
     fn _set_rflags(&mut self, mut rflags: RFlags) {
@@ -910,7 +1203,6 @@ impl VirtCpu {
 
     pub fn set_segment_regs(&mut self, sregs: &mut UapiKvmSegmentRegs) -> Result<(), SystemError> {
         self.load();
-        kdebug!("set_segment_regs sregs{sregs:?}");
         self._set_segmenet_regs(&self.kvm().lock(), sregs)?;
         Ok(())
     }
@@ -935,7 +1227,7 @@ impl VirtCpu {
             if pending < max_bits {
                 self.arch.queue_interrupt(pending as u8, false);
 
-                self.request(VirCpuRequest::KVM_REQ_EVENT);
+                self.request(VirtCpuRequest::KVM_REQ_EVENT);
             }
         }
 
@@ -1121,7 +1413,7 @@ impl VirtCpu {
         self.arch.exception.pending = false;
         self.arch.exception_vmexit.pending = false;
 
-        self.request(VirCpuRequest::KVM_REQ_EVENT);
+        self.request(VirtCpuRequest::KVM_REQ_EVENT);
     }
 
     pub fn load_guest_xsave_state(&mut self) {
@@ -1154,16 +1446,130 @@ impl VirtCpu {
 }
 
 bitflags! {
-    pub struct VirCpuRequest: u32 {
-        const KVM_REQUEST_NO_WAKEUP = 1 << 0;
-        const KVM_REQUEST_WAIT = 1 << 1;
-        const KVM_REQUEST_NO_ACTION = 1 << 2;
-        const KVM_REQ_EVENT = 1 << 6;
-        const KVM_REQ_STEAL_UPDATE = 1 << 8;
-        const KVM_REQ_APIC_PAGE_RELOAD = 1 << 17 | Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits;
-        const KVM_REQ_TLB_FLUSH_GUEST = 1 << 27 | Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits;
-        const KVM_REQ_TLB_FLUSH = 1 | Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits;
+    // pub struct VirtCpuRequest: u64 {
+    //     const KVM_REQUEST_MASK = 0xFF;
+
+    //     const KVM_REQ_TLB_FLUSH = 0 | Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits;
+    //     const KVM_REQ_VM_DEAD = 1 | Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits;
+
+    //     const KVM_REQUEST_NO_WAKEUP = 1 << 8;
+    //     const KVM_REQUEST_WAIT = 1 << 9;
+    //     const KVM_REQUEST_NO_ACTION = 1 << 10;
+
+    //     const KVM_REQ_MIGRATE_TIMER = kvm_arch_req(0);
+    //     const KVM_REQ_REPORT_TPR_ACCESS = kvm_arch_req(1);
+    //     const KVM_REQ_TRIPLE_FAULT = kvm_arch_req(2);
+    //     const KVM_REQ_MMU_SYNC = kvm_arch_req(3);
+    //     const KVM_REQ_CLOCK_UPDATE = kvm_arch_req(4);
+    //     const KVM_REQ_LOAD_MMU_PGD = kvm_arch_req(5);
+    //     const KVM_REQ_EVENT = kvm_arch_req(6);
+    //     const KVM_REQ_APF_HALT = kvm_arch_req(7);
+    //     const KVM_REQ_STEAL_UPDATE = kvm_arch_req(8);
+    //     const KVM_REQ_NMI = kvm_arch_req(9);
+    //     const KVM_REQ_PMU = kvm_arch_req(10);
+    //     const KVM_REQ_PMI = kvm_arch_req(11);
+    //     const KVM_REQ_SMI = kvm_arch_req(12);
+
+    //     const KVM_REQ_MASTERCLOCK_UPDATE = kvm_arch_req(13);
+    //     const KVM_REQ_MCLOCK_INPROGRESS = kvm_arch_req_flags(14, Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits);
+    //     const KVM_REQ_SCAN_IOAPIC = kvm_arch_req_flags(15, Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits);
+    //     const KVM_REQ_GLOBAL_CLOCK_UPDATE = kvm_arch_req(16);
+    //     const KVM_REQ_APIC_PAGE_RELOAD = kvm_arch_req_flags(17, Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits);
+    //     const KVM_REQ_HV_CRASH = kvm_arch_req(18);
+    //     const KVM_REQ_IOAPIC_EOI_EXIT = kvm_arch_req(19);
+    //     const KVM_REQ_HV_RESET = kvm_arch_req(20);
+    //     const KVM_REQ_HV_EXIT = kvm_arch_req(21);
+    //     const KVM_REQ_HV_STIMER = kvm_arch_req(22);
+    //     const KVM_REQ_LOAD_EOI_EXITMAP = kvm_arch_req(23);
+    //     const KVM_REQ_GET_NESTED_STATE_PAGES = kvm_arch_req(24);
+    //     const KVM_REQ_APICV_UPDATE = kvm_arch_req_flags(25, Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits);
+    //     const KVM_REQ_TLB_FLUSH_CURRENT = kvm_arch_req(26);
+
+    //     const KVM_REQ_TLB_FLUSH_GUEST = kvm_arch_req_flags(27, Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits);
+    //     const KVM_REQ_APF_READY = kvm_arch_req(28);
+    //     const KVM_REQ_MSR_FILTER_CHANGED = kvm_arch_req(29);
+    //     const KVM_REQ_UPDATE_CPU_DIRTY_LOGGING  = kvm_arch_req_flags(30, Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits);
+    //     const KVM_REQ_MMU_FREE_OBSOLETE_ROOTS = kvm_arch_req_flags(31, Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits);
+    //     const KVM_REQ_HV_TLB_FLUSH = kvm_arch_req_flags(32, Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits);
+    // }
+
+    pub struct VirtCpuRequest: u64 {
+        // const KVM_REQUEST_MASK = 0xFF;
+
+        const KVM_REQ_TLB_FLUSH = Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits;
+        const KVM_REQ_VM_DEAD = 1;
+
+        const KVM_REQUEST_NO_WAKEUP = 1 << 8;
+        const KVM_REQUEST_WAIT = 1 << 9;
+        const KVM_REQUEST_NO_ACTION = 1 << 10;
+
+        const KVM_REQ_MIGRATE_TIMER = kvm_arch_req(0);
+        const KVM_REQ_REPORT_TPR_ACCESS = kvm_arch_req(1);
+        const KVM_REQ_TRIPLE_FAULT = kvm_arch_req(2);
+        const KVM_REQ_MMU_SYNC = kvm_arch_req(3);
+        const KVM_REQ_CLOCK_UPDATE = kvm_arch_req(4);
+        const KVM_REQ_LOAD_MMU_PGD = kvm_arch_req(5);
+        const KVM_REQ_EVENT = kvm_arch_req(6);
+        const KVM_REQ_APF_HALT = kvm_arch_req(7);
+        const KVM_REQ_STEAL_UPDATE = kvm_arch_req(8);
+        const KVM_REQ_NMI = kvm_arch_req(9);
+        const KVM_REQ_PMU = kvm_arch_req(10);
+        const KVM_REQ_PMI = kvm_arch_req(11);
+        const KVM_REQ_SMI = kvm_arch_req(12);
+
+        const KVM_REQ_MASTERCLOCK_UPDATE = kvm_arch_req(13);
+
+        const KVM_REQ_MCLOCK_INPROGRESS = kvm_arch_req(14);
+        const MAKE_KVM_REQ_MCLOCK_INPROGRESS = kvm_arch_req_flags(14, Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits);
+
+        const KVM_REQ_SCAN_IOAPIC = kvm_arch_req(15);
+        const MAKE_KVM_REQ_SCAN_IOAPIC = kvm_arch_req_flags(15, Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits);
+
+
+        const KVM_REQ_GLOBAL_CLOCK_UPDATE = kvm_arch_req(16);
+
+        const KVM_REQ_APIC_PAGE_RELOAD = kvm_arch_req(17);
+        const MAKE_KVM_REQ_APIC_PAGE_RELOAD = kvm_arch_req_flags(17, Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits);
+
+        const KVM_REQ_HV_CRASH = kvm_arch_req(18);
+        const KVM_REQ_IOAPIC_EOI_EXIT = kvm_arch_req(19);
+        const KVM_REQ_HV_RESET = kvm_arch_req(20);
+        const KVM_REQ_HV_EXIT = kvm_arch_req(21);
+        const KVM_REQ_HV_STIMER = kvm_arch_req(22);
+        const KVM_REQ_LOAD_EOI_EXITMAP = kvm_arch_req(23);
+        const KVM_REQ_GET_NESTED_STATE_PAGES = kvm_arch_req(24);
+
+        const KVM_REQ_APICV_UPDATE = kvm_arch_req(25);
+        const MAKE_KVM_REQ_APICV_UPDATE = kvm_arch_req_flags(25, Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits);
+
+        const KVM_REQ_TLB_FLUSH_CURRENT = kvm_arch_req(26);
+
+        const KVM_REQ_TLB_FLUSH_GUEST = kvm_arch_req(27);
+        const MAKE_KVM_REQ_TLB_FLUSH_GUEST = kvm_arch_req_flags(27, Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits);
+
+        const KVM_REQ_APF_READY = kvm_arch_req(28);
+        const KVM_REQ_MSR_FILTER_CHANGED = kvm_arch_req(29);
+
+        const KVM_REQ_UPDATE_CPU_DIRTY_LOGGING  = kvm_arch_req(30);
+        const MAKE_KVM_REQ_UPDATE_CPU_DIRTY_LOGGING  = kvm_arch_req_flags(30, Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits);
+
+        const KVM_REQ_MMU_FREE_OBSOLETE_ROOTS = kvm_arch_req(31);
+        const MAKE_KVM_REQ_MMU_FREE_OBSOLETE_ROOTS = kvm_arch_req_flags(31, Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits);
+
+        const KVM_REQ_HV_TLB_FLUSH = kvm_arch_req(32);
+        const MAKE_KVM_REQ_HV_TLB_FLUSH = kvm_arch_req_flags(32, Self::KVM_REQUEST_WAIT.bits | Self::KVM_REQUEST_NO_WAKEUP.bits);
     }
+}
+
+// const KVM_REQUEST_ARCH_BASE: u64 = 8;
+const KVM_REQUEST_ARCH_BASE: u64 = 11;
+
+const fn kvm_arch_req(nr: u64) -> u64 {
+    return kvm_arch_req_flags(nr, 0);
+}
+
+const fn kvm_arch_req_flags(nr: u64, flags: u64) -> u64 {
+    1 << (nr + KVM_REQUEST_ARCH_BASE) | flags
 }
 
 #[derive(Debug, Default)]
@@ -1174,6 +1580,7 @@ pub struct KvmQueuedInterrupt {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct KvmQueuedException {
     pending: bool,
     injected: bool,
@@ -1185,6 +1592,7 @@ pub struct KvmQueuedException {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct KvmAsyncPageFault {
     /// 是否处于停止状态
     halted: bool,

@@ -25,19 +25,18 @@ use crate::arch::VirtCpuArch;
 
 use super::{
     asm::{MsrData, VcpuSegment, VmxMsrEntry},
-    uapi::UapiKvmDtable,
-    vmx::{vmx_info, VmxVCpuPriv},
+    vmx::{exit::ExitFastpathCompletion, vmx_info},
     x86_kvm_manager, x86_kvm_ops,
 };
 
 pub mod lapic;
 pub mod vcpu;
-
+#[allow(dead_code)]
 pub const TSS_IOPB_BASE_OFFSET: usize = 0x66;
 pub const TSS_BASE_SIZE: usize = 0x68;
-pub const TSS_IOPB_SIZE: usize = (65536 / 8);
-pub const TSS_REDIRECTION_SIZE: usize = (256 / 8);
-pub const RMODE_TSS_SIZE: usize = (TSS_BASE_SIZE + TSS_REDIRECTION_SIZE + TSS_IOPB_SIZE + 1);
+pub const TSS_IOPB_SIZE: usize = 65536 / 8;
+pub const TSS_REDIRECTION_SIZE: usize = 256 / 8;
+pub const RMODE_TSS_SIZE: usize = TSS_BASE_SIZE + TSS_REDIRECTION_SIZE + TSS_IOPB_SIZE + 1;
 
 #[derive(Debug, Default)]
 pub struct X86KvmArch {
@@ -121,6 +120,7 @@ impl X86KvmArch {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub enum KvmIrqChipMode {
     None,
     Kernel,
@@ -153,6 +153,8 @@ pub trait KvmFunc: Send + Sync + Debug {
     fn vcpu_create(&self, vcpu: &mut VirtCpu, vm: &Vm);
 
     fn vcpu_load(&self, vcpu: &mut VirtCpu, cpu: ProcessorId);
+
+    fn load_mmu_pgd(&self, vcpu: &mut VirtCpu, vm: &Vm, root_hpa: u64, root_level: u32);
 
     fn cache_reg(&self, vcpu: &mut VirtCpuArch, reg: KvmReg);
 
@@ -202,13 +204,26 @@ pub trait KvmFunc: Send + Sync + Debug {
 
     fn get_msr_feature(&self, msr: &mut VmxMsrEntry) -> bool;
 
-    fn vcpu_run(&self, vcpu: &mut VirtCpu);
+    fn prepare_switch_to_guest(&self, vcpu: &mut VirtCpu);
+
+    fn flush_tlb_all(&self, vcpu: &mut VirtCpu);
+
+    fn vcpu_run(&self, vcpu: &mut VirtCpu) -> ExitFastpathCompletion;
+
+    fn handle_exit_irqoff(&self, vcpu: &mut VirtCpu);
+
+    fn handle_exit(
+        &self,
+        vcpu: &mut VirtCpu,
+        fastpath: ExitFastpathCompletion,
+    ) -> Result<(), SystemError>;
 }
 
 /// ## 中断抑制的原因位
 #[derive(Debug)]
 pub struct KvmApicvInhibit;
 
+#[allow(dead_code)]
 impl KvmApicvInhibit {
     // Intel与AMD共用
 
@@ -266,6 +281,7 @@ pub struct KernelMsrRange {
 }
 
 #[repr(C)]
+#[allow(dead_code)]
 pub struct PosixMsrFilterRange {
     pub flags: u32,
     pub nmsrs: u32,

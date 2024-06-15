@@ -100,13 +100,12 @@ ENTRY(__vmx_vcpu_run)
     jmp .Lvmfail
 
 .Lvmlaunch:
-    vmlaunch
+    call vmx_vmlaunch
     jmp .Lvmfail
 
 // 从guest模式退出
 ENTRY(vmx_vmexit)
     // TODO: unwind hint restore
-
     // 临时保存guest RAX
     push %rax
 
@@ -172,6 +171,7 @@ ENTRY(vmx_vmexit)
     ret
 
 .Lvmfail:
+    // 失败，设置返回值为1
     mov $1, %rbx
     jmp .Lclear_regs
 

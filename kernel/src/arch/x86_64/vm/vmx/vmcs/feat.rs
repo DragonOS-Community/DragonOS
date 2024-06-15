@@ -12,7 +12,7 @@ use x86::{
 use crate::arch::vm::vmx::Vmx;
 
 pub struct VmxFeat;
-
+#[allow(dead_code)]
 impl VmxFeat {
     pub const KVM_REQUIRED_VMX_CPU_BASED_VM_EXEC_CONTROL: u32 = PrimaryControls::HLT_EXITING.bits()
         | PrimaryControls::CR3_LOAD_EXITING.bits()
@@ -111,48 +111,52 @@ impl VmxFeat {
     pub const VMX_BASIC_INOUT: u64 = 0x0040000000000000;
 
     pub fn adjust_primary_controls() -> Result<PrimaryControls, SystemError> {
-        Ok(PrimaryControls::from_bits_truncate(
-            Vmx::adjust_vmx_controls(
+        Ok(unsafe {
+            PrimaryControls::from_bits_unchecked(Vmx::adjust_vmx_controls(
                 Self::KVM_REQUIRED_VMX_CPU_BASED_VM_EXEC_CONTROL,
                 Self::KVM_OPTIONAL_VMX_CPU_BASED_VM_EXEC_CONTROL,
                 IA32_VMX_PROCBASED_CTLS,
-            )?,
-        ))
+            )?)
+        })
     }
 
     pub fn adjust_secondary_controls() -> Result<SecondaryControls, SystemError> {
-        Ok(SecondaryControls::from_bits_truncate(
-            Vmx::adjust_vmx_controls(
+        Ok(unsafe {
+            SecondaryControls::from_bits_unchecked(Vmx::adjust_vmx_controls(
                 Self::KVM_REQUIRED_VMX_SECONDARY_VM_EXEC_CONTROL,
                 Self::KVM_OPTIONAL_VMX_SECONDARY_VM_EXEC_CONTROL,
                 IA32_VMX_PROCBASED_CTLS2,
-            )?,
-        ))
+            )?)
+        })
     }
 
     pub fn adjust_exit_controls() -> Result<ExitControls, SystemError> {
-        Ok(ExitControls::from_bits_truncate(Vmx::adjust_vmx_controls(
-            Self::KVM_REQUIRED_VMX_VM_EXIT_CONTROLS,
-            Self::KVM_OPTIONAL_VMX_VM_EXIT_CONTROLS,
-            IA32_VMX_EXIT_CTLS,
-        )?))
+        Ok(unsafe {
+            ExitControls::from_bits_unchecked(Vmx::adjust_vmx_controls(
+                Self::KVM_REQUIRED_VMX_VM_EXIT_CONTROLS,
+                Self::KVM_OPTIONAL_VMX_VM_EXIT_CONTROLS,
+                IA32_VMX_EXIT_CTLS,
+            )?)
+        })
     }
 
     pub fn adjust_entry_controls() -> Result<EntryControls, SystemError> {
-        Ok(EntryControls::from_bits_truncate(Vmx::adjust_vmx_controls(
-            Self::KVM_REQUIRED_VMX_VM_ENTRY_CONTROLS,
-            Self::KVM_OPTIONAL_VMX_VM_ENTRY_CONTROLS,
-            IA32_VMX_ENTRY_CTLS,
-        )?))
+        Ok(unsafe {
+            EntryControls::from_bits_unchecked(Vmx::adjust_vmx_controls(
+                Self::KVM_REQUIRED_VMX_VM_ENTRY_CONTROLS,
+                Self::KVM_OPTIONAL_VMX_VM_ENTRY_CONTROLS,
+                IA32_VMX_ENTRY_CTLS,
+            )?)
+        })
     }
 
     pub fn adjust_pin_based_controls() -> Result<PinbasedControls, SystemError> {
-        Ok(PinbasedControls::from_bits_truncate(
-            Vmx::adjust_vmx_controls(
+        Ok(unsafe {
+            PinbasedControls::from_bits_unchecked(Vmx::adjust_vmx_controls(
                 Self::KVM_REQUIRED_VMX_PIN_BASED_VM_EXEC_CONTROL,
                 Self::KVM_OPTIONAL_VMX_PIN_BASED_VM_EXEC_CONTROL,
                 IA32_VMX_PINBASED_CTLS,
-            )?,
-        ))
+            )?)
+        })
     }
 }

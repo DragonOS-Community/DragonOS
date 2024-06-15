@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 
 #[derive(Debug, Default, Clone, Copy)]
+#[allow(dead_code)]
 pub struct KvmCpuidEntry2 {
     pub function: u32,
     pub index: u32,

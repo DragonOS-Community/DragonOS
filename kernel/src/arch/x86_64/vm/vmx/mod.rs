@@ -1,17 +1,22 @@
+use core::intrinsics::likely;
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::arch::process::table::USER_DS;
 use crate::arch::vm::mmu::KvmMmu;
+use crate::arch::vm::uapi::kvm_exit;
 use crate::arch::vm::uapi::{
     AC_VECTOR, BP_VECTOR, DB_VECTOR, GP_VECTOR, MC_VECTOR, NM_VECTOR, PF_VECTOR, UD_VECTOR,
 };
+use crate::arch::vm::vmx::vmcs::VmcsIntrHelper;
 use crate::libs::spinlock::SpinLockGuard;
+use crate::process::ProcessManager;
 use crate::virt::vm::kvm_host::vcpu::GuestDebug;
 use crate::{
     arch::{
         vm::{
             asm::KvmX86Asm,
-            kvm_host::{vcpu::VirCpuRequest, X86KvmArch},
+            kvm_host::{vcpu::VirtCpuRequest, X86KvmArch},
             vmx::vmcs::vmx_area,
         },
         CurrentIrqArch, MMArch, VirtCpuArch,
@@ -27,27 +32,26 @@ use crate::{
     virt::vm::{kvm_dev::kvm_init, kvm_host::vcpu::VirtCpu, user_api::UapiKvmSegment},
 };
 use alloc::{alloc::Global, boxed::Box, collections::LinkedList, sync::Arc, vec::Vec};
+use asm::VMX_EPTP_AD_ENABLE_BIT;
+use asm::VMX_EPTP_MT_WB;
+use asm::VMX_EPTP_PWL_4;
+use asm::VMX_EPTP_PWL_5;
 use bitfield_struct::bitfield;
-use bitmap::{traits::BitMapOps, AllocBitmap, StaticBitmap};
+use bitmap::{traits::BitMapOps, AllocBitmap};
 use raw_cpuid::CpuId;
 use system_error::SystemError;
 use x86::controlregs::{cr2, cr2_write};
-use x86::irq::PageFaultError;
+use x86::dtables::ldtr;
 use x86::msr::wrmsr;
+use x86::segmentation::load_ds;
+use x86::segmentation::load_es;
+use x86::segmentation::{ds, es, fs, gs};
+use x86::vmx::vmcs::ro;
 use x86::{
     bits64::rflags::RFlags,
-    controlregs::{cr0, cr3, cr4, Cr0, Cr4, Xcr0},
-    msr::{
-        self, rdmsr, IA32_CSTAR, IA32_EFER, IA32_FMASK, IA32_FS_BASE, IA32_GS_BASE,
-        IA32_KERNEL_GSBASE, IA32_LSTAR, IA32_SMBASE, IA32_STAR, IA32_SYSENTER_CS,
-        IA32_SYSENTER_EIP, IA32_SYSENTER_ESP, IA32_TIME_STAMP_COUNTER, IA32_TSC_AUX,
-        IA32_VMX_BASIC, IA32_VMX_EPT_VPID_CAP, IA32_VMX_MISC, IA32_VMX_VMFUNC,
-        MSR_CORE_C1_RESIDENCY, MSR_CORE_C3_RESIDENCY, MSR_CORE_C6_RESIDENCY, MSR_CORE_C7_RESIDENCY,
-        MSR_IA32_ADDR0_START, MSR_IA32_ADDR3_END, MSR_IA32_CR3_MATCH, MSR_IA32_RTIT_OUTPUT_BASE,
-        MSR_IA32_RTIT_OUTPUT_MASK_PTRS, MSR_IA32_RTIT_STATUS, MSR_IA32_TSX_CTRL,
-        MSR_LASTBRANCH_TOS, MSR_LBR_SELECT,
-    },
-    segmentation::{self, cs},
+    controlregs::{cr0, cr4, Cr0, Cr4, Xcr0},
+    msr::{self, rdmsr},
+    segmentation::{self},
     vmx::vmcs::{
         control::{
             self, EntryControls, ExitControls, PinbasedControls, PrimaryControls, SecondaryControls,
@@ -56,7 +60,6 @@ use x86::{
     },
 };
 use x86_64::registers::control::Cr3;
-use x86_64::structures::idt::PageFaultErrorCode;
 use x86_64::{instructions::tables::sidt, registers::control::EferFlags};
 
 use crate::{
@@ -69,6 +72,9 @@ use crate::{
     virt::vm::kvm_host::Vm,
 };
 
+use self::exit::ExitFastpathCompletion;
+use self::exit::VmxExitReason;
+use self::exit::VmxExitReasonBasic;
 use self::vmcs::LoadedVmcs;
 use self::{
     capabilities::{ProcessorTraceMode, VmcsConfig, VmxCapability},
@@ -79,19 +85,20 @@ use self::{
     },
 };
 
+use super::asm::IntrInfo;
 use super::asm::SegmentCacheField;
 use super::kvm_host::RMODE_TSS_SIZE;
 use super::x86_kvm_ops;
 use super::{
     asm::{VcpuSegment, VmxAsm, VmxMsrEntry},
     init_kvm_arch,
-    kvm_host::{
-        vcpu, KvmFunc, KvmInitFunc, KvmIrqChipMode, KvmReg, MsrFilterType, NotifyVmExitFlags,
-    },
+    kvm_host::{KvmFunc, KvmInitFunc, KvmIrqChipMode, KvmReg, MsrFilterType, NotifyVmExitFlags},
     x86_kvm_manager, KvmArchManager,
 };
 
+pub mod asm;
 pub mod capabilities;
+pub mod exit;
 pub mod vmcs;
 
 extern "C" {
@@ -278,6 +285,7 @@ impl KvmInitFunc for VmxKvmInitFunc {
         init_vmx(vmx_init);
         self.setup_per_cpu();
 
+        kwarn!("hardware setup finish");
         Ok(())
     }
 
@@ -344,8 +352,11 @@ impl VmxKvmFunc {
 
             vmx.loaded_vmcs.lock().cpu = cpu;
             let id = vmx.loaded_vmcs.lock().vmcs.lock().revision_id();
-            kdebug!("revision_id {id}");
-            vcpu.request(VirCpuRequest::KVM_REQ_TLB_FLUSH);
+            kdebug!(
+                "revision_id {id} req {:?}",
+                VirtCpuRequest::KVM_REQ_TLB_FLUSH
+            );
+            vcpu.request(VirtCpuRequest::KVM_REQ_TLB_FLUSH);
 
             VmxAsm::vmx_vmwrite(
                 host::TR_BASE,
@@ -358,7 +369,9 @@ impl VmxKvmFunc {
 
             VmxAsm::vmx_vmwrite(host::GDTR_BASE, pseudo_descriptpr.base as usize as u64);
 
-            VmxAsm::vmx_vmwrite(host::IA32_SYSENTER_ESP, unsafe { rdmsr(IA32_SYSENTER_ESP) });
+            VmxAsm::vmx_vmwrite(host::IA32_SYSENTER_ESP, unsafe {
+                rdmsr(msr::IA32_SYSENTER_ESP)
+            });
         }
     }
 
@@ -489,7 +502,7 @@ impl KvmFunc for VmxKvmFunc {
         }
     }
 
-    fn apicv_pre_state_restore(&self, vcpu: &mut VirtCpu) {
+    fn apicv_pre_state_restore(&self, _vcpu: &mut VirtCpu) {
         // https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/vmx/vmx.c#6924
         // TODO: pi
         // todo!()
@@ -604,9 +617,8 @@ impl KvmFunc for VmxKvmFunc {
             _ => {
                 let uret_msr = vmx.find_uret_msr(msr_index);
 
-                if let Some(msr) = uret_msr {
-                    let mut tmp_msr = VmxUretMsr::from(*msr);
-                    vmx.set_guest_uret_msr(&mut tmp_msr, data)?;
+                if let Some((idx, _msr)) = uret_msr {
+                    vmx.set_guest_uret_msr(idx, data)?;
                     vmx.set_uret_msr(msr_index, data);
                 } else {
                     vcpu.arch.set_msr_common(&msr);
@@ -674,7 +686,7 @@ impl KvmFunc for VmxKvmFunc {
 
         VmxAsm::vmx_vmwrite(control::VMENTRY_INTERRUPTION_INFO_FIELD, 0);
 
-        vcpu.request(VirCpuRequest::KVM_REQ_APIC_PAGE_RELOAD);
+        vcpu.request(VirtCpuRequest::MAKE_KVM_REQ_APIC_PAGE_RELOAD);
 
         vmx_info().vpid_sync_context(vcpu.vmx().vpid);
 
@@ -702,7 +714,6 @@ impl KvmFunc for VmxKvmFunc {
         VmxAsm::vmx_vmwrite(guest::RFLAGS, rflags.bits());
 
         if (old_rflags ^ vmx.rflags).contains(RFlags::FLAGS_VM) {
-            drop(vmx);
             let emulation_required = vmx_info().emulation_required(vcpu);
             vcpu.vmx_mut().emulation_required = emulation_required;
         }
@@ -880,12 +891,12 @@ impl KvmFunc for VmxKvmFunc {
 
     fn has_emulated_msr(&self, msr: u32) -> bool {
         match msr {
-            IA32_SMBASE => {
+            msr::IA32_SMBASE => {
                 return vmx_info().enable_unrestricted_guest
                     || vmx_info().emulate_invalid_guest_state;
             }
 
-            IA32_VMX_BASIC..=IA32_VMX_VMFUNC => {
+            msr::IA32_VMX_BASIC..=msr::IA32_VMX_VMFUNC => {
                 return vmx_info().nested;
             }
 
@@ -902,7 +913,7 @@ impl KvmFunc for VmxKvmFunc {
 
     fn get_msr_feature(&self, msr: &mut super::asm::VmxMsrEntry) -> bool {
         match msr.index {
-            IA32_VMX_BASIC..=IA32_VMX_VMFUNC => {
+            msr::IA32_VMX_BASIC..=msr::IA32_VMX_VMFUNC => {
                 if !vmx_info().nested {
                     return false;
                 }
@@ -988,7 +999,7 @@ impl KvmFunc for VmxKvmFunc {
         VmxAsm::vmx_vmwrite(guest::GDTR_BASE, dt.base as usize as u64);
     }
 
-    fn is_vaild_cr0(&self, vcpu: &VirtCpu, cr0: Cr0) -> bool {
+    fn is_vaild_cr0(&self, vcpu: &VirtCpu, _cr0: Cr0) -> bool {
         if vcpu.arch.is_guest_mode() {
             todo!()
         }
@@ -1008,11 +1019,11 @@ impl KvmFunc for VmxKvmFunc {
         return true;
     }
 
-    fn post_set_cr3(&self, vcpu: &VirtCpu, cr3: u64) {
-        // Nothing
+    fn post_set_cr3(&self, _vcpu: &VirtCpu, _cr3: u64) {
+        // Do Nothing
     }
 
-    fn vcpu_run(&self, vcpu: &mut VirtCpu) {
+    fn vcpu_run(&self, vcpu: &mut VirtCpu) -> ExitFastpathCompletion {
         if unlikely(vmx_info().enable_vnmi && vcpu.vmx().loaded_vmcs().soft_vnmi_blocked) {
             todo!()
         }
@@ -1060,12 +1071,168 @@ impl KvmFunc for VmxKvmFunc {
         // TODO: atomic_switch_perf_msrs
 
         if vmx_info().enable_preemption_timer {
-            todo!()
+            // todo!()
+            kwarn!("vmx_update_hv_timer TODO");
         }
 
         Vmx::vmx_vcpu_enter_exit(vcpu, vcpu.vmx().vmx_vcpu_run_flags());
 
-        todo!()
+        unsafe {
+            load_ds(USER_DS);
+            load_es(USER_DS);
+        };
+
+        // TODO: pt_guest_exit
+
+        // TODO: kvm_load_host_xsave_state
+
+        if vcpu.arch.is_guest_mode() {
+            todo!()
+        }
+
+        if unlikely(vcpu.vmx().fail != 0) {
+            return ExitFastpathCompletion::None;
+        }
+
+        if unlikely(
+            vcpu.vmx().exit_reason.basic()
+                == VmxExitReasonBasic::VM_ENTRY_FAILURE_MACHINE_CHECK_EVENT as u16,
+        ) {
+            todo!()
+        }
+
+        if unlikely(vcpu.vmx().exit_reason.failed_vmentry()) {
+            return ExitFastpathCompletion::None;
+        }
+
+        vcpu.vmx().loaded_vmcs().launched = true;
+
+        // TODO: 处理中断
+
+        if vcpu.arch.is_guest_mode() {
+            return ExitFastpathCompletion::None;
+        }
+
+        return Vmx::vmx_exit_handlers_fastpath(vcpu);
+    }
+
+    fn prepare_switch_to_guest(&self, vcpu: &mut VirtCpu) {
+        // let cpu = smp_get_processor_id();
+        let vmx = vcpu.vmx_mut();
+        vmx.req_immediate_exit = false;
+
+        if !vmx.guest_uret_msrs_loaded {
+            vmx.guest_uret_msrs_loaded = true;
+
+            for (idx, msr) in vmx.guest_uret_msrs.iter().enumerate() {
+                if msr.load_into_hardware {
+                    x86_kvm_manager().kvm_set_user_return_msr(idx, msr.data, msr.mask);
+                }
+            }
+        }
+
+        // TODO: nested
+
+        if vmx.guest_state_loaded {
+            return;
+        }
+
+        // fixme: 这里读的是当前cpu的gsbase，正确安全做法应该为将gsbase设置为percpu变量
+        let gs_base = unsafe { rdmsr(msr::IA32_KERNEL_GSBASE) };
+
+        let current = ProcessManager::current_pcb();
+        let mut pcb_arch = current.arch_info_irqsave();
+
+        let fs_sel = fs().bits();
+        let gs_sel = gs().bits();
+
+        unsafe {
+            pcb_arch.save_fsbase();
+            pcb_arch.save_gsbase();
+        }
+
+        let fs_base = pcb_arch.fsbase();
+        vmx.msr_host_kernel_gs_base = pcb_arch.gsbase() as u64;
+
+        unsafe { wrmsr(msr::IA32_KERNEL_GSBASE, vmx.msr_guest_kernel_gs_base) };
+
+        let mut loaded_vmcs = vmx.loaded_vmcs();
+        let host_state = &mut loaded_vmcs.host_state;
+        host_state.ldt_sel = unsafe { ldtr() }.bits();
+
+        host_state.ds_sel = ds().bits();
+        host_state.es_sel = es().bits();
+
+        host_state.set_host_fsgs(fs_sel, gs_sel, fs_base, gs_base as usize);
+        drop(loaded_vmcs);
+
+        vmx.guest_state_loaded = true;
+    }
+
+    fn flush_tlb_all(&self, vcpu: &mut VirtCpu) {
+        if vmx_info().enable_ept {
+            VmxAsm::ept_sync_global();
+        } else {
+            if vmx_info().has_invvpid_global() {
+                VmxAsm::sync_vcpu_global();
+            } else {
+                VmxAsm::sync_vcpu_single(vcpu.vmx().vpid);
+                // TODO: 嵌套：VmxAsm::sync_vcpu_single(vcpu.vmx().nested.vpid02);
+            }
+        }
+    }
+
+    fn handle_exit_irqoff(&self, vcpu: &mut VirtCpu) {
+        if vcpu.vmx().emulation_required {
+            return;
+        }
+
+        let basic = VmxExitReasonBasic::from(vcpu.vmx().exit_reason.basic());
+
+        if basic == VmxExitReasonBasic::EXTERNAL_INTERRUPT {
+            todo!()
+        } else if basic == VmxExitReasonBasic::EXCEPTION_OR_NMI {
+            todo!()
+        }
+    }
+
+    fn handle_exit(
+        &self,
+        vcpu: &mut VirtCpu,
+        fastpath: ExitFastpathCompletion,
+    ) -> Result<(), SystemError> {
+        let r = vmx_info().vmx_handle_exit(vcpu, fastpath);
+
+        if vcpu.vmx().exit_reason.bus_lock_detected() {
+            todo!()
+        }
+
+        r
+    }
+
+    fn load_mmu_pgd(&self, vcpu: &mut VirtCpu, _vm: &Vm, root_hpa: u64, root_level: u32) {
+        let guest_cr3;
+        let eptp;
+
+        if vmx_info().enable_ept {
+            eptp = vmx_info().construct_eptp(vcpu, root_hpa, root_level);
+
+            VmxAsm::vmx_vmwrite(control::EPTP_FULL, eptp);
+
+            if !vmx_info().enable_unrestricted_guest
+                && !vcpu.arch.cr0.contains(Cr0::CR0_ENABLE_PAGING)
+            {
+                todo!()
+            } else if vcpu.arch.is_register_dirty(KvmReg::VcpuExregCr3) {
+                guest_cr3 = vcpu.arch.cr3;
+            } else {
+                return;
+            }
+        } else {
+            todo!();
+        }
+
+        VmxAsm::vmx_vmwrite(guest::CR3, guest_cr3);
     }
 }
 
@@ -1168,7 +1335,9 @@ impl Vmx {
      * an error that should result in #GP in the guest, unless userspace
      * handles it.
      */
+    #[allow(dead_code)]
     pub const KVM_MSR_RET_INVALID: u32 = 2; /* in-kernel MSR emulation #GP condition */
+    #[allow(dead_code)]
     pub const KVM_MSR_RET_FILTERED: u32 = 3; /* #GP due to userspace MSR filter */
 
     pub const MAX_POSSIBLE_PASSTHROUGH_MSRS: usize = 16;
@@ -1177,19 +1346,19 @@ impl Vmx {
         0x48,  // MSR_IA32_SPEC_CTRL
         0x49,  // MSR_IA32_PRED_CMD
         0x10b, // MSR_IA32_FLUSH_CMD
-        IA32_TIME_STAMP_COUNTER,
-        IA32_FS_BASE,
-        IA32_GS_BASE,
-        IA32_KERNEL_GSBASE,
+        msr::IA32_TIME_STAMP_COUNTER,
+        msr::IA32_FS_BASE,
+        msr::IA32_GS_BASE,
+        msr::IA32_KERNEL_GSBASE,
         0x1c4, // MSR_IA32_XFD
         0x1c5, // MSR_IA32_XFD_ERR
-        IA32_SYSENTER_CS,
-        IA32_SYSENTER_ESP,
-        IA32_SYSENTER_EIP,
-        MSR_CORE_C1_RESIDENCY,
-        MSR_CORE_C3_RESIDENCY,
-        MSR_CORE_C6_RESIDENCY,
-        MSR_CORE_C7_RESIDENCY,
+        msr::IA32_SYSENTER_CS,
+        msr::IA32_SYSENTER_ESP,
+        msr::IA32_SYSENTER_EIP,
+        msr::MSR_CORE_C1_RESIDENCY,
+        msr::MSR_CORE_C3_RESIDENCY,
+        msr::MSR_CORE_C6_RESIDENCY,
+        msr::MSR_CORE_C7_RESIDENCY,
     ];
 
     /// ### 查看CPU是否支持虚拟化
@@ -1214,12 +1383,12 @@ impl Vmx {
     #[inline(never)]
     pub fn set_up_user_return_msrs() {
         const VMX_URET_MSRS_LIST: &'static [u32] = &[
-            IA32_FMASK,
-            IA32_LSTAR,
-            IA32_CSTAR,
-            IA32_EFER,
-            IA32_TSC_AUX,
-            IA32_STAR,
+            msr::IA32_FMASK,
+            msr::IA32_LSTAR,
+            msr::IA32_CSTAR,
+            msr::IA32_EFER,
+            msr::IA32_TSC_AUX,
+            msr::IA32_STAR,
             // 这个寄存器会出错<,先注释掉
             // MSR_IA32_TSX_CTRL,
         ];
@@ -1274,7 +1443,7 @@ impl Vmx {
             )
         }
 
-        let cap = unsafe { rdmsr(IA32_VMX_EPT_VPID_CAP) };
+        let cap = unsafe { rdmsr(msr::IA32_VMX_EPT_VPID_CAP) };
         vmx_cap.set_val_from_msr_val(cap);
 
         // 不支持ept但是读取到了值
@@ -1337,7 +1506,7 @@ impl Vmx {
             return Err(SystemError::EIO);
         }
 
-        let basic = unsafe { rdmsr(IA32_VMX_BASIC) };
+        let basic = unsafe { rdmsr(msr::IA32_VMX_BASIC) };
         let vmx_msr_high = (basic >> 32) as u32;
         let vmx_msr_low = basic as u32;
 
@@ -1351,7 +1520,7 @@ impl Vmx {
             return Err(SystemError::EIO);
         }
 
-        let misc_msr = unsafe { rdmsr(IA32_VMX_MISC) };
+        let misc_msr = unsafe { rdmsr(msr::IA32_VMX_MISC) };
 
         vmcs_config.size = vmx_msr_high & 0x1fff;
         vmcs_config.basic_cap = vmx_msr_high & !0x1fff;
@@ -1417,15 +1586,15 @@ impl Vmx {
                 // x2Apic msr寄存器
                 return true;
             }
-            MSR_IA32_RTIT_STATUS
-            | MSR_IA32_RTIT_OUTPUT_BASE
-            | MSR_IA32_RTIT_OUTPUT_MASK_PTRS
-            | MSR_IA32_CR3_MATCH
-            | MSR_LBR_SELECT
-            | MSR_LASTBRANCH_TOS => {
+            msr::MSR_IA32_RTIT_STATUS
+            | msr::MSR_IA32_RTIT_OUTPUT_BASE
+            | msr::MSR_IA32_RTIT_OUTPUT_MASK_PTRS
+            | msr::MSR_IA32_CR3_MATCH
+            | msr::MSR_LBR_SELECT
+            | msr::MSR_LASTBRANCH_TOS => {
                 return true;
             }
-            MSR_IA32_ADDR0_START..MSR_IA32_ADDR3_END => {
+            msr::MSR_IA32_ADDR0_START..msr::MSR_IA32_ADDR3_END => {
                 return true;
             }
             0xdc0..0xddf => {
@@ -1481,6 +1650,24 @@ impl Vmx {
         *L1TF_VMX_MITIGATION.write() = VmxL1dFlushState::FlushNotRequired;
     }
 
+    pub fn construct_eptp(&self, vcpu: &mut VirtCpu, root_hpa: u64, root_level: u32) -> u64 {
+        let mut eptp = VMX_EPTP_MT_WB;
+
+        eptp |= if root_level == 5 {
+            VMX_EPTP_PWL_5
+        } else {
+            VMX_EPTP_PWL_4
+        };
+
+        if self.enable_ept_ad && !vcpu.arch.is_guest_mode() {
+            eptp |= VMX_EPTP_AD_ENABLE_BIT;
+        }
+
+        eptp |= root_hpa;
+
+        return eptp;
+    }
+
     fn vmx_reset_vcpu(&mut self, vcpu: &mut VirtCpu, vm: &Vm) {
         self.init_vmcs(vcpu, vm);
 
@@ -1508,6 +1695,10 @@ impl Vmx {
         }
 
         if vmx_info().has_msr_bitmap() {
+            kdebug!(
+                "msr_bitmap addr 0x{:x}",
+                vcpu.vmx().vmcs01.lock().msr_bitmap.phys_addr() as u64
+            );
             VmxAsm::vmx_vmwrite(
                 control::MSR_BITMAPS_ADDR_FULL,
                 vcpu.vmx().vmcs01.lock().msr_bitmap.phys_addr() as u64,
@@ -1680,6 +1871,349 @@ impl Vmx {
         self.setup_uret_msrs(vcpu);
     }
 
+    /// 打印VMCS信息用于debug
+    pub fn dump_vmcs(&self, vcpu: &VirtCpu) {
+        let vmentry_ctl =
+            EntryControls::from_bits_truncate(self.vmread(control::VMENTRY_CONTROLS) as u32);
+
+        let vmexit_ctl =
+            ExitControls::from_bits_truncate(self.vmread(control::VMEXIT_CONTROLS) as u32);
+
+        let cpu_based_exec_ctl = PrimaryControls::from_bits_truncate(
+            self.vmread(control::PRIMARY_PROCBASED_EXEC_CONTROLS) as u32,
+        );
+
+        let pin_based_exec_ctl = PinbasedControls::from_bits_truncate(
+            self.vmread(control::PINBASED_EXEC_CONTROLS) as u32,
+        );
+
+        // let cr4 = Cr4::from_bits_truncate(self.vmread(guest::CR4) as usize);
+
+        let secondary_exec_control = if self.has_sceondary_exec_ctrls() {
+            SecondaryControls::from_bits_truncate(
+                self.vmread(control::SECONDARY_PROCBASED_EXEC_CONTROLS) as u32,
+            )
+        } else {
+            SecondaryControls::empty()
+        };
+
+        if self.has_tertiary_exec_ctrls() {
+            todo!()
+        }
+
+        kerror!(
+            "VMCS addr: 0x{:x}, last attempted VM-entry on CPU {:?}",
+            vcpu.vmx().loaded_vmcs().vmcs.lock().as_ref() as *const _ as usize,
+            vcpu.arch.last_vmentry_cpu
+        );
+
+        kerror!("--- GUEST STATE ---");
+        kerror!(
+            "CR0: actual = 0x{:x}, shadow = 0x{:x}, gh_mask = 0x{:x}",
+            self.vmread(guest::CR0),
+            self.vmread(control::CR0_READ_SHADOW),
+            self.vmread(control::CR0_GUEST_HOST_MASK)
+        );
+        kerror!(
+            "CR4: actual = 0x{:x}, shadow = 0x{:x}, gh_mask = 0x{:x}",
+            self.vmread(guest::CR4),
+            self.vmread(control::CR4_READ_SHADOW),
+            self.vmread(control::CR4_GUEST_HOST_MASK)
+        );
+        kerror!("CR3: actual = 0x{:x}", self.vmread(guest::CR3));
+
+        if self.has_ept() {
+            kerror!(
+                "PDPTR0 = 0x{:x}, PDPTR1 = 0x{:x}",
+                self.vmread(guest::PDPTE0_FULL),
+                self.vmread(guest::PDPTE1_FULL)
+            );
+            kerror!(
+                "PDPTR2 = 0x{:x}, PDPTR3 = 0x{:x}",
+                self.vmread(guest::PDPTE2_FULL),
+                self.vmread(guest::PDPTE3_FULL)
+            );
+        }
+        kerror!(
+            "RSP = 0x{:x}, RIP = 0x{:x}",
+            self.vmread(guest::RSP),
+            self.vmread(guest::RIP)
+        );
+        kerror!(
+            "RFLAGS = 0x{:x}, DR7 = 0x{:x}",
+            self.vmread(guest::RFLAGS),
+            self.vmread(guest::DR7)
+        );
+        kerror!(
+            "Sysenter RSP = 0x{:x}, CS:RIP = 0x{:x}:0x{:x}",
+            self.vmread(guest::IA32_SYSENTER_ESP),
+            self.vmread(guest::IA32_SYSENTER_CS),
+            self.vmread(guest::IA32_SYSENTER_EIP),
+        );
+
+        self.dump_sel("CS: ", guest::CS_SELECTOR);
+        self.dump_sel("DS: ", guest::DS_SELECTOR);
+        self.dump_sel("SS: ", guest::SS_SELECTOR);
+        self.dump_sel("FS: ", guest::FS_SELECTOR);
+        self.dump_sel("GS: ", guest::GS_SELECTOR);
+
+        self.dump_dtsel("GDTR: ", guest::GDTR_LIMIT);
+        self.dump_sel("LDTR: ", guest::LDTR_SELECTOR);
+        self.dump_dtsel("IDTR: ", guest::IDTR_LIMIT);
+        self.dump_sel("TR: ", guest::TR_SELECTOR);
+
+        let efer_slot = vcpu
+            .vmx()
+            .msr_autoload
+            .guest
+            .find_loadstore_msr_slot(msr::IA32_EFER);
+
+        if vmentry_ctl.contains(EntryControls::LOAD_IA32_EFER) {
+            kerror!("EFER = 0x{:x}", self.vmread(guest::IA32_EFER_FULL));
+        } else if let Some(slot) = efer_slot {
+            kerror!(
+                "EFER = 0x{:x} (autoload)",
+                vcpu.vmx().msr_autoload.guest.val[slot].data
+            );
+        } else if vmentry_ctl.contains(EntryControls::IA32E_MODE_GUEST) {
+            kerror!(
+                "EFER = 0x{:x} (effective)",
+                vcpu.arch.efer | (EferFlags::LONG_MODE_ACTIVE | EferFlags::LONG_MODE_ENABLE)
+            );
+        } else {
+            kerror!(
+                "EFER = 0x{:x} (effective)",
+                vcpu.arch.efer & !(EferFlags::LONG_MODE_ACTIVE | EferFlags::LONG_MODE_ENABLE)
+            );
+        }
+
+        if vmentry_ctl.contains(EntryControls::LOAD_IA32_PAT) {
+            kerror!("PAT = 0x{:x}", self.vmread(guest::IA32_PAT_FULL));
+        }
+
+        kerror!(
+            "DebugCtl = 0x{:x}, DebugExceptions = 0x{:x}",
+            self.vmread(guest::IA32_DEBUGCTL_FULL),
+            self.vmread(guest::PENDING_DBG_EXCEPTIONS)
+        );
+
+        if self.has_load_perf_global_ctrl()
+            && vmentry_ctl.contains(EntryControls::LOAD_IA32_PERF_GLOBAL_CTRL)
+        {
+            kerror!(
+                "PerfGlobCtl = 0x{:x}",
+                self.vmread(guest::IA32_PERF_GLOBAL_CTRL_FULL)
+            );
+        }
+
+        if vmentry_ctl.contains(EntryControls::LOAD_IA32_BNDCFGS) {
+            kerror!("BndCfgS = 0x{:x}", self.vmread(guest::IA32_BNDCFGS_FULL));
+        }
+
+        kerror!(
+            "Interruptibility = 0x{:x}, ActivityState = 0x{:x}",
+            self.vmread(guest::INTERRUPT_STATUS),
+            self.vmread(guest::ACTIVITY_STATE)
+        );
+
+        if secondary_exec_control.contains(SecondaryControls::VIRTUAL_INTERRUPT_DELIVERY) {
+            kerror!(
+                "InterruptStatus = 0x{:x}",
+                self.vmread(guest::INTERRUPT_STATUS)
+            );
+        }
+
+        if self.vmread(control::VMENTRY_MSR_LOAD_COUNT) > 0 {
+            self.dump_msrs("guest autoload", &vcpu.vmx().msr_autoload.guest);
+        }
+        if self.vmread(control::VMEXIT_MSR_LOAD_COUNT) > 0 {
+            self.dump_msrs("guest autostore", &vcpu.vmx().msr_autostore);
+        }
+
+        kerror!("\n--- HOST STATE ---");
+        kerror!(
+            "RIP = 0x{:x}, RSP = 0x{:x}",
+            self.vmread(host::RIP),
+            self.vmread(host::RSP)
+        );
+        kerror!(
+            "CS = 0x{:x}, SS = 0x{:x}, DS = 0x{:x}, ES = 0x{:x}, FS = 0x{:x}, GS = 0x{:x}, TR = 0x{:x}",
+            self.vmread(host::CS_SELECTOR),
+            self.vmread(host::SS_SELECTOR),
+            self.vmread(host::DS_SELECTOR),
+            self.vmread(host::ES_SELECTOR),
+            self.vmread(host::FS_SELECTOR),
+            self.vmread(host::GS_SELECTOR),
+            self.vmread(host::TR_SELECTOR)
+        );
+        kerror!(
+            "FSBase = 0x{:x}, GSBase = 0x{:x}, TRBase = 0x{:x}",
+            self.vmread(host::FS_BASE),
+            self.vmread(host::GS_BASE),
+            self.vmread(host::TR_BASE),
+        );
+        kerror!(
+            "GDTBase = 0x{:x}, IDTBase = 0x{:x}",
+            self.vmread(host::GDTR_BASE),
+            self.vmread(host::IDTR_BASE),
+        );
+        kerror!(
+            "CR0 = 0x{:x}, CR3 = 0x{:x}, CR4 = 0x{:x}",
+            self.vmread(host::CR0),
+            self.vmread(host::CR3),
+            self.vmread(host::CR4),
+        );
+        kerror!(
+            "Sysenter RSP = 0x{:x}, CS:RIP=0x{:x}:0x{:x}",
+            self.vmread(host::IA32_SYSENTER_ESP),
+            self.vmread(host::IA32_SYSENTER_CS),
+            self.vmread(host::IA32_SYSENTER_EIP),
+        );
+
+        if vmexit_ctl.contains(ExitControls::LOAD_IA32_EFER) {
+            kerror!("EFER = 0x{:x}", self.vmread(host::IA32_EFER_FULL));
+        }
+
+        if vmexit_ctl.contains(ExitControls::LOAD_IA32_PAT) {
+            kerror!("PAT = 0x{:x}", self.vmread(host::IA32_PAT_FULL));
+        }
+
+        if self.has_load_perf_global_ctrl()
+            && vmexit_ctl.contains(ExitControls::LOAD_IA32_PERF_GLOBAL_CTRL)
+        {
+            kerror!(
+                "PerfGlobCtl = 0x{:x}",
+                self.vmread(host::IA32_PERF_GLOBAL_CTRL_FULL)
+            );
+        }
+
+        if self.vmread(control::VMEXIT_MSR_LOAD_COUNT) > 0 {
+            self.dump_msrs("host autoload", &vcpu.vmx().msr_autoload.host);
+        }
+
+        kerror!("\n--- CONTROL STATE ---");
+        kerror!(
+            "\nCPUBased = {:?},\nSecondaryExec = 0x{:x},\nTertiaryExec = 0(Unused)",
+            cpu_based_exec_ctl,
+            secondary_exec_control,
+        );
+        kerror!(
+            "\nPinBased = {:?},\nEntryControls = {:?},\nExitControls = {:?}",
+            pin_based_exec_ctl,
+            vmentry_ctl,
+            vmexit_ctl,
+        );
+        kerror!(
+            "ExceptionBitmap = 0x{:x}, PFECmask = 0x{:x}, PFECmatch = 0x{:x}",
+            self.vmread(control::EXCEPTION_BITMAP),
+            self.vmread(control::PAGE_FAULT_ERR_CODE_MASK),
+            self.vmread(control::PAGE_FAULT_ERR_CODE_MATCH),
+        );
+        kerror!(
+            "VMEntry: intr_info = 0x{:x}, errcode = 0x{:x}, ilen = 0x{:x}",
+            self.vmread(control::VMENTRY_INTERRUPTION_INFO_FIELD),
+            self.vmread(control::VMENTRY_EXCEPTION_ERR_CODE),
+            self.vmread(control::VMENTRY_INSTRUCTION_LEN),
+        );
+        kerror!(
+            "VMExit: intr_info = 0x{:x}, errcode = 0x{:x}, ilen = 0x{:x}",
+            self.vmread(ro::VMEXIT_INSTRUCTION_INFO),
+            self.vmread(ro::VMEXIT_INTERRUPTION_ERR_CODE),
+            self.vmread(ro::VMEXIT_INSTRUCTION_LEN),
+        );
+        kerror!(
+            "        reason = 0x{:x}, qualification = 0x{:x}",
+            self.vmread(ro::EXIT_REASON),
+            self.vmread(ro::EXIT_QUALIFICATION),
+        );
+        kerror!(
+            "IDTVectoring: info = 0x{:x}, errcode = 0x{:x}",
+            self.vmread(ro::IDT_VECTORING_INFO),
+            self.vmread(ro::IDT_VECTORING_ERR_CODE),
+        );
+        kerror!("TSC Offset = 0x{:x}", self.vmread(control::TSC_OFFSET_FULL));
+
+        if secondary_exec_control.contains(SecondaryControls::USE_TSC_SCALING) {
+            kerror!(
+                "TSC Multiplier = 0x{:x}",
+                self.vmread(control::TSC_MULTIPLIER_FULL)
+            );
+        }
+
+        if cpu_based_exec_ctl.contains(PrimaryControls::USE_TPR_SHADOW) {
+            if secondary_exec_control.contains(SecondaryControls::VIRTUAL_INTERRUPT_DELIVERY) {
+                let status = self.vmread(guest::INTERRUPT_STATUS);
+                kerror!("SVI|RVI = 0x{:x}|0x{:x}", status >> 8, status & 0xff);
+            }
+
+            kerror!(
+                "TPR Threshold = 0x{:x}",
+                self.vmread(control::TPR_THRESHOLD)
+            );
+            if secondary_exec_control.contains(SecondaryControls::VIRTUALIZE_APIC) {
+                kerror!(
+                    "APIC-access addr = 0x{:x}",
+                    self.vmread(control::APIC_ACCESS_ADDR_FULL)
+                );
+            }
+            kerror!(
+                "virt-APIC addr = 0x{:x}",
+                self.vmread(control::VIRT_APIC_ADDR_FULL)
+            );
+        }
+
+        if pin_based_exec_ctl.contains(PinbasedControls::POSTED_INTERRUPTS) {
+            kerror!(
+                "PostedIntrVec = 0x{:x}",
+                self.vmread(control::POSTED_INTERRUPT_NOTIFICATION_VECTOR)
+            );
+        }
+
+        if secondary_exec_control.contains(SecondaryControls::ENABLE_EPT) {
+            kerror!("EPT pointer = 0x{:x}", self.vmread(control::EPTP_FULL));
+        }
+        if secondary_exec_control.contains(SecondaryControls::PAUSE_LOOP_EXITING) {
+            kerror!(
+                "PLE Gap = 0x{:x}, Window = 0x{:x}",
+                self.vmread(control::PLE_GAP),
+                self.vmread(control::PLE_WINDOW)
+            );
+        }
+        if secondary_exec_control.contains(SecondaryControls::ENABLE_VPID) {
+            kerror!("Virtual processor ID = 0x{:x}", self.vmread(control::VPID));
+        }
+    }
+
+    pub fn dump_sel(&self, name: &'static str, sel: u32) {
+        kerror!(
+            "{name} sel = 0x{:x}, attr = 0x{:x}, limit = 0x{:x}, base = 0x{:x}",
+            self.vmread(sel),
+            self.vmread(sel + guest::ES_ACCESS_RIGHTS - guest::ES_SELECTOR),
+            self.vmread(sel + guest::ES_LIMIT - guest::ES_SELECTOR),
+            self.vmread(sel + guest::ES_BASE - guest::ES_SELECTOR),
+        );
+    }
+
+    pub fn dump_dtsel(&self, name: &'static str, limit: u32) {
+        kerror!(
+            "{name} limit = 0x{:x}, base = 0x{:x}",
+            self.vmread(limit),
+            self.vmread(limit + guest::GDTR_BASE - guest::GDTR_LIMIT)
+        );
+    }
+
+    pub fn dump_msrs(&self, name: &'static str, msr: &VmxMsrs) {
+        kerror!("MSR {name}:");
+        for (idx, msr) in msr.val.iter().enumerate() {
+            kerror!("{idx}: msr = 0x{:x}, value = 0x{:x}", msr.index, msr.data);
+        }
+    }
+
+    #[inline]
+    pub fn vmread(&self, field: u32) -> u64 {
+        VmxAsm::vmx_vmread(field)
+    }
+
     fn setup_uret_msrs(&self, vcpu: &mut VirtCpu) {
         // 是否加载syscall相关msr
         let load_syscall_msrs =
@@ -1709,7 +2243,7 @@ impl Vmx {
     fn setup_uret_msr(&self, vcpu: &mut VirtCpu, msr: u32, load_into_hardware: bool) {
         let uret_msr = vcpu.vmx_mut().find_uret_msr_mut(msr);
 
-        if let Some(msr) = uret_msr {
+        if let Some((_idx, msr)) = uret_msr {
             msr.load_into_hardware = load_into_hardware;
         }
     }
@@ -1862,7 +2396,7 @@ impl Vmx {
     fn get_pin_based_exec_controls(&self, vcpu: &VirtCpu) -> PinbasedControls {
         let mut ctrls = self.vmcs_config.pin_based_exec_ctrl;
 
-        if vcpu.arch.vcpu_apicv_active() {
+        if !vcpu.arch.vcpu_apicv_active() {
             ctrls.remove(PinbasedControls::POSTED_INTERRUPTS);
         }
 
@@ -2365,13 +2899,161 @@ impl Vmx {
 
         let fail =
             unsafe { __vmx_vcpu_run(vcpu.vmx(), vcpu.arch.regs.as_ptr(), flags.bits as u32) };
+
         vcpu.vmx_mut().fail = fail as u8;
+
+        vcpu.arch.cr2 = unsafe { cr2() } as u64;
+        vcpu.arch.regs_avail.set_all(true);
+
+        // 这些寄存器需要更新缓存
+        for reg_idx in Vmx::VMX_REGS_LAZY_LOAD_SET {
+            vcpu.arch.regs_avail.set(*reg_idx, false);
+        }
+
+        vcpu.vmx_mut().idt_vectoring_info = IntrInfo::empty();
+
+        // TODO: enable_fb_clear
+
+        if unlikely(vcpu.vmx().fail != 0) {
+            vcpu.vmx_mut().exit_reason = VmxExitReason::from(0xdead);
+            return;
+        }
+
+        vcpu.vmx_mut().exit_reason =
+            VmxExitReason::from(VmxAsm::vmx_vmread(ro::EXIT_REASON) as u32);
+
+        if likely(!vcpu.vmx().exit_reason.failed_vmentry()) {
+            vcpu.vmx_mut().idt_vectoring_info =
+                IntrInfo::from_bits_truncate(VmxAsm::vmx_vmread(ro::IDT_VECTORING_INFO) as u32);
+        }
+
+        if VmxExitReasonBasic::from(vcpu.vmx().exit_reason.basic())
+            == VmxExitReasonBasic::EXCEPTION_OR_NMI
+            && VmcsIntrHelper::is_nmi(Vmx::vmx_get_intr_info(vcpu))
+        {
+            todo!()
+        }
+    }
+
+    fn vmx_get_intr_info(vcpu: &mut VirtCpu) -> IntrInfo {
+        if !vcpu
+            .arch
+            .test_and_mark_available(KvmReg::VcpuExregExitInfo2)
+        {
+            vcpu.vmx_mut().exit_intr_info = IntrInfo::from_bits_truncate(VmxAsm::vmx_vmread(
+                ro::VMEXIT_INTERRUPTION_INFO,
+            ) as u32);
+        }
+
+        return vcpu.vmx_mut().exit_intr_info;
+    }
+
+    pub fn vmx_exit_handlers_fastpath(vcpu: &mut VirtCpu) -> ExitFastpathCompletion {
+        match VmxExitReasonBasic::from(vcpu.vmx().exit_reason.basic()) {
+            VmxExitReasonBasic::WRMSR => {
+                todo!()
+            }
+            VmxExitReasonBasic::VMX_PREEMPTION_TIMER_EXPIRED => {
+                todo!()
+            }
+            _ => ExitFastpathCompletion::None,
+        }
+    }
+
+    pub fn vmx_handle_exit(
+        &self,
+        vcpu: &mut VirtCpu,
+        exit_fastpath: ExitFastpathCompletion,
+    ) -> Result<(), SystemError> {
+        let exit_reason = vcpu.vmx().exit_reason;
+
+        let unexpected_vmexit = |vcpu: &mut VirtCpu| -> Result<(), SystemError> {
+            kerror!("vmx: unexpected exit reason {:?}\n", exit_reason);
+
+            self.dump_vmcs(vcpu);
+
+            let cpu = vcpu.arch.last_vmentry_cpu.into() as u64;
+            let run = vcpu.kvm_run_mut();
+            run.exit_reason = kvm_exit::KVM_EXIT_INTERNAL_ERROR;
+
+            unsafe {
+                run.__bindgen_anon_1.internal.ndata = 2;
+                run.__bindgen_anon_1.internal.data[0] = Into::<u32>::into(exit_reason) as u64;
+                run.__bindgen_anon_1.internal.data[1] = cpu;
+            }
+
+            return Ok(());
+        };
+
+        let vectoring_info = vcpu.vmx().idt_vectoring_info;
+
+        if self.enable_pml && !vcpu.arch.is_guest_mode() {
+            todo!()
+        }
+
+        if vcpu.arch.is_guest_mode() {
+            if exit_reason.basic() == VmxExitReasonBasic::PML_FULL as u16 {
+                return unexpected_vmexit(vcpu);
+            }
+
+            todo!()
+        }
+
+        if vcpu.vmx().emulation_required {
+            todo!()
+        }
+
+        if exit_reason.failed_vmentry() {
+            self.dump_vmcs(vcpu);
+            todo!()
+        }
+
+        if unlikely(vcpu.vmx().fail != 0) {
+            self.dump_vmcs(vcpu);
+            todo!()
+        }
+
+        let basic = VmxExitReasonBasic::from(exit_reason.basic());
+        if vectoring_info.contains(IntrInfo::INTR_INFO_VALID_MASK)
+            && basic != VmxExitReasonBasic::EXCEPTION_OR_NMI
+            && basic != VmxExitReasonBasic::EPT_VIOLATION
+            && basic != VmxExitReasonBasic::PML_FULL
+            && basic != VmxExitReasonBasic::APIC_ACCESS
+            && basic != VmxExitReasonBasic::TASK_SWITCH
+            && basic != VmxExitReasonBasic::NOTIFY
+        {
+            todo!()
+        }
+
+        if unlikely(!self.enable_pml && vcpu.vmx().loaded_vmcs().soft_vnmi_blocked) {
+            todo!()
+        }
+
+        if exit_fastpath != ExitFastpathCompletion::None {
+            return Err(SystemError::EINVAL);
+        }
 
         todo!()
     }
+
+    /// 需要在缓存中更新的寄存器集。此处未列出的其他寄存器在 VM 退出后立即同步到缓存。
+    pub const VMX_REGS_LAZY_LOAD_SET: &'static [usize] = &[
+        KvmReg::VcpuRegsRip as usize,
+        KvmReg::VcpuRegsRsp as usize,
+        KvmReg::VcpuExregRflags as usize,
+        KvmReg::NrVcpuRegs as usize,
+        KvmReg::VcpuExregSegments as usize,
+        KvmReg::VcpuExregCr0 as usize,
+        KvmReg::VcpuExregCr3 as usize,
+        KvmReg::VcpuExregCr4 as usize,
+        KvmReg::VcpuExregExitInfo1 as usize,
+        KvmReg::VcpuExregExitInfo2 as usize,
+    ];
 }
 
 extern "C" {
+    /// #[allow(improper_ctypes)]因为只需要在内部调用而无需与C交互
+    #[allow(improper_ctypes)]
     fn __vmx_vcpu_run(vmx: &VmxVCpuPriv, regs: *const u64, flags: u32) -> i32;
 }
 
@@ -2473,10 +3155,17 @@ pub struct VmxSegmentCache {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct VmxVCpuPriv {
     vpid: u16,
 
     fail: u8,
+
+    exit_reason: VmxExitReason,
+
+    exit_intr_info: IntrInfo,
+
+    idt_vectoring_info: IntrInfo,
 
     vmcs01: Arc<LockedLoadedVmcs>,
     loaded_vmcs: Arc<LockedLoadedVmcs>,
@@ -2491,6 +3180,9 @@ pub struct VmxVCpuPriv {
     msr_ia32_feature_control: u64,
     msr_ia32_feature_control_valid_bits: u64,
 
+    msr_host_kernel_gs_base: u64,
+    msr_guest_kernel_gs_base: u64,
+
     emulation_required: bool,
 
     rflags: RFlags,
@@ -2499,6 +3191,7 @@ pub struct VmxVCpuPriv {
     ple_window_dirty: bool,
 
     msr_autoload: VmxMsrAutoLoad,
+    msr_autostore: VmxMsrs,
 
     pml_pg: Box<[u8; MMArch::PAGE_SIZE]>,
 
@@ -2509,9 +3202,13 @@ pub struct VmxVCpuPriv {
     hv_deadline_tsc: u64,
 
     segment_cache: VmxSegmentCache,
+
+    req_immediate_exit: bool,
+    guest_state_loaded: bool,
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct KvmVmx {
     tss_addr: usize,
     ept_identity_pagetable_done: bool,
@@ -2560,6 +3257,14 @@ impl VmxVCpuPriv {
             segment_cache: VmxSegmentCache::default(),
             emulation_required: false,
             rflags: RFlags::empty(),
+            req_immediate_exit: false,
+            guest_state_loaded: false,
+            msr_host_kernel_gs_base: 0,
+            msr_guest_kernel_gs_base: 0,
+            idt_vectoring_info: IntrInfo::empty(),
+            exit_reason: VmxExitReason::new(),
+            exit_intr_info: IntrInfo::empty(),
+            msr_autostore: VmxMsrs::default(),
         };
 
         vmx.vpid = vmx_info().alloc_vpid().unwrap_or_default() as u16;
@@ -2569,8 +3274,8 @@ impl VmxVCpuPriv {
         }
 
         if CpuId::new().get_extended_feature_info().unwrap().has_rtm() {
-            let tsx_ctrl = vmx.find_uret_msr_mut(MSR_IA32_TSX_CTRL);
-            if let Some(tsx_ctrl) = tsx_ctrl {
+            let tsx_ctrl = vmx.find_uret_msr_mut(msr::MSR_IA32_TSX_CTRL);
+            if let Some((_idx, tsx_ctrl)) = tsx_ctrl {
                 // Disable TSX enumeration
                 tsx_ctrl.mask = !(1 << 1);
             }
@@ -2581,20 +3286,20 @@ impl VmxVCpuPriv {
 
         let arch = &vm.arch;
 
-        vmx.disable_intercept_for_msr(arch, IA32_TIME_STAMP_COUNTER, MsrType::READ);
-        vmx.disable_intercept_for_msr(arch, IA32_FS_BASE, MsrType::RW);
-        vmx.disable_intercept_for_msr(arch, IA32_GS_BASE, MsrType::RW);
-        vmx.disable_intercept_for_msr(arch, IA32_KERNEL_GSBASE, MsrType::RW);
+        vmx.disable_intercept_for_msr(arch, msr::IA32_TIME_STAMP_COUNTER, MsrType::READ);
+        vmx.disable_intercept_for_msr(arch, msr::IA32_FS_BASE, MsrType::RW);
+        vmx.disable_intercept_for_msr(arch, msr::IA32_GS_BASE, MsrType::RW);
+        vmx.disable_intercept_for_msr(arch, msr::IA32_KERNEL_GSBASE, MsrType::RW);
 
-        vmx.disable_intercept_for_msr(arch, IA32_SYSENTER_CS, MsrType::RW);
-        vmx.disable_intercept_for_msr(arch, IA32_SYSENTER_ESP, MsrType::RW);
-        vmx.disable_intercept_for_msr(arch, IA32_SYSENTER_EIP, MsrType::RW);
+        vmx.disable_intercept_for_msr(arch, msr::IA32_SYSENTER_CS, MsrType::RW);
+        vmx.disable_intercept_for_msr(arch, msr::IA32_SYSENTER_ESP, MsrType::RW);
+        vmx.disable_intercept_for_msr(arch, msr::IA32_SYSENTER_EIP, MsrType::RW);
 
         if arch.pause_in_guest {
-            vmx.disable_intercept_for_msr(arch, MSR_CORE_C1_RESIDENCY, MsrType::READ);
-            vmx.disable_intercept_for_msr(arch, MSR_CORE_C3_RESIDENCY, MsrType::READ);
-            vmx.disable_intercept_for_msr(arch, MSR_CORE_C6_RESIDENCY, MsrType::READ);
-            vmx.disable_intercept_for_msr(arch, MSR_CORE_C7_RESIDENCY, MsrType::READ);
+            vmx.disable_intercept_for_msr(arch, msr::MSR_CORE_C1_RESIDENCY, MsrType::READ);
+            vmx.disable_intercept_for_msr(arch, msr::MSR_CORE_C3_RESIDENCY, MsrType::READ);
+            vmx.disable_intercept_for_msr(arch, msr::MSR_CORE_C6_RESIDENCY, MsrType::READ);
+            vmx.disable_intercept_for_msr(arch, msr::MSR_CORE_C7_RESIDENCY, MsrType::READ);
         }
 
         if vmx_info().enable_flexpriority && vcpu.arch.lapic_in_kernel() {
@@ -2613,34 +3318,37 @@ impl VmxVCpuPriv {
         vcpu.private = Some(vmx);
     }
 
-    pub fn find_uret_msr(&self, msr: u32) -> Option<&VmxUretMsr> {
+    pub fn find_uret_msr(&self, msr: u32) -> Option<(usize, &VmxUretMsr)> {
         let idx = x86_kvm_manager().find_user_return_msr_idx(msr);
         if let Some(index) = idx {
-            return Some(&self.guest_uret_msrs[index]);
+            return Some((index, &self.guest_uret_msrs[index]));
         } else {
             return None;
         }
     }
 
     fn set_uret_msr(&mut self, msr: u32, data: u64) {
-        if let Some(msr) = self.find_uret_msr_mut(msr) {
+        if let Some((_idx, msr)) = self.find_uret_msr_mut(msr) {
             msr.data = data;
         }
     }
 
-    pub fn find_uret_msr_mut(&mut self, msr: u32) -> Option<&mut VmxUretMsr> {
+    pub fn find_uret_msr_mut(&mut self, msr: u32) -> Option<(usize, &mut VmxUretMsr)> {
         let idx = x86_kvm_manager().find_user_return_msr_idx(msr);
         if let Some(index) = idx {
-            return Some(&mut self.guest_uret_msrs[index]);
+            return Some((index, &mut self.guest_uret_msrs[index]));
         } else {
             return None;
         }
     }
 
-    fn set_guest_uret_msr(&mut self, msr: &VmxUretMsr, data: u64) -> Result<(), SystemError> {
+    fn set_guest_uret_msr(&mut self, slot: usize, data: u64) -> Result<(), SystemError> {
+        let msr = &mut self.guest_uret_msrs[slot];
         if msr.load_into_hardware {
-            todo!()
+            x86_kvm_manager().kvm_set_user_return_msr(slot, data, msr.mask);
         }
+
+        msr.data = data;
 
         Ok(())
     }
@@ -2784,7 +3492,7 @@ impl VmxVCpuPriv {
         }
 
         let m = &mut self.msr_autoload;
-        let mut i = m.guest.find_loadstore_msr_slot(msr);
+        let i = m.guest.find_loadstore_msr_slot(msr);
         let j = if !entry_only {
             m.host.find_loadstore_msr_slot(msr)
         } else {
@@ -2794,7 +3502,7 @@ impl VmxVCpuPriv {
         if (i.is_none() && m.guest.nr == VmxMsrs::MAX_NR_LOADSTORE_MSRS)
             || (j.is_none() && m.host.nr == VmxMsrs::MAX_NR_LOADSTORE_MSRS)
         {
-            kwarn!("Not enough msr switch entries. Can't add msr {:x}", msr);
+            kwarn!("Not enough msr switch entries. Can't add msr 0x{:x}", msr);
             return;
         }
 
@@ -2821,8 +3529,8 @@ impl VmxVCpuPriv {
             j.unwrap()
         };
 
-        m.host.val[i].index = msr;
-        m.host.val[i].data = host_val;
+        m.host.val[j].index = msr;
+        m.host.val[j].data = host_val;
     }
 
     fn add_atomic_switch_msr_special(
@@ -2887,6 +3595,7 @@ bitflags! {
 }
 
 #[derive(Debug, PartialEq)]
+#[allow(dead_code)]
 pub enum VmxL1dFlushState {
     FlushAuto,
     FlushNever,
@@ -2962,143 +3671,6 @@ pub const KVM_VMX_SEGMENT_FIELDS: &'static [VmxSegmentField] = &[
     },
 ];
 
-#[derive(FromPrimitive)]
-#[allow(non_camel_case_types)]
-pub enum VmxExitReason {
-    EXCEPTION_OR_NMI = 0,
-    EXTERNAL_INTERRUPT = 1,
-    TRIPLE_FAULT = 2,
-    INIT_SIGNAL = 3,
-    SIPI = 4,
-    IO_SMI = 5,
-    OTHER_SMI = 6,
-    INTERRUPT_WINDOW = 7,
-    NMI_WINDOW = 8,
-    TASK_SWITCH = 9,
-    CPUID = 10,
-    GETSEC = 11,
-    HLT = 12,
-    INVD = 13,
-    INVLPG = 14,
-    RDPMC = 15,
-    RDTSC = 16,
-    RSM = 17,
-    VMCALL = 18,
-    VMCLEAR = 19,
-    VMLAUNCH = 20,
-    VMPTRLD = 21,
-    VMPTRST = 22,
-    VMREAD = 23,
-    VMRESUME = 24,
-    VMWRITE = 25,
-    VMXOFF = 26,
-    VMXON = 27,
-    CR_ACCESS = 28,
-    DR_ACCESS = 29,
-    IO_INSTRUCTION = 30,
-    RDMSR = 31,
-    WRMSR = 32,
-    VM_ENTRY_FAILURE_INVALID_GUEST_STATE = 33,
-    VM_ENTRY_FAILURE_MSR_LOADING = 34,
-    MWAIT = 36,
-    MONITOR_TRAP_FLAG = 37,
-    MONITOR = 39,
-    PAUSE = 40,
-    VM_ENTRY_FAILURE_MACHINE_CHECK_EVENT = 41,
-    TPR_BELOW_THRESHOLD = 43,
-    APIC_ACCESS = 44,
-    VIRTUALIZED_EOI = 45,
-    ACCESS_GDTR_OR_IDTR = 46,
-    ACCESS_LDTR_OR_TR = 47,
-    EPT_VIOLATION = 48,
-    EPT_MISCONFIG = 49,
-    INVEPT = 50,
-    RDTSCP = 51,
-    VMX_PREEMPTION_TIMER_EXPIRED = 52,
-    INVVPID = 53,
-    WBINVD = 54,
-    XSETBV = 55,
-    APIC_WRITE = 56,
-    RDRAND = 57,
-    INVPCID = 58,
-    VMFUNC = 59,
-    ENCLS = 60,
-    RDSEED = 61,
-    PML_FULL = 62,
-    XSAVES = 63,
-    XRSTORS = 64,
-}
-
-impl From<i32> for VmxExitReason {
-    fn from(num: i32) -> Self {
-        match num {
-            0 => VmxExitReason::EXCEPTION_OR_NMI,
-            1 => VmxExitReason::EXTERNAL_INTERRUPT,
-            2 => VmxExitReason::TRIPLE_FAULT,
-            3 => VmxExitReason::INIT_SIGNAL,
-            4 => VmxExitReason::SIPI,
-            5 => VmxExitReason::IO_SMI,
-            6 => VmxExitReason::OTHER_SMI,
-            7 => VmxExitReason::INTERRUPT_WINDOW,
-            8 => VmxExitReason::NMI_WINDOW,
-            9 => VmxExitReason::TASK_SWITCH,
-            10 => VmxExitReason::CPUID,
-            11 => VmxExitReason::GETSEC,
-            12 => VmxExitReason::HLT,
-            13 => VmxExitReason::INVD,
-            14 => VmxExitReason::INVLPG,
-            15 => VmxExitReason::RDPMC,
-            16 => VmxExitReason::RDTSC,
-            17 => VmxExitReason::RSM,
-            18 => VmxExitReason::VMCALL,
-            19 => VmxExitReason::VMCLEAR,
-            20 => VmxExitReason::VMLAUNCH,
-            21 => VmxExitReason::VMPTRLD,
-            22 => VmxExitReason::VMPTRST,
-            23 => VmxExitReason::VMREAD,
-            24 => VmxExitReason::VMRESUME,
-            25 => VmxExitReason::VMWRITE,
-            26 => VmxExitReason::VMXOFF,
-            27 => VmxExitReason::VMXON,
-            28 => VmxExitReason::CR_ACCESS,
-            29 => VmxExitReason::DR_ACCESS,
-            30 => VmxExitReason::IO_INSTRUCTION,
-            31 => VmxExitReason::RDMSR,
-            32 => VmxExitReason::WRMSR,
-            33 => VmxExitReason::VM_ENTRY_FAILURE_INVALID_GUEST_STATE,
-            34 => VmxExitReason::VM_ENTRY_FAILURE_MSR_LOADING,
-            36 => VmxExitReason::MWAIT,
-            37 => VmxExitReason::MONITOR_TRAP_FLAG,
-            39 => VmxExitReason::MONITOR,
-            40 => VmxExitReason::PAUSE,
-            41 => VmxExitReason::VM_ENTRY_FAILURE_MACHINE_CHECK_EVENT,
-            43 => VmxExitReason::TPR_BELOW_THRESHOLD,
-            44 => VmxExitReason::APIC_ACCESS,
-            45 => VmxExitReason::VIRTUALIZED_EOI,
-            46 => VmxExitReason::ACCESS_GDTR_OR_IDTR,
-            47 => VmxExitReason::ACCESS_LDTR_OR_TR,
-            48 => VmxExitReason::EPT_VIOLATION,
-            49 => VmxExitReason::EPT_MISCONFIG,
-            50 => VmxExitReason::INVEPT,
-            51 => VmxExitReason::RDTSCP,
-            52 => VmxExitReason::VMX_PREEMPTION_TIMER_EXPIRED,
-            53 => VmxExitReason::INVVPID,
-            54 => VmxExitReason::WBINVD,
-            55 => VmxExitReason::XSETBV,
-            56 => VmxExitReason::APIC_WRITE,
-            57 => VmxExitReason::RDRAND,
-            58 => VmxExitReason::INVPCID,
-            59 => VmxExitReason::VMFUNC,
-            60 => VmxExitReason::ENCLS,
-            61 => VmxExitReason::RDSEED,
-            62 => VmxExitReason::PML_FULL,
-            63 => VmxExitReason::XSAVES,
-            64 => VmxExitReason::XRSTORS,
-            _ => panic!("Invalid VmxExitReason number: {}", num),
-        }
-    }
-}
-
 pub static L1TF_VMX_MITIGATION: RwLock<VmxL1dFlushState> = RwLock::new(VmxL1dFlushState::FlushAuto);
 
 pub fn vmx_init() -> Result<(), SystemError> {
@@ -3120,17 +3692,16 @@ pub fn vmx_init() -> Result<(), SystemError> {
 
 #[no_mangle]
 unsafe extern "C" fn vmx_update_host_rsp(vcpu_vmx: &VmxVCpuPriv, host_rsp: usize) {
+    kwarn!("vmx_update_host_rsp");
     let mut guard = vcpu_vmx.loaded_vmcs.lock();
     if unlikely(host_rsp != guard.host_state.rsp) {
         guard.host_state.rsp = host_rsp;
         VmxAsm::vmx_vmwrite(host::RSP, host_rsp as u64);
     }
-
-    return;
 }
 
 #[no_mangle]
-unsafe extern "C" fn vmx_spec_ctrl_restore_host(vcpu_vmx: &VmxVCpuPriv, flags: u32) {
+unsafe extern "C" fn vmx_spec_ctrl_restore_host(_vcpu_vmx: &VmxVCpuPriv, _flags: u32) {
     // TODO
-    return;
+    kwarn!("vmx_spec_ctrl_restore_host todo!");
 }

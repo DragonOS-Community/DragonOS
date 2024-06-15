@@ -1,18 +1,21 @@
-use alloc::{boxed::Box, collections::LinkedList, sync::Arc, vec::Vec};
+use core::intrinsics::unlikely;
+
+use alloc::{boxed::Box, collections::LinkedList, sync::Arc};
 use bitmap::{traits::BitMapOps, AllocBitmap};
-use system_error::SystemError;
 use x86::{
     controlregs::Cr4,
     vmx::vmcs::{
         control::{self, PrimaryControls},
-        guest,
+        host,
     },
 };
-use x86_64::registers::control::{Cr3, Cr3Flags};
+use x86_64::registers::control::Cr3Flags;
 
 use crate::{
-    arch::{vm::asm::VmxAsm, MMArch},
-    kdebug,
+    arch::{
+        vm::asm::{IntrInfo, IntrType, VmxAsm},
+        MMArch,
+    },
     libs::spinlock::{SpinLock, SpinLockGuard},
     mm::{percpu::PerCpuVar, virt_2_phys, MemoryManagementArch, PhysAddr},
     smp::cpu::ProcessorId,
@@ -38,6 +41,7 @@ pub fn current_loaded_vmcs_list_mut() -> &'static mut LinkedList<Arc<LockedLoade
     unsafe { PERCPU_LOADED_VMCS_LIST.as_ref().unwrap().get_mut() }
 }
 
+#[allow(dead_code)]
 pub fn current_loaded_vmcs_list() -> &'static LinkedList<Arc<LockedLoadedVmcs>> {
     unsafe { PERCPU_LOADED_VMCS_LIST.as_ref().unwrap().get() }
 }
@@ -70,6 +74,7 @@ impl VMControlStructure {
         self.header & 0x7FFF_FFFF
     }
 
+    #[allow(dead_code)]
     pub fn is_shadow_vmcs(&self) -> bool {
         self.header & 0x8000_0000 == 1
     }
@@ -125,7 +130,41 @@ pub struct VmcsHostState {
     pub gs_sel: u16,
     pub ldt_sel: u16,
     pub ds_sel: u16,
-    pub rs_sel: u16,
+    pub es_sel: u16,
+}
+
+impl VmcsHostState {
+    pub fn set_host_fsgs(&mut self, fs_sel: u16, gs_sel: u16, fs_base: usize, gs_base: usize) {
+        if unlikely(self.fs_sel != fs_sel) {
+            if (fs_sel & 7) == 0 {
+                VmxAsm::vmx_vmwrite(host::FS_SELECTOR, fs_sel as u64);
+            } else {
+                VmxAsm::vmx_vmwrite(host::FS_SELECTOR, 0);
+            }
+
+            self.fs_sel = fs_sel;
+        }
+
+        if unlikely(self.gs_sel != gs_sel) {
+            if (gs_sel & 7) == 0 {
+                VmxAsm::vmx_vmwrite(host::GS_SELECTOR, gs_sel as u64);
+            } else {
+                VmxAsm::vmx_vmwrite(host::GS_SELECTOR, 0);
+            }
+
+            self.gs_sel = gs_sel;
+        }
+
+        if unlikely(fs_base != self.fs_base) {
+            VmxAsm::vmx_vmwrite(host::FS_BASE, fs_base as u64);
+            self.fs_base = fs_base;
+        }
+
+        if unlikely(self.gs_base != gs_base) {
+            VmxAsm::vmx_vmwrite(host::GS_BASE, gs_base as u64);
+            self.gs_base = gs_base;
+        }
+    }
 }
 
 impl Default for VmcsHostState {
@@ -140,7 +179,7 @@ impl Default for VmcsHostState {
             gs_sel: 0,
             ldt_sel: 0,
             ds_sel: 0,
-            rs_sel: 0,
+            es_sel: 0,
         }
     }
 }
@@ -156,6 +195,7 @@ pub struct VmcsControlsShadow {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct LoadedVmcs {
     pub vmcs: Arc<LockedVMControlStructure>,
     pub shadow_vmcs: Option<Arc<LockedVMControlStructure>>,
@@ -262,6 +302,7 @@ pub struct LockedLoadedVmcs {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum ControlsType {
     VmEntry,
     VmExit,
@@ -382,5 +423,20 @@ impl VmxMsrBitmap {
                 true
             }
         }
+    }
+}
+
+/// 中断相关辅助函数载体
+pub struct VmcsIntrHelper;
+
+impl VmcsIntrHelper {
+    pub fn is_nmi(intr_info: IntrInfo) -> bool {
+        return Self::is_intr_type(intr_info, IntrType::INTR_TYPE_NMI_INTR);
+    }
+
+    pub fn is_intr_type(intr_info: IntrInfo, intr_type: IntrType) -> bool {
+        return (intr_info & (IntrInfo::INTR_INFO_VALID_MASK | IntrInfo::INTR_INFO_INTR_TYPE_MASK))
+            .bits()
+            == IntrInfo::INTR_INFO_VALID_MASK.bits() | intr_type.bits() as u32;
     }
 }

@@ -1,16 +1,16 @@
 use alloc::boxed::Box;
 
 use crate::{
-    arch::{kvm_arch_ops, MMArch},
-    kdebug,
-    mm::MemoryManagementArch,
+    arch::kvm_arch_ops,
     virt::vm::kvm_host::{vcpu::VirtCpu, Vm},
 };
 
 const APIC_DEFAULT_PHYS_BASE: u64 = 0xfee00000;
+#[allow(dead_code)]
 const MSR_IA32_APICBASE: u64 = 0x0000001b;
 const MSR_IA32_APICBASE_BSP: u64 = 1 << 8;
 const MSR_IA32_APICBASE_ENABLE: u64 = 1 << 11;
+#[allow(dead_code)]
 const MSR_IA32_APICBASE_BASE: u64 = 0xfffff << 12;
 
 #[derive(Debug)]

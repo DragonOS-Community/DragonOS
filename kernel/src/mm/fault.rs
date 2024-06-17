@@ -56,6 +56,8 @@ pub struct PageFaultMessage {
     flags: FaultFlags,
     /// 缺页的文件页在文件中的偏移量
     file_pgoff: Option<usize>,
+    /// 缺页对应PageCache中的文件页
+    page: Option<Arc<Page>>,
 }
 
 impl PageFaultMessage {
@@ -69,6 +71,7 @@ impl PageFaultMessage {
             address,
             flags,
             file_pgoff,
+            page: None,
         }
     }
 
@@ -104,6 +107,7 @@ impl Clone for PageFaultMessage {
             address: self.address,
             flags: self.flags,
             file_pgoff: self.file_pgoff,
+            page: None,
         }
     }
 }
@@ -333,11 +337,15 @@ impl PageFaultHandler {
 
         // TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#do_read_fault
         log::info!("do_read_fault");
-        let ret = Self::do_fault_around(pfm.clone(), mapper);
+        let mut ret = Self::do_fault_around(pfm.clone(), mapper);
         if !ret.is_empty() {
             return ret;
         }
-        return Self::filemap_fault(pfm.clone(), mapper);
+        ret = Self::filemap_fault(pfm.clone(), mapper);
+
+        ret = ret.union(Self::finish_fault(pfm, mapper));
+        
+        ret
     }
 
     /// 处理对共享文件映射区写入引起的缺页
@@ -551,13 +559,17 @@ impl PageFaultHandler {
         VmFaultReason::empty()
     }
 
-    pub unsafe fn filemap_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+    pub unsafe fn filemap_fault(
+        mut pfm: PageFaultMessage,
+        mapper: &mut PageMapper,
+    ) -> VmFaultReason {
         log::info!("filemap_fault");
         let vma = pfm.vma();
         let vma_guard = vma.lock();
         let file = vma_guard.vm_file().expect("no vm_file in vma");
         let page_cache = file.inode().page_cache().unwrap();
         let file_pgoff = pfm.file_pgoff.expect("no file_pgoff");
+        let mut ret = VmFaultReason::empty();
 
         if let Some(page) = page_cache.get_page(file_pgoff) {
             // TODO 异步从磁盘中预读页面进PageCache
@@ -573,6 +585,8 @@ impl PageFaultHandler {
             new_frame.copy_from_nonoverlapping(frame, MMArch::PAGE_SIZE);
         } else {
             // TODO 同步预读
+            //涉及磁盘IO，返回标志为VM_FAULT_MAJOR
+            ret = VmFaultReason::VM_FAULT_MAJOR;
             let mut buf: Vec<u8> = vec![0; MMArch::PAGE_SIZE];
             file.pread(
                 file_pgoff * MMArch::PAGE_SIZE,
@@ -586,15 +600,43 @@ impl PageFaultHandler {
             let new_cache_page = allocator.allocate_one().unwrap();
             (phys_2_virt(new_cache_page.data()) as *mut u8)
                 .copy_from_nonoverlapping(buf.as_mut_ptr(), MMArch::PAGE_SIZE);
-            page_cache.add_page(
-                file_pgoff,
-                Arc::new(Page::new(false, PhysPageFrame::new(new_cache_page))),
-            );
 
+            let page = Arc::new(Page::new(false, PhysPageFrame::new(new_cache_page)));
+
+            page_cache.add_page(file_pgoff, page.clone());
+
+            pfm.page = Some(page);
+
+            //     // 分配空白页并映射到缺页地址
+            //     mapper.map(pfm.address, vma_guard.flags()).unwrap().flush();
+            //     let new_frame = phys_2_virt(mapper.translate(pfm.address).unwrap().0.data());
+            //     (new_frame as *mut u8).copy_from_nonoverlapping(buf.as_mut_ptr(), MMArch::PAGE_SIZE);
+        }
+        ret
+    }
+
+    pub unsafe fn finish_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+        let vma = pfm.vma();
+        let vma_guard = vma.lock();
+        let page = pfm.page.clone().expect("no page in pfm");
+        let cache_frame = page.phys_frame().phys_address();
+
+        if pfm.flags().contains(FaultFlags::FAULT_FLAG_WRITE)
+            && !pfm.vma().lock().vm_flags().contains(VmFlags::VM_SHARED)
+        {
+            // 私有文件映射的写时复制场景
             // 分配空白页并映射到缺页地址
             mapper.map(pfm.address, vma_guard.flags()).unwrap().flush();
+
+            //复制PageCache内容到新的页内
             let new_frame = phys_2_virt(mapper.translate(pfm.address).unwrap().0.data());
-            (new_frame as *mut u8).copy_from_nonoverlapping(buf.as_mut_ptr(), MMArch::PAGE_SIZE);
+            (new_frame as *mut u8).copy_from_nonoverlapping(
+                phys_2_virt(cache_frame.data()) as *mut u8,
+                MMArch::PAGE_SIZE,
+            );
+        } else {
+            // 直接映射到PageCache
+            mapper.map_phys(*pfm.address(), cache_frame, vma_guard.flags());
         }
         VmFaultReason::VM_FAULT_COMPLETED
     }

@@ -326,6 +326,41 @@ impl MemoryManagementArch for X86_64MMArch {
         }
         pkru::pkru_allows_pkey(pkru::vma_pkey(vma), write)
     }
+
+    const PAGE_NONE: usize =
+        Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_ACCESSED | Self::ENTRY_FLAG_GLOBAL;
+
+    const PAGE_SHARED: usize = Self::ENTRY_FLAG_PRESENT
+        | Self::ENTRY_FLAG_READWRITE
+        | Self::ENTRY_FLAG_USER
+        | Self::ENTRY_FLAG_ACCESSED
+        | Self::ENTRY_FLAG_NO_EXEC;
+
+    const PAGE_SHARED_EXEC: usize = Self::ENTRY_FLAG_PRESENT
+        | Self::ENTRY_FLAG_READWRITE
+        | Self::ENTRY_FLAG_USER
+        | Self::ENTRY_FLAG_ACCESSED;
+
+    const PAGE_COPY_NOEXEC: usize = Self::ENTRY_FLAG_PRESENT
+        | Self::ENTRY_FLAG_USER
+        | Self::ENTRY_FLAG_ACCESSED
+        | Self::ENTRY_FLAG_NO_EXEC;
+
+    const PAGE_COPY_EXEC: usize =
+        Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_USER | Self::ENTRY_FLAG_ACCESSED;
+
+    const PAGE_COPY: usize = Self::ENTRY_FLAG_PRESENT
+        | Self::ENTRY_FLAG_USER
+        | Self::ENTRY_FLAG_ACCESSED
+        | Self::ENTRY_FLAG_NO_EXEC;
+
+    const PAGE_READONLY: usize = Self::ENTRY_FLAG_PRESENT
+        | Self::ENTRY_FLAG_USER
+        | Self::ENTRY_FLAG_ACCESSED
+        | Self::ENTRY_FLAG_NO_EXEC;
+
+    const PAGE_READONLY_EXEC: usize =
+        Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_USER | Self::ENTRY_FLAG_ACCESSED;
 }
 
 impl X86_64MMArch {

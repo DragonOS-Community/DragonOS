@@ -1425,6 +1425,10 @@ impl VMA {
         self.mapped = mapped;
     }
 
+    pub fn set_flags(&mut self) {
+        self.flags = MMArch::vm_get_page_prot(self.vm_flags);
+    }
+
     /// # 拷贝当前VMA的内容
     ///
     /// ### 安全性

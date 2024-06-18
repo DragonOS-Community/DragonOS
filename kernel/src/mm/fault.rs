@@ -307,14 +307,20 @@ impl PageFaultHandler {
     /// - VmFaultReason: 页面错误处理信息标志
     #[allow(dead_code, unused_variables)]
     pub unsafe fn do_cow_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
-        panic!(
-            "do_cow_fault has not yet been implemented, 
-        fault message: {:?}, 
-        pid: {}\n",
-            pfm,
-            crate::process::ProcessManager::current_pid().data()
-        );
+        // panic!(
+        //     "do_cow_fault has not yet been implemented,
+        // fault message: {:?},
+        // pid: {}\n",
+        //     pfm,
+        //     crate::process::ProcessManager::current_pid().data()
+        // );
         // TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#do_cow_fault
+
+        let mut ret = Self::filemap_fault(pfm.clone(), mapper);
+
+        ret = ret.union(Self::finish_fault(pfm, mapper));
+
+        ret
     }
 
     /// 处理文件映射页的缺页异常
@@ -344,7 +350,7 @@ impl PageFaultHandler {
         ret = Self::filemap_fault(pfm.clone(), mapper);
 
         ret = ret.union(Self::finish_fault(pfm, mapper));
-        
+
         ret
     }
 
@@ -456,6 +462,14 @@ impl PageFaultHandler {
         }
     }
 
+    /// 缺页附近页预读
+    /// ## 参数
+    ///
+    /// - `pfm`: 缺页异常信息
+    /// - `mapper`: 页表映射器
+    ///
+    /// ## 返回值
+    /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn do_fault_around(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
         log::info!("do_fault_around");
         if mapper.get_table(*pfm.address(), 0).is_none() {
@@ -518,6 +532,14 @@ impl PageFaultHandler {
         VmFaultReason::empty()
     }
 
+    /// 通用的VMA文件映射页面映射函数
+    /// ## 参数
+    ///
+    /// - `pfm`: 缺页异常信息
+    /// - `mapper`: 页表映射器
+    ///
+    /// ## 返回值
+    /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn filemap_map_pages(
         pfm: PageFaultMessage,
         mapper: &mut PageMapper,
@@ -559,6 +581,14 @@ impl PageFaultHandler {
         VmFaultReason::empty()
     }
 
+    /// 通用的VMA文件映射错误处理函数
+    /// ## 参数
+    ///
+    /// - `pfm`: 缺页异常信息
+    /// - `mapper`: 页表映射器
+    ///
+    /// ## 返回值
+    /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn filemap_fault(
         mut pfm: PageFaultMessage,
         mapper: &mut PageMapper,
@@ -626,7 +656,13 @@ impl PageFaultHandler {
         {
             // 私有文件映射的写时复制场景
             // 分配空白页并映射到缺页地址
-            mapper.map(pfm.address, vma_guard.flags()).unwrap().flush();
+            mapper
+                .map(
+                    pfm.address,
+                    vma_guard.flags().set_write(true).set_dirty(true),
+                )
+                .unwrap()
+                .flush();
 
             //复制PageCache内容到新的页内
             let new_frame = phys_2_virt(mapper.translate(pfm.address).unwrap().0.data());

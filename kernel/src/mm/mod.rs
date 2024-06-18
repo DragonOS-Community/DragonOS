@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use page::EntryFlags;
 use system_error::SystemError;
 
 use crate::{arch::MMArch, include::bindings::bindings::PAGE_OFFSET};
@@ -40,7 +41,7 @@ static mut __IDLE_PROCESS_ADDRESS_SPACE: Option<Arc<AddressSpace>> = None;
 bitflags! {
     /// Virtual memory flags
     #[allow(clippy::bad_bit_mask)]
-    pub struct VmFlags:u64{
+    pub struct VmFlags:usize{
         const VM_NONE = 0x00000000;
 
         const VM_READ = 0x00000001;
@@ -93,6 +94,20 @@ bitflags! {
         const VM_FAULT_NEEDDSYNC = 0x002000;
         const VM_FAULT_COMPLETED = 0x004000;
         const VM_FAULT_HINDEX_MASK = 0x0f0000;
+    }
+}
+
+impl core::ops::Index<VmFlags> for [usize] {
+    type Output = usize;
+
+    fn index(&self, index: VmFlags) -> &Self::Output {
+        &self[index.bits]
+    }
+}
+
+impl core::ops::IndexMut<VmFlags> for [usize] {
+    fn index_mut(&mut self, index: VmFlags) -> &mut Self::Output {
+        &mut self[index.bits]
     }
 }
 
@@ -641,6 +656,49 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
         _foreign: bool,
     ) -> bool {
         true
+    }
+
+    const PAGE_NONE: usize;
+    const PAGE_SHARED: usize;
+    const PAGE_SHARED_EXEC: usize;
+    const PAGE_COPY_NOEXEC: usize;
+    const PAGE_COPY_EXEC: usize;
+    const PAGE_COPY: usize;
+    const PAGE_READONLY: usize;
+    const PAGE_READONLY_EXEC: usize;
+
+    fn protection_map() -> [usize; 16] {
+        let mut map = [0; 16];
+        map[VmFlags::VM_NONE] = Self::PAGE_NONE;
+        map[VmFlags::VM_READ] = Self::PAGE_READONLY;
+        map[VmFlags::VM_WRITE] = Self::PAGE_COPY;
+        map[VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_COPY;
+        map[VmFlags::VM_EXEC] = Self::PAGE_READONLY_EXEC;
+        map[VmFlags::VM_EXEC | VmFlags::VM_READ] = Self::PAGE_READONLY_EXEC;
+        map[VmFlags::VM_EXEC | VmFlags::VM_WRITE] = Self::PAGE_COPY_EXEC;
+        map[VmFlags::VM_EXEC | VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_COPY_EXEC;
+        map[VmFlags::VM_SHARED] = Self::PAGE_NONE;
+        map[VmFlags::VM_SHARED | VmFlags::VM_READ] = Self::PAGE_READONLY;
+        map[VmFlags::VM_SHARED | VmFlags::VM_WRITE] = Self::PAGE_SHARED;
+        map[VmFlags::VM_SHARED | VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_SHARED;
+        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC] = Self::PAGE_READONLY_EXEC;
+        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_READ] = Self::PAGE_READONLY_EXEC;
+        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_WRITE] = Self::PAGE_SHARED_EXEC;
+        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_WRITE | VmFlags::VM_READ] =
+            Self::PAGE_SHARED_EXEC;
+        map
+    }
+
+    /// 页面保护标志转换函数
+    /// ## 参数
+    ///
+    /// - `vm_flags`: VmFlags标志
+    ///
+    /// ## 返回值
+    /// - EntryFlags: 页面的保护位
+    fn vm_get_page_prot(vm_flags: VmFlags) -> EntryFlags<Self> {
+        let map = Self::protection_map();
+        unsafe { EntryFlags::from_data(map[vm_flags]) }
     }
 }
 

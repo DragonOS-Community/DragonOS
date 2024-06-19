@@ -36,7 +36,7 @@
 #[cfg(test)]
 #[macro_use]
 extern crate std;
-#[cfg(target_os = "none")]
+
 use core::panic::PanicInfo;
 
 /// 导出x86_64架构相关的代码，命名为arch模块
@@ -87,7 +87,7 @@ extern crate uefi;
 extern crate uefi_raw;
 
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
-#[cfg(target_os = "none")]
+
 use crate::process::ProcessManager;
 
 #[cfg(all(feature = "backtrace", target_arch = "x86_64"))]

@@ -667,25 +667,16 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     const PAGE_READONLY: usize;
     const PAGE_READONLY_EXEC: usize;
 
+    const PAGE_READ: usize;
+    const PAGE_READ_EXEC: usize;
+
+    /// 获取保护标志的映射表
+    ///
+    ///
+    /// ## 返回值
+    /// - `[usize; 16]`: 长度为16的映射表
     fn protection_map() -> [usize; 16] {
-        let mut map = [0; 16];
-        map[VmFlags::VM_NONE] = Self::PAGE_NONE;
-        map[VmFlags::VM_READ] = Self::PAGE_READONLY;
-        map[VmFlags::VM_WRITE] = Self::PAGE_COPY;
-        map[VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_COPY;
-        map[VmFlags::VM_EXEC] = Self::PAGE_READONLY_EXEC;
-        map[VmFlags::VM_EXEC | VmFlags::VM_READ] = Self::PAGE_READONLY_EXEC;
-        map[VmFlags::VM_EXEC | VmFlags::VM_WRITE] = Self::PAGE_COPY_EXEC;
-        map[VmFlags::VM_EXEC | VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_COPY_EXEC;
-        map[VmFlags::VM_SHARED] = Self::PAGE_NONE;
-        map[VmFlags::VM_SHARED | VmFlags::VM_READ] = Self::PAGE_READONLY;
-        map[VmFlags::VM_SHARED | VmFlags::VM_WRITE] = Self::PAGE_SHARED;
-        map[VmFlags::VM_SHARED | VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_SHARED;
-        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC] = Self::PAGE_READONLY_EXEC;
-        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_READ] = Self::PAGE_READONLY_EXEC;
-        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_WRITE] = Self::PAGE_SHARED_EXEC;
-        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_WRITE | VmFlags::VM_READ] =
-            Self::PAGE_SHARED_EXEC;
+        let map = [0; 16];
         map
     }
 

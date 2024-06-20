@@ -191,6 +191,10 @@ impl Page {
     pub fn phys_frame(&self) -> &PhysPageFrame {
         &self.phys_frame
     }
+
+    pub fn lock(&self) {
+        //TODO 使用读写锁包装Page结构体保证多进程的修改互斥操作
+    }
 }
 
 #[derive(Debug)]

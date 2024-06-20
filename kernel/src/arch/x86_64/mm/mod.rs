@@ -29,7 +29,7 @@ use crate::{
 
 use crate::mm::kernel_mapper::KernelMapper;
 use crate::mm::page::{EntryFlags, PageEntry, PAGE_1G_SHIFT};
-use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr};
+use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr, VmFlags};
 
 use system_error::SystemError;
 
@@ -327,6 +327,28 @@ impl MemoryManagementArch for X86_64MMArch {
         pkru::pkru_allows_pkey(pkru::vma_pkey(vma), write)
     }
 
+    fn protection_map() -> [usize; 16] {
+        let mut map = [0; 16];
+        map[VmFlags::VM_NONE] = Self::PAGE_NONE;
+        map[VmFlags::VM_READ] = Self::PAGE_READONLY;
+        map[VmFlags::VM_WRITE] = Self::PAGE_COPY;
+        map[VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_COPY;
+        map[VmFlags::VM_EXEC] = Self::PAGE_READONLY_EXEC;
+        map[VmFlags::VM_EXEC | VmFlags::VM_READ] = Self::PAGE_READONLY_EXEC;
+        map[VmFlags::VM_EXEC | VmFlags::VM_WRITE] = Self::PAGE_COPY_EXEC;
+        map[VmFlags::VM_EXEC | VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_COPY_EXEC;
+        map[VmFlags::VM_SHARED] = Self::PAGE_NONE;
+        map[VmFlags::VM_SHARED | VmFlags::VM_READ] = Self::PAGE_READONLY;
+        map[VmFlags::VM_SHARED | VmFlags::VM_WRITE] = Self::PAGE_SHARED;
+        map[VmFlags::VM_SHARED | VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_SHARED;
+        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC] = Self::PAGE_READONLY_EXEC;
+        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_READ] = Self::PAGE_READONLY_EXEC;
+        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_WRITE] = Self::PAGE_SHARED_EXEC;
+        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_WRITE | VmFlags::VM_READ] =
+            Self::PAGE_SHARED_EXEC;
+        map
+    }
+
     const PAGE_NONE: usize =
         Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_ACCESSED | Self::ENTRY_FLAG_GLOBAL;
 
@@ -361,6 +383,9 @@ impl MemoryManagementArch for X86_64MMArch {
 
     const PAGE_READONLY_EXEC: usize =
         Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_USER | Self::ENTRY_FLAG_ACCESSED;
+
+    const PAGE_READ: usize = 0;
+    const PAGE_READ_EXEC: usize = 0;
 }
 
 impl X86_64MMArch {

@@ -364,14 +364,20 @@ impl PageFaultHandler {
     /// - VmFaultReason: 页面错误处理信息标志
     #[allow(dead_code, unused_variables)]
     pub unsafe fn do_shared_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
-        panic!(
-            "do_shared_fault has not yet been implemented, 
-        fault message: {:?}, 
-        pid: {}\n",
-            pfm,
-            crate::process::ProcessManager::current_pid().data()
-        );
+        // panic!(
+        //     "do_shared_fault has not yet been implemented,
+        // fault message: {:?},
+        // pid: {}\n",
+        //     pfm,
+        //     crate::process::ProcessManager::current_pid().data()
+        // );
         // TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#do_shared_fault
+
+        let mut ret = Self::filemap_fault(pfm.clone(), mapper);
+
+        ret = ret.union(Self::finish_fault(pfm, mapper));
+
+        ret
     }
 
     /// 处理被置换页面的缺页异常

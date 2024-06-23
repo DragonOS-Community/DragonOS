@@ -669,6 +669,9 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
 
     const PAGE_READ: usize;
     const PAGE_READ_EXEC: usize;
+    const PAGE_WRITE: usize;
+    const PAGE_WRITE_EXEC: usize;
+    const PAGE_EXEC: usize;
 
     /// 获取保护标志的映射表
     ///

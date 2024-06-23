@@ -346,6 +346,10 @@ impl MemoryManagementArch for X86_64MMArch {
         map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_WRITE] = Self::PAGE_SHARED_EXEC;
         map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_WRITE | VmFlags::VM_READ] =
             Self::PAGE_SHARED_EXEC;
+
+        if Self::is_xd_reserved() {
+            map.iter_mut().for_each(|x| *x &= !Self::ENTRY_FLAG_NO_EXEC)
+        }
         map
     }
 
@@ -386,6 +390,9 @@ impl MemoryManagementArch for X86_64MMArch {
 
     const PAGE_READ: usize = 0;
     const PAGE_READ_EXEC: usize = 0;
+    const PAGE_WRITE: usize = 0;
+    const PAGE_WRITE_EXEC: usize = 0;
+    const PAGE_EXEC: usize = 0;
 }
 
 impl X86_64MMArch {

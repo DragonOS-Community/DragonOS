@@ -14,7 +14,7 @@ use crate::{
         kernel_mapper::KernelMapper,
         page::{EntryFlags, PageEntry, PAGE_1G_SHIFT},
         ucontext::UserMapper,
-        MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
+        MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr, VmFlags,
     },
     smp::cpu::ProcessorId,
 };
@@ -256,7 +256,59 @@ impl MemoryManagementArch for RiscV64MMArch {
     ) -> bool {
         true
     }
+
+    fn protection_map() -> [usize; 16] {
+        let mut map = [0; 16];
+        map[VmFlags::VM_NONE] = Self::PAGE_NONE;
+        map[VmFlags::VM_READ] = Self::PAGE_READONLY;
+        map[VmFlags::VM_WRITE] = Self::PAGE_COPY;
+        map[VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_COPY;
+        map[VmFlags::VM_EXEC] = Self::PAGE_READONLY_EXEC;
+        map[VmFlags::VM_EXEC | VmFlags::VM_READ] = Self::PAGE_READONLY_EXEC;
+        map[VmFlags::VM_EXEC | VmFlags::VM_WRITE] = Self::PAGE_COPY_EXEC;
+        map[VmFlags::VM_EXEC | VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_COPY_EXEC;
+        map[VmFlags::VM_SHARED] = Self::PAGE_NONE;
+        map[VmFlags::VM_SHARED | VmFlags::VM_READ] = Self::PAGE_READONLY;
+        map[VmFlags::VM_SHARED | VmFlags::VM_WRITE] = Self::PAGE_SHARED;
+        map[VmFlags::VM_SHARED | VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_SHARED;
+        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC] = Self::PAGE_READONLY_EXEC;
+        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_READ] = Self::PAGE_READONLY_EXEC;
+        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_WRITE] = Self::PAGE_SHARED_EXEC;
+        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_WRITE | VmFlags::VM_READ] =
+            Self::PAGE_SHARED_EXEC;
+        map
+    }
+
+    const PAGE_NONE: usize = Self::ENTRY_FLAG_GLOBAL | Self::ENTRY_FLAG_READONLY;
+
+    const PAGE_READ: usize = PAGE_ENTRY_BASE | Self::ENTRY_FLAG_READONLY;
+
+    const PAGE_WRITE: usize =
+        PAGE_ENTRY_BASE | Self::ENTRY_FLAG_READONLY | Self::ENTRY_FLAG_WRITEABLE;
+
+    const PAGE_EXEC: usize = PAGE_ENTRY_BASE | Self::ENTRY_FLAG_EXEC;
+
+    const PAGE_READ_EXEC: usize =
+        PAGE_ENTRY_BASE | Self::ENTRY_FLAG_READONLY | Self::ENTRY_FLAG_EXEC;
+
+    const PAGE_WRITE_EXEC: usize = PAGE_ENTRY_BASE
+        | Self::ENTRY_FLAG_READONLY
+        | Self::ENTRY_FLAG_EXEC
+        | Self::ENTRY_FLAG_WRITEABLE;
+
+    const PAGE_COPY: usize = Self::PAGE_READ;
+    const PAGE_COPY_EXEC: usize = Self::PAGE_READ_EXEC;
+    const PAGE_SHARED: usize = Self::PAGE_WRITE;
+    const PAGE_SHARED_EXEC: usize = Self::PAGE_WRITE_EXEC;
+
+    const PAGE_COPY_NOEXEC: usize = 0;
+    const PAGE_READONLY: usize = 0;
+    const PAGE_READONLY_EXEC: usize = 0;
 }
+
+const PAGE_ENTRY_BASE: usize = RiscV64MMArch::ENTRY_FLAG_PRESENT
+    | RiscV64MMArch::ENTRY_FLAG_ACCESSED
+    | RiscV64MMArch::ENTRY_FLAG_USER;
 
 impl VirtAddr {
     /// 判断虚拟地址是否合法

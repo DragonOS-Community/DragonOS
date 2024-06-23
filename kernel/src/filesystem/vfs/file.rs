@@ -538,11 +538,7 @@ impl File {
                 return inode.inner().lock().add_epoll(epitem);
             }
             _ => {
-                let r = self.inode.ioctl(
-                    EventPoll::ADD_EPOLLITEM,
-                    &epitem as *const Arc<EPollItem> as usize,
-                    &self.private_data.lock(),
-                );
+                let r = self.inode.kernel_ioctl(epitem, &self.private_data.lock());
                 if r.is_err() {
                     return Err(SystemError::ENOSYS);
                 }

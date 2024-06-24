@@ -907,7 +907,7 @@ impl UserMappings {
             if guard.region.contains(vaddr) {
                 return Some(v.clone());
             }
-            if guard.region.start > vaddr
+            if guard.region.start >= vaddr
                 && if let Some(ref nearest) = nearest {
                     guard.region.start < nearest.lock().region.start
                 } else {

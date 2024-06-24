@@ -23,7 +23,7 @@ use crate::mm::MemoryManagementArch;
 use super::{
     allocator::page_frame::{FrameAllocator, PhysPageFrame},
     page::{Page, PageFlags},
-    phys_2_virt,
+    phys_2_virt, PhysAddr,
 };
 
 bitflags! {
@@ -56,8 +56,8 @@ pub struct PageFaultMessage {
     flags: FaultFlags,
     /// 缺页的文件页在文件中的偏移量
     file_pgoff: Option<usize>,
-    /// 缺页对应PageCache中的文件页
-    page: Option<Arc<Page>>,
+    /// 缺页对应PageCache中的文件页的物理地址
+    page_phys_address: Option<PhysAddr>,
 }
 
 impl PageFaultMessage {
@@ -71,7 +71,7 @@ impl PageFaultMessage {
             address,
             flags,
             file_pgoff,
-            page: None,
+            page_phys_address: None,
         }
     }
 
@@ -107,7 +107,7 @@ impl Clone for PageFaultMessage {
             address: self.address,
             flags: self.flags,
             file_pgoff: self.file_pgoff,
-            page: None,
+            page_phys_address: None,
         }
     }
 }
@@ -124,7 +124,10 @@ impl PageFaultHandler {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
-    pub unsafe fn handle_mm_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+    pub unsafe fn handle_mm_fault(
+        pfm: &mut PageFaultMessage,
+        mapper: &mut PageMapper,
+    ) -> VmFaultReason {
         let flags = pfm.flags();
         let vma = pfm.vma();
         let current_pcb = ProcessManager::current_pcb();
@@ -161,7 +164,7 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn handle_normal_fault(
-        pfm: PageFaultMessage,
+        pfm: &mut PageFaultMessage,
         mapper: &mut PageMapper,
     ) -> VmFaultReason {
         let address = pfm.address_aligned_down();
@@ -198,12 +201,9 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn handle_pte_fault(
-        pfm: PageFaultMessage,
+        pfm: &mut PageFaultMessage,
         mapper: &mut PageMapper,
     ) -> VmFaultReason {
-        if pfm.address.data() == 0x10000 {
-            log::info!("handle_pte_fault: {:?}", pfm);
-        }
         let address = pfm.address_aligned_down();
         let flags = pfm.flags;
         let vma = pfm.vma.clone();
@@ -223,9 +223,9 @@ impl PageFaultHandler {
                 }
             }
         } else if vma.is_anonymous() {
-            ret = Self::do_anonymous_page(pfm.clone(), mapper);
+            ret = Self::do_anonymous_page(pfm, mapper);
         } else {
-            ret = Self::do_fault(pfm.clone(), mapper);
+            ret = Self::do_fault(pfm, mapper);
         }
 
         vma.lock().set_mapped(true);
@@ -242,7 +242,7 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn do_anonymous_page(
-        pfm: PageFaultMessage,
+        pfm: &mut PageFaultMessage,
         mapper: &mut PageMapper,
     ) -> VmFaultReason {
         let address = pfm.address_aligned_down();
@@ -277,8 +277,7 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     #[allow(unused_variables)]
-    pub unsafe fn do_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
-        log::info!("do_fault");
+    pub unsafe fn do_fault(pfm: &mut PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
         // panic!(
         //     "do_fault has not yet been implemented,
         // fault message: {:?},
@@ -306,7 +305,10 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     #[allow(dead_code, unused_variables)]
-    pub unsafe fn do_cow_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+    pub unsafe fn do_cow_fault(
+        pfm: &mut PageFaultMessage,
+        mapper: &mut PageMapper,
+    ) -> VmFaultReason {
         // panic!(
         //     "do_cow_fault has not yet been implemented,
         // fault message: {:?},
@@ -316,7 +318,7 @@ impl PageFaultHandler {
         // );
         // TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#do_cow_fault
 
-        let mut ret = Self::filemap_fault(pfm.clone(), mapper);
+        let mut ret = Self::filemap_fault(pfm, mapper);
 
         ret = ret.union(Self::finish_fault(pfm, mapper));
 
@@ -332,7 +334,10 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     #[allow(dead_code, unused_variables)]
-    pub unsafe fn do_read_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+    pub unsafe fn do_read_fault(
+        pfm: &mut PageFaultMessage,
+        mapper: &mut PageMapper,
+    ) -> VmFaultReason {
         // panic!(
         //     "do_read_fault has not yet been implemented,
         // fault message: {:?},
@@ -342,12 +347,12 @@ impl PageFaultHandler {
         // );
 
         // TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#do_read_fault
-        log::info!("do_read_fault");
+
         let mut ret = Self::do_fault_around(pfm.clone(), mapper);
         if !ret.is_empty() {
             return ret;
         }
-        ret = Self::filemap_fault(pfm.clone(), mapper);
+        ret = Self::filemap_fault(pfm, mapper);
 
         ret = ret.union(Self::finish_fault(pfm, mapper));
 
@@ -363,7 +368,10 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     #[allow(dead_code, unused_variables)]
-    pub unsafe fn do_shared_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+    pub unsafe fn do_shared_fault(
+        pfm: &mut PageFaultMessage,
+        mapper: &mut PageMapper,
+    ) -> VmFaultReason {
         // panic!(
         //     "do_shared_fault has not yet been implemented,
         // fault message: {:?},
@@ -373,7 +381,7 @@ impl PageFaultHandler {
         // );
         // TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#do_shared_fault
 
-        let mut ret = Self::filemap_fault(pfm.clone(), mapper);
+        let mut ret = Self::filemap_fault(pfm, mapper);
 
         ret = ret.union(Self::finish_fault(pfm, mapper));
 
@@ -477,7 +485,6 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn do_fault_around(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
-        log::info!("do_fault_around");
         if mapper.get_table(*pfm.address(), 0).is_none() {
             mapper
                 .allocate_table(*pfm.address(), 0)
@@ -538,7 +545,7 @@ impl PageFaultHandler {
         VmFaultReason::empty()
     }
 
-    /// 通用的VMA文件映射页面映射函数
+    /// 通用的VMA文件映射页面映射函数，将页面从PageCache中映射到内存
     /// ## 参数
     ///
     /// - `pfm`: 缺页异常信息
@@ -556,6 +563,7 @@ impl PageFaultHandler {
         let vma_guard = vma.lock();
         let file = vma_guard.vm_file().expect("no vm_file in vma");
         let page_cache = file.inode().page_cache().unwrap();
+        let page_manager_guard = page_manager_lock_irqsave();
 
         // 起始页地址
         let addr = vma_guard.region().start
@@ -569,7 +577,8 @@ impl PageFaultHandler {
         //     .iter()
         //     .filter(|page| page.flags().contains(PageFlags::PG_UPTODATE));
         for pgoff in start_pgoff..=end_pgoff {
-            if let Some(page) = page_cache.get_page(pgoff) {
+            if let Some(page_phys) = page_cache.get_page(pgoff) {
+                let page = page_manager_guard.get(&page_phys).unwrap();
                 if page.flags().contains(PageFlags::PG_UPTODATE) {
                     let phys = page.phys_frame().phys_address();
                     let virt = phys_2_virt(phys.data());
@@ -596,29 +605,22 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn filemap_fault(
-        mut pfm: PageFaultMessage,
+        pfm: &mut PageFaultMessage,
         mapper: &mut PageMapper,
     ) -> VmFaultReason {
-        log::info!("filemap_fault");
         let vma = pfm.vma();
         let vma_guard = vma.lock();
         let file = vma_guard.vm_file().expect("no vm_file in vma");
         let page_cache = file.inode().page_cache().unwrap();
         let file_pgoff = pfm.file_pgoff.expect("no file_pgoff");
         let mut ret = VmFaultReason::empty();
+        let mut page_manager_guard = page_manager_lock_irqsave();
 
         if let Some(page) = page_cache.get_page(file_pgoff) {
             // TODO 异步从磁盘中预读页面进PageCache
-            let address = vma_guard.region().start
-                + ((file_pgoff
-                    - vma_guard
-                        .file_page_offset()
-                        .expect("file_page_offset is none"))
-                    << MMArch::PAGE_SHIFT);
-            mapper.map(address, vma_guard.flags()).unwrap().flush();
-            let frame = phys_2_virt(page.phys_frame().phys_address().data()) as *mut u8;
-            let new_frame = phys_2_virt(mapper.translate(address).unwrap().0.data()) as *mut u8;
-            new_frame.copy_from_nonoverlapping(frame, MMArch::PAGE_SIZE);
+
+            // 直接将PageCache中的页面作为要映射的页面
+            pfm.page_phys_address = Some(page);
         } else {
             // TODO 同步预读
             //涉及磁盘IO，返回标志为VM_FAULT_MAJOR
@@ -637,11 +639,12 @@ impl PageFaultHandler {
             (phys_2_virt(new_cache_page.data()) as *mut u8)
                 .copy_from_nonoverlapping(buf.as_mut_ptr(), MMArch::PAGE_SIZE);
 
-            let page = Arc::new(Page::new(false, PhysPageFrame::new(new_cache_page)));
+            let page = Page::new(false, PhysPageFrame::new(new_cache_page));
+            pfm.page_phys_address = Some(page.phys_frame().phys_address());
 
-            page_cache.add_page(file_pgoff, page.clone());
+            page_cache.add_page(file_pgoff, page.phys_frame().phys_address());
 
-            pfm.page = Some(page);
+            page_manager_guard.insert(new_cache_page, page);
 
             //     // 分配空白页并映射到缺页地址
             //     mapper.map(pfm.address, vma_guard.flags()).unwrap().flush();
@@ -651,11 +654,13 @@ impl PageFaultHandler {
         ret
     }
 
-    pub unsafe fn finish_fault(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+    pub unsafe fn finish_fault(
+        pfm: &mut PageFaultMessage,
+        mapper: &mut PageMapper,
+    ) -> VmFaultReason {
         let vma = pfm.vma();
         let vma_guard = vma.lock();
-        let page = pfm.page.clone().expect("no page in pfm");
-        let cache_frame = page.phys_frame().phys_address();
+        let cache_frame = pfm.page_phys_address.expect("no page in pfm");
 
         if pfm.flags().contains(FaultFlags::FAULT_FLAG_WRITE)
             && !pfm.vma().lock().vm_flags().contains(VmFlags::VM_SHARED)

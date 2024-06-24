@@ -17,7 +17,7 @@ use crate::{
     filesystem::procfs::ProcfsFilePrivateData,
     ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
     libs::{rwlock::RwLock, spinlock::SpinLock},
-    mm::page::Page,
+    mm::{page::Page, PhysAddr},
     net::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
         socket::SocketInode,
@@ -124,7 +124,7 @@ impl FileMode {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct PageCache {
-    map: RwLock<HashMap<usize, Arc<Page>>>,
+    map: RwLock<HashMap<usize, PhysAddr>>,
 }
 
 impl PageCache {
@@ -134,12 +134,14 @@ impl PageCache {
         }
     }
 
-    pub fn add_page(&self, offset: usize, page: Arc<Page>) {
-        self.map.write().insert(offset, page);
+    pub fn add_page(&self, offset: usize, page_phys_address: PhysAddr) {
+        self.map.write().insert(offset, page_phys_address);
     }
 
-    pub fn get_page(&self, offset: usize) -> Option<Arc<Page>> {
-        self.map.read().get(&offset).cloned()
+    pub fn get_page(&self, offset: usize) -> Option<PhysAddr> {
+        let guard = self.map.read();
+        let phys = guard.get(&offset).cloned();
+        phys
     }
 
     // pub fn get_pages(&self, start_pgoff: usize, end_pgoff: usize) -> Vec<Arc<Page>> {

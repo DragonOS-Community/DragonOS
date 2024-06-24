@@ -271,7 +271,7 @@ impl X86_64MMArch {
             let mapper = &mut space_guard.user_mapper.utable;
 
             fault = PageFaultHandler::handle_mm_fault(
-                PageFaultMessage::new(vma.clone(), address, flags),
+                &mut PageFaultMessage::new(vma.clone(), address, flags),
                 mapper,
             );
 

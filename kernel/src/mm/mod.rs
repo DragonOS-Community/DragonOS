@@ -95,6 +95,12 @@ bitflags! {
         const VM_FAULT_COMPLETED = 0x004000;
         const VM_FAULT_HINDEX_MASK = 0x0f0000;
     }
+
+    pub struct MsFlags:usize {
+        const MS_ASYNC = 1;
+        const MS_INVALIDATE = 2;
+        const MS_SYNC = 4;
+    }
 }
 
 impl core::ops::Index<VmFlags> for [usize] {

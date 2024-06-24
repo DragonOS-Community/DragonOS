@@ -1,4 +1,4 @@
-use core::intrinsics::unlikely;
+use core::{intrinsics::unlikely, slice::from_raw_parts};
 
 use alloc::sync::Arc;
 use log::error;
@@ -6,6 +6,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
+    driver::base::block::SeekFrom,
     ipc::shm::ShmFlags,
     libs::align::{check_aligned, page_align_up},
     mm::MemoryManagementArch,
@@ -15,7 +16,7 @@ use crate::{
 use super::{
     allocator::page_frame::{PageFrameCount, VirtPageFrame},
     ucontext::{AddressSpace, DEFAULT_MMAP_MIN_ADDR},
-    verify_area, VirtAddr, VmFlags,
+    verify_area, MsFlags, VirtAddr, VmFlags,
 };
 
 bitflags! {
@@ -152,6 +153,10 @@ impl From<MapFlags> for VmFlags {
 
         if map_flags.contains(MapFlags::MAP_SYNC) {
             vm_flags |= VmFlags::VM_SYNC;
+        }
+
+        if map_flags.contains(MapFlags::MAP_SHARED) {
+            vm_flags |= VmFlags::VM_SHARED;
         }
 
         vm_flags
@@ -544,5 +549,96 @@ impl Syscall {
             .madvise(start_frame, page_count, madv_flags)
             .map_err(|_| SystemError::EINVAL)?;
         return Ok(0);
+    }
+
+    /// ## msync系统调用
+    ///
+    /// ## 参数
+    ///
+    /// - `start`：起始地址(已经对齐到页)
+    /// - `len`：长度(已经对齐到页)
+    /// - `flags`：标志
+    pub fn msync(start: VirtAddr, len: usize, flags: usize) -> Result<usize, SystemError> {
+        let mut start = start.data();
+        let end = start + len;
+        let flags = MsFlags::from_bits_truncate(flags);
+        let mut err = Err(SystemError::EINVAL);
+        let mut unmapped_error = Ok(0);
+        if !flags.intersects(MsFlags::MS_ASYNC | MsFlags::MS_INVALIDATE | MsFlags::MS_SYNC) {
+            return err;
+        }
+        if flags.contains(MsFlags::MS_ASYNC | MsFlags::MS_SYNC) {
+            return err;
+        }
+
+        err = Err(SystemError::ENOMEM);
+        if end < start {
+            return err;
+        }
+        err = Ok(0);
+
+        if start == end {
+            return err;
+        }
+
+        let current_address_space = AddressSpace::current()?;
+        loop {
+            err = Err(SystemError::ENOMEM);
+
+            if let Some(vma) = current_address_space
+                .read()
+                .mappings
+                .find_nearest(VirtAddr::new(start))
+            {
+                let guard = vma.lock();
+                let vm_start = guard.region().start().data();
+                let vm_end = guard.region().end().data();
+                if start < vm_start {
+                    if flags == MsFlags::MS_ASYNC {
+                        break;
+                    }
+                    start = vm_start;
+                    if start >= vm_end {
+                        break;
+                    }
+                    unmapped_error = Err(SystemError::ENOMEM);
+                }
+                let vm_flags = *guard.vm_flags();
+                if flags.contains(MsFlags::MS_INVALIDATE) && vm_flags.contains(VmFlags::VM_LOCKED) {
+                    err = Err(SystemError::EBUSY);
+                    break;
+                }
+                let file = guard.vm_file();
+                let fstart = (start - vm_start)
+                    + (guard.file_page_offset().unwrap_or(0) << MMArch::PAGE_SHIFT);
+                let fend = fstart + (core::cmp::min(end, vm_end) - start) - 1;
+                let old_start = start;
+                start = vm_end;
+                // log::info!("flags: {:?}", flags);
+                // log::info!("vm_flags: {:?}", vm_flags);
+                // log::info!("file: {:?}", file);
+                if flags.contains(MsFlags::MS_SYNC) && vm_flags.contains(VmFlags::VM_SHARED) {
+                    if let Some(file) = file {
+                        let old_pos = file.lseek(SeekFrom::SeekCurrent(0)).unwrap();
+                        file.lseek(SeekFrom::SeekSet(fstart as i64)).unwrap();
+                        err = file.write(len, unsafe {
+                            from_raw_parts(old_start as *mut u8, fend - fstart + 1)
+                        });
+                        file.lseek(SeekFrom::SeekSet(old_pos as i64)).unwrap();
+
+                        if err.is_err() || start >= end {
+                            err = Ok(0);
+                            break;
+                        }
+                    }
+                } else if start >= end {
+                    err = Ok(0);
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        return if err.is_err() { err } else { unmapped_error };
     }
 }

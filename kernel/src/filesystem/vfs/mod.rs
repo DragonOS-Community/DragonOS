@@ -818,7 +818,10 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     fn super_block(&self) -> SuperBlock;
 
     unsafe fn fault(&self, _pfm: &mut PageFaultMessage, _mapper: &mut PageMapper) -> VmFaultReason {
-        panic!("fault() has not yet been implemented for this filesystem")
+        panic!(
+            "fault() has not yet been implemented for filesystem: {}",
+            crate::libs::name::get_type_name(&self)
+        )
     }
 
     unsafe fn map_pages(
@@ -828,7 +831,10 @@ pub trait FileSystem: Any + Sync + Send + Debug {
         _start_pgoff: usize,
         _end_pgoff: usize,
     ) -> VmFaultReason {
-        panic!("map_pages() has not yet been implemented for this filesystem")
+        panic!(
+            "map_pages() has not yet been implemented for filesystem: {}",
+            crate::libs::name::get_type_name(&self)
+        )
     }
 }
 

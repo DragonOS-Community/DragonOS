@@ -323,12 +323,15 @@ impl InnerAddressSpace {
     /// - `len`：映射的长度
     /// - `prot_flags`：保护标志
     /// - `map_flags`：映射标志
+    /// - `fd`：文件描述符
+    /// - `offset`：映射偏移量
     /// - `round_to_min`：是否将`start_vaddr`对齐到`mmap_min`，如果为`true`，则当`start_vaddr`不为0时，会对齐到`mmap_min`，否则仅向下对齐到页边界
     /// - `allocate_at_once`：是否立即分配物理空间
     ///
     /// ## 返回
     ///
     /// 返回映射的起始虚拟页帧
+    #[allow(clippy::too_many_arguments)]
     pub fn file_mapping(
         &mut self,
         start_vaddr: VirtAddr,
@@ -340,7 +343,6 @@ impl InnerAddressSpace {
         round_to_min: bool,
         allocate_at_once: bool,
     ) -> Result<VirtPageFrame, SystemError> {
-        log::info!("file_mapping");
         let allocate_at_once = if MMArch::PAGE_FAULT_ENABLED {
             allocate_at_once
         } else {
@@ -1579,14 +1581,20 @@ impl VMA {
     }
 
     /// 从页分配器中分配一些物理页，并把它们映射到指定的虚拟地址，然后创建VMA
+    /// ## 参数
     ///
-    /// @param destination 要映射到的虚拟地址
-    /// @param count 要映射的页帧数量
-    /// @param flags 页面标志位
-    /// @param mapper 页表映射器
-    /// @param flusher 页表项刷新器
+    /// - `destination`: 要映射到的虚拟地址
+    /// - `page_count`: 要映射的页帧数量
+    /// - `vm_flags`: VMA标志位
+    /// - `flags`: 页面标志位
+    /// - `mapper`: 页表映射器
+    /// - `flusher`: 页表项刷新器
+    /// - `file`: 映射文件
+    /// - `pgoff`: 返回映射后的虚拟内存区域
     ///
-    /// @return 返回映射后的虚拟内存区域
+    /// ## 返回值
+    /// - 页面错误处理信息标志
+    #[allow(clippy::too_many_arguments)]
     pub fn zeroed(
         destination: VirtPageFrame,
         page_count: PageFrameCount,

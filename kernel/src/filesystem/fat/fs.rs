@@ -12,11 +12,14 @@ use alloc::{
     vec::Vec,
 };
 
+use crate::arch::mm::PageMapper;
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::vfs::file::PageCache;
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
+use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
+use crate::mm::VmFaultReason;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
@@ -274,6 +277,20 @@ impl FileSystem for FATFileSystem {
             self.bpb.bytes_per_sector.into(),
             FAT_MAX_NAMELEN,
         )
+    }
+
+    unsafe fn fault(&self, pfm: &mut PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+        PageFaultHandler::filemap_fault(pfm, mapper)
+    }
+
+    unsafe fn map_pages(
+        &self,
+        pfm: &mut PageFaultMessage,
+        mapper: &mut PageMapper,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
+        PageFaultHandler::filemap_map_pages(pfm, mapper, start_pgoff, end_pgoff)
     }
 }
 

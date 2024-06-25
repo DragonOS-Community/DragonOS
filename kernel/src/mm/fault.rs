@@ -317,6 +317,7 @@ impl PageFaultHandler {
         //     crate::process::ProcessManager::current_pid().data()
         // );
         // TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#do_cow_fault
+        let file = pfm.vma().lock().vm_file().unwrap();
 
         let mut ret = Self::filemap_fault(pfm, mapper);
 
@@ -338,21 +339,14 @@ impl PageFaultHandler {
         pfm: &mut PageFaultMessage,
         mapper: &mut PageMapper,
     ) -> VmFaultReason {
-        // panic!(
-        //     "do_read_fault has not yet been implemented,
-        // fault message: {:?},
-        // pid: {}\n",
-        //     pfm,
-        //     crate::process::ProcessManager::current_pid().data()
-        // );
+        let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
 
-        // TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#do_read_fault
-
-        let mut ret = Self::do_fault_around(pfm.clone(), mapper);
+        let mut ret = Self::do_fault_around(pfm, mapper);
         if !ret.is_empty() {
             return ret;
         }
-        ret = Self::filemap_fault(pfm, mapper);
+
+        ret = fs.fault(pfm, mapper);
 
         ret = ret.union(Self::finish_fault(pfm, mapper));
 
@@ -484,7 +478,10 @@ impl PageFaultHandler {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
-    pub unsafe fn do_fault_around(pfm: PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+    pub unsafe fn do_fault_around(
+        pfm: &mut PageFaultMessage,
+        mapper: &mut PageMapper,
+    ) -> VmFaultReason {
         if mapper.get_table(*pfm.address(), 0).is_none() {
             mapper
                 .allocate_table(*pfm.address(), 0)
@@ -534,9 +531,10 @@ impl PageFaultHandler {
             return VmFaultReason::VM_FAULT_OOM;
         }
 
+        let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
         // from_pte - pte_pgoff得出预读起始pte相对缺失页的偏移，加上pfm.file_pgoff（缺失页在文件中的偏移）得出起始页在文件中的偏移，结束pte同理
-        Self::filemap_map_pages(
-            pfm.clone(),
+        fs.map_pages(
+            pfm,
             mapper,
             file_pgoff + (from_pte - pte_pgoff),
             file_pgoff + (to_pte - pte_pgoff),
@@ -554,7 +552,7 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn filemap_map_pages(
-        pfm: PageFaultMessage,
+        pfm: &mut PageFaultMessage,
         mapper: &mut PageMapper,
         start_pgoff: usize,
         end_pgoff: usize,

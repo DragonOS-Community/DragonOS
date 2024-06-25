@@ -12,6 +12,7 @@ use intertrait::CastFromSync;
 use system_error::SystemError;
 
 use crate::{
+    arch::mm::PageMapper,
     driver::base::{
         block::block_device::BlockDevice, char::CharDevice, device::device_number::DeviceNumber,
     },
@@ -20,6 +21,7 @@ use crate::{
         casting::DowncastArc,
         spinlock::{SpinLock, SpinLockGuard},
     },
+    mm::{fault::PageFaultMessage, VmFaultReason},
     time::PosixTimeSpec,
 };
 
@@ -814,6 +816,20 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     fn name(&self) -> &str;
 
     fn super_block(&self) -> SuperBlock;
+
+    unsafe fn fault(&self, _pfm: &mut PageFaultMessage, _mapper: &mut PageMapper) -> VmFaultReason {
+        panic!("fault() has not yet been implemented for this filesystem")
+    }
+
+    unsafe fn map_pages(
+        &self,
+        _pfm: &mut PageFaultMessage,
+        _mapper: &mut PageMapper,
+        _start_pgoff: usize,
+        _end_pgoff: usize,
+    ) -> VmFaultReason {
+        panic!("map_pages() has not yet been implemented for this filesystem")
+    }
 }
 
 impl DowncastArc for dyn FileSystem {

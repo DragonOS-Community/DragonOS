@@ -52,7 +52,6 @@ pub struct TimekeeperData {
     cycle_interval: CycleNum,
     /// 一个NTP间隔中时钟移位的纳秒数。
     xtime_interval: u64,
-    ///
     xtime_remainder: i64,
     /// 每个NTP间隔累积的原始纳米秒
     raw_interval: i64,

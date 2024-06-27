@@ -55,6 +55,7 @@ impl MbrDiskPartitionTableEntry {
 #[repr(packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct MbrDiskPartionTable {
+    #[allow(dead_code)]
     pub reserved: [u8; 446],
     pub dpte: [MbrDiskPartitionTableEntry; 4], // 磁盘分区表项
     pub bs_trailsig: u16,

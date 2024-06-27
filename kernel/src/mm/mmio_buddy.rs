@@ -55,9 +55,10 @@ impl MmioBuddyMemPool {
             free_regions[i as usize] = MaybeUninit::new(SpinLock::new(MmioFreeRegionList::new()));
         }
         let free_regions = unsafe {
-            mem::transmute::<_, [SpinLock<MmioFreeRegionList>; MMIO_BUDDY_REGION_COUNT as usize]>(
-                free_regions,
-            )
+            mem::transmute::<
+                [MaybeUninit<SpinLock<MmioFreeRegionList>>; 19],
+                [SpinLock<MmioFreeRegionList>; 19],
+            >(free_regions)
         };
 
         let pool = MmioBuddyMemPool {

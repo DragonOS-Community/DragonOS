@@ -284,6 +284,7 @@ pub fn timer_init() {
 }
 
 /// 计算接下来n毫秒对应的定时器时间片
+#[allow(dead_code)]
 pub fn next_n_ms_timer_jiffies(expire_ms: u64) -> u64 {
     return TIMER_JIFFIES.load(Ordering::SeqCst) + expire_ms * 1000000 / NSEC_PER_JIFFY as u64;
 }

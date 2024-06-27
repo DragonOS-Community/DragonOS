@@ -161,6 +161,7 @@ impl MountFSInode {
     }
 
     /// 将新的挂载点-挂载文件系统添加到父级的挂载树
+    #[allow(dead_code)]
     pub(super) fn do_mount(
         &self,
         inode_id: InodeId,
@@ -175,6 +176,7 @@ impl MountFSInode {
         return Ok(());
     }
 
+    #[allow(dead_code)]
     pub(super) fn inode_id(&self) -> InodeId {
         self.metadata().map(|x| x.inode_id).unwrap()
     }

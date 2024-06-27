@@ -45,6 +45,7 @@ pub struct IrqDomainManager {
     inner: RwLock<InnerIrqDomainManager>,
 }
 
+#[allow(dead_code)]
 impl IrqDomainManager {
     pub fn new() -> IrqDomainManager {
         IrqDomainManager {
@@ -64,7 +65,6 @@ impl IrqDomainManager {
     /// - `name` - 中断域的名字
     /// - `ops` - 中断域的操作
     /// - `irq_size` - 中断号的数量
-    #[allow(dead_code)]
     pub fn create_and_add_linear(
         &self,
         name: String,
@@ -118,7 +118,6 @@ impl IrqDomainManager {
         self.domains.lock_irqsave().push(domain);
     }
 
-    #[allow(dead_code)]
     pub fn remove_domain(&self, domain: &Arc<IrqDomain>) {
         let mut domains = self.domains.lock_irqsave();
         let index = domains
@@ -129,7 +128,6 @@ impl IrqDomainManager {
     }
 
     /// 获取默认的中断域
-    #[allow(dead_code)]
     pub fn default_domain(&self) -> Option<Arc<IrqDomain>> {
         self.inner.read().default_domain.clone()
     }
@@ -530,12 +528,10 @@ impl IrqDomain {
             .contains(IrqDomainFlags::NO_MAP)
     }
 
-    #[allow(dead_code)]
     fn revmap_read_irqsave(&self) -> RwLockReadGuard<IrqDomainRevMap> {
         self.revmap.read_irqsave()
     }
 
-    #[allow(dead_code)]
     fn revmap_write_irqsave(&self) -> RwLockWriteGuard<IrqDomainRevMap> {
         self.revmap.write_irqsave()
     }
@@ -557,14 +553,17 @@ impl IrqDomain {
     }
 
     /// The number of mapped interrupts
+    #[allow(dead_code)]
     pub fn map_count(&self) -> u32 {
         self.revmap_read_irqsave().map.len() as u32
     }
 
+    #[allow(dead_code)]
     pub fn host_data(&self) -> Option<Arc<dyn IrqChipData>> {
         self.inner.lock_irqsave().host_data.clone()
     }
 
+    #[allow(dead_code)]
     pub fn set_host_data(&self, host_data: Option<Arc<dyn IrqChipData>>) {
         self.inner.lock_irqsave().host_data = host_data;
     }
@@ -642,6 +641,7 @@ pub enum IrqDomainBusToken {
 /// IrqDomain的操作方法
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irqdomain.h#107
+#[allow(dead_code)]
 pub trait IrqDomainOps: Debug + Send + Sync {
     /// 匹配一个中断控制器设备节点到一个主机。
     fn match_node(

@@ -277,6 +277,7 @@ pub struct TtyContorlInfo {
     pub packet: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct TtyCoreWriteData {
     /// 写缓冲区
@@ -466,6 +467,7 @@ impl TtyCoreData {
 }
 
 /// TTY 核心接口，不同的tty需要各自实现这个trait
+#[allow(dead_code)]
 pub trait TtyCoreFuncs: Debug + Send + Sync {}
 
 impl TtyOperation for TtyCore {

@@ -16,6 +16,7 @@ use super::{platform_bus, platform_device::PlatformDevice};
 ///
 /// 应当在所有实现这个trait的结构体上方，添加 `#[cast_to([sync] PlatformDriver)]`，
 /// 否则运行时将报错“该对象不是PlatformDriver”
+#[allow(dead_code)]
 pub trait PlatformDriver: Driver {
     /// 检测设备是否能绑定到这个驱动
     ///

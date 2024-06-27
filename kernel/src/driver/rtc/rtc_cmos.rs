@@ -44,7 +44,7 @@ struct CmosPlatformDriver {
 }
 
 impl CmosPlatformDriver {
-    const NAME: &str = "rtc_cmos";
+    const NAME: &'static str = "rtc_cmos";
 
     fn new() -> Arc<Self> {
         Arc::new(CmosPlatformDriver {

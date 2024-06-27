@@ -132,7 +132,7 @@ pub struct VirtualConsoleData {
     pub utf_char: u32,
     /// 构建utf时需要的参数，表示目前接收了多少个字节的数据来构建utf字符
     pub npar: u32,
-    ///
+
     pub par: [u32; NPAR],
 
     /// 字符转换表 用于将输入字符映射到特定的字符

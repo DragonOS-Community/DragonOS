@@ -24,6 +24,7 @@ fn init_intertrait() {
     intertrait::init_caster_map();
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct BootParams {
     pub screen_info: BootTimeScreenInfo,

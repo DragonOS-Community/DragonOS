@@ -18,6 +18,7 @@ pub mod virtio_impl;
 /// virtio 设备厂商ID
 pub const VIRTIO_VENDOR_ID: u16 = 0x1af4;
 
+#[allow(dead_code)]
 pub trait VirtIODevice: Device {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError>;
 

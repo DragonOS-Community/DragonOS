@@ -31,6 +31,7 @@ pub struct KernelWaitOption<'a> {
     pub no_task_error: Option<SystemError>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct WaitIdInfo {
     pub pid: Pid,

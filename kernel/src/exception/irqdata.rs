@@ -306,10 +306,12 @@ impl IrqCommonData {
         self.inner.lock_irqsave().affinity = affinity;
     }
 
+    #[allow(dead_code)]
     pub fn set_effective_affinity(&self, affinity: CpuMask) {
         self.inner.lock_irqsave().effective_affinity = affinity;
     }
 
+    #[allow(dead_code)]
     pub fn inner(&self) -> SpinLockGuard<InnerIrqCommonData> {
         self.inner.lock_irqsave()
     }
@@ -346,6 +348,7 @@ impl InnerIrqCommonData {
         self.handler_data.clone()
     }
 
+    #[allow(dead_code)]
     pub fn effective_affinity(&self) -> &CpuMask {
         &self.effective_affinity
     }

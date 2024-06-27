@@ -27,6 +27,8 @@ use super::vfs::{
 };
 use super::vfs::{Magic, SuperBlock};
 
+use linkme::distributed_slice;
+
 /// RamFS的inode名称的最大长度
 const RAMFS_MAX_NAMELEN: usize = 64;
 const RAMFS_BLOCK_SIZE: u64 = 512;
@@ -149,6 +151,7 @@ impl RamFS {
         return Ok(fs);
     }
 }
+
 #[distributed_slice(FSMAKER)]
 static RAMFSMAKER: FileSystemMaker = FileSystemMaker::new(
     "ramfs",

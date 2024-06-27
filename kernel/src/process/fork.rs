@@ -84,6 +84,7 @@ bitflags! {
 /// 因为这两个系统调用的参数很多，所以有这样一个载体更灵活
 ///
 /// 仅仅作为参数传递
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct KernelCloneArgs {
     pub flags: CloneFlags,

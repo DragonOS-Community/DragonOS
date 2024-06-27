@@ -1,11 +1,14 @@
 use core::intrinsics::likely;
 use core::intrinsics::unlikely;
 use core::mem::swap;
+use core::ops::Deref;
+use core::ops::DerefMut;
 use core::sync::atomic::fence;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::libs::rbtree::RBTree;
 use crate::libs::spinlock::SpinLock;
+use crate::libs::unsafecell_wrapper::UnsafeCellWrapper;
 use crate::process::ProcessControlBlock;
 use crate::process::ProcessFlags;
 use crate::sched::clock::ClockUpdataFlag;
@@ -18,6 +21,7 @@ use alloc::sync::{Arc, Weak};
 
 use super::idle::IdleScheduler;
 use super::pelt::{add_positive, sub_positive, SchedulerAvg, UpdateAvgFlags, PELT_MIN_DIVIDER};
+use super::CpuRunQueueInner;
 use super::{
     CpuRunQueue, DequeueFlag, EnqueueFlag, LoadWeight, OnRq, SchedPolicy, Scheduler, TaskGroup,
     WakeupFlags, SCHED_CAPACITY_SHIFT,
@@ -38,9 +42,105 @@ static NORMALIZED_SYSCTL_SHCED_BASE_SLICE: AtomicU64 = AtomicU64::new(750000);
 /// 预设的调度延迟任务数量
 static SCHED_NR_LATENCY: AtomicU64 = AtomicU64::new(8);
 
+#[derive(Debug)]
+pub struct FairSchedEntity(UnsafeCellWrapper<FairSchedEntityInner>);
+
+impl Deref for FairSchedEntity {
+    type Target = UnsafeCellWrapper<FairSchedEntityInner>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for FairSchedEntity {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl FairSchedEntity {
+    pub fn new() -> Arc<Self> {
+        let inner = UnsafeCellWrapper::new(FairSchedEntityInner {
+            parent: Weak::new(),
+            self_ref: Weak::new(),
+            pcb: Weak::new(),
+            cfs_rq: Weak::new(),
+            my_cfs_rq: None,
+            on_rq: OnRq::None,
+            slice: SYSCTL_SHCED_BASE_SLICE.load(Ordering::SeqCst),
+            load: Default::default(),
+            deadline: Default::default(),
+            min_deadline: Default::default(),
+            exec_start: Default::default(),
+            sum_exec_runtime: Default::default(),
+            vruntime: Default::default(),
+            vlag: Default::default(),
+            prev_sum_exec_runtime: Default::default(),
+            avg: Default::default(),
+            depth: Default::default(),
+            runnable_weight: Default::default(),
+        });
+
+        let ret = Arc::new(Self(inner));
+
+        ret.force_get_mut().self_ref = Arc::downgrade(&ret);
+
+        ret
+    }
+
+    pub fn calculate_delta_fair(&self, delta: u64) -> u64 {
+        if unlikely(self.load.weight != LoadWeight::NICE_0_LOAD_SHIFT as u64) {
+            return self
+                .force_get_mut()
+                .load
+                .calculate_delta(delta, LoadWeight::NICE_0_LOAD_SHIFT as u64);
+        };
+
+        delta
+    }
+
+    /// 遍历se组，如果返回false则需要调用的函数return，
+    /// 会将se指向其顶层parent
+    /// 该函数会改变se指向
+    /// 参数：
+    /// - se: 对应调度实体
+    /// - f: 对调度实体执行操作的闭包，返回值对应(no_break,should_continue),no_break为假时，退出循环，should_continue为假时表示需要将调用者return
+    ///
+    /// 返回值：
+    /// - bool: 是否需要调度者return
+    /// - Option<Arc<FairSchedEntity>>：最终se的指向
+    pub fn for_each_in_group(
+        se: &mut Arc<FairSchedEntity>,
+        mut f: impl FnMut(Arc<FairSchedEntity>) -> (bool, bool),
+    ) -> (bool, Option<Arc<FairSchedEntity>>) {
+        let mut should_continue;
+        let ret;
+        // 这一步是循环计算,直到根节点
+        // 比如有任务组 A ，有进程B，B属于A任务组，那么B的时间分配依赖于A组的权重以及B进程自己的权重
+        loop {
+            let (no_break, flag) = f(se.clone());
+            should_continue = flag;
+            if !no_break || !should_continue {
+                ret = Some(se.clone());
+                break;
+            }
+
+            let parent = se.parent();
+            if parent.is_none() {
+                ret = None;
+                break;
+            }
+
+            *se = parent.unwrap();
+        }
+
+        (should_continue, ret)
+    }
+}
+
 /// 调度实体单位，一个调度实体可以是一个进程、一个进程组或者是一个用户等等划分
 #[derive(Debug)]
-pub struct FairSchedEntity {
+pub struct FairSchedEntityInner {
     /// 负载相关
     pub load: LoadWeight,
     pub deadline: u64,
@@ -82,36 +182,7 @@ pub struct FairSchedEntity {
     pcb: Weak<ProcessControlBlock>,
 }
 
-impl FairSchedEntity {
-    pub fn new() -> Arc<Self> {
-        let ret = Arc::new(Self {
-            parent: Weak::new(),
-            self_ref: Weak::new(),
-            pcb: Weak::new(),
-            cfs_rq: Weak::new(),
-            my_cfs_rq: None,
-            on_rq: OnRq::None,
-            slice: SYSCTL_SHCED_BASE_SLICE.load(Ordering::SeqCst),
-            load: Default::default(),
-            deadline: Default::default(),
-            min_deadline: Default::default(),
-            exec_start: Default::default(),
-            sum_exec_runtime: Default::default(),
-            vruntime: Default::default(),
-            vlag: Default::default(),
-            prev_sum_exec_runtime: Default::default(),
-            avg: Default::default(),
-            depth: Default::default(),
-            runnable_weight: Default::default(),
-        });
-
-        ret.force_mut().self_ref = Arc::downgrade(&ret);
-
-        ret
-    }
-}
-
-impl FairSchedEntity {
+impl FairSchedEntityInner {
     pub fn self_arc(&self) -> Arc<FairSchedEntity> {
         self.self_ref.upgrade().unwrap()
     }
@@ -142,11 +213,6 @@ impl FairSchedEntity {
         self.parent.upgrade()
     }
 
-    #[allow(clippy::mut_from_ref)]
-    pub fn force_mut(&self) -> &mut Self {
-        unsafe { &mut *(self as *const Self as usize as *mut Self) }
-    }
-
     /// 判断是否是进程持有的调度实体
     #[inline]
     pub fn is_task(&self) -> bool {
@@ -166,9 +232,9 @@ impl FairSchedEntity {
     pub fn clear_buddies(&self) {
         let mut se = self.self_arc();
 
-        Self::for_each_in_group(&mut se, |se| {
+        FairSchedEntity::for_each_in_group(&mut se, |se| {
             let binding = se.cfs_rq();
-            let cfs_rq = binding.force_mut();
+            let cfs_rq = binding.force_get_mut();
 
             if let Some(next) = cfs_rq.next.upgrade() {
                 if !Arc::ptr_eq(&next, &se) {
@@ -181,14 +247,7 @@ impl FairSchedEntity {
     }
 
     pub fn calculate_delta_fair(&self, delta: u64) -> u64 {
-        if unlikely(self.load.weight != LoadWeight::NICE_0_LOAD_SHIFT as u64) {
-            return self
-                .force_mut()
-                .load
-                .calculate_delta(delta, LoadWeight::NICE_0_LOAD_SHIFT as u64);
-        };
-
-        delta
+        self.self_arc().calculate_delta_fair(delta)
     }
 
     /// 更新组内的权重信息
@@ -204,47 +263,9 @@ impl FairSchedEntity {
         if unlikely(self.load.weight != shares) {
             // TODO: reweight
             self.cfs_rq()
-                .force_mut()
+                .force_get_mut()
                 .reweight_entity(self.self_arc(), shares);
         }
-    }
-
-    /// 遍历se组，如果返回false则需要调用的函数return，
-    /// 会将se指向其顶层parent
-    /// 该函数会改变se指向
-    /// 参数：
-    /// - se: 对应调度实体
-    /// - f: 对调度实体执行操作的闭包，返回值对应(no_break,should_continue),no_break为假时，退出循环，should_continue为假时表示需要将调用者return
-    ///
-    /// 返回值：
-    /// - bool: 是否需要调度者return
-    /// - Option<Arc<FairSchedEntity>>：最终se的指向
-    pub fn for_each_in_group(
-        se: &mut Arc<FairSchedEntity>,
-        mut f: impl FnMut(Arc<FairSchedEntity>) -> (bool, bool),
-    ) -> (bool, Option<Arc<FairSchedEntity>>) {
-        let mut should_continue;
-        let ret;
-        // 这一步是循环计算,直到根节点
-        // 比如有任务组 A ，有进程B，B属于A任务组，那么B的时间分配依赖于A组的权重以及B进程自己的权重
-        loop {
-            let (no_break, flag) = f(se.clone());
-            should_continue = flag;
-            if !no_break || !should_continue {
-                ret = Some(se.clone());
-                break;
-            }
-
-            let parent = se.parent();
-            if parent.is_none() {
-                ret = None;
-                break;
-            }
-
-            *se = parent.unwrap();
-        }
-
-        (should_continue, ret)
     }
 
     pub fn runnable(&self) -> u64 {
@@ -262,7 +283,7 @@ impl FairSchedEntity {
         }
 
         let binding = self.my_cfs_rq.clone().unwrap();
-        let gcfs_rq = binding.force_mut();
+        let gcfs_rq = binding.force_get_mut();
 
         if gcfs_rq.propagate == 0 {
             return false;
@@ -271,7 +292,7 @@ impl FairSchedEntity {
         gcfs_rq.propagate = 0;
 
         let binding = self.cfs_rq();
-        let cfs_rq = binding.force_mut();
+        let cfs_rq = binding.force_get_mut();
 
         cfs_rq.add_task_group_propagate(gcfs_rq.prop_runnable_sum);
 
@@ -299,10 +320,64 @@ impl FairSchedEntity {
     }
 }
 
+#[derive(Debug)]
+pub struct CfsRunQueue(UnsafeCellWrapper<CfsRunQueueInner>);
+
+impl Deref for CfsRunQueue {
+    type Target = UnsafeCellWrapper<CfsRunQueueInner>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for CfsRunQueue {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl CfsRunQueue {
+    pub fn new() -> Self {
+        let inner = CfsRunQueueInner {
+            load: LoadWeight::default(),
+            nr_running: 0,
+            h_nr_running: 0,
+            exec_clock: 0,
+            min_vruntime: 1 << 20,
+            entities: RBTree::new(),
+            idle: 0,
+            idle_nr_running: 0,
+            idle_h_nr_running: 0,
+            current: Weak::new(),
+            next: Weak::new(),
+            last: Weak::new(),
+            skip: Weak::new(),
+            avg_load: 0,
+            avg_vruntime: 0,
+            last_update_time_copy: 0,
+            avg: SchedulerAvg::default(),
+            rq: Weak::new(),
+            task_group: Weak::new(),
+            throttled_clock: 0,
+            throttled_clock_pelt: 0,
+            throttled_clock_pelt_time: 0,
+            throttled_pelt_idle: 0,
+            throttled: false,
+            throttled_count: 0,
+            removed: SpinLock::new(CfsRemoved::default()),
+            propagate: 0,
+            prop_runnable_sum: 0,
+            runtime_remaining: 0,
+        };
+
+        Self(UnsafeCellWrapper::new(inner))
+    }
+}
+
 /// CFS的运行队列，这个队列需确保是percpu的
 #[allow(dead_code)]
 #[derive(Debug)]
-pub struct CfsRunQueue {
+pub struct CfsRunQueueInner {
     load: LoadWeight,
 
     /// 全局运行的调度实体计数器，用于负载均衡
@@ -368,41 +443,7 @@ pub struct CfsRemoved {
     pub runnable_avg: usize,
 }
 
-impl CfsRunQueue {
-    pub fn new() -> Self {
-        Self {
-            load: LoadWeight::default(),
-            nr_running: 0,
-            h_nr_running: 0,
-            exec_clock: 0,
-            min_vruntime: 1 << 20,
-            entities: RBTree::new(),
-            idle: 0,
-            idle_nr_running: 0,
-            idle_h_nr_running: 0,
-            current: Weak::new(),
-            next: Weak::new(),
-            last: Weak::new(),
-            skip: Weak::new(),
-            avg_load: 0,
-            avg_vruntime: 0,
-            last_update_time_copy: 0,
-            avg: SchedulerAvg::default(),
-            rq: Weak::new(),
-            task_group: Weak::new(),
-            throttled_clock: 0,
-            throttled_clock_pelt: 0,
-            throttled_clock_pelt_time: 0,
-            throttled_pelt_idle: 0,
-            throttled: false,
-            throttled_count: 0,
-            removed: SpinLock::new(CfsRemoved::default()),
-            propagate: 0,
-            prop_runnable_sum: 0,
-            runtime_remaining: 0,
-        }
-    }
-
+impl CfsRunQueueInner {
     #[inline]
     pub fn rq(&self) -> Arc<CpuRunQueue> {
         self.rq.upgrade().unwrap()
@@ -411,12 +452,6 @@ impl CfsRunQueue {
     #[inline]
     pub fn set_rq(&mut self, rq: Weak<CpuRunQueue>) {
         self.rq = rq;
-    }
-
-    #[inline]
-    #[allow(clippy::mut_from_ref)]
-    pub fn force_mut(&self) -> &mut Self {
-        unsafe { &mut *(self as *const Self as usize as *mut Self) }
     }
 
     #[inline]
@@ -486,11 +521,14 @@ impl CfsRunQueue {
         // 比如有任务组 A ，有进程B，B属于A任务组，那么B的时间分配依赖于A组的权重以及B进程自己的权重
         FairSchedEntity::for_each_in_group(&mut entity, |se| {
             if unlikely(!se.on_rq()) {
-                se.cfs_rq().force_mut().load.update_load_add(se.load.weight);
+                se.cfs_rq()
+                    .force_get_mut()
+                    .load
+                    .update_load_add(se.load.weight);
             }
             slice = se
                 .cfs_rq()
-                .force_mut()
+                .force_get_mut()
                 .load
                 .calculate_delta(slice, se.load.weight);
 
@@ -577,7 +615,7 @@ impl CfsRunQueue {
         fence(Ordering::SeqCst);
         let delta_exec = now - curr.exec_start;
 
-        let curr = curr.force_mut();
+        let curr = curr.force_get_mut();
 
         curr.exec_start = now;
 
@@ -621,9 +659,9 @@ impl CfsRunQueue {
             return;
         }
 
-        se.force_mut().slice = SYSCTL_SHCED_BASE_SLICE.load(Ordering::SeqCst);
+        se.force_get_mut().slice = SYSCTL_SHCED_BASE_SLICE.load(Ordering::SeqCst);
 
-        se.force_mut().deadline = se.vruntime + se.calculate_delta_fair(se.slice);
+        se.force_get_mut().deadline = se.vruntime + se.calculate_delta_fair(se.slice);
 
         if self.nr_running > 1 {
             self.rq().resched_current();
@@ -705,15 +743,15 @@ impl CfsRunQueue {
         self.dequeue_load_avg(&se);
 
         if !se.on_rq() {
-            se.force_mut().vlag = se.vlag * se.load.weight as i64 / weight as i64;
+            se.force_get_mut().vlag = se.vlag * se.load.weight as i64 / weight as i64;
         } else {
             self.reweight_eevdf(&se, weight);
         }
-        se.force_mut().load.update_load_set(weight);
+        se.force_get_mut().load.update_load_set(weight);
 
         // SMP
         let divider = se.avg.get_pelt_divider();
-        se.force_mut().avg.load_avg = LoadWeight::scale_load_down(se.load.weight) as usize
+        se.force_get_mut().avg.load_avg = LoadWeight::scale_load_down(se.load.weight) as usize
             * se.avg.load_sum as usize
             / divider;
 
@@ -737,12 +775,12 @@ impl CfsRunQueue {
         if avg_vruntime != se.vruntime {
             vlag = avg_vruntime as i64 - se.vruntime as i64;
             vlag = vlag * old_weight as i64 / weight as i64;
-            se.force_mut().vruntime = (avg_vruntime as i64 - vlag) as u64;
+            se.force_get_mut().vruntime = (avg_vruntime as i64 - vlag) as u64;
         }
 
         let mut vslice = se.deadline as i64 - avg_vruntime as i64;
         vslice = vslice * old_weight as i64 / weight as i64;
-        se.force_mut().deadline = avg_vruntime + vslice as u64;
+        se.force_get_mut().deadline = avg_vruntime + vslice as u64;
     }
 
     fn avg_vruntime(&self) -> u64 {
@@ -801,7 +839,7 @@ impl CfsRunQueue {
         let vruntime = self.avg_vruntime();
         let mut lag = 0;
 
-        let se = se.force_mut();
+        let se = se.force_get_mut();
         se.slice = SYSCTL_SHCED_BASE_SLICE.load(Ordering::SeqCst);
 
         let mut vslice = se.calculate_delta_fair(se.slice);
@@ -842,11 +880,11 @@ impl CfsRunQueue {
         let now = self.cfs_rq_clock_pelt();
 
         if se.avg.last_update_time > 0 && !flags.contains(UpdateAvgFlags::SKIP_AGE_LOAD) {
-            se.force_mut().update_load_avg(self, now);
+            se.force_get_mut().update_load_avg(self, now);
         }
 
         let mut decayed = self.update_self_load_avg(now);
-        decayed |= se.force_mut().propagate_entity_load_avg() as u32;
+        decayed |= se.force_get_mut().propagate_entity_load_avg() as u32;
 
         if se.avg.last_update_time > 0 && flags.contains(UpdateAvgFlags::DO_ATTACH) {
             todo!()
@@ -973,7 +1011,7 @@ impl CfsRunQueue {
 
         self.update_load_avg(se, UpdateAvgFlags::UPDATE_TG | UpdateAvgFlags::DO_ATTACH);
 
-        se.force_mut().update_runnable();
+        se.force_get_mut().update_runnable();
 
         se.update_cfs_group();
 
@@ -984,14 +1022,14 @@ impl CfsRunQueue {
         self.account_entity_enqueue(se);
 
         if flags.contains(EnqueueFlag::ENQUEUE_MIGRATED) {
-            se.force_mut().exec_start = 0;
+            se.force_get_mut().exec_start = 0;
         }
 
         if !is_curr {
             self.inner_enqueue_entity(se);
         }
 
-        se.force_mut().on_rq = OnRq::Queued;
+        se.force_get_mut().on_rq = OnRq::Queued;
 
         if self.nr_running == 1 {
             // 只有上面加入的
@@ -1010,7 +1048,7 @@ impl CfsRunQueue {
 
         self.update_load_avg(se, action);
 
-        se.force_mut().update_runnable();
+        se.force_get_mut().update_runnable();
 
         self.clear_buddies(se);
 
@@ -1024,7 +1062,7 @@ impl CfsRunQueue {
             self.inner_dequeue_entity(se);
         }
 
-        se.force_mut().on_rq = OnRq::None;
+        se.force_get_mut().on_rq = OnRq::None;
 
         self.account_entity_dequeue(se);
 
@@ -1063,12 +1101,12 @@ impl CfsRunQueue {
         if se.on_rq() {
             self.inner_dequeue_entity(se);
             self.update_load_avg(se, UpdateAvgFlags::UPDATE_TG);
-            se.force_mut().vlag = se.deadline as i64;
+            se.force_get_mut().vlag = se.deadline as i64;
         }
 
         self.set_current(Arc::downgrade(se));
 
-        se.force_mut().prev_sum_exec_runtime = se.sum_exec_runtime;
+        se.force_get_mut().prev_sum_exec_runtime = se.sum_exec_runtime;
     }
 
     fn update_idle_clock_pelt(&mut self) {
@@ -1086,7 +1124,7 @@ impl CfsRunQueue {
 
         let limit = se.calculate_delta_fair((TICK_NESC as u64).max(2 * se.slice)) as i64;
 
-        se.force_mut().vlag = if lag < -limit {
+        se.force_get_mut().vlag = if lag < -limit {
             -limit
         } else if lag > limit {
             limit
@@ -1129,7 +1167,7 @@ impl CfsRunQueue {
 
     pub fn inner_enqueue_entity(&mut self, se: &Arc<FairSchedEntity>) {
         self.avg_vruntime_add(se);
-        se.force_mut().min_deadline = se.deadline;
+        se.force_get_mut().min_deadline = se.deadline;
         self.entities.insert(se.vruntime, se.clone());
         // warn!(
         //     "enqueue pcb {:?} cfsrq {:?}",
@@ -1179,7 +1217,7 @@ impl CfsRunQueue {
             if Arc::ptr_eq(&rm, se) {
                 break;
             }
-            rm.force_mut().vruntime += i;
+            rm.force_get_mut().vruntime += i;
             self.entities.insert(rm.vruntime, rm);
 
             i += 1;
@@ -1234,7 +1272,7 @@ impl CfsRunQueue {
             .max((self.avg.load_avg * PELT_MIN_DIVIDER) as u64)
     }
 
-    pub fn update_task_group_util(&mut self, se: Arc<FairSchedEntity>, gcfs_rq: &CfsRunQueue) {
+    pub fn update_task_group_util(&mut self, se: Arc<FairSchedEntity>, gcfs_rq: &CfsRunQueueInner) {
         let mut delta_sum = gcfs_rq.avg.load_avg as isize - se.avg.load_avg as isize;
         let delta_avg = delta_sum;
 
@@ -1244,7 +1282,7 @@ impl CfsRunQueue {
 
         let divider = self.avg.get_pelt_divider();
 
-        let se = se.force_mut();
+        let se = se.force_get_mut();
         se.avg.util_avg = gcfs_rq.avg.util_avg;
         let new_sum = se.avg.util_avg * divider;
         delta_sum = new_sum as isize - se.avg.util_sum as isize;
@@ -1260,7 +1298,11 @@ impl CfsRunQueue {
             .max((self.avg.util_avg * PELT_MIN_DIVIDER) as u64);
     }
 
-    pub fn update_task_group_runnable(&mut self, se: Arc<FairSchedEntity>, gcfs_rq: &CfsRunQueue) {
+    pub fn update_task_group_runnable(
+        &mut self,
+        se: Arc<FairSchedEntity>,
+        gcfs_rq: &CfsRunQueueInner,
+    ) {
         let mut delta_sum = gcfs_rq.avg.runnable_avg as isize - se.avg.runnable_avg as isize;
         let delta_avg = delta_sum;
 
@@ -1270,7 +1312,7 @@ impl CfsRunQueue {
 
         let divider = self.avg.get_pelt_divider();
 
-        let se = se.force_mut();
+        let se = se.force_get_mut();
         se.avg.runnable_avg = gcfs_rq.avg.runnable_avg;
         let new_sum = se.avg.runnable_sum * divider as u64;
         delta_sum = new_sum as isize - se.avg.runnable_sum as isize;
@@ -1286,7 +1328,11 @@ impl CfsRunQueue {
             .max((self.avg.runnable_avg * PELT_MIN_DIVIDER) as u64);
     }
 
-    pub fn update_task_group_load(&mut self, se: Arc<FairSchedEntity>, gcfs_rq: &mut CfsRunQueue) {
+    pub fn update_task_group_load(
+        &mut self,
+        se: Arc<FairSchedEntity>,
+        gcfs_rq: &mut CfsRunQueueInner,
+    ) {
         let mut runnable_sum = gcfs_rq.prop_runnable_sum;
 
         let mut load_sum = 0;
@@ -1324,7 +1370,7 @@ impl CfsRunQueue {
         let delta_sum = load_sum as isize
             - LoadWeight::scale_load_down(se.load.weight) as isize * se.avg.load_sum as isize;
 
-        let se = se.force_mut();
+        let se = se.force_get_mut();
         se.avg.load_sum = runnable_sum as u64;
         se.avg.load_avg = load_avg as usize;
 
@@ -1393,7 +1439,7 @@ impl CompletelyFairScheduler {
 
 impl Scheduler for CompletelyFairScheduler {
     fn enqueue(
-        rq: &mut CpuRunQueue,
+        rq: &mut CpuRunQueueInner,
         pcb: Arc<crate::process::ProcessControlBlock>,
         mut flags: EnqueueFlag,
     ) {
@@ -1405,7 +1451,7 @@ impl Scheduler for CompletelyFairScheduler {
             }
 
             let binding = se.cfs_rq();
-            let cfs_rq = binding.force_mut();
+            let cfs_rq = binding.force_get_mut();
             cfs_rq.enqueue_entity(&se, flags);
 
             cfs_rq.h_nr_running += 1;
@@ -1429,11 +1475,11 @@ impl Scheduler for CompletelyFairScheduler {
         if let Some(mut se) = se {
             FairSchedEntity::for_each_in_group(&mut se, |se| {
                 let binding = se.cfs_rq();
-                let cfs_rq = binding.force_mut();
+                let cfs_rq = binding.force_get_mut();
 
                 cfs_rq.update_load_avg(&se, UpdateAvgFlags::UPDATE_TG);
 
-                let se = se.force_mut();
+                let se = se.force_get_mut();
                 se.update_runnable();
 
                 se.update_cfs_group();
@@ -1455,7 +1501,7 @@ impl Scheduler for CompletelyFairScheduler {
     }
 
     fn dequeue(
-        rq: &mut CpuRunQueue,
+        rq: &mut CpuRunQueueInner,
         pcb: Arc<crate::process::ProcessControlBlock>,
         mut flags: DequeueFlag,
     ) {
@@ -1466,7 +1512,7 @@ impl Scheduler for CompletelyFairScheduler {
 
         let (should_continue, se) = FairSchedEntity::for_each_in_group(&mut se, |se| {
             let binding = se.cfs_rq();
-            let cfs_rq = binding.force_mut();
+            let cfs_rq = binding.force_get_mut();
             cfs_rq.dequeue_entity(&se, flags);
 
             cfs_rq.h_nr_running -= 1;
@@ -1498,11 +1544,11 @@ impl Scheduler for CompletelyFairScheduler {
         if let Some(mut se) = se {
             FairSchedEntity::for_each_in_group(&mut se, |se| {
                 let binding = se.cfs_rq();
-                let cfs_rq = binding.force_mut();
+                let cfs_rq = binding.force_get_mut();
 
                 cfs_rq.update_load_avg(&se, UpdateAvgFlags::UPDATE_TG);
 
-                let se = se.force_mut();
+                let se = se.force_get_mut();
                 se.update_runnable();
 
                 se.update_cfs_group();
@@ -1527,11 +1573,11 @@ impl Scheduler for CompletelyFairScheduler {
         }
     }
 
-    fn yield_task(rq: &mut CpuRunQueue) {
+    fn yield_task(rq: &mut CpuRunQueueInner) {
         let curr = rq.current();
         let se = curr.sched_info().sched_entity();
         let binding = se.cfs_rq();
-        let cfs_rq = binding.force_mut();
+        let cfs_rq = binding.force_get_mut();
 
         if unlikely(rq.nr_running == 1) {
             return;
@@ -1545,11 +1591,11 @@ impl Scheduler for CompletelyFairScheduler {
 
         rq.clock_updata_flags |= ClockUpdataFlag::RQCF_REQ_SKIP;
 
-        se.force_mut().deadline += se.calculate_delta_fair(se.slice);
+        se.force_get_mut().deadline += se.calculate_delta_fair(se.slice);
     }
 
     fn check_preempt_currnet(
-        rq: &mut CpuRunQueue,
+        rq: &mut CpuRunQueueInner,
         pcb: &Arc<crate::process::ProcessControlBlock>,
         wake_flags: WakeupFlags,
     ) {
@@ -1575,7 +1621,7 @@ impl Scheduler for CompletelyFairScheduler {
                     return (false, true);
                 }
 
-                se.cfs_rq().force_mut().next = Arc::downgrade(&se);
+                se.cfs_rq().force_get_mut().next = Arc::downgrade(&se);
 
                 return (true, true);
             });
@@ -1616,7 +1662,7 @@ impl Scheduler for CompletelyFairScheduler {
         }
 
         let cfs_rq = se.cfs_rq();
-        cfs_rq.force_mut().update_current();
+        cfs_rq.force_get_mut().update_current();
 
         if let Some((_, pick_se)) = cfs_rq.entities.get_first() {
             if Arc::ptr_eq(pick_se, &pse) {
@@ -1634,8 +1680,8 @@ impl Scheduler for CompletelyFairScheduler {
 
         let mut se;
         loop {
-            let cfs = cfs_rq.unwrap();
-            let cfs = cfs.force_mut();
+            let cfs = cfs_rq.clone().unwrap();
+            let cfs = cfs.force_get_mut();
             let curr = cfs.current();
             if let Some(curr) = curr {
                 if curr.on_rq() {
@@ -1647,7 +1693,7 @@ impl Scheduler for CompletelyFairScheduler {
 
             se = cfs.pick_next_entity();
             match se.clone() {
-                Some(val) => cfs_rq = val.my_cfs_rq.clone(),
+                Some(val) => cfs_rq.clone_from(&val.my_cfs_rq),
                 None => {
                     break;
                 }
@@ -1661,13 +1707,17 @@ impl Scheduler for CompletelyFairScheduler {
         se.map(|se| se.pcb())
     }
 
-    fn tick(_rq: &mut CpuRunQueue, pcb: Arc<crate::process::ProcessControlBlock>, queued: bool) {
+    fn tick(
+        _rq: &mut CpuRunQueueInner,
+        pcb: Arc<crate::process::ProcessControlBlock>,
+        queued: bool,
+    ) {
         let mut se = pcb.sched_info().sched_entity();
 
         FairSchedEntity::for_each_in_group(&mut se, |se| {
             let binding = se.clone();
             let binding = binding.cfs_rq();
-            let cfs_rq = binding.force_mut();
+            let cfs_rq = binding.force_get_mut();
 
             cfs_rq.entity_tick(se, queued);
             (true, true)
@@ -1683,7 +1733,7 @@ impl Scheduler for CompletelyFairScheduler {
         rq.update_rq_clock();
 
         let binding = se.cfs_rq();
-        let cfs_rq = binding.force_mut();
+        let cfs_rq = binding.force_get_mut();
 
         if cfs_rq.current().is_some() {
             cfs_rq.update_current();
@@ -1693,7 +1743,7 @@ impl Scheduler for CompletelyFairScheduler {
     }
 
     fn pick_next_task(
-        rq: &mut CpuRunQueue,
+        rq: &mut CpuRunQueueInner,
         prev: Option<Arc<ProcessControlBlock>>,
     ) -> Option<Arc<ProcessControlBlock>> {
         let mut cfs_rq = rq.cfs_rq();
@@ -1719,7 +1769,7 @@ impl Scheduler for CompletelyFairScheduler {
                     None => return None,
                 }
 
-                cfs_rq.force_mut().set_next_entity(&se);
+                cfs_rq.force_get_mut().set_next_entity(&se);
 
                 match &se.my_cfs_rq {
                     Some(q) => cfs_rq = q.clone(),
@@ -1738,9 +1788,9 @@ impl Scheduler for CompletelyFairScheduler {
                 let curr = cfs_rq.current();
                 if let Some(current) = curr {
                     if current.on_rq() {
-                        cfs_rq.force_mut().update_current()
+                        cfs_rq.force_get_mut().update_current()
                     } else {
-                        cfs_rq.force_mut().set_current(Weak::default());
+                        cfs_rq.force_get_mut().set_current(Weak::default());
                     }
                 }
 
@@ -1768,18 +1818,18 @@ impl Scheduler for CompletelyFairScheduler {
                     let pse_depth = pse.depth;
 
                     if se_depth <= pse_depth {
-                        pse.cfs_rq().force_mut().put_prev_entity(pse.clone());
+                        pse.cfs_rq().force_get_mut().put_prev_entity(pse.clone());
                         pse = pse.parent().unwrap();
                     }
 
                     if se_depth >= pse_depth {
-                        se.cfs_rq().force_mut().set_next_entity(&se);
+                        se.cfs_rq().force_get_mut().set_next_entity(&se);
                         se = se.parent().unwrap();
                     }
                 }
 
-                cfs_rq.force_mut().put_prev_entity(pse);
-                cfs_rq.force_mut().set_next_entity(&se);
+                cfs_rq.force_get_mut().put_prev_entity(pse);
+                cfs_rq.force_get_mut().set_next_entity(&se);
             }
 
             return Some(p);
@@ -1788,12 +1838,12 @@ impl Scheduler for CompletelyFairScheduler {
         }
     }
 
-    fn put_prev_task(_rq: &mut CpuRunQueue, prev: Arc<ProcessControlBlock>) {
+    fn put_prev_task(_rq: &mut CpuRunQueueInner, prev: Arc<ProcessControlBlock>) {
         let mut se = prev.sched_info().sched_entity();
 
         FairSchedEntity::for_each_in_group(&mut se, |se| {
             let cfs = se.cfs_rq();
-            cfs.force_mut().put_prev_entity(se);
+            cfs.force_get_mut().put_prev_entity(se);
 
             return (true, true);
         });

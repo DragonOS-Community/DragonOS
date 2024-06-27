@@ -5,8 +5,8 @@ use alloc::sync::Arc;
 use crate::process::ProcessControlBlock;
 
 use super::{
-    fair::{CfsRunQueue, FairSchedEntity},
-    CpuRunQueue, LoadWeight, SchedPolicy, SCHED_CAPACITY_SCALE, SCHED_CAPACITY_SHIFT,
+    fair::{CfsRunQueueInner, FairSchedEntityInner},
+    CpuRunQueueInner, LoadWeight, SchedPolicy, SCHED_CAPACITY_SCALE, SCHED_CAPACITY_SHIFT,
 };
 
 const RUNNABLE_AVG_Y_N_INV: [u32; 32] = [
@@ -167,7 +167,7 @@ impl SchedulerAvg {
     pub fn post_init_entity_util_avg(pcb: &Arc<ProcessControlBlock>) {
         let se = pcb.sched_info().sched_entity();
         let cfs_rq = se.cfs_rq();
-        let sa = &mut se.force_mut().avg;
+        let sa = &mut se.force_get_mut().avg;
 
         // TODO: 这里和架构相关
         let cpu_scale = SCHED_CAPACITY_SCALE;
@@ -195,13 +195,13 @@ impl SchedulerAvg {
     }
 }
 
-impl CpuRunQueue {
+impl CpuRunQueueInner {
     pub fn rq_clock_pelt(&self) -> u64 {
         self.clock_pelt - self.lost_idle_time
     }
 }
 
-impl CfsRunQueue {
+impl CfsRunQueueInner {
     pub fn cfs_rq_clock_pelt(&self) -> u64 {
         if unlikely(self.throttled_count > 0) {
             return self.throttled_clock_pelt - self.throttled_clock_pelt_time;
@@ -214,8 +214,8 @@ impl CfsRunQueue {
     }
 }
 
-impl FairSchedEntity {
-    pub fn update_load_avg(&mut self, cfs_rq: &mut CfsRunQueue, now: u64) -> bool {
+impl FairSchedEntityInner {
+    pub fn update_load_avg(&mut self, cfs_rq: &mut CfsRunQueueInner, now: u64) -> bool {
         if self.avg.update_load_sum(
             now,
             self.on_rq as u32,

@@ -1,5 +1,3 @@
-use core::usize;
-
 use system_error::SystemError;
 
 use crate::syscall::Syscall;

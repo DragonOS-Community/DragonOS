@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use alloc::string::ToString;
 use core::cmp::Ordering;
 use core::intrinsics::unlikely;

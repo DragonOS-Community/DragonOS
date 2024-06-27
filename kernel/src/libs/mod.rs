@@ -19,6 +19,7 @@ pub mod rbtree;
 pub mod rwlock;
 pub mod semaphore;
 pub mod spinlock;
+pub mod unsafecell_wrapper;
 pub mod vec_cursor;
 #[macro_use]
 pub mod volatile;

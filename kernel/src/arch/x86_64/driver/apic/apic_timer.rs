@@ -156,6 +156,7 @@ impl LocalApicTimerIntrController {
         local_apic_timer.start_current();
     }
 
+    #[allow(dead_code)]
     pub(super) fn disable(&self) {
         let cpu_id = smp_get_processor_id();
         let local_apic_timer = local_apic_timer_instance_mut(cpu_id);

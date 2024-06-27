@@ -600,6 +600,7 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     }
 
     /// @brief 判断指定的虚拟地址是否正确（符合规范）
+    #[allow(dead_code)]
     fn virt_is_valid(virt: VirtAddr) -> bool;
 
     /// 获取内存管理初始化时，创建的第一个内核页表的地址

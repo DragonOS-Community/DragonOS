@@ -48,10 +48,9 @@ use crate::{
         VirtAddr,
     },
     net::socket::SocketInode,
-    sched::completion::Completion,
     sched::{
-        cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag, EnqueueFlag, OnRq, SchedMode,
-        WakeupFlags, __schedule,
+        completion::Completion, cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag,
+        EnqueueFlag, OnRq, SchedMode, SchedPolicy, WakeupFlags, __schedule,
     },
     smp::{
         core::smp_get_processor_id,
@@ -512,9 +511,9 @@ pub unsafe fn switch_finish_hook() {
 
 int_like!(Pid, AtomicPid, usize, AtomicUsize);
 
-impl ToString for Pid {
-    fn to_string(&self) -> String {
-        self.0.to_string()
+impl core::fmt::Display for Pid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -737,7 +736,7 @@ impl ProcessControlBlock {
 
         pcb.sched_info()
             .sched_entity()
-            .force_mut()
+            .force_get_mut()
             .set_pcb(Arc::downgrade(&pcb));
         // 设置进程的arc指针到内核栈和系统调用栈的最低地址处
         unsafe {
@@ -1133,7 +1132,7 @@ pub struct ProcessSchedulerInfo {
     // rt_time_slice: AtomicIsize,
     pub sched_stat: RwLock<SchedInfo>,
     /// 调度策略
-    pub sched_policy: RwLock<crate::sched::SchedPolicy>,
+    pub sched_policy: RwLock<SchedPolicy>,
     /// cfs调度实体
     pub sched_entity: Arc<FairSchedEntity>,
     pub on_rq: SpinLock<OnRq>,
@@ -1141,6 +1140,7 @@ pub struct ProcessSchedulerInfo {
     pub prio_data: RwLock<PrioData>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct SchedInfo {
     /// 记录任务在特定 CPU 上运行的次数
@@ -1153,6 +1153,7 @@ pub struct SchedInfo {
     pub last_queued: u64,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct PrioData {
     pub prio: i32,

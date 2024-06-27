@@ -71,7 +71,7 @@ impl ProcessManager {
             idle_pcb
                 .sched_info()
                 .sched_entity()
-                .force_mut()
+                .force_get_mut()
                 .set_cfs(Arc::downgrade(&rq.cfs_rq()));
 
             v.push(idle_pcb);

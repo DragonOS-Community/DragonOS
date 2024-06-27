@@ -7,8 +7,8 @@ use crate::{
     time::timer::schedule_timeout,
 };
 
-const COMPLETE_ALL: u32 = core::u32::MAX;
-const MAX_TIMEOUT: i64 = core::i64::MAX;
+const COMPLETE_ALL: u32 = u32::MAX;
+const MAX_TIMEOUT: i64 = i64::MAX;
 
 #[derive(Debug)]
 pub struct Completion {

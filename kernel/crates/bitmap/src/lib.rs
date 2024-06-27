@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(internal_features)]
 #![feature(core_intrinsics)]
 #![allow(incomplete_features)] // for const generics
 #![feature(generic_const_exprs)]

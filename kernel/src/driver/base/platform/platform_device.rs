@@ -64,6 +64,7 @@ pub trait PlatformDevice: Device {
     /// @brief: 判断设备是否初始化
     /// @parameter: None
     /// @return: 如果已经初始化，返回true，否则，返回false
+    #[allow(dead_code)]
     fn is_initialized(&self) -> bool;
 
     /// @brief: 设置设备状态

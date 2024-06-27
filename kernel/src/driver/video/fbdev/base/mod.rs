@@ -301,6 +301,7 @@ impl FrameBufferInfoData {
 }
 
 /// 帧缓冲区信息
+#[allow(dead_code)]
 pub trait FrameBufferInfo: FrameBufferOps {
     fn framebuffer_info_data(&self) -> &RwLock<FrameBufferInfoData>;
 
@@ -377,6 +378,7 @@ pub trait FrameBufferInfo: FrameBufferOps {
 /// 帧缓冲区操作
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/fb.h#237
+#[allow(dead_code)]
 pub trait FrameBufferOps {
     fn fb_open(&self, user: bool);
     fn fb_release(&self, user: bool);
@@ -1065,7 +1067,9 @@ pub enum FbAccel {
 
 #[derive(Debug, Copy, Clone)]
 pub struct BootTimeScreenInfo {
+    #[allow(dead_code)]
     pub origin_x: u8,
+    #[allow(dead_code)]
     pub origin_y: u8,
     /// text mode时，每行的字符数
     pub origin_video_cols: u8,

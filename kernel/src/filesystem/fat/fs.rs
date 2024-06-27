@@ -1472,6 +1472,16 @@ impl IndexNode for LockedFATInode {
     fn metadata(&self) -> Result<Metadata, SystemError> {
         return Ok(self.0.lock().metadata.clone());
     }
+    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
+        let inode = &mut self.0.lock();
+        inode.metadata.atime = metadata.atime;
+        inode.metadata.mtime = metadata.mtime;
+        inode.metadata.ctime = metadata.ctime;
+        inode.metadata.mode = metadata.mode;
+        inode.metadata.uid = metadata.uid;
+        inode.metadata.gid = metadata.gid;
+        Ok(())
+    }
     fn resize(&self, len: usize) -> Result<(), SystemError> {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();

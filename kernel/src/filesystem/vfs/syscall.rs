@@ -7,6 +7,7 @@ use log::warn;
 use system_error::SystemError;
 
 use crate::producefs;
+use crate::syscall::user_access::UserBufferReader;
 use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
     filesystem::vfs::{core as Vcore, file::FileDescriptorVec},
@@ -17,14 +18,14 @@ use crate::{
         user_access::{self, check_and_clone_cstr, UserBufferWriter},
         Syscall,
     },
-    time::PosixTimeSpec,
+    time::{syscall::PosixTimeval, PosixTimeSpec},
 };
 
 use super::{
     core::{do_mkdir_at, do_remove_dir, do_unlink_at},
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
-    open::{do_faccessat, do_fchmodat, do_sys_open},
+    open::{do_faccessat, do_fchmodat, do_sys_open, do_utimensat, do_utimes},
     utils::{rsplit_path, user_path_at},
     Dirent, FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
@@ -320,6 +321,13 @@ bitflags! {
         const STATX_ATTR_VERITY = 0x00100000;
         /// 文件当前处于 DAX 状态 CPU直接访问
         const STATX_ATTR_DAX = 0x00200000;
+    }
+}
+
+bitflags! {
+    pub struct UtimensFlags: u32 {
+        /// 不需要解释符号链接
+        const AT_SYMLINK_NOFOLLOW = 0x100;
     }
 }
 
@@ -1619,6 +1627,44 @@ impl Syscall {
             UmountFlag::from_bits(flags).ok_or(SystemError::EINVAL)?,
         )?;
         return Ok(());
+    }
+
+    pub fn sys_utimensat(
+        dirfd: i32,
+        pathname: *const u8,
+        times: *const PosixTimeSpec,
+        flags: u32,
+    ) -> Result<usize, SystemError> {
+        let pathname = if pathname.is_null() {
+            None
+        } else {
+            let pathname = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?;
+            Some(pathname)
+        };
+        let flags = UtimensFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
+        let times = if times.is_null() {
+            None
+        } else {
+            let times_reader = UserBufferReader::new(times, size_of::<PosixTimeSpec>() * 2, true)?;
+            let times = times_reader.read_from_user::<PosixTimeSpec>(0)?;
+            Some([times[0], times[1]])
+        };
+        do_utimensat(dirfd, pathname, times, flags)
+    }
+
+    pub fn sys_utimes(
+        pathname: *const u8,
+        times: *const PosixTimeval,
+    ) -> Result<usize, SystemError> {
+        let pathname = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?;
+        let times = if times.is_null() {
+            None
+        } else {
+            let times_reader = UserBufferReader::new(times, size_of::<PosixTimeval>() * 2, true)?;
+            let times = times_reader.read_from_user::<PosixTimeval>(0)?;
+            Some([times[0], times[1]])
+        };
+        do_utimes(&pathname, times)
     }
 }
 

@@ -15,7 +15,7 @@ use crate::{
 use super::{
     event_poll::{EPollEventType, EventPoll},
     socket::{
-        handle::GlobalSocketHandle, inet::TcpSocket, netlink::af_netlink::SkBuff, HANDLE_MAP,
+        handle::GlobalSocketHandle, inet::TcpSocket, netlink::skbuff::SkBuff, HANDLE_MAP,
         SOCKET_SET,
     },
 };

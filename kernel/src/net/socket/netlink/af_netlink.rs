@@ -7,14 +7,12 @@
 //     obj_size: std::mem::size_of::<netlink_sock>(),
 // };
 
-macro_rules! container_of {
-    ($ptr:expr, $type:ty, $($f:tt)*) => { ... };
-}
 
-use core::{cell::RefCell, fmt::Debug, hash::Hash, ops::Deref};
+use core::{any::Any, cell::RefCell, fmt::Debug, hash::Hash, ops::Deref};
 
 use alloc::sync::Arc;
 
+use num::Zero;
 use system_error::SystemError;
 
 use crate::{
@@ -22,12 +20,15 @@ use crate::{
     net::{net_core::consume_skb, socket::SocketType},
     syscall::Syscall,
 };
+use crate::net::socket::netlink::skbuff::SkBuff;
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::net::socket::Socket;
 use lazy_static::lazy_static;
 use smoltcp::socket::raw::PacketBuffer;
 use smoltcp::socket::raw::PacketMetadata;
+
+use super::skbuff::{netlink_overrun, skb_orphan, skb_shared, sock_put};
 
 // Flags constants
 bitflags! {
@@ -51,14 +52,7 @@ pub struct SockaddrNl {
     pub nl_groups: u32,
 }
 
-trait NetlinkSocket {
-    fn send(&self, msg: &[u8]) -> Result<(), SystemError>;
-    fn recv(&self) -> Result<Vec<u8>, SystemError>;
-    fn bind(&self) -> Result<(), SystemError>;
-    fn unbind(&self) -> Result<(), SystemError>;
-    fn register(&self, listener: Box<dyn NetlinkMessageHandler>);
-    fn unregister(&self, listener: Box<dyn NetlinkMessageHandler>);
-}
+
 
 pub struct HListHead<T> {
     first: Option<Box<HListNode<T>>>,
@@ -244,53 +238,28 @@ enum Error {
     SocketTypeNotSupported,
     ProtocolNotSupported,
 }
-#[derive(PartialEq)]
-pub struct sock {
-    sk_protocol: usize,
-    sk_family: i32,
-    sk_state: i32,
-    sk_flags: u32,
-    sk_type: SocketType,
-    // sk_prot: dyn proto,
-    // sk_net: Net,
-    sk_bound_dev_if: i32,
-}
-pub trait socktrait {
-    fn sk(&self) -> &sock;
+
+// netlink机制特定的内核抽象，不同于标准的trait Socket
+pub trait NetlinkSocket :Sync + Send + Debug + Any{
     // fn sk_prot(&self) -> &dyn proto;
     fn sk_family(&self) -> i32;
     fn sk_state(&self) -> i32;
     fn sk_protocol(&self) -> usize;
     fn is_kernel(&self) -> bool;
-}
-impl socktrait for sock {
-    fn sk(&self) -> &sock {
-        self
-    }
-    // fn sk_prot(&self) -> &dyn proto;
-    fn sk_family(&self) -> i32 {
-        0
-    }
-    fn sk_state(&self) -> i32 {
-        0
-    }
-    fn sk_protocol(&self) -> usize {
-        self.sk_protocol
-    }
-    fn is_kernel(&self) -> bool {
-        true
-    }
+    fn equals(&self, other: &dyn NetlinkSocket) -> bool;
 }
 
+
 /* linux：struct sock has to be the first member of netlink_sock */
+#[derive(Debug)]
 pub struct NetlinkSock {
-    sk: sock,
+    sk: Box<dyn NetlinkSocket>,
     portid: u32,
     dst_portid: u32,
     dst_group: u32,
     flags: u32,
     subscriptions: u32,
-    ngroups: u32,
+    ngroups: u64,
     groups: Vec<u64>,
     state: u64,
     max_recvmsg_len: usize,
@@ -298,10 +267,7 @@ pub struct NetlinkSock {
     cb_running: bool,
 }
 
-impl socktrait for NetlinkSock {
-    fn sk(&self) -> &sock {
-        &self.sk
-    }
+impl NetlinkSocket for NetlinkSock {
     fn sk_family(&self) -> i32 {
         0
     }
@@ -313,6 +279,47 @@ impl socktrait for NetlinkSock {
     }
     fn is_kernel(&self) -> bool {
         true
+    }
+    fn equals(&self, other: &dyn NetlinkSocket) -> bool {
+        // compare the fields of self and other
+        // use the equals method to compare the NetlinkSocket objects
+        self.sk.equals(&*other)
+    }
+}
+impl PartialEq for NetlinkSock {
+    fn eq(&self, other: &Self) -> bool {
+        // compare the fields of self and other
+        // use the equals method to compare the NetlinkSocket objects
+        self.sk.equals(&*other.sk)
+    }
+}
+
+impl NetlinkSock {
+    fn send(&self, msg: &[u8]) -> Result<(), SystemError>{
+        // Implementation of the function
+        Ok(())
+    }
+
+    fn recv(&self) -> Result<Vec<u8>, SystemError> {
+        // Implementation of the function
+        Ok(Vec::new())
+    }
+
+    fn bind(&self) -> Result<(), SystemError> {
+        // Implementation of the function
+        Ok(())
+    }
+
+    fn unbind(&self) -> Result<(), SystemError> {
+        // Implementation of the function
+        Ok(())
+    }
+
+    fn register(&self, listener: Box<dyn NetlinkMessageHandler>) {
+        // Implementation of the function
+    }
+    fn unregister(&self, listener: Box<dyn NetlinkMessageHandler>) {
+        // Implementation of the function
     }
 }
 
@@ -375,46 +382,21 @@ impl listeners {
 lazy_static! {
     static ref NL_TABLE: RwLock<Vec<NetlinkTable>> = RwLock::new(vec![NetlinkTable::new()]);
 }
-pub fn netlink_has_listeners(sk: &sock, group: u32) -> i32 {
+pub fn netlink_has_listeners(sk: &NetlinkSock, group: u32) -> i32 {
     let mut res = 0;
     let nl_table = NL_TABLE.read();
-    if let Some(listeners) = &nl_table[sk.sk_protocol].listeners {
-        if group - 1 < nl_table[sk.sk_protocol].groups {
+    if let Some(listeners) = &nl_table[sk.sk_protocol()].listeners {
+        if group - 1 < nl_table[sk.sk_protocol()].groups {
             res = listeners.masks[group as usize - 1] as i32;
         }
     }
     res
 }
-pub struct SkBuff<'a> {
-    inner: PacketBuffer<'a>,
-}
-
-impl<'a> SkBuff<'a> {
-    pub fn new() -> Self {
-        Self {
-            inner: PacketBuffer::new(vec![PacketMetadata::EMPTY; 666], vec![0; 666]),
-        }
-    }
-    pub fn inner(&self) -> &PacketBuffer<'a> {
-        &self.inner
-    }
-    pub fn inner_mut(&mut self) -> &mut PacketBuffer<'a> {
-        &mut self.inner
-    }
-    pub fn clone_with_new_inner(&self) -> Self {
-        Self {
-            inner: PacketBuffer::new(vec![PacketMetadata::EMPTY; 666], vec![0; 666]),
-        }
-    }
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-}
 struct NetlinkBroadcastData<'a> {
-    exclude_sk: &'a sock,
+    exclude_sk: NetlinkSock,
     // net: &'a Net,
     portid: u32,
-    group: u32,
+    group: u64,
     failure: i32,
     delivery_failure: i32,
     congested: i32,
@@ -429,11 +411,11 @@ impl<'a> NetlinkBroadcastData<'a> {
         *self.skb_2.borrow_mut() = skb;
     }
 }
-fn sk_for_each_bound(sk: &sock, mc_list: &HListHead<NetlinkSock>) {
+fn sk_for_each_bound(sk: &NetlinkSock, mc_list: &HListHead<NetlinkSock>) {
     let mut node = mc_list.first.as_ref();
     while let Some(n) = node {
         let data = &n.data;
-        if data.sk.sk_protocol == sk.sk_protocol {
+        if data.sk.sk_protocol() == sk.sk_protocol() {
             // Implementation of the function
         }
         node = n.next.as_ref();
@@ -513,15 +495,14 @@ out:
     sock_put(sk);
 }
 */
-fn do_one_broadcast(sk: &sock, info: &NetlinkBroadcastData) {
+fn do_one_broadcast(sk: NetlinkSock, info: NetlinkBroadcastData) {
     let mut sk = sk;
     let mut info = info;
-    let ret: i32;
-    let nlk:NetlinkSock = NetlinkSock::from_sk(sk);
+    let ret: i32;;
     if info.exclude_sk == sk {
         return;
     }
-    if nlk.portid == info.portid || info.group - 1 >= nlk.ngroups || !nlk.groups.contains(&(info.group - 1)) {
+    if sk.portid == info.portid || info.group - 1 >= sk.ngroups || !sk.groups.contains(&(info.group - 1)) {
         return;
     }
     // if !net_eq(sock_net(sk), info.net) {
@@ -536,10 +517,11 @@ fn do_one_broadcast(sk: &sock, info: &NetlinkBroadcastData) {
     //     }
     // }
     if info.failure != 0 {
-        netlink_overrun(sk);
+        netlink_overrun(&sk);
         return;
     }
-    sock_hold(sk);
+    // 增加引用计数
+    // sock_hold(sk);
     if info.skb_2.borrow().is_empty() {
         if skb_shared(info.skb) {
             info.copy_skb_to_skb_2();
@@ -549,25 +531,28 @@ fn do_one_broadcast(sk: &sock, info: &NetlinkBroadcastData) {
         }
     }
     if info.skb_2.borrow().is_empty() {
-        netlink_overrun(sk);
+        netlink_overrun(&sk);
         info.failure = 1;
-        if nlk.flags & NetlinkFlags::BROADCAST_SEND_ERROR.bits() {
+        if !sk.flags.is_zero() & !NetlinkFlags::BROADCAST_SEND_ERROR.bits().is_zero() {
             info.delivery_failure = 1;
         }
+        // out:
         return;
     }
-    if sk_filter(sk, info.skb_2) {
+    if sk_filter(&sk, info.skb_2) {
         info.skb_2 = info.skb.clone();
+        // out：
         return;
     }
-    NETLINK_CB(info.skb_2).nsid = peernet2id(sock_net(sk), info.net);
-    if NETLINK_CB(info.skb_2).nsid != NETNSA_NSID_NOT_ASSIGNED {
-        NETLINK_CB(info.skb_2).nsid_is_set = true;
-    }
-    ret = netlink_broadcast_deliver(sk, info.skb_2);
+    // peernet2id用于检索与给定网络(net)相关联的对等网络(peer)的ID
+    // NETLINK_CB(info.skb_2).nsid = peernet2id(sock_net(sk), info.net);
+    // if NETLINK_CB(info.skb_2).nsid != NETNSA_NSID_NOT_ASSIGNED {
+    //     NETLINK_CB(info.skb_2).nsid_is_set = true;
+    // }
+    ret = netlink_broadcast_deliver(&sk, info.skb_2);
     if ret < 0 {
-        netlink_overrun(sk);
-        if nlk.flags & NetlinkFlags::BROADCAST_SEND_ERROR.bits() {
+        netlink_overrun(&sk);
+        if !sk.flags.is_zero() & !NetlinkFlags::BROADCAST_SEND_ERROR.bits().is_zero() {
             info.delivery_failure = 1;
         }
     } else {
@@ -575,13 +560,13 @@ fn do_one_broadcast(sk: &sock, info: &NetlinkBroadcastData) {
         info.delivered = 1;
         info.skb_2 = info.skb.clone();
     }
-    sock_put(sk);
+    sock_put(&sk);
 }
 pub fn netlink_broadcast<'a>(
-    ssk: &'a sock,
+    ssk: NetlinkSock,
     skb: Arc<RefCell<SkBuff<'a>>>,
     portid: u32,
-    group: u32,
+    group: u64,
     allocation: u32,
 ) -> Result<(), SystemError> {
     // let net = sock_net(ssk);
@@ -601,8 +586,8 @@ pub fn netlink_broadcast<'a>(
 
     // While we sleep in clone, do not allow to change socket list
     let nl_table = NL_TABLE.read();
-    for sk in &mut nl_table[ssk.sk_protocol].mc_list.iter() {
-        do_one_broadcast(sk.sk(), &info);
+    for sk in &mut nl_table[ssk.sk_protocol()].mc_list.iter() {
+        do_one_broadcast(*sk, info);
     }
 
     consume_skb(info.skb);
@@ -622,25 +607,16 @@ pub fn netlink_broadcast<'a>(
     return Err(SystemError::ESRCH);
 }
 
-fn netlink_overrun(sk: &sock) {
-    // Implementation of the function
-}
 
-fn skb_shared(skb: Arc<RefCell<SkBuff>>) -> bool {
+
+// 对网络套接字(sk)和网络数据包(skb)进行过滤。
+fn sk_filter(sk: &NetlinkSock, skb: Arc<RefCell<SkBuff>>) -> bool {
     // Implementation of the function
     false
 }
 
-fn skb_orphan(skb: Arc<RefCell<SkBuff>>) {
+// 处理Netlink套接字的广播消息传递
+fn netlink_broadcast_deliver(sk: &NetlinkSock, skb: Arc<RefCell<SkBuff>>) -> i32 {
     // Implementation of the function
-}
-
-fn skb_clone(skb: Arc<RefCell<SkBuff>>, allocation: u32) -> Arc<RefCell<SkBuff>> {
-    // Implementation of the function
-    Arc::new(RefCell::new(SkBuff::new()))
-}
-
-fn skb_get(skb: Arc<RefCell<SkBuff>>) -> Arc<RefCell<SkBuff>> {
-    // Implementation of the function
-    Arc::new(RefCell::new(SkBuff::new()))
+    0
 }

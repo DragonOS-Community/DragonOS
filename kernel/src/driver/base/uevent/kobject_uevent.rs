@@ -31,7 +31,7 @@ Function
     kobject_uevent_net_broadcast    √
     uevent_net_broadcast
     uevent_net_broadcast_tagged
-    uevent_net_broadcast_untagged
+    uevent_net_broadcast_untagged √
     uevent_net_exit
     uevent_net_init
     uevent_net_rcv
@@ -51,11 +51,10 @@ use super::{UEVENT_BUFFER_SIZE, UEVENT_NUM_ENVP};
 use crate::driver::base::kobject::{KObjectManager, KObjectState};
 use crate::libs::mutex::Mutex;
 use crate::net::net_core::consume_skb;
-use crate::net::socket::netlink::af_netlink::netlink_broadcast;
+use crate::net::socket::netlink::af_netlink::{netlink_broadcast, NetlinkSock};
 use crate::net::socket::netlink::af_netlink::netlink_has_listeners;
-use crate::net::socket::netlink::af_netlink::sock;
-use crate::net::socket::netlink::af_netlink::socktrait;
-use crate::net::socket::netlink::af_netlink::SkBuff;
+use crate::net::socket::netlink::af_netlink::NetlinkSocket;
+use crate::net::socket::netlink::skbuff::SkBuff;
 use crate::net::socket::Socket;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -81,28 +80,21 @@ pub static UEVENT_SUPPRESS: i32 = 1;
 
 // to be adjust
 pub const BUFFERSIZE: usize = 666;
+#[derive(Debug)]
 pub struct ListHead {
     next: Option<Box<ListHead>>,
     prev: Option<Box<ListHead>>,
 }
 // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c#38
+#[derive(Debug)]
 pub struct UeventSock {
+    netlinksock:NetlinkSock,
     list: Vec<ListHead>,
-    sk: sock,
 }
 impl UeventSock {
-    fn new(sk: sock) -> Self {
-        Self {
-            list: Vec::new(),
-            sk,
-        }
-    }
 }
 
-impl socktrait for UeventSock {
-    fn sk(&self) -> &sock {
-        &self.sk
-    }
+impl NetlinkSocket for UeventSock {
     fn sk_family(&self) -> i32 {
         0
     }
@@ -114,6 +106,10 @@ impl socktrait for UeventSock {
     }
     fn is_kernel(&self) -> bool {
         true
+    }
+    fn equals(&self, other: &dyn NetlinkSocket) -> bool {
+        false
+    
     }
 }
 // static const char *kobject_actions[] = {
@@ -433,7 +429,7 @@ fn zap_modalias_env(env: &mut Box<KobjUeventEnv>) {
 }
 
 // 用于处理网络相关的uevent（通用事件）广播
-
+// https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c#381
 pub fn kobject_uevent_net_broadcast(
     kobj: &dyn KObject,
     env: &KobjUeventEnv,
@@ -504,7 +500,7 @@ pub fn uevent_net_broadcast_untagged(
 
     // 发送uevent message
     for ue_sk in &uevent_sock_list {
-        let uevent_sock = &ue_sk.sk;
+        let uevent_sock = &ue_sk.netlinksock;
         if !(netlink_has_listeners(uevent_sock, 1) != 0) {
             continue;
         }
@@ -517,7 +513,7 @@ pub fn uevent_net_broadcast_untagged(
             }
         }
 
-        retval = match netlink_broadcast(uevent_sock, get_packet_buffer(skb.clone()), 0, 1, 1) {
+        retval = match netlink_broadcast(*uevent_sock, get_packet_buffer(skb.clone()), 0, 1, 1) {
             Ok(_) => 0,
             Err(err) => err.to_posix_errno(),
         };

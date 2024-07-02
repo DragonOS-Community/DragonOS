@@ -5,11 +5,12 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use hashbrown::HashMap;
 use log::error;
 use system_error::SystemError;
+use xarray::XArray;
 
 use crate::{
+    arch::MMArch,
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
         tty::tty_device::TtyFilePrivateData,
@@ -17,7 +18,7 @@ use crate::{
     filesystem::procfs::ProcfsFilePrivateData,
     ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
     libs::{rwlock::RwLock, spinlock::SpinLock},
-    mm::{page::Page, PhysAddr},
+    mm::{page::Page, MemoryManagementArch, PhysAddr},
     net::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
         socket::SocketInode,
@@ -122,25 +123,43 @@ impl FileMode {
 }
 
 #[allow(dead_code)]
-#[derive(Debug)]
 pub struct PageCache {
-    map: RwLock<HashMap<usize, PhysAddr>>,
+    xarray: SpinLock<XArray<Arc<PhysAddr>>>,
+}
+
+impl core::fmt::Debug for PageCache {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PageCache")
+            .field(
+                "xarray",
+                &self
+                    .xarray
+                    .lock()
+                    .range(0..((MMArch::PAGE_ADDRESS_SIZE >> MMArch::PAGE_SHIFT) as u64))
+                    .map(|(_, r)| **r)
+                    .collect::<Vec<PhysAddr>>(),
+            )
+            .finish()
+    }
 }
 
 impl PageCache {
     pub fn new() -> PageCache {
         Self {
-            map: RwLock::new(HashMap::new()),
+            xarray: SpinLock::new(XArray::new()),
         }
     }
 
     pub fn add_page(&self, offset: usize, page_phys_address: PhysAddr) {
-        self.map.write().insert(offset, page_phys_address);
+        let mut guard = self.xarray.lock();
+        let mut cursor = guard.cursor_mut(offset as u64);
+        cursor.store(Arc::new(page_phys_address));
     }
 
     pub fn get_page(&self, offset: usize) -> Option<PhysAddr> {
-        let guard = self.map.read();
-        let phys = guard.get(&offset).cloned();
+        let mut guard = self.xarray.lock();
+        let mut cursor = guard.cursor_mut(offset as u64);
+        let phys = cursor.load().map(|r| **r);
         phys
     }
 

@@ -54,7 +54,7 @@ uefi-raw = "=0.5.0"
 paste = "=1.0.14"
 slabmalloc = { path = "crates/rust-slabmalloc" }
 log = "0.4.21"
-
+xarray = "0.1.0"
 
 # target为x86_64时，使用下面的依赖
 [target.'cfg(target_arch = "x86_64")'.dependencies]

@@ -1,5 +1,5 @@
 use core::cell::RefCell;
-
+use alloc::rc::Rc;
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
 use log::{debug, info, warn};
 use smoltcp::{socket::dhcpv4, wire};
@@ -253,7 +253,7 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
 // proto_unregister
 
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/core/skbuff.c#1027
-pub fn consume_skb(skb: Arc<RefCell<SkBuff>>) {
+pub fn consume_skb(skb: Rc<RefCell<SkBuff>>) {
     // 释放skb
     drop(skb);
 }

@@ -1,11 +1,10 @@
 use core::cell::RefCell;
 
-use alloc::sync::Arc;
+
+use alloc::rc::Rc;
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata};
 
 use super::af_netlink::NetlinkSock;
-
-
 pub struct SkBuff<'a> {
     inner: PacketBuffer<'a>,
 }
@@ -38,7 +37,7 @@ pub fn netlink_overrun(sk: &NetlinkSock) {
 }
 
 // 用于检查网络数据包(skb)是否被共享
-pub fn skb_shared(skb: Arc<RefCell<SkBuff>>) -> bool {
+pub fn skb_shared(skb: &Rc<RefCell<SkBuff>>) -> bool {
     // Implementation of the function
     false
 }
@@ -46,20 +45,20 @@ pub fn skb_shared(skb: Arc<RefCell<SkBuff>>) -> bool {
 // 处理被孤儿化的网络数据包(skb)。
 // 孤儿化网络数据包意味着数据包不再与任何套接字关联，
 // 通常是因为发送数据包时指定了MSG_DONTWAIT标志，这告诉内核不要等待必要的资源（如内存），而是尽可能快地发送数据包。
-pub fn skb_orphan(skb: Arc<RefCell<SkBuff>>) {
+pub fn skb_orphan(skb: &Rc<RefCell<SkBuff>>) {
     // Implementation of the function
 }
 
 // 网络数据包(skb)的克隆操作
-pub fn skb_clone(skb: Arc<RefCell<SkBuff>>, allocation: u32) -> Arc<RefCell<SkBuff>> {
+pub fn skb_clone(skb: Rc<RefCell<SkBuff>>, allocation: u32) -> Rc<RefCell<SkBuff>> {
     // Implementation of the function
-    Arc::new(RefCell::new(SkBuff::new()))
+    Rc::new(RefCell::new(SkBuff::new()))
 }
 
 // 增加网络数据包(skb)的使用者计数
-pub fn skb_get(skb: Arc<RefCell<SkBuff>>) -> Arc<RefCell<SkBuff>> {
+pub fn skb_get(skb: Rc<RefCell<SkBuff>>) -> Rc<RefCell<SkBuff>> {
     // Implementation of the function
-    Arc::new(RefCell::new(SkBuff::new()))
+    Rc::new(RefCell::new(SkBuff::new()))
 }
 
 // 增加网络套接字(sk)的引用计数

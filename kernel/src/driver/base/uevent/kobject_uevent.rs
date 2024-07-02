@@ -1,4 +1,5 @@
 use core::cell::RefCell;
+use alloc::rc::Rc;
 use core::fmt::Write;
 // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c
 /*
@@ -42,7 +43,6 @@ Function
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use num::Zero;
-use smoltcp::socket::raw::PacketMetadata;
 
 use super::KObject;
 use super::KobjUeventEnv;
@@ -51,9 +51,9 @@ use super::{UEVENT_BUFFER_SIZE, UEVENT_NUM_ENVP};
 use crate::driver::base::kobject::{KObjectManager, KObjectState};
 use crate::libs::mutex::Mutex;
 use crate::net::net_core::consume_skb;
-use crate::net::socket::netlink::af_netlink::{netlink_broadcast, NetlinkSock};
 use crate::net::socket::netlink::af_netlink::netlink_has_listeners;
 use crate::net::socket::netlink::af_netlink::NetlinkSocket;
+use crate::net::socket::netlink::af_netlink::{netlink_broadcast, NetlinkSock};
 use crate::net::socket::netlink::skbuff::SkBuff;
 use crate::net::socket::Socket;
 use alloc::boxed::Box;
@@ -88,11 +88,10 @@ pub struct ListHead {
 // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c#38
 #[derive(Debug)]
 pub struct UeventSock {
-    netlinksock:NetlinkSock,
+    netlinksock: NetlinkSock,
     list: Vec<ListHead>,
 }
-impl UeventSock {
-}
+impl UeventSock {}
 
 impl NetlinkSocket for UeventSock {
     fn sk_family(&self) -> i32 {
@@ -109,7 +108,6 @@ impl NetlinkSocket for UeventSock {
     }
     fn equals(&self, other: &dyn NetlinkSocket) -> bool {
         false
-    
     }
 }
 // static const char *kobject_actions[] = {
@@ -201,7 +199,7 @@ pub fn kobject_uevent_env(
 
     /* skip the event, if the filter returns zero. */
     if kset.as_ref().unwrap().uevent_ops.is_some()
-        && kset.as_ref().unwrap().uevent_ops.as_ref().unwrap().filter() == None
+        && kset.as_ref().unwrap().uevent_ops.is_none()
     {
         log::info!("filter caused the event to drop!");
         return Ok(0);
@@ -461,7 +459,7 @@ pub fn kobject_uevent_net_broadcast(
     // if !net.is_none() {
     //     ret = uevent_net_broadcast_tagged(net.unwrap().sk, env, action_string, devpath);
     // } else {
-        ret = uevent_net_broadcast_untagged(env, action_string, devpath);
+    ret = uevent_net_broadcast_untagged(env, action_string, devpath);
     // }
     ret
 }
@@ -475,13 +473,13 @@ pub fn uevent_net_broadcast_tagged(
     let ret = 0;
     ret
 }
-static uevent_sock_list: Vec<UeventSock> = Vec::new();
+static UEVENT_SOCK_LIST: Vec<UeventSock> = Vec::new();
 pub fn alloc_uevent_skb<'a>(
     env: &'a KobjUeventEnv,
     action_string: &'a str,
     devpath: &'a str,
-) -> Arc<RefCell<SkBuff<'a>>> {
-    let skb = Arc::new(RefCell::new(SkBuff::new()));
+) -> Rc<RefCell<SkBuff<'a>>> {
+    let skb = Rc::new(RefCell::new(SkBuff::new()));
     skb
 }
 pub fn uevent_net_broadcast_untagged(
@@ -490,18 +488,18 @@ pub fn uevent_net_broadcast_untagged(
     devpath: &str,
 ) -> i32 {
     let mut retval = 0;
-    let skb = Arc::new(RefCell::new(SkBuff::new()));
+    let skb = Rc::new(RefCell::new(SkBuff::new()));
 
     // 模拟 skb_get 行为，增加引用并返回引用
-    fn get_packet_buffer(shared_skb: Arc<RefCell<SkBuff>>) -> Arc<RefCell<SkBuff>> {
+    fn get_packet_buffer(shared_skb: Rc<RefCell<SkBuff>>) -> Rc<RefCell<SkBuff>> {
         // Rc::clone 会增加内部引用计数
         shared_skb.clone()
     }
 
     // 发送uevent message
-    for ue_sk in &uevent_sock_list {
+    for ue_sk in &UEVENT_SOCK_LIST {
         let uevent_sock = &ue_sk.netlinksock;
-        if !(netlink_has_listeners(uevent_sock, 1) != 0) {
+        if netlink_has_listeners(uevent_sock, 1) == 0 {
             continue;
         }
 
@@ -513,10 +511,11 @@ pub fn uevent_net_broadcast_untagged(
             }
         }
 
-        retval = match netlink_broadcast(*uevent_sock, get_packet_buffer(skb.clone()), 0, 1, 1) {
-            Ok(_) => 0,
-            Err(err) => err.to_posix_errno(),
-        };
+        retval =
+            match netlink_broadcast(&ue_sk.netlinksock, get_packet_buffer(skb.clone()), 0, 1, 1) {
+                Ok(_) => 0,
+                Err(err) => err.to_posix_errno(),
+            };
 
         // ENOBUFS should be handled in userspace
         if retval == SystemError::ENOBUFS.to_posix_errno()

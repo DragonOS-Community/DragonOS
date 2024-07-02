@@ -12,6 +12,7 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
+    arch::mm::PageMapper,
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::ROOT_INODE,
     libs::{
@@ -19,11 +20,14 @@ use crate::{
         rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
+    mm::{fault::PageFaultMessage, VmFaultReason},
 };
 
 use super::{
-    file::FileMode, syscall::ModeType, utils::DName, FilePrivateData, FileSystem, FileType,
-    IndexNode, InodeId, Magic, SuperBlock,
+    file::{FileMode, PageCache},
+    syscall::ModeType,
+    utils::DName,
+    FilePrivateData, FileSystem, FileType, IndexNode, InodeId, Magic, SuperBlock,
 };
 
 const MOUNTFS_BLOCK_SIZE: u64 = 512;
@@ -520,6 +524,10 @@ impl IndexNode for MountFSInode {
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         return self.do_parent().map(|inode| inode as Arc<dyn IndexNode>);
     }
+
+    fn page_cache(&self) -> Option<Arc<PageCache>> {
+        self.inner_inode.page_cache()
+    }
 }
 
 impl FileSystem for MountFS {
@@ -546,6 +554,21 @@ impl FileSystem for MountFS {
     }
     fn super_block(&self) -> SuperBlock {
         SuperBlock::new(Magic::MOUNT_MAGIC, MOUNTFS_BLOCK_SIZE, MOUNTFS_MAX_NAMELEN)
+    }
+
+    unsafe fn fault(&self, pfm: &mut PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+        self.inner_filesystem.fault(pfm, mapper)
+    }
+
+    unsafe fn map_pages(
+        &self,
+        pfm: &mut PageFaultMessage,
+        mapper: &mut PageMapper,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
+        self.inner_filesystem
+            .map_pages(pfm, mapper, start_pgoff, end_pgoff)
     }
 }
 

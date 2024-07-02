@@ -172,3 +172,9 @@ impl TrapFrame {
         return (self.cs & 0x3) != 0;
     }
 }
+
+impl Default for TrapFrame {
+    fn default() -> Self {
+        Self::new()
+    }
+}

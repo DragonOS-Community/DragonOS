@@ -1,7 +1,7 @@
 use crate::arch::mm::LockedFrameAllocator;
 use crate::arch::mm::PageMapper;
 use crate::arch::MMArch;
-use crate::mm::page::PageFlags;
+use crate::mm::page::EntryFlags;
 use crate::mm::{PageTableKind, PhysAddr, VirtAddr};
 use crate::smp::core::smp_get_processor_id;
 use crate::smp::cpu::AtomicProcessorId;
@@ -92,7 +92,7 @@ impl EptMapper {
         &mut self,
         gpa: u64,
         hpa: u64,
-        flags: PageFlags<MMArch>,
+        flags: EntryFlags<MMArch>,
     ) -> Result<(), SystemError> {
         if self.readonly {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);

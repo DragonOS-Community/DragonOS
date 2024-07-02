@@ -7,8 +7,10 @@ use alloc::{
 };
 use log::error;
 use system_error::SystemError;
+use xarray::XArray;
 
 use crate::{
+    arch::MMArch,
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
         tty::tty_device::TtyFilePrivateData,
@@ -16,6 +18,7 @@ use crate::{
     filesystem::procfs::ProcfsFilePrivateData,
     ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
     libs::{rwlock::RwLock, spinlock::SpinLock},
+    mm::{page::Page, MemoryManagementArch, PhysAddr},
     net::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
         socket::SocketInode,
@@ -118,6 +121,70 @@ impl FileMode {
         return self.bits() & FileMode::O_ACCMODE.bits();
     }
 }
+
+#[allow(dead_code)]
+pub struct PageCache {
+    xarray: SpinLock<XArray<Arc<PhysAddr>>>,
+}
+
+impl core::fmt::Debug for PageCache {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PageCache")
+            .field(
+                "xarray",
+                &self
+                    .xarray
+                    .lock()
+                    .range(0..((MMArch::PAGE_ADDRESS_SIZE >> MMArch::PAGE_SHIFT) as u64))
+                    .map(|(_, r)| **r)
+                    .collect::<Vec<PhysAddr>>(),
+            )
+            .finish()
+    }
+}
+
+impl PageCache {
+    pub fn new() -> PageCache {
+        Self {
+            xarray: SpinLock::new(XArray::new()),
+        }
+    }
+
+    pub fn add_page(&self, offset: usize, page_phys_address: PhysAddr) {
+        let mut guard = self.xarray.lock();
+        let mut cursor = guard.cursor_mut(offset as u64);
+        cursor.store(Arc::new(page_phys_address));
+    }
+
+    pub fn get_page(&self, offset: usize) -> Option<PhysAddr> {
+        let mut guard = self.xarray.lock();
+        let mut cursor = guard.cursor_mut(offset as u64);
+        let phys = cursor.load().map(|r| **r);
+        phys
+    }
+
+    // pub fn get_pages(&self, start_pgoff: usize, end_pgoff: usize) -> Vec<Arc<Page>> {
+    //     let mut vec = Vec::new();
+    //     for pgoff in start_pgoff..=end_pgoff {
+    //         if let Some(page) = self.map.get(&pgoff) {
+    //             vec.push(page.clone());
+    //         }
+    //     }
+    //     vec
+    // }
+}
+
+impl Default for PageCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub trait PageCacheOperations: IndexNode {
+    fn write_page(&self, page: Page);
+    fn read_ahead(&self);
+}
+
 /// @brief 抽象文件结构体
 #[derive(Debug)]
 pub struct File {
@@ -643,9 +710,8 @@ impl FileDescriptorVec {
         self.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
 
         // 把文件描述符数组对应位置设置为空
-        let file = self.fds[fd as usize].take().unwrap();
+        self.fds[fd as usize].take().unwrap();
 
-        assert!(Arc::strong_count(&file) == 1);
         return Ok(());
     }
 

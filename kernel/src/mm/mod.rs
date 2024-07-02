@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use page::EntryFlags;
 use system_error::SystemError;
 
 use crate::{arch::MMArch, include::bindings::bindings::PAGE_OFFSET};
@@ -40,7 +41,7 @@ static mut __IDLE_PROCESS_ADDRESS_SPACE: Option<Arc<AddressSpace>> = None;
 bitflags! {
     /// Virtual memory flags
     #[allow(clippy::bad_bit_mask)]
-    pub struct VmFlags:u64{
+    pub struct VmFlags:usize{
         const VM_NONE = 0x00000000;
 
         const VM_READ = 0x00000001;
@@ -93,6 +94,26 @@ bitflags! {
         const VM_FAULT_NEEDDSYNC = 0x002000;
         const VM_FAULT_COMPLETED = 0x004000;
         const VM_FAULT_HINDEX_MASK = 0x0f0000;
+    }
+
+    pub struct MsFlags:usize {
+        const MS_ASYNC = 1;
+        const MS_INVALIDATE = 2;
+        const MS_SYNC = 4;
+    }
+}
+
+impl core::ops::Index<VmFlags> for [usize] {
+    type Output = usize;
+
+    fn index(&self, index: VmFlags) -> &Self::Output {
+        &self[index.bits]
+    }
+}
+
+impl core::ops::IndexMut<VmFlags> for [usize] {
+    fn index_mut(&mut self, index: VmFlags) -> &mut Self::Output {
+        &mut self[index.bits]
     }
 }
 
@@ -610,7 +631,7 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
 
     /// 创建页表项
     ///
-    /// 这是一个低阶api，用于根据物理地址以及指定好的pageflags，创建页表项
+    /// 这是一个低阶api，用于根据物理地址以及指定好的EntryFlags，创建页表项
     ///
     /// ## 参数
     ///
@@ -641,6 +662,43 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
         _foreign: bool,
     ) -> bool {
         true
+    }
+
+    const PAGE_NONE: usize;
+    const PAGE_SHARED: usize;
+    const PAGE_SHARED_EXEC: usize;
+    const PAGE_COPY_NOEXEC: usize;
+    const PAGE_COPY_EXEC: usize;
+    const PAGE_COPY: usize;
+    const PAGE_READONLY: usize;
+    const PAGE_READONLY_EXEC: usize;
+
+    const PAGE_READ: usize;
+    const PAGE_READ_EXEC: usize;
+    const PAGE_WRITE: usize;
+    const PAGE_WRITE_EXEC: usize;
+    const PAGE_EXEC: usize;
+
+    /// 获取保护标志的映射表
+    ///
+    ///
+    /// ## 返回值
+    /// - `[usize; 16]`: 长度为16的映射表
+    fn protection_map() -> [usize; 16] {
+        let map = [0; 16];
+        map
+    }
+
+    /// 页面保护标志转换函数
+    /// ## 参数
+    ///
+    /// - `vm_flags`: VmFlags标志
+    ///
+    /// ## 返回值
+    /// - EntryFlags: 页面的保护位
+    fn vm_get_page_prot(vm_flags: VmFlags) -> EntryFlags<Self> {
+        let map = Self::protection_map();
+        unsafe { EntryFlags::from_data(map[vm_flags]) }
     }
 }
 

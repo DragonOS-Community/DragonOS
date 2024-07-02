@@ -20,7 +20,7 @@ use crate::{
     libs::spinlock::SpinLock,
     mm::{
         allocator::page_frame::{PageFrameCount, PhysPageFrame, VirtPageFrame},
-        page::{page_manager_lock_irqsave, PageFlags, PageFlushAll},
+        page::{page_manager_lock_irqsave, EntryFlags, PageFlushAll},
         syscall::ProtFlags,
         ucontext::{AddressSpace, VMA},
         VirtAddr, VmFlags,
@@ -324,8 +324,8 @@ impl Syscall {
                     .ok_or(SystemError::EINVAL)?;
                 let vm_flags = VmFlags::from(shmflg);
                 let destination = VirtPageFrame::new(region.start());
-                let page_flags: PageFlags<MMArch> =
-                    PageFlags::from_prot_flags(ProtFlags::from(vm_flags), true);
+                let page_flags: EntryFlags<MMArch> =
+                    EntryFlags::from_prot_flags(ProtFlags::from(vm_flags), true);
                 let flusher: PageFlushAll<MMArch> = PageFlushAll::new();
 
                 // 将共享内存映射到对应虚拟区域
@@ -358,7 +358,7 @@ impl Syscall {
                 // 验证用户虚拟内存区域是否有效
                 let _ = UserBufferReader::new(vaddr.data() as *const u8, size, true)?;
 
-                // 必须在取消映射前获取到PageFlags
+                // 必须在取消映射前获取到EntryFlags
                 let page_flags = address_write_guard
                     .user_mapper
                     .utable

@@ -1,10 +1,10 @@
 use core::cell::RefCell;
 
 
-use alloc::rc::Rc;
+use alloc::{rc::Rc, sync::Arc};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata};
 
-use super::af_netlink::NetlinkSock;
+use super::af_netlink::{NetlinkSock, NetlinkSocket};
 pub struct SkBuff<'a> {
     inner: PacketBuffer<'a>,
 }
@@ -32,7 +32,7 @@ impl<'a> SkBuff<'a> {
 }
 
 // 处理网络套接字的过度运行情况
-pub fn netlink_overrun(sk: &NetlinkSock) {
+pub fn netlink_overrun(sk: &Arc<dyn NetlinkSocket>) {
     // Implementation of the function
 }
 
@@ -62,11 +62,11 @@ pub fn skb_get(skb: Rc<RefCell<SkBuff>>) -> Rc<RefCell<SkBuff>> {
 }
 
 // 增加网络套接字(sk)的引用计数
-pub fn sock_hold(sk: &NetlinkSock) {
+pub fn sock_hold(sk: &Arc<dyn NetlinkSocket>) {
     // Implementation of the function
 }
 
 // 用于释放网络套接字(sk)的资源。
-pub fn sock_put(sk: &NetlinkSock) {
+pub fn sock_put(sk: &Arc<dyn NetlinkSocket>) {
     // Implementation of the function
 }

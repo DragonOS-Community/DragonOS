@@ -51,7 +51,7 @@ use super::{UEVENT_BUFFER_SIZE, UEVENT_NUM_ENVP};
 use crate::driver::base::kobject::{KObjectManager, KObjectState};
 use crate::libs::mutex::Mutex;
 use crate::net::net_core::consume_skb;
-use crate::net::socket::netlink::af_netlink::netlink_has_listeners;
+use crate::net::socket::netlink::af_netlink::{netlink_has_listeners, NetlinkFlags};
 use crate::net::socket::netlink::af_netlink::NetlinkSocket;
 use crate::net::socket::netlink::af_netlink::{netlink_broadcast, NetlinkSock};
 use crate::net::socket::netlink::skbuff::SkBuff;
@@ -108,6 +108,18 @@ impl NetlinkSocket for UeventSock {
     }
     fn equals(&self, other: &dyn NetlinkSocket) -> bool {
         false
+    }
+    fn portid(&self) -> u32 {
+        0
+    }
+    fn ngroups(&self) -> u64 {
+        0
+    }
+    fn groups(&self) -> Vec<u64> {
+        Vec::new()
+    }
+    fn flags(&self) -> u32 {
+        0
     }
 }
 // static const char *kobject_actions[] = {

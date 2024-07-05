@@ -8,7 +8,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, process::arch_switch_to_user},
-    driver::{net::e1000e::e1000e::e1000e_init, virtio::virtio::virtio_probe},
+    driver::{net::{e1000e::e1000e::e1000e_init, loopback::loopback_init}, virtio::virtio::virtio_probe},
     filesystem::vfs::core::mount_root_fs,
     net::net_core::net_init,
     process::{kthread::KernelThreadMechanism, stdio::stdio_init, ProcessFlags, ProcessManager},
@@ -43,6 +43,8 @@ fn kernel_init() -> Result<(), SystemError> {
     net_init().unwrap_or_else(|err| {
         error!("Failed to initialize network: {:?}", err);
     });
+
+    loopback_init();
 
     debug!("initial kernel thread done.");
 

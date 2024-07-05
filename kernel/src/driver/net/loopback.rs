@@ -1,298 +1,44 @@
-use core::{cell::UnsafeCell, ops::DerefMut};
-use core::ops::Deref;
-use alloc::fmt::{format, Debug};
-use alloc::string::{String, ToString};
-use alloc::rc::Weak;
+use core::cell::UnsafeCell;
+use core::ops::{Deref, DerefMut};
+use alloc::fmt::Debug;
+use alloc::string::String;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use alloc::sync::Arc;
-use smoltcp::wire::{self, HardwareAddress};
-use smoltcp::{iface, phy::{self, DeviceCapabilities, TxToken}, wire::{EthernetAddress, IpAddress, IpCidr}};
+use alloc::sync::{Arc, Weak};
+use log::info;
+use smoltcp::wire::HardwareAddress;
+use smoltcp::{phy::{self}, wire::{IpAddress, IpCidr}};
 use system_error::SystemError;
-use x86::bits64;
 use crate::arch::rand::rand;
 use crate::driver::base::class::Class;
 use crate::driver::base::device::bus::Bus;
 use crate::driver::base::device::{Device, DeviceType, IdTable};
 use crate::driver::base::device::driver::Driver;
-use crate::driver::base::device::DeviceCommonData;
-use crate::driver::base::kobject::{KObject, KObjectCommonData, LockedKObjectState};
-use crate::driver::pci::attr::DeviceID;
-use crate::libs::spinlock::SpinLockGuard;
+use crate::driver::base::kobject::{KObjType, KObject, KObjectState};
 use crate::net::{generate_iface_id, NET_DEVICES};
 use crate::libs::spinlock::SpinLock;
 use crate::time::Instant;
 
 use super::NetDevice;
 
-// const DEVICE_NAME: &str = "loopback";
 
-// //定义Loopback网络接口
-// pub struct LoopbackInterface {
-//     device_inner: LoopbackDeviceInnerWapper,
-//     iface_id: usize,
-//     iface_name: String,
-//     dev_id: Arc<DeviceID>,
-//     iface: SpinLock<iface::Interface>,
-//     inner: SpinLock<InnerLoopbackInterface>,
-//     locked_kobj_state: LockedKObjectState,
+
+// pub struct LoopbackBuffer {
+//     buffer: Vec<u8>,
+//     length: usize,
 // }
 
-// struct InnerLoopbackInterface {
-//     name: Option<String>,
-//     device_common: DeviceCommonData,
-//     kobj_common: KObjectCommonData,
-// }
-
-// impl core::fmt::Debug for LoopbackDeviceInner {
-//     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-//         f.debug_struct("LoopbackInterface")
-//             .field("iface_id", &self.iface_id)
-//             .field("iface_name", &self.iface_name)
-//             .field("dev_id", &self.dev_id)
-//             .field("inner", &self.inner)
-//             .field("locked_kobj_state", &self.locked_kobj_state)
-//             .finish()
-//     }
-// }
-
-// impl LoopbackInterface {
-//     pub fn new(mut device_inner: LoopbackDeviceInner, dev_id: Arc<DeviceID>) -> Arc<Self> {
-//         let iface_id = generate_iface_id();
-//         let hardware_addrs = wire::EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into();
-//         let mut iface_config = iface::Config::new(hardware_addrs);
-
-//         let iface = iface::Interface::new(iface_config, &mut dev_id, Instant::now().into());
-//         iface.update_ip_addrs(|ip_addrs| {
-//             ip_addrs.push(wire::IpCidr::new(IpAddress::v4(127,0, 0, 1), 8)).unwrap();
-//         });
-//         dosf
-//         let result = Arc::new(LoopbackInterface {
-//             device_inner: LoopbackDeviceInnerWapper(UnsafeCell::new(device_inner)),
-//             iface_id,
-//             locked_kobj_state: LockedKObjectState::default(),
-//             iface: SpinLock::new(iface),
-//             iface_name: format!("eth{}", iface_id),
-//             dev_id,
-//             inner: SpinLock::new(InnerLoopbackInterface{
-//                 name: None,
-//                 device_common: DeviceCommonData::default(),
-//                 kobj_common: KObjectCommonData::default(),
-//             })
-//         });
-
-//         result.inner().device_common.driver = 
-//             Some(Arc::downgrade(None)) as Weak<dyn Driver>;
-
-//         return result;
-//     }
-
-//     fn inner(&self) -> SpinLockGuard<InnerLoopbackInterface> {
-//         return self.inner.lock();
-//     }
-//     #[allow(dead_code)]
-//     pub fn iface_name(&self) -> String{
-//         self.iface_name.clone()
-//     }
-// }
-
-// impl Device for LoopbackInterface {
-//     fn dev_type(&self) -> DeviceType {
-//         DeviceType::Net
-//     }
-
-//     fn id_table(&self) -> IdTable {
-//         IdTable::new(DEVICE_NAME.to_string(), None)
-//     }
-
-//     fn bus(&self) -> Option<Weak<dyn Bus>> {
-//         self.inner().device_common.bus.clone();
-//     }
-
-//     fn set_bus(&self, bus:Option<Weak<dyn Bus>>) {
-//         self.inner().device_common.bus = bus;
-//     }
-
-//     fn class(&self) -> Option<Arc<dyn Class>> {
-//         let mut guard = self.inner();
-//         let r = guard.device_common.class.clone();
-//         if r.is_none() {
-//             guard.device_common.class = None;
+// impl LoopbackBuffer {
+//     pub fn new(length: usize) -> Self {
+//         let buffer = vec![0; length / size_of::<usize>()];
+//         LoopbackBuffer{
+//             buffer,
+//             length,
 //         }
-         
+//        }
 
-//          return r;
-//     }
-
-//     fn set_class(&self, class: Option<Weak<dyn Class>>) {
-//         self.inner().device_common.class = class;
-//     }
-
-//     fn driver(&self) -> Option<Arc<dyn Driver>> {
-//         let r = self.inner().device_common.driver;
-//         if r.is_none() {
-//             self.inner().device_common.driver = None;
-//         }
-//         return r;
-//     }
-
-//     fn is_dead(&self) -> bool {
-//         false
-//     }
-
-//     fn can_match(&self) -> bool {
-//         self.inner().device_common.can_match
-//     }
-
-//     fn set_can_match(&self, can_match:bool) {
-//         self.inner().device_common.can_match = can_match;
-//     }
-
-//     fn state_synced(&self) -> bool {
-//         true
-//     }
-
-//     fn set_driver(&self, driver: Option<alloc::sync::Weak<dyn Driver>>) {
-//         dfafda
-//     }
-
-// }
-
-// impl NetDevice for LoopbackInterface {
-//     fn update_ip_addrs(&self, ip_addrs: &[wire::IpCidr]) -> Result<(), system_error::SystemError> {
-//         dfsaf
-//         Ok(())
-//     }
-
-//     fn mac(&self) -> wire::EthernetAddress {
-//         EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])
-//     }
-
-//     #[inline]
-//     fn nic_id(&self) -> usize {
-//         return self.iface_id;
-//     }
-
-//     #[inline]
-//     fn name(&self) -> String {
-//         return self.iface_name.clone();
-//     }
-
-//     fn poll(&self, sockets: &mut iface::SocketSet) -> Result<(), system_error::SystemError> {
-//         let timestamp: smoltcp::time::Instant = Instant::now().into();
-//         let mut guard = self.iface.lock();
-//         let poll_res = guard.poll(timestamp, self.device_inner.force_get_mut(), sockets);
-//         // todo: notify!!!
-//         // kdebug!("Virtio Interface poll:{poll_res}");
-//         if poll_res {
-//             return Ok(());
-//         }
-//         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-//     }
-
-//     #[inline(always)]
-//     fn inner_iface(&self) -> &SpinLock<smoltcp::iface::Interface> {
-//         return &self.iface;
-//     }
-// }
-
-// impl KObject for LoopbackInterface {
-    
-// }
-
-// pub struct LoopbackDeviceInnerWapper(UnsafeCell<LoopbackDeviceInner>);
-// unsafe impl Send for LoopbackDeviceInnerWapper {}
-// unsafe impl Sync for LoopbackDeviceInnerWapper {}
-
-// impl Deref for LoopbackDeviceInnerWapper {
-//     type Target = LoopbackDeviceInner;
-//     fn deref(&self) -> &Self::Target {
-//         unsafe{&*self.0.get()}
-//     }
-// }
-
-// impl DerefMut for LoopbackDeviceInnerWapper {
-//     fn deref_mut(&mut self) -> &mut Self::Target {
-//         unsafe { &mut *self.0.get() }
-//     }
-// }
-
-// #[allow(clippy::mut_from_ref)]
-// impl LoopbackDeviceInnerWapper {
-//     fn force_get_mut(&self) -> &mut <LoopbackDeviceInnerWapper as Deref>::Target {
-//         unsafe {&mut *self.0.get()}
-//     }
-// }
-
-// //Loopback网络设备驱动（加锁）
-// pub struct LoopbackDeviceInner{
-//     pub inner: Arc<SpinLock<Loopback>>,
-// }
-
-// impl LoopbackDeviceInner {
-//     pub fn new(loopback: Loopback) -> Self {
-//         let inner = Arc::new(SpinLock::new(loopback));
-//         let result = LoopbackDeviceInner{
-//             inner,
-//         };
-//         result
-//     }
-// }
-
-// #[derive(Debug)]
-// pub struct Loopback {
-//     queue: VecDeque<Vec<u8>>,
-// }
-
-// impl Loopback {
-//     //创建一个loopback设备
-//     pub fn new() {
-//         Loopback {
-//             queue: VecDeque::new(),
-//         }
-//     }
-// }
-
-// impl phy::Device for LoopbackDeviceInner {
-//     type RxToken<'a> = LoopbackRxToken;
-//     type TxToken<'a> = LoopbackTxToken<'a>;
-
-//     fn capabilities(&self) -> phy::DeviceCapabilities {
-//         //loopback的最大传输单元
-//         let mut result = phy::DeviceCapabilities::default();
-//         result.max_transmission_unit = 65535;
-//         result.max_burst_size = Some(1);
-//         return result;
-//     }
-//     //收包
-//     fn receive(
-//         &mut self,
-//         timestamp: smoltcp::time::Instant
-//     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-//         self.inner.lock().queue.pop_front().map(move |buffer| {
-//             let rx = LoopbackRxToken {buffer};
-//             let tx = LoopbackTxToken {
-//                 queue: &mut self.inner.lock().queue,
-//             };
-//             (rx, tx)
-//         })
-//     }
-//     //发包
-//     fn transmit(
-//         &mut self, 
-//         timestamp: smoltcp::time::Instant
-//     ) -> Option<Self::TxToken<'_>> {
-//         Some(LoopbackTxToken{
-//             queue: &mut self.inner.lock().queue,
-//         })    
-//     }
-// }
-
-// impl Clone for LoopbackDeviceInner {
-//     fn clone(&self) -> Self {
-//         return LoopbackDeviceInner{
-//             inner: self.inner.clone(),
-//         }
+//     pub fn as_mut_slice(&mut self) -> &mut [u8] {
+//         self.buffer.as_mut_slice()
 //     }
 // }
 
@@ -304,12 +50,12 @@ impl phy::RxToken for LoopbackRxToken {
     fn consume<R, F>(mut self, f: F) -> R
         where
             F: FnOnce(&mut [u8]) -> R {
-        f(&mut self.buffer)
+        f(&mut self.buffer.as_mut_slice())
     }
 }
 
 pub struct LoopbackTxToken {
-    driver: Loopback_driver,
+    driver: LoopbackDriver,
 }
 
 impl phy::TxToken for LoopbackTxToken {
@@ -321,56 +67,82 @@ impl phy::TxToken for LoopbackTxToken {
         buffer.resize(len, 0);
         let result = f(buffer.as_mut_slice());
         let mut device = self.driver.inner.lock();
-
-        self.driver.push_back(buffer);
+        device.loopback_transmit(buffer);
         result
     }
 }
 
 pub struct Loopback {
-    buffer: VecDeque<Vec<u8>>,
+    //回环设备的transmit缓冲区，
+    queue: VecDeque<Vec<u8>>,
 }
 
 impl Loopback {
     pub fn new() -> Self {
-        let buffer = VecDeque::new();
+        let queue = VecDeque::new();
         Loopback{
-            buffer,
+            queue,
         }
     }
 
-    pub fn loopback_receive(&mut self) {
-        let packet: Vec<u8> = Vec::new();
-        self.buffer.push_back(packet);
+    pub fn loopback_receive(&mut self) -> Vec<u8>{
+        self.queue.pop_front().unwrap()
     }
 
     pub fn loopback_transmit(&mut self, buffer: Vec<u8>){
-        
+        self.queue.push_back(buffer)
     }
 }
 
-pub struct Loopback_driver{
+//driver的包裹器
+//参考virtio_net.rs
+struct LoopbackDriverWapper(UnsafeCell<LoopbackDriver>);
+unsafe impl Send for LoopbackDriverWapper {}
+unsafe impl Sync for LoopbackDriverWapper {}
+
+impl Deref for LoopbackDriverWapper {
+    type Target = LoopbackDriver;
+    fn deref(&self) -> &Self::Target {
+        unsafe {&*self.0.get()}
+    }
+}
+
+impl DerefMut for LoopbackDriverWapper {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe {&mut *self.0.get()}
+    } 
+}
+
+impl LoopbackDriverWapper {
+    #[allow(clippy::mut_from_ref)]
+    fn force_get_mut(&self) -> &mut LoopbackDriver {
+        unsafe {&mut *self.0.get()}
+    }
+    
+}
+
+pub struct LoopbackDriver{
     pub inner: Arc<SpinLock<Loopback>>,
 }
 
-impl Loopback_driver{
+impl LoopbackDriver{
     pub fn new() -> Self {
         let inner = Arc::new(SpinLock::new(Loopback::new()));
-        Loopback_driver {
+        LoopbackDriver {
             inner,
         }
     }
 }
 
-impl Clone for Loopback_driver {
+impl Clone for LoopbackDriver {
     fn clone(&self) -> Self {
-        Loopback_driver {
+        LoopbackDriver {
             inner: self.inner.clone(),
         }
     }
 }
 
-impl phy::Device for Loopback_driver {
+impl phy::Device for LoopbackDriver {
     type RxToken<'a> = LoopbackRxToken;
     type TxToken<'a> = LoopbackTxToken;
 
@@ -384,20 +156,19 @@ impl phy::Device for Loopback_driver {
     //收包
     fn receive(
         &mut self,
-        timestamp: smoltcp::time::Instant
+        _timestamp: smoltcp::time::Instant
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        self.inner.lock().buffer.pop_front().map(move |buffer| {
-            let rx = LoopbackRxToken {buffer};
-            let tx = LoopbackTxToken {
-                driver: self.clone(),
-            };
-            (rx, tx)
-        })
+        let buffer = self.inner.lock().loopback_receive();
+        let rx = LoopbackRxToken {buffer};
+        let tx = LoopbackTxToken {
+            driver: self.clone(),
+        };
+        Option::Some((rx, tx))
     }
     //发包
     fn transmit(
         &mut self, 
-        timestamp: smoltcp::time::Instant
+        _timestamp: smoltcp::time::Instant
     ) -> Option<Self::TxToken<'_>> {
         Some(LoopbackTxToken{
             driver: self.clone(),
@@ -406,21 +177,27 @@ impl phy::Device for Loopback_driver {
 }
 
 pub struct LoopbackInterface {
-    driver: Loopback_driver,
+    driver: LoopbackDriverWapper,
     iface_id: usize,
     iface: SpinLock<smoltcp::iface::Interface>,
     name: String,
 }
 
 impl LoopbackInterface {
-    pub fn new(mut driver: Loopback_driver) -> Arc<Self>{
-        let driver = driver;
+    pub fn new(mut driver: LoopbackDriver) -> Arc<Self>{
         let iface_id = generate_iface_id();
         let mut iface_config = smoltcp::iface::Config::new(HardwareAddress::Ethernet(
             smoltcp::wire::EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])));
         iface_config.random_seed = rand() as u64;
         
-        let iface = smoltcp::iface::Interface::new(iface_config, &mut driver, Instant::now().into());
+        let mut iface = smoltcp::iface::Interface::new(iface_config, &mut driver, Instant::now().into());
+        //设置网卡地址为127.0.0.1
+        iface.update_ip_addrs(|ip_addrs|{
+            ip_addrs
+            .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
+            .unwrap();
+        });
+        let driver = LoopbackDriverWapper(UnsafeCell::new(driver));
         Arc::new(
             LoopbackInterface {
                 driver,
@@ -431,18 +208,185 @@ impl LoopbackInterface {
     }
 }
 
-pub fn loopback_probe() {
-    
+impl Debug for LoopbackInterface {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LoopbackInterface")
+            .field("iface_id", &self.iface_id)
+            .field("iface", &"smtoltcp::iface::Interface")
+            .field("name", &self.name)
+            .finish()
+    }
 }
 
-pub fn loopback_driver_init(device: Loopback) {
+impl KObject for LoopbackInterface {
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn set_inode(&self, _inode: Option<Arc<crate::filesystem::kernfs::KernFSInode>>) {
+        todo!()
+    }
+
+    fn inode(&self) -> Option<Arc<crate::filesystem::kernfs::KernFSInode>> {
+        todo!()
+    }
+
+    fn parent(&self) -> Option<alloc::sync::Weak<dyn KObject>> {
+        todo!()
+    }
+
+    fn set_parent(&self, _parent: Option<alloc::sync::Weak<dyn KObject>>) {
+        todo!()
+    }
+
+    fn kset(&self) -> Option<Arc<crate::driver::base::kset::KSet>> {
+        todo!()
+    }
+
+    fn set_kset(&self, _kset: Option<Arc<crate::driver::base::kset::KSet>>) {
+        todo!()
+    }
+
+    fn kobj_type(&self) -> Option<&'static dyn crate::driver::base::kobject::KObjType> {
+        todo!()
+    }
+
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn set_name(&self, _name: String) {
+        todo!()
+    }
+
+    fn kobj_state(
+        &self,
+    ) -> crate::libs::rwlock::RwLockReadGuard<crate::driver::base::kobject::KObjectState> {
+        todo!()
+    }
+
+    fn kobj_state_mut(
+        &self,
+    ) -> crate::libs::rwlock::RwLockWriteGuard<crate::driver::base::kobject::KObjectState> {
+        todo!()
+    }
+
+    fn set_kobj_state(&self, _state: KObjectState) {
+        todo!()
+    }
+
+    fn set_kobj_type(&self, _ktype: Option<&'static dyn KObjType>) {
+        todo!()
+    }
+}
+
+impl Device for LoopbackInterface {
+    fn dev_type(&self) -> DeviceType {
+        todo!()
+    }
+
+    fn id_table(&self) -> IdTable {
+        todo!()
+    }
+
+    fn set_bus(&self, _bus: Option<Weak<dyn Bus>>) {
+        todo!()
+    }
+
+    fn set_class(&self, _class: Option<Weak<dyn Class>>) {
+        todo!()
+    }
+
+    fn driver(&self) -> Option<Arc<dyn Driver>> {
+        todo!()
+    }
+
+    fn set_driver(&self, _driver: Option<Weak<dyn Driver>>) {
+        todo!()
+    }
+
+    fn is_dead(&self) -> bool {
+        todo!()
+    }
+
+    fn can_match(&self) -> bool {
+        todo!()
+    }
+
+    fn set_can_match(&self, _can_match: bool) {
+        todo!()
+    }
+
+    fn state_synced(&self) -> bool {
+        todo!()
+    }
+}
+
+impl NetDevice for LoopbackInterface {
+    fn mac(&self) -> smoltcp::wire::EthernetAddress {
+        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        smoltcp::wire::EthernetAddress(mac)
+    }
+
+    #[inline]
+    fn nic_id(&self) -> usize {
+        self.iface_id
+    }
+
+    #[inline]
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn update_ip_addrs(&self, ip_addrs: &[smoltcp::wire::IpCidr]) -> Result<(), system_error::SystemError> {
+        if ip_addrs.len() != 1 {
+            return Err(SystemError::EINVAL);
+        }
+
+        self.iface.lock().update_ip_addrs(|addrs| {
+            let dest = addrs.iter_mut().next();
+
+            if let Some(dest) = dest {
+                *dest = ip_addrs[0];
+            } else {
+                addrs.push(ip_addrs[0]).expect("Push ipCidr failed: full");
+            }
+        });
+        return Ok(());
+    }
+
+    fn poll(&self, sockets: &mut smoltcp::iface::SocketSet) -> Result<(), SystemError> {
+        let timestamp: smoltcp::time::Instant = Instant::now().into();
+        let mut guard = self.iface.lock();
+        let poll_res = guard.poll(timestamp, self.driver.force_get_mut(), sockets);
+        if poll_res {
+            return Ok(());
+        }
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+    }
+
+    #[inline(always)]
+    fn inner_iface(&self) -> &SpinLock<smoltcp::iface::Interface> {
+        return &self.iface;
+    }
+}
+
+pub fn loopback_probe() {
+    loopback_driver_init();
+}
+
+pub fn loopback_driver_init() {
     let mac = smoltcp::wire::EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
-    let driver = Loopback_driver::new();
+    let driver = LoopbackDriver::new();
     let iface = LoopbackInterface::new(driver);
 
     NET_DEVICES
     .write_irqsave()
     .insert(iface.iface_id, iface.clone());
+    info!("loopback driver init successfully!\tMAC: [{}]", mac);
 
+}
 
+pub fn loopback_init() {
+    loopback_probe();
 }

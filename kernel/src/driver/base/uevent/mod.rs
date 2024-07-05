@@ -39,6 +39,7 @@ pub mod kobject_uevent;
 
 // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c?fi=kobject_uevent#457
 // kobject_action
+#[derive(Debug)]
 pub enum KobjectAction {
     KOBJADD,
     KOBJREMOVE, //Kobject（或上层数据结构）的添加/移除事件

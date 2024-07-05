@@ -49,7 +49,6 @@ use super::KobjUeventEnv;
 use super::KobjectAction;
 use super::{UEVENT_BUFFER_SIZE, UEVENT_NUM_ENVP};
 use crate::driver::base::kobject::{KObjectManager, KObjectState};
-use crate::libs::mutex::Mutex;
 use crate::net::net_core::consume_skb;
 use crate::net::socket::netlink::af_netlink::{netlink_has_listeners, NetlinkFlags};
 use crate::net::socket::netlink::af_netlink::NetlinkSocket;
@@ -159,7 +158,7 @@ kobject_action_type，将enum kobject_action类型的Action，转换为字符串
 */
 
 //kobject_uevent->kobject_uevent_env
-pub fn kobject_uevent(kobj: &dyn KObject, action: KobjectAction) -> Result<(), SystemError> {
+pub fn kobject_uevent(kobj: Arc<dyn KObject>, action: KobjectAction) -> Result<(), SystemError> {
     // kobject_uevent和kobject_uevent_env功能一样，只是没有指定任何的环境变量
     match kobject_uevent_env(kobj, action, None) {
         Ok(_) => Ok(()),
@@ -167,10 +166,11 @@ pub fn kobject_uevent(kobj: &dyn KObject, action: KobjectAction) -> Result<(), S
     }
 }
 pub fn kobject_uevent_env(
-    kobj: &dyn KObject,
+    kobj: Arc<dyn KObject>,
     action: KobjectAction,
     envp_ext: Option<Vec<String>>,
 ) -> Result<i32, SystemError> {
+    log::info!("kobject_uevent_env: kobj: {:?}, action: {:?}", kobj, action);
     let mut state = KObjectState::empty();
     let mut top_kobj = kobj.parent().unwrap().upgrade().unwrap();
     let mut retval: i32;
@@ -256,7 +256,7 @@ pub fn kobject_uevent_env(
 
     //获取设备的完整对象路径
     /* complete object path */
-    let devpath: String = KObjectManager::kobject_get_path(kobj);
+    let devpath: String = KObjectManager::kobject_get_path(&kobj);
     if devpath.is_empty() {
         retval = SystemError::ENOENT.to_posix_errno();
         // goto exit
@@ -266,9 +266,6 @@ pub fn kobject_uevent_env(
     }
     retval = add_uevent_var(&mut env, "ACTION=%s", &action_string).unwrap();
     if retval.is_zero() {
-        // goto exit
-        // 这里的goto目标代码较少，暂时直接复制使用，不仿写goto逻辑
-        // drop替代了kfree
         drop(devpath);
         drop(env);
         return Ok(retval);
@@ -441,7 +438,7 @@ fn zap_modalias_env(env: &mut Box<KobjUeventEnv>) {
 // 用于处理网络相关的uevent（通用事件）广播
 // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c#381
 pub fn kobject_uevent_net_broadcast(
-    kobj: &dyn KObject,
+    kobj: Arc<dyn KObject>,
     env: &KobjUeventEnv,
     action_string: &str,
     devpath: &str,

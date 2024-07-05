@@ -6,7 +6,7 @@
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "/home/val213/DragonOS/user/apps/test_uevent"
+        "path": "apps/test-uevent"
       }
     }
   },

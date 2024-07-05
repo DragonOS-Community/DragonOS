@@ -8,3 +8,5 @@ authors = [ "val213 <val213666@gmail.com>" ]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+netlink-sys = "0.5"
+nix = "0.24"

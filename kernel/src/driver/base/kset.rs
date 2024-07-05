@@ -98,6 +98,7 @@ impl KSet {
     pub fn register(&self, join_kset: Option<Arc<KSet>>) -> Result<(), SystemError> {
         return KObjectManager::add_kobj(self.self_ref.upgrade().unwrap(), join_kset);
         // todo: 引入uevent之后，发送uevent
+        kobject_uevent();
     }
 
     /// 注销一个kset

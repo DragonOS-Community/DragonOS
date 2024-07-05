@@ -22,7 +22,7 @@ use crate::{
 
 use system_error::SystemError;
 
-use super::kset::KSet;
+use super::{kset::KSet, uevent::kobject_uevent};
 
 pub trait KObject: Any + Send + Sync + Debug + CastFromSync {
     fn as_any_ref(&self) -> &dyn core::any::Any;
@@ -251,7 +251,7 @@ impl KObjectManager {
         }
 
         // todo: 发送uevent: KOBJ_REMOVE
-
+        kobject_uevent();
         sysfs_instance().remove_dir(&kobj);
         kobj.update_kobj_state(None, Some(KObjectState::IN_SYSFS));
         let kset = kobj.kset();
@@ -261,7 +261,7 @@ impl KObjectManager {
         kobj.set_parent(None);
     }
 
-    fn get_kobj_path_length(kobj: &dyn KObject) -> usize {
+    fn get_kobj_path_length(kobj: &Arc<dyn KObject>) -> usize {
         let mut length = 1;
         let mut parent = kobj.parent().unwrap().upgrade().unwrap();
         /* walk up the ancestors until we hit the one pointing to the
@@ -298,7 +298,7 @@ impl KObjectManager {
              kobj, __func__, path);
     }
          */
-    fn fill_kobj_path(kobj: &dyn KObject, path: *mut u8, length: usize) {
+    fn fill_kobj_path(kobj: &Arc<dyn KObject>, path: *mut u8, length: usize) {
         let mut parent = kobj.parent().unwrap().upgrade().unwrap();
         let mut length = length;
         length -= 1;
@@ -316,7 +316,7 @@ impl KObjectManager {
     }
     // TODO: 实现kobject_get_path
     // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject.c#139
-    pub fn kobject_get_path(kobj: &dyn KObject) -> String {
+    pub fn kobject_get_path(kobj: &Arc<dyn KObject>) -> String {
         let length = Self::get_kobj_path_length(kobj);
         let path_raw = vec![0u8; length].into_boxed_slice();
         let path = Box::into_raw(path_raw) as *mut u8;

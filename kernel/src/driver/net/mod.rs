@@ -12,6 +12,7 @@ mod dma;
 pub mod e1000e;
 pub mod irq_handle;
 pub mod virtio_net;
+pub mod loopback;
 
 pub trait NetDevice: Device {
     /// @brief 获取网卡的MAC地址

@@ -1116,7 +1116,7 @@ impl LockedVMA {
         let before: Option<Arc<LockedVMA>> = guard.region.before(&region).map(|virt_region| {
             let mut vma: VMA = unsafe { guard.clone() };
             vma.region = virt_region;
-
+            vma.mapped = false;
             let vma: Arc<LockedVMA> = LockedVMA::new(vma);
             vma
         });
@@ -1124,7 +1124,7 @@ impl LockedVMA {
         let after: Option<Arc<LockedVMA>> = guard.region.after(&region).map(|virt_region| {
             let mut vma: VMA = unsafe { guard.clone() };
             vma.region = virt_region;
-
+            vma.mapped = false;
             let vma: Arc<LockedVMA> = LockedVMA::new(vma);
             vma
         });
@@ -1134,20 +1134,24 @@ impl LockedVMA {
         if let Some(before) = before.clone() {
             let virt_iter = before.lock().region.iter_pages();
             for frame in virt_iter {
-                let paddr = utable.translate(frame.virt_address()).unwrap().0;
-                let page = page_manager_guard.get_mut(&paddr);
-                page.insert_vma(before.clone());
-                page.remove_vma(self);
+                if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
+                    let page = page_manager_guard.get_mut(&paddr);
+                    page.insert_vma(before.clone());
+                    page.remove_vma(self);
+                    before.lock().mapped = true;
+                }
             }
         }
 
         if let Some(after) = after.clone() {
             let virt_iter = after.lock().region.iter_pages();
             for frame in virt_iter {
-                let paddr = utable.translate(frame.virt_address()).unwrap().0;
-                let page = page_manager_guard.get_mut(&paddr);
-                page.insert_vma(after.clone());
-                page.remove_vma(self);
+                if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
+                    let page = page_manager_guard.get_mut(&paddr);
+                    page.insert_vma(after.clone());
+                    page.remove_vma(self);
+                    after.lock().mapped = true;
+                }
             }
         }
 
@@ -1490,12 +1494,6 @@ impl VMA {
             // 将VMA加入到anon_vma
             let page = page_manager_guard.get_mut(&paddr);
             page.insert_vma(r.clone());
-
-            // 清空内存
-            unsafe {
-                let vaddr = MMArch::phys_2_virt(paddr).unwrap();
-                MMArch::write_bytes(vaddr, 0, MMArch::PAGE_SIZE);
-            }
         }
         // debug!("VMA::zeroed: done");
         return Ok(r);

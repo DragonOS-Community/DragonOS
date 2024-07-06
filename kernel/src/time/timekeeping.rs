@@ -164,10 +164,8 @@ impl Timekeeper {
 
     #[inline]
     fn do_read_cpu_cycle_ns(&self) -> usize {
-        CurrentTimeArch::cycles2ns(
-            CurrentTimeArch::get_cycles()
-                .wrapping_sub(self.last_update_cpu_cycle.load(Ordering::SeqCst)),
-        )
+        let prev = self.last_update_cpu_cycle.load(Ordering::SeqCst);
+        CurrentTimeArch::cycles2ns(CurrentTimeArch::get_cycles().wrapping_sub(prev))
     }
 
     fn mark_update_wall_time_ok(&self) {

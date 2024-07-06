@@ -29,7 +29,7 @@ use crate::{
     filesystem::vfs::{
         fcntl::{AtFlags, FcntlCommand},
         file::FileMode,
-        syscall::{ModeType, PosixKstat},
+        syscall::{ModeType, PosixKstat, UtimensFlags},
         MAX_PATHLEN,
     },
     libs::align::page_align_up,
@@ -1103,7 +1103,24 @@ impl Syscall {
 
                 Self::shmctl(id, cmd, user_buf, from_user)
             }
-
+            SYS_UTIMENSAT => Self::sys_utimensat(
+                args[0] as i32,
+                args[1] as *const u8,
+                args[2] as *const PosixTimeSpec,
+                args[3] as u32,
+            ),
+            #[cfg(target_arch = "x86_64")]
+            SYS_FUTIMESAT => {
+                let flags = UtimensFlags::empty();
+                Self::sys_utimensat(
+                    args[0] as i32,
+                    args[1] as *const u8,
+                    args[2] as *const PosixTimeSpec,
+                    flags.bits(),
+                )
+            }
+            #[cfg(target_arch = "x86_64")]
+            SYS_UTIMES => Self::sys_utimes(args[0] as *const u8, args[1] as *const PosixTimeval),
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

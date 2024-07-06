@@ -401,7 +401,7 @@ unsafe extern "C" fn do_page_fault(regs: &'static TrapFrame, error_code: u64) {
     // panic!("Page Fault");
     CurrentIrqArch::interrupt_disable();
     let address = x86::controlregs::cr2();
-    // crate::info!(
+    // log::info!(
     //     "fault address: {:#x}, error_code: {:#b}, pid: {}\n",
     //     address,
     //     error_code,

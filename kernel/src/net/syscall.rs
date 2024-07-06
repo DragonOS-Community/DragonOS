@@ -1,6 +1,7 @@
 use core::{cmp::min, ffi::CStr};
 
 use alloc::{boxed::Box, sync::Arc};
+use log::debug;
 use num_traits::{FromPrimitive, ToPrimitive};
 use smoltcp::wire;
 use system_error::SystemError;
@@ -13,7 +14,7 @@ use crate::{
     },
     libs::spinlock::SpinLockGuard,
     mm::{verify_area, VirtAddr},
-    net::{socket::{AddressFamily, SOL_SOCKET}, SOL},
+    net::{socket::{AddressFamily, SOL_SOCKET}, SocketOptionsLevel},
     process::ProcessManager,
     syscall::Syscall,
 };
@@ -108,20 +109,14 @@ impl Syscall {
         optname: usize,
         optval: &[u8],
     ) -> Result<usize, SystemError> {
-        let sol = SOL::from_bits_truncate(level as u32);
+        let sol = SocketOptionsLevel::from_bits_truncate(level as u32);
         let socket_inode: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         // 获取内层的socket（真正的数据）
         let socket: SpinLockGuard<Box<dyn Socket>> = socket_inode.inner();
-
-        // level at socket
-        if sol == SOL::SOL_SOCKET {
-            todo!("sock_setsockopt")
-        } else {
-            return socket.setsockopt(sol, optname, optval).map(|_| 0);
-        }
-
+        debug!("setsockopt: level={:?}", level);
+        return socket.setsockopt(sol, optname, optval).map(|_| 0);
     }
 
     /// @brief sys_getsockopt系统调用的实际执行函数

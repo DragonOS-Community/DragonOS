@@ -37,13 +37,14 @@ use self::{
 };
 
 use super::{
-    event_poll::{EPollEventType, EPollItem, EventPoll}, Endpoint, Protocol, ShutdownType, SOL
+    event_poll::{EPollEventType, EPollItem, EventPoll}, Endpoint, Protocol, ShutdownType, SocketOptionsLevel
 };
 
 pub mod handle;
 pub mod inet;
 pub mod unix;
 pub mod tcp_def;
+pub mod ip_def;
 
 lazy_static! {
     /// 所有socket的集合
@@ -227,7 +228,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     /// https://code.dragonos.org.cn/s?refs=sk_setsockopt&project=linux-6.6.21
     fn setsockopt(
         &self,
-        _level: SOL,
+        _level: SocketOptionsLevel,
         _optname: usize,
         _optval: &[u8],
     ) -> Result<(), SystemError> {

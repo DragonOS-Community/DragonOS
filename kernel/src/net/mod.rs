@@ -145,7 +145,7 @@ impl From<Protocol> for u8 {
 }
 
 bitflags! {
-    pub struct SOL: u32 {
+    pub struct SocketOptionsLevel: u32 {
         const SOL_IP = 0;
         // const SOL_ICMP = 1; // No-no-no! Due to Linux :-) we cannot
         const SOL_SOCKET = 1;

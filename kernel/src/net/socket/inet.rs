@@ -1,5 +1,5 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use log::{error, warn};
+use log::{debug, error, warn};
 use smoltcp::{
     socket::{raw, tcp, udp},
     wire,
@@ -10,13 +10,12 @@ use crate::{
     driver::net::NetDevice,
     libs::rwlock::RwLock,
     net::{
-        event_poll::EPollEventType, net_core::poll_ifaces, socket::tcp_def::TcpOptions, syscall::PosixSocketOption, Endpoint, Protocol, ShutdownType, NET_DEVICES, SOL
+        event_poll::EPollEventType, net_core::poll_ifaces, socket::tcp_def::TcpOptions, syscall::PosixSocketOption, Endpoint, Protocol, ShutdownType, NET_DEVICES, SocketOptionsLevel
     },
 };
 
 use super::{
-    handle::GlobalSocketHandle, Socket, SocketHandleItem, SocketMetadata, SocketOptions,
-    SocketPollMethod, SocketType, HANDLE_MAP, PORT_MANAGER, SOCKET_SET,
+    handle::GlobalSocketHandle, ip_def::IpOptions, Socket, SocketHandleItem, SocketMetadata, SocketOptions, SocketPollMethod, SocketType, HANDLE_MAP, PORT_MANAGER, SOCKET_SET
 };
 
 /// @brief 表示原始的socket。原始套接字绕过传输层协议（如 TCP 或 UDP）并提供对网络层协议（如 IP）的直接访问。
@@ -232,7 +231,7 @@ impl Socket for RawSocket {
     /// https://code.dragonos.org.cn/s?refs=sk_setsockopt&project=linux-6.6.21
     fn setsockopt(
         &self,
-        _level: SOL,
+        _level: SocketOptionsLevel,
         optname: usize,
         _optval: &[u8],
     ) -> Result<(), SystemError> {
@@ -363,7 +362,7 @@ impl UdpSocket {
     fn sk_setsockopt(
         &self,
         _socket: &mut udp::Socket,
-        _level: SOL,
+        _level: SocketOptionsLevel,
         optname: PosixSocketOption,
         _optval: &[u8],
     ) -> Result<(), SystemError> {
@@ -545,7 +544,7 @@ impl UdpSocket {
 
     fn udp_lib_setsockopt(
         &self,
-        level: SOL,
+        level: SocketOptionsLevel,
         optname: usize,
         optval: &[u8],
     ) -> Result<(), SystemError> {
@@ -558,7 +557,7 @@ impl UdpSocket {
             PosixSocketOption::try_from(optname as i32)
                 .map_err(|_| SystemError::ENOPROTOOPT)?;
 
-        if level == SOL::SOL_SOCKET {
+        if level == SocketOptionsLevel::SOL_SOCKET {
             self.sk_setsockopt(socket, level, so_opt_name, optval)?;
             if so_opt_name == SO_RCVBUF || so_opt_name == SO_RCVBUFFORCE {
                 todo!("SO_RCVBUF");
@@ -756,11 +755,11 @@ impl Socket for UdpSocket {
 
     fn setsockopt(
             &self,
-            level: SOL,
+            level: SocketOptionsLevel,
             optname: usize,
             optval: &[u8],
         ) -> Result<(), SystemError> {
-        if level == SOL::SOL_UDP || level == SOL::SOL_UDPLITE || level == SOL::SOL_SOCKET {
+        if level == SocketOptionsLevel::SOL_UDP || level == SocketOptionsLevel::SOL_UDPLITE || level == SocketOptionsLevel::SOL_SOCKET {
             return self.udp_lib_setsockopt(level, optname, optval);
         }
         todo!("ip_setsockopt");
@@ -894,12 +893,14 @@ impl TcpSocket {
     fn sk_setsockopt(
         &self,
         _socket: &mut tcp::Socket,
-        _level: SOL,
+        _level: SocketOptionsLevel,
         optname: PosixSocketOption,
         _optval: &[u8],
     ) -> Result<(), SystemError> {
         use PosixSocketOption::*;
         use SystemError::*;
+
+        debug!("[SYS] [TCP] [setsockopt: {:?}]", optname);
 
         if optname == SO_BINDTODEVICE {
             todo!("SO_BINDTODEVICE");
@@ -910,7 +911,7 @@ impl TcpSocket {
                 todo!("SO_DEBUG");
             }
             SO_REUSEADDR => {
-                todo!("SO_REUSEADDR");
+                return Ok(());
             }
             SO_REUSEPORT => {
                 todo!("SO_REUSEPORT");
@@ -1076,17 +1077,11 @@ impl TcpSocket {
 
     fn do_tcp_setsockopt(
         &self,
-        level: SOL,
+        socket: &mut tcp::Socket,
+        level: SocketOptionsLevel,
         optname: usize,
         optval: &[u8],
     ) -> Result<(), SystemError> {
-
-        let mut socket_set_guard = SOCKET_SET.lock_irqsave();
-        let socket = socket_set_guard.get_mut::<tcp::Socket>(self.handles[0].smoltcp_handle().unwrap());
-
-        if level == SOL::SOL_SOCKET {
-            self.sk_setsockopt(socket, level, PosixSocketOption::try_from(optname as i32)?, optval)?;
-        }
 
         let boolval = optval[0] != 0;
 
@@ -1116,6 +1111,20 @@ impl TcpSocket {
             _ => {
                 return Err(SystemError::ENOPROTOOPT);
             }
+        }
+        return Ok(());
+    }
+    
+    fn do_ip_setsockopt(
+        &self,
+        _level: SocketOptionsLevel,
+        optname: usize,
+        _optval: &[u8],
+    ) -> Result<(), SystemError> {
+        debug!("ip_setsockopt: optname={}", optname);
+        match IpOptions::from_bits_truncate(optname as u32) {
+            IpOptions::IP_LOCAL_PORT_RANGE => {}
+            _ => {}
         }
         return Ok(());
     }
@@ -1505,14 +1514,22 @@ impl Socket for TcpSocket {
 
     fn setsockopt(
         &self,
-        level: SOL,
+        level: SocketOptionsLevel,
         optname: usize,
         optval: &[u8],
     ) -> Result<(), SystemError> {
-        if level != SOL::SOL_TCP {
-            todo!("icsk_setsockopt");
+
+        let mut socket_set_guard = SOCKET_SET.lock_irqsave();
+        let socket = socket_set_guard.get_mut::<tcp::Socket>(self.handles[0].smoltcp_handle().unwrap());
+
+        if level == SocketOptionsLevel::SOL_SOCKET {
+            return self.sk_setsockopt(socket, level, PosixSocketOption::try_from(optname as i32)?, optval);
         }
-        return self.do_tcp_setsockopt(level, optname, optval);
+
+        if level != SocketOptionsLevel::SOL_TCP {
+            return self.do_ip_setsockopt(level, optname, optval);
+        }
+        return self.do_tcp_setsockopt(socket, level, optname, optval);
     }
 
     fn socket_handle(&self) -> GlobalSocketHandle {

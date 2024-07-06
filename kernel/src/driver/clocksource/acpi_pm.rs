@@ -119,15 +119,17 @@ impl Clocksource for Acpipm {
 
     fn update_clocksource_data(&self, data: ClocksourceData) -> Result<(), SystemError> {
         let d = &mut self.0.lock_irqsave().data;
-        d.set_flags(data.flags);
-        d.set_mask(data.mask);
-        d.set_max_idle_ns(data.max_idle_ns);
-        d.set_mult(data.mult);
         d.set_name(data.name);
         d.set_rating(data.rating);
+        d.set_mask(data.mask);
+        d.set_mult(data.mult);
         d.set_shift(data.shift);
+        d.set_max_idle_ns(data.max_idle_ns);
+        d.set_flags(data.flags);
         d.watchdog_last = data.watchdog_last;
         d.cs_last = data.cs_last;
+        d.set_uncertainty_margin(data.uncertainty_margin);
+        d.set_maxadj(data.maxadj);
         d.cycle_last = data.cycle_last;
         return Ok(());
     }
@@ -285,7 +287,7 @@ pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
     }
 
     // 检查TSC时钟源的监视器是否被禁用，如果被禁用则将时钟源的标志设置为CLOCK_SOURCE_MUST_VERIFY
-    // 没有实现clocksource_selecet_watchdog函数，所以这里设置为false
+    // 是因为jiffies精度小于acpi pm，所以不需要被jiffies监视
     let tsc_clocksource_watchdog_disabled = false;
     if tsc_clocksource_watchdog_disabled {
         clocksource_acpi_pm().0.lock_irqsave().data.flags |=
@@ -294,7 +296,7 @@ pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
 
     // 注册ACPI PM Timer
     let acpi_pmtmr = clocksource_acpi_pm() as Arc<dyn Clocksource>;
-    match acpi_pmtmr.register(100, PMTMR_TICKS_PER_SEC as u32) {
+    match acpi_pmtmr.register(1, PMTMR_TICKS_PER_SEC as u32) {
         Ok(_) => {
             info!("ACPI PM Timer registered as clocksource sccessfully");
             return Ok(());

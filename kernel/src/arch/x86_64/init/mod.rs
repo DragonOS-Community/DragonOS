@@ -94,7 +94,6 @@ pub fn setup_arch() -> Result<(), SystemError> {
 /// 架构相关的初始化（在IDLE的最后一个阶段）
 #[inline(never)]
 pub fn setup_arch_post() -> Result<(), SystemError> {
-    // init_acpi_pm_clocksource().expect("acpi_pm_timer inits failed");
     let ret = hpet_init();
     if ret.is_ok() {
         hpet_instance().hpet_enable().expect("hpet enable failed");

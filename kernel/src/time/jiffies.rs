@@ -50,15 +50,17 @@ impl Clocksource for ClocksourceJiffies {
     }
     fn update_clocksource_data(&self, _data: ClocksourceData) -> Result<(), SystemError> {
         let d = &mut self.0.lock_irqsave().data;
-        d.set_flags(_data.flags);
-        d.set_mask(_data.mask);
-        d.set_max_idle_ns(_data.max_idle_ns);
-        d.set_mult(_data.mult);
         d.set_name(_data.name);
         d.set_rating(_data.rating);
+        d.set_mask(_data.mask);
+        d.set_mult(_data.mult);
         d.set_shift(_data.shift);
+        d.set_max_idle_ns(_data.max_idle_ns);
+        d.set_flags(_data.flags);
         d.watchdog_last = _data.watchdog_last;
         d.cs_last = _data.cs_last;
+        d.set_uncertainty_margin(_data.uncertainty_margin);
+        d.set_maxadj(_data.maxadj);
         d.cycle_last = _data.cycle_last;
         return Ok(());
     }

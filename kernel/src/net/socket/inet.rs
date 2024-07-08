@@ -1078,7 +1078,7 @@ impl TcpSocket {
     fn do_tcp_setsockopt(
         &self,
         socket: &mut tcp::Socket,
-        level: SocketOptionsLevel,
+        _level: SocketOptionsLevel,
         optname: usize,
         optval: &[u8],
     ) -> Result<(), SystemError> {

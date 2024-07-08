@@ -1,7 +1,7 @@
 use crate::{
     arch::{
         ipc::signal::X86_64SignalArch,
-        syscall::nr::{SYS_ARCH_PRCTL, SYS_RT_SIGRETURN},
+        syscall::nr::{SysCall, SYS_ARCH_PRCTL, SYS_RT_SIGRETURN},
         CurrentIrqArch,
     },
     exception::InterruptArch,
@@ -53,8 +53,26 @@ macro_rules! syscall_return {
 
         if $show {
             let pid = ProcessManager::current_pcb().pid();
-            debug!("syscall return:pid={:?},ret= {:?}\n", pid, ret as isize);
+            debug!("[SYS] [Pid: {:?}] [Retn: {:?}]", pid, ret as i64);
         }
+
+        unsafe {
+            CurrentIrqArch::interrupt_disable();
+        }
+        return;
+    }};
+}
+
+macro_rules! normal_syscall_return {
+    ($val:expr, $regs:expr, $show:expr) => {{
+        let ret = $val;
+
+        if $show {
+            let pid = ProcessManager::current_pcb().pid();
+            debug!("[SYS] [Pid: {:?}] [Retn: {:?}]", pid, ret);
+        }
+
+        $regs.rax = ret.unwrap_or_else(|e| e.to_posix_errno() as usize) as u64;
 
         unsafe {
             CurrentIrqArch::interrupt_disable();
@@ -87,15 +105,12 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
     ];
     mfence();
     let pid = ProcessManager::current_pcb().pid();
-    let show = false;
-    // let show = if syscall_num != SYS_SCHED && pid.data() >= 7 {
-    //     true
-    // } else {
-    //     false
-    // };
+    let show = 
+        // false;
+        (syscall_num != SYS_SCHED) && (pid.data() >= 7) ;
 
     if show {
-        debug!("syscall: pid: {:?}, num={:?}\n", pid, syscall_num);
+        debug!("[SYS] [Pid: {:?}] [Call: {:?}]", pid, SysCall::try_from(syscall_num));
     }
 
     // Arch specific syscall
@@ -108,18 +123,16 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
             );
         }
         SYS_ARCH_PRCTL => {
-            syscall_return!(
-                Syscall::arch_prctl(args[0], args[1])
-                    .unwrap_or_else(|e| e.to_posix_errno() as usize),
+            normal_syscall_return!(
+                Syscall::arch_prctl(args[0], args[1]),
                 frame,
                 show
             );
         }
         _ => {}
     }
-    syscall_return!(
-        Syscall::handle(syscall_num, &args, frame).unwrap_or_else(|e| e.to_posix_errno() as usize)
-            as u64,
+    normal_syscall_return!(
+        Syscall::handle(syscall_num, &args, frame),
         frame,
         show
     );

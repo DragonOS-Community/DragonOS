@@ -1,0 +1,25 @@
+{
+  "name": "cloud-seed",
+  "version": "0.1.0",
+  "description": "cloud-seed",
+  "task_type": {
+    "BuildFromSource": {
+      "Git": {
+        "url" : "https://github.com/Samuka007/cloud-seed.git",
+        "revision": "d0e663a"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "envs": [],
+  "target_arch": ["x86_64"]
+}

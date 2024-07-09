@@ -50,7 +50,7 @@ use super::KobjectAction;
 use super::{UEVENT_BUFFER_SIZE, UEVENT_NUM_ENVP};
 use crate::driver::base::kobject::{KObjectManager, KObjectState};
 use crate::net::net_core::consume_skb;
-use crate::net::socket::netlink::af_netlink::{netlink_has_listeners, NetlinkFlags};
+use crate::net::socket::netlink::af_netlink::netlink_has_listeners;
 use crate::net::socket::netlink::af_netlink::NetlinkSocket;
 use crate::net::socket::netlink::af_netlink::{netlink_broadcast, NetlinkSock};
 use crate::net::socket::netlink::skbuff::SkBuff;
@@ -196,7 +196,7 @@ pub fn kobject_uevent_env(
     while let Some(weak_parent) = top_kobj.parent() {
         top_kobj = weak_parent.upgrade().unwrap();
     }
-
+    /* 查找当前kobject或其parent是否从属于某个kset;如果都不从属于某个kset，则返回错误。(说明一个kobject若没有加入kset，是不会上报uevent的) */
     if top_kobj.kset().is_none() {
         log::info!("attempted to send uevent without kset!\n");
         return Err(SystemError::EINVAL);

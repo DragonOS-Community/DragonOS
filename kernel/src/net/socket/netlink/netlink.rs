@@ -5,7 +5,7 @@
 use crate::libs::mutex::Mutex;
 use core::mem;
 bitflags! {
-pub struct NetlinkFlags :u32 {
+pub struct NETLINK_PROTO :u32 {
     const NETLINK_ROUTE = 0;
     const NETLINK_UNUSED = 1;
     const NETLINK_USERSOCK = 2;

@@ -1,20 +1,17 @@
 //参考https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c
 
-// netlink_proto结构体
-// static mut NETLINK_PROTO: netlink_proto::NetlinkProto = netlink_proto::NetlinkProto {
-//     name: String::from("NETLINK"),
-//     owner: std::sync::Arc::downgrade(THIS_MODULE),
-//     obj_size: std::mem::size_of::<netlink_sock>(),
-// };
 
+use core::mem::size_of;
 use core::{any::Any, cell::RefCell, fmt::Debug, hash::Hash, ops::Deref};
 
 use alloc::rc::Rc;
+use alloc::string::String;
 use alloc::sync::Arc;
 
 use intertrait::CastFromSync;
 use num::Zero;
 use system_error::SystemError;
+use unified_init::macros::unified_init;
 
 use crate::net::socket::netlink::skbuff::SkBuff;
 use crate::{
@@ -29,7 +26,10 @@ use lazy_static::lazy_static;
 use smoltcp::socket::raw::PacketBuffer;
 use smoltcp::socket::raw::PacketMetadata;
 
+use super::netlink_proto::{proto_register, Proto, NETLINK_PROTO};
 use super::skbuff::{netlink_overrun, skb_orphan, skb_shared, sock_hold, sock_put};
+
+use crate::init::initcall::INITCALL_CORE;
 
 // Flags constants
 bitflags! {
@@ -172,8 +172,14 @@ impl RCuListeners {
 //https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#2916
 
 const MAX_LINKS: usize = 32;
-
+#[unified_init(INITCALL_CORE)]
 fn netlink_proto_init() -> Result<(), SystemError> {
+    let i:i32;
+	let err:i32 = proto_register(&NETLINK_PROTO, 0);
+
+	if err != 0{
+        return Err(SystemError::ENOSYS)
+    }
     // 创建NetlinkTable,每种netlink协议类型占数组中的一项，后续内核中创建的不同种协议类型的netlink都将保存在这个表中，由该表统一维护
     // 检查NetlinkTable的大小是否符合预期
     let mut nl_table = [0; MAX_LINKS];
@@ -192,12 +198,12 @@ fn netlink_proto_init() -> Result<(), SystemError> {
     //     }
     // }
 
-    //netlink_add_usersock_entry();
-    //sock_register(&netlink_family_ops);
-    //register_pernet_subsys(&netlink_net_ops);
-    //register_pernet_subsys(&netlink_tap_net_ops);
+    // netlink_add_usersock_entry();
+    // sock_register(&netlink_family_ops);
+    // register_pernet_subsys(&netlink_net_ops);
+    // register_pernet_subsys(&netlink_tap_net_ops);
     /* The netlink device handler may be needed early. */
-    //rtnetlink_init();
+    // rtnetlink_init();
     Ok(())
 }
 
@@ -209,14 +215,14 @@ fn main() {
 }
 
 // You will need to implement the following types and functions:
-// - NetlinkProto
-// - proto_register
+// - NetlinkProto -
+// - proto_register -
 // - bpf_iter_register
 // - RhashTable
-// - netlink_add_usersock_entry
-// - sock_register
-// - register_pernet_subsys
-// - rtnetlink_init
+// - netlink_add_usersock_entry -
+// - sock_register -
+// - register_pernet_subsys -
+// - rtnetlink_init -
 // ...
 
 //内核初始化函数注册
@@ -327,6 +333,100 @@ impl NetlinkSock {
     }
     fn unregister(&self, listener: Box<dyn NetlinkMessageHandler>) {
         // Implementation of the function
+    }
+}
+impl Socket for NetlinkSock {
+    fn read(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+        // Implementation of the function
+        Ok(0)
+    }
+    fn write(&self, buf: &[u8]) -> Result<usize, SystemError> {
+        // Implementation of the function
+        Ok(0)
+    }
+    fn close(&self) {
+        // Implementation of the function
+    }
+    fn connect(&mut self, _endpoint: crate::net::Endpoint) -> Result<(), SystemError> {
+        // Implementation of the function
+        Ok(())
+    }
+    fn bind(&mut self, _endpoint: crate::net::Endpoint) -> Result<(), SystemError> {
+        // Implementation of the function
+        Ok(())
+    }
+    fn shutdown(&mut self, _type: crate::net::ShutdownType) -> Result<(), SystemError> {
+        // Implementation of the function
+        Ok(())
+    }
+    fn listen(&mut self, _backlog: usize) -> Result<(), SystemError> {
+        // Implementation of the function
+        Ok(())
+    }
+    fn accept(&mut self) -> Result<(Box<dyn Socket>, crate::net::Endpoint), SystemError> {
+        // Implementation of the function
+        Ok((Box::new(NetlinkSock::new()), crate::net::Endpoint::new()))
+    }
+    fn endpoint(&self) -> Option<crate::net::Endpoint> {
+        // Implementation of the function
+        None
+    }
+    fn peer_endpoint(&self) -> Option<crate::net::Endpoint> {
+        // Implementation of the function
+        None
+    }
+    fn remove_epoll(&mut self, epoll: &alloc::sync::Weak<crate::libs::spinlock::SpinLock<crate::net::event_poll::EventPoll>>) -> Result<(), SystemError> {
+        // Implementation of the function
+        Ok(())
+    }
+    fn clear_epoll(&mut self) -> Result<(), SystemError> {
+        // Implementation of the function
+        Ok(())
+    }
+    fn pool(&self) -> Option<crate::libs::pool::Pool> {
+        // Implementation of the function
+        None
+    }
+    fn ioctl(&self, _request: u32, _arg: u64) -> Result<u64, SystemError> {
+        // Implementation of the function
+        Ok(0)
+    }
+    fn metadata(&self) -> crate::net::socket::SocketMetadata {
+        // Implementation of the function
+        crate::net::socket::SocketMetadata::new()
+    }
+    fn box_clone(&self) -> Box<dyn Socket> {
+        // Implementation of the function
+        Box::new(NetlinkSock::new())
+    }
+    fn setsockopt(
+            &self,
+            _level: usize,
+            _optname: usize,
+            _optval: &[u8],
+        ) -> Result<(), SystemError> {
+        // Implementation of the function
+        Ok(())
+    }
+    fn socket_handle(&self) -> crate::net::socket::handle::GlobalSocketHandle {
+        // Implementation of the function
+        crate::net::socket::handle::GlobalSocketHandle::new()
+    }
+    fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
+        // Implementation of the function
+        Ok(0)
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        // Implementation of the function
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        // Implementation of the function
+        self
+    }
+    fn add_epoll(&mut self, epitem: Arc<crate::net::event_poll::EPollItem>) -> Result<(), SystemError> {
+        // Implementation of the function
+        Ok(())
     }
 }
 

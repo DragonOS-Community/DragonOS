@@ -251,7 +251,7 @@ impl KObjectManager {
         }
 
         // todo: 发送uevent: KOBJ_REMOVE
-        kobject_uevent();
+        // kobject_uevent();
         sysfs_instance().remove_dir(&kobj);
         kobj.update_kobj_state(None, Some(KObjectState::IN_SYSFS));
         let kset = kobj.kset();

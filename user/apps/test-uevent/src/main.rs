@@ -1,11 +1,11 @@
-use netlink_sys::{protocols::NETLINK_GENERIC, Socket, SocketAddr};
+use netlink_sys::{protocols::{NETLINK_KOBJECT_UEVENT}, Socket, SocketAddr};
 use std::os::unix::io::AsRawFd;
 use nix::sys::socket::{recv, send, MsgFlags};
 
 fn main() {
     // 创建netlink socket
-    let mut socket = Socket::new(NETLINK_GENERIC).expect("Failed to create netlink socket");
-
+    let mut socket = Socket::new(NETLINK_KOBJECT_UEVENT).expect("Failed to create netlink socket");
+    // fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
     // 绑定到内核
     let addr = SocketAddr::new(0, 0);
     socket.bind(&addr).expect("Failed to bind socket");

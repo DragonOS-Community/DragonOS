@@ -8,7 +8,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, process::arch_switch_to_user},
-    driver::{net::e1000e::e1000e::e1000e_init, virtio::virtio::virtio_probe},
+    driver::{net::{e1000e::e1000e::e1000e_init, loopback::loopback_init}, virtio::virtio::virtio_probe},
     filesystem::vfs::core::mount_root_fs,
     net::net_core::net_init,
     process::{kthread::KernelThreadMechanism, stdio::stdio_init, ProcessFlags, ProcessManager},
@@ -35,10 +35,9 @@ fn kernel_init() -> Result<(), SystemError> {
 
     #[cfg(target_arch = "x86_64")]
     crate::driver::disk::ahci::ahci_init().expect("Failed to initialize AHCI");
-
     virtio_probe();
     mount_root_fs().expect("Failed to mount root fs");
-    //loopback_init();
+    loopback_init();
     e1000e_init();
     net_init().unwrap_or_else(|err| {
         error!("Failed to initialize network: {:?}", err);
@@ -106,6 +105,5 @@ fn run_init_process(path: String, trap_frame: &mut TrapFrame) -> Result<(), Syst
 
     compiler_fence(Ordering::SeqCst);
     Syscall::do_execve(path, argv, envp, trap_frame)?;
-    debug!("3");
     Ok(())
 }

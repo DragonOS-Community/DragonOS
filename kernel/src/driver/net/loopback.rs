@@ -21,14 +21,11 @@ use smoltcp::{
     wire::{IpAddress, IpCidr},
 };
 use system_error::SystemError;
-use unified_init::define_unified_initializer_slice;
-use unified_init::macros::unified_init;
 
 use super::NetDevice;
 
 const DEVICE_NAME: &str = "loopback";
 
-define_unified_initializer_slice!(INITIALIZER_LIST);
 
 // pub struct LoopbackBuffer {
 //     buffer: Vec<u8>,
@@ -387,18 +384,16 @@ pub fn loopback_probe() {
 }
 
 pub fn loopback_driver_init() {
-    let mac = smoltcp::wire::EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    //let mac = smoltcp::wire::EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
     let driver = LoopbackDriver::new();
     let iface = LoopbackInterface::new(driver);
 
     NET_DEVICES
         .write_irqsave()
         .insert(iface.iface_id, iface.clone());
-    info!("loopback driver init successfully!\tMAC: [{}]", mac);
+
 }
 
-#[unified_init(INITIALIZER_LIST)]
-pub fn loopback_init() -> Result<(), SystemError> {
+pub fn loopback_init(){
     loopback_probe();
-    return Ok(());
 }

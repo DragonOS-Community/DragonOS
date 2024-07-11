@@ -12,9 +12,10 @@ use alloc::fmt::Debug;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use unified_init::define_public_unified_initializer_slice;
+use unified_init::macros::unified_init;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use log::info;
 use smoltcp::wire::HardwareAddress;
 use smoltcp::{
     phy::{self},
@@ -25,8 +26,7 @@ use system_error::SystemError;
 use super::NetDevice;
 
 const DEVICE_NAME: &str = "loopback";
-
-
+define_public_unified_initializer_slice!(INITCALL_DEVICE);
 // pub struct LoopbackBuffer {
 //     buffer: Vec<u8>,
 //     length: usize,
@@ -383,6 +383,7 @@ pub fn loopback_probe() {
     loopback_driver_init();
 }
 
+
 pub fn loopback_driver_init() {
     //let mac = smoltcp::wire::EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
     let driver = LoopbackDriver::new();
@@ -394,6 +395,8 @@ pub fn loopback_driver_init() {
 
 }
 
-pub fn loopback_init(){
+#[unified_init(INITCALL_DEVICE)]
+pub fn loopback_init() -> Result<(), SystemError>{
     loopback_probe();
+    return Ok(());
 }

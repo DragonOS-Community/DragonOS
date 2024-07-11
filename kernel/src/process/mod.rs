@@ -672,6 +672,17 @@ impl ProcessControlBlock {
         return Self::do_create_pcb(name, kstack, true);
     }
 
+    /// # 函数的功能
+    ///
+    /// 返回此函数是否是内核进程
+    ///
+    /// # 返回值
+    ///
+    /// 若进程是内核进程则返回true 否则返回false
+    pub fn is_kthread(&self) -> bool {
+        return matches!(self.flags(), &mut ProcessFlags::KTHREAD);
+    }
+
     #[inline(never)]
     fn do_create_pcb(name: String, kstack: KernelStack, is_idle: bool) -> Arc<Self> {
         let (pid, ppid, cwd) = if is_idle {

@@ -492,11 +492,7 @@ impl File {
                 return inode.inner().lock().add_epoll(epitem);
             }
             _ => {
-                let r = self.inode.ioctl(
-                    EventPoll::ADD_EPOLLITEM,
-                    &epitem as *const Arc<EPollItem> as usize,
-                    &self.private_data.lock(),
-                );
+                let r = self.inode.kernel_ioctl(epitem, &self.private_data.lock());
                 if r.is_err() {
                     return Err(SystemError::ENOSYS);
                 }
@@ -571,6 +567,17 @@ impl FileDescriptorVec {
             }
         }
         return res;
+    }
+
+    /// 返回 `已经打开的` 文件描述符的数量
+    pub fn fd_open_count(&self) -> usize {
+        let mut size = 0;
+        for fd in &self.fds {
+            if fd.is_some() {
+                size += 1;
+            }
+        }
+        return size;
     }
 
     /// @brief 判断文件描述符序号是否合法

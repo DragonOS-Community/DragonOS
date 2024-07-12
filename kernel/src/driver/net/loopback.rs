@@ -13,38 +13,20 @@ use alloc::fmt::Debug;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use log::debug;
-use unified_init::macros::unified_init;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
+use log::debug;
 use smoltcp::wire::HardwareAddress;
 use smoltcp::{
     phy::{self},
     wire::{IpAddress, IpCidr},
 };
 use system_error::SystemError;
+use unified_init::macros::unified_init;
 
 use super::NetDevice;
 
 const DEVICE_NAME: &str = "loopback";
-// pub struct LoopbackBuffer {
-//     buffer: Vec<u8>,
-//     length: usize,
-// }
-
-// impl LoopbackBuffer {
-//     pub fn new(length: usize) -> Self {
-//         let buffer = vec![0; length / size_of::<usize>()];
-//         LoopbackBuffer{
-//             buffer,
-//             length,
-//         }
-//        }
-
-//     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-//         self.buffer.as_mut_slice()
-//     }
-// }
 
 pub struct LoopbackRxToken {
     buffer: Vec<u8>,
@@ -84,9 +66,7 @@ pub struct Loopback {
 impl Loopback {
     pub fn new() -> Self {
         let queue = VecDeque::new();
-        Loopback { 
-            queue,
-         }
+        Loopback { queue }
     }
 
     pub fn loopback_receive(&mut self) -> Vec<u8> {
@@ -104,7 +84,6 @@ impl Loopback {
     pub fn loopback_transmit(&mut self, buffer: Vec<u8>) {
         self.queue.push_back(buffer)
     }
-
 }
 
 //driver的包裹器
@@ -184,7 +163,6 @@ impl phy::Device for LoopbackDriver {
     }
     //发包
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
-        debug!("lo transmit!");
         Some(LoopbackTxToken {
             driver: self.clone(),
         })
@@ -375,11 +353,9 @@ impl NetDevice for LoopbackInterface {
     }
 
     fn poll(&self, sockets: &mut smoltcp::iface::SocketSet) -> Result<(), SystemError> {
-        debug!("lo begin poll!");
         let timestamp: smoltcp::time::Instant = Instant::now().into();
         let mut guard = self.iface.lock();
         let poll_res = guard.poll(timestamp, self.driver.force_get_mut(), sockets);
-        debug!("lo poll_res!");
         if poll_res {
             return Ok(());
         }
@@ -396,7 +372,6 @@ pub fn loopback_probe() {
     loopback_driver_init();
 }
 
-
 pub fn loopback_driver_init() {
     //let mac = smoltcp::wire::EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
     let driver = LoopbackDriver::new();
@@ -405,11 +380,10 @@ pub fn loopback_driver_init() {
     NET_DEVICES
         .write_irqsave()
         .insert(iface.iface_id, iface.clone());
-
 }
 
 #[unified_init(INITCALL_DEVICE)]
-pub fn loopback_init() -> Result<(), SystemError>{
+pub fn loopback_init() -> Result<(), SystemError> {
     loopback_probe();
     return Ok(());
 }

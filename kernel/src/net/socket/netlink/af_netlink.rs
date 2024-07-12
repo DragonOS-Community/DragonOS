@@ -167,22 +167,24 @@ impl RCuListeners {
     }
 }
 
-// You would need to implement the actual methods for the NetlinkTable and NetlinkSocket structs.
-// netlink初始化函数
-//https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#2916
 
+ 
+// https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#2916
+/// netlink 协议的最大数量
 const MAX_LINKS: usize = 32;
 #[unified_init(INITCALL_CORE)]
+/// netlink 协议的初始化函数
 fn netlink_proto_init() -> Result<(), SystemError> {
-    let i:i32;
-	let err:i32 = proto_register(&NETLINK_PROTO, 0);
-
-	if err != 0{
-        return Err(SystemError::ENOSYS)
+	unsafe{ 
+        let err = proto_register(&mut NETLINK_PROTO, 0);
+        if err.is_err(){
+            return Err(SystemError::ENOSYS)
+        }
     }
     // 创建NetlinkTable,每种netlink协议类型占数组中的一项，后续内核中创建的不同种协议类型的netlink都将保存在这个表中，由该表统一维护
     // 检查NetlinkTable的大小是否符合预期
-    let mut nl_table = [0; MAX_LINKS];
+    let nl_table = NL_TABLE.read();
+    // let mut nl_table = [0; MAX_LINKS];
     if nl_table.is_empty() {
         panic!("netlink_init: Cannot allocate nl_table");
     }
@@ -335,100 +337,100 @@ impl NetlinkSock {
         // Implementation of the function
     }
 }
-impl Socket for NetlinkSock {
-    fn read(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        // Implementation of the function
-        Ok(0)
-    }
-    fn write(&self, buf: &[u8]) -> Result<usize, SystemError> {
-        // Implementation of the function
-        Ok(0)
-    }
-    fn close(&self) {
-        // Implementation of the function
-    }
-    fn connect(&mut self, _endpoint: crate::net::Endpoint) -> Result<(), SystemError> {
-        // Implementation of the function
-        Ok(())
-    }
-    fn bind(&mut self, _endpoint: crate::net::Endpoint) -> Result<(), SystemError> {
-        // Implementation of the function
-        Ok(())
-    }
-    fn shutdown(&mut self, _type: crate::net::ShutdownType) -> Result<(), SystemError> {
-        // Implementation of the function
-        Ok(())
-    }
-    fn listen(&mut self, _backlog: usize) -> Result<(), SystemError> {
-        // Implementation of the function
-        Ok(())
-    }
-    fn accept(&mut self) -> Result<(Box<dyn Socket>, crate::net::Endpoint), SystemError> {
-        // Implementation of the function
-        Ok((Box::new(NetlinkSock::new()), crate::net::Endpoint::new()))
-    }
-    fn endpoint(&self) -> Option<crate::net::Endpoint> {
-        // Implementation of the function
-        None
-    }
-    fn peer_endpoint(&self) -> Option<crate::net::Endpoint> {
-        // Implementation of the function
-        None
-    }
-    fn remove_epoll(&mut self, epoll: &alloc::sync::Weak<crate::libs::spinlock::SpinLock<crate::net::event_poll::EventPoll>>) -> Result<(), SystemError> {
-        // Implementation of the function
-        Ok(())
-    }
-    fn clear_epoll(&mut self) -> Result<(), SystemError> {
-        // Implementation of the function
-        Ok(())
-    }
-    fn pool(&self) -> Option<crate::libs::pool::Pool> {
-        // Implementation of the function
-        None
-    }
-    fn ioctl(&self, _request: u32, _arg: u64) -> Result<u64, SystemError> {
-        // Implementation of the function
-        Ok(0)
-    }
-    fn metadata(&self) -> crate::net::socket::SocketMetadata {
-        // Implementation of the function
-        crate::net::socket::SocketMetadata::new()
-    }
-    fn box_clone(&self) -> Box<dyn Socket> {
-        // Implementation of the function
-        Box::new(NetlinkSock::new())
-    }
-    fn setsockopt(
-            &self,
-            _level: usize,
-            _optname: usize,
-            _optval: &[u8],
-        ) -> Result<(), SystemError> {
-        // Implementation of the function
-        Ok(())
-    }
-    fn socket_handle(&self) -> crate::net::socket::handle::GlobalSocketHandle {
-        // Implementation of the function
-        crate::net::socket::handle::GlobalSocketHandle::new()
-    }
-    fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
-        // Implementation of the function
-        Ok(0)
-    }
-    fn as_any_ref(&self) -> &dyn Any {
-        // Implementation of the function
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        // Implementation of the function
-        self
-    }
-    fn add_epoll(&mut self, epitem: Arc<crate::net::event_poll::EPollItem>) -> Result<(), SystemError> {
-        // Implementation of the function
-        Ok(())
-    }
-}
+// impl Socket for NetlinkSock {
+//     fn read(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+//         // Implementation of the function
+//         Ok(0)
+//     }
+//     fn write(&self, buf: &[u8]) -> Result<usize, SystemError> {
+//         // Implementation of the function
+//         Ok(0)
+//     }
+//     fn close(&self) {
+//         // Implementation of the function
+//     }
+//     fn connect(&mut self, _endpoint: crate::net::Endpoint) -> Result<(), SystemError> {
+//         // Implementation of the function
+//         Ok(())
+//     }
+//     fn bind(&mut self, _endpoint: crate::net::Endpoint) -> Result<(), SystemError> {
+//         // Implementation of the function
+//         Ok(())
+//     }
+//     fn shutdown(&mut self, _type: crate::net::ShutdownType) -> Result<(), SystemError> {
+//         // Implementation of the function
+//         Ok(())
+//     }
+//     fn listen(&mut self, _backlog: usize) -> Result<(), SystemError> {
+//         // Implementation of the function
+//         Ok(())
+//     }
+//     fn accept(&mut self) -> Result<(Box<dyn Socket>, crate::net::Endpoint), SystemError> {
+//         // Implementation of the function
+//         Ok((Box::new(NetlinkSock::new()), crate::net::Endpoint::new()))
+//     }
+//     fn endpoint(&self) -> Option<crate::net::Endpoint> {
+//         // Implementation of the function
+//         None
+//     }
+//     fn peer_endpoint(&self) -> Option<crate::net::Endpoint> {
+//         // Implementation of the function
+//         None
+//     }
+//     fn remove_epoll(&mut self, epoll: &alloc::sync::Weak<crate::libs::spinlock::SpinLock<crate::net::event_poll::EventPoll>>) -> Result<(), SystemError> {
+//         // Implementation of the function
+//         Ok(())
+//     }
+//     fn clear_epoll(&mut self) -> Result<(), SystemError> {
+//         // Implementation of the function
+//         Ok(())
+//     }
+//     fn pool(&self) -> Option<crate::libs::pool::Pool> {
+//         // Implementation of the function
+//         None
+//     }
+//     fn ioctl(&self, _request: u32, _arg: u64) -> Result<u64, SystemError> {
+//         // Implementation of the function
+//         Ok(0)
+//     }
+//     fn metadata(&self) -> crate::net::socket::SocketMetadata {
+//         // Implementation of the function
+//         crate::net::socket::SocketMetadata::new()
+//     }
+//     fn box_clone(&self) -> Box<dyn Socket> {
+//         // Implementation of the function
+//         Box::new(NetlinkSock::new())
+//     }
+//     fn setsockopt(
+//             &self,
+//             _level: usize,
+//             _optname: usize,
+//             _optval: &[u8],
+//         ) -> Result<(), SystemError> {
+//         // Implementation of the function
+//         Ok(())
+//     }
+//     fn socket_handle(&self) -> crate::net::socket::handle::GlobalSocketHandle {
+//         // Implementation of the function
+//         crate::net::socket::handle::GlobalSocketHandle::new()
+//     }
+//     fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
+//         // Implementation of the function
+//         Ok(0)
+//     }
+//     fn as_any_ref(&self) -> &dyn Any {
+//         // Implementation of the function
+//         self
+//     }
+//     fn as_any_mut(&mut self) -> &mut dyn Any {
+//         // Implementation of the function
+//         self
+//     }
+//     fn add_epoll(&mut self, epitem: Arc<crate::net::event_poll::EPollItem>) -> Result<(), SystemError> {
+//         // Implementation of the function
+//         Ok(())
+//     }
+// }
 
 // https://code.dragonos.org.cn/s?refs=netlink_create&project=linux-6.1.9
 fn netlink_create(socket: &mut dyn Socket, protocol: i32, _kern: bool) -> Result<(), Error> {
@@ -479,6 +481,7 @@ impl listeners {
 }
 
 lazy_static! {
+    /// 一个维护全局的NetlinkTable的哈希链，每一个元素代表一个netlink协议类型，最大数量为MAX_LINKS
     static ref NL_TABLE: RwLock<Vec<NetlinkTable>> = RwLock::new(vec![NetlinkTable::new()]);
 }
 pub fn netlink_has_listeners(sk: &NetlinkSock, group: u32) -> i32 {

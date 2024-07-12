@@ -43,7 +43,7 @@ pub fn net_init() -> Result<(), SystemError> {
 fn dhcp_query() -> Result<(), SystemError> {
     let binding = NET_DEVICES.write_irqsave();
 
-    let net_face = binding.get(&0).ok_or(SystemError::ENODEV)?.clone();
+    let net_face = binding.get(&1).ok_or(SystemError::ENODEV)?.clone();
 
     drop(binding);
 

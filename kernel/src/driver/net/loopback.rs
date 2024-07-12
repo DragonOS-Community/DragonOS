@@ -4,6 +4,7 @@ use crate::driver::base::device::bus::Bus;
 use crate::driver::base::device::driver::Driver;
 use crate::driver::base::device::{Device, DeviceType, IdTable};
 use crate::driver::base::kobject::{KObjType, KObject, KObjectState};
+use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::spinlock::SpinLock;
 use crate::net::{generate_iface_id, NET_DEVICES};
 use crate::time::Instant;
@@ -12,7 +13,7 @@ use alloc::fmt::Debug;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use unified_init::define_public_unified_initializer_slice;
+use log::debug;
 use unified_init::macros::unified_init;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
@@ -26,7 +27,6 @@ use system_error::SystemError;
 use super::NetDevice;
 
 const DEVICE_NAME: &str = "loopback";
-define_public_unified_initializer_slice!(INITCALL_DEVICE);
 // pub struct LoopbackBuffer {
 //     buffer: Vec<u8>,
 //     length: usize,
@@ -84,7 +84,9 @@ pub struct Loopback {
 impl Loopback {
     pub fn new() -> Self {
         let queue = VecDeque::new();
-        Loopback { queue }
+        Loopback { 
+            queue,
+         }
     }
 
     pub fn loopback_receive(&mut self) -> Vec<u8> {
@@ -102,6 +104,7 @@ impl Loopback {
     pub fn loopback_transmit(&mut self, buffer: Vec<u8>) {
         self.queue.push_back(buffer)
     }
+
 }
 
 //driver的包裹器
@@ -113,12 +116,14 @@ unsafe impl Sync for LoopbackDriverWapper {}
 impl Deref for LoopbackDriverWapper {
     type Target = LoopbackDriver;
     fn deref(&self) -> &Self::Target {
+        debug!("use unsafe!");
         unsafe { &*self.0.get() }
     }
 }
 
 impl DerefMut for LoopbackDriverWapper {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        debug!("use unsafe!");
         unsafe { &mut *self.0.get() }
     }
 }
@@ -150,14 +155,15 @@ impl Clone for LoopbackDriver {
 }
 
 impl phy::Device for LoopbackDriver {
-    type RxToken<'a> = LoopbackRxToken;
-    type TxToken<'a> = LoopbackTxToken;
+    type RxToken<'a> = LoopbackRxToken where Self: 'a;
+    type TxToken<'a> = LoopbackTxToken where Self: 'a;
 
     fn capabilities(&self) -> phy::DeviceCapabilities {
         //loopback的最大传输单元
         let mut result = phy::DeviceCapabilities::default();
         result.max_transmission_unit = 65535;
         result.max_burst_size = Some(1);
+        result.medium = smoltcp::phy::Medium::Ethernet;
         return result;
     }
     //收包
@@ -166,14 +172,19 @@ impl phy::Device for LoopbackDriver {
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let buffer = self.inner.lock().loopback_receive();
+        //receive队列为为空，返回NONE值以通知上层没有可以receive的包
+        if buffer.is_empty() {
+            return Option::None;
+        }
         let rx = LoopbackRxToken { buffer };
         let tx = LoopbackTxToken {
             driver: self.clone(),
         };
-        Option::Some((rx, tx))
+        return Option::Some((rx, tx));
     }
     //发包
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+        debug!("lo transmit!");
         Some(LoopbackTxToken {
             driver: self.clone(),
         })
@@ -364,9 +375,11 @@ impl NetDevice for LoopbackInterface {
     }
 
     fn poll(&self, sockets: &mut smoltcp::iface::SocketSet) -> Result<(), SystemError> {
+        debug!("lo begin poll!");
         let timestamp: smoltcp::time::Instant = Instant::now().into();
         let mut guard = self.iface.lock();
         let poll_res = guard.poll(timestamp, self.driver.force_get_mut(), sockets);
+        debug!("lo poll_res!");
         if poll_res {
             return Ok(());
         }

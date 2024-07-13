@@ -5,6 +5,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
+use log::debug;
 use system_error::SystemError;
 
 use super::{
@@ -341,6 +342,42 @@ impl Syscall {
         } else {
             return Err(SystemError::EPERM);
         }
+
+        return Ok(0);
+    }
+
+    pub fn seteuid(euid: usize) -> Result<usize, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        let mut guard = pcb.cred.lock();
+
+        if euid == usize::MAX || (euid == guard.euid.data() && euid == guard.fsuid.data()) {
+            return Ok(0);
+        }
+
+        if euid != usize::MAX {
+            guard.seteuid(euid);
+        }
+
+        let euid = guard.euid.data();
+        guard.setfsuid(euid);
+
+        return Ok(0);
+    }
+
+    pub fn setegid(egid: usize) -> Result<usize, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        let mut guard = pcb.cred.lock();
+
+        if egid == usize::MAX || (egid == guard.egid.data() && egid == guard.fsgid.data()) {
+            return Ok(0);
+        }
+
+        if egid != usize::MAX {
+            guard.setegid(egid);
+        }
+
+        let egid = guard.egid.data();
+        guard.setfsgid(egid);
 
         return Ok(0);
     }

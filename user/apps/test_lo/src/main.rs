@@ -7,12 +7,12 @@ fn main() {
     let ping = icmp::IcmpSocket::connect(localhost_v4);
     let mut ping = ping.unwrap();
 
-    let payload: &[u8] = &[1, 666];
+    let payload: &[u8] = &[1, 2];
 
     let result = ping.send(payload);
     match result {
         Ok(bytes_sent) => {
-            if bytes_sent == 666 {
+            if bytes_sent == 2 {
                 println!("Ping successful, sent {} bytes", bytes_sent);
             } else {
                 println!(

@@ -13,3 +13,4 @@ policy.c
 pub mod af_netlink;
 pub mod skbuff;
 pub mod netlink_proto;
+pub mod netlink;

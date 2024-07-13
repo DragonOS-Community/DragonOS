@@ -4,40 +4,41 @@
 // Ensure the header is only included once
 use crate::libs::mutex::Mutex;
 use core::mem;
+// Netlink protocol family
+pub const NETLINK_ROUTE : usize = 0;
+pub const NETLINK_UNUSED : usize = 1;
+pub const NETLINK_USERSOCK : usize = 2;
+pub const NETLINK_FIREWALL : usize = 3;
+pub const NETLINK_SOCK_DIAG : usize = 4;
+pub const NETLINK_NFLOG : usize = 5;
+pub const NETLINK_XFRM : usize = 6;
+pub const NETLINK_SELINUX : usize = 7;
+pub const NETLINK_ISCSI : usize = 8;
+pub const NETLINK_AUDIT : usize = 9;
+pub const NETLINK_FIB_LOOKUP : usize = 10;
+pub const NETLINK_CONNECTOR : usize = 11;
+pub const NETLINK_NETFILTER : usize = 12;
+pub const NETLINK_IP6_FW : usize = 13;
+pub const NETLINK_DNRTMSG : usize = 14;
+// implemente uevent needed
+pub const NETLINK_KOBJECT_UEVENT : usize = 15;
+pub const NETLINK_GENERIC : usize = 16;
+// pub const NETLINK_DM : usize = 17; // Assuming DM Events is unused, not defined
+pub const NETLINK_SCSITRANSPORT : usize = 18;
+pub const NETLINK_ECRYPTFS : usize = 19;
+pub const NETLINK_RDMA : usize = 20;
+pub const NETLINK_CRYPTO : usize = 21;
+pub const NETLINK_SMC : usize = 22;
+
+//pub const NETLINK_INET_DIAG = NETLINK_SOCK_DIAG;
+pub const NETLINK_INET_DIAG : usize = 4;
+
+pub const MAX_LINKS : usize = 32;
+
+pub const NL_CFG_F_NONROOT_RECV	:u32 = 1 << 0;
+pub const NL_CFG_F_NONROOT_SEND	:u32 = 1 << 1;
+
 bitflags! {
-pub struct NETLINK_PROTO :u32 {
-    const NETLINK_ROUTE = 0;
-    const NETLINK_UNUSED = 1;
-    const NETLINK_USERSOCK = 2;
-    const NETLINK_FIREWALL = 3;
-    const NETLINK_SOCK_DIAG = 4;
-    const NETLINK_NFLOG = 5;
-    const NETLINK_XFRM = 6;
-    const NETLINK_SELINUX = 7;
-    const NETLINK_ISCSI = 8;
-    const NETLINK_AUDIT = 9;
-    const NETLINK_FIB_LOOKUP = 10;
-    const NETLINK_CONNECTOR = 11;
-    const NETLINK_NETFILTER = 12;
-    const NETLINK_IP6_FW = 13;
-    const NETLINK_DNRTMSG = 14;
-    // implemente uevent needed
-    const NETLINK_KOBJECT_UEVENT = 15;
-    const NETLINK_GENERIC = 16;
-    // const NETLINK_DM = 17; // Assuming DM Events is unused, not defined
-    const NETLINK_SCSITRANSPORT = 18;
-    const NETLINK_ECRYPTFS = 19;
-    const NETLINK_RDMA = 20;
-    const NETLINK_CRYPTO = 21;
-    const NETLINK_SMC = 22;
-
-    //const NETLINK_INET_DIAG = NETLINK_SOCK_DIAG;
-    const NETLINK_INET_DIAG = 4;
-
-    const MAX_LINKS = 32;
-}
-
-
 
 //netlink消息报头
 /**

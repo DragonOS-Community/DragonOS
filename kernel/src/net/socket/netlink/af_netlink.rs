@@ -8,8 +8,10 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::sync::Arc;
 
+use hashbrown::HashMap;
 use intertrait::CastFromSync;
 use num::Zero;
+use smoltcp::wire::IpListenEndpoint;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -26,11 +28,11 @@ use lazy_static::lazy_static;
 use smoltcp::socket::raw::PacketBuffer;
 use smoltcp::socket::raw::PacketMetadata;
 
+use super::netlink::{NETLINK_USERSOCK, NL_CFG_F_NONROOT_SEND};
 use super::netlink_proto::{proto_register, Proto, NETLINK_PROTO};
 use super::skbuff::{netlink_overrun, skb_orphan, skb_shared, sock_hold, sock_put};
 
 use crate::init::initcall::INITCALL_CORE;
-
 // Flags constants
 bitflags! {
     pub struct NetlinkFlags: u32 {
@@ -88,17 +90,19 @@ impl<'a> Iterator for HListHeadIter<'a> {
 }
 
 pub struct NetlinkTable {
+    hash: HashMap<u32, Arc<dyn NetlinkSocket>>,
     listeners: Option<listeners>,
-    registed: u32,
+    registered: u32,
     flags: u32,
-    groups: u32,
+    groups: i32,
     mc_list: HListHead,
 }
 impl NetlinkTable {
     fn new() -> NetlinkTable {
         NetlinkTable {
+            hash: HashMap::new(),
             listeners: Some(listeners { masks: Vec::new() }),
-            registed: 0,
+            registered: 0,
             flags: 0,
             groups: 0,
             mc_list: HListHead { first: None },
@@ -193,15 +197,17 @@ fn netlink_proto_init() -> Result<(), SystemError> {
     //     if rhashtable_init(&mut nl_table[i], &netlink_rhashtable_params) < 0 {
     //         while i > 0 {
     //             i -= 1;
-    //             rhashtable_destroy(&mut nl_table[i].hash);
+    //             &mut nl_table[i].hash.clear();
     //         }
     //         drop(nl_table); // This replaces kfree in Rust
     //         panic!("netlink_init: Cannot allocate nl_table");
     //     }
     // }
 
-    // netlink_add_usersock_entry();
+    netlink_add_usersock_entry();
     // sock_register(&netlink_family_ops);
+
+    // TODO: 以下函数需要 net namespace 支持
     // register_pernet_subsys(&netlink_net_ops);
     // register_pernet_subsys(&netlink_tap_net_ops);
     /* The netlink device handler may be needed early. */
@@ -209,26 +215,38 @@ fn netlink_proto_init() -> Result<(), SystemError> {
     Ok(())
 }
 
-fn main() {
-    // 调用初始化函数，并处理可能的错误
-    if let Err(e) = netlink_proto_init() {
-        // 如果出现错误，打印错误信息并退出
+pub fn netlink_add_usersock_entry()
+{
+	let listeners: Option<listeners> = Some(listeners::new());
+	let groups: i32 = 32;
+	if listeners.is_none(){
+        panic!("netlink_add_usersock_entry: Cannot allocate listeners\n");
     }
+
+    let nl_table = NL_TABLE.read();
+    let index = NETLINK_USERSOCK;
+	nl_table[index].groups = groups;
+	// rcu_assign_pointer(nl_table[index].listeners, listeners);
+	// nl_table[index].module = THIS_MODULE;
+	nl_table[index].registered = 1;
+	nl_table[index].flags = NL_CFG_F_NONROOT_SEND;
+}
+
+/// 
+fn netlink_insert(){
+
+}
+
+/// 
+fn netlink_lookup(){
+
 }
 
 // You will need to implement the following types and functions:
-// - NetlinkProto -
-// - proto_register -
-// - bpf_iter_register
 // - RhashTable
 // - netlink_add_usersock_entry -
 // - sock_register -
-// - register_pernet_subsys -
-// - rtnetlink_init -
-// ...
 
-//内核初始化函数注册
-//Linux：core_initcall(netlink_proto_init);
 
 //https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#672
 
@@ -337,6 +355,7 @@ impl NetlinkSock {
         // Implementation of the function
     }
 }
+
 // impl Socket for NetlinkSock {
 //     fn read(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
 //         // Implementation of the function
@@ -433,6 +452,7 @@ impl NetlinkSock {
 // }
 
 // https://code.dragonos.org.cn/s?refs=netlink_create&project=linux-6.1.9
+/// 创建一个netlink套接字
 fn netlink_create(socket: &mut dyn Socket, protocol: i32, _kern: bool) -> Result<(), Error> {
     // 假设我们有一个类型来跟踪协议最大值
     const MAX_LINKS: i32 = 1024;
@@ -450,17 +470,10 @@ fn netlink_create(socket: &mut dyn Socket, protocol: i32, _kern: bool) -> Result
     Ok(())
 }
 
-// 假设的绑定和解绑函数
-// fn bind_function(net: &Net, group: usize) {
-//     // 实现细节
-// }
-
-// fn unbind_function(net: &Net, group: usize) {
-//     // 实现细节
-// }
 struct callback_head {
     next: Option<Box<callback_head>>,
 }
+
 impl callback_head {
     fn next(&self) -> &Option<Box<callback_head>> {
         &self.next
@@ -475,6 +488,9 @@ struct listeners {
     masks: Vec<u64>,
 }
 impl listeners {
+    fn new() -> listeners {
+        listeners { masks: Vec::new() }
+    }
     fn masks(&self) -> Vec<u64> {
         Vec::new()
     }
@@ -484,7 +500,7 @@ lazy_static! {
     /// 一个维护全局的NetlinkTable的哈希链，每一个元素代表一个netlink协议类型，最大数量为MAX_LINKS
     static ref NL_TABLE: RwLock<Vec<NetlinkTable>> = RwLock::new(vec![NetlinkTable::new()]);
 }
-pub fn netlink_has_listeners(sk: &NetlinkSock, group: u32) -> i32 {
+pub fn netlink_has_listeners(sk: &NetlinkSock, group: i32) -> i32 {
     let mut res = 0;
     let nl_table = NL_TABLE.read();
     if let Some(listeners) = &nl_table[sk.sk_protocol()].listeners {
@@ -513,6 +529,7 @@ impl<'a> NetlinkBroadcastData<'a> {
         *self.skb_2.borrow_mut() = skb;
     }
 }
+/// 弃用
 fn sk_for_each_bound(sk: &NetlinkSock, mc_list: &HListHead) {
     let mut node = mc_list.first.as_ref();
     while let Some(n) = node {
@@ -534,6 +551,7 @@ fn do_one_broadcast(sk: &Arc<dyn NetlinkSocket>, info: &mut Box<NetlinkBroadcast
     {
         return Err(SystemError::EINVAL);
     }
+    // TODO: 需要net namespace支持
     // if !net_eq(sock_net(sk), info.net) {
     //     if !(nlk.flags & NetlinkFlags::LISTEN_ALL_NSID.bits()) {
     //         return;
@@ -567,6 +585,7 @@ fn do_one_broadcast(sk: &Arc<dyn NetlinkSocket>, info: &mut Box<NetlinkBroadcast
     if sk_filter(sk, &info.skb_2) {
         return Err(SystemError::EINVAL);
     }
+    // TODO: 需要net namespace支持
     // peernet2id用于检索与给定网络(net)相关联的对等网络(peer)的ID
     // NETLINK_CB(info.skb_2).nsid = peernet2id(sock_net(sk), info.net);
     // if NETLINK_CB(info.skb_2).nsid != NETNSA_NSID_NOT_ASSIGNED {
@@ -593,6 +612,7 @@ pub fn netlink_broadcast<'a>(
     group: u64,
     allocation: u32,
 ) -> Result<(), SystemError> {
+    // TODO: 需要net namespace支持
     // let net = sock_net(ssk);
     let mut info = Box::new(NetlinkBroadcastData {
         exclude_sk: ssk,

@@ -15,6 +15,7 @@ use smoltcp::wire::IpListenEndpoint;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
+use crate::libs::rwlock::RwLockWriteGuard;
 use crate::net::socket::netlink::skbuff::SkBuff;
 use crate::{
     libs::rwlock::RwLock,
@@ -187,27 +188,19 @@ fn netlink_proto_init() -> Result<(), SystemError> {
     }
     // 创建NetlinkTable,每种netlink协议类型占数组中的一项，后续内核中创建的不同种协议类型的netlink都将保存在这个表中，由该表统一维护
     // 检查NetlinkTable的大小是否符合预期
-    let nl_table = NL_TABLE.read();
+    let mut nl_table = NL_TABLE.write();
     // let mut nl_table = [0; MAX_LINKS];
     if nl_table.is_empty() {
         panic!("netlink_init: Cannot allocate nl_table");
     }
     // 初始化哈希表
-    // for i in 0..MAX_LINKS {
-    //     if rhashtable_init(&mut nl_table[i], &netlink_rhashtable_params) < 0 {
-    //         while i > 0 {
-    //             i -= 1;
-    //             &mut nl_table[i].hash.clear();
-    //         }
-    //         drop(nl_table); // This replaces kfree in Rust
-    //         panic!("netlink_init: Cannot allocate nl_table");
-    //     }
-    // }
-
-    netlink_add_usersock_entry();
-    // sock_register(&netlink_family_ops);
-
+    for i in 0..MAX_LINKS {
+        nl_table[i].hash = HashMap::new();
+    }
+    // 将读写锁守卫作为参数传递，避免锁的重复获取造成阻塞
+    netlink_add_usersock_entry(&mut nl_table);
     // TODO: 以下函数需要 net namespace 支持
+    // sock_register(&netlink_family_ops);
     // register_pernet_subsys(&netlink_net_ops);
     // register_pernet_subsys(&netlink_tap_net_ops);
     /* The netlink device handler may be needed early. */
@@ -215,7 +208,8 @@ fn netlink_proto_init() -> Result<(), SystemError> {
     Ok(())
 }
 
-pub fn netlink_add_usersock_entry()
+/// 初始化和注册一个用户套接字条目，并将其添加到全局的NetlinkTable向量中
+pub fn netlink_add_usersock_entry(nl_table: &mut RwLockWriteGuard<Vec<NetlinkTable>>)
 {
 	let listeners: Option<listeners> = Some(listeners::new());
 	let groups: i32 = 32;
@@ -223,7 +217,6 @@ pub fn netlink_add_usersock_entry()
         panic!("netlink_add_usersock_entry: Cannot allocate listeners\n");
     }
 
-    let nl_table = NL_TABLE.read();
     let index = NETLINK_USERSOCK;
 	nl_table[index].groups = groups;
 	// rcu_assign_pointer(nl_table[index].listeners, listeners);
@@ -242,13 +235,7 @@ fn netlink_lookup(){
 
 }
 
-// You will need to implement the following types and functions:
-// - RhashTable
-// - netlink_add_usersock_entry -
-// - sock_register -
-
-
-//https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#672
+// https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#672
 
 enum Error {
     SocketTypeNotSupported,

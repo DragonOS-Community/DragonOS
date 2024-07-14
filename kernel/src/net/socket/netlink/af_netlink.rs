@@ -24,7 +24,7 @@ use crate::{
 };
 use alloc::{boxed::Box, vec::Vec};
 
-use crate::net::socket::Socket;
+use crate::net::socket::{AddressFamily, Socket};
 use lazy_static::lazy_static;
 use smoltcp::socket::raw::PacketBuffer;
 use smoltcp::socket::raw::PacketMetadata;
@@ -55,7 +55,7 @@ pub struct SockaddrNl {
     pub nl_pid: u32,
     pub nl_groups: u32,
 }
-
+#[derive(Clone)]
 pub struct HListHead {
     first: Option<Arc<HListNode>>,
 }
@@ -89,7 +89,7 @@ impl<'a> Iterator for HListHeadIter<'a> {
         }
     }
 }
-
+#[derive(Clone)]
 pub struct NetlinkTable {
     hash: HashMap<u32, Arc<dyn NetlinkSocket>>,
     listeners: Option<listeners>,
@@ -200,7 +200,7 @@ fn netlink_proto_init() -> Result<(), SystemError> {
     // 将读写锁守卫作为参数传递，避免锁的重复获取造成阻塞
     netlink_add_usersock_entry(&mut nl_table);
     // TODO: 以下函数需要 net namespace 支持
-    // sock_register(&netlink_family_ops);
+    sock_register(&NETLINK_FAMILY_OPS);
     // register_pernet_subsys(&netlink_net_ops);
     // register_pernet_subsys(&netlink_tap_net_ops);
     /* The netlink device handler may be needed early. */
@@ -208,6 +208,45 @@ fn netlink_proto_init() -> Result<(), SystemError> {
     Ok(())
 }
 
+/// 
+pub trait NetProtoFamily {
+    fn create(socket: &mut dyn Socket, protocol: i32, _kern: bool) -> Result<(), Error>;
+}
+/// 
+pub struct NetlinkFamulyOps {
+    family: AddressFamily,
+    // owner: Module,
+}
+
+impl NetProtoFamily for NetlinkFamulyOps {
+    // https://code.dragonos.org.cn/s?refs=netlink_create&project=linux-6.1.9
+    /// netlink_create() 创建一个netlink套接字
+    fn create(socket: &mut dyn Socket, protocol: i32, _kern: bool) -> Result<(), Error> {
+        // 假设我们有一个类型来跟踪协议最大值
+        const MAX_LINKS: i32 = 1024;
+        // if socket.type_ != SocketType::Raw && socket.type_ != SocketType::Dgram {
+        //     return Err(Error::SocketTypeNotSupported);
+        // }
+        if !(0..MAX_LINKS).contains(&protocol) {
+            return Err(Error::ProtocolNotSupported);
+        }
+        // 安全的数组索引封装
+        let protocol = protocol as usize;
+        // 这里简化了锁和模块加载逻辑
+        // 假设成功加载了模块和相关函数
+        Ok(())
+    }
+}
+
+lazy_static! {
+    static ref NETLINK_FAMILY_OPS: NetlinkFamulyOps = NetlinkFamulyOps {
+        family: AddressFamily::Netlink,
+    };
+}
+
+pub fn sock_register(ops: &NetlinkFamulyOps) {
+
+}
 /// 初始化和注册一个用户套接字条目，并将其添加到全局的NetlinkTable向量中
 pub fn netlink_add_usersock_entry(nl_table: &mut RwLockWriteGuard<Vec<NetlinkTable>>)
 {
@@ -237,7 +276,7 @@ fn netlink_lookup(){
 
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#672
 
-enum Error {
+pub enum Error {
     SocketTypeNotSupported,
     ProtocolNotSupported,
 }
@@ -438,24 +477,7 @@ impl NetlinkSock {
 //     }
 // }
 
-// https://code.dragonos.org.cn/s?refs=netlink_create&project=linux-6.1.9
-/// 创建一个netlink套接字
-fn netlink_create(socket: &mut dyn Socket, protocol: i32, _kern: bool) -> Result<(), Error> {
-    // 假设我们有一个类型来跟踪协议最大值
-    const MAX_LINKS: i32 = 1024;
 
-    // if socket.type_ != SocketType::Raw && socket.type_ != SocketType::Dgram {
-    //     return Err(Error::SocketTypeNotSupported);
-    // }
-    if !(0..MAX_LINKS).contains(&protocol) {
-        return Err(Error::ProtocolNotSupported);
-    }
-    // 安全的数组索引封装
-    let protocol = protocol as usize;
-    // 这里简化了锁和模块加载逻辑
-    // 假设成功加载了模块和相关函数
-    Ok(())
-}
 
 struct callback_head {
     next: Option<Box<callback_head>>,
@@ -469,7 +491,7 @@ impl callback_head {
         None
     }
 }
-
+#[derive(Clone)]
 struct listeners {
     // Recursive Wakeup Unlocking?
     masks: Vec<u64>,
@@ -485,7 +507,7 @@ impl listeners {
 
 lazy_static! {
     /// 一个维护全局的NetlinkTable的哈希链，每一个元素代表一个netlink协议类型，最大数量为MAX_LINKS
-    static ref NL_TABLE: RwLock<Vec<NetlinkTable>> = RwLock::new(vec![NetlinkTable::new()]);
+    static ref NL_TABLE: RwLock<Vec<NetlinkTable>> = RwLock::new(vec![NetlinkTable::new(); MAX_LINKS]);
 }
 pub fn netlink_has_listeners(sk: &NetlinkSock, group: i32) -> i32 {
     let mut res = 0;

@@ -108,6 +108,7 @@ impl Loopback {
         let buffer = self.queue.pop_front();
         match buffer {
             Some(buffer) => {
+                debug!("receive:{:?}", buffer);
                 return buffer;
             }
             None => {
@@ -138,14 +139,12 @@ unsafe impl Sync for LoopbackDriverWapper {}
 impl Deref for LoopbackDriverWapper {
     type Target = LoopbackDriver;
     fn deref(&self) -> &Self::Target {
-        debug!("use unsafe!");
         unsafe { &*self.0.get() }
     }
 }
 /// ## `deref_mut` 方法返回一个指向可变 `LoopbackDriver` 的引用。
 impl DerefMut for LoopbackDriverWapper {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        debug!("use unsafe!");
         unsafe { &mut *self.0.get() }
     }
 }

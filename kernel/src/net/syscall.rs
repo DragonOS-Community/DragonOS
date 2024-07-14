@@ -1,6 +1,7 @@
 use core::{cmp::min, ffi::CStr};
 
 use alloc::{boxed::Box, sync::Arc};
+use log::debug;
 use num_traits::{FromPrimitive, ToPrimitive};
 use smoltcp::wire;
 use system_error::SystemError;
@@ -579,6 +580,7 @@ impl SockAddr {
                     let ip: wire::IpAddress = wire::IpAddress::from(wire::Ipv4Address::from_bytes(
                         &u32::from_be(addr_in.sin_addr).to_be_bytes()[..],
                     ));
+                    debug!("ip:{:?}", ip.as_bytes());
                     let port = u16::from_be(addr_in.sin_port);
 
                     return Ok(Endpoint::Ip(Some(wire::IpEndpoint::new(ip, port))));

@@ -45,7 +45,6 @@ impl RiscVSbiTimer {
         //     CurrentTimeArch::get_cycles() as u64
         // );
         tick_handle_periodic(trap_frame);
-        try_raise_timer_softirq();
         compiler_fence(Ordering::SeqCst);
         sbi_rt::set_timer(CurrentTimeArch::get_cycles() as u64 + unsafe { INTERVAL_CNT } as u64);
         Ok(())

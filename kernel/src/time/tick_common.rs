@@ -7,6 +7,8 @@ use crate::{
 
 use super::timer::update_timer_jiffies;
 
+/// # 函数的功能
+/// 用于周期滴答的事件处理
 pub fn tick_handle_periodic(trap_frame: &TrapFrame) {
     let cpu_id = smp_get_processor_id();
 

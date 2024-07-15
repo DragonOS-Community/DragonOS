@@ -274,7 +274,6 @@ impl dyn Clocksource {
         let cs_data_guard = self.clocksource_data();
 
         let mut max_cycles: u64;
-        // 这里我有问题，不知道要不要修改，暂时不修改它
         max_cycles = (1 << (63 - (log2(cs_data_guard.mult + cs_data_guard.maxadj) + 1))) as u64;
         max_cycles = max_cycles.min(cs_data_guard.mask.bits);
         let max_nsecs = clocksource_cyc2ns(

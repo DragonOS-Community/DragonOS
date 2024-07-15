@@ -65,7 +65,7 @@ pub struct TimekeeperData {
     wall_to_monotonic: PosixTimeSpec,
     total_sleep_time: PosixTimeSpec,
     xtime: PosixTimeSpec,
-    /// 实时偏移量
+    /// 单调时间和实时时间的偏移量
     real_time_offset: ktime_t,
 }
 impl TimekeeperData {
@@ -450,6 +450,7 @@ pub fn update_wall_time() {
 }
 // TODO wall_to_monotic
 
+/// 参考：https://code.dragonos.org.cn/xref/linux-3.4.99/kernel/time/timekeeping.c#190
 pub fn timekeeping_update() {
     // TODO：如果clearntp为true，则会清除NTP错误并调用ntp_clear()
 

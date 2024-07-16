@@ -674,6 +674,7 @@ impl InnerAddressSpace {
                 self.mappings.insert_vma(r.clone());
                 return Err(SystemError::EACCES);
             }
+            r_guard.set_vm_flags(VmFlags::from(prot_flags));
 
             let new_flags: EntryFlags<MMArch> = r_guard
                 .flags()

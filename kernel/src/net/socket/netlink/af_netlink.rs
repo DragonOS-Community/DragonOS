@@ -2,6 +2,7 @@
 
 
 use core::mem::size_of;
+use core::ops::DerefMut;
 use core::{any::Any, cell::RefCell, fmt::Debug, hash::Hash, ops::Deref};
 
 use alloc::rc::Rc;
@@ -263,14 +264,78 @@ pub fn netlink_add_usersock_entry(nl_table: &mut RwLockWriteGuard<Vec<NetlinkTab
 	nl_table[index].registered = 1;
 	nl_table[index].flags = NL_CFG_F_NONROOT_SEND;
 }
+// https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#572
+// static int netlink_insert(struct sock *sk, u32 portid)
+// {
+// 	struct netlink_table *table = &nl_table[sk->sk_protocol];
+// 	int err;
 
-/// 
-fn netlink_insert(){
+// 	lock_sock(sk);
 
+// 	err = nlk_sk(sk)->portid == portid ? 0 : -EBUSY;
+// 	if (nlk_sk(sk)->bound)
+// 		goto err;
+
+// 	/* portid can be read locklessly from netlink_getname(). */
+// 	WRITE_ONCE(nlk_sk(sk)->portid, portid);
+
+// 	sock_hold(sk);
+
+// 	err = __netlink_insert(table, sk);
+// 	if (err) {
+// 		/* In case the hashtable backend returns with -EBUSY
+// 		 * from here, it must not escape to the caller.
+// 		 */
+// 		if (unlikely(err == -EBUSY))
+// 			err = -EOVERFLOW;
+// 		if (err == -EEXIST)
+// 			err = -EADDRINUSE;
+// 		sock_put(sk);
+// 		goto err;
+// 	}
+
+// 	/* We need to ensure that the socket is hashed and visible. */
+// 	smp_wmb();
+// 	/* Paired with lockless reads from netlink_bind(),
+// 	 * netlink_connect() and netlink_sendmsg().
+// 	 */
+// 	WRITE_ONCE(nlk_sk(sk)->bound, portid);
+
+// err:
+// 	release_sock(sk);
+// 	return err;
+// }
+
+/// 内核套接字插入 nl_table
+fn netlink_insert(sk: &Arc<dyn NetlinkSocket>, portid: u32) -> Result<(), SystemError> {
+    let mut nl_table = NL_TABLE.write();
+    let index = sk.sk_protocol();
+    nl_table[index].hash.insert(portid, Arc::clone(sk));
+    // 从Arc<dyn NetlinkSocket>中获取NetlinkSock
+    let mut nlk: Arc<NetlinkSock> = Arc::clone(sk).arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
+    if nlk.portid != portid {
+        return Err(SystemError::EBUSY);
+    }
+    // 套接字是否已经绑定
+    if nlk.bound{
+        log::debug!("netlink_insert: socket already bound\n");
+        return Err(SystemError::EINVAL);
+    }
+    // 设置套接字的端口ID
+    // 遇到问题，这种方法得到的nlk无法修改
+    // nlk.portid = portid;
+
+
+    // 增加套接字的引用计数
+    // sock_hold(&nlk);
+    // 设置套接字的绑定状态
+    // nlk.bound = true;
+
+    Ok(())
 }
 
 /// 
-fn netlink_lookup(){
+fn netlink_lookup() {
 
 }
 
@@ -308,6 +373,7 @@ pub struct NetlinkSock {
     subscriptions: u32,
     ngroups: u64,
     groups: Vec<u64>,
+    bound: bool,
     state: u64,
     max_recvmsg_len: usize,
     dump_done_errno: i32,
@@ -550,6 +616,7 @@ fn sk_for_each_bound(sk: &NetlinkSock, mc_list: &HListHead) {
     }
 }
 fn do_one_broadcast(sk: &Arc<dyn NetlinkSocket>, info: &mut Box<NetlinkBroadcastData>)->Result<(), SystemError> {
+    // 从Arc<dyn NetlinkSocket>中获取NetlinkSock
     let nlk: Arc<NetlinkSock> = Arc::clone(sk).arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
     if info.exclude_sk.equals(&**sk) {
         return Err(SystemError::EINVAL);

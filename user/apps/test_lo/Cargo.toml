@@ -5,6 +5,3 @@ edition = "2021"
 description = "测试lo网卡功能"
 authors = [ "smallc <2628035541@qq.com>" ]
 
-[dependencies]
-icmp = "0.3.0"
-

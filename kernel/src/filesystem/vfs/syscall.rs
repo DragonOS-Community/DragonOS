@@ -3,13 +3,14 @@ use core::mem::size_of;
 
 use alloc::string::ToString;
 use alloc::{string::String, sync::Arc, vec::Vec};
+use log::warn;
 use system_error::SystemError;
 
 use crate::producefs;
+use crate::syscall::user_access::UserBufferReader;
 use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
     filesystem::vfs::{core as Vcore, file::FileDescriptorVec},
-    kerror,
     libs::rwlock::RwLockWriteGuard,
     mm::{verify_area, VirtAddr},
     process::ProcessManager,
@@ -17,19 +18,18 @@ use crate::{
         user_access::{self, check_and_clone_cstr, UserBufferWriter},
         Syscall,
     },
-    time::PosixTimeSpec,
+    time::{syscall::PosixTimeval, PosixTimeSpec},
 };
 
 use super::{
     core::{do_mkdir_at, do_remove_dir, do_unlink_at},
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
-    open::{do_faccessat, do_fchmodat, do_sys_open},
+    open::{do_faccessat, do_fchmodat, do_sys_open, do_utimensat, do_utimes},
     utils::{rsplit_path, user_path_at},
     Dirent, FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
-// use crate::kdebug;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -321,6 +321,13 @@ bitflags! {
         const STATX_ATTR_VERITY = 0x00100000;
         /// 文件当前处于 DAX 状态 CPU直接访问
         const STATX_ATTR_DAX = 0x00200000;
+    }
+}
+
+bitflags! {
+    pub struct UtimensFlags: u32 {
+        /// 不需要解释符号链接
+        const AT_SYMLINK_NOFOLLOW = 0x100;
     }
 }
 
@@ -908,7 +915,7 @@ impl Syscall {
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
 
         if flags.contains(AtFlags::AT_REMOVEDIR) {
-            // kdebug!("rmdir");
+            // debug!("rmdir");
             match do_remove_dir(dirfd, &path) {
                 Err(err) => {
                     return Err(err);
@@ -1092,7 +1099,7 @@ impl Syscall {
     /// - `cmd`：命令
     /// - `arg`：参数
     pub fn fcntl(fd: i32, cmd: FcntlCommand, arg: i32) -> Result<usize, SystemError> {
-        // kdebug!("fcntl ({cmd:?}) fd: {fd}, arg={arg}");
+        // debug!("fcntl ({cmd:?}) fd: {fd}, arg={arg}");
         match cmd {
             FcntlCommand::DupFd | FcntlCommand::DupFdCloexec => {
                 if arg < 0 || arg as usize >= FileDescriptorVec::PROCESS_MAX_FD {
@@ -1186,7 +1193,7 @@ impl Syscall {
                 // TODO: unimplemented
                 // 未实现的命令，返回0，不报错。
 
-                kwarn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
+                warn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
                 return Err(SystemError::ENOSYS);
             }
         }
@@ -1568,7 +1575,7 @@ impl Syscall {
 
         // fchmod没完全实现，因此不修改文件的权限
         // todo: 实现fchmod
-        kwarn!("fchmod not fully implemented");
+        warn!("fchmod not fully implemented");
         return Ok(0);
     }
     /// #挂载文件系统
@@ -1620,6 +1627,44 @@ impl Syscall {
             UmountFlag::from_bits(flags).ok_or(SystemError::EINVAL)?,
         )?;
         return Ok(());
+    }
+
+    pub fn sys_utimensat(
+        dirfd: i32,
+        pathname: *const u8,
+        times: *const PosixTimeSpec,
+        flags: u32,
+    ) -> Result<usize, SystemError> {
+        let pathname = if pathname.is_null() {
+            None
+        } else {
+            let pathname = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?;
+            Some(pathname)
+        };
+        let flags = UtimensFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
+        let times = if times.is_null() {
+            None
+        } else {
+            let times_reader = UserBufferReader::new(times, size_of::<PosixTimeSpec>() * 2, true)?;
+            let times = times_reader.read_from_user::<PosixTimeSpec>(0)?;
+            Some([times[0], times[1]])
+        };
+        do_utimensat(dirfd, pathname, times, flags)
+    }
+
+    pub fn sys_utimes(
+        pathname: *const u8,
+        times: *const PosixTimeval,
+    ) -> Result<usize, SystemError> {
+        let pathname = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?;
+        let times = if times.is_null() {
+            None
+        } else {
+            let times_reader = UserBufferReader::new(times, size_of::<PosixTimeval>() * 2, true)?;
+            let times = times_reader.read_from_user::<PosixTimeval>(0)?;
+            Some([times[0], times[1]])
+        };
+        do_utimes(&pathname, times)
     }
 }
 

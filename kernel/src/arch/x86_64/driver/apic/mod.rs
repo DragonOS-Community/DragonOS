@@ -1,6 +1,7 @@
 use core::sync::atomic::Ordering;
 
 use atomic_enum::atomic_enum;
+use log::{debug, info};
 use system_error::SystemError;
 use x86::{apic::Icr, msr::IA32_APIC_BASE};
 
@@ -10,7 +11,6 @@ use crate::{
         io::PortIOArch,
         CurrentPortIOArch,
     },
-    kdebug, kinfo,
     mm::PhysAddr,
     smp::core::smp_get_processor_id,
 };
@@ -468,7 +468,7 @@ impl CurrentApic {
         CurrentPortIOArch::out8(0x20, 0x20);
         CurrentPortIOArch::out8(0xa0, 0x20);
 
-        kdebug!("8259A Masked.");
+        debug!("8259A Masked.");
 
         // enable IMCR
         CurrentPortIOArch::out8(0x22, 0x70);
@@ -488,14 +488,14 @@ impl LocalAPIC for CurrentApic {
                 self.mask8259a();
             }
         }
-        kinfo!("Initializing apic for cpu {:?}", cpu_id);
+        info!("Initializing apic for cpu {:?}", cpu_id);
         if X2Apic::support() && X2Apic.init_current_cpu() {
             if cpu_id.data() == 0 {
                 LOCAL_APIC_ENABLE_TYPE.store(LocalApicEnableType::X2Apic, Ordering::SeqCst);
             }
-            kinfo!("x2APIC initialized for cpu {:?}", cpu_id);
+            info!("x2APIC initialized for cpu {:?}", cpu_id);
         } else {
-            kinfo!("x2APIC not supported or failed to initialize, fallback to xAPIC.");
+            info!("x2APIC not supported or failed to initialize, fallback to xAPIC.");
             if cpu_id.data() == 0 {
                 LOCAL_APIC_ENABLE_TYPE.store(LocalApicEnableType::XApic, Ordering::SeqCst);
             }
@@ -514,10 +514,10 @@ impl LocalAPIC for CurrentApic {
                 xapic.init_current_cpu();
             }
 
-            kinfo!("xAPIC initialized for cpu {:?}", cpu_id);
+            info!("xAPIC initialized for cpu {:?}", cpu_id);
         }
 
-        kinfo!("Apic initialized.");
+        info!("Apic initialized.");
         return true;
     }
 

@@ -1,11 +1,11 @@
 use fdt::node::FdtNode;
+use log::{debug, info};
 use system_error::SystemError;
 
 use crate::{
     arch::{driver::sbi::SbiDriver, mm::init::mm_early_init},
     driver::{firmware::efi::init::efi_init, open_firmware::fdt::open_firmware_fdt_driver},
     init::{boot_params, init::start_kernel},
-    kdebug, kinfo,
     mm::{memblock::mem_block_manager, PhysAddr, VirtAddr},
     print, println,
     smp::cpu::ProcessorId,
@@ -112,13 +112,12 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
     arch_boot_params_guard.arch.fdt_paddr = fdt_paddr;
     arch_boot_params_guard.arch.fdt_size = fdt.total_size();
     arch_boot_params_guard.arch.boot_hartid = ProcessorId::new(hartid);
-    // kdebug!("fdt_paddr: {:?}, fdt_size: {}", fdt_paddr, fdt.total_size());
+    // debug!("fdt_paddr: {:?}, fdt_size: {}", fdt_paddr, fdt.total_size());
     drop(arch_boot_params_guard);
 
-    kinfo!(
+    info!(
         "DragonOS kernel is running on hart {}, fdt address:{:?}",
-        hartid,
-        fdt_paddr
+        hartid, fdt_paddr
     );
     mm_early_init();
 
@@ -127,7 +126,7 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
     unsafe { parse_dtb() };
 
     for x in mem_block_manager().to_iter() {
-        kdebug!("before efi: {x:?}");
+        debug!("before efi: {x:?}");
     }
 
     efi_init();

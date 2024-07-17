@@ -1,4 +1,5 @@
 use alloc::{string::ToString, sync::Arc};
+use log::error;
 use system_error::SystemError;
 
 use crate::{
@@ -155,7 +156,7 @@ pub unsafe fn riscv_intc_init() -> Result<(), SystemError> {
             RiscvIntcChip::IRQ_SIZE,
         )
         .ok_or_else(|| {
-            kerror!("Failed to create riscv-intc domain");
+            error!("Failed to create riscv-intc domain");
             SystemError::ENXIO
         })?;
 
@@ -197,7 +198,7 @@ pub fn riscv_intc_assicate_irq(hwirq: HardwareIrqNumber) -> Option<IrqNumber> {
     irq_domain_manager()
         .domain_associate(
             riscv_intc_domain().as_ref().or_else(|| {
-                kerror!("riscv_intc_domain is None");
+                error!("riscv_intc_domain is None");
                 None
             })?,
             virq,

@@ -64,7 +64,7 @@ pub enum TypeOneFSMState {
 impl TypeOneFSMState {
     /// @brief 状态机总控程序
     fn parse(&self, scancode: u8, scancode_status: &mut ScanCodeStatus) -> TypeOneFSMState {
-        // kdebug!("the code is {:#x}\n", scancode);
+        // debug!("the code is {:#x}\n", scancode);
         match self {
             TypeOneFSMState::Start => {
                 return self.handle_start(scancode, scancode_status);
@@ -87,7 +87,7 @@ impl TypeOneFSMState {
 
     /// @brief 处理起始状态
     fn handle_start(&self, scancode: u8, scancode_status: &mut ScanCodeStatus) -> TypeOneFSMState {
-        //kdebug!("in handle_start the code is {:#x}\n",scancode);
+        //debug!("in handle_start the code is {:#x}\n",scancode);
         match scancode {
             0xe1 => {
                 return TypeOneFSMState::PauseBreak(1);
@@ -96,7 +96,7 @@ impl TypeOneFSMState {
                 return TypeOneFSMState::Func0;
             }
             _ => {
-                //kdebug!("in _d the code is {:#x}\n",scancode);
+                //debug!("in _d the code is {:#x}\n",scancode);
                 return TypeOneFSMState::Type3.handle_type3(scancode, scancode_status);
             }
         }
@@ -274,7 +274,7 @@ impl TypeOneFSMState {
         let mut col: bool = false;
         let index = scancode & 0x7f;
 
-        //kdebug!("in type3 ch is {:#x}\n",ch);
+        //debug!("in type3 ch is {:#x}\n",ch);
         let mut key = KeyFlag::OtherKey; // 可视字符
 
         match index {
@@ -306,7 +306,7 @@ impl TypeOneFSMState {
             }
             _ => {
                 if !flag_make {
-                    // kdebug!("in type3 ch is {:#x}\n",ch);
+                    // debug!("in type3 ch is {:#x}\n",ch);
                     key = KeyFlag::NoneFlag;
                 }
             }
@@ -327,7 +327,7 @@ impl TypeOneFSMState {
 
         let mut ch = TYPE1_KEY_CODE_MAPTABLE[col as usize + 2 * index as usize];
         if key != KeyFlag::NoneFlag {
-            // kdebug!("EMIT: ch is '{}', keyflag is {:?}\n", ch as char, key);
+            // debug!("EMIT: ch is '{}', keyflag is {:?}\n", ch as char, key);
             if scancode_status.ctrl_l || scancode_status.ctrl_r {
                 ch = Self::to_ctrl(ch);
             }

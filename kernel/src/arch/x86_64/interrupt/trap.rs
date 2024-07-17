@@ -1,9 +1,9 @@
+use log::{error, warn};
 use system_error::SystemError;
 
 use crate::{
     arch::{CurrentIrqArch, MMArch},
     exception::InterruptArch,
-    kerror, kwarn,
     mm::VirtAddr,
     process::ProcessManager,
     smp::core::smp_get_processor_id,
@@ -112,7 +112,7 @@ pub fn arch_trap_init() -> Result<(), SystemError> {
 /// 处理除法错误 0 #DE
 #[no_mangle]
 unsafe extern "C" fn do_divide_error(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
+    error!(
         "do_divide_error(0), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -126,7 +126,7 @@ unsafe extern "C" fn do_divide_error(regs: &'static TrapFrame, error_code: u64) 
 /// 处理调试异常 1 #DB
 #[no_mangle]
 unsafe extern "C" fn do_debug(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
+    error!(
         "do_debug(1), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -140,7 +140,7 @@ unsafe extern "C" fn do_debug(regs: &'static TrapFrame, error_code: u64) {
 /// 处理NMI中断 2 NMI
 #[no_mangle]
 unsafe extern "C" fn do_nmi(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
+    error!(
         "do_nmi(2), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -154,7 +154,7 @@ unsafe extern "C" fn do_nmi(regs: &'static TrapFrame, error_code: u64) {
 /// 处理断点异常 3 #BP
 #[no_mangle]
 unsafe extern "C" fn do_int3(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
+    error!(
         "do_int3(3), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -168,7 +168,7 @@ unsafe extern "C" fn do_int3(regs: &'static TrapFrame, error_code: u64) {
 /// 处理溢出异常 4 #OF
 #[no_mangle]
 unsafe extern "C" fn do_overflow(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
+    error!(
         "do_overflow(4), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -182,7 +182,7 @@ unsafe extern "C" fn do_overflow(regs: &'static TrapFrame, error_code: u64) {
 /// 处理BOUND指令检查异常 5 #BR
 #[no_mangle]
 unsafe extern "C" fn do_bounds(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
+    error!(
         "do_bounds(5), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -196,7 +196,7 @@ unsafe extern "C" fn do_bounds(regs: &'static TrapFrame, error_code: u64) {
 /// 处理未定义操作码异常 6 #UD
 #[no_mangle]
 unsafe extern "C" fn do_undefined_opcode(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
+    error!(
         "do_undefined_opcode(6), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -210,7 +210,7 @@ unsafe extern "C" fn do_undefined_opcode(regs: &'static TrapFrame, error_code: u
 /// 处理设备不可用异常(FPU不存在) 7 #NM
 #[no_mangle]
 unsafe extern "C" fn do_dev_not_avaliable(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
+    error!(
         "do_dev_not_avaliable(7), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -224,7 +224,7 @@ unsafe extern "C" fn do_dev_not_avaliable(regs: &'static TrapFrame, error_code: 
 /// 处理双重错误 8 #DF
 #[no_mangle]
 unsafe extern "C" fn do_double_fault(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
+    error!(
         "do_double_fault(8), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -238,7 +238,7 @@ unsafe extern "C" fn do_double_fault(regs: &'static TrapFrame, error_code: u64) 
 /// 处理协处理器段越界 9 #MF
 #[no_mangle]
 unsafe extern "C" fn do_coprocessor_segment_overrun(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
+    error!(
         "do_coprocessor_segment_overrun(9), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -272,7 +272,7 @@ unsafe extern "C" fn do_invalid_TSS(regs: &'static TrapFrame, error_code: u64) {
         ERR_MSG_4
     };
 
-    kerror!(
+    error!(
         "do_invalid_TSS(10), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}\n{}{}",
         error_code,
         regs.rsp,
@@ -288,7 +288,7 @@ unsafe extern "C" fn do_invalid_TSS(regs: &'static TrapFrame, error_code: u64) {
 /// 处理段不存在 11 #NP
 #[no_mangle]
 unsafe extern "C" fn do_segment_not_exists(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
+    error!(
         "do_segment_not_exists(11), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -302,7 +302,7 @@ unsafe extern "C" fn do_segment_not_exists(regs: &'static TrapFrame, error_code:
 /// 处理栈段错误 12 #SS
 #[no_mangle]
 unsafe extern "C" fn do_stack_segment_fault(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
+    error!(
         "do_stack_segment_fault(12), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -343,7 +343,7 @@ unsafe extern "C" fn do_general_protection(regs: &'static TrapFrame, error_code:
     } else {
         ""
     };
-    kerror!(
+    error!(
         "do_general_protection(13), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t rflags: {:#x}\t CPU: {}, \tpid: {:?}
 {}{}{}
 Segment Selector Index: {:#x}\n
@@ -363,7 +363,7 @@ Segment Selector Index: {:#x}\n
 /// 处理页错误 14 #PF
 #[no_mangle]
 unsafe extern "C" fn do_page_fault(regs: &'static TrapFrame, error_code: u64) {
-    // kerror!(
+    // error!(
     //     "do_page_fault(14), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}, \nFault Address: {:#x}",
     //     error_code,
     //     regs.rsp,
@@ -401,7 +401,7 @@ unsafe extern "C" fn do_page_fault(regs: &'static TrapFrame, error_code: u64) {
     // panic!("Page Fault");
     CurrentIrqArch::interrupt_disable();
     let address = x86::controlregs::cr2();
-    // crate::kinfo!(
+    // log::info!(
     //     "fault address: {:#x}, error_code: {:#b}, pid: {}\n",
     //     address,
     //     error_code,
@@ -421,7 +421,7 @@ unsafe extern "C" fn do_page_fault(regs: &'static TrapFrame, error_code: u64) {
 /// 处理x87 FPU错误 16 #MF
 #[no_mangle]
 unsafe extern "C" fn do_x87_FPU_error(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
+    error!(
         "do_x87_FPU_error(16), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -435,7 +435,7 @@ unsafe extern "C" fn do_x87_FPU_error(regs: &'static TrapFrame, error_code: u64)
 /// 处理对齐检查 17 #AC
 #[no_mangle]
 unsafe extern "C" fn do_alignment_check(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
+    error!(
         "do_alignment_check(17), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -449,7 +449,7 @@ unsafe extern "C" fn do_alignment_check(regs: &'static TrapFrame, error_code: u6
 /// 处理机器检查 18 #MC
 #[no_mangle]
 unsafe extern "C" fn do_machine_check(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
+    error!(
         "do_machine_check(18), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -463,7 +463,7 @@ unsafe extern "C" fn do_machine_check(regs: &'static TrapFrame, error_code: u64)
 /// 处理SIMD异常 19 #XM
 #[no_mangle]
 unsafe extern "C" fn do_SIMD_exception(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
+    error!(
         "do_SIMD_exception(19), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -477,7 +477,7 @@ unsafe extern "C" fn do_SIMD_exception(regs: &'static TrapFrame, error_code: u64
 /// 处理虚拟化异常 20 #VE
 #[no_mangle]
 unsafe extern "C" fn do_virtualization_exception(regs: &'static TrapFrame, error_code: u64) {
-    kerror!(
+    error!(
         "do_virtualization_exception(20), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -490,5 +490,5 @@ unsafe extern "C" fn do_virtualization_exception(regs: &'static TrapFrame, error
 
 #[no_mangle]
 unsafe extern "C" fn ignore_int_handler(_regs: &'static TrapFrame, _error_code: u64) {
-    kwarn!("Unknown interrupt.");
+    warn!("Unknown interrupt.");
 }

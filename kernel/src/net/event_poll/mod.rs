@@ -1,5 +1,6 @@
 use core::{
     cell::Cell,
+    any::Any,
     fmt::Debug,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -9,6 +10,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use intertrait::CastFromSync;
 use system_error::SystemError;
 
 use crate::{
@@ -130,6 +132,10 @@ impl EPollItem {
         return EPollEventType::empty();
     }
 }
+
+pub trait KernelIoctlData: Send + Sync + Any + Debug + CastFromSync {}
+
+impl KernelIoctlData for EPollItem {}
 
 /// ### Epoll文件的私有信息
 #[derive(Debug, Clone)]
@@ -567,7 +573,7 @@ impl EventPoll {
             // 记数加一
             res += 1;
 
-            // crate::kdebug!("ep send {event:?}");
+            // crate::debug!("ep send {event:?}");
 
             if ep_events.contains(EPollEventType::EPOLLONESHOT) {
                 let mut event_writer = epitem.event.write();

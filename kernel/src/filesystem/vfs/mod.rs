@@ -350,6 +350,14 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    fn kernel_ioctl(
+        &self,
+        _arg: Arc<dyn crate::net::event_poll::KernelIoctlData>,
+        _data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
+
     /// @brief 获取inode所在的文件系统的指针
     fn fs(&self) -> Arc<dyn FileSystem>;
 
@@ -882,7 +890,7 @@ macro_rules! producefs {
         match $initializer_slice.iter().find(|&m| m.name == $filesystem) {
             Some(maker) => maker.call(),
             None => {
-                kerror!("mismatch filesystem type : {}", $filesystem);
+                log::error!("mismatch filesystem type : {}", $filesystem);
                 Err(SystemError::EINVAL)
             }
         }

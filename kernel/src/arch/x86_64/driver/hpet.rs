@@ -7,6 +7,7 @@ use core::{
 
 use acpi::HpetInfo;
 use alloc::{string::ToString, sync::Arc};
+use log::{debug, error, info};
 use system_error::SystemError;
 
 use crate::{
@@ -21,7 +22,6 @@ use crate::{
         manage::irq_manager,
         InterruptArch, IrqNumber,
     },
-    kdebug, kerror, kinfo,
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         volatile::volwrite,
@@ -30,10 +30,7 @@ use crate::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         PhysAddr,
     },
-    time::{
-        jiffies::NSEC_PER_JIFFY,
-        timer::{try_raise_timer_softirq, update_timer_jiffies},
-    },
+    time::jiffies::NSEC_PER_JIFFY,
 };
 
 static mut HPET_INSTANCE: Option<Hpet> = None;
@@ -80,8 +77,8 @@ impl Hpet {
                 .unwrap()
         };
         let tm_num = hpet.timers_num();
-        kdebug!("HPET0_INTERVAL_USEC: {}", Self::HPET0_INTERVAL_USEC);
-        kinfo!("HPET has {} timers", tm_num);
+        debug!("HPET0_INTERVAL_USEC: {}", Self::HPET0_INTERVAL_USEC);
+        info!("HPET has {} timers", tm_num);
         hpet_info.hpet_number = tm_num as u8;
 
         drop(mmio);
@@ -124,10 +121,10 @@ impl Hpet {
         // ！！！这里是临时糊代码的，需要在apic重构的时候修改！！！
         let (inner_guard, regs) = unsafe { self.hpet_regs_mut() };
         let freq = regs.frequency();
-        kdebug!("HPET frequency: {} Hz", freq);
+        debug!("HPET frequency: {} Hz", freq);
         let ticks = Self::HPET0_INTERVAL_USEC * freq / 1000000;
         if ticks == 0 || ticks > freq * 8 {
-            kerror!("HPET enable: ticks '{ticks}' is invalid");
+            error!("HPET enable: ticks '{ticks}' is invalid");
             return Err(SystemError::EINVAL);
         }
         if unlikely(regs.timers_num() == 0) {
@@ -166,7 +163,7 @@ impl Hpet {
 
         drop(inner_guard);
 
-        kinfo!("HPET enabled");
+        info!("HPET enabled");
 
         drop(irq_guard);
         return Ok(());
@@ -239,7 +236,7 @@ impl Hpet {
     pub fn period(&self) -> u64 {
         let (inner_guard, regs) = unsafe { self.hpet_regs() };
         let period = regs.counter_clock_period();
-        kdebug!("HPET period: {}", period);
+        debug!("HPET period: {}", period);
 
         drop(inner_guard);
         return period;
@@ -249,9 +246,6 @@ impl Hpet {
     pub(super) fn handle_irq(&self, timer_num: u32) {
         if timer_num == 0 {
             assert!(!CurrentIrqArch::is_irq_enabled());
-            update_timer_jiffies(1, Self::HPET0_INTERVAL_USEC as i64);
-
-            try_raise_timer_softirq();
         }
     }
 }

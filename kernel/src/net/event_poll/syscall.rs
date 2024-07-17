@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use log::debug;
 use system_error::SystemError;
 
 use crate::{
@@ -124,9 +125,9 @@ impl Syscall {
                 )?;
                 let mut cfd = CPollfd::default();
                 reader.copy_one_from_user::<CPollfd>(&mut cfd, 0)?;
-                // kdebug!("{:?}",cfd);
+                // debug!("{:?}",cfd);
                 let fd = Pollfd::from(cfd);
-                // kdebug!("{:?}",fd);
+                // debug!("{:?}",fd);
                 fds.push(fd);
                 read_add += core::mem::size_of::<CPollfd>();
             }
@@ -163,7 +164,7 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         let mut timer = None;
         let mut timeout = false;
-        kdebug!("{:?}", poll_fds);
+        debug!("{:?}", poll_fds);
         loop {
             let mut revent_nums = 0;
             for poll_fd in poll_fds {
@@ -188,19 +189,19 @@ impl Syscall {
 
                 let revents =
                     EPollEventType::from_bits_truncate(file.poll()? as u32) & !flag_to_check1;
-                // kdebug!("{:?}",poll_fd);
+                // debug!("{:?}",poll_fd);
 
                 if !revents.is_empty() {
-                    kdebug!("{:?}", poll_fd);
+                    debug!("{:?}", poll_fd);
 
                     revent_nums += 1;
-                    // kdebug!("after:{:?}",revent_nums);
+                    // debug!("after:{:?}",revent_nums);
                     poll_fd.revents().set(revents | flag_to_check1);
                 }
                 // poll_fd.revents().set(revents | flag_to_check1);
             }
-            // kdebug!("{:?}",revent_nums);
-            // kdebug!("{:?}", poll_fds);
+            // debug!("{:?}",revent_nums);
+            // debug!("{:?}", poll_fds);
             if revent_nums > 0 {
                 return Ok(revent_nums);
             }

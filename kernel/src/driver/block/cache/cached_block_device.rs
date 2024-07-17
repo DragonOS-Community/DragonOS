@@ -1,5 +1,6 @@
 use alloc::{boxed::Box, vec::Vec};
 use hashbrown::HashMap;
+use log::debug;
 
 use crate::{driver::base::block::block_device::BlockId, libs::rwlock::RwLock};
 
@@ -41,7 +42,7 @@ impl BlockCache {
             CSPACE = Some(LockedCacheSpace::new(CacheSpace::new()));
             CMAPPER = Some(LockedCacheMapper::new(CacheMapper::new()));
         }
-        kdebug!("BlockCache Initialized!");
+        debug!("BlockCache Initialized!");
     }
     /// # 函数的功能
     /// 使用blockcache进行对块设备进行连续块的读操作

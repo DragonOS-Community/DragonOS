@@ -5,6 +5,7 @@ use alloc::{
     vec::Vec,
 };
 use bitmap::{traits::BitMapOps, StaticBitmap};
+use log::warn;
 
 use crate::{
     driver::{
@@ -936,7 +937,7 @@ impl VirtualConsoleData {
 
             'c' => {
                 if self.par[0] == 0 {
-                    kwarn!("respone ID todo");
+                    warn!("respone ID todo");
                 }
                 return;
             }
@@ -1612,7 +1613,7 @@ impl VirtualConsoleData {
 
             tc |= ((attr as u32) << 8) & (!himask as u32);
 
-            // kwarn!(
+            // warn!(
             //     "ch {} pos {} x {} y {} cols {}",
             //     c as u8 as char,
             //     self.pos,

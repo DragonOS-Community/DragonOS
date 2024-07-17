@@ -20,6 +20,7 @@ use crate::{
     syscall::user_access::check_and_clone_cstr,
 };
 
+use log::{info, warn};
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 
@@ -28,10 +29,9 @@ use crate::{
     filesystem::vfs::{
         fcntl::{AtFlags, FcntlCommand},
         file::FileMode,
-        syscall::{ModeType, PosixKstat},
+        syscall::{ModeType, PosixKstat, UtimensFlags},
         MAX_PATHLEN,
     },
-    kinfo,
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
@@ -69,9 +69,9 @@ impl Syscall {
         if prev {
             panic!("Cannot initialize syscall more than once!");
         }
-        kinfo!("Initializing syscall...");
+        info!("Initializing syscall...");
         let r = crate::arch::syscall::arch_syscall_init();
-        kinfo!("Syscall init successfully!");
+        info!("Syscall init successfully!");
 
         return r;
     }
@@ -369,7 +369,7 @@ impl Syscall {
             SYS_KILL => {
                 let pid = Pid::new(args[0]);
                 let sig = args[1] as c_int;
-                // kdebug!("KILL SYSCALL RECEIVED");
+                // debug!("KILL SYSCALL RECEIVED");
                 Self::kill(pid, sig)
             }
 
@@ -383,7 +383,7 @@ impl Syscall {
             SYS_GETPID => Self::getpid().map(|pid| pid.into()),
 
             SYS_SCHED => {
-                kwarn!("syscall sched");
+                warn!("syscall sched");
                 schedule(SchedMode::SM_NONE);
                 Ok(0)
             }
@@ -650,7 +650,7 @@ impl Syscall {
                     Err(SystemError::EINVAL)
                 };
 
-                // kdebug!("FCNTL: fd: {}, cmd: {:?}, arg: {}, res: {:?}", fd, cmd, arg, res);
+                // debug!("FCNTL: fd: {}, cmd: {:?}, arg: {}, res: {:?}", fd, cmd, arg, res);
                 res
             }
 
@@ -658,7 +658,7 @@ impl Syscall {
                 let fd = args[0] as i32;
                 let len = args[1];
                 let res = Self::ftruncate(fd, len);
-                // kdebug!("FTRUNCATE: fd: {}, len: {}, res: {:?}", fd, len, res);
+                // debug!("FTRUNCATE: fd: {}, len: {}, res: {:?}", fd, len, res);
                 res
             }
 
@@ -837,27 +837,27 @@ impl Syscall {
             SYS_POLL => Self::poll(VirtAddr::new(args[0]), args[1] as u32, args[2] as i32),
 
             SYS_SETPGID => {
-                kwarn!("SYS_SETPGID has not yet been implemented");
+                warn!("SYS_SETPGID has not yet been implemented");
                 Ok(0)
             }
 
             SYS_RT_SIGPROCMASK => {
-                kwarn!("SYS_RT_SIGPROCMASK has not yet been implemented");
+                warn!("SYS_RT_SIGPROCMASK has not yet been implemented");
                 Ok(0)
             }
 
             SYS_TKILL => {
-                kwarn!("SYS_TKILL has not yet been implemented");
+                warn!("SYS_TKILL has not yet been implemented");
                 Ok(0)
             }
 
             SYS_SIGALTSTACK => {
-                kwarn!("SYS_SIGALTSTACK has not yet been implemented");
+                warn!("SYS_SIGALTSTACK has not yet been implemented");
                 Ok(0)
             }
 
             SYS_EXIT_GROUP => {
-                kwarn!("SYS_EXIT_GROUP has not yet been implemented");
+                warn!("SYS_EXIT_GROUP has not yet been implemented");
                 Ok(0)
             }
 
@@ -888,15 +888,15 @@ impl Syscall {
 
             SYS_GETGID => Self::getgid(),
             SYS_SETUID => {
-                kwarn!("SYS_SETUID has not yet been implemented");
+                warn!("SYS_SETUID has not yet been implemented");
                 Ok(0)
             }
             SYS_SETGID => {
-                kwarn!("SYS_SETGID has not yet been implemented");
+                warn!("SYS_SETGID has not yet been implemented");
                 Ok(0)
             }
             SYS_SETSID => {
-                kwarn!("SYS_SETSID has not yet been implemented");
+                warn!("SYS_SETSID has not yet been implemented");
                 Ok(0)
             }
             SYS_GETEUID => Self::geteuid(),
@@ -972,17 +972,17 @@ impl Syscall {
             }
 
             SYS_FCHOWN => {
-                kwarn!("SYS_FCHOWN has not yet been implemented");
+                warn!("SYS_FCHOWN has not yet been implemented");
                 Ok(0)
             }
 
             SYS_FSYNC => {
-                kwarn!("SYS_FSYNC has not yet been implemented");
+                warn!("SYS_FSYNC has not yet been implemented");
                 Ok(0)
             }
 
             SYS_RSEQ => {
-                kwarn!("SYS_RSEQ has not yet been implemented");
+                warn!("SYS_RSEQ has not yet been implemented");
                 Ok(0)
             }
 
@@ -1100,7 +1100,24 @@ impl Syscall {
 
                 Self::shmctl(id, cmd, user_buf, from_user)
             }
-
+            SYS_UTIMENSAT => Self::sys_utimensat(
+                args[0] as i32,
+                args[1] as *const u8,
+                args[2] as *const PosixTimeSpec,
+                args[3] as u32,
+            ),
+            #[cfg(target_arch = "x86_64")]
+            SYS_FUTIMESAT => {
+                let flags = UtimensFlags::empty();
+                Self::sys_utimensat(
+                    args[0] as i32,
+                    args[1] as *const u8,
+                    args[2] as *const PosixTimeSpec,
+                    flags.bits(),
+                )
+            }
+            #[cfg(target_arch = "x86_64")]
+            SYS_UTIMES => Self::sys_utimes(args[0] as *const u8, args[1] as *const PosixTimeval),
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

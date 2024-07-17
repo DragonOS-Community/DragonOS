@@ -58,14 +58,14 @@
 
 请阅读[贡献者指南](https://community.dragonos.org/contributors/#%E7%A4%BE%E5%8C%BA)~
 
+- 您可以通过[社区管理团队]信息，与各委员会的成员们建立联系~
+- 同时，您可以通过[SIGs]和[WGs]页面，找到对应的社区团体负责人的联系方式~
+
 ## 贡献者名单
 
 [Contributors to DragonOS-Community/DragonOS · GitHub](https://github.com/DragonOS-Community/DragonOS/graphs/contributors)
 
-## 联系我们
 
-- 您可以通过[社区管理层]信息，与各委员会的成员们建立联系~
-- 同时，您可以通过[SIGs]和[WGs]页面，找到对应的社区团体负责人的联系方式~
 
 ## 赞助
 
@@ -123,7 +123,7 @@
 若您发现了任何违背开源协议的使用行为，我们欢迎您发邮件到 pmc@dragonos.org 反馈！让我们共同建设诚信的开源社区。
 
 
-
-[社区管理层]: https://community.dragonos.org/governance/staff-info.html
+[DragonOS社区介绍文档]: https://community.dragonos.org/
+[社区管理团队]: https://community.dragonos.org/governance/staff-info.html
 [SIGs]: https://community.dragonos.org/sigs/
 [WGs]: https://community.dragonos.org/wgs/

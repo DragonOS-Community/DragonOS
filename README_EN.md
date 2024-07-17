@@ -54,6 +54,10 @@ Carefully read the [DragonOS Community Introduction Document] to understand how 
 
 Please read the [Contributor Guide](https://community.dragonos.org/contributors/#%E7%A4%BE%E5%8C%BA)~
 
+- You can establish contact with the members of various committees through the [Community Management Team] information.
+- Additionally, you can find the contact information of the respective community group leaders via the [SIGs] and [WGs] pages.
+
+
 ## Reward
 
 &emsp;&emsp;DragonOS is an open source public welfare project, but its development cannot be separated from the support of funds. If you want, you can visit **[Sponsor - DragonOS](https://dragonos.org/?page_id=37)** , so as to promote the development of this project. The list of all sponsors will be published. Every bit of your sponsorship will contribute to the development of DragonOS!
@@ -108,3 +112,7 @@ We guarantee that all sponsorship funds and items will be used for:
 **What we condemn**: any non-compliance with the open source license. Including but not limited to: plagiarizing the code of the project as your graduation project and other academic misconduct, as well as commercial closed source use without payment.
 
 If you find any violation of the open source license, we welcome you to send email feedback! Let's build an honest open source community together!
+
+[Community Management Team]: https://community.dragonos.org/governance/staff-info.html
+[SIGs]: https://community.dragonos.org/sigs/
+[WGs]: https://community.dragonos.org/wgs/

@@ -33,6 +33,11 @@ Carefully read the [DragonOS Community Introduction Document] to understand how 
 - **To stay updated on development news and tasks, visit the DragonOS Community Forum**: [https://bbs.dragonos.org.cn](https://bbs.dragonos.org.cn)
 - You can also learn about the development progress by checking the project's issues.
 
+&emsp;&emsp;If you're interested in joining us, you can check out the issues and post your discussions or ideas under them, or visit the DragonOS forum to learn about development updates and tasks: [https://bbs.dragonos.org.cn](https://bbs.dragonos.org.cn)
+
+&emsp;&emsp;You're also welcome to bring your creative ideas and discuss them with the community members, working together to create new features for DragonOS.
+
+
 ## Website
 
 - **Project's Website**: [DragonOS.org](https://dragonos.org)
@@ -44,12 +49,6 @@ Carefully read the [DragonOS Community Introduction Document] to understand how 
 &emsp;&emsp;Running DragonOS is quite straightforward. You can refer to the following resources and get DragonOS up and running in as little as 15 minutes!
 
 - [Building DragonOS — DragonOS Development Documentation](https://docs.dragonos.org/zh_CN/latest/introduction/build_system.html)
-
-## How to Join?
-
-&emsp;&emsp;If you're interested in joining us, you can check out the issues and post your discussions or ideas under them, or visit the DragonOS forum to learn about development updates and tasks: [https://bbs.dragonos.org.cn](https://bbs.dragonos.org.cn)
-
-&emsp;&emsp;You're also welcome to bring your creative ideas and discuss them with the community members, working together to create new features for DragonOS.
 
 ## How to Connect with the Community?
 

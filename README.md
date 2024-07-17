@@ -28,10 +28,15 @@
 
 ## 参与开发？
 
-仔细阅读[DragonOS社区介绍文档]，能够帮助你了解社区的运作方式，以及如何参与贡献！
+仔细阅读 [DragonOS社区介绍文档] ，能够帮助你了解社区的运作方式，以及如何参与贡献！
 
 - **了解开发动态、开发任务，请访问DragonOS社区论坛**： [https://bbs.dragonos.org.cn](https://bbs.dragonos.org.cn)
 - 您也可以从项目的issue里面了解相关的开发内容。
+
+
+&emsp;&emsp;如果你愿意加入我们，你可以查看issue，并在issue下发表讨论、想法，或者访问DragonOS的论坛，了解开发动态、开发任务： [https://bbs.dragonos.org.cn](https://bbs.dragonos.org.cn)
+
+&emsp;&emsp;你也可以带着你的创意与想法，和社区的小伙伴一起讨论，为DragonOS创造一些新的功能。
 
 ## 网站
 
@@ -47,11 +52,7 @@
 
 - [构建DragonOS — DragonOS dev 文档](https://docs.dragonos.org/zh_CN/latest/introduction/build_system.html)
 
-## 如何加入？
 
-&emsp;&emsp;如果你愿意加入我们，你可以查看issue，并在issue下发表讨论、想法，或者访问DragonOS的论坛，了解开发动态、开发任务： [https://bbs.dragonos.org.cn](https://bbs.dragonos.org.cn)
-
-&emsp;&emsp;你也可以带着你的创意与想法，和社区的小伙伴一起讨论，为DragonOS创造一些新的功能。
 
 ## 如何与社区建立联系？
 

@@ -1,0 +1,23 @@
+{
+  "name": "test_utimensat",
+  "version": "0.1.0",
+  "description": "test_utimensat",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "apps/test_utimensat"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "install": {
+    "in_dragonos_path": "/bin"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "target_arch": ["x86_64"]
+}

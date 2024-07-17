@@ -12,10 +12,10 @@ use crate::exception::manage::irq_manager;
 use crate::exception::IrqNumber;
 
 use crate::mm::percpu::PerCpu;
-use crate::process::ProcessManager;
 use crate::smp::core::smp_get_processor_id;
 use crate::smp::cpu::ProcessorId;
 use crate::time::clocksource::HZ;
+use crate::time::tick_common::tick_handle_periodic;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 pub use drop;
@@ -277,7 +277,7 @@ impl LocalApicTimer {
 
     pub(super) fn handle_irq(trap_frame: &TrapFrame) -> Result<IrqReturn, SystemError> {
         // sched_update_jiffies();
-        ProcessManager::update_process_times(trap_frame.is_from_user());
+        tick_handle_periodic(trap_frame);
         return Ok(IrqReturn::Handled);
     }
 }

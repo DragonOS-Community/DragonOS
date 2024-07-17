@@ -59,13 +59,13 @@ int main() {
     printf("Server started. Waiting for connections...\n");
     
     while (1) {
-        printf("server_fd=%d,fds.events=%d,fds.revents=%d\n",fds[0],fds[0].events,fds[0].revents);
-        printf("client_fds=%d,fds.revents=%d\n",client_fds[1],fds[1].revents);
+        printf("server_fd=%d,fds.events=%d,fds.revents=%d\n",fds[0].fd,fds[0].events,fds[0].revents);
+        printf("client_fds[1]=%d,fds.revents[1]=%d\n",client_fds[1],fds[1].revents);
         fds[0].revents=0; 
         // 调用 poll 等待事件
         int ret = poll(fds, MAX_CLIENTS + 1, -1);
-        printf("poll后server_fd=%d,fds.events=%d,fds.revents=%d\n",fds[0],fds[0].events,fds[0].revents);
-        printf("poll后client_fds=%d,fds.revents=%d\n",client_fds[1],fds[1].revents);
+        printf("After poll server_fd=%d,fds.events=%d,fds.revents=%d\n",fds[0].fd,fds[0].events,fds[0].revents);
+        printf("After poll client_fds[1]=%d,fds[1].revents=%d\n",client_fds[1],fds[1].revents);
         printf("ret=%d\n",ret);
         // printf("server_fd=%d,fds.revents=%d\n",fds[0],fds[0].revents);
 
@@ -91,7 +91,7 @@ int main() {
             }
 
             // 将新连接添加到客户端连接数组
-            int i;
+            int i=0;
             for (i = 1; i <= MAX_CLIENTS; i++) {
                 if (client_fds[i] == 0) {
                     client_fds[i] = client_fd;printf("i=%d",i);
@@ -124,7 +124,7 @@ int main() {
                     printf("Received from client: %s\n", buffer);
                 }
             }
-             printf("client_fds=%d,fds.revents=%d\n",client_fds[i],fds[i].revents);
+             printf("In Read: client_fds[%d]=%d,fds.revents=%d\n",i, client_fds[i],fds[i].revents);
         }
     }
 

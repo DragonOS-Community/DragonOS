@@ -10,15 +10,14 @@
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 #
-# import os
+import os
 # import sys
 # sys.path.insert(0, os.path.abspath('.'))
-
 
 # -- Project information -----------------------------------------------------
 
 project = 'DragonOS'
-copyright = '2022-2023, DragonOS Community'
+copyright = '2022-2024, DragonOS Community'
 author = 'longjin'
 
 # The full version, including alpha/beta/rc tags
@@ -74,3 +73,11 @@ myst_enable_extensions = [
     "substitution",
     "tasklist",
 ]
+
+
+# Define the canonical URL if you are using a custom domain on Read the Docs
+html_baseurl = os.environ.get("READTHEDOCS_CANONICAL_URL", "")
+
+# Tell Jinja2 templates the build is running on Read the Docs
+if os.environ.get("READTHEDOCS", "") == "True":
+    html_context["READTHEDOCS"] = True

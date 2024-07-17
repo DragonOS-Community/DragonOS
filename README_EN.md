@@ -113,6 +113,7 @@ We guarantee that all sponsorship funds and items will be used for:
 
 If you find any violation of the open source license, we welcome you to send email feedback! Let's build an honest open source community together!
 
+[DragonOS Community Introduction Document]: https://community.dragonos.org/
 [Community Management Team]: https://community.dragonos.org/governance/staff-info.html
 [SIGs]: https://community.dragonos.org/sigs/
 [WGs]: https://community.dragonos.org/wgs/

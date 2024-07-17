@@ -47,6 +47,7 @@ pub struct Ext2FileSystem {
     pub sb_info: Arc<LockedExt2SBInfo>,
     /// 文件系统的根inode
     root_inode: Arc<LockedExt2InodeInfo>,
+    // TODO 做一个缓存机制 记录inode
 }
 // TODO 用于加载fs
 impl FileSystem for Ext2FileSystem {
@@ -321,6 +322,7 @@ pub struct Ext2SuperBlockInfo {
                                            // struct rb_root s_rsv_window_root,
                                            // struct ext2_reserve_window_node s_rsv_window_head,
     pub major_version:u32,
+    pub file_pre_alloc:u8,
 }
 
 impl Ext2SuperBlockInfo {
@@ -385,6 +387,7 @@ impl Ext2SuperBlockInfo {
             s_dirs_counter: AtomicU32::new(1),
             partition: Some(partition.clone()),
             major_version: sb.major_version,
+            file_pre_alloc:sb.prealloc_blocks,
         };
         // debug!("end build super block info");
         ret
@@ -498,7 +501,7 @@ impl Ext2SuperBlock {
         super_block.block_size = cursor.read_u32()?;
         let mut log_f_size = [0u8; 4];
         cursor.read_exact(&mut log_f_size)?;
-        super_block.fragment_size = i32::from_be_bytes(log_f_size);
+        super_block.fragment_size = i32::from_le_bytes(log_f_size);
         super_block.blocks_per_group = cursor.read_u32()?;
         super_block.fragments_per_group = cursor.read_u32()?;
         super_block.inodes_per_group = cursor.read_u32()?;

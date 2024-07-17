@@ -1,6 +1,7 @@
 use core::mem::{self, size_of};
 
 use alloc::{fmt, string::String, sync::Arc, vec::Vec};
+use log::debug;
 use system_error::SystemError;
 
 use crate::driver::base::block::{block_device::LBA_SIZE, disk_info::Partition};
@@ -54,9 +55,8 @@ impl Ext2BlockGroupDescriptor {
         des_data.resize(LBA_SIZE * count, 0);
         let _ = partition.disk().read_at(start_block, count, &mut des_data);
         let offset_in_block = offset % block_size;
-        // BUG 错误：	source slice length (18) does not match destination slice length (32)
-        des_data[offset_in_block..offset_in_block + mem::size_of::<Ext2BlockGroupDescriptor>()]
-            .copy_from_slice(self.to_bytes().as_slice());
+        let bytes = self.to_bytes();
+        des_data[offset_in_block..offset_in_block + bytes.len()].copy_from_slice(bytes.as_slice());
         let _ = partition.disk().write_at(start_block, count, &mut des_data);
 
         Ok(())
@@ -71,22 +71,41 @@ impl Ext2BlockGroupDescriptor {
         bytes.extend_from_slice(&self.dir_num.to_le_bytes());
         bytes
     }
-    pub fn alloc_one_block(&self, bitmap: &[u8], group_id: usize, block_per_group: usize) -> usize {
+    pub fn alloc_one_block(
+        &mut self,
+        bitmap: &mut [u8],
+        group_id: usize,
+        block_per_group: usize,
+    ) -> Result<usize, SystemError> {
         // TODO 可能要修改desc
-        for (pos, value) in bitmap.iter().enumerate() {
+        // BUG bitmap改成mut 分配之后写回
+      //  debug!(" ========== alloc_one_block ==========");
+        let offset = group_id * block_per_group;
+      //  debug!("group_id={group_id},block_per_group={block_per_group}");
+        for (pos, value) in bitmap.iter_mut().enumerate() {
             if *value != 0xFFu8 {
-                let bitmap_byte = !(*value);
+              //  debug!("block bit map one byte = {value:08b}");
+                // let bitmap_byte = !(*value);
                 let mut mask = 0b1000_0000u8;
                 for i in 0..8 {
-                    if bitmap_byte & mask == mask {
-                        let block_num = group_id * block_per_group + pos * 8 + i;
-                        return block_num;
+                    if (*value) & mask == 0 {
+                        let block_num = offset + pos * 8 + i;
+                        *value |= mask;
+                        // debug!(
+                        //     "block bit map one byte = {value:08b}",
+                        // );
+
+                        // debug!(
+                        //     " ========== alloc_one_block num = {block_num} ,pos = {pos}=========="
+                        // );
+                        return Ok(block_num + 1);
                     }
-                    mask >>= 1;
+                    mask <<= 1;
                 }
             }
         }
-        0
+      //  debug!(" ========== alloc_one_block Err==========");
+        Err(SystemError::ENOMEM)
     }
 }
 impl Debug for Ext2BlockGroupDescriptor {

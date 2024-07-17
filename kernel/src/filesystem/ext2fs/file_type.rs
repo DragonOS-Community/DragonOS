@@ -1,9 +1,13 @@
+use core::fmt::Debug;
+
+use log::debug;
 use system_error::SystemError;
 
 use crate::filesystem::vfs::{syscall::ModeType, FileType};
 
 /// 文件的类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+
 pub enum Ext2FileType {
     /// 文件系统中的 FIFO（管道）
     FIFO = 0x1000,
@@ -56,18 +60,26 @@ impl Ext2FileType {
             FileType::File => Ok(Ext2FileType::RegularFile),
             FileType::SymLink => Ok(Ext2FileType::SymbolicLink),
             FileType::Socket => Ok(Ext2FileType::UnixSocket),
-            _ => Err(SystemError::EINVAL),
         }
     }
 }
-impl Into<u8> for Ext2FileType {
-    fn into(self) -> u8 {
-        self as u8
+impl Into<u16> for Ext2FileType {
+    fn into(self) -> u16 {
+        match self {
+            Ext2FileType::FIFO => 0x1000,
+            Ext2FileType::CharacterDevice => 0x2000,
+            Ext2FileType::Directory => 0x4000,
+            Ext2FileType::BlockDevice => 0x6000,
+            Ext2FileType::RegularFile => 0x8000,
+            Ext2FileType::SymbolicLink => 0xA000,
+            Ext2FileType::UnixSocket => 0xC000,
+        }
     }
 }
 
 bitflags! {
-   pub struct Ext2FileMode:u16 {
+
+    pub struct Ext2FileMode:u16 {
             /// 文件系统中的 FIFO（管道）
     const  FIFO = 0x1000;
         /// 字符设备
@@ -127,9 +139,24 @@ impl Ext2FileMode {
         todo!()
     }
     pub fn from_common_type(mode: ModeType) -> Result<Self, SystemError> {
+        // TODO 转换
         match Ext2FileMode::from_bits(mode.bits() as u16) {
             Some(v) => Ok(v),
             None => Err(SystemError::EINVAL),
         }
+    }
+    pub fn set_file_type(&mut self, file_type: Ext2FileType) {
+        self.bits = self.bits() | file_type as u16;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::filesystem::ext2fs::file_type::{Ext2FileMode, Ext2FileType};
+    #[test]
+    fn test_ext2_file_mode() {
+        let mut mode = Ext2FileMode::from_bits(0o777).unwrap();
+        mode.set_file_type(Ext2FileType::RegularFile);
+        println!("{:?}", mode)
     }
 }

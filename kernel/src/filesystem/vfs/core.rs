@@ -172,35 +172,6 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
             spin_loop();
         }
     };
-    // // ======== mount ext2 ========
-    // let partiton1 = ahci::get_disks_by_name("ahci_disk_1".to_string());
-    // if partiton1.is_err() {
-    //     kerror!("Failed to find ahci_disk_1");
-    //     return Ok(());
-    // }
-    // let p1 = partiton1.unwrap().0.lock().partitions[0].clone();
-    // let ext2fs: Result<Arc<Ext2FileSystem>, SystemError> = Ext2FileSystem::new(p1);
-    // if ext2fs.is_err() {
-    //     kerror!(
-    //         "Failed to initialize ext2fs, code={:?}",
-    //         ext2fs.as_ref().err()
-    //     );
-    //     loop {
-    //         spin_loop();
-    //     }
-    // }
-    // let ext2fs: Arc<Ext2FileSystem> = ext2fs.unwrap();
-    // let root_i = ROOT_INODE();
-    // let mount_inode = root_i
-    //     .create("ext2", FileType::Dir, ModeType::from_bits_truncate(0o755))
-    //     .expect("Failed to create /ext2");
-
-    // mount_inode.mount(ext2fs)?;
-    // if let Err(err) = root_i.lookup("/ext2") {
-    //     kdebug!("look up ext2 failed: {err:?}");
-    // };
-    // kinfo!("Successfully mount EXT2");
-    // // ======== mount ext2 ========
 
     return Ok(());
 }

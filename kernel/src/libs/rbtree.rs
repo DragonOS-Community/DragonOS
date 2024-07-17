@@ -1417,7 +1417,7 @@ impl<K: Ord + Debug, V: Debug> RBTree<K, V> {
 
 #[cfg(test)]
 mod tests {
-
+    use crate::libs::rbtree::RBTree;
     #[test]
     fn test_insert() {
         use crate::libs::rbtree::RBTree;

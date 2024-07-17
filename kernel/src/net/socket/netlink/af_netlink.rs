@@ -32,7 +32,7 @@ use smoltcp::socket::raw::PacketMetadata;
 
 use super::netlink::{NETLINK_USERSOCK, NL_CFG_F_NONROOT_SEND};
 use super::netlink_proto::{proto_register, Proto, NETLINK_PROTO};
-use super::skbuff::{netlink_overrun, skb_orphan, skb_shared, sock_hold, sock_put};
+use super::skbuff::{netlink_overrun, skb_orphan, skb_shared, sock_put};
 
 use crate::init::initcall::INITCALL_CORE;
 // Flags constants
@@ -57,10 +57,11 @@ pub struct SockaddrNl {
     pub nl_groups: u32,
 }
 #[derive(Clone)]
+#[derive(Debug)]
 pub struct HListHead {
     first: Option<Arc<HListNode>>,
 }
-
+#[derive(Debug)]
 pub struct HListNode {
     data: Arc<dyn NetlinkSocket>,
     next: Option<Arc<HListNode>>,
@@ -265,78 +266,48 @@ pub fn netlink_add_usersock_entry(nl_table: &mut RwLockWriteGuard<Vec<NetlinkTab
 	nl_table[index].flags = NL_CFG_F_NONROOT_SEND;
 }
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#572
-// static int netlink_insert(struct sock *sk, u32 portid)
-// {
-// 	struct netlink_table *table = &nl_table[sk->sk_protocol];
-// 	int err;
-
-// 	lock_sock(sk);
-
-// 	err = nlk_sk(sk)->portid == portid ? 0 : -EBUSY;
-// 	if (nlk_sk(sk)->bound)
-// 		goto err;
-
-// 	/* portid can be read locklessly from netlink_getname(). */
-// 	WRITE_ONCE(nlk_sk(sk)->portid, portid);
-
-// 	sock_hold(sk);
-
-// 	err = __netlink_insert(table, sk);
-// 	if (err) {
-// 		/* In case the hashtable backend returns with -EBUSY
-// 		 * from here, it must not escape to the caller.
-// 		 */
-// 		if (unlikely(err == -EBUSY))
-// 			err = -EOVERFLOW;
-// 		if (err == -EEXIST)
-// 			err = -EADDRINUSE;
-// 		sock_put(sk);
-// 		goto err;
-// 	}
-
-// 	/* We need to ensure that the socket is hashed and visible. */
-// 	smp_wmb();
-// 	/* Paired with lockless reads from netlink_bind(),
-// 	 * netlink_connect() and netlink_sendmsg().
-// 	 */
-// 	WRITE_ONCE(nlk_sk(sk)->bound, portid);
-
-// err:
-// 	release_sock(sk);
-// 	return err;
-// }
-
 /// 内核套接字插入 nl_table
 fn netlink_insert(sk: &Arc<dyn NetlinkSocket>, portid: u32) -> Result<(), SystemError> {
     let mut nl_table = NL_TABLE.write();
     let index = sk.sk_protocol();
-    nl_table[index].hash.insert(portid, Arc::clone(sk));
-    // 从Arc<dyn NetlinkSocket>中获取NetlinkSock
-    let mut nlk: Arc<NetlinkSock> = Arc::clone(sk).arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
-    if nlk.portid != portid {
-        return Err(SystemError::EBUSY);
+   
+
+    let nlk: Arc<LockedNetlinkSock> = Arc::clone(sk).arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
+
+    {
+        let nlk_guard = nlk.0.read();
+        // 检查端口是否已经被绑定
+        if nlk_guard.portid != portid {
+            return Err(SystemError::EOVERFLOW);
+        }
+        // 检查套接字是否已经绑定
+        if nlk_guard.bound {
+            log::debug!("netlink_insert: socket already bound\n");
+            return Err(SystemError::EADDRINUSE);
+        }
     }
-    // 套接字是否已经绑定
-    if nlk.bound{
-        log::debug!("netlink_insert: socket already bound\n");
-        return Err(SystemError::EINVAL);
+
+    {
+        let mut nlk_guard = nlk.0.write();
+        // 绑定端口
+        nlk_guard.portid = portid;
+        // 设置套接字已绑定
+        nlk_guard.bound = true;
+        // 将套接字插入哈希表
+        nl_table[index].hash.insert(portid, Arc::clone(sk));
     }
-    // 设置套接字的端口ID
-    // 遇到问题，这种方法得到的nlk无法修改
-    // nlk.portid = portid;
-
-
-    // 增加套接字的引用计数
-    // sock_hold(&nlk);
-    // 设置套接字的绑定状态
-    // nlk.bound = true;
-
+    
     Ok(())
 }
 
-/// 
-fn netlink_lookup() {
-
+// TODO: net namespace支持
+// https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#532
+/// 在 netlink_table 中查找 netlink 套接字
+fn netlink_lookup(protocol:i32, portid:u32)-> Arc<dyn NetlinkSocket>{
+    let nl_table = NL_TABLE.read();
+    let index = protocol as usize;
+    let sk = nl_table[index].hash.get(&portid).unwrap();
+    Arc::clone(sk)
 }
 
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#672
@@ -363,10 +334,18 @@ pub trait NetlinkSocket: Any + Send + Sync + Debug + CastFromSync {
 /* linux：struct sock has to be the first member of netlink_sock */
 // linux 6.1.9中的netlink_sock结构体里，sock是一个很大的结构体，这里简化
 // 意义是netlink_sock（NetlinkSock）是一个sock（NetlinkSocket）
+
+pub struct LockedNetlinkSock(RwLock<NetlinkSock>);
+impl LockedNetlinkSock {
+    pub fn new(netlinksock: NetlinkSock) -> LockedNetlinkSock {
+        LockedNetlinkSock(RwLock::new(netlinksock))
+    }
+}
 #[derive(Debug)]
 pub struct NetlinkSock {
     sk: Box<dyn NetlinkSocket>,
     portid: u32,
+    node: Arc<HListHead>,
     dst_portid: u32,
     dst_group: u32,
     flags: u32,
@@ -643,7 +622,6 @@ fn do_one_broadcast(sk: &Arc<dyn NetlinkSocket>, info: &mut Box<NetlinkBroadcast
         netlink_overrun(sk);
         return Err(SystemError::EINVAL);
     }
-    sock_hold(sk);
     if info.skb_2.borrow().is_empty() {
         if skb_shared(&info.skb) {
             info.copy_skb_to_skb_2();

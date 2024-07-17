@@ -61,11 +61,6 @@ pub fn skb_get(skb: Rc<RefCell<SkBuff>>) -> Rc<RefCell<SkBuff>> {
     Rc::new(RefCell::new(SkBuff::new()))
 }
 
-// 增加网络套接字(sk)的引用计数
-pub fn sock_hold(sk: &Arc<dyn NetlinkSocket>) {
-    // Implementation of the function
-}
-
 // 用于释放网络套接字(sk)的资源。
 pub fn sock_put(sk: &Arc<dyn NetlinkSocket>) {
     // Implementation of the function

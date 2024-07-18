@@ -20,12 +20,9 @@ use crate::{
     },
     libs::spinlock::SpinLock,
     mm::percpu::PerCpu,
-    process::ProcessManager,
     smp::core::smp_get_processor_id,
     time::{
-        clocksource::HZ,
-        jiffies::NSEC_PER_JIFFY,
-        timer::{try_raise_timer_softirq, update_timer_jiffies},
+        clocksource::HZ, tick_common::tick_handle_periodic, timer::try_raise_timer_softirq,
         TimeArch,
     },
 };
@@ -37,13 +34,6 @@ static SBI_TIMER_INIT_BMP: SpinLock<StaticBitmap<{ PerCpu::MAX_CPU_NUM as usize 
 
 static mut INTERVAL_CNT: usize = 0;
 
-/// 已经过去的纳秒数
-///
-/// 0号核心用这个值来更新墙上时钟，他只能被0号核心访问
-static mut HART0_NSEC_PASSED: usize = 0;
-/// hart0上一次更新墙上时钟的时间
-static mut HART0_LAST_UPDATED: u64 = 0;
-
 impl RiscVSbiTimer {
     pub const TIMER_IRQ: HardwareIrqNumber = HardwareIrqNumber::new(5);
 
@@ -54,8 +44,8 @@ impl RiscVSbiTimer {
         //     smp_get_processor_id().data(),
         //     CurrentTimeArch::get_cycles() as u64
         // );
-        ProcessManager::update_process_times(trap_frame.is_from_user());
-        Self::update_nsec_passed_and_walltime();
+        tick_handle_periodic(trap_frame);
+        compiler_fence(Ordering::SeqCst);
         sbi_rt::set_timer(CurrentTimeArch::get_cycles() as u64 + unsafe { INTERVAL_CNT } as u64);
         Ok(())
     }
@@ -67,30 +57,6 @@ impl RiscVSbiTimer {
     #[allow(dead_code)]
     fn disable() {
         unsafe { riscv::register::sie::clear_stimer() };
-    }
-
-    fn update_nsec_passed_and_walltime() {
-        if smp_get_processor_id().data() != 0 {
-            return;
-        }
-
-        let cycles = CurrentTimeArch::get_cycles() as u64;
-        let nsec_passed =
-            CurrentTimeArch::cycles2ns((cycles - unsafe { HART0_LAST_UPDATED }) as usize);
-        unsafe {
-            HART0_LAST_UPDATED = cycles;
-            HART0_NSEC_PASSED += nsec_passed;
-        }
-
-        let jiffies = unsafe { HART0_NSEC_PASSED } / NSEC_PER_JIFFY as usize;
-        unsafe { HART0_NSEC_PASSED %= NSEC_PER_JIFFY as usize };
-
-        update_timer_jiffies(
-            jiffies as u64,
-            (jiffies * NSEC_PER_JIFFY as usize / 1000) as i64,
-        );
-        try_raise_timer_softirq();
-        compiler_fence(Ordering::SeqCst);
     }
 }
 

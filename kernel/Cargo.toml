@@ -21,7 +21,8 @@ default = ["backtrace", "kvm"]
 backtrace = []
 # kvm
 kvm = []
-
+# kprobe
+kprobe_test = []
 
 # 运行时依赖项
 [dependencies]
@@ -54,7 +55,7 @@ uefi-raw = "=0.5.0"
 paste = "=1.0.14"
 slabmalloc = { path = "crates/rust-slabmalloc" }
 log = "0.4.21"
-
+kprobe = { git = "https://github.com/os-module/eebpf" }
 
 # target为x86_64时，使用下面的依赖
 [target.'cfg(target_arch = "x86_64")'.dependencies]

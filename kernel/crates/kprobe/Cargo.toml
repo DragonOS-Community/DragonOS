@@ -11,4 +11,4 @@ yaxpeax-x86 = { version = "2", default-features = false, features = ["fmt"] }
 yaxpeax-arch = { version = "0", default-features = false }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
-raki = { git = "https://github.com/Alignof/raki" }
+raki = "0"

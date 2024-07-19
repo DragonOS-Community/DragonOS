@@ -13,15 +13,24 @@ pub fn detect_func(x: usize, y: usize) -> usize {
 pub fn kprobe_test() {
     let pre_handler = |regs: &dyn ProbeArgs| {
         let pt_regs = regs.as_any().downcast_ref::<TrapFrame>().unwrap();
-        println!("call pre_handler, the sp is {:#x}", pt_regs.rsp);
+        println!(
+            "call pre_handler, the sp is {:#x}",
+            pt_regs as *const _ as usize
+        );
     };
     let post_handler = |regs: &dyn ProbeArgs| {
         let pt_regs = regs.as_any().downcast_ref::<TrapFrame>().unwrap();
-        println!("call post_handler, the sp is {:#x}", pt_regs.rsp);
+        println!(
+            "call post_handler, the sp is {:#x}",
+            pt_regs as *const _ as usize
+        );
     };
     let fault_handler = |regs: &dyn ProbeArgs| {
         let pt_regs = regs.as_any().downcast_ref::<TrapFrame>().unwrap();
-        println!("call fault_handler, the sp is {:#x}", pt_regs.rsp);
+        println!(
+            "call fault_handler, the sp is {:#x}",
+            pt_regs as *const _ as usize
+        );
     };
     println!("kprobe test for [detect_func]: {:#x}", detect_func as usize);
     let kprobe_info = KprobeInfo {

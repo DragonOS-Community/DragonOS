@@ -108,7 +108,7 @@ impl Loopback {
         let buffer = self.queue.pop_front();
         match buffer {
             Some(buffer) => {
-                debug!("lo receive:{:?}", buffer);
+                //debug!("lo receive:{:?}", buffer);
                 return buffer;
             }
             None => {
@@ -123,7 +123,7 @@ impl Loopback {
     /// - &mut self：自身可变引用
     /// - buffer：需要发送的数据包
     pub fn loopback_transmit(&mut self, buffer: Vec<u8>) {
-        debug!("lo transmit!");
+        //debug!("lo transmit!");
         self.queue.push_back(buffer)
     }
 }

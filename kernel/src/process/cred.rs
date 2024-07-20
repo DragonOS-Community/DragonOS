@@ -16,6 +16,12 @@ bitflags! {
     }
 }
 
+pub enum CredFsCmp {
+    Equal,
+    Less,
+    Greater,
+}
+
 /// 凭证集
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cred {
@@ -71,27 +77,27 @@ impl Cred {
 
     #[allow(dead_code)]
     /// Compare two credentials with respect to filesystem access.
-    pub fn fscmp(&self, other: Cred) -> i32 {
+    pub fn fscmp(&self, other: Cred) -> CredFsCmp {
         if *self == other {
-            return 0;
+            return CredFsCmp::Equal;
         }
 
         if self.fsuid < other.fsuid {
-            return -1;
+            return CredFsCmp::Less;
         }
         if self.fsuid > other.fsuid {
-            return 1;
+            return CredFsCmp::Greater;
         }
 
         if self.fsgid < other.fsgid {
-            return -1;
+            return CredFsCmp::Less;
         }
         if self.fsgid > other.fsgid {
-            return 1;
+            return CredFsCmp::Greater;
         }
 
         if self.group_info == other.group_info {
-            return 0;
+            return CredFsCmp::Equal;
         }
 
         if let (Some(ga), Some(gb)) = (&self.group_info, &other.group_info) {
@@ -99,30 +105,30 @@ impl Cred {
             let gb_count = gb.gids.len();
 
             if ga_count < gb_count {
-                return -1;
+                return CredFsCmp::Less;
             }
             if ga_count > gb_count {
-                return 1;
+                return CredFsCmp::Greater;
             }
 
             for i in 0..ga_count {
                 if ga.gids[i] < gb.gids[i] {
-                    return -1;
+                    return CredFsCmp::Less;
                 }
                 if ga.gids[i] > gb.gids[i] {
-                    return 1;
+                    return CredFsCmp::Greater;
                 }
             }
         } else {
             if self.group_info.is_none() {
-                return -1;
+                return CredFsCmp::Less;
             }
             if other.group_info.is_none() {
-                return 1;
+                return CredFsCmp::Greater;
             }
         }
 
-        return 0;
+        return CredFsCmp::Equal;
     }
 
     pub fn setuid(&mut self, uid: usize) {

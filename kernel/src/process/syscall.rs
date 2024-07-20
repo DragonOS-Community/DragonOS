@@ -5,7 +5,6 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use log::debug;
 use system_error::SystemError;
 
 use super::{

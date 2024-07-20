@@ -30,10 +30,7 @@ use crate::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         PhysAddr,
     },
-    time::{
-        jiffies::NSEC_PER_JIFFY,
-        timer::{try_raise_timer_softirq, update_timer_jiffies},
-    },
+    time::jiffies::NSEC_PER_JIFFY,
 };
 
 static mut HPET_INSTANCE: Option<Hpet> = None;
@@ -249,9 +246,6 @@ impl Hpet {
     pub(super) fn handle_irq(&self, timer_num: u32) {
         if timer_num == 0 {
             assert!(!CurrentIrqArch::is_irq_enabled());
-            update_timer_jiffies(1, Self::HPET0_INTERVAL_USEC as i64);
-
-            try_raise_timer_softirq();
         }
     }
 }

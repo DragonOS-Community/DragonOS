@@ -1,14 +1,7 @@
-# DragonOS Rust-Application Template
+# test-lo 
 
-您可以使用此模板来创建DragonOS应用程序。
+lo网卡功能测试程序
 
-## 使用方法
+## 测试过程：
 
-1. 使用DragonOS的tools目录下的`bootstrap.sh`脚本初始化环境
-2. 在终端输入`cargo install cargo-generate`
-3. 在终端输入`cargo generate --git https://github.com/DragonOS-Community/Rust-App-Template`即可创建项目
-如果您的网络较慢，请使用镜像站`cargo generate --git https://git.mirrors.dragonos.org/DragonOS-Community/Rust-App-Template`
-4. 使用`cargo run`来运行项目
-5. 在DragonOS的`user/dadk/config`目录下，使用`dadk new`命令，创建编译配置,安装到DragonOS的`/`目录下。 
-(在dadk的编译命令选项处，请使用Makefile里面的`make install`配置进行编译、安装)
-6. 编译DragonOS即可安装
+通过创建一个UDP套接字，然后发送一条消息到本地回环地址127.0.0.1（lo网卡），再接收并验证这条消息，以此来测试lo网卡的功能。期望发送的消息和接收到的消息是完全一样的。通过日志输出查看测试是否成功。

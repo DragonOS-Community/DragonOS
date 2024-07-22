@@ -11,6 +11,7 @@ use system_error::SystemError;
 mod dma;
 pub mod e1000e;
 pub mod irq_handle;
+pub mod loopback;
 pub mod virtio_net;
 
 pub trait NetDevice: Device {

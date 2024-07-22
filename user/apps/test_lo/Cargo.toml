@@ -1,0 +1,7 @@
+[package]
+name = "test_lo"
+version = "0.1.0"
+edition = "2021"
+description = "测试lo网卡功能"
+authors = [ "smallc <2628035541@qq.com>" ]
+

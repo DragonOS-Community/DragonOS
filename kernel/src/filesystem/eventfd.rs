@@ -17,8 +17,15 @@ static EVENTFD_ID: AtomicU32 = AtomicU32::new(0);
 
 bitflags! {
     pub struct EventFdFlags: u32{
+        /// Provide semaphore-like semantics for reads from the new
+        /// file descriptor.
         const EFD_SEMAPHORE = 1;
+        /// Set the close-on-exec (FD_CLOEXEC) flag on the new file
+        /// descriptor
         const EFD_CLOEXEC = 2;
+        /// Set the O_NONBLOCK file status flag on the open file
+        /// description (see open(2)) referred to by the new file
+        /// descriptor
         const EFD_NONBLOCK = 4;
     }
 }
@@ -65,6 +72,12 @@ impl IndexNode for EventFdInode {
         Ok(())
     }
 
+    /// 1. counter !=0
+    ///     - EFD_SEMAPHORE 如果没有被设置，从 eventfd read，会得到 counter，并将它归0
+    ///     - EFD_SEMAPHORE 如果被设置，从 eventfd read，会得到值 1，并将 counter - 1
+    /// 2. counter == 0
+    ///     - EFD_NONBLOCK 如果被设置，那么会以 EAGAIN 的错失败
+    ///     - 否则 read 会被阻塞，直到为非0。
     fn read_at(
         &self,
         _offset: usize,
@@ -103,6 +116,13 @@ impl IndexNode for EventFdInode {
         return Ok(8);
     }
 
+    /// - 把一个 8 字节的int值写入到 counter 里
+    /// - counter 最大值是 2^64 - 1
+    /// - 如果写入时会发生溢出，则write会被阻塞
+    ///     - 如果 EFD_NONBLOCK 被设置，那么以 EAGAIN 失败
+    /// - 以不合法的值写入时，会以 EINVAL 失败
+    ///     - 比如 0xffffffffffffffff 不合法
+    ///     -  比如 写入的值 size 小于8字节
     fn write_at(
         &self,
         _offset: usize,
@@ -137,6 +157,8 @@ impl IndexNode for EventFdInode {
         return Ok(8);
     }
 
+    /// - 如果 counter 的值大于 0 ，那么 fd 的状态就是可读的
+    /// - 如果能无阻塞地写入一个至少为 1 的值，那么 fd 的状态就是可写的
     fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
         let mut events = EPollEventType::empty();
         if self.eventfd.lock().count != 0 {
@@ -172,6 +194,7 @@ impl IndexNode for EventFdInode {
 }
 
 impl Syscall {
+    /// See: https://man7.org/linux/man-pages/man2/eventfd2.2.html
     pub fn sys_eventfd(init_val: u32, flags: u32) -> Result<usize, SystemError> {
         let flags = EventFdFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
         let id = EVENTFD_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);

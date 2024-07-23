@@ -10,8 +10,8 @@ use crate::arch::mm::{LockedFrameAllocator, PageMapper};
 use crate::arch::x86_64::mm::X86_64MMArch;
 use crate::arch::MMArch;
 
-use crate::mm::{phys_2_virt, VirtAddr};
 use crate::mm::{MemoryManagementArch, PageTableKind};
+use crate::mm::{PhysAddr, VirtAddr};
 use crate::virt::kvm::vcpu::Vcpu;
 use crate::virt::kvm::vm::Vm;
 use alloc::alloc::Global;
@@ -474,14 +474,9 @@ pub fn get_segment_base(gdt_base: *const u64, gdt_size: u16, segment_selector: u
     let base_mid = (descriptor & 0x0000_00FF_0000_0000) >> 16;
     let base_low = (descriptor & 0x0000_0000_FFFF_0000) >> 16;
     let segment_base = (base_high | base_mid | base_low) & 0xFFFFFFFF;
-    let virtaddr = phys_2_virt(segment_base.try_into().unwrap())
-        .try_into()
-        .unwrap();
-    debug!(
-        "segment_base={:x}",
-        phys_2_virt(segment_base.try_into().unwrap())
-    );
-    return virtaddr;
+    let virtaddr = unsafe { MMArch::phys_2_virt(PhysAddr::new(segment_base as usize)).unwrap() };
+
+    return virtaddr.data() as u64;
 }
 
 // FIXME: may have bug

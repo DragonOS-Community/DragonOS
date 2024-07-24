@@ -18,7 +18,7 @@ use crate::{
     filesystem::procfs::ProcfsFilePrivateData,
     ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
     libs::{rwlock::RwLock, spinlock::SpinLock},
-    mm::{page::Page, MemoryManagementArch, PhysAddr},
+    mm::{page::Page, MemoryManagementArch},
     net::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
         socket::SocketInode,
@@ -124,7 +124,7 @@ impl FileMode {
 
 #[allow(dead_code)]
 pub struct PageCache {
-    xarray: SpinLock<XArray<Arc<PhysAddr>>>,
+    xarray: SpinLock<XArray<Arc<Page>>>,
 }
 
 impl core::fmt::Debug for PageCache {
@@ -136,8 +136,8 @@ impl core::fmt::Debug for PageCache {
                     .xarray
                     .lock()
                     .range(0..((MMArch::PAGE_ADDRESS_SIZE >> MMArch::PAGE_SHIFT) as u64))
-                    .map(|(_, r)| **r)
-                    .collect::<Vec<PhysAddr>>(),
+                    .map(|(_, r)| (*r).clone())
+                    .collect::<Vec<Arc<Page>>>(),
             )
             .finish()
     }
@@ -150,17 +150,17 @@ impl PageCache {
         }
     }
 
-    pub fn add_page(&self, offset: usize, page_phys_address: PhysAddr) {
+    pub fn add_page(&self, offset: usize, page: &Arc<Page>) {
         let mut guard = self.xarray.lock();
         let mut cursor = guard.cursor_mut(offset as u64);
-        cursor.store(Arc::new(page_phys_address));
+        cursor.store(page.clone());
     }
 
-    pub fn get_page(&self, offset: usize) -> Option<PhysAddr> {
+    pub fn get_page(&self, offset: usize) -> Option<Arc<Page>> {
         let mut guard = self.xarray.lock();
         let mut cursor = guard.cursor_mut(offset as u64);
-        let phys = cursor.load().map(|r| **r);
-        phys
+        let page = cursor.load().map(|r| (*r).clone());
+        page
     }
 
     // pub fn get_pages(&self, start_pgoff: usize, end_pgoff: usize) -> Vec<Arc<Page>> {

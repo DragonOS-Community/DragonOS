@@ -14,7 +14,7 @@ use crate::{
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::PosixTimeSpec,
 };
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{compiler_fence, Ordering};
 use hashbrown::{HashMap, HashSet};
 use ida::IdAllocator;
@@ -165,10 +165,10 @@ impl ShmManager {
         let mut page_manager_guard = page_manager_lock_irqsave();
         let mut cur_phys = PhysPageFrame::new(phys_page.0);
         for _ in 0..page_count.data() {
-            let page = Page::new(true, cur_phys);
+            let page = Arc::new(Page::new(true, cur_phys));
             page.write().set_shm_id(shm_id);
             let paddr = cur_phys.phys_address();
-            page_manager_guard.insert(paddr, page);
+            page_manager_guard.insert(paddr, &page);
             cur_phys = cur_phys.next();
         }
 

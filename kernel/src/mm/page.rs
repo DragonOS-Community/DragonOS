@@ -71,7 +71,7 @@ impl PageManager {
     }
 
     pub fn get(&self, paddr: &PhysAddr) -> Option<Arc<Page>> {
-        self.phys2page.get(paddr).map(|x| x.clone())
+        self.phys2page.get(paddr).cloned()
     }
 
     pub fn get_unwrap(&self, paddr: &PhysAddr) -> Arc<Page> {
@@ -88,8 +88,8 @@ impl PageManager {
     //         .write()
     // }
 
-    pub fn insert(&mut self, paddr: PhysAddr, page: Page) {
-        self.phys2page.insert(paddr, Arc::new(page));
+    pub fn insert(&mut self, paddr: PhysAddr, page: &Arc<Page>) {
+        self.phys2page.insert(paddr, page.clone());
     }
 
     pub fn remove_page(&mut self, paddr: &PhysAddr) {
@@ -230,6 +230,11 @@ impl InnerPage {
     #[inline(always)]
     pub fn phys_frame(&self) -> &PhysPageFrame {
         &self.phys_frame
+    }
+
+    #[inline(always)]
+    pub fn phys_address(&self) -> PhysAddr {
+        self.phys_frame.phys_address()
     }
 }
 
@@ -407,7 +412,10 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
                         } else {
                             let phys = allocator.allocate_one()?;
                             let mut anon_vma_guard = page_manager_lock_irqsave();
-                            anon_vma_guard.insert(phys, Page::new(false, PhysPageFrame::new(phys)));
+                            anon_vma_guard.insert(
+                                phys,
+                                &Arc::new(Page::new(false, PhysPageFrame::new(phys))),
+                            );
                             let old_phys = entry.address().unwrap();
                             let frame = MMArch::phys_2_virt(phys).unwrap().data() as *mut u8;
                             frame.copy_from_nonoverlapping(
@@ -953,7 +961,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         let mut page_manager_guard: SpinLockGuard<'static, PageManager> =
             page_manager_lock_irqsave();
         if !page_manager_guard.contains(&phys) {
-            page_manager_guard.insert(phys, Page::new(false, PhysPageFrame::new(phys)))
+            page_manager_guard.insert(phys, &Arc::new(Page::new(false, PhysPageFrame::new(phys))))
         }
 
         return self.map_phys(virt, phys, flags);

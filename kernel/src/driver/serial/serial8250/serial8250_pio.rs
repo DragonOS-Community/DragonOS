@@ -20,6 +20,7 @@ static mut PIO_PORTS: [Option<Serial8250PIOPort>; 8] =
     [None, None, None, None, None, None, None, None];
 
 impl Serial8250Manager {
+    #[allow(static_mut_refs)]
     pub(super) fn bind_pio_ports(
         &self,
         uart_driver: &Arc<Serial8250ISADriver>,
@@ -251,6 +252,7 @@ impl Serial8250PIOPortInner {
         Self { device: None }
     }
 
+    #[allow(dead_code)]
     pub fn device(&self) -> Option<Arc<Serial8250ISADevices>> {
         if let Some(device) = self.device.as_ref() {
             return device.upgrade();

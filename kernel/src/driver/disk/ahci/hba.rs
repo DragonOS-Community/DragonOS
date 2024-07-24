@@ -43,6 +43,7 @@ pub enum HbaPortType {
 
 /// 声明了 HBA 的所有属性
 #[repr(packed)]
+#[allow(dead_code)]
 pub struct HbaPort {
     pub clb: u64,         // 0x00, command list base address, 1K-byte aligned
     pub fb: u64,          // 0x08, FIS base address, 256-byte aligned
@@ -65,6 +66,7 @@ pub struct HbaPort {
 
 /// 全称 HBA Memory Register，是HBA的寄存器在内存中的映射
 #[repr(packed)]
+#[allow(dead_code)]
 pub struct HbaMem {
     pub cap: u32,             // 0x00, Host capability
     pub ghc: u32,             // 0x04, Global host control
@@ -94,6 +96,7 @@ pub struct HbaPrdtEntry {
 /// HAB Command Table
 /// 每个 Port 一个 Table，主机和设备的交互都靠这个数据结构
 #[repr(packed)]
+#[allow(dead_code)]
 pub struct HbaCmdTable {
     // 0x00
     pub cfis: [u8; 64], // Command FIS
@@ -262,6 +265,7 @@ pub enum FisType {
 }
 
 #[repr(packed)]
+#[allow(dead_code)]
 pub struct FisRegH2D {
     // DWORD 0
     pub fis_type: u8, // FIS_TYPE_REG_H2D

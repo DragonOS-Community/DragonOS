@@ -55,7 +55,7 @@ impl MbrDiskPartitionTableEntry {
 #[repr(packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct MbrDiskPartionTable {
-    pub reserved: [u8; 446],
+    pub _reserved: [u8; 446],
     pub dpte: [MbrDiskPartitionTableEntry; 4], // 磁盘分区表项
     pub bs_trailsig: u16,
 }
@@ -63,7 +63,7 @@ pub struct MbrDiskPartionTable {
 impl Default for MbrDiskPartionTable {
     fn default() -> Self {
         MbrDiskPartionTable {
-            reserved: [0; 446],
+            _reserved: [0; 446],
             dpte: [Default::default(); 4],
             bs_trailsig: Default::default(),
         }

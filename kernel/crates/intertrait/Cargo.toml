@@ -14,7 +14,7 @@ include = ["src/**/*", "Cargo.toml", "LICENSE-*", "README.md"]
 
 
 [dependencies]
-linkme = "0.2"
+linkme = "=0.3.27"
 hashbrown = "0.13.2"
 intertrait-macros = { version = "=0.2.2", path = "macros" }
 

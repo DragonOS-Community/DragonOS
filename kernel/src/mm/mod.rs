@@ -427,6 +427,7 @@ impl Default for PhysMemoryArea {
     }
 }
 
+#[allow(dead_code)]
 pub trait MemoryManagementArch: Clone + Copy + Debug {
     /// 是否支持缺页中断
     const PAGE_FAULT_ENABLED: bool;

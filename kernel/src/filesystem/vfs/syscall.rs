@@ -398,6 +398,7 @@ impl PosixOpenHow {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct OpenHow {
     pub o_flags: FileMode,
@@ -1707,8 +1708,7 @@ impl IoVecs {
         // 将用户空间的IoVec转换为引用（注意：这里的引用是静态的，因为用户空间的IoVec不会被释放）
         let iovs: &[IoVec] = core::slice::from_raw_parts(iov, iovcnt);
 
-        let mut slices: Vec<&mut [u8]> = vec![];
-        slices.reserve(iovs.len());
+        let mut slices: Vec<&mut [u8]> = Vec::with_capacity(iovs.len());
 
         for iov in iovs.iter() {
             if iov.iov_len == 0 {

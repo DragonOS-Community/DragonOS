@@ -327,31 +327,33 @@ impl MemoryManagementArch for X86_64MMArch {
         pkru::pkru_allows_pkey(pkru::vma_pkey(vma), write)
     }
 
-    fn protection_map() -> [usize; 16] {
-        let mut map = [0; 16];
-        map[VmFlags::VM_NONE] = Self::PAGE_NONE;
-        map[VmFlags::VM_READ] = Self::PAGE_READONLY;
-        map[VmFlags::VM_WRITE] = Self::PAGE_COPY;
-        map[VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_COPY;
-        map[VmFlags::VM_EXEC] = Self::PAGE_READONLY_EXEC;
-        map[VmFlags::VM_EXEC | VmFlags::VM_READ] = Self::PAGE_READONLY_EXEC;
-        map[VmFlags::VM_EXEC | VmFlags::VM_WRITE] = Self::PAGE_COPY_EXEC;
-        map[VmFlags::VM_EXEC | VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_COPY_EXEC;
-        map[VmFlags::VM_SHARED] = Self::PAGE_NONE;
-        map[VmFlags::VM_SHARED | VmFlags::VM_READ] = Self::PAGE_READONLY;
-        map[VmFlags::VM_SHARED | VmFlags::VM_WRITE] = Self::PAGE_SHARED;
-        map[VmFlags::VM_SHARED | VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_SHARED;
-        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC] = Self::PAGE_READONLY_EXEC;
-        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_READ] = Self::PAGE_READONLY_EXEC;
-        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_WRITE] = Self::PAGE_SHARED_EXEC;
-        map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_WRITE | VmFlags::VM_READ] =
-            Self::PAGE_SHARED_EXEC;
+    // fn protection_map() -> [usize; 16] {
+    //     let mut map = [0; 16];
+    //     map[VmFlags::VM_NONE] = Self::PAGE_NONE;
+    //     map[VmFlags::VM_READ] = Self::PAGE_READONLY;
+    //     map[VmFlags::VM_WRITE] = Self::PAGE_COPY;
+    //     map[VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_COPY;
+    //     map[VmFlags::VM_EXEC] = Self::PAGE_READONLY_EXEC;
+    //     map[VmFlags::VM_EXEC | VmFlags::VM_READ] = Self::PAGE_READONLY_EXEC;
+    //     map[VmFlags::VM_EXEC | VmFlags::VM_WRITE] = Self::PAGE_COPY_EXEC;
+    //     map[VmFlags::VM_EXEC | VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_COPY_EXEC;
+    //     map[VmFlags::VM_SHARED] = Self::PAGE_NONE;
+    //     map[VmFlags::VM_SHARED | VmFlags::VM_READ] = Self::PAGE_READONLY;
+    //     map[VmFlags::VM_SHARED | VmFlags::VM_WRITE] = Self::PAGE_SHARED;
+    //     map[VmFlags::VM_SHARED | VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_SHARED;
+    //     map[VmFlags::VM_SHARED | VmFlags::VM_EXEC] = Self::PAGE_READONLY_EXEC;
+    //     map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_READ] = Self::PAGE_READONLY_EXEC;
+    //     map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_WRITE] = Self::PAGE_SHARED_EXEC;
+    //     map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_WRITE | VmFlags::VM_READ] =
+    //         Self::PAGE_SHARED_EXEC;
 
-        if Self::is_xd_reserved() {
-            map.iter_mut().for_each(|x| *x &= !Self::ENTRY_FLAG_NO_EXEC)
-        }
-        map
-    }
+    //     if Self::is_xd_reserved() {
+    //         map.iter_mut().for_each(|x| *x &= !Self::ENTRY_FLAG_NO_EXEC)
+    //     }
+    //     map
+    // }
+
+    const PROTECTION_MAP: [usize; 16] = protection_map();
 
     const PAGE_NONE: usize =
         Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_ACCESSED | Self::ENTRY_FLAG_GLOBAL;
@@ -393,6 +395,44 @@ impl MemoryManagementArch for X86_64MMArch {
     const PAGE_WRITE: usize = 0;
     const PAGE_WRITE_EXEC: usize = 0;
     const PAGE_EXEC: usize = 0;
+}
+
+/// 获取保护标志的映射表
+///
+///
+/// ## 返回值
+/// - `[usize; 16]`: 长度为16的映射表
+const fn protection_map() -> [usize; 16] {
+    type Arch = X86_64MMArch;
+    let mut map = [0; 16];
+    map[VmFlags::VM_NONE.bits()] = Arch::PAGE_NONE;
+    map[VmFlags::VM_READ.bits()] = Arch::PAGE_READONLY;
+    map[VmFlags::VM_WRITE.bits()] = Arch::PAGE_COPY;
+    map[VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] = Arch::PAGE_COPY;
+    map[VmFlags::VM_EXEC.bits()] = Arch::PAGE_READONLY_EXEC;
+    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] = Arch::PAGE_READONLY_EXEC;
+    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] = Arch::PAGE_COPY_EXEC;
+    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
+        Arch::PAGE_COPY_EXEC;
+    map[VmFlags::VM_SHARED.bits()] = X86_64MMArch::PAGE_NONE;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_READ.bits()] = Arch::PAGE_READONLY;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits()] = Arch::PAGE_SHARED;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
+        Arch::PAGE_SHARED;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits()] = Arch::PAGE_READONLY_EXEC;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] =
+        Arch::PAGE_READONLY_EXEC;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] =
+        Arch::PAGE_SHARED_EXEC;
+    map[VmFlags::VM_SHARED.bits()
+        | VmFlags::VM_EXEC.bits()
+        | VmFlags::VM_WRITE.bits()
+        | VmFlags::VM_READ.bits()] = Arch::PAGE_SHARED_EXEC;
+
+    // if X86_64MMArch::is_xd_reserved() {
+    //     map.iter_mut().for_each(|x| *x &= !Self::ENTRY_FLAG_NO_EXEC)
+    // }
+    map
 }
 
 impl X86_64MMArch {

@@ -10,10 +10,10 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::AtomicU32;
+use ida::IdAllocator;
 use system_error::SystemError;
 
-static EVENTFD_ID: AtomicU32 = AtomicU32::new(0);
+static EVENTFD_ID_ALLOCATOR: IdAllocator = IdAllocator::new(0, u32::MAX as usize);
 
 bitflags! {
     pub struct EventFdFlags: u32{
@@ -72,6 +72,8 @@ impl IndexNode for EventFdInode {
         Ok(())
     }
 
+    /// # 从 counter 里读取一个 8 字节的int值
+    ///
     /// 1. counter !=0
     ///     - EFD_SEMAPHORE 如果没有被设置，从 eventfd read，会得到 counter，并将它归0
     ///     - EFD_SEMAPHORE 如果被设置，从 eventfd read，会得到值 1，并将 counter - 1
@@ -116,7 +118,8 @@ impl IndexNode for EventFdInode {
         return Ok(8);
     }
 
-    /// - 把一个 8 字节的int值写入到 counter 里
+    /// # 把一个 8 字节的int值写入到 counter 里
+    ///
     /// - counter 最大值是 2^64 - 1
     /// - 如果写入时会发生溢出，则write会被阻塞
     ///     - 如果 EFD_NONBLOCK 被设置，那么以 EAGAIN 失败
@@ -157,6 +160,8 @@ impl IndexNode for EventFdInode {
         return Ok(8);
     }
 
+    /// # 检查 eventfd 的状态
+    ///
     /// - 如果 counter 的值大于 0 ，那么 fd 的状态就是可读的
     /// - 如果能无阻塞地写入一个至少为 1 的值，那么 fd 的状态就是可写的
     fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
@@ -194,10 +199,20 @@ impl IndexNode for EventFdInode {
 }
 
 impl Syscall {
+    /// # 创建一个 eventfd 文件描述符
+    ///
+    /// ## 参数
+    /// - `init_val`: u32: eventfd 的初始值
+    /// - `flags`: u32: eventfd 的标志
+    ///
+    /// ## 返回值
+    /// - `Ok(usize)`: 成功创建的文件描述符
+    /// - `Err(SystemError)`: 创建失败
+    ///
     /// See: https://man7.org/linux/man-pages/man2/eventfd2.2.html
     pub fn sys_eventfd(init_val: u32, flags: u32) -> Result<usize, SystemError> {
         let flags = EventFdFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
-        let id = EVENTFD_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let id = EVENTFD_ID_ALLOCATOR.alloc().ok_or(SystemError::ENOMEM)? as u32;
         let eventfd = EventFd::new(init_val as u64, flags, id);
         let inode = Arc::new(EventFdInode::new(eventfd));
         let filemode = if flags.contains(EventFdFlags::EFD_CLOEXEC) {

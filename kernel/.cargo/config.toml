@@ -6,7 +6,8 @@
 runner = "bootimage runner"
 
 [build]
-rustflags = ["-Clink-args=-znostart-stop-gc"]
-rustdocflags = ["-Clink-args=-znostart-stop-gc"]
+# '-Zlinker-features=-lld' 禁用rustlld（20240723），因为它与linkme0.3版本冲突
+rustflags = ["-Zlinker-features=-lld"]
+rustdocflags = ["-Zlinker-features=-lld"]
 
 [env]

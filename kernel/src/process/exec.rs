@@ -281,9 +281,9 @@ impl ProcInitInfo {
         return Ok(());
     }
 
-    fn push_str(&self, ustack: &mut UserStack, s: &CString) -> Result<(), SystemError> {
-        let bytes = s.as_bytes_with_nul();
-        self.push_slice(ustack, bytes)?;
+    fn push_str(&self, ustack: &mut UserStack, s: &str) -> Result<(), SystemError> {
+        self.push_slice(ustack, &[b"\0"])?;
+        self.push_slice(ustack, s.as_bytes())?;
         return Ok(());
     }
 }

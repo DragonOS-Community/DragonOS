@@ -24,4 +24,13 @@ echo ${LOOP_DEVICE}p1
 
 mkdir -p ../bin/disk_mount/
 mount ${LOOP_DEVICE}p1 ../bin/disk_mount/ 
+
+# LOOP_DEVICE2=$(losetup -f --show -P ../bin/ext2.img) 
+# mkdir -p ../bin/tmp/ext2
+# mount ${LOOP_DEVICE2}p1 ../bin/tmp/ext2
+# cp -a ../bin/disk_mount/ ../bin/tmp/ext2
+# umount ../bin/tmp/ext2
+
+# mount ${LOOP_DEVICE}p1 ../bin/disk_mount/ext2
+
 lsblk

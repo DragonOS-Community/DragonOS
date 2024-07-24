@@ -3,11 +3,13 @@ use core::{hint::spin_loop, sync::atomic::Ordering};
 use alloc::sync::Arc;
 use log::{error, info};
 use system_error::SystemError;
+use uefi::proto::media::partition;
 
 use crate::{
-    driver::base::block::disk_info::Partition,
+    driver::{base::block::disk_info::Partition, disk::ahci},
     filesystem::{
         devfs::devfs_init,
+        ext2fs::{ext2fs_init, fs::Ext2FileSystem},
         fat::fs::FATFileSystem,
         procfs::procfs_init,
         ramfs::RamFS,
@@ -164,6 +166,12 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
         }
     }
     info!("Successfully migrate rootfs to FAT32!");
+    if let Err(err) = ext2fs_init() {
+        error!("Failed to init ext2fs,{:?}", err);
+        loop {
+            spin_loop();
+        }
+    };
 
     return Ok(());
 }

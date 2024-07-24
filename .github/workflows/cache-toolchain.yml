@@ -76,7 +76,7 @@ jobs:
             rustup component add rustfmt --toolchain nightly-2024-07-23-riscv64gc-unknown-linux-gnu
             rustup component add rustfmt --toolchain nightly-2023-08-15-riscv64gc-unknown-linux-gnu
 
-            rustup default nightly
+            rustup default nightly-2024-07-23
 
             cargo install dadk --version 0.1.11
           

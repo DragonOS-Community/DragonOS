@@ -19,6 +19,7 @@ use super::{
 ///
 /// The main purpose of this function is to poll all network interfaces.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct NetWorkPollFunc;
 
 impl TimerFunction for NetWorkPollFunc {

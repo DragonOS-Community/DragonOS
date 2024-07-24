@@ -160,25 +160,6 @@ impl MountFSInode {
         }
     }
 
-    /// 将新的挂载点-挂载文件系统添加到父级的挂载树
-    pub(super) fn do_mount(
-        &self,
-        inode_id: InodeId,
-        new_mount_fs: Arc<MountFS>,
-    ) -> Result<(), SystemError> {
-        let mut guard = self.mount_fs.mountpoints.lock();
-        if guard.contains_key(&inode_id) {
-            return Err(SystemError::EBUSY);
-        }
-        guard.insert(inode_id, new_mount_fs);
-
-        return Ok(());
-    }
-
-    pub(super) fn inode_id(&self) -> InodeId {
-        self.metadata().map(|x| x.inode_id).unwrap()
-    }
-
     fn do_find(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
         // 直接调用当前inode所在的文件系统的find方法进行查找
         // 由于向下查找可能会跨越文件系统的边界，因此需要尝试替换inode

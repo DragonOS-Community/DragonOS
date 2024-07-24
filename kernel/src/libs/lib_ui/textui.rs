@@ -822,7 +822,7 @@ impl TextuiWindow {
         //进行换行操作
         if character == '\n' {
             // 换行时还需要输出\r
-            send_to_default_serial8250_port(&[b'\r']);
+            send_to_default_serial8250_port(b"\r");
             if is_enable_window {
                 self.textui_new_line()?;
             }

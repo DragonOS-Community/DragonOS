@@ -85,6 +85,7 @@ bitflags! {
 ///
 /// 仅仅作为参数传递
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct KernelCloneArgs {
     pub flags: CloneFlags,
 

@@ -101,7 +101,7 @@ impl<T> RwLock<T> {
     #[inline]
     /// @brief 获取实时的读者数并尝试加1,如果增加值成功则返回增加1后的读者数,否则panic
     fn current_reader(&self) -> Result<u32, SystemError> {
-        const MAX_READERS: u32 = core::u32::MAX >> READER_BIT >> 1; //右移3位
+        const MAX_READERS: u32 = u32::MAX >> READER_BIT >> 1; //右移3位
 
         let value = self.lock.fetch_add(READER, Ordering::Acquire);
         //value二进制形式的MSB不能为1, 否则导致溢出

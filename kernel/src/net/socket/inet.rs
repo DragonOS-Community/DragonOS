@@ -632,7 +632,7 @@ impl Socket for TcpSocket {
             let mut socket_set_guard = SOCKET_SET.lock_irqsave();
 
             let socket = socket_set_guard
-                .get_mut::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+                .get_mut::<tcp::Socket>(self.handles.first().unwrap().smoltcp_handle().unwrap());
 
             // 如果socket已经关闭，返回错误
             if !socket.is_active() {
@@ -694,7 +694,7 @@ impl Socket for TcpSocket {
         let mut socket_set_guard = SOCKET_SET.lock_irqsave();
 
         let socket = socket_set_guard
-            .get_mut::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+            .get_mut::<tcp::Socket>(self.handles.first().unwrap().smoltcp_handle().unwrap());
 
         if socket.is_open() {
             if socket.can_send() {
@@ -730,7 +730,7 @@ impl Socket for TcpSocket {
         // debug!("tcp socket:poll, socket'len={}",self.handle.len());
 
         let socket = socket_set_guard
-            .get_mut::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+            .get_mut::<tcp::Socket>(self.handles.first().unwrap().smoltcp_handle().unwrap());
         let handle_map_guard = HANDLE_MAP.read_irqsave();
         let handle_item = handle_map_guard.get(&self.socket_handle()).unwrap();
         let shutdown_type = handle_item.shutdown_type();
@@ -745,7 +745,7 @@ impl Socket for TcpSocket {
         // debug!("tcp socket:connect, socket'len={}", self.handles.len());
 
         let socket =
-            sockets.get_mut::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+            sockets.get_mut::<tcp::Socket>(self.handles.first().unwrap().smoltcp_handle().unwrap());
 
         if let Endpoint::Ip(Some(ip)) = endpoint {
             let temp_port = PORT_MANAGER.get_ephemeral_port(self.metadata.socket_type)?;
@@ -767,7 +767,7 @@ impl Socket for TcpSocket {
                         poll_ifaces();
                         let mut sockets = SOCKET_SET.lock_irqsave();
                         let socket = sockets.get_mut::<tcp::Socket>(
-                            self.handles.get(0).unwrap().smoltcp_handle().unwrap(),
+                            self.handles.first().unwrap().smoltcp_handle().unwrap(),
                         );
 
                         match socket.state() {
@@ -957,7 +957,7 @@ impl Socket for TcpSocket {
 
             drop(sockset);
 
-            // debug!("[TCP] [Accept] sleeping socket with handle: {:?}", self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+            // debug!("[TCP] [Accept] sleeping socket with handle: {:?}", self.handles.first().unwrap().smoltcp_handle().unwrap());
             self.posix_item.sleep(Self::CAN_ACCPET);
             // debug!("tcp socket:after sleep, handle_guard'len={}",HANDLE_MAP.write_irqsave().len());
         }
@@ -971,7 +971,7 @@ impl Socket for TcpSocket {
             // debug!("tcp socket:endpoint, socket'len={}",self.handle.len());
 
             let socket =
-                sockets.get::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+                sockets.get::<tcp::Socket>(self.handles.first().unwrap().smoltcp_handle().unwrap());
             if let Some(ep) = socket.local_endpoint() {
                 result = Some(Endpoint::Ip(Some(ep)));
             }
@@ -984,7 +984,7 @@ impl Socket for TcpSocket {
         // debug!("tcp socket:peer_endpoint, socket'len={}",self.handle.len());
 
         let socket =
-            sockets.get::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+            sockets.get::<tcp::Socket>(self.handles.first().unwrap().smoltcp_handle().unwrap());
         return socket.remote_endpoint().map(|x| Endpoint::Ip(Some(x)));
     }
 
@@ -999,7 +999,7 @@ impl Socket for TcpSocket {
     fn socket_handle(&self) -> GlobalSocketHandle {
         // debug!("tcp socket:socket_handle, socket'len={}",self.handle.len());
 
-        *self.handles.get(0).unwrap()
+        *self.handles.first().unwrap()
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {

@@ -387,6 +387,7 @@ impl Ps2MouseDevice {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn wait_for_read(&self) -> Result<(), SystemError> {
         let timeout = 100_000;
         for _ in 0..timeout {

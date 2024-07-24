@@ -780,7 +780,8 @@ const E1000E_TXD_CMD_EOP: u8 = 1 << 0;
 const E1000E_TXD_CMD_IFCS: u8 = 1 << 1;
 const E1000E_TXD_CMD_RS: u8 = 1 << 3;
 
-// E1000E驱动初始化过程中可能的错误
+/// E1000E驱动初始化过程中可能的错误
+#[allow(dead_code)]
 pub enum E1000EPciError {
     // 获取到错误类型的BAR（IO BAR）
     // An IO BAR was provided rather than a memory BAR.

@@ -281,7 +281,7 @@ impl ProcInitInfo {
     }
 
     fn push_str(&self, ustack: &mut UserStack, s: &str) -> Result<(), SystemError> {
-        self.push_slice(ustack, &[b'\0'])?;
+        self.push_slice(ustack, &[b"\0"])?;
         self.push_slice(ustack, s.as_bytes())?;
         return Ok(());
     }

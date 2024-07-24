@@ -42,6 +42,7 @@ pub struct MSRBitmap {
     pub data: [u8; PAGE_SIZE],
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct VcpuData {
     /// The virtual and physical address of the Vmxon naturally aligned 4-KByte region of memory
@@ -73,6 +74,7 @@ pub enum VcpuState {
     Act = 2,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct VmxVcpu {
     pub vcpu_id: u32,
@@ -318,13 +320,13 @@ impl VmxVcpu {
         )?;
         vmx_vmwrite(
             VmcsFields::HOST_GDTR_BASE as u32,
-            pseudo_descriptpr.base.to_bits() as u64,
+            pseudo_descriptpr.base as usize as u64,
         )?;
         vmx_vmwrite(VmcsFields::HOST_IDTR_BASE as u32, unsafe {
             let mut pseudo_descriptpr: x86::dtables::DescriptorTablePointer<u64> =
                 Default::default();
             x86::dtables::sidt(&mut pseudo_descriptpr);
-            pseudo_descriptpr.base.to_bits() as u64
+            pseudo_descriptpr.base as usize as u64
         })?;
 
         // fast entry into the kernel

@@ -14,7 +14,10 @@ use crate::{
     arch::{interrupt::ipi::send_ipi, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
     ipc::shm::ShmId,
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    libs::{
+        rwlock::RwLock,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
 };
 
 use super::{
@@ -53,7 +56,7 @@ pub fn page_manager_lock_irqsave() -> SpinLockGuard<'static, PageManager> {
 
 // 物理页管理器
 pub struct PageManager {
-    phys2page: HashMap<PhysAddr, Page>,
+    phys2page: HashMap<PhysAddr, Arc<Page>>,
 }
 
 impl PageManager {
@@ -67,18 +70,26 @@ impl PageManager {
         self.phys2page.contains_key(paddr)
     }
 
-    pub fn get(&self, paddr: &PhysAddr) -> Option<&Page> {
-        self.phys2page.get(paddr)
+    pub fn get(&self, paddr: &PhysAddr) -> Option<Arc<Page>> {
+        self.phys2page.get(paddr).map(|x| x.clone())
     }
 
-    pub fn get_mut(&mut self, paddr: &PhysAddr) -> &mut Page {
+    pub fn get_unwrap(&self, paddr: &PhysAddr) -> Arc<Page> {
         self.phys2page
-            .get_mut(paddr)
-            .unwrap_or_else(|| panic!("{:?}", paddr))
+            .get(paddr)
+            .unwrap_or_else(|| panic!("Phys Page not found, {:?}", paddr))
+            .clone()
     }
+
+    // pub fn get_mut(&mut self, paddr: &PhysAddr) -> RwLockWriteGuard<Page> {
+    //     self.phys2page
+    //         .get_mut(paddr)
+    //         .unwrap_or_else(|| panic!("{:?}", paddr))
+    //         .write()
+    // }
 
     pub fn insert(&mut self, paddr: PhysAddr, page: Page) {
-        self.phys2page.insert(paddr, page);
+        self.phys2page.insert(paddr, Arc::new(page));
     }
 
     pub fn remove_page(&mut self, paddr: &PhysAddr) {
@@ -106,9 +117,38 @@ bitflags! {
         const PG_SWAPBACKED = 1 << 19;
     }
 }
+
+#[derive(Debug)]
+pub struct Page {
+    inner: RwLock<InnerPage>,
+}
+
+impl core::ops::Deref for Page {
+    type Target = RwLock<InnerPage>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl core::ops::DerefMut for Page {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Page {
+    pub fn new(shared: bool, phys_frame: PhysPageFrame) -> Self {
+        let inner = InnerPage::new(shared, phys_frame);
+        Self {
+            inner: RwLock::new(inner),
+        }
+    }
+}
+
 #[derive(Debug)]
 /// 物理页面信息
-pub struct Page {
+pub struct InnerPage {
     /// 映射计数
     map_count: usize,
     /// 是否为共享页
@@ -125,7 +165,7 @@ pub struct Page {
     phys_frame: PhysPageFrame,
 }
 
-impl Page {
+impl InnerPage {
     pub fn new(shared: bool, phys_frame: PhysPageFrame) -> Self {
         let dealloc_when_zero = !shared;
         Self {

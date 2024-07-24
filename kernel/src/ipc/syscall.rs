@@ -371,7 +371,7 @@ impl Syscall {
                 vma.unmap(&mut address_write_guard.user_mapper.utable, flusher);
 
                 // 将该虚拟内存区域映射到共享内存区域
-                let mut page_manager_guard = page_manager_lock_irqsave();
+                let page_manager_guard = page_manager_lock_irqsave();
                 let mut virt = VirtPageFrame::new(vaddr);
                 for _ in 0..count.data() {
                     let r = unsafe {
@@ -386,7 +386,8 @@ impl Syscall {
 
                     // 将vma加入到对应Page的anon_vma
                     page_manager_guard
-                        .get_mut(&phys.phys_address())
+                        .get_unwrap(&phys.phys_address())
+                        .write()
                         .insert_vma(vma.clone());
 
                     phys = phys.next();
@@ -442,7 +443,7 @@ impl Syscall {
         // 如果物理页的shm_id为None，代表不是共享页
         let page_manager_guard = page_manager_lock_irqsave();
         let page = page_manager_guard.get(&paddr).ok_or(SystemError::EINVAL)?;
-        let shm_id = page.shm_id().ok_or(SystemError::EINVAL)?;
+        let shm_id = page.read().shm_id().ok_or(SystemError::EINVAL)?;
         drop(page_manager_guard);
 
         // 获取对应共享页管理信息

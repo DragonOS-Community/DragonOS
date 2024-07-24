@@ -259,9 +259,9 @@ impl PageFaultHandler {
                 klog_types::LogSource::Buddy,
             );
             let paddr = mapper.translate(address).unwrap().0;
-            let mut anon_vma_guard = page_manager_lock_irqsave();
-            let page = anon_vma_guard.get_mut(&paddr);
-            page.insert_vma(vma.clone());
+            let anon_vma_guard = page_manager_lock_irqsave();
+            let page = anon_vma_guard.get_unwrap(&paddr);
+            page.write().insert_vma(vma.clone());
             VmFaultReason::VM_FAULT_COMPLETED
         } else {
             VmFaultReason::VM_FAULT_OOM
@@ -434,8 +434,8 @@ impl PageFaultHandler {
         let address = pfm.address_aligned_down();
         let vma = pfm.vma.clone();
         let old_paddr = mapper.translate(address).unwrap().0;
-        let mut page_manager = page_manager_lock_irqsave();
-        let map_count = page_manager.get_mut(&old_paddr).map_count();
+        let page_manager = page_manager_lock_irqsave();
+        let map_count = page_manager.get_unwrap(&old_paddr).read().map_count();
         drop(page_manager);
 
         let mut entry = mapper.get_entry(address, 0).unwrap();
@@ -448,16 +448,16 @@ impl PageFaultHandler {
             table.set_entry(i, entry);
             VmFaultReason::VM_FAULT_COMPLETED
         } else if let Some(flush) = mapper.map(address, new_flags) {
-            let mut page_manager = page_manager_lock_irqsave();
-            let old_page = page_manager.get_mut(&old_paddr);
-            old_page.remove_vma(&vma);
+            let page_manager = page_manager_lock_irqsave();
+            let old_page = page_manager.get_unwrap(&old_paddr);
+            old_page.write().remove_vma(&vma);
             drop(page_manager);
 
             flush.flush();
             let paddr = mapper.translate(address).unwrap().0;
-            let mut anon_vma_guard = page_manager_lock_irqsave();
-            let page = anon_vma_guard.get_mut(&paddr);
-            page.insert_vma(vma.clone());
+            let anon_vma_guard = page_manager_lock_irqsave();
+            let page = anon_vma_guard.get_unwrap(&paddr);
+            page.write().insert_vma(vma.clone());
 
             (MMArch::phys_2_virt(paddr).unwrap().data() as *mut u8).copy_from_nonoverlapping(
                 MMArch::phys_2_virt(old_paddr).unwrap().data() as *mut u8,
@@ -577,8 +577,9 @@ impl PageFaultHandler {
         for pgoff in start_pgoff..=end_pgoff {
             if let Some(page_phys) = page_cache.get_page(pgoff) {
                 let page = page_manager_guard.get(&page_phys).unwrap();
-                if page.flags().contains(PageFlags::PG_UPTODATE) {
-                    let phys = page.phys_frame().phys_address();
+                let page_guard = page.read();
+                if page_guard.flags().contains(PageFlags::PG_UPTODATE) {
+                    let phys = page_guard.phys_frame().phys_address();
                     let virt = phys_2_virt(phys.data());
 
                     let address =
@@ -638,10 +639,11 @@ impl PageFaultHandler {
                 .copy_from_nonoverlapping(buf.as_mut_ptr(), MMArch::PAGE_SIZE);
 
             let page = Page::new(false, PhysPageFrame::new(new_cache_page));
-            pfm.page_phys_address = Some(page.phys_frame().phys_address());
+            let page_guard = page.read();
+            pfm.page_phys_address = Some(page_guard.phys_frame().phys_address());
 
-            page_cache.add_page(file_pgoff, page.phys_frame().phys_address());
-
+            page_cache.add_page(file_pgoff, page_guard.phys_frame().phys_address());
+            drop(page_guard);
             page_manager_guard.insert(new_cache_page, page);
 
             //     // 分配空白页并映射到缺页地址

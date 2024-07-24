@@ -165,8 +165,8 @@ impl ShmManager {
         let mut page_manager_guard = page_manager_lock_irqsave();
         let mut cur_phys = PhysPageFrame::new(phys_page.0);
         for _ in 0..page_count.data() {
-            let mut page = Page::new(true, cur_phys);
-            page.set_shm_id(shm_id);
+            let page = Page::new(true, cur_phys);
+            page.write().set_shm_id(shm_id);
             let paddr = cur_phys.phys_address();
             page_manager_guard.insert(paddr, page);
             cur_phys = cur_phys.next();
@@ -324,8 +324,8 @@ impl ShmManager {
         if map_count > 0 {
             // 设置共享内存物理页当映射计数等于0时可被回收
             for _ in 0..count.data() {
-                let page = page_manager_guard.get_mut(&cur_phys.phys_address());
-                page.set_dealloc_when_zero(true);
+                let page = page_manager_guard.get_unwrap(&cur_phys.phys_address());
+                page.write().set_dealloc_when_zero(true);
 
                 cur_phys = cur_phys.next();
             }
@@ -444,7 +444,8 @@ impl KernelShm {
         for _ in 0..page_count.data() {
             let page = page_manager_guard.get(&cur_phys.phys_address()).unwrap();
             id_set.extend(
-                page.anon_vma()
+                page.read()
+                    .anon_vma()
                     .iter()
                     .map(|vma| vma.id())
                     .collect::<Vec<_>>(),

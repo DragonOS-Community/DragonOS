@@ -187,11 +187,11 @@ impl InnerAddressSpace {
             // debug!("new vma: {:x?}", new_vma);
             let new_vma_guard = new_vma.lock();
             let new_mapper = &new_guard.user_mapper.utable;
-            let mut anon_vma_guard = page_manager_lock_irqsave();
+            let anon_vma_guard = page_manager_lock_irqsave();
             for page in new_vma_guard.pages().map(|p| p.virt_address()) {
                 if let Some((paddr, _)) = new_mapper.translate(page) {
-                    let page = anon_vma_guard.get_mut(&paddr);
-                    page.insert_vma(new_vma.clone());
+                    let page = anon_vma_guard.get_unwrap(&paddr);
+                    page.write().insert_vma(new_vma.clone());
                 }
             }
 
@@ -1177,12 +1177,13 @@ impl LockedVMA {
                 .expect("Failed to unmap, beacuse of some page is not mapped");
 
             // 从anon_vma中删除当前VMA
-            let page = page_manager_guard.get_mut(&paddr);
-            page.remove_vma(self);
+            let page = page_manager_guard.get_unwrap(&paddr);
+            page.write().remove_vma(self);
 
             // 如果物理页的anon_vma链表长度为0并且不是共享页，则释放物理页.
-            if page.can_deallocate() {
+            if page.read().can_deallocate() {
                 unsafe {
+                    drop(page);
                     deallocate_page_frames(
                         PhysPageFrame::new(paddr),
                         PageFrameCount::new(1),
@@ -1250,14 +1251,15 @@ impl LockedVMA {
         });
 
         // 重新设置before、after这两个VMA里面的物理页的anon_vma
-        let mut page_manager_guard = page_manager_lock_irqsave();
+        let page_manager_guard = page_manager_lock_irqsave();
         if let Some(before) = before.clone() {
             let virt_iter = before.lock().region.iter_pages();
             for frame in virt_iter {
                 if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
-                    let page = page_manager_guard.get_mut(&paddr);
-                    page.insert_vma(before.clone());
-                    page.remove_vma(self);
+                    let page = page_manager_guard.get_unwrap(&paddr);
+                    let mut page_guard = page.write();
+                    page_guard.insert_vma(before.clone());
+                    page_guard.remove_vma(self);
                     before.lock().mapped = true;
                 }
             }
@@ -1267,9 +1269,10 @@ impl LockedVMA {
             let virt_iter = after.lock().region.iter_pages();
             for frame in virt_iter {
                 if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
-                    let page = page_manager_guard.get_mut(&paddr);
-                    page.insert_vma(after.clone());
-                    page.remove_vma(self);
+                    let page = page_manager_guard.get_unwrap(&paddr);
+                    let mut page_guard = page.write();
+                    page_guard.insert_vma(after.clone());
+                    page_guard.remove_vma(self);
                     after.lock().mapped = true;
                 }
             }
@@ -1569,12 +1572,12 @@ impl VMA {
         ));
 
         // 将VMA加入到anon_vma中
-        let mut page_manager_guard = page_manager_lock_irqsave();
+        let page_manager_guard = page_manager_lock_irqsave();
         cur_phy = phys;
         for _ in 0..count.data() {
             let paddr = cur_phy.phys_address();
-            let page = page_manager_guard.get_mut(&paddr);
-            page.insert_vma(r.clone());
+            let page = page_manager_guard.get_unwrap(&paddr);
+            page.write().insert_vma(r.clone());
             cur_phy = cur_phy.next();
         }
 
@@ -1639,15 +1642,15 @@ impl VMA {
         // debug!("VMA::zeroed: flusher dropped");
 
         // 清空这些内存并将VMA加入到anon_vma中
-        let mut page_manager_guard = page_manager_lock_irqsave();
+        let page_manager_guard = page_manager_lock_irqsave();
         let virt_iter: VirtPageFrameIter =
             VirtPageFrameIter::new(destination, destination.add(page_count));
         for frame in virt_iter {
             let paddr = mapper.translate(frame.virt_address()).unwrap().0;
 
             // 将VMA加入到anon_vma
-            let page = page_manager_guard.get_mut(&paddr);
-            page.insert_vma(r.clone());
+            let page = page_manager_guard.get_unwrap(&paddr);
+            page.write().insert_vma(r.clone());
         }
         // debug!("VMA::zeroed: done");
         return Ok(r);

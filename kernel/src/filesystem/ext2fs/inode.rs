@@ -323,12 +323,12 @@ pub struct Ext2InodeInfo {
 
 impl Ext2InodeInfo {
     pub fn new(inode: &Ext2Inode, inode_num: u32) -> Self {
-      //  info!(" ============ Ext2InodeInfo new ============");
+        //  info!(" ============ Ext2InodeInfo new ============");
         let mode = inode.mode;
 
         // info!("mode = {mode:X}");
         let file_type = Ext2FileType::type_from_mode(&mode).unwrap().covert_type();
-      //  info!("file_type = {:?},inode_num = {inode_num}", file_type);
+        //  info!("file_type = {:?},inode_num = {inode_num}", file_type);
 
         // TODO 根据inode mode转换modetype
         let fs_mode = ModeType::from_bits_truncate(mode as u32);
@@ -337,7 +337,7 @@ impl Ext2InodeInfo {
 
         // TODO 间接地址
         // info!("end Ext2InodeInfo new");
-      //  info!(" ============ Ext2InodeInfo new ============");
+        //  info!(" ============ Ext2InodeInfo new ============");
         Self {
             inode: inode.clone(),
             i_data: inode.blocks,
@@ -354,18 +354,18 @@ impl Ext2InodeInfo {
 
 impl IndexNode for LockedExt2InodeInfo {
     fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
-      //  debug!("poll");
+        //  debug!("poll");
         Ok(0)
     }
     fn get_entry_name_and_metadata(
         &self,
         ino: crate::filesystem::vfs::InodeId,
     ) -> Result<(String, Metadata), SystemError> {
-      //  debug!("not implement get_entry_name_and_metadata");
+        //  debug!("not implement get_entry_name_and_metadata");
         Err(SystemError::ENOSYS)
     }
     fn get_entry_name(&self, _ino: crate::filesystem::vfs::InodeId) -> Result<String, SystemError> {
-      //  debug!("not implement get_entry_name");
+        //  debug!("not implement get_entry_name");
         Err(SystemError::ENOSYS)
     }
     fn move_to(
@@ -374,7 +374,7 @@ impl IndexNode for LockedExt2InodeInfo {
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
     ) -> Result<(), SystemError> {
-      //  debug!("not implement fn move_to");
+        //  debug!("not implement fn move_to");
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::ENOSYS);
     }
@@ -396,12 +396,12 @@ impl IndexNode for LockedExt2InodeInfo {
         _private_data: &FilePrivateData,
     ) -> Result<usize, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
-      //  debug!("not implement ioctl");
+        //  debug!("not implement ioctl");
         return Err(SystemError::ENOSYS);
     }
 
     fn find(&self, _name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-      //  info!(" =========== begin find {_name} ===========");
+        //  info!(" =========== begin find {_name} ===========");
         let guard = self.0.lock();
         let sb = ext2fs_instance().super_block();
         let super_block = sb.0.lock();
@@ -417,7 +417,7 @@ impl IndexNode for LockedExt2InodeInfo {
         }
         // let size: usize = ((inode.directory_acl as usize) << 32usize) + inode.lower_size as usize;
         let size: usize = inode.file_size(version);
-      //  debug!("{_name} size = {size}");
+        //  debug!("{_name} size = {size}");
         let mut data_block: Vec<u8> = Vec::with_capacity(size);
         data_block.resize(size, 0);
         drop(guard);
@@ -431,7 +431,7 @@ impl IndexNode for LockedExt2InodeInfo {
         let mut begin_pos = 0;
         loop {
             if begin_pos >= data_block.len() {
-              //  debug!("begin_pos >= data_block.len()");
+                //  debug!("begin_pos >= data_block.len()");
                 break;
             }
             let inode_num =
@@ -446,12 +446,12 @@ impl IndexNode for LockedExt2InodeInfo {
             let name_len: u8 = u8::from_le(data_block[begin_pos + 2]);
 
             let name = String::from_utf8_lossy(&data_block[name_pos..name_pos + name_len as usize]);
-          //  debug!("name:{name:?},rc_len={rc_len}");
+            //  debug!("name:{name:?},rc_len={rc_len}");
             if name == _name {
                 let ext2 = ext2fs_instance();
                 let sb = ext2.sb_info.0.lock();
                 let i = sb.read_inode(inode_num).unwrap();
-              //  info!(" =========== find {_name} ===========");
+                //  info!(" =========== find {_name} ===========");
 
                 return Ok(Arc::new(LockedExt2InodeInfo(SpinLock::new(
                     Ext2InodeInfo::new(&i, inode_num),
@@ -459,7 +459,7 @@ impl IndexNode for LockedExt2InodeInfo {
             }
             begin_pos += rc_len as usize - mem::size_of::<u32>();
         }
-      //  info!(" =========== not find {_name} ===========");
+        //  info!(" =========== not find {_name} ===========");
         // return self.create_with_data(_name, FileType::File, ModeType::all(), 0);
 
         return Err(SystemError::ENOENT);
@@ -555,11 +555,11 @@ impl IndexNode for LockedExt2InodeInfo {
 
                 if already_read_block == read_block_num || inode_grade.i_data[12] == 0 {
                     buf.copy_from_slice(&read_buf[..len]);
-                  //  debug!("end read direct,end LockedExt2InodeInfo read_at, start_block = {start_block}");
+                    //  debug!("end read direct,end LockedExt2InodeInfo read_at, start_block = {start_block}");
                     return Ok(min(file_size, len));
                 }
 
-              //  debug!("read indirect, start_block = {start_block}");
+                //  debug!("read indirect, start_block = {start_block}");
 
                 // 读取一级间接块
                 // 获取地址块
@@ -600,10 +600,10 @@ impl IndexNode for LockedExt2InodeInfo {
 
                 if inode_grade.i_data[13] == 0 || already_read_block == read_block_num {
                     buf.copy_from_slice(&read_buf[..len]);
-                  //  debug!("end read indirect,end LockedExt2InodeInfo read_at, start_block = {start_block}");
+                    //  debug!("end read indirect,end LockedExt2InodeInfo read_at, start_block = {start_block}");
                     return Ok(min(file_size, len));
                 }
-              //  debug!("read secondly direct, start_block = {start_block}");
+                //  debug!("read secondly direct, start_block = {start_block}");
 
                 // 读取二级间接块
 
@@ -658,11 +658,11 @@ impl IndexNode for LockedExt2InodeInfo {
                 }
 
                 if inode_grade.i_data[14] == 0 || already_read_block == read_block_num {
-                  //  debug!("end read secondly direct,end LockedExt2InodeInfo read_at, start_block = {start_block}");
+                    //  debug!("end read secondly direct,end LockedExt2InodeInfo read_at, start_block = {start_block}");
                     buf.copy_from_slice(&read_buf[..len]);
                     return Ok(min(file_size, len));
                 }
-              //  debug!("read thirdly direct, start_block = {start_block}");
+                //  debug!("read thirdly direct, start_block = {start_block}");
 
                 // 读取三级间接块
 
@@ -752,7 +752,7 @@ impl IndexNode for LockedExt2InodeInfo {
         buf: &[u8],
         _data: SpinLockGuard<'_, FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
-      //  debug!("============== begin write_at ==============");
+        //  debug!("============== begin write_at ==============");
         //TODO 读inode
 
         let inode_grade = self.0.lock();
@@ -780,7 +780,7 @@ impl IndexNode for LockedExt2InodeInfo {
                 let block_size = super_block.s_block_size as usize;
 
                 let mut block_offset = offset / block_size;
-              //  debug!("block_offset = {block_offset}");
+                //  debug!("block_offset = {block_offset}");
                 // let inode = &inode_grade.inode;
                 let inode = new_read_inode;
 
@@ -815,13 +815,13 @@ impl IndexNode for LockedExt2InodeInfo {
                 let mut start_buf_offset = 0usize;
                 let mut inode_flush = false;
                 let mut new_file_offset = offset % block_size;
-              //  debug!("new_file_offset = {new_file_offset}");
+                //  debug!("new_file_offset = {new_file_offset}");
 
                 // 通过file size 判断是否要分配新的块
                 while start_buf_offset < len {
                     // 每次要写的长度
                     let write_len = min(block_size, buf.len());
-                  //  debug!("write_len = {write_len},block_offset = {block_offset},start_buf_offset = {start_buf_offset}");
+                    //  debug!("write_len = {write_len},block_offset = {block_offset},start_buf_offset = {start_buf_offset}");
                     // 找到起始要插入的块
                     if block_offset < 12 {
                         block_id = inode.blocks[block_offset] as usize;
@@ -848,11 +848,11 @@ impl IndexNode for LockedExt2InodeInfo {
                         //     "direct: write file data,lba_id: {},count: {count}",
                         //     block_id * block_size / LBA_SIZE
                         // );
-                      //  debug!("direct alloc block id {block_id}");
+                        //  debug!("direct alloc block id {block_id}");
 
                         // 每次写一块逻辑块的大小数据
                         if write_len < block_size {
-                          //  debug!(" ============ write_len < block_size write data ============");
+                            //  debug!(" ============ write_len < block_size write data ============");
                             let mut write_buf: Vec<u8> = Vec::with_capacity(block_size);
                             write_buf.resize(block_size, 0);
                             partition
@@ -876,7 +876,7 @@ impl IndexNode for LockedExt2InodeInfo {
                             partition
                                 .disk()
                                 .write_at(block_id * count, count, &write_buf)?;
-                          //  debug!(" ============== write_len < block_size end write data ============== ");
+                            //  debug!(" ============== write_len < block_size end write data ============== ");
                         } else {
                             // debug!(
                             //     " ============== write_len = block_size write data =============="
@@ -886,10 +886,10 @@ impl IndexNode for LockedExt2InodeInfo {
                                 count,
                                 &buf[start_buf_offset..start_buf_offset + write_len],
                             )?;
-                          //  debug!(" ============== write_len = block_size end write data ============== ");
+                            //  debug!(" ============== write_len = block_size end write data ============== ");
                         }
 
-                      //  debug!("direct:end write data");
+                        //  debug!("direct:end write data");
                     } else if block_offset < id_per_block + 12 {
                         // 一级间接
                         let mut id = inode.blocks[12] as usize;
@@ -902,7 +902,7 @@ impl IndexNode for LockedExt2InodeInfo {
                             )?;
                             inode_clone.blocks[12] = new_block as u32;
                             id = new_block;
-                          //  debug!("indirect alloc 1th block id {new_block}");
+                            //  debug!("indirect alloc 1th block id {new_block}");
                         }
                         let mut address_block: Vec<u8> = Vec::with_capacity(block_size);
                         address_block.resize(block_size, 0);
@@ -921,7 +921,7 @@ impl IndexNode for LockedExt2InodeInfo {
                                 group_id,
                                 block_size / mem::size_of::<Ext2BlockGroupDescriptor>(),
                             )?;
-                          //  debug!("indirect alloc 2th block id {new_block}");
+                            //  debug!("indirect alloc 2th block id {new_block}");
                             block_id = new_block;
                             address_block_data[block_offset - 12] = new_block as u32;
 
@@ -933,17 +933,17 @@ impl IndexNode for LockedExt2InodeInfo {
                         }
                         // TODO 将数据写到新块中
 
-                      //  debug!("indirect: write file data");
+                        //  debug!("indirect: write file data");
 
                         let count = block_size / LBA_SIZE;
                         // 每次写一块逻辑块的大小数据
                         if write_len < block_size {
-                          //  debug!("write_len < block_size write data");
+                            //  debug!("write_len < block_size write data");
                             let mut write_buf: Vec<u8> = Vec::with_capacity(block_size);
                             write_buf.append(
                                 &mut buf[start_buf_offset..start_buf_offset + write_len].to_vec(),
                             );
-                          //  debug!("write buf len = {}", write_buf.len());
+                            //  debug!("write buf len = {}", write_buf.len());
                             let zero = vec![0u8; block_size - write_len];
                             write_buf.extend_from_slice(&zero);
                             partition.disk().write_at(
@@ -951,7 +951,7 @@ impl IndexNode for LockedExt2InodeInfo {
                                 count,
                                 &write_buf,
                             )?;
-                          //  debug!("write_len < block_size end write data");
+                            //  debug!("write_len < block_size end write data");
                         } else {
                             partition.disk().write_at(
                                 block_id * block_size / LBA_SIZE,
@@ -960,7 +960,7 @@ impl IndexNode for LockedExt2InodeInfo {
                             )?;
                         }
 
-                      //  debug!("indirect: end write file data");
+                        //  debug!("indirect: end write file data");
 
                         // TODO address_block写回磁盘
                     } else if block_offset < id_per_block.pow(2) + 12 {
@@ -973,7 +973,7 @@ impl IndexNode for LockedExt2InodeInfo {
                                 group_id,
                                 block_size / mem::size_of::<Ext2BlockGroupDescriptor>(),
                             )?;
-                          //  debug!("secondly alloc 1th block id {new_block}");
+                            //  debug!("secondly alloc 1th block id {new_block}");
                             inode_clone.blocks[13] = new_block as u32;
                             id = new_block;
                         }
@@ -997,7 +997,7 @@ impl IndexNode for LockedExt2InodeInfo {
                                 group_id,
                                 block_size / mem::size_of::<Ext2BlockGroupDescriptor>(),
                             )?;
-                          //  debug!("secondly alloc 2th block id {new_block}");
+                            //  debug!("secondly alloc 2th block id {new_block}");
 
                             address_block_data[(block_offset - id_per_block - 12) / id_per_block] =
                                 new_block as u32;
@@ -1025,7 +1025,7 @@ impl IndexNode for LockedExt2InodeInfo {
                                 group_id,
                                 block_size / mem::size_of::<Ext2BlockGroupDescriptor>(),
                             )?;
-                          //  debug!("secondly alloc 3th block id {new_block}");
+                            //  debug!("secondly alloc 3th block id {new_block}");
 
                             // TODO address_block写回磁盘
                             block_id = new_block;
@@ -1039,16 +1039,16 @@ impl IndexNode for LockedExt2InodeInfo {
                         }
                         // TODO address_block写回磁盘
 
-                      //  debug!("secondly: write file data");
+                        //  debug!("secondly: write file data");
                         let count = block_size / LBA_SIZE;
                         // 每次写一块逻辑块的大小数据
                         if write_len < block_size {
-                          //  debug!("write_len < block_size write data");
+                            //  debug!("write_len < block_size write data");
                             let mut write_buf: Vec<u8> = Vec::with_capacity(block_size);
                             write_buf.append(
                                 &mut buf[start_buf_offset..start_buf_offset + write_len].to_vec(),
                             );
-                          //  debug!("write buf len = {}", write_buf.len());
+                            //  debug!("write buf len = {}", write_buf.len());
                             let zero = vec![0u8; block_size - write_len];
                             write_buf.extend_from_slice(&zero);
                             partition.disk().write_at(
@@ -1056,7 +1056,7 @@ impl IndexNode for LockedExt2InodeInfo {
                                 count,
                                 &write_buf,
                             )?;
-                          //  debug!("write_len < block_size end write data");
+                            //  debug!("write_len < block_size end write data");
                         } else {
                             partition.disk().write_at(
                                 block_id * block_size / LBA_SIZE,
@@ -1065,7 +1065,7 @@ impl IndexNode for LockedExt2InodeInfo {
                             )?;
                         }
 
-                      //  debug!("secondly: end write file data");
+                        //  debug!("secondly: end write file data");
                     } else {
                         // 三级间接
                         let mut id = inode.blocks[14] as usize;
@@ -1076,7 +1076,7 @@ impl IndexNode for LockedExt2InodeInfo {
                                 group_id,
                                 block_size / mem::size_of::<Ext2BlockGroupDescriptor>(),
                             )?;
-                          //  debug!("thirdly alloc 1th block id {new_block}");
+                            //  debug!("thirdly alloc 1th block id {new_block}");
 
                             inode_clone.blocks[14] = new_block as u32;
                             id = new_block;
@@ -1102,7 +1102,7 @@ impl IndexNode for LockedExt2InodeInfo {
                                 group_id,
                                 block_size / mem::size_of::<Ext2BlockGroupDescriptor>(),
                             )?;
-                          //  debug!("thirdly alloc 2th block id {new_block}");
+                            //  debug!("thirdly alloc 2th block id {new_block}");
 
                             // TODO address_block写回磁盘
 
@@ -1139,7 +1139,7 @@ impl IndexNode for LockedExt2InodeInfo {
                                 group_id,
                                 block_size / mem::size_of::<Ext2BlockGroupDescriptor>(),
                             )?;
-                          //  debug!("thirdly alloc 3th block id {new_block}");
+                            //  debug!("thirdly alloc 3th block id {new_block}");
 
                             // TODO address_block写回磁盘
                             address_block_data[(block_offset
@@ -1172,7 +1172,7 @@ impl IndexNode for LockedExt2InodeInfo {
                                 group_id,
                                 block_size / mem::size_of::<Ext2BlockGroupDescriptor>(),
                             )?;
-                          //  debug!("thirdly alloc 4th block id {new_block}");
+                            //  debug!("thirdly alloc 4th block id {new_block}");
                             block_id = new_block;
                             address_block_data
                                 [block_offset - id_per_block - 12 - id_per_block.pow(2)] =
@@ -1186,17 +1186,17 @@ impl IndexNode for LockedExt2InodeInfo {
                         }
                         // BUG 将数据写到新块中
 
-                      //  debug!("thirdly:write file data");
+                        //  debug!("thirdly:write file data");
 
                         let count = block_size / LBA_SIZE;
                         // 每次写一块逻辑块的大小数据
                         if write_len < block_size {
-                          //  debug!("write_len < block_size write data");
+                            //  debug!("write_len < block_size write data");
                             let mut write_buf: Vec<u8> = Vec::with_capacity(block_size);
                             write_buf.append(
                                 &mut buf[start_buf_offset..start_buf_offset + write_len].to_vec(),
                             );
-                          //  debug!("write buf len = {}", write_buf.len());
+                            //  debug!("write buf len = {}", write_buf.len());
                             let zero = vec![0u8; block_size - write_len];
                             write_buf.extend_from_slice(&zero);
                             partition.disk().write_at(
@@ -1204,7 +1204,7 @@ impl IndexNode for LockedExt2InodeInfo {
                                 count,
                                 &write_buf,
                             )?;
-                          //  debug!("write_len < block_size end write data");
+                            //  debug!("write_len < block_size end write data");
                         } else {
                             // BUG 先读后写
                             partition.disk().write_at(
@@ -1213,21 +1213,21 @@ impl IndexNode for LockedExt2InodeInfo {
                                 &buf[start_buf_offset..start_buf_offset + write_len],
                             )?;
                         }
-                      //  debug!("thirdly:end write file data");
+                        //  debug!("thirdly:end write file data");
                     }
 
                     block_offset += 1;
                     start_buf_offset += write_len;
                     new_file_offset = (new_file_offset + write_len) % block_size;
                 }
-              //  debug!("end write data,maybe flush inode");
+                //  debug!("end write data,maybe flush inode");
                 if inode_flush {
-                  //  debug!("============ inode flush ============ ");
+                    //  debug!("============ inode flush ============ ");
                     // 写inode表
                     let mut table_num = group_desc.inode_table_start as usize;
                     let inode_per_block = block_size / mem::size_of::<Ext2Inode>();
                     let inode_id = inode_grade.inode_num as usize - 1;
-                  //  debug!("inode_id: {inode_id}");
+                    //  debug!("inode_id: {inode_id}");
                     // BUG inode id 比预期大1
                     let inode_group_offset = inode_id % super_block.s_inodes_per_group as usize;
                     let inode_size = mem::size_of::<Ext2Inode>();
@@ -1241,14 +1241,14 @@ impl IndexNode for LockedExt2InodeInfo {
                     table_data.resize(block_size, 0);
                     partition.disk().read_at(lba_id, count, &mut table_data)?;
                     let inode_data = inode_clone.to_bytes();
-                  //  debug!("inode_clone: {inode_clone:?}\n inode_data:{inode_data:X?}");
+                    //  debug!("inode_clone: {inode_clone:?}\n inode_data:{inode_data:X?}");
                     // BUG inode data
                     table_data.splice(
                         inode_byte_offset..inode_byte_offset + inode_size,
                         inode_data,
                     );
 
-                  //  debug!("inode_byte_offset:{inode_byte_offset},lbaid:{lba_id}");
+                    //  debug!("inode_byte_offset:{inode_byte_offset},lbaid:{lba_id}");
                     // debug!(
                     //     "write inode table,pos = {}",
                     //     lba_id * LBA_SIZE + inode_byte_offset
@@ -1256,18 +1256,18 @@ impl IndexNode for LockedExt2InodeInfo {
 
                     partition.disk().write_at(lba_id, count, &table_data)?;
 
-                  //  debug!("============ inode flush ============ ");
-                  //  debug!("============== write block bitmap ==============");
+                    //  debug!("============ inode flush ============ ");
+                    //  debug!("============== write block bitmap ==============");
                     partition.disk().write_at(
                         group_desc.block_bitmap_address as usize * block_size / LBA_SIZE,
                         bitmap_count * (block_size / LBA_SIZE),
                         bitmap_buf.as_mut_slice(),
                     )?;
-                  //  debug!("{:X?}", bitmap_buf);
-                  //  debug!("============== write block bitmap ==============");
+                    //  debug!("{:X?}", bitmap_buf);
+                    //  debug!("============== write block bitmap ==============");
                 }
 
-              //  debug!("============== end write at ==============");
+                //  debug!("============== end write at ==============");
                 return Ok(start_buf_offset);
                 // let start_block_id = offset
             }
@@ -1289,7 +1289,7 @@ impl IndexNode for LockedExt2InodeInfo {
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
-      //  debug!("begin ext2 list");
+        //  debug!("begin ext2 list");
         let guard = self.0.lock();
         let file_type = Ext2FileType::type_from_mode(&guard.i_mode);
         if file_type.is_err() {
@@ -1297,7 +1297,7 @@ impl IndexNode for LockedExt2InodeInfo {
             return Err(SystemError::EINVAL);
         }
         let file_type = file_type.unwrap();
-      //  debug!("file type = {file_type:?}");
+        //  debug!("file type = {file_type:?}");
         let mut names: Vec<String> = Vec::new();
         match file_type {
             Ext2FileType::Directory => {
@@ -1321,7 +1321,7 @@ impl IndexNode for LockedExt2InodeInfo {
                 let mut data_block: Vec<u8> = Vec::with_capacity(size);
                 data_block.resize(size, 0);
                 drop(guard);
-              //  debug!("enter read at");
+                //  debug!("enter read at");
                 let _read_size = inode_info.read_at(
                     0,
                     size,
@@ -1353,7 +1353,7 @@ impl IndexNode for LockedExt2InodeInfo {
                     names.push(name.to_string());
                     begin_pos += rc_len as usize - mem::size_of::<u32>();
                 }
-              //  debug!("end ext2 list");
+                //  debug!("end ext2 list");
 
                 // 将entry添加到ret中
                 return Ok(names);
@@ -1374,11 +1374,11 @@ impl IndexNode for LockedExt2InodeInfo {
         _data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         if _data == 0 {
-          //  debug!("create_with_data to create");
+            //  debug!("create_with_data to create");
             return self.create(_name, _file_type, _mode);
         }
 
-      //  debug!("not implement create with data address data flag");
+        //  debug!("not implement create with data address data flag");
         return Err(SystemError::ENOSYS);
     }
     fn create(
@@ -1387,7 +1387,7 @@ impl IndexNode for LockedExt2InodeInfo {
         file_type: FileType,
         mode: ModeType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-      //  debug!("============== begin ext2 create {name}============== ");
+        //  debug!("============== begin ext2 create {name}============== ");
         let guard = self.0.lock();
         let ext2fs = ext2fs_instance();
         let sb = ext2fs.sb_info.0.lock();
@@ -1402,7 +1402,7 @@ impl IndexNode for LockedExt2InodeInfo {
             (((sb.s_inodes_per_group as usize / 8) / block_size) + 1) * (block_size / LBA_SIZE);
         let mut bitmap_buf: Vec<u8> = Vec::with_capacity(bitmap_count * LBA_SIZE);
         bitmap_buf.resize(bitmap_count * LBA_SIZE, 0);
-      //  debug!("get bitmap");
+        //  debug!("get bitmap");
 
         let _ = ext2fs_instance().partition.disk().read_at(
             i_bitmap,
@@ -1450,12 +1450,12 @@ impl IndexNode for LockedExt2InodeInfo {
         let block_id = (descriptor.inode_table_start as usize
             + (index_offset * sb.s_inode_size as usize) / block_size)
             * (block_size / LBA_SIZE);
-      //  debug!("block_id: {block_id}");
+        //  debug!("block_id: {block_id}");
 
         // 读inode table
         let mut table_buf: Vec<u8> = Vec::with_capacity(block_size);
         table_buf.resize(block_size, 0);
-      //  debug!("read inode table");
+        //  debug!("read inode table");
         let _ = ext2fs_instance().partition.disk().read_at(
             block_id,
             block_size / LBA_SIZE,
@@ -1463,11 +1463,11 @@ impl IndexNode for LockedExt2InodeInfo {
         );
 
         let in_block_offset = (index_offset * sb.s_inode_size as usize) % block_size;
-      //  debug!("block_id:{block_id},in_block_offset:{in_block_offset}");
+        //  debug!("block_id:{block_id},in_block_offset:{in_block_offset}");
         table_buf[in_block_offset..in_block_offset + mem::size_of::<Ext2Inode>()]
             .copy_from_slice(&new_inode.to_bytes());
         // 写inode table
-      //  debug!("write inode table");
+        //  debug!("write inode table");
 
         let _ = ext2fs_instance().partition.disk().write_at(
             block_id,
@@ -1475,7 +1475,7 @@ impl IndexNode for LockedExt2InodeInfo {
             table_buf.as_slice(),
         );
         //  写inode bitmap
-      //  debug!("write inode bitmap");
+        //  debug!("write inode bitmap");
 
         bitmap_buf[bpos] = new_bm;
         let _ = ext2fs_instance().partition.disk().write_at(
@@ -1485,7 +1485,7 @@ impl IndexNode for LockedExt2InodeInfo {
         );
         // TODO 修改
         // descriptor.free_inodes_num-=1;
-      //  debug!("descriptor flush");
+        //  debug!("descriptor flush");
         descriptor.flush(&ext2fs_instance().partition, group_id as usize, block_size)?;
 
         // TODO 写descriptor
@@ -1512,7 +1512,7 @@ impl IndexNode for LockedExt2InodeInfo {
         drop(sb);
 
         let entry_buf = new_entry.to_bytes();
-      //  debug!("============== write entry ==============");
+        //  debug!("============== write entry ==============");
         // debug!("entry_buf={:X?}", entry_buf);
         // BUG 构造一个新的 inode info
         let new_father = Arc::new(LockedExt2InodeInfo(SpinLock::new(Ext2InodeInfo::new(
@@ -1532,7 +1532,7 @@ impl IndexNode for LockedExt2InodeInfo {
         //     SpinLock::new(FilePrivateData::Unused).lock(),
         // )?;
         // TODO 调用write at追加entry
-      //  debug!("============== end ext2 create {name}==============");
+        //  debug!("============== end ext2 create {name}==============");
 
         Ok(Arc::new(LockedExt2InodeInfo(SpinLock::new(
             Ext2InodeInfo::new(&new_inode, new_inode_index.try_into().unwrap()),

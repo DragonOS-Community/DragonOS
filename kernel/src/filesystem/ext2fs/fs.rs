@@ -96,9 +96,7 @@ impl Ext2FileSystem {
         }
 
         let root_inode = root_inode.unwrap();
-        // debug!("new the Ext2InodeInfo");
-        let r_info = Ext2InodeInfo::new(&root_inode,2);
-        // debug!("end mount Ext2FS");
+        let r_info = Ext2InodeInfo::new(&root_inode, 2);
         return Ok(Arc::new(Self {
             partition,
             first_data_sector: 0,
@@ -318,11 +316,11 @@ pub struct Ext2SuperBlockInfo {
     pub s_dirs_counter: AtomicU32,
 
     pub partition: Option<Arc<Partition>>, /* root of the per fs reservation window tree */
-                                           // spinlock_t s_rsv_window_lock,
-                                           // struct rb_root s_rsv_window_root,
-                                           // struct ext2_reserve_window_node s_rsv_window_head,
-    pub major_version:u32,
-    pub file_pre_alloc:u8,
+    // spinlock_t s_rsv_window_lock,
+    // struct rb_root s_rsv_window_root,
+    // struct ext2_reserve_window_node s_rsv_window_head,
+    pub major_version: u32,
+    pub file_pre_alloc: u8,
 }
 
 impl Ext2SuperBlockInfo {
@@ -342,11 +340,10 @@ impl Ext2SuperBlockInfo {
         } else {
             128
         };
-        
+
         debug!(
             "fragment_size = {},block_size = {}",
-            fragment_size,
-            block_size
+            fragment_size, block_size
         );
         debug!(
             "s_inodes_per_block = {}.s_frags_per_block = {}",
@@ -387,7 +384,7 @@ impl Ext2SuperBlockInfo {
             s_dirs_counter: AtomicU32::new(1),
             partition: Some(partition.clone()),
             major_version: sb.major_version,
-            file_pre_alloc:sb.prealloc_blocks,
+            file_pre_alloc: sb.prealloc_blocks,
         };
         // debug!("end build super block info");
         ret
@@ -553,8 +550,7 @@ impl Ext2SuperBlock {
     pub fn get_group_count(&self) -> usize {
         debug!(
             "block_count = {},blocks_per_group = {}",
-            self.block_count,
-            self.blocks_per_group
+            self.block_count, self.blocks_per_group
         );
         return (self.block_count / self.blocks_per_group) as usize;
     }

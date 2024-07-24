@@ -79,32 +79,21 @@ impl Ext2BlockGroupDescriptor {
     ) -> Result<usize, SystemError> {
         // TODO 可能要修改desc
         // BUG bitmap改成mut 分配之后写回
-      //  debug!(" ========== alloc_one_block ==========");
         let offset = group_id * block_per_group;
-      //  debug!("group_id={group_id},block_per_group={block_per_group}");
         for (pos, value) in bitmap.iter_mut().enumerate() {
             if *value != 0xFFu8 {
-              //  debug!("block bit map one byte = {value:08b}");
                 // let bitmap_byte = !(*value);
                 let mut mask = 0b1000_0000u8;
                 for i in 0..8 {
                     if (*value) & mask == 0 {
                         let block_num = offset + pos * 8 + i;
                         *value |= mask;
-                        // debug!(
-                        //     "block bit map one byte = {value:08b}",
-                        // );
-
-                        // debug!(
-                        //     " ========== alloc_one_block num = {block_num} ,pos = {pos}=========="
-                        // );
                         return Ok(block_num + 1);
                     }
                     mask <<= 1;
                 }
             }
         }
-      //  debug!(" ========== alloc_one_block Err==========");
         Err(SystemError::ENOMEM)
     }
 }

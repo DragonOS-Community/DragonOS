@@ -556,6 +556,8 @@ impl InnerAddressSpace {
                 return Err(SystemError::EACCES);
             }
 
+            r_guard.set_vm_flags(VmFlags::from(prot_flags));
+
             let new_flags: PageFlags<MMArch> = r_guard
                 .flags()
                 .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))

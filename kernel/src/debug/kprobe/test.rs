@@ -4,7 +4,7 @@ use kprobe::ProbeArgs;
 
 #[inline(never)]
 #[no_mangle]
-pub fn detect_func(x: usize, y: usize) -> usize {
+fn detect_func(x: usize, y: usize) -> usize {
     let hart = 0;
     println!("detect_func: hart_id: {}, x: {}, y:{}", hart, x, y);
     hart
@@ -36,7 +36,7 @@ pub fn kprobe_test() {
     let kprobe_info = KprobeInfo {
         pre_handler,
         post_handler,
-        fault_handler,
+        fault_handler: Some(fault_handler),
         symbol: "detect_func",
         offset: 0,
     };
@@ -47,5 +47,10 @@ pub fn kprobe_test() {
     );
     detect_func(1, 2);
     unregister_kprobe(kprobe).unwrap();
+    println!(
+        "uninstall kprobe at [detect_func]: {:#x}",
+        detect_func as usize
+    );
     detect_func(1, 2);
+    println!("kprobe test end");
 }

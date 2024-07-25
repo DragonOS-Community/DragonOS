@@ -1,13 +1,12 @@
-use alloc::{boxed::Box, string::String};
+use alloc::string::String;
 use core::{any::Any, fmt::Debug};
 
+#[cfg(target_arch = "loongarch64")]
+mod loongarch64;
 #[cfg(target_arch = "riscv64")]
 mod rv64;
 #[cfg(target_arch = "x86_64")]
 mod x86;
-
-#[cfg(target_arch = "loongarch64")]
-mod loongarch64;
 
 #[cfg(target_arch = "loongarch64")]
 pub use loongarch64::*;
@@ -17,86 +16,74 @@ pub use rv64::*;
 pub use x86::*;
 
 pub trait ProbeArgs: Send {
+    /// 用于使用者转换到特定架构下的TrapFrame
     fn as_any(&self) -> &dyn Any;
+    /// 返回导致break异常的地址
     fn break_address(&self) -> usize;
+    /// 返回导致单步执行异常的地址
     fn debug_address(&self) -> usize;
 }
 
 pub trait KprobeOps: Send {
-    /// Install the kprobe
+    /// # 安装kprobe
+    ///
+    /// 不同的架构下需要保存原指令，然后替换为断点指令
     fn install(self) -> Self;
-    /// The next instruction address
+    /// # 返回探测点的下一条指令地址
+    ///
+    /// 执行流需要回到正常的路径中，在执行完探测点的指令后，需要返回到下一条指令
     fn return_address(&self) -> usize;
-    /// The location of the instruction that needs to be single-stepped
+    /// # 返回单步执行的指令地址
+    ///
+    /// 通常探测点的处的原指令被保存在一个数组当中。根据架构的不同, 在保存的指令后面，可能会填充必要的指令。
+    /// 例如x86架构下支持单步执行的特性， 而其它架构下通常没有，因此我们使用break异常来进行模拟，所以会填充
+    /// 一条断点指令。
     fn single_step_address(&self) -> usize;
-    /// The instruction address that triggered the exception after single-step execution
+    /// # 返回单步执行指令触发异常的地址
+    ///
+    /// 其值等于`single_step_address`的值加上探测点指令的长度
     fn debug_address(&self) -> usize;
 }
 
-pub struct ProbeHandler {
-    func: Box<fn(&dyn ProbeArgs)>,
+struct ProbeHandler {
+    func: fn(&dyn ProbeArgs),
 }
 
 impl ProbeHandler {
     pub fn new(func: fn(&dyn ProbeArgs)) -> Self {
-        ProbeHandler {
-            func: Box::new(func),
-        }
+        ProbeHandler { func }
     }
+    /// 调用探测点处理函数
     pub fn call(&self, trap_frame: &dyn ProbeArgs) {
         (self.func)(trap_frame);
     }
 }
 
 pub struct KprobeBuilder {
-    symbol: Option<String>,
-    symbol_addr: Option<usize>,
-    offset: Option<usize>,
-    pre_handler: Option<ProbeHandler>,
-    post_handler: Option<ProbeHandler>,
+    symbol: String,
+    symbol_addr: usize,
+    offset: usize,
+    pre_handler: ProbeHandler,
+    post_handler: ProbeHandler,
     fault_handler: Option<ProbeHandler>,
 }
 
-impl Default for KprobeBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 impl KprobeBuilder {
-    pub fn new() -> Self {
+    pub fn new(
+        symbol: String,
+        symbol_addr: usize,
+        offset: usize,
+        pre_handler: fn(&dyn ProbeArgs),
+        post_handler: fn(&dyn ProbeArgs),
+    ) -> Self {
         KprobeBuilder {
-            symbol: None,
-            symbol_addr: None,
-            offset: None,
-            pre_handler: None,
-            post_handler: None,
+            symbol,
+            symbol_addr,
+            offset,
+            pre_handler: ProbeHandler::new(pre_handler),
+            post_handler: ProbeHandler::new(post_handler),
             fault_handler: None,
         }
-    }
-
-    pub fn symbol(mut self, symbol: String) -> Self {
-        self.symbol = Some(symbol);
-        self
-    }
-
-    pub fn symbol_addr(mut self, symbol_addr: usize) -> Self {
-        self.symbol_addr = Some(symbol_addr);
-        self
-    }
-
-    pub fn offset(mut self, offset: usize) -> Self {
-        self.offset = Some(offset);
-        self
-    }
-
-    pub fn pre_handler(mut self, func: fn(&dyn ProbeArgs)) -> Self {
-        self.pre_handler = Some(ProbeHandler::new(func));
-        self
-    }
-
-    pub fn post_handler(mut self, func: fn(&dyn ProbeArgs)) -> Self {
-        self.post_handler = Some(ProbeHandler::new(func));
-        self
     }
 
     pub fn fault_handler(mut self, func: fn(&dyn ProbeArgs)) -> Self {
@@ -137,10 +124,12 @@ impl KprobeBasic {
         self.fault_handler.call(trap_frame);
     }
 
+    /// 返回探测点的函数名称
     pub fn symbol(&self) -> &str {
         &self.symbol
     }
 
+    /// 计算探测点的地址
     pub fn kprobe_address(&self) -> usize {
         self.symbol_addr + self.offset
     }
@@ -148,15 +137,13 @@ impl KprobeBasic {
 
 impl From<KprobeBuilder> for KprobeBasic {
     fn from(value: KprobeBuilder) -> Self {
-        let fault_handler = value
-            .fault_handler
-            .unwrap_or_else(|| ProbeHandler::new(|_| {}));
+        let fault_handler = value.fault_handler.unwrap_or(ProbeHandler::new(|_| {}));
         KprobeBasic {
-            symbol: value.symbol.unwrap(),
-            symbol_addr: value.symbol_addr.unwrap(),
-            offset: value.offset.unwrap(),
-            pre_handler: value.pre_handler.unwrap(),
-            post_handler: value.post_handler.unwrap(),
+            symbol: value.symbol,
+            symbol_addr: value.symbol_addr,
+            offset: value.offset,
+            pre_handler: value.pre_handler,
+            post_handler: value.post_handler,
             fault_handler,
         }
     }

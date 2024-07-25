@@ -18,7 +18,7 @@ pub fn kprobe_init() {}
 pub struct KprobeInfo<'a> {
     pub pre_handler: fn(&dyn ProbeArgs),
     pub post_handler: fn(&dyn ProbeArgs),
-    pub fault_handler: fn(&dyn ProbeArgs),
+    pub fault_handler: Option<fn(&dyn ProbeArgs)>,
     pub symbol: &'a str,
     pub offset: usize,
 }
@@ -27,29 +27,41 @@ extern "C" {
     fn addr_from_symbol(symbol: *const u8) -> usize;
 }
 
-/// 注册一个kprobe
-pub fn register_kprobe(kprobe: KprobeInfo) -> Result<Arc<Kprobe>, SystemError> {
-    let mut symbol_sting = kprobe.symbol.to_string();
+/// # 注册一个kprobe
+///
+/// 该函数会根据`symbol`查找对应的函数地址，如果找不到则返回错误。
+///
+/// ## 参数
+/// - `kprobe_info`: kprobe的信息
+pub fn register_kprobe(kprobe_info: KprobeInfo) -> Result<Arc<Kprobe>, SystemError> {
+    let mut symbol_sting = kprobe_info.symbol.to_string();
     if !symbol_sting.ends_with("\0") {
         symbol_sting.push('\0');
     }
     let symbol = symbol_sting.as_ptr();
     let func_addr = unsafe { addr_from_symbol(symbol) };
     if func_addr == 0 {
-        warn!("register_kprobe: the symbol: {} not found", kprobe.symbol);
+        warn!(
+            "register_kprobe: the symbol: {} not found",
+            kprobe_info.symbol
+        );
         return Err(SystemError::ENXIO);
     }
-    let kprobe = KprobeBuilder::new()
-        .symbol(kprobe.symbol.to_string())
-        .symbol_addr(func_addr)
-        .offset(kprobe.offset)
-        .pre_handler(kprobe.pre_handler)
-        .post_handler(kprobe.post_handler)
-        .fault_handler(kprobe.fault_handler)
-        .build()
-        .install();
+    let mut kprobe_builder = KprobeBuilder::new(
+        kprobe_info.symbol.to_string(),
+        func_addr,
+        kprobe_info.offset,
+        kprobe_info.pre_handler,
+        kprobe_info.post_handler,
+    );
+    if kprobe_info.fault_handler.is_some() {
+        kprobe_builder = kprobe_builder.fault_handler(kprobe_info.fault_handler.unwrap());
+    }
+    let kprobe = kprobe_builder.build().install();
+
     let kprobe = Arc::new(kprobe);
-    BREAK_KPROBE_LIST.lock().insert(func_addr, kprobe.clone());
+    let kprobe_addr = kprobe.kprobe_address();
+    BREAK_KPROBE_LIST.lock().insert(kprobe_addr, kprobe.clone());
     let debug_address = kprobe.debug_address();
     DEBUG_KPROBE_LIST
         .lock()
@@ -57,7 +69,10 @@ pub fn register_kprobe(kprobe: KprobeInfo) -> Result<Arc<Kprobe>, SystemError> {
     Ok(kprobe)
 }
 
-/// 注销一个kprobe
+/// # 注销一个kprobe
+///
+/// ## 参数
+/// - `kprobe`: 已安装的kprobe
 pub fn unregister_kprobe(kprobe: Arc<Kprobe>) -> Result<(), SystemError> {
     let debug_address = kprobe.debug_address();
     let kprobe_addr = kprobe.kprobe_address();

@@ -9,10 +9,11 @@ use yaxpeax_arch::LengthedInstruction;
 use crate::{KprobeBasic, KprobeBuilder, KprobeOps};
 
 const EBREAK_INST: u8 = 0xcc; // x86_64: 0xcc
+const MAX_INSTRUCTION_SIZE: usize = 15; // x86_64 max instruction length
 
 pub struct Kprobe {
     basic: KprobeBasic,
-    old_instruction: [u8; 15],
+    old_instruction: [u8; MAX_INSTRUCTION_SIZE],
     old_instruction_len: usize,
 }
 
@@ -53,22 +54,18 @@ impl KprobeBuilder {
 impl KprobeOps for Kprobe {
     fn install(mut self) -> Kprobe {
         let address = self.symbol_addr + self.offset;
-        let max_instruction_size = 15; // x86_64 max instruction length
-        let mut inst_tmp = [0u8; 15];
+        let mut inst_tmp = [0u8; MAX_INSTRUCTION_SIZE];
         unsafe {
             core::ptr::copy(
                 address as *const u8,
                 inst_tmp.as_mut_ptr(),
-                max_instruction_size,
+                MAX_INSTRUCTION_SIZE,
             );
         }
-
         let decoder = yaxpeax_x86::amd64::InstDecoder::default();
-
         let inst = decoder.decode_slice(&inst_tmp).unwrap();
         let len = inst.len().to_const();
         log::trace!("inst: {:?}, len: {:?}", inst.to_string(), len);
-
         self.old_instruction = inst_tmp;
         self.old_instruction_len = len as usize;
         unsafe {

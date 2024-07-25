@@ -564,6 +564,7 @@ pub unsafe fn set_system_trap_gate(irq: u32, ist: u8, vaddr: VirtAddr) {
     set_gate(idt_entry, 0xEF, ist, vaddr);
 }
 
+#[allow(static_mut_refs)]
 unsafe fn get_idt_entry(irq: u32) -> &'static mut [u64] {
     assert!(irq < 256);
     let mut idt_vaddr =

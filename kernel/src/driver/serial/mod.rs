@@ -9,6 +9,7 @@ use self::serial8250::serial8250_manager;
 
 pub mod serial8250;
 
+#[allow(dead_code)]
 pub trait UartDriver: Debug + Send + Sync {
     fn device_number(&self) -> DeviceNumber;
 
@@ -21,6 +22,7 @@ pub trait UartDriver: Debug + Send + Sync {
 /// 串口端口应当实现的trait
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/serial_core.h#428
+#[allow(dead_code)]
 pub trait UartPort {
     fn iobase(&self) -> Option<usize> {
         None

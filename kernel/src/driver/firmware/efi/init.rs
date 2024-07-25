@@ -168,9 +168,8 @@ fn uefi_init(system_table: PhysAddr) -> Result<(), SystemError> {
     let st_ptr = st_vaddr.data() as *const uefi_raw::table::system::SystemTable;
     efi_manager()
         .check_system_table_header(unsafe { &st_ptr.as_ref().unwrap().header }, 2)
-        .map_err(|e| {
+        .inspect_err(|_| {
             err_unmap_systable(st_vaddr);
-            e
         })?;
 
     let st_ref = unsafe { st_ptr.as_ref().unwrap() };

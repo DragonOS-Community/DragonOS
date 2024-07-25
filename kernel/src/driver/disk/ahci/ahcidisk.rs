@@ -195,9 +195,8 @@ impl AhciDisk {
                 return Err(SystemError::EIO);
             }
         }
-
-        if kbuf.is_some() {
-            buf.copy_from_slice(kbuf.as_ref().unwrap());
+        if let Some(kbuf) = &kbuf {
+            buf.copy_from_slice(kbuf);
         }
 
         compiler_fence(Ordering::SeqCst);

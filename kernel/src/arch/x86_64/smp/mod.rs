@@ -259,6 +259,7 @@ impl X86_64SMPArch {
 }
 
 impl SmpCpuManager {
+    #[allow(static_mut_refs)]
     pub fn arch_init(_boot_cpu: ProcessorId) {
         assert!(smp_get_processor_id().data() == 0);
         // 写入APU_START_CR3，这个值会在AP处理器启动时设置到CR3寄存器

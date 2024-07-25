@@ -19,6 +19,7 @@ use super::{
 ///
 /// The main purpose of this function is to poll all network interfaces.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct NetWorkPollFunc;
 
 impl TimerFunction for NetWorkPollFunc {
@@ -43,7 +44,9 @@ pub fn net_init() -> Result<(), SystemError> {
 fn dhcp_query() -> Result<(), SystemError> {
     let binding = NET_DEVICES.write_irqsave();
 
-    let net_face = binding.get(&0).ok_or(SystemError::ENODEV)?.clone();
+    //由于现在os未实现在用户态为网卡动态分配内存，而lo网卡的id最先分配且ip固定不能被分配
+    //所以特判取用id为1的网卡（也就是virto_net）
+    let net_face = binding.get(&1).ok_or(SystemError::ENODEV)?.clone();
 
     drop(binding);
 
@@ -189,25 +192,25 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
     for (handle, socket_type) in sockets.iter() {
         let handle_guard = HANDLE_MAP.read_irqsave();
         let global_handle = GlobalSocketHandle::new_smoltcp_handle(handle);
-        let item = handle_guard.get(&global_handle);
+        let item: Option<&super::socket::SocketHandleItem> = handle_guard.get(&global_handle);
         if item.is_none() {
             continue;
         }
 
         let handle_item = item.unwrap();
+        let posix_item = handle_item.posix_item();
+        if posix_item.is_none() {
+            continue;
+        }
+        let posix_item = posix_item.unwrap();
 
         // 获取socket上的事件
-        let mut events =
-            SocketPollMethod::poll(socket_type, handle_item.shutdown_type()).bits() as u64;
+        let mut events = SocketPollMethod::poll(socket_type, handle_item).bits() as u64;
 
         // 分发到相应类型socket处理
         match socket_type {
             smoltcp::socket::Socket::Raw(_) | smoltcp::socket::Socket::Udp(_) => {
-                handle_guard
-                    .get(&global_handle)
-                    .unwrap()
-                    .wait_queue
-                    .wakeup_any(events);
+                posix_item.wakeup_any(events);
             }
             smoltcp::socket::Socket::Icmp(_) => unimplemented!("Icmp socket hasn't unimplemented"),
             smoltcp::socket::Socket::Tcp(inner_socket) => {
@@ -220,17 +223,14 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
                 if inner_socket.state() == smoltcp::socket::tcp::State::CloseWait {
                     events |= EPollEventType::EPOLLHUP.bits() as u64;
                 }
-                handle_guard
-                    .get(&global_handle)
-                    .unwrap()
-                    .wait_queue
-                    .wakeup_any(events);
+
+                posix_item.wakeup_any(events);
             }
             smoltcp::socket::Socket::Dhcpv4(_) => {}
             smoltcp::socket::Socket::Dns(_) => unimplemented!("Dns socket hasn't unimplemented"),
         }
         EventPoll::wakeup_epoll(
-            &handle_item.epitems,
+            &posix_item.epitems,
             EPollEventType::from_bits_truncate(events as u32),
         )?;
         drop(handle_guard);

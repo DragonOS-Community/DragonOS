@@ -144,7 +144,10 @@ impl FairSchedEntity {
 
     #[allow(clippy::mut_from_ref)]
     pub fn force_mut(&self) -> &mut Self {
-        unsafe { &mut *(self as *const Self as usize as *mut Self) }
+        unsafe {
+            let p = self as *const Self as usize;
+            (p as *mut Self).as_mut().unwrap()
+        }
     }
 
     /// 判断是否是进程持有的调度实体
@@ -416,7 +419,11 @@ impl CfsRunQueue {
     #[inline]
     #[allow(clippy::mut_from_ref)]
     pub fn force_mut(&self) -> &mut Self {
-        unsafe { &mut *(self as *const Self as usize as *mut Self) }
+        unsafe {
+            (self as *const Self as usize as *mut Self)
+                .as_mut()
+                .unwrap()
+        }
     }
 
     #[inline]

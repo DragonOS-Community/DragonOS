@@ -136,9 +136,8 @@ impl SysFS {
         if let Some(name) = group.name() {
             parent_inode = inode
                 .find(name)
-                .map_err(|e| {
+                .inspect_err(|_e| {
                     warn!("sysfs group '{name}' not found for kobject {kobj:?}");
-                    e
                 })?
                 .downcast_arc()
                 .unwrap();

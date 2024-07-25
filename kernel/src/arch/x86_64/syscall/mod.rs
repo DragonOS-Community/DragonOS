@@ -126,11 +126,11 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
                 show &= false;
             },
         }
+        if show {
+            debug!("[Pid: {:?}] [SYSCall: {:?}]", pid, to_print);
+        }
     }
 
-    if show {
-        debug!("[Pid: {:?}] [SYSCall: {:?}]", pid, syscall_num);
-    }
 
     // Arch specific syscall
     match syscall_num {

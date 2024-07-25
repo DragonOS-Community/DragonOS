@@ -445,7 +445,7 @@ pub fn alloc_uevent_skb<'a>(
     env: &'a KobjUeventEnv,
     action_string: &'a str,
     devpath: &'a str,
-) -> Arc<RwLock<SkBuff<'a>>> {
+) -> Arc<RwLock<SkBuff>> {
     let skb = Arc::new(RwLock::new(SkBuff::new()));
     skb
 }

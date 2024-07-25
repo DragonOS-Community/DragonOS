@@ -4,15 +4,20 @@ use core::cell::RefCell;
 use alloc::{rc::Rc, sync::Arc};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata};
 
+use crate::libs::rwlock::RwLock;
+
 use super::af_netlink::{NetlinkSock, NetlinkSocket};
+// 在 smoltcp::PacketBuffer 的基础上封装了一层，用于处理 netlink 协议中网络数据包(skb)的相关操作
+#[derive(Debug)]
 pub struct SkBuff<'a> {
-    inner: PacketBuffer<'a>,
+    inner: Arc<PacketBuffer<'a>>,
 }
 
 impl<'a> SkBuff<'a> {
     pub fn new() -> Self {
         Self {
-            inner: PacketBuffer::new(vec![PacketMetadata::EMPTY; 666], vec![0; 666]),
+            // TODO: 666 is a magic number, should be replaced by a constant
+            inner: Arc::new(PacketBuffer::new(vec![PacketMetadata::EMPTY; 666], vec![0; 666])),
         }
     }
     pub fn inner(&self) -> &PacketBuffer<'a> {
@@ -22,12 +27,18 @@ impl<'a> SkBuff<'a> {
         &mut self.inner
     }
     pub fn clone_with_new_inner(&self) -> Self {
+        // TODO: 666 is a magic number, should be replaced by a constant
         Self {
-            inner: PacketBuffer::new(vec![PacketMetadata::EMPTY; 666], vec![0; 666]),
+            inner: Arc::new(PacketBuffer::new(vec![PacketMetadata::EMPTY; 666], vec![0; 666])),
         }
     }
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+    pub fn clone(&self) -> Self {
+        SkBuff {
+            inner: Arc::clone(&self.inner),
+        }
     }
 }
 
@@ -37,7 +48,7 @@ pub fn netlink_overrun(sk: &Arc<dyn NetlinkSocket>) {
 }
 
 // 用于检查网络数据包(skb)是否被共享
-pub fn skb_shared(skb: &Rc<RefCell<SkBuff>>) -> bool {
+pub fn skb_shared(skb: &RwLock<SkBuff>) -> bool {
     // Implementation of the function
     false
 }
@@ -45,7 +56,7 @@ pub fn skb_shared(skb: &Rc<RefCell<SkBuff>>) -> bool {
 // 处理被孤儿化的网络数据包(skb)。
 // 孤儿化网络数据包意味着数据包不再与任何套接字关联，
 // 通常是因为发送数据包时指定了MSG_DONTWAIT标志，这告诉内核不要等待必要的资源（如内存），而是尽可能快地发送数据包。
-pub fn skb_orphan(skb: &Rc<RefCell<SkBuff>>) {
+pub fn skb_orphan(skb: &RwLock<SkBuff>) {
     // Implementation of the function
 }
 

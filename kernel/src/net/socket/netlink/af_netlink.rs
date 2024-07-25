@@ -5,6 +5,7 @@ use core::mem::size_of;
 use core::ops::DerefMut;
 use core::{any::Any, cell::RefCell, fmt::Debug, hash::Hash, ops::Deref};
 
+use alloc::borrow::ToOwned;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -49,7 +50,7 @@ bitflags! {
         const NETLINK_F_KERNEL_SOCKET = 0x100;
     }
 }
-
+const NETLINK_S_CONGESTED: u64 = 0x0;
 pub struct SockaddrNl {
     // pub nl_family: SA_FAMILY_T,
     pub nl_pad: u16,
@@ -58,16 +59,16 @@ pub struct SockaddrNl {
 }
 #[derive(Clone)]
 #[derive(Debug)]
-pub struct HListHead {
-    first: Option<Arc<HListNode>>,
+pub struct HListHead<'a> {
+    first: Option<Arc<HListNode<'a>>>,
 }
 #[derive(Debug)]
-pub struct HListNode {
-    data: Arc<dyn NetlinkSocket>,
-    next: Option<Arc<HListNode>>,
+pub struct HListNode<'a> {
+    data: Arc<dyn NetlinkSocket<'a>>,
+    next: Option<Arc<HListNode<'a>>>,
 }
-impl HListHead {
-    fn iter(&self) -> HListHeadIter {
+impl<'a> HListHead<'a> {
+    fn iter(&'a self) -> HListHeadIter {
         HListHeadIter {
             current: self.first.as_ref(),
         }
@@ -75,11 +76,11 @@ impl HListHead {
 }
 
 struct HListHeadIter<'a> {
-    current: Option<&'a Arc<HListNode>>,
+    current: Option<&'a Arc<HListNode<'a>>>,
 }
 
 impl<'a> Iterator for HListHeadIter<'a> {
-    type Item = &'a Arc<dyn NetlinkSocket>;
+    type Item = &'a Arc<dyn NetlinkSocket<'a>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.current {
@@ -92,16 +93,16 @@ impl<'a> Iterator for HListHeadIter<'a> {
     }
 }
 #[derive(Clone)]
-pub struct NetlinkTable {
-    hash: HashMap<u32, Arc<dyn NetlinkSocket>>,
+pub struct NetlinkTable<'a> {
+    hash: HashMap<u32, Arc<dyn NetlinkSocket<'a>>>,
     listeners: Option<listeners>,
     registered: u32,
     flags: u32,
     groups: i32,
-    mc_list: HListHead,
+    mc_list: HListHead<'a>,
 }
-impl NetlinkTable {
-    fn new() -> NetlinkTable {
+impl<'a> NetlinkTable<'a> {
+    fn new() -> NetlinkTable<'a> {
         NetlinkTable {
             hash: HashMap::new(),
             listeners: Some(listeners { masks: Vec::new() }),
@@ -140,10 +141,10 @@ impl NetlinkTable {
     // }
 }
 
-pub struct LockedNetlinkTable(RwLock<NetlinkTable>);
+pub struct LockedNetlinkTable<'a>(RwLock<NetlinkTable<'a>>);
 
-impl LockedNetlinkTable {
-    pub fn new(netlinktable: NetlinkTable) -> LockedNetlinkTable {
+impl<'a> LockedNetlinkTable<'a> {
+    pub fn new(netlinktable: NetlinkTable<'a>) -> LockedNetlinkTable<'a> {
         LockedNetlinkTable(RwLock::new(netlinktable))
     }
 }
@@ -267,12 +268,12 @@ pub fn netlink_add_usersock_entry(nl_table: &mut RwLockWriteGuard<Vec<NetlinkTab
 }
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#572
 /// 内核套接字插入 nl_table
-fn netlink_insert(sk: &Arc<dyn NetlinkSocket>, portid: u32) -> Result<(), SystemError> {
+fn netlink_insert(sk: Arc<dyn NetlinkSocket<'static>>, portid: u32) -> Result<(), SystemError> {
     let mut nl_table = NL_TABLE.write();
-    let index = sk.sk_protocol();
+    let index = Arc::clone(&sk).sk_protocol();
    
 
-    let nlk: Arc<LockedNetlinkSock> = Arc::clone(sk).arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
+    let nlk: Arc<LockedNetlinkSock> = Arc::clone(&sk).arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
 
     {
         let nlk_guard = nlk.0.read();
@@ -294,7 +295,7 @@ fn netlink_insert(sk: &Arc<dyn NetlinkSocket>, portid: u32) -> Result<(), System
         // 设置套接字已绑定
         nlk_guard.bound = true;
         // 将套接字插入哈希表
-        nl_table[index].hash.insert(portid, Arc::clone(sk));
+        nl_table[index].hash.insert(portid, Arc::clone(&sk));
     }
     
     Ok(())
@@ -303,7 +304,7 @@ fn netlink_insert(sk: &Arc<dyn NetlinkSocket>, portid: u32) -> Result<(), System
 // TODO: net namespace支持
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#532
 /// 在 netlink_table 中查找 netlink 套接字
-fn netlink_lookup(protocol:i32, portid:u32)-> Arc<dyn NetlinkSocket>{
+fn netlink_lookup<'a>(protocol:i32, portid:u32)-> Arc<dyn NetlinkSocket<'static>>{
     let nl_table = NL_TABLE.read();
     let index = protocol as usize;
     let sk = nl_table[index].hash.get(&portid).unwrap();
@@ -318,11 +319,15 @@ pub enum Error {
 }
 
 // netlink机制特定的内核抽象，不同于标准的trait Socket
-pub trait NetlinkSocket: Any + Send + Sync + Debug + CastFromSync {
+pub trait NetlinkSocket<'a>: Any + Send + Sync + Debug + CastFromSync {
     // fn sk_prot(&self) -> &dyn proto;
     fn sk_family(&self) -> i32;
     fn sk_state(&self) -> i32;
     fn sk_protocol(&self) -> usize;
+    fn sk_rmem_alloc(&self) -> usize;
+    fn sk_rcvbuf(&self) -> usize;
+    fn enqueue_skb(&mut self, skb: Arc<RwLock<SkBuff>>);
+    fn sk_data_ready(&self);
     fn is_kernel(&self) -> bool;
     fn equals(&self, other: &dyn NetlinkSocket) -> bool;
     fn portid(&self) -> u32;
@@ -335,17 +340,17 @@ pub trait NetlinkSocket: Any + Send + Sync + Debug + CastFromSync {
 // linux 6.1.9中的netlink_sock结构体里，sock是一个很大的结构体，这里简化
 // 意义是netlink_sock（NetlinkSock）是一个sock（NetlinkSocket）
 
-pub struct LockedNetlinkSock(RwLock<NetlinkSock>);
-impl LockedNetlinkSock {
+pub struct LockedNetlinkSock<'a>(RwLock<NetlinkSock<'a>>);
+impl<'a> LockedNetlinkSock<'a> {
     pub fn new(netlinksock: NetlinkSock) -> LockedNetlinkSock {
         LockedNetlinkSock(RwLock::new(netlinksock))
     }
 }
 #[derive(Debug)]
-pub struct NetlinkSock {
-    sk: Box<dyn NetlinkSocket>,
+pub struct NetlinkSock<'a> {
+    sk: Box<dyn NetlinkSocket<'a>>,
     portid: u32,
-    node: Arc<HListHead>,
+    node: Arc<HListHead<'a>>,
     dst_portid: u32,
     dst_group: u32,
     flags: u32,
@@ -357,9 +362,10 @@ pub struct NetlinkSock {
     max_recvmsg_len: usize,
     dump_done_errno: i32,
     cb_running: bool,
+    queue: Vec<Arc<RwLock<SkBuff<'a>>>>,
 }
-
-impl NetlinkSocket for NetlinkSock {
+// TODO: 实现NetlinkSocket trait
+impl<'a> NetlinkSocket<'a> for NetlinkSock<'a> {
     fn sk_family(&self) -> i32 {
         0
     }
@@ -368,6 +374,19 @@ impl NetlinkSocket for NetlinkSock {
     }
     fn sk_protocol(&self) -> usize {
         0
+    }
+    fn sk_rmem_alloc(&self) -> usize {
+        0
+    }
+    fn sk_rcvbuf(&self) -> usize {
+        0
+    }
+    fn enqueue_skb(&mut self, skb: Arc<RwLock<SkBuff>>) {
+        self.queue.push(skb);
+    }
+    fn sk_data_ready(&self) {
+        // Implementation of the function
+        
     }
     fn is_kernel(&self) -> bool {
         true
@@ -390,7 +409,7 @@ impl NetlinkSocket for NetlinkSock {
         0
     }
 }
-impl PartialEq for NetlinkSock {
+impl<'a> PartialEq for NetlinkSock<'a> {
     fn eq(&self, other: &Self) -> bool {
         // compare the fields of self and other
         // use the equals method to compare the NetlinkSocket objects
@@ -398,7 +417,10 @@ impl PartialEq for NetlinkSock {
     }
 }
 
-impl NetlinkSock {
+impl<'a> NetlinkSock<'a> {
+    pub fn get_sk(&self) -> &'a dyn NetlinkSocket {
+        &*self.sk
+    }
     fn send(&self, msg: &[u8]) -> Result<(), SystemError> {
         // Implementation of the function
         Ok(())
@@ -551,21 +573,22 @@ impl listeners {
 }
 
 lazy_static! {
-    /// 一个维护全局的NetlinkTable的哈希链，每一个元素代表一个netlink协议类型，最大数量为MAX_LINKS
-    static ref NL_TABLE: RwLock<Vec<NetlinkTable>> = RwLock::new(vec![NetlinkTable::new(); MAX_LINKS]);
+    /// 一个维护全局的 NetlinkTable 哈希链的向量，每一个元素代表一个 netlink 协议类型，最大数量为MAX_LINKS
+    static ref NL_TABLE: RwLock<Vec<NetlinkTable<'static>>> = RwLock::new(vec![NetlinkTable::new(); MAX_LINKS]);
 }
-pub fn netlink_has_listeners(sk: &NetlinkSock, group: i32) -> i32 {
+pub fn netlink_has_listeners(sk: &dyn NetlinkSocket, group: i32) -> i32 {
     let mut res = 0;
+    let protocol = sk.sk_protocol();
     let nl_table = NL_TABLE.read();
-    if let Some(listeners) = &nl_table[sk.sk_protocol()].listeners {
-        if group - 1 < nl_table[sk.sk_protocol()].groups {
+    if let Some(listeners) = &nl_table[protocol].listeners {
+        if group - 1 < nl_table[protocol].groups {
             res = listeners.masks[group as usize - 1] as i32;
         }
     }
     res
 }
 struct NetlinkBroadcastData<'a> {
-    exclude_sk: &'a dyn NetlinkSocket,
+    exclude_sk: &'a dyn NetlinkSocket<'a>,
     // net: &'a Net,
     portid: u32,
     group: u64,
@@ -574,13 +597,13 @@ struct NetlinkBroadcastData<'a> {
     congested: i32,
     delivered: i32,
     allocation: u32,
-    skb: Rc<RefCell<SkBuff<'a>>>,
-    skb_2: Rc<RefCell<SkBuff<'a>>>,
+    skb: Arc<RwLock<SkBuff<'a>>>,
+    skb_2: Arc<RwLock<SkBuff<'a>>>,
 }
 impl<'a> NetlinkBroadcastData<'a> {
     pub fn copy_skb_to_skb_2(&mut self) {
-        let skb = self.skb.borrow().clone_with_new_inner();
-        *self.skb_2.borrow_mut() = skb;
+        let skb = self.skb.read().clone_with_new_inner();
+        *self.skb_2.write() = skb;
     }
 }
 /// 弃用
@@ -594,10 +617,10 @@ fn sk_for_each_bound(sk: &NetlinkSock, mc_list: &HListHead) {
         node = n.next.as_ref();
     }
 }
-fn do_one_broadcast(sk: &Arc<dyn NetlinkSocket>, info: &mut Box<NetlinkBroadcastData>)->Result<(), SystemError> {
+fn do_one_broadcast(sk: Arc<dyn NetlinkSocket>, info: &mut Box<NetlinkBroadcastData>)->Result<(), SystemError> {
     // 从Arc<dyn NetlinkSocket>中获取NetlinkSock
-    let nlk: Arc<NetlinkSock> = Arc::clone(sk).arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
-    if info.exclude_sk.equals(&**sk) {
+    let nlk: Arc<NetlinkSock> = Arc::clone(&sk).arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
+    if info.exclude_sk.equals(&*sk) {
         return Err(SystemError::EINVAL);
     }
     if nlk.portid() == info.portid
@@ -619,24 +642,24 @@ fn do_one_broadcast(sk: &Arc<dyn NetlinkSocket>, info: &mut Box<NetlinkBroadcast
     //     }
     // }
     if info.failure != 0 {
-        netlink_overrun(sk);
+        netlink_overrun(&sk);
         return Err(SystemError::EINVAL);
     }
-    if info.skb_2.borrow().is_empty() {
+    if info.skb_2.read().is_empty() {
         if skb_shared(&info.skb) {
             info.copy_skb_to_skb_2();
         } else {
-            info.skb_2 = info.skb.clone();
+            info.skb_2 = Arc::new(RwLock::new(info.skb.read().clone()));
             skb_orphan(&info.skb_2);
         }
-        netlink_overrun(sk);
+        netlink_overrun(&sk);
         info.failure = 1;
         if !sk.flags().is_zero() & !NetlinkFlags::BROADCAST_SEND_ERROR.bits().is_zero() {
             info.delivery_failure = 1;
         }
         return Err(SystemError::EINVAL);
     }
-    if sk_filter(sk, &info.skb_2) {
+    if sk_filter(&sk, info.skb_2) {
         return Err(SystemError::EINVAL);
     }
     // TODO: 需要net namespace支持
@@ -645,23 +668,23 @@ fn do_one_broadcast(sk: &Arc<dyn NetlinkSocket>, info: &mut Box<NetlinkBroadcast
     // if NETLINK_CB(info.skb_2).nsid != NETNSA_NSID_NOT_ASSIGNED {
     //     NETLINK_CB(info.skb_2).nsid_is_set = true;
     // }
-    let ret: i32 = netlink_broadcast_deliver(sk, &mut info.skb_2);
+    let ret = netlink_broadcast_deliver(Arc::clone(&sk), info.skb_2);
     if ret < 0 {
-        netlink_overrun(sk);
+        netlink_overrun(&sk);
         if !sk.flags().is_zero() & !NetlinkFlags::BROADCAST_SEND_ERROR.bits().is_zero() {
             info.delivery_failure = 1;
         }
     } else {
         info.congested |= ret;
         info.delivered = 1;
-        info.skb_2 = info.skb.clone();
+        info.skb_2 = Arc::new(RwLock::new(info.skb.read().clone()));
     }
-    sock_put(sk);
+    sock_put(&sk);
     Ok(())
 }
 pub fn netlink_broadcast<'a>(
-    ssk: &'a NetlinkSock,
-    skb: Rc<RefCell<SkBuff<'a>>>,
+    ssk: &'a dyn NetlinkSocket,
+    skb: Arc<RwLock<SkBuff<'a>>>,
     portid: u32,
     group: u64,
     allocation: u32,
@@ -679,14 +702,14 @@ pub fn netlink_broadcast<'a>(
         delivered: 0,
         allocation,
         skb,
-        skb_2: Rc::new(RefCell::new(SkBuff::new())),
+        skb_2: Arc::new(RwLock::new(SkBuff::new())),
     });
 
     // While we sleep in clone, do not allow to change socket list
     let nl_table = NL_TABLE.read();
     // 下面这行替代了sk_for_each_bound(ssk, &nl_table[ssk.sk_protocol()].mc_list);
     for sk in &mut nl_table[ssk.sk_protocol()].mc_list.iter() {
-        let _ = do_one_broadcast(sk, &mut info);
+        let _ = do_one_broadcast(Arc::clone(sk), &mut info);
     }
 
     consume_skb(info.skb);
@@ -705,14 +728,49 @@ pub fn netlink_broadcast<'a>(
     return Err(SystemError::ESRCH);
 }
 
-// 对网络套接字(sk)和网络数据包(skb)进行过滤。
-fn sk_filter(sk: &Arc<dyn NetlinkSocket>, skb: &Rc<RefCell<SkBuff>>) -> bool {
+/// 对网络套接字(sk)和网络数据包(skb)进行过滤。
+fn sk_filter(sk: &Arc<dyn NetlinkSocket>, skb: Arc<RwLock<SkBuff>>) -> bool {
     // Implementation of the function
     false
 }
 
-// 处理Netlink套接字的广播消息传递
-fn netlink_broadcast_deliver(sk: &Arc<dyn NetlinkSocket>, skb: &mut Rc<RefCell<SkBuff>>) -> i32 {
-    // Implementation of the function
-    0
+// https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c?fi=netlink_has_listeners#1400
+/// 处理Netlink套接字的广播消息传递
+fn netlink_broadcast_deliver<'a>(sk: Arc<dyn NetlinkSocket>, skb: Arc<RwLock<SkBuff<'a>>>) -> i32 {
+    let nlk: Arc<LockedNetlinkSock> = Arc::clone(&sk).arc_any().downcast().expect("Invalid downcast to LockedNetlinkSock");
+    let nlk_guard = nlk.0.read();
+    // 如果接收缓冲区的已分配内存小于或等于其总大小，并且套接字没有被标记为拥塞，则继续执行内部的代码块。
+    if (sk.sk_rmem_alloc()<= sk.sk_rcvbuf()) && !(nlk_guard.state == NETLINK_S_CONGESTED) {
+        netlink_skb_set_owner_r(skb, sk);
+        __netlink_sendskb(sk, skb);
+        if &sk.sk_rmem_alloc() > &((sk.sk_rcvbuf() >> 1)){
+            return 1;
+        }else{
+            return 0;
+        }
+    }
+    -1
+}
+// https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c?fi=netlink_has_listeners#387
+/*
+static void netlink_skb_set_owner_r(struct sk_buff *skb, struct sock *sk)
+{
+	WARN_ON(skb->sk != NULL);
+	skb->sk = sk;
+	skb->destructor = netlink_skb_destructor;
+	atomic_add(skb->truesize, &sk->sk_rmem_alloc);
+	sk_mem_charge(sk, skb->truesize);
+}
+*/
+fn netlink_skb_set_owner_r(skb: Arc<RwLock<SkBuff>>, sk: Arc<dyn NetlinkSocket>) {
+    // WARN_ON(skb->sk != NULL);
+    // skb->sk = sk;
+    // skb->destructor = netlink_skb_destructor;
+    // atomic_add(skb->truesize, &sk->sk_rmem_alloc);
+    // sk_mem_charge(sk, skb->truesize);
+}
+// https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c?fi=netlink_has_listeners#1268
+fn __netlink_sendskb(mut sk: Arc<dyn NetlinkSocket>, skb: Arc<RwLock<SkBuff<'a>>>) {
+    sk.enqueue_skb(skb);
+    sk.sk_data_ready();
 }

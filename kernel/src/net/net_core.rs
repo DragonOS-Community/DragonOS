@@ -5,6 +5,7 @@ use log::{debug, info, warn};
 use smoltcp::{socket::dhcpv4, wire};
 use system_error::SystemError;
 
+use crate::libs::rwlock::RwLock;
 use crate::{
     driver::net::NetDevice,
     libs::rwlock::RwLockReadGuard,
@@ -253,7 +254,7 @@ fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
 // proto_unregister
 
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/core/skbuff.c#1027
-pub fn consume_skb(skb: Rc<RefCell<SkBuff>>) {
+pub fn consume_skb(skb: Arc<RwLock<SkBuff>>) {
     // 释放skb
     drop(skb);
 }

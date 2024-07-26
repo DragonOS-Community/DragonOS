@@ -8,7 +8,7 @@ use core::{any::Any, cell::RefCell, fmt::Debug, hash::Hash, ops::Deref};
 use alloc::borrow::ToOwned;
 use alloc::rc::Rc;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 
 use hashbrown::HashMap;
 use intertrait::CastFromSync;
@@ -65,7 +65,7 @@ pub struct HListHead {
 }
 #[derive(Debug)]
 pub struct HListNode {
-    data: Arc<RwLock<Box<dyn NetlinkSocket>>>,
+    data: Arc<dyn NetlinkSocket>,
     next: Option<Arc<HListNode>>,
 }
 impl HListHead {
@@ -81,7 +81,7 @@ struct HListHeadIter<'a> {
 }
 
 impl<'a> Iterator for HListHeadIter<'a> {
-    type Item = &'a Arc<RwLock<Box<dyn NetlinkSocket>>>;
+    type Item = &'a Arc<dyn NetlinkSocket>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.current {
@@ -330,7 +330,7 @@ pub trait NetlinkSocket: Any + Send + Sync + Debug + CastFromSync {
     fn enqueue_skb(&mut self, skb: Arc<RwLock<SkBuff>>);
     fn sk_data_ready(&self);
     fn is_kernel(&self) -> bool;
-    fn equals(&self, other: &Arc<RwLock<Box<dyn NetlinkSocket>>>) -> bool;
+    fn equals(&self, other: Option<Arc<dyn NetlinkSocket>>) -> bool;
     fn clone_box(&self) -> Box<dyn NetlinkSocket>;
     fn portid(&self) -> u32;
     fn ngroups(&self) -> u64;
@@ -354,7 +354,7 @@ impl LockedNetlinkSock {
 }
 #[derive(Debug)]
 pub struct NetlinkSock {
-    sk: Box<dyn NetlinkSocket>,
+    sk: Option<Weak<dyn NetlinkSocket>>,
     portid: u32,
     node: Arc<HListHead>,
     dst_portid: u32,
@@ -397,10 +397,12 @@ impl NetlinkSocket for NetlinkSock {
     fn is_kernel(&self) -> bool {
         true
     }
-    fn equals(&self, other: &Arc<RwLock<Box<dyn NetlinkSocket>>>) -> bool {
-        // compare the fields of self and other
-        // use the equals method to compare the NetlinkSocket objects
-        self.sk.equals(other)
+    fn equals(&self, other: Option<Arc<dyn NetlinkSocket>>) -> bool {
+        if let Some(self_sk) = self.sk.as_ref().unwrap().upgrade() {
+            self_sk.equals(other)
+        } else {
+            false
+        }
     }
     fn clone_box(&self) -> Box<dyn NetlinkSocket> {
         Box::new(NetlinkSock {
@@ -436,15 +438,51 @@ impl NetlinkSocket for NetlinkSock {
 }
 impl PartialEq for NetlinkSock {
     fn eq(&self, other: &Self) -> bool {
-        // compare the fields of self and other
-        // use the equals method to compare the NetlinkSocket objects
-        self.sk.equals(&Arc::new(RwLock::new(other.sk.clone())))
+        if let Some(self_sk) = self.sk.as_ref().unwrap().upgrade() {
+           if let Some(other_sk) = other.sk.as_ref() {
+               self_sk.equals(other_sk.upgrade())
+           } else {
+               false
+           }
+        } else {
+            false
+        }
     }
 }
+// impl Deref for NetlinkSock {
+//     type Target = Arc<dyn NetlinkSocket>;
 
+//     fn deref(&self) -> &Self::Target {
+//         self.sk.as_ref().unwrap().upgrade().unwrap().deref()
+//     }
+// }
+// impl DerefMut for NetlinkSock {
+//     fn deref_mut(&mut self) -> &mut Self::Target {
+//         self.sk.as_ref().unwrap().upgrade()
+//     }
+// }
 impl NetlinkSock {
-    pub fn get_sk(&self) -> &dyn NetlinkSocket {
-        &*self.sk
+    pub fn new() -> NetlinkSock {
+        NetlinkSock {
+            sk: None,
+            portid: 0,
+            node: Arc::new(HListHead { first: None }),
+            dst_portid: 0,
+            dst_group: 0,
+            flags: 0,
+            subscriptions: 0,
+            ngroups: 0,
+            groups: Vec::new(),
+            bound: false,
+            state: 0,
+            max_recvmsg_len: 0,
+            dump_done_errno: 0,
+            cb_running: false,
+            queue: Vec::new(),
+        }
+    }
+    pub fn get_sk(&self) -> &Weak<dyn NetlinkSocket> {
+        self.sk.as_ref().unwrap()
     }
     fn send(&self, msg: &[u8]) -> Result<(), SystemError> {
         // Implementation of the function
@@ -601,7 +639,7 @@ lazy_static! {
     /// 一个维护全局的 NetlinkTable 哈希链的向量，每一个元素代表一个 netlink 协议类型，最大数量为MAX_LINKS
     static ref NL_TABLE: RwLock<Vec<NetlinkTable>> = RwLock::new(vec![NetlinkTable::new(); MAX_LINKS]);
 }
-pub fn netlink_has_listeners(sk: &dyn NetlinkSocket, group: i32) -> i32 {
+pub fn netlink_has_listeners(sk: &Arc<dyn NetlinkSocket>, group: i32) -> i32 {
     let mut res = 0;
     let protocol = sk.sk_protocol();
     let nl_table = NL_TABLE.read();
@@ -613,7 +651,7 @@ pub fn netlink_has_listeners(sk: &dyn NetlinkSocket, group: i32) -> i32 {
     res
 }
 struct NetlinkBroadcastData<'a> {
-    exclude_sk: &'a dyn NetlinkSocket,
+    exclude_sk: &'a Arc<dyn NetlinkSocket>,
     // net: &'a Net,
     portid: u32,
     group: u64,
@@ -636,16 +674,16 @@ fn sk_for_each_bound(sk: &NetlinkSock, mc_list: &HListHead) {
     let mut node = mc_list.first.as_ref();
     while let Some(n) = node {
         let data = &n.data;
-        if data.read().sk_protocol() == sk.sk_protocol() {
+        if data.sk_protocol() == sk.sk_protocol() {
             // Implementation of the function
         }
         node = n.next.as_ref();
     }
 }
-fn do_one_broadcast(sk: Arc<RwLock<Box<dyn NetlinkSocket>>>, info: &mut Box<NetlinkBroadcastData>)->Result<(), SystemError> {
+fn do_one_broadcast(sk: Arc<dyn NetlinkSocket>, info: &mut Box<NetlinkBroadcastData>)->Result<(), SystemError> {
     // 从Arc<dyn NetlinkSocket>中获取NetlinkSock
     let nlk: Arc<NetlinkSock> = Arc::clone(&sk).arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
-    if info.exclude_sk.equals(&sk) {
+    if info.exclude_sk.equals(Some(sk.clone())) {
         return Err(SystemError::EINVAL);
     }
     if nlk.portid() == info.portid
@@ -679,7 +717,7 @@ fn do_one_broadcast(sk: Arc<RwLock<Box<dyn NetlinkSocket>>>, info: &mut Box<Netl
         }
         netlink_overrun(&sk);
         info.failure = 1;
-        if !sk.read().flags().is_zero() & !NetlinkFlags::BROADCAST_SEND_ERROR.bits().is_zero() {
+        if !sk.flags().is_zero() & !NetlinkFlags::BROADCAST_SEND_ERROR.bits().is_zero() {
             info.delivery_failure = 1;
         }
         return Err(SystemError::EINVAL);
@@ -696,7 +734,7 @@ fn do_one_broadcast(sk: Arc<RwLock<Box<dyn NetlinkSocket>>>, info: &mut Box<Netl
     let ret = netlink_broadcast_deliver(Arc::clone(&sk), &info.skb_2);
     if ret < 0 {
         netlink_overrun(&sk);
-        if !sk.read().flags().is_zero() & !NetlinkFlags::BROADCAST_SEND_ERROR.bits().is_zero() {
+        if !sk.flags().is_zero() & !NetlinkFlags::BROADCAST_SEND_ERROR.bits().is_zero() {
             info.delivery_failure = 1;
         }
     } else {
@@ -708,7 +746,7 @@ fn do_one_broadcast(sk: Arc<RwLock<Box<dyn NetlinkSocket>>>, info: &mut Box<Netl
     Ok(())
 }
 pub fn netlink_broadcast<'a>(
-    ssk: &'a dyn NetlinkSocket,
+    ssk: &'a Arc<dyn NetlinkSocket>,
     skb: Arc<RwLock<SkBuff>>,
     portid: u32,
     group: u64,
@@ -754,21 +792,21 @@ pub fn netlink_broadcast<'a>(
 }
 
 /// 对网络套接字(sk)和网络数据包(skb)进行过滤。
-fn sk_filter(sk: &Arc<RwLock<Box<dyn NetlinkSocket>>>, skb: &Arc<RwLock<SkBuff>>) -> bool {
+fn sk_filter(sk: &Arc<dyn NetlinkSocket>, skb: &Arc<RwLock<SkBuff>>) -> bool {
     // Implementation of the function
     false
 }
 
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c?fi=netlink_has_listeners#1400
 /// 处理Netlink套接字的广播消息传递
-fn netlink_broadcast_deliver(sk: Arc<RwLock<Box<dyn NetlinkSocket>>>, skb: &Arc<RwLock<SkBuff>>) -> i32 {
+fn netlink_broadcast_deliver(sk: Arc<dyn NetlinkSocket>, skb: &Arc<RwLock<SkBuff>>) -> i32 {
     let nlk: Arc<LockedNetlinkSock> = Arc::clone(&sk).arc_any().downcast().expect("Invalid downcast to LockedNetlinkSock");
     let nlk_guard = nlk.0.read();
     // 如果接收缓冲区的已分配内存小于或等于其总大小，并且套接字没有被标记为拥塞，则继续执行内部的代码块。
-    if (sk.read().sk_rmem_alloc()<= sk.read().sk_rcvbuf()) && !(nlk_guard.state == NETLINK_S_CONGESTED) {
+    if (sk.sk_rmem_alloc()<= sk.sk_rcvbuf()) && !(nlk_guard.state == NETLINK_S_CONGESTED) {
         netlink_skb_set_owner_r(skb, sk.clone());
-        __netlink_sendskb(sk.clone(), skb);
-        if &sk.read().sk_rmem_alloc() > &((sk.read().sk_rcvbuf() >> 1)){
+        let _ = netlink_sendskb(sk.clone(), skb);
+        if &sk.sk_rmem_alloc() > &((sk.sk_rcvbuf() >> 1)){
             return 1;
         }else{
             return 0;
@@ -777,25 +815,30 @@ fn netlink_broadcast_deliver(sk: Arc<RwLock<Box<dyn NetlinkSocket>>>, skb: &Arc<
     -1
 }
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c?fi=netlink_has_listeners#387
-/*
-static void netlink_skb_set_owner_r(struct sk_buff *skb, struct sock *sk)
-{
-	WARN_ON(skb->sk != NULL);
-	skb->sk = sk;
-	skb->destructor = netlink_skb_destructor;
-	atomic_add(skb->truesize, &sk->sk_rmem_alloc);
-	sk_mem_charge(sk, skb->truesize);
-}
-*/
-fn netlink_skb_set_owner_r(mut skb: &Arc<RwLock<SkBuff>>, sk: Arc<RwLock<Box<dyn NetlinkSocket>>>) {
+/// 设置一个网络缓冲区skb的所有者为指定的套接字sk
+fn netlink_skb_set_owner_r(mut skb: &Arc<RwLock<SkBuff>>, sk: Arc<dyn NetlinkSocket>) {
     // WARN_ON(skb->sk != NULL);
-    // skb.sk = sk;
+    let mut skb_write = skb.write();
+    skb_write.sk = sk;
     // skb->destructor = netlink_skb_destructor;
     // atomic_add(skb->truesize, &sk->sk_rmem_alloc);
     // sk_mem_charge(sk, skb->truesize);
 }
+pub struct NetlinkSocketWrapper {
+    sk: Arc<dyn NetlinkSocket>,
+}
+impl NetlinkSocketWrapper {
+    pub fn new(sk: Arc<dyn NetlinkSocket>) -> NetlinkSocketWrapper {
+        NetlinkSocketWrapper { sk }
+    }
+}
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c?fi=netlink_has_listeners#1268
-fn __netlink_sendskb(sk: Arc<RwLock<Box<dyn NetlinkSocket>>>, skb: &Arc<RwLock<SkBuff>>) {
-    sk.write().enqueue_skb(skb.clone());
-    sk.write().sk_data_ready();
+/// 将一个网络缓冲区skb中的数据发送到指定的套接字sk
+fn netlink_sendskb(sk: Arc<dyn NetlinkSocket>, skb: &Arc<RwLock<SkBuff>>)->u32 {
+    let len = skb.read().len;
+    {
+        // sk.enqueue_skb(skb.clone());
+        sk.sk_data_ready();
+    }
+    len
 }

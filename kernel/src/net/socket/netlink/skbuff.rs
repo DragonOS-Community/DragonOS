@@ -7,11 +7,11 @@ use smoltcp::socket::udp::{PacketBuffer, PacketMetadata};
 use crate::libs::rwlock::RwLock;
 
 use super::af_netlink::{NetlinkSock, NetlinkSocket};
-// 弃用：在 smoltcp::PacketBuffer 的基础上封装了一层，用于处理 netlink 协议中网络数据包(skb)的相关操作
+// 曾用方案：在 smoltcp::PacketBuffer 的基础上封装了一层，用于处理 netlink 协议中网络数据包(skb)的相关操作
 #[derive(Debug)]
 #[derive(Clone)]
-#[derive(Copy)]
 pub struct SkBuff {
+    pub sk: Arc<dyn NetlinkSocket>,
     pub len: u32,
     pub pkt_type: u32,
     pub mark: u32,
@@ -49,6 +49,7 @@ pub struct SkBuff {
 impl SkBuff {
     pub fn new() -> Self {
         SkBuff {
+            sk: Arc::new(NetlinkSock::new()),
             len: 0,
             pkt_type: 0,
             mark: 0,
@@ -90,7 +91,7 @@ impl SkBuff {
 }
 
 // 处理网络套接字的过度运行情况
-pub fn netlink_overrun(sk: &Arc<RwLock<Box<dyn NetlinkSocket>>>) {
+pub fn netlink_overrun(sk: &Arc<dyn NetlinkSocket>) {
     // Implementation of the function
 }
 
@@ -120,6 +121,6 @@ pub fn skb_get(skb: Rc<RefCell<SkBuff>>) -> Rc<RefCell<SkBuff>> {
 }
 
 // 用于释放网络套接字(sk)的资源。
-pub fn sock_put(sk: &Arc<RwLock<Box<dyn NetlinkSocket>>>) {
+pub fn sock_put(sk: &Arc<dyn NetlinkSocket>) {
     // Implementation of the function
 }

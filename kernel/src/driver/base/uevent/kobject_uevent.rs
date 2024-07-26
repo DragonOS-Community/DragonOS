@@ -463,7 +463,7 @@ pub fn uevent_net_broadcast_untagged(
     for ue_sk in &UEVENT_SOCK_LIST {
         let uevent_sock = ue_sk.get_sk();
         // 如果没有监听者，则跳过
-        if netlink_has_listeners(uevent_sock, 1) == 0 {
+        if netlink_has_listeners(&uevent_sock.upgrade().unwrap(), 1) == 0 {
             continue;
         }
         // 如果 skb 为空，则分配一个新的 skb
@@ -474,10 +474,8 @@ pub fn uevent_net_broadcast_untagged(
                 continue;
             }
         }
-
-
         retval =
-            match netlink_broadcast(ue_sk.get_sk(), Arc::clone(&skb), 0, 1, 1) {
+            match netlink_broadcast(&ue_sk.get_sk().upgrade().unwrap(), Arc::clone(&skb), 0, 1, 1) {
                 Ok(_) => 0,
                 Err(err) => err.to_posix_errno(),
             };

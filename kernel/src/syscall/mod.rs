@@ -1121,6 +1121,16 @@ impl Syscall {
             }
             #[cfg(target_arch = "x86_64")]
             SYS_UTIMES => Self::sys_utimes(args[0] as *const u8, args[1] as *const PosixTimeval),
+            #[cfg(target_arch = "x86_64")]
+            SYS_EVENTFD => {
+                let initval = args[0] as u32;
+                Self::sys_eventfd(initval, 0)
+            }
+            SYS_EVENTFD2 => {
+                let initval = args[0] as u32;
+                let flags = args[1] as u32;
+                Self::sys_eventfd(initval, flags)
+            }
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

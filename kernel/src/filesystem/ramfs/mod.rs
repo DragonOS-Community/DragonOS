@@ -25,6 +25,9 @@ use super::vfs::{
     file::FilePrivateData, syscall::ModeType, utils::DName, FileSystem, FileSystemMaker, FsInfo,
     IndexNode, InodeId, Metadata, SpecialNodeData,
 };
+
+use linkme::distributed_slice;
+
 use super::vfs::{Magic, SuperBlock};
 
 /// RamFS的inode名称的最大长度

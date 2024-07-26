@@ -214,10 +214,10 @@ impl DriverManager {
 
         bus_manager().add_driver(&driver)?;
 
-        self.add_groups(&driver, driver.groups()).map_err(|e| {
-            bus_manager().remove_driver(&driver);
-            e
-        })?;
+        self.add_groups(&driver, driver.groups())
+            .inspect_err(|_e| {
+                bus_manager().remove_driver(&driver);
+            })?;
 
         // todo: 发送uevent，类型问题
         let _ = kobject_uevent(driver.clone() as Arc<dyn KObject>, KobjectAction::KOBJADD);

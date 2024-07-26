@@ -10,6 +10,7 @@ pub trait ConsoleSwitch: Sync + Send {
     fn con_init(&self, vc_data: &mut VirtualConsoleData, init: bool) -> Result<(), SystemError>;
 
     /// 进行释放等系列操作，目前未使用
+    #[allow(dead_code)]
     fn con_deinit(&self) -> Result<(), SystemError>;
 
     /// ## 清空console的一片区域

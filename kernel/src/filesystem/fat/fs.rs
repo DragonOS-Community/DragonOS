@@ -45,6 +45,7 @@ pub const MAX_FILE_SIZE: u64 = 0xffff_ffff;
 
 /// @brief 表示当前簇和上一个簇的关系的结构体
 /// 定义这样一个结构体的原因是，FAT文件系统的文件中，前后两个簇具有关联关系。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Cluster {
     pub cluster_num: u64,
@@ -642,7 +643,7 @@ impl FATFileSystem {
             self.set_entry(cluster, FATEntry::Unused)?;
             self.fs_info.0.lock().update_free_count_delta(1);
             // 安全选项：清空被释放的簇
-            #[cfg(feature = "secure")]
+            #[cfg(feature = "fatfs-secure")]
             self.zero_cluster(cluster)?;
             return Ok(());
         } else {

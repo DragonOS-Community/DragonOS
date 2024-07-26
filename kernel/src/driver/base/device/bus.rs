@@ -478,9 +478,8 @@ impl BusManager {
 
         driver_manager()
             .create_attr_file(driver, &DriverAttrBind)
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 driver_manager().remove_attr_file(driver, &DriverAttrUnbind);
-                e
             })?;
 
         return Ok(());

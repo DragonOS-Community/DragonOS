@@ -272,6 +272,7 @@ pub trait SchedArch {
     /// 开启当前核心的调度
     fn enable_sched_local();
     /// 关闭当前核心的调度
+    #[allow(dead_code)]
     fn disable_sched_local();
 
     /// 在第一次开启调度之前，进行初始化工作。
@@ -363,14 +364,22 @@ impl CpuRunQueue {
         {
             // 在本cpu已上锁则可以直接拿
             (
-                unsafe { &mut *(self as *const Self as usize as *mut Self) },
+                unsafe {
+                    (self as *const Self as usize as *mut Self)
+                        .as_mut()
+                        .unwrap()
+                },
                 None,
             )
         } else {
             // 否则先上锁再拿
             let guard = self.lock();
             (
-                unsafe { &mut *(self as *const Self as usize as *mut Self) },
+                unsafe {
+                    (self as *const Self as usize as *mut Self)
+                        .as_mut()
+                        .unwrap()
+                },
                 Some(guard),
             )
         }

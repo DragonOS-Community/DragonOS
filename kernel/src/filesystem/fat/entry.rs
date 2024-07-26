@@ -1328,6 +1328,7 @@ impl ShortDirEntry {
     }
 
     /// @brief 计算短目录项的名称的校验和
+    #[allow(clippy::manual_rotate)]
     fn checksum(&self) -> u8 {
         let mut result = 0;
 

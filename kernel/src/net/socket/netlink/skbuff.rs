@@ -4,14 +4,14 @@ use core::cell::RefCell;
 use alloc::{boxed::Box, rc::Rc, sync::Arc};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata};
 
-use crate::libs::rwlock::RwLock;
+use crate::libs::{mutex::Mutex, rwlock::RwLock};
 
 use super::af_netlink::{NetlinkSock, NetlinkSocket};
 // 曾用方案：在 smoltcp::PacketBuffer 的基础上封装了一层，用于处理 netlink 协议中网络数据包(skb)的相关操作
 #[derive(Debug)]
 #[derive(Clone)]
 pub struct SkBuff {
-    pub sk: Arc<dyn NetlinkSocket>,
+    pub sk: Arc<Mutex<Box<dyn NetlinkSocket>>>,
     pub len: u32,
     pub pkt_type: u32,
     pub mark: u32,
@@ -49,7 +49,7 @@ pub struct SkBuff {
 impl SkBuff {
     pub fn new() -> Self {
         SkBuff {
-            sk: Arc::new(NetlinkSock::new()),
+            sk: Arc::new(Mutex::new(Box::new(NetlinkSock::new()))),
             len: 0,
             pkt_type: 0,
             mark: 0,
@@ -91,7 +91,7 @@ impl SkBuff {
 }
 
 // 处理网络套接字的过度运行情况
-pub fn netlink_overrun(sk: &Arc<dyn NetlinkSocket>) {
+pub fn netlink_overrun(sk: &Arc<Mutex<Box<dyn NetlinkSocket>>>) {
     // Implementation of the function
 }
 
@@ -101,26 +101,9 @@ pub fn skb_shared(skb: &RwLock<SkBuff>) -> bool {
     false
 }
 
-// 处理被孤儿化的网络数据包(skb)。
-// 孤儿化网络数据包意味着数据包不再与任何套接字关联，
-// 通常是因为发送数据包时指定了MSG_DONTWAIT标志，这告诉内核不要等待必要的资源（如内存），而是尽可能快地发送数据包。
-pub fn skb_orphan(skb: &RwLock<SkBuff>) {
-    // Implementation of the function
-}
-
-// 网络数据包(skb)的克隆操作
-pub fn skb_clone(skb: Rc<RefCell<SkBuff>>, allocation: u32) -> Rc<RefCell<SkBuff>> {
-    // Implementation of the function
-    Rc::new(RefCell::new(SkBuff::new()))
-}
-
-// 增加网络数据包(skb)的使用者计数
-pub fn skb_get(skb: Rc<RefCell<SkBuff>>) -> Rc<RefCell<SkBuff>> {
-    // Implementation of the function
-    Rc::new(RefCell::new(SkBuff::new()))
-}
-
-// 用于释放网络套接字(sk)的资源。
-pub fn sock_put(sk: &Arc<dyn NetlinkSocket>) {
-    // Implementation of the function
+/// 处理被孤儿化的网络数据包(skb)
+/// 孤儿化网络数据包意味着数据包不再与任何套接字关联，
+/// 通常是因为发送数据包时指定了 MSG_DONTWAIT 标志，这告诉内核不要等待必要的资源（如内存），而是尽可能快地发送数据包。
+pub fn skb_orphan(skb: &Arc<RwLock<SkBuff>>) {
+    // TODO: Implementation of the function
 }

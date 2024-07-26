@@ -47,14 +47,16 @@ pub fn i8042_init() -> Result<(), SystemError> {
     Ok(())
 }
 
-// TODO: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/i8042.c#441
+/// TODO: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/i8042.c#441
+#[allow(dead_code)]
 pub fn i8042_start(_serio: &Arc<dyn SerioDevice>) -> Result<(), SystemError> {
-    todo!()
+    todo!("i8042_start")
 }
 
-// TODO: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/i8042.c#471
+/// TODO: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/i8042.c#471
+#[allow(dead_code)]
 pub fn i8042_stop(_serio: &Arc<dyn SerioDevice>) -> Result<(), SystemError> {
-    todo!()
+    todo!("i8042_stop")
 }
 
 /// # 函数的功能

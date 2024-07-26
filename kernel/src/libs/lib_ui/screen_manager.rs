@@ -240,6 +240,7 @@ pub trait ScmUiFramework: Sync + Send + Debug {
         return Err(SystemError::ENOSYS);
     }
     // 卸载ui框架的回调函数
+    #[allow(dead_code)]
     fn uninstall(&self) -> Result<i32, SystemError> {
         return Err(SystemError::ENOSYS);
     }

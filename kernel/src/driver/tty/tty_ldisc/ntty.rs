@@ -1344,7 +1344,7 @@ impl NTtyData {
                                     tty.write(core, &[8], 1)?;
                                 }
                                 if tty.put_char(tty.core(), b' ').is_err() {
-                                    tty.write(core, &[b' '], 1)?;
+                                    tty.write(core, b" ", 1)?;
                                 }
                                 self.cursor_column -= 1;
                                 space -= 1;
@@ -1357,7 +1357,7 @@ impl NTtyData {
                                 }
 
                                 if tty.put_char(tty.core(), b'^').is_err() {
-                                    tty.write(core, &[b'^'], 1)?;
+                                    tty.write(core, b"^", 1)?;
                                 }
 
                                 if tty.put_char(tty.core(), ch ^ 0o100).is_err() {

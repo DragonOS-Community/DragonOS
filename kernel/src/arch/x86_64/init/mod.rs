@@ -35,6 +35,7 @@ extern "C" {
 }
 
 #[no_mangle]
+#[allow(static_mut_refs)]
 unsafe extern "C" fn kernel_main(
     mb2_info: u64,
     mb2_magic: u64,
@@ -66,6 +67,7 @@ unsafe extern "C" fn kernel_main(
 
 /// 在内存管理初始化之前的架构相关的早期初始化
 #[inline(never)]
+#[allow(static_mut_refs)]
 pub fn early_setup_arch() -> Result<(), SystemError> {
     let stack_start = unsafe { *(head_stack_start as *const u64) } as usize;
     debug!("head_stack_start={:#x}\n", stack_start);

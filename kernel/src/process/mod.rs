@@ -1,4 +1,5 @@
 use core::{
+    fmt,
     hash::Hash,
     hint::spin_loop,
     intrinsics::{likely, unlikely},
@@ -514,9 +515,9 @@ pub unsafe fn switch_finish_hook() {
 
 int_like!(Pid, AtomicPid, usize, AtomicUsize);
 
-impl ToString for Pid {
-    fn to_string(&self) -> String {
-        self.0.to_string()
+impl fmt::Display for Pid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -1157,6 +1158,7 @@ pub struct ProcessSchedulerInfo {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct SchedInfo {
     /// 记录任务在特定 CPU 上运行的次数
     pub pcount: usize,
@@ -1169,6 +1171,7 @@ pub struct SchedInfo {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct PrioData {
     pub prio: i32,
     pub static_prio: i32,

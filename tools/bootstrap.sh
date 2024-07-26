@@ -247,7 +247,7 @@ rustInstall() {
 		rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
 		rustup component add rust-src
         rustup component add llvm-tools-preview
-		rustup default nightly
+		rustup default nightly-07-23
 		
 		echo "Rust已经成功的在您的计算机上安装！请运行 source ~/.cargo/env 以使rust在当前窗口生效！"
 	fi

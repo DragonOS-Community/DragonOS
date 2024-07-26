@@ -20,6 +20,7 @@ use super::{
 
 /// 类kmalloc的分配器应当实现的trait
 pub trait LocalAlloc {
+    #[allow(dead_code)]
     unsafe fn local_alloc(&self, layout: Layout) -> *mut u8;
     unsafe fn local_alloc_zeroed(&self, layout: Layout) -> *mut u8;
     unsafe fn local_dealloc(&self, ptr: *mut u8, layout: Layout);

@@ -10,8 +10,8 @@ use crate::arch::mm::{LockedFrameAllocator, PageMapper};
 use crate::arch::x86_64::mm::X86_64MMArch;
 use crate::arch::MMArch;
 
-use crate::mm::{phys_2_virt, VirtAddr};
 use crate::mm::{MemoryManagementArch, PageTableKind};
+use crate::mm::{PhysAddr, VirtAddr};
 use crate::virt::kvm::vcpu::Vcpu;
 use crate::virt::kvm::vm::Vm;
 use alloc::alloc::Global;
@@ -42,6 +42,7 @@ pub struct MSRBitmap {
     pub data: [u8; PAGE_SIZE],
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct VcpuData {
     /// The virtual and physical address of the Vmxon naturally aligned 4-KByte region of memory
@@ -73,6 +74,7 @@ pub enum VcpuState {
     Act = 2,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct VmxVcpu {
     pub vcpu_id: u32,
@@ -318,13 +320,13 @@ impl VmxVcpu {
         )?;
         vmx_vmwrite(
             VmcsFields::HOST_GDTR_BASE as u32,
-            pseudo_descriptpr.base.to_bits() as u64,
+            pseudo_descriptpr.base as usize as u64,
         )?;
         vmx_vmwrite(VmcsFields::HOST_IDTR_BASE as u32, unsafe {
             let mut pseudo_descriptpr: x86::dtables::DescriptorTablePointer<u64> =
                 Default::default();
             x86::dtables::sidt(&mut pseudo_descriptpr);
-            pseudo_descriptpr.base.to_bits() as u64
+            pseudo_descriptpr.base as usize as u64
         })?;
 
         // fast entry into the kernel
@@ -474,14 +476,9 @@ pub fn get_segment_base(gdt_base: *const u64, gdt_size: u16, segment_selector: u
     let base_mid = (descriptor & 0x0000_00FF_0000_0000) >> 16;
     let base_low = (descriptor & 0x0000_0000_FFFF_0000) >> 16;
     let segment_base = (base_high | base_mid | base_low) & 0xFFFFFFFF;
-    let virtaddr = phys_2_virt(segment_base.try_into().unwrap())
-        .try_into()
-        .unwrap();
-    debug!(
-        "segment_base={:x}",
-        phys_2_virt(segment_base.try_into().unwrap())
-    );
-    return virtaddr;
+    let virtaddr = unsafe { MMArch::phys_2_virt(PhysAddr::new(segment_base as usize)).unwrap() };
+
+    return virtaddr.data() as u64;
 }
 
 // FIXME: may have bug

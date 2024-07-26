@@ -1,4 +1,4 @@
-TOOLCHAIN="+nightly-2023-08-15-x86_64-unknown-linux-gnu"
+TOOLCHAIN="+nightly-2024-07-23-x86_64-unknown-linux-gnu"
 RUSTFLAGS+=""
 
 ifdef DADK_CURRENT_BUILD_DIR

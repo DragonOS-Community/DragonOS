@@ -646,18 +646,16 @@ impl DeviceManager {
             let parent_kobj = parent.clone() as Arc<dyn KObject>;
             sysfs_instance()
                 .create_link(Some(&dev_kobj), &parent_kobj, "device".to_string())
-                .map_err(|e| {
+                .inspect_err(|_e| {
                     err_remove_subsystem(&dev_kobj);
-                    e
                 })?;
         }
 
         sysfs_instance()
             .create_link(Some(&subsys_kobj), &dev_kobj, dev.name())
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 err_remove_device(&dev_kobj);
                 err_remove_subsystem(&dev_kobj);
-                e
             })?;
 
         return Ok(());
@@ -695,18 +693,16 @@ impl DeviceManager {
         // 添加kobj_type的属性文件
         if let Some(kobj_type) = dev.kobj_type() {
             self.add_groups(dev, kobj_type.attribute_groups().unwrap_or(&[]))
-                .map_err(|e| {
+                .inspect_err(|_e| {
                     err_remove_class_groups(dev);
-                    e
                 })?;
         }
 
         // 添加设备本身的属性文件
         self.add_groups(dev, dev.attribute_groups().unwrap_or(&[]))
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 err_remove_kobj_type_groups(dev);
                 err_remove_class_groups(dev);
-                e
             })?;
 
         return Ok(());

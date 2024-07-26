@@ -1,5 +1,6 @@
 #![no_std]
 #![feature(core_intrinsics)]
+#![allow(internal_features)]
 #![allow(clippy::needless_return)]
 
 use core::intrinsics::unlikely;

@@ -154,7 +154,7 @@ impl MMMonitorThread {
         info!("MMMonitorThread::run(): kmem_path: {:?}", self.kmem_path);
 
         let mut kmem_file = {
-            let mut file: File;
+            let file: File;
             loop {
                 let f = self.open_kmem_file();
                 if f.is_ok() {

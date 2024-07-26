@@ -23,7 +23,7 @@ Add the following two dependencies to your `Cargo.toml`:
 ```toml
 [dependencies]
 intertrait = "0.2"
-linkme = "0.2"
+linkme = "=0.3.27"
 ```
 
 The `linkme` dependency is required due to the use of `linkme` macro in the output of `intertrait` macros.

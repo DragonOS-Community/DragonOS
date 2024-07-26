@@ -3,6 +3,7 @@ pub mod ahci_inode;
 pub mod ahcidisk;
 pub mod hba;
 
+use crate::arch::MMArch;
 use crate::driver::base::block::disk_info::BLK_GF_AHCI;
 use crate::driver::block::cache::cached_block_device::BlockCache;
 // 依赖的rust工具包
@@ -18,7 +19,7 @@ use crate::driver::disk::ahci::{
 };
 use crate::libs::rwlock::RwLockWriteGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
-use crate::mm::virt_2_phys;
+use crate::mm::{MemoryManagementArch, VirtAddr};
 use ahci_inode::LockedAhciInode;
 use alloc::{boxed::Box, collections::LinkedList, format, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::compiler_fence;
@@ -97,13 +98,25 @@ pub fn ahci_init() -> Result<(), SystemError> {
                         debug!("<ahci_rust_init> Find a {:?} type Disk.", tp);
 
                         // 计算地址
-                        let fb = virt_2_phys(ahci_port_base_vaddr + (32 << 10) + (j << 8));
-                        let clb = virt_2_phys(ahci_port_base_vaddr + (j << 10));
+                        let fb = unsafe {
+                            MMArch::virt_2_phys(VirtAddr::new(
+                                ahci_port_base_vaddr + (32 << 10) + (j << 8),
+                            ))
+                        }
+                        .unwrap()
+                        .data();
+                        let clb = unsafe {
+                            MMArch::virt_2_phys(VirtAddr::new(ahci_port_base_vaddr + (j << 10)))
+                                .unwrap()
+                                .data()
+                        };
                         let ctbas = (0..32)
-                            .map(|x| {
-                                virt_2_phys(
+                            .map(|x| unsafe {
+                                MMArch::virt_2_phys(VirtAddr::new(
                                     ahci_port_base_vaddr + (40 << 10) + (j << 13) + (x << 8),
-                                ) as u64
+                                ))
+                                .unwrap()
+                                .data() as u64
                             })
                             .collect::<Vec<_>>();
 

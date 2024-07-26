@@ -207,10 +207,12 @@ pub trait Clocksource: Send + Sync + Debug {
         return Err(SystemError::ENOSYS);
     }
     /// optional function to disable the clocksource
+    #[allow(dead_code)]
     fn disable(&self) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
     }
     /// vsyscall based read
+    #[allow(dead_code)]
     fn vread(&self) -> Result<CycleNum, SystemError> {
         return Err(SystemError::ENOSYS);
     }

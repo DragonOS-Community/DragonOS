@@ -141,6 +141,7 @@ impl Serial8250Manager {
 }
 
 /// 所有的8250串口设备都应该实现的trait
+#[allow(dead_code)]
 trait Serial8250Port: UartPort {
     fn device(&self) -> Option<Arc<Serial8250ISADevices>> {
         None

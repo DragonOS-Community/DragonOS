@@ -142,6 +142,7 @@ impl DeviceManager {
     /// - Ok(true): 匹配成功
     /// - Ok(false): 没有匹配成功
     /// - Err(SystemError): 匹配过程中出现意外错误,没有匹配成功
+    ///
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#899
     fn do_device_attach_driver(
         &self,
@@ -484,17 +485,15 @@ impl DriverManager {
 
         sysfs_instance()
             .create_link(Some(&device_kobj), &driver_kobj, "driver".to_string())
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 fail_rm_dev_link();
-                e
             })?;
 
         device_manager()
             .create_file(device, &DeviceAttrCoredump)
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 sysfs_instance().remove_link(&device_kobj, "driver".to_string());
                 fail_rm_dev_link();
-                e
             })?;
 
         return Ok(());

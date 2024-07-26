@@ -1,12 +1,13 @@
 use alloc::sync::Arc;
-use core::sync::atomic::{compiler_fence, AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use log::{debug, info};
+use core::intrinsics::{likely, unlikely};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use log::{debug, info, warn};
 use system_error::SystemError;
 
 use crate::{
-    arch::{CurrentIrqArch, CurrentTimeArch},
+    arch::CurrentIrqArch,
     exception::InterruptArch,
-    libs::rwlock::{RwLock, RwLockReadGuard},
+    libs::rwlock::RwLock,
     time::{
         jiffies::{clocksource_default_clock, jiffies_init},
         timekeep::ktime_get_real_ns,
@@ -14,10 +15,11 @@ use crate::{
     },
 };
 
+use super::timekeep::{ktime_t, timespec_to_ktime};
 use super::{
     clocksource::{clocksource_cyc2ns, Clocksource, CycleNum, HZ},
     syscall::PosixTimeval,
-    TimeArch, NSEC_PER_SEC,
+    NSEC_PER_SEC,
 };
 /// NTP周期频率
 pub const NTP_INTERVAL_FREQ: u64 = HZ;
@@ -28,17 +30,12 @@ pub const NTP_SCALE_SHIFT: u32 = 32;
 
 /// timekeeping休眠标志，false为未休眠
 pub static TIMEKEEPING_SUSPENDED: AtomicBool = AtomicBool::new(false);
-/// 已经递增的微秒数
-static __ADDED_USEC: AtomicI64 = AtomicI64::new(0);
 /// timekeeper全局变量，用于管理timekeeper模块
 static mut __TIMEKEEPER: Option<Timekeeper> = None;
 
 #[derive(Debug)]
 pub struct Timekeeper {
     inner: RwLock<TimekeeperData>,
-
-    /// 上一次更新墙上时间时的CPU周期数
-    last_update_cpu_cycle: AtomicUsize,
 }
 
 #[allow(dead_code)]
@@ -52,7 +49,6 @@ pub struct TimekeeperData {
     cycle_interval: CycleNum,
     /// 一个NTP间隔中时钟移位的纳秒数。
     xtime_interval: u64,
-    ///
     xtime_remainder: i64,
     /// 每个NTP间隔累积的原始纳米秒
     raw_interval: i64,
@@ -68,6 +64,8 @@ pub struct TimekeeperData {
     wall_to_monotonic: PosixTimeSpec,
     total_sleep_time: PosixTimeSpec,
     xtime: PosixTimeSpec,
+    /// 单调时间和实时时间的偏移量
+    real_time_offset: ktime_t,
 }
 impl TimekeeperData {
     pub fn new() -> Self {
@@ -98,6 +96,7 @@ impl TimekeeperData {
                 tv_nsec: 0,
                 tv_sec: 0,
             },
+            real_time_offset: 0,
         }
     }
 }
@@ -105,7 +104,6 @@ impl Timekeeper {
     fn new() -> Self {
         Self {
             inner: RwLock::new(TimekeeperData::new()),
-            last_update_cpu_cycle: AtomicUsize::new(0),
         }
     }
 
@@ -118,7 +116,7 @@ impl Timekeeper {
         let mut timekeeper = self.inner.write_irqsave();
         // 更新clock
         let mut clock_data = clock.clocksource_data();
-        clock_data.watchdog_last = clock.read();
+        clock_data.cycle_last = clock.read();
         if clock.update_clocksource_data(clock_data).is_err() {
             debug!("timekeeper_setup_internals:update_clocksource_data run failed");
         }
@@ -144,33 +142,150 @@ impl Timekeeper {
         timekeeper.mult = clock_data.mult;
     }
 
-    /// # 获取当前时钟源距离上次watchdog检测走过的纳秒数
-    #[allow(dead_code)]
-    pub fn tk_get_ns(&self) -> u64 {
-        let timekeeper: RwLockReadGuard<'_, TimekeeperData> = self.inner.read_irqsave();
+    pub fn timekeeping_get_ns(&self) -> i64 {
+        let timekeeper = self.inner.read_irqsave();
         let clock = timekeeper.clock.clone().unwrap();
-        drop(timekeeper);
 
-        let clock_now = clock.read();
+        let cycle_now = clock.read();
         let clock_data = clock.clocksource_data();
-        let clock_delta = clock_now.div(clock_data.watchdog_last).data() & clock_data.mask.bits();
+        let cycle_delta = (cycle_now.div(clock_data.cycle_last)).data() & clock_data.mask.bits();
 
         return clocksource_cyc2ns(
-            CycleNum::new(clock_delta),
-            clock_data.mult,
-            clock_data.shift,
-        );
+            CycleNum::new(cycle_delta),
+            timekeeper.mult,
+            timekeeper.shift as u32,
+        ) as i64;
     }
 
-    #[inline]
-    fn do_read_cpu_cycle_ns(&self) -> usize {
-        let prev = self.last_update_cpu_cycle.load(Ordering::SeqCst);
-        CurrentTimeArch::cycles2ns(CurrentTimeArch::get_cycles().wrapping_sub(prev))
+    /// # 处理大幅度调整
+    pub fn timekeeping_bigadjust(&self, error: i64, interval: i64, offset: i64) -> (i64, i64, i32) {
+        let mut error = error;
+        let mut interval = interval;
+        let mut offset = offset;
+
+        // TODO: 计算look_head并调整ntp误差
+
+        let tmp = interval;
+        let mut mult = 1;
+        let mut adj = 0;
+        if error < 0 {
+            error = -error;
+            interval = -interval;
+            offset = -offset;
+            mult = -1;
+        }
+        while error > tmp {
+            adj += 1;
+            error >>= 1;
+        }
+
+        interval <<= adj;
+        offset <<= adj;
+        mult <<= adj;
+
+        return (interval, offset, mult);
     }
 
-    fn mark_update_wall_time_ok(&self) {
-        self.last_update_cpu_cycle
-            .store(CurrentTimeArch::get_cycles(), Ordering::SeqCst);
+    /// # 调整时钟的mult减少ntp_error
+    pub fn timekeeping_adjust(&self, offset: i64) -> i64 {
+        let mut timekeeper = self.inner.write_irqsave();
+        let mut interval = timekeeper.cycle_interval.data() as i64;
+        let mut offset = offset;
+        let adj: i32;
+
+        // 计算误差
+        let mut error = timekeeper.ntp_error >> (timekeeper.ntp_error_shift - 1);
+
+        // 误差超过一个interval，就要进行调整
+        if error >= 0 {
+            if error > interval {
+                error >>= 2;
+                if likely(error <= interval) {
+                    adj = 1;
+                } else {
+                    (interval, offset, adj) = self.timekeeping_bigadjust(error, interval, offset);
+                }
+            } else {
+                // 不需要校准
+                return offset;
+            }
+        } else if -error > interval {
+            if likely(-error <= interval) {
+                adj = -1;
+                interval = -interval;
+                offset = -offset;
+            } else {
+                (interval, offset, adj) = self.timekeeping_bigadjust(error, interval, offset);
+            }
+        } else {
+            // 不需要校准
+            return offset;
+        }
+
+        // 检查最大调整值，确保调整值不会超过时钟源允许的最大值
+        let clock_data = timekeeper.clock.clone().unwrap().clocksource_data();
+        if unlikely(
+            clock_data.maxadj != 0
+                && (timekeeper.mult as i32 + adj
+                    > clock_data.mult as i32 + clock_data.maxadj as i32),
+        ) {
+            warn!(
+                "Adjusting {:?} more than ({} vs {})",
+                clock_data.name,
+                timekeeper.mult as i32 + adj,
+                clock_data.mult as i32 + clock_data.maxadj as i32
+            );
+        }
+
+        if error > 0 {
+            timekeeper.mult += adj as u32;
+            timekeeper.xtime_interval += interval as u64;
+            timekeeper.xtime_nsec -= offset as u64;
+        } else {
+            timekeeper.mult -= adj as u32;
+            timekeeper.xtime_interval -= interval as u64;
+            timekeeper.xtime_nsec += offset as u64;
+        }
+        timekeeper.ntp_error -= (interval - offset) << timekeeper.ntp_error_shift;
+
+        return offset;
+    }
+    /// # 用于累积时间间隔，并将其转换为纳秒时间
+    pub fn logarithmic_accumulation(&self, offset: u64, shift: i32) -> u64 {
+        let mut timekeeper = self.inner.write_irqsave();
+        let clock = timekeeper.clock.clone().unwrap();
+        let clock_data = clock.clocksource_data();
+        let nsecps = (NSEC_PER_SEC as u64) << timekeeper.shift;
+        let mut offset = offset;
+
+        // 检查offset是否小于一个NTP周期间隔
+        if offset < timekeeper.cycle_interval.data() << shift {
+            return offset;
+        }
+
+        // 累积一个移位的interval
+        offset -= timekeeper.cycle_interval.data() << shift;
+        clock_data
+            .cycle_last
+            .add(CycleNum::new(timekeeper.cycle_interval.data() << shift));
+        if clock.update_clocksource_data(clock_data).is_err() {
+            debug!("logarithmic_accumulation:update_clocksource_data run failed");
+        }
+        timekeeper.clock.replace(clock.clone());
+
+        // 更新xime_nsec
+        timekeeper.xtime_nsec += timekeeper.xtime_interval << shift;
+        while timekeeper.xtime_nsec >= nsecps {
+            timekeeper.xtime_nsec -= nsecps;
+            timekeeper.xtime.tv_sec += 1;
+            // TODO: 处理闰秒
+        }
+
+        // TODO：更新raw_time
+
+        // TODO：计算ntp_error
+
+        return offset;
     }
 }
 
@@ -201,19 +316,15 @@ pub fn getnstimeofday() -> PosixTimeSpec {
             Some(tk) => {
                 xtime = tk.xtime;
                 drop(tk);
-                // 提供基于cpu周期数的ns时间，以便在两次update_wall_time之间提供更好的精度
-                let cpu_delta_ns = timekeeper().do_read_cpu_cycle_ns() as u64;
 
-                // 尚未同步到xtime的时间
-                let tmp_delta_ns = __ADDED_USEC.load(Ordering::SeqCst) as u64 * 1000;
+                nsecs = timekeeper().timekeeping_get_ns();
 
-                nsecs = cpu_delta_ns + tmp_delta_ns;
                 // TODO 不同架构可能需要加上不同的偏移量
                 break;
             }
         }
     }
-    xtime.tv_nsec += nsecs as i64;
+    xtime.tv_nsec += nsecs;
     xtime.tv_sec += xtime.tv_nsec / NSEC_PER_SEC as i64;
     xtime.tv_nsec %= NSEC_PER_SEC as i64;
     // debug!("getnstimeofday: xtime = {:?}, nsecs = {:}", xtime, nsecs);
@@ -267,8 +378,6 @@ pub fn timekeeping_init() {
         timekeeper.wall_to_monotonic.tv_sec,
     ) = (-timekeeper.xtime.tv_nsec, -timekeeper.xtime.tv_sec);
 
-    __ADDED_USEC.store(0, Ordering::SeqCst);
-
     drop(irq_guard);
     drop(timekeeper);
     jiffies_init();
@@ -276,7 +385,8 @@ pub fn timekeeping_init() {
 }
 
 /// # 使用当前时钟源增加wall time
-pub fn update_wall_time(delta_us: i64) {
+/// 参考：https://code.dragonos.org.cn/xref/linux-3.4.99/kernel/time/timekeeping.c#1041
+pub fn update_wall_time() {
     // debug!("enter update_wall_time, stack_use = {:}",stack_use);
     compiler_fence(Ordering::SeqCst);
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
@@ -285,60 +395,74 @@ pub fn update_wall_time(delta_us: i64) {
         return;
     }
 
-    // ===== 请不要删除这些注释 =====
-    // let clock = timekeeper.clock.clone().unwrap();
-    // let clock_data = clock.clocksource_data();
-    // let offset = (clock.read().div(clock_data.watchdog_last).data()) & clock_data.mask.bits();
+    let mut tk = timekeeper().inner.write_irqsave();
+    // 获取当前时钟源
+    let clock = tk.clock.clone().unwrap();
+    let clock_data = clock.clocksource_data();
+    // 计算从上一次更新周期以来经过的时钟周期数
+    let mut offset = (clock.read().div(clock_data.cycle_last).data()) & clock_data.mask.bits();
+    // 检查offset是否达到了一个NTP周期间隔
+    if offset < tk.cycle_interval.data() {
+        return;
+    }
 
-    // timekeeper.xtime_nsec = (timekeeper.xtime.tv_nsec as u64) << timekeeper.shift;
-    // // TODO 当有ntp模块之后 需要将timekeep与ntp进行同步并检查
-    // timekeeper.xtime.tv_nsec = ((timekeeper.xtime_nsec as i64) >> timekeeper.shift) + 1;
-    // timekeeper.xtime_nsec -= (timekeeper.xtime.tv_nsec as u64) << timekeeper.shift;
+    // 将纳秒部分转换为更高精度的格式
+    tk.xtime_nsec = (tk.xtime.tv_nsec as u64) << tk.shift;
 
-    // timekeeper.xtime.tv_nsec += offset as i64;
-    // while unlikely(timekeeper.xtime.tv_nsec >= NSEC_PER_SEC.into()) {
-    //     timekeeper.xtime.tv_nsec -= NSEC_PER_SEC as i64;
-    //     timekeeper.xtime.tv_sec += 1;
-    //     // TODO 需要处理闰秒
-    // }
-    // ================
-    compiler_fence(Ordering::SeqCst);
-
-    __ADDED_USEC.fetch_add(delta_us, Ordering::SeqCst);
-    compiler_fence(Ordering::SeqCst);
-    let mut retry = 10;
-
-    let usec = __ADDED_USEC.load(Ordering::SeqCst);
-
-    // 一分钟同步一次
-    loop {
-        if (usec & !((1 << 26) - 1)) != 0 {
-            if __ADDED_USEC
-                .compare_exchange(usec, 0, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-                || retry == 0
-            {
-                // 同步时间
-                // 我感觉这里会出问题：多个读者不退出的话，写者就无法写入
-                // 然后这里会超时，导致在中断返回之后，会不断的进入这个中断，最终爆栈。
-                let mut timekeeper = timekeeper().inner.write_irqsave();
-                timekeeper.xtime.tv_nsec = ktime_get_real_ns();
-                timekeeper.xtime.tv_sec = 0;
-                __ADDED_USEC.store(0, Ordering::SeqCst);
-
-                drop(timekeeper);
-                break;
-            }
-            retry -= 1;
-        } else {
-            break;
+    let mut shift = (offset.ilog2() - tk.cycle_interval.data().ilog2()) as i32;
+    shift = shift.max(0);
+    // let max_shift = (64 - (ntp_tick_length().ilog2()+1)) - 1;
+    // shift = min(shift, max_shift)
+    while offset >= tk.cycle_interval.data() {
+        offset = timekeeper().logarithmic_accumulation(offset, shift);
+        if offset < tk.cycle_interval.data() << shift {
+            shift -= 1;
         }
     }
-    timekeeper().mark_update_wall_time_ok();
-    // TODO 需要检查是否更新时间源
+
+    timekeeper().timekeeping_adjust(offset as i64);
+
+    // 处理xtime_nsec下溢问题，并对NTP误差进行调整
+    if unlikely((tk.xtime_nsec as i64) < 0) {
+        let neg = -(tk.xtime_nsec as i64);
+        tk.xtime_nsec = 0;
+        tk.ntp_error += neg << tk.ntp_error_shift;
+    }
+
+    // 将纳秒部分舍入后存储在xtime.tv_nsec中
+    tk.xtime.tv_nsec = ((tk.xtime_nsec as i64) >> tk.shift) + 1;
+    tk.xtime_nsec -= (tk.xtime.tv_nsec as u64) << tk.shift;
+
+    // 确保经过舍入后的xtime.tv_nsec不会大于NSEC_PER_SEC，并在超过1秒的情况下进行适当的调整
+    if unlikely(tk.xtime.tv_nsec >= NSEC_PER_SEC.into()) {
+        tk.xtime.tv_nsec -= NSEC_PER_SEC as i64;
+        tk.xtime.tv_sec += 1;
+        // TODO: 处理闰秒
+    }
+
+    // 更新时间的相关信息
+    timekeeping_update();
+
     compiler_fence(Ordering::SeqCst);
     drop(irq_guard);
     compiler_fence(Ordering::SeqCst);
 }
-// TODO timekeeping_adjust
 // TODO wall_to_monotic
+
+/// 参考：https://code.dragonos.org.cn/xref/linux-3.4.99/kernel/time/timekeeping.c#190
+pub fn timekeeping_update() {
+    // TODO：如果clearntp为true，则会清除NTP错误并调用ntp_clear()
+
+    // 更新实时时钟偏移量，用于跟踪硬件时钟与系统时间的差异，以便进行时间校正
+    update_rt_offset();
+}
+
+/// # 更新实时偏移量(墙上之间与单调时间的差值)
+pub fn update_rt_offset() {
+    let mut timekeeper = timekeeper().inner.write_irqsave();
+    let ts = PosixTimeSpec::new(
+        -timekeeper.wall_to_monotonic.tv_sec,
+        -timekeeper.wall_to_monotonic.tv_nsec,
+    );
+    timekeeper.real_time_offset = timespec_to_ktime(ts);
+}

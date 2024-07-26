@@ -54,7 +54,7 @@ pub fn no_init_textui_putchar_window(
         match character {
             // 进行换行操作
             '\n' => {
-                send_to_default_serial8250_port(&[b'\r']);
+                send_to_default_serial8250_port(b"\r");
                 if is_put_to_window {
                     next_line();
                 }

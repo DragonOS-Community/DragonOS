@@ -635,7 +635,7 @@ impl InnerAddressSpace {
         //     page_count
         // );
         let (mut active, mut inactive);
-        let mut flusher = if self.is_current() {
+        let flusher = if self.is_current() {
             active = PageFlushAll::new();
             &mut active as &mut dyn Flusher<MMArch>
         } else {
@@ -681,7 +681,7 @@ impl InnerAddressSpace {
                 .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))
                 .set_write(prot_flags.contains(ProtFlags::PROT_WRITE));
 
-            r_guard.remap(new_flags, mapper, &mut flusher)?;
+            r_guard.remap(new_flags, mapper, &mut *flusher)?;
             drop(r_guard);
             self.mappings.insert_vma(r);
         }
@@ -696,7 +696,7 @@ impl InnerAddressSpace {
         behavior: MadvFlags,
     ) -> Result<(), SystemError> {
         let (mut active, mut inactive);
-        let mut flusher = if self.is_current() {
+        let flusher = if self.is_current() {
             active = PageFlushAll::new();
             &mut active as &mut dyn Flusher<MMArch>
         } else {
@@ -724,7 +724,7 @@ impl InnerAddressSpace {
             if let Some(after) = split_result.after {
                 self.mappings.insert_vma(after);
             }
-            r.do_madvise(behavior, mapper, &mut flusher)?;
+            r.do_madvise(behavior, mapper, &mut *flusher)?;
             self.mappings.insert_vma(r);
         }
         Ok(())
@@ -1328,6 +1328,7 @@ impl Drop for LockedVMA {
 }
 
 /// VMA切分结果
+#[allow(dead_code)]
 pub struct VMASplitResult {
     pub prev: Option<Arc<LockedVMA>>,
     pub middle: Arc<LockedVMA>,

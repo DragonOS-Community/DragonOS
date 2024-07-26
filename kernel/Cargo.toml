@@ -12,15 +12,17 @@ crate-type = ["staticlib"]
 [workspace]
 members = [ 
     "crates/*",
-    "src/libs/intertrait"
 ]
 
 [features]
-default = ["backtrace", "kvm"]
+default = ["backtrace", "kvm", "fatfs", "fatfs-secure"]
 # 内核栈回溯
 backtrace = []
 # kvm
 kvm = []
+
+fatfs = []
+fatfs-secure = ["fatfs"]
 
 
 # 运行时依赖项
@@ -37,10 +39,10 @@ driver_base_macros = { "path" = "crates/driver_base_macros" }
 elf = { version = "=0.7.2", default-features = false }
 hashbrown = "=0.13.2"
 ida = { path = "src/libs/ida" }
-intertrait = { path = "src/libs/intertrait" }
+intertrait = { path = "crates/intertrait" }
 kdepends = { path = "crates/kdepends" }
 klog_types = { path = "crates/klog_types" }
-linkme = "=0.2"
+linkme = "=0.3.27"
 num = { version = "=0.4.0", default-features = false }
 num-derive = "=0.3"
 num-traits = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/num-traits.git", rev="1597c1c", default-features = false }

@@ -12,6 +12,7 @@ use super::{dev_id::PciDeviceID, device::PciDevice, subsys::pci_bus};
 /// Pci驱动应该实现的trait
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/pci.h#907
+#[allow(dead_code)]
 pub trait PciDriver: Driver {
     /// # 函数的功能
     /// 对设备进行probe操作

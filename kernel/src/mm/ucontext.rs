@@ -35,7 +35,7 @@ use super::{
     allocator::page_frame::{
         deallocate_page_frames, PageFrameCount, PhysPageFrame, VirtPageFrame, VirtPageFrameIter,
     },
-    page::{EntryFlags, Flusher, InactiveFlusher, PageFlushAll},
+    page::{EntryFlags, Flusher, InactiveFlusher, Page, PageFlushAll},
     syscall::{MadvFlags, MapFlags, MremapFlags, ProtFlags},
     MemoryManagementArch, PageTableKind, VirtAddr, VirtRegion, VmFlags,
 };
@@ -187,15 +187,15 @@ impl InnerAddressSpace {
             // debug!("new vma: {:x?}", new_vma);
             let new_vma_guard = new_vma.lock();
             let new_mapper = &new_guard.user_mapper.utable;
-            let anon_vma_guard = page_manager_lock_irqsave();
+            let mut page_manager_guard = page_manager_lock_irqsave();
             for page in new_vma_guard.pages().map(|p| p.virt_address()) {
                 if let Some((paddr, _)) = new_mapper.translate(page) {
-                    let page = anon_vma_guard.get_unwrap(&paddr);
+                    let page = page_manager_guard.get_unwrap(&paddr);
                     page.write().insert_vma(new_vma.clone());
                 }
             }
 
-            drop(anon_vma_guard);
+            drop(page_manager_guard);
             drop(vma_guard);
             drop(new_vma_guard);
         }
@@ -1251,7 +1251,7 @@ impl LockedVMA {
         });
 
         // 重新设置before、after这两个VMA里面的物理页的anon_vma
-        let page_manager_guard = page_manager_lock_irqsave();
+        let mut page_manager_guard = page_manager_lock_irqsave();
         if let Some(before) = before.clone() {
             let virt_iter = before.lock().region.iter_pages();
             for frame in virt_iter {
@@ -1419,6 +1419,10 @@ impl VMA {
         return self.vm_file.clone();
     }
 
+    pub fn address_space(&self) -> Option<Weak<AddressSpace>> {
+        return self.user_address_space.clone();
+    }
+
     pub fn set_vm_flags(&mut self, vm_flags: VmFlags) {
         self.vm_flags = vm_flags;
     }
@@ -1572,7 +1576,7 @@ impl VMA {
         ));
 
         // 将VMA加入到anon_vma中
-        let page_manager_guard = page_manager_lock_irqsave();
+        let mut page_manager_guard = page_manager_lock_irqsave();
         cur_phy = phys;
         for _ in 0..count.data() {
             let paddr = cur_phy.phys_address();
@@ -1642,7 +1646,7 @@ impl VMA {
         // debug!("VMA::zeroed: flusher dropped");
 
         // 清空这些内存并将VMA加入到anon_vma中
-        let page_manager_guard = page_manager_lock_irqsave();
+        let mut page_manager_guard = page_manager_lock_irqsave();
         let virt_iter: VirtPageFrameIter =
             VirtPageFrameIter::new(destination, destination.add(page_count));
         for frame in virt_iter {
@@ -1654,6 +1658,19 @@ impl VMA {
         }
         // debug!("VMA::zeroed: done");
         return Ok(r);
+    }
+
+    pub fn page_address(&self, page: &Arc<Page>) -> Result<VirtAddr, SystemError> {
+        let page_guard = page.read();
+        let index = page_guard.index().unwrap();
+        if index >= self.file_pgoff.unwrap() {
+            let address =
+                self.region.start + ((index - self.file_pgoff.unwrap()) << MMArch::PAGE_SHIFT);
+            if address <= self.region.end() {
+                return Ok(address);
+            }
+        }
+        return Err(SystemError::EFAULT);
     }
 }
 

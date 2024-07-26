@@ -7,12 +7,14 @@ use core::{
 };
 
 use alloc::sync::Arc;
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashSet;
 use log::{error, info};
+use lru::LruCache;
 
 use crate::{
     arch::{interrupt::ipi::send_ipi, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
+    filesystem::vfs::file::PageCache,
     ipc::shm::ShmId,
     libs::{
         rwlock::RwLock,
@@ -21,7 +23,7 @@ use crate::{
 };
 
 use super::{
-    allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame},
+    allocator::page_frame::{FrameAllocator, PageFrameCount},
     syscall::ProtFlags,
     ucontext::LockedVMA,
     MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
@@ -56,44 +58,56 @@ pub fn page_manager_lock_irqsave() -> SpinLockGuard<'static, PageManager> {
 
 // 物理页管理器
 pub struct PageManager {
-    phys2page: HashMap<PhysAddr, Arc<Page>>,
+    phys2page: LruCache<PhysAddr, Arc<Page>>,
 }
 
 impl PageManager {
     pub fn new() -> Self {
         Self {
-            phys2page: HashMap::new(),
+            phys2page: LruCache::unbounded(),
         }
     }
 
     pub fn contains(&self, paddr: &PhysAddr) -> bool {
-        self.phys2page.contains_key(paddr)
+        self.phys2page.peek(paddr).is_some()
     }
 
-    pub fn get(&self, paddr: &PhysAddr) -> Option<Arc<Page>> {
+    pub fn get(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
         self.phys2page.get(paddr).cloned()
     }
 
-    pub fn get_unwrap(&self, paddr: &PhysAddr) -> Arc<Page> {
+    pub fn get_unwrap(&mut self, paddr: &PhysAddr) -> Arc<Page> {
         self.phys2page
             .get(paddr)
             .unwrap_or_else(|| panic!("Phys Page not found, {:?}", paddr))
             .clone()
     }
 
-    // pub fn get_mut(&mut self, paddr: &PhysAddr) -> RwLockWriteGuard<Page> {
-    //     self.phys2page
-    //         .get_mut(paddr)
-    //         .unwrap_or_else(|| panic!("{:?}", paddr))
-    //         .write()
-    // }
-
     pub fn insert(&mut self, paddr: PhysAddr, page: &Arc<Page>) {
-        self.phys2page.insert(paddr, page.clone());
+        self.phys2page.put(paddr, page.clone());
     }
 
     pub fn remove_page(&mut self, paddr: &PhysAddr) {
-        self.phys2page.remove(paddr);
+        self.phys2page.pop(paddr);
+    }
+
+    pub fn shrink_list(&mut self) {
+        let entry = self.phys2page.peek_lru().unwrap();
+        let page = entry.1.clone();
+        let phys = *entry.0;
+        let page_cache = page.read().page_cache().unwrap();
+        for vma in page.read().anon_vma() {
+            let address_space = vma.lock().address_space().unwrap();
+            let address_space = address_space.upgrade().unwrap();
+            let mut guard = address_space.write();
+            let mapper = &mut guard.user_mapper.utable;
+            let virt = vma.lock().page_address(&page).unwrap();
+            unsafe {
+                mapper.unmap(virt, false).unwrap().flush();
+            }
+        }
+        self.phys2page.pop(&phys);
+        page_cache.remove_page(page.read().index().unwrap());
     }
 }
 
@@ -138,8 +152,8 @@ impl core::ops::DerefMut for Page {
 }
 
 impl Page {
-    pub fn new(shared: bool, phys_frame: PhysPageFrame) -> Self {
-        let inner = InnerPage::new(shared, phys_frame);
+    pub fn new(shared: bool, phys_addr: PhysAddr) -> Self {
+        let inner = InnerPage::new(shared, phys_addr);
         Self {
             inner: RwLock::new(inner),
         }
@@ -162,11 +176,14 @@ pub struct InnerPage {
     /// 标志
     flags: PageFlags,
     /// 页所在的物理页帧号
-    phys_frame: PhysPageFrame,
+    phys_addr: PhysAddr,
+    /// 在pagecache中的偏移
+    index: Option<usize>,
+    page_cache: Option<Arc<PageCache>>,
 }
 
 impl InnerPage {
-    pub fn new(shared: bool, phys_frame: PhysPageFrame) -> Self {
+    pub fn new(shared: bool, phys_addr: PhysAddr) -> Self {
         let dealloc_when_zero = !shared;
         Self {
             map_count: 0,
@@ -175,7 +192,9 @@ impl InnerPage {
             shm_id: None,
             anon_vma: HashSet::new(),
             flags: PageFlags::empty(),
-            phys_frame,
+            phys_addr,
+            index: None,
+            page_cache: None,
         }
     }
 
@@ -204,6 +223,31 @@ impl InnerPage {
         self.shm_id
     }
 
+    pub fn index(&self) -> Option<usize> {
+        self.index
+    }
+
+    pub fn page_cache(&self) -> Option<Arc<PageCache>> {
+        self.page_cache.clone()
+    }
+
+    pub fn set_page_cache(&mut self, page_cache: Option<Arc<PageCache>>) {
+        self.page_cache = page_cache;
+    }
+
+    pub fn set_index(&mut self, index: Option<usize>) {
+        self.index = index;
+    }
+
+    pub fn set_page_cache_index(
+        &mut self,
+        page_cache: Option<Arc<PageCache>>,
+        index: Option<usize>,
+    ) {
+        self.page_cache = page_cache;
+        self.index = index;
+    }
+
     pub fn set_shm_id(&mut self, shm_id: ShmId) {
         self.shm_id = Some(shm_id);
     }
@@ -228,13 +272,8 @@ impl InnerPage {
     }
 
     #[inline(always)]
-    pub fn phys_frame(&self) -> &PhysPageFrame {
-        &self.phys_frame
-    }
-
-    #[inline(always)]
     pub fn phys_address(&self) -> PhysAddr {
-        self.phys_frame.phys_address()
+        self.phys_addr
     }
 }
 
@@ -411,11 +450,18 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
                             new_table.set_entry(i, entry);
                         } else {
                             let phys = allocator.allocate_one()?;
-                            let mut anon_vma_guard = page_manager_lock_irqsave();
-                            anon_vma_guard.insert(
-                                phys,
-                                &Arc::new(Page::new(false, PhysPageFrame::new(phys))),
-                            );
+                            let mut page_manager_guard = page_manager_lock_irqsave();
+                            let old_phys = entry.address().unwrap();
+                            let old_page = page_manager_guard.get_unwrap(&old_phys);
+                            let new_page = Arc::new(Page::new(old_page.read().shared(), phys));
+                            if let Some(ref page_cache) = old_page.read().page_cache() {
+                                new_page.write().set_page_cache_index(
+                                    Some(page_cache.clone()),
+                                    old_page.read().index(),
+                                );
+                            }
+
+                            page_manager_guard.insert(phys, &new_page);
                             let old_phys = entry.address().unwrap();
                             let frame = MMArch::phys_2_virt(phys).unwrap().data() as *mut u8;
                             frame.copy_from_nonoverlapping(
@@ -961,7 +1007,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         let mut page_manager_guard: SpinLockGuard<'static, PageManager> =
             page_manager_lock_irqsave();
         if !page_manager_guard.contains(&phys) {
-            page_manager_guard.insert(phys, &Arc::new(Page::new(false, PhysPageFrame::new(phys))))
+            page_manager_guard.insert(phys, &Arc::new(Page::new(false, phys)))
         }
 
         return self.map_phys(virt, phys, flags);

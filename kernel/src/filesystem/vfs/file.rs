@@ -163,6 +163,12 @@ impl PageCache {
         page
     }
 
+    pub fn remove_page(&self, offset: usize) {
+        let mut guard = self.xarray.lock();
+        let mut cursor = guard.cursor_mut(offset as u64);
+        cursor.remove();
+    }
+
     // pub fn get_pages(&self, start_pgoff: usize, end_pgoff: usize) -> Vec<Arc<Page>> {
     //     let mut vec = Vec::new();
     //     for pgoff in start_pgoff..=end_pgoff {

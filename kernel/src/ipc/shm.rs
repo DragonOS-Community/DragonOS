@@ -165,7 +165,7 @@ impl ShmManager {
         let mut page_manager_guard = page_manager_lock_irqsave();
         let mut cur_phys = PhysPageFrame::new(phys_page.0);
         for _ in 0..page_count.data() {
-            let page = Arc::new(Page::new(true, cur_phys));
+            let page = Arc::new(Page::new(true, cur_phys.phys_address()));
             page.write().set_shm_id(shm_id);
             let paddr = cur_phys.phys_address();
             page_manager_guard.insert(paddr, &page);
@@ -436,7 +436,7 @@ impl KernelShm {
 
     /// 共享内存段的映射计数（有多少个不同的VMA映射）
     pub fn map_count(&self) -> usize {
-        let page_manager_guard = page_manager_lock_irqsave();
+        let mut page_manager_guard = page_manager_lock_irqsave();
         let mut id_set: HashSet<usize> = HashSet::new();
         let mut cur_phys = PhysPageFrame::new(self.shm_start_paddr);
         let page_count = PageFrameCount::from_bytes(page_align_up(self.shm_size)).unwrap();

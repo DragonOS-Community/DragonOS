@@ -21,7 +21,7 @@ use crate::{
 use crate::mm::MemoryManagementArch;
 
 use super::{
-    allocator::page_frame::{FrameAllocator, PhysPageFrame},
+    allocator::page_frame::FrameAllocator,
     page::{Page, PageFlags},
 };
 
@@ -258,8 +258,8 @@ impl PageFaultHandler {
                 klog_types::LogSource::Buddy,
             );
             let paddr = mapper.translate(address).unwrap().0;
-            let anon_vma_guard = page_manager_lock_irqsave();
-            let page = anon_vma_guard.get_unwrap(&paddr);
+            let mut page_manager_guard = page_manager_lock_irqsave();
+            let page = page_manager_guard.get_unwrap(&paddr);
             page.write().insert_vma(vma.clone());
             VmFaultReason::VM_FAULT_COMPLETED
         } else {
@@ -433,7 +433,7 @@ impl PageFaultHandler {
         let address = pfm.address_aligned_down();
         let vma = pfm.vma.clone();
         let old_paddr = mapper.translate(address).unwrap().0;
-        let page_manager = page_manager_lock_irqsave();
+        let mut page_manager = page_manager_lock_irqsave();
         let map_count = page_manager.get_unwrap(&old_paddr).read().map_count();
         drop(page_manager);
 
@@ -447,15 +447,15 @@ impl PageFaultHandler {
             table.set_entry(i, entry);
             VmFaultReason::VM_FAULT_COMPLETED
         } else if let Some(flush) = mapper.map(address, new_flags) {
-            let page_manager = page_manager_lock_irqsave();
-            let old_page = page_manager.get_unwrap(&old_paddr);
+            let mut page_manager_guard = page_manager_lock_irqsave();
+            let old_page = page_manager_guard.get_unwrap(&old_paddr);
             old_page.write().remove_vma(&vma);
-            drop(page_manager);
+            // drop(page_manager_guard);
 
             flush.flush();
             let paddr = mapper.translate(address).unwrap().0;
-            let anon_vma_guard = page_manager_lock_irqsave();
-            let page = anon_vma_guard.get_unwrap(&paddr);
+            // let mut page_manager_guard = page_manager_lock_irqsave();
+            let page = page_manager_guard.get_unwrap(&paddr);
             page.write().insert_vma(vma.clone());
 
             (MMArch::phys_2_virt(paddr).unwrap().data() as *mut u8).copy_from_nonoverlapping(
@@ -630,11 +630,14 @@ impl PageFaultHandler {
             (MMArch::phys_2_virt(new_cache_page).unwrap().data() as *mut u8)
                 .copy_from_nonoverlapping(buf.as_mut_ptr(), MMArch::PAGE_SIZE);
 
-            let page = Arc::new(Page::new(false, PhysPageFrame::new(new_cache_page)));
+            let page = Arc::new(Page::new(false, new_cache_page));
             pfm.page = Some(page.clone());
 
             page_manager_guard.insert(new_cache_page, &page);
             page_cache.add_page(file_pgoff, &page);
+
+            page.write()
+                .set_page_cache_index(Some(page_cache), Some(file_pgoff));
 
             //     // 分配空白页并映射到缺页地址
             //     mapper.map(pfm.address, vma_guard.flags()).unwrap().flush();
@@ -667,11 +670,23 @@ impl PageFaultHandler {
                 .flush();
 
             //复制PageCache内容到新的页内
-            let new_frame = MMArch::phys_2_virt(mapper.translate(pfm.address).unwrap().0).unwrap();
+            let new_phys = mapper.translate(pfm.address).unwrap().0;
+            let new_frame = MMArch::phys_2_virt(new_phys).unwrap();
             (new_frame.data() as *mut u8).copy_from_nonoverlapping(
                 MMArch::phys_2_virt(page_phys).unwrap().data() as *mut u8,
                 MMArch::PAGE_SIZE,
             );
+
+            let vma = pfm.vma();
+            let vma_guard = vma.lock();
+            let file = vma_guard.vm_file().expect("no vm_file in vma");
+            let page_cache = file.inode().page_cache().unwrap();
+            let page_guard = cache_page.read();
+            let new_page = Arc::new(Page::new(page_guard.shared(), new_phys));
+            page_cache.add_page(pfm.file_pgoff.unwrap(), &new_page);
+            new_page
+                .write()
+                .set_page_cache_index(cache_page.read().page_cache(), cache_page.read().index());
         } else {
             // 直接映射到PageCache
             mapper.map_phys(*pfm.address(), page_phys, vma_guard.flags());

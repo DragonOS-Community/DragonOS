@@ -1,23 +1,18 @@
-use std::format;
 use args::Args;
 use clap::Parser;
+use std::format;
 
-mod ping;
+mod args;
 mod config;
 mod error;
-mod args;
-fn main(){
+mod ping;
+fn main() {
     let args = Args::parse();
     match ping::Ping::new(args.as_config()) {
-        Ok(pinger) => {
-            pinger.run().unwrap_or_else(|e| 
-            {
-                exit(format!("Error on run ping: {}", e));
-            })
-        },
-        Err(e) => {
-            exit(format!("Error on init: {}", e))
-        }
+        Ok(pinger) => pinger.run().unwrap_or_else(|e| {
+            exit(format!("Error on run ping: {}", e));
+        }),
+        Err(e) => exit(format!("Error on init: {}", e)),
     }
 }
 

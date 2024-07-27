@@ -7,5 +7,4 @@ pub enum PingError {
 
     #[error("invaild packet")]
     InvalidPacket,
-    
 }

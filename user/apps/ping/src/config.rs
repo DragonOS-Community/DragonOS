@@ -1,5 +1,8 @@
-use std::{ffi::CString, net::{self}};
 use anyhow::bail;
+use std::{
+    ffi::CString,
+    net::{self},
+};
 
 use crate::error;
 
@@ -22,7 +25,7 @@ pub struct IpAddress {
 }
 
 impl IpAddress {
-    pub fn parse(host: &str) -> anyhow::Result<Self>{
+    pub fn parse(host: &str) -> anyhow::Result<Self> {
         println!("{:?}", host);
         let chost = CString::new(host.as_bytes())?;
         println!("chost: {:?}", chost);
@@ -30,16 +33,12 @@ impl IpAddress {
         println!("{:?}", raw);
         let opt = host.parse::<net::IpAddr>().ok();
         match opt {
-            Some(ip) => {
-                Ok(Self{
-                    ip,
-                    raw,
-                })
-            }
+            Some(ip) => Ok(Self { ip, raw }),
             None => {
-                bail!(error::PingError::InvalidConfig("Invalid Address".to_string()));
+                bail!(error::PingError::InvalidConfig(
+                    "Invalid Address".to_string()
+                ));
             }
         }
-
     }
 }

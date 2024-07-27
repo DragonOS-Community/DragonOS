@@ -1,8 +1,24 @@
-use std::{io, net::{self, Ipv4Addr, SocketAddr}, sync::{atomic::{AtomicU64, Ordering}, Arc}, thread::{self}, time::{Duration, Instant}};
 use crossbeam_channel::{bounded, select, Receiver};
-use pnet::packet::{icmp::{echo_reply::{EchoReplyPacket, IcmpCodes}, echo_request::MutableEchoRequestPacket, IcmpTypes}, util, Packet};
+use pnet::packet::{
+    icmp::{
+        echo_reply::{EchoReplyPacket, IcmpCodes},
+        echo_request::MutableEchoRequestPacket,
+        IcmpTypes,
+    },
+    util, Packet,
+};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::{
+    io,
+    net::{self, Ipv4Addr, SocketAddr},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    thread::{self},
+    time::{Duration, Instant},
+};
 
 use crate::{config::Config, error::PingError};
 
@@ -22,14 +38,14 @@ impl Ping {
         socket.set_ttl(64)?;
         socket.set_read_timeout(Some(Duration::from_secs(config.timeout)))?;
         socket.set_write_timeout(Some(Duration::from_secs(config.timeout)))?;
-        Ok(Self{
+        Ok(Self {
             config,
             dest,
             socket: Arc::new(socket),
         })
     }
 
-    pub fn ping(&self, seq_offset: u16) -> anyhow::Result<()>{
+    pub fn ping(&self, seq_offset: u16) -> anyhow::Result<()> {
         //create icmp request packet
         let mut buf = vec![0; self.config.packet_size];
         let mut icmp = MutableEchoRequestPacket::new(&mut buf[..]).expect("InvalidBuffferSize");
@@ -44,12 +60,10 @@ impl Ping {
         //send request
 
         self.socket.send_to(icmp.packet(), &self.dest.into())?;
-        
+
         //handle recv
-        let mut mem_buf = 
-            unsafe {
-                &mut *(buf.as_mut_slice() as *mut [u8] as *mut [std::mem::MaybeUninit<u8>])
-            };
+        let mut mem_buf =
+            unsafe { &mut *(buf.as_mut_slice() as *mut [u8] as *mut [std::mem::MaybeUninit<u8>]) };
         let (size, _) = self.socket.recv_from(&mut mem_buf)?;
 
         let duration = start.elapsed().as_micros() as f64 / 1000.0;
@@ -64,11 +78,13 @@ impl Ping {
         );
 
         Ok(())
-
     }
 
     pub fn run(&self) -> io::Result<()> {
-        println!("PING {}({})", self.config.address.raw, self.config.address.ip);
+        println!(
+            "PING {}({})",
+            self.config.address.raw, self.config.address.ip
+        );
         let _now = Instant::now();
         let send = Arc::new(AtomicU64::new(0));
         let _send = send.clone();
@@ -80,7 +96,7 @@ impl Ping {
                 let _this = this.clone();
                 sx.send(thread::spawn(move || _this.ping(i))).unwrap();
                 _send.fetch_add(1, Ordering::SeqCst);
-                if i < this.config.count -1 {
+                if i < this.config.count - 1 {
                     thread::sleep(Duration::from_millis(this.config.interval));
                 }
             }
@@ -134,7 +150,6 @@ impl Ping {
         Ok(())
     }
 }
-
 
 //创建一个进程用于监听用户是否提前退出程序
 fn signal_notify() -> std::io::Result<Receiver<i32>> {

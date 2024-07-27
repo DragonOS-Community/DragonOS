@@ -2,7 +2,7 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use alloc::string::{String, ToString};
+use alloc::{ffi::CString, string::ToString};
 use log::{debug, error};
 use system_error::SystemError;
 
@@ -86,7 +86,7 @@ fn switch_to_user() -> ! {
 }
 
 fn try_to_run_init_process(path: &str, trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    if let Err(e) = run_init_process(path.to_string(), trap_frame) {
+    if let Err(e) = run_init_process(path, trap_frame) {
         if e != SystemError::ENOENT {
             error!(
                 "Failed to run init process: {path} exists but couldn't execute it (error {:?})",
@@ -98,11 +98,11 @@ fn try_to_run_init_process(path: &str, trap_frame: &mut TrapFrame) -> Result<(),
     Ok(())
 }
 
-fn run_init_process(path: String, trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    let argv = vec![path.clone()];
-    let envp = vec![String::from("PATH=/")];
+fn run_init_process(path: &str, trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    let argv = vec![CString::new(path).unwrap()];
+    let envp = vec![CString::new("PATH=/").unwrap()];
 
     compiler_fence(Ordering::SeqCst);
-    Syscall::do_execve(path, argv, envp, trap_frame)?;
+    Syscall::do_execve(path.to_string(), argv, envp, trap_frame)?;
     Ok(())
 }

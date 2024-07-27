@@ -1,5 +1,4 @@
 use alloc::{
-    boxed::Box,
     string::String,
     sync::{Arc, Weak},
     vec::Vec,

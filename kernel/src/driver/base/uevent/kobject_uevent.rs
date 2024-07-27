@@ -1,5 +1,3 @@
-use core::cell::RefCell;
-use alloc::rc::Rc;
 use core::fmt::Write;
 // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c
 /*

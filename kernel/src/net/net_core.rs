@@ -1,5 +1,3 @@
-use core::cell::RefCell;
-use alloc::rc::Rc;
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
 use log::{debug, info, warn};
 use smoltcp::{socket::dhcpv4, wire};

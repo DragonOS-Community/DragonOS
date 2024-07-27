@@ -1,23 +1,19 @@
 //参考https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c
 
 
-use core::mem::size_of;
-use core::ops::DerefMut;
-use core::{any::Any, cell::RefCell, fmt::Debug, hash::Hash, ops::Deref};
 
-use alloc::borrow::ToOwned;
-use alloc::rc::Rc;
-use alloc::string::String;
+use core::{any::Any, fmt::Debug, hash::Hash};
+
+
 use alloc::sync::{Arc, Weak};
 
 use hashbrown::HashMap;
 use intertrait::CastFromSync;
 use num::Zero;
-use smoltcp::wire::IpListenEndpoint;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
-use crate::include::bindings::bindings::{EAGAIN, ECONNREFUSED};
+use crate::include::bindings::bindings::ECONNREFUSED;
 use crate::libs::mutex::Mutex;
 use crate::libs::rwlock::RwLockWriteGuard;
 use crate::libs::wait_queue::WaitQueue;
@@ -25,15 +21,13 @@ use crate::net::socket::netlink::skbuff::SkBuff;
 use crate::time::timer::schedule_timeout;
 use crate::{
     libs::rwlock::RwLock,
-    net::{net_core::consume_skb, socket::SocketType},
+    net::net_core::consume_skb,
     syscall::Syscall,
 };
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::net::socket::{AddressFamily, Socket};
 use lazy_static::lazy_static;
-use smoltcp::socket::raw::PacketBuffer;
-use smoltcp::socket::raw::PacketMetadata;
 
 use super::netlink::{NETLINK_USERSOCK, NL_CFG_F_NONROOT_SEND};
 use super::netlink_proto::{proto_register, Proto, NETLINK_PROTO};
@@ -959,7 +953,7 @@ fn netlink_unicast_kernel(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, ssk: Arc<Mutex
     let nlk_guard = nlk.0.read();
 	ret = ECONNREFUSED;
     // 检查内核netlink套接字是否注册了netlink_rcv回调(就是各个协议在创建内核netlink套接字时通常会传入的input函数)
-	if (!nlk_guard.netlink_rcv().is_empty()) {
+	if !nlk_guard.netlink_rcv().is_empty() {
 		ret = skb.read().len;
 		netlink_skb_set_owner_r(&skb, sk);
 		// NETLINK_CB(skb).sk = ssk;

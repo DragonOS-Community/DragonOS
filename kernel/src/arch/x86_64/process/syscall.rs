@@ -1,4 +1,4 @@
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
@@ -19,14 +19,14 @@ use crate::{
 impl Syscall {
     pub fn do_execve(
         path: String,
-        argv: Vec<String>,
-        envp: Vec<String>,
+        argv: Vec<CString>,
+        envp: Vec<CString>,
         regs: &mut TrapFrame,
     ) -> Result<(), SystemError> {
         // 关中断，防止在设置地址空间的时候，发生中断，然后进调度器，出现错误。
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let pcb = ProcessManager::current_pcb();
-        // crate::debug!(
+        // log::debug!(
         //     "pid: {:?}  do_execve: path: {:?}, argv: {:?}, envp: {:?}\n",
         //     pcb.pid(),
         //     path,

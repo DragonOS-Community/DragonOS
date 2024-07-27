@@ -28,7 +28,7 @@ pub struct Args {
     
         /// Ping destination, ip or domain
         #[arg(value_parser=IpAddress::parse)]
-        pub destination: IpAddress,
+        destination: IpAddress,
 }
 
 impl Args {

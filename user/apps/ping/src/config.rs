@@ -1,4 +1,4 @@
-use std::net::{self};
+use std::{ffi::CString, net::{self}};
 use anyhow::bail;
 
 use crate::error;
@@ -24,6 +24,8 @@ pub struct IpAddress {
 impl IpAddress {
     pub fn parse(host: &str) -> anyhow::Result<Self>{
         println!("{:?}", host);
+        let chost = CString::new(host.as_bytes())?;
+        println!("chost: {:?}", chost);
         let raw = String::from(host);
         println!("{:?}", raw);
         let opt = host.parse::<net::IpAddr>().ok();

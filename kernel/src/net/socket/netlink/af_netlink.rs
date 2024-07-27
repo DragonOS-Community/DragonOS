@@ -17,9 +17,12 @@ use smoltcp::wire::IpListenEndpoint;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
+use crate::include::bindings::bindings::{EAGAIN, ECONNREFUSED};
 use crate::libs::mutex::Mutex;
 use crate::libs::rwlock::RwLockWriteGuard;
+use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::netlink::skbuff::SkBuff;
+use crate::time::timer::schedule_timeout;
 use crate::{
     libs::rwlock::RwLock,
     net::{net_core::consume_skb, socket::SocketType},
@@ -37,6 +40,7 @@ use super::netlink_proto::{proto_register, Proto, NETLINK_PROTO};
 use super::skbuff::{netlink_overrun, skb_orphan, skb_shared};
 
 use crate::init::initcall::INITCALL_CORE;
+use crate::net::socket::netlink::netlink::NetlinkState;
 // Flags constants
 bitflags! {
     pub struct NetlinkFlags: u32 {
@@ -51,7 +55,7 @@ bitflags! {
         const NETLINK_F_KERNEL_SOCKET = 0x100;
     }
 }
-const NETLINK_S_CONGESTED: u64 = 0x0;
+
 pub struct SockaddrNl {
     // pub nl_family: SA_FAMILY_T,
     pub nl_pad: u16,
@@ -95,7 +99,7 @@ impl<'a> Iterator for HListHeadIter<'a> {
 }
 #[derive(Clone)]
 pub struct NetlinkTable {
-    hash: HashMap<u32, Arc<dyn NetlinkSocket>>,
+    hash: HashMap<u32, Arc<Mutex<Box<dyn NetlinkSocket>>>>,
     listeners: Option<listeners>,
     registered: u32,
     flags: u32,
@@ -270,9 +274,9 @@ pub fn netlink_add_usersock_entry(nl_table: &mut RwLockWriteGuard<Vec<NetlinkTab
 }
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#572
 /// 内核套接字插入 nl_table
-fn netlink_insert(sk: Arc<dyn NetlinkSocket>, portid: u32) -> Result<(), SystemError> {
+fn netlink_insert(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, portid: u32) -> Result<(), SystemError> {
     let mut nl_table = NL_TABLE.write();
-    let index = Arc::clone(&sk).sk_protocol();
+    let index = sk.lock().sk_protocol();
    
 
     let nlk: Arc<LockedNetlinkSock> = Arc::clone(&sk).arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
@@ -306,9 +310,10 @@ fn netlink_insert(sk: Arc<dyn NetlinkSocket>, portid: u32) -> Result<(), SystemE
 // TODO: net namespace支持
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#532
 /// 在 netlink_table 中查找 netlink 套接字
-fn netlink_lookup(protocol:i32, portid:u32)-> Arc<dyn NetlinkSocket>{
+fn netlink_lookup(protocol:usize, portid:u32)-> Arc<Mutex<Box<dyn NetlinkSocket>>>{
+    // todo: net 支持
     let nl_table = NL_TABLE.read();
-    let index = protocol as usize;
+    let index = protocol;
     let sk = nl_table[index].hash.get(&portid).unwrap();
     Arc::clone(sk)
 }
@@ -324,7 +329,7 @@ pub enum Error {
 pub trait NetlinkSocket: Any + Send + Sync + Debug + CastFromSync {
     // fn sk_prot(&self) -> &dyn proto;
     fn sk_family(&self) -> i32;
-    fn sk_state(&self) -> i32;
+    fn sk_state(&self) -> NetlinkState;
     fn sk_protocol(&self) -> usize;
     fn sk_rmem_alloc(&self) -> usize;
     fn sk_rcvbuf(&self) -> usize;
@@ -338,12 +343,15 @@ pub trait NetlinkSocket: Any + Send + Sync + Debug + CastFromSync {
     fn ngroups(&self) -> u64;
     fn groups(&self) -> Vec<u64>;
     fn flags(&self) -> u32;
+    fn sock_sndtimeo(&self, noblock: bool) -> i64;
 }
+
 impl Clone for Box<dyn NetlinkSocket> {
     fn clone(&self) -> Box<dyn NetlinkSocket> {
         self.clone_box()
     }
 }
+
 /* linux：struct sock has to be the first member of netlink_sock */
 // linux 6.1.9中的netlink_sock结构体里，sock是一个很大的结构体，这里简化
 // 意义是netlink_sock（NetlinkSock）是一个sock（NetlinkSocket）
@@ -366,19 +374,21 @@ pub struct NetlinkSock {
     ngroups: u64,
     groups: Vec<u64>,
     bound: bool,
-    state: u64,
+    state: NetlinkState,
     max_recvmsg_len: usize,
     dump_done_errno: i32,
     cb_running: bool,
     queue: Vec<Arc<RwLock<SkBuff>>>,
+    sk_sndtimeo: i64,
+    sk_rcvtimeo: i64,
 }
 // TODO: 实现NetlinkSocket trait
 impl NetlinkSocket for NetlinkSock {
     fn sk_family(&self) -> i32 {
         0
     }
-    fn sk_state(&self) -> i32 {
-        0
+    fn sk_state(&self) -> NetlinkState {
+        return self.state
     }
     fn sk_protocol(&self) -> usize {
         0
@@ -423,6 +433,8 @@ impl NetlinkSocket for NetlinkSock {
             dump_done_errno: self.dump_done_errno,
             cb_running: self.cb_running,
             queue: self.queue.clone(),
+            sk_sndtimeo: self.sk_sndtimeo,
+            sk_rcvtimeo: self.sk_rcvtimeo,
         })
     }
     fn portid(&self) -> u32 {
@@ -436,6 +448,13 @@ impl NetlinkSocket for NetlinkSock {
     }
     fn flags(&self) -> u32 {
         0
+    }
+    fn sock_sndtimeo(&self, noblock: bool) -> i64{
+        if noblock == true{
+            return 0
+        }else{
+            return self.sk_sndtimeo;
+        }
     }
 }
 // impl PartialEq for NetlinkSock {
@@ -476,11 +495,13 @@ impl NetlinkSock {
             ngroups: 0,
             groups: Vec::new(),
             bound: false,
-            state: 0,
+            state: NetlinkState::NetlinkUnconnected,
             max_recvmsg_len: 0,
             dump_done_errno: 0,
             cb_running: false,
             queue: Vec::new(),
+            sk_sndtimeo: 0,
+            sk_rcvtimeo: 0,
         }
     }
     pub fn get_sk(&self) -> &Weak<dyn NetlinkSocket> {
@@ -836,7 +857,7 @@ fn netlink_broadcast_deliver(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, skb: &Arc<R
     let nlk: Arc<LockedNetlinkSock> = Arc::clone(&sk).arc_any().downcast().expect("Invalid downcast to LockedNetlinkSock");
     let nlk_guard = nlk.0.read();
     // 如果接收缓冲区的已分配内存小于或等于其总大小，并且套接字没有被标记为拥塞，则继续执行内部的代码块。
-    if (sk.lock().sk_rmem_alloc()<= sk.lock().sk_rcvbuf()) && !(nlk_guard.state == NETLINK_S_CONGESTED) {
+    if (sk.lock().sk_rmem_alloc()<= sk.lock().sk_rcvbuf()) && !(nlk_guard.state == NetlinkState::NETLINK_S_CONGESTED) {
         // 如果满足接收条件，则设置skb的所有者是该netlink套接字
         netlink_skb_set_owner_r(skb, sk.clone());
         // 将 skb 发送到该 netlink 套接字，实际也就是将该 skb 放入了该套接字的接收队列中
@@ -881,13 +902,158 @@ fn netlink_sendskb(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, skb: &Arc<RwLock<SkBu
     len
 }
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#1337
-/// 
-fn netlink_unicast(){
-
+/// 内核执行 netlink 单播消息
+/// ## 参数
+/// - ssk：源sock结构
+/// - skb: 属于发送方的承载了 netlink 消息的 skb
+/// - portid: 目的单播地址
+/// - nonblock    - 1：非阻塞调用，2：阻塞调用
+fn netlink_unicast(ssk: Arc<Mutex<Box<dyn NetlinkSocket>>>, skb: Arc<RwLock<SkBuff>>, portid:u32, nonblock: bool) ->Result<u32,SystemError> {
+	let mut err:i32;
+	let timeo:i64;
+    // todo：重新调整skb的大小
+	// skb = netlink_trim(skb, gfp_any());
+    // 计算发送超时时间(如果是非阻塞调用，则返回 0)
+	timeo = ssk.lock().sock_sndtimeo(nonblock);
+    loop {
+        // 根据源sock结构和目的单播地址，得到目的sock结构
+        let sk = netlink_getsockbyportid(ssk.clone(), portid);
+        if sk.is_err() {
+            drop(skb);
+            return Err(sk.err().unwrap());
+        }
+        let sk = sk.unwrap();
+    
+        if sk.lock().is_kernel() {
+            return Ok(netlink_unicast_kernel(sk, ssk, skb));
+        }
+    
+        if sk_filter(&sk, &skb) {
+            let err = skb.read().len;
+            drop(skb);
+            return Err(SystemError::EINVAL);
+        }
+    
+        err = netlink_attachskb(sk.clone(), skb.clone(), timeo, ssk.clone()).unwrap() as i32;
+        if err == 1 {
+            continue; // 重试
+        }
+        if err != 0 {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+	return Ok(netlink_sendskb(sk, &skb));
+    }
 }
 
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#1316
-///
-fn netlink_unicast_kernel(){
-    
+/// 来自用户进程的 netlink 消息 单播 发往内核 netlink 套接字
+/// ## 参数
+/// - sk：目的sock结构
+/// - skb：属于发送方的承载了netlink消息的skb
+/// - ssk：源sock结构
+/// ## 备注：
+/// - skb的所有者在本函数中发生了变化
+fn netlink_unicast_kernel(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, ssk: Arc<Mutex<Box<dyn NetlinkSocket>>>, skb: Arc<RwLock<SkBuff>>) -> u32{
+    let ret: u32;
+    let nlk: Arc<LockedNetlinkSock> = Arc::clone(&sk).arc_any().downcast().map_err(|_| SystemError::EINVAL).expect("Invalid downcast to LockedNetlinkSock");
+    let nlk_guard = nlk.0.read();
+	ret = ECONNREFUSED;
+    // 检查内核netlink套接字是否注册了netlink_rcv回调(就是各个协议在创建内核netlink套接字时通常会传入的input函数)
+	if (!nlk_guard.netlink_rcv().is_empty()) {
+		ret = skb.read().len;
+		netlink_skb_set_owner_r(&skb, sk);
+		// NETLINK_CB(skb).sk = ssk;
+		// todo: netlink_deliver_tap_kernel(sk, ssk, skb);
+		nlk_guard.netlink_rcv(skb);
+		consume_skb(skb);
+	} else {
+        // 如果指定的内核netlink套接字没有注册netlink_rcv回调，就直接丢弃所有收到的netlink消息
+		drop(skb);
+	}
+	return ret;
+}
+// https://code.dragonos.org.cn/s?refs=netlink_attachskb&project=linux-6.1.9
+/// 将一个指定skb绑定到一个指定的属于用户进程的netlink套接字上
+/// ## 参数
+/// - sk: 目的套接字
+/// - ssk: 源套接字
+/// - skb: 待绑定的skb
+/// - timeo: 超时时间
+/// ## 返回值
+/// - 小于0：表示错误，skb已经被释放，对套接字的引用也被释放。
+/// - 0：表示继续执行，skb可以被附加到套接字上。
+/// - 1：表示需要重新查找，可能因为等待超时或接收缓冲区不足。
+fn netlink_attachskb(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, skb: Arc<RwLock<SkBuff>>, timeo: i64, ssk: Arc<Mutex<Box<dyn NetlinkSocket>>>) -> Result<u64, SystemError> {
+
+    let nlk: Arc<LockedNetlinkSock> = Arc::clone(&sk).arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
+    let nlk_guard = nlk.0.read();
+    let ssk_option: Option<Arc<Mutex<Box<dyn NetlinkSocket>>>> = Some(ssk);
+
+    /* 
+        如果目的netlink套接字上已经接收尚未处理的数据大小超过了接收缓冲区大小，
+        或者目的netlink套接字被设置了拥挤标志，
+        意味着该sbk不能立即被目的netlink套接字接收，需要加入等待队列
+    */
+	if sk.lock().sk_rmem_alloc() > sk.lock().sk_rcvbuf() ||
+        nlk_guard.state == NetlinkState::NETLINK_S_CONGESTED {
+        // 申请一个等待队列
+        let mut wq = WaitQueue::default();
+        // 如果传入的超时时间为0, 意味着非阻塞调用，则丢弃这条 netlink 消息，并返回 EAGAIN
+		if timeo == 0 {
+            /* 如果该netlink消息对应的源sock结构不存在，或者该netlink消息来自kernel
+            * 则对目的netlink套接字设置缓冲区溢出状态
+            */
+			if ssk_option.is_none() || ssk.lock().is_kernel(){
+                netlink_overrun(&sk); }
+			drop(skb);
+			return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+		}
+        // 程序运行到这里意味着是阻塞调用
+        // 改变当前进程状态为可中断
+		// __set_current_state(TASK_INTERRUPTIBLE);
+        // todo: 将目的netlink套接字加入等待队列
+		// add_wait_queue(&nlk_guard.wait, &wait);
+        
+        // 程序到这里意味着被唤醒了
+        // 如果接收条件还是不满足，则要计算剩余的超时时间
+		if (sk.lock().sk_rmem_alloc() > sk.lock().sk_rcvbuf() ||
+        nlk_guard.state == NetlinkState::NETLINK_S_CONGESTED) &&
+        // todo: sock_flag
+		    sk.lock().flags() != SOCK_DEAD {
+            timeo = schedule_timeout(timeo)?;
+        }
+        // 改变当前进程状态为运行
+		// __set_current_state(TASK_RUNNING);
+        // 将目的 netlink 套接字从等待队列中删除
+		// remove_wait_queue(&nlk_guard.wait, &wait);
+
+        // todo: 如果在等待期间接收到信号
+		// if (signal_pending(current)) {
+		// 	drop(skb);
+		// 	return sock_intr_errno(*timeo);
+		// }
+		return Ok(1);
+	}
+	netlink_skb_set_owner_r(&skb, sk);
+	return Ok(0);
+}
+
+fn netlink_getsockbyportid(ssk: Arc<Mutex<Box<dyn NetlinkSocket>>>, portid: u32)-> Result<Arc<Mutex<Box<dyn NetlinkSocket>>>, SystemError> {
+
+	let sock: Arc<Mutex<Box<dyn NetlinkSocket>>> = netlink_lookup(ssk.lock().sk_protocol(), portid);
+	if Some(sock.clone()).is_none() {
+        return Err(SystemError::ECONNREFUSED);
+    }
+		
+	/* Don't bother queuing skb if kernel socket has no input function */
+	let nlk_sock: Arc<LockedNetlinkSock> = Arc::clone(&sock).arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
+    let nlk_sock_guard = nlk_sock.0.read();
+    let nlk_ssk: Arc<LockedNetlinkSock> = Arc::clone(&ssk).arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
+    let nlk_ssk_guard = nlk_ssk.0.read();
+	/* dst_portid and sk_state can be changed in netlink_connect() */
+	if sock.lock().sk_state() == NetlinkState::NetlinkUnconnected &&
+	    (nlk_sock_guard.dst_portid) != nlk_ssk_guard.portid {
+        return Err(SystemError::ECONNREFUSED);
+	}
+	return Ok(sock);
 }

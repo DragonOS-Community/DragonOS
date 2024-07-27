@@ -104,6 +104,13 @@ struct NLmsghdr {
 }
 
 const NLMSG_ALIGNTO: usize = 4;
+#[derive(Debug, PartialEq)]
+#[derive(Copy, Clone)]
+pub enum NetlinkState {
+    NetlinkUnconnected = 0,
+    NetlinkConnected,
+    NETLINK_S_CONGESTED = 2,
+}
 
 fn nlmsg_align(len: usize) -> usize {
     (len + NLMSG_ALIGNTO - 1) & !(NLMSG_ALIGNTO - 1)

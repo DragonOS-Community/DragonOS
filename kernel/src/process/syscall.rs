@@ -1,10 +1,7 @@
 use core::ffi::c_void;
 
-use alloc::{
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{ffi::CString, string::ToString, sync::Arc, vec::Vec};
+use log::error;
 use system_error::SystemError;
 
 use super::{
@@ -115,16 +112,16 @@ impl Syscall {
         }
 
         let x = || {
-            let path: String = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
-            let argv: Vec<String> = check_and_clone_cstr_array(argv)?;
-            let envp: Vec<String> = check_and_clone_cstr_array(envp)?;
+            let path: CString = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+            let argv: Vec<CString> = check_and_clone_cstr_array(argv)?;
+            let envp: Vec<CString> = check_and_clone_cstr_array(envp)?;
             Ok((path, argv, envp))
         };
-        let r: Result<(String, Vec<String>, Vec<String>), SystemError> = x();
-        if let Err(e) = r {
-            panic!("Failed to execve: {:?}", e);
-        }
-        let (path, argv, envp) = r.unwrap();
+        let (path, argv, envp) = x().inspect_err(|e: &SystemError| {
+            error!("Failed to execve: {:?}", e);
+        })?;
+
+        let path = path.into_string().map_err(|_| SystemError::EINVAL)?;
         ProcessManager::current_pcb()
             .basic_mut()
             .set_name(ProcessControlBlock::generate_name(&path, &argv));

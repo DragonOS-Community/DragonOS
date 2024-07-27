@@ -8,6 +8,7 @@ use core::{
 };
 
 use alloc::{
+    ffi::CString,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
@@ -937,11 +938,11 @@ impl ProcessControlBlock {
     }
 
     /// 生成进程的名字
-    pub fn generate_name(program_path: &str, args: &Vec<String>) -> String {
+    pub fn generate_name(program_path: &str, args: &Vec<CString>) -> String {
         let mut name = program_path.to_string();
         for arg in args {
             name.push(' ');
-            name.push_str(arg);
+            name.push_str(arg.to_string_lossy().as_ref());
         }
         return name;
     }

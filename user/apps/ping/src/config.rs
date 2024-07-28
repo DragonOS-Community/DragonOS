@@ -6,6 +6,8 @@ use std::{
 
 use crate::error;
 
+///# Config结构体
+/// 记录ping指令的一些参数值
 #[derive(Debug, Clone)]
 pub struct Config {
     pub count: u16,
@@ -18,6 +20,9 @@ pub struct Config {
     pub address: IpAddress,
 }
 
+///# 目标地址ip结构体
+/// ip负责提供给socket使用
+/// raw负责打印输出
 #[derive(Debug, Clone)]
 pub struct IpAddress {
     pub ip: net::IpAddr,

@@ -30,6 +30,8 @@ pub struct Ping {
 }
 
 impl Ping {
+    ///# ping创建函数
+    /// 使用config进行ping的配置
     pub fn new(config: Config) -> std::io::Result<Self> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))?;
         let src = SocketAddr::new(net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), 12345);
@@ -44,9 +46,10 @@ impl Ping {
             socket: Arc::new(socket),
         })
     }
-
+    ///# ping主要执行逻辑
+    /// 创建icmpPacket发送给socket
     pub fn ping(&self, seq_offset: u16) -> anyhow::Result<()> {
-        //create icmp request packet
+        //创建 icmp request packet
         let mut buf = vec![0; self.config.packet_size];
         let mut icmp = MutableEchoRequestPacket::new(&mut buf[..]).expect("InvalidBuffferSize");
         icmp.set_icmp_type(IcmpTypes::EchoRequest);
@@ -57,11 +60,11 @@ impl Ping {
 
         let start = Instant::now();
 
-        //send request
+        //发送 request
 
         self.socket.send_to(icmp.packet(), &self.dest.into())?;
 
-        //handle recv
+        //处理 recv
         let mut mem_buf =
             unsafe { &mut *(buf.as_mut_slice() as *mut [u8] as *mut [std::mem::MaybeUninit<u8>]) };
         let (size, _) = self.socket.recv_from(&mut mem_buf)?;
@@ -79,7 +82,8 @@ impl Ping {
 
         Ok(())
     }
-
+    ///# ping指令多线程运行
+    /// 创建多个线程负责不同的ping函数的执行
     pub fn run(&self) -> io::Result<()> {
         println!(
             "PING {}({})",
@@ -151,7 +155,7 @@ impl Ping {
     }
 }
 
-//创建一个进程用于监听用户是否提前退出程序
+/// # 创建一个进程用于监听用户是否提前退出程序
 fn signal_notify() -> std::io::Result<Receiver<i32>> {
     let (s, r) = bounded(1);
 

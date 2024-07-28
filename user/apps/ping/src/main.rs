@@ -6,6 +6,7 @@ mod args;
 mod config;
 mod error;
 mod ping;
+///# ping入口主函数
 fn main() {
     let args = Args::parse();
     match ping::Ping::new(args.as_config()) {

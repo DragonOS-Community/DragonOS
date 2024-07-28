@@ -1156,7 +1156,9 @@ impl Syscall {
         back_color: u32,
     ) -> Result<usize, SystemError> {
         // todo: 删除这个系统调用
-        let s = check_and_clone_cstr(s, Some(4096))?;
+        let s = check_and_clone_cstr(s, Some(4096))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
         let fr = (front_color & 0x00ff0000) >> 16;
         let fg = (front_color & 0x0000ff00) >> 8;
         let fb = front_color & 0x000000ff;

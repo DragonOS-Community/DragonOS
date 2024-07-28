@@ -7,14 +7,14 @@ use core::{
 };
 
 use alloc::sync::Arc;
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 use log::{error, info};
 use lru::LruCache;
 
 use crate::{
     arch::{interrupt::ipi::send_ipi, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
-    filesystem::vfs::file::PageCache,
+    filesystem::vfs::{file::PageCache, FilePrivateData},
     ipc::shm::ShmId,
     libs::{
         rwlock::RwLock,
@@ -58,25 +58,29 @@ pub fn page_manager_lock_irqsave() -> SpinLockGuard<'static, PageManager> {
 
 // 物理页管理器
 pub struct PageManager {
-    phys2page: LruCache<PhysAddr, Arc<Page>>,
+    phys2page: HashMap<PhysAddr, Arc<Page>>,
+    lru: LruCache<PhysAddr, Arc<Page>>,
 }
 
 impl PageManager {
     pub fn new() -> Self {
         Self {
-            phys2page: LruCache::unbounded(),
+            phys2page: HashMap::new(),
+            lru: LruCache::unbounded(),
         }
     }
 
     pub fn contains(&self, paddr: &PhysAddr) -> bool {
-        self.phys2page.peek(paddr).is_some()
+        self.phys2page.contains_key(paddr)
     }
 
     pub fn get(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
+        self.lru.promote(paddr);
         self.phys2page.get(paddr).cloned()
     }
 
     pub fn get_unwrap(&mut self, paddr: &PhysAddr) -> Arc<Page> {
+        self.lru.promote(paddr);
         self.phys2page
             .get(paddr)
             .unwrap_or_else(|| panic!("Phys Page not found, {:?}", paddr))
@@ -84,30 +88,60 @@ impl PageManager {
     }
 
     pub fn insert(&mut self, paddr: PhysAddr, page: &Arc<Page>) {
-        self.phys2page.put(paddr, page.clone());
+        self.phys2page.insert(paddr, page.clone());
+        if page.read().flags.contains(PageFlags::PG_LRU) {
+            self.lru.put(paddr, page.clone());
+        }
     }
 
     pub fn remove_page(&mut self, paddr: &PhysAddr) {
-        self.phys2page.pop(paddr);
+        self.phys2page.remove(paddr);
     }
 
-    pub fn shrink_list(&mut self) {
-        let entry = self.phys2page.peek_lru().unwrap();
-        let page = entry.1.clone();
-        let phys = *entry.0;
-        let page_cache = page.read().page_cache().unwrap();
-        for vma in page.read().anon_vma() {
-            let address_space = vma.lock().address_space().unwrap();
-            let address_space = address_space.upgrade().unwrap();
-            let mut guard = address_space.write();
-            let mapper = &mut guard.user_mapper.utable;
-            let virt = vma.lock().page_address(&page).unwrap();
-            unsafe {
-                mapper.unmap(virt, false).unwrap().flush();
+    pub fn shrink_list(&mut self, count: PageFrameCount) {
+        for _ in 0..count.data() {
+            let entry = self.lru.pop_lru().unwrap();
+            let page = entry.1.clone();
+            let page_cache = page.read().page_cache().unwrap();
+            for vma in page.read().anon_vma() {
+                let address_space = vma.lock().address_space().unwrap();
+                let address_space = address_space.upgrade().unwrap();
+                let mut guard = address_space.write();
+                let mapper = &mut guard.user_mapper.utable;
+                let virt = vma.lock().page_address(&page).unwrap();
+                unsafe {
+                    mapper.unmap(virt, false).unwrap().flush();
+                }
+            }
+            page_cache.remove_page(page.read().index().unwrap());
+            if page.read().flags.contains(PageFlags::PG_DIRTY) {
+                //TODO 回写页面
+                let inode = page
+                    .read()
+                    .page_cache
+                    .clone()
+                    .unwrap()
+                    .inode
+                    .clone()
+                    .unwrap()
+                    .upgrade()
+                    .unwrap();
+                inode
+                    .write_at(
+                        page.read().index().unwrap(),
+                        MMArch::PAGE_SIZE,
+                        unsafe {
+                            core::slice::from_raw_parts(
+                                MMArch::phys_2_virt(page.read().phys_addr).unwrap().data()
+                                    as *mut u8,
+                                MMArch::PAGE_SIZE,
+                            )
+                        },
+                        SpinLock::new(FilePrivateData::Unused).lock(),
+                    )
+                    .unwrap();
             }
         }
-        self.phys2page.pop(&phys);
-        page_cache.remove_page(page.read().index().unwrap());
     }
 }
 
@@ -269,6 +303,21 @@ impl InnerPage {
     #[inline(always)]
     pub fn flags(&self) -> &PageFlags {
         &self.flags
+    }
+
+    #[inline(always)]
+    pub fn set_flags(&mut self, flags: PageFlags) {
+        self.flags = flags
+    }
+
+    #[inline(always)]
+    pub fn add_flags(&mut self, flags: PageFlags) {
+        self.flags = self.flags.union(flags);
+    }
+
+    #[inline(always)]
+    pub fn remove_flags(&mut self, flags: PageFlags) {
+        self.flags = self.flags.difference(flags);
     }
 
     #[inline(always)]
@@ -623,7 +672,7 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
     ///
     /// - prot_flags: 页的保护标志
     /// - user: 用户空间是否可访问
-    pub fn from_prot_flags(prot_flags: ProtFlags, user: bool) -> EntryFlags<Arch> {
+    pub fn from_prot_flags(prot_flags: ProtFlags, user: bool) -> Self {
         let vm_flags = super::VmFlags::from(prot_flags);
         // let flags: EntryFlags<Arch> = EntryFlags::new()
         //     .set_user(user)

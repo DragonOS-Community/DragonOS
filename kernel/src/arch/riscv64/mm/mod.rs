@@ -283,36 +283,41 @@ impl MemoryManagementArch for RiscV64MMArch {
     const PAGE_READONLY: usize = 0;
     const PAGE_READONLY_EXEC: usize = 0;
 
-    const PROTECTION_MAP: [usize; 16] = protection_map();
+    const PROTECTION_MAP: [EntryFlags<MMArch>; 16] = protection_map();
 }
 
-const fn protection_map() -> [usize; 16] {
-    type Arch = RiscV64MMArch;
+const fn protection_map() -> [EntryFlags<MMArch>; 16] {
     let mut map = [0; 16];
-    map[VmFlags::VM_NONE.bits()] = Arch::PAGE_NONE;
-    map[VmFlags::VM_READ.bits()] = Arch::PAGE_READONLY;
-    map[VmFlags::VM_WRITE.bits()] = Arch::PAGE_COPY;
-    map[VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] = Arch::PAGE_COPY;
-    map[VmFlags::VM_EXEC.bits()] = Arch::PAGE_READONLY_EXEC;
-    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] = Arch::PAGE_READONLY_EXEC;
-    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] = Arch::PAGE_COPY_EXEC;
+    map[VmFlags::VM_NONE.bits()] = MMArch::PAGE_NONE;
+    map[VmFlags::VM_READ.bits()] = MMArch::PAGE_READONLY;
+    map[VmFlags::VM_WRITE.bits()] = MMArch::PAGE_COPY;
+    map[VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] = MMArch::PAGE_COPY;
+    map[VmFlags::VM_EXEC.bits()] = MMArch::PAGE_READONLY_EXEC;
+    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] = MMArch::PAGE_READONLY_EXEC;
+    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] = MMArch::PAGE_COPY_EXEC;
     map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
-        Arch::PAGE_COPY_EXEC;
-    map[VmFlags::VM_SHARED.bits()] = Arch::PAGE_NONE;
-    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_READ.bits()] = Arch::PAGE_READONLY;
-    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits()] = Arch::PAGE_SHARED;
+        MMArch::PAGE_COPY_EXEC;
+    map[VmFlags::VM_SHARED.bits()] = MMArch::PAGE_NONE;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_READ.bits()] = MMArch::PAGE_READONLY;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits()] = MMArch::PAGE_SHARED;
     map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
-        Arch::PAGE_SHARED;
-    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits()] = Arch::PAGE_READONLY_EXEC;
+        MMArch::PAGE_SHARED;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits()] = MMArch::PAGE_READONLY_EXEC;
     map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] =
-        Arch::PAGE_READONLY_EXEC;
+        MMArch::PAGE_READONLY_EXEC;
     map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] =
-        Arch::PAGE_SHARED_EXEC;
+        MMArch::PAGE_SHARED_EXEC;
     map[VmFlags::VM_SHARED.bits()
         | VmFlags::VM_EXEC.bits()
         | VmFlags::VM_WRITE.bits()
-        | VmFlags::VM_READ.bits()] = Arch::PAGE_SHARED_EXEC;
-    map
+        | VmFlags::VM_READ.bits()] = MMArch::PAGE_SHARED_EXEC;
+    let mut ret = [unsafe { EntryFlags::from_data(0) }; 16];
+    let mut index = 0;
+    while index < 16 {
+        ret[index] = unsafe { EntryFlags::from_data(map[index]) };
+        index += 1;
+    }
+    ret
 }
 
 const PAGE_ENTRY_BASE: usize = RiscV64MMArch::ENTRY_FLAG_PRESENT

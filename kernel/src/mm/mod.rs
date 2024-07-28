@@ -678,7 +678,7 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     //     map
     // }
 
-    const PROTECTION_MAP: [usize; 16];
+    const PROTECTION_MAP: [EntryFlags<Self>; 16];
 
     /// 页面保护标志转换函数
     /// ## 参数
@@ -689,13 +689,11 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     /// - EntryFlags: 页面的保护位
     fn vm_get_page_prot(vm_flags: VmFlags) -> EntryFlags<Self> {
         let map = Self::PROTECTION_MAP;
-        let mut ret = unsafe {
-            EntryFlags::from_data(
-                map[vm_flags.intersection(
-                    VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_EXEC | VmFlags::VM_SHARED,
-                )],
+        let mut ret = map[vm_flags
+            .intersection(
+                VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_EXEC | VmFlags::VM_SHARED,
             )
-        };
+            .bits()];
 
         #[cfg(target_arch = "x86_64")]
         {

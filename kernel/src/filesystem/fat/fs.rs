@@ -194,6 +194,8 @@ impl LockedFATInode {
             FileType::File
         };
 
+        let mut page_cache = PageCache::default();
+
         let inode: Arc<LockedFATInode> = Arc::new(LockedFATInode(SpinLock::new(FATInode {
             parent,
             self_ref: Weak::default(),
@@ -225,9 +227,19 @@ impl LockedFATInode {
             page_cache: Arc::new(PageCache::default()),
         })));
 
+        page_cache.inode = Some(Arc::downgrade(&inode) as Weak<dyn IndexNode>);
+
+        inode.0.lock().page_cache = Arc::new(page_cache);
+
         inode.0.lock().self_ref = Arc::downgrade(&inode);
 
         inode.0.lock().update_metadata();
+
+        // inode
+        //     .0
+        //     .lock()
+        //     .page_cache
+        //     .set_inode(Arc::downgrade(&inode) as Weak<dyn IndexNode>);
 
         return inode;
     }

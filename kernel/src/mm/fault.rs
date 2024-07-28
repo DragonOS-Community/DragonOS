@@ -633,6 +633,7 @@ impl PageFaultHandler {
             let page = Arc::new(Page::new(false, new_cache_page));
             pfm.page = Some(page.clone());
 
+            page.write().add_flags(PageFlags::PG_LRU);
             page_manager_guard.insert(new_cache_page, &page);
             page_cache.add_page(file_pgoff, &page);
 
@@ -677,19 +678,28 @@ impl PageFaultHandler {
                 MMArch::PAGE_SIZE,
             );
 
-            let vma = pfm.vma();
-            let vma_guard = vma.lock();
-            let file = vma_guard.vm_file().expect("no vm_file in vma");
-            let page_cache = file.inode().page_cache().unwrap();
+            let mut page_manager_guard = page_manager_lock_irqsave();
             let page_guard = cache_page.read();
             let new_page = Arc::new(Page::new(page_guard.shared(), new_phys));
-            page_cache.add_page(pfm.file_pgoff.unwrap(), &new_page);
+
+            // 新页加入页管理器中
+            page_manager_guard.insert(new_phys, &new_page);
             new_page
                 .write()
                 .set_page_cache_index(cache_page.read().page_cache(), cache_page.read().index());
+
+            // 将vma插入页的vma链表中
+            new_page.write().insert_vma(pfm.vma());
         } else {
             // 直接映射到PageCache
             mapper.map_phys(*pfm.address(), page_phys, vma_guard.flags());
+
+            if pfm.flags().contains(FaultFlags::FAULT_FLAG_WRITE)
+                && pfm.vma().lock().vm_flags().contains(VmFlags::VM_SHARED)
+            {
+                // 如果是共享写映射，将pagecache页设为脏页，以便回收时能够回写
+                cache_page.write().add_flags(PageFlags::PG_DIRTY)
+            }
         }
         VmFaultReason::VM_FAULT_COMPLETED
     }

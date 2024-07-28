@@ -353,7 +353,7 @@ impl MemoryManagementArch for X86_64MMArch {
     //     map
     // }
 
-    const PROTECTION_MAP: [usize; 16] = protection_map();
+    const PROTECTION_MAP: [EntryFlags<MMArch>; 16] = protection_map();
 
     const PAGE_NONE: usize =
         Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_ACCESSED | Self::ENTRY_FLAG_GLOBAL;
@@ -402,33 +402,39 @@ impl MemoryManagementArch for X86_64MMArch {
 ///
 /// ## 返回值
 /// - `[usize; 16]`: 长度为16的映射表
-const fn protection_map() -> [usize; 16] {
-    type Arch = X86_64MMArch;
-    let mut map = [0; 16];
-    map[VmFlags::VM_NONE.bits()] = Arch::PAGE_NONE;
-    map[VmFlags::VM_READ.bits()] = Arch::PAGE_READONLY;
-    map[VmFlags::VM_WRITE.bits()] = Arch::PAGE_COPY;
-    map[VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] = Arch::PAGE_COPY;
-    map[VmFlags::VM_EXEC.bits()] = Arch::PAGE_READONLY_EXEC;
-    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] = Arch::PAGE_READONLY_EXEC;
-    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] = Arch::PAGE_COPY_EXEC;
-    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
-        Arch::PAGE_COPY_EXEC;
-    map[VmFlags::VM_SHARED.bits()] = X86_64MMArch::PAGE_NONE;
-    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_READ.bits()] = Arch::PAGE_READONLY;
-    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits()] = Arch::PAGE_SHARED;
-    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
-        Arch::PAGE_SHARED;
-    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits()] = Arch::PAGE_READONLY_EXEC;
-    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] =
-        Arch::PAGE_READONLY_EXEC;
-    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] =
-        Arch::PAGE_SHARED_EXEC;
-    map[VmFlags::VM_SHARED.bits()
-        | VmFlags::VM_EXEC.bits()
-        | VmFlags::VM_WRITE.bits()
-        | VmFlags::VM_READ.bits()] = Arch::PAGE_SHARED_EXEC;
-
+const fn protection_map() -> [EntryFlags<MMArch>; 16] {
+    let mut map = [unsafe { EntryFlags::from_data(0) }; 16];
+    unsafe {
+        map[VmFlags::VM_NONE.bits()] = EntryFlags::from_data(MMArch::PAGE_NONE);
+        map[VmFlags::VM_READ.bits()] = EntryFlags::from_data(MMArch::PAGE_READONLY);
+        map[VmFlags::VM_WRITE.bits()] = EntryFlags::from_data(MMArch::PAGE_COPY);
+        map[VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_COPY);
+        map[VmFlags::VM_EXEC.bits()] = EntryFlags::from_data(MMArch::PAGE_READONLY_EXEC);
+        map[VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_READONLY_EXEC);
+        map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_COPY_EXEC);
+        map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_COPY_EXEC);
+        map[VmFlags::VM_SHARED.bits()] = EntryFlags::from_data(MMArch::PAGE_NONE);
+        map[VmFlags::VM_SHARED.bits() | VmFlags::VM_READ.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_READONLY);
+        map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_SHARED);
+        map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_SHARED);
+        map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_READONLY_EXEC);
+        map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_READONLY_EXEC);
+        map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_SHARED_EXEC);
+        map[VmFlags::VM_SHARED.bits()
+            | VmFlags::VM_EXEC.bits()
+            | VmFlags::VM_WRITE.bits()
+            | VmFlags::VM_READ.bits()] = EntryFlags::from_data(MMArch::PAGE_SHARED_EXEC);
+    }
     // if X86_64MMArch::is_xd_reserved() {
     //     map.iter_mut().for_each(|x| *x &= !Self::ENTRY_FLAG_NO_EXEC)
     // }
@@ -734,13 +740,21 @@ impl FrameAllocator for LockedFrameAllocator {
     unsafe fn allocate(&mut self, mut count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         count = count.next_power_of_two();
         if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
-            // 首次分配时内存不足
-            allocator.allocate(count).or_else(|| {
+            let usage = self.usage();
+            if usage.used().data() + count.data() > usage.total().data() / 2 {
+                log::info!("shrink: {:?}", usage);
                 let mut page_manager_guard = page_manager_lock_irqsave();
-                // 释放部分页面并再次尝试分配
-                page_manager_guard.shrink_list();
-                return allocator.allocate(count);
-            })
+                // 释放部分页面
+                page_manager_guard.shrink_list(count);
+            }
+            allocator.allocate(count)
+            // // 首次分配时内存不足
+            // allocator.allocate(count).or_else(|| {
+            //     let mut page_manager_guard = page_manager_lock_irqsave();
+            //     // 释放部分页面并再次尝试分配
+            //     page_manager_guard.shrink_list(count);
+            //     return allocator.allocate(count);
+            // })
         } else {
             return None;
         }

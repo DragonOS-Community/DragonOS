@@ -125,6 +125,7 @@ impl FileMode {
 #[allow(dead_code)]
 pub struct PageCache {
     xarray: SpinLock<XArray<Arc<Page>>>,
+    pub inode: Option<Weak<dyn IndexNode>>,
 }
 
 impl core::fmt::Debug for PageCache {
@@ -144,9 +145,10 @@ impl core::fmt::Debug for PageCache {
 }
 
 impl PageCache {
-    pub fn new() -> PageCache {
+    pub fn new(inode: Option<Weak<dyn IndexNode>>) -> PageCache {
         Self {
             xarray: SpinLock::new(XArray::new()),
+            inode,
         }
     }
 
@@ -169,6 +171,10 @@ impl PageCache {
         cursor.remove();
     }
 
+    pub fn set_inode(&mut self, inode: Weak<dyn IndexNode>) {
+        self.inode = Some(inode)
+    }
+
     // pub fn get_pages(&self, start_pgoff: usize, end_pgoff: usize) -> Vec<Arc<Page>> {
     //     let mut vec = Vec::new();
     //     for pgoff in start_pgoff..=end_pgoff {
@@ -182,13 +188,8 @@ impl PageCache {
 
 impl Default for PageCache {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
-}
-
-pub trait PageCacheOperations: IndexNode {
-    fn write_page(&self, page: Page);
-    fn read_ahead(&self);
 }
 
 /// @brief 抽象文件结构体

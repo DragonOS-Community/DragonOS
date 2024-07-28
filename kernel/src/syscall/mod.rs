@@ -1121,6 +1121,16 @@ impl Syscall {
             }
             #[cfg(target_arch = "x86_64")]
             SYS_UTIMES => Self::sys_utimes(args[0] as *const u8, args[1] as *const PosixTimeval),
+            #[cfg(target_arch = "x86_64")]
+            SYS_EVENTFD => {
+                let initval = args[0] as u32;
+                Self::sys_eventfd(initval, 0)
+            }
+            SYS_EVENTFD2 => {
+                let initval = args[0] as u32;
+                let flags = args[1] as u32;
+                Self::sys_eventfd(initval, flags)
+            }
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 
@@ -1140,7 +1150,9 @@ impl Syscall {
         back_color: u32,
     ) -> Result<usize, SystemError> {
         // todo: 删除这个系统调用
-        let s = check_and_clone_cstr(s, Some(4096))?;
+        let s = check_and_clone_cstr(s, Some(4096))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
         let fr = (front_color & 0x00ff0000) >> 16;
         let fg = (front_color & 0x0000ff00) >> 8;
         let fb = front_color & 0x000000ff;

@@ -2,7 +2,8 @@ use core::{intrinsics::size_of, ptr};
 
 use core::sync::atomic::compiler_fence;
 
-use crate::mm::phys_2_virt;
+use crate::arch::MMArch;
+use crate::mm::{MemoryManagementArch, PhysAddr};
 
 /// 文件说明: 实现了 AHCI 中的控制器 HBA 的相关行为
 
@@ -43,6 +44,7 @@ pub enum HbaPortType {
 
 /// 声明了 HBA 的所有属性
 #[repr(packed)]
+#[allow(dead_code)]
 pub struct HbaPort {
     pub clb: u64,         // 0x00, command list base address, 1K-byte aligned
     pub fb: u64,          // 0x08, FIS base address, 256-byte aligned
@@ -65,6 +67,7 @@ pub struct HbaPort {
 
 /// 全称 HBA Memory Register，是HBA的寄存器在内存中的映射
 #[repr(packed)]
+#[allow(dead_code)]
 pub struct HbaMem {
     pub cap: u32,             // 0x00, Host capability
     pub ghc: u32,             // 0x04, Global host control
@@ -94,6 +97,7 @@ pub struct HbaPrdtEntry {
 /// HAB Command Table
 /// 每个 Port 一个 Table，主机和设备的交互都靠这个数据结构
 #[repr(packed)]
+#[allow(dead_code)]
 pub struct HbaCmdTable {
     // 0x00
     pub cfis: [u8; 64], // Command FIS
@@ -195,7 +199,13 @@ impl HbaPort {
 
         unsafe {
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            ptr::write_bytes(phys_2_virt(clb as usize) as *mut u64, 0, 1024);
+            ptr::write_bytes(
+                MMArch::phys_2_virt(PhysAddr::new(clb as usize))
+                    .unwrap()
+                    .data() as *mut u64,
+                0,
+                1024,
+            );
         }
 
         // 赋值 fis base address
@@ -204,20 +214,36 @@ impl HbaPort {
         volatile_write!(self.fb, fb);
         unsafe {
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            ptr::write_bytes(phys_2_virt(fb as usize) as *mut u64, 0, 256);
+            ptr::write_bytes(
+                MMArch::phys_2_virt(PhysAddr::new(fb as usize))
+                    .unwrap()
+                    .data() as *mut u64,
+                0,
+                256,
+            );
         }
 
         // 赋值 command table base address
         // Command table offset: 40K + 8K*portno
         // Command table size = 256*32 = 8K per port
-        let mut cmdheaders = phys_2_virt(clb as usize) as *mut u64 as *mut HbaCmdHeader;
+        let mut cmdheaders = unsafe {
+            MMArch::phys_2_virt(PhysAddr::new(clb as usize))
+                .unwrap()
+                .data()
+        } as *mut u64 as *mut HbaCmdHeader;
         for ctbas_value in ctbas.iter().take(32) {
             volatile_write!((*cmdheaders).prdtl, 0); // 一开始没有询问，prdtl = 0（预留了8个PRDT项的空间）
             volatile_write!((*cmdheaders).ctba, *ctbas_value);
             // 这里限制了 prdtl <= 8, 所以一共用了256bytes，如果需要修改，可以修改这里
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
             unsafe {
-                ptr::write_bytes(phys_2_virt(*ctbas_value as usize) as *mut u64, 0, 256);
+                ptr::write_bytes(
+                    MMArch::phys_2_virt(PhysAddr::new(*ctbas_value as usize))
+                        .unwrap()
+                        .data() as *mut u64,
+                    0,
+                    256,
+                );
             }
             cmdheaders = (cmdheaders as usize + size_of::<HbaCmdHeader>()) as *mut HbaCmdHeader;
         }
@@ -262,6 +288,7 @@ pub enum FisType {
 }
 
 #[repr(packed)]
+#[allow(dead_code)]
 pub struct FisRegH2D {
     // DWORD 0
     pub fis_type: u8, // FIS_TYPE_REG_H2D

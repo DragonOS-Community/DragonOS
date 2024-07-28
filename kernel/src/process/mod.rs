@@ -1,4 +1,5 @@
 use core::{
+    fmt,
     hash::Hash,
     hint::spin_loop,
     intrinsics::{likely, unlikely},
@@ -7,6 +8,7 @@ use core::{
 };
 
 use alloc::{
+    ffi::CString,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
@@ -512,9 +514,9 @@ pub unsafe fn switch_finish_hook() {
 
 int_like!(Pid, AtomicPid, usize, AtomicUsize);
 
-impl ToString for Pid {
-    fn to_string(&self) -> String {
-        self.0.to_string()
+impl fmt::Display for Pid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -921,11 +923,11 @@ impl ProcessControlBlock {
     }
 
     /// 生成进程的名字
-    pub fn generate_name(program_path: &str, args: &Vec<String>) -> String {
+    pub fn generate_name(program_path: &str, args: &Vec<CString>) -> String {
         let mut name = program_path.to_string();
         for arg in args {
             name.push(' ');
-            name.push_str(arg);
+            name.push_str(arg.to_string_lossy().as_ref());
         }
         return name;
     }
@@ -1142,6 +1144,7 @@ pub struct ProcessSchedulerInfo {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct SchedInfo {
     /// 记录任务在特定 CPU 上运行的次数
     pub pcount: usize,
@@ -1154,6 +1157,7 @@ pub struct SchedInfo {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct PrioData {
     pub prio: i32,
     pub static_prio: i32,

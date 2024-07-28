@@ -8,6 +8,7 @@ use super::serio_bus;
 /// 串行设备，实现该trait的设备实例挂载在serio总线上，同时应该实现Device trait
 ///
 /// 参考: https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/serio.h#20
+#[allow(dead_code)]
 pub trait SerioDevice: Device {
     /// # 函数功能
     ///

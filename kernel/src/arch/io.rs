@@ -1,4 +1,5 @@
 /// 每个架构都需要实现的IO接口
+#[allow(unused)]
 pub trait PortIOArch {
     unsafe fn in8(port: u16) -> u8;
     unsafe fn in16(port: u16) -> u16;

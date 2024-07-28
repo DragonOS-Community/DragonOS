@@ -1,0 +1,23 @@
+{
+  "name": "test_eventfd",
+  "version": "0.1.0",
+  "description": "test_eventfd",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "apps/test_eventfd"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "install": {
+    "in_dragonos_path": "/bin"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "target_arch": ["x86_64"]
+}

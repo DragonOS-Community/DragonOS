@@ -179,6 +179,7 @@ bitflags! {
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn irq_msi_compose_msg(cfg: &HardwareIrqConfig, msg: &mut MsiMsg, dmar: bool) {
     *msg = MsiMsg::new_zeroed();
 

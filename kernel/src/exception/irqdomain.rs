@@ -644,6 +644,7 @@ pub enum IrqDomainBusToken {
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irqdomain.h#107
 pub trait IrqDomainOps: Debug + Send + Sync {
     /// 匹配一个中断控制器设备节点到一个主机。
+    #[allow(dead_code)]
     fn match_node(
         &self,
         _irq_domain: &Arc<IrqDomain>,
@@ -667,6 +668,7 @@ pub trait IrqDomainOps: Debug + Send + Sync {
     }
 
     /// 删除一个虚拟中断号与一个硬件中断号之间的映射。
+    #[allow(dead_code)]
     fn unmap(&self, irq_domain: &Arc<IrqDomain>, virq: IrqNumber);
 
     fn activate(

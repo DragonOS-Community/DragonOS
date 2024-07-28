@@ -1,6 +1,6 @@
 use core::{fmt::Debug, ptr::null};
 
-use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, ffi::CString, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
@@ -15,6 +15,8 @@ use crate::{
         VirtAddr,
     },
 };
+
+use super::ProcessManager;
 
 /// 系统支持的所有二进制文件加载器的列表
 const BINARY_LOADERS: [&'static dyn BinaryLoader; 1] = [&ELF_LOADER];
@@ -125,7 +127,7 @@ impl ExecParam {
             file,
             vm,
             flags,
-            init_info: ProcInitInfo::new(),
+            init_info: ProcInitInfo::new(ProcessManager::current_pcb().basic().name()),
         })
     }
 
@@ -195,16 +197,16 @@ pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, Sys
 /// 程序初始化信息，这些信息会被压入用户栈中
 #[derive(Debug)]
 pub struct ProcInitInfo {
-    pub proc_name: String,
-    pub args: Vec<String>,
-    pub envs: Vec<String>,
+    pub proc_name: CString,
+    pub args: Vec<CString>,
+    pub envs: Vec<CString>,
     pub auxv: BTreeMap<u8, usize>,
 }
 
 impl ProcInitInfo {
-    pub fn new() -> Self {
+    pub fn new(proc_name: &str) -> Self {
         Self {
-            proc_name: String::new(),
+            proc_name: CString::new(proc_name).unwrap_or(CString::new("").unwrap()),
             args: Vec::new(),
             envs: Vec::new(),
             auxv: BTreeMap::new(),
@@ -229,17 +231,16 @@ impl ProcInitInfo {
             .envs
             .iter()
             .map(|s| {
-                self.push_str(ustack, s.as_str()).expect("push_str failed");
+                self.push_str(ustack, s).expect("push_str failed");
                 ustack.sp()
             })
             .collect::<Vec<_>>();
-
         // 然后把参数压入栈中
         let argps = self
             .args
             .iter()
             .map(|s| {
-                self.push_str(ustack, s.as_str()).expect("push_str failed");
+                self.push_str(ustack, s).expect("push_str failed");
                 ustack.sp()
             })
             .collect::<Vec<_>>();
@@ -280,9 +281,9 @@ impl ProcInitInfo {
         return Ok(());
     }
 
-    fn push_str(&self, ustack: &mut UserStack, s: &str) -> Result<(), SystemError> {
-        self.push_slice(ustack, &[b'\0'])?;
-        self.push_slice(ustack, s.as_bytes())?;
+    fn push_str(&self, ustack: &mut UserStack, s: &CString) -> Result<(), SystemError> {
+        let bytes = s.as_bytes_with_nul();
+        self.push_slice(ustack, bytes)?;
         return Ok(());
     }
 }

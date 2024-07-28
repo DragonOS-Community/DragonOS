@@ -20,7 +20,7 @@ registry = \"https://github.com/rust-lang/crates.io-index\"  \n \
 replace-with = 'tuna' \n \
 [source.tuna] \n \
 registry = \"sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/\"	 \n \
-" > ~/.cargo/config
+" > ~/.cargo/config.toml
 else
         echo -e "[source.crates-io]   \n \
 registry = \"https://github.com/rust-lang/crates.io-index\"  \n \
@@ -28,6 +28,6 @@ registry = \"https://github.com/rust-lang/crates.io-index\"  \n \
 replace-with = 'tuna' \n \
 [source.tuna] \n \
 registry = \"https://mirrors.tuna.tsinghua.edu.cn/git/crates.io-index.git\"	 \n \
-" > ~/.cargo/config
+" > ~/.cargo/config.toml
 
 fi

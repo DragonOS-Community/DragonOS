@@ -29,10 +29,11 @@ use alloc::{boxed::Box, vec::Vec};
 use crate::net::socket::{AddressFamily, Socket};
 use lazy_static::lazy_static;
 
+use super::callback::NetlinkCallback;
 use super::netlink::{NETLINK_USERSOCK, NL_CFG_F_NONROOT_SEND};
 use super::netlink_proto::{proto_register, Proto, NETLINK_PROTO};
 use super::skbuff::{netlink_overrun, skb_orphan, skb_shared};
-
+use super::sock::SockFlags;
 use crate::init::initcall::INITCALL_CORE;
 use crate::net::socket::netlink::netlink::NetlinkState;
 // Flags constants
@@ -336,7 +337,7 @@ pub trait NetlinkSocket: Any + Send + Sync + Debug + CastFromSync {
     fn portid(&self) -> u32;
     fn ngroups(&self) -> u64;
     fn groups(&self) -> Vec<u64>;
-    fn flags(&self) -> u32;
+    fn flags(&self) -> Option<SockFlags>;
     fn sock_sndtimeo(&self, noblock: bool) -> i64;
 }
 
@@ -375,6 +376,7 @@ pub struct NetlinkSock {
     queue: Vec<Arc<RwLock<SkBuff>>>,
     sk_sndtimeo: i64,
     sk_rcvtimeo: i64,
+    callback: Option<&'static dyn NetlinkCallback>,
 }
 // TODO: 实现NetlinkSocket trait
 impl NetlinkSocket for NetlinkSock {
@@ -429,6 +431,7 @@ impl NetlinkSocket for NetlinkSock {
             queue: self.queue.clone(),
             sk_sndtimeo: self.sk_sndtimeo,
             sk_rcvtimeo: self.sk_rcvtimeo,
+            callback: None,
         })
     }
     fn portid(&self) -> u32 {
@@ -440,8 +443,8 @@ impl NetlinkSocket for NetlinkSock {
     fn groups(&self) -> Vec<u64> {
         Vec::new()
     }
-    fn flags(&self) -> u32 {
-        0
+    fn flags(&self) -> Option<SockFlags> {
+        Some(SockFlags::SockDead)
     }
     fn sock_sndtimeo(&self, noblock: bool) -> i64{
         if noblock == true{
@@ -451,31 +454,6 @@ impl NetlinkSocket for NetlinkSock {
         }
     }
 }
-// impl PartialEq for NetlinkSock {
-//     fn eq(&self, other: &Self) -> bool {
-//         if let Some(self_sk) = self.sk.as_ref().unwrap().upgrade() {
-//            if let Some(other_sk) = other.sk.as_ref() {
-//                self_sk.equals(other_sk.upgrade())
-//            } else {
-//                false
-//            }
-//         } else {
-//             false
-//         }
-//     }
-// }
-// impl Deref for NetlinkSock {
-//     type Target = Arc<dyn NetlinkSocket>;
-
-//     fn deref(&self) -> &Self::Target {
-//         self.sk.as_ref().unwrap().upgrade().unwrap().deref()
-//     }
-// }
-// impl DerefMut for NetlinkSock {
-//     fn deref_mut(&mut self) -> &mut Self::Target {
-//         self.sk.as_ref().unwrap().upgrade()
-//     }
-// }
 impl NetlinkSock {
     pub fn new() -> NetlinkSock {
         NetlinkSock {
@@ -496,6 +474,7 @@ impl NetlinkSock {
             queue: Vec::new(),
             sk_sndtimeo: 0,
             sk_rcvtimeo: 0,
+            callback: None,
         }
     }
     pub fn get_sk(&self) -> &Weak<dyn NetlinkSocket> {
@@ -626,18 +605,18 @@ impl NetlinkSock {
 
 
 
-struct callback_head {
-    next: Option<Box<callback_head>>,
-}
+// struct callback_head {
+//     next: Option<Box<callback_head>>,
+// }
 
-impl callback_head {
-    fn next(&self) -> &Option<Box<callback_head>> {
-        &self.next
-    }
-    fn func(&self) -> Option<Box<dyn Fn() -> i32>> {
-        None
-    }
-}
+// impl callback_head {
+//     fn next(&self) -> &Option<Box<callback_head>> {
+//         &self.next
+//     }
+//     fn func(&self) -> Option<Box<dyn Fn() -> i32>> {
+//         None
+//     }
+// }
 #[derive(Clone)]
 struct listeners {
     // Recursive Wakeup Unlocking?
@@ -739,7 +718,7 @@ fn do_one_broadcast(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, info: &mut Box<Netli
     if info.skb_2.read().is_empty() {
         netlink_overrun(&sk);
         info.failure = 1;
-        if !sk.lock().flags().is_zero() & !NetlinkFlags::BROADCAST_SEND_ERROR.bits().is_zero() {
+        if !sk.lock().flags().is_none() & !NetlinkFlags::BROADCAST_SEND_ERROR.bits().is_zero() {
             info.delivery_failure = 1;
         }
         return Err(SystemError::EINVAL);
@@ -757,7 +736,7 @@ fn do_one_broadcast(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, info: &mut Box<Netli
     // 如果将承载了组播消息的 skb 发送到该用户进程 netlink 套接字失败
     if ret < 0 {
         netlink_overrun(&sk);
-        if !sk.lock().flags().is_zero() & !NetlinkFlags::BROADCAST_SEND_ERROR.bits().is_zero() {
+        if !sk.lock().flags().is_none() & !NetlinkFlags::BROADCAST_SEND_ERROR.bits().is_zero() {
             info.delivery_failure = 1;
         }
     } else {
@@ -948,18 +927,18 @@ fn netlink_unicast(ssk: Arc<Mutex<Box<dyn NetlinkSocket>>>, skb: Arc<RwLock<SkBu
 /// ## 备注：
 /// - skb的所有者在本函数中发生了变化
 fn netlink_unicast_kernel(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, ssk: Arc<Mutex<Box<dyn NetlinkSocket>>>, skb: Arc<RwLock<SkBuff>>) -> u32{
-    let ret: u32;
+    let mut ret: u32;
     let nlk: Arc<LockedNetlinkSock> = Arc::clone(&sk).arc_any().downcast().map_err(|_| SystemError::EINVAL).expect("Invalid downcast to LockedNetlinkSock");
     let nlk_guard = nlk.0.read();
 	ret = ECONNREFUSED;
     // 检查内核netlink套接字是否注册了netlink_rcv回调(就是各个协议在创建内核netlink套接字时通常会传入的input函数)
-	if !nlk_guard.netlink_rcv().is_empty() {
+	if !nlk_guard.callback.is_none() {
 		ret = skb.read().len;
 		netlink_skb_set_owner_r(&skb, sk);
 		// NETLINK_CB(skb).sk = ssk;
 		// todo: netlink_deliver_tap_kernel(sk, ssk, skb);
-		nlk_guard.netlink_rcv(skb);
-		consume_skb(skb);
+		nlk_guard.callback.unwrap().netlink_rcv(skb.clone());
+		drop(skb);
 	} else {
         // 如果指定的内核netlink套接字没有注册netlink_rcv回调，就直接丢弃所有收到的netlink消息
 		drop(skb);
@@ -977,11 +956,11 @@ fn netlink_unicast_kernel(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, ssk: Arc<Mutex
 /// - 小于0：表示错误，skb已经被释放，对套接字的引用也被释放。
 /// - 0：表示继续执行，skb可以被附加到套接字上。
 /// - 1：表示需要重新查找，可能因为等待超时或接收缓冲区不足。
-fn netlink_attachskb(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, skb: Arc<RwLock<SkBuff>>, timeo: i64, ssk: Arc<Mutex<Box<dyn NetlinkSocket>>>) -> Result<u64, SystemError> {
+fn netlink_attachskb(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, skb: Arc<RwLock<SkBuff>>, mut timeo: i64, ssk: Arc<Mutex<Box<dyn NetlinkSocket>>>) -> Result<u64, SystemError> {
 
     let nlk: Arc<LockedNetlinkSock> = Arc::clone(&sk).arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
     let nlk_guard = nlk.0.read();
-    let ssk_option: Option<Arc<Mutex<Box<dyn NetlinkSocket>>>> = Some(ssk);
+    let ssk_option: Option<Arc<Mutex<Box<dyn NetlinkSocket>>>> = Some(ssk.clone());
 
     /* 
         如果目的netlink套接字上已经接收尚未处理的数据大小超过了接收缓冲区大小，
@@ -1013,7 +992,7 @@ fn netlink_attachskb(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, skb: Arc<RwLock<SkB
 		if (sk.lock().sk_rmem_alloc() > sk.lock().sk_rcvbuf() ||
         nlk_guard.state == NetlinkState::NETLINK_S_CONGESTED) &&
         // todo: sock_flag
-		    sk.lock().flags() != SOCK_DEAD {
+		    sk.lock().flags() != Some(SockFlags::SockDead) {
             timeo = schedule_timeout(timeo)?;
         }
         // 改变当前进程状态为运行

@@ -68,21 +68,7 @@ pub static UEVENT_SUPPRESS: i32 = 1;
 
 // to be adjust
 pub const BUFFERSIZE: usize = 666;
-#[derive(Debug)]
-pub struct ListHead {
-    next: Option<Box<ListHead>>,
-    prev: Option<Box<ListHead>>,
-}
-// static const char *kobject_actions[] = {
-// 	[KOBJ_ADD] =		"add",
-// 	[KOBJ_REMOVE] =		"remove",
-// 	[KOBJ_CHANGE] =		"change",
-// 	[KOBJ_MOVE] =		"move",
-// 	[KOBJ_ONLINE] =		"online",
-// 	[KOBJ_OFFLINE] =	"offline",
-// 	[KOBJ_BIND] =		"bind",
-// 	[KOBJ_UNBIND] =		"unbind",
-// };
+
 
 /*
  kobject_uevent_env，以envp为环境变量，上报一个指定action的uevent。环境变量的作用是为执行用户空间程序指定运行环境。具体动作如下：

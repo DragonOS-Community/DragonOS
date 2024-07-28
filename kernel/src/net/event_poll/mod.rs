@@ -436,6 +436,7 @@ impl EventPoll {
             }
             // 判断epoll上有没有就绪事件
             let mut available = epoll_guard.ep_events_available();
+
             drop(epoll_guard);
             loop {
                 if available {
@@ -759,6 +760,7 @@ impl EventPoll {
 /// 与C兼容的Epoll事件结构体
 #[derive(Copy, Clone, Default)]
 #[repr(packed)]
+#[repr(C)]
 pub struct EPollEvent {
     /// 表示触发的事件
     events: u32,
@@ -870,5 +872,8 @@ bitflags! {
 
         /// 表示epoll已经被释放，但是在目前的设计中未用到
         const POLLFREE = 0x4000;
+
+        /// listen状态的socket可以接受连接
+        const EPOLL_LISTEN_CAN_ACCEPT = Self::EPOLLIN.bits | Self::EPOLLRDNORM.bits;
     }
 }

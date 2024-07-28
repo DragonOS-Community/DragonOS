@@ -27,7 +27,7 @@ pub struct IpAddress {
 impl IpAddress {
     pub fn parse(host: &str) -> anyhow::Result<Self> {
         let raw = String::from(host);
-        let opt = "127.0.0.1".parse::<net::IpAddr>().ok();
+        let opt = host.parse::<net::IpAddr>().ok();
         match opt {
             Some(ip) => Ok(Self { ip, raw }),
             None => {

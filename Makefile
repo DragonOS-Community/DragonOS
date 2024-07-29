@@ -156,14 +156,14 @@ log-monitor:
 .PHONY: update-submodules
 update-submodules:
 	@echo "更新子模块"
-	@git submodule update --recursive
+	@git submodule update --recursive --init
 	@git submodule foreach git pull origin master
 
 .PHONY: update-submodules-by-mirror
 update-submodules-by-mirror:
 	@echo "从镜像更新子模块"
 	@git config --global url."https://git.mirrors.dragonos.org.cn/DragonOS-Community/".insteadOf https://github.com/DragonOS-Community/
-	@$(MAKE) update-submodules
+	@$(MAKE) update-submodules --init
 	@git config --global --unset url."https://git.mirrors.dragonos.org.cn/DragonOS-Community/".insteadOf
 
 help:

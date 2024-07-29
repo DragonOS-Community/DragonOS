@@ -1,4 +1,4 @@
-use alloc::{string::String, vec::Vec};
+use alloc::{ffi::CString, string::String, vec::Vec};
 use riscv::register::sstatus::{FS, SPP};
 use system_error::SystemError;
 
@@ -16,8 +16,8 @@ use crate::{
 impl Syscall {
     pub fn do_execve(
         path: String,
-        argv: Vec<String>,
-        envp: Vec<String>,
+        argv: Vec<CString>,
+        envp: Vec<CString>,
         regs: &mut TrapFrame,
     ) -> Result<(), SystemError> {
         // 关中断，防止在设置地址空间的时候，发生中断，然后进调度器，出现错误。

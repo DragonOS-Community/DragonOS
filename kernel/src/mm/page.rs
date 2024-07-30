@@ -1,3 +1,4 @@
+use alloc::string::ToString;
 use core::{
     fmt::{self, Debug, Error, Formatter},
     marker::PhantomData,
@@ -5,6 +6,8 @@ use core::{
     ops::Add,
     sync::atomic::{compiler_fence, Ordering},
 };
+use system_error::SystemError;
+use unified_init::macros::unified_init;
 
 use alloc::sync::Arc;
 use hashbrown::{HashMap, HashSet};
@@ -12,14 +15,17 @@ use log::{error, info};
 use lru::LruCache;
 
 use crate::{
-    arch::{interrupt::ipi::send_ipi, MMArch},
+    arch::{interrupt::ipi::send_ipi, mm::LockedFrameAllocator, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
     filesystem::vfs::{file::PageCache, FilePrivateData},
+    init::initcall::INITCALL_MM,
     ipc::shm::ShmId,
     libs::{
         rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
+    process::{ProcessControlBlock, ProcessManager},
+    time::{sleep::usleep, PosixTimeSpec},
 };
 
 use super::{
@@ -59,14 +65,12 @@ pub fn page_manager_lock_irqsave() -> SpinLockGuard<'static, PageManager> {
 // 物理页管理器
 pub struct PageManager {
     phys2page: HashMap<PhysAddr, Arc<Page>>,
-    lru: LruCache<PhysAddr, Arc<Page>>,
 }
 
 impl PageManager {
     pub fn new() -> Self {
         Self {
             phys2page: HashMap::new(),
-            lru: LruCache::unbounded(),
         }
     }
 
@@ -75,12 +79,12 @@ impl PageManager {
     }
 
     pub fn get(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
-        self.lru.promote(paddr);
+        page_reclaimer_lock_irqsave().get(paddr);
         self.phys2page.get(paddr).cloned()
     }
 
     pub fn get_unwrap(&mut self, paddr: &PhysAddr) -> Arc<Page> {
-        self.lru.promote(paddr);
+        page_reclaimer_lock_irqsave().get(paddr);
         self.phys2page
             .get(paddr)
             .unwrap_or_else(|| panic!("Phys Page not found, {:?}", paddr))
@@ -89,19 +93,89 @@ impl PageManager {
 
     pub fn insert(&mut self, paddr: PhysAddr, page: &Arc<Page>) {
         self.phys2page.insert(paddr, page.clone());
-        if page.read().flags.contains(PageFlags::PG_LRU) {
-            self.lru.put(paddr, page.clone());
-        }
     }
 
     pub fn remove_page(&mut self, paddr: &PhysAddr) {
         self.phys2page.remove(paddr);
     }
+}
+
+pub static mut PAGE_RECLAIMER: Option<SpinLock<PageReclaimer>> = None;
+
+pub fn page_reclaimer_init() {
+    info!("page_reclaimer_init");
+    let page_reclaimer = SpinLock::new(PageReclaimer::new());
+
+    compiler_fence(Ordering::SeqCst);
+    unsafe { PAGE_RECLAIMER = Some(page_reclaimer) };
+    compiler_fence(Ordering::SeqCst);
+
+    info!("page_reclaimer_init done");
+}
+
+static mut PAGE_RECLAIMER_THREAD: Option<Arc<ProcessControlBlock>> = None;
+
+#[unified_init(INITCALL_MM)]
+fn page_reclaimer_thread_init() -> Result<(), SystemError> {
+    let closure = crate::process::kthread::KernelThreadClosure::StaticEmptyClosure((
+        &(page_reclaim_thread as fn() -> i32),
+        (),
+    ));
+    let pcb = crate::process::kthread::KernelThreadMechanism::create_and_run(
+        closure,
+        "page_reclaim".to_string(),
+    )
+    .ok_or("")
+    .expect("create tty_refresh thread failed");
+    unsafe {
+        PAGE_RECLAIMER_THREAD = Some(pcb);
+    }
+    Ok(())
+}
+
+fn page_reclaim_thread() -> i32 {
+    loop {
+        let usage = unsafe { LockedFrameAllocator.usage() };
+        // log::info!("usage{:?}", usage);
+
+        // 保留4096个页面，总计16MB的空闲空间
+        if usage.free().data() < 4096 {
+            let page_to_free = 4096;
+            page_reclaimer_lock_irqsave().shrink_list(PageFrameCount::new(page_to_free));
+        } else {
+            // 休眠5秒
+            // log::info!("sleep");
+            let _ = usleep(PosixTimeSpec::new(5, 0));
+        }
+    }
+}
+
+pub fn page_reclaimer_lock_irqsave() -> SpinLockGuard<'static, PageReclaimer> {
+    unsafe { PAGE_RECLAIMER.as_ref().unwrap().lock_irqsave() }
+}
+
+pub struct PageReclaimer {
+    lru: LruCache<PhysAddr, Arc<Page>>,
+}
+
+impl PageReclaimer {
+    pub fn new() -> Self {
+        Self {
+            lru: LruCache::unbounded(),
+        }
+    }
+
+    pub fn get(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
+        self.lru.get(paddr).cloned()
+    }
+
+    pub fn insert_page(&mut self, paddr: PhysAddr, page: &Arc<Page>) {
+        self.lru.put(paddr, page.clone());
+    }
 
     pub fn shrink_list(&mut self, count: PageFrameCount) {
         for _ in 0..count.data() {
-            let entry = self.lru.pop_lru().unwrap();
-            let page = entry.1.clone();
+            let (paddr, page) = self.lru.pop_lru().expect("pagecache is empty");
             let page_cache = page.read().page_cache().unwrap();
             for vma in page.read().anon_vma() {
                 let address_space = vma.lock().address_space().unwrap();
@@ -114,6 +188,7 @@ impl PageManager {
                 }
             }
             page_cache.remove_page(page.read().index().unwrap());
+            page_manager_lock_irqsave().remove_page(&paddr);
             if page.read().flags.contains(PageFlags::PG_DIRTY) {
                 //TODO 回写页面
                 let inode = page
@@ -142,6 +217,11 @@ impl PageManager {
                     .unwrap();
             }
         }
+    }
+
+    pub fn wakeup_claim_thread() {
+        log::info!("wakeup_claim_thread");
+        let _ = ProcessManager::wakeup(unsafe { PAGE_RECLAIMER_THREAD.as_ref().unwrap() });
     }
 }
 
@@ -1058,7 +1138,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         if !page_manager_guard.contains(&phys) {
             page_manager_guard.insert(phys, &Arc::new(Page::new(false, phys)))
         }
-
+        drop(page_manager_guard);
         return self.map_phys(virt, phys, flags);
     }
 

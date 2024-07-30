@@ -22,7 +22,7 @@ use crate::mm::MemoryManagementArch;
 
 use super::{
     allocator::page_frame::FrameAllocator,
-    page::{Page, PageFlags},
+    page::{page_reclaimer_lock_irqsave, Page, PageFlags},
 };
 
 bitflags! {
@@ -605,7 +605,6 @@ impl PageFaultHandler {
         let page_cache = file.inode().page_cache().unwrap();
         let file_pgoff = pfm.file_pgoff.expect("no file_pgoff");
         let mut ret = VmFaultReason::empty();
-        let mut page_manager_guard = page_manager_lock_irqsave();
 
         if let Some(page) = page_cache.get_page(file_pgoff) {
             // TODO 异步从磁盘中预读页面进PageCache
@@ -634,7 +633,8 @@ impl PageFaultHandler {
             pfm.page = Some(page.clone());
 
             page.write().add_flags(PageFlags::PG_LRU);
-            page_manager_guard.insert(new_cache_page, &page);
+            page_manager_lock_irqsave().insert(new_cache_page, &page);
+            page_reclaimer_lock_irqsave().insert_page(new_cache_page, &page);
             page_cache.add_page(file_pgoff, &page);
 
             page.write()

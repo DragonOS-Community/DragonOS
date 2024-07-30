@@ -28,7 +28,7 @@ use crate::{
 };
 
 use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::{page_manager_lock_irqsave, EntryFlags, PageEntry, PAGE_1G_SHIFT};
+use crate::mm::page::{EntryFlags, PageEntry, PAGE_1G_SHIFT};
 use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr, VmFlags};
 
 use system_error::SystemError;
@@ -740,21 +740,7 @@ impl FrameAllocator for LockedFrameAllocator {
     unsafe fn allocate(&mut self, mut count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         count = count.next_power_of_two();
         if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
-            let usage = self.usage();
-            if usage.used().data() + count.data() > usage.total().data() / 2 {
-                log::info!("shrink: {:?}", usage);
-                let mut page_manager_guard = page_manager_lock_irqsave();
-                // 释放部分页面
-                page_manager_guard.shrink_list(count);
-            }
-            allocator.allocate(count)
-            // // 首次分配时内存不足
-            // allocator.allocate(count).or_else(|| {
-            //     let mut page_manager_guard = page_manager_lock_irqsave();
-            //     // 释放部分页面并再次尝试分配
-            //     page_manager_guard.shrink_list(count);
-            //     return allocator.allocate(count);
-            // })
+            return allocator.allocate(count);
         } else {
             return None;
         }

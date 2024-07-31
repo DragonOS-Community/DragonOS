@@ -8,6 +8,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use intertrait::CastFromSync;
 use log::warn;
 use smoltcp::{
     iface::SocketSet,
@@ -101,8 +102,7 @@ pub(super) fn new_socket(
         .insert(socket.socket_handle(), handle_item);
     Ok(socket)
 }
-
-pub trait Socket: Sync + Send + Debug + Any {
+pub trait Socket: Sync + Send + Debug + Any + CastFromSync{
     /// @brief 从socket中读取数据，如果socket是阻塞的，那么直到读取到数据才返回
     ///
     /// @param buf 读取到的数据存放的缓冲区

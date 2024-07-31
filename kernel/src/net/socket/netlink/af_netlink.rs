@@ -2,22 +2,30 @@
 
 
 
+use core::ops::Deref;
 use core::{any::Any, fmt::Debug, hash::Hash};
-
+use core::mem;
 
 use alloc::sync::{Arc, Weak};
 
 use hashbrown::HashMap;
+use intertrait::cast::CastBox;
 use intertrait::CastFromSync;
+use log::warn;
 use num::Zero;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
-use crate::include::bindings::bindings::ECONNREFUSED;
+use crate::include::bindings::bindings::{ECONNREFUSED, __WORDSIZE};
 use crate::libs::mutex::Mutex;
 use crate::libs::rwlock::RwLockWriteGuard;
+use crate::libs::spinlock::SpinLock;
 use crate::libs::wait_queue::WaitQueue;
+use crate::net::event_poll::{EPollEventType, EPollItem, EventPoll};
+use crate::net::socket::handle::GlobalSocketHandle;
 use crate::net::socket::netlink::skbuff::SkBuff;
+use crate::net::syscall::SockAddrNl;
+use crate::net::{Endpoint, ShutdownType};
 use crate::time::timer::schedule_timeout;
 use crate::{
     libs::rwlock::RwLock,
@@ -26,7 +34,7 @@ use crate::{
 };
 use alloc::{boxed::Box, vec::Vec};
 
-use crate::net::socket::{AddressFamily, Socket};
+use crate::net::socket::{AddressFamily, PosixSocketHandleItem, Socket, SocketMetadata};
 use lazy_static::lazy_static;
 
 use super::callback::NetlinkCallback;
@@ -49,13 +57,6 @@ bitflags! {
         const STRICT_CHK = 0x80;
         const NETLINK_F_KERNEL_SOCKET = 0x100;
     }
-}
-
-pub struct SockaddrNl {
-    // pub nl_family: SA_FAMILY_T,
-    pub nl_pad: u16,
-    pub nl_pid: u32,
-    pub nl_groups: u32,
 }
 #[derive(Clone)]
 #[derive(Debug)]
@@ -92,6 +93,8 @@ impl<'a> Iterator for HListHeadIter<'a> {
         }
     }
 }
+/// 
+/// 
 #[derive(Clone)]
 pub struct NetlinkTable {
     hash: HashMap<u32, Arc<Mutex<Box<dyn NetlinkSocket>>>>,
@@ -271,6 +274,8 @@ pub fn netlink_add_usersock_entry(nl_table: &mut RwLockWriteGuard<Vec<NetlinkTab
 /// 内核套接字插入 nl_table
 fn netlink_insert(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, portid: u32) -> Result<(), SystemError> {
     let mut nl_table = NL_TABLE.write();
+    // 将 Arc<Mutex<Box<dyn Socket>>> 转换为 Arc<Mutex<Box<dyn NetlinkSocket>>>
+
     let index = sk.lock().sk_protocol();
    
 
@@ -301,7 +306,92 @@ fn netlink_insert(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, portid: u32) -> Result
     
     Ok(())
 }
+fn netlink_bind(sock: Box<dyn Socket>, addr: &SockAddrNl, addr_len: usize) -> Result<(), SystemError> {
+    let _sk = sock
+                .clone()
+                .cast::<dyn NetlinkSocket>()
+                .map_err(|_| SystemError::EINVAL)?;
+    let sk = Arc::new(Mutex::new(_sk));
+    // todo: net namespace支持
+    // let net = sock_net(sk);
+    let nlk: Arc<NetlinkSock> = Arc::clone(&sk).arc_any().downcast().map_err(|_| SystemError::EINVAL)?; 
+    let nladdr = addr;
+    let mut err = 0;
+    let mut groups: u32;
+    let mut bound: bool;
+    
+    if addr_len < mem::size_of::<SockAddrNl>() {
+        return Err(SystemError::EINVAL);
+    }
 
+    if nladdr.nl_family != AddressFamily::Netlink {
+        return Err(SystemError::EINVAL);
+    }
+    groups = nladdr.nl_groups;
+
+    // Only superuser is allowed to listen multicasts
+    // if groups != 0 {
+    //     if !netlink_allowed(sock, NL_CFG_F_NONROOT_RECV) {
+    //         return Err(-EPERM);
+    //     }
+    //     err = netlink_realloc_groups(sk);
+    //     if err != 0 {
+    //         return Err(err);
+    //     }
+    // }
+
+    // BITS_PER_LONG = __WORDSIZE
+    if nlk.ngroups < __WORDSIZE as u64 {
+        groups &= (1 << nlk.ngroups) - 1;
+    }
+
+    bound = nlk.bound;
+    if bound {
+        // Ensure nlk.portid is up-to-date.
+        if nladdr.nl_pid != nlk.portid {
+            return Err(SystemError::EINVAL);
+        }
+    }
+
+    if groups != 0 {
+        for group in 0..(mem::size_of::<u32>() * 8)as u32 {
+            if group == groups {
+                continue;
+            }
+            // err = nlk.bind().unwrap()(group + 1);
+            if err == 0 {
+                continue;
+            }
+            // netlink_undo_bind(group, groups, sk);
+            return Err(SystemError::EINVAL);
+        }
+    }
+
+    // No need for barriers here as we return to user-space without
+    // using any of the bound attributes.
+    if !bound {
+        if nladdr.nl_pid != 0 {
+            let _ = netlink_insert(sk, nladdr.nl_pid);
+        } else {
+            // todo
+            // netlink_autobind(sock)
+        };
+        if err != 0 {
+            // BITS_PER_TYPE<TYPE> = SIZEOF TYPE * BITS PER BYTES
+            // todo
+            // netlink_undo_bind(mem::size_of::<u32>() * 8, groups, sk);
+            // netlink_unlock_table();
+            return Err(SystemError::EINVAL);
+        }
+    }
+
+    // todo
+    // netlink_update_subscriptions(sk, nlk.subscriptions + hweight32(groups) - hweight32(nlk.groups.unwrap()[0]));
+    // nlk.groups.unwrap()[0] = (nlk.groups.unwrap()[0] & !0xffffffff) | groups;
+    // netlink_update_listeners(sk);
+
+    Ok(())
+}
 // TODO: net namespace支持
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#532
 /// 在 netlink_table 中查找 netlink 套接字
@@ -321,7 +411,7 @@ pub enum Error {
 }
 
 // netlink机制特定的内核抽象，不同于标准的trait Socket
-pub trait NetlinkSocket: Any + Send + Sync + Debug + CastFromSync {
+pub trait NetlinkSocket: Any + Send + Sync + Debug + Socket {
     // fn sk_prot(&self) -> &dyn proto;
     fn sk_family(&self) -> i32;
     fn sk_state(&self) -> NetlinkState;
@@ -347,6 +437,123 @@ impl Clone for Box<dyn NetlinkSocket> {
     }
 }
 
+// impl<T: NetlinkSocket> Socket for T {
+//     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
+//         todo!()
+//     }
+//     fn write(&self, buf: &[u8], to: Option<Endpoint>) -> Result<usize, SystemError>{
+//         // Implementation of the function
+//         Ok(0)
+//     }
+//     fn connect(&mut self, _endpoint: Endpoint) -> Result<(), SystemError>{
+//         // Implementation of the function
+//         Ok(())
+//     }
+//     fn bind(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
+//         return Ok(())
+//     }
+//     fn shutdown(&mut self, _type: ShutdownType) -> Result<(), SystemError> {
+//         Err(SystemError::ENOSYS)
+//     }
+//     fn listen(&mut self, _backlog: usize) -> Result<(), SystemError> {
+//         Err(SystemError::ENOSYS)
+//     }
+//     fn accept(&mut self) -> Result<(Box<dyn Socket>, Endpoint), SystemError> {
+//         Err(SystemError::ENOSYS)
+//     }
+
+//     fn endpoint(&self) -> Option<Endpoint> {
+//         None
+//     }
+
+
+//     fn peer_endpoint(&self) -> Option<Endpoint> {
+//         None
+//     }
+
+//     fn poll(&self) -> EPollEventType {
+//         EPollEventType::empty()
+//     }
+
+//     fn ioctl(
+//         &self,
+//         _cmd: usize,
+//         _arg0: usize,
+//         _arg1: usize,
+//         _arg2: usize,
+//     ) -> Result<usize, SystemError> {
+//         Ok(0)
+//     }
+
+//     fn metadata(&self) -> SocketMetadata{
+//         todo!()
+//     }
+
+//     fn box_clone(&self) -> Box<dyn Socket>{
+//         todo!()
+//     }
+
+//     fn setsockopt(
+//         &self,
+//         _level: usize,
+//         _optname: usize,
+//         _optval: &[u8],
+//     ) -> Result<(), SystemError> {
+//         warn!("setsockopt is not implemented");
+//         Ok(())
+//     }
+
+//     fn socket_handle(&self) -> GlobalSocketHandle{
+//         todo!()
+//     }
+
+//     fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
+//         todo!()
+//     }
+
+//     fn as_any_ref(&self) -> &dyn Any{
+//         self
+//     }
+
+//     fn as_any_mut(&mut self) -> &mut dyn Any{
+//         self
+//     }
+
+//     fn add_epoll(&mut self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
+//         let posix_item = self.posix_item();
+//         posix_item.add_epoll(epitem);
+//         Ok(())
+//     }
+
+//     fn remove_epoll(&mut self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
+//         let posix_item = self.posix_item();
+//         posix_item.remove_epoll(epoll)?;
+
+//         Ok(())
+//     }
+
+//     fn clear_epoll(&mut self) -> Result<(), SystemError> {
+//         let posix_item = self.posix_item();
+
+//         for epitem in posix_item.epitems.lock_irqsave().iter() {
+//             let epoll = epitem.epoll();
+
+//             if let Some(epoll) = epoll.upgrade() {
+//                 EventPoll::ep_remove(&mut epoll.lock_irqsave(), epitem.fd(), None)?;
+//             }
+//         }
+
+//         Ok(())
+//     }
+
+//     fn close(&mut self){
+//         todo!()
+//     }
+
+//     fn posix_item(&self) -> Arc<PosixSocketHandleItem>{
+//         todo!()
+//     }
+// }
 /* linux：struct sock has to be the first member of netlink_sock */
 // linux 6.1.9中的netlink_sock结构体里，sock是一个很大的结构体，这里简化
 // 意义是netlink_sock（NetlinkSock）是一个sock（NetlinkSocket）
@@ -358,6 +565,8 @@ impl LockedNetlinkSock {
     }
 }
 #[derive(Debug)]
+#[cast_to([sync] Socket)]
+#[cast_to([sync] NetlinkSocket)]
 pub struct NetlinkSock {
     sk: Option<Weak<dyn NetlinkSocket>>,
     portid: u32,
@@ -378,7 +587,130 @@ pub struct NetlinkSock {
     sk_rcvtimeo: i64,
     callback: Option<&'static dyn NetlinkCallback>,
 }
-// TODO: 实现NetlinkSocket trait
+impl Socket for NetlinkSock{
+    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
+        todo!()
+    }
+    fn write(&self, buf: &[u8], to: Option<Endpoint>) -> Result<usize, SystemError>{
+        // Implementation of the function
+        Ok(0)
+    }
+    fn connect(&mut self, _endpoint: Endpoint) -> Result<(), SystemError>{
+        // Implementation of the function
+        Ok(())
+    }
+    fn bind(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
+        log::debug!("NetlinkSock bind to {:?}", _endpoint);
+        if let Some(Endpoint::Netlink(Some(netlink)))= self.endpoint(){
+            let addr = netlink.addr;
+            let addr_len = netlink.addr_len;
+            let _ = netlink_bind(self.box_clone(), &addr, addr_len);
+        }
+        return Ok(())
+    }
+    fn shutdown(&mut self, _type: ShutdownType) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+    fn listen(&mut self, _backlog: usize) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+    fn accept(&mut self) -> Result<(Box<dyn Socket>, Endpoint), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
+    fn endpoint(&self) -> Option<Endpoint> {
+        None
+    }
+
+
+    fn peer_endpoint(&self) -> Option<Endpoint> {
+        None
+    }
+
+    fn poll(&self) -> EPollEventType {
+        EPollEventType::empty()
+    }
+
+    fn ioctl(
+        &self,
+        _cmd: usize,
+        _arg0: usize,
+        _arg1: usize,
+        _arg2: usize,
+    ) -> Result<usize, SystemError> {
+        Ok(0)
+    }
+
+    fn metadata(&self) -> SocketMetadata{
+        todo!()
+    }
+
+    fn box_clone(&self) -> Box<dyn Socket>{
+        todo!()
+    }
+
+    fn setsockopt(
+        &self,
+        _level: usize,
+        _optname: usize,
+        _optval: &[u8],
+    ) -> Result<(), SystemError> {
+        warn!("setsockopt is not implemented");
+        Ok(())
+    }
+
+    fn socket_handle(&self) -> GlobalSocketHandle{
+        todo!()
+    }
+
+    fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn as_any_ref(&self) -> &dyn Any{
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any{
+        self
+    }
+
+    fn add_epoll(&mut self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
+        let posix_item = self.posix_item();
+        posix_item.add_epoll(epitem);
+        Ok(())
+    }
+
+    fn remove_epoll(&mut self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
+        let posix_item = self.posix_item();
+        posix_item.remove_epoll(epoll)?;
+
+        Ok(())
+    }
+
+    fn clear_epoll(&mut self) -> Result<(), SystemError> {
+        let posix_item = self.posix_item();
+
+        for epitem in posix_item.epitems.lock_irqsave().iter() {
+            let epoll = epitem.epoll();
+
+            if let Some(epoll) = epoll.upgrade() {
+                EventPoll::ep_remove(&mut epoll.lock_irqsave(), epitem.fd(), None)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn close(&mut self){
+        todo!()
+    }
+
+    fn posix_item(&self) -> Arc<PosixSocketHandleItem>{
+        todo!()
+    }
+}
+// TODO: 实现 NetlinkSocket trait
 impl NetlinkSocket for NetlinkSock {
     fn sk_family(&self) -> i32 {
         0

@@ -16,3 +16,4 @@ pub mod netlink_proto;
 pub mod netlink;
 pub mod callback;
 pub mod sock;
+pub mod endpoint;

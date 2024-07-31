@@ -1,28 +1,25 @@
-use netlink_sys::{Socket, protocols::NETLINK_KOBJECT_UEVENT};
 use std::io::{self, Write};
-
+use nix::sys::socket::{bind, socket, AddressFamily, SockAddr, SockFlag, SockProtocol, SockType};
+use nix::errno::Errno;
+use std::os::unix::io::RawFd;
+fn create_netlink_socket() -> Result<RawFd, Errno> {
+    socket(
+        AddressFamily::Netlink,
+        SockType::Raw,
+        SockFlag::SOCK_CLOEXEC,
+        SockProtocol::NetlinkKObjectUEvent,
+    )
+}
+fn bind_netlink_socket(sock: RawFd) -> Result<(), Errno> {
+    let pid = nix::unistd::getpid(); // 获取当前进程 PID
+    let addr = SockAddr::new_netlink(pid.as_raw() as u32, 0);
+    bind(sock, &addr)
+}
 fn main() {
     // 创建一个 Netlink 套接字
-    let mut socket = Socket::new(NETLINK_KOBJECT_UEVENT).expect("Failed to create netlink socket");
-
+    let socket = create_netlink_socket().expect("Failed to create Netlink socket");
+    println!("Netlink socket created successfully");
     // 绑定套接字
-    socket.bind_auto().expect("Failed to bind socket");
-
-    println!("Listening for uevents...");
-
-    // 接收消息
-    let mut buf = vec![0; 4096];
-    loop {
-        match socket.recv(&mut buf, 0) {
-            Ok(size) => {
-                // 打印接收到的消息
-                io::stdout().write_all(&buf[..size]).expect("Failed to write to stdout");
-                println!();
-            }
-            Err(e) => {
-                eprintln!("Failed to receive message: {}", e);
-                break;
-            }
-        }
-    }
+    bind_netlink_socket(socket).expect("Failed to bind Netlink socket");
+    println!("Netlink socket created and bound successfully");
 }

@@ -1,6 +1,6 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::kprobe::setup_single_step;
-use crate::debug::kprobe::BREAK_KPROBE_LIST;
+use crate::debug::kprobe::KPROBE_MANAGER;
 use crate::exception::debug::DebugException;
 use kprobe::{KprobeOps, ProbeArgs};
 use system_error::SystemError;
@@ -14,14 +14,19 @@ impl EBreak {
     }
     fn kprobe_handler(frame: &mut TrapFrame) -> Result<(), SystemError> {
         let break_addr = frame.break_address();
-        let kprobe = BREAK_KPROBE_LIST.lock().get(&break_addr).map(Clone::clone);
-        if let Some(kprobe) = kprobe {
-            kprobe.call_pre_handler(frame);
+        let guard = KPROBE_MANAGER.lock();
+        let kprobe_list = guard.get_break_list(break_addr);
+        if let Some(kprobe_list) = kprobe_list {
+            for kprobe in kprobe_list {
+                kprobe.call_pre_handler(frame);
+            }
+            let probe_point = kprobe_list[0].probe_point();
             // setup_single_step
-            setup_single_step(frame, kprobe.single_step_address());
+            setup_single_step(frame, probe_point.single_step_address());
         } else {
             // For some architectures, they do not support single step execution,
             // and we need to use breakpoint exceptions to simulate
+            drop(guard);
             DebugException::handle(frame)?;
         }
         Ok(())

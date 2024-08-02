@@ -1,30 +1,22 @@
+use crate::debug::kprobe::args::KprobeInfo;
 use crate::libs::spinlock::SpinLock;
 use alloc::collections::BTreeMap;
-use alloc::string::ToString;
 use alloc::sync::Arc;
-use kprobe::{Kprobe, KprobeBuilder, KprobeOps, ProbeArgs};
-use log::warn;
+use kprobe::{Kprobe, KprobeBuilder, KprobeManager, KprobeOps, KprobePoint};
 use system_error::SystemError;
 
+mod args;
 mod test;
 
-pub static BREAK_KPROBE_LIST: SpinLock<BTreeMap<usize, Arc<Kprobe>>> =
-    SpinLock::new(BTreeMap::new());
-pub static DEBUG_KPROBE_LIST: SpinLock<BTreeMap<usize, Arc<Kprobe>>> =
+pub static KPROBE_MANAGER: SpinLock<KprobeManager> = SpinLock::new(KprobeManager::new());
+static KPROBE_POINT_LIST: SpinLock<BTreeMap<usize, Arc<KprobePoint>>> =
     SpinLock::new(BTreeMap::new());
 
 pub fn kprobe_init() {}
 
-pub struct KprobeInfo<'a> {
-    pub pre_handler: fn(&dyn ProbeArgs),
-    pub post_handler: fn(&dyn ProbeArgs),
-    pub fault_handler: Option<fn(&dyn ProbeArgs)>,
-    pub symbol: &'a str,
-    pub offset: usize,
-}
-
-extern "C" {
-    fn addr_from_symbol(symbol: *const u8) -> usize;
+#[cfg(feature = "kprobe_test")]
+pub fn kprobe_test() {
+    test::kprobe_test();
 }
 
 /// # 注册一个kprobe
@@ -34,38 +26,28 @@ extern "C" {
 /// ## 参数
 /// - `kprobe_info`: kprobe的信息
 pub fn register_kprobe(kprobe_info: KprobeInfo) -> Result<Arc<Kprobe>, SystemError> {
-    let mut symbol_sting = kprobe_info.symbol.to_string();
-    if !symbol_sting.ends_with("\0") {
-        symbol_sting.push('\0');
-    }
-    let symbol = symbol_sting.as_ptr();
-    let func_addr = unsafe { addr_from_symbol(symbol) };
-    if func_addr == 0 {
-        warn!(
-            "register_kprobe: the symbol: {} not found",
-            kprobe_info.symbol
-        );
-        return Err(SystemError::ENXIO);
-    }
-    let mut kprobe_builder = KprobeBuilder::new(
-        kprobe_info.symbol.to_string(),
-        func_addr,
-        kprobe_info.offset,
-        kprobe_info.pre_handler,
-        kprobe_info.post_handler,
-    );
-    if kprobe_info.fault_handler.is_some() {
-        kprobe_builder = kprobe_builder.fault_handler(kprobe_info.fault_handler.unwrap());
-    }
-    let kprobe = kprobe_builder.build().install();
-
+    let kprobe_builder = KprobeBuilder::try_from(kprobe_info)?;
+    let address = kprobe_builder.probe_addr();
+    let existed_point = KPROBE_POINT_LIST.lock().get(&address).map(Clone::clone);
+    let (kprobe, probe_point) = match existed_point {
+        Some(existed_point) => kprobe_builder
+            .with_probe_point(existed_point.clone())
+            .install(),
+        None => {
+            let (kprobe, probe_point) = kprobe_builder.install();
+            KPROBE_POINT_LIST
+                .lock()
+                .insert(address, probe_point.clone());
+            (kprobe, probe_point)
+        }
+    };
     let kprobe = Arc::new(kprobe);
-    let kprobe_addr = kprobe.kprobe_address();
-    BREAK_KPROBE_LIST.lock().insert(kprobe_addr, kprobe.clone());
-    let debug_address = kprobe.debug_address();
-    DEBUG_KPROBE_LIST
+    KPROBE_MANAGER
         .lock()
-        .insert(debug_address, kprobe.clone());
+        .insert_break_point(probe_point.break_address(), kprobe.clone());
+    KPROBE_MANAGER
+        .lock()
+        .insert_debug_point(probe_point.debug_address(), kprobe.clone());
     Ok(kprobe)
 }
 
@@ -74,14 +56,16 @@ pub fn register_kprobe(kprobe_info: KprobeInfo) -> Result<Arc<Kprobe>, SystemErr
 /// ## 参数
 /// - `kprobe`: 已安装的kprobe
 pub fn unregister_kprobe(kprobe: Arc<Kprobe>) -> Result<(), SystemError> {
-    let debug_address = kprobe.debug_address();
-    let kprobe_addr = kprobe.kprobe_address();
-    BREAK_KPROBE_LIST.lock().remove(&kprobe_addr);
-    DEBUG_KPROBE_LIST.lock().remove(&debug_address);
+    let probe_point = kprobe.probe_point();
+    let debug_address = probe_point.debug_address();
+    let kprobe_addr = probe_point.break_address();
+    KPROBE_MANAGER.lock().remove_one_break(kprobe_addr, &kprobe);
+    KPROBE_MANAGER
+        .lock()
+        .remove_one_debug(debug_address, &kprobe);
+    // 如果没有其他kprobe注册在这个地址上，则删除探测点
+    if KPROBE_MANAGER.lock().break_list_len(kprobe_addr) == 0 {
+        KPROBE_POINT_LIST.lock().remove(&kprobe_addr);
+    }
     Ok(())
-}
-
-#[cfg(feature = "kprobe_test")]
-pub fn kprobe_test() {
-    test::kprobe_test();
 }

@@ -182,13 +182,22 @@ impl KprobeManager {
             debug_list: BTreeMap::new(),
         }
     }
+    /// # 插入一个kprobe
+    ///
+    /// ## 参数
+    /// - `kprobe`: kprobe的实例
+    pub fn insert_kprobe(&mut self, kprobe: Arc<Kprobe>) {
+        let probe_point = kprobe.probe_point();
+        self.insert_break_point(probe_point.break_address(), kprobe.clone());
+        self.insert_debug_point(probe_point.debug_address(), kprobe);
+    }
 
     /// # 向break_list中插入一个kprobe
     ///
     /// ## 参数
     /// - `address`: kprobe的地址, 由`KprobePoint::break_address()`或者`KprobeBuilder::probe_addr()`返回
     /// - `kprobe`: kprobe的实例
-    pub fn insert_break_point(&mut self, address: usize, kprobe: Arc<Kprobe>) {
+    fn insert_break_point(&mut self, address: usize, kprobe: Arc<Kprobe>) {
         let list = self.break_list.entry(address).or_default();
         list.push(kprobe);
     }
@@ -198,7 +207,7 @@ impl KprobeManager {
     /// ## 参数
     /// - `address`: kprobe的单步执行地址，由`KprobePoint::debug_address()`返回
     /// - `kprobe`: kprobe的实例
-    pub fn insert_debug_point(&mut self, address: usize, kprobe: Arc<Kprobe>) {
+    fn insert_debug_point(&mut self, address: usize, kprobe: Arc<Kprobe>) {
         let list = self.debug_list.entry(address).or_default();
         list.push(kprobe);
     }
@@ -211,18 +220,37 @@ impl KprobeManager {
         self.debug_list.get(&address)
     }
 
-    pub fn break_list_len(&self, address: usize) -> usize {
+    /// # 返回一个地址上注册的kprobe数量
+    ///
+    /// ## 参数
+    /// - `address`: kprobe的地址, 由`KprobePoint::break_address()`或者`KprobeBuilder::probe_addr()`返回
+    pub fn kprobe_num(&self, address: usize) -> usize {
+        self.break_list_len(address)
+    }
+
+    #[inline]
+    fn break_list_len(&self, address: usize) -> usize {
         self.break_list
             .get(&address)
             .map(|list| list.len())
             .unwrap_or(0)
     }
-
-    pub fn debug_list_len(&self, address: usize) -> usize {
+    #[inline]
+    fn debug_list_len(&self, address: usize) -> usize {
         self.debug_list
             .get(&address)
             .map(|list| list.len())
             .unwrap_or(0)
+    }
+
+    /// # 移除一个kprobe
+    ///
+    /// ## 参数
+    /// - `kprobe`: kprobe的实例
+    pub fn remove_kprobe(&mut self, kprobe: &Arc<Kprobe>) {
+        let probe_point = kprobe.probe_point();
+        self.remove_one_break(probe_point.break_address(), kprobe);
+        self.remove_one_debug(probe_point.debug_address(), kprobe);
     }
 
     /// # 从break_list中移除一个kprobe
@@ -232,11 +260,10 @@ impl KprobeManager {
     /// ## 参数
     /// - `address`: kprobe的地址, 由`KprobePoint::break_address()`或者`KprobeBuilder::probe_addr()`返回
     /// - `kprobe`: kprobe的实例
-    pub fn remove_one_break(&mut self, address: usize, kprobe: &Arc<Kprobe>) {
+    fn remove_one_break(&mut self, address: usize, kprobe: &Arc<Kprobe>) {
         if let Some(list) = self.break_list.get_mut(&address) {
             list.retain(|x| !Arc::ptr_eq(x, kprobe));
         }
-
         if self.break_list_len(address) == 0 {
             self.break_list.remove(&address);
         }
@@ -249,7 +276,7 @@ impl KprobeManager {
     /// ## 参数
     /// - `address`: kprobe的单步执行地址，由`KprobePoint::debug_address()`返回
     /// - `kprobe`: kprobe的实例
-    pub fn remove_one_debug(&mut self, address: usize, kprobe: &Arc<Kprobe>) {
+    fn remove_one_debug(&mut self, address: usize, kprobe: &Arc<Kprobe>) {
         if let Some(list) = self.debug_list.get_mut(&address) {
             list.retain(|x| !Arc::ptr_eq(x, kprobe));
         }

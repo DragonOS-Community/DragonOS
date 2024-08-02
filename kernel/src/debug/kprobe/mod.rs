@@ -29,25 +29,21 @@ pub fn register_kprobe(kprobe_info: KprobeInfo) -> Result<Arc<Kprobe>, SystemErr
     let kprobe_builder = KprobeBuilder::try_from(kprobe_info)?;
     let address = kprobe_builder.probe_addr();
     let existed_point = KPROBE_POINT_LIST.lock().get(&address).map(Clone::clone);
-    let (kprobe, probe_point) = match existed_point {
-        Some(existed_point) => kprobe_builder
-            .with_probe_point(existed_point.clone())
-            .install(),
+    let kprobe = match existed_point {
+        Some(existed_point) => {
+            kprobe_builder
+                .with_probe_point(existed_point.clone())
+                .install()
+                .0
+        }
         None => {
             let (kprobe, probe_point) = kprobe_builder.install();
-            KPROBE_POINT_LIST
-                .lock()
-                .insert(address, probe_point.clone());
-            (kprobe, probe_point)
+            KPROBE_POINT_LIST.lock().insert(address, probe_point);
+            kprobe
         }
     };
     let kprobe = Arc::new(kprobe);
-    KPROBE_MANAGER
-        .lock()
-        .insert_break_point(probe_point.break_address(), kprobe.clone());
-    KPROBE_MANAGER
-        .lock()
-        .insert_debug_point(probe_point.debug_address(), kprobe.clone());
+    KPROBE_MANAGER.lock().insert_kprobe(kprobe.clone());
     Ok(kprobe)
 }
 
@@ -56,15 +52,10 @@ pub fn register_kprobe(kprobe_info: KprobeInfo) -> Result<Arc<Kprobe>, SystemErr
 /// ## 参数
 /// - `kprobe`: 已安装的kprobe
 pub fn unregister_kprobe(kprobe: Arc<Kprobe>) -> Result<(), SystemError> {
-    let probe_point = kprobe.probe_point();
-    let debug_address = probe_point.debug_address();
-    let kprobe_addr = probe_point.break_address();
-    KPROBE_MANAGER.lock().remove_one_break(kprobe_addr, &kprobe);
-    KPROBE_MANAGER
-        .lock()
-        .remove_one_debug(debug_address, &kprobe);
+    let kprobe_addr = kprobe.probe_point().break_address();
+    KPROBE_MANAGER.lock().remove_kprobe(&kprobe);
     // 如果没有其他kprobe注册在这个地址上，则删除探测点
-    if KPROBE_MANAGER.lock().break_list_len(kprobe_addr) == 0 {
+    if KPROBE_MANAGER.lock().kprobe_num(kprobe_addr) == 0 {
         KPROBE_POINT_LIST.lock().remove(&kprobe_addr);
     }
     Ok(())

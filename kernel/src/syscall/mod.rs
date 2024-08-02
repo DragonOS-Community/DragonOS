@@ -875,7 +875,6 @@ impl Syscall {
             }
 
             SYS_GETTID => Self::gettid().map(|tid| tid.into()),
-            SYS_GETUID => Self::getuid(),
 
             SYS_SYSLOG => {
                 let syslog_action_type = args[0];
@@ -889,27 +888,29 @@ impl Syscall {
                 Self::do_syslog(syslog_action_type, user_buf, len)
             }
 
+            SYS_GETUID => Self::getuid(),
             SYS_GETGID => Self::getgid(),
-            SYS_SETUID => {
-                warn!("SYS_SETUID has not yet been implemented");
-                Ok(0)
-            }
-            SYS_SETGID => {
-                warn!("SYS_SETGID has not yet been implemented");
-                Ok(0)
-            }
+            SYS_SETUID => Self::setuid(args[0]),
+            SYS_SETGID => Self::setgid(args[0]),
+
+            SYS_GETEUID => Self::geteuid(),
+            SYS_GETEGID => Self::getegid(),
+            SYS_SETRESUID => Self::seteuid(args[1]),
+            SYS_SETRESGID => Self::setegid(args[1]),
+
+            SYS_SETFSUID => Self::setfsuid(args[0]),
+            SYS_SETFSGID => Self::setfsgid(args[0]),
+
             SYS_SETSID => {
                 warn!("SYS_SETSID has not yet been implemented");
                 Ok(0)
             }
-            SYS_GETEUID => Self::geteuid(),
-            SYS_GETEGID => Self::getegid(),
+
             SYS_GETRUSAGE => {
                 let who = args[0] as c_int;
                 let rusage = args[1] as *mut RUsage;
                 Self::get_rusage(who, rusage)
             }
-
             #[cfg(target_arch = "x86_64")]
             SYS_READLINK => {
                 let path = args[0] as *const u8;
@@ -1150,7 +1151,9 @@ impl Syscall {
         back_color: u32,
     ) -> Result<usize, SystemError> {
         // todo: 删除这个系统调用
-        let s = check_and_clone_cstr(s, Some(4096))?;
+        let s = check_and_clone_cstr(s, Some(4096))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
         let fr = (front_color & 0x00ff0000) >> 16;
         let fg = (front_color & 0x0000ff00) >> 8;
         let fb = front_color & 0x000000ff;

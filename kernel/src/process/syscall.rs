@@ -1,14 +1,12 @@
 use core::ffi::c_void;
 
-use alloc::{
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{ffi::CString, string::ToString, sync::Arc, vec::Vec};
+use log::error;
 use system_error::SystemError;
 
 use super::{
     abi::WaitOption,
+    cred::{Kgid, Kuid},
     exit::kernel_wait4,
     fork::{CloneFlags, KernelCloneArgs},
     resource::{RLimit64, RLimitID, RUsage, RUsageWho},
@@ -114,16 +112,16 @@ impl Syscall {
         }
 
         let x = || {
-            let path: String = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
-            let argv: Vec<String> = check_and_clone_cstr_array(argv)?;
-            let envp: Vec<String> = check_and_clone_cstr_array(envp)?;
+            let path: CString = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+            let argv: Vec<CString> = check_and_clone_cstr_array(argv)?;
+            let envp: Vec<CString> = check_and_clone_cstr_array(envp)?;
             Ok((path, argv, envp))
         };
-        let r: Result<(String, Vec<String>, Vec<String>), SystemError> = x();
-        if let Err(e) = r {
-            panic!("Failed to execve: {:?}", e);
-        }
-        let (path, argv, envp) = r.unwrap();
+        let (path, argv, envp) = x().inspect_err(|e: &SystemError| {
+            error!("Failed to execve: {:?}", e);
+        })?;
+
+        let path = path.into_string().map_err(|_| SystemError::EINVAL)?;
         ProcessManager::current_pcb()
             .basic_mut()
             .set_name(ProcessControlBlock::generate_name(&path, &argv));
@@ -289,23 +287,123 @@ impl Syscall {
     }
 
     pub fn getuid() -> Result<usize, SystemError> {
-        // todo: 增加credit功能之后，需要修改
-        return Ok(0);
+        let pcb = ProcessManager::current_pcb();
+        return Ok(pcb.cred.lock().uid.data());
     }
 
     pub fn getgid() -> Result<usize, SystemError> {
-        // todo: 增加credit功能之后，需要修改
-        return Ok(0);
+        let pcb = ProcessManager::current_pcb();
+        return Ok(pcb.cred.lock().gid.data());
     }
 
     pub fn geteuid() -> Result<usize, SystemError> {
-        // todo: 增加credit功能之后，需要修改
-        return Ok(0);
+        let pcb = ProcessManager::current_pcb();
+        return Ok(pcb.cred.lock().euid.data());
     }
 
     pub fn getegid() -> Result<usize, SystemError> {
-        // todo: 增加credit功能之后，需要修改
+        let pcb = ProcessManager::current_pcb();
+        return Ok(pcb.cred.lock().egid.data());
+    }
+
+    pub fn setuid(uid: usize) -> Result<usize, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        let mut guard = pcb.cred.lock();
+
+        if guard.uid.data() == 0 {
+            guard.setuid(uid);
+            guard.seteuid(uid);
+            guard.setsuid(uid);
+        } else if uid == guard.uid.data() || uid == guard.suid.data() {
+            guard.seteuid(uid);
+        } else {
+            return Err(SystemError::EPERM);
+        }
+
         return Ok(0);
+    }
+
+    pub fn setgid(gid: usize) -> Result<usize, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        let mut guard = pcb.cred.lock();
+
+        if guard.egid.data() == 0 {
+            guard.setgid(gid);
+            guard.setegid(gid);
+            guard.setsgid(gid);
+            guard.setfsgid(gid);
+        } else if guard.gid.data() == gid || guard.sgid.data() == gid {
+            guard.setegid(gid);
+            guard.setfsgid(gid);
+        } else {
+            return Err(SystemError::EPERM);
+        }
+
+        return Ok(0);
+    }
+
+    pub fn seteuid(euid: usize) -> Result<usize, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        let mut guard = pcb.cred.lock();
+
+        if euid == usize::MAX || (euid == guard.euid.data() && euid == guard.fsuid.data()) {
+            return Ok(0);
+        }
+
+        if euid != usize::MAX {
+            guard.seteuid(euid);
+        }
+
+        let euid = guard.euid.data();
+        guard.setfsuid(euid);
+
+        return Ok(0);
+    }
+
+    pub fn setegid(egid: usize) -> Result<usize, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        let mut guard = pcb.cred.lock();
+
+        if egid == usize::MAX || (egid == guard.egid.data() && egid == guard.fsgid.data()) {
+            return Ok(0);
+        }
+
+        if egid != usize::MAX {
+            guard.setegid(egid);
+        }
+
+        let egid = guard.egid.data();
+        guard.setfsgid(egid);
+
+        return Ok(0);
+    }
+
+    pub fn setfsuid(fsuid: usize) -> Result<usize, SystemError> {
+        let fsuid = Kuid::new(fsuid);
+
+        let pcb = ProcessManager::current_pcb();
+        let mut guard = pcb.cred.lock();
+        let old_fsuid = guard.fsuid;
+
+        if fsuid == guard.uid || fsuid == guard.euid || fsuid == guard.suid {
+            guard.setfsuid(fsuid.data());
+        }
+
+        Ok(old_fsuid.data())
+    }
+
+    pub fn setfsgid(fsgid: usize) -> Result<usize, SystemError> {
+        let fsgid = Kgid::new(fsgid);
+
+        let pcb = ProcessManager::current_pcb();
+        let mut guard = pcb.cred.lock();
+        let old_fsgid = guard.fsgid;
+
+        if fsgid == guard.gid || fsgid == guard.egid || fsgid == guard.sgid {
+            guard.setfsgid(fsgid.data());
+        }
+
+        Ok(old_fsgid.data())
     }
 
     pub fn get_rusage(who: i32, rusage: *mut RUsage) -> Result<usize, SystemError> {

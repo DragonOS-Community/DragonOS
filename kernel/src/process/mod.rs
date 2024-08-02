@@ -8,10 +8,12 @@ use core::{
 };
 
 use alloc::{
+    ffi::CString,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
+use cred::INIT_CRED;
 use hashbrown::HashMap;
 use log::{debug, error, info, warn};
 use system_error::SystemError;
@@ -63,10 +65,11 @@ use crate::{
 };
 use timer::AlarmTimer;
 
-use self::kthread::WorkerPrivate;
+use self::{cred::Cred, kthread::WorkerPrivate};
 
 pub mod abi;
 pub mod c_adapter;
+pub mod cred;
 pub mod exec;
 pub mod exit;
 pub mod fork;
@@ -648,6 +651,9 @@ pub struct ProcessControlBlock {
 
     /// 进程的robust lock列表
     robust_list: RwLock<Option<RobustListHead>>,
+
+    /// 进程作为主体的凭证集
+    cred: SpinLock<Cred>,
 }
 
 impl ProcessControlBlock {
@@ -686,12 +692,16 @@ impl ProcessControlBlock {
 
     #[inline(never)]
     fn do_create_pcb(name: String, kstack: KernelStack, is_idle: bool) -> Arc<Self> {
-        let (pid, ppid, cwd) = if is_idle {
-            (Pid(0), Pid(0), "/".to_string())
+        let (pid, ppid, cwd, cred) = if is_idle {
+            let cred = INIT_CRED.clone();
+            (Pid(0), Pid(0), "/".to_string(), cred)
         } else {
             let ppid = ProcessManager::current_pcb().pid();
+            let mut cred = ProcessManager::current_pcb().cred();
+            cred.cap_permitted = cred.cap_ambient;
+            cred.cap_effective = cred.cap_ambient;
             let cwd = ProcessManager::current_pcb().basic().cwd();
-            (Self::generate_pid(), ppid, cwd)
+            (Self::generate_pid(), ppid, cwd, cred)
         };
 
         let basic_info = ProcessBasicInfo::new(Pid(0), ppid, name, cwd, None);
@@ -726,6 +736,7 @@ impl ProcessControlBlock {
             thread: RwLock::new(ThreadInfo::new()),
             alarm_timer: SpinLock::new(None),
             robust_list: RwLock::new(None),
+            cred: SpinLock::new(cred),
         };
 
         // 初始化系统调用栈
@@ -878,6 +889,11 @@ impl ProcessControlBlock {
         return self.basic.read().fd_table().unwrap();
     }
 
+    #[inline(always)]
+    pub fn cred(&self) -> Cred {
+        self.cred.lock().clone()
+    }
+
     /// 根据文件描述符序号，获取socket对象的Arc指针
     ///
     /// ## 参数
@@ -922,11 +938,11 @@ impl ProcessControlBlock {
     }
 
     /// 生成进程的名字
-    pub fn generate_name(program_path: &str, args: &Vec<String>) -> String {
+    pub fn generate_name(program_path: &str, args: &Vec<CString>) -> String {
         let mut name = program_path.to_string();
         for arg in args {
             name.push(' ');
-            name.push_str(arg);
+            name.push_str(arg.to_string_lossy().as_ref());
         }
         return name;
     }

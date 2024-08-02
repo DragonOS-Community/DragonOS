@@ -38,8 +38,9 @@ pub(super) fn do_faccessat(
     // let follow_symlink = flags & AtFlags::AT_SYMLINK_NOFOLLOW.bits() as u32 == 0;
 
     let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+    let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
 
-    let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
+    let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
     // 如果找不到文件，则返回错误码ENOENT
     let _inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
@@ -50,8 +51,9 @@ pub(super) fn do_faccessat(
 
 pub fn do_fchmodat(dirfd: i32, path: *const u8, _mode: ModeType) -> Result<usize, SystemError> {
     let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+    let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
 
-    let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
+    let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
     // 如果找不到文件，则返回错误码ENOENT
     let _inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;

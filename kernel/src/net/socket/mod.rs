@@ -37,13 +37,14 @@ use self::{
 };
 
 use super::{
-    event_poll::{EPollEventType, EPollItem, EventPoll},
-    Endpoint, Protocol, ShutdownType,
+    event_poll::{EPollEventType, EPollItem, EventPoll}, Endpoint, Protocol, ShutdownType, SocketOptionsLevel
 };
 
 pub mod handle;
 pub mod inet;
 pub mod unix;
+pub mod tcp_def;
+pub mod ip_def;
 
 lazy_static! {
     /// 所有socket的集合
@@ -222,9 +223,12 @@ pub trait Socket: Sync + Send + Debug + Any {
     /// @param optval 选项的值
     ///
     /// @return 返回设置是否成功, 如果不支持该选项，返回ENOSYS
+    /// 
+    /// ## See
+    /// https://code.dragonos.org.cn/s?refs=sk_setsockopt&project=linux-6.6.21
     fn setsockopt(
         &self,
-        _level: usize,
+        _level: SocketOptionsLevel,
         _optname: usize,
         _optval: &[u8],
     ) -> Result<(), SystemError> {

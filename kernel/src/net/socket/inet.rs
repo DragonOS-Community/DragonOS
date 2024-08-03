@@ -7,7 +7,7 @@ use smoltcp::{
 use system_error::SystemError;
 
 use crate::{
-    driver::net::NetDevice,
+    driver::net::Iface,
     libs::rwlock::RwLock,
     net::{
         event_poll::EPollEventType, net_core::poll_ifaces, socket::tcp_def::TcpOptions, syscall::PosixSocketOption, Endpoint, Protocol, ShutdownType, NET_DEVICES, SocketOptionsLevel
@@ -1321,7 +1321,7 @@ impl Socket for TcpSocket {
             PORT_MANAGER.bind_port(self.metadata.socket_type, temp_port)?;
 
             // debug!("temp_port: {}", temp_port);
-            let iface: Arc<dyn NetDevice> = NET_DEVICES.write_irqsave().get(&0).unwrap().clone();
+            let iface: Arc<dyn Iface> = NET_DEVICES.write_irqsave().get(&0).unwrap().clone();
             let mut inner_iface = iface.inner_iface().lock();
             // debug!("to connect: {ip:?}");
 

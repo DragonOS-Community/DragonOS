@@ -49,7 +49,7 @@ pub mod ip_def;
 lazy_static! {
     /// 所有socket的集合
     /// TODO: 优化这里，自己实现SocketSet！！！现在这样的话，不管全局有多少个网卡，每个时间点都只会有1个进程能够访问socket
-    pub static ref SOCKET_SET: SpinLock<SocketSet<'static >> = SpinLock::new(SocketSet::new(vec![]));
+    // pub static ref SOCKET_SET: SpinLock<SocketSet<'static >> = SpinLock::new(SocketSet::new(vec![]));
     /// SocketHandle表，每个SocketHandle对应一个SocketHandleItem，
     /// 注意！：在网卡中断中需要拿到这张表的🔓，在获取读锁时应该确保关中断避免死锁
     pub static ref HANDLE_MAP: RwLock<HashMap<GlobalSocketHandle, SocketHandleItem>> = RwLock::new(HashMap::new());
@@ -496,6 +496,7 @@ impl SocketHandleItem {
 
 /// # TCP 和 UDP 的端口管理器。
 /// 如果 TCP/UDP 的 socket 绑定了某个端口，它会在对应的表中记录，以检测端口冲突。
+#[derive(Debug)]
 pub struct PortManager {
     // TCP 端口记录表
     tcp_port_table: SpinLock<HashMap<u16, Pid>>,

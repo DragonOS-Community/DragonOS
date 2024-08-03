@@ -15,7 +15,7 @@ use smoltcp::{iface, phy, wire};
 use unified_init::macros::unified_init;
 use virtio_drivers::device::net::VirtIONet;
 
-use super::NetDevice;
+use super::Iface;
 use crate::{
     arch::rand::rand,
     driver::{
@@ -129,12 +129,12 @@ impl Debug for VirtIONicDeviceInner {
 
 #[cast_to([sync] VirtIODevice)]
 #[cast_to([sync] Device)]
+#[derive(Debug)]
 pub struct VirtioInterface {
     device_inner: VirtIONicDeviceInnerWrapper,
-    iface_id: usize,
     iface_name: String,
+    iface_common: super::IfaceCommon,
     dev_id: Arc<DeviceId>,
-    iface: SpinLock<iface::Interface>,
     inner: SpinLock<InnerVirtIOInterface>,
     locked_kobj_state: LockedKObjectState,
 }
@@ -145,18 +145,6 @@ struct InnerVirtIOInterface {
     virtio_index: Option<VirtIODeviceIndex>,
     device_common: DeviceCommonData,
     kobj_common: KObjectCommonData,
-}
-
-impl core::fmt::Debug for VirtioInterface {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("VirtioInterface")
-            .field("iface_id", &self.iface_id)
-            .field("iface_name", &self.iface_name)
-            .field("dev_id", &self.dev_id)
-            .field("inner", &self.inner)
-            .field("locked_kobj_state", &self.locked_kobj_state)
-            .finish()
-    }
 }
 
 impl VirtioInterface {
@@ -171,10 +159,9 @@ impl VirtioInterface {
 
         let result = Arc::new(VirtioInterface {
             device_inner: VirtIONicDeviceInnerWrapper(UnsafeCell::new(device_inner)),
-            iface_id,
             locked_kobj_state: LockedKObjectState::default(),
-            iface: SpinLock::new(iface),
             iface_name: format!("eth{}", iface_id),
+            iface_common: super::IfaceCommon::new(iface_id, iface),
             dev_id,
             inner: SpinLock::new(InnerVirtIOInterface {
                 name: None,
@@ -245,7 +232,7 @@ impl VirtIODevice for VirtioInterface {
 impl Drop for VirtioInterface {
     fn drop(&mut self) {
         // 从全局的网卡接口信息表中删除这个网卡的接口信息
-        NET_DEVICES.write_irqsave().remove(&self.iface_id);
+        NET_DEVICES.write_irqsave().remove(&self.nic_id());
     }
 }
 
@@ -431,15 +418,14 @@ pub fn virtio_net(transport: VirtIOTransport, dev_id: Arc<DeviceId>) {
         .expect("Add virtio net failed");
 }
 
-impl NetDevice for VirtioInterface {
+impl Iface for VirtioInterface {
+    fn common(&self) -> &super::IfaceCommon {
+        &self.iface_common
+    }
+
     fn mac(&self) -> wire::EthernetAddress {
         let mac: [u8; 6] = self.device_inner.inner.lock().mac_address();
         return wire::EthernetAddress::from_bytes(&mac);
-    }
-
-    #[inline]
-    fn nic_id(&self) -> usize {
-        return self.iface_id;
     }
 
     #[inline]
@@ -447,41 +433,10 @@ impl NetDevice for VirtioInterface {
         return self.iface_name.clone();
     }
 
-    fn update_ip_addrs(&self, ip_addrs: &[wire::IpCidr]) -> Result<(), SystemError> {
-        if ip_addrs.len() != 1 {
-            return Err(SystemError::EINVAL);
-        }
-
-        self.iface.lock().update_ip_addrs(|addrs| {
-            let dest = addrs.iter_mut().next();
-
-            if let Some(dest) = dest {
-                *dest = ip_addrs[0];
-            } else {
-                addrs
-                    .push(ip_addrs[0])
-                    .expect("Push wire::IpCidr failed: full");
-            }
-        });
-        return Ok(());
+    fn poll(&self) -> Result<(), SystemError> {
+        self.iface_common.poll(self.device_inner.force_get_mut())
     }
 
-    fn poll(&self, sockets: &mut iface::SocketSet) -> Result<(), SystemError> {
-        let timestamp: smoltcp::time::Instant = Instant::now().into();
-        let mut guard = self.iface.lock();
-        let poll_res = guard.poll(timestamp, self.device_inner.force_get_mut(), sockets);
-        // todo: notify!!!
-        // debug!("Virtio Interface poll:{poll_res}");
-        if poll_res {
-            return Ok(());
-        }
-        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-    }
-
-    #[inline(always)]
-    fn inner_iface(&self) -> &SpinLock<iface::Interface> {
-        return &self.iface;
-    }
     // fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
     //     return self;
     // }

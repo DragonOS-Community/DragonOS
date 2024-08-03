@@ -4,7 +4,7 @@ use smoltcp::{socket::dhcpv4, wire};
 use system_error::SystemError;
 
 use crate::{
-    driver::net::NetDevice,
+    driver::net::Iface,
     libs::rwlock::RwLockReadGuard,
     net::{socket::SocketPollMethod, NET_DEVICES},
     time::timer::{next_n_ms_timer_jiffies, Timer, TimerFunction},
@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     event_poll::{EPollEventType, EventPoll},
-    socket::{handle::GlobalSocketHandle, inet::TcpSocket, HANDLE_MAP, SOCKET_SET},
+    socket::{handle::GlobalSocketHandle, inet::TcpSocket, HANDLE_MAP},
 };
 
 /// The network poll function, which will be called by timer.
@@ -122,14 +122,13 @@ fn dhcp_query() -> Result<(), SystemError> {
 }
 
 pub fn poll_ifaces() {
-    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDevice>>> = NET_DEVICES.read_irqsave();
+    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn Iface>>> = NET_DEVICES.read_irqsave();
     if guard.len() == 0 {
         warn!("poll_ifaces: No net driver found!");
         return;
     }
-    let mut sockets = SOCKET_SET.lock_irqsave();
     for (_, iface) in guard.iter() {
-        iface.poll(&mut sockets).ok();
+        let _ = iface.poll();
     }
     let _ = send_event(&sockets);
 }
@@ -142,25 +141,17 @@ pub fn poll_ifaces() {
 pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
     let mut i = 0;
     while i < times {
-        let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDevice>>> =
+        let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn Iface>>> =
             NET_DEVICES.read_irqsave();
         if guard.len() == 0 {
             warn!("poll_ifaces: No net driver found!");
             // 没有网卡，返回错误
             return Err(SystemError::ENODEV);
         }
-        let sockets = SOCKET_SET.try_lock_irqsave();
-        // 加锁失败，继续尝试
-        if sockets.is_err() {
-            i += 1;
-            continue;
-        }
-
-        let mut sockets = sockets.unwrap();
         for (_, iface) in guard.iter() {
-            iface.poll(&mut sockets).ok();
+            iface.poll().ok();
         }
-        send_event(&sockets)?;
+        send_event()?;
         return Ok(());
     }
     // 尝试次数用完，返回错误
@@ -173,25 +164,26 @@ pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
 /// @return 加锁超时，返回SystemError::EAGAIN_OR_EWOULDBLOCK
 /// @return 没有网卡，返回SystemError::ENODEV
 pub fn poll_ifaces_try_lock_onetime() -> Result<(), SystemError> {
-    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDevice>>> = NET_DEVICES.read_irqsave();
+    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn Iface>>> = NET_DEVICES.read_irqsave();
     if guard.len() == 0 {
         warn!("poll_ifaces: No net driver found!");
         // 没有网卡，返回错误
         return Err(SystemError::ENODEV);
     }
-    let mut sockets = SOCKET_SET.try_lock_irqsave()?;
     for (_, iface) in guard.iter() {
-        iface.poll(&mut sockets).ok();
+        let _ = iface.poll();
     }
     send_event(&sockets)?;
     return Ok(());
 }
 
 /// ### 处理轮询后的事件
-fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
-    for (handle, socket_type) in sockets.iter() {
-        let handle_guard = HANDLE_MAP.read_irqsave();
+fn send_event() -> Result<(), SystemError> {
+    for (handle, socket_type) in .iter() {
+
         let global_handle = GlobalSocketHandle::new_smoltcp_handle(handle);
+
+        let handle_guard = HANDLE_MAP.read_irqsave();
         let item: Option<&super::socket::SocketHandleItem> = handle_guard.get(&global_handle);
         if item.is_none() {
             continue;

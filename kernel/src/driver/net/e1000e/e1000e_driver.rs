@@ -8,7 +8,7 @@ use crate::{
             device::{bus::Bus, driver::Driver, Device, DeviceType, IdTable},
             kobject::{KObjType, KObject, KObjectState},
         },
-        net::NetDevice,
+        net::{Iface, IfaceCommon},
     },
     libs::spinlock::SpinLock,
     net::{generate_iface_id, NET_DEVICES},
@@ -26,7 +26,7 @@ use core::{
 use log::info;
 use smoltcp::{
     phy,
-    wire::{self, HardwareAddress},
+    wire::HardwareAddress,
 };
 use system_error::SystemError;
 
@@ -73,10 +73,10 @@ impl Debug for E1000EDriverWrapper {
     }
 }
 
+#[derive(Debug)]
 pub struct E1000EInterface {
     driver: E1000EDriverWrapper,
-    iface_id: usize,
-    iface: SpinLock<smoltcp::iface::Interface>,
+    common: IfaceCommon,
     name: String,
 }
 impl phy::RxToken for E1000ERxToken {
@@ -184,25 +184,13 @@ impl E1000EInterface {
         let iface =
             smoltcp::iface::Interface::new(iface_config, &mut driver, Instant::now().into());
 
-        let driver: E1000EDriverWrapper = E1000EDriverWrapper(UnsafeCell::new(driver));
         let result = Arc::new(E1000EInterface {
-            driver,
-            iface_id,
-            iface: SpinLock::new(iface),
+            driver: E1000EDriverWrapper(UnsafeCell::new(driver)),
+            common: IfaceCommon::new(iface_id, iface),
             name: format!("eth{}", iface_id),
         });
 
         return result;
-    }
-}
-
-impl Debug for E1000EInterface {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("E1000EInterface")
-            .field("iface_id", &self.iface_id)
-            .field("iface", &"smoltcp::iface::Interface")
-            .field("name", &self.name)
-            .finish()
     }
 }
 
@@ -248,15 +236,14 @@ impl Device for E1000EInterface {
     }
 }
 
-impl NetDevice for E1000EInterface {
+impl Iface for E1000EInterface {
+    fn common(&self) -> &IfaceCommon {
+        return &self.common;
+    }
+
     fn mac(&self) -> smoltcp::wire::EthernetAddress {
         let mac = self.driver.inner.lock().mac_address();
         return smoltcp::wire::EthernetAddress::from_bytes(&mac);
-    }
-
-    #[inline]
-    fn nic_id(&self) -> usize {
-        return self.iface_id;
     }
 
     #[inline]
@@ -264,36 +251,8 @@ impl NetDevice for E1000EInterface {
         return self.name.clone();
     }
 
-    fn update_ip_addrs(&self, ip_addrs: &[wire::IpCidr]) -> Result<(), SystemError> {
-        if ip_addrs.len() != 1 {
-            return Err(SystemError::EINVAL);
-        }
-
-        self.iface.lock().update_ip_addrs(|addrs| {
-            let dest = addrs.iter_mut().next();
-
-            if let Some(dest) = dest {
-                *dest = ip_addrs[0];
-            } else {
-                addrs.push(ip_addrs[0]).expect("Push ipCidr failed: full");
-            }
-        });
-        return Ok(());
-    }
-
-    fn poll(&self, sockets: &mut smoltcp::iface::SocketSet) -> Result<(), SystemError> {
-        let timestamp: smoltcp::time::Instant = Instant::now().into();
-        let mut guard = self.iface.lock();
-        let poll_res = guard.poll(timestamp, self.driver.force_get_mut(), sockets);
-        if poll_res {
-            return Ok(());
-        }
-        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-    }
-
-    #[inline(always)]
-    fn inner_iface(&self) -> &SpinLock<smoltcp::iface::Interface> {
-        return &self.iface;
+    fn poll(&self) -> Result<(), SystemError> {
+        self.common.poll(self.driver.force_get_mut())
     }
 }
 

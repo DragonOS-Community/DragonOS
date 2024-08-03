@@ -131,7 +131,6 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         }
     }
 
-
     // Arch specific syscall
     match syscall_num {
         SYS_RT_SIGRETURN => {

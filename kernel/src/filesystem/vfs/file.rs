@@ -20,7 +20,7 @@ use crate::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
         socket::SocketInode,
     },
-    process::ProcessManager,
+    process::{cred::Cred, ProcessManager},
 };
 
 use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
@@ -131,6 +131,8 @@ pub struct File {
     /// readdir时候用的，暂存的本次循环中，所有子目录项的名字的数组
     readdir_subdirs_name: SpinLock<Vec<String>>,
     pub private_data: SpinLock<FilePrivateData>,
+    /// 文件的凭证
+    cred: Cred,
 }
 
 impl File {
@@ -154,6 +156,7 @@ impl File {
             file_type,
             readdir_subdirs_name: SpinLock::new(Vec::default()),
             private_data: SpinLock::new(FilePrivateData::default()),
+            cred: ProcessManager::current_pcb().cred(),
         };
         f.inode.open(f.private_data.lock(), &mode)?;
 
@@ -408,6 +411,7 @@ impl File {
             file_type: self.file_type,
             readdir_subdirs_name: SpinLock::new(self.readdir_subdirs_name.lock().clone()),
             private_data: SpinLock::new(self.private_data.lock().clone()),
+            cred: self.cred.clone(),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
         if self

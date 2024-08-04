@@ -45,6 +45,10 @@ pub mod inet;
 pub mod unix;
 pub mod tcp_def;
 pub mod ip_def;
+pub mod inode;
+pub mod common;
+
+pub use inode::SocketInode;
 
 lazy_static! {
     /// 所有socket的集合
@@ -246,36 +250,9 @@ pub trait Socket: Sync + Send + Debug + Any {
 
     fn as_any_mut(&mut self) -> &mut dyn Any;
 
-    fn add_epoll(&mut self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
-        let posix_item = self.posix_item();
-        posix_item.add_epoll(epitem);
-        Ok(())
-    }
-
-    fn remove_epoll(&mut self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
-        let posix_item = self.posix_item();
-        posix_item.remove_epoll(epoll)?;
-
-        Ok(())
-    }
-
-    fn clear_epoll(&mut self) -> Result<(), SystemError> {
-        let posix_item = self.posix_item();
-
-        for epitem in posix_item.epitems.lock_irqsave().iter() {
-            let epoll = epitem.epoll();
-
-            if let Some(epoll) = epoll.upgrade() {
-                EventPoll::ep_remove(&mut epoll.lock_irqsave(), epitem.fd(), None)?;
-            }
-        }
-
-        Ok(())
-    }
-
     fn close(&mut self);
 
-    fn posix_item(&self) -> Arc<PosixSocketHandleItem>;
+    // fn posix_item(&self) -> Arc<PosixSocketHandleItem>;
 }
 
 impl Clone for Box<dyn Socket> {
@@ -284,126 +261,6 @@ impl Clone for Box<dyn Socket> {
     }
 }
 
-/// # Socket在文件系统中的inode封装
-#[derive(Debug)]
-pub struct SocketInode(SpinLock<Box<dyn Socket>>, AtomicUsize);
-
-impl SocketInode {
-    pub fn new(socket: Box<dyn Socket>) -> Arc<Self> {
-        Arc::new(Self(SpinLock::new(socket), AtomicUsize::new(0)))
-    }
-
-    #[inline]
-    pub fn inner(&self) -> SpinLockGuard<Box<dyn Socket>> {
-        self.0.lock()
-    }
-
-    pub unsafe fn inner_no_preempt(&self) -> SpinLockGuard<Box<dyn Socket>> {
-        self.0.lock_no_preempt()
-    }
-
-    fn do_close(&self) -> Result<(), SystemError> {
-        let prev_ref_count = self.1.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
-        if prev_ref_count == 1 {
-            // 最后一次关闭，需要释放
-            let mut socket = self.0.lock_irqsave();
-
-            if socket.metadata().socket_type == SocketType::Unix {
-                return Ok(());
-            }
-
-            if let Some(Endpoint::Ip(Some(ip))) = socket.endpoint() {
-                PORT_MANAGER.unbind_port(socket.metadata().socket_type, ip.port);
-            }
-
-            socket.clear_epoll()?;
-
-            HANDLE_MAP
-                .write_irqsave()
-                .remove(&socket.socket_handle())
-                .unwrap();
-            socket.close();
-        }
-
-        Ok(())
-    }
-}
-
-impl Drop for SocketInode {
-    fn drop(&mut self) {
-        for _ in 0..self.1.load(core::sync::atomic::Ordering::SeqCst) {
-            let _ = self.do_close();
-        }
-    }
-}
-
-impl IndexNode for SocketInode {
-    fn open(
-        &self,
-        _data: SpinLockGuard<FilePrivateData>,
-        _mode: &FileMode,
-    ) -> Result<(), SystemError> {
-        self.1.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
-        self.do_close()
-    }
-
-    fn read_at(
-        &self,
-        _offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        data: SpinLockGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        drop(data);
-        self.0.lock_no_preempt().read(&mut buf[0..len]).0
-    }
-
-    fn write_at(
-        &self,
-        _offset: usize,
-        len: usize,
-        buf: &[u8],
-        data: SpinLockGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        drop(data);
-        self.0.lock_no_preempt().write(&buf[0..len], None)
-    }
-
-    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        let events = self.0.lock_irqsave().poll();
-        return Ok(events.bits() as usize);
-    }
-
-    fn fs(&self) -> Arc<dyn FileSystem> {
-        todo!()
-    }
-
-    fn as_any_ref(&self) -> &dyn Any {
-        self
-    }
-
-    fn list(&self) -> Result<Vec<String>, SystemError> {
-        return Err(SystemError::ENOTDIR);
-    }
-
-    fn metadata(&self) -> Result<Metadata, SystemError> {
-        let meta = Metadata {
-            mode: ModeType::from_bits_truncate(0o755),
-            file_type: FileType::Socket,
-            ..Default::default()
-        };
-
-        return Ok(meta);
-    }
-
-    fn resize(&self, _len: usize) -> Result<(), SystemError> {
-        return Ok(());
-    }
-}
 
 #[derive(Debug)]
 pub struct PosixSocketHandleItem {
@@ -420,6 +277,7 @@ impl PosixSocketHandleItem {
             epitems: SpinLock::new(LinkedList::new()),
         }
     }
+
     /// ## 在socket的等待队列上睡眠
     pub fn sleep(&self, events: u64) {
         unsafe {
@@ -459,6 +317,7 @@ impl PosixSocketHandleItem {
         self.wait_queue.wakeup_any(events);
     }
 }
+
 #[derive(Debug)]
 pub struct SocketHandleItem {
     /// 对应的posix socket是否为listen的

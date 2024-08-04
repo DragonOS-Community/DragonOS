@@ -4,11 +4,10 @@ use core::{
 };
 
 use alloc::{collections::BTreeMap, sync::Arc};
+use socket::SocketInode;
 
 use crate::{driver::net::Iface, libs::rwlock::RwLock};
 use smoltcp::wire::IpEndpoint;
-
-use self::socket::SocketInode;
 
 pub mod event_poll;
 pub mod net_core;

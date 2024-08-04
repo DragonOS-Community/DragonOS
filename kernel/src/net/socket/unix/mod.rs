@@ -4,7 +4,7 @@ use system_error::SystemError;
 use crate::{libs::spinlock::SpinLock, net::Endpoint};
 
 use super::{
-    handle::GlobalSocketHandle, PosixSocketHandleItem, Socket, SocketInode, SocketMetadata,
+    handle::GlobalSocketHandle, PosixSocketHandleItem, Socket, inode::SocketInode, SocketMetadata,
     SocketOptions, SocketType,
 };
 
@@ -51,9 +51,7 @@ impl StreamSocket {
 }
 
 impl Socket for StreamSocket {
-    fn posix_item(&self) -> Arc<PosixSocketHandleItem> {
-        self.posix_item.clone()
-    }
+
     fn socket_handle(&self) -> GlobalSocketHandle {
         self.handle
     }
@@ -166,9 +164,7 @@ impl SeqpacketSocket {
 }
 
 impl Socket for SeqpacketSocket {
-    fn posix_item(&self) -> Arc<PosixSocketHandleItem> {
-        self.posix_item.clone()
-    }
+
     fn close(&mut self) {}
 
     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {

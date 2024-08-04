@@ -18,7 +18,7 @@ use crate::{
     libs::{rwlock::RwLock, spinlock::SpinLock},
     net::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
-        socket::SocketInode,
+        socket::inode::SocketInode,
     },
     process::{cred::Cred, ProcessManager},
 };

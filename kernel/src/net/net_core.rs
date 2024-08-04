@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     event_poll::{EPollEventType, EventPoll},
-    socket::{handle::GlobalSocketHandle, inet::TcpSocket, HANDLE_MAP},
+    socket::{handle::GlobalSocketHandle, inet::TcpSocket, HANDLE_MAP, SOCKET_SET},
 };
 
 /// The network poll function, which will be called by timer.
@@ -130,7 +130,7 @@ pub fn poll_ifaces() {
     for (_, iface) in guard.iter() {
         let _ = iface.poll();
     }
-    let _ = send_event(&sockets);
+    let _ = send_event();
 }
 
 /// 对ifaces进行轮询，最多对SOCKET_SET尝试times次加锁。
@@ -173,13 +173,13 @@ pub fn poll_ifaces_try_lock_onetime() -> Result<(), SystemError> {
     for (_, iface) in guard.iter() {
         let _ = iface.poll();
     }
-    send_event(&sockets)?;
+    send_event()?;
     return Ok(());
 }
 
 /// ### 处理轮询后的事件
 fn send_event() -> Result<(), SystemError> {
-    for (handle, socket_type) in .iter() {
+    for (handle, socket_type) in .lock().iter() {
 
         let global_handle = GlobalSocketHandle::new_smoltcp_handle(handle);
 
@@ -226,11 +226,6 @@ fn send_event() -> Result<(), SystemError> {
             EPollEventType::from_bits_truncate(events as u32),
         )?;
         drop(handle_guard);
-        // crate::debug!(
-        //     "{} send_event {:?}",
-        //     handle,
-        //     EPollEventType::from_bits_truncate(events as u32)
-        // );
     }
     Ok(())
 }

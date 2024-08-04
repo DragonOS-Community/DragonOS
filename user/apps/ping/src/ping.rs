@@ -34,8 +34,8 @@ impl Ping {
     /// 使用config进行ping的配置
     pub fn new(config: Config) -> std::io::Result<Self> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))?;
-        let src = SocketAddr::new(net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), 12580);
-        let dest = SocketAddr::new(config.address.ip, 12580);
+        let src = SocketAddr::new(net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), 12549);
+        let dest = SocketAddr::new(config.address.ip, 12549);
         socket.bind(&src.into())?;
         // socket.set_ttl(64)?;
         // socket.set_read_timeout(Some(Duration::from_secs(config.timeout)))?;
@@ -93,19 +93,6 @@ impl Ping {
         let send = Arc::new(AtomicU64::new(0));
         let _send = send.clone();
         let this = Arc::new(self.clone());
-        // let (sx, rx) = bounded(this.config.count as usize);
-        // //创建线程负责重复执行ping
-        // thread::spawn(move || {
-        //     for i in 0..this.config.count {
-        //         let _this = this.clone();
-        //         sx.send(thread::spawn(move || _this.ping(i))).unwrap();
-        //         _send.fetch_add(1, Ordering::SeqCst);
-        //         if i < this.config.count - 1 {
-        //             thread::sleep(Duration::from_millis(this.config.interval));
-        //         }
-        //     }
-        //     drop(sx);
-        // });
 
         let success = Arc::new(AtomicU64::new(0));
         let _success = success.clone();
@@ -115,34 +102,6 @@ impl Ping {
         this.ping(0);
 
         _success.fetch_add(1, Ordering::SeqCst);
-
-        // let (summary_s, summary_r) = bounded(0);
-
-        // thread::spawn(move || {
-        //     for handle in rx.iter() {
-        //         if let Some(res) = handle.join().ok() {
-        //             if res.is_ok() {
-        //                 _success.fetch_add(1, Ordering::SeqCst);
-        //             }
-        //         }
-        //     }
-        //     summary_s.send(()).unwrap();
-        // });
-
-        // let stop = signal_notify()?;
-
-        // select! {
-        //     recv(stop) -> sig => {
-        //         if let Some(s) = sig.ok() {
-        //             println!("Receive signal {:?}", s)
-        //         }
-        //     },
-        //     recv(summary_r) -> summary => {
-        //         if let Some(e) = summary.err() {
-        //             println!("Error on summary: {}", e);
-        //         }
-        //     }
-        // };
 
         let total = _now.elapsed().as_micros() as f64 / 1000.0;
         let send = send.load(Ordering::SeqCst);
@@ -161,17 +120,17 @@ impl Ping {
     }
 }
 
-/// # 创建一个进程用于监听用户是否提前退出程序
-fn signal_notify() -> std::io::Result<Receiver<i32>> {
-    let (s, r) = bounded(1);
+// /// # 创建一个进程用于监听用户是否提前退出程序
+// fn signal_notify() -> std::io::Result<Receiver<i32>> {
+//     let (s, r) = bounded(1);
 
-    let mut signals = signal_hook::iterator::Signals::new(&[SIGINT, SIGTERM])?;
+//     let mut signals = signal_hook::iterator::Signals::new(&[SIGINT, SIGTERM])?;
 
-    thread::spawn(move || {
-        for signal in signals.forever() {
-            s.send(signal).unwrap();
-            break;
-        }
-    });
-    Ok(r)
-}
+//     thread::spawn(move || {
+//         for signal in signals.forever() {
+//             s.send(signal).unwrap();
+//             break;
+//         }
+//     });
+//     Ok(r)
+// }

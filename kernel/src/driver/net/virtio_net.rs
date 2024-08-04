@@ -391,6 +391,7 @@ impl phy::TxToken for VirtioNetToken {
         let mut tx_buf = driver_net.new_tx_buffer(len);
         let result = f(tx_buf.packet_mut());
         driver_net.send(tx_buf).expect("virtio_net send failed");
+        debug!("virtonet send!");
         return result;
     }
 }
@@ -471,7 +472,7 @@ impl NetDevice for VirtioInterface {
         let mut guard = self.iface.lock();
         let poll_res = guard.poll(timestamp, self.device_inner.force_get_mut(), sockets);
         // todo: notify!!!
-        // debug!("Virtio Interface poll:{poll_res}");
+        debug!("Virtio Interface poll:{poll_res}");
         if poll_res {
             return Ok(());
         }

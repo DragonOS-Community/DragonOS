@@ -34,12 +34,12 @@ impl Ping {
     /// 使用config进行ping的配置
     pub fn new(config: Config) -> std::io::Result<Self> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))?;
-        let src = SocketAddr::new(net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), 12345);
-        let dest = SocketAddr::new(config.address.ip, 12345);
+        let src = SocketAddr::new(net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), 12580);
+        let dest = SocketAddr::new(config.address.ip, 12580);
         socket.bind(&src.into())?;
-        socket.set_ttl(64)?;
-        socket.set_read_timeout(Some(Duration::from_secs(config.timeout)))?;
-        socket.set_write_timeout(Some(Duration::from_secs(config.timeout)))?;
+        // socket.set_ttl(64)?;
+        // socket.set_read_timeout(Some(Duration::from_secs(config.timeout)))?;
+        // socket.set_write_timeout(Some(Duration::from_secs(config.timeout)))?;
         Ok(Self {
             config,
             dest,
@@ -93,50 +93,56 @@ impl Ping {
         let send = Arc::new(AtomicU64::new(0));
         let _send = send.clone();
         let this = Arc::new(self.clone());
-        let (sx, rx) = bounded(this.config.count as usize);
-        //创建线程负责重复执行ping
-        thread::spawn(move || {
-            for i in 0..this.config.count {
-                let _this = this.clone();
-                sx.send(thread::spawn(move || _this.ping(i))).unwrap();
-                _send.fetch_add(1, Ordering::SeqCst);
-                if i < this.config.count - 1 {
-                    thread::sleep(Duration::from_millis(this.config.interval));
-                }
-            }
-            drop(sx);
-        });
+        // let (sx, rx) = bounded(this.config.count as usize);
+        // //创建线程负责重复执行ping
+        // thread::spawn(move || {
+        //     for i in 0..this.config.count {
+        //         let _this = this.clone();
+        //         sx.send(thread::spawn(move || _this.ping(i))).unwrap();
+        //         _send.fetch_add(1, Ordering::SeqCst);
+        //         if i < this.config.count - 1 {
+        //             thread::sleep(Duration::from_millis(this.config.interval));
+        //         }
+        //     }
+        //     drop(sx);
+        // });
 
         let success = Arc::new(AtomicU64::new(0));
         let _success = success.clone();
 
-        let (summary_s, summary_r) = bounded(0);
+        _send.fetch_add(1,Ordering::SeqCst);
 
-        thread::spawn(move || {
-            for handle in rx.iter() {
-                if let Some(res) = handle.join().ok() {
-                    if res.is_ok() {
-                        _success.fetch_add(1, Ordering::SeqCst);
-                    }
-                }
-            }
-            summary_s.send(()).unwrap();
-        });
+        this.ping(0);
 
-        let stop = signal_notify()?;
+        _success.fetch_add(1, Ordering::SeqCst);
 
-        select! {
-            recv(stop) -> sig => {
-                if let Some(s) = sig.ok() {
-                    println!("Receive signal {:?}", s)
-                }
-            },
-            recv(summary_r) -> summary => {
-                if let Some(e) = summary.err() {
-                    println!("Error on summary: {}", e);
-                }
-            }
-        };
+        // let (summary_s, summary_r) = bounded(0);
+
+        // thread::spawn(move || {
+        //     for handle in rx.iter() {
+        //         if let Some(res) = handle.join().ok() {
+        //             if res.is_ok() {
+        //                 _success.fetch_add(1, Ordering::SeqCst);
+        //             }
+        //         }
+        //     }
+        //     summary_s.send(()).unwrap();
+        // });
+
+        // let stop = signal_notify()?;
+
+        // select! {
+        //     recv(stop) -> sig => {
+        //         if let Some(s) = sig.ok() {
+        //             println!("Receive signal {:?}", s)
+        //         }
+        //     },
+        //     recv(summary_r) -> summary => {
+        //         if let Some(e) = summary.err() {
+        //             println!("Error on summary: {}", e);
+        //         }
+        //     }
+        // };
 
         let total = _now.elapsed().as_micros() as f64 / 1000.0;
         let send = send.load(Ordering::SeqCst);

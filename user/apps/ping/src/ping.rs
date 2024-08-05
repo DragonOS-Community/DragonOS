@@ -97,11 +97,25 @@ impl Ping {
         let success = Arc::new(AtomicU64::new(0));
         let _success = success.clone();
 
-        _send.fetch_add(1,Ordering::SeqCst);
+        let mut handles = vec![];
 
-        this.ping(0);
+        for i in 0..this.config.count {
+            let _this = this.clone();
+            let handle = thread::spawn(move||{
+                _this.ping(i).unwrap();
+            });
+            _send.fetch_add(1, Ordering::SeqCst);
+            handles.push(handle);
+            if i < this.config.count - 1 {
+                thread::sleep(Duration::from_millis(this.config.interval));
+            }
+        }
 
-        _success.fetch_add(1, Ordering::SeqCst);
+        for handle in handles {
+            if handle.join().is_ok() {
+                _success.fetch_add(1, Ordering::SeqCst);
+            }
+        }
 
         let total = _now.elapsed().as_micros() as f64 / 1000.0;
         let send = send.load(Ordering::SeqCst);
@@ -120,6 +134,7 @@ impl Ping {
     }
 }
 
+//TODO: 等待添加ctrl+c发送信号后添加该特性
 // /// # 创建一个进程用于监听用户是否提前退出程序
 // fn signal_notify() -> std::io::Result<Receiver<i32>> {
 //     let (s, r) = bounded(1);

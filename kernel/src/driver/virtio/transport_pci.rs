@@ -120,7 +120,7 @@ impl PciTransport {
     pub fn new<H: Hal>(
         device: &mut PciDeviceStructureGeneralDevice,
         dev_id: Arc<DeviceId>,
-        add:usize
+        add: usize,
     ) -> Result<Self, VirtioPciError> {
         let irq = VIRTIO_RECV_VECTOR.add(add as u32);
         let header = &device.common_header;
@@ -142,8 +142,8 @@ impl PciTransport {
         let irq_vector = standard_device.irq_vector_mut().unwrap();
         irq_vector.push(irq);
         standard_device
-            .irq_init(IRQ::PCI_IRQ_MSIX|IRQ::PCI_IRQ_MSI)
-            .ok_or_else(|| VirtioPciError::UnableToInitIrq)?;
+            .irq_init(IRQ::PCI_IRQ_MSIX | IRQ::PCI_IRQ_MSI)
+            .ok_or(VirtioPciError::UnableToInitIrq)?;
         // 中断相关信息
         let msg = PciIrqMsg {
             irq_common_message: IrqCommonMsg::init_from(
@@ -478,10 +478,7 @@ impl Display for VirtioPciError {
                 "PCI device vender ID {:#06x} was not the VirtIO vendor ID {:#06x}.",
                 vendor_id, VIRTIO_VENDOR_ID
             ),
-            Self::UnableToInitIrq=>write!(
-                f,
-                "Unable to find capability such as MSIX or MSI."
-            ),
+            Self::UnableToInitIrq => write!(f, "Unable to find capability such as MSIX or MSI."),
             Self::MissingCommonConfig => write!(
                 f,
                 "No valid `VIRTIO_PCI_CAP_COMMON_CFG` capability was found."

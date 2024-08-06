@@ -26,3 +26,4 @@ pub mod rand;
 pub mod wait_queue;
 
 pub mod font;
+pub mod name;

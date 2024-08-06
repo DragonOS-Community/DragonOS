@@ -1,6 +1,6 @@
 use system_error::SystemError;
 
-use super::{page::PageFlags, PageTableKind, PhysAddr, VirtAddr};
+use super::{page::EntryFlags, PageTableKind, PhysAddr, VirtAddr};
 use crate::{
     arch::{
         mm::{LockedFrameAllocator, PageMapper},
@@ -104,7 +104,7 @@ impl KernelMapper {
         mut vaddr: VirtAddr,
         mut paddr: PhysAddr,
         size: usize,
-        flags: PageFlags<MMArch>,
+        flags: EntryFlags<MMArch>,
         flush: bool,
     ) -> Result<(), SystemError> {
         if self.readonly {

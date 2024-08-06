@@ -12,10 +12,14 @@ use alloc::{
     vec::Vec,
 };
 
+use crate::arch::mm::PageMapper;
 use crate::driver::base::device::device_number::DeviceNumber;
+use crate::filesystem::vfs::file::PageCache;
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
+use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
+use crate::mm::VmFaultReason;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
@@ -118,6 +122,9 @@ pub struct FATInode {
 
     /// 目录名
     dname: DName,
+
+    /// 页缓存
+    page_cache: Arc<PageCache>,
 }
 
 impl FATInode {
@@ -187,6 +194,8 @@ impl LockedFATInode {
             FileType::File
         };
 
+        let mut page_cache = PageCache::default();
+
         let inode: Arc<LockedFATInode> = Arc::new(LockedFATInode(SpinLock::new(FATInode {
             parent,
             self_ref: Weak::default(),
@@ -215,11 +224,22 @@ impl LockedFATInode {
             },
             special_node: None,
             dname,
+            page_cache: Arc::new(PageCache::default()),
         })));
+
+        page_cache.inode = Some(Arc::downgrade(&inode) as Weak<dyn IndexNode>);
+
+        inode.0.lock().page_cache = Arc::new(page_cache);
 
         inode.0.lock().self_ref = Arc::downgrade(&inode);
 
         inode.0.lock().update_metadata();
+
+        // inode
+        //     .0
+        //     .lock()
+        //     .page_cache
+        //     .set_inode(Arc::downgrade(&inode) as Weak<dyn IndexNode>);
 
         return inode;
     }
@@ -270,6 +290,20 @@ impl FileSystem for FATFileSystem {
             self.bpb.bytes_per_sector.into(),
             FAT_MAX_NAMELEN,
         )
+    }
+
+    unsafe fn fault(&self, pfm: &mut PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
+        PageFaultHandler::filemap_fault(pfm, mapper)
+    }
+
+    unsafe fn map_pages(
+        &self,
+        pfm: &mut PageFaultMessage,
+        mapper: &mut PageMapper,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
+        PageFaultHandler::filemap_map_pages(pfm, mapper, start_pgoff, end_pgoff)
     }
 }
 
@@ -348,6 +382,7 @@ impl FATFileSystem {
             },
             special_node: None,
             dname: DName::default(),
+            page_cache: Arc::new(PageCache::default()),
         })));
 
         let result: Arc<FATFileSystem> = Arc::new(FATFileSystem {
@@ -1841,6 +1876,10 @@ impl IndexNode for LockedFATInode {
             .upgrade()
             .map(|item| item as Arc<dyn IndexNode>)
             .ok_or(SystemError::EINVAL)
+    }
+
+    fn page_cache(&self) -> Option<Arc<PageCache>> {
+        Some(self.0.lock().page_cache.clone())
     }
 }
 

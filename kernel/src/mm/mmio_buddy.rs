@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use log::{debug, error, info, warn};
 use system_error::SystemError;
 
-use super::page::{PageFlags, PAGE_4K_SIZE};
+use super::page::{EntryFlags, PAGE_4K_SIZE};
 use super::{PhysAddr, VirtAddr};
 
 // 最大的伙伴块的幂
@@ -552,7 +552,7 @@ impl MmioBuddyMemPool {
             unsafe {
                 let x: Option<(
                     PhysAddr,
-                    PageFlags<MMArch>,
+                    EntryFlags<MMArch>,
                     crate::mm::page::PageFlush<MMArch>,
                 )> = kernel_mapper
                     .as_mut()
@@ -677,7 +677,7 @@ impl MMIOSpaceGuard {
             return Err(SystemError::EINVAL);
         }
 
-        let flags = PageFlags::mmio_flags();
+        let flags = EntryFlags::mmio_flags();
 
         let mut kernel_mapper = KernelMapper::lock();
         let r = kernel_mapper.map_phys_with_size(self.vaddr, paddr, length, flags, true);

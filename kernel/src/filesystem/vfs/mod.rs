@@ -12,6 +12,7 @@ use intertrait::CastFromSync;
 use system_error::SystemError;
 
 use crate::{
+    arch::mm::PageMapper,
     driver::base::{
         block::block_device::BlockDevice, char::CharDevice, device::device_number::DeviceNumber,
     },
@@ -20,10 +21,16 @@ use crate::{
         casting::DowncastArc,
         spinlock::{SpinLock, SpinLockGuard},
     },
+    mm::{fault::PageFaultMessage, VmFaultReason},
     time::PosixTimeSpec,
 };
 
-use self::{core::generate_inode_id, file::FileMode, syscall::ModeType, utils::DName};
+use self::{
+    core::generate_inode_id,
+    file::{FileMode, PageCache},
+    syscall::ModeType,
+    utils::DName,
+};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
@@ -556,6 +563,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         return self.find("..");
     }
+
+    fn page_cache(&self) -> Option<Arc<PageCache>> {
+        panic!("function page_cache() has not yet been implemented");
+    }
 }
 
 impl DowncastArc for dyn IndexNode {
@@ -805,6 +816,26 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     fn name(&self) -> &str;
 
     fn super_block(&self) -> SuperBlock;
+
+    unsafe fn fault(&self, _pfm: &mut PageFaultMessage, _mapper: &mut PageMapper) -> VmFaultReason {
+        panic!(
+            "fault() has not yet been implemented for filesystem: {}",
+            crate::libs::name::get_type_name(&self)
+        )
+    }
+
+    unsafe fn map_pages(
+        &self,
+        _pfm: &mut PageFaultMessage,
+        _mapper: &mut PageMapper,
+        _start_pgoff: usize,
+        _end_pgoff: usize,
+    ) -> VmFaultReason {
+        panic!(
+            "map_pages() has not yet been implemented for filesystem: {}",
+            crate::libs::name::get_type_name(&self)
+        )
+    }
 }
 
 impl DowncastArc for dyn FileSystem {

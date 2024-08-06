@@ -8,7 +8,11 @@ use crate::{
     filesystem::procfs::kmsg::kmsg_init,
     ipc::shm::shm_manager_init,
     libs::printk::PrintkWriter,
-    mm::{allocator::slab::slab_init, mmio_buddy::mmio_init, page::page_manager_init},
+    mm::{
+        allocator::slab::slab_init,
+        mmio_buddy::mmio_init,
+        page::{page_manager_init, page_reclaimer_init},
+    },
 };
 
 use super::MemoryManagementArch;
@@ -57,6 +61,8 @@ pub unsafe fn mm_init() {
     page_manager_init();
     // enable SHM_MANAGER
     shm_manager_init();
+    // enable PAGE_RECLAIMER
+    page_reclaimer_init();
 
     MM_INIT
         .compare_exchange(

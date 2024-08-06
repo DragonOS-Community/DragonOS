@@ -10,7 +10,7 @@ use crate::{
         spinlock::SpinLock,
     },
     mm::{
-        allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper, page::PageFlags,
+        allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper, page::EntryFlags,
         MemoryManagementArch,
     },
     time::timer::{Timer, TimerFunction},
@@ -95,7 +95,7 @@ impl VideoRefreshManager {
         let count = PageFrameCount::new(
             page_align_up(frame_buffer_info_guard.buf_size()) / MMArch::PAGE_SIZE,
         );
-        let page_flags: PageFlags<MMArch> = PageFlags::new().set_execute(true).set_write(true);
+        let page_flags: EntryFlags<MMArch> = EntryFlags::new().set_execute(true).set_write(true);
 
         let mut kernel_mapper = KernelMapper::lock();
         let mut kernel_mapper = kernel_mapper.as_mut();

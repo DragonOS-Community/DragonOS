@@ -28,7 +28,7 @@ pub type PageMapper =
 
 impl X86_64MMArch {
     pub fn vma_access_error(vma: Arc<LockedVMA>, error_code: X86PfErrorCode) -> bool {
-        let vm_flags = *vma.lock().vm_flags();
+        let vm_flags = *vma.lock_irqsave().vm_flags();
         let foreign = false;
         if error_code.contains(X86PfErrorCode::X86_PF_PK) {
             return true;
@@ -236,7 +236,7 @@ impl X86_64MMArch {
                     address.data(),
                 )
             });
-            let guard = vma.lock();
+            let guard = vma.lock_irqsave();
             let region = *guard.region();
             let vm_flags = *guard.vm_flags();
             drop(guard);
@@ -271,7 +271,7 @@ impl X86_64MMArch {
             let mapper = &mut space_guard.user_mapper.utable;
 
             fault = PageFaultHandler::handle_mm_fault(
-                PageFaultMessage::new(vma.clone(), address, flags),
+                &mut PageFaultMessage::new(vma.clone(), address, flags),
                 mapper,
             );
 

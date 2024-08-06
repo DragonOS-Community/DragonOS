@@ -113,16 +113,21 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     return Ok(());
 }
 
-fn root_partition() -> Arc<Partition> {
+fn root_partition() -> Result<Arc<Partition>,SystemError> { 
     #[cfg(target_arch = "x86_64")]
     {
         use alloc::string::ToString;
-        return crate::driver::disk::ahci::get_disks_by_name("ahci_disk_0".to_string())
-            .unwrap()
-            .0
-            .lock()
-            .partitions[0]
-            .clone();
+        use crate::driver::base::block::block_device::BlockDevice;
+        if let Some(d)=crate::driver::block::virtio_blk::virtio_blk_0(){
+            return Ok(d.partitions()[0].clone());
+        }
+
+
+        if let Ok(d)=crate::driver::disk::ahci::get_disks_by_name("ahci_disk_0".to_string()){
+            return Ok(d.0.lock().partitions[0].clone());
+        }
+
+        return Err(SystemError::ENXIO);
     }
 
     #[cfg(target_arch = "riscv64")]
@@ -143,7 +148,7 @@ fn root_partition() -> Arc<Partition> {
 }
 pub fn mount_root_fs() -> Result<(), SystemError> {
     info!("Try to mount FAT32 as root fs...");
-    let partiton: Arc<Partition> = root_partition();
+    let partiton: Arc<Partition> = root_partition()?;
 
     let fatfs: Result<Arc<FATFileSystem>, SystemError> = FATFileSystem::new(partiton);
     if fatfs.is_err() {

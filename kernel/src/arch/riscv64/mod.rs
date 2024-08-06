@@ -5,6 +5,7 @@ pub mod elf;
 pub mod init;
 pub mod interrupt;
 pub mod ipc;
+pub mod kprobe;
 mod kvm;
 pub mod mm;
 pub mod msi;

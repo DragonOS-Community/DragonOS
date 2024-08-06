@@ -1,17 +1,18 @@
-use log::{error, warn};
+use log::{error, trace, warn};
 use system_error::SystemError;
 
+use super::{
+    entry::{set_intr_gate, set_system_trap_gate},
+    TrapFrame,
+};
+use crate::exception::debug::DebugException;
+use crate::exception::ebreak::EBreak;
 use crate::{
     arch::{CurrentIrqArch, MMArch},
     exception::InterruptArch,
     mm::VirtAddr,
     process::ProcessManager,
     smp::core::smp_get_processor_id,
-};
-
-use super::{
-    entry::{set_intr_gate, set_system_trap_gate},
-    TrapFrame,
 };
 
 extern "C" {
@@ -125,8 +126,8 @@ unsafe extern "C" fn do_divide_error(regs: &'static TrapFrame, error_code: u64) 
 
 /// 处理调试异常 1 #DB
 #[no_mangle]
-unsafe extern "C" fn do_debug(regs: &'static TrapFrame, error_code: u64) {
-    error!(
+unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
+    trace!(
         "do_debug(1), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -134,7 +135,7 @@ unsafe extern "C" fn do_debug(regs: &'static TrapFrame, error_code: u64) {
         smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
-    panic!("Debug Exception");
+    DebugException::handle(regs).unwrap();
 }
 
 /// 处理NMI中断 2 NMI
@@ -153,8 +154,8 @@ unsafe extern "C" fn do_nmi(regs: &'static TrapFrame, error_code: u64) {
 
 /// 处理断点异常 3 #BP
 #[no_mangle]
-unsafe extern "C" fn do_int3(regs: &'static TrapFrame, error_code: u64) {
-    error!(
+unsafe extern "C" fn do_int3(regs: &'static mut TrapFrame, error_code: u64) {
+    trace!(
         "do_int3(3), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
         regs.rsp,
@@ -162,7 +163,7 @@ unsafe extern "C" fn do_int3(regs: &'static TrapFrame, error_code: u64) {
         smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
-    panic!("Int3");
+    EBreak::handle(regs).unwrap();
 }
 
 /// 处理溢出异常 4 #OF

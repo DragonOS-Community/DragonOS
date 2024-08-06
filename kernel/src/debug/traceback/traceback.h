@@ -15,3 +15,4 @@ extern const char *kallsyms_names __attribute__((weak));
  * @param regs 内核栈结构体
  */
 void traceback(struct pt_regs *regs);
+uint64_t addr_from_symbol(const char *symbol);

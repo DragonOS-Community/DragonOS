@@ -4,7 +4,9 @@ use system_error::SystemError;
 
 use crate::arch::CurrentIrqArch;
 
+pub mod debug;
 pub mod dummychip;
+pub mod ebreak;
 pub mod handle;
 pub mod init;
 pub mod ipi;

@@ -142,7 +142,7 @@ fn root_partition() -> Result<Arc<Partition>, SystemError> {
         }
 
         let virtio0 = virtio0.unwrap();
-        return virtio0.partitions()[0].clone();
+        return Ok(virtio0.partitions()[0].clone());
     }
 }
 pub fn mount_root_fs() -> Result<(), SystemError> {

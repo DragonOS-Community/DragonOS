@@ -18,6 +18,7 @@ use crate::mm::VirtAddr;
 
 use alloc::string::ToString;
 use alloc::sync::Arc;
+use core::ops::Add;
 use core::{
     fmt::{self, Display, Formatter},
     mem::{align_of, size_of},
@@ -119,8 +120,9 @@ impl PciTransport {
     pub fn new<H: Hal>(
         device: &mut PciDeviceStructureGeneralDevice,
         dev_id: Arc<DeviceId>,
+        add:usize
     ) -> Result<Self, VirtioPciError> {
-        let irq = VIRTIO_RECV_VECTOR;
+        let irq = VIRTIO_RECV_VECTOR.add(add as u32);
         let header = &device.common_header;
         let bus_device_function = header.bus_device_function;
         if header.vendor_id != VIRTIO_VENDOR_ID {
@@ -140,8 +142,8 @@ impl PciTransport {
         let irq_vector = standard_device.irq_vector_mut().unwrap();
         irq_vector.push(irq);
         standard_device
-            .irq_init(IRQ::PCI_IRQ_MSIX)
-            .expect("IRQ init failed");
+            .irq_init(IRQ::PCI_IRQ_MSIX|IRQ::PCI_IRQ_MSI)
+            .ok_or_else(|| VirtioPciError::UnableToInitIrq)?;
         // 中断相关信息
         let msg = PciIrqMsg {
             irq_common_message: IrqCommonMsg::init_from(
@@ -445,6 +447,8 @@ pub enum VirtioPciError {
     /// `VIRTIO_PCI_CAP_NOTIFY_CFG` capability has a `notify_off_multiplier` that is not a multiple
     /// of 2.
     InvalidNotifyOffMultiplier(u32),
+    /// Unable to find capability such as MSIX or MSI.
+    UnableToInitIrq,
     /// No valid `VIRTIO_PCI_CAP_ISR_CFG` capability was found.
     MissingIsrConfig,
     /// An IO BAR was provided rather than a memory BAR.
@@ -473,6 +477,10 @@ impl Display for VirtioPciError {
                 f,
                 "PCI device vender ID {:#06x} was not the VirtIO vendor ID {:#06x}.",
                 vendor_id, VIRTIO_VENDOR_ID
+            ),
+            Self::UnableToInitIrq=>write!(
+                f,
+                "Unable to find capability such as MSIX or MSI."
             ),
             Self::MissingCommonConfig => write!(
                 f,

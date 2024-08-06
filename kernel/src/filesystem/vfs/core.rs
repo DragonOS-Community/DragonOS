@@ -113,17 +113,16 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     return Ok(());
 }
 
-fn root_partition() -> Result<Arc<Partition>,SystemError> { 
+fn root_partition() -> Result<Arc<Partition>, SystemError> {
     #[cfg(target_arch = "x86_64")]
     {
-        use alloc::string::ToString;
         use crate::driver::base::block::block_device::BlockDevice;
-        if let Some(d)=crate::driver::block::virtio_blk::virtio_blk_0(){
+        use alloc::string::ToString;
+        if let Some(d) = crate::driver::block::virtio_blk::virtio_blk_0() {
             return Ok(d.partitions()[0].clone());
         }
 
-
-        if let Ok(d)=crate::driver::disk::ahci::get_disks_by_name("ahci_disk_0".to_string()){
+        if let Ok(d) = crate::driver::disk::ahci::get_disks_by_name("ahci_disk_0".to_string()) {
             return Ok(d.0.lock().partitions[0].clone());
         }
 

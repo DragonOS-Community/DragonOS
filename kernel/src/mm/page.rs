@@ -21,7 +21,7 @@ use crate::{
     init::initcall::INITCALL_MM,
     ipc::shm::ShmId,
     libs::{
-        rwlock::RwLock,
+        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
     process::{ProcessControlBlock, ProcessManager},
@@ -143,6 +143,8 @@ fn page_reclaim_thread() -> i32 {
             let page_to_free = 4096;
             page_reclaimer_lock_irqsave().shrink_list(PageFrameCount::new(page_to_free));
         } else {
+            //TODO 暂时让页面回收线程负责脏页回写任务，后续需要分离
+            page_reclaimer_lock_irqsave().flush_dirty_pages();
             // 休眠5秒
             // log::info!("sleep");
             let _ = usleep(PosixTimeSpec::new(5, 0));
@@ -176,52 +178,90 @@ impl PageReclaimer {
     pub fn shrink_list(&mut self, count: PageFrameCount) {
         for _ in 0..count.data() {
             let (paddr, page) = self.lru.pop_lru().expect("pagecache is empty");
-            let page_cache = page.read().page_cache().unwrap();
-            for vma in page.read().anon_vma() {
-                let address_space = vma.lock().address_space().unwrap();
+            let page_cache = page.read_irqsave().page_cache().unwrap();
+            for vma in page.read_irqsave().anon_vma() {
+                let address_space = vma.lock_irqsave().address_space().unwrap();
                 let address_space = address_space.upgrade().unwrap();
                 let mut guard = address_space.write();
                 let mapper = &mut guard.user_mapper.utable;
-                let virt = vma.lock().page_address(&page).unwrap();
+                let virt = vma.lock_irqsave().page_address(&page).unwrap();
                 unsafe {
                     mapper.unmap(virt, false).unwrap().flush();
                 }
             }
-            page_cache.remove_page(page.read().index().unwrap());
+            page_cache.remove_page(page.read_irqsave().index().unwrap());
             page_manager_lock_irqsave().remove_page(&paddr);
-            if page.read().flags.contains(PageFlags::PG_DIRTY) {
-                //TODO 回写页面
-                let inode = page
-                    .read()
-                    .page_cache
-                    .clone()
-                    .unwrap()
-                    .inode
-                    .clone()
-                    .unwrap()
-                    .upgrade()
-                    .unwrap();
-                inode
-                    .write_at(
-                        page.read().index().unwrap(),
-                        MMArch::PAGE_SIZE,
-                        unsafe {
-                            core::slice::from_raw_parts(
-                                MMArch::phys_2_virt(page.read().phys_addr).unwrap().data()
-                                    as *mut u8,
-                                MMArch::PAGE_SIZE,
-                            )
-                        },
-                        SpinLock::new(FilePrivateData::Unused).lock(),
-                    )
-                    .unwrap();
+            if page.read_irqsave().flags.contains(PageFlags::PG_DIRTY) {
+                Self::page_writeback(&page, true);
             }
         }
     }
 
     pub fn wakeup_claim_thread() {
-        log::info!("wakeup_claim_thread");
+        // log::info!("wakeup_claim_thread");
         let _ = ProcessManager::wakeup(unsafe { PAGE_RECLAIMER_THREAD.as_ref().unwrap() });
+    }
+
+    pub fn page_writeback(page: &Arc<Page>, unmap: bool) {
+        if !unmap {
+            page.write_irqsave().remove_flags(PageFlags::PG_DIRTY);
+        }
+
+        for vma in page.read_irqsave().anon_vma() {
+            let address_space = vma.lock_irqsave().address_space().unwrap();
+            let address_space = address_space.upgrade().unwrap();
+            let mut guard = address_space.write();
+            let mapper = &mut guard.user_mapper.utable;
+            let virt = vma.lock_irqsave().page_address(page).unwrap();
+            if unmap {
+                unsafe {
+                    mapper.unmap(virt, false).unwrap().flush();
+                }
+            } else {
+                unsafe {
+                    // 保护位设为只读
+                    mapper.remap(
+                        virt,
+                        mapper.get_entry(virt, 0).unwrap().flags().set_write(false),
+                    )
+                };
+            }
+        }
+        let inode = page
+            .read_irqsave()
+            .page_cache
+            .clone()
+            .unwrap()
+            .inode
+            .clone()
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        inode
+            .write_at(
+                page.read_irqsave().index().unwrap(),
+                MMArch::PAGE_SIZE,
+                unsafe {
+                    core::slice::from_raw_parts(
+                        MMArch::phys_2_virt(page.read_irqsave().phys_addr)
+                            .unwrap()
+                            .data() as *mut u8,
+                        MMArch::PAGE_SIZE,
+                    )
+                },
+                SpinLock::new(FilePrivateData::Unused).lock(),
+            )
+            .unwrap();
+    }
+
+    pub fn flush_dirty_pages(&self) {
+        // log::info!("flush_dirty_pages");
+        let iter = self.lru.iter();
+        for (_, page) in iter {
+            if page.read_irqsave().flags().contains(PageFlags::PG_DIRTY) {
+                Self::page_writeback(page, false);
+            }
+        }
     }
 }
 
@@ -251,26 +291,20 @@ pub struct Page {
     inner: RwLock<InnerPage>,
 }
 
-impl core::ops::Deref for Page {
-    type Target = RwLock<InnerPage>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl core::ops::DerefMut for Page {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
 impl Page {
     pub fn new(shared: bool, phys_addr: PhysAddr) -> Self {
         let inner = InnerPage::new(shared, phys_addr);
         Self {
             inner: RwLock::new(inner),
         }
+    }
+
+    pub fn read_irqsave(&self) -> RwLockReadGuard<InnerPage> {
+        self.inner.read_irqsave()
+    }
+
+    pub fn write_irqsave(&self) -> RwLockWriteGuard<InnerPage> {
+        self.inner.write_irqsave()
     }
 }
 
@@ -582,11 +616,12 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
                             let mut page_manager_guard = page_manager_lock_irqsave();
                             let old_phys = entry.address().unwrap();
                             let old_page = page_manager_guard.get_unwrap(&old_phys);
-                            let new_page = Arc::new(Page::new(old_page.read().shared(), phys));
-                            if let Some(ref page_cache) = old_page.read().page_cache() {
-                                new_page.write().set_page_cache_index(
+                            let new_page =
+                                Arc::new(Page::new(old_page.read_irqsave().shared(), phys));
+                            if let Some(ref page_cache) = old_page.read_irqsave().page_cache() {
+                                new_page.write_irqsave().set_page_cache_index(
                                     Some(page_cache.clone()),
-                                    old_page.read().index(),
+                                    old_page.read_irqsave().index(),
                                 );
                             }
 

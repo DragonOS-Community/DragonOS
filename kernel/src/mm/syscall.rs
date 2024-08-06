@@ -416,7 +416,7 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
         let vma = vma.unwrap();
-        let vm_flags = *vma.lock().vm_flags();
+        let vm_flags = *vma.lock_irqsave().vm_flags();
 
         // 暂时不支持巨页映射
         if vm_flags.contains(VmFlags::VM_HUGETLB) {
@@ -590,7 +590,7 @@ impl Syscall {
                 .mappings
                 .find_nearest(VirtAddr::new(start))
             {
-                let guard = vma.lock();
+                let guard = vma.lock_irqsave();
                 let vm_start = guard.region().start().data();
                 let vm_end = guard.region().end().data();
                 if start < vm_start {

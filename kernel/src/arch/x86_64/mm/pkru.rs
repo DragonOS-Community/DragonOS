@@ -16,7 +16,7 @@ const PKEY_MASK: usize = 1 << 32 | 1 << 33 | 1 << 34 | 1 << 35;
 /// ## 返回值
 /// - `u16`: vma的protection_key
 pub fn vma_pkey(vma: Arc<LockedVMA>) -> u16 {
-    let guard = vma.lock();
+    let guard = vma.lock_irqsave();
     ((guard.vm_flags().bits() & PKEY_MASK) >> VM_PKEY_SHIFT) as u16
 }
 

@@ -179,19 +179,19 @@ impl InnerAddressSpace {
         for vma in self.mappings.vmas.iter() {
             // TODO: 增加对VMA是否为文件映射的判断，如果是的话，就跳过
 
-            let vma_guard: SpinLockGuard<'_, VMA> = vma.lock();
+            let vma_guard: SpinLockGuard<'_, VMA> = vma.lock_irqsave();
 
             // 仅拷贝VMA信息并添加反向映射，因为UserMapper克隆时已经分配了新的物理页
             let new_vma = LockedVMA::new(vma_guard.clone_info_only());
             new_guard.mappings.vmas.insert(new_vma.clone());
             // debug!("new vma: {:x?}", new_vma);
-            let new_vma_guard = new_vma.lock();
+            let new_vma_guard = new_vma.lock_irqsave();
             let new_mapper = &new_guard.user_mapper.utable;
             let mut page_manager_guard = page_manager_lock_irqsave();
             for page in new_vma_guard.pages().map(|p| p.virt_address()) {
                 if let Some((paddr, _)) = new_mapper.translate(page) {
                     let page = page_manager_guard.get_unwrap(&paddr);
-                    page.write().insert_vma(new_vma.clone());
+                    page.write_irqsave().insert_vma(new_vma.clone());
                 }
             }
 
@@ -598,9 +598,9 @@ impl InnerAddressSpace {
         let regions: Vec<Arc<LockedVMA>> = self.mappings.conflicts(to_unmap).collect::<Vec<_>>();
 
         for r in regions {
-            let r = r.lock().region;
+            let r = r.lock_irqsave().region;
             let r = self.mappings.remove_vma(&r).unwrap();
-            let intersection = r.lock().region().intersect(&to_unmap).unwrap();
+            let intersection = r.lock_irqsave().region().intersect(&to_unmap).unwrap();
             let split_result = r.extract(intersection, &self.user_mapper.utable).unwrap();
 
             // TODO: 当引入后备页映射后，这里需要增加通知文件的逻辑
@@ -652,10 +652,10 @@ impl InnerAddressSpace {
 
         for r in regions {
             // debug!("mprotect: r: {:?}", r);
-            let r = *r.lock().region();
+            let r = *r.lock_irqsave().region();
             let r = self.mappings.remove_vma(&r).unwrap();
 
-            let intersection = r.lock().region().intersect(&region).unwrap();
+            let intersection = r.lock_irqsave().region().intersect(&region).unwrap();
             let split_result = r
                 .extract(intersection, mapper)
                 .expect("Failed to extract VMA");
@@ -667,7 +667,7 @@ impl InnerAddressSpace {
                 self.mappings.insert_vma(after);
             }
 
-            let mut r_guard = r.lock();
+            let mut r_guard = r.lock_irqsave();
             // 如果VMA的保护标志不允许指定的修改，则返回错误
             if !r_guard.can_have_flags(prot_flags) {
                 drop(r_guard);
@@ -710,10 +710,10 @@ impl InnerAddressSpace {
         let regions = self.mappings.conflicts(region).collect::<Vec<_>>();
 
         for r in regions {
-            let r = *r.lock().region();
+            let r = *r.lock_irqsave().region();
             let r = self.mappings.remove_vma(&r).unwrap();
 
-            let intersection = r.lock().region().intersect(&region).unwrap();
+            let intersection = r.lock_irqsave().region().intersect(&region).unwrap();
             let split_result = r
                 .extract(intersection, mapper)
                 .expect("Failed to extract VMA");
@@ -886,7 +886,7 @@ impl UserMappings {
     #[allow(dead_code)]
     pub fn contains(&self, vaddr: VirtAddr) -> Option<Arc<LockedVMA>> {
         for v in self.vmas.iter() {
-            let guard = v.lock();
+            let guard = v.lock_irqsave();
             if guard.region.contains(vaddr) {
                 return Some(v.clone());
             }
@@ -906,13 +906,13 @@ impl UserMappings {
     pub fn find_nearest(&self, vaddr: VirtAddr) -> Option<Arc<LockedVMA>> {
         let mut nearest: Option<Arc<LockedVMA>> = None;
         for v in self.vmas.iter() {
-            let guard = v.lock();
+            let guard = v.lock_irqsave();
             if guard.region.contains(vaddr) {
                 return Some(v.clone());
             }
             if guard.region.start >= vaddr
                 && if let Some(ref nearest) = nearest {
-                    guard.region.start < nearest.lock().region.start
+                    guard.region.start < nearest.lock_irqsave().region.start
                 } else {
                     true
                 }
@@ -928,7 +928,7 @@ impl UserMappings {
         let r = self
             .vmas
             .iter()
-            .filter(move |v| v.lock().region.intersect(&request).is_some())
+            .filter(move |v| v.lock_irqsave().region.intersect(&request).is_some())
             .cloned();
         return r;
     }
@@ -1050,7 +1050,7 @@ impl UserMappings {
 
     /// 在当前进程的映射关系中，插入一个新的VMA。
     pub fn insert_vma(&mut self, vma: Arc<LockedVMA>) {
-        let region = vma.lock().region;
+        let region = vma.lock_irqsave().region;
         // 要求插入的地址范围必须是空闲的，也就是说，当前进程的地址空间中，不能有任何与之重叠的VMA。
         assert!(self.conflicts(region).next().is_none());
         self.reserve_hole(&region);
@@ -1070,7 +1070,7 @@ impl UserMappings {
         // 请注意，由于这里会对每个VMA加锁，因此性能很低
         let vma: Arc<LockedVMA> = self
             .vmas
-            .drain_filter(|vma| vma.lock().region == *region)
+            .drain_filter(|vma| vma.lock_irqsave().region == *region)
             .next()?;
         self.unreserve_hole(region);
 
@@ -1120,7 +1120,7 @@ impl LockedVMA {
             id: LOCKEDVMA_ID_ALLOCATOR.alloc().unwrap(),
             vma: SpinLock::new(vma),
         });
-        r.vma.lock().self_ref = Arc::downgrade(&r);
+        r.vma.lock_irqsave().self_ref = Arc::downgrade(&r);
         return r;
     }
 
@@ -1130,6 +1130,10 @@ impl LockedVMA {
 
     pub fn lock(&self) -> SpinLockGuard<VMA> {
         return self.vma.lock();
+    }
+
+    pub fn lock_irqsave(&self) -> SpinLockGuard<VMA> {
+        return self.vma.lock_irqsave();
     }
 
     /// 调整当前VMA的页面的标志位
@@ -1146,7 +1150,7 @@ impl LockedVMA {
         mapper: &mut PageMapper,
         mut flusher: impl Flusher<MMArch>,
     ) -> Result<(), SystemError> {
-        let mut guard = self.lock();
+        let mut guard = self.lock_irqsave();
         for page in guard.region.pages() {
             // 暂时要求所有的页帧都已经映射到页表
             // TODO: 引入Lazy Mapping, 通过缺页中断来映射页帧，这里就不必要求所有的页帧都已经映射到页表了
@@ -1164,7 +1168,7 @@ impl LockedVMA {
     pub fn unmap(&self, mapper: &mut PageMapper, mut flusher: impl Flusher<MMArch>) {
         // todo: 如果当前vma与文件相关，完善文件相关的逻辑
 
-        let mut guard = self.lock();
+        let mut guard = self.lock_irqsave();
 
         // 获取物理页的anon_vma的守卫
         let mut page_manager_guard: SpinLockGuard<'_, crate::mm::page::PageManager> =
@@ -1178,10 +1182,10 @@ impl LockedVMA {
 
             // 从anon_vma中删除当前VMA
             let page = page_manager_guard.get_unwrap(&paddr);
-            page.write().remove_vma(self);
+            page.write_irqsave().remove_vma(self);
 
             // 如果物理页的anon_vma链表长度为0并且不是共享页，则释放物理页.
-            if page.read().can_deallocate() {
+            if page.read_irqsave().can_deallocate() {
                 unsafe {
                     drop(page);
                     deallocate_page_frames(
@@ -1195,10 +1199,19 @@ impl LockedVMA {
             flusher.consume(flush);
         }
         guard.mapped = false;
+
+        // 当vma对应共享文件的写映射时，唤醒脏页回写线程
+        if guard.vm_file().is_some()
+            && guard
+                .vm_flags()
+                .contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE)
+        {
+            crate::mm::page::PageReclaimer::wakeup_claim_thread();
+        }
     }
 
     pub fn mapped(&self) -> bool {
-        return self.vma.lock().mapped;
+        return self.vma.lock_irqsave().mapped;
     }
 
     /// 将当前VMA进行切分，切分成3个VMA，分别是：
@@ -1210,7 +1223,7 @@ impl LockedVMA {
         assert!(region.start().check_aligned(MMArch::PAGE_SIZE));
         assert!(region.end().check_aligned(MMArch::PAGE_SIZE));
 
-        let mut guard = self.lock();
+        let mut guard = self.lock_irqsave();
         {
             // 如果传入的region不在当前VMA的范围内，则直接返回None
             if unlikely(region.start() < guard.region.start() || region.end() > guard.region.end())
@@ -1253,27 +1266,27 @@ impl LockedVMA {
         // 重新设置before、after这两个VMA里面的物理页的anon_vma
         let mut page_manager_guard = page_manager_lock_irqsave();
         if let Some(before) = before.clone() {
-            let virt_iter = before.lock().region.iter_pages();
+            let virt_iter = before.lock_irqsave().region.iter_pages();
             for frame in virt_iter {
                 if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
                     let page = page_manager_guard.get_unwrap(&paddr);
-                    let mut page_guard = page.write();
+                    let mut page_guard = page.write_irqsave();
                     page_guard.insert_vma(before.clone());
                     page_guard.remove_vma(self);
-                    before.lock().mapped = true;
+                    before.lock_irqsave().mapped = true;
                 }
             }
         }
 
         if let Some(after) = after.clone() {
-            let virt_iter = after.lock().region.iter_pages();
+            let virt_iter = after.lock_irqsave().region.iter_pages();
             for frame in virt_iter {
                 if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
                     let page = page_manager_guard.get_unwrap(&paddr);
-                    let mut page_guard = page.write();
+                    let mut page_guard = page.write_irqsave();
                     page_guard.insert_vma(after.clone());
                     page_guard.remove_vma(self);
-                    after.lock().mapped = true;
+                    after.lock_irqsave().mapped = true;
                 }
             }
         }
@@ -1289,7 +1302,7 @@ impl LockedVMA {
 
     /// 判断VMA是否为外部（非当前进程空间）的VMA
     pub fn is_foreign(&self) -> bool {
-        let guard = self.lock();
+        let guard = self.lock_irqsave();
         if let Some(space) = guard.user_address_space.clone() {
             if let Some(space) = space.upgrade() {
                 return AddressSpace::is_current(&space);
@@ -1303,14 +1316,14 @@ impl LockedVMA {
 
     /// 判断VMA是否可访问
     pub fn is_accessible(&self) -> bool {
-        let guard = self.lock();
+        let guard = self.lock_irqsave();
         let vm_access_flags: VmFlags = VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_EXEC;
         guard.vm_flags().intersects(vm_access_flags)
     }
 
     /// 判断VMA是否为匿名映射
     pub fn is_anonymous(&self) -> bool {
-        let guard = self.lock();
+        let guard = self.lock_irqsave();
         guard.vm_file.is_none()
     }
 
@@ -1582,7 +1595,7 @@ impl VMA {
         for _ in 0..count.data() {
             let paddr = cur_phy.phys_address();
             let page = page_manager_guard.get_unwrap(&paddr);
-            page.write().insert_vma(r.clone());
+            page.write_irqsave().insert_vma(r.clone());
             cur_phy = cur_phy.next();
         }
 
@@ -1655,14 +1668,14 @@ impl VMA {
 
             // 将VMA加入到anon_vma
             let page = page_manager_guard.get_unwrap(&paddr);
-            page.write().insert_vma(r.clone());
+            page.write_irqsave().insert_vma(r.clone());
         }
         // debug!("VMA::zeroed: done");
         return Ok(r);
     }
 
     pub fn page_address(&self, page: &Arc<Page>) -> Result<VirtAddr, SystemError> {
-        let page_guard = page.read();
+        let page_guard = page.read_irqsave();
         let index = page_guard.index().unwrap();
         if index >= self.file_pgoff.unwrap() {
             let address =

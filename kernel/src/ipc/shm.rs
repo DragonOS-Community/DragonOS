@@ -166,7 +166,7 @@ impl ShmManager {
         let mut cur_phys = PhysPageFrame::new(phys_page.0);
         for _ in 0..page_count.data() {
             let page = Arc::new(Page::new(true, cur_phys.phys_address()));
-            page.write().set_shm_id(shm_id);
+            page.write_irqsave().set_shm_id(shm_id);
             let paddr = cur_phys.phys_address();
             page_manager_guard.insert(paddr, &page);
             cur_phys = cur_phys.next();
@@ -325,7 +325,7 @@ impl ShmManager {
             // 设置共享内存物理页当映射计数等于0时可被回收
             for _ in 0..count.data() {
                 let page = page_manager_guard.get_unwrap(&cur_phys.phys_address());
-                page.write().set_dealloc_when_zero(true);
+                page.write_irqsave().set_dealloc_when_zero(true);
 
                 cur_phys = cur_phys.next();
             }
@@ -444,7 +444,7 @@ impl KernelShm {
         for _ in 0..page_count.data() {
             let page = page_manager_guard.get(&cur_phys.phys_address()).unwrap();
             id_set.extend(
-                page.read()
+                page.read_irqsave()
                     .anon_vma()
                     .iter()
                     .map(|vma| vma.id())

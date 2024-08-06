@@ -371,7 +371,7 @@ pub unsafe fn deallocate_page_frames(
 
         if let Some(page) = page {
             // 如果page是共享页，将其共享页信息从SHM_MANAGER中删去
-            let page_guard = page.read();
+            let page_guard = page.read_irqsave();
             if page_guard.shared() {
                 shm_manager_lock().free_id(&page_guard.shm_id().unwrap());
             }

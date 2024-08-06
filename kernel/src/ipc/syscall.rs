@@ -351,7 +351,7 @@ impl Syscall {
                     .mappings
                     .contains(vaddr)
                     .ok_or(SystemError::EINVAL)?;
-                if vma.lock().region().start() != vaddr {
+                if vma.lock_irqsave().region().start() != vaddr {
                     return Err(SystemError::EINVAL);
                 }
 
@@ -387,7 +387,7 @@ impl Syscall {
                     // 将vma加入到对应Page的anon_vma
                     page_manager_guard
                         .get_unwrap(&phys.phys_address())
-                        .write()
+                        .write_irqsave()
                         .insert_vma(vma.clone());
 
                     phys = phys.next();
@@ -395,7 +395,7 @@ impl Syscall {
                 }
 
                 // 更新vma的映射状态
-                vma.lock().set_mapped(true);
+                vma.lock_irqsave().set_mapped(true);
 
                 vaddr.data()
             }
@@ -428,7 +428,7 @@ impl Syscall {
             .ok_or(SystemError::EINVAL)?;
 
         // 判断vaddr是否为起始地址
-        if vma.lock().region().start() != vaddr {
+        if vma.lock_irqsave().region().start() != vaddr {
             return Err(SystemError::EINVAL);
         }
 
@@ -443,7 +443,7 @@ impl Syscall {
         // 如果物理页的shm_id为None，代表不是共享页
         let mut page_manager_guard = page_manager_lock_irqsave();
         let page = page_manager_guard.get(&paddr).ok_or(SystemError::EINVAL)?;
-        let shm_id = page.read().shm_id().ok_or(SystemError::EINVAL)?;
+        let shm_id = page.read_irqsave().shm_id().ok_or(SystemError::EINVAL)?;
         drop(page_manager_guard);
 
         // 获取对应共享页管理信息

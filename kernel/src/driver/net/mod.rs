@@ -1,8 +1,9 @@
-use alloc::{string::String, fmt};
+use alloc::{sync::{Weak, Arc}, string::String, fmt, vec::Vec};
 
 use smoltcp;
-use crate::libs::spinlock::SpinLock;
 use system_error::SystemError;
+use crate::libs::spinlock::SpinLock;
+use crate::net::socket::inet::common::{BoundInetInner, PortManager};
 
 mod dma;
 pub mod e1000e;
@@ -52,7 +53,7 @@ pub trait Iface: crate::driver::base::device::Device {
     /// @brief 获取smoltcp的网卡接口类型
     #[inline(always)]
     fn inner_iface(&self) -> &SpinLock<smoltcp::iface::Interface> {
-        &self.common().iface
+        &self.common().smol_iface
     }
     // fn as_any_ref(&'static self) -> &'static dyn core::any::Any;
 
@@ -64,16 +65,16 @@ pub trait Iface: crate::driver::base::device::Device {
 
     /// # `port_manager`
     /// 用于管理网卡的端口
-    fn port_manager(&self) -> &crate::net::socket::PortManager {
+    fn port_manager(&self) -> &PortManager {
         &self.common().port_manager
     }
 }
 
 pub struct IfaceCommon {
     iface_id: usize,
-    iface: SpinLock<smoltcp::iface::Interface>,
+    smol_iface: SpinLock<smoltcp::iface::Interface>,
     sockets: SpinLock<smoltcp::iface::SocketSet<'static>>,
-    port_manager: crate::net::socket::PortManager,
+    port_manager: PortManager,
     _poll_at_ms: core::sync::atomic::AtomicU64,
 }
 
@@ -92,9 +93,9 @@ impl IfaceCommon {
     pub fn new(iface_id: usize, iface: smoltcp::iface::Interface) -> Self {
         IfaceCommon {
             iface_id,
-            iface: SpinLock::new(iface),
-            sockets: SpinLock::new(smoltcp::iface::SocketSet::new(vec![])),
-            port_manager: crate::net::socket::PortManager::new(),
+            smol_iface: SpinLock::new(iface),
+            sockets: SpinLock::new(smoltcp::iface::SocketSet::new(Vec::new())),
+            port_manager: PortManager::new(),
             _poll_at_ms: core::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -105,7 +106,7 @@ impl IfaceCommon {
     {
         let timestamp = crate::time::Instant::now().into();
         let mut sockets = self.sockets.lock();
-        if self.iface.lock().poll(timestamp, device, &mut sockets) {
+        if self.smol_iface.lock().poll(timestamp, device, &mut sockets) {
             return Ok(());
         } else {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -117,7 +118,7 @@ impl IfaceCommon {
             return Err(SystemError::EINVAL);
         }
 
-        self.iface.lock().update_ip_addrs(|addrs| {
+        self.smol_iface.lock().update_ip_addrs(|addrs| {
             let dest = addrs.iter_mut().next();
 
             if let Some(dest) = dest {
@@ -128,4 +129,63 @@ impl IfaceCommon {
         });
         return Ok(());
     }
+
+    // pub fn bind_socket<T>(&self, socket: T, endpoint: &smoltcp::wire::IpEndpoint) 
+    //     -> Result<smoltcp::iface::SocketHandle, SystemError>
+    // where 
+    //     T: smoltcp::socket::AnySocket<'static> 
+    // {
+    //     use crate::net::socket::inet::common::SocketType;
+    //     match socket.upcast() {
+    //         smoltcp::socket::Socket::Tcp(socket) => {
+    //             self.port_manager.bind_port(SocketType::Tcp, endpoint.port)?;
+    //             Ok(self.sockets.lock_no_preempt().add(socket))
+    //         }
+    //         smoltcp::socket::Socket::Udp(socket) => {
+    //             self.port_manager.bind_port(SocketType::Udp, endpoint.port)?;
+    //             Ok(self.sockets.lock_no_preempt().add(socket))
+    //         }
+    //         smoltcp::socket::Socket::Raw(socket) => {
+    //             Ok(self.sockets.lock_no_preempt().add(socket))
+    //         }
+    //         smoltcp::socket::Socket::Dhcpv4(socket) => {
+    //             Ok(self.sockets.lock_no_preempt().add(socket))
+    //         }
+    //         smoltcp::socket::Socket::Icmp(socket) => {
+    //             Ok(self.sockets.lock_no_preempt().add(socket))
+    //         }
+    //         smoltcp::socket::Socket::Dns(socket) => {
+    //             Ok(self.sockets.lock_no_preempt().add(socket))
+    //         }
+    //     }
+    // }
+
+    // pub fn bind_socket_ephemeral<T>(&self, socket: T) 
+    // -> Result<smoltcp::iface::SocketHandle, SystemError>
+    // where 
+    //     T: smoltcp::socket::AnySocket<'static> 
+    // {
+    //     match socket.upcast() {
+    //         smoltcp::socket::Socket::Tcp(socket) => {
+    //             self.port_manager.bind_ephemeral_tcp()?;
+    //             Ok(self.sockets.lock_no_preempt().add(socket))
+    //         }
+    //         smoltcp::socket::Socket::Udp(socket) => {
+    //             self.port_manager.bind_ephemeral_udp()?;
+    //             Ok(self.sockets.lock_no_preempt().add(socket))
+    //         }
+    //         smoltcp::socket::Socket::Raw(socket) => {
+    //             Ok(self.sockets.lock_no_preempt().add(socket))
+    //         }
+    //         smoltcp::socket::Socket::Dhcpv4(socket) => {
+    //             Ok(self.sockets.lock_no_preempt().add(socket))
+    //         }
+    //         smoltcp::socket::Socket::Icmp(socket) => {
+    //             Ok(self.sockets.lock_no_preempt().add(socket))
+    //         }
+    //         smoltcp::socket::Socket::Dns(socket) => {
+    //             Ok(self.sockets.lock_no_preempt().add(socket))
+    //         }
+    //     }
+    // }
 }

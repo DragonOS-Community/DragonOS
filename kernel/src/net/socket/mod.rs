@@ -32,12 +32,13 @@ use crate::{
 
 use self::{
     handle::GlobalSocketHandle,
-    inet::{RawSocket, TcpSocket, UdpSocket},
+    inet::{RawSocket, TcpSocket, BoundUdp},
     unix::{SeqpacketSocket, StreamSocket},
+    common::shutdown::ShutdownType,
 };
 
 use super::{
-    event_poll::{EPollEventType, EPollItem, EventPoll}, Endpoint, Protocol, ShutdownType, SocketOptionsLevel
+    event_poll::{EPollEventType, EPollItem, EventPoll}, Endpoint, Protocol, SocketOptionsLevel
 };
 
 pub mod handle;
@@ -66,7 +67,7 @@ lazy_static! {
 pub const SOL_SOCKET: u8 = 1;
 
 /// 根据地址族、socket类型和协议创建socket
-pub(super) fn new_socket(
+pub(super) fn new_unbound_socket(
     address_family: AddressFamily,
     socket_type: PosixSocketType,
     protocol: Protocol,
@@ -81,7 +82,7 @@ pub(super) fn new_socket(
         },
         AddressFamily::INet => match socket_type {
             PosixSocketType::Stream => Box::new(TcpSocket::new(SocketOptions::default())),
-            PosixSocketType::Datagram => Box::new(UdpSocket::new(SocketOptions::default())),
+            PosixSocketType::Datagram => Box::new(BoundUdp::new(SocketOptions::default())),
             PosixSocketType::Raw => Box::new(RawSocket::new(protocol, SocketOptions::default())),
             _ => {
                 return Err(SystemError::EINVAL);
@@ -106,7 +107,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     ///
     /// @return - 成功：(返回读取的数据的长度，读取数据的端点).
     ///         - 失败：错误码
-    fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint);
+    fn read(&self, buf: &mut [u8]) -> Result<(usize, Endpoint), SystemError>;
 
     /// @brief 向socket中写入数据。如果socket是阻塞的，那么直到写入的数据全部写入socket中才返回
     ///
@@ -230,7 +231,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     /// 
     /// ## See
     /// https://code.dragonos.org.cn/s?refs=sk_setsockopt&project=linux-6.6.21
-    fn setsockopt(
+    fn set_option(
         &self,
         _level: SocketOptionsLevel,
         _optname: usize,
@@ -262,199 +263,41 @@ impl Clone for Box<dyn Socket> {
 }
 
 
-#[derive(Debug)]
-pub struct PosixSocketHandleItem {
-    /// socket的waitqueue
-    wait_queue: Arc<EventWaitQueue>,
+// #[derive(Debug)]
+// pub struct SocketHandleItem {
+//     /// 对应的posix socket是否为listen的
+//     pub is_posix_listen: bool,
+//     /// shutdown状态
+//     pub shutdown_type: RwLock<ShutdownType>,
+//     pub posix_item: Weak<PosixSocketHandleItem>,
+// }
 
-    pub epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
-}
+// impl SocketHandleItem {
+//     pub fn new(posix_item: Weak<PosixSocketHandleItem>) -> Self {
+//         Self {
+//             is_posix_listen: false,
+//             shutdown_type: RwLock::new(ShutdownType::empty()),
+//             posix_item,
+//         }
+//     }
 
-impl PosixSocketHandleItem {
-    pub fn new(wait_queue: Option<Arc<EventWaitQueue>>) -> Self {
-        Self {
-            wait_queue: wait_queue.unwrap_or(Arc::new(EventWaitQueue::new())),
-            epitems: SpinLock::new(LinkedList::new()),
-        }
-    }
+//     pub fn shutdown_type(&self) -> ShutdownType {
+//         *self.shutdown_type.read()
+//     }
 
-    /// ## 在socket的等待队列上睡眠
-    pub fn sleep(&self, events: u64) {
-        unsafe {
-            ProcessManager::preempt_disable();
-            self.wait_queue.sleep_without_schedule(events);
-            ProcessManager::preempt_enable();
-        }
-        schedule(SchedMode::SM_NONE);
-    }
+//     pub fn shutdown_type_writer(&mut self) -> RwLockWriteGuard<ShutdownType> {
+//         self.shutdown_type.write_irqsave()
+//     }
 
-    pub fn add_epoll(&self, epitem: Arc<EPollItem>) {
-        self.epitems.lock_irqsave().push_back(epitem)
-    }
+//     pub fn reset_shutdown_type(&self) {
+//         *self.shutdown_type.write() = ShutdownType::empty();
+//     }
 
-    pub fn remove_epoll(&self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
-        let is_remove = !self
-            .epitems
-            .lock_irqsave()
-            .extract_if(|x| x.epoll().ptr_eq(epoll))
-            .collect::<Vec<_>>()
-            .is_empty();
+//     pub fn posix_item(&self) -> Option<Arc<PosixSocketHandleItem>> {
+//         self.posix_item.upgrade()
+//     }
+// }
 
-        if is_remove {
-            return Ok(());
-        }
-
-        Err(SystemError::ENOENT)
-    }
-
-    /// ### 唤醒该队列上等待events的进程
-    ///
-    ///  ### 参数
-    /// - events: 发生的事件
-    ///
-    /// 需要注意的是，只要触发了events中的任意一件事件，进程都会被唤醒
-    pub fn wakeup_any(&self, events: u64) {
-        self.wait_queue.wakeup_any(events);
-    }
-}
-
-#[derive(Debug)]
-pub struct SocketHandleItem {
-    /// 对应的posix socket是否为listen的
-    pub is_posix_listen: bool,
-    /// shutdown状态
-    pub shutdown_type: RwLock<ShutdownType>,
-    pub posix_item: Weak<PosixSocketHandleItem>,
-}
-
-impl SocketHandleItem {
-    pub fn new(posix_item: Weak<PosixSocketHandleItem>) -> Self {
-        Self {
-            is_posix_listen: false,
-            shutdown_type: RwLock::new(ShutdownType::empty()),
-            posix_item,
-        }
-    }
-
-    pub fn shutdown_type(&self) -> ShutdownType {
-        *self.shutdown_type.read()
-    }
-
-    pub fn shutdown_type_writer(&mut self) -> RwLockWriteGuard<ShutdownType> {
-        self.shutdown_type.write_irqsave()
-    }
-
-    pub fn reset_shutdown_type(&self) {
-        *self.shutdown_type.write() = ShutdownType::empty();
-    }
-
-    pub fn posix_item(&self) -> Option<Arc<PosixSocketHandleItem>> {
-        self.posix_item.upgrade()
-    }
-}
-
-/// # TCP 和 UDP 的端口管理器。
-/// 如果 TCP/UDP 的 socket 绑定了某个端口，它会在对应的表中记录，以检测端口冲突。
-#[derive(Debug)]
-pub struct PortManager {
-    // TCP 端口记录表
-    tcp_port_table: SpinLock<HashMap<u16, Pid>>,
-    // UDP 端口记录表
-    udp_port_table: SpinLock<HashMap<u16, Pid>>,
-}
-
-impl PortManager {
-    pub fn new() -> Self {
-        return Self {
-            tcp_port_table: SpinLock::new(HashMap::new()),
-            udp_port_table: SpinLock::new(HashMap::new()),
-        };
-    }
-
-    /// @brief 自动分配一个相对应协议中未被使用的PORT，如果动态端口均已被占用，返回错误码 EADDRINUSE
-    pub fn get_ephemeral_port(&self, socket_type: SocketType) -> Result<u16, SystemError> {
-        // TODO: selects non-conflict high port
-
-        static mut EPHEMERAL_PORT: u16 = 0;
-        unsafe {
-            if EPHEMERAL_PORT == 0 {
-                EPHEMERAL_PORT = (49152 + rand() % (65536 - 49152)) as u16;
-            }
-        }
-
-        let mut remaining = 65536 - 49152; // 剩余尝试分配端口次数
-        let mut port: u16;
-        while remaining > 0 {
-            unsafe {
-                if EPHEMERAL_PORT == 65535 {
-                    EPHEMERAL_PORT = 49152;
-                } else {
-                    EPHEMERAL_PORT += 1;
-                }
-                port = EPHEMERAL_PORT;
-            }
-
-            // 使用 ListenTable 检查端口是否被占用
-            let listen_table_guard = match socket_type {
-                SocketType::Udp => self.udp_port_table.lock(),
-                SocketType::Tcp => self.tcp_port_table.lock(),
-                _ => panic!("{:?} cann't get a port", socket_type),
-            };
-            if listen_table_guard.get(&port).is_none() {
-                drop(listen_table_guard);
-                return Ok(port);
-            }
-            remaining -= 1;
-        }
-        return Err(SystemError::EADDRINUSE);
-    }
-
-    /// @brief 检测给定端口是否已被占用，如果未被占用则在 TCP/UDP 对应的表中记录
-    ///
-    /// TODO: 增加支持端口复用的逻辑
-    pub fn bind_port(&self, socket_type: SocketType, port: u16) -> Result<(), SystemError> {
-        if port > 0 {
-            let mut listen_table_guard = match socket_type {
-                SocketType::Udp => self.udp_port_table.lock(),
-                SocketType::Tcp => self.tcp_port_table.lock(),
-                _ => panic!("{:?} cann't bind a port", socket_type),
-            };
-            match listen_table_guard.get(&port) {
-                Some(_) => return Err(SystemError::EADDRINUSE),
-                None => listen_table_guard.insert(port, ProcessManager::current_pid()),
-            };
-            drop(listen_table_guard);
-        }
-        return Ok(());
-    }
-
-    /// @brief 在对应的端口记录表中将端口和 socket 解绑
-    /// should call this function when socket is closed or aborted
-    pub fn unbind_port(&self, socket_type: SocketType, port: u16) {
-        let mut listen_table_guard = match socket_type {
-            SocketType::Udp => self.udp_port_table.lock(),
-            SocketType::Tcp => self.tcp_port_table.lock(),
-            _ => {
-                return;
-            }
-        };
-        listen_table_guard.remove(&port);
-        drop(listen_table_guard);
-    }
-}
-
-/// @brief socket的类型
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SocketType {
-    /// 原始的socket
-    Raw,
-    /// 用于Tcp通信的 Socket
-    Tcp,
-    /// 用于Udp通信的 Socket
-    Udp,
-    /// unix域的 Socket
-    Unix,
-}
 
 bitflags! {
     /// @brief socket的选项
@@ -476,8 +319,8 @@ bitflags! {
 #[derive(Debug, Clone)]
 /// @brief 在trait Socket的metadata函数中返回该结构体供外部使用
 pub struct SocketMetadata {
-    /// socket的类型
-    pub socket_type: SocketType,
+    // /// socket的类型
+    // pub socket_type: InetSocketType,
     /// 接收缓冲区的大小
     pub rx_buf_size: usize,
     /// 发送缓冲区的大小
@@ -490,14 +333,14 @@ pub struct SocketMetadata {
 
 impl SocketMetadata {
     fn new(
-        socket_type: SocketType,
+        // socket_type: InetSocketType,
         rx_buf_size: usize,
         tx_buf_size: usize,
         metadata_buf_size: usize,
         options: SocketOptions,
     ) -> Self {
         Self {
-            socket_type,
+            // socket_type,
             rx_buf_size,
             tx_buf_size,
             metadata_buf_size,

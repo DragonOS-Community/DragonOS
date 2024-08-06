@@ -10,13 +10,13 @@ use crate::{
     driver::net::Iface,
     libs::rwlock::RwLock,
     net::{
-        event_poll::EPollEventType, net_core::poll_ifaces, socket::tcp_def::TcpOptions, syscall::PosixSocketOption, Endpoint, Protocol, ShutdownType, NET_DEVICES, SocketOptionsLevel
+        event_poll::EPollEventType, net_core::poll_ifaces, socket::tcp_def::TcpOptions, syscall::PosixSocketOption, Endpoint, Protocol, NET_DEVICES, SocketOptionsLevel
     },
 };
 
 use crate::net::socket::{
-    handle::GlobalSocketHandle, PosixSocketHandleItem, Socket, SocketHandleItem, SocketMetadata,
-    SocketOptions, SocketPollMethod, SocketType, HANDLE_MAP, PORT_MANAGER, SOCKET_SET, ip_def::IpOptions,
+    handle::GlobalSocketHandle, Socket, SocketMetadata,
+    SocketOptions, SocketPollMethod, ip_def::IpOptions,
 };
 
 
@@ -71,7 +71,7 @@ impl RawSocket {
         let handle = GlobalSocketHandle::new_smoltcp_handle(SOCKET_SET.lock_irqsave().add(socket));
 
         let metadata = SocketMetadata::new(
-            SocketType::Raw,
+            InetSocketType::Raw,
             Self::DEFAULT_RX_BUF_SIZE,
             Self::DEFAULT_TX_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
@@ -222,7 +222,7 @@ impl Socket for RawSocket {
     /// 
     /// ## See
     /// https://code.dragonos.org.cn/s?refs=sk_setsockopt&project=linux-6.6.21
-    fn setsockopt(
+    fn set_option(
         &self,
         _level: SocketOptionsLevel,
         optname: usize,

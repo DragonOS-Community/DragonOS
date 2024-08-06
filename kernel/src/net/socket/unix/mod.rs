@@ -5,7 +5,7 @@ use crate::{libs::spinlock::SpinLock, net::Endpoint};
 
 use super::{
     handle::GlobalSocketHandle, PosixSocketHandleItem, Socket, inode::SocketInode, SocketMetadata,
-    SocketOptions, SocketType,
+    SocketOptions, InetSocketType,
 };
 
 #[derive(Debug, Clone)]
@@ -31,7 +31,7 @@ impl StreamSocket {
         let buffer = Arc::new(SpinLock::new(Vec::with_capacity(Self::DEFAULT_BUF_SIZE)));
 
         let metadata = SocketMetadata::new(
-            SocketType::Unix,
+            InetSocketType::Unix,
             Self::DEFAULT_BUF_SIZE,
             Self::DEFAULT_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
@@ -144,7 +144,7 @@ impl SeqpacketSocket {
         let buffer = Arc::new(SpinLock::new(Vec::with_capacity(Self::DEFAULT_BUF_SIZE)));
 
         let metadata = SocketMetadata::new(
-            SocketType::Unix,
+            InetSocketType::Unix,
             Self::DEFAULT_BUF_SIZE,
             Self::DEFAULT_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,

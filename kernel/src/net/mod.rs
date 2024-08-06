@@ -26,16 +26,6 @@ pub fn generate_iface_id() -> usize {
     return IFACE_ID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 }
 
-bitflags! {
-    /// @brief 用于指定socket的关闭类型
-    /// 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/include/net/sock.h?fi=SHUTDOWN_MASK#1573
-    pub struct ShutdownType: u8 {
-        const RCV_SHUTDOWN = 1;
-        const SEND_SHUTDOWN = 2;
-        const SHUTDOWN_MASK = 3;
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum Endpoint {
     /// 链路层端点

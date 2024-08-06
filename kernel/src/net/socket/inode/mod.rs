@@ -27,7 +27,7 @@ use crate::{
 };
 
 use super::{
-    handle::GlobalSocketHandle, inet::{RawSocket, TcpSocket, UdpSocket}, unix::{SeqpacketSocket, StreamSocket}, Socket, SocketOptions, SocketType, PORT_MANAGER
+    handle::GlobalSocketHandle, inet::{RawSocket, TcpSocket, BoundUdp}, unix::{SeqpacketSocket, StreamSocket}, Socket, SocketOptions, InetSocketType, PORT_MANAGER
 };
 
 use super::super::{
@@ -69,16 +69,6 @@ impl SocketInode {
 
     pub unsafe fn inner_no_preempt(&self) -> SpinLockGuard<Box<dyn Socket>> {
         self.socket.lock_no_preempt()
-    }
-
-    /// ## 在socket的等待队列上睡眠
-    pub fn sleep(&self, events: u64) {
-        unsafe {
-            ProcessManager::preempt_disable();
-            self.wait_queue.sleep_without_schedule(events);
-            ProcessManager::preempt_enable();
-        }
-        schedule(SchedMode::SM_NONE);
     }
 
     // ==> epoll api
@@ -124,6 +114,16 @@ impl SocketInode {
         self.wait_queue.wakeup_any(events);
     }
 
+    /// ## 在socket的等待队列上睡眠
+    pub fn sleep(&self, events: u64) {
+        unsafe {
+            ProcessManager::preempt_disable();
+            self.wait_queue.sleep_without_schedule(events);
+            ProcessManager::preempt_enable();
+        }
+        schedule(SchedMode::SM_NONE);
+    }
+
     // ==> shutdown_type api
     pub fn shutdown_type(&self) -> ShutdownType {
         *self.shutdown_type.read()
@@ -151,16 +151,11 @@ impl IndexNode for SocketInode {
     fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
         let mut socket = self.socket.lock_irqsave();
 
-        if socket.metadata().socket_type == SocketType::Unix {
+        if socket.metadata().socket_type == InetSocketType::Unix {
             return Ok(());
         }
 
         self.clear_epoll()?;
-
-        // HANDLE_MAP
-        //     .write_irqsave()
-        //     .remove(&socket.socket_handle())
-        //     .unwrap();
 
         socket.close();
 
@@ -187,15 +182,24 @@ impl IndexNode for SocketInode {
             if let Some(iface) = self.bound_iface.as_ref() {
                 iface.poll()?;
             }
-            let (read_result, _endpoint) 
+            let read_result
                 = self.socket.lock_no_preempt().read(&mut buf[0..len]);
-            if self.socket.lock().metadata().options.contains(SocketOptions::BLOCK) {
-                if Err(SystemError::EAGAIN_OR_EWOULDBLOCK) == read_result {
-                    self.sleep(EPollEventType::EPOLLIN.bits() as u64);
-                    continue;
+            if self
+                .socket
+                .lock()
+                .metadata()
+                .options
+                .contains(SocketOptions::BLOCK) 
+            {
+                match read_result {
+                    Ok((x, _)) => break Ok(x),
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        self.sleep(EPollEventType::EPOLLIN.bits() as u64);
+                        continue;
+                    }
+                    Err(e) => break Err(e),
                 }
             }
-            break read_result;
         };
         if let Some(iface) = self.bound_iface.as_ref() {
             iface.poll()?;
@@ -219,8 +223,16 @@ impl IndexNode for SocketInode {
     }
 
     fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        let events = self.socket.lock_irqsave().poll();
-        
+        let mut events = self.socket.lock_irqsave().poll();
+        if self.shutdown_type().contains(ShutdownType::RCV_SHUTDOWN) {
+            events.insert(
+                EPollEventType::EPOLLRDHUP | EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+            );
+        }
+        if self.shutdown_type().contains(ShutdownType::SHUTDOWN_MASK) {
+            events.insert(EPollEventType::EPOLLHUP);
+        }
+
         return Ok(events.bits() as usize);
     }
 

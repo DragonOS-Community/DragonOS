@@ -20,7 +20,7 @@ use crate::{
 };
 
 use super::{
-    socket::{new_socket, PosixSocketType, Socket, SocketInode},
+    socket::{new_unbound_socket, PosixSocketType, Socket, SocketInode},
     Endpoint, Protocol, ShutdownType,
 };
 
@@ -43,7 +43,7 @@ impl Syscall {
         let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
         let protocol = Protocol::from(protocol as u8);
 
-        let socket = new_socket(address_family, socket_type, protocol)?;
+        let socket = new_unbound_socket(address_family, socket_type, protocol)?;
 
         let socketinode: Arc<SocketInode> = SocketInode::new(socket, None);
         let f = File::new(socketinode, FileMode::O_RDWR)?;
@@ -76,8 +76,8 @@ impl Syscall {
         let mut fd_table_guard = binding.write();
 
         // 创建一对socket
-        let inode0 = SocketInode::new(new_socket(address_family, socket_type, protocol)?, None);
-        let inode1 = SocketInode::new(new_socket(address_family, socket_type, protocol)?, None);
+        let inode0 = SocketInode::new(new_unbound_socket(address_family, socket_type, protocol)?, None);
+        let inode1 = SocketInode::new(new_unbound_socket(address_family, socket_type, protocol)?, None);
 
         // 进行pair
         unsafe {
@@ -116,7 +116,7 @@ impl Syscall {
         // 获取内层的socket（真正的数据）
         let socket: SpinLockGuard<Box<dyn Socket>> = socket_inode.inner();
         debug!("setsockopt: level={:?}", level);
-        return socket.setsockopt(sol, optname, optval).map(|_| 0);
+        return socket.set_option(sol, optname, optval).map(|_| 0);
     }
 
     /// @brief sys_getsockopt系统调用的实际执行函数

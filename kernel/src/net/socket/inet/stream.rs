@@ -16,7 +16,7 @@ use crate::{
 
 use crate::net::socket::{
     handle::GlobalSocketHandle, PosixSocketHandleItem, Socket, SocketHandleItem, SocketMetadata,
-    SocketOptions, SocketPollMethod, SocketType, HANDLE_MAP, PORT_MANAGER, SOCKET_SET, ip_def::IpOptions,
+    SocketOptions, SocketPollMethod, InetSocketType, HANDLE_MAP, PORT_MANAGER, SOCKET_SET, ip_def::IpOptions,
 };
 
 
@@ -56,7 +56,7 @@ impl TcpSocket {
         )];
 
         let metadata = SocketMetadata::new(
-            SocketType::Tcp,
+            InetSocketType::Tcp,
             Self::DEFAULT_RX_BUF_SIZE,
             Self::DEFAULT_TX_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
@@ -544,7 +544,7 @@ impl Socket for TcpSocket {
                 let old_handle = core::mem::replace(&mut self.handles[handle_index], new_handle);
 
                 let metadata = SocketMetadata::new(
-                    SocketType::Tcp,
+                    InetSocketType::Tcp,
                     Self::DEFAULT_TX_BUF_SIZE,
                     Self::DEFAULT_RX_BUF_SIZE,
                     Self::DEFAULT_METADATA_BUF_SIZE,
@@ -627,7 +627,7 @@ impl Socket for TcpSocket {
         Box::new(self.clone())
     }
 
-    fn setsockopt(
+    fn set_option(
         &self,
         level: SocketOptionsLevel,
         optname: usize,

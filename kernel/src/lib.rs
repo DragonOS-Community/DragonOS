@@ -46,6 +46,7 @@ mod arch;
 mod libs;
 #[macro_use]
 mod include;
+mod cgroup;
 mod debug;
 mod driver; // 如果driver依赖了libs，应该在libs后面导出
 mod exception;
@@ -54,6 +55,7 @@ mod init;
 mod ipc;
 mod misc;
 mod mm;
+mod namespace;
 mod net;
 mod process;
 mod sched;

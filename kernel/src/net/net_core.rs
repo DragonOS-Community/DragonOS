@@ -44,8 +44,6 @@ pub fn net_init() -> Result<(), SystemError> {
 fn dhcp_query() -> Result<(), SystemError> {
     let binding = NET_DEVICES.write_irqsave();
 
-    //由于现在os未实现在用户态为网卡动态分配内存，而lo网卡的id最先分配且ip固定不能被分配
-    //所以特判取用id为1的网卡（也就是virto_net）
     let net_face = binding.get(&0).ok_or(SystemError::ENODEV)?.clone();
 
     drop(binding);

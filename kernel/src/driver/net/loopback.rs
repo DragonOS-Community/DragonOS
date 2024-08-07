@@ -478,6 +478,7 @@ pub fn loopback_driver_init() {
 }
 
 /// ## lo网卡设备的注册函数
+//TODO: 现在先不用初始化宏进行注册，使virtonet排在网卡列表头，待网络子系统重构后再使用初始化宏并修复该bug
 // #[unified_init(INITCALL_DEVICE)]
 pub fn loopback_init() -> Result<(), SystemError> {
     loopback_probe();

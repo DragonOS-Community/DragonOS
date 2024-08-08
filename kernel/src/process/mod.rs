@@ -51,10 +51,12 @@ use crate::{
         VirtAddr,
     },
     net::socket::SocketInode,
-    sched::completion::Completion,
     sched::{
-        cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag, EnqueueFlag, OnRq, SchedMode,
-        WakeupFlags, __schedule,
+        completion::Completion,
+        cpu_rq,
+        fair::{CompletelyFairScheduler, FairSchedEntity},
+        prio::MAX_PRIO,
+        DequeueFlag, EnqueueFlag, OnRq, SchedMode, SchedPolicy, WakeupFlags, __schedule,
     },
     smp::{
         core::smp_get_processor_id,
@@ -472,6 +474,20 @@ impl ProcessManager {
             .take()
             .expect("next_pcb is None");
 
+        let guard = prev_pcb.sched_info.inner_lock_read_irqsave();
+        if unlikely(guard.state() == ProcessState::Dead) {
+            match prev_pcb.sched_info().policy() {
+                SchedPolicy::RT => todo!(),
+                SchedPolicy::FIFO => todo!(),
+                SchedPolicy::CFS => CompletelyFairScheduler::task_dead(prev_pcb.clone()),
+                SchedPolicy::IDLE => todo!(),
+            }
+
+            // TODO: put_task_stack
+            // TODO: put_task_struct_rcu_user
+        }
+        drop(guard);
+
         // 由于进程切换前使用了SpinLockGuard::leak()，所以这里需要手动释放锁
         fence(Ordering::SeqCst);
 
@@ -535,6 +551,7 @@ pub enum ProcessState {
     Stopped,
     /// 进程已经退出，usize表示进程的退出码
     Exited(usize),
+    Dead,
 }
 
 #[allow(dead_code)]
@@ -1005,6 +1022,11 @@ impl ProcessControlBlock {
 
     pub fn alarm_timer_irqsave(&self) -> SpinLockGuard<Option<AlarmTimer>> {
         return self.alarm_timer.lock_irqsave();
+    }
+
+    #[inline]
+    pub fn task_util(&self) -> usize {
+        self.sched_info().sched_entity.avg.util_avg
     }
 }
 
@@ -1510,6 +1532,13 @@ impl ProcessSignalInfo {
 
     pub fn set_tty(&mut self, tty: Arc<TtyCore>) {
         self.tty = Some(tty);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_task_cpu(&self, _new_cpu: x86::cpuid::CpuId) {
+        // TODO
+
+        // TODO(pelt): call migrate_task_rq
     }
 
     /// 从 pcb 的 siginfo中取出下一个要处理的信号，先处理线程信号，再处理进程信号

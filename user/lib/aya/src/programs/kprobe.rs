@@ -1,0 +1,177 @@
+use std::{
+    ffi::OsStr,
+    io,
+    os::fd::AsFd,
+    path::{Path, PathBuf},
+    vec::Vec,
+};
+
+use aya_obj::{
+    generated::{bpf_insn, bpf_link_type, bpf_prog_type::BPF_PROG_TYPE_KPROBE},
+    obj,
+};
+use thiserror::Error;
+
+use crate::{
+    programs::{
+        links::{define_link_wrapper, FdLink, LinkError},
+        load_program,
+        perf_attach::{PerfLinkIdInner, PerfLinkInner},
+        probe::{attach, ProbeKind},
+        ProgramData, ProgramError,
+    },
+    sys::bpf_link_get_info_by_fd,
+    VerifierLogLevel,
+};
+
+define_link_wrapper!(
+    /// The link used by [KProbe] programs.
+    KProbeLink,
+    /// The type returned by [KProbe::attach]. Can be passed to [KProbe::detach].
+    KProbeLinkId,
+    PerfLinkInner,
+    PerfLinkIdInner
+);
+
+/// The type returned when attaching a [`KProbe`] fails.
+#[derive(Debug, Error)]
+pub enum KProbeError {
+    /// Error detaching from debugfs
+    #[error("`{filename}`")]
+    FileError {
+        /// The file name
+        filename: PathBuf,
+        /// The [`io::Error`] returned from the file operation
+        #[source]
+        io_error: io::Error,
+    },
+}
+
+#[derive(Debug)]
+#[doc(alias = "BPF_PROG_TYPE_KPROBE")]
+pub struct KProbe {
+    pub(crate) data: ProgramData<KProbeLink>,
+    pub(crate) kind: ProbeKind,
+}
+
+impl KProbe {
+    /// Loads the program inside the kernel.
+    pub fn load(&mut self) -> Result<(), ProgramError> {
+        load_program(BPF_PROG_TYPE_KPROBE, &mut self.data)
+    }
+
+    pub fn name(&self) -> Option<String> {
+        self.data.name.clone()
+    }
+    /// Returns the instructions of the program.
+    #[allow(unused)]
+    pub fn inst(&mut self) -> Result<Vec<bpf_insn>, ProgramError> {
+        let ProgramData {
+            name,
+            obj,
+            fd,
+            links: _,
+            expected_attach_type,
+            attach_btf_obj_fd,
+            attach_btf_id,
+            attach_prog_fd,
+            btf_fd,
+            verifier_log_level,
+            path: _,
+            flags,
+        } = &self.data;
+        let obj = obj.as_ref().unwrap();
+        let (
+            obj::Program {
+                license,
+                kernel_version,
+                ..
+            },
+            obj::Function {
+                instructions,
+                func_info,
+                line_info,
+                func_info_rec_size,
+                line_info_rec_size,
+                ..
+            },
+        ) = obj;
+        Ok(instructions.clone())
+    }
+
+    /// Returns `KProbe` if the program is a `kprobe`, or `KRetProbe` if the
+    /// program is a `kretprobe`.
+    pub fn kind(&self) -> ProbeKind {
+        self.kind
+    }
+
+    /// Attaches the program.
+    ///
+    /// Attaches the probe to the given function name inside the kernel. If
+    /// `offset` is non-zero, it is added to the address of the target
+    /// function.
+    ///
+    /// If the program is a `kprobe`, it is attached to the *start* address of the target function.
+    /// Conversely if the program is a `kretprobe`, it is attached to the return address of the
+    /// target function.
+    ///
+    /// The returned value can be used to detach from the given function, see [KProbe::detach].
+    pub fn attach<T: AsRef<OsStr>>(
+        &mut self,
+        fn_name: T,
+        offset: u64,
+    ) -> Result<KProbeLinkId, ProgramError> {
+        attach(&mut self.data, self.kind, fn_name.as_ref(), offset, None)
+    }
+
+    /// Detaches the program.
+    ///
+    /// See [KProbe::attach].
+    pub fn detach(&mut self, link_id: KProbeLinkId) -> Result<(), ProgramError> {
+        self.data.links.remove(link_id)
+    }
+
+    /// Takes ownership of the link referenced by the provided link_id.
+    ///
+    /// The link will be detached on `Drop` and the caller is now responsible
+    /// for managing its lifetime.
+    pub fn take_link(&mut self, link_id: KProbeLinkId) -> Result<KProbeLink, ProgramError> {
+        // self.data.take_link(link_id)
+        unimplemented!("take_link")
+    }
+
+    /// Creates a program from a pinned entry on a bpffs.
+    ///
+    /// Existing links will not be populated. To work with existing links you should use [`crate::programs::links::PinnedLink`].
+    ///
+    /// On drop, any managed links are detached and the program is unloaded. This will not result in
+    /// the program being unloaded from the kernel if it is still pinned.
+    pub fn from_pin<P: AsRef<Path>>(path: P, kind: ProbeKind) -> Result<Self, ProgramError> {
+        let data = ProgramData::from_pinned_path(path, VerifierLogLevel::default())?;
+        Ok(Self { data, kind })
+    }
+}
+
+impl TryFrom<KProbeLink> for FdLink {
+    type Error = LinkError;
+
+    fn try_from(value: KProbeLink) -> Result<Self, Self::Error> {
+        if let PerfLinkInner::FdLink(fd) = value.into_inner() {
+            Ok(fd)
+        } else {
+            Err(LinkError::InvalidLink)
+        }
+    }
+}
+
+impl TryFrom<FdLink> for KProbeLink {
+    type Error = LinkError;
+
+    fn try_from(fd_link: FdLink) -> Result<Self, Self::Error> {
+        let info = bpf_link_get_info_by_fd(fd_link.fd.as_fd())?;
+        if info.type_ == (bpf_link_type::BPF_LINK_TYPE_KPROBE_MULTI as u32) {
+            return Ok(Self::new(PerfLinkInner::FdLink(fd_link)));
+        }
+        Err(LinkError::InvalidLink)
+    }
+}

@@ -1,0 +1,23 @@
+[package]
+name = "aya"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = { version = "1", default-features = false }
+lazy_static = { version = "1", default-features = false }
+aya-obj = { git = "https://github.com/aya-rs/aya", rev = "3d57d35", features = ["std"] }
+bitflags = { version = "2.2.1", default-features = false }
+object = { version = "0.36", default-features = false, features = ["elf", "read_core", "std", "write"] }
+bytes = { version = "1", default-features = false }
+assert_matches = { version = "1.5.0", default-features = false }
+log = { version = "0.4", default-features = false }
+libc = { version = "0.2.105", default-features = false }
+async-io = { version = "2.0", default-features = false, optional = true }
+tokio = { version = "1.24.0", default-features = false, features = ["rt"], optional = true  }
+
+
+[features]
+default = ["async_tokio"]
+async_tokio = ["tokio/net"]
+async_std = ["dep:async-io"]

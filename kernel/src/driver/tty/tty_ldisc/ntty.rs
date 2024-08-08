@@ -388,9 +388,9 @@ impl NTtyData {
                 continue;
             }
 
-            if self.char_map.get(c as usize).unwrap() {
+            if ((c as usize) < self.char_map.size()) && self.char_map.get(c as usize).unwrap() {
                 // 特殊字符
-                self.receive_special_char(c, tty.clone(), lookahead_done)
+                self.receive_special_char(c, tty.clone(), lookahead_done);
             } else {
                 self.receive_char(c, tty.clone());
             }

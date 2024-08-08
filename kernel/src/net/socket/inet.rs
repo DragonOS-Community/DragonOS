@@ -1,3 +1,5 @@
+use core::any::Any;
+
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use log::{error, warn};
 use smoltcp::{
@@ -89,6 +91,9 @@ impl RawSocket {
 }
 
 impl Socket for RawSocket {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
     fn posix_item(&self) -> Arc<PosixSocketHandleItem> {
         self.posix_item.clone()
     }
@@ -319,6 +324,9 @@ impl UdpSocket {
 }
 
 impl Socket for UdpSocket {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
     fn posix_item(&self) -> Arc<PosixSocketHandleItem> {
         self.posix_item.clone()
     }
@@ -593,6 +601,9 @@ impl TcpSocket {
 }
 
 impl Socket for TcpSocket {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
     fn posix_item(&self) -> Arc<PosixSocketHandleItem> {
         self.posix_item.clone()
     }

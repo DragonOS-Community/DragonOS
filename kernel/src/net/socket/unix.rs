@@ -1,3 +1,5 @@
+use core::any::Any;
+
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
@@ -51,6 +53,9 @@ impl StreamSocket {
 }
 
 impl Socket for StreamSocket {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
     fn posix_item(&self) -> Arc<PosixSocketHandleItem> {
         self.posix_item.clone()
     }
@@ -166,6 +171,9 @@ impl SeqpacketSocket {
 }
 
 impl Socket for SeqpacketSocket {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
     fn posix_item(&self) -> Arc<PosixSocketHandleItem> {
         self.posix_item.clone()
     }

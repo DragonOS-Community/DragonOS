@@ -588,6 +588,9 @@ pub struct NetlinkSock {
     callback: Option<&'static dyn NetlinkCallback>,
 }
 impl Socket for NetlinkSock{
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         todo!()
     }

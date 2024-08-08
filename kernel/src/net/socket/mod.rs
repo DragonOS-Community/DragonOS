@@ -10,6 +10,7 @@ use alloc::{
 use hashbrown::HashMap;
 use intertrait::CastFromSync;
 use log::warn;
+use netlink::af_netlink::NetlinkSock;
 use smoltcp::{
     iface::SocketSet,
     socket::{self, raw, tcp, udp},
@@ -85,9 +86,17 @@ pub(super) fn new_socket(
         },
         //https://www.man7.org/linux/man-pages/man7/netlink.7.html
         AddressFamily::Netlink => match socket_type {
-            PosixSocketType::Raw => Box::new(RawSocket::new(protocol, SocketOptions::default())),
-            PosixSocketType::Datagram => Box::new(UdpSocket::new(SocketOptions::default())),
+            PosixSocketType::Raw => {
+                log::debug!("Netlink socket RAW created");
+                return Ok(Box::new(NetlinkSock::new()))
+                
+            }
+            PosixSocketType::Datagram => {
+                log::debug!("Netlink socket Datagram created");
+                return Ok(Box::new(NetlinkSock::new()))
+            }
             _ => {
+                log::warn!("Netlink socket type {:?} is not supported", socket_type);
                 return Err(SystemError::EINVAL);
             }
         },
@@ -103,6 +112,7 @@ pub(super) fn new_socket(
     Ok(socket)
 }
 pub trait Socket: Sync + Send + Debug + Any + CastFromSync{
+    fn as_any(&self) -> &dyn Any;
     /// @brief 从socket中读取数据，如果socket是阻塞的，那么直到读取到数据才返回
     ///
     /// @param buf 读取到的数据存放的缓冲区

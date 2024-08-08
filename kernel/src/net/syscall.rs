@@ -13,7 +13,7 @@ use crate::{
     },
     libs::spinlock::SpinLockGuard,
     mm::{verify_area, VirtAddr},
-    net::socket::{AddressFamily, SOL_SOCKET},
+    net::socket::{netlink::af_netlink::NetlinkSock, AddressFamily, SOL_SOCKET},
     process::ProcessManager,
     syscall::Syscall,
 };
@@ -215,12 +215,26 @@ impl Syscall {
     /// @return 成功返回0，失败返回错误码
     pub fn bind(fd: usize, addr: *const SockAddr, addrlen: usize) -> Result<usize, SystemError> {
         // 打印收到的参数
-        log::debug!("bind: fd={:?}, addr={:?}, addrlen={:?}", fd, addr, addrlen);
+        log::debug!("bind: fd={:?}, family={:?}, addrlen={:?}", fd, (unsafe{addr.as_ref().unwrap().family}), addrlen);
         let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
+        log::debug!("bind: socket={:?}", socket);
         let mut socket = unsafe { socket.inner_no_preempt() };
+        // 解锁 SpinLockGuard 并获取 Box<dyn Socket>
+        let socket_box: &Box<dyn Socket> = &*socket;
+
+        // 解引用 Box 并调用 as_any 方法
+        let socket_ref: &dyn Socket = &**socket_box;
+
+        // 打印 dyn Socket 对象的具体类型
+        if let Some(socket_any) = socket_ref.as_any().downcast_ref::<NetlinkSock>() {
+            log::debug!("Socket type: NetlinkSock");
+        } else {
+            log::debug!("Socket type: Unknown: {:?}", socket_ref);
+        }
+        log::debug!("bind: socket={:?}", socket);
         socket.bind(endpoint)?;
         Ok(0)
     }

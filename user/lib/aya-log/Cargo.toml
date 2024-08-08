@@ -1,0 +1,26 @@
+[package]
+name = "aya-log"
+version = "0.2.0"
+description = "A logging library for eBPF programs."
+keywords = ["bpf", "ebpf", "log", "logging"]
+readme = "README.md"
+documentation = "https://docs.rs/aya-log"
+edition = "2021"
+
+
+[dependencies]
+aya = { path = "../aya", features = ["async_tokio"] }
+aya-log-common = { git = "https://github.com/aya-rs/aya", rev = "3d57d35", default-features = false }
+bytes = { version = "1", default-features = false }
+log = { version = "0.4", default-features = false }
+thiserror = { version = "1", default-features = false }
+tokio = { version = "1.24.0", default-features = false, features = ["rt"] }
+
+
+[dev-dependencies]
+env_logger = { version = "0.11", default-features = false }
+testing_logger = { version = "0.1.1", default-features = false }
+
+
+[lib]
+path = "src/lib.rs"

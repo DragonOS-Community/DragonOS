@@ -1,6 +1,4 @@
-use ebpf::STACK_SIZE;
-
-use crate::lib::Vec;
+use crate::{ebpf::STACK_SIZE, lib::Vec};
 
 pub struct StackFrame {
     return_address: u16,
@@ -18,7 +16,7 @@ impl StackFrame {
             sp: 0,
             return_address: 0,
             saved_registers: [0; 4],
-            frame: Vec::with_capacity(STACK_SIZE),
+            frame: vec![0; STACK_SIZE],
         }
     }
 
@@ -29,7 +27,7 @@ impl StackFrame {
             sp: 0,
             return_address: 0,
             saved_registers: [0; 4],
-            frame: Vec::with_capacity(capacity),
+            frame: vec![0; capacity],
         }
     }
 
@@ -42,6 +40,9 @@ impl StackFrame {
         self.frame.as_ptr()
     }
 
+    pub fn as_slice(&self) -> &[u8] {
+        self.frame.as_slice()
+    }
     /// Save the callee-saved registers
     pub fn save_registers(&mut self, regs: &[u64]) {
         self.saved_registers.copy_from_slice(regs);

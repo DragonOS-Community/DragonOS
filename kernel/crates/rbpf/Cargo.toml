@@ -48,7 +48,7 @@ json = "0.11"
 hex = "0.4.3"
 
 [features]
-default = ["std"]
+default = ["std", "user"]
 cargo-clippy = []
 std = ["dep:time", "dep:libc", "combine/std"]
 cranelift = [
@@ -58,6 +58,7 @@ cranelift = [
     "dep:cranelift-native",
     "dep:cranelift-module",
 ]
+user = []
 
 # Examples that depend on the standard library should be disabled when
 # testing the `no_std` configuration.

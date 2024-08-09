@@ -4,12 +4,11 @@
 //! Functions in this module are used to handle eBPF programs with a higher level representation,
 //! for example to disassemble the code into a human-readable format.
 
-use ebpf;
 #[cfg(not(feature = "std"))]
 use log::info;
 use log::warn;
 
-use crate::lib::*;
+use crate::{ebpf, lib::*};
 
 #[inline]
 fn alu_imm_str(name: &str, insn: &ebpf::Insn) -> String {

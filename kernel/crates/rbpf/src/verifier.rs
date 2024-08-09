@@ -18,9 +18,7 @@
 //
 // Contrary to the verifier of the Linux kernel, this one does not modify the bytecode at all.
 
-use ebpf;
-
-use crate::lib::*;
+use crate::{ebpf, lib::*};
 
 fn reject<S: AsRef<str>>(msg: S) -> Result<(), Error> {
     let full_msg = format!("[Verifier] Error: {}", msg.as_ref());

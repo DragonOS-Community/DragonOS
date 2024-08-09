@@ -5,13 +5,14 @@
 // Copyright 2016 6WIND S.A. <quentin.monnet@6wind.com>
 //      (Translation to Rust, MetaBuff/multiple classes addition, hashmaps for helpers)
 
-use ebpf::{self, Insn};
-use helpers::BPF_FUNC_MAPPER;
-use stack::StackFrame;
+use crate::{
+    ebpf::{self, Insn},
+    helpers::BPF_FUNC_MAPPER,
+    lib::*,
+    stack::StackFrame,
+};
 
-use crate::lib::*;
-
-#[allow(unused)]
+#[cfg(feature = "user")]
 fn check_mem(
     addr: u64,
     len: usize,
@@ -82,21 +83,27 @@ pub fn execute_program(
         stack.as_ptr() as u64 + stack.len() as u64,
     ];
     stacks.push(stack);
-
     if !mbuff.is_empty() {
         reg[1] = mbuff.as_ptr() as u64;
     } else if !mem.is_empty() {
         reg[1] = mem.as_ptr() as u64;
     }
-
-    let check_mem_load = |_addr: u64, _len: usize, _insn_ptr: usize| -> Result<(), Error> {
-        // check_mem(addr, len, "load", insn_ptr, mbuff, mem, stacks.last().unwrap().as_slice())
-        Ok(())
-    };
-    let check_mem_store = |_addr: u64, _len: usize, _insn_ptr: usize| -> Result<(), Error> {
-        // check_mem(addr, len, "store", insn_ptr, mbuff, mem, stacks.last().unwrap().as_slice())
-        Ok(())
-    };
+    let check_mem_load =
+        |stack: &[u8], addr: u64, len: usize, insn_ptr: usize| -> Result<(), Error> {
+            if cfg!(feature = "user") {
+                check_mem(addr, len, "load", insn_ptr, mbuff, mem, stack)
+            } else {
+                Ok(())
+            }
+        };
+    let check_mem_store =
+        |stack: &[u8], addr: u64, len: usize, insn_ptr: usize| -> Result<(), Error> {
+            if cfg!(feature = "user") {
+                check_mem(addr, len, "store", insn_ptr, mbuff, mem, stack)
+            } else {
+                Ok(())
+            }
+        };
 
     // Loop on instructions
     let mut insn_ptr: usize = 0;
@@ -114,28 +121,29 @@ pub fn execute_program(
             ebpf::LD_ABS_B => {
                 reg[0] = unsafe {
                     let x = (mem.as_ptr() as u64 + (insn.imm as u32) as u64) as *const u8;
-                    check_mem_load(x as u64, 8, insn_ptr)?;
+                    check_mem_load(stacks.last().unwrap().as_slice(), x as u64, 8, insn_ptr)?;
                     x.read_unaligned() as u64
                 }
             }
             ebpf::LD_ABS_H => {
                 reg[0] = unsafe {
                     let x = (mem.as_ptr() as u64 + (insn.imm as u32) as u64) as *const u16;
-                    check_mem_load(x as u64, 8, insn_ptr)?;
+                    check_mem_load(stacks.last().unwrap().as_slice(), x as u64, 8, insn_ptr)?;
                     x.read_unaligned() as u64
                 }
             }
             ebpf::LD_ABS_W => {
                 reg[0] = unsafe {
                     let x = (mem.as_ptr() as u64 + (insn.imm as u32) as u64) as *const u32;
-                    check_mem_load(x as u64, 8, insn_ptr)?;
+                    check_mem_load(stacks.last().unwrap().as_slice(), x as u64, 8, insn_ptr)?;
                     x.read_unaligned() as u64
                 }
             }
             ebpf::LD_ABS_DW => {
+                log::info!("executing LD_ABS_DW, set reg[{}] to {:#x}", _dst, insn.imm);
                 reg[0] = unsafe {
                     let x = (mem.as_ptr() as u64 + (insn.imm as u32) as u64) as *const u64;
-                    check_mem_load(x as u64, 8, insn_ptr)?;
+                    check_mem_load(stacks.last().unwrap().as_slice(), x as u64, 8, insn_ptr)?;
                     x.read_unaligned()
                 }
             }
@@ -143,7 +151,7 @@ pub fn execute_program(
                 reg[0] = unsafe {
                     let x =
                         (mem.as_ptr() as u64 + reg[_src] + (insn.imm as u32) as u64) as *const u8;
-                    check_mem_load(x as u64, 8, insn_ptr)?;
+                    check_mem_load(stacks.last().unwrap().as_slice(), x as u64, 8, insn_ptr)?;
                     x.read_unaligned() as u64
                 }
             }
@@ -151,7 +159,7 @@ pub fn execute_program(
                 reg[0] = unsafe {
                     let x =
                         (mem.as_ptr() as u64 + reg[_src] + (insn.imm as u32) as u64) as *const u16;
-                    check_mem_load(x as u64, 8, insn_ptr)?;
+                    check_mem_load(stacks.last().unwrap().as_slice(), x as u64, 8, insn_ptr)?;
                     x.read_unaligned() as u64
                 }
             }
@@ -159,7 +167,7 @@ pub fn execute_program(
                 reg[0] = unsafe {
                     let x =
                         (mem.as_ptr() as u64 + reg[_src] + (insn.imm as u32) as u64) as *const u32;
-                    check_mem_load(x as u64, 8, insn_ptr)?;
+                    check_mem_load(stacks.last().unwrap().as_slice(), x as u64, 8, insn_ptr)?;
                     x.read_unaligned() as u64
                 }
             }
@@ -167,7 +175,7 @@ pub fn execute_program(
                 reg[0] = unsafe {
                     let x =
                         (mem.as_ptr() as u64 + reg[_src] + (insn.imm as u32) as u64) as *const u64;
-                    check_mem_load(x as u64, 8, insn_ptr)?;
+                    check_mem_load(stacks.last().unwrap().as_slice(), x as u64, 8, insn_ptr)?;
                     x.read_unaligned()
                 }
             }
@@ -175,7 +183,6 @@ pub fn execute_program(
             ebpf::LD_DW_IMM => {
                 let next_insn = ebpf::get_insn(prog, insn_ptr);
                 insn_ptr += 1;
-                // reg[_dst] = ((insn.imm as u32) as u64) + ((next_insn.imm as u64) << 32);
                 // log::warn!(
                 //     "executing LD_DW_IMM, set reg[{}] to {:#x}",
                 //     _dst,
@@ -189,7 +196,7 @@ pub fn execute_program(
                 reg[_dst] = unsafe {
                     #[allow(clippy::cast_ptr_alignment)]
                     let x = (reg[_src] as *const u8).offset(insn.off as isize);
-                    check_mem_load(x as u64, 1, insn_ptr)?;
+                    check_mem_load(stacks.last().unwrap().as_slice(), x as u64, 1, insn_ptr)?;
                     x.read_unaligned() as u64
                 }
             }
@@ -197,7 +204,7 @@ pub fn execute_program(
                 reg[_dst] = unsafe {
                     #[allow(clippy::cast_ptr_alignment)]
                     let x = (reg[_src] as *const u8).offset(insn.off as isize) as *const u16;
-                    check_mem_load(x as u64, 2, insn_ptr)?;
+                    check_mem_load(stacks.last().unwrap().as_slice(), x as u64, 2, insn_ptr)?;
                     x.read_unaligned() as u64
                 }
             }
@@ -205,7 +212,7 @@ pub fn execute_program(
                 reg[_dst] = unsafe {
                     #[allow(clippy::cast_ptr_alignment)]
                     let x = (reg[_src] as *const u8).offset(insn.off as isize) as *const u32;
-                    check_mem_load(x as u64, 4, insn_ptr)?;
+                    check_mem_load(stacks.last().unwrap().as_slice(), x as u64, 4, insn_ptr)?;
                     // log::warn!(
                     //     "executing LD_W_REG, the ptr is REG:{} -> [{:#x}] + {:#x}",
                     //     _src,
@@ -219,7 +226,7 @@ pub fn execute_program(
                 reg[_dst] = unsafe {
                     #[allow(clippy::cast_ptr_alignment)]
                     let x = (reg[_src] as *const u8).offset(insn.off as isize) as *const u64;
-                    check_mem_load(x as u64, 8, insn_ptr)?;
+                    check_mem_load(stacks.last().unwrap().as_slice(), x as u64, 8, insn_ptr)?;
                     x.read_unaligned()
                 }
             }
@@ -227,50 +234,50 @@ pub fn execute_program(
             // BPF_ST class
             ebpf::ST_B_IMM => unsafe {
                 let x = (reg[_dst] as *const u8).offset(insn.off as isize) as *mut u8;
-                check_mem_store(x as u64, 1, insn_ptr)?;
+                check_mem_store(stacks.last().unwrap().as_slice(), x as u64, 1, insn_ptr)?;
                 x.write_unaligned(insn.imm as u8);
             },
             ebpf::ST_H_IMM => unsafe {
                 #[allow(clippy::cast_ptr_alignment)]
                 let x = (reg[_dst] as *const u8).offset(insn.off as isize) as *mut u16;
-                check_mem_store(x as u64, 2, insn_ptr)?;
+                check_mem_store(stacks.last().unwrap().as_slice(), x as u64, 2, insn_ptr)?;
                 x.write_unaligned(insn.imm as u16);
             },
             ebpf::ST_W_IMM => unsafe {
                 #[allow(clippy::cast_ptr_alignment)]
                 let x = (reg[_dst] as *const u8).offset(insn.off as isize) as *mut u32;
-                check_mem_store(x as u64, 4, insn_ptr)?;
+                check_mem_store(stacks.last().unwrap().as_slice(), x as u64, 4, insn_ptr)?;
                 x.write_unaligned(insn.imm as u32);
             },
             ebpf::ST_DW_IMM => unsafe {
                 #[allow(clippy::cast_ptr_alignment)]
                 let x = (reg[_dst] as *const u8).offset(insn.off as isize) as *mut u64;
-                check_mem_store(x as u64, 8, insn_ptr)?;
+                check_mem_store(stacks.last().unwrap().as_slice(), x as u64, 8, insn_ptr)?;
                 x.write_unaligned(insn.imm as u64);
             },
 
             // BPF_STX class
             ebpf::ST_B_REG => unsafe {
                 let x = (reg[_dst] as *const u8).offset(insn.off as isize) as *mut u8;
-                check_mem_store(x as u64, 1, insn_ptr)?;
+                check_mem_store(stacks.last().unwrap().as_slice(), x as u64, 1, insn_ptr)?;
                 x.write_unaligned(reg[_src] as u8);
             },
             ebpf::ST_H_REG => unsafe {
                 #[allow(clippy::cast_ptr_alignment)]
                 let x = (reg[_dst] as *const u8).offset(insn.off as isize) as *mut u16;
-                check_mem_store(x as u64, 2, insn_ptr)?;
+                check_mem_store(stacks.last().unwrap().as_slice(), x as u64, 2, insn_ptr)?;
                 x.write_unaligned(reg[_src] as u16);
             },
             ebpf::ST_W_REG => unsafe {
                 #[allow(clippy::cast_ptr_alignment)]
                 let x = (reg[_dst] as *const u8).offset(insn.off as isize) as *mut u32;
-                check_mem_store(x as u64, 4, insn_ptr)?;
+                check_mem_store(stacks.last().unwrap().as_slice(), x as u64, 4, insn_ptr)?;
                 x.write_unaligned(reg[_src] as u32);
             },
             ebpf::ST_DW_REG => unsafe {
                 #[allow(clippy::cast_ptr_alignment)]
                 let x = (reg[_dst] as *const u8).offset(insn.off as isize) as *mut u64;
-                check_mem_store(x as u64, 8, insn_ptr)?;
+                check_mem_store(stacks.last().unwrap().as_slice(), x as u64, 8, insn_ptr)?;
                 x.write_unaligned(reg[_src]);
             },
             ebpf::ST_W_XADD => unimplemented!(),

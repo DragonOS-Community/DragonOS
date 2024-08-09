@@ -13,7 +13,7 @@ use std::{
     ops::{Index, IndexMut},
 };
 
-use ebpf;
+use crate::ebpf;
 
 extern crate libc;
 

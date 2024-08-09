@@ -7,16 +7,17 @@
 //! This module parses eBPF assembly language source code.
 
 #[cfg(feature = "std")]
-use combine::EasyParser;
-use combine::{
-    attempt, between, eof, many, many1, one_of, optional,
-    parser::char::{alpha_num, char, digit, hex_digit, spaces, string},
-    sep_by,
-    stream::position::{self},
-    ParseError, Parser, Stream,
+use crate::combine::EasyParser;
+use crate::{
+    combine::{
+        attempt, between, eof, many, many1, one_of, optional,
+        parser::char::{alpha_num, char, digit, hex_digit, spaces, string},
+        sep_by,
+        stream::position::{self},
+        ParseError, Parser, Stream,
+    },
+    lib::*,
 };
-
-use crate::lib::*;
 
 /// Operand of an instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

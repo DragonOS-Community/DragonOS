@@ -102,6 +102,8 @@ pub mod lib {
     #[cfg(feature = "std")]
     pub use std::string::{String, ToString};
     #[cfg(feature = "std")]
+    pub use std::vec;
+    #[cfg(feature = "std")]
     pub use std::vec::Vec;
 
     pub use self::core::{convert::TryInto, f64, mem, mem::ManuallyDrop, ptr};

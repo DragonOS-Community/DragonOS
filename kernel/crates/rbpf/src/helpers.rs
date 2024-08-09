@@ -19,8 +19,6 @@
 #[cfg(feature = "std")]
 extern crate libc;
 
-use crate::lib::*;
-
 // Helpers associated to kernel helpers
 // See also linux/include/uapi/linux/bpf.h in Linux kernel sources.
 

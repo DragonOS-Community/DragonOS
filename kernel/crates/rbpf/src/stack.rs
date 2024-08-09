@@ -1,4 +1,4 @@
-use crate::{ebpf::STACK_SIZE, lib::Vec};
+use crate::{ebpf::STACK_SIZE, vec, Vec};
 
 pub struct StackFrame {
     return_address: u16,

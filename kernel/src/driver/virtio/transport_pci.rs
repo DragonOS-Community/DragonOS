@@ -116,13 +116,14 @@ impl PciTransport {
     /// - `device` - The PCI device structure for the VirtIO device.
     /// - `irq_handler` - An optional handler for the device's interrupt. If `None`, a default
     ///     handler `DefaultVirtioIrqHandler` will be used.
+    /// - `irq_number_offset` - Currently, this parameter is just simple make a offset to the irq number, cause it's not be allowed to have the same irq number within different device
     #[allow(clippy::extra_unused_type_parameters)]
     pub fn new<H: Hal>(
         device: &mut PciDeviceStructureGeneralDevice,
         dev_id: Arc<DeviceId>,
-        add: usize,
+        irq_number_offset: usize,
     ) -> Result<Self, VirtioPciError> {
-        let irq = VIRTIO_RECV_VECTOR.add(add as u32);
+        let irq = VIRTIO_RECV_VECTOR.add(irq_number_offset as u32);
         let header = &device.common_header;
         let bus_device_function = header.bus_device_function;
         if header.vendor_id != VIRTIO_VENDOR_ID {

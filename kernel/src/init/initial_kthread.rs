@@ -34,10 +34,12 @@ fn kernel_init() -> Result<(), SystemError> {
     // scm_enable_double_buffer().expect("Failed to enable double buffer");
 
     #[cfg(target_arch = "x86_64")]
-    crate::driver::disk::ahci::ahci_init().map_err(|err| {
-        error!("Failed to initialize ahci disk:{:?}", err);
-        err
-    })?;
+    crate::driver::disk::ahci::ahci_init()
+        .map_err(|err| {
+            error!("Failed to initialize ahci disk:{:?}", err);
+            err
+        })
+        .ok();
 
     virtio_probe();
     mount_root_fs().expect("Failed to mount root fs");

@@ -6,17 +6,19 @@
 
 //! This module parses eBPF assembly language source code.
 
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
+
 #[cfg(feature = "std")]
-use crate::combine::EasyParser;
-use crate::{
-    combine::{
-        attempt, between, eof, many, many1, one_of, optional,
-        parser::char::{alpha_num, char, digit, hex_digit, spaces, string},
-        sep_by,
-        stream::position::{self},
-        ParseError, Parser, Stream,
-    },
-    lib::*,
+use combine::EasyParser;
+use combine::{
+    attempt, between, eof, many, many1, one_of, optional,
+    parser::char::{alpha_num, char, digit, hex_digit, spaces, string},
+    sep_by,
+    stream::position::{self},
+    ParseError, Parser, Stream,
 };
 
 /// Operand of an instruction.
@@ -123,11 +125,11 @@ pub fn parse(input: &str) -> Result<Vec<Instruction>, String> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::{string::ToString, vec};
 
     use combine::Parser;
 
     use super::{ident, instruction, integer, operand, parse, register, Instruction, Operand};
-    use crate::lib::*;
 
     // Unit tests for the different kinds of parsers.
 

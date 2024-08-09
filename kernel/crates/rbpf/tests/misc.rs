@@ -21,10 +21,7 @@ extern crate rbpf;
 
 #[cfg(feature = "std")]
 use rbpf::helpers;
-use rbpf::{
-    assembler::assemble,
-    lib::{Error, ErrorKind},
-};
+use rbpf::{assembler::assemble, Error, ErrorKind};
 
 // The following two examples have been compiled from C with the following command:
 //

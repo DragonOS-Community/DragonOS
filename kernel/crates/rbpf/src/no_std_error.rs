@@ -3,7 +3,7 @@
 //! This module provides a simple implementation of the Error struct that is
 //! used as a drop-in replacement for `std::io::Error` when using `rbpf` in `no_std`.
 
-use crate::lib::String;
+use alloc::string::String;
 
 /// Implementation of Error for no_std applications.
 /// Ensures that the existing code can use it with the same interface

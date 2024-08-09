@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
+use alloc::{collections::BTreeMap, format, vec, vec::Vec};
+use core::{mem, mem::ManuallyDrop};
+use std::io::ErrorKind;
+
 use cranelift_codegen::{
     entity::EntityRef,
     ir::{
@@ -15,13 +19,10 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 
-use super::Error;
-use crate::{
-    ebpf::{
-        self, Insn, BPF_ALU_OP_MASK, BPF_IND, BPF_JEQ, BPF_JGE, BPF_JGT, BPF_JLE, BPF_JLT,
-        BPF_JMP32, BPF_JNE, BPF_JSET, BPF_JSGE, BPF_JSGT, BPF_JSLE, BPF_JSLT, BPF_X, STACK_SIZE,
-    },
-    lib::*,
+use super::{Error, HashMap, HashSet};
+use crate::ebpf::{
+    self, Insn, BPF_ALU_OP_MASK, BPF_IND, BPF_JEQ, BPF_JGE, BPF_JGT, BPF_JLE, BPF_JLT, BPF_JMP32,
+    BPF_JNE, BPF_JSET, BPF_JSGE, BPF_JSGT, BPF_JSLE, BPF_JSLT, BPF_X, STACK_SIZE,
 };
 
 pub type JittedFunction = extern "C" fn(

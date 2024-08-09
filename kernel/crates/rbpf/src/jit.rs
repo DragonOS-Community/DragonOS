@@ -6,14 +6,13 @@
 //      (Translation to Rust, MetaBuff addition)
 
 use std::{
-    collections::HashMap,
     fmt::{Error as FormatterError, Formatter},
     io::{Error, ErrorKind},
     mem,
     ops::{Index, IndexMut},
 };
 
-use crate::ebpf;
+use crate::{ebpf, HashMap};
 
 extern crate libc;
 

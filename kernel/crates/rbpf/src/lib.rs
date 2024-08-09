@@ -28,31 +28,16 @@
 )]
 // Configures the crate to be `no_std` when `std` feature is disabled.
 #![cfg_attr(not(feature = "std"), no_std)]
-
-extern crate byteorder;
-extern crate combine;
-extern crate log;
-#[cfg(feature = "std")]
-extern crate time;
-
-#[cfg(not(feature = "std"))]
 extern crate alloc;
 
-#[cfg(feature = "cranelift")]
-extern crate cranelift_codegen;
-#[cfg(feature = "cranelift")]
-extern crate cranelift_frontend;
-#[cfg(feature = "cranelift")]
-extern crate cranelift_jit;
-#[cfg(feature = "cranelift")]
-extern crate cranelift_module;
-#[cfg(feature = "cranelift")]
-extern crate cranelift_native;
+use alloc::{collections::BTreeMap, format, vec, vec::Vec};
+use core::ptr;
 
 use byteorder::{ByteOrder, LittleEndian};
 
-use crate::lib::*;
-
+type HashMap<K, V> = BTreeMap<K, V>;
+#[cfg(feature = "cranelift")]
+type HashSet<T> = alloc::collections::BTreeSet<T>;
 mod asm_parser;
 pub mod assembler;
 #[cfg(feature = "cranelift")]
@@ -69,47 +54,13 @@ mod no_std_error;
 mod stack;
 mod verifier;
 
-/// Reexports all the types needed from the `std`, `core`, and `alloc`
-/// crates. This avoids elaborate import wrangling having to happen in every
-/// module. Inspired by the design used in `serde`.
-pub mod lib {
-    mod core {
-        #[cfg(not(feature = "std"))]
-        pub use core::*;
-        #[cfg(feature = "std")]
-        pub use std::*;
-    }
+#[cfg(feature = "std")]
+pub use std::io::{Error, ErrorKind};
 
-    // In no_std we cannot use randomness for hashing, thus we need to use
-    // BTree-based implementations of Maps and Sets. The cranelift module uses
-    // BTrees by default, hence we need to expose it twice here.
-    #[cfg(not(feature = "std"))]
-    pub use alloc::collections::{BTreeMap as HashMap, BTreeMap, BTreeSet as HashSet, BTreeSet};
-    #[cfg(not(feature = "std"))]
-    pub use alloc::format;
-    #[cfg(not(feature = "std"))]
-    pub use alloc::string::{String, ToString};
-    #[cfg(not(feature = "std"))]
-    pub use alloc::vec;
-    #[cfg(not(feature = "std"))]
-    pub use alloc::vec::Vec;
-    #[cfg(feature = "std")]
-    pub use std::collections::{BTreeMap, HashMap, HashSet};
-    #[cfg(feature = "std")]
-    pub use std::io::{Error, ErrorKind};
-    #[cfg(feature = "std")]
-    pub use std::println;
-    #[cfg(feature = "std")]
-    pub use std::string::{String, ToString};
-    #[cfg(feature = "std")]
-    pub use std::vec::Vec;
-
-    pub use self::core::{convert::TryInto, f64, mem, mem::ManuallyDrop, ptr};
-    /// In no_std we use a custom implementation of the error which acts as a
-    /// replacement for the io Error.
-    #[cfg(not(feature = "std"))]
-    pub use crate::no_std_error::{Error, ErrorKind};
-}
+/// In no_std we use a custom implementation of the error which acts as a
+/// replacement for the io Error.
+#[cfg(not(feature = "std"))]
+pub use crate::no_std_error::{Error, ErrorKind};
 
 /// eBPF verification function that returns an error if the program does not meet its requirements.
 ///
@@ -240,7 +191,7 @@ impl<'a> EbpfVmMbuff<'a> {
     /// # Examples
     ///
     /// ```
-    /// use rbpf::lib::{Error, ErrorKind};
+    /// use rbpf::{Error, ErrorKind};
     /// use rbpf::ebpf;
     ///
     /// // Define a simple verifier function.
@@ -739,7 +690,7 @@ impl<'a> EbpfVmFixedMbuff<'a> {
     /// # Examples
     ///
     /// ```
-    /// use rbpf::lib::{Error, ErrorKind};
+    /// use rbpf::{Error, ErrorKind};
     /// use rbpf::ebpf;
     ///
     /// // Define a simple verifier function.
@@ -1180,7 +1131,7 @@ impl<'a> EbpfVmRaw<'a> {
     /// # Examples
     ///
     /// ```
-    /// use rbpf::lib::{Error, ErrorKind};
+    /// use rbpf::{Error, ErrorKind};
     /// use rbpf::ebpf;
     ///
     /// // Define a simple verifier function.
@@ -1258,7 +1209,7 @@ impl<'a> EbpfVmRaw<'a> {
     #[allow(clippy::type_complexity)]
     pub fn register_helper_set(
         &mut self,
-        helpers: &BTreeMap<u32, fn(u64, u64, u64, u64, u64) -> u64>,
+        helpers: &HashMap<u32, fn(u64, u64, u64, u64, u64) -> u64>,
     ) -> Result<(), Error> {
         for (key, function) in helpers {
             self.parent.register_helper(*key, *function)?;
@@ -1541,7 +1492,7 @@ impl<'a> EbpfVmNoData<'a> {
     /// # Examples
     ///
     /// ```
-    /// use rbpf::lib::{Error, ErrorKind};
+    /// use rbpf::{Error, ErrorKind};
     /// use rbpf::ebpf;
     ///
     /// // Define a simple verifier function.

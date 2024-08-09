@@ -8,9 +8,38 @@
 use crate::{
     ebpf::{self, Insn},
     helpers::BPF_FUNC_MAPPER,
-    lib::*,
     stack::StackFrame,
+    *,
 };
+
+#[cfg(not(feature = "user"))]
+fn check_mem(
+    addr: u64,
+    len: usize,
+    access_type: &str,
+    insn_ptr: usize,
+    mbuff: &[u8],
+    mem: &[u8],
+    stack: &[u8],
+) -> Result<(), Error> {
+    log::trace!(
+        "check_mem: addr {:#x}, len {}, access_type {}, insn_ptr {}",
+        addr,
+        len,
+        access_type,
+        insn_ptr
+    );
+    log::trace!(
+        "check_mem: mbuff: {:#x}/{:#x}, mem: {:#x}/{:#x}, stack: {:#x}/{:#x}",
+        mbuff.as_ptr() as u64,
+        mbuff.len(),
+        mem.as_ptr() as u64,
+        mem.len(),
+        stack.as_ptr() as u64,
+        stack.len()
+    );
+    Ok(())
+}
 
 #[cfg(feature = "user")]
 fn check_mem(
@@ -90,19 +119,11 @@ pub fn execute_program(
     }
     let check_mem_load =
         |stack: &[u8], addr: u64, len: usize, insn_ptr: usize| -> Result<(), Error> {
-            if cfg!(feature = "user") {
-                check_mem(addr, len, "load", insn_ptr, mbuff, mem, stack)
-            } else {
-                Ok(())
-            }
+            check_mem(addr, len, "load", insn_ptr, mbuff, mem, stack)
         };
     let check_mem_store =
         |stack: &[u8], addr: u64, len: usize, insn_ptr: usize| -> Result<(), Error> {
-            if cfg!(feature = "user") {
-                check_mem(addr, len, "store", insn_ptr, mbuff, mem, stack)
-            } else {
-                Ok(())
-            }
+            check_mem(addr, len, "store", insn_ptr, mbuff, mem, stack)
         };
 
     // Loop on instructions

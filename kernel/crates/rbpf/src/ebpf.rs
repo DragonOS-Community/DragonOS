@@ -14,9 +14,9 @@
 //! <https://www.kernel.org/doc/Documentation/networking/filter.txt>, or for a shorter version of
 //! the list of the operation codes: <https://github.com/iovisor/bpf-docs/blob/master/eBPF.md>
 
-use byteorder::{ByteOrder, LittleEndian};
+use alloc::{vec, vec::Vec};
 
-use crate::lib::*;
+use byteorder::{ByteOrder, LittleEndian};
 
 /// The maximum call depth is 8
 pub const RBPF_MAX_CALL_DEPTH: usize = 8;

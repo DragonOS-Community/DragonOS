@@ -12,6 +12,7 @@ readme = "README.md"
 keywords = ["BPF", "eBPF", "interpreter", "JIT", "filtering"]
 license = "Apache-2.0/MIT"
 edition = "2021"
+
 # Packaging directives
 include = [
     "src/**",
@@ -48,7 +49,7 @@ json = "0.11"
 hex = "0.4.3"
 
 [features]
-default = ["std", "user"]
+default = ["std", "user", "cranelift"]
 cargo-clippy = []
 std = ["dep:time", "dep:libc", "combine/std"]
 cranelift = [

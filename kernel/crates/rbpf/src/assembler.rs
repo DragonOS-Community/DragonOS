@@ -3,6 +3,14 @@
 
 //! This module translates eBPF assembly language to binary.
 
+use alloc::{
+    collections::BTreeMap,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+
 use self::InstructionType::{
     AluBinary, AluUnary, Call, Endian, JumpConditional, JumpUnconditional, LoadAbs, LoadImm,
     LoadInd, LoadReg, NoOperand, StoreImm, StoreReg,
@@ -13,7 +21,6 @@ use crate::{
         Operand::{Integer, Memory, Nil, Register},
     },
     ebpf::{self, Insn},
-    lib::*,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -33,8 +40,8 @@ enum InstructionType {
     NoOperand,
 }
 
-fn make_instruction_map() -> HashMap<String, (InstructionType, u8)> {
-    let mut result = HashMap::new();
+fn make_instruction_map() -> BTreeMap<String, (InstructionType, u8)> {
+    let mut result = BTreeMap::new();
 
     let alu_binary_ops = [
         ("add", ebpf::BPF_ADD),

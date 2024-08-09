@@ -16,11 +16,6 @@
 //! value. Hence some helpers have unused arguments, or return a 0 value in all cases, in order to
 //! respect this convention.
 
-#[cfg(feature = "std")]
-extern crate libc;
-
-use crate::lib::*;
-
 // Helpers associated to kernel helpers
 // See also linux/include/uapi/linux/bpf.h in Linux kernel sources.
 

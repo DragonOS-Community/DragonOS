@@ -327,32 +327,6 @@ impl MemoryManagementArch for X86_64MMArch {
         pkru::pkru_allows_pkey(pkru::vma_pkey(vma), write)
     }
 
-    // fn protection_map() -> [usize; 16] {
-    //     let mut map = [0; 16];
-    //     map[VmFlags::VM_NONE] = Self::PAGE_NONE;
-    //     map[VmFlags::VM_READ] = Self::PAGE_READONLY;
-    //     map[VmFlags::VM_WRITE] = Self::PAGE_COPY;
-    //     map[VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_COPY;
-    //     map[VmFlags::VM_EXEC] = Self::PAGE_READONLY_EXEC;
-    //     map[VmFlags::VM_EXEC | VmFlags::VM_READ] = Self::PAGE_READONLY_EXEC;
-    //     map[VmFlags::VM_EXEC | VmFlags::VM_WRITE] = Self::PAGE_COPY_EXEC;
-    //     map[VmFlags::VM_EXEC | VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_COPY_EXEC;
-    //     map[VmFlags::VM_SHARED] = Self::PAGE_NONE;
-    //     map[VmFlags::VM_SHARED | VmFlags::VM_READ] = Self::PAGE_READONLY;
-    //     map[VmFlags::VM_SHARED | VmFlags::VM_WRITE] = Self::PAGE_SHARED;
-    //     map[VmFlags::VM_SHARED | VmFlags::VM_WRITE | VmFlags::VM_READ] = Self::PAGE_SHARED;
-    //     map[VmFlags::VM_SHARED | VmFlags::VM_EXEC] = Self::PAGE_READONLY_EXEC;
-    //     map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_READ] = Self::PAGE_READONLY_EXEC;
-    //     map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_WRITE] = Self::PAGE_SHARED_EXEC;
-    //     map[VmFlags::VM_SHARED | VmFlags::VM_EXEC | VmFlags::VM_WRITE | VmFlags::VM_READ] =
-    //         Self::PAGE_SHARED_EXEC;
-
-    //     if Self::is_xd_reserved() {
-    //         map.iter_mut().for_each(|x| *x &= !Self::ENTRY_FLAG_NO_EXEC)
-    //     }
-    //     map
-    // }
-
     const PROTECTION_MAP: [EntryFlags<MMArch>; 16] = protection_map();
 
     const PAGE_NONE: usize =

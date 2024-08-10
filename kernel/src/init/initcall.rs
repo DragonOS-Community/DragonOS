@@ -10,7 +10,6 @@ define_public_unified_initializer_slice!(INITCALL_FS);
 define_public_unified_initializer_slice!(INITCALL_ROOTFS);
 define_public_unified_initializer_slice!(INITCALL_DEVICE);
 define_public_unified_initializer_slice!(INITCALL_LATE);
-define_public_unified_initializer_slice!(INITCALL_MM);
 
 pub fn do_initcalls() -> Result<(), SystemError> {
     unified_init!(INITCALL_PURE);
@@ -22,6 +21,5 @@ pub fn do_initcalls() -> Result<(), SystemError> {
     unified_init!(INITCALL_ROOTFS);
     unified_init!(INITCALL_DEVICE);
     unified_init!(INITCALL_LATE);
-    unified_init!(INITCALL_MM);
     return Ok(());
 }

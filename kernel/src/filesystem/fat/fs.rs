@@ -12,7 +12,6 @@ use alloc::{
     vec::Vec,
 };
 
-use crate::arch::mm::PageMapper;
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::vfs::file::PageCache;
 use crate::filesystem::vfs::utils::DName;
@@ -292,18 +291,17 @@ impl FileSystem for FATFileSystem {
         )
     }
 
-    unsafe fn fault(&self, pfm: &mut PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
-        PageFaultHandler::filemap_fault(pfm, mapper)
+    unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        PageFaultHandler::filemap_fault(pfm)
     }
 
     unsafe fn map_pages(
         &self,
         pfm: &mut PageFaultMessage,
-        mapper: &mut PageMapper,
         start_pgoff: usize,
         end_pgoff: usize,
     ) -> VmFaultReason {
-        PageFaultHandler::filemap_map_pages(pfm, mapper, start_pgoff, end_pgoff)
+        PageFaultHandler::filemap_map_pages(pfm, start_pgoff, end_pgoff)
     }
 }
 

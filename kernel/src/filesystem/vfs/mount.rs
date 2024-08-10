@@ -12,7 +12,6 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    arch::mm::PageMapper,
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::ROOT_INODE,
     libs::{
@@ -537,19 +536,17 @@ impl FileSystem for MountFS {
         SuperBlock::new(Magic::MOUNT_MAGIC, MOUNTFS_BLOCK_SIZE, MOUNTFS_MAX_NAMELEN)
     }
 
-    unsafe fn fault(&self, pfm: &mut PageFaultMessage, mapper: &mut PageMapper) -> VmFaultReason {
-        self.inner_filesystem.fault(pfm, mapper)
+    unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        self.inner_filesystem.fault(pfm)
     }
 
     unsafe fn map_pages(
         &self,
         pfm: &mut PageFaultMessage,
-        mapper: &mut PageMapper,
         start_pgoff: usize,
         end_pgoff: usize,
     ) -> VmFaultReason {
-        self.inner_filesystem
-            .map_pages(pfm, mapper, start_pgoff, end_pgoff)
+        self.inner_filesystem.map_pages(pfm, start_pgoff, end_pgoff)
     }
 }
 

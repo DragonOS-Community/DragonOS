@@ -94,6 +94,7 @@ bitflags! {
         const VM_FAULT_NEEDDSYNC = 0x002000;
         const VM_FAULT_COMPLETED = 0x004000;
         const VM_FAULT_HINDEX_MASK = 0x0f0000;
+        const VM_FAULT_ERROR = 0x000001 | 0x000002 | 0x000040 | 0x000010 | 0x000020 | 0x000800;
     }
 
     pub struct MsFlags:usize {
@@ -667,16 +668,6 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     const PAGE_WRITE: usize;
     const PAGE_WRITE_EXEC: usize;
     const PAGE_EXEC: usize;
-
-    // /// 获取保护标志的映射表
-    // ///
-    // ///
-    // /// ## 返回值
-    // /// - `[usize; 16]`: 长度为16的映射表
-    // fn protection_map() -> [usize; 16] {
-    //     let map = [0; 16];
-    //     map
-    // }
 
     const PROTECTION_MAP: [EntryFlags<Self>; 16];
 

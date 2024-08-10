@@ -223,7 +223,7 @@ impl X86_64MMArch {
         }
 
         let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
-        let mut space_guard = current_address_space.write();
+        let mut space_guard = current_address_space.write_irqsave();
         let mut fault;
         loop {
             let vma = space_guard.mappings.find_nearest(address);
@@ -269,11 +269,9 @@ impl X86_64MMArch {
                 );
             }
             let mapper = &mut space_guard.user_mapper.utable;
+            let message = PageFaultMessage::new(vma.clone(), address, flags, mapper);
 
-            fault = PageFaultHandler::handle_mm_fault(
-                &mut PageFaultMessage::new(vma.clone(), address, flags),
-                mapper,
-            );
+            fault = PageFaultHandler::handle_mm_fault(message);
 
             if fault.contains(VmFaultReason::VM_FAULT_COMPLETED) {
                 return;

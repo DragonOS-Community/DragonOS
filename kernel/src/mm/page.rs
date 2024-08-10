@@ -18,7 +18,7 @@ use crate::{
     arch::{interrupt::ipi::send_ipi, mm::LockedFrameAllocator, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
     filesystem::vfs::{file::PageCache, FilePrivateData},
-    init::initcall::INITCALL_MM,
+    init::initcall::INITCALL_CORE,
     ipc::shm::ShmId,
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -113,9 +113,11 @@ pub fn page_reclaimer_init() {
     info!("page_reclaimer_init done");
 }
 
+/// 页面回收线程
 static mut PAGE_RECLAIMER_THREAD: Option<Arc<ProcessControlBlock>> = None;
 
-#[unified_init(INITCALL_MM)]
+/// 页面回收线程初始化函数
+#[unified_init(INITCALL_CORE)]
 fn page_reclaimer_thread_init() -> Result<(), SystemError> {
     let closure = crate::process::kthread::KernelThreadClosure::StaticEmptyClosure((
         &(page_reclaim_thread as fn() -> i32),
@@ -133,6 +135,7 @@ fn page_reclaimer_thread_init() -> Result<(), SystemError> {
     Ok(())
 }
 
+/// 页面回收线程执行的函数
 fn page_reclaim_thread() -> i32 {
     loop {
         let usage = unsafe { LockedFrameAllocator.usage() };
@@ -152,10 +155,12 @@ fn page_reclaim_thread() -> i32 {
     }
 }
 
+/// 获取页面回收器
 pub fn page_reclaimer_lock_irqsave() -> SpinLockGuard<'static, PageReclaimer> {
     unsafe { PAGE_RECLAIMER.as_ref().unwrap().lock_irqsave() }
 }
 
+/// 页面回收器
 pub struct PageReclaimer {
     lru: LruCache<PhysAddr, Arc<Page>>,
 }
@@ -175,6 +180,10 @@ impl PageReclaimer {
         self.lru.put(paddr, page.clone());
     }
 
+    /// lru链表缩减
+    /// ## 参数
+    ///
+    /// - `count`: 需要缩减的页面数量
     pub fn shrink_list(&mut self, count: PageFrameCount) {
         for _ in 0..count.data() {
             let (paddr, page) = self.lru.pop_lru().expect("pagecache is empty");
@@ -197,11 +206,20 @@ impl PageReclaimer {
         }
     }
 
+    /// 唤醒页面回收线程
     pub fn wakeup_claim_thread() {
         // log::info!("wakeup_claim_thread");
         let _ = ProcessManager::wakeup(unsafe { PAGE_RECLAIMER_THREAD.as_ref().unwrap() });
     }
 
+    /// 脏页回写函数
+    /// ## 参数
+    ///
+    /// - `page`: 需要回写的脏页
+    /// - `unmap`: 是否取消映射
+    ///
+    /// ## 返回值
+    /// - VmFaultReason: 页面错误处理信息标志
     pub fn page_writeback(page: &Arc<Page>, unmap: bool) {
         if !unmap {
             page.write_irqsave().remove_flags(PageFlags::PG_DIRTY);
@@ -254,6 +272,7 @@ impl PageReclaimer {
             .unwrap();
     }
 
+    /// lru脏页刷新
     pub fn flush_dirty_pages(&self) {
         // log::info!("flush_dirty_pages");
         let iter = self.lru.iter();

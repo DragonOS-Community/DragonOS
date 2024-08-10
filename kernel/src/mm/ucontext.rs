@@ -283,23 +283,15 @@ impl InnerAddressSpace {
 
         // debug!("map_anonymous: len = {}", len);
 
-        let start_page: VirtPageFrame = if allocate_at_once {
-            self.mmap(
-                round_hint_to_min(start_vaddr),
-                PageFrameCount::from_bytes(len).unwrap(),
-                prot_flags,
-                map_flags,
-                move |page, count, flags, mapper, flusher| {
+        let start_page: VirtPageFrame = self.mmap(
+            round_hint_to_min(start_vaddr),
+            PageFrameCount::from_bytes(len).unwrap(),
+            prot_flags,
+            map_flags,
+            move |page, count, flags, mapper, flusher| {
+                if allocate_at_once {
                     VMA::zeroed(page, count, vm_flags, flags, mapper, flusher, None, None)
-                },
-            )?
-        } else {
-            self.mmap(
-                round_hint_to_min(start_vaddr),
-                PageFrameCount::from_bytes(len).unwrap(),
-                prot_flags,
-                map_flags,
-                move |page, count, flags, _mapper, _flusher| {
+                } else {
                     Ok(LockedVMA::new(VMA::new(
                         VirtRegion::new(page.virt_address(), count.data() * MMArch::PAGE_SIZE),
                         vm_flags,
@@ -308,9 +300,9 @@ impl InnerAddressSpace {
                         None,
                         false,
                     )))
-                },
-            )?
-        };
+                }
+            },
+        )?;
 
         return Ok(start_page);
     }
@@ -391,13 +383,13 @@ impl InnerAddressSpace {
         }
         let pgoff = offset >> MMArch::PAGE_SHIFT;
 
-        let start_page: VirtPageFrame = if allocate_at_once {
-            self.mmap(
-                round_hint_to_min(start_vaddr),
-                PageFrameCount::from_bytes(len).unwrap(),
-                prot_flags,
-                map_flags,
-                move |page, count, flags, mapper, flusher| {
+        let start_page: VirtPageFrame = self.mmap(
+            round_hint_to_min(start_vaddr),
+            PageFrameCount::from_bytes(len).unwrap(),
+            prot_flags,
+            map_flags,
+            move |page, count, flags, mapper, flusher| {
+                if allocate_at_once {
                     VMA::zeroed(
                         page,
                         count,
@@ -408,15 +400,7 @@ impl InnerAddressSpace {
                         file,
                         Some(pgoff),
                     )
-                },
-            )?
-        } else {
-            self.mmap(
-                round_hint_to_min(start_vaddr),
-                PageFrameCount::from_bytes(len).unwrap(),
-                prot_flags,
-                map_flags,
-                move |page, count, flags, _mapper, _flusher| {
+                } else {
                     Ok(LockedVMA::new(VMA::new(
                         VirtRegion::new(page.virt_address(), count.data() * MMArch::PAGE_SIZE),
                         vm_flags,
@@ -425,9 +409,9 @@ impl InnerAddressSpace {
                         Some(pgoff),
                         false,
                     )))
-                },
-            )?
-        };
+                }
+            },
+        )?;
         return Ok(start_page);
     }
 

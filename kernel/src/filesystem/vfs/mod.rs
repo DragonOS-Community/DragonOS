@@ -12,7 +12,6 @@ use intertrait::CastFromSync;
 use system_error::SystemError;
 
 use crate::{
-    arch::mm::PageMapper,
     driver::base::{
         block::block_device::BlockDevice, char::CharDevice, device::device_number::DeviceNumber,
     },
@@ -565,7 +564,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     }
 
     fn page_cache(&self) -> Option<Arc<PageCache>> {
-        panic!("function page_cache() has not yet been implemented");
+        log::error!(
+            "function page_cache() has not yet been implemented for inode:{}",
+            crate::libs::name::get_type_name(&self)
+        );
+        None
     }
 }
 
@@ -817,7 +820,7 @@ pub trait FileSystem: Any + Sync + Send + Debug {
 
     fn super_block(&self) -> SuperBlock;
 
-    unsafe fn fault(&self, _pfm: &mut PageFaultMessage, _mapper: &mut PageMapper) -> VmFaultReason {
+    unsafe fn fault(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
         panic!(
             "fault() has not yet been implemented for filesystem: {}",
             crate::libs::name::get_type_name(&self)
@@ -827,7 +830,6 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     unsafe fn map_pages(
         &self,
         _pfm: &mut PageFaultMessage,
-        _mapper: &mut PageMapper,
         _start_pgoff: usize,
         _end_pgoff: usize,
     ) -> VmFaultReason {

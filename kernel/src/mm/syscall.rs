@@ -316,11 +316,6 @@ impl Syscall {
             );
             return Err(SystemError::EINVAL);
         }
-        // 暂时不支持除匿名页以外的映射
-        // if !map_flags.contains(MapFlags::MAP_ANONYMOUS) {
-        //     error!("mmap: not support file mapping");
-        //     return Err(SystemError::ENOSYS);
-        // }
 
         // 暂时不支持巨页映射
         if map_flags.contains(MapFlags::MAP_HUGETLB) {
@@ -329,6 +324,7 @@ impl Syscall {
         }
         let current_address_space = AddressSpace::current()?;
         let start_page = if map_flags.contains(MapFlags::MAP_ANONYMOUS) {
+            // 匿名映射
             current_address_space.write().map_anonymous(
                 start_vaddr,
                 len,
@@ -338,6 +334,7 @@ impl Syscall {
                 false,
             )?
         } else {
+            // 文件映射
             current_address_space.write().file_mapping(
                 start_vaddr,
                 len,
@@ -349,14 +346,7 @@ impl Syscall {
                 false,
             )?
         };
-        // let start_page = current_address_space.write().map_anonymous(
-        //     start_vaddr,
-        //     len,
-        //     prot_flags,
-        //     map_flags,
-        //     true,
-        //     false,
-        // )?;
+
         return Ok(start_page.virt_address().data());
     }
 
@@ -559,37 +549,46 @@ impl Syscall {
     /// - `len`：长度(已经对齐到页)
     /// - `flags`：标志
     pub fn msync(start: VirtAddr, len: usize, flags: usize) -> Result<usize, SystemError> {
+        if !start.check_aligned(MMArch::PAGE_SIZE) || !check_aligned(len, MMArch::PAGE_SIZE) {
+            return Err(SystemError::EINVAL);
+        }
+
+        if unlikely(verify_area(start, len).is_err()) {
+            return Err(SystemError::EINVAL);
+        }
+        if unlikely(len == 0) {
+            return Err(SystemError::EINVAL);
+        }
+
         let mut start = start.data();
         let end = start + len;
         let flags = MsFlags::from_bits_truncate(flags);
-        let mut err = Err(SystemError::EINVAL);
         let mut unmapped_error = Ok(0);
+
         if !flags.intersects(MsFlags::MS_ASYNC | MsFlags::MS_INVALIDATE | MsFlags::MS_SYNC) {
-            return err;
-        }
-        if flags.contains(MsFlags::MS_ASYNC | MsFlags::MS_SYNC) {
-            return err;
+            return Err(SystemError::EINVAL);
         }
 
-        err = Err(SystemError::ENOMEM);
-        if end < start {
-            return err;
+        if flags.contains(MsFlags::MS_ASYNC | MsFlags::MS_SYNC) {
+            return Err(SystemError::EINVAL);
         }
-        err = Ok(0);
+
+        if end < start {
+            return Err(SystemError::ENOMEM);
+        }
 
         if start == end {
-            return err;
+            return Ok(0);
         }
 
         let current_address_space = AddressSpace::current()?;
+        let mut err = Err(SystemError::ENOMEM);
+        let mut next_vma = current_address_space
+            .read()
+            .mappings
+            .find_nearest(VirtAddr::new(start));
         loop {
-            err = Err(SystemError::ENOMEM);
-
-            if let Some(vma) = current_address_space
-                .read()
-                .mappings
-                .find_nearest(VirtAddr::new(start))
-            {
+            if let Some(vma) = next_vma.clone() {
                 let guard = vma.lock_irqsave();
                 let vm_start = guard.region().start().data();
                 let vm_end = guard.region().end().data();
@@ -625,20 +624,31 @@ impl Syscall {
                             from_raw_parts(old_start as *mut u8, fend - fstart + 1)
                         });
                         file.lseek(SeekFrom::SeekSet(old_pos as i64)).unwrap();
-
-                        if err.is_err() || start >= end {
-                            err = Ok(0);
+                        if err.is_err() {
+                            break;
+                        } else if start >= end {
+                            err = unmapped_error;
                             break;
                         }
+                        next_vma = current_address_space
+                            .read()
+                            .mappings
+                            .find_nearest(VirtAddr::new(start));
                     }
-                } else if start >= end {
-                    err = Ok(0);
-                    break;
+                } else {
+                    if start >= end {
+                        err = unmapped_error;
+                        break;
+                    }
+                    next_vma = current_address_space
+                        .read()
+                        .mappings
+                        .find_nearest(VirtAddr::new(vm_end));
                 }
             } else {
-                break;
+                return Err(SystemError::ENOMEM);
             }
         }
-        return if err.is_err() { err } else { unmapped_error };
+        return err;
     }
 }

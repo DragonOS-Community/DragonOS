@@ -122,7 +122,7 @@ impl FileMode {
     }
 }
 
-#[allow(dead_code)]
+/// 页面缓存
 pub struct PageCache {
     xarray: SpinLock<XArray<Arc<Page>>>,
     pub inode: Option<Weak<dyn IndexNode>>,
@@ -174,16 +174,6 @@ impl PageCache {
     pub fn set_inode(&mut self, inode: Weak<dyn IndexNode>) {
         self.inode = Some(inode)
     }
-
-    // pub fn get_pages(&self, start_pgoff: usize, end_pgoff: usize) -> Vec<Arc<Page>> {
-    //     let mut vec = Vec::new();
-    //     for pgoff in start_pgoff..=end_pgoff {
-    //         if let Some(page) = self.map.get(&pgoff) {
-    //             vec.push(page.clone());
-    //         }
-    //     }
-    //     vec
-    // }
 }
 
 impl Default for PageCache {

@@ -1,16 +1,13 @@
-use core::{
-    hash::Hash,
-    sync::atomic::{AtomicU32, AtomicUsize},
-};
+use core::{hash::Hash, sync::atomic::AtomicU32};
 
 use alloc::sync::Arc;
 use hashbrown::HashMap;
 use log::warn;
 
 use super::user_namespace::UserNamespace;
+use crate::namespace::ucount::rlimit_type::UCOUNT_RLIMIT_COUNTS;
+use crate::namespace::ucount::UcountType::UCOUNT_COUNTS;
 use crate::{include::bindings::bindings::uid_t, libs::mutex::Mutex};
-use crate::{libs::spinlock, namespace::ucount::rlimit_type::UCOUNT_RLIMIT_COUNTS};
-use crate::{libs::spinlock::SpinLock, namespace::ucount::UcountType::UCOUNT_COUNTS};
 
 #[derive(Clone, Copy)]
 pub enum UcountType {

@@ -47,11 +47,11 @@ use crate::{
         ucontext::AddressSpace,
         VirtAddr,
     },
+    namespace::NsProxy,
     net::socket::SocketInode,
-    sched::completion::Completion,
     sched::{
-        cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag, EnqueueFlag, OnRq, SchedMode,
-        WakeupFlags, __schedule,
+        completion::Completion, cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag,
+        EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule,
     },
     smp::{
         core::smp_get_processor_id,
@@ -647,6 +647,9 @@ pub struct ProcessControlBlock {
 
     /// 进程的robust lock列表
     robust_list: RwLock<Option<RobustListHead>>,
+
+    /// namespace的指针
+    nsproxy: Weak<NsProxy>, // 用weak 避免所有的namespace出现循环引用问题
 }
 
 impl ProcessControlBlock {
@@ -725,6 +728,7 @@ impl ProcessControlBlock {
             thread: RwLock::new(ThreadInfo::new()),
             alarm_timer: SpinLock::new(None),
             robust_list: RwLock::new(None),
+            nsproxy: Weak::new(),
         };
 
         // 初始化系统调用栈
@@ -988,6 +992,10 @@ impl ProcessControlBlock {
 
     pub fn alarm_timer_irqsave(&self) -> SpinLockGuard<Option<AlarmTimer>> {
         return self.alarm_timer.lock_irqsave();
+    }
+
+    pub fn get_nsproxy(&self) -> Weak<NsProxy> {
+        self.nsproxy.clone()
     }
 }
 

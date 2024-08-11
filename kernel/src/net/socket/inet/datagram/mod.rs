@@ -1,136 +1,132 @@
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use log::{debug, error, warn};
-use smoltcp::{
-    socket::{raw, tcp, udp},
-    wire,
-};
 use system_error::SystemError::{self, *};
+use smoltcp;
 
-use crate::{
-    driver::net::Iface,
-    libs::rwlock::RwLock,
-    net::{
-        event_poll::EPollEventType, net_core::poll_ifaces, socket::tcp_def::TcpOptions, syscall::PosixSocketOption, Endpoint, Protocol, NET_DEVICES, SocketOptionsLevel
-    },
-};
-
-use crate::net::socket::{
-    handle::GlobalSocketHandle, Socket, SocketMetadata,
-    SocketOptions, SocketPollMethod, HANDLE_MAP, PORT_MANAGER, ip_def::IpOptions,
-};
-
-use super::common::{get_iface_to_bind, BoundInetInner, SocketType};
+use core::sync::atomic::AtomicBool;
+use crate::net::event_poll::EPollEventType;
+use crate::libs::rwlock::RwLock;
 
 pub type SmolUdpSocket = smoltcp::socket::udp::Socket<'static>;
 
-pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
-pub const DEFAULT_RX_BUF_SIZE: usize = 64 * 1024;
-pub const DEFAULT_TX_BUF_SIZE: usize = 64 * 1024;
+pub mod inner;
 
-#[derive(Debug)]
-pub struct UnboundUdp {
-    socket: SmolUdpSocket,
-}
-
-impl UnboundUdp {
-    pub fn new() -> Self {
-        let rx_buffer = udp::PacketBuffer::new(
-            vec![udp::PacketMetadata::EMPTY; DEFAULT_METADATA_BUF_SIZE],
-            vec![0; DEFAULT_RX_BUF_SIZE],
-        );
-        let tx_buffer = udp::PacketBuffer::new(
-            vec![udp::PacketMetadata::EMPTY; DEFAULT_METADATA_BUF_SIZE],
-            vec![0; DEFAULT_TX_BUF_SIZE],
-        );
-        let socket = SmolUdpSocket::new(rx_buffer, tx_buffer);
-
-        return Self { socket };
-    }
-
-    pub fn bind(self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<BoundUdp, SystemError> {
-        Ok( BoundUdp {
-            inner: BoundInetInner::bind(self.socket, SocketType::Udp, local_endpoint)?,
-        })
-    }
-
-    pub fn close(&mut self) {
-        self.socket.close();
-    }
-}
-
-#[derive(Debug)]
-pub struct BoundUdp {
-    inner: BoundInetInner,
-}
-
-impl BoundUdp {
-    fn with_mut_socket<F, T>(&mut self, f: F) -> T
-    where
-        F: FnMut(&mut SmolUdpSocket) -> T,
-    {
-        self.inner.with_mut(f)
-    }
-
-    #[inline]
-    fn try_recv(&mut self, buf: &mut [u8]) -> Result<(usize, smoltcp::wire::IpEndpoint), SystemError> {
-        self.with_mut_socket(|socket| {
-            if socket.can_recv() {
-                if let Ok((size, metadata)) = socket.recv_slice(buf) {
-                    return Ok((size, metadata.endpoint));
-                }
-            }
-            return Err(ENOTCONN);
-        })
-    }
-
-    fn try_send(&mut self, buf: &[u8], to: Option<smoltcp::wire::IpEndpoint>) -> Result<usize, SystemError> {
-        let remote = to.or(self.inner.remote).ok_or(ENOTCONN)?;
-
-        let result = self.with_mut_socket(|socket| {
-            if socket.can_send() && socket.send_slice(buf, remote).is_ok() {
-                return Ok(buf.len());
-            }
-            return Err(ENOBUFS);
-        });
-        return result;
-    }
-
-    fn close(&mut self) {
-        self.with_mut_socket(|socket|{
-            socket.close();
-        });
-        self.inner.iface().port_manager().unbind_port(SocketType::Udp, self.inner.endpoint().port);
-    }
-}
-
-// Udp Inner 负责其内部资源管理
-#[derive(Debug)]
-pub enum UdpInner {
-    Unbound(UnboundUdp),
-    Bound(BoundUdp),
-}
+use inner::*;
 
 // Udp Socket 负责提供状态切换接口、执行状态切换
 #[derive(Debug)]
 pub struct UdpSocket {
     inner: RwLock<Option<UdpInner>>,
-    metadata: SocketMetadata,
-    
+    nonblock: AtomicBool,
 }
 
 impl UdpSocket {
-    pub fn new(options: SocketOptions) -> Self {
-        let metadata = SocketMetadata::new(
-            // SocketType::Udp,
-            DEFAULT_RX_BUF_SIZE,
-            DEFAULT_TX_BUF_SIZE,
-            DEFAULT_METADATA_BUF_SIZE,
-            options,
-        );
+    pub fn new(nonblock: bool) -> Self {
         return Self {
-            inner: RwLock::new(None),
-            metadata,
+            inner: RwLock::new(Some(UdpInner::Unbound(UnboundUdp::new()))),
+            nonblock: AtomicBool::new(nonblock),
         };
+    }
+
+    pub fn bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
+        let mut inner = self.inner.write();
+        if let Some(UdpInner::Unbound(unbound)) = inner.take() {
+            let bound = unbound.bind(local_endpoint)?;
+            *inner = Some(UdpInner::Bound(bound));
+            return Ok(());
+        }
+        return Err(EINVAL);
+    }
+
+    pub fn bind_emphemeral(&self, remote: smoltcp::wire::IpAddress) -> Result<(), SystemError> {
+        let mut inner_guard = self.inner.write();
+        if let Some(UdpInner::Unbound(unbound)) = inner_guard.take() {
+            let bound = unbound.bind_ephemeral(remote)?;
+            inner_guard.replace(UdpInner::Bound(bound));
+            return Ok(());
+        }
+        return Err(EINVAL);
+    }
+
+    pub fn is_bound(&self) -> bool {
+        let inner = self.inner.read();
+        if let Some(UdpInner::Bound(_)) = &*inner {
+            return true;
+        }
+        return false;
+    }
+
+    pub fn close(&self) {
+        let mut inner = self.inner.write();
+        if let Some(UdpInner::Bound(bound)) = &mut *inner {
+            bound.close();
+            *inner = None;
+        }
+    }
+
+    pub fn try_recv(&self, buf: &mut [u8]) 
+        -> Result<(usize, smoltcp::wire::IpEndpoint), SystemError> 
+    {
+        let inner = self.inner.read();
+        if let Some(UdpInner::Bound(bound)) = &*inner {
+            let (size, endpoint) = bound.try_recv(buf)?;
+            return Ok((size, endpoint));
+        }
+        return Err(ENOTCONN);
+    }
+
+    pub fn try_send(&self, buf: &[u8], to: Option<smoltcp::wire::IpEndpoint>) 
+        -> Result<usize, SystemError> 
+    {
+        let size;
+        {
+            let mut inner_guard = self.inner.write();
+            let inner = match inner_guard.take().ok_or(EINVAL)? {
+                UdpInner::Bound(bound) => bound,
+                UdpInner::Unbound(unbound) => {
+                    unbound.bind_ephemeral(to.ok_or(EADDRNOTAVAIL)?.addr)?
+                }
+            };
+            size = inner.try_send(buf, to)?;
+            inner_guard.replace(UdpInner::Bound(inner));
+        };
+        return Ok(size);
+    }
+
+    pub fn poll(&self) -> EPollEventType {
+        let mut event = EPollEventType::empty();
+        match self.inner.read().as_ref().unwrap() {
+            UdpInner::Unbound(_) => {
+                event.insert(
+                    EPollEventType::EPOLLOUT |
+                    EPollEventType::EPOLLWRNORM |
+                    EPollEventType::EPOLLWRBAND
+                );
+            }
+            UdpInner::Bound(bound) => {
+                let (can_recv, can_send) = 
+                    bound.with_socket(|socket| {
+                        (socket.can_recv(), socket.can_send())
+                    }
+                );
+
+                if can_recv {
+                    event.insert(
+                        EPollEventType::EPOLLIN |
+                        EPollEventType::EPOLLRDNORM
+                    );
+                }
+
+                if can_send {
+                    event.insert(
+                        EPollEventType::EPOLLOUT |
+                        EPollEventType::EPOLLWRNORM |
+                        EPollEventType::EPOLLWRBAND
+                    );
+                } else {
+                    todo!("缓冲区空间不够，需要使用信号处理");
+                }
+            }
+        }
+        return event;
     }
 }
 
@@ -161,7 +157,6 @@ bitflags! {
         const ESPINTCP = 7;             // Yikes, this is really xfrm encap types.
     }
 }
-
 
 // fn sock_set_option(
 //     &self,

@@ -38,18 +38,20 @@ use self::{
 };
 
 use super::{
-    event_poll::{EPollEventType, EPollItem, EventPoll}, Endpoint, Protocol, SocketOptionsLevel
+    event_poll::{EPollEventType, EPollItem, EventPoll}, Endpoint,
 };
 
 pub mod handle;
 pub mod inet;
 pub mod unix;
-pub mod tcp_def;
 pub mod ip_def;
+pub mod poll_method;
+pub mod define;
 pub mod inode;
 pub mod common;
 
 pub use inode::SocketInode;
+pub use define::{AddressFamily, Options as SocketOptions, OptionsLevel as SocketOptionsLevel, Types as SocketTypes};
 
 lazy_static! {
     /// 所有socket的集合
@@ -74,16 +76,16 @@ pub(super) fn new_unbound_socket(
 ) -> Result<Box<dyn Socket>, SystemError> {
     let socket: Box<dyn Socket> = match address_family {
         AddressFamily::Unix => match socket_type {
-            PosixSocketType::Stream => Box::new(StreamSocket::new(SocketOptions::default())),
-            PosixSocketType::SeqPacket => Box::new(SeqpacketSocket::new(SocketOptions::default())),
+            PosixSocketType::Stream => Box::new(StreamSocket::new(Options::default())),
+            PosixSocketType::SeqPacket => Box::new(SeqpacketSocket::new(Options::default())),
             _ => {
                 return Err(SystemError::EINVAL);
             }
         },
         AddressFamily::INet => match socket_type {
-            PosixSocketType::Stream => Box::new(TcpSocket::new(SocketOptions::default())),
-            PosixSocketType::Datagram => Box::new(BoundUdp::new(SocketOptions::default())),
-            PosixSocketType::Raw => Box::new(RawSocket::new(protocol, SocketOptions::default())),
+            PosixSocketType::Stream => Box::new(TcpSocket::new(Options::default())),
+            PosixSocketType::Datagram => Box::new(BoundUdp::new(Options::default())),
+            PosixSocketType::Raw => Box::new(RawSocket::new(protocol, Options::default())),
             _ => {
                 return Err(SystemError::EINVAL);
             }
@@ -233,7 +235,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     /// https://code.dragonos.org.cn/s?refs=sk_setsockopt&project=linux-6.6.21
     fn set_option(
         &self,
-        _level: SocketOptionsLevel,
+        _level: OptionsLevel,
         _optname: usize,
         _optval: &[u8],
     ) -> Result<(), SystemError> {
@@ -263,46 +265,10 @@ impl Clone for Box<dyn Socket> {
 }
 
 
-// #[derive(Debug)]
-// pub struct SocketHandleItem {
-//     /// 对应的posix socket是否为listen的
-//     pub is_posix_listen: bool,
-//     /// shutdown状态
-//     pub shutdown_type: RwLock<ShutdownType>,
-//     pub posix_item: Weak<PosixSocketHandleItem>,
-// }
-
-// impl SocketHandleItem {
-//     pub fn new(posix_item: Weak<PosixSocketHandleItem>) -> Self {
-//         Self {
-//             is_posix_listen: false,
-//             shutdown_type: RwLock::new(ShutdownType::empty()),
-//             posix_item,
-//         }
-//     }
-
-//     pub fn shutdown_type(&self) -> ShutdownType {
-//         *self.shutdown_type.read()
-//     }
-
-//     pub fn shutdown_type_writer(&mut self) -> RwLockWriteGuard<ShutdownType> {
-//         self.shutdown_type.write_irqsave()
-//     }
-
-//     pub fn reset_shutdown_type(&self) {
-//         *self.shutdown_type.write() = ShutdownType::empty();
-//     }
-
-//     pub fn posix_item(&self) -> Option<Arc<PosixSocketHandleItem>> {
-//         self.posix_item.upgrade()
-//     }
-// }
-
-
 bitflags! {
     /// @brief socket的选项
     #[derive(Default)]
-    pub struct SocketOptions: u32 {
+    pub struct Options: u32 {
         /// 是否阻塞
         const BLOCK = 1 << 0;
         /// 是否允许广播
@@ -313,314 +279,5 @@ bitflags! {
         const REUSEADDR = 1 << 3;
         /// 是否允许重用端口
         const REUSEPORT = 1 << 4;
-    }
-}
-
-#[derive(Debug, Clone)]
-/// @brief 在trait Socket的metadata函数中返回该结构体供外部使用
-pub struct SocketMetadata {
-    // /// socket的类型
-    // pub socket_type: InetSocketType,
-    /// 接收缓冲区的大小
-    pub rx_buf_size: usize,
-    /// 发送缓冲区的大小
-    pub tx_buf_size: usize,
-    /// 元数据的缓冲区的大小
-    pub metadata_buf_size: usize,
-    /// socket的选项
-    pub options: SocketOptions,
-}
-
-impl SocketMetadata {
-    fn new(
-        // socket_type: InetSocketType,
-        rx_buf_size: usize,
-        tx_buf_size: usize,
-        metadata_buf_size: usize,
-        options: SocketOptions,
-    ) -> Self {
-        Self {
-            // socket_type,
-            rx_buf_size,
-            tx_buf_size,
-            metadata_buf_size,
-            options,
-        }
-    }
-}
-
-/// @brief 地址族的枚举
-///
-/// 参考：https://code.dragonos.org.cn/xref/linux-5.19.10/include/linux/socket.h#180
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
-pub enum AddressFamily {
-    /// AF_UNSPEC 表示地址族未指定
-    Unspecified = 0,
-    /// AF_UNIX 表示Unix域的socket (与AF_LOCAL相同)
-    Unix = 1,
-    ///  AF_INET 表示IPv4的socket
-    INet = 2,
-    /// AF_AX25 表示AMPR AX.25的socket
-    AX25 = 3,
-    /// AF_IPX 表示IPX的socket
-    IPX = 4,
-    /// AF_APPLETALK 表示Appletalk的socket
-    Appletalk = 5,
-    /// AF_NETROM 表示AMPR NET/ROM的socket
-    Netrom = 6,
-    /// AF_BRIDGE 表示多协议桥接的socket
-    Bridge = 7,
-    /// AF_ATMPVC 表示ATM PVCs的socket
-    Atmpvc = 8,
-    /// AF_X25 表示X.25的socket
-    X25 = 9,
-    /// AF_INET6 表示IPv6的socket
-    INet6 = 10,
-    /// AF_ROSE 表示AMPR ROSE的socket
-    Rose = 11,
-    /// AF_DECnet Reserved for DECnet project
-    Decnet = 12,
-    /// AF_NETBEUI Reserved for 802.2LLC project
-    Netbeui = 13,
-    /// AF_SECURITY 表示Security callback的伪AF
-    Security = 14,
-    /// AF_KEY 表示Key management API
-    Key = 15,
-    /// AF_NETLINK 表示Netlink的socket
-    Netlink = 16,
-    /// AF_PACKET 表示Low level packet interface
-    Packet = 17,
-    /// AF_ASH 表示Ash
-    Ash = 18,
-    /// AF_ECONET 表示Acorn Econet
-    Econet = 19,
-    /// AF_ATMSVC 表示ATM SVCs
-    Atmsvc = 20,
-    /// AF_RDS 表示Reliable Datagram Sockets
-    Rds = 21,
-    /// AF_SNA 表示Linux SNA Project
-    Sna = 22,
-    /// AF_IRDA 表示IRDA sockets
-    Irda = 23,
-    /// AF_PPPOX 表示PPPoX sockets
-    Pppox = 24,
-    /// AF_WANPIPE 表示WANPIPE API sockets
-    WanPipe = 25,
-    /// AF_LLC 表示Linux LLC
-    Llc = 26,
-    /// AF_IB 表示Native InfiniBand address
-    /// 介绍：https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/9/html-single/configuring_infiniband_and_rdma_networks/index#understanding-infiniband-and-rdma_configuring-infiniband-and-rdma-networks
-    Ib = 27,
-    /// AF_MPLS 表示MPLS
-    Mpls = 28,
-    /// AF_CAN 表示Controller Area Network
-    Can = 29,
-    /// AF_TIPC 表示TIPC sockets
-    Tipc = 30,
-    /// AF_BLUETOOTH 表示Bluetooth sockets
-    Bluetooth = 31,
-    /// AF_IUCV 表示IUCV sockets
-    Iucv = 32,
-    /// AF_RXRPC 表示RxRPC sockets
-    Rxrpc = 33,
-    /// AF_ISDN 表示mISDN sockets
-    Isdn = 34,
-    /// AF_PHONET 表示Phonet sockets
-    Phonet = 35,
-    /// AF_IEEE802154 表示IEEE 802.15.4 sockets
-    Ieee802154 = 36,
-    /// AF_CAIF 表示CAIF sockets
-    Caif = 37,
-    /// AF_ALG 表示Algorithm sockets
-    Alg = 38,
-    /// AF_NFC 表示NFC sockets
-    Nfc = 39,
-    /// AF_VSOCK 表示vSockets
-    Vsock = 40,
-    /// AF_KCM 表示Kernel Connection Multiplexor
-    Kcm = 41,
-    /// AF_QIPCRTR 表示Qualcomm IPC Router
-    Qipcrtr = 42,
-    /// AF_SMC 表示SMC-R sockets.
-    /// reserve number for PF_SMC protocol family that reuses AF_INET address family
-    Smc = 43,
-    /// AF_XDP 表示XDP sockets
-    Xdp = 44,
-    /// AF_MCTP 表示Management Component Transport Protocol
-    Mctp = 45,
-    /// AF_MAX 表示最大的地址族
-    Max = 46,
-}
-
-impl TryFrom<u16> for AddressFamily {
-    type Error = SystemError;
-    fn try_from(x: u16) -> Result<Self, Self::Error> {
-        use num_traits::FromPrimitive;
-        return <Self as FromPrimitive>::from_u16(x).ok_or(SystemError::EINVAL);
-    }
-}
-
-/// @brief posix套接字类型的枚举(这些值与linux内核中的值一致)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
-pub enum PosixSocketType {
-    Stream = 1,
-    Datagram = 2,
-    Raw = 3,
-    Rdm = 4,
-    SeqPacket = 5,
-    Dccp = 6,
-    Packet = 10,
-}
-
-impl TryFrom<u8> for PosixSocketType {
-    type Error = SystemError;
-    fn try_from(x: u8) -> Result<Self, Self::Error> {
-        use num_traits::FromPrimitive;
-        return <Self as FromPrimitive>::from_u8(x).ok_or(SystemError::EINVAL);
-    }
-}
-
-/// ### 为socket提供无锁的poll方法
-///
-/// 因为在网卡中断中，需要轮询socket的状态，如果使用socket文件或者其inode来poll
-/// 在当前的设计，会必然死锁，所以引用这一个设计来解决，提供无🔓的poll
-pub struct SocketPollMethod;
-
-impl SocketPollMethod {
-    pub fn poll(socket: &socket::Socket, handle_item: &SocketHandleItem) -> EPollEventType {
-        let shutdown = handle_item.shutdown_type();
-        match socket {
-            socket::Socket::Udp(udp) => Self::udp_poll(udp, shutdown),
-            socket::Socket::Tcp(tcp) => Self::tcp_poll(tcp, shutdown, handle_item.is_posix_listen),
-            socket::Socket::Raw(raw) => Self::raw_poll(raw, shutdown),
-            _ => todo!(),
-        }
-    }
-
-    pub fn tcp_poll(
-        socket: &tcp::Socket,
-        shutdown: ShutdownType,
-        is_posix_listen: bool,
-    ) -> EPollEventType {
-        let mut events = EPollEventType::empty();
-        // debug!("enter tcp_poll! is_posix_listen:{}", is_posix_listen);
-        // 处理listen的socket
-        if is_posix_listen {
-            // 如果是listen的socket，那么只有EPOLLIN和EPOLLRDNORM
-            if socket.is_active() {
-                events.insert(EPollEventType::EPOLL_LISTEN_CAN_ACCEPT);
-            }
-
-            // debug!("tcp_poll listen socket! events:{:?}", events);
-            return events;
-        }
-
-        let state = socket.state();
-
-        if shutdown == ShutdownType::SHUTDOWN_MASK || state == tcp::State::Closed {
-            events.insert(EPollEventType::EPOLLHUP);
-        }
-
-        if shutdown.contains(ShutdownType::RCV_SHUTDOWN) {
-            events.insert(
-                EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM | EPollEventType::EPOLLRDHUP,
-            );
-        }
-
-        // Connected or passive Fast Open socket?
-        if state != tcp::State::SynSent && state != tcp::State::SynReceived {
-            // socket有可读数据
-            if socket.can_recv() {
-                events.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
-            }
-
-            if !(shutdown.contains(ShutdownType::SEND_SHUTDOWN)) {
-                // 缓冲区可写（这里判断可写的逻辑好像跟linux不太一样）
-                if socket.send_queue() < socket.send_capacity() {
-                    events.insert(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM);
-                } else {
-                    // TODO：触发缓冲区已满的信号SIGIO
-                    todo!("A signal SIGIO that the buffer is full needs to be sent");
-                }
-            } else {
-                // 如果我们的socket关闭了SEND_SHUTDOWN，epoll事件就是EPOLLOUT
-                events.insert(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM);
-            }
-        } else if state == tcp::State::SynSent {
-            events.insert(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM);
-        }
-
-        // socket发生错误
-        // TODO: 这里的逻辑可能有问题，需要进一步验证是否is_active()==false就代表socket发生错误
-        if !socket.is_active() {
-            events.insert(EPollEventType::EPOLLERR);
-        }
-
-        events
-    }
-
-    pub fn udp_poll(socket: &udp::Socket, shutdown: ShutdownType) -> EPollEventType {
-        let mut event = EPollEventType::empty();
-
-        if shutdown.contains(ShutdownType::RCV_SHUTDOWN) {
-            event.insert(
-                EPollEventType::EPOLLRDHUP | EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
-            );
-        }
-        if shutdown.contains(ShutdownType::SHUTDOWN_MASK) {
-            event.insert(EPollEventType::EPOLLHUP);
-        }
-
-        if socket.can_recv() {
-            event.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
-        }
-
-        if socket.can_send() {
-            event.insert(
-                EPollEventType::EPOLLOUT
-                    | EPollEventType::EPOLLWRNORM
-                    | EPollEventType::EPOLLWRBAND,
-            );
-        } else {
-            // TODO: 缓冲区空间不够，需要使用信号处理
-            todo!()
-        }
-
-        return event;
-    }
-
-    pub fn raw_poll(socket: &raw::Socket, shutdown: ShutdownType) -> EPollEventType {
-        //debug!("enter raw_poll!");
-        let mut event = EPollEventType::empty();
-
-        if shutdown.contains(ShutdownType::RCV_SHUTDOWN) {
-            event.insert(
-                EPollEventType::EPOLLRDHUP | EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
-            );
-        }
-        if shutdown.contains(ShutdownType::SHUTDOWN_MASK) {
-            event.insert(EPollEventType::EPOLLHUP);
-        }
-
-        if socket.can_recv() {
-            //debug!("poll can recv!");
-            event.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
-        } else {
-            //debug!("poll can not recv!");
-        }
-
-        if socket.can_send() {
-            //debug!("poll can send!");
-            event.insert(
-                EPollEventType::EPOLLOUT
-                    | EPollEventType::EPOLLWRNORM
-                    | EPollEventType::EPOLLWRBAND,
-            );
-        } else {
-            //debug!("poll can not send!");
-            // TODO: 缓冲区空间不够，需要使用信号处理
-            todo!()
-        }
-        return event;
     }
 }

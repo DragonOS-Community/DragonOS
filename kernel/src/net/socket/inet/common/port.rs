@@ -3,7 +3,7 @@ use system_error::SystemError;
 
 use crate::{arch::rand::rand, libs::spinlock::SpinLock, process::{Pid, ProcessManager}};
 
-use super::SocketType::{self, *};
+use super::Types::{self, *};
 
 /// # TCP 和 UDP 的端口管理器。
 /// 如果 TCP/UDP 的 socket 绑定了某个端口，它会在对应的表中记录，以检测端口冲突。
@@ -24,7 +24,7 @@ impl PortManager {
     }
 
     /// @brief 自动分配一个相对应协议中未被使用的PORT，如果动态端口均已被占用，返回错误码 EADDRINUSE
-    pub fn get_ephemeral_port(&self, socket_type: SocketType) -> Result<u16, SystemError> {
+    pub fn get_ephemeral_port(&self, socket_type: Types) -> Result<u16, SystemError> {
         // TODO: selects non-conflict high port
 
         static mut EPHEMERAL_PORT: u16 = 0;
@@ -62,7 +62,7 @@ impl PortManager {
     }
 
     #[inline]
-    pub fn bind_ephemeral_port(&self, socket_type: SocketType) -> Result<u16, SystemError> {
+    pub fn bind_ephemeral_port(&self, socket_type: Types) -> Result<u16, SystemError> {
         let port = self.get_ephemeral_port(socket_type)?;
         self.bind_port(socket_type, port)?;
         return Ok(port);
@@ -71,7 +71,7 @@ impl PortManager {
     /// @brief 检测给定端口是否已被占用，如果未被占用则在 TCP/UDP 对应的表中记录
     ///
     /// TODO: 增加支持端口复用的逻辑
-    pub fn bind_port(&self, socket_type: SocketType, port: u16) -> Result<(), SystemError> {
+    pub fn bind_port(&self, socket_type: Types, port: u16) -> Result<(), SystemError> {
         if port > 0 {
             match socket_type {
                 Udp => {
@@ -96,7 +96,7 @@ impl PortManager {
 
     /// @brief 在对应的端口记录表中将端口和 socket 解绑
     /// should call this function when socket is closed or aborted
-    pub fn unbind_port(&self, socket_type: SocketType, port: u16) {
+    pub fn unbind_port(&self, socket_type: Types, port: u16) {
         match socket_type {
             Udp => {self.udp_port_table.lock().remove(&port);},
             Tcp => {self.tcp_port_table.lock().remove(&port);},

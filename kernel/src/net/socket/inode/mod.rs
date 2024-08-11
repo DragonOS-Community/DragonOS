@@ -27,7 +27,7 @@ use crate::{
 };
 
 use super::{
-    handle::GlobalSocketHandle, inet::{RawSocket, TcpSocket, BoundUdp}, unix::{SeqpacketSocket, StreamSocket}, Socket, SocketOptions, InetSocketType, PORT_MANAGER
+    handle::GlobalSocketHandle, inet::{RawSocket, TcpSocket, BoundUdp}, unix::{SeqpacketSocket, StreamSocket}, Socket, Options, InetSocketType, PORT_MANAGER
 };
 
 use super::super::{
@@ -189,7 +189,7 @@ impl IndexNode for SocketInode {
                 .lock()
                 .metadata()
                 .options
-                .contains(SocketOptions::BLOCK) 
+                .contains(Options::BLOCK) 
             {
                 match read_result {
                     Ok((x, _)) => break Ok(x),

@@ -82,19 +82,19 @@ fn dhcp_query() -> Result<(), SystemError> {
 
                 if let Some(router) = config.router {
                     net_face
-                        .inner_iface()
+                        .smol_iface()
                         .lock()
                         .routes_mut()
                         .add_default_ipv4_route(router)
                         .unwrap();
-                    let cidr = net_face.inner_iface().lock().ip_addrs().first().cloned();
+                    let cidr = net_face.smol_iface().lock().ip_addrs().first().cloned();
                     if let Some(cidr) = cidr {
                         info!("Successfully allocated ip by Dhcpv4! Ip:{}", cidr);
                         return Ok(());
                     }
                 } else {
                     net_face
-                        .inner_iface()
+                        .smol_iface()
                         .lock()
                         .routes_mut()
                         .remove_default_ipv4_route();
@@ -110,7 +110,7 @@ fn dhcp_query() -> Result<(), SystemError> {
                     ))])
                     .ok();
                 net_face
-                    .inner_iface()
+                    .smol_iface()
                     .lock()
                     .routes_mut()
                     .remove_default_ipv4_route();

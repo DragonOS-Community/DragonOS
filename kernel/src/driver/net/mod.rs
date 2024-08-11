@@ -3,7 +3,7 @@ use alloc::{sync::{Weak, Arc}, string::String, fmt, vec::Vec};
 use smoltcp;
 use system_error::SystemError;
 use crate::libs::spinlock::SpinLock;
-use crate::net::socket::inet::common::{BoundInetInner, PortManager};
+use crate::net::socket::inet::common::{BoundInner, PortManager};
 
 mod dma;
 pub mod e1000e;
@@ -52,7 +52,7 @@ pub trait Iface: crate::driver::base::device::Device {
 
     /// @brief 获取smoltcp的网卡接口类型
     #[inline(always)]
-    fn inner_iface(&self) -> &SpinLock<smoltcp::iface::Interface> {
+    fn smol_iface(&self) -> &SpinLock<smoltcp::iface::Interface> {
         &self.common().smol_iface
     }
     // fn as_any_ref(&'static self) -> &'static dyn core::any::Any;

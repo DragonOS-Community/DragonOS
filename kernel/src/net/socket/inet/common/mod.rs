@@ -6,7 +6,7 @@ pub mod port;
 pub use port::PortManager;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SocketType {
+pub enum Types {
     Raw,
     Icmp,
     Udp,
@@ -16,57 +16,58 @@ pub enum SocketType {
 }
 
 #[derive(Debug)]
-pub struct BoundInetInner {
+pub struct BoundInner {
     handle: smoltcp::iface::SocketHandle,
     iface: Arc<dyn Iface>,
-    endpoint: smoltcp::wire::IpEndpoint,
-    pub remote: Option<smoltcp::wire::IpEndpoint>,
+    // address: smoltcp::wire::IpAddress,
 }
 
-impl BoundInetInner {
+impl BoundInner {
     pub fn bind<T>(
         socket: T, 
-        socket_type: SocketType, 
-        endpoint: smoltcp::wire::IpEndpoint
+        // socket_type: Types, 
+        address: &smoltcp::wire::IpAddress
     ) -> Result<Self, SystemError>
     where 
         T: smoltcp::socket::AnySocket<'static>
     {
-        let iface = get_iface_to_bind(&endpoint.addr).ok_or(ENODEV)?;
-        iface.port_manager().bind_port(socket_type, endpoint.port)?;
+        let iface = get_iface_to_bind(address).ok_or(ENODEV)?;
         let handle = iface.sockets().lock_no_preempt().add(socket);
-        Ok( Self { handle, iface, endpoint, remote: None } )
+        Ok( Self { handle, iface } )
     }
 
-    pub fn ephemeral_bind<T>(
+    pub fn bind_ephemeral<T>(
         socket: T, 
-        socket_type: SocketType, 
-        remote_endpoint: smoltcp::wire::IpEndpoint
-    ) -> Result<Self, SystemError>
+        // socket_type: Types, 
+        remote: smoltcp::wire::IpAddress
+    ) -> Result<(Self, smoltcp::wire::IpAddress), SystemError>
     where 
         T: smoltcp::socket::AnySocket<'static>
     {
-        let (iface, local_addr) = get_ephemeral_iface(&remote_endpoint.addr);
-        let bound_port = iface.port_manager().bind_ephemeral_port(socket_type)?;
+        let (iface, address) = get_ephemeral_iface(&remote);
+        // let bound_port = iface.port_manager().bind_ephemeral_port(socket_type)?;
         let handle = iface.sockets().lock_no_preempt().add(socket);
-        let endpoint = smoltcp::wire::IpEndpoint::new(local_addr, bound_port);
-        Ok( Self { handle, iface, endpoint, remote: None } )
+        // let endpoint = smoltcp::wire::IpEndpoint::new(local_addr, bound_port);
+        Ok( (Self { handle, iface }, address) )
+    }
+
+    pub fn port_manager(&self) -> &PortManager {
+        self.iface.port_manager()
     }
 
     pub fn with_mut<T: smoltcp::socket::AnySocket<'static>, R, F: FnMut(&mut T) -> R>(&self, mut f: F) -> R {
         f(self.iface.sockets().lock().get_mut::<T>(self.handle))
     }
 
-    pub fn endpoint(&self) -> smoltcp::wire::IpEndpoint {
-        self.endpoint
+    pub fn with<T: smoltcp::socket::AnySocket<'static>, R, F: Fn(&T) -> R>(&self, f: F) -> R {
+        f(self.iface.sockets().lock().get::<T>(self.handle))
     }
 
     pub fn iface(&self) -> &Arc<dyn Iface> {
         &self.iface
     }
 
-    pub fn release(&self, socket_type: SocketType, port: u16) {
-        self.iface.port_manager().unbind_port(socket_type, port);
+    pub fn release(&self) {
         self.iface.sockets().lock_no_preempt().remove(self.handle);
     }
 }
@@ -77,7 +78,7 @@ pub fn get_iface_to_bind(ip_addr: &smoltcp::wire::IpAddress) -> Option<Arc<dyn I
         .read_irqsave()
         .iter()
         .find(|(_, iface)| { 
-            iface.inner_iface().lock().has_ip_addr(*ip_addr)
+            iface.smol_iface().lock().has_ip_addr(*ip_addr)
         })
         .map(|(_, iface)| iface.clone())
 }
@@ -93,7 +94,7 @@ fn get_ephemeral_iface(remote_ip_addr: &smoltcp::wire::IpAddress) -> (Arc<dyn If
             ifaces
                 .iter()
                 .find_map(|(_, iface)| {
-                    iface.inner_iface().lock().ip_addrs().iter().find(|cidr| {
+                    iface.smol_iface().lock().ip_addrs().iter().find(|cidr| {
                         cidr.contains_addr(remote_ip_addr)
                     })
                     .map(|cidr| (iface.clone(), cidr.address()))
@@ -101,7 +102,7 @@ fn get_ephemeral_iface(remote_ip_addr: &smoltcp::wire::IpAddress) -> (Arc<dyn If
         })
         .or({
             NET_DEVICES.read_irqsave().values().next()
-                .map(|iface| (iface.clone(), iface.inner_iface().lock().ip_addrs()[0].address()))
+                .map(|iface| (iface.clone(), iface.smol_iface().lock().ip_addrs()[0].address()))
         })
         .expect("No network interface")
 }

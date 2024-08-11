@@ -1,10 +1,14 @@
 use system_error::SystemError::{self, *};
 
 pub mod raw;
+pub mod icmp;
 pub mod datagram;
 pub mod stream;
 pub mod common;
+pub mod syscall;
 
+pub use common::Types;
+pub use common::BoundInner;
 pub use raw::RawSocket;
 pub use datagram::UdpInner;
 pub use stream::TcpSocket;
@@ -19,10 +23,10 @@ pub enum InetSocket {
 pub trait AnyInetSocket {
     fn bind(&self, endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError>;
     
-    fn common(&self) -> &common::BoundInetInner;
+    fn common(&self) -> &common::BoundInner;
     
     fn endpoint(&self) -> smoltcp::wire::IpEndpoint {
-        self.common().endpoint()
+        self.common().address()
     }
 
     fn remote(&self) -> Option<smoltcp::wire::IpEndpoint> {
@@ -30,10 +34,14 @@ pub trait AnyInetSocket {
     }
 
     fn connect(&self, endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError>;
+
+    fn listen(&self, backlog: usize) -> Result<(), SystemError>;
+
+    fn accept(&self) -> Result<(InetSocket, smoltcp::wire::IpEndpoint), SystemError>;
     
-    fn send(&self, data: &[u8]) -> Result<usize, SystemError>;
+    fn sendmsg(&self, data: &[u8]) -> Result<usize, SystemError>;
     
-    fn recv(&self, data: &mut [u8]) -> Result<usize, SystemError>;
+    fn recvmsg(&self, data: &mut [u8]) -> Result<usize, SystemError>;
     
     fn close(&mut self);
 }

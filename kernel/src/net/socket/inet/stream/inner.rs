@@ -164,13 +164,13 @@ impl Established {
         })
     }
 
-    pub fn recv_slice(self, buf: &mut [u8]) -> Result<usize, SystemError> {
+    pub fn recv_slice(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         self.inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
             socket.recv_slice(buf).map_err(|_| ECONNABORTED)
         })
     }
 
-    pub fn send_slice(self, buf: &[u8]) -> Result<usize, SystemError> {
+    pub fn send_slice(&self, buf: &[u8]) -> Result<usize, SystemError> {
         self.inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
             socket.send_slice(buf).map_err(|_| ECONNABORTED)
         })

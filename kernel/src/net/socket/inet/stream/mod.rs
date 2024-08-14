@@ -8,6 +8,7 @@ use smoltcp;
 pub mod inner;
 use inner::*;
 
+#[derive(Debug)]
 pub struct TcpSocket {
     inner: RwLock<Option<Inner>>,
     shutdown: Shutdown,
@@ -24,22 +25,24 @@ impl TcpSocket {
     }
 
     #[inline]
-    fn write_state<F, R>(&self, mut f: F) -> R
+    fn write_state<F>(&self, mut f: F) -> Result<(), SystemError>
     where 
-        F: FnMut(RwLockWriteGuard<Option<Inner>>, Inner) -> R
+        F: FnMut(Inner) -> Result<Inner, SystemError>
     {
         let mut inner_guard = self.inner.write();
         let inner = inner_guard.take().expect("Tcp Inner is None");
-        f(inner_guard, inner)
+        let update = f(inner)?;
+        inner_guard.replace(update);
+        Ok(())
     }
 
     pub fn bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
-        self.write_state(|mut inner_guard, inner| {
+        self.write_state(|inner| {
             match inner {
                 Inner::Unbound(unbound) => {
-                    let connecting = unbound.bind(local_endpoint)?;
-                    inner_guard.replace(Inner::Connecting(connecting));
-                    Ok(())
+                    unbound.bind(local_endpoint).map(|inner| 
+                        Inner::Connecting(inner)
+                    )
                 }
                 _ => Err(EINVAL),
             }
@@ -47,15 +50,41 @@ impl TcpSocket {
     }
 
     pub fn listen(&self, backlog: usize) -> Result<(), SystemError> {
-        self.write_state(|mut inner_guard, inner| {
+        self.write_state(|inner| {
             match inner {
                 Inner::Connecting(connecting) => {
-                    let listening = connecting.listen(backlog)?;
-                    inner_guard.replace(Inner::Listening(listening));
-                    Ok(())
+                    connecting.listen(backlog).map(|inners| 
+                        Inner::Listening(inners)
+                    )
                 }
                 _ => Err(EINVAL),
             }
         })
     }
+
+    pub fn accept(&self) -> Result<(TcpStream, smoltcp::wire::IpEndpoint), SystemError> {
+        match self.inner.write().as_mut().expect("Tcp Inner is None") {
+            Inner::Listening(listening) => {
+                listening.accept().map(|(stream, remote)| 
+                    (TcpStream { inner: stream }, remote)
+                )
+            }
+            _ => Err(EINVAL),
+        }
+    }
 }
+
+struct TcpStream {
+    inner: Established,
+}
+
+// impl TcpStream {
+//     pub fn read(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+//         self.inner.recv_slice(buf)
+//     }
+
+//     pub fn write(&self, buf: &[u8]) -> Result<usize, SystemError> {
+//         self.inner.send_slice(buf)
+//     }
+// }
+

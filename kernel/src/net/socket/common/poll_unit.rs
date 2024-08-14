@@ -51,6 +51,18 @@ impl PollUnit {
         Err(SystemError::ENOENT)
     }
 
+    pub fn clear_epoll(&self) -> Result<(), SystemError> {
+        for epitem in self.epitems.lock_irqsave().iter() {
+            let epoll = epitem.epoll();
+
+            if let Some(epoll) = epoll.upgrade() {
+                EventPoll::ep_remove(&mut epoll.lock_irqsave(), epitem.fd(), None)?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// # `wakeup_any`
     /// 唤醒该队列上等待events的进程
     /// ## 参数

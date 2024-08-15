@@ -7,6 +7,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use common::PollUnit;
 use hashbrown::HashMap;
 use log::warn;
 use smoltcp::{
@@ -32,9 +33,9 @@ use crate::{
 
 use self::{
     handle::GlobalSocketHandle,
-    inet::{RawSocket, TcpSocket, BoundUdp},
+    inet::{RawSocket},
     unix::{SeqpacketSocket, StreamSocket},
-    common::shutdown::ShutdownType,
+    common::shutdown::Shutdown,
 };
 
 use super::{
@@ -56,41 +57,46 @@ pub use define::{AddressFamily, Options as SocketOptions, OptionsLevel as Socket
 // See: linux-5.19.10/include/uapi/asm-generic/socket.h#9
 pub const SOL_SOCKET: u8 = 1;
 
-/// 根据地址族、socket类型和协议创建socket
-pub(super) fn new_unbound_socket(
-    address_family: AddressFamily,
-    socket_type: PosixSocketType,
-    protocol: Protocol,
-) -> Result<Box<dyn Socket>, SystemError> {
-    let socket: Box<dyn Socket> = match address_family {
-        AddressFamily::Unix => match socket_type {
-            PosixSocketType::Stream => Box::new(StreamSocket::new(Options::default())),
-            PosixSocketType::SeqPacket => Box::new(SeqpacketSocket::new(Options::default())),
-            _ => {
-                return Err(SystemError::EINVAL);
-            }
-        },
-        AddressFamily::INet => match socket_type {
-            PosixSocketType::Stream => Box::new(TcpSocket::new(Options::default())),
-            PosixSocketType::Datagram => Box::new(BoundUdp::new(Options::default())),
-            PosixSocketType::Raw => Box::new(RawSocket::new(protocol, Options::default())),
-            _ => {
-                return Err(SystemError::EINVAL);
-            }
-        },
-        _ => {
-            return Err(SystemError::EAFNOSUPPORT);
-        }
-    };
+// /// 根据地址族、socket类型和协议创建socket
+// pub(super) fn new_unbound_socket(
+//     address_family: AddressFamily,
+//     socket_type: PosixSocketType,
+//     protocol: Protocol,
+// ) -> Result<Box<dyn Socket>, SystemError> {
+//     let socket: Box<dyn Socket> = match address_family {
+//         AddressFamily::Unix => match socket_type {
+//             PosixSocketType::Stream => Box::new(StreamSocket::new(Options::default())),
+//             PosixSocketType::SeqPacket => Box::new(SeqpacketSocket::new(Options::default())),
+//             _ => {
+//                 return Err(SystemError::EINVAL);
+//             }
+//         },
+//         AddressFamily::INet => match socket_type {
+//             PosixSocketType::Stream => Box::new(TcpSocket::new(Options::default())),
+//             PosixSocketType::Datagram => Box::new(BoundUdp::new(Options::default())),
+//             PosixSocketType::Raw => Box::new(RawSocket::new(protocol, Options::default())),
+//             _ => {
+//                 return Err(SystemError::EINVAL);
+//             }
+//         },
+//         _ => {
+//             return Err(SystemError::EAFNOSUPPORT);
+//         }
+//     };
 
-    Ok(socket)
-}
+//     Ok(socket)
+// }
 
 pub trait Socket: IndexNode {
+    /// # `poll_unit`
+    /// 获取socket的poll单元
+    fn poll_unit(&self) -> &PollUnit;
 
     /// # `connect` 
     /// 对应于POSIX的connect函数，用于连接到指定的远程服务器端点
-    fn connect(&self, _endpoint: Endpoint) -> Result<(), SystemError>;
+    fn connect(&self, _endpoint: Endpoint) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 
     /// # `bind` 
     /// 对应于POSIX的bind函数，用于绑定到本机指定的端点
@@ -100,7 +106,7 @@ pub trait Socket: IndexNode {
 
     /// # `shutdown`
     /// 对应于 POSIX 的 shutdown 函数，用于网络连接的可选关闭。
-    fn shutdown(&self, _type: ShutdownType) -> Result<(), SystemError> {
+    fn shutdown(&self, _type: Shutdown) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
 

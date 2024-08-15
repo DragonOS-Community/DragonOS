@@ -20,31 +20,31 @@ pub enum InetSocket {
     Tcp(TcpSocket),
 }
 
-pub trait AnyInetSocket {
-    fn bind(&self, endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError>;
+// pub trait AnyInetSocket {
+//     fn bind(&self, endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError>;
     
-    fn common(&self) -> &common::BoundInner;
+//     fn common(&self) -> &common::BoundInner;
     
-    fn endpoint(&self) -> smoltcp::wire::IpEndpoint {
-        self.common().address()
-    }
+//     fn endpoint(&self) -> smoltcp::wire::IpEndpoint {
+//         self.common().address()
+//     }
 
-    fn remote(&self) -> Option<smoltcp::wire::IpEndpoint> {
-        self.common().remote
-    }
+//     fn remote(&self) -> Option<smoltcp::wire::IpEndpoint> {
+//         self.common().remote
+//     }
 
-    fn connect(&self, endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError>;
+//     fn connect(&self, endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError>;
 
-    fn listen(&self, backlog: usize) -> Result<(), SystemError>;
+//     fn listen(&self, backlog: usize) -> Result<(), SystemError>;
 
-    fn accept(&self) -> Result<(InetSocket, smoltcp::wire::IpEndpoint), SystemError>;
+//     fn accept(&self) -> Result<(InetSocket, smoltcp::wire::IpEndpoint), SystemError>;
     
-    fn sendmsg(&self, data: &[u8]) -> Result<usize, SystemError>;
+//     fn sendmsg(&self, data: &[u8]) -> Result<usize, SystemError>;
     
-    fn recvmsg(&self, data: &mut [u8]) -> Result<usize, SystemError>;
+//     fn recvmsg(&self, data: &mut [u8]) -> Result<usize, SystemError>;
     
-    fn close(&mut self);
-}
+//     fn close(&mut self);
+// }
 
 // pub trait Socket: FileLike + Send + Sync {
 //     /// Assign the address specified by socket_addr to the socket

@@ -4,7 +4,7 @@ use core::{
 };
 
 use alloc::{collections::BTreeMap, sync::Arc};
-use socket::SocketInode;
+use socket::Socket;
 
 use crate::{driver::net::Iface, libs::rwlock::RwLock};
 use smoltcp::wire::IpEndpoint;
@@ -31,9 +31,9 @@ pub enum Endpoint {
     /// 链路层端点
     LinkLayer(LinkLayerEndpoint),
     /// 网络层端点
-    Ip(Option<IpEndpoint>),
+    Ip(IpEndpoint),
     /// inode端点
-    Inode(Option<Arc<SocketInode>>),
+    Inode(Arc<dyn Socket>),
     // todo: 增加NetLink机制后，增加NetLink端点
 }
 

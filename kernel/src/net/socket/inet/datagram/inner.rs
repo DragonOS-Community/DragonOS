@@ -93,7 +93,7 @@ impl BoundUdp {
                     return Ok((size, metadata.endpoint));
                 }
             }
-            return Err(ENOTCONN);
+            return Err(EAGAIN_OR_EWOULDBLOCK);
         })
     }
 

@@ -145,6 +145,10 @@ impl Established {
         self.inner.with_mut(f)
     }
 
+    pub fn with<R, F: Fn(&smoltcp::socket::tcp::Socket<'static>) -> R>(&self, f: F) -> R {
+        self.inner.with(f)
+    }
+
     pub fn close(self) {
         self.inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
             socket.close();
@@ -164,9 +168,9 @@ impl Established {
         })
     }
 
-    pub fn recv_slice(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+    pub fn recv_slice(&self, buf: &mut [u8]) -> Result<usize, smoltcp::socket::tcp::RecvError> {
         self.inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-            socket.recv_slice(buf).map_err(|_| ECONNABORTED)
+            socket.recv_slice(buf)
         })
     }
 

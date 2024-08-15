@@ -2,8 +2,12 @@ use system_error::SystemError::{self, *};
 use smoltcp;
 
 use core::sync::atomic::AtomicBool;
+use crate::filesystem::vfs::IndexNode;
 use crate::net::event_poll::EPollEventType;
 use crate::libs::rwlock::RwLock;
+use crate::net::net_core::poll_ifaces;
+use crate::net::socket::common::PollUnit;
+use crate::net::socket::Socket;
 
 pub type SmolUdpSocket = smoltcp::socket::udp::Socket<'static>;
 
@@ -11,11 +15,20 @@ pub mod inner;
 
 use inner::*;
 
+type EP = EPollEventType;
+
 // Udp Socket 负责提供状态切换接口、执行状态切换
 #[derive(Debug)]
 pub struct UdpSocket {
     inner: RwLock<Option<UdpInner>>,
     nonblock: AtomicBool,
+    poll_unit: PollUnit,
+}
+
+impl Default for UdpSocket {
+    fn default() -> Self {
+        Self::new(false)
+    }
 }
 
 impl UdpSocket {
@@ -23,10 +36,15 @@ impl UdpSocket {
         return Self {
             inner: RwLock::new(Some(UdpInner::Unbound(UnboundUdp::new()))),
             nonblock: AtomicBool::new(nonblock),
+            poll_unit: Default::default(),
         };
     }
 
-    pub fn bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
+    pub fn is_nonblock(&self) -> bool {
+        self.nonblock.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn do_bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
         let mut inner = self.inner.write();
         if let Some(UdpInner::Unbound(unbound)) = inner.take() {
             let bound = unbound.bind(local_endpoint)?;
@@ -58,47 +76,66 @@ impl UdpSocket {
         let mut inner = self.inner.write();
         if let Some(UdpInner::Bound(bound)) = &mut *inner {
             bound.close();
-            *inner = None;
+            inner.take();
         }
     }
 
     pub fn try_recv(&self, buf: &mut [u8]) 
         -> Result<(usize, smoltcp::wire::IpEndpoint), SystemError> 
     {
-        let inner = self.inner.read();
-        if let Some(UdpInner::Bound(bound)) = &*inner {
-            let (size, endpoint) = bound.try_recv(buf)?;
-            return Ok((size, endpoint));
-        }
-        return Err(ENOTCONN);
+        let received 
+            = match self.inner.read().as_ref().expect("Udp Inner is None") {
+            UdpInner::Bound(bound) => {
+                bound.try_recv(buf)
+            }
+            _ => Err(ENOTCONN)
+        };
+
+        poll_ifaces();
+
+        return received;
     }
 
     pub fn try_send(&self, buf: &[u8], to: Option<smoltcp::wire::IpEndpoint>) 
         -> Result<usize, SystemError> 
     {
-        let size;
         {
             let mut inner_guard = self.inner.write();
-            let inner = match inner_guard.take().ok_or(EINVAL)? {
+            let inner = match inner_guard.take().expect("Udp Inner is None") {
                 UdpInner::Bound(bound) => bound,
                 UdpInner::Unbound(unbound) => {
                     unbound.bind_ephemeral(to.ok_or(EADDRNOTAVAIL)?.addr)?
                 }
             };
-            size = inner.try_send(buf, to)?;
+            // size = inner.try_send(buf, to)?;
             inner_guard.replace(UdpInner::Bound(inner));
         };
-        return Ok(size);
+        // Optimize: 拿两次锁的平均效率是否比一次长时间的读锁效率要高？
+        let result
+            = match self.inner.read().as_ref().expect("Udp Inner is None") {
+            UdpInner::Bound(bound) => bound.try_send(buf, to),
+            _ => Err(ENOTCONN),
+        };
+        poll_ifaces();
+        return result;
     }
 
-    pub fn poll(&self) -> EPollEventType {
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+        if self.is_nonblock() {
+            return self.try_recv(buf).map(|(size, _)| size);
+        } else {
+            return self.poll_unit().busy_wait(EP::EPOLLIN, 
+                || self.try_recv(buf).map(|(size, _)| size)
+            );
+        }
+    }
+
+    pub fn on_events(&self) -> EPollEventType {
         let mut event = EPollEventType::empty();
         match self.inner.read().as_ref().unwrap() {
             UdpInner::Unbound(_) => {
                 event.insert(
-                    EPollEventType::EPOLLOUT |
-                    EPollEventType::EPOLLWRNORM |
-                    EPollEventType::EPOLLWRBAND
+                    EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND
                 );
             }
             UdpInner::Bound(bound) => {
@@ -110,16 +147,13 @@ impl UdpSocket {
 
                 if can_recv {
                     event.insert(
-                        EPollEventType::EPOLLIN |
-                        EPollEventType::EPOLLRDNORM
+                        EP::EPOLLIN | EP::EPOLLRDNORM
                     );
                 }
 
                 if can_send {
                     event.insert(
-                        EPollEventType::EPOLLOUT |
-                        EPollEventType::EPOLLWRNORM |
-                        EPollEventType::EPOLLWRBAND
+                        EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND
                     );
                 } else {
                     todo!("缓冲区空间不够，需要使用信号处理");
@@ -128,6 +162,62 @@ impl UdpSocket {
         }
         return event;
     }
+}
+
+impl IndexNode for UdpSocket {
+    fn read_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        buf: &mut [u8],
+        data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        drop(data);
+        self.read(buf)
+    }
+
+    fn write_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        buf: &[u8],
+        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        self.try_send(buf, None)
+    }
+
+    fn fs(&self) -> alloc::sync::Arc<dyn crate::filesystem::vfs::FileSystem> {
+        todo!()
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
+        todo!()
+    }
+
+    fn poll(&self, _private_data: &crate::filesystem::vfs::FilePrivateData) -> Result<usize, SystemError> {
+        Ok(self.on_events().bits() as usize)
+    }
+}
+
+impl Socket for UdpSocket {
+    fn poll_unit(&self) -> &PollUnit {
+        &self.poll_unit
+    }
+
+    fn bind(&self, local_endpoint: crate::net::Endpoint) -> Result<(), SystemError> {
+        match local_endpoint {
+            crate::net::Endpoint::Ip(local_endpoint) => {
+                self.do_bind(local_endpoint)
+            }
+            _ => Err(EAFNOSUPPORT),
+        }
+    }
+
+
 }
 
 bitflags! {

@@ -19,14 +19,14 @@ bitflags! {
     pub struct EventFdFlags: u32{
         /// Provide semaphore-like semantics for reads from the new
         /// file descriptor.
-        const EFD_SEMAPHORE = 1;
+        const EFD_SEMAPHORE = 0o1;
         /// Set the close-on-exec (FD_CLOEXEC) flag on the new file
         /// descriptor
-        const EFD_CLOEXEC = 2;
+        const EFD_CLOEXEC = 0o2000000;
         /// Set the O_NONBLOCK file status flag on the open file
         /// description (see open(2)) referred to by the new file
         /// descriptor
-        const EFD_NONBLOCK = 4;
+        const EFD_NONBLOCK = 0o0004000;
     }
 }
 

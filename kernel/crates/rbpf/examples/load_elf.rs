@@ -48,7 +48,7 @@ use rbpf::helpers;
 // Once the bytecode has been edited, we can load the bytecode directly from the ELF object file.
 
 fn main() {
-    let filename = "examples/load_elf__block_a_port.o";
+    let filename = "examples/load_elf__block_a_port.elf";
 
     let path = PathBuf::from(filename);
     let file = match elf::File::open_path(path) {

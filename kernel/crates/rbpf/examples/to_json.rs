@@ -55,7 +55,7 @@ fn to_json(prog: &[u8]) -> String {
 // Load a program from an object file, and prints it to standard output as a JSON string.
 fn main() {
     // Let's reuse this file from `load_elf` example.
-    let filename = "examples/load_elf__block_a_port.o";
+    let filename = "examples/load_elf__block_a_port.elf";
 
     let path = PathBuf::from(filename);
     let file = match elf::File::open_path(path) {

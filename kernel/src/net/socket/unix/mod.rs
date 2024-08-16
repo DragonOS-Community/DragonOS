@@ -4,8 +4,8 @@ use system_error::SystemError;
 use crate::{libs::spinlock::SpinLock, net::Endpoint};
 
 use super::{
-    handle::GlobalSocketHandle, PosixSocketHandleItem, Socket, SocketInode, SocketMetadata,
-    SocketOptions, SocketType,
+    handle::GlobalSocketHandle, PosixSocketHandleItem, Socket, inode::SocketInode, SocketMetadata,
+    Options, InetSocketType,
 };
 
 #[derive(Debug, Clone)]
@@ -27,11 +27,11 @@ impl StreamSocket {
     ///
     /// ## 参数
     /// - `options`: socket选项
-    pub fn new(options: SocketOptions) -> Self {
+    pub fn new(options: Options) -> Self {
         let buffer = Arc::new(SpinLock::new(Vec::with_capacity(Self::DEFAULT_BUF_SIZE)));
 
         let metadata = SocketMetadata::new(
-            SocketType::Unix,
+            InetSocketType::Unix,
             Self::DEFAULT_BUF_SIZE,
             Self::DEFAULT_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
@@ -51,9 +51,7 @@ impl StreamSocket {
 }
 
 impl Socket for StreamSocket {
-    fn posix_item(&self) -> Arc<PosixSocketHandleItem> {
-        self.posix_item.clone()
-    }
+
     fn socket_handle(&self) -> GlobalSocketHandle {
         self.handle
     }
@@ -142,11 +140,11 @@ impl SeqpacketSocket {
     ///
     /// ## 参数
     /// - `options`: socket选项
-    pub fn new(options: SocketOptions) -> Self {
+    pub fn new(options: Options) -> Self {
         let buffer = Arc::new(SpinLock::new(Vec::with_capacity(Self::DEFAULT_BUF_SIZE)));
 
         let metadata = SocketMetadata::new(
-            SocketType::Unix,
+            InetSocketType::Unix,
             Self::DEFAULT_BUF_SIZE,
             Self::DEFAULT_BUF_SIZE,
             Self::DEFAULT_METADATA_BUF_SIZE,
@@ -166,9 +164,7 @@ impl SeqpacketSocket {
 }
 
 impl Socket for SeqpacketSocket {
-    fn posix_item(&self) -> Arc<PosixSocketHandleItem> {
-        self.posix_item.clone()
-    }
+
     fn close(&mut self) {}
 
     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {

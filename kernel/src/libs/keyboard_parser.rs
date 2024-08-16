@@ -313,7 +313,8 @@ impl TypeOneFSMState {
         }
 
         // shift被按下
-        if scancode_status.shift_l || scancode_status.shift_r {
+        let shift = scancode_status.shift_l || scancode_status.shift_r;
+        if shift {
             col = true;
         }
 
@@ -327,9 +328,8 @@ impl TypeOneFSMState {
 
         let mut ch = TYPE1_KEY_CODE_MAPTABLE[col as usize + 2 * index as usize];
         if key != KeyFlag::NoneFlag {
-            // debug!("EMIT: ch is '{}', keyflag is {:?}\n", ch as char, key);
             if scancode_status.ctrl_l || scancode_status.ctrl_r {
-                ch = Self::to_ctrl(ch);
+                ch = Self::to_ctrl(ch, shift);
             }
             Self::emit(ch);
         }
@@ -337,10 +337,16 @@ impl TypeOneFSMState {
     }
 
     #[inline]
-    fn to_ctrl(ch: u8) -> u8 {
+    fn to_ctrl(ch: u8, shift: bool) -> u8 {
         return match ch as char {
-            'a'..='z' => ch - 0x40,
-            'A'..='Z' => ch - 0x40,
+            'a'..='z' => ch - 0x60,
+            'A'..='Z' => {
+                if shift {
+                    ch
+                } else {
+                    ch - 0x40
+                }
+            }
             '@'..='_' => ch - 0x40,
             _ => ch,
         };

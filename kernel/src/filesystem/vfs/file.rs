@@ -18,10 +18,12 @@ use crate::{
     libs::{rwlock::RwLock, spinlock::SpinLock},
     net::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
-        socket::SocketInode,
+        socket::Socket,
     },
     process::{cred::Cred, ProcessManager},
 };
+
+use crate::libs::casting::DowncastArc;
 
 use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 
@@ -486,10 +488,11 @@ impl File {
     pub fn add_epoll(&self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
         match self.file_type {
             FileType::Socket => {
-                let inode = self.inode.downcast_ref::<SocketInode>().unwrap();
-                let mut socket = inode.inner();
+                let inode = self.inode.downcast_ref::<dyn Socket>().unwrap();
+                // let mut socket = inode.inner();
 
-                return socket.add_epoll(epitem);
+                inode.epoll_items().add(epitem);
+                return Ok(());
             }
             FileType::Pipe => {
                 let inode = self.inode.downcast_ref::<LockedPipeInode>().unwrap();
@@ -510,10 +513,9 @@ impl File {
     pub fn remove_epoll(&self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
         match self.file_type {
             FileType::Socket => {
-                let inode = self.inode.downcast_ref::<SocketInode>().unwrap();
-                let mut socket = inode.inner();
+                let inode = self.inode.downcast_arc::<dyn Socket>().unwrap();
 
-                return socket.remove_epoll(epoll);
+                return inode.epoll_items().remove(epoll);
             }
             _ => return Err(SystemError::ENOSYS),
         }

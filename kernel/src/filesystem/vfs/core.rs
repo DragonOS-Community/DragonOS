@@ -239,7 +239,7 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::EPERM);
     }
 
-    let (filename, parent_path) = rsplit_path(path);
+    let (filename, parent_path) = rsplit_path(&remain_path);
     // 查找父目录
     let parent_inode: Arc<dyn IndexNode> = inode_begin
         .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;

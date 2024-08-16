@@ -1,6 +1,7 @@
 use core::{cmp::min, ffi::CStr};
 
 use alloc::{boxed::Box, sync::Arc};
+use log::debug;
 use num_traits::{FromPrimitive, ToPrimitive};
 use smoltcp::wire;
 use system_error::SystemError;
@@ -14,12 +15,14 @@ use crate::{
     libs::spinlock::SpinLockGuard,
     mm::{verify_area, VirtAddr},
     net::socket::{netlink::af_netlink::NetlinkSock, AddressFamily, SOL_SOCKET},
+    net::{socket::{AddressFamily, SOL_SOCKET}, SocketOptionsLevel},
     process::ProcessManager,
     syscall::Syscall,
 };
 
 use super::{
     socket::{netlink::endpoint::NetlinkEndpoint, new_socket, PosixSocketType, Socket, SocketInode},
+    socket::{new_unbound_socket, PosixSocketType, Socket, SocketInode},
     Endpoint, Protocol, ShutdownType,
 };
 
@@ -44,9 +47,9 @@ impl Syscall {
         let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
         let protocol = Protocol::from(protocol as u8);
 
-        let socket = new_socket(address_family, socket_type, protocol)?;
+        let socket = new_unbound_socket(address_family, socket_type, protocol)?;
 
-        let socketinode: Arc<SocketInode> = SocketInode::new(socket);
+        let socketinode: Arc<SocketInode> = SocketInode::new(socket, None);
         let f = File::new(socketinode, FileMode::O_RDWR)?;
         // 把socket添加到当前进程的文件描述符表中
         let binding = ProcessManager::current_pcb().fd_table();
@@ -77,8 +80,8 @@ impl Syscall {
         let mut fd_table_guard = binding.write();
 
         // 创建一对socket
-        let inode0 = SocketInode::new(new_socket(address_family, socket_type, protocol)?);
-        let inode1 = SocketInode::new(new_socket(address_family, socket_type, protocol)?);
+        let inode0 = SocketInode::new(new_unbound_socket(address_family, socket_type, protocol)?, None);
+        let inode1 = SocketInode::new(new_unbound_socket(address_family, socket_type, protocol)?, None);
 
         // 进行pair
         unsafe {
@@ -110,12 +113,14 @@ impl Syscall {
         optname: usize,
         optval: &[u8],
     ) -> Result<usize, SystemError> {
+        let sol = SocketOptionsLevel::from_bits_truncate(level as u32);
         let socket_inode: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         // 获取内层的socket（真正的数据）
         let socket: SpinLockGuard<Box<dyn Socket>> = socket_inode.inner();
-        return socket.setsockopt(level, optname, optval).map(|_| 0);
+        debug!("setsockopt: level={:?}", level);
+        return socket.set_option(sol, optname, optval).map(|_| 0);
     }
 
     /// @brief sys_getsockopt系统调用的实际执行函数
@@ -363,7 +368,7 @@ impl Syscall {
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let mut socket = unsafe { socket.inner_no_preempt() };
-        socket.shutdown(ShutdownType::from_bits_truncate(how as u8))?;
+        socket.shutdown(ShutdownType::from_bits_truncate((how + 1) as u8))?;
         return Ok(0);
     }
 
@@ -430,7 +435,7 @@ impl Syscall {
 
         // debug!("accept: new_socket={:?}", new_socket);
         // Insert the new socket into the file descriptor vector
-        let new_socket: Arc<SocketInode> = SocketInode::new(new_socket);
+        let new_socket: Arc<SocketInode> = SocketInode::new(new_socket, None);
 
         let mut file_mode = FileMode::O_RDWR;
         if flags & SOCK_NONBLOCK.bits() != 0 {
@@ -474,12 +479,12 @@ impl Syscall {
         if addr.is_null() {
             return Err(SystemError::EINVAL);
         }
-        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
+        let endpoint = ProcessManager::current_pcb()
             .get_socket(fd as i32)
-            .ok_or(SystemError::EBADF)?;
-        let socket = socket.inner();
-        let endpoint: Endpoint = socket.endpoint().ok_or(SystemError::EINVAL)?;
-        drop(socket);
+            .ok_or(SystemError::EBADF)?
+            .inner()
+            .endpoint()
+            .ok_or(SystemError::EINVAL)?;
 
         let sockaddr_in = SockAddr::from(endpoint);
         unsafe {
@@ -944,6 +949,7 @@ pub enum PosixSocketOption {
     SO_RESERVE_MEM = 73,
     SO_TXREHASH = 74,
     SO_RCVMARK = 75,
+    SO_PASSPIDFD = 76,
 }
 
 impl TryFrom<i32> for PosixSocketOption {

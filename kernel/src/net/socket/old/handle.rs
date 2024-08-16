@@ -1,5 +1,4 @@
 use ida::IdAllocator;
-use smoltcp::iface::SocketHandle;
 
 int_like!(KernelHandle, usize);
 
@@ -8,14 +7,14 @@ int_like!(KernelHandle, usize);
 /// 比如，在socket被关闭时，自动释放socket的资源，通知系统的其他组件。
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
 pub enum GlobalSocketHandle {
-    Smoltcp(SocketHandle),
+    Smoltcp(smoltcp::iface::SocketHandle),
     Kernel(KernelHandle),
 }
 
 static KERNEL_HANDLE_IDA: IdAllocator = IdAllocator::new(0, usize::MAX);
 
 impl GlobalSocketHandle {
-    pub fn new_smoltcp_handle(handle: SocketHandle) -> Self {
+    pub fn new_smoltcp_handle(handle: smoltcp::iface::SocketHandle) -> Self {
         return Self::Smoltcp(handle);
     }
 
@@ -23,7 +22,7 @@ impl GlobalSocketHandle {
         return Self::Kernel(KernelHandle::new(KERNEL_HANDLE_IDA.alloc().unwrap()));
     }
 
-    pub fn smoltcp_handle(&self) -> Option<SocketHandle> {
+    pub fn smoltcp_handle(&self) -> Option<smoltcp::iface::SocketHandle> {
         if let Self::Smoltcp(sh) = *self {
             return Some(sh);
         }
@@ -35,5 +34,11 @@ impl GlobalSocketHandle {
             return Some(kh);
         }
         None
+    }
+}
+
+impl From<smoltcp::iface::SocketHandle> for GlobalSocketHandle {
+    fn from(handle: smoltcp::iface::SocketHandle) -> Self {
+        return Self::new_smoltcp_handle(handle);
     }
 }

@@ -5,17 +5,16 @@ use system_error::SystemError;
 
 use crate::libs::rwlock::RwLock;
 use crate::{
-    driver::net::NetDevice,
+    driver::net::Iface,
     libs::rwlock::RwLockReadGuard,
-    net::{socket::SocketPollMethod, NET_DEVICES},
+    net::NET_DEVICES,
     time::timer::{next_n_ms_timer_jiffies, Timer, TimerFunction},
 };
 
 use super::{
     event_poll::{EPollEventType, EventPoll},
     socket::{
-        handle::GlobalSocketHandle, inet::TcpSocket, netlink::skbuff::SkBuff, HANDLE_MAP,
-        SOCKET_SET,
+        handle::GlobalSocketHandle, inet::TcpSocket, netlink::skbuff::SkBuff
     },
 };
 
@@ -86,19 +85,19 @@ fn dhcp_query() -> Result<(), SystemError> {
 
                 if let Some(router) = config.router {
                     net_face
-                        .inner_iface()
+                        .smol_iface()
                         .lock()
                         .routes_mut()
                         .add_default_ipv4_route(router)
                         .unwrap();
-                    let cidr = net_face.inner_iface().lock().ip_addrs().first().cloned();
+                    let cidr = net_face.smol_iface().lock().ip_addrs().first().cloned();
                     if let Some(cidr) = cidr {
                         info!("Successfully allocated ip by Dhcpv4! Ip:{}", cidr);
                         return Ok(());
                     }
                 } else {
                     net_face
-                        .inner_iface()
+                        .smol_iface()
                         .lock()
                         .routes_mut()
                         .remove_default_ipv4_route();
@@ -114,7 +113,7 @@ fn dhcp_query() -> Result<(), SystemError> {
                     ))])
                     .ok();
                 net_face
-                    .inner_iface()
+                    .smol_iface()
                     .lock()
                     .routes_mut()
                     .remove_default_ipv4_route();
@@ -126,133 +125,108 @@ fn dhcp_query() -> Result<(), SystemError> {
 }
 
 pub fn poll_ifaces() {
-    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDevice>>> = NET_DEVICES.read_irqsave();
+    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn Iface>>> = NET_DEVICES.read_irqsave();
     if guard.len() == 0 {
         warn!("poll_ifaces: No net driver found!");
         return;
     }
-    let mut sockets = SOCKET_SET.lock_irqsave();
     for (_, iface) in guard.iter() {
-        iface.poll(&mut sockets).ok();
+        iface.poll();
     }
-    let _ = send_event(&sockets);
 }
 
-/// 对ifaces进行轮询，最多对SOCKET_SET尝试times次加锁。
-///
-/// @return 轮询成功，返回Ok(())
-/// @return 加锁超时，返回SystemError::EAGAIN_OR_EWOULDBLOCK
-/// @return 没有网卡，返回SystemError::ENODEV
-pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
-    let mut i = 0;
-    while i < times {
-        let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDevice>>> =
-            NET_DEVICES.read_irqsave();
-        if guard.len() == 0 {
-            warn!("poll_ifaces: No net driver found!");
-            // 没有网卡，返回错误
-            return Err(SystemError::ENODEV);
-        }
-        let sockets = SOCKET_SET.try_lock_irqsave();
-        // 加锁失败，继续尝试
-        if sockets.is_err() {
-            i += 1;
-            continue;
-        }
+// /// 对ifaces进行轮询，最多对SOCKET_SET尝试times次加锁。
+// ///
+// /// @return 轮询成功，返回Ok(())
+// /// @return 加锁超时，返回SystemError::EAGAIN_OR_EWOULDBLOCK
+// /// @return 没有网卡，返回SystemError::ENODEV
+// pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
+//     let mut i = 0;
+//     while i < times {
+//         let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn Iface>>> =
+//             NET_DEVICES.read_irqsave();
+//         if guard.len() == 0 {
+//             warn!("poll_ifaces: No net driver found!");
+//             // 没有网卡，返回错误
+//             return Err(SystemError::ENODEV);
+//         }
+//         for (_, iface) in guard.iter() {
+//             iface.poll();
+//         }
+//         return Ok(());
+//     }
+//     // 尝试次数用完，返回错误
+//     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+// }
 
-        let mut sockets = sockets.unwrap();
-        for (_, iface) in guard.iter() {
-            iface.poll(&mut sockets).ok();
-        }
-        send_event(&sockets)?;
-        return Ok(());
-    }
-    // 尝试次数用完，返回错误
-    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-}
+// /// 对ifaces进行轮询，最多对SOCKET_SET尝试一次加锁。
+// ///
+// /// @return 轮询成功，返回Ok(())
+// /// @return 加锁超时，返回SystemError::EAGAIN_OR_EWOULDBLOCK
+// /// @return 没有网卡，返回SystemError::ENODEV
+// pub fn poll_ifaces_try_lock_onetime() -> Result<(), SystemError> {
+//     let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn Iface>>> = NET_DEVICES.read_irqsave();
+//     if guard.len() == 0 {
+//         warn!("poll_ifaces: No net driver found!");
+//         // 没有网卡，返回错误
+//         return Err(SystemError::ENODEV);
+//     }
+//     for (_, iface) in guard.iter() {
+//         let _ = iface.poll();
+//     }
+//     send_event()?;
+//     return Ok(());
+// }
 
-/// 对ifaces进行轮询，最多对SOCKET_SET尝试一次加锁。
-///
-/// @return 轮询成功，返回Ok(())
-/// @return 加锁超时，返回SystemError::EAGAIN_OR_EWOULDBLOCK
-/// @return 没有网卡，返回SystemError::ENODEV
-pub fn poll_ifaces_try_lock_onetime() -> Result<(), SystemError> {
-    let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn NetDevice>>> = NET_DEVICES.read_irqsave();
-    if guard.len() == 0 {
-        warn!("poll_ifaces: No net driver found!");
-        // 没有网卡，返回错误
-        return Err(SystemError::ENODEV);
-    }
-    let mut sockets = SOCKET_SET.try_lock_irqsave()?;
-    for (_, iface) in guard.iter() {
-        iface.poll(&mut sockets).ok();
-    }
-    send_event(&sockets)?;
-    return Ok(());
-}
+// /// ### 处理轮询后的事件
+// fn send_event() -> Result<(), SystemError> {
+//     for (handle, socket_type) in .lock().iter() {
 
-/// ### 处理轮询后的事件
-fn send_event(sockets: &smoltcp::iface::SocketSet) -> Result<(), SystemError> {
-    for (handle, socket_type) in sockets.iter() {
-        let handle_guard = HANDLE_MAP.read_irqsave();
-        let global_handle = GlobalSocketHandle::new_smoltcp_handle(handle);
-        let item: Option<&super::socket::SocketHandleItem> = handle_guard.get(&global_handle);
-        if item.is_none() {
-            continue;
-        }
+//         let global_handle = GlobalSocketHandle::new_smoltcp_handle(handle);
 
-        let handle_item = item.unwrap();
-        let posix_item = handle_item.posix_item();
-        if posix_item.is_none() {
-            continue;
-        }
-        let posix_item = posix_item.unwrap();
+//         let handle_guard = HANDLE_MAP.read_irqsave();
+//         let item: Option<&super::socket::SocketHandleItem> = handle_guard.get(&global_handle);
+//         if item.is_none() {
+//             continue;
+//         }
 
-        // 获取socket上的事件
-        let mut events = SocketPollMethod::poll(socket_type, handle_item).bits() as u64;
+//         let handle_item = item.unwrap();
+//         let posix_item = handle_item.posix_item();
+//         if posix_item.is_none() {
+//             continue;
+//         }
+//         let posix_item = posix_item.unwrap();
 
-        // 分发到相应类型socket处理
-        match socket_type {
-            smoltcp::socket::Socket::Raw(_) | smoltcp::socket::Socket::Udp(_) => {
-                posix_item.wakeup_any(events);
-            }
-            smoltcp::socket::Socket::Icmp(_) => unimplemented!("Icmp socket hasn't unimplemented"),
-            smoltcp::socket::Socket::Tcp(inner_socket) => {
-                if inner_socket.is_active() {
-                    events |= TcpSocket::CAN_ACCPET;
-                }
-                if inner_socket.state() == smoltcp::socket::tcp::State::Established {
-                    events |= TcpSocket::CAN_CONNECT;
-                }
-                if inner_socket.state() == smoltcp::socket::tcp::State::CloseWait {
-                    events |= EPollEventType::EPOLLHUP.bits() as u64;
-                }
+//         // 获取socket上的事件
+//         let mut events = SocketPollMethod::poll(socket_type, handle_item).bits() as u64;
 
-                posix_item.wakeup_any(events);
-            }
-            smoltcp::socket::Socket::Dhcpv4(_) => {}
-            smoltcp::socket::Socket::Dns(_) => unimplemented!("Dns socket hasn't unimplemented"),
-        }
-        EventPoll::wakeup_epoll(
-            &posix_item.epitems,
-            EPollEventType::from_bits_truncate(events as u32),
-        )?;
-        drop(handle_guard);
-        // crate::debug!(
-        //     "{} send_event {:?}",
-        //     handle,
-        //     EPollEventType::from_bits_truncate(events as u32)
-        // );
-    }
-    Ok(())
-}
+//         // 分发到相应类型socket处理
+//         match socket_type {
+//             smoltcp::socket::Socket::Raw(_) | smoltcp::socket::Socket::Udp(_) => {
+//                 posix_item.wakeup_any(events);
+//             }
+//             smoltcp::socket::Socket::Icmp(_) => unimplemented!("Icmp socket hasn't unimplemented"),
+//             smoltcp::socket::Socket::Tcp(inner_socket) => {
+//                 if inner_socket.is_active() {
+//                     events |= TcpSocket::CAN_ACCPET;
+//                 }
+//                 if inner_socket.state() == smoltcp::socket::tcp::State::Established {
+//                     events |= TcpSocket::CAN_CONNECT;
+//                 }
+//                 if inner_socket.state() == smoltcp::socket::tcp::State::CloseWait {
+//                     events |= EPollEventType::EPOLLHUP.bits() as u64;
+//                 }
 
-// 参考https://code.dragonos.org.cn/xref/linux-6.1.9/net/core/scok.c#3853
-// proto_register
-// proto_unregister
-
-// https://code.dragonos.org.cn/xref/linux-6.1.9/net/core/skbuff.c#1027
-pub fn consume_skb(skb: Arc<RwLock<SkBuff>>) {
-    // 释放skb
-    drop(skb);
-}
+//                 posix_item.wakeup_any(events);
+//             }
+//             smoltcp::socket::Socket::Dhcpv4(_) => {}
+//             smoltcp::socket::Socket::Dns(_) => unimplemented!("Dns socket hasn't unimplemented"),
+//         }
+//         EventPoll::wakeup_epoll(
+//             &posix_item.epitems,
+//             EPollEventType::from_bits_truncate(events as u32),
+//         )?;
+//         drop(handle_guard);
+//     }
+//     Ok(())
+// }

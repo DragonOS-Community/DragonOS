@@ -23,6 +23,8 @@ pub struct BoundInner {
 }
 
 impl BoundInner {
+    /// # `bind`
+    /// 将socket绑定到指定的地址上，置入指定的网络接口中
     pub fn bind<T>(
         socket: T, 
         // socket_type: Types, 

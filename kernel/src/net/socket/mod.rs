@@ -7,7 +7,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use common::PollUnit;
+use common::poll_unit::{EPollItems, WaitQueue};
 use hashbrown::HashMap;
 use log::warn;
 use smoltcp::{
@@ -32,8 +32,6 @@ use crate::{
 };
 
 use self::{
-    handle::GlobalSocketHandle,
-    inet::{RawSocket},
     unix::{SeqpacketSocket, StreamSocket},
     common::shutdown::Shutdown,
 };
@@ -42,15 +40,11 @@ use super::{
     event_poll::{EPollEventType, EPollItem, EventPoll}, Endpoint,
 };
 
-pub mod handle;
 pub mod inet;
 pub mod unix;
-pub mod poll_method;
 pub mod define;
-pub mod inode;
 pub mod common;
 
-pub use inode::SocketInode;
 pub use define::{AddressFamily, Options as SocketOptions, OptionsLevel as SocketOptionsLevel, Types as SocketTypes};
 
 /* For setsockopt(2) */
@@ -90,7 +84,15 @@ pub const SOL_SOCKET: u8 = 1;
 pub trait Socket: IndexNode {
     /// # `poll_unit`
     /// 获取socket的poll单元
-    fn poll_unit(&self) -> &PollUnit;
+    fn epoll_items(&self) -> &EPollItems;
+
+    /// # `wait_queue`
+    /// 获取socket的wait queue
+    fn wait_queue(&self) -> &WaitQueue;
+
+    /// # `on_iface_events`
+    /// 通知socket iface事件更新
+    fn on_iface_events(&self);
 
     /// # `connect` 
     /// 对应于POSIX的connect函数，用于连接到指定的远程服务器端点
@@ -120,7 +122,7 @@ pub trait Socket: IndexNode {
     /// 接受连接，仅用于listening stream socket
     /// ## Block
     /// 如果没有连接到来，会阻塞
-    fn accept(&self) -> Result<(Box<dyn Socket>, Endpoint), SystemError> {
+    fn accept(&self) -> Result<(Arc<dyn IndexNode>, Endpoint), SystemError> {
         Err(SystemError::ENOSYS)
     }
 
@@ -156,6 +158,26 @@ pub trait Socket: IndexNode {
 
     fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
         todo!()
+    }
+}
+
+pub trait Poll {
+    fn events(&self) -> EPollEventType;
+
+    fn busy_wait<F, R>(&self, mask: EPollEventType, mut f: F) -> Result<R, SystemError>
+    where
+        F: FnMut() -> Result<R, SystemError>,
+    {
+        let wait_queue = WaitQueue::default();
+        loop {
+            match f() {
+                Ok(r) => return Ok(r),
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    wait_queue.wait_for(mask);
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 

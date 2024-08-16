@@ -6,7 +6,7 @@ use system_error::SystemError;
 use crate::{
     driver::net::Iface,
     libs::rwlock::RwLockReadGuard,
-    net::{socket::SocketPollMethod, NET_DEVICES},
+    net::NET_DEVICES,
     time::timer::{next_n_ms_timer_jiffies, Timer, TimerFunction},
 };
 
@@ -129,8 +129,10 @@ pub fn poll_ifaces() {
     }
     for (_, iface) in guard.iter() {
         let _ = iface.poll();
+        for (_handle, socket) in iface.sockets().lock().iter() {
+            
+        }
     }
-    let _ = send_event();
 }
 
 /// 对ifaces进行轮询，最多对SOCKET_SET尝试times次加锁。

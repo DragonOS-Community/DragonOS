@@ -6,59 +6,24 @@ use crate::{libs::{spinlock::SpinLock, wait_queue::EventWaitQueue}, net::event_p
 
 
 #[derive(Debug)]
-pub struct PollUnit {
+pub struct WaitQueue {
     /// socket的waitqueue
     wait_queue: Arc<EventWaitQueue>,
-
-    pub epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
 }
 
-impl Default for PollUnit {
+impl Default for WaitQueue {
     fn default() -> Self {
         Self {
             wait_queue: Default::default(),
-            epitems: SpinLock::new(LinkedList::new()),
         }
     }
 }
 
-impl PollUnit {
+impl WaitQueue {
     pub fn new(wait_queue: Arc<EventWaitQueue>) -> Self {
         Self {
             wait_queue,
-            epitems: SpinLock::new(LinkedList::new()),
         }
-    }
-
-    pub fn add_epoll(&self, epitem: Arc<EPollItem>) {
-        self.epitems.lock_irqsave().push_back(epitem)
-    }
-
-    pub fn remove_epoll(&self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
-        let is_remove = !self
-            .epitems
-            .lock_irqsave()
-            .extract_if(|x| x.epoll().ptr_eq(epoll))
-            .collect::<Vec<_>>()
-            .is_empty();
-
-        if is_remove {
-            return Ok(());
-        }
-
-        Err(SystemError::ENOENT)
-    }
-
-    pub fn clear_epoll(&self) -> Result<(), SystemError> {
-        for epitem in self.epitems.lock_irqsave().iter() {
-            let epoll = epitem.epoll();
-
-            if let Some(epoll) = epoll.upgrade() {
-                EventPoll::ep_remove(&mut epoll.lock_irqsave(), epitem.fd(), None)?;
-            }
-        }
-
-        Ok(())
     }
 
     /// # `wakeup_any`
@@ -96,5 +61,63 @@ impl PollUnit {
                 Err(e) => return Err(e),
             }
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct EPollItems {
+    items: SpinLock<LinkedList<Arc<EPollItem>>>,
+}
+
+impl Default for EPollItems {
+    fn default() -> Self {
+        Self {
+            items: SpinLock::new(LinkedList::new()),
+        }
+    }
+}
+
+impl EPollItems {
+    pub fn new() -> Self {
+        Self {
+            items: SpinLock::new(LinkedList::new()),
+        }
+    }
+
+    pub fn add(&self, item: Arc<EPollItem>) {
+        self.items.lock_irqsave().push_back(item);
+    }
+
+    pub fn remove(&self, item: &Arc<EPollItem>) -> Result<(), SystemError> {
+        let to_remove = self
+            .items
+            .lock_irqsave()
+            .extract_if(|x| Arc::ptr_eq(x, item))
+            .collect::<Vec<_>>();
+
+        let result = if !to_remove.is_empty() {
+            Ok(())
+        } else {
+            Err(SystemError::ENOENT)
+        };
+
+        drop(to_remove);
+        return result;
+    }
+
+    pub fn clear(&self) -> Result<(), SystemError> {
+        let mut guard = self.items.lock_irqsave();
+        let mut result = Ok(());
+        guard.iter().for_each(|item| {
+            if let Some(epoll) = item.epoll().upgrade() {
+                let _ = EventPoll::ep_remove(&mut epoll.lock_irqsave(), item.fd(), None)
+                    .map_err(|e| {
+                        result = Err(e);
+                    }
+                );
+            }
+        });
+        guard.clear();
+        return result;
     }
 }

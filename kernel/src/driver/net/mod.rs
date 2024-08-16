@@ -1,8 +1,11 @@
+use alloc::collections::BTreeSet;
+
 use alloc::{sync::{Weak, Arc}, string::String, fmt, vec::Vec};
 
 use smoltcp;
 use system_error::SystemError;
-use crate::libs::spinlock::SpinLock;
+use crate::net::socket::inet::AnyInetSocket;
+use crate::{libs::{spinlock::SpinLock, rwlock::RwLock}, net::socket::Socket};
 use crate::net::socket::inet::common::{BoundInner, PortManager};
 
 mod dma;
@@ -74,8 +77,9 @@ pub struct IfaceCommon {
     iface_id: usize,
     smol_iface: SpinLock<smoltcp::iface::Interface>,
     sockets: SpinLock<smoltcp::iface::SocketSet<'static>>,
+    bounds: RwLock<Vec<Arc<dyn AnyInetSocket>>>,
     port_manager: PortManager,
-    _poll_at_ms: core::sync::atomic::AtomicU64,
+    poll_at_ms: core::sync::atomic::AtomicU64,
 }
 
 impl fmt::Debug for IfaceCommon {
@@ -83,8 +87,9 @@ impl fmt::Debug for IfaceCommon {
         f.debug_struct("IfaceCommon")
             .field("iface_id", &self.iface_id)
             .field("sockets", &self.sockets)
+            .field("bounds", &self.bounds)
             .field("port_manager", &self.port_manager)
-            .field("_poll_at_ms", &self._poll_at_ms)
+            .field("poll_at_ms", &self.poll_at_ms)
             .finish()
     }
 }
@@ -95,8 +100,9 @@ impl IfaceCommon {
             iface_id,
             smol_iface: SpinLock::new(iface),
             sockets: SpinLock::new(smoltcp::iface::SocketSet::new(Vec::new())),
+            bounds: RwLock::new(Vec::new()),
             port_manager: PortManager::new(),
-            _poll_at_ms: core::sync::atomic::AtomicU64::new(0),
+            poll_at_ms: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -105,12 +111,57 @@ impl IfaceCommon {
         D: smoltcp::phy::Device + ?Sized,
     {
         let timestamp = crate::time::Instant::now().into();
-        let mut sockets = self.sockets.lock();
-        if self.smol_iface.lock().poll(timestamp, device, &mut sockets) {
-            return Ok(());
+        let mut sockets = self.sockets.lock_no_preempt();
+        let mut interface = self.smol_iface.lock_no_preempt();
+
+        let (has_events, poll_at) = {
+            let mut has_events = false;
+            let mut poll_at;
+            loop {
+                has_events |= interface.poll(timestamp, device, &mut sockets);
+                poll_at = interface.poll_at(timestamp, &sockets);
+                let Some(instant) = poll_at else {
+                    break;
+                };
+                if instant > timestamp {
+                    break;
+                }
+            }
+            (has_events, poll_at)
+        };
+
+        // drop sockets here to avoid deadlock
+        drop(interface);
+        drop(sockets);
+
+        use core::sync::atomic::Ordering;
+        if let Some(instant) = poll_at {
+            let _old_instant = self.poll_at_ms.load(Ordering::Relaxed);
+            let new_instant = instant.total_millis() as u64;
+            self.poll_at_ms.store(new_instant, Ordering::Relaxed);
+
+            // if old_instant == 0 || new_instant < old_instant {
+            //     self.polling_wait_queue.wake_all();
+            // }
         } else {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            self.poll_at_ms.store(0, Ordering::Relaxed);
         }
+
+        if has_events {
+            // We never try to hold the write lock in the IRQ context, and we disable IRQ when
+            // holding the write lock. So we don't need to disable IRQ when holding the read lock.
+            self.bounds.read().iter().for_each(|bound_socket| {
+                bound_socket.on_iface_events();
+            });
+
+            // let closed_sockets = self
+            //     .closing_sockets
+            //     .lock_irq_disabled()
+            //     .extract_if(|closing_socket| closing_socket.is_closed())
+            //     .collect::<Vec<_>>();
+            // drop(closed_sockets);
+        }
+        return Ok(());
     }
 
     pub fn update_ip_addrs(&self, ip_addrs: &[smoltcp::wire::IpCidr]) -> Result<(), SystemError> {
@@ -130,62 +181,7 @@ impl IfaceCommon {
         return Ok(());
     }
 
-    // pub fn bind_socket<T>(&self, socket: T, endpoint: &smoltcp::wire::IpEndpoint) 
-    //     -> Result<smoltcp::iface::SocketHandle, SystemError>
-    // where 
-    //     T: smoltcp::socket::AnySocket<'static> 
-    // {
-    //     use crate::net::socket::inet::common::SocketType;
-    //     match socket.upcast() {
-    //         smoltcp::socket::Socket::Tcp(socket) => {
-    //             self.port_manager.bind_port(SocketType::Tcp, endpoint.port)?;
-    //             Ok(self.sockets.lock_no_preempt().add(socket))
-    //         }
-    //         smoltcp::socket::Socket::Udp(socket) => {
-    //             self.port_manager.bind_port(SocketType::Udp, endpoint.port)?;
-    //             Ok(self.sockets.lock_no_preempt().add(socket))
-    //         }
-    //         smoltcp::socket::Socket::Raw(socket) => {
-    //             Ok(self.sockets.lock_no_preempt().add(socket))
-    //         }
-    //         smoltcp::socket::Socket::Dhcpv4(socket) => {
-    //             Ok(self.sockets.lock_no_preempt().add(socket))
-    //         }
-    //         smoltcp::socket::Socket::Icmp(socket) => {
-    //             Ok(self.sockets.lock_no_preempt().add(socket))
-    //         }
-    //         smoltcp::socket::Socket::Dns(socket) => {
-    //             Ok(self.sockets.lock_no_preempt().add(socket))
-    //         }
-    //     }
-    // }
-
-    // pub fn bind_socket_ephemeral<T>(&self, socket: T) 
-    // -> Result<smoltcp::iface::SocketHandle, SystemError>
-    // where 
-    //     T: smoltcp::socket::AnySocket<'static> 
-    // {
-    //     match socket.upcast() {
-    //         smoltcp::socket::Socket::Tcp(socket) => {
-    //             self.port_manager.bind_ephemeral_tcp()?;
-    //             Ok(self.sockets.lock_no_preempt().add(socket))
-    //         }
-    //         smoltcp::socket::Socket::Udp(socket) => {
-    //             self.port_manager.bind_ephemeral_udp()?;
-    //             Ok(self.sockets.lock_no_preempt().add(socket))
-    //         }
-    //         smoltcp::socket::Socket::Raw(socket) => {
-    //             Ok(self.sockets.lock_no_preempt().add(socket))
-    //         }
-    //         smoltcp::socket::Socket::Dhcpv4(socket) => {
-    //             Ok(self.sockets.lock_no_preempt().add(socket))
-    //         }
-    //         smoltcp::socket::Socket::Icmp(socket) => {
-    //             Ok(self.sockets.lock_no_preempt().add(socket))
-    //         }
-    //         smoltcp::socket::Socket::Dns(socket) => {
-    //             Ok(self.sockets.lock_no_preempt().add(socket))
-    //         }
-    //     }
-    // }
+    pub fn bind_socket(&self, socket: Arc<dyn AnyInetSocket>) {
+        self.bounds.write().push(socket);
+    }
 }

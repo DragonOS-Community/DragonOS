@@ -1,7 +1,9 @@
 use system_error::SystemError::{self, *};
+use smoltcp;
+use alloc::sync::Arc;
 
-pub mod raw;
-pub mod icmp;
+// pub mod raw;
+// pub mod icmp;
 pub mod datagram;
 pub mod stream;
 pub mod common;
@@ -9,41 +11,62 @@ pub mod syscall;
 
 pub use common::Types;
 pub use common::BoundInner;
-pub use raw::RawSocket;
-pub use datagram::UdpInner;
+// pub use raw::RawSocket;
+pub use datagram::UdpSocket;
 pub use stream::TcpSocket;
 
-#[derive(Debug)]
-pub enum InetSocket {
-    Raw(RawSocket),
-    Udp(UdpInner),
-    Tcp(TcpSocket),
-}
+use crate::filesystem::vfs::IndexNode;
 
-// pub trait AnyInetSocket {
-//     fn bind(&self, endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError>;
+use super::Socket;
+
+// trait AnyInetSocket {
+//     fn epoll_items(&self) -> &super::common::poll_unit::EPollItems;
+//     fn wait_queue(&self) -> &super::common::poll_unit::WaitQueue;
+//     fn on_iface_events(&self);
+//     fn do_bind(&self, endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError>;
+// }
+
+// #[derive(Debug)]
+// pub enum InetSocket {
+//     // Raw(RawSocket),
+//     Udp(UdpSocket),
+//     Tcp(TcpSocket),
+// }
+
+// impl IndexNode for InetSocket {
     
-//     fn common(&self) -> &common::BoundInner;
-    
-//     fn endpoint(&self) -> smoltcp::wire::IpEndpoint {
-//         self.common().address()
+// }
+
+// impl Socket for InetSocket {
+//     fn epoll_items(&self) -> &super::common::poll_unit::EPollItems {
+//         match self {
+//             InetSocket::Udp(udp) => udp.epoll_items(),
+//             InetSocket::Tcp(tcp) => tcp.epoll_items(),
+//         }
 //     }
 
-//     fn remote(&self) -> Option<smoltcp::wire::IpEndpoint> {
-//         self.common().remote
+//     fn bind(&self, endpoint: crate::net::Endpoint) -> Result<(), SystemError> {
+//         if let crate::net::Endpoint::Ip(ip) = endpoint {
+//             match self {
+//                 InetSocket::Udp(udp) => {
+//                     udp.do_bind(ip)?;
+//                 },
+//                 InetSocket::Tcp(tcp) => {
+//                     tcp.do_bind(ip)?;
+//                 },
+//             }
+//             return Ok(());
+//         }
+//         return Err(EINVAL);
 //     }
 
-//     fn connect(&self, endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError>;
+//     fn wait_queue(&self) -> &super::common::poll_unit::WaitQueue {
+//         todo!()
+//     }
 
-//     fn listen(&self, backlog: usize) -> Result<(), SystemError>;
-
-//     fn accept(&self) -> Result<(InetSocket, smoltcp::wire::IpEndpoint), SystemError>;
-    
-//     fn sendmsg(&self, data: &[u8]) -> Result<usize, SystemError>;
-    
-//     fn recvmsg(&self, data: &mut [u8]) -> Result<usize, SystemError>;
-    
-//     fn close(&mut self);
+//     fn on_iface_events(&self) {
+//         todo!()
+//     }
 // }
 
 // pub trait Socket: FileLike + Send + Sync {

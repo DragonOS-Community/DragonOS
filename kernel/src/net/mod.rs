@@ -54,3 +54,9 @@ impl LinkLayerEndpoint {
         Self { interface }
     }
 }
+
+impl From<IpEndpoint> for Endpoint {
+    fn from(endpoint: IpEndpoint) -> Self {
+        Self::Ip(endpoint)
+    }
+}

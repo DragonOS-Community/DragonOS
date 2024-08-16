@@ -1,5 +1,6 @@
 use system_error::SystemError::{self, *};
-use crate::net::socket;
+use crate::net::socket::{self, inet::Types};
+use crate::libs::rwlock::RwLock;
 use alloc::vec::Vec;
 use smoltcp;
 
@@ -24,35 +25,109 @@ fn new_listen_smoltcp_socket(local_endpoint: smoltcp::wire::IpEndpoint) -> smolt
 }
 
 
+// #[derive(Debug)]
+// pub struct Unbound {
+//     socket: smoltcp::socket::tcp::Socket<'static>,
+// }
+
+// impl Unbound {
+//     pub fn new() -> Self {
+//         Self { socket: new_smoltcp_socket() }
+//     }
+
+//     pub fn bind(self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<Connecting, SystemError> {
+//         Ok( Connecting {
+//             inner: socket::inet::BoundInner::bind(
+//                 self.socket, 
+//                 &local_endpoint.addr,
+//             )?,
+//             local_endpoint,
+//         })
+//     }
+
+//     pub fn close(&mut self) {
+//         self.socket.close();
+//     }
+// }
+
+// #[derive(Debug)]
+// pub struct Bound {
+//     inner: socket::inet::BoundInner,
+// }
+
 #[derive(Debug)]
-pub struct Unbound {
-    socket: smoltcp::socket::tcp::Socket<'static>,
+pub enum Init {
+    Unbound(smoltcp::socket::tcp::Socket<'static>),
+    Bound((socket::inet::BoundInner, smoltcp::wire::IpEndpoint)),
 }
 
-impl Unbound {
-    pub fn new() -> Self {
-        Self { socket: new_smoltcp_socket() }
+impl Init {
+    pub(super) fn new() -> Self {
+        Init::Unbound(new_smoltcp_socket())
     }
 
-    pub fn bind(self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<Connecting, SystemError> {
-        Ok( Connecting {
-            inner: socket::inet::BoundInner::bind(
-                self.socket, 
-                &local_endpoint.addr,
-            )?,
-            local_endpoint,
-        })
+    pub(super) fn new_bound(inner: socket::inet::BoundInner) -> Self {
+        Init::Bound(inner)
     }
 
-    pub fn close(&mut self) {
-        self.socket.close();
+    pub(super) fn bind(self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<Self, SystemError> {
+        match self {
+            Init::Unbound(socket) => {
+                let bound = socket::inet::BoundInner::bind(
+                    socket, 
+                    &local_endpoint.addr,
+                )?;
+                bound.port_manager().bind_port(Types::Tcp, local_endpoint.port)?;
+                // bound.iface().common().bind_socket()
+                Ok( Init::Bound((bound, local_endpoint)) )
+            },
+            Init::Bound(_) => {
+                Err(EINVAL)
+            }
+        }
+    }
+
+    pub(super) fn bind_to_ephemeral(self, remote_endpoint: smoltcp::wire::IpEndpoint) 
+        -> Result<Self, SystemError> 
+    {
+        match self {
+            Init::Unbound(socket) => {
+                let (bound, address) = socket::inet::BoundInner::bind_ephemeral(
+                    socket, 
+                    remote_endpoint.addr,
+                )?;
+                let bound_port = bound.port_manager().bind_ephemeral_port(Types::Tcp)?;
+                let endpoint = smoltcp::wire::IpEndpoint::new(address, bound_port);
+                Ok( Init::Bound((bound, endpoint)) )
+            },
+            Init::Bound(_) => {
+                Err(EINVAL)
+            }
+        }
+    }
+
+    pub(super) fn connect(self, remote_endpoint: smoltcp::wire::IpEndpoint) -> Result<Connecting, SystemError> {
+        let (inner, local) = match self {
+            Init::Unbound(_) => {
+                self.bind_to_ephemeral(remote_endpoint)?
+            },
+            Init::Bound(inner) => inner,
+        };
+        inner.with_mut(|socket| {
+            socket.connect(
+                inner.iface().smol_iface().lock().context(),
+                remote_endpoint,
+                local
+            ).map_err(|_| ECONNREFUSED)
+        })?;
+        return Ok( Connecting {inner, result: None} );
     }
 }
 
 #[derive(Debug)]
 pub struct Connecting {
     inner: socket::inet::BoundInner,
-    local_endpoint: smoltcp::wire::IpEndpoint,
+    result: RwLock<Option<Result<(), SystemError>>>,
 }
 
 impl Connecting {
@@ -60,40 +135,44 @@ impl Connecting {
         self.inner.with_mut(f)
     }
 
-    pub fn listen(self, backlog: usize) -> Result<Listening, SystemError> {
-        let mut inners = Vec::new();
-        self.with_mut(|socket| {
-            socket.listen(self.local_endpoint).map_err(|_| EADDRNOTAVAIL)
-        })?;
-        inners.push(self.inner);
-        for _ in 1..backlog {
-            inners.push(socket::inet::BoundInner::bind(
-                new_listen_smoltcp_socket(self.local_endpoint), 
-                &self.local_endpoint.addr,
-            )?);
+    // pub fn into_result(self) -> Result<Established, SystemError> {
+    //     if let Some(result) = self.result {
+
+    //     } else {
+    //         return Err(EAGAIN_OR_EWOULDBLOCK);
+    //     }
+    // }
+   
+    /// Returns `true` when `conn_result` becomes ready, which indicates that the caller should
+    /// invoke the `into_result()` method as soon as possible.
+    ///
+    /// Since `into_result()` needs to be called only once, this method will return `true`
+    /// _exactly_ once. The caller is responsible for not missing this event.
+    #[must_use]
+    pub(super) fn update_io_events(&self) -> bool {
+        if self.result.read().is_some() {
+            return false;
         }
-        return Ok( Listening {inners} );
-    }
 
-    pub fn connect(self, remote_endpoint: smoltcp::wire::IpEndpoint) -> Result<Established, SystemError> {
-        self.inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-            socket.connect(
-                self.inner.iface().smol_iface().lock().context(),
-                remote_endpoint,
-                self.local_endpoint
-            ).map_err(|_| ECONNREFUSED)
-        })?;
-        return Ok( Established { inner: self.inner });
-    }
+        self.inner.with_mut(|socket: &mut smoltcp::socket::tcp::Socket| {
+            let mut result = self.result.write();
+            if result.is_some() {
+                return false;
+            }
 
-    pub fn close(self) {
-        self.inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-            socket.close();
-        });
-    }
-
-    pub fn local_endpoint(&self) -> &smoltcp::wire::IpEndpoint {
-        &self.local_endpoint
+            // Connected
+            if socket.can_send() {
+                result.replace(Ok(()));
+                return true;
+            }
+            // Connecting
+            if socket.is_open() {
+                return false;
+            }
+            // Refused
+            result.replace(Err(ECONNREFUSED));
+            true
+        })
     }
 }
 
@@ -168,22 +247,40 @@ impl Established {
         })
     }
 
-    pub fn recv_slice(&self, buf: &mut [u8]) -> Result<usize, smoltcp::socket::tcp::RecvError> {
+    pub fn recv_slice(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         self.inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-            socket.recv_slice(buf)
+            use smoltcp::socket::tcp::RecvError::*;
+            if socket.can_send() {
+                match socket.recv_slice(buf) {
+                    Ok(size) => Ok(size),
+                    Err(InvalidState) => {
+                        log::error!("TcpSocket::try_recv: InvalidState");
+                        Err(ENOTCONN)
+                    },
+                    Err(Finished) => {
+                        Ok(0)
+                    }
+                }
+            } else {
+                Err(ENOBUFS)
+            }
         })
     }
 
     pub fn send_slice(&self, buf: &[u8]) -> Result<usize, SystemError> {
         self.inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-            socket.send_slice(buf).map_err(|_| ECONNABORTED)
+            if socket.can_send() {
+                socket.send_slice(buf).map_err(|_| ECONNABORTED)
+            } else {
+                Err(ENOBUFS)
+            }
         })
     }
 }
 
 #[derive(Debug)]
 pub enum Inner {
-    Unbound(Unbound),
+    Init(Init),
     Connecting(Connecting),
     Listening(Listening),
     Established(Established),

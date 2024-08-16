@@ -3,7 +3,6 @@ pub mod poll_unit;
 
 #[allow(dead_code)]
 pub use shutdown::Shutdown;
-pub use poll_unit::PollUnit;
 
 // /// @brief 在trait Socket的metadata函数中返回该结构体供外部使用
 // #[derive(Debug, Clone)]

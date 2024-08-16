@@ -24,37 +24,6 @@ fn new_listen_smoltcp_socket(local_endpoint: smoltcp::wire::IpEndpoint) -> smolt
     socket
 }
 
-
-// #[derive(Debug)]
-// pub struct Unbound {
-//     socket: smoltcp::socket::tcp::Socket<'static>,
-// }
-
-// impl Unbound {
-//     pub fn new() -> Self {
-//         Self { socket: new_smoltcp_socket() }
-//     }
-
-//     pub fn bind(self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<Connecting, SystemError> {
-//         Ok( Connecting {
-//             inner: socket::inet::BoundInner::bind(
-//                 self.socket, 
-//                 &local_endpoint.addr,
-//             )?,
-//             local_endpoint,
-//         })
-//     }
-
-//     pub fn close(&mut self) {
-//         self.socket.close();
-//     }
-// }
-
-// #[derive(Debug)]
-// pub struct Bound {
-//     inner: socket::inet::BoundInner,
-// }
-
 #[derive(Debug)]
 pub enum Init {
     Unbound(smoltcp::socket::tcp::Socket<'static>),
@@ -106,10 +75,10 @@ impl Init {
         }
     }
 
-    pub(super) fn connect(self, remote_endpoint: smoltcp::wire::IpEndpoint) -> Result<Connecting, SystemError> {
+    pub(super) fn connect(self, remote_endpoint: smoltcp::wire::IpEndpoint) -> Result<Connecting, (Self, SystemError)> {
         let (inner, local) = match self {
             Init::Unbound(_) => {
-                self.bind_to_ephemeral(remote_endpoint)?
+                self.bind_to_ephemeral(remote_endpoint).map_err(|err| (self, err))?
             },
             Init::Bound(inner) => inner,
         };
@@ -118,31 +87,46 @@ impl Init {
                 inner.iface().smol_iface().lock().context(),
                 remote_endpoint,
                 local
-            ).map_err(|_| ECONNREFUSED)
+            ).map_err(|_| (self, ECONNREFUSED))
         })?;
-        return Ok( Connecting {inner, result: None} );
+        return Ok( Connecting::new(inner) );
     }
+}
+
+#[derive(Debug, Default)]
+enum ConnectResult {
+    Connected,
+    #[default] Connecting,
+    Refused,
 }
 
 #[derive(Debug)]
 pub struct Connecting {
     inner: socket::inet::BoundInner,
-    result: RwLock<Option<Result<(), SystemError>>>,
+    result: RwLock<ConnectResult>,
 }
 
 impl Connecting {
+    fn new(inner: socket::inet::BoundInner) -> Self {
+        Connecting {
+            inner,
+            result: RwLock::new(Err(EAGAIN_OR_EWOULDBLOCK)),
+        }
+    }
+
     pub fn with_mut<R, F: FnMut(&mut smoltcp::socket::tcp::Socket<'static>) -> R>(&self, f: F) -> R {
         self.inner.with_mut(f)
     }
 
-    // pub fn into_result(self) -> Result<Established, SystemError> {
-    //     if let Some(result) = self.result {
+    pub fn into_result(self) -> (Inner, Option<SystemError>) {
+        use ConnectResult::*;
+        match self.result.read() {
+            Connecting => (Inner::Connecting(self), Some(EAGAIN_OR_EWOULDBLOCK)),
+            Connected => (Inner::Established(Established { inner: self.inner }), None),
+            Refused => (Inner::Init(Init::Bound(self.inner)), Some(ECONNREFUSED)),
+        }
+    }
 
-    //     } else {
-    //         return Err(EAGAIN_OR_EWOULDBLOCK);
-    //     }
-    // }
-   
     /// Returns `true` when `conn_result` becomes ready, which indicates that the caller should
     /// invoke the `into_result()` method as soon as possible.
     ///

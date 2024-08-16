@@ -36,6 +36,10 @@ impl TcpSocket {
         )
     }
 
+    pub fn is_nonblock(&self) -> bool {
+        self.nonblock.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
     #[inline]
     fn write_state<F>(&self, mut f: F) -> Result<(), SystemError>
     where 
@@ -101,17 +105,68 @@ impl TcpSocket {
         }
     }
 
-    pub fn connect(&self, remote_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
-        self.write_state(|inner| {
-            match inner {
-                Inner::Connecting(connecting) => {
-                    connecting.connect(remote_endpoint).map(|inner| 
-                        Inner::Established(inner)
-                    )
+    pub fn start_connect(&self, remote_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
+        let mut writer = self.inner.write();
+        let inner = writer.take().expect("Tcp Inner is None");
+        let (init, err) = match inner {
+            Inner::Init(init) => {
+                let conn_result = init.connect(remote_endpoint);
+                match conn_result {
+                    Ok(connecting) => {
+                        (
+                            Inner::Connecting(connecting), 
+                            if self.is_nonblock() {
+                                None
+                            } else {
+                                Some(EINPROGRESS)
+                            }
+                        )
+                    }
+                    Err((init, err)) => {
+                        (Inner::Init(init), Some(err))
+                    }
                 }
-                _ => Err(EINVAL),
             }
-        })
+            Inner::Connecting(connecting) if self.is_nonblock() => {
+                (Inner::Connecting(connecting), Some(EALREADY))
+            },
+            Inner::Connecting(connecting) => {
+                (Inner::Connecting(connecting), None)
+            }
+            Inner::Listening(inner) => {
+                (Inner::Listening(inner), Some(EISCONN))
+            }
+            Inner::Established(_) => {
+                (Inner::Established(Established::new()), Some(EISCONN))
+            }
+        };
+        writer.replace(init);
+
+        drop(writer);
+
+        poll_ifaces();
+
+        if let Some(err) = err {
+            return Err(err);
+        }
+        return Ok(());
+    }
+
+    pub fn finish_connect(&self) -> Result<(), SystemError> {
+        let mut writer = self.inner.write();
+        let Inner::Connecting(conn) = writer.take().expect("Tcp Inner is None") else {
+            log::error!("TcpSocket::finish_connect: not Connecting");
+            return Err(EINVAL);
+        };
+
+        let (inner, err) = conn.into_result();
+        writer.replace(inner);
+        drop(writer);
+
+        if let Some(err) = err {
+            return Err(err);
+        }
+        return Ok(());
     }
 
     pub fn try_recv(&self, buf: &mut [u8]) -> Result<usize, SystemError> {

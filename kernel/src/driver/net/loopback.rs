@@ -4,7 +4,6 @@ use crate::driver::base::device::bus::Bus;
 use crate::driver::base::device::driver::Driver;
 use crate::driver::base::device::{Device, DeviceType, IdTable};
 use crate::driver::base::kobject::{KObjType, KObject, KObjectState};
-use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::spinlock::SpinLock;
 use crate::net::{generate_iface_id, NET_DEVICES};
 use crate::time::Instant;
@@ -15,13 +14,13 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
+use log::debug;
 use smoltcp::wire::HardwareAddress;
 use smoltcp::{
     phy::{self},
     wire::{IpAddress, IpCidr},
 };
 use system_error::SystemError;
-use unified_init::macros::unified_init;
 
 use super::{Iface, IfaceCommon};
 
@@ -76,6 +75,7 @@ impl phy::TxToken for LoopbackTxToken {
         let result = f(buffer.as_mut_slice());
         let mut device = self.driver.inner.lock();
         device.loopback_transmit(buffer);
+        debug!("lo transmit!");
         result
     }
 }
@@ -417,8 +417,9 @@ pub fn loopback_driver_init() {
         .insert(iface.nic_id(), iface.clone());
 }
 
-/// # lo网卡设备的注册函数
-#[unified_init(INITCALL_DEVICE)]
+/// ## lo网卡设备的注册函数
+//TODO: 现在先不用初始化宏进行注册，使virtonet排在网卡列表头，待网络子系统重构后再使用初始化宏并修复该bug
+// #[unified_init(INITCALL_DEVICE)]
 pub fn loopback_init() -> Result<(), SystemError> {
     loopback_probe();
     return Ok(());

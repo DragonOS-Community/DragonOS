@@ -1,13 +1,11 @@
-use alloc::collections::BTreeSet;
 
-use alloc::{sync::{Weak, Arc}, string::String, fmt, vec::Vec};
+use alloc::{sync::Arc, string::String, fmt, vec::Vec};
 
 use smoltcp;
 use system_error::SystemError;
-use crate::net::socket::inet::{AnyInetSocket, InetSocket};
-// use crate::net::socket::inet::AnyInetSocket;
-use crate::{libs::{spinlock::SpinLock, rwlock::RwLock}, net::socket::Socket};
-use crate::net::socket::inet::common::{BoundInner, PortManager};
+use crate::net::socket::inet::InetSocket;
+use crate::libs::{spinlock::SpinLock, rwlock::RwLock};
+use crate::net::socket::inet::common::PortManager;
 
 mod dma;
 pub mod e1000e;

@@ -44,7 +44,7 @@ use crate::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    net::{generate_iface_id, net_core::poll_ifaces_try_lock_onetime, NET_DEVICES},
+    net::{generate_iface_id, net_core::poll_ifaces, NET_DEVICES},
     time::Instant,
 };
 use system_error::SystemError;
@@ -190,7 +190,9 @@ impl VirtioInterface {
 
 impl VirtIODevice for VirtioInterface {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
-        poll_ifaces_try_lock_onetime().ok();
+        // poll_ifaces_try_lock_onetime().ok();
+        log::warn!("VirtioInterface: poll_ifaces_try_lock_onetime -> poll_ifaces");
+        poll_ifaces();
         return Ok(IrqReturn::Handled);
     }
 

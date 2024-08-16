@@ -128,36 +128,33 @@ pub fn poll_ifaces() {
         return;
     }
     for (_, iface) in guard.iter() {
-        let _ = iface.poll();
-        for (_handle, socket) in iface.sockets().lock().iter() {
-
-        }
+        iface.poll();
     }
 }
 
-/// 对ifaces进行轮询，最多对SOCKET_SET尝试times次加锁。
-///
-/// @return 轮询成功，返回Ok(())
-/// @return 加锁超时，返回SystemError::EAGAIN_OR_EWOULDBLOCK
-/// @return 没有网卡，返回SystemError::ENODEV
-pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
-    let mut i = 0;
-    while i < times {
-        let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn Iface>>> =
-            NET_DEVICES.read_irqsave();
-        if guard.len() == 0 {
-            warn!("poll_ifaces: No net driver found!");
-            // 没有网卡，返回错误
-            return Err(SystemError::ENODEV);
-        }
-        for (_, iface) in guard.iter() {
-            iface.poll().ok();
-        }
-        return Ok(());
-    }
-    // 尝试次数用完，返回错误
-    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-}
+// /// 对ifaces进行轮询，最多对SOCKET_SET尝试times次加锁。
+// ///
+// /// @return 轮询成功，返回Ok(())
+// /// @return 加锁超时，返回SystemError::EAGAIN_OR_EWOULDBLOCK
+// /// @return 没有网卡，返回SystemError::ENODEV
+// pub fn poll_ifaces_try_lock(times: u16) -> Result<(), SystemError> {
+//     let mut i = 0;
+//     while i < times {
+//         let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn Iface>>> =
+//             NET_DEVICES.read_irqsave();
+//         if guard.len() == 0 {
+//             warn!("poll_ifaces: No net driver found!");
+//             // 没有网卡，返回错误
+//             return Err(SystemError::ENODEV);
+//         }
+//         for (_, iface) in guard.iter() {
+//             iface.poll();
+//         }
+//         return Ok(());
+//     }
+//     // 尝试次数用完，返回错误
+//     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+// }
 
 // /// 对ifaces进行轮询，最多对SOCKET_SET尝试一次加锁。
 // ///

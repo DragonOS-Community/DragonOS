@@ -6,8 +6,9 @@ use crate::filesystem::vfs::IndexNode;
 use crate::net::event_poll::EPollEventType;
 use crate::libs::rwlock::RwLock;
 use crate::net::net_core::poll_ifaces;
-use crate::net::socket::common::PollUnit;
+use crate::net::socket::common::poll_unit::{WaitQueue, EPollItems};
 use crate::net::socket::Socket;
+use alloc::sync::{Arc, Weak};
 
 pub type SmolUdpSocket = smoltcp::socket::udp::Socket<'static>;
 
@@ -22,22 +23,20 @@ type EP = EPollEventType;
 pub struct UdpSocket {
     inner: RwLock<Option<UdpInner>>,
     nonblock: AtomicBool,
-    poll_unit: PollUnit,
-}
-
-impl Default for UdpSocket {
-    fn default() -> Self {
-        Self::new(false)
-    }
+    epoll_items: EPollItems,
+    wait_queue: WaitQueue,
+    self_ref: Weak<UdpSocket>,
 }
 
 impl UdpSocket {
-    pub fn new(nonblock: bool) -> Self {
-        return Self {
+    pub fn new(nonblock: bool) -> Arc<Self> {
+        return Arc::new_cyclic(|me| Self {
             inner: RwLock::new(Some(UdpInner::Unbound(UnboundUdp::new()))),
             nonblock: AtomicBool::new(nonblock),
-            poll_unit: Default::default(),
-        };
+            wait_queue: WaitQueue::default(),
+            epoll_items: EPollItems::new(),
+            self_ref: me.clone(),
+        });
     }
 
     pub fn is_nonblock(&self) -> bool {
@@ -204,8 +203,16 @@ impl IndexNode for UdpSocket {
 }
 
 impl Socket for UdpSocket {
-    fn poll_unit(&self) -> &PollUnit {
-        &self.poll_unit
+    fn wait_queue(&self) -> &crate::net::socket::common::poll_unit::WaitQueue {
+        &self.wait_queue
+    }
+
+    fn epoll_items(&self) -> &crate::net::socket::common::poll_unit::EPollItems {
+        &self.epoll_items
+    }
+
+    fn update_io_events(&self) -> Result<EPollEventType, SystemError> {
+        todo!()
     }
 
     fn bind(&self, local_endpoint: crate::net::Endpoint) -> Result<(), SystemError> {

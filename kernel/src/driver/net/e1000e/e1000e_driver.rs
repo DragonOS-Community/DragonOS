@@ -28,7 +28,7 @@ use smoltcp::{
     phy,
     wire::HardwareAddress,
 };
-use system_error::SystemError;
+// use system_error::SystemError;
 
 use super::e1000e::{E1000EBuffer, E1000EDevice};
 
@@ -251,7 +251,7 @@ impl Iface for E1000EInterface {
         return self.name.clone();
     }
 
-    fn poll(&self) -> Result<(), SystemError> {
+    fn poll(&self) {
         self.common.poll(self.driver.force_get_mut())
     }
 }

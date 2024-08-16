@@ -19,19 +19,27 @@ use crate::filesystem::vfs::IndexNode;
 
 use super::Socket;
 
-// trait AnyInetSocket {
-//     fn epoll_items(&self) -> &super::common::poll_unit::EPollItems;
-//     fn wait_queue(&self) -> &super::common::poll_unit::WaitQueue;
-//     fn on_iface_events(&self);
-//     fn do_bind(&self, endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError>;
-// }
+pub trait AnyInetSocket {
+    fn epoll_items(&self) -> &super::common::poll_unit::EPollItems;
+    fn wait_queue(&self) -> &super::common::poll_unit::WaitQueue;
+    /// `on_iface_events` 
+    /// 通知socket发生的事件
+    fn on_iface_events(&self);
+    fn do_bind(&self, endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError>;
+}
 
-// #[derive(Debug)]
-// pub enum InetSocket {
-//     // Raw(RawSocket),
-//     Udp(UdpSocket),
-//     Tcp(TcpSocket),
-// }
+#[derive(Debug)]
+pub enum InetSocket {
+    // Raw(RawSocket),
+    Udp(UdpSocket),
+    Tcp(TcpSocket),
+}
+
+impl InetSocket {
+    pub fn on_iface_events(&self) {
+        todo!()
+    }
+}
 
 // impl IndexNode for InetSocket {
     

@@ -82,17 +82,13 @@ pub const SOL_SOCKET: u8 = 1;
 // }
 
 pub trait Socket: IndexNode {
-    /// # `poll_unit`
-    /// 获取socket的poll单元
+    /// # `epoll_items`
+    /// socket的epoll事件集
     fn epoll_items(&self) -> &EPollItems;
 
     /// # `wait_queue`
     /// 获取socket的wait queue
     fn wait_queue(&self) -> &WaitQueue;
-
-    /// # `on_iface_events`
-    /// 通知socket iface事件更新
-    fn on_iface_events(&self);
 
     /// # `connect` 
     /// 对应于POSIX的connect函数，用于连接到指定的远程服务器端点
@@ -159,25 +155,14 @@ pub trait Socket: IndexNode {
     fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
         todo!()
     }
-}
 
-pub trait Poll {
-    fn events(&self) -> EPollEventType;
+    /// # `update_io_events`
+    /// 更新socket的事件。
+    /// 原socket::poll
+    fn update_io_events(&self) -> Result<EPollEventType, SystemError>;
 
-    fn busy_wait<F, R>(&self, mask: EPollEventType, mut f: F) -> Result<R, SystemError>
-    where
-        F: FnMut() -> Result<R, SystemError>,
-    {
-        let wait_queue = WaitQueue::default();
-        loop {
-            match f() {
-                Ok(r) => return Ok(r),
-                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                    wait_queue.wait_for(mask);
-                }
-                Err(e) => return Err(e),
-            }
-        }
+    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
+        Ok(self.update_io_events()?.bits() as usize)
     }
 }
 

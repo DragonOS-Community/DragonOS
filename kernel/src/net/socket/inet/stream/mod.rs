@@ -252,6 +252,20 @@ impl IndexNode for TcpSocket {
 
     fn poll(&self, private_data: &crate::filesystem::vfs::FilePrivateData) -> Result<usize, SystemError> {
         drop(private_data);
+        
+    }
+}
+
+impl Socket for TcpSocket {
+    fn epoll_items(&self) -> &EPollItems {
+        &self.epitems
+    }
+
+    fn wait_queue(&self) -> &WaitQueue {
+        &self.wait_queue
+    }
+
+    fn update_io_events(&self) -> Result<EPollEventType, SystemError> {
         let mut mask = EP::empty();
         let shutdown = self.shutdown.get();
         match self.inner.read().as_ref().expect("Tcp Inner is None") {
@@ -298,20 +312,6 @@ impl IndexNode for TcpSocket {
             }
             _ => Err(EINVAL),
         }
-    }
-}
-
-impl Socket for TcpSocket {
-    fn epoll_items(&self) -> &EPollItems {
-        &self.epitems
-    }
-
-    fn wait_queue(&self) -> &WaitQueue {
-        &self.wait_queue
-    }
-
-    fn on_iface_events(&self) {
-        todo!("TcpSocket::on_iface_events")
     }
 
     fn accept(&self) -> Result<(Arc<dyn IndexNode>, crate::net::Endpoint), SystemError> {
@@ -427,8 +427,18 @@ impl IndexNode for TcpStream {
     //     return Ok(0);
     // }
 
-    fn poll(&self, private_data: &crate::filesystem::vfs::FilePrivateData) -> Result<usize, SystemError> {
-        drop(private_data);
+}
+
+impl Socket for TcpStream {
+    fn epoll_items(&self) -> &EPollItems {
+        &self.epitems
+    }
+
+    fn wait_queue(&self) -> &WaitQueue {
+        &self.wait_queue
+    }
+
+    fn update_io_events(&self) -> Result<EPollEventType, SystemError> {
         self.inner.with(|socket| {
             let mut mask = EPollEventType::empty();
             let shutdown = self.shutdown.get();
@@ -485,19 +495,5 @@ impl IndexNode for TcpStream {
             // TODO socket error
             return Ok(mask.bits() as usize);
         })
-    }
-}
-
-impl Socket for TcpStream {
-    fn epoll_items(&self) -> &EPollItems {
-        &self.epitems
-    }
-
-    fn wait_queue(&self) -> &WaitQueue {
-        &self.wait_queue
-    }
-
-    fn on_iface_events(&self) {
-        todo!("TcpStream::on_iface_events")
     }
 }

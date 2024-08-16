@@ -433,7 +433,7 @@ impl Iface for VirtioInterface {
         return self.iface_name.clone();
     }
 
-    fn poll(&self) -> Result<(), SystemError> {
+    fn poll(&self) {
         self.iface_common.poll(self.device_inner.force_get_mut())
     }
 

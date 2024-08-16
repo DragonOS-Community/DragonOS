@@ -398,7 +398,7 @@ impl Iface for LoopbackInterface {
         smoltcp::wire::EthernetAddress(mac)
     }
 
-    fn poll(&self) -> Result<(), SystemError> {
+    fn poll(&self) {
         self.common.poll(self.driver.force_get_mut())
     }
 }

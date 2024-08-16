@@ -4,7 +4,8 @@ use alloc::{sync::{Weak, Arc}, string::String, fmt, vec::Vec};
 
 use smoltcp;
 use system_error::SystemError;
-use crate::net::socket::inet::AnyInetSocket;
+use crate::net::socket::inet::{AnyInetSocket, InetSocket};
+// use crate::net::socket::inet::AnyInetSocket;
 use crate::{libs::{spinlock::SpinLock, rwlock::RwLock}, net::socket::Socket};
 use crate::net::socket::inet::common::{BoundInner, PortManager};
 
@@ -41,7 +42,7 @@ pub trait Iface: crate::driver::base::device::Device {
     /// ## 返回值
     /// - 成功返回 `Ok(())`
     /// - 如果轮询失败，返回 `Err(SystemError::EAGAIN_OR_EWOULDBLOCK)`，表示需要再次尝试或者操作会阻塞
-    fn poll(&self) -> Result<(), SystemError>;
+    fn poll(&self);
 
     /// # `update_ip_addrs` 
     /// 用于更新接口的 IP 地址
@@ -76,9 +77,13 @@ pub trait Iface: crate::driver::base::device::Device {
 pub struct IfaceCommon {
     iface_id: usize,
     smol_iface: SpinLock<smoltcp::iface::Interface>,
+    /// 存smoltcp网卡的套接字集
     sockets: SpinLock<smoltcp::iface::SocketSet<'static>>,
-    bounds: RwLock<Vec<Arc<dyn AnyInetSocket>>>,
+    /// 存 kernel wrap smoltcp socket 的集合
+    bounds: RwLock<Vec<Arc<InetSocket>>>,
+    /// 端口管理器
     port_manager: PortManager,
+    /// 下次轮询的时间
     poll_at_ms: core::sync::atomic::AtomicU64,
 }
 
@@ -106,7 +111,7 @@ impl IfaceCommon {
         }
     }
 
-    pub fn poll<D>(&self, device: &mut D) -> Result<(), SystemError>
+    pub fn poll<D>(&self, device: &mut D)
     where
         D: smoltcp::phy::Device + ?Sized,
     {
@@ -161,7 +166,6 @@ impl IfaceCommon {
             //     .collect::<Vec<_>>();
             // drop(closed_sockets);
         }
-        return Ok(());
     }
 
     pub fn update_ip_addrs(&self, ip_addrs: &[smoltcp::wire::IpCidr]) -> Result<(), SystemError> {
@@ -181,7 +185,7 @@ impl IfaceCommon {
         return Ok(());
     }
 
-    pub fn bind_socket(&self, socket: Arc<dyn AnyInetSocket>) {
+    pub fn bind_socket(&self, socket: Arc<InetSocket>) {
         self.bounds.write().push(socket);
     }
 }

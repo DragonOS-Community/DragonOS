@@ -24,15 +24,10 @@ use crate::{
         ipc::signal::{AtomicSignal, SigSet, Signal},
         process::ArchPCBInfo,
         CurrentIrqArch,
-    },
-    driver::tty::tty_core::TtyCore,
-    exception::InterruptArch,
-    filesystem::{
+    }, driver::tty::tty_core::TtyCore, exception::InterruptArch, filesystem::{
         procfs::procfs_unregister_pid,
         vfs::{file::FileDescriptorVec, FileType},
-    },
-    ipc::signal_types::{SigInfo, SigPending, SignalStruct},
-    libs::{
+    }, ipc::signal_types::{SigInfo, SigPending, SignalStruct}, libs::{
         align::AlignedBox,
         casting::DowncastArc,
         futex::{
@@ -43,25 +38,16 @@ use crate::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
-    },
-    mm::{
+    }, mm::{
         percpu::{PerCpu, PerCpuVar},
         set_IDLE_PROCESS_ADDRESS_SPACE,
         ucontext::AddressSpace,
         VirtAddr,
-    },
-    net::socket::SocketInode,
-    sched::completion::Completion,
-    sched::{
-        cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag, EnqueueFlag, OnRq, SchedMode,
-        WakeupFlags, __schedule,
-    },
-    smp::{
+    }, net::socket::Socket, sched::{completion::Completion, cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule}, smp::{
         core::smp_get_processor_id,
         cpu::{AtomicProcessorId, ProcessorId},
         kick_cpu,
-    },
-    syscall::{user_access::clear_user, Syscall},
+    }, syscall::{user_access::clear_user, Syscall}
 };
 use timer::AlarmTimer;
 
@@ -903,7 +889,7 @@ impl ProcessControlBlock {
     /// ## 返回值
     ///
     /// Option(&mut Box<dyn Socket>) socket对象的可变引用. 如果文件描述符不是socket，那么返回None
-    pub fn get_socket(&self, fd: i32) -> Option<Arc<SocketInode>> {
+    pub fn get_socket(&self, fd: i32) -> Option<Arc<dyn Socket>> {
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
 
@@ -913,9 +899,9 @@ impl ProcessControlBlock {
         if f.file_type() != FileType::Socket {
             return None;
         }
-        let socket: Arc<SocketInode> = f
+        let socket: Arc<dyn Socket> = f
             .inode()
-            .downcast_arc::<SocketInode>()
+            .downcast_arc::<dyn Socket>()
             .expect("Not a socket inode");
         return Some(socket);
     }

@@ -1,4 +1,4 @@
-use alloc::{collections::LinkedList, sync::{Weak, Arc}, vec::Vec};
+use alloc::{collections::LinkedList, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{libs::{spinlock::SpinLock, wait_queue::EventWaitQueue}, net::event_poll::{EPollEventType, EPollItem, EventPoll}, process::ProcessManager, sched::{schedule, SchedMode}};

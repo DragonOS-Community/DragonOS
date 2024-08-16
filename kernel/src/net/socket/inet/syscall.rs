@@ -1,7 +1,10 @@
 use system_error::SystemError::{self, *};
 use smoltcp;
+use alloc::sync::Arc;
 
-pub fn create_inet_socket(sock_type: crate::net::socket::define::Types, protocol: smoltcp::wire::IpProtocol) -> Result<super::InetSocket, SystemError> {
+use super::AnyInetSocket;
+
+pub fn create_inet_socket(sock_type: crate::net::socket::define::Types, protocol: smoltcp::wire::IpProtocol) -> Result<Arc<dyn AnyInetSocket>, SystemError> {
     use crate::net::socket::define::Types as SocketTypes;
     use smoltcp::wire::IpProtocol::*;
     match protocol {

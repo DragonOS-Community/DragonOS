@@ -522,8 +522,9 @@ impl Syscall {
     pub fn close(fd: usize) -> Result<usize, SystemError> {
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
-
-        fd_table_guard.drop_fd(fd as i32).map(|_| 0)
+        let _file = fd_table_guard.drop_fd(fd as i32)?;
+        drop(fd_table_guard);
+        Ok(0)
     }
 
     /// @brief 发送命令到文件描述符对应的设备，

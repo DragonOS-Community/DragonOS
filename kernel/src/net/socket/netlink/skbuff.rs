@@ -1,5 +1,5 @@
 use alloc::{boxed::Box, sync::Arc};
-use crate::libs::{mutex::Mutex, rwlock::RwLock};
+use crate::{libs::{mutex::Mutex, rwlock::RwLock}, net::socket::SocketOptions};
 use super::af_netlink::{NetlinkSock, NetlinkSocket};
 // 曾用方案：在 smoltcp::PacketBuffer 的基础上封装了一层，用于处理 netlink 协议中网络数据包(skb)的相关操作
 #[derive(Debug)]
@@ -43,7 +43,7 @@ pub struct SkBuff {
 impl SkBuff {
     pub fn new() -> Self {
         SkBuff {
-            sk: Arc::new(Mutex::new(Box::new(NetlinkSock::new()))),
+            sk: Arc::new(Mutex::new(Box::new(NetlinkSock::new(SocketOptions::default())))),
             len: 0,
             pkt_type: 0,
             mark: 0,

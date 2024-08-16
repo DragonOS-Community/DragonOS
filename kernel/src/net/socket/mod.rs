@@ -88,12 +88,12 @@ pub(super) fn new_socket(
         AddressFamily::Netlink => match socket_type {
             PosixSocketType::Raw => {
                 log::debug!("Netlink socket RAW created");
-                return Ok(Box::new(NetlinkSock::new()))
+                return Ok(Box::new(NetlinkSock::new(SocketOptions::default())))
                 
             }
             PosixSocketType::Datagram => {
                 log::debug!("Netlink socket Datagram created");
-                return Ok(Box::new(NetlinkSock::new()))
+                return Ok(Box::new(NetlinkSock::new(SocketOptions::default())))
             }
             _ => {
                 log::warn!("Netlink socket type {:?} is not supported", socket_type);
@@ -106,6 +106,7 @@ pub(super) fn new_socket(
     };
 
     let handle_item = SocketHandleItem::new(Arc::downgrade(&socket.posix_item()));
+    log::info!("Inserting into HANDLE_MAP: key = {:?}, value = {:?}", socket.socket_handle(), handle_item);
     HANDLE_MAP
         .write_irqsave()
         .insert(socket.socket_handle(), handle_item);
@@ -331,7 +332,7 @@ impl SocketInode {
             }
 
             socket.clear_epoll()?;
-
+            log::info!("Removing from HANDLE_MAP: key = {:?}", socket.socket_handle());
             HANDLE_MAP
                 .write_irqsave()
                 .remove(&socket.socket_handle())

@@ -22,6 +22,7 @@ use crate::libs::rwlock::RwLockWriteGuard;
 use crate::libs::spinlock::SpinLock;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::event_poll::{EPollEventType, EPollItem, EventPoll};
+use crate::net::net_core::poll_ifaces;
 use crate::net::socket::handle::GlobalSocketHandle;
 use crate::net::socket::netlink::skbuff::SkBuff;
 use crate::net::syscall::SockAddrNl;
@@ -34,7 +35,7 @@ use crate::{
 };
 use alloc::{boxed::Box, vec::Vec};
 
-use crate::net::socket::{AddressFamily, PosixSocketHandleItem, Socket, SocketMetadata};
+use crate::net::socket::{AddressFamily, PosixSocketHandleItem, Socket, SocketMetadata, SocketOptions, SocketType, SOCKET_SET};
 use lazy_static::lazy_static;
 
 use super::callback::NetlinkCallback;
@@ -307,6 +308,7 @@ fn netlink_insert(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, portid: u32) -> Result
     Ok(())
 }
 fn netlink_bind(sock: Box<dyn Socket>, addr: &SockAddrNl, addr_len: usize) -> Result<(), SystemError> {
+    log::info!("netlink_bind here!");
     let _sk = sock
                 .clone()
                 .cast::<dyn NetlinkSocket>()
@@ -565,6 +567,18 @@ impl LockedNetlinkSock {
     }
 }
 #[derive(Debug)]
+#[derive(Clone)]
+struct NetlinkSockMetadata{
+    
+}
+impl NetlinkSockMetadata{
+    fn new()->NetlinkSockMetadata{
+        NetlinkSockMetadata{
+            
+        }
+    }
+}
+#[derive(Debug)]
 #[cast_to([sync] Socket)]
 #[cast_to([sync] NetlinkSocket)]
 pub struct NetlinkSock {
@@ -586,6 +600,9 @@ pub struct NetlinkSock {
     sk_sndtimeo: i64,
     sk_rcvtimeo: i64,
     callback: Option<&'static dyn NetlinkCallback>,
+    metadata: SocketMetadata,
+    posix_item: Arc<PosixSocketHandleItem>,
+    handle: GlobalSocketHandle,
 }
 impl Socket for NetlinkSock{
     fn as_any(&self) -> &dyn Any {
@@ -645,7 +662,7 @@ impl Socket for NetlinkSock{
     }
 
     fn metadata(&self) -> SocketMetadata{
-        todo!()
+        self.metadata.clone()
     }
 
     fn box_clone(&self) -> Box<dyn Socket>{
@@ -663,7 +680,7 @@ impl Socket for NetlinkSock{
     }
 
     fn socket_handle(&self) -> GlobalSocketHandle{
-        todo!()
+        self.handle
     }
 
     fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
@@ -706,11 +723,18 @@ impl Socket for NetlinkSock{
     }
 
     fn close(&mut self){
-        todo!()
+        let mut socket_set_guard = SOCKET_SET.lock_irqsave();
+        if let smoltcp::socket::Socket::Udp(mut sock) =
+            socket_set_guard.remove(self.handle.smoltcp_handle().unwrap())
+        {
+            sock.close();
+        }
+        drop(socket_set_guard);
+        poll_ifaces();
     }
 
     fn posix_item(&self) -> Arc<PosixSocketHandleItem>{
-        todo!()
+        self.posix_item.clone()
     }
 }
 // TODO: 实现 NetlinkSocket trait
@@ -767,6 +791,9 @@ impl NetlinkSocket for NetlinkSock {
             sk_sndtimeo: self.sk_sndtimeo,
             sk_rcvtimeo: self.sk_rcvtimeo,
             callback: None,
+            metadata: self.metadata.clone(),
+            posix_item: self.posix_item.clone(),
+            handle: self.handle.clone()
         })
     }
     fn portid(&self) -> u32 {
@@ -790,7 +817,22 @@ impl NetlinkSocket for NetlinkSock {
     }
 }
 impl NetlinkSock {
-    pub fn new() -> NetlinkSock {
+    /// 元数据的缓冲区的大小
+    pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
+    /// 默认的接收缓冲区的大小 receive
+    pub const DEFAULT_RX_BUF_SIZE: usize = 512 * 1024;
+    /// 默认的发送缓冲区的大小 transmiss
+    pub const DEFAULT_TX_BUF_SIZE: usize = 512 * 1024;
+    pub fn new(options:SocketOptions) -> NetlinkSock {
+        let metadata = SocketMetadata::new(
+            SocketType::Raw,
+            Self::DEFAULT_RX_BUF_SIZE,
+            Self::DEFAULT_TX_BUF_SIZE,
+            Self::DEFAULT_METADATA_BUF_SIZE,
+            options,
+        );
+        let posix_item = Arc::new(PosixSocketHandleItem::new(None));
+        let handle = crate::net::socket::handle::GlobalSocketHandle::new_kernel_handle();
         NetlinkSock {
             sk: None,
             portid: 0,
@@ -810,6 +852,9 @@ impl NetlinkSock {
             sk_sndtimeo: 0,
             sk_rcvtimeo: 0,
             callback: None,
+            metadata,
+            posix_item,
+            handle
         }
     }
     pub fn get_sk(&self) -> &Weak<dyn NetlinkSocket> {
@@ -843,100 +888,6 @@ impl NetlinkSock {
     }
 }
 
-// impl Socket for NetlinkSock {
-//     fn read(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-//         // Implementation of the function
-//         Ok(0)
-//     }
-//     fn write(&self, buf: &[u8]) -> Result<usize, SystemError> {
-//         // Implementation of the function
-//         Ok(0)
-//     }
-//     fn close(&self) {
-//         // Implementation of the function
-//     }
-//     fn connect(&mut self, _endpoint: crate::net::Endpoint) -> Result<(), SystemError> {
-//         // Implementation of the function
-//         Ok(())
-//     }
-//     fn bind(&mut self, _endpoint: crate::net::Endpoint) -> Result<(), SystemError> {
-//         // Implementation of the function
-//         Ok(())
-//     }
-//     fn shutdown(&mut self, _type: crate::net::ShutdownType) -> Result<(), SystemError> {
-//         // Implementation of the function
-//         Ok(())
-//     }
-//     fn listen(&mut self, _backlog: usize) -> Result<(), SystemError> {
-//         // Implementation of the function
-//         Ok(())
-//     }
-//     fn accept(&mut self) -> Result<(Box<dyn Socket>, crate::net::Endpoint), SystemError> {
-//         // Implementation of the function
-//         Ok((Box::new(NetlinkSock::new()), crate::net::Endpoint::new()))
-//     }
-//     fn endpoint(&self) -> Option<crate::net::Endpoint> {
-//         // Implementation of the function
-//         None
-//     }
-//     fn peer_endpoint(&self) -> Option<crate::net::Endpoint> {
-//         // Implementation of the function
-//         None
-//     }
-//     fn remove_epoll(&mut self, epoll: &alloc::sync::Weak<crate::libs::spinlock::SpinLock<crate::net::event_poll::EventPoll>>) -> Result<(), SystemError> {
-//         // Implementation of the function
-//         Ok(())
-//     }
-//     fn clear_epoll(&mut self) -> Result<(), SystemError> {
-//         // Implementation of the function
-//         Ok(())
-//     }
-//     fn pool(&self) -> Option<crate::libs::pool::Pool> {
-//         // Implementation of the function
-//         None
-//     }
-//     fn ioctl(&self, _request: u32, _arg: u64) -> Result<u64, SystemError> {
-//         // Implementation of the function
-//         Ok(0)
-//     }
-//     fn metadata(&self) -> crate::net::socket::SocketMetadata {
-//         // Implementation of the function
-//         crate::net::socket::SocketMetadata::new()
-//     }
-//     fn box_clone(&self) -> Box<dyn Socket> {
-//         // Implementation of the function
-//         Box::new(NetlinkSock::new())
-//     }
-//     fn setsockopt(
-//             &self,
-//             _level: usize,
-//             _optname: usize,
-//             _optval: &[u8],
-//         ) -> Result<(), SystemError> {
-//         // Implementation of the function
-//         Ok(())
-//     }
-//     fn socket_handle(&self) -> crate::net::socket::handle::GlobalSocketHandle {
-//         // Implementation of the function
-//         crate::net::socket::handle::GlobalSocketHandle::new()
-//     }
-//     fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
-//         // Implementation of the function
-//         Ok(0)
-//     }
-//     fn as_any_ref(&self) -> &dyn Any {
-//         // Implementation of the function
-//         self
-//     }
-//     fn as_any_mut(&mut self) -> &mut dyn Any {
-//         // Implementation of the function
-//         self
-//     }
-//     fn add_epoll(&mut self, epitem: Arc<crate::net::event_poll::EPollItem>) -> Result<(), SystemError> {
-//         // Implementation of the function
-//         Ok(())
-//     }
-// }
 
 
 

@@ -169,6 +169,14 @@ impl TcpSocket {
         return Ok(());
     }
 
+    pub fn check_connect(&self) -> Result<(), SystemError> {
+        match self.inner.read().as_ref().expect("Tcp Inner is None") {
+            Inner::Connecting(_) => Err(EAGAIN_OR_EWOULDBLOCK),
+            Inner::Established(_) => Ok(()), // TODO check established
+            _ => Err(EINVAL), // TODO socket error options
+        }
+    }
+
     pub fn try_recv(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         match self.inner.read().as_ref().expect("Tcp Inner is None") {
             Inner::Established(inner) => {

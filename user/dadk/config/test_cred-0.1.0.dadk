@@ -1,0 +1,23 @@
+{
+  "name": "test_cred",
+  "version": "0.1.0",
+  "description": "测试cred",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "apps/test_cred"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "install": {
+    "in_dragonos_path": "/bin"
+  },
+  "target_arch": ["x86_64"]
+}

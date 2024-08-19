@@ -8,6 +8,8 @@ use alloc::{
 use log::error;
 use system_error::SystemError;
 
+use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
+use crate::filesystem::eventfd::EventFdInode;
 use crate::{
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
@@ -22,8 +24,6 @@ use crate::{
     },
     process::{cred::Cred, ProcessManager},
 };
-
-use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
@@ -513,9 +513,19 @@ impl File {
                 let inode = self.inode.downcast_ref::<SocketInode>().unwrap();
                 let mut socket = inode.inner();
 
-                return socket.remove_epoll(epoll);
+                socket.remove_epoll(epoll)
             }
-            _ => return Err(SystemError::ENOSYS),
+            FileType::Pipe => {
+                let inode = self.inode.downcast_ref::<LockedPipeInode>().unwrap();
+                inode.inner().lock().remove_epoll(epoll)
+            }
+            _ => {
+                let inode = self
+                    .inode
+                    .downcast_ref::<EventFdInode>()
+                    .ok_or(SystemError::ENOSYS)?;
+                inode.remove_epoll(epoll)
+            }
         }
     }
 
@@ -643,14 +653,14 @@ impl FileDescriptorVec {
     /// ## 参数
     ///
     /// - `fd` 文件描述符序号
-    pub fn drop_fd(&mut self, fd: i32) -> Result<(), SystemError> {
+    pub fn drop_fd(&mut self, fd: i32) -> Result<Arc<File>, SystemError> {
         self.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
 
         // 把文件描述符数组对应位置设置为空
         let file = self.fds[fd as usize].take().unwrap();
 
         assert!(Arc::strong_count(&file) == 1);
-        return Ok(());
+        return Ok(file);
     }
 
     #[allow(dead_code)]

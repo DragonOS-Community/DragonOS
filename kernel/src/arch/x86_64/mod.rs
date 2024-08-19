@@ -8,6 +8,7 @@ pub mod fpu;
 pub mod init;
 pub mod interrupt;
 pub mod ipc;
+pub mod kprobe;
 pub mod kvm;
 pub mod libs;
 pub mod mm;

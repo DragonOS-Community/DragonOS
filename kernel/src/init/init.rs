@@ -1,3 +1,4 @@
+use crate::debug::kprobe::kprobe_init;
 use crate::{
     arch::{
         init::{early_setup_arch, setup_arch, setup_arch_post},
@@ -77,7 +78,7 @@ fn do_start_kernel() {
     kthread_init();
     setup_arch_post().expect("setup_arch_post failed");
     clocksource_boot_finish();
-
+    kprobe_init();
     Futex::init();
 
     #[cfg(all(target_arch = "x86_64", feature = "kvm"))]

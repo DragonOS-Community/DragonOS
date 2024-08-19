@@ -1,3 +1,5 @@
+use core::any::Any;
+use kprobe::ProbeArgs;
 use riscv::register::{scause::Scause, sstatus::Sstatus};
 use system_error::SystemError;
 
@@ -159,5 +161,22 @@ impl TrapFrame {
 
     pub fn set_return_value(&mut self, value: usize) {
         self.a0 = value;
+    }
+
+    /// 设置当前的程序计数器
+    pub fn set_pc(&mut self, pc: usize) {
+        self.epc = pc;
+    }
+}
+
+impl ProbeArgs for TrapFrame {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn break_address(&self) -> usize {
+        self.epc
+    }
+    fn debug_address(&self) -> usize {
+        self.epc
     }
 }

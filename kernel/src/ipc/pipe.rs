@@ -16,6 +16,7 @@ use crate::{
 use alloc::{
     collections::LinkedList,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use system_error::SystemError;
 
@@ -105,6 +106,21 @@ impl InnerPipeInode {
 
     fn buf_full(&self) -> bool {
         return self.valid_cnt as usize == PIPE_BUFF_SIZE;
+    }
+
+    pub fn remove_epoll(&self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
+        let is_remove = !self
+            .epitems
+            .lock_irqsave()
+            .extract_if(|x| x.epoll().ptr_eq(epoll))
+            .collect::<Vec<_>>()
+            .is_empty();
+
+        if is_remove {
+            return Ok(());
+        }
+
+        Err(SystemError::ENOENT)
     }
 }
 

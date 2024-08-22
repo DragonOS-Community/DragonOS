@@ -123,7 +123,7 @@ pub struct FATInode {
     dname: DName,
 
     /// 页缓存
-    page_cache: Arc<PageCache>,
+    page_cache: Option<Arc<PageCache>>,
 }
 
 impl FATInode {
@@ -193,8 +193,6 @@ impl LockedFATInode {
             FileType::File
         };
 
-        let mut page_cache = PageCache::default();
-
         let inode: Arc<LockedFATInode> = Arc::new(LockedFATInode(SpinLock::new(FATInode {
             parent,
             self_ref: Weak::default(),
@@ -223,22 +221,17 @@ impl LockedFATInode {
             },
             special_node: None,
             dname,
-            page_cache: Arc::new(PageCache::default()),
+            page_cache: None,
         })));
 
-        page_cache.inode = Some(Arc::downgrade(&inode) as Weak<dyn IndexNode>);
-
-        inode.0.lock().page_cache = Arc::new(page_cache);
+        if !inode.0.lock().inode_type.is_dir() {
+            let page_cache = PageCache::new(Some(Arc::downgrade(&inode) as Weak<dyn IndexNode>));
+            inode.0.lock().page_cache = Some(page_cache);
+        }
 
         inode.0.lock().self_ref = Arc::downgrade(&inode);
 
         inode.0.lock().update_metadata();
-
-        // inode
-        //     .0
-        //     .lock()
-        //     .page_cache
-        //     .set_inode(Arc::downgrade(&inode) as Weak<dyn IndexNode>);
 
         return inode;
     }
@@ -380,7 +373,7 @@ impl FATFileSystem {
             },
             special_node: None,
             dname: DName::default(),
-            page_cache: Arc::new(PageCache::default()),
+            page_cache: None,
         })));
 
         let result: Arc<FATFileSystem> = Arc::new(FATFileSystem {
@@ -1877,7 +1870,7 @@ impl IndexNode for LockedFATInode {
     }
 
     fn page_cache(&self) -> Option<Arc<PageCache>> {
-        Some(self.0.lock().page_cache.clone())
+        self.0.lock().page_cache.clone()
     }
 }
 

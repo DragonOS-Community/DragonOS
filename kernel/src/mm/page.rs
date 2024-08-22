@@ -250,7 +250,7 @@ impl PageReclaimer {
             .page_cache
             .clone()
             .unwrap()
-            .inode
+            .inode()
             .clone()
             .unwrap()
             .upgrade()

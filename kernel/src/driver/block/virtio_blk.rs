@@ -5,6 +5,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use bitmap::traits::BitMapOps;
 use log::{debug, error};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -14,8 +15,9 @@ use crate::{
     driver::{
         base::{
             block::{
-                block_device::{BlockDevice, BlockId, LBA_SIZE},
+                block_device::{BlockDevName, BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE},
                 disk_info::Partition,
+                manager::BlockDevMeta,
             },
             class::Class,
             device::{
@@ -71,11 +73,76 @@ pub fn virtio_blk(transport: VirtIOTransport, dev_id: Arc<DeviceId>) {
     }
 }
 
+static mut VIRTIOBLK_MANAGER: Option<VirtIOBlkManager> = None;
+
+#[inline]
+fn virtioblk_manager() -> &'static VirtIOBlkManager {
+    unsafe { VIRTIOBLK_MANAGER.as_ref().unwrap() }
+}
+
+#[unified_init(INITCALL_POSTCORE)]
+fn virtioblk_manager_init() -> Result<(), SystemError> {
+    unsafe {
+        VIRTIOBLK_MANAGER = Some(VirtIOBlkManager::new());
+    }
+    Ok(())
+}
+
+pub struct VirtIOBlkManager {
+    inner: SpinLock<InnerVirtIOBlkManager>,
+}
+
+struct InnerVirtIOBlkManager {
+    id_bmp: bitmap::StaticBitmap<{ VirtIOBlkManager::MAX_DEVICES }>,
+    devname: [Option<BlockDevName>; VirtIOBlkManager::MAX_DEVICES],
+}
+
+impl VirtIOBlkManager {
+    pub const MAX_DEVICES: usize = 25;
+
+    pub fn new() -> Self {
+        Self {
+            inner: SpinLock::new(InnerVirtIOBlkManager {
+                id_bmp: bitmap::StaticBitmap::new(),
+                devname: [const { None }; Self::MAX_DEVICES],
+            }),
+        }
+    }
+
+    fn inner(&self) -> SpinLockGuard<InnerVirtIOBlkManager> {
+        self.inner.lock()
+    }
+
+    pub fn alloc_id(&self) -> Option<BlockDevName> {
+        let mut inner = self.inner();
+        let idx = inner.id_bmp.first_false_index()?;
+        inner.id_bmp.set(idx, true);
+        let name = Self::format_name(idx);
+        inner.devname[idx] = Some(name.clone());
+        Some(name)
+    }
+
+    /// Generate a new block device name like 'vda', 'vdb', etc.
+    fn format_name(id: usize) -> BlockDevName {
+        let x = (b'a' + id as u8) as char;
+        BlockDevName::new(format!("vd{}", x), id)
+    }
+
+    pub fn free_id(&self, id: usize) {
+        if id >= Self::MAX_DEVICES {
+            return;
+        }
+        self.inner().id_bmp.set(id, false);
+        self.inner().devname[id] = None;
+    }
+}
+
 /// virtio block device
 #[derive(Debug)]
 #[cast_to([sync] VirtIODevice)]
 #[cast_to([sync] Device)]
 pub struct VirtIOBlkDevice {
+    blkdev_meta: BlockDevMeta,
     dev_id: Arc<DeviceId>,
     inner: SpinLock<InnerVirtIOBlkDevice>,
     locked_kobj_state: LockedKObjectState,
@@ -87,6 +154,7 @@ unsafe impl Sync for VirtIOBlkDevice {}
 
 impl VirtIOBlkDevice {
     pub fn new(transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {
+        let devname = virtioblk_manager().alloc_id()?;
         let irq = transport.irq().map(|irq| IrqNumber::new(irq.data()));
         let device_inner = VirtIOBlk::<HalImpl, VirtIOTransport>::new(transport);
         if let Err(e) = device_inner {
@@ -97,6 +165,7 @@ impl VirtIOBlkDevice {
         let mut device_inner: VirtIOBlk<HalImpl, VirtIOTransport> = device_inner.unwrap();
         device_inner.enable_interrupts();
         let dev = Arc::new_cyclic(|self_ref| Self {
+            blkdev_meta: BlockDevMeta::new(devname),
             self_ref: self_ref.clone(),
             dev_id,
             locked_kobj_state: LockedKObjectState::default(),
@@ -123,6 +192,18 @@ impl VirtIOBlkDevice {
 }
 
 impl BlockDevice for VirtIOBlkDevice {
+    fn dev_name(&self) -> &BlockDevName {
+        &self.blkdev_meta.devname
+    }
+
+    fn blkdev_meta(&self) -> &BlockDevMeta {
+        &self.blkdev_meta
+    }
+
+    fn disk_range(&self) -> GeneralBlockRange {
+        todo!("Get virtio blk disk range")
+    }
+
     fn read_at_sync(
         &self,
         lba_id_start: BlockId,

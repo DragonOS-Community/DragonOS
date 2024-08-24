@@ -6,6 +6,7 @@ use core::ops::Deref;
 use core::{any::Any, fmt::Debug, hash::Hash};
 use core::mem;
 
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 
 use hashbrown::HashMap;
@@ -16,15 +17,16 @@ use num::Zero;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
-use crate::filesystem::vfs::{FilePrivateData, IndexNode};
+use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode};
 use crate::include::bindings::bindings::{ECONNREFUSED, __WORDSIZE};
 use crate::libs::mutex::Mutex;
 use crate::libs::rwlock::RwLockWriteGuard;
-use crate::libs::spinlock::SpinLock;
+use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::event_poll::{EPollEventType, EPollItem, EventPoll};
 use crate::net::net_core::poll_ifaces;
 use crate::net::socket::common::poll_unit::{self, EPollItems};
+use crate::net::socket::common::Shutdown;
 use crate::net::socket::netlink::skbuff::SkBuff;
 use crate::net::syscall::SockAddrNl;
 use crate::net::Endpoint;
@@ -307,13 +309,9 @@ fn netlink_insert(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, portid: u32) -> Result
     
     Ok(())
 }
-fn netlink_bind(sock: Box<dyn Socket>, addr: &SockAddrNl, addr_len: usize) -> Result<(), SystemError> {
+fn netlink_bind(sock: Arc<Mutex<Box<dyn NetlinkSocket>>>, addr: &SockAddrNl, addr_len: usize) -> Result<(), SystemError> {
     log::info!("netlink_bind here!");
-    let _sk = sock
-                .clone()
-                .cast::<dyn NetlinkSocket>()
-                .map_err(|_| SystemError::EINVAL)?;
-    let sk = Arc::new(Mutex::new(_sk));
+    let sk = Arc::clone(&sock);
     // todo: net namespace支持
     // let net = sock_net(sk);
     let nlk: Arc<NetlinkSock> = Arc::clone(&sk).arc_any().downcast().map_err(|_| SystemError::EINVAL)?; 
@@ -413,7 +411,7 @@ pub enum Error {
 }
 
 // netlink机制特定的内核抽象，不同于标准的trait Socket
-pub trait NetlinkSocket: Any + Send + Sync + Debug + Socket {
+pub trait NetlinkSocket: Socket {
     // fn sk_prot(&self) -> &dyn proto;
     fn sk_family(&self) -> i32;
     fn sk_state(&self) -> NetlinkState;
@@ -425,7 +423,6 @@ pub trait NetlinkSocket: Any + Send + Sync + Debug + Socket {
     fn sk_data_ready(&self);
     fn is_kernel(&self) -> bool;
     fn equals(&self, other: Option<Arc<Mutex<Box<dyn NetlinkSocket>>>>) -> bool;
-    fn clone_box(&self) -> Box<dyn NetlinkSocket>;
     fn portid(&self) -> u32;
     fn ngroups(&self) -> u64;
     fn groups(&self) -> Vec<u64>;
@@ -433,129 +430,6 @@ pub trait NetlinkSocket: Any + Send + Sync + Debug + Socket {
     fn sock_sndtimeo(&self, noblock: bool) -> i64;
 }
 
-impl Clone for Box<dyn NetlinkSocket> {
-    fn clone(&self) -> Box<dyn NetlinkSocket> {
-        self.clone_box()
-    }
-}
-
-// impl<T: NetlinkSocket> Socket for T {
-//     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
-//         todo!()
-//     }
-//     fn write(&self, buf: &[u8], to: Option<Endpoint>) -> Result<usize, SystemError>{
-//         // Implementation of the function
-//         Ok(0)
-//     }
-//     fn connect(&mut self, _endpoint: Endpoint) -> Result<(), SystemError>{
-//         // Implementation of the function
-//         Ok(())
-//     }
-//     fn bind(&mut self, _endpoint: Endpoint) -> Result<(), SystemError> {
-//         return Ok(())
-//     }
-//     fn shutdown(&mut self, _type: ShutdownType) -> Result<(), SystemError> {
-//         Err(SystemError::ENOSYS)
-//     }
-//     fn listen(&mut self, _backlog: usize) -> Result<(), SystemError> {
-//         Err(SystemError::ENOSYS)
-//     }
-//     fn accept(&mut self) -> Result<(Box<dyn Socket>, Endpoint), SystemError> {
-//         Err(SystemError::ENOSYS)
-//     }
-
-//     fn endpoint(&self) -> Option<Endpoint> {
-//         None
-//     }
-
-
-//     fn peer_endpoint(&self) -> Option<Endpoint> {
-//         None
-//     }
-
-//     fn poll(&self) -> EPollEventType {
-//         EPollEventType::empty()
-//     }
-
-//     fn ioctl(
-//         &self,
-//         _cmd: usize,
-//         _arg0: usize,
-//         _arg1: usize,
-//         _arg2: usize,
-//     ) -> Result<usize, SystemError> {
-//         Ok(0)
-//     }
-
-//     fn metadata(&self) -> SocketMetadata{
-//         todo!()
-//     }
-
-//     fn box_clone(&self) -> Box<dyn Socket>{
-//         todo!()
-//     }
-
-//     fn setsockopt(
-//         &self,
-//         _level: usize,
-//         _optname: usize,
-//         _optval: &[u8],
-//     ) -> Result<(), SystemError> {
-//         warn!("setsockopt is not implemented");
-//         Ok(())
-//     }
-
-//     fn socket_handle(&self) -> GlobalSocketHandle{
-//         todo!()
-//     }
-
-//     fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
-//         todo!()
-//     }
-
-//     fn as_any_ref(&self) -> &dyn Any{
-//         self
-//     }
-
-//     fn as_any_mut(&mut self) -> &mut dyn Any{
-//         self
-//     }
-
-//     fn add_epoll(&mut self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
-//         let posix_item = self.posix_item();
-//         posix_item.add_epoll(epitem);
-//         Ok(())
-//     }
-
-//     fn remove_epoll(&mut self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
-//         let posix_item = self.posix_item();
-//         posix_item.remove_epoll(epoll)?;
-
-//         Ok(())
-//     }
-
-//     fn clear_epoll(&mut self) -> Result<(), SystemError> {
-//         let posix_item = self.posix_item();
-
-//         for epitem in posix_item.epitems.lock_irqsave().iter() {
-//             let epoll = epitem.epoll();
-
-//             if let Some(epoll) = epoll.upgrade() {
-//                 EventPoll::ep_remove(&mut epoll.lock_irqsave(), epitem.fd(), None)?;
-//             }
-//         }
-
-//         Ok(())
-//     }
-
-//     fn close(&mut self){
-//         todo!()
-//     }
-
-//     fn posix_item(&self) -> Arc<PosixSocketHandleItem>{
-//         todo!()
-//     }
-// }
 /* linux：struct sock has to be the first member of netlink_sock */
 // linux 6.1.9中的netlink_sock结构体里，sock是一个很大的结构体，这里简化
 // 意义是netlink_sock（NetlinkSock）是一个sock（NetlinkSocket）
@@ -578,7 +452,7 @@ impl NetlinkSockMetadata{
         }
     }
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[cast_to([sync] Socket)]
 #[cast_to([sync] NetlinkSocket)]
 pub struct NetlinkSock {
@@ -600,38 +474,35 @@ pub struct NetlinkSock {
     sk_sndtimeo: i64,
     sk_rcvtimeo: i64,
     callback: Option<&'static dyn NetlinkCallback>,
-    metadata: SocketMetadata,
-    posix_item: Arc<PosixSocketHandleItem>,
 }
 impl Socket for NetlinkSock{
     fn connect(&self, _endpoint: Endpoint) -> Result<(), SystemError>{
         // Implementation of the function
         Ok(())
     }
+    fn shutdown(&self, _type: Shutdown) -> Result<(), SystemError> {
+        todo!()
+    }
     fn bind(&self, _endpoint: Endpoint) -> Result<(), SystemError> {
         log::debug!("NetlinkSock bind to {:?}", _endpoint);
         if let Some(Endpoint::Netlink(Some(netlink)))= self.endpoint(){
             let addr = netlink.addr;
             let addr_len = netlink.addr_len;
-            let _ = netlink_bind(self.box_clone(), &addr, addr_len);
+            let sock: Arc<Mutex<Box<dyn NetlinkSocket>>> = Arc::new(Mutex::new(Box::new(self.clone())));
+            let _ = netlink_bind(sock, &addr, addr_len);
         }
         return Ok(())
     }
-    fn shutdown(&mut self, _type: ShutdownType) -> Result<(), SystemError> {
-        Err(SystemError::ENOSYS)
-    }
     fn listen(&self, _backlog: usize) -> Result<(), SystemError> {
-        Err(SystemError::ENOSYS)
+        todo!()
     }
     fn accept(&self) -> Result<(Arc<dyn IndexNode>, Endpoint), SystemError> {
-        Err(SystemError::ENOSYS)
+        todo!()
     }
 
     fn endpoint(&self) -> Option<Endpoint> {
         None
     }
-
-
     fn peer_endpoint(&self) -> Option<Endpoint> {
         None
     }
@@ -651,6 +522,41 @@ impl Socket for NetlinkSock{
     }
     fn update_io_events(&self) -> Result<EPollEventType, SystemError>{
         todo!()
+    }
+    fn as_any(&self) -> &dyn Any{
+        self
+    }
+}
+impl IndexNode for NetlinkSock{
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError>{
+        // Implementation of the function
+        Ok(0)
+    }
+    fn write_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError>{
+        // Implementation of the function
+        Ok(0)
+    }
+    fn fs(&self) -> Arc<dyn FileSystem>{
+        todo!()
+    }
+    fn as_any_ref(&self) -> &dyn Any{
+        self
+    }
+    fn list(&self) -> Result<Vec<String>, SystemError>{
+        // Implementation of the function
+        Ok(Vec::new())
     }
 }
 // TODO: 实现 NetlinkSocket trait
@@ -687,31 +593,6 @@ impl NetlinkSocket for NetlinkSock {
             false
         }
     }
-    fn clone_box(&self) -> Box<dyn NetlinkSocket> {
-        Box::new(NetlinkSock {
-            sk: self.sk.clone(),
-            portid: self.portid,
-            node: self.node.clone(),
-            dst_portid: self.dst_portid,
-            dst_group: self.dst_group,
-            flags: self.flags,
-            subscriptions: self.subscriptions,
-            ngroups: self.ngroups,
-            groups: self.groups.clone(),
-            bound: self.bound,
-            state: self.state,
-            max_recvmsg_len: self.max_recvmsg_len,
-            dump_done_errno: self.dump_done_errno,
-            cb_running: self.cb_running,
-            queue: self.queue.clone(),
-            sk_sndtimeo: self.sk_sndtimeo,
-            sk_rcvtimeo: self.sk_rcvtimeo,
-            callback: None,
-            metadata: self.metadata.clone(),
-            posix_item: self.posix_item.clone(),
-            handle: self.handle.clone()
-        })
-    }
     fn portid(&self) -> u32 {
         0
     }
@@ -740,14 +621,6 @@ impl NetlinkSock {
     /// 默认的发送缓冲区的大小 transmiss
     pub const DEFAULT_TX_BUF_SIZE: usize = 512 * 1024;
     pub fn new(options:SocketOptions) -> NetlinkSock {
-        let metadata = SocketMetadata::new(
-            SocketType::Raw,
-            Self::DEFAULT_RX_BUF_SIZE,
-            Self::DEFAULT_TX_BUF_SIZE,
-            Self::DEFAULT_METADATA_BUF_SIZE,
-            options,
-        );
-        let posix_item = Arc::new(PosixSocketHandleItem::new(None));
         NetlinkSock {
             sk: None,
             portid: 0,
@@ -767,8 +640,6 @@ impl NetlinkSock {
             sk_sndtimeo: 0,
             sk_rcvtimeo: 0,
             callback: None,
-            metadata,
-            posix_item,
         }
     }
     pub fn get_sk(&self) -> &Weak<dyn NetlinkSocket> {
@@ -988,12 +859,12 @@ pub fn netlink_broadcast<'a>(
         let _ = do_one_broadcast(Arc::clone(sk), &mut info);
     }
 
-    consume_skb(info.skb);
+    drop(info.skb);
 
     if info.delivery_failure != 0 {
         return Err(SystemError::ENOBUFS);
     }
-    consume_skb(info.skb_2);
+    drop(info.skb_2);
 
     if info.delivered != 0 {
         if info.congested != 0 {

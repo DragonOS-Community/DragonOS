@@ -3,6 +3,7 @@ use log::{debug, info, warn};
 use smoltcp::{socket::dhcpv4, wire};
 use system_error::SystemError;
 
+use crate::libs::rwlock::RwLock;
 use crate::{
     driver::net::Iface,
     libs::rwlock::RwLockReadGuard,
@@ -12,7 +13,9 @@ use crate::{
 
 use super::{
     event_poll::{EPollEventType, EventPoll},
-    socket::{handle::GlobalSocketHandle, inet::TcpSocket, HANDLE_MAP, SOCKET_SET},
+    socket::{
+        handle::GlobalSocketHandle, inet::TcpSocket, netlink::skbuff::SkBuff
+    },
 };
 
 /// The network poll function, which will be called by timer.
@@ -44,7 +47,9 @@ pub fn net_init() -> Result<(), SystemError> {
 fn dhcp_query() -> Result<(), SystemError> {
     let binding = NET_DEVICES.write_irqsave();
 
-    let net_face = binding.get(&0).ok_or(SystemError::ENODEV)?.clone();
+    //由于现在os未实现在用户态为网卡动态分配内存，而lo网卡的id最先分配且ip固定不能被分配
+    //所以特判取用id为1的网卡（也就是virto_net）
+    let net_face = binding.get(&1).ok_or(SystemError::ENODEV)?.clone();
 
     drop(binding);
 

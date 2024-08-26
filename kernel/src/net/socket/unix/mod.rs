@@ -1,3 +1,5 @@
+use core::any::Any;
+
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
@@ -51,7 +53,6 @@ impl StreamSocket {
 }
 
 impl Socket for StreamSocket {
-
     fn socket_handle(&self) -> GlobalSocketHandle {
         self.handle
     }
@@ -164,7 +165,6 @@ impl SeqpacketSocket {
 }
 
 impl Socket for SeqpacketSocket {
-
     fn close(&mut self) {}
 
     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {

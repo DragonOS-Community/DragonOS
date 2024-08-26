@@ -9,7 +9,9 @@ use alloc::{
 };
 use common::poll_unit::{EPollItems, WaitQueue};
 use hashbrown::HashMap;
+use intertrait::CastFromSync;
 use log::warn;
+use netlink::af_netlink::NetlinkSock;
 use smoltcp::{
     iface::SocketSet,
     socket::{self, raw, tcp, udp},
@@ -41,6 +43,7 @@ use super::{
 };
 
 pub mod inet;
+pub mod netlink;
 pub mod unix;
 pub mod define;
 pub mod common;
@@ -81,7 +84,7 @@ pub const SOL_SOCKET: u8 = 1;
 //     Ok(socket)
 // }
 
-pub trait Socket: IndexNode {
+pub trait Socket: IndexNode{
     /// # `epoll_items`
     /// socket的epoll事件集
     fn epoll_items(&self) -> &EPollItems;
@@ -164,6 +167,8 @@ pub trait Socket: IndexNode {
     fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
         Ok(self.update_io_events()?.bits() as usize)
     }
+
+    fn as_any(&self) -> &dyn Any;
 }
 
 bitflags! {

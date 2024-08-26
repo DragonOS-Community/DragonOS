@@ -1,6 +1,8 @@
 use core::intrinsics::likely;
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicBool, Ordering};
+use x86_64::registers::control::Cr3Flags;
+use x86_64::structures::paging::PhysFrame;
 
 use crate::arch::process::table::USER_DS;
 use crate::arch::vm::mmu::KvmMmu;
@@ -1046,9 +1048,10 @@ impl KvmFunc for VmxKvmFunc {
 
         vcpu.arch.clear_dirty();
 
-        let cr3 = Cr3::read().1;
+        let cr3: (PhysFrame,Cr3Flags) = Cr3::read();
         if unlikely(cr3 != vcpu.vmx().loaded_vmcs().host_state.cr3) {
-            VmxAsm::vmx_vmwrite(host::CR3, cr3.bits());
+            let cr3_combined: u64 = (cr3.0.start_address().as_u64() & 0xFFFF_FFFF_FFFF_F000) | (cr3.1.bits() & 0xFFF);
+            VmxAsm::vmx_vmwrite(host::CR3, cr3_combined);
             vcpu.vmx().loaded_vmcs().host_state.cr3 = cr3;
         }
 
@@ -2339,8 +2342,9 @@ impl Vmx {
 
         VmxAsm::vmx_vmwrite(host::CR0, unsafe { cr0() }.bits() as u64);
 
-        let cr3 = Cr3::read().1;
-        VmxAsm::vmx_vmwrite(host::CR3, cr3.bits());
+        let cr3: (PhysFrame, Cr3Flags) = Cr3::read();
+        let cr3_combined: u64 = (cr3.0.start_address().as_u64() & 0xFFFF_FFFF_FFFF_F000) | (cr3.1.bits() & 0xFFF);
+        VmxAsm::vmx_vmwrite(host::CR3, cr3_combined);
         loaded_vmcs_host_state.cr3 = cr3;
 
         let cr4 = unsafe { cr4() };

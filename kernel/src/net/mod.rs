@@ -4,6 +4,7 @@ use core::{
 };
 
 use alloc::{collections::BTreeMap, sync::Arc};
+use socket::netlink::endpoint::NetlinkEndpoint;
 use socket::Socket;
 
 use crate::{driver::net::Iface, libs::rwlock::RwLock};
@@ -35,6 +36,8 @@ pub enum Endpoint {
     /// inode端点
     Inode(Arc<dyn Socket>),
     // todo: 增加NetLink机制后，增加NetLink端点
+    /// NetLink端点
+    Netlink(Option<NetlinkEndpoint>),
 }
 
 /// @brief 链路层端点

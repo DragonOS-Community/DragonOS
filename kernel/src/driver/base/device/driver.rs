@@ -2,6 +2,8 @@ use super::{
     bus::{bus_manager, Bus},
     Device, DeviceMatchName, DeviceMatcher, IdTable,
 };
+use crate::driver::base::uevent::kobject_uevent::kobject_uevent;
+use crate::driver::base::uevent::KobjectAction;
 use crate::{
     driver::base::{
         device::{bus::BusNotifyEvent, dd::DeviceAttrCoredump, device_manager},
@@ -17,7 +19,6 @@ use alloc::{
 use core::fmt::Debug;
 use log::error;
 use system_error::SystemError;
-
 /// @brief: Driver error
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -218,7 +219,9 @@ impl DriverManager {
                 bus_manager().remove_driver(&driver);
             })?;
 
-        // todo: 发送uevent
+        // todo: 发送uevent，类型问题
+        let _ = kobject_uevent(driver.clone() as Arc<dyn KObject>, KobjectAction::KOBJADD);
+        // deferred_probe_extend_timeout();
 
         return Ok(());
     }

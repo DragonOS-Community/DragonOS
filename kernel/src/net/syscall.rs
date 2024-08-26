@@ -14,12 +14,14 @@ use crate::{
     },
     libs::spinlock::SpinLockGuard,
     mm::{verify_area, VirtAddr},
+    net::socket::{netlink::af_netlink::NetlinkSock, AddressFamily, SOL_SOCKET},
     net::{socket::{AddressFamily, SOL_SOCKET}, SocketOptionsLevel},
     process::ProcessManager,
     syscall::Syscall,
 };
 
 use super::{
+    socket::{netlink::endpoint::NetlinkEndpoint, new_socket, PosixSocketType, Socket, SocketInode},
     socket::{new_unbound_socket, PosixSocketType, Socket, SocketInode},
     Endpoint, Protocol, ShutdownType,
 };
@@ -39,6 +41,8 @@ impl Syscall {
         socket_type: usize,
         protocol: usize,
     ) -> Result<usize, SystemError> {
+        // 打印收到的参数
+        log::debug!("socket: address_family={:?}, socket_type={:?}, protocol={:?}", address_family, socket_type, protocol);
         let address_family = AddressFamily::try_from(address_family as u16)?;
         let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
         let protocol = Protocol::from(protocol as u8);
@@ -50,7 +54,7 @@ impl Syscall {
         // 把socket添加到当前进程的文件描述符表中
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
-        let fd = fd_table_guard.alloc_fd(f, None).map(|x| x as usize);
+        let fd: Result<usize, SystemError> = fd_table_guard.alloc_fd(f, None).map(|x| x as usize);
         drop(fd_table_guard);
         return fd;
     }
@@ -215,11 +219,27 @@ impl Syscall {
     ///
     /// @return 成功返回0，失败返回错误码
     pub fn bind(fd: usize, addr: *const SockAddr, addrlen: usize) -> Result<usize, SystemError> {
+        // 打印收到的参数
+        log::debug!("bind: fd={:?}, family={:?}, addrlen={:?}", fd, (unsafe{addr.as_ref().unwrap().family}), addrlen);
         let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
         let socket: Arc<SocketInode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
+        log::debug!("bind: socket={:?}", socket);
         let mut socket = unsafe { socket.inner_no_preempt() };
+        // 解锁 SpinLockGuard 并获取 Box<dyn Socket>
+        let socket_box: &Box<dyn Socket> = &*socket;
+
+        // 解引用 Box 并调用 as_any 方法
+        let socket_ref: &dyn Socket = &**socket_box;
+
+        // 打印 dyn Socket 对象的具体类型
+        if let Some(socket_any) = socket_ref.as_any().downcast_ref::<NetlinkSock>() {
+            log::debug!("Socket type: NetlinkSock");
+        } else {
+            log::debug!("Socket type: Unknown: {:?}", socket_ref);
+        }
+        log::debug!("bind: socket={:?}", socket);
         socket.bind(endpoint)?;
         Ok(0)
     }
@@ -536,10 +556,10 @@ pub struct SockAddrLl {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SockAddrNl {
-    nl_family: u16,
-    nl_pad: u16,
-    nl_pid: u32,
-    nl_groups: u32,
+    pub nl_family: AddressFamily,
+    pub nl_pad: u16,
+    pub nl_pid: u32,
+    pub nl_groups: u32,
 }
 
 #[repr(C)]
@@ -614,7 +634,8 @@ impl SockAddr {
                 }
                 AddressFamily::Netlink => {
                     // TODO: support netlink socket
-                    return Err(SystemError::EINVAL);
+                    let addr: SockAddrNl = addr.addr_nl;
+                    return Ok(Endpoint::Netlink(Some(NetlinkEndpoint::new(addr,len))));
                 }
                 _ => {
                     return Err(SystemError::EINVAL);

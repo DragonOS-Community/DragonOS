@@ -236,7 +236,14 @@ impl File {
 
         let len = self
             .inode
-            .read_at(offset, len, buf, self.private_data.lock())?;
+            .read_at(offset, len, buf, self.private_data.lock())
+            .map_err(|e| {
+                if e == SystemError::ERESTARTSYS {
+                    SystemError::EINTR
+                } else {
+                    e
+                }
+            })?;
 
         if update_offset {
             self.offset
@@ -261,11 +268,24 @@ impl File {
 
         // 如果文件指针已经超过了文件大小，则需要扩展文件大小
         if offset > self.inode.metadata()?.size as usize {
-            self.inode.resize(offset)?;
+            self.inode.resize(offset).map_err(|e| {
+                if e == SystemError::ERESTARTSYS {
+                    SystemError::EINTR
+                } else {
+                    e
+                }
+            })?;
         }
         let len = self
             .inode
-            .write_at(offset, len, buf, self.private_data.lock())?;
+            .write_at(offset, len, buf, self.private_data.lock())
+            .map_err(|e| {
+                if e == SystemError::ERESTARTSYS {
+                    SystemError::EINTR
+                } else {
+                    e
+                }
+            })?;
 
         if update_offset {
             self.offset
@@ -555,7 +575,11 @@ pub struct FileDescriptorVec {
     /// 当前进程打开的文件描述符
     fds: Vec<Option<Arc<File>>>,
 }
-
+impl Default for FileDescriptorVec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl FileDescriptorVec {
     pub const PROCESS_MAX_FD: usize = 1024;
 

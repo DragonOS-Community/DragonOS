@@ -975,6 +975,14 @@ impl ProcessControlBlock {
         return None;
     }
 
+    /// 判断当前进程是否有未处理的信号
+    pub fn has_pending_signal(&self) -> bool {
+        let sig_info = self.sig_info_irqsave();
+        let has_pending = sig_info.sig_pending().has_pending();
+        drop(sig_info);
+        return has_pending;
+    }
+
     pub fn sig_struct(&self) -> SpinLockGuard<SignalStruct> {
         self.sig_struct.lock_irqsave()
     }

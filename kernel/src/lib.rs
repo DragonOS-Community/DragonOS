@@ -12,6 +12,7 @@
 #![feature(c_void_variant)]
 #![feature(extract_if)]
 #![feature(fn_align)]
+#![feature(linked_list_retain)]
 #![feature(naked_functions)]
 #![feature(new_uninit)]
 #![feature(ptr_internals)]
@@ -83,6 +84,8 @@ extern crate x86;
 extern crate klog_types;
 extern crate uefi;
 extern crate uefi_raw;
+#[macro_use]
+extern crate wait_queue_macros;
 
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
 

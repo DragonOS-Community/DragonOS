@@ -1,50 +1,62 @@
+use alloc::vec::Vec;
 use core::{hash::Hash, sync::atomic::AtomicU32};
+use system_error::SystemError;
 
 use alloc::sync::Arc;
 use hashbrown::HashMap;
 use log::warn;
 
 use super::user_namespace::UserNamespace;
-use crate::namespace::ucount::rlimit_type::UCOUNT_RLIMIT_COUNTS;
-use crate::namespace::ucount::UcountType::UCOUNT_COUNTS;
+use crate::namespace::ucount::RlimiType::UcountRlimitCounts;
+use crate::namespace::ucount::UcountType::UcountCounts;
 use crate::{include::bindings::bindings::uid_t, libs::mutex::Mutex};
 
 #[derive(Clone, Copy)]
 pub enum UcountType {
-    UCOUNT_USER_NAMESPACES = 1,
-    UCOUNT_PID_NAMESPACES = 2,
-    UCOUNT_UTS_NAMESPACES = 3,
-    UCOUNT_IPC_NAMESPACES = 4,
-    UCOUNT_NET_NAMESPACES = 5,
-    UCOUNT_MNT_NAMESPACES = 6,
-    UCOUNT_CGROUP_NAMESPACES = 7,
-    UCOUNT_TIME_NAMESPACES = 8,
-    UCOUNT_COUNTS = 9,
+    UcountUserNamespaces = 1,
+    UcountPidNamespaces = 2,
+    UcountUtsNamespaces = 3,
+    UcountIpcNamespaces = 4,
+    UcountNetNamespaces = 5,
+    UcountMntNamespaces = 6,
+    UcountCgroupNamespaces = 7,
+    UcountTimeNamespaces = 8,
+    UcountCounts = 9,
 }
 
-pub enum rlimit_type {
-    UCOUNT_RLIMIT_NPROC = 1,
-    UCOUNT_RLIMIT_MSGQUEUE = 2,
-    UCOUNT_RLIMIT_SIGPENDING = 3,
-    UCOUNT_RLIMIT_MEMLOCK = 4,
-    UCOUNT_RLIMIT_COUNTS = 5,
+pub enum RlimiType {
+    UcountRlimitNproc = 1,
+    UcountRlimitMsgqueue = 2,
+    UcountRlimitSigpending = 3,
+    UcountRlimitMemlock = 4,
+    UcountRlimitCounts = 5,
 }
 
 lazy_static! {
     static ref COUNT_MANAGER: Arc<CountManager> = Arc::new(CountManager::new());
 }
 
+#[derive(Debug)]
 pub struct UCounts {
     /// 对应的user_namespace
     ns: Arc<UserNamespace>,
     /// 用户标识符
     uid: uid_t,
     count: AtomicU32,
-    ucount: [AtomicU32; UCOUNT_COUNTS as usize],
-    rlimit: [AtomicU32; UCOUNT_RLIMIT_COUNTS as usize],
+    ucount: Vec<AtomicU32>, //[AtomicU32; UCOUNT_COUNTS as usize],
+    rlimit: Vec<AtomicU32>, //[AtomicU32; UCOUNT_RLIMIT_COUNTS as usize],
 }
 
 impl UCounts {
+    pub fn new() -> Result<Self, SystemError> {
+        Ok(Self {
+            ns: Arc::new(UserNamespace::new()?),
+            uid: 0,
+            count: AtomicU32::new(1),
+            ucount: Vec::new(),
+            rlimit: Vec::new(),
+        })
+    }
     fn alloc_ucounts(&self, ns: Arc<UserNamespace>, uid: uid_t) -> Arc<Self> {
         let mut counts = COUNT_MANAGER.counts.lock();
         let key = UKey {
@@ -60,8 +72,8 @@ impl UCounts {
                 ns,
                 uid,
                 count: AtomicU32::new(1),
-                ucount: Default::default(),
-                rlimit: Default::default(),
+                ucount: Vec::with_capacity(UcountCounts as usize),
+                rlimit: Vec::with_capacity(UcountRlimitCounts as usize),
             })
         };
         counts.insert(key, uc.clone());

@@ -47,7 +47,7 @@ use crate::{
         ucontext::AddressSpace,
         VirtAddr,
     },
-    namespace::NsProxy,
+    namespace::{pid_namespace::PidStrcut, NsProxy},
     net::socket::SocketInode,
     sched::{
         completion::Completion, cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag,
@@ -86,7 +86,6 @@ pub static mut PROCESS_SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
 /// 一个只改变1次的全局变量，标志进程管理器是否已经初始化完成
 static mut __PROCESS_MANAGEMENT_INIT_DONE: bool = false;
 
-#[derive(Debug)]
 pub struct SwitchResult {
     pub prev_pcb: Option<Arc<ProcessControlBlock>>,
     pub next_pcb: Option<Arc<ProcessControlBlock>>,
@@ -597,14 +596,14 @@ bitflags! {
         const RANDOMIZE = 1 << 8;
     }
 }
-
 #[derive(Debug)]
 pub struct ProcessControlBlock {
     /// 当前进程的pid
     pid: Pid,
     /// 当前进程的线程组id（这个值在同一个线程组内永远不变）
     tgid: Pid,
-
+    /// 有关Pid的相关的信息
+    thread_pid: Arc<PidStrcut>,
     basic: RwLock<ProcessBasicInfo>,
     /// 当前进程的自旋锁持有计数
     preempt_count: AtomicUsize,
@@ -649,7 +648,7 @@ pub struct ProcessControlBlock {
     robust_list: RwLock<Option<RobustListHead>>,
 
     /// namespace的指针
-    nsproxy: Weak<NsProxy>, // 用weak 避免所有的namespace出现循环引用问题
+    nsproxy: Arc<NsProxy>,
 }
 
 impl ProcessControlBlock {
@@ -706,10 +705,11 @@ impl ProcessControlBlock {
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find(ppid)
             .map(|p| Arc::downgrade(&p))
             .unwrap_or_default();
-
+        let pid_strcut = PidStrcut::new();
         let pcb = Self {
             pid,
             tgid: pid,
+            thread_pid: Arc::new(pid_strcut),
             basic: basic_info,
             preempt_count,
             flags,
@@ -728,7 +728,7 @@ impl ProcessControlBlock {
             thread: RwLock::new(ThreadInfo::new()),
             alarm_timer: SpinLock::new(None),
             robust_list: RwLock::new(None),
-            nsproxy: Weak::new(),
+            nsproxy: Arc::new(NsProxy::new()),
         };
 
         // 初始化系统调用栈
@@ -871,6 +871,11 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
+    pub fn pid_strcut(&self) -> Arc<PidStrcut> {
+        self.thread_pid.clone()
+    }
+
+    #[inline(always)]
     pub fn tgid(&self) -> Pid {
         return self.tgid;
     }
@@ -994,7 +999,7 @@ impl ProcessControlBlock {
         return self.alarm_timer.lock_irqsave();
     }
 
-    pub fn get_nsproxy(&self) -> Weak<NsProxy> {
+    pub fn get_nsproxy(&self) -> Arc<NsProxy> {
         self.nsproxy.clone()
     }
 }

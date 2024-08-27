@@ -48,4 +48,8 @@ impl IdAllocator {
     pub fn free(&self, _id: usize) {
         // todo: free
     }
+
+    pub fn get_max_id(&self) -> usize {
+        self.max_id
+    }
 }

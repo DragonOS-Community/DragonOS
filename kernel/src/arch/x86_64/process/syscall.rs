@@ -74,7 +74,7 @@ impl Syscall {
 
         // 生成16字节随机数
         // TODO 暂时设为0
-        param.init_info_mut().rand_num = [0; 16];
+        param.init_info_mut().rand_num = 0;
 
         // 把proc_init_info写到用户栈上
         let mut ustack_message = unsafe {

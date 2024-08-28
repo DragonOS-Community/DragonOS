@@ -206,7 +206,7 @@ pub struct ProcInitInfo {
     pub args: Vec<CString>,
     pub envs: Vec<CString>,
     pub auxv: BTreeMap<u8, usize>,
-    pub rand_num: [u8; 16],
+    pub rand_num: u128,
 }
 
 impl ProcInitInfo {
@@ -216,7 +216,7 @@ impl ProcInitInfo {
             args: Vec::new(),
             envs: Vec::new(),
             auxv: BTreeMap::new(),
-            rand_num: [0; 16],
+            rand_num: 0,
         }
     }
 
@@ -230,15 +230,9 @@ impl ProcInitInfo {
         &mut self,
         ustack: &mut UserStack,
     ) -> Result<(VirtAddr, VirtAddr), SystemError> {
-        // TODO: 实现栈的16字节对齐
-        // self.push_slice(
-        //     ustack,
-        //     vec![0u8; 0x10 - (ustack.sp().data() & 0b1111)].as_slice(),
-        // )?;
-        self.push_slice(ustack, vec![0u8; 8].as_slice())?;
-
         // 先把程序的名称压入栈中
         self.push_str(ustack, &self.proc_name)?;
+
         // 然后把环境变量压入栈中
         let envps = self
             .envs
@@ -248,6 +242,7 @@ impl ProcInitInfo {
                 ustack.sp()
             })
             .collect::<Vec<_>>();
+
         // 然后把参数压入栈中
         let argps = self
             .args
@@ -259,13 +254,20 @@ impl ProcInitInfo {
             .collect::<Vec<_>>();
 
         // 压入随机数，把指针放入auxv
-        self.push_slice(ustack, &self.rand_num)?;
+        self.push_slice(ustack, &[self.rand_num])?;
         self.auxv
             .insert(super::abi::AtType::Random as u8, ustack.sp().data());
+
+        // 实现栈的16字节对齐，如果argv、envp、argc在栈中的长度加起来不能对齐16字节，则手动填充一个空字节
+        // TODO 感觉这样对齐有点简陋，后续可能要完善一下
+        if (envps.len() + argps.len() + 1) * core::mem::align_of::<usize>() % 0x10 != 0 {
+            self.push_slice(ustack, &vec![0u8; 1])?;
+        }
 
         // 压入auxv
         self.push_slice(ustack, &[null::<u8>(), null::<u8>()])?;
         for (&k, &v) in self.auxv.iter() {
+            log::debug!("auxv: {:?}", ustack.sp());
             self.push_slice(ustack, &[k as usize, v])?;
         }
 
@@ -276,7 +278,6 @@ impl ProcInitInfo {
         // 把参数指针压入栈中
         self.push_slice(ustack, &[null::<u8>()])?;
         self.push_slice(ustack, argps.as_slice())?;
-
         let argv_ptr = ustack.sp();
 
         // 把argc压入栈中

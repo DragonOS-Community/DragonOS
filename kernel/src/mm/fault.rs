@@ -76,7 +76,7 @@ impl<'a> PageFaultMessage<'a> {
         });
         Self {
             vma: vma.clone(),
-            address,
+            address: VirtAddr::new(crate::libs::align::page_align_down(address.data())),
             flags,
             file_pgoff,
             page: None,

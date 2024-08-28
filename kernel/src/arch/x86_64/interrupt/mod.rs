@@ -132,6 +132,12 @@ pub struct TrapFrame {
     pub ss: ::core::ffi::c_ulong,
 }
 
+impl Default for TrapFrame {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TrapFrame {
     pub fn new() -> Self {
         Self {
@@ -170,11 +176,5 @@ impl TrapFrame {
     /// 判断当前中断是否来自用户模式
     pub fn is_from_user(&self) -> bool {
         return (self.cs & 0x3) != 0;
-    }
-}
-
-impl Default for TrapFrame {
-    fn default() -> Self {
-        Self::new()
     }
 }

@@ -1373,6 +1373,11 @@ impl CfsRunQueue {
     }
 }
 
+impl Default for CfsRunQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 pub struct CompletelyFairScheduler;
 
 impl CompletelyFairScheduler {

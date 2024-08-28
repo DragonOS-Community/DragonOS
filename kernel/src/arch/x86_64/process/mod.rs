@@ -8,13 +8,13 @@ use core::{
 use alloc::sync::{Arc, Weak};
 
 use kdepends::memoffset::offset_of;
+use log::{error, warn};
 use system_error::SystemError;
 use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 
 use crate::{
     arch::process::table::TSSManager,
     exception::InterruptArch,
-    kerror, kwarn,
     libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{
@@ -167,7 +167,7 @@ impl ArchPCBInfo {
     // 清空浮点寄存器
     pub fn clear_fp_state(&mut self) {
         if unlikely(self.fp_state.is_none()) {
-            kwarn!("fp_state is none");
+            warn!("fp_state is none");
             return;
         }
 
@@ -275,7 +275,7 @@ impl ProcessControlBlock {
         // 从内核栈的最低地址处取出pcb的地址
         let p = stack_base.data() as *const *const ProcessControlBlock;
         if unlikely((unsafe { *p }).is_null()) {
-            kerror!("p={:p}", p);
+            error!("p={:p}", p);
             panic!("current_pcb is null");
         }
         unsafe {
@@ -406,7 +406,7 @@ impl ProcessManager {
         );
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
-        // kdebug!("switch tss ok");
+        // debug!("switch tss ok");
         compiler_fence(Ordering::SeqCst);
         // 正式切换上下文
         switch_to_inner(prev_arch, next_arch);
@@ -515,7 +515,7 @@ pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
     let trap_frame_vaddr = VirtAddr::new(
         current_pcb.kernel_stack().stack_max_address().data() - core::mem::size_of::<TrapFrame>(),
     );
-    // kdebug!("trap_frame_vaddr: {:?}", trap_frame_vaddr);
+    // debug!("trap_frame_vaddr: {:?}", trap_frame_vaddr);
 
     assert!(
         (x86::current::registers::rsp() as usize) < trap_frame_vaddr.data(),

@@ -94,6 +94,20 @@ install_ubuntu_debian_pkg()
 
 }
 
+
+####################################
+# 当检测到gentoo时，执行此函数         #
+####################################
+gentoo()
+{
+    pkgman="emerge"
+    echo "检测到Gentoo发行版"
+    echo "正在更新包管理器的列表..."
+    sudo "${pkgman}" --sync
+    echo "正在安装所需的包..."
+    sudo "${pkgman}"  net-misc/curl net-misc/wget net-misc/bridge-utils net-dns/dnsmasq sys-apps/diffutils dev-util/pkgconf sys-apps/which app-arch/unzip sys-apps/util-linux sys-fs/dosfstools sys-devel/gcc dev-build/make sys-devel/flex sys-apps/texinfo dev-libs/gmp dev-libs/mpfr app-emulation/qemu dev-libs/mpc dev-libs/openssl
+}
+
 install_archlinux_pkg()
 {
     pkgman="pacman"
@@ -214,25 +228,26 @@ rustInstall() {
 		fi
         echo "正在安装DragonOS所需的rust组件...首次安装需要一些时间来更新索引，请耐心等待..."
         cargo install cargo-binutils
-		rustup toolchain install nightly-2023-01-21-x86_64-unknown-linux-gnu
 		rustup toolchain install nightly-2023-08-15-x86_64-unknown-linux-gnu
-		rustup component add rust-src --toolchain nightly-2023-01-21-x86_64-unknown-linux-gnu
+		rustup toolchain install nightly-2024-07-23-x86_64-unknown-linux-gnu
+		rustup component add rust-src --toolchain nightly-2024-07-23-x86_64-unknown-linux-gnu
 		rustup component add rust-src --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
-		rustup target add x86_64-unknown-none --toolchain nightly-2023-01-21-x86_64-unknown-linux-gnu
+		rustup target add x86_64-unknown-none --toolchain nightly-2024-07-23-x86_64-unknown-linux-gnu
 		rustup target add x86_64-unknown-none --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
 		rustup target add x86_64-unknown-linux-musl --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
+		rustup target add x86_64-unknown-linux-musl --toolchain nightly-2024-07-23-x86_64-unknown-linux-gnu
 
-		rustup toolchain install nightly-2023-01-21-riscv64gc-unknown-linux-gnu --force-non-host
+		rustup toolchain install nightly-2024-07-23-riscv64gc-unknown-linux-gnu --force-non-host
 		rustup toolchain install nightly-2023-08-15-riscv64gc-unknown-linux-gnu --force-non-host
-		rustup target add riscv64gc-unknown-none-elf --toolchain nightly-2023-01-21-riscv64gc-unknown-linux-gnu
-		rustup target add riscv64imac-unknown-none-elf --toolchain nightly-2023-01-21-riscv64gc-unknown-linux-gnu
+		rustup target add riscv64gc-unknown-none-elf --toolchain nightly-2024-07-23-riscv64gc-unknown-linux-gnu
+		rustup target add riscv64imac-unknown-none-elf --toolchain nightly-2024-07-23-riscv64gc-unknown-linux-gnu
 		rustup target add riscv64gc-unknown-none-elf --toolchain nightly-2023-08-15-riscv64gc-unknown-linux-gnu
 		rustup target add riscv64imac-unknown-none-elf --toolchain nightly-2023-08-15-riscv64gc-unknown-linux-gnu
         
 		rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
 		rustup component add rust-src
         rustup component add llvm-tools-preview
-		rustup default nightly
+		rustup default nightly-2024-07-23
 		
 		echo "Rust已经成功的在您的计算机上安装！请运行 source ~/.cargo/env 以使rust在当前窗口生效！"
 	fi

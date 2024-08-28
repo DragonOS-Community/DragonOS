@@ -5,6 +5,7 @@ use alloc::{
     vec::Vec,
 };
 use bitmap::{traits::BitMapOps, StaticBitmap};
+use log::warn;
 
 use crate::{
     driver::{
@@ -131,7 +132,6 @@ pub struct VirtualConsoleData {
     pub utf_char: u32,
     /// 构建utf时需要的参数，表示目前接收了多少个字节的数据来构建utf字符
     pub npar: u32,
-    ///
     pub par: [u32; NPAR],
 
     /// 字符转换表 用于将输入字符映射到特定的字符
@@ -936,7 +936,7 @@ impl VirtualConsoleData {
 
             'c' => {
                 if self.par[0] == 0 {
-                    kwarn!("respone ID todo");
+                    warn!("respone ID todo");
                 }
                 return;
             }
@@ -1612,7 +1612,7 @@ impl VirtualConsoleData {
 
             tc |= ((attr as u32) << 8) & (!himask as u32);
 
-            // kwarn!(
+            // warn!(
             //     "ch {} pos {} x {} y {} cols {}",
             //     c as u8 as char,
             //     self.pos,
@@ -1785,6 +1785,7 @@ impl VirtualConsoleData {
         draw.size = 0;
     }
 
+    #[allow(clippy::manual_rotate)]
     fn build_attr(
         &self,
         color: u8,

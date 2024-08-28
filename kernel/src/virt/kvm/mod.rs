@@ -1,9 +1,10 @@
 use self::kvm_dev::LockedKvmInode;
 use crate::arch::KVMArch;
 use crate::filesystem::devfs::devfs_register;
-use crate::kdebug;
+
 use crate::libs::mutex::Mutex;
 use alloc::vec::Vec;
+use log::debug;
 use vm::Vm;
 
 pub mod host_mem;
@@ -23,7 +24,7 @@ pub static VM_LIST: Mutex<Vec<Vm>> = Mutex::new(Vec::new());
 pub fn push_vm(id: usize) -> Result<(), ()> {
     let mut vm_list = VM_LIST.lock();
     if vm_list.iter().any(|x| x.id == id) {
-        kdebug!("push_vm: vm {} already exists", id);
+        debug!("push_vm: vm {} already exists", id);
         Err(())
     } else {
         vm_list.push(Vm::new(id).unwrap());
@@ -54,14 +55,14 @@ pub fn vm(id: usize) -> Option<Vm> {
 
 #[inline(never)]
 pub fn kvm_init() {
-    kdebug!("kvm init");
+    debug!("kvm init");
 
     match KVMArch::kvm_arch_cpu_supports_vm() {
         Ok(_) => {
-            kdebug!("[+] CPU supports Intel VMX");
+            debug!("[+] CPU supports Intel VMX");
         }
         Err(e) => {
-            kdebug!("[-] CPU does not support Intel VMX: {:?}", e);
+            debug!("[-] CPU does not support Intel VMX: {:?}", e);
         }
     };
 
@@ -76,9 +77,9 @@ pub fn kvm_init() {
     // let host_stack = vec![0xCC; HOST_STACK_SIZE];
     // let guest_rsp = guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64;
     // let host_rsp = (host_stack.as_ptr() as u64) + HOST_STACK_SIZE  as u64;
-    // kdebug!("guest rsp: {:x}", guest_rsp);
-    // kdebug!("guest rip: {:x}", guest_code as *const () as u64);
-    // kdebug!("host rsp: {:x}", host_rsp);
+    // debug!("guest rsp: {:x}", guest_rsp);
+    // debug!("guest rip: {:x}", guest_code as *const () as u64);
+    // debug!("host rsp: {:x}", host_rsp);
     // let hypervisor = Hypervisor::new(1, host_rsp, 0).expect("Cannot create hypervisor");
     // let vcpu = VmxVcpu::new(1, Arc::new(Mutex::new(hypervisor)), host_rsp, guest_rsp,  guest_code as *const () as u64).expect("Cannot create VcpuData");
     // vcpu.virtualize_cpu().expect("Cannot virtualize cpu");

@@ -3,6 +3,7 @@ use core::{
     sync::atomic::compiler_fence,
 };
 
+use log::{error, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -15,7 +16,6 @@ use crate::{
         FilePrivateData,
     },
     ipc::shm::{shm_manager_lock, IPC_PRIVATE},
-    kerror, kwarn,
     libs::align::page_align_up,
     libs::spinlock::SpinLock,
     mm::{
@@ -96,7 +96,7 @@ impl Syscall {
         let sig = Signal::from(sig);
         if sig == Signal::INVALID {
             // 传入的signal数值不合法
-            kwarn!("Not a valid signal number");
+            warn!("Not a valid signal number");
             return Err(SystemError::EINVAL);
         }
 
@@ -173,12 +173,12 @@ impl Syscall {
             }
 
             // TODO 如果为空，赋默认值？
-            // kdebug!("new_ka={:?}", new_ka);
+            // debug!("new_ka={:?}", new_ka);
             // 如果用户手动给了sa_restorer，那么就置位SA_FLAG_RESTORER，否则报错。（用户必须手动指定restorer）
             if new_ka.restorer().is_some() {
                 new_ka.flags_mut().insert(SigFlags::SA_RESTORER);
             } else if new_ka.action().is_customized() {
-                kerror!(
+                error!(
                 "pid:{:?}: in sys_sigaction: User must manually sprcify a sa_restorer for signal {}.",
                 ProcessManager::current_pcb().pid(),
                 sig
@@ -229,7 +229,7 @@ impl Syscall {
                     }
                 }
                 SigactionType::SaSigaction(_) => {
-                    kerror!("unsupported type: SaSigaction");
+                    error!("unsupported type: SaSigaction");
                     VirtAddr::new(USER_SIG_DFL as usize)
                 }
             };
@@ -261,7 +261,7 @@ impl Syscall {
     pub fn shmget(key: ShmKey, size: usize, shmflg: ShmFlags) -> Result<usize, SystemError> {
         // 暂不支持巨页
         if shmflg.contains(ShmFlags::SHM_HUGETLB) {
-            kerror!("shmget: not support huge page");
+            error!("shmget: not support huge page");
             return Err(SystemError::ENOSYS);
         }
 

@@ -1,4 +1,4 @@
-use alloc::{string::String, vec::Vec};
+use alloc::{ffi::CString, string::String, vec::Vec};
 use riscv::register::sstatus::{FS, SPP};
 use system_error::SystemError;
 
@@ -16,14 +16,14 @@ use crate::{
 impl Syscall {
     pub fn do_execve(
         path: String,
-        argv: Vec<String>,
-        envp: Vec<String>,
+        argv: Vec<CString>,
+        envp: Vec<CString>,
         regs: &mut TrapFrame,
     ) -> Result<(), SystemError> {
         // 关中断，防止在设置地址空间的时候，发生中断，然后进调度器，出现错误。
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let pcb = ProcessManager::current_pcb();
-        // crate::kdebug!(
+        // crate::debug!(
         //     "pid: {:?}  do_execve: path: {:?}, argv: {:?}, envp: {:?}\n",
         //     pcb.pid(),
         //     path,
@@ -52,20 +52,20 @@ impl Syscall {
             AddressSpace::is_current(&address_space),
             "Failed to set address space"
         );
-        // kdebug!("Switch to new address space");
+        // debug!("Switch to new address space");
 
         // 切换到新的用户地址空间
         unsafe { address_space.read().user_mapper.utable.make_current() };
 
         drop(old_address_space);
         drop(irq_guard);
-        // kdebug!("to load binary file");
+        // debug!("to load binary file");
         let mut param = ExecParam::new(path.as_str(), address_space.clone(), ExecParamFlags::EXEC)?;
 
         // 加载可执行文件
         let load_result = load_binary_file(&mut param)?;
-        // kdebug!("load binary file done");
-        // kdebug!("argv: {:?}, envp: {:?}", argv, envp);
+        // debug!("load binary file done");
+        // debug!("argv: {:?}, envp: {:?}", argv, envp);
         param.init_info_mut().args = argv;
         param.init_info_mut().envs = envp;
 
@@ -91,7 +91,7 @@ impl Syscall {
         };
         address_space.write().user_stack = Some(ustack_message);
 
-        // kdebug!("write proc_init_info to user stack done");
+        // debug!("write proc_init_info to user stack done");
 
         regs.a0 = param.init_info().args.len();
         regs.a1 = argv_ptr.data();

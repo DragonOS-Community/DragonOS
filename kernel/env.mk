@@ -42,3 +42,6 @@ endif
 ifeq ($(DEBUG), DEBUG)
 GLOBAL_CFLAGS += -g 
 endif
+
+export RUSTFLAGS := -C link-args=-znostart-stop-gc
+export RUSTDOCFLAGS := -C link-args=-znostart-stop-gc

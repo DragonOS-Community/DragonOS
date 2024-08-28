@@ -2,13 +2,10 @@ use crate::arch::kvm::vmx::vmcs::VmcsFields;
 use crate::arch::kvm::vmx::vmx_asm_wrapper::{vmx_vmlaunch, vmx_vmread};
 use crate::libs::mutex::Mutex;
 use crate::virt::kvm::vm;
-use crate::{
-    kdebug,
-    kerror,
-    // libs::spinlock::{SpinLock, SpinLockGuard},
-};
+
 use alloc::sync::Arc;
 use core::arch::asm;
+use log::{debug, error};
 use raw_cpuid::CpuId;
 use system_error::SystemError;
 // use crate::virt::kvm::guest_code;
@@ -54,7 +51,7 @@ impl X86_64KVMArch {
 
     #[deny(clippy::match_single_binding)]
     pub fn kvm_arch_dev_ioctl(cmd: u32, _arg: usize) -> Result<usize, SystemError> {
-        kerror!("unknown kvm ioctl cmd: {}", cmd);
+        error!("unknown kvm ioctl cmd: {}", cmd);
         return Err(SystemError::EINVAL);
     }
 
@@ -74,7 +71,7 @@ impl X86_64KVMArch {
             Ok(_) => {}
             Err(e) => {
                 let vmx_err = vmx_vmread(VmcsFields::VMEXIT_INSTR_ERR as u32).unwrap();
-                kdebug!("vmlaunch failed: {:?}", vmx_err);
+                debug!("vmlaunch failed: {:?}", vmx_err);
                 return Err(e);
             }
         }
@@ -103,12 +100,12 @@ impl X86_64KVMArch {
 
 #[no_mangle]
 pub extern "C" fn guest_code() {
-    kdebug!("guest_code");
+    debug!("guest_code");
     loop {
         unsafe {
             asm!("mov rax, 0", "mov rcx, 0", "cpuid");
         }
         unsafe { asm!("nop") };
-        kdebug!("guest_code");
+        debug!("guest_code");
     }
 }

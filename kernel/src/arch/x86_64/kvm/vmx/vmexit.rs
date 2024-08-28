@@ -1,8 +1,9 @@
 use super::vmcs::{VmcsFields, VmxExitReason};
 use super::vmx_asm_wrapper::{vmx_vmread, vmx_vmwrite};
-use crate::kdebug;
+
 use crate::virt::kvm::vm;
 use core::arch::asm;
+use log::debug;
 use system_error::SystemError;
 use x86::vmx::vmcs::ro::GUEST_PHYSICAL_ADDR_FULL;
 
@@ -147,7 +148,7 @@ pub struct GuestCpuContext {
 
 #[no_mangle]
 pub extern "C" fn vmx_return() {
-    kdebug!("vmx_return!");
+    debug!("vmx_return!");
     unsafe { save_rpg() };
     vmexit_handler();
     // XMM registers are vector registers. They're renamed onto the FP/SIMD register file
@@ -181,14 +182,14 @@ pub extern "C" fn vmx_return() {
 #[no_mangle]
 extern "C" fn vmexit_handler() {
     // let guest_cpu_context = unsafe { guest_cpu_context_ptr.as_mut().unwrap() };
-    // kdebug!("guest_cpu_context_ptr={:p}",guest_cpu_context_ptr);
-    kdebug!("vmexit handler!");
+    // debug!("guest_cpu_context_ptr={:p}",guest_cpu_context_ptr);
+    debug!("vmexit handler!");
 
     let exit_reason = vmx_vmread(VmcsFields::VMEXIT_EXIT_REASON as u32).unwrap() as u32;
     let exit_basic_reason = exit_reason & 0x0000_ffff;
     let guest_rip = vmx_vmread(VmcsFields::GUEST_RIP as u32).unwrap();
     // let guest_rsp = vmx_vmread(VmcsFields::GUEST_RSP as u32).unwrap();
-    kdebug!("guest_rip={:x}", guest_rip);
+    debug!("guest_rip={:x}", guest_rip);
     let _guest_rflags = vmx_vmread(VmcsFields::GUEST_RFLAGS as u32).unwrap();
 
     match VmxExitReason::from(exit_basic_reason as i32) {
@@ -205,28 +206,28 @@ extern "C" fn vmexit_handler() {
         | VmxExitReason::VMFUNC
         | VmxExitReason::INVEPT
         | VmxExitReason::INVVPID => {
-            kdebug!("vmexit handler: vmx instruction!");
+            debug!("vmexit handler: vmx instruction!");
             vmexit_vmx_instruction_executed().expect("previledge instruction handle error");
         }
         VmxExitReason::CPUID => {
-            kdebug!("vmexit handler: cpuid instruction!");
+            debug!("vmexit handler: cpuid instruction!");
             // vmexit_cpuid_handler(guest_cpu_context);
             adjust_rip(guest_rip).unwrap();
         }
         VmxExitReason::RDMSR => {
-            kdebug!("vmexit handler: rdmsr instruction!");
+            debug!("vmexit handler: rdmsr instruction!");
             adjust_rip(guest_rip).unwrap();
         }
         VmxExitReason::WRMSR => {
-            kdebug!("vmexit handler: wrmsr instruction!");
+            debug!("vmexit handler: wrmsr instruction!");
             adjust_rip(guest_rip).unwrap();
         }
         VmxExitReason::TRIPLE_FAULT => {
-            kdebug!("vmexit handler: triple fault!");
+            debug!("vmexit handler: triple fault!");
             adjust_rip(guest_rip).unwrap();
         }
         VmxExitReason::EPT_VIOLATION => {
-            kdebug!("vmexit handler: ept violation!");
+            debug!("vmexit handler: ept violation!");
             let gpa = vmx_vmread(GUEST_PHYSICAL_ADDR_FULL).unwrap();
             let exit_qualification = vmx_vmread(VmcsFields::VMEXIT_QUALIFICATION as u32).unwrap();
             /* It is a write fault? */
@@ -244,17 +245,17 @@ extern "C" fn vmexit_handler() {
                 .expect("ept page fault error");
         }
         _ => {
-            kdebug!(
+            debug!(
                 "vmexit handler: unhandled vmexit reason: {}!",
                 exit_basic_reason
             );
 
             let info = vmx_vmread(VmcsFields::VMEXIT_INSTR_LEN as u32).unwrap() as u32;
-            kdebug!("vmexit handler: VMEXIT_INSTR_LEN: {}!", info);
+            debug!("vmexit handler: VMEXIT_INSTR_LEN: {}!", info);
             let info = vmx_vmread(VmcsFields::VMEXIT_INSTR_INFO as u32).unwrap() as u32;
-            kdebug!("vmexit handler: VMEXIT_INSTR_INFO: {}!", info);
+            debug!("vmexit handler: VMEXIT_INSTR_INFO: {}!", info);
             let info = vmx_vmread(VmcsFields::CTRL_EXPECTION_BITMAP as u32).unwrap() as u32;
-            kdebug!("vmexit handler: CTRL_EXPECTION_BITMAP: {}!", info);
+            debug!("vmexit handler: CTRL_EXPECTION_BITMAP: {}!", info);
 
             adjust_rip(guest_rip).unwrap();
             // panic!();

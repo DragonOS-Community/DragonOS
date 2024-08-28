@@ -15,16 +15,17 @@ use crate::{
     libs::spinlock::SpinLockGuard,
     mm::{verify_area, VirtAddr},
     net::socket::{netlink::af_netlink::NetlinkSock, AddressFamily, SOL_SOCKET},
-    net::{socket::{AddressFamily, SOL_SOCKET}, SocketOptionsLevel},
     process::ProcessManager,
     syscall::Syscall,
 };
 
 use super::{
-    socket::{netlink::endpoint::NetlinkEndpoint, new_socket, PosixSocketType, Socket, SocketInode},
-    socket::{new_unbound_socket, PosixSocketType, Socket, SocketInode},
-    Endpoint, Protocol, ShutdownType,
+    socket::{netlink::endpoint::NetlinkEndpoint, Socket, },
+    Endpoint,
 };
+
+use super::syscall_util::SysArgSocketType;
+use super::socket;
 
 /// Flags for socket, socketpair, accept4
 const SOCK_CLOEXEC: FileMode = FileMode::O_CLOEXEC;
@@ -43,18 +44,25 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         // 打印收到的参数
         log::debug!("socket: address_family={:?}, socket_type={:?}, protocol={:?}", address_family, socket_type, protocol);
-        let address_family = AddressFamily::try_from(address_family as u16)?;
-        let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
-        let protocol = Protocol::from(protocol as u8);
+        let address_family = socket::AddressFamily::try_from(address_family as u16)?;
+        let socket_type = SysArgSocketType::from_bits_truncate(socket_type as u32);
+        let is_nonblock = socket_type.is_nonblock();
+        let is_close_on_exec = socket_type.is_cloexec();
+        let stype = socket::Type::try_from(socket_type)?;
 
-        let socket = new_unbound_socket(address_family, socket_type, protocol)?;
+        let inode = socket::create_socket(
+            address_family, 
+            stype, 
+            protocol as u32, 
+            is_nonblock, 
+            is_close_on_exec
+        );
 
-        let socketinode: Arc<SocketInode> = SocketInode::new(socket, None);
-        let f = File::new(socketinode, FileMode::O_RDWR)?;
+        let file = File::new(inode, FileMode::O_RDWR)?;
         // 把socket添加到当前进程的文件描述符表中
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
-        let fd: Result<usize, SystemError> = fd_table_guard.alloc_fd(f, None).map(|x| x as usize);
+        let fd: Result<usize, SystemError> = fd_table_guard.alloc_fd(file, None).map(|x| x as usize);
         drop(fd_table_guard);
         return fd;
     }

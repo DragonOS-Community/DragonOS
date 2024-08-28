@@ -132,6 +132,12 @@ pub struct TrapFrame {
     pub ss: ::core::ffi::c_ulong,
 }
 
+impl Default for TrapFrame {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TrapFrame {
     pub fn new() -> Self {
         Self {

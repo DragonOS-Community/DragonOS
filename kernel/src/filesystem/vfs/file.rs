@@ -8,6 +8,8 @@ use alloc::{
 use log::error;
 use system_error::SystemError;
 
+use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
+use crate::filesystem::eventfd::EventFdInode;
 use crate::{
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
@@ -18,14 +20,10 @@ use crate::{
     libs::{rwlock::RwLock, spinlock::SpinLock},
     net::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
-        socket::Socket,
+        socket::{Inode as SocketInode, Socket},
     },
     process::{cred::Cred, ProcessManager},
 };
-
-use crate::libs::casting::DowncastArc;
-
-use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
@@ -238,7 +236,14 @@ impl File {
 
         let len = self
             .inode
-            .read_at(offset, len, buf, self.private_data.lock())?;
+            .read_at(offset, len, buf, self.private_data.lock())
+            .map_err(|e| {
+                if e == SystemError::ERESTARTSYS {
+                    SystemError::EINTR
+                } else {
+                    e
+                }
+            })?;
 
         if update_offset {
             self.offset
@@ -263,11 +268,24 @@ impl File {
 
         // 如果文件指针已经超过了文件大小，则需要扩展文件大小
         if offset > self.inode.metadata()?.size as usize {
-            self.inode.resize(offset)?;
+            self.inode.resize(offset).map_err(|e| {
+                if e == SystemError::ERESTARTSYS {
+                    SystemError::EINTR
+                } else {
+                    e
+                }
+            })?;
         }
         let len = self
             .inode
-            .write_at(offset, len, buf, self.private_data.lock())?;
+            .write_at(offset, len, buf, self.private_data.lock())
+            .map_err(|e| {
+                if e == SystemError::ERESTARTSYS {
+                    SystemError::EINTR
+                } else {
+                    e
+                }
+            })?;
 
         if update_offset {
             self.offset
@@ -488,7 +506,7 @@ impl File {
     pub fn add_epoll(&self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
         match self.file_type {
             FileType::Socket => {
-                let inode = self.inode.downcast_ref::<dyn Socket>().unwrap();
+                let inode = self.inode.downcast_ref::<SocketInode>().unwrap();
                 // let mut socket = inode.inner();
 
                 inode.epoll_items().add(epitem);
@@ -513,11 +531,21 @@ impl File {
     pub fn remove_epoll(&self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
         match self.file_type {
             FileType::Socket => {
-                let inode = self.inode.downcast_arc::<dyn Socket>().unwrap();
+                let inode = self.inode.downcast_ref::<SocketInode>().unwrap();
 
-                return inode.epoll_items().remove(epoll);
+                socket.remove_epoll(epoll)
             }
-            _ => return Err(SystemError::ENOSYS),
+            FileType::Pipe => {
+                let inode = self.inode.downcast_ref::<LockedPipeInode>().unwrap();
+                inode.inner().lock().remove_epoll(epoll)
+            }
+            _ => {
+                let inode = self
+                    .inode
+                    .downcast_ref::<EventFdInode>()
+                    .ok_or(SystemError::ENOSYS)?;
+                inode.remove_epoll(epoll)
+            }
         }
     }
 
@@ -547,7 +575,11 @@ pub struct FileDescriptorVec {
     /// 当前进程打开的文件描述符
     fds: Vec<Option<Arc<File>>>,
 }
-
+impl Default for FileDescriptorVec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl FileDescriptorVec {
     pub const PROCESS_MAX_FD: usize = 1024;
 
@@ -645,14 +677,14 @@ impl FileDescriptorVec {
     /// ## 参数
     ///
     /// - `fd` 文件描述符序号
-    pub fn drop_fd(&mut self, fd: i32) -> Result<(), SystemError> {
+    pub fn drop_fd(&mut self, fd: i32) -> Result<Arc<File>, SystemError> {
         self.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
 
         // 把文件描述符数组对应位置设置为空
         let file = self.fds[fd as usize].take().unwrap();
 
         assert!(Arc::strong_count(&file) == 1);
-        return Ok(());
+        return Ok(file);
     }
 
     #[allow(dead_code)]

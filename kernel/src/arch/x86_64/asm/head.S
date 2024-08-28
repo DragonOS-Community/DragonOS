@@ -85,17 +85,32 @@
 // 声明这一段代码以 32 位模式编译
 .code32
 
+.section ".multiboot_header", "a"
+
+MB_MAGIC = 0x1BADB002
+MB_FLAGS = 0
+MB_CHECKSUM = -(MB_MAGIC + MB_FLAGS)
+
+.code32
+multiboot_header:
+    .align 8
+    .long MB_MAGIC
+    .long MB_FLAGS
+    .long MB_CHECKSUM
+
+
 // multiboot2 文件头
 // 计算头长度
-.SET HEADER_LENGTH, multiboot_header_end - multiboot_header
+.SET HEADER_LENGTH, multiboot2_header_end - multiboot2_header
 // 计算校验和
-.SET CHECKSUM, -(MULTIBOOT2_HEADER_MAGIC + MULTIBOOT_ARCHITECTURE_I386 + HEADER_LENGTH)
+.SET MB2_CHECKSUM, -(MULTIBOOT2_HEADER_MAGIC + MULTIBOOT_ARCHITECTURE_I386 + HEADER_LENGTH)
 // 8 字节对齐
-.section .multiboot_header
+.code32
+.section .multiboot2_header
 .align MULTIBOOT_HEADER_ALIGN
 // 声明所属段
 
-multiboot_header:
+multiboot2_header:
     // 魔数
     .long MULTIBOOT2_HEADER_MAGIC
     // 架构
@@ -103,7 +118,7 @@ multiboot_header:
     // 头长度
     .long HEADER_LENGTH
     // 校验和
-    .long CHECKSUM
+    .long MB2_CHECKSUM
     // 添加其它内容在此，详细信息见 Multiboot2 Specification version 2.0.pdf
 
 // 设置帧缓冲区(同时在这里设置qemu的分辨率, 默认为: 1440*900, 还支持: 640*480, 等)
@@ -121,7 +136,7 @@ framebuffer_tag_end:
     // 结束标记
     .short 0
     .long 8
-multiboot_header_end:
+multiboot2_header_end:
 
 .section .bootstrap
 

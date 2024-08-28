@@ -9,7 +9,7 @@ use crate::net::Endpoint;
 use alloc::collections::VecDeque;
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Inner {
     Init(Init),
     Connected(Connected),
@@ -55,22 +55,14 @@ impl Connected {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Listener {
-    addr: Option<Endpoint>,
-}
-
-impl Listener {
-    pub fn new(addr: Option<Endpoint>, backlog: usize) -> Self {}
-}
-
-pub struct Backlog {
     addr: Option<Endpoint>,
     incoming_connects: Mutex<VecDeque<Connected>>,
     backlog: AtomicUsize,
 }
 
-impl Backlog {
+impl Listener {
     pub fn new(addr: Option<Endpoint>, backlog: usize) -> Self {
         Self {
             addr,

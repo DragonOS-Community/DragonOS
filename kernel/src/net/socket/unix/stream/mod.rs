@@ -1,11 +1,13 @@
 use core::sync::atomic::AtomicBool;
+use std::alloc::System;
 
 use alloc::{sync::{Arc,Weak}, vec::Vec};
 use inner::{Init, Inner, Listener};
+use log::debug;
 use system_error::SystemError;
 
 use crate::{
-    filesystem::vfs::IndexNode, include::bindings::bindings::{EINVAL, EISCONN}, libs::{rwlock::RwLock, spinlock::SpinLock}, net::{
+    filesystem::vfs::IndexNode, include::bindings::bindings::{_end, EINVAL, EISCONN}, libs::{rwlock::RwLock, spinlock::SpinLock}, net::{
         socket::{
             common::{
                 poll_unit::{EPollItems, WaitQueue},
@@ -40,7 +42,7 @@ impl StreamSocket {
         todo!();
     }
 
-    pub fn bind(&self, local_endpoint: Endpoint) -> Result<(), SystemError> {
+    pub fn do_bind(&self, local_endpoint: Endpoint) -> Result<(), SystemError> {
         let mut guard = self.inner.write();
         match guard.take().expect("Unix Stream Socket is None") {
             Inner::Init(mut inner) => inner.bind(local_endpoint),
@@ -49,7 +51,7 @@ impl StreamSocket {
     }
 
     pub fn do_listen(&self, backlog: usize) -> Result<(), SystemError> {
-        let inner = self.inner.write();
+        let mut inner = self.inner.write();
         let addr = match inner.take().expect("Unix Stream Socket is None") {
             Inner::Init(init) => init.addr().unwrap(),
             Inner::Connected(_) => {
@@ -61,27 +63,38 @@ impl StreamSocket {
         };
 
         let listener = Listener::new(Some(addr), backlog);
-        inner.replace(Listener(listener));
+        inner.replace(Inner::Listener(listener));
         return Ok(());
     }
 
-    pub fn connect(&self, remote_endpoint: Endpoint) -> Result<(), SystemError> {
+    pub fn do_connect(&self, remote_socket: Arc<StreamSocket>) -> Result<(), SystemError> {
         let mut client = self.inner.write();
         let client_endpoint = match client.take() {
-            Inner::Init(inner) => inner.addr().unwrap(),
-            Inner::Connected(_) => Err(EISCONN),
-            Inner::Listener(_) => Err(EINVAL),
+            Some(inner) => match inner {
+                Inner::Init(socket) => socket.addr().clone(),
+                Inner::Connected(_) => return Err(SystemError::EINVAL),
+                Inner::Listener(_) => return Err(SystemError::EINVAL),
+            },
+            None => return Err(SystemError::EINVAL),
         };
+
+        //查看remote_socket是否处于监听状态
+        let mut remote_inner = remote_socket.inner.write();
+        match remote_inner.take().expect("unix stream sock is none") {
+            Inner::Listener(listener) => {
+                //往服务端socket的连接队列中添加connected
+                listener.push_incoming(client_endpoint);
+                Ok(())
+            },
+            _ => return Err(SystemError::EINVAL),
+        }
 
     }
 
     pub fn accept(&self) -> Result<(), SystemError> {
-        todo!();
+        Ok(())
     }
 
-    pub fn inner(&self) -> RwLock<Option<Inner>> {
-        return self.inner;
-    }
 
     pub fn write(buf: &[u8], remote_endpoint: Endpoint) -> Result<(), SystemError> {
         todo!();
@@ -328,6 +341,7 @@ impl Socket for StreamSocket {
     }
     
     fn connect(&self, _endpoint: Endpoint) -> Result<(), SystemError> {
+        //使用endpoint获取服务端socket
         let remote_socket = match _endpoint {
             Endpoint::Inode(socket) => socket,
             _ => return Err(SystemError::EINVAL),
@@ -335,11 +349,11 @@ impl Socket for StreamSocket {
 
         let remote_stream_socket: Arc<StreamSocket> = Arc::clone(&remote_socket).arc_any().downcast().map_err(|_| SystemError::EINVAL)?;
 
-        Ok(())
+        return self.do_connect(remote_stream_socket);
     }
     
     fn bind(&self, _endpoint: Endpoint) -> Result<(), SystemError> {
-        Err(SystemError::ENOSYS)
+        return self.do_bind(_endpoint);
     }
     
     fn shutdown(&self, _type: Shutdown) -> Result<(), SystemError> {
@@ -347,7 +361,7 @@ impl Socket for StreamSocket {
     }
     
     fn listen(&self, _backlog: usize) -> Result<(), SystemError> {
-        Err(SystemError::ENOSYS)
+        return self.do_listen(_backlog);
     }
     
     fn accept(&self) -> Result<(Arc<dyn crate::filesystem::vfs::IndexNode>, Endpoint), SystemError> {

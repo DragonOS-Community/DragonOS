@@ -80,6 +80,12 @@ impl KernelThreadPcbPrivate {
     }
 }
 
+impl Default for KernelThreadPcbPrivate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// 内核线程的闭包，参数必须与闭包的参数一致，返回值必须是i32
 ///
 /// 元组的第一个元素是闭包，第二个元素是闭包的参数对象

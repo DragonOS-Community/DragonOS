@@ -369,7 +369,7 @@ pub trait PciInterrupt: PciDeviceStructure {
                         irq_num,
                         common_msg.irq_name.clone(),
                         common_msg.irq_hander,
-                        IrqHandleFlags::empty(),
+                        IrqHandleFlags::IRQF_SHARED,
                         Some(common_msg.dev_id.clone()),
                     );
 
@@ -532,7 +532,7 @@ pub trait PciInterrupt: PciDeviceStructure {
                         irq_num,
                         common_msg.irq_name.clone(),
                         common_msg.irq_hander,
-                        IrqHandleFlags::empty(),
+                        IrqHandleFlags::IRQF_SHARED,
                         Some(common_msg.dev_id.clone()),
                     );
 

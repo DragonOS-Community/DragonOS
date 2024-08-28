@@ -6,10 +6,10 @@ use alloc::{
     vec::Vec,
 };
 use bitmap::traits::BitMapOps;
-use log::{debug, error};
+use log::error;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
-use virtio_drivers::device::blk::VirtIOBlk;
+use virtio_drivers::device::blk::{VirtIOBlk, SECTOR_SIZE};
 
 use crate::{
     driver::{
@@ -17,7 +17,7 @@ use crate::{
             block::{
                 block_device::{BlockDevName, BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE},
                 disk_info::Partition,
-                manager::BlockDevMeta,
+                manager::{block_dev_manager, BlockDevMeta},
             },
             class::Class,
             device::{
@@ -66,7 +66,6 @@ pub fn virtio_blk_0() -> Option<Arc<VirtIOBlkDevice>> {
 pub fn virtio_blk(transport: VirtIOTransport, dev_id: Arc<DeviceId>) {
     let device = VirtIOBlkDevice::new(transport, dev_id);
     if let Some(device) = device {
-        debug!("VirtIOBlkDevice '{:?}' created", device.dev_id);
         virtio_device_manager()
             .device_add(device.clone() as Arc<dyn VirtIODevice>)
             .expect("Add virtio blk failed");
@@ -201,7 +200,15 @@ impl BlockDevice for VirtIOBlkDevice {
     }
 
     fn disk_range(&self) -> GeneralBlockRange {
-        todo!("Get virtio blk disk range")
+        let inner = self.inner();
+        let blocks = inner.device_inner.capacity() as usize * SECTOR_SIZE / LBA_SIZE;
+        drop(inner);
+        log::debug!(
+            "VirtIOBlkDevice '{:?}' disk_range: 0..{}",
+            self.dev_name(),
+            blocks
+        );
+        GeneralBlockRange::new(0, blocks).unwrap()
     }
 
     fn read_at_sync(
@@ -492,7 +499,7 @@ struct InnerVirtIOBlkDriver {
 
 impl VirtIODriver for VirtIOBlkDriver {
     fn probe(&self, device: &Arc<dyn VirtIODevice>) -> Result<(), SystemError> {
-        let _dev = device
+        let dev = device
             .clone()
             .arc_any()
             .downcast::<VirtIOBlkDevice>()
@@ -504,6 +511,7 @@ impl VirtIODriver for VirtIOBlkDriver {
                 SystemError::EINVAL
             })?;
 
+        block_dev_manager().register(dev as Arc<dyn BlockDevice>)?;
         return Ok(());
     }
 }

@@ -72,6 +72,10 @@ impl Syscall {
         param.init_info_mut().args = argv;
         param.init_info_mut().envs = envp;
 
+        // 生成16字节随机数
+        // TODO 暂时设为0
+        param.init_info_mut().rand_num = [0; 16];
+
         // 把proc_init_info写到用户栈上
         let mut ustack_message = unsafe {
             address_space
@@ -82,7 +86,7 @@ impl Syscall {
         };
         let (user_sp, argv_ptr) = unsafe {
             param
-                .init_info()
+                .init_info_mut()
                 .push_at(
                     // address_space
                     //     .write()

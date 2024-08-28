@@ -206,6 +206,7 @@ pub struct ProcInitInfo {
     pub args: Vec<CString>,
     pub envs: Vec<CString>,
     pub auxv: BTreeMap<u8, usize>,
+    pub rand_num: [u8; 16],
 }
 
 impl ProcInitInfo {
@@ -215,6 +216,7 @@ impl ProcInitInfo {
             args: Vec::new(),
             envs: Vec::new(),
             auxv: BTreeMap::new(),
+            rand_num: [0; 16],
         }
     }
 
@@ -225,7 +227,7 @@ impl ProcInitInfo {
     ///
     /// 返回值是一个元组，第一个元素是最终的用户栈顶地址，第二个元素是环境变量pointer数组的起始地址     
     pub unsafe fn push_at(
-        &self,
+        &mut self,
         ustack: &mut UserStack,
     ) -> Result<(VirtAddr, VirtAddr), SystemError> {
         // TODO: 实现栈的16字节对齐
@@ -255,6 +257,11 @@ impl ProcInitInfo {
                 ustack.sp()
             })
             .collect::<Vec<_>>();
+
+        // 压入随机数，把指针放入auxv
+        self.push_slice(ustack, &self.rand_num)?;
+        self.auxv
+            .insert(super::abi::AtType::Random as u8, ustack.sp().data());
 
         // 压入auxv
         self.push_slice(ustack, &[null::<u8>(), null::<u8>()])?;

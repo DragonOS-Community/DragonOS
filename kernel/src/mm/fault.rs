@@ -294,6 +294,17 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn do_cow_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
+        let mut ret = Self::filemap_fault(pfm);
+
+        if unlikely(ret.intersects(
+            VmFaultReason::VM_FAULT_ERROR
+                | VmFaultReason::VM_FAULT_NOPAGE
+                | VmFaultReason::VM_FAULT_RETRY
+                | VmFaultReason::VM_FAULT_DONE_COW,
+        )) {
+            return ret;
+        }
+
         let cache_page = pfm.page.clone().unwrap();
         let mapper = &mut pfm.mapper;
 
@@ -305,17 +316,6 @@ impl PageFaultHandler {
 
         let cow_page = Arc::new(Page::new(false, cow_page_phys));
         pfm.cow_page = Some(cow_page.clone());
-
-        let mut ret = Self::filemap_fault(pfm);
-
-        if unlikely(ret.intersects(
-            VmFaultReason::VM_FAULT_ERROR
-                | VmFaultReason::VM_FAULT_NOPAGE
-                | VmFaultReason::VM_FAULT_RETRY
-                | VmFaultReason::VM_FAULT_DONE_COW,
-        )) {
-            return ret;
-        }
 
         //复制PageCache内容到新的页内
         let new_frame = MMArch::phys_2_virt(cow_page_phys).unwrap();
@@ -331,8 +331,8 @@ impl PageFaultHandler {
         // 新页加入页管理器中
         page_manager_guard.insert(cow_page_phys, &cow_page);
         cow_page.write_irqsave().set_page_cache_index(
-            cow_page.read_irqsave().page_cache(),
-            cow_page.read_irqsave().index(),
+            cache_page.read_irqsave().page_cache(),
+            cache_page.read_irqsave().index(),
         );
 
         // 将vma插入页的vma表中

@@ -15,7 +15,7 @@ use crate::{
 
 use super::{
     allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper, mmio_buddy::mmio_pool,
-    no_init::pseudo_map_phys, page::PageFlags, MemoryManagementArch, PhysAddr, VirtAddr,
+    no_init::pseudo_map_phys, page::EntryFlags, MemoryManagementArch, PhysAddr, VirtAddr,
 };
 
 lazy_static! {
@@ -40,7 +40,7 @@ pub unsafe extern "C" fn rs_map_phys(vaddr: usize, paddr: usize, size: usize, fl
     let count = PageFrameCount::new(page_align_up(size) / MMArch::PAGE_SIZE);
     // debug!("rs_map_phys: vaddr: {vaddr:?}, paddr: {paddr:?}, count: {count:?}, flags: {flags:?}");
 
-    let mut page_flags: PageFlags<MMArch> = PageFlags::new().set_execute(true).set_write(true);
+    let mut page_flags: EntryFlags<MMArch> = EntryFlags::new().set_execute(true).set_write(true);
     if flags & PAGE_U_S as usize != 0 {
         page_flags = page_flags.set_user(true);
     }

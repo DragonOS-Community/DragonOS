@@ -28,8 +28,8 @@ use crate::{
 };
 
 use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::{PageEntry, PageFlags, PAGE_1G_SHIFT};
-use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr};
+use crate::mm::page::{EntryFlags, PageEntry, PAGE_1G_SHIFT};
+use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr, VmFlags};
 
 use system_error::SystemError;
 
@@ -326,6 +326,93 @@ impl MemoryManagementArch for X86_64MMArch {
         }
         pkru::pkru_allows_pkey(pkru::vma_pkey(vma), write)
     }
+
+    const PROTECTION_MAP: [EntryFlags<MMArch>; 16] = protection_map();
+
+    const PAGE_NONE: usize =
+        Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_ACCESSED | Self::ENTRY_FLAG_GLOBAL;
+
+    const PAGE_SHARED: usize = Self::ENTRY_FLAG_PRESENT
+        | Self::ENTRY_FLAG_READWRITE
+        | Self::ENTRY_FLAG_USER
+        | Self::ENTRY_FLAG_ACCESSED
+        | Self::ENTRY_FLAG_NO_EXEC;
+
+    const PAGE_SHARED_EXEC: usize = Self::ENTRY_FLAG_PRESENT
+        | Self::ENTRY_FLAG_READWRITE
+        | Self::ENTRY_FLAG_USER
+        | Self::ENTRY_FLAG_ACCESSED;
+
+    const PAGE_COPY_NOEXEC: usize = Self::ENTRY_FLAG_PRESENT
+        | Self::ENTRY_FLAG_USER
+        | Self::ENTRY_FLAG_ACCESSED
+        | Self::ENTRY_FLAG_NO_EXEC;
+
+    const PAGE_COPY_EXEC: usize =
+        Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_USER | Self::ENTRY_FLAG_ACCESSED;
+
+    const PAGE_COPY: usize = Self::ENTRY_FLAG_PRESENT
+        | Self::ENTRY_FLAG_USER
+        | Self::ENTRY_FLAG_ACCESSED
+        | Self::ENTRY_FLAG_NO_EXEC;
+
+    const PAGE_READONLY: usize = Self::ENTRY_FLAG_PRESENT
+        | Self::ENTRY_FLAG_USER
+        | Self::ENTRY_FLAG_ACCESSED
+        | Self::ENTRY_FLAG_NO_EXEC;
+
+    const PAGE_READONLY_EXEC: usize =
+        Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_USER | Self::ENTRY_FLAG_ACCESSED;
+
+    const PAGE_READ: usize = 0;
+    const PAGE_READ_EXEC: usize = 0;
+    const PAGE_WRITE: usize = 0;
+    const PAGE_WRITE_EXEC: usize = 0;
+    const PAGE_EXEC: usize = 0;
+}
+
+/// 获取保护标志的映射表
+///
+///
+/// ## 返回值
+/// - `[usize; 16]`: 长度为16的映射表
+const fn protection_map() -> [EntryFlags<MMArch>; 16] {
+    let mut map = [unsafe { EntryFlags::from_data(0) }; 16];
+    unsafe {
+        map[VmFlags::VM_NONE.bits()] = EntryFlags::from_data(MMArch::PAGE_NONE);
+        map[VmFlags::VM_READ.bits()] = EntryFlags::from_data(MMArch::PAGE_READONLY);
+        map[VmFlags::VM_WRITE.bits()] = EntryFlags::from_data(MMArch::PAGE_COPY);
+        map[VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_COPY);
+        map[VmFlags::VM_EXEC.bits()] = EntryFlags::from_data(MMArch::PAGE_READONLY_EXEC);
+        map[VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_READONLY_EXEC);
+        map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_COPY_EXEC);
+        map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_COPY_EXEC);
+        map[VmFlags::VM_SHARED.bits()] = EntryFlags::from_data(MMArch::PAGE_NONE);
+        map[VmFlags::VM_SHARED.bits() | VmFlags::VM_READ.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_READONLY);
+        map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_SHARED);
+        map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_SHARED);
+        map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_READONLY_EXEC);
+        map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_READONLY_EXEC);
+        map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_SHARED_EXEC);
+        map[VmFlags::VM_SHARED.bits()
+            | VmFlags::VM_EXEC.bits()
+            | VmFlags::VM_WRITE.bits()
+            | VmFlags::VM_READ.bits()] = EntryFlags::from_data(MMArch::PAGE_SHARED_EXEC);
+    }
+    // if X86_64MMArch::is_xd_reserved() {
+    //     map.iter_mut().for_each(|x| *x &= !Self::ENTRY_FLAG_NO_EXEC)
+    // }
+    map
 }
 
 impl X86_64MMArch {
@@ -650,17 +737,17 @@ impl FrameAllocator for LockedFrameAllocator {
 }
 
 /// 获取内核地址默认的页面标志
-pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> PageFlags<A> {
+pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> EntryFlags<A> {
     let info: X86_64MMBootstrapInfo = BOOTSTRAP_MM_INFO.unwrap();
 
     if virt.data() >= info.kernel_code_start && virt.data() < info.kernel_code_end {
         // Remap kernel code  execute
-        return PageFlags::new().set_execute(true).set_write(true);
+        return EntryFlags::new().set_execute(true).set_write(true);
     } else if virt.data() >= info.kernel_data_end && virt.data() < info.kernel_rodata_end {
         // Remap kernel rodata read only
-        return PageFlags::new().set_execute(true);
+        return EntryFlags::new().set_execute(true);
     } else {
-        return PageFlags::new().set_write(true).set_execute(true);
+        return EntryFlags::new().set_write(true).set_execute(true);
     }
 }
 

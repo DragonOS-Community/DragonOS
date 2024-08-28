@@ -1106,6 +1106,12 @@ impl Syscall {
 
                 Self::shmctl(id, cmd, user_buf, from_user)
             }
+            SYS_MSYNC => {
+                let start = page_align_up(args[0]);
+                let len = page_align_up(args[1]);
+                let flags = args[2];
+                Self::msync(VirtAddr::new(start), len, flags)
+            }
             SYS_UTIMENSAT => Self::sys_utimensat(
                 args[0] as i32,
                 args[1] as *const u8,

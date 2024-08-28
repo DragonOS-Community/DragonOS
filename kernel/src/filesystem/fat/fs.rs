@@ -13,9 +13,12 @@ use alloc::{
 };
 
 use crate::driver::base::device::device_number::DeviceNumber;
+use crate::filesystem::vfs::file::PageCache;
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
+use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
+use crate::mm::VmFaultReason;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
@@ -118,6 +121,9 @@ pub struct FATInode {
 
     /// 目录名
     dname: DName,
+
+    /// 页缓存
+    page_cache: Option<Arc<PageCache>>,
 }
 
 impl FATInode {
@@ -215,7 +221,13 @@ impl LockedFATInode {
             },
             special_node: None,
             dname,
+            page_cache: None,
         })));
+
+        if !inode.0.lock().inode_type.is_dir() {
+            let page_cache = PageCache::new(Some(Arc::downgrade(&inode) as Weak<dyn IndexNode>));
+            inode.0.lock().page_cache = Some(page_cache);
+        }
 
         inode.0.lock().self_ref = Arc::downgrade(&inode);
 
@@ -270,6 +282,19 @@ impl FileSystem for FATFileSystem {
             self.bpb.bytes_per_sector.into(),
             FAT_MAX_NAMELEN,
         )
+    }
+
+    unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        PageFaultHandler::filemap_fault(pfm)
+    }
+
+    unsafe fn map_pages(
+        &self,
+        pfm: &mut PageFaultMessage,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
+        PageFaultHandler::filemap_map_pages(pfm, start_pgoff, end_pgoff)
     }
 }
 
@@ -348,6 +373,7 @@ impl FATFileSystem {
             },
             special_node: None,
             dname: DName::default(),
+            page_cache: None,
         })));
 
         let result: Arc<FATFileSystem> = Arc::new(FATFileSystem {
@@ -1841,6 +1867,10 @@ impl IndexNode for LockedFATInode {
             .upgrade()
             .map(|item| item as Arc<dyn IndexNode>)
             .ok_or(SystemError::EINVAL)
+    }
+
+    fn page_cache(&self) -> Option<Arc<PageCache>> {
+        self.0.lock().page_cache.clone()
     }
 }
 

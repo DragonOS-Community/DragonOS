@@ -272,12 +272,12 @@ impl IndexNode for TcpSocket {
 }
 
 impl Socket for TcpSocket {
-    fn epoll_items(&self) -> &EPollItems {
-        &self.epitems
+    fn epoll_items(&self) -> EPollItems {
+        self.epitems.clone()
     }
 
-    fn wait_queue(&self) -> &WaitQueue {
-        &self.wait_queue
+    fn wait_queue(&self) -> WaitQueue {
+        self.wait_queue.clone()
     }
 
     fn update_io_events(&self) -> Result<EPollEventType, SystemError> {
@@ -432,12 +432,12 @@ impl IndexNode for TcpStream {
 }
 
 impl Socket for TcpStream {
-    fn epoll_items(&self) -> &EPollItems {
-        &self.epitems
+    fn epoll_items(&self) -> EPollItems {
+        self.epitems.clone()
     }
 
-    fn wait_queue(&self) -> &WaitQueue {
-        &self.wait_queue
+    fn wait_queue(&self) -> WaitQueue {
+        self.wait_queue.clone()
     }
 
     fn update_io_events(&self) -> Result<EPollEventType, SystemError> {

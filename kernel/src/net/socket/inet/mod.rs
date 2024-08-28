@@ -14,6 +14,7 @@ pub use common::BoundInner;
 // pub use raw::RawSocket;
 pub use datagram::UdpSocket;
 pub use stream::TcpSocket;
+pub use syscall::Inet;
 
 use crate::filesystem::vfs::IndexNode;
 

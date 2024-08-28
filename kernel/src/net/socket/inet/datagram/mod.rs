@@ -34,7 +34,7 @@ impl UdpSocket {
             inner: RwLock::new(Some(UdpInner::Unbound(UnboundUdp::new()))),
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
-            epoll_items: EPollItems::new(),
+            epoll_items: EPollItems::default(),
             self_ref: me.clone(),
         });
     }
@@ -123,7 +123,7 @@ impl UdpSocket {
         if self.is_nonblock() {
             return self.try_recv(buf).map(|(size, _)| size);
         } else {
-            return self.poll_unit().busy_wait(EP::EPOLLIN, 
+            return self.wait_queue.busy_wait(EP::EPOLLIN, 
                 || self.try_recv(buf).map(|(size, _)| size)
             );
         }
@@ -203,12 +203,12 @@ impl IndexNode for UdpSocket {
 }
 
 impl Socket for UdpSocket {
-    fn wait_queue(&self) -> &crate::net::socket::common::poll_unit::WaitQueue {
-        &self.wait_queue
+    fn wait_queue(&self) -> WaitQueue {
+        self.wait_queue.clone()
     }
 
-    fn epoll_items(&self) -> &crate::net::socket::common::poll_unit::EPollItems {
-        &self.epoll_items
+    fn epoll_items(&self) -> EPollItems {
+        self.epoll_items.clone()
     }
 
     fn update_io_events(&self) -> Result<EPollEventType, SystemError> {

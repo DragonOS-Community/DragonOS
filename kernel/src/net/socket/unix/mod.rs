@@ -6,7 +6,7 @@ use system_error::SystemError;
 use crate::{libs::spinlock::SpinLock, net::Endpoint};
 
 use super::{
-    handle::GlobalSocketHandle, PosixSocketHandleItem, Socket, inode::SocketInode, SocketMetadata,
+    handle::GlobalSocketHandle, PosixSocketHandleItem, Socket, inode::Inode, SocketMetadata,
     Options, InetSocketType,
 };
 
@@ -14,7 +14,7 @@ use super::{
 pub struct StreamSocket {
     metadata: SocketMetadata,
     buffer: Arc<SpinLock<Vec<u8>>>,
-    peer_inode: Option<Arc<SocketInode>>,
+    peer_inode: Option<Arc<Inode>>,
     handle: GlobalSocketHandle,
     posix_item: Arc<PosixSocketHandleItem>,
 }
@@ -126,7 +126,7 @@ impl Socket for StreamSocket {
 pub struct SeqpacketSocket {
     metadata: SocketMetadata,
     buffer: Arc<SpinLock<Vec<u8>>>,
-    peer_inode: Option<Arc<SocketInode>>,
+    peer_inode: Option<Arc<Inode>>,
     handle: GlobalSocketHandle,
     posix_item: Arc<PosixSocketHandleItem>,
 }

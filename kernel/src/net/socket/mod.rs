@@ -45,53 +45,29 @@ use super::{
 pub mod inet;
 pub mod netlink;
 pub mod unix;
-pub mod define;
-pub mod common;
+mod define;
+mod common;
+mod inode;
+mod family;
+mod utils;
 
-pub use define::{AddressFamily, Options as SocketOptions, OptionsLevel as SocketOptionsLevel, Types as SocketTypes};
+pub use define::{Options as SocketOptions, OptionsLevel as SocketOptionsLevel, Type};
+pub use inode::Inode;
+pub use family::{AddressFamily, Family};
+pub use utils::create_socket;
 
 /* For setsockopt(2) */
 // See: linux-5.19.10/include/uapi/asm-generic/socket.h#9
 pub const SOL_SOCKET: u8 = 1;
 
-// /// 根据地址族、socket类型和协议创建socket
-// pub(super) fn new_unbound_socket(
-//     address_family: AddressFamily,
-//     socket_type: PosixSocketType,
-//     protocol: Protocol,
-// ) -> Result<Box<dyn Socket>, SystemError> {
-//     let socket: Box<dyn Socket> = match address_family {
-//         AddressFamily::Unix => match socket_type {
-//             PosixSocketType::Stream => Box::new(StreamSocket::new(Options::default())),
-//             PosixSocketType::SeqPacket => Box::new(SeqpacketSocket::new(Options::default())),
-//             _ => {
-//                 return Err(SystemError::EINVAL);
-//             }
-//         },
-//         AddressFamily::INet => match socket_type {
-//             PosixSocketType::Stream => Box::new(TcpSocket::new(Options::default())),
-//             PosixSocketType::Datagram => Box::new(BoundUdp::new(Options::default())),
-//             PosixSocketType::Raw => Box::new(RawSocket::new(protocol, Options::default())),
-//             _ => {
-//                 return Err(SystemError::EINVAL);
-//             }
-//         },
-//         _ => {
-//             return Err(SystemError::EAFNOSUPPORT);
-//         }
-//     };
-
-//     Ok(socket)
-// }
-
-pub trait Socket: IndexNode{
+pub trait Socket: IndexNode {
     /// # `epoll_items`
     /// socket的epoll事件集
-    fn epoll_items(&self) -> &EPollItems;
+    fn epoll_items(&self) -> EPollItems;
 
     /// # `wait_queue`
     /// 获取socket的wait queue
-    fn wait_queue(&self) -> &WaitQueue;
+    fn wait_queue(&self) -> WaitQueue;
 
     /// # `connect` 
     /// 对应于POSIX的connect函数，用于连接到指定的远程服务器端点
@@ -161,29 +137,22 @@ pub trait Socket: IndexNode{
 
     /// # `update_io_events`
     /// 更新socket的事件。
-    /// 原socket::poll
     fn update_io_events(&self) -> Result<EPollEventType, SystemError>;
-
-    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        Ok(self.update_io_events()?.bits() as usize)
-    }
-
-    // fn as_any(&self) -> &dyn Any;
 }
 
-bitflags! {
-    /// @brief socket的选项
-    #[derive(Default)]
-    pub struct Options: u32 {
-        /// 是否阻塞
-        const BLOCK = 1 << 0;
-        /// 是否允许广播
-        const BROADCAST = 1 << 1;
-        /// 是否允许多播
-        const MULTICAST = 1 << 2;
-        /// 是否允许重用地址
-        const REUSEADDR = 1 << 3;
-        /// 是否允许重用端口
-        const REUSEPORT = 1 << 4;
-    }
-}
+// bitflags! {
+//     /// @brief socket的选项
+//     #[derive(Default)]
+//     pub struct Options: u32 {
+//         /// 是否阻塞
+//         const BLOCK = 1 << 0;
+//         /// 是否允许广播
+//         const BROADCAST = 1 << 1;
+//         /// 是否允许多播
+//         const MULTICAST = 1 << 2;
+//         /// 是否允许重用地址
+//         const REUSEADDR = 1 << 3;
+//         /// 是否允许重用端口
+//         const REUSEPORT = 1 << 4;
+//     }
+// }

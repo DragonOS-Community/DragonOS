@@ -463,6 +463,7 @@ impl Syscall {
                 let addr = args[1] as *const SockAddr;
                 let addrlen = args[2];
                 let virt_addr = VirtAddr::new(addr as usize);
+                log::debug!("SYS_BIND: bind addr.addr_nl: {:?}, addrlen: {}", (unsafe{addr.as_ref().unwrap().addr_nl}), addrlen);
                 // 验证addr的地址是否合法
                 if verify_area(virt_addr, addrlen).is_err() {
                     // 地址空间超出了用户空间的范围，不合法

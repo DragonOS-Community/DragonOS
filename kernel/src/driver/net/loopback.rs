@@ -4,7 +4,6 @@ use crate::driver::base::device::bus::Bus;
 use crate::driver::base::device::driver::Driver;
 use crate::driver::base::device::{Device, DeviceType, IdTable};
 use crate::driver::base::kobject::{KObjType, KObject, KObjectState};
-use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::spinlock::SpinLock;
 use crate::net::{generate_iface_id, NET_DEVICES};
 use crate::time::Instant;
@@ -15,15 +14,15 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
+use log::debug;
 use smoltcp::wire::HardwareAddress;
 use smoltcp::{
     phy::{self},
     wire::{IpAddress, IpCidr},
 };
 use system_error::SystemError;
-use unified_init::macros::unified_init;
 
-use super::NetDevice;
+use super::{Iface, IfaceCommon};
 
 const DEVICE_NAME: &str = "loopback";
 
@@ -76,6 +75,7 @@ impl phy::TxToken for LoopbackTxToken {
         let result = f(buffer.as_mut_slice());
         let mut device = self.driver.inner.lock();
         device.loopback_transmit(buffer);
+        debug!("lo transmit!");
         result
     }
 }
@@ -131,6 +131,7 @@ impl Loopback {
 /// 为实现获得不可变引用的Interface的内部可变性，故为Driver提供UnsafeCell包裹器
 ///
 /// 参考virtio_net.rs
+#[derive(Debug)]
 struct LoopbackDriverWapper(UnsafeCell<LoopbackDriver>);
 unsafe impl Send for LoopbackDriverWapper {}
 unsafe impl Sync for LoopbackDriverWapper {}
@@ -235,11 +236,10 @@ impl phy::Device for LoopbackDriver {
 
 /// ## LoopbackInterface结构
 /// 封装驱动包裹器和iface，设置接口名称
+#[derive(Debug)]
 pub struct LoopbackInterface {
     driver: LoopbackDriverWapper,
-    iface_id: usize,
-    iface: SpinLock<smoltcp::iface::Interface>,
-    name: String,
+    common: IfaceCommon,
 }
 
 impl LoopbackInterface {
@@ -264,29 +264,20 @@ impl LoopbackInterface {
             smoltcp::iface::Interface::new(iface_config, &mut driver, Instant::now().into());
         //设置网卡地址为127.0.0.1
         iface.update_ip_addrs(|ip_addrs| {
-            ip_addrs
-                .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
-                .unwrap();
+            for i in 1..=8 {
+                ip_addrs
+                    .push(IpCidr::new(IpAddress::v4(127, 0, 0, i), 8))
+                    .expect("Push ipCidr failed: full");
+            }
         });
-        let driver = LoopbackDriverWapper(UnsafeCell::new(driver));
+        
         Arc::new(LoopbackInterface {
-            driver,
-            iface_id,
-            iface: SpinLock::new(iface),
-            name: "lo".to_string(),
+            driver: LoopbackDriverWapper(UnsafeCell::new(driver)),
+            common: IfaceCommon::new(iface_id, iface),
         })
     }
 }
 
-impl Debug for LoopbackInterface {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("LoopbackInterface")
-            .field("iface_id", &self.iface_id)
-            .field("iface", &"smtoltcp::iface::Interface")
-            .field("name", &self.name)
-            .finish()
-    }
-}
 //TODO: 向sysfs注册lo设备
 impl KObject for LoopbackInterface {
     fn as_any_ref(&self) -> &dyn core::any::Any {
@@ -322,7 +313,7 @@ impl KObject for LoopbackInterface {
     }
 
     fn name(&self) -> String {
-        self.name.clone()
+        "lo".to_string()
     }
 
     fn set_name(&self, _name: String) {
@@ -392,79 +383,30 @@ impl Device for LoopbackInterface {
     }
 }
 
-impl NetDevice for LoopbackInterface {
+impl Iface for LoopbackInterface {
+    fn common(&self) -> &IfaceCommon {
+        &self.common
+    }
+
+    fn name(&self) -> String {
+        "lo".to_string()
+    }
+
     /// 由于lo网卡设备不是实际的物理设备，其mac地址需要手动设置为一个默认值，这里默认为0200000001
     fn mac(&self) -> smoltcp::wire::EthernetAddress {
         let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
         smoltcp::wire::EthernetAddress(mac)
     }
 
-    #[inline]
-    fn nic_id(&self) -> usize {
-        self.iface_id
-    }
-
-    #[inline]
-    fn name(&self) -> String {
-        self.name.clone()
-    }
-    /// ## `update_ip_addrs` 用于更新接口的 IP 地址。
-    ///
-    /// ## 参数
-    /// - `&self` ：自身引用
-    /// - `ip_addrs` ：一个包含 `smoltcp::wire::IpCidr` 的切片，表示要设置的 IP 地址和子网掩码
-    ///
-    /// ## 返回值
-    /// - 如果 `ip_addrs` 的长度不为 1，返回 `Err(SystemError::EINVAL)`，表示输入参数无效
-    /// - 如果更新成功，返回 `Ok(())`
-    fn update_ip_addrs(
-        &self,
-        ip_addrs: &[smoltcp::wire::IpCidr],
-    ) -> Result<(), system_error::SystemError> {
-        if ip_addrs.len() != 1 {
-            return Err(SystemError::EINVAL);
-        }
-
-        self.iface.lock().update_ip_addrs(|addrs| {
-            let dest = addrs.iter_mut().next();
-
-            if let Some(dest) = dest {
-                *dest = ip_addrs[0];
-            } else {
-                addrs.push(ip_addrs[0]).expect("Push ipCidr failed: full");
-            }
-        });
-        return Ok(());
-    }
-    /// ## `poll` 用于轮询接口的状态。
-    ///
-    /// ## 参数
-    /// - `&self` ：自身引用
-    /// - `sockets` ：一个可变引用到 `smoltcp::iface::SocketSet`，表示要轮询的套接字集
-    ///
-    /// ## 返回值
-    /// - 如果轮询成功，返回 `Ok(())`
-    /// - 如果轮询失败，返回 `Err(SystemError::EAGAIN_OR_EWOULDBLOCK)`，表示需要再次尝试或者操作会阻塞
-    fn poll(&self, sockets: &mut smoltcp::iface::SocketSet) -> Result<(), SystemError> {
-        let timestamp: smoltcp::time::Instant = Instant::now().into();
-        let mut guard = self.iface.lock();
-        let poll_res = guard.poll(timestamp, self.driver.force_get_mut(), sockets);
-        if poll_res {
-            return Ok(());
-        }
-        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-    }
-
-    #[inline(always)]
-    fn inner_iface(&self) -> &SpinLock<smoltcp::iface::Interface> {
-        return &self.iface;
+    fn poll(&self) {
+        self.common.poll(self.driver.force_get_mut())
     }
 }
 
 pub fn loopback_probe() {
     loopback_driver_init();
 }
-/// ## lo网卡设备初始化函数
+/// # lo网卡设备初始化函数
 /// 创建驱动和iface，初始化一个lo网卡，添加到全局NET_DEVICES中
 pub fn loopback_driver_init() {
     let driver = LoopbackDriver::new();
@@ -472,11 +414,12 @@ pub fn loopback_driver_init() {
 
     NET_DEVICES
         .write_irqsave()
-        .insert(iface.iface_id, iface.clone());
+        .insert(iface.nic_id(), iface.clone());
 }
 
 /// ## lo网卡设备的注册函数
-#[unified_init(INITCALL_DEVICE)]
+//TODO: 现在先不用初始化宏进行注册，使virtonet排在网卡列表头，待网络子系统重构后再使用初始化宏并修复该bug
+// #[unified_init(INITCALL_DEVICE)]
 pub fn loopback_init() -> Result<(), SystemError> {
     loopback_probe();
     return Ok(());

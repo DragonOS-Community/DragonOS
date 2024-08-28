@@ -3,13 +3,11 @@ use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::libs::wait_queue::WaitQueue;
-use crate::net::event_poll::{EPollEventType, EPollItem, EventPoll, KernelIoctlData};
+use crate::net::event_poll::EPollEventType;
 use crate::process::ProcessManager;
 use crate::syscall::Syscall;
-use alloc::collections::LinkedList;
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::sync::Weak;
 use alloc::vec::Vec;
 use core::any::Any;
 use ida::IdAllocator;
@@ -21,14 +19,14 @@ bitflags! {
     pub struct EventFdFlags: u32{
         /// Provide semaphore-like semantics for reads from the new
         /// file descriptor.
-        const EFD_SEMAPHORE = 0o1;
+        const EFD_SEMAPHORE = 1;
         /// Set the close-on-exec (FD_CLOEXEC) flag on the new file
         /// descriptor
-        const EFD_CLOEXEC = 0o2000000;
+        const EFD_CLOEXEC = 2;
         /// Set the O_NONBLOCK file status flag on the open file
         /// description (see open(2)) referred to by the new file
         /// descriptor
-        const EFD_NONBLOCK = 0o0004000;
+        const EFD_NONBLOCK = 4;
     }
 }
 
@@ -50,7 +48,6 @@ impl EventFd {
 pub struct EventFdInode {
     eventfd: SpinLock<EventFd>,
     wait_queue: WaitQueue,
-    epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
 }
 
 impl EventFdInode {
@@ -58,22 +55,7 @@ impl EventFdInode {
         EventFdInode {
             eventfd: SpinLock::new(eventfd),
             wait_queue: WaitQueue::default(),
-            epitems: SpinLock::new(LinkedList::new()),
         }
-    }
-    pub fn remove_epoll(&self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
-        let is_remove = !self
-            .epitems
-            .lock_irqsave()
-            .extract_if(|x| x.epoll().ptr_eq(epoll))
-            .collect::<Vec<_>>()
-            .is_empty();
-
-        if is_remove {
-            return Ok(());
-        }
-
-        Err(SystemError::ENOENT)
     }
 }
 
@@ -103,7 +85,7 @@ impl IndexNode for EventFdInode {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: SpinLockGuard<FilePrivateData>,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if len < 8 {
             return Err(SystemError::EINVAL);
@@ -133,11 +115,6 @@ impl IndexNode for EventFdInode {
         }
         let val_bytes = val.to_ne_bytes();
         buf[..8].copy_from_slice(&val_bytes);
-
-        let pollflag = EPollEventType::from_bits_truncate(self.poll(&data)? as u32);
-        // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
-
         return Ok(8);
     }
 
@@ -154,7 +131,7 @@ impl IndexNode for EventFdInode {
         _offset: usize,
         len: usize,
         buf: &[u8],
-        data: SpinLockGuard<FilePrivateData>,
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if len < 8 {
             return Err(SystemError::EINVAL);
@@ -180,10 +157,6 @@ impl IndexNode for EventFdInode {
         let mut eventfd = self.eventfd.lock();
         eventfd.count += val;
         self.wait_queue.wakeup_all(None);
-
-        let pollflag = EPollEventType::from_bits_truncate(self.poll(&data)? as u32);
-        // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
         return Ok(8);
     }
 
@@ -213,18 +186,6 @@ impl IndexNode for EventFdInode {
 
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
         Ok(())
-    }
-    fn kernel_ioctl(
-        &self,
-        arg: Arc<dyn KernelIoctlData>,
-        _data: &FilePrivateData,
-    ) -> Result<usize, SystemError> {
-        let epitem = arg
-            .arc_any()
-            .downcast::<EPollItem>()
-            .map_err(|_| SystemError::EFAULT)?;
-        self.epitems.lock().push_back(epitem);
-        Ok(0)
     }
     fn fs(&self) -> Arc<dyn FileSystem> {
         panic!("EventFd does not have a filesystem")

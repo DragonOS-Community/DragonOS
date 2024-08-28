@@ -35,8 +35,12 @@ impl Init {
         Init::Unbound(new_smoltcp_socket())
     }
 
+    /// 传入一个已经绑定的socket
     pub(super) fn new_bound(inner: socket::inet::BoundInner) -> Self {
-        Init::Bound(inner)
+        let endpoint = inner.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
+            socket.local_endpoint().expect("A Bound Socket Must Have A Local Endpoint")
+        });
+        Init::Bound((inner, endpoint))
     }
 
     pub(super) fn bind(self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<Self, SystemError> {
@@ -57,20 +61,23 @@ impl Init {
     }
 
     pub(super) fn bind_to_ephemeral(self, remote_endpoint: smoltcp::wire::IpEndpoint) 
-        -> Result<Self, SystemError> 
+        -> Result<(socket::inet::BoundInner, smoltcp::wire::IpEndpoint), (Self, SystemError)> 
     {
         match self {
             Init::Unbound(socket) => {
                 let (bound, address) = socket::inet::BoundInner::bind_ephemeral(
                     socket, 
                     remote_endpoint.addr,
-                )?;
-                let bound_port = bound.port_manager().bind_ephemeral_port(Types::Tcp)?;
+                ).map_err(|err| (Self::new(), err))?;
+                let bound_port = bound
+                    .port_manager()
+                    .bind_ephemeral_port(Types::Tcp)
+                    .map_err(|err| (Self::new(), err))?;
                 let endpoint = smoltcp::wire::IpEndpoint::new(address, bound_port);
-                Ok( Init::Bound((bound, endpoint)) )
+                Ok( (bound, endpoint) )
             },
             Init::Bound(_) => {
-                Err(EINVAL)
+                Err((self, EINVAL))
             }
         }
     }
@@ -78,22 +85,61 @@ impl Init {
     pub(super) fn connect(self, remote_endpoint: smoltcp::wire::IpEndpoint) -> Result<Connecting, (Self, SystemError)> {
         let (inner, local) = match self {
             Init::Unbound(_) => {
-                self.bind_to_ephemeral(remote_endpoint).map_err(|err| (self, err))?
+                self.bind_to_ephemeral(remote_endpoint)?
             },
             Init::Bound(inner) => inner,
         };
-        inner.with_mut(|socket| {
+        let result = inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
             socket.connect(
                 inner.iface().smol_iface().lock().context(),
                 remote_endpoint,
                 local
-            ).map_err(|_| (self, ECONNREFUSED))
-        })?;
-        return Ok( Connecting::new(inner) );
+            ).map_err(|_| ECONNREFUSED)
+        });
+        match result {
+            Ok(_) => {
+                Ok( Connecting::new(inner) )
+            },
+            Err(err) => {
+                Err((Init::Bound((inner, local)), err))
+            }
+        }
+    }
+
+    /// # `listen`
+    pub(super) fn listen(self, backlog: usize) -> Result<Listening, (Self, SystemError)> {
+        let (inner, local) = match self {
+            Init::Unbound(_) => {
+                return Err((self, EINVAL));
+            },
+            Init::Bound(inner) => inner,
+        };
+        let mut inners = Vec::new();
+        if let Err(err) = || -> Result<(), SystemError> {
+            for _ in 0..(backlog-1) { // -1 because the first one is already bound
+                let new_listen = socket::inet::BoundInner::bind(
+                    new_listen_smoltcp_socket(local), 
+                    &local.addr,
+                )?;
+                inners.push(new_listen);
+            }
+            Ok(())
+        }() { 
+            return Err((Init::Bound((inner, local)), err));
+        }
+
+        if let Err(err) = inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
+            socket.listen(local).map_err(|_| ECONNREFUSED)
+        }) {
+            return Err((Init::Bound((inner, local)), err));
+        }
+
+        inners.push(inner);
+        return Ok( Listening { inners });
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 enum ConnectResult {
     Connected,
     #[default] Connecting,
@@ -110,7 +156,7 @@ impl Connecting {
     fn new(inner: socket::inet::BoundInner) -> Self {
         Connecting {
             inner,
-            result: RwLock::new(Err(EAGAIN_OR_EWOULDBLOCK)),
+            result: RwLock::new(ConnectResult::Connecting),
         }
     }
 
@@ -120,10 +166,11 @@ impl Connecting {
 
     pub fn into_result(self) -> (Inner, Option<SystemError>) {
         use ConnectResult::*;
-        match self.result.read() {
+        let result = self.result.read_irqsave().clone();
+        match result {
             Connecting => (Inner::Connecting(self), Some(EAGAIN_OR_EWOULDBLOCK)),
             Connected => (Inner::Established(Established { inner: self.inner }), None),
-            Refused => (Inner::Init(Init::Bound(self.inner)), Some(ECONNREFUSED)),
+            Refused => (Inner::Init(Init::new_bound(self.inner)), Some(ECONNREFUSED)),
         }
     }
 
@@ -134,19 +181,19 @@ impl Connecting {
     /// _exactly_ once. The caller is responsible for not missing this event.
     #[must_use]
     pub(super) fn update_io_events(&self) -> bool {
-        if self.result.read().is_some() {
+        if matches!(*self.result.read_irqsave(), ConnectResult::Connecting) {
             return false;
         }
 
         self.inner.with_mut(|socket: &mut smoltcp::socket::tcp::Socket| {
-            let mut result = self.result.write();
-            if result.is_some() {
-                return false;
+            let mut result = self.result.write_irqsave();
+            if matches!(*result, ConnectResult::Refused | ConnectResult::Connected) {
+                return false; // Already connected or refused
             }
 
             // Connected
             if socket.can_send() {
-                result.replace(Ok(()));
+                *result = ConnectResult::Connected;
                 return true;
             }
             // Connecting
@@ -154,8 +201,8 @@ impl Connecting {
                 return false;
             }
             // Refused
-            result.replace(Err(ECONNREFUSED));
-            true
+            *result = ConnectResult::Refused;
+            return true;
         })
     }
 }

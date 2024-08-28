@@ -26,7 +26,7 @@ impl TcpSocket {
     pub fn new(nonblock: bool) -> Arc<Self> {
         Arc::new_cyclic(
             |me| Self {
-                inner: RwLock::new(Some(Inner::Unbound(Init::new()))),
+                inner: RwLock::new(Some(Inner::Init(Init::new()))),
                 shutdown: Shutdown::new(),
                 nonblock: AtomicBool::new(nonblock),
                 epitems: EPollItems::new(),
@@ -57,8 +57,8 @@ impl TcpSocket {
         match writer.take().expect("Tcp Inner is None") {
             Inner::Init(inner) => {
                 let bound = inner.bind(local_endpoint)?;
-                if let Init::Bound((bound, _)) = &bound {
-                    bound.0.iface().common().bind_socket(self.self_ref.upgrade().unwrap());
+                if let Init::Bound((ref bound, _)) = bound {
+                    bound.iface().common().bind_socket(self.self_ref.upgrade().unwrap());
                 }
                 writer.replace(Inner::Init(bound));
                 Ok(())
@@ -68,16 +68,31 @@ impl TcpSocket {
     }
 
     pub fn do_listen(&self, backlog: usize) -> Result<(), SystemError> {
-        self.write_state(|inner| {
-            match inner {
-                Inner::Connecting(connecting) => {
-                    connecting.listen(backlog).map(|inners| 
-                        Inner::Listening(inners)
-                    )
+        let mut writer = self.inner.write();
+        let inner = writer.take().expect("Tcp Inner is None");
+        let (listening, err) = match inner {
+            Inner::Init(init) => {
+                let listen_result = init.listen(backlog);
+                match listen_result {
+                    Ok(listening) => {
+                        (Inner::Listening(listening), None)
+                    }
+                    Err((init, err)) => {
+                        (Inner::Init(init), Some(err))
+                    }
                 }
-                _ => Err(EINVAL),
             }
-        })
+            _ => {
+                (inner, Some(EINVAL))
+            }
+        };
+        writer.replace(listening);
+        drop(writer);
+
+        if let Some(err) = err {
+            return Err(err);
+        }
+        return Ok(());
     }
 
     pub fn try_accept(&self) -> Result<(Arc<TcpStream>, smoltcp::wire::IpEndpoint), SystemError> {
@@ -136,8 +151,8 @@ impl TcpSocket {
             Inner::Listening(inner) => {
                 (Inner::Listening(inner), Some(EISCONN))
             }
-            Inner::Established(_) => {
-                (Inner::Established(Established::new()), Some(EISCONN))
+            Inner::Established(inner) => {
+                (Inner::Established(inner), Some(EISCONN))
             }
         };
         writer.replace(init);
@@ -252,7 +267,7 @@ impl IndexNode for TcpSocket {
 
     fn poll(&self, private_data: &crate::filesystem::vfs::FilePrivateData) -> Result<usize, SystemError> {
         drop(private_data);
-        
+        self.update_io_events().map(|x| x.bits() as usize)   
     }
 }
 
@@ -307,7 +322,7 @@ impl Socket for TcpSocket {
                     }
 
                     // TODO socket error
-                    return Ok(mask.bits() as usize);
+                    return Ok(mask);
                 })
             }
             _ => Err(EINVAL),
@@ -349,20 +364,7 @@ impl TcpStream {
     }
 
     pub fn recv_slice(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        use smoltcp::socket::tcp::RecvError::*;
-        let received = match self.inner.recv_slice(buf) {
-            Ok(0) => Err(EAGAIN_OR_EWOULDBLOCK),
-            Ok(size) => Ok(size),
-            Err(InvalidState) => {
-                log::error!("TcpStream::recv_slice: InvalidState");
-                Err(EINVAL)
-            },
-            Err(Finished) => {
-                // Remote send is shutdown
-                self.shutdown.recv_shutdown();
-                Err(ENOTCONN)
-            }
-        };
+        let received = self.inner.recv_slice(buf);
         poll_ifaces();
         received
     }
@@ -493,7 +495,7 @@ impl Socket for TcpStream {
             }
 
             // TODO socket error
-            return Ok(mask.bits() as usize);
+            return Ok(mask);
         })
     }
 }

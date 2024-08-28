@@ -168,7 +168,7 @@ pub trait Socket: IndexNode{
         Ok(self.update_io_events()?.bits() as usize)
     }
 
-    fn as_any(&self) -> &dyn Any;
+    // fn as_any(&self) -> &dyn Any;
 }
 
 bitflags! {

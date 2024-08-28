@@ -361,23 +361,22 @@ impl ElfLoader {
         let mut last_bss: VirtAddr = VirtAddr::new(0);
         let mut bss_prot: Option<ProtFlags> = None;
         for section in phdr_table {
-            log::debug!("loading {:?}", section);
             if section.p_type == PT_LOAD {
+                log::debug!("loading {:?}", section);
                 let mut elf_type = MapFlags::MAP_PRIVATE;
                 let elf_prot = Self::make_prot(section.p_flags, true, true);
                 let vaddr = TryInto::<usize>::try_into(section.p_vaddr).unwrap();
+                let mut addr_to_map = load_addr + vaddr;
                 if interp_hdr.e_type == ET_EXEC || load_addr_set {
                     elf_type.insert(MapFlags::MAP_FIXED) //TODO 应当为MapFlags::MAP_FIXED，暂时未支持
-                }
-                load_addr += vaddr;
-                if load_bias != 0 && interp_hdr.e_type == ET_DYN {
-                    load_addr -= vaddr;
+                } else if load_bias != 0 && interp_hdr.e_type == ET_DYN {
+                    addr_to_map = VirtAddr::new(0);
                 }
                 let map_addr = Self::load_elf_segment(
                     &mut interp_elf_ex.vm().clone().write(),
                     interp_elf_ex,
                     &section,
-                    load_addr,
+                    addr_to_map,
                     &elf_prot,
                     &elf_type,
                     total_size,
@@ -452,9 +451,8 @@ impl ElfLoader {
                     _ => return ExecError::InvalidParemeter,
                 })?;
         }
-        if load_addr + TryInto::<usize>::try_into(interp_hdr.e_entry).unwrap()
-            > MMArch::USER_END_VADDR
-        {
+        load_addr += TryInto::<usize>::try_into(interp_hdr.e_entry).unwrap();
+        if load_addr > MMArch::USER_END_VADDR {
             return Err(ExecError::BadAddress(Some(
                 load_addr + TryInto::<usize>::try_into(interp_hdr.e_entry).unwrap(),
             )));
@@ -868,6 +866,7 @@ impl BinaryLoader for ElfLoader {
 
             // 加载这个段到用户空间
 
+            log::debug!("bias: {load_bias}");
             let e = Self::load_elf_segment(
                 &mut user_vm,
                 param,
@@ -882,7 +881,7 @@ impl BinaryLoader for ElfLoader {
                 SystemError::ENOMEM => ExecError::OutOfMemory,
                 _ => ExecError::Other(format!("load_elf_segment failed: {:?}", e)),
             })?;
-
+            log::debug!("e.0={:?}", e.0);
             // 如果地址不对，那么就报错
             if !e.1 {
                 return Err(ExecError::BadAddress(Some(e.0)));
@@ -1006,12 +1005,7 @@ impl BinaryLoader for ElfLoader {
         }
         // debug!("to create auxv");
         let mut user_vm = binding.write();
-        self.create_auxv(
-            param,
-            interp_load_addr.unwrap_or(program_entrypoint),
-            phdr_vaddr,
-            &ehdr,
-        )?;
+        self.create_auxv(param, program_entrypoint, phdr_vaddr, &ehdr)?;
 
         // debug!("auxv create ok");
         user_vm.start_code = start_code.unwrap_or(VirtAddr::new(0));
@@ -1019,8 +1013,8 @@ impl BinaryLoader for ElfLoader {
         user_vm.start_data = start_data.unwrap_or(VirtAddr::new(0));
         user_vm.end_data = end_data.unwrap_or(VirtAddr::new(0));
 
-        let result = BinaryLoaderResult::new(program_entrypoint);
-        // debug!("elf load OK!!!");
+        let result = BinaryLoaderResult::new(interp_load_addr.unwrap_or(program_entrypoint));
+        // kdebug!("elf load OK!!!");
         return Ok(result);
     }
 }

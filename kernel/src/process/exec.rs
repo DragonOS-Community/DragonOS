@@ -228,9 +228,15 @@ impl ProcInitInfo {
         &self,
         ustack: &mut UserStack,
     ) -> Result<(VirtAddr, VirtAddr), SystemError> {
+        // TODO: 实现栈的16字节对齐
+        // self.push_slice(
+        //     ustack,
+        //     vec![0u8; 0x10 - (ustack.sp().data() & 0b1111)].as_slice(),
+        // )?;
+        self.push_slice(ustack, vec![0u8; 8].as_slice())?;
+
         // 先把程序的名称压入栈中
         self.push_str(ustack, &self.proc_name)?;
-
         // 然后把环境变量压入栈中
         let envps = self
             .envs

@@ -860,8 +860,10 @@ impl Syscall {
             }
 
             SYS_EXIT_GROUP => {
-                warn!("SYS_EXIT_GROUP has not yet been implemented");
-                Ok(0)
+                let exit_code = args[0];
+                Self::exit(exit_code)
+                // warn!("SYS_EXIT_GROUP has not yet been implemented");
+                // Ok(0)
             }
 
             SYS_MADVISE => {

@@ -28,7 +28,7 @@ pub fn virtio_probe() {
 fn virtio_probe_pci() {
     let mut list = PCI_DEVICE_LINKEDLIST.write();
     let virtio_list = virtio_device_search(&mut list);
-    for virtio_device in virtio_list.into_iter() {
+    for virtio_device in virtio_list {
         let dev_id = virtio_device.common_header.device_id;
         let dev_id = DeviceId::new(None, Some(format!("{dev_id}"))).unwrap();
         match PciTransport::new::<HalImpl>(virtio_device, dev_id.clone()) {

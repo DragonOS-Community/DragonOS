@@ -18,7 +18,6 @@ use crate::mm::VirtAddr;
 
 use alloc::string::ToString;
 use alloc::sync::Arc;
-use core::ops::Add;
 use core::{
     fmt::{self, Display, Formatter},
     mem::{align_of, size_of},

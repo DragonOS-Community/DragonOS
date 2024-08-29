@@ -27,7 +27,7 @@ pub trait Socket: Sync + Send + Debug {
     /// 接受连接，仅用于listening stream socket
     /// ## Block
     /// 如果没有连接到来，会阻塞
-    fn accept(&self) -> Result<(Arc<dyn IndexNode>, Endpoint), SystemError> {
+    fn accept(&self) -> Result<(Arc<Inode>, Endpoint), SystemError> {
         Err(ENOSYS)
     }
 
@@ -150,7 +150,7 @@ pub trait Socket: Sync + Send + Debug {
     }
 
     /// # `shutdown`
-    fn shutdown(&self, how: Shutdown) -> Result<(), SystemError> {
+    fn shutdown(&self, how: ShutdownTemp) -> Result<(), SystemError> {
         Err(ENOSYS)
     }
 

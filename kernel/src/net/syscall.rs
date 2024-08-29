@@ -218,11 +218,11 @@ impl Syscall {
     /// @param addrlen 地址长度
     ///
     /// @return 成功返回0，失败返回错误码
-    pub fn connect(fd: usize, addr: *const SockAddr, addrlen: usize) -> Result<usize, SystemError> {
+    pub fn connect(fd: usize, addr: *const SockAddr, addrlen: u32) -> Result<usize, SystemError> {
         let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
-            .ok_or(SystemError::EBADF)?;;
+            .ok_or(SystemError::EBADF)?;
         socket.connect(endpoint)?;
         Ok(0)
     }
@@ -234,7 +234,7 @@ impl Syscall {
     /// @param addrlen 地址长度
     ///
     /// @return 成功返回0，失败返回错误码
-    pub fn bind(fd: usize, addr: *const SockAddr, addrlen: usize) -> Result<usize, SystemError> {
+    pub fn bind(fd: usize, addr: *const SockAddr, addrlen: u32) -> Result<usize, SystemError> {
         // 打印收到的参数
         log::debug!("bind: fd={:?}, family={:?}, addrlen={:?}", fd, (unsafe{addr.as_ref().unwrap().family}), addrlen);
         let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
@@ -267,7 +267,7 @@ impl Syscall {
         buf: &[u8],
         flags: u32,
         addr: *const SockAddr,
-        addrlen: usize,
+        addrlen: u32,
     ) -> Result<usize, SystemError> {
         let endpoint = if addr.is_null() {
             None
@@ -302,7 +302,7 @@ impl Syscall {
         buf: &mut [u8],
         flags: u32,
         addr: *mut SockAddr,
-        addrlen: *mut usize,
+        addrlen: *mut u32,
     ) -> Result<usize, SystemError> {
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
@@ -335,29 +335,30 @@ impl Syscall {
     /// @param flags 标志，暂时未使用
     ///
     /// @return 成功返回接收的字节数，失败返回错误码
-    pub fn recvmsg(fd: usize, msg: &mut MsgHdr, _flags: u32) -> Result<usize, SystemError> {
-        // 检查每个缓冲区地址是否合法，生成iovecs
-        let mut iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
+    pub fn recvmsg(fd: usize, msg: &mut MsgHdr, flags: u32) -> Result<usize, SystemError> {
+        todo!()
+        // // 检查每个缓冲区地址是否合法，生成iovecs
+        // let mut iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
 
-        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
-            .get_socket(fd as i32)
-            .ok_or(SystemError::EBADF)?;
+        // let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
+        //     .get_socket(fd as i32)
+        //     .ok_or(SystemError::EBADF)?;
 
-        let mut buf = iovs.new_buf(true);
-        // 从socket中读取数据
-        let (n, endpoint) = socket.recv_msg(&mut buf);
-        drop(socket);
+        // let flags = socket::MessageFlag::from_bits_truncate(flags as u32);
 
-        let n: usize = n?;
+        // let mut buf = iovs.new_buf(true);
+        // // 从socket中读取数据
+        // let recv_size = socket.recv_msg(&mut buf, flags)?;
+        // drop(socket);
 
-        // 将数据写入用户空间的iovecs
-        iovs.scatter(&buf[..n]);
+        // // 将数据写入用户空间的iovecs
+        // iovs.scatter(&buf[..recv_size]);
 
-        let sockaddr_in = SockAddr::from(endpoint);
-        unsafe {
-            sockaddr_in.write_to_user(msg.msg_name, &mut msg.msg_namelen)?;
-        }
-        return Ok(n);
+        // // let sockaddr_in = SockAddr::from(endpoint);
+        // // unsafe {
+        // //     sockaddr_in.write_to_user(msg.msg_name, &mut msg.msg_namelen)?;
+        // // }
+        // return Ok(recv_size);
     }
 
     /// @brief sys_listen系统调用的实际执行函数
@@ -370,9 +371,7 @@ impl Syscall {
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let mut socket = unsafe { socket.inner_no_preempt() };
-        socket.listen(backlog)?;
-        return Ok(0);
+        socket.listen(backlog).map(|_| 0)
     }
 
     /// @brief sys_shutdown系统调用的实际执行函数
@@ -385,8 +384,7 @@ impl Syscall {
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let mut socket = unsafe { socket.inner_no_preempt() };
-        socket.shutdown(ShutdownType::from_bits_truncate((how + 1) as u8))?;
+        socket.shutdown(socket::ShutdownTemp::from_how(how))?;
         return Ok(0);
     }
 
@@ -445,15 +443,13 @@ impl Syscall {
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        // debug!("accept: socket={:?}", socket);
-        let mut socket = unsafe { socket.inner_no_preempt() };
+
         // 从socket中接收连接
         let (new_socket, remote_endpoint) = socket.accept()?;
         drop(socket);
 
         // debug!("accept: new_socket={:?}", new_socket);
         // Insert the new socket into the file descriptor vector
-        let new_socket: Arc<socket::Inode> = socket::Inode::new(new_socket, None);
 
         let mut file_mode = FileMode::O_RDWR;
         if flags & SOCK_NONBLOCK.bits() != 0 {
@@ -500,9 +496,7 @@ impl Syscall {
         let endpoint = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?
-            .inner()
-            .endpoint()
-            .ok_or(SystemError::EINVAL)?;
+            .get_name()?;
 
         let sockaddr_in = SockAddr::from(endpoint);
         unsafe {
@@ -530,8 +524,8 @@ impl Syscall {
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let socket = socket.inner();
-        let endpoint: Endpoint = socket.peer_endpoint().ok_or(SystemError::EINVAL)?;
+
+        let endpoint: Endpoint = socket.get_peer_name()?;
         drop(socket);
 
         let sockaddr_in = SockAddr::from(endpoint);
@@ -539,129 +533,6 @@ impl Syscall {
             sockaddr_in.write_to_user(addr, addrlen)?;
         }
         return Ok(0);
-    }
-}
-
-
-#[allow(non_camel_case_types)]
-#[derive(Debug, Clone, Copy, FromPrimitive, ToPrimitive, PartialEq, Eq)]
-pub enum PosixSocketOption {
-    SO_DEBUG = 1,
-    SO_REUSEADDR = 2,
-    SO_TYPE = 3,
-    SO_ERROR = 4,
-    SO_DONTROUTE = 5,
-    SO_BROADCAST = 6,
-    SO_SNDBUF = 7,
-    SO_RCVBUF = 8,
-    SO_SNDBUFFORCE = 32,
-    SO_RCVBUFFORCE = 33,
-    SO_KEEPALIVE = 9,
-    SO_OOBINLINE = 10,
-    SO_NO_CHECK = 11,
-    SO_PRIORITY = 12,
-    SO_LINGER = 13,
-    SO_BSDCOMPAT = 14,
-    SO_REUSEPORT = 15,
-    SO_PASSCRED = 16,
-    SO_PEERCRED = 17,
-    SO_RCVLOWAT = 18,
-    SO_SNDLOWAT = 19,
-    SO_RCVTIMEO_OLD = 20,
-    SO_SNDTIMEO_OLD = 21,
-
-    SO_SECURITY_AUTHENTICATION = 22,
-    SO_SECURITY_ENCRYPTION_TRANSPORT = 23,
-    SO_SECURITY_ENCRYPTION_NETWORK = 24,
-
-    SO_BINDTODEVICE = 25,
-
-    /// 与SO_GET_FILTER相同
-    SO_ATTACH_FILTER = 26,
-    SO_DETACH_FILTER = 27,
-
-    SO_PEERNAME = 28,
-
-    SO_ACCEPTCONN = 30,
-
-    SO_PEERSEC = 31,
-    SO_PASSSEC = 34,
-
-    SO_MARK = 36,
-
-    SO_PROTOCOL = 38,
-    SO_DOMAIN = 39,
-
-    SO_RXQ_OVFL = 40,
-
-    /// 与SCM_WIFI_STATUS相同
-    SO_WIFI_STATUS = 41,
-    SO_PEEK_OFF = 42,
-
-    /* Instruct lower device to use last 4-bytes of skb data as FCS */
-    SO_NOFCS = 43,
-
-    SO_LOCK_FILTER = 44,
-    SO_SELECT_ERR_QUEUE = 45,
-    SO_BUSY_POLL = 46,
-    SO_MAX_PACING_RATE = 47,
-    SO_BPF_EXTENSIONS = 48,
-    SO_INCOMING_CPU = 49,
-    SO_ATTACH_BPF = 50,
-    // SO_DETACH_BPF = SO_DETACH_FILTER,
-    SO_ATTACH_REUSEPORT_CBPF = 51,
-    SO_ATTACH_REUSEPORT_EBPF = 52,
-
-    SO_CNX_ADVICE = 53,
-    SCM_TIMESTAMPING_OPT_STATS = 54,
-    SO_MEMINFO = 55,
-    SO_INCOMING_NAPI_ID = 56,
-    SO_COOKIE = 57,
-    SCM_TIMESTAMPING_PKTINFO = 58,
-    SO_PEERGROUPS = 59,
-    SO_ZEROCOPY = 60,
-    /// 与SCM_TXTIME相同
-    SO_TXTIME = 61,
-
-    SO_BINDTOIFINDEX = 62,
-
-    SO_TIMESTAMP_OLD = 29,
-    SO_TIMESTAMPNS_OLD = 35,
-    SO_TIMESTAMPING_OLD = 37,
-    SO_TIMESTAMP_NEW = 63,
-    SO_TIMESTAMPNS_NEW = 64,
-    SO_TIMESTAMPING_NEW = 65,
-
-    SO_RCVTIMEO_NEW = 66,
-    SO_SNDTIMEO_NEW = 67,
-
-    SO_DETACH_REUSEPORT_BPF = 68,
-
-    SO_PREFER_BUSY_POLL = 69,
-    SO_BUSY_POLL_BUDGET = 70,
-
-    SO_NETNS_COOKIE = 71,
-    SO_BUF_LOCK = 72,
-    SO_RESERVE_MEM = 73,
-    SO_TXREHASH = 74,
-    SO_RCVMARK = 75,
-    SO_PASSPIDFD = 76,
-}
-
-impl TryFrom<i32> for PosixSocketOption {
-    type Error = SystemError;
-
-    fn try_from(value: i32) -> Result<Self, Self::Error> {
-        match <Self as FromPrimitive>::from_i32(value) {
-            Some(p) => Ok(p),
-            None => Err(SystemError::EINVAL),
-        }
-    }
-}
-
-impl From<PosixSocketOption> for i32 {
-    fn from(value: PosixSocketOption) -> Self {
-        <PosixSocketOption as ToPrimitive>::to_i32(&value).unwrap()
     }
 }
 

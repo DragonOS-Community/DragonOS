@@ -37,7 +37,7 @@ use crate::{
 };
 use alloc::{boxed::Box, vec::Vec};
 
-use crate::net::socket::{AddressFamily, Socket, SocketOptions, SocketTypes};
+use crate::net::socket::{AddressFamily, Socket, Options as SocketOptions, Type as SocketTypes};
 use lazy_static::lazy_static;
 
 use super::callback::NetlinkCallback;

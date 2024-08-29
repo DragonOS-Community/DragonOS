@@ -531,9 +531,8 @@ impl File {
     pub fn remove_epoll(&self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
         match self.file_type {
             FileType::Socket => {
-                let inode = self.inode.downcast_ref::<SocketInode>().unwrap();
-
-                socket.remove_epoll(epoll)
+                let socket = self.inode.downcast_ref::<SocketInode>().unwrap();
+                socket.epoll_items().remove(epoll)
             }
             FileType::Pipe => {
                 let inode = self.inode.downcast_ref::<LockedPipeInode>().unwrap();

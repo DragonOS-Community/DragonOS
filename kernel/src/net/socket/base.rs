@@ -5,6 +5,7 @@ use alloc::sync::Arc;
 use system_error::SystemError::{self, *};
 use crate::filesystem::vfs::IndexNode;
 use crate::net::socket::*;
+use crate::net::syscall_util::MsgHdr;
 
 /// # `Socket` methods
 /// ## Reference
@@ -108,10 +109,10 @@ pub trait Socket: Sync + Send + Debug {
         Err(ENOSYS) 
     }
 
-    // /// # `recv_msg`
-    // fn recv_msg(&self, msg: &mut MsgHdr, flags: MessageFlag) -> Result<usize, SystemError> {
-    //     Err(ENOSYS)
-    // }
+    /// # `recv_msg`
+    fn recv_msg(&self, msg: &mut MsgHdr, flags: MessageFlag) -> Result<usize, SystemError> {
+        Err(ENOSYS)
+    }
 
     // select
 
@@ -120,10 +121,10 @@ pub trait Socket: Sync + Send + Debug {
         Err(ENOSYS)
     }
 
-    // /// # `send_msg`
-    // fn send_msg(&self, msg: &MsgHdr, flags: MessageFlag) -> Result<usize, SystemError> {
-    //     Err(ENOSYS)
-    // }
+    /// # `send_msg`
+    fn send_msg(&self, msg: &MsgHdr, flags: MessageFlag) -> Result<usize, SystemError> {
+        Err(ENOSYS)
+    }
 
     /// # `send_to`
     fn send_to(&self, buffer: &[u8], flags: MessageFlag, address: Endpoint) -> Result<usize, SystemError> {

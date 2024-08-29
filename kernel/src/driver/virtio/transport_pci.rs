@@ -121,9 +121,8 @@ impl PciTransport {
     pub fn new<H: Hal>(
         device: &mut PciDeviceStructureGeneralDevice,
         dev_id: Arc<DeviceId>,
-        irq_number_offset: usize,
     ) -> Result<Self, VirtioPciError> {
-        let irq = VIRTIO_RECV_VECTOR.add(irq_number_offset as u32);
+        let irq = VIRTIO_RECV_VECTOR;
         let header = &device.common_header;
         let bus_device_function = header.bus_device_function;
         if header.vendor_id != VIRTIO_VENDOR_ID {

@@ -41,6 +41,7 @@ unsafe extern "C" fn kernel_main(
     mb2_magic: u64,
     bsp_gdt_size: u64,
     bsp_idt_size: u64,
+    boot_entry_type: u64,
 ) -> ! {
     let mut gdtp = DescriptorTablePointer::<usize>::default();
     let gdt_vaddr =

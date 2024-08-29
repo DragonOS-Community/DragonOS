@@ -508,7 +508,7 @@ impl Syscall {
                     }
 
                     // 验证addrlen的地址是否合法
-                    if verify_area(virt_addrlen, core::mem::size_of::<u32>()).is_err() {
+                    if verify_area(virt_addrlen, core::mem::size_of::<usize>()).is_err() {
                         // 地址空间超出了用户空间的范围，不合法
                         return Err(SystemError::EFAULT);
                     }
@@ -519,12 +519,11 @@ impl Syscall {
                     }
                     return Ok(());
                 };
-                let r = security_check();
-                if let Err(e) = r {
+                if let Err(e) = security_check() {
                     Err(e)
                 } else {
                     let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-                    Self::recvfrom(args[0], buf, flags, addr, addrlen as *mut u32)
+                    Self::recvfrom(args[0], buf, flags, addr, addrlen)
                 }
             }
 

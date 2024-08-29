@@ -29,7 +29,7 @@ impl TcpSocket {
                 inner: RwLock::new(Some(Inner::Init(Init::new()))),
                 shutdown: Shutdown::new(),
                 nonblock: AtomicBool::new(nonblock),
-                epitems: EPollItems::new(),
+                epitems: EPollItems::default(),
                 wait_queue: WaitQueue::default(),
                 self_ref: me.clone(),
             }

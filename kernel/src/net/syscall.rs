@@ -342,11 +342,10 @@ impl Syscall {
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let socket = unsafe { socket.inner_no_preempt() };
 
         let mut buf = iovs.new_buf(true);
         // 从socket中读取数据
-        let (n, endpoint) = socket.read(&mut buf);
+        let (n, endpoint) = socket.recv_msg(&mut buf);
         drop(socket);
 
         let n: usize = n?;

@@ -7,6 +7,7 @@ use crate::libs::mutex::Mutex;
 use crate::net::Endpoint;
 
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 
 
 #[derive(Debug)]
@@ -53,6 +54,10 @@ impl Connected {
 
         return (this, peer);
     }
+
+    pub fn peer_addr(&self) -> Option<Endpoint> {
+        self.peer_addr.clone()
+    }
 }
 
 #[derive(Debug)]
@@ -98,25 +103,3 @@ impl Listener {
     }
 }
 
-// static BACKLOG_TABLE: BacklogTable = BacklogTable::new();
-
-// struct BacklogTable {
-//     backlog_sockets: RwLock<BTreeMap<Option<Endpoint>, Arc<Backlog>>>,
-// }
-
-// impl BacklogTable {
-//     const fn new() -> Self {
-//         Self {
-//             backlog_sockets: RwLock::new(BTreeMap::new()),
-//         }
-//     }
-
-//     fn add_backlog(&self, addr: Option<Endpoint>, backlog: usize) -> Result<(), SystemError>{
-//         let mut backlog_sockets = self.backlog_sockets.write();
-//         if backlog_sockets.contains_key(&addr) {
-//             return Err(SystemError::EADDRINUSE);
-//         }
-//         let 
-//         Ok(())
-//     }
-// }

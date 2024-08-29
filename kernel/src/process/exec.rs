@@ -261,13 +261,12 @@ impl ProcInitInfo {
         // 实现栈的16字节对齐，如果argv、envp、argc在栈中的长度加起来不能对齐16字节，则手动填充一个空字节
         // TODO 感觉这样对齐有点简陋，后续可能要完善一下
         if (envps.len() + argps.len() + 1) * core::mem::align_of::<usize>() % 0x10 != 0 {
-            self.push_slice(ustack, &vec![0u8; 1])?;
+            self.push_slice(ustack, &[0u8; 1])?;
         }
 
         // 压入auxv
         self.push_slice(ustack, &[null::<u8>(), null::<u8>()])?;
         for (&k, &v) in self.auxv.iter() {
-            log::debug!("auxv: {:?}", ustack.sp());
             self.push_slice(ustack, &[k as usize, v])?;
         }
 

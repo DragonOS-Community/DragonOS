@@ -37,6 +37,8 @@ pub enum InetSocket {
 }
 
 impl InetSocket {
+    /// # `on_iface_events`
+    /// 通知socket发生了事件
     pub fn on_iface_events(&self) {
         todo!()
     }

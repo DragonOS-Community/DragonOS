@@ -1,7 +1,8 @@
 use alloc::sync::Arc;
+use system_error::SystemError;
 use crate::filesystem::vfs::IndexNode;
 
-use super::Socket;
+use crate::net::socket::*;
 use super::common::poll_unit::EPollItems;
 
 #[derive(Debug)]
@@ -11,13 +12,45 @@ pub struct Inode {
 
 impl IndexNode for Inode {
     fn read_at(
-            &self,
-            offset: usize,
-            len: usize,
-            buf: &mut [u8],
-            data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-        ) -> Result<usize, system_error::SystemError> {
-        self.inner.read_at(offset, len, buf, data)
+        &self,
+        _offset: usize,
+        _len: usize,
+        buf: &mut [u8],
+        data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        drop(data);
+        self.inner.read(buf)
+    }
+
+    fn write_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        buf: &[u8],
+        data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        drop(data);
+        self.inner.write(buf)
+    }
+
+    
+    /* Following are not yet available in socket */
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    /* filesystem associate interfaces are about unix and netlink socket */
+    fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
+        unimplemented!()
+    }
+
+    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
+        unimplemented!()
+    }
+
+    fn poll(&self, private_data: &crate::filesystem::vfs::FilePrivateData) -> Result<usize, SystemError> {
+        drop(private_data);
+        self.update_io_events().map(|event| event.bits() as usize)
     }
 }
 
@@ -32,8 +65,8 @@ impl Socket for Inode {
         self.inner.wait_queue()
     }
 
-    fn update_io_events(&self) -> Result<crate::net::event_poll::EPollEventType, system_error::SystemError> {
-        todo!()
+    fn update_io_events(&self) -> Result<crate::net::event_poll::EPollEventType, SystemError> {
+        self.inner.update_io_events()
     }
 }
 

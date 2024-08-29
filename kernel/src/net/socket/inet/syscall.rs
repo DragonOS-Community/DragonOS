@@ -4,12 +4,15 @@ use alloc::sync::Arc;
 
 use super::AnyInetSocket;
 
-pub fn create_inet_socket(sock_type: crate::net::socket::define::SysArgSocketType, protocol: smoltcp::wire::IpProtocol) -> Result<Arc<dyn AnyInetSocket>, SystemError> {
-    use crate::net::socket::define::SysArgSocketType as SocketTypes;
+// use crate::net::syscall_util::SysArgSocketType;
+use crate::net::socket;
+
+
+fn create_inet_socket(sock_type: socket::Type, protocol: smoltcp::wire::IpProtocol) -> Result<Arc<dyn AnyInetSocket>, SystemError> {
     use smoltcp::wire::IpProtocol::*;
     match protocol {
         Udp => {
-            if sock_type.types() != SocketTypes::DGRAM {
+            if !matches!(sock_type, socket::Type::Datagram) {
                 return Err(EPROTONOSUPPORT);
             }
             todo!()
@@ -21,7 +24,7 @@ pub fn create_inet_socket(sock_type: crate::net::socket::define::SysArgSocketTyp
             todo!()
         }
         HopByHop => {
-            if sock_type.types() != SocketTypes::RAW {
+            if !matches!(sock_type, socket::Type::Raw) {
                 return Err(EPROTONOSUPPORT);
             }
             todo!()
@@ -32,12 +35,11 @@ pub fn create_inet_socket(sock_type: crate::net::socket::define::SysArgSocketTyp
     }
 }
 
-use crate::net::socket;
-
 pub struct Inet;
 impl socket::family::Family for Inet {
     fn socket(stype: socket::Type, protocol: u32) -> Arc<socket::Inode> {
-        todo!()
+        // create_inet_socket(stype, protocol.into())
+        todo!("{:?}{:?}", stype, protocol);
     }
 
     

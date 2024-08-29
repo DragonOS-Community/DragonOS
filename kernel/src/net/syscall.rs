@@ -4,7 +4,7 @@ use alloc::{boxed::Box, sync::Arc};
 use log::debug;
 use num_traits::{FromPrimitive, ToPrimitive};
 use smoltcp::wire;
-use system_error::SystemError;
+use system_error::SystemError::{self, *};
 
 use crate::{
     filesystem::vfs::{
@@ -14,18 +14,15 @@ use crate::{
     },
     libs::spinlock::SpinLockGuard,
     mm::{verify_area, VirtAddr},
-    net::socket::{netlink::af_netlink::NetlinkSock, AddressFamily, SOL_SOCKET},
+    // net::socket::{netlink::af_netlink::NetlinkSock, AddressFamily},
     process::ProcessManager,
     syscall::Syscall,
 };
 
-use super::{
-    socket::{netlink::endpoint::NetlinkEndpoint, Socket, },
-    Endpoint,
-};
+use super::socket::{self, Socket, Endpoint};
+use super::socket::AddressFamily as AF;
 
-use super::syscall_util::SysArgSocketType;
-use super::socket;
+pub use super::syscall_util::*;
 
 /// Flags for socket, socketpair, accept4
 const SOCK_CLOEXEC: FileMode = FileMode::O_CLOEXEC;
@@ -45,18 +42,18 @@ impl Syscall {
         // 打印收到的参数
         log::debug!("socket: address_family={:?}, socket_type={:?}, protocol={:?}", address_family, socket_type, protocol);
         let address_family = socket::AddressFamily::try_from(address_family as u16)?;
-        let socket_type = SysArgSocketType::from_bits_truncate(socket_type as u32);
-        let is_nonblock = socket_type.is_nonblock();
-        let is_close_on_exec = socket_type.is_cloexec();
-        let stype = socket::Type::try_from(socket_type)?;
+        let type_arg = SysArgSocketType::from_bits_truncate(socket_type as u32);
+        let is_nonblock = type_arg.is_nonblock();
+        let is_close_on_exec = type_arg.is_cloexec();
+        let stype = socket::Type::try_from(type_arg)?;
 
         let inode = socket::create_socket(
             address_family, 
             stype, 
             protocol as u32, 
             is_nonblock, 
-            is_close_on_exec
-        );
+            is_close_on_exec,
+        )?;
 
         let file = File::new(inode, FileMode::O_RDWR)?;
         // 把socket添加到当前进程的文件描述符表中
@@ -80,25 +77,38 @@ impl Syscall {
         protocol: usize,
         fds: &mut [i32],
     ) -> Result<usize, SystemError> {
-        let address_family = AddressFamily::try_from(address_family as u16)?;
-        let socket_type = PosixSocketType::try_from((socket_type & 0xf) as u8)?;
-        let protocol = Protocol::from(protocol as u8);
+        let address_family = AF::try_from(address_family as u16)?;
+        let socket_type = SysArgSocketType::from_bits_truncate(socket_type as u32);
+        let stype = socket::Type::try_from(socket_type)?;
 
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
 
+        // check address family, only support AF_UNIX
+        if address_family != AF::Unix {
+            return Err(SystemError::EAFNOSUPPORT);
+        }
+
         // 创建一对socket
-        let inode0 = SocketInode::new(new_unbound_socket(address_family, socket_type, protocol)?, None);
-        let inode1 = SocketInode::new(new_unbound_socket(address_family, socket_type, protocol)?, None);
+        let inode0 = socket::create_socket(
+            address_family,
+            stype, 
+            protocol as u32, 
+            socket_type.is_nonblock(), 
+            socket_type.is_cloexec()
+        )?;
+        let inode1 = socket::create_socket(
+            address_family, 
+            stype, 
+            protocol as u32, 
+            socket_type.is_nonblock(), 
+            socket_type.is_cloexec()
+        )?;
 
         // 进行pair
         unsafe {
-            inode0
-                .inner_no_preempt()
-                .connect(Endpoint::Inode(Some(inode1.clone())))?;
-            inode1
-                .inner_no_preempt()
-                .connect(Endpoint::Inode(Some(inode0.clone())))?;
+            inode0.connect(socket::Endpoint::Inode(inode1.clone()))?;
+            inode1.connect(socket::Endpoint::Inode(inode0.clone()))?;
         }
 
         fds[0] = fd_table_guard.alloc_fd(File::new(inode0, FileMode::O_RDWR)?, None)?;
@@ -121,12 +131,10 @@ impl Syscall {
         optname: usize,
         optval: &[u8],
     ) -> Result<usize, SystemError> {
-        let sol = SocketOptionsLevel::from_bits_truncate(level as u32);
-        let socket_inode: Arc<SocketInode> = ProcessManager::current_pcb()
+        let sol = socket::OptionsLevel::try_from(level as u32)?;
+        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        // 获取内层的socket（真正的数据）
-        let socket: SpinLockGuard<Box<dyn Socket>> = socket_inode.inner();
         debug!("setsockopt: level={:?}", level);
         return socket.set_option(sol, optname, optval).map(|_| 0);
     }
@@ -149,16 +157,19 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         // 获取socket
         let optval = optval as *mut u32;
-        let binding: Arc<SocketInode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
-            .ok_or(SystemError::EBADF)?;
-        let socket = binding.inner();
+            .ok_or(EBADF)?;
 
-        if level as u8 == SOL_SOCKET {
-            let optname = PosixSocketOption::try_from(optname as i32)
-                .map_err(|_| SystemError::ENOPROTOOPT)?;
+        let level = socket::OptionsLevel::try_from(level as u32)?;
+
+        use socket::OptionsLevel as SOL;
+        use socket::Options as SO;
+        if matches!(level, SOL::SOCKET) {
+            let optname = SO::try_from(optname as u32)
+                .map_err(|_| ENOPROTOOPT)?;
             match optname {
-                PosixSocketOption::SO_SNDBUF => {
+                SO::SNDBUF => {
                     // 返回发送缓冲区大小
                     unsafe {
                         *optval = socket.metadata().tx_buf_size as u32;
@@ -166,7 +177,7 @@ impl Syscall {
                     }
                     return Ok(0);
                 }
-                PosixSocketOption::SO_RCVBUF => {
+                SO::RCVBUF => {
                     // 返回默认的接收缓冲区大小
                     unsafe {
                         *optval = socket.metadata().rx_buf_size as u32;
@@ -175,7 +186,7 @@ impl Syscall {
                     return Ok(0);
                 }
                 _ => {
-                    return Err(SystemError::ENOPROTOOPT);
+                    return Err(ENOPROTOOPT);
                 }
             }
         }
@@ -187,19 +198,17 @@ impl Syscall {
         // to be interpreted by the TCP protocol, level should be set to the
         // protocol number of TCP.
 
-        let posix_protocol =
-            PosixIpProtocol::try_from(level as u16).map_err(|_| SystemError::ENOPROTOOPT)?;
-        if posix_protocol == PosixIpProtocol::TCP {
+        if matches!(level, SOL::TCP) {
             let optname = PosixTcpSocketOptions::try_from(optname as i32)
-                .map_err(|_| SystemError::ENOPROTOOPT)?;
+                .map_err(|_| ENOPROTOOPT)?;
             match optname {
                 PosixTcpSocketOptions::Congestion => return Ok(0),
                 _ => {
-                    return Err(SystemError::ENOPROTOOPT);
+                    return Err(ENOPROTOOPT);
                 }
             }
         }
-        return Err(SystemError::ENOPROTOOPT);
+        return Err(ENOPROTOOPT);
     }
 
     /// @brief sys_connect系统调用的实际执行函数
@@ -211,10 +220,9 @@ impl Syscall {
     /// @return 成功返回0，失败返回错误码
     pub fn connect(fd: usize, addr: *const SockAddr, addrlen: usize) -> Result<usize, SystemError> {
         let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
-        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
-            .ok_or(SystemError::EBADF)?;
-        let mut socket = unsafe { socket.inner_no_preempt() };
+            .ok_or(SystemError::EBADF)?;;
         socket.connect(endpoint)?;
         Ok(0)
     }
@@ -230,24 +238,17 @@ impl Syscall {
         // 打印收到的参数
         log::debug!("bind: fd={:?}, family={:?}, addrlen={:?}", fd, (unsafe{addr.as_ref().unwrap().family}), addrlen);
         let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
-        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         log::debug!("bind: socket={:?}", socket);
-        let mut socket = unsafe { socket.inner_no_preempt() };
-        // 解锁 SpinLockGuard 并获取 Box<dyn Socket>
-        let socket_box: &Box<dyn Socket> = &*socket;
 
-        // 解引用 Box 并调用 as_any 方法
-        let socket_ref: &dyn Socket = &**socket_box;
-
-        // 打印 dyn Socket 对象的具体类型
-        if let Some(socket_any) = socket_ref.as_any().downcast_ref::<NetlinkSock>() {
-            log::debug!("Socket type: NetlinkSock");
-        } else {
-            log::debug!("Socket type: Unknown: {:?}", socket_ref);
-        }
-        log::debug!("bind: socket={:?}", socket);
+        // // 打印 dyn Socket 对象的具体类型
+        // if let Some(socket_any) = socket_ref.as_any().downcast_ref::<NetlinkSock>() {
+        //     log::debug!("Socket type: NetlinkSock");
+        // } else {
+        //     log::debug!("Socket type: Unknown: {:?}", socket_ref);
+        // }
         socket.bind(endpoint)?;
         Ok(0)
     }
@@ -264,7 +265,7 @@ impl Syscall {
     pub fn sendto(
         fd: usize,
         buf: &[u8],
-        _flags: u32,
+        flags: u32,
         addr: *const SockAddr,
         addrlen: usize,
     ) -> Result<usize, SystemError> {
@@ -274,11 +275,17 @@ impl Syscall {
             Some(SockAddr::to_endpoint(addr, addrlen)?)
         };
 
-        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
+        let flags = socket::MessageFlag::from_bits_truncate(flags as u32);
+
+        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let socket = unsafe { socket.inner_no_preempt() };
-        return socket.write(buf, endpoint);
+        
+        if let Some(endpoint) = endpoint {
+            return socket.send_to(buf, flags, endpoint);
+        } else {
+            return socket.send(buf, flags);
+        }
     }
 
     /// @brief sys_recvfrom系统调用的实际执行函数
@@ -293,22 +300,26 @@ impl Syscall {
     pub fn recvfrom(
         fd: usize,
         buf: &mut [u8],
-        _flags: u32,
+        flags: u32,
         addr: *mut SockAddr,
-        addrlen: *mut u32,
+        addrlen: *mut usize,
     ) -> Result<usize, SystemError> {
-        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let socket = unsafe { socket.inner_no_preempt() };
+        let flags = socket::MessageFlag::from_bits_truncate(flags as u32);
 
-        let (n, endpoint) = socket.read(buf);
+        let address = if addr.is_null() {
+            None
+        } else {
+            Some(SockAddr::to_endpoint(addr, unsafe{ addrlen.as_ref() }.ok_or(EINVAL)?.clone())?)
+        };
+
+        let (n, endpoint) = socket.recv_from(buf, flags, address)?;
         drop(socket);
 
-        let n: usize = n?;
-
         // 如果有地址信息，将地址信息写入用户空间
-        if !addr.is_null() {
+        if addr.is_null() {
             let sockaddr_in = SockAddr::from(endpoint);
             unsafe {
                 sockaddr_in.write_to_user(addr, addrlen)?;
@@ -328,14 +339,13 @@ impl Syscall {
         // 检查每个缓冲区地址是否合法，生成iovecs
         let mut iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
 
-        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let socket = unsafe { socket.inner_no_preempt() };
 
         let mut buf = iovs.new_buf(true);
         // 从socket中读取数据
-        let (n, endpoint) = socket.read(&mut buf);
+        let (n, endpoint) = socket.recv_msg(&mut buf);
         drop(socket);
 
         let n: usize = n?;
@@ -357,7 +367,7 @@ impl Syscall {
     ///
     /// @return 成功返回0，失败返回错误码
     pub fn listen(fd: usize, backlog: usize) -> Result<usize, SystemError> {
-        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let mut socket = unsafe { socket.inner_no_preempt() };
@@ -372,7 +382,7 @@ impl Syscall {
     ///
     /// @return 成功返回0，失败返回错误码
     pub fn shutdown(fd: usize, how: usize) -> Result<usize, SystemError> {
-        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let mut socket = unsafe { socket.inner_no_preempt() };
@@ -432,7 +442,7 @@ impl Syscall {
         addrlen: *mut u32,
         flags: u32,
     ) -> Result<usize, SystemError> {
-        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         // debug!("accept: socket={:?}", socket);
@@ -443,7 +453,7 @@ impl Syscall {
 
         // debug!("accept: new_socket={:?}", new_socket);
         // Insert the new socket into the file descriptor vector
-        let new_socket: Arc<SocketInode> = SocketInode::new(new_socket, None);
+        let new_socket: Arc<socket::Inode> = socket::Inode::new(new_socket, None);
 
         let mut file_mode = FileMode::O_RDWR;
         if flags & SOCK_NONBLOCK.bits() != 0 {
@@ -517,7 +527,7 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
 
-        let socket: Arc<SocketInode> = ProcessManager::current_pcb()
+        let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let socket = socket.inner();
@@ -532,328 +542,6 @@ impl Syscall {
     }
 }
 
-// 参考资料： https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/netinet_in.h.html#tag_13_32
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct SockAddrIn {
-    pub sin_family: u16,
-    pub sin_port: u16,
-    pub sin_addr: u32,
-    pub sin_zero: [u8; 8],
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct SockAddrUn {
-    pub sun_family: u16,
-    pub sun_path: [u8; 108],
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct SockAddrLl {
-    pub sll_family: u16,
-    pub sll_protocol: u16,
-    pub sll_ifindex: u32,
-    pub sll_hatype: u16,
-    pub sll_pkttype: u8,
-    pub sll_halen: u8,
-    pub sll_addr: [u8; 8],
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct SockAddrNl {
-    pub nl_family: AddressFamily,
-    pub nl_pad: u16,
-    pub nl_pid: u32,
-    pub nl_groups: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct SockAddrPlaceholder {
-    pub family: u16,
-    pub data: [u8; 14],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub union SockAddr {
-    pub family: u16,
-    pub addr_in: SockAddrIn,
-    pub addr_un: SockAddrUn,
-    pub addr_ll: SockAddrLl,
-    pub addr_nl: SockAddrNl,
-    pub addr_ph: SockAddrPlaceholder,
-}
-
-impl SockAddr {
-    /// @brief 把用户传入的SockAddr转换为Endpoint结构体
-    pub fn to_endpoint(addr: *const SockAddr, len: usize) -> Result<Endpoint, SystemError> {
-        verify_area(
-            VirtAddr::new(addr as usize),
-            core::mem::size_of::<SockAddr>(),
-        )
-        .map_err(|_| SystemError::EFAULT)?;
-
-        let addr = unsafe { addr.as_ref() }.ok_or(SystemError::EFAULT)?;
-        unsafe {
-            match AddressFamily::try_from(addr.family)? {
-                AddressFamily::INet => {
-                    if len < addr.len()? {
-                        return Err(SystemError::EINVAL);
-                    }
-
-                    let addr_in: SockAddrIn = addr.addr_in;
-
-                    let ip: wire::IpAddress = wire::IpAddress::from(wire::Ipv4Address::from_bytes(
-                        &u32::from_be(addr_in.sin_addr).to_be_bytes()[..],
-                    ));
-                    let port = u16::from_be(addr_in.sin_port);
-
-                    return Ok(Endpoint::Ip(Some(wire::IpEndpoint::new(ip, port))));
-                }
-                AddressFamily::Unix => {
-                    let addr_un: SockAddrUn = addr.addr_un;
-
-                    let path = CStr::from_bytes_until_nul(&addr_un.sun_path)
-                        .map_err(|_| SystemError::EINVAL)?
-                        .to_str()
-                        .map_err(|_| SystemError::EINVAL)?;
-
-                    let fd = Syscall::open(path.as_ptr(), FileMode::O_RDWR.bits(), 0o755, true)?;
-
-                    let binding = ProcessManager::current_pcb().fd_table();
-                    let fd_table_guard = binding.read();
-
-                    let file = fd_table_guard.get_file_by_fd(fd as i32).unwrap();
-                    if file.file_type() != FileType::Socket {
-                        return Err(SystemError::ENOTSOCK);
-                    }
-                    let inode = file.inode();
-                    let socketinode = inode.as_any_ref().downcast_ref::<Arc<SocketInode>>();
-
-                    return Ok(Endpoint::Inode(socketinode.cloned()));
-                }
-                AddressFamily::Packet => {
-                    // TODO: support packet socket
-                    return Err(SystemError::EINVAL);
-                }
-                AddressFamily::Netlink => {
-                    // TODO: support netlink socket
-                    let addr: SockAddrNl = addr.addr_nl;
-                    return Ok(Endpoint::Netlink(Some(NetlinkEndpoint::new(addr,len))));
-                }
-                _ => {
-                    return Err(SystemError::EINVAL);
-                }
-            }
-        }
-    }
-
-    /// @brief 获取地址长度
-    pub fn len(&self) -> Result<usize, SystemError> {
-        let ret = match AddressFamily::try_from(unsafe { self.family })? {
-            AddressFamily::INet => Ok(core::mem::size_of::<SockAddrIn>()),
-            AddressFamily::Packet => Ok(core::mem::size_of::<SockAddrLl>()),
-            AddressFamily::Netlink => Ok(core::mem::size_of::<SockAddrNl>()),
-            AddressFamily::Unix => Err(SystemError::EINVAL),
-            _ => Err(SystemError::EINVAL),
-        };
-
-        return ret;
-    }
-
-    /// @brief 把SockAddr的数据写入用户空间
-    ///
-    /// @param addr 用户空间的SockAddr的地址
-    /// @param len 要写入的长度
-    ///
-    /// @return 成功返回写入的长度，失败返回错误码
-    pub unsafe fn write_to_user(
-        &self,
-        addr: *mut SockAddr,
-        addr_len: *mut u32,
-    ) -> Result<usize, SystemError> {
-        // 当用户传入的地址或者长度为空时，直接返回0
-        if addr.is_null() || addr_len.is_null() {
-            return Ok(0);
-        }
-
-        // 检查用户传入的地址是否合法
-        verify_area(
-            VirtAddr::new(addr as usize),
-            core::mem::size_of::<SockAddr>(),
-        )
-        .map_err(|_| SystemError::EFAULT)?;
-
-        verify_area(
-            VirtAddr::new(addr_len as usize),
-            core::mem::size_of::<u32>(),
-        )
-        .map_err(|_| SystemError::EFAULT)?;
-
-        let to_write = min(self.len()?, *addr_len as usize);
-        if to_write > 0 {
-            let buf = core::slice::from_raw_parts_mut(addr as *mut u8, to_write);
-            buf.copy_from_slice(core::slice::from_raw_parts(
-                self as *const SockAddr as *const u8,
-                to_write,
-            ));
-        }
-        *addr_len = self.len()? as u32;
-        return Ok(to_write);
-    }
-}
-
-impl From<Endpoint> for SockAddr {
-    fn from(value: Endpoint) -> Self {
-        match value {
-            Endpoint::Ip(ip_endpoint) => {
-                // 未指定地址
-                if ip_endpoint.is_none() {
-                    return SockAddr {
-                        addr_ph: SockAddrPlaceholder {
-                            family: AddressFamily::Unspecified as u16,
-                            data: [0; 14],
-                        },
-                    };
-                }
-                // 指定了地址
-                let ip_endpoint = ip_endpoint.unwrap();
-                match ip_endpoint.addr {
-                    wire::IpAddress::Ipv4(ipv4_addr) => {
-                        let addr_in = SockAddrIn {
-                            sin_family: AddressFamily::INet as u16,
-                            sin_port: ip_endpoint.port.to_be(),
-                            sin_addr: u32::from_be_bytes(ipv4_addr.0).to_be(),
-                            sin_zero: [0; 8],
-                        };
-
-                        return SockAddr { addr_in };
-                    }
-                    _ => {
-                        unimplemented!("not support ipv6");
-                    }
-                }
-            }
-
-            Endpoint::LinkLayer(link_endpoint) => {
-                let addr_ll = SockAddrLl {
-                    sll_family: AddressFamily::Packet as u16,
-                    sll_protocol: 0,
-                    sll_ifindex: link_endpoint.interface as u32,
-                    sll_hatype: 0,
-                    sll_pkttype: 0,
-                    sll_halen: 0,
-                    sll_addr: [0; 8],
-                };
-
-                return SockAddr { addr_ll };
-            }
-
-            _ => {
-                // todo: support other endpoint, like Netlink...
-                unimplemented!("not support {value:?}");
-            }
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct MsgHdr {
-    /// 指向一个SockAddr结构体的指针
-    pub msg_name: *mut SockAddr,
-    /// SockAddr结构体的大小
-    pub msg_namelen: u32,
-    /// scatter/gather array
-    pub msg_iov: *mut IoVec,
-    /// elements in msg_iov
-    pub msg_iovlen: usize,
-    /// 辅助数据
-    pub msg_control: *mut u8,
-    /// 辅助数据长度
-    pub msg_controllen: usize,
-    /// 接收到的消息的标志
-    pub msg_flags: u32,
-}
-
-#[derive(Debug, Clone, Copy, FromPrimitive, ToPrimitive, PartialEq, Eq)]
-pub enum PosixIpProtocol {
-    /// Dummy protocol for TCP.
-    IP = 0,
-    /// Internet Control Message Protocol.
-    ICMP = 1,
-    /// Internet Group Management Protocol.
-    IGMP = 2,
-    /// IPIP tunnels (older KA9Q tunnels use 94).
-    IPIP = 4,
-    /// Transmission Control Protocol.
-    TCP = 6,
-    /// Exterior Gateway Protocol.
-    EGP = 8,
-    /// PUP protocol.
-    PUP = 12,
-    /// User Datagram Protocol.
-    UDP = 17,
-    /// XNS IDP protocol.
-    IDP = 22,
-    /// SO Transport Protocol Class 4.
-    TP = 29,
-    /// Datagram Congestion Control Protocol.
-    DCCP = 33,
-    /// IPv6-in-IPv4 tunnelling.
-    IPv6 = 41,
-    /// RSVP Protocol.
-    RSVP = 46,
-    /// Generic Routing Encapsulation. (Cisco GRE) (rfc 1701, 1702)
-    GRE = 47,
-    /// Encapsulation Security Payload protocol
-    ESP = 50,
-    /// Authentication Header protocol
-    AH = 51,
-    /// Multicast Transport Protocol.
-    MTP = 92,
-    /// IP option pseudo header for BEET
-    BEETPH = 94,
-    /// Encapsulation Header.
-    ENCAP = 98,
-    /// Protocol Independent Multicast.
-    PIM = 103,
-    /// Compression Header Protocol.
-    COMP = 108,
-    /// Stream Control Transport Protocol
-    SCTP = 132,
-    /// UDP-Lite protocol (RFC 3828)
-    UDPLITE = 136,
-    /// MPLS in IP (RFC 4023)
-    MPLSINIP = 137,
-    /// Ethernet-within-IPv6 Encapsulation
-    ETHERNET = 143,
-    /// Raw IP packets
-    RAW = 255,
-    /// Multipath TCP connection
-    MPTCP = 262,
-}
-
-impl TryFrom<u16> for PosixIpProtocol {
-    type Error = SystemError;
-
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
-        match <Self as FromPrimitive>::from_u16(value) {
-            Some(p) => Ok(p),
-            None => Err(SystemError::EPROTONOSUPPORT),
-        }
-    }
-}
-
-impl From<PosixIpProtocol> for u16 {
-    fn from(value: PosixIpProtocol) -> Self {
-        <PosixIpProtocol as ToPrimitive>::to_u16(&value).unwrap()
-    }
-}
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, FromPrimitive, ToPrimitive, PartialEq, Eq)]

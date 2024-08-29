@@ -91,7 +91,8 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     if [ ${VIRTIO_BLK_DEVICE} == false ]; then
       QEMU_DEVICES_DISK+="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 "
     else
-      QEMU_DEVICES_DISK=" -device virtio-blk-pci,drive=disk -device pci-bridge,chassis_nr=1,id=pci.1 -device pcie-root-port "
+     # QEMU_DEVICES_DISK=" -device virtio-blk-pci,drive=disk -device pci-bridge,chassis_nr=1,id=pci.1 -device pcie-root-port "
+      QEMU_DEVICES_DISK="-chardev socket,id=char0,path=/tmp/serial.sock,server,nowait -device virtio-serial -device virtconsole,chardev=char0 -device virtio-blk-pci,drive=disk -device pci-bridge,chassis_nr=1,id=pci.1 -device pcie-root-port "
     fi
     
     

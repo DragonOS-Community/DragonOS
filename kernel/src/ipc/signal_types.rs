@@ -81,6 +81,12 @@ impl SignalStruct {
     }
 }
 
+impl Default for SignalStruct {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Deref for SignalStruct {
     type Target = InnerSignalStruct;
 

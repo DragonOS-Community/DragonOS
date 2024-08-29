@@ -458,6 +458,12 @@ pub struct PageFlags<Arch> {
     phantom: PhantomData<Arch>,
 }
 
+impl<Arch: MemoryManagementArch> Default for PageFlags<Arch> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[allow(dead_code)]
 impl<Arch: MemoryManagementArch> PageFlags<Arch> {
     #[inline(always)]

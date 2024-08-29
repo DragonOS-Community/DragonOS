@@ -37,7 +37,7 @@ use crate::{
 };
 use alloc::{boxed::Box, vec::Vec};
 
-use crate::net::socket::{AddressFamily, Socket, SocketOptions, SocketTypes};
+use crate::net::socket::{AddressFamily, Socket, SocketOptions};
 use lazy_static::lazy_static;
 
 use super::callback::NetlinkCallback;
@@ -507,17 +507,13 @@ impl Socket for NetlinkSock{
         None
     }
 
-    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        Ok(self.update_io_events()?.bits() as usize)
-    }
-
     fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
         todo!()
     }
-    fn epoll_items(&self) -> &EPollItems{
+    fn epoll_items(&self) -> EPollItems{
         todo!()
     }
-    fn wait_queue(&self) -> &poll_unit::WaitQueue{
+    fn wait_queue(&self) -> poll_unit::WaitQueue{
         todo!()
     }
     fn update_io_events(&self) -> Result<EPollEventType, SystemError>{

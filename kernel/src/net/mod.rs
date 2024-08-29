@@ -14,6 +14,7 @@ pub mod event_poll;
 pub mod net_core;
 pub mod socket;
 pub mod syscall;
+pub mod syscall_util;
 
 lazy_static! {
     /// # 所有网络接口的列表
@@ -34,7 +35,7 @@ pub enum Endpoint {
     /// 网络层端点
     Ip(IpEndpoint),
     /// inode端点
-    Inode(Arc<dyn Socket>),
+    Inode(Arc<socket::Inode>),
     // todo: 增加NetLink机制后，增加NetLink端点
     /// NetLink端点
     Netlink(Option<NetlinkEndpoint>),

@@ -3,7 +3,7 @@ use alloc::{sync::Arc, string::String, fmt, vec::Vec};
 
 use smoltcp;
 use system_error::SystemError;
-use crate::libs::{spinlock::SpinLock, rwlock::RwLock};
+use crate::{libs::{rwlock::RwLock, spinlock::SpinLock}, net::socket::inet::{common::PortManager, InetSocket}};
 
 mod dma;
 pub mod e1000e;

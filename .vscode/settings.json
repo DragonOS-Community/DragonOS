@@ -160,6 +160,5 @@
         
     ],
     "rust-analyzer.showUnlinkedFileNotification": false,
-    "files.autoSave": "onFocusChange",
     "editor.accessibilityPageSize": 15,
 }

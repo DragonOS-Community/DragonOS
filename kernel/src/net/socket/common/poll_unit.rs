@@ -1,11 +1,11 @@
-use alloc::{collections::LinkedList, sync::Arc, vec::Vec};
+use alloc::{collections::LinkedList, sync::{Arc, Weak}, vec::Vec};
 use system_error::SystemError;
 
 use crate::{libs::{spinlock::SpinLock, wait_queue::EventWaitQueue}, net::event_poll::{EPollEventType, EPollItem, EventPoll}, process::ProcessManager, sched::{schedule, SchedMode}};
 
 
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WaitQueue {
     /// socket的waitqueue
     wait_queue: Arc<EventWaitQueue>,
@@ -20,9 +20,9 @@ impl Default for WaitQueue {
 }
 
 impl WaitQueue {
-    pub fn new(wait_queue: Arc<EventWaitQueue>) -> Self {
+    pub fn new(wait_queue: EventWaitQueue) -> Self {
         Self {
-            wait_queue,
+            wait_queue: Arc::new(wait_queue),
         }
     }
 
@@ -64,35 +64,29 @@ impl WaitQueue {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EPollItems {
-    items: SpinLock<LinkedList<Arc<EPollItem>>>,
+    items: Arc<SpinLock<LinkedList<Arc<EPollItem>>>>,
 }
 
 impl Default for EPollItems {
     fn default() -> Self {
         Self {
-            items: SpinLock::new(LinkedList::new()),
+            items: Arc::new(SpinLock::new(LinkedList::new())),
         }
     }
 }
 
 impl EPollItems {
-    pub fn new() -> Self {
-        Self {
-            items: SpinLock::new(LinkedList::new()),
-        }
-    }
-
     pub fn add(&self, item: Arc<EPollItem>) {
         self.items.lock_irqsave().push_back(item);
     }
 
-    pub fn remove(&self, item: &Arc<EPollItem>) -> Result<(), SystemError> {
+    pub fn remove(&self, item: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
         let to_remove = self
             .items
             .lock_irqsave()
-            .extract_if(|x| Arc::ptr_eq(x, item))
+            .extract_if(|x| x.epoll().ptr_eq(item))
             .collect::<Vec<_>>();
 
         let result = if !to_remove.is_empty() {

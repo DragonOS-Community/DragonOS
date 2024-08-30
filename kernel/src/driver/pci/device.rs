@@ -82,6 +82,8 @@ pub trait PciDevice: Device {
     fn device_id(&self) -> u16;
     fn subsystem_vendor(&self) -> u16;
     fn subsystem_device(&self) -> u16;
+    fn revision_id(&self)->u8;
+    fn class_code(&self)->u32;
 }
 
 /// #结构功能

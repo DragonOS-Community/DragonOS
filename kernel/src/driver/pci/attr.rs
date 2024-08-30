@@ -23,7 +23,7 @@ impl AttributeGroup for BasicPciReadOnlyAttrs {
     }
 
     fn attrs(&self) -> &[&'static dyn Attribute] {
-        &[&Vendor, &DeviceID, &SubsystemVendor, &SubsystemDevice]
+        &[&Vendor, &DeviceID, &SubsystemVendor, &SubsystemDevice,&PciRevision,&ClassCode]
     }
 
     fn is_visible(
@@ -150,6 +150,64 @@ impl Attribute for SubsystemDevice {
         return sysfs_emit_str(_buf, &format!("0x{:04x}", dev.subsystem_device()));
     }
 
+    fn store(&self, _kobj: Arc<dyn KObject>, _buf: &[u8]) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn support(&self) -> SysFSOpsSupport {
+        SysFSOpsSupport::ATTR_SHOW
+    }
+}
+
+#[derive(Debug)]
+pub struct ClassCode;
+
+impl Attribute for ClassCode{
+    fn mode(&self) -> ModeType {
+        SYSFS_ATTR_MODE_RO
+    }
+
+    fn name(&self) -> &str {
+        "class"
+    }
+    fn show(&self, _kobj: Arc<dyn KObject>, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        let dev = _kobj
+            .cast::<dyn PciDevice>()
+            .map_err(|e: Arc<dyn KObject>| {
+                warn!("device:{:?} is not a pci device!", e);
+                SystemError::EINVAL
+            })?;
+        return sysfs_emit_str(_buf, &format!("0x{:06x}", dev.class_code()));
+    }
+    fn store(&self, _kobj: Arc<dyn KObject>, _buf: &[u8]) -> Result<usize, SystemError> {
+        todo!()
+    }
+
+    fn support(&self) -> SysFSOpsSupport {
+        SysFSOpsSupport::ATTR_SHOW
+    }
+}
+
+#[derive(Debug)]
+pub struct PciRevision;
+
+impl Attribute for PciRevision{
+    fn mode(&self) -> ModeType {
+        SYSFS_ATTR_MODE_RO
+    }
+
+    fn name(&self) -> &str {
+        "revision"
+    }
+    fn show(&self, _kobj: Arc<dyn KObject>, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        let dev = _kobj
+            .cast::<dyn PciDevice>()
+            .map_err(|e: Arc<dyn KObject>| {
+                warn!("device:{:?} is not a pci device!", e);
+                SystemError::EINVAL
+            })?;
+        return sysfs_emit_str(_buf, &format!("0x{:02x}", dev.revision_id()));
+    }
     fn store(&self, _kobj: Arc<dyn KObject>, _buf: &[u8]) -> Result<usize, SystemError> {
         todo!()
     }

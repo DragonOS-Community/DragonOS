@@ -70,6 +70,14 @@ impl PciDevice for TestDevice {
     fn subsystem_device(&self) -> u16 {
         return 0xffff;
     }
+
+    fn revision_id(&self)->u8{
+        return 0xff;
+    }
+
+    fn class_code(&self)->u32 {
+        return 0xffff;
+    }
 }
 
 impl Device for TestDevice {

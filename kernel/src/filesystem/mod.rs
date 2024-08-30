@@ -3,6 +3,7 @@ pub mod devpts;
 pub mod fat;
 pub mod kernfs;
 pub mod mbr;
+pub mod overlayfs;
 pub mod procfs;
 pub mod ramfs;
 pub mod sysfs;

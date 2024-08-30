@@ -206,7 +206,7 @@ pub struct ProcInitInfo {
     pub args: Vec<CString>,
     pub envs: Vec<CString>,
     pub auxv: BTreeMap<u8, usize>,
-    pub rand_num: u128,
+    pub rand_num: [u8; 16],
 }
 
 impl ProcInitInfo {
@@ -216,7 +216,7 @@ impl ProcInitInfo {
             args: Vec::new(),
             envs: Vec::new(),
             auxv: BTreeMap::new(),
-            rand_num: 0,
+            rand_num: [0u8; 16],
         }
     }
 
@@ -258,11 +258,14 @@ impl ProcInitInfo {
         self.auxv
             .insert(super::abi::AtType::Random as u8, ustack.sp().data());
 
-        // 实现栈的16字节对齐，如果argv、envp、argc在栈中的长度加起来不能对齐16字节，则手动填充一个空字节
-        // TODO 感觉这样对齐有点简陋，后续可能要完善一下
-        if (envps.len() + argps.len() + 1) * core::mem::align_of::<usize>() % 0x10 != 0 {
-            self.push_slice(ustack, &[0u8; 1])?;
-        }
+        // 实现栈的16字节对齐
+        // 用当前栈顶地址减去后续要压栈的长度，得到的压栈后的栈顶地址与0xF按位与操作得到对齐要填充的字节数
+        let length_to_push = (self.auxv.len() + envps.len() + 1 + argps.len() + 1 + 1)
+            * core::mem::align_of::<usize>();
+        self.push_slice(
+            ustack,
+            &vec![0u8; (ustack.sp().data() - length_to_push) & 0xF],
+        )?;
 
         // 压入auxv
         self.push_slice(ustack, &[null::<u8>(), null::<u8>()])?;

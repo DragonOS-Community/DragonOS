@@ -32,7 +32,7 @@ pub struct KvmMmuMemoryCache {
     gfp_custom: u32,
     capacity: usize,
     nobjs: usize,
-    objects: Option<Box<Vec<u8>>>,
+    objects: Option<Vec<u8>>,
 }
 impl KvmMmuMemoryCache {
     #[allow(dead_code)]
@@ -283,7 +283,7 @@ impl Vm {
                     return Err(SystemError::EIO);
                 }
                 drop(slots_guard);
-                return self.set_memslot(Some(&old), None, KvmMemoryChangeMode::Delete);
+                return self.set_memslot(Some(old), None, KvmMemoryChangeMode::Delete);
             } else {
                 return Err(SystemError::EINVAL);
             }
@@ -325,10 +325,11 @@ impl Vm {
             }
         };
 
-        if change == KvmMemoryChangeMode::Create || change == KvmMemoryChangeMode::Move {
-            if slots_guard.gfn_tree.contains_key(&base_gfn) {
-                return Err(SystemError::EEXIST);
-            }
+        if change == KvmMemoryChangeMode::Create
+            || change == KvmMemoryChangeMode::Move
+            || slots_guard.gfn_tree.contains_key(&base_gfn)
+        {
+            return Err(SystemError::EEXIST);
         }
 
         let new = LockedKvmMemSlot::new();
@@ -346,6 +347,7 @@ impl Vm {
         return self.set_memslot(old.as_ref(), Some(&new), change);
     }
 
+    #[allow(clippy::modulo_one)]
     #[inline]
     /// 获取活动内存插槽
     fn memslot_set(&self, id: usize) -> &Arc<LockedVmMemSlotSet> {
@@ -501,7 +503,7 @@ impl Vm {
 
             if let Some(last) = &slots_guard.last_use {
                 if Arc::ptr_eq(last, old) {
-                    slots_guard.last_use = new.map(|x| x.clone());
+                    slots_guard.last_use = new.cloned();
                 }
             }
 

@@ -54,7 +54,7 @@ impl VirtCpu {
         }
 
         if (old_val ^ value) & MSR_IA32_APICBASE_ENABLE != 0 {
-            if value & MSR_IA32_APICBASE_ENABLE != 0 {}
+            // if value & MSR_IA32_APICBASE_ENABLE != 0 {}
         }
 
         todo!()

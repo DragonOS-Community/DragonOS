@@ -134,6 +134,8 @@ pub struct X86VcpuArch {
     pub nmi_pending: u32,
     pub nmi_injected: bool,
 
+    pub handling_intr_from_guest: KvmIntrType,
+
     pub xfd_no_write_intercept: bool,
 
     pub l1tf_flush_l1d: bool,
@@ -561,6 +563,18 @@ impl X86VcpuArch {
             }
         }
     }
+
+    pub fn kvm_before_interrupt(&mut self, intr: KvmIntrType) {
+        barrier::mfence();
+        self.handling_intr_from_guest = intr;
+        barrier::mfence();
+    }
+
+    pub fn kvm_after_interrupt(&mut self) {
+        barrier::mfence();
+        self.handling_intr_from_guest = KvmIntrType::None;
+        barrier::mfence();
+    }
 }
 
 impl VirtCpu {
@@ -595,7 +609,7 @@ impl VirtCpu {
     }
 
     #[inline]
-    pub fn kvm_run(&self) -> &Box<UapiKvmRun> {
+    pub fn kvm_run(&self) -> &UapiKvmRun {
         self.run.as_ref().unwrap()
     }
 
@@ -1257,10 +1271,11 @@ impl VirtCpu {
             return Ok(());
         }
 
-        let mut dt: DescriptorTablePointer<u8> = DescriptorTablePointer::default();
+        let mut dt: DescriptorTablePointer<u8> = DescriptorTablePointer {
+            limit: sregs.idt.limit,
+            base: sregs.idt.base as usize as *const u8,
+        };
 
-        dt.limit = sregs.idt.limit;
-        dt.base = sregs.idt.base as usize as *const u8;
         x86_kvm_ops().set_idt(self, &dt);
 
         dt.limit = sregs.gdt.limit;
@@ -1274,7 +1289,7 @@ impl VirtCpu {
 
         self.arch.mark_register_dirty(KvmReg::VcpuExregCr3);
 
-        x86_kvm_ops().post_set_cr3(&self, sregs.cr3);
+        x86_kvm_ops().post_set_cr3(self, sregs.cr3);
 
         self.kvm_set_cr8(sregs.cr8);
 
@@ -1335,12 +1350,9 @@ impl VirtCpu {
             }
 
             // TODO: legal gpa?
-        } else {
-            if efer.contains(EferFlags::LONG_MODE_ACTIVE) || sregs.cs.l != 0 {
-                return false;
-            }
+        } else if efer.contains(EferFlags::LONG_MODE_ACTIVE) || sregs.cs.l != 0 {
+            return false;
         }
-
         return self.kvm_is_vaild_cr0(cr0) && self.kvm_is_vaild_cr4(cr4);
     }
 
@@ -1620,4 +1632,11 @@ pub struct KvmAsyncPageFault {
 
 impl KvmAsyncPageFault {
     pub const ASYNC_PF_PER_VCPU: usize = 64;
+}
+
+#[derive(Debug)]
+pub enum KvmIntrType {
+    None,
+    Irq,
+    Nmi,
 }

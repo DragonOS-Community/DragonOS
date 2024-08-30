@@ -121,7 +121,7 @@ impl LockedVMControlStructure {
 
 #[derive(Debug)]
 pub struct VmcsHostState {
-    pub cr3:(PhysFrame,Cr3Flags),
+    pub cr3: (PhysFrame, Cr3Flags),
     pub cr4: Cr4,
     pub gs_base: usize,
     pub fs_base: usize,
@@ -170,7 +170,10 @@ impl VmcsHostState {
 impl Default for VmcsHostState {
     fn default() -> Self {
         Self {
-            cr3: (PhysFrame::containing_address(x86_64::PhysAddr::new(0)), Cr3Flags::empty()),
+            cr3: (
+                PhysFrame::containing_address(x86_64::PhysAddr::new(0)),
+                Cr3Flags::empty(),
+            ),
             cr4: Cr4::empty(),
             gs_base: 0,
             fs_base: 0,
@@ -397,8 +400,10 @@ impl VmxMsrBitmap {
     ) -> bool {
         if msr <= 0x1fff {
             return self.bit_op(msr as usize, access.base(), action);
-        } else if msr >= 0xc0000000 && msr <= 0xc0001fff {
-            return self.bit_op(msr as usize, access.base(), action);
+        } else if (0xc0000000..=0xc0001fff).contains(&msr) {
+            // 这里是有问题的，需要后续检查
+            // https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/vmx/vmx.h#450
+            return self.bit_op(msr as usize & 0x1fff, access.base() + 0x400, action);
         } else {
             return true;
         }
@@ -430,13 +435,18 @@ impl VmxMsrBitmap {
 pub struct VmcsIntrHelper;
 
 impl VmcsIntrHelper {
-    pub fn is_nmi(intr_info: IntrInfo) -> bool {
+    pub fn is_nmi(intr_info: &IntrInfo) -> bool {
         return Self::is_intr_type(intr_info, IntrType::INTR_TYPE_NMI_INTR);
     }
 
-    pub fn is_intr_type(intr_info: IntrInfo, intr_type: IntrType) -> bool {
-        return (intr_info & (IntrInfo::INTR_INFO_VALID_MASK | IntrInfo::INTR_INFO_INTR_TYPE_MASK))
+    pub fn is_intr_type(intr_info: &IntrInfo, intr_type: IntrType) -> bool {
+        return (*intr_info
+            & (IntrInfo::INTR_INFO_VALID_MASK | IntrInfo::INTR_INFO_INTR_TYPE_MASK))
             .bits()
-            == IntrInfo::INTR_INFO_VALID_MASK.bits() | intr_type.bits() as u32;
+            == IntrInfo::INTR_INFO_VALID_MASK.bits() | intr_type.bits();
+    }
+
+    pub fn is_external_intr(intr_info: &IntrInfo) -> bool {
+        return Self::is_intr_type(intr_info, IntrType::INTR_TYPE_EXT_INTR);
     }
 }

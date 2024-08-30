@@ -79,14 +79,8 @@ impl Syscall {
         };
         let (user_sp, argv_ptr) = unsafe {
             param
-                .init_info()
-                .push_at(
-                    // address_space
-                    //     .write()
-                    //     .user_stack_mut()
-                    //     .expect("No user stack found"),
-                    &mut ustack_message,
-                )
+                .init_info_mut()
+                .push_at(&mut ustack_message)
                 .expect("Failed to push proc_init_info to user stack")
         };
         address_space.write().user_stack = Some(ustack_message);

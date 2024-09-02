@@ -32,11 +32,12 @@ fn kernel_init() -> Result<(), SystemError> {
 
     // 由于目前加锁，速度过慢，所以先不开启双缓冲
     // scm_enable_double_buffer().expect("Failed to enable double buffer");
-
+  
     #[cfg(target_arch = "x86_64")]
     crate::driver::disk::ahci::ahci_init()
         .inspect_err(|e| log::error!("ahci_init failed: {:?}", e))
         .ok();
+
     virtio_probe();
     mount_root_fs().expect("Failed to mount root fs");
     e1000e_init();

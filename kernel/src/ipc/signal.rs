@@ -16,6 +16,35 @@ use super::signal_types::{
 };
 
 impl Signal {
+    pub fn signal_pending_state(
+        interruptible: bool,
+        task_wake_kill: bool,
+        pcb: &Arc<ProcessControlBlock>,
+    ) -> bool {
+        if !interruptible && !task_wake_kill {
+            return false;
+        }
+
+        if !pcb.has_pending_signal() {
+            return false;
+        }
+
+        return interruptible || Self::fatal_signal_pending(pcb);
+    }
+
+    /// 判断当前进程是否收到了SIGKILL信号
+    pub fn fatal_signal_pending(pcb: &Arc<ProcessControlBlock>) -> bool {
+        let guard = pcb.sig_info_irqsave();
+        if guard
+            .sig_pending()
+            .signal()
+            .contains(Signal::SIGKILL.into())
+        {
+            return true;
+        }
+
+        return false;
+    }
     /// 向目标进程发送信号
     ///
     /// ## 参数

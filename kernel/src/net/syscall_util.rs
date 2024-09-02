@@ -145,7 +145,7 @@ impl SockAddr {
                 AddressFamily::Netlink => {
                     // TODO: support netlink socket
                     let addr: SockAddrNl = addr.addr_nl;
-                    return Ok(Endpoint::Netlink(Some(NetlinkEndpoint::new(addr,len))));
+                    return Ok(Endpoint::Netlink(NetlinkEndpoint::new(addr,len)));
                 }
                 _ => {
                     return Err(SystemError::EINVAL);

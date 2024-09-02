@@ -214,12 +214,11 @@ fn netlink_proto_init() -> Result<(), SystemError> {
     // rtnetlink_init();
     Ok(())
 }
-// 等待重构
-/// 
+
 pub trait NetProtoFamily {
     fn create(socket: &mut dyn Socket, protocol: i32, _kern: bool) -> Result<(), Error>;
 }
-/// 
+
 pub struct NetlinkFamulyOps {
     family: AddressFamily,
     // owner: Module,

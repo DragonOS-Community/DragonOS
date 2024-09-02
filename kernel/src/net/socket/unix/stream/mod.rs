@@ -139,7 +139,7 @@ impl Socket for StreamSocket {
     fn connect(&self, _endpoint: Endpoint) -> Result<(), SystemError> {
         //使用endpoint获取服务端socket
         let remote_socket = match _endpoint {
-            Endpoint::Inode(socket) => socket,
+            Endpoint::Inode(socket) => socket.clone(),
             _ => return Err(SystemError::EINVAL),
         };
 
@@ -147,7 +147,8 @@ impl Socket for StreamSocket {
         let mut client_socket = self.inner.write();
         match client_socket.take().expect("Unix Stream Socket is None") {
             Inner::Init(inner) => {
-                let client_conn = Connected::new(inner.addr().clone(), Some(_endpoint));
+                let remote_endpoint = Some(Endpoint::Inode(remote_socket.clone()));
+                let client_conn = Connected::new(inner.addr().clone(), remote_endpoint);
                 client_socket.replace(Inner::Connected(client_conn));
             },
             _ => {

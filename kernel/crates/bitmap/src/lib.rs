@@ -2,6 +2,7 @@
 #![feature(core_intrinsics)]
 #![allow(incomplete_features)] // for const generics
 #![feature(generic_const_exprs)]
+#![allow(internal_features)]
 #![allow(clippy::needless_return)]
 
 #[macro_use]

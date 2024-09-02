@@ -1,17 +1,10 @@
 extern crate klog_types;
 
-use core::{
-    intrinsics::unlikely,
-    sync::atomic::{compiler_fence, Ordering},
-};
+use core::sync::atomic::{compiler_fence, Ordering};
 
 use klog_types::{AllocatorLog, AllocatorLogType, LogSource, MMLogChannel};
 
-use crate::{
-    arch::CurrentTimeArch,
-    process::{Pid, ProcessManager},
-    time::TimeArch,
-};
+use crate::{arch::CurrentTimeArch, process::Pid, time::TimeArch};
 
 /// 全局的内存分配器日志通道
 ///
@@ -31,13 +24,14 @@ static __MM_DEBUG_LOG_IDA: ida::IdAllocator = ida::IdAllocator::new(1, usize::MA
 ///
 /// - `log_type`：日志类型
 /// - `source`：日志来源
-pub fn mm_debug_log(log_type: AllocatorLogType, source: LogSource) {
-    let pid = if unlikely(!ProcessManager::initialized()) {
-        Some(Pid::new(0))
-    } else {
-        Some(ProcessManager::current_pcb().pid())
-    };
-    MMDebugLogManager::log(log_type, source, pid);
+pub fn mm_debug_log(_log_type: AllocatorLogType, _source: LogSource) {
+    // todo: 由于目前底层的thingbuf存在卡死的问题，因此这里暂时注释掉。
+    // let pid = if unlikely(!ProcessManager::initialized()) {
+    //     Some(Pid::new(0))
+    // } else {
+    //     Some(ProcessManager::current_pcb().pid())
+    // };
+    // MMDebugLogManager::log(log_type, source, pid);
 }
 
 #[derive(Debug)]
@@ -54,6 +48,7 @@ impl MMDebugLogManager {
     /// - `log_type`：日志类型
     /// - `source`：日志来源
     /// - `pid`：日志来源的pid
+    #[allow(dead_code)]
     pub fn log(log_type: AllocatorLogType, source: LogSource, pid: Option<Pid>) {
         let id = __MM_DEBUG_LOG_IDA.alloc().unwrap();
         let log = AllocatorLog::new(

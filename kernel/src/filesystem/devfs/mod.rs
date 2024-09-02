@@ -11,7 +11,6 @@ use super::vfs::{
 };
 use crate::{
     driver::base::device::device_number::DeviceNumber,
-    kerror, kinfo,
     libs::{
         once::Once,
         spinlock::{SpinLock, SpinLockGuard},
@@ -24,6 +23,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::{error, info};
 use system_error::SystemError;
 
 const DEVFS_BLOCK_SIZE: u64 = 512;
@@ -97,7 +97,7 @@ impl DevFS {
             .expect("DevFS: Failed to create /dev/block");
         devfs.register_bultinin_device();
 
-        // kdebug!("ls /dev: {:?}", root.list());
+        // debug!("ls /dev: {:?}", root.list());
         return devfs;
     }
 
@@ -541,7 +541,7 @@ impl IndexNode for LockedDevFSInode {
         _buf: &mut [u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        kerror!("DevFS: read_at is not supported!");
+        error!("DevFS: read_at is not supported!");
         Err(SystemError::ENOSYS)
     }
 
@@ -580,7 +580,7 @@ macro_rules! devfs_exact_ref {
     () => {{
         let devfs_inode: Result<Arc<dyn IndexNode>, SystemError> = ROOT_INODE().find("dev");
         if let Err(e) = devfs_inode {
-            kerror!("failed to get DevFS ref. errcode = {:?}", e);
+            error!("failed to get DevFS ref. errcode = {:?}", e);
             return Err(SystemError::ENOENT);
         }
 
@@ -611,7 +611,7 @@ pub fn devfs_init() -> Result<(), SystemError> {
     static INIT: Once = Once::new();
     let mut result = None;
     INIT.call_once(|| {
-        kinfo!("Initializing DevFS...");
+        info!("Initializing DevFS...");
         // 创建 devfs 实例
         let devfs: Arc<DevFS> = DevFS::new();
         // devfs 挂载
@@ -620,7 +620,7 @@ pub fn devfs_init() -> Result<(), SystemError> {
             .expect("Unabled to find /dev")
             .mount(devfs)
             .expect("Failed to mount at /dev");
-        kinfo!("DevFS mounted.");
+        info!("DevFS mounted.");
         result = Some(Ok(()));
     });
 

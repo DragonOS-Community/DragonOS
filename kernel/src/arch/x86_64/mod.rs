@@ -30,6 +30,7 @@ pub use interrupt::X86_64InterruptArch as CurrentIrqArch;
 pub use crate::arch::asm::pio::X86_64PortIOArch as CurrentPortIOArch;
 pub use kvm::X86_64KVMArch as KVMArch;
 
+#[allow(unused_imports)]
 pub use crate::arch::ipc::signal::X86_64SignalArch as CurrentSignalArch;
 pub use crate::arch::time::X86_64TimeArch as CurrentTimeArch;
 

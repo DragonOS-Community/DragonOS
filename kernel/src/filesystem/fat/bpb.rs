@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 use alloc::sync::Arc;
+use log::error;
 use system_error::SystemError;
 
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
-    kerror,
     libs::vec_cursor::VecCursor,
 };
 
@@ -190,27 +190,27 @@ impl BiosParameterBlockFAT32 {
     /// @brief 验证BPB32的信息是否合法
     fn validate(&self, bpb: &BiosParameterBlock) -> Result<(), SystemError> {
         if bpb.fat_size_16 != 0 {
-            kerror!("Invalid fat_size_16 value in BPB (should be zero for FAT32)");
+            error!("Invalid fat_size_16 value in BPB (should be zero for FAT32)");
             return Err(SystemError::EINVAL);
         }
 
         if bpb.root_entries_cnt != 0 {
-            kerror!("Invalid root_entries value in BPB (should be zero for FAT32)");
+            error!("Invalid root_entries value in BPB (should be zero for FAT32)");
             return Err(SystemError::EINVAL);
         }
 
         if bpb.total_sectors_16 != 0 {
-            kerror!("Invalid total_sectors_16 value in BPB (should be zero for FAT32)");
+            error!("Invalid total_sectors_16 value in BPB (should be zero for FAT32)");
             return Err(SystemError::EINVAL);
         }
 
         if self.fat_size_32 == 0 {
-            kerror!("Invalid fat_size_32 value in BPB (should be non-zero for FAT32)");
+            error!("Invalid fat_size_32 value in BPB (should be non-zero for FAT32)");
             return Err(SystemError::EINVAL);
         }
 
         if self.fs_version != 0 {
-            kerror!("Unknown FAT FS version");
+            error!("Unknown FAT FS version");
             return Err(SystemError::EINVAL);
         }
 
@@ -315,28 +315,28 @@ impl BiosParameterBlock {
     pub fn validate(&self) -> Result<(), SystemError> {
         // 校验每扇区字节数是否合法
         if self.bytes_per_sector.count_ones() != 1 {
-            kerror!("Invalid bytes per sector(not a power of 2)");
+            error!("Invalid bytes per sector(not a power of 2)");
             return Err(SystemError::EINVAL);
         } else if self.bytes_per_sector < 512 {
-            kerror!("Invalid bytes per sector (value < 512)");
+            error!("Invalid bytes per sector (value < 512)");
             return Err(SystemError::EINVAL);
         } else if self.bytes_per_sector > 4096 {
-            kerror!("Invalid bytes per sector (value > 4096)");
+            error!("Invalid bytes per sector (value > 4096)");
             return Err(SystemError::EINVAL);
         }
 
         if self.rsvd_sec_cnt < 1 {
-            kerror!("Invalid rsvd_sec_cnt value in BPB");
+            error!("Invalid rsvd_sec_cnt value in BPB");
             return Err(SystemError::EINVAL);
         }
 
         if self.num_fats == 0 {
-            kerror!("Invalid fats value in BPB");
+            error!("Invalid fats value in BPB");
             return Err(SystemError::EINVAL);
         }
 
         if (self.total_sectors_16 == 0) && (self.total_sectors_32 == 0) {
-            kerror!("Invalid BPB (total_sectors_16 or total_sectors_32 should be non-zero)");
+            error!("Invalid BPB (total_sectors_16 or total_sectors_32 should be non-zero)");
             return Err(SystemError::EINVAL);
         }
 
@@ -367,7 +367,7 @@ impl BiosParameterBlock {
 
         // 总扇区数应当大于第一个数据扇区的扇区号
         if total_sectors <= first_data_sector {
-            kerror!("Total sectors lesser than first data sector");
+            error!("Total sectors lesser than first data sector");
             return Err(SystemError::EINVAL);
         }
 

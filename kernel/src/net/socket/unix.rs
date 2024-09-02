@@ -4,7 +4,8 @@ use system_error::SystemError;
 use crate::{libs::spinlock::SpinLock, net::Endpoint};
 
 use super::{
-    handle::GlobalSocketHandle, Socket, SocketInode, SocketMetadata, SocketOptions, SocketType,
+    handle::GlobalSocketHandle, PosixSocketHandleItem, Socket, SocketInode, SocketMetadata,
+    SocketOptions, SocketType,
 };
 
 #[derive(Debug, Clone)]
@@ -13,6 +14,7 @@ pub struct StreamSocket {
     buffer: Arc<SpinLock<Vec<u8>>>,
     peer_inode: Option<Arc<SocketInode>>,
     handle: GlobalSocketHandle,
+    posix_item: Arc<PosixSocketHandleItem>,
 }
 
 impl StreamSocket {
@@ -36,16 +38,22 @@ impl StreamSocket {
             options,
         );
 
+        let posix_item = Arc::new(PosixSocketHandleItem::new(None));
+
         Self {
             metadata,
             buffer,
             peer_inode: None,
             handle: GlobalSocketHandle::new_kernel_handle(),
+            posix_item,
         }
     }
 }
 
 impl Socket for StreamSocket {
+    fn posix_item(&self) -> Arc<PosixSocketHandleItem> {
+        self.posix_item.clone()
+    }
     fn socket_handle(&self) -> GlobalSocketHandle {
         self.handle
     }
@@ -121,6 +129,7 @@ pub struct SeqpacketSocket {
     buffer: Arc<SpinLock<Vec<u8>>>,
     peer_inode: Option<Arc<SocketInode>>,
     handle: GlobalSocketHandle,
+    posix_item: Arc<PosixSocketHandleItem>,
 }
 
 impl SeqpacketSocket {
@@ -144,16 +153,22 @@ impl SeqpacketSocket {
             options,
         );
 
+        let posix_item = Arc::new(PosixSocketHandleItem::new(None));
+
         Self {
             metadata,
             buffer,
             peer_inode: None,
             handle: GlobalSocketHandle::new_kernel_handle(),
+            posix_item,
         }
     }
 }
 
 impl Socket for SeqpacketSocket {
+    fn posix_item(&self) -> Arc<PosixSocketHandleItem> {
+        self.posix_item.clone()
+    }
     fn close(&mut self) {}
 
     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {

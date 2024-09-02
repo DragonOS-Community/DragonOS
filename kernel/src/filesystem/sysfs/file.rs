@@ -4,6 +4,7 @@ use alloc::{
     string::ToString,
     sync::{Arc, Weak},
 };
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -16,7 +17,6 @@ use crate::{
         sysfs::{SysFSOps, SysFSOpsSupport},
         vfs::{syscall::ModeType, PollStatus},
     },
-    kwarn,
 };
 
 use super::{Attribute, BinAttribute, SysFS, SysFSKernPrivateData};
@@ -130,7 +130,7 @@ impl SysFS {
         drop(x);
 
         let sysfs_ops: &dyn SysFSOps = kobj.kobj_type().unwrap().sysfs_ops().ok_or_else(|| {
-            kwarn!("missing sysfs attribute operations for kobject: {kobj:?}");
+            warn!("missing sysfs attribute operations for kobject: {kobj:?}");
             SystemError::EINVAL
         })?;
 
@@ -184,7 +184,7 @@ impl SysFS {
         if let Some(parent) = parent {
             let r = parent.remove(attr.name());
             if unlikely(r.is_err()) {
-                kwarn!(
+                warn!(
                     "failed to remove file '{}' from '{}'",
                     attr.name(),
                     kobj.name()
@@ -220,7 +220,7 @@ impl SysFS {
         if let Some(parent) = parent {
             let r = parent.remove(attr.name());
             if unlikely(r.is_err()) {
-                kwarn!(
+                warn!(
                     "failed to remove file '{}' from '{}'",
                     attr.name(),
                     kobj.name()

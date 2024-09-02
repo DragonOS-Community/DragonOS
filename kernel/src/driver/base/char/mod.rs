@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
+use log::error;
 
-use crate::kerror;
 use system_error::SystemError;
 
 use super::{
@@ -129,7 +129,7 @@ impl CharDevOps {
         let mut major = device_number.major();
         let baseminor = device_number.minor();
         if major >= DEV_MAJOR_MAX {
-            kerror!(
+            error!(
                 "DEV {} major requested {:?} is greater than the maximum {}\n",
                 name,
                 major,
@@ -137,7 +137,7 @@ impl CharDevOps {
             );
         }
         if minorct > DeviceNumber::MINOR_MASK + 1 - baseminor {
-            kerror!("DEV {} minor range requested ({}-{}) is out of range of maximum range ({}-{}) for a single major\n",
+            error!("DEV {} minor range requested ({}-{}) is out of range of maximum range ({}-{}) for a single major\n",
                 name, baseminor, baseminor + minorct - 1, 0, DeviceNumber::MINOR_MASK);
         }
         let chardev = DeviceStruct::new(DeviceNumber::new(major, baseminor), minorct, name);
@@ -207,7 +207,7 @@ impl CharDevOps {
         range: usize,
     ) -> Result<(), SystemError> {
         if id_table.device_number().data() == 0 {
-            kerror!("Device number can't be 0!\n");
+            error!("Device number can't be 0!\n");
         }
         device_manager().add_device(cdev.clone())?;
         kobj_map(

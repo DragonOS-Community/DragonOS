@@ -27,6 +27,7 @@ fn init_intertrait() {
 #[derive(Debug)]
 pub struct BootParams {
     pub screen_info: BootTimeScreenInfo,
+    #[allow(dead_code)]
     pub arch: ArchBootParams,
     boot_command_line: [u8; Self::BOOT_COMMAND_LINE_SIZE],
 }

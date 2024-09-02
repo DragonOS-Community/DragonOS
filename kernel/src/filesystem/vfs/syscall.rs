@@ -1,15 +1,15 @@
 use core::ffi::c_void;
 use core::mem::size_of;
 
-use alloc::string::ToString;
 use alloc::{string::String, sync::Arc, vec::Vec};
+use log::warn;
 use system_error::SystemError;
 
 use crate::producefs;
+use crate::syscall::user_access::UserBufferReader;
 use crate::{
     driver::base::{block::SeekFrom, device::device_number::DeviceNumber},
     filesystem::vfs::{core as Vcore, file::FileDescriptorVec},
-    kerror,
     libs::rwlock::RwLockWriteGuard,
     mm::{verify_area, VirtAddr},
     process::ProcessManager,
@@ -17,19 +17,18 @@ use crate::{
         user_access::{self, check_and_clone_cstr, UserBufferWriter},
         Syscall,
     },
-    time::PosixTimeSpec,
+    time::{syscall::PosixTimeval, PosixTimeSpec},
 };
 
 use super::{
     core::{do_mkdir_at, do_remove_dir, do_unlink_at},
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
-    open::{do_faccessat, do_fchmodat, do_sys_open},
+    open::{do_faccessat, do_fchmodat, do_sys_open, do_utimensat, do_utimes},
     utils::{rsplit_path, user_path_at},
     Dirent, FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
-// use crate::kdebug;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
@@ -324,6 +323,13 @@ bitflags! {
     }
 }
 
+bitflags! {
+    pub struct UtimensFlags: u32 {
+        /// 不需要解释符号链接
+        const AT_SYMLINK_NOFOLLOW = 0x100;
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct PosixStatfs {
@@ -391,6 +397,7 @@ impl PosixOpenHow {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct OpenHow {
     pub o_flags: FileMode,
@@ -476,7 +483,10 @@ impl Syscall {
         mode: u32,
         follow_symlink: bool,
     ) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
+
         let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
         let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
         return do_sys_open(
@@ -495,7 +505,10 @@ impl Syscall {
         mode: u32,
         follow_symlink: bool,
     ) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
+
         let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
         let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
         return do_sys_open(dirfd, &path, open_flags, mode, follow_symlink);
@@ -509,8 +522,9 @@ impl Syscall {
     pub fn close(fd: usize) -> Result<usize, SystemError> {
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
-
-        fd_table_guard.drop_fd(fd as i32).map(|_| 0)
+        let _file = fd_table_guard.drop_fd(fd as i32)?;
+        drop(fd_table_guard);
+        Ok(0)
     }
 
     /// @brief 发送命令到文件描述符对应的设备，
@@ -674,7 +688,10 @@ impl Syscall {
             return Err(SystemError::EFAULT);
         }
 
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
+
         let proc = ProcessManager::current_pcb();
         // Copy path to kernel space to avoid some security issues
         let mut new_path = String::from("");
@@ -778,7 +795,10 @@ impl Syscall {
     ///
     /// @return uint64_t 负数错误码 / 0表示成功
     pub fn mkdir(path: *const u8, mode: usize) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
+
         do_mkdir_at(
             AtFlags::AT_FDCWD.bits(),
             &path,
@@ -853,7 +873,10 @@ impl Syscall {
 
     pub fn link(old: *const u8, new: *const u8) -> Result<usize, SystemError> {
         let get_path = |cstr: *const u8| -> Result<String, SystemError> {
-            let res = check_and_clone_cstr(cstr, Some(MAX_PATHLEN))?;
+            let res = check_and_clone_cstr(cstr, Some(MAX_PATHLEN))?
+                .into_string()
+                .map_err(|_| SystemError::EINVAL)?;
+
             if res.len() >= MAX_PATHLEN {
                 return Err(SystemError::ENAMETOOLONG);
             }
@@ -880,8 +903,12 @@ impl Syscall {
         new: *const u8,
         flags: i32,
     ) -> Result<usize, SystemError> {
-        let old = check_and_clone_cstr(old, Some(MAX_PATHLEN))?;
-        let new = check_and_clone_cstr(new, Some(MAX_PATHLEN))?;
+        let old = check_and_clone_cstr(old, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
+        let new = check_and_clone_cstr(new, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
         if old.len() >= MAX_PATHLEN || new.len() >= MAX_PATHLEN {
             return Err(SystemError::ENAMETOOLONG);
         }
@@ -905,10 +932,12 @@ impl Syscall {
     pub fn unlinkat(dirfd: i32, path: *const u8, flags: u32) -> Result<usize, SystemError> {
         let flags = AtFlags::from_bits(flags as i32).ok_or(SystemError::EINVAL)?;
 
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
 
         if flags.contains(AtFlags::AT_REMOVEDIR) {
-            // kdebug!("rmdir");
+            // debug!("rmdir");
             match do_remove_dir(dirfd, &path) {
                 Err(err) => {
                     return Err(err);
@@ -930,12 +959,16 @@ impl Syscall {
     }
 
     pub fn rmdir(path: *const u8) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
         return do_remove_dir(AtFlags::AT_FDCWD.bits(), &path).map(|v| v as usize);
     }
 
     pub fn unlink(path: *const u8) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
         return do_unlink_at(AtFlags::AT_FDCWD.bits(), &path).map(|v| v as usize);
     }
 
@@ -962,8 +995,14 @@ impl Syscall {
         filename_to: *const u8,
         _flags: u32,
     ) -> Result<usize, SystemError> {
-        let filename_from = check_and_clone_cstr(filename_from, Some(MAX_PATHLEN)).unwrap();
-        let filename_to = check_and_clone_cstr(filename_to, Some(MAX_PATHLEN)).unwrap();
+        let filename_from = check_and_clone_cstr(filename_from, Some(MAX_PATHLEN))
+            .unwrap()
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
+        let filename_to = check_and_clone_cstr(filename_to, Some(MAX_PATHLEN))
+            .unwrap()
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
         // 文件名过长
         if filename_from.len() > MAX_PATHLEN || filename_to.len() > MAX_PATHLEN {
             return Err(SystemError::ENAMETOOLONG);
@@ -1092,7 +1131,7 @@ impl Syscall {
     /// - `cmd`：命令
     /// - `arg`：参数
     pub fn fcntl(fd: i32, cmd: FcntlCommand, arg: i32) -> Result<usize, SystemError> {
-        // kdebug!("fcntl ({cmd:?}) fd: {fd}, arg={arg}");
+        // debug!("fcntl ({cmd:?}) fd: {fd}, arg={arg}");
         match cmd {
             FcntlCommand::DupFd | FcntlCommand::DupFdCloexec => {
                 if arg < 0 || arg as usize >= FileDescriptorVec::PROCESS_MAX_FD {
@@ -1186,7 +1225,7 @@ impl Syscall {
                 // TODO: unimplemented
                 // 未实现的命令，返回0，不报错。
 
-                kwarn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
+                warn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
                 return Err(SystemError::ENOSYS);
             }
         }
@@ -1307,7 +1346,10 @@ impl Syscall {
             ModeType::empty().bits(),
             true,
         )?;
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN)).unwrap();
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))
+            .unwrap()
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
         let pcb = ProcessManager::current_pcb();
         let (_inode_begin, remain_path) = user_path_at(&pcb, fd as i32, &path)?;
         let inode = ROOT_INODE().lookup_follow_symlink(&remain_path, MAX_PATHLEN)?;
@@ -1442,7 +1484,9 @@ impl Syscall {
         mode: ModeType,
         dev_t: DeviceNumber,
     ) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
         let path = path.as_str().trim();
 
         let inode: Result<Arc<dyn IndexNode>, SystemError> =
@@ -1491,7 +1535,9 @@ impl Syscall {
         user_buf: *mut u8,
         buf_size: usize,
     ) -> Result<usize, SystemError> {
-        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
         let path = path.as_str().trim();
         let mut user_buf = UserBufferWriter::new(user_buf, buf_size, true)?;
 
@@ -1568,7 +1614,7 @@ impl Syscall {
 
         // fchmod没完全实现，因此不修改文件的权限
         // todo: 实现fchmod
-        kwarn!("fchmod not fully implemented");
+        warn!("fchmod not fully implemented");
         return Ok(0);
     }
     /// #挂载文件系统
@@ -1593,13 +1639,16 @@ impl Syscall {
         _mountflags: usize,
         _data: *const c_void,
     ) -> Result<usize, SystemError> {
-        let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?;
+        let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
 
-        let filesystemtype = user_access::check_and_clone_cstr(filesystemtype, Some(MAX_PATHLEN))?;
+        let fstype_str = user_access::check_and_clone_cstr(filesystemtype, Some(MAX_PATHLEN))?;
+        let fstype_str = fstype_str.to_str().map_err(|_| SystemError::EINVAL)?;
 
-        let filesystemtype = producefs!(FSMAKER, filesystemtype)?;
+        let fstype = producefs!(FSMAKER, fstype_str)?;
 
-        Vcore::do_mount(filesystemtype, target.to_string().as_str())?;
+        Vcore::do_mount(fstype, &target)?;
 
         return Ok(0);
     }
@@ -1613,13 +1662,57 @@ impl Syscall {
     ///
     /// [umount(2) — Linux manual page](https://www.man7.org/linux/man-pages/man2/umount.2.html)
     pub fn umount2(target: *const u8, flags: i32) -> Result<(), SystemError> {
-        let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?;
+        let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
         Vcore::do_umount2(
             AtFlags::AT_FDCWD.bits(),
             &target,
             UmountFlag::from_bits(flags).ok_or(SystemError::EINVAL)?,
         )?;
         return Ok(());
+    }
+
+    pub fn sys_utimensat(
+        dirfd: i32,
+        pathname: *const u8,
+        times: *const PosixTimeSpec,
+        flags: u32,
+    ) -> Result<usize, SystemError> {
+        let pathname = if pathname.is_null() {
+            None
+        } else {
+            let pathname = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
+                .into_string()
+                .map_err(|_| SystemError::EINVAL)?;
+            Some(pathname)
+        };
+        let flags = UtimensFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
+        let times = if times.is_null() {
+            None
+        } else {
+            let times_reader = UserBufferReader::new(times, size_of::<PosixTimeSpec>() * 2, true)?;
+            let times = times_reader.read_from_user::<PosixTimeSpec>(0)?;
+            Some([times[0], times[1]])
+        };
+        do_utimensat(dirfd, pathname, times, flags)
+    }
+
+    pub fn sys_utimes(
+        pathname: *const u8,
+        times: *const PosixTimeval,
+    ) -> Result<usize, SystemError> {
+        let pathname = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
+        let times = if times.is_null() {
+            None
+        } else {
+            let times_reader = UserBufferReader::new(times, size_of::<PosixTimeval>() * 2, true)?;
+            let times = times_reader.read_from_user::<PosixTimeval>(0)?;
+            Some([times[0], times[1]])
+        };
+        do_utimes(&pathname, times)
     }
 }
 
@@ -1662,8 +1755,7 @@ impl IoVecs {
         // 将用户空间的IoVec转换为引用（注意：这里的引用是静态的，因为用户空间的IoVec不会被释放）
         let iovs: &[IoVec] = core::slice::from_raw_parts(iov, iovcnt);
 
-        let mut slices: Vec<&mut [u8]> = vec![];
-        slices.reserve(iovs.len());
+        let mut slices: Vec<&mut [u8]> = Vec::with_capacity(iovs.len());
 
         for iov in iovs.iter() {
             if iov.iov_len == 0 {

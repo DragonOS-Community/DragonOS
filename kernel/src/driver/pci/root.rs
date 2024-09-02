@@ -4,16 +4,17 @@ use alloc::sync::Arc;
 use hashbrown::HashMap;
 
 use crate::{
+    arch::{PciArch, TraitPciArch},
     libs::spinlock::{SpinLock, SpinLockGuard},
     mm::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         page::PAGE_2M_SIZE,
-        PhysAddr,
     },
 };
 
-use super::pci::{
-    BusDeviceFunction, ExternalCapabilityIterator, PciCam, PciError, SegmentGroupNumber,
+use super::{
+    ecam::EcamRootInfo,
+    pci::{BusDeviceFunction, ExternalCapabilityIterator, PciCam, PciError, SegmentGroupNumber},
 };
 
 lazy_static! {
@@ -28,13 +29,14 @@ pub fn pci_root_manager() -> &'static PciRootManager {
 /// 代表一个PCI segement greoup.
 #[derive(Clone, Debug)]
 pub struct PciRoot {
-    pub physical_address_base: PhysAddr,          //物理地址，acpi获取
-    pub mmio_guard: Option<Arc<MMIOSpaceGuard>>,  //映射后的虚拟地址，为方便访问数据这里转化成指针
-    pub segment_group_number: SegmentGroupNumber, //segement greoup的id
-    pub bus_begin: u8,                            //该分组中的最小bus
-    pub bus_end: u8,                              //该分组中的最大bus
+    pub ecam_root_info: Option<EcamRootInfo>,
+    pub mmio_guard: Option<Arc<MMIOSpaceGuard>>, //映射后的虚拟地址，为方便访问数据这里转化成指针
     /// 配置空间访问机制
     pub cam: PciCam,
+    /// bus起始位置
+    pub bus_begin: u8,
+    /// bus结束位置
+    pub bus_end: u8,
 }
 
 ///线程间共享需要，该结构体只需要在初始化时写入数据，无需读写锁保证线程安全
@@ -43,11 +45,15 @@ unsafe impl Sync for PciRoot {}
 ///实现PciRoot的Display trait，自定义输出
 impl core::fmt::Display for PciRoot {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-        write!(
-                f,
-                "PCI Root with segement:{}, bus begin at {}, bus end at {}, physical address at {:?},mapped at {:?}",
-                self.segment_group_number, self.bus_begin, self.bus_end, self.physical_address_base, self.mmio_guard
-            )
+        if let Some(ecam_root_info) = &self.ecam_root_info {
+            write!(
+                    f,
+                    "PCI Eacm Root with segment:{}, bus begin at {}, bus end at {}, physical address at {:?},mapped at {:?}",
+                    ecam_root_info.segment_group_number, ecam_root_info.bus_begin, ecam_root_info.bus_end, ecam_root_info.physical_address_base, self.mmio_guard
+                )
+        } else {
+            write!(f, "PCI Root cam is {:?}", self.cam,)
+        }
     }
 }
 
@@ -69,29 +75,30 @@ impl PciRoot {
     ///
     /// - 成功执行后，结构体的内部状态将被初始化为包含映射后的虚拟地址。
     pub fn new(
-        segment_group_number: SegmentGroupNumber,
+        ecam_root_info: Option<EcamRootInfo>,
         cam: PciCam,
-        phys_base: PhysAddr,
         bus_begin: u8,
         bus_end: u8,
     ) -> Result<Arc<Self>, PciError> {
-        assert_eq!(cam, PciCam::Ecam);
         let mut pci_root = Self {
-            physical_address_base: phys_base,
+            ecam_root_info,
             mmio_guard: None,
-            segment_group_number,
+            cam,
             bus_begin,
             bus_end,
-            cam,
         };
-        pci_root.map()?;
+
+        if ecam_root_info.is_some() {
+            pci_root.map()?;
+        }
 
         Ok(Arc::new(pci_root))
     }
-    /// @brief  完成物理地址到虚拟地址的映射，并将虚拟地址加入mmio_base变量
-    /// @return 返回错误或Ok(0)
+
+    /// # 完成物理地址到虚拟地址的映射，并将虚拟地址加入mmio_base变量
+    /// ## return 返回错误或Ok(0)
     fn map(&mut self) -> Result<u8, PciError> {
-        //kdebug!("bus_begin={},bus_end={}", self.bus_begin,self.bus_end);
+        //debug!("bus_begin={},bus_end={}", self.bus_begin,self.bus_end);
         let bus_number = (self.bus_end - self.bus_begin) as u32 + 1;
         let bus_number_double = (bus_number - 1) / 2 + 1; //一个bus占据1MB空间，计算全部bus占据空间相对于2MB空间的个数
 
@@ -104,7 +111,7 @@ impl PciRoot {
             self.mmio_guard = Some(space_guard.clone());
 
             assert!(space_guard
-                .map_phys(self.physical_address_base, size)
+                .map_phys(self.ecam_root_info.unwrap().physical_address_base, size)
                 .is_ok());
         }
         return Ok(0);
@@ -129,11 +136,12 @@ impl PciRoot {
     /// - 此函数计算出的地址需要是字对齐的（即地址与0x3对齐）。如果不是，将panic。
     fn cam_offset(&self, bus_device_function: BusDeviceFunction, register_offset: u16) -> u32 {
         assert!(bus_device_function.valid());
-        let bdf = ((bus_device_function.bus - self.bus_begin) as u32) << 8
+        let bdf = ((bus_device_function.bus - self.ecam_root_info.unwrap().bus_begin) as u32) << 8
             | (bus_device_function.device as u32) << 3
             | bus_device_function.function as u32;
         let address =
             bdf << match self.cam {
+                PciCam::Portiocam => 4,
                 PciCam::MmioCam => 8,
                 PciCam::Ecam => 12,
             } | register_offset as u32;
@@ -141,6 +149,7 @@ impl PciRoot {
         assert!(address & 0x3 == 0);
         address
     }
+
     /// # read_config - 通过bus_device_function和offset读取相应位置寄存器的值（32位）
     ///
     /// 此函数用于通过指定的bus_device_function和register_offset读取PCI设备中相应位置的寄存器值。
@@ -154,12 +163,16 @@ impl PciRoot {
     ///
     /// - `u32`: 寄存器读值结果
     pub fn read_config(&self, bus_device_function: BusDeviceFunction, register_offset: u16) -> u32 {
-        let address = self.cam_offset(bus_device_function, register_offset);
-        unsafe {
-            // Right shift to convert from byte offset to word offset.
-            ((self.mmio_guard.as_ref().unwrap().vaddr().data() as *mut u32)
-                .add((address >> 2) as usize))
-            .read_volatile()
+        if self.ecam_root_info.is_some() {
+            let address = self.cam_offset(bus_device_function, register_offset);
+            unsafe {
+                // Right shift to convert from byte offset to word offset.
+                ((self.mmio_guard.as_ref().unwrap().vaddr().data() as *mut u32)
+                    .add((address >> 2) as usize))
+                .read_volatile()
+            }
+        } else {
+            PciArch::read_config(&bus_device_function, register_offset as u8)
         }
     }
 
@@ -178,16 +191,21 @@ impl PciRoot {
         register_offset: u16,
         data: u32,
     ) {
-        let address = self.cam_offset(bus_device_function, register_offset);
-        // Safe because both the `mmio_base` and the address offset are properly aligned, and the
-        // resulting pointer is within the MMIO range of the CAM.
-        unsafe {
-            // Right shift to convert from byte offset to word offset.
-            ((self.mmio_guard.as_ref().unwrap().vaddr().data() as *mut u32)
-                .add((address >> 2) as usize))
-            .write_volatile(data)
+        if self.ecam_root_info.is_some() {
+            let address = self.cam_offset(bus_device_function, register_offset);
+            // Safe because both the `mmio_base` and the address offset are properly aligned, and the
+            // resulting pointer is within the MMIO range of the CAM.
+            unsafe {
+                // Right shift to convert from byte offset to word offset.
+                ((self.mmio_guard.as_ref().unwrap().vaddr().data() as *mut u32)
+                    .add((address >> 2) as usize))
+                .write_volatile(data)
+            }
+        } else {
+            PciArch::write_config(&bus_device_function, register_offset as u8, data);
         }
     }
+
     /// 返回迭代器，遍历pcie设备的external_capabilities
     #[allow(dead_code)]
     pub fn external_capabilities(
@@ -233,9 +251,14 @@ impl PciRootManager {
     /// - `pci_root`: Arc<PciRoot>，要添加的PciRoot的Arc指针
     pub fn add_pci_root(&self, pci_root: Arc<PciRoot>) {
         let mut inner = self.inner.lock();
-        inner
-            .pci_root
-            .insert(pci_root.segment_group_number, pci_root);
+
+        if let Some(ecam_root_info) = pci_root.ecam_root_info {
+            inner
+                .pci_root
+                .insert(ecam_root_info.segment_group_number, pci_root);
+        } else {
+            inner.pci_root.insert(pci_root.bus_begin as u16, pci_root);
+        }
     }
 
     /// # 检查是否存在PciRoot - 检查PciRootManager中是否存在指定segment_group_number的PciRoot

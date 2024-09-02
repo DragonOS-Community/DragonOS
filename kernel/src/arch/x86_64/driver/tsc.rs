@@ -2,13 +2,13 @@ use crate::{
     arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch, CurrentTimeArch},
     driver::acpi::pmtmr::{acpi_pm_read_early, ACPI_PM_OVERRUN, PMTMR_TICKS_PER_SEC},
     exception::InterruptArch,
-    kdebug, kerror, kinfo, kwarn,
     time::{TimeArch, PIT_TICK_RATE},
 };
 use core::{
     cmp::{max, min},
     intrinsics::unlikely,
 };
+use log::{debug, error, info, warn};
 use system_error::SystemError;
 
 use super::hpet::{hpet_instance, is_hpet_enabled};
@@ -31,13 +31,13 @@ impl TSCManager {
         let cpuid = x86::cpuid::CpuId::new();
         let feat = cpuid.get_feature_info().ok_or(SystemError::ENODEV)?;
         if !feat.has_tsc() {
-            kerror!("TSC is not available");
+            error!("TSC is not available");
             return Err(SystemError::ENODEV);
         }
 
         if unsafe { TSC_KHZ == 0 } {
             if let Err(e) = Self::determine_cpu_tsc_frequency(false) {
-                kerror!("Failed to determine CPU TSC frequency: {:?}", e);
+                error!("Failed to determine CPU TSC frequency: {:?}", e);
                 // todo: mark TSC as unstable clock source
                 return Err(e);
             }
@@ -57,7 +57,7 @@ impl TSCManager {
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/tsc.c#1438
     fn determine_cpu_tsc_frequency(early: bool) -> Result<(), SystemError> {
         if unlikely(Self::cpu_khz() != 0 || Self::tsc_khz() != 0) {
-            kwarn!("TSC and CPU frequency already determined");
+            warn!("TSC and CPU frequency already determined");
         }
 
         if early {
@@ -79,16 +79,16 @@ impl TSCManager {
         }
 
         if Self::cpu_khz() == 0 {
-            kerror!("Failed to determine CPU frequency");
+            error!("Failed to determine CPU frequency");
             return Err(SystemError::ENODEV);
         }
 
-        kinfo!(
+        info!(
             "Detected {}.{} MHz processor",
             Self::cpu_khz() / 1000,
             Self::cpu_khz() % 1000
         );
-        kinfo!(
+        info!(
             "Detected {}.{} MHz TSC",
             Self::tsc_khz() / 1000,
             Self::tsc_khz() % 1000
@@ -102,7 +102,7 @@ impl TSCManager {
     /// 使用pit、hpet、ptimer来测量CPU总线的频率
     fn calibrate_cpu_by_pit_hpet_ptimer() -> Result<u64, SystemError> {
         let hpet = is_hpet_enabled();
-        kdebug!(
+        debug!(
             "Calibrating TSC with {}",
             if hpet { "HPET" } else { "PMTIMER" }
         );
@@ -143,7 +143,7 @@ impl TSCManager {
 
             // HPET或者PTIMER可能是不可用的
             if ref1 == ref2 {
-                kdebug!("HPET/PMTIMER not available");
+                debug!("HPET/PMTIMER not available");
                 continue;
             }
 
@@ -169,7 +169,7 @@ impl TSCManager {
             // 如果误差在10%以内，那么认为测量成功
             // 返回参考值，因为它是更精确的
             if (90..=110).contains(&delta) {
-                kinfo!(
+                info!(
                     "PIT calibration matches {}. {} loops",
                     if hpet { "HPET" } else { "PMTIMER" },
                     i + 1
@@ -185,20 +185,20 @@ impl TSCManager {
         }
 
         if tsc_pit_min == u64::MAX {
-            kwarn!("Unable to calibrate against PIT");
+            warn!("Unable to calibrate against PIT");
 
             // 如果没有参考值，那么禁用tsc
             if (!hpet) && (global_ref1 == 0) && (global_ref2 == 0) {
-                kwarn!("No reference (HPET/PMTIMER) available");
+                warn!("No reference (HPET/PMTIMER) available");
                 return Err(SystemError::ENODEV);
             }
 
             if tsc_ref_min == u64::MAX {
-                kwarn!("Unable to calibrate against HPET/PMTIMER");
+                warn!("Unable to calibrate against HPET/PMTIMER");
                 return Err(SystemError::ENODEV);
             }
 
-            kinfo!(
+            info!(
                 "Using {} reference calibration",
                 if hpet { "HPET" } else { "PMTIMER" }
             );
@@ -207,27 +207,27 @@ impl TSCManager {
 
         // We don't have an alternative source, use the PIT calibration value
         if (!hpet) && (global_ref1 == 0) && (global_ref2 == 0) {
-            kinfo!("Using PIT calibration value");
+            info!("Using PIT calibration value");
             return Ok(tsc_pit_min);
         }
 
         // The alternative source failed, use the PIT calibration value
         if tsc_ref_min == u64::MAX {
-            kwarn!("Unable to calibrate against HPET/PMTIMER, using PIT calibration value");
+            warn!("Unable to calibrate against HPET/PMTIMER, using PIT calibration value");
             return Ok(tsc_pit_min);
         }
 
         // The calibration values differ too much. In doubt, we use
         // the PIT value as we know that there are PMTIMERs around
         // running at double speed. At least we let the user know:
-        kwarn!(
+        warn!(
             "PIT calibration deviates from {}: tsc_pit_min={}, tsc_ref_min={}",
             if hpet { "HPET" } else { "PMTIMER" },
             tsc_pit_min,
             tsc_ref_min
         );
 
-        kinfo!("Using PIT calibration value");
+        info!("Using PIT calibration value");
         return Ok(tsc_pit_min);
     }
 
@@ -326,7 +326,7 @@ impl TSCManager {
             }
         }
 
-        kwarn!("TSCManager: Failed to read reference value, tsc delta too high");
+        warn!("TSCManager: Failed to read reference value, tsc delta too high");
         return (u64::MAX, ref_ret);
     }
 

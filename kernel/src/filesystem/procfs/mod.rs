@@ -1,5 +1,6 @@
 use core::intrinsics::size_of;
 
+use ::log::{error, info};
 use alloc::{
     borrow::ToOwned,
     collections::BTreeMap,
@@ -17,7 +18,6 @@ use crate::{
         core::{generate_inode_id, ROOT_INODE},
         FileType,
     },
-    kerror, kinfo,
     libs::{
         once::Once,
         rwlock::RwLock,
@@ -149,7 +149,7 @@ impl ProcFSInode {
         let pcb = if let Some(pcb) = pcb {
             pcb
         } else {
-            kerror!(
+            error!(
                 "ProcFS: Cannot find pcb for pid {:?} when opening its 'status' file.",
                 pid
             );
@@ -157,7 +157,7 @@ impl ProcFSInode {
         };
         // 传入数据
         let pdata: &mut Vec<u8> = &mut pdata.data;
-
+        // name
         pdata.append(
             &mut format!("Name:\t{}", pcb.basic().name())
                 .as_bytes()
@@ -174,17 +174,32 @@ impl ProcFSInode {
         let priority = sched_info_guard.policy();
         let vrtime = sched_info_guard.sched_entity.vruntime;
 
+        // State
         pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
+
+        // Tgid
+        pdata.append(&mut format!("\nTgid:\t{}", pcb.tgid().into()).into());
+
+        // pid
         pdata.append(
             &mut format!("\nPid:\t{}", pcb.pid().into())
                 .as_bytes()
                 .to_owned(),
         );
+
+        // ppid
         pdata.append(
             &mut format!("\nPpid:\t{}", pcb.basic().ppid().into())
                 .as_bytes()
                 .to_owned(),
         );
+
+        // fdsize
+        pdata.append(&mut format!("\nFDSize:\t{}", pcb.fd_table().read().fd_open_count()).into());
+
+        // kthread
+        pdata.append(&mut format!("\nKthread:\t{}", pcb.is_kthread() as usize).into());
+
         pdata.append(&mut format!("\ncpu_id:\t{}", cpu_id).as_bytes().to_owned());
         pdata.append(&mut format!("\npriority:\t{:?}", priority).as_bytes().to_owned());
         pdata.append(
@@ -192,6 +207,7 @@ impl ProcFSInode {
                 .as_bytes()
                 .to_owned(),
         );
+
         pdata.append(&mut format!("\nvrtime:\t{}", vrtime).as_bytes().to_owned());
 
         if let Some(user_vm) = pcb.basic().user_vm() {
@@ -821,7 +837,7 @@ pub fn procfs_init() -> Result<(), SystemError> {
     static INIT: Once = Once::new();
     let mut result = None;
     INIT.call_once(|| {
-        kinfo!("Initializing ProcFS...");
+        info!("Initializing ProcFS...");
         // 创建 procfs 实例
         let procfs: Arc<ProcFS> = ProcFS::new();
         // procfs 挂载
@@ -830,7 +846,7 @@ pub fn procfs_init() -> Result<(), SystemError> {
             .expect("Unabled to find /proc")
             .mount(procfs)
             .expect("Failed to mount at /proc");
-        kinfo!("ProcFS mounted.");
+        info!("ProcFS mounted.");
         result = Some(Ok(()));
     });
 

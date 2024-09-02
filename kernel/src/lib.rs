@@ -7,22 +7,21 @@
 #![feature(const_for)]
 #![feature(const_mut_refs)]
 #![feature(const_trait_impl)]
-#![feature(const_transmute_copy)]
 #![feature(const_refs_to_cell)]
 #![feature(core_intrinsics)]
 #![feature(c_void_variant)]
 #![feature(extract_if)]
 #![feature(fn_align)]
-#![feature(inline_const)]
+#![feature(linked_list_retain)]
 #![feature(naked_functions)]
 #![feature(new_uninit)]
-#![feature(panic_info_message)]
 #![feature(ptr_internals)]
-#![feature(ptr_to_from_bits)]
 #![feature(trait_upcasting)]
 #![feature(slice_ptr_get)]
+#![feature(sync_unsafe_cell)]
 #![feature(vec_into_raw_parts)]
 #![cfg_attr(target_os = "none", no_std)]
+#![allow(internal_features)]
 // clippy的配置
 #![deny(clippy::all)]
 #![allow(clippy::bad_bit_mask)]
@@ -85,6 +84,8 @@ extern crate x86;
 extern crate klog_types;
 extern crate uefi;
 extern crate uefi_raw;
+#[macro_use]
+extern crate wait_queue_macros;
 
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
@@ -106,7 +107,9 @@ pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator;
 #[panic_handler]
 #[no_mangle]
 pub fn panic(info: &PanicInfo) -> ! {
-    kerror!("Kernel Panic Occurred.");
+    use log::error;
+
+    error!("Kernel Panic Occurred.");
 
     match info.location() {
         Some(loc) => {
@@ -121,15 +124,7 @@ pub fn panic(info: &PanicInfo) -> ! {
             println!("No location info");
         }
     }
-
-    match info.message() {
-        Some(msg) => {
-            println!("Message:\n\t{}", msg);
-        }
-        None => {
-            println!("No panic message.");
-        }
-    }
+    println!("Message:\n\t{}", info.message());
 
     #[cfg(all(feature = "backtrace", target_arch = "x86_64"))]
     {

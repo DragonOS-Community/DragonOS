@@ -18,7 +18,7 @@ macro_rules! syscall_return {
 
         if $show {
             let pid = ProcessManager::current_pcb().pid();
-            crate::kdebug!("syscall return:pid={:?},ret= {:?}\n", pid, ret as isize);
+            log::debug!("syscall return:pid={:?},ret= {:?}\n", pid, ret as isize);
         }
 
         unsafe {
@@ -29,7 +29,7 @@ macro_rules! syscall_return {
 }
 
 pub(super) fn syscall_handler(syscall_num: usize, frame: &mut TrapFrame) -> () {
-    // kdebug!("syscall_handler: syscall_num: {}", syscall_num);
+    // debug!("syscall_handler: syscall_num: {}", syscall_num);
     unsafe {
         CurrentIrqArch::interrupt_enable();
     }

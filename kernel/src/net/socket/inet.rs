@@ -1,14 +1,13 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use log::{error, warn};
 use smoltcp::{
-    socket::{raw, tcp, udp, AnySocket},
+    socket::{raw, tcp, udp},
     wire,
 };
 use system_error::SystemError;
 
 use crate::{
-    arch::rand::rand,
     driver::net::NetDevice,
-    kerror, kwarn,
     libs::rwlock::RwLock,
     net::{
         event_poll::EPollEventType, net_core::poll_ifaces, Endpoint, Protocol, ShutdownType,
@@ -17,8 +16,8 @@ use crate::{
 };
 
 use super::{
-    handle::GlobalSocketHandle, Socket, SocketHandleItem, SocketMetadata, SocketOptions,
-    SocketPollMethod, SocketType, HANDLE_MAP, PORT_MANAGER, SOCKET_SET,
+    handle::GlobalSocketHandle, PosixSocketHandleItem, Socket, SocketHandleItem, SocketMetadata,
+    SocketOptions, SocketPollMethod, SocketType, HANDLE_MAP, PORT_MANAGER, SOCKET_SET,
 };
 
 /// @brief 表示原始的socket。原始套接字绕过传输层协议（如 TCP 或 UDP）并提供对网络层协议（如 IP）的直接访问。
@@ -33,6 +32,7 @@ pub struct RawSocket {
     header_included: bool,
     /// socket的metadata
     metadata: SocketMetadata,
+    posix_item: Arc<PosixSocketHandleItem>,
 }
 
 impl RawSocket {
@@ -77,18 +77,29 @@ impl RawSocket {
             options,
         );
 
+        let posix_item = Arc::new(PosixSocketHandleItem::new(None));
+
         return Self {
             handle,
             header_included: false,
             metadata,
+            posix_item,
         };
     }
 }
 
 impl Socket for RawSocket {
+    fn posix_item(&self) -> Arc<PosixSocketHandleItem> {
+        self.posix_item.clone()
+    }
+
     fn close(&mut self) {
         let mut socket_set_guard = SOCKET_SET.lock_irqsave();
-        socket_set_guard.remove(self.handle.smoltcp_handle().unwrap()); // 删除的时候，会发送一条FINISH的信息？
+        if let smoltcp::socket::Socket::Udp(mut sock) =
+            socket_set_guard.remove(self.handle.smoltcp_handle().unwrap())
+        {
+            sock.close();
+        }
         drop(socket_set_guard);
         poll_ifaces();
     }
@@ -120,11 +131,7 @@ impl Socket for RawSocket {
                 }
             }
             drop(socket_set_guard);
-            SocketHandleItem::sleep(
-                self.socket_handle(),
-                EPollEventType::EPOLLIN.bits() as u64,
-                HANDLE_MAP.read_irqsave(),
-            );
+            self.posix_item.sleep(EPollEventType::EPOLLIN.bits() as u64);
         }
     }
 
@@ -194,7 +201,7 @@ impl Socket for RawSocket {
                     drop(socket_set_guard);
                     return Ok(len);
                 } else {
-                    kwarn!("Unsupport Ip protocol type!");
+                    warn!("Unsupport Ip protocol type!");
                     return Err(SystemError::EINVAL);
                 }
             } else {
@@ -237,6 +244,7 @@ pub struct UdpSocket {
     pub handle: GlobalSocketHandle,
     remote_endpoint: Option<Endpoint>, // 记录远程endpoint提供给connect()， 应该使用IP地址。
     metadata: SocketMetadata,
+    posix_item: Arc<PosixSocketHandleItem>,
 }
 
 impl UdpSocket {
@@ -275,10 +283,13 @@ impl UdpSocket {
             options,
         );
 
+        let posix_item = Arc::new(PosixSocketHandleItem::new(None));
+
         return Self {
             handle,
             remote_endpoint: None,
             metadata,
+            posix_item,
         };
     }
 
@@ -289,7 +300,7 @@ impl UdpSocket {
                 ip.port = PORT_MANAGER.get_ephemeral_port(self.metadata.socket_type)?;
             }
             // 检测端口是否已被占用
-            PORT_MANAGER.bind_port(self.metadata.socket_type, ip.port, self.clone())?;
+            PORT_MANAGER.bind_port(self.metadata.socket_type, ip.port)?;
 
             let bind_res = if ip.addr.is_unspecified() {
                 socket.bind(ip.port)
@@ -308,9 +319,17 @@ impl UdpSocket {
 }
 
 impl Socket for UdpSocket {
+    fn posix_item(&self) -> Arc<PosixSocketHandleItem> {
+        self.posix_item.clone()
+    }
+
     fn close(&mut self) {
         let mut socket_set_guard = SOCKET_SET.lock_irqsave();
-        socket_set_guard.remove(self.handle.smoltcp_handle().unwrap()); // 删除的时候，会发送一条FINISH的信息？
+        if let smoltcp::socket::Socket::Udp(mut sock) =
+            socket_set_guard.remove(self.handle.smoltcp_handle().unwrap())
+        {
+            sock.close();
+        }
         drop(socket_set_guard);
         poll_ifaces();
     }
@@ -318,13 +337,13 @@ impl Socket for UdpSocket {
     /// @brief 在read函数执行之前，请先bind到本地的指定端口
     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
         loop {
-            // kdebug!("Wait22 to Read");
+            // debug!("Wait22 to Read");
             poll_ifaces();
             let mut socket_set_guard = SOCKET_SET.lock_irqsave();
             let socket =
                 socket_set_guard.get_mut::<udp::Socket>(self.handle.smoltcp_handle().unwrap());
 
-            // kdebug!("Wait to Read");
+            // debug!("Wait to Read");
 
             if socket.can_recv() {
                 if let Ok((size, metadata)) = socket.recv_slice(buf) {
@@ -337,16 +356,12 @@ impl Socket for UdpSocket {
                 // return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
             }
             drop(socket_set_guard);
-            SocketHandleItem::sleep(
-                self.socket_handle(),
-                EPollEventType::EPOLLIN.bits() as u64,
-                HANDLE_MAP.read_irqsave(),
-            );
+            self.posix_item.sleep(EPollEventType::EPOLLIN.bits() as u64);
         }
     }
 
     fn write(&self, buf: &[u8], to: Option<Endpoint>) -> Result<usize, SystemError> {
-        // kdebug!("udp to send: {:?}, len={}", to, buf.len());
+        // debug!("udp to send: {:?}, len={}", to, buf.len());
         let remote_endpoint: &wire::IpEndpoint = {
             if let Some(Endpoint::Ip(Some(ref endpoint))) = to {
                 endpoint
@@ -356,28 +371,28 @@ impl Socket for UdpSocket {
                 return Err(SystemError::ENOTCONN);
             }
         };
-        // kdebug!("udp write: remote = {:?}", remote_endpoint);
+        // debug!("udp write: remote = {:?}", remote_endpoint);
 
         let mut socket_set_guard = SOCKET_SET.lock_irqsave();
         let socket = socket_set_guard.get_mut::<udp::Socket>(self.handle.smoltcp_handle().unwrap());
-        // kdebug!("is open()={}", socket.is_open());
-        // kdebug!("socket endpoint={:?}", socket.endpoint());
+        // debug!("is open()={}", socket.is_open());
+        // debug!("socket endpoint={:?}", socket.endpoint());
         if socket.can_send() {
-            // kdebug!("udp write: can send");
+            // debug!("udp write: can send");
             match socket.send_slice(buf, *remote_endpoint) {
                 Ok(()) => {
-                    // kdebug!("udp write: send ok");
+                    // debug!("udp write: send ok");
                     drop(socket_set_guard);
                     poll_ifaces();
                     return Ok(buf.len());
                 }
                 Err(_) => {
-                    // kdebug!("udp write: send err");
+                    // debug!("udp write: send err");
                     return Err(SystemError::ENOBUFS);
                 }
             }
         } else {
-            // kdebug!("udp write: can not send");
+            // debug!("udp write: can not send");
             return Err(SystemError::ENOBUFS);
         };
     }
@@ -385,7 +400,7 @@ impl Socket for UdpSocket {
     fn bind(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
         let mut sockets = SOCKET_SET.lock_irqsave();
         let socket = sockets.get_mut::<udp::Socket>(self.handle.smoltcp_handle().unwrap());
-        // kdebug!("UDP Bind to {:?}", endpoint);
+        // debug!("UDP Bind to {:?}", endpoint);
         return self.do_bind(socket, endpoint);
     }
 
@@ -477,6 +492,7 @@ pub struct TcpSocket {
     local_endpoint: Option<wire::IpEndpoint>, // save local endpoint for bind()
     is_listening: bool,
     metadata: SocketMetadata,
+    posix_item: Arc<PosixSocketHandleItem>,
 }
 
 impl TcpSocket {
@@ -509,13 +525,15 @@ impl TcpSocket {
             Self::DEFAULT_METADATA_BUF_SIZE,
             options,
         );
-        // kdebug!("when there's a new tcp socket,its'len: {}",handles.len());
+        let posix_item = Arc::new(PosixSocketHandleItem::new(None));
+        // debug!("when there's a new tcp socket,its'len: {}",handles.len());
 
         return Self {
             handles,
             local_endpoint: None,
             is_listening: false,
             metadata,
+            posix_item,
         };
     }
 
@@ -525,15 +543,13 @@ impl TcpSocket {
         local_endpoint: wire::IpEndpoint,
     ) -> Result<(), SystemError> {
         let listen_result = if local_endpoint.addr.is_unspecified() {
-            // kdebug!("Tcp Socket Listen on port {}", local_endpoint.port);
             socket.listen(local_endpoint.port)
         } else {
-            // kdebug!("Tcp Socket Listen on {local_endpoint}");
             socket.listen(local_endpoint)
         };
         return match listen_result {
             Ok(()) => {
-                // kdebug!(
+                // debug!(
                 //     "Tcp Socket Listen on {local_endpoint}, open?:{}",
                 //     socket.is_open()
                 // );
@@ -554,16 +570,49 @@ impl TcpSocket {
         let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_TX_BUF_SIZE]);
         tcp::Socket::new(rx_buffer, tx_buffer)
     }
+
+    /// listening状态的posix socket是需要特殊处理的
+    fn tcp_poll_listening(&self) -> EPollEventType {
+        let socketset_guard = SOCKET_SET.lock_irqsave();
+
+        let can_accept = self.handles.iter().any(|h| {
+            if let Some(sh) = h.smoltcp_handle() {
+                let socket = socketset_guard.get::<tcp::Socket>(sh);
+                socket.is_active()
+            } else {
+                false
+            }
+        });
+
+        if can_accept {
+            return EPollEventType::EPOLL_LISTEN_CAN_ACCEPT;
+        } else {
+            return EPollEventType::empty();
+        }
+    }
 }
 
 impl Socket for TcpSocket {
+    fn posix_item(&self) -> Arc<PosixSocketHandleItem> {
+        self.posix_item.clone()
+    }
+
     fn close(&mut self) {
         for handle in self.handles.iter() {
-            let mut socket_set_guard = SOCKET_SET.lock_irqsave();
-            socket_set_guard.remove(handle.smoltcp_handle().unwrap()); // 删除的时候，会发送一条FINISH的信息？
-            drop(socket_set_guard);
+            {
+                let mut socket_set_guard = SOCKET_SET.lock_irqsave();
+                let smoltcp_handle = handle.smoltcp_handle().unwrap();
+                socket_set_guard
+                    .get_mut::<smoltcp::socket::tcp::Socket>(smoltcp_handle)
+                    .close();
+                drop(socket_set_guard);
+            }
+            poll_ifaces();
+            SOCKET_SET
+                .lock_irqsave()
+                .remove(handle.smoltcp_handle().unwrap());
+            // debug!("[Socket] [TCP] Close: {:?}", handle);
         }
-        poll_ifaces();
     }
 
     fn read(&self, buf: &mut [u8]) -> (Result<usize, SystemError>, Endpoint) {
@@ -576,18 +625,18 @@ impl Socket for TcpSocket {
         {
             return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
         }
-        // kdebug!("tcp socket: read, buf len={}", buf.len());
-        // kdebug!("tcp socket:read, socket'len={}",self.handle.len());
+        // debug!("tcp socket: read, buf len={}", buf.len());
+        // debug!("tcp socket:read, socket'len={}",self.handle.len());
         loop {
             poll_ifaces();
             let mut socket_set_guard = SOCKET_SET.lock_irqsave();
 
             let socket = socket_set_guard
-                .get_mut::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+                .get_mut::<tcp::Socket>(self.handles.first().unwrap().smoltcp_handle().unwrap());
 
             // 如果socket已经关闭，返回错误
             if !socket.is_active() {
-                // kdebug!("Tcp Socket Read Error, socket is closed");
+                // debug!("Tcp Socket Read Error, socket is closed");
                 return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
             }
 
@@ -607,7 +656,7 @@ impl Socket for TcpSocket {
                         }
                     }
                     Err(tcp::RecvError::InvalidState) => {
-                        kwarn!("Tcp Socket Read Error, InvalidState");
+                        warn!("Tcp Socket Read Error, InvalidState");
                         return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
                     }
                     Err(tcp::RecvError::Finished) => {
@@ -625,11 +674,8 @@ impl Socket for TcpSocket {
                 return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
             }
             drop(socket_set_guard);
-            SocketHandleItem::sleep(
-                self.socket_handle(),
-                EPollEventType::EPOLLIN.bits() as u64,
-                HANDLE_MAP.read_irqsave(),
-            );
+            self.posix_item
+                .sleep((EPollEventType::EPOLLIN | EPollEventType::EPOLLHUP).bits() as u64);
         }
     }
 
@@ -643,12 +689,12 @@ impl Socket for TcpSocket {
         {
             return Err(SystemError::ENOTCONN);
         }
-        // kdebug!("tcp socket:write, socket'len={}",self.handle.len());
+        // debug!("tcp socket:write, socket'len={}",self.handle.len());
 
         let mut socket_set_guard = SOCKET_SET.lock_irqsave();
 
         let socket = socket_set_guard
-            .get_mut::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+            .get_mut::<tcp::Socket>(self.handles.first().unwrap().smoltcp_handle().unwrap());
 
         if socket.is_open() {
             if socket.can_send() {
@@ -659,7 +705,7 @@ impl Socket for TcpSocket {
                         return Ok(size);
                     }
                     Err(e) => {
-                        kerror!("Tcp Socket Write Error {e:?}");
+                        error!("Tcp Socket Write Error {e:?}");
                         return Err(SystemError::ENOBUFS);
                     }
                 }
@@ -672,37 +718,44 @@ impl Socket for TcpSocket {
     }
 
     fn poll(&self) -> EPollEventType {
+        // 处理listen的快速路径
+        if self.is_listening {
+            return self.tcp_poll_listening();
+        }
+        // 由于上面处理了listening状态，所以这里只处理非listening状态，这种情况下只有一个handle
+
+        assert!(self.handles.len() == 1);
+
         let mut socket_set_guard = SOCKET_SET.lock_irqsave();
-        // kdebug!("tcp socket:poll, socket'len={}",self.handle.len());
+        // debug!("tcp socket:poll, socket'len={}",self.handle.len());
 
         let socket = socket_set_guard
-            .get_mut::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
-        return SocketPollMethod::tcp_poll(
-            socket,
-            HANDLE_MAP
-                .read_irqsave()
-                .get(&self.socket_handle())
-                .unwrap()
-                .shutdown_type(),
-        );
+            .get_mut::<tcp::Socket>(self.handles.first().unwrap().smoltcp_handle().unwrap());
+        let handle_map_guard = HANDLE_MAP.read_irqsave();
+        let handle_item = handle_map_guard.get(&self.socket_handle()).unwrap();
+        let shutdown_type = handle_item.shutdown_type();
+        let is_posix_listen = handle_item.is_posix_listen;
+        drop(handle_map_guard);
+
+        return SocketPollMethod::tcp_poll(socket, shutdown_type, is_posix_listen);
     }
 
     fn connect(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
         let mut sockets = SOCKET_SET.lock_irqsave();
-        // kdebug!("tcp socket:connect, socket'len={}",self.handle.len());
+        // debug!("tcp socket:connect, socket'len={}", self.handles.len());
 
         let socket =
-            sockets.get_mut::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+            sockets.get_mut::<tcp::Socket>(self.handles.first().unwrap().smoltcp_handle().unwrap());
 
         if let Endpoint::Ip(Some(ip)) = endpoint {
             let temp_port = PORT_MANAGER.get_ephemeral_port(self.metadata.socket_type)?;
             // 检测端口是否被占用
-            PORT_MANAGER.bind_port(self.metadata.socket_type, temp_port, self.clone())?;
+            PORT_MANAGER.bind_port(self.metadata.socket_type, temp_port)?;
 
-            // kdebug!("temp_port: {}", temp_port);
+            // debug!("temp_port: {}", temp_port);
             let iface: Arc<dyn NetDevice> = NET_DEVICES.write_irqsave().get(&0).unwrap().clone();
             let mut inner_iface = iface.inner_iface().lock();
-            // kdebug!("to connect: {ip:?}");
+            // debug!("to connect: {ip:?}");
 
             match socket.connect(inner_iface.context(), ip, temp_port) {
                 Ok(()) => {
@@ -714,7 +767,7 @@ impl Socket for TcpSocket {
                         poll_ifaces();
                         let mut sockets = SOCKET_SET.lock_irqsave();
                         let socket = sockets.get_mut::<tcp::Socket>(
-                            self.handles.get(0).unwrap().smoltcp_handle().unwrap(),
+                            self.handles.first().unwrap().smoltcp_handle().unwrap(),
                         );
 
                         match socket.state() {
@@ -723,11 +776,7 @@ impl Socket for TcpSocket {
                             }
                             tcp::State::SynSent => {
                                 drop(sockets);
-                                SocketHandleItem::sleep(
-                                    self.socket_handle(),
-                                    Self::CAN_CONNECT,
-                                    HANDLE_MAP.read_irqsave(),
-                                );
+                                self.posix_item.sleep(Self::CAN_CONNECT);
                             }
                             _ => {
                                 return Err(SystemError::ECONNREFUSED);
@@ -736,7 +785,7 @@ impl Socket for TcpSocket {
                     }
                 }
                 Err(e) => {
-                    // kerror!("Tcp Socket Connect Error {e:?}");
+                    // error!("Tcp Socket Connect Error {e:?}");
                     match e {
                         tcp::ConnectError::InvalidState => return Err(SystemError::EISCONN),
                         tcp::ConnectError::Unaddressable => return Err(SystemError::EADDRNOTAVAIL),
@@ -750,11 +799,16 @@ impl Socket for TcpSocket {
 
     /// @brief tcp socket 监听 local_endpoint 端口
     ///
-    /// @param backlog 未处理的连接队列的最大长度. 由于smoltcp不支持backlog，所以这个参数目前无效
+    /// @param backlog 未处理的连接队列的最大长度
     fn listen(&mut self, backlog: usize) -> Result<(), SystemError> {
         if self.is_listening {
             return Ok(());
         }
+
+        // debug!(
+        //     "tcp socket:listen, socket'len={}, backlog = {backlog}",
+        //     self.handles.len()
+        // );
 
         let local_endpoint = self.local_endpoint.ok_or(SystemError::EINVAL)?;
         let mut sockets = SOCKET_SET.lock_irqsave();
@@ -763,17 +817,22 @@ impl Socket for TcpSocket {
         let backlog = handlen.max(backlog);
 
         // 添加剩余需要构建的socket
-        // kdebug!("tcp socket:before listen, socket'len={}",self.handle.len());
+        // debug!("tcp socket:before listen, socket'len={}", self.handle_list.len());
         let mut handle_guard = HANDLE_MAP.write_irqsave();
+        let socket_handle_item_0 = handle_guard.get_mut(&self.socket_handle()).unwrap();
+        socket_handle_item_0.is_posix_listen = true;
+
         self.handles.extend((handlen..backlog).map(|_| {
             let socket = Self::create_new_socket();
             let handle = GlobalSocketHandle::new_smoltcp_handle(sockets.add(socket));
-            let handle_item = SocketHandleItem::new();
+            let mut handle_item = SocketHandleItem::new(Arc::downgrade(&self.posix_item));
+            handle_item.is_posix_listen = true;
             handle_guard.insert(handle, handle_item);
             handle
         }));
-        // kdebug!("tcp socket:listen, socket'len={}",self.handle.len());
-        // kdebug!("tcp socket:listen, backlog={backlog}");
+
+        // debug!("tcp socket:listen, socket'len={}", self.handles.len());
+        // debug!("tcp socket:listen, backlog={backlog}");
 
         // 监听所有的socket
         for i in 0..backlog {
@@ -782,11 +841,12 @@ impl Socket for TcpSocket {
             let socket = sockets.get_mut::<tcp::Socket>(handle.smoltcp_handle().unwrap());
 
             if !socket.is_listening() {
-                // kdebug!("Tcp Socket is already listening on {local_endpoint}");
+                // debug!("Tcp Socket is already listening on {local_endpoint}");
                 self.do_listen(socket, local_endpoint)?;
             }
-            // kdebug!("Tcp Socket  before listen, open={}", socket.is_open());
+            // debug!("Tcp Socket  before listen, open={}", socket.is_open());
         }
+
         return Ok(());
     }
 
@@ -797,11 +857,12 @@ impl Socket for TcpSocket {
             }
 
             // 检测端口是否已被占用
-            PORT_MANAGER.bind_port(self.metadata.socket_type, ip.port, self.clone())?;
-            // kdebug!("tcp socket:bind, socket'len={}",self.handle.len());
+            PORT_MANAGER.bind_port(self.metadata.socket_type, ip.port)?;
+            // debug!("tcp socket:bind, socket'len={}",self.handle.len());
 
             self.local_endpoint = Some(ip);
             self.is_listening = false;
+
             return Ok(());
         }
         return Err(SystemError::EINVAL);
@@ -818,101 +879,87 @@ impl Socket for TcpSocket {
     }
 
     fn accept(&mut self) -> Result<(Box<dyn Socket>, Endpoint), SystemError> {
+        if !self.is_listening {
+            return Err(SystemError::EINVAL);
+        }
         let endpoint = self.local_endpoint.ok_or(SystemError::EINVAL)?;
         loop {
-            // kdebug!("tcp accept: poll_ifaces()");
+            // debug!("tcp accept: poll_ifaces()");
             poll_ifaces();
-            // kdebug!("tcp socket:accept, socket'len={}",self.handle.len());
+            // debug!("tcp socket:accept, socket'len={}", self.handle_list.len());
 
-            let mut sockets = SOCKET_SET.lock_irqsave();
+            let mut sockset = SOCKET_SET.lock_irqsave();
+            // Get the corresponding activated handler
+            let global_handle_index = self.handles.iter().position(|handle| {
+                let con_smol_sock = sockset.get::<tcp::Socket>(handle.smoltcp_handle().unwrap());
+                con_smol_sock.is_active()
+            });
 
-            // 随机获取访问的socket的handle
-            let index: usize = rand() % self.handles.len();
-            let handle = self.handles.get(index).unwrap();
+            if let Some(handle_index) = global_handle_index {
+                let con_smol_sock = sockset
+                    .get::<tcp::Socket>(self.handles[handle_index].smoltcp_handle().unwrap());
 
-            let socket = sockets
-                .iter_mut()
-                .find(|y| {
-                    tcp::Socket::downcast(y.1)
-                        .map(|y| y.is_active())
-                        .unwrap_or(false)
-                })
-                .map(|y| tcp::Socket::downcast_mut(y.1).unwrap());
-            if let Some(socket) = socket {
-                if socket.is_active() {
-                    // kdebug!("tcp accept: socket.is_active()");
-                    let remote_ep = socket.remote_endpoint().ok_or(SystemError::ENOTCONN)?;
+                // debug!("[Socket] [TCP] Accept: {:?}", handle);
+                // handle is connected socket's handle
+                let remote_ep = con_smol_sock
+                    .remote_endpoint()
+                    .ok_or(SystemError::ENOTCONN)?;
 
-                    let new_socket = {
-                        // The new TCP socket used for sending and receiving data.
-                        let mut tcp_socket = Self::create_new_socket();
-                        self.do_listen(&mut tcp_socket, endpoint)
-                            .expect("do_listen failed");
+                let tcp_socket = Self::create_new_socket();
 
-                        // tcp_socket.listen(endpoint).unwrap();
+                let new_handle = GlobalSocketHandle::new_smoltcp_handle(sockset.add(tcp_socket));
 
-                        // 之所以把old_handle存入new_socket, 是因为当前时刻，smoltcp已经把old_handle对应的socket与远程的endpoint关联起来了
-                        // 因此需要再为当前的socket分配一个新的handle
-                        let new_handle =
-                            GlobalSocketHandle::new_smoltcp_handle(sockets.add(tcp_socket));
-                        let old_handle = ::core::mem::replace(
-                            &mut *self.handles.get_mut(index).unwrap(),
-                            new_handle,
-                        );
+                // let handle in TcpSock be the new empty handle, and return the old connected handle
+                let old_handle = core::mem::replace(&mut self.handles[handle_index], new_handle);
 
-                        let metadata = SocketMetadata::new(
-                            SocketType::Tcp,
-                            Self::DEFAULT_TX_BUF_SIZE,
-                            Self::DEFAULT_RX_BUF_SIZE,
-                            Self::DEFAULT_METADATA_BUF_SIZE,
-                            self.metadata.options,
-                        );
+                let metadata = SocketMetadata::new(
+                    SocketType::Tcp,
+                    Self::DEFAULT_TX_BUF_SIZE,
+                    Self::DEFAULT_RX_BUF_SIZE,
+                    Self::DEFAULT_METADATA_BUF_SIZE,
+                    self.metadata.options,
+                );
 
-                        let new_socket = Box::new(TcpSocket {
-                            handles: vec![old_handle],
-                            local_endpoint: self.local_endpoint,
-                            is_listening: false,
-                            metadata,
-                        });
-                        // kdebug!("tcp socket:after accept, socket'len={}",new_socket.handle.len());
+                let sock_ret = Box::new(TcpSocket {
+                    handles: vec![old_handle],
+                    local_endpoint: self.local_endpoint,
+                    is_listening: false,
+                    metadata,
+                    posix_item: Arc::new(PosixSocketHandleItem::new(None)),
+                });
 
-                        // 更新端口与 socket 的绑定
-                        if let Some(Endpoint::Ip(Some(ip))) = self.endpoint() {
-                            PORT_MANAGER.unbind_port(self.metadata.socket_type, ip.port)?;
-                            PORT_MANAGER.bind_port(
-                                self.metadata.socket_type,
-                                ip.port,
-                                *new_socket.clone(),
-                            )?;
-                        }
+                {
+                    let mut handle_guard = HANDLE_MAP.write_irqsave();
+                    // 先删除原来的
+                    let item = handle_guard.remove(&old_handle).unwrap();
+                    item.reset_shutdown_type();
+                    assert!(item.is_posix_listen);
 
-                        // 更新handle表
-                        let mut handle_guard = HANDLE_MAP.write_irqsave();
-                        // 先删除原来的
+                    // 按照smoltcp行为，将新的handle绑定到原来的item
+                    let new_item = SocketHandleItem::new(Arc::downgrade(&sock_ret.posix_item));
+                    handle_guard.insert(old_handle, new_item);
+                    // 插入新的item
+                    handle_guard.insert(new_handle, item);
 
-                        let item = handle_guard.remove(&old_handle).unwrap();
+                    let socket = sockset.get_mut::<tcp::Socket>(
+                        self.handles[handle_index].smoltcp_handle().unwrap(),
+                    );
 
-                        // 按照smoltcp行为，将新的handle绑定到原来的item
-                        handle_guard.insert(new_handle, item);
-                        let new_item = SocketHandleItem::new();
+                    if !socket.is_listening() {
+                        self.do_listen(socket, endpoint)?;
+                    }
 
-                        // 插入新的item
-                        handle_guard.insert(old_handle, new_item);
-
-                        new_socket
-                    };
-                    // kdebug!("tcp accept: new socket: {:?}", new_socket);
-                    drop(sockets);
-                    poll_ifaces();
-
-                    return Ok((new_socket, Endpoint::Ip(Some(remote_ep))));
+                    drop(handle_guard);
                 }
-            }
-            // kdebug!("tcp socket:before sleep, handle_guard'len={}",HANDLE_MAP.write_irqsave().len());
 
-            drop(sockets);
-            SocketHandleItem::sleep(*handle, Self::CAN_ACCPET, HANDLE_MAP.read_irqsave());
-            // kdebug!("tcp socket:after sleep, handle_guard'len={}",HANDLE_MAP.write_irqsave().len());
+                return Ok((sock_ret, Endpoint::Ip(Some(remote_ep))));
+            }
+
+            drop(sockset);
+
+            // debug!("[TCP] [Accept] sleeping socket with handle: {:?}", self.handles.first().unwrap().smoltcp_handle().unwrap());
+            self.posix_item.sleep(Self::CAN_ACCPET);
+            // debug!("tcp socket:after sleep, handle_guard'len={}",HANDLE_MAP.write_irqsave().len());
         }
     }
 
@@ -921,10 +968,10 @@ impl Socket for TcpSocket {
 
         if result.is_none() {
             let sockets = SOCKET_SET.lock_irqsave();
-            // kdebug!("tcp socket:endpoint, socket'len={}",self.handle.len());
+            // debug!("tcp socket:endpoint, socket'len={}",self.handle.len());
 
             let socket =
-                sockets.get::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+                sockets.get::<tcp::Socket>(self.handles.first().unwrap().smoltcp_handle().unwrap());
             if let Some(ep) = socket.local_endpoint() {
                 result = Some(Endpoint::Ip(Some(ep)));
             }
@@ -934,10 +981,10 @@ impl Socket for TcpSocket {
 
     fn peer_endpoint(&self) -> Option<Endpoint> {
         let sockets = SOCKET_SET.lock_irqsave();
-        // kdebug!("tcp socket:peer_endpoint, socket'len={}",self.handle.len());
+        // debug!("tcp socket:peer_endpoint, socket'len={}",self.handle.len());
 
         let socket =
-            sockets.get::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+            sockets.get::<tcp::Socket>(self.handles.first().unwrap().smoltcp_handle().unwrap());
         return socket.remote_endpoint().map(|x| Endpoint::Ip(Some(x)));
     }
 
@@ -950,9 +997,9 @@ impl Socket for TcpSocket {
     }
 
     fn socket_handle(&self) -> GlobalSocketHandle {
-        // kdebug!("tcp socket:socket_handle, socket'len={}",self.handle.len());
+        // debug!("tcp socket:socket_handle, socket'len={}",self.handle.len());
 
-        *self.handles.get(0).unwrap()
+        *self.handles.first().unwrap()
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {

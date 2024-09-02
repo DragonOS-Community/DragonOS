@@ -388,9 +388,9 @@ impl NTtyData {
                 continue;
             }
 
-            if self.char_map.get(c as usize).unwrap() {
+            if ((c as usize) < self.char_map.size()) && self.char_map.get(c as usize).unwrap() {
                 // 特殊字符
-                self.receive_special_char(c, tty.clone(), lookahead_done)
+                self.receive_special_char(c, tty.clone(), lookahead_done);
             } else {
                 self.receive_char(c, tty.clone());
             }
@@ -1344,7 +1344,7 @@ impl NTtyData {
                                     tty.write(core, &[8], 1)?;
                                 }
                                 if tty.put_char(tty.core(), b' ').is_err() {
-                                    tty.write(core, &[b' '], 1)?;
+                                    tty.write(core, b" ", 1)?;
                                 }
                                 self.cursor_column -= 1;
                                 space -= 1;
@@ -1357,7 +1357,7 @@ impl NTtyData {
                                 }
 
                                 if tty.put_char(tty.core(), b'^').is_err() {
-                                    tty.write(core, &[b'^'], 1)?;
+                                    tty.write(core, b"^", 1)?;
                                 }
 
                                 if tty.put_char(tty.core(), ch ^ 0o100).is_err() {

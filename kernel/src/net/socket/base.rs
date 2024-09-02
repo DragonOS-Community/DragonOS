@@ -3,7 +3,6 @@
 use core::fmt::Debug;
 use alloc::sync::Arc;
 use system_error::SystemError::{self, *};
-use crate::filesystem::vfs::IndexNode;
 use crate::net::socket::*;
 use crate::net::syscall_util::MsgHdr;
 
@@ -27,7 +26,7 @@ pub trait Socket: Sync + Send + Debug {
     /// 接受连接，仅用于listening stream socket
     /// ## Block
     /// 如果没有连接到来，会阻塞
-    fn accept(&self) -> Result<(Arc<dyn IndexNode>, Endpoint), SystemError> {
+    fn accept(&self) -> Result<(Arc<Inode>, Endpoint), SystemError> {
         Err(ENOSYS)
     }
 

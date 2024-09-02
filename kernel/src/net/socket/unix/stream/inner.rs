@@ -4,10 +4,9 @@ use log::debug;
 use system_error::SystemError;
 
 use crate::libs::mutex::Mutex;
-use crate::net::Endpoint;
+use crate::net::socket::Endpoint;
 
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
 
 
 #[derive(Debug)]
@@ -55,6 +54,10 @@ impl Connected {
         return (this, peer);
     }
 
+    pub(super) fn addr(&self) -> Option<Endpoint> {
+        self.addr.clone()
+    }
+
     pub fn peer_addr(&self) -> Option<Endpoint> {
         self.peer_addr.clone()
     }
@@ -100,6 +103,10 @@ impl Listener {
         let mut incoming_connects = self.incoming_connects.lock();
 
         return incoming_connects.pop_front();
+    }
+
+    pub(super) fn addr(&self) -> Option<Endpoint> {
+        self.addr.clone()
     }
 }
 

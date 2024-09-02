@@ -329,9 +329,9 @@ impl Socket for TcpSocket {
         }
     }
 
-    fn accept(&self) -> Result<(Arc<dyn IndexNode>, crate::net::Endpoint), SystemError> {
+    fn accept(&self) -> Result<(Arc<Inode>, crate::net::socket::Endpoint), SystemError> {
         self.try_accept().map(|(stream, remote)| 
-            (stream as Arc<dyn IndexNode>, crate::net::Endpoint::from(remote))
+            (stream as Arc<Inode>, crate::net::socket::Endpoint::from(remote))
         )
     }
 }
@@ -376,7 +376,7 @@ impl TcpStream {
     }
 }
 
-use crate::net::socket::Socket;
+use crate::net::socket::{Inode, Socket};
 use crate::filesystem::vfs::IndexNode;
 
 impl IndexNode for TcpStream {

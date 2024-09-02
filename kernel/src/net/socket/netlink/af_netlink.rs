@@ -1,12 +1,8 @@
-//参考https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c
-
-
-
+// 参考https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c
 use core::cmp::{max, min};
 use core::ops::Deref;
 use core::{any::Any, fmt::Debug, hash::Hash};
 use core::{mem, slice};
-use std::alloc::System;
 
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -488,13 +484,18 @@ impl Socket for NetlinkSock{
     }
     fn bind(&self, _endpoint: Endpoint) -> Result<(), SystemError> {
         log::debug!("NetlinkSock bind to {:?}", _endpoint);
-        if let Some(Endpoint::Netlink(netlink))= self.endpoint(){
-            let addr = netlink.addr;
-            let addr_len = netlink.addr_len;
-            let sock: Arc<Mutex<Box<dyn NetlinkSocket>>> = Arc::new(Mutex::new(Box::new(self.clone())));
-            let _ = netlink_bind(sock, &addr, addr_len);
+        match _endpoint {
+            Endpoint::Netlink(netlinkendpoint) => {
+                let addr = netlinkendpoint.addr;
+                let addr_len = netlinkendpoint.addr_len;
+                let sock: Arc<Mutex<Box<dyn NetlinkSocket>>> = Arc::new(Mutex::new(Box::new(self.clone())));
+                netlink_bind(sock, &addr, addr_len);
+            }
+            _ => {
+                return Err(SystemError::EINVAL);
+            }
         }
-        return Ok(())
+        Ok(())
     }
     fn listen(&self, _backlog: usize) -> Result<(), SystemError> {
         todo!()
@@ -657,15 +658,14 @@ impl NetlinkSock {
 
 
     // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#1849
-    /// 用户进程对netlink套接字调用sendmsg()系统调用后，内核执行netlink操作的总入口函数
+    /// 用户进程对netlink套接字调用 sendmsg() 系统调用后，内核执行netlink操作的总入口函数
     /// ## 参数
     /// - sock    - 指向用户进程的netlink套接字，也就是发送方的
     /// - msg     - 承载了发送方传递的netlink消息
     /// - len     - netlink消息长度
     /// ## 备注
-    /// netlink套接字在创建的过程中(具体是在 netlink_create 开头)，已经和 netlink_ops (socket层netlink协议族的通用操作集合)关联,其中注册的sendmsg回调就是指向本函数
+    /// netlink套接字在创建的过程中(具体是在 netlink_create 开头)，已经和 netlink_ops (socket层netlink协议族的通用操作集合)关联,其中注册的 sendmsg 回调就是指向本函数
     fn netlink_send(&self, data: &[u8], address:Endpoint)-> Result<usize, SystemError>{
-        // 如果用户没有指定netlink消息的目的地址，则使用netlink套接字默认的（该值默认为0，会在调用connect系统调用时在netlink_connect()中被赋值为用户设置的值
         // 一个有效的 Netlink 消息至少应该包含一个消息头
         if data.len()< size_of::<NLmsghdr>(){
             return Err(SystemError::EINVAL);
@@ -675,7 +675,7 @@ impl NetlinkSock {
         if header.nlmsg_len as usize >data.len(){
             return Err(SystemError::ENAVAIL);
         }
-        let message_type = NLmsgType::from(header.nlmsg_type);
+        // let message_type = NLmsgType::from(header.nlmsg_type);
         let mut buffer = self.data.lock();
         buffer.clear();
         
@@ -699,7 +699,7 @@ impl NetlinkSock {
     }
 
     // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#1938
-    /// 用户进程对netlink套接字调用recvmsg()系统调用后，内核执行netlink操作的总入口函数
+    /// 用户进程对 netlink 套接字调用 recvmsg() 系统调用后，内核执行 netlink 操作的总入口函数
     /// ## 参数
     /// - sock    - 指向用户进程的netlink套接字，也就是接收方的
     /// - msg     - 用于存放接收到的netlink消息

@@ -1,3 +1,5 @@
+use alloc::{slice, vec::Vec};
+
 //定义Netlink消息的结构体，如NLmsghdr和geNLmsghdr(拓展的netlink消息头)，以及用于封包和解包消息的函数。
 //参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/netlink.h
 // SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
@@ -39,23 +41,16 @@ pub const NL_CFG_F_NONROOT_RECV	:u32 = 1 << 0;
 pub const NL_CFG_F_NONROOT_SEND	:u32 = 1 << 1;
 
 bitflags! {
-
-//netlink消息报头
-/**
- * struct NLmsghdr - fixed format metadata header of Netlink messages
- * @nlmsg_len:   Length of message including header
- * @nlmsg_type:  Message content type
- * @nlmsg_flags: Additional flags
- * @nlmsg_seq:   Sequence number
- * @nlmsg_pid:   Sending process port ID
- */
-
-//四种通用的消息类型 nlmsg_type
+/// 四种通用的消息类型 nlmsg_type
 pub struct NLmsgType: u8 {
-    const NLMSG_NOOP = 0x1; /* Nothing.     */
-    const NLMSG_ERROR = 0x2; /* Error       */
-    const NLMSG_DONE = 0x3; /* End of a dump    */
-    const NLMSG_OVERRUN = 0x4; /* Data lost     */
+    /* Nothing.     */
+    const NLMSG_NOOP = 0x1; 
+    /* Error       */
+    const NLMSG_ERROR = 0x2; 
+    /* End of a dump    */
+    const NLMSG_DONE = 0x3; 
+    /* Data lost     */
+    const NLMSG_OVERRUN = 0x4;
 }
 
 //消息标记 nlmsg_flags
@@ -94,13 +89,21 @@ pub struct NLmsgFlags: u16 {
     const NLM_F_ACK_TLVS = 0x200;	/* extended ACK TVLs were included */
 }
 }
-
-struct NLmsghdr {
-    nlmsg_len: usize,
-    nlmsg_type: u16,
-    nlmsg_flags: u16,
-    nlmsg_seq: u32,
-    nlmsg_pid: u32,
+/// netlink消息报头
+/**
+ * struct NLmsghdr - fixed format metadata header of Netlink messages
+ * @nlmsg_len:   Length of message including header
+ * @nlmsg_type:  Message content type
+ * @nlmsg_flags: Additional flags
+ * @nlmsg_seq:   Sequence number
+ * @nlmsg_pid:   Sending process port ID
+ */
+pub struct NLmsghdr {
+    pub nlmsg_len: usize,
+    pub nlmsg_type: NLmsgType,
+    pub nlmsg_flags: NLmsgFlags,
+    pub nlmsg_seq: u32,
+    pub nlmsg_pid: u32,
 }
 
 const NLMSG_ALIGNTO: usize = 4;
@@ -167,4 +170,39 @@ impl NetlinkKernelCfg {
 struct NLattr {
     nla_len: u16,
     nla_type: u16,
+}
+
+
+pub trait VecExt {
+    fn align4(&mut self);
+    fn push_ext<T: Sized>(&mut self, data: T);
+    fn set_ext<T: Sized>(&mut self, offset: usize, data: T);
+}
+
+impl VecExt for Vec<u8> {
+    fn align4(&mut self) {
+        let len = (self.len() + 3) & !3;
+        if len > self.len() {
+            self.resize(len, 0);
+        }
+    }
+
+    fn push_ext<T: Sized>(&mut self, data: T) {
+        #[allow(unsafe_code)]
+        let bytes =
+            unsafe { slice::from_raw_parts(&data as *const T as *const u8, size_of::<T>()) };
+        for byte in bytes {
+            self.push(*byte);
+        }
+    }
+
+    fn set_ext<T: Sized>(&mut self, offset: usize, data: T) {
+        if self.len() < offset + size_of::<T>() {
+            self.resize(offset + size_of::<T>(), 0);
+        }
+        #[allow(unsafe_code)]
+        let bytes =
+            unsafe { slice::from_raw_parts(&data as *const T as *const u8, size_of::<T>()) };
+        self[offset..(bytes.len() + offset)].copy_from_slice(bytes);
+    }
 }

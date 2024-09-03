@@ -75,10 +75,10 @@
 #define MULTIBOOT2_BOOTLOADER_MAGIC 0x36d76289
 
 // 存储到boot_entry_type的值
-BOOT_ENTRY_TYPE_MULTIBOOT = 1
-BOOT_ENTRY_TYPE_MULTIBOOT2 = 2
-BOOT_ENTRY_TYPE_LINUX_32 = 3
-BOOT_ENTRY_TYPE_LINUX_64 = 4
+#define BOOT_ENTRY_TYPE_MULTIBOOT 1
+#define BOOT_ENTRY_TYPE_MULTIBOOT2  2
+#define BOOT_ENTRY_TYPE_LINUX_32  3
+#define BOOT_ENTRY_TYPE_LINUX_64  4
 
 // 直接用 -m64 编译出来的是 64 位代码，
 // 但是启动后的机器是 32 位的，相当于在 32 位机器上跑 64 位程序。
@@ -173,11 +173,11 @@ ENTRY(_start)
     jmp halt // unreachable
 
 bl_magic_is_mb:
-    mov BOOT_ENTRY_TYPE_MULTIBOOT, %ebx
+    mov $BOOT_ENTRY_TYPE_MULTIBOOT, %ebx
     mov %ebx, boot_entry_type
     jmp protected_mode_setup
 bl_magic_is_mb2:
-    mov BOOT_ENTRY_TYPE_MULTIBOOT2, %ebx
+    mov $BOOT_ENTRY_TYPE_MULTIBOOT2, %ebx
     mov %ebx, boot_entry_type
     jmp protected_mode_setup
 
@@ -480,7 +480,7 @@ repeat_set_idt:
     movq mb_entry_magic, %rsi
     movq %r13, %rdx // GDT size
     movq %r12, %r10 // IDT size
-    movq boot_entry_type, %r9
+    movq boot_entry_type, %r8
 
 	lretq
 

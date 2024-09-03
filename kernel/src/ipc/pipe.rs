@@ -1,6 +1,4 @@
 use crate::{
-    arch::CurrentIrqArch,
-    exception::InterruptArch,
     filesystem::vfs::{
         core::generate_inode_id, file::FileMode, syscall::ModeType, FilePrivateData, FileSystem,
         FileType, IndexNode, Metadata,
@@ -11,13 +9,14 @@ use crate::{
     },
     net::event_poll::{EPollEventType, EPollItem, EventPoll},
     process::ProcessState,
-    sched::{schedule, SchedMode},
+    sched::SchedMode,
     time::PosixTimeSpec,
 };
 
 use alloc::{
     collections::LinkedList,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use system_error::SystemError;
 
@@ -104,6 +103,25 @@ impl InnerPipeInode {
         self.epitems.lock().push_back(epitem);
         Ok(())
     }
+
+    fn buf_full(&self) -> bool {
+        return self.valid_cnt as usize == PIPE_BUFF_SIZE;
+    }
+
+    pub fn remove_epoll(&self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
+        let is_remove = !self
+            .epitems
+            .lock_irqsave()
+            .extract_if(|x| x.epoll().ptr_eq(epoll))
+            .collect::<Vec<_>>()
+            .is_empty();
+
+        if is_remove {
+            return Ok(());
+        }
+
+        Err(SystemError::ENOENT)
+    }
 }
 
 impl LockedPipeInode {
@@ -150,6 +168,16 @@ impl LockedPipeInode {
     pub fn inner(&self) -> &SpinLock<InnerPipeInode> {
         &self.inner
     }
+
+    fn readable(&self) -> bool {
+        let inode = self.inner.lock();
+        return inode.valid_cnt > 0 || inode.writer == 0;
+    }
+
+    fn writeable(&self) -> bool {
+        let inode = self.inner.lock();
+        return !inode.buf_full() || inode.reader == 0;
+    }
 }
 
 impl IndexNode for LockedPipeInode {
@@ -173,6 +201,7 @@ impl IndexNode for LockedPipeInode {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
+        // log::debug!("pipe mode: {:?}", mode);
         // 加锁
         let mut inode = self.inner.lock();
 
@@ -193,14 +222,12 @@ impl IndexNode for LockedPipeInode {
             }
 
             // 否则在读等待队列中睡眠，并释放锁
-            unsafe {
-                let irq_guard = CurrentIrqArch::save_and_disable_irq();
-
-                drop(inode);
-                self.read_wait_queue.sleep_without_schedule();
-                drop(irq_guard);
+            drop(inode);
+            let r = wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {});
+            if r.is_err() {
+                return Err(SystemError::ERESTARTSYS);
             }
-            schedule(SchedMode::SM_NONE);
+
             inode = self.inner.lock();
         }
 
@@ -351,13 +378,11 @@ impl IndexNode for LockedPipeInode {
             }
 
             // 解锁并睡眠
-            unsafe {
-                let irq_guard = CurrentIrqArch::save_and_disable_irq();
-                drop(inode);
-                self.write_wait_queue.sleep_without_schedule();
-                drop(irq_guard);
+            drop(inode);
+            let r = wq_wait_event_interruptible!(self.write_wait_queue, self.writeable(), {});
+            if r.is_err() {
+                return Err(SystemError::ERESTARTSYS);
             }
-            schedule(SchedMode::SM_NONE);
             inode = self.inner.lock();
         }
 

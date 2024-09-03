@@ -345,7 +345,7 @@ impl Syscall {
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let mut socket = unsafe { socket.inner_no_preempt() };
-        socket.shutdown(ShutdownType::from_bits_truncate(how as u8))?;
+        socket.shutdown(ShutdownType::from_bits_truncate((how + 1) as u8))?;
         return Ok(0);
     }
 

@@ -9,7 +9,7 @@ use crate::{
         rwlock::{RwLock, RwLockReadGuard},
         spinlock::SpinLock,
     },
-    mm::{mmio_buddy::mmio_pool, page::PageFlags},
+    mm::{mmio_buddy::mmio_pool, page::EntryFlags},
     time::timer::{Timer, TimerFunction},
 };
 use alloc::{boxed::Box, sync::Arc};
@@ -91,7 +91,7 @@ impl VideoRefreshManager {
         }
         // 地址映射
         let paddr = bp.screen_info.lfb_base;
-        let page_flags: PageFlags<MMArch> = PageFlags::new().set_execute(true).set_write(true);
+        let page_flags: EntryFlags<MMArch> = EntryFlags::new().set_execute(true).set_write(true);
 
         unsafe {
             mmio_guard

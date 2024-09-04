@@ -10,15 +10,18 @@ use x86::{bits64::rflags::RFlags, controlregs::Cr4};
 use crate::{
     arch::{
         interrupt::{trap::X86PfErrorCode, TrapFrame},
+        ipc::signal::{SigCode, Signal},
         mm::{MemoryManagementArch, X86_64MMArch},
         CurrentIrqArch, MMArch,
     },
     exception::InterruptArch,
+    ipc::signal_types::{SigInfo, SigType},
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
         ucontext::{AddressSpace, LockedVMA},
         VirtAddr, VmFaultReason, VmFlags,
     },
+    process::ProcessManager,
 };
 
 use super::LockedFrameAllocator;
@@ -28,7 +31,7 @@ pub type PageMapper =
 
 impl X86_64MMArch {
     pub fn vma_access_error(vma: Arc<LockedVMA>, error_code: X86PfErrorCode) -> bool {
-        let vm_flags = *vma.lock().vm_flags();
+        let vm_flags = *vma.lock_irqsave().vm_flags();
         let foreign = false;
         if error_code.contains(X86PfErrorCode::X86_PF_PK) {
             return true;
@@ -223,20 +226,30 @@ impl X86_64MMArch {
         }
 
         let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
-        let mut space_guard = current_address_space.write();
+        let mut space_guard = current_address_space.write_irqsave();
         let mut fault;
         loop {
             let vma = space_guard.mappings.find_nearest(address);
             // let vma = space_guard.mappings.contains(address);
 
-            let vma = vma.unwrap_or_else(|| {
-                panic!(
-                    "can not find nearest vma, error_code: {:#b}, address: {:#x}",
-                    error_code,
-                    address.data(),
-                )
-            });
-            let guard = vma.lock();
+            let vma = match vma {
+                Some(vma) => vma,
+                None => {
+                    log::error!(
+                        "can not find nearest vma, error_code: {:#b}, address: {:#x}",
+                        error_code,
+                        address.data(),
+                    );
+                    let pid = ProcessManager::current_pid();
+                    let mut info =
+                        SigInfo::new(Signal::SIGSEGV, 0, SigCode::User, SigType::Kill(pid));
+                    Signal::SIGSEGV
+                        .send_signal_info(Some(&mut info), pid)
+                        .expect("failed to send SIGSEGV to process");
+                    return;
+                }
+            };
+            let guard = vma.lock_irqsave();
             let region = *guard.region();
             let vm_flags = *guard.vm_flags();
             drop(guard);
@@ -253,11 +266,18 @@ impl X86_64MMArch {
                             )
                         });
                 } else {
-                    panic!(
+                    log::error!(
                         "No mapped vma, error_code: {:#b}, address: {:#x}",
                         error_code,
                         address.data(),
-                    )
+                    );
+                    let pid = ProcessManager::current_pid();
+                    let mut info =
+                        SigInfo::new(Signal::SIGSEGV, 0, SigCode::User, SigType::Kill(pid));
+                    Signal::SIGSEGV
+                        .send_signal_info(Some(&mut info), pid)
+                        .expect("failed to send SIGSEGV to process");
+                    return;
                 }
             }
 
@@ -269,11 +289,9 @@ impl X86_64MMArch {
                 );
             }
             let mapper = &mut space_guard.user_mapper.utable;
+            let message = PageFaultMessage::new(vma.clone(), address, flags, mapper);
 
-            fault = PageFaultHandler::handle_mm_fault(
-                PageFaultMessage::new(vma.clone(), address, flags),
-                mapper,
-            );
+            fault = PageFaultHandler::handle_mm_fault(message);
 
             if fault.contains(VmFaultReason::VM_FAULT_COMPLETED) {
                 return;

@@ -10,7 +10,6 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    arch::MMArch,
     driver::{
         base::{
             class::Class,
@@ -32,18 +31,13 @@ use crate::{
         sysfs::{file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport},
         vfs::syscall::ModeType,
     },
-    include::bindings::bindings::FRAME_BUFFER_MAPPING_OFFSET,
     init::{boot::boot_callbacks, boot_params, initcall::INITCALL_DEVICE},
     libs::{
-        align::page_align_up,
         once::Once,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::SpinLock,
     },
-    mm::{
-        allocator::page_frame::PageFrameCount, no_init::pseudo_map_phys, MemoryManagementArch,
-        PhysAddr, VirtAddr,
-    },
+    mm::{early_ioremap::EarlyIoRemap, PhysAddr, VirtAddr},
 };
 
 use super::base::{
@@ -936,14 +930,8 @@ pub fn vesafb_early_init() -> Result<(), SystemError> {
 }
 
 pub fn vesafb_early_map(paddr: PhysAddr, size: usize) -> Result<VirtAddr, SystemError> {
-    // todo: 改用early ioremap
-    let buf_vaddr = VirtAddr::new(
-        crate::include::bindings::bindings::SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE as usize
-            + FRAME_BUFFER_MAPPING_OFFSET as usize,
-    );
+    let (buf_vaddr, _) = EarlyIoRemap::map(paddr, size, false)?;
 
-    let count = PageFrameCount::new(page_align_up(size) / MMArch::PAGE_SIZE);
-    unsafe { pseudo_map_phys(buf_vaddr, paddr, count) };
     return Ok(buf_vaddr);
 }
 

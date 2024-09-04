@@ -67,7 +67,7 @@ unsafe extern "C" fn kernel_main(
     x86::dtables::lidt(&idtp);
 
     compiler_fence(Ordering::SeqCst);
-    if let Err(_) = early_boot_init(boot_entry_type, mb2_magic, mb2_info) {
+    if early_boot_init(boot_entry_type, mb2_magic, mb2_info).is_err() {
         loop {
             spin_loop();
         }

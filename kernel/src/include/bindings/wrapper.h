@@ -23,5 +23,4 @@
 #include <mm/mmio.h>
 #include <mm/slab.h>
 #include <process/process.h>
-#include <time/sleep.h>
 #include <common/errno.h>

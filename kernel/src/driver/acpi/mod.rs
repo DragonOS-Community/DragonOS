@@ -78,14 +78,9 @@ impl AcpiManager {
     }
 
     fn map_tables(&self, acpi_args: BootloaderAcpiArg) -> Result<(), SystemError> {
-        let table_paddr: PhysAddr;
-        match acpi_args {
-            BootloaderAcpiArg::Rsdt(rsdpv1) => {
-                table_paddr = Self::rsdp_paddr(&rsdpv1);
-            }
-            BootloaderAcpiArg::Xsdt(rsdpv2) => {
-                table_paddr = Self::rsdp_paddr(&rsdpv2);
-            }
+        let table_paddr: PhysAddr = match acpi_args {
+            BootloaderAcpiArg::Rsdt(rsdpv1) => Self::rsdp_paddr(&rsdpv1),
+            BootloaderAcpiArg::Xsdt(rsdpv2) => Self::rsdp_paddr(&rsdpv2),
             _ => {
                 error!(
                     "AcpiManager::map_tables(): unsupported acpi_args: {:?}",
@@ -93,7 +88,7 @@ impl AcpiManager {
                 );
                 return Err(SystemError::ENODEV);
             }
-        }
+        };
         let res = unsafe { acpi::AcpiTables::from_rsdp(AcpiHandlerImpl, table_paddr.data()) };
         match res {
             Ok(acpi_table) => {

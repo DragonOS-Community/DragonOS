@@ -1,4 +1,5 @@
-use crate::arch::TraitPciArch;
+use crate::arch::io::PortIOArch;
+use crate::arch::{CurrentPortIOArch, TraitPciArch};
 use crate::driver::acpi::acpi_manager;
 use crate::driver::pci::ecam::{pci_ecam_root_info_manager, EcamRootInfo};
 use crate::driver::pci::pci::{
@@ -6,7 +7,6 @@ use crate::driver::pci::pci::{
     PORT_PCI_CONFIG_DATA,
 };
 use crate::driver::pci::root::{pci_root_manager, PciRoot};
-use crate::include::bindings::bindings::{io_in32, io_in8, io_out32};
 use crate::init::initcall::INITCALL_SUBSYS;
 use crate::mm::PhysAddr;
 
@@ -22,7 +22,7 @@ impl X86_64PciArch {
     /// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/pci/early.c?fi=read_pci_config_byte#19
     fn read_config_early(bus: u8, slot: u8, func: u8, offset: u8) -> u8 {
         unsafe {
-            io_out32(
+            CurrentPortIOArch::out32(
                 PORT_PCI_CONFIG_ADDRESS,
                 0x80000000
                     | ((bus as u32) << 16)
@@ -31,7 +31,7 @@ impl X86_64PciArch {
                     | offset as u32,
             );
         }
-        let value = unsafe { io_in8(PORT_PCI_CONFIG_DATA + (offset & 3) as u16) };
+        let value = unsafe { CurrentPortIOArch::in8(PORT_PCI_CONFIG_DATA + (offset & 3) as u16) };
         return value;
     }
 }
@@ -45,8 +45,8 @@ impl TraitPciArch for X86_64PciArch {
             | (offset & 0xfc) as u32
             | (0x80000000);
         let ret = unsafe {
-            io_out32(PORT_PCI_CONFIG_ADDRESS, address);
-            let temp = io_in32(PORT_PCI_CONFIG_DATA);
+            CurrentPortIOArch::out32(PORT_PCI_CONFIG_ADDRESS, address);
+            let temp = CurrentPortIOArch::in32(PORT_PCI_CONFIG_DATA);
             temp
         };
         return ret;
@@ -59,9 +59,9 @@ impl TraitPciArch for X86_64PciArch {
             | (offset & 0xfc) as u32
             | (0x80000000);
         unsafe {
-            io_out32(PORT_PCI_CONFIG_ADDRESS, address);
+            CurrentPortIOArch::out32(PORT_PCI_CONFIG_ADDRESS, address);
             // 写入数据
-            io_out32(PORT_PCI_CONFIG_DATA, data);
+            CurrentPortIOArch::out32(PORT_PCI_CONFIG_DATA, data);
         }
     }
 

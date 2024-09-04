@@ -17,7 +17,6 @@ use crate::{
         file::{File, FileMode},
         FilePrivateData, IndexNode, Metadata,
     },
-    include::bindings::bindings::INT32_MAX,
     libs::{
         rbtree::RBTree,
         rwlock::RwLock,
@@ -53,7 +52,7 @@ pub struct EventPoll {
 }
 
 impl EventPoll {
-    pub const EP_MAX_EVENTS: u32 = INT32_MAX / (core::mem::size_of::<EPollEvent>() as u32);
+    pub const EP_MAX_EVENTS: u32 = u32::MAX / (core::mem::size_of::<EPollEvent>() as u32);
     /// 用于获取inode中的epitem队列
     pub const ADD_EPOLLITEM: u32 = 0x7965;
     pub fn new() -> Self {

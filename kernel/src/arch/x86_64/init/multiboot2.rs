@@ -150,7 +150,7 @@ impl BootCallbacks for Mb2Callback {
         for region in mem_regions_tag.memory_areas() {
             let start = PhysAddr::new(region.start_address() as usize);
             let size = region.size() as usize;
-            let area_typ = MemoryAreaType::from(region.typ()).into();
+            let area_typ = MemoryAreaType::from(region.typ());
             total_mem_size += size;
 
             match area_typ {

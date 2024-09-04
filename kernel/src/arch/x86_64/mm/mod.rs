@@ -127,8 +127,8 @@ impl MemoryManagementArch for X86_64MMArch {
     const USER_STACK_START: VirtAddr = VirtAddr::new(0x6ffff0a00000);
 
     const FIXMAP_START_VADDR: VirtAddr = VirtAddr::new(0xffffb00000000000);
-    /// 设置FIXMAP区域大小为1M
-    const FIXMAP_SIZE: usize = 256 * 4096;
+    /// 设置FIXMAP区域大小为16M
+    const FIXMAP_SIZE: usize = 256 * 4096 * 16;
 
     const MMIO_BASE: VirtAddr = VirtAddr::new(0xffffa10000000000);
     const MMIO_SIZE: usize = 1 << PAGE_1G_SHIFT;

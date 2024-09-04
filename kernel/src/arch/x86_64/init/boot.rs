@@ -42,9 +42,7 @@ pub(super) fn early_boot_init(
             // early_multiboot_init(arg1, arg2);
             unimplemented!();
         }
-        BootProtocol::Multiboot2 => {
-            early_multiboot2_init(arg1 as u32, arg2)
-        }
+        BootProtocol::Multiboot2 => early_multiboot2_init(arg1 as u32, arg2),
         BootProtocol::Linux32 => {
             // linux32_init(arg1, arg2);
             unimplemented!();

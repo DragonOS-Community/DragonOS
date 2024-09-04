@@ -14,7 +14,7 @@ pub enum Endpoint {
     Inode(Arc<socket::Inode>),
     // todo: 增加NetLink机制后，增加NetLink端点
     /// NetLink端点
-    Netlink(Option<NetlinkEndpoint>),
+    Netlink(NetlinkEndpoint),
 }
 
 /// @brief 链路层端点

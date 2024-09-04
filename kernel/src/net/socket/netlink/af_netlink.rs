@@ -1,10 +1,8 @@
-//参考https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c
-
-
-
+// 参考https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c
+use core::cmp::{max, min};
 use core::ops::Deref;
 use core::{any::Any, fmt::Debug, hash::Hash};
-use core::mem;
+use core::{mem, slice};
 
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -22,14 +20,10 @@ use crate::include::bindings::bindings::{ECONNREFUSED, __WORDSIZE};
 use crate::libs::mutex::Mutex;
 use crate::libs::rwlock::RwLockWriteGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
-use crate::libs::wait_queue::WaitQueue;
 use crate::net::event_poll::{EPollEventType, EPollItem, EventPoll};
-use crate::net::net_core::poll_ifaces;
-use crate::net::socket::common::poll_unit::{self, EPollItems};
-use crate::net::socket::common::Shutdown;
+use crate::net::socket::*;
 use crate::net::socket::netlink::skbuff::SkBuff;
-use crate::net::syscall::SockAddrNl;
-use crate::net::Endpoint;
+use crate::net::syscall::{MsgHdr, SockAddr, SockAddrNl};
 use crate::time::timer::schedule_timeout;
 use crate::{
     libs::rwlock::RwLock,
@@ -37,11 +31,12 @@ use crate::{
 };
 use alloc::{boxed::Box, vec::Vec};
 
-use crate::net::socket::{AddressFamily, Socket, Options as SocketOptions, Type as SocketTypes};
+use crate::net::socket::{AddressFamily, Endpoint, MessageFlag, Socket};
 use lazy_static::lazy_static;
 
 use super::callback::NetlinkCallback;
-use super::netlink::{NETLINK_USERSOCK, NL_CFG_F_NONROOT_SEND};
+use super::endpoint::NetlinkEndpoint;
+use super::netlink::{NLmsgFlags, NLmsgType, NLmsghdr, VecExt, NETLINK_USERSOCK, NL_CFG_F_NONROOT_SEND};
 use super::netlink_proto::{proto_register, Proto, NETLINK_PROTO};
 use super::skbuff::{netlink_overrun, skb_orphan, skb_shared};
 use super::sock::SockFlags;
@@ -216,7 +211,7 @@ fn netlink_proto_init() -> Result<(), SystemError> {
     // rtnetlink_init();
     Ok(())
 }
-
+// 等待重构
 /// 
 pub trait NetProtoFamily {
     fn create(socket: &mut dyn Socket, protocol: i32, _kern: bool) -> Result<(), Error>;
@@ -392,6 +387,7 @@ fn netlink_bind(sock: Arc<Mutex<Box<dyn NetlinkSocket>>>, addr: &SockAddrNl, add
 
     Ok(())
 }
+
 // TODO: net namespace支持
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#532
 /// 在 netlink_table 中查找 netlink 套接字
@@ -471,60 +467,56 @@ pub struct NetlinkSock {
     dump_done_errno: i32,
     cb_running: bool,
     queue: Vec<Arc<RwLock<SkBuff>>>,
+    data: Arc<Mutex<Vec<Vec<u8>>>>,
     sk_sndtimeo: i64,
     sk_rcvtimeo: i64,
     callback: Option<&'static dyn NetlinkCallback>,
 }
 impl Socket for NetlinkSock{
     fn connect(&self, _endpoint: Endpoint) -> Result<(), SystemError>{
-        // Implementation of the function
-        Ok(())
+        self.netlink_connect(_endpoint)
     }
-    fn shutdown(&self, _type: Shutdown) -> Result<(), SystemError> {
+    fn shutdown(&self, _type: ShutdownTemp) -> Result<(), SystemError> {
         todo!()
     }
     fn bind(&self, _endpoint: Endpoint) -> Result<(), SystemError> {
         log::debug!("NetlinkSock bind to {:?}", _endpoint);
-        if let Some(Endpoint::Netlink(Some(netlink)))= self.endpoint(){
-            let addr = netlink.addr;
-            let addr_len = netlink.addr_len;
-            let sock: Arc<Mutex<Box<dyn NetlinkSocket>>> = Arc::new(Mutex::new(Box::new(self.clone())));
-            let _ = netlink_bind(sock, &addr, addr_len);
+        match _endpoint {
+            Endpoint::Netlink(netlinkendpoint) => {
+                let addr = netlinkendpoint.addr;
+                let addr_len = netlinkendpoint.addr_len;
+                let sock: Arc<Mutex<Box<dyn NetlinkSocket>>> = Arc::new(Mutex::new(Box::new(self.clone())));
+                netlink_bind(sock, &addr, addr_len);
+            }
+            _ => {
+                return Err(SystemError::EINVAL);
+            }
         }
-        return Ok(())
+        Ok(())
     }
     fn listen(&self, _backlog: usize) -> Result<(), SystemError> {
         todo!()
     }
-    fn accept(&self) -> Result<(Arc<dyn IndexNode>, Endpoint), SystemError> {
+    fn accept(&self) -> Result<(Arc<Inode>, Endpoint), SystemError> {
         todo!()
     }
 
-    fn endpoint(&self) -> Option<Endpoint> {
-        None
-    }
-    fn peer_endpoint(&self) -> Option<Endpoint> {
-        None
-    }
-
-    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        Ok(self.update_io_events()?.bits() as usize)
-    }
-
-    fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
+    fn epoll_items(&self) -> EPollItems {
         todo!()
     }
-    fn epoll_items(&self) -> &EPollItems{
-        todo!()
-    }
-    fn wait_queue(&self) -> &poll_unit::WaitQueue{
+    fn wait_queue(&self) -> WaitQueue {
         todo!()
     }
     fn update_io_events(&self) -> Result<EPollEventType, SystemError>{
         todo!()
     }
-    fn as_any(&self) -> &dyn Any{
-        self
+    // 借用 send_to 的接口模拟netlink_sendmsg的功能
+    fn send_to(&self, buffer: &[u8], flags: MessageFlag, address: Endpoint) -> Result<usize, SystemError> {
+        return self.netlink_send(buffer, address);
+    }
+    // 借用 recv_from 的接口模拟netlink_recvmsg的功能
+    fn recv_from(&self, msg: &mut [u8], flags: MessageFlag, address: Option<Endpoint>) -> Result<(usize, Endpoint), SystemError>  {
+        return self.netlink_recv(msg, msg.len(), flags)
     }
 }
 impl IndexNode for NetlinkSock{
@@ -584,7 +576,7 @@ impl NetlinkSocket for NetlinkSock {
         
     }
     fn is_kernel(&self) -> bool {
-        true
+        self.flags & NetlinkFlags::NETLINK_F_KERNEL_SOCKET.bits() !=0
     }
     fn equals(&self, other: Option<Arc<Mutex<Box<dyn NetlinkSocket>>>>) -> bool {
         if let Some(self_sk) = self.sk.as_ref().unwrap().upgrade() {
@@ -620,7 +612,10 @@ impl NetlinkSock {
     pub const DEFAULT_RX_BUF_SIZE: usize = 512 * 1024;
     /// 默认的发送缓冲区的大小 transmiss
     pub const DEFAULT_TX_BUF_SIZE: usize = 512 * 1024;
-    pub fn new(options:SocketOptions) -> NetlinkSock {
+    pub fn new() -> NetlinkSock {
+        let vec_of_vec_u8: Vec<Vec<u8>> = Vec::new();
+        let mutex_protected = Mutex::new(vec_of_vec_u8);
+        let data: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(mutex_protected);
         NetlinkSock {
             sk: None,
             portid: 0,
@@ -637,6 +632,7 @@ impl NetlinkSock {
             dump_done_errno: 0,
             cb_running: false,
             queue: Vec::new(),
+            data,
             sk_sndtimeo: 0,
             sk_rcvtimeo: 0,
             callback: None,
@@ -645,32 +641,116 @@ impl NetlinkSock {
     pub fn get_sk(&self) -> &Weak<dyn NetlinkSocket> {
         self.sk.as_ref().unwrap()
     }
-    fn send(&self, msg: &[u8]) -> Result<(), SystemError> {
-        // Implementation of the function
-        Ok(())
-    }
-
-    fn recv(&self) -> Result<Vec<u8>, SystemError> {
-        // Implementation of the function
-        Ok(Vec::new())
-    }
-
-    fn bind(&self) -> Result<(), SystemError> {
-        // Implementation of the function
-        Ok(())
-    }
-
-    fn unbind(&self) -> Result<(), SystemError> {
-        // Implementation of the function
-        Ok(())
-    }
-
     fn register(&self, listener: Box<dyn NetlinkMessageHandler>) {
         // Implementation of the function
     }
     fn unregister(&self, listener: Box<dyn NetlinkMessageHandler>) {
         // Implementation of the function
     }
+    // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#1078
+    /// 
+    fn netlink_connect(&self, _endpoint: Endpoint) -> Result<(), SystemError>{
+        Ok(())
+    }
+
+
+    // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#1849
+    /// 用户进程对netlink套接字调用 sendmsg() 系统调用后，内核执行netlink操作的总入口函数
+    /// ## 参数
+    /// - sock    - 指向用户进程的netlink套接字，也就是发送方的
+    /// - msg     - 承载了发送方传递的netlink消息
+    /// - len     - netlink消息长度
+    /// ## 备注
+    /// netlink套接字在创建的过程中(具体是在 netlink_create 开头)，已经和 netlink_ops (socket层netlink协议族的通用操作集合)关联,其中注册的 sendmsg 回调就是指向本函数
+    fn netlink_send(&self, data: &[u8], address:Endpoint)-> Result<usize, SystemError>{
+        // 一个有效的 Netlink 消息至少应该包含一个消息头
+        if data.len()< size_of::<NLmsghdr>(){
+            return Err(SystemError::EINVAL);
+        }
+        #[allow(unsafe_code)]
+        let header = unsafe{ &*(data.as_ptr() as *const NLmsghdr)};
+        if header.nlmsg_len as usize >data.len(){
+            return Err(SystemError::ENAVAIL);
+        }
+        // let message_type = NLmsgType::from(header.nlmsg_type);
+        let mut buffer = self.data.lock();
+        buffer.clear();
+        
+        let mut msg = Vec::new();
+        let new_header = NLmsghdr {
+            nlmsg_len: 0, // to be determined later
+            nlmsg_type: NLmsgType::NLMSG_DONE.into(),
+            nlmsg_flags: NLmsgFlags::NLM_F_MULTI,
+            nlmsg_seq: header.nlmsg_seq,
+            nlmsg_pid: header.nlmsg_pid,
+        };
+        // 将新消息头序列化到 msg 中
+        msg.push_ext(new_header);
+        // 确保 msg 的长度按照 4 字节对齐
+        msg.align4();
+        // msg 的开头设置消息长度。
+        msg.set_ext(0, msg.len() as u32);
+        // 将序列化后的 msg 添加到发送缓冲区 buffer 中
+        buffer.push(msg);
+        Ok(data.len())
+    }
+
+    // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#1938
+    /// 用户进程对 netlink 套接字调用 recvmsg() 系统调用后，内核执行 netlink 操作的总入口函数
+    /// ## 参数
+    /// - sock    - 指向用户进程的netlink套接字，也就是接收方的
+    /// - msg     - 用于存放接收到的netlink消息
+    /// - len     - 用户空间支持的netlink消息接收长度上限
+    /// - flags   - 跟本次接收操作有关的标志位集合(主要来源于用户空间)
+    fn netlink_recv(&self, msg: &mut [u8], len: usize, flags: MessageFlag) -> Result<(usize, Endpoint), SystemError> {
+        let mut copied: usize = 0;
+        let mut buffer = self.data.lock();
+        let msg_kernel = buffer.remove(0);
+    
+        // 判断是否是带外消息，如果是带外消息，直接返回错误码
+        if flags == MessageFlag::OOB {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+    
+        // 计算实际要复制的数据长度，不能超过 msg_from 的长度 或 msg 缓冲区的长度
+        let actual_len = msg_kernel.len().min(len);
+        
+        if !msg_kernel.is_empty() {
+            msg[..actual_len].copy_from_slice(&msg_kernel[..actual_len]);
+            copied = actual_len;
+        } else {
+            // 如果没有数据可复制，返回 0 字节被复制
+            copied = 0;
+        }
+    
+        let endpoint = Endpoint::Netlink(NetlinkEndpoint {
+            addr: SockAddrNl {
+                nl_family: AddressFamily::Netlink,
+                nl_pad: 0,
+                nl_pid: self.portid,
+                nl_groups: 0,
+            },
+            addr_len: mem::size_of::<SockAddrNl>(),
+        });
+    
+        // 返回复制的字节数和端点信息
+        Ok((copied, endpoint))
+    }
+    //     // let skb:SkBuff = skb_recv_datagram(sk, &nlk, &mut copied, &err, &ret);
+    //     // if skb.is_empty(){
+    //     //     netlink_rcv_wake(sk);
+    //     // }
+    //     // data_skb = skb;
+    //     // nlk.max_recvmsg_len = max(nlk.max_recvmsg_len, len);
+    //     // nlk.max_recvmsg_len = min(nlk.max_recvmsg_len,32768);
+    //     // copied = data_skb.len;
+    //     // if len < copied {
+    //     //     msg.msg_flags |= MessageFlag::TRUNC;
+    //     //     copied = len;
+    //     // }
+    //     // skb_copy_datagram_msg(data_skb, 0, msg, copied);
+    //     // return Ok(0);
+    // }
 }
 
 

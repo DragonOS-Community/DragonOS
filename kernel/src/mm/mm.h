@@ -107,20 +107,6 @@
 
 #define PAGE_USER_4K_PAGE (PAGE_U_S | PAGE_R_W | PAGE_PRESENT)
 
-/**
- * @brief 刷新TLB的宏定义
- * 由于任何写入cr3的操作都会刷新TLB，因此这个宏定义可以刷新TLB
- */
-#define flush_tlb()                                                            \
-  do {                                                                         \
-    ul tmp;                                                                    \
-    io_mfence();                                                               \
-    __asm__ __volatile__("movq %%cr3, %0\n\t"                                  \
-                         "movq %0, %%cr3\n\t"                                  \
-                         : "=r"(tmp)::"memory");                               \
-                                                                               \
-  } while (0);
-
 // 导出内核程序的几个段的起止地址
 extern char _text;
 extern char _etext;
@@ -131,20 +117,6 @@ extern char _erodata;
 extern char _bss;
 extern char _ebss;
 extern char _end;
-
-#if ARCH(I386) || ARCH(X86_64)
-/**
- * @brief 读取CR3寄存器的值（存储了页目录的基地址）
- *
- * @return unsigned*  cr3的值的指针
- */
-unsigned long *get_CR3() {
-  ul *tmp;
-  __asm__ __volatile__("movq %%cr3, %0\n\t" : "=r"(tmp)::"memory");
-  return tmp;
-}
-
-#endif
 
 /*
  *  vm_area_struct中的vm_flags的可选值

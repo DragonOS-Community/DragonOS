@@ -169,12 +169,6 @@ impl BootCallbacks for Mb2Callback {
                 }
 
                 _ => {
-                    log::debug!(
-                        "Memory area: base={:?}, size={:#x}, type={:?}",
-                        start,
-                        size,
-                        area_typ
-                    );
                     mem_block_manager()
                         .reserve_block(start, size)
                         .unwrap_or_else(|e| {
@@ -194,6 +188,23 @@ impl BootCallbacks for Mb2Callback {
             total_mem_size,
             usable_mem_size
         );
+
+        // Add the boot module region since Grub does not specify it.
+        let mb2_module_tag = mb2_info.module_tags();
+        for module in mb2_module_tag {
+            let start = PhysAddr::new(module.start_address() as usize);
+            let size = module.module_size() as usize;
+            mem_block_manager()
+                .reserve_block(start, size)
+                .unwrap_or_else(|e| {
+                    log::warn!(
+                        "Failed to reserve memory block for mb2 modules: base={:?}, size={:#x}, error={:?}",
+                        start,
+                        size,
+                        e
+                    );
+                });
+        }
 
         // setup kernel load base
         self.setup_kernel_load_base();

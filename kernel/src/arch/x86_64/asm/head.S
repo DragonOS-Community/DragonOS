@@ -108,9 +108,9 @@ multiboot_header:
 
 // multiboot2 文件头
 // 计算头长度
-.SET HEADER_LENGTH, multiboot2_header_end - multiboot2_header
+.SET MB2_HEADER_LENGTH, multiboot2_header_end - multiboot2_header
 // 计算校验和
-.SET MB2_CHECKSUM, -(MULTIBOOT2_HEADER_MAGIC + MULTIBOOT_ARCHITECTURE_I386 + HEADER_LENGTH)
+.SET MB2_CHECKSUM, -(MULTIBOOT2_HEADER_MAGIC + MULTIBOOT_ARCHITECTURE_I386 + MB2_HEADER_LENGTH)
 // 8 字节对齐
 .code32
 .section .multiboot2_header
@@ -123,7 +123,7 @@ multiboot2_header:
     // 架构
     .long MULTIBOOT_ARCHITECTURE_I386
     // 头长度
-    .long HEADER_LENGTH
+    .long MB2_HEADER_LENGTH
     // 校验和
     .long MB2_CHECKSUM
     // 添加其它内容在此，详细信息见 Multiboot2 Specification version 2.0.pdf

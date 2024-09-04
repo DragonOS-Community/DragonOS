@@ -1,5 +1,6 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::debug::kprobe::{register_kprobe, unregister_kprobe, KprobeInfo};
+use alloc::string::ToString;
 use kprobe::ProbeArgs;
 
 #[inline(never)]
@@ -39,9 +40,11 @@ pub fn kprobe_test() {
         pre_handler,
         post_handler,
         fault_handler: Some(fault_handler),
+        event_callback: None,
         symbol: None,
         addr: Some(detect_func as usize),
         offset: 0,
+        enable: true,
     };
     let kprobe = register_kprobe(kprobe_info).unwrap();
 
@@ -57,9 +60,11 @@ pub fn kprobe_test() {
         pre_handler: new_pre_handler,
         post_handler,
         fault_handler: Some(fault_handler),
-        symbol: Some("dragonos_kernel::debug::kprobe::test::detect_func"),
+        event_callback: None,
+        symbol: Some("dragonos_kernel::debug::kprobe::test::detect_func".to_string()),
         addr: None,
         offset: 0,
+        enable: true,
     };
     let kprobe2 = register_kprobe(kprobe_info).unwrap();
     println!(

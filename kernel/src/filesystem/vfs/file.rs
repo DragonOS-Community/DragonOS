@@ -10,6 +10,7 @@ use system_error::SystemError;
 
 use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 use crate::filesystem::eventfd::EventFdInode;
+use crate::perf::PerfEventInode;
 use crate::{
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
@@ -540,11 +541,15 @@ impl File {
                 inode.inner().lock().remove_epoll(epoll)
             }
             _ => {
+                let inode = self.inode.downcast_ref::<EventFdInode>();
+                if let Some(inode) = inode {
+                    return inode.remove_epoll(epoll);
+                }
                 let inode = self
                     .inode
-                    .downcast_ref::<EventFdInode>()
+                    .downcast_ref::<PerfEventInode>()
                     .ok_or(SystemError::ENOSYS)?;
-                inode.remove_epoll(epoll)
+                return inode.remove_epoll(epoll);
             }
         }
     }

@@ -227,6 +227,24 @@ impl InnerAddressSpace {
         return self.user_mapper.utable.is_current();
     }
 
+    pub fn map_file(
+        &mut self,
+        start_vaddr: VirtAddr,
+        len: usize,
+        prot_flags: ProtFlags,
+        map_flags: MapFlags,
+        round_to_min: bool,
+        allocate_at_once: bool,
+    ) -> Result<VirtPageFrame, SystemError> {
+        self.map_anonymous(
+            start_vaddr,
+            len,
+            prot_flags,
+            map_flags,
+            round_to_min,
+            allocate_at_once,
+        )
+    }
     /// 进行匿名页映射
     ///
     /// ## 参数

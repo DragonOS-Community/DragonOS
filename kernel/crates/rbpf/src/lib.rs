@@ -29,9 +29,7 @@
 // Configures the crate to be `no_std` when `std` feature is disabled.
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
-
 use alloc::{collections::BTreeMap, format, vec, vec::Vec};
-use core::ptr;
 
 use byteorder::{ByteOrder, LittleEndian};
 
@@ -509,7 +507,7 @@ impl<'a> EbpfVmMbuff<'a> {
         //  in the kernel; anyway the verifier would prevent the use of uninitialized registers).
         //  See `mul_loop` test.
         let mem_ptr = match mem.len() {
-            0 => ptr::null_mut(),
+            0 => core::ptr::null_mut(),
             _ => mem.as_ptr() as *mut u8,
         };
 
@@ -908,7 +906,7 @@ impl<'a> EbpfVmFixedMbuff<'a> {
         //  in the kernel; anyway the verifier would prevent the use of uninitialized registers).
         //  See `mul_loop` test.
         let mem_ptr = match mem.len() {
-            0 => ptr::null_mut(),
+            0 => core::ptr::null_mut(),
             _ => mem.as_ptr() as *mut u8,
         };
 
@@ -1010,7 +1008,7 @@ impl<'a> EbpfVmFixedMbuff<'a> {
         //  in the kernel; anyway the verifier would prevent the use of uninitialized registers).
         //  See `mul_loop` test.
         let mem_ptr = match mem.len() {
-            0 => ptr::null_mut(),
+            0 => core::ptr::null_mut(),
             _ => mem.as_ptr() as *mut u8,
         };
 
@@ -1687,5 +1685,100 @@ impl<'a> EbpfVmNoData<'a> {
     #[cfg(feature = "cranelift")]
     pub fn execute_program_cranelift(&self) -> Result<u64, Error> {
         self.parent.execute_program_cranelift(&mut [])
+    }
+}
+
+/// EbpfVm with Owned data
+pub struct EbpfVmRawOwned {
+    parent: EbpfVmRaw<'static>,
+    data_len: usize,
+    data_cap: usize,
+}
+
+impl EbpfVmRawOwned {
+    /// Create a new virtual machine instance, and load an eBPF program into that instance.
+    /// When attempting to load the program, it passes through a simple verifier.
+    pub fn new(prog: Option<Vec<u8>>) -> Result<EbpfVmRawOwned, Error> {
+        let (prog, data_len, data_cap) = match prog {
+            Some(prog) => {
+                let data_len = prog.len();
+                let data_cap = prog.capacity();
+                let slice = prog.leak();
+                let slice = unsafe { core::slice::from_raw_parts(slice.as_ptr(), data_len) };
+                (Some(slice), data_len, data_cap)
+            }
+            None => (None, 0, 0),
+        };
+        let parent = EbpfVmRaw::new(prog)?;
+        Ok(Self {
+            parent,
+            data_len,
+            data_cap,
+        })
+    }
+    /// Load a new eBPF program into the virtual machine instance
+    pub fn set_program(&mut self, prog: Vec<u8>) -> Result<(), Error> {
+        self.data_len = prog.len();
+        self.data_cap = prog.capacity();
+        let slice = prog.leak();
+        self.parent.set_program(slice)?;
+        Ok(())
+    }
+
+    /// Set a new verifier function. The function should return an Error if the program should be rejected by the virtual machine.
+    /// If a program has been loaded to the VM already, the verifier is immediately run.
+    pub fn set_verifier(&mut self, verifier: Verifier) -> Result<(), Error> {
+        self.parent.set_verifier(verifier)
+    }
+
+    /// Register a built-in or user-defined helper function in order to use it later from within the eBPF program.
+    /// The helper is registered into a hashmap, so the key can be any u32.
+    /// If using JIT-compiled eBPF programs, be sure to register all helpers before compiling the program.
+    /// You should be able to change registered helpers after compiling, but not to add new ones (i. e. with new keys).
+    pub fn register_helper(
+        &mut self,
+        key: u32,
+        function: fn(u64, u64, u64, u64, u64) -> u64,
+    ) -> Result<(), Error> {
+        self.parent.register_helper(key, function)
+    }
+
+    /// Register a set of built-in or user-defined helper functions in order to use them later from
+    /// within the eBPF program. The helpers are registered into a hashmap, so the `key` can be any
+    /// `u32`.
+    #[allow(clippy::type_complexity)]
+    pub fn register_helper_set(
+        &mut self,
+        helpers: &HashMap<u32, fn(u64, u64, u64, u64, u64) -> u64>,
+    ) -> Result<(), Error> {
+        for (key, function) in helpers {
+            self.parent.register_helper(*key, *function)?;
+        }
+        Ok(())
+    }
+
+    /// Execute the previously JIT-compiled program, with the given packet data, in a manner very similar to execute_program().
+    ///
+    /// Safety
+    ///
+    /// **WARNING:** JIT-compiled assembly code is not safe, in particular there is no runtime check for memory access;
+    /// so if the eBPF program attempts erroneous accesses, this may end very bad (program may segfault).
+    /// It may be wise to check that the program works with the interpreter before running the JIT-compiled version of it.
+    ///
+    /// For this reason the function should be called from within an unsafe bloc.
+    pub fn execute_program(&self, mem: &mut [u8]) -> Result<u64, Error> {
+        self.parent.execute_program(mem)
+    }
+}
+
+impl Drop for EbpfVmRawOwned {
+    fn drop(&mut self) {
+        match self.parent.parent.prog {
+            Some(prog) => unsafe {
+                let ptr = prog.as_ptr();
+                let _prog = Vec::from_raw_parts(ptr as *mut u8, self.data_len, self.data_cap);
+            },
+            None => {}
+        };
     }
 }

@@ -4,18 +4,18 @@ use alloc::sync::Arc;
 use log::error;
 use system_error::SystemError;
 
+use super::{
+    allocator::page_frame::{PageFrameCount, VirtPageFrame},
+    ucontext::{AddressSpace, DEFAULT_MMAP_MIN_ADDR},
+    verify_area, VirtAddr, VmFlags,
+};
+use crate::process::ProcessManager;
 use crate::{
     arch::MMArch,
     ipc::shm::ShmFlags,
     libs::align::{check_aligned, page_align_up},
     mm::MemoryManagementArch,
     syscall::Syscall,
-};
-
-use super::{
-    allocator::page_frame::{PageFrameCount, VirtPageFrame},
-    ucontext::{AddressSpace, DEFAULT_MMAP_MIN_ADDR},
-    verify_area, VirtAddr, VmFlags,
 };
 
 bitflags! {
@@ -296,8 +296,8 @@ impl Syscall {
         len: usize,
         prot_flags: usize,
         map_flags: usize,
-        _fd: i32,
-        _offset: usize,
+        fd: i32,
+        offset: usize,
     ) -> Result<usize, SystemError> {
         let map_flags = MapFlags::from_bits_truncate(map_flags as u64);
         let prot_flags = ProtFlags::from_bits_truncate(prot_flags as u64);
@@ -312,10 +312,10 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
         // 暂时不支持除匿名页以外的映射
-        if !map_flags.contains(MapFlags::MAP_ANONYMOUS) {
-            error!("mmap: not support file mapping");
-            return Err(SystemError::ENOSYS);
-        }
+        // if !map_flags.contains(MapFlags::MAP_ANONYMOUS) {
+        //     error!("mmap: not support file mapping");
+        //     return Err(SystemError::ENOSYS);
+        // }
 
         // 暂时不支持巨页映射
         if map_flags.contains(MapFlags::MAP_HUGETLB) {
@@ -323,14 +323,40 @@ impl Syscall {
             return Err(SystemError::ENOSYS);
         }
         let current_address_space = AddressSpace::current()?;
-        let start_page = current_address_space.write().map_anonymous(
-            start_vaddr,
-            len,
-            prot_flags,
-            map_flags,
-            true,
-            false,
-        )?;
+        let start_page = if fd > 0 {
+            let page_frame = current_address_space.write().map_file(
+                start_vaddr,
+                len,
+                prot_flags,
+                map_flags,
+                true,
+                false,
+            )?;
+            let fd_table = ProcessManager::current_pcb().fd_table();
+            let file = fd_table
+                .read()
+                .get_file_by_fd(fd as _)
+                .ok_or(SystemError::EBADF)?;
+            let start_addr = page_frame.virt_address().data();
+            log::info!(
+                "mmap for file: start_addr: {:#x}, len: {:#x}, offset: {:#x}",
+                start_addr,
+                len,
+                offset
+            );
+            file.inode().mmap(start_addr, len, offset)?;
+            page_frame
+        } else {
+            let start_page = current_address_space.write().map_anonymous(
+                start_vaddr,
+                len,
+                prot_flags,
+                map_flags,
+                true,
+                false,
+            )?;
+            start_page
+        };
         return Ok(start_page.virt_address().data());
     }
 

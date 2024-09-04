@@ -4,7 +4,7 @@ use log::debug;
 use system_error::SystemError;
 
 use crate::libs::mutex::Mutex;
-use crate::net::socket::Endpoint;
+use crate::net::socket::{Endpoint, Shutdown};
 
 use alloc::collections::VecDeque;
 
@@ -60,6 +60,20 @@ impl Connected {
 
     pub fn peer_addr(&self) -> Option<Endpoint> {
         self.peer_addr.clone()
+    }
+
+    pub fn shutdown(&self, shutdown: Shutdown) -> Result<(), SystemError> {
+        let how = shutdown.get();
+
+        if how.is_empty() {
+            return Err(SystemError::EINVAL);
+        }else if how.is_send_shutdown() {
+            unimplemented!("unimplemented!");
+        }else if how.is_recv_shutdown() {
+            unimplemented!("unimplemented!");            
+        }
+
+        Ok(())
     }
 }
 

@@ -75,17 +75,6 @@ impl PciDevice for PciGeneralDevice {
     fn subsystem_device(&self) -> u16 {
         self.header.subsystem_id
     }
-
-    fn revision_id(&self)->u8{
-        self.header.common_header.revision_id
-    }
-
-    fn class_code(&self)->u32 {
-        let class=self.header.common_header.class_code as u32;
-        let subclass = self.header.common_header.subclass as u32;
-        let prog_if = self.header.common_header.prog_if as u32;
-        (class << 16) | (subclass << 8) | (prog_if)
-    }
 }
 
 impl Device for PciGeneralDevice {

@@ -1,7 +1,7 @@
 use crate::{
     arch::kvm::vmx::ept::EptMapper,
     libs::mutex::Mutex,
-    mm::{page::PageFlags, syscall::ProtFlags},
+    mm::{page::EntryFlags, syscall::ProtFlags},
     virt::kvm::host_mem::{__gfn_to_pfn, kvm_vcpu_gfn_to_memslot, PAGE_MASK, PAGE_SHIFT},
 };
 use bitfield_struct::bitfield;
@@ -218,7 +218,7 @@ pub fn __direct_map(
     }
     // 把gpa映射到hpa
     let mut ept_mapper = EptMapper::lock();
-    let page_flags = PageFlags::from_prot_flags(ProtFlags::from_bits_truncate(0x7_u64), false);
+    let page_flags = EntryFlags::from_prot_flags(ProtFlags::from_bits_truncate(0x7_u64), false);
     unsafe {
         assert!(ept_mapper.walk(gpa, pfn << PAGE_SHIFT, page_flags).is_ok());
     }

@@ -1,8 +1,4 @@
-use core::{
-    ffi::{c_uint, c_void},
-    mem::MaybeUninit,
-    sync::atomic::AtomicBool,
-};
+use core::sync::atomic::AtomicBool;
 
 use alloc::{
     string::{String, ToString},
@@ -14,7 +10,6 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    arch::MMArch,
     driver::{
         base::{
             class::Class,
@@ -36,21 +31,13 @@ use crate::{
         sysfs::{file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport},
         vfs::syscall::ModeType,
     },
-    include::bindings::bindings::{
-        multiboot2_get_Framebuffer_info, multiboot2_iter, multiboot_tag_framebuffer_info_t,
-        FRAME_BUFFER_MAPPING_OFFSET,
-    },
-    init::{boot_params, initcall::INITCALL_DEVICE},
+    init::{boot::boot_callbacks, boot_params, initcall::INITCALL_DEVICE},
     libs::{
-        align::page_align_up,
         once::Once,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::SpinLock,
     },
-    mm::{
-        allocator::page_frame::PageFrameCount, no_init::pseudo_map_phys, MemoryManagementArch,
-        PhysAddr, VirtAddr,
-    },
+    mm::{early_ioremap::EarlyIoRemap, PhysAddr, VirtAddr},
 };
 
 use super::base::{
@@ -933,68 +920,18 @@ pub fn vesa_fb_driver_init() -> Result<(), SystemError> {
 }
 
 /// 在内存管理初始化之前,初始化vesafb
-pub fn vesafb_early_init() -> Result<VirtAddr, SystemError> {
-    let mut _reserved: u32 = 0;
+pub fn vesafb_early_init() -> Result<(), SystemError> {
+    let mut boot_params_guard = boot_params().write();
+    boot_callbacks().early_init_framebuffer_info(&mut boot_params_guard.screen_info)?;
 
-    let mut fb_info: MaybeUninit<multiboot_tag_framebuffer_info_t> = MaybeUninit::uninit();
-    //从multiboot2中读取帧缓冲区信息至fb_info
-
-    // todo: 换成rust的，并且检测是否成功获取
-    unsafe {
-        multiboot2_iter(
-            Some(multiboot2_get_Framebuffer_info),
-            fb_info.as_mut_ptr() as usize as *mut c_void,
-            &mut _reserved as *mut c_uint,
-        )
-    };
-    unsafe { fb_info.assume_init() };
-    let fb_info: multiboot_tag_framebuffer_info_t = unsafe { core::mem::transmute(fb_info) };
-
-    // todo: 判断是否有vesa帧缓冲区，这里暂时直接设置true
     HAS_VESA_FB.store(true, core::sync::atomic::Ordering::SeqCst);
 
-    let width = fb_info.framebuffer_width;
-    let height = fb_info.framebuffer_height;
+    return Ok(());
+}
 
-    let mut boot_params_guard = boot_params().write();
-    let boottime_screen_info = &mut boot_params_guard.screen_info;
+pub fn vesafb_early_map(paddr: PhysAddr, size: usize) -> Result<VirtAddr, SystemError> {
+    let (buf_vaddr, _) = EarlyIoRemap::map(paddr, size, false)?;
 
-    boottime_screen_info.is_vga = true;
-
-    boottime_screen_info.lfb_base = PhysAddr::new(fb_info.framebuffer_addr as usize);
-
-    if fb_info.framebuffer_type == 2 {
-        //当type=2时,width与height用字符数表示,故depth=8
-        boottime_screen_info.origin_video_cols = width as u8;
-        boottime_screen_info.origin_video_lines = height as u8;
-        boottime_screen_info.video_type = BootTimeVideoType::Mda;
-        boottime_screen_info.lfb_depth = 8;
-    } else {
-        //否则为图像模式,depth应参照帧缓冲区信息里面的每个像素的位数
-        boottime_screen_info.lfb_width = width;
-        boottime_screen_info.lfb_height = height;
-        boottime_screen_info.video_type = BootTimeVideoType::Vlfb;
-        boottime_screen_info.lfb_depth = fb_info.framebuffer_bpp as u8;
-    }
-
-    boottime_screen_info.lfb_size =
-        (width * height * ((fb_info.framebuffer_bpp as u32 + 7) / 8)) as usize;
-
-    // let buf_vaddr = VirtAddr::new(0xffff800003200000);
-    let buf_vaddr = VirtAddr::new(
-        crate::include::bindings::bindings::SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE as usize
-            + FRAME_BUFFER_MAPPING_OFFSET as usize,
-    );
-    boottime_screen_info.lfb_virt_base = Some(buf_vaddr);
-
-    let init_text = "Video driver to map.\n\0";
-    send_to_default_serial8250_port(init_text.as_bytes());
-
-    // 地址映射
-    let paddr = PhysAddr::new(fb_info.framebuffer_addr as usize);
-    let count =
-        PageFrameCount::new(page_align_up(boottime_screen_info.lfb_size) / MMArch::PAGE_SIZE);
-    unsafe { pseudo_map_phys(buf_vaddr, paddr, count) };
     return Ok(buf_vaddr);
 }
 

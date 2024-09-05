@@ -13,6 +13,7 @@ SECTIONS
 	.boot.text :
 	{
 		KEEP(*(.multiboot_header))
+		KEEP(*(.multiboot2_header))
 		*(.bootstrap)
 		*(.bootstrap.code64)
 		*(.bootstrap.data)

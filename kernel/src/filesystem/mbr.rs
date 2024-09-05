@@ -148,7 +148,45 @@ impl MbrDiskPartionTable {
         return partitions;
     }
 
+    /// # partitions_raw - 获取磁盘的分区信息，不包含磁盘设备信息
+    pub fn partitions_raw(&self) -> MbrPartitionIter {
+        MbrPartitionIter::new(self)
+    }
+
     pub fn is_valid(&self) -> bool {
         self.bs_trailsig == 0xAA55
+    }
+}
+
+pub struct MbrPartitionIter<'a> {
+    table: &'a MbrDiskPartionTable,
+    index: usize,
+}
+
+impl<'a> MbrPartitionIter<'a> {
+    fn new(table: &'a MbrDiskPartionTable) -> Self {
+        MbrPartitionIter { table, index: 0 }
+    }
+}
+
+impl<'a> Iterator for MbrPartitionIter<'a> {
+    type Item = Partition;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < 4 {
+            let entry = &self.table.dpte[self.index];
+            let index = self.index;
+            self.index += 1;
+            if entry.is_valid() {
+                let p = Partition::new_raw(
+                    self.table.dpte[index].starting_sector() as u64,
+                    self.table.dpte[index].starting_lba as u64,
+                    self.table.dpte[index].total_sectors as u64,
+                    index as u16,
+                );
+                return Some(p);
+            }
+        }
+        return None;
     }
 }

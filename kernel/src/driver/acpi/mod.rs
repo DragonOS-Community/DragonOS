@@ -1,4 +1,4 @@
-use core::{fmt::Debug, hint::spin_loop, ptr::NonNull};
+use core::{fmt::Debug, ptr::NonNull};
 
 use acpi::{AcpiHandler, AcpiTables, PlatformInfo};
 use alloc::{string::ToString, sync::Arc};
@@ -7,6 +7,7 @@ use log::{error, info};
 use crate::{
     arch::MMArch,
     driver::base::firmware::sys_firmware_kset,
+    init::{boot::BootloaderAcpiArg, boot_params},
     libs::align::{page_align_down, page_align_up, AlignedBox},
     mm::{
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
@@ -20,7 +21,6 @@ use super::base::kset::KSet;
 extern crate acpi;
 
 pub mod bus;
-mod c_adapter;
 pub mod glue;
 pub mod pmtmr;
 mod sysfs;
@@ -56,7 +56,7 @@ impl AcpiManager {
     /// ## 参考资料
     ///
     /// https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/acpi/bus.c#1390
-    pub fn init(&self, rsdp_vaddr1: u64, rsdp_vaddr2: u64) -> Result<(), SystemError> {
+    fn init(&self) -> Result<(), SystemError> {
         info!("Initializing Acpi Manager...");
 
         // 初始化`/sys/firmware/acpi`的kset
@@ -65,45 +65,45 @@ impl AcpiManager {
         unsafe {
             ACPI_KSET_INSTANCE = Some(kset.clone());
         }
-        self.map_tables(rsdp_vaddr1, rsdp_vaddr2)?;
+        let acpi_args = boot_params().read().acpi;
+        if let BootloaderAcpiArg::NotProvided = acpi_args {
+            error!("acpi_init(): ACPI not provided by bootloader");
+            return Err(SystemError::ENODEV);
+        }
+
+        self.map_tables(acpi_args)?;
         self.bus_init()?;
         info!("Acpi Manager initialized.");
         return Ok(());
     }
 
-    fn map_tables(&self, rsdp_vaddr1: u64, rsdp_vaddr2: u64) -> Result<(), SystemError> {
-        let rsdp_paddr1 = Self::rsdp_paddr(rsdp_vaddr1);
-        let res1 = unsafe { acpi::AcpiTables::from_rsdp(AcpiHandlerImpl, rsdp_paddr1.data()) };
-        let e1;
-        match res1 {
-            // 如果rsdpv1能够获取到acpi_table，则就用该表，不用rsdpv2了
+    fn map_tables(&self, acpi_args: BootloaderAcpiArg) -> Result<(), SystemError> {
+        let table_paddr: PhysAddr = match acpi_args {
+            BootloaderAcpiArg::Rsdt(rsdpv1) => Self::rsdp_paddr(&rsdpv1),
+            BootloaderAcpiArg::Xsdt(rsdpv2) => Self::rsdp_paddr(&rsdpv2),
+            _ => {
+                error!(
+                    "AcpiManager::map_tables(): unsupported acpi_args: {:?}",
+                    acpi_args
+                );
+                return Err(SystemError::ENODEV);
+            }
+        };
+        let res = unsafe { acpi::AcpiTables::from_rsdp(AcpiHandlerImpl, table_paddr.data()) };
+        match res {
             Ok(acpi_table) => {
                 Self::set_acpi_table(acpi_table);
                 return Ok(());
             }
             Err(e) => {
-                e1 = e;
+                error!(
+                    "AcpiManager::map_tables(): failed to map tables, error: {:?}",
+                    e
+                );
                 Self::drop_rsdp_tmp_box();
+                return Err(SystemError::ENODEV);
             }
         }
-
-        let rsdp_paddr2 = Self::rsdp_paddr(rsdp_vaddr2);
-        let res2 = unsafe { acpi::AcpiTables::from_rsdp(AcpiHandlerImpl, rsdp_paddr2.data()) };
-        match res2 {
-            Ok(acpi_table) => {
-                Self::set_acpi_table(acpi_table);
-            }
-            // 如果rsdpv1和rsdpv2都无法获取到acpi_table，说明有问题，打印报错信息后进入死循环
-            Err(e2) => {
-                error!("acpi_init(): failed to parse acpi tables, error: (rsdpv1: {:?}) or (rsdpv2: {:?})", e1, e2);
-                Self::drop_rsdp_tmp_box();
-                loop {
-                    spin_loop();
-                }
-            }
-        }
-
-        return Ok(());
     }
 
     /// 通过RSDP虚拟地址获取RSDP物理地址
@@ -115,13 +115,18 @@ impl AcpiManager {
     /// ## 返回值
     ///
     /// RSDP物理地址
-    fn rsdp_paddr(rsdp_vaddr: u64) -> PhysAddr {
+    fn rsdp_paddr(rsdp_instance: &acpi::rsdp::Rsdp) -> PhysAddr {
         unsafe {
             RSDP_TMP_BOX = Some(AlignedBox::new_zeroed().expect("rs_acpi_init(): failed to alloc"))
         };
+
         let size = core::mem::size_of::<acpi::rsdp::Rsdp>();
-        let tmp_data =
-            unsafe { core::slice::from_raw_parts(rsdp_vaddr as usize as *const u8, size) };
+        let tmp_data = unsafe {
+            core::slice::from_raw_parts(
+                rsdp_instance as *const acpi::rsdp::Rsdp as usize as *const u8,
+                size,
+            )
+        };
         unsafe { RSDP_TMP_BOX.as_mut().unwrap()[0..size].copy_from_slice(tmp_data) };
         let rsdp_paddr = unsafe {
             MMArch::virt_2_phys(VirtAddr::new(
@@ -219,5 +224,19 @@ impl AcpiHandler for AcpiHandlerImpl {
             )
         };
         drop(mmio_guard);
+    }
+}
+
+#[inline(never)]
+pub fn acpi_init() -> Result<(), SystemError> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        acpi_manager().init()
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        log::warn!("acpi_init(): unsupported arch");
+        return Ok(());
     }
 }

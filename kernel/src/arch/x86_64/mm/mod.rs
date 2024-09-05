@@ -141,12 +141,13 @@ impl MemoryManagementArch for X86_64MMArch {
             fn _edata();
             fn _erodata();
             fn _end();
+            fn _default_kernel_load_base();
         }
 
         Self::init_xd_rsvd();
 
         let bootstrap_info = X86_64MMBootstrapInfo {
-            kernel_load_base_paddr: 0,
+            kernel_load_base_paddr: _default_kernel_load_base as usize,
             kernel_code_start: _text as usize,
             kernel_code_end: _etext as usize,
             kernel_data_end: _edata as usize,

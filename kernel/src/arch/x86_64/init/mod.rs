@@ -25,6 +25,7 @@ use super::{
 };
 
 mod boot;
+mod multiboot;
 mod multiboot2;
 
 #[derive(Debug)]

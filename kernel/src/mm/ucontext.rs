@@ -275,12 +275,6 @@ impl InnerAddressSpace {
 
         let len = page_align_up(len);
 
-        let vm_flags = VmFlags::from(prot_flags)
-            | VmFlags::from(map_flags)
-            | VmFlags::VM_MAYREAD
-            | VmFlags::VM_MAYWRITE
-            | VmFlags::VM_MAYEXEC;
-
         // debug!("map_anonymous: len = {}", len);
 
         let start_page: VirtPageFrame = self.mmap(
@@ -288,7 +282,7 @@ impl InnerAddressSpace {
             PageFrameCount::from_bytes(len).unwrap(),
             prot_flags,
             map_flags,
-            move |page, count, flags, mapper, flusher| {
+            move |page, count, vm_flags, flags, mapper, flusher| {
                 if allocate_at_once {
                     VMA::zeroed(page, count, vm_flags, flags, mapper, flusher, None, None)
                 } else {
@@ -359,12 +353,6 @@ impl InnerAddressSpace {
 
         let len = page_align_up(len);
 
-        let vm_flags = VmFlags::from(prot_flags)
-            | VmFlags::from(map_flags)
-            | VmFlags::VM_MAYREAD
-            | VmFlags::VM_MAYWRITE
-            | VmFlags::VM_MAYEXEC;
-
         // debug!("map_anonymous: len = {}", len);
 
         let binding = ProcessManager::current_pcb().fd_table();
@@ -388,7 +376,7 @@ impl InnerAddressSpace {
             PageFrameCount::from_bytes(len).unwrap(),
             prot_flags,
             map_flags,
-            move |page, count, flags, mapper, flusher| {
+            move |page, count, vm_flags, flags, mapper, flusher| {
                 if allocate_at_once {
                     VMA::zeroed(
                         page,
@@ -436,6 +424,7 @@ impl InnerAddressSpace {
         F: FnOnce(
             VirtPageFrame,
             PageFrameCount,
+            VmFlags,
             EntryFlags<MMArch>,
             &mut PageMapper,
             &mut dyn Flusher<MMArch>,
@@ -467,6 +456,12 @@ impl InnerAddressSpace {
 
         let page = VirtPageFrame::new(region.start());
 
+        let vm_flags = VmFlags::from(prot_flags)
+            | VmFlags::from(map_flags)
+            | VmFlags::VM_MAYREAD
+            | VmFlags::VM_MAYWRITE
+            | VmFlags::VM_MAYEXEC;
+
         // debug!("mmap: page: {:?}, region={region:?}", page.virt_address());
 
         compiler_fence(Ordering::SeqCst);
@@ -483,6 +478,7 @@ impl InnerAddressSpace {
         self.mappings.insert_vma(map_func(
             page,
             page_count,
+            vm_flags,
             EntryFlags::from_prot_flags(prot_flags, true),
             &mut self.user_mapper.utable,
             flusher,

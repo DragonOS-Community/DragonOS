@@ -34,7 +34,7 @@ use crate::{
 };
 use alloc::{boxed::Box, vec::Vec};
 
-use crate::net::socket::{AddressFamily, Endpoint, MessageFlag, Socket};
+use crate::net::socket::{AddressFamily, Endpoint, Inode, MessageFlag, Socket};
 use lazy_static::lazy_static;
 
 use super::callback::NetlinkCallback;
@@ -390,6 +390,7 @@ fn netlink_bind(sock: Arc<Mutex<Box<dyn NetlinkSocket>>>, addr: &SockAddrNl, add
     Ok(())
 }
 
+
 // TODO: net namespace支持
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#532
 /// 在 netlink_table 中查找 netlink 套接字
@@ -499,7 +500,7 @@ impl Socket for NetlinkSock{
     fn listen(&self, _backlog: usize) -> Result<(), SystemError> {
         todo!()
     }
-    fn accept(&self) -> Result<(Arc<dyn IndexNode>, Endpoint), SystemError> {
+    fn accept(&self) -> Result<(Arc<Inode>, Endpoint), SystemError> {
         todo!()
     }
 

@@ -151,7 +151,11 @@ pub fn boot_callbacks() -> &'static dyn BootCallbacks {
 pub(super) fn boot_callback_except_early() {
     boot_callbacks()
         .init_kernel_cmdline()
-        .expect("Failed to init kernel cmdline");
+        .inspect_err(|e| {
+            log::error!("Failed to init kernel cmdline: {:?}", e);
+        })
+        .ok();
+
     let mut boot_params = boot_params().write();
     boot_params.bootloader_name = boot_callbacks()
         .init_bootloader_name()

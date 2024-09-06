@@ -1,5 +1,7 @@
 use system_error::SystemError;
 
+use crate::arch::init::multiboot::early_multiboot_init;
+
 use super::multiboot2::early_multiboot2_init;
 
 const BOOT_ENTRY_TYPE_MULTIBOOT: u64 = 1;
@@ -38,10 +40,7 @@ pub(super) fn early_boot_init(
 ) -> Result<(), SystemError> {
     let boot_protocol = BootProtocol::try_from(boot_entry_type)?;
     match boot_protocol {
-        BootProtocol::Multiboot => {
-            // early_multiboot_init(arg1, arg2);
-            unimplemented!();
-        }
+        BootProtocol::Multiboot => early_multiboot_init(arg1 as u32, arg2),
         BootProtocol::Multiboot2 => early_multiboot2_init(arg1 as u32, arg2),
         BootProtocol::Linux32 => {
             // linux32_init(arg1, arg2);

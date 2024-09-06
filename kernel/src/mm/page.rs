@@ -807,13 +807,15 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
     /// - prot_flags: 页的保护标志
     /// - user: 用户空间是否可访问
     pub fn from_prot_flags(prot_flags: ProtFlags, user: bool) -> Self {
-        let vm_flags = super::VmFlags::from(prot_flags);
-        // let flags: EntryFlags<Arch> = EntryFlags::new()
-        //     .set_user(user)
-        //     .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))
-        //     .set_write(prot_flags.contains(ProtFlags::PROT_WRITE));
-        let flags = Arch::vm_get_page_prot(vm_flags).set_user(user);
-        return flags;
+        if Arch::PAGE_FAULT_ENABLED {
+            let vm_flags = super::VmFlags::from(prot_flags);
+            Arch::vm_get_page_prot(vm_flags).set_user(user)
+        } else {
+            EntryFlags::new()
+                .set_user(user)
+                .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))
+                .set_write(prot_flags.contains(ProtFlags::PROT_WRITE))
+        }
     }
 
     #[inline(always)]

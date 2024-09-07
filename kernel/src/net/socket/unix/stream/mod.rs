@@ -8,7 +8,7 @@ use crate::{
             self, buffer::Buffer, common::{
                 poll_unit::{EPollItems, WaitQueue},
                 Shutdown,
-            }, Endpoint, Inode, MessageFlag, OptionsLevel, Socket
+            }, Endpoint, Inode, MessageFlag, OptionsLevel, ShutdownTemp, Socket
         }
 };
 
@@ -222,10 +222,10 @@ impl Socket for StreamSocket {
         return self.do_bind(_endpoint);
     }
     
-    fn shutdown(&self, _type: Shutdown) -> Result<(), SystemError> {
+    fn shutdown(&self, stype: ShutdownTemp) -> Result<(), SystemError> {
         match self.inner.write().take().expect("Unix Stream Socket is None") {
             Inner::Connected(conn) => {
-                conn.shutdown(_type)
+                conn.shutdown(stype)
             },
             _ => return Err(SystemError::EINVAL),
         }
@@ -249,10 +249,6 @@ impl Socket for StreamSocket {
     ) -> Result<(), SystemError> {
         log::warn!("setsockopt is not implemented");
         Ok(())
-    }
-    
-    fn epoll_items(&self) -> EPollItems {
-        todo!()
     }
     
     fn wait_queue(&self) -> WaitQueue {
@@ -345,6 +341,13 @@ impl Socket for StreamSocket {
         self.send(buffer, socket::MessageFlag::empty())
     }
     
+    fn send_buffer_size(&self) -> usize {
+        todo!()
+    }
+
+    fn recv_buffer_size(&self) -> usize {
+        todo!()
+    }
 }
 
 

@@ -158,17 +158,9 @@ pub trait Socket: Sync + Send + Debug {
         self.send(buffer, MessageFlag::empty())
     }
 
-    // /// # `endpoint`
-    // fn endpoint(&self) -> Option<Endpoint> {
-    //     None
-    // }
-
-    // /// # `peer_endpoint`
-    // /// 获取对端的端点
-    // fn peer_endpoint(&self) -> Option<Endpoint> {
-    //     None
-    // }
-
+    fn send_buffer_size(&self) -> usize;
+    fn recv_buffer_size(&self) -> usize;
+    
     // fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
     //     todo!()
     // }

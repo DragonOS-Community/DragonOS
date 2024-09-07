@@ -172,7 +172,7 @@ impl Syscall {
                 SO::SNDBUF => {
                     // 返回发送缓冲区大小
                     unsafe {
-                        *optval = socket.metadata().tx_buf_size as u32;
+                        *optval = socket.send_buffer_size() as u32;
                         *optlen = core::mem::size_of::<u32>() as u32;
                     }
                     return Ok(0);
@@ -180,7 +180,7 @@ impl Syscall {
                 SO::RCVBUF => {
                     // 返回默认的接收缓冲区大小
                     unsafe {
-                        *optval = socket.metadata().rx_buf_size as u32;
+                        *optval = socket.recv_buffer_size() as u32;
                         *optlen = core::mem::size_of::<u32>() as u32;
                     }
                     return Ok(0);
@@ -336,7 +336,7 @@ impl Syscall {
     ///
     /// @return 成功返回接收的字节数，失败返回错误码
     pub fn recvmsg(fd: usize, msg: &mut MsgHdr, flags: u32) -> Result<usize, SystemError> {
-        todo!()
+        todo!("recvmsg, fd={}, msg={:?}, flags={}", fd, msg, flags);
         // // 检查每个缓冲区地址是否合法，生成iovecs
         // let mut iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
 

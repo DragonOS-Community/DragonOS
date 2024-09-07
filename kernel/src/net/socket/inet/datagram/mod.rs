@@ -217,7 +217,19 @@ impl Socket for UdpSocket {
         Err(EAFNOSUPPORT)
     }
 
+    fn send_buffer_size(&self) -> usize {
+        match self.inner.read().as_ref().unwrap() {
+            UdpInner::Bound(bound) => bound.with_socket(|socket| socket.payload_send_capacity()),
+            _ => inner::DEFAULT_TX_BUF_SIZE
+        }
+    }
 
+    fn recv_buffer_size(&self) -> usize {
+        match self.inner.read().as_ref().unwrap() {
+            UdpInner::Bound(bound) => bound.with_socket(|socket| socket.payload_recv_capacity()),
+            _ => inner::DEFAULT_RX_BUF_SIZE
+        }
+    }
 }
 
 bitflags! {

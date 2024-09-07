@@ -65,6 +65,14 @@ impl Socket for Inode {
     fn update_io_events(&self) -> Result<crate::net::event_poll::EPollEventType, SystemError> {
         self.inner.update_io_events()
     }
+
+    fn send_buffer_size(&self) -> usize {
+        self.inner.send_buffer_size()
+    }
+
+    fn recv_buffer_size(&self) -> usize {
+        self.inner.recv_buffer_size()
+    }
 }
 
 impl Inode {

@@ -58,7 +58,8 @@ impl TcpSocket {
             Inner::Init(inner) => {
                 let bound = inner.bind(local_endpoint)?;
                 if let Init::Bound((ref bound, _)) = bound {
-                    bound.iface().common().bind_socket(self.self_ref.upgrade().unwrap());
+                    todo!("TcpSocket::bind: bind_socket");
+                    // bound.iface().common().bind_socket(self.self_ref.upgrade().unwrap());
                 }
                 writer.replace(Inner::Init(bound));
                 Ok(())
@@ -213,49 +214,6 @@ impl TcpSocket {
     }
 }
 
-impl IndexNode for TcpSocket {
-    fn read_at(
-        &self,
-        _offset: usize,
-        _len: usize,
-        buf: &mut [u8],
-        data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        drop(data);
-        // self.inner.read().as_ref().expect("Tcp Inner is None").read(buf)
-        todo!()
-    }
-
-    fn write_at(
-        &self,
-        _offset: usize,
-        _len: usize,
-        buf: &[u8],
-        data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        drop(data);
-        // self.inner.read().as_ref().expect("Tcp Inner is None").write(buf)
-        todo!()
-    }
-
-    fn fs(&self) -> alloc::sync::Arc<dyn crate::filesystem::vfs::FileSystem> {
-        todo!("TcpSocket::fs")
-    }
-
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        self
-    }
-
-    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
-        todo!("TcpSocket::list")
-    }
-
-    fn poll(&self, private_data: &crate::filesystem::vfs::FilePrivateData) -> Result<usize, SystemError> {
-        drop(private_data);
-        self.update_io_events().map(|x| x.bits() as usize)   
-    }
-}
-
 impl Socket for TcpSocket {
 
     fn wait_queue(&self) -> WaitQueue {
@@ -315,6 +273,14 @@ impl Socket for TcpSocket {
         self.try_accept().map(|(stream, remote)| 
             (Inode::new(stream), Endpoint::from(remote))
         )
+    }
+
+    fn send_buffer_size(&self) -> usize {
+        self.inner.read().as_ref().expect("Tcp Inner is None").send_buffer_size()
+    }
+
+    fn recv_buffer_size(&self) -> usize {
+        self.inner.read().as_ref().expect("Tcp Inner is None").recv_buffer_size()
     }
 }
 
@@ -461,5 +427,13 @@ impl Socket for TcpStream {
             // TODO socket error
             return Ok(mask);
         })
+    }
+
+    fn send_buffer_size(&self) -> usize {
+        self.inner.with(|socket| socket.send_capacity())
+    }
+
+    fn recv_buffer_size(&self) -> usize {
+        self.inner.with(|socket| socket.recv_capacity())
     }
 }

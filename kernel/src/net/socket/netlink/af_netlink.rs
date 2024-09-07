@@ -516,6 +516,14 @@ impl Socket for NetlinkSock{
     fn recv_from(&self, msg: &mut [u8], flags: MessageFlag, address: Option<Endpoint>) -> Result<(usize, Endpoint), SystemError>  {
         return self.netlink_recv(msg, msg.len(), flags)
     }
+    fn send_buffer_size(&self) -> usize {
+        log::warn!("send_buffer_size is implemented to 0");
+        0
+    }
+    fn recv_buffer_size(&self) -> usize {
+        log::warn!("recv_buffer_size is implemented to 0");
+        0
+    }
 }
 impl IndexNode for NetlinkSock{
     fn read_at(

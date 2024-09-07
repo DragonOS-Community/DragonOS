@@ -11,10 +11,6 @@ use crate::net::syscall_util::MsgHdr;
 /// ## Reference
 /// - [Posix standard](https://pubs.opengroup.org/onlinepubs/9699919799/)
 pub trait Socket: Sync + Send + Debug {
-    /// # `epoll_items`
-    /// socket的epoll事件集
-    fn epoll_items(&self) -> EPollItems;
-
     /// # `wait_queue`
     /// 获取socket的wait queue
     fn wait_queue(&self) -> WaitQueue;

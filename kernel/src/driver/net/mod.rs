@@ -181,6 +181,7 @@ impl IfaceCommon {
         return Ok(());
     }
 
+    // 需要bounds储存具体的Inet Socket信息，以提供不同种类inet socket的事件分发
     pub fn bind_socket(&self, socket: Arc<InetSocket>) {
         self.bounds.write().push(socket);
     }

@@ -4,7 +4,7 @@ use alloc::sync::{Arc, Weak};
 
 use crate::net::event_poll::EPollEventType;
 use crate::net::net_core::poll_ifaces;
-use crate::net::socket::common::{poll_unit::{EPollItems, WaitQueue}, Shutdown};
+use crate::net::socket::*;
 use crate::libs::rwlock::RwLock;
 use smoltcp;
 
@@ -108,7 +108,7 @@ impl TcpSocket {
                                     core::sync::atomic::Ordering::Relaxed
                                 )
                             ),
-                            epitems: EPollItems::new(),
+                            epitems: EPollItems::default(),
                             wait_queue: WaitQueue::default(),
                             self_ref: me.clone(),
                         }),
@@ -250,21 +250,6 @@ impl IndexNode for TcpSocket {
         todo!("TcpSocket::list")
     }
 
-    fn kernel_ioctl(
-            &self,
-            arg: alloc::sync::Arc<dyn crate::net::event_poll::KernelIoctlData>,
-            _data: &crate::filesystem::vfs::FilePrivateData,
-        ) -> Result<usize, SystemError> {
-        let epitem = arg
-            .arc_any()
-            .downcast::<crate::net::event_poll::EPollItem>()
-            .map_err(|_| SystemError::EFAULT)?;
-
-        self.epoll_items().add(epitem);
-
-        return Ok(0);
-    }
-
     fn poll(&self, private_data: &crate::filesystem::vfs::FilePrivateData) -> Result<usize, SystemError> {
         drop(private_data);
         self.update_io_events().map(|x| x.bits() as usize)   
@@ -272,9 +257,6 @@ impl IndexNode for TcpSocket {
 }
 
 impl Socket for TcpSocket {
-    fn epoll_items(&self) -> EPollItems {
-        self.epitems.clone()
-    }
 
     fn wait_queue(&self) -> WaitQueue {
         self.wait_queue.clone()
@@ -329,9 +311,9 @@ impl Socket for TcpSocket {
         }
     }
 
-    fn accept(&self) -> Result<(Arc<dyn IndexNode>, crate::net::Endpoint), SystemError> {
+    fn accept(&self) -> Result<(Arc<Inode>, Endpoint), SystemError> {
         self.try_accept().map(|(stream, remote)| 
-            (stream as Arc<dyn IndexNode>, crate::net::Endpoint::from(remote))
+            (Inode::new(stream), Endpoint::from(remote))
         )
     }
 }
@@ -414,27 +396,9 @@ impl IndexNode for TcpStream {
         todo!("TcpSocket::list")
     }
 
-    // fn kernel_ioctl(
-    //         &self,
-    //         arg: alloc::sync::Arc<dyn crate::net::event_poll::KernelIoctlData>,
-    //         _data: &crate::filesystem::vfs::FilePrivateData,
-    //     ) -> Result<usize, SystemError> {
-    //     let epitem = arg
-    //         .arc_any()
-    //         .downcast::<crate::net::event_poll::EPollItem>()
-    //         .map_err(|_| SystemError::EFAULT)?;
-
-    //     self.epoll_items().add(epitem);
-
-    //     return Ok(0);
-    // }
-
 }
 
 impl Socket for TcpStream {
-    fn epoll_items(&self) -> EPollItems {
-        self.epitems.clone()
-    }
 
     fn wait_queue(&self) -> WaitQueue {
         self.wait_queue.clone()

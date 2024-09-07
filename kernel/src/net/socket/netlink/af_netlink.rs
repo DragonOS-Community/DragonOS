@@ -501,12 +501,10 @@ impl Socket for NetlinkSock{
         todo!()
     }
 
-    fn epoll_items(&self) -> EPollItems {
-        todo!()
-    }
     fn wait_queue(&self) -> WaitQueue {
         todo!()
     }
+
     fn update_io_events(&self) -> Result<EPollEventType, SystemError>{
         todo!()
     }

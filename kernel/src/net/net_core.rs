@@ -27,7 +27,7 @@ struct NetWorkPollFunc;
 
 impl TimerFunction for NetWorkPollFunc {
     fn run(&mut self) -> Result<(), SystemError> {
-        poll_ifaces_try_lock(10).ok();
+        poll_ifaces();
         let next_time = next_n_ms_timer_jiffies(10);
         let timer = Timer::new(Box::new(NetWorkPollFunc), next_time);
         timer.activate();
@@ -62,13 +62,16 @@ fn dhcp_query() -> Result<(), SystemError> {
     // IMPORTANT: This should be removed in production.
     dhcp_socket.set_max_lease_duration(Some(smoltcp::time::Duration::from_secs(10)));
 
-    let dhcp_handle = SOCKET_SET.lock_irqsave().add(dhcp_socket);
+    let sockets = || { net_face.sockets().lock_irqsave() };
+
+    // let dhcp_handle = SOCKET_SET.lock_irqsave().add(dhcp_socket);
+    let dhcp_handle = sockets().add(dhcp_socket);
 
     const DHCP_TRY_ROUND: u8 = 10;
     for i in 0..DHCP_TRY_ROUND {
         debug!("DHCP try round: {}", i);
-        net_face.poll(&mut SOCKET_SET.lock_irqsave()).ok();
-        let mut binding = SOCKET_SET.lock_irqsave();
+        net_face.poll();
+        let mut binding = sockets();
         let event = binding.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
 
         match event {

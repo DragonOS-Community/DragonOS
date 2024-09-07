@@ -71,6 +71,10 @@ impl Socket for Inode {
 }
 
 impl Inode {
+    pub fn new(socket: Arc<dyn Socket>) -> Arc<Self>{
+        return Arc::new(Self{inner: socket.clone()});
+    }
+
     pub fn set_nonblock(&self, nonblock: bool) {
         todo!()
     }

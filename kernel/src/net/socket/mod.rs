@@ -7,6 +7,7 @@ mod inode;
 mod family;
 mod utils;
 mod base;
+mod buffer;
 mod endpoint;
 
 pub use define::*;

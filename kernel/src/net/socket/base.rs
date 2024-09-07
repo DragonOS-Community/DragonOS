@@ -3,7 +3,6 @@
 use core::fmt::Debug;
 use alloc::sync::Arc;
 use system_error::SystemError::{self, *};
-use crate::filesystem::vfs::IndexNode;
 use crate::net::socket::*;
 use crate::net::syscall_util::MsgHdr;
 

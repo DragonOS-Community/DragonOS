@@ -358,7 +358,7 @@ impl TcpStream {
     }
 }
 
-use crate::net::socket::Socket;
+use crate::net::socket::{Inode, Socket};
 use crate::filesystem::vfs::IndexNode;
 
 impl IndexNode for TcpStream {

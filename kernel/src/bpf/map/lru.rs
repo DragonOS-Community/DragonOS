@@ -1,25 +1,22 @@
-use super::Result;
-use crate::bpf::map::util::{round_up, BpfMapUpdateElemFlags};
-use crate::bpf::map::{BpfCallBackFn, BpfMapCommonOps, BpfMapMeta, PerCpuInfo};
-use alloc::{collections::BTreeMap, vec::Vec};
+use super::{BpfCallBackFn, BpfMapCommonOps, PerCpuInfo, Result};
+use crate::bpf::map::util::{round_up, BpfMapMeta};
+use crate::libs::spinlock::SpinLock;
+use alloc::vec::Vec;
 use core::fmt::Debug;
+use core::num::NonZero;
+use lru::LruCache;
 use system_error::SystemError;
+
 type BpfHashMapKey = Vec<u8>;
 type BpfHashMapValue = Vec<u8>;
 
-/// The hash map type is a generic map type with no restrictions on the structure of the key and value.
-/// Hash-maps are implemented using a hash table, allowing for lookups with arbitrary keys.
-///
-/// See https://ebpf-docs.dylanreimerink.nl/linux/map-type/BPF_MAP_TYPE_HASH/
 #[derive(Debug)]
-pub struct BpfHashMap {
+pub struct LruMap {
     max_entries: u32,
-    key_size: u32,
-    value_size: u32,
-    data: BTreeMap<BpfHashMapKey, BpfHashMapValue>,
+    data: LruCache<BpfHashMapKey, BpfHashMapValue>,
 }
 
-impl TryFrom<&BpfMapMeta> for BpfHashMap {
+impl TryFrom<&BpfMapMeta> for LruMap {
     type Error = SystemError;
     fn try_from(attr: &BpfMapMeta) -> Result<Self> {
         if attr.value_size == 0 || attr.max_entries == 0 {
@@ -28,25 +25,22 @@ impl TryFrom<&BpfMapMeta> for BpfHashMap {
         let value_size = round_up(attr.value_size as usize, 8);
         Ok(Self {
             max_entries: attr.max_entries,
-            key_size: attr.key_size,
-            value_size: value_size as u32,
-            data: BTreeMap::new(),
+            data: LruCache::new(NonZero::new(attr.max_entries as usize).unwrap()),
         })
     }
 }
 
-impl BpfMapCommonOps for BpfHashMap {
+impl BpfMapCommonOps for LruMap {
     fn lookup_elem(&mut self, key: &[u8]) -> Result<Option<&[u8]>> {
         let value = self.data.get(key).map(|v| v.as_slice());
         Ok(value)
     }
-    fn update_elem(&mut self, key: &[u8], value: &[u8], flags: u64) -> Result<()> {
-        let _flags = BpfMapUpdateElemFlags::from_bits_truncate(flags);
-        self.data.insert(key.to_vec(), value.to_vec());
+    fn update_elem(&mut self, key: &[u8], value: &[u8], _flags: u64) -> Result<()> {
+        self.data.put(key.to_vec(), value.to_vec());
         Ok(())
     }
     fn delete_elem(&mut self, key: &[u8]) -> Result<()> {
-        self.data.remove(key);
+        self.data.pop(key);
         Ok(())
     }
     fn for_each_elem(&mut self, cb: BpfCallBackFn, ctx: *const u8, flags: u64) -> Result<u32> {
@@ -71,7 +65,7 @@ impl BpfMapCommonOps for BpfHashMap {
             .map(|v| v.as_slice())
             .ok_or(SystemError::ENOENT)?;
         value.copy_from_slice(v);
-        self.data.remove(key);
+        self.data.pop(key);
         Ok(())
     }
     fn get_next_key(&self, key: Option<&[u8]>, next_key: &mut [u8]) -> Result<()> {
@@ -94,38 +88,37 @@ impl BpfMapCommonOps for BpfHashMap {
     }
 }
 
-/// This is the per-CPU variant of the [BpfHashMap] map type.
-///
-/// See https://ebpf-docs.dylanreimerink.nl/linux/map-type/BPF_MAP_TYPE_PERCPU_HASH/
-pub struct PerCpuHashMap<T> {
-    maps: Vec<BpfHashMap>,
+/// See https://ebpf-docs.dylanreimerink.nl/linux/map-type/BPF_MAP_TYPE_LRU_PERCPU_HASH/
+pub struct PerCpuLruMap<T> {
+    maps: Vec<LruMap>,
     _phantom: core::marker::PhantomData<T>,
 }
 
-impl<T> Debug for PerCpuHashMap<T> {
+impl<T> Debug for PerCpuLruMap<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("PerCpuHashMap")
+        f.debug_struct("PerCpuLruMap")
             .field("maps", &self.maps)
             .finish()
     }
 }
-impl<T: PerCpuInfo> TryFrom<&BpfMapMeta> for PerCpuHashMap<T> {
+
+impl<T: PerCpuInfo> TryFrom<&BpfMapMeta> for PerCpuLruMap<T> {
     type Error = SystemError;
     fn try_from(attr: &BpfMapMeta) -> Result<Self> {
         let num_cpus = T::num_cpus();
         let mut data = Vec::with_capacity(num_cpus as usize);
         for _ in 0..num_cpus {
-            let array_map = BpfHashMap::try_from(attr)?;
+            let array_map = LruMap::try_from(attr)?;
             data.push(array_map);
         }
-        Ok(PerCpuHashMap {
+        Ok(PerCpuLruMap {
             maps: data,
             _phantom: core::marker::PhantomData,
         })
     }
 }
 
-impl<T: PerCpuInfo> BpfMapCommonOps for PerCpuHashMap<T> {
+impl<T: PerCpuInfo> BpfMapCommonOps for PerCpuLruMap<T> {
     fn lookup_elem(&mut self, key: &[u8]) -> Result<Option<&[u8]>> {
         self.maps[T::cpu_id() as usize].lookup_elem(key)
     }
@@ -146,8 +139,5 @@ impl<T: PerCpuInfo> BpfMapCommonOps for PerCpuHashMap<T> {
     }
     fn get_next_key(&self, key: Option<&[u8]>, next_key: &mut [u8]) -> Result<()> {
         self.maps[T::cpu_id() as usize].get_next_key(key, next_key)
-    }
-    fn first_value_ptr(&self) -> *const u8 {
-        self.maps[T::cpu_id() as usize].first_value_ptr()
     }
 }

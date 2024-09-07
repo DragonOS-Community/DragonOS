@@ -84,3 +84,17 @@ impl From<&bpf_attr> for BpfMapGetNextKeyArg {
 pub fn round_up(x: usize, align: usize) -> usize {
     (x + align - 1) & !(align - 1)
 }
+
+/// flags for BPF_MAP_UPDATE_ELEM command
+bitflags! {
+    pub struct BpfMapUpdateElemFlags: u64 {
+        /// create new element or update existing
+        const BPF_ANY = 0;
+        /// create new element if it didn't exist
+        const BPF_NOEXIST = 1;
+        /// update existing element
+        const BPF_EXIST = 2;
+        /// spin_lock-ed map_lookup/map_update
+        const BPF_F_LOCK = 4;
+    }
+}

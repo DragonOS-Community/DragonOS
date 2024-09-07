@@ -1,9 +1,12 @@
 mod array_map;
 mod hash_map;
+mod lru;
+mod queue;
 mod util;
 
 use super::Result;
 use crate::bpf::map::array_map::{ArrayMap, PerCpuArrayMap, PerfEventArrayMap};
+use crate::bpf::map::hash_map::PerCpuHashMap;
 use crate::bpf::map::util::{BpfMapGetNextKeyArg, BpfMapMeta, BpfMapUpdateArg};
 use crate::filesystem::vfs::file::{File, FileMode};
 use crate::filesystem::vfs::syscall::ModeType;
@@ -31,47 +34,71 @@ pub struct BpfMap {
     meta: BpfMapMeta,
 }
 
-type BpfCallBackFn = fn(key: &[u8], value: &[u8], ctx: &[u8]) -> i32;
+pub type BpfCallBackFn = fn(key: &[u8], value: &[u8], ctx: *const u8) -> i32;
 
 pub trait BpfMapCommonOps: Send + Sync + Debug + CastFromSync {
     /// Lookup an element in the map.
     ///
     /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_lookup_elem/
-    fn lookup_elem(&self, _key: &[u8]) -> Result<Option<&[u8]>> {
-        panic!("lookup_elem not implemented")
+    fn lookup_elem(&mut self, _key: &[u8]) -> Result<Option<&[u8]>> {
+        Err(SystemError::ENOSYS)
     }
     /// Update an element in the map.
     ///
     /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_update_elem/
     fn update_elem(&mut self, _key: &[u8], _value: &[u8], _flags: u64) -> Result<()> {
-        panic!("update_elem not implemented")
+        Err(SystemError::ENOSYS)
     }
     /// Delete an element from the map.
     ///
     /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_delete_elem/
     fn delete_elem(&mut self, _key: &[u8]) -> Result<()> {
-        panic!("delete_elem not implemented")
+        Err(SystemError::ENOSYS)
     }
     /// For each element in map, call callback_fn function with map,
     /// callback_ctx and other map-specific parameters.
     ///
     /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_for_each_map_elem/
-    fn for_each_elem(&mut self, _cb: BpfCallBackFn, _ctx: &[u8], _flags: u64) -> Result<u32> {
-        panic!("for_each_elem not implemented")
+    fn for_each_elem(&mut self, _cb: BpfCallBackFn, _ctx: *const u8, _flags: u64) -> Result<u32> {
+        Err(SystemError::ENOSYS)
+    }
+    /// Look up an element with the given key in the map referred to by the file descriptor fd,
+    /// and if found, delete the element.
+    fn lookup_and_delete_elem(&mut self, _key: &[u8], _value: &mut [u8]) -> Result<()> {
+        Err(SystemError::ENOSYS)
     }
 
+    /// erform a lookup in percpu map for an entry associated to key on cpu.
+    fn lookup_percpu_elem(&mut self, _key: &[u8], cpu: u32) -> Result<Option<&[u8]>> {
+        Err(SystemError::ENOSYS)
+    }
     /// Get the next key in the map. If key is None, get the first key.
     ///
     /// Called from syscall
     fn get_next_key(&self, _key: Option<&[u8]>, _next_key: &mut [u8]) -> Result<()> {
-        panic!("get_next_key not implemented")
+        Err(SystemError::ENOSYS)
+    }
+
+    /// Push an element value in map.
+    fn push_elem(&mut self, _value: &[u8], _flags: u64) -> Result<()> {
+        Err(SystemError::ENOSYS)
+    }
+
+    /// Pop an element value from map.
+    fn pop_elem(&mut self, _value: &mut [u8]) -> Result<()> {
+        Err(SystemError::ENOSYS)
+    }
+
+    /// Peek an element value from map.
+    fn peek_elem(&self, _value: &mut [u8]) -> Result<()> {
+        Err(SystemError::ENOSYS)
     }
 
     /// Freeze the map.
     ///
     /// It's useful for .rodata maps.
     fn freeze(&self) -> Result<()> {
-        panic!("freeze not implemented")
+        Err(SystemError::ENOSYS)
     }
 
     /// Get the first value pointer.
@@ -184,6 +211,11 @@ impl IndexNode for BpfMap {
     }
 }
 
+/// Create a map and return a file descriptor that refers to
+/// the map.  The close-on-exec file descriptor flag
+/// is automatically enabled for the new file descriptor.
+///
+/// See https://ebpf-docs.dylanreimerink.nl/linux/syscall/BPF_MAP_CREATE/
 pub fn bpf_map_create(attr: &bpf_attr) -> Result<usize> {
     let map_meta = BpfMapMeta::try_from(attr)?;
     info!("The map attr is {:#?}", map_meta);
@@ -211,18 +243,41 @@ pub fn bpf_map_create(attr: &bpf_attr) -> Result<usize> {
             let hash_map = hash_map::BpfHashMap::try_from(&map_meta)?;
             Box::new(hash_map)
         }
+        bpf_map_type::BPF_MAP_TYPE_PERCPU_HASH => {
+            let per_cpu_hash_map = PerCpuHashMap::<PerCpuInfoImpl>::try_from(&map_meta)?;
+            Box::new(per_cpu_hash_map)
+        }
+        bpf_map_type::BPF_MAP_TYPE_QUEUE => {
+            let queue_map = queue::QueueMap::try_from(&map_meta)?;
+            Box::new(queue_map)
+        }
+        bpf_map_type::BPF_MAP_TYPE_STACK => {
+            let stack_map = queue::StackMap::try_from(&map_meta)?;
+            Box::new(stack_map)
+        }
+        bpf_map_type::BPF_MAP_TYPE_LRU_HASH => {
+            let lru_hash_map = lru::LruMap::try_from(&map_meta)?;
+            Box::new(lru_hash_map)
+        }
+        bpf_map_type::BPF_MAP_TYPE_LRU_PERCPU_HASH => {
+            let lru_per_cpu_hash_map = lru::PerCpuLruMap::<PerCpuInfoImpl>::try_from(&map_meta)?;
+            Box::new(lru_per_cpu_hash_map)
+        }
         _ => {
             unimplemented!("bpf map type {:?} not implemented", map_meta.map_type)
         }
     };
     let bpf_map = BpfMap::new(map, map_meta);
     let fd_table = ProcessManager::current_pcb().fd_table();
-    let file = File::new(Arc::new(bpf_map), FileMode::O_RDWR)?;
+    let file = File::new(Arc::new(bpf_map), FileMode::O_RDWR | FileMode::O_CLOEXEC)?;
     let fd = fd_table.write().alloc_fd(file, None).map(|x| x as usize)?;
     info!("create map with fd: [{}]", fd);
     Ok(fd)
 }
 
+/// Create or update an element (key/value pair) in a specified map.
+///
+/// See https://ebpf-docs.dylanreimerink.nl/linux/syscall/BPF_MAP_UPDATE_ELEM/
 pub fn bpf_map_update_elem(attr: &bpf_attr) -> Result<usize> {
     let arg = BpfMapUpdateArg::from(attr);
     info!("<bpf_map_update_elem>: {:#x?}", arg);
@@ -250,6 +305,8 @@ pub fn bpf_map_freeze(attr: &bpf_attr) -> Result<usize> {
     Ok(0)
 }
 
+///  Look up an element by key in a specified map and return its value.
+///
 /// See https://ebpf-docs.dylanreimerink.nl/linux/syscall/BPF_MAP_LOOKUP_ELEM/
 pub fn bpf_lookup_elem(attr: &bpf_attr) -> Result<usize> {
     let arg = BpfMapUpdateArg::from(attr);
@@ -264,8 +321,8 @@ pub fn bpf_lookup_elem(attr: &bpf_attr) -> Result<usize> {
 
     let key = key_buf.read_from_user(0)?;
 
-    let inner = map.inner_map.lock();
-    let r_value = inner.lookup_elem(key).unwrap();
+    let mut inner = map.inner_map.lock();
+    let r_value = inner.lookup_elem(key)?;
     if let Some(r_value) = r_value {
         value_buf.copy_to_user(r_value, 0)?;
         Ok(0)
@@ -273,7 +330,12 @@ pub fn bpf_lookup_elem(attr: &bpf_attr) -> Result<usize> {
         Err(SystemError::ENOENT)
     }
 }
-
+/// Look up an element by key in a specified map and return the key of the next element.
+///
+/// - If key is `None`, the operation returns zero and sets the next_key pointer to the key of the first element.
+/// - If key is `Some(T)`, the operation returns zero and sets the next_key pointer to the key of the next element.
+/// - If key is the last element, returns -1 and errno is set to ENOENT.
+///
 /// See https://ebpf-docs.dylanreimerink.nl/linux/syscall/BPF_MAP_GET_NEXT_KEY/
 pub fn bpf_map_get_next_key(attr: &bpf_attr) -> Result<usize> {
     let arg = BpfMapGetNextKeyArg::from(attr);
@@ -292,10 +354,78 @@ pub fn bpf_map_get_next_key(attr: &bpf_attr) -> Result<usize> {
     let key = key.as_deref();
     let mut next_key_buf = UserBufferWriter::new(arg.next_key as *mut u8, key_size, true)?;
     let inner = map.inner_map.lock();
-    let mut next_key = vec![0u8; key_size];
-    inner.get_next_key(key, &mut next_key)?;
+    let next_key = next_key_buf.buffer(0)?;
+    inner.get_next_key(key, next_key)?;
     // info!("next_key: {:?}", next_key);
-    next_key_buf.copy_to_user(&next_key, 0)?;
+    Ok(0)
+}
+
+/// Look up and delete an element by key in a specified map.
+///
+/// # WARN
+///
+/// Not all map types (particularly array maps) support this operation,
+/// instead a zero value can be written to the map value. Check the map types page to check for support.
+///
+/// See https://ebpf-docs.dylanreimerink.nl/linux/syscall/BPF_MAP_DELETE_ELEM/
+pub fn bpf_map_delete_elem(attr: &bpf_attr) -> Result<usize> {
+    let arg = BpfMapUpdateArg::from(attr);
+    // info!("<bpf_map_delete_elem>: {:#x?}", arg);
+    let map = get_map_file(arg.map_fd as i32)?;
+    let meta = &map.meta;
+    let key_size = meta.key_size as usize;
+
+    let key_buf = UserBufferReader::new(arg.key as *const u8, key_size, true)?;
+    let key = key_buf.read_from_user(0)?;
+    map.inner_map.lock().delete_elem(key)?;
+    Ok(0)
+}
+
+/// Iterate and fetch multiple elements in a map.
+///
+/// See https://ebpf-docs.dylanreimerink.nl/linux/syscall/BPF_MAP_LOOKUP_BATCH/
+pub fn bpf_map_lookup_batch(_attr: &bpf_attr) -> Result<usize> {
+    todo!()
+}
+
+/// Look up an element with the given key in the map referred to by the file descriptor fd,
+/// and if found, delete the element.
+///
+/// For BPF_MAP_TYPE_QUEUE and BPF_MAP_TYPE_STACK map types, the flags argument needs to be set to 0,
+/// but for other map types, it may be specified as:
+/// - BPF_F_LOCK : If this flag is set, the command will acquire the spin-lock of the map value we are looking up.
+///
+/// If the map contains no spin-lock in its value, -EINVAL will be returned by the command.
+///
+/// The BPF_MAP_TYPE_QUEUE and BPF_MAP_TYPE_STACK map types implement this command as a “pop” operation,
+/// deleting the top element rather than one corresponding to key.
+/// The key and key_len parameters should be zeroed when issuing this operation for these map types.
+///
+/// This command is only valid for the following map types:
+/// - BPF_MAP_TYPE_QUEUE
+/// - BPF_MAP_TYPE_STACK
+/// - BPF_MAP_TYPE_HASH
+/// - BPF_MAP_TYPE_PERCPU_HASH
+/// - BPF_MAP_TYPE_LRU_HASH
+/// - BPF_MAP_TYPE_LRU_PERCPU_HASH
+///
+///
+/// See https://ebpf-docs.dylanreimerink.nl/linux/syscall/BPF_MAP_LOOKUP_AND_DELETE_ELEM/
+pub fn bpf_map_lookup_and_delete_elem(attr: &bpf_attr) -> Result<usize> {
+    let arg = BpfMapUpdateArg::from(attr);
+    // info!("<bpf_map_lookup_and_delete_elem>: {:#x?}", arg);
+    let map = get_map_file(arg.map_fd as i32)?;
+    let meta = &map.meta;
+    let key_size = meta.key_size as usize;
+    let value_size = meta.value_size as usize;
+
+    let key_buf = UserBufferReader::new(arg.key as *const u8, key_size, true)?;
+    let mut value_buf = UserBufferWriter::new(arg.value as *mut u8, value_size, true)?;
+
+    let value = value_buf.buffer(0)?;
+    let key = key_buf.read_from_user(0)?;
+    let mut inner = map.inner_map.lock();
+    inner.lookup_and_delete_elem(key, value)?;
     Ok(0)
 }
 

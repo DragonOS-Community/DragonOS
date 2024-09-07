@@ -15,6 +15,10 @@ use core::{
 use log::info;
 use system_error::SystemError;
 
+/// The array map type is a generic map type with no restrictions on the structure of the value.
+/// Like a normal array, the array map has a numeric key starting at 0 and incrementing.
+///
+/// See https://ebpf-docs.dylanreimerink.nl/linux/map-type/BPF_MAP_TYPE_ARRAY/
 #[derive(Debug)]
 pub struct ArrayMap {
     max_entries: u32,
@@ -23,6 +27,7 @@ pub struct ArrayMap {
 
 struct ArrayMapData {
     elem_size: u32,
+    /// The data is stored in a Vec<u8> with the size of elem_size * max_entries.
     data: Vec<u8>,
 }
 
@@ -75,7 +80,7 @@ impl TryFrom<&BpfMapMeta> for ArrayMap {
 }
 
 impl BpfMapCommonOps for ArrayMap {
-    fn lookup_elem(&self, key: &[u8]) -> Result<Option<&[u8]>> {
+    fn lookup_elem(&mut self, key: &[u8]) -> Result<Option<&[u8]>> {
         if key.len() != 4 {
             return Err(SystemError::EINVAL);
         }
@@ -101,10 +106,11 @@ impl BpfMapCommonOps for ArrayMap {
         old_value[..value.len()].copy_from_slice(value);
         Ok(())
     }
+    /// For ArrayMap, delete_elem is not supported.
     fn delete_elem(&mut self, _key: &[u8]) -> Result<()> {
         Err(SystemError::EINVAL)
     }
-    fn for_each_elem(&mut self, cb: BpfCallBackFn, ctx: &[u8], flags: u64) -> Result<u32> {
+    fn for_each_elem(&mut self, cb: BpfCallBackFn, ctx: *const u8, flags: u64) -> Result<u32> {
         if flags != 0 {
             return Err(SystemError::EINVAL);
         }
@@ -113,13 +119,17 @@ impl BpfMapCommonOps for ArrayMap {
             let key = i.to_ne_bytes();
             let value = self.data.index(i);
             total_used += 1;
-            let res = cb(ctx, &key, value);
+            let res = cb(&key, value, ctx);
             // return value: 0 - continue, 1 - stop and return
             if res != 0 {
                 break;
             }
         }
         Ok(total_used)
+    }
+
+    fn lookup_and_delete_elem(&mut self, _key: &[u8], _value: &mut [u8]) -> Result<()> {
+        Err(SystemError::EINVAL)
     }
 
     fn get_next_key(&self, key: Option<&[u8]>, next_key: &mut [u8]) -> Result<()> {
@@ -148,6 +158,9 @@ impl BpfMapCommonOps for ArrayMap {
     }
 }
 
+/// This is the per-CPU variant of the [ArrayMap] map type.
+///
+/// See https://ebpf-docs.dylanreimerink.nl/linux/map-type/BPF_MAP_TYPE_PERCPU_ARRAY/
 pub struct PerCpuArrayMap<T> {
     data: Vec<ArrayMap>,
     _phantom: core::marker::PhantomData<T>,
@@ -178,7 +191,7 @@ impl<T: PerCpuInfo> TryFrom<&BpfMapMeta> for PerCpuArrayMap<T> {
 }
 
 impl<T: PerCpuInfo> BpfMapCommonOps for PerCpuArrayMap<T> {
-    fn lookup_elem(&self, key: &[u8]) -> Result<Option<&[u8]>> {
+    fn lookup_elem(&mut self, key: &[u8]) -> Result<Option<&[u8]>> {
         let cpu_id = T::cpu_id();
         self.data[cpu_id as usize].lookup_elem(key)
     }
@@ -190,9 +203,15 @@ impl<T: PerCpuInfo> BpfMapCommonOps for PerCpuArrayMap<T> {
         let cpu_id = T::cpu_id();
         self.data[cpu_id as usize].delete_elem(key)
     }
-    fn for_each_elem(&mut self, cb: BpfCallBackFn, ctx: &[u8], flags: u64) -> Result<u32> {
+    fn for_each_elem(&mut self, cb: BpfCallBackFn, ctx: *const u8, flags: u64) -> Result<u32> {
         let cpu_id = T::cpu_id();
         self.data[cpu_id as usize].for_each_elem(cb, ctx, flags)
+    }
+    fn lookup_and_delete_elem(&mut self, _key: &[u8], _value: &mut [u8]) -> Result<()> {
+        Err(SystemError::EINVAL)
+    }
+    fn lookup_percpu_elem(&mut self, key: &[u8], cpu: u32) -> Result<Option<&[u8]>> {
+        self.data[cpu as usize].lookup_elem(key)
     }
     fn get_next_key(&self, key: Option<&[u8]>, next_key: &mut [u8]) -> Result<()> {
         let cpu_id = T::cpu_id();
@@ -235,7 +254,7 @@ impl<T: PerCpuInfo> TryFrom<&BpfMapMeta> for PerfEventArrayMap<T> {
 }
 
 impl<T: PerCpuInfo> BpfMapCommonOps for PerfEventArrayMap<T> {
-    fn lookup_elem(&self, key: &[u8]) -> Result<Option<&[u8]>> {
+    fn lookup_elem(&mut self, key: &[u8]) -> Result<Option<&[u8]>> {
         let cpu_id = u32::from_ne_bytes(key.try_into().unwrap());
         let value = self.fds.index(cpu_id);
         Ok(Some(value))
@@ -252,18 +271,21 @@ impl<T: PerCpuInfo> BpfMapCommonOps for PerfEventArrayMap<T> {
         self.fds.index_mut(cpu_id).copy_from_slice(&[0; 4]);
         Ok(())
     }
-    fn for_each_elem(&mut self, cb: BpfCallBackFn, ctx: &[u8], _flags: u64) -> Result<u32> {
+    fn for_each_elem(&mut self, cb: BpfCallBackFn, ctx: *const u8, _flags: u64) -> Result<u32> {
         let mut total_used = 0;
         for i in 0..T::num_cpus() {
             let key = i.to_ne_bytes();
             let value = self.fds.index(i);
             total_used += 1;
-            let res = cb(ctx, &key, value);
+            let res = cb(&key, value, ctx);
             if res != 0 {
                 break;
             }
         }
         Ok(total_used)
+    }
+    fn lookup_and_delete_elem(&mut self, _key: &[u8], _value: &mut [u8]) -> Result<()> {
+        Err(SystemError::EINVAL)
     }
     fn first_value_ptr(&self) -> *const u8 {
         self.fds.data.as_ptr()

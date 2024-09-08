@@ -255,7 +255,7 @@ impl Socket for StreamSocket {
         todo!()
     }
     
-    fn update_io_events(&self) -> Result<crate::net::event_poll::EPollEventType, SystemError> {
+    fn poll(&self) -> usize {
         todo!()
     }
     

@@ -206,8 +206,8 @@ impl Socket for UdpSocket {
         self.wait_queue.clone()
     }
 
-    fn update_io_events(&self) -> Result<EPollEventType, SystemError> {
-        Ok(self.on_events())
+    fn poll(&self) -> usize {
+        self.on_events().bits() as usize
     }
 
     fn bind(&self, local_endpoint: Endpoint) -> Result<(), SystemError> {

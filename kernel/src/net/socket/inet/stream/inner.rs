@@ -1,4 +1,7 @@
+use core::sync::atomic::{AtomicU32, AtomicUsize};
+
 use system_error::SystemError::{self, *};
+use crate::net::socket::EPollEventType;
 use crate::net::socket::{self, inet::Types};
 use crate::libs::rwlock::RwLock;
 use alloc::vec::Vec;
@@ -243,6 +246,19 @@ impl Listening {
 
         return Ok (( Established { inner: new_listen }, remote_endpoint));
     }
+
+    pub fn update_io_events(&self, pollee: &AtomicUsize) {
+        let can_accept = self.inners.iter().any(|inner| {
+            inner.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
+                socket.is_active()
+            })
+        });
+        if can_accept {
+            pollee.fetch_or(EPollEventType::EPOLLIN.bits() as usize, core::sync::atomic::Ordering::Relaxed);
+        } else {
+            pollee.fetch_and(!EPollEventType::EPOLLIN.bits() as usize, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -304,6 +320,21 @@ impl Established {
                 socket.send_slice(buf).map_err(|_| ECONNABORTED)
             } else {
                 Err(ENOBUFS)
+            }
+        })
+    }
+
+    pub fn update_io_events(&self, pollee: &AtomicUsize) {
+        self.inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
+            if socket.can_send() {
+                pollee.fetch_or(EPollEventType::EPOLLOUT.bits() as usize, core::sync::atomic::Ordering::Relaxed);
+            } else {
+                pollee.fetch_and(!EPollEventType::EPOLLOUT.bits() as usize, core::sync::atomic::Ordering::Relaxed);
+            }
+            if socket.can_recv() {
+                pollee.fetch_or(EPollEventType::EPOLLIN.bits() as usize, core::sync::atomic::Ordering::Relaxed);
+            } else {
+                pollee.fetch_and(!EPollEventType::EPOLLIN.bits() as usize, core::sync::atomic::Ordering::Relaxed);
             }
         })
     }

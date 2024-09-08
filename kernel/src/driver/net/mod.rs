@@ -76,7 +76,7 @@ pub struct IfaceCommon {
     /// 存smoltcp网卡的套接字集
     sockets: SpinLock<smoltcp::iface::SocketSet<'static>>,
     /// 存 kernel wrap smoltcp socket 的集合
-    bounds: RwLock<Vec<Arc<InetSocket>>>,
+    bounds: RwLock<Vec<Arc<dyn InetSocket>>>,
     /// 端口管理器
     port_manager: PortManager,
     /// 下次轮询的时间
@@ -182,7 +182,7 @@ impl IfaceCommon {
     }
 
     // 需要bounds储存具体的Inet Socket信息，以提供不同种类inet socket的事件分发
-    pub fn bind_socket(&self, socket: Arc<InetSocket>) {
+    pub fn bind_socket(&self, socket: Arc<dyn InetSocket>) {
         self.bounds.write().push(socket);
     }
 }

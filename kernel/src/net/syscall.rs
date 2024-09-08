@@ -282,7 +282,7 @@ impl Syscall {
             .ok_or(SystemError::EBADF)?;
         
         if let Some(endpoint) = endpoint {
-            return socket.send_to(buf, flags, endpoint);
+            return socket.send_to(buf, endpoint, flags);
         } else {
             return socket.send(buf, flags);
         }

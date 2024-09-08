@@ -505,7 +505,7 @@ impl Socket for NetlinkSock{
         todo!()
     }
 
-    fn update_io_events(&self) -> Result<EPollEventType, SystemError>{
+    fn poll(&self) -> usize {
         todo!()
     }
     // 借用 send_to 的接口模拟netlink_sendmsg的功能

@@ -6,12 +6,9 @@ use system_error::SystemError;
 pub fn create_socket(family: socket::AddressFamily, socket_type: socket::Type, protocol: u32, is_nonblock: bool, is_close_on_exec: bool) 
     -> Result<Arc<socket::Inode>, SystemError> {
     type AF = socket::AddressFamily;
-    match family {
+    let inode = match family {
         AF::INet => {
-            let inode = socket::inet::Inet::socket(socket_type, protocol);
-            inode.set_nonblock(is_nonblock);
-            inode.set_close_on_exec(is_close_on_exec);
-            return Ok(inode);
+            socket::inet::Inet::socket(socket_type, protocol)?
         }
         AF::INet6 => {
             todo!("AF_INET6 unimplemented");
@@ -25,5 +22,8 @@ pub fn create_socket(family: socket::AddressFamily, socket_type: socket::Type, p
         _ => {
             todo!("unsupport address family");
         }
-    }
+    };
+    inode.set_nonblock(is_nonblock);
+    inode.set_close_on_exec(is_close_on_exec);
+    return Ok(inode);
 }

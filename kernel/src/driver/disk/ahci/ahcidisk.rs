@@ -509,6 +509,14 @@ impl Device for LockedAhciDisk {
     fn set_class(&self, _class: Option<Weak<dyn Class>>) {
         todo!()
     }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        None
+    }
+
+    fn set_dev_parent(&self, _dev_parent: Option<Weak<dyn Device>>) {
+        todo!()
+    }
 }
 
 impl BlockDevice for LockedAhciDisk {

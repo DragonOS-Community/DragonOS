@@ -173,6 +173,14 @@ impl Device for RtcGeneralDevice {
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
         Some(&[&RtcAttrGroup])
     }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        self.inner().device_common.get_parent_weak_or_clear()
+    }
+
+    fn set_dev_parent(&self, dev_parent: Option<Weak<dyn Device>>) {
+        self.inner().device_common.parent = dev_parent;
+    }
 }
 
 impl KObject for RtcGeneralDevice {
@@ -245,7 +253,7 @@ pub fn rtc_general_device_create(
 ) -> Arc<RtcGeneralDevice> {
     let dev = RtcGeneralDevice::new(priority.unwrap_or_default());
     device_manager().device_default_initialize(&(dev.clone() as Arc<dyn Device>));
-    dev.set_parent(Some(Arc::downgrade(real_dev) as Weak<dyn KObject>));
+    dev.set_dev_parent(Some(Arc::downgrade(real_dev) as Weak<dyn Device>));
     dev.set_class(Some(Arc::downgrade(
         &(sys_class_rtc_instance().cloned().unwrap() as Arc<dyn Class>),
     )));

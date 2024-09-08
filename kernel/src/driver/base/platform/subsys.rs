@@ -5,7 +5,9 @@ use alloc::{
 use intertrait::cast::CastArc;
 use log::error;
 
-use super::{platform_device::PlatformDevice, platform_driver::PlatformDriver};
+use super::{
+    platform_bus_device, platform_device::PlatformDevice, platform_driver::PlatformDriver,
+};
 use crate::{
     driver::{
         acpi::acpi_manager,
@@ -140,6 +142,11 @@ impl Bus for PlatformBus {
 
         // 尝试根据设备名称匹配
         return Ok(device.name().eq(&driver.name()));
+    }
+
+    fn root_device(&self) -> Option<Weak<dyn Device>> {
+        let root_device = platform_bus_device() as Arc<dyn Device>;
+        return Some(Arc::downgrade(&root_device));
     }
 }
 

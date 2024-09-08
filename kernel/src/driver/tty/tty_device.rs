@@ -549,6 +549,17 @@ impl Device for TtyDevice {
     fn state_synced(&self) -> bool {
         true
     }
+
+    fn dev_parent(&self) -> Option<alloc::sync::Weak<dyn crate::driver::base::device::Device>> {
+        None
+    }
+
+    fn set_dev_parent(
+        &self,
+        _dev_parent: Option<alloc::sync::Weak<dyn crate::driver::base::device::Device>>,
+    ) {
+        todo!()
+    }
 }
 
 impl CharDevice for TtyDevice {

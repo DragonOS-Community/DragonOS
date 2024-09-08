@@ -32,7 +32,7 @@ use crate::{
     init::initcall::INITCALL_CORE,
 };
 
-use super::{VirtIODevice, VirtIODeviceIndex, VirtIODriver};
+use super::{VirtIODevice, VirtIODeviceIndex, VirtIODriver, VIRTIO_DEV_ANY_ID};
 
 static mut VIRTIO_BUS: Option<Arc<VirtIOBus>> = None;
 
@@ -113,13 +113,38 @@ impl Bus for VirtIOBus {
         todo!()
     }
 
+    // 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/virtio/virtio.c#85
     fn match_device(
         &self,
         _device: &Arc<dyn Device>,
         _driver: &Arc<dyn Driver>,
     ) -> Result<bool, SystemError> {
-        // todo: https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/virtio/virtio.c#85
-        todo!("VirtIOBus::match_device() is not implemented")
+        let virtio_device = _device.clone().cast::<dyn VirtIODevice>().map_err(|_| {
+            error!(
+                "VirtIOBus::match_device() failed: device is not a VirtIODevice. Device: '{:?}'",
+                _device.name()
+            );
+            SystemError::EINVAL
+        })?;
+        let virtio_driver = _driver.clone().cast::<dyn VirtIODriver>().map_err(|_| {
+            error!(
+                "VirtIOBus::match_device() failed: driver is not a VirtioDriver. Driver: '{:?}'",
+                _driver.name()
+            );
+            SystemError::EINVAL
+        })?;
+
+        let ids = virtio_driver.virtio_id_table();
+        for id in &ids {
+            if id.device != virtio_device.device_type_id() && id.vendor != VIRTIO_DEV_ANY_ID {
+                continue;
+            }
+            if id.vendor == VIRTIO_DEV_ANY_ID || id.vendor == virtio_device.vendor() {
+                return Ok(true);
+            }
+        }
+
+        return Ok(false);
     }
 }
 
@@ -165,19 +190,10 @@ impl VirtIODeviceManager {
     pub fn device_add(&self, dev: Arc<dyn VirtIODevice>) -> Result<(), SystemError> {
         dev.set_bus(Some(Arc::downgrade(&(virtio_bus() as Arc<dyn Bus>))));
         device_manager().device_default_initialize(&(dev.clone() as Arc<dyn Device>));
-        let drv = dev.driver().ok_or(SystemError::EINVAL)?;
 
-        let virtio_drv = drv.cast::<dyn VirtIODriver>().map_err(|_| {
-            error!(
-                "VirtIODeviceManager::device_add() failed: device.driver() is not a VirtioDriver. Device: '{:?}'",
-                dev.name()
-            );
-            SystemError::EINVAL
-        })?;
         let virtio_index = VIRTIO_DEVICE_INDEX_MANAGER.alloc();
         dev.set_virtio_device_index(virtio_index);
         dev.set_device_name(format!("virtio{}", virtio_index.data()));
-        virtio_drv.probe(&dev)?;
 
         device_manager().add_device(dev.clone() as Arc<dyn Device>)?;
         let r = device_manager()

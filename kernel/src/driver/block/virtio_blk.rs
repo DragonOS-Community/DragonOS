@@ -1,6 +1,7 @@
 use core::{any::Any, fmt::Debug};
 
 use alloc::{
+    collections::LinkedList,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
@@ -32,7 +33,8 @@ use crate::{
             sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
             transport::VirtIOTransport,
             virtio_impl::HalImpl,
-            VirtIODevice, VirtIODeviceIndex, VirtIODriver, VIRTIO_VENDOR_ID,
+            VirtIODevice, VirtIODeviceIndex, VirtIODriver, VirtIODriverCommonData, VirtioDeviceId,
+            VIRTIO_VENDOR_ID,
         },
     },
     exception::{irqdesc::IrqReturn, IrqNumber},
@@ -49,6 +51,7 @@ const VIRTIO_BLK_BASENAME: &str = "virtio_blk";
 static mut VIRTIO_BLK_DRIVER: Option<Arc<VirtIOBlkDriver>> = None;
 
 #[inline(always)]
+#[allow(dead_code)]
 fn virtio_blk_driver() -> Arc<VirtIOBlkDriver> {
     unsafe { VIRTIO_BLK_DRIVER.as_ref().unwrap().clone() }
 }
@@ -63,9 +66,16 @@ pub fn virtio_blk_0() -> Option<Arc<VirtIOBlkDevice>> {
         .map(|dev| dev.arc_any().downcast().unwrap())
 }
 
-pub fn virtio_blk(transport: VirtIOTransport, dev_id: Arc<DeviceId>) {
+pub fn virtio_blk(
+    transport: VirtIOTransport,
+    dev_id: Arc<DeviceId>,
+    dev_parent: Option<Arc<dyn Device>>,
+) {
     let device = VirtIOBlkDevice::new(transport, dev_id);
     if let Some(device) = device {
+        if let Some(dev_parent) = dev_parent {
+            device.set_dev_parent(Some(Arc::downgrade(&dev_parent)));
+        }
         virtio_device_manager()
             .device_add(device.clone() as Arc<dyn VirtIODevice>)
             .expect("Add virtio blk failed");
@@ -177,10 +187,6 @@ impl VirtIOBlkDevice {
                 irq,
             }),
         });
-
-        dev.set_driver(Some(Arc::downgrade(
-            &(virtio_blk_driver() as Arc<dyn Driver>),
-        )));
 
         Some(dev)
     }
@@ -393,6 +399,14 @@ impl Device for VirtIOBlkDevice {
     fn state_synced(&self) -> bool {
         true
     }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        self.inner().device_common.get_parent_weak_or_clear()
+    }
+
+    fn set_dev_parent(&self, parent: Option<Weak<dyn Device>>) {
+        self.inner().device_common.parent = parent;
+    }
 }
 
 impl KObject for VirtIOBlkDevice {
@@ -477,13 +491,22 @@ struct VirtIOBlkDriver {
 impl VirtIOBlkDriver {
     pub fn new() -> Arc<Self> {
         let inner = InnerVirtIOBlkDriver {
+            virtio_driver_common: VirtIODriverCommonData::default(),
             driver_common: DriverCommonData::default(),
             kobj_common: KObjectCommonData::default(),
         };
-        Arc::new(VirtIOBlkDriver {
+
+        let id_table = VirtioDeviceId::new(
+            virtio_drivers::transport::DeviceType::Block as u32,
+            VIRTIO_VENDOR_ID.into(),
+        );
+        let result = VirtIOBlkDriver {
             inner: SpinLock::new(inner),
             kobj_state: LockedKObjectState::default(),
-        })
+        };
+        result.add_virtio_id(id_table);
+
+        return Arc::new(result);
     }
 
     fn inner(&self) -> SpinLockGuard<InnerVirtIOBlkDriver> {
@@ -493,6 +516,7 @@ impl VirtIOBlkDriver {
 
 #[derive(Debug)]
 struct InnerVirtIOBlkDriver {
+    virtio_driver_common: VirtIODriverCommonData,
     driver_common: DriverCommonData,
     kobj_common: KObjectCommonData,
 }
@@ -513,6 +537,14 @@ impl VirtIODriver for VirtIOBlkDriver {
 
         block_dev_manager().register(dev as Arc<dyn BlockDevice>)?;
         return Ok(());
+    }
+
+    fn virtio_id_table(&self) -> LinkedList<crate::driver::virtio::VirtioDeviceId> {
+        self.inner().virtio_driver_common.id_table.clone()
+    }
+
+    fn add_virtio_id(&self, id: VirtioDeviceId) {
+        self.inner().virtio_driver_common.id_table.push_back(id);
     }
 }
 

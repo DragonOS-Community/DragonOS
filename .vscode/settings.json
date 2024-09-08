@@ -161,5 +161,4 @@
     ],
     "rust-analyzer.showUnlinkedFileNotification": false,
     "editor.accessibilityPageSize": 15,
-    "makefile.configureOnOpen": false,
 }

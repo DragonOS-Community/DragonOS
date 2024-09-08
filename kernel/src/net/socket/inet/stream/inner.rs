@@ -316,3 +316,38 @@ pub enum Inner {
     Listening(Listening),
     Established(Established),
 }
+
+impl Inner {
+    pub fn send_buffer_size(&self) -> usize {
+        match self {
+            Inner::Init(_) => DEFAULT_TX_BUF_SIZE,
+            Inner::Connecting(conn) 
+                => conn.with_mut(|socket| socket.send_capacity()),
+            // only the first socket in the list is used for sending
+            Inner::Listening (listen) 
+                => listen
+                    .inners[0]
+                    .with_mut::<smoltcp::socket::tcp::Socket, _, _>(
+                        |socket| socket.send_capacity()
+                    ),
+            Inner::Established(est) 
+                => est.with_mut(|socket| socket.send_capacity()),
+        }
+    }
+
+    pub fn recv_buffer_size(&self) -> usize {
+        match self {
+            Inner::Init(_) => DEFAULT_RX_BUF_SIZE,
+            Inner::Connecting(conn) 
+                => conn.with_mut(|socket| socket.recv_capacity()),
+            // only the first socket in the list is used for receiving
+            Inner::Listening (listen) 
+                => listen.inners[0]
+                    .with_mut::<smoltcp::socket::tcp::Socket, _, _>(
+                        |socket| socket.recv_capacity()
+                    ),
+            Inner::Established(est) 
+                => est.with_mut(|socket| socket.recv_capacity()),
+        }
+    }
+}

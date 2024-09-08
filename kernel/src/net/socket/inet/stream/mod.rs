@@ -4,7 +4,7 @@ use alloc::sync::{Arc, Weak};
 
 use crate::net::event_poll::EPollEventType;
 use crate::net::net_core::poll_ifaces;
-use crate::net::socket::common::{poll_unit::{EPollItems, WaitQueue}, Shutdown};
+use crate::net::socket::*;
 use crate::libs::rwlock::RwLock;
 use smoltcp;
 
@@ -58,7 +58,8 @@ impl TcpSocket {
             Inner::Init(inner) => {
                 let bound = inner.bind(local_endpoint)?;
                 if let Init::Bound((ref bound, _)) = bound {
-                    bound.iface().common().bind_socket(self.self_ref.upgrade().unwrap());
+                    todo!("TcpSocket::bind: bind_socket");
+                    // bound.iface().common().bind_socket(self.self_ref.upgrade().unwrap());
                 }
                 writer.replace(Inner::Init(bound));
                 Ok(())
@@ -108,7 +109,7 @@ impl TcpSocket {
                                     core::sync::atomic::Ordering::Relaxed
                                 )
                             ),
-                            epitems: EPollItems::new(),
+                            epitems: EPollItems::default(),
                             wait_queue: WaitQueue::default(),
                             self_ref: me.clone(),
                         }),
@@ -213,68 +214,7 @@ impl TcpSocket {
     }
 }
 
-impl IndexNode for TcpSocket {
-    fn read_at(
-        &self,
-        _offset: usize,
-        _len: usize,
-        buf: &mut [u8],
-        data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        drop(data);
-        // self.inner.read().as_ref().expect("Tcp Inner is None").read(buf)
-        todo!()
-    }
-
-    fn write_at(
-        &self,
-        _offset: usize,
-        _len: usize,
-        buf: &[u8],
-        data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        drop(data);
-        // self.inner.read().as_ref().expect("Tcp Inner is None").write(buf)
-        todo!()
-    }
-
-    fn fs(&self) -> alloc::sync::Arc<dyn crate::filesystem::vfs::FileSystem> {
-        todo!("TcpSocket::fs")
-    }
-
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        self
-    }
-
-    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
-        todo!("TcpSocket::list")
-    }
-
-    fn kernel_ioctl(
-            &self,
-            arg: alloc::sync::Arc<dyn crate::net::event_poll::KernelIoctlData>,
-            _data: &crate::filesystem::vfs::FilePrivateData,
-        ) -> Result<usize, SystemError> {
-        let epitem = arg
-            .arc_any()
-            .downcast::<crate::net::event_poll::EPollItem>()
-            .map_err(|_| SystemError::EFAULT)?;
-
-        self.epoll_items().add(epitem);
-
-        return Ok(0);
-    }
-
-    fn poll(&self, private_data: &crate::filesystem::vfs::FilePrivateData) -> Result<usize, SystemError> {
-        drop(private_data);
-        self.update_io_events().map(|x| x.bits() as usize)   
-    }
-}
-
 impl Socket for TcpSocket {
-    fn epoll_items(&self) -> EPollItems {
-        self.epitems.clone()
-    }
 
     fn wait_queue(&self) -> WaitQueue {
         self.wait_queue.clone()
@@ -329,10 +269,18 @@ impl Socket for TcpSocket {
         }
     }
 
-    fn accept(&self) -> Result<(Arc<Inode>, crate::net::socket::Endpoint), SystemError> {
+    fn accept(&self) -> Result<(Arc<Inode>, Endpoint), SystemError> {
         self.try_accept().map(|(stream, remote)| 
-            (stream as Arc<Inode>, crate::net::socket::Endpoint::from(remote))
+            (Inode::new(stream), Endpoint::from(remote))
         )
+    }
+
+    fn send_buffer_size(&self) -> usize {
+        self.inner.read().as_ref().expect("Tcp Inner is None").send_buffer_size()
+    }
+
+    fn recv_buffer_size(&self) -> usize {
+        self.inner.read().as_ref().expect("Tcp Inner is None").recv_buffer_size()
     }
 }
 
@@ -414,27 +362,9 @@ impl IndexNode for TcpStream {
         todo!("TcpSocket::list")
     }
 
-    // fn kernel_ioctl(
-    //         &self,
-    //         arg: alloc::sync::Arc<dyn crate::net::event_poll::KernelIoctlData>,
-    //         _data: &crate::filesystem::vfs::FilePrivateData,
-    //     ) -> Result<usize, SystemError> {
-    //     let epitem = arg
-    //         .arc_any()
-    //         .downcast::<crate::net::event_poll::EPollItem>()
-    //         .map_err(|_| SystemError::EFAULT)?;
-
-    //     self.epoll_items().add(epitem);
-
-    //     return Ok(0);
-    // }
-
 }
 
 impl Socket for TcpStream {
-    fn epoll_items(&self) -> EPollItems {
-        self.epitems.clone()
-    }
 
     fn wait_queue(&self) -> WaitQueue {
         self.wait_queue.clone()
@@ -497,5 +427,13 @@ impl Socket for TcpStream {
             // TODO socket error
             return Ok(mask);
         })
+    }
+
+    fn send_buffer_size(&self) -> usize {
+        self.inner.with(|socket| socket.send_capacity())
+    }
+
+    fn recv_buffer_size(&self) -> usize {
+        self.inner.with(|socket| socket.recv_capacity())
     }
 }

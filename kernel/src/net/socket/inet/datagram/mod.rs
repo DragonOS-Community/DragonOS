@@ -6,8 +6,7 @@ use crate::filesystem::vfs::IndexNode;
 use crate::net::event_poll::EPollEventType;
 use crate::libs::rwlock::RwLock;
 use crate::net::net_core::poll_ifaces;
-use crate::net::socket::common::poll_unit::{WaitQueue, EPollItems};
-use crate::net::socket::Socket;
+use crate::net::socket::*;
 use alloc::sync::{Arc, Weak};
 
 pub type SmolUdpSocket = smoltcp::socket::udp::Socket<'static>;
@@ -207,24 +206,30 @@ impl Socket for UdpSocket {
         self.wait_queue.clone()
     }
 
-    fn epoll_items(&self) -> EPollItems {
-        self.epoll_items.clone()
-    }
-
     fn update_io_events(&self) -> Result<EPollEventType, SystemError> {
-        todo!()
+        Ok(self.on_events())
     }
 
-    fn bind(&self, local_endpoint: crate::net::Endpoint) -> Result<(), SystemError> {
-        match local_endpoint {
-            crate::net::Endpoint::Ip(local_endpoint) => {
-                self.do_bind(local_endpoint)
-            }
-            _ => Err(EAFNOSUPPORT),
+    fn bind(&self, local_endpoint: Endpoint) -> Result<(), SystemError> {
+        if let Endpoint::Ip(local_endpoint) = local_endpoint {
+            return self.do_bind(local_endpoint);
+        }
+        Err(EAFNOSUPPORT)
+    }
+
+    fn send_buffer_size(&self) -> usize {
+        match self.inner.read().as_ref().unwrap() {
+            UdpInner::Bound(bound) => bound.with_socket(|socket| socket.payload_send_capacity()),
+            _ => inner::DEFAULT_TX_BUF_SIZE
         }
     }
 
-
+    fn recv_buffer_size(&self) -> usize {
+        match self.inner.read().as_ref().unwrap() {
+            UdpInner::Bound(bound) => bound.with_socket(|socket| socket.payload_recv_capacity()),
+            _ => inner::DEFAULT_RX_BUF_SIZE
+        }
+    }
 }
 
 bitflags! {

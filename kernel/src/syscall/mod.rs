@@ -456,9 +456,10 @@ impl Syscall {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
                 } else {
-                    Self::connect(args[0], addr, addrlen)
+                    Self::connect(args[0], addr, addrlen as u32)
                 }
             }
+
             SYS_BIND => {
                 let addr = args[1] as *const SockAddr;
                 let addrlen = args[2];
@@ -469,7 +470,7 @@ impl Syscall {
                     // 地址空间超出了用户空间的范围，不合法
                     Err(SystemError::EFAULT)
                 } else {
-                    Self::bind(args[0], addr, addrlen)
+                    Self::bind(args[0], addr, addrlen as u32)
                 }
             }
 
@@ -487,7 +488,7 @@ impl Syscall {
                     Err(SystemError::EFAULT)
                 } else {
                     let data: &[u8] = unsafe { core::slice::from_raw_parts(buf, len) };
-                    Self::sendto(args[0], data, flags, addr, addrlen)
+                    Self::sendto(args[0], data, flags, addr, addrlen as u32)
                 }
             }
 
@@ -496,7 +497,7 @@ impl Syscall {
                 let len = args[2];
                 let flags = args[3] as u32;
                 let addr = args[4] as *mut SockAddr;
-                let addrlen = args[5] as *mut usize;
+                let addrlen = args[5] as *mut u32;
                 let virt_buf = VirtAddr::new(buf as usize);
                 let virt_addrlen = VirtAddr::new(addrlen as usize);
                 let virt_addr = VirtAddr::new(addr as usize);

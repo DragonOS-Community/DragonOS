@@ -95,7 +95,7 @@ pub union SockAddr {
 
 impl SockAddr {
     /// @brief 把用户传入的SockAddr转换为Endpoint结构体
-    pub fn to_endpoint(addr: *const SockAddr, len: usize) -> Result<Endpoint, SystemError> {
+    pub fn to_endpoint(addr: *const SockAddr, len: u32) -> Result<Endpoint, SystemError> {
         use crate::net::socket::AddressFamily;
 
         let addr = unsafe { addr.as_ref() }.ok_or(SystemError::EFAULT)?;
@@ -145,7 +145,7 @@ impl SockAddr {
                 AddressFamily::Netlink => {
                     // TODO: support netlink socket
                     let addr: SockAddrNl = addr.addr_nl;
-                    return Ok(Endpoint::Netlink(Some(NetlinkEndpoint::new(addr,len))));
+                    return Ok(Endpoint::Netlink(NetlinkEndpoint::new(addr,len as usize)));
                 }
                 _ => {
                     return Err(SystemError::EINVAL);
@@ -155,16 +155,14 @@ impl SockAddr {
     }
 
     /// @brief 获取地址长度
-    pub fn len(&self) -> Result<usize, SystemError> {
-        let ret = match AddressFamily::try_from(unsafe { self.family })? {
+    pub fn len(&self) -> Result<u32, SystemError> {
+        match AddressFamily::try_from(unsafe { self.family })? {
             AddressFamily::INet => Ok(core::mem::size_of::<SockAddrIn>()),
             AddressFamily::Packet => Ok(core::mem::size_of::<SockAddrLl>()),
             AddressFamily::Netlink => Ok(core::mem::size_of::<SockAddrNl>()),
             AddressFamily::Unix => Err(SystemError::EINVAL),
             _ => Err(SystemError::EINVAL),
-        };
-
-        return ret;
+        }.map(|x| x as u32)
     }
 
     /// @brief 把SockAddr的数据写入用户空间
@@ -176,8 +174,8 @@ impl SockAddr {
     pub unsafe fn write_to_user(
         &self,
         addr: *mut SockAddr,
-        addr_len: *mut usize,
-    ) -> Result<usize, SystemError> {
+        addr_len: *mut u32,
+    ) -> Result<u32, SystemError> {
         // 当用户传入的地址或者长度为空时，直接返回0
         if addr.is_null() || addr_len.is_null() {
             return Ok(0);
@@ -196,12 +194,12 @@ impl SockAddr {
         )
         .map_err(|_| SystemError::EFAULT)?;
 
-        let to_write = core::cmp::min(self.len()?, *addr_len as usize);
+        let to_write = core::cmp::min(self.len()?, *addr_len);
         if to_write > 0 {
-            let buf = core::slice::from_raw_parts_mut(addr as *mut u8, to_write);
+            let buf = core::slice::from_raw_parts_mut(addr as *mut u8, to_write as usize);
             buf.copy_from_slice(core::slice::from_raw_parts(
                 self as *const SockAddr as *const u8,
-                to_write,
+                to_write as usize,
             ));
         }
         *addr_len = self.len()?;
@@ -266,7 +264,9 @@ pub struct MsgHdr {
     /// 辅助数据
     pub msg_control: *mut u8,
     /// 辅助数据长度
-    pub msg_controllen: usize,
+    pub msg_controllen: u32,
     /// 接收到的消息的标志
     pub msg_flags: u32,
 }
+
+// TODO: 从用户态读取MsgHdr，以及写入MsgHdr

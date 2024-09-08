@@ -270,7 +270,7 @@ impl LoopbackInterface {
                     .expect("Push ipCidr failed: full");
             }
         });
-        
+
         Arc::new(LoopbackInterface {
             driver: LoopbackDriverWapper(UnsafeCell::new(driver)),
             common: IfaceCommon::new(iface_id, iface),

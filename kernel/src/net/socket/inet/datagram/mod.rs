@@ -1,13 +1,13 @@
-use system_error::SystemError::{self, *};
 use smoltcp;
+use system_error::SystemError::{self, *};
 
-use core::sync::atomic::AtomicBool;
 use crate::filesystem::vfs::IndexNode;
-use crate::net::event_poll::EPollEventType;
 use crate::libs::rwlock::RwLock;
+use crate::net::event_poll::EPollEventType;
 use crate::net::net_core::poll_ifaces;
 use crate::net::socket::*;
 use alloc::sync::{Arc, Weak};
+use core::sync::atomic::AtomicBool;
 
 pub type SmolUdpSocket = smoltcp::socket::udp::Socket<'static>;
 
@@ -78,15 +78,13 @@ impl UdpSocket {
         }
     }
 
-    pub fn try_recv(&self, buf: &mut [u8]) 
-        -> Result<(usize, smoltcp::wire::IpEndpoint), SystemError> 
-    {
-        let received 
-            = match self.inner.read().as_ref().expect("Udp Inner is None") {
-            UdpInner::Bound(bound) => {
-                bound.try_recv(buf)
-            }
-            _ => Err(ENOTCONN)
+    pub fn try_recv(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<(usize, smoltcp::wire::IpEndpoint), SystemError> {
+        let received = match self.inner.read().as_ref().expect("Udp Inner is None") {
+            UdpInner::Bound(bound) => bound.try_recv(buf),
+            _ => Err(ENOTCONN),
         };
 
         poll_ifaces();
@@ -94,9 +92,11 @@ impl UdpSocket {
         return received;
     }
 
-    pub fn try_send(&self, buf: &[u8], to: Option<smoltcp::wire::IpEndpoint>) 
-        -> Result<usize, SystemError> 
-    {
+    pub fn try_send(
+        &self,
+        buf: &[u8],
+        to: Option<smoltcp::wire::IpEndpoint>,
+    ) -> Result<usize, SystemError> {
         {
             let mut inner_guard = self.inner.write();
             let inner = match inner_guard.take().expect("Udp Inner is None") {
@@ -109,8 +109,7 @@ impl UdpSocket {
             inner_guard.replace(UdpInner::Bound(inner));
         };
         // Optimize: 拿两次锁的平均效率是否比一次长时间的读锁效率要高？
-        let result
-            = match self.inner.read().as_ref().expect("Udp Inner is None") {
+        let result = match self.inner.read().as_ref().expect("Udp Inner is None") {
             UdpInner::Bound(bound) => bound.try_send(buf, to),
             _ => Err(ENOTCONN),
         };
@@ -122,9 +121,9 @@ impl UdpSocket {
         if self.is_nonblock() {
             return self.try_recv(buf).map(|(size, _)| size);
         } else {
-            return self.wait_queue.busy_wait(EP::EPOLLIN, 
-                || self.try_recv(buf).map(|(size, _)| size)
-            );
+            return self
+                .wait_queue
+                .busy_wait(EP::EPOLLIN, || self.try_recv(buf).map(|(size, _)| size));
         }
     }
 
@@ -132,27 +131,18 @@ impl UdpSocket {
         let mut event = EPollEventType::empty();
         match self.inner.read().as_ref().unwrap() {
             UdpInner::Unbound(_) => {
-                event.insert(
-                    EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND
-                );
+                event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
             }
             UdpInner::Bound(bound) => {
-                let (can_recv, can_send) = 
-                    bound.with_socket(|socket| {
-                        (socket.can_recv(), socket.can_send())
-                    }
-                );
+                let (can_recv, can_send) =
+                    bound.with_socket(|socket| (socket.can_recv(), socket.can_send()));
 
                 if can_recv {
-                    event.insert(
-                        EP::EPOLLIN | EP::EPOLLRDNORM
-                    );
+                    event.insert(EP::EPOLLIN | EP::EPOLLRDNORM);
                 }
 
                 if can_send {
-                    event.insert(
-                        EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND
-                    );
+                    event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
                 } else {
                     todo!("缓冲区空间不够，需要使用信号处理");
                 }
@@ -196,7 +186,10 @@ impl IndexNode for UdpSocket {
         todo!()
     }
 
-    fn poll(&self, _private_data: &crate::filesystem::vfs::FilePrivateData) -> Result<usize, SystemError> {
+    fn poll(
+        &self,
+        _private_data: &crate::filesystem::vfs::FilePrivateData,
+    ) -> Result<usize, SystemError> {
         Ok(self.on_events().bits() as usize)
     }
 }
@@ -220,14 +213,14 @@ impl Socket for UdpSocket {
     fn send_buffer_size(&self) -> usize {
         match self.inner.read().as_ref().unwrap() {
             UdpInner::Bound(bound) => bound.with_socket(|socket| socket.payload_send_capacity()),
-            _ => inner::DEFAULT_TX_BUF_SIZE
+            _ => inner::DEFAULT_TX_BUF_SIZE,
         }
     }
 
     fn recv_buffer_size(&self) -> usize {
         match self.inner.read().as_ref().unwrap() {
             UdpInner::Bound(bound) => bound.with_socket(|socket| socket.payload_recv_capacity()),
-            _ => inner::DEFAULT_RX_BUF_SIZE
+            _ => inner::DEFAULT_RX_BUF_SIZE,
         }
     }
 }
@@ -284,13 +277,13 @@ bitflags! {
 //         SO_TIMESTAMP_OLD => {}
 //         SO_TIMESTAMP_NEW => {}
 //         SO_TIMESTAMPNS_OLD => {}
-        
+
 //         SO_TIMESTAMPING_OLD => {}
-        
+
 //         SO_RCVTIMEO_OLD => {}
 
 //         SO_SNDTIMEO_OLD => {}
-        
+
 //         // if define CONFIG_NET_RX_BUSY_POLL
 //         SO_BUSY_POLL | SO_PREFER_BUSY_POLL | SO_BUSY_POLL_BUDGET => {
 //             debug!("Unsupported socket option: {:?}", optname);
@@ -313,7 +306,7 @@ bitflags! {
 // ) -> Result<(), SystemError> {
 //     use PosixSocketOption::*;
 
-//     let so_opt_name = 
+//     let so_opt_name =
 //         PosixSocketOption::try_from(optname as i32)
 //             .map_err(|_| SystemError::ENOPROTOOPT)?;
 

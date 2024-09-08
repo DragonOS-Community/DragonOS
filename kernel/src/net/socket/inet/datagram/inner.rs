@@ -1,5 +1,5 @@
-use system_error::SystemError::{self, *};
 use smoltcp;
+use system_error::SystemError::{self, *};
 
 use crate::net::socket::inet::common::{BoundInner, Types as InetTypes};
 
@@ -29,14 +29,19 @@ impl UnboundUdp {
         return Self { socket };
     }
 
-    pub fn bind(mut self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<BoundUdp, SystemError> {
+    pub fn bind(
+        mut self,
+        local_endpoint: smoltcp::wire::IpEndpoint,
+    ) -> Result<BoundUdp, SystemError> {
         // let (addr, port) = (local_endpoint.addr, local_endpoint.port);
         if self.socket.bind(local_endpoint).is_err() {
             return Err(EINVAL);
         }
         let inner = BoundInner::bind(self.socket, &local_endpoint.addr)?;
-        inner.port_manager().bind_port(InetTypes::Udp, local_endpoint.port)?;
-        Ok( BoundUdp {
+        inner
+            .port_manager()
+            .bind_port(InetTypes::Udp, local_endpoint.port)?;
+        Ok(BoundUdp {
             inner,
             remote: None,
         })
@@ -47,7 +52,7 @@ impl UnboundUdp {
         let (inner, address) = BoundInner::bind_ephemeral(self.socket, remote)?;
         let bound_port = inner.port_manager().bind_ephemeral_port(InetTypes::Udp)?;
         let endpoint = smoltcp::wire::IpEndpoint::new(address, bound_port);
-        Ok( BoundUdp {
+        Ok(BoundUdp {
             inner,
             remote: Some(endpoint),
         })
@@ -80,13 +85,15 @@ impl BoundUdp {
     }
 
     pub fn endpoint(&self) -> smoltcp::wire::IpListenEndpoint {
-        self.inner.with::<SmolUdpSocket, _, _>(|socket| {
-            socket.endpoint()
-        })
+        self.inner
+            .with::<SmolUdpSocket, _, _>(|socket| socket.endpoint())
     }
 
     #[inline]
-    pub fn try_recv(&self, buf: &mut [u8]) -> Result<(usize, smoltcp::wire::IpEndpoint), SystemError> {
+    pub fn try_recv(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<(usize, smoltcp::wire::IpEndpoint), SystemError> {
         self.with_mut_socket(|socket| {
             if socket.can_recv() {
                 if let Ok((size, metadata)) = socket.recv_slice(buf) {
@@ -97,7 +104,11 @@ impl BoundUdp {
         })
     }
 
-    pub fn try_send(&self, buf: &[u8], to: Option<smoltcp::wire::IpEndpoint>) -> Result<usize, SystemError> {
+    pub fn try_send(
+        &self,
+        buf: &[u8],
+        to: Option<smoltcp::wire::IpEndpoint>,
+    ) -> Result<usize, SystemError> {
         let remote = to.or(self.remote).ok_or(ENOTCONN)?;
 
         let result = self.with_mut_socket(|socket| {
@@ -110,8 +121,11 @@ impl BoundUdp {
     }
 
     pub fn close(&self) {
-        self.inner.iface().port_manager().unbind_port(InetTypes::Udp, self.endpoint().port);
-        self.with_mut_socket(|socket|{
+        self.inner
+            .iface()
+            .port_manager()
+            .unbind_port(InetTypes::Udp, self.endpoint().port);
+        self.with_mut_socket(|socket| {
             socket.close();
         });
     }

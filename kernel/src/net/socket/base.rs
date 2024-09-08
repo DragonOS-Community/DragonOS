@@ -1,10 +1,10 @@
 #![allow(unused_variables)]
 
-use core::fmt::Debug;
-use alloc::sync::Arc;
-use system_error::SystemError::{self, *};
 use crate::net::socket::*;
 use crate::net::syscall_util::MsgHdr;
+use alloc::sync::Arc;
+use core::fmt::Debug;
+use system_error::SystemError::{self, *};
 
 /// # `Socket` methods
 /// ## Reference
@@ -26,17 +26,17 @@ pub trait Socket: Sync + Send + Debug {
     fn accept(&self) -> Result<(Arc<Inode>, Endpoint), SystemError> {
         Err(ENOSYS)
     }
-    /// # `bind` 
+    /// # `bind`
     /// 对应于POSIX的bind函数，用于绑定到本机指定的端点
     fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         Err(ENOSYS)
     }
-    /// # `close` 
+    /// # `close`
     /// 关闭socket
     fn close(&self) -> Result<(), SystemError> {
         Err(ENOSYS)
     }
-    /// # `connect` 
+    /// # `connect`
     /// 对应于POSIX的connect函数，用于连接到指定的远程服务器端点
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         Err(ENOSYS)
@@ -84,13 +84,12 @@ pub trait Socket: Sync + Send + Debug {
     }
     /// # `recv_from`
     fn recv_from(
-        &self, 
+        &self,
         buffer: &mut [u8],
         flags: MessageFlag,
         address: Option<Endpoint>,
-    ) -> Result<(usize, Endpoint), SystemError> 
-    { 
-        Err(ENOSYS) 
+    ) -> Result<(usize, Endpoint), SystemError> {
+        Err(ENOSYS)
     }
     /// # `recv_msg`
     fn recv_msg(&self, msg: &mut MsgHdr, flags: MessageFlag) -> Result<usize, SystemError> {
@@ -106,7 +105,12 @@ pub trait Socket: Sync + Send + Debug {
         Err(ENOSYS)
     }
     /// # `send_to`
-    fn send_to(&self, buffer: &[u8], flags: MessageFlag, address: Endpoint) -> Result<usize, SystemError> {
+    fn send_to(
+        &self,
+        buffer: &[u8],
+        flags: MessageFlag,
+        address: Endpoint,
+    ) -> Result<usize, SystemError> {
         Err(ENOSYS)
     }
     /// # `set_option`
@@ -117,12 +121,7 @@ pub trait Socket: Sync + Send + Debug {
     /// - value 选项的值
     /// ## Reference
     /// https://code.dragonos.org.cn/s?refs=sk_setsockopt&project=linux-6.6.21
-    fn set_option(
-        &self,
-        level: OptionsLevel,
-        name: usize,
-        val: &[u8],
-    ) -> Result<(), SystemError> {
+    fn set_option(&self, level: OptionsLevel, name: usize, val: &[u8]) -> Result<(), SystemError> {
         log::warn!("setsockopt is not implemented");
         Ok(())
     }

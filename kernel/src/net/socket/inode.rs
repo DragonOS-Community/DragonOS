@@ -1,6 +1,6 @@
+use crate::filesystem::vfs::IndexNode;
 use alloc::sync::Arc;
 use system_error::SystemError;
-use crate::filesystem::vfs::IndexNode;
 
 use crate::net::socket::*;
 
@@ -33,7 +33,6 @@ impl IndexNode for Inode {
         self.inner.write(buf)
     }
 
-    
     /* Following are not yet available in socket */
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
@@ -48,7 +47,10 @@ impl IndexNode for Inode {
         unimplemented!()
     }
 
-    fn poll(&self, private_data: &crate::filesystem::vfs::FilePrivateData) -> Result<usize, SystemError> {
+    fn poll(
+        &self,
+        private_data: &crate::filesystem::vfs::FilePrivateData,
+    ) -> Result<usize, SystemError> {
         drop(private_data);
         Ok(self.inner.poll())
     }
@@ -57,7 +59,6 @@ impl IndexNode for Inode {
 use super::common::poll_unit::WaitQueue;
 
 impl Inode {
-
     pub fn wait_queue(&self) -> WaitQueue {
         self.inner.wait_queue()
     }
@@ -78,11 +79,21 @@ impl Inode {
         self.inner.bind(endpoint)
     }
 
-    pub fn set_option(&self, level: OptionsLevel, name: usize, value: &[u8]) -> Result<(), SystemError> {
+    pub fn set_option(
+        &self,
+        level: OptionsLevel,
+        name: usize,
+        value: &[u8],
+    ) -> Result<(), SystemError> {
         self.inner.set_option(level, name, value)
     }
 
-    pub fn get_option(&self, level: OptionsLevel, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
+    pub fn get_option(
+        &self,
+        level: OptionsLevel,
+        name: usize,
+        value: &mut [u8],
+    ) -> Result<usize, SystemError> {
         self.inner.get_option(level, name, value)
     }
 
@@ -90,7 +101,12 @@ impl Inode {
         self.inner.listen(backlog)
     }
 
-    pub fn send_to(&self, buffer: &[u8], address: Endpoint, flags: MessageFlag) -> Result<usize, SystemError> {
+    pub fn send_to(
+        &self,
+        buffer: &[u8],
+        address: Endpoint,
+        flags: MessageFlag,
+    ) -> Result<usize, SystemError> {
         self.inner.send_to(buffer, flags, address)
     }
 
@@ -103,7 +119,12 @@ impl Inode {
     }
 
     // TODO receive from split with endpoint or not
-    pub fn recv_from(&self, buffer: &mut [u8], flags: MessageFlag, address: Option<Endpoint>) -> Result<(usize, Endpoint), SystemError> {
+    pub fn recv_from(
+        &self,
+        buffer: &mut [u8],
+        flags: MessageFlag,
+        address: Option<Endpoint>,
+    ) -> Result<(usize, Endpoint), SystemError> {
         self.inner.recv_from(buffer, flags, address)
     }
 
@@ -124,7 +145,10 @@ impl Inode {
     }
 
     pub fn new(inner: Arc<dyn Socket>) -> Arc<Self> {
-        Arc::new(Self { inner, epoll_items: EPollItems::default() })
+        Arc::new(Self {
+            inner,
+            epoll_items: EPollItems::default(),
+        })
     }
 
     /// # `epoll_items`

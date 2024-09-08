@@ -1,14 +1,16 @@
-use system_error::SystemError::{self, *};
-use smoltcp;
 use alloc::sync::Arc;
+use smoltcp;
+use system_error::SystemError::{self, *};
 
 use super::InetSocket;
 
 // use crate::net::syscall_util::SysArgSocketType;
 use crate::net::socket::*;
 
-
-fn create_inet_socket(sock_type: Type, protocol: smoltcp::wire::IpProtocol) -> Result<Arc<dyn Socket>, SystemError> {
+fn create_inet_socket(
+    sock_type: Type,
+    protocol: smoltcp::wire::IpProtocol,
+) -> Result<Arc<dyn Socket>, SystemError> {
     use smoltcp::wire::IpProtocol::*;
     match protocol {
         Udp => {
@@ -41,6 +43,4 @@ impl family::Family for Inet {
         let socket = create_inet_socket(stype, smoltcp::wire::IpProtocol::from(protocol as u8))?;
         Ok(Inode::new(socket))
     }
-
-    
 }

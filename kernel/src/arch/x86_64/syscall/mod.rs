@@ -105,9 +105,8 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
     ];
     mfence();
     let pid = ProcessManager::current_pcb().pid();
-    let mut show = 
-        // false;
-        (syscall_num != SYS_SCHED) && (pid.data() >= 7) ;
+    let mut show = (syscall_num != SYS_SCHED) && (pid.data() >= 7);
+    // false;
 
     let to_print = SysCall::try_from(syscall_num);
     if let Ok(to_print) = to_print {
@@ -115,16 +114,17 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         match to_print {
             SYS_ACCEPT | SYS_ACCEPT4 | SYS_BIND | SYS_CONNECT | SYS_SHUTDOWN | SYS_LISTEN => {
                 show &= true;
-            },
-            SYS_RECVFROM | SYS_SENDTO | SYS_SENDMSG | SYS_RECVMSG  => {
+            }
+            SYS_RECVFROM | SYS_SENDTO | SYS_SENDMSG | SYS_RECVMSG => {
                 show &= true;
-            },
-            SYS_SOCKET | SYS_GETSOCKNAME | SYS_GETPEERNAME | SYS_SOCKETPAIR | SYS_SETSOCKOPT | SYS_GETSOCKOPT => {
+            }
+            SYS_SOCKET | SYS_GETSOCKNAME | SYS_GETPEERNAME | SYS_SOCKETPAIR | SYS_SETSOCKOPT
+            | SYS_GETSOCKOPT => {
                 show &= true;
-            },
+            }
             _ => {
                 show &= false;
-            },
+            }
         }
         if show {
             debug!("[SYS] [Pid: {:?}] [Call: {:?}]", pid, to_print);
@@ -141,19 +141,11 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
             );
         }
         SYS_ARCH_PRCTL => {
-            normal_syscall_return!(
-                Syscall::arch_prctl(args[0], args[1]),
-                frame,
-                show
-            );
+            normal_syscall_return!(Syscall::arch_prctl(args[0], args[1]), frame, show);
         }
         _ => {}
     }
-    normal_syscall_return!(
-        Syscall::handle(syscall_num, &args, frame),
-        frame,
-        show
-    );
+    normal_syscall_return!(Syscall::handle(syscall_num, &args, frame), frame, show);
 }
 
 /// 系统调用初始化

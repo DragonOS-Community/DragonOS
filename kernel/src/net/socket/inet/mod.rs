@@ -1,16 +1,16 @@
-use system_error::SystemError::{self, *};
-use smoltcp;
 use alloc::sync::Arc;
+use smoltcp;
+use system_error::SystemError::{self, *};
 
 // pub mod raw;
 // pub mod icmp;
+pub mod common;
 pub mod datagram;
 pub mod stream;
-pub mod common;
 pub mod syscall;
 
-pub use common::Types;
 pub use common::BoundInner;
+pub use common::Types;
 // pub use raw::RawSocket;
 pub use datagram::UdpSocket;
 pub use stream::TcpSocket;
@@ -30,7 +30,7 @@ const UNSPECIFIED_LOCAL_ENDPOINT: IpEndpoint =
     IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), 0);
 
 pub trait InetSocket: Socket {
-    /// `on_iface_events` 
+    /// `on_iface_events`
     /// 通知socket发生的事件
     fn on_iface_events(&self);
 }
@@ -51,7 +51,7 @@ pub trait InetSocket: Socket {
 // }
 
 // impl IndexNode for InetSocket {
-    
+
 // }
 
 // impl Socket for InetSocket {

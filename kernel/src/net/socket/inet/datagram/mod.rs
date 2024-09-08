@@ -1,3 +1,4 @@
+use inet::InetSocket;
 use smoltcp;
 use system_error::SystemError::{self, *};
 
@@ -8,8 +9,6 @@ use crate::net::net_core::poll_ifaces;
 use crate::net::socket::*;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::AtomicBool;
-
-pub type SmolUdpSocket = smoltcp::socket::udp::Socket<'static>;
 
 pub mod inner;
 
@@ -46,6 +45,7 @@ impl UdpSocket {
         let mut inner = self.inner.write();
         if let Some(UdpInner::Unbound(unbound)) = inner.take() {
             let bound = unbound.bind(local_endpoint)?;
+            bound.inner().iface().common().bind_socket(self.self_ref.upgrade().unwrap());
             *inner = Some(UdpInner::Bound(bound));
             return Ok(());
         }
@@ -152,48 +152,6 @@ impl UdpSocket {
     }
 }
 
-impl IndexNode for UdpSocket {
-    fn read_at(
-        &self,
-        _offset: usize,
-        _len: usize,
-        buf: &mut [u8],
-        data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        drop(data);
-        self.read(buf)
-    }
-
-    fn write_at(
-        &self,
-        _offset: usize,
-        _len: usize,
-        buf: &[u8],
-        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        self.try_send(buf, None)
-    }
-
-    fn fs(&self) -> alloc::sync::Arc<dyn crate::filesystem::vfs::FileSystem> {
-        todo!()
-    }
-
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        self
-    }
-
-    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
-        todo!()
-    }
-
-    fn poll(
-        &self,
-        _private_data: &crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<usize, SystemError> {
-        Ok(self.on_events().bits() as usize)
-    }
-}
-
 impl Socket for UdpSocket {
     fn wait_queue(&self) -> WaitQueue {
         self.wait_queue.clone()
@@ -222,6 +180,12 @@ impl Socket for UdpSocket {
             UdpInner::Bound(bound) => bound.with_socket(|socket| socket.payload_recv_capacity()),
             _ => inner::DEFAULT_RX_BUF_SIZE,
         }
+    }
+}
+
+impl InetSocket for UdpSocket {
+    fn on_iface_events(&self) {
+        return;
     }
 }
 

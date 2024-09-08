@@ -16,9 +16,7 @@ pub fn create_socket(
         AF::INet6 => {
             todo!("AF_INET6 unimplemented");
         }
-        AF::Unix => {
-            todo!("AF_UNIX unimplemented");
-        }
+        AF::Unix => socket::unix::Unix::socket(socket_type, protocol)?,
         AF::Netlink => {
             todo!("AF_NETLINK unimplemented");
         }

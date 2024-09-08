@@ -120,6 +120,10 @@ impl BoundUdp {
         return result;
     }
 
+    pub fn inner(&self) -> &BoundInner {
+        &self.inner
+    }
+
     pub fn close(&self) {
         self.inner
             .iface()

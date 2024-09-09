@@ -7,7 +7,6 @@ use crate::net::socket::*;
 #[derive(Debug)]
 pub struct Inode {
     inner: Arc<dyn Socket>,
-    epoll_items: EPollItems,
 }
 
 impl IndexNode for Inode {
@@ -76,14 +75,8 @@ impl Socket for Inode {
 }
 
 impl Inode {
-    pub fn new(inner: Arc<dyn Socket>) -> Arc<Self> {
-        Arc::new(Self { inner, epoll_items: EPollItems::default() })
-    }
-
-    /// # `epoll_items`
-    /// socket的epoll事件集
-    pub fn epoll_items(&self) -> EPollItems {
-        self.epoll_items.clone()
+    pub fn new(socket: Arc<dyn Socket>) -> Arc<Self>{
+        return Arc::new(Self{inner: socket.clone()});
     }
 
     pub fn set_nonblock(&self, nonblock: bool) {

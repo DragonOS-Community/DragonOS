@@ -3,12 +3,11 @@ use system_error::SystemError;
 use crate::filesystem::vfs::IndexNode;
 
 use crate::net::socket::*;
-use super::common::poll_unit::EPollItems;
 
 #[derive(Debug)]
 pub struct Inode {
     inner: Arc<dyn Socket>,
-    socket: Arc<dyn Socket>,
+    epoll_items: EPollItems,
 }
 
 impl IndexNode for Inode {
@@ -58,10 +57,7 @@ impl IndexNode for Inode {
 use super::common::poll_unit::WaitQueue;
 
 impl Socket for Inode {
-    fn epoll_items(&self) -> EPollItems {
-        self.inner.epoll_items()
-    }
-    
+
     fn wait_queue(&self) -> WaitQueue {
         self.inner.wait_queue()
     }
@@ -69,11 +65,25 @@ impl Socket for Inode {
     fn update_io_events(&self) -> Result<crate::net::event_poll::EPollEventType, SystemError> {
         self.inner.update_io_events()
     }
+
+    fn send_buffer_size(&self) -> usize {
+        self.inner.send_buffer_size()
+    }
+
+    fn recv_buffer_size(&self) -> usize {
+        self.inner.recv_buffer_size()
+    }
 }
 
 impl Inode {
-    pub fn new(socket: Arc<dyn Socket>) -> Arc<Self>{
-        return Arc::new(Self{inner: socket.clone(), socket: socket.clone()});
+    pub fn new(inner: Arc<dyn Socket>) -> Arc<Self> {
+        Arc::new(Self { inner, epoll_items: EPollItems::default() })
+    }
+
+    /// # `epoll_items`
+    /// socket的epoll事件集
+    pub fn epoll_items(&self) -> EPollItems {
+        self.epoll_items.clone()
     }
 
     pub fn set_nonblock(&self, nonblock: bool) {

@@ -68,6 +68,10 @@ impl Shutdown {
     //     self.bit.load(core::sync::atomic::Ordering::SeqCst) == 0
     // }
 
+    pub fn from_how(how: usize) -> Self {
+        Self::from(ShutdownBit::from_bits_truncate(how as u8))
+    }
+
     pub fn get(&self) -> ShutdownTemp {
         ShutdownTemp {
             bit: self.bit.load(core::sync::atomic::Ordering::SeqCst),
@@ -94,5 +98,30 @@ impl ShutdownTemp {
 
     pub fn is_empty(&self) -> bool {
         self.bit == 0
+    }
+
+    pub fn from_how(how: usize) -> Self {
+        Self {
+            bit: how as u8 + 1,
+        }
+    }
+}
+
+impl From<ShutdownBit> for ShutdownTemp {
+    fn from(shutdown_bit: ShutdownBit) -> Self {
+        match shutdown_bit {
+            ShutdownBit::SHUT_RD => Self {
+                bit: RCV_SHUTDOWN,
+            },
+            ShutdownBit::SHUT_WR => Self {
+                bit: SEND_SHUTDOWN,
+            },
+            ShutdownBit::SHUT_RDWR => Self {
+                bit: SHUTDOWN_MASK,
+            },
+            _ => Self {
+                bit: 0,
+            },
+        }
     }
 }

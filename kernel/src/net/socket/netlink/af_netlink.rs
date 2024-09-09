@@ -20,11 +20,8 @@ use crate::include::bindings::bindings::{ECONNREFUSED, __WORDSIZE};
 use crate::libs::mutex::Mutex;
 use crate::libs::rwlock::RwLockWriteGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
-use crate::libs::wait_queue::WaitQueue;
 use crate::net::event_poll::{EPollEventType, EPollItem, EventPoll};
-use crate::net::net_core::poll_ifaces;
-use crate::net::socket::common::poll_unit::{self, EPollItems};
-use crate::net::socket::common::Shutdown;
+use crate::net::socket::*;
 use crate::net::socket::netlink::skbuff::SkBuff;
 use crate::net::syscall::{MsgHdr, SockAddr, SockAddrNl};
 use crate::time::timer::schedule_timeout;
@@ -479,7 +476,7 @@ impl Socket for NetlinkSock{
     fn connect(&self, _endpoint: Endpoint) -> Result<(), SystemError>{
         self.netlink_connect(_endpoint)
     }
-    fn shutdown(&self, _type: Shutdown) -> Result<(), SystemError> {
+    fn shutdown(&self, _type: ShutdownTemp) -> Result<(), SystemError> {
         todo!()
     }
     fn bind(&self, _endpoint: Endpoint) -> Result<(), SystemError> {
@@ -504,12 +501,10 @@ impl Socket for NetlinkSock{
         todo!()
     }
 
-    fn epoll_items(&self) -> EPollItems{
+    fn wait_queue(&self) -> WaitQueue {
         todo!()
     }
-    fn wait_queue(&self) -> poll_unit::WaitQueue{
-        todo!()
-    }
+
     fn update_io_events(&self) -> Result<EPollEventType, SystemError>{
         todo!()
     }
@@ -520,6 +515,14 @@ impl Socket for NetlinkSock{
     // 借用 recv_from 的接口模拟netlink_recvmsg的功能
     fn recv_from(&self, msg: &mut [u8], flags: MessageFlag, address: Option<Endpoint>) -> Result<(usize, Endpoint), SystemError>  {
         return self.netlink_recv(msg, msg.len(), flags)
+    }
+    fn send_buffer_size(&self) -> usize {
+        log::warn!("send_buffer_size is implemented to 0");
+        0
+    }
+    fn recv_buffer_size(&self) -> usize {
+        log::warn!("recv_buffer_size is implemented to 0");
+        0
     }
 }
 impl IndexNode for NetlinkSock{

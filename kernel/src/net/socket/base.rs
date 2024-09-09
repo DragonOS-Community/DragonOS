@@ -10,10 +10,6 @@ use crate::net::syscall_util::MsgHdr;
 /// ## Reference
 /// - [Posix standard](https://pubs.opengroup.org/onlinepubs/9699919799/)
 pub trait Socket: Sync + Send + Debug {
-    /// # `epoll_items`
-    /// socket的epoll事件集
-    fn epoll_items(&self) -> EPollItems;
-
     /// # `wait_queue`
     /// 获取socket的wait queue
     fn wait_queue(&self) -> WaitQueue;
@@ -149,7 +145,7 @@ pub trait Socket: Sync + Send + Debug {
     }
 
     /// # `shutdown`
-    fn shutdown(&self, how: Shutdown) -> Result<(), SystemError> {
+    fn shutdown(&self, how: ShutdownTemp) -> Result<(), SystemError> {
         Err(ENOSYS)
     }
 
@@ -162,17 +158,9 @@ pub trait Socket: Sync + Send + Debug {
         self.send(buffer, MessageFlag::empty())
     }
 
-    // /// # `endpoint`
-    // fn endpoint(&self) -> Option<Endpoint> {
-    //     None
-    // }
-
-    // /// # `peer_endpoint`
-    // /// 获取对端的端点
-    // fn peer_endpoint(&self) -> Option<Endpoint> {
-    //     None
-    // }
-
+    fn send_buffer_size(&self) -> usize;
+    fn recv_buffer_size(&self) -> usize;
+    
     // fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
     //     todo!()
     // }

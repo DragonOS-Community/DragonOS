@@ -20,7 +20,7 @@ use crate::{
     libs::{rwlock::RwLock, spinlock::SpinLock},
     net::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
-        socket::{Inode as SocketInode, Socket},
+        socket::Inode as SocketInode,
     },
     process::{cred::Cred, ProcessManager},
 };
@@ -531,9 +531,8 @@ impl File {
     pub fn remove_epoll(&self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
         match self.file_type {
             FileType::Socket => {
-                let inode = self.inode.downcast_ref::<SocketInode>().unwrap();
-
-                socket.remove_epoll(epoll)
+                let socket = self.inode.downcast_ref::<SocketInode>().unwrap();
+                socket.epoll_items().remove(epoll)
             }
             FileType::Pipe => {
                 let inode = self.inode.downcast_ref::<LockedPipeInode>().unwrap();

@@ -1,5 +1,6 @@
 #![allow(unused_variables)]
 
+use core::any::Any;
 use core::fmt::Debug;
 use alloc::sync::Arc;
 use system_error::SystemError::{self, *};
@@ -9,7 +10,7 @@ use crate::net::syscall_util::MsgHdr;
 /// # `Socket` methods
 /// ## Reference
 /// - [Posix standard](https://pubs.opengroup.org/onlinepubs/9699919799/)
-pub trait Socket: Sync + Send + Debug {
+pub trait Socket: Sync + Send + Debug + Any{
     /// # `wait_queue`
     /// 获取socket的wait queue
     fn wait_queue(&self) -> WaitQueue;

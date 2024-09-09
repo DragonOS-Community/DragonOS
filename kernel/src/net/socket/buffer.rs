@@ -25,6 +25,10 @@ impl Buffer {
         return self.read_buffer.lock().is_empty();
     }
 
+    pub fn is_read_buf_full(&self) ->bool {
+        return self.metadata.buf_size-self.read_buffer.lock().len()==0
+    }
+
     pub fn is_write_buf_empty(&self) -> bool {
         return self.write_buffer.lock().is_empty();
     }

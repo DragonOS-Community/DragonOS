@@ -93,4 +93,8 @@ impl Inode {
     pub fn set_close_on_exec(&self, close_on_exec: bool) {
         todo!()
     }
+
+    pub fn inner(&self)->Arc<dyn Socket>{
+        return self.inner.clone();
+    }
 }

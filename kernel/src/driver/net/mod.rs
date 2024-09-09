@@ -1,9 +1,11 @@
+use alloc::{fmt, string::String, sync::Arc, vec::Vec};
 
-use alloc::{sync::Arc, string::String, fmt, vec::Vec};
-
+use crate::{
+    libs::{rwlock::RwLock, spinlock::SpinLock},
+    net::socket::inet::{common::PortManager, InetSocket},
+};
 use smoltcp;
 use system_error::SystemError;
-use crate::{libs::{rwlock::RwLock, spinlock::SpinLock}, net::socket::inet::{common::PortManager, InetSocket}};
 
 mod dma;
 pub mod e1000e;
@@ -17,7 +19,7 @@ pub trait Iface: crate::driver::base::device::Device {
     /// 获取网卡的公共信息
     fn common(&self) -> &IfaceCommon;
 
-    /// # `mac` 
+    /// # `mac`
     /// 获取网卡的MAC地址
     fn mac(&self) -> smoltcp::wire::EthernetAddress;
 
@@ -25,13 +27,13 @@ pub trait Iface: crate::driver::base::device::Device {
     /// 获取网卡名
     fn name(&self) -> String;
 
-    /// # `nic_id` 
+    /// # `nic_id`
     /// 获取网卡id
     fn nic_id(&self) -> usize {
         self.common().iface_id
     }
 
-    /// # `poll` 
+    /// # `poll`
     /// 用于轮询接口的状态。
     /// ## 参数
     /// - `sockets` ：一个可变引用到 `smoltcp::iface::SocketSet`，表示要轮询的套接字集
@@ -40,7 +42,7 @@ pub trait Iface: crate::driver::base::device::Device {
     /// - 如果轮询失败，返回 `Err(SystemError::EAGAIN_OR_EWOULDBLOCK)`，表示需要再次尝试或者操作会阻塞
     fn poll(&self);
 
-    /// # `update_ip_addrs` 
+    /// # `update_ip_addrs`
     /// 用于更新接口的 IP 地址
     /// ## 参数
     /// - `ip_addrs` ：一个包含 `smoltcp::wire::IpCidr` 的切片，表示要设置的 IP 地址和子网掩码
@@ -76,7 +78,7 @@ pub struct IfaceCommon {
     /// 存smoltcp网卡的套接字集
     sockets: SpinLock<smoltcp::iface::SocketSet<'static>>,
     /// 存 kernel wrap smoltcp socket 的集合
-    bounds: RwLock<Vec<Arc<InetSocket>>>,
+    bounds: RwLock<Vec<Arc<dyn InetSocket>>>,
     /// 端口管理器
     port_manager: PortManager,
     /// 下次轮询的时间
@@ -182,7 +184,7 @@ impl IfaceCommon {
     }
 
     // 需要bounds储存具体的Inet Socket信息，以提供不同种类inet socket的事件分发
-    pub fn bind_socket(&self, socket: Arc<InetSocket>) {
+    pub fn bind_socket(&self, socket: Arc<dyn InetSocket>) {
         self.bounds.write().push(socket);
     }
 }

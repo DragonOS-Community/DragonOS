@@ -1,3 +1,7 @@
+//! # 网络模块
+//! 注意，net模块下，为了方便导入，模块细分，且共用部分模块直接使用
+//! `pub use`导出，导入时也常见`use crate::net::socket::*`的写法，
+//! 敬请注意。
 use core::{
     fmt::{self, Debug},
     sync::atomic::AtomicUsize,

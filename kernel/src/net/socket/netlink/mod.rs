@@ -11,9 +11,9 @@ policy.c
 */
 // Top-level module defining the public API for Netlink
 pub mod af_netlink;
-pub mod skbuff;
-pub mod netlink_proto;
-pub mod netlink;
 pub mod callback;
-pub mod sock;
 pub mod endpoint;
+pub mod netlink;
+pub mod netlink_proto;
+pub mod skbuff;
+pub mod sock;

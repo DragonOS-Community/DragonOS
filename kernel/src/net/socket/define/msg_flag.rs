@@ -99,12 +99,12 @@ bitflags::bitflags! {
         const FASTOPEN      = 0x2000_0000;
         /// `MSG_CMSG_CLOEXEC`
         const CMSG_CLOEXEC  = 0x4000_0000;
-        /// `MSG_CMSG_COMPAT` 
+        /// `MSG_CMSG_COMPAT`
         // if define CONFIG_COMPAT
         // const CMSG_COMPAT   = 0x8000_0000;
         const CMSG_COMPAT   = 0;
         /// `MSG_INTERNAL_SENDMSG_FLAGS`
-        const INTERNAL_SENDMSG_FLAGS 
+        const INTERNAL_SENDMSG_FLAGS
             = Self::SPLICE_PAGES.bits | Self::SENDPAGE_NOPOLICY.bits | Self::SENDPAGE_DECRYPTED.bits;
     }
 }

@@ -105,7 +105,8 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
     ];
     mfence();
     let pid = ProcessManager::current_pcb().pid();
-    let mut show = (syscall_num != SYS_SCHED) && (pid.data() >= 7);
+    // let mut show = (syscall_num != SYS_SCHED) && (pid.data() >= 7);
+    let mut show = true;
     // false;
 
     let to_print = SysCall::try_from(syscall_num);
@@ -123,7 +124,7 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
                 show &= true;
             }
             _ => {
-                show &= false;
+                show &= true;
             }
         }
         if show {

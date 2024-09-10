@@ -17,7 +17,7 @@ impl Buffer {
         Arc::new(Self {
             metadata: Metadata::default(),
             read_buffer: SpinLock::new(Vec::new()),
-            write_buffer: SpinLock::new(Vec::new())
+            write_buffer: SpinLock::new(Vec::new()),
         })
     }
 
@@ -52,7 +52,6 @@ impl Buffer {
 
         Ok(len)
     }
-
 }
 
 #[derive(Debug)]
@@ -65,10 +64,9 @@ pub struct Metadata {
 
 impl Default for Metadata {
     fn default() -> Self {
-        Self { 
-            metadata_buf_size: 1024, 
-            buf_size: 64 * 1024, 
+        Self {
+            metadata_buf_size: 1024,
+            buf_size: 64 * 1024,
         }
     }
 }
-

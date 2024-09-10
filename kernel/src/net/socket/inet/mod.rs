@@ -1,16 +1,16 @@
-use system_error::SystemError::{self, *};
-use smoltcp;
 use alloc::sync::Arc;
+use smoltcp;
+use system_error::SystemError::{self, *};
 
 // pub mod raw;
 // pub mod icmp;
+pub mod common;
 pub mod datagram;
 pub mod stream;
-pub mod common;
 pub mod syscall;
 
-pub use common::Types;
 pub use common::BoundInner;
+pub use common::Types;
 // pub use raw::RawSocket;
 pub use datagram::UdpSocket;
 pub use stream::TcpSocket;
@@ -20,32 +20,38 @@ use crate::filesystem::vfs::IndexNode;
 
 use super::Socket;
 
-pub trait AnyInetSocket {
-    fn epoll_items(&self) -> &super::common::poll_unit::EPollItems;
-    fn wait_queue(&self) -> &super::common::poll_unit::WaitQueue;
-    /// `on_iface_events` 
+use smoltcp::wire::*;
+/// A local endpoint, which indicates that the local endpoint is unspecified.
+///
+/// According to the Linux man pages and the Linux implementation, `getsockname()` will _not_ fail
+/// even if the socket is unbound. Instead, it will return an unspecified socket address. This
+/// unspecified endpoint helps with that.
+const UNSPECIFIED_LOCAL_ENDPOINT: IpEndpoint =
+    IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), 0);
+
+pub trait InetSocket: Socket {
+    /// `on_iface_events`
     /// 通知socket发生的事件
     fn on_iface_events(&self);
-    fn do_bind(&self, endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError>;
 }
 
-#[derive(Debug)]
-pub enum InetSocket {
-    // Raw(RawSocket),
-    Udp(UdpSocket),
-    Tcp(TcpSocket),
-}
+// #[derive(Debug)]
+// pub enum InetSocket {
+//     // Raw(RawSocket),
+//     Udp(UdpSocket),
+//     Tcp(TcpSocket),
+// }
 
-impl InetSocket {
-    /// # `on_iface_events`
-    /// 通知socket发生了事件
-    pub fn on_iface_events(&self) {
-        todo!()
-    }
-}
+// impl InetSocket {
+//     /// # `on_iface_events`
+//     /// 通知socket发生了事件
+//     pub fn on_iface_events(&self) {
+//         todo!()
+//     }
+// }
 
 // impl IndexNode for InetSocket {
-    
+
 // }
 
 // impl Socket for InetSocket {

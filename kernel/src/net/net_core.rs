@@ -13,9 +13,7 @@ use crate::{
 
 use super::{
     event_poll::{EPollEventType, EventPoll},
-    socket::{
-        inet::TcpSocket, netlink::skbuff::SkBuff
-    },
+    socket::{inet::TcpSocket, netlink::skbuff::SkBuff},
 };
 
 /// The network poll function, which will be called by timer.
@@ -36,7 +34,7 @@ impl TimerFunction for NetWorkPollFunc {
 }
 
 pub fn net_init() -> Result<(), SystemError> {
-    dhcp_query()?;
+    // dhcp_query()?;
     // Init poll timer function
     // let next_time = next_n_ms_timer_jiffies(5);
     // let timer = Timer::new(Box::new(NetWorkPollFunc), next_time);
@@ -46,7 +44,7 @@ pub fn net_init() -> Result<(), SystemError> {
 
 fn dhcp_query() -> Result<(), SystemError> {
     let binding = NET_DEVICES.write_irqsave();
-
+    log::debug!("binding: {:?}", *binding);
     //由于现在os未实现在用户态为网卡动态分配内存，而lo网卡的id最先分配且ip固定不能被分配
     //所以特判取用id为1的网卡（也就是virto_net）
     let net_face = binding.get(&1).ok_or(SystemError::ENODEV)?.clone();
@@ -62,7 +60,7 @@ fn dhcp_query() -> Result<(), SystemError> {
     // IMPORTANT: This should be removed in production.
     dhcp_socket.set_max_lease_duration(Some(smoltcp::time::Duration::from_secs(10)));
 
-    let sockets = || { net_face.sockets().lock_irqsave() };
+    let sockets = || net_face.sockets().lock_irqsave();
 
     // let dhcp_handle = SOCKET_SET.lock_irqsave().add(dhcp_socket);
     let dhcp_handle = sockets().add(dhcp_socket);

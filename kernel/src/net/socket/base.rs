@@ -1,3 +1,4 @@
+
 #![allow(unused_variables)]
 
 use core::any::Any;
@@ -14,10 +15,9 @@ pub trait Socket: Sync + Send + Debug + Any{
     /// # `wait_queue`
     /// 获取socket的wait queue
     fn wait_queue(&self) -> WaitQueue;
-    
-    /// # `update_io_events`
-    /// 更新socket的事件。
-    fn update_io_events(&self) -> Result<EPollEventType, SystemError>;
+    /// # `socket_poll`
+    /// 获取socket的事件。
+    fn poll(&self) -> usize;
 
     /// # `accept`
     /// 接受连接，仅用于listening stream socket

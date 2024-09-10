@@ -1,5 +1,5 @@
-pub mod shutdown;
 pub mod poll_unit;
+pub mod shutdown;
 
 #[allow(dead_code)]
 pub use shutdown::Shutdown;

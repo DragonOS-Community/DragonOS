@@ -1,7 +1,11 @@
 use hashbrown::HashMap;
 use system_error::SystemError;
 
-use crate::{arch::rand::rand, libs::spinlock::SpinLock, process::{Pid, ProcessManager}};
+use crate::{
+    arch::rand::rand,
+    libs::spinlock::SpinLock,
+    process::{Pid, ProcessManager},
+};
 
 use super::Types::{self, *};
 
@@ -80,15 +84,15 @@ impl PortManager {
                         return Err(SystemError::EADDRINUSE);
                     }
                     guard.insert(port, ProcessManager::current_pid());
-                },
+                }
                 Tcp => {
                     let mut guard = self.tcp_port_table.lock();
                     if guard.get(&port).is_some() {
                         return Err(SystemError::EADDRINUSE);
                     }
                     guard.insert(port, ProcessManager::current_pid());
-                },
-                _ => {},
+                }
+                _ => {}
             };
         }
         return Ok(());
@@ -98,8 +102,12 @@ impl PortManager {
     /// should call this function when socket is closed or aborted
     pub fn unbind_port(&self, socket_type: Types, port: u16) {
         match socket_type {
-            Udp => {self.udp_port_table.lock().remove(&port);},
-            Tcp => {self.tcp_port_table.lock().remove(&port);},
+            Udp => {
+                self.udp_port_table.lock().remove(&port);
+            }
+            Tcp => {
+                self.tcp_port_table.lock().remove(&port);
+            }
             _ => {}
         };
     }

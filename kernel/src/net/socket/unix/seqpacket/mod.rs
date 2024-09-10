@@ -103,7 +103,9 @@ impl Socket for SeqpacketSocket{
             // ***错误处理
                 Err(_) => todo!(),
             },
-            Inner::Init(_) => return Err(SystemError::EINVAL),
+            Inner::Init(_) => {
+                log::debug!("init einval");
+                return Err(SystemError::EINVAL)},
             Inner::Connected(_) => return Err(SystemError::EISCONN),
         };
 
@@ -287,50 +289,54 @@ impl Socket for SeqpacketSocket{
         self.send(buffer, crate::net::socket::MessageFlag::empty())
     }
     
-    fn update_io_events(&self) -> Result<crate::net::socket::EPollEventType, SystemError> {
-        // 参考linux的unix_poll https://code.dragonos.org.cn/xref/linux-6.1.9/net/unix/af_unix.c#3152
-        todo!()
-        // let mut mask = EP::empty();
-        // let shutdown = self.shutdown.get();
+    // fn update_io_events(&self) -> Result<crate::net::socket::EPollEventType, SystemError> {
+    //     // 参考linux的unix_poll https://code.dragonos.org.cn/xref/linux-6.1.9/net/unix/af_unix.c#3152
+    //     todo!()
+    //     // let mut mask = EP::empty();
+    //     // let shutdown = self.shutdown.get();
         
-        // // todo:socket_poll_wait?注册socket
-        // if shutdown.is_both_shutdown(){
-        //     mask |= EP::EPOLLHUP;
-        // }
+    //     // // todo:socket_poll_wait?注册socket
+    //     // if shutdown.is_both_shutdown(){
+    //     //     mask |= EP::EPOLLHUP;
+    //     // }
 
-        // if shutdown.is_recv_shutdown(){
-        //     mask |= EP::EPOLLRDHUP | EP::EPOLLIN | EP::EPOLLRDNORM;
-        // }
-        // match &*self.state.read(){
-        //     State::Connected(connected) => {
-        //         if connected.can_recv(){
-        //             mask |= EP::EPOLLIN | EP::EPOLLRDNORM;
-        //         }
-        //         // if (sk_is_readable(sk))
-        //         // mask |= EPOLLIN | EPOLLRDNORM;
+    //     // if shutdown.is_recv_shutdown(){
+    //     //     mask |= EP::EPOLLRDHUP | EP::EPOLLIN | EP::EPOLLRDNORM;
+    //     // }
+    //     // match &*self.state.read(){
+    //     //     State::Connected(connected) => {
+    //     //         if connected.can_recv(){
+    //     //             mask |= EP::EPOLLIN | EP::EPOLLRDNORM;
+    //     //         }
+    //     //         // if (sk_is_readable(sk))
+    //     //         // mask |= EPOLLIN | EPOLLRDNORM;
 
-        //         // TODO:处理紧急情况 EPOLLPRI
-        //         // TODO:处理连接是否关闭 EPOLLHUP
-        //         if !shutdown.is_send_shutdown() {
-        //             if connected.can_send() {
-        //                 mask |= EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND;
-        //             } else {
-        //                 todo!("TcpSocket::poll: buffer space not enough");
-        //             }
-        //         } else {
-        //             mask |= EP::EPOLLOUT | EP::EPOLLWRNORM;
-        //         }
-        //     },
-        //     _ =>return Err(SystemError::EINVAL),
-        // }
-        // return Ok(mask)
-    }
+    //     //         // TODO:处理紧急情况 EPOLLPRI
+    //     //         // TODO:处理连接是否关闭 EPOLLHUP
+    //     //         if !shutdown.is_send_shutdown() {
+    //     //             if connected.can_send() {
+    //     //                 mask |= EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND;
+    //     //             } else {
+    //     //                 todo!("TcpSocket::poll: buffer space not enough");
+    //     //             }
+    //     //         } else {
+    //     //             mask |= EP::EPOLLOUT | EP::EPOLLWRNORM;
+    //     //         }
+    //     //     },
+    //     //     _ =>return Err(SystemError::EINVAL),
+    //     // }
+    //     // return Ok(mask)
+    // }
     
     fn send_buffer_size(&self) -> usize {
         todo!()
     }
     
     fn recv_buffer_size(&self) -> usize {
+        todo!()
+    }
+    
+    fn poll(&self) -> usize {
         todo!()
     }
     

@@ -115,6 +115,15 @@ impl Connected{
         (this,peer)
     }
 
+
+    pub fn set_peer_inode(&mut self,peer_epoint:Option<Endpoint>){
+        self.peer_inode=peer_epoint;
+    }
+
+    pub fn set_inode(&mut self,epoint:Option<Endpoint>){
+        self.inode=epoint;
+    }
+
     pub fn endpoint(&self) ->Option<&Endpoint> {
         self.inode.as_ref()
     }

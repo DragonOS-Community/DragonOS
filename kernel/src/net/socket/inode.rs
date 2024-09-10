@@ -1,6 +1,6 @@
+use crate::filesystem::vfs::IndexNode;
 use alloc::sync::Arc;
 use system_error::SystemError;
-use crate::filesystem::vfs::IndexNode;
 
 use crate::net::socket::*;
 
@@ -32,7 +32,6 @@ impl IndexNode for Inode {
         self.inner.write(buf)
     }
 
-    
     /* Following are not yet available in socket */
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
@@ -47,36 +46,114 @@ impl IndexNode for Inode {
         unimplemented!()
     }
 
-    fn poll(&self, private_data: &crate::filesystem::vfs::FilePrivateData) -> Result<usize, SystemError> {
+    fn poll(
+        &self,
+        private_data: &crate::filesystem::vfs::FilePrivateData,
+    ) -> Result<usize, SystemError> {
         drop(private_data);
-        self.update_io_events().map(|event| event.bits() as usize)
+        Ok(self.inner.poll())
     }
 }
 
 use super::common::poll_unit::WaitQueue;
 
-impl Socket for Inode {
-
-    fn wait_queue(&self) -> WaitQueue {
+impl Inode {
+    pub fn wait_queue(&self) -> WaitQueue {
         self.inner.wait_queue()
     }
 
-    fn update_io_events(&self) -> Result<crate::net::event_poll::EPollEventType, SystemError> {
-        self.inner.update_io_events()
-    }
-
-    fn send_buffer_size(&self) -> usize {
+    pub fn send_buffer_size(&self) -> usize {
         self.inner.send_buffer_size()
     }
 
-    fn recv_buffer_size(&self) -> usize {
+    pub fn recv_buffer_size(&self) -> usize {
         self.inner.recv_buffer_size()
     }
-}
 
-impl Inode {
-    pub fn new(socket: Arc<dyn Socket>) -> Arc<Self>{
-        return Arc::new(Self{inner: socket.clone()});
+    pub fn accept(&self) -> Result<(Arc<Self>, Endpoint), SystemError> {
+        self.inner.accept()
+    }
+
+    pub fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
+        self.inner.bind(endpoint)
+    }
+
+    pub fn set_option(
+        &self,
+        level: OptionsLevel,
+        name: usize,
+        value: &[u8],
+    ) -> Result<(), SystemError> {
+        self.inner.set_option(level, name, value)
+    }
+
+    pub fn get_option(
+        &self,
+        level: OptionsLevel,
+        name: usize,
+        value: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        self.inner.get_option(level, name, value)
+    }
+
+    pub fn listen(&self, backlog: usize) -> Result<(), SystemError> {
+        self.inner.listen(backlog)
+    }
+
+    pub fn send_to(
+        &self,
+        buffer: &[u8],
+        address: Endpoint,
+        flags: MessageFlag,
+    ) -> Result<usize, SystemError> {
+        self.inner.send_to(buffer, flags, address)
+    }
+
+    pub fn send(&self, buffer: &[u8], flags: MessageFlag) -> Result<usize, SystemError> {
+        self.inner.send(buffer, flags)
+    }
+
+    pub fn recv(&self, buffer: &mut [u8], flags: MessageFlag) -> Result<usize, SystemError> {
+        self.inner.recv(buffer, flags)
+    }
+
+    // TODO receive from split with endpoint or not
+    pub fn recv_from(
+        &self,
+        buffer: &mut [u8],
+        flags: MessageFlag,
+        address: Option<Endpoint>,
+    ) -> Result<(usize, Endpoint), SystemError> {
+        self.inner.recv_from(buffer, flags, address)
+    }
+
+    pub fn shutdown(&self, how: ShutdownTemp) -> Result<(), SystemError> {
+        self.inner.shutdown(how)
+    }
+
+    pub fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
+        self.inner.connect(endpoint)
+    }
+
+    pub fn get_name(&self) -> Result<Endpoint, SystemError> {
+        self.inner.get_name()
+    }
+
+    pub fn get_peer_name(&self) -> Result<Endpoint, SystemError> {
+        self.inner.get_peer_name()
+    }
+
+    pub fn new(inner: Arc<dyn Socket>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            epoll_items: EPollItems::default(),
+        })
+    }
+
+    /// # `epoll_items`
+    /// socket的epoll事件集
+    pub fn epoll_items(&self) -> EPollItems {
+        self.epoll_items.clone()
     }
 
     pub fn set_nonblock(&self, nonblock: bool) {

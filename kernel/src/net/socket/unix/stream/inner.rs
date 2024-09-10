@@ -8,7 +8,6 @@ use crate::net::socket::{Endpoint, ShutdownTemp};
 
 use alloc::collections::VecDeque;
 
-
 #[derive(Debug)]
 pub enum Inner {
     Init(Init),
@@ -63,13 +62,12 @@ impl Connected {
     }
 
     pub fn shutdown(&self, how: ShutdownTemp) -> Result<(), SystemError> {
-
         if how.is_empty() {
             return Err(SystemError::EINVAL);
         } else if how.is_send_shutdown() {
             unimplemented!("unimplemented!");
         } else if how.is_recv_shutdown() {
-            unimplemented!("unimplemented!");            
+            unimplemented!("unimplemented!");
         }
 
         Ok(())
@@ -122,4 +120,3 @@ impl Listener {
         self.addr.clone()
     }
 }
-

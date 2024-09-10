@@ -19,8 +19,8 @@ use crate::{
     syscall::Syscall,
 };
 
-use super::socket::{self, Socket, Endpoint};
 use super::socket::AddressFamily as AF;
+use super::socket::{self, Endpoint, Socket};
 
 pub use super::syscall_util::*;
 
@@ -40,7 +40,12 @@ impl Syscall {
         protocol: usize,
     ) -> Result<usize, SystemError> {
         // 打印收到的参数
-        log::debug!("socket: address_family={:?}, socket_type={:?}, protocol={:?}", address_family, socket_type, protocol);
+        log::debug!(
+            "socket: address_family={:?}, socket_type={:?}, protocol={:?}",
+            address_family,
+            socket_type,
+            protocol
+        );
         let address_family = socket::AddressFamily::try_from(address_family as u16)?;
         let type_arg = SysArgSocketType::from_bits_truncate(socket_type as u32);
         let is_nonblock = type_arg.is_nonblock();
@@ -48,10 +53,10 @@ impl Syscall {
         let stype = socket::Type::try_from(type_arg)?;
 
         let inode = socket::create_socket(
-            address_family, 
-            stype, 
-            protocol as u32, 
-            is_nonblock, 
+            address_family,
+            stype,
+            protocol as u32,
+            is_nonblock,
             is_close_on_exec,
         )?;
 
@@ -59,7 +64,8 @@ impl Syscall {
         // 把socket添加到当前进程的文件描述符表中
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
-        let fd: Result<usize, SystemError> = fd_table_guard.alloc_fd(file, None).map(|x| x as usize);
+        let fd: Result<usize, SystemError> =
+            fd_table_guard.alloc_fd(file, None).map(|x| x as usize);
         drop(fd_table_guard);
         return fd;
     }
@@ -92,17 +98,17 @@ impl Syscall {
         // 创建一对socket
         let inode0 = socket::create_socket(
             address_family,
-            stype, 
-            protocol as u32, 
-            socket_type.is_nonblock(), 
-            socket_type.is_cloexec()
+            stype,
+            protocol as u32,
+            socket_type.is_nonblock(),
+            socket_type.is_cloexec(),
         )?;
         let inode1 = socket::create_socket(
-            address_family, 
-            stype, 
-            protocol as u32, 
-            socket_type.is_nonblock(), 
-            socket_type.is_cloexec()
+            address_family,
+            stype,
+            protocol as u32,
+            socket_type.is_nonblock(),
+            socket_type.is_cloexec(),
         )?;
 
         // 进行pair
@@ -163,11 +169,10 @@ impl Syscall {
 
         let level = socket::OptionsLevel::try_from(level as u32)?;
 
-        use socket::OptionsLevel as SOL;
         use socket::Options as SO;
+        use socket::OptionsLevel as SOL;
         if matches!(level, SOL::SOCKET) {
-            let optname = SO::try_from(optname as u32)
-                .map_err(|_| ENOPROTOOPT)?;
+            let optname = SO::try_from(optname as u32).map_err(|_| ENOPROTOOPT)?;
             match optname {
                 SO::SNDBUF => {
                     // 返回发送缓冲区大小
@@ -199,8 +204,8 @@ impl Syscall {
         // protocol number of TCP.
 
         if matches!(level, SOL::TCP) {
-            let optname = PosixTcpSocketOptions::try_from(optname as i32)
-                .map_err(|_| ENOPROTOOPT)?;
+            let optname =
+                PosixTcpSocketOptions::try_from(optname as i32).map_err(|_| ENOPROTOOPT)?;
             match optname {
                 PosixTcpSocketOptions::Congestion => return Ok(0),
                 _ => {
@@ -236,7 +241,12 @@ impl Syscall {
     /// @return 成功返回0，失败返回错误码
     pub fn bind(fd: usize, addr: *const SockAddr, addrlen: u32) -> Result<usize, SystemError> {
         // 打印收到的参数
-        log::debug!("bind: fd={:?}, family={:?}, addrlen={:?}", fd, (unsafe{addr.as_ref().unwrap().family}), addrlen);
+        log::debug!(
+            "bind: fd={:?}, family={:?}, addrlen={:?}",
+            fd,
+            (unsafe { addr.as_ref().unwrap().family }),
+            addrlen
+        );
         let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
@@ -280,9 +290,9 @@ impl Syscall {
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        
+
         if let Some(endpoint) = endpoint {
-            return socket.send_to(buf, flags, endpoint);
+            return socket.send_to(buf, endpoint, flags);
         } else {
             return socket.send(buf, flags);
         }
@@ -312,7 +322,10 @@ impl Syscall {
         let address = if addr.is_null() {
             None
         } else {
-            Some(SockAddr::to_endpoint(addr, unsafe{ addrlen.as_ref() }.ok_or(EINVAL)?.clone())?)
+            Some(SockAddr::to_endpoint(
+                addr,
+                unsafe { addrlen.as_ref() }.ok_or(EINVAL)?.clone(),
+            )?)
         };
 
         let (n, endpoint) = socket.recv_from(buf, flags, address)?;

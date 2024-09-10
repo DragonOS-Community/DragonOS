@@ -1,8 +1,8 @@
-use alloc::sync::Arc;
 use crate::net::socket;
+use alloc::sync::Arc;
 
-pub use socket::netlink::endpoint::NetlinkEndpoint;
 pub use smoltcp::wire::IpEndpoint;
+pub use socket::netlink::endpoint::NetlinkEndpoint;
 
 #[derive(Debug, Clone)]
 pub enum Endpoint {

@@ -33,9 +33,16 @@ impl SysArgSocketType {
 
 use core::ffi::CStr;
 
-use system_error::SystemError::{self, *};
-use crate::{filesystem::vfs::{file::FileMode, FileType}, libs::casting::DowncastArc, mm::{verify_area, VirtAddr}, net::socket::{self, *}, process::ProcessManager, syscall::Syscall};
+use crate::{
+    filesystem::vfs::{file::FileMode, FileType},
+    libs::casting::DowncastArc,
+    mm::{verify_area, VirtAddr},
+    net::socket::{self, *},
+    process::ProcessManager,
+    syscall::Syscall,
+};
 use smoltcp;
+use system_error::SystemError::{self, *};
 
 // 参考资料： https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/netinet_in.h.html#tag_13_32
 #[repr(C)]
@@ -145,7 +152,7 @@ impl SockAddr {
                 AddressFamily::Netlink => {
                     // TODO: support netlink socket
                     let addr: SockAddrNl = addr.addr_nl;
-                    return Ok(Endpoint::Netlink(NetlinkEndpoint::new(addr,len as usize)));
+                    return Ok(Endpoint::Netlink(NetlinkEndpoint::new(addr, len as usize)));
                 }
                 _ => {
                     return Err(SystemError::EINVAL);
@@ -162,7 +169,8 @@ impl SockAddr {
             AddressFamily::Netlink => Ok(core::mem::size_of::<SockAddrNl>()),
             AddressFamily::Unix => Err(SystemError::EINVAL),
             _ => Err(SystemError::EINVAL),
-        }.map(|x| x as u32)
+        }
+        .map(|x| x as u32)
     }
 
     /// @brief 把SockAddr的数据写入用户空间
@@ -210,23 +218,21 @@ impl SockAddr {
 impl From<Endpoint> for SockAddr {
     fn from(value: Endpoint) -> Self {
         match value {
-            Endpoint::Ip(ip_endpoint) => {
-                match ip_endpoint.addr {
-                    smoltcp::wire::IpAddress::Ipv4(ipv4_addr) => {
-                        let addr_in = SockAddrIn {
-                            sin_family: AddressFamily::INet as u16,
-                            sin_port: ip_endpoint.port.to_be(),
-                            sin_addr: u32::from_be_bytes(ipv4_addr.0).to_be(),
-                            sin_zero: [0; 8],
-                        };
+            Endpoint::Ip(ip_endpoint) => match ip_endpoint.addr {
+                smoltcp::wire::IpAddress::Ipv4(ipv4_addr) => {
+                    let addr_in = SockAddrIn {
+                        sin_family: AddressFamily::INet as u16,
+                        sin_port: ip_endpoint.port.to_be(),
+                        sin_addr: u32::from_be_bytes(ipv4_addr.0).to_be(),
+                        sin_zero: [0; 8],
+                    };
 
-                        return SockAddr { addr_in };
-                    }
-                    _ => {
-                        unimplemented!("not support ipv6");
-                    }
+                    return SockAddr { addr_in };
                 }
-            }
+                _ => {
+                    unimplemented!("not support ipv6");
+                }
+            },
 
             Endpoint::LinkLayer(link_endpoint) => {
                 let addr_ll = SockAddrLl {

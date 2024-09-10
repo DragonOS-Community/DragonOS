@@ -50,6 +50,7 @@ use crate::{
         ucontext::AddressSpace,
         VirtAddr,
     },
+    net::socket::Inode as SocketInode,
     // net::socket::SocketInode,
     sched::completion::Completion,
     sched::{
@@ -62,7 +63,6 @@ use crate::{
         kick_cpu,
     },
     syscall::{user_access::clear_user, Syscall},
-    net::socket::Inode as SocketInode,
 };
 use timer::AlarmTimer;
 

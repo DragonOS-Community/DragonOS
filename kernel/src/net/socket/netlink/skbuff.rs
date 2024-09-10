@@ -1,9 +1,8 @@
-use alloc::{boxed::Box, sync::Arc};
-use crate::libs::{mutex::Mutex, rwlock::RwLock};
 use super::af_netlink::{NetlinkSock, NetlinkSocket};
+use crate::libs::{mutex::Mutex, rwlock::RwLock};
+use alloc::{boxed::Box, sync::Arc};
 // 曾用方案：在 smoltcp::PacketBuffer 的基础上封装了一层，用于处理 netlink 协议中网络数据包(skb)的相关操作
-#[derive(Debug)]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SkBuff {
     pub sk: Arc<Mutex<Box<dyn NetlinkSocket>>>,
     pub len: u32,
@@ -102,13 +101,8 @@ pub fn skb_orphan(skb: &Arc<RwLock<SkBuff>>) {
     // TODO: Implementation of the function
 }
 
-fn skb_recv_datagram(){
+fn skb_recv_datagram() {}
 
-}
+fn skb_try_recv_datagram() {}
 
-fn skb_try_recv_datagram(){
-}
-
-fn skb_try_recv_from_queue(){
-
-}
+fn skb_try_recv_from_queue() {}

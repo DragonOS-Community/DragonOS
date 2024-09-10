@@ -1,6 +1,5 @@
 use core::sync::atomic::AtomicU8;
 
-
 bitflags! {
     /// @brief 用于指定socket的关闭类型
     /// 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/include/net/sock.h?fi=SHUTDOWN_MASK#1573
@@ -17,7 +16,7 @@ const SHUTDOWN_MASK: u8 = 0x03;
 
 #[derive(Debug, Default)]
 pub struct Shutdown {
-    bit: AtomicU8
+    bit: AtomicU8,
 }
 
 impl From<ShutdownBit> for Shutdown {
@@ -45,11 +44,13 @@ impl Shutdown {
     }
 
     pub fn recv_shutdown(&self) {
-        self.bit.fetch_or(RCV_SHUTDOWN, core::sync::atomic::Ordering::SeqCst);
+        self.bit
+            .fetch_or(RCV_SHUTDOWN, core::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn send_shutdown(&self) {
-        self.bit.fetch_or(SEND_SHUTDOWN, core::sync::atomic::Ordering::SeqCst);
+        self.bit
+            .fetch_or(SEND_SHUTDOWN, core::sync::atomic::Ordering::SeqCst);
     }
 
     // pub fn is_recv_shutdown(&self) -> bool {
@@ -101,27 +102,17 @@ impl ShutdownTemp {
     }
 
     pub fn from_how(how: usize) -> Self {
-        Self {
-            bit: how as u8 + 1,
-        }
+        Self { bit: how as u8 + 1 }
     }
 }
 
 impl From<ShutdownBit> for ShutdownTemp {
     fn from(shutdown_bit: ShutdownBit) -> Self {
         match shutdown_bit {
-            ShutdownBit::SHUT_RD => Self {
-                bit: RCV_SHUTDOWN,
-            },
-            ShutdownBit::SHUT_WR => Self {
-                bit: SEND_SHUTDOWN,
-            },
-            ShutdownBit::SHUT_RDWR => Self {
-                bit: SHUTDOWN_MASK,
-            },
-            _ => Self {
-                bit: 0,
-            },
+            ShutdownBit::SHUT_RD => Self { bit: RCV_SHUTDOWN },
+            ShutdownBit::SHUT_WR => Self { bit: SEND_SHUTDOWN },
+            ShutdownBit::SHUT_RDWR => Self { bit: SHUTDOWN_MASK },
+            _ => Self { bit: 0 },
         }
     }
 }

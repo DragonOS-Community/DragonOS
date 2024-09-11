@@ -14,9 +14,10 @@ use crate::{
         base::{
             class::Class,
             device::{
-                bus::Bus, device_manager, driver::Driver, Device, DeviceState, DeviceType, IdTable,
+                bus::Bus, device_manager, driver::Driver, Device, DeviceCommonData, DeviceState,
+                DeviceType, IdTable,
             },
-            kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+            kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
             platform::{
                 platform_device::{platform_device_manager, PlatformDevice},
@@ -35,7 +36,7 @@ use crate::{
     libs::{
         once::Once,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
-        spinlock::SpinLock,
+        spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{early_ioremap::EarlyIoRemap, PhysAddr, VirtAddr},
 };
@@ -86,13 +87,8 @@ impl VesaFb {
         fb_info_data.pesudo_palette.resize(256, 0);
         return Self {
             inner: SpinLock::new(InnerVesaFb {
-                bus: None,
-                class: None,
-                driver: None,
-                kern_inode: None,
-                parent: None,
-                kset: None,
-                kobj_type: None,
+                kobject_common: KObjectCommonData::default(),
+                device_common: DeviceCommonData::default(),
                 device_state: DeviceState::NotInitialized,
                 pdev_id: 0,
                 pdev_id_auto: false,
@@ -104,17 +100,16 @@ impl VesaFb {
             fb_data: RwLock::new(fb_info_data),
         };
     }
+
+    fn inner(&self) -> SpinLockGuard<InnerVesaFb> {
+        self.inner.lock()
+    }
 }
 
 #[derive(Debug)]
 struct InnerVesaFb {
-    bus: Option<Weak<dyn Bus>>,
-    class: Option<Weak<dyn Class>>,
-    driver: Option<Weak<dyn Driver>>,
-    kern_inode: Option<Arc<KernFSInode>>,
-    parent: Option<Weak<dyn KObject>>,
-    kset: Option<Arc<KSet>>,
-    kobj_type: Option<&'static dyn KObjType>,
+    kobject_common: KObjectCommonData,
+    device_common: DeviceCommonData,
     device_state: DeviceState,
     pdev_id: i32,
     pdev_id_auto: bool,
@@ -165,35 +160,35 @@ impl Device for VesaFb {
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {
-        self.inner.lock().bus.clone()
+        self.inner().device_common.bus.clone()
     }
 
     fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
-        self.inner.lock().bus = bus;
+        self.inner().device_common.bus = bus;
     }
 
     fn set_class(&self, class: Option<Weak<dyn Class>>) {
-        self.inner.lock().class = class;
+        self.inner().device_common.class = class;
     }
 
     fn class(&self) -> Option<Arc<dyn Class>> {
-        let mut guard = self.inner.lock();
+        let mut guard = self.inner();
 
-        let r = guard.class.clone()?.upgrade();
+        let r = guard.device_common.class.clone()?.upgrade();
         if r.is_none() {
             // 为了让弱引用失效
-            guard.class = None;
+            guard.device_common.class = None;
         }
 
         return r;
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
-        self.inner.lock().driver.clone()?.upgrade()
+        self.inner().device_common.driver.clone()?.upgrade()
     }
 
     fn set_driver(&self, driver: Option<Weak<dyn Driver>>) {
-        self.inner.lock().driver = driver;
+        self.inner().device_common.driver = driver;
     }
 
     fn is_dead(&self) -> bool {
@@ -209,6 +204,14 @@ impl Device for VesaFb {
     fn state_synced(&self) -> bool {
         true
     }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        self.inner().device_common.get_parent_weak_or_clear()
+    }
+
+    fn set_dev_parent(&self, dev_parent: Option<Weak<dyn Device>>) {
+        self.inner().device_common.parent = dev_parent;
+    }
 }
 
 impl KObject for VesaFb {
@@ -217,35 +220,35 @@ impl KObject for VesaFb {
     }
 
     fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
-        self.inner.lock().kern_inode = inode;
+        self.inner().kobject_common.kern_inode = inode;
     }
 
     fn inode(&self) -> Option<Arc<KernFSInode>> {
-        self.inner.lock().kern_inode.clone()
+        self.inner().kobject_common.kern_inode.clone()
     }
 
     fn parent(&self) -> Option<Weak<dyn KObject>> {
-        self.inner.lock().parent.clone()
+        self.inner().kobject_common.parent.clone()
     }
 
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
-        self.inner.lock().parent = parent;
+        self.inner().kobject_common.parent = parent;
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {
-        self.inner.lock().kset.clone()
+        self.inner().kobject_common.kset.clone()
     }
 
     fn set_kset(&self, kset: Option<Arc<KSet>>) {
-        self.inner.lock().kset = kset;
+        self.inner().kobject_common.kset = kset;
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.inner.lock().kobj_type
+        self.inner().kobject_common.kobj_type
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
-        self.inner.lock().kobj_type = ktype;
+        self.inner().kobject_common.kobj_type = ktype;
     }
 
     fn name(&self) -> String {

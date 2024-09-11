@@ -5,17 +5,20 @@ use crate::{
     driver::{
         base::{
             class::Class,
-            device::{bus::Bus, driver::Driver, Device, DeviceType, IdTable},
-            kobject::{KObjType, KObject, KObjectState},
+            device::{bus::Bus, driver::Driver, Device, DeviceCommonData, DeviceType, IdTable},
+            kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         },
-        net::NetDevice,
+        net::{register_netdevice, NetDeivceState, NetDevice, NetDeviceCommonData, Operstate},
     },
-    libs::spinlock::SpinLock,
+    libs::{
+        rwlock::{RwLockReadGuard, RwLockWriteGuard},
+        spinlock::{SpinLock, SpinLockGuard},
+    },
     net::{generate_iface_id, NET_DEVICES},
     time::Instant,
 };
 use alloc::{
-    string::String,
+    string::{String, ToString},
     sync::{Arc, Weak},
 };
 use core::{
@@ -31,6 +34,8 @@ use smoltcp::{
 use system_error::SystemError;
 
 use super::e1000e::{E1000EBuffer, E1000EDevice};
+
+const DEVICE_NAME: &str = "e1000e";
 
 pub struct E1000ERxToken(E1000EBuffer);
 pub struct E1000ETxToken {
@@ -73,12 +78,24 @@ impl Debug for E1000EDriverWrapper {
     }
 }
 
+#[cast_to([sync] NetDevice)]
+#[cast_to([sync] Device)]
 pub struct E1000EInterface {
     driver: E1000EDriverWrapper,
     iface_id: usize,
     iface: SpinLock<smoltcp::iface::Interface>,
     name: String,
+    inner: SpinLock<InnerE1000EInterface>,
+    locked_kobj_state: LockedKObjectState,
 }
+
+#[derive(Debug)]
+pub struct InnerE1000EInterface {
+    netdevice_common: NetDeviceCommonData,
+    device_common: DeviceCommonData,
+    kobj_common: KObjectCommonData,
+}
+
 impl phy::RxToken for E1000ERxToken {
     fn consume<R, F>(mut self, f: F) -> R
     where
@@ -190,9 +207,19 @@ impl E1000EInterface {
             iface_id,
             iface: SpinLock::new(iface),
             name: format!("eth{}", iface_id),
+            inner: SpinLock::new(InnerE1000EInterface {
+                netdevice_common: NetDeviceCommonData::default(),
+                device_common: DeviceCommonData::default(),
+                kobj_common: KObjectCommonData::default(),
+            }),
+            locked_kobj_state: LockedKObjectState::default(),
         });
 
         return result;
+    }
+
+    pub fn inner(&self) -> SpinLockGuard<InnerE1000EInterface> {
+        return self.inner.lock();
     }
 }
 
@@ -208,43 +235,70 @@ impl Debug for E1000EInterface {
 
 impl Device for E1000EInterface {
     fn dev_type(&self) -> DeviceType {
-        todo!()
+        DeviceType::Net
     }
 
     fn id_table(&self) -> IdTable {
-        todo!()
+        IdTable::new(DEVICE_NAME.to_string(), None)
     }
 
-    fn set_bus(&self, _bus: Option<Weak<dyn Bus>>) {
-        todo!()
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
+        self.inner().device_common.bus.clone()
     }
 
-    fn set_class(&self, _class: Option<Weak<dyn Class>>) {
-        todo!()
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
+        self.inner().device_common.bus = bus;
+    }
+
+    fn class(&self) -> Option<Arc<dyn Class>> {
+        let mut guard = self.inner();
+        let r = guard.device_common.class.clone()?.upgrade();
+        if r.is_none() {
+            guard.device_common.class = None;
+        }
+
+        return r;
+    }
+
+    fn set_class(&self, class: Option<Weak<dyn Class>>) {
+        self.inner().device_common.class = class;
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
-        todo!()
+        let r = self.inner().device_common.driver.clone()?.upgrade();
+        if r.is_none() {
+            self.inner().device_common.driver = None;
+        }
+
+        return r;
     }
 
-    fn set_driver(&self, _driver: Option<Weak<dyn Driver>>) {
-        todo!()
+    fn set_driver(&self, driver: Option<Weak<dyn Driver>>) {
+        self.inner().device_common.driver = driver;
     }
 
     fn is_dead(&self) -> bool {
-        todo!()
+        false
     }
 
     fn can_match(&self) -> bool {
-        todo!()
+        self.inner().device_common.can_match
     }
 
-    fn set_can_match(&self, _can_match: bool) {
-        todo!()
+    fn set_can_match(&self, can_match: bool) {
+        self.inner().device_common.can_match = can_match;
     }
 
     fn state_synced(&self) -> bool {
-        todo!()
+        true
+    }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        self.inner().device_common.get_parent_weak_or_clear()
+    }
+
+    fn set_dev_parent(&self, parent: Option<Weak<dyn Device>>) {
+        self.inner().device_common.parent = parent;
     }
 }
 
@@ -260,7 +314,7 @@ impl NetDevice for E1000EInterface {
     }
 
     #[inline]
-    fn name(&self) -> String {
+    fn iface_name(&self) -> String {
         return self.name.clone();
     }
 
@@ -295,6 +349,31 @@ impl NetDevice for E1000EInterface {
     fn inner_iface(&self) -> &SpinLock<smoltcp::iface::Interface> {
         return &self.iface;
     }
+
+    fn addr_assign_type(&self) -> u8 {
+        return self.inner().netdevice_common.addr_assign_type;
+    }
+
+    fn net_device_type(&self) -> u16 {
+        self.inner().netdevice_common.net_device_type = 1; // 以太网设备
+        return self.inner().netdevice_common.net_device_type;
+    }
+
+    fn net_state(&self) -> NetDeivceState {
+        return self.inner().netdevice_common.state;
+    }
+
+    fn set_net_state(&self, state: NetDeivceState) {
+        self.inner().netdevice_common.state |= state;
+    }
+
+    fn operstate(&self) -> Operstate {
+        return self.inner().netdevice_common.operstate;
+    }
+
+    fn set_operstate(&self, state: Operstate) {
+        self.inner().netdevice_common.operstate = state;
+    }
 }
 
 impl KObject for E1000EInterface {
@@ -302,32 +381,32 @@ impl KObject for E1000EInterface {
         self
     }
 
-    fn set_inode(&self, _inode: Option<Arc<crate::filesystem::kernfs::KernFSInode>>) {
-        todo!()
+    fn set_inode(&self, inode: Option<Arc<crate::filesystem::kernfs::KernFSInode>>) {
+        self.inner().kobj_common.kern_inode = inode;
     }
 
     fn inode(&self) -> Option<Arc<crate::filesystem::kernfs::KernFSInode>> {
-        todo!()
+        self.inner().kobj_common.kern_inode.clone()
     }
 
     fn parent(&self) -> Option<alloc::sync::Weak<dyn KObject>> {
-        todo!()
+        self.inner().kobj_common.parent.clone()
     }
 
-    fn set_parent(&self, _parent: Option<alloc::sync::Weak<dyn KObject>>) {
-        todo!()
+    fn set_parent(&self, parent: Option<alloc::sync::Weak<dyn KObject>>) {
+        self.inner().kobj_common.parent = parent;
     }
 
     fn kset(&self) -> Option<Arc<crate::driver::base::kset::KSet>> {
-        todo!()
+        self.inner().kobj_common.kset.clone()
     }
 
-    fn set_kset(&self, _kset: Option<Arc<crate::driver::base::kset::KSet>>) {
-        todo!()
+    fn set_kset(&self, kset: Option<Arc<crate::driver::base::kset::KSet>>) {
+        self.inner().kobj_common.kset = kset;
     }
 
     fn kobj_type(&self) -> Option<&'static dyn crate::driver::base::kobject::KObjType> {
-        todo!()
+        self.inner().kobj_common.kobj_type
     }
 
     fn name(&self) -> String {
@@ -335,27 +414,23 @@ impl KObject for E1000EInterface {
     }
 
     fn set_name(&self, _name: String) {
-        todo!()
+        // do nothing
     }
 
-    fn kobj_state(
-        &self,
-    ) -> crate::libs::rwlock::RwLockReadGuard<crate::driver::base::kobject::KObjectState> {
-        todo!()
+    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+        self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(
-        &self,
-    ) -> crate::libs::rwlock::RwLockWriteGuard<crate::driver::base::kobject::KObjectState> {
-        todo!()
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+        self.locked_kobj_state.write()
     }
 
-    fn set_kobj_state(&self, _state: KObjectState) {
-        todo!()
+    fn set_kobj_state(&self, state: KObjectState) {
+        *self.locked_kobj_state.write() = state;
     }
 
-    fn set_kobj_type(&self, _ktype: Option<&'static dyn KObjType>) {
-        todo!()
+    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
+        self.inner().kobj_common.kobj_type = ktype;
     }
 }
 
@@ -363,9 +438,14 @@ pub fn e1000e_driver_init(device: E1000EDevice) {
     let mac = smoltcp::wire::EthernetAddress::from_bytes(&device.mac_address());
     let driver = E1000EDriver::new(device);
     let iface = E1000EInterface::new(driver);
+    // 标识网络设备已经启动
+    iface.set_net_state(NetDeivceState::__LINK_STATE_START);
+
     // 将网卡的接口信息注册到全局的网卡接口信息表中
     NET_DEVICES
         .write_irqsave()
         .insert(iface.nic_id(), iface.clone());
     info!("e1000e driver init successfully!\tMAC: [{}]", mac);
+
+    register_netdevice(iface.clone()).expect("register lo device failed");
 }

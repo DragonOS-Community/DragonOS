@@ -20,7 +20,7 @@ fn do_probe_virtio_mmio() -> Result<(), SystemError> {
     let do_check = |node: FdtNode| -> Result<(), SystemError> {
         let mmio_transport = VirtIOMmioTransport::new(node)?;
         let device_id = mmio_transport.device_id();
-        virtio_device_init(VirtIOTransport::Mmio(mmio_transport), device_id);
+        virtio_device_init(VirtIOTransport::Mmio(mmio_transport), device_id, None);
         Ok(())
     };
 

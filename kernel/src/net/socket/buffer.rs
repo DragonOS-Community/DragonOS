@@ -1,7 +1,6 @@
 use alloc::vec::Vec;
 
 use alloc::sync::Arc;
-use log::MetadataBuilder;
 use system_error::SystemError;
 
 use crate::libs::spinlock::SpinLock;
@@ -9,16 +8,16 @@ use crate::libs::spinlock::SpinLock;
 #[derive(Debug)]
 pub struct Buffer {
     metadata: Metadata,
-    read_buffer: Arc<SpinLock<Vec<u8>>>,
-    write_buffer: Arc<SpinLock<Vec<u8>>>,
+    read_buffer: SpinLock<Vec<u8>>,
+    write_buffer: SpinLock<Vec<u8>>,
 }
 
 impl Buffer {
-    pub fn new(read_buffer: Arc<SpinLock<Vec<u8>>>, write_buffer: Arc<SpinLock<Vec<u8>>>) -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         Arc::new(Self {
             metadata: Metadata::default(),
-            read_buffer,
-            write_buffer,
+            read_buffer: SpinLock::new(Vec::new()),
+            write_buffer: SpinLock::new(Vec::new()),
         })
     }
 

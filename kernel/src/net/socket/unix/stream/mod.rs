@@ -1,6 +1,5 @@
 use alloc::sync::{Arc, Weak};
 use inner::{Connected, Init, Inner, Listener};
-use intertrait::CastFromSync;
 use system_error::SystemError;
 
 use crate::{
@@ -52,6 +51,14 @@ impl StreamSocket {
         })
     }
 
+    pub fn new_pair() -> (Arc<Self>, Arc<Self>) {
+        let (conn, peer_conn) = Connected::new_pair(None, None);
+        (
+            StreamSocket::new_connected(conn),
+            StreamSocket::new_connected(peer_conn),
+        )
+    }
+
     pub fn do_bind(&self, local_endpoint: Endpoint) -> Result<(), SystemError> {
 
         match &mut *self.inner.write() {
@@ -79,20 +86,6 @@ impl StreamSocket {
         };
         return Ok(());
     }
-
-    pub fn do_accept(&self) -> Result<(Arc<StreamSocket>, Endpoint), SystemError> {
-        match & *self.inner.read() {
-            Inner::Listener(listener) => {
-                let server_conn = listener.pop_incoming().unwrap();
-                let peer_addr = server_conn.peer_addr().clone().unwrap();
-
-                return Ok((StreamSocket::new_connected(server_conn.clone()), peer_addr));
-            }
-            _ => {
-                return Err(SystemError::EINVAL);
-            }
-        }
-    }
 }
 
 
@@ -113,8 +106,13 @@ impl Socket for StreamSocket {
             _ => return Err(SystemError::EINVAL),
         };
 
-        //获取一对连接
-        let (client_conn, server_conn) = Connected::new_pair(client_endpoint, Some(server_endpoint).clone());
+        //创建新的对端endpoint
+        let server_inode = StreamSocket::new();
+        let new_server_endpoint = Some(Endpoint::Inode(Inode::new(server_inode.clone())));
+        //获取connect pair
+        let (client_conn, server_conn) = Connected::new_pair(client_endpoint, new_server_endpoint);
+
+        *server_inode.inner.write() = Inner::Connected(server_conn);
 
         let remote_socket: Arc<StreamSocket> =
             Arc::downcast::<StreamSocket>(peer_inode.inner()).map_err(|_| SystemError::EINVAL)?;
@@ -124,7 +122,7 @@ impl Socket for StreamSocket {
         match & *remote_listener {
             Inner::Listener(listener) => {
                 //往服务端socket的连接队列中添加connected
-                listener.push_incoming(server_conn)?;
+                listener.push_incoming(Inode::new(server_inode as Arc<dyn Socket>))?;
             }
             _ => return Err(SystemError::EINVAL),
         }
@@ -149,12 +147,18 @@ impl Socket for StreamSocket {
     }
 
     fn accept(&self) -> Result<(Arc<socket::Inode>, Endpoint), SystemError> {
-        self.do_accept().map(|(stream, remote_endpoint)| {
-            (
-                Inode::new(stream as Arc<dyn Socket>),
-                Endpoint::from(remote_endpoint),
-            )
-        })
+        match & *self.inner.read() {
+            Inner::Listener(listener) => {
+                let server_inode = listener.pop_incoming().unwrap();
+                return Ok({(
+                    server_inode.clone(),
+                    Endpoint::Inode(server_inode.clone()),
+                )})
+            }
+            _ => {
+                return Err(SystemError::EINVAL);
+            }
+        }
     }
 
     fn set_option(

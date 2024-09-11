@@ -4,13 +4,11 @@ use log::debug;
 use system_error::SystemError;
 
 use crate::libs::mutex::Mutex;
-use crate::libs::spinlock::SpinLock;
 use crate::net::socket::buffer::Buffer;
-use crate::net::socket::{Endpoint, ShutdownTemp};
+use crate::net::socket::{Endpoint, Inode, ShutdownTemp};
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 #[derive(Debug)]
 pub enum Inner {
@@ -47,35 +45,35 @@ pub struct Connected {
 }
 
 impl Connected {
-    pub fn new(addr: Option<Endpoint>, peer_addr: Option<Endpoint>, buffer: Arc<Buffer>) -> Self {
-        Self { 
-            addr, 
-            peer_addr, 
-            buffer,
-        }
-    }
-
-    pub fn new_pair(addr: Option<Endpoint>, peer_addr: Option<Endpoint>) -> (Connected, Connected) {
-        let buffer1 = Arc::new(SpinLock::new(Vec::new()));
-        let buffer2 = Arc::new(SpinLock::new(Vec::new()));
-        let this = Connected::new(
-            addr.clone(), 
-            peer_addr.clone(), 
-            Buffer::new(buffer1.clone(), buffer2.clone()));
-        let peer = Connected::new(
-            peer_addr.clone(), 
-            addr.clone(),
-            Buffer::new(buffer2.clone(), buffer1.clone()));
+    pub fn new_pair(addr: Option<Endpoint>, peer_addr: Option<Endpoint>) -> (Self, Self) {
+        let this = Connected{
+            addr: addr.clone(), 
+            peer_addr: peer_addr.clone(), 
+            buffer: Buffer::new()
+        };
+        let peer = Connected{
+            addr: addr.clone(), 
+            peer_addr: peer_addr.clone(), 
+            buffer: Buffer::new()
+        };
 
         return (this, peer);
     }
 
-    pub(super) fn addr(&self) -> Option<Endpoint> {
+    pub fn addr(&self) -> Option<Endpoint> {
         self.addr.clone()
+    }
+
+    pub fn set_addr(&mut self, addr: Option<Endpoint>) {
+        self.addr = addr;
     }
 
     pub fn peer_addr(&self) -> Option<Endpoint> {
         self.peer_addr.clone()
+    }
+
+    pub fn set_peer_addr(&mut self, peer: Option<Endpoint>) {
+        self.peer_addr = peer;
     }
 
     fn send_slice(&self, buf: &[u8]) -> Result<usize, SystemError> {
@@ -129,7 +127,7 @@ impl Connected {
 #[derive(Debug)]
 pub struct Listener {
     addr: Option<Endpoint>,
-    incoming_connects: Mutex<VecDeque<Connected>>,
+    incoming_connects: Mutex<VecDeque<Arc<Inode>>>,
     backlog: AtomicUsize,
 }
 
@@ -147,7 +145,7 @@ impl Listener {
         return Ok(());
     }
 
-    pub fn push_incoming(&self, server_conn: Connected) -> Result<(), SystemError> {
+    pub fn push_incoming(&self, server_inode: Arc<Inode>) -> Result<(), SystemError> {
         let mut incoming_connects = self.incoming_connects.lock();
 
         if incoming_connects.len() >= self.backlog.load(Ordering::Relaxed) {
@@ -155,12 +153,12 @@ impl Listener {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
 
-        incoming_connects.push_back(server_conn);
+        incoming_connects.push_back(server_inode);
 
         return Ok(());
     }
 
-    pub fn pop_incoming(&self) -> Option<Connected> {
+    pub fn pop_incoming(&self) -> Option<Arc<Inode>> {
         let mut incoming_connects = self.incoming_connects.lock();
 
         return incoming_connects.pop_front();

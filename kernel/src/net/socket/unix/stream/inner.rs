@@ -15,7 +15,7 @@ pub enum Inner {
     Listener(Listener),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Init {
     addr: Option<Endpoint>,
 }

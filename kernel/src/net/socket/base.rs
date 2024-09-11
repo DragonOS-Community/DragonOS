@@ -3,13 +3,13 @@
 use crate::net::socket::*;
 use crate::net::syscall_util::MsgHdr;
 use alloc::sync::Arc;
-use core::fmt::Debug;
+use core::{any::Any, fmt::Debug};
 use system_error::SystemError::{self, *};
 
 /// # `Socket` methods
 /// ## Reference
 /// - [Posix standard](https://pubs.opengroup.org/onlinepubs/9699919799/)
-pub trait Socket: Sync + Send + Debug {
+pub trait Socket: Sync + Send + Debug + Any{
     /// # `wait_queue`
     /// 获取socket的wait queue
     fn wait_queue(&self) -> WaitQueue;

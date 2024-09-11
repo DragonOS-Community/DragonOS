@@ -21,7 +21,7 @@ pub mod inner;
 #[derive(Debug)]
 pub struct StreamSocket {
     buffer: Arc<Buffer>,
-    inner: RwLock<Option<Inner>>,
+    inner: RwLock<Inner>,
     shutdown: Shutdown,
     epitems: EPollItems,
     wait_queue: WaitQueue,
@@ -37,7 +37,7 @@ impl StreamSocket {
     pub fn new() -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             buffer: Buffer::new(),
-            inner: RwLock::new(Some(Inner::Init(Init::new()))),
+            inner: RwLock::new(Inner::Init(Init::new())),
             shutdown: Shutdown::new(),
             epitems: EPollItems::default(),
             wait_queue: WaitQueue::default(),
@@ -48,7 +48,7 @@ impl StreamSocket {
     pub fn new_connected(connected: Connected) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             buffer: Buffer::new(),
-            inner: RwLock::new(Some(Inner::Connected(connected))),
+            inner: RwLock::new(Inner::Connected(connected)),
             shutdown: Shutdown::new(),
             epitems: EPollItems::default(),
             wait_queue: WaitQueue::default(),
@@ -57,11 +57,13 @@ impl StreamSocket {
     }
 
     pub fn do_bind(&self, local_endpoint: Endpoint) -> Result<(), SystemError> {
-        let mut guard = self.inner.write();
-        match guard.take().expect("Unix Stream Socket is None") {
-            Inner::Init(mut inner) => {
+        //let mut guard = self.inner.write();
+        // match guard.take().expect("Unix Stream Socket is None") {
+
+        // }
+        match &mut *self.inner.write() {
+            Inner::Init(inner) => {
                 inner.bind(local_endpoint)?;
-                guard.replace(Inner::Init(inner));
                 Ok(())
             }
             _ => Err(SystemError::EINVAL),
@@ -69,9 +71,11 @@ impl StreamSocket {
     }
 
     pub fn do_listen(&self, backlog: usize) -> Result<(), SystemError> {
-        let mut inner = self.inner.write();
-        let addr = match inner.take().expect("Unix Stream Socket is None") {
-            Inner::Init(init) => init.addr().unwrap(),
+        match &mut *self.inner.write(){
+            Inner::Init(init) => {
+                let listener = Listener::new(init.addr(), backlog);
+                *self.inner.write() = Inner::Listener(listener);
+            },
             Inner::Connected(_) => {
                 return Err(SystemError::EINVAL);
             }
@@ -79,30 +83,20 @@ impl StreamSocket {
                 return listener.listen(backlog);
             }
         };
-
-        let listener = Listener::new(Some(addr), backlog);
-        inner.replace(Inner::Listener(listener));
         return Ok(());
     }
 
     pub fn do_connect(&self, remote_socket: Arc<StreamSocket>) -> Result<(), SystemError> {
-        let mut client = self.inner.write();
-        let client_endpoint = match client.take() {
-            Some(inner) => match inner {
-                Inner::Init(socket) => socket.addr().clone(),
-                Inner::Connected(_) => return Err(SystemError::EINVAL),
-                Inner::Listener(_) => return Err(SystemError::EINVAL),
-            },
-            None => return Err(SystemError::EINVAL),
+        let client_endpoint: Option<Endpoint> = match & *self.inner.read() {
+            Inner::Init(socket) => socket.addr().clone(),
+            Inner::Connected(_) => return Err(SystemError::EINVAL),
+            Inner::Listener(_) => return Err(SystemError::EINVAL),
         };
-
         //查看remote_socket是否处于监听状态
-        let mut remote_inner = remote_socket.inner.write();
-        match remote_inner.take().expect("unix stream sock is none") {
+        match &mut *remote_socket.inner.write() {
             Inner::Listener(listener) => {
                 //往服务端socket的连接队列中添加connected
                 listener.push_incoming(client_endpoint);
-                remote_inner.replace(Inner::Listener(listener));
                 return Ok(());
             }
             _ => return Err(SystemError::EINVAL),
@@ -110,18 +104,12 @@ impl StreamSocket {
     }
 
     pub fn do_accept(&self) -> Result<(Arc<StreamSocket>, Endpoint), SystemError> {
-        let mut inner = self.inner.write();
-        match inner.take().expect("Unix Stream Socket is None") {
+        match &mut *self.inner.write() {
             Inner::Listener(listener) => {
-                let server_conn = listener.pop_incoming();
-                let peer_addr = server_conn
-                    .clone()
-                    .take()
-                    .expect("Unix Stream Socket is none")
-                    .peer_addr()
-                    .unwrap();
+                let server_conn = listener.pop_incoming().unwrap();
+                let peer_addr = server_conn.peer_addr().clone().unwrap();
 
-                return Ok((StreamSocket::new_connected(server_conn.unwrap()), peer_addr));
+                return Ok((StreamSocket::new_connected(server_conn.clone()), peer_addr));
             }
             _ => {
                 return Err(SystemError::EINVAL);
@@ -131,32 +119,28 @@ impl StreamSocket {
 
     fn send_slice(&self, buf: &[u8]) -> Result<usize, SystemError> {
         //找到peer_inode，并将write_buffer的内容写入对端的read_buffer
-        let mut inner = self.inner.write();
-        match inner.take().expect("Unix Stream Socket is None") {
+        match &*self.inner.read() {
             Inner::Connected(connected) => {
                 let peer_inode = connected.peer_addr().unwrap();
-                match peer_inode {
-                    Endpoint::Inode(inode) => {
-                        let remote_socket: Arc<StreamSocket> = Arc::clone(&inode)
-                            .arc_any()
-                            .downcast()
-                            .map_err(|_| SystemError::EINVAL)?;
-                        let usize = remote_socket.buffer.write_read_buffer(buf)?;
-                        inner.replace(Inner::Connected(connected));
-                        Ok(usize)
+                    match peer_inode {
+                        Endpoint::Inode(inode) => {
+                            let remote_socket: Arc<StreamSocket> = Arc::clone(&inode)
+                                .arc_any()
+                                .downcast()
+                                .map_err(|_| SystemError::EINVAL)?;
+                            let usize = remote_socket.buffer.write_read_buffer(buf)?;
+                            Ok(usize)
+                        }
+                        _ => return Err(SystemError::EINVAL),
                     }
-                    _ => return Err(SystemError::EINVAL),
-                }
-            }
+            },
             _ => return Err(SystemError::EINVAL),
         }
     }
 
     fn can_send(&self) -> Result<bool, SystemError> {
         //获取对端socket的read_buffer查看是否为空
-        let binding = self.inner.read();
-        let inner = binding.as_ref().unwrap();
-        match inner {
+        match & *self.inner.read() {
             Inner::Connected(conn) => {
                 let peer_inode = conn.peer_addr().unwrap();
                 match peer_inode {
@@ -202,28 +186,24 @@ impl StreamSocket {
 impl Socket for StreamSocket {
     fn connect(&self, _endpoint: Endpoint) -> Result<(), SystemError> {
         //使用endpoint获取服务端socket
-        let remote_socket = match _endpoint {
+        let peer_inode = match _endpoint {
             Endpoint::Inode(socket) => socket.clone(),
             _ => return Err(SystemError::EINVAL),
         };
 
         //客户端建立connected连接
-        let mut client_socket = self.inner.write();
-        match client_socket.take().expect("Unix Stream Socket is None") {
+        match &mut *self.inner.write() {
             Inner::Init(inner) => {
-                let remote_endpoint = Some(Endpoint::Inode(remote_socket.clone()));
+                let remote_endpoint = Some(Endpoint::Inode(peer_inode.clone()));
                 let client_conn = Connected::new(inner.addr().clone(), remote_endpoint);
-                client_socket.replace(Inner::Connected(client_conn));
+                *self.inner.write() = Inner::Connected(client_conn);
             }
             _ => {
                 return Err(SystemError::EINVAL);
             }
         }
 
-        let remote_stream_socket: Arc<StreamSocket> = Arc::clone(&remote_socket)
-            .arc_any()
-            .downcast()
-            .map_err(|_| SystemError::EINVAL)?;
+        let remote_stream_socket: Arc<StreamSocket> = Arc::downcast::<StreamSocket>(peer_inode.inner()).map_err(|_| SystemError::EINVAL)?;
 
         //服务端建立连接
         return self.do_connect(remote_stream_socket);
@@ -234,15 +214,7 @@ impl Socket for StreamSocket {
     }
 
     fn shutdown(&self, stype: ShutdownTemp) -> Result<(), SystemError> {
-        match self
-            .inner
-            .write()
-            .take()
-            .expect("Unix Stream Socket is None")
-        {
-            Inner::Connected(conn) => conn.shutdown(stype),
-            _ => return Err(SystemError::EINVAL),
-        }
+        todo!();
     }
 
     fn listen(&self, _backlog: usize) -> Result<(), SystemError> {

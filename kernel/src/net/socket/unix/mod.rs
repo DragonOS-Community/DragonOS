@@ -1,5 +1,6 @@
 mod stream;
 use crate::net::socket::*;
+use log::debug;
 use system_error::SystemError::{self, *};
 use alloc::sync::Arc;
 pub struct Unix;
@@ -10,6 +11,9 @@ fn create_unix_socket(
     match sock_type {
         Type::Stream => {
             Ok(stream::StreamSocket::new())
+        }
+        Type::SeqPacket => {
+            todo!();
         }
         _ => {
             Err(EPROTONOSUPPORT)

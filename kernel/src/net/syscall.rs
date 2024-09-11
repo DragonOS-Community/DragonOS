@@ -1,5 +1,6 @@
 use core::{cmp::min, ffi::CStr};
 
+use acpi::address;
 use alloc::{boxed::Box, sync::Arc};
 use log::debug;
 use num_traits::{FromPrimitive, ToPrimitive};

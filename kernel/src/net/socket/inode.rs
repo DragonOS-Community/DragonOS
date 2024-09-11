@@ -7,6 +7,7 @@ use crate::net::socket::*;
 #[derive(Debug)]
 pub struct Inode {
     inner: Arc<dyn Socket>,
+    epoll_items: EPollItems
 }
 
 impl IndexNode for Inode {
@@ -162,5 +163,9 @@ impl Inode {
 
     pub fn set_close_on_exec(&self, close_on_exec: bool) {
         todo!()
+    }
+
+    pub fn inner(&self) -> Arc<dyn Socket> {
+        return self.inner.clone();
     }
 }

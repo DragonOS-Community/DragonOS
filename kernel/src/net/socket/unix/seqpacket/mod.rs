@@ -188,7 +188,7 @@ impl Socket for SeqpacketSocket{
         // 获取对端地址
         let endpoint = match  &*self.inner.read() {
             Inner::Connected(connected) => connected.peer_endpoint().cloned(),
-            _ =>panic!("the socket is not connected")
+            _ =>return Err(SystemError::ENOTCONN)
         };
         
         if let Some(endpoint) = endpoint{
@@ -300,7 +300,6 @@ impl Socket for SeqpacketSocket{
             flags: MessageFlag,
             _address: Option<Endpoint>,
         ) -> Result<(usize, Endpoint), SystemError> {
-        log::debug!("sepacket recvfrom not impl");
         match &*self.inner.write(){
             Inner::Connected(connected)=>{
                 if flags.contains(MessageFlag::OOB){

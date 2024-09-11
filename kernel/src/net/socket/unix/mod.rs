@@ -1,23 +1,17 @@
 mod stream;
 use crate::net::socket::*;
+use alloc::sync::Arc;
 use log::debug;
 use system_error::SystemError::{self, *};
-use alloc::sync::Arc;
 pub struct Unix;
 
-fn create_unix_socket(
-    sock_type: Type,
-) -> Result<Arc<dyn Socket>, SystemError> {
+fn create_unix_socket(sock_type: Type) -> Result<Arc<dyn Socket>, SystemError> {
     match sock_type {
-        Type::Stream => {
-            Ok(stream::StreamSocket::new())
-        }
+        Type::Stream => Ok(stream::StreamSocket::new()),
         Type::SeqPacket => {
             todo!();
         }
-        _ => {
-            Err(EPROTONOSUPPORT)
-        }
+        _ => Err(EPROTONOSUPPORT),
     }
 }
 

@@ -7,7 +7,7 @@ use crate::net::socket::*;
 #[derive(Debug)]
 pub struct Inode {
     inner: Arc<dyn Socket>,
-    epoll_items: EPollItems
+    epoll_items: EPollItems,
 }
 
 impl IndexNode for Inode {

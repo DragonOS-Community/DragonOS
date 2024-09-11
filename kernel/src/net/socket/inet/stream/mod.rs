@@ -72,7 +72,10 @@ impl TcpSocket {
                 let bound = inner.bind(local_endpoint)?;
                 if let Init::Bound((ref bound, _)) = bound {
                     // todo!("TcpSocket::bind: bind_socket");
-                    bound.iface().common().bind_socket(self.self_ref.upgrade().unwrap());
+                    bound
+                        .iface()
+                        .common()
+                        .bind_socket(self.self_ref.upgrade().unwrap());
                 }
                 writer.replace(Inner::Init(bound));
                 Ok(())

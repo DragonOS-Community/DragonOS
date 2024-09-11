@@ -51,8 +51,16 @@ impl SeqpacketSocket {
     }
 
     pub fn new_pairs() ->Result<(Arc<Inode>,Arc<Inode>),SystemError> {
-        let (conn_a, conn_b) = Connected::new_pairs()?;
-        return Ok((conn_a, conn_b))
+        let socket0=SeqpacketSocket::new(false);
+        let socket1=SeqpacketSocket::new(false);
+        let inode0=Inode::new(socket0.clone());
+        let inode1=Inode::new(socket1.clone());
+
+        let (conn_0, conn_1)=Connected::new_pair(Some(Endpoint::Inode(inode0.clone())), Some(Endpoint::Inode(inode1.clone())));
+        *socket0.inner.write()=Inner::Connected(conn_0);
+        *socket1.inner.write()=Inner::Connected(conn_1);
+
+        return Ok((inode0, inode1))
     }
 
     fn try_accept(&self) -> Result<(Arc<Inode>, Endpoint),SystemError> {

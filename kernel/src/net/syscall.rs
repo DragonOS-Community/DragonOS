@@ -19,7 +19,7 @@ use crate::{
     syscall::Syscall,
 };
 
-use super::socket::{unix::Unix, AddressFamily as AF};
+use super::socket::{netlink::endpoint, unix::Unix, AddressFamily as AF};
 use super::socket::{self, Endpoint, Socket};
 
 pub use super::syscall_util::*;
@@ -331,11 +331,17 @@ impl Syscall {
             )?)
         };
 
-        let (n, endpoint) = socket.recv_from(buf, flags, address)?;
+        let (n, endpoint) = match socket.recv_from(buf, flags, address){
+            Ok((n,endpoint))=>(n,endpoint),
+            Err(err)=>{
+                //log::debug!("recvfrom not impl");
+                return Err(err)
+            }
+        };
         drop(socket);
 
         // 如果有地址信息，将地址信息写入用户空间
-        if addr.is_null() {
+        if !addr.is_null() {
             let sockaddr_in = SockAddr::from(endpoint);
             unsafe {
                 sockaddr_in.write_to_user(addr, addrlen)?;

@@ -234,7 +234,7 @@ impl Socket for SeqpacketSocket{
                 if flags.contains(MessageFlag::OOB){
                     return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
                 }
-                if flags.contains(MessageFlag::DONTWAIT){
+                if !flags.contains(MessageFlag::DONTWAIT){
                     loop{
                         match connected.try_read(buffer){
                             Ok(usize)=>return Ok(usize),
@@ -266,7 +266,7 @@ impl Socket for SeqpacketSocket{
                     return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
                 }
 
-                if flags.contains(MessageFlag::DONTWAIT){
+                if !flags.contains(MessageFlag::DONTWAIT){
                     loop{
                         match connected.try_write(buffer){
                             Ok(usize)=>return Ok(usize),
@@ -293,6 +293,39 @@ impl Socket for SeqpacketSocket{
     fn write(&self, buffer: &[u8]) -> Result<usize, SystemError> {
         self.send(buffer, crate::net::socket::MessageFlag::empty())
     }
+
+    fn recv_from(
+            &self, 
+            buffer: &mut [u8],
+            flags: MessageFlag,
+            _address: Option<Endpoint>,
+        ) -> Result<(usize, Endpoint), SystemError> {
+        log::debug!("sepacket recvfrom not impl");
+        match &*self.inner.write(){
+            Inner::Connected(connected)=>{
+                if flags.contains(MessageFlag::OOB){
+                    return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                }
+                if !flags.contains(MessageFlag::DONTWAIT){
+                    loop{
+                        match connected.recv_slice(buffer){
+                            Ok(usize)=>return Ok((usize,connected.endpoint().unwrap().clone())),
+                            Err(_)=>continue,
+                        }
+                    }
+                }
+                else {
+                    unimplemented!("unimplemented non_block")
+                }
+            },
+            _=>{
+                log::error!("the socket is not connected");
+                return Err(SystemError::ENOTCONN)
+            }
+        }
+        //Err(SystemError::ENOSYS) 
+    }
+    
     
     // fn update_io_events(&self) -> Result<crate::net::socket::EPollEventType, SystemError> {
     //     // 参考linux的unix_poll https://code.dragonos.org.cn/xref/linux-6.1.9/net/unix/af_unix.c#3152

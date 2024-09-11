@@ -167,11 +167,11 @@ impl Connected{
         Ok(is_full)
     }
 
-    fn recv_slice(&self, buf: &mut [u8]) -> Result<usize, SystemError>{
+    pub fn recv_slice(&self, buf: &mut [u8]) -> Result<usize, SystemError>{
         return self.buffer.read_read_buffer(buf);
     }
 
-    fn send_slice(&self, buf: &[u8]) -> Result<usize, SystemError> {
+    pub fn send_slice(&self, buf: &[u8]) -> Result<usize, SystemError> {
         //找到peer_inode，并将write_buffer的内容写入对端的read_buffer
         let peer_inode=match self.peer_inode.as_ref().unwrap(){
             Endpoint::Inode(inode) =>inode,

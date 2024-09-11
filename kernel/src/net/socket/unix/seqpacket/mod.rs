@@ -50,12 +50,9 @@ impl SeqpacketSocket {
         })
     }
 
-    pub fn new_pair(is_nonblocking: bool) -> (Arc<Self>, Arc<Self>) {
-        let (conn_a, conn_b) = Connected::new_pair(None, None);
-        (
-            Self::new_connected(conn_a, is_nonblocking),
-            Self::new_connected(conn_b, is_nonblocking),
-        )
+    pub fn new_pairs() ->Result<(Arc<Inode>,Arc<Inode>),SystemError> {
+        let (conn_a, conn_b) = Connected::new_pairs()?;
+        return Ok((conn_a, conn_b))
     }
 
     fn try_accept(&self) -> Result<(Arc<Inode>, Endpoint),SystemError> {
@@ -176,7 +173,7 @@ impl Socket for SeqpacketSocket{
     }
     
     fn close(&self) -> Result<(), SystemError> {
-        Err(SystemError::ENOSYS)
+        Ok(())
     }
     
     fn get_peer_name(&self) -> Result<Endpoint, SystemError> {

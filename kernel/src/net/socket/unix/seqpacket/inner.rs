@@ -115,7 +115,45 @@ impl Connected{
         (this,peer)
     }
 
+    pub fn new_pairs() ->Result<(Arc<Inode>,Arc<Inode>),SystemError>{
+        // let rebuffer = Arc::new(SpinLock::new(Vec::with_capacity(Self::DEFAULT_BUF_SIZE)));
+        // let sebuffer = Arc::new(SpinLock::new(Vec::with_capacity(Self::DEFAULT_BUF_SIZE)));
+        log::debug!("new pair");
+        let this = Connected{
+            inode:None,
+            peer_inode:None,
+            buffer:Buffer::new(),
+        };
+        let peer = Connected{
+            inode:None,
+            peer_inode:None,
+            buffer:Buffer::new(),
+        };
+        let this_inode=Inode::new(SeqpacketSocket::new_connected(this,false));
+        let peer_inode=Inode::new(SeqpacketSocket::new_connected(peer,false));
+        
+        let peer_socket=Arc::downcast::<SeqpacketSocket>(peer_inode.inner()).map_err(|_| SystemError::EINVAL)?;
+        match &mut *peer_socket.inner.write(){
+            Inner::Connected(connected) => {
+                connected.inode=Some(Endpoint::Inode(Arc::clone(&peer_inode)));
+                connected.peer_inode=Some(Endpoint::Inode(Arc::clone(&this_inode)))
+            },
+            _=>return  Err(SystemError::EINVAL),
+        };
 
+        let this_socket=Arc::downcast::<SeqpacketSocket>(this_inode.inner()).map_err(|_| SystemError::EINVAL)?;
+        match &mut *this_socket.inner.write(){
+            Inner::Connected(connected) => {
+                connected.inode=Some(Endpoint::Inode(Arc::clone(&this_inode)));
+                connected.peer_inode=Some(Endpoint::Inode(Arc::clone(&peer_inode)))
+            },
+            _=>return  Err(SystemError::EINVAL),
+        };
+        log::debug!("new pair2");
+
+        Ok((this_inode,peer_inode))
+    }
+    
     pub fn set_peer_inode(&mut self,peer_epoint:Option<Endpoint>){
         self.peer_inode=peer_epoint;
     }

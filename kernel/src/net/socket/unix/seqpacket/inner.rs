@@ -40,7 +40,7 @@ impl Init{
 pub(super) struct Listener{
     inode: Endpoint,
     backlog: AtomicUsize,
-    incoming_conns: Mutex<VecDeque<Connected>>,
+    incoming_conns: Mutex<VecDeque<Arc<Inode>>>,
 }
 
 impl Listener {
@@ -58,9 +58,11 @@ impl Listener {
     pub(super) fn try_accept(&self) ->Result<(Arc<Inode>, Endpoint),SystemError>{
         let mut incoming_conns =self.incoming_conns.lock();
         let conn=incoming_conns.pop_front().ok_or_else(|| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
-        let peer = conn.peer_endpoint().cloned().unwrap();
-        // *** 返回Arc<Inode>额不是Arc<dyn IndexNode>
-        let socket = SeqpacketSocket::new_connected(conn, false);
+        let socket =Arc::downcast::<SeqpacketSocket>(conn).map_err(|_| SystemError::EINVAL)?;
+        let peer = match &*socket.inner.read(){
+            Inner::Connected(connected)=>connected.peer_endpoint().unwrap().clone(),
+            _=>return Err(SystemError::ENOTCONN),
+        };
         
         return Ok((Inode::new(socket),peer));
     }
@@ -77,8 +79,12 @@ impl Listener {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
 
-        let (server_conn, client_conn) = Connected::new_pair(Some(self.inode.clone()), client_epoint);
-        incoming_conns.push_back(server_conn);
+        let new_server=SeqpacketSocket::new(false);
+        let new_inode=Inode::new(new_server.clone());
+
+        let (server_conn, client_conn) = Connected::new_pair(Some(Endpoint::Inode(new_inode.clone())), client_epoint);
+        *new_server.inner.write()=Inner::Connected(server_conn);
+        incoming_conns.push_back(new_inode);
 
         // TODO: epollin
 
@@ -98,8 +104,6 @@ impl Connected{
     pub const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 
     pub fn new_pair(inode:Option<Endpoint>,peer_inode:Option<Endpoint>) ->(Connected,Connected){
-        // let rebuffer = Arc::new(SpinLock::new(Vec::with_capacity(Self::DEFAULT_BUF_SIZE)));
-        // let sebuffer = Arc::new(SpinLock::new(Vec::with_capacity(Self::DEFAULT_BUF_SIZE)));
 
         let this = Connected{
             inode:inode.clone(),
@@ -114,7 +118,6 @@ impl Connected{
 
         (this,peer)
     }
-
 
     pub fn set_peer_inode(&mut self,peer_epoint:Option<Endpoint>){
         self.peer_inode=peer_epoint;
@@ -163,18 +166,18 @@ impl Connected{
         let peer_socket=Arc::downcast::<SeqpacketSocket>(peer_inode.inner()).map_err(|_| SystemError::EINVAL)?;
         let is_full=match &*peer_socket.inner.read(){
             Inner::Connected(connected) => {
-                connected.buffer.is_write_buf_empty()
+                connected.buffer.is_read_buf_full()
             },
             _=>return  Err(SystemError::EINVAL),
         };
         Ok(is_full)
     }
 
-    fn recv_slice(&self, buf: &mut [u8]) -> Result<usize, SystemError>{
+    pub fn recv_slice(&self, buf: &mut [u8]) -> Result<usize, SystemError>{
         return self.buffer.read_read_buffer(buf);
     }
 
-    fn send_slice(&self, buf: &[u8]) -> Result<usize, SystemError> {
+    pub fn send_slice(&self, buf: &[u8]) -> Result<usize, SystemError> {
         //找到peer_inode，并将write_buffer的内容写入对端的read_buffer
         let peer_inode=match self.peer_inode.as_ref().unwrap(){
             Endpoint::Inode(inode) =>inode,

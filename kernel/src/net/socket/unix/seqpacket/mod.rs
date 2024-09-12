@@ -50,12 +50,17 @@ impl SeqpacketSocket {
         })
     }
 
-    pub fn new_pair(is_nonblocking: bool) -> (Arc<Self>, Arc<Self>) {
-        let (conn_a, conn_b) = Connected::new_pair(None, None);
-        (
-            Self::new_connected(conn_a, is_nonblocking),
-            Self::new_connected(conn_b, is_nonblocking),
-        )
+    pub fn new_pairs() ->Result<(Arc<Inode>,Arc<Inode>),SystemError> {
+        let socket0=SeqpacketSocket::new(false);
+        let socket1=SeqpacketSocket::new(false);
+        let inode0=Inode::new(socket0.clone());
+        let inode1=Inode::new(socket1.clone());
+
+        let (conn_0, conn_1)=Connected::new_pair(Some(Endpoint::Inode(inode0.clone())), Some(Endpoint::Inode(inode1.clone())));
+        *socket0.inner.write()=Inner::Connected(conn_0);
+        *socket1.inner.write()=Inner::Connected(conn_1);
+
+        return Ok((inode0, inode1))
     }
 
     fn try_accept(&self) -> Result<(Arc<Inode>, Endpoint),SystemError> {
@@ -176,14 +181,14 @@ impl Socket for SeqpacketSocket{
     }
     
     fn close(&self) -> Result<(), SystemError> {
-        Err(SystemError::ENOSYS)
+        Ok(())
     }
     
     fn get_peer_name(&self) -> Result<Endpoint, SystemError> {
         // 获取对端地址
         let endpoint = match  &*self.inner.read() {
             Inner::Connected(connected) => connected.peer_endpoint().cloned(),
-            _ =>panic!("the socket is not connected")
+            _ =>return Err(SystemError::ENOTCONN)
         };
         
         if let Some(endpoint) = endpoint{
@@ -229,7 +234,7 @@ impl Socket for SeqpacketSocket{
                 if flags.contains(MessageFlag::OOB){
                     return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
                 }
-                if flags.contains(MessageFlag::DONTWAIT){
+                if !flags.contains(MessageFlag::DONTWAIT){
                     loop{
                         match connected.try_read(buffer){
                             Ok(usize)=>return Ok(usize),
@@ -261,7 +266,7 @@ impl Socket for SeqpacketSocket{
                     return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
                 }
 
-                if flags.contains(MessageFlag::DONTWAIT){
+                if !flags.contains(MessageFlag::DONTWAIT){
                     loop{
                         match connected.try_write(buffer){
                             Ok(usize)=>return Ok(usize),
@@ -288,6 +293,38 @@ impl Socket for SeqpacketSocket{
     fn write(&self, buffer: &[u8]) -> Result<usize, SystemError> {
         self.send(buffer, crate::net::socket::MessageFlag::empty())
     }
+
+    fn recv_from(
+            &self, 
+            buffer: &mut [u8],
+            flags: MessageFlag,
+            _address: Option<Endpoint>,
+        ) -> Result<(usize, Endpoint), SystemError> {
+        match &*self.inner.write(){
+            Inner::Connected(connected)=>{
+                if flags.contains(MessageFlag::OOB){
+                    return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                }
+                if !flags.contains(MessageFlag::DONTWAIT){
+                    loop{
+                        match connected.recv_slice(buffer){
+                            Ok(usize)=>return Ok((usize,connected.endpoint().unwrap().clone())),
+                            Err(_)=>continue,
+                        }
+                    }
+                }
+                else {
+                    unimplemented!("unimplemented non_block")
+                }
+            },
+            _=>{
+                log::error!("the socket is not connected");
+                return Err(SystemError::ENOTCONN)
+            }
+        }
+        //Err(SystemError::ENOSYS) 
+    }
+    
     
     // fn update_io_events(&self) -> Result<crate::net::socket::EPollEventType, SystemError> {
     //     // 参考linux的unix_poll https://code.dragonos.org.cn/xref/linux-6.1.9/net/unix/af_unix.c#3152

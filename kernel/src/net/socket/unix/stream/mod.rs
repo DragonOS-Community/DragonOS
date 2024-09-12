@@ -371,10 +371,12 @@ impl Socket for StreamSocket {
     }
 
     fn send_buffer_size(&self) -> usize {
-        todo!()
+        log::warn!("using default buffer size");
+        StreamSocket::DEFAULT_BUF_SIZE
     }
 
     fn recv_buffer_size(&self) -> usize {
-        todo!()
+        log::warn!("using default buffer size");
+        StreamSocket::DEFAULT_BUF_SIZE
     }
 }

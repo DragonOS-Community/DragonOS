@@ -69,7 +69,6 @@ pub static UEVENT_SUPPRESS: i32 = 1;
 // to be adjust
 pub const BUFFERSIZE: usize = 666;
 
-
 /*
  kobject_uevent_env，以envp为环境变量，上报一个指定action的uevent。环境变量的作用是为执行用户空间程序指定运行环境。具体动作如下：
 
@@ -148,9 +147,7 @@ pub fn kobject_uevent_env(
     }
 
     /* skip the event, if the filter returns zero. */
-    if kset.as_ref().unwrap().uevent_ops.is_some()
-        && kset.as_ref().unwrap().uevent_ops.is_none()
-    {
+    if kset.as_ref().unwrap().uevent_ops.is_some() && kset.as_ref().unwrap().uevent_ops.is_none() {
         log::info!("filter caused the event to drop!");
         return Ok(0);
     }
@@ -458,11 +455,16 @@ pub fn uevent_net_broadcast_untagged(
                 continue;
             }
         }
-        retval =
-            match netlink_broadcast(&ue_sk.get_sk().upgrade().unwrap(), Arc::clone(&skb), 0, 1, 1) {
-                Ok(_) => 0,
-                Err(err) => err.to_posix_errno(),
-            };
+        retval = match netlink_broadcast(
+            &ue_sk.get_sk().upgrade().unwrap(),
+            Arc::clone(&skb),
+            0,
+            1,
+            1,
+        ) {
+            Ok(_) => 0,
+            Err(err) => err.to_posix_errno(),
+        };
 
         // ENOBUFS should be handled in userspace
         if retval == SystemError::ENOBUFS.to_posix_errno()

@@ -17,12 +17,16 @@ impl Buffer {
         Arc::new(Self {
             metadata: Metadata::default(),
             read_buffer: SpinLock::new(Vec::new()),
-            write_buffer: SpinLock::new(Vec::new())
+            write_buffer: SpinLock::new(Vec::new()),
         })
     }
 
     pub fn is_read_buf_empty(&self) -> bool {
         return self.read_buffer.lock().is_empty();
+    }
+
+    pub fn is_read_buf_full(&self) ->bool {
+        return self.metadata.buf_size-self.read_buffer.lock().len()==0
     }
 
     pub fn is_write_buf_empty(&self) -> bool {
@@ -48,7 +52,6 @@ impl Buffer {
 
         Ok(len)
     }
-
 }
 
 #[derive(Debug)]
@@ -61,10 +64,9 @@ pub struct Metadata {
 
 impl Default for Metadata {
     fn default() -> Self {
-        Self { 
-            metadata_buf_size: 1024, 
-            buf_size: 64 * 1024, 
+        Self {
+            metadata_buf_size: 1024,
+            buf_size: 64 * 1024,
         }
     }
 }
-

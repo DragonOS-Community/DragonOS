@@ -24,10 +24,7 @@ use core::{
     ops::{Deref, DerefMut},
 };
 use log::info;
-use smoltcp::{
-    phy,
-    wire::HardwareAddress,
-};
+use smoltcp::{phy, wire::HardwareAddress};
 // use system_error::SystemError;
 
 use super::e1000e::{E1000EBuffer, E1000EDevice};

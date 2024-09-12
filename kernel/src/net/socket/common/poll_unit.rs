@@ -1,9 +1,16 @@
-use alloc::{collections::LinkedList, sync::{Arc, Weak}, vec::Vec};
+use alloc::{
+    collections::LinkedList,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use system_error::SystemError;
 
-use crate::{libs::{spinlock::SpinLock, wait_queue::EventWaitQueue}, net::event_poll::{EPollEventType, EPollItem, EventPoll}, process::ProcessManager, sched::{schedule, SchedMode}};
-
-
+use crate::{
+    libs::{spinlock::SpinLock, wait_queue::EventWaitQueue},
+    net::event_poll::{EPollEventType, EPollItem, EventPoll},
+    process::ProcessManager,
+    sched::{schedule, SchedMode},
+};
 
 #[derive(Debug, Clone)]
 pub struct WaitQueue {
@@ -49,15 +56,15 @@ impl WaitQueue {
     /// # `busy_wait`
     /// 轮询一个会返回EPAGAIN_OR_EWOULDBLOCK的函数
     pub fn busy_wait<F, R>(&self, events: EPollEventType, mut f: F) -> Result<R, SystemError>
-    where 
-        F: FnMut() -> Result<R, SystemError>
+    where
+        F: FnMut() -> Result<R, SystemError>,
     {
         loop {
             match f() {
                 Ok(r) => return Ok(r),
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                     self.wait_for(events);
-                },
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -104,11 +111,10 @@ impl EPollItems {
         let mut result = Ok(());
         guard.iter().for_each(|item| {
             if let Some(epoll) = item.epoll().upgrade() {
-                let _ = EventPoll::ep_remove(&mut epoll.lock_irqsave(), item.fd(), None)
-                    .map_err(|e| {
+                let _ =
+                    EventPoll::ep_remove(&mut epoll.lock_irqsave(), item.fd(), None).map_err(|e| {
                         result = Err(e);
-                    }
-                );
+                    });
             }
         });
         guard.clear();

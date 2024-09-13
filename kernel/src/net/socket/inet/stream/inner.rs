@@ -91,6 +91,9 @@ impl Init {
             Init::Unbound(_) => self.bind_to_ephemeral(remote_endpoint)?,
             Init::Bound(inner) => inner,
         };
+        if local.addr.is_unspecified() {
+            return Err((Init::Bound((inner, local)), EINVAL));
+        }
         let result = inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
             socket
                 .connect(
@@ -225,11 +228,6 @@ impl Listening {
                 EINVAL
             })?;
 
-        let mut new_listen = socket::inet::BoundInner::bind(
-            new_listen_smoltcp_socket(local_endpoint),
-            &local_endpoint.addr,
-        )?;
-
         let connected: &mut socket::inet::BoundInner = self
             .inners
             .iter_mut()
@@ -237,6 +235,11 @@ impl Listening {
                 inner.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.is_active())
             })
             .ok_or(EAGAIN_OR_EWOULDBLOCK)?;
+
+        let mut new_listen = socket::inet::BoundInner::bind(
+            new_listen_smoltcp_socket(local_endpoint),
+            &local_endpoint.addr,
+        )?;
 
         // swap the connected socket with the new_listen socket
         // TODO is smoltcp socket swappable?

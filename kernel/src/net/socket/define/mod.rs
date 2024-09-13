@@ -12,8 +12,8 @@ pub use ipproto::IPProtocol;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 pub enum Type {
-    Datagram = 1,
-    Stream = 2,
+    Stream = 1,
+    Datagram = 2,
     Raw = 3,
     RDM = 4,
     SeqPacket = 5,

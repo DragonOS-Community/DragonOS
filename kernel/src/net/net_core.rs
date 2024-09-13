@@ -34,7 +34,7 @@ impl TimerFunction for NetWorkPollFunc {
 }
 
 pub fn net_init() -> Result<(), SystemError> {
-    // dhcp_query()?;
+    dhcp_query()?;
     // Init poll timer function
     // let next_time = next_n_ms_timer_jiffies(5);
     // let timer = Timer::new(Box::new(NetWorkPollFunc), next_time);
@@ -46,8 +46,8 @@ fn dhcp_query() -> Result<(), SystemError> {
     let binding = NET_DEVICES.write_irqsave();
     log::debug!("binding: {:?}", *binding);
     //由于现在os未实现在用户态为网卡动态分配内存，而lo网卡的id最先分配且ip固定不能被分配
-    //所以特判取用id为1的网卡（也就是virto_net）
-    let net_face = binding.get(&1).ok_or(SystemError::ENODEV)?.clone();
+    //所以特判取用id为0的网卡（也就是virto_net）
+    let net_face = binding.get(&0).ok_or(SystemError::ENODEV)?.clone();
 
     drop(binding);
 
@@ -67,7 +67,7 @@ fn dhcp_query() -> Result<(), SystemError> {
 
     const DHCP_TRY_ROUND: u8 = 10;
     for i in 0..DHCP_TRY_ROUND {
-        debug!("DHCP try round: {}", i);
+        log::debug!("DHCP try round: {}", i);
         net_face.poll();
         let mut binding = sockets();
         let event = binding.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();

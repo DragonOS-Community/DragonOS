@@ -14,7 +14,7 @@ use crate::net::syscall_util::MsgHdr;
 pub trait Socket: Sync + Send + Debug + Any {
     /// # `wait_queue`
     /// 获取socket的wait queue
-    fn wait_queue(&self) -> WaitQueue;
+    fn wait_queue(&self) -> &WaitQueue;
     /// # `socket_poll`
     /// 获取socket的事件。
     fn poll(&self) -> usize;

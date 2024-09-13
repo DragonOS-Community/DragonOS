@@ -3,7 +3,11 @@ use log::{debug, info};
 use system_error::SystemError;
 
 use crate::{
-    arch::{driver::sbi::SbiDriver, mm::init::mm_early_init},
+    arch::{
+        driver::sbi::SbiDriver,
+        init::boot::{early_boot_init, BootProtocol},
+        mm::init::mm_early_init,
+    },
     driver::{firmware::efi::init::efi_init, open_firmware::fdt::open_firmware_fdt_driver},
     init::{boot_params, init::start_kernel},
     mm::{memblock::mem_block_manager, PhysAddr, VirtAddr},
@@ -12,6 +16,9 @@ use crate::{
 };
 
 use super::{cpu::init_local_context, interrupt::entry::handle_exception};
+
+mod boot;
+mod dragonstub;
 
 #[derive(Debug)]
 pub struct ArchBootParams {
@@ -119,6 +126,7 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
         "DragonOS kernel is running on hart {}, fdt address:{:?}",
         hartid, fdt_paddr
     );
+    early_boot_init(BootProtocol::DragonStub).expect("Failed to init boot protocol!");
     mm_early_init();
 
     print_node(fdt.find_node("/").unwrap(), 0);

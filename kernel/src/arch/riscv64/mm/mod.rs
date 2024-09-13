@@ -12,9 +12,9 @@ use crate::{
             page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage, PhysPageFrame},
         },
         kernel_mapper::KernelMapper,
-        page::{PageEntry, PageFlags, PAGE_1G_SHIFT},
+        page::{EntryFlags, PageEntry, PAGE_1G_SHIFT},
         ucontext::UserMapper,
-        MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
+        MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr, VmFlags,
     },
     smp::cpu::ProcessorId,
 };
@@ -256,7 +256,73 @@ impl MemoryManagementArch for RiscV64MMArch {
     ) -> bool {
         true
     }
+
+    const PAGE_NONE: usize = Self::ENTRY_FLAG_GLOBAL | Self::ENTRY_FLAG_READONLY;
+
+    const PAGE_READ: usize = PAGE_ENTRY_BASE | Self::ENTRY_FLAG_READONLY;
+
+    const PAGE_WRITE: usize =
+        PAGE_ENTRY_BASE | Self::ENTRY_FLAG_READONLY | Self::ENTRY_FLAG_WRITEABLE;
+
+    const PAGE_EXEC: usize = PAGE_ENTRY_BASE | Self::ENTRY_FLAG_EXEC;
+
+    const PAGE_READ_EXEC: usize =
+        PAGE_ENTRY_BASE | Self::ENTRY_FLAG_READONLY | Self::ENTRY_FLAG_EXEC;
+
+    const PAGE_WRITE_EXEC: usize = PAGE_ENTRY_BASE
+        | Self::ENTRY_FLAG_READONLY
+        | Self::ENTRY_FLAG_EXEC
+        | Self::ENTRY_FLAG_WRITEABLE;
+
+    const PAGE_COPY: usize = Self::PAGE_READ;
+    const PAGE_COPY_EXEC: usize = Self::PAGE_READ_EXEC;
+    const PAGE_SHARED: usize = Self::PAGE_WRITE;
+    const PAGE_SHARED_EXEC: usize = Self::PAGE_WRITE_EXEC;
+
+    const PAGE_COPY_NOEXEC: usize = 0;
+    const PAGE_READONLY: usize = 0;
+    const PAGE_READONLY_EXEC: usize = 0;
+
+    const PROTECTION_MAP: [EntryFlags<MMArch>; 16] = protection_map();
 }
+
+const fn protection_map() -> [EntryFlags<MMArch>; 16] {
+    let mut map = [0; 16];
+    map[VmFlags::VM_NONE.bits()] = MMArch::PAGE_NONE;
+    map[VmFlags::VM_READ.bits()] = MMArch::PAGE_READONLY;
+    map[VmFlags::VM_WRITE.bits()] = MMArch::PAGE_COPY;
+    map[VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] = MMArch::PAGE_COPY;
+    map[VmFlags::VM_EXEC.bits()] = MMArch::PAGE_READONLY_EXEC;
+    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] = MMArch::PAGE_READONLY_EXEC;
+    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] = MMArch::PAGE_COPY_EXEC;
+    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
+        MMArch::PAGE_COPY_EXEC;
+    map[VmFlags::VM_SHARED.bits()] = MMArch::PAGE_NONE;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_READ.bits()] = MMArch::PAGE_READONLY;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits()] = MMArch::PAGE_SHARED;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
+        MMArch::PAGE_SHARED;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits()] = MMArch::PAGE_READONLY_EXEC;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] =
+        MMArch::PAGE_READONLY_EXEC;
+    map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] =
+        MMArch::PAGE_SHARED_EXEC;
+    map[VmFlags::VM_SHARED.bits()
+        | VmFlags::VM_EXEC.bits()
+        | VmFlags::VM_WRITE.bits()
+        | VmFlags::VM_READ.bits()] = MMArch::PAGE_SHARED_EXEC;
+    let mut ret = [unsafe { EntryFlags::from_data(0) }; 16];
+    let mut index = 0;
+    while index < 16 {
+        ret[index] = unsafe { EntryFlags::from_data(map[index]) };
+        index += 1;
+    }
+    ret
+}
+
+const PAGE_ENTRY_BASE: usize = RiscV64MMArch::ENTRY_FLAG_PRESENT
+    | RiscV64MMArch::ENTRY_FLAG_ACCESSED
+    | RiscV64MMArch::ENTRY_FLAG_USER;
 
 impl VirtAddr {
     /// 判断虚拟地址是否合法
@@ -270,8 +336,8 @@ impl VirtAddr {
 }
 
 /// 获取内核地址默认的页面标志
-pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(_virt: VirtAddr) -> PageFlags<A> {
-    PageFlags::from_data(RiscV64MMArch::ENTRY_FLAG_DEFAULT_PAGE)
+pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(_virt: VirtAddr) -> EntryFlags<A> {
+    EntryFlags::from_data(RiscV64MMArch::ENTRY_FLAG_DEFAULT_PAGE)
         .set_user(false)
         .set_execute(true)
 }

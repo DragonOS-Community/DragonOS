@@ -1,7 +1,7 @@
 
 CFLAGS += -I .
 
-kernel_driver_subdirs:=acpi multiboot2 
+kernel_driver_subdirs:= 
 
 ECHO:
 	@echo "$@"

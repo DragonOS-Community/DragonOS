@@ -19,7 +19,7 @@ use core::marker::PhantomData;
 
 use super::{
     allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage},
-    page::PageFlags,
+    page::EntryFlags,
     PageTableKind, VirtAddr,
 };
 
@@ -141,7 +141,7 @@ impl<MMA: MemoryManagementArch> FrameAllocator for PseudoAllocator<MMA> {
 /// 并且，内核引导文件必须以4K页为粒度，填写了前100M的内存映射关系。（具体以本文件开头的注释为准）
 #[inline(never)]
 pub unsafe fn pseudo_map_phys(vaddr: VirtAddr, paddr: PhysAddr, count: PageFrameCount) {
-    let flags: PageFlags<MMArch> = PageFlags::new().set_write(true);
+    let flags: EntryFlags<MMArch> = EntryFlags::new().set_write(true);
 
     pseudo_map_phys_with_flags(vaddr, paddr, count, flags);
 }
@@ -150,7 +150,7 @@ pub unsafe fn pseudo_map_phys(vaddr: VirtAddr, paddr: PhysAddr, count: PageFrame
 /// with READ_ONLY and EXECUTE flags.
 #[inline(never)]
 pub unsafe fn pseudo_map_phys_ro(vaddr: VirtAddr, paddr: PhysAddr, count: PageFrameCount) {
-    let flags: PageFlags<MMArch> = PageFlags::new().set_write(false).set_execute(true);
+    let flags: EntryFlags<MMArch> = EntryFlags::new().set_write(false).set_execute(true);
 
     pseudo_map_phys_with_flags(vaddr, paddr, count, flags);
 }
@@ -160,7 +160,7 @@ pub unsafe fn pseudo_map_phys_with_flags(
     vaddr: VirtAddr,
     paddr: PhysAddr,
     count: PageFrameCount,
-    flags: PageFlags<MMArch>,
+    flags: EntryFlags<MMArch>,
 ) {
     assert!(vaddr.check_aligned(MMArch::PAGE_SIZE));
     assert!(paddr.check_aligned(MMArch::PAGE_SIZE));

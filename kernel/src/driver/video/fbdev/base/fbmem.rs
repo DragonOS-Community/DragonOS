@@ -18,9 +18,9 @@ use crate::{
             device_manager,
             device_number::{DeviceNumber, Major},
             driver::Driver,
-            sys_dev_char_kset, Device, DeviceType, IdTable,
+            sys_dev_char_kset, Device, DeviceCommonData, DeviceType, IdTable,
         },
-        kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+        kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,
         subsys::SubSysPrivate,
     },
@@ -146,7 +146,7 @@ impl FrameBufferManager {
         fb.set_fb_id(id);
         let fb_device = FbDevice::new(Arc::downgrade(&fb) as Weak<dyn FrameBuffer>, id);
         device_manager().device_default_initialize(&(fb_device.clone() as Arc<dyn Device>));
-        fb_device.set_parent(Some(Arc::downgrade(&(fb.clone() as Arc<dyn KObject>))));
+        fb_device.set_dev_parent(Some(Arc::downgrade(&(fb.clone() as Arc<dyn Device>))));
 
         fb.set_fb_device(Some(fb_device.clone()));
 
@@ -218,10 +218,8 @@ impl FbDevice {
         let r = Arc::new(Self {
             inner: SpinLock::new(InnerFbDevice {
                 fb,
-                kern_inode: None,
-                parent: None,
-                kset: None,
-                ktype: None,
+                kobject_common: KObjectCommonData::default(),
+                device_common: DeviceCommonData::default(),
                 fb_id: id,
                 device_inode_fs: None,
                 devfs_metadata: Metadata::new(
@@ -253,15 +251,17 @@ impl FbDevice {
     fn do_device_number(&self, inner_guard: &SpinLockGuard<'_, InnerFbDevice>) -> DeviceNumber {
         DeviceNumber::new(Major::FB_MAJOR, inner_guard.fb_id.data())
     }
+
+    fn inner(&self) -> SpinLockGuard<InnerFbDevice> {
+        self.inner.lock()
+    }
 }
 
 #[derive(Debug)]
 struct InnerFbDevice {
     fb: Weak<dyn FrameBuffer>,
-    kern_inode: Option<Arc<KernFSInode>>,
-    parent: Option<Weak<dyn KObject>>,
-    kset: Option<Arc<KSet>>,
-    ktype: Option<&'static dyn KObjType>,
+    kobject_common: KObjectCommonData,
+    device_common: DeviceCommonData,
     /// 帧缓冲区id
     fb_id: FbId,
 
@@ -276,35 +276,35 @@ impl KObject for FbDevice {
     }
 
     fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
-        self.inner.lock().kern_inode = inode;
+        self.inner().kobject_common.kern_inode = inode;
     }
 
     fn inode(&self) -> Option<Arc<KernFSInode>> {
-        self.inner.lock().kern_inode.clone()
+        self.inner().kobject_common.kern_inode.clone()
     }
 
     fn parent(&self) -> Option<Weak<dyn KObject>> {
-        self.inner.lock().parent.clone()
+        self.inner().kobject_common.parent.clone()
     }
 
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
-        self.inner.lock().parent = parent;
+        self.inner().kobject_common.parent = parent;
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {
-        self.inner.lock().kset.clone()
+        self.inner().kobject_common.kset.clone()
     }
 
     fn set_kset(&self, kset: Option<Arc<KSet>>) {
-        self.inner.lock().kset = kset;
+        self.inner().kobject_common.kset = kset;
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.inner.lock().ktype
+        self.inner().kobject_common.kobj_type
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
-        self.inner.lock().ktype = ktype;
+        self.inner().kobject_common.kobj_type = ktype;
     }
 
     fn name(&self) -> String {
@@ -374,6 +374,14 @@ impl Device for FbDevice {
 
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
         Some(&[&FbDeviceAttrGroup])
+    }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        self.inner().device_common.get_parent_weak_or_clear()
+    }
+
+    fn set_dev_parent(&self, dev_parent: Option<Weak<dyn Device>>) {
+        self.inner().device_common.parent = dev_parent;
     }
 }
 

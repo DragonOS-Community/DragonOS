@@ -24,12 +24,17 @@ use super::{
 #[cast_to([sync] Device)]
 #[cast_to([sync] PciDevice)]
 pub struct PciGeneralDevice {
-    device_data: RwLock<DeviceCommonData>,
-    kobj_data: RwLock<KObjectCommonData>,
-    name: RwLock<Option<String>>,
+    inner: RwLock<InnerPciGeneralDevice>,
     kobj_state: LockedKObjectState,
     dev_id: PciDeviceID,
     header: Arc<PciDeviceStructureGeneralDevice>,
+}
+
+#[derive(Debug)]
+struct InnerPciGeneralDevice {
+    name: Option<String>,
+    kobject_common: KObjectCommonData,
+    device_common: DeviceCommonData,
 }
 
 impl From<&PciDeviceStructureGeneralDevice> for PciGeneralDevice {
@@ -37,18 +42,18 @@ impl From<&PciDeviceStructureGeneralDevice> for PciGeneralDevice {
         let value = Arc::new(value.clone());
         let name: String = value.common_header.bus_device_function.into();
         let kobj_state = LockedKObjectState::new(None);
-        let common_dev = RwLock::new(DeviceCommonData::default());
-        let common_kobj = RwLock::new(KObjectCommonData::default());
         let dev_id = PciDeviceID::dummpy();
 
         // dev_id.set_special(PciSpecifiedData::Virtio());
         let res = Self {
-            device_data: common_dev,
-            kobj_data: common_kobj,
+            inner: RwLock::new(InnerPciGeneralDevice {
+                name: None,
+                kobject_common: KObjectCommonData::default(),
+                device_common: DeviceCommonData::default(),
+            }),
             kobj_state,
             dev_id,
             header: value,
-            name: RwLock::new(None),
         };
         res.set_name(name);
         res
@@ -83,21 +88,21 @@ impl Device for PciGeneralDevice {
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {
-        self.device_data.read().bus.clone()
+        self.inner.read().device_common.bus.clone()
     }
 
     fn class(&self) -> Option<Arc<dyn Class>> {
-        let mut guard = self.device_data.write();
-        let r = guard.class.clone()?.upgrade();
+        let mut guard = self.inner.write();
+        let r = guard.device_common.class.clone()?.upgrade();
         if r.is_none() {
-            guard.class = None;
+            guard.device_common.class = None;
         }
 
         return r;
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
-        self.device_data.read().driver.clone()?.upgrade()
+        self.inner.read().device_common.driver.clone()?.upgrade()
     }
 
     fn dev_type(&self) -> DeviceType {
@@ -117,21 +122,29 @@ impl Device for PciGeneralDevice {
     }
 
     fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
-        self.device_data.write().bus = bus;
+        self.inner.write().device_common.bus = bus;
     }
 
     fn set_can_match(&self, _can_match: bool) {}
 
     fn set_class(&self, class: Option<Weak<dyn Class>>) {
-        self.device_data.write().class = class;
+        self.inner.write().device_common.class = class;
     }
 
     fn set_driver(&self, driver: Option<Weak<dyn Driver>>) {
-        self.device_data.write().driver = driver
+        self.inner.write().device_common.driver = driver
     }
 
     fn state_synced(&self) -> bool {
         true
+    }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        self.inner.write().device_common.parent.clone()
+    }
+
+    fn set_dev_parent(&self, dev_parent: Option<Weak<dyn Device>>) {
+        self.inner.write().device_common.parent = dev_parent;
     }
 }
 
@@ -141,43 +154,43 @@ impl KObject for PciGeneralDevice {
     }
 
     fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
-        self.kobj_data.write().kern_inode = inode;
+        self.inner.write().kobject_common.kern_inode = inode;
     }
 
     fn inode(&self) -> Option<Arc<KernFSInode>> {
-        self.kobj_data.read().kern_inode.clone()
+        self.inner.read().kobject_common.kern_inode.clone()
     }
 
     fn parent(&self) -> Option<Weak<dyn KObject>> {
-        self.kobj_data.read().parent.clone()
+        self.inner.read().kobject_common.parent.clone()
     }
 
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
-        self.kobj_data.write().parent = parent;
+        self.inner.write().kobject_common.parent = parent;
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {
-        self.kobj_data.read().kset.clone()
+        self.inner.read().kobject_common.kset.clone()
     }
 
     fn set_kset(&self, kset: Option<Arc<KSet>>) {
-        self.kobj_data.write().kset = kset;
+        self.inner.write().kobject_common.kset = kset;
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.kobj_data.read().kobj_type
+        self.inner.read().kobject_common.kobj_type
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
-        self.kobj_data.write().kobj_type = ktype;
+        self.inner.write().kobject_common.kobj_type = ktype;
     }
 
     fn name(&self) -> String {
-        self.name.read().clone().unwrap()
+        self.inner.read().name.clone().unwrap()
     }
 
     fn set_name(&self, name: String) {
-        *self.name.write() = Some(name);
+        self.inner.write().name = Some(name);
     }
 
     fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {

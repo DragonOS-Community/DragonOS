@@ -8,8 +8,6 @@ use alloc::{
 };
 use bitmap::traits::BitMapOps;
 use log::error;
-use bitmap::traits::BitMapOps;
-use log::error;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 use virtio_drivers::device::blk::{VirtIOBlk, SECTOR_SIZE};

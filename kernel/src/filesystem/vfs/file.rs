@@ -11,8 +11,6 @@ use xarray::XArray;
 
 use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 use crate::filesystem::eventfd::EventFdInode;
-use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
-use crate::filesystem::eventfd::EventFdInode;
 use crate::{
     arch::MMArch,
     driver::{

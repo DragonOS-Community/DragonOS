@@ -39,6 +39,7 @@ bitmap = { path = "crates/bitmap" }
 driver_base_macros = { "path" = "crates/driver_base_macros" }
 elf = { version = "=0.7.2", default-features = false }
 fdt = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/fdt", rev = "9862813020" }
+# 一个no_std的hashmap、hashset
 hashbrown = "=0.13.2"
 ida = { path = "src/libs/ida" }
 intertrait = { path = "crates/intertrait" }

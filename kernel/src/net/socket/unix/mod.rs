@@ -1,7 +1,8 @@
 mod stream;
 pub(crate) mod seqpacket;
-use crate::net::socket::*;
+use crate::{libs::rwlock::RwLock, net::socket::*};
 use alloc::sync::Arc;
+use hashbrown::HashMap;
 use system_error::SystemError::{self, *};
 pub struct Unix;
 
@@ -33,5 +34,39 @@ impl Unix {
             Type::SeqPacket=>seqpacket::SeqpacketSocket::new_pairs(),
             _=>todo!()
         }
+    }
+}
+
+static PNODE_TABLE: PnodeTable = PnodeTable::new();
+
+pub struct PnodeTable {
+    unix_sockets: RwLock<HashMap<usize, Arc<Inode>>>,
+}
+
+impl PnodeTable {
+    pub fn new() -> Self {
+        Self { unix_sockets: RwLock::new(HashMap::new()) }
+    }
+
+    pub fn add_entry(&self, inode_number: &usize, snode: Arc<Inode>) -> Result<(), SystemError>{
+        let mut sockets = self.unix_sockets.write();
+        if sockets.contains_key(inode_number) {
+            return Err(SystemError::EINVAL); 
+        }   
+        sockets.insert(inode_number, snode);
+        Ok(())
+    }
+
+    pub fn delete_entry(&self, inode_number: &usize) -> Result<(), SystemError>{
+        let mut sockets = self.unix_sockets.write();
+        if sockets.contains_key(inode_number) {
+            sockets.remove(inode_socket);
+            Ok(())
+        }
+        return Err(SystemError::EINVAL);
+    }
+
+    pub fn get_entry(&self, inode_number: &usize) -> Arc<Inode>{
+        return self.unix_sockets.read().get(inode_number)
     }
 }

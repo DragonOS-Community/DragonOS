@@ -5,6 +5,7 @@ use system_error::SystemError;
 
 use crate::libs::mutex::Mutex;
 use crate::net::socket::buffer::Buffer;
+use crate::net::socket::unix::PNODE_TABLE;
 use crate::net::socket::{Endpoint, Inode, ShutdownTemp};
 
 use alloc::collections::VecDeque;
@@ -27,9 +28,17 @@ impl Init {
         Self { addr: None}
     }
 
-    pub(super) fn bind(&mut self, endpoint_to_bind: Endpoint) -> Result<(), SystemError> {
-        self.addr = Some(endpoint_to_bind);
-        Ok(())
+    pub(super) fn bind(&mut self, endpoint_to_bind: Endpoint, snode: Arc<Inode>) -> Result<(), SystemError> {
+        self.addr = Some(endpoint_to_bind.clone());
+        // 获得pnode的inode id
+        let inode_id = match endpoint_to_bind {
+            Endpoint::Pnode(pnode) => {
+                pnode.metadata().unwrap().inode_id.data()
+            },
+            _ => return Err(SystemError::EINVAL),
+        };
+
+        PNODE_TABLE.add_entry(inode_id, snode)
     }
 
     pub(super) fn addr(&self) -> Option<Endpoint> {

@@ -14,6 +14,8 @@ use crate::{
     },
 };
 
+use super::PNODE_TABLE;
+
 pub mod inner;
 
 #[derive(Debug)]
@@ -60,10 +62,19 @@ impl StreamSocket {
     }
 
     pub fn do_bind(&self, local_endpoint: Endpoint) -> Result<(), SystemError> {
+        //获得snode引用
+        let inode =
+            Inode::new(
+                Arc::new(
+                    self.self_ref
+                    .upgrade()
+                    .clone()
+                )
+        );
 
         match &mut *self.inner.write() {
             Inner::Init(inner) => {
-                inner.bind(local_endpoint)?;
+                inner.bind(local_endpoint, inode)?;
                 Ok(())
             }
             _ => Err(SystemError::EINVAL),
@@ -101,14 +112,22 @@ impl Socket for StreamSocket {
         drop(inner);
         
         //获取服务端地址
-        let peer_inode = match server_endpoint.clone() {
-            Endpoint::Inode(socket) => socket,
-            _ => return Err(SystemError::EINVAL),
-        };
+        // let peer_inode = match server_endpoint.clone() {
+        //     Endpoint::Inode(socket) => socket,
+        //     _ => return Err(SystemError::EINVAL),
+        // };
 
+        //找到对端pnode_id
+        let pnode_id = match server_endpoint {
+            Endpoint::Pnode(pnode) => pnode.metadata().unwrap().inode_id.data(),
+            _ => {
+                return Err(SystemError::EINVAL)
+            }
+        };
+        //找到对端snode
+        let peer_inode = PNODE_TABLE.get_entry(inode_number).clone();
         //创建新的对端endpoint
-        let server_inode = StreamSocket::new();
-        let new_server_endpoint = Some(Endpoint::Inode(Inode::new(server_inode.clone())));
+        let new_server_endpoint = Some(Endpoint::Inode(peer_inode));
         //获取connect pair
         let (client_conn, server_conn) = Connected::new_pair(client_endpoint, new_server_endpoint);
 

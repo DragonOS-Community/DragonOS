@@ -34,7 +34,7 @@ impl SysArgSocketType {
 use core::ffi::CStr;
 
 use crate::{
-    filesystem::vfs::{file::FileMode, FileType},
+    filesystem::vfs::{file::FileMode, syscall::ModeType, utils::rsplit_path, FileType, ROOT_INODE},
     libs::casting::DowncastArc,
     mm::{verify_area, VirtAddr},
     net::socket::{self, *},
@@ -132,18 +132,21 @@ impl SockAddr {
                         .to_str()
                         .map_err(|_| SystemError::EINVAL)?;
 
-                    let fd = Syscall::open(path.as_ptr(), FileMode::O_RDWR.bits(), 0o755, true)?;
-
-                    let binding = ProcessManager::current_pcb().fd_table();
-                    let fd_table_guard = binding.read();
-
-                    let file = fd_table_guard.get_file_by_fd(fd as i32).unwrap();
-                    if file.file_type() != FileType::Socket {
-                        return Err(SystemError::ENOTSOCK);
-                    }
-                    let socket = file.inode().downcast_arc::<socket::Inode>().ok_or(EINVAL)?;
-
-                    return Ok(Endpoint::Inode(socket.clone()));
+                    // 使用path创建文件，如果已有文件返回错误。
+                    let (filename, parent_path) = rsplit_path(&path);
+                    //查找父目录
+                    let parent_inode = ROOT_INODE().lookup(parent_path).unwrap_or("/");
+                    //创建文件
+                    let inode = match parent_inode.create(filename, FileType::Socket, ModeType::from_bits_truncate(0o775)) {
+                        Ok(inode) => inode,
+                        Err(e) => {
+                            log::debug!("pnode create failed");
+                            return Err(e);
+                        }
+                    };
+                    
+                    //返回endpoint
+                    return Ok(Endpoint::Pnode(inode.clone()));
                 }
                 AddressFamily::Packet => {
                     // TODO: support packet socket

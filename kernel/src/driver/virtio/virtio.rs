@@ -1,16 +1,19 @@
 use super::mmio::virtio_probe_mmio;
 use super::transport_pci::PciTransport;
 use super::virtio_impl::HalImpl;
-use crate::driver::base::device::DeviceId;
+use crate::driver::base::device::bus::Bus;
+use crate::driver::base::device::{Device, DeviceId};
 use crate::driver::block::virtio_blk::virtio_blk;
 use crate::driver::net::virtio_net::virtio_net;
 use crate::driver::pci::pci::{
     get_pci_device_structures_mut_by_vendor_id, PciDeviceStructure,
     PciDeviceStructureGeneralDevice, PCI_DEVICE_LINKEDLIST,
 };
+use crate::driver::pci::subsys::pci_bus;
 use crate::driver::virtio::transport::VirtIOTransport;
 use crate::libs::rwlock::RwLockWriteGuard;
 
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::{boxed::Box, collections::LinkedList};
@@ -39,7 +42,11 @@ fn virtio_probe_pci() {
                     transport.read_device_features(),
                 );
                 let transport = VirtIOTransport::Pci(transport);
-                virtio_device_init(transport, dev_id);
+                // 这里暂时通过设备名称在sysfs中查找设备，但是我感觉用设备ID更好
+                let bus = pci_bus() as Arc<dyn Bus>;
+                let name: String = virtio_device.common_header.bus_device_function.into();
+                let pci_raw_device = bus.find_device_by_name(name.as_str());
+                virtio_device_init(transport, dev_id, pci_raw_device);
             }
             Err(err) => {
                 error!("Pci transport create failed because of error: {}", err);
@@ -49,16 +56,20 @@ fn virtio_probe_pci() {
 }
 
 ///@brief 为virtio设备寻找对应的驱动进行初始化
-pub(super) fn virtio_device_init(transport: VirtIOTransport, dev_id: Arc<DeviceId>) {
+pub(super) fn virtio_device_init(
+    transport: VirtIOTransport,
+    dev_id: Arc<DeviceId>,
+    dev_parent: Option<Arc<dyn Device>>,
+) {
     match transport.device_type() {
-        DeviceType::Block => virtio_blk(transport, dev_id),
+        DeviceType::Block => virtio_blk(transport, dev_id, dev_parent),
         DeviceType::GPU => {
             warn!("Not support virtio_gpu device for now");
         }
         DeviceType::Input => {
             warn!("Not support virtio_input device for now");
         }
-        DeviceType::Network => virtio_net(transport, dev_id),
+        DeviceType::Network => virtio_net(transport, dev_id, dev_parent),
         t => {
             warn!("Unrecognized virtio device: {:?}", t);
         }

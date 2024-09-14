@@ -882,7 +882,7 @@ impl FixedScreenInfo {
     ///
     /// 长度为16的字符数组
     pub const fn name2id(name: &str) -> [char; 16] {
-        let mut id = [0 as char; 16];
+        let mut id = [0u8 as char; 16];
         let mut i = 0;
 
         while i < 15 && i < name.len() {

@@ -24,7 +24,7 @@ pub struct Init {
 
 impl Init {
     pub(super) fn new() -> Self {
-        Self { addr: None }
+        Self { addr: None}
     }
 
     pub(super) fn bind(&mut self, endpoint_to_bind: Endpoint) -> Result<(), SystemError> {
@@ -60,16 +60,16 @@ impl Connected {
         return (this, peer);
     }
 
-    pub fn addr(&self) -> Option<Endpoint> {
-        self.addr.clone()
+    pub fn addr(&self) -> Option<&Endpoint> {
+        self.addr.as_ref()
     }
 
     pub fn set_addr(&mut self, addr: Option<Endpoint>) {
         self.addr = addr;
     }
 
-    pub fn peer_addr(&self) -> Option<Endpoint> {
-        self.peer_addr.clone()
+    pub fn peer_addr(&self) -> Option<&Endpoint> {
+        self.peer_addr.as_ref()
     }
 
     pub fn set_peer_addr(&mut self, peer: Option<Endpoint>) {

@@ -138,7 +138,7 @@ impl Socket for StreamSocket {
         return self.do_bind(_endpoint);
     }
 
-    fn shutdown(&self, stype: ShutdownTemp) -> Result<(), SystemError> {
+    fn shutdown(&self, _stype: ShutdownTemp) -> Result<(), SystemError> {
         todo!();
     }
 
@@ -193,9 +193,9 @@ impl Socket for StreamSocket {
 
     fn get_option(
         &self,
-        level: OptionsLevel,
-        name: usize,
-        value: &mut [u8],
+        _level: OptionsLevel,
+        _name: usize,
+        _value: &mut [u8],
     ) -> Result<usize, SystemError> {
         log::warn!("getsockopt is not implemented");
         Ok(0)
@@ -212,7 +212,7 @@ impl Socket for StreamSocket {
             _ => return Err(SystemError::EINVAL),
         };
 
-        if flags.contains(MessageFlag::DONTWAIT) {
+        if !flags.contains(MessageFlag::DONTWAIT) {
             //阻塞式读取
             //忙询直到缓冲区有数据可以读取
             loop {
@@ -230,15 +230,35 @@ impl Socket for StreamSocket {
         &self,
         buffer: &mut [u8],
         flags: socket::MessageFlag,
-        address: Option<Endpoint>,
+        _address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
-        Err(SystemError::ENOSYS)
+        match & *self.inner.write() {
+            Inner::Connected(connected) => {
+                if flags.contains(MessageFlag::OOB) {
+                    return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                }
+                if !flags.contains(MessageFlag::DONTWAIT) {
+                    loop {
+                        match connected.try_recv(buffer) {
+                            Ok(usize) => return Ok((usize, connected.peer_addr().unwrap().clone())),
+                            Err(_) => continue,
+                        }
+                    }
+                } else {
+                    unimplemented!("unimplemented non_block");
+                }
+            }
+            _ => {
+                log::error!("the socket is not connected");
+                return Err(SystemError::ENOTCONN);
+            }
+        }
     }
 
     fn recv_msg(
         &self,
-        msg: &mut crate::net::syscall::MsgHdr,
-        flags: socket::MessageFlag,
+        _msg: &mut crate::net::syscall::MsgHdr,
+        _flags: socket::MessageFlag,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -250,9 +270,9 @@ impl Socket for StreamSocket {
             _ => return Err(SystemError::EINVAL),
         };
 
-        if flags.contains(MessageFlag::DONTWAIT) {
+        if !flags.contains(MessageFlag::DONTWAIT) {
             //阻塞式读取
-            //忙询直到缓冲区有数据可以读取
+            //忙询直到缓冲区有数据可以发送
             loop {
                 match conn.try_send(buffer) {
                     Ok(len) => return Ok(len),
@@ -260,14 +280,14 @@ impl Socket for StreamSocket {
                 }
             }
         } else {
-            unimplemented!("未实现非阻塞式处理")
+            unimplemented!("not implement non_block")
         }
     }
 
     fn send_msg(
         &self,
-        msg: &crate::net::syscall::MsgHdr,
-        flags: socket::MessageFlag,
+        _msg: &crate::net::syscall::MsgHdr,
+        _flags: socket::MessageFlag,
     ) -> Result<usize, SystemError> {
         todo!()
     }

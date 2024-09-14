@@ -7,7 +7,7 @@ pub struct Unix;
 
 fn create_unix_socket(sock_type: Type) -> Result<Arc<dyn Socket>, SystemError> {
     match sock_type {
-        Type::Stream => {
+        Type::Datagram => {
             Ok(stream::StreamSocket::new())
         },
         Type::SeqPacket =>{

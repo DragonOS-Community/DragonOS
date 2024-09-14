@@ -38,7 +38,7 @@ impl Init {
             _ => return Err(SystemError::EINVAL),
         };
 
-        PNODE_TABLE.add_entry(inode_id, snode)
+        PNODE_TABLE.add_entry(&inode_id, snode)
     }
 
     pub(super) fn addr(&self) -> Option<Endpoint> {

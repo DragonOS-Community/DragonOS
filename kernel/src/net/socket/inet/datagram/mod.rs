@@ -21,7 +21,6 @@ type EP = EPollEventType;
 pub struct UdpSocket {
     inner: RwLock<Option<UdpInner>>,
     nonblock: AtomicBool,
-    epoll_items: EPollItems,
     wait_queue: WaitQueue,
     self_ref: Weak<UdpSocket>,
 }
@@ -32,7 +31,6 @@ impl UdpSocket {
             inner: RwLock::new(Some(UdpInner::Unbound(UnboundUdp::new()))),
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
-            epoll_items: EPollItems::default(),
             self_ref: me.clone(),
         });
     }

@@ -78,12 +78,10 @@ impl IndexNode for Inode {
     }
 }
 
-use super::common::poll_unit::WaitQueue;
-
 impl Inode {
-    pub fn wait_queue(&self) -> WaitQueue {
-        self.inner.wait_queue()
-    }
+    // pub fn wait_queue(&self) -> WaitQueue {
+    //     self.inner.wait_queue()
+    // }
 
     pub fn send_buffer_size(&self) -> usize {
         self.inner.send_buffer_size()
@@ -181,11 +179,11 @@ impl Inode {
     }
 
     pub fn set_nonblock(&self, nonblock: bool) {
-        todo!()
+        log::warn!("nonblock is not support yet");
     }
 
     pub fn set_close_on_exec(&self, close_on_exec: bool) {
-        todo!()
+        log::warn!("close_on_exec is not support yet");
     }
 
     pub fn inner(&self)->Arc<dyn Socket>{

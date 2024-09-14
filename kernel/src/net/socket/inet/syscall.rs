@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use inet::TcpSocket;
 use smoltcp;
 use system_error::SystemError::{self, *};
 
@@ -8,29 +9,32 @@ use super::InetSocket;
 use crate::net::socket::*;
 
 fn create_inet_socket(
-    sock_type: Type,
+    socket_type: Type,
     protocol: smoltcp::wire::IpProtocol,
 ) -> Result<Arc<dyn Socket>, SystemError> {
+    log::debug!("type: {:?}, protocol: {:?}", socket_type, protocol);
     use smoltcp::wire::IpProtocol::*;
-    match protocol {
-        Udp => {
-            if !matches!(sock_type, Type::Datagram) {
+    use Type::*;
+    match socket_type {
+        Datagram => {
+            if !matches!(protocol, Udp) {
                 return Err(EPROTONOSUPPORT);
             }
-            todo!()
-        }
-        Tcp => {
-            todo!()
-        }
-        Icmp => {
-            todo!()
-        }
-        HopByHop => {
-            if !matches!(sock_type, Type::Raw) {
-                return Err(EPROTONOSUPPORT);
+            todo!("udp")
+        },
+        Stream => {
+            match protocol {
+                HopByHop | Tcp => {
+                    return Ok(TcpSocket::new(false));
+                },
+                _ => {
+                    return Err(EPROTONOSUPPORT);
+                }
             }
-            todo!()
-        }
+        },
+        Raw => {
+            todo!("raw")
+        },
         _ => {
             return Err(EPROTONOSUPPORT);
         }

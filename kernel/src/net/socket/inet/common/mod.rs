@@ -1,5 +1,5 @@
 use crate::net::{Iface, NET_DEVICES};
-use alloc::sync::Arc;
+use alloc::{vec::Vec, sync::Arc};
 use system_error::SystemError::{self, *};
 
 pub mod port;
@@ -15,10 +15,15 @@ pub enum Types {
     Dns,
 }
 
+/**
+ * 目前，以下设计仍然没有考虑多网卡的listen问题，仅只解决了socket在绑定单网卡下的问题。
+ */
+
 #[derive(Debug)]
 pub struct BoundInner {
     handle: smoltcp::iface::SocketHandle,
     iface: Arc<dyn Iface>,
+    // inner: Vec<(smoltcp::iface::SocketHandle, Arc<dyn Iface>)>
     // address: smoltcp::wire::IpAddress,
 }
 
@@ -33,9 +38,22 @@ impl BoundInner {
     where
         T: smoltcp::socket::AnySocket<'static>,
     {
-        let iface = get_iface_to_bind(address).ok_or(ENODEV)?;
-        let handle = iface.sockets().lock_no_preempt().add(socket);
-        Ok(Self { handle, iface })
+        if address.is_unspecified() {
+            // let inner = Vec::new();
+            // for (_, iface) in *NET_DEVICES.read_irqsave() {
+            //     let handle = iface.sockets().lock_no_preempt().add()
+            //     inner.push((iface))
+            // }
+            // 强行绑定 VirtIO
+            let iface = NET_DEVICES.read_irqsave().get(&0).expect("??bind without virtIO, serious?").clone();
+            let handle = iface.sockets().lock_no_preempt().add(socket);
+            return Ok( Self { handle, iface });
+        } else {
+            let iface = get_iface_to_bind(address).ok_or(ENODEV)?;
+            let handle = iface.sockets().lock_no_preempt().add(socket);
+            // return Ok(Self { inner: vec![(handle, iface)] });
+            return Ok( Self { handle, iface });
+        }
     }
 
     pub fn bind_ephemeral<T>(
@@ -79,10 +97,15 @@ impl BoundInner {
 
 #[inline]
 pub fn get_iface_to_bind(ip_addr: &smoltcp::wire::IpAddress) -> Option<Arc<dyn Iface>> {
+    // if ip_addr.is_unspecified()
     crate::net::NET_DEVICES
         .read_irqsave()
         .iter()
-        .find(|(_, iface)| iface.smol_iface().lock().has_ip_addr(*ip_addr))
+        .find(|(_, iface)| {
+            let guard = iface.smol_iface().lock();
+            // log::debug!("iface ip: {:?}", guard.ip_addrs());
+            return guard.has_ip_addr(*ip_addr);
+        })
         .map(|(_, iface)| iface.clone())
 }
 

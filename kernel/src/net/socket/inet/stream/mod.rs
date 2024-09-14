@@ -6,6 +6,7 @@ use crate::libs::rwlock::RwLock;
 use crate::net::event_poll::EPollEventType;
 use crate::net::net_core::poll_ifaces;
 use crate::net::socket::*;
+use crate::sched::SchedMode;
 use inet::InetSocket;
 use smoltcp;
 
@@ -65,13 +66,12 @@ impl TcpSocket {
         Ok(())
     }
 
-    pub fn bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
+    pub fn do_bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
         let mut writer = self.inner.write();
         match writer.take().expect("Tcp Inner is None") {
             Inner::Init(inner) => {
                 let bound = inner.bind(local_endpoint)?;
                 if let Init::Bound((ref bound, _)) = bound {
-                    // todo!("TcpSocket::bind: bind_socket");
                     bound.iface().common().bind_socket(self.self_ref.upgrade().unwrap());
                 }
                 writer.replace(Inner::Init(bound));
@@ -212,20 +212,67 @@ impl TcpSocket {
             }
         }
     }
+
+    // should only call on accept
+    fn is_acceptable(&self) -> bool {
+        self.poll() & EP::EPOLLIN.bits() as usize != 0
+    }
 }
 
 impl Socket for TcpSocket {
-    fn wait_queue(&self) -> WaitQueue {
-        self.wait_queue.clone()
+    fn wait_queue(&self) -> &WaitQueue {
+        &self.wait_queue
+    }
+
+    fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
+        if let Endpoint::Ip(addr) = endpoint {
+            return self.do_bind(addr);
+        }
+        return Err(EINVAL);
+    }
+
+    fn close(&self) -> Result<(), SystemError> {
+        log::warn!("resource release not impl yet");
+        Ok(())
+    }
+
+    fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
+        if let Endpoint::Ip(addr) = endpoint {
+            return self.start_connect(addr);
+        }
+        return Err(EINVAL);
     }
 
     fn poll(&self) -> usize {
         self.pollee.load(core::sync::atomic::Ordering::Relaxed)
     }
 
+    fn listen(&self, backlog: usize) -> Result<(), SystemError> {
+        self.do_listen(backlog)
+    }
+
     fn accept(&self) -> Result<(Arc<Inode>, Endpoint), SystemError> {
-        self.try_accept()
-            .map(|(stream, remote)| (Inode::new(stream), Endpoint::from(remote)))
+        // could block io
+        if self.is_nonblock() {
+            self.try_accept()
+        } else {
+            loop {
+                wq_wait_event_interruptible!(self.wait_queue, self.is_acceptable(), {})?;
+                match self.try_accept() {
+                    Err(EAGAIN_OR_EWOULDBLOCK) => continue,
+                    result => break result,
+                }
+            }
+        }.map(|(inner, endpoint)| 
+        (Inode::new(inner), Endpoint::Ip(endpoint)))
+    }
+
+    fn recv(&self, buffer: &mut [u8], _flags: MessageFlag) -> Result<usize, SystemError> {
+        self.try_recv(buffer)
+    }
+
+    fn send(&self, buffer: &[u8], _flags: MessageFlag) -> Result<usize, SystemError> {
+        self.try_send(buffer)
     }
 
     fn send_buffer_size(&self) -> usize {

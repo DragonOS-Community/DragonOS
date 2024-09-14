@@ -54,6 +54,28 @@ impl IndexNode for Inode {
         drop(private_data);
         Ok(self.inner.poll())
     }
+
+    fn open(
+        &self,
+        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _mode: &crate::filesystem::vfs::file::FileMode,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
+        let meta = crate::filesystem::vfs::Metadata {
+            mode: crate::filesystem::vfs::syscall::ModeType::from_bits_truncate(0o755),
+            file_type: crate::filesystem::vfs::FileType::Socket,
+            ..Default::default()
+        };
+
+        return Ok(meta);
+    }
+
+    fn close(&self, _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>) -> Result<(), SystemError> {
+        self.inner.close()
+    }
 }
 
 use super::common::poll_unit::WaitQueue;
@@ -125,6 +147,7 @@ impl Inode {
         flags: MessageFlag,
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
+
         self.inner.recv_from(buffer, flags, address)
     }
 

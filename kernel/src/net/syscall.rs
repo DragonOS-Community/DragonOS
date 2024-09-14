@@ -20,7 +20,7 @@ use crate::{
     syscall::Syscall,
 };
 
-use super::socket::AddressFamily as AF;
+use super::socket::{netlink::endpoint, unix::Unix, AddressFamily as AF};
 use super::socket::{self, Endpoint, Socket};
 
 pub use super::syscall_util::*;
@@ -97,26 +97,29 @@ impl Syscall {
         }
 
         // 创建一对socket
-        let inode0 = socket::create_socket(
-            address_family,
-            stype,
-            protocol as u32,
-            socket_type.is_nonblock(),
-            socket_type.is_cloexec(),
-        )?;
-        let inode1 = socket::create_socket(
-            address_family,
-            stype,
-            protocol as u32,
-            socket_type.is_nonblock(),
-            socket_type.is_cloexec(),
-        )?;
+        // let inode0 = socket::create_socket(
+        //     address_family,
+        //     stype,
+        //     protocol as u32,
+        //     socket_type.is_nonblock(),
+        //     socket_type.is_cloexec(),
+        // )?;
+        // let inode1 = socket::create_socket(
+        //     address_family,
+        //     stype,
+        //     protocol as u32,
+        //     socket_type.is_nonblock(),
+        //     socket_type.is_cloexec(),
+        // )?;
 
-        // 进行pair
-        unsafe {
-            inode0.connect(socket::Endpoint::Inode(inode1.clone()))?;
-            inode1.connect(socket::Endpoint::Inode(inode0.clone()))?;
-        }
+        // // 进行pair
+        // unsafe {
+        //     inode0.connect(socket::Endpoint::Inode(inode1.clone()))?;
+        //     inode1.connect(socket::Endpoint::Inode(inode0.clone()))?;
+        // }
+
+        // 创建一对新的unix socket pair
+        let (inode0,inode1)=Unix::new_pairs(stype)?;
 
         fds[0] = fd_table_guard.alloc_fd(File::new(inode0, FileMode::O_RDWR)?, None)?;
         fds[1] = fd_table_guard.alloc_fd(File::new(inode1, FileMode::O_RDWR)?, None)?;
@@ -329,11 +332,17 @@ impl Syscall {
             )?)
         };
 
-        let (n, endpoint) = socket.recv_from(buf, flags, address)?;
+        let (n, endpoint) = match socket.recv_from(buf, flags, address){
+            Ok((n,endpoint))=>(n,endpoint),
+            Err(err)=>{
+                //log::debug!("recvfrom not impl");
+                return Err(err)
+            }
+        };
         drop(socket);
 
         // 如果有地址信息，将地址信息写入用户空间
-        if addr.is_null() {
+        if !addr.is_null() {
             let sockaddr_in = SockAddr::from(endpoint);
             unsafe {
                 sockaddr_in.write_to_user(addr, addrlen)?;

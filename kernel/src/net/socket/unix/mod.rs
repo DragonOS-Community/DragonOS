@@ -1,8 +1,7 @@
 mod stream;
-mod seqpacket;
+pub(crate) mod seqpacket;
 use crate::net::socket::*;
 use alloc::sync::Arc;
-use log::debug;
 use system_error::SystemError::{self, *};
 pub struct Unix;
 
@@ -25,5 +24,14 @@ impl family::Family for Unix {
     fn socket(stype: Type, _protocol: u32) -> Result<Arc<Inode>, SystemError> {
         let socket = create_unix_socket(stype)?;
         Ok(Inode::new(socket))
+    }
+}
+
+impl Unix {
+    pub fn new_pairs(socket_type:Type) ->Result<(Arc<Inode>,Arc<Inode>),SystemError>{
+        match socket_type {
+            Type::SeqPacket=>seqpacket::SeqpacketSocket::new_pairs(),
+            _=>todo!()
+        }
     }
 }

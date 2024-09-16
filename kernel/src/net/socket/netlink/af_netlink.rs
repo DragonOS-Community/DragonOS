@@ -490,7 +490,7 @@ impl Socket for NetlinkSock {
         todo!()
     }
 
-    fn wait_queue(&self) -> WaitQueue {
+    fn wait_queue(&self) -> &WaitQueue {
         todo!()
     }
 

@@ -8,6 +8,7 @@ use kprobe::{Kprobe, KprobeBuilder, KprobeOps, KprobePoint};
 use system_error::SystemError;
 
 pub mod args;
+#[cfg(feature = "kprobe_test")]
 mod test;
 
 pub type LockKprobe = Arc<RwLock<Kprobe>>;

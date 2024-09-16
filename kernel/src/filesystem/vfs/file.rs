@@ -126,7 +126,7 @@ impl FileMode {
 /// 页面缓存
 pub struct PageCache {
     xarray: SpinLock<XArray<Arc<Page>>>,
-    inode: Option<Weak<dyn IndexNode>>,
+    inode: SpinLock<Option<Weak<dyn IndexNode>>>,
 }
 
 impl core::fmt::Debug for PageCache {
@@ -149,13 +149,13 @@ impl PageCache {
     pub fn new(inode: Option<Weak<dyn IndexNode>>) -> Arc<PageCache> {
         let page_cache = Self {
             xarray: SpinLock::new(XArray::new()),
-            inode,
+            inode: SpinLock::new(inode),
         };
         Arc::new(page_cache)
     }
 
     pub fn inode(&self) -> Option<Weak<dyn IndexNode>> {
-        self.inode.clone()
+        self.inode.lock().clone()
     }
 
     pub fn add_page(&self, offset: usize, page: &Arc<Page>) {
@@ -177,8 +177,8 @@ impl PageCache {
         cursor.remove();
     }
 
-    pub fn set_inode(&mut self, inode: Weak<dyn IndexNode>) {
-        self.inode = Some(inode)
+    pub fn set_inode(&self, inode: Weak<dyn IndexNode>) {
+        *self.inode.lock() = Some(inode)
     }
 }
 

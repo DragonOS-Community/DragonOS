@@ -271,18 +271,18 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn do_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
-        if !pfm.flags().contains(FaultFlags::FAULT_FLAG_WRITE) {
-            return Self::do_read_fault(pfm);
+        return if !pfm.flags().contains(FaultFlags::FAULT_FLAG_WRITE) {
+            Self::do_read_fault(pfm)
         } else if !pfm
             .vma()
             .lock_irqsave()
             .vm_flags()
             .contains(VmFlags::VM_SHARED)
         {
-            return Self::do_cow_fault(pfm);
+            Self::do_cow_fault(pfm)
         } else {
-            return Self::do_shared_fault(pfm);
-        }
+            Self::do_shared_fault(pfm)
+        };
     }
 
     /// 处理私有文件映射的写时复制

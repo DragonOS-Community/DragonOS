@@ -3,14 +3,18 @@ mod bpf;
 mod kprobe;
 mod util;
 
-use crate::filesystem::vfs::file::{File, FileMode};
+use crate::filesystem::vfs::file::{File, FileMode, PageCache};
 use crate::filesystem::vfs::syscall::ModeType;
-use crate::filesystem::vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata};
+use crate::filesystem::vfs::{
+    FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Metadata, SuperBlock,
+};
 use crate::include::bindings::linux_bpf::{
     perf_event_attr, perf_event_sample_format, perf_sw_ids, perf_type_id,
 };
 use crate::libs::casting::DowncastArc;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
+use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
+use crate::mm::VmFaultReason;
 use crate::net::event_poll::{EPollEventType, EPollItem, EventPoll, KernelIoctlData};
 use crate::perf::bpf::BpfPerfEvent;
 use crate::perf::util::{PerfEventIoc, PerfEventOpenFlags, PerfProbeArgs};
@@ -33,10 +37,7 @@ use system_error::SystemError;
 
 type Result<T> = core::result::Result<T, SystemError>;
 
-pub trait PerfEventOps: Send + Sync + Debug + CastFromSync + CastFrom {
-    fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<()> {
-        panic!("mmap not implemented for PerfEvent");
-    }
+pub trait PerfEventOps: Send + Sync + Debug + CastFromSync + CastFrom + IndexNode {
     fn set_bpf_prog(&self, _bpf_prog: Arc<File>) -> Result<()> {
         panic!("set_bpf_prog not implemented for PerfEvent");
     }
@@ -188,13 +189,54 @@ impl IndexNode for PerfEventInode {
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        panic!("PerfEvent does not have a filesystem")
+        // panic!("PerfEvent does not have a filesystem")
+        Arc::new(PerfFakeFs)
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
     }
     fn list(&self) -> Result<Vec<String>> {
         Err(SystemError::ENOSYS)
+    }
+    fn page_cache(&self) -> Option<Arc<PageCache>> {
+        self.event.page_cache()
+    }
+}
+
+#[derive(Debug)]
+struct PerfFakeFs;
+
+impl FileSystem for PerfFakeFs {
+    fn root_inode(&self) -> Arc<dyn IndexNode> {
+        panic!("PerfFakeFs does not have a root inode")
+    }
+
+    fn info(&self) -> FsInfo {
+        panic!("PerfFakeFs does not have a filesystem info")
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "perf"
+    }
+
+    fn super_block(&self) -> SuperBlock {
+        panic!("PerfFakeFs does not have a super block")
+    }
+    unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        let res = PageFaultHandler::filemap_fault(pfm);
+        res
+    }
+    unsafe fn map_pages(
+        &self,
+        pfm: &mut PageFaultMessage,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
+        PageFaultHandler::filemap_map_pages(pfm, start_pgoff, end_pgoff)
     }
 }
 
@@ -255,8 +297,13 @@ pub fn perf_event_open(
             unimplemented!("perf_event_process: unknown type: {:?}", args);
         }
     };
-    let perf_event = PerfEventInode::new(event);
-    let file = File::new(Arc::new(perf_event), file_mode)?;
+
+    let page_cache = event.page_cache();
+    let perf_event = Arc::new(PerfEventInode::new(event));
+    if let Some(cache) = page_cache {
+        cache.set_inode(Arc::downgrade(&(perf_event.clone() as _)));
+    }
+    let file = File::new(perf_event, file_mode)?;
     let fd_table = ProcessManager::current_pcb().fd_table();
     let fd = fd_table.write().alloc_fd(file, None).map(|x| x as usize)?;
     Ok(fd)

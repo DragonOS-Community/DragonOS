@@ -2,6 +2,7 @@ mod util;
 mod verifier;
 
 use super::Result;
+use crate::bpf::map::BpfMap;
 use crate::bpf::prog::util::{BpfProgMeta, BpfProgVerifierInfo};
 use crate::bpf::prog::verifier::BpfProgVerifier;
 use crate::filesystem::vfs::file::{File, FileMode};
@@ -19,11 +20,15 @@ use system_error::SystemError;
 #[derive(Debug)]
 pub struct BpfProg {
     meta: BpfProgMeta,
+    raw_file_ptr: Vec<usize>,
 }
 
 impl BpfProg {
     pub fn new(meta: BpfProgMeta) -> Self {
-        Self { meta }
+        Self {
+            meta,
+            raw_file_ptr: Vec::new(),
+        }
     }
 
     pub fn insns(&self) -> &[u8] {
@@ -32,6 +37,10 @@ impl BpfProg {
 
     pub fn insns_mut(&mut self) -> &mut [u8] {
         &mut self.meta.insns
+    }
+
+    pub fn insert_map(&mut self, map_ptr: usize) {
+        self.raw_file_ptr.push(map_ptr);
     }
 }
 
@@ -88,6 +97,16 @@ impl IndexNode for BpfProg {
     }
 }
 
+impl Drop for BpfProg {
+    fn drop(&mut self) {
+        unsafe {
+            for ptr in self.raw_file_ptr.iter() {
+                let file = Arc::from_raw(*ptr as *const u8 as *const BpfMap);
+                drop(file)
+            }
+        }
+    }
+}
 /// Load a BPF program into the kernel.
 ///
 /// See https://ebpf-docs.dylanreimerink.nl/linux/syscall/BPF_PROG_LOAD/

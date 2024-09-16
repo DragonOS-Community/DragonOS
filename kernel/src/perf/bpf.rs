@@ -1,13 +1,22 @@
 use super::{PerfEventOps, Result};
+use crate::arch::mm::LockedFrameAllocator;
 use crate::arch::MMArch;
+use crate::filesystem::vfs::file::PageCache;
+use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode};
 use crate::include::bindings::linux_bpf::{
     perf_event_header, perf_event_mmap_page, perf_event_type,
 };
-use crate::libs::spinlock::SpinLock;
+use crate::libs::spinlock::{SpinLock, SpinLockGuard};
+use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame};
+use crate::mm::page::{page_manager_lock_irqsave, Page, PageFlushAll};
 use crate::mm::MemoryManagementArch;
-use crate::perf::util::PerfProbeArgs;
+use crate::perf::util::{LostSamples, PerfProbeArgs, PerfSample, SampleHeader};
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::any::Any;
 use core::fmt::Debug;
-
+use system_error::SystemError;
 const PAGE_SIZE: usize = MMArch::PAGE_SIZE;
 #[derive(Debug)]
 pub struct BpfPerfEvent {
@@ -19,50 +28,8 @@ pub struct BpfPerfEvent {
 pub struct BpfPerfEventData {
     enabled: bool,
     mmap_page: RingPage,
+    page_cache: Arc<PageCache>,
     offset: usize,
-}
-
-/// The event type in our particular use case will be `PERF_RECORD_SAMPLE` or `PERF_RECORD_LOST`.
-/// `PERF_RECORD_SAMPLE` indicating that there is an actual sample after this header.
-/// And `PERF_RECORD_LOST` indicating that there is a record lost header following the perf event header.
-#[repr(C)]
-#[derive(Debug)]
-struct LostSamples {
-    header: perf_event_header,
-    id: u64,
-    count: u64,
-}
-
-impl LostSamples {
-    fn as_bytes(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self as *const Self as *const u8, size_of::<Self>()) }
-    }
-}
-
-#[repr(C)]
-#[derive(Debug)]
-struct Sample {
-    header: perf_event_header,
-    size: u32,
-}
-
-impl Sample {
-    fn as_bytes(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self as *const Self as *const u8, size_of::<Self>()) }
-    }
-}
-
-#[repr(C)]
-#[derive(Debug)]
-struct PerfSample<'a> {
-    s_hdr: Sample,
-    value: &'a [u8],
-}
-
-impl<'a> PerfSample<'a> {
-    fn calculate_size(value_size: usize) -> usize {
-        size_of::<Sample>() + value_size
-    }
 }
 
 #[derive(Debug)]
@@ -203,11 +170,11 @@ impl RingPage {
     /// Write a sample to the page.
     fn write_sample(&mut self, data: &[u8], data_head: usize) -> Result<usize> {
         let perf_sample = PerfSample {
-            s_hdr: Sample {
+            s_hdr: SampleHeader {
                 header: perf_event_header {
                     type_: perf_event_type::PERF_RECORD_SAMPLE as u32,
                     misc: 0,
-                    size: size_of::<Sample>() as u16 + data.len() as u16,
+                    size: size_of::<SampleHeader>() as u16 + data.len() as u16,
                 },
                 size: data.len() as u32,
             },
@@ -253,13 +220,29 @@ impl BpfPerfEvent {
             data: SpinLock::new(BpfPerfEventData {
                 enabled: false,
                 mmap_page: RingPage::empty(),
+                page_cache: PageCache::new(None),
                 offset: 0,
             }),
         }
     }
     pub fn do_mmap(&self, start: usize, len: usize, offset: usize) -> Result<()> {
         let mut data = self.data.lock();
-        let mmap_page = RingPage::new_init(start, len);
+        // alloc page frame
+        let (phy_addr, page_count) =
+            unsafe { LockedFrameAllocator.allocate(PageFrameCount::new(len / PAGE_SIZE)) }
+                .ok_or(SystemError::ENOSPC)?;
+        let mut page_manager_guard = page_manager_lock_irqsave();
+        let mut cur_phys = PhysPageFrame::new(phy_addr);
+        for i in 0..page_count.data() {
+            let page = Arc::new(Page::new(true, cur_phys.phys_address()));
+            let paddr = cur_phys.phys_address();
+            page_manager_guard.insert(paddr, &page);
+            data.page_cache.add_page(i, &page);
+            cur_phys = cur_phys.next();
+        }
+        let virt_addr = unsafe { MMArch::phys_2_virt(phy_addr) }.unwrap();
+        // create mmap page
+        let mmap_page = RingPage::new_init(virt_addr.data(), len);
         data.mmap_page = mmap_page;
         data.offset = offset;
         Ok(())
@@ -267,14 +250,53 @@ impl BpfPerfEvent {
 
     pub fn write_event(&self, data: &[u8]) -> Result<()> {
         let mut inner_data = self.data.lock();
-        inner_data.mmap_page.write_event(data)
+        inner_data.mmap_page.write_event(data);
+        Ok(())
+    }
+}
+
+impl IndexNode for BpfPerfEvent {
+    fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<()> {
+        self.do_mmap(start, len, offset)
+    }
+
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize> {
+        panic!("PerfEventInode does not support read")
+    }
+
+    fn write_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize> {
+        panic!("PerfEventInode does not support write")
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        panic!("PerfEventInode does not have a filesystem")
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn list(&self) -> Result<Vec<String>> {
+        Err(SystemError::ENOSYS)
+    }
+
+    fn page_cache(&self) -> Option<Arc<PageCache>> {
+        Some(self.data.lock().page_cache.clone())
     }
 }
 
 impl PerfEventOps for BpfPerfEvent {
-    fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<()> {
-        self.do_mmap(start, len, offset)
-    }
     fn enable(&self) -> Result<()> {
         self.data.lock().enabled = true;
         Ok(())
@@ -284,7 +306,6 @@ impl PerfEventOps for BpfPerfEvent {
         Ok(())
     }
     fn readable(&self) -> bool {
-        // false
         self.data.lock().mmap_page.readable()
     }
 }

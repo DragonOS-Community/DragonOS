@@ -1,5 +1,5 @@
 use crate::include::bindings::linux_bpf::{
-    perf_event_attr, perf_event_sample_format, perf_sw_ids, perf_type_id,
+    perf_event_attr, perf_event_header, perf_event_sample_format, perf_sw_ids, perf_type_id,
 };
 use crate::syscall::user_access::check_and_clone_cstr;
 use alloc::string::String;
@@ -67,5 +67,48 @@ impl PerfProbeArgs {
             sample_type: sample_ty,
         };
         Ok(args)
+    }
+}
+
+/// The event type in our particular use case will be `PERF_RECORD_SAMPLE` or `PERF_RECORD_LOST`.
+/// `PERF_RECORD_SAMPLE` indicating that there is an actual sample after this header.
+/// And `PERF_RECORD_LOST` indicating that there is a record lost header following the perf event header.
+#[repr(C)]
+#[derive(Debug)]
+pub struct LostSamples {
+    pub header: perf_event_header,
+    pub id: u64,
+    pub count: u64,
+}
+
+impl LostSamples {
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self as *const Self as *const u8, size_of::<Self>()) }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct SampleHeader {
+    pub header: perf_event_header,
+    pub size: u32,
+}
+
+impl SampleHeader {
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self as *const Self as *const u8, size_of::<Self>()) }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct PerfSample<'a> {
+    pub s_hdr: SampleHeader,
+    pub value: &'a [u8],
+}
+
+impl<'a> PerfSample<'a> {
+    pub fn calculate_size(value_size: usize) -> usize {
+        size_of::<SampleHeader>() + value_size
     }
 }

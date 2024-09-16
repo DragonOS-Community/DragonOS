@@ -5,17 +5,21 @@ use crate::bpf::helper::BPF_HELPER_FUN_SET;
 use crate::bpf::prog::BpfProg;
 use crate::debug::kprobe::args::KprobeInfo;
 use crate::debug::kprobe::{register_kprobe, unregister_kprobe, LockKprobe};
-use crate::filesystem::vfs::file::File;
+use crate::filesystem::vfs::file::{File, PageCache};
+use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode};
 use crate::libs::casting::DowncastArc;
+use crate::libs::spinlock::SpinLockGuard;
 use crate::perf::util::PerfProbeArgs;
 use crate::perf::PerfEventOps;
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::any::Any;
 use core::fmt::Debug;
 use kprobe::{CallBackFunc, ProbeArgs};
 use rbpf::EbpfVmRawOwned;
 use system_error::SystemError;
-
 #[derive(Debug)]
 pub struct KprobePerfEvent {
     args: PerfProbeArgs,
@@ -71,6 +75,44 @@ impl CallBackFunc for KprobePerfCallBack {
         let _res = self.vm.execute_program(probe_context).unwrap();
         // log::info!("Program returned: {res:?} ({res:#x})");
         // log::info!("---------------------Probe finished---------------------");
+    }
+}
+
+impl IndexNode for KprobePerfEvent {
+    fn read_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        buf: &mut [u8],
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize> {
+        panic!("read_at not implemented for PerfEvent");
+    }
+
+    fn write_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize> {
+        panic!("write_at not implemented for PerfEvent");
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        panic!("fs not implemented for PerfEvent");
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn list(&self) -> Result<Vec<String>> {
+        Err(SystemError::ENOSYS)
+    }
+
+    fn page_cache(&self) -> Option<Arc<PageCache>> {
+        None
     }
 }
 

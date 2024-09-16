@@ -37,6 +37,7 @@ impl<'a> BpfProgVerifier<'a> {
         let instructions = self.prog.insns_mut();
         let mut fmt_insn = to_insn_vec(instructions);
         let mut index = 0;
+        let mut raw_file_ptr = vec![];
         loop {
             if index >= fmt_insn.len() {
                 break;
@@ -85,6 +86,7 @@ impl<'a> BpfProgVerifier<'a> {
                             "Relocate for BPF_PSEUDO_MAP_FD, instruction index: {}, map_fd: {}, ptr: {:#x}",
                             index, map_fd, map_ptr
                         );
+                        raw_file_ptr.push(map_ptr);
                         Some(map_ptr)
                     }
                     ty => {
@@ -115,6 +117,9 @@ impl<'a> BpfProgVerifier<'a> {
             .flat_map(|ins| ins.to_vec())
             .collect::<Vec<u8>>();
         instructions.copy_from_slice(&fmt_insn);
+        for ptr in raw_file_ptr {
+            self.prog.insert_map(ptr);
+        }
         Ok(())
     }
 

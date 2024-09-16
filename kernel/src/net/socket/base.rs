@@ -98,6 +98,7 @@ pub trait Socket: Sync + Send + Debug + Any{
     fn recv_from(
         &self, 
         buffer: &mut [u8],
+        len: usize,
         flags: MessageFlag,
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> 

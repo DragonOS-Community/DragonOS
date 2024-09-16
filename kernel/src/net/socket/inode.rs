@@ -148,7 +148,7 @@ impl Inode {
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
 
-        self.inner.recv_from(buffer, flags, address)
+        self.inner.recv_from(buffer, buffer.len(), flags, address)
     }
 
     pub fn shutdown(&self, how: ShutdownTemp) -> Result<(), SystemError> {
@@ -181,11 +181,11 @@ impl Inode {
     }
 
     pub fn set_nonblock(&self, nonblock: bool) {
-        todo!()
+        return ()
     }
 
     pub fn set_close_on_exec(&self, close_on_exec: bool) {
-        todo!()
+        return ()
     }
 
     pub fn inner(&self)->Arc<dyn Socket>{

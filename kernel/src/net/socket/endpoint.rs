@@ -1,4 +1,4 @@
-use crate::net::socket;
+use crate::{filesystem::vfs::InodeId, net::socket};
 use alloc::sync::Arc;
 
 pub use smoltcp::wire::IpEndpoint;
@@ -13,6 +13,7 @@ pub enum Endpoint {
     /// inode端点
     Inode(Arc<socket::Inode>),
     // todo: 增加NetLink机制后，增加NetLink端点
+    InodeId(InodeId),
     /// NetLink端点
     Netlink(NetlinkEndpoint),
 }

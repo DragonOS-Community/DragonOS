@@ -1,9 +1,14 @@
 mod stream;
 pub(crate) mod seqpacket;
-use crate::net::socket::*;
+use crate::{filesystem::vfs::InodeId, libs::rwlock::RwLock, net::socket::*};
+use hashbrown::HashMap;
 use system_error::SystemError::{self, *};
 use alloc::sync::Arc;
 pub struct Unix;
+
+lazy_static!{
+    pub static ref INODE_MAP: RwLock<HashMap<InodeId, Endpoint>> = RwLock::new(HashMap::new());
+}
 
 fn create_unix_socket(
     sock_type: Type,
@@ -12,7 +17,7 @@ fn create_unix_socket(
         Type::Stream => {
             Ok(stream::StreamSocket::new())
         },
-        Type::SeqPacket =>{
+        Type::SeqPacket |Type::Datagram=>{
             Ok(seqpacket::SeqpacketSocket::new(false))
         }
         _ => {
@@ -30,8 +35,9 @@ impl family::Family for Unix {
 
 impl Unix {
     pub fn new_pairs(socket_type:Type) ->Result<(Arc<Inode>,Arc<Inode>),SystemError>{
+        log::debug!("socket_type {:?}",socket_type);
         match socket_type {
-            Type::SeqPacket=>seqpacket::SeqpacketSocket::new_pairs(),
+            Type::SeqPacket |Type::Datagram=>seqpacket::SeqpacketSocket::new_pairs(),
             _=>todo!()
         }
     }

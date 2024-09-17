@@ -857,9 +857,9 @@ impl VirtCpu {
 
         // TODO: 一些中断或者tsc操作
 
-        match x86_kvm_ops().handle_exit(self, exit_fastpath){
-            Err(err)=>return Err(err),
-            Ok(_)=>{Ok(())}
+        match x86_kvm_ops().handle_exit(self, vm, exit_fastpath) {
+            Err(err) => return Err(err),
+            Ok(_) => Ok(()),
         }
     }
 

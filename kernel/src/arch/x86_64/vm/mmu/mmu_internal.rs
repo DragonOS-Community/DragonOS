@@ -1,43 +1,53 @@
-use core::{intrinsics::unlikely, ops::Index};
 use alloc::{
     boxed::Box,
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::{intrinsics::unlikely, ops::Index};
 
 use system_error::SystemError;
 
 use crate::{
     arch::vm::{
-        kvm_host::{EmulType,KVM_PFN_NOSLOT} ,mmu::{mmu::{PFRet, PageLevel}, tdp_iter::
-        { is_large_pte, is_shadow_present_pte, TdpIter}}, mtrr::kvm_mtrr_check_gfn_range_consistency, vmx::PageFaultErr
+        kvm_host::{EmulType, KVM_PFN_NOSLOT},
+        mmu::{
+            mmu::{PFRet, PageLevel},
+            tdp_iter::{is_large_pte, is_shadow_present_pte, TdpIter},
+        },
+        mtrr::kvm_mtrr_check_gfn_range_consistency,
+        vmx::PageFaultErr,
     },
     kwarn,
+    libs::spinlock::SpinLockGuard,
     mm::{virt_2_phys, PhysAddr},
     virt::{
         kvm::host_mem::PAGE_SHIFT,
-        vm::kvm_host::{mem::{LockedKvmMemSlot, LockedVmMemSlotSet, UserMemRegionFlag, __gfn_to_pfn_memslot}, search_memslots, vcpu::VirtCpu},
+        vm::kvm_host::{
+            mem::{LockedKvmMemSlot, LockedVmMemSlotSet, UserMemRegionFlag, __gfn_to_pfn_memslot},
+            search_memslots,
+            vcpu::VirtCpu,
+            Vm,
+        },
     },
 };
 
 use super::mmu::{gfn_round_for_level, is_tdp_mmu_enabled, KvmMmuPageRole};
 
 #[derive(Debug, Default)]
-pub struct KvmMmuPage{
-    pub tdp_mmu_page:bool,// 标记是否为 TDP（Two-Dimensional Paging）页表页
-    pub gfn: u64,// 客户机帧号（Guest Frame Number）
-   
+pub struct KvmMmuPage {
+    pub tdp_mmu_page: bool, // 标记是否为 TDP（Two-Dimensional Paging）页表页
+    pub gfn: u64,           // 客户机帧号（Guest Frame Number）
+
     /*
-    * The following two entries are used to key the shadow page in the
-    * hash table.暫時沒看出來
-    */
+     * The following two entries are used to key the shadow page in the
+     * hash table.暫時沒看出來
+     */
     pub role: KvmMmuPageRole,
-    pub spt: u64,// 指向页表条目（SPTE）的指针
+    pub spt: u64, // 指向页表条目（SPTE）的指针
     pub mmu_seq: u64,
     pub map_writable: bool,
     pub write_fault_to_shadow_pgtable: bool,
 }
-
 
 #[derive(Debug, Default)]
 pub struct KvmPageFault {
@@ -89,6 +99,7 @@ impl VirtCpu {
     #[inline(never)]
     pub fn page_fault(
         &mut self,
+        vm: &Vm,
         cr2_or_gpa: u64,
         mut error_code: u64,
         insn: Option<u64>,
@@ -120,7 +131,7 @@ impl VirtCpu {
 
         if r == PFRet::Invalid {
             r = self
-                .do_page_fault(cr2_or_gpa, error_code as u32, false, emulation_type)?
+                .do_page_fault(vm, cr2_or_gpa, error_code as u32, false, emulation_type)?
                 .into();
             if r == PFRet::Invalid {
                 return Err(SystemError::EIO);
@@ -158,8 +169,10 @@ impl VirtCpu {
         // self.emulate_instruction(cr2_or_gpa, emulation_type, insn, insn_len)
         todo!("emulate_instruction")
     }
+
     fn do_page_fault(
         &mut self,
+        vm: &Vm,
         cr2_or_gpa: u64,
         error_code: u32,
         prefetch: bool,
@@ -175,7 +188,7 @@ impl VirtCpu {
             rsvd: error_code & PageFaultErr::PFERR_RSVD.bits() as u32 != 0,
             user: error_code & PageFaultErr::PFERR_USER.bits() as u32 != 0,
             prefetch,
-            is_tdp : true,
+            is_tdp: true,
             nx_huge_page_workaround_enabled: false, //todo
             max_level: PageLevel::Level1G as u8,
             req_level: PageLevel::Level4K as u8,
@@ -185,7 +198,7 @@ impl VirtCpu {
         //处理直接映射
         if self.arch.mmu().root_role.get_direct() {
             page_fault.gfn = (page_fault.addr.data() >> PAGE_SHIFT) as u64;
-            page_fault.slot = self.gfn_to_memslot(page_fault.gfn);//kvm_vcpu_gfn_to_memslot(vcpu, fault.gfn);没完成
+            page_fault.slot = self.gfn_to_memslot(page_fault.gfn, vm); //kvm_vcpu_gfn_to_memslot(vcpu, fault.gfn);没完成
         }
         //异步页面错误（Async #PF），也称为预取错误（prefetch faults），
         //从客机（guest）的角度来看并不是错误，并且已经在原始错误发生时被计数。
@@ -194,7 +207,7 @@ impl VirtCpu {
         }
 
         let r = if page_fault.is_tdp {
-            self.tdp_page_fault(&mut page_fault).unwrap()
+            self.tdp_page_fault(vm, &mut page_fault).unwrap()
         } else {
             let handle = self.arch.mmu().page_fault.unwrap();
             handle(self, &page_fault).unwrap()
@@ -211,52 +224,58 @@ impl VirtCpu {
             PFRet::Spurious => self.stat.pf_spurious += 1,
             _ => {}
         }
-    
+
         Ok(r)
     }
 
-    fn gfn_to_memslot(&self, gfn: u64) -> Option<Arc<LockedKvmMemSlot>> {
-        let slot_set: Arc<LockedVmMemSlotSet> = self.kvm_vcpu_memslots();
+    fn gfn_to_memslot(&self, gfn: u64, vm: &Vm) -> Option<Arc<LockedKvmMemSlot>> {
+        let slot_set: Arc<LockedVmMemSlotSet> = self.kvm_vcpu_memslots(vm);
         //...todo
-        
-        search_memslots(slot_set, gfn)
 
+        search_memslots(slot_set, gfn)
     }
-    pub fn kvm_vcpu_memslots(&self) ->Arc<LockedVmMemSlotSet> {
-        let binding = self.kvm();
-        let kvm = binding.lock();
-        kvm.memslots.index(0).clone()
+    pub fn kvm_vcpu_memslots(&self, vm: &Vm) -> Arc<LockedVmMemSlotSet> {
+        vm.memslots.index(0).clone()
     }
-    fn tdp_page_fault(&mut self, page_fault: &mut KvmPageFault) -> Result<u64,SystemError> {
+    fn tdp_page_fault(
+        &mut self,
+        vm: &Vm,
+        page_fault: &mut KvmPageFault,
+    ) -> Result<u64, SystemError> {
         // 如果 shadow_memtype_mask 为真，并且虚拟机有非一致性 DMA
         //if shadow_memtype_mask != 0 && self.kvm().lock().arch.noncoherent_dma_count > 0 {
-            while page_fault.max_level > PageLevel::Level4K as u8{
-                let page_num = PageLevel::kvm_pages_per_hpage(page_fault.max_level);
+        while page_fault.max_level > PageLevel::Level4K as u8 {
+            let page_num = PageLevel::kvm_pages_per_hpage(page_fault.max_level);
 
-                //低地址对齐
-                let base = gfn_round_for_level(page_fault.gfn, page_fault.max_level);
+            //低地址对齐
+            let base = gfn_round_for_level(page_fault.gfn, page_fault.max_level);
 
-                //检查给定 GFN 范围内的内存类型是否一致，暂未实现
-                if kvm_mtrr_check_gfn_range_consistency(self, base, page_num) {
-                    break;
-                }
-
-                page_fault.max_level -= 1;
+            //检查给定 GFN 范围内的内存类型是否一致，暂未实现
+            if kvm_mtrr_check_gfn_range_consistency(self, base, page_num) {
+                break;
             }
+
+            page_fault.max_level -= 1;
+        }
         //}
 
-            if is_tdp_mmu_enabled() {
-                return self.kvm_tdp_mmu_page_fault(page_fault);
-            }
+        if is_tdp_mmu_enabled() {
+            return self.kvm_tdp_mmu_page_fault(vm, page_fault);
+        }
 
         self.direct_page_fault(page_fault)
     }
-    fn kvm_tdp_mmu_page_fault(&self,page_fault: &mut KvmPageFault)->Result<u64,SystemError>{
-
-        //page_fault_handle_page_track(page_fault) 
+    fn kvm_tdp_mmu_page_fault(
+        &self,
+        vm: &Vm,
+        page_fault: &mut KvmPageFault,
+    ) -> Result<u64, SystemError> {
+        //page_fault_handle_page_track(page_fault)
         //fast_page_fault(page_fault);
         //mmu_topup_memory_caches(false);//补充内存缓存
-        let mut r= self.kvm_faultin_pfn(page_fault, 1|1<<1|1<<2).unwrap();
+        let mut r = self
+            .kvm_faultin_pfn(vm, page_fault, 1 | 1 << 1 | 1 << 2)
+            .unwrap();
         if r != PFRet::Continue {
             return Ok(r.into());
         }
@@ -266,34 +285,37 @@ impl VirtCpu {
         self.tdp_map(page_fault);
         Ok(r.into())
     }
-    fn tdp_map(&self,page_fault: &mut KvmPageFault)->Result<u64,SystemError>{
+    fn tdp_map(&self, page_fault: &mut KvmPageFault) -> Result<u64, SystemError> {
         //没有实现SPTE，huge page相关
-        let mmu=self.arch.mmu();
+        let mmu = self.arch.mmu();
         let kvm = self.kvm();
         let ret = PFRet::Retry;
-        
-        
-        let mut tdp_iter : TdpIter=TdpIter::default();
 
+        let mut tdp_iter: TdpIter = TdpIter::default();
 
-        tdp_iter.start(virt_2_phys(mmu.root.hpa as usize)/*__va */,mmu.root_role.level() as u8, 
-        PageLevel::Level4K as u8,page_fault.gfn );
-        for iter in tdp_iter{
-            if !(iter.valid && iter.gfn<page_fault.gfn +1) {//fixme:不懂这里的判断条件
+        tdp_iter.start(
+            virt_2_phys(mmu.root.hpa as usize), /*__va */
+            mmu.root_role.level() as u8,
+            PageLevel::Level4K as u8,
+            page_fault.gfn,
+        );
+
+        for iter in tdp_iter {
+            if !(iter.valid && iter.gfn < page_fault.gfn + 1) {
+                //fixme:不懂这里的判断条件
                 break;
             }
             //fixme:这一步va->pa的转换可能有点问题
-
 
             // 如果启用了 NX 巨大页解决方法，则进行调整
             if page_fault.nx_huge_page_workaround_enabled {
                 page_fault.nx_huge_page_workaround_enabled = false;
             }
 
-            if iter.level == page_fault.goal_level{
+            if iter.level == page_fault.goal_level {
                 //self.map_handle_target_level(page_fault,&mut iter);
             }
-            
+
             //如果在比目标更高的级别有一个映射大页的 SPTE，
             //那么该 SPTE 必须被清除并替换为非叶子 SPTE。
             if is_shadow_present_pte(iter.old_spte) && !is_large_pte(iter.old_spte) {
@@ -301,59 +323,69 @@ impl VirtCpu {
             }
 
             //SPTE是non-present或者指向一个需要split的大页
-
-
         }
         todo!()
     }
     ///todo()!!!
-    fn map_handle_target_level(&self,page_fault:&mut KvmPageFault,iter: &mut TdpIter){
+    fn map_handle_target_level(&self, page_fault: &mut KvmPageFault, iter: &mut TdpIter) {
         todo!()
     }
 
-    fn direct_page_fault(&self,page_fault: &KvmPageFault)->Result<u64,SystemError>{
+    fn direct_page_fault(&self, page_fault: &KvmPageFault) -> Result<u64, SystemError> {
         todo!()
     }
-    fn kvm_faultin_pfn(&self,page_fault: &mut KvmPageFault,access: u32)->Result<PFRet, SystemError>{
-        page_fault.mmu_seq = self.kvm().lock().mmu_invalidate_seq;
+    fn kvm_faultin_pfn(
+        &self,
+        vm: &Vm,
+        page_fault: &mut KvmPageFault,
+        access: u32,
+    ) -> Result<PFRet, SystemError> {
+        page_fault.mmu_seq = vm.mmu_invalidate_seq;
         self.__kvm_faultin_pfn(page_fault)
     }
-    fn __kvm_faultin_pfn(&self,page_fault: &mut KvmPageFault)->Result<PFRet, SystemError>{
+    fn __kvm_faultin_pfn(&self, page_fault: &mut KvmPageFault) -> Result<PFRet, SystemError> {
         let slot = &page_fault.slot;
         let mut is_async = false;
         if slot.is_none() {
             return Err(SystemError::KVM_HVA_ERR_BAD);
         }
         let slot = slot.as_ref().unwrap().read();
-        
-            if slot.get_flags().bits()& UserMemRegionFlag::KVM_MEMSLOT_INVALID.bits()!= 0 {
-                return Ok(PFRet::Retry);
-            }
-            if !slot.is_visible(){
-                /* 不要将私有内存槽暴露给 L2。 */
-                if self.arch.is_guest_mode() {
-                    drop(slot);
-                    page_fault.slot = None;
-                    page_fault.pfn = KVM_PFN_NOSLOT;
-                    page_fault.map_writable = false;
-                    return Ok(PFRet::Continue);
-                }
-                /*
-                 * 如果 APIC 访问页面存在但被禁用，则直接进行仿真，
-                 * 而不缓存 MMIO 访问或创建 MMIO SPTE。
-                 * 这样，当 AVIC 重新启用时，不需要清除缓存。
-                 */
-                // if slot.get_id() == APIC_ACCESS_PAGE_PRIVATE_MEMSLOT && !self.kvm_apicv_activated() 
-                // {
-                //     return PFRet::Emulate;
-                // }
-            }
 
+        if slot.get_flags().bits() & UserMemRegionFlag::KVM_MEMSLOT_INVALID.bits() != 0 {
+            return Ok(PFRet::Retry);
+        }
+        if !slot.is_visible() {
+            /* 不要将私有内存槽暴露给 L2。 */
+            if self.arch.is_guest_mode() {
+                drop(slot);
+                page_fault.slot = None;
+                page_fault.pfn = KVM_PFN_NOSLOT;
+                page_fault.map_writable = false;
+                return Ok(PFRet::Continue);
+            }
+            /*
+             * 如果 APIC 访问页面存在但被禁用，则直接进行仿真，
+             * 而不缓存 MMIO 访问或创建 MMIO SPTE。
+             * 这样，当 AVIC 重新启用时，不需要清除缓存。
+             */
+            // if slot.get_id() == APIC_ACCESS_PAGE_PRIVATE_MEMSLOT && !self.kvm_apicv_activated()
+            // {
+            //     return PFRet::Emulate;
+            // }
+        }
 
         // 尝试将 GFN 转换为 PFN
-        page_fault.pfn = __gfn_to_pfn_memslot(Some(&slot), page_fault.gfn, false, false, &mut is_async,
-                                                   page_fault.write, &mut page_fault.map_writable,
-                                                   &mut page_fault.hva)?;
+        page_fault.pfn = __gfn_to_pfn_memslot(
+            Some(&slot),
+            page_fault.gfn,
+            false,
+            false,
+            &mut is_async,
+            page_fault.write,
+            &mut page_fault.map_writable,
+            &mut page_fault.hva,
+        )?;
+
         if !is_async {
             return Ok(PFRet::Continue); /* *pfn 已经有正确的页面 */
         }

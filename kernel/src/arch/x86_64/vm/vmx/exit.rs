@@ -4,7 +4,9 @@ use x86::vmx::vmcs::{guest, ro};
 
 use crate::{
     arch::vm::asm::{IntrInfo, VmxAsm},
-    virt::vm::kvm_host::vcpu::VirtCpu,
+    kerror,
+    libs::spinlock::SpinLockGuard,
+    virt::vm::kvm_host::{vcpu::VirtCpu, Vm},
 };
 
 use super::{ept::EptViolationExitQual, vmx_info, PageFaultErr};
@@ -32,7 +34,7 @@ pub struct VmxExitReason {
 }
 
 //#define VMX_EXIT_REASONS
-#[derive(FromPrimitive, PartialEq)]
+#[derive(FromPrimitive, PartialEq, Clone, Copy)]
 #[allow(non_camel_case_types)]
 pub enum VmxExitReasonBasic {
     EXCEPTION_OR_NMI = 0,
@@ -248,6 +250,7 @@ impl VmxExitHandlers {
     #[inline(never)]
     pub fn try_handle_exit(
         vcpu: &mut VirtCpu,
+        vm: &Vm,
         basic: VmxExitReasonBasic,
     ) -> Option<Result<u64, SystemError>> {
         match basic {
@@ -255,12 +258,12 @@ impl VmxExitHandlers {
                 return Some(Self::handle_io(vcpu));
             }
             VmxExitReasonBasic::EPT_VIOLATION => {
-                return Some(Self::handle_ept_violation(vcpu));
+                return Some(Self::handle_ept_violation(vcpu, vm));
             }
-
-            _ => {
-                None
+            VmxExitReasonBasic::EXTERNAL_INTERRUPT => {
+                return Some(Self::handle_external_interrupt(vcpu));
             }
+            _ => None,
         }
     }
 
@@ -268,7 +271,12 @@ impl VmxExitHandlers {
         todo!();
     }
 
-    fn handle_ept_violation(vcpu: &mut VirtCpu) -> Result<u64, SystemError> {
+    fn handle_external_interrupt(vcpu: &mut VirtCpu) -> Result<u64, SystemError> {
+        vcpu.stat.irq_exits += 1;
+        Ok(1)
+    }
+
+    fn handle_ept_violation(vcpu: &mut VirtCpu, vm: &Vm) -> Result<u64, SystemError> {
         let exit_qualification = vcpu.get_exit_qual();
 
         // EPT 违规发生在从 NMI 执行 iret 时，
@@ -286,12 +294,14 @@ impl VmxExitHandlers {
         // trace_kvm_page_fault(vcpu, gpa, exit_qualification);//fztodo!()
 
         // 根据故障类型确定错误代码
-        let mut error_code = if exit_qualification & (EptViolationExitQual::ACC_READ.bits()) != 0 {//active
+        let mut error_code = if exit_qualification & (EptViolationExitQual::ACC_READ.bits()) != 0 {
+            //active
             PageFaultErr::PFERR_USER.bits()
         } else {
             0
         };
-        error_code |= if exit_qualification & (EptViolationExitQual::ACC_WRITE.bits()) != 0 {//active
+        error_code |= if exit_qualification & (EptViolationExitQual::ACC_WRITE.bits()) != 0 {
+            //active
             PageFaultErr::PFERR_WRITE.bits()
         } else {
             0
@@ -307,7 +317,7 @@ impl VmxExitHandlers {
             0
         };
         error_code |= if exit_qualification & (EptViolationExitQual::GVA_TRANSLATED.bits()) != 0 {
-            PageFaultErr::PFERR_GUEST_FINAL.bits()//active
+            PageFaultErr::PFERR_GUEST_FINAL.bits() //active
         } else {
             PageFaultErr::PFERR_GUEST_PAGE.bits()
         };
@@ -323,6 +333,6 @@ impl VmxExitHandlers {
         //     return kvm_emulate_instruction(vcpu, 0);
         // }
 
-        vcpu.page_fault(gpa, error_code, None, 0)
+        vcpu.page_fault(vm, gpa, error_code, None, 0)
     }
 }

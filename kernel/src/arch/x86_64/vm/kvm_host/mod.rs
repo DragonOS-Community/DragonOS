@@ -38,7 +38,7 @@ pub const TSS_IOPB_SIZE: usize = 65536 / 8;
 pub const TSS_REDIRECTION_SIZE: usize = 256 / 8;
 pub const RMODE_TSS_SIZE: usize = TSS_BASE_SIZE + TSS_REDIRECTION_SIZE + TSS_IOPB_SIZE + 1;
 
-pub const KVM_PFN_NOSLOT:u64 = 0x1 << 63;
+pub const KVM_PFN_NOSLOT: u64 = 0x1 << 63;
 
 #[derive(Debug, Default)]
 pub struct X86KvmArch {
@@ -63,7 +63,7 @@ pub struct X86KvmArch {
 
     msr_fliter: Option<Box<KvmX86MsrFilter>>,
 
-    pub noncoherent_dma_count:AtomicU32,
+    pub noncoherent_dma_count: AtomicU32,
 }
 
 impl X86KvmArch {
@@ -219,6 +219,7 @@ pub trait KvmFunc: Send + Sync + Debug {
     fn handle_exit(
         &self,
         vcpu: &mut VirtCpu,
+        vm: &Vm,
         fastpath: ExitFastpathCompletion,
     ) -> Result<u64, SystemError>;
 }
@@ -401,7 +402,7 @@ bitflags! {
         const WRITE_PF_TO_SP = 1 << 8;
     }
 }
-#[derive(Default,Debug)]
+#[derive(Default, Debug)]
 ///用于跟踪和记录VCPU的各种统计信息。
 pub struct KvmVcpuStat {
     //pub generic: KvmVcpuStatGeneric,
@@ -441,12 +442,12 @@ pub struct KvmVcpuStat {
     pub notify_window_exits: u64,
 }
 #[inline]
-/// 将 GFN 转换为 GPA 
+/// 将 GFN 转换为 GPA
 pub fn gfn_to_gpa(gfn: u64) -> u64 {
     gfn << 12
 }
 #[inline]
-/// 将 GPA 转换为 GFN 
+/// 将 GPA 转换为 GFN
 pub fn gpa_to_gfn(gfn: u64) -> u64 {
     gfn >> 12
 }

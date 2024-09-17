@@ -1211,9 +1211,10 @@ impl KvmFunc for VmxKvmFunc {
         //vmx_handle_exit
         &self,
         vcpu: &mut VirtCpu,
+        vm: &Vm,
         fastpath: ExitFastpathCompletion,
     ) -> Result<u64, SystemError> {
-        let r = vmx_info().vmx_handle_exit(vcpu, fastpath);
+        let r = vmx_info().vmx_handle_exit(vcpu, vm, fastpath);
 
         if vcpu.vmx().exit_reason.bus_lock_detected() {
             todo!()
@@ -2977,6 +2978,7 @@ impl Vmx {
     pub fn vmx_handle_exit(
         &self,
         vcpu: &mut VirtCpu,
+        vm: &Vm,
         exit_fastpath: ExitFastpathCompletion,
     ) -> Result<u64, SystemError> {
         let exit_reason = vcpu.vmx().exit_reason;
@@ -3046,8 +3048,11 @@ impl Vmx {
         if exit_fastpath != ExitFastpathCompletion::None {
             return Err(SystemError::EINVAL);
         }
-        match VmxExitHandlers::try_handle_exit(vcpu, VmxExitReasonBasic::from(exit_reason.basic()))
-        {
+        match VmxExitHandlers::try_handle_exit(
+            vcpu,
+            vm,
+            VmxExitReasonBasic::from(exit_reason.basic()),
+        ) {
             Some(Ok(r)) => return Ok(r),
             Some(Err(_)) | None => unexpected_vmexit(vcpu),
         }

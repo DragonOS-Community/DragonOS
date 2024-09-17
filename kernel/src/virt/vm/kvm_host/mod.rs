@@ -18,7 +18,10 @@ use crate::{
         CurrentKvmManager, KvmArch, VirtCpuArch,
     },
     filesystem::vfs::file::{File, FileMode},
-    libs::{rbtree::RBTree, spinlock::{SpinLock, SpinLockGuard}},
+    libs::{
+        rbtree::RBTree,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
     mm::ucontext::AddressSpace,
     process::ProcessManager,
     smp::cpu::ProcessorId,
@@ -143,7 +146,7 @@ pub struct Vm {
     #[cfg(target_arch = "x86_64")]
     pub kvm_vmx: KvmVmx,
 
-    pub mmu_invalidate_seq:u64//用于表示内存管理单元（MMU）无效化序列号
+    pub mmu_invalidate_seq: u64, //用于表示内存管理单元（MMU）无效化序列号
 }
 
 impl Vm {
@@ -246,13 +249,21 @@ pub enum MutilProcessorState {
 ///当 "approx" 设置为 true 时，即使地址落在空洞中，也会返回 memslot。
 ///在这种情况下，将返回空洞边界的其中一个 memslot。
 /// 先简陋完成，原本是二分，现在先遍历
-pub fn search_memslots(slot_set:Arc<LockedVmMemSlotSet>,gfn:u64,/*_approx:bool*/)->Option<Arc<LockedKvmMemSlot>>{
-    let slots=slot_set.lock();
+pub fn search_memslots(
+    slot_set: Arc<LockedVmMemSlotSet>,
+    gfn: u64, /*_approx:bool*/
+) -> Option<Arc<LockedKvmMemSlot>> {
+    let slots = slot_set.lock();
     let node = &slots.gfn_tree;
     //let(start,end)=(0,node.len()-1);
-    for (_gfn_num,slot) in node.iter(){
+    for (_gfn_num, slot) in node.iter() {
         let slot_guard = slot.read();
-        if gfn >= slot_guard.base_gfn && gfn < slot_guard.base_gfn + slot_guard.npages as u64{
+        kdebug!(
+            "gfn:{gfn},slot base_gfn: {},slot npages: {}",
+            slot_guard.base_gfn,
+            slot_guard.npages
+        );
+        if gfn >= slot_guard.base_gfn && gfn < slot_guard.base_gfn + slot_guard.npages as u64 {
             return Some(slot.clone());
         }
     }

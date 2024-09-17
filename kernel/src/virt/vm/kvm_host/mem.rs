@@ -8,11 +8,17 @@ use hashbrown::HashMap;
 use system_error::SystemError;
 
 use crate::{
-    arch::{vm::mmu::mmu::PAGE_SIZE, MMArch}, libs::{
+    arch::{vm::mmu::mmu::PAGE_SIZE, MMArch},
+    libs::{
         rbtree::RBTree,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
-    }, mm::{kernel_mapper::KernelMapper, page::PageFlags, MemoryManagementArch, VirtAddr}, virt::{kvm::host_mem::PAGE_SHIFT, vm::{kvm_host::KVM_ADDRESS_SPACE_NUM, user_api::KvmUserspaceMemoryRegion}}
+    },
+    mm::{kernel_mapper::KernelMapper, page::PageFlags, MemoryManagementArch, VirtAddr},
+    virt::{
+        kvm::host_mem::PAGE_SHIFT,
+        vm::{kvm_host::KVM_ADDRESS_SPACE_NUM, user_api::KvmUserspaceMemoryRegion},
+    },
 };
 
 use super::{LockedVm, Vm};
@@ -21,14 +27,14 @@ pub const KVM_USER_MEM_SLOTS: u16 = u16::MAX;
 pub const KVM_INTERNAL_MEM_SLOTS: u16 = 3;
 pub const KVM_MEM_SLOTS_NUM: u16 = KVM_USER_MEM_SLOTS - KVM_INTERNAL_MEM_SLOTS;
 pub const KVM_MEM_MAX_NR_PAGES: usize = (1 << 31) - 1;
-pub const APIC_ACCESS_PAGE_PRIVATE_MEMSLOT: u16 = KVM_MEM_SLOTS_NUM+1;
+pub const APIC_ACCESS_PAGE_PRIVATE_MEMSLOT: u16 = KVM_MEM_SLOTS_NUM + 1;
 
 /// 对于普通的页帧号（PFN），最高的12位应该为零，
 /// 因此我们可以mask位62到位52来表示错误的PFN，
 /// mask位63来表示无槽的PFN。
-const KVM_PFN_ERR_MASK: u64 = 0x7ff << 52;//0x7FF0000000000000
-const KVM_PFN_ERR_NOSLOT_MASK: u64 = 0xfff << 52;//0xFFF0000000000000
-const KVM_PFN_NOSLOT: u64 = 1 << 63;//0x8000000000000000
+const KVM_PFN_ERR_MASK: u64 = 0x7ff << 52; //0x7FF0000000000000
+const KVM_PFN_ERR_NOSLOT_MASK: u64 = 0xfff << 52; //0xFFF0000000000000
+const KVM_PFN_NOSLOT: u64 = 1 << 63; //0x8000000000000000
 
 const KVM_PFN_ERR_FAULT: u64 = KVM_PFN_ERR_MASK;
 const KVM_PFN_ERR_HWPOISON: u64 = KVM_PFN_ERR_MASK + 1;
@@ -158,7 +164,7 @@ pub struct KvmMemSlot {
 }
 impl KvmMemSlot {
     pub fn check_aligned_addr(&self, align: usize) -> bool {
-        self.userspace_addr.data() % align  == 0
+        self.userspace_addr.data() % align == 0
     }
     pub fn get_flags(&self) -> UserMemRegionFlag {
         self.flags
@@ -166,9 +172,10 @@ impl KvmMemSlot {
     pub fn get_id(&self) -> u16 {
         self.id
     }
-     // 检查内存槽是否可见
+    // 检查内存槽是否可见
     pub fn is_visible(&self) -> bool {
-        self.id < KVM_USER_MEM_SLOTS && (self.flags.bits() & UserMemRegionFlag::KVM_MEMSLOT_INVALID.bits()) == 0
+        self.id < KVM_USER_MEM_SLOTS
+            && (self.flags.bits() & UserMemRegionFlag::KVM_MEMSLOT_INVALID.bits()) == 0
     }
 }
 
@@ -350,9 +357,8 @@ impl Vm {
             }
         };
 
-        if change == KvmMemoryChangeMode::Create
-            || change == KvmMemoryChangeMode::Move
-            || slots_guard.gfn_tree.contains_key(&base_gfn)
+        if (change == KvmMemoryChangeMode::Create || change == KvmMemoryChangeMode::Move)
+            && slots_guard.gfn_tree.contains_key(&base_gfn)
         {
             return Err(SystemError::EEXIST);
         }
@@ -594,8 +600,9 @@ fn __gfn_to_hva_many(
     let slot = slot.as_ref().unwrap();
 
     // 检查内存槽是否无效或尝试对只读内存槽进行写操作
-    if slot.flags.bits() & UserMemRegionFlag::KVM_MEMSLOT_INVALID.bits() != 0 || 
-       (slot.flags.bits() & UserMemRegionFlag::READONLY.bits() != 0) && write {
+    if slot.flags.bits() & UserMemRegionFlag::KVM_MEMSLOT_INVALID.bits() != 0
+        || (slot.flags.bits() & UserMemRegionFlag::READONLY.bits() != 0) && write
+    {
         return Err(SystemError::KVM_HVA_ERR_BAD);
     }
 
@@ -645,15 +652,15 @@ pub fn __gfn_to_pfn_memslot(
 ) -> Result<u64, SystemError> {
     let addr = __gfn_to_hva_many(&slot, gfn, None, write)?;
     *hva = addr;
-    
+
     //todo:检查地址是否为错误
 
     // 如果内存槽为只读，且 writable 不为空，则更新 writable 的值
     if slot.unwrap().flags.bits() & UserMemRegionFlag::READONLY.bits() != 0 {
         *writable = false;
     }
-    
-    let pfn = hva_to_pfn(addr, atomic,interruptible, is_async,write,writable)?;
+
+    let pfn = hva_to_pfn(addr, atomic, interruptible, is_async, write, writable)?;
     return Ok(pfn);
 }
 /// 将用户空间虚拟地址（HVA）转换为页帧号（PFN）。

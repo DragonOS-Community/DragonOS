@@ -1,7 +1,14 @@
 use bitfield_struct::bitfield;
 use system_error::SystemError;
+use x86::vmx::vmcs::{guest, ro};
 
-use crate::virt::vm::kvm_host::vcpu::VirtCpu;
+use crate::{
+    arch::vm::asm::{IntrInfo, VmxAsm},
+    virt::vm::kvm_host::vcpu::VirtCpu,
+};
+
+use super::{ept::EptViolationExitQual, vmx_info, PageFaultErr};
+extern crate num_traits;
 
 #[bitfield(u32)]
 pub struct VmxExitReason {
@@ -24,6 +31,7 @@ pub struct VmxExitReason {
     pub failed_vmentry: bool,
 }
 
+//#define VMX_EXIT_REASONS
 #[derive(FromPrimitive, PartialEq)]
 #[allow(non_camel_case_types)]
 pub enum VmxExitReasonBasic {
@@ -69,7 +77,7 @@ pub enum VmxExitReasonBasic {
     VM_ENTRY_FAILURE_MACHINE_CHECK_EVENT = 41,
     TPR_BELOW_THRESHOLD = 43,
     APIC_ACCESS = 44,
-    VIRTUALIZED_EOI = 45,
+    VIRTUALIZED_EOI = 45, // "EOI_INDUCED"
     ACCESS_GDTR_OR_IDTR = 46,
     ACCESS_LDTR_OR_TR = 47,
     EPT_VIOLATION = 48,
@@ -180,25 +188,141 @@ pub enum ExitFastpathCompletion {
     ReenterGuest,
     ExitHandled,
 }
+pub struct VmxExitHandlers {}
+//     //name 代表暂时不懂含义的(name linux=name DragonOS)
+//     ExceptionNmi = VmxExitReasonBasic::EXCEPTION_OR_NMI as isize,
+//     ExternalInterrupt = VmxExitReasonBasic::EXTERNAL_INTERRUPT as isize,
+//     TripleFault = VmxExitReasonBasic::TRIPLE_FAULT as isize,
+//     NmiWindow = VmxExitReasonBasic::NMI_WINDOW as isize,
+//     IoInstruction = VmxExitReasonBasic::IO_INSTRUCTION as isize,
+//     CrAccess = VmxExitReasonBasic::CR_ACCESS as isize,
+//     DrAccess = VmxExitReasonBasic::DR_ACCESS as isize,
+//     Cpuid = VmxExitReasonBasic::CPUID as isize,
+//     MsrRead = VmxExitReasonBasic::RDMSR as isize,
+//     MsrWrite = VmxExitReasonBasic::WRMSR as isize,
+//     InterruptWindow = VmxExitReasonBasic::INTERRUPT_WINDOW as isize,
+//     Hlt = VmxExitReasonBasic::HLT as isize,
+//     Invd = VmxExitReasonBasic::INVD as isize,
+//     Invlpg = VmxExitReasonBasic::INVLPG as isize,
+//     Rdpmc = VmxExitReasonBasic::RDPMC as isize,
+//     Vmcall = VmxExitReasonBasic::VMCALL as isize,
+//     Vmclear = VmxExitReasonBasic::VMCLEAR as isize,
+//     Vmlaunch = VmxExitReasonBasic::VMLAUNCH as isize,
+//     Vmptrld = VmxExitReasonBasic::VMPTRLD as isize,
+//     Vmptrst = VmxExitReasonBasic::VMPTRST as isize,
+//     Vmread = VmxExitReasonBasic::VMREAD as isize,
+//     Vmresume = VmxExitReasonBasic::VMRESUME as isize,
+//     Vmwrite = VmxExitReasonBasic::VMWRITE as isize,
+//     Vmoff = VmxExitReasonBasic::VMXOFF as isize,
+//     Vmon = VmxExitReasonBasic::VMXON as isize,
+//     TprBelowThreshold = VmxExitReasonBasic::TPR_BELOW_THRESHOLD as isize,
+//     ApicAccess = VmxExitReasonBasic::APIC_ACCESS as isize,
+//     ApicWrite = VmxExitReasonBasic::APIC_WRITE as isize,
+//     EoiInduced = VmxExitReasonBasic::VIRTUALIZED_EOI as isize, //name
+//     Wbinvd = VmxExitReasonBasic::WBINVD as isize,
+//     Xsetbv = VmxExitReasonBasic::XSETBV as isize,
+//     TaskSwitch = VmxExitReasonBasic::TASK_SWITCH as isize,
+//     MceDuringVmentry = VmxExitReasonBasic::VM_ENTRY_FAILURE_MACHINE_CHECK_EVENT as isize, //name
+//     GdtrIdtr = VmxExitReasonBasic::ACCESS_GDTR_OR_IDTR as isize,
+//     LdtrTr = VmxExitReasonBasic::ACCESS_LDTR_OR_TR as isize,
+//     EptViolation = VmxExitReasonBasic::EPT_VIOLATION as isize,
+//     EptMisconfig = VmxExitReasonBasic::EPT_MISCONFIG as isize,
+//     PauseInstruction = VmxExitReasonBasic::PAUSE as isize,
+//     MwaitInstruction = VmxExitReasonBasic::MWAIT as isize,
+//     MonitorTrapFlag = VmxExitReasonBasic::MONITOR_TRAP_FLAG as isize,
+//     MonitorInstruction = VmxExitReasonBasic::MONITOR as isize,
+//     Invept = VmxExitReasonBasic::INVEPT as isize,
+//     Invvpid = VmxExitReasonBasic::INVVPID as isize,
+//     Rdrand = VmxExitReasonBasic::RDRAND as isize,
+//     Rdseed = VmxExitReasonBasic::RDSEED as isize,
+//     PmlFull = VmxExitReasonBasic::PML_FULL as isize,
+//     Invpcid = VmxExitReasonBasic::INVPCID as isize,
+//     Vmfunc = VmxExitReasonBasic::VMFUNC as isize,
+//     PreemptionTimer = VmxExitReasonBasic::VMX_PREEMPTION_TIMER_EXPIRED as isize,
+//     Encls = VmxExitReasonBasic::ENCLS as isize,
+//     BusLock = VmxExitReasonBasic::BUS_LOCK as isize,
+//     Notify = VmxExitReasonBasic::NOTIFY as isize,
+//     Unknown,
 
-pub struct VmxExitHandler;
-
-impl VmxExitHandler {
-    pub fn handle(
+impl VmxExitHandlers {
+    #[inline(never)]
+    pub fn try_handle_exit(
         vcpu: &mut VirtCpu,
         basic: VmxExitReasonBasic,
-    ) -> Option<Result<(), SystemError>> {
+    ) -> Option<Result<u64, SystemError>> {
         match basic {
             VmxExitReasonBasic::IO_INSTRUCTION => {
                 return Some(Self::handle_io(vcpu));
             }
+            VmxExitReasonBasic::EPT_VIOLATION => {
+                return Some(Self::handle_ept_violation(vcpu));
+            }
+
             _ => {
-                return None;
+                None
             }
         }
     }
 
-    fn handle_io(vcpu: &mut VirtCpu) -> Result<(), SystemError> {
+    fn handle_io(vcpu: &mut VirtCpu) -> Result<u64, SystemError> {
         todo!();
+    }
+
+    fn handle_ept_violation(vcpu: &mut VirtCpu) -> Result<u64, SystemError> {
+        let exit_qualification = vcpu.get_exit_qual();
+
+        // EPT 违规发生在从 NMI 执行 iret 时，
+        // 在下一次 VM 进入之前必须设置 "blocked by NMI" 位。
+        // 有一些错误可能会导致该位未被设置：
+        // AAK134, BY25。
+        let vmx = vcpu.vmx();
+        if vmx.idt_vectoring_info.bits() & IntrInfo::INTR_INFO_VALID_MASK.bits() != 0
+            && vmx_info().enable_vnmi
+            && exit_qualification & IntrInfo::INTR_INFO_UNBLOCK_NMI.bits() as u64 != 0
+        {
+            VmxAsm::vmx_vmwrite(guest::INTERRUPTIBILITY_STATE, 0x8); //GUEST_INTR_STATE_NMI
+        }
+        let gpa = VmxAsm::vmx_vmread(ro::GUEST_PHYSICAL_ADDR_FULL);
+        // trace_kvm_page_fault(vcpu, gpa, exit_qualification);//fztodo!()
+
+        // 根据故障类型确定错误代码
+        let mut error_code = if exit_qualification & (EptViolationExitQual::ACC_READ.bits()) != 0 {//active
+            PageFaultErr::PFERR_USER.bits()
+        } else {
+            0
+        };
+        error_code |= if exit_qualification & (EptViolationExitQual::ACC_WRITE.bits()) != 0 {//active
+            PageFaultErr::PFERR_WRITE.bits()
+        } else {
+            0
+        };
+        error_code |= if exit_qualification & (EptViolationExitQual::ACC_INSTR.bits()) != 0 {
+            PageFaultErr::PFERR_FETCH.bits()
+        } else {
+            0
+        };
+        error_code |= if exit_qualification & (EptViolationExitQual::RWX_MASK.bits()) != 0 {
+            PageFaultErr::PFERR_PRESENT.bits()
+        } else {
+            0
+        };
+        error_code |= if exit_qualification & (EptViolationExitQual::GVA_TRANSLATED.bits()) != 0 {
+            PageFaultErr::PFERR_GUEST_FINAL.bits()//active
+        } else {
+            PageFaultErr::PFERR_GUEST_PAGE.bits()
+        };
+        //fixme:: 此时error_code为0x100000011,感觉有问题
+
+        vcpu.arch.exit_qual = exit_qualification;
+
+        // 检查 GPA 是否超出物理内存限制，因为这是一个客户机页面错误。
+        // 我们必须在这里模拟指令，因为如果非法地址是分页结构的地址，
+        // 则会设置 EPT_VIOLATION_ACC_WRITE 位。
+        // 或者，如果支持，我们还可以使用 EPT 违规的高级 VM 退出信息来重建页面错误代码。
+        // if allow_smaller_maxphyaddr && kvm_vcpu_is_illegal_gpa(vcpu, gpa) {
+        //     return kvm_emulate_instruction(vcpu, 0);
+        // }
+
+        vcpu.page_fault(gpa, error_code, None, 0)
     }
 }

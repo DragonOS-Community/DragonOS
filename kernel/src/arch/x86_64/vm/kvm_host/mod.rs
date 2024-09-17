@@ -1,4 +1,4 @@
-use core::fmt::Debug;
+use core::{fmt::Debug, sync::atomic::AtomicU32};
 
 use alloc::{boxed::Box, vec::Vec};
 use bit_field::BitField;
@@ -38,6 +38,8 @@ pub const TSS_IOPB_SIZE: usize = 65536 / 8;
 pub const TSS_REDIRECTION_SIZE: usize = 256 / 8;
 pub const RMODE_TSS_SIZE: usize = TSS_BASE_SIZE + TSS_REDIRECTION_SIZE + TSS_IOPB_SIZE + 1;
 
+pub const KVM_PFN_NOSLOT:u64 = 0x1 << 63;
+
 #[derive(Debug, Default)]
 pub struct X86KvmArch {
     /// 中断芯片模式
@@ -60,6 +62,8 @@ pub struct X86KvmArch {
     pub notify_window: u32,
 
     msr_fliter: Option<Box<KvmX86MsrFilter>>,
+
+    pub noncoherent_dma_count:AtomicU32,
 }
 
 impl X86KvmArch {
@@ -216,7 +220,7 @@ pub trait KvmFunc: Send + Sync + Debug {
         &self,
         vcpu: &mut VirtCpu,
         fastpath: ExitFastpathCompletion,
-    ) -> Result<(), SystemError>;
+    ) -> Result<u64, SystemError>;
 }
 
 /// ## 中断抑制的原因位
@@ -335,8 +339,8 @@ pub enum KvmReg {
     VcpuExregCr4,
     VcpuExregRflags,
     VcpuExregSegments,
-    VcpuExregExitInfo1,
-    VcpuExregExitInfo2,
+    VcpuExregExitInfo1, //EXITINFO1 provides the linear address of the memory operand.
+    VcpuExregExitInfo2, //EXITINFO2 provides the contents of the register operand.
 }
 
 bitflags! {
@@ -383,4 +387,66 @@ impl Vm {
 
         return x86_kvm_ops().vcpu_precreate(self);
     }
+}
+bitflags! {
+    pub struct EmulType: u32 {
+        const NO_DECODE = 1 << 0;
+        const TRAP_UD = 1 << 1;
+        const SKIP = 1 << 2;
+        const ALLOW_RETRY_PF = 1 << 3;
+        const TRAP_UD_FORCED = 1 << 4;
+        const VMWARE_GP = 1 << 5;
+        const PF = 1 << 6;
+        const COMPLETE_USER_EXIT = 1 << 7;
+        const WRITE_PF_TO_SP = 1 << 8;
+    }
+}
+#[derive(Default,Debug)]
+///用于跟踪和记录VCPU的各种统计信息。
+pub struct KvmVcpuStat {
+    //pub generic: KvmVcpuStatGeneric,
+    pub pf_taken: u64,
+    pub pf_fixed: u64,
+    pub pf_emulate: u64,
+    pub pf_spurious: u64,
+    pub pf_fast: u64,
+    pub pf_mmio_spte_created: u64,
+    pub pf_guest: u64,
+    pub tlb_flush: u64,
+    pub invlpg: u64,
+    pub exits: u64,
+    pub io_exits: u64,
+    pub mmio_exits: u64,
+    pub signal_exits: u64,
+    pub irq_window_exits: u64,
+    pub nmi_window_exits: u64,
+    pub l1d_flush: u64,
+    pub halt_exits: u64,
+    pub request_irq_exits: u64,
+    pub irq_exits: u64,
+    pub host_state_reload: u64,
+    pub fpu_reload: u64,
+    pub insn_emulation: u64,
+    pub insn_emulation_fail: u64,
+    pub hypercalls: u64,
+    pub irq_injections: u64,
+    pub nmi_injections: u64,
+    pub req_event: u64,
+    pub nested_run: u64,
+    pub directed_yield_attempted: u64,
+    pub directed_yield_successful: u64,
+    pub preemption_reported: u64,
+    pub preemption_other: u64,
+    pub guest_mode: u64,
+    pub notify_window_exits: u64,
+}
+#[inline]
+/// 将 GFN 转换为 GPA 
+pub fn gfn_to_gpa(gfn: u64) -> u64 {
+    gfn << 12
+}
+#[inline]
+/// 将 GPA 转换为 GFN 
+pub fn gpa_to_gfn(gfn: u64) -> u64 {
+    gfn >> 12
 }

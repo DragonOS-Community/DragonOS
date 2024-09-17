@@ -8,14 +8,11 @@ use hashbrown::HashMap;
 use system_error::SystemError;
 
 use crate::{
-    arch::MMArch,
-    libs::{
+    arch::{vm::mmu::mmu::PAGE_SIZE, MMArch}, libs::{
         rbtree::RBTree,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
-    },
-    mm::{MemoryManagementArch, VirtAddr},
-    virt::vm::{kvm_host::KVM_ADDRESS_SPACE_NUM, user_api::KvmUserspaceMemoryRegion},
+    }, mm::{kernel_mapper::KernelMapper, page::PageFlags, MemoryManagementArch, VirtAddr}, virt::{kvm::host_mem::PAGE_SHIFT, vm::{kvm_host::KVM_ADDRESS_SPACE_NUM, user_api::KvmUserspaceMemoryRegion}}
 };
 
 use super::{LockedVm, Vm};
@@ -24,6 +21,19 @@ pub const KVM_USER_MEM_SLOTS: u16 = u16::MAX;
 pub const KVM_INTERNAL_MEM_SLOTS: u16 = 3;
 pub const KVM_MEM_SLOTS_NUM: u16 = KVM_USER_MEM_SLOTS - KVM_INTERNAL_MEM_SLOTS;
 pub const KVM_MEM_MAX_NR_PAGES: usize = (1 << 31) - 1;
+pub const APIC_ACCESS_PAGE_PRIVATE_MEMSLOT: u16 = KVM_MEM_SLOTS_NUM+1;
+
+/// 对于普通的页帧号（PFN），最高的12位应该为零，
+/// 因此我们可以mask位62到位52来表示错误的PFN，
+/// mask位63来表示无槽的PFN。
+const KVM_PFN_ERR_MASK: u64 = 0x7ff << 52;//0x7FF0000000000000
+const KVM_PFN_ERR_NOSLOT_MASK: u64 = 0xfff << 52;//0xFFF0000000000000
+const KVM_PFN_NOSLOT: u64 = 1 << 63;//0x8000000000000000
+
+const KVM_PFN_ERR_FAULT: u64 = KVM_PFN_ERR_MASK;
+const KVM_PFN_ERR_HWPOISON: u64 = KVM_PFN_ERR_MASK + 1;
+const KVM_PFN_ERR_RO_FAULT: u64 = KVM_PFN_ERR_MASK + 2;
+const KVM_PFN_ERR_SIGPENDING: u64 = KVM_PFN_ERR_MASK + 3;
 
 #[derive(Debug, Default)]
 #[allow(dead_code)]
@@ -76,7 +86,7 @@ pub struct KvmMemSlotSet {
     /// 存储虚拟地址（hva）和内存插槽之间的映射关系
     hva_tree: RBTree<AddrRange, Arc<LockedKvmMemSlot>>,
     /// 用于存储全局页帧号（gfn）和内存插槽之间的映射关系
-    gfn_tree: RBTree<u64, Arc<LockedKvmMemSlot>>,
+    pub gfn_tree: RBTree<u64, Arc<LockedKvmMemSlot>>,
     /// 将内存插槽的ID映射到对应的内存插槽。
     slots: HashMap<u16, Arc<LockedKvmMemSlot>>,
 
@@ -132,9 +142,9 @@ impl LockedKvmMemSlot {
 #[derive(Debug, Default)]
 pub struct KvmMemSlot {
     /// 首个gfn
-    base_gfn: u64,
+    pub base_gfn: u64,
     /// 页数量
-    npages: usize,
+    pub npages: usize,
     /// 脏页位图
     dirty_bitmap: Option<AllocBitmap>,
     /// 架构相关
@@ -145,6 +155,21 @@ pub struct KvmMemSlot {
     as_id: u16,
 
     hva_node_key: [AddrRange; 2],
+}
+impl KvmMemSlot {
+    pub fn check_aligned_addr(&self, align: usize) -> bool {
+        self.userspace_addr.data() % align  == 0
+    }
+    pub fn get_flags(&self) -> UserMemRegionFlag {
+        self.flags
+    }
+    pub fn get_id(&self) -> u16 {
+        self.id
+    }
+     // 检查内存槽是否可见
+    pub fn is_visible(&self) -> bool {
+        self.id < KVM_USER_MEM_SLOTS && (self.flags.bits() & UserMemRegionFlag::KVM_MEMSLOT_INVALID.bits()) == 0
+    }
 }
 
 #[derive(Debug)]
@@ -540,4 +565,136 @@ impl Vm {
     fn swap_active_memslots(&mut self, as_id: usize) {
         self.memslots[as_id] = self.get_inactive_memslot_set(as_id);
     }
+}
+/// 将给定的客户机帧号（GFN）转换为用户空间虚拟地址（HVA），并根据内存槽的状态和标志进行相应的检查。
+///
+/// # 参数
+/// - `slot`: 可选的 `KvmMemSlot`，表示内存槽。
+/// - `gfn`: 客户机帧号（GFN），表示要转换的帧号。
+/// - `nr_pages`: 可选的可变引用，用于存储计算出的页数。
+/// - `write`: 布尔值，表示是否为写操作。
+///
+/// # 返回
+/// 如果成功，返回转换后的用户空间虚拟地址（HVA）；如果失败，返回相应的错误。
+///
+/// # 错误
+/// 如果内存槽为空或无效，或者尝试对只读内存槽进行写操作，则返回 `SystemError::KVM_HVA_ERR_BAD`。
+fn __gfn_to_hva_many(
+    slot: &Option<&KvmMemSlot>,
+    gfn: u64,
+    nr_pages: Option<&mut u64>,
+    write: bool,
+) -> Result<u64, SystemError> {
+    kdebug!("__gfn_to_hva_many");
+
+    // 检查内存槽是否为空
+    if slot.is_none() {
+        return Err(SystemError::KVM_HVA_ERR_BAD);
+    }
+    let slot = slot.as_ref().unwrap();
+
+    // 检查内存槽是否无效或尝试对只读内存槽进行写操作
+    if slot.flags.bits() & UserMemRegionFlag::KVM_MEMSLOT_INVALID.bits() != 0 || 
+       (slot.flags.bits() & UserMemRegionFlag::READONLY.bits() != 0) && write {
+        return Err(SystemError::KVM_HVA_ERR_BAD);
+    }
+
+    // 如果 `nr_pages` 不为空，计算并更新页数
+    if let Some(nr_pages) = nr_pages {
+        *nr_pages = slot.npages as u64 - (gfn - slot.base_gfn);
+    }
+
+    // 调用辅助函数将 GFN 转换为 HVA
+    return Ok(__gfn_to_hva_memslot(slot, gfn));
+}
+
+/// 将给定的全局帧号（GFN）转换为用户空间虚拟地址（HVA）。
+///
+/// # 参数
+/// - `slot`: `KvmMemSlot`，表示内存槽。
+/// - `gfn`: 全局帧号（GFN），表示要转换的帧号。
+///
+/// # 返回
+/// 转换后的用户空间虚拟地址（HVA）。
+fn __gfn_to_hva_memslot(slot: &KvmMemSlot, gfn: u64) -> u64 {
+    return slot.userspace_addr.data() as u64 + (gfn - slot.base_gfn) * PAGE_SIZE;
+}
+/// 将给定的全局帧号（GFN）转换为页帧号（PFN），并根据内存槽的状态和标志进行相应的检查。
+///
+/// # 参数
+/// - `slot`: 内存槽的引用。
+/// - `gfn`: 全局帧号（GFN），表示要转换的帧号。
+/// - `atomic`: 布尔值，表示是否为原子操作。
+/// - `interruptible`: 布尔值，表示操作是否可中断。
+/// - `async`: 可变引用，表示操作是否为异步。
+/// - `write_fault`: 布尔值，表示是否为写操作。
+/// - `writable`: 可变引用，表示是否可写。
+/// - `hva`: 可变引用，表示用户空间虚拟地址（HVA）。
+///
+/// # 返回
+/// 如果成功，返回转换后的页帧号（PFN）；如果失败，返回相应的错误。
+pub fn __gfn_to_pfn_memslot(
+    slot: Option<&KvmMemSlot>,
+    gfn: u64,
+    atomic: bool,
+    interruptible: bool,
+    is_async: &mut bool,
+    write: bool,
+    writable: &mut bool,
+    hva: &mut u64,
+) -> Result<u64, SystemError> {
+    let addr = __gfn_to_hva_many(&slot, gfn, None, write)?;
+    *hva = addr;
+    
+    //todo:检查地址是否为错误
+
+    // 如果内存槽为只读，且 writable 不为空，则更新 writable 的值
+    if slot.unwrap().flags.bits() & UserMemRegionFlag::READONLY.bits() != 0 {
+        *writable = false;
+    }
+    
+    let pfn = hva_to_pfn(addr, atomic,interruptible, is_async,write,writable)?;
+    return Ok(pfn);
+}
+/// 将用户空间虚拟地址（HVA）转换为页帧号（PFN）。
+///
+/// # 参数
+/// - `addr`: 用户空间虚拟地址（HVA）。
+/// - `atomic`: 布尔值，表示是否为原子操作。
+/// - `interruptible`: 布尔值，表示操作是否可中断。
+/// - `is_async`: 可变引用，表示操作是否为异步。
+/// - `write_fault`: 布尔值，表示是否为写操作。
+/// - `writable`: 可变引用，表示是否可写。
+///
+/// # 返回
+/// 如果成功，返回转换后的页帧号（PFN）；如果失败，返回相应的错误。
+// 正确性待验证
+pub fn hva_to_pfn(
+    addr: u64,
+    atomic: bool,
+    _interruptible: bool,
+    is_async: &mut bool,
+    _write_fault: bool,
+    _writable: &mut bool,
+) -> Result<u64, SystemError> {
+    // 我们可以原子地或异步地执行，但不能同时执行
+    assert!(!(atomic && *is_async), "Cannot be both atomic and async");
+
+    kdebug!("hva_to_pfn");
+    unsafe {
+        let raw = addr as *const i32;
+        kdebug!("raw={:x}", *raw);
+    }
+    // let hpa = MMArch::virt_2_phys(VirtAddr::new(addr)).unwrap().data() as u64;
+    let hva = VirtAddr::new(addr as usize);
+    let mut mapper = KernelMapper::lock();
+    let mapper = mapper.as_mut().unwrap();
+    if let Some((hpa, _)) = mapper.translate(hva) {
+        return Ok(hpa.data() as u64 >> PAGE_SHIFT);
+    }
+    unsafe {
+        mapper.map(hva, PageFlags::mmio_flags());
+    }
+    let (hpa, _) = mapper.translate(hva).unwrap();
+    return Ok(hpa.data() as u64 >> PAGE_SHIFT);
 }

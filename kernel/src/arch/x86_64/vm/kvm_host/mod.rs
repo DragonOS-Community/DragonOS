@@ -97,7 +97,7 @@ impl X86KvmArch {
 
     pub fn msr_allowed(&self, msr: u32, ftype: MsrFilterType) -> bool {
         // x2APIC MSRs
-        if msr >= 0x800 && msr <= 0x8ff {
+        if (0x800..=0x8ff).contains(&msr) {
             return true;
         }
 

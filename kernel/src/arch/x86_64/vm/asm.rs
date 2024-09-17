@@ -110,7 +110,7 @@ impl VmxAsm {
     pub fn vmx_vmwrite(vmcs_field: u32, value: u64) {
         unsafe {
             x86::bits64::vmx::vmwrite(vmcs_field, value)
-                .expect(&format!("vmcs_field: {:x} vmx_write fail", vmcs_field))
+                .unwrap_or_else(|_| panic!("vmcs_field: {:x} vmx_write fail", vmcs_field))
         }
     }
 

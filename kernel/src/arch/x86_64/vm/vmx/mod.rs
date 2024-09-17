@@ -2,6 +2,7 @@ use core::intrinsics::likely;
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicBool, Ordering};
 use exit::VmxExitHandlers;
+use x86::segmentation::GateDescriptorBuilder;
 use x86_64::registers::control::Cr3Flags;
 use x86_64::structures::paging::PhysFrame;
 
@@ -90,6 +91,7 @@ use self::{
 
 use super::asm::IntrInfo;
 use super::asm::SegmentCacheField;
+use super::kvm_host::vcpu::KvmIntrType;
 use super::kvm_host::RMODE_TSS_SIZE;
 use super::x86_kvm_ops;
 use super::{
@@ -128,6 +130,7 @@ impl VmxKvmInitFunc {
 }
 
 impl KvmInitFunc for VmxKvmInitFunc {
+    #[allow(clippy::borrow_interior_mutable_const)]
     #[inline(never)]
     fn hardware_setup(&self) -> Result<(), SystemError> {
         let idt = sidt();
@@ -311,6 +314,7 @@ pub struct VmxKvmFuncConfig {
 }
 
 impl VmxKvmFunc {
+    #[allow(clippy::declare_interior_mutable_const)]
     pub const CONFIG: RwLock<VmxKvmFuncConfig> = RwLock::new(VmxKvmFuncConfig {
         have_set_apic_access_page_addr: true,
         have_update_cr8_intercept: true,
@@ -400,7 +404,7 @@ impl VmxKvmFunc {
                 }
             }
 
-            let _ = current_loaded_vmcs_list_mut().extract_if(|x| Arc::ptr_eq(&x, loaded_vmcs));
+            let _ = current_loaded_vmcs_list_mut().extract_if(|x| Arc::ptr_eq(x, loaded_vmcs));
 
             guard.cpu = ProcessorId::INVALID;
             guard.launched = false;
@@ -868,7 +872,7 @@ impl KvmFunc for VmxKvmFunc {
             eb = !0;
         }
 
-        if !vmx_info().vmx_need_pf_intercept(&vcpu) {
+        if !vmx_info().vmx_need_pf_intercept(vcpu) {
             eb &= !(1 << PF_VECTOR);
         }
 
@@ -1051,7 +1055,10 @@ impl KvmFunc for VmxKvmFunc {
         vcpu.arch.clear_dirty();
 
         let cr3: (PhysFrame, Cr3Flags) = Cr3::read();
+        let cr3: (PhysFrame, Cr3Flags) = Cr3::read();
         if unlikely(cr3 != vcpu.vmx().loaded_vmcs().host_state.cr3) {
+            let cr3_combined: u64 =
+                (cr3.0.start_address().as_u64() & 0xFFFF_FFFF_FFFF_F000) | (cr3.1.bits() & 0xFFF);
             let cr3_combined: u64 =
                 (cr3.0.start_address().as_u64() & 0xFFFF_FFFF_FFFF_F000) | (cr3.1.bits() & 0xFFF);
             VmxAsm::vmx_vmwrite(host::CR3, cr3_combined);
@@ -1178,13 +1185,11 @@ impl KvmFunc for VmxKvmFunc {
     fn flush_tlb_all(&self, vcpu: &mut VirtCpu) {
         if vmx_info().enable_ept {
             VmxAsm::ept_sync_global();
+        } else if vmx_info().has_invvpid_global() {
+            VmxAsm::sync_vcpu_global();
         } else {
-            if vmx_info().has_invvpid_global() {
-                VmxAsm::sync_vcpu_global();
-            } else {
-                VmxAsm::sync_vcpu_single(vcpu.vmx().vpid);
-                // TODO: 嵌套：VmxAsm::sync_vcpu_single(vcpu.vmx().nested.vpid02);
-            }
+            VmxAsm::sync_vcpu_single(vcpu.vmx().vpid);
+            // TODO: 嵌套：VmxAsm::sync_vcpu_single(vcpu.vmx().nested.vpid02);
         }
     }
 
@@ -1196,7 +1201,7 @@ impl KvmFunc for VmxKvmFunc {
         let basic = VmxExitReasonBasic::from(vcpu.vmx().exit_reason.basic());
 
         if basic == VmxExitReasonBasic::EXTERNAL_INTERRUPT {
-            todo!()
+            Vmx::handle_external_interrupt_irqoff(vcpu);
         } else if basic == VmxExitReasonBasic::EXCEPTION_OR_NMI {
             todo!()
         }
@@ -1334,9 +1339,7 @@ impl Vmx {
         self.nested = false;
         self.enable_vmware_backdoor = false;
     }
-}
 
-impl Vmx {
     /*
      * Internal error codes that are used to indicate that MSR emulation encountered
      * an error that should result in #GP in the guest, unless userspace
@@ -1389,7 +1392,7 @@ impl Vmx {
 
     #[inline(never)]
     pub fn set_up_user_return_msrs() {
-        const VMX_URET_MSRS_LIST: &'static [u32] = &[
+        const VMX_URET_MSRS_LIST: &[u32] = &[
             msr::IA32_FMASK,
             msr::IA32_LSTAR,
             msr::IA32_CSTAR,
@@ -1412,7 +1415,7 @@ impl Vmx {
         vmcs_config: &mut VmcsConfig,
         vmx_cap: &mut VmxCapability,
     ) -> Result<(), SystemError> {
-        const VMCS_ENTRY_EXIT_PAIRS: &'static [VmcsEntryExitPair] = &[
+        const VMCS_ENTRY_EXIT_PAIRS: &[VmcsEntryExitPair] = &[
             VmcsEntryExitPair::new(
                 EntryControls::LOAD_IA32_PERF_GLOBAL_CTRL,
                 ExitControls::LOAD_IA32_PERF_GLOBAL_CTRL,
@@ -1654,7 +1657,7 @@ impl Vmx {
 
     fn setup_l1d_flush(&self) {
         // TODO:先这样写
-        *L1TF_VMX_MITIGATION.write() = VmxL1dFlushState::FlushNotRequired;
+        *L1TF_VMX_MITIGATION.write() = VmxL1dFlushState::NotRequired;
     }
 
     pub fn construct_eptp(&self, vcpu: &mut VirtCpu, root_hpa: u64, root_level: u32) -> u64 {
@@ -2282,8 +2285,8 @@ impl Vmx {
             if guest_efer != x86_kvm_manager().host_efer {
                 vcpu.vmx_mut().add_atomic_switch_msr(
                     msr::IA32_EFER,
-                    guest_efer.bits().into(),
-                    x86_kvm_manager().host_efer.bits().into(),
+                    guest_efer.bits(),
+                    x86_kvm_manager().host_efer.bits(),
                     false,
                 );
             } else {
@@ -2300,8 +2303,8 @@ impl Vmx {
             guest_efer.remove(ignore_efer);
             guest_efer.insert(x86_kvm_manager().host_efer & ignore_efer);
 
-            vcpu.vmx_mut().guest_uret_msrs[i].data = guest_efer.bits().into();
-            vcpu.vmx_mut().guest_uret_msrs[i].mask = (!ignore_efer).bits().into();
+            vcpu.vmx_mut().guest_uret_msrs[i].data = guest_efer.bits();
+            vcpu.vmx_mut().guest_uret_msrs[i].mask = (!ignore_efer).bits();
             return true;
         } else {
             return false;
@@ -2349,6 +2352,8 @@ impl Vmx {
         let cr3: (PhysFrame, Cr3Flags) = Cr3::read();
         let cr3_combined: u64 =
             (cr3.0.start_address().as_u64() & 0xFFFF_FFFF_FFFF_F000) | (cr3.1.bits() & 0xFFF);
+        let cr3_combined: u64 =
+            (cr3.0.start_address().as_u64() & 0xFFFF_FFFF_FFFF_F000) | (cr3.1.bits() & 0xFFF);
         VmxAsm::vmx_vmwrite(host::CR3, cr3_combined);
         loaded_vmcs_host_state.cr3 = cr3;
 
@@ -2374,7 +2379,7 @@ impl Vmx {
         );
 
         VmxAsm::vmx_vmwrite(host::IDTR_BASE, self.host_idt_base);
-        VmxAsm::vmx_vmwrite(host::RIP, vmx_vmexit as u64);
+        VmxAsm::vmx_vmwrite(host::RIP, vmx_vmexit as usize as u64);
 
         let val = unsafe { rdmsr(msr::IA32_SYSENTER_CS) };
 
@@ -2706,7 +2711,7 @@ impl Vmx {
 
         if !vmx_info().emulate_invalid_guest_state {
             var.selector = (var.base >> 4) as u16;
-            var.base = var.base & 0xffff0;
+            var.base &= 0xffff0;
             var.limit = 0xffff;
             var.g = 0;
             var.db = 0;
@@ -2938,7 +2943,7 @@ impl Vmx {
 
         if VmxExitReasonBasic::from(vcpu.vmx().exit_reason.basic())
             == VmxExitReasonBasic::EXCEPTION_OR_NMI
-            && VmcsIntrHelper::is_nmi(Vmx::vmx_get_intr_info(vcpu))
+            && VmcsIntrHelper::is_nmi(&Vmx::vmx_get_intr_info(vcpu))
         {
             todo!()
         }
@@ -3048,6 +3053,24 @@ impl Vmx {
         }
     }
 
+    #[allow(unreachable_code)]
+    pub fn handle_external_interrupt_irqoff(vcpu: &mut VirtCpu) {
+        let intr_info = Vmx::vmx_get_intr_info(vcpu);
+        let vector = intr_info & IntrInfo::INTR_INFO_VECTOR_MASK;
+        // let desc = vmx_info().host_idt_base + vector.bits() as u64;
+        if !VmcsIntrHelper::is_external_intr(&intr_info) {
+            kerror!("unexpected VM-Exit interrupt info: {:?}", intr_info);
+            return;
+        }
+
+        vcpu.arch.kvm_before_interrupt(KvmIntrType::Irq);
+        // TODO
+        kwarn!("handle_external_interrupt_irqoff TODO");
+        vcpu.arch.kvm_after_interrupt();
+
+        vcpu.arch.at_instruction_boundary = true;
+    }
+
     /// 需要在缓存中更新的寄存器集。此处未列出的其他寄存器在 VM 退出后立即同步到缓存。
     pub const VMX_REGS_LAZY_LOAD_SET: &'static [usize] = &[
         KvmReg::VcpuRegsRip as usize,
@@ -3119,13 +3142,7 @@ impl VmxMsrs {
     pub const MAX_NR_LOADSTORE_MSRS: usize = 8;
 
     pub fn find_loadstore_msr_slot(&self, msr: u32) -> Option<usize> {
-        for i in 0..self.nr {
-            if self.val[i].index == msr {
-                return Some(i);
-            }
-        }
-
-        None
+        return (0..self.nr).find(|&i| self.val[i].index == msr);
     }
 }
 
@@ -3521,12 +3538,12 @@ impl VmxVCpuPriv {
             return;
         }
 
-        let i = if i.is_none() {
+        let i = if let Some(i) = i {
+            i
+        } else {
             m.guest.nr += 1;
             VmxAsm::vmx_vmwrite(control::VMENTRY_MSR_LOAD_COUNT, m.guest.nr as u64);
             m.guest.nr
-        } else {
-            i.unwrap()
         };
 
         m.guest.val[i].index = msr;
@@ -3536,12 +3553,12 @@ impl VmxVCpuPriv {
             return;
         }
 
-        let j = if j.is_none() {
+        let j = if let Some(j) = j {
+            j
+        } else {
             m.host.nr += 1;
             VmxAsm::vmx_vmwrite(control::VMEXIT_MSR_LOAD_COUNT, m.host.nr as u64);
             m.host.nr
-        } else {
-            j.unwrap()
         };
 
         m.host.val[j].index = msr;
@@ -3619,12 +3636,12 @@ bitflags! {
 #[derive(Debug, PartialEq)]
 #[allow(dead_code)]
 pub enum VmxL1dFlushState {
-    FlushAuto,
-    FlushNever,
-    FlushCond,
-    FlushAlways,
-    FlushEptDisabled,
-    FlushNotRequired,
+    Auto,
+    Never,
+    Cond,
+    Always,
+    EptDisabled,
+    NotRequired,
 }
 
 pub struct VmxSegmentField {
@@ -3634,7 +3651,7 @@ pub struct VmxSegmentField {
     ar_bytes: u32,
 }
 
-pub const KVM_VMX_SEGMENT_FIELDS: &'static [VmxSegmentField] = &[
+pub const KVM_VMX_SEGMENT_FIELDS: &[VmxSegmentField] = &[
     // CS
     VmxSegmentField {
         selector: guest::CS_SELECTOR,
@@ -3693,7 +3710,7 @@ pub const KVM_VMX_SEGMENT_FIELDS: &'static [VmxSegmentField] = &[
     },
 ];
 
-pub static L1TF_VMX_MITIGATION: RwLock<VmxL1dFlushState> = RwLock::new(VmxL1dFlushState::FlushAuto);
+pub static L1TF_VMX_MITIGATION: RwLock<VmxL1dFlushState> = RwLock::new(VmxL1dFlushState::Auto);
 
 pub fn vmx_init() -> Result<(), SystemError> {
     let cpuid = CpuId::new();

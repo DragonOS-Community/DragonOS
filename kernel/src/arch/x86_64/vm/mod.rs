@@ -144,7 +144,7 @@ impl KvmArchManager {
 
     pub fn mpx_supported(&self) -> bool {
         self.kvm_caps.supported_xcr0 & (Xcr0::XCR0_BNDREG_STATE | Xcr0::XCR0_BNDCSR_STATE)
-            == (Xcr0::XCR0_BNDREG_STATE | Xcr0::XCR0_BNDREG_STATE)
+            == (Xcr0::XCR0_BNDREG_STATE | Xcr0::XCR0_BNDCSR_STATE)
     }
 
     pub const KVM_MAX_VCPUS: usize = 1024;
@@ -512,7 +512,7 @@ impl KvmArchManager {
             & ArchCapabilities::KVM_SUPPORTED_ARCH_CAP;
         data.insert(ArchCapabilities::ARCH_CAP_PSCHANGE_MC_NO);
 
-        if *L1TF_VMX_MITIGATION.read() != VmxL1dFlushState::FlushNever {
+        if *L1TF_VMX_MITIGATION.read() != VmxL1dFlushState::Never {
             data.insert(ArchCapabilities::ARCH_CAP_SKIP_VMENTRY_L1DFLUSH);
         }
 

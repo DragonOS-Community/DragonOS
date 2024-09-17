@@ -450,10 +450,13 @@ impl VirtCpuArch {
 
         if !context.cpu_role.base.is_cr0_pg() {
             // todo: context->gva_to_gpa = nonpaging_gva_to_gpa;
+            kwarn!("context->gva_to_gpa = nonpaging_gva_to_gpa todo!");
         } else if context.cpu_role.base.is_cr4_pae() {
             // todo: context->gva_to_gpa = paging64_gva_to_gpa;
+            kwarn!("context->gva_to_gpa = paging64_gva_to_gpa todo!");
         } else {
             // todo: context->gva_to_gpa = paging32_gva_to_gpa;
+            kwarn!("context->gva_to_gpa = paging32_gva_to_gpa todo!");
         }
 
         // todo:

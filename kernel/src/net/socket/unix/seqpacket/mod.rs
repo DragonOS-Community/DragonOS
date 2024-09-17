@@ -297,7 +297,6 @@ impl Socket for SeqpacketSocket{
     fn recv_from(
             &self, 
             buffer: &mut [u8],
-            len: usize,
             flags: MessageFlag,
             _address: Option<Endpoint>,
         ) -> Result<(usize, Endpoint), SystemError> {

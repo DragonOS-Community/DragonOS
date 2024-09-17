@@ -511,12 +511,11 @@ impl Socket for NetlinkSock {
     fn recv_from(
         &self,
         msg: &mut [u8],
-        len: usize,
         flags: MessageFlag,
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
         log::debug!("NetlinkSock recv_from");
-        return self.netlink_recv(msg, len, flags);
+        return self.netlink_recv(msg, flags);
     }
     fn send_buffer_size(&self) -> usize {
         log::warn!("send_buffer_size is implemented to 0");
@@ -716,7 +715,6 @@ impl NetlinkSock {
     fn netlink_recv(
         &self,
         msg: &mut [u8],
-        len: usize,
         flags: MessageFlag,
     ) -> Result<(usize, Endpoint), SystemError> {
         let mut copied: usize = 0;
@@ -730,7 +728,7 @@ impl NetlinkSock {
         }
 
         // 计算实际要复制的数据长度，不能超过 msg_from 的长度 或 msg 缓冲区的长度
-        let actual_len = msg_kernel.len().min(len);
+        let actual_len = msg_kernel.len().min(msg.len());
 
         if !msg_kernel.is_empty() {
             msg[..actual_len].copy_from_slice(&msg_kernel[..actual_len]);

@@ -320,7 +320,6 @@ impl Socket for StreamSocket {
     fn recv_from(
         &self,
         buffer: &mut [u8],
-        len: usize,
         flags: socket::MessageFlag,
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {

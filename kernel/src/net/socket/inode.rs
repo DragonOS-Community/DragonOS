@@ -148,7 +148,7 @@ impl Inode {
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
 
-        self.inner.recv_from(buffer, buffer.len(), flags, address)
+        self.inner.recv_from(buffer, flags, address)
     }
 
     pub fn shutdown(&self, how: ShutdownTemp) -> Result<(), SystemError> {

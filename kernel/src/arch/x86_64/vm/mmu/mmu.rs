@@ -1,4 +1,12 @@
-use crate::{arch::mm::X86_64MMArch, kdebug};
+use crate::kerror;
+use crate::virt::kvm::host_mem::PAGE_SHIFT;
+use crate::{arch::mm::X86_64MMArch, kdebug, kwarn};
+use crate::{
+    arch::{mm::LockedFrameAllocator, MMArch, VirtCpuArch},
+    libs::spinlock::{SpinLock, SpinLockGuard},
+    mm::{page::PageMapper, MemoryManagementArch, PageTableKind},
+    virt::vm::kvm_host::{vcpu::VirtCpu, Vm},
+};
 use alloc::{sync::Arc, vec::Vec};
 use bitfield_struct::bitfield;
 use core::intrinsics::likely;
@@ -7,14 +15,11 @@ use system_error::SystemError;
 use x86::controlregs::{Cr0, Cr4};
 use x86_64::registers::control::EferFlags;
 
-use crate::{
-    arch::{mm::LockedFrameAllocator, MMArch, VirtCpuArch},
-    libs::spinlock::{SpinLock, SpinLockGuard},
-    mm::{page::PageMapper, MemoryManagementArch, PageTableKind},
-    virt::vm::kvm_host::{vcpu::VirtCpu, Vm},
+use super::super::{
+    vmx::vmx_info,
+    x86_kvm_ops,
 };
-
-use super::{vmx::vmx_info, x86_kvm_ops};
+use super::mmu_internal::KvmPageFault;
 
 const PT64_ROOT_5LEVEL: usize = 5;
 const PT64_ROOT_4LEVEL: usize = 4;
@@ -31,14 +36,49 @@ static mut SHADOW_ACCESSED_MASK: usize = 0;
 
 static mut MAX_HUGE_PAGE_LEVEL: PageLevel = PageLevel::None;
 
+pub const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
+
+pub fn is_tdp_mmu_enabled()->bool{
+    unsafe { TDP_MMU_ENABLED }
+}
+
 #[allow(dead_code)]
+#[repr(u8)]
 pub enum PageLevel {
     None,
-    Level4k,
+    Level4K,
     Level2M,
     Level1G,
     Level512G,
     LevelNum,
+}
+impl PageLevel {
+    fn kvm_hpage_gfn_shift(level: u8) -> u32 {
+        ((level - 1) * 9) as u32
+    }
+    
+    fn kvm_hpage_shift(level: u8) -> u32 {
+        PAGE_SHIFT + Self::kvm_hpage_gfn_shift(level)
+    }
+    
+    fn kvm_hpage_size(level: u8) -> u64 {
+        1 << Self::kvm_hpage_shift(level)
+    }
+    /// 计算每个大页包含的页数
+    ///
+    /// # 参数
+    /// - `level`: 页级别
+    ///
+    /// # 返回值
+    /// 返回每个大页包含的页数
+    pub fn kvm_pages_per_hpage(level: u8) -> u64 {
+        Self::kvm_hpage_size(level) / PAGE_SIZE
+    }
+    
+}
+///计算给定 GFN（Guest Frame Number）在指定级别上的对齐值
+pub fn gfn_round_for_level(gfn: u64, level: u8) -> u64 {
+    gfn & !(PageLevel::kvm_pages_per_hpage(level) - 1)
 }
 
 #[derive(Debug)]
@@ -58,12 +98,16 @@ impl LockedKvmMmu {
     }
 }
 
+pub type KvmMmuPageFaultHandler =
+    fn(vcpu: &mut VirtCpu, page_fault:&KvmPageFault) -> Result<u64, SystemError>;
+
 #[derive(Debug, Default)]
 #[allow(dead_code)]
 pub struct KvmMmu {
     pub root: KvmMmuRootInfo,
     pub cpu_role: KvmCpuRole,
     pub root_role: KvmMmuPageRole,
+    pub page_fault: Option<KvmMmuPageFaultHandler>,
 
     pkru_mask: u32,
 
@@ -148,7 +192,7 @@ impl PartialEq for KvmCpuRole {
 pub struct KvmMmuPageRole {
     /// 表示页表级别，占用 4 位。对于普通的页表，取值是 2（二级页表）、3（三级页表）、4（四级页表）和 5（五级页表）
     #[bits(4)]
-    level: u32,
+    pub level: u32,
     /// 页表项是否为 4 字节，占用 1 位。在非 PAE 分页模式下，该值为 1
     has_4_byte_gpte: bool,
     /// 表示页表项所在的象限，占用 2 位。该字段仅在 has_4_byte_gpte 为 1 时有效。
@@ -180,7 +224,7 @@ pub struct KvmMmuPageRole {
     unused: u32,
     /// 表示 SMM（System Management Mode）模式
     #[bits(8)]
-    smm: u32,
+    pub smm: u32,
 }
 
 impl KvmMmuPageRole {
@@ -190,6 +234,9 @@ impl KvmMmuPageRole {
 
     pub fn is_cr4_pae(&self) -> bool {
         !self.has_4_byte_gpte()
+    }
+    pub fn get_direct(&self) -> bool {
+        self.direct()
     }
 }
 
@@ -213,6 +260,38 @@ pub struct KvmMmuRoleRegs {
     pub efer: EferFlags,
 }
 
+/// page falut的返回值, 用于表示页面错误的处理结果
+/// 应用在handle_mmio_page_fault()、mmu.page_fault()、fast_page_fault()和
+/// kvm_mmu_do_page_fault()等
+#[derive(Debug, Eq, PartialEq, FromPrimitive)]
+#[repr(u32)]
+pub enum PFRet {
+    Continue,       // RET_PF_CONTINUE: 到目前为止一切正常，继续处理页面错误。
+    Retry,          // RET_PF_RETRY: 让 CPU 再次对该地址发生页面错误。
+    Emulate,        // RET_PF_EMULATE: MMIO 页面错误，直接模拟指令。
+    Invalid,        // RET_PF_INVALID: SPTE 无效，让实际的页面错误路径更新它。
+    Fixed,          // RET_PF_FIXED: 故障的条目已经被修复
+    Spurious,       // RET_PF_SPURIOUS: 故障的条目已经被修复，例如由另一个 vCPU 修复。
+    Err = u32::MAX, // 错误
+}
+impl From<PFRet> for u64 {
+    fn from(pf_ret: PFRet) -> Self {
+        pf_ret as u64
+    }
+}
+impl From<u64> for PFRet {
+    fn from(value: u64) -> Self {
+        match value {
+            0 => PFRet::Continue,
+            1 => PFRet::Retry,
+            2 => PFRet::Emulate,
+            3 => PFRet::Invalid,
+            4 => PFRet::Fixed,
+            5 => PFRet::Spurious,
+            _ => PFRet::Err, // 默认返回 Invalid
+        }
+    }
+}
 impl VirtCpuArch {
     pub fn kvm_init_mmu(&mut self) {
         let regs = self.role_regs();

@@ -26,7 +26,7 @@ use crate::{
             asm::{hyperv, kvm_msr, KvmX86Asm, MiscEnable, MsrData, VcpuSegment},
             cpuid::KvmCpuidEntry2,
             kvm_host::KvmReg,
-            mmu::LockedKvmMmu,
+            mmu::mmu::LockedKvmMmu,
             uapi::{UapiKvmSegmentRegs, KVM_SYNC_X86_VALID_FIELDS},
             vmx::{vmcs::ControlsType, vmx_info},
             x86_kvm_manager, x86_kvm_manager_mut, x86_kvm_ops,
@@ -141,6 +141,9 @@ pub struct X86VcpuArch {
     pub at_instruction_boundary: bool,
 
     pub db: [usize; Self::KVM_NR_DB_REGS],
+
+    /* set at EPT violation at this point */
+    pub exit_qual: u64,
 }
 
 impl X86VcpuArch {
@@ -155,6 +158,7 @@ impl X86VcpuArch {
         ret.mp_state = MutilProcessorState::Runnable;
 
         ret.apic = None;
+        //max_phyaddr=?? fztodo
         *ret
     }
 
@@ -839,7 +843,10 @@ impl VirtCpu {
 
         // TODO: 一些中断或者tsc操作
 
-        return x86_kvm_ops().handle_exit(self, exit_fastpath);
+        match x86_kvm_ops().handle_exit(self, exit_fastpath){
+            Err(err)=>return Err(err),
+            Ok(_)=>{Ok(())}
+        }
     }
 
     fn flush_tlb_all(&mut self) {

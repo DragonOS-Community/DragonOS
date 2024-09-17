@@ -6,8 +6,11 @@ use alloc::{
 
 use crate::{
     arch::{
-        vm::{kvm_host::vcpu::VirtCpuRequest, vmx::VmxVCpuPriv},
-        VirtCpuArch,
+        vm::{
+            kvm_host::{vcpu::VirtCpuRequest, KvmReg},
+            vmx::VmxVCpuPriv,
+        },
+        VirtCpuArch, VirtCpuStat,
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
     process::Pid,
@@ -61,6 +64,7 @@ pub struct VirtCpu {
     pub stats_id: String,
     pub pv_time: GfnToHvaCache,
     pub arch: VirtCpuArch,
+    pub stat: VirtCpuStat,
 
     pub mode: VcpuMode,
 
@@ -88,6 +92,19 @@ impl VirtCpu {
     #[cfg(target_arch = "x86_64")]
     pub fn vmx_mut(&mut self) -> &mut VmxVCpuPriv {
         self.private.as_mut().unwrap()
+    }
+    //https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/vmx/vmx.h?fi=vmx_get_exit_qual#677
+    #[inline]
+    pub fn get_exit_qual(&mut self) -> u64 {
+        if !self
+            .arch
+            .test_and_mark_available(KvmReg::VcpuExregExitInfo1)
+        {
+            self.vmx_mut().vmread_exit_qual();
+        }
+        let vmx = self.vmx();
+        vmx.get_exit_qual()
+        //vmx.
     }
 }
 

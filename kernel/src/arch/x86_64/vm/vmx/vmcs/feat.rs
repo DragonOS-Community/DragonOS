@@ -85,9 +85,8 @@ impl VmxFeat {
     pub const KVM_REQUIRED_VMX_PIN_BASED_VM_EXEC_CONTROL: u32 =
         PinbasedControls::EXTERNAL_INTERRUPT_EXITING.bits() | PinbasedControls::NMI_EXITING.bits();
 
-    pub const KVM_OPTIONAL_VMX_PIN_BASED_VM_EXEC_CONTROL: u32 = PinbasedControls::VIRTUAL_NMIS
-        .bits()
-        | PinbasedControls::POSTED_INTERRUPTS.bits();
+    pub const KVM_OPTIONAL_VMX_PIN_BASED_VM_EXEC_CONTROL: u32 =
+        PinbasedControls::VIRTUAL_NMIS.bits() | PinbasedControls::POSTED_INTERRUPTS.bits();
 
     pub const KVM_REQUIRED_VMX_VM_ENTRY_CONTROLS: u32 =
         EntryControls::LOAD_DEBUG_CONTROLS.bits() | EntryControls::IA32E_MODE_GUEST.bits();

@@ -1,11 +1,12 @@
 use core::intrinsics::likely;
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicBool, Ordering};
+use exit::VmxExitHandlers;
 use x86_64::registers::control::Cr3Flags;
 use x86_64::structures::paging::PhysFrame;
 
 use crate::arch::process::table::USER_DS;
-use crate::arch::vm::mmu::KvmMmu;
+use crate::arch::vm::mmu::mmu::KvmMmu;
 use crate::arch::vm::uapi::kvm_exit;
 use crate::arch::vm::uapi::{
     AC_VECTOR, BP_VECTOR, DB_VECTOR, GP_VECTOR, MC_VECTOR, NM_VECTOR, PF_VECTOR, UD_VECTOR,
@@ -100,6 +101,7 @@ use super::{
 
 pub mod asm;
 pub mod capabilities;
+pub mod ept;
 pub mod exit;
 pub mod vmcs;
 
@@ -1048,9 +1050,10 @@ impl KvmFunc for VmxKvmFunc {
 
         vcpu.arch.clear_dirty();
 
-        let cr3: (PhysFrame,Cr3Flags) = Cr3::read();
+        let cr3: (PhysFrame, Cr3Flags) = Cr3::read();
         if unlikely(cr3 != vcpu.vmx().loaded_vmcs().host_state.cr3) {
-            let cr3_combined: u64 = (cr3.0.start_address().as_u64() & 0xFFFF_FFFF_FFFF_F000) | (cr3.1.bits() & 0xFFF);
+            let cr3_combined: u64 =
+                (cr3.0.start_address().as_u64() & 0xFFFF_FFFF_FFFF_F000) | (cr3.1.bits() & 0xFFF);
             VmxAsm::vmx_vmwrite(host::CR3, cr3_combined);
             vcpu.vmx().loaded_vmcs().host_state.cr3 = cr3;
         }
@@ -1200,10 +1203,11 @@ impl KvmFunc for VmxKvmFunc {
     }
 
     fn handle_exit(
+        //vmx_handle_exit
         &self,
         vcpu: &mut VirtCpu,
         fastpath: ExitFastpathCompletion,
-    ) -> Result<(), SystemError> {
+    ) -> Result<u64, SystemError> {
         let r = vmx_info().vmx_handle_exit(vcpu, fastpath);
 
         if vcpu.vmx().exit_reason.bus_lock_detected() {
@@ -2343,7 +2347,8 @@ impl Vmx {
         VmxAsm::vmx_vmwrite(host::CR0, unsafe { cr0() }.bits() as u64);
 
         let cr3: (PhysFrame, Cr3Flags) = Cr3::read();
-        let cr3_combined: u64 = (cr3.0.start_address().as_u64() & 0xFFFF_FFFF_FFFF_F000) | (cr3.1.bits() & 0xFFF);
+        let cr3_combined: u64 =
+            (cr3.0.start_address().as_u64() & 0xFFFF_FFFF_FFFF_F000) | (cr3.1.bits() & 0xFFF);
         VmxAsm::vmx_vmwrite(host::CR3, cr3_combined);
         loaded_vmcs_host_state.cr3 = cr3;
 
@@ -2968,10 +2973,10 @@ impl Vmx {
         &self,
         vcpu: &mut VirtCpu,
         exit_fastpath: ExitFastpathCompletion,
-    ) -> Result<(), SystemError> {
+    ) -> Result<u64, SystemError> {
         let exit_reason = vcpu.vmx().exit_reason;
 
-        let unexpected_vmexit = |vcpu: &mut VirtCpu| -> Result<(), SystemError> {
+        let unexpected_vmexit = |vcpu: &mut VirtCpu| -> Result<u64, SystemError> {
             kerror!("vmx: unexpected exit reason {:?}\n", exit_reason);
 
             self.dump_vmcs(vcpu);
@@ -2986,7 +2991,7 @@ impl Vmx {
                 run.__bindgen_anon_1.internal.data[1] = cpu;
             }
 
-            return Ok(());
+            return Ok(0);
         };
 
         let vectoring_info = vcpu.vmx().idt_vectoring_info;
@@ -3036,8 +3041,11 @@ impl Vmx {
         if exit_fastpath != ExitFastpathCompletion::None {
             return Err(SystemError::EINVAL);
         }
-
-        todo!()
+        match VmxExitHandlers::try_handle_exit(vcpu, VmxExitReasonBasic::from(exit_reason.basic()))
+        {
+            Some(Ok(r)) => return Ok(r),
+            Some(Err(_)) | None => unexpected_vmexit(vcpu),
+        }
     }
 
     /// 需要在缓存中更新的寄存器集。此处未列出的其他寄存器在 VM 退出后立即同步到缓存。
@@ -3209,6 +3217,8 @@ pub struct VmxVCpuPriv {
 
     req_immediate_exit: bool,
     guest_state_loaded: bool,
+
+    exit_qualification: u64, //暂时不知道用处fztodo
 }
 
 #[derive(Debug, Default)]
@@ -3269,6 +3279,7 @@ impl VmxVCpuPriv {
             exit_reason: VmxExitReason::new(),
             exit_intr_info: IntrInfo::empty(),
             msr_autostore: VmxMsrs::default(),
+            exit_qualification: 0, //fztodo
         };
 
         vmx.vpid = vmx_info().alloc_vpid().unwrap_or_default() as u16;
@@ -3570,6 +3581,12 @@ impl VmxVCpuPriv {
 
         flags
     }
+    pub fn get_exit_qual(&self) -> u64 {
+        self.exit_qualification
+    }
+    pub fn vmread_exit_qual(&mut self) {
+        self.exit_qualification = VmxAsm::vmx_vmread(ro::EXIT_QUALIFICATION);
+    }
 }
 
 bitflags! {
@@ -3579,6 +3596,7 @@ bitflags! {
         const RW = 3;
     }
 
+    //https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/include/asm/kvm_host.h#249
     pub struct PageFaultErr: u64 {
         const PFERR_PRESENT = 1 << 0;
         const PFERR_WRITE = 1 << 1;

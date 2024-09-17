@@ -47,3 +47,4 @@ pub use crate::arch::vm::kvm_host::X86KvmArch as KvmArch;
 pub use crate::arch::vm::x86_kvm_ops as kvm_arch_ops;
 
 pub use crate::arch::vm::kvm_host::vcpu::X86VcpuArch as VirtCpuArch;
+pub use crate::arch::vm::kvm_host::KvmVcpuStat as VirtCpuStat;

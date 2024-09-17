@@ -121,7 +121,7 @@ impl LockedVMControlStructure {
 
 #[derive(Debug)]
 pub struct VmcsHostState {
-    pub cr3:(PhysFrame,Cr3Flags),
+    pub cr3: (PhysFrame, Cr3Flags),
     pub cr4: Cr4,
     pub gs_base: usize,
     pub fs_base: usize,
@@ -170,7 +170,10 @@ impl VmcsHostState {
 impl Default for VmcsHostState {
     fn default() -> Self {
         Self {
-            cr3: (PhysFrame::containing_address(x86_64::PhysAddr::new(0)), Cr3Flags::empty()),
+            cr3: (
+                PhysFrame::containing_address(x86_64::PhysAddr::new(0)),
+                Cr3Flags::empty(),
+            ),
             cr4: Cr4::empty(),
             gs_base: 0,
             fs_base: 0,

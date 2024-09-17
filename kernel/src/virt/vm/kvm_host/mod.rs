@@ -9,6 +9,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use mem::LockedKvmMemSlot;
 use system_error::SystemError;
 
 use crate::{
@@ -17,7 +18,7 @@ use crate::{
         CurrentKvmManager, KvmArch, VirtCpuArch,
     },
     filesystem::vfs::file::{File, FileMode},
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    libs::{rbtree::RBTree, spinlock::{SpinLock, SpinLockGuard}},
     mm::ucontext::AddressSpace,
     process::ProcessManager,
     smp::cpu::ProcessorId,
@@ -88,6 +89,7 @@ impl LockedVm {
             #[cfg(target_arch = "x86_64")]
             kvm_vmx: KvmVmx::default(),
             nr_memslots_dirty_logging: 0,
+            mmu_invalidate_seq: 0,
         };
 
         let ret = Arc::new(Self {
@@ -128,7 +130,7 @@ pub struct Vm {
     /// 对应活动和非活动内存槽,实际为：[[Arc<LockedVmMemSlots>; 2]; KVM_ADDRESS_SPACE_NUM]，这里暂时写Vec
     memslots_set: Vec<Vec<Arc<LockedVmMemSlotSet>>>,
     /// 当前活动内存槽，实际为：[Arc<LockedVmMemSlots>; KVM_ADDRESS_SPACE_NUM]，这里暂时写Vec
-    memslots: Vec<Arc<LockedVmMemSlotSet>>,
+    pub memslots: Vec<Arc<LockedVmMemSlotSet>>,
     /// 内存槽对应的页数
     nr_memslot_pages: usize,
 
@@ -140,6 +142,8 @@ pub struct Vm {
 
     #[cfg(target_arch = "x86_64")]
     pub kvm_vmx: KvmVmx,
+
+    pub mmu_invalidate_seq:u64//用于表示内存管理单元（MMU）无效化序列号
 }
 
 impl Vm {
@@ -207,6 +211,7 @@ impl Vm {
             run: unsafe { Some(Box::new_zeroed().assume_init()) },
             vcpu_idx: 0,
             mode: VcpuMode::OutsideGuestMode,
+            stat: Default::default(),
         };
     }
 
@@ -236,4 +241,20 @@ pub enum MutilProcessorState {
     Load,
     ApResetHold,
     Suspended,
+}
+///返回包含 gfn 的 memslot 的指针。如果没有找到，则返回 NULL。
+///当 "approx" 设置为 true 时，即使地址落在空洞中，也会返回 memslot。
+///在这种情况下，将返回空洞边界的其中一个 memslot。
+/// 先简陋完成，原本是二分，现在先遍历
+pub fn search_memslots(slot_set:Arc<LockedVmMemSlotSet>,gfn:u64,/*_approx:bool*/)->Option<Arc<LockedKvmMemSlot>>{
+    let slots=slot_set.lock();
+    let node = &slots.gfn_tree;
+    //let(start,end)=(0,node.len()-1);
+    for (_gfn_num,slot) in node.iter(){
+        let slot_guard = slot.read();
+        if gfn >= slot_guard.base_gfn && gfn < slot_guard.base_gfn + slot_guard.npages as u64{
+            return Some(slot.clone());
+        }
+    }
+    return None;
 }

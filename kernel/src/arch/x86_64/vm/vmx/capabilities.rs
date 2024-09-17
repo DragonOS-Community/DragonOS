@@ -8,8 +8,9 @@ use x86::{
 
 use crate::{
     arch::vm::{
-        mmu::PageLevel, CPU_BASED_ALWAYSON_WITHOUT_TRUE_MSR, PIN_BASED_ALWAYSON_WITHOUT_TRUE_MSR,
-        VM_ENTRY_ALWAYSON_WITHOUT_TRUE_MSR, VM_EXIT_ALWAYSON_WITHOUT_TRUE_MSR,
+        mmu::mmu::PageLevel, CPU_BASED_ALWAYSON_WITHOUT_TRUE_MSR,
+        PIN_BASED_ALWAYSON_WITHOUT_TRUE_MSR, VM_ENTRY_ALWAYSON_WITHOUT_TRUE_MSR,
+        VM_EXIT_ALWAYSON_WITHOUT_TRUE_MSR,
     },
     virt::vm::kvm_host::vcpu::VirtCpu,
 };
@@ -388,7 +389,7 @@ impl Vmx {
             return PageLevel::Level2M;
         }
 
-        return PageLevel::Level4k;
+        return PageLevel::Level4K;
     }
 
     /// 判断mt(Memory type)是否为write back

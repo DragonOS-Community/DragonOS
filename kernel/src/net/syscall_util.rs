@@ -152,7 +152,7 @@ impl SockAddr {
                 AddressFamily::Netlink => {
                     // TODO: support netlink socket
                     let addr: SockAddrNl = addr.addr_nl;
-                    return Ok(Endpoint::Netlink(NetlinkEndpoint::new(addr, len as usize)));
+                    return Ok(Endpoint::Netlink(NetlinkEndpoint::new(addr)));
                 }
                 _ => {
                     return Err(SystemError::EINVAL);
@@ -246,7 +246,18 @@ impl From<Endpoint> for SockAddr {
                 };
 
                 return SockAddr { addr_ll };
-            }
+            },
+
+            Endpoint::Netlink(netlink_endpoint) => {
+                let addr_nl = SockAddrNl {
+                    nl_family: AddressFamily::Netlink,
+                    nl_pad: 0,
+                    nl_pid: netlink_endpoint.addr.nl_pid,
+                    nl_groups: netlink_endpoint.addr.nl_groups,
+                };
+
+                return SockAddr { addr_nl };
+            },
 
             _ => {
                 // todo: support other endpoint, like Netlink...

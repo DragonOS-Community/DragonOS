@@ -330,7 +330,7 @@ impl Syscall {
                 unsafe { addrlen.as_ref() }.ok_or(EINVAL)?.clone(),
             )?)
         };
-
+        log::debug!("call the recvfrom syscall");
         let (n, endpoint) = match socket.recv_from(buf, flags, address){
             Ok((n,endpoint))=>(n,endpoint),
             Err(err)=>{

@@ -28,7 +28,7 @@ use crate::time::timer::schedule_timeout;
 use crate::{libs::rwlock::RwLock, syscall::Syscall};
 use alloc::{boxed::Box, vec::Vec};
 
-use crate::net::socket::{AddressFamily, Endpoint, MessageFlag, Socket};
+use crate::net::socket::{AddressFamily, Endpoint, Inode, MessageFlag, Socket};
 use lazy_static::lazy_static;
 
 use super::callback::NetlinkCallback;
@@ -89,7 +89,6 @@ impl<'a> Iterator for HListHeadIter<'a> {
         }
     }
 }
-///
 ///
 #[derive(Clone)]
 pub struct NetlinkTable {
@@ -207,37 +206,30 @@ fn netlink_proto_init() -> Result<(), SystemError> {
     // rtnetlink_init();
     Ok(())
 }
-// 等待重构
-///
-pub trait NetProtoFamily {
-    fn create(socket: &mut dyn Socket, protocol: i32, _kern: bool) -> Result<(), Error>;
-}
-///
+
 pub struct NetlinkFamulyOps {
     family: AddressFamily,
     // owner: Module,
 }
 
-impl NetProtoFamily for NetlinkFamulyOps {
-    // https://code.dragonos.org.cn/s?refs=netlink_create&project=linux-6.1.9
-    /// netlink_create() 创建一个netlink套接字
-    fn create(socket: &mut dyn Socket, protocol: i32, _kern: bool) -> Result<(), Error> {
-        // 假设我们有一个类型来跟踪协议最大值
-        const MAX_LINKS: i32 = 1024;
-        // if socket.type_ != SocketType::Raw && socket.type_ != SocketType::Dgram {
-        //     return Err(Error::SocketTypeNotSupported);
-        // }
-        if !(0..MAX_LINKS).contains(&protocol) {
-            // todo: 这里不符合规范，后续待修改为 SystemError
-            return Err(Error::ProtocolNotSupported);
-        }
-        // 安全的数组索引封装
-        let protocol = protocol as usize;
-        // 这里简化了锁和模块加载逻辑
-        // 假设成功加载了模块和相关函数
-        Ok(())
-    }
-}
+// impl NetProtoFamily for NetlinkFamulyOps {
+//     // https://code.dragonos.org.cn/s?refs=netlink_create&project=linux-6.1.9
+//     /// netlink_create() 创建一个netlink套接字
+//     fn create(socket: &mut dyn Socket, protocol: i32, _kern: bool) -> Result<(), Error> {
+//         // 假设我们有一个类型来跟踪协议最大值
+//         const MAX_LINKS: i32 = 1024;
+//         // if socket.type_ != SocketType::Raw && socket.type_ != SocketType::Dgram {
+//         //     return Err(Error::SocketTypeNotSupported);
+//         // }
+//         if !(0..MAX_LINKS).contains(&protocol) {
+//             // todo: 这里不符合规范，后续待修改为 SystemError
+//             return Err(Error::ProtocolNotSupported);
+//         }
+//         // 安全的数组索引封装
+//         let protocol = protocol as usize;
+//         Ok(())
+//     }
+// }
 
 lazy_static! {
     static ref NETLINK_FAMILY_OPS: NetlinkFamulyOps = NetlinkFamulyOps {
@@ -299,10 +291,10 @@ fn netlink_insert(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, portid: u32) -> Result
 
     Ok(())
 }
+/// 
 fn netlink_bind(
     sock: Arc<Mutex<Box<dyn NetlinkSocket>>>,
     addr: &SockAddrNl,
-    addr_len: usize,
 ) -> Result<(), SystemError> {
     log::info!("netlink_bind here!");
     let sk = Arc::clone(&sock);
@@ -316,10 +308,6 @@ fn netlink_bind(
     let mut err = 0;
     let mut groups: u32;
     let mut bound: bool;
-
-    if addr_len < mem::size_of::<SockAddrNl>() {
-        return Err(SystemError::EINVAL);
-    }
 
     if nladdr.nl_family != AddressFamily::Netlink {
         return Err(SystemError::EINVAL);
@@ -389,6 +377,7 @@ fn netlink_bind(
 
     Ok(())
 }
+
 
 // TODO: net namespace支持
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#532
@@ -481,15 +470,17 @@ impl Socket for NetlinkSock {
         match _endpoint {
             Endpoint::Netlink(netlinkendpoint) => {
                 let addr = netlinkendpoint.addr;
-                let addr_len = netlinkendpoint.addr_len;
                 let sock: Arc<Mutex<Box<dyn NetlinkSocket>>> =
                     Arc::new(Mutex::new(Box::new(self.clone())));
-                netlink_bind(sock, &addr, addr_len);
+                let _ = netlink_bind(sock, &addr);
             }
             _ => {
                 return Err(SystemError::EINVAL);
             }
         }
+        Ok(())
+    }
+    fn close(&self) -> Result<(), SystemError>{
         Ok(())
     }
     fn listen(&self, _backlog: usize) -> Result<(), SystemError> {
@@ -513,6 +504,7 @@ impl Socket for NetlinkSock {
         flags: MessageFlag,
         address: Endpoint,
     ) -> Result<usize, SystemError> {
+        log::debug!("NetlinkSock send_to");
         return self.netlink_send(buffer, address);
     }
     // 借用 recv_from 的接口模拟netlink_recvmsg的功能
@@ -522,7 +514,8 @@ impl Socket for NetlinkSock {
         flags: MessageFlag,
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
-        return self.netlink_recv(msg, msg.len(), flags);
+        log::debug!("NetlinkSock recv_from");
+        return self.netlink_recv(msg, flags);
     }
     fn send_buffer_size(&self) -> usize {
         log::warn!("send_buffer_size is implemented to 0");
@@ -675,13 +668,16 @@ impl NetlinkSock {
     /// ## 备注
     /// netlink套接字在创建的过程中(具体是在 netlink_create 开头)，已经和 netlink_ops (socket层netlink协议族的通用操作集合)关联,其中注册的 sendmsg 回调就是指向本函数
     fn netlink_send(&self, data: &[u8], address: Endpoint) -> Result<usize, SystemError> {
+        log::info!("netlink_send: data: {:?}", data);
         // 一个有效的 Netlink 消息至少应该包含一个消息头
         if data.len() < size_of::<NLmsghdr>() {
+            log::warn!("netlink_send: data too short, len: {}", data.len());
             return Err(SystemError::EINVAL);
         }
         #[allow(unsafe_code)]
         let header = unsafe { &*(data.as_ptr() as *const NLmsghdr) };
         if header.nlmsg_len as usize > data.len() {
+            log::warn!("netlink_send: data too short, nlmsg_len: {}", header.nlmsg_len);
             return Err(SystemError::ENAVAIL);
         }
         // let message_type = NLmsgType::from(header.nlmsg_type);
@@ -698,6 +694,8 @@ impl NetlinkSock {
         };
         // 将新消息头序列化到 msg 中
         msg.push_ext(new_header);
+        // 将消息体数据追加到 msg 中
+        msg.extend_from_slice(data);
         // 确保 msg 的长度按照 4 字节对齐
         msg.align4();
         // msg 的开头设置消息长度。
@@ -717,7 +715,6 @@ impl NetlinkSock {
     fn netlink_recv(
         &self,
         msg: &mut [u8],
-        len: usize,
         flags: MessageFlag,
     ) -> Result<(usize, Endpoint), SystemError> {
         let mut copied: usize = 0;
@@ -726,11 +723,12 @@ impl NetlinkSock {
 
         // 判断是否是带外消息，如果是带外消息，直接返回错误码
         if flags == MessageFlag::OOB {
+            log::warn!("netlink_recv: OOB message is not supported");
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
 
         // 计算实际要复制的数据长度，不能超过 msg_from 的长度 或 msg 缓冲区的长度
-        let actual_len = msg_kernel.len().min(len);
+        let actual_len = msg_kernel.len().min(msg.len());
 
         if !msg_kernel.is_empty() {
             msg[..actual_len].copy_from_slice(&msg_kernel[..actual_len]);
@@ -747,10 +745,10 @@ impl NetlinkSock {
                 nl_pid: self.portid,
                 nl_groups: 0,
             },
-            addr_len: mem::size_of::<SockAddrNl>(),
         });
 
         // 返回复制的字节数和端点信息
+        log::debug!("netlink_recv: copied: {}, endpoint: {:?}", copied, endpoint);
         Ok((copied, endpoint))
     }
     //     // let skb:SkBuff = skb_recv_datagram(sk, &nlk, &mut copied, &err, &ret);

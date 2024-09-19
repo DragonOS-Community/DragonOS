@@ -12,6 +12,7 @@ use crate::{
     syscall::{Syscall, SYS_SCHED},
 };
 use log::debug;
+use nr::SysCall;
 use system_error::SystemError;
 
 use super::{

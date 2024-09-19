@@ -5,7 +5,7 @@ use alloc::sync::{Arc,Weak};
 use inner::*;
 use system_error::SystemError;
 use crate::sched::SchedMode;
-use crate::{arch::init, libs::rwlock::RwLock, net::socket::*};
+use crate::{libs::rwlock::RwLock, net::socket::*};
 
 use super::INODE_MAP;
 

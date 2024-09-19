@@ -5,15 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     libs::rwlock::RwLock,
-    net::socket::{
-        self,
-        buffer::Buffer,
-        common::{
-            poll_unit::{EPollItems, WaitQueue},
-            Shutdown,
-        },
-        Endpoint, Inode, MessageFlag, OptionsLevel, ShutdownTemp, Socket,
-    },
+    net::socket::{self, *},
 };
 
 pub mod inner;
@@ -268,7 +260,7 @@ impl Socket for StreamSocket {
         Ok(())
     }
 
-    fn wait_queue(&self) -> WaitQueue {
+    fn wait_queue(&self) -> &WaitQueue {
         todo!()
     }
 
@@ -371,10 +363,12 @@ impl Socket for StreamSocket {
     }
 
     fn send_buffer_size(&self) -> usize {
-        todo!()
+        log::warn!("using default buffer size");
+        StreamSocket::DEFAULT_BUF_SIZE
     }
 
     fn recv_buffer_size(&self) -> usize {
-        todo!()
+        log::warn!("using default buffer size");
+        StreamSocket::DEFAULT_BUF_SIZE
     }
 }

@@ -90,7 +90,7 @@ impl Listener {
 
         let new_server=SeqpacketSocket::new(false);
         let new_inode=Inode::new(new_server.clone());
-        log::debug!("new inode {:?},client_epoint {:?}",new_inode,client_epoint);
+        // log::debug!("new inode {:?},client_epoint {:?}",new_inode,client_epoint);
         let (server_conn, client_conn) = Connected::new_pair(Some(Endpoint::Inode(new_inode.clone())), client_epoint);
         *new_server.inner.write()=Inner::Connected(server_conn);
         incoming_conns.push_back(new_inode);
@@ -98,6 +98,10 @@ impl Listener {
         // TODO: epollin
 
         Ok(client_conn)
+    }
+
+    pub(super) fn is_acceptable(&self)->bool {
+        return self.incoming_conns.lock().len()!=0
     }
 }
 

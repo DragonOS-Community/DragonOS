@@ -92,6 +92,20 @@ pub fn test_seq_socket() ->Result<(), Error>{
         let server_fd = create_seqpacket_socket()?;
         bind_socket(server_fd)?;
         listen_socket(server_fd)?;
+
+        // Accept connection in a separate thread
+        let server_thread = std::thread::spawn(move || {
+            let client_fd = accept_connection(server_fd).expect("Failed to accept connection");
+    
+            // Receive and print message
+            let received_msg = receive_message(client_fd).expect("Failed to receive message");
+            println!("Server: Received message: {}", received_msg);
+            
+            send_message(client_fd, MSG2).expect("Failed to send message");
+    
+            // Close client connection
+            unsafe { close(client_fd) };
+        });
     
         // Create and connect the client socket
         let client_fd = create_seqpacket_socket()?;
@@ -112,19 +126,7 @@ pub fn test_seq_socket() ->Result<(), Error>{
         }
         send_message(client_fd, MSG1)?;
 
-        // Accept connection in a separate thread
-        let server_thread = std::thread::spawn(move || {
-            let client_fd = accept_connection(server_fd).expect("Failed to accept connection");
-    
-            // Receive and print message
-            let received_msg = receive_message(client_fd).expect("Failed to receive message");
-            println!("Server: Received message: {}", received_msg);
-            
-            send_message(client_fd, MSG2).expect("Failed to send message");
-    
-            // Close client connection
-            unsafe { close(client_fd) };
-        });
+
             
         server_thread.join().expect("Server thread panicked");
 

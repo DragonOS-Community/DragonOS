@@ -51,6 +51,7 @@ impl Syscall {
         let is_nonblock = type_arg.is_nonblock();
         let is_close_on_exec = type_arg.is_cloexec();
         let stype = socket::Type::try_from(type_arg)?;
+        log::debug!("type_arg {:?}  stype {:?}",type_arg,stype);
 
         let inode = socket::create_socket(
             address_family,

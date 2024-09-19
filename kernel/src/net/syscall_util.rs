@@ -138,63 +138,6 @@ impl SockAddr {
                     //     Ok(fd)=>fd,
                     //     Err(e)=>{
                     //         log::debug!("not fd {:?} path {}",e,path);
-                    //         let (filename, parent_path) = crate::filesystem::vfs::utils::rsplit_path(&path);
-                    //         // 查找父目录
-                    //         log::debug!("filename {:?} parent_path {:?}",filename,parent_path);
-
-                    //         let parent_inode: Arc<dyn IndexNode> =
-                    //             ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
-                    //         // 创建文件
-                    //         let  inode: Arc<dyn IndexNode> = match parent_inode.create(
-                    //             filename,
-                    //             FileType::Socket,
-                    //             crate::filesystem::vfs::syscall::ModeType::from_bits_truncate(0o755),
-                    //         ){
-                    //             Ok(inode)=>inode,
-                    //             Err(e)=>{
-                    //                 log::debug!("inode create fail {:?}",e);
-                    //                 return Err(e);
-                    //             }
-                    //         };
-
-                    //         //查找一
-                    //         let follow_symlink=true;
-                    //         let (inode_begin, path) = crate::filesystem::vfs::utils::user_path_at(&ProcessManager::current_pcb(), crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(), path.trim())?;
-                    //         let inode0: Result<Arc<dyn IndexNode>, SystemError> = inode_begin.lookup_follow_symlink(
-                    //             &path,
-                    //             if follow_symlink {
-                    //                 VFS_MAX_FOLLOW_SYMLINK_TIMES
-                    //             } else {
-                    //                 0
-                    //             },
-                    //         );
-
-                    //         //查找2
-                    //         let (inode_begins, path) = crate::filesystem::vfs::utils::user_path_at(&ProcessManager::current_pcb(), crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(), path.trim())?;
-                    //         let inode1= inode_begins.lookup_follow_symlink(
-                    //             &path,
-                    //             if follow_symlink {
-                    //                 VFS_MAX_FOLLOW_SYMLINK_TIMES
-                    //             } else {
-                    //                 0
-                    //             },
-                    //         )?;
-
-                    //         match inode0 {
-                    //             Ok(inode0)=>{
-                    //                 if  Arc::ptr_eq(&inode0, &inode1){
-                    //                     log::debug!("found equal inode!");
-                    //                 }
-                    //                 else {
-                    //                     log::debug!("not found equal inode! inode1 {:?} ,not found equal inode! inode2 {:?}",inode1.metadata()?.inode_id,inode0.metadata()?.inode_id);
-                    //                 }
-                    //             }
-                    //             Err(_)=>{
-                    //                 log::debug!("not found file!");
-                    //             }
-                                
-                    //         }
-                    //         log::debug!("ssssssssssss");
                     //         return Err(e);
                     //     }
                     // };

@@ -1,8 +1,10 @@
-pub mod poll_unit;
+// pub mod poll_unit;
 pub mod shutdown;
+mod epoll_items;
 
 #[allow(dead_code)]
 pub use shutdown::Shutdown;
+pub use epoll_items::EPollItems;
 
 // /// @brief 在trait Socket的metadata函数中返回该结构体供外部使用
 // #[derive(Debug, Clone)]

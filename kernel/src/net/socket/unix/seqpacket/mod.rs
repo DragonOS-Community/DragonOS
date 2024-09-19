@@ -6,9 +6,8 @@ use inner::*;
 use system_error::SystemError;
 
 use crate::{libs::rwlock::RwLock, 
-            net::socket::{common::{poll_unit::{EPollItems, WaitQueue,}, shutdown, Shutdown}, 
-            endpoint::Endpoint, inode::Inode, Socket}};
-use crate::net::{event_poll::EPollEventType,socket::MessageFlag};
+            net::socket::*};
+use crate::net::{event_poll::EPollEventType};
 
 
 type EP = EPollEventType;
@@ -126,7 +125,7 @@ impl Socket for SeqpacketSocket{
         }
     }
 
-    fn shutdown(&self, how: shutdown::ShutdownTemp) -> Result<(), SystemError> {
+    fn shutdown(&self, how: ShutdownTemp) -> Result<(), SystemError> {
         match &*self.inner.write(){
             Inner::Connected(connected)=>{
                 connected.shutdown(how)
@@ -176,8 +175,8 @@ impl Socket for SeqpacketSocket{
     }
 
     
-    fn wait_queue(&self) -> WaitQueue {
-        return self.wait_queue.clone();
+    fn wait_queue(&self) -> &WaitQueue {
+        return &self.wait_queue;
     }
     
     fn close(&self) -> Result<(), SystemError> {

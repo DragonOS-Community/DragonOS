@@ -1,3 +1,11 @@
+use alloc::sync::Arc;
+use netlink::NETLINK_KOBJECT_UEVENT;
+use system_error::SystemError;
+
+use crate::driver::base::uevent::KobjUeventEnv;
+
+use super::{family, inet::datagram, Inode, Socket, Type};
+
 //https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/
 /*
 ..		-	-
@@ -17,3 +25,25 @@ pub mod netlink;
 pub mod netlink_proto;
 pub mod skbuff;
 pub mod sock;
+
+pub struct Netlink;
+
+impl family::Family for Netlink {
+    fn socket(stype: Type, _protocol: u32) -> Result<Arc<Inode>, SystemError> {
+        let socket = create_netlink_socket(_protocol)?;
+        Ok(Inode::new(socket))
+    }
+}
+
+fn create_netlink_socket(
+    _protocol: u32,
+) -> Result<Arc<dyn Socket>, SystemError> {
+    match _protocol as usize {
+        NETLINK_KOBJECT_UEVENT => {
+            Ok(Arc::new(af_netlink::NetlinkSock::new()))
+        }
+        _ => {
+            Err(SystemError::EPROTONOSUPPORT)
+        }
+    }
+}

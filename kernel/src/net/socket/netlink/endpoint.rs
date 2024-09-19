@@ -1,11 +1,10 @@
 use crate::net::syscall::SockAddrNl;
 #[derive(Debug, Clone)]
 pub struct NetlinkEndpoint {
-    pub addr: SockAddrNl,
-    pub addr_len: usize,
+    pub addr: SockAddrNl
 }
 impl NetlinkEndpoint {
-    pub fn new(addr: SockAddrNl, addr_len: usize) -> Self {
-        NetlinkEndpoint { addr, addr_len }
+    pub fn new(addr: SockAddrNl) -> Self {
+        NetlinkEndpoint { addr}
     }
 }

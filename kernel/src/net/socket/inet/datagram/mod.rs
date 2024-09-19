@@ -123,9 +123,10 @@ impl UdpSocket {
         if self.is_nonblock() {
             return self.try_recv(buf).map(|(size, _)| size);
         } else {
-            return self
-                .wait_queue
-                .busy_wait(EP::EPOLLIN, || self.try_recv(buf).map(|(size, _)| size));
+            // return self
+            //     .wait_queue
+            //     .busy_wait(EP::EPOLLIN, || self.try_recv(buf).map(|(size, _)| size));
+            todo!()
         }
     }
 
@@ -155,8 +156,8 @@ impl UdpSocket {
 }
 
 impl Socket for UdpSocket {
-    fn wait_queue(&self) -> WaitQueue {
-        self.wait_queue.clone()
+    fn wait_queue(&self) -> &WaitQueue {
+        &self.wait_queue
     }
 
     fn poll(&self) -> usize {

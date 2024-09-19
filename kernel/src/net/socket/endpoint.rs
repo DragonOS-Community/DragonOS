@@ -1,4 +1,4 @@
-use crate::{filesystem::vfs::IndexNode, net::socket};
+use crate::{filesystem::vfs::InodeId, net::socket};
 use alloc::sync::Arc;
 
 pub use smoltcp::wire::IpEndpoint;
@@ -15,6 +15,7 @@ pub enum Endpoint {
     /// unix socket file端点
     Pnode(Arc<dyn IndexNode>),
     // todo: 增加NetLink机制后，增加NetLink端点
+    InodeId(InodeId),
     /// NetLink端点
     Netlink(NetlinkEndpoint),
 }

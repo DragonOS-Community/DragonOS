@@ -32,9 +32,11 @@ impl SysArgSocketType {
 }
 
 use core::ffi::CStr;
+use alloc::sync::Arc;
+use unix::INODE_MAP;
 
 use crate::{
-    filesystem::vfs::{file::FileMode, syscall::ModeType, utils::rsplit_path, FileType, ROOT_INODE},
+    filesystem::vfs::{file::FileMode, FileType,IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,},
     libs::casting::DowncastArc,
     mm::{verify_area, VirtAddr},
     net::socket::{self, *},
@@ -106,7 +108,7 @@ impl SockAddr {
         use crate::net::socket::AddressFamily;
 
         let addr = unsafe { addr.as_ref() }.ok_or(SystemError::EFAULT)?;
-
+        log::debug!("addr is not null ");
         unsafe {
             match AddressFamily::try_from(addr.family)? {
                 AddressFamily::INet => {
@@ -132,21 +134,62 @@ impl SockAddr {
                         .to_str()
                         .map_err(|_| SystemError::EINVAL)?;
 
-                    // 使用path创建文件，如果已有文件返回错误。
-                    let (filename, parent_path) = rsplit_path(&path);
-                    //查找父目录
-                    let parent_inode = ROOT_INODE().lookup(parent_path).unwrap_or("/");
-                    //创建文件
-                    let inode = match parent_inode.create(filename, FileType::Socket, ModeType::from_bits_truncate(0o775)) {
-                        Ok(inode) => inode,
-                        Err(e) => {
-                            log::debug!("pnode create failed");
-                            return Err(e);
+                    // let fd = match Syscall::open(path.as_ptr(), FileMode::O_RDWR.bits(), 0o755, true){
+                    //     Ok(fd)=>fd,
+                    //     Err(e)=>{
+                    //         log::debug!("not fd {:?} path {}",e,path);
+                    //         return Err(e);
+                    //     }
+                    // };
+
+                    // let binding = ProcessManager::current_pcb().fd_table();
+                    // let fd_table_guard = binding.read();
+
+                    // let file = fd_table_guard.get_file_by_fd(fd as i32).unwrap();
+                    // if file.file_type() != FileType::Socket {
+                    //     return Err(SystemError::ENOTSOCK);
+                    // }
+                    // let socket = file.inode().downcast_arc::<socket::Inode>().ok_or(EINVAL)?;
+
+                    let follow_symlink=true;
+                    let (inode_begin, path) = crate::filesystem::vfs::utils::user_path_at(&ProcessManager::current_pcb(), crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(), path.trim())?;
+                    let inode0: Result<Arc<dyn IndexNode>, SystemError> = inode_begin.lookup_follow_symlink(
+                        &path,
+                        if follow_symlink {
+                            VFS_MAX_FOLLOW_SYMLINK_TIMES
+                        } else {
+                            0
+                        },
+                    );
+
+                    let inode = match inode0{
+                        Ok(inode)=>{
+                            inode
+                        }
+                        Err(_)=>{
+                            let (filename, parent_path) = crate::filesystem::vfs::utils::rsplit_path(&path);
+                            // 查找父目录
+                            log::debug!("filename {:?} parent_path {:?}",filename,parent_path);
+
+                            let parent_inode: Arc<dyn IndexNode> =
+                                ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+                            // 创建文件
+                            let inode: Arc<dyn IndexNode> = match parent_inode.create(
+                                filename,
+                                FileType::File,
+                                crate::filesystem::vfs::syscall::ModeType::from_bits_truncate(0o755),
+                            ){
+                                Ok(inode)=>inode,
+                                Err(e)=>{
+                                    log::debug!("inode create fail {:?}",e);
+                                    return Err(e);
+                                }
+                            };
+                            inode
                         }
                     };
-                    
-                    //返回endpoint
-                    return Ok(Endpoint::Pnode(inode.clone()));
+
+                    return Ok(Endpoint::InodeId(inode.metadata()?.inode_id));
                 }
                 AddressFamily::Packet => {
                     // TODO: support packet socket

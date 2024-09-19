@@ -1,0 +1,12 @@
+[package]
+name = "test_seqpacket"
+version = "0.1.0"
+edition = "2021"
+description = "测试seqpacket的socket"
+authors = [ "Saga <1750226968@qq.com>" ]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+nix = "0.26"
+libc = "0.2"

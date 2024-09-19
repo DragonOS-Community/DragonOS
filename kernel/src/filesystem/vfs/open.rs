@@ -64,6 +64,54 @@ pub fn do_fchmodat(dirfd: i32, path: *const u8, _mode: ModeType) -> Result<usize
     return Ok(0);
 }
 
+pub fn do_fchownat(
+    dirfd: i32,
+    path: *const u8,
+    uid: usize,
+    gid: usize,
+    flag: u32,
+) -> Result<usize, SystemError> {
+    if (flag & (!((AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH).bits() as u32))) != 0 {
+        return Err(SystemError::EINVAL);
+    }
+
+    let follow_symlink = flag & AtFlags::AT_SYMLINK_NOFOLLOW.bits() as u32 == 0;
+
+    let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+    let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
+
+    let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
+
+    // 如果找不到文件，则返回错误码ENOENT
+    let inode = if follow_symlink {
+        inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)
+    } else {
+        inode.lookup(path.as_str())
+    };
+
+    if inode.is_err() {
+        let errno = inode.clone().unwrap_err();
+        // 文件不存在
+        if errno == SystemError::ENOENT {
+            return Err(SystemError::ENOENT);
+        }
+    }
+
+    let inode = inode.unwrap();
+
+    return chown_common(inode, uid, gid);
+
+    // Linux中是先获取对文件系统的写权限，然后调用chown_common去修改文件所有者和组所有者，最后放弃对文件系统的写权限
+}
+
+fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usize, SystemError> {
+    let mut meta = inode.metadata()?;
+    meta.uid = uid;
+    meta.gid = gid;
+    inode.set_metadata(&meta)?;
+    return Ok(0);
+}
+
 pub(super) fn do_sys_open(
     dfd: i32,
     path: &str,

@@ -8,7 +8,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
-use log::warn;
+use log::{info, warn};
 use smoltcp::{
     iface::SocketSet,
     socket::{self, raw, tcp, udp},
@@ -26,6 +26,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::EventWaitQueue,
     },
+    net::syscall::{PosixIpProtocol, PosixSocketOption},
     process::{Pid, ProcessManager},
     sched::{schedule, SchedMode},
 };
@@ -222,12 +223,20 @@ pub trait Socket: Sync + Send + Debug + Any {
     /// @param optval 选项的值
     ///
     /// @return 返回设置是否成功, 如果不支持该选项，返回ENOSYS
-    fn setsockopt(
-        &self,
-        _level: usize,
-        _optname: usize,
-        _optval: &[u8],
-    ) -> Result<(), SystemError> {
+    fn setsockopt(&self, level: usize, optname: usize, optval: &[u8]) -> Result<(), SystemError> {
+        if level as u8 == SOL_SOCKET {
+            let _optname = PosixSocketOption::try_from(optname as i32)
+                .map_err(|_| SystemError::ENOPROTOOPT)?;
+        }
+
+        let posix_protocol =
+            PosixIpProtocol::try_from(level as u16).map_err(|_| SystemError::ENOPROTOOPT)?;
+        
+        info!(
+            "posix_protocol: {:?}, optname: {:?}, optval: {:?}",
+            posix_protocol, optname, optval
+        );
+        
         warn!("setsockopt is not implemented");
         Ok(())
     }

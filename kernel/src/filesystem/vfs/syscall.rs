@@ -24,7 +24,7 @@ use super::{
     core::{do_mkdir_at, do_remove_dir, do_unlink_at},
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
-    open::{do_faccessat, do_fchmodat, do_sys_open, do_utimensat, do_utimes},
+    open::{do_faccessat, do_fchmodat, do_fchownat, do_sys_open, do_utimensat, do_utimes},
     utils::{rsplit_path, user_path_at},
     Dirent, FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
@@ -1617,6 +1617,20 @@ impl Syscall {
         warn!("fchmod not fully implemented");
         return Ok(0);
     }
+
+    pub fn chown(pathname: *const u8, uid: usize, gid: usize) -> Result<usize, SystemError> {
+        return do_fchownat(AtFlags::AT_FDCWD.bits(), pathname, uid, gid, 0);
+    }
+
+    pub fn lchown(pathname: *const u8, uid: usize, gid: usize) -> Result<usize, SystemError> {
+        return do_fchownat(AtFlags::AT_FDCWD.bits(),pathname, uid, gid, AtFlags::AT_SYMLINK_NOFOLLOW.bits() as u32);
+    }
+
+    pub fn fchownat(dirfd: i32, pathname: *const u8, uid: usize, gid: usize, flags: u32) -> Result<usize, SystemError> {
+        return do_fchownat(dirfd, pathname, uid, gid, flags);
+    }
+
+
     /// #挂载文件系统
     ///
     /// 用于挂载文件系统,目前仅支持ramfs挂载

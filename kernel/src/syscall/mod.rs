@@ -1138,6 +1138,27 @@ impl Syscall {
                 let flags = args[1] as u32;
                 Self::sys_eventfd(initval, flags)
             }
+            SYS_CHOWN => {
+                let pathname = args[0] as *const u8;
+                let uid = args[1] as usize;
+                let gid = args[2] as usize;
+                Self::chown(pathname, uid, gid)
+            }
+            SYS_LCHOWN => {
+                let pathname = args[0] as *const u8;
+                let uid = args[1] as usize;
+                let gid = args[2] as usize;
+                Self::lchown(pathname, uid, gid)
+            }
+            SYS_FCHOWNAT => {
+                let dirfd = args[0] as i32;
+                let pathname = args[1] as *const u8;
+                let uid = args[2] as usize;
+                let gid = args[3] as usize;
+                let flag = args[4] as u32;
+                Self::fchownat(dirfd, pathname, uid, gid, flag)
+            }
+            // SYS_FCHOWN => {}
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

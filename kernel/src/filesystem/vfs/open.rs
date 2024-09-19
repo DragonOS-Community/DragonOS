@@ -1,5 +1,5 @@
 use alloc::sync::Arc;
-use log::warn;
+use log::{debug, warn};
 use system_error::SystemError;
 
 use super::{
@@ -81,7 +81,7 @@ fn do_sys_openat2(
     how: OpenHow,
     follow_symlink: bool,
 ) -> Result<usize, SystemError> {
-    // debug!("open path: {}, how: {:?}", path, how);
+    //debug!("open path: {}, how: {:?}", path, how);
     let path = path.trim();
 
     let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;

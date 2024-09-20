@@ -32,9 +32,11 @@ impl SysArgSocketType {
 }
 
 use core::ffi::CStr;
+use alloc::sync::Arc;
+use unix::INODE_MAP;
 
 use crate::{
-    filesystem::vfs::{file::FileMode, FileType},
+    filesystem::vfs::{file::FileMode, FileType,IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,},
     libs::casting::DowncastArc,
     mm::{verify_area, VirtAddr},
     net::socket::{self, *},
@@ -106,7 +108,7 @@ impl SockAddr {
         use crate::net::socket::AddressFamily;
 
         let addr = unsafe { addr.as_ref() }.ok_or(SystemError::EFAULT)?;
-
+        log::debug!("addr is not null ");
         unsafe {
             match AddressFamily::try_from(addr.family)? {
                 AddressFamily::INet => {
@@ -132,18 +134,62 @@ impl SockAddr {
                         .to_str()
                         .map_err(|_| SystemError::EINVAL)?;
 
-                    let fd = Syscall::open(path.as_ptr(), FileMode::O_RDWR.bits(), 0o755, true)?;
+                    // let fd = match Syscall::open(path.as_ptr(), FileMode::O_RDWR.bits(), 0o755, true){
+                    //     Ok(fd)=>fd,
+                    //     Err(e)=>{
+                    //         log::debug!("not fd {:?} path {}",e,path);
+                    //         return Err(e);
+                    //     }
+                    // };
 
-                    let binding = ProcessManager::current_pcb().fd_table();
-                    let fd_table_guard = binding.read();
+                    // let binding = ProcessManager::current_pcb().fd_table();
+                    // let fd_table_guard = binding.read();
 
-                    let file = fd_table_guard.get_file_by_fd(fd as i32).unwrap();
-                    if file.file_type() != FileType::Socket {
-                        return Err(SystemError::ENOTSOCK);
-                    }
-                    let socket = file.inode().downcast_arc::<socket::Inode>().ok_or(EINVAL)?;
+                    // let file = fd_table_guard.get_file_by_fd(fd as i32).unwrap();
+                    // if file.file_type() != FileType::Socket {
+                    //     return Err(SystemError::ENOTSOCK);
+                    // }
+                    // let socket = file.inode().downcast_arc::<socket::Inode>().ok_or(EINVAL)?;
 
-                    return Ok(Endpoint::Inode(socket.clone()));
+                    let follow_symlink=true;
+                    let (inode_begin, path) = crate::filesystem::vfs::utils::user_path_at(&ProcessManager::current_pcb(), crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(), path.trim())?;
+                    let inode0: Result<Arc<dyn IndexNode>, SystemError> = inode_begin.lookup_follow_symlink(
+                        &path,
+                        if follow_symlink {
+                            VFS_MAX_FOLLOW_SYMLINK_TIMES
+                        } else {
+                            0
+                        },
+                    );
+
+                    let inode = match inode0{
+                        Ok(inode)=>{
+                            inode
+                        }
+                        Err(_)=>{
+                            let (filename, parent_path) = crate::filesystem::vfs::utils::rsplit_path(&path);
+                            // 查找父目录
+                            log::debug!("filename {:?} parent_path {:?}",filename,parent_path);
+
+                            let parent_inode: Arc<dyn IndexNode> =
+                                ROOT_INODE().lookup(parent_path.unwrap_or("/"))?;
+                            // 创建文件
+                            let inode: Arc<dyn IndexNode> = match parent_inode.create(
+                                filename,
+                                FileType::File,
+                                crate::filesystem::vfs::syscall::ModeType::from_bits_truncate(0o755),
+                            ){
+                                Ok(inode)=>inode,
+                                Err(e)=>{
+                                    log::debug!("inode create fail {:?}",e);
+                                    return Err(e);
+                                }
+                            };
+                            inode
+                        }
+                    };
+
+                    return Ok(Endpoint::InodeId(inode.metadata()?.inode_id));
                 }
                 AddressFamily::Packet => {
                     // TODO: support packet socket
@@ -152,7 +198,7 @@ impl SockAddr {
                 AddressFamily::Netlink => {
                     // TODO: support netlink socket
                     let addr: SockAddrNl = addr.addr_nl;
-                    return Ok(Endpoint::Netlink(NetlinkEndpoint::new(addr, len as usize)));
+                    return Ok(Endpoint::Netlink(NetlinkEndpoint::new(addr)));
                 }
                 _ => {
                     return Err(SystemError::EINVAL);
@@ -246,7 +292,18 @@ impl From<Endpoint> for SockAddr {
                 };
 
                 return SockAddr { addr_ll };
-            }
+            },
+
+            Endpoint::Netlink(netlink_endpoint) => {
+                let addr_nl = SockAddrNl {
+                    nl_family: AddressFamily::Netlink,
+                    nl_pad: 0,
+                    nl_pid: netlink_endpoint.addr.nl_pid,
+                    nl_groups: netlink_endpoint.addr.nl_groups,
+                };
+
+                return SockAddr { addr_nl };
+            },
 
             _ => {
                 // todo: support other endpoint, like Netlink...

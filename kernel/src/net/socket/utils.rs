@@ -17,14 +17,12 @@ pub fn create_socket(
             todo!("AF_INET6 unimplemented");
         }
         AF::Unix => socket::unix::Unix::socket(socket_type, protocol)?,
-        AF::Netlink => {
-            todo!("AF_NETLINK unimplemented");
-        }
+        AF::Netlink => {socket::netlink::Netlink::socket(socket_type, protocol)?}
         _ => {
             todo!("unsupport address family");
         }
     };
-    inode.set_nonblock(is_nonblock);
-    inode.set_close_on_exec(is_close_on_exec);
+    // inode.set_nonblock(is_nonblock);
+    // inode.set_close_on_exec(is_close_on_exec);
     return Ok(inode);
 }

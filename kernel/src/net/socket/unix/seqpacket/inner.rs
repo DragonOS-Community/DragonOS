@@ -1,4 +1,5 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
+use alloc::string::String;
 use alloc::{collections::VecDeque,sync::Arc};
 
 use crate::{libs::mutex::Mutex, net::socket::{buffer::Buffer, endpoint::Endpoint, Inode, ShutdownTemp}};
@@ -45,10 +46,17 @@ pub(super) struct Listener{
 
 impl Listener {
     pub(super) fn new(inode:Endpoint,backlog:usize)->Self{
+        log::debug!("backlog {}",backlog);
+        let back = if backlog>1024{
+            1024 as usize
+        }
+        else{
+            backlog
+        };
         return Self{
             inode,
-            backlog:AtomicUsize::new(backlog),
-            incoming_conns:Mutex::new(VecDeque::with_capacity(backlog)),
+            backlog:AtomicUsize::new(back),
+            incoming_conns:Mutex::new(VecDeque::with_capacity(back)),
         }
     }
     pub(super) fn endpoint(&self) ->&Endpoint{
@@ -57,8 +65,9 @@ impl Listener {
 
     pub(super) fn try_accept(&self) ->Result<(Arc<Inode>, Endpoint),SystemError>{
         let mut incoming_conns =self.incoming_conns.lock();
+        log::debug!(" incom len {}",incoming_conns.len());
         let conn=incoming_conns.pop_front().ok_or_else(|| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
-        let socket =Arc::downcast::<SeqpacketSocket>(conn).map_err(|_| SystemError::EINVAL)?;
+        let socket =Arc::downcast::<SeqpacketSocket>(conn.inner()).map_err(|_| SystemError::EINVAL)?;
         let peer = match &*socket.inner.read(){
             Inner::Connected(connected)=>connected.peer_endpoint().unwrap().clone(),
             _=>return Err(SystemError::ENOTCONN),
@@ -81,7 +90,7 @@ impl Listener {
 
         let new_server=SeqpacketSocket::new(false);
         let new_inode=Inode::new(new_server.clone());
-
+        // log::debug!("new inode {:?},client_epoint {:?}",new_inode,client_epoint);
         let (server_conn, client_conn) = Connected::new_pair(Some(Endpoint::Inode(new_inode.clone())), client_epoint);
         *new_server.inner.write()=Inner::Connected(server_conn);
         incoming_conns.push_back(new_inode);
@@ -89,6 +98,10 @@ impl Listener {
         // TODO: epollin
 
         Ok(client_conn)
+    }
+
+    pub(super) fn is_acceptable(&self)->bool {
+        return self.incoming_conns.lock().len()!=0
     }
 }
 
@@ -147,6 +160,7 @@ impl Connected{
         if self.can_send()? {
             return self.send_slice(buf);
         } else {
+            log::debug!("can not send {:?}",String::from_utf8_lossy(&buf[..]));
             return Err(SystemError::ENOBUFS);
         }
     }
@@ -155,7 +169,7 @@ impl Connected{
         return !self.buffer.is_read_buf_empty();
     }
 
-    // 检查发送缓冲区是否为空
+    // 检查发送缓冲区是否满了
     pub fn can_send(&self) -> Result<bool, SystemError> {
         // let sebuffer = self.sebuffer.lock(); // 获取锁
         // sebuffer.capacity()-sebuffer.len() ==0;
@@ -170,7 +184,7 @@ impl Connected{
             },
             _=>return  Err(SystemError::EINVAL),
         };
-        Ok(is_full)
+        Ok(!is_full)
     }
 
     pub fn recv_slice(&self, buf: &mut [u8]) -> Result<usize, SystemError>{

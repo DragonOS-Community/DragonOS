@@ -7,6 +7,7 @@ use core::{
 };
 
 use alloc::{ffi::CString, vec::Vec};
+use log::debug;
 
 use crate::mm::{verify_area, VirtAddr};
 
@@ -99,7 +100,6 @@ pub fn check_and_clone_cstr(
     }
 
     let cstr = CString::from(buffer);
-
     return Ok(cstr);
 }
 

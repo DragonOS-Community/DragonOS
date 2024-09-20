@@ -1,12 +1,12 @@
 {
-  "name": "cloud-seed",
+  "name": "test_stream_socket",
   "version": "0.1.0",
-  "description": "cloud-seed",
+  "description": "test for unix stream socket",
+  "rust_target": null,
   "task_type": {
     "BuildFromSource": {
-      "Git": {
-        "url" : "https://github.com/Samuka007/cloud-seed.git",
-        "revision": "d0e663a"
+      "Local": {
+        "path": "apps/test_unix_stream_socket"
       }
     }
   },
@@ -21,5 +21,9 @@
     "clean_command": "make clean"
   },
   "envs": [],
-  "target_arch": ["x86_64"]
+  "build_once": false,
+  "install_once": false,
+  "target_arch": [
+    "x86_64"
+  ]
 }

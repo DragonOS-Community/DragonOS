@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 
 use alloc::{sync::Arc,string::String};
+use log::debug;
 use system_error::SystemError;
 
 use crate::libs::spinlock::SpinLock;
@@ -33,6 +34,10 @@ impl Buffer {
         return self.write_buffer.lock().is_empty();
     }
 
+    pub fn is_write_buf_full(&self) -> bool {
+        return self.write_buffer.lock().len() >= self.metadata.buf_size;
+    }
+
     pub fn read_read_buffer(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         let mut read_buffer = self.read_buffer.lock_irqsave();
         let len = core::cmp::min(buf.len(), read_buffer.len());
@@ -46,6 +51,18 @@ impl Buffer {
     pub fn write_read_buffer(&self, buf: &[u8]) -> Result<usize, SystemError> {
         let mut buffer = self.read_buffer.lock_irqsave();
         log::debug!("send buf {}",String::from_utf8_lossy(buf));
+        let len = buf.len();
+        if self.metadata.buf_size - buffer.len() < len {
+            return Err(SystemError::ENOBUFS);
+        }
+        buffer.extend_from_slice(buf);
+
+        Ok(len)
+    }
+
+    pub fn write_write_buffer(&self, buf: &[u8]) -> Result<usize, SystemError> {
+        let mut buffer = self.write_buffer.lock_irqsave();
+
         let len = buf.len();
         if self.metadata.buf_size - buffer.len() < len {
             return Err(SystemError::ENOBUFS);

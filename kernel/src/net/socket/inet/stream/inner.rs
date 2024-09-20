@@ -221,12 +221,6 @@ pub struct Listening {
 
 impl Listening {
     pub fn accept(&mut self) -> Result<(Established, smoltcp::wire::IpEndpoint), SystemError> {
-        let local_endpoint = self.inners[0]
-            .with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.local_endpoint())
-            .ok_or_else(|| {
-                log::error!("A Listening Tcp With No Local Endpoint");
-                EINVAL
-            })?;
 
         let connected: &mut socket::inet::BoundInner = self
             .inners
@@ -235,6 +229,15 @@ impl Listening {
                 inner.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.is_active())
             })
             .ok_or(EAGAIN_OR_EWOULDBLOCK)?;
+
+        let local_endpoint = connected
+            .with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.local_endpoint())
+            .ok_or_else(|| {
+                log::error!("A Connected Tcp With No Local Endpoint");
+                EINVAL
+            })?;
+
+        log::debug!("local at {:?}", local_endpoint);
 
         let mut new_listen = socket::inet::BoundInner::bind(
             new_listen_smoltcp_socket(local_endpoint),

@@ -43,7 +43,11 @@ impl UdpSocket {
         let mut inner = self.inner.write();
         if let Some(UdpInner::Unbound(unbound)) = inner.take() {
             let bound = unbound.bind(local_endpoint)?;
-            bound.inner().iface().common().bind_socket(self.self_ref.upgrade().unwrap());
+            bound
+                .inner()
+                .iface()
+                .common()
+                .bind_socket(self.self_ref.upgrade().unwrap());
             *inner = Some(UdpInner::Bound(bound));
             return Ok(());
         }

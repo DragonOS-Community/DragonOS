@@ -14,16 +14,14 @@ fn create_unix_socket(
     sock_type: Type,
 ) -> Result<Arc<Inode>, SystemError> {
     match sock_type {
-        // Type::Stream => {
-        //     Ok(stream::StreamSocket::new())
-        // },
-        Type::SeqPacket |Type::Datagram=>{
+        Type::Stream | Type::Datagram => {
+            stream::StreamSocket::new_inode()
+        },
+        Type::SeqPacket => {
             // Ok(seqpacket::SeqpacketSocket::new(false))
             seqpacket::SeqpacketSocket::new_inode(false)
         },
-        _ => {
-            Err(EPROTONOSUPPORT)
-        }
+        _ => Err(EPROTONOSUPPORT),
     }
 }
 

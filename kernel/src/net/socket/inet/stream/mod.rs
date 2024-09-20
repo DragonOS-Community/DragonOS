@@ -104,6 +104,7 @@ impl TcpSocket {
     }
 
     pub fn try_accept(&self) -> Result<(Arc<TcpSocket>, smoltcp::wire::IpEndpoint), SystemError> {
+        poll_ifaces();
         match self.inner.write().as_mut().expect("Tcp Inner is None") {
             Inner::Listening(listening) => listening.accept().map(|(stream, remote)| {
                 (
@@ -215,7 +216,7 @@ impl TcpSocket {
 
     // should only call on accept
     fn is_acceptable(&self) -> bool {
-        self.poll() & EP::EPOLLIN.bits() as usize != 0
+        (self.poll() & EP::EPOLLIN.bits() as usize) != 0
     }
 }
 
@@ -258,6 +259,7 @@ impl Socket for TcpSocket {
         } else {
             loop {
                 wq_wait_event_interruptible!(self.wait_queue, self.is_acceptable(), {})?;
+                // log::debug!("TcpSocket::accept: wake up");
                 match self.try_accept() {
                     Err(EAGAIN_OR_EWOULDBLOCK) => continue,
                     result => break result,

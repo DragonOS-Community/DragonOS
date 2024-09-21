@@ -1,3 +1,5 @@
+use crate::arch::vm::asm::VmxAsm;
+use crate::arch::vm::kvm_host::KvmReg;
 use crate::kerror;
 use crate::virt::kvm::host_mem::PAGE_SHIFT;
 use crate::{arch::mm::X86_64MMArch, kdebug, kwarn};
@@ -9,16 +11,16 @@ use crate::{
 };
 use alloc::{sync::Arc, vec::Vec};
 use bitfield_struct::bitfield;
+use uefi::table::cfg;
+use x86::vmx::vmcs::guest;
 use core::intrinsics::likely;
+use core::ops::{Add, Sub};
 use raw_cpuid::CpuId;
 use system_error::SystemError;
 use x86::controlregs::{Cr0, Cr4};
 use x86_64::registers::control::EferFlags;
 
-use super::super::{
-    vmx::vmx_info,
-    x86_kvm_ops,
-};
+use super::super::{vmx::vmx_info, x86_kvm_ops};
 use super::mmu_internal::KvmPageFault;
 
 const PT64_ROOT_5LEVEL: usize = 5;
@@ -38,12 +40,22 @@ static mut MAX_HUGE_PAGE_LEVEL: PageLevel = PageLevel::None;
 
 pub const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
 
-pub fn is_tdp_mmu_enabled()->bool{
+pub fn is_tdp_mmu_enabled() -> bool {
     unsafe { TDP_MMU_ENABLED }
+}
+
+pub fn max_huge_page_level() -> PageLevel{
+    //不让外面直接修改MAX_HUGE_PAGE_LEVEL的值
+    let level: PageLevel;
+    unsafe {
+        level = MAX_HUGE_PAGE_LEVEL;
+    }
+    level
 }
 
 #[allow(dead_code)]
 #[repr(u8)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum PageLevel {
     None,
     Level4K,
@@ -52,15 +64,49 @@ pub enum PageLevel {
     Level512G,
     LevelNum,
 }
+// 实现 Add trait
+impl Add<usize> for PageLevel {
+    type Output = Self;
+
+    fn add(self, other: usize) -> Self {
+        let result = self as usize + other;
+        match result {
+            0 => PageLevel::None,
+            1 => PageLevel::Level4K,
+            2 => PageLevel::Level2M,
+            3 => PageLevel::Level1G,
+            4 => PageLevel::Level512G,
+            5 => PageLevel::LevelNum,
+            _ => PageLevel::LevelNum, // 超出范围时返回 LevelNum
+        }
+    }
+}
+// 实现 Sub trait
+impl Sub<usize> for PageLevel {
+    type Output = Self;
+
+    fn sub(self, other: usize) -> Self {
+        let result = self as isize - other as isize;
+        match result {
+            0 => PageLevel::None,
+            1 => PageLevel::Level4K,
+            2 => PageLevel::Level2M,
+            3 => PageLevel::Level1G,
+            4 => PageLevel::Level512G,
+            5 => PageLevel::LevelNum,
+            _ => PageLevel::None, // 超出范围时返回 None
+        }
+    }
+}
 impl PageLevel {
     fn kvm_hpage_gfn_shift(level: u8) -> u32 {
         ((level - 1) * 9) as u32
     }
-    
+
     fn kvm_hpage_shift(level: u8) -> u32 {
         PAGE_SHIFT + Self::kvm_hpage_gfn_shift(level)
     }
-    
+
     fn kvm_hpage_size(level: u8) -> u64 {
         1 << Self::kvm_hpage_shift(level)
     }
@@ -99,7 +145,7 @@ impl LockedKvmMmu {
 }
 
 pub type KvmMmuPageFaultHandler =
-    fn(vcpu: &mut VirtCpu, page_fault:&KvmPageFault) -> Result<u64, SystemError>;
+    fn(vcpu: &mut VirtCpu, page_fault: &KvmPageFault) -> Result<u64, SystemError>;
 
 #[derive(Debug, Default)]
 #[allow(dead_code)]
@@ -114,9 +160,17 @@ pub struct KvmMmu {
     prev_roots: [KvmMmuRootInfo; Self::KVM_MMU_NUM_PREV_ROOTS],
 
     pae_root: Vec<u64>,
+
+    pub pdptrs: [u64;4],
 }
 
 impl KvmMmu {
+    pub fn save_pdptrs(&mut self){
+        self.pdptrs[0] = VmxAsm::vmx_vmread(guest::PDPTE0_FULL);
+        self.pdptrs[1] = VmxAsm::vmx_vmread(guest::PDPTE1_FULL);
+        self.pdptrs[2] = VmxAsm::vmx_vmread(guest::PDPTE2_FULL);
+        self.pdptrs[3] = VmxAsm::vmx_vmread(guest::PDPTE3_FULL);
+    }
     const KVM_MMU_NUM_PREV_ROOTS: usize = 3;
     pub const INVALID_PAGE: u64 = u64::MAX;
 
@@ -508,7 +562,7 @@ impl VirtCpu {
         if direct {
             self.mmu_alloc_direct_roots()?;
         } else {
-            self.mmu_alloc_shadow_roots()?;
+            self.mmu_alloc_shadow_roots(vm)?;
         }
 
         // TODO: kvm_mmu_sync_roots
@@ -571,7 +625,51 @@ impl VirtCpu {
         Ok(())
     }
 
-    fn mmu_alloc_shadow_roots(&mut self) -> Result<(), SystemError> {
+    ///没做完
+    fn mmu_alloc_shadow_roots(&mut self,vm: &Vm) -> Result<(), SystemError> {
+        // let mut pdptrs:[u64;4] = [0;4];
+        
+        // let root_pgd = self.get_guest_pgd();
+        // let root_gfn = root_pgd >> PAGE_SHIFT;
+        
+        //     let mut mmu = self.arch.mmu();
+        //     //检查gfn是否合法
+        //     if let Some(slot) = self.gfn_to_memslot(root_gfn,vm){
+        //         if !slot.read().is_visible(){
+        //             mmu.root.hpa = KvmMmu::INVALID_PAGE;
+        //             return Err(SystemError::EFAULT);
+        //         }
+        //     }
+        
+
+
+        // //在SVM架构下？，读取PDPTR可能会访问客户机内存并导致缺页错误，从而使进程进入睡眠状态。
+        // //为了避免在持有mmu_lock时发生睡眠，应该在获取mmu_lock之前先读取PDPTR。
+        // //感觉先不用管
+        // if mmu.cpu_role.base.level() == 3{ //PT32E_ROOT_LEVEL=3
+        //     mmu.save_pdptrs();
+        //     //x86_kvm_ops().cache_reg(&mut self.arch, KvmReg::NrVcpuRegs);
+        //     for i in 0..4{
+        //         pdptrs[i] = self.arch.walk_mmu.clone().unwrap().lock().pdptrs[i];
+        //         if !pdptrs[i] & 0x1 != 0{
+        //             continue;
+        //         }
+
+        //         if let Some(slot) = self.gfn_to_memslot(pdptrs[i]>>PAGE_SHIFT,vm){
+        //             if !slot.read().is_visible(){
+        //                pdptrs[i] = 0;
+        //             }
+        //         }
+        //     }
+        // }
+
+
+
         todo!();
     }
+    // fn get_guest_pgd(&mut self)-> u64{
+    //     x86_kvm_ops().cache_reg(&mut self.arch, KvmReg::VcpuExregCr3);
+    //     self.arch.cr3
+    // }
+
 }

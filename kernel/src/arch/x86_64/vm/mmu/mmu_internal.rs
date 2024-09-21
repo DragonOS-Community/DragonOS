@@ -4,22 +4,23 @@ use alloc::{
     vec::Vec,
 };
 use core::{intrinsics::unlikely, ops::Index};
+use x86::vmx::vmcs::{guest, host};
 
 use system_error::SystemError;
 
 use crate::{
-    arch::vm::{
+    arch::{vm::{
+        asm::VmxAsm,
         kvm_host::{EmulType, KVM_PFN_NOSLOT},
         mmu::{
             mmu::{PFRet, PageLevel},
-            tdp_iter::{is_large_pte, is_shadow_present_pte, TdpIter},
         },
         mtrr::kvm_mtrr_check_gfn_range_consistency,
-        vmx::PageFaultErr,
-    },
-    kwarn,
+        vmx::{ept::EptPageMapper, PageFaultErr},
+    }, MMArch},
+    kdebug, kwarn,
     libs::spinlock::SpinLockGuard,
-    mm::{virt_2_phys, PhysAddr},
+    mm::{page::PageFlags, syscall::ProtFlags, virt_2_phys, PhysAddr},
     virt::{
         kvm::host_mem::PAGE_SHIFT,
         vm::kvm_host::{
@@ -52,7 +53,9 @@ pub struct KvmMmuPage {
 #[derive(Debug, Default)]
 pub struct KvmPageFault {
     // vcpu.do_page_fault 的参数
-    addr: PhysAddr, // gpa_t 通常是一个 64 位地址
+
+    // addr是guestOS传进来的gpa
+    addr: PhysAddr,
     error_code: u32,
     prefetch: bool,
 
@@ -87,12 +90,25 @@ pub struct KvmPageFault {
 
     // kvm_faultin_pfn 的输出
     mmu_seq: u64,
-    pfn: u64, // kvm_pfn_t 通常是一个 64 位地址
+
+    // kvm_pfn_t 通常是一个 64 位地址,相当于知道了hpa
+    pfn: u64,
     hva: u64, // hva_t 通常是一个 64 位地址
     map_writable: bool,
 
     // 表示访客正在尝试写入包含用于翻译写入本身的一个或多个 PTE 的 gfn
     write_fault_to_shadow_pgtable: bool,
+}
+impl KvmPageFault {
+    pub fn pfn(&self) -> u64 {
+        self.pfn
+    }
+    pub fn gfn(&self) -> u64 {
+        self.gfn
+    }
+    pub fn gpa(&self) -> u64 {
+        self.addr.data() as u64
+    }
 }
 
 impl VirtCpu {
@@ -228,7 +244,7 @@ impl VirtCpu {
         Ok(r)
     }
 
-    fn gfn_to_memslot(&self, gfn: u64, vm: &Vm) -> Option<Arc<LockedKvmMemSlot>> {
+    pub fn gfn_to_memslot(&self, gfn: u64, vm: &Vm) -> Option<Arc<LockedKvmMemSlot>> {
         let slot_set: Arc<LockedVmMemSlotSet> = self.kvm_vcpu_memslots(vm);
         //...todo
 
@@ -290,50 +306,26 @@ impl VirtCpu {
         let mmu = self.arch.mmu();
         let kvm = self.kvm();
         let ret = PFRet::Retry;
-
-        let mut tdp_iter: TdpIter = TdpIter::default();
-
-        tdp_iter.start(
-            virt_2_phys(mmu.root.hpa as usize), /*__va */
-            mmu.root_role.level() as u8,
-            PageLevel::Level4K as u8,
-            page_fault.gfn,
-        );
-
-        for iter in tdp_iter {
-            if !(iter.valid && iter.gfn < page_fault.gfn + 1) {
-                //fixme:不懂这里的判断条件
-                break;
-            }
-            //fixme:这一步va->pa的转换可能有点问题
-
-            // 如果启用了 NX 巨大页解决方法，则进行调整
-            if page_fault.nx_huge_page_workaround_enabled {
-                page_fault.nx_huge_page_workaround_enabled = false;
-            }
-
-            if iter.level == page_fault.goal_level {
-                //self.map_handle_target_level(page_fault,&mut iter);
-            }
-
-            //如果在比目标更高的级别有一个映射大页的 SPTE，
-            //那么该 SPTE 必须被清除并替换为非叶子 SPTE。
-            if is_shadow_present_pte(iter.old_spte) && !is_large_pte(iter.old_spte) {
-                continue;
-            }
-
-            //SPTE是non-present或者指向一个需要split的大页
-        }
-        todo!()
-    }
-    ///todo()!!!
-    fn map_handle_target_level(&self, page_fault: &mut KvmPageFault, iter: &mut TdpIter) {
-        todo!()
+        let mut mapper = EptPageMapper::lock();
+        if mapper.is_mapped(page_fault) {
+            kdebug!("page fault is already mapped");
+            return Ok(PFRet::Continue.into());
+        };
+        let page_flags = PageFlags::from_prot_flags(ProtFlags::from_bits_truncate(0x7_u64), false);
+        mapper.map(PhysAddr::new(page_fault.gpa() as usize), page_flags);
+        if mapper.is_mapped(page_fault) {
+            kdebug!("page fault is mapped now");
+        };
+        kdebug!("The ept_root_addr is {:?}", EptPageMapper::root_page_addr());
+        //todo: 一些参数的更新
+        Ok(PFRet::Fixed.into())
+        //todo!()
     }
 
     fn direct_page_fault(&self, page_fault: &KvmPageFault) -> Result<u64, SystemError> {
         todo!()
     }
+
     fn kvm_faultin_pfn(
         &self,
         vm: &Vm,
@@ -375,6 +367,9 @@ impl VirtCpu {
         }
 
         // 尝试将 GFN 转换为 PFN
+        let guest_cr3 = VmxAsm::vmx_vmread(guest::CR3);
+        let host_cr3 = VmxAsm::vmx_vmread(host::CR3);
+        kdebug!("guest_cr3={:x}, host_cr3={:x}", guest_cr3, host_cr3);
         page_fault.pfn = __gfn_to_pfn_memslot(
             Some(&slot),
             page_fault.gfn,

@@ -335,6 +335,7 @@ pub enum KvmReg {
     VcpuRegsRip = 16,
     NrVcpuRegs = 17,
 
+    //VcpuExregPdptr = NrVcpuRegs,
     VcpuExregCr0,
     VcpuExregCr3,
     VcpuExregCr4,

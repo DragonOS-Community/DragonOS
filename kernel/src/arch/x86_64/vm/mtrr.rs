@@ -11,7 +11,7 @@ pub fn kvm_mtrr_check_gfn_range_consistency(vcpu: &mut VirtCpu, gfn: u64, page_n
     // };
     let start = gfn_to_gpa(gfn);
     let end = gfn_to_gpa(gfn + page_num);
-    
+
     // mtrr_for_each_mem_type(&mut iter, mtrr_state, start, end, |iter| {
     //     if iter.mem_type == -1 {
     //         iter.mem_type = iter.mem_type;

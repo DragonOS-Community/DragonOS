@@ -27,9 +27,9 @@ pub(super) mod exit;
 pub mod kvm_host;
 pub mod mem;
 pub mod mmu;
+pub mod mtrr;
 pub mod uapi;
 pub mod vmx;
-pub mod mtrr;
 
 static mut KVM_X86_MANAGER: Option<KvmArchManager> = None;
 

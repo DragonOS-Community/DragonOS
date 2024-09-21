@@ -699,6 +699,7 @@ pub fn hva_to_pfn(
     if let Some((hpa, _)) = mapper.translate(hva) {
         return Ok(hpa.data() as u64 >> PAGE_SHIFT);
     }
+    kdebug!("hva_to_pfn NOT FOUND,try map a new pfn");
     unsafe {
         mapper.map(hva, PageFlags::mmio_flags());
     }

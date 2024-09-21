@@ -14,7 +14,7 @@ bitflags::bitflags! {
 }
 
 pub struct Pte {
-    pub address: u64, // 物理地址
+    pub address: u64,    // 物理地址
     pub flags: PteFlags, // 页表条目标志
 }
 

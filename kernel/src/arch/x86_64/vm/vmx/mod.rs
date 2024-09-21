@@ -482,6 +482,7 @@ impl KvmFunc for VmxKvmFunc {
             // VCPU_EXREG_PDPTR
             KvmReg::NrVcpuRegs => {
                 if vmx_info().enable_ept {
+
                     todo!()
                 }
             }
@@ -494,7 +495,10 @@ impl KvmFunc for VmxKvmFunc {
                 );
             }
             KvmReg::VcpuExregCr3 => {
-                todo!()
+                //当拦截CR3加载时（例如用于影子分页），KVM（Kernel-based Virtual Machine）的CR3会被加载到硬件中，而不是客户机的CR3。
+                //暂时先直接读寄存器
+                vcpu.cr3 = VmxAsm::vmx_vmread(guest::CR3);
+                //todo!()
             }
             KvmReg::VcpuExregCr4 => {
                 let guest_owned = vcpu.cr4_guest_owned_bits;
@@ -1055,10 +1059,7 @@ impl KvmFunc for VmxKvmFunc {
         vcpu.arch.clear_dirty();
 
         let cr3: (PhysFrame, Cr3Flags) = Cr3::read();
-        let cr3: (PhysFrame, Cr3Flags) = Cr3::read();
         if unlikely(cr3 != vcpu.vmx().loaded_vmcs().host_state.cr3) {
-            let cr3_combined: u64 =
-                (cr3.0.start_address().as_u64() & 0xFFFF_FFFF_FFFF_F000) | (cr3.1.bits() & 0xFFF);
             let cr3_combined: u64 =
                 (cr3.0.start_address().as_u64() & 0xFFFF_FFFF_FFFF_F000) | (cr3.1.bits() & 0xFFF);
             VmxAsm::vmx_vmwrite(host::CR3, cr3_combined);
@@ -1238,13 +1239,15 @@ impl KvmFunc for VmxKvmFunc {
                 todo!()
             } else if vcpu.arch.is_register_dirty(KvmReg::VcpuExregCr3) {
                 guest_cr3 = vcpu.arch.cr3;
+                kdebug!("load_mmu_pgd: guest_cr3 = {:#x}", guest_cr3);
+
             } else {
                 return;
             }
         } else {
             todo!();
         }
-
+        vcpu.load_pdptrs();
         VmxAsm::vmx_vmwrite(guest::CR3, guest_cr3);
     }
 }
@@ -2351,8 +2354,6 @@ impl Vmx {
         VmxAsm::vmx_vmwrite(host::CR0, unsafe { cr0() }.bits() as u64);
 
         let cr3: (PhysFrame, Cr3Flags) = Cr3::read();
-        let cr3_combined: u64 =
-            (cr3.0.start_address().as_u64() & 0xFFFF_FFFF_FFFF_F000) | (cr3.1.bits() & 0xFFF);
         let cr3_combined: u64 =
             (cr3.0.start_address().as_u64() & 0xFFFF_FFFF_FFFF_F000) | (cr3.1.bits() & 0xFFF);
         VmxAsm::vmx_vmwrite(host::CR3, cr3_combined);
@@ -3748,4 +3749,7 @@ unsafe extern "C" fn vmx_update_host_rsp(vcpu_vmx: &VmxVCpuPriv, host_rsp: usize
 unsafe extern "C" fn vmx_spec_ctrl_restore_host(_vcpu_vmx: &VmxVCpuPriv, _flags: u32) {
     // TODO
     kwarn!("vmx_spec_ctrl_restore_host todo!");
+}
+const fn vmcs_control_bit(x: u32) -> u32 {
+    1 << (x & 0x1f)
 }

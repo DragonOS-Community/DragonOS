@@ -150,15 +150,61 @@ fn nlmsg_ok(nlh: &NLmsghdr, len: usize) -> bool {
 fn nlmsg_payload(nlh: &NLmsghdr, len: usize) -> usize {
     nlh.nlmsg_len - nlmsg_space(len)
 }
-
-//struct netlink_kernel_cfg,该结构包含了内核netlink的可选参数:
+// 定义类型别名来简化闭包类型的定义
+type InputCallback = Arc<dyn FnMut() + Send + Sync>;
+type BindCallback = Arc<dyn Fn(i32) -> i32 + Send + Sync>;
+type UnbindCallback = Arc<dyn Fn(i32) -> i32 + Send + Sync>;
+type CompareCallback = Arc<dyn Fn(&NetlinkSock) -> bool + Send + Sync>;
+/// 该结构包含了内核netlink的可选参数:
+#[derive(Default)]
 pub struct NetlinkKernelCfg {
     pub groups: u32,
     pub flags: u32,
-    pub input: Option<Box<dyn FnMut()>>,
-    pub bind: Option<Box<dyn Fn(i32)>>,
-    pub unbind: Option<Box<dyn Fn(i32)>>,
-    pub compare: Option<Box<dyn Fn(&NetlinkSock) -> bool>>,
+    pub input: Option<InputCallback>,
+    pub bind: Option<BindCallback>,
+    pub unbind: Option<UnbindCallback>,
+    pub compare: Option<CompareCallback>,
+}
+
+impl NetlinkKernelCfg {
+    pub fn new() -> Self {
+        NetlinkKernelCfg {
+            groups: 32,
+            flags: 0,
+            input: None,
+            bind: None,
+            unbind: None,
+            compare: None,
+        }
+    }
+
+    pub fn set_input<F>(&mut self, callback: F)
+    where
+        F: FnMut() + Send + Sync + 'static,
+    {
+        self.input = Some(Arc::new(callback));
+    }
+
+    pub fn set_bind<F>(&mut self, callback: F)
+    where
+        F: Fn(i32) -> i32 + Send + Sync + 'static,
+    {
+        self.bind = Some(Arc::new(callback));
+    }
+
+    pub fn set_unbind<F>(&mut self, callback: F)
+    where
+        F: Fn(i32) -> i32 + Send + Sync + 'static,
+    {
+        self.unbind = Some(Arc::new(callback));
+    }
+
+    pub fn set_compare<F>(&mut self, callback: F)
+    where
+        F: Fn(&NetlinkSock) -> bool + Send + Sync + 'static,
+    {
+        self.compare = Some(Arc::new(callback));
+    }
 }
 //https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/netlink.h#229
 //netlink属性头
@@ -202,21 +248,24 @@ impl VecExt for Vec<u8> {
 }
 
 // todo： net namespace
-pub fn netlink_kernel_create(unit:usize, cfg:Option<NetlinkKernelCfg>) -> Result<NetlinkSock, SystemError> {
+pub fn netlink_kernel_create(unit: usize, cfg:Option<NetlinkKernelCfg>) -> Result<NetlinkSock, SystemError> {
     // THIS_MODULE
 	let mut nlk: NetlinkSock = NetlinkSock::new();
-    let sk:Arc<Mutex<Box<dyn NetlinkSocket>>> = Arc::new(Mutex::new(Box::new(nlk)));
+    let sk:Arc<Mutex<Box<dyn NetlinkSocket>>> = Arc::new(Mutex::new(Box::new(nlk.clone())));
     let groups:u32;
-    if unit <0 || unit >= MAX_LINKS{
+    if unit >= MAX_LINKS {
         return Err(SystemError::EINVAL);
     }
     __netlink_create(&mut nlk, unit, 1).expect("__netlink_create failed");
 
-    if cfg.is_some() || cfg.clone().unwrap().groups < 32{
-		groups = 32;
-    }
-	else{
-		groups = cfg.unwrap().groups;
+    if let Some(cfg) = cfg.as_ref() {
+        if cfg.groups < 32 {
+            groups = 32;
+        } else {
+            groups = cfg.groups;
+        }
+    } else {
+        groups = 32;
     }
     let listeners = Listeners::new();
     // todo：设计和实现回调函数
@@ -230,24 +279,29 @@ pub fn netlink_kernel_create(unit:usize, cfg:Option<NetlinkKernelCfg>) -> Result
     let mut nl_table = NL_TABLE.write();
     if nl_table[unit].get_registered()==0 {
             nl_table[unit].set_groups(groups);
-            if cfg.is_some() {
-                // todo: 解决闭包实现回调的定义问题后，支持 cfg 配置协议族的其他参数
-                // nl_table[unit].bind = cfg.unwrap().bind;
-                // nl_table[unit].unbind = cfg.unwrap().unbind;
-                nl_table[unit].set_flags(cfg.unwrap().flags);
-                // if nl_table[unit].compare.is_some(){
-                //     nl_table[unit].compare = cfg.unwrap().compare;
-                // }
+            if let Some(cfg) = cfg.as_ref() {
+                nl_table[unit].bind = cfg.bind.clone();
+                nl_table[unit].unbind = cfg.unbind.clone();
+                nl_table[unit].set_flags(cfg.flags);
+                if cfg.compare.is_some() {
+                    nl_table[unit].compare = cfg.compare.clone();
             }
             nl_table[unit].set_registered(1);
         } else {
             drop(listeners);
-            nl_table[unit].set_registered(nl_table[unit].get_registered() + 1);
+            let registered = nl_table[unit].get_registered();
+            nl_table[unit].set_registered(registered + 1);
         }
+    }
     return Ok(nlk);
 }
 
 fn __netlink_create(nlk: &mut NetlinkSock, unit: usize, kern:usize)->Result<i32,SystemError>{
     // 其他的初始化配置参数
     return Ok(0);
+}
+
+pub fn sk_data_ready(nlk: Arc<NetlinkSock>)-> Result<(),SystemError>{
+    // 唤醒
+    return Ok(());
 }

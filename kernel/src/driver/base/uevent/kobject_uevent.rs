@@ -62,14 +62,11 @@ fn uevent_net_init()-> Result<(),SystemError>{
 	
     let cfg = NetlinkKernelCfg {
         groups: 1,
-        input: Some(Box::new(uevent_net_rcv)),
         flags: NL_CFG_F_NONROOT_RECV,
-        bind: None,
-        unbind: None,
-        compare: None,
+        ..Default::default()
     };
     // 创建一个内核 netlink socket
-    let mut ue_sk = UeventSock::new(netlink_kernel_create(NETLINK_KOBJECT_UEVENT, Some(cfg)).unwrap());
+    let ue_sk = UeventSock::new(netlink_kernel_create(NETLINK_KOBJECT_UEVENT, Some(cfg)).unwrap());
 	if ue_sk.inner.get_sk().is_none() {
 		log::debug!("kobject_uevent: unable to create netlink socket!\n");
 		drop(ue_sk);

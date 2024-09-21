@@ -298,6 +298,8 @@ pub fn netlink_kernel_create(unit: usize, cfg:Option<NetlinkKernelCfg>) -> Resul
 
 fn __netlink_create(nlk: &mut NetlinkSock, unit: usize, kern:usize)->Result<i32,SystemError>{
     // 其他的初始化配置参数
+    nlk.flags = kern as u32;
+    nlk.protocol = unit;
     return Ok(0);
 }
 

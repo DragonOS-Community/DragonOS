@@ -67,23 +67,13 @@ fn uevent_net_init()-> Result<(),SystemError>{
     };
     // 创建一个内核 netlink socket
     let ue_sk = UeventSock::new(netlink_kernel_create(NETLINK_KOBJECT_UEVENT, Some(cfg)).unwrap());
-	if ue_sk.inner.get_sk().is_none() {
-		log::debug!("kobject_uevent: unable to create netlink socket!\n");
-		drop(ue_sk);
-		return Err(SystemError::ENODEV);
-	}
+
     // todo: net namespace
 	// net.uevent_sock = ue_sk;
-
-	/* Restrict uevents to initial user namespace. */
-	// if sock_net(ue_sk->sk)->user_ns == &init_user_ns {
-	// 	mutex_lock(&uevent_sock_mutex);
-	// 	list_add_tail(&ue_sk->list, &uevent_sock_list);
-	// 	mutex_unlock(&uevent_sock_mutex);
-	// }
     
     // 每个 net namespace 向链表中添加一个新的 uevent socket
     UEVENT_SOCK_LIST.lock().push_back(ue_sk);
+    log::info!("uevent_net_init finish");
 	return Ok(());
 }
 
@@ -440,11 +430,11 @@ pub fn kobject_uevent_net_broadcast(
     // 		net = kobj.ktype().namespace(kobj);
     // 如果有网络命名空间，则广播标记的uevent；如果没有，则广播未标记的uevent
     // if !net.is_none() {
-    //     ret = uevent_net_broadcast_tagged(net.unwrap().sk, env, action_string, devpath);
+    //     ret = uevent_net_broadcast_tagged(net.unwrap(), env, action_string, devpath);
     // } else {
     ret = uevent_net_broadcast_untagged(env, action_string, devpath);
     // }
-    log::info!("kobject_uevent_net_broadcast finish");
+    log::info!("kobject_uevent_net_broadcast finish. ret: {}", ret);
     ret
 }
 
@@ -481,9 +471,8 @@ pub fn uevent_net_broadcast_untagged(
     // 锁定 UEVENT_SOCK_LIST 并遍历
     let ue_sk_list = UEVENT_SOCK_LIST.lock();
     for ue_sk in ue_sk_list.iter() {
-        let uevent_sock = ue_sk.inner.get_sk();
         // 如果没有监听者，则跳过
-        if netlink_has_listeners(&uevent_sock.unwrap().upgrade().unwrap(), 1) == 0 {
+        if netlink_has_listeners(&ue_sk.inner, 1) == 0 {
             log::info!("uevent_net_broadcast_untagged: no listeners");
             continue;
         }
@@ -496,8 +485,10 @@ pub fn uevent_net_broadcast_untagged(
                 continue;
             }
         }
+        log::info!("next is netlink_broadcast");
+        let netlink_socket: Arc<dyn NetlinkSocket> = Arc::new(ue_sk.inner.clone());
         retval = match netlink_broadcast(
-            &ue_sk.inner.get_sk().unwrap().upgrade().unwrap(),
+            &netlink_socket,
             Arc::clone(&skb),
             0,
             1,
@@ -506,7 +497,7 @@ pub fn uevent_net_broadcast_untagged(
             Ok(_) => 0,
             Err(err) => err.to_posix_errno(),
         };
-
+        log::info!("finished netlink_broadcast");
         // ENOBUFS should be handled in userspace
         if retval == SystemError::ENOBUFS.to_posix_errno()
             || retval == SystemError::ESRCH.to_posix_errno()

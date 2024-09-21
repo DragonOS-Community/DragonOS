@@ -412,7 +412,7 @@ pub trait NetlinkSocket: Socket + Any {
     fn sk_rcvbuf(&self) -> usize;
     fn enqueue_skb(&mut self, skb: Arc<RwLock<SkBuff>>);
     fn is_kernel(&self) -> bool;
-    fn equals(&self, other: Option<Arc<Mutex<Box<dyn NetlinkSocket>>>>) -> bool;
+    fn equals(&self, other: Arc<Mutex<Box<dyn NetlinkSocket>>>) -> bool;
     fn portid(&self) -> u32;
     fn ngroups(&self) -> u64;
     fn groups(&self) -> Vec<u64>;
@@ -440,7 +440,7 @@ impl NetlinkSockMetadata {
 #[cast_to([sync] Socket)]
 #[cast_to([sync] NetlinkSocket)]
 pub struct NetlinkSock {
-    sk: Option<Weak<dyn NetlinkSocket>>,
+    // sk: Option<Weak<dyn NetlinkSocket>>,
     portid: u32,
     node: Arc<HListHead>,
     dst_portid: u32,
@@ -449,6 +449,7 @@ pub struct NetlinkSock {
     subscriptions: u32,
     ngroups: u64,
     groups: Vec<u64>,
+    pub protocol:usize,
     bound: bool,
     state: NetlinkState,
     max_recvmsg_len: usize,
@@ -569,7 +570,7 @@ impl NetlinkSocket for NetlinkSock {
         return self.state;
     }
     fn sk_protocol(&self) -> usize {
-        0
+        return self.protocol;
     }
     fn sk_rmem_alloc(&self) -> usize {
         0
@@ -583,12 +584,16 @@ impl NetlinkSocket for NetlinkSock {
     fn is_kernel(&self) -> bool {
         self.flags & NetlinkFlags::NETLINK_F_KERNEL_SOCKET.bits() != 0
     }
-    fn equals(&self, other: Option<Arc<Mutex<Box<dyn NetlinkSocket>>>>) -> bool {
-        if let Some(self_sk) = self.sk.as_ref().unwrap().upgrade() {
-            self_sk.equals(other)
-        } else {
-            false
-        }
+    fn equals(&self, other: Arc<Mutex<Box<dyn NetlinkSocket>>>) -> bool {
+        let binding = other.lock();
+        let nlk =
+            binding
+                .deref()
+                .as_any()
+                .downcast_ref::<NetlinkSock>()
+                .ok_or(SystemError::EINVAL)
+                .clone().unwrap(); 
+        return self.portid == nlk.portid;
     }
     fn portid(&self) -> u32 {
         0
@@ -628,7 +633,7 @@ impl NetlinkSock {
         let mutex_protected = Mutex::new(vec_of_vec_u8);
         let data: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(mutex_protected);
         NetlinkSock {
-            sk: None,
+            // sk: None,
             portid: 0,
             node: Arc::new(HListHead { first: None }),
             dst_portid: 0,
@@ -639,6 +644,7 @@ impl NetlinkSock {
             groups: Vec::new(),
             bound: false,
             state: NetlinkState::NetlinkUnconnected,
+            protocol:1,
             max_recvmsg_len: 0,
             dump_done_errno: 0,
             cb_running: false,
@@ -648,12 +654,6 @@ impl NetlinkSock {
             sk_rcvtimeo: 0,
             callback: None,
         }
-    }
-    pub fn get_sk(&self) -> Option<&Weak<dyn NetlinkSocket>> {
-        self.sk.as_ref()
-    }
-    pub fn set_sk(&mut self, sk: Weak<dyn NetlinkSocket>) {
-        self.sk = Some(sk);
     }
     fn register(&self, listener: Box<dyn NetlinkMessageHandler>) {
         // Implementation of the function
@@ -759,35 +759,8 @@ impl NetlinkSock {
         log::debug!("netlink_recv: copied: {}, endpoint: {:?}", copied, endpoint);
         Ok((copied, endpoint))
     }
-    //     // let skb:SkBuff = skb_recv_datagram(sk, &nlk, &mut copied, &err, &ret);
-    //     // if skb.is_empty(){
-    //     //     netlink_rcv_wake(sk);
-    //     // }
-    //     // data_skb = skb;
-    //     // nlk.max_recvmsg_len = max(nlk.max_recvmsg_len, len);
-    //     // nlk.max_recvmsg_len = min(nlk.max_recvmsg_len,32768);
-    //     // copied = data_skb.len;
-    //     // if len < copied {
-    //     //     msg.msg_flags |= MessageFlag::TRUNC;
-    //     //     copied = len;
-    //     // }
-    //     // skb_copy_datagram_msg(data_skb, 0, msg, copied);
-    //     // return Ok(0);
-    // }
 }
 
-// struct callback_head {
-//     next: Option<Box<callback_head>>,
-// }
-
-// impl callback_head {
-//     fn next(&self) -> &Option<Box<callback_head>> {
-//         &self.next
-//     }
-//     fn func(&self) -> Option<Box<dyn Fn() -> i32>> {
-//         None
-//     }
-// }
 #[derive(Clone)]
 pub struct Listeners {
     // Recursive Wakeup Unlocking?
@@ -814,7 +787,7 @@ lazy_static! {
     /// 一个维护全局的 NetlinkTable 向量，每一个元素代表一个 netlink 协议类型，最大数量为 MAX_LINKS
     pub static ref NL_TABLE: RwLock<Vec<NetlinkTable>> = initialize_netlink_table();
 }
-pub fn netlink_has_listeners(sk: &Arc<dyn NetlinkSocket>, group: u32) -> i32 {
+pub fn netlink_has_listeners(sk: &NetlinkSock, group: u32) -> i32 {
     log::info!("netlink_has_listeners");
     let mut res = 0;
     let protocol = sk.sk_protocol();
@@ -862,7 +835,7 @@ fn do_one_broadcast(
         .downcast()
         .map_err(|_| SystemError::EINVAL)?;
     // 如果源 sock 和目的 sock 是同一个则直接返回
-    if info.exclude_sk.equals(Some(sk.clone())) {
+    if info.exclude_sk.equals(sk.clone()) {
         return Err(SystemError::EINVAL);
     }
     // 如果目的单播地址就是该 netlink 套接字
@@ -1151,7 +1124,6 @@ fn netlink_unicast_kernel(
     if !nlk_guard.callback.is_none() {
         ret = skb.read().len;
         netlink_skb_set_owner_r(&skb, sk);
-        // NETLINK_CB(skb).sk = ssk;
         // todo: netlink_deliver_tap_kernel(sk, ssk, skb);
         nlk_guard.callback.unwrap().netlink_rcv(skb.clone());
         drop(skb);

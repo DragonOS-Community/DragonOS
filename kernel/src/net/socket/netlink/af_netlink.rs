@@ -11,12 +11,13 @@ use hashbrown::HashMap;
 use intertrait::cast::CastBox;
 use intertrait::CastFromSync;
 use log::warn;
+use netlink::netlink::NetlinkKernelCfg;
 use num::Zero;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode};
-use crate::include::bindings::bindings::{ECONNREFUSED, __WORDSIZE};
+use system_error::SystemError::ECONNREFUSED;
 use crate::libs::mutex::Mutex;
 use crate::libs::rwlock::RwLockWriteGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
@@ -89,28 +90,28 @@ impl<'a> Iterator for HListHeadIter<'a> {
         }
     }
 }
-///
+/// 
 #[derive(Clone)]
 pub struct NetlinkTable {
     hash: HashMap<u32, Arc<Mutex<Box<dyn NetlinkSocket>>>>,
-    listeners: Option<listeners>,
+    listeners: Option<Listeners>,
     registered: u32,
     flags: u32,
-    groups: i32,
+    groups: u32,
+    // todo: mc_list
     mc_list: HListHead,
 }
 impl<'a> NetlinkTable {
     fn new() -> NetlinkTable {
         NetlinkTable {
             hash: HashMap::new(),
-            listeners: Some(listeners { masks: Vec::new() }),
+            listeners: Some(Listeners { masks: Vec::new() }),
             registered: 0,
             flags: 0,
             groups: 0,
             mc_list: HListHead { first: None },
         }
     }
-    // fn hash(&self)->RhashTable;
     fn listeners(&self) -> RCuListeners {
         RCuListeners::new()
     }
@@ -120,23 +121,19 @@ impl<'a> NetlinkTable {
     fn groups(&self) -> u32 {
         0
     }
-    // fn cb_mutex(&self)->Mutex;
-    // fn module(&self)->Module;
-    // fn bind(net:Net, group: u32);
-    // fn unbind(net:Net, group: u32);
-    // fn compare(net:Net, sock:sock);
-    fn registed(&self) -> u32 {
-        0
+    pub fn set_registered(&mut self, registered: u32) {
+        self.registered = registered;
     }
-    // fn bind(&self, net: &Net, group: u32) {
-    //     // Implementation of bind
-    // }
-    // fn unbind(&self, net: &Net, group: u32) {
-    //     // Implementation of unbind
-    // }
-    // fn compare(&self, net: &Net, sock: &sock) {
-    //     // Implementation of compare
-    // }
+    pub fn set_flags(&mut self, flags: u32) {
+        self.flags = flags;
+    }
+    pub fn set_groups(&mut self, groups: u32) {
+        self.groups = groups;
+    }
+    pub fn get_registered(&self) -> u32 {
+        self.registered
+    }
+
 }
 
 pub struct LockedNetlinkTable(RwLock<NetlinkTable>);
@@ -214,7 +211,7 @@ pub struct NetlinkFamulyOps {
 
 // impl NetProtoFamily for NetlinkFamulyOps {
 //     // https://code.dragonos.org.cn/s?refs=netlink_create&project=linux-6.1.9
-//     /// netlink_create() 创建一个netlink套接字
+//     /// netlink_create() 用户空间创建一个netlink套接字
 //     fn create(socket: &mut dyn Socket, protocol: i32, _kern: bool) -> Result<(), Error> {
 //         // 假设我们有一个类型来跟踪协议最大值
 //         const MAX_LINKS: i32 = 1024;
@@ -240,8 +237,8 @@ lazy_static! {
 pub fn sock_register(ops: &NetlinkFamulyOps) {}
 /// 初始化和注册一个用户套接字条目，并将其添加到全局的NetlinkTable向量中
 pub fn netlink_add_usersock_entry(nl_table: &mut RwLockWriteGuard<Vec<NetlinkTable>>) {
-    let listeners: Option<listeners> = Some(listeners::new());
-    let groups: i32 = 32;
+    let listeners: Option<Listeners> = Some(Listeners::new());
+    let groups: u32 = 32;
     if listeners.is_none() {
         panic!("netlink_add_usersock_entry: Cannot allocate listeners\n");
     }
@@ -255,7 +252,7 @@ pub fn netlink_add_usersock_entry(nl_table: &mut RwLockWriteGuard<Vec<NetlinkTab
 }
 // https://code.dragonos.org.cn/xref/linux-6.1.9/net/netlink/af_netlink.c#572
 /// 内核套接字插入 nl_table
-fn netlink_insert(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, portid: u32) -> Result<(), SystemError> {
+pub fn netlink_insert(sk: Arc<Mutex<Box<dyn NetlinkSocket>>>, portid: u32) -> Result<(), SystemError> {
     let mut nl_table = NL_TABLE.write();
     // 将 Arc<Mutex<Box<dyn Socket>>> 转换为 Arc<Mutex<Box<dyn NetlinkSocket>>>
 
@@ -325,8 +322,8 @@ fn netlink_bind(
     //     }
     // }
 
-    // BITS_PER_LONG = __WORDSIZE
-    if nlk.ngroups < __WORDSIZE as u64 {
+    // BITS_PER_LONG = __WORDSIZE = 64
+    if nlk.ngroups < 64 as u64 {
         groups &= (1 << nlk.ngroups) - 1;
     }
 
@@ -419,7 +416,7 @@ pub trait NetlinkSocket: Socket {
 
 /* linux：struct sock has to be the first member of netlink_sock */
 // linux 6.1.9中的netlink_sock结构体里，sock是一个很大的结构体，这里简化
-// 意义是netlink_sock（NetlinkSock）是一个sock（NetlinkSocket）
+// 意义是：netlink_sock（NetlinkSock）是一个sock（NetlinkSocket）, 实现了 Netlinksocket trait 和 Sock trait.
 
 pub struct LockedNetlinkSock(RwLock<NetlinkSock>);
 impl LockedNetlinkSock {
@@ -443,7 +440,7 @@ pub struct NetlinkSock {
     node: Arc<HListHead>,
     dst_portid: u32,
     dst_group: u32,
-    flags: u32,
+    pub flags: u32,
     subscriptions: u32,
     ngroups: u64,
     groups: Vec<u64>,
@@ -644,8 +641,11 @@ impl NetlinkSock {
             callback: None,
         }
     }
-    pub fn get_sk(&self) -> &Weak<dyn NetlinkSocket> {
-        self.sk.as_ref().unwrap()
+    pub fn get_sk(&self) -> Option<&Weak<dyn NetlinkSocket>> {
+        self.sk.as_ref()
+    }
+    pub fn set_sk(&mut self, sk: Weak<dyn NetlinkSocket>) {
+        self.sk = Some(sk);
     }
     fn register(&self, listener: Box<dyn NetlinkMessageHandler>) {
         // Implementation of the function
@@ -781,13 +781,13 @@ impl NetlinkSock {
 //     }
 // }
 #[derive(Clone)]
-struct listeners {
+pub struct Listeners {
     // Recursive Wakeup Unlocking?
     masks: Vec<u64>,
 }
-impl listeners {
-    fn new() -> listeners {
-        listeners { masks: Vec::new() }
+impl Listeners {
+    pub fn new() -> Listeners {
+        Listeners { masks: Vec::new() }
     }
     fn masks(&self) -> Vec<u64> {
         Vec::new()
@@ -796,9 +796,10 @@ impl listeners {
 
 lazy_static! {
     /// 一个维护全局的 NetlinkTable 哈希链的向量，每一个元素代表一个 netlink 协议类型，最大数量为MAX_LINKS
-    static ref NL_TABLE: RwLock<Vec<NetlinkTable>> = RwLock::new(vec![NetlinkTable::new(); MAX_LINKS]);
+    pub static ref NL_TABLE: RwLock<Vec<NetlinkTable>> = RwLock::new(vec![NetlinkTable::new(); MAX_LINKS]);
 }
-pub fn netlink_has_listeners(sk: &Arc<dyn NetlinkSocket>, group: i32) -> i32 {
+pub fn netlink_has_listeners(sk: &Arc<dyn NetlinkSocket>, group: u32) -> i32 {
+    log::info!("netlink_has_listeners");
     let mut res = 0;
     let protocol = sk.sk_protocol();
     let nl_table = NL_TABLE.read();
@@ -838,6 +839,7 @@ fn do_one_broadcast(
     sk: Arc<Mutex<Box<dyn NetlinkSocket>>>,
     info: &mut Box<NetlinkBroadcastData>,
 ) -> Result<(), SystemError> {
+    log::info!("do_one_broadcast");
     // 从Arc<dyn NetlinkSocket>中获取NetlinkSock
     let nlk: Arc<NetlinkSock> = Arc::clone(&sk)
         .arc_any()
@@ -914,6 +916,7 @@ fn do_one_broadcast(
         info.skb_2 = Arc::new(RwLock::new(info.skb.read().clone()));
     }
     drop(sk);
+    log::info!("do_one_broadcast success");
     Ok(())
 }
 /// 发送 netlink 组播消息
@@ -934,6 +937,7 @@ pub fn netlink_broadcast<'a>(
     group: u64,
     allocation: u32,
 ) -> Result<(), SystemError> {
+    log::info!("netlink_broadcast");
     // TODO: 需要net namespace支持
     // let net = sock_net(ssk);
     let mut info = Box::new(NetlinkBroadcastData {
@@ -999,6 +1003,7 @@ fn netlink_broadcast_deliver(
     sk: Arc<Mutex<Box<dyn NetlinkSocket>>>,
     skb: &Arc<RwLock<SkBuff>>,
 ) -> i32 {
+    log::info!("netlink_broadcast_deliver");
     let nlk: Arc<LockedNetlinkSock> = Arc::clone(&sk)
         .arc_any()
         .downcast()
@@ -1120,7 +1125,8 @@ fn netlink_unicast_kernel(
         .map_err(|_| SystemError::EINVAL)
         .expect("Invalid downcast to LockedNetlinkSock");
     let nlk_guard = nlk.0.read();
-    ret = ECONNREFUSED;
+    // ret = ECONNREFUSED = 111;
+    ret = 111;
     // 检查内核netlink套接字是否注册了netlink_rcv回调(就是各个协议在创建内核netlink套接字时通常会传入的input函数)
     if !nlk_guard.callback.is_none() {
         ret = skb.read().len;

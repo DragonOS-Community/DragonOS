@@ -1,67 +1,102 @@
-use core::fmt::Write;
 // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c
-/*
-
-Variable
-
-    kobject_actions √
-    uevent_helper
-    uevent_net_ops
-    uevent_seqnum   √
-
-Struct
-
-    uevent_sock
-
-Function
-
-    action_arg_word_end
-    cleanup_uevent_env
-    init_uevent_argv
-    kobj_usermode_filter
-    kobject_action_args
-    kobject_action_type
-    kobject_synth_uevent
-    kobject_uevent_init
-    uevent_net_exit
-    uevent_net_init
-    uevent_net_rcv
-    uevent_net_rcv_skb
-
-*/
+use core::fmt::Write;
+use alloc::collections::LinkedList;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use num::Zero;
-
+use unified_init::macros::unified_init;
 use super::KObject;
 use super::KobjUeventEnv;
 use super::KobjectAction;
 use super::{UEVENT_BUFFER_SIZE, UEVENT_NUM_ENVP};
 use crate::driver::base::kobject::{KObjectManager, KObjectState};
+use crate::init::initcall::INITCALL_POSTCORE;
+use crate::libs::mutex::Mutex;
 use crate::libs::rwlock::RwLock;
 use crate::net::socket::netlink::af_netlink::netlink_has_listeners;
 use crate::net::socket::netlink::af_netlink::NetlinkSocket;
 use crate::net::socket::netlink::af_netlink::{netlink_broadcast, NetlinkSock};
+use crate::net::socket::netlink::netlink::{netlink_kernel_create, NetlinkKernelCfg, NETLINK_KOBJECT_UEVENT, NL_CFG_F_NONROOT_RECV};
 use crate::net::socket::netlink::skbuff::SkBuff;
-use crate::net::socket::Socket;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use system_error::SystemError;
-// 存放需要用到的全局变量
+// 全局变量
 pub static UEVENT_SEQNUM: u64 = 0;
-pub static UEVENT_SUPPRESS: i32 = 1;
 // #ifdef CONFIG_UEVENT_HELPER
 // char uevent_helper[UEVENT_HELPER_PATH_LEN] = CONFIG_UEVENT_HELPER_PATH;
 // #endif
 
-// struct uevent_sock {
-// 	struct list_head list;
-// 	struct sock *sk;
-// };
+struct UeventSock {inner: NetlinkSock}
+impl UeventSock {
+    pub fn new(inner:NetlinkSock) -> Self {
+        UeventSock {
+            inner,
+        }
+    }
+}
 
-// #ifdef CONFIG_NET
-// static LIST_HEAD(uevent_sock_list);
-// #endif
+// 用于存储所有用于发送 uevent 消息的 netlink sockets。这些 sockets 用于在内核和用户空间之间传递设备事件通知。
+// 每当需要发送 uevent 消息时，内核会遍历这个链表，并通过其中的每一个 socket 发送消息。
+// 使用 Mutex 保护全局链表
+lazy_static::lazy_static! {
+    static ref UEVENT_SOCK_LIST: Mutex<LinkedList<UeventSock>> = Mutex::new(LinkedList::new());
+}
+// 回调函数，当接收到 uevent 消息时调用
+fn uevent_net_rcv(){
+    // netlink_rcv_skb(skb, &uevent_net_rcv_skb);
+    
+}
+
+/// 内核初始化的时候，在设备初始化之前执行
+#[unified_init(INITCALL_POSTCORE)]
+fn kobejct_uevent_init()-> Result<(),SystemError>{
+    // todo: net namespace
+    return uevent_net_init();
+}
+// TODO：等net namespace实现后添加 net 参数和相关操作
+// 内核启动的时候，即使没有进行网络命名空间的隔离也需要调用这个函数
+// 支持 net namespace 之后需要在每个 net namespace 初始化的时候调用这个函数
+/// 为每一个 net namespace 初始化 uevent
+fn uevent_net_init()-> Result<(),SystemError>{
+	
+    let cfg = NetlinkKernelCfg {
+        groups: 1,
+        input: Some(Box::new(uevent_net_rcv)),
+        flags: NL_CFG_F_NONROOT_RECV,
+        bind: None,
+        unbind: None,
+        compare: None,
+    };
+    // 创建一个内核 netlink socket
+    let mut ue_sk = UeventSock::new(netlink_kernel_create(NETLINK_KOBJECT_UEVENT, Some(cfg)).unwrap());
+	if ue_sk.inner.get_sk().is_none() {
+		log::debug!("kobject_uevent: unable to create netlink socket!\n");
+		drop(ue_sk);
+		return Err(SystemError::ENODEV);
+	}
+    // todo: net namespace
+	// net.uevent_sock = ue_sk;
+
+	/* Restrict uevents to initial user namespace. */
+	// if sock_net(ue_sk->sk)->user_ns == &init_user_ns {
+	// 	mutex_lock(&uevent_sock_mutex);
+	// 	list_add_tail(&ue_sk->list, &uevent_sock_list);
+	// 	mutex_unlock(&uevent_sock_mutex);
+	// }
+    
+    // 每个 net namespace 向链表中添加一个新的 uevent socket
+    UEVENT_SOCK_LIST.lock().push_back(ue_sk);
+	return Ok(());
+}
+
+// 系统关闭时清理
+fn uevent_net_exit()
+{
+    // 清理链表
+    UEVENT_SOCK_LIST.lock().clear();
+}
+
 
 // /* This lock protects uevent_seqnum and uevent_sock_list */
 // static DEFINE_MUTEX(uevent_sock_mutex);
@@ -126,95 +161,104 @@ pub fn kobject_uevent_env(
      * do not want to re-trigger "remove" event via automatic cleanup.
      */
     if let KobjectAction::KOBJREMOVE = action {
+        log::info!("kobject_uevent_env: action: remove");
         state.insert(KObjectState::REMOVE_UEVENT_SENT);
     }
 
-    /* search the kset we belong to */
+    // 不断向上查找，直到找到最顶层的kobject
     while let Some(weak_parent) = top_kobj.parent() {
+        log::info!("kobject_uevent_env: top_kobj: {:?}", top_kobj);
         top_kobj = weak_parent.upgrade().unwrap();
     }
     /* 查找当前kobject或其parent是否从属于某个kset;如果都不从属于某个kset，则返回错误。(说明一个kobject若没有加入kset，是不会上报uevent的) */
-    if top_kobj.kset().is_none() {
+    if kobj.kset().is_none() && top_kobj.kset().is_none() {
         log::info!("attempted to send uevent without kset!\n");
         return Err(SystemError::EINVAL);
     }
 
     let kset = top_kobj.kset();
-    /* skip the event, if uevent_suppress is set*/
-    if UEVENT_SUPPRESS == 1 {
+    // 判断该 kobject 的状态是否设置了uevent_suppress，如果设置了，则忽略所有的uevent上报并返回
+    if kobj.kobj_state().contains(KObjectState::UEVENT_SUPPRESS)
+    {
         log::info!("uevent_suppress caused the event to drop!");
         return Ok(0);
     }
 
-    /* skip the event, if the filter returns zero. */
-    if kset.as_ref().unwrap().uevent_ops.is_some() && kset.as_ref().unwrap().uevent_ops.is_none() {
-        log::info!("filter caused the event to drop!");
-        return Ok(0);
+    // 如果所属的kset的kset->filter返回的是0，过滤此次上报
+    if let Some(kset_ref) = kset.as_ref() {
+        if let Some(uevent_ops) = &kset_ref.uevent_ops {
+            if uevent_ops.filter() == Some(0) {
+                log::info!("filter caused the event to drop!");
+                return Ok(0);
+            }
+        }
     }
 
-    /* originating subsystem */
-    let subsystem: String = if kset.as_ref().unwrap().uevent_ops.is_some()
-        && kset
-            .as_ref()
-            .unwrap()
-            .uevent_ops
-            .as_ref()
-            .unwrap()
-            .uevent_name()
-            != ""
-    {
-        kset.as_ref()
-            .unwrap()
-            .uevent_ops
-            .as_ref()
-            .unwrap()
-            .uevent_name()
+     // 判断所属的kset是否有合法的名称（称作subsystem，和前期的内核版本有区别），否则不允许上报uevent
+    // originating subsystem
+    let subsystem: String = if let Some(kset_ref) = kset.as_ref() {
+        if let Some(uevent_ops) = &kset_ref.uevent_ops {
+            let name = uevent_ops.uevent_name();
+            if !name.is_empty() {
+                name
+            } else {
+                kobj.name()
+            }
+        } else {
+            kobj.name()
+        }
     } else {
         kobj.name()
     };
     if subsystem.is_empty() {
-        log::info!("unset sussystem caused the event to drop!");
+        log::info!("unset subsystem caused the event to drop!");
     }
+    log::info!("kobject_uevent_env: subsystem: {}", subsystem);
 
-    /* environment buffer */
     // 创建一个用于环境变量的缓冲区
     let mut env = Box::new(KobjUeventEnv {
         argv: Vec::with_capacity(UEVENT_NUM_ENVP),
         envp: Vec::with_capacity(UEVENT_NUM_ENVP),
         envp_idx: 0,
-        buf: Vec::with_capacity(UEVENT_BUFFER_SIZE),
+        buf: vec![0; UEVENT_BUFFER_SIZE],
         buflen: 0,
     });
     if env.buf.is_empty() {
+        log::error!("kobject_uevent_env: failed to allocate buffer");
         return Err(SystemError::ENOMEM);
     }
 
-    //获取设备的完整对象路径
-    /* complete object path */
+    // 获取设备的完整对象路径
     let devpath: String = KObjectManager::kobject_get_path(&kobj);
+    log::info!("kobject_uevent_env: devpath: {}", devpath);
     if devpath.is_empty() {
         retval = SystemError::ENOENT.to_posix_errno();
         // goto exit
         drop(devpath);
         drop(env);
+        log::warn!("kobject_uevent_env: devpath is empty");
         return Ok(retval);
     }
     retval = add_uevent_var(&mut env, "ACTION=%s", &action_string).unwrap();
-    if retval.is_zero() {
+    log::info!("kobject_uevent_env: retval: {}", retval);
+    if !retval.is_zero() {
         drop(devpath);
         drop(env);
+        log::info!("add_uevent_var failed ACTION");
         return Ok(retval);
     };
     retval = add_uevent_var(&mut env, "DEVPATH=%s", &devpath).unwrap();
-    if retval.is_zero() {
+    if !retval.is_zero() {
         drop(devpath);
         drop(env);
+        log::info!("add_uevent_var failed DEVPATH");
         return Ok(retval);
     };
     retval = add_uevent_var(&mut env, "SUBSYSTEM=%s", &subsystem).unwrap();
-    if retval.is_zero() {
+    if !retval.is_zero() {
         drop(devpath);
         drop(env);
+        log::info!("add_uevent_var failed SUBSYSTEM");
         return Ok(retval);
     };
 
@@ -222,36 +266,27 @@ pub fn kobject_uevent_env(
     if let Some(env_ext) = envp_ext {
         for var in env_ext {
             let retval = add_uevent_var(&mut env, "%s", &var).unwrap();
-            if retval.is_zero() {
+            if !retval.is_zero() {
                 drop(devpath);
                 drop(env);
+                log::info!("add_uevent_var failed");
                 return Ok(retval);
             }
         }
     }
-    if kset.as_ref().unwrap().uevent_ops.is_some()
-        && kset
-            .as_ref()
-            .unwrap()
-            .uevent_ops
-            .as_ref()
-            .unwrap()
-            .uevent(&env)
-            != 0
-    {
-        retval = kset
-            .as_ref()
-            .unwrap()
-            .uevent_ops
-            .as_ref()
-            .unwrap()
-            .uevent(&env);
-        if retval.is_zero() {
-            log::info!("kset uevent caused the event to drop!");
-            // goto exit
-            drop(devpath);
-            drop(env);
-            return Ok(retval);
+    if let Some(kset_ref) = kset.as_ref() {
+        if let Some(uevent_ops) = kset_ref.uevent_ops.as_ref() {
+            if uevent_ops.uevent(&env) != 0 {
+                retval = uevent_ops.uevent(&env);
+                if retval.is_zero() {
+                    log::info!("kset uevent caused the event to drop!");
+                    // goto exit
+                    drop(devpath);
+                    drop(env);
+                    return Ok(retval);
+                }
+            }
+
         }
     }
     match action {
@@ -267,9 +302,10 @@ pub fn kobject_uevent_env(
     //mutex_lock(&uevent_sock_mutex);
     /* we will send an event, so request a new sequence number */
     retval = add_uevent_var(&mut env, "SEQNUM=%llu", &(UEVENT_SEQNUM + 1).to_string()).unwrap();
-    if retval.is_zero() {
+    if !retval.is_zero() {
         drop(devpath);
         drop(env);
+        log::info!("add_uevent_var failed");
         return Ok(retval);
     }
     retval = kobject_uevent_net_broadcast(kobj, &env, &action_string, &devpath);
@@ -312,31 +348,38 @@ pub fn kobject_uevent_env(
     handle_uevent_helper();
     drop(devpath);
     drop(env);
+    log::info!("kobject_uevent_env: retval: {}", retval);
     return Ok(retval);
 }
 
 pub fn add_uevent_var(
     env: &mut Box<KobjUeventEnv>,
     format: &str,
-    args: &String,
+    args: &str,
 ) -> Result<i32, SystemError> {
-    if env.envp_idx >= env.envp.len() {
+    log::info!("add_uevent_var: format: {}, args: {}", format, args);
+    if env.envp_idx >= env.envp.capacity() {
         log::info!("add_uevent_var: too many keys");
         return Err(SystemError::ENOMEM);
     }
 
-    let mut buffer = String::with_capacity(env.buf.len() - env.buflen);
+    let mut buffer = String::new();
     write!(&mut buffer, "{} {}", format, args).map_err(|_| SystemError::ENOMEM)?;
     let len = buffer.len();
 
-    if len >= env.buf.len() - env.buflen {
+    if len >= env.buf.capacity() - env.buflen {
         log::info!("add_uevent_var: buffer size too small");
         return Err(SystemError::ENOMEM);
     }
 
-    env.envp[env.envp_idx].replace(buffer);
-    env.envp_idx += 1;
+    // Convert the buffer to bytes and add to env.buf
+    env.buf.extend_from_slice(buffer.as_bytes());
+    env.buf.push(0); // Null-terminate the string
     env.buflen += len + 1;
+
+    // Add the string to envp
+    env.envp.push(buffer);
+    env.envp_idx += 1;
 
     Ok(0)
 }
@@ -347,25 +390,24 @@ fn zap_modalias_env(env: &mut Box<KobjUeventEnv>) {
     const MODALIAS_PREFIX: &str = "MODALIAS=";
     let mut len: usize;
 
-    for i in 0..env.envp_idx {
-        // 如果存在而且是以MODALIAS=开头的字符串
-        if env.envp[i].is_some() && env.envp[i].as_ref().unwrap().starts_with("MODALIAS=") {
-            len = env.envp[i].as_ref().unwrap().len() + 1;
+    let mut i = 0;
+    while i < env.envp_idx {
+        // 如果是以 MODALIAS= 开头的字符串
+        if env.envp[i].starts_with(MODALIAS_PREFIX) {
+            len = env.envp[i].len() + 1;
             // 如果不是最后一个元素
             if i != env.envp_idx - 1 {
-                // 将下一个环境变量移动到当前的位置，这样可以覆盖掉"MODALIAS="前缀的环境变量。
-                let next_envp = env.envp[i + 1].as_ref().unwrap().clone();
-                env.envp[i].replace(next_envp);
-                // 更新数组中后续元素的位置，以反映它们被移动后的位置
+                // 将后续的环境变量向前移动，以覆盖掉 "MODALIAS=" 前缀的环境变量
                 for j in i..env.envp_idx - 1 {
-                    let next_envp = env.envp[j + 1].as_ref().unwrap().clone();
-                    env.envp[j].replace(next_envp);
+                    env.envp[j] = env.envp[j + 1].clone();
                 }
             }
             // 减少环境变量数组的索引，因为一个变量已经被移除
             env.envp_idx -= 1;
             // 减少环境变量的总长度
             env.buflen -= len;
+        } else {
+            i += 1;
         }
     }
 }
@@ -405,6 +447,7 @@ pub fn kobject_uevent_net_broadcast(
     // } else {
     ret = uevent_net_broadcast_untagged(env, action_string, devpath);
     // }
+    log::info!("kobject_uevent_net_broadcast finish");
     ret
 }
 
@@ -417,10 +460,7 @@ pub fn uevent_net_broadcast_tagged(
     let ret = 0;
     ret
 }
-/// 用于存储所有用于发送 uevent 消息的 netlink sockets。这些 sockets 用于在内核和用户空间之间传递设备事件通知。
-/// 每当需要发送 uevent 消息时，内核会遍历这个链表，并通过其中的每一个 socket 发送消息。
-// Linux6.1.9 中通过链表来存储 uevent_sock，这里做了修改，使用 Vec 来存储 NetlinkSock
-static UEVENT_SOCK_LIST: Vec<NetlinkSock> = Vec::new();
+
 /// 分配一个用于 uevent 消息的 skb（socket buffer）。
 pub fn alloc_uevent_skb<'a>(
     env: &'a KobjUeventEnv,
@@ -437,18 +477,22 @@ pub fn uevent_net_broadcast_untagged(
     action_string: &str,
     devpath: &str,
 ) -> i32 {
+    log::info!("uevent_net_broadcast_untagged: action_string: {}, devpath: {}", action_string, devpath);
     let mut retval = 0;
     let mut skb = Arc::new(RwLock::new(SkBuff::new()));
 
-    // 发送uevent message
-    for ue_sk in &UEVENT_SOCK_LIST {
-        let uevent_sock = ue_sk.get_sk();
+    // 锁定 UEVENT_SOCK_LIST 并遍历
+    let ue_sk_list = UEVENT_SOCK_LIST.lock();
+    for ue_sk in ue_sk_list.iter() {
+        let uevent_sock = ue_sk.inner.get_sk();
         // 如果没有监听者，则跳过
-        if netlink_has_listeners(&uevent_sock.upgrade().unwrap(), 1) == 0 {
+        if netlink_has_listeners(&uevent_sock.unwrap().upgrade().unwrap(), 1) == 0 {
+            log::info!("uevent_net_broadcast_untagged: no listeners");
             continue;
         }
         // 如果 skb 为空，则分配一个新的 skb
         if skb.read().is_empty() {
+            log::info!("uevent_net_broadcast_untagged: alloc_uevent_skb failed");
             retval = SystemError::ENOMEM.to_posix_errno();
             skb = alloc_uevent_skb(env, action_string, devpath);
             if skb.read().is_empty() {
@@ -456,7 +500,7 @@ pub fn uevent_net_broadcast_untagged(
             }
         }
         retval = match netlink_broadcast(
-            &ue_sk.get_sk().upgrade().unwrap(),
+            &ue_sk.inner.get_sk().unwrap().upgrade().unwrap(),
             Arc::clone(&skb),
             0,
             1,

@@ -1,4 +1,5 @@
-use alloc::{slice, vec::Vec};
+use alloc::{boxed::Box, slice, sync::{Arc, Weak}, vec::Vec};
+use system_error::SystemError;
 
 //定义Netlink消息的结构体，如NLmsghdr和geNLmsghdr(拓展的netlink消息头)，以及用于封包和解包消息的函数。
 //参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/netlink.h
@@ -6,6 +7,8 @@ use alloc::{slice, vec::Vec};
 // Ensure the header is only included once
 use crate::libs::mutex::Mutex;
 use core::mem;
+
+use super::af_netlink::{netlink_insert, Listeners, NetlinkFlags, NetlinkSock, NetlinkSocket, NL_TABLE};
 // Netlink protocol family
 pub const NETLINK_ROUTE: usize = 0;
 pub const NETLINK_UNUSED: usize = 1;
@@ -149,20 +152,13 @@ fn nlmsg_payload(nlh: &NLmsghdr, len: usize) -> usize {
 }
 
 //struct netlink_kernel_cfg,该结构包含了内核netlink的可选参数:
-struct NetlinkKernelCfg {
-    groups: usize,
-    flags: usize,
-    //todo about mutex
-    cb_mutex: *mut Mutex<()>,
-}
-impl NetlinkKernelCfg {
-    fn input() {}
-
-    fn bind() {}
-
-    fn unbind() {}
-
-    fn compare() {}
+pub struct NetlinkKernelCfg {
+    pub groups: u32,
+    pub flags: u32,
+    pub input: Option<Box<dyn FnMut()>>,
+    pub bind: Option<Box<dyn Fn(i32)>>,
+    pub unbind: Option<Box<dyn Fn(i32)>>,
+    pub compare: Option<Box<dyn Fn(&NetlinkSock) -> bool>>,
 }
 //https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/netlink.h#229
 //netlink属性头
@@ -203,4 +199,55 @@ impl VecExt for Vec<u8> {
             unsafe { slice::from_raw_parts(&data as *const T as *const u8, size_of::<T>()) };
         self[offset..(bytes.len() + offset)].copy_from_slice(bytes);
     }
+}
+
+// todo： net namespace
+pub fn netlink_kernel_create(unit:usize, cfg:Option<NetlinkKernelCfg>) -> Result<NetlinkSock, SystemError> {
+    // THIS_MODULE
+	let mut nlk: NetlinkSock = NetlinkSock::new();
+    let sk:Arc<Mutex<Box<dyn NetlinkSocket>>> = Arc::new(Mutex::new(Box::new(nlk)));
+    let groups:u32;
+    if unit <0 || unit >= MAX_LINKS{
+        return Err(SystemError::EINVAL);
+    }
+    __netlink_create(&mut nlk, unit, 1).expect("__netlink_create failed");
+
+    if cfg.is_some() || cfg.clone().unwrap().groups < 32{
+		groups = 32;
+    }
+	else{
+		groups = cfg.unwrap().groups;
+    }
+    let listeners = Listeners::new();
+    // todo：设计和实现回调函数
+    // sk.sk_data_read = netlink_data_ready;
+    // if cfg.is_some() && cfg.unwrap().input.is_some(){
+    //     nlk.netlink_rcv = cfg.unwrap().input;
+    // }
+    netlink_insert(sk,0).expect("netlink_insert failed");
+    nlk.flags |= NetlinkFlags::NETLINK_F_KERNEL_SOCKET.bits();
+
+    let mut nl_table = NL_TABLE.write();
+    if nl_table[unit].get_registered()==0 {
+            nl_table[unit].set_groups(groups);
+            if cfg.is_some() {
+                // todo: 解决闭包实现回调的定义问题后，支持 cfg 配置协议族的其他参数
+                // nl_table[unit].bind = cfg.unwrap().bind;
+                // nl_table[unit].unbind = cfg.unwrap().unbind;
+                nl_table[unit].set_flags(cfg.unwrap().flags);
+                // if nl_table[unit].compare.is_some(){
+                //     nl_table[unit].compare = cfg.unwrap().compare;
+                // }
+            }
+            nl_table[unit].set_registered(1);
+        } else {
+            drop(listeners);
+            nl_table[unit].set_registered(nl_table[unit].get_registered() + 1);
+        }
+    return Ok(nlk);
+}
+
+fn __netlink_create(nlk: &mut NetlinkSock, unit: usize, kern:usize)->Result<i32,SystemError>{
+    // 其他的初始化配置参数
+    return Ok(0);
 }

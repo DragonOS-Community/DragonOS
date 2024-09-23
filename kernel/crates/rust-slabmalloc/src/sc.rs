@@ -59,6 +59,8 @@ pub struct SCAllocator<'a, P: AllocablePage> {
     pub(crate) slabs: PageList<'a, P>,
     /// List of full ObjectPages (everything allocated in these don't need to search them).
     pub(crate) full_slabs: PageList<'a, P>,
+    /// Maximum free objects num for this `SCAllocator`.
+    pub(crate) free_limit: usize,
 }
 
 /// Creates an instance of a scallocator, we do this in a macro because we
@@ -72,6 +74,7 @@ macro_rules! new_sc_allocator {
             empty_slabs: PageList::new(),
             slabs: PageList::new(),
             full_slabs: PageList::new(),
+            free_limit: 2 * cmin((P::SIZE - OBJECT_PAGE_METADATA_OVERHEAD) / $size, 8 * 64),// TODO:优化free_limit的计算
         }
     };
 }
@@ -304,7 +307,12 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
     /// May return an error in case an invalid `layout` is provided.
     /// The function may also move internal slab pages between lists partial -> empty
     /// or full -> partial lists.
-    pub fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) -> Result<(), AllocationError> {
+    pub unsafe fn deallocate(
+        &mut self,
+        ptr: NonNull<u8>,
+        layout: Layout,
+        slab_callback: &'static dyn CallBack,
+    ) -> Result<(), AllocationError> {
         assert!(layout.size() <= self.size);
         assert!(self.size <= (P::SIZE - OBJECT_PAGE_METADATA_OVERHEAD));
         trace!(
@@ -321,9 +329,33 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
         // TODO: The linked list will have another &mut reference
         let slab_page = unsafe { mem::transmute::<VAddr, &'a mut P>(page) };
         let new_layout = unsafe { Layout::from_size_align_unchecked(self.size, layout.align()) };
+        let is_full_before_dealloc = slab_page.is_full();
 
         let ret = slab_page.deallocate(ptr, new_layout);
+        let is_empty_after_dealloc = slab_page.is_empty(self.obj_per_page);
         debug_assert!(ret.is_ok(), "Slab page deallocate won't fail at the moment");
+
+        // 计算空闲块数
+        let mut free_obj_count = 0;
+        for slab_page in self.slabs.iter_mut() {
+            free_obj_count += slab_page.free_obj_count();
+        }
+        free_obj_count += self.empty_slabs.elements * self.obj_per_page;
+
+        // 如果slab_page是空白的，且slabs和empty_slabs的空闲块数大于free_limit，将slab_page归还buddy
+        if free_obj_count >= self.free_limit && is_empty_after_dealloc {
+            self.slabs.remove_from_list(slab_page);
+            // 将slab_page归还buddy
+            slab_callback.free_slab_page(slab_page as *const P as *mut u8, P::SIZE);
+        } else {
+            if is_empty_after_dealloc {
+                self.move_to_empty(slab_page);
+            } else if is_full_before_dealloc {
+                self.move_full_to_partial(slab_page);
+            }
+        }
+        self.check_page_assignments();
+
         ret
     }
 }

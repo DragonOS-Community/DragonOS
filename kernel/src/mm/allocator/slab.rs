@@ -4,11 +4,15 @@ use alloc::boxed::Box;
 use log::debug;
 use slabmalloc::*;
 
+use crate::SlabCallback;
+
 // 全局slab分配器
 pub(crate) static mut SLABALLOCATOR: Option<SlabAllocator> = None;
 
 // slab初始化状态
 pub(crate) static mut SLABINITSTATE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) static SLAB_CALLBACK: SlabCallback = SlabCallback {};
 
 /// slab分配器，实际为一堆小的allocator，可以在里面装4K的page
 /// 利用这些allocator可以为对象分配不同大小的空间
@@ -52,7 +56,7 @@ impl SlabAllocator {
     ) -> Result<(), AllocationError> {
         if let Some(nptr) = NonNull::new(ptr) {
             self.zone
-                .deallocate(nptr, layout)
+                .deallocate(nptr, layout, &SLAB_CALLBACK)
                 .expect("Couldn't deallocate");
             return Ok(());
         } else {

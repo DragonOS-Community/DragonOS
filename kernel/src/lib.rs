@@ -36,6 +36,7 @@
 #[macro_use]
 extern crate std;
 
+use core::alloc::Layout;
 use core::panic::PanicInfo;
 
 /// 导出x86_64架构相关的代码，命名为arch模块
@@ -86,6 +87,8 @@ extern crate uefi;
 extern crate uefi_raw;
 #[macro_use]
 extern crate wait_queue_macros;
+
+use slabmalloc::CallBack;
 
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
@@ -142,4 +145,14 @@ pub fn panic(info: &PanicInfo) -> ! {
     println!("Current PCB:\n\t{:?}", (ProcessManager::current_pcb()));
 
     ProcessManager::exit(usize::MAX);
+}
+
+/// 归还slab_page给buddy的回调
+pub struct SlabCallback;
+impl CallBack for SlabCallback {
+    unsafe fn free_slab_page(&self, base_addr: *mut u8, size: usize) {
+        unsafe {
+            KERNEL_ALLOCATOR.free_in_buddy(base_addr, Layout::from_size_align_unchecked(size, 1))
+        };
+    }
 }

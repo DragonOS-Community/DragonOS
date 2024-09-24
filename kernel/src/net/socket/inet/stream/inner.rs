@@ -261,6 +261,7 @@ impl Listening {
             inner.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.is_active())
         });
         if can_accept {
+            log::debug!("Can accept!");
             pollee.fetch_or(
                 EPollEventType::EPOLLIN.bits() as usize,
                 core::sync::atomic::Ordering::Relaxed,

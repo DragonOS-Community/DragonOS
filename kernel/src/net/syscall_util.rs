@@ -108,11 +108,12 @@ impl SockAddr {
         use crate::net::socket::AddressFamily;
 
         let addr = unsafe { addr.as_ref() }.ok_or(SystemError::EFAULT)?;
-        log::debug!("addr is not null ");
+
         unsafe {
             match AddressFamily::try_from(addr.family)? {
                 AddressFamily::INet => {
                     if len < addr.len()? {
+                        log::error!("len < addr.len()");
                         return Err(SystemError::EINVAL);
                     }
 
@@ -130,9 +131,15 @@ impl SockAddr {
                     let addr_un: SockAddrUn = addr.addr_un;
 
                     let path = CStr::from_bytes_until_nul(&addr_un.sun_path)
-                        .map_err(|_| SystemError::EINVAL)?
+                        .map_err(|_| {
+                            log::error!("CStr::from_bytes_until_nul fail");
+                            SystemError::EINVAL
+                        })?
                         .to_str()
-                        .map_err(|_| SystemError::EINVAL)?;
+                        .map_err(|_| {
+                            log::error!("CStr::to_str fail");
+                            SystemError::EINVAL
+                        })?;
 
                     // let fd = match Syscall::open(path.as_ptr(), FileMode::O_RDWR.bits(), 0o755, true){
                     //     Ok(fd)=>fd,
@@ -193,6 +200,7 @@ impl SockAddr {
                 }
                 AddressFamily::Packet => {
                     // TODO: support packet socket
+                    log::warn!("not support address family {:?}", addr.family);
                     return Err(SystemError::EINVAL);
                 }
                 AddressFamily::Netlink => {
@@ -201,6 +209,7 @@ impl SockAddr {
                     return Ok(Endpoint::Netlink(NetlinkEndpoint::new(addr)));
                 }
                 _ => {
+                    log::warn!("not support address family {:?}", addr.family);
                     return Err(SystemError::EINVAL);
                 }
             }
@@ -213,7 +222,7 @@ impl SockAddr {
             AddressFamily::INet => Ok(core::mem::size_of::<SockAddrIn>()),
             AddressFamily::Packet => Ok(core::mem::size_of::<SockAddrLl>()),
             AddressFamily::Netlink => Ok(core::mem::size_of::<SockAddrNl>()),
-            AddressFamily::Unix => Err(SystemError::EINVAL),
+            AddressFamily::Unix => Ok(core::mem::size_of::<SockAddrUn>()),
             _ => Err(SystemError::EINVAL),
         }
         .map(|x| x as u32)
@@ -258,6 +267,10 @@ impl SockAddr {
         }
         *addr_len = self.len()?;
         return Ok(to_write);
+    }
+
+    pub unsafe fn is_empty(&self) -> bool {
+        unsafe { self.family == 0 && self.addr_ph.data == [0; 14] }
     }
 }
 
@@ -304,6 +317,17 @@ impl From<Endpoint> for SockAddr {
 
                 return SockAddr { addr_nl };
             },
+
+            Endpoint::Inode(inode) => {
+                // let path = inode.absolute_path().unwrap_or(alloc::string::String::new());
+                // let sun_path: [u8; 108];
+                // sun_path.copy_within(src, dest);
+                let addr_un = SockAddrUn {
+                    sun_family: AddressFamily::Unix as u16,
+                    sun_path: [0; 108],
+                };
+                return SockAddr { addr_un };
+            }
 
             _ => {
                 // todo: support other endpoint, like Netlink...

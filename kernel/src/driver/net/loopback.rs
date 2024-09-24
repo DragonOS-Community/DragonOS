@@ -75,7 +75,7 @@ impl phy::TxToken for LoopbackTxToken {
         let result = f(buffer.as_mut_slice());
         let mut device = self.driver.inner.lock();
         device.loopback_transmit(buffer);
-        debug!("lo transmit!");
+        // debug!("lo transmit!");
         result
     }
 }
@@ -107,7 +107,7 @@ impl Loopback {
         let buffer = self.queue.pop_front();
         match buffer {
             Some(buffer) => {
-                //debug!("lo receive:{:?}", buffer);
+                // debug!("lo receive:{:?}", buffer);
                 return buffer;
             }
             None => {
@@ -122,7 +122,7 @@ impl Loopback {
     /// - &mut self：自身可变引用
     /// - buffer：需要发送的数据包
     pub fn loopback_transmit(&mut self, buffer: Vec<u8>) {
-        //debug!("lo transmit!");
+        // debug!("lo transmit:{:?}", buffer);
         self.queue.push_back(buffer)
     }
 }
@@ -210,8 +210,10 @@ impl phy::Device for LoopbackDriver {
         let buffer = self.inner.lock().loopback_receive();
         //receive队列为为空，返回NONE值以通知上层没有可以receive的包
         if buffer.is_empty() {
+            // log::debug!("lo receive none!");
             return Option::None;
         }
+        // log::debug!("lo receive!");
         let rx = LoopbackRxToken { buffer };
         let tx = LoopbackTxToken {
             driver: self.clone(),
@@ -228,6 +230,7 @@ impl phy::Device for LoopbackDriver {
     /// ## 返回值
     /// - 返回一个 `Some`，其中包含一个发送令牌，该令牌包含一个对自身的克隆引用
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+        // log::debug!("lo transmit!");
         Some(LoopbackTxToken {
             driver: self.clone(),
         })
@@ -270,6 +273,10 @@ impl LoopbackInterface {
                     .expect("Push ipCidr failed: full");
             }
         });
+
+        // iface.routes_mut().update(|routes_map| {
+        //     routes_map[0].
+        // });
 
         Arc::new(LoopbackInterface {
             driver: LoopbackDriverWapper(UnsafeCell::new(driver)),
@@ -388,7 +395,7 @@ impl Iface for LoopbackInterface {
         &self.common
     }
 
-    fn name(&self) -> String {
+    fn iface_name(&self) -> String {
         "lo".to_string()
     }
 
@@ -422,5 +429,6 @@ pub fn loopback_driver_init() {
 // #[unified_init(INITCALL_DEVICE)]
 pub fn loopback_init() -> Result<(), SystemError> {
     loopback_probe();
+    log::debug!("Successfully init loopback device");
     return Ok(());
 }

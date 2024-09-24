@@ -4,6 +4,7 @@ use system_error::SystemError::{self, *};
 
 use crate::filesystem::vfs::IndexNode;
 use crate::libs::rwlock::RwLock;
+use crate::libs::spinlock::SpinLock;
 use crate::net::event_poll::EPollEventType;
 use crate::net::net_core::poll_ifaces;
 use crate::net::socket::*;
@@ -43,6 +44,7 @@ impl UdpSocket {
         let mut inner = self.inner.write();
         if let Some(UdpInner::Unbound(unbound)) = inner.take() {
             let bound = unbound.bind(local_endpoint)?;
+            
             bound
                 .inner()
                 .iface()
@@ -56,12 +58,12 @@ impl UdpSocket {
 
     pub fn bind_emphemeral(&self, remote: smoltcp::wire::IpAddress) -> Result<(), SystemError> {
         let mut inner_guard = self.inner.write();
-        if let Some(UdpInner::Unbound(unbound)) = inner_guard.take() {
-            let bound = unbound.bind_ephemeral(remote)?;
-            inner_guard.replace(UdpInner::Bound(bound));
-            return Ok(());
-        }
-        return Err(EINVAL);
+        let bound = match inner_guard.take().expect("Udp inner is None") {
+            UdpInner::Bound(inner) => inner,
+            UdpInner::Unbound(inner) => inner.bind_ephemeral(remote)?
+        };
+        inner_guard.replace(UdpInner::Bound(bound));
+        return Ok(());
     }
 
     pub fn is_bound(&self) -> bool {
@@ -92,6 +94,23 @@ impl UdpSocket {
         poll_ifaces();
 
         return received;
+    }
+
+    pub fn can_recv(&self) -> bool {
+        // poll_ifaces();
+        let ret = match self.inner.read().as_ref().expect("Udp Inner is None") {
+            UdpInner::Bound(bound) => bound.can_recv(),
+            _ => {
+                log::warn!("UdpSocket::can_recv: not bound");
+                false
+            },
+        };
+        if ret {
+            log::debug!("UdpSocket::can_recv: true");
+            return true;
+        }
+        log::debug!("UdpSocket::can_recv: false");
+        return false;
     }
 
     pub fn try_send(
@@ -183,6 +202,98 @@ impl Socket for UdpSocket {
             UdpInner::Bound(bound) => bound.with_socket(|socket| socket.payload_recv_capacity()),
             _ => inner::DEFAULT_RX_BUF_SIZE,
         }
+    }
+
+    fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
+        if let Endpoint::Ip(remote) = endpoint {
+            self.bind_emphemeral(remote.addr)?;
+            if let UdpInner::Bound(inner) = self.inner.read().as_ref().expect("UDP Inner disappear") {
+                inner.connect(remote);
+                return Ok(());
+            } else {
+                panic!("");
+            }
+        }
+        return Err(EAFNOSUPPORT);
+    }
+
+    fn send(&self, buffer: &[u8], flags: MessageFlag) -> Result<usize, SystemError> {
+        // if flags.contains(MessageFlag::DONTWAIT) {
+        
+        return self.try_send(buffer, None);
+        // } else {
+        //     // return self
+        //     //     .wait_queue
+        //     //     .busy_wait(EP::EPOLLOUT, || self.try_send(buffer, None));
+        //     todo!()
+        // }
+    }
+
+    fn send_to(
+        &self,
+        buffer: &[u8],
+        flags: MessageFlag,
+        address: Endpoint,
+    ) -> Result<usize, SystemError> 
+    {
+        // if flags.contains(MessageFlag::DONTWAIT) {
+        if let Endpoint::Ip(remote) = address {
+            return self.try_send(buffer, Some(remote));
+        }
+        // } else {
+        //     // return self
+        //     //     .wait_queue
+        //     //     .busy_wait(EP::EPOLLOUT, || {
+        //     //         if let Endpoint::Ip(remote) = address {
+        //     //             return self.try_send(buffer, Some(remote.addr));
+        //     //         }
+        //     //         return Err(EAFNOSUPPORT);
+        //     //     });
+        //     todo!()
+        // }
+        return Err(EINVAL);
+    }
+
+    fn recv(&self, buffer: &mut [u8], flags: MessageFlag) -> Result<usize, SystemError> {
+        use crate::sched::SchedMode;
+        return if self.is_nonblock() || flags.contains(MessageFlag::DONTWAIT) {
+            self.try_recv(buffer)
+        } else {
+            loop {
+                wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {} )?;
+                log::debug!("UdpSocket::recv: wake up");
+                match self.try_recv(buffer) {
+                    Err(EAGAIN_OR_EWOULDBLOCK) => continue,
+                    result => break result,
+                }
+            }
+        }.map(|(len, _)| len);
+    }
+
+    fn recv_from(
+            &self,
+            buffer: &mut [u8],
+            flags: MessageFlag,
+            address: Option<Endpoint>,
+        ) -> Result<(usize, Endpoint), SystemError> {
+        use crate::sched::SchedMode;
+        // could block io
+        if let Some(endpoint) = address {
+            self.connect(endpoint)?;
+        }
+        // poll_ifaces();
+        return if self.is_nonblock() || flags.contains(MessageFlag::DONTWAIT) {
+            self.try_recv(buffer)
+        } else {
+            loop {
+                wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {} )?;
+                log::debug!("UdpSocket::recv_from: wake up");
+                match self.try_recv(buffer) {
+                    Err(EAGAIN_OR_EWOULDBLOCK) => continue,
+                    result => break result,
+                }
+            }
+        }.map(|(len, remote)| (len, Endpoint::Ip(remote)));
     }
 }
 

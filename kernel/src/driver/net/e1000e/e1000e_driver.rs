@@ -244,7 +244,7 @@ impl Iface for E1000EInterface {
     }
 
     #[inline]
-    fn name(&self) -> String {
+    fn iface_name(&self) -> String {
         return self.name.clone();
     }
 

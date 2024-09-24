@@ -7,7 +7,14 @@ use core::ops::DerefMut;
 use system_error::SystemError;
 
 type BpfQueueValue = Vec<u8>;
-
+/// BPF_MAP_TYPE_QUEUE provides FIFO storage and BPF_MAP_TYPE_STACK provides LIFO storage for BPF programs.
+/// These maps support peek, pop and push operations that are exposed to BPF programs through the respective helpers.
+/// These operations are exposed to userspace applications using the existing bpf syscall in the following way:
+/// - `BPF_MAP_LOOKUP_ELEM` -> `peek`
+/// - `BPF_MAP_UPDATE_ELEM` -> `push`
+/// - `BPF_MAP_LOOKUP_AND_DELETE_ELEM ` -> `pop`
+///
+/// See https://docs.kernel.org/bpf/map_queue_stack.html
 pub trait SpecialMap: Debug + Send + Sync + 'static {
     /// Returns the number of elements the queue can hold.
     fn push(&mut self, value: BpfQueueValue, flags: BpfMapUpdateElemFlags) -> Result<()>;

@@ -1,4 +1,6 @@
+mod consts;
 mod print;
+
 use crate::bpf::helper::print::trace_printf;
 use crate::bpf::map::PerCpuInfo;
 use crate::bpf::map::{BpfCallBackFn, BpfMap};
@@ -310,27 +312,37 @@ pub static BPF_HELPER_FUN_SET: Lazy<BTreeMap<u32, RawBPFHelperFn>> = Lazy::new()
 
 /// Initialize the helper functions.
 pub fn init_helper_functions() {
+    use consts::*;
     let mut map = BTreeMap::new();
     unsafe {
         // Map helpers::Generic map helpers
-        map.insert(1, define_func!(raw_map_lookup_elem));
-        map.insert(2, define_func!(raw_map_update_elem));
-        map.insert(3, define_func!(raw_map_delete_elem));
-        map.insert(164, define_func!(raw_map_for_each_elem));
-        map.insert(195, define_func!(raw_map_lookup_percpu_elem));
+        map.insert(HELPER_MAP_LOOKUP_ELEM, define_func!(raw_map_lookup_elem));
+        map.insert(HELPER_MAP_UPDATE_ELEM, define_func!(raw_map_update_elem));
+        map.insert(HELPER_MAP_DELETE_ELEM, define_func!(raw_map_delete_elem));
+        map.insert(
+            HELPER_MAP_FOR_EACH_ELEM,
+            define_func!(raw_map_for_each_elem),
+        );
+        map.insert(
+            HELPER_MAP_LOOKUP_PERCPU_ELEM,
+            define_func!(raw_map_lookup_percpu_elem),
+        );
         // map.insert(93,define_func!(raw_bpf_spin_lock);
         // map.insert(94,define_func!(raw_bpf_spin_unlock);
         // Map helpers::Perf event array helpers
-        map.insert(25, define_func!(raw_perf_event_output));
+        map.insert(
+            HELPER_PERF_EVENT_OUTPUT,
+            define_func!(raw_perf_event_output),
+        );
         // Probe and trace helpers::Memory helpers
-        map.insert(4, define_func!(raw_bpf_probe_read));
+        map.insert(HELPER_BPF_PROBE_READ, define_func!(raw_bpf_probe_read));
         // Print helpers
-        map.insert(6, define_func!(trace_printf));
+        map.insert(HELPER_TRACE_PRINTF, define_func!(trace_printf));
 
         // Map helpers::Queue and stack helpers
-        map.insert(87, define_func!(raw_map_push_elem));
-        map.insert(88, define_func!(raw_map_pop_elem));
-        map.insert(89, define_func!(raw_map_peek_elem));
+        map.insert(HELPER_MAP_PUSH_ELEM, define_func!(raw_map_push_elem));
+        map.insert(HELPER_MAP_POP_ELEM, define_func!(raw_map_pop_elem));
+        map.insert(HELPER_MAP_PEEK_ELEM, define_func!(raw_map_peek_elem));
     }
     BPF_HELPER_FUN_SET.init(map);
 }

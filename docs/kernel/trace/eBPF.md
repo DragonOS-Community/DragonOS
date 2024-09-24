@@ -1,5 +1,9 @@
 # eBPF
 
+> 作者: 陈林峰
+> 
+> Email: chenlinfeng25@outlook.com
+
 ## 概述
 
 eBPF 是一项革命性的技术，起源于 Linux 内核，它可以在特权上下文中（如操作系统内核）运行沙盒程序。它用于安全有效地扩展内核的功能，而无需通过更改内核源代码或加载内核模块的方式来实现。
@@ -14,7 +18,7 @@ eBPF 从根本上改变了这个方式。通过允许在操作系统中运行沙
 
 ## eBPF的运行流程
 
-![image-20240909165945192](./img_1.png)
+![image-20240909165945192](./ebpf_flow.png)
 
 如图所示，eBPF程序的运行过程分为三个主要步骤：
 
@@ -85,8 +89,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 ```
 [dependencies]
-aya = { git = "https://github.com/os-module/tiny-aya.git" }
-aya-log = { git = "https://github.com/os-module/tiny-aya.git" }
+aya = { git = "https://github.com/DragonOS-Community/tiny-aya.git" }
+aya-log = { git = "https://github.com/DragonOS-Community/tiny-aya.git" }
 ```
 
 只需要稍加修改，就可以利用Aya现有的工具完成eBPF程序的实现。

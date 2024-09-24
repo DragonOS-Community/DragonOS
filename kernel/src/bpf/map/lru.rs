@@ -9,7 +9,12 @@ use system_error::SystemError;
 
 type BpfHashMapKey = Vec<u8>;
 type BpfHashMapValue = Vec<u8>;
-
+/// This map is the LRU (Least Recently Used) variant of the BPF_MAP_TYPE_HASH.
+/// It is a generic map type that stores a fixed maximum number of key/value pairs.
+/// When the map starts to get at capacity, the approximately least recently
+/// used elements is removed to make room for new elements.
+///
+/// See https://docs.ebpf.io/linux/map-type/BPF_MAP_TYPE_LRU_HASH/
 #[derive(Debug)]
 pub struct LruMap {
     max_entries: u32,

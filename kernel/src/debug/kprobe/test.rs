@@ -2,17 +2,18 @@ use crate::arch::interrupt::TrapFrame;
 use crate::debug::kprobe::{register_kprobe, unregister_kprobe, KprobeInfo};
 use alloc::string::ToString;
 use kprobe::ProbeArgs;
+use log::info;
 
 #[inline(never)]
 fn detect_func(x: usize, y: usize) -> usize {
     let hart = 0;
-    println!("detect_func: hart_id: {}, x: {}, y:{}", hart, x, y);
+    info!("detect_func: hart_id: {}, x: {}, y:{}", hart, x, y);
     hart
 }
 
 fn pre_handler(regs: &dyn ProbeArgs) {
     let pt_regs = regs.as_any().downcast_ref::<TrapFrame>().unwrap();
-    println!(
+    info!(
         "call pre_handler, the sp is {:#x}",
         pt_regs as *const _ as usize
     );
@@ -20,7 +21,7 @@ fn pre_handler(regs: &dyn ProbeArgs) {
 
 fn post_handler(regs: &dyn ProbeArgs) {
     let pt_regs = regs.as_any().downcast_ref::<TrapFrame>().unwrap();
-    println!(
+    info!(
         "call post_handler, the sp is {:#x}",
         pt_regs as *const _ as usize
     );
@@ -28,14 +29,14 @@ fn post_handler(regs: &dyn ProbeArgs) {
 
 fn fault_handler(regs: &dyn ProbeArgs) {
     let pt_regs = regs.as_any().downcast_ref::<TrapFrame>().unwrap();
-    println!(
+    info!(
         "call fault_handler, the sp is {:#x}",
         pt_regs as *const _ as usize
     );
 }
 
 pub fn kprobe_test() {
-    println!("kprobe test for [detect_func]: {:#x}", detect_func as usize);
+    info!("kprobe test for [detect_func]: {:#x}", detect_func as usize);
     let kprobe_info = KprobeInfo {
         pre_handler,
         post_handler,
@@ -50,7 +51,7 @@ pub fn kprobe_test() {
 
     let new_pre_handler = |regs: &dyn ProbeArgs| {
         let pt_regs = regs.as_any().downcast_ref::<TrapFrame>().unwrap();
-        println!(
+        info!(
             "call new pre_handler, the sp is {:#x}",
             pt_regs as *const _ as usize
         );
@@ -67,17 +68,17 @@ pub fn kprobe_test() {
         enable: true,
     };
     let kprobe2 = register_kprobe(kprobe_info).unwrap();
-    println!(
+    info!(
         "install 2 kprobes at [detect_func]: {:#x}",
         detect_func as usize
     );
     detect_func(1, 2);
     unregister_kprobe(kprobe).unwrap();
     unregister_kprobe(kprobe2).unwrap();
-    println!(
+    info!(
         "uninstall 2 kprobes at [detect_func]: {:#x}",
         detect_func as usize
     );
     detect_func(1, 2);
-    println!("kprobe test end");
+    info!("kprobe test end");
 }

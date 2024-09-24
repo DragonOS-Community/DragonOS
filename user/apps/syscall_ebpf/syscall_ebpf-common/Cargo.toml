@@ -8,7 +8,7 @@ default = []
 user = ["aya"]
 
 [dependencies]
-aya = { git = "https://github.com/os-module/tiny-aya.git", optional = true }
+aya = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/tiny-aya.git", rev = "9632e57", optional = true }
 
 [lib]
 path = "src/lib.rs"

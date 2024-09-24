@@ -1,5 +1,9 @@
 # kprobe
 
+> 作者: 陈林峰
+>
+> Email: chenlinfeng25@outlook.com
+
 ## 概述
 
 Linux kprobes调试技术是内核开发者们专门为了便于跟踪内核函数执行状态所设计的一种轻量级内核调试技术。利用kprobes技术，内核开发人员可以在内核的绝大多数指定函数中动态的插入探测点来收集所需的调试状态信息而基本不影响内核原有的执行流程。
@@ -10,7 +14,7 @@ kprobes技术依赖硬件架构相关的支持，主要包括CPU的异常处理�
 
 ## kprobe工作流程
 
-<img src="./img.png" style="zoom: 67%;"  alt="xxx"/>
+<img src="./kprobe_flow.png" style="zoom: 67%;"  alt="xxx"/>
 
 
 
@@ -50,51 +54,4 @@ impl KprobeBasic {
 - `update_event_callback`用于运行过程中更新回调函数
 - `disable` 和 `enable` 用于动态关闭kprobe，在`disable`调用后，kprobe被触发时不执行回调函数
 - `symbol` 返回探测点的函数名称
-
-
-
-## 代码示例
-
-```rust
-#[inline(never)]
-fn detect_func(x: usize, y: usize) -> usize {
-    let hart = 0;
-    println!("detect_func: hart_id: {}, x: {}, y:{}", hart, x, y);
-    hart
-}
-fn pre_handler(regs: &dyn ProbeArgs) {
-    let pt_regs = regs.as_any().downcast_ref::<TrapFrame>().unwrap();
-    println!(
-        "call pre_handler, the sp is {:#x}",
-        pt_regs as *const _ as usize
-    );
-}
-fn post_handler(regs: &dyn ProbeArgs) {
-    let pt_regs = regs.as_any().downcast_ref::<TrapFrame>().unwrap();
-    println!(
-        "call post_handler, the sp is {:#x}",
-        pt_regs as *const _ as usize
-    );
-}
-fn fault_handler(regs: &dyn ProbeArgs) {
-    let pt_regs = regs.as_any().downcast_ref::<TrapFrame>().unwrap();
-    println!(
-        "call fault_handler, the sp is {:#x}",
-        pt_regs as *const _ as usize
-    );
-}
-
-let kprobe_info = KprobeInfo {
-        pre_handler,
-        post_handler,
-        fault_handler: Some(fault_handler),
-        event_callback: None,
-        symbol: None,
-        addr: Some(detect_func as usize),
-        offset: 0,
-        enable: true,
-    };
-let kprobe = register_kprobe(kprobe_info).unwrap();
- unregister_kprobe(kprobe).unwrap();
-```
 

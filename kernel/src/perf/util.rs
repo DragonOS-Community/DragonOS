@@ -14,11 +14,18 @@ bitflags! {
         const PERF_FLAG_FD_CLOEXEC = 8;
     }
 }
+
+/// The `PerfEventIoc` enum is used to define the ioctl commands for perf events.
+///
+/// See https://elixir.bootlin.com/linux/v6.1/source/include/uapi/linux/perf_event.h#L544
 #[repr(u32)]
 #[derive(Debug, Copy, Clone, FromPrimitive)]
 pub enum PerfEventIoc {
+    /// Equivalent to [crate::include::bindings::linux_bpf::AYA_PERF_EVENT_IOC_ENABLE].
     Enable = 9216,
+    /// Equivalent to [crate::include::bindings::linux_bpf::AYA_PERF_EVENT_IOC_DISABLE].
     Disable = 9217,
+    /// Equivalent to [crate::include::bindings::linux_bpf::AYA_PERF_EVENT_IOC_SET_BPF].
     SetBpf = 1074013192,
 }
 

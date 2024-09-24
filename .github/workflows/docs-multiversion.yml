@@ -25,8 +25,9 @@ jobs:
       working-directory: ./docs
       run: |
         sudo apt-get update
-        sudo apt-get install -y python3-pip awscli
+        sudo apt-get install -y python3-pip python3-setuptools
         pip3 install -r requirements.txt
+        python3 -m pip install --user awscli
 
     - name: build docs
       working-directory: ./docs

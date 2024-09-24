@@ -29,7 +29,7 @@ release = 'dev'
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
-extensions = ['myst_parser']
+extensions = ['myst_parser', 'sphinx_multiversion']
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
@@ -59,6 +59,12 @@ html_theme = 'sphinx_rtd_theme'
 # so a file named "default.css" will overwrite the builtin "default.css".
 html_static_path = ['_static']
 
+html_sidebars = {
+    '**': [
+        'versioning.html',
+    ],
+}
+
 myst_enable_extensions = [
     "amsmath",
     "colon_fence",
@@ -74,6 +80,11 @@ myst_enable_extensions = [
     "tasklist",
 ]
 
+# sphinx-multiversion 指定哪个分支为 lastest 版本
+smv_latest_version = 'master'
+smv_released_pattern = r'^tags/.*$'           # Tags only
+smv_tag_whitelist = r'^(V.*|v.*)$'
+smv_branch_whitelist = "master"
 
 # Define the canonical URL if you are using a custom domain on Read the Docs
 html_baseurl = os.environ.get("READTHEDOCS_CANONICAL_URL", "")

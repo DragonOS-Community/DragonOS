@@ -19,9 +19,8 @@ pub struct BpfHashMap {
     data: BTreeMap<BpfHashMapKey, BpfHashMapValue>,
 }
 
-impl TryFrom<&BpfMapMeta> for BpfHashMap {
-    type Error = SystemError;
-    fn try_from(attr: &BpfMapMeta) -> Result<Self> {
+impl BpfHashMap {
+    pub fn new(attr: &BpfMapMeta) -> Result<Self> {
         if attr.value_size == 0 || attr.max_entries == 0 {
             return Err(SystemError::EINVAL);
         }
@@ -97,57 +96,51 @@ impl BpfMapCommonOps for BpfHashMap {
 /// This is the per-CPU variant of the [BpfHashMap] map type.
 ///
 /// See https://ebpf-docs.dylanreimerink.nl/linux/map-type/BPF_MAP_TYPE_PERCPU_HASH/
-pub struct PerCpuHashMap<T> {
+pub struct PerCpuHashMap {
     maps: Vec<BpfHashMap>,
-    _phantom: core::marker::PhantomData<T>,
 }
 
-impl<T> Debug for PerCpuHashMap<T> {
+impl Debug for PerCpuHashMap {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PerCpuHashMap")
             .field("maps", &self.maps)
             .finish()
     }
 }
-impl<T: PerCpuInfo> TryFrom<&BpfMapMeta> for PerCpuHashMap<T> {
-    type Error = SystemError;
-    fn try_from(attr: &BpfMapMeta) -> Result<Self> {
-        let num_cpus = T::num_cpus();
+impl PerCpuHashMap {
+    pub fn new(attr: &BpfMapMeta) -> Result<Self> {
+        let num_cpus = PerCpuInfo::num_cpus();
         let mut data = Vec::with_capacity(num_cpus as usize);
         for _ in 0..num_cpus {
-            let array_map = BpfHashMap::try_from(attr)?;
+            let array_map = BpfHashMap::new(attr)?;
             data.push(array_map);
         }
-        Ok(PerCpuHashMap {
-            maps: data,
-            _phantom: core::marker::PhantomData,
-        })
+        Ok(PerCpuHashMap { maps: data })
     }
 }
-
-impl<T: PerCpuInfo> BpfMapCommonOps for PerCpuHashMap<T> {
+impl BpfMapCommonOps for PerCpuHashMap {
     fn lookup_elem(&mut self, key: &[u8]) -> Result<Option<&[u8]>> {
-        self.maps[T::cpu_id() as usize].lookup_elem(key)
+        self.maps[PerCpuInfo::cpu_id() as usize].lookup_elem(key)
     }
     fn update_elem(&mut self, key: &[u8], value: &[u8], flags: u64) -> Result<()> {
-        self.maps[T::cpu_id() as usize].update_elem(key, value, flags)
+        self.maps[PerCpuInfo::cpu_id() as usize].update_elem(key, value, flags)
     }
     fn delete_elem(&mut self, key: &[u8]) -> Result<()> {
-        self.maps[T::cpu_id() as usize].delete_elem(key)
+        self.maps[PerCpuInfo::cpu_id() as usize].delete_elem(key)
     }
     fn for_each_elem(&mut self, cb: BpfCallBackFn, ctx: *const u8, flags: u64) -> Result<u32> {
-        self.maps[T::cpu_id() as usize].for_each_elem(cb, ctx, flags)
+        self.maps[PerCpuInfo::cpu_id() as usize].for_each_elem(cb, ctx, flags)
     }
     fn lookup_and_delete_elem(&mut self, key: &[u8], value: &mut [u8]) -> Result<()> {
-        self.maps[T::cpu_id() as usize].lookup_and_delete_elem(key, value)
+        self.maps[PerCpuInfo::cpu_id() as usize].lookup_and_delete_elem(key, value)
     }
     fn lookup_percpu_elem(&mut self, key: &[u8], cpu: u32) -> Result<Option<&[u8]>> {
         self.maps[cpu as usize].lookup_elem(key)
     }
     fn get_next_key(&self, key: Option<&[u8]>, next_key: &mut [u8]) -> Result<()> {
-        self.maps[T::cpu_id() as usize].get_next_key(key, next_key)
+        self.maps[PerCpuInfo::cpu_id() as usize].get_next_key(key, next_key)
     }
-    fn first_value_ptr(&self) -> *const u8 {
-        self.maps[T::cpu_id() as usize].first_value_ptr()
+    fn first_value_ptr(&self) -> Result<*const u8> {
+        self.maps[PerCpuInfo::cpu_id() as usize].first_value_ptr()
     }
 }

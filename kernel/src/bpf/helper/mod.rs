@@ -1,7 +1,7 @@
 mod print;
 use crate::bpf::helper::print::trace_printf;
+use crate::bpf::map::PerCpuInfo;
 use crate::bpf::map::{BpfCallBackFn, BpfMap};
-use crate::bpf::map::{PerCpuInfo, PerCpuInfoImpl};
 use crate::include::bindings::linux_bpf::BPF_F_CURRENT_CPU;
 use crate::libs::lazy_init::Lazy;
 use alloc::{collections::BTreeMap, sync::Arc};
@@ -75,7 +75,7 @@ pub fn perf_event_output(
     let index = flags as u32;
     let flags = (flags >> 32) as u32;
     let key = if index == BPF_F_CURRENT_CPU as u32 {
-        let cpu_id = PerCpuInfoImpl::cpu_id();
+        let cpu_id = PerCpuInfo::cpu_id();
         cpu_id
     } else {
         index

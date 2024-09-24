@@ -62,7 +62,8 @@ impl<'a> BpfProgVerifier<'a> {
                             .inode()
                             .downcast_arc::<BpfMap>()
                             .ok_or(SystemError::EINVAL)?;
-                        let first_value_ptr = bpf_map.inner_map().lock().first_value_ptr() as usize;
+                        let first_value_ptr =
+                            bpf_map.inner_map().lock().first_value_ptr()? as usize;
                         let offset = next_insn.imm as usize;
                         info!(
                             "Relocate for BPF_PSEUDO_MAP_VALUE, instruction index: {}, map_fd: {}",

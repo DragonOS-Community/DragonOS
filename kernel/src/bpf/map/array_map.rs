@@ -64,9 +64,8 @@ impl IndexMut<u32> for ArrayMapData {
     }
 }
 
-impl TryFrom<&BpfMapMeta> for ArrayMap {
-    type Error = SystemError;
-    fn try_from(attr: &BpfMapMeta) -> Result<Self> {
+impl ArrayMap {
+    pub fn new(attr: &BpfMapMeta) -> Result<Self> {
         if attr.value_size == 0 || attr.max_entries == 0 || attr.key_size != 4 {
             return Err(SystemError::EINVAL);
         }
@@ -153,20 +152,19 @@ impl BpfMapCommonOps for ArrayMap {
         info!("fake freeze done for ArrayMap");
         Ok(())
     }
-    fn first_value_ptr(&self) -> *const u8 {
-        self.data.data.as_ptr()
+    fn first_value_ptr(&self) -> Result<*const u8> {
+        Ok(self.data.data.as_ptr())
     }
 }
 
 /// This is the per-CPU variant of the [ArrayMap] map type.
 ///
 /// See https://ebpf-docs.dylanreimerink.nl/linux/map-type/BPF_MAP_TYPE_PERCPU_ARRAY/
-pub struct PerCpuArrayMap<T> {
+pub struct PerCpuArrayMap {
     data: Vec<ArrayMap>,
-    _phantom: core::marker::PhantomData<T>,
 }
 
-impl<T> Debug for PerCpuArrayMap<T> {
+impl Debug for PerCpuArrayMap {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PerCpuArrayMap")
             .field("data", &self.data)
@@ -174,37 +172,33 @@ impl<T> Debug for PerCpuArrayMap<T> {
     }
 }
 
-impl<T: PerCpuInfo> TryFrom<&BpfMapMeta> for PerCpuArrayMap<T> {
-    type Error = SystemError;
-    fn try_from(attr: &BpfMapMeta) -> Result<Self> {
-        let num_cpus = T::num_cpus();
+impl PerCpuArrayMap {
+    pub fn new(attr: &BpfMapMeta) -> Result<Self> {
+        let num_cpus = PerCpuInfo::num_cpus();
         let mut data = Vec::with_capacity(num_cpus as usize);
         for _ in 0..num_cpus {
-            let array_map = ArrayMap::try_from(attr)?;
+            let array_map = ArrayMap::new(attr)?;
             data.push(array_map);
         }
-        Ok(PerCpuArrayMap {
-            data,
-            _phantom: core::marker::PhantomData,
-        })
+        Ok(PerCpuArrayMap { data })
     }
 }
 
-impl<T: PerCpuInfo> BpfMapCommonOps for PerCpuArrayMap<T> {
+impl BpfMapCommonOps for PerCpuArrayMap {
     fn lookup_elem(&mut self, key: &[u8]) -> Result<Option<&[u8]>> {
-        let cpu_id = T::cpu_id();
+        let cpu_id = PerCpuInfo::cpu_id();
         self.data[cpu_id as usize].lookup_elem(key)
     }
     fn update_elem(&mut self, key: &[u8], value: &[u8], flags: u64) -> Result<()> {
-        let cpu_id = T::cpu_id();
+        let cpu_id = PerCpuInfo::cpu_id();
         self.data[cpu_id as usize].update_elem(key, value, flags)
     }
     fn delete_elem(&mut self, key: &[u8]) -> Result<()> {
-        let cpu_id = T::cpu_id();
+        let cpu_id = PerCpuInfo::cpu_id();
         self.data[cpu_id as usize].delete_elem(key)
     }
     fn for_each_elem(&mut self, cb: BpfCallBackFn, ctx: *const u8, flags: u64) -> Result<u32> {
-        let cpu_id = T::cpu_id();
+        let cpu_id = PerCpuInfo::cpu_id();
         self.data[cpu_id as usize].for_each_elem(cb, ctx, flags)
     }
     fn lookup_and_delete_elem(&mut self, _key: &[u8], _value: &mut [u8]) -> Result<()> {
@@ -214,23 +208,22 @@ impl<T: PerCpuInfo> BpfMapCommonOps for PerCpuArrayMap<T> {
         self.data[cpu as usize].lookup_elem(key)
     }
     fn get_next_key(&self, key: Option<&[u8]>, next_key: &mut [u8]) -> Result<()> {
-        let cpu_id = T::cpu_id();
+        let cpu_id = PerCpuInfo::cpu_id();
         self.data[cpu_id as usize].get_next_key(key, next_key)
     }
-    fn first_value_ptr(&self) -> *const u8 {
-        let cpu_id = T::cpu_id();
+    fn first_value_ptr(&self) -> Result<*const u8> {
+        let cpu_id = PerCpuInfo::cpu_id();
         self.data[cpu_id as usize].first_value_ptr()
     }
 }
 
 /// See https://ebpf-docs.dylanreimerink.nl/linux/map-type/BPF_MAP_TYPE_PERF_EVENT_ARRAY/
-pub struct PerfEventArrayMap<T> {
+pub struct PerfEventArrayMap {
     // The value is the file descriptor of the perf event.
     fds: ArrayMapData,
-    _phantom: core::marker::PhantomData<T>,
 }
 
-impl<T> Debug for PerfEventArrayMap<T> {
+impl Debug for PerfEventArrayMap {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PerfEventArrayMap")
             .field("fds", &self.fds)
@@ -238,22 +231,18 @@ impl<T> Debug for PerfEventArrayMap<T> {
     }
 }
 
-impl<T: PerCpuInfo> TryFrom<&BpfMapMeta> for PerfEventArrayMap<T> {
-    type Error = SystemError;
-    fn try_from(attr: &BpfMapMeta) -> Result<Self> {
-        let num_cpus = T::num_cpus();
+impl PerfEventArrayMap {
+    pub fn new(attr: &BpfMapMeta) -> Result<Self> {
+        let num_cpus = PerCpuInfo::num_cpus();
         if attr.key_size != 4 || attr.value_size != 4 || attr.max_entries != num_cpus {
             return Err(SystemError::EINVAL);
         }
         let fds = ArrayMapData::new(4, num_cpus);
-        Ok(PerfEventArrayMap {
-            fds,
-            _phantom: core::marker::PhantomData,
-        })
+        Ok(PerfEventArrayMap { fds })
     }
 }
 
-impl<T: PerCpuInfo> BpfMapCommonOps for PerfEventArrayMap<T> {
+impl BpfMapCommonOps for PerfEventArrayMap {
     fn lookup_elem(&mut self, key: &[u8]) -> Result<Option<&[u8]>> {
         let cpu_id = u32::from_ne_bytes(key.try_into().unwrap());
         let value = self.fds.index(cpu_id);
@@ -273,7 +262,7 @@ impl<T: PerCpuInfo> BpfMapCommonOps for PerfEventArrayMap<T> {
     }
     fn for_each_elem(&mut self, cb: BpfCallBackFn, ctx: *const u8, _flags: u64) -> Result<u32> {
         let mut total_used = 0;
-        for i in 0..T::num_cpus() {
+        for i in 0..PerCpuInfo::num_cpus() {
             let key = i.to_ne_bytes();
             let value = self.fds.index(i);
             total_used += 1;
@@ -287,7 +276,7 @@ impl<T: PerCpuInfo> BpfMapCommonOps for PerfEventArrayMap<T> {
     fn lookup_and_delete_elem(&mut self, _key: &[u8], _value: &mut [u8]) -> Result<()> {
         Err(SystemError::EINVAL)
     }
-    fn first_value_ptr(&self) -> *const u8 {
-        self.fds.data.as_ptr()
+    fn first_value_ptr(&self) -> Result<*const u8> {
+        Ok(self.fds.data.as_ptr())
     }
 }

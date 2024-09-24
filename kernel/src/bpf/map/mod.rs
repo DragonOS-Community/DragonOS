@@ -15,8 +15,6 @@ use crate::include::bindings::linux_bpf::{bpf_attr, bpf_map_type};
 use crate::libs::casting::DowncastArc;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::process::ProcessManager;
-use crate::smp::core::smp_get_processor_id;
-use crate::smp::cpu::smp_cpu_manager;
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -102,8 +100,8 @@ pub trait BpfMapCommonOps: Send + Sync + Debug + CastFromSync {
     }
 
     /// Get the first value pointer.
-    fn first_value_ptr(&self) -> *const u8 {
-        panic!("value_ptr not implemented")
+    fn first_value_ptr(&self) -> Result<*const u8> {
+        Err(SystemError::ENOSYS)
     }
 }
 impl DowncastArc for dyn BpfMapCommonOps {
@@ -112,30 +110,22 @@ impl DowncastArc for dyn BpfMapCommonOps {
     }
 }
 
-pub struct PerCpuInfoImpl;
+pub struct PerCpuInfo;
 
-impl PerCpuInfo for PerCpuInfoImpl {
-    fn cpu_id() -> u32 {
-        // let cpu = smp_get_processor_id();
+impl PerCpuInfo {
+    pub fn cpu_id() -> u32 {
+        // let cpu = crate::smp::core::smp_get_processor_id();
         // log::info!("cpu_id: {:?}", cpu.data());
         // cpu.data()
         0
     }
-    fn num_cpus() -> u32 {
-        // let cpus =  smp_cpu_manager();
+    pub fn num_cpus() -> u32 {
+        // let cpus =  crate::smp::cpu::smp_cpu_manager();
         // log::info!("num_cpus: {:?}", cpus.present_cpus_count());
         // cpus.present_cpus_count()
         1
     }
 }
-
-pub trait PerCpuInfo: Send + Sync + 'static {
-    /// Get the CPU ID of the current CPU.
-    fn cpu_id() -> u32;
-    /// Get the number of CPUs.
-    fn num_cpus() -> u32;
-}
-
 impl BpfMap {
     pub fn new(map: Box<dyn BpfMapCommonOps>, meta: BpfMapMeta) -> Self {
         assert_ne!(meta.key_size, 0);
@@ -199,7 +189,7 @@ impl IndexNode for BpfMap {
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        panic!("BpfMap does not have a filesystem")
+        todo!("BpfMap does not have a filesystem")
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -221,15 +211,15 @@ pub fn bpf_map_create(attr: &bpf_attr) -> Result<usize> {
     info!("The map attr is {:#?}", map_meta);
     let map: Box<dyn BpfMapCommonOps> = match map_meta.map_type {
         bpf_map_type::BPF_MAP_TYPE_ARRAY => {
-            let array_map = ArrayMap::try_from(&map_meta)?;
+            let array_map = ArrayMap::new(&map_meta)?;
             Box::new(array_map)
         }
         bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY => {
-            let per_cpu_array_map = PerCpuArrayMap::<PerCpuInfoImpl>::try_from(&map_meta)?;
+            let per_cpu_array_map = PerCpuArrayMap::new(&map_meta)?;
             Box::new(per_cpu_array_map)
         }
         bpf_map_type::BPF_MAP_TYPE_PERF_EVENT_ARRAY => {
-            let perf_event_array_map = PerfEventArrayMap::<PerCpuInfoImpl>::try_from(&map_meta)?;
+            let perf_event_array_map = PerfEventArrayMap::new(&map_meta)?;
             Box::new(perf_event_array_map)
         }
 
@@ -240,27 +230,27 @@ pub fn bpf_map_create(attr: &bpf_attr) -> Result<usize> {
             Err(SystemError::EINVAL)?
         }
         bpf_map_type::BPF_MAP_TYPE_HASH => {
-            let hash_map = hash_map::BpfHashMap::try_from(&map_meta)?;
+            let hash_map = hash_map::BpfHashMap::new(&map_meta)?;
             Box::new(hash_map)
         }
         bpf_map_type::BPF_MAP_TYPE_PERCPU_HASH => {
-            let per_cpu_hash_map = PerCpuHashMap::<PerCpuInfoImpl>::try_from(&map_meta)?;
+            let per_cpu_hash_map = PerCpuHashMap::new(&map_meta)?;
             Box::new(per_cpu_hash_map)
         }
         bpf_map_type::BPF_MAP_TYPE_QUEUE => {
-            let queue_map = queue::QueueMap::try_from(&map_meta)?;
+            let queue_map = queue::QueueMap::new(&map_meta)?;
             Box::new(queue_map)
         }
         bpf_map_type::BPF_MAP_TYPE_STACK => {
-            let stack_map = queue::StackMap::try_from(&map_meta)?;
+            let stack_map = queue::StackMap::new(&map_meta)?;
             Box::new(stack_map)
         }
         bpf_map_type::BPF_MAP_TYPE_LRU_HASH => {
-            let lru_hash_map = lru::LruMap::try_from(&map_meta)?;
+            let lru_hash_map = lru::LruMap::new(&map_meta)?;
             Box::new(lru_hash_map)
         }
         bpf_map_type::BPF_MAP_TYPE_LRU_PERCPU_HASH => {
-            let lru_per_cpu_hash_map = lru::PerCpuLruMap::<PerCpuInfoImpl>::try_from(&map_meta)?;
+            let lru_per_cpu_hash_map = lru::PerCpuLruMap::new(&map_meta)?;
             Box::new(lru_per_cpu_hash_map)
         }
         _ => {

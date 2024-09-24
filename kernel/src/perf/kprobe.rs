@@ -128,6 +128,10 @@ impl PerfEventOps for KprobePerfEvent {
         self.kprobe.write().disable();
         Ok(())
     }
+
+    fn readable(&self) -> bool {
+        true
+    }
 }
 
 pub fn perf_event_open_kprobe(args: PerfProbeArgs) -> KprobePerfEvent {

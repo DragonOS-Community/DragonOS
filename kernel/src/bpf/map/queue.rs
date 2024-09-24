@@ -7,6 +7,16 @@ use core::ops::DerefMut;
 use system_error::SystemError;
 
 type BpfQueueValue = Vec<u8>;
+
+pub trait SpecialMap: Debug + Send + Sync + 'static {
+    /// Returns the number of elements the queue can hold.
+    fn push(&mut self, value: BpfQueueValue, flags: BpfMapUpdateElemFlags) -> Result<()>;
+    /// Removes the first element and returns it.
+    fn pop(&mut self) -> Option<BpfQueueValue>;
+    /// Returns the first element without removing it.
+    fn peek(&self) -> Option<&BpfQueueValue>;
+}
+
 /// The queue map type is a generic map type, resembling a FIFO (First-In First-Out) queue.
 ///
 /// This map type has no keys, only values. The size and type of the values can be specified by the user
@@ -22,24 +32,14 @@ pub struct QueueMap {
     data: Vec<BpfQueueValue>,
 }
 
-pub trait SpecialMap: Debug + Send + Sync + 'static {
-    /// Returns the number of elements the queue can hold.
-    fn push(&mut self, value: BpfQueueValue, flags: BpfMapUpdateElemFlags) -> Result<()>;
-    /// Removes the first element and returns it.
-    fn pop(&mut self) -> Option<BpfQueueValue>;
-    /// Returns the first element without removing it.
-    fn peek(&self) -> Option<&BpfQueueValue>;
-}
-
-impl TryFrom<&BpfMapMeta> for QueueMap {
-    type Error = SystemError;
-    fn try_from(value: &BpfMapMeta) -> Result<Self> {
-        if value.value_size == 0 || value.max_entries == 0 || value.key_size != 0 {
+impl QueueMap {
+    pub fn new(attr: &BpfMapMeta) -> Result<Self> {
+        if attr.value_size == 0 || attr.max_entries == 0 || attr.key_size != 0 {
             return Err(SystemError::EINVAL);
         }
-        let data = Vec::with_capacity(value.max_entries as usize);
+        let data = Vec::with_capacity(attr.max_entries as usize);
         Ok(Self {
-            max_entries: value.max_entries,
+            max_entries: attr.max_entries,
             data,
         })
     }
@@ -74,10 +74,9 @@ impl SpecialMap for QueueMap {
 #[derive(Debug)]
 pub struct StackMap(QueueMap);
 
-impl TryFrom<&BpfMapMeta> for StackMap {
-    type Error = SystemError;
-    fn try_from(value: &BpfMapMeta) -> Result<Self> {
-        QueueMap::try_from(value).map(StackMap)
+impl StackMap {
+    pub fn new(attr: &BpfMapMeta) -> Result<Self> {
+        QueueMap::new(attr).map(StackMap)
     }
 }
 

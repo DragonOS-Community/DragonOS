@@ -38,18 +38,20 @@ use system_error::SystemError;
 type Result<T> = core::result::Result<T, SystemError>;
 
 pub trait PerfEventOps: Send + Sync + Debug + CastFromSync + CastFrom + IndexNode {
+    /// Set the bpf program for the perf event
     fn set_bpf_prog(&self, _bpf_prog: Arc<File>) -> Result<()> {
-        panic!("set_bpf_prog not implemented for PerfEvent");
+        Err(SystemError::ENOSYS)
     }
+    /// Enable the perf event
     fn enable(&self) -> Result<()> {
-        panic!("enable not implemented");
+        Err(SystemError::ENOSYS)
     }
+    /// Disable the perf event
     fn disable(&self) -> Result<()> {
-        panic!("disable not implemented");
+        Err(SystemError::ENOSYS)
     }
-    fn readable(&self) -> bool {
-        panic!("readable not implemented");
-    }
+    /// Whether the perf event is readable
+    fn readable(&self) -> bool;
 }
 
 #[derive(Debug)]

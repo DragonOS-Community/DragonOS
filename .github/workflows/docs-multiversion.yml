@@ -25,7 +25,7 @@ jobs:
       working-directory: ./docs
       run: |
         sudo apt-get update
-        sudo apt-get install -y python3-pip
+        sudo apt-get install -y python3-pip awscli
         pip3 install -r requirements.txt
 
     - name: build docs
@@ -34,3 +34,13 @@ jobs:
 
       run: |
         make html-multiversion
+
+    - name: deploy docs
+      working-directory: ./docs
+      env:
+        AWS_ENDPOINT_URL: ${{ secrets.DOCS_DEPLOY_S3_ENDPOINT_URL }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.DOCS_DEPLOY_S3_API_KEY }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.DOCS_DEPLOY_S3_SECRET_KEY }}
+      
+      run: |
+        aws s3 sync ./_build/html s3://dragonos-docs --delete

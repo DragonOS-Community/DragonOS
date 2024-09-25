@@ -19,6 +19,8 @@ import os
 project = 'DragonOS'
 copyright = '2022-2024, DragonOS Community'
 author = 'longjin'
+github_org = 'DragonOS-Community'
+github_repo = 'DragonOS'
 
 # The full version, including alpha/beta/rc tags
 release = 'dev'
@@ -97,9 +99,20 @@ if os.environ.get("READTHEDOCS", "") == "True":
 
 if os.environ.get("SPHINX_MULTIVERSION_GIT_COMMIT", "") != "":
     html_context["commit"] = os.environ["SPHINX_MULTIVERSION_GIT_COMMIT"]
-
+elif os.environ.get("CURRENT_GIT_COMMIT_HASH", "") != "":
+    html_context["commit"] = os.environ["CURRENT_GIT_COMMIT_HASH"]
 
 
 # 截取前 7 位 commit hash，如果长度不足则不截取
 if "commit" in html_context:
     html_context["commit"] = html_context["commit"][:7]
+    if os.environ.get("CURRENT_GIT_COMMIT_DIRTY", "") == "1":
+        html_context["commit"] += "-dirty"
+
+
+# -- Set GitHub URL for Edit on GitHub links ---
+html_context['display_github'] = True
+html_context['github_user'] = github_org
+html_context['github_repo'] = github_repo
+html_context['github_version'] = html_context['commit'] if 'commit' in html_context else 'master'
+html_context['conf_py_path'] = '/docs/'

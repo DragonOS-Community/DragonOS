@@ -54,6 +54,8 @@ source_suffix = ['.rst', '.md']
 #
 html_theme = 'sphinx_rtd_theme'
 
+html_context = dict()
+
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
@@ -92,3 +94,12 @@ html_baseurl = os.environ.get("READTHEDOCS_CANONICAL_URL", "")
 # Tell Jinja2 templates the build is running on Read the Docs
 if os.environ.get("READTHEDOCS", "") == "True":
     html_context["READTHEDOCS"] = True
+
+if os.environ.get("SPHINX_MULTIVERSION_GIT_COMMIT", "") != "":
+    html_context["commit"] = os.environ["SPHINX_MULTIVERSION_GIT_COMMIT"]
+
+
+
+# 截取前 7 位 commit hash，如果长度不足则不截取
+if "commit" in html_context:
+    html_context["commit"] = html_context["commit"][:7]

@@ -103,15 +103,16 @@ pub fn do_fchownat(
 }
 
 fn chown_common(inode: &Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usize, SystemError> {
-    log::debug!("Setting inode: to-set uid:{}, to-set gid:{}", uid, gid);
+    // log::debug!("Setting inode: to-set uid:{}, to-set gid:{}", uid, gid);
 
     let mut meta = inode.metadata()?;
     meta.uid = uid;
     meta.gid = gid;
     inode.set_metadata(&meta)?;
+    // log::info!("Inode Type: {}",inode.fs().name());
 
-    let data = inode.metadata()?;
-    log::debug!("Setting inode: new uid:{}, new gid:{}", data.uid, data.gid);
+    // let data = inode.metadata()?;
+    // log::debug!("Setting inode: new uid:{}, new gid:{}", data.uid, data.gid);
     return Ok(0);
 }
 
@@ -126,7 +127,11 @@ pub fn ksys_fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError
     //                   gid: usize|
     //  -> Result<usize, SystemError> { chown_common(inode, uid, gid) };
 
-    return chown_common(&inode, uid, gid);
+    let result = chown_common(&inode, uid, gid);
+
+    drop(fd_table);
+
+    result
 }
 
 pub(super) fn do_sys_open(

@@ -976,8 +976,10 @@ impl Syscall {
             }
 
             SYS_FCHOWN => {
-                warn!("SYS_FCHOWN has not yet been implemented");
-                Ok(0)
+                let dirfd = args[0] as i32;
+                let uid = args[1] as usize;
+                let gid = args[2] as usize;
+                Self::fchown(dirfd, uid, gid)
             }
 
             SYS_FSYNC => {
@@ -1158,7 +1160,6 @@ impl Syscall {
                 let flag = args[4] as u32;
                 Self::fchownat(dirfd, pathname, uid, gid, flag)
             }
-            // SYS_FCHOWN => {}
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

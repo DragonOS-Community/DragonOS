@@ -431,7 +431,7 @@ impl Iface for VirtioInterface {
     }
 
     #[inline]
-    fn name(&self) -> String {
+    fn iface_name(&self) -> String {
         return self.iface_name.clone();
     }
 

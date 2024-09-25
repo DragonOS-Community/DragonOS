@@ -51,7 +51,7 @@ impl IndexNode for Inode {
         &self,
         private_data: &crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, SystemError> {
-        drop(private_data);
+        // let _ = private_data;
         Ok(self.inner.poll())
     }
 
@@ -145,7 +145,6 @@ impl Inode {
         flags: MessageFlag,
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
-
         self.inner.recv_from(buffer, flags, address)
     }
 

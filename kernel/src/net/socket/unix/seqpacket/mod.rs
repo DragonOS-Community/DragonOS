@@ -379,7 +379,7 @@ impl Socket for SeqpacketSocket{
                                 log::debug!("recv from successfully");
                                 return Ok((usize,connected.endpoint().unwrap().clone()))
                             },
-                            Err(_)=>continue,
+                            Err(_) => continue,
                         }
                     }
                 }

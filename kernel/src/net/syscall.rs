@@ -246,24 +246,17 @@ impl Syscall {
     /// @return 成功返回0，失败返回错误码
     pub fn bind(fd: usize, addr: *const SockAddr, addrlen: u32) -> Result<usize, SystemError> {
         // 打印收到的参数
-        log::debug!(
-            "bind: fd={:?}, family={:?}, addrlen={:?}",
-            fd,
-            (unsafe { addr.as_ref().unwrap().family }),
-            addrlen
-        );
+        // log::debug!(
+        //     "bind: fd={:?}, family={:?}, addrlen={:?}",
+        //     fd,
+        //     (unsafe { addr.as_ref().unwrap().family }),
+        //     addrlen
+        // );
         let endpoint: Endpoint = SockAddr::to_endpoint(addr, addrlen)?;
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         log::debug!("bind: socket={:?}", socket);
-
-        // // 打印 dyn Socket 对象的具体类型
-        // if let Some(socket_any) = socket_ref.as_any().downcast_ref::<NetlinkSock>() {
-        //     log::debug!("Socket type: NetlinkSock");
-        // } else {
-        //     log::debug!("Socket type: Unknown: {:?}", socket_ref);
-        // }
         socket.bind(endpoint)?;
         Ok(0)
     }
@@ -317,39 +310,34 @@ impl Syscall {
         buf: &mut [u8],
         flags: u32,
         addr: *mut SockAddr,
-        addrlen: *mut u32,
+        addr_len: *mut u32,
     ) -> Result<usize, SystemError> {
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
         let flags = socket::MessageFlag::from_bits_truncate(flags as u32);
 
-        let address = if addr.is_null() {
-            None
-        } else {
-            Some(SockAddr::to_endpoint(
-                addr,
-                unsafe { addrlen.as_ref() }.ok_or(EINVAL)?.clone(),
-            )?)
-        };
+        if addr.is_null() {
+            let (n, _) = socket.recv_from(buf, flags, None)?;
+            return Ok(n);
+        }
 
-        let (n, endpoint) = match socket.recv_from(buf, flags, address){
-            Ok((n,endpoint))=>(n,endpoint),
-            Err(err)=>{
-                //log::debug!("recvfrom not impl");
-                return Err(err)
-            }
-        };
-        drop(socket);
+        // address is not null
+        let address = unsafe { addr.as_ref() }.ok_or(EINVAL)?;
 
-        // 如果有地址信息，将地址信息写入用户空间
-        if !addr.is_null() {
+        if unsafe { address.is_empty() } {
+            let (recv_len, endpoint) = socket.recv_from(buf, flags, None)?;
             let sockaddr_in = SockAddr::from(endpoint);
             unsafe {
-                sockaddr_in.write_to_user(addr, addrlen)?;
+                sockaddr_in.write_to_user(addr, addr_len)?;
             }
-        }
-        return Ok(n);
+            return Ok(recv_len);
+        } else { // 从socket中读取数据
+            let addr_len = unsafe { addr_len.as_ref() }.ok_or(EINVAL)?.clone();
+            let address = SockAddr::to_endpoint(addr, addr_len)?;
+            let (recv_len, _) = socket.recv_from(buf, flags, Some(address))?;
+            return Ok(recv_len);
+        };
     }
 
     /// @brief sys_recvmsg系统调用的实际执行函数

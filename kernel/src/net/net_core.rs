@@ -126,6 +126,7 @@ fn dhcp_query() -> Result<(), SystemError> {
 }
 
 pub fn poll_ifaces() {
+    log::debug!("poll_ifaces");
     let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn Iface>>> = NET_DEVICES.read_irqsave();
     if guard.len() == 0 {
         warn!("poll_ifaces: No net driver found!");

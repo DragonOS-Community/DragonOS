@@ -1,7 +1,7 @@
 use smoltcp;
 use system_error::SystemError::{self, *};
 
-use crate::net::socket::inet::common::{BoundInner, Types as InetTypes};
+use crate::{libs::spinlock::SpinLock, net::socket::inet::common::{BoundInner, Types as InetTypes}};
 
 pub type SmolUdpSocket = smoltcp::socket::udp::Socket<'static>;
 
@@ -43,7 +43,7 @@ impl UnboundUdp {
             .bind_port(InetTypes::Udp, local_endpoint.port)?;
         Ok(BoundUdp {
             inner,
-            remote: None,
+            remote: SpinLock::new(None),
         })
     }
 
@@ -54,7 +54,7 @@ impl UnboundUdp {
         let endpoint = smoltcp::wire::IpEndpoint::new(address, bound_port);
         Ok(BoundUdp {
             inner,
-            remote: Some(endpoint),
+            remote: SpinLock::new(Some(endpoint)),
         })
     }
 
@@ -66,7 +66,7 @@ impl UnboundUdp {
 #[derive(Debug)]
 pub struct BoundUdp {
     inner: BoundInner,
-    remote: Option<smoltcp::wire::IpEndpoint>,
+    remote: SpinLock<Option<smoltcp::wire::IpEndpoint>>,
 }
 
 impl BoundUdp {
@@ -89,6 +89,10 @@ impl BoundUdp {
             .with::<SmolUdpSocket, _, _>(|socket| socket.endpoint())
     }
 
+    pub fn connect(&self, remote: smoltcp::wire::IpEndpoint) {
+        self.remote.lock().replace(remote);
+    }
+
     #[inline]
     pub fn try_recv(
         &self,
@@ -104,15 +108,21 @@ impl BoundUdp {
         })
     }
 
+    #[inline]
+    pub fn can_recv(&self) -> bool {
+        self.with_socket(|socket| socket.can_recv())
+    }
+
     pub fn try_send(
         &self,
         buf: &[u8],
         to: Option<smoltcp::wire::IpEndpoint>,
     ) -> Result<usize, SystemError> {
-        let remote = to.or(self.remote).ok_or(ENOTCONN)?;
+        let remote = to.or(*self.remote.lock()).ok_or(ENOTCONN)?;
 
         let result = self.with_mut_socket(|socket| {
             if socket.can_send() && socket.send_slice(buf, remote).is_ok() {
+                log::debug!("send {} bytes", buf.len());
                 return Ok(buf.len());
             }
             return Err(ENOBUFS);

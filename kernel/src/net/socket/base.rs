@@ -36,7 +36,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     /// # `close`
     /// 关闭socket
     fn close(&self) -> Result<(), SystemError> {
-        Err(ENOSYS)
+        Ok(())
     }
     /// # `connect`
     /// 对应于POSIX的connect函数，用于连接到指定的远程服务器端点

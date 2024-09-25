@@ -2,7 +2,7 @@ use alloc::{fmt, string::String, sync::Arc, vec::Vec};
 
 use crate::{
     libs::{rwlock::RwLock, spinlock::SpinLock},
-    net::socket::inet::{common::PortManager, InetSocket},
+    net::socket::inet::{common::PortManager, InetSocket}, process::ProcessState,
 };
 use smoltcp;
 use system_error::SystemError;
@@ -25,7 +25,7 @@ pub trait Iface: crate::driver::base::device::Device {
 
     /// # `name`
     /// 获取网卡名
-    fn name(&self) -> String;
+    fn iface_name(&self) -> String;
 
     /// # `nic_id`
     /// 获取网卡id
@@ -155,6 +155,7 @@ impl IfaceCommon {
             // holding the write lock. So we don't need to disable IRQ when holding the read lock.
             self.bounds.read().iter().for_each(|bound_socket| {
                 bound_socket.on_iface_events();
+                bound_socket.wait_queue().wakeup(Some(ProcessState::Blocked(true)));
             });
 
             // let closed_sockets = self

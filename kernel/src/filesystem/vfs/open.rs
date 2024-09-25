@@ -99,17 +99,34 @@ pub fn do_fchownat(
 
     let inode = inode.unwrap();
 
-    return chown_common(inode, uid, gid);
-
-    // Linux中是先获取对文件系统的写权限，然后调用chown_common去修改文件所有者和组所有者，最后放弃对文件系统的写权限
+    return chown_common(&inode, uid, gid);
 }
 
-fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usize, SystemError> {
+fn chown_common(inode: &Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usize, SystemError> {
+    log::debug!("Setting inode: to-set uid:{}, to-set gid:{}", uid, gid);
+
     let mut meta = inode.metadata()?;
     meta.uid = uid;
     meta.gid = gid;
     inode.set_metadata(&meta)?;
+
+    let data = inode.metadata()?;
+    log::debug!("Setting inode: new uid:{}, new gid:{}", data.uid, data.gid);
     return Ok(0);
+}
+
+pub fn ksys_fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError> {
+    let fd_table = &ProcessManager::current_pcb().fd_table();
+    let fd_table = fd_table.read();
+
+    let inode = fd_table.get_file_by_fd(fd).unwrap().inode();
+
+    // let vfs_fchown = |inode: &Arc<dyn IndexNode>,
+    //                   uid: usize,
+    //                   gid: usize|
+    //  -> Result<usize, SystemError> { chown_common(inode, uid, gid) };
+
+    return chown_common(&inode, uid, gid);
 }
 
 pub(super) fn do_sys_open(

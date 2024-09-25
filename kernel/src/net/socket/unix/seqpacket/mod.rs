@@ -176,14 +176,6 @@ impl Socket for SeqpacketSocket{
             }
             _=>return Err(SystemError::EINVAL)
         }
-           
-        // match &mut *self.inner.write(){
-        //     Inner::Init(init)=>init.bind(Endpoint::Inode(inode.clone())),
-        //     _ =>{
-        //         log::error!("cannot bind a listening or connected socket");
-        //         return Err(SystemError::EINVAL)
-        //     }
-        // }
     }
 
     fn shutdown(&self, how: ShutdownTemp) -> Result<(), SystemError> {
@@ -283,9 +275,9 @@ impl Socket for SeqpacketSocket{
     
     fn get_option(
         &self,
-        level: crate::net::socket::OptionsLevel,
-        name: usize,
-        value: &mut [u8],
+        _level: crate::net::socket::OptionsLevel,
+        _name: usize,
+        _value: &mut [u8],
     ) -> Result<usize, SystemError> {
         log::warn!("getsockopt is not implemented");
         Ok(0)
@@ -325,7 +317,7 @@ impl Socket for SeqpacketSocket{
     }
     
     
-    fn recv_msg(&self, msg: &mut crate::net::syscall::MsgHdr, flags: crate::net::socket::MessageFlag) -> Result<usize, SystemError> {
+    fn recv_msg(&self, _msg: &mut crate::net::syscall::MsgHdr, _flags: crate::net::socket::MessageFlag) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
     
@@ -358,7 +350,7 @@ impl Socket for SeqpacketSocket{
         }
     }
     
-    fn send_msg(&self, msg: &crate::net::syscall::MsgHdr, flags: crate::net::socket::MessageFlag) -> Result<usize, SystemError> {
+    fn send_msg(&self, _msg: &crate::net::syscall::MsgHdr, _flags: crate::net::socket::MessageFlag) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
     

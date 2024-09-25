@@ -118,18 +118,13 @@ impl Socket for StreamSocket {
         // };
 
         //找到对端socket
-        let mut sun_path=String::from("");
-        let peer_inode = match server_endpoint {
-            Endpoint::Inode((inode,path)) => {
-                sun_path = path;
-                inode
-            },
+        let (peer_inode,sun_path) = match server_endpoint {
+            Endpoint::Inode((inode,path)) => (inode,path),
             Endpoint::Unixpath((inode_id,path)) => {
-                sun_path = path;
                 let inode_guard = INODE_MAP.read_irqsave();
                 let inode = inode_guard.get(&inode_id).unwrap();
                 match inode {
-                    Endpoint::Inode((inode,_)) => inode.clone(),
+                    Endpoint::Inode((inode,_)) => (inode.clone(),path),
                     _ => return Err(SystemError::EINVAL),
                 }
             }

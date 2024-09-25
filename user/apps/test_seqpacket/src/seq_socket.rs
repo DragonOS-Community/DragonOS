@@ -56,6 +56,7 @@ fn accept_connection(fd: RawFd) -> Result<RawFd, Error> {
         //     sun_path: [0; 108],
         // };
         // let mut len = mem::size_of_val(&addr) as socklen_t;
+        // let client_fd = accept(fd, &mut addr as *mut _ as *mut sockaddr, &mut len);
         let client_fd = accept(fd, std::ptr::null_mut(), std::ptr::null_mut());
         if client_fd == -1 {
             return Err(Error::last_os_error());
@@ -125,8 +126,22 @@ pub fn test_seq_socket() ->Result<(), Error>{
             }
         }
         send_message(client_fd, MSG1)?;
+        // get peer_name
+        unsafe {
+            let mut addrss = sockaddr_un {
+                sun_family: AF_UNIX as u16,
+                sun_path: [0; 108],
+            };
+            let mut len = mem::size_of_val(&addrss) as socklen_t;
+            let res = getpeername(client_fd, &mut addrss as *mut _ as *mut sockaddr, &mut len);
+            if res == -1 {
+                return Err(Error::last_os_error());
+            }
+            let sun_path = addrss.sun_path.clone();
+            let peer_path:[u8;108] = sun_path.iter().map(|&x| x as u8).collect::<Vec<u8>>().try_into().unwrap();
+            println!("Client: Connected to server at path: {}", String::from_utf8_lossy(&peer_path));
 
-
+        }
             
         server_thread.join().expect("Server thread panicked");
 

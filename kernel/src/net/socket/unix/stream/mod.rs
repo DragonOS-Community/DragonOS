@@ -1,4 +1,4 @@
-use alloc::sync::{Arc, Weak};
+use alloc::{sync::{Arc, Weak},string::String};
 use inner::{Connected, Init, Inner, Listener};
 use log::debug;
 use system_error::SystemError;
@@ -52,7 +52,7 @@ impl StreamSocket {
         let inode = Inode::new(socket.clone());
 
         let _ = match &mut *socket.inner.write() {
-            Inner::Init(init) => init.bind(Endpoint::Inode(inode.clone())),
+            Inner::Init(init) => init.bind(Endpoint::Inode((inode.clone(),String::from("")))),
             _ => return Err(SystemError::EINVAL),
         };
 
@@ -102,8 +102,9 @@ impl Socket for StreamSocket {
                     None => {
                         debug!("not bind when connected");
                         let inode = Inode::new(self.self_ref.upgrade().unwrap().clone());
-                        let _ = init.bind(Endpoint::Inode(inode.clone()));
-                        Some(Endpoint::Inode(inode.clone()))
+                        let epoint =Endpoint::Inode((inode.clone(),String::from("")));
+                        let _ = init.bind(epoint.clone());
+                        Some(epoint)
                     }
                 }
             },
@@ -117,13 +118,18 @@ impl Socket for StreamSocket {
         // };
 
         //找到对端socket
+        let mut sun_path=String::from("");
         let peer_inode = match server_endpoint {
-            Endpoint::Inode(inode) => inode,
-            Endpoint::InodeId(inode_id) => {
+            Endpoint::Inode((inode,path)) => {
+                sun_path = path;
+                inode
+            },
+            Endpoint::Unixpath((inode_id,path)) => {
+                sun_path = path;
                 let inode_guard = INODE_MAP.read_irqsave();
                 let inode = inode_guard.get(&inode_id).unwrap();
                 match inode {
-                    Endpoint::Inode(inode) => inode.clone(),
+                    Endpoint::Inode((inode,_)) => inode.clone(),
                     _ => return Err(SystemError::EINVAL),
                 }
             }
@@ -136,7 +142,7 @@ impl Socket for StreamSocket {
         //创建新的对端socket
         let new_server_socket = StreamSocket::new();
         let new_server_inode = Inode::new(new_server_socket.clone());
-        let new_server_endpoint = Some(Endpoint::Inode(new_server_inode.clone()));
+        let new_server_endpoint = Some(Endpoint::Inode((new_server_inode.clone(),sun_path)));
         //获取connect pair
         let (client_conn, server_conn) = Connected::new_pair(client_endpoint, new_server_endpoint.clone());
         *new_server_socket.inner.write() = Inner::Connected(server_conn);
@@ -157,10 +163,15 @@ impl Socket for StreamSocket {
     }
 
     fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
-        let inode = self.get_name()?;
-        
         match endpoint {
-            Endpoint::InodeId(inodeid) => {
+            Endpoint::Unixpath((inodeid,path)) => {
+                let inode = match &mut *self.inner.write() {
+                    Inner::Init(init)=>init.bind_path(path)?,
+                    _ =>{
+                        log::error!("socket has listen or connected");
+                        return Err(SystemError::EINVAL);
+                    }
+                };
                 INODE_MAP.write_irqsave().insert(inodeid, inode);
                 Ok(())
             }

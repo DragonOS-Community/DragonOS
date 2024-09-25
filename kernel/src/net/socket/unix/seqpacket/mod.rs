@@ -1,6 +1,6 @@
 pub mod inner;
 use core::sync::atomic::{AtomicBool, Ordering};
-use alloc::sync::{Arc,Weak};
+use alloc::{sync::{Arc,Weak},string::String};
 
 use inner::*;
 use system_error::SystemError;
@@ -41,7 +41,7 @@ impl SeqpacketSocket {
         let inode = Inode::new(socket.clone());
         // 建立时绑定自身为后续能正常获取本端地址
         let _ = match &mut*socket.inner.write() {
-            Inner::Init(init)=>init.bind(Endpoint::Inode(inode.clone())),
+            Inner::Init(init)=>init.bind(Endpoint::Inode((inode.clone(),String::from("")))),
             _=>return Err(SystemError::EINVAL),
         };
         return Ok(inode);
@@ -63,7 +63,7 @@ impl SeqpacketSocket {
         let inode0=Inode::new(socket0.clone());
         let inode1=Inode::new(socket1.clone());
 
-        let (conn_0, conn_1)=Connected::new_pair(Some(Endpoint::Inode(inode0.clone())), Some(Endpoint::Inode(inode1.clone())));
+        let (conn_0, conn_1)=Connected::new_pair(Some(Endpoint::Inode((inode0.clone(),String::from("")))), Some(Endpoint::Inode((inode1.clone(),String::from("")))));
         *socket0.inner.write()=Inner::Connected(conn_0);
         *socket1.inner.write()=Inner::Connected(conn_1);
 
@@ -104,12 +104,12 @@ impl SeqpacketSocket {
 impl Socket for SeqpacketSocket{
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         let peer_inode = match endpoint {
-            Endpoint::Inode(inode)=> inode,
-            Endpoint::InodeId(inode_id)=>{
+            Endpoint::Inode((inode,_))=> inode,
+            Endpoint::Unixpath((inode_id,_))=>{
                 let inode_guard = INODE_MAP.read_irqsave();
                 let inode = inode_guard.get(&inode_id).unwrap();
                 match inode {
-                Endpoint::Inode(inode)=> inode.clone(),
+                Endpoint::Inode((inode,_))=> inode.clone(),
                 _ => {return Err(SystemError::EINVAL)},
                 }
             }
@@ -128,8 +128,9 @@ impl Socket for SeqpacketSocket{
                     None=>{
                         log::debug!("not bind when connect");
                         let inode= Inode::new(self.self_ref.upgrade().unwrap().clone());
-                        let _ = init.bind(Endpoint::Inode(inode.clone()));
-                        Some(Endpoint::Inode(inode.clone()))
+                        let epoint = Endpoint::Inode((inode.clone(),String::from("")));
+                        let _ = init.bind(epoint.clone());
+                        Some(epoint)
                     }
                 }
             },
@@ -159,11 +160,17 @@ impl Socket for SeqpacketSocket{
     }
 
     fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
-        // let inode= Inode::new(self.self_ref.upgrade().unwrap().clone());
-        let inode =self.get_name()?;
         // 将自身socket的inode与用户端提供路径的文件indoe_id进行绑定
         match endpoint{
-            Endpoint::InodeId(inodeid)=>{
+            Endpoint::Unixpath((inodeid,path))=>{
+                let inode = match &mut *self.inner.write() {
+                    Inner::Init(init)=>init.bind_path(path)?,
+                    _ =>{
+                        log::error!("socket has listen or connected");
+                        return Err(SystemError::EINVAL);
+                    }
+                };
+
                INODE_MAP.write_irqsave().insert(inodeid, inode);
                 Ok(())
             }
@@ -366,7 +373,10 @@ impl Socket for SeqpacketSocket{
             flags: MessageFlag,
             _address: Option<Endpoint>,
         ) -> Result<(usize, Endpoint), SystemError> {
-            log::debug!("recvfrom flags {:?}",flags);
+        log::debug!("recvfrom flags {:?}",flags);
+
+        // wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+        // connect锁和flag判断顺序不正确，应该先判断在
         match &*self.inner.write(){
             Inner::Connected(connected)=>{
                 if flags.contains(MessageFlag::OOB){
@@ -377,7 +387,7 @@ impl Socket for SeqpacketSocket{
                         match connected.recv_slice(buffer){
                             Ok(usize)=>{
                                 log::debug!("recv from successfully");
-                                return Ok((usize,connected.endpoint().unwrap().clone()))
+                                return Ok((usize,connected.peer_endpoint().unwrap().clone()))
                             },
                             Err(_) => continue,
                         }

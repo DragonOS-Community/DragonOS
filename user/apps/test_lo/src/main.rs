@@ -2,7 +2,7 @@ use std::net::UdpSocket;
 use std::str;
 
 fn main() -> std::io::Result<()> {
-    let socket = UdpSocket::bind("127.0.0.1:34254")?;
+    let socket = UdpSocket::bind("10.0.2.15:34254")?;
     socket.connect("127.0.0.1:34255")?;
 
     let listener = UdpSocket::bind("127.0.0.1:34255")?;

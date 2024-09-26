@@ -3,7 +3,7 @@ name = "ida"
 version = "0.1.0"
 edition = "2021"
 authors = ["longjin <longjin@dragonos.org>"]
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "一个基于XArray的ID分配器"
 
 [dependencies]
+kdepends = { path = "../kdepends" }

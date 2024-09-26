@@ -5,7 +5,7 @@ use system_error::SystemError;
 
 use crate::libs::rwlock::RwLock;
 use crate::{
-    driver::net::Iface,
+    driver::net::{Iface, Operstate},
     libs::rwlock::RwLockReadGuard,
     net::NET_DEVICES,
     time::timer::{next_n_ms_timer_jiffies, Timer, TimerFunction},
@@ -93,6 +93,8 @@ fn dhcp_query() -> Result<(), SystemError> {
                         .unwrap();
                     let cidr = net_face.smol_iface().lock().ip_addrs().first().cloned();
                     if let Some(cidr) = cidr {
+                        // 这里先在这里将网卡设置为up，后面等netlink实现了再修改
+                        net_face.set_operstate(Operstate::IF_OPER_UP);
                         info!("Successfully allocated ip by Dhcpv4! Ip:{}", cidr);
                         return Ok(());
                     }

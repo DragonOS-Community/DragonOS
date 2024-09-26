@@ -1,8 +1,4 @@
-use core::{
-    ffi::{c_uint, c_void},
-    mem::MaybeUninit,
-    sync::atomic::AtomicBool,
-};
+use core::sync::atomic::AtomicBool;
 
 use alloc::{
     string::{String, ToString},
@@ -14,14 +10,14 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    arch::MMArch,
     driver::{
         base::{
             class::Class,
             device::{
-                bus::Bus, device_manager, driver::Driver, Device, DeviceState, DeviceType, IdTable,
+                bus::Bus, device_manager, driver::Driver, Device, DeviceCommonData, DeviceState,
+                DeviceType, IdTable,
             },
-            kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+            kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
             platform::{
                 platform_device::{platform_device_manager, PlatformDevice},
@@ -36,21 +32,13 @@ use crate::{
         sysfs::{file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport},
         vfs::syscall::ModeType,
     },
-    include::bindings::bindings::{
-        multiboot2_get_Framebuffer_info, multiboot2_iter, multiboot_tag_framebuffer_info_t,
-        FRAME_BUFFER_MAPPING_OFFSET,
-    },
-    init::{boot_params, initcall::INITCALL_DEVICE},
+    init::{boot::boot_callbacks, boot_params, initcall::INITCALL_DEVICE},
     libs::{
-        align::page_align_up,
         once::Once,
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
-        spinlock::SpinLock,
+        spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::{
-        allocator::page_frame::PageFrameCount, no_init::pseudo_map_phys, MemoryManagementArch,
-        PhysAddr, VirtAddr,
-    },
+    mm::{early_ioremap::EarlyIoRemap, PhysAddr, VirtAddr},
 };
 
 use super::base::{
@@ -99,13 +87,8 @@ impl VesaFb {
         fb_info_data.pesudo_palette.resize(256, 0);
         return Self {
             inner: SpinLock::new(InnerVesaFb {
-                bus: None,
-                class: None,
-                driver: None,
-                kern_inode: None,
-                parent: None,
-                kset: None,
-                kobj_type: None,
+                kobject_common: KObjectCommonData::default(),
+                device_common: DeviceCommonData::default(),
                 device_state: DeviceState::NotInitialized,
                 pdev_id: 0,
                 pdev_id_auto: false,
@@ -117,17 +100,16 @@ impl VesaFb {
             fb_data: RwLock::new(fb_info_data),
         };
     }
+
+    fn inner(&self) -> SpinLockGuard<InnerVesaFb> {
+        self.inner.lock()
+    }
 }
 
 #[derive(Debug)]
 struct InnerVesaFb {
-    bus: Option<Weak<dyn Bus>>,
-    class: Option<Weak<dyn Class>>,
-    driver: Option<Weak<dyn Driver>>,
-    kern_inode: Option<Arc<KernFSInode>>,
-    parent: Option<Weak<dyn KObject>>,
-    kset: Option<Arc<KSet>>,
-    kobj_type: Option<&'static dyn KObjType>,
+    kobject_common: KObjectCommonData,
+    device_common: DeviceCommonData,
     device_state: DeviceState,
     pdev_id: i32,
     pdev_id_auto: bool,
@@ -178,35 +160,35 @@ impl Device for VesaFb {
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {
-        self.inner.lock().bus.clone()
+        self.inner().device_common.bus.clone()
     }
 
     fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
-        self.inner.lock().bus = bus;
+        self.inner().device_common.bus = bus;
     }
 
     fn set_class(&self, class: Option<Weak<dyn Class>>) {
-        self.inner.lock().class = class;
+        self.inner().device_common.class = class;
     }
 
     fn class(&self) -> Option<Arc<dyn Class>> {
-        let mut guard = self.inner.lock();
+        let mut guard = self.inner();
 
-        let r = guard.class.clone()?.upgrade();
+        let r = guard.device_common.class.clone()?.upgrade();
         if r.is_none() {
             // 为了让弱引用失效
-            guard.class = None;
+            guard.device_common.class = None;
         }
 
         return r;
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
-        self.inner.lock().driver.clone()?.upgrade()
+        self.inner().device_common.driver.clone()?.upgrade()
     }
 
     fn set_driver(&self, driver: Option<Weak<dyn Driver>>) {
-        self.inner.lock().driver = driver;
+        self.inner().device_common.driver = driver;
     }
 
     fn is_dead(&self) -> bool {
@@ -222,6 +204,14 @@ impl Device for VesaFb {
     fn state_synced(&self) -> bool {
         true
     }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        self.inner().device_common.get_parent_weak_or_clear()
+    }
+
+    fn set_dev_parent(&self, dev_parent: Option<Weak<dyn Device>>) {
+        self.inner().device_common.parent = dev_parent;
+    }
 }
 
 impl KObject for VesaFb {
@@ -230,35 +220,35 @@ impl KObject for VesaFb {
     }
 
     fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
-        self.inner.lock().kern_inode = inode;
+        self.inner().kobject_common.kern_inode = inode;
     }
 
     fn inode(&self) -> Option<Arc<KernFSInode>> {
-        self.inner.lock().kern_inode.clone()
+        self.inner().kobject_common.kern_inode.clone()
     }
 
     fn parent(&self) -> Option<Weak<dyn KObject>> {
-        self.inner.lock().parent.clone()
+        self.inner().kobject_common.parent.clone()
     }
 
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
-        self.inner.lock().parent = parent;
+        self.inner().kobject_common.parent = parent;
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {
-        self.inner.lock().kset.clone()
+        self.inner().kobject_common.kset.clone()
     }
 
     fn set_kset(&self, kset: Option<Arc<KSet>>) {
-        self.inner.lock().kset = kset;
+        self.inner().kobject_common.kset = kset;
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.inner.lock().kobj_type
+        self.inner().kobject_common.kobj_type
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
-        self.inner.lock().kobj_type = ktype;
+        self.inner().kobject_common.kobj_type = ktype;
     }
 
     fn name(&self) -> String {
@@ -933,68 +923,18 @@ pub fn vesa_fb_driver_init() -> Result<(), SystemError> {
 }
 
 /// 在内存管理初始化之前,初始化vesafb
-pub fn vesafb_early_init() -> Result<VirtAddr, SystemError> {
-    let mut _reserved: u32 = 0;
+pub fn vesafb_early_init() -> Result<(), SystemError> {
+    let mut boot_params_guard = boot_params().write();
+    boot_callbacks().early_init_framebuffer_info(&mut boot_params_guard.screen_info)?;
 
-    let mut fb_info: MaybeUninit<multiboot_tag_framebuffer_info_t> = MaybeUninit::uninit();
-    //从multiboot2中读取帧缓冲区信息至fb_info
-
-    // todo: 换成rust的，并且检测是否成功获取
-    unsafe {
-        multiboot2_iter(
-            Some(multiboot2_get_Framebuffer_info),
-            fb_info.as_mut_ptr() as usize as *mut c_void,
-            &mut _reserved as *mut c_uint,
-        )
-    };
-    unsafe { fb_info.assume_init() };
-    let fb_info: multiboot_tag_framebuffer_info_t = unsafe { core::mem::transmute(fb_info) };
-
-    // todo: 判断是否有vesa帧缓冲区，这里暂时直接设置true
     HAS_VESA_FB.store(true, core::sync::atomic::Ordering::SeqCst);
 
-    let width = fb_info.framebuffer_width;
-    let height = fb_info.framebuffer_height;
+    return Ok(());
+}
 
-    let mut boot_params_guard = boot_params().write();
-    let boottime_screen_info = &mut boot_params_guard.screen_info;
+pub fn vesafb_early_map(paddr: PhysAddr, size: usize) -> Result<VirtAddr, SystemError> {
+    let (buf_vaddr, _) = EarlyIoRemap::map(paddr, size, false)?;
 
-    boottime_screen_info.is_vga = true;
-
-    boottime_screen_info.lfb_base = PhysAddr::new(fb_info.framebuffer_addr as usize);
-
-    if fb_info.framebuffer_type == 2 {
-        //当type=2时,width与height用字符数表示,故depth=8
-        boottime_screen_info.origin_video_cols = width as u8;
-        boottime_screen_info.origin_video_lines = height as u8;
-        boottime_screen_info.video_type = BootTimeVideoType::Mda;
-        boottime_screen_info.lfb_depth = 8;
-    } else {
-        //否则为图像模式,depth应参照帧缓冲区信息里面的每个像素的位数
-        boottime_screen_info.lfb_width = width;
-        boottime_screen_info.lfb_height = height;
-        boottime_screen_info.video_type = BootTimeVideoType::Vlfb;
-        boottime_screen_info.lfb_depth = fb_info.framebuffer_bpp as u8;
-    }
-
-    boottime_screen_info.lfb_size =
-        (width * height * ((fb_info.framebuffer_bpp as u32 + 7) / 8)) as usize;
-
-    // let buf_vaddr = VirtAddr::new(0xffff800003200000);
-    let buf_vaddr = VirtAddr::new(
-        crate::include::bindings::bindings::SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE as usize
-            + FRAME_BUFFER_MAPPING_OFFSET as usize,
-    );
-    boottime_screen_info.lfb_virt_base = Some(buf_vaddr);
-
-    let init_text = "Video driver to map.\n\0";
-    send_to_default_serial8250_port(init_text.as_bytes());
-
-    // 地址映射
-    let paddr = PhysAddr::new(fb_info.framebuffer_addr as usize);
-    let count =
-        PageFrameCount::new(page_align_up(boottime_screen_info.lfb_size) / MMArch::PAGE_SIZE);
-    unsafe { pseudo_map_phys(buf_vaddr, paddr, count) };
     return Ok(buf_vaddr);
 }
 

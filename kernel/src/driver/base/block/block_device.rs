@@ -13,12 +13,12 @@ use crate::driver::{
     block::cache::{cached_block_device::BlockCache, BlockCacheError, BLOCK_SIZE},
 };
 
-use alloc::{sync::Arc, vec::Vec};
-use core::any::Any;
+use alloc::{string::String, sync::Arc, vec::Vec};
+use core::{any::Any, fmt::Display, ops::Deref};
 use log::error;
 use system_error::SystemError;
 
-use super::disk_info::Partition;
+use super::{disk_info::Partition, gendisk::GenDisk, manager::BlockDevMeta};
 
 /// 该文件定义了 Device 和 BlockDevice 的接口
 /// Notice 设备错误码使用 Posix 规定的 int32_t 的错误码表示，而不是自己定义错误enum
@@ -35,6 +35,41 @@ pub type BlockId = usize;
 pub const BLK_SIZE_LOG2_LIMIT: u8 = 12; // 设定块设备的块大小不能超过 1 << 12.
 /// 在DragonOS中，我们认为磁盘的每个LBA大小均为512字节。（注意，文件系统的1个扇区可能事实上是多个LBA）
 pub const LBA_SIZE: usize = 512;
+
+#[derive(Debug, Clone, Copy)]
+pub struct GeneralBlockRange {
+    pub lba_start: usize,
+    pub lba_end: usize,
+}
+
+impl GeneralBlockRange {
+    pub fn new(lba_start: usize, lba_end: usize) -> Option<Self> {
+        if lba_start >= lba_end {
+            return None;
+        }
+        return Some(GeneralBlockRange { lba_start, lba_end });
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        return self.lba_end - self.lba_start;
+    }
+
+    /// 取交集
+    pub fn intersects_with(&self, rhs: &Self) -> Option<Self> {
+        // 检查是否相交
+        if self.lba_start <= rhs.lba_end && self.lba_end >= rhs.lba_start {
+            // 计算相交部分的起始和结束 LBA
+            let start = usize::max(self.lba_start, rhs.lba_start);
+            let end = usize::min(self.lba_end, rhs.lba_end);
+            // 返回相交部分
+            GeneralBlockRange::new(start, end)
+        } else {
+            // 不相交，返回 None
+            None
+        }
+    }
+}
 
 /// @brief 块设备的迭代器
 /// @usage 某次操作读/写块设备的[L,R]范围内的字节，
@@ -186,8 +221,80 @@ pub fn __lba_to_bytes(lba_id: usize, blk_size: usize) -> BlockId {
     return lba_id * blk_size;
 }
 
+/// 块设备的名字
+pub struct BlockDevName {
+    name: Arc<String>,
+    id: usize,
+}
+
+impl BlockDevName {
+    pub fn new(name: String, id: usize) -> Self {
+        return BlockDevName {
+            name: Arc::new(name),
+            id,
+        };
+    }
+
+    #[inline]
+    pub fn id(&self) -> usize {
+        return self.id;
+    }
+}
+
+impl core::fmt::Debug for BlockDevName {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        return write!(f, "{}", self.name);
+    }
+}
+
+impl Display for BlockDevName {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        return write!(f, "{}", self.name);
+    }
+}
+
+impl Clone for BlockDevName {
+    fn clone(&self) -> Self {
+        return BlockDevName {
+            name: self.name.clone(),
+            id: self.id,
+        };
+    }
+}
+
+impl core::hash::Hash for BlockDevName {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
+
+impl Deref for BlockDevName {
+    type Target = String;
+
+    fn deref(&self) -> &Self::Target {
+        return self.name.as_ref();
+    }
+}
+
+impl PartialEq for BlockDevName {
+    fn eq(&self, other: &Self) -> bool {
+        return self.name == other.name;
+    }
+}
+
+impl Eq for BlockDevName {}
+
 /// @brief 块设备应该实现的操作
 pub trait BlockDevice: Device {
+    /// # dev_name
+    /// 返回块设备的名字
+    fn dev_name(&self) -> &BlockDevName;
+
+    fn blkdev_meta(&self) -> &BlockDevMeta;
+
+    /// 获取设备的扇区范围
+    fn disk_range(&self) -> GeneralBlockRange;
+
     /// @brief: 在块设备中，从第lba_id_start个块开始，读取count个块数据，存放到buf中
     ///
     /// @parameter lba_id_start: 起始块
@@ -378,6 +485,11 @@ pub trait BlockDevice: Device {
             }
         }
         return Ok(len);
+    }
+
+    /// # gendisk注册成功的回调函数
+    fn callback_gendisk_registered(&self, _gendisk: &Arc<GenDisk>) -> Result<(), SystemError> {
+        Ok(())
     }
 }
 

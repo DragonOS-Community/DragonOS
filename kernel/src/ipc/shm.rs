@@ -14,7 +14,7 @@ use crate::{
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::PosixTimeSpec,
 };
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{compiler_fence, Ordering};
 use hashbrown::{HashMap, HashSet};
 use ida::IdAllocator;
@@ -125,7 +125,7 @@ pub struct ShmManager {
 impl ShmManager {
     pub fn new() -> Self {
         ShmManager {
-            id_allocator: IdAllocator::new(0, usize::MAX - 1),
+            id_allocator: IdAllocator::new(0, usize::MAX - 1).unwrap(),
             id2shm: HashMap::new(),
             key2id: HashMap::new(),
         }
@@ -165,10 +165,10 @@ impl ShmManager {
         let mut page_manager_guard = page_manager_lock_irqsave();
         let mut cur_phys = PhysPageFrame::new(phys_page.0);
         for _ in 0..page_count.data() {
-            let mut page = Page::new(true);
-            page.set_shm_id(shm_id);
+            let page = Arc::new(Page::new(true, cur_phys.phys_address()));
+            page.write_irqsave().set_shm_id(shm_id);
             let paddr = cur_phys.phys_address();
-            page_manager_guard.insert(paddr, page);
+            page_manager_guard.insert(paddr, &page);
             cur_phys = cur_phys.next();
         }
 
@@ -324,8 +324,8 @@ impl ShmManager {
         if map_count > 0 {
             // 设置共享内存物理页当映射计数等于0时可被回收
             for _ in 0..count.data() {
-                let page = page_manager_guard.get_mut(&cur_phys.phys_address());
-                page.set_dealloc_when_zero(true);
+                let page = page_manager_guard.get_unwrap(&cur_phys.phys_address());
+                page.write_irqsave().set_dealloc_when_zero(true);
 
                 cur_phys = cur_phys.next();
             }
@@ -436,7 +436,7 @@ impl KernelShm {
 
     /// 共享内存段的映射计数（有多少个不同的VMA映射）
     pub fn map_count(&self) -> usize {
-        let page_manager_guard = page_manager_lock_irqsave();
+        let mut page_manager_guard = page_manager_lock_irqsave();
         let mut id_set: HashSet<usize> = HashSet::new();
         let mut cur_phys = PhysPageFrame::new(self.shm_start_paddr);
         let page_count = PageFrameCount::from_bytes(page_align_up(self.shm_size)).unwrap();
@@ -444,7 +444,8 @@ impl KernelShm {
         for _ in 0..page_count.data() {
             let page = page_manager_guard.get(&cur_phys.phys_address()).unwrap();
             id_set.extend(
-                page.anon_vma()
+                page.read_irqsave()
+                    .anon_vma()
                     .iter()
                     .map(|vma| vma.id())
                     .collect::<Vec<_>>(),

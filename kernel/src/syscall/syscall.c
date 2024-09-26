@@ -5,7 +5,6 @@
 #include <common/string.h>
 #include <mm/slab.h>
 #include <process/process.h>
-#include <time/sleep.h>
 
 #if ARCH(I386) || ARCH(X86_64)
 // 导出系统调用入口函数，定义在entry.S中

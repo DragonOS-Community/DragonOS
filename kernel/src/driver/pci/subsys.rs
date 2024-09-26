@@ -151,6 +151,11 @@ impl Bus for PciBus {
         };
         return Ok(pci_dev.name().eq(&pci_driver.name()));
     }
+
+    fn root_device(&self) -> Option<Weak<dyn Device>> {
+        let root_device = pci_bus_device() as Arc<dyn Device>;
+        return Some(Arc::downgrade(&root_device));
+    }
 }
 
 #[derive(Debug)]

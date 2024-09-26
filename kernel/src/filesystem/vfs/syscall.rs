@@ -483,10 +483,10 @@ impl Syscall {
         mode: u32,
         follow_symlink: bool,
     ) -> Result<usize, SystemError> {
-        debug!("path: {:?}", path);
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
+
         let open_flags: FileMode = FileMode::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
         let mode = ModeType::from_bits(mode).ok_or(SystemError::EINVAL)?;
         return do_sys_open(

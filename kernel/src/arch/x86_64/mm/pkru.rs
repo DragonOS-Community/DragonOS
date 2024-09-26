@@ -16,8 +16,8 @@ const PKEY_MASK: usize = 1 << 32 | 1 << 33 | 1 << 34 | 1 << 35;
 /// ## 返回值
 /// - `u16`: vma的protection_key
 pub fn vma_pkey(vma: Arc<LockedVMA>) -> u16 {
-    let guard = vma.lock();
-    ((guard.vm_flags().bits() & PKEY_MASK as u64) >> VM_PKEY_SHIFT) as u16
+    let guard = vma.lock_irqsave();
+    ((guard.vm_flags().bits() & PKEY_MASK) >> VM_PKEY_SHIFT) as u16
 }
 
 // TODO pkru实现参考：https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/include/asm/pkru.h

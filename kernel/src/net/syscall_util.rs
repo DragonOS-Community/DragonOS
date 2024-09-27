@@ -46,6 +46,7 @@ use crate::{
 use smoltcp;
 use system_error::SystemError::{self, *};
 
+
 // 参考资料： https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/netinet_in.h.html#tag_13_32
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -160,14 +161,7 @@ impl SockAddr {
 
                     let follow_symlink=true;
                     let (inode_begin, path) = crate::filesystem::vfs::utils::user_path_at(&ProcessManager::current_pcb(), crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(), path.trim())?;
-                    let inode0: Result<Arc<dyn IndexNode>, SystemError> = inode_begin.lookup_follow_symlink(
-                        &path,
-                        if follow_symlink {
-                            VFS_MAX_FOLLOW_SYMLINK_TIMES
-                        } else {
-                            0
-                        },
-                    );
+                    let inode0: Result<Arc<dyn IndexNode>, SystemError> = inode_begin.lookup_follow_symlink(&path,VFS_MAX_FOLLOW_SYMLINK_TIMES);
 
                     let inode = match inode0{
                         Ok(inode)=>{
@@ -196,7 +190,7 @@ impl SockAddr {
                         }
                     };
 
-                    return Ok(Endpoint::InodeId(inode.metadata()?.inode_id));
+                    return Ok(Endpoint::Unixpath((inode.metadata()?.inode_id,path)));
                 }
                 AddressFamily::Packet => {
                     // TODO: support packet socket
@@ -318,16 +312,22 @@ impl From<Endpoint> for SockAddr {
                 return SockAddr { addr_nl };
             },
 
-            Endpoint::Inode(inode) => {
-                // let path = inode.absolute_path().unwrap_or(alloc::string::String::new());
-                // let sun_path: [u8; 108];
-                // sun_path.copy_within(src, dest);
+            Endpoint::Inode((_,path))=>{
+                log::debug!("from unix path {:?}",path);
+                let bytes = path.as_bytes();
+                let mut sun_path = [0u8;108];
+                if bytes.len() <= 108{
+                    sun_path[..bytes.len()].copy_from_slice(bytes);
+                }
+                else{
+                    panic!("unix address path too long!");
+                }
                 let addr_un = SockAddrUn {
-                    sun_family: AddressFamily::Unix as u16,
-                    sun_path: [0; 108],
+                    sun_family:AddressFamily::Unix as u16,
+                    sun_path:sun_path,
                 };
-                return SockAddr { addr_un };
-            }
+                return SockAddr { addr_un} 
+            },
 
             _ => {
                 // todo: support other endpoint, like Netlink...

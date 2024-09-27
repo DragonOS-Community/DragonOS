@@ -9,7 +9,7 @@ use crate::net::socket::unix::stream::StreamSocket;
 use crate::net::socket::{Endpoint, Inode, ShutdownTemp};
 
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
+use alloc::{sync::Arc,string::String};
 
 #[derive(Debug)]
 pub enum Inner {
@@ -40,6 +40,21 @@ impl Init {
         }
 
         return Ok(())
+    }
+
+    pub fn bind_path(&mut self,sun_path:String)->Result<Endpoint, SystemError>{
+        if self.addr.is_none()  {
+            log::error!("the socket is not bound");
+            return Err(SystemError::EINVAL);
+        }
+        if let Some(Endpoint::Inode((inode,mut path))) = self.addr.take(){
+            path=sun_path;
+            let epoint = Endpoint::Inode((inode,path));
+            self.addr.replace(epoint.clone());
+            return Ok(epoint);
+        };
+
+        return Err(SystemError::EINVAL)
     }
 
     pub(super) fn endpoint(&self) -> Option<&Endpoint> {
@@ -89,7 +104,7 @@ impl Connected {
     fn send_slice(&self, buf: &[u8]) -> Result<usize, SystemError> {
         //写入对端buffer
         let peer_inode = match self.peer_addr.as_ref().unwrap() {
-            Endpoint::Inode(inode) => inode,
+            Endpoint::Inode((inode,_)) => inode,
             _ => return Err(SystemError::EINVAL),
         };
         let peer_socket = Arc::downcast::<StreamSocket>(peer_inode.inner()).map_err(|_| SystemError::EINVAL)?;
@@ -109,7 +124,7 @@ impl Connected {
     fn can_send(&self) -> Result<bool, SystemError>{
         //查看连接体里的buf是否非满
         let peer_inode = match self.peer_addr.as_ref().unwrap() {
-            Endpoint::Inode(inode) => inode,
+            Endpoint::Inode((inode,_)) => inode,
             _ => return Err(SystemError::EINVAL),
         };
         let peer_socket = Arc::downcast::<StreamSocket>(peer_inode.inner()).map_err(|_| SystemError::EINVAL)?;

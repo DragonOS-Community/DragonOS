@@ -32,6 +32,21 @@ impl Init{
         return Ok(())
     }
 
+    pub fn bind_path(&mut self,sun_path:String)->Result<Endpoint, SystemError>{
+        if self.inode.is_none()  {
+            log::error!("the socket is not bound");
+            return Err(EINVAL);
+        }
+        if let Some(Endpoint::Inode((inode,mut path))) = self.inode.take(){
+            path=sun_path;
+            let epoint = Endpoint::Inode((inode,path));
+            self.inode.replace(epoint.clone());
+            return Ok(epoint);
+        };
+
+        return Err(SystemError::EINVAL)
+    }
+
     pub fn endpoint(&self) ->Option<&Endpoint>{
         return self.inode.as_ref()
     }
@@ -91,7 +106,12 @@ impl Listener {
         let new_server=SeqpacketSocket::new(false);
         let new_inode=Inode::new(new_server.clone());
         // log::debug!("new inode {:?},client_epoint {:?}",new_inode,client_epoint);
-        let (server_conn, client_conn) = Connected::new_pair(Some(Endpoint::Inode(new_inode.clone())), client_epoint);
+        let path = match& self.inode{
+            Endpoint::Inode((_,path)) => path.clone(),
+            _ => return Err(SystemError::EINVAL)
+        };
+
+        let (server_conn, client_conn) = Connected::new_pair(Some(Endpoint::Inode((new_inode.clone(),path))), client_epoint);
         *new_server.inner.write()=Inner::Connected(server_conn);
         incoming_conns.push_back(new_inode);
 
@@ -174,7 +194,7 @@ impl Connected{
         // let sebuffer = self.sebuffer.lock(); // 获取锁
         // sebuffer.capacity()-sebuffer.len() ==0;
         let peer_inode=match self.peer_inode.as_ref().unwrap(){
-            Endpoint::Inode(inode) =>inode,
+            Endpoint::Inode((inode,_)) =>inode,
             _=>return Err(SystemError::EINVAL),
         };
         let peer_socket=Arc::downcast::<SeqpacketSocket>(peer_inode.inner()).map_err(|_| SystemError::EINVAL)?;
@@ -194,7 +214,7 @@ impl Connected{
     pub fn send_slice(&self, buf: &[u8]) -> Result<usize, SystemError> {
         //找到peer_inode，并将write_buffer的内容写入对端的read_buffer
         let peer_inode=match self.peer_inode.as_ref().unwrap(){
-            Endpoint::Inode(inode) =>inode,
+            Endpoint::Inode((inode,_)) =>inode,
             _=>return Err(SystemError::EINVAL),
         };
         let peer_socket=Arc::downcast::<SeqpacketSocket>(peer_inode.inner()).map_err(|_| SystemError::EINVAL)?;

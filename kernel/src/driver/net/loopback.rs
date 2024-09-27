@@ -20,7 +20,6 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use log::debug;
 use smoltcp::wire::HardwareAddress;
 use smoltcp::{
     phy::{self},

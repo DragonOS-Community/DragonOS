@@ -3,17 +3,11 @@ use log::{debug, info, warn};
 use smoltcp::{socket::dhcpv4, wire};
 use system_error::SystemError;
 
-use crate::libs::rwlock::RwLock;
 use crate::{
     driver::net::{Iface, Operstate},
     libs::rwlock::RwLockReadGuard,
     net::NET_DEVICES,
     time::timer::{next_n_ms_timer_jiffies, Timer, TimerFunction},
-};
-
-use super::{
-    event_poll::{EPollEventType, EventPoll},
-    socket::{inet::TcpSocket, netlink::skbuff::SkBuff},
 };
 
 /// The network poll function, which will be called by timer.
@@ -85,13 +79,28 @@ fn dhcp_query() -> Result<(), SystemError> {
                     .ok();
 
                 if let Some(router) = config.router {
-                    net_face
-                        .smol_iface()
-                        .lock()
+                    let mut smol_iface = net_face.smol_iface().lock();
+                    let _ = smol_iface
                         .routes_mut()
-                        .add_default_ipv4_route(router)
-                        .unwrap();
-                    let cidr = net_face.smol_iface().lock().ip_addrs().first().cloned();
+                        .update(|table| {
+                            let _ = table.push(smoltcp::iface::Route {
+                                cidr: smoltcp::wire::IpCidr::Ipv4(
+                                    smoltcp::wire::Ipv4Cidr::new(
+                                    smoltcp::wire::Ipv4Address::new(127, 0, 0, 0), 
+                                    8
+                                )),
+                                via_router: smoltcp::wire::IpAddress::v4(127, 0, 0, 1),
+                                preferred_until: None,
+                                expires_at: None,
+                            });
+                        });
+                    if smol_iface
+                        .routes_mut()
+                        .add_default_ipv4_route(router).is_err() 
+                    {
+                        log::warn!("Route table full");
+                    }
+                    let cidr = smol_iface.ip_addrs().first().cloned();
                     if let Some(cidr) = cidr {
                         // 这里先在这里将网卡设置为up，后面等netlink实现了再修改
                         net_face.set_operstate(Operstate::IF_OPER_UP);
@@ -128,7 +137,7 @@ fn dhcp_query() -> Result<(), SystemError> {
 }
 
 pub fn poll_ifaces() {
-    log::debug!("poll_ifaces");
+    // log::debug!("poll_ifaces");
     let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn Iface>>> = NET_DEVICES.read_irqsave();
     if guard.len() == 0 {
         warn!("poll_ifaces: No net driver found!");

@@ -37,6 +37,19 @@ impl StreamSocket {
         })
     }
 
+    pub fn new_pairs() -> Result<(Arc<Inode>, Arc<Inode>), SystemError> {
+        let socket0=StreamSocket::new();
+        let socket1=StreamSocket::new();
+        let inode0=Inode::new(socket0.clone());
+        let inode1=Inode::new(socket1.clone());
+
+        let (conn_0, conn_1)=Connected::new_pair(Some(Endpoint::Inode((inode0.clone(),String::from("")))), Some(Endpoint::Inode((inode1.clone(),String::from("")))));
+        *socket0.inner.write()=Inner::Connected(conn_0);
+        *socket1.inner.write()=Inner::Connected(conn_1);
+
+        return Ok((inode0, inode1))
+    }
+
     pub fn new_connected(connected: Connected) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             inner: RwLock::new(Inner::Connected(connected)),
@@ -57,14 +70,6 @@ impl StreamSocket {
         };
 
         return Ok(inode)
-    }
-
-    pub fn new_pairs() -> (Arc<Self>, Arc<Self>) {
-        let (conn, peer_conn) = Connected::new_pair(None, None);
-        (
-            StreamSocket::new_connected(conn),
-            StreamSocket::new_connected(peer_conn),
-        )
     }
 
     fn is_acceptable(&self) -> bool {

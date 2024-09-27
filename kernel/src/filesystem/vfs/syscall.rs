@@ -24,7 +24,9 @@ use super::{
     core::{do_mkdir_at, do_remove_dir, do_unlink_at},
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
-    open::{do_faccessat, do_fchmodat, do_fchownat, do_sys_open, do_utimensat, do_utimes, ksys_fchown},
+    open::{
+        do_faccessat, do_fchmodat, do_fchownat, do_sys_open, do_utimensat, do_utimes, ksys_fchown,
+    },
     utils::{rsplit_path, user_path_at},
     Dirent, FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
@@ -873,7 +875,7 @@ impl Syscall {
 
     pub fn link(old: *const u8, new: *const u8) -> Result<usize, SystemError> {
         let get_path = |cstr: *const u8| -> Result<String, SystemError> {
-            let res = check_and_clone_cstr(cstr, Some(MAX_PATHLEN))?
+            let res: String = check_and_clone_cstr(cstr, Some(MAX_PATHLEN))?
                 .into_string()
                 .map_err(|_| SystemError::EINVAL)?;
 
@@ -1021,6 +1023,70 @@ impl Syscall {
             .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
         old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename)?;
         return Ok(0);
+    }
+
+    pub fn do_symlinkat(oldname: &str, newfd: i32, newname: &str) -> Result<usize, SystemError> {
+        // log::info!("do_symlinkat start");
+        let pcb = ProcessManager::current_pcb();
+
+        let (old_begin_inode, old_remain_path) =
+            user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), oldname)?;
+        old_begin_inode.lookup_follow_symlink(&old_remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+
+        // 得到新创建节点的父节点
+        let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newfd, newname)?;
+        let (new_name, new_parent_path) = rsplit_path(&new_remain_path);
+
+        let new_parent =
+            new_begin_inode.lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        // log::info!("do_symlinkat end");
+        new_parent.create(new_name, FileType::SymLink, ModeType::S_IFLNK)?;
+        // log::info!("do_symlinkat create end");
+        Ok(0)
+    }
+
+    pub fn symlinkat(
+        oldname: *const u8,
+        newfd: i32,
+        newname: *const u8,
+    ) -> Result<usize, SystemError> {
+        let get_path = |cstr: *const u8| -> Result<String, SystemError> {
+            let res = check_and_clone_cstr(cstr, Some(MAX_PATHLEN))?
+                .into_string()
+                .map_err(|_| SystemError::EINVAL)?;
+
+            if res.len() >= MAX_PATHLEN {
+                return Err(SystemError::ENAMETOOLONG);
+            }
+            if res.is_empty() {
+                return Err(SystemError::ENOENT);
+            }
+            Ok(res)
+        };
+        let old = get_path(oldname)?;
+        let new = get_path(newname)?;
+        return Self::do_symlinkat(&old, newfd, &new);
+    }
+
+    pub fn symlink(oldname: *const u8, newname: *const u8) -> Result<usize, SystemError> {
+        // log::info!("symlink start");
+        let get_path = |cstr: *const u8| -> Result<String, SystemError> {
+            let res = check_and_clone_cstr(cstr, Some(MAX_PATHLEN))?
+                .into_string()
+                .map_err(|_| SystemError::EINVAL)?;
+
+            if res.len() >= MAX_PATHLEN {
+                return Err(SystemError::ENAMETOOLONG);
+            }
+            if res.is_empty() {
+                return Err(SystemError::ENOENT);
+            }
+            Ok(res)
+        };
+        let old = get_path(oldname)?;
+        let new = get_path(newname)?;
+        // log::info!("symlink end");
+        return Self::do_symlinkat(&old, AtFlags::AT_FDCWD.bits(), &new);
     }
 
     /// @brief 根据提供的文件描述符的fd，复制对应的文件结构体，并返回新复制的文件结构体对应的fd

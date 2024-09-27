@@ -1160,6 +1160,19 @@ impl Syscall {
                 let flag = args[4] as u32;
                 Self::fchownat(dirfd, pathname, uid, gid, flag)
             }
+            SYS_SYMLINK => {
+                let oldname = args[0] as *const u8;
+                let newname = args[1] as *const u8;
+                // log::info!("SYS_SYMLINK");
+                Self::symlink(oldname, newname)
+            }
+            SYS_SYMLINKAT => {
+                let oldname = args[0] as *const u8;
+                let newfd = args[1] as i32;
+                let newname= args[2] as *const u8;
+                Self::symlinkat(oldname, newfd, newname)
+            }
+
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

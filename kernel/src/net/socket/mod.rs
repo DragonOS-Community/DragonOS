@@ -231,12 +231,12 @@ pub trait Socket: Sync + Send + Debug + Any {
 
         let posix_protocol =
             PosixIpProtocol::try_from(level as u16).map_err(|_| SystemError::ENOPROTOOPT)?;
-        
+
         info!(
             "posix_protocol: {:?}, optname: {:?}, optval: {:?}",
             posix_protocol, optname, optval
         );
-        
+
         warn!("setsockopt is not implemented");
         Ok(())
     }

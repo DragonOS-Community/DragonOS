@@ -1,12 +1,12 @@
 {
-  "name": "test_chown",
+  "name": "test_symlink",
   "version": "0.1.0",
-  "description": "测试chown",
+  "description": "symlink",
   "rust_target": "x86_64-unknown-dragonos",
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "/home/zky/DragonOS/user/apps/test_chown"
+        "path": "/home/zky/DragonOS/user/apps/test_symlink"
       }
     }
   },

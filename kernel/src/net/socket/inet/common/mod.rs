@@ -1,5 +1,5 @@
 use crate::net::{Iface, NET_DEVICES};
-use alloc::{vec::Vec, sync::Arc};
+use alloc::sync::Arc;
 use system_error::SystemError::{self, *};
 
 pub mod port;
@@ -52,7 +52,7 @@ impl BoundInner {
         } else {
             let iface = get_iface_to_bind(address).ok_or(ENODEV)?;
             let handle = iface.sockets().lock_no_preempt().add(socket);
-            log::debug!("Bind to iface: {}", iface.iface_name());
+            // log::debug!("Bind to iface: {}", iface.iface_name());
             // return Ok(Self { inner: vec![(handle, iface)] });
             return Ok( Self { handle, iface });
         }
@@ -93,20 +93,20 @@ impl BoundInner {
     }
 
     pub fn release(&self) {
-        self.iface.sockets().lock_no_preempt().remove(self.handle);
+        self.iface.sockets().lock().remove(self.handle);
     }
 }
 
 #[inline]
 pub fn get_iface_to_bind(ip_addr: &smoltcp::wire::IpAddress) -> Option<Arc<dyn Iface>> {
-    log::debug!("get_iface_to_bind: {:?}", ip_addr);
+    // log::debug!("get_iface_to_bind: {:?}", ip_addr);
     // if ip_addr.is_unspecified()
     crate::net::NET_DEVICES
         .read_irqsave()
         .iter()
         .find(|(_, iface)| {
             let guard = iface.smol_iface().lock();
-            log::debug!("iface name: {}, ip: {:?}", iface.iface_name(), guard.ip_addrs());
+            // log::debug!("iface name: {}, ip: {:?}", iface.iface_name(), guard.ip_addrs());
             return guard.has_ip_addr(ip_addr.clone());
         })
         .map(|(_, iface)| iface.clone())

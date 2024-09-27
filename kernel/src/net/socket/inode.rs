@@ -67,6 +67,7 @@ impl IndexNode for Inode {
         let meta = crate::filesystem::vfs::Metadata {
             mode: crate::filesystem::vfs::syscall::ModeType::from_bits_truncate(0o755),
             file_type: crate::filesystem::vfs::FileType::Socket,
+            size: self.send_buffer_size() as i64,
             ..Default::default()
         };
 

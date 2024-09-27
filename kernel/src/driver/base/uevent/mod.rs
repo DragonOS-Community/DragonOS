@@ -82,15 +82,16 @@ pub const UEVENT_HELPER_PATH_LEN: usize = 256;
 
 */
 // 表示一个待发送的uevent
+#[derive(Debug)]
 pub struct KobjUeventEnv {
-    argv: Vec<Option<String>>,
-    envp: Vec<Option<String>>,
+    argv: Vec<String>,
+    envp: Vec<String>,
     envp_idx: usize,
-    buf: Vec<Option<String>>,
+    buf: Vec<u8>,
     buflen: usize,
 }
 
-//kset_uevent_ops是为kset量身订做的一个数据结构，里面包含filter和uevent两个回调函数，用处如下：
+// kset_uevent_ops是为kset量身订做的一个数据结构，里面包含filter和uevent两个回调函数，用处如下：
 /*
     filter，当任何Kobject需要上报uevent时，它所属的kset可以通过该接口过滤，阻止不希望上报的event，从而达到从整体上管理的目的。
 

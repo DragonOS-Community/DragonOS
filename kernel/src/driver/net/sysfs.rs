@@ -17,11 +17,11 @@ use intertrait::cast::CastArc;
 use log::error;
 use system_error::SystemError;
 
-use super::{class::sys_class_net_instance, NetDeivceState, NetDevice, Operstate};
+use super::{class::sys_class_net_instance, Iface, NetDeivceState, Operstate};
 
 /// 将设备注册到`/sys/class/net`目录下
 /// 参考：https://code.dragonos.org.cn/xref/linux-2.6.39/net/core/net-sysfs.c?fi=netdev_register_kobject#1311
-pub fn netdev_register_kobject(dev: Arc<dyn NetDevice>) -> Result<(), SystemError> {
+pub fn netdev_register_kobject(dev: Arc<dyn Iface>) -> Result<(), SystemError> {
     // 初始化设备
     device_manager().device_default_initialize(&(dev.clone() as Arc<dyn Device>));
 
@@ -103,8 +103,8 @@ impl Attribute for AttrAddrAssignType {
     }
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let net_device = kobj.cast::<dyn NetDevice>().map_err(|_| {
-            error!("AttrAddrAssignType::show() failed: kobj is not a NetDevice");
+        let net_device = kobj.cast::<dyn Iface>().map_err(|_| {
+            error!("AttrAddrAssignType::show() failed: kobj is not a Iface");
             SystemError::EINVAL
         })?;
         let addr_assign_type = net_device.addr_assign_type();
@@ -271,8 +271,8 @@ impl Attribute for AttrType {
     }
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let net_deive = kobj.cast::<dyn NetDevice>().map_err(|_| {
-            error!("AttrType::show() failed: kobj is not a NetDevice");
+        let net_deive = kobj.cast::<dyn Iface>().map_err(|_| {
+            error!("AttrType::show() failed: kobj is not a Iface");
             SystemError::EINVAL
         })?;
         let net_type = net_deive.net_device_type();
@@ -322,8 +322,8 @@ impl Attribute for AttrAddress {
     }
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let net_device = kobj.cast::<dyn NetDevice>().map_err(|_| {
-            error!("AttrAddress::show() failed: kobj is not a NetDevice");
+        let net_device = kobj.cast::<dyn Iface>().map_err(|_| {
+            error!("AttrAddress::show() failed: kobj is not a Iface");
             SystemError::EINVAL
         })?;
         let mac_addr = net_device.mac();
@@ -373,8 +373,8 @@ impl Attribute for AttrCarrier {
     }
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let net_device = kobj.cast::<dyn NetDevice>().map_err(|_| {
-            error!("AttrCarrier::show() failed: kobj is not a NetDevice");
+        let net_device = kobj.cast::<dyn Iface>().map_err(|_| {
+            error!("AttrCarrier::show() failed: kobj is not a Iface");
             SystemError::EINVAL
         })?;
         if net_device
@@ -489,8 +489,8 @@ impl Attribute for AttrOperstate {
     }
 
     fn show(&self, _kobj: Arc<dyn KObject>, _buf: &mut [u8]) -> Result<usize, SystemError> {
-        let net_device = _kobj.cast::<dyn NetDevice>().map_err(|_| {
-            error!("AttrOperstate::show() failed: kobj is not a NetDevice");
+        let net_device = _kobj.cast::<dyn Iface>().map_err(|_| {
+            error!("AttrOperstate::show() failed: kobj is not a Iface");
             SystemError::EINVAL
         })?;
         if !net_device

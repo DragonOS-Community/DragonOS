@@ -17,9 +17,11 @@ fn new_smoltcp_socket() -> smoltcp::socket::tcp::Socket<'static> {
     smoltcp::socket::tcp::Socket::new(rx_buffer, tx_buffer)
 }
 
-fn new_listen_smoltcp_socket(
-    local_endpoint: smoltcp::wire::IpEndpoint,
-) -> smoltcp::socket::tcp::Socket<'static> {
+fn new_listen_smoltcp_socket<T>(
+    local_endpoint: T,
+) -> smoltcp::socket::tcp::Socket<'static> 
+    where T: Into<smoltcp::wire::IpListenEndpoint>,
+{
     let mut socket = new_smoltcp_socket();
     socket.listen(local_endpoint).unwrap();
     socket
@@ -117,12 +119,18 @@ impl Init {
             }
             Init::Bound(inner) => inner,
         };
+        let listen_addr = if local.addr.is_unspecified() {
+            smoltcp::wire::IpListenEndpoint::from(local.port)
+        } else {
+            smoltcp::wire::IpListenEndpoint::from(local)
+        };
+        log::debug!("listen at {:?}", listen_addr);
         let mut inners = Vec::new();
         if let Err(err) = || -> Result<(), SystemError> {
             for _ in 0..(backlog - 1) {
                 // -1 because the first one is already bound
                 let new_listen =
-                    socket::inet::BoundInner::bind(new_listen_smoltcp_socket(local), &local.addr)?;
+                    socket::inet::BoundInner::bind(new_listen_smoltcp_socket(listen_addr), &local.addr)?;
                 inners.push(new_listen);
             }
             Ok(())
@@ -131,13 +139,13 @@ impl Init {
         }
 
         if let Err(err) = inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-            socket.listen(local).map_err(|_| ECONNREFUSED)
+            socket.listen(listen_addr).map_err(|_| ECONNREFUSED)
         }) {
             return Err((Init::Bound((inner, local)), err));
         }
 
         inners.push(inner);
-        return Ok(Listening { inners });
+        return Ok(Listening { inners, connect: AtomicUsize::new(0) });
     }
 }
 
@@ -217,27 +225,32 @@ impl Connecting {
 #[derive(Debug)]
 pub struct Listening {
     inners: Vec<socket::inet::BoundInner>,
+    connect: AtomicUsize,
 }
 
 impl Listening {
     pub fn accept(&mut self) -> Result<(Established, smoltcp::wire::IpEndpoint), SystemError> {
 
-        let connected: &mut socket::inet::BoundInner = self
-            .inners
-            .iter_mut()
-            .find(|inner| {
-                inner.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.is_active())
-            })
-            .ok_or(EAGAIN_OR_EWOULDBLOCK)?;
+        let connected: &mut socket::inet::BoundInner = 
+            self.inners
+                .get_mut(self.connect.load(
+                    core::sync::atomic::Ordering::Relaxed
+                )).unwrap();
+        
+        if connected.with::<smoltcp::socket::tcp::Socket, _, _>(
+            |socket| !socket.is_active()) {
+            return Err(EAGAIN_OR_EWOULDBLOCK);
+        }
 
-        let local_endpoint = connected
-            .with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.local_endpoint())
-            .ok_or_else(|| {
-                log::error!("A Connected Tcp With No Local Endpoint");
-                EINVAL
-            })?;
+        let (local_endpoint, remote_endpoint) = connected
+            .with::<smoltcp::socket::tcp::Socket, _, _>(|socket|
+                (
+                    socket.local_endpoint().expect("A Connected Tcp With No Local Endpoint"), 
+                    socket.remote_endpoint().expect("A Connected Tcp With No Remote Endpoint")
+                )
+            );
 
-        log::debug!("local at {:?}", local_endpoint);
+        // log::debug!("local at {:?}", local_endpoint);
 
         let mut new_listen = socket::inet::BoundInner::bind(
             new_listen_smoltcp_socket(local_endpoint),
@@ -248,25 +261,23 @@ impl Listening {
         // TODO is smoltcp socket swappable?
         core::mem::swap(&mut new_listen, connected);
 
-        let remote_endpoint = connected.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-            // haven't check ECONNABORTED is the right error
-            socket.remote_endpoint().ok_or(ECONNABORTED)
-        })?;
-
         return Ok((Established { inner: new_listen }, remote_endpoint));
     }
 
     pub fn update_io_events(&self, pollee: &AtomicUsize) {
-        let can_accept = self.inners.iter().any(|inner| {
+        let position = self.inners.iter().position(|inner| {
             inner.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.is_active())
         });
-        if can_accept {
-            log::debug!("Can accept!");
+
+        if let Some(position) = position {
+            // log::debug!("Can accept!");
+            self.connect.store(position, core::sync::atomic::Ordering::Relaxed);
             pollee.fetch_or(
                 EPollEventType::EPOLLIN.bits() as usize,
                 core::sync::atomic::Ordering::Relaxed,
             );
         } else {
+            // log::debug!("Can't accept!");
             pollee.fetch_and(
                 !EPollEventType::EPOLLIN.bits() as usize,
                 core::sync::atomic::Ordering::Relaxed,
@@ -292,11 +303,14 @@ impl Established {
         self.inner.with(f)
     }
 
-    pub fn close(self) {
+    pub fn close(&self) {
         self.inner
-            .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-                socket.close();
-            });
+            .with_mut::<smoltcp::socket::tcp::Socket, _, _>(
+            |socket| socket.close() );
+        self.inner.iface().poll();
+    }
+
+    pub fn release(&self) {
         self.inner.release();
     }
 

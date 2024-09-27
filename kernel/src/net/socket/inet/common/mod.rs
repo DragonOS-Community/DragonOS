@@ -93,7 +93,7 @@ impl BoundInner {
     }
 
     pub fn release(&self) {
-        self.iface.sockets().lock_no_preempt().remove(self.handle);
+        self.iface.sockets().lock().remove(self.handle);
     }
 }
 

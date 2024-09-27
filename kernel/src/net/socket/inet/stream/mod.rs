@@ -182,6 +182,7 @@ impl TcpSocket {
     }
 
     pub fn try_recv(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+        poll_ifaces();
         match self.inner.read().as_ref().expect("Tcp Inner is None") {
             Inner::Established(inner) => inner.recv_slice(buf),
             _ => Err(EINVAL),
@@ -216,7 +217,8 @@ impl TcpSocket {
 
     // should only call on accept
     fn is_acceptable(&self) -> bool {
-        (self.poll() & EP::EPOLLIN.bits() as usize) != 0
+        // (self.poll() & EP::EPOLLIN.bits() as usize) != 0
+        EP::from_bits_truncate(self.poll() as u32).contains(EP::EPOLLIN)
     }
 }
 
@@ -230,11 +232,6 @@ impl Socket for TcpSocket {
             return self.do_bind(addr);
         }
         return Err(EINVAL);
-    }
-
-    fn close(&self) -> Result<(), SystemError> {
-        log::warn!("resource release not impl yet");
-        Ok(())
     }
 
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
@@ -258,10 +255,11 @@ impl Socket for TcpSocket {
             self.try_accept()
         } else {
             loop {
-                wq_wait_event_interruptible!(self.wait_queue, self.is_acceptable(), {})?;
                 // log::debug!("TcpSocket::accept: wake up");
                 match self.try_accept() {
-                    Err(EAGAIN_OR_EWOULDBLOCK) => continue,
+                    Err(EAGAIN_OR_EWOULDBLOCK) => {
+                        wq_wait_event_interruptible!(self.wait_queue, self.is_acceptable(), {})?;
+                    },
                     result => break result,
                 }
             }
@@ -291,6 +289,21 @@ impl Socket for TcpSocket {
             .as_ref()
             .expect("Tcp Inner is None")
             .recv_buffer_size()
+    }
+
+    fn close(&self) -> Result<(), SystemError> {
+        match self.inner.read().as_ref().expect("Tcp Inner is None") {
+            Inner::Init(_) => {},
+            Inner::Connecting(_) => {
+                return Err(EINPROGRESS);
+            },
+            Inner::Established(es) => {
+                es.close();
+                es.release();
+            },
+            Inner::Listening(_) => {},
+        }
+        Ok(())
     }
 }
 

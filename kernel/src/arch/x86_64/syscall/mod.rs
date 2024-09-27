@@ -118,10 +118,17 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
             SYS_RECVFROM | SYS_SENDTO | SYS_SENDMSG | SYS_RECVMSG => {
                 show &= true;
             }
-            SYS_SOCKET | SYS_GETSOCKNAME | SYS_GETPEERNAME | SYS_SOCKETPAIR | SYS_SETSOCKOPT
-            | SYS_GETSOCKOPT => {
+            SYS_SOCKET | SYS_GETSOCKNAME | SYS_GETPEERNAME | SYS_SOCKETPAIR 
+            | SYS_SETSOCKOPT | SYS_GETSOCKOPT => {
                 show &= true;
-            }
+            },
+            SYS_OPEN | SYS_OPENAT | SYS_CREAT | SYS_CLOSE => {
+                show &= true;
+            },
+            SYS_READ | SYS_WRITE | SYS_READV | SYS_WRITEV | SYS_PREAD64 
+            | SYS_PWRITE64 | SYS_PREADV | SYS_PWRITEV | SYS_PREADV2 => {
+                show &= true;
+            },
             _ => {
                 show &= false;
             }

@@ -86,31 +86,22 @@ impl UdpSocket {
         &self,
         buf: &mut [u8],
     ) -> Result<(usize, smoltcp::wire::IpEndpoint), SystemError> {
+        poll_ifaces();
         let received = match self.inner.read().as_ref().expect("Udp Inner is None") {
             UdpInner::Bound(bound) => bound.try_recv(buf),
             _ => Err(ENOTCONN),
         };
-
-        poll_ifaces();
-
         return received;
     }
 
+    #[inline]
     pub fn can_recv(&self) -> bool {
-        // poll_ifaces();
-        let ret = match self.inner.read().as_ref().expect("Udp Inner is None") {
-            UdpInner::Bound(bound) => bound.can_recv(),
-            _ => {
-                log::warn!("UdpSocket::can_recv: not bound");
-                false
-            },
-        };
-        if ret {
-            log::debug!("UdpSocket::can_recv: true");
-            return true;
-        }
-        log::debug!("UdpSocket::can_recv: false");
-        return false;
+        self.on_events().contains(EP::EPOLLIN)
+    }
+
+    #[inline]
+    pub fn can_send(&self) -> bool {
+        self.on_events().contains(EP::EPOLLOUT)
     }
 
     pub fn try_send(
@@ -256,14 +247,15 @@ impl Socket for UdpSocket {
 
     fn recv(&self, buffer: &mut [u8], flags: MessageFlag) -> Result<usize, SystemError> {
         use crate::sched::SchedMode;
+
         return if self.is_nonblock() || flags.contains(MessageFlag::DONTWAIT) {
             self.try_recv(buffer)
         } else {
             loop {
-                wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {} )?;
-                log::debug!("UdpSocket::recv: wake up");
                 match self.try_recv(buffer) {
-                    Err(EAGAIN_OR_EWOULDBLOCK) => continue,
+                    Err(EAGAIN_OR_EWOULDBLOCK) => {
+                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {} )?;
+                    },
                     result => break result,
                 }
             }
@@ -281,15 +273,16 @@ impl Socket for UdpSocket {
         if let Some(endpoint) = address {
             self.connect(endpoint)?;
         }
-        // poll_ifaces();
+
         return if self.is_nonblock() || flags.contains(MessageFlag::DONTWAIT) {
             self.try_recv(buffer)
         } else {
             loop {
-                wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {} )?;
-                log::debug!("UdpSocket::recv_from: wake up");
                 match self.try_recv(buffer) {
-                    Err(EAGAIN_OR_EWOULDBLOCK) => continue,
+                    Err(EAGAIN_OR_EWOULDBLOCK) => {
+                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {} )?;
+                        log::debug!("UdpSocket::recv_from: wake up");
+                    },
                     result => break result,
                 }
             }

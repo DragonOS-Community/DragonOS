@@ -142,6 +142,24 @@ impl SockAddr {
                             SystemError::EINVAL
                         })?;
 
+                    // let fd = match Syscall::open(path.as_ptr(), FileMode::O_RDWR.bits(), 0o755, true){
+                    //     Ok(fd)=>fd,
+                    //     Err(e)=>{
+                    //         log::debug!("not fd {:?} path {}",e,path);
+                    //         return Err(e);
+                    //     }
+                    // };
+
+                    // let binding = ProcessManager::current_pcb().fd_table();
+                    // let fd_table_guard = binding.read();
+
+                    // let file = fd_table_guard.get_file_by_fd(fd as i32).unwrap();
+                    // if file.file_type() != FileType::Socket {
+                    //     return Err(SystemError::ENOTSOCK);
+                    // }
+                    // let socket = file.inode().downcast_arc::<socket::Inode>().ok_or(EINVAL)?;
+
+                    let follow_symlink=true;
                     let (inode_begin, path) = crate::filesystem::vfs::utils::user_path_at(&ProcessManager::current_pcb(), crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(), path.trim())?;
                     let inode0: Result<Arc<dyn IndexNode>, SystemError> = inode_begin.lookup_follow_symlink(&path,VFS_MAX_FOLLOW_SYMLINK_TIMES);
 

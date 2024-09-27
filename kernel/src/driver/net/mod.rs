@@ -114,8 +114,8 @@ impl IfaceCommon {
         D: smoltcp::phy::Device + ?Sized,
     {
         let timestamp = crate::time::Instant::now().into();
-        let mut sockets = self.sockets.lock_no_preempt();
-        let mut interface = self.smol_iface.lock_no_preempt();
+        let mut sockets = self.sockets.lock_irqsave();
+        let mut interface = self.smol_iface.lock_irqsave();
 
         let (has_events, poll_at) = {
             let mut has_events = false;
@@ -151,6 +151,7 @@ impl IfaceCommon {
         }
 
         if has_events {
+            // log::debug!("IfaceCommon::poll: has_events");
             // We never try to hold the write lock in the IRQ context, and we disable IRQ when
             // holding the write lock. So we don't need to disable IRQ when holding the read lock.
             self.bounds.read().iter().for_each(|bound_socket| {

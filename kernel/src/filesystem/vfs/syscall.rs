@@ -483,7 +483,6 @@ impl Syscall {
         mode: u32,
         follow_symlink: bool,
     ) -> Result<usize, SystemError> {
-        debug!("path: {:?}", path);
         let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;

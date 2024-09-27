@@ -41,7 +41,7 @@ const PTY_NR_LIMIT: usize = 4096;
 pub struct DevPtsFs {
     /// 根节点
     root_inode: Arc<LockedDevPtsFSInode>,
-    pts_ida: IdAllocator,
+    pts_ida: SpinLock<IdAllocator>,
     pts_count: AtomicU32,
 }
 
@@ -50,7 +50,7 @@ impl DevPtsFs {
         let root_inode = Arc::new(LockedDevPtsFSInode::new());
         let ret = Arc::new(Self {
             root_inode,
-            pts_ida: IdAllocator::new(1, NR_UNIX98_PTY_MAX as usize),
+            pts_ida: SpinLock::new(IdAllocator::new(1, NR_UNIX98_PTY_MAX as usize).unwrap()),
             pts_count: AtomicU32::new(0),
         });
 
@@ -60,7 +60,7 @@ impl DevPtsFs {
     }
 
     pub fn alloc_index(&self) -> Result<usize, SystemError> {
-        self.pts_ida.alloc().ok_or(SystemError::ENOSPC)
+        self.pts_ida.lock().alloc().ok_or(SystemError::ENOSPC)
     }
 }
 

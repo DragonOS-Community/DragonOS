@@ -1,6 +1,8 @@
 use ida::IdAllocator;
 use smoltcp::iface::SocketHandle;
 
+use crate::libs::spinlock::SpinLock;
+
 int_like!(KernelHandle, usize);
 
 /// # socket的句柄管理组件
@@ -12,7 +14,8 @@ pub enum GlobalSocketHandle {
     Kernel(KernelHandle),
 }
 
-static KERNEL_HANDLE_IDA: IdAllocator = IdAllocator::new(0, usize::MAX);
+static KERNEL_HANDLE_IDA: SpinLock<IdAllocator> =
+    SpinLock::new(IdAllocator::new(0, usize::MAX).unwrap());
 
 impl GlobalSocketHandle {
     pub fn new_smoltcp_handle(handle: SocketHandle) -> Self {
@@ -20,7 +23,7 @@ impl GlobalSocketHandle {
     }
 
     pub fn new_kernel_handle() -> Self {
-        return Self::Kernel(KernelHandle::new(KERNEL_HANDLE_IDA.alloc().unwrap()));
+        return Self::Kernel(KernelHandle::new(KERNEL_HANDLE_IDA.lock().alloc().unwrap()));
     }
 
     pub fn smoltcp_handle(&self) -> Option<SocketHandle> {

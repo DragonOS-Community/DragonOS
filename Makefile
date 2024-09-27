@@ -163,7 +163,7 @@ update-submodules:
 update-submodules-by-mirror:
 	@echo "从镜像更新子模块"
 	@git config --global url."https://git.mirrors.dragonos.org.cn/DragonOS-Community/".insteadOf https://github.com/DragonOS-Community/
-	@$(MAKE) update-submodules --init
+	@$(MAKE) update-submodules
 	@git config --global --unset url."https://git.mirrors.dragonos.org.cn/DragonOS-Community/".insteadOf
 
 help:

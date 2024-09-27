@@ -27,7 +27,8 @@ use system_error::SystemError;
 use super::{super::device::DeviceState, platform_bus, platform_bus_device, CompatibleTable};
 
 /// 平台设备id分配器
-static PLATFORM_DEVID_IDA: IdAllocator = IdAllocator::new(0, i32::MAX as usize);
+static PLATFORM_DEVID_IDA: SpinLock<IdAllocator> =
+    SpinLock::new(IdAllocator::new(0, i32::MAX as usize).unwrap());
 
 #[inline(always)]
 pub fn platform_device_manager() -> &'static PlatformDeviceManager {
@@ -93,7 +94,10 @@ impl PlatformDeviceManager {
                 pdev.set_name(pdev.pdev_name().to_string());
             }
             PLATFORM_DEVID_AUTO => {
-                let id = PLATFORM_DEVID_IDA.alloc().ok_or(SystemError::EOVERFLOW)?;
+                let id = PLATFORM_DEVID_IDA
+                    .lock()
+                    .alloc()
+                    .ok_or(SystemError::EOVERFLOW)?;
                 pdev.set_pdev_id(id as i32);
                 pdev.set_pdev_id_auto(true);
                 pdev.set_name(format!("{}.{}.auto", pdev.pdev_name(), pdev.pdev_id().0));
@@ -112,7 +116,7 @@ impl PlatformDeviceManager {
             // failed
             let pdevid = pdev.pdev_id();
             if pdevid.1 {
-                PLATFORM_DEVID_IDA.free(pdevid.0 as usize);
+                PLATFORM_DEVID_IDA.lock().free(pdevid.0 as usize);
                 pdev.set_pdev_id(PLATFORM_DEVID_AUTO);
             }
 

@@ -54,7 +54,8 @@ use super::{
 pub const DEFAULT_MMAP_MIN_ADDR: usize = 65536;
 
 /// LockedVMA的id分配器
-static LOCKEDVMA_ID_ALLOCATOR: IdAllocator = IdAllocator::new(0, usize::MAX);
+static LOCKEDVMA_ID_ALLOCATOR: SpinLock<IdAllocator> =
+    SpinLock::new(IdAllocator::new(0, usize::MAX).unwrap());
 
 #[derive(Debug)]
 pub struct AddressSpace {
@@ -1097,7 +1098,7 @@ impl Eq for LockedVMA {}
 impl LockedVMA {
     pub fn new(vma: VMA) -> Arc<Self> {
         let r = Arc::new(Self {
-            id: LOCKEDVMA_ID_ALLOCATOR.alloc().unwrap(),
+            id: LOCKEDVMA_ID_ALLOCATOR.lock().alloc().unwrap(),
             vma: SpinLock::new(vma),
         });
         r.vma.lock_irqsave().self_ref = Arc::downgrade(&r);
@@ -1316,7 +1317,7 @@ impl LockedVMA {
 
 impl Drop for LockedVMA {
     fn drop(&mut self) {
-        LOCKEDVMA_ID_ALLOCATOR.free(self.id);
+        LOCKEDVMA_ID_ALLOCATOR.lock().free(self.id);
     }
 }
 

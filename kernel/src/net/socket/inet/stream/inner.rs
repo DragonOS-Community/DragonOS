@@ -7,6 +7,8 @@ use alloc::vec::Vec;
 use smoltcp;
 use system_error::SystemError::{self, *};
 
+use super::inet::UNSPECIFIED_LOCAL_ENDPOINT;
+
 pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
 pub const DEFAULT_RX_BUF_SIZE: usize = 512 * 1024;
 pub const DEFAULT_TX_BUF_SIZE: usize = 512 * 1024;
@@ -220,6 +222,13 @@ impl Connecting {
                 return true;
             })
     }
+
+    pub fn get_name(&self) -> smoltcp::wire::IpEndpoint {
+        self.inner
+            .with::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
+                socket.local_endpoint().expect("A Connecting Tcp With No Local Endpoint")
+            })
+    }
 }
 
 #[derive(Debug)]
@@ -283,6 +292,17 @@ impl Listening {
                 core::sync::atomic::Ordering::Relaxed,
             );
         }
+    }
+
+    pub fn get_name(&self) -> smoltcp::wire::IpEndpoint {
+        self.inners[0]
+            .with::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
+                if let Some(name) = socket.local_endpoint() {
+                    return name;
+                } else {
+                    return UNSPECIFIED_LOCAL_ENDPOINT
+                }
+            })
     }
 }
 

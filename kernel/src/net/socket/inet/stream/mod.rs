@@ -7,7 +7,7 @@ use crate::net::event_poll::EPollEventType;
 use crate::net::net_core::poll_ifaces;
 use crate::net::socket::*;
 use crate::sched::SchedMode;
-use inet::InetSocket;
+use inet::{InetSocket, UNSPECIFIED_LOCAL_ENDPOINT};
 use smoltcp;
 
 pub mod inner;
@@ -225,6 +225,16 @@ impl TcpSocket {
 impl Socket for TcpSocket {
     fn wait_queue(&self) -> &WaitQueue {
         &self.wait_queue
+    }
+
+    fn get_name(&self) -> Result<Endpoint, SystemError> {
+        match self.inner.read().as_ref().expect("Tcp Inner is None") {
+            Inner::Init(Init::Unbound(_)) => Ok(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT)),
+            Inner::Init(Init::Bound((_, local))) => Ok(Endpoint::Ip(local.clone())),
+            Inner::Connecting(connecting) => Ok(Endpoint::Ip(connecting.get_name())),
+            Inner::Established(established) => Ok(Endpoint::Ip(established.local_endpoint())),
+            Inner::Listening(listening) => Ok(Endpoint::Ip(listening.get_name())),
+        }
     }
 
     fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {

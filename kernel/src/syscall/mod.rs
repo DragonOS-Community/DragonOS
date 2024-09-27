@@ -1169,7 +1169,7 @@ impl Syscall {
             SYS_SYMLINKAT => {
                 let oldname = args[0] as *const u8;
                 let newfd = args[1] as i32;
-                let newname= args[2] as *const u8;
+                let newname = args[2] as *const u8;
                 Self::symlinkat(oldname, newfd, newname)
             }
 

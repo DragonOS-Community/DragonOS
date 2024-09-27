@@ -1037,8 +1037,8 @@ impl Syscall {
         let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newfd, newname)?;
         let (new_name, new_parent_path) = rsplit_path(&new_remain_path);
 
-        let new_parent =
-            new_begin_inode.lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        let new_parent = new_begin_inode
+            .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
         // log::info!("do_symlinkat end");
         new_parent.create(new_name, FileType::SymLink, ModeType::S_IFLNK)?;
         // log::info!("do_symlinkat create end");

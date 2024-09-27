@@ -29,12 +29,13 @@ pub mod sock;
 pub struct Netlink;
 
 impl family::Family for Netlink {
+    /// 用户空间创建一个新的套接字的入口
     fn socket(stype: Type, _protocol: u32) -> Result<Arc<Inode>, SystemError> {
         let socket = create_netlink_socket(_protocol)?;
         Ok(Inode::new(socket))
     }
 }
-
+/// 用户空间创建一个新的Netlink套接字
 fn create_netlink_socket(
     _protocol: u32,
 ) -> Result<Arc<dyn Socket>, SystemError> {

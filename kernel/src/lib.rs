@@ -148,12 +148,3 @@ pub fn panic(info: &PanicInfo) -> ! {
     ProcessManager::exit(usize::MAX);
 }
 
-/// 归还slab_page给buddy的回调
-pub struct SlabCallback;
-impl CallBack for SlabCallback {
-    unsafe fn free_slab_page(&self, base_addr: *mut u8, size: usize) {
-        unsafe {
-            KERNEL_ALLOCATOR.free_in_buddy(base_addr, Layout::from_size_align_unchecked(size, 1))
-        };
-    }
-}

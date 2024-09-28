@@ -89,7 +89,7 @@ pub unsafe fn slab_usage() -> SlabUsage {
 pub struct SlabCallback;
 impl CallBack for SlabCallback {
     unsafe fn free_slab_page(&self, base_addr: *mut u8, size: usize) {
-        assert_eq!(base_addr as usize & (MMArch::PAGE_SIZE), 0); // 确认地址4k对齐
+        assert_eq!(base_addr as usize & (MMArch::PAGE_SIZE - 1), 0); // 确认地址4k对齐
         assert_eq!(size, MMArch::PAGE_SIZE);
         unsafe {
             KERNEL_ALLOCATOR.free_in_buddy(base_addr, Layout::from_size_align_unchecked(size, 1))

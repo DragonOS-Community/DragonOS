@@ -37,7 +37,6 @@
 #[macro_use]
 extern crate std;
 
-use core::alloc::Layout;
 use core::panic::PanicInfo;
 
 /// 导出x86_64架构相关的代码，命名为arch模块
@@ -88,8 +87,6 @@ extern crate uefi;
 extern crate uefi_raw;
 #[macro_use]
 extern crate wait_queue_macros;
-
-use slabmalloc::CallBack;
 
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
@@ -147,4 +144,3 @@ pub fn panic(info: &PanicInfo) -> ! {
 
     ProcessManager::exit(usize::MAX);
 }
-

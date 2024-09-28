@@ -253,6 +253,7 @@ pub fn pty_init() -> Result<(), SystemError> {
         TtyDriverType::Pty,
         *TTY_STD_TERMIOS,
         Arc::new(Unix98PtyDriverInner::new()),
+        None,
     );
     ptm_driver.set_subtype(TtyDriverSubType::PtyMaster);
     let term = ptm_driver.init_termios_mut();
@@ -273,6 +274,7 @@ pub fn pty_init() -> Result<(), SystemError> {
         TtyDriverType::Pty,
         *TTY_STD_TERMIOS,
         Arc::new(Unix98PtyDriverInner::new()),
+        None,
     );
     pts_driver.set_subtype(TtyDriverSubType::PtySlave);
     let term = pts_driver.init_termios_mut();

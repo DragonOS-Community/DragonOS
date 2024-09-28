@@ -50,7 +50,7 @@ impl DevPtsFs {
         let root_inode = Arc::new(LockedDevPtsFSInode::new());
         let ret = Arc::new(Self {
             root_inode,
-            pts_ida: SpinLock::new(IdAllocator::new(1, NR_UNIX98_PTY_MAX as usize).unwrap()),
+            pts_ida: SpinLock::new(IdAllocator::new(0, NR_UNIX98_PTY_MAX as usize).unwrap()),
             pts_count: AtomicU32::new(0),
         });
 

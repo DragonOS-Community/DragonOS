@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use ida::IdAllocator;
 use log::warn;
 use system_error::SystemError;
 
@@ -15,13 +16,17 @@ use crate::{
             char::CharDevOps,
             device::{
                 device_number::{DeviceNumber, Major},
+                device_register,
                 driver::Driver,
+                IdTable,
             },
             kobject::KObject,
         },
         tty::tty_port::TtyPortState,
     },
+    filesystem::devfs::devfs_register,
     libs::{
+        lazy_init::Lazy,
         rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
@@ -30,6 +35,7 @@ use crate::{
 use super::{
     termios::{Termios, WindowSize},
     tty_core::{TtyCore, TtyCoreData},
+    tty_device::TtyDevice,
     tty_ldisc::TtyLdiscManager,
     tty_port::{DefaultTtyPort, TtyPort},
 };
@@ -79,6 +85,7 @@ impl TtyDriverManager {
 
         // 加入全局TtyDriver表
         let driver = Arc::new(driver);
+        driver.self_ref.init(Arc::downgrade(&driver));
         TTY_DRIVERS.lock().push(driver.clone());
 
         // TODO: 加入procfs?
@@ -86,6 +93,10 @@ impl TtyDriverManager {
         Ok(driver)
     }
 }
+
+/// tty 驱动程序的与设备相关的数据
+pub trait TtyDriverPrivateField: Debug + Send + Sync {}
+pub trait TtyCorePrivateField: Debug + Send + Sync {}
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -121,7 +132,11 @@ pub struct TtyDriver {
     ttys: SpinLock<HashMap<usize, Arc<TtyCore>>>,
     /// 管理的端口列表
     ports: RwLock<Vec<Arc<dyn TtyPort>>>,
-    // procfs入口?
+    /// 与设备相关的私有数据
+    private_field: Option<Arc<dyn TtyDriverPrivateField>>,
+    /// id分配器
+    ida: SpinLock<IdAllocator>,
+    self_ref: Lazy<Weak<Self>>,
 }
 
 impl TtyDriver {
@@ -135,6 +150,7 @@ impl TtyDriver {
         tty_driver_type: TtyDriverType,
         default_termios: Termios,
         driver_funcs: Arc<dyn TtyOperation>,
+        private_field: Option<Arc<dyn TtyDriverPrivateField>>,
     ) -> Self {
         let mut ports: Vec<Arc<dyn TtyPort>> = Vec::with_capacity(count as usize);
         for _ in 0..count {
@@ -156,6 +172,9 @@ impl TtyDriver {
             ttys: SpinLock::new(HashMap::new()),
             saved_termios: Vec::with_capacity(count as usize),
             ports: RwLock::new(ports),
+            private_field,
+            ida: SpinLock::new(IdAllocator::new(0, count as usize).unwrap()),
+            self_ref: Lazy::new(),
         }
     }
 
@@ -177,6 +196,22 @@ impl TtyDriver {
     #[inline]
     pub fn driver_funcs(&self) -> Arc<dyn TtyOperation> {
         self.driver_funcs.clone()
+    }
+
+    /// ## 获取该驱动对应的设备的设备号
+    #[inline]
+    pub fn device_number(&self, index: usize) -> Option<DeviceNumber> {
+        if index >= self.device_count as usize {
+            return None;
+        }
+        Some(DeviceNumber::new(
+            self.major,
+            self.minor_start + index as u32,
+        ))
+    }
+
+    fn self_ref(&self) -> Arc<Self> {
+        self.self_ref.get().upgrade().unwrap()
     }
 
     #[inline]
@@ -230,7 +265,7 @@ impl TtyDriver {
         ret.ok()
     }
 
-    fn standard_install(&self, tty_core: Arc<TtyCore>) -> Result<(), SystemError> {
+    pub fn standard_install(&self, tty_core: Arc<TtyCore>) -> Result<(), SystemError> {
         let tty = tty_core.core();
         tty.init_termios();
         // TODO:设置termios波特率？
@@ -242,59 +277,81 @@ impl TtyDriver {
         Ok(())
     }
 
-    fn driver_install_tty(driver: Arc<TtyDriver>, tty: Arc<TtyCore>) -> Result<(), SystemError> {
-        let res = tty.install(driver.clone(), tty.clone());
+    fn driver_install_tty(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
+        let res = tty.install(self.self_ref(), tty.clone());
 
         if let Err(err) = res {
             if err == SystemError::ENOSYS {
-                return driver.standard_install(tty);
+                return self.standard_install(tty);
             } else {
                 return Err(err);
             }
         }
 
-        driver.add_tty(tty);
+        self.add_tty(tty);
 
         Ok(())
     }
 
-    pub fn init_tty_device(
-        driver: Arc<TtyDriver>,
-        index: usize,
-    ) -> Result<Arc<TtyCore>, SystemError> {
-        let tty = TtyCore::new(driver.clone(), index);
+    pub fn init_tty_device(&self, index: Option<usize>) -> Result<Arc<TtyCore>, SystemError> {
+        // 如果传入的index为None，那么就自动分配index
+        let idx: usize;
+        if let Some(i) = index {
+            if self.ida.lock().exists(i) {
+                return Err(SystemError::EINVAL);
+            }
+            idx = i;
+        } else {
+            idx = self.ida.lock().alloc().ok_or(SystemError::EBUSY)?;
+        }
 
-        Self::driver_install_tty(driver.clone(), tty.clone())?;
+        let tty = TtyCore::new(self.self_ref(), idx);
+
+        self.driver_install_tty(tty.clone())?;
 
         let core = tty.core();
 
         if core.port().is_none() {
-            let ports = driver.ports.read();
+            let ports = self.ports.read();
             ports[core.index()].setup_internal_tty(Arc::downgrade(&tty));
             tty.set_port(ports[core.index()].clone());
         }
 
         TtyLdiscManager::ldisc_setup(tty.clone(), tty.core().link())?;
 
+        // 在devfs创建对应的文件
+
+        let device = TtyDevice::new(
+            core.name().clone(),
+            IdTable::new(self.tty_line_name(idx), Some(*core.device_number())),
+            super::tty_device::TtyType::Tty,
+        );
+
+        devfs_register(device.name_ref(), device.clone())?;
+        device_register(device)?;
         Ok(tty)
     }
 
     /// ## 通过设备号找到对应驱动并且初始化Tty
-    pub fn open_tty(index: usize, driver: Arc<TtyDriver>) -> Result<Arc<TtyCore>, SystemError> {
-        let tty = match driver.lookup_tty(index) {
-            Some(tty) => {
-                // TODO: 暂时这么写，因为还没写TtyPort
-                if tty.core().port().is_none() {
-                    warn!("{} port is None", tty.core().name());
-                } else if tty.core().port().unwrap().state() == TtyPortState::KOPENED {
+    pub fn open_tty(&self, index: Option<usize>) -> Result<Arc<TtyCore>, SystemError> {
+        let mut tty: Option<Arc<TtyCore>> = None;
+
+        if index.is_some() {
+            if let Some(t) = self.lookup_tty(index.unwrap()) {
+                if t.core().port().is_none() {
+                    warn!("{} port is None", t.core().name());
+                } else if t.core().port().unwrap().state() == TtyPortState::KOPENED {
                     return Err(SystemError::EBUSY);
                 }
 
-                tty.reopen()?;
-                tty
+                t.reopen()?;
+                tty = Some(t);
             }
-            None => Self::init_tty_device(driver, index)?,
-        };
+        }
+        if tty.is_none() {
+            tty = Some(self.init_tty_device(index)?);
+        }
+        let tty = tty.ok_or(SystemError::ENODEV)?;
 
         return Ok(tty);
     }
@@ -447,7 +504,9 @@ pub trait TtyOperation: Sync + Send + Debug {
 
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError>;
 
-    fn resize(&self, _tty: Arc<TtyCore>, _winsize: WindowSize) -> Result<(), SystemError>;
+    fn resize(&self, _tty: Arc<TtyCore>, _winsize: WindowSize) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 }
 
 #[allow(dead_code)]

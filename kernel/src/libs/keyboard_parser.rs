@@ -176,6 +176,9 @@ impl TypeOneFSMState {
             }
             0x47 => {
                 scancode_status.home = true;
+                Self::emit(0x1b);
+                Self::emit(0x5b);
+                Self::emit(0x48);
             }
             0xc7 => {
                 scancode_status.home = false;
@@ -188,13 +191,19 @@ impl TypeOneFSMState {
             }
             0x53 => {
                 scancode_status.del = true;
-                Self::emit(127);
+                Self::emit(0x1b);
+                Self::emit(0x5b);
+                Self::emit(0x33);
+                Self::emit(0x7e);
             }
             0xd3 => {
                 scancode_status.del = false;
             }
             0x4f => {
                 scancode_status.end = true;
+                Self::emit(0x1b);
+                Self::emit(0x5b);
+                Self::emit(0x46);
             }
             0xcf => {
                 scancode_status.end = false;
@@ -207,32 +216,36 @@ impl TypeOneFSMState {
             }
             0x48 => {
                 scancode_status.arrow_u = true;
-                Self::emit(224);
-                Self::emit(72);
+                Self::emit(0x1b);
+                Self::emit(0x5b);
+                Self::emit(0x41);
             }
             0xc8 => {
                 scancode_status.arrow_u = false;
             }
             0x4b => {
                 scancode_status.arrow_l = true;
-                Self::emit(224);
-                Self::emit(75);
+                Self::emit(0x1b);
+                Self::emit(0x5b);
+                Self::emit(0x44);
             }
             0xcb => {
                 scancode_status.arrow_l = false;
             }
             0x50 => {
                 scancode_status.arrow_d = true;
-                Self::emit(224);
-                Self::emit(80);
+                Self::emit(0x1b);
+                Self::emit(0x5b);
+                Self::emit(0x42);
             }
             0xd0 => {
                 scancode_status.arrow_d = false;
             }
             0x4d => {
                 scancode_status.arrow_r = true;
-                Self::emit(224);
-                Self::emit(77);
+                Self::emit(0x1b);
+                Self::emit(0x5b);
+                Self::emit(0x43);
             }
             0xcd => {
                 scancode_status.arrow_r = false;
@@ -481,7 +494,7 @@ const TYPE1_KEY_CODE_MAPTABLE: [u8; 256] = [
     /*0x05*/ b'4', b'$', /*0x06*/ b'5', b'%', /*0x07*/ b'6', b'^',
     /*0x08*/ b'7', b'&', /*0x09*/ b'8', b'*', /*0x0a*/ b'9', b'(',
     /*0x0b*/ b'0', b')', /*0x0c*/ b'-', b'_', /*0x0d*/ b'=', b'+',
-    /*0x0e  \b */ 8, 8, // BACKSPACE
+    /*0x0e  \b */ 0x7f, 0x7f, // BACKSPACE
     /*0x0f*/ b'\t', b'\t', // TAB
     ////////////////////////character///////////////////////////
     /*0x10*/ b'q', b'Q',

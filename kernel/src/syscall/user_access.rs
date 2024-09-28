@@ -103,6 +103,40 @@ pub fn check_and_clone_cstr(
     return Ok(cstr);
 }
 
+/// 获取用户态字符串的长度
+///
+/// ## 参数
+///
+/// - `user`：用户态的 C 字符串指针
+///
+/// ## 返回值
+///
+/// 返回字符串的长度
+///
+/// ## 错误
+///
+/// - `EFAULT`：用户态地址不合法
+pub fn get_len_of_cstr(user: *const u8) -> Result<usize, SystemError> {
+    if user.is_null() {
+        return Err(SystemError::EFAULT);
+    }
+
+    let mut len = 0;
+    for i in 0.. {
+        let addr = unsafe { user.add(i) };
+        let mut c = [0u8; 1];
+        unsafe {
+            copy_from_user(&mut c, VirtAddr::new(addr as usize))?;
+        }
+        if c[0] == 0 {
+            break;
+        }
+        len += 1;
+    }
+
+    return Ok(len);
+}
+
 /// 检查并从用户态拷贝一个 C 字符串数组
 ///
 /// 一旦遇到空指针，就会停止拷贝. 一旦遇到非法地址，就会返回错误

@@ -17,7 +17,7 @@ use crate::{
         ProcessFlags, ProcessManager,
     },
     sched::{schedule, SchedMode},
-    syscall::user_access::check_and_clone_cstr,
+    syscall::user_access::{check_and_clone_cstr, get_len_of_cstr},
 };
 
 use log::{info, warn};
@@ -1145,12 +1145,12 @@ impl Syscall {
                 let uid = args[1];
                 let gid = args[2];
 
+                let length = get_len_of_cstr(pathname)?;
                 let from_user = frame.is_from_user();
-                let user_buffer_reader = UserBufferReader::new(pathname, core::mem::size_of::<u8>(), from_user)?;
+                let user_buffer_reader = UserBufferReader::new(pathname, length, from_user)?;
                 let path = user_buffer_reader.read_from_user::<u8>(0)?;
-                let path=core::str::from_utf8(path).unwrap();
-                // let path = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?;
-                // let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
+                let path = core::str::from_utf8(path).unwrap();
+                // info!("chown path={:?}", path);
 
                 Self::chown(path, uid, gid)
             }
@@ -1159,12 +1159,13 @@ impl Syscall {
                 let uid = args[1];
                 let gid = args[2];
 
+                let length = get_len_of_cstr(pathname)?;
                 let from_user = frame.is_from_user();
-                let user_buffer_reader = UserBufferReader::new(pathname, core::mem::size_of::<u8>(), from_user)?;
+                let user_buffer_reader = UserBufferReader::new(pathname, length, from_user)?;
                 let path = user_buffer_reader.read_from_user::<u8>(0)?;
-                let path=core::str::from_utf8(path).unwrap();
+                let path = core::str::from_utf8(path).unwrap();
 
-                Self::lchown(&path, uid, gid)
+                Self::lchown(path, uid, gid)
             }
             SYS_FCHOWNAT => {
                 let dirfd = args[0] as i32;
@@ -1173,12 +1174,13 @@ impl Syscall {
                 let gid = args[3];
                 let flag = args[4] as u32;
 
+                let length = get_len_of_cstr(pathname)?;
                 let from_user = frame.is_from_user();
-                let user_buffer_reader = UserBufferReader::new(pathname, core::mem::size_of::<u8>(), from_user)?;
+                let user_buffer_reader = UserBufferReader::new(pathname, length, from_user)?;
                 let path = user_buffer_reader.read_from_user::<u8>(0)?;
-                let path=core::str::from_utf8(path).unwrap();
+                let path = core::str::from_utf8(path).unwrap();
 
-                Self::fchownat(dirfd, &path, uid, gid, flag)
+                Self::fchownat(dirfd, path, uid, gid, flag)
             }
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };

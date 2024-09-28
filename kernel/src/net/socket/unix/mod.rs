@@ -38,6 +38,7 @@ impl Unix {
         log::debug!("socket_type {:?}",socket_type);
         match socket_type {
             Type::SeqPacket |Type::Datagram=>seqpacket::SeqpacketSocket::new_pairs(),
+            Type::Stream => stream::StreamSocket::new_pairs(),
             _=>todo!()
         }
     }

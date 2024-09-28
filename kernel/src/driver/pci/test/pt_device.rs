@@ -130,6 +130,14 @@ impl Device for TestDevice {
     fn state_synced(&self) -> bool {
         true
     }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        self.device_data.read().parent.clone()
+    }
+
+    fn set_dev_parent(&self, dev_parent: Option<Weak<dyn Device>>) {
+        self.device_data.write().parent = dev_parent
+    }
 }
 
 impl KObject for TestDevice {

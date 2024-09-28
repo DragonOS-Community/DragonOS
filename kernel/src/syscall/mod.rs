@@ -1144,13 +1144,27 @@ impl Syscall {
                 let pathname = args[0] as *const u8;
                 let uid = args[1];
                 let gid = args[2];
-                Self::chown(pathname, uid, gid)
+
+                let from_user = frame.is_from_user();
+                let user_buffer_reader = UserBufferReader::new(pathname, core::mem::size_of::<u8>(), from_user)?;
+                let path = user_buffer_reader.read_from_user::<u8>(0)?;
+                let path=core::str::from_utf8(path).unwrap();
+                // let path = check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?;
+                // let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
+
+                Self::chown(path, uid, gid)
             }
             SYS_LCHOWN => {
                 let pathname = args[0] as *const u8;
                 let uid = args[1];
                 let gid = args[2];
-                Self::lchown(pathname, uid, gid)
+
+                let from_user = frame.is_from_user();
+                let user_buffer_reader = UserBufferReader::new(pathname, core::mem::size_of::<u8>(), from_user)?;
+                let path = user_buffer_reader.read_from_user::<u8>(0)?;
+                let path=core::str::from_utf8(path).unwrap();
+
+                Self::lchown(&path, uid, gid)
             }
             SYS_FCHOWNAT => {
                 let dirfd = args[0] as i32;
@@ -1158,7 +1172,13 @@ impl Syscall {
                 let uid = args[2];
                 let gid = args[3];
                 let flag = args[4] as u32;
-                Self::fchownat(dirfd, pathname, uid, gid, flag)
+
+                let from_user = frame.is_from_user();
+                let user_buffer_reader = UserBufferReader::new(pathname, core::mem::size_of::<u8>(), from_user)?;
+                let path = user_buffer_reader.read_from_user::<u8>(0)?;
+                let path=core::str::from_utf8(path).unwrap();
+
+                Self::fchownat(dirfd, &path, uid, gid, flag)
             }
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };

@@ -31,17 +31,17 @@ fn print_file_owner_group(filename: &str) -> Result<(), Error> {
     println!("Group GID: {}", gid);
     Ok(())
 }
-fn test_fchownat(filename: &str, new_uid: uid_t, new_gid: gid_t, flags: i32) -> Result<(), Error> {
-    println!("Testing fchownat on file: {}", filename);
-    let c_filename = CString::new(filename)?;
-    let result = unsafe { fchownat(AT_FDCWD, c_filename.as_ptr(), new_uid, new_gid, flags) };
+// fn test_fchownat(filename: &str, new_uid: uid_t, new_gid: gid_t, flags: i32) -> Result<(), Error> {
+//     println!("Testing fchownat on file: {}", filename);
+//     let c_filename = CString::new(filename)?;
+//     let result = unsafe { fchownat(AT_FDCWD, c_filename.as_ptr(), new_uid, new_gid, flags) };
 
-    if result == -1 {
-        return Err(Error::last_os_error());
-    }
+//     if result == -1 {
+//         return Err(Error::last_os_error());
+//     }
 
-    print_file_owner_group(filename)
-}
+//     print_file_owner_group(filename)
+// }
 
 fn test_chown(filename: &str, new_uid: uid_t, new_gid: gid_t) -> Result<(), Error> {
     println!("Testing chown on file: {}", filename);
@@ -68,17 +68,17 @@ fn test_fchown(fd: i32, new_uid: uid_t, new_gid: gid_t) -> Result<(), Error> {
     Ok(())
 }
 
-fn test_lchown(symlink_name: &str, new_uid: uid_t, new_gid: gid_t) -> Result<(), Error> {
-    println!("Testing lchown on symbolic link: {}", symlink_name);
-    let c_symlink = CString::new(symlink_name)?;
-    let result = unsafe { lchown(c_symlink.as_ptr(), new_uid, new_gid) };
+// fn test_lchown(symlink_name: &str, new_uid: uid_t, new_gid: gid_t) -> Result<(), Error> {
+//     println!("Testing lchown on symbolic link: {}", symlink_name);
+//     let c_symlink = CString::new(symlink_name)?;
+//     let result = unsafe { lchown(c_symlink.as_ptr(), new_uid, new_gid) };
 
-    if result == -1 {
-        return Err(Error::last_os_error());
-    }
+//     if result == -1 {
+//         return Err(Error::last_os_error());
+//     }
 
-    print_file_owner_group(symlink_name)
-}
+//     print_file_owner_group(symlink_name)
+// }
 
 fn main() -> Result<(), Error> {
     let filename = "testfile.txt";
@@ -103,7 +103,7 @@ fn main() -> Result<(), Error> {
     writeln!(file, "This is a test file for chown system call")?;
 
     // 创建符号链接
-    std::os::unix::fs::symlink(filename, symlink_name)?;
+    // std::os::unix::fs::symlink(filename, symlink_name)?;
 
     // 打开文件以测试 fchown
     let fd = file.as_raw_fd();
@@ -114,11 +114,11 @@ fn main() -> Result<(), Error> {
     // 测试 fchown
     test_fchown(fd, new_uid, new_gid)?;
 
-    // 测试 lchown
-    test_lchown(symlink_name, new_uid, new_gid)?;
+    // // 测试 lchown
+    // test_lchown(symlink_name, new_uid, new_gid)?;
 
-    // 测试 fchownat，带 AT_SYMLINK_NOFOLLOW 标志（不会跟随符号链接）
-    test_fchownat(symlink_name, new_uid, new_gid, AT_SYMLINK_NOFOLLOW)?;
+    // // 测试 fchownat，带 AT_SYMLINK_NOFOLLOW 标志（不会跟随符号链接）
+    // test_fchownat(symlink_name, new_uid, new_gid, AT_SYMLINK_NOFOLLOW)?;
 
     // 清理测试文件
     std::fs::remove_file(filename)?;

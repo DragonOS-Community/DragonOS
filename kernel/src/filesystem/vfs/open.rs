@@ -66,19 +66,20 @@ pub fn do_fchmodat(dirfd: i32, path: *const u8, _mode: ModeType) -> Result<usize
 
 pub fn do_fchownat(
     dirfd: i32,
-    path: *const u8,
+    path: &str,
     uid: usize,
     gid: usize,
     flag: u32,
 ) -> Result<usize, SystemError> {
+    // 检查flag是否合法
     if (flag & (!((AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH).bits() as u32))) != 0 {
         return Err(SystemError::EINVAL);
     }
 
     let follow_symlink = flag & AtFlags::AT_SYMLINK_NOFOLLOW.bits() as u32 == 0;
 
-    let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
-    let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
+    // let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+    // let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
 
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 

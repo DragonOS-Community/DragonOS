@@ -1620,11 +1620,11 @@ impl Syscall {
         return Ok(0);
     }
 
-    pub fn chown(pathname: *const u8, uid: usize, gid: usize) -> Result<usize, SystemError> {
+    pub fn chown(pathname: &str, uid: usize, gid: usize) -> Result<usize, SystemError> {
         return do_fchownat(AtFlags::AT_FDCWD.bits(), pathname, uid, gid, 0);
     }
 
-    pub fn lchown(pathname: *const u8, uid: usize, gid: usize) -> Result<usize, SystemError> {
+    pub fn lchown(pathname: &str, uid: usize, gid: usize) -> Result<usize, SystemError> {
         return do_fchownat(
             AtFlags::AT_FDCWD.bits(),
             pathname,
@@ -1636,7 +1636,7 @@ impl Syscall {
 
     pub fn fchownat(
         dirfd: i32,
-        pathname: *const u8,
+        pathname: &str,
         uid: usize,
         gid: usize,
         flags: u32,

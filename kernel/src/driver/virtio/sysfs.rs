@@ -30,6 +30,7 @@ use crate::{
         vfs::syscall::ModeType,
     },
     init::initcall::INITCALL_CORE,
+    libs::spinlock::SpinLock,
 };
 
 use super::{VirtIODevice, VirtIODeviceIndex, VirtIODriver, VIRTIO_DEV_ANY_ID};
@@ -255,7 +256,7 @@ pub struct VirtIODeviceIndexManager {
     // ID分配器
     ///
     /// ID分配器用于分配唯一的索引给VirtIO设备。
-    ida: IdAllocator,
+    ida: SpinLock<IdAllocator>,
 }
 
 // VirtIO设备索引管理器的新建实例
@@ -265,7 +266,7 @@ impl VirtIODeviceIndexManager {
     /// 创建一个新的VirtIO设备索引管理器实例，初始时分配器从0开始，直到最大usize值。
     const fn new() -> Self {
         Self {
-            ida: IdAllocator::new(0, usize::MAX),
+            ida: SpinLock::new(IdAllocator::new(0, usize::MAX).unwrap()),
         }
     }
 
@@ -273,7 +274,7 @@ impl VirtIODeviceIndexManager {
     ///
     /// 分配一个唯一的索引给VirtIO设备。
     pub fn alloc(&self) -> VirtIODeviceIndex {
-        VirtIODeviceIndex(self.ida.alloc().unwrap())
+        VirtIODeviceIndex(self.ida.lock().alloc().unwrap())
     }
 
     // 释放一个VirtIO设备索引
@@ -281,7 +282,7 @@ impl VirtIODeviceIndexManager {
     /// 释放之前分配的VirtIO设备索引，使其可以被重新使用。
     #[allow(dead_code)]
     pub fn free(&self, index: VirtIODeviceIndex) {
-        self.ida.free(index.0);
+        self.ida.lock().free(index.0);
     }
 }
 

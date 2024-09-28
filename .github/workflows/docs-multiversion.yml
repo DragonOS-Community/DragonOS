@@ -1,0 +1,47 @@
+name: Build multiversion docs
+
+on:
+  push:
+    branches: [ "master" ]
+    tags: [ "v*", "V*"]
+
+env:
+    GITHUB_REPOSITORY: ${{ github.repository }}
+    GITHUB_REF: ${{ github.ref }}
+
+jobs:
+
+  build-multiversion:
+    if: github.repository == 'DragonOS-Community/DragonOS'
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ref: master
+      
+    - name: install requirements
+      working-directory: ./docs
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3-pip python3-setuptools
+        pip3 install -r requirements.txt
+        python3 -m pip install --user awscli
+
+    - name: build docs
+      working-directory: ./docs
+      shell: bash -ileo pipefail {0}
+
+      run: |
+        make html-multiversion
+
+    - name: deploy docs
+      working-directory: ./docs
+      env:
+        AWS_ENDPOINT_URL: ${{ secrets.DOCS_DEPLOY_S3_ENDPOINT_URL }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.DOCS_DEPLOY_S3_API_KEY }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.DOCS_DEPLOY_S3_SECRET_KEY }}
+      
+      run: |
+        aws s3 sync ./_build/html s3://dragonos-docs --delete

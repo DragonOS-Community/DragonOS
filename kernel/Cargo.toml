@@ -39,7 +39,7 @@ elf = { version = "=0.7.2", default-features = false }
 fdt = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/fdt", rev = "9862813020" }
 # 一个no_std的hashmap、hashset
 hashbrown = "=0.13.2"
-ida = { path = "src/libs/ida" }
+ida = { path = "crates/ida" }
 intertrait = { path = "crates/intertrait" }
 kdepends = { path = "crates/kdepends" }
 klog_types = { path = "crates/klog_types" }
@@ -57,7 +57,6 @@ wait_queue_macros = { path = "crates/wait_queue_macros" }
 paste = "=1.0.14"
 slabmalloc = { path = "crates/rust-slabmalloc" }
 log = "0.4.21"
-xarray = "0.1.0"
 lru = "0.12.3"
 
 # target为x86_64时，使用下面的依赖

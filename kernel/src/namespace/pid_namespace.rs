@@ -108,7 +108,7 @@ impl PidStrcut {
         }
 
         Ok(Self {
-            pid: numbers.last().unwrap().nr,
+            pid: numbers[0].nr,
             level: ns.level,
             numbers,
             stashed: ROOT_INODE(),
@@ -152,7 +152,7 @@ impl NsOperations for PidNsOperations {
     fn get_parent(&self, ns_common: Arc<NsCommon>) -> Result<Arc<NsCommon>, SystemError> {
         let current = ProcessManager::current_pid();
         let pcb = ProcessManager::find(current).unwrap();
-        let active = pcb.pid_strcut().pid_to_ns();
+        let active = pcb.pid_strcut().read().pid_to_ns();
         let mut pid_ns = &PidNamespace::ns_common_to_ns(ns_common).parent;
 
         while let Some(ns) = pid_ns {
@@ -178,7 +178,7 @@ impl NsOperations for PidNsOperations {
         let nsproxy = &mut nsset.nsproxy;
         let current = ProcessManager::current_pid();
         let pcb = ProcessManager::find(current).unwrap();
-        let active = pcb.pid_strcut().pid_to_ns();
+        let active = pcb.pid_strcut().read().pid_to_ns();
         let mut pid_ns = PidNamespace::ns_common_to_ns(ns_common);
         if pid_ns.level < active.level {
             return Err(SystemError::EINVAL);

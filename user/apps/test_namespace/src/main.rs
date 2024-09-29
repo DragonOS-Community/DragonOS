@@ -23,6 +23,7 @@ fn main() {
             }
             Ok(ForkResult::Child) => {
                 // 使用 unshare 创建新的命名空间
+                println!("Child process. PID: {}", unistd::getpid());
                 if let Err(e) = sched::unshare(clone_flags) {
                     println!("Failed to unshare: {:?}", e);
                     process::exit(1);

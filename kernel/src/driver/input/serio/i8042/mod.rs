@@ -6,7 +6,6 @@ use unified_init::macros::unified_init;
 use crate::{
     driver::base::{
         device::{device_manager, Device},
-        kobject::KObject,
         platform::{
             platform_device::{platform_device_manager, PlatformDevice},
             platform_driver::{platform_driver_manager, PlatformDriver},
@@ -47,14 +46,16 @@ pub fn i8042_init() -> Result<(), SystemError> {
     Ok(())
 }
 
-// TODO: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/i8042.c#441
+/// TODO: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/i8042.c#441
+#[allow(dead_code)]
 pub fn i8042_start(_serio: &Arc<dyn SerioDevice>) -> Result<(), SystemError> {
-    todo!()
+    todo!("i8042_start")
 }
 
-// TODO: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/i8042.c#471
+/// TODO: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/i8042.c#471
+#[allow(dead_code)]
 pub fn i8042_stop(_serio: &Arc<dyn SerioDevice>) -> Result<(), SystemError> {
-    todo!()
+    todo!("i8042_stop")
 }
 
 /// # 函数的功能
@@ -63,14 +64,14 @@ pub fn i8042_stop(_serio: &Arc<dyn SerioDevice>) -> Result<(), SystemError> {
 /// 参考: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/i8042.c#i8042_setup_aux
 pub fn i8042_setup_aux() -> Result<(), SystemError> {
     let aux_port = Arc::new(I8042AuxPort::new());
-    aux_port.set_parent(Some(Arc::downgrade(
-        &(i8042_platform_device() as Arc<dyn KObject>),
+    aux_port.set_dev_parent(Some(Arc::downgrade(
+        &(i8042_platform_device() as Arc<dyn Device>),
     )));
     serio_device_manager().register_port(aux_port.clone() as Arc<dyn SerioDevice>)?;
 
     #[cfg(target_arch = "x86_64")]
     crate::driver::input::ps2_mouse::ps_mouse_device::rs_ps2_mouse_device_init(
-        aux_port.clone() as Arc<dyn KObject>
+        aux_port.clone() as Arc<dyn Device>
     )?;
     Ok(())
 }

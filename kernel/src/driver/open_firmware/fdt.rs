@@ -468,8 +468,7 @@ fn read_cell(reg_value: &[u8], base_index: usize, cells: usize) -> (u64, usize) 
         1 => {
             return (
                 u32::from_be_bytes(reg_value[base_index..base_index + 4].try_into().unwrap())
-                    .try_into()
-                    .unwrap(),
+                    .into(),
                 next_base_index,
             );
         }

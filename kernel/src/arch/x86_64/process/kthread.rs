@@ -42,9 +42,8 @@ impl KernelThreadMechanism {
         frame.rip = kernel_thread_bootstrap_stage1 as usize as u64;
 
         // fork失败的话，子线程不会执行。否则将导致内存安全问题。
-        let pid = ProcessManager::fork(&frame, clone_flags).map_err(|e| {
+        let pid = ProcessManager::fork(&frame, clone_flags).inspect_err(|_e| {
             unsafe { KernelThreadCreateInfo::parse_unsafe_arc_ptr(create_info) };
-            e
         })?;
 
         ProcessManager::find(pid)

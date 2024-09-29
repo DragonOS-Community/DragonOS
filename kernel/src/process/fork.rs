@@ -11,7 +11,7 @@ use crate::{
     ipc::signal::flush_signal_handlers,
     libs::rwlock::RwLock,
     mm::VirtAddr,
-    namespace::{create_new_namespaces, namespace::USER_NS, pid_namespace::PidStrcut},
+    namespaces::{create_new_namespaces, namespace::USER_NS, pid_namespace::PidStrcut},
     process::ProcessFlags,
     sched::{sched_cgroup_fork, sched_fork},
     smp::core::smp_get_processor_id,
@@ -87,6 +87,7 @@ bitflags! {
 /// 因为这两个系统调用的参数很多，所以有这样一个载体更灵活
 ///
 /// 仅仅作为参数传递
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct KernelCloneArgs {
     pub flags: CloneFlags,
@@ -392,10 +393,6 @@ impl ProcessManager {
 
         // TODO: 克隆前应该锁信号处理，等待克隆完成后再处理
 
-        let new_pid = PidStrcut::alloc_pid(
-            pcb.get_nsproxy().read().pid_namespace.clone().unwrap(), // 获取命名空间
-            clone_args.set_tid.clone(),
-        )?;
         // 克隆架构相关
         let guard = current_pcb.arch_info_irqsave();
         unsafe { pcb.arch_info().clone_from(&guard) };
@@ -479,6 +476,14 @@ impl ProcessManager {
                 current_pcb.pid(), pcb.pid(), e
             )
         });
+
+        if pcb.pid().0 != 0 {
+            let new_pid = PidStrcut::alloc_pid(
+                pcb.get_nsproxy().read().pid_namespace.clone().unwrap(), // 获取命名空间
+                clone_args.set_tid.clone(),
+            )?;
+            *pcb.thread_pid.write() = new_pid;
+        }
 
         // 设置线程组id、组长
         if clone_flags.contains(CloneFlags::CLONE_THREAD) {

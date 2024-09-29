@@ -12,10 +12,14 @@ use alloc::{
     vec::Vec,
 };
 
+use crate::driver::base::block::gendisk::GenDisk;
 use crate::driver::base::device::device_number::DeviceNumber;
+use crate::filesystem::vfs::file::PageCache;
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
+use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
+use crate::mm::VmFaultReason;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
@@ -45,6 +49,7 @@ pub const MAX_FILE_SIZE: u64 = 0xffff_ffff;
 
 /// @brief 表示当前簇和上一个簇的关系的结构体
 /// 定义这样一个结构体的原因是，FAT文件系统的文件中，前后两个簇具有关联关系。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Cluster {
     pub cluster_num: u64,
@@ -70,7 +75,7 @@ impl Eq for Cluster {}
 #[derive(Debug)]
 pub struct FATFileSystem {
     /// 当前文件系统所在的分区
-    pub partition: Arc<Partition>,
+    pub gendisk: Arc<GenDisk>,
     /// 当前文件系统的BOPB
     pub bpb: BiosParameterBlock,
     /// 当前文件系统的第一个数据扇区（相对分区开始位置）
@@ -117,6 +122,9 @@ pub struct FATInode {
 
     /// 目录名
     dname: DName,
+
+    /// 页缓存
+    page_cache: Option<Arc<PageCache>>,
 }
 
 impl FATInode {
@@ -214,7 +222,13 @@ impl LockedFATInode {
             },
             special_node: None,
             dname,
+            page_cache: None,
         })));
+
+        if !inode.0.lock().inode_type.is_dir() {
+            let page_cache = PageCache::new(Some(Arc::downgrade(&inode) as Weak<dyn IndexNode>));
+            inode.0.lock().page_cache = Some(page_cache);
+        }
 
         inode.0.lock().self_ref = Arc::downgrade(&inode);
 
@@ -270,6 +284,19 @@ impl FileSystem for FATFileSystem {
             FAT_MAX_NAMELEN,
         )
     }
+
+    unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        PageFaultHandler::filemap_fault(pfm)
+    }
+
+    unsafe fn map_pages(
+        &self,
+        pfm: &mut PageFaultMessage,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
+        PageFaultHandler::filemap_map_pages(pfm, start_pgoff, end_pgoff)
+    }
 }
 
 impl FATFileSystem {
@@ -280,17 +307,16 @@ impl FATFileSystem {
     /// FAT32允许的最大簇号
     pub const FAT32_MAX_CLUSTER: u32 = 0x0FFFFFF7;
 
-    pub fn new(partition: Arc<Partition>) -> Result<Arc<FATFileSystem>, SystemError> {
-        let bpb = BiosParameterBlock::new(partition.clone())?;
-
+    pub fn new(gendisk: Arc<GenDisk>) -> Result<Arc<FATFileSystem>, SystemError> {
+        let bpb = BiosParameterBlock::new(&gendisk)?;
         // 从磁盘上读取FAT32文件系统的FsInfo结构体
         let fs_info: FATFsInfo = match bpb.fat_type {
             FATType::FAT32(bpb32) => {
-                let fs_info_in_disk_bytes_offset = partition.lba_start * LBA_SIZE as u64
-                    + bpb32.fs_info as u64 * bpb.bytes_per_sector as u64;
+                let fs_info_in_gendisk_bytes_offset =
+                    bpb32.fs_info as usize * bpb.bytes_per_sector as usize;
                 FATFsInfo::new(
-                    partition.clone(),
-                    fs_info_in_disk_bytes_offset,
+                    &gendisk,
+                    fs_info_in_gendisk_bytes_offset,
                     bpb.bytes_per_sector as usize,
                 )?
             }
@@ -347,10 +373,11 @@ impl FATFileSystem {
             },
             special_node: None,
             dname: DName::default(),
+            page_cache: None,
         })));
 
         let result: Arc<FATFileSystem> = Arc::new(FATFileSystem {
-            partition,
+            gendisk,
             bpb,
             first_data_sector,
             fs_info: Arc::new(LockedFATFsInfo::new(fs_info)),
@@ -397,17 +424,14 @@ impl FATFileSystem {
         let fat_bytes_offset =
             fat_type.get_fat_bytes_offset(cluster, fat_start_sector, bytes_per_sec);
 
-        // FAT表项所在的LBA地址
-        // let fat_ent_lba = self.get_lba_from_offset(self.bytes_to_sector(fat_bytes_offset));
-        let fat_ent_lba = self.partition.lba_start + fat_bytes_offset / LBA_SIZE as u64;
+        // FAT表项所在的分区内LBA地址
+        let fat_ent_lba = fat_bytes_offset / LBA_SIZE as u64;
 
         // FAT表项在逻辑块内的字节偏移量
         let blk_offset = self.get_in_block_offset(fat_bytes_offset);
 
         let mut v: Vec<u8> = vec![0; self.bpb.bytes_per_sector as usize];
-        self.partition
-            .disk()
-            .read_at(fat_ent_lba as usize, self.lba_per_sector(), &mut v)?;
+        self.gendisk.read_at(&mut v, fat_ent_lba as usize)?;
 
         let mut cursor = VecCursor::new(v);
         cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
@@ -491,16 +515,14 @@ impl FATFileSystem {
         let fat_bytes_offset =
             fat_type.get_fat_bytes_offset(cluster, fat_start_sector, bytes_per_sec);
 
-        // FAT表项所在的LBA地址
-        let fat_ent_lba = self.get_lba_from_offset(self.bytes_to_sector(fat_bytes_offset));
+        // FAT表项所在的分区内LBA地址
+        let fat_ent_lba = self.gendisk_lba_from_offset(self.bytes_to_sector(fat_bytes_offset));
 
         // FAT表项在逻辑块内的字节偏移量
         let blk_offset = self.get_in_block_offset(fat_bytes_offset);
 
         let mut v: Vec<u8> = vec![0; self.bpb.bytes_per_sector as usize];
-        self.partition
-            .disk()
-            .read_at(fat_ent_lba, self.lba_per_sector(), &mut v)?;
+        self.gendisk.read_at(&mut v, fat_ent_lba)?;
 
         let mut cursor = VecCursor::new(v);
         cursor.seek(SeekFrom::SeekSet(blk_offset as i64))?;
@@ -528,24 +550,24 @@ impl FATFileSystem {
         return Ok(res);
     }
 
-    /// @brief 获取当前文件系统的root inode，在磁盘上的字节偏移量
+    /// @brief 获取当前文件系统的root inode，在分区内的字节偏移量
     pub fn root_dir_bytes_offset(&self) -> u64 {
         match self.bpb.fat_type {
             FATType::FAT32(s) => {
                 let first_sec_cluster: u64 = (s.root_cluster as u64 - 2)
                     * (self.bpb.sector_per_cluster as u64)
                     + self.first_data_sector;
-                return (self.get_lba_from_offset(first_sec_cluster) * LBA_SIZE) as u64;
+                return (self.gendisk_lba_from_offset(first_sec_cluster) * LBA_SIZE) as u64;
             }
             _ => {
                 let root_sec = (self.bpb.rsvd_sec_cnt as u64)
                     + (self.bpb.num_fats as u64) * (self.bpb.fat_size_16 as u64);
-                return (self.get_lba_from_offset(root_sec) * LBA_SIZE) as u64;
+                return (self.gendisk_lba_from_offset(root_sec) * LBA_SIZE) as u64;
             }
         }
     }
 
-    /// @brief 获取当前文件系统的根目录项区域的结束位置，在磁盘上的字节偏移量。
+    /// @brief 获取当前文件系统的根目录项区域的结束位置，在分区内的字节偏移量。
     /// 请注意，当前函数只对FAT12/FAT16生效。对于FAT32,返回None
     pub fn root_dir_end_bytes_offset(&self) -> Option<u64> {
         match self.bpb.fat_type {
@@ -560,14 +582,14 @@ impl FATFileSystem {
         }
     }
 
-    /// @brief 获取簇在磁盘内的字节偏移量(相对磁盘起始位置。注意，不是分区内偏移量)
+    /// 获取簇在分区内的字节偏移量
     pub fn cluster_bytes_offset(&self, cluster: Cluster) -> u64 {
         if cluster.cluster_num >= 2 {
             // 指定簇的第一个扇区号
             let first_sec_of_cluster = (cluster.cluster_num - 2)
                 * (self.bpb.sector_per_cluster as u64)
                 + self.first_data_sector;
-            return (self.get_lba_from_offset(first_sec_of_cluster) * LBA_SIZE) as u64;
+            return first_sec_of_cluster * (self.bpb.bytes_per_sector as u64);
         } else {
             return 0;
         }
@@ -642,7 +664,7 @@ impl FATFileSystem {
             self.set_entry(cluster, FATEntry::Unused)?;
             self.fs_info.0.lock().update_free_count_delta(1);
             // 安全选项：清空被释放的簇
-            #[cfg(feature = "secure")]
+            #[cfg(feature = "fatfs-secure")]
             self.zero_cluster(cluster)?;
             return Ok(());
         } else {
@@ -726,11 +748,10 @@ impl FATFileSystem {
         }
     }
 
-    /// @brief 根据分区内的扇区偏移量，获得在磁盘上的LBA地址
+    /// 获取分区内的扇区偏移量
     #[inline]
-    pub fn get_lba_from_offset(&self, in_partition_sec_offset: u64) -> usize {
-        return (self.partition.lba_start
-            + in_partition_sec_offset * (self.bpb.bytes_per_sector as u64 / LBA_SIZE as u64))
+    pub fn gendisk_lba_from_offset(&self, in_partition_sec_offset: u64) -> usize {
+        return (in_partition_sec_offset * (self.bpb.bytes_per_sector as u64 / LBA_SIZE as u64))
             as usize;
     }
 
@@ -744,12 +765,6 @@ impl FATFileSystem {
     #[inline]
     pub fn bytes_to_sector(&self, in_partition_bytes_offset: u64) -> u64 {
         return in_partition_bytes_offset / (self.bpb.bytes_per_sector as u64);
-    }
-
-    /// @brief 根据磁盘上的字节偏移量，获取对应位置在分区内的字节偏移量
-    #[inline]
-    pub fn get_in_partition_bytes_offset(&self, disk_bytes_offset: u64) -> u64 {
-        return disk_bytes_offset - (self.partition.lba_start * LBA_SIZE as u64);
     }
 
     /// @brief 根据字节偏移量计算在逻辑块内的字节偏移量
@@ -887,13 +902,13 @@ impl FATFileSystem {
 
     /// @brief 执行文件系统卸载前的一些准备工作：设置好对应的标志位，并把缓存中的数据刷入磁盘
     pub fn umount(&mut self) -> Result<(), SystemError> {
-        self.fs_info.0.lock().flush(&self.partition)?;
+        self.fs_info.0.lock().flush(&self.gendisk)?;
 
         self.set_shut_bit_ok()?;
 
         self.set_hard_error_bit_ok()?;
 
-        self.partition.disk().sync()?;
+        self.gendisk.sync()?;
 
         return Ok(());
     }
@@ -958,12 +973,12 @@ impl FATFileSystem {
                     fat_type.get_fat_bytes_offset(start_cluster, fat_start_sector, bytes_per_sec);
                 let in_block_offset = self.get_in_block_offset(part_bytes_offset);
 
-                let lba = self.get_lba_from_offset(self.bytes_to_sector(part_bytes_offset));
+                let lba = self.gendisk_lba_from_offset(self.bytes_to_sector(part_bytes_offset));
 
                 // 由于FAT12的FAT表不大于6K，因此直接读取6K
                 let num_lba = (6 * 1024) / LBA_SIZE;
                 let mut v: Vec<u8> = vec![0; num_lba * LBA_SIZE];
-                self.partition.disk().read_at(lba, num_lba, &mut v)?;
+                self.gendisk.read_at(&mut v, lba)?;
 
                 let mut cursor: VecCursor = VecCursor::new(v);
                 cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
@@ -1005,12 +1020,10 @@ impl FATFileSystem {
                     );
                     let in_block_offset = self.get_in_block_offset(part_bytes_offset);
 
-                    let lba = self.get_lba_from_offset(self.bytes_to_sector(part_bytes_offset));
+                    let lba = self.gendisk_lba_from_offset(self.bytes_to_sector(part_bytes_offset));
 
                     let mut v: Vec<u8> = vec![0; self.lba_per_sector() * LBA_SIZE];
-                    self.partition
-                        .disk()
-                        .read_at_sync(lba, self.lba_per_sector(), &mut v)?;
+                    self.gendisk.read_at(&mut v, lba)?;
 
                     let mut cursor: VecCursor = VecCursor::new(v);
                     cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
@@ -1036,12 +1049,10 @@ impl FATFileSystem {
                     );
                     let in_block_offset = self.get_in_block_offset(part_bytes_offset);
 
-                    let lba = self.get_lba_from_offset(self.bytes_to_sector(part_bytes_offset));
+                    let lba = self.gendisk_lba_from_offset(self.bytes_to_sector(part_bytes_offset));
 
                     let mut v: Vec<u8> = vec![0; self.lba_per_sector() * LBA_SIZE];
-                    self.partition
-                        .disk()
-                        .read_at_sync(lba, self.lba_per_sector(), &mut v)?;
+                    self.gendisk.read_at(&mut v, lba)?;
 
                     let mut cursor: VecCursor = VecCursor::new(v);
                     cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
@@ -1084,10 +1095,10 @@ impl FATFileSystem {
 
                 let in_block_offset = self.get_in_block_offset(fat_part_bytes_offset);
 
-                let lba = self.get_lba_from_offset(self.bytes_to_sector(fat_part_bytes_offset));
+                let lba = self.gendisk_lba_from_offset(self.bytes_to_sector(fat_part_bytes_offset));
 
                 let mut v: Vec<u8> = vec![0; LBA_SIZE];
-                self.partition.disk().read_at_sync(lba, 1, &mut v)?;
+                self.gendisk.read_at(&mut v, lba)?;
 
                 let mut cursor: VecCursor = VecCursor::new(v);
                 cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
@@ -1102,7 +1113,7 @@ impl FATFileSystem {
                 // 写回数据到磁盘上
                 cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
                 cursor.write_u16(new_val)?;
-                self.partition.disk().write_at(lba, 1, cursor.as_slice())?;
+                self.gendisk.write_at(cursor.as_slice(), lba)?;
                 return Ok(());
             }
             FATType::FAT16(_) => {
@@ -1116,16 +1127,16 @@ impl FATFileSystem {
 
                 let in_block_offset = self.get_in_block_offset(fat_part_bytes_offset);
 
-                let lba = self.get_lba_from_offset(self.bytes_to_sector(fat_part_bytes_offset));
+                let lba = self.gendisk_lba_from_offset(self.bytes_to_sector(fat_part_bytes_offset));
 
                 let mut v: Vec<u8> = vec![0; LBA_SIZE];
-                self.partition.disk().read_at(lba, 1, &mut v)?;
+                self.gendisk.read_at(&mut v, lba)?;
 
                 let mut cursor: VecCursor = VecCursor::new(v);
                 cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
 
                 cursor.write_u16(raw_val)?;
-                self.partition.disk().write_at(lba, 1, cursor.as_slice())?;
+                self.gendisk.write_at(cursor.as_slice(), lba)?;
 
                 return Ok(());
             }
@@ -1141,11 +1152,11 @@ impl FATFileSystem {
                     // 当前操作的FAT表在磁盘上的字节偏移量
                     let f_offset: u64 = fat_part_bytes_offset + i * fat_size;
                     let in_block_offset: u64 = self.get_in_block_offset(f_offset);
-                    let lba = self.get_lba_from_offset(self.bytes_to_sector(f_offset));
+                    let lba = self.gendisk_lba_from_offset(self.bytes_to_sector(f_offset));
 
                     // debug!("set entry, lba={lba}, in_block_offset={in_block_offset}");
                     let mut v: Vec<u8> = vec![0; LBA_SIZE];
-                    self.partition.disk().read_at(lba, 1, &mut v)?;
+                    self.gendisk.read_at(&mut v, lba)?;
 
                     let mut cursor: VecCursor = VecCursor::new(v);
                     cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
@@ -1180,7 +1191,7 @@ impl FATFileSystem {
                     cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
                     cursor.write_u32(raw_val)?;
 
-                    self.partition.disk().write_at(lba, 1, cursor.as_slice())?;
+                    self.gendisk.write_at(cursor.as_slice(), lba)?;
                 }
 
                 return Ok(());
@@ -1188,16 +1199,15 @@ impl FATFileSystem {
         }
     }
 
-    /// @brief 清空指定的簇
+    /// # 清空指定的簇
     ///
-    /// @param cluster 要被清空的簇
+    /// # 参数
+    /// - cluster 要被清空的簇
     pub fn zero_cluster(&self, cluster: Cluster) -> Result<(), SystemError> {
         // 准备数据，用于写入
         let zeros: Vec<u8> = vec![0u8; self.bytes_per_cluster() as usize];
-        let offset: usize = self.cluster_bytes_offset(cluster) as usize;
-        self.partition
-            .disk()
-            .write_at_bytes(offset, zeros.len(), zeros.as_slice())?;
+        let offset = self.cluster_bytes_offset(cluster) as usize;
+        self.gendisk.write_at_bytes(&zeros, offset)?;
         return Ok(());
     }
 }
@@ -1224,19 +1234,18 @@ impl FATFsInfo {
     /// @brief 从磁盘上读取FAT文件系统的FSInfo结构体
     ///
     /// @param partition 磁盘分区
-    /// @param in_disk_fs_info_offset FSInfo扇区在磁盘内的字节偏移量（单位：字节）
+    /// @param in_gendisk_fs_info_offset FSInfo扇区在gendisk内的字节偏移量（单位：字节）
     /// @param bytes_per_sec 每扇区字节数
     pub fn new(
-        partition: Arc<Partition>,
-        in_disk_fs_info_offset: u64,
+        gendisk: &Arc<GenDisk>,
+        in_gendisk_fs_info_offset: usize,
         bytes_per_sec: usize,
     ) -> Result<Self, SystemError> {
         let mut v = vec![0; bytes_per_sec];
 
-        // 计算fs_info扇区在磁盘上的字节偏移量，从磁盘读取数据
-        partition
-            .disk()
-            .read_at_sync(in_disk_fs_info_offset as usize / LBA_SIZE, 1, &mut v)?;
+        // 读取磁盘上的FsInfo扇区
+        gendisk.read_at_bytes(&mut v, in_gendisk_fs_info_offset)?;
+
         let mut cursor = VecCursor::new(v);
 
         let mut fsinfo = FATFsInfo {
@@ -1252,7 +1261,7 @@ impl FATFsInfo {
 
         fsinfo.trail_sig = cursor.read_u32()?;
         fsinfo.dirty = false;
-        fsinfo.offset = Some(in_disk_fs_info_offset);
+        fsinfo.offset = Some(gendisk.disk_bytes_offset(in_gendisk_fs_info_offset) as u64);
 
         if fsinfo.is_valid() {
             return Ok(fsinfo);
@@ -1321,14 +1330,14 @@ impl FATFsInfo {
     /// @brief 把fs info刷入磁盘
     ///
     /// @param partition fs info所在的分区
-    pub fn flush(&self, partition: &Arc<Partition>) -> Result<(), SystemError> {
+    pub fn flush(&self, gendisk: &Arc<GenDisk>) -> Result<(), SystemError> {
         if let Some(off) = self.offset {
             let in_block_offset = off % LBA_SIZE as u64;
 
             let lba = off as usize / LBA_SIZE;
 
             let mut v: Vec<u8> = vec![0; LBA_SIZE];
-            partition.disk().read_at(lba, 1, &mut v)?;
+            gendisk.read_at(&mut v, lba)?;
 
             let mut cursor: VecCursor = VecCursor::new(v);
             cursor.seek(SeekFrom::SeekSet(in_block_offset as i64))?;
@@ -1341,7 +1350,7 @@ impl FATFsInfo {
             cursor.seek(SeekFrom::SeekCurrent(12))?;
             cursor.write_u32(self.trail_sig)?;
 
-            partition.disk().write_at(lba, 1, cursor.as_slice())?;
+            gendisk.write_at(cursor.as_slice(), lba)?;
         }
         return Ok(());
     }
@@ -1840,6 +1849,10 @@ impl IndexNode for LockedFATInode {
             .upgrade()
             .map(|item| item as Arc<dyn IndexNode>)
             .ok_or(SystemError::EINVAL)
+    }
+
+    fn page_cache(&self) -> Option<Arc<PageCache>> {
+        self.0.lock().page_cache.clone()
     }
 }
 

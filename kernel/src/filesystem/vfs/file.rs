@@ -5,10 +5,14 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use kdepends::xarray::XArray;
 use log::error;
 use system_error::SystemError;
 
+use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
+use crate::filesystem::eventfd::EventFdInode;
 use crate::{
+    arch::MMArch,
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
         tty::tty_device::TtyFilePrivateData,
@@ -16,14 +20,13 @@ use crate::{
     filesystem::procfs::ProcfsFilePrivateData,
     ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
     libs::{rwlock::RwLock, spinlock::SpinLock},
+    mm::{page::Page, MemoryManagementArch},
     net::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
         socket::SocketInode,
     },
-    process::ProcessManager,
+    process::{cred::Cred, ProcessManager},
 };
-
-use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
@@ -118,6 +121,66 @@ impl FileMode {
         return self.bits() & FileMode::O_ACCMODE.bits();
     }
 }
+
+/// 页面缓存
+pub struct PageCache {
+    xarray: SpinLock<XArray<Arc<Page>>>,
+    inode: Option<Weak<dyn IndexNode>>,
+}
+
+impl core::fmt::Debug for PageCache {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PageCache")
+            .field(
+                "xarray",
+                &self
+                    .xarray
+                    .lock()
+                    .range(0..((MMArch::PAGE_ADDRESS_SIZE >> MMArch::PAGE_SHIFT) as u64))
+                    .map(|(_, r)| (*r).clone())
+                    .collect::<Vec<Arc<Page>>>(),
+            )
+            .finish()
+    }
+}
+
+impl PageCache {
+    pub fn new(inode: Option<Weak<dyn IndexNode>>) -> Arc<PageCache> {
+        let page_cache = Self {
+            xarray: SpinLock::new(XArray::new()),
+            inode,
+        };
+        Arc::new(page_cache)
+    }
+
+    pub fn inode(&self) -> Option<Weak<dyn IndexNode>> {
+        self.inode.clone()
+    }
+
+    pub fn add_page(&self, offset: usize, page: &Arc<Page>) {
+        let mut guard = self.xarray.lock();
+        let mut cursor = guard.cursor_mut(offset as u64);
+        cursor.store(page.clone());
+    }
+
+    pub fn get_page(&self, offset: usize) -> Option<Arc<Page>> {
+        let mut guard = self.xarray.lock();
+        let mut cursor = guard.cursor_mut(offset as u64);
+        let page = cursor.load().map(|r| (*r).clone());
+        page
+    }
+
+    pub fn remove_page(&self, offset: usize) {
+        let mut guard = self.xarray.lock();
+        let mut cursor = guard.cursor_mut(offset as u64);
+        cursor.remove();
+    }
+
+    pub fn set_inode(&mut self, inode: Weak<dyn IndexNode>) {
+        self.inode = Some(inode)
+    }
+}
+
 /// @brief 抽象文件结构体
 #[derive(Debug)]
 pub struct File {
@@ -131,6 +194,8 @@ pub struct File {
     /// readdir时候用的，暂存的本次循环中，所有子目录项的名字的数组
     readdir_subdirs_name: SpinLock<Vec<String>>,
     pub private_data: SpinLock<FilePrivateData>,
+    /// 文件的凭证
+    cred: Cred,
 }
 
 impl File {
@@ -154,6 +219,7 @@ impl File {
             file_type,
             readdir_subdirs_name: SpinLock::new(Vec::default()),
             private_data: SpinLock::new(FilePrivateData::default()),
+            cred: ProcessManager::current_pcb().cred(),
         };
         f.inode.open(f.private_data.lock(), &mode)?;
 
@@ -233,7 +299,14 @@ impl File {
 
         let len = self
             .inode
-            .read_at(offset, len, buf, self.private_data.lock())?;
+            .read_at(offset, len, buf, self.private_data.lock())
+            .map_err(|e| {
+                if e == SystemError::ERESTARTSYS {
+                    SystemError::EINTR
+                } else {
+                    e
+                }
+            })?;
 
         if update_offset {
             self.offset
@@ -258,11 +331,24 @@ impl File {
 
         // 如果文件指针已经超过了文件大小，则需要扩展文件大小
         if offset > self.inode.metadata()?.size as usize {
-            self.inode.resize(offset)?;
+            self.inode.resize(offset).map_err(|e| {
+                if e == SystemError::ERESTARTSYS {
+                    SystemError::EINTR
+                } else {
+                    e
+                }
+            })?;
         }
         let len = self
             .inode
-            .write_at(offset, len, buf, self.private_data.lock())?;
+            .write_at(offset, len, buf, self.private_data.lock())
+            .map_err(|e| {
+                if e == SystemError::ERESTARTSYS {
+                    SystemError::EINTR
+                } else {
+                    e
+                }
+            })?;
 
         if update_offset {
             self.offset
@@ -408,6 +494,7 @@ impl File {
             file_type: self.file_type,
             readdir_subdirs_name: SpinLock::new(self.readdir_subdirs_name.lock().clone()),
             private_data: SpinLock::new(self.private_data.lock().clone()),
+            cred: self.cred.clone(),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
         if self
@@ -509,9 +596,19 @@ impl File {
                 let inode = self.inode.downcast_ref::<SocketInode>().unwrap();
                 let mut socket = inode.inner();
 
-                return socket.remove_epoll(epoll);
+                socket.remove_epoll(epoll)
             }
-            _ => return Err(SystemError::ENOSYS),
+            FileType::Pipe => {
+                let inode = self.inode.downcast_ref::<LockedPipeInode>().unwrap();
+                inode.inner().lock().remove_epoll(epoll)
+            }
+            _ => {
+                let inode = self
+                    .inode
+                    .downcast_ref::<EventFdInode>()
+                    .ok_or(SystemError::ENOSYS)?;
+                inode.remove_epoll(epoll)
+            }
         }
     }
 
@@ -541,7 +638,11 @@ pub struct FileDescriptorVec {
     /// 当前进程打开的文件描述符
     fds: Vec<Option<Arc<File>>>,
 }
-
+impl Default for FileDescriptorVec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl FileDescriptorVec {
     pub const PROCESS_MAX_FD: usize = 1024;
 
@@ -639,14 +740,13 @@ impl FileDescriptorVec {
     /// ## 参数
     ///
     /// - `fd` 文件描述符序号
-    pub fn drop_fd(&mut self, fd: i32) -> Result<(), SystemError> {
+    pub fn drop_fd(&mut self, fd: i32) -> Result<Arc<File>, SystemError> {
         self.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
 
         // 把文件描述符数组对应位置设置为空
         let file = self.fds[fd as usize].take().unwrap();
 
-        assert!(Arc::strong_count(&file) == 1);
-        return Ok(());
+        return Ok(file);
     }
 
     #[allow(dead_code)]

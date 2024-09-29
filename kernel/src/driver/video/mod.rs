@@ -9,10 +9,7 @@ use crate::{
         rwlock::{RwLock, RwLockReadGuard},
         spinlock::SpinLock,
     },
-    mm::{
-        allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper, page::PageFlags,
-        MemoryManagementArch,
-    },
+    mm::{mmio_buddy::mmio_pool, page::EntryFlags},
     time::timer::{Timer, TimerFunction},
 };
 use alloc::{boxed::Box, sync::Arc};
@@ -74,46 +71,33 @@ impl VideoRefreshManager {
     }
 
     /**
-     * @brief VBE帧缓存区的地址重新映射
-     * 将帧缓存区映射到地址SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE处
+     * VBE帧缓存区的地址重新映射
      */
     fn init_frame_buffer(&self) {
         info!("Re-mapping VBE frame buffer...");
-        let buf_vaddr = boot_params()
-            .read_irqsave()
-            .screen_info
-            .lfb_virt_base
-            .unwrap();
+        let mut bp = boot_params().write_irqsave();
+        let buf_size = bp.screen_info.lfb_size;
 
-        let mut frame_buffer_info_guard = self.device_buffer.write();
+        let mmio_guard = mmio_pool().create_mmio(page_align_up(buf_size)).unwrap();
+        let mmio_guard = Arc::new(mmio_guard);
+        let buf_vaddr = mmio_guard.vaddr();
+        bp.screen_info.lfb_virt_base = Some(buf_vaddr);
+
+        let mut frame_buffer_info_guard: crate::libs::rwlock::RwLockWriteGuard<ScmBufferInfo> =
+            self.device_buffer.write();
+        unsafe { frame_buffer_info_guard.set_device_buffer_mmio_guard(mmio_guard.clone()) };
         if let ScmBuffer::DeviceBuffer(vaddr) = &mut (frame_buffer_info_guard).buf {
             *vaddr = buf_vaddr;
         }
-
         // 地址映射
-        let mut paddr = boot_params().read().screen_info.lfb_base;
-        let count = PageFrameCount::new(
-            page_align_up(frame_buffer_info_guard.buf_size()) / MMArch::PAGE_SIZE,
-        );
-        let page_flags: PageFlags<MMArch> = PageFlags::new().set_execute(true).set_write(true);
+        let paddr = bp.screen_info.lfb_base;
+        let page_flags: EntryFlags<MMArch> = EntryFlags::new().set_execute(true).set_write(true);
 
-        let mut kernel_mapper = KernelMapper::lock();
-        let mut kernel_mapper = kernel_mapper.as_mut();
-        assert!(kernel_mapper.is_some());
-        let mut vaddr = buf_vaddr;
         unsafe {
-            for _ in 0..count.data() {
-                let flusher = kernel_mapper
-                    .as_mut()
-                    .unwrap()
-                    .map_phys(vaddr, paddr, page_flags)
-                    .unwrap();
-
-                flusher.flush();
-                vaddr += MMArch::PAGE_SIZE;
-                paddr += MMArch::PAGE_SIZE;
-            }
-        }
+            mmio_guard
+                .map_phys_with_flags(paddr, page_align_up(buf_size), page_flags)
+                .expect("Failed to map VBE frame buffer!")
+        };
 
         info!("VBE frame buffer successfully Re-mapped!");
     }
@@ -196,6 +180,7 @@ impl VideoRefreshManager {
                 screen_info.lfb_depth.into(),
                 buf_flag,
                 buf_vaddr,
+                None,
             )
             .unwrap();
         } else {
@@ -208,6 +193,7 @@ impl VideoRefreshManager {
                 screen_info.lfb_depth.into(),
                 buf_flag,
                 buf_vaddr,
+                None,
             )
             .unwrap();
         }

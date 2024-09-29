@@ -10,8 +10,11 @@ use crate::{
     driver::{
         base::{
             class::Class,
-            device::{bus::Bus, device_manager, driver::Driver, Device, DeviceType, IdTable},
-            kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+            device::{
+                bus::Bus, device_manager, driver::Driver, Device, DeviceCommonData, DeviceType,
+                IdTable,
+            },
+            kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
         },
         tty::virtual_terminal::virtual_console::{CursorOperation, VcCursor, VirtualConsoleData},
@@ -89,12 +92,8 @@ struct InnerFbConsoleManager {}
 
 #[derive(Debug)]
 struct InnerFbConsoleDevice {
-    kernfs_inode: Option<Arc<KernFSInode>>,
-    parent: Option<Weak<dyn KObject>>,
-    kset: Option<Arc<KSet>>,
-    bus: Option<Weak<dyn Bus>>,
-    driver: Option<Weak<dyn Driver>>,
-    ktype: Option<&'static dyn KObjType>,
+    device_common: DeviceCommonData,
+    kobject_common: KObjectCommonData,
 }
 
 /// `/sys/class/graphics/fbcon`代表的 framebuffer console 设备
@@ -111,15 +110,15 @@ impl FbConsoleDevice {
     pub fn new() -> Arc<Self> {
         return Arc::new(Self {
             inner: SpinLock::new(InnerFbConsoleDevice {
-                kernfs_inode: None,
-                parent: None,
-                kset: None,
-                bus: None,
-                ktype: None,
-                driver: None,
+                device_common: DeviceCommonData::default(),
+                kobject_common: KObjectCommonData::default(),
             }),
             kobj_state: LockedKObjectState::new(None),
         });
+    }
+
+    fn inner(&self) -> SpinLockGuard<InnerFbConsoleDevice> {
+        self.inner.lock()
     }
 }
 
@@ -129,35 +128,35 @@ impl KObject for FbConsoleDevice {
     }
 
     fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
-        self.inner.lock().kernfs_inode = inode;
+        self.inner().kobject_common.kern_inode = inode;
     }
 
     fn inode(&self) -> Option<Arc<KernFSInode>> {
-        self.inner.lock().kernfs_inode.clone()
+        self.inner().kobject_common.kern_inode.clone()
     }
 
     fn parent(&self) -> Option<Weak<dyn KObject>> {
-        self.inner.lock().parent.clone()
+        self.inner().kobject_common.parent.clone()
     }
 
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
-        self.inner.lock().parent = parent;
+        self.inner().kobject_common.parent = parent;
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {
-        self.inner.lock().kset.clone()
+        self.inner().kobject_common.kset.clone()
     }
 
     fn set_kset(&self, kset: Option<Arc<KSet>>) {
-        self.inner.lock().kset = kset;
+        self.inner().kobject_common.kset = kset;
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.inner.lock().ktype
+        self.inner().kobject_common.kobj_type
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
-        self.inner.lock().ktype = ktype;
+        self.inner().kobject_common.kobj_type = ktype;
     }
 
     fn name(&self) -> String {
@@ -191,11 +190,11 @@ impl Device for FbConsoleDevice {
     }
 
     fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
-        self.inner.lock().bus = bus;
+        self.inner().device_common.bus = bus;
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {
-        self.inner.lock().bus.clone()
+        self.inner().device_common.bus.clone()
     }
 
     fn set_class(&self, _class: Option<Weak<dyn Class>>) {
@@ -208,27 +207,27 @@ impl Device for FbConsoleDevice {
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
-        self.inner
-            .lock()
+        self.inner()
+            .device_common
             .driver
             .clone()
             .and_then(|driver| driver.upgrade())
     }
 
     fn set_driver(&self, driver: Option<Weak<dyn Driver>>) {
-        self.inner.lock().driver = driver;
+        self.inner().device_common.driver = driver;
     }
 
     fn is_dead(&self) -> bool {
-        todo!()
+        self.inner().device_common.dead
     }
 
     fn can_match(&self) -> bool {
-        todo!()
+        self.inner().device_common.can_match
     }
 
-    fn set_can_match(&self, _can_match: bool) {
-        todo!()
+    fn set_can_match(&self, can_match: bool) {
+        self.inner().device_common.can_match = can_match;
     }
 
     fn state_synced(&self) -> bool {
@@ -237,6 +236,14 @@ impl Device for FbConsoleDevice {
 
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
         return Some(&[&AnonymousAttributeGroup]);
+    }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        self.inner().device_common.get_parent_weak_or_clear()
+    }
+
+    fn set_dev_parent(&self, dev_parent: Option<Weak<dyn Device>>) {
+        self.inner().device_common.parent = dev_parent;
     }
 }
 
@@ -341,12 +348,12 @@ impl Attribute for AttrCursorBlink {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct FrameBufferConsoleData {
     /// 光标闪烁间隔
     pub cursor_blink_jiffies: i64,
     /// 是否刷新光标
     pub cursor_flash: bool,
-    ///
     pub display: FbConsoleDisplay,
     /// 光标状态
     pub cursor_state: FbCursor,

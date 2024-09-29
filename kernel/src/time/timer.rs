@@ -366,11 +366,17 @@ pub fn try_raise_timer_softirq() {
     }
 }
 
+/// 处理本地定时器中断
+pub fn run_local_timer() {
+    assert!(!CurrentIrqArch::is_irq_enabled());
+    try_raise_timer_softirq();
+}
+
 /// 更新系统时间片
-pub fn update_timer_jiffies(add_jiffies: u64, time_us: i64) -> u64 {
+pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
     let prev = TIMER_JIFFIES.fetch_add(add_jiffies, Ordering::SeqCst);
     compiler_fence(Ordering::SeqCst);
-    update_wall_time(time_us);
+    update_wall_time();
 
     compiler_fence(Ordering::SeqCst);
     return prev + add_jiffies;

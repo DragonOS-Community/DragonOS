@@ -1,0 +1,23 @@
+{
+  "name": "test_tokio",
+  "version": "0.1.0",
+  "description": "测试tokio",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "apps/test_tokio"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "target_arch": ["x86_64"]
+}

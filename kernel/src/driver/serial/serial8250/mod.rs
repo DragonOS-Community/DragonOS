@@ -16,9 +16,9 @@ use crate::{
         class::Class,
         device::{
             bus::Bus, device_manager, device_number::DeviceNumber, driver::Driver, Device,
-            DeviceKObjType, DeviceState, DeviceType, IdTable,
+            DeviceCommonData, DeviceKObjType, DeviceState, DeviceType, IdTable,
         },
-        kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+        kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,
         platform::{
             platform_device::{platform_device_manager, PlatformDevice},
@@ -141,6 +141,7 @@ impl Serial8250Manager {
 }
 
 /// 所有的8250串口设备都应该实现的trait
+#[allow(dead_code)]
 trait Serial8250Port: UartPort {
     fn device(&self) -> Option<Arc<Serial8250ISADevices>> {
         None
@@ -211,11 +212,11 @@ impl Device for Serial8250ISADevices {
         false
     }
     fn bus(&self) -> Option<Weak<dyn Bus>> {
-        self.inner.read().bus.clone()
+        self.inner.read().device_common.bus.clone()
     }
 
     fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
-        self.inner.write().bus = bus;
+        self.inner.write().device_common.bus = bus;
     }
 
     fn dev_type(&self) -> DeviceType {
@@ -227,19 +228,19 @@ impl Device for Serial8250ISADevices {
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
-        self.inner.read().driver.clone()?.upgrade()
+        self.inner.read().device_common.driver.clone()?.upgrade()
     }
 
     fn set_driver(&self, driver: Option<Weak<dyn Driver>>) {
-        self.inner.write().driver = driver;
+        self.inner.write().device_common.driver = driver;
     }
 
     fn can_match(&self) -> bool {
-        self.inner.read().can_match
+        self.inner.read().device_common.can_match
     }
 
     fn set_can_match(&self, can_match: bool) {
-        self.inner.write().can_match = can_match;
+        self.inner.write().device_common.can_match = can_match;
     }
 
     fn state_synced(&self) -> bool {
@@ -249,6 +250,14 @@ impl Device for Serial8250ISADevices {
     fn set_class(&self, _class: Option<Weak<dyn Class>>) {
         todo!()
     }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        self.inner.read().device_common.parent.clone()
+    }
+
+    fn set_dev_parent(&self, dev_parent: Option<Weak<dyn Device>>) {
+        self.inner.write().device_common.parent = dev_parent;
+    }
 }
 
 impl KObject for Serial8250ISADevices {
@@ -257,27 +266,27 @@ impl KObject for Serial8250ISADevices {
     }
 
     fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
-        self.inner.write().inode = inode;
+        self.inner.write().kobject_common.kern_inode = inode;
     }
 
     fn inode(&self) -> Option<Arc<KernFSInode>> {
-        self.inner.read().inode.clone()
+        self.inner.read().kobject_common.kern_inode.clone()
     }
 
     fn parent(&self) -> Option<Weak<dyn KObject>> {
-        self.inner.read().parent_kobj.clone()
+        self.inner.read().kobject_common.parent.clone()
     }
 
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
-        self.inner.write().parent_kobj = parent;
+        self.inner.write().kobject_common.parent = parent;
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {
-        self.inner.read().kset.clone()
+        self.inner.read().kobject_common.kset.clone()
     }
 
     fn set_kset(&self, kset: Option<Arc<KSet>>) {
-        self.inner.write().kset = kset;
+        self.inner.write().kobject_common.kset = kset;
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
@@ -309,27 +318,17 @@ impl KObject for Serial8250ISADevices {
 
 #[derive(Debug)]
 struct InnerSerial8250ISADevices {
-    /// 当前设备所述的kset
-    kset: Option<Arc<KSet>>,
-    parent_kobj: Option<Weak<dyn KObject>>,
-    /// 当前设备所述的总线
-    bus: Option<Weak<dyn Bus>>,
-    inode: Option<Arc<KernFSInode>>,
-    driver: Option<Weak<dyn Driver>>,
+    kobject_common: KObjectCommonData,
+    device_common: DeviceCommonData,
     device_state: DeviceState,
-    can_match: bool,
 }
 
 impl InnerSerial8250ISADevices {
     fn new() -> Self {
         Self {
-            kset: None,
-            parent_kobj: None,
-            bus: None,
-            inode: None,
-            driver: None,
+            kobject_common: KObjectCommonData::default(),
+            device_common: DeviceCommonData::default(),
             device_state: DeviceState::NotInitialized,
-            can_match: false,
         }
     }
 }

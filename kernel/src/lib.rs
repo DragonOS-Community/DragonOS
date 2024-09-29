@@ -6,23 +6,23 @@
 #![feature(concat_idents)]
 #![feature(const_for)]
 #![feature(const_mut_refs)]
+#![feature(const_option)]
 #![feature(const_trait_impl)]
-#![feature(const_transmute_copy)]
 #![feature(const_refs_to_cell)]
 #![feature(core_intrinsics)]
 #![feature(c_void_variant)]
 #![feature(extract_if)]
 #![feature(fn_align)]
-#![feature(inline_const)]
+#![feature(linked_list_retain)]
 #![feature(naked_functions)]
 #![feature(new_uninit)]
-#![feature(panic_info_message)]
 #![feature(ptr_internals)]
-#![feature(ptr_to_from_bits)]
 #![feature(trait_upcasting)]
 #![feature(slice_ptr_get)]
+#![feature(sync_unsafe_cell)]
 #![feature(vec_into_raw_parts)]
 #![cfg_attr(target_os = "none", no_std)]
+#![allow(internal_features)]
 // clippy的配置
 #![deny(clippy::all)]
 #![allow(clippy::bad_bit_mask)]
@@ -55,7 +55,7 @@ mod init;
 mod ipc;
 mod misc;
 mod mm;
-mod namespace;
+mod namespaces;
 mod net;
 mod process;
 mod sched;
@@ -87,10 +87,10 @@ extern crate x86;
 extern crate klog_types;
 extern crate uefi;
 extern crate uefi_raw;
+#[macro_use]
+extern crate wait_queue_macros;
 
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
-
-use crate::process::ProcessManager;
 
 #[cfg(all(feature = "backtrace", target_arch = "x86_64"))]
 extern crate mini_backtrace;
@@ -109,6 +109,7 @@ pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator;
 #[no_mangle]
 pub fn panic(info: &PanicInfo) -> ! {
     use log::error;
+    use process::ProcessManager;
 
     error!("Kernel Panic Occurred.");
 
@@ -125,15 +126,7 @@ pub fn panic(info: &PanicInfo) -> ! {
             println!("No location info");
         }
     }
-
-    match info.message() {
-        Some(msg) => {
-            println!("Message:\n\t{}", msg);
-        }
-        None => {
-            println!("No panic message.");
-        }
-    }
+    println!("Message:\n\t{}", info.message());
 
     #[cfg(all(feature = "backtrace", target_arch = "x86_64"))]
     {

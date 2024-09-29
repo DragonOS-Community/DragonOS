@@ -1,4 +1,4 @@
-use super::cgroup::CgroupSubsysState;
+use super::CgroupSubsysState;
 
 struct MemCgroup {
     css: CgroupSubsysState,

@@ -1,0 +1,8 @@
+[package]
+name = "multiboot"
+version = "0.1.0"
+edition = "2021"
+authors = ["longjin <longjin@dragonos.org>", "Dan Schatzberg <schatzberg.dan@gmail.com>", "Adrian Danis <Adrian.Danis@nicta.com.au>", "Stephane Duverger <stephane.duverger@gmail.com>", "Niklas Sombert <niklas@ytvwld.de>", "Paul Cacheux <paulcacheux@gmail.com>"]
+license = "GPL-2.0"
+
+[dependencies]

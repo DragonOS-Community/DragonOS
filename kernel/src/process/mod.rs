@@ -1,4 +1,5 @@
 use core::{
+    fmt,
     hash::Hash,
     hint::spin_loop,
     intrinsics::{likely, unlikely},
@@ -7,10 +8,12 @@ use core::{
 };
 
 use alloc::{
+    ffi::CString,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
+use cred::INIT_CRED;
 use hashbrown::HashMap;
 use log::{debug, error, info, warn};
 use system_error::SystemError;
@@ -47,7 +50,7 @@ use crate::{
         ucontext::AddressSpace,
         VirtAddr,
     },
-    namespace::{pid_namespace::PidStrcut, NsProxy},
+    namespaces::{pid_namespace::PidStrcut, NsProxy},
     net::socket::SocketInode,
     sched::{
         completion::Completion, cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag,
@@ -62,10 +65,11 @@ use crate::{
 };
 use timer::AlarmTimer;
 
-use self::kthread::WorkerPrivate;
+use self::{cred::Cred, kthread::WorkerPrivate};
 
 pub mod abi;
 pub mod c_adapter;
+pub mod cred;
 pub mod exec;
 pub mod exit;
 pub mod fork;
@@ -511,9 +515,9 @@ pub unsafe fn switch_finish_hook() {
 
 int_like!(Pid, AtomicPid, usize, AtomicUsize);
 
-impl ToString for Pid {
-    fn to_string(&self) -> String {
-        self.0.to_string()
+impl fmt::Display for Pid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -603,7 +607,7 @@ pub struct ProcessControlBlock {
     /// 当前进程的线程组id（这个值在同一个线程组内永远不变）
     tgid: Pid,
     /// 有关Pid的相关的信息
-    thread_pid: Arc<PidStrcut>,
+    thread_pid: Arc<RwLock<PidStrcut>>,
     basic: RwLock<ProcessBasicInfo>,
     /// 当前进程的自旋锁持有计数
     preempt_count: AtomicUsize,
@@ -649,6 +653,9 @@ pub struct ProcessControlBlock {
 
     /// namespace的指针
     nsproxy: Arc<RwLock<NsProxy>>,
+
+    /// 进程作为主体的凭证集
+    cred: SpinLock<Cred>,
 }
 
 impl ProcessControlBlock {
@@ -687,12 +694,16 @@ impl ProcessControlBlock {
 
     #[inline(never)]
     fn do_create_pcb(name: String, kstack: KernelStack, is_idle: bool) -> Arc<Self> {
-        let (pid, ppid, cwd) = if is_idle {
-            (Pid(0), Pid(0), "/".to_string())
+        let (pid, ppid, cwd, cred) = if is_idle {
+            let cred = INIT_CRED.clone();
+            (Pid(0), Pid(0), "/".to_string(), cred)
         } else {
             let ppid = ProcessManager::current_pcb().pid();
+            let mut cred = ProcessManager::current_pcb().cred();
+            cred.cap_permitted = cred.cap_ambient;
+            cred.cap_effective = cred.cap_ambient;
             let cwd = ProcessManager::current_pcb().basic().cwd();
-            (Self::generate_pid(), ppid, cwd)
+            (Self::generate_pid(), ppid, cwd, cred)
         };
 
         let basic_info = ProcessBasicInfo::new(Pid(0), ppid, name, cwd, None);
@@ -709,7 +720,7 @@ impl ProcessControlBlock {
         let pcb = Self {
             pid,
             tgid: pid,
-            thread_pid: Arc::new(pid_strcut),
+            thread_pid: Arc::new(RwLock::new(pid_strcut)),
             basic: basic_info,
             preempt_count,
             flags,
@@ -728,7 +739,8 @@ impl ProcessControlBlock {
             thread: RwLock::new(ThreadInfo::new()),
             alarm_timer: SpinLock::new(None),
             robust_list: RwLock::new(None),
-            nsproxy: Arc::new(RwLock::new(NsProxy::new())),
+            nsproxy: Arc::new(RwLock::new(NsProxy::default())),
+            cred: SpinLock::new(cred),
         };
 
         // 初始化系统调用栈
@@ -871,7 +883,7 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn pid_strcut(&self) -> Arc<PidStrcut> {
+    pub fn pid_strcut(&self) -> Arc<RwLock<PidStrcut>> {
         self.thread_pid.clone()
     }
 
@@ -884,6 +896,11 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn fd_table(&self) -> Arc<RwLock<FileDescriptorVec>> {
         return self.basic.read().fd_table().unwrap();
+    }
+
+    #[inline(always)]
+    pub fn cred(&self) -> Cred {
+        self.cred.lock().clone()
     }
 
     /// 根据文件描述符序号，获取socket对象的Arc指针
@@ -930,11 +947,11 @@ impl ProcessControlBlock {
     }
 
     /// 生成进程的名字
-    pub fn generate_name(program_path: &str, args: &Vec<String>) -> String {
+    pub fn generate_name(program_path: &str, args: &Vec<CString>) -> String {
         let mut name = program_path.to_string();
         for arg in args {
             name.push(' ');
-            name.push_str(arg);
+            name.push_str(arg.to_string_lossy().as_ref());
         }
         return name;
     }
@@ -965,6 +982,14 @@ impl ProcessControlBlock {
         }
 
         return None;
+    }
+
+    /// 判断当前进程是否有未处理的信号
+    pub fn has_pending_signal(&self) -> bool {
+        let sig_info = self.sig_info_irqsave();
+        let has_pending = sig_info.sig_pending().has_pending();
+        drop(sig_info);
+        return has_pending;
     }
 
     pub fn sig_struct(&self) -> SpinLockGuard<SignalStruct> {
@@ -1159,6 +1184,7 @@ pub struct ProcessSchedulerInfo {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct SchedInfo {
     /// 记录任务在特定 CPU 上运行的次数
     pub pcount: usize,
@@ -1171,6 +1197,7 @@ pub struct SchedInfo {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct PrioData {
     pub prio: i32,
     pub static_prio: i32,

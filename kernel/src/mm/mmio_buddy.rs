@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use log::{debug, error, info, warn};
 use system_error::SystemError;
 
-use super::page::{PageFlags, PAGE_4K_SIZE};
+use super::page::{EntryFlags, PAGE_4K_SIZE};
 use super::{PhysAddr, VirtAddr};
 
 // 最大的伙伴块的幂
@@ -55,9 +55,12 @@ impl MmioBuddyMemPool {
             free_regions[i as usize] = MaybeUninit::new(SpinLock::new(MmioFreeRegionList::new()));
         }
         let free_regions = unsafe {
-            mem::transmute::<_, [SpinLock<MmioFreeRegionList>; MMIO_BUDDY_REGION_COUNT as usize]>(
-                free_regions,
-            )
+            mem::transmute::<
+                [core::mem::MaybeUninit<
+                    crate::libs::spinlock::SpinLock<crate::mm::mmio_buddy::MmioFreeRegionList>,
+                >; MMIO_BUDDY_REGION_COUNT as usize],
+                [SpinLock<MmioFreeRegionList>; MMIO_BUDDY_REGION_COUNT as usize],
+            >(free_regions)
         };
 
         let pool = MmioBuddyMemPool {
@@ -549,7 +552,7 @@ impl MmioBuddyMemPool {
             unsafe {
                 let x: Option<(
                     PhysAddr,
-                    PageFlags<MMArch>,
+                    EntryFlags<MMArch>,
                     crate::mm::page::PageFlush<MMArch>,
                 )> = kernel_mapper
                     .as_mut()
@@ -674,7 +677,35 @@ impl MMIOSpaceGuard {
             return Err(SystemError::EINVAL);
         }
 
-        let flags = PageFlags::mmio_flags();
+        let flags = EntryFlags::mmio_flags();
+
+        let mut kernel_mapper = KernelMapper::lock();
+        let r = kernel_mapper.map_phys_with_size(self.vaddr, paddr, length, flags, true);
+        return r;
+    }
+
+    /// 将物理地址填写到虚拟地址空间中
+    ///
+    /// ## Safety
+    ///
+    /// 传入的物理地址【一定要是设备的物理地址】。
+    /// 如果物理地址是从内存分配器中分配的，那么会造成内存泄露。因为mmio_release的时候，只取消映射，不会释放内存。
+    pub unsafe fn map_phys_with_flags(
+        &self,
+        paddr: PhysAddr,
+        length: usize,
+        flags: EntryFlags<MMArch>,
+    ) -> Result<(), SystemError> {
+        if length > self.size {
+            return Err(SystemError::EINVAL);
+        }
+
+        let check = self
+            .mapped
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
+        if check.is_err() {
+            return Err(SystemError::EINVAL);
+        }
 
         let mut kernel_mapper = KernelMapper::lock();
         let r = kernel_mapper.map_phys_with_size(self.vaddr, paddr, length, flags, true);

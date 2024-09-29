@@ -5,7 +5,7 @@ use log::{error, info};
 use system_error::SystemError;
 
 use crate::{
-    driver::base::block::disk_info::Partition,
+    driver::base::block::manager::block_dev_manager,
     filesystem::{
         devfs::devfs_init,
         fat::fs::FATFileSystem,
@@ -25,6 +25,9 @@ use super::{
     utils::{rsplit_path, user_path_at},
     IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
+
+/// 当没有指定根文件系统时，尝试的根文件系统列表
+const ROOTFS_TRY_LIST: [&str; 4] = ["/dev/sda1", "/dev/sda", "/dev/vda1", "/dev/vda"];
 
 /// @brief 原子地生成新的Inode号。
 /// 请注意，所有的inode号都需要通过该函数来生成.全局的inode号，除了以下两个特殊的以外，都是唯一的
@@ -113,39 +116,22 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     return Ok(());
 }
 
-fn root_partition() -> Arc<Partition> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        use alloc::string::ToString;
-        return crate::driver::disk::ahci::get_disks_by_name("ahci_disk_0".to_string())
-            .unwrap()
-            .0
-            .lock()
-            .partitions[0]
-            .clone();
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    {
-        use crate::driver::base::block::block_device::BlockDevice;
-
-        let virtio0 = crate::driver::block::virtio_blk::virtio_blk_0();
-        if virtio0.is_none() {
-            error!("Failed to get virtio_blk_0");
-            loop {
-                spin_loop();
-            }
-        }
-
-        let virtio0 = virtio0.unwrap();
-        return virtio0.partitions()[0].clone();
-    }
-}
 pub fn mount_root_fs() -> Result<(), SystemError> {
-    info!("Try to mount FAT32 as root fs...");
-    let partiton: Arc<Partition> = root_partition();
+    info!("Try to mount root fs...");
+    block_dev_manager().print_gendisks();
 
-    let fatfs: Result<Arc<FATFileSystem>, SystemError> = FATFileSystem::new(partiton);
+    let gendisk = ROOTFS_TRY_LIST
+        .iter()
+        .find_map(|&path| {
+            if let Some(gd) = block_dev_manager().lookup_gendisk_by_path(path) {
+                info!("Use {} as rootfs", path);
+                return Some(gd);
+            }
+            return None;
+        })
+        .ok_or(SystemError::ENODEV)?;
+
+    let fatfs: Result<Arc<FATFileSystem>, SystemError> = FATFileSystem::new(gendisk);
     if fatfs.is_err() {
         error!(
             "Failed to initialize fatfs, code={:?}",
@@ -239,7 +225,7 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::EPERM);
     }
 
-    let (filename, parent_path) = rsplit_path(path);
+    let (filename, parent_path) = rsplit_path(&remain_path);
     // 查找父目录
     let parent_inode: Arc<dyn IndexNode> = inode_begin
         .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;

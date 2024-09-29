@@ -2,7 +2,7 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use alloc::string::{String, ToString};
+use alloc::{ffi::CString, string::ToString};
 use log::{debug, error};
 use system_error::SystemError;
 
@@ -34,11 +34,11 @@ fn kernel_init() -> Result<(), SystemError> {
     // scm_enable_double_buffer().expect("Failed to enable double buffer");
 
     #[cfg(target_arch = "x86_64")]
-    crate::driver::disk::ahci::ahci_init().expect("Failed to initialize AHCI");
-
+    crate::driver::disk::ahci::ahci_init()
+        .inspect_err(|e| log::error!("ahci_init failed: {:?}", e))
+        .ok();
     virtio_probe();
     mount_root_fs().expect("Failed to mount root fs");
-
     e1000e_init();
     net_init().unwrap_or_else(|err| {
         error!("Failed to initialize network: {:?}", err);
@@ -88,7 +88,7 @@ fn switch_to_user() -> ! {
 }
 
 fn try_to_run_init_process(path: &str, trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    if let Err(e) = run_init_process(path.to_string(), trap_frame) {
+    if let Err(e) = run_init_process(path, trap_frame) {
         if e != SystemError::ENOENT {
             error!(
                 "Failed to run init process: {path} exists but couldn't execute it (error {:?})",
@@ -97,16 +97,14 @@ fn try_to_run_init_process(path: &str, trap_frame: &mut TrapFrame) -> Result<(),
         }
         return Err(e);
     }
-
     Ok(())
 }
 
-fn run_init_process(path: String, trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    let argv = vec![path.clone()];
-    let envp = vec![String::from("PATH=/")];
+fn run_init_process(path: &str, trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    let argv = vec![CString::new(path).unwrap()];
+    let envp = vec![CString::new("PATH=/").unwrap()];
 
     compiler_fence(Ordering::SeqCst);
-    Syscall::do_execve(path, argv, envp, trap_frame)?;
-
+    Syscall::do_execve(path.to_string(), argv, envp, trap_frame)?;
     Ok(())
 }

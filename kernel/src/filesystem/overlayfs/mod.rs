@@ -1,8 +1,10 @@
+#![allow(dead_code, unused_variables, unused_imports)]
 pub mod copy_up;
 pub mod entry;
 use super::vfs::{self, FileSystem, FileType, FsInfo, IndexNode, SuperBlock};
+use crate::driver::base::device::device_number::DeviceNumber;
+use crate::driver::base::device::device_number::Major;
 use crate::libs::spinlock::SpinLock;
-use crate::{include::bindings::bindings::dev_t, libs::mutex::Mutex};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::sync::Weak;
@@ -11,13 +13,13 @@ use entry::{OvlEntry, OvlLayer};
 use system_error::SystemError;
 
 const WHITEOUT_MODE: u64 = 0o020000 | 0o600; // whiteout字符设备文件模式与权限
-const WHITEOUT_DEV: dev_t = 0; // Whiteout 文件设备号
+const WHITEOUT_DEV: DeviceNumber = DeviceNumber::new(Major::UNNAMED_MAJOR, 0); // Whiteout 文件设备号
 const WHITEOUT_FLAG: u64 = 0x1;
 
 #[derive(Debug)]
 pub struct OvlSuperBlock {
     super_block: SuperBlock,
-    pseudo_dev: dev_t, // 虚拟设备号
+    pseudo_dev: DeviceNumber, // 虚拟设备号
     is_lower: bool,
 }
 
@@ -88,7 +90,7 @@ impl OvlInode {
         let whiteout_mode = vfs::syscall::ModeType::S_IFCHR;
         let mut upper_inode = self.upper_inode.lock();
         if let Some(ref upper_inode) = *upper_inode {
-            upper_inode.mknod(name, whiteout_mode, WHITEOUT_DEV.into())?;
+            upper_inode.mknod(name, whiteout_mode, WHITEOUT_DEV)?;
         } else {
             let new_inode = self
                 .fs
@@ -200,16 +202,14 @@ impl IndexNode for OvlInode {
         let upper_inode = self.upper_inode.lock();
         if let Some(ref upper_inode) = *upper_inode {
             upper_inode.rmdir(name)?;
-        } else {
-            if let Some(lower_inode) = &self.lower_inode {
-                if lower_inode.find(name).is_ok() {
-                    self.create_whiteout(name)?;
-                } else {
-                    return Err(SystemError::ENOENT);
-                }
+        } else if let Some(lower_inode) = &self.lower_inode {
+            if lower_inode.find(name).is_ok() {
+                self.create_whiteout(name)?;
             } else {
                 return Err(SystemError::ENOENT);
             }
+        } else {
+            return Err(SystemError::ENOENT);
         }
 
         Ok(())
@@ -219,16 +219,14 @@ impl IndexNode for OvlInode {
         let upper_inode = self.upper_inode.lock();
         if let Some(ref upper_inode) = *upper_inode {
             upper_inode.unlink(name)?;
-        } else {
-            if let Some(lower_inode) = &self.lower_inode {
-                if lower_inode.find(name).is_ok() {
-                    self.create_whiteout(name)?;
-                } else {
-                    return Err(SystemError::ENOENT);
-                }
+        } else if let Some(lower_inode) = &self.lower_inode {
+            if lower_inode.find(name).is_ok() {
+                self.create_whiteout(name)?;
             } else {
                 return Err(SystemError::ENOENT);
             }
+        } else {
+            return Err(SystemError::ENOENT);
         }
 
         Ok(())

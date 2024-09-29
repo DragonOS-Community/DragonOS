@@ -1,4 +1,7 @@
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::{
+    hint::spin_loop,
+    sync::atomic::{compiler_fence, Ordering},
+};
 
 use log::debug;
 use system_error::SystemError;
@@ -11,6 +14,8 @@ use crate::{
     mm::{MemoryManagementArch, PhysAddr},
 };
 
+use self::boot::early_boot_init;
+
 use super::{
     driver::{
         hpet::{hpet_init, hpet_instance},
@@ -18,6 +23,10 @@ use super::{
     },
     MMArch,
 };
+
+mod boot;
+mod multiboot;
+mod multiboot2;
 
 #[derive(Debug)]
 pub struct ArchBootParams {}
@@ -31,15 +40,16 @@ extern "C" {
     static mut IDT_Table: [usize; 0usize];
     fn head_stack_start();
 
-    fn multiboot2_init(mb2_info: u64, mb2_magic: u32) -> bool;
 }
 
 #[no_mangle]
+#[allow(static_mut_refs)]
 unsafe extern "C" fn kernel_main(
     mb2_info: u64,
     mb2_magic: u64,
     bsp_gdt_size: u64,
     bsp_idt_size: u64,
+    boot_entry_type: u64,
 ) -> ! {
     let mut gdtp = DescriptorTablePointer::<usize>::default();
     let gdt_vaddr =
@@ -58,7 +68,11 @@ unsafe extern "C" fn kernel_main(
     x86::dtables::lidt(&idtp);
 
     compiler_fence(Ordering::SeqCst);
-    multiboot2_init(mb2_info, (mb2_magic & 0xFFFF_FFFF) as u32);
+    if early_boot_init(boot_entry_type, mb2_magic, mb2_info).is_err() {
+        loop {
+            spin_loop();
+        }
+    }
     compiler_fence(Ordering::SeqCst);
 
     start_kernel();
@@ -66,6 +80,7 @@ unsafe extern "C" fn kernel_main(
 
 /// 在内存管理初始化之前的架构相关的早期初始化
 #[inline(never)]
+#[allow(static_mut_refs)]
 pub fn early_setup_arch() -> Result<(), SystemError> {
     let stack_start = unsafe { *(head_stack_start as *const u64) } as usize;
     debug!("head_stack_start={:#x}\n", stack_start);

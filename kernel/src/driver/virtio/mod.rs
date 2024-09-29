@@ -1,4 +1,4 @@
-use alloc::{string::String, sync::Arc};
+use alloc::{collections::LinkedList, string::String, sync::Arc};
 use system_error::SystemError;
 
 use crate::exception::{irqdesc::IrqReturn, IrqNumber};
@@ -17,7 +17,10 @@ pub mod virtio_impl;
 
 /// virtio 设备厂商ID
 pub const VIRTIO_VENDOR_ID: u16 = 0x1af4;
+// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/mod_devicetable.h?fi=VIRTIO_DEV_ANY_ID#453
+pub const VIRTIO_DEV_ANY_ID: u32 = 0xffffffff;
 
+#[allow(dead_code)]
 pub trait VirtIODevice: Device {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError>;
 
@@ -47,6 +50,28 @@ pub trait VirtIODevice: Device {
 
 pub trait VirtIODriver: Driver {
     fn probe(&self, device: &Arc<dyn VirtIODevice>) -> Result<(), SystemError>;
+
+    fn virtio_id_table(&self) -> LinkedList<VirtioDeviceId>;
+
+    fn add_virtio_id(&self, id: VirtioDeviceId);
 }
 
 int_like!(VirtIODeviceIndex, usize);
+
+#[derive(Debug, Default)]
+pub struct VirtIODriverCommonData {
+    pub id_table: LinkedList<VirtioDeviceId>,
+}
+
+/// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/mod_devicetable.h#449
+#[derive(Debug, Default, Clone)]
+pub struct VirtioDeviceId {
+    pub device: u32,
+    pub vendor: u32,
+}
+
+impl VirtioDeviceId {
+    pub fn new(device: u32, vendor: u32) -> Self {
+        Self { device, vendor }
+    }
+}

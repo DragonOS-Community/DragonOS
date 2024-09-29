@@ -301,6 +301,7 @@ impl FrameBufferInfoData {
 }
 
 /// 帧缓冲区信息
+#[allow(dead_code)]
 pub trait FrameBufferInfo: FrameBufferOps {
     fn framebuffer_info_data(&self) -> &RwLock<FrameBufferInfoData>;
 
@@ -377,6 +378,7 @@ pub trait FrameBufferInfo: FrameBufferOps {
 /// 帧缓冲区操作
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/fb.h#237
+#[allow(dead_code)]
 pub trait FrameBufferOps {
     fn fb_open(&self, user: bool);
     fn fb_release(&self, user: bool);
@@ -880,7 +882,7 @@ impl FixedScreenInfo {
     ///
     /// 长度为16的字符数组
     pub const fn name2id(name: &str) -> [char; 16] {
-        let mut id = [0 as char; 16];
+        let mut id = [0u8 as char; 16];
         let mut i = 0;
 
         while i < 15 && i < name.len() {
@@ -1063,6 +1065,7 @@ pub enum FbAccel {
     // Add other accelerators here
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Copy, Clone)]
 pub struct BootTimeScreenInfo {
     pub origin_x: u8,

@@ -16,8 +16,8 @@ use crate::{
 };
 
 use super::{
-    handle::GlobalSocketHandle, Socket, SocketHandleItem, SocketMetadata, SocketOptions,
-    SocketPollMethod, SocketType, HANDLE_MAP, PORT_MANAGER, SOCKET_SET,
+    handle::GlobalSocketHandle, PosixSocketHandleItem, Socket, SocketHandleItem, SocketMetadata,
+    SocketOptions, SocketPollMethod, SocketType, HANDLE_MAP, PORT_MANAGER, SOCKET_SET,
 };
 
 /// @brief 表示原始的socket。原始套接字绕过传输层协议（如 TCP 或 UDP）并提供对网络层协议（如 IP）的直接访问。
@@ -32,6 +32,7 @@ pub struct RawSocket {
     header_included: bool,
     /// socket的metadata
     metadata: SocketMetadata,
+    posix_item: Arc<PosixSocketHandleItem>,
 }
 
 impl RawSocket {
@@ -76,15 +77,22 @@ impl RawSocket {
             options,
         );
 
+        let posix_item = Arc::new(PosixSocketHandleItem::new(None));
+
         return Self {
             handle,
             header_included: false,
             metadata,
+            posix_item,
         };
     }
 }
 
 impl Socket for RawSocket {
+    fn posix_item(&self) -> Arc<PosixSocketHandleItem> {
+        self.posix_item.clone()
+    }
+
     fn close(&mut self) {
         let mut socket_set_guard = SOCKET_SET.lock_irqsave();
         if let smoltcp::socket::Socket::Udp(mut sock) =
@@ -123,11 +131,7 @@ impl Socket for RawSocket {
                 }
             }
             drop(socket_set_guard);
-            SocketHandleItem::sleep(
-                self.socket_handle(),
-                EPollEventType::EPOLLIN.bits() as u64,
-                HANDLE_MAP.read_irqsave(),
-            );
+            self.posix_item.sleep(EPollEventType::EPOLLIN.bits() as u64);
         }
     }
 
@@ -240,6 +244,7 @@ pub struct UdpSocket {
     pub handle: GlobalSocketHandle,
     remote_endpoint: Option<Endpoint>, // 记录远程endpoint提供给connect()， 应该使用IP地址。
     metadata: SocketMetadata,
+    posix_item: Arc<PosixSocketHandleItem>,
 }
 
 impl UdpSocket {
@@ -278,10 +283,13 @@ impl UdpSocket {
             options,
         );
 
+        let posix_item = Arc::new(PosixSocketHandleItem::new(None));
+
         return Self {
             handle,
             remote_endpoint: None,
             metadata,
+            posix_item,
         };
     }
 
@@ -311,6 +319,10 @@ impl UdpSocket {
 }
 
 impl Socket for UdpSocket {
+    fn posix_item(&self) -> Arc<PosixSocketHandleItem> {
+        self.posix_item.clone()
+    }
+
     fn close(&mut self) {
         let mut socket_set_guard = SOCKET_SET.lock_irqsave();
         if let smoltcp::socket::Socket::Udp(mut sock) =
@@ -344,11 +356,7 @@ impl Socket for UdpSocket {
                 // return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
             }
             drop(socket_set_guard);
-            SocketHandleItem::sleep(
-                self.socket_handle(),
-                EPollEventType::EPOLLIN.bits() as u64,
-                HANDLE_MAP.read_irqsave(),
-            );
+            self.posix_item.sleep(EPollEventType::EPOLLIN.bits() as u64);
         }
     }
 
@@ -484,6 +492,7 @@ pub struct TcpSocket {
     local_endpoint: Option<wire::IpEndpoint>, // save local endpoint for bind()
     is_listening: bool,
     metadata: SocketMetadata,
+    posix_item: Arc<PosixSocketHandleItem>,
 }
 
 impl TcpSocket {
@@ -516,6 +525,7 @@ impl TcpSocket {
             Self::DEFAULT_METADATA_BUF_SIZE,
             options,
         );
+        let posix_item = Arc::new(PosixSocketHandleItem::new(None));
         // debug!("when there's a new tcp socket,its'len: {}",handles.len());
 
         return Self {
@@ -523,6 +533,7 @@ impl TcpSocket {
             local_endpoint: None,
             is_listening: false,
             metadata,
+            posix_item,
         };
     }
 
@@ -532,10 +543,8 @@ impl TcpSocket {
         local_endpoint: wire::IpEndpoint,
     ) -> Result<(), SystemError> {
         let listen_result = if local_endpoint.addr.is_unspecified() {
-            // debug!("Tcp Socket Listen on port {}", local_endpoint.port);
             socket.listen(local_endpoint.port)
         } else {
-            // debug!("Tcp Socket Listen on {local_endpoint}");
             socket.listen(local_endpoint)
         };
         return match listen_result {
@@ -561,9 +570,33 @@ impl TcpSocket {
         let tx_buffer = tcp::SocketBuffer::new(vec![0; Self::DEFAULT_TX_BUF_SIZE]);
         tcp::Socket::new(rx_buffer, tx_buffer)
     }
+
+    /// listening状态的posix socket是需要特殊处理的
+    fn tcp_poll_listening(&self) -> EPollEventType {
+        let socketset_guard = SOCKET_SET.lock_irqsave();
+
+        let can_accept = self.handles.iter().any(|h| {
+            if let Some(sh) = h.smoltcp_handle() {
+                let socket = socketset_guard.get::<tcp::Socket>(sh);
+                socket.is_active()
+            } else {
+                false
+            }
+        });
+
+        if can_accept {
+            return EPollEventType::EPOLL_LISTEN_CAN_ACCEPT;
+        } else {
+            return EPollEventType::empty();
+        }
+    }
 }
 
 impl Socket for TcpSocket {
+    fn posix_item(&self) -> Arc<PosixSocketHandleItem> {
+        self.posix_item.clone()
+    }
+
     fn close(&mut self) {
         for handle in self.handles.iter() {
             {
@@ -599,7 +632,7 @@ impl Socket for TcpSocket {
             let mut socket_set_guard = SOCKET_SET.lock_irqsave();
 
             let socket = socket_set_guard
-                .get_mut::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+                .get_mut::<tcp::Socket>(self.handles.first().unwrap().smoltcp_handle().unwrap());
 
             // 如果socket已经关闭，返回错误
             if !socket.is_active() {
@@ -641,11 +674,8 @@ impl Socket for TcpSocket {
                 return (Err(SystemError::ENOTCONN), Endpoint::Ip(None));
             }
             drop(socket_set_guard);
-            SocketHandleItem::sleep(
-                self.socket_handle(),
-                (EPollEventType::EPOLLIN.bits() | EPollEventType::EPOLLHUP.bits()) as u64,
-                HANDLE_MAP.read_irqsave(),
-            );
+            self.posix_item
+                .sleep((EPollEventType::EPOLLIN | EPollEventType::EPOLLHUP).bits() as u64);
         }
     }
 
@@ -664,7 +694,7 @@ impl Socket for TcpSocket {
         let mut socket_set_guard = SOCKET_SET.lock_irqsave();
 
         let socket = socket_set_guard
-            .get_mut::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+            .get_mut::<tcp::Socket>(self.handles.first().unwrap().smoltcp_handle().unwrap());
 
         if socket.is_open() {
             if socket.can_send() {
@@ -688,27 +718,34 @@ impl Socket for TcpSocket {
     }
 
     fn poll(&self) -> EPollEventType {
+        // 处理listen的快速路径
+        if self.is_listening {
+            return self.tcp_poll_listening();
+        }
+        // 由于上面处理了listening状态，所以这里只处理非listening状态，这种情况下只有一个handle
+
+        assert!(self.handles.len() == 1);
+
         let mut socket_set_guard = SOCKET_SET.lock_irqsave();
         // debug!("tcp socket:poll, socket'len={}",self.handle.len());
 
         let socket = socket_set_guard
-            .get_mut::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
-        return SocketPollMethod::tcp_poll(
-            socket,
-            HANDLE_MAP
-                .read_irqsave()
-                .get(&self.socket_handle())
-                .unwrap()
-                .shutdown_type(),
-        );
+            .get_mut::<tcp::Socket>(self.handles.first().unwrap().smoltcp_handle().unwrap());
+        let handle_map_guard = HANDLE_MAP.read_irqsave();
+        let handle_item = handle_map_guard.get(&self.socket_handle()).unwrap();
+        let shutdown_type = handle_item.shutdown_type();
+        let is_posix_listen = handle_item.is_posix_listen;
+        drop(handle_map_guard);
+
+        return SocketPollMethod::tcp_poll(socket, shutdown_type, is_posix_listen);
     }
 
     fn connect(&mut self, endpoint: Endpoint) -> Result<(), SystemError> {
         let mut sockets = SOCKET_SET.lock_irqsave();
-        // debug!("tcp socket:connect, socket'len={}",self.handle.len());
+        // debug!("tcp socket:connect, socket'len={}", self.handles.len());
 
         let socket =
-            sockets.get_mut::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+            sockets.get_mut::<tcp::Socket>(self.handles.first().unwrap().smoltcp_handle().unwrap());
 
         if let Endpoint::Ip(Some(ip)) = endpoint {
             let temp_port = PORT_MANAGER.get_ephemeral_port(self.metadata.socket_type)?;
@@ -730,7 +767,7 @@ impl Socket for TcpSocket {
                         poll_ifaces();
                         let mut sockets = SOCKET_SET.lock_irqsave();
                         let socket = sockets.get_mut::<tcp::Socket>(
-                            self.handles.get(0).unwrap().smoltcp_handle().unwrap(),
+                            self.handles.first().unwrap().smoltcp_handle().unwrap(),
                         );
 
                         match socket.state() {
@@ -739,11 +776,7 @@ impl Socket for TcpSocket {
                             }
                             tcp::State::SynSent => {
                                 drop(sockets);
-                                SocketHandleItem::sleep(
-                                    self.socket_handle(),
-                                    Self::CAN_CONNECT,
-                                    HANDLE_MAP.read_irqsave(),
-                                );
+                                self.posix_item.sleep(Self::CAN_CONNECT);
                             }
                             _ => {
                                 return Err(SystemError::ECONNREFUSED);
@@ -772,6 +805,11 @@ impl Socket for TcpSocket {
             return Ok(());
         }
 
+        // debug!(
+        //     "tcp socket:listen, socket'len={}, backlog = {backlog}",
+        //     self.handles.len()
+        // );
+
         let local_endpoint = self.local_endpoint.ok_or(SystemError::EINVAL)?;
         let mut sockets = SOCKET_SET.lock_irqsave();
         // 获取handle的数量
@@ -781,16 +819,19 @@ impl Socket for TcpSocket {
         // 添加剩余需要构建的socket
         // debug!("tcp socket:before listen, socket'len={}", self.handle_list.len());
         let mut handle_guard = HANDLE_MAP.write_irqsave();
-        let wait_queue = Arc::clone(&handle_guard.get(&self.socket_handle()).unwrap().wait_queue);
+        let socket_handle_item_0 = handle_guard.get_mut(&self.socket_handle()).unwrap();
+        socket_handle_item_0.is_posix_listen = true;
 
         self.handles.extend((handlen..backlog).map(|_| {
             let socket = Self::create_new_socket();
             let handle = GlobalSocketHandle::new_smoltcp_handle(sockets.add(socket));
-            let handle_item = SocketHandleItem::new(Some(wait_queue.clone()));
+            let mut handle_item = SocketHandleItem::new(Arc::downgrade(&self.posix_item));
+            handle_item.is_posix_listen = true;
             handle_guard.insert(handle, handle_item);
             handle
         }));
-        // debug!("tcp socket:listen, socket'len={}",self.handle.len());
+
+        // debug!("tcp socket:listen, socket'len={}", self.handles.len());
         // debug!("tcp socket:listen, backlog={backlog}");
 
         // 监听所有的socket
@@ -805,6 +846,7 @@ impl Socket for TcpSocket {
             }
             // debug!("Tcp Socket  before listen, open={}", socket.is_open());
         }
+
         return Ok(());
     }
 
@@ -820,6 +862,7 @@ impl Socket for TcpSocket {
 
             self.local_endpoint = Some(ip);
             self.is_listening = false;
+
             return Ok(());
         }
         return Err(SystemError::EINVAL);
@@ -862,8 +905,7 @@ impl Socket for TcpSocket {
                     .remote_endpoint()
                     .ok_or(SystemError::ENOTCONN)?;
 
-                let mut tcp_socket = Self::create_new_socket();
-                self.do_listen(&mut tcp_socket, endpoint)?;
+                let tcp_socket = Self::create_new_socket();
 
                 let new_handle = GlobalSocketHandle::new_smoltcp_handle(sockset.add(tcp_socket));
 
@@ -883,31 +925,40 @@ impl Socket for TcpSocket {
                     local_endpoint: self.local_endpoint,
                     is_listening: false,
                     metadata,
+                    posix_item: Arc::new(PosixSocketHandleItem::new(None)),
                 });
 
                 {
                     let mut handle_guard = HANDLE_MAP.write_irqsave();
                     // 先删除原来的
                     let item = handle_guard.remove(&old_handle).unwrap();
+                    item.reset_shutdown_type();
+                    assert!(item.is_posix_listen);
 
                     // 按照smoltcp行为，将新的handle绑定到原来的item
-                    let new_item = SocketHandleItem::new(None);
+                    let new_item = SocketHandleItem::new(Arc::downgrade(&sock_ret.posix_item));
                     handle_guard.insert(old_handle, new_item);
                     // 插入新的item
                     handle_guard.insert(new_handle, item);
+
+                    let socket = sockset.get_mut::<tcp::Socket>(
+                        self.handles[handle_index].smoltcp_handle().unwrap(),
+                    );
+
+                    if !socket.is_listening() {
+                        self.do_listen(socket, endpoint)?;
+                    }
+
                     drop(handle_guard);
                 }
+
                 return Ok((sock_ret, Endpoint::Ip(Some(remote_ep))));
             }
 
             drop(sockset);
 
-            // debug!("[TCP] [Accept] sleeping socket with handle: {:?}", self.handles.get(0).unwrap().smoltcp_handle().unwrap());
-            SocketHandleItem::sleep(
-                self.socket_handle(), // NOTICE
-                Self::CAN_ACCPET,
-                HANDLE_MAP.read_irqsave(),
-            );
+            // debug!("[TCP] [Accept] sleeping socket with handle: {:?}", self.handles.first().unwrap().smoltcp_handle().unwrap());
+            self.posix_item.sleep(Self::CAN_ACCPET);
             // debug!("tcp socket:after sleep, handle_guard'len={}",HANDLE_MAP.write_irqsave().len());
         }
     }
@@ -920,7 +971,7 @@ impl Socket for TcpSocket {
             // debug!("tcp socket:endpoint, socket'len={}",self.handle.len());
 
             let socket =
-                sockets.get::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+                sockets.get::<tcp::Socket>(self.handles.first().unwrap().smoltcp_handle().unwrap());
             if let Some(ep) = socket.local_endpoint() {
                 result = Some(Endpoint::Ip(Some(ep)));
             }
@@ -933,7 +984,7 @@ impl Socket for TcpSocket {
         // debug!("tcp socket:peer_endpoint, socket'len={}",self.handle.len());
 
         let socket =
-            sockets.get::<tcp::Socket>(self.handles.get(0).unwrap().smoltcp_handle().unwrap());
+            sockets.get::<tcp::Socket>(self.handles.first().unwrap().smoltcp_handle().unwrap());
         return socket.remote_endpoint().map(|x| Endpoint::Ip(Some(x)));
     }
 
@@ -948,7 +999,7 @@ impl Socket for TcpSocket {
     fn socket_handle(&self) -> GlobalSocketHandle {
         // debug!("tcp socket:socket_handle, socket'len={}",self.handle.len());
 
-        *self.handles.get(0).unwrap()
+        *self.handles.first().unwrap()
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {

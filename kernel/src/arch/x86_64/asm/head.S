@@ -7,71 +7,78 @@
 
 // 以下是来自 multiboot2 规范的定义
 //  How many bytes from the start of the file we search for the header.
-#define MULTIBOOT_SEARCH 32768
-#define MULTIBOOT_HEADER_ALIGN 8
+#define MULTIBOOT2_SEARCH 32768
+#define MULTIBOOT2_HEADER_ALIGN 8
 
 //  The magic field should contain this.
 #define MULTIBOOT2_HEADER_MAGIC 0xe85250d6
 
-//  This should be in %eax.
-#define MULTIBOOT2_BOOTLOADER_MAGIC 0x36d76289
+
 
 //  Alignment of multiboot modules.
-#define MULTIBOOT_MOD_ALIGN 0x00001000
+#define MULTIBOOT2_MOD_ALIGN 0x00001000
 
 //  Alignment of the multiboot info structure.
-#define MULTIBOOT_INFO_ALIGN 0x00000008
+#define MULTIBOOT2_INFO_ALIGN 0x00000008
 
 //  Flags set in the 'flags' member of the multiboot header.
 
-#define MULTIBOOT_TAG_ALIGN 8
-#define MULTIBOOT_TAG_TYPE_END 0
-#define MULTIBOOT_TAG_TYPE_CMDLINE 1
-#define MULTIBOOT_TAG_TYPE_BOOT_LOADER_NAME 2
-#define MULTIBOOT_TAG_TYPE_MODULE 3
-#define MULTIBOOT_TAG_TYPE_BASIC_MEMINFO 4
-#define MULTIBOOT_TAG_TYPE_BOOTDEV 5
-#define MULTIBOOT_TAG_TYPE_MMAP 6
-#define MULTIBOOT_TAG_TYPE_VBE 7
-#define MULTIBOOT_TAG_TYPE_FRAMEBUFFER 8
-#define MULTIBOOT_TAG_TYPE_ELF_SECTIONS 9
-#define MULTIBOOT_TAG_TYPE_APM 10
-#define MULTIBOOT_TAG_TYPE_EFI32 11
-#define MULTIBOOT_TAG_TYPE_EFI64 12
-#define MULTIBOOT_TAG_TYPE_SMBIOS 13
-#define MULTIBOOT_TAG_TYPE_ACPI_OLD 14
-#define MULTIBOOT_TAG_TYPE_ACPI_NEW 15
-#define MULTIBOOT_TAG_TYPE_NETWORK 16
-#define MULTIBOOT_TAG_TYPE_EFI_MMAP 17
-#define MULTIBOOT_TAG_TYPE_EFI_BS 18
-#define MULTIBOOT_TAG_TYPE_EFI32_IH 19
-#define MULTIBOOT_TAG_TYPE_EFI64_IH 20
-#define MULTIBOOT_TAG_TYPE_LOAD_BASE_ADDR 21
+#define MULTIBOOT2_TAG_ALIGN 8
+#define MULTIBOOT2_TAG_TYPE_END 0
+#define MULTIBOOT2_TAG_TYPE_CMDLINE 1
+#define MULTIBOOT2_TAG_TYPE_BOOT_LOADER_NAME 2
+#define MULTIBOOT2_TAG_TYPE_MODULE 3
+#define MULTIBOOT2_TAG_TYPE_BASIC_MEMINFO 4
+#define MULTIBOOT2_TAG_TYPE_BOOTDEV 5
+#define MULTIBOOT2_TAG_TYPE_MMAP 6
+#define MULTIBOOT2_TAG_TYPE_VBE 7
+#define MULTIBOOT2_TAG_TYPE_FRAMEBUFFER 8
+#define MULTIBOOT2_TAG_TYPE_ELF_SECTIONS 9
+#define MULTIBOOT2_TAG_TYPE_APM 10
+#define MULTIBOOT2_TAG_TYPE_EFI32 11
+#define MULTIBOOT2_TAG_TYPE_EFI64 12
+#define MULTIBOOT2_TAG_TYPE_SMBIOS 13
+#define MULTIBOOT2_TAG_TYPE_ACPI_OLD 14
+#define MULTIBOOT2_TAG_TYPE_ACPI_NEW 15
+#define MULTIBOOT2_TAG_TYPE_NETWORK 16
+#define MULTIBOOT2_TAG_TYPE_EFI_MMAP 17
+#define MULTIBOOT2_TAG_TYPE_EFI_BS 18
+#define MULTIBOOT2_TAG_TYPE_EFI32_IH 19
+#define MULTIBOOT2_TAG_TYPE_EFI64_IH 20
+#define MULTIBOOT2_TAG_TYPE_LOAD_BASE_ADDR 21
 
-#define MULTIBOOT_HEADER_TAG_END 0
-#define MULTIBOOT_HEADER_TAG_INFORMATION_REQUEST 1
-#define MULTIBOOT_HEADER_TAG_ADDRESS 2
-#define MULTIBOOT_HEADER_TAG_ENTRY_ADDRESS 3
-#define MULTIBOOT_HEADER_TAG_CONSOLE_FLAGS 4
-#define MULTIBOOT_HEADER_TAG_FRAMEBUFFER 5
-#define MULTIBOOT_HEADER_TAG_MODULE_ALIGN 6
-#define MULTIBOOT_HEADER_TAG_EFI_BS 7
-#define MULTIBOOT_HEADER_TAG_ENTRY_ADDRESS_EFI32 8
-#define MULTIBOOT_HEADER_TAG_ENTRY_ADDRESS_EFI64 9
-#define MULTIBOOT_HEADER_TAG_RELOCATABLE 10
+#define MULTIBOOT2_HEADER_TAG_END 0
+#define MULTIBOOT2_HEADER_TAG_INFORMATION_REQUEST 1
+#define MULTIBOOT2_HEADER_TAG_ADDRESS 2
+#define MULTIBOOT2_HEADER_TAG_ENTRY_ADDRESS 3
+#define MULTIBOOT2_HEADER_TAG_CONSOLE_FLAGS 4
+#define MULTIBOOT2_HEADER_TAG_FRAMEBUFFER 5
+#define MULTIBOOT2_HEADER_TAG_MODULE_ALIGN 6
+#define MULTIBOOT2_HEADER_TAG_EFI_BS 7
+#define MULTIBOOT2_HEADER_TAG_ENTRY_ADDRESS_EFI32 8
+#define MULTIBOOT2_HEADER_TAG_ENTRY_ADDRESS_EFI64 9
+#define MULTIBOOT2_HEADER_TAG_RELOCATABLE 10
 
-#define MULTIBOOT_ARCHITECTURE_I386 0
-#define MULTIBOOT_ARCHITECTURE_MIPS32 4
-#define MULTIBOOT_HEADER_TAG_OPTIONAL 1
+#define MULTIBOOT2_ARCHITECTURE_I386 0
+#define MULTIBOOT2_ARCHITECTURE_MIPS32 4
+#define MULTIBOOT2_HEADER_TAG_OPTIONAL 1
 
-#define MULTIBOOT_LOAD_PREFERENCE_NONE 0
-#define MULTIBOOT_LOAD_PREFERENCE_LOW 1
-#define MULTIBOOT_LOAD_PREFERENCE_HIGH 2
+#define MULTIBOOT2_LOAD_PREFERENCE_NONE 0
+#define MULTIBOOT2_LOAD_PREFERENCE_LOW 1
+#define MULTIBOOT2_LOAD_PREFERENCE_HIGH 2
 
-#define MULTIBOOT_CONSOLE_FLAGS_CONSOLE_REQUIRED 1
-#define MULTIBOOT_CONSOLE_FLAGS_EGA_TEXT_SUPPORTED 2
+#define MULTIBOOT2_CONSOLE_FLAGS_CONSOLE_REQUIRED 1
+#define MULTIBOOT2_CONSOLE_FLAGS_EGA_TEXT_SUPPORTED 2
 
+//  This should be in %eax.
+#define MULTIBOOT_BOOTLOADER_MAGIC 0x2badb002
+#define MULTIBOOT2_BOOTLOADER_MAGIC 0x36d76289
 
+// 存储到boot_entry_type的值
+#define BOOT_ENTRY_TYPE_MULTIBOOT 1
+#define BOOT_ENTRY_TYPE_MULTIBOOT2  2
+#define BOOT_ENTRY_TYPE_LINUX_32  3
+#define BOOT_ENTRY_TYPE_LINUX_64  4
 
 // 直接用 -m64 编译出来的是 64 位代码，
 // 但是启动后的机器是 32 位的，相当于在 32 位机器上跑 64 位程序。
@@ -85,49 +92,88 @@
 // 声明这一段代码以 32 位模式编译
 .code32
 
+.section ".multiboot_header", "a"
+
+#define MB_FLAGS_FB 0x4
+
+// reference: https://www.gnu.org/software/grub/manual/multiboot/multiboot.html#Header-graphics-fields
+#define MB_HEADER_GRAPHIC_MODE_LINEAR 0
+#define MB_HEADER_GRAPHIC_MODE_TEXT 1
+
+MB_MAGIC = 0x1BADB002
+MB_FLAGS = MB_FLAGS_FB
+MB_CHECKSUM = -(MB_MAGIC + MB_FLAGS)
+
+.code32
+multiboot_header:
+    .align 8
+    .long MB_MAGIC
+    .long MB_FLAGS
+    .long MB_CHECKSUM
+    // header_addr if flags[16] is set
+    .long 0
+    // load_addr if flags[16] is set
+    .long 0
+    // load_end_addr if flags[16] is set
+    .long 0
+    // bss_end_addr if flags[16] is set
+    .long 0
+    // entry_addr if flags[16] is set
+    .long 0
+    // mode_type if flags[2] is set
+    .long MB_HEADER_GRAPHIC_MODE_LINEAR
+    // width if flags[2] is set
+    .long 1440
+    // height if flags[2] is set
+    .long 900
+    // depth if flags[2] is set
+    .long 32
+
+
 // multiboot2 文件头
 // 计算头长度
-.SET HEADER_LENGTH, multiboot_header_end - multiboot_header
+.SET MB2_HEADER_LENGTH, multiboot2_header_end - multiboot2_header
 // 计算校验和
-.SET CHECKSUM, -(MULTIBOOT2_HEADER_MAGIC + MULTIBOOT_ARCHITECTURE_I386 + HEADER_LENGTH)
+.SET MB2_CHECKSUM, -(MULTIBOOT2_HEADER_MAGIC + MULTIBOOT2_ARCHITECTURE_I386 + MB2_HEADER_LENGTH)
 // 8 字节对齐
-.section .multiboot_header
-.align MULTIBOOT_HEADER_ALIGN
+.code32
+.section .multiboot2_header
+.align MULTIBOOT2_HEADER_ALIGN
 // 声明所属段
 
-multiboot_header:
+multiboot2_header:
     // 魔数
     .long MULTIBOOT2_HEADER_MAGIC
     // 架构
-    .long MULTIBOOT_ARCHITECTURE_I386
+    .long MULTIBOOT2_ARCHITECTURE_I386
     // 头长度
-    .long HEADER_LENGTH
+    .long MB2_HEADER_LENGTH
     // 校验和
-    .long CHECKSUM
+    .long MB2_CHECKSUM
     // 添加其它内容在此，详细信息见 Multiboot2 Specification version 2.0.pdf
 
 // 设置帧缓冲区(同时在这里设置qemu的分辨率, 默认为: 1440*900, 还支持: 640*480, 等)
 .align 8
 framebuffer_tag_start:
-    .short MULTIBOOT_HEADER_TAG_FRAMEBUFFER
-    .short MULTIBOOT_HEADER_TAG_OPTIONAL
+    .short MULTIBOOT2_HEADER_TAG_FRAMEBUFFER
+    .short MULTIBOOT2_HEADER_TAG_OPTIONAL
     .long framebuffer_tag_end - framebuffer_tag_start
     .long 1440   // 宽
     .long 900   // 高
     .long 32
 framebuffer_tag_end:
 .align 8
-	.short MULTIBOOT_HEADER_TAG_END
+	.short MULTIBOOT2_HEADER_TAG_END
     // 结束标记
     .short 0
     .long 8
-multiboot_header_end:
+multiboot2_header_end:
 
 .section .bootstrap
 
+
 .global _start
 .type _start, @function
-# 在 multiboot2.cpp 中定义
 
 .extern _start64
 .extern boot_info_addr
@@ -136,12 +182,30 @@ ENTRY(_start)
     // 关中断
     cli
     
-    // multiboot2_info 结构体指针
-    mov %ebx, mb2_info
+    // multiboot2_info/ multiboot_info 结构体指针
+    mov %ebx, mb_entry_info
     //mov %ebx, %e8
-    // 魔数
-    mov %eax, mb2_magic
+    // multiboot魔数
+    mov %eax, mb_entry_magic
 
+    mov $MULTIBOOT_BOOTLOADER_MAGIC, %ebx
+    cmp %eax, %ebx
+    je bl_magic_is_mb
+    mov $MULTIBOOT2_BOOTLOADER_MAGIC, %ebx
+    cmp %eax, %ebx
+    je bl_magic_is_mb2
+    jmp halt // unreachable
+
+bl_magic_is_mb:
+    mov $BOOT_ENTRY_TYPE_MULTIBOOT, %ebx
+    mov %ebx, boot_entry_type
+    jmp protected_mode_setup
+bl_magic_is_mb2:
+    mov $BOOT_ENTRY_TYPE_MULTIBOOT2, %ebx
+    mov %ebx, boot_entry_type
+    jmp protected_mode_setup
+
+protected_mode_setup:
     //mov %eax, %e9
     / 从保护模式跳转到长模式
     // 1. 允许 PAE
@@ -225,9 +289,10 @@ switch_to_start64:
 
 
 .code64
-is_from_ap:
-    
+halt:
+    cli
     hlt
+    jmp halt
 
 .global _start64
 .type _start64, @function
@@ -435,10 +500,11 @@ repeat_set_idt:
 
     
     // 传参
-    movq mb2_info, %rdi
-    movq mb2_magic, %rsi
+    movq mb_entry_info, %rdi
+    movq mb_entry_magic, %rsi
     movq %r13, %rdx // GDT size
     movq %r12, %r10 // IDT size
+    movq boot_entry_type, %r8
 
 	lretq
 
@@ -573,8 +639,10 @@ IDT_BASE64: .quad IDT_Table + 0xffff800000000000
 
 
 .section .bootstrap.data
-mb2_magic: .quad 0
-mb2_info: .quad 0
+mb_entry_magic: .quad 0
+mb_entry_info: .quad 0
+// 引导协议类型
+boot_entry_type: .quad 0
 
 .code32
 // 临时页表 4KB/页

@@ -1,12 +1,24 @@
 # 引导加载程序
 
-## 原理
+## X86_64
 
-&emsp;&emsp;目前，DragonOS支持Legacy BIOS以及UEFI两种方式，进行启动引导。
+- [x] multiboot2
 
-&emsp;&emsp;在`head.S`的头部包含了Multiboot2引导头，里面标志了一些Multiboot2相关的特定信息，以及一些配置命令。
+## RISC-V 64
 
-&emsp;&emsp;在DragonOS的启动初期，会存储由GRUB2传来的magic number以及multiboot2_boot_info_addr。当系统进入`Start_Kernel`函数之后，将会把这两个信息保存到multiboot2驱动程序之中。信息的具体含义请参照Multiboot2 Specification进行理解，该部分难度不大，相信读者经过思考能理解其中的原理。
+DragonOS在RISC-V 64上，启动流程为：
+
+opensbi --> uboot --> DragonStub --> kernel
+
+这个启动流程，使得DragonOS内核与具体的硬件板卡解耦，能够以同一个二进制文件，在不同的硬件板卡上启动运行。
+
+
+## 内核启动回调
+
+DragonOS对内核引导加载程序进行了抽象，体现为`BootCallbacks`这个trait。
+不同的引导加载程序，实现对应的callback，初始化内核bootParams或者是其他的一些数据结构。
+
+内核启动时，自动根据引导加载程序的类型，注册回调。并且在适当的时候，会调用这些回调函数。
 
 ## 参考资料
 

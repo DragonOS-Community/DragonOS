@@ -20,7 +20,7 @@ use crate::{
     libs::spinlock::SpinLock,
     mm::{
         allocator::page_frame::{PageFrameCount, PhysPageFrame, VirtPageFrame},
-        page::{page_manager_lock_irqsave, PageFlags, PageFlushAll},
+        page::{page_manager_lock_irqsave, EntryFlags, PageFlushAll},
         syscall::ProtFlags,
         ucontext::{AddressSpace, VMA},
         VirtAddr, VmFlags,
@@ -324,8 +324,8 @@ impl Syscall {
                     .ok_or(SystemError::EINVAL)?;
                 let vm_flags = VmFlags::from(shmflg);
                 let destination = VirtPageFrame::new(region.start());
-                let page_flags: PageFlags<MMArch> =
-                    PageFlags::from_prot_flags(ProtFlags::from(vm_flags), true);
+                let page_flags: EntryFlags<MMArch> =
+                    EntryFlags::from_prot_flags(ProtFlags::from(vm_flags), true);
                 let flusher: PageFlushAll<MMArch> = PageFlushAll::new();
 
                 // 将共享内存映射到对应虚拟区域
@@ -351,14 +351,14 @@ impl Syscall {
                     .mappings
                     .contains(vaddr)
                     .ok_or(SystemError::EINVAL)?;
-                if vma.lock().region().start() != vaddr {
+                if vma.lock_irqsave().region().start() != vaddr {
                     return Err(SystemError::EINVAL);
                 }
 
                 // 验证用户虚拟内存区域是否有效
                 let _ = UserBufferReader::new(vaddr.data() as *const u8, size, true)?;
 
-                // 必须在取消映射前获取到PageFlags
+                // 必须在取消映射前获取到EntryFlags
                 let page_flags = address_write_guard
                     .user_mapper
                     .utable
@@ -386,7 +386,8 @@ impl Syscall {
 
                     // 将vma加入到对应Page的anon_vma
                     page_manager_guard
-                        .get_mut(&phys.phys_address())
+                        .get_unwrap(&phys.phys_address())
+                        .write_irqsave()
                         .insert_vma(vma.clone());
 
                     phys = phys.next();
@@ -394,7 +395,7 @@ impl Syscall {
                 }
 
                 // 更新vma的映射状态
-                vma.lock().set_mapped(true);
+                vma.lock_irqsave().set_mapped(true);
 
                 vaddr.data()
             }
@@ -427,7 +428,7 @@ impl Syscall {
             .ok_or(SystemError::EINVAL)?;
 
         // 判断vaddr是否为起始地址
-        if vma.lock().region().start() != vaddr {
+        if vma.lock_irqsave().region().start() != vaddr {
             return Err(SystemError::EINVAL);
         }
 
@@ -440,9 +441,9 @@ impl Syscall {
             .0;
 
         // 如果物理页的shm_id为None，代表不是共享页
-        let page_manager_guard = page_manager_lock_irqsave();
+        let mut page_manager_guard = page_manager_lock_irqsave();
         let page = page_manager_guard.get(&paddr).ok_or(SystemError::EINVAL)?;
-        let shm_id = page.shm_id().ok_or(SystemError::EINVAL)?;
+        let shm_id = page.read_irqsave().shm_id().ok_or(SystemError::EINVAL)?;
         drop(page_manager_guard);
 
         // 获取对应共享页管理信息

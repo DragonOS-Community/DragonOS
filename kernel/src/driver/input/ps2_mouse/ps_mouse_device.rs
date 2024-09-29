@@ -16,9 +16,9 @@ use crate::{
             class::Class,
             device::{
                 bus::Bus, device_manager, device_number::DeviceNumber, driver::Driver, Device,
-                DeviceType, IdTable,
+                DeviceCommonData, DeviceType, IdTable,
             },
-            kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+            kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
         },
         input::{
@@ -184,13 +184,8 @@ impl Ps2MouseDevice {
     pub fn new() -> Self {
         let r = Self {
             inner: SpinLock::new(InnerPs2MouseDevice {
-                bus: None,
-                class: None,
-                driver: None,
-                kern_inode: None,
-                parent: None,
-                kset: None,
-                kobj_type: None,
+                device_common: DeviceCommonData::default(),
+                kobject_common: KObjectCommonData::default(),
                 current_packet: 0,
                 current_state: MouseState::new(),
                 buf: AllocRingBuffer::new(MOUSE_BUFFER_CAPACITY),
@@ -387,6 +382,7 @@ impl Ps2MouseDevice {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn wait_for_read(&self) -> Result<(), SystemError> {
         let timeout = 100_000;
         for _ in 0..timeout {
@@ -408,17 +404,16 @@ impl Ps2MouseDevice {
         }
         Err(SystemError::ETIMEDOUT)
     }
+
+    fn inner(&self) -> SpinLockGuard<InnerPs2MouseDevice> {
+        self.inner.lock_irqsave()
+    }
 }
 
 #[derive(Debug)]
 struct InnerPs2MouseDevice {
-    bus: Option<Weak<dyn Bus>>,
-    class: Option<Weak<dyn Class>>,
-    driver: Option<Weak<dyn Driver>>,
-    kern_inode: Option<Arc<KernFSInode>>,
-    parent: Option<Weak<dyn KObject>>,
-    kset: Option<Arc<KSet>>,
-    kobj_type: Option<&'static dyn KObjType>,
+    device_common: DeviceCommonData,
+    kobject_common: KObjectCommonData,
 
     /// 鼠标数据
     current_state: MouseState,
@@ -445,19 +440,19 @@ impl Device for Ps2MouseDevice {
     }
 
     fn set_bus(&self, bus: Option<alloc::sync::Weak<dyn Bus>>) {
-        self.inner.lock_irqsave().bus = bus;
+        self.inner().device_common.bus = bus;
     }
 
     fn set_class(&self, class: Option<alloc::sync::Weak<dyn Class>>) {
-        self.inner.lock_irqsave().class = class;
+        self.inner().device_common.class = class;
     }
 
     fn driver(&self) -> Option<alloc::sync::Arc<dyn Driver>> {
-        self.inner.lock_irqsave().driver.clone()?.upgrade()
+        self.inner().device_common.driver.clone()?.upgrade()
     }
 
     fn set_driver(&self, driver: Option<alloc::sync::Weak<dyn Driver>>) {
-        self.inner.lock_irqsave().driver = driver;
+        self.inner().device_common.driver = driver;
     }
 
     fn can_match(&self) -> bool {
@@ -471,17 +466,25 @@ impl Device for Ps2MouseDevice {
     }
 
     fn bus(&self) -> Option<alloc::sync::Weak<dyn Bus>> {
-        self.inner.lock_irqsave().bus.clone()
+        self.inner().device_common.bus.clone()
     }
 
     fn class(&self) -> Option<Arc<dyn Class>> {
-        let mut guard = self.inner.lock_irqsave();
-        let r = guard.class.clone()?.upgrade();
+        let mut guard = self.inner();
+        let r = guard.device_common.class.clone()?.upgrade();
         if r.is_none() {
-            guard.class = None;
+            guard.device_common.class = None;
         }
 
         return r;
+    }
+
+    fn dev_parent(&self) -> Option<alloc::sync::Weak<dyn Device>> {
+        self.inner().device_common.get_parent_weak_or_clear()
+    }
+
+    fn set_dev_parent(&self, dev_parent: Option<alloc::sync::Weak<dyn Device>>) {
+        self.inner().device_common.parent = dev_parent;
     }
 }
 
@@ -529,35 +532,35 @@ impl KObject for Ps2MouseDevice {
     }
 
     fn set_inode(&self, inode: Option<alloc::sync::Arc<KernFSInode>>) {
-        self.inner.lock_irqsave().kern_inode = inode;
+        self.inner().kobject_common.kern_inode = inode;
     }
 
     fn inode(&self) -> Option<alloc::sync::Arc<KernFSInode>> {
-        self.inner.lock_irqsave().kern_inode.clone()
+        self.inner().kobject_common.kern_inode.clone()
     }
 
     fn parent(&self) -> Option<alloc::sync::Weak<dyn KObject>> {
-        self.inner.lock_irqsave().parent.clone()
+        self.inner().kobject_common.parent.clone()
     }
 
     fn set_parent(&self, parent: Option<alloc::sync::Weak<dyn KObject>>) {
-        self.inner.lock_irqsave().parent = parent
+        self.inner().kobject_common.parent = parent
     }
 
     fn kset(&self) -> Option<alloc::sync::Arc<KSet>> {
-        self.inner.lock_irqsave().kset.clone()
+        self.inner().kobject_common.kset.clone()
     }
 
     fn set_kset(&self, kset: Option<alloc::sync::Arc<KSet>>) {
-        self.inner.lock_irqsave().kset = kset;
+        self.inner().kobject_common.kset = kset;
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.inner.lock_irqsave().kobj_type
+        self.inner().kobject_common.kobj_type
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
-        self.inner.lock_irqsave().kobj_type = ktype;
+        self.inner().kobject_common.kobj_type = ktype;
     }
 
     fn name(&self) -> alloc::string::String {
@@ -664,12 +667,12 @@ impl IndexNode for Ps2MouseDevice {
 
 impl Ps2Device for Ps2MouseDevice {}
 
-pub fn rs_ps2_mouse_device_init(parent: Arc<dyn KObject>) -> Result<(), SystemError> {
+pub fn rs_ps2_mouse_device_init(dev_parent: Arc<dyn Device>) -> Result<(), SystemError> {
     debug!("ps2_mouse_device initializing...");
     let psmouse = Arc::new(Ps2MouseDevice::new());
 
     device_manager().device_default_initialize(&(psmouse.clone() as Arc<dyn Device>));
-    psmouse.set_parent(Some(Arc::downgrade(&parent)));
+    psmouse.set_dev_parent(Some(Arc::downgrade(&dev_parent)));
     serio_device_manager().register_port(psmouse.clone() as Arc<dyn SerioDevice>)?;
 
     devfs_register(&psmouse.name(), psmouse.clone()).map_err(|e| {

@@ -18,9 +18,9 @@ use super::{
     device::{
         bus::{subsystem_manager, Bus},
         driver::Driver,
-        Device, DeviceType, IdTable,
+        Device, DeviceCommonData, DeviceType, IdTable,
     },
-    kobject::{KObjType, KObject, KObjectState, LockedKObjectState},
+    kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
     kset::KSet,
     subsys::SubSysPrivate,
 };
@@ -123,23 +123,17 @@ impl CpuSubSystemFakeRootDevice {
 
 #[derive(Debug)]
 struct InnerCpuSubSystemFakeRootDevice {
-    parent_kobj: Option<Weak<dyn KObject>>,
-    bus: Option<Weak<dyn Bus>>,
-    kset: Option<Arc<KSet>>,
+    kobject_common: KObjectCommonData,
+    device_common: DeviceCommonData,
     name: String,
-    kern_inode: Option<Arc<KernFSInode>>,
-    ktype: Option<&'static dyn KObjType>,
 }
 
 impl InnerCpuSubSystemFakeRootDevice {
     pub fn new() -> Self {
         return Self {
-            parent_kobj: None,
-            bus: None,
-            kset: None,
+            kobject_common: KObjectCommonData::default(),
+            device_common: DeviceCommonData::default(),
             name: "".to_string(),
-            kern_inode: None,
-            ktype: None,
         };
     }
 }
@@ -154,11 +148,11 @@ impl Device for CpuSubSystemFakeRootDevice {
     }
 
     fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
-        self.inner.write().bus = bus;
+        self.inner.write().device_common.bus = bus;
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {
-        self.inner.read().bus.clone()
+        self.inner.read().device_common.bus.clone()
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
@@ -188,6 +182,14 @@ impl Device for CpuSubSystemFakeRootDevice {
     fn set_class(&self, _class: Option<Weak<dyn Class>>) {
         todo!()
     }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        self.inner.read().device_common.parent.clone()
+    }
+
+    fn set_dev_parent(&self, dev_parent: Option<Weak<dyn Device>>) {
+        self.inner.write().device_common.parent = dev_parent;
+    }
 }
 
 impl KObject for CpuSubSystemFakeRootDevice {
@@ -196,35 +198,35 @@ impl KObject for CpuSubSystemFakeRootDevice {
     }
 
     fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
-        self.inner.write().kern_inode = inode;
+        self.inner.write().kobject_common.kern_inode = inode;
     }
 
     fn inode(&self) -> Option<Arc<KernFSInode>> {
-        self.inner.read().kern_inode.clone()
+        self.inner.read().kobject_common.kern_inode.clone()
     }
 
     fn parent(&self) -> Option<Weak<dyn KObject>> {
-        self.inner.read().parent_kobj.clone()
+        self.inner.read().kobject_common.parent.clone()
     }
 
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
-        self.inner.write().parent_kobj = parent;
+        self.inner.write().kobject_common.parent = parent;
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {
-        self.inner.read().kset.clone()
+        self.inner.read().kobject_common.kset.clone()
     }
 
     fn set_kset(&self, kset: Option<Arc<KSet>>) {
-        self.inner.write().kset = kset;
+        self.inner.write().kobject_common.kset = kset;
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.inner.read().ktype
+        self.inner.read().kobject_common.kobj_type
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
-        self.inner.write().ktype = ktype;
+        self.inner.write().kobject_common.kobj_type = ktype;
     }
 
     fn name(&self) -> String {

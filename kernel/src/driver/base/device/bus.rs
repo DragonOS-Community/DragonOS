@@ -299,9 +299,14 @@ impl BusManager {
             .ok_or(SystemError::EINVAL)?;
         debug!("bus '{}' add driver '{}'", bus.name(), driver.name());
 
-        driver.set_kobj_type(Some(&BusDriverKType));
+        // driver.set_kobj_type(Some(&BusDriverKType));
         let kobj = driver.clone() as Arc<dyn KObject>;
-        KObjectManager::add_kobj(kobj, bus.subsystem().drivers_kset())?;
+        // KObjectManager::add_kobj(kobj, bus.subsystem().drivers_kset())?;
+        KObjectManager::init_and_add_kobj(
+            kobj,
+            bus.subsystem().drivers_kset(),
+            Some(&BusDriverKType),
+        )?;
 
         bus.subsystem().add_driver_to_vec(driver)?;
         if bus.subsystem().drivers_autoprobe() {
@@ -451,6 +456,7 @@ impl BusManager {
         }
         let bus = bus.unwrap();
         if bus.subsystem().drivers_autoprobe() {
+            log::info!("MT bus '{}' autoprobe driver", bus.name());
             device_manager().device_initial_probe(dev).ok();
         }
         for interface in bus.subsystem().interfaces() {
@@ -478,9 +484,8 @@ impl BusManager {
 
         driver_manager()
             .create_attr_file(driver, &DriverAttrBind)
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 driver_manager().remove_attr_file(driver, &DriverAttrUnbind);
-                e
             })?;
 
         return Ok(());

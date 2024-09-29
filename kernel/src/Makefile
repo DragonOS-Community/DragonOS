@@ -21,7 +21,7 @@ ifeq ($(ARCH), x86_64)
 endif
 endif
 
-RUSTFLAGS = $(RUSTFLAGS_UNWIND)
+RUSTFLAGS += $(RUSTFLAGS_UNWIND)
 
 CFLAGS = $(GLOBAL_CFLAGS) -fno-pie $(CFLAGS_UNWIND) -I $(shell pwd) -I $(shell pwd)/include
 
@@ -40,7 +40,7 @@ kernel_subdirs := common driver debug syscall libs
 
 
 kernel_rust:
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2023-08-15 $(CARGO_ZBUILD) build --release --target $(TARGET_JSON)
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-07-23 $(CARGO_ZBUILD) build --release --target $(TARGET_JSON)
 
 
 all: kernel

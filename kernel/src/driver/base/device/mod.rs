@@ -1,4 +1,5 @@
 use alloc::{
+    collections::BTreeMap,
     string::{String, ToString},
     sync::{Arc, Weak},
 };
@@ -12,16 +13,21 @@ use crate::{
     },
     exception::irqdata::IrqHandlerData,
     filesystem::{
+        kernfs::KernFSInode,
         sysfs::{
             file::sysfs_emit_str, sysfs_instance, Attribute, AttributeGroup, SysFSOps,
             SysFSOpsSupport,
         },
         vfs::syscall::ModeType,
     },
+    libs::{
+        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        spinlock::{SpinLock, SpinLockGuard},
+    },
 };
 
-use core::fmt::Debug;
 use core::intrinsics::unlikely;
+use core::{any::Any, fmt::Debug};
 use system_error::SystemError;
 
 use self::{
@@ -31,8 +37,10 @@ use self::{
 };
 
 use super::{
-    class::Class,
-    kobject::{KObjType, KObject, KObjectManager, KObjectState},
+    class::{Class, ClassKObjbectType},
+    kobject::{
+        KObjType, KObject, KObjectCommonData, KObjectManager, KObjectState, LockedKObjectState,
+    },
     kset::KSet,
     swnode::software_node_notify,
 };
@@ -193,6 +201,10 @@ pub trait Device: KObject {
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
         None
     }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>>;
+
+    fn set_dev_parent(&self, parent: Option<Weak<dyn Device>>);
 }
 
 impl dyn Device {
@@ -210,6 +222,7 @@ pub struct DeviceCommonData {
     pub driver: Option<Weak<dyn Driver>>,
     pub dead: bool,
     pub can_match: bool,
+    pub parent: Option<Weak<dyn Device>>,
 }
 
 impl Default for DeviceCommonData {
@@ -220,6 +233,7 @@ impl Default for DeviceCommonData {
             driver: None,
             dead: false,
             can_match: true,
+            parent: None,
         }
     }
 }
@@ -244,6 +258,13 @@ impl DeviceCommonData {
     /// 当weak指针的strong count为0的时候，清除弱引用
     pub fn get_driver_weak_or_clear(&mut self) -> Option<Weak<dyn Driver>> {
         driver_base_macros::get_weak_or_clear!(self.driver)
+    }
+
+    /// 获取parent字段
+    ///
+    /// 当weak指针的strong count为0的时候，清除弱引用
+    pub fn get_parent_weak_or_clear(&mut self) -> Option<Weak<dyn Device>> {
+        driver_base_macros::get_weak_or_clear!(self.parent)
     }
 }
 
@@ -475,21 +496,26 @@ impl DeviceManager {
     #[allow(dead_code)]
     pub fn add_device(&self, device: Arc<dyn Device>) -> Result<(), SystemError> {
         // 在这里处理与parent相关的逻辑
-
-        let current_parent = device
-            .parent()
-            .and_then(|x| x.upgrade())
-            .and_then(|x| x.arc_any().cast::<dyn Device>().ok());
-
-        let actual_parent = self.get_device_parent(&device, current_parent)?;
-        if let Some(actual_parent) = actual_parent {
+        let deivce_parent = device.dev_parent().and_then(|x| x.upgrade());
+        if let Some(ref dev) = deivce_parent {
+            log::info!(
+                "deivce: {:?}  dev parent: {:?}",
+                device.name().to_string(),
+                dev.name()
+            );
+        }
+        let kobject_parent = self.get_device_parent(&device, deivce_parent)?;
+        if let Some(ref kobj) = kobject_parent {
+            log::info!("kobject parent: {:?}", kobj.name());
+        }
+        if let Some(kobject_parent) = kobject_parent {
             // debug!(
             //     "device '{}' parent is '{}', strong_count: {}",
             //     device.name().to_string(),
             //     actual_parent.name(),
             //     Arc::strong_count(&actual_parent)
             // );
-            device.set_parent(Some(Arc::downgrade(&actual_parent)));
+            device.set_parent(Some(Arc::downgrade(&kobject_parent)));
         }
 
         KObjectManager::add_kobj(device.clone() as Arc<dyn KObject>, None).map_err(|e| {
@@ -536,12 +562,43 @@ impl DeviceManager {
         return Ok(());
     }
 
+    /// 用于创建并添加一个新的kset，表示一个设备类目录
+    /// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/base/core.c#3159
+    fn class_dir_create_and_add(
+        &self,
+        class: Arc<dyn Class>,
+        kobject_parent: Arc<dyn KObject>,
+    ) -> Arc<dyn KObject> {
+        let mut guard = CLASS_DIR_KSET_INSTANCE.write();
+        let class_name: String = class.name().to_string();
+        let kobject_parent_name = kobject_parent.name();
+        let key = format!("{}-{}", class_name, kobject_parent_name);
+
+        // 检查设备类目录是否已经存在
+        if let Some(class_dir) = guard.get(&key) {
+            return class_dir.clone();
+        }
+
+        let class_dir: Arc<ClassDir> = ClassDir::new();
+
+        class_dir.set_name(class_name.clone());
+        class_dir.set_kobj_type(Some(&ClassKObjbectType));
+        class_dir.set_parent(Some(Arc::downgrade(&kobject_parent)));
+
+        KObjectManager::add_kobj(class_dir.clone() as Arc<dyn KObject>, None)
+            .expect("add class dir failed");
+
+        guard.insert(key, class_dir.clone());
+
+        return class_dir;
+    }
+
     /// 获取设备真实的parent kobject
     ///
     /// ## 参数
     ///
     /// - `device`: 设备
-    /// - `current_parent`: 当前的parent kobject
+    /// - `device_parent`: 父设备
     ///
     /// ## 返回值
     ///
@@ -551,29 +608,31 @@ impl DeviceManager {
     fn get_device_parent(
         &self,
         device: &Arc<dyn Device>,
-        current_parent: Option<Arc<dyn Device>>,
+        device_parent: Option<Arc<dyn Device>>,
     ) -> Result<Option<Arc<dyn KObject>>, SystemError> {
         // debug!("get_device_parent() device:{:?}", device.name());
         if device.class().is_some() {
-            let parent_kobj: Arc<dyn KObject>;
-            // debug!("current_parent:{:?}", current_parent);
-            if let Some(cp) = current_parent {
-                if cp.class().is_some() {
-                    return Ok(Some(cp.clone() as Arc<dyn KObject>));
+            let kobject_parent: Arc<dyn KObject>;
+            if let Some(dp) = device_parent {
+                if dp.class().is_some() {
+                    return Ok(Some(dp.clone() as Arc<dyn KObject>));
                 } else {
-                    parent_kobj = cp.clone() as Arc<dyn KObject>;
+                    kobject_parent = dp.clone() as Arc<dyn KObject>;
                 }
             } else {
-                parent_kobj = sys_devices_virtual_kset() as Arc<dyn KObject>;
+                kobject_parent = sys_devices_virtual_kset() as Arc<dyn KObject>;
             }
 
             // 是否需要glue dir?
 
-            return Ok(Some(parent_kobj));
+            let kobject_parent =
+                self.class_dir_create_and_add(device.class().unwrap(), kobject_parent.clone());
+
+            return Ok(Some(kobject_parent));
         }
 
         // subsystems can specify a default root directory for their devices
-        if current_parent.is_none() {
+        if device_parent.is_none() {
             if let Some(bus) = device.bus().and_then(|bus| bus.upgrade()) {
                 if let Some(root) = bus.root_device().and_then(|x| x.upgrade()) {
                     return Ok(Some(root as Arc<dyn KObject>));
@@ -581,8 +640,8 @@ impl DeviceManager {
             }
         }
 
-        if let Some(current_parent) = current_parent {
-            return Ok(Some(current_parent as Arc<dyn KObject>));
+        if let Some(device_parent) = device_parent {
+            return Ok(Some(device_parent as Arc<dyn KObject>));
         }
 
         return Ok(None);
@@ -641,23 +700,20 @@ impl DeviceManager {
         let subsys_kobj = class.subsystem().subsys() as Arc<dyn KObject>;
         sysfs_instance().create_link(Some(&dev_kobj), &subsys_kobj, "subsystem".to_string())?;
 
-        // todo: 这里需要处理class的parent逻辑, 添加device链接
-        if let Some(parent) = dev.parent().and_then(|x| x.upgrade()) {
-            let parent_kobj = parent.clone() as Arc<dyn KObject>;
+        if let Some(dev_parent) = dev.dev_parent().and_then(|x| x.upgrade()) {
+            let parent_kobj = dev_parent.clone() as Arc<dyn KObject>;
             sysfs_instance()
                 .create_link(Some(&dev_kobj), &parent_kobj, "device".to_string())
-                .map_err(|e| {
+                .inspect_err(|_e| {
                     err_remove_subsystem(&dev_kobj);
-                    e
                 })?;
         }
 
         sysfs_instance()
             .create_link(Some(&subsys_kobj), &dev_kobj, dev.name())
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 err_remove_device(&dev_kobj);
                 err_remove_subsystem(&dev_kobj);
-                e
             })?;
 
         return Ok(());
@@ -695,18 +751,16 @@ impl DeviceManager {
         // 添加kobj_type的属性文件
         if let Some(kobj_type) = dev.kobj_type() {
             self.add_groups(dev, kobj_type.attribute_groups().unwrap_or(&[]))
-                .map_err(|e| {
+                .inspect_err(|_e| {
                     err_remove_class_groups(dev);
-                    e
                 })?;
         }
 
         // 添加设备本身的属性文件
         self.add_groups(dev, dev.attribute_groups().unwrap_or(&[]))
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 err_remove_kobj_type_groups(dev);
                 err_remove_class_groups(dev);
-                e
             })?;
 
         return Ok(());
@@ -970,3 +1024,93 @@ impl core::hash::Hash for DeviceId {
 impl Eq for DeviceId {}
 
 impl IrqHandlerData for DeviceId {}
+
+lazy_static! {
+    /// class_dir列表，通过parent kobject的name和class_dir的name来索引class_dir实例
+    static ref CLASS_DIR_KSET_INSTANCE: RwLock<BTreeMap<String, Arc<ClassDir>>> = RwLock::new(BTreeMap::new());
+}
+
+#[derive(Debug)]
+struct ClassDir {
+    inner: SpinLock<InnerClassDir>,
+    locked_kobj_state: LockedKObjectState,
+}
+#[derive(Debug)]
+struct InnerClassDir {
+    name: Option<String>,
+    kobject_common: KObjectCommonData,
+}
+
+impl ClassDir {
+    fn new() -> Arc<Self> {
+        return Arc::new(Self {
+            inner: SpinLock::new(InnerClassDir {
+                name: None,
+                kobject_common: KObjectCommonData::default(),
+            }),
+            locked_kobj_state: LockedKObjectState::default(),
+        });
+    }
+
+    fn inner(&self) -> SpinLockGuard<InnerClassDir> {
+        return self.inner.lock();
+    }
+}
+
+impl KObject for ClassDir {
+    fn as_any_ref(&self) -> &dyn Any {
+        return self;
+    }
+
+    fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
+        self.inner().kobject_common.kern_inode = inode;
+    }
+
+    fn inode(&self) -> Option<Arc<KernFSInode>> {
+        return self.inner().kobject_common.kern_inode.clone();
+    }
+
+    fn parent(&self) -> Option<Weak<dyn KObject>> {
+        return self.inner().kobject_common.parent.clone();
+    }
+
+    fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
+        self.inner().kobject_common.parent = parent;
+    }
+
+    fn kset(&self) -> Option<Arc<KSet>> {
+        return self.inner().kobject_common.kset.clone();
+    }
+
+    fn set_kset(&self, kset: Option<Arc<KSet>>) {
+        self.inner().kobject_common.kset = kset;
+    }
+
+    fn kobj_type(&self) -> Option<&'static dyn KObjType> {
+        return self.inner().kobject_common.kobj_type;
+    }
+
+    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
+        self.inner().kobject_common.kobj_type = ktype;
+    }
+
+    fn name(&self) -> String {
+        return self.inner().name.clone().unwrap_or_default();
+    }
+
+    fn set_name(&self, name: String) {
+        self.inner().name = Some(name);
+    }
+
+    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+        self.locked_kobj_state.read()
+    }
+
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+        self.locked_kobj_state.write()
+    }
+
+    fn set_kobj_state(&self, state: KObjectState) {
+        *self.locked_kobj_state.write() = state;
+    }
+}

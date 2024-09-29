@@ -158,6 +158,9 @@ pub struct UapiKvmRunBindgenTy1BindgenTy4 {
     pub data_offset: u64,
 }
 
+pub const KVM_EXIT_IO_IN: u8 = 0;
+pub const KVM_EXIT_IO_OUT: u8 = 1;
+
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, PartialEq)]
 pub struct UapiKvmDebugExitArch {

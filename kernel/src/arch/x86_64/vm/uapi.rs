@@ -2,6 +2,8 @@
 
 use crate::virt::vm::user_api::UapiKvmSegment;
 
+pub const KVM_PIO_PAGE_OFFSET: u64 = 1;
+
 pub const DE_VECTOR: usize = 0;
 pub const DB_VECTOR: usize = 1;
 pub const BP_VECTOR: usize = 3;

@@ -9,6 +9,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use io::KvmIoBus;
 use mem::LockedKvmMemSlot;
 use system_error::SystemError;
 
@@ -36,6 +37,7 @@ use self::{
     vcpu::{GuestDebug, VcpuMode},
 };
 
+pub mod io;
 pub mod mem;
 pub mod vcpu;
 
@@ -93,6 +95,7 @@ impl LockedVm {
             kvm_vmx: KvmVmx::default(),
             nr_memslots_dirty_logging: 0,
             mmu_invalidate_seq: 0,
+            buses: Vec::with_capacity(KvmBus::NrBuses as usize),
         };
 
         let ret = Arc::new(Self {
@@ -147,6 +150,8 @@ pub struct Vm {
     pub kvm_vmx: KvmVmx,
 
     pub mmu_invalidate_seq: u64, //用于表示内存管理单元（MMU）无效化序列号
+
+    pub buses: Vec<KvmIoBus>,
 }
 
 impl Vm {
@@ -245,6 +250,16 @@ pub enum MutilProcessorState {
     ApResetHold,
     Suspended,
 }
+
+pub enum KvmBus {
+    MmioBus = 0,
+    PioBus = 1,
+    VirtioCcwNotifyBus = 2,
+    FastMmioBus = 3,
+
+    NrBuses,
+}
+
 ///返回包含 gfn 的 memslot 的指针。如果没有找到，则返回 NULL。
 ///当 "approx" 设置为 true 时，即使地址落在空洞中，也会返回 memslot。
 ///在这种情况下，将返回空洞边界的其中一个 memslot。

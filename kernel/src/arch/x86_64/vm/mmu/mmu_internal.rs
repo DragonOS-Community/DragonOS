@@ -9,15 +9,16 @@ use x86::vmx::vmcs::{guest, host};
 use system_error::SystemError;
 
 use crate::{
-    arch::{vm::{
-        asm::VmxAsm,
-        kvm_host::{EmulType, KVM_PFN_NOSLOT},
-        mmu::{
-            mmu::{PFRet, PageLevel},
+    arch::{
+        vm::{
+            asm::VmxAsm,
+            kvm_host::{EmulType, KVM_PFN_NOSLOT},
+            mmu::mmu::{PFRet, PageLevel},
+            mtrr::kvm_mtrr_check_gfn_range_consistency,
+            vmx::{ept::EptPageMapper, PageFaultErr},
         },
-        mtrr::kvm_mtrr_check_gfn_range_consistency,
-        vmx::{ept::EptPageMapper, PageFaultErr},
-    }, MMArch},
+        MMArch,
+    },
     kdebug, kwarn,
     libs::spinlock::SpinLockGuard,
     mm::{page::PageFlags, syscall::ProtFlags, virt_2_phys, PhysAddr},
@@ -312,7 +313,10 @@ impl VirtCpu {
             return Ok(PFRet::Continue.into());
         };
         let page_flags = PageFlags::from_prot_flags(ProtFlags::from_bits_truncate(0x7_u64), false);
-        mapper.map(PhysAddr::new(page_fault.gpa() as usize), page_flags);
+        mapper
+            .map(PhysAddr::new(page_fault.gpa() as usize), page_flags)
+            .unwrap()
+            .flush();
         if mapper.is_mapped(page_fault) {
             kdebug!("page fault is mapped now");
         };

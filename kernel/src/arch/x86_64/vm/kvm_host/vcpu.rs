@@ -17,7 +17,8 @@ use x86_64::registers::control::EferFlags;
 
 use crate::arch::vm::asm::VmxAsm;
 use crate::arch::vm::vmx::exit::ExitFastpathCompletion;
-use crate::{kdebug, kwarn};
+use crate::arch::MMArch;
+use crate::mm::MemoryManagementArch;
 use crate::virt::vm::kvm_host::mem::KvmMmuMemoryCache;
 use crate::virt::vm::kvm_host::vcpu::VcpuMode;
 use crate::{
@@ -45,7 +46,9 @@ use crate::{
         user_api::{UapiKvmRun, UapiKvmSegment},
     },
 };
+use crate::{kdebug, kwarn};
 
+use super::io::KvmPioRequest;
 use super::{lapic::KvmLapic, HFlags, KvmCommonRegs, KvmIrqChipMode};
 
 #[derive(Debug)]
@@ -60,7 +63,7 @@ pub struct X86VcpuArch {
     mp_state: MutilProcessorState,
     pub apic_base: u64,
     /// apic
-    pub apic: Option<KvmLapic>,
+    pub apic: Option<Box<KvmLapic>>,
     /// 主机pkru寄存器
     host_pkru: u32,
     pkru: u32,
@@ -148,6 +151,10 @@ pub struct X86VcpuArch {
 
     /* set at EPT violation at this point */
     pub exit_qual: u64,
+
+    pub pio: KvmPioRequest,
+
+    pub pio_data: Box<[u8; MMArch::PAGE_SIZE]>,
 }
 
 impl X86VcpuArch {
@@ -160,7 +167,6 @@ impl X86VcpuArch {
         ret.regs_avail = AllocBitmap::new(32);
         ret.regs_dirty = AllocBitmap::new(32);
         ret.mp_state = MutilProcessorState::Runnable;
-
         ret.apic = None;
         //max_phyaddr=?? fztodo
         *ret
@@ -258,7 +264,6 @@ impl X86VcpuArch {
 
     #[inline]
     pub fn is_pae_paging(&mut self) -> bool {
-
         let flag1 = self.is_long_mode();
         let flag2 = self.is_pae();
         let flag3 = self.is_paging();
@@ -269,7 +274,6 @@ impl X86VcpuArch {
     #[inline]
     pub fn is_pae(&mut self) -> bool {
         !self.read_cr4_bits(Cr4::CR4_ENABLE_PAE).is_empty()
-
     }
     #[inline]
     pub fn is_paging(&mut self) -> bool {
@@ -1489,19 +1493,19 @@ impl VirtCpu {
         }
     }
 
-    pub fn load_pdptrs(&mut self){
+    pub fn load_pdptrs(&mut self) {
         //let mmu = self.arch.mmu();
-        if !self.arch.is_register_dirty(KvmReg::VcpuExregCr3){
+        if !self.arch.is_register_dirty(KvmReg::VcpuExregCr3) {
             return;
         }
-        if self.arch.is_pae_paging(){
+        if self.arch.is_pae_paging() {
             let mmu = self.arch.mmu();
 
             VmxAsm::vmx_vmwrite(guest::PDPTE0_FULL, mmu.pdptrs[0]);
             VmxAsm::vmx_vmwrite(guest::PDPTE0_FULL, mmu.pdptrs[1]);
             VmxAsm::vmx_vmwrite(guest::PDPTE0_FULL, mmu.pdptrs[2]);
             VmxAsm::vmx_vmwrite(guest::PDPTE0_FULL, mmu.pdptrs[3]);
-        }else{
+        } else {
             kdebug!("load_pdptrs: not pae paging");
         }
     }

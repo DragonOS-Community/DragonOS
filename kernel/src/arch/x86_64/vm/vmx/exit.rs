@@ -268,7 +268,28 @@ impl VmxExitHandlers {
     }
 
     fn handle_io(vcpu: &mut VirtCpu) -> Result<u64, SystemError> {
-        todo!();
+        let exit_qualification = vcpu.get_exit_qual();
+        let string = (exit_qualification & 16) != 0;
+
+        vcpu.stat.io_exits += 1;
+
+        if string {
+            todo!("kvm_emulate_instruction todo");
+        }
+
+        let port = exit_qualification >> 16;
+        let size = (exit_qualification & 7) + 1;
+        let is_in = (exit_qualification & 8) != 0;
+
+        return vcpu
+            .arch
+            .kvm_fast_pio(
+                vcpu.run.as_mut().unwrap().as_mut(),
+                size as u32,
+                port as u16,
+                is_in,
+            )
+            .and(Ok(0));
     }
 
     fn handle_external_interrupt(vcpu: &mut VirtCpu) -> Result<u64, SystemError> {

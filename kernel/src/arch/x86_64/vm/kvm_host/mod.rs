@@ -29,6 +29,7 @@ use super::{
     x86_kvm_manager, x86_kvm_ops,
 };
 
+pub mod io;
 pub mod lapic;
 pub mod vcpu;
 #[allow(dead_code)]
@@ -442,6 +443,7 @@ pub struct KvmVcpuStat {
     pub guest_mode: u64,
     pub notify_window_exits: u64,
 }
+
 #[inline]
 /// 将 GFN 转换为 GPA
 pub fn gfn_to_gpa(gfn: u64) -> u64 {

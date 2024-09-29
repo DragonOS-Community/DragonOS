@@ -177,9 +177,7 @@ unsafe impl<'a> crate::Allocator<'a> for ZoneAllocator<'a> {
         slab_callback: &'static dyn CallBack,
     ) -> Result<(), AllocationError> {
         match ZoneAllocator::get_slab(layout.size()) {
-            Slab::Base(idx) => unsafe {
-                self.small_slabs[idx].deallocate(ptr, layout, slab_callback)
-            },
+            Slab::Base(idx) => self.small_slabs[idx].deallocate(ptr, layout, slab_callback),
             Slab::Unsupported => Err(AllocationError::InvalidLayout),
         }
     }

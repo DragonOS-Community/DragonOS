@@ -787,16 +787,36 @@ lazy_static! {
     /// 一个维护全局的 NetlinkTable 向量，每一个元素代表一个 netlink 协议类型，最大数量为 MAX_LINKS
     pub static ref NL_TABLE: RwLock<Vec<NetlinkTable>> = initialize_netlink_table();
 }
+
 pub fn netlink_has_listeners(sk: &NetlinkSock, group: u32) -> i32 {
     log::info!("netlink_has_listeners");
     let mut res = 0;
     let protocol = sk.sk_protocol();
+    
+    // 获取读锁
     let nl_table = NL_TABLE.read();
-    if let Some(listeners) = &nl_table[protocol].listeners {
-        if group - 1 < nl_table[protocol].groups {
-            res = listeners.masks[group as usize - 1] as i32;
-        }
+    
+    // 检查 protocol 是否在范围内
+    if protocol >= nl_table.len() {
+        log::error!("Protocol {} is out of bounds, table's len is {}", protocol, nl_table.len());
+        return res;
     }
+    
+    // 获取对应的 NetlinkTable
+    let netlink_table = &nl_table[protocol];
+    
+    // 检查 listeners 是否存在
+    if let Some(listeners) = &netlink_table.listeners {
+        // 检查 group 是否在范围内
+        if group > 0 && (group as usize - 1) < listeners.masks.len() {
+            res = listeners.masks[group as usize - 1] as i32;
+        } else {
+            log::error!("Group {} is out of bounds", group);
+        }
+    } else {
+        log::error!("Listeners for protocol {} are None", protocol);
+    }
+    
     res
 }
 struct NetlinkBroadcastData<'a> {

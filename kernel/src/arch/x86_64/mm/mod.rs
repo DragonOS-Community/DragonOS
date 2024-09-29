@@ -6,15 +6,13 @@ pub mod pkru;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashSet;
-use log::{debug, info, warn};
+use log::{debug, info};
 use x86::time::rdtsc;
 use x86_64::registers::model_specific::EferFlags;
 
 use crate::driver::serial::serial8250::send_to_default_serial8250_port;
-use crate::include::bindings::bindings::{
-    multiboot2_get_load_base, multiboot2_get_memory, multiboot2_iter, multiboot_mmap_entry_t,
-    multiboot_tag_load_base_addr_t,
-};
+
+use crate::init::boot::boot_callbacks;
 use crate::libs::align::page_align_up;
 use crate::libs::lib_ui::screen_manager::scm_disable_put_to_window;
 use crate::libs::spinlock::SpinLock;
@@ -28,15 +26,13 @@ use crate::{
 };
 
 use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::{PageEntry, PageFlags, PAGE_1G_SHIFT};
-use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr};
+use crate::mm::page::{EntryFlags, PageEntry, PAGE_1G_SHIFT};
+use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr, VmFlags};
 
 use system_error::SystemError;
 
 use core::arch::asm;
-use core::ffi::c_void;
 use core::fmt::Debug;
-use core::mem::{self};
 
 use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
@@ -62,6 +58,12 @@ pub struct X86_64MMBootstrapInfo {
 }
 
 pub(super) static mut BOOTSTRAP_MM_INFO: Option<X86_64MMBootstrapInfo> = None;
+
+pub(super) fn x86_64_set_kernel_load_base_paddr(paddr: PhysAddr) {
+    unsafe {
+        BOOTSTRAP_MM_INFO.as_mut().unwrap().kernel_load_base_paddr = paddr.data();
+    }
+}
 
 /// @brief X86_64的内存管理架构结构体
 #[derive(Debug, Clone, Copy, Hash)]
@@ -125,8 +127,8 @@ impl MemoryManagementArch for X86_64MMArch {
     const USER_STACK_START: VirtAddr = VirtAddr::new(0x6ffff0a00000);
 
     const FIXMAP_START_VADDR: VirtAddr = VirtAddr::new(0xffffb00000000000);
-    /// 设置FIXMAP区域大小为1M
-    const FIXMAP_SIZE: usize = 256 * 4096;
+    /// 设置FIXMAP区域大小为16M
+    const FIXMAP_SIZE: usize = 256 * 4096 * 16;
 
     const MMIO_BASE: VirtAddr = VirtAddr::new(0xffffa10000000000);
     const MMIO_SIZE: usize = 1 << PAGE_1G_SHIFT;
@@ -139,13 +141,13 @@ impl MemoryManagementArch for X86_64MMArch {
             fn _edata();
             fn _erodata();
             fn _end();
+            fn _default_kernel_load_base();
         }
 
         Self::init_xd_rsvd();
-        let load_base_paddr = Self::get_load_base_paddr();
 
         let bootstrap_info = X86_64MMBootstrapInfo {
-            kernel_load_base_paddr: load_base_paddr.data(),
+            kernel_load_base_paddr: _default_kernel_load_base as usize,
             kernel_code_start: _text as usize,
             kernel_code_end: _etext as usize,
             kernel_data_end: _edata as usize,
@@ -157,8 +159,10 @@ impl MemoryManagementArch for X86_64MMArch {
             BOOTSTRAP_MM_INFO = Some(bootstrap_info);
         }
 
-        // 初始化物理内存区域(从multiboot2中获取)
-        Self::init_memory_area_from_multiboot2().expect("init memory area failed");
+        // 初始化物理内存区域
+        boot_callbacks()
+            .early_init_memory_blocks()
+            .expect("init memory area failed");
 
         debug!("bootstrap info: {:?}", unsafe { BOOTSTRAP_MM_INFO });
         debug!("phys[0]=virt[0x{:x}]", unsafe {
@@ -168,7 +172,7 @@ impl MemoryManagementArch for X86_64MMArch {
         // 初始化内存管理器
         unsafe { allocator_init() };
 
-        send_to_default_serial8250_port("x86 64 init done\n\0".as_bytes());
+        send_to_default_serial8250_port("x86 64 mm init done\n\0".as_bytes());
     }
 
     /// @brief 刷新TLB中，关于指定虚拟地址的条目
@@ -326,76 +330,96 @@ impl MemoryManagementArch for X86_64MMArch {
         }
         pkru::pkru_allows_pkey(pkru::vma_pkey(vma), write)
     }
+
+    const PROTECTION_MAP: [EntryFlags<MMArch>; 16] = protection_map();
+
+    const PAGE_NONE: usize =
+        Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_ACCESSED | Self::ENTRY_FLAG_GLOBAL;
+
+    const PAGE_SHARED: usize = Self::ENTRY_FLAG_PRESENT
+        | Self::ENTRY_FLAG_READWRITE
+        | Self::ENTRY_FLAG_USER
+        | Self::ENTRY_FLAG_ACCESSED
+        | Self::ENTRY_FLAG_NO_EXEC;
+
+    const PAGE_SHARED_EXEC: usize = Self::ENTRY_FLAG_PRESENT
+        | Self::ENTRY_FLAG_READWRITE
+        | Self::ENTRY_FLAG_USER
+        | Self::ENTRY_FLAG_ACCESSED;
+
+    const PAGE_COPY_NOEXEC: usize = Self::ENTRY_FLAG_PRESENT
+        | Self::ENTRY_FLAG_USER
+        | Self::ENTRY_FLAG_ACCESSED
+        | Self::ENTRY_FLAG_NO_EXEC;
+
+    const PAGE_COPY_EXEC: usize =
+        Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_USER | Self::ENTRY_FLAG_ACCESSED;
+
+    const PAGE_COPY: usize = Self::ENTRY_FLAG_PRESENT
+        | Self::ENTRY_FLAG_USER
+        | Self::ENTRY_FLAG_ACCESSED
+        | Self::ENTRY_FLAG_NO_EXEC;
+
+    const PAGE_READONLY: usize = Self::ENTRY_FLAG_PRESENT
+        | Self::ENTRY_FLAG_USER
+        | Self::ENTRY_FLAG_ACCESSED
+        | Self::ENTRY_FLAG_NO_EXEC;
+
+    const PAGE_READONLY_EXEC: usize =
+        Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_USER | Self::ENTRY_FLAG_ACCESSED;
+
+    const PAGE_READ: usize = 0;
+    const PAGE_READ_EXEC: usize = 0;
+    const PAGE_WRITE: usize = 0;
+    const PAGE_WRITE_EXEC: usize = 0;
+    const PAGE_EXEC: usize = 0;
+}
+
+/// 获取保护标志的映射表
+///
+///
+/// ## 返回值
+/// - `[usize; 16]`: 长度为16的映射表
+const fn protection_map() -> [EntryFlags<MMArch>; 16] {
+    let mut map = [unsafe { EntryFlags::from_data(0) }; 16];
+    unsafe {
+        map[VmFlags::VM_NONE.bits()] = EntryFlags::from_data(MMArch::PAGE_NONE);
+        map[VmFlags::VM_READ.bits()] = EntryFlags::from_data(MMArch::PAGE_READONLY);
+        map[VmFlags::VM_WRITE.bits()] = EntryFlags::from_data(MMArch::PAGE_COPY);
+        map[VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_COPY);
+        map[VmFlags::VM_EXEC.bits()] = EntryFlags::from_data(MMArch::PAGE_READONLY_EXEC);
+        map[VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_READONLY_EXEC);
+        map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_COPY_EXEC);
+        map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_COPY_EXEC);
+        map[VmFlags::VM_SHARED.bits()] = EntryFlags::from_data(MMArch::PAGE_NONE);
+        map[VmFlags::VM_SHARED.bits() | VmFlags::VM_READ.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_READONLY);
+        map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_SHARED);
+        map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_SHARED);
+        map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_READONLY_EXEC);
+        map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_READONLY_EXEC);
+        map[VmFlags::VM_SHARED.bits() | VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] =
+            EntryFlags::from_data(MMArch::PAGE_SHARED_EXEC);
+        map[VmFlags::VM_SHARED.bits()
+            | VmFlags::VM_EXEC.bits()
+            | VmFlags::VM_WRITE.bits()
+            | VmFlags::VM_READ.bits()] = EntryFlags::from_data(MMArch::PAGE_SHARED_EXEC);
+    }
+    // if X86_64MMArch::is_xd_reserved() {
+    //     map.iter_mut().for_each(|x| *x &= !Self::ENTRY_FLAG_NO_EXEC)
+    // }
+    map
 }
 
 impl X86_64MMArch {
-    unsafe fn get_load_base_paddr() -> PhysAddr {
-        let mut mb2_lb_info: [multiboot_tag_load_base_addr_t; 512] = mem::zeroed();
-        send_to_default_serial8250_port("get_load_base_paddr begin\n\0".as_bytes());
-
-        let mut mb2_count: u32 = 0;
-        multiboot2_iter(
-            Some(multiboot2_get_load_base),
-            &mut mb2_lb_info as *mut [multiboot_tag_load_base_addr_t; 512] as usize as *mut c_void,
-            &mut mb2_count,
-        );
-
-        if mb2_count == 0 {
-            send_to_default_serial8250_port(
-                "get_load_base_paddr mb2_count == 0, default to 1MB\n\0".as_bytes(),
-            );
-            return PhysAddr::new(0x100000);
-        }
-
-        let phys = mb2_lb_info[0].load_base_addr as usize;
-
-        return PhysAddr::new(phys);
-    }
-    unsafe fn init_memory_area_from_multiboot2() -> Result<usize, SystemError> {
-        // 这个数组用来存放内存区域的信息（从C获取）
-        let mut mb2_mem_info: [multiboot_mmap_entry_t; 512] = mem::zeroed();
-        send_to_default_serial8250_port("init_memory_area_from_multiboot2 begin\n\0".as_bytes());
-
-        let mut mb2_count: u32 = 0;
-        multiboot2_iter(
-            Some(multiboot2_get_memory),
-            &mut mb2_mem_info as *mut [multiboot_mmap_entry_t; 512] as usize as *mut c_void,
-            &mut mb2_count,
-        );
-        send_to_default_serial8250_port("init_memory_area_from_multiboot2 2\n\0".as_bytes());
-
-        let mb2_count = mb2_count as usize;
-        let mut areas_count = 0usize;
-        let mut total_mem_size = 0usize;
-        for info_entry in mb2_mem_info.iter().take(mb2_count) {
-            // Only use the memory area if its type is 1 (RAM)
-            if info_entry.type_ == 1 {
-                // Skip the memory area if its len is 0
-                if info_entry.len == 0 {
-                    continue;
-                }
-
-                total_mem_size += info_entry.len as usize;
-
-                mem_block_manager()
-                    .add_block(
-                        PhysAddr::new(info_entry.addr as usize),
-                        info_entry.len as usize,
-                    )
-                    .unwrap_or_else(|e| {
-                        warn!(
-                            "Failed to add memory block: base={:#x}, size={:#x}, error={:?}",
-                            info_entry.addr, info_entry.len, e
-                        );
-                    });
-                areas_count += 1;
-            }
-        }
-        send_to_default_serial8250_port("init_memory_area_from_multiboot2 end\n\0".as_bytes());
-        info!("Total memory size: {} MB, total areas from multiboot2: {mb2_count}, valid areas: {areas_count}", total_mem_size / 1024 / 1024);
-        return Ok(areas_count);
-    }
-
     fn init_xd_rsvd() {
         // 读取ia32-EFER寄存器的值
         let efer: EferFlags = x86_64::registers::model_specific::Efer::read();
@@ -650,17 +674,17 @@ impl FrameAllocator for LockedFrameAllocator {
 }
 
 /// 获取内核地址默认的页面标志
-pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> PageFlags<A> {
+pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> EntryFlags<A> {
     let info: X86_64MMBootstrapInfo = BOOTSTRAP_MM_INFO.unwrap();
 
     if virt.data() >= info.kernel_code_start && virt.data() < info.kernel_code_end {
         // Remap kernel code  execute
-        return PageFlags::new().set_execute(true).set_write(true);
+        return EntryFlags::new().set_execute(true).set_write(true);
     } else if virt.data() >= info.kernel_data_end && virt.data() < info.kernel_rodata_end {
         // Remap kernel rodata read only
-        return PageFlags::new().set_execute(true);
+        return EntryFlags::new().set_execute(true);
     } else {
-        return PageFlags::new().set_write(true).set_execute(true);
+        return EntryFlags::new().set_write(true).set_execute(true);
     }
 }
 

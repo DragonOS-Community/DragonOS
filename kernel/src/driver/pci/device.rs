@@ -13,7 +13,10 @@ use crate::{
         kset::KSet,
     },
     filesystem::kernfs::KernFSInode,
-    libs::{rwlock::RwLockWriteGuard, spinlock::SpinLock},
+    libs::{
+        rwlock::RwLockWriteGuard,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
 };
 
 use super::{
@@ -41,10 +44,8 @@ impl PciDeviceManager {
     /// - Err(e) :失败原因
     pub fn device_add(&self, pci_dev: Arc<dyn PciDevice>) -> Result<(), SystemError> {
         // pci设备一般放置在/sys/device/pci:xxxx下
-        if pci_dev.parent().is_none() {
-            pci_dev.set_parent(Some(Arc::downgrade(
-                &(pci_bus_device() as Arc<dyn KObject>),
-            )));
+        if pci_dev.dev_parent().is_none() {
+            pci_dev.set_dev_parent(Some(Arc::downgrade(&(pci_bus_device() as Arc<dyn Device>))));
         }
         // 设置设备的总线
         pci_dev.set_bus(Some(Arc::downgrade(&(pci_bus() as Arc<dyn Bus>))));
@@ -90,26 +91,34 @@ pub trait PciDevice: Device {
 #[derive(Debug)]
 #[cast_to([sync] Device)]
 pub struct PciBusDevice {
-    // inner: SpinLock<InnerPciBusDevice>,
-    device_data: SpinLock<DeviceCommonData>,
-    kobj_data: SpinLock<KObjectCommonData>,
+    inner: SpinLock<InnerPciBusDevice>,
     kobj_state: LockedKObjectState,
     name: String,
 }
 
 impl PciBusDevice {
     pub fn new(parent: Option<Weak<dyn KObject>>) -> Arc<Self> {
-        let common_device = DeviceCommonData::default();
-        let common_kobj = KObjectCommonData::default();
         let bus_device = Self {
-            device_data: SpinLock::new(common_device),
-            kobj_data: SpinLock::new(common_kobj),
+            inner: SpinLock::new(InnerPciBusDevice {
+                kobject_common: KObjectCommonData::default(),
+                device_common: DeviceCommonData::default(),
+            }),
             kobj_state: LockedKObjectState::new(None),
             name: "pci".to_string(),
         };
         bus_device.set_parent(parent);
         return Arc::new(bus_device);
     }
+
+    fn inner(&self) -> SpinLockGuard<InnerPciBusDevice> {
+        self.inner.lock()
+    }
+}
+
+#[derive(Debug)]
+struct InnerPciBusDevice {
+    kobject_common: KObjectCommonData,
+    device_common: DeviceCommonData,
 }
 
 impl KObject for PciBusDevice {
@@ -118,27 +127,27 @@ impl KObject for PciBusDevice {
     }
 
     fn parent(&self) -> Option<alloc::sync::Weak<dyn KObject>> {
-        self.kobj_data.lock().parent.clone()
+        self.inner().kobject_common.parent.clone()
     }
 
     fn inode(&self) -> Option<Arc<KernFSInode>> {
-        self.kobj_data.lock().kern_inode.clone()
+        self.inner().kobject_common.kern_inode.clone()
     }
 
     fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
-        self.kobj_data.lock().kern_inode = inode;
+        self.inner().kobject_common.kern_inode = inode;
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.kobj_data.lock().kobj_type
+        self.inner().kobject_common.kobj_type
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
-        self.kobj_data.lock().kobj_type = ktype
+        self.inner().kobject_common.kobj_type = ktype
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {
-        self.kobj_data.lock().kset.clone()
+        self.inner().kobject_common.kset.clone()
     }
 
     fn kobj_state(
@@ -164,11 +173,11 @@ impl KObject for PciBusDevice {
     }
 
     fn set_kset(&self, kset: Option<Arc<KSet>>) {
-        self.kobj_data.lock().kset = kset;
+        self.inner().kobject_common.kset = kset;
     }
 
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
-        self.kobj_data.lock().parent = parent;
+        self.inner().kobject_common.parent = parent;
     }
 }
 
@@ -182,15 +191,15 @@ impl Device for PciBusDevice {
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {
-        self.device_data.lock().bus.clone()
+        self.inner().device_common.bus.clone()
     }
 
     fn set_bus(&self, bus: Option<alloc::sync::Weak<dyn Bus>>) {
-        self.device_data.lock().bus = bus
+        self.inner().device_common.bus = bus
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
-        self.device_data.lock().driver.clone()?.upgrade()
+        self.inner().device_common.driver.clone()?.upgrade()
     }
 
     fn is_dead(&self) -> bool {
@@ -198,7 +207,7 @@ impl Device for PciBusDevice {
     }
 
     fn set_driver(&self, driver: Option<alloc::sync::Weak<dyn Driver>>) {
-        self.device_data.lock().driver = driver;
+        self.inner().device_common.driver = driver;
     }
 
     fn can_match(&self) -> bool {
@@ -215,5 +224,13 @@ impl Device for PciBusDevice {
 
     fn state_synced(&self) -> bool {
         todo!()
+    }
+
+    fn dev_parent(&self) -> Option<alloc::sync::Weak<dyn Device>> {
+        self.inner().device_common.get_parent_weak_or_clear()
+    }
+
+    fn set_dev_parent(&self, dev_parent: Option<alloc::sync::Weak<dyn Device>>) {
+        self.inner().device_common.parent = dev_parent;
     }
 }

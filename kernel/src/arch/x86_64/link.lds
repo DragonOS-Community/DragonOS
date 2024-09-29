@@ -9,10 +9,11 @@ SECTIONS
 	//KERNEL_VMA = 0;
 	. = 0;
 	. = 0x100000;
-	
+	_default_kernel_load_base = .;
 	.boot.text :
 	{
 		KEEP(*(.multiboot_header))
+		KEEP(*(.multiboot2_header))
 		*(.bootstrap)
 		*(.bootstrap.code64)
 		*(.bootstrap.data)

@@ -1,4 +1,4 @@
-use core::intrinsics::unlikely;
+use core::{intrinsics::unlikely, slice::from_raw_parts};
 
 use alloc::sync::Arc;
 use log::error;
@@ -6,6 +6,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
+    driver::base::block::SeekFrom,
     ipc::shm::ShmFlags,
     libs::align::{check_aligned, page_align_up},
     mm::MemoryManagementArch,
@@ -15,7 +16,7 @@ use crate::{
 use super::{
     allocator::page_frame::{PageFrameCount, VirtPageFrame},
     ucontext::{AddressSpace, DEFAULT_MMAP_MIN_ADDR},
-    verify_area, VirtAddr, VmFlags,
+    verify_area, MsFlags, VirtAddr, VmFlags,
 };
 
 bitflags! {
@@ -152,6 +153,10 @@ impl From<MapFlags> for VmFlags {
 
         if map_flags.contains(MapFlags::MAP_SYNC) {
             vm_flags |= VmFlags::VM_SYNC;
+        }
+
+        if map_flags.contains(MapFlags::MAP_SHARED) {
+            vm_flags |= VmFlags::VM_SHARED;
         }
 
         vm_flags
@@ -296,8 +301,8 @@ impl Syscall {
         len: usize,
         prot_flags: usize,
         map_flags: usize,
-        _fd: i32,
-        _offset: usize,
+        fd: i32,
+        offset: usize,
     ) -> Result<usize, SystemError> {
         let map_flags = MapFlags::from_bits_truncate(map_flags as u64);
         let prot_flags = ProtFlags::from_bits_truncate(prot_flags as u64);
@@ -311,11 +316,6 @@ impl Syscall {
             );
             return Err(SystemError::EINVAL);
         }
-        // 暂时不支持除匿名页以外的映射
-        if !map_flags.contains(MapFlags::MAP_ANONYMOUS) {
-            error!("mmap: not support file mapping");
-            return Err(SystemError::ENOSYS);
-        }
 
         // 暂时不支持巨页映射
         if map_flags.contains(MapFlags::MAP_HUGETLB) {
@@ -323,14 +323,30 @@ impl Syscall {
             return Err(SystemError::ENOSYS);
         }
         let current_address_space = AddressSpace::current()?;
-        let start_page = current_address_space.write().map_anonymous(
-            start_vaddr,
-            len,
-            prot_flags,
-            map_flags,
-            true,
-            false,
-        )?;
+        let start_page = if map_flags.contains(MapFlags::MAP_ANONYMOUS) {
+            // 匿名映射
+            current_address_space.write().map_anonymous(
+                start_vaddr,
+                len,
+                prot_flags,
+                map_flags,
+                true,
+                false,
+            )?
+        } else {
+            // 文件映射
+            current_address_space.write().file_mapping(
+                start_vaddr,
+                len,
+                prot_flags,
+                map_flags,
+                fd,
+                offset,
+                true,
+                false,
+            )?
+        };
+
         return Ok(start_page.virt_address().data());
     }
 
@@ -390,7 +406,7 @@ impl Syscall {
             return Err(SystemError::EINVAL);
         }
         let vma = vma.unwrap();
-        let vm_flags = *vma.lock().vm_flags();
+        let vm_flags = *vma.lock_irqsave().vm_flags();
 
         // 暂时不支持巨页映射
         if vm_flags.contains(VmFlags::VM_HUGETLB) {
@@ -523,5 +539,116 @@ impl Syscall {
             .madvise(start_frame, page_count, madv_flags)
             .map_err(|_| SystemError::EINVAL)?;
         return Ok(0);
+    }
+
+    /// ## msync系统调用
+    ///
+    /// ## 参数
+    ///
+    /// - `start`：起始地址(已经对齐到页)
+    /// - `len`：长度(已经对齐到页)
+    /// - `flags`：标志
+    pub fn msync(start: VirtAddr, len: usize, flags: usize) -> Result<usize, SystemError> {
+        if !start.check_aligned(MMArch::PAGE_SIZE) || !check_aligned(len, MMArch::PAGE_SIZE) {
+            return Err(SystemError::EINVAL);
+        }
+
+        if unlikely(verify_area(start, len).is_err()) {
+            return Err(SystemError::EINVAL);
+        }
+        if unlikely(len == 0) {
+            return Err(SystemError::EINVAL);
+        }
+
+        let mut start = start.data();
+        let end = start + len;
+        let flags = MsFlags::from_bits_truncate(flags);
+        let mut unmapped_error = Ok(0);
+
+        if !flags.intersects(MsFlags::MS_ASYNC | MsFlags::MS_INVALIDATE | MsFlags::MS_SYNC) {
+            return Err(SystemError::EINVAL);
+        }
+
+        if flags.contains(MsFlags::MS_ASYNC | MsFlags::MS_SYNC) {
+            return Err(SystemError::EINVAL);
+        }
+
+        if end < start {
+            return Err(SystemError::ENOMEM);
+        }
+
+        if start == end {
+            return Ok(0);
+        }
+
+        let current_address_space = AddressSpace::current()?;
+        let mut err = Err(SystemError::ENOMEM);
+        let mut next_vma = current_address_space
+            .read()
+            .mappings
+            .find_nearest(VirtAddr::new(start));
+        loop {
+            if let Some(vma) = next_vma.clone() {
+                let guard = vma.lock_irqsave();
+                let vm_start = guard.region().start().data();
+                let vm_end = guard.region().end().data();
+                if start < vm_start {
+                    if flags == MsFlags::MS_ASYNC {
+                        break;
+                    }
+                    start = vm_start;
+                    if start >= vm_end {
+                        break;
+                    }
+                    unmapped_error = Err(SystemError::ENOMEM);
+                }
+                let vm_flags = *guard.vm_flags();
+                if flags.contains(MsFlags::MS_INVALIDATE) && vm_flags.contains(VmFlags::VM_LOCKED) {
+                    err = Err(SystemError::EBUSY);
+                    break;
+                }
+                let file = guard.vm_file();
+                let fstart = (start - vm_start)
+                    + (guard.file_page_offset().unwrap_or(0) << MMArch::PAGE_SHIFT);
+                let fend = fstart + (core::cmp::min(end, vm_end) - start) - 1;
+                let old_start = start;
+                start = vm_end;
+                // log::info!("flags: {:?}", flags);
+                // log::info!("vm_flags: {:?}", vm_flags);
+                // log::info!("file: {:?}", file);
+                if flags.contains(MsFlags::MS_SYNC) && vm_flags.contains(VmFlags::VM_SHARED) {
+                    if let Some(file) = file {
+                        let old_pos = file.lseek(SeekFrom::SeekCurrent(0)).unwrap();
+                        file.lseek(SeekFrom::SeekSet(fstart as i64)).unwrap();
+                        err = file.write(len, unsafe {
+                            from_raw_parts(old_start as *mut u8, fend - fstart + 1)
+                        });
+                        file.lseek(SeekFrom::SeekSet(old_pos as i64)).unwrap();
+                        if err.is_err() {
+                            break;
+                        } else if start >= end {
+                            err = unmapped_error;
+                            break;
+                        }
+                        next_vma = current_address_space
+                            .read()
+                            .mappings
+                            .find_nearest(VirtAddr::new(start));
+                    }
+                } else {
+                    if start >= end {
+                        err = unmapped_error;
+                        break;
+                    }
+                    next_vma = current_address_space
+                        .read()
+                        .mappings
+                        .find_nearest(VirtAddr::new(vm_end));
+                }
+            } else {
+                return Err(SystemError::ENOMEM);
+            }
+        }
+        return err;
     }
 }

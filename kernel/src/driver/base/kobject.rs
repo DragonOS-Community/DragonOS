@@ -178,18 +178,17 @@ impl SysFSOps for KObjectSysFSOps {
 pub struct KObjectManager;
 
 impl KObjectManager {
-    #[allow(dead_code)]
     pub fn init_and_add_kobj(
         kobj: Arc<dyn KObject>,
         join_kset: Option<Arc<KSet>>,
+        kobj_type: Option<&'static dyn KObjType>,
     ) -> Result<(), SystemError> {
-        Self::kobj_init(&kobj);
+        Self::kobj_init(&kobj, kobj_type);
         Self::add_kobj(kobj, join_kset)
     }
 
-    #[allow(dead_code)]
-    pub fn kobj_init(kobj: &Arc<dyn KObject>) {
-        kobj.set_kobj_type(Some(&DynamicKObjKType));
+    pub fn kobj_init(kobj: &Arc<dyn KObject>, kobj_type: Option<&'static dyn KObjType>) {
+        kobj.set_kobj_type(kobj_type);
     }
 
     pub fn add_kobj(

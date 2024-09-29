@@ -1,14 +1,18 @@
-use core::sync::atomic::AtomicUsize;
-
 use alloc::sync::Arc;
 use mnt_namespace::{FsStruct, MntNamespace};
 use pid_namespace::PidNamespace;
+use system_error::SystemError;
+use user_namespace::UserNamespace;
 
-use crate::libs::spinlock::SpinLock;
+use crate::{
+    libs::spinlock::SpinLock,
+    process::{fork::CloneFlags, ProcessControlBlock},
+};
 
 pub mod mnt_namespace;
 pub mod namespace;
 pub mod pid_namespace;
+pub mod syscall;
 pub mod ucount;
 pub mod user_namespace;
 
@@ -18,9 +22,8 @@ pub struct NsSet {
     nsproxy: NsProxy,
     fs: Arc<SpinLock<FsStruct>>,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NsProxy {
-    pub count: AtomicUsize,
     pub pid_namespace: Option<Arc<PidNamespace>>,
     pub mnt_namespace: Option<Arc<MntNamespace>>,
 }
@@ -28,11 +31,48 @@ pub struct NsProxy {
 impl NsProxy {
     pub fn new() -> Self {
         Self {
-            count: AtomicUsize::new(1),
             pid_namespace: None,
             mnt_namespace: None,
         }
     }
+
+    pub fn set_pid_namespace(&mut self, new_pid_ns: Option<Arc<PidNamespace>>) {
+        self.pid_namespace = new_pid_ns;
+    }
+
+    pub fn set_mnt_namespace(&mut self, new_mnt_ns: Option<Arc<MntNamespace>>) {
+        self.mnt_namespace = new_mnt_ns;
+    }
+}
+
+pub fn create_new_namespaces(
+    clone_flags: u64,
+    pcb: &Arc<ProcessControlBlock>,
+    user_ns: Arc<UserNamespace>,
+) -> Result<NsProxy, SystemError> {
+    let mut nsproxy = NsProxy::new();
+    // pid_namespace
+    let new_pid_ns = if (clone_flags & CloneFlags::CLONE_NEWPID.bits()) != 0 {
+        Some(Arc::new(PidNamespace::new()?.create_pid_namespace(
+            pcb.get_nsproxy().read().pid_namespace.clone(),
+            user_ns.clone(),
+        )?))
+    } else {
+        pcb.get_nsproxy().read().pid_namespace.clone()
+    };
+    nsproxy.set_pid_namespace(new_pid_ns);
+
+    // mnt_namespace
+    let new_mnt_ns = if clone_flags & CloneFlags::CLONE_NEWNS.bits() != 0 {
+        Some(Arc::new(
+            MntNamespace::new()?.create_mnt_namespace(user_ns.clone(), false)?,
+        ))
+    } else {
+        pcb.get_nsproxy().read().mnt_namespace.clone()
+    };
+    nsproxy.set_mnt_namespace(new_mnt_ns);
+
+    Ok(nsproxy)
 }
 
 #[macro_export]

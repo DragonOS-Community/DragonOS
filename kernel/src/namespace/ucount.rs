@@ -53,10 +53,15 @@ impl UCounts {
             ns: Arc::new(UserNamespace::new()?),
             uid: 0,
             count: AtomicU32::new(1),
-            ucount: Vec::new(),
-            rlimit: Vec::new(),
+            ucount: (0..UcountCounts as usize)
+                .map(|_| AtomicU32::new(0))
+                .collect(),
+            rlimit: (0..UcountRlimitCounts as usize)
+                .map(|_| AtomicU32::new(0))
+                .collect(),
         })
     }
+
     fn alloc_ucounts(&self, ns: Arc<UserNamespace>, uid: uid_t) -> Arc<Self> {
         let mut counts = COUNT_MANAGER.counts.lock();
         let key = UKey {
@@ -72,8 +77,12 @@ impl UCounts {
                 ns,
                 uid,
                 count: AtomicU32::new(1),
-                ucount: Vec::with_capacity(UcountCounts as usize),
-                rlimit: Vec::with_capacity(UcountRlimitCounts as usize),
+                ucount: (0..UcountCounts as usize)
+                    .map(|_| AtomicU32::new(0))
+                    .collect(),
+                rlimit: (0..UcountRlimitCounts as usize)
+                    .map(|_| AtomicU32::new(0))
+                    .collect(),
             })
         };
         counts.insert(key, uc.clone());

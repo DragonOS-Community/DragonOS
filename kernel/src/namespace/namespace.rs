@@ -7,6 +7,10 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use system_error::SystemError;
 
+// 目前无credit功能，采用全局静态的user_namespace
+lazy_static! {
+    pub static ref USER_NS: Arc<UserNamespace> = Arc::new(UserNamespace::new().unwrap());
+}
 use super::NsSet;
 pub trait NsOperations: Send + Sync + Debug {
     fn get(&self, pid: Pid) -> Option<Arc<NsCommon>>;

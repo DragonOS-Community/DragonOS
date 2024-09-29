@@ -31,7 +31,7 @@ pub struct PidNamespace {
     /// 已经分配的进程数
     pid_allocated: u32,
     /// 当前的pid_namespace所在的层数
-    level: usize,
+    pub level: usize,
     /// 父命名空间
     parent: Option<Arc<PidNamespace>>,
     /// 资源计数器
@@ -45,15 +45,15 @@ pub struct PidNamespace {
 }
 #[derive(Debug, Clone)]
 pub struct PidStrcut {
-    pid: Pid,
-    level: usize,
-    numbers: Vec<UPid>,
-    stashed: Arc<dyn IndexNode>,
+    pub pid: Pid,
+    pub level: usize,
+    pub numbers: Vec<UPid>,
+    pub stashed: Arc<dyn IndexNode>,
 }
 #[derive(Debug, Clone)]
-struct UPid {
-    nr: usize, // 在某个pid_namespace 中的pid号
-    ns: Arc<PidNamespace>,
+pub struct UPid {
+    pub nr: Pid, // 在某个pid_namespace 中的pid号
+    pub ns: Arc<PidNamespace>,
 }
 
 impl UPid {
@@ -73,11 +73,7 @@ impl PidStrcut {
 
     pub fn put_pid(pid: Pid) {}
 
-    pub fn alloc_pid(
-        ns: Arc<PidNamespace>,
-        pid: Pid,
-        set_tid: Vec<usize>,
-    ) -> Result<PidStrcut, SystemError> {
+    pub fn alloc_pid(ns: Arc<PidNamespace>, set_tid: Vec<usize>) -> Result<PidStrcut, SystemError> {
         if set_tid.len() > ns.level + 1 {
             return Err(SystemError::EINVAL);
         }
@@ -102,11 +98,17 @@ impl PidStrcut {
                     return Err(SystemError::EINVAL);
                 }
             }
-            numbers.insert(i, UPid { nr, ns: ns.clone() });
+            numbers.insert(
+                i,
+                UPid {
+                    nr: Pid::from(nr),
+                    ns: ns.clone(),
+                },
+            );
         }
 
         Ok(Self {
-            pid,
+            pid: numbers.last().unwrap().nr,
             level: ns.level,
             numbers,
             stashed: ROOT_INODE(),
@@ -166,6 +168,7 @@ impl NsOperations for PidNsOperations {
         let pcb = ProcessManager::find(pid);
         pcb.and_then(|pcb| {
             pcb.get_nsproxy()
+                .read()
                 .pid_namespace
                 .clone()
                 .and_then(|ns| Some(ns.ns_common.clone()))
@@ -230,6 +233,11 @@ impl PidNamespace {
             "pid".to_string(),
         )))?);
         let stashed = ROOT_INODE().find("proc")?;
+        let child_reaper = if let Some(parent_ns) = &parent {
+            parent_ns.child_reaper.clone()
+        } else {
+            Arc::new(RwLock::new(PidStrcut::new()))
+        };
         Ok(Self {
             id_alloctor: IdAllocator::new(1, PID_MAX),
             pid_allocated: PIDNS_ADDING,
@@ -238,7 +246,7 @@ impl PidNamespace {
             parent,
             user_ns,
             ns_common,
-            child_reaper: Arc::new(RwLock::new(PidStrcut::new())), //默认为init进程，在clone的时候改变
+            child_reaper,
         })
     }
 

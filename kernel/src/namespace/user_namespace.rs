@@ -16,9 +16,10 @@ use crate::process::Pid;
 use alloc::sync::Arc;
 
 use super::namespace::NsOperations;
+use super::ucount::UcountType::UcountCounts;
 
 const UID_GID_MAP_MAX_BASE_EXTENTS: usize = 5;
-
+const UCOUNT_MAX: u32 = 62636;
 /// 管理用户ID和组ID的映射
 #[derive(Clone, Debug)]
 struct UidGidMap {
@@ -117,9 +118,9 @@ impl UserNamespace {
                 "User".to_string(),
             )))?),
             pid: Arc::new(RwLock::new(Pid::new(1))),
-            ucount_max: Vec::new(),
+            ucount_max: vec![UCOUNT_MAX; UcountCounts as usize],
             ucounts: None,
-            rlimit_max: Vec::new(),
+            rlimit_max: vec![65535, 10, 32000, 64 * 1024],
         })
     }
 }

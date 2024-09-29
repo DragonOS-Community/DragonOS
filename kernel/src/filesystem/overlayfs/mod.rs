@@ -37,7 +37,6 @@ struct OvlInode {
     redirect: String, // 重定向路径
     file_type: FileType,
     flags: SpinLock<u64>,
-    lock: Mutex<()>,
     upper_inode: SpinLock<Option<Arc<dyn IndexNode>>>, // 读写层
     lower_inode: Option<Arc<dyn IndexNode>>,           // 只读层
     oe: Arc<OvlEntry>,
@@ -190,7 +189,6 @@ impl IndexNode for OvlInode {
         name: &str,
         mode: vfs::syscall::ModeType,
     ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
-        let _lock = self.lock.lock();
         if let Some(ref upper_inode) = *self.upper_inode.lock() {
             upper_inode.mkdir(name, mode)
         } else {
@@ -199,7 +197,6 @@ impl IndexNode for OvlInode {
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
-        let _lock = self.lock.lock();
         let upper_inode = self.upper_inode.lock();
         if let Some(ref upper_inode) = *upper_inode {
             upper_inode.rmdir(name)?;
@@ -219,7 +216,6 @@ impl IndexNode for OvlInode {
     }
 
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
-        let _lock = self.lock.lock();
         let upper_inode = self.upper_inode.lock();
         if let Some(ref upper_inode) = *upper_inode {
             upper_inode.unlink(name)?;
@@ -243,7 +239,6 @@ impl IndexNode for OvlInode {
         name: &str,
         other: &Arc<dyn IndexNode>,
     ) -> Result<(), system_error::SystemError> {
-        let _lock = self.lock.lock();
         if let Some(ref upper_inode) = *self.upper_inode.lock() {
             upper_inode.link(name, other)
         } else {
@@ -257,7 +252,6 @@ impl IndexNode for OvlInode {
         file_type: vfs::FileType,
         mode: vfs::syscall::ModeType,
     ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
-        let _lock = self.lock.lock();
         if let Some(ref upper_inode) = *self.upper_inode.lock() {
             upper_inode.create(name, file_type, mode)
         } else {
@@ -291,7 +285,6 @@ impl IndexNode for OvlInode {
         mode: vfs::syscall::ModeType,
         dev_t: crate::driver::base::device::device_number::DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
-        let _lock = self.lock.lock();
         let upper_inode = self.upper_inode.lock();
         if let Some(ref inode) = *upper_inode {
             inode.mknod(filename, mode, dev_t)

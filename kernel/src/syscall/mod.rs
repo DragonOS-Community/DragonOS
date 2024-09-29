@@ -1121,6 +1121,7 @@ impl Syscall {
             }
             #[cfg(target_arch = "x86_64")]
             SYS_UTIMES => Self::sys_utimes(args[0] as *const u8, args[1] as *const PosixTimeval),
+            SYS_UNSHARE => Self::sys_unshare(args[0] as u64),
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

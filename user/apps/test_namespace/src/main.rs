@@ -6,12 +6,12 @@ use std::ffi::CString;
 use std::process;
 
 fn main() {
-    // 定义新的 PID 和 MNT namespaces
     let clone_flags = CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS;
+
+    println!("Parent process. PID: {}", unistd::getpid());
     unsafe {
         match fork() {
             Ok(ForkResult::Parent { child }) => {
-                // 父进程等待子进程
                 println!("Parent process. Child PID: {}", child);
                 match waitpid(child, None) {
                     Ok(WaitStatus::Exited(pid, status)) => {
@@ -22,20 +22,12 @@ fn main() {
                 }
             }
             Ok(ForkResult::Child) => {
-                // 子进程：在新 namespace 中执行
+                // 使用 unshare 创建新的命名空间
+                if let Err(e) = sched::unshare(clone_flags) {
+                    println!("Failed to unshare: {:?}", e);
+                    process::exit(1);
+                }
                 println!("Child process. PID: {}", unistd::getpid());
-
-                // 使用 `unshare` 创建新的 namespaces
-                sched::unshare(clone_flags).expect("Failed to unshare");
-
-                // 执行命令或脚本来检查 namespace 的隔离效果
-                let cmd = CString::new("/bin/bash").expect("CString::new failed");
-                let args = [
-                    CString::new("-c").expect("CString::new failed"),
-                    CString::new("echo 'Running in new PID namespace'; sleep 5; /bin/bash")
-                        .expect("CString::new failed"),
-                ];
-                execvp(&cmd, &args).expect("Failed to execvp");
             }
             Err(err) => {
                 println!("Fork failed: {:?}", err);

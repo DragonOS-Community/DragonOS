@@ -37,6 +37,7 @@ pub struct MntNamespace {
     root: Option<Arc<MountFS>>,
     /// 红黑树用于挂载所有挂载点
     mounts: RBTree<InodeId, MountFSInode>,
+    /// 等待队列
     poll: WaitQueue,
     ///  挂载序列号
     seq: AtomicU64,
@@ -53,6 +54,7 @@ struct MntNsOperations {
 }
 
 /// 使用该结构体的时候加spinlock
+#[derive(Clone)]
 pub struct FsStruct {
     umask: u32,   //文件权限掩码
     in_exec: u32, // 是否正在执行exec
@@ -90,6 +92,7 @@ impl NsOperations for MntNsOperations {
         let pcb = ProcessManager::find(pid);
         pcb.and_then(|pcb| {
             pcb.get_nsproxy()
+                .read()
                 .mnt_namespace
                 .clone()
                 .and_then(|ns| Some(ns.ns_common.clone()))
@@ -124,6 +127,23 @@ impl NsOperations for MntNsOperations {
     }
 }
 impl MntNamespace {
+    pub fn new() -> Result<Self, SystemError> {
+        let ns_common = Arc::new(NsCommon::new(Box::new(MntNsOperations::new(
+            "mnt".to_string(),
+        )))?);
+
+        Ok(Self {
+            ns_common,
+            user_ns: Arc::new(UserNamespace::new()?),
+            ucounts: Arc::new(UCounts::new()?),
+            root: None,
+            mounts: RBTree::new(),
+            poll: WaitQueue::default(),
+            seq: AtomicU64::new(0),
+            nr_mounts: 0,
+            pending_mounts: 0,
+        })
+    }
     /// anon 用来判断是否是匿名的.匿名函数的问题还需要考虑
     pub fn create_mnt_namespace(
         &self,

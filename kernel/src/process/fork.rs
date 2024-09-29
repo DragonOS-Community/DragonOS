@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::{intrinsics::unlikely, sync::atomic::Ordering};
 
 use alloc::{string::ToString, sync::Arc};
@@ -10,6 +11,7 @@ use crate::{
     ipc::signal::flush_signal_handlers,
     libs::rwlock::RwLock,
     mm::VirtAddr,
+    namespace::{create_new_namespaces, namespace::USER_NS, pid_namespace::PidStrcut},
     process::ProcessFlags,
     sched::{sched_cgroup_fork, sched_fork},
     smp::core::smp_get_processor_id,
@@ -20,6 +22,7 @@ use super::{
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
     KernelStack, Pid, ProcessControlBlock, ProcessManager,
 };
+const MAX_PID_NS_LEVEL: usize = 32;
 
 bitflags! {
     /// 进程克隆标志
@@ -84,7 +87,7 @@ bitflags! {
 /// 因为这两个系统调用的参数很多，所以有这样一个载体更灵活
 ///
 /// 仅仅作为参数传递
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct KernelCloneArgs {
     pub flags: CloneFlags,
 
@@ -92,7 +95,7 @@ pub struct KernelCloneArgs {
     pub pidfd: VirtAddr,
     pub child_tid: VirtAddr,
     pub parent_tid: VirtAddr,
-    pub set_tid: VirtAddr,
+    pub set_tid: Vec<usize>,
 
     /// 进程退出时发送的信号
     pub exit_signal: Signal,
@@ -121,7 +124,7 @@ impl KernelCloneArgs {
             pidfd: null_addr,
             child_tid: null_addr,
             parent_tid: null_addr,
-            set_tid: null_addr,
+            set_tid: vec![0; MAX_PID_NS_LEVEL],
             exit_signal: Signal::SIGCHLD,
             stack: 0,
             stack_size: 0,
@@ -255,6 +258,34 @@ impl ProcessManager {
     }
 
     #[inline(never)]
+    fn copy_namespaces(
+        clone_flags: &CloneFlags,
+        current_pcb: &Arc<ProcessControlBlock>,
+        new_pcb: &Arc<ProcessControlBlock>,
+    ) -> Result<(), SystemError> {
+        if !clone_flags.contains(CloneFlags::CLONE_NEWNS)
+            && !clone_flags.contains(CloneFlags::CLONE_NEWUTS)
+            && !clone_flags.contains(CloneFlags::CLONE_NEWIPC)
+            && !clone_flags.contains(CloneFlags::CLONE_NEWPID)
+            && !clone_flags.contains(CloneFlags::CLONE_NEWNET)
+            && !clone_flags.contains(CloneFlags::CLONE_NEWCGROUP)
+        {
+            new_pcb.set_nsproxy(current_pcb.get_nsproxy().read().clone());
+            return Ok(());
+        }
+
+        if clone_flags.contains(CloneFlags::CLONE_NEWIPC)
+            && clone_flags.contains(CloneFlags::CLONE_SYSVSEM)
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        let new_nsproxy = create_new_namespaces(clone_flags.bits(), current_pcb, USER_NS.clone())?;
+        *new_pcb.nsproxy.write() = new_nsproxy;
+        Ok(())
+    }
+
+    #[inline(never)]
     fn copy_files(
         clone_flags: &CloneFlags,
         current_pcb: &Arc<ProcessControlBlock>,
@@ -361,6 +392,10 @@ impl ProcessManager {
 
         // TODO: 克隆前应该锁信号处理，等待克隆完成后再处理
 
+        let new_pid = PidStrcut::alloc_pid(
+            pcb.get_nsproxy().read().pid_namespace.clone().unwrap(), // 获取命名空间
+            clone_args.set_tid.clone(),
+        )?;
         // 克隆架构相关
         let guard = current_pcb.arch_info_irqsave();
         unsafe { pcb.arch_info().clone_from(&guard) };
@@ -416,6 +451,11 @@ impl ProcessManager {
             )
         });
 
+        Self::copy_namespaces(&clone_flags, current_pcb, pcb).unwrap_or_else(|e|{
+            panic!("fork: Failed to copy namespace form current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.pid(), pcb.pid(), e)
+        });
+
         // 拷贝文件描述符表
         Self::copy_files(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
@@ -433,7 +473,7 @@ impl ProcessManager {
         });
 
         // 拷贝线程
-        Self::copy_thread(current_pcb, pcb, clone_args,current_trapframe).unwrap_or_else(|e| {
+        Self::copy_thread(current_pcb, pcb, &clone_args, current_trapframe).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy thread from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.pid(), pcb.pid(), e

@@ -5,7 +5,10 @@ use crate::{
     arch::ipc::signal::{SigSet, Signal},
     mm::VirtAddr,
     process::{Pid, ProcessManager},
-    syscall::{user_access::UserBufferWriter, Syscall},
+    syscall::{
+        user_access::{UserBufferReader, UserBufferWriter},
+        Syscall,
+    },
 };
 
 use super::tty_core::{TtyCore, TtyIoctlCmd};
@@ -81,13 +84,13 @@ impl TtyJobCtrlManager {
                     }
                 };
 
-                // let user_reader = UserBufferReader::new(
-                //     VirtAddr::new(arg).as_ptr::<usize>(),
-                //     core::mem::size_of::<usize>(),
-                //     true,
-                // )?;
+                let user_reader = UserBufferReader::new(
+                    VirtAddr::new(arg).as_ptr::<i32>(),
+                    core::mem::size_of::<i32>(),
+                    true,
+                )?;
 
-                // let pgrp = user_reader.read_one_from_user::<usize>(0)?;
+                let pgrp = user_reader.read_one_from_user::<i32>(0)?;
 
                 let current = ProcessManager::current_pcb();
 
@@ -101,7 +104,7 @@ impl TtyJobCtrlManager {
                     return Err(SystemError::ENOTTY);
                 }
 
-                ctrl.pgid = Some(Pid::new(arg));
+                ctrl.pgid = Some(Pid::new(*pgrp as usize));
 
                 return Ok(0);
             }

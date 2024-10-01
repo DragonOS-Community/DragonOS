@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use alloc::{
     sync::{Arc, Weak},
@@ -10,11 +10,7 @@ use log::warn;
 use crate::{
     driver::{
         serial::serial8250::send_to_default_serial8250_port,
-        tty::{
-            console::ConsoleSwitch,
-            tty_port::{DefaultTtyPort, TtyPort},
-            ConsoleFont, KDMode,
-        },
+        tty::{console::ConsoleSwitch, ConsoleFont, KDMode},
     },
     libs::{font::FontDesc, rwlock::RwLock},
     process::Pid,
@@ -22,7 +18,8 @@ use crate::{
 
 use super::{
     console_map::{TranslationMap, TranslationMapType},
-    Color, DrawRegion, VtMode, VtModeData, COLOR_TABLE, DEFAULT_BLUE, DEFAULT_GREEN, DEFAULT_RED,
+    vc_manager, Color, DrawRegion, VtMode, VtModeData, COLOR_TABLE, DEFAULT_BLUE, DEFAULT_GREEN,
+    DEFAULT_RED,
 };
 
 pub(super) const NPAR: usize = 16;
@@ -34,14 +31,12 @@ lazy_static! {
 
 }
 
-pub static CURRENT_VCNUM: AtomicIsize = AtomicIsize::new(-1);
-
 pub static CONSOLE_BLANKED: AtomicBool = AtomicBool::new(false);
 
 /// ## 虚拟控制台的信息
 #[derive(Debug, Clone)]
 pub struct VirtualConsoleData {
-    pub num: usize,
+    pub vc_index: usize,
     pub state: VirtualConsoleInfo,
     pub saved_state: VirtualConsoleInfo,
     /// 最大列数
@@ -146,9 +141,6 @@ pub struct VirtualConsoleData {
 
     /// 对应的Console Driver funcs
     driver_funcs: Option<Weak<dyn ConsoleSwitch>>,
-
-    /// 对应端口
-    port: Arc<dyn TtyPort>,
 }
 
 impl VirtualConsoleData {
@@ -210,14 +202,8 @@ impl VirtualConsoleData {
             screen_buf: Default::default(),
             driver_funcs: None,
             cursor_type: VcCursor::empty(),
-            num,
-            port: Arc::new(DefaultTtyPort::new()),
+            vc_index: num,
         }
-    }
-
-    #[inline]
-    pub fn port(&self) -> Arc<dyn TtyPort> {
-        self.port.clone()
     }
 
     pub(super) fn init(&mut self, rows: Option<usize>, cols: Option<usize>, clear: bool) {
@@ -245,12 +231,11 @@ impl VirtualConsoleData {
     }
 
     pub fn is_visible(&self) -> bool {
-        let cur_vc = CURRENT_VCNUM.load(Ordering::SeqCst);
-        if cur_vc == -1 {
-            return false;
+        if let Some(cur_vc) = vc_manager().current_vc_index() {
+            cur_vc == self.vc_index
+        } else {
+            false
         }
-
-        cur_vc as usize == self.num
     }
 
     fn driver_funcs(&self) -> Arc<dyn ConsoleSwitch> {

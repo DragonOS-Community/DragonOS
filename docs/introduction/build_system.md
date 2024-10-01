@@ -242,6 +242,7 @@ make run-docker
 - Docker编译，并写入磁盘镜像,: `make docker`
 - Docker编译，写入磁盘镜像，并在QEMU中运行: `make run-docker`
 - 不编译，直接从已有的磁盘镜像启动: `make qemu`
+- 不编译，直接从已有的磁盘镜像启动（无图形模式）: `make qemu-nographic`
 - 清理编译产生的文件: `make clean`
 - 编译文档: `make docs` （需要手动安装sphinx以及docs下的`requirements.txt`中的依赖）
 - 清理文档: `make clean-docs`

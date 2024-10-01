@@ -792,7 +792,6 @@ impl NTtyData {
         }
 
         ctrl_info.pgid = None;
-        ctrl_info.session = None;
 
         if !termios.local_mode.contains(LocalMode::NOFLSH) {
             // 重置

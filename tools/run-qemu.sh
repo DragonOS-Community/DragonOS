@@ -124,7 +124,7 @@ while true;do
         --display)
         case "$2" in
               vnc)
-              QEMU_ARGUMENT+=" -display vnc=:00"
+              QEMU_ARGUMENT+=" -display vnc=:00 "
               ;;
               window)
               ;;

@@ -36,7 +36,7 @@ export ASFLAGS := --64
 LD_LIST := ""
 
 
-kernel_subdirs := common driver debug syscall libs
+kernel_subdirs := debug
 
 
 kernel_rust:

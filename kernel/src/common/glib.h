@@ -6,11 +6,11 @@
 #pragma once
 
 // 引入对bool类型的支持
-#include <stdbool.h>
 #include <DragonOS/stdint.h>
-#include <common/stddef.h>
 #include <arch/arch.h>
 #include <common/compiler.h>
+#include <common/stddef.h>
+#include <stdbool.h>
 
 #include <asm/asm.h>
 
@@ -22,13 +22,11 @@
  *
  * 方法：使用ptr减去结构体内的偏移，得到结构体变量的基地址
  */
-#define container_of(ptr, type, member)                                     \
-    ({                                                                      \
-        typeof(((type *)0)->member) *p = (ptr);                             \
-        (type *)((unsigned long)p - (unsigned long)&(((type *)0)->member)); \
-    })
-
-
+#define container_of(ptr, type, member)                                        \
+  ({                                                                           \
+    typeof(((type *)0)->member) *p = (ptr);                                    \
+    (type *)((unsigned long)p - (unsigned long)&(((type *)0)->member));        \
+  })
 
 #define ABS(x) ((x) > 0 ? (x) : -(x)) // 绝对值
 // 最大最小值
@@ -39,10 +37,7 @@
 #define MASK_HIGH_32bit(x) (x & (0x00000000ffffffffUL))
 
 // 四舍五入成整数
-ul round(double x)
-{
-    return (ul)(x + 0.5);
-}
+ul round(double x) { return (ul)(x + 0.5); }
 
 /**
  * @brief 地址按照align进行对齐
@@ -51,18 +46,6 @@ ul round(double x)
  * @param _align
  * @return ul 对齐后的地址
  */
-static __always_inline ul ALIGN(const ul addr, const ul _align)
-{
-    return (ul)((addr + _align - 1) & (~(_align - 1)));
+static __always_inline ul ALIGN(const ul addr, const ul _align) {
+  return (ul)((addr + _align - 1) & (~(_align - 1)));
 }
-
-
-/**
- * @brief 将数据从src搬运到dst，并能正确处理地址重叠的问题
- *
- * @param dst 目标地址指针
- * @param src 源地址指针
- * @param size 大小
- * @return void* 指向目标地址的指针
- */
-void *c_memmove(void *dst, const void *src, uint64_t size);

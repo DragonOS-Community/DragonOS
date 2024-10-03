@@ -185,10 +185,12 @@ impl ConsoleSwitch for BlittingFbConsole {
         }
         let fb = fb.unwrap();
         if fb.is_none() {
-            panic!(
+            log::warn!(
                 "The Framebuffer with FbID {} has not been initialized yet.",
                 vc_data.index
-            )
+            );
+
+            return Err(SystemError::ENODEV);
         }
 
         let fb = fb.as_ref().unwrap().clone();

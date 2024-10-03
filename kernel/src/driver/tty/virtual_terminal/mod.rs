@@ -495,9 +495,10 @@ pub struct DrawRegion {
 #[inline(never)]
 pub fn vty_init() -> Result<(), SystemError> {
     if let Ok(tty_console_driver_inner) = TtyConsoleDriverInner::new() {
+        const NAME: &str = "tty";
         let console_driver = TtyDriver::new(
             MAX_NR_CONSOLES,
-            "tty",
+            NAME,
             0,
             Major::TTY_MAJOR,
             0,
@@ -507,8 +508,8 @@ pub fn vty_init() -> Result<(), SystemError> {
             None,
         );
 
-        TtyDriverManager::tty_register_driver(console_driver).inspect(|_| {
-            log::error!("tty console: register driver failed");
+        TtyDriverManager::tty_register_driver(console_driver).inspect_err(|e| {
+            log::error!("tty console: register driver {} failed: {:?}", NAME, e);
         })?;
     }
 
@@ -520,7 +521,7 @@ fn vty_late_init() -> Result<(), SystemError> {
     let (_, console_driver) =
         TtyDriverManager::lookup_tty_driver(DeviceNumber::new(Major::TTY_MAJOR, 0))
             .ok_or(SystemError::ENODEV)?;
-    console_driver.init_tty_device(None)?;
+    console_driver.init_tty_device(None).ok();
 
     vc_manager().setup_default_vc();
     Ok(())

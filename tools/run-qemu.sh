@@ -94,8 +94,7 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     else
       QEMU_DEVICES_DISK="-device virtio-blk-pci,drive=disk -device pci-bridge,chassis_nr=1,id=pci.1 -device pcie-root-port "
     fi
-    
-    
+
 else
     QEMU_MACHINE=" -machine virt,memory-backend=${QEMU_MEMORY_BACKEND} -cpu sifive-u54 "
     QEMU_DEVICES_DISK="-device virtio-blk-device,drive=disk "
@@ -132,6 +131,7 @@ while true;do
               QEMU_SERIAL=" -serial mon:stdio "
               QEMU_MONITOR=""
               QEMU_ARGUMENT+=" --nographic "
+              QEMU_ARGUMENT+=" -kernel ../bin/kernel/kernel.elf "
 
               ;;
         esac;shift 2;;

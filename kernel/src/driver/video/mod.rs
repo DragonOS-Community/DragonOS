@@ -21,6 +21,10 @@ pub mod fbdev;
 
 static mut __MAMAGER: Option<VideoRefreshManager> = None;
 
+#[inline]
+pub fn has_video_refresh_manager() -> bool {
+    return unsafe { __MAMAGER.is_some() };
+}
 pub fn video_refresh_manager() -> &'static VideoRefreshManager {
     return unsafe {
         __MAMAGER
@@ -73,9 +77,13 @@ impl VideoRefreshManager {
     /**
      * VBE帧缓存区的地址重新映射
      */
-    fn init_frame_buffer(&self) {
-        info!("Re-mapping VBE frame buffer...");
+    fn init_frame_buffer(&self) -> Result<(), SystemError> {
         let mut bp = boot_params().write_irqsave();
+        // 没有VBE
+        if bp.screen_info.lfb_base.data() == 0 {
+            return Err(SystemError::ENODEV);
+        }
+        info!("Re-mapping VBE frame buffer...");
         let buf_size = bp.screen_info.lfb_size;
 
         let mmio_guard = mmio_pool().create_mmio(page_align_up(buf_size)).unwrap();
@@ -100,6 +108,7 @@ impl VideoRefreshManager {
         };
 
         info!("VBE frame buffer successfully Re-mapped!");
+        Ok(())
     }
 
     /**
@@ -111,7 +120,7 @@ impl VideoRefreshManager {
      */
     pub fn video_reinitialize(&self, level: bool) -> Result<(), SystemError> {
         if !level {
-            self.init_frame_buffer();
+            self.init_frame_buffer()?;
         } else {
             // 开启屏幕计时刷新
             assert!(self.run_video_refresh());

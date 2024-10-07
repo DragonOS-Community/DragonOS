@@ -1209,7 +1209,8 @@ impl NTtyData {
                     if termios.output_mode.contains(OutputMode::OCRNL) {
                         break;
                     }
-                    self.canon_cursor_column = self.cursor_column;
+                    self.cursor_column = 0;
+                    self.canon_cursor_column = 0;
                 }
                 '\t' => {
                     break;

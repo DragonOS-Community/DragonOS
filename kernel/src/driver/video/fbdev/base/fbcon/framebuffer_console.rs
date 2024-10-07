@@ -8,7 +8,7 @@ use crate::{
             console::ConsoleSwitch,
             virtual_terminal::{
                 virtual_console::{CursorOperation, ScrollDir, VcCursor, VirtualConsoleData},
-                Color,
+                Color, VirtConsole,
             },
         },
         video::fbdev::base::{
@@ -174,6 +174,7 @@ impl BlittingFbConsole {
 impl ConsoleSwitch for BlittingFbConsole {
     fn con_init(
         &self,
+        _vc: &Arc<VirtConsole>,
         vc_data: &mut VirtualConsoleData,
         init: bool,
     ) -> Result<(), system_error::SystemError> {

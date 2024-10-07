@@ -5,11 +5,33 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use alloc::sync::{Arc, Weak};
+use alloc::{
+    string::ToString,
+    sync::{Arc, Weak},
+};
 
 use crate::{
-    arch::{io::PortIOArch, CurrentPortIOArch},
-    driver::serial::{AtomicBaudRate, BaudRate, DivisorFraction, UartPort},
+    arch::{driver::apic::ioapic::IoApic, io::PortIOArch, CurrentPortIOArch},
+    driver::{
+        base::device::{
+            device_number::{DeviceNumber, Major},
+            DeviceId,
+        },
+        serial::{AtomicBaudRate, BaudRate, DivisorFraction, UartPort},
+        tty::{
+            kthread::send_to_tty_refresh_thread,
+            termios::WindowSize,
+            tty_core::{TtyCore, TtyCoreData},
+            tty_driver::{TtyDriver, TtyDriverManager, TtyOperation},
+            virtual_terminal::{vc_manager, VirtConsole},
+        },
+    },
+    exception::{
+        irqdata::IrqHandlerData,
+        irqdesc::{IrqHandleFlags, IrqHandler, IrqReturn},
+        manage::irq_manager,
+        IrqNumber,
+    },
     libs::rwlock::RwLock,
 };
 use system_error::SystemError;
@@ -18,6 +40,8 @@ use super::{Serial8250ISADevices, Serial8250ISADriver, Serial8250Manager, Serial
 
 static mut PIO_PORTS: [Option<Serial8250PIOPort>; 8] =
     [None, None, None, None, None, None, None, None];
+
+const SERIAL_8250_PIO_IRQ: IrqNumber = IrqNumber::new(IoApic::VECTOR_BASE as u32 + 4);
 
 impl Serial8250Manager {
     #[allow(static_mut_refs)]
@@ -34,7 +58,7 @@ impl Serial8250Manager {
 }
 
 macro_rules! init_port {
-    ($port_num:expr, $baudrate:expr) => {
+    ($port_num:expr) => {
         unsafe {
             let port = Serial8250PIOPort::new(
                 match $port_num {
@@ -48,12 +72,17 @@ macro_rules! init_port {
                     8 => Serial8250PortBase::COM8,
                     _ => panic!("invalid port number"),
                 },
-                BaudRate::new($baudrate),
+                crate::driver::serial::SERIAL_BAUDRATE,
             );
             if let Ok(port) = port {
                 if port.init().is_ok() {
                     PIO_PORTS[$port_num - 1] = Some(port);
+                    true
+                } else {
+                    false
                 }
+            } else {
+                false
             }
         }
     };
@@ -62,8 +91,9 @@ macro_rules! init_port {
 /// 在内存管理初始化之前，初始化串口设备
 pub(super) fn serial8250_pio_port_early_init() -> Result<(), SystemError> {
     for i in 1..=8 {
-        init_port!(i, 115200);
+        init_port!(i);
     }
+
     return Ok(());
 }
 
@@ -100,7 +130,6 @@ impl Serial8250PIOPort {
         }
 
         let port = self.iobase as u16;
-
         unsafe {
             CurrentPortIOArch::out8(port + 1, 0x00); // Disable all interrupts
             self.set_divisor(self.baudrate.load(Ordering::SeqCst))
@@ -119,7 +148,9 @@ impl Serial8250PIOPort {
 
             // If serial is not faulty set it in normal operation mode
             // (not-loopback with IRQs enabled and OUT#1 and OUT#2 bits enabled)
-            CurrentPortIOArch::out8(port + 4, 0x08);
+            CurrentPortIOArch::out8(port + 4, 0x0b);
+
+            CurrentPortIOArch::out8(port + 1, 0x01); // Enable interrupts
         }
 
         return Ok(());
@@ -168,13 +199,12 @@ impl Serial8250PIOPort {
         }
     }
 
-    /// 读取一个字节
-    #[allow(dead_code)]
-    fn read_one_byte(&self) -> u8 {
-        while !self.serial_received() {
-            spin_loop();
+    /// 读取一个字节，如果没有数据则返回None
+    fn read_one_byte(&self) -> Option<u8> {
+        if !self.serial_received() {
+            return None;
         }
-        return self.serial_in(0) as u8;
+        return Some(self.serial_in(0) as u8);
     }
 }
 
@@ -235,7 +265,14 @@ impl UartPort for Serial8250PIOPort {
     }
 
     fn handle_irq(&self) -> Result<(), SystemError> {
-        todo!("serial8250_pio::handle_irq")
+        if let Some(c) = self.read_one_byte() {
+            send_to_tty_refresh_thread(&[c]);
+        }
+        Ok(())
+    }
+
+    fn iobase(&self) -> Option<usize> {
+        Some(self.iobase as usize)
     }
 }
 
@@ -280,8 +317,140 @@ pub enum Serial8250PortBase {
 }
 
 /// 临时函数，用于向COM1发送数据
-pub fn send_to_serial8250_pio_com1(s: &[u8]) {
+pub fn send_to_default_serial8250_pio_port(s: &[u8]) {
     if let Some(port) = unsafe { PIO_PORTS[0].as_ref() } {
         port.send_bytes(s);
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct Serial8250PIOTtyDriverInner;
+
+impl Serial8250PIOTtyDriverInner {
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn do_install(
+        &self,
+        driver: Arc<TtyDriver>,
+        tty: Arc<TtyCore>,
+        vc: Arc<VirtConsole>,
+    ) -> Result<(), SystemError> {
+        driver.standard_install(tty.clone())?;
+        vc.port().setup_internal_tty(Arc::downgrade(&tty));
+        tty.set_port(vc.port());
+        vc.devfs_setup()?;
+
+        Ok(())
+    }
+}
+
+impl TtyOperation for Serial8250PIOTtyDriverInner {
+    fn open(&self, _tty: &TtyCoreData) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn write(&self, tty: &TtyCoreData, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
+        let index = tty.index();
+        if tty.index() >= unsafe { PIO_PORTS.len() } {
+            return Err(SystemError::ENODEV);
+        }
+        let pio_port = unsafe { PIO_PORTS[index].as_ref() }.ok_or(SystemError::ENODEV)?;
+        pio_port.send_bytes(&buf[..nr]);
+
+        Ok(nr)
+    }
+
+    fn flush_chars(&self, _tty: &TtyCoreData) {}
+
+    fn put_char(&self, tty: &TtyCoreData, ch: u8) -> Result<(), SystemError> {
+        self.write(tty, &[ch], 1).map(|_| ())
+    }
+
+    fn ioctl(&self, _tty: Arc<TtyCore>, _cmd: u32, _arg: usize) -> Result<(), SystemError> {
+        Err(SystemError::ENOIOCTLCMD)
+    }
+
+    fn close(&self, _tty: Arc<TtyCore>) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn resize(&self, tty: Arc<TtyCore>, winsize: WindowSize) -> Result<(), SystemError> {
+        *tty.core().window_size_write() = winsize;
+        Ok(())
+    }
+
+    fn install(&self, driver: Arc<TtyDriver>, tty: Arc<TtyCore>) -> Result<(), SystemError> {
+        if tty.core().index() >= unsafe { PIO_PORTS.len() } {
+            return Err(SystemError::ENODEV);
+        }
+        let vc = VirtConsole::new(None);
+        let vc_index = vc_manager().alloc(vc.clone()).ok_or(SystemError::EBUSY)?;
+        self.do_install(driver, tty, vc.clone()).inspect_err(|_| {
+            vc_manager().free(vc_index);
+        })?;
+
+        Ok(())
+    }
+}
+
+pub(super) fn serial_8250_pio_register_tty_devices() -> Result<(), SystemError> {
+    let (_, driver) = TtyDriverManager::lookup_tty_driver(DeviceNumber::new(
+        Major::TTY_MAJOR,
+        Serial8250Manager::TTY_SERIAL_MINOR_START,
+    ))
+    .ok_or(SystemError::ENODEV)?;
+
+    for (i, port) in unsafe { PIO_PORTS.iter() }.enumerate() {
+        if let Some(port) = port {
+            let core = driver.init_tty_device(Some(i)).inspect_err(|_| {
+                log::error!(
+                    "failed to init tty device for serial 8250 pio port {}, port iobase: {:?}",
+                    i,
+                    port.iobase
+                );
+            })?;
+            core.resize( core.clone(), WindowSize::DEFAULT)
+                .inspect_err(|_| {
+                    log::error!(
+                        "failed to resize tty device for serial 8250 pio port {}, port iobase: {:?}",
+                        i,
+                        port.iobase
+                    );
+                })?;
+        }
+    }
+
+    irq_manager()
+        .request_irq(
+            SERIAL_8250_PIO_IRQ,
+            "serial8250_pio".to_string(),
+            &Serial8250IrqHandler,
+            IrqHandleFlags::IRQF_SHARED | IrqHandleFlags::IRQF_TRIGGER_RISING,
+            Some(DeviceId::new(Some("serial8250_pio"), None).unwrap()),
+        )
+        .inspect_err(|e| {
+            log::error!("failed to request irq for serial 8250 pio: {:?}", e);
+        })?;
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct Serial8250IrqHandler;
+
+impl IrqHandler for Serial8250IrqHandler {
+    fn handle(
+        &self,
+        _irq: IrqNumber,
+        _static_data: Option<&dyn IrqHandlerData>,
+        _dynamic_data: Option<Arc<dyn IrqHandlerData>>,
+    ) -> Result<IrqReturn, SystemError> {
+        for port in unsafe { PIO_PORTS.iter() }.flatten() {
+            port.handle_irq()?;
+        }
+
+        Ok(IrqReturn::Handled)
     }
 }

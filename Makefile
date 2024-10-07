@@ -91,6 +91,11 @@ write_diskimage-uefi:
 # 不编译，直接启动QEMU
 qemu:
 	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=window && cd .."
+
+# 不编译，直接启动QEMU,不显示图像
+qemu-nographic:
+	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=nographic && cd .."
+
 # 不编译，直接启动QEMU(UEFI)
 qemu-uefi:
 	sh -c "cd tools && bash run-qemu.sh --bios=uefi --display=window && cd .."

@@ -11,7 +11,7 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    driver::{serial::serial8250::send_to_default_serial8250_port, tty::pty::ptm_driver},
+    driver::{base::device::device_number::DeviceNumber, tty::pty::ptm_driver},
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
@@ -25,13 +25,13 @@ use crate::{
 
 use super::{
     termios::{ControlMode, PosixTermios, Termios, TtySetTermiosOpt, WindowSize},
-    tty_driver::{TtyDriver, TtyDriverSubType, TtyDriverType, TtyOperation},
+    tty_driver::{TtyCorePrivateField, TtyDriver, TtyDriverSubType, TtyDriverType, TtyOperation},
     tty_ldisc::{
         ntty::{NTtyData, NTtyLinediscipline},
         TtyLineDiscipline,
     },
     tty_port::TtyPort,
-    virtual_terminal::{virtual_console::VirtualConsoleData, VIRT_CONSOLES},
+    virtual_terminal::{vc_manager, virtual_console::VirtualConsoleData},
 };
 
 #[derive(Debug)]
@@ -52,6 +52,9 @@ impl Drop for TtyCore {
 impl TtyCore {
     pub fn new(driver: Arc<TtyDriver>, index: usize) -> Arc<Self> {
         let name = driver.tty_line_name(index);
+        let device_number = driver
+            .device_number(index)
+            .expect("Get tty device number failed.");
         let termios = driver.init_termios();
         let core = TtyCoreData {
             tty_driver: driver,
@@ -64,11 +67,14 @@ impl TtyCore {
             write_wq: EventWaitQueue::new(),
             port: RwLock::new(None),
             index,
+            vc_index: AtomicUsize::new(usize::MAX),
             ctrl: SpinLock::new(TtyContorlInfo::default()),
             closing: AtomicBool::new(false),
             flow: SpinLock::new(TtyFlowState::default()),
             link: RwLock::default(),
             epitems: SpinLock::new(LinkedList::new()),
+            device_number,
+            privete_fields: SpinLock::new(None),
         };
 
         return Arc::new(Self {
@@ -82,6 +88,14 @@ impl TtyCore {
     #[inline]
     pub fn core(&self) -> &TtyCoreData {
         return &self.core;
+    }
+
+    pub fn private_fields(&self) -> Option<Arc<dyn TtyCorePrivateField>> {
+        self.core.privete_fields.lock().clone()
+    }
+
+    pub fn set_private_fields(&self, fields: Arc<dyn TtyCorePrivateField>) {
+        *self.core.privete_fields.lock() = Some(fields);
     }
 
     #[inline]
@@ -231,7 +245,7 @@ impl TtyCore {
         Ok(0)
     }
 
-    pub fn set_termios_next(tty: Arc<TtyCore>, new_termios: Termios) -> Result<(), SystemError> {
+    fn set_termios_next(tty: Arc<TtyCore>, new_termios: Termios) -> Result<(), SystemError> {
         let mut termios = tty.core().termios_write();
 
         let old_termios = *termios;
@@ -252,7 +266,7 @@ impl TtyCore {
 
         drop(termios);
         let ld = tty.ldisc();
-        ld.set_termios(tty, Some(old_termios))?;
+        ld.set_termios(tty, Some(old_termios)).ok();
 
         Ok(())
     }
@@ -292,6 +306,7 @@ pub struct TtyCoreData {
     flags: RwLock<TtyFlag>,
     /// 在初始化时即确定不会更改，所以这里不用加锁
     index: usize,
+    vc_index: AtomicUsize,
     count: AtomicUsize,
     /// 窗口大小
     window_size: RwLock<WindowSize>,
@@ -311,12 +326,16 @@ pub struct TtyCoreData {
     link: RwLock<Weak<TtyCore>>,
     /// epitems
     epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
+    /// 设备号
+    device_number: DeviceNumber,
+
+    privete_fields: SpinLock<Option<Arc<dyn TtyCorePrivateField>>>,
 }
 
 impl TtyCoreData {
     #[inline]
-    pub fn driver(&self) -> Arc<TtyDriver> {
-        self.tty_driver.clone()
+    pub fn driver(&self) -> &Arc<TtyDriver> {
+        &self.tty_driver
     }
 
     #[inline]
@@ -335,8 +354,12 @@ impl TtyCoreData {
     }
 
     #[inline]
-    pub fn name(&self) -> String {
-        self.name.clone()
+    pub fn name(&self) -> &String {
+        &self.name
+    }
+
+    pub fn device_number(&self) -> &DeviceNumber {
+        &self.device_number
     }
 
     #[inline]
@@ -412,8 +435,20 @@ impl TtyCoreData {
     }
 
     #[inline]
-    pub fn vc_data_irqsave(&self) -> SpinLockGuard<VirtualConsoleData> {
-        VIRT_CONSOLES[self.index].lock_irqsave()
+    pub fn vc_data(&self) -> Option<Arc<SpinLock<VirtualConsoleData>>> {
+        vc_manager().get(self.vc_index()?).unwrap().vc_data()
+    }
+
+    pub fn set_vc_index(&self, index: usize) {
+        self.vc_index.store(index, Ordering::SeqCst);
+    }
+
+    pub fn vc_index(&self) -> Option<usize> {
+        let x = self.vc_index.load(Ordering::SeqCst);
+        if x == usize::MAX {
+            return None;
+        }
+        return Some(x);
     }
 
     #[inline]
@@ -469,7 +504,6 @@ impl TtyOperation for TtyCore {
 
     #[inline]
     fn write(&self, tty: &TtyCoreData, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
-        send_to_default_serial8250_port(buf);
         return self.core().tty_driver.driver_funcs().write(tty, buf, nr);
     }
 

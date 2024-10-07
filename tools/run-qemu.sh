@@ -77,6 +77,7 @@ QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none"
 QEMU_ACCELARATE=""
 QEMU_ARGUMENT=""
 QEMU_DEVICES=""
+BIOS_TYPE=""
 #这个变量为true则使用virtio磁盘
 VIRTIO_BLK_DEVICE=false
 # 如果qemu_accel不为空
@@ -108,6 +109,35 @@ if [ ${ARCH} == "riscv64" ]; then
     QEMU_MONITOR=""
     QEMU_SERIAL=""
 fi
+
+while true;do
+    case "$1" in
+        --bios) 
+        case "$2" in
+              uefi) #uefi启动新增ovmf.fd固件
+              BIOS_TYPE=uefi
+            ;;
+              legacy)
+              BIOS_TYPE=legacy
+              ;;
+        esac;shift 2;;
+        --display)
+        case "$2" in
+              vnc)
+              QEMU_ARGUMENT+=" -display vnc=:00 "
+              ;;
+              window)
+              ;;
+              nographic)
+              QEMU_SERIAL=" -serial mon:stdio "
+              QEMU_MONITOR=""
+              QEMU_ARGUMENT+=" --nographic "
+
+              ;;
+        esac;shift 2;;
+        *) break
+      esac 
+  done
 
 
 # ps: 下面这条使用tap的方式，无法dhcp获取到ip，暂时不知道为什么
@@ -149,28 +179,7 @@ install_riscv_uboot()
 
 
 if [ $flag_can_run -eq 1 ]; then
-  while true;do
-    case "$1" in
-        --bios) 
-        case "$2" in
-              uefi) #uefi启动新增ovmf.fd固件
-              BIOS_TYPE=uefi
-            ;;
-              legacy)
-              BIOS_TYPE=legacy
-              ;;
-        esac;shift 2;;
-        --display)
-        case "$2" in
-              vnc)
-              QEMU_ARGUMENT+=" -display vnc=:00"
-              ;;
-              window)
-              ;;
-        esac;shift 2;;
-        *) break
-      esac 
-  done 
+   
 
 # 删除共享内存
 sudo rm -rf ${QEMU_MEMORY_BACKEND_PATH_PREFIX}/${QEMU_MEMORY_BACKEND}

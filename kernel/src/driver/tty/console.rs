@@ -1,13 +1,20 @@
+use alloc::sync::Arc;
 use system_error::SystemError;
 
-use super::virtual_terminal::virtual_console::{
-    CursorOperation, ScrollDir, VirtualConsoleData, VirtualConsoleIntensity,
+use super::virtual_terminal::{
+    virtual_console::{CursorOperation, ScrollDir, VirtualConsoleData, VirtualConsoleIntensity},
+    VirtConsole,
 };
 
 /// 终端切换相关的回调
 pub trait ConsoleSwitch: Sync + Send {
     /// 初始化，会对vc_data进行一系列初始化操作
-    fn con_init(&self, vc_data: &mut VirtualConsoleData, init: bool) -> Result<(), SystemError>;
+    fn con_init(
+        &self,
+        vc: &Arc<VirtConsole>,
+        vc_data: &mut VirtualConsoleData,
+        init: bool,
+    ) -> Result<(), SystemError>;
 
     /// 进行释放等系列操作，目前未使用
     #[allow(dead_code)]

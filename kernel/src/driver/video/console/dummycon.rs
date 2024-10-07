@@ -5,7 +5,10 @@ use crate::driver::tty::{
     console::ConsoleSwitch,
     termios::WindowSize,
     tty_driver::TtyOperation,
-    virtual_terminal::virtual_console::{CursorOperation, ScrollDir, VirtualConsoleData},
+    virtual_terminal::{
+        virtual_console::{CursorOperation, ScrollDir, VirtualConsoleData},
+        VirtConsole,
+    },
 };
 
 lazy_static! {
@@ -49,14 +52,19 @@ impl ConsoleSwitch for DummyConsole {
     ) -> Result<u8, SystemError> {
         Ok(0)
     }
-    fn con_init(&self, vc_data: &mut VirtualConsoleData, init: bool) -> Result<(), SystemError> {
+    fn con_init(
+        &self,
+        vc: &Arc<VirtConsole>,
+        vc_data: &mut VirtualConsoleData,
+        init: bool,
+    ) -> Result<(), SystemError> {
         vc_data.color_mode = true;
 
         if init {
             vc_data.cols = Self::COLUNMS;
             vc_data.rows = Self::ROWS;
         } else {
-            let tty = vc_data.port().port_data().tty().unwrap();
+            let tty = vc.port().port_data().tty().unwrap();
             tty.resize(
                 tty.clone(),
                 WindowSize::new(Self::ROWS as u16, Self::COLUNMS as u16, 0, 0),

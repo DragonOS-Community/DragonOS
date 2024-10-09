@@ -62,7 +62,6 @@ lru = "0.12.3"
 # target为x86_64时，使用下面的依赖
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 mini-backtrace = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/mini-backtrace.git", rev = "e0b1d90940" }
-multiboot = { path = "crates/multiboot" }
 multiboot2 = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/multiboot2", rev = "05739aab40" }
 raw-cpuid = "11.0.1"
 x86 = "=0.52.0"
@@ -90,4 +89,4 @@ debug = true   # Controls whether the compiler passes `-g`
 
 # The release profile, used for `cargo build --release`
 [profile.release]
-debug = true
+debug = false

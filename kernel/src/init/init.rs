@@ -1,3 +1,5 @@
+use log::warn;
+
 use crate::{
     arch::{
         init::{early_setup_arch, setup_arch, setup_arch_post},
@@ -55,8 +57,11 @@ fn do_start_kernel() {
     early_setup_arch().expect("setup_arch failed");
     unsafe { mm_init() };
 
-    scm_reinit().unwrap();
-    textui_init().unwrap();
+    if scm_reinit().is_ok() {
+        if let Err(e) = textui_init() {
+            warn!("Failed to init textui: {:?}", e);
+        }
+    }
 
     boot_callback_except_early();
     init_intertrait();

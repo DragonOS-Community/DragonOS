@@ -81,6 +81,7 @@ impl AcpiManager {
         let table_paddr: PhysAddr = match acpi_args {
             BootloaderAcpiArg::Rsdt(rsdpv1) => Self::rsdp_paddr(&rsdpv1),
             BootloaderAcpiArg::Xsdt(rsdpv2) => Self::rsdp_paddr(&rsdpv2),
+            BootloaderAcpiArg::Rsdp(rsdp) => rsdp,
             _ => {
                 error!(
                     "AcpiManager::map_tables(): unsupported acpi_args: {:?}",

@@ -22,15 +22,13 @@ impl TtyJobCtrlManager {
         let mut ctrl = core.contorl_info_irqsave();
         let pcb = ProcessManager::current_pcb();
 
-        // todo 目前将pgid设置为pid
-        ctrl.pgid = Some(pcb.pid());
-        ctrl.session = Some(pcb.pid());
+        ctrl.session = Some(pcb.basic().sid());
 
         assert!(pcb.sig_info_irqsave().tty().is_none());
 
         let mut singal = pcb.sig_info_mut();
         drop(ctrl);
-        singal.set_tty(tty);
+        singal.set_tty(Some(tty.clone()));
     }
 
     /// ### 检查tty
@@ -99,7 +97,7 @@ impl TtyJobCtrlManager {
                 if current.sig_info_irqsave().tty().is_none()
                     || !Arc::ptr_eq(&current.sig_info_irqsave().tty().clone().unwrap(), &tty)
                     || ctrl.session.is_none()
-                    || ctrl.session.unwrap() != current.pid()
+                    || ctrl.session.unwrap() != current.basic().sid()
                 {
                     return Err(SystemError::ENOTTY);
                 }

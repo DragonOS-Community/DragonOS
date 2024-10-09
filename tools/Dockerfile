@@ -4,6 +4,8 @@ FROM ubuntu:jammy
 ENV TZ=Asia/Shanghai
 ENV RUSTUP_DIST_SERVER=https://static.rust-lang.org
 ENV RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
+ENV FORCE_UNSAFE_CONFIGURE=1
+
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 # 设置工作目录
@@ -18,6 +20,7 @@ RUN apt update && \
     bash bootstrap.sh --default && \
     sudo cp /tmp/docker-entrypoint.sh /root/entrypoint.sh && \
     sudo chmod a+rwx /root/entrypoint.sh && \
+    git config --global --add safe.directory '*' && \
     sudo apt autoremove -q -y && \         
     sudo apt clean -q -y && \
     sudo rm -rf /tmp/*

@@ -284,6 +284,11 @@ impl TtyDriver {
             if err == SystemError::ENOSYS {
                 return self.standard_install(tty);
             } else {
+                log::error!(
+                    "driver_install_tty: Failed to install. name: {}, err: {:?}",
+                    tty.core().name(),
+                    err
+                );
                 return Err(err);
             }
         }

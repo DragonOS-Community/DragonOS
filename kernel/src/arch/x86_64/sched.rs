@@ -4,17 +4,6 @@ use crate::{exception::InterruptArch, sched::SchedArch, smp::core::smp_get_proce
 
 use super::{driver::apic::apic_timer::apic_timer_init, CurrentIrqArch};
 
-// /// @brief 若内核代码不处在中断上下文中，那么将可以使用本函数，发起一个sys_sched系统调用，然后运行调度器。
-// /// 由于只能在中断上下文中进行进程切换，因此需要发起一个系统调用SYS_SCHED。
-// #[no_mangle]
-// pub extern "C" fn sched() {
-//     let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-//     __schedule(SchedMode::SM_NONE);
-//     // unsafe {
-//     //     enter_syscall_int(SYS_SCHED as u64, 0, 0, 0, 0, 0, 0);
-//     // }
-// }
-
 static mut BSP_INIT_OK: bool = false;
 
 pub struct X86_64SchedArch;

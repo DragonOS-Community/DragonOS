@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 use crate::{constant::ARCH_DIR_RISCV64, utils::FileUtils};
 
@@ -12,17 +12,18 @@ impl CFilesArch for RiscV64CFilesArch {
         c.define("__riscv", None);
     }
 
-    fn setup_global_include_dir(&self, c: &mut cc::Build) {
-        c.include("src/arch/riscv64/include");
+    fn setup_global_include_dir(&self, include_dirs: &mut HashSet<PathBuf>) {
+        include_dirs.insert("src/arch/riscv64/include".into());
     }
 
-    fn setup_files(&self, _c: &mut cc::Build, files: &mut Vec<std::path::PathBuf>) {
-        files.push(PathBuf::from("src/arch/riscv64/asm/head.S"));
-        files.append(&mut FileUtils::list_all_files(
-            &arch_path("asm"),
-            Some("c"),
-            true,
-        ));
+    fn setup_files(&self, _c: &mut cc::Build, files: &mut HashSet<PathBuf>) {
+        files.insert(PathBuf::from("src/arch/riscv64/asm/head.S"));
+
+        FileUtils::list_all_files(&arch_path("asm"), Some("c"), true)
+            .into_iter()
+            .for_each(|f| {
+                files.insert(f);
+            });
     }
 
     fn setup_global_flags(&self, c: &mut cc::Build) {

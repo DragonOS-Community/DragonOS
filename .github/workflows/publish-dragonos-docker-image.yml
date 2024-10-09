@@ -27,7 +27,6 @@ jobs:
         id: fetch-versions
         run: |
           BUILD_CONTAINER_VERSION=$(cat tools/BUILD_CONTAINER_VERSION)
-          RUST_VERSION=$(grep -m1 -o 'nightly-[0-9]\+-[0-9]\+-[0-9]\+' rust-toolchain.toml)
           echo "build_container_version=$BUILD_CONTAINER_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Build and push docker image

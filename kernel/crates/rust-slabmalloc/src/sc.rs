@@ -69,15 +69,19 @@ pub struct SCAllocator<'a, P: AllocablePage> {
 /// re-use the code in const and non-const functions
 macro_rules! new_sc_allocator {
     ($size:expr) => {
-        SCAllocator {
-            size: $size,
-            allocation_count: 0,
-            obj_per_page: cmin((P::SIZE - OBJECT_PAGE_METADATA_OVERHEAD) / $size, 8 * 64),
-            empty_slabs: PageList::new(),
-            slabs: PageList::new(),
-            full_slabs: PageList::new(),
-            free_limit: 2 * cmin((P::SIZE - OBJECT_PAGE_METADATA_OVERHEAD) / $size, 8 * 64),// TODO:优化free_limit的计算
-            free_obj_count: 0
+        {
+            let obj_per_page = cmin((P::SIZE - OBJECT_PAGE_METADATA_OVERHEAD) / $size, 8 * 64);
+            SCAllocator {
+                size: $size,
+                allocation_count: 0,
+                obj_per_page,
+                empty_slabs: PageList::new(),
+                slabs: PageList::new(),
+                full_slabs: PageList::new(),
+                // TODO: 优化free_limit的计算: https://bbs.dragonos.org.cn/t/topic/358
+                free_limit: 2 * obj_per_page,
+                free_obj_count: 0
+            }
         }
     };
 }

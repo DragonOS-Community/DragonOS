@@ -126,6 +126,8 @@ pub fn test_seq_socket() ->Result<(), Error>{
             }
         }
         send_message(client_fd, MSG1)?;
+        let received_msg = receive_message(client_fd).expect("Failed to receive message");
+        println!("Client: Received message: {}", received_msg);
         // get peer_name
         unsafe {
             let mut addrss = sockaddr_un {
@@ -144,10 +146,8 @@ pub fn test_seq_socket() ->Result<(), Error>{
         }
             
         server_thread.join().expect("Server thread panicked");
-
         let received_msg = receive_message(client_fd).expect("Failed to receive message");
         println!("Client: Received message: {}", received_msg);
-
         // Close client connection
         unsafe { close(client_fd) };
         fs::remove_file(&SOCKET_PATH).ok();

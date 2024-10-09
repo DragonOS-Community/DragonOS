@@ -18,7 +18,6 @@ fn create_unix_socket(
             stream::StreamSocket::new_inode()
         },
         Type::SeqPacket => {
-            // Ok(seqpacket::SeqpacketSocket::new(false))
             seqpacket::SeqpacketSocket::new_inode(false)
         },
         _ => Err(EPROTONOSUPPORT),
@@ -28,7 +27,6 @@ fn create_unix_socket(
 impl family::Family for Unix {
     fn socket(stype: Type, _protocol: u32) -> Result<Arc<Inode>, SystemError> {
         let socket = create_unix_socket(stype)?;
-        // Ok(Inode::new(socket))
         Ok(socket)
     }
 }
@@ -37,8 +35,8 @@ impl Unix {
     pub fn new_pairs(socket_type:Type) ->Result<(Arc<Inode>,Arc<Inode>),SystemError>{
         log::debug!("socket_type {:?}",socket_type);
         match socket_type {
-            Type::SeqPacket |Type::Datagram=>seqpacket::SeqpacketSocket::new_pairs(),
-            Type::Stream => stream::StreamSocket::new_pairs(),
+            Type::SeqPacket =>seqpacket::SeqpacketSocket::new_pairs(),
+            Type::Stream | Type::Datagram => stream::StreamSocket::new_pairs(),
             _=>todo!()
         }
     }

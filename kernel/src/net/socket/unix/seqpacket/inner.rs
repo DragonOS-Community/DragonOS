@@ -225,6 +225,7 @@ impl Connected{
             },
             _ =>return  Err(SystemError::EINVAL),
         };
+        peer_socket.wait_queue.wakeup(None);
         Ok(usize)
     }
     

@@ -101,7 +101,7 @@ impl Connected {
         self.peer_addr = peer;
     }
 
-    fn send_slice(&self, buf: &[u8]) -> Result<usize, SystemError> {
+    pub fn send_slice(&self, buf: &[u8]) -> Result<usize, SystemError> {
         //写入对端buffer
         let peer_inode = match self.peer_addr.as_ref().unwrap() {
             Endpoint::Inode((inode,_)) => inode,
@@ -118,10 +118,11 @@ impl Connected {
                 return Err(SystemError::EINVAL);
             }
         };
+        peer_socket.wait_queue.wakeup(None);
         Ok(usize)
     }
 
-    fn can_send(&self) -> Result<bool, SystemError>{
+    pub fn can_send(&self) -> Result<bool, SystemError>{
         //查看连接体里的buf是否非满
         let peer_inode = match self.peer_addr.as_ref().unwrap() {
             Endpoint::Inode((inode,_)) => inode,
@@ -140,7 +141,7 @@ impl Connected {
         Ok(!is_full)
     }
 
-    fn can_recv(&self) -> bool {
+    pub fn can_recv(&self) -> bool {
         //查看连接体里的buf是否非空
         return !self.buffer.is_read_buf_empty();
     }

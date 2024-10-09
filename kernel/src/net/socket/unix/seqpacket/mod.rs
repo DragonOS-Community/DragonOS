@@ -89,6 +89,27 @@ impl SeqpacketSocket {
         }
     }
 
+    fn is_peer_shutdown(&self) -> Result<bool, SystemError>{
+        let peer_shutdown = match self.get_peer_name()?{
+            Endpoint::Inode((inode,_)) =>{
+                Arc::downcast::<SeqpacketSocket>(inode.inner()).map_err(|_| SystemError::EINVAL)?
+                .shutdown
+                .get()
+                .is_both_shutdown()
+            },
+            _ => return Err(SystemError::EINVAL),
+        };
+        Ok(peer_shutdown)
+    }
+
+    fn can_recv(&self) ->Result<bool, SystemError>{
+        let can=match &*self.inner.read(){
+            Inner::Connected(connected) =>connected.can_recv(),
+            _ => return Err(SystemError::ENOTCONN)
+        };
+        Ok(can)
+    }
+
     fn is_nonblocking(&self) -> bool {
         self.is_nonblocking.load(Ordering::Relaxed)
     }
@@ -98,8 +119,6 @@ impl SeqpacketSocket {
     }
 
 }
-
-
 
 impl Socket for SeqpacketSocket{
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
@@ -144,8 +163,9 @@ impl Socket for SeqpacketSocket{
             Inner::Listen(listener) => match listener.push_incoming(client_epoint){
                 Ok(connected) => {
                      *self.inner.write() = Inner::Connected(connected);
+                     log::debug!("try to wake up");
 
-                     remote_socket.wait_queue.wakeup(None);
+                    remote_socket.wait_queue.wakeup(None);
                     return Ok(());
             },
             // ***错误处理
@@ -179,6 +199,7 @@ impl Socket for SeqpacketSocket{
     }
 
     fn shutdown(&self, how: ShutdownTemp) -> Result<(), SystemError> {
+        log::debug!("seqpacket shutdown");
         match &*self.inner.write(){
             Inner::Connected(connected)=>{
                 connected.shutdown(how)
@@ -239,6 +260,9 @@ impl Socket for SeqpacketSocket{
     }
     
     fn close(&self) -> Result<(), SystemError> {
+        log::debug!("seqpacket close");
+        self.shutdown.recv_shutdown();
+        self.shutdown.send_shutdown();
         Ok(())
     }
     
@@ -288,32 +312,33 @@ impl Socket for SeqpacketSocket{
     }
     
     fn recv(&self, buffer: &mut [u8], flags: crate::net::socket::MessageFlag) -> Result<usize, SystemError> {
-        match &*self.inner.write(){
-            Inner::Connected(connected)=>{
-                if flags.contains(MessageFlag::OOB){
-                    return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-                }
-                if !flags.contains(MessageFlag::DONTWAIT){
-                    loop{
+        if flags.contains(MessageFlag::OOB){
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        if !flags.contains(MessageFlag::DONTWAIT){
+            loop{
+                wq_wait_event_interruptible!(self.wait_queue, self.can_recv()? || self.is_peer_shutdown()?, {})?;    
+                // connect锁和flag判断顺序不正确，应该先判断在
+                match &*self.inner.write(){
+                    Inner::Connected(connected)=>{
                         match connected.try_read(buffer){
                             Ok(usize)=>{
-                                log::debug!("recv successfully");
+                                log::debug!("recv from successfully");
                                 return Ok(usize)
                             },
-                            Err(_)=>continue,
+                            Err(_) => continue,
                         }
+                    },
+                    _ => {
+                        log::error!("the socket is not connected");
+                        return Err(SystemError::ENOTCONN)
                     }
                 }
-                else {
-                    unimplemented!("unimplemented non_block")
-                }
-            },
-            _=>{
-                log::error!("the socket is not connected");
-                return Err(SystemError::ENOTCONN)
             }
         }
-        
+        else{
+            unimplemented!("unimplemented non_block")
+        }
     }
     
     
@@ -322,31 +347,33 @@ impl Socket for SeqpacketSocket{
     }
     
     fn send(&self, buffer: &[u8], flags: crate::net::socket::MessageFlag) -> Result<usize, SystemError> {
-            match &mut *self.inner.write() {
-            Inner::Connected(connected)=>{
-                if flags.contains(MessageFlag::OOB){
-                    return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-                }
-
-                if !flags.contains(MessageFlag::DONTWAIT){
-                    loop{
+        if flags.contains(MessageFlag::OOB){
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        if self.is_peer_shutdown()?{
+            return Err(SystemError::EPIPE)
+        }
+        if !flags.contains(MessageFlag::DONTWAIT){
+            loop{  
+                match &*self.inner.write(){
+                    Inner::Connected(connected)=>{
                         match connected.try_write(buffer){
                             Ok(usize)=>{
                                 log::debug!("send successfully");
                                 return Ok(usize)
                             },
-                            Err(_)=>continue,
+                            Err(_) => continue,
                         }
+                    },
+                    _ => {
+                        log::error!("the socket is not connected");
+                        return Err(SystemError::ENOTCONN)
                     }
                 }
-                else {
-                    unimplemented!("unimplemented non_block")
-                }
-            },
-            _ =>{
-                log::error!("the socket is not connected");
-                return Err(SystemError::ENOTCONN)
             }
+        }
+        else{
+            unimplemented!("unimplemented non_block")
         }
     }
     
@@ -366,76 +393,35 @@ impl Socket for SeqpacketSocket{
             _address: Option<Endpoint>,
         ) -> Result<(usize, Endpoint), SystemError> {
         log::debug!("recvfrom flags {:?}",flags);
-
-        // wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
-        // connect锁和flag判断顺序不正确，应该先判断在
-        match &*self.inner.write(){
-            Inner::Connected(connected)=>{
-                if flags.contains(MessageFlag::OOB){
-                    return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-                }
-                if !flags.contains(MessageFlag::DONTWAIT){
-                    loop{
+        if flags.contains(MessageFlag::OOB){
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        if !flags.contains(MessageFlag::DONTWAIT){
+            loop{
+                wq_wait_event_interruptible!(self.wait_queue, self.can_recv()? || self.is_peer_shutdown()?, {})?;    
+                // connect锁和flag判断顺序不正确，应该先判断在
+                match &*self.inner.write(){
+                    Inner::Connected(connected)=>{
                         match connected.recv_slice(buffer){
                             Ok(usize)=>{
-                                log::debug!("recv from successfully");
+                                log::debug!("recvs from successfully");
                                 return Ok((usize,connected.peer_endpoint().unwrap().clone()))
                             },
                             Err(_) => continue,
                         }
+                    },
+                    _ => {
+                        log::error!("the socket is not connected");
+                        return Err(SystemError::ENOTCONN)
                     }
                 }
-                else {
-                    unimplemented!("unimplemented non_block")
-                }
-            },
-            _=>{
-                log::error!("the socket is not connected");
-                return Err(SystemError::ENOTCONN)
             }
+        }
+        else{
+            unimplemented!("unimplemented non_block")
         }
         //Err(SystemError::ENOSYS) 
     }
-    
-    
-    // fn update_io_events(&self) -> Result<crate::net::socket::EPollEventType, SystemError> {
-    //     // 参考linux的unix_poll https://code.dragonos.org.cn/xref/linux-6.1.9/net/unix/af_unix.c#3152
-    //     todo!()
-    //     // let mut mask = EP::empty();
-    //     // let shutdown = self.shutdown.get();
-        
-    //     // // todo:socket_poll_wait?注册socket
-    //     // if shutdown.is_both_shutdown(){
-    //     //     mask |= EP::EPOLLHUP;
-    //     // }
-
-    //     // if shutdown.is_recv_shutdown(){
-    //     //     mask |= EP::EPOLLRDHUP | EP::EPOLLIN | EP::EPOLLRDNORM;
-    //     // }
-    //     // match &*self.state.read(){
-    //     //     State::Connected(connected) => {
-    //     //         if connected.can_recv(){
-    //     //             mask |= EP::EPOLLIN | EP::EPOLLRDNORM;
-    //     //         }
-    //     //         // if (sk_is_readable(sk))
-    //     //         // mask |= EPOLLIN | EPOLLRDNORM;
-
-    //     //         // TODO:处理紧急情况 EPOLLPRI
-    //     //         // TODO:处理连接是否关闭 EPOLLHUP
-    //     //         if !shutdown.is_send_shutdown() {
-    //     //             if connected.can_send() {
-    //     //                 mask |= EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND;
-    //     //             } else {
-    //     //                 todo!("TcpSocket::poll: buffer space not enough");
-    //     //             }
-    //     //         } else {
-    //     //             mask |= EP::EPOLLOUT | EP::EPOLLWRNORM;
-    //     //         }
-    //     //     },
-    //     //     _ =>return Err(SystemError::EINVAL),
-    //     // }
-    //     // return Ok(mask)
-    // }
     
     fn send_buffer_size(&self) -> usize {
         log::warn!("using default buffer size");
@@ -448,7 +434,40 @@ impl Socket for SeqpacketSocket{
     }
     
     fn poll(&self) -> usize {
-        EPollEventType::empty().bits() as usize
+        let mut mask = EP::empty();
+        let shutdown = self.shutdown.get();
+        
+        // 参考linux的unix_poll https://code.dragonos.org.cn/xref/linux-6.1.9/net/unix/af_unix.c#3152
+        // 用关闭读写端表示连接断开
+        if shutdown.is_both_shutdown() || self.is_peer_shutdown().unwrap(){
+            mask |= EP::EPOLLHUP;
+        }
+
+        if shutdown.is_recv_shutdown(){
+            mask |= EP::EPOLLRDHUP | EP::EPOLLIN | EP::EPOLLRDNORM;
+        }
+        match &*self.inner.read(){
+            Inner::Connected(connected) => {
+                if connected.can_recv(){
+                    mask |= EP::EPOLLIN | EP::EPOLLRDNORM;
+                }
+                // if (sk_is_readable(sk))
+                // mask |= EPOLLIN | EPOLLRDNORM;
+
+                // TODO:处理紧急情况 EPOLLPRI
+                // TODO:处理连接是否关闭 EPOLLHUP
+                if !shutdown.is_send_shutdown() {
+                    if connected.can_send().unwrap() {
+                        mask |= EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND;
+                    } else {
+                        todo!("poll: buffer space not enough");
+                    }
+                } 
+            },
+            Inner::Listen(_) => mask |= EP::EPOLLIN,
+            Inner::Init(_)=>mask |= EP::EPOLLOUT,
+        }
+        mask.bits() as usize
     }
     
 }

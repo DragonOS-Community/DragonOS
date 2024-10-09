@@ -2,6 +2,8 @@ FROM ubuntu:jammy
 
 # 设置环境变量
 ENV TZ=Asia/Shanghai
+ENV RUSTUP_DIST_SERVER=https://static.rust-lang.org
+ENV RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 # 设置工作目录

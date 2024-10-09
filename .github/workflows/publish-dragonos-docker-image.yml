@@ -5,6 +5,8 @@ on:
   push:
     paths:
       - tools/BUILD_CONTAINER_VERSION
+    branches:
+      - master
 
 jobs:
   docker:
@@ -30,8 +32,8 @@ jobs:
       - name: Build and push docker image
         uses: docker/build-push-action@v4
         with:
-          context: .
-          file: ./tools/Dockerfile
+          context: "{{defaultContext}}:tools"
+          file: Dockerfile
           platforms: linux/amd64
           push: true
           tags: dragonos/dragonos-dev:${{ steps.fetch-versions.outputs.build_container_version }}

@@ -5,8 +5,6 @@ on:
   push:
     paths:
       - tools/BUILD_CONTAINER_VERSION
-    branches:
-      - master
 
 jobs:
   docker:

@@ -7,17 +7,6 @@ runs:
         with:
           submodules: 'recursive'
 
-      - name: Cache DragonOS GCC
-        id: cache-dragonos-gcc
-        uses: actions/cache@v3
-        env:
-            cache-name: cache-dragonos-gcc
-        with:
-          path: |
-            ~/opt
-            ~/.bashrc
-          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('tools/build_gcc_toolchain.sh') }}
-
       - name: Cache build tools
         id: cache-build-tools
         uses: actions/cache@v3
@@ -33,4 +22,4 @@ runs:
           key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ env.dadk_version }}-${{ hashFiles('.github/workflows/cache-toolchain.yml') }}-${{ hashFiles('tools/install_musl_gcc.sh') }}
       
       - uses: ./.github/actions/install-apt-packages
-      
+

@@ -10,23 +10,6 @@ jobs:
         steps:
         - uses: actions/checkout@v3
         
-        - name: Cache DragonOS GCC
-          id: cache-dragonos-gcc
-          uses: actions/cache@v3
-          env:
-              cache-name: cache-dragonos-gcc
-          with:
-            path: |
-              ~/opt
-              ~/.bashrc
-            key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('tools/build_gcc_toolchain.sh') }}
-        
-        - if: ${{ steps.cache-dragonos-gcc.outputs.cache-hit != 'true' }}
-          name: build dragonos-gcc
-          continue-on-error: true
-          run: |
-              bash tools/build_gcc_toolchain.sh -f
-        
         - uses: ./.github/actions/install-apt-packages
 
         - name: Cache build tools

@@ -25,6 +25,8 @@ jobs:
     - name: Format check
       env:
           ARCH: ${{ matrix.arch }}
+          HOME: /root
+      shell: bash -ileo pipefail {0}
       run: |
             printf "\n" >> kernel/src/include/bindings/bindings.rs
             FMT_CHECK=1 make fmt
@@ -48,7 +50,8 @@ jobs:
       shell: bash -ileo pipefail {0}
       env:
           ARCH: ${{ matrix.arch }}
-      run: bash -c "source ~/.cargo/env && cd kernel && make test"
+          HOME: /root
+      run: bash -c "source /root/.cargo/env && cd kernel && make test"
 
   build-x86_64:
 
@@ -62,6 +65,7 @@ jobs:
     - name: build the DragonOS
       env:
           ARCH: x86_64
+          HOME: /root
       shell: bash -ileo pipefail {0}
 
       run: |
@@ -87,6 +91,7 @@ jobs:
       shell: bash -ileo pipefail {0}
       env:
           ARCH: riscv64
+          HOME: /root
 
       run: source ~/.bashrc && source ~/.cargo/env && make kernel -j $(nproc)
 

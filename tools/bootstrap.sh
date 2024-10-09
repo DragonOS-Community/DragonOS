@@ -76,7 +76,7 @@ install_ubuntu_debian_pkg()
 		sudo apt install -y python3 python3-pip
 	fi
 
-    if [ -z "$(which docker)" ] && [ ${dockerInstall} = "true" ]; then
+    if [ -z "$(which docker)" ] && [ "${dockerInstall}" = "true" ]; then
         echo "正在安装docker..."
         sudo apt install -y docker.io docker-compose
 		sudo groupadd docker

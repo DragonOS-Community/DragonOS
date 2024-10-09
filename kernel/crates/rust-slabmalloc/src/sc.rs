@@ -334,7 +334,6 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
         // TODO: The linked list will have another &mut reference
         let slab_page = unsafe { mem::transmute::<VAddr, &'a mut P>(page) };
         let new_layout = unsafe { Layout::from_size_align_unchecked(self.size, layout.align()) };
-        let is_full_before_dealloc = slab_page.is_full();
 
         let ret = slab_page.deallocate(ptr, new_layout);
         debug_assert!(ret.is_ok(), "Slab page deallocate won't fail at the moment");
@@ -346,12 +345,6 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
             self.slabs.remove_from_list(slab_page);
             // 将slab_page归还buddy
             slab_callback.free_slab_page(slab_page as *const P as *mut u8, P::SIZE);
-        } else {
-            if is_empty_after_dealloc {
-                self.move_to_empty(slab_page);
-            } else if is_full_before_dealloc {
-                self.move_full_to_partial(slab_page);
-            }
         }
         self.check_page_assignments();
 

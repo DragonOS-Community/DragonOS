@@ -17,7 +17,7 @@ use intertrait::cast::CastArc;
 use log::error;
 use system_error::SystemError;
 
-use super::{class::sys_class_net_instance, NetDeivceState, Iface, Operstate};
+use super::{class::sys_class_net_instance, Iface, NetDeivceState, Operstate};
 
 /// 将设备注册到`/sys/class/net`目录下
 /// 参考：https://code.dragonos.org.cn/xref/linux-2.6.39/net/core/net-sysfs.c?fi=netdev_register_kobject#1311

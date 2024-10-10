@@ -1,5 +1,5 @@
 use crate::{filesystem::vfs::InodeId, net::socket};
-use alloc::{sync::Arc,string::String};
+use alloc::{string::String, sync::Arc};
 
 pub use smoltcp::wire::IpEndpoint;
 pub use socket::netlink::endpoint::NetlinkEndpoint;
@@ -11,9 +11,9 @@ pub enum Endpoint {
     /// 网络层端点
     Ip(IpEndpoint),
     /// inode端点,Unix实际保存的端点
-    Inode((Arc<socket::Inode>,String)),
+    Inode((Arc<socket::Inode>, String)),
     /// Unix传递id索引和path所用的端点
-    Unixpath((InodeId,String)),
+    Unixpath((InodeId, String)),
     /// NetLink端点
     Netlink(NetlinkEndpoint),
 }

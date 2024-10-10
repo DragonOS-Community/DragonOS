@@ -20,8 +20,8 @@ use crate::{
     syscall::Syscall,
 };
 
-use super::socket::{netlink::endpoint, unix::Unix, AddressFamily as AF};
 use super::socket::{self, Endpoint, Socket};
+use super::socket::{netlink::endpoint, unix::Unix, AddressFamily as AF};
 
 pub use super::syscall_util::*;
 
@@ -52,7 +52,7 @@ impl Syscall {
         let is_nonblock = type_arg.is_nonblock();
         let is_close_on_exec = type_arg.is_cloexec();
         let stype = socket::Type::try_from(type_arg)?;
-        log::debug!("type_arg {:?}  stype {:?}",type_arg,stype);
+        log::debug!("type_arg {:?}  stype {:?}", type_arg, stype);
 
         let inode = socket::create_socket(
             address_family,
@@ -120,7 +120,7 @@ impl Syscall {
         // }
 
         // 创建一对新的unix socket pair
-        let (inode0,inode1)=Unix::new_pairs(stype)?;
+        let (inode0, inode1) = Unix::new_pairs(stype)?;
 
         fds[0] = fd_table_guard.alloc_fd(File::new(inode0, FileMode::O_RDWR)?, None)?;
         fds[1] = fd_table_guard.alloc_fd(File::new(inode1, FileMode::O_RDWR)?, None)?;
@@ -283,7 +283,7 @@ impl Syscall {
             Some(SockAddr::to_endpoint(addr, addrlen)?)
         };
 
-        let flags = socket::MessageFlag::from_bits_truncate(flags as u32);
+        let flags = socket::MessageFlag::from_bits_truncate(flags);
 
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
@@ -315,7 +315,7 @@ impl Syscall {
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let flags = socket::MessageFlag::from_bits_truncate(flags as u32);
+        let flags = socket::MessageFlag::from_bits_truncate(flags);
 
         if addr.is_null() {
             let (n, _) = socket.recv_from(buf, flags, None)?;
@@ -332,8 +332,9 @@ impl Syscall {
                 sockaddr_in.write_to_user(addr, addr_len)?;
             }
             return Ok(recv_len);
-        } else { // 从socket中读取数据
-            let addr_len = unsafe { addr_len.as_ref() }.ok_or(EINVAL)?.clone();
+        } else {
+            // 从socket中读取数据
+            let addr_len = *unsafe { addr_len.as_ref() }.ok_or(EINVAL)?;
             let address = SockAddr::to_endpoint(addr, addr_len)?;
             let (recv_len, _) = socket.recv_from(buf, flags, Some(address))?;
             return Ok(recv_len);

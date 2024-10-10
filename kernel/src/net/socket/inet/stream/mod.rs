@@ -72,7 +72,10 @@ impl TcpSocket {
             Inner::Init(inner) => {
                 let bound = inner.bind(local_endpoint)?;
                 if let Init::Bound((ref bound, _)) = bound {
-                    bound.iface().common().bind_socket(self.self_ref.upgrade().unwrap());
+                    bound
+                        .iface()
+                        .common()
+                        .bind_socket(self.self_ref.upgrade().unwrap());
                 }
                 writer.replace(Inner::Init(bound));
                 Ok(())
@@ -269,12 +272,12 @@ impl Socket for TcpSocket {
                 match self.try_accept() {
                     Err(EAGAIN_OR_EWOULDBLOCK) => {
                         wq_wait_event_interruptible!(self.wait_queue, self.is_acceptable(), {})?;
-                    },
+                    }
                     result => break result,
                 }
             }
-        }.map(|(inner, endpoint)| 
-        (Inode::new(inner), Endpoint::Ip(endpoint)))
+        }
+        .map(|(inner, endpoint)| (Inode::new(inner), Endpoint::Ip(endpoint)))
     }
 
     fn recv(&self, buffer: &mut [u8], _flags: MessageFlag) -> Result<usize, SystemError> {
@@ -303,15 +306,15 @@ impl Socket for TcpSocket {
 
     fn close(&self) -> Result<(), SystemError> {
         match self.inner.read().as_ref().expect("Tcp Inner is None") {
-            Inner::Init(_) => {},
+            Inner::Init(_) => {}
             Inner::Connecting(_) => {
                 return Err(EINPROGRESS);
-            },
+            }
             Inner::Established(es) => {
                 es.close();
                 es.release();
-            },
-            Inner::Listening(_) => {},
+            }
+            Inner::Listening(_) => {}
         }
         Ok(())
     }

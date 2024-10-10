@@ -36,15 +36,9 @@ impl family::Family for Netlink {
     }
 }
 /// 用户空间创建一个新的Netlink套接字
-fn create_netlink_socket(
-    _protocol: u32,
-) -> Result<Arc<dyn Socket>, SystemError> {
+fn create_netlink_socket(_protocol: u32) -> Result<Arc<dyn Socket>, SystemError> {
     match _protocol as usize {
-        NETLINK_KOBJECT_UEVENT => {
-            Ok(Arc::new(af_netlink::NetlinkSock::new()))
-        }
-        _ => {
-            Err(SystemError::EPROTONOSUPPORT)
-        }
+        NETLINK_KOBJECT_UEVENT => Ok(Arc::new(af_netlink::NetlinkSock::new())),
+        _ => Err(SystemError::EPROTONOSUPPORT),
     }
 }

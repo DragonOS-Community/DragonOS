@@ -80,23 +80,21 @@ fn dhcp_query() -> Result<(), SystemError> {
 
                 if let Some(router) = config.router {
                     let mut smol_iface = net_face.smol_iface().lock();
-                    let _ = smol_iface
-                        .routes_mut()
-                        .update(|table| {
-                            let _ = table.push(smoltcp::iface::Route {
-                                cidr: smoltcp::wire::IpCidr::Ipv4(
-                                    smoltcp::wire::Ipv4Cidr::new(
-                                    smoltcp::wire::Ipv4Address::new(127, 0, 0, 0), 
-                                    8
-                                )),
-                                via_router: smoltcp::wire::IpAddress::v4(127, 0, 0, 1),
-                                preferred_until: None,
-                                expires_at: None,
-                            });
+                    smol_iface.routes_mut().update(|table| {
+                        let _ = table.push(smoltcp::iface::Route {
+                            cidr: smoltcp::wire::IpCidr::Ipv4(smoltcp::wire::Ipv4Cidr::new(
+                                smoltcp::wire::Ipv4Address::new(127, 0, 0, 0),
+                                8,
+                            )),
+                            via_router: smoltcp::wire::IpAddress::v4(127, 0, 0, 1),
+                            preferred_until: None,
+                            expires_at: None,
                         });
+                    });
                     if smol_iface
                         .routes_mut()
-                        .add_default_ipv4_route(router).is_err() 
+                        .add_default_ipv4_route(router)
+                        .is_err()
                     {
                         log::warn!("Route table full");
                     }

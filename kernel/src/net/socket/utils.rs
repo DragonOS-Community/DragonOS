@@ -17,7 +17,7 @@ pub fn create_socket(
             todo!("AF_INET6 unimplemented");
         }
         AF::Unix => socket::unix::Unix::socket(socket_type, protocol)?,
-        AF::Netlink => {socket::netlink::Netlink::socket(socket_type, protocol)?}
+        AF::Netlink => socket::netlink::Netlink::socket(socket_type, protocol)?,
         _ => {
             todo!("unsupport address family");
         }

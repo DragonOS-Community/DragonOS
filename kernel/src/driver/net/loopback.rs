@@ -300,10 +300,10 @@ impl LoopbackInterface {
         Arc::new(LoopbackInterface {
             driver: LoopbackDriverWapper(UnsafeCell::new(driver)),
             common: IfaceCommon::new(iface_id, iface),
-            inner: SpinLock::new(InnerLoopbackInterface { 
-                netdevice_common: NetDeviceCommonData::default(), 
-                device_common: DeviceCommonData::default(), 
-                kobj_common: KObjectCommonData::default() 
+            inner: SpinLock::new(InnerLoopbackInterface {
+                netdevice_common: NetDeviceCommonData::default(),
+                device_common: DeviceCommonData::default(),
+                kobj_common: KObjectCommonData::default(),
             }),
             locked_kobj_state: LockedKObjectState::default(),
         })

@@ -8,7 +8,9 @@ use crate::{
             device::{bus::Bus, driver::Driver, Device, DeviceCommonData, DeviceType, IdTable},
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         },
-        net::{register_netdevice, NetDeivceState, Iface, IfaceCommon, NetDeviceCommonData, Operstate},
+        net::{
+            register_netdevice, Iface, IfaceCommon, NetDeivceState, NetDeviceCommonData, Operstate,
+        },
     },
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},

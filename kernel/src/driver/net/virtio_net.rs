@@ -16,7 +16,7 @@ use smoltcp::{iface, phy, wire};
 use unified_init::macros::unified_init;
 use virtio_drivers::device::net::VirtIONet;
 
-use super::{NetDeivceState, Iface, NetDeviceCommonData, Operstate};
+use super::{Iface, NetDeivceState, NetDeviceCommonData, Operstate};
 use crate::{
     arch::rand::rand,
     driver::{
@@ -32,7 +32,12 @@ use crate::{
         },
         net::register_netdevice,
         virtio::{
-            irq::virtio_irq_manager, sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager}, transport::VirtIOTransport, virtio_impl::HalImpl, VirtIODevice, VirtIODeviceIndex, VirtIODriver, VirtIODriverCommonData, VirtioDeviceId, VIRTIO_VENDOR_ID
+            irq::virtio_irq_manager,
+            sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
+            transport::VirtIOTransport,
+            virtio_impl::HalImpl,
+            VirtIODevice, VirtIODeviceIndex, VirtIODriver, VirtIODriverCommonData, VirtioDeviceId,
+            VIRTIO_VENDOR_ID,
         },
     },
     exception::{irqdesc::IrqReturn, IrqNumber},

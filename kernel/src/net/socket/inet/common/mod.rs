@@ -46,15 +46,19 @@ impl BoundInner {
             // }
             // 强绑VirtualIO
             log::debug!("Not bind to any iface, bind to virtIO");
-            let iface = NET_DEVICES.read_irqsave().get(&0).expect("??bind without virtIO, serious?").clone();
+            let iface = NET_DEVICES
+                .read_irqsave()
+                .get(&0)
+                .expect("??bind without virtIO, serious?")
+                .clone();
             let handle = iface.sockets().lock_no_preempt().add(socket);
-            return Ok( Self { handle, iface });
+            return Ok(Self { handle, iface });
         } else {
             let iface = get_iface_to_bind(address).ok_or(ENODEV)?;
             let handle = iface.sockets().lock_no_preempt().add(socket);
             // log::debug!("Bind to iface: {}", iface.iface_name());
             // return Ok(Self { inner: vec![(handle, iface)] });
-            return Ok( Self { handle, iface });
+            return Ok(Self { handle, iface });
         }
     }
 
@@ -107,7 +111,7 @@ pub fn get_iface_to_bind(ip_addr: &smoltcp::wire::IpAddress) -> Option<Arc<dyn I
         .find(|(_, iface)| {
             let guard = iface.smol_iface().lock();
             // log::debug!("iface name: {}, ip: {:?}", iface.iface_name(), guard.ip_addrs());
-            return guard.has_ip_addr(ip_addr.clone());
+            return guard.has_ip_addr(*ip_addr);
         })
         .map(|(_, iface)| iface.clone())
 }
@@ -119,7 +123,7 @@ fn get_ephemeral_iface(
     remote_ip_addr: &smoltcp::wire::IpAddress,
 ) -> (Arc<dyn Iface>, smoltcp::wire::IpAddress) {
     get_iface_to_bind(remote_ip_addr)
-        .map(|iface| (iface, remote_ip_addr.clone()))
+        .map(|iface| (iface, *remote_ip_addr))
         .or({
             let ifaces = NET_DEVICES.read_irqsave();
             ifaces.iter().find_map(|(_, iface)| {

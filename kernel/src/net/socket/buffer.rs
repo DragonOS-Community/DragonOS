@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use alloc::{sync::Arc,string::String};
+use alloc::{string::String, sync::Arc};
 use log::debug;
 use system_error::SystemError;
 
@@ -26,8 +26,8 @@ impl Buffer {
         return self.read_buffer.lock().is_empty();
     }
 
-    pub fn is_read_buf_full(&self) ->bool {
-        return self.metadata.buf_size-self.read_buffer.lock().len()==0
+    pub fn is_read_buf_full(&self) -> bool {
+        return self.metadata.buf_size - self.read_buffer.lock().len() == 0;
     }
 
     pub fn is_write_buf_empty(&self) -> bool {
@@ -43,14 +43,14 @@ impl Buffer {
         let len = core::cmp::min(buf.len(), read_buffer.len());
         buf[..len].copy_from_slice(&read_buffer[..len]);
         let _ = read_buffer.split_off(len);
-        log::debug!("recv buf {}",String::from_utf8_lossy(buf));
+        log::debug!("recv buf {}", String::from_utf8_lossy(buf));
 
         return Ok(len);
     }
 
     pub fn write_read_buffer(&self, buf: &[u8]) -> Result<usize, SystemError> {
         let mut buffer = self.read_buffer.lock_irqsave();
-        log::debug!("send buf {}",String::from_utf8_lossy(buf));
+        log::debug!("send buf {}", String::from_utf8_lossy(buf));
         let len = buf.len();
         if self.metadata.buf_size - buffer.len() < len {
             return Err(SystemError::ENOBUFS);

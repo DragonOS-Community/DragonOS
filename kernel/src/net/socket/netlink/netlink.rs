@@ -1,4 +1,9 @@
-use alloc::{boxed::Box, slice, sync::{Arc, Weak}, vec::Vec};
+use alloc::{
+    boxed::Box,
+    slice,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use system_error::SystemError;
 
 //定义Netlink消息的结构体，如NLmsghdr和geNLmsghdr(拓展的netlink消息头)，以及用于封包和解包消息的函数。
@@ -8,7 +13,9 @@ use system_error::SystemError;
 use crate::libs::mutex::Mutex;
 use core::mem;
 
-use super::af_netlink::{netlink_insert, Listeners, NetlinkFlags, NetlinkSock, NetlinkSocket, NL_TABLE};
+use super::af_netlink::{
+    netlink_insert, Listeners, NetlinkFlags, NetlinkSock, NetlinkSocket, NL_TABLE,
+};
 // Netlink protocol family
 pub const NETLINK_ROUTE: usize = 0;
 pub const NETLINK_UNUSED: usize = 1;
@@ -248,11 +255,14 @@ impl VecExt for Vec<u8> {
 }
 
 // todo： net namespace
-pub fn netlink_kernel_create(unit: usize, cfg:Option<NetlinkKernelCfg>) -> Result<NetlinkSock, SystemError> {
+pub fn netlink_kernel_create(
+    unit: usize,
+    cfg: Option<NetlinkKernelCfg>,
+) -> Result<NetlinkSock, SystemError> {
     // THIS_MODULE
-	let mut nlk: NetlinkSock = NetlinkSock::new();
-    let sk:Arc<Mutex<Box<dyn NetlinkSocket>>> = Arc::new(Mutex::new(Box::new(nlk.clone())));
-    let groups:u32;
+    let mut nlk: NetlinkSock = NetlinkSock::new();
+    let sk: Arc<Mutex<Box<dyn NetlinkSocket>>> = Arc::new(Mutex::new(Box::new(nlk.clone())));
+    let groups: u32;
     if unit >= MAX_LINKS {
         return Err(SystemError::EINVAL);
     }
@@ -273,18 +283,18 @@ pub fn netlink_kernel_create(unit: usize, cfg:Option<NetlinkKernelCfg>) -> Resul
     // if cfg.is_some() && cfg.unwrap().input.is_some(){
     //     nlk.netlink_rcv = cfg.unwrap().input;
     // }
-    netlink_insert(sk,0).expect("netlink_insert failed");
+    netlink_insert(sk, 0).expect("netlink_insert failed");
     nlk.flags |= NetlinkFlags::NETLINK_F_KERNEL_SOCKET.bits();
 
     let mut nl_table = NL_TABLE.write();
-    if nl_table[unit].get_registered()==0 {
-            nl_table[unit].set_groups(groups);
-            if let Some(cfg) = cfg.as_ref() {
-                nl_table[unit].bind = cfg.bind.clone();
-                nl_table[unit].unbind = cfg.unbind.clone();
-                nl_table[unit].set_flags(cfg.flags);
-                if cfg.compare.is_some() {
-                    nl_table[unit].compare = cfg.compare.clone();
+    if nl_table[unit].get_registered() == 0 {
+        nl_table[unit].set_groups(groups);
+        if let Some(cfg) = cfg.as_ref() {
+            nl_table[unit].bind = cfg.bind.clone();
+            nl_table[unit].unbind = cfg.unbind.clone();
+            nl_table[unit].set_flags(cfg.flags);
+            if cfg.compare.is_some() {
+                nl_table[unit].compare = cfg.compare.clone();
             }
             nl_table[unit].set_registered(1);
         } else {
@@ -296,14 +306,14 @@ pub fn netlink_kernel_create(unit: usize, cfg:Option<NetlinkKernelCfg>) -> Resul
     return Ok(nlk);
 }
 
-fn __netlink_create(nlk: &mut NetlinkSock, unit: usize, kern:usize)->Result<i32,SystemError>{
+fn __netlink_create(nlk: &mut NetlinkSock, unit: usize, kern: usize) -> Result<i32, SystemError> {
     // 其他的初始化配置参数
     nlk.flags = kern as u32;
     nlk.protocol = unit;
     return Ok(0);
 }
 
-pub fn sk_data_ready(nlk: Arc<NetlinkSock>)-> Result<(),SystemError>{
+pub fn sk_data_ready(nlk: Arc<NetlinkSock>) -> Result<(), SystemError> {
     // 唤醒
     return Ok(());
 }

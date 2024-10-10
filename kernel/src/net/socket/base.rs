@@ -1,12 +1,11 @@
-
 #![allow(unused_variables)]
 
-use core::any::Any;
-use core::fmt::Debug;
-use alloc::sync::Arc;
-use system_error::SystemError::{self, *};
 use crate::net::socket::*;
 use crate::net::syscall_util::MsgHdr;
+use alloc::sync::Arc;
+use core::any::Any;
+use core::fmt::Debug;
+use system_error::SystemError::{self, *};
 
 /// # `Socket` methods
 /// ## Reference

@@ -1,7 +1,10 @@
 use smoltcp;
 use system_error::SystemError::{self, *};
 
-use crate::{libs::spinlock::SpinLock, net::socket::inet::common::{BoundInner, Types as InetTypes}};
+use crate::{
+    libs::spinlock::SpinLock,
+    net::socket::inet::common::{BoundInner, Types as InetTypes},
+};
 
 pub type SmolUdpSocket = smoltcp::socket::udp::Socket<'static>;
 

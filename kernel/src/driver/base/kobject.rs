@@ -274,7 +274,11 @@ impl KObjectManager {
         const MAX_ITERATIONS: usize = 10; // 最大迭代次数
 
         loop {
-            log::info!("Iteration {}: parent.name():{:?}", iteration_count, parent.name());
+            log::info!(
+                "Iteration {}: parent.name():{:?}",
+                iteration_count,
+                parent.name()
+            );
             length += parent.name().len() + 1;
             if let Some(weak_parent) = parent.parent() {
                 if let Some(upgraded_parent) = weak_parent.upgrade() {
@@ -350,7 +354,7 @@ impl KObjectManager {
     pub fn kobject_get_path(kobj: &Arc<dyn KObject>) -> String {
         log::debug!("kobject_get_path() kobj:{:?}", kobj.name());
         let length = Self::get_kobj_path_length(kobj);
-        let path:&mut [u8] = &mut vec![0; length];
+        let path: &mut [u8] = &mut vec![0; length];
         Self::fill_kobj_path(kobj, path, length);
         let path_string = String::from_utf8(path.to_vec()).unwrap();
         return path_string;

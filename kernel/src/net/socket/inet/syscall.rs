@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use smoltcp;
 use system_error::SystemError::{self, *};
 
-use inet::{UdpSocket, TcpSocket};
+use inet::{TcpSocket, UdpSocket};
 
 // use crate::net::syscall_util::SysArgSocketType;
 use crate::net::socket::*;
@@ -19,7 +19,7 @@ fn create_inet_socket(
             match protocol {
                 HopByHop | Udp => {
                     return Ok(UdpSocket::new(false));
-                },
+                }
                 _ => {
                     return Err(EPROTONOSUPPORT);
                 }
@@ -28,20 +28,18 @@ fn create_inet_socket(
             //     return Err(EPROTONOSUPPORT);
             // }
             // return Ok(UdpSocket::new(false));
-        },
-        Stream => {
-            match protocol {
-                HopByHop | Tcp => {
-                    return Ok(TcpSocket::new(false));
-                },
-                _ => {
-                    return Err(EPROTONOSUPPORT);
-                }
+        }
+        Stream => match protocol {
+            HopByHop | Tcp => {
+                return Ok(TcpSocket::new(false));
+            }
+            _ => {
+                return Err(EPROTONOSUPPORT);
             }
         },
         Raw => {
             todo!("raw")
-        },
+        }
         _ => {
             return Err(EPROTONOSUPPORT);
         }

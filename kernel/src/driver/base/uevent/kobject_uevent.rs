@@ -1,10 +1,4 @@
 // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c
-use core::fmt::Write;
-use alloc::collections::LinkedList;
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
-use num::Zero;
-use unified_init::macros::unified_init;
 use super::KObject;
 use super::KobjUeventEnv;
 use super::KobjectAction;
@@ -16,23 +10,31 @@ use crate::libs::rwlock::RwLock;
 use crate::net::socket::netlink::af_netlink::netlink_has_listeners;
 use crate::net::socket::netlink::af_netlink::NetlinkSocket;
 use crate::net::socket::netlink::af_netlink::{netlink_broadcast, NetlinkSock};
-use crate::net::socket::netlink::netlink::{netlink_kernel_create, NetlinkKernelCfg, NETLINK_KOBJECT_UEVENT, NL_CFG_F_NONROOT_RECV};
+use crate::net::socket::netlink::netlink::{
+    netlink_kernel_create, NetlinkKernelCfg, NETLINK_KOBJECT_UEVENT, NL_CFG_F_NONROOT_RECV,
+};
 use crate::net::socket::netlink::skbuff::SkBuff;
 use alloc::boxed::Box;
+use alloc::collections::LinkedList;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::fmt::Write;
+use num::Zero;
 use system_error::SystemError;
+use unified_init::macros::unified_init;
 // 全局变量
 pub static UEVENT_SEQNUM: u64 = 0;
 // #ifdef CONFIG_UEVENT_HELPER
 // char uevent_helper[UEVENT_HELPER_PATH_LEN] = CONFIG_UEVENT_HELPER_PATH;
 // #endif
 
-struct UeventSock {inner: NetlinkSock}
+struct UeventSock {
+    inner: NetlinkSock,
+}
 impl UeventSock {
-    pub fn new(inner:NetlinkSock) -> Self {
-        UeventSock {
-            inner,
-        }
+    pub fn new(inner: NetlinkSock) -> Self {
+        UeventSock { inner }
     }
 }
 
@@ -43,14 +45,13 @@ lazy_static::lazy_static! {
     static ref UEVENT_SOCK_LIST: Mutex<LinkedList<UeventSock>> = Mutex::new(LinkedList::new());
 }
 // 回调函数，当接收到 uevent 消息时调用
-fn uevent_net_rcv(){
+fn uevent_net_rcv() {
     // netlink_rcv_skb(skb, &uevent_net_rcv_skb);
-    
 }
 
 /// 内核初始化的时候，在设备初始化之前执行
 #[unified_init(INITCALL_POSTCORE)]
-fn kobejct_uevent_init()-> Result<(),SystemError>{
+fn kobejct_uevent_init() -> Result<(), SystemError> {
     // todo: net namespace
     return uevent_net_init();
 }
@@ -58,8 +59,7 @@ fn kobejct_uevent_init()-> Result<(),SystemError>{
 // 内核启动的时候，即使没有进行网络命名空间的隔离也需要调用这个函数
 // 支持 net namespace 之后需要在每个 net namespace 初始化的时候调用这个函数
 /// 为每一个 net namespace 初始化 uevent
-fn uevent_net_init()-> Result<(),SystemError>{
-	
+fn uevent_net_init() -> Result<(), SystemError> {
     let cfg = NetlinkKernelCfg {
         groups: 1,
         flags: NL_CFG_F_NONROOT_RECV,
@@ -69,21 +69,19 @@ fn uevent_net_init()-> Result<(),SystemError>{
     let ue_sk = UeventSock::new(netlink_kernel_create(NETLINK_KOBJECT_UEVENT, Some(cfg)).unwrap());
 
     // todo: net namespace
-	// net.uevent_sock = ue_sk;
-    
+    // net.uevent_sock = ue_sk;
+
     // 每个 net namespace 向链表中添加一个新的 uevent socket
     UEVENT_SOCK_LIST.lock().push_back(ue_sk);
     log::info!("uevent_net_init finish");
-	return Ok(());
+    return Ok(());
 }
 
 // 系统关闭时清理
-fn uevent_net_exit()
-{
+fn uevent_net_exit() {
     // 清理链表
     UEVENT_SOCK_LIST.lock().clear();
 }
-
 
 // /* This lock protects uevent_seqnum and uevent_sock_list */
 // static DEFINE_MUTEX(uevent_sock_mutex);
@@ -165,8 +163,7 @@ pub fn kobject_uevent_env(
 
     let kset = top_kobj.kset();
     // 判断该 kobject 的状态是否设置了uevent_suppress，如果设置了，则忽略所有的uevent上报并返回
-    if kobj.kobj_state().contains(KObjectState::UEVENT_SUPPRESS)
-    {
+    if kobj.kobj_state().contains(KObjectState::UEVENT_SUPPRESS) {
         log::info!("uevent_suppress caused the event to drop!");
         return Ok(0);
     }
@@ -181,7 +178,7 @@ pub fn kobject_uevent_env(
         }
     }
 
-     // 判断所属的kset是否有合法的名称（称作subsystem，和前期的内核版本有区别），否则不允许上报uevent
+    // 判断所属的kset是否有合法的名称（称作subsystem，和前期的内核版本有区别），否则不允许上报uevent
     // originating subsystem
     let subsystem: String = if let Some(kset_ref) = kset.as_ref() {
         if let Some(uevent_ops) = &kset_ref.uevent_ops {
@@ -273,7 +270,6 @@ pub fn kobject_uevent_env(
                     return Ok(retval);
                 }
             }
-
         }
     }
     match action {
@@ -464,7 +460,11 @@ pub fn uevent_net_broadcast_untagged(
     action_string: &str,
     devpath: &str,
 ) -> i32 {
-    log::info!("uevent_net_broadcast_untagged: action_string: {}, devpath: {}", action_string, devpath);
+    log::info!(
+        "uevent_net_broadcast_untagged: action_string: {}, devpath: {}",
+        action_string,
+        devpath
+    );
     let mut retval = 0;
     let mut skb = Arc::new(RwLock::new(SkBuff::new()));
 
@@ -487,13 +487,7 @@ pub fn uevent_net_broadcast_untagged(
         }
         log::info!("next is netlink_broadcast");
         let netlink_socket: Arc<dyn NetlinkSocket> = Arc::new(ue_sk.inner.clone());
-        retval = match netlink_broadcast(
-            &netlink_socket,
-            Arc::clone(&skb),
-            0,
-            1,
-            1,
-        ) {
+        retval = match netlink_broadcast(&netlink_socket, Arc::clone(&skb), 0, 1, 1) {
             Ok(_) => 0,
             Err(err) => err.to_posix_errno(),
         };

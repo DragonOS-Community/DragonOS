@@ -44,7 +44,7 @@ impl UdpSocket {
         let mut inner = self.inner.write();
         if let Some(UdpInner::Unbound(unbound)) = inner.take() {
             let bound = unbound.bind(local_endpoint)?;
-            
+
             bound
                 .inner()
                 .iface()
@@ -60,7 +60,7 @@ impl UdpSocket {
         let mut inner_guard = self.inner.write();
         let bound = match inner_guard.take().expect("Udp inner is None") {
             UdpInner::Bound(inner) => inner,
-            UdpInner::Unbound(inner) => inner.bind_ephemeral(remote)?
+            UdpInner::Unbound(inner) => inner.bind_ephemeral(remote)?,
         };
         inner_guard.replace(UdpInner::Bound(bound));
         return Ok(());
@@ -198,7 +198,8 @@ impl Socket for UdpSocket {
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         if let Endpoint::Ip(remote) = endpoint {
             self.bind_emphemeral(remote.addr)?;
-            if let UdpInner::Bound(inner) = self.inner.read().as_ref().expect("UDP Inner disappear") {
+            if let UdpInner::Bound(inner) = self.inner.read().as_ref().expect("UDP Inner disappear")
+            {
                 inner.connect(remote);
                 return Ok(());
             } else {
@@ -210,7 +211,7 @@ impl Socket for UdpSocket {
 
     fn send(&self, buffer: &[u8], flags: MessageFlag) -> Result<usize, SystemError> {
         // if flags.contains(MessageFlag::DONTWAIT) {
-        
+
         return self.try_send(buffer, None);
         // } else {
         //     // return self
@@ -225,8 +226,7 @@ impl Socket for UdpSocket {
         buffer: &[u8],
         flags: MessageFlag,
         address: Endpoint,
-    ) -> Result<usize, SystemError> 
-    {
+    ) -> Result<usize, SystemError> {
         // if flags.contains(MessageFlag::DONTWAIT) {
         if let Endpoint::Ip(remote) = address {
             return self.try_send(buffer, Some(remote));
@@ -254,20 +254,21 @@ impl Socket for UdpSocket {
             loop {
                 match self.try_recv(buffer) {
                     Err(EAGAIN_OR_EWOULDBLOCK) => {
-                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {} )?;
-                    },
+                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+                    }
                     result => break result,
                 }
             }
-        }.map(|(len, _)| len);
+        }
+        .map(|(len, _)| len);
     }
 
     fn recv_from(
-            &self,
-            buffer: &mut [u8],
-            flags: MessageFlag,
-            address: Option<Endpoint>,
-        ) -> Result<(usize, Endpoint), SystemError> {
+        &self,
+        buffer: &mut [u8],
+        flags: MessageFlag,
+        address: Option<Endpoint>,
+    ) -> Result<(usize, Endpoint), SystemError> {
         use crate::sched::SchedMode;
         // could block io
         if let Some(endpoint) = address {
@@ -280,13 +281,14 @@ impl Socket for UdpSocket {
             loop {
                 match self.try_recv(buffer) {
                     Err(EAGAIN_OR_EWOULDBLOCK) => {
-                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {} )?;
+                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
                         log::debug!("UdpSocket::recv_from: wake up");
-                    },
+                    }
                     result => break result,
                 }
             }
-        }.map(|(len, remote)| (len, Endpoint::Ip(remote)));
+        }
+        .map(|(len, remote)| (len, Endpoint::Ip(remote)));
     }
 }
 

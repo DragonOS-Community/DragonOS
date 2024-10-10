@@ -74,7 +74,10 @@ impl IndexNode for Inode {
         return Ok(meta);
     }
 
-    fn close(&self, _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>) -> Result<(), SystemError> {
+    fn close(
+        &self,
+        _data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<(), SystemError> {
         self.inner.close()
     }
 }
@@ -186,7 +189,7 @@ impl Inode {
         log::warn!("close_on_exec is not support yet");
     }
 
-    pub fn inner(&self)->Arc<dyn Socket>{
+    pub fn inner(&self) -> Arc<dyn Socket> {
         return self.inner.clone();
     }
 }

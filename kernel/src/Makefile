@@ -17,7 +17,7 @@ ifeq ($(UNWIND_ENABLE), yes)
     CFLAGS_UNWIND = -funwind-tables
 ifeq ($(ARCH), x86_64)
     LDFLAGS_UNWIND = --eh-frame-hdr
-    RUSTFLAGS_UNWIND = -Cforce-unwind-tables -Clink-arg=-Wl,eh_frame.ld 
+    RUSTFLAGS_UNWIND = -Cforce-unwind-tables -Clink-arg=-Wl,eh_frame.ld
 endif
 endif
 
@@ -36,7 +36,7 @@ export ASFLAGS := --64
 LD_LIST := ""
 
 
-kernel_subdirs := common driver debug syscall libs
+kernel_subdirs := debug
 
 
 kernel_rust:

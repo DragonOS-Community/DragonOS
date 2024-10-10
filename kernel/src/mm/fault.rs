@@ -334,10 +334,6 @@ impl PageFaultHandler {
             cache_page.read_irqsave().page_cache(),
             cache_page.read_irqsave().index(),
         );
-
-        // 将vma插入页的vma表中
-        cow_page.write_irqsave().insert_vma(pfm.vma());
-
         ret = ret.union(Self::finish_fault(pfm));
 
         ret

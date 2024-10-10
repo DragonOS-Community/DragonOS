@@ -792,7 +792,6 @@ impl NTtyData {
         }
 
         ctrl_info.pgid = None;
-        ctrl_info.session = None;
 
         if !termios.local_mode.contains(LocalMode::NOFLSH) {
             // 重置
@@ -1209,7 +1208,8 @@ impl NTtyData {
                     if termios.output_mode.contains(OutputMode::OCRNL) {
                         break;
                     }
-                    self.canon_cursor_column = self.cursor_column;
+                    self.cursor_column = 0;
+                    self.canon_cursor_column = 0;
                 }
                 '\t' => {
                     break;

@@ -4,7 +4,7 @@ use log::error;
 use system_error::SystemError;
 
 use crate::{
-    driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
+    driver::base::block::{block_device::LBA_SIZE, gendisk::GenDisk, SeekFrom},
     libs::vec_cursor::VecCursor,
 };
 
@@ -219,14 +219,10 @@ impl BiosParameterBlockFAT32 {
 }
 
 impl BiosParameterBlock {
-    pub fn new(partition: Arc<Partition>) -> Result<BiosParameterBlock, SystemError> {
+    pub fn new(gendisk: &Arc<GenDisk>) -> Result<BiosParameterBlock, SystemError> {
         let mut v = vec![0; LBA_SIZE];
-
         // 读取分区的引导扇区
-        partition
-            .disk()
-            .read_at_sync(partition.lba_start as usize, 1, &mut v)?;
-
+        gendisk.read_at(&mut v, 0)?;
         // 获取指针对象
         let mut cursor = VecCursor::new(v);
 

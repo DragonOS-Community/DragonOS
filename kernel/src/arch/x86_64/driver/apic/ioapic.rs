@@ -403,7 +403,7 @@ pub fn ioapic_init(ignore: &'static [IrqNumber]) {
     }
 
     // 绑定irqchip
-    for i in 32..256 {
+    for i in IoApic::VECTOR_BASE as u32..256 {
         let irq = IrqNumber::new(i);
 
         if ignore.contains(&irq) {

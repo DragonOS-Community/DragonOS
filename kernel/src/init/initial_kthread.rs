@@ -20,7 +20,8 @@ use super::initcall::do_initcalls;
 
 pub fn initial_kernel_thread() -> i32 {
     kernel_init().unwrap_or_else(|err| {
-        panic!("Failed to initialize kernel: {:?}", err);
+        log::error!("Failed to initialize kernel: {:?}", err);
+        panic!()
     });
 
     switch_to_user();
@@ -29,12 +30,10 @@ pub fn initial_kernel_thread() -> i32 {
 fn kernel_init() -> Result<(), SystemError> {
     KernelThreadMechanism::init_stage2();
     kenrel_init_freeable()?;
-
-    // 由于目前加锁，速度过慢，所以先不开启双缓冲
-    // scm_enable_double_buffer().expect("Failed to enable double buffer");
-
     #[cfg(target_arch = "x86_64")]
-    crate::driver::disk::ahci::ahci_init().expect("Failed to initialize AHCI");
+    crate::driver::disk::ahci::ahci_init()
+        .inspect_err(|e| log::error!("ahci_init failed: {:?}", e))
+        .ok();
     virtio_probe();
     mount_root_fs().expect("Failed to mount root fs");
     e1000e_init();

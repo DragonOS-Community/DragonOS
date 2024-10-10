@@ -1,7 +1,6 @@
 use crate::{
     driver::{
-        serial::serial8250::send_to_default_serial8250_port,
-        tty::{tty_port::tty_port, virtual_terminal::virtual_console::CURRENT_VCNUM},
+        serial::serial8250::send_to_default_serial8250_port, tty::virtual_terminal::vc_manager,
         video::video_refresh_manager,
     },
     libs::{
@@ -1031,8 +1030,7 @@ where
 
 #[no_mangle]
 pub extern "C" fn rs_textui_putchar(character: u8, fr_color: u32, bk_color: u32) -> i32 {
-    let current_vcnum = CURRENT_VCNUM.load(Ordering::SeqCst);
-    if current_vcnum != -1 {
+    if let Some(current_vc) = vc_manager().current_vc() {
         // tty已经初始化了之后才输出到屏幕
         let fr = (fr_color & 0x00ff0000) >> 16;
         let fg = (fr_color & 0x0000ff00) >> 8;
@@ -1044,7 +1042,7 @@ pub extern "C" fn rs_textui_putchar(character: u8, fr_color: u32, bk_color: u32)
             "\x1B[38;2;{fr};{fg};{fb};48;2;{br};{bg};{bb}m{}\x1B[0m",
             character as char
         );
-        let port = tty_port(current_vcnum as usize);
+        let port = current_vc.port();
         let tty = port.port_data().internal_tty();
         if let Some(tty) = tty {
             send_to_default_serial8250_port(&[character]);

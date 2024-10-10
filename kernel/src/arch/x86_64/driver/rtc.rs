@@ -163,6 +163,14 @@ impl Device for CmosRtcDevice {
     fn bus(&self) -> Option<Weak<dyn Bus>> {
         self.inner().device_common.get_bus_weak_or_clear()
     }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        self.inner().device_common.get_parent_weak_or_clear()
+    }
+
+    fn set_dev_parent(&self, parent: Option<Weak<dyn Device>>) {
+        self.inner().device_common.parent = parent;
+    }
 }
 
 impl KObject for CmosRtcDevice {

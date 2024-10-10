@@ -1,10 +1,15 @@
+use log::warn;
+
 use crate::{
     arch::{
         init::{early_setup_arch, setup_arch, setup_arch_post},
         time::time_init,
         CurrentIrqArch, CurrentSMPArch, CurrentSchedArch,
     },
-    driver::{base::init::driver_init, serial::serial_early_init, video::VideoRefreshManager},
+    driver::{
+        acpi::acpi_init, base::init::driver_init, serial::serial_early_init,
+        video::VideoRefreshManager,
+    },
     exception::{init::irq_init, softirq::softirq_init, InterruptArch},
     filesystem::vfs::core::vfs_init,
     init::init_intertrait,
@@ -25,6 +30,8 @@ use crate::{
         clocksource::clocksource_boot_finish, timekeeping::timekeeping_init, timer::timer_init,
     },
 };
+
+use super::boot::boot_callback_except_early;
 
 /// The entry point for the kernel
 ///
@@ -50,17 +57,19 @@ fn do_start_kernel() {
     early_setup_arch().expect("setup_arch failed");
     unsafe { mm_init() };
 
-    scm_reinit().unwrap();
-    textui_init().unwrap();
+    if scm_reinit().is_ok() {
+        if let Err(e) = textui_init() {
+            warn!("Failed to init textui: {:?}", e);
+        }
+    }
+
+    boot_callback_except_early();
     init_intertrait();
 
     vfs_init().expect("vfs init failed");
     driver_init().expect("driver init failed");
 
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        crate::include::bindings::bindings::acpi_init()
-    };
+    acpi_init().expect("acpi init failed");
     crate::sched::sched_init();
     process_init();
     early_smp_init().expect("early smp init failed");

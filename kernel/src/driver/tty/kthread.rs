@@ -5,7 +5,7 @@ use kdepends::thingbuf::StaticThingBuf;
 
 use crate::{
     arch::CurrentIrqArch,
-    driver::tty::virtual_terminal::virtual_console::CURRENT_VCNUM,
+    driver::tty::virtual_terminal::vc_manager,
     exception::InterruptArch,
     process::{
         kthread::{KernelThreadClosure, KernelThreadMechanism},
@@ -13,8 +13,6 @@ use crate::{
     },
     sched::{schedule, SchedMode},
 };
-
-use super::tty_port::current_tty_port;
 
 /// 用于缓存键盘输入的缓冲区
 static KEYBUF: StaticThingBuf<u8, 512> = StaticThingBuf::new();
@@ -51,8 +49,10 @@ fn tty_refresh_thread() -> i32 {
             *item = KEYBUF.pop().unwrap();
         }
 
-        if CURRENT_VCNUM.load(core::sync::atomic::Ordering::SeqCst) != -1 {
-            let _ = current_tty_port().receive_buf(&data[0..to_dequeue], &[], to_dequeue);
+        if let Some(cur_vc) = vc_manager().current_vc() {
+            let _ = cur_vc
+                .port()
+                .receive_buf(&data[0..to_dequeue], &[], to_dequeue);
         } else {
             // 这里由于stdio未初始化，所以无法找到port
             // TODO: 考虑改用双端队列，能够将丢失的输入插回

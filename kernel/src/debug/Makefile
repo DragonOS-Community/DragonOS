@@ -1,5 +1,6 @@
 
-all: traceback.o
+all: 
+	@echo ""
 
 CFLAGS += -I .
 

@@ -1,6 +1,7 @@
 use system_error::SystemError;
 
 use crate::{
+    driver::tty::virtual_terminal::vc_manager,
     filesystem::vfs::{
         file::{File, FileMode},
         ROOT_INODE,
@@ -13,9 +14,16 @@ pub fn stdio_init() -> Result<(), SystemError> {
     if ProcessManager::current_pcb().pid() != Pid(1) {
         return Err(SystemError::EPERM);
     }
+    let tty_path = format!(
+        "/dev/{}",
+        vc_manager()
+            .current_vc_tty_name()
+            .expect("Init stdio: can't get tty name")
+    );
     let tty_inode = ROOT_INODE()
-        .lookup("/dev/tty0")
-        .expect("Init stdio: can't find tty0");
+        .lookup(&tty_path)
+        .unwrap_or_else(|_| panic!("Init stdio: can't find {}", tty_path));
+
     let stdin =
         File::new(tty_inode.clone(), FileMode::O_RDONLY).expect("Init stdio: can't create stdin");
     let stdout =

@@ -5,6 +5,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use kdepends::xarray::XArray;
 use log::error;
 use system_error::SystemError;
 use xarray::XArray;

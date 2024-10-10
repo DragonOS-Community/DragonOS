@@ -7,11 +7,8 @@ use hashbrown::HashMap;
 use log::error;
 use system_error::SystemError;
 
-use crate::{
-    include::bindings::bindings::{gfp_t, PAGE_U_S},
-    libs::{align::page_align_up, spinlock::SpinLock},
-    mm::MMArch,
-};
+use crate::libs::spinlock::SpinLock;
+
 
 use super::{
     allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper, mmio_buddy::mmio_pool,
@@ -23,7 +20,6 @@ lazy_static! {
     static ref C_ALLOCATION_MAP: SpinLock<HashMap<VirtAddr, (VirtAddr, usize, usize)>> = SpinLock::new(HashMap::new());
 }
 
-/// [EXTERN TO C] Use pseudo mapper to map physical memory to virtual memory.
 #[no_mangle]
 pub unsafe extern "C" fn rs_pseudo_map_phys(vaddr: usize, paddr: usize, size: usize) {
     let vaddr = VirtAddr::new(vaddr);
@@ -62,14 +58,14 @@ pub unsafe extern "C" fn rs_map_phys(vaddr: usize, paddr: usize, size: usize, fl
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn kzalloc(size: usize, _gfp: gfp_t) -> usize {
+
+pub unsafe extern "C" fn kzalloc(size: usize, _gfp: u64) -> usize {
     // debug!("kzalloc: size: {size}");
     return do_kmalloc(size, true);
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn kmalloc(size: usize, _gfp: gfp_t) -> usize {
+pub unsafe extern "C" fn kmalloc(size: usize, _gfp: u64) -> usize {
     // debug!("kmalloc: size: {size}");
     // 由于C代码不规范，因此都全部清空
     return do_kmalloc(size, true);

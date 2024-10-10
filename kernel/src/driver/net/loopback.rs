@@ -2,10 +2,15 @@ use crate::arch::rand::rand;
 use crate::driver::base::class::Class;
 use crate::driver::base::device::bus::Bus;
 use crate::driver::base::device::driver::Driver;
-use crate::driver::base::device::{Device, DeviceType, IdTable};
-use crate::driver::base::kobject::{KObjType, KObject, KObjectState};
+use crate::driver::base::device::{Device, DeviceCommonData, DeviceType, IdTable};
+use crate::driver::base::kobject::{
+    KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState,
+};
+use crate::driver::base::kset::KSet;
+use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
-use crate::libs::spinlock::SpinLock;
+use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
+use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::net::{generate_iface_id, NET_DEVICES};
 use crate::time::Instant;
 use alloc::collections::VecDeque;
@@ -23,7 +28,7 @@ use smoltcp::{
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
-use super::NetDevice;
+use super::{register_netdevice, NetDeivceState, NetDevice, NetDeviceCommonData, Operstate};
 
 const DEVICE_NAME: &str = "loopback";
 
@@ -235,11 +240,22 @@ impl phy::Device for LoopbackDriver {
 
 /// ## LoopbackInterface结构
 /// 封装驱动包裹器和iface，设置接口名称
+#[cast_to([sync] NetDevice)]
+#[cast_to([sync] Device)]
 pub struct LoopbackInterface {
     driver: LoopbackDriverWapper,
     iface_id: usize,
     iface: SpinLock<smoltcp::iface::Interface>,
     name: String,
+    inner: SpinLock<InnerLoopbackInterface>,
+    locked_kobj_state: LockedKObjectState,
+}
+
+#[derive(Debug)]
+pub struct InnerLoopbackInterface {
+    netdevice_common: NetDeviceCommonData,
+    device_common: DeviceCommonData,
+    kobj_common: KObjectCommonData,
 }
 
 impl LoopbackInterface {
@@ -274,7 +290,17 @@ impl LoopbackInterface {
             iface_id,
             iface: SpinLock::new(iface),
             name: "lo".to_string(),
+            inner: SpinLock::new(InnerLoopbackInterface {
+                netdevice_common: NetDeviceCommonData::default(),
+                device_common: DeviceCommonData::default(),
+                kobj_common: KObjectCommonData::default(),
+            }),
+            locked_kobj_state: LockedKObjectState::default(),
         })
+    }
+
+    fn inner(&self) -> SpinLockGuard<InnerLoopbackInterface> {
+        return self.inner.lock();
     }
 }
 
@@ -287,38 +313,38 @@ impl Debug for LoopbackInterface {
             .finish()
     }
 }
-//TODO: 向sysfs注册lo设备
+
 impl KObject for LoopbackInterface {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
 
-    fn set_inode(&self, _inode: Option<Arc<crate::filesystem::kernfs::KernFSInode>>) {
-        todo!()
+    fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
+        self.inner().kobj_common.kern_inode = inode;
     }
 
-    fn inode(&self) -> Option<Arc<crate::filesystem::kernfs::KernFSInode>> {
-        todo!()
+    fn inode(&self) -> Option<Arc<KernFSInode>> {
+        self.inner().kobj_common.kern_inode.clone()
     }
 
-    fn parent(&self) -> Option<alloc::sync::Weak<dyn KObject>> {
-        todo!()
+    fn parent(&self) -> Option<Weak<dyn KObject>> {
+        self.inner().kobj_common.parent.clone()
     }
 
-    fn set_parent(&self, _parent: Option<alloc::sync::Weak<dyn KObject>>) {
-        todo!()
+    fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
+        self.inner().kobj_common.parent = parent;
     }
 
-    fn kset(&self) -> Option<Arc<crate::driver::base::kset::KSet>> {
-        todo!()
+    fn kset(&self) -> Option<Arc<KSet>> {
+        self.inner().kobj_common.kset.clone()
     }
 
-    fn set_kset(&self, _kset: Option<Arc<crate::driver::base::kset::KSet>>) {
-        todo!()
+    fn set_kset(&self, kset: Option<Arc<KSet>>) {
+        self.inner().kobj_common.kset = kset;
     }
 
-    fn kobj_type(&self) -> Option<&'static dyn crate::driver::base::kobject::KObjType> {
-        todo!()
+    fn kobj_type(&self) -> Option<&'static dyn KObjType> {
+        self.inner().kobj_common.kobj_type
     }
 
     fn name(&self) -> String {
@@ -326,27 +352,23 @@ impl KObject for LoopbackInterface {
     }
 
     fn set_name(&self, _name: String) {
-        todo!()
+        // do nothing
     }
 
-    fn kobj_state(
-        &self,
-    ) -> crate::libs::rwlock::RwLockReadGuard<crate::driver::base::kobject::KObjectState> {
-        todo!()
+    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+        self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(
-        &self,
-    ) -> crate::libs::rwlock::RwLockWriteGuard<crate::driver::base::kobject::KObjectState> {
-        todo!()
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+        self.locked_kobj_state.write()
     }
 
-    fn set_kobj_state(&self, _state: KObjectState) {
-        todo!()
+    fn set_kobj_state(&self, state: KObjectState) {
+        *self.locked_kobj_state.write() = state;
     }
 
-    fn set_kobj_type(&self, _ktype: Option<&'static dyn KObjType>) {
-        todo!()
+    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
+        self.inner().kobj_common.kobj_type = ktype;
     }
 }
 
@@ -359,43 +381,70 @@ impl Device for LoopbackInterface {
         IdTable::new(DEVICE_NAME.to_string(), None)
     }
 
-    fn set_bus(&self, _bus: Option<Weak<dyn Bus>>) {
-        todo!()
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
+        self.inner().device_common.bus.clone()
     }
 
-    fn set_class(&self, _class: Option<Weak<dyn Class>>) {
-        todo!()
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
+        self.inner().device_common.bus = bus;
+    }
+
+    fn class(&self) -> Option<Arc<dyn Class>> {
+        let mut guard = self.inner();
+        let r = guard.device_common.class.clone()?.upgrade();
+        if r.is_none() {
+            guard.device_common.class = None;
+        }
+
+        return r;
+    }
+
+    fn set_class(&self, class: Option<Weak<dyn Class>>) {
+        self.inner().device_common.class = class;
     }
 
     fn driver(&self) -> Option<Arc<dyn Driver>> {
-        todo!()
+        let r = self.inner().device_common.driver.clone()?.upgrade();
+        if r.is_none() {
+            self.inner().device_common.driver = None;
+        }
+
+        return r;
     }
 
-    fn set_driver(&self, _driver: Option<Weak<dyn Driver>>) {
-        todo!()
+    fn set_driver(&self, driver: Option<Weak<dyn Driver>>) {
+        self.inner().device_common.driver = driver;
     }
 
     fn is_dead(&self) -> bool {
-        todo!()
+        false
     }
 
     fn can_match(&self) -> bool {
-        todo!()
+        self.inner().device_common.can_match
     }
 
-    fn set_can_match(&self, _can_match: bool) {
-        todo!()
+    fn set_can_match(&self, can_match: bool) {
+        self.inner().device_common.can_match = can_match;
     }
 
     fn state_synced(&self) -> bool {
         true
     }
+
+    fn dev_parent(&self) -> Option<Weak<dyn Device>> {
+        self.inner().device_common.get_parent_weak_or_clear()
+    }
+
+    fn set_dev_parent(&self, parent: Option<Weak<dyn Device>>) {
+        self.inner().device_common.parent = parent;
+    }
 }
 
 impl NetDevice for LoopbackInterface {
-    /// 由于lo网卡设备不是实际的物理设备，其mac地址需要手动设置为一个默认值，这里默认为0200000001
+    /// 由于lo网卡设备不是实际的物理设备，其mac地址需要手动设置为一个默认值，这里默认为00:00:00:00:00
     fn mac(&self) -> smoltcp::wire::EthernetAddress {
-        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let mac = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         smoltcp::wire::EthernetAddress(mac)
     }
 
@@ -405,7 +454,7 @@ impl NetDevice for LoopbackInterface {
     }
 
     #[inline]
-    fn name(&self) -> String {
+    fn iface_name(&self) -> String {
         self.name.clone()
     }
     /// ## `update_ip_addrs` 用于更新接口的 IP 地址。
@@ -459,6 +508,31 @@ impl NetDevice for LoopbackInterface {
     fn inner_iface(&self) -> &SpinLock<smoltcp::iface::Interface> {
         return &self.iface;
     }
+
+    fn addr_assign_type(&self) -> u8 {
+        return self.inner().netdevice_common.addr_assign_type;
+    }
+
+    fn net_device_type(&self) -> u16 {
+        self.inner().netdevice_common.net_device_type = 24; // 环回设备
+        return self.inner().netdevice_common.net_device_type;
+    }
+
+    fn net_state(&self) -> NetDeivceState {
+        return self.inner().netdevice_common.state;
+    }
+
+    fn set_net_state(&self, state: NetDeivceState) {
+        self.inner().netdevice_common.state |= state;
+    }
+
+    fn operstate(&self) -> Operstate {
+        return self.inner().netdevice_common.operstate;
+    }
+
+    fn set_operstate(&self, state: Operstate) {
+        self.inner().netdevice_common.operstate = state;
+    }
 }
 
 pub fn loopback_probe() {
@@ -469,10 +543,14 @@ pub fn loopback_probe() {
 pub fn loopback_driver_init() {
     let driver = LoopbackDriver::new();
     let iface = LoopbackInterface::new(driver);
+    // 标识网络设备已经启动
+    iface.set_net_state(NetDeivceState::__LINK_STATE_START);
 
     NET_DEVICES
         .write_irqsave()
         .insert(iface.iface_id, iface.clone());
+
+    register_netdevice(iface.clone()).expect("register lo device failed");
 }
 
 /// ## lo网卡设备的注册函数

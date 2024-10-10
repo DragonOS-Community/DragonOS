@@ -8,4 +8,3 @@
    :caption: 目录
 
    bootloader
-   multiboot2

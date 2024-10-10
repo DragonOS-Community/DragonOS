@@ -8,7 +8,7 @@ use crate::{
             console::ConsoleSwitch,
             virtual_terminal::{
                 virtual_console::{CursorOperation, ScrollDir, VcCursor, VirtualConsoleData},
-                Color,
+                Color, VirtConsole,
             },
         },
         video::fbdev::base::{
@@ -174,6 +174,7 @@ impl BlittingFbConsole {
 impl ConsoleSwitch for BlittingFbConsole {
     fn con_init(
         &self,
+        _vc: &Arc<VirtConsole>,
         vc_data: &mut VirtualConsoleData,
         init: bool,
     ) -> Result<(), system_error::SystemError> {
@@ -184,10 +185,12 @@ impl ConsoleSwitch for BlittingFbConsole {
         }
         let fb = fb.unwrap();
         if fb.is_none() {
-            panic!(
+            log::warn!(
                 "The Framebuffer with FbID {} has not been initialized yet.",
                 vc_data.index
-            )
+            );
+
+            return Err(SystemError::ENODEV);
         }
 
         let fb = fb.as_ref().unwrap().clone();

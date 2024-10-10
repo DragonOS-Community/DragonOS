@@ -54,7 +54,8 @@ use super::{
 pub const DEFAULT_MMAP_MIN_ADDR: usize = 65536;
 
 /// LockedVMA的id分配器
-static LOCKEDVMA_ID_ALLOCATOR: IdAllocator = IdAllocator::new(0, usize::MAX);
+static LOCKEDVMA_ID_ALLOCATOR: SpinLock<IdAllocator> =
+    SpinLock::new(IdAllocator::new(0, usize::MAX).unwrap());
 
 #[derive(Debug)]
 pub struct AddressSpace {
@@ -275,12 +276,6 @@ impl InnerAddressSpace {
 
         let len = page_align_up(len);
 
-        let vm_flags = VmFlags::from(prot_flags)
-            | VmFlags::from(map_flags)
-            | VmFlags::VM_MAYREAD
-            | VmFlags::VM_MAYWRITE
-            | VmFlags::VM_MAYEXEC;
-
         // debug!("map_anonymous: len = {}", len);
 
         let start_page: VirtPageFrame = self.mmap(
@@ -288,7 +283,7 @@ impl InnerAddressSpace {
             PageFrameCount::from_bytes(len).unwrap(),
             prot_flags,
             map_flags,
-            move |page, count, flags, mapper, flusher| {
+            move |page, count, vm_flags, flags, mapper, flusher| {
                 if allocate_at_once {
                     VMA::zeroed(page, count, vm_flags, flags, mapper, flusher, None, None)
                 } else {
@@ -364,9 +359,8 @@ impl InnerAddressSpace {
             | VmFlags::VM_MAYREAD
             | VmFlags::VM_MAYWRITE
             | VmFlags::VM_MAYEXEC;
-
         // debug!("map_anonymous: len = {}", len);
-
+      
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
 
@@ -388,7 +382,7 @@ impl InnerAddressSpace {
             PageFrameCount::from_bytes(len).unwrap(),
             prot_flags,
             map_flags,
-            move |page, count, flags, mapper, flusher| {
+            move |page, count, vm_flags, flags, mapper, flusher| {
                 if allocate_at_once {
                     VMA::zeroed(
                         page,
@@ -436,6 +430,7 @@ impl InnerAddressSpace {
         F: FnOnce(
             VirtPageFrame,
             PageFrameCount,
+            VmFlags,
             EntryFlags<MMArch>,
             &mut PageMapper,
             &mut dyn Flusher<MMArch>,
@@ -466,6 +461,12 @@ impl InnerAddressSpace {
 
         let page = VirtPageFrame::new(region.start());
 
+        let vm_flags = VmFlags::from(prot_flags)
+            | VmFlags::from(map_flags)
+            | VmFlags::VM_MAYREAD
+            | VmFlags::VM_MAYWRITE
+            | VmFlags::VM_MAYEXEC;
+
         // debug!("mmap: page: {:?}, region={region:?}", page.virt_address());
 
         compiler_fence(Ordering::SeqCst);
@@ -482,6 +483,7 @@ impl InnerAddressSpace {
         self.mappings.insert_vma(map_func(
             page,
             page_count,
+            vm_flags,
             EntryFlags::from_prot_flags(prot_flags, true),
             &mut self.user_mapper.utable,
             flusher,
@@ -1111,7 +1113,7 @@ impl Eq for LockedVMA {}
 impl LockedVMA {
     pub fn new(vma: VMA) -> Arc<Self> {
         let r = Arc::new(Self {
-            id: LOCKEDVMA_ID_ALLOCATOR.alloc().unwrap(),
+            id: LOCKEDVMA_ID_ALLOCATOR.lock().alloc().unwrap(),
             vma: SpinLock::new(vma),
         });
         r.vma.lock_irqsave().self_ref = Arc::downgrade(&r);
@@ -1330,7 +1332,7 @@ impl LockedVMA {
 
 impl Drop for LockedVMA {
     fn drop(&mut self) {
-        LOCKEDVMA_ID_ALLOCATOR.free(self.id);
+        LOCKEDVMA_ID_ALLOCATOR.lock().free(self.id);
     }
 }
 

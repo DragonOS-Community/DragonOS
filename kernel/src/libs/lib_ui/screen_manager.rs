@@ -8,9 +8,12 @@ use alloc::{boxed::Box, collections::LinkedList, string::String, sync::Arc};
 use system_error::SystemError;
 
 use crate::{
-    driver::{serial::serial8250::send_to_default_serial8250_port, video::video_refresh_manager},
+    driver::{
+        serial::serial8250::send_to_default_serial8250_port,
+        video::{has_video_refresh_manager, video_refresh_manager},
+    },
     libs::{lib_ui::textui::textui_is_enable_put_to_window, rwlock::RwLock, spinlock::SpinLock},
-    mm::VirtAddr,
+    mm::{mmio_buddy::MMIOSpaceGuard, VirtAddr},
 };
 
 use super::{
@@ -56,6 +59,7 @@ pub struct ScmBufferInfo {
     height: u32,    // 帧缓冲区高度（pixel或lines）
     size: u32,      // 帧缓冲区大小（bytes）
     bit_depth: u32, // 像素点位深度
+    device_buffer_mmio_guard: Option<Arc<MMIOSpaceGuard>>,
     pub buf: ScmBuffer,
     flags: ScmBufferFlag, // 帧缓冲区标志位
 }
@@ -100,11 +104,16 @@ impl ScmBufferInfo {
                 bit_depth: device_buffer_guard.bit_depth,
                 flags: buf_type,
                 buf: ScmBuffer::DoubleBuffer(buf_space),
+                device_buffer_mmio_guard: None,
             };
             drop(device_buffer_guard);
 
             return Ok(buffer);
         }
+    }
+
+    pub unsafe fn set_device_buffer_mmio_guard(&mut self, guard: Arc<MMIOSpaceGuard>) {
+        self.device_buffer_mmio_guard = Some(guard);
     }
 
     pub unsafe fn new_device_buffer(
@@ -114,7 +123,9 @@ impl ScmBufferInfo {
         bit_depth: u32,
         buf_type: ScmBufferFlag,
         vaddr: VirtAddr,
+        mut device_buffer_mmio_guard: Option<MMIOSpaceGuard>,
     ) -> Result<Self, SystemError> {
+        let mmio_guard = device_buffer_mmio_guard.take().map(Arc::new);
         let buffer = Self {
             width,
             height,
@@ -122,6 +133,7 @@ impl ScmBufferInfo {
             bit_depth,
             flags: buf_type,
             buf: ScmBuffer::DeviceBuffer(vaddr),
+            device_buffer_mmio_guard: mmio_guard,
         };
         return Ok(buffer);
     }
@@ -421,9 +433,10 @@ pub fn scm_reinit() -> Result<(), SystemError> {
 
 #[allow(dead_code)]
 fn true_scm_reinit() -> Result<(), SystemError> {
-    video_refresh_manager()
-        .video_reinitialize(false)
-        .expect("video reinitialize failed");
+    if !has_video_refresh_manager() {
+        return Err(SystemError::ENODEV);
+    }
+    video_refresh_manager().video_reinitialize(false)?;
 
     // 遍历当前所有使用帧缓冲区的框架，更新地址
     let device_buffer = video_refresh_manager().device_buffer().clone();

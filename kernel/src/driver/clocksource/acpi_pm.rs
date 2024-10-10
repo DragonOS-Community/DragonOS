@@ -15,13 +15,12 @@ use acpi::fadt::Fadt;
 use alloc::sync::{Arc, Weak};
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicU32, Ordering};
-use log::info;
 use system_error::SystemError;
 
 // 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/clocksource/acpi_pm.c
 
 /// acpi_pmtmr所在的I/O端口
-pub static PMTMR_IO_PORT: AtomicU32 = AtomicU32::new(0);
+pub static mut PMTMR_IO_PORT: AtomicU32 = AtomicU32::new(0);
 
 /// # 读取acpi_pmtmr当前值，并对齐进行掩码操作
 #[inline(always)]
@@ -88,10 +87,8 @@ impl Acpipm {
             max_idle_ns: Default::default(),
             flags: ClocksourceFlags::CLOCK_SOURCE_IS_CONTINUOUS,
             watchdog_last: CycleNum::new(0),
-            cs_last: CycleNum::new(0),
             uncertainty_margin: 0,
             maxadj: 0,
-            cycle_last: CycleNum::new(0),
         };
         let acpi_pm = Arc::new(Acpipm(SpinLock::new(InnerAcpipm {
             data,
@@ -119,18 +116,14 @@ impl Clocksource for Acpipm {
 
     fn update_clocksource_data(&self, data: ClocksourceData) -> Result<(), SystemError> {
         let d = &mut self.0.lock_irqsave().data;
+        d.set_flags(data.flags);
+        d.set_mask(data.mask);
+        d.set_max_idle_ns(data.max_idle_ns);
+        d.set_mult(data.mult);
         d.set_name(data.name);
         d.set_rating(data.rating);
-        d.set_mask(data.mask);
-        d.set_mult(data.mult);
         d.set_shift(data.shift);
-        d.set_max_idle_ns(data.max_idle_ns);
-        d.set_flags(data.flags);
         d.watchdog_last = data.watchdog_last;
-        d.cs_last = data.cs_last;
-        d.set_uncertainty_margin(data.uncertainty_margin);
-        d.set_maxadj(data.maxadj);
-        d.cycle_last = data.cycle_last;
         return Ok(());
     }
 }
@@ -177,8 +170,6 @@ const PMTMR_EXPECTED_RATE: u64 =
 #[cfg(not(target_arch = "x86_64"))]
 #[allow(dead_code)]
 fn verify_pmtmr_rate() -> bool {
-    use log::info;
-
     let mut count: u32 = 0;
 
     mach_prepare_counter();
@@ -188,7 +179,7 @@ fn verify_pmtmr_rate() -> bool {
     let delta = (value2 - value1) & ACPI_PM_MASK;
 
     if (delta < (PMTMR_EXPECTED_RATE * 19) / 20) || (delta > (PMTMR_EXPECTED_RATE * 21) / 20) {
-        info!(
+        kinfo!(
             "PM Timer running at invalid rate: {}",
             100 * delta / PMTMR_EXPECTED_RATE
         );
@@ -215,13 +206,12 @@ fn find_acpi_pm_clock() -> Result<(), SystemError> {
     let pm_timer_block = fadt.pm_timer_block().map_err(|_| SystemError::ENODEV)?;
     let pm_timer_block = pm_timer_block.ok_or(SystemError::ENODEV)?;
     let pmtmr_addr = pm_timer_block.address;
-
-    PMTMR_IO_PORT.store(pmtmr_addr as u32, Ordering::SeqCst);
-
-    info!(
-        "apic_pmtmr I/O port: {}",
+    unsafe {
+        PMTMR_IO_PORT.store(pmtmr_addr as u32, Ordering::SeqCst);
+    }
+    kinfo!("apic_pmtmr I/O port: {}", unsafe {
         PMTMR_IO_PORT.load(Ordering::SeqCst)
-    );
+    });
 
     return Ok(());
 }
@@ -232,17 +222,16 @@ fn find_acpi_pm_clock() -> Result<(), SystemError> {
 #[allow(dead_code)]
 pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
     let acpi_pm = Acpipm::new();
+    unsafe {
+        CLOCKSOURCE_ACPI_PM = Some(acpi_pm);
+    }
 
     // 解析fadt
     find_acpi_pm_clock()?;
 
     // 检查pmtmr_io_port是否被设置
-    if PMTMR_IO_PORT.load(Ordering::SeqCst) == 0 {
+    if unsafe { PMTMR_IO_PORT.load(Ordering::SeqCst) } == 0 {
         return Err(SystemError::ENODEV);
-    }
-
-    unsafe {
-        CLOCKSOURCE_ACPI_PM = Some(acpi_pm);
     }
 
     // 验证ACPI PM Timer作为时钟源的稳定性和一致性
@@ -266,28 +255,30 @@ pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
             if (value2 < value1) && (value2 < 0xfff) {
                 break;
             }
-            info!("PM Timer had inconsistens results: {} {}", value1, value2);
-
-            PMTMR_IO_PORT.store(0, Ordering::SeqCst);
-
+            kinfo!("PM Timer had inconsistens results: {} {}", value1, value2);
+            unsafe {
+                PMTMR_IO_PORT.store(0, Ordering::SeqCst);
+            }
             return Err(SystemError::EINVAL);
         }
         if i == ACPI_PM_READ_CHECKS {
-            info!("PM Timer failed consistency check: {}", value1);
-
-            PMTMR_IO_PORT.store(0, Ordering::SeqCst);
-
+            kinfo!("PM Timer failed consistency check: {}", value1);
+            unsafe {
+                PMTMR_IO_PORT.store(0, Ordering::SeqCst);
+            }
             return Err(SystemError::EINVAL);
         }
     }
 
     // 检查ACPI PM Timer的频率是否正确
     if !verify_pmtmr_rate() {
-        PMTMR_IO_PORT.store(0, Ordering::SeqCst);
+        unsafe {
+            PMTMR_IO_PORT.store(0, Ordering::SeqCst);
+        }
     }
 
     // 检查TSC时钟源的监视器是否被禁用，如果被禁用则将时钟源的标志设置为CLOCK_SOURCE_MUST_VERIFY
-    // 是因为jiffies精度小于acpi pm，所以不需要被jiffies监视
+    // 没有实现clocksource_selecet_watchdog函数，所以这里设置为false
     let tsc_clocksource_watchdog_disabled = false;
     if tsc_clocksource_watchdog_disabled {
         clocksource_acpi_pm().0.lock_irqsave().data.flags |=
@@ -296,13 +287,13 @@ pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
 
     // 注册ACPI PM Timer
     let acpi_pmtmr = clocksource_acpi_pm() as Arc<dyn Clocksource>;
-    match acpi_pmtmr.register(1, PMTMR_TICKS_PER_SEC as u32) {
+    match acpi_pmtmr.register(100, PMTMR_TICKS_PER_SEC as u32) {
         Ok(_) => {
-            info!("ACPI PM Timer registered as clocksource sccessfully");
+            kinfo!("ACPI PM Timer registered as clocksource sccessfully");
             return Ok(());
         }
         Err(_) => {
-            info!("ACPI PM Timer init registered failed");
+            kinfo!("ACPI PM Timer init registered failed");
             return Err(SystemError::ENOSYS);
         }
     };

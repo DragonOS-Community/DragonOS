@@ -38,7 +38,7 @@ pub enum AtType {
     /// Frequency at which times() increments.
     ClkTck,
     /// Secure mode boolean.
-    Secure = 23,
+    Secure,
     /// String identifying real platform, may differ from AT_PLATFORM.
     BasePlatform,
     /// Address of 16 random bytes.
@@ -46,7 +46,7 @@ pub enum AtType {
     /// Extension of AT_HWCAP.
     HwCap2,
     /// Filename of program.
-    ExecFn = 31,
+    ExecFn,
     /// Minimal stack size for signal delivery.
     MinSigStackSize,
 }

@@ -8,7 +8,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use log::error;
 use system_error::SystemError;
 
 use crate::{
@@ -141,7 +140,6 @@ impl Serial8250Manager {
 }
 
 /// 所有的8250串口设备都应该实现的trait
-#[allow(dead_code)]
 trait Serial8250Port: UartPort {
     fn device(&self) -> Option<Arc<Serial8250ISADevices>> {
         None
@@ -412,7 +410,7 @@ impl PlatformDriver for Serial8250ISADriver {
             .arc_any()
             .downcast::<Serial8250ISADevices>()
             .map_err(|_| {
-                error!("Serial8250ISADriver::probe: device is not a Serial8250ISADevices");
+                kerror!("Serial8250ISADriver::probe: device is not a Serial8250ISADevices");
                 SystemError::EINVAL
             })?;
         isa_dev.set_driver(Some(self.self_ref.clone()));

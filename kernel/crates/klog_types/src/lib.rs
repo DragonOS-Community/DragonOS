@@ -175,12 +175,6 @@ impl MMLogCycle {
     }
 }
 
-impl Default for MMLogCycle {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl kdepends::thingbuf::Recycle<AllocatorLog> for MMLogCycle {
     fn new_element(&self) -> AllocatorLog {
         AllocatorLog::zeroed()

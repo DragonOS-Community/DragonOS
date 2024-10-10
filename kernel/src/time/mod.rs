@@ -5,7 +5,6 @@ use core::{
 };
 
 use crate::arch::CurrentTimeArch;
-use crate::time::syscall::PosixTimeval;
 
 use self::timekeeping::getnstimeofday;
 
@@ -13,7 +12,6 @@ pub mod clocksource;
 pub mod jiffies;
 pub mod sleep;
 pub mod syscall;
-pub mod tick_common;
 pub mod timeconv;
 pub mod timekeep;
 pub mod timekeeping;
@@ -116,15 +114,6 @@ impl From<Duration> for PosixTimeSpec {
     }
 }
 
-impl From<PosixTimeval> for PosixTimeSpec {
-    fn from(value: PosixTimeval) -> Self {
-        PosixTimeSpec {
-            tv_sec: value.tv_sec,
-            tv_nsec: value.tv_usec as i64 * 1000,
-        }
-    }
-}
-
 impl From<PosixTimeSpec> for Duration {
     fn from(val: PosixTimeSpec) -> Self {
         Duration::from_micros(val.tv_sec as u64 * 1000000 + val.tv_nsec as u64 / 1000)
@@ -141,6 +130,7 @@ impl From<PosixTimeSpec> for Duration {
 /// * A value less than `0` indicates a time before the starting
 ///   point.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Instant {
     micros: i64,
 }
@@ -316,6 +306,7 @@ impl ops::Sub<Instant> for Instant {
 
 /// A relative amount of time.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Duration {
     micros: u64,
 }

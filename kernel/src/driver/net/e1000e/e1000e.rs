@@ -9,7 +9,6 @@ use core::mem::size_of;
 use core::ptr::NonNull;
 use core::slice::{from_raw_parts, from_raw_parts_mut};
 use core::sync::atomic::{compiler_fence, Ordering};
-use log::{debug, info};
 
 use super::e1000e_driver::e1000e_driver_init;
 use crate::driver::base::device::DeviceId;
@@ -23,6 +22,8 @@ use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, Pc
 use crate::exception::IrqNumber;
 
 use crate::libs::volatile::{ReadOnly, Volatile, WriteOnly};
+
+use crate::{kdebug, kinfo};
 
 const PAGE_SIZE: usize = 4096;
 const NETWORK_CLASS: u8 = 0x2;
@@ -283,7 +284,7 @@ impl E1000EDevice {
             volwrite!(general_regs, ctrl, ctrl | E1000E_CTRL_SLU);
         }
         let status = unsafe { volread!(general_regs, status) };
-        debug!("Status: {status:#X}");
+        kdebug!("Status: {status:#X}");
 
         // 读取设备的mac地址
         // Read mac address
@@ -441,7 +442,7 @@ impl E1000EDevice {
         buffer.set_length(desc.len as usize);
         rdt = index;
         unsafe { volwrite!(self.receive_regs, rdt0, rdt as u32) };
-        // debug!("e1000e: receive packet");
+        // kdebug!("e1000e: receive packet");
         return Some(buffer);
     }
 
@@ -558,7 +559,7 @@ impl Drop for E1000EDevice {
     fn drop(&mut self) {
         // 释放已分配的所有dma页
         // free all dma pages we have allocated
-        debug!("droping...");
+        kdebug!("droping...");
         let recv_ring_length = PAGE_SIZE / size_of::<E1000ERecvDesc>();
         let trans_ring_length = PAGE_SIZE / size_of::<E1000ETransDesc>();
         unsafe {
@@ -589,10 +590,10 @@ impl Drop for E1000EDevice {
 pub fn e1000e_init() {
     match e1000e_probe() {
         Ok(_code) => {
-            info!("Successfully init e1000e device!");
+            kinfo!("Successfully init e1000e device!");
         }
         Err(_error) => {
-            info!("Error occurred!");
+            kinfo!("Error occurred!");
         }
     }
 }
@@ -609,7 +610,7 @@ pub fn e1000e_probe() -> Result<u64, E1000EPciError> {
         if header.vendor_id == 0x8086 {
             // intel
             if E1000E_DEVICE_ID.contains(&header.device_id) {
-                debug!(
+                kdebug!(
                     "Detected e1000e PCI device with device id {:#x}",
                     header.device_id
                 );
@@ -780,8 +781,7 @@ const E1000E_TXD_CMD_EOP: u8 = 1 << 0;
 const E1000E_TXD_CMD_IFCS: u8 = 1 << 1;
 const E1000E_TXD_CMD_RS: u8 = 1 << 3;
 
-/// E1000E驱动初始化过程中可能的错误
-#[allow(dead_code)]
+// E1000E驱动初始化过程中可能的错误
 pub enum E1000EPciError {
     // 获取到错误类型的BAR（IO BAR）
     // An IO BAR was provided rather than a memory BAR.

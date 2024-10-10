@@ -8,7 +8,6 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
-use log::warn;
 use smoltcp::{
     iface::SocketSet,
     socket::{self, raw, tcp, udp},
@@ -22,11 +21,10 @@ use crate::{
         Metadata,
     },
     libs::{
-        rwlock::{RwLock, RwLockWriteGuard},
+        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::EventWaitQueue,
     },
-    process::{Pid, ProcessManager},
     sched::{schedule, SchedMode},
 };
 
@@ -87,7 +85,7 @@ pub(super) fn new_socket(
         }
     };
 
-    let handle_item = SocketHandleItem::new(Arc::downgrade(&socket.posix_item()));
+    let handle_item = SocketHandleItem::new();
     HANDLE_MAP
         .write_irqsave()
         .insert(socket.socket_handle(), handle_item);
@@ -228,7 +226,7 @@ pub trait Socket: Sync + Send + Debug + Any {
         _optname: usize,
         _optval: &[u8],
     ) -> Result<(), SystemError> {
-        warn!("setsockopt is not implemented");
+        kwarn!("setsockopt is not implemented");
         Ok(())
     }
 
@@ -243,26 +241,36 @@ pub trait Socket: Sync + Send + Debug + Any {
     fn as_any_mut(&mut self) -> &mut dyn Any;
 
     fn add_epoll(&mut self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
-        let posix_item = self.posix_item();
-        posix_item.add_epoll(epitem);
+        HANDLE_MAP
+            .write_irqsave()
+            .get_mut(&self.socket_handle())
+            .unwrap()
+            .add_epoll(epitem);
         Ok(())
     }
 
     fn remove_epoll(&mut self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
-        let posix_item = self.posix_item();
-        posix_item.remove_epoll(epoll)?;
+        HANDLE_MAP
+            .write_irqsave()
+            .get_mut(&self.socket_handle())
+            .unwrap()
+            .remove_epoll(epoll)?;
 
         Ok(())
     }
 
     fn clear_epoll(&mut self) -> Result<(), SystemError> {
-        let posix_item = self.posix_item();
+        let mut handle_map_guard = HANDLE_MAP.write_irqsave();
+        let handle_item = handle_map_guard.get_mut(&self.socket_handle()).unwrap();
 
-        for epitem in posix_item.epitems.lock_irqsave().iter() {
+        for epitem in handle_item.epitems.lock_irqsave().iter() {
             let epoll = epitem.epoll();
-
-            if let Some(epoll) = epoll.upgrade() {
-                EventPoll::ep_remove(&mut epoll.lock_irqsave(), epitem.fd(), None)?;
+            if epoll.upgrade().is_some() {
+                EventPoll::ep_remove(
+                    &mut epoll.upgrade().unwrap().lock_irqsave(),
+                    epitem.fd(),
+                    None,
+                )?;
             }
         }
 
@@ -270,8 +278,6 @@ pub trait Socket: Sync + Send + Debug + Any {
     }
 
     fn close(&mut self);
-
-    fn posix_item(&self) -> Arc<PosixSocketHandleItem>;
 }
 
 impl Clone for Box<dyn Socket> {
@@ -297,40 +303,6 @@ impl SocketInode {
     pub unsafe fn inner_no_preempt(&self) -> SpinLockGuard<Box<dyn Socket>> {
         self.0.lock_no_preempt()
     }
-
-    fn do_close(&self) -> Result<(), SystemError> {
-        let prev_ref_count = self.1.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
-        if prev_ref_count == 1 {
-            // 最后一次关闭，需要释放
-            let mut socket = self.0.lock_irqsave();
-
-            if socket.metadata().socket_type == SocketType::Unix {
-                return Ok(());
-            }
-
-            if let Some(Endpoint::Ip(Some(ip))) = socket.endpoint() {
-                PORT_MANAGER.unbind_port(socket.metadata().socket_type, ip.port);
-            }
-
-            socket.clear_epoll()?;
-
-            HANDLE_MAP
-                .write_irqsave()
-                .remove(&socket.socket_handle())
-                .unwrap();
-            socket.close();
-        }
-
-        Ok(())
-    }
-}
-
-impl Drop for SocketInode {
-    fn drop(&mut self) {
-        for _ in 0..self.1.load(core::sync::atomic::Ordering::SeqCst) {
-            let _ = self.do_close();
-        }
-    }
 }
 
 impl IndexNode for SocketInode {
@@ -344,7 +316,29 @@ impl IndexNode for SocketInode {
     }
 
     fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
-        self.do_close()
+        let prev_ref_count = self.1.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+        if prev_ref_count == 1 {
+            // 最后一次关闭，需要释放
+            let mut socket = self.0.lock_irqsave();
+
+            if socket.metadata().socket_type == SocketType::Unix {
+                return Ok(());
+            }
+
+            if let Some(Endpoint::Ip(Some(ip))) = socket.endpoint() {
+                PORT_MANAGER.unbind_port(socket.metadata().socket_type, ip.port)?;
+            }
+
+            socket.clear_epoll()?;
+
+            HANDLE_MAP
+                .write_irqsave()
+                .remove(&socket.socket_handle())
+                .unwrap();
+            socket.close();
+        }
+
+        Ok(())
     }
 
     fn read_at(
@@ -402,35 +396,54 @@ impl IndexNode for SocketInode {
 }
 
 #[derive(Debug)]
-pub struct PosixSocketHandleItem {
+pub struct SocketHandleItem {
+    /// shutdown状态
+    pub shutdown_type: RwLock<ShutdownType>,
     /// socket的waitqueue
-    wait_queue: Arc<EventWaitQueue>,
-
+    pub wait_queue: EventWaitQueue,
+    /// epitems，考虑写在这是否是最优解？
     pub epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
 }
 
-impl PosixSocketHandleItem {
-    pub fn new(wait_queue: Option<Arc<EventWaitQueue>>) -> Self {
+impl SocketHandleItem {
+    pub fn new() -> Self {
         Self {
-            wait_queue: wait_queue.unwrap_or(Arc::new(EventWaitQueue::new())),
+            shutdown_type: RwLock::new(ShutdownType::empty()),
+            wait_queue: EventWaitQueue::new(),
             epitems: SpinLock::new(LinkedList::new()),
         }
     }
+
     /// ## 在socket的等待队列上睡眠
-    pub fn sleep(&self, events: u64) {
+    pub fn sleep(
+        socket_handle: GlobalSocketHandle,
+        events: u64,
+        handle_map_guard: RwLockReadGuard<'_, HashMap<GlobalSocketHandle, SocketHandleItem>>,
+    ) {
         unsafe {
-            ProcessManager::preempt_disable();
-            self.wait_queue.sleep_without_schedule(events);
-            ProcessManager::preempt_enable();
-        }
+            handle_map_guard
+                .get(&socket_handle)
+                .unwrap()
+                .wait_queue
+                .sleep_without_schedule(events)
+        };
+        drop(handle_map_guard);
         schedule(SchedMode::SM_NONE);
     }
 
-    pub fn add_epoll(&self, epitem: Arc<EPollItem>) {
+    pub fn shutdown_type(&self) -> ShutdownType {
+        *self.shutdown_type.read()
+    }
+
+    pub fn shutdown_type_writer(&mut self) -> RwLockWriteGuard<ShutdownType> {
+        self.shutdown_type.write_irqsave()
+    }
+
+    pub fn add_epoll(&mut self, epitem: Arc<EPollItem>) {
         self.epitems.lock_irqsave().push_back(epitem)
     }
 
-    pub fn remove_epoll(&self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
+    pub fn remove_epoll(&mut self, epoll: &Weak<SpinLock<EventPoll>>) -> Result<(), SystemError> {
         let is_remove = !self
             .epitems
             .lock_irqsave()
@@ -444,59 +457,15 @@ impl PosixSocketHandleItem {
 
         Err(SystemError::ENOENT)
     }
-
-    /// ### 唤醒该队列上等待events的进程
-    ///
-    ///  ### 参数
-    /// - events: 发生的事件
-    ///
-    /// 需要注意的是，只要触发了events中的任意一件事件，进程都会被唤醒
-    pub fn wakeup_any(&self, events: u64) {
-        self.wait_queue.wakeup_any(events);
-    }
-}
-#[derive(Debug)]
-pub struct SocketHandleItem {
-    /// 对应的posix socket是否为listen的
-    pub is_posix_listen: bool,
-    /// shutdown状态
-    pub shutdown_type: RwLock<ShutdownType>,
-    pub posix_item: Weak<PosixSocketHandleItem>,
-}
-
-impl SocketHandleItem {
-    pub fn new(posix_item: Weak<PosixSocketHandleItem>) -> Self {
-        Self {
-            is_posix_listen: false,
-            shutdown_type: RwLock::new(ShutdownType::empty()),
-            posix_item,
-        }
-    }
-
-    pub fn shutdown_type(&self) -> ShutdownType {
-        *self.shutdown_type.read()
-    }
-
-    pub fn shutdown_type_writer(&mut self) -> RwLockWriteGuard<ShutdownType> {
-        self.shutdown_type.write_irqsave()
-    }
-
-    pub fn reset_shutdown_type(&self) {
-        *self.shutdown_type.write() = ShutdownType::empty();
-    }
-
-    pub fn posix_item(&self) -> Option<Arc<PosixSocketHandleItem>> {
-        self.posix_item.upgrade()
-    }
 }
 
 /// # TCP 和 UDP 的端口管理器。
 /// 如果 TCP/UDP 的 socket 绑定了某个端口，它会在对应的表中记录，以检测端口冲突。
 pub struct PortManager {
     // TCP 端口记录表
-    tcp_port_table: SpinLock<HashMap<u16, Pid>>,
+    tcp_port_table: SpinLock<HashMap<u16, Arc<dyn Socket>>>,
     // UDP 端口记录表
-    udp_port_table: SpinLock<HashMap<u16, Pid>>,
+    udp_port_table: SpinLock<HashMap<u16, Arc<dyn Socket>>>,
 }
 
 impl PortManager {
@@ -548,7 +517,12 @@ impl PortManager {
     /// @brief 检测给定端口是否已被占用，如果未被占用则在 TCP/UDP 对应的表中记录
     ///
     /// TODO: 增加支持端口复用的逻辑
-    pub fn bind_port(&self, socket_type: SocketType, port: u16) -> Result<(), SystemError> {
+    pub fn bind_port(
+        &self,
+        socket_type: SocketType,
+        port: u16,
+        socket: impl Socket,
+    ) -> Result<(), SystemError> {
         if port > 0 {
             let mut listen_table_guard = match socket_type {
                 SocketType::Udp => self.udp_port_table.lock(),
@@ -557,7 +531,7 @@ impl PortManager {
             };
             match listen_table_guard.get(&port) {
                 Some(_) => return Err(SystemError::EADDRINUSE),
-                None => listen_table_guard.insert(port, ProcessManager::current_pid()),
+                None => listen_table_guard.insert(port, Arc::new(socket)),
             };
             drop(listen_table_guard);
         }
@@ -565,17 +539,15 @@ impl PortManager {
     }
 
     /// @brief 在对应的端口记录表中将端口和 socket 解绑
-    /// should call this function when socket is closed or aborted
-    pub fn unbind_port(&self, socket_type: SocketType, port: u16) {
+    pub fn unbind_port(&self, socket_type: SocketType, port: u16) -> Result<(), SystemError> {
         let mut listen_table_guard = match socket_type {
             SocketType::Udp => self.udp_port_table.lock(),
             SocketType::Tcp => self.tcp_port_table.lock(),
-            _ => {
-                return;
-            }
+            _ => return Ok(()),
         };
         listen_table_guard.remove(&port);
         drop(listen_table_guard);
+        return Ok(());
     }
 }
 
@@ -780,47 +752,33 @@ impl TryFrom<u8> for PosixSocketType {
 pub struct SocketPollMethod;
 
 impl SocketPollMethod {
-    pub fn poll(socket: &socket::Socket, handle_item: &SocketHandleItem) -> EPollEventType {
-        let shutdown = handle_item.shutdown_type();
+    pub fn poll(socket: &socket::Socket, shutdown: ShutdownType) -> EPollEventType {
         match socket {
             socket::Socket::Udp(udp) => Self::udp_poll(udp, shutdown),
-            socket::Socket::Tcp(tcp) => Self::tcp_poll(tcp, shutdown, handle_item.is_posix_listen),
+            socket::Socket::Tcp(tcp) => Self::tcp_poll(tcp, shutdown),
             socket::Socket::Raw(raw) => Self::raw_poll(raw, shutdown),
             _ => todo!(),
         }
     }
 
-    pub fn tcp_poll(
-        socket: &tcp::Socket,
-        shutdown: ShutdownType,
-        is_posix_listen: bool,
-    ) -> EPollEventType {
+    pub fn tcp_poll(socket: &tcp::Socket, shutdown: ShutdownType) -> EPollEventType {
         let mut events = EPollEventType::empty();
-        // debug!("enter tcp_poll! is_posix_listen:{}", is_posix_listen);
-        // 处理listen的socket
-        if is_posix_listen {
-            // 如果是listen的socket，那么只有EPOLLIN和EPOLLRDNORM
-            if socket.is_active() {
-                events.insert(EPollEventType::EPOLL_LISTEN_CAN_ACCEPT);
-            }
-
-            // debug!("tcp_poll listen socket! events:{:?}", events);
+        if socket.is_listening() && socket.is_active() {
+            events.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
             return events;
         }
 
-        let state = socket.state();
-
-        if shutdown == ShutdownType::SHUTDOWN_MASK || state == tcp::State::Closed {
-            events.insert(EPollEventType::EPOLLHUP);
+        // socket已经关闭
+        if !socket.is_open() {
+            events.insert(EPollEventType::EPOLLHUP)
         }
-
         if shutdown.contains(ShutdownType::RCV_SHUTDOWN) {
             events.insert(
                 EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM | EPollEventType::EPOLLRDHUP,
             );
         }
 
-        // Connected or passive Fast Open socket?
+        let state = socket.state();
         if state != tcp::State::SynSent && state != tcp::State::SynReceived {
             // socket有可读数据
             if socket.can_recv() {
@@ -828,12 +786,12 @@ impl SocketPollMethod {
             }
 
             if !(shutdown.contains(ShutdownType::SEND_SHUTDOWN)) {
-                // 缓冲区可写（这里判断可写的逻辑好像跟linux不太一样）
+                // 缓冲区可写
                 if socket.send_queue() < socket.send_capacity() {
                     events.insert(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM);
                 } else {
-                    // TODO：触发缓冲区已满的信号SIGIO
-                    todo!("A signal SIGIO that the buffer is full needs to be sent");
+                    // TODO：触发缓冲区已满的信号
+                    todo!("A signal that the buffer is full needs to be sent");
                 }
             } else {
                 // 如果我们的socket关闭了SEND_SHUTDOWN，epoll事件就是EPOLLOUT
@@ -844,7 +802,6 @@ impl SocketPollMethod {
         }
 
         // socket发生错误
-        // TODO: 这里的逻辑可能有问题，需要进一步验证是否is_active()==false就代表socket发生错误
         if !socket.is_active() {
             events.insert(EPollEventType::EPOLLERR);
         }
@@ -883,7 +840,7 @@ impl SocketPollMethod {
     }
 
     pub fn raw_poll(socket: &raw::Socket, shutdown: ShutdownType) -> EPollEventType {
-        //debug!("enter raw_poll!");
+        //kdebug!("enter raw_poll!");
         let mut event = EPollEventType::empty();
 
         if shutdown.contains(ShutdownType::RCV_SHUTDOWN) {
@@ -896,21 +853,21 @@ impl SocketPollMethod {
         }
 
         if socket.can_recv() {
-            //debug!("poll can recv!");
+            //kdebug!("poll can recv!");
             event.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
         } else {
-            //debug!("poll can not recv!");
+            //kdebug!("poll can not recv!");
         }
 
         if socket.can_send() {
-            //debug!("poll can send!");
+            //kdebug!("poll can send!");
             event.insert(
                 EPollEventType::EPOLLOUT
                     | EPollEventType::EPOLLWRNORM
                     | EPollEventType::EPOLLWRBAND,
             );
         } else {
-            //debug!("poll can not send!");
+            //kdebug!("poll can not send!");
             // TODO: 缓冲区空间不够，需要使用信号处理
             todo!()
         }

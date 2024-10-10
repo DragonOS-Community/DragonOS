@@ -10,6 +10,7 @@ use crate::{
         },
         net::NetDevice,
     },
+    kinfo,
     libs::spinlock::SpinLock,
     net::{generate_iface_id, NET_DEVICES},
     time::Instant,
@@ -23,7 +24,6 @@ use core::{
     fmt::Debug,
     ops::{Deref, DerefMut},
 };
-use log::info;
 use smoltcp::{
     phy,
     wire::{self, HardwareAddress},
@@ -367,5 +367,5 @@ pub fn e1000e_driver_init(device: E1000EDevice) {
     NET_DEVICES
         .write_irqsave()
         .insert(iface.nic_id(), iface.clone());
-    info!("e1000e driver init successfully!\tMAC: [{}]", mac);
+    kinfo!("e1000e driver init successfully!\tMAC: [{}]", mac);
 }

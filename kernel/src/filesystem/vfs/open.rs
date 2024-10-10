@@ -1,6 +1,10 @@
 use alloc::sync::Arc;
-use log::warn;
 use system_error::SystemError;
+
+use crate::{
+    driver::base::block::SeekFrom, process::ProcessManager,
+    syscall::user_access::check_and_clone_cstr,
+};
 
 use super::{
     fcntl::AtFlags,
@@ -9,13 +13,6 @@ use super::{
     utils::{rsplit_path, user_path_at},
     FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
-use crate::filesystem::vfs::syscall::UtimensFlags;
-use crate::time::{syscall::PosixTimeval, PosixTimeSpec};
-use crate::{
-    driver::base::block::SeekFrom, process::ProcessManager,
-    syscall::user_access::check_and_clone_cstr,
-};
-use alloc::string::String;
 
 pub(super) fn do_faccessat(
     dirfd: i32,
@@ -38,9 +35,8 @@ pub(super) fn do_faccessat(
     // let follow_symlink = flags & AtFlags::AT_SYMLINK_NOFOLLOW.bits() as u32 == 0;
 
     let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
-    let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
 
-    let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
+    let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
 
     // 如果找不到文件，则返回错误码ENOENT
     let _inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
@@ -51,14 +47,13 @@ pub(super) fn do_faccessat(
 
 pub fn do_fchmodat(dirfd: i32, path: *const u8, _mode: ModeType) -> Result<usize, SystemError> {
     let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
-    let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
 
-    let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
+    let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, &path)?;
 
     // 如果找不到文件，则返回错误码ENOENT
     let _inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
-    warn!("do_fchmodat: not implemented yet\n");
+    kwarn!("do_fchmodat: not implemented yet\n");
     // todo: 真正去改变文件的权限
 
     return Ok(0);
@@ -81,7 +76,7 @@ fn do_sys_openat2(
     how: OpenHow,
     follow_symlink: bool,
 ) -> Result<usize, SystemError> {
-    // debug!("open path: {}, how: {:?}", path, how);
+    // kdebug!("open path: {}, how: {:?}", path, how);
     let path = path.trim();
 
     let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
@@ -150,85 +145,4 @@ fn do_sys_openat2(
         .map(|fd| fd as usize);
 
     return r;
-}
-
-/// On Linux, futimens() is a library function implemented on top of
-/// the utimensat() system call.  To support this, the Linux
-/// utimensat() system call implements a nonstandard feature: if
-/// pathname is NULL, then the call modifies the timestamps of the
-/// file referred to by the file descriptor dirfd (which may refer to
-/// any type of file).
-pub fn do_utimensat(
-    dirfd: i32,
-    pathname: Option<String>,
-    times: Option<[PosixTimeSpec; 2]>,
-    flags: UtimensFlags,
-) -> Result<usize, SystemError> {
-    const UTIME_NOW: i64 = (1i64 << 30) - 1i64;
-    const UTIME_OMIT: i64 = (1i64 << 30) - 2i64;
-    // log::debug!("do_utimensat: dirfd:{}, pathname:{:?}, times:{:?}, flags:{:?}", dirfd, pathname, times, flags);
-    let inode = match pathname {
-        Some(path) => {
-            let (inode_begin, path) =
-                user_path_at(&ProcessManager::current_pcb(), dirfd, path.as_str())?;
-            let inode = if flags.contains(UtimensFlags::AT_SYMLINK_NOFOLLOW) {
-                inode_begin.lookup(path.as_str())?
-            } else {
-                inode_begin.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?
-            };
-            inode
-        }
-        None => {
-            let binding = ProcessManager::current_pcb().fd_table();
-            let fd_table_guard = binding.write();
-            let file = fd_table_guard
-                .get_file_by_fd(dirfd)
-                .ok_or(SystemError::EBADF)?;
-            file.inode()
-        }
-    };
-    let now = PosixTimeSpec::now();
-    let mut meta = inode.metadata()?;
-
-    if let Some([atime, mtime]) = times {
-        if atime.tv_nsec == UTIME_NOW {
-            meta.atime = now;
-        } else if atime.tv_nsec != UTIME_OMIT {
-            meta.atime = atime;
-        }
-        if mtime.tv_nsec == UTIME_NOW {
-            meta.mtime = now;
-        } else if mtime.tv_nsec != UTIME_OMIT {
-            meta.mtime = mtime;
-        }
-        inode.set_metadata(&meta).unwrap();
-    } else {
-        meta.atime = now;
-        meta.mtime = now;
-        inode.set_metadata(&meta).unwrap();
-    }
-    return Ok(0);
-}
-
-pub fn do_utimes(path: &str, times: Option<[PosixTimeval; 2]>) -> Result<usize, SystemError> {
-    // log::debug!("do_utimes: path:{:?}, times:{:?}", path, times);
-    let (inode_begin, path) = user_path_at(
-        &ProcessManager::current_pcb(),
-        AtFlags::AT_FDCWD.bits(),
-        path,
-    )?;
-    let inode = inode_begin.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-    let mut meta = inode.metadata()?;
-
-    if let Some([atime, mtime]) = times {
-        meta.atime = PosixTimeSpec::from(atime);
-        meta.mtime = PosixTimeSpec::from(mtime);
-        inode.set_metadata(&meta)?;
-    } else {
-        let now = PosixTimeSpec::now();
-        meta.atime = now;
-        meta.mtime = now;
-        inode.set_metadata(&meta)?;
-    }
-    return Ok(0);
 }

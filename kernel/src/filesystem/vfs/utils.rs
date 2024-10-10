@@ -1,7 +1,8 @@
 use core::cmp::Ordering;
-use core::fmt::{self, Debug};
+use core::fmt::Debug;
 use core::hash::Hash;
 
+use alloc::string::ToString;
 use alloc::{string::String, sync::Arc};
 use system_error::SystemError;
 
@@ -134,9 +135,9 @@ impl Clone for DName {
     }
 }
 
-impl fmt::Display for DName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+impl ToString for DName {
+    fn to_string(&self) -> String {
+        (*self.0).clone()
     }
 }
 

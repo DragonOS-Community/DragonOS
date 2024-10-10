@@ -11,9 +11,8 @@ use system_error::SystemError;
 mod dma;
 pub mod e1000e;
 pub mod irq_handle;
-pub mod loopback;
 pub mod virtio_net;
-#[allow(dead_code)]
+
 pub trait NetDevice: Device {
     /// @brief 获取网卡的MAC地址
     fn mac(&self) -> EthernetAddress;

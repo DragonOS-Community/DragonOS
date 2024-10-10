@@ -12,12 +12,12 @@ use elf::{
     file::FileHeader,
     segment::{ProgramHeader, SegmentTable},
 };
-use log::error;
 use system_error::SystemError;
 
 use crate::{
     arch::{CurrentElfArch, MMArch},
     driver::base::block::SeekFrom,
+    kdebug, kerror,
     libs::align::page_align_up,
     mm::{
         allocator::page_frame::{PageFrameCount, VirtPageFrame},
@@ -124,7 +124,7 @@ impl ElfLoader {
     ) -> Result<(), ExecError> {
         let start = Self::elf_page_start(start);
         let end = Self::elf_page_align_up(end);
-        // debug!("set_elf_brk: start={:?}, end={:?}", start, end);
+
         if end > start {
             let r = user_vm_guard.map_anonymous(
                 start,
@@ -134,9 +134,9 @@ impl ElfLoader {
                 false,
                 true,
             );
-            // debug!("set_elf_brk: map_anonymous: r={:?}", r);
+            // kdebug!("set_elf_brk: map_anonymous: r={:?}", r);
             if r.is_err() {
-                error!("set_elf_brk: map_anonymous failed, err={:?}", r);
+                kerror!("set_elf_brk: map_anonymous failed, err={:?}", r);
                 return Err(ExecError::OutOfMemory);
             }
         }
@@ -207,7 +207,7 @@ impl ElfLoader {
         map_flags: &MapFlags,
         total_size: usize,
     ) -> Result<(VirtAddr, bool), SystemError> {
-        // debug!("load_elf_segment: addr_to_map={:?}", addr_to_map);
+        // kdebug!("load_elf_segment: addr_to_map={:?}", addr_to_map);
 
         // 映射位置的偏移量（页内偏移）
         let beginning_page_offset = Self::elf_page_offset(addr_to_map);
@@ -228,7 +228,7 @@ impl ElfLoader {
 
         let map_err_handler = |err: SystemError| {
             if err == SystemError::EEXIST {
-                error!(
+                kerror!(
                     "Pid: {:?}, elf segment at {:p} overlaps with existing mapping",
                     ProcessManager::current_pcb().pid(),
                     addr_to_map.as_ptr::<u8>()
@@ -255,7 +255,7 @@ impl ElfLoader {
         if total_size != 0 {
             let total_size = Self::elf_page_align_up(VirtAddr::new(total_size)).data();
 
-            // log::debug!("total_size={}", total_size);
+            // kdebug!("total_size={}", total_size);
 
             map_addr = user_vm_guard
                 .map_anonymous(addr_to_map, total_size, tmp_prot, *map_flags, false, true)
@@ -285,12 +285,12 @@ impl ElfLoader {
                 )?;
             }
         } else {
-            // debug!("total size = 0");
+            // kdebug!("total size = 0");
 
             map_addr = user_vm_guard
                 .map_anonymous(addr_to_map, map_size, tmp_prot, *map_flags, false, true)?
                 .virt_address();
-            // debug!(
+            // kdebug!(
             //     "map ok: addr_to_map={:?}, map_addr={map_addr:?},beginning_page_offset={beginning_page_offset:?}",
             //     addr_to_map
             // );
@@ -311,7 +311,7 @@ impl ElfLoader {
                 )?;
             }
         }
-        // debug!("load_elf_segment OK: map_addr={:?}", map_addr);
+        // kdebug!("load_elf_segment OK: map_addr={:?}", map_addr);
         return Ok((map_addr, true));
     }
 
@@ -329,7 +329,7 @@ impl ElfLoader {
         interp_elf_ex: &mut ExecParam,
         load_bias: usize,
     ) -> Result<BinaryLoaderResult, ExecError> {
-        log::debug!("loading elf interp");
+        kdebug!("loading elf interp");
         let mut head_buf = [0u8; 512];
         interp_elf_ex
             .file_mut()
@@ -361,28 +361,29 @@ impl ElfLoader {
         let mut last_bss: VirtAddr = VirtAddr::new(0);
         let mut bss_prot: Option<ProtFlags> = None;
         for section in phdr_table {
+            kdebug!("loading {:?}", section);
             if section.p_type == PT_LOAD {
-                log::debug!("loading {:?}", section);
                 let mut elf_type = MapFlags::MAP_PRIVATE;
                 let elf_prot = Self::make_prot(section.p_flags, true, true);
                 let vaddr = TryInto::<usize>::try_into(section.p_vaddr).unwrap();
-                let mut addr_to_map = load_addr + vaddr;
                 if interp_hdr.e_type == ET_EXEC || load_addr_set {
                     elf_type.insert(MapFlags::MAP_FIXED) //TODO 应当为MapFlags::MAP_FIXED，暂时未支持
-                } else if load_bias != 0 && interp_hdr.e_type == ET_DYN {
-                    addr_to_map = VirtAddr::new(0);
+                }
+                load_addr += vaddr;
+                if load_bias != 0 && interp_hdr.e_type == ET_DYN {
+                    load_addr -= vaddr;
                 }
                 let map_addr = Self::load_elf_segment(
                     &mut interp_elf_ex.vm().clone().write(),
                     interp_elf_ex,
                     &section,
-                    addr_to_map,
+                    load_addr,
                     &elf_prot,
                     &elf_type,
                     total_size,
                 )
                 .map_err(|e| {
-                    log::error!("Failed to load elf interpreter :{:?}", e);
+                    kerror!("Failed to load elf interpreter :{:?}", e);
                     return ExecError::InvalidParemeter;
                 })?;
                 if !map_addr.1 {
@@ -451,13 +452,14 @@ impl ElfLoader {
                     _ => return ExecError::InvalidParemeter,
                 })?;
         }
-        load_addr += TryInto::<usize>::try_into(interp_hdr.e_entry).unwrap();
-        if load_addr > MMArch::USER_END_VADDR {
+        if load_addr + TryInto::<usize>::try_into(interp_hdr.e_entry).unwrap()
+            > MMArch::USER_END_VADDR
+        {
             return Err(ExecError::BadAddress(Some(
                 load_addr + TryInto::<usize>::try_into(interp_hdr.e_entry).unwrap(),
             )));
         }
-        log::debug!("sucessfully load elf interp");
+        kdebug!("sucessfully load elf interp");
         return Ok(BinaryLoaderResult::new(load_addr));
     }
 
@@ -489,7 +491,7 @@ impl ElfLoader {
         while remain > 0 {
             let read_size = min(remain, buf_size);
             file.read(read_size, &mut buf[..read_size])?;
-            // debug!("copy_to_user: vaddr={:?}, read_size = {read_size}", vaddr);
+            // kdebug!("copy_to_user: vaddr={:?}, read_size = {read_size}", vaddr);
             unsafe {
                 copy_to_user(vaddr, &buf[..read_size]).map_err(|_| SystemError::EFAULT)?;
             }
@@ -706,14 +708,14 @@ impl BinaryLoader for ElfLoader {
         // https://code.dragonos.org.cn/xref/linux-5.19.10/fs/binfmt_elf.c?r=&mo=22652&fi=824#1034
 
         let elf_type = ElfType::from(ehdr.e_type);
-        // debug!("ehdr = {:?}", ehdr);
+        // kdebug!("ehdr = {:?}", ehdr);
 
         let binding = param.vm().clone();
         let mut user_vm = binding.write();
 
         // todo: 增加对user stack上的内存是否具有可执行权限的处理（方法：寻找phdr里面的PT_GNU_STACK段）
 
-        // debug!("to parse segments");
+        // kdebug!("to parse segments");
         // 加载ELF文件并映射到用户空间
         let mut phdr_buf = Vec::new();
         let phdr_table = Self::parse_segments(param, &ehdr, &mut phdr_buf)
@@ -736,8 +738,9 @@ impl BinaryLoader for ElfLoader {
             if seg.p_filesz > 4096 || seg.p_filesz < 2 {
                 return Err(ExecError::NotExecutable);
             }
-            log::debug!("seg:{:?}", seg);
-            let mut buffer = vec![0; seg.p_filesz.try_into().unwrap()];
+            kdebug!("seg:{:?}", seg);
+            let mut buffer = Vec::new();
+            buffer.resize(seg.p_filesz.try_into().unwrap(), 0);
             let r = param
                 .file_mut()
                 .pread(
@@ -746,11 +749,11 @@ impl BinaryLoader for ElfLoader {
                     buffer.as_mut_slice(),
                 )
                 .map_err(|e| {
-                    log::error!("Failed to load interpreter :{:?}", e);
+                    kerror!("Failed to load interpreter :{:?}", e);
                     return ExecError::NotSupported;
                 })?;
             if r != seg.p_filesz.try_into().unwrap() {
-                log::error!("Failed to load interpreter ");
+                kerror!("Failed to load interpreter ");
                 return Err(ExecError::NotSupported);
             }
             let interpreter_path = core::str::from_utf8(
@@ -762,11 +765,11 @@ impl BinaryLoader for ElfLoader {
                     e
                 ))
             })?;
-            log::debug!("opening interpreter at :{}", interpreter_path);
+            kdebug!("opening interpreter at :{}", interpreter_path);
             interpreter = Some(
-                ExecParam::new(interpreter_path, param.vm().clone(), ExecParamFlags::EXEC)
+                ExecParam::new(&interpreter_path, param.vm().clone(), ExecParamFlags::EXEC)
                     .map_err(|e| {
-                        log::error!("Failed to load interpreter :{:?}", e);
+                        kerror!("Failed to load interpreter :{:?}", e);
                         return ExecError::NotSupported;
                     })?,
             );
@@ -801,9 +804,9 @@ impl BinaryLoader for ElfLoader {
             .filter(|seg| seg.p_type == elf::abi::PT_LOAD);
 
         for seg_to_load in loadable_sections {
-            log::debug!("seg_to_load = {:?}", seg_to_load);
+            kdebug!("seg_to_load = {:?}", seg_to_load);
             if unlikely(elf_brk > elf_bss) {
-                // debug!(
+                // kdebug!(
                 //     "to set brk, elf_brk = {:?}, elf_bss = {:?}",
                 //     elf_brk,
                 //     elf_bss
@@ -866,7 +869,6 @@ impl BinaryLoader for ElfLoader {
 
             // 加载这个段到用户空间
 
-            log::debug!("bias: {load_bias}");
             let e = Self::load_elf_segment(
                 &mut user_vm,
                 param,
@@ -881,7 +883,7 @@ impl BinaryLoader for ElfLoader {
                 SystemError::ENOMEM => ExecError::OutOfMemory,
                 _ => ExecError::Other(format!("load_elf_segment failed: {:?}", e)),
             })?;
-            log::debug!("e.0={:?}", e.0);
+
             // 如果地址不对，那么就报错
             if !e.1 {
                 return Err(ExecError::BadAddress(Some(e.0)));
@@ -900,9 +902,9 @@ impl BinaryLoader for ElfLoader {
                 }
             }
 
-            // debug!("seg_to_load.p_offset={}", seg_to_load.p_offset);
-            // debug!("e_phoff={}", ehdr.e_phoff);
-            // debug!("seg_to_load.p_filesz={}", seg_to_load.p_filesz);
+            // kdebug!("seg_to_load.p_offset={}", seg_to_load.p_offset);
+            // kdebug!("e_phoff={}", ehdr.e_phoff);
+            // kdebug!("seg_to_load.p_filesz={}", seg_to_load.p_filesz);
             // Figure out which segment in the file contains the Program Header Table,
             // and map to the associated virtual address.
             if (seg_to_load.p_offset <= ehdr.e_phoff)
@@ -932,7 +934,7 @@ impl BinaryLoader for ElfLoader {
                 || Self::elf_page_align_up(p_vaddr + seg_to_load.p_memsz as usize)
                     >= MMArch::USER_END_VADDR
             {
-                // debug!("ERR:     p_vaddr={p_vaddr:?}");
+                // kdebug!("ERR:     p_vaddr={p_vaddr:?}");
                 return Err(ExecError::InvalidParemeter);
             }
 
@@ -965,7 +967,7 @@ impl BinaryLoader for ElfLoader {
                 elf_brk = seg_end_vaddr;
             }
         }
-        // debug!("elf load: phdr_vaddr={phdr_vaddr:?}");
+        // kdebug!("elf load: phdr_vaddr={phdr_vaddr:?}");
         let program_entrypoint = VirtAddr::new(ehdr.e_entry as usize + load_bias);
         let phdr_vaddr = phdr_vaddr.map(|phdr_vaddr| phdr_vaddr + load_bias);
 
@@ -976,7 +978,7 @@ impl BinaryLoader for ElfLoader {
         start_data = start_data.map(|v| v + load_bias);
         end_data = end_data.map(|v| v + load_bias);
         let mut interp_load_addr: Option<VirtAddr> = None;
-        // debug!(
+        // kdebug!(
         //     "to set brk: elf_bss: {:?}, elf_brk: {:?}, bss_prot_flags: {:?}",
         //     elf_bss,
         //     elf_brk,
@@ -985,7 +987,7 @@ impl BinaryLoader for ElfLoader {
         self.set_elf_brk(&mut user_vm, elf_bss, elf_brk, bss_prot_flags)?;
 
         if likely(elf_bss != elf_brk) && unlikely(Self::pad_zero(elf_bss).is_err()) {
-            // debug!("elf_bss = {elf_bss:?}, elf_brk = {elf_brk:?}");
+            // kdebug!("elf_bss = {elf_bss:?}, elf_brk = {elf_brk:?}");
             return Err(ExecError::BadAddress(Some(elf_bss)));
         }
         drop(user_vm);
@@ -1003,17 +1005,22 @@ impl BinaryLoader for ElfLoader {
                 .map(|fd| fd as usize)
                 .map_err(|_| ExecError::InvalidParemeter)?;
         }
-        // debug!("to create auxv");
+        // kdebug!("to create auxv");
         let mut user_vm = binding.write();
-        self.create_auxv(param, program_entrypoint, phdr_vaddr, &ehdr)?;
+        self.create_auxv(
+            param,
+            interp_load_addr.unwrap_or(program_entrypoint),
+            phdr_vaddr,
+            &ehdr,
+        )?;
 
-        // debug!("auxv create ok");
+        // kdebug!("auxv create ok");
         user_vm.start_code = start_code.unwrap_or(VirtAddr::new(0));
         user_vm.end_code = end_code.unwrap_or(VirtAddr::new(0));
         user_vm.start_data = start_data.unwrap_or(VirtAddr::new(0));
         user_vm.end_data = end_data.unwrap_or(VirtAddr::new(0));
 
-        let result = BinaryLoaderResult::new(interp_load_addr.unwrap_or(program_entrypoint));
+        let result = BinaryLoaderResult::new(program_entrypoint);
         // kdebug!("elf load OK!!!");
         return Ok(result);
     }

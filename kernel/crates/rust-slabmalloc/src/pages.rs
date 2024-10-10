@@ -38,7 +38,7 @@ impl Bitfield for [AtomicU64] {
     fn initialize(&mut self, for_size: usize, capacity: usize) {
         // Set everything to allocated
         for bitmap in self.iter_mut() {
-            *bitmap = AtomicU64::new(u64::MAX);
+            *bitmap = AtomicU64::new(u64::max_value());
         }
 
         // Mark actual slots as free
@@ -64,7 +64,7 @@ impl Bitfield for [AtomicU64] {
 
         for (base_idx, b) in self.iter().enumerate() {
             let bitval = b.load(Ordering::Relaxed);
-            if bitval == u64::MAX {
+            if bitval == u64::max_value() {
                 continue;
             } else {
                 let negated = !bitval;
@@ -125,7 +125,7 @@ impl Bitfield for [AtomicU64] {
     #[inline(always)]
     fn is_full(&self) -> bool {
         self.iter()
-            .filter(|&x| x.load(Ordering::Relaxed) != u64::MAX)
+            .filter(|&x| x.load(Ordering::Relaxed) != u64::max_value())
             .count()
             == 0
     }
@@ -410,7 +410,6 @@ impl<'a, T: AllocablePage> PageList<'a, T> {
     }
 
     /// Removes `slab_page` from the list.
-    #[allow(clippy::manual_inspect)]
     pub(crate) fn pop<'b>(&'b mut self) -> Option<&'a mut T> {
         match self.head {
             None => None,
@@ -454,7 +453,6 @@ impl<'a, P: AllocablePage + 'a> Iterator for ObjectPageIterMut<'a, P> {
     type Item = &'a mut P;
 
     #[inline]
-    #[allow(clippy::manual_inspect)]
     fn next(&mut self) -> Option<&'a mut P> {
         unsafe {
             self.head.resolve_mut().map(|next| {

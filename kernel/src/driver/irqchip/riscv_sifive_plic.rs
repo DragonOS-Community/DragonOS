@@ -25,7 +25,6 @@ use alloc::{
 };
 use bitmap::AllocBitmap;
 use fdt::node::FdtNode;
-use log::{debug, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -188,7 +187,7 @@ impl PlicHandler {
 
 fn plic_irq_toggle(cpumask: &CpuMask, irq_data: &Arc<IrqData>, enable: bool) {
     cpumask.iter_cpu().for_each(|cpu| {
-        debug!("plic: irq_toggle: cpu: {cpu:?}");
+        kdebug!("plic: irq_toggle: cpu: {cpu:?}");
         let handler = unsafe { plic_handlers().force_get(cpu) };
         handler.toggle(irq_data.hardware_irq(), enable);
     });
@@ -241,7 +240,7 @@ impl IrqChip for PlicIrqChip {
         "SiFive PLIC"
     }
     fn irq_enable(&self, irq_data: &Arc<IrqData>) -> Result<(), SystemError> {
-        // warn!("plic: irq_enable");
+        // kwarn!("plic: irq_enable");
         let common_data = irq_data.common_data();
         let inner_guard = common_data.inner();
         let mask = inner_guard.effective_affinity();
@@ -253,7 +252,7 @@ impl IrqChip for PlicIrqChip {
     }
 
     fn irq_unmask(&self, irq_data: &Arc<IrqData>) -> Result<(), SystemError> {
-        // warn!("plic: irq_unmask");
+        // kwarn!("plic: irq_unmask");
 
         let chip_data = irq_data
             .chip_info_read_irqsave()
@@ -301,7 +300,7 @@ impl IrqChip for PlicIrqChip {
     }
 
     fn irq_disable(&self, irq_data: &Arc<IrqData>) {
-        debug!("plic: irq_disable");
+        kdebug!("plic: irq_disable");
         let common_data = irq_data.common_data();
         let inner_guard = common_data.inner();
         let mask = inner_guard.effective_affinity();
@@ -322,7 +321,7 @@ impl IrqChip for PlicIrqChip {
 
             handler.toggle(irq_data.hardware_irq(), false);
         } else {
-            // debug!("plic: irq_eoi: hwirq: {:?}", irq_data.hardware_irq());
+            // kdebug!("plic: irq_eoi: hwirq: {:?}", irq_data.hardware_irq());
             unsafe {
                 write_volatile(
                     (handler.inner().hart_base + PlicIrqChip::CONTEXT_CLAIM).data() as *mut u32,
@@ -424,7 +423,7 @@ pub fn riscv_sifive_plic_init() -> Result<(), SystemError> {
     });
     for node in all_plics {
         if let Err(e) = do_riscv_sifive_plic_init(&node) {
-            warn!("Failed to init SiFive PLIC: node: {node:?} {e:?}");
+            kwarn!("Failed to init SiFive PLIC: node: {node:?} {e:?}");
         }
     }
 
@@ -458,7 +457,7 @@ fn do_riscv_sifive_plic_init(fdt_node: &FdtNode) -> Result<(), SystemError> {
         .ok_or(SystemError::EINVAL)?
         .as_usize()
         .ok_or(SystemError::EINVAL)?;
-    debug!(
+    kdebug!(
         "plic: node: {}, irq_num: {irq_num}, paddr: {paddr:?}, size: {size}",
         fdt_node.name
     );
@@ -466,7 +465,7 @@ fn do_riscv_sifive_plic_init(fdt_node: &FdtNode) -> Result<(), SystemError> {
         .interrupts_extended()
         .ok_or(SystemError::EINVAL)?
         .count();
-    debug!("plic: nr_contexts: {nr_contexts}");
+    kdebug!("plic: nr_contexts: {nr_contexts}");
 
     let irq_domain = irq_domain_manager()
         .create_and_add_linear(
@@ -475,7 +474,7 @@ fn do_riscv_sifive_plic_init(fdt_node: &FdtNode) -> Result<(), SystemError> {
             (irq_num + 1) as u32,
         )
         .ok_or(SystemError::EINVAL)?;
-    // debug!("plic: irq_domain: {irq_domain:?}");
+    // kdebug!("plic: irq_domain: {irq_domain:?}");
 
     let priv_data = PlicChipData::new(
         Arc::downgrade(&irq_domain),
@@ -507,13 +506,13 @@ fn do_riscv_sifive_plic_init(fdt_node: &FdtNode) -> Result<(), SystemError> {
         let cpu = ProcessorId::new(i as u32);
         let handler = unsafe { plic_handlers().force_get(cpu) };
         if handler.present() {
-            warn!("plic: handler {i} already present.");
+            kwarn!("plic: handler {i} already present.");
             handler.set_threshold(PlicIrqChip::PLIC_ENABLE_THRESHOLD);
             loop_done_setup(handler);
             continue;
         }
 
-        debug!("plic: setup lmask {cpu:?}.");
+        kdebug!("plic: setup lmask {cpu:?}.");
         priv_data.lmask().set(cpu, true);
         let mut handler_inner = handler.inner();
         handler_inner.hart_base =
@@ -561,7 +560,7 @@ fn associate_irq_with_plic_domain(
             let irq = irq as u32;
             let virq = IrqNumber::new(irq);
             let hwirq = HardwareIrqNumber::new(irq);
-            debug!("plic: associate irq: {irq}, virq: {virq:?}, hwirq: {hwirq:?}");
+            kdebug!("plic: associate irq: {irq}, virq: {virq:?}, hwirq: {hwirq:?}");
             irq_domain_manager()
                 .domain_associate(irq_domain, virq, hwirq)
                 .ok();
@@ -584,7 +583,7 @@ impl IrqDomainOps for PlicIrqDomainOps {
         hwirq: HardwareIrqNumber,
         virq: IrqNumber,
     ) -> Result<(), SystemError> {
-        // debug!("plic: map: virq: {virq:?}, hwirq: {hwirq:?}");
+        // kdebug!("plic: map: virq: {virq:?}, hwirq: {hwirq:?}");
 
         let chip_data = irq_domain.host_data().ok_or(SystemError::EINVAL)?;
         let plic_chip_data = chip_data
@@ -614,7 +613,7 @@ impl IrqDomainOps for PlicIrqDomainOps {
         _irq_data: &Arc<IrqData>,
         _reserve: bool,
     ) -> Result<(), SystemError> {
-        warn!("plic: activate");
+        kwarn!("plic: activate");
         loop {}
     }
 
@@ -623,7 +622,7 @@ impl IrqDomainOps for PlicIrqDomainOps {
 
 /// 处理PLIC中断
 pub(super) fn do_plic_irq(trap_frame: &mut TrapFrame) {
-    // debug!("plic: do_plic_irq");
+    // kdebug!("plic: do_plic_irq");
 
     let handler = plic_handlers().get();
     let priv_data = handler.priv_data();
@@ -649,11 +648,11 @@ pub(super) fn do_plic_irq(trap_frame: &mut TrapFrame) {
         if claim == 0 {
             break;
         }
-        debug!("plic: claim: {claim:?}");
+        kdebug!("plic: claim: {claim:?}");
 
         let hwirq = HardwareIrqNumber::new(claim);
         if let Err(e) = GenericIrqHandler::handle_domain_irq(domain.clone(), hwirq, trap_frame) {
-            warn!("plic: can't find mapping for hwirq {hwirq:?}, {e:?}");
+            kwarn!("plic: can't find mapping for hwirq {hwirq:?}, {e:?}");
         }
     }
 }

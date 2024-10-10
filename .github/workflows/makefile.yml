@@ -2,9 +2,9 @@ name: Build Check
 
 on:
   push:
-    branches: [ "master", "feat-*", "fix-*"]
+    branches: [ "master" ]
   pull_request:
-    branches: [ "master", "feat-*", "fix-*"]
+    branches: [ "master" ]
 
 jobs:
   # ensure the toolchain is cached

@@ -182,6 +182,11 @@ macro_rules! bitops_for {
                 }
             }
 
+            #[cfg(feature = "std")]
+            fn to_hex(bits: &Self) -> String {
+                format!("{:x}", bits)
+            }
+
             #[inline]
             fn bit_size() -> usize {
                 <$target>::BITS as usize

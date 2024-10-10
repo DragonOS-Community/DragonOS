@@ -18,7 +18,6 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use log::{debug, error, warn};
 use system_error::SystemError;
 
 use super::{acpi_kset, AcpiManager};
@@ -110,7 +109,7 @@ impl AcpiManager {
         let tables = self.tables().unwrap();
         let headers = tables.headers();
         for header in headers {
-            debug!("ACPI header: {:?}", header);
+            kdebug!("ACPI header: {:?}", header);
             let attr = AttrAcpiTable::new(&header)?;
             acpi_table_attr_list().write().push(attr);
             self.acpi_table_data_init(&header)?;
@@ -173,7 +172,7 @@ impl AttrAcpiTable {
         // 将当前实例的序号加1
         r.instance += 1;
         if r.instance > ACPI_MAX_TABLE_INSTANCES as isize {
-            warn!("too many table instances. name: {}", r.name);
+            kwarn!("too many table instances. name: {}", r.name);
             return Err(SystemError::ERANGE);
         }
 
@@ -290,9 +289,10 @@ impl BinAttribute for AttrAcpiTable {
             ($name: ident, $tables: expr) => {
                 define_struct!($name);
                 let table = $tables.find_entire_table::<$name>().map_err(|e| {
-                    warn!(
+                    kwarn!(
                         "AttrAcpiTable::read(): failed to find table. name: {}, error: {:?}",
-                        self.name, e
+                        self.name,
+                        e
                     );
                     SystemError::ENODEV
                 })?;
@@ -500,7 +500,7 @@ impl BinAttribute for AttrAcpiTable {
             }
 
             _ => {
-                error!("AttrAcpiTable::read(): unknown table. name: {}", self.name);
+                kerror!("AttrAcpiTable::read(): unknown table. name: {}", self.name);
                 return Err(SystemError::ENODEV);
             }
         };

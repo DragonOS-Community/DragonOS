@@ -12,7 +12,7 @@ pub const ACPI_PM_MASK: u64 = 0xffffff;
 pub fn acpi_pm_read_early() -> u32 {
     use crate::driver::clocksource::acpi_pm::{acpi_pm_read_verified, PMTMR_IO_PORT};
     use core::sync::atomic::Ordering;
-    let port = PMTMR_IO_PORT.load(Ordering::SeqCst);
+    let port = unsafe { PMTMR_IO_PORT.load(Ordering::SeqCst) };
 
     // 如果端口为零直接返回
     if port == 0 {

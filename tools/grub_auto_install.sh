@@ -38,25 +38,14 @@ export OBJCOPY=objcopy
 if [ -d ${grub_dir_i386_efi}/bin ] && [ -d ${grub_dir_i386_legacy}/bin ] && [ -d ${grub_dir_x86_64_efi}/bin ] ; then
 	exit 0
 fi
-#仅支持Ubuntu/Debain, Arch, Centos/RHEL8/Fedora gentoo下的自动安装
-supported_package_manager="apt-get pacman dnf yum emerge"
+#仅支持Ubuntu/Debain, Arch, Centos/RHEL8/Fedora下的自动安装
+supported_package_manager="apt-get pacman dnf"
 packages=("make binutils bison gcc gettext flex bison automake autoconf wget gawk" \
-              "make binutils bison gcc gettext flex bison automake autoconf wget gawk" \
-	      "make binutils bison gcc gettext flex bison automake autoconf wget gawk" \
-	      "make binutils bison gcc gettext flex bison automake autoconf wget gawk" \
-	      "dev-build/make sys-devel/binutils sys-devel/bison sys-devel/gcc sys-devel/gettext sys-devel/flex dev-build/automake dev-build/autoconf net-misc/wget sys-apps/gawk")
+          "make binutils bison gcc gettext flex bison automake autoconf wget gawk")
 update_options=("update" \
-                    "-Sy" \
-		    "update" \
-		    "update" \
-		    "--sync"
-	       )
+                "-Sy")
 install_options=("install -y" \
-                     "-S --needed --noconfirm" \
-		     "install -y" \
-		     "install -y" \
-		     ""
-		)
+                 "-S --needed --noconfirm")
 found_pm=0
 pm_index=0
 for pm in ${supported_package_manager}; do

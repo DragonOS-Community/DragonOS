@@ -14,7 +14,7 @@
     "build_command": "make install"
   },
   "install": {
-    "in_dragonos_path": "/"
+    "in_dragonos_path": "/bin"
   },
   "clean": {
     "clean_command": "make clean"

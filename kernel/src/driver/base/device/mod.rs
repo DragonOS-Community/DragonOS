@@ -3,7 +3,6 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use intertrait::cast::CastArc;
-use log::{error, warn};
 
 use crate::{
     driver::{
@@ -76,7 +75,7 @@ static mut DEVICES_VIRTUAL_KSET_INSTANCE: Option<Arc<KSet>> = None;
 
 /// 获取`/sys/devices`的kset实例
 #[inline(always)]
-pub fn sys_devices_kset() -> Arc<KSet> {
+pub(super) fn sys_devices_kset() -> Arc<KSet> {
     unsafe { DEVICES_KSET_INSTANCE.as_ref().unwrap().clone() }
 }
 
@@ -140,7 +139,7 @@ pub trait Device: KObject {
     /// 设备释放时的回调函数
     fn release(&self) {
         let name = self.name();
-        warn!(
+        kwarn!(
             "device {} does not have a release() function, it is broken and must be fixed.",
             name
         );
@@ -288,7 +287,6 @@ pub enum DeviceType {
     Intc,
     PlatformDev,
     Char,
-    Pci,
 }
 
 /// @brief: 设备标识符类型
@@ -483,7 +481,7 @@ impl DeviceManager {
 
         let actual_parent = self.get_device_parent(&device, current_parent)?;
         if let Some(actual_parent) = actual_parent {
-            // debug!(
+            // kdebug!(
             //     "device '{}' parent is '{}', strong_count: {}",
             //     device.name().to_string(),
             //     actual_parent.name(),
@@ -493,7 +491,7 @@ impl DeviceManager {
         }
 
         KObjectManager::add_kobj(device.clone() as Arc<dyn KObject>, None).map_err(|e| {
-            error!("add device '{:?}' failed: {:?}", device.name(), e);
+            kerror!("add device '{:?}' failed: {:?}", device.name(), e);
             e
         })?;
 
@@ -553,10 +551,10 @@ impl DeviceManager {
         device: &Arc<dyn Device>,
         current_parent: Option<Arc<dyn Device>>,
     ) -> Result<Option<Arc<dyn KObject>>, SystemError> {
-        // debug!("get_device_parent() device:{:?}", device.name());
+        // kdebug!("get_device_parent() device:{:?}", device.name());
         if device.class().is_some() {
             let parent_kobj: Arc<dyn KObject>;
-            // debug!("current_parent:{:?}", current_parent);
+            // kdebug!("current_parent:{:?}", current_parent);
             if let Some(cp) = current_parent {
                 if cp.class().is_some() {
                     return Ok(Some(cp.clone() as Arc<dyn KObject>));
@@ -646,16 +644,18 @@ impl DeviceManager {
             let parent_kobj = parent.clone() as Arc<dyn KObject>;
             sysfs_instance()
                 .create_link(Some(&dev_kobj), &parent_kobj, "device".to_string())
-                .inspect_err(|_e| {
+                .map_err(|e| {
                     err_remove_subsystem(&dev_kobj);
+                    e
                 })?;
         }
 
         sysfs_instance()
             .create_link(Some(&subsys_kobj), &dev_kobj, dev.name())
-            .inspect_err(|_e| {
+            .map_err(|e| {
                 err_remove_device(&dev_kobj);
                 err_remove_subsystem(&dev_kobj);
+                e
             })?;
 
         return Ok(());
@@ -693,16 +693,18 @@ impl DeviceManager {
         // 添加kobj_type的属性文件
         if let Some(kobj_type) = dev.kobj_type() {
             self.add_groups(dev, kobj_type.attribute_groups().unwrap_or(&[]))
-                .inspect_err(|_e| {
+                .map_err(|e| {
                     err_remove_class_groups(dev);
+                    e
                 })?;
         }
 
         // 添加设备本身的属性文件
         self.add_groups(dev, dev.attribute_groups().unwrap_or(&[]))
-            .inspect_err(|_e| {
+            .map_err(|e| {
                 err_remove_kobj_type_groups(dev);
                 err_remove_class_groups(dev);
+                e
             })?;
 
         return Ok(());
@@ -753,7 +755,7 @@ impl DeviceManager {
             attr.mode().contains(ModeType::S_IRUGO)
                 && (!attr.support().contains(SysFSOpsSupport::ATTR_SHOW)),
         ) {
-            warn!(
+            kwarn!(
                 "Attribute '{}': read permission without 'show'",
                 attr.name()
             );
@@ -762,7 +764,7 @@ impl DeviceManager {
             attr.mode().contains(ModeType::S_IWUGO)
                 && (!attr.support().contains(SysFSOpsSupport::ATTR_STORE)),
         ) {
-            warn!(
+            kwarn!(
                 "Attribute '{}': write permission without 'store'",
                 attr.name()
             );
@@ -804,7 +806,7 @@ impl DeviceManager {
 
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c?fi=device_links_force_bind#1226
     pub fn device_links_force_bind(&self, _dev: &Arc<dyn Device>) {
-        warn!("device_links_force_bind not implemented");
+        kwarn!("device_links_force_bind not implemented");
     }
 
     /// 把device对象的一些结构进行默认初始化
@@ -869,7 +871,7 @@ impl Attribute for DeviceAttrDev {
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
         let dev = kobj.cast::<dyn Device>().map_err(|kobj| {
-            error!(
+            kerror!(
                 "Intertrait casting not implemented for kobj: {}",
                 kobj.name()
             );

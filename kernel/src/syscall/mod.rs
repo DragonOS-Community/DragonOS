@@ -20,7 +20,6 @@ use crate::{
     syscall::user_access::check_and_clone_cstr,
 };
 
-use log::{info, warn};
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 
@@ -29,9 +28,10 @@ use crate::{
     filesystem::vfs::{
         fcntl::{AtFlags, FcntlCommand},
         file::FileMode,
-        syscall::{ModeType, PosixKstat, UtimensFlags},
+        syscall::{ModeType, PosixKstat},
         MAX_PATHLEN,
     },
+    kinfo,
     libs::align::page_align_up,
     mm::{verify_area, MemoryManagementArch, VirtAddr},
     net::syscall::SockAddr,
@@ -69,9 +69,9 @@ impl Syscall {
         if prev {
             panic!("Cannot initialize syscall more than once!");
         }
-        info!("Initializing syscall...");
+        kinfo!("Initializing syscall...");
         let r = crate::arch::syscall::arch_syscall_init();
-        info!("Syscall init successfully!");
+        kinfo!("Syscall init successfully!");
 
         return r;
     }
@@ -369,7 +369,7 @@ impl Syscall {
             SYS_KILL => {
                 let pid = Pid::new(args[0]);
                 let sig = args[1] as c_int;
-                // debug!("KILL SYSCALL RECEIVED");
+                // kdebug!("KILL SYSCALL RECEIVED");
                 Self::kill(pid, sig)
             }
 
@@ -383,7 +383,7 @@ impl Syscall {
             SYS_GETPID => Self::getpid().map(|pid| pid.into()),
 
             SYS_SCHED => {
-                warn!("syscall sched");
+                kwarn!("syscall sched");
                 schedule(SchedMode::SM_NONE);
                 Ok(0)
             }
@@ -650,7 +650,7 @@ impl Syscall {
                     Err(SystemError::EINVAL)
                 };
 
-                // debug!("FCNTL: fd: {}, cmd: {:?}, arg: {}, res: {:?}", fd, cmd, arg, res);
+                // kdebug!("FCNTL: fd: {}, cmd: {:?}, arg: {}, res: {:?}", fd, cmd, arg, res);
                 res
             }
 
@@ -658,7 +658,7 @@ impl Syscall {
                 let fd = args[0] as i32;
                 let len = args[1];
                 let res = Self::ftruncate(fd, len);
-                // debug!("FTRUNCATE: fd: {}, len: {}, res: {:?}", fd, len, res);
+                // kdebug!("FTRUNCATE: fd: {}, len: {}, res: {:?}", fd, len, res);
                 res
             }
 
@@ -835,35 +835,33 @@ impl Syscall {
 
             #[cfg(target_arch = "x86_64")]
             SYS_POLL => {
-                warn!("SYS_POLL has not yet been implemented");
+                kwarn!("SYS_POLL has not yet been implemented");
                 Ok(0)
             }
 
             SYS_SETPGID => {
-                warn!("SYS_SETPGID has not yet been implemented");
+                kwarn!("SYS_SETPGID has not yet been implemented");
                 Ok(0)
             }
 
             SYS_RT_SIGPROCMASK => {
-                warn!("SYS_RT_SIGPROCMASK has not yet been implemented");
+                kwarn!("SYS_RT_SIGPROCMASK has not yet been implemented");
                 Ok(0)
             }
 
             SYS_TKILL => {
-                warn!("SYS_TKILL has not yet been implemented");
+                kwarn!("SYS_TKILL has not yet been implemented");
                 Ok(0)
             }
 
             SYS_SIGALTSTACK => {
-                warn!("SYS_SIGALTSTACK has not yet been implemented");
+                kwarn!("SYS_SIGALTSTACK has not yet been implemented");
                 Ok(0)
             }
 
             SYS_EXIT_GROUP => {
-                let exit_code = args[0];
-                Self::exit(exit_code)
-                // warn!("SYS_EXIT_GROUP has not yet been implemented");
-                // Ok(0)
+                kwarn!("SYS_EXIT_GROUP has not yet been implemented");
+                Ok(0)
             }
 
             SYS_MADVISE => {
@@ -877,6 +875,7 @@ impl Syscall {
             }
 
             SYS_GETTID => Self::gettid().map(|tid| tid.into()),
+            SYS_GETUID => Self::getuid(),
 
             SYS_SYSLOG => {
                 let syslog_action_type = args[0];
@@ -890,29 +889,27 @@ impl Syscall {
                 Self::do_syslog(syslog_action_type, user_buf, len)
             }
 
-            SYS_GETUID => Self::getuid(),
             SYS_GETGID => Self::getgid(),
-            SYS_SETUID => Self::setuid(args[0]),
-            SYS_SETGID => Self::setgid(args[0]),
-
-            SYS_GETEUID => Self::geteuid(),
-            SYS_GETEGID => Self::getegid(),
-            SYS_SETRESUID => Self::seteuid(args[1]),
-            SYS_SETRESGID => Self::setegid(args[1]),
-
-            SYS_SETFSUID => Self::setfsuid(args[0]),
-            SYS_SETFSGID => Self::setfsgid(args[0]),
-
-            SYS_SETSID => {
-                warn!("SYS_SETSID has not yet been implemented");
+            SYS_SETUID => {
+                kwarn!("SYS_SETUID has not yet been implemented");
                 Ok(0)
             }
-
+            SYS_SETGID => {
+                kwarn!("SYS_SETGID has not yet been implemented");
+                Ok(0)
+            }
+            SYS_SETSID => {
+                kwarn!("SYS_SETSID has not yet been implemented");
+                Ok(0)
+            }
+            SYS_GETEUID => Self::geteuid(),
+            SYS_GETEGID => Self::getegid(),
             SYS_GETRUSAGE => {
                 let who = args[0] as c_int;
                 let rusage = args[1] as *mut RUsage;
                 Self::get_rusage(who, rusage)
             }
+
             #[cfg(target_arch = "x86_64")]
             SYS_READLINK => {
                 let path = args[0] as *const u8;
@@ -978,17 +975,17 @@ impl Syscall {
             }
 
             SYS_FCHOWN => {
-                warn!("SYS_FCHOWN has not yet been implemented");
+                kwarn!("SYS_FCHOWN has not yet been implemented");
                 Ok(0)
             }
 
             SYS_FSYNC => {
-                warn!("SYS_FSYNC has not yet been implemented");
+                kwarn!("SYS_FSYNC has not yet been implemented");
                 Ok(0)
             }
 
             SYS_RSEQ => {
-                warn!("SYS_RSEQ has not yet been implemented");
+                kwarn!("SYS_RSEQ has not yet been implemented");
                 Ok(0)
             }
 
@@ -1106,40 +1103,7 @@ impl Syscall {
 
                 Self::shmctl(id, cmd, user_buf, from_user)
             }
-            SYS_MSYNC => {
-                let start = page_align_up(args[0]);
-                let len = page_align_up(args[1]);
-                let flags = args[2];
-                Self::msync(VirtAddr::new(start), len, flags)
-            }
-            SYS_UTIMENSAT => Self::sys_utimensat(
-                args[0] as i32,
-                args[1] as *const u8,
-                args[2] as *const PosixTimeSpec,
-                args[3] as u32,
-            ),
-            #[cfg(target_arch = "x86_64")]
-            SYS_FUTIMESAT => {
-                let flags = UtimensFlags::empty();
-                Self::sys_utimensat(
-                    args[0] as i32,
-                    args[1] as *const u8,
-                    args[2] as *const PosixTimeSpec,
-                    flags.bits(),
-                )
-            }
-            #[cfg(target_arch = "x86_64")]
-            SYS_UTIMES => Self::sys_utimes(args[0] as *const u8, args[1] as *const PosixTimeval),
-            #[cfg(target_arch = "x86_64")]
-            SYS_EVENTFD => {
-                let initval = args[0] as u32;
-                Self::sys_eventfd(initval, 0)
-            }
-            SYS_EVENTFD2 => {
-                let initval = args[0] as u32;
-                let flags = args[1] as u32;
-                Self::sys_eventfd(initval, flags)
-            }
+
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 
@@ -1159,9 +1123,7 @@ impl Syscall {
         back_color: u32,
     ) -> Result<usize, SystemError> {
         // todo: 删除这个系统调用
-        let s = check_and_clone_cstr(s, Some(4096))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
+        let s = check_and_clone_cstr(s, Some(4096))?;
         let fr = (front_color & 0x00ff0000) >> 16;
         let fg = (front_color & 0x0000ff00) >> 8;
         let fb = front_color & 0x000000ff;

@@ -1,6 +1,6 @@
 [package]
 name = "dragonos_kernel"
-version = "0.1.10"
+version = "0.1.9"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -12,17 +12,15 @@ crate-type = ["staticlib"]
 [workspace]
 members = [ 
     "crates/*",
+    "src/libs/intertrait"
 ]
 
 [features]
-default = ["backtrace", "kvm", "fatfs", "fatfs-secure"]
+default = ["backtrace", "kvm"]
 # 内核栈回溯
 backtrace = []
 # kvm
 kvm = []
-
-fatfs = []
-fatfs-secure = ["fatfs"]
 
 
 # 运行时依赖项
@@ -37,28 +35,26 @@ bitmap = { path = "crates/bitmap" }
 driver_base_macros = { "path" = "crates/driver_base_macros" }
 # 一个no_std的hashmap、hashset
 elf = { version = "=0.7.2", default-features = false }
-fdt = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/fdt", rev = "9862813020" }
 hashbrown = "=0.13.2"
 ida = { path = "src/libs/ida" }
-intertrait = { path = "crates/intertrait" }
+intertrait = { path = "src/libs/intertrait" }
 kdepends = { path = "crates/kdepends" }
 klog_types = { path = "crates/klog_types" }
-linkme = "=0.3.27"
+linkme = "=0.2"
 num = { version = "=0.4.0", default-features = false }
 num-derive = "=0.3"
 num-traits = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/num-traits.git", rev="1597c1c", default-features = false }
 smoltcp = { version = "=0.11.0", default-features = false, features = ["log", "alloc",  "socket-raw", "socket-udp", "socket-tcp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-ipv4", "proto-ipv6"]}
 system_error = { path = "crates/system_error" }
-uefi = { version = "=0.26.0", features = ["alloc"] }
-uefi-raw = "=0.5.0"
 unified-init = { path = "crates/unified-init" }
 virtio-drivers = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers", rev = "f91c807965" }
-wait_queue_macros = { path = "crates/wait_queue_macros" }
+fdt = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/fdt", rev = "9862813020" }
+uefi = { version = "=0.26.0", features = ["alloc"] }
+uefi-raw = "=0.5.0"
 paste = "=1.0.14"
 slabmalloc = { path = "crates/rust-slabmalloc" }
 log = "0.4.21"
-xarray = "0.1.0"
-lru = "0.12.3"
+
 
 # target为x86_64时，使用下面的依赖
 [target.'cfg(target_arch = "x86_64")'.dependencies]
@@ -89,4 +85,4 @@ debug = true   # Controls whether the compiler passes `-g`
 
 # The release profile, used for `cargo build --release`
 [profile.release]
-debug = true
+debug = false

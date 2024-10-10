@@ -124,7 +124,6 @@ impl MsiDesc {
     }
 }
 
-#[allow(dead_code)]
 pub trait MsiDescFunc: Debug + Send + Sync {
     /// Callback that may be called when the MSI message
     /// address or data changes.

@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 use core::fmt::Debug;
 
-use crate::libs::{rwlock::RwLock, spinlock::SpinLock};
+use crate::{
+    kwarn,
+    libs::{rwlock::RwLock, spinlock::SpinLock},
+};
 use alloc::{sync::Arc, vec::Vec};
-use log::warn;
 use system_error::SystemError;
 
 /// @brief 通知链节点
@@ -37,7 +39,7 @@ impl<V: Clone + Copy, T> NotifierChain<V, T> {
         for b in self.0.iter() {
             // 判断之前是否已经注册过该节点
             if Arc::ptr_eq(&block, b) {
-                warn!(
+                kwarn!(
                     "notifier callback {:?} already registered",
                     Arc::as_ptr(&block)
                 );

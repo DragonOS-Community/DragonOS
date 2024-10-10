@@ -4,18 +4,18 @@ use core::intrinsics::unlikely;
 
 use alloc::vec::Vec;
 use hashbrown::HashMap;
-use log::error;
 use system_error::SystemError;
 
 use crate::{
     include::bindings::bindings::{gfp_t, PAGE_U_S},
+    kerror,
     libs::{align::page_align_up, spinlock::SpinLock},
     mm::MMArch,
 };
 
 use super::{
     allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper, mmio_buddy::mmio_pool,
-    no_init::pseudo_map_phys, page::EntryFlags, MemoryManagementArch, PhysAddr, VirtAddr,
+    no_init::pseudo_map_phys, page::PageFlags, MemoryManagementArch, PhysAddr, VirtAddr,
 };
 
 lazy_static! {
@@ -38,9 +38,9 @@ pub unsafe extern "C" fn rs_map_phys(vaddr: usize, paddr: usize, size: usize, fl
     let mut vaddr = VirtAddr::new(vaddr);
     let mut paddr = PhysAddr::new(paddr);
     let count = PageFrameCount::new(page_align_up(size) / MMArch::PAGE_SIZE);
-    // debug!("rs_map_phys: vaddr: {vaddr:?}, paddr: {paddr:?}, count: {count:?}, flags: {flags:?}");
+    // kdebug!("rs_map_phys: vaddr: {vaddr:?}, paddr: {paddr:?}, count: {count:?}, flags: {flags:?}");
 
-    let mut page_flags: EntryFlags<MMArch> = EntryFlags::new().set_execute(true).set_write(true);
+    let mut page_flags: PageFlags<MMArch> = PageFlags::new().set_execute(true).set_write(true);
     if flags & PAGE_U_S as usize != 0 {
         page_flags = page_flags.set_user(true);
     }
@@ -64,13 +64,13 @@ pub unsafe extern "C" fn rs_map_phys(vaddr: usize, paddr: usize, size: usize, fl
 
 #[no_mangle]
 pub unsafe extern "C" fn kzalloc(size: usize, _gfp: gfp_t) -> usize {
-    // debug!("kzalloc: size: {size}");
+    // kdebug!("kzalloc: size: {size}");
     return do_kmalloc(size, true);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn kmalloc(size: usize, _gfp: gfp_t) -> usize {
-    // debug!("kmalloc: size: {size}");
+    // kdebug!("kmalloc: size: {size}");
     // 由于C代码不规范，因此都全部清空
     return do_kmalloc(size, true);
 }
@@ -109,7 +109,7 @@ pub unsafe extern "C" fn kfree(vaddr: usize) -> usize {
     drop(guard);
 
     if p.is_none() {
-        error!("kfree: vaddr {:?} not found in C Allocation Map", vaddr);
+        kerror!("kfree: vaddr {:?} not found in C Allocation Map", vaddr);
         return SystemError::EINVAL.to_posix_errno() as i64 as usize;
     }
     let (vaddr, len, cap) = p.unwrap();
@@ -135,7 +135,7 @@ unsafe extern "C" fn rs_mmio_create(
     res_vaddr: *mut u64,
     res_length: *mut u64,
 ) -> i32 {
-    // debug!("mmio_create");
+    // kdebug!("mmio_create");
     let r = mmio_pool().create_mmio(size as usize);
     if let Err(e) = r {
         return e.to_posix_errno();

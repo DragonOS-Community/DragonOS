@@ -5,7 +5,6 @@ use crate::{
 };
 use alloc::vec::Vec;
 use core::cmp;
-use log::warn;
 use system_error::SystemError;
 
 use super::{user_access::UserBufferWriter, Syscall};
@@ -60,7 +59,7 @@ impl Syscall {
     }
 
     pub fn umask(_mask: u32) -> Result<usize, SystemError> {
-        warn!("SYS_UMASK has not yet been implemented\n");
+        kwarn!("SYS_UMASK has not yet been implemented\n");
         return Ok(0o777);
     }
 

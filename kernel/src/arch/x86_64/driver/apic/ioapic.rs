@@ -4,7 +4,6 @@ use acpi::madt::Madt;
 use alloc::sync::Arc;
 use bit_field::BitField;
 use bitflags::bitflags;
-use log::{debug, info};
 use system_error::SystemError;
 
 use crate::{
@@ -17,6 +16,7 @@ use crate::{
         manage::irq_manager,
         IrqNumber,
     },
+    kdebug, kinfo,
     libs::{
         cpumask::CpuMask,
         once::Once,
@@ -68,7 +68,7 @@ impl IoApic {
 
         let mut result: Option<IoApic> = None;
         INIT_STATE.call_once(|| {
-            info!("Initializing ioapic...");
+            kinfo!("Initializing ioapic...");
 
             // get ioapic base from acpi
 
@@ -104,7 +104,7 @@ impl IoApic {
                 mmio_guard.map_phys(phys_base, 0x1000).is_ok(),
                 "IoApic::new(): failed to map phys"
             );
-            debug!("Ioapic map ok");
+            kdebug!("Ioapic map ok");
             let reg = mmio_guard.vaddr();
 
             result = Some(IoApic {
@@ -114,13 +114,13 @@ impl IoApic {
                 phys_base,
                 mmio_guard,
             });
-            debug!("IOAPIC: to mask all RTE");
+            kdebug!("IOAPIC: to mask all RTE");
             // 屏蔽所有的RTE
             let res_mut = result.as_mut().unwrap();
             for i in 0..res_mut.supported_interrupts() {
                 res_mut.write_rte(i, 0x20 + i, RedirectionEntry::DISABLED, 0);
             }
-            debug!("Ioapic init done");
+            kdebug!("Ioapic init done");
         });
 
         assert!(
@@ -393,7 +393,7 @@ impl InnerIoApicChipData {
 
 #[inline(never)]
 pub fn ioapic_init(ignore: &'static [IrqNumber]) {
-    info!("Initializing ioapic...");
+    kinfo!("Initializing ioapic...");
     let ioapic = unsafe { IoApic::new() };
     unsafe {
         __IOAPIC = Some(SpinLock::new(ioapic));
@@ -424,7 +424,7 @@ pub fn ioapic_init(ignore: &'static [IrqNumber]) {
         register_handler(&desc, level);
     }
 
-    info!("IO Apic initialized.");
+    kinfo!("IO Apic initialized.");
 }
 
 fn register_handler(desc: &Arc<IrqDesc>, level_triggered: bool) {

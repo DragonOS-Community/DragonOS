@@ -1,5 +1,4 @@
 use crate::driver::base::device::device_number::DeviceNumber;
-use crate::filesystem;
 use crate::filesystem::devfs::{DevFS, DeviceINode};
 use crate::filesystem::vfs::{
     core::generate_inode_id,
@@ -9,6 +8,7 @@ use crate::filesystem::vfs::{
 use crate::libs::spinlock::SpinLockGuard;
 use crate::process::ProcessManager;
 use crate::{arch::KVMArch, libs::spinlock::SpinLock, time::PosixTimeSpec};
+use crate::{filesystem, kdebug};
 // use crate::virt::kvm::{host_stack};
 use super::push_vm;
 use crate::virt::kvm::vm_dev::LockedVmInode;
@@ -17,7 +17,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use log::debug;
 use system_error::SystemError;
 
 pub const KVM_API_VERSION: u32 = 12;
@@ -95,7 +94,7 @@ impl IndexNode for LockedKvmInode {
         _data: SpinLockGuard<FilePrivateData>,
         _mode: &FileMode,
     ) -> Result<(), SystemError> {
-        debug!("file private data:{:?}", _data);
+        kdebug!("file private data:{:?}", _data);
         return Ok(());
     }
 
@@ -142,12 +141,12 @@ impl IndexNode for LockedKvmInode {
     ) -> Result<usize, SystemError> {
         match cmd {
             0xdeadbeef => {
-                debug!("kvm ioctl");
+                kdebug!("kvm ioctl");
                 Ok(0)
             }
             KVM_GET_API_VERSION => Ok(KVM_API_VERSION as usize),
             KVM_CREATE_VM => {
-                debug!("kvm KVM_CREATE_VM");
+                kdebug!("kvm KVM_CREATE_VM");
                 kvm_dev_ioctl_create_vm(data)
             }
             KVM_CHECK_EXTENSION

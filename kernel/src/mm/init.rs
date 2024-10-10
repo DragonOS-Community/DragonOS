@@ -1,18 +1,12 @@
 use core::{fmt::Write, sync::atomic::Ordering};
 
-use log::info;
-
 use crate::{
     arch::MMArch,
     driver::serial::serial8250::send_to_default_serial8250_port,
     filesystem::procfs::kmsg::kmsg_init,
     ipc::shm::shm_manager_init,
     libs::printk::PrintkWriter,
-    mm::{
-        allocator::slab::slab_init,
-        mmio_buddy::mmio_init,
-        page::{page_manager_init, page_reclaimer_init},
-    },
+    mm::{allocator::slab::slab_init, mmio_buddy::mmio_init, page::page_manager_init},
 };
 
 use super::MemoryManagementArch;
@@ -61,8 +55,6 @@ pub unsafe fn mm_init() {
     page_manager_init();
     // enable SHM_MANAGER
     shm_manager_init();
-    // enable PAGE_RECLAIMER
-    page_reclaimer_init();
 
     MM_INIT
         .compare_exchange(
@@ -73,7 +65,7 @@ pub unsafe fn mm_init() {
         )
         .unwrap();
     MMArch::arch_post_init();
-    info!("mm init done.");
+    kinfo!("mm init done.");
 }
 
 /// 获取内存管理的初始化状态

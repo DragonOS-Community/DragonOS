@@ -3,7 +3,6 @@ pub mod ahci_inode;
 pub mod ahcidisk;
 pub mod hba;
 
-use crate::arch::MMArch;
 use crate::driver::base::block::disk_info::BLK_GF_AHCI;
 use crate::driver::block::cache::cached_block_device::BlockCache;
 // 依赖的rust工具包
@@ -11,19 +10,21 @@ use crate::driver::pci::pci::{
     get_pci_device_structure_mut, PciDeviceStructure, PCI_DEVICE_LINKEDLIST,
 };
 use crate::filesystem::devfs::devfs_register;
-
-use crate::driver::disk::ahci::{
-    ahcidisk::LockedAhciDisk,
-    hba::HbaMem,
-    hba::{HbaPort, HbaPortType},
-};
+use crate::kerror;
 use crate::libs::rwlock::RwLockWriteGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
-use crate::mm::{MemoryManagementArch, VirtAddr};
+use crate::mm::virt_2_phys;
+use crate::{
+    driver::disk::ahci::{
+        ahcidisk::LockedAhciDisk,
+        hba::HbaMem,
+        hba::{HbaPort, HbaPortType},
+    },
+    kdebug,
+};
 use ahci_inode::LockedAhciInode;
 use alloc::{boxed::Box, collections::LinkedList, format, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::compiler_fence;
-use log::{debug, error};
 use system_error::SystemError;
 
 // 仅module内可见 全局数据区  hbr_port, disks
@@ -89,34 +90,22 @@ pub fn ahci_init() -> Result<(), SystemError> {
                 let tp = hba_mem_port.check_type();
                 match tp {
                     HbaPortType::None => {
-                        debug!("<ahci_rust_init> Find a None type Disk.");
+                        kdebug!("<ahci_rust_init> Find a None type Disk.");
                     }
                     HbaPortType::Unknown(err) => {
-                        debug!("<ahci_rust_init> Find a Unknown({:?}) type Disk.", err);
+                        kdebug!("<ahci_rust_init> Find a Unknown({:?}) type Disk.", err);
                     }
                     _ => {
-                        debug!("<ahci_rust_init> Find a {:?} type Disk.", tp);
+                        kdebug!("<ahci_rust_init> Find a {:?} type Disk.", tp);
 
                         // 计算地址
-                        let fb = unsafe {
-                            MMArch::virt_2_phys(VirtAddr::new(
-                                ahci_port_base_vaddr + (32 << 10) + (j << 8),
-                            ))
-                        }
-                        .unwrap()
-                        .data();
-                        let clb = unsafe {
-                            MMArch::virt_2_phys(VirtAddr::new(ahci_port_base_vaddr + (j << 10)))
-                                .unwrap()
-                                .data()
-                        };
+                        let fb = virt_2_phys(ahci_port_base_vaddr + (32 << 10) + (j << 8));
+                        let clb = virt_2_phys(ahci_port_base_vaddr + (j << 10));
                         let ctbas = (0..32)
-                            .map(|x| unsafe {
-                                MMArch::virt_2_phys(VirtAddr::new(
+                            .map(|x| {
+                                virt_2_phys(
                                     ahci_port_base_vaddr + (40 << 10) + (j << 13) + (x << 8),
-                                ))
-                                .unwrap()
-                                .data() as u64
+                                ) as u64
                             })
                             .collect::<Vec<_>>();
 
@@ -133,7 +122,7 @@ pub fn ahci_init() -> Result<(), SystemError> {
                         )?);
                         id += 1; // ID 从0开始
 
-                        debug!("start register ahci device");
+                        kdebug!("start register ahci device");
 
                         // 挂载到devfs上面去
                         let ret = devfs_register(
@@ -141,7 +130,7 @@ pub fn ahci_init() -> Result<(), SystemError> {
                             LockedAhciInode::new(disks_list.last().unwrap().clone()),
                         );
                         if let Err(err) = ret {
-                            error!(
+                            kerror!(
                                 "Ahci_{} ctrl = {}, port = {} failed to register, error code = {:?}",
                                 id,
                                 hba_mem_index as u8,

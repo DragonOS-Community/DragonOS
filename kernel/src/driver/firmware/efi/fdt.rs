@@ -3,7 +3,6 @@
 use core::fmt::Debug;
 
 use fdt::Fdt;
-use log::error;
 use system_error::SystemError;
 
 use crate::init::boot_params;
@@ -118,7 +117,7 @@ impl EFIManager {
             )
         }
         .map_err(|e| {
-            error!("failed to parse fdt, err={:?}", e);
+            kerror!("failed to parse fdt, err={:?}", e);
             SystemError::EINVAL
         })?;
 
@@ -146,7 +145,7 @@ impl EFIManager {
 
                 self.do_get_fdt_prop(prop_type, &prop, &mut ret)
                     .unwrap_or_else(|e| {
-                        error!("Failed to get fdt prop: {prop_type:?}, error: {e:?}");
+                        kerror!("Failed to get fdt prop: {prop_type:?}, error: {e:?}");
                     })
             }
         }

@@ -7,7 +7,8 @@ use crate::{
         irqdesc::{IrqHandler, IrqReturn},
         IrqNumber,
     },
-    net::net_core::poll_ifaces_try_lock_onetime,
+    // net::net_core::poll_ifaces_try_lock_onetime,
+    net::net_core::poll_ifaces,
 };
 
 /// 默认的网卡中断处理函数
@@ -21,7 +22,9 @@ impl IrqHandler for DefaultNetIrqHandler {
         _static_data: Option<&dyn IrqHandlerData>,
         _dynamic_data: Option<Arc<dyn IrqHandlerData>>,
     ) -> Result<IrqReturn, SystemError> {
-        poll_ifaces_try_lock_onetime().ok();
+        // poll_ifaces_try_lock_onetime().ok();
+        log::warn!("DefaultNetIrqHandler: poll_ifaces_try_lock_onetime -> poll_ifaces");
+        poll_ifaces();
         Ok(IrqReturn::Handled)
     }
 }

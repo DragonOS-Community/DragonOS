@@ -506,7 +506,7 @@ impl DeviceManager {
         }
         let kobject_parent = self.get_device_parent(&device, deivce_parent)?;
         if let Some(ref kobj) = kobject_parent {
-            log::debug!("kobject parent: {:?}", kobj.name());
+            log::info!("kobject parent: {:?}", kobj.name());
         }
         if let Some(kobject_parent) = kobject_parent {
             // debug!(
@@ -547,7 +547,7 @@ impl DeviceManager {
         }
 
         // todo: 发送uevent: KOBJ_ADD
-
+        // kobject_uevent();
         // probe drivers for a new device
         bus_probe_device(&device);
 

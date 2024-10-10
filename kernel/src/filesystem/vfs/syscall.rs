@@ -2,7 +2,7 @@ use core::ffi::c_void;
 use core::mem::size_of;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
-use log::warn;
+use log::{debug, warn};
 use system_error::SystemError;
 
 use crate::producefs;

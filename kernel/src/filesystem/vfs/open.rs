@@ -64,6 +64,64 @@ pub fn do_fchmodat(dirfd: i32, path: *const u8, _mode: ModeType) -> Result<usize
     return Ok(0);
 }
 
+pub fn do_fchownat(
+    dirfd: i32,
+    path: &str,
+    uid: usize,
+    gid: usize,
+    flag: u32,
+) -> Result<usize, SystemError> {
+    // 检查flag是否合法
+    if (flag & (!((AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH).bits() as u32))) != 0 {
+        return Err(SystemError::EINVAL);
+    }
+
+    let follow_symlink = flag & AtFlags::AT_SYMLINK_NOFOLLOW.bits() as u32 == 0;
+
+    let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
+
+    // 如果找不到文件，则返回错误码ENOENT
+    let inode = if follow_symlink {
+        inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)
+    } else {
+        inode.lookup(path.as_str())
+    };
+
+    if inode.is_err() {
+        let errno = inode.clone().unwrap_err();
+        // 文件不存在
+        if errno == SystemError::ENOENT {
+            return Err(SystemError::ENOENT);
+        }
+    }
+
+    let inode = inode.unwrap();
+
+    return chown_common(inode, uid, gid);
+}
+
+fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usize, SystemError> {
+    let mut meta = inode.metadata()?;
+    meta.uid = uid;
+    meta.gid = gid;
+    inode.set_metadata(&meta)?;
+
+    return Ok(0);
+}
+
+pub fn ksys_fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError> {
+    let fd_table = &ProcessManager::current_pcb().fd_table();
+    let fd_table = fd_table.read();
+
+    let inode = fd_table.get_file_by_fd(fd).unwrap().inode();
+
+    let result = chown_common(inode, uid, gid);
+
+    drop(fd_table);
+
+    result
+}
+
 pub(super) fn do_sys_open(
     dfd: i32,
     path: &str,

@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 
+use log::error;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -152,7 +153,7 @@ impl FrameBufferManager {
         device_manager().add_device(fb_device.clone() as Arc<dyn Device>)?;
         // 添加到devfs
         devfs_register(&fb_device.name(), fb_device.clone()).map_err(|e| {
-            kerror!(
+            error!(
                 "register fb device '{}' to devfs failed: {:?}",
                 fb_device.name(),
                 e

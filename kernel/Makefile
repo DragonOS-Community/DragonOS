@@ -25,9 +25,9 @@ clean:
 
 .PHONY: fmt
 fmt:
-	@cargo fmt --all $(FMT_CHECK)
+	RUSTFLAGS="$(RUSTFLAGS)" cargo fmt --all $(FMT_CHECK)
 ifeq ($(ARCH), x86_64)
-	@cargo clippy --all-features
+	RUSTFLAGS="$(RUSTFLAGS)" cargo clippy --all-features
 endif
 
 
@@ -36,12 +36,12 @@ check: ECHO
 # @echo "Checking kernel... ARCH=$(ARCH)"
 # @exit 1
 ifeq ($(ARCH), x86_64)
-	@cargo +nightly-2023-08-15 check --workspace $(CARGO_ZBUILD) --message-format=json --target ./src/$(TARGET_JSON)
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-07-23 check --workspace $(CARGO_ZBUILD) --message-format=json --target ./src/$(TARGET_JSON)
 else ifeq ($(ARCH), riscv64)
-	@cargo +nightly-2023-08-15 check --workspace $(CARGO_ZBUILD) --message-format=json --target $(TARGET_JSON)
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-07-23 check --workspace $(CARGO_ZBUILD) --message-format=json --target $(TARGET_JSON)
 endif
 
 test:
 # 测试内核库
-	@cargo +nightly-2023-08-15 test --workspace --exclude dragonos_kernel
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-07-23 test --workspace --exclude dragonos_kernel
 

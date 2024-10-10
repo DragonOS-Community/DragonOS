@@ -4,7 +4,7 @@ use core::{
 };
 
 use alloc::string::ToString;
-use log::{info, Log};
+use log::{info, Level, Log};
 
 use super::lib_ui::textui::{textui_putstr, FontColor};
 
@@ -31,49 +31,6 @@ macro_rules! println {
         $crate::print!("\n");
     };
     ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
-}
-
-#[macro_export]
-macro_rules! kdebug {
-    ($($arg:tt)*) => {
-        $crate::libs::printk::Logger.log(7,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ DEBUG ] ({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)))
-    }
-}
-
-#[macro_export]
-macro_rules! kinfo {
-    ($($arg:tt)*) => {
-        $crate::libs::printk::Logger.log(6,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("[ INFO ] ({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)))
-    }
-}
-
-#[macro_export]
-macro_rules! kwarn {
-    ($($arg:tt)*) => {
-        $crate::libs::printk::Logger.log(4,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("\x1B[1;33m[ WARN ] \x1B[0m"));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-    }
-}
-
-#[macro_export]
-macro_rules! kerror {
-    ($($arg:tt)*) => {
-        $crate::libs::printk::Logger.log(3,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("\x1B[41m[ ERROR ] \x1B[0m"));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-    }
-}
-
-#[macro_export]
-macro_rules! kBUG {
-    ($($arg:tt)*) => {
-        $crate::libs::printk::Logger.log(1,format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("\x1B[41m[ BUG ] \x1B[0m"));
-        $crate::libs::printk::PrintkWriter.__write_fmt(format_args!("({}:{})\t {}\n", file!(), line!(),format_args!($($arg)*)));
-    }
 }
 
 pub struct PrintkWriter;
@@ -133,10 +90,10 @@ impl Logger {
 
 /// 内核自定义日志器
 ///
-/// todo: 完善他的功能，并且逐步把kinfo等宏，迁移到这个logger上面来。
-struct CustomLogger;
+/// todo: https://github.com/DragonOS-Community/DragonOS/issues/762
+struct KernelLogger;
 
-impl Log for CustomLogger {
+impl Log for KernelLogger {
     fn enabled(&self, _metadata: &log::Metadata) -> bool {
         // 这里可以自定义日志过滤规则
         true
@@ -145,17 +102,8 @@ impl Log for CustomLogger {
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
             // todo: 接入kmsg
-
-            writeln!(
-                PrintkWriter,
-                "[ {} ] {} ({}:{}) {}",
-                record.level(),
-                record.target(),
-                record.file().unwrap_or(""),
-                record.line().unwrap_or(0),
-                record.args()
-            )
-            .unwrap();
+            Self::kernel_log(record);
+            Self::iodisplay(record)
         }
     }
 
@@ -164,8 +112,77 @@ impl Log for CustomLogger {
     }
 }
 
+impl KernelLogger {
+    fn iodisplay(record: &log::Record) {
+        match record.level() {
+            Level::Debug | Level::Info | Level::Trace => {
+                write!(PrintkWriter, "[ {} ] ", record.level(),)
+            }
+            Level::Error => {
+                write!(PrintkWriter, "\x1B[41m[ ERROR ] \x1B[0m",)
+            }
+            Level::Warn => {
+                write!(PrintkWriter, "\x1B[1;33m[ WARN ] \x1B[0m",)
+            }
+        }
+        .unwrap();
+        writeln!(
+            PrintkWriter,
+            "({}:{})\t {}",
+            record.file().unwrap_or(""),
+            record.line().unwrap_or(0),
+            record.args()
+        )
+        .unwrap();
+    }
+
+    fn kernel_log(record: &log::Record) {
+        match record.level() {
+            Level::Debug => Logger.log(
+                7,
+                format_args!(
+                    "({}:{})\t {}\n",
+                    record.file().unwrap_or(""),
+                    record.line().unwrap_or(0),
+                    record.args()
+                ),
+            ),
+            Level::Error => Logger.log(
+                3,
+                format_args!(
+                    "({}:{})\t {}\n",
+                    record.file().unwrap_or(""),
+                    record.line().unwrap_or(0),
+                    record.args()
+                ),
+            ),
+            Level::Info => Logger.log(
+                6,
+                format_args!(
+                    "({}:{})\t {}\n",
+                    record.file().unwrap_or(""),
+                    record.line().unwrap_or(0),
+                    record.args()
+                ),
+            ),
+            Level::Warn => Logger.log(
+                4,
+                format_args!(
+                    "({}:{})\t {}\n",
+                    record.file().unwrap_or(""),
+                    record.line().unwrap_or(0),
+                    record.args()
+                ),
+            ),
+            Level::Trace => {
+                todo!()
+            }
+        }
+    }
+}
+
 pub fn early_init_logging() {
-    log::set_logger(&CustomLogger).unwrap();
+    log::set_logger(&KernelLogger).unwrap();
     log::set_max_level(log::LevelFilter::Debug);
     info!("Logging initialized");
 }

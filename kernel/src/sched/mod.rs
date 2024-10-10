@@ -111,7 +111,9 @@ pub trait Scheduler {
         flags: WakeupFlags,
     );
 
+    #[allow(dead_code)]
     /// ## 选择接下来最适合运行的任务
+    #[allow(dead_code)]
     fn pick_task(rq: &mut CpuRunQueue) -> Option<Arc<ProcessControlBlock>>;
 
     /// ## 选择接下来最适合运行的任务
@@ -272,6 +274,7 @@ pub trait SchedArch {
     /// 开启当前核心的调度
     fn enable_sched_local();
     /// 关闭当前核心的调度
+    #[allow(dead_code)]
     fn disable_sched_local();
 
     /// 在第一次开启调度之前，进行初始化工作。
@@ -363,14 +366,22 @@ impl CpuRunQueue {
         {
             // 在本cpu已上锁则可以直接拿
             (
-                unsafe { &mut *(self as *const Self as usize as *mut Self) },
+                unsafe {
+                    (self as *const Self as usize as *mut Self)
+                        .as_mut()
+                        .unwrap()
+                },
                 None,
             )
         } else {
             // 否则先上锁再拿
             let guard = self.lock();
             (
-                unsafe { &mut *(self as *const Self as usize as *mut Self) },
+                unsafe {
+                    (self as *const Self as usize as *mut Self)
+                        .as_mut()
+                        .unwrap()
+                },
                 Some(guard),
             )
         }
@@ -510,7 +521,7 @@ impl CpuRunQueue {
 
         let delta = clock - self.clock;
         self.clock += delta;
-        // kerror!("clock {}", self.clock);
+        // error!("clock {}", self.clock);
         self.update_rq_clock_task(delta);
     }
 
@@ -518,7 +529,7 @@ impl CpuRunQueue {
     pub fn update_rq_clock_task(&mut self, mut delta: u64) {
         let mut irq_delta = irq_time_read(self.cpu) - self.prev_irq_time;
         // if self.cpu == 0 {
-        //     kerror!(
+        //     error!(
         //         "cpu 0 delta {delta} irq_delta {} irq_time_read(self.cpu) {} self.prev_irq_time {}",
         //         irq_delta,
         //         irq_time_read(self.cpu),
@@ -542,7 +553,7 @@ impl CpuRunQueue {
         self.clock_task += delta;
         compiler_fence(Ordering::SeqCst);
         // if self.cpu == 0 {
-        //     kerror!("cpu {} clock_task {}", self.cpu, self.clock_task);
+        //     error!("cpu {} clock_task {}", self.cpu, self.clock_task);
         // }
         // todo: pelt?
     }
@@ -656,7 +667,7 @@ impl CpuRunQueue {
             if let Some(pcb) = p.as_ref() {
                 return pcb.clone();
             } else {
-                // kerror!(
+                // error!(
                 //     "pick idle cfs rq {:?}",
                 //     self.cfs_rq()
                 //         .entities
@@ -849,7 +860,7 @@ pub fn __schedule(sched_mod: SchedMode) {
     //         .map(|x| { x.1.vruntime })
     //         .collect::<Vec<_>>(),
     // );
-    // kwarn!(
+    // warn!(
     //     "before cfs rq {:?} prev {:?}",
     //     rq.cfs
     //         .entities
@@ -859,12 +870,12 @@ pub fn __schedule(sched_mod: SchedMode) {
     //     prev.pid()
     // );
 
-    // kerror!("prev pid {:?} {:?}", prev.pid(), prev.sched_info().policy());
+    // error!("prev pid {:?} {:?}", prev.pid(), prev.sched_info().policy());
     if !sched_mod.contains(SchedMode::SM_MASK_PREEMPT)
         && prev.sched_info().policy() != SchedPolicy::IDLE
         && prev.sched_info().inner_lock_read_irqsave().is_mark_sleep()
     {
-        // kwarn!("deactivate_task prev {:?}", prev.pid());
+        // warn!("deactivate_task prev {:?}", prev.pid());
         // TODO: 这里需要处理信号
         // https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/sched/core.c?r=&mo=172979&fi=6578#6630
         rq.deactivate_task(
@@ -889,13 +900,13 @@ pub fn __schedule(sched_mod: SchedMode) {
     //         .collect::<Vec<_>>(),
     // );
 
-    // kerror!("next {:?}", next.pid());
+    // error!("next {:?}", next.pid());
 
     prev.flags().remove(ProcessFlags::NEED_SCHEDULE);
     fence(Ordering::SeqCst);
     if likely(!Arc::ptr_eq(&prev, &next)) {
         rq.set_current(Arc::downgrade(&next));
-        // kwarn!(
+        // warn!(
         //     "switch_process prev {:?} next {:?} sched_mode {sched_mod:?}",
         //     prev.pid(),
         //     next.pid()

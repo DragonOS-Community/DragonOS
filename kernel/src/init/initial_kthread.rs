@@ -2,14 +2,14 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use alloc::string::{String, ToString};
+use alloc::{ffi::CString, string::ToString};
+use log::{debug, error};
 use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, process::arch_switch_to_user},
     driver::{net::e1000e::e1000e::e1000e_init, virtio::virtio::virtio_probe},
     filesystem::vfs::core::mount_root_fs,
-    kdebug, kerror,
     net::net_core::net_init,
     process::{kthread::KernelThreadMechanism, stdio::stdio_init, ProcessFlags, ProcessManager},
     smp::smp_init,
@@ -35,16 +35,14 @@ fn kernel_init() -> Result<(), SystemError> {
 
     #[cfg(target_arch = "x86_64")]
     crate::driver::disk::ahci::ahci_init().expect("Failed to initialize AHCI");
-
     virtio_probe();
     mount_root_fs().expect("Failed to mount root fs");
-
     e1000e_init();
     net_init().unwrap_or_else(|err| {
-        kerror!("Failed to initialize network: {:?}", err);
+        error!("Failed to initialize network: {:?}", err);
     });
 
-    kdebug!("initial kernel thread done.");
+    debug!("initial kernel thread done.");
 
     return Ok(());
 }
@@ -88,25 +86,23 @@ fn switch_to_user() -> ! {
 }
 
 fn try_to_run_init_process(path: &str, trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    if let Err(e) = run_init_process(path.to_string(), trap_frame) {
+    if let Err(e) = run_init_process(path, trap_frame) {
         if e != SystemError::ENOENT {
-            kerror!(
+            error!(
                 "Failed to run init process: {path} exists but couldn't execute it (error {:?})",
                 e
             );
         }
         return Err(e);
     }
-
     Ok(())
 }
 
-fn run_init_process(path: String, trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    let argv = vec![path.clone()];
-    let envp = vec![String::from("PATH=/")];
+fn run_init_process(path: &str, trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    let argv = vec![CString::new(path).unwrap()];
+    let envp = vec![CString::new("PATH=/").unwrap()];
 
     compiler_fence(Ordering::SeqCst);
-    Syscall::do_execve(path, argv, envp, trap_frame)?;
-
+    Syscall::do_execve(path.to_string(), argv, envp, trap_frame)?;
     Ok(())
 }

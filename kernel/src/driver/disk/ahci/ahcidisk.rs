@@ -1,4 +1,5 @@
-use super::{_port, hba::HbaCmdTable, virt_2_phys};
+use super::{_port, hba::HbaCmdTable};
+use crate::arch::MMArch;
 use crate::driver::base::block::block_device::{BlockDevice, BlockId};
 use crate::driver::base::block::disk_info::Partition;
 use crate::driver::base::class::Class;
@@ -13,16 +14,14 @@ use crate::driver::disk::ahci::HBA_PxIS_TFES;
 use crate::filesystem::kernfs::KernFSInode;
 use crate::filesystem::mbr::MbrDiskPartionTable;
 
+use crate::driver::disk::ahci::hba::{
+    FisRegH2D, FisType, HbaCmdHeader, ATA_CMD_READ_DMA_EXT, ATA_CMD_WRITE_DMA_EXT, ATA_DEV_BUSY,
+    ATA_DEV_DRQ,
+};
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::spinlock::SpinLock;
-use crate::mm::{phys_2_virt, verify_area, VirtAddr};
-use crate::{
-    driver::disk::ahci::hba::{
-        FisRegH2D, FisType, HbaCmdHeader, ATA_CMD_READ_DMA_EXT, ATA_CMD_WRITE_DMA_EXT,
-        ATA_DEV_BUSY, ATA_DEV_DRQ,
-    },
-    kerror,
-};
+use crate::mm::{verify_area, MemoryManagementArch, PhysAddr, VirtAddr};
+use log::error;
 use system_error::SystemError;
 
 use alloc::sync::Weak;
@@ -70,7 +69,7 @@ impl AhciDisk {
         compiler_fence(Ordering::SeqCst);
         let check_length = ((count - 1) >> 4) + 1; // prdt length
         if count * 512 > buf.len() || check_length > 8_usize {
-            kerror!("ahci read: e2big");
+            error!("ahci read: e2big");
             // 不可能的操作
             return Err(SystemError::E2BIG);
         } else if count == 0 {
@@ -88,9 +87,11 @@ impl AhciDisk {
 
         #[allow(unused_unsafe)]
         let cmdheader: &mut HbaCmdHeader = unsafe {
-            (phys_2_virt(
+            (MMArch::phys_2_virt(PhysAddr::new(
                 volatile_read!(port.clb) as usize + slot as usize * size_of::<HbaCmdHeader>(),
-            ) as *mut HbaCmdHeader)
+            ))
+            .unwrap()
+            .data() as *mut HbaCmdHeader)
                 .as_mut()
                 .unwrap()
         };
@@ -120,7 +121,9 @@ impl AhciDisk {
 
         #[allow(unused_unsafe)]
         let cmdtbl = unsafe {
-            (phys_2_virt(volatile_read!(cmdheader.ctba) as usize) as *mut HbaCmdTable)
+            (MMArch::phys_2_virt(PhysAddr::new(volatile_read!(cmdheader.ctba) as usize))
+                .unwrap()
+                .data() as *mut HbaCmdTable)
                 .as_mut()
                 .unwrap() // 必须使用 as_mut ，得到的才是原来的变量
         };
@@ -130,11 +133,14 @@ impl AhciDisk {
             // 清空整个table的旧数据
             write_bytes(cmdtbl, 0, 1);
         }
-        // kdebug!("cmdheader.prdtl={}", volatile_read!(cmdheader.prdtl));
+        // debug!("cmdheader.prdtl={}", volatile_read!(cmdheader.prdtl));
 
         // 8K bytes (16 sectors) per PRDT
         for i in 0..((volatile_read!(cmdheader.prdtl) - 1) as usize) {
-            volatile_write!(cmdtbl.prdt_entry[i].dba, virt_2_phys(buf_ptr) as u64);
+            volatile_write!(
+                cmdtbl.prdt_entry[i].dba,
+                MMArch::virt_2_phys(VirtAddr::new(buf_ptr)).unwrap().data() as u64
+            );
             cmdtbl.prdt_entry[i].dbc = 8 * 1024 - 1;
             volatile_set_bit!(cmdtbl.prdt_entry[i].dbc, 1 << 31, true); // 允许中断 prdt_entry.i
             buf_ptr += 8 * 1024;
@@ -143,7 +149,10 @@ impl AhciDisk {
 
         // Last entry
         let las = (volatile_read!(cmdheader.prdtl) - 1) as usize;
-        volatile_write!(cmdtbl.prdt_entry[las].dba, virt_2_phys(buf_ptr) as u64);
+        volatile_write!(
+            cmdtbl.prdt_entry[las].dba,
+            MMArch::virt_2_phys(VirtAddr::new(buf_ptr)).unwrap().data() as u64
+        );
         cmdtbl.prdt_entry[las].dbc = ((tmp_count << 9) - 1) as u32; // 数据长度
 
         volatile_set_bit!(cmdtbl.prdt_entry[las].dbc, 1 << 31, true); // 允许中断
@@ -181,25 +190,24 @@ impl AhciDisk {
         }
 
         if spin_count == SPIN_LIMIT {
-            kerror!("Port is hung");
+            error!("Port is hung");
             return Err(SystemError::EIO);
         }
 
         volatile_set_bit!(port.ci, 1 << slot, true); // Issue command
-                                                     // kdebug!("To wait ahci read complete.");
+                                                     // debug!("To wait ahci read complete.");
                                                      // 等待操作完成
         loop {
             if (volatile_read!(port.ci) & (1 << slot)) == 0 {
                 break;
             }
             if (volatile_read!(port.is) & HBA_PxIS_TFES) > 0 {
-                kerror!("Read disk error");
+                error!("Read disk error");
                 return Err(SystemError::EIO);
             }
         }
-
-        if kbuf.is_some() {
-            buf.copy_from_slice(kbuf.as_ref().unwrap());
+        if let Some(kbuf) = &kbuf {
+            buf.copy_from_slice(kbuf);
         }
 
         compiler_fence(Ordering::SeqCst);
@@ -236,9 +244,11 @@ impl AhciDisk {
         compiler_fence(Ordering::SeqCst);
         #[allow(unused_unsafe)]
         let cmdheader: &mut HbaCmdHeader = unsafe {
-            (phys_2_virt(
+            (MMArch::phys_2_virt(PhysAddr::new(
                 volatile_read!(port.clb) as usize + slot as usize * size_of::<HbaCmdHeader>(),
-            ) as *mut HbaCmdHeader)
+            ))
+            .unwrap()
+            .data() as *mut HbaCmdHeader)
                 .as_mut()
                 .unwrap()
         };
@@ -275,7 +285,9 @@ impl AhciDisk {
 
         #[allow(unused_unsafe)]
         let cmdtbl = unsafe {
-            (phys_2_virt(volatile_read!(cmdheader.ctba) as usize) as *mut HbaCmdTable)
+            (MMArch::phys_2_virt(PhysAddr::new(volatile_read!(cmdheader.ctba) as usize))
+                .unwrap()
+                .data() as *mut HbaCmdTable)
                 .as_mut()
                 .unwrap()
         };
@@ -289,7 +301,10 @@ impl AhciDisk {
 
         // 8K bytes (16 sectors) per PRDT
         for i in 0..((volatile_read!(cmdheader.prdtl) - 1) as usize) {
-            volatile_write!(cmdtbl.prdt_entry[i].dba, virt_2_phys(buf_ptr) as u64);
+            volatile_write!(
+                cmdtbl.prdt_entry[i].dba,
+                MMArch::virt_2_phys(VirtAddr::new(buf_ptr)).unwrap().data() as u64
+            );
             volatile_write_bit!(cmdtbl.prdt_entry[i].dbc, (1 << 22) - 1, 8 * 1024 - 1); // 数据长度
             volatile_set_bit!(cmdtbl.prdt_entry[i].dbc, 1 << 31, true); // 允许中断
             buf_ptr += 8 * 1024;
@@ -298,7 +313,10 @@ impl AhciDisk {
 
         // Last entry
         let las = (volatile_read!(cmdheader.prdtl) - 1) as usize;
-        volatile_write!(cmdtbl.prdt_entry[las].dba, virt_2_phys(buf_ptr) as u64);
+        volatile_write!(
+            cmdtbl.prdt_entry[las].dba,
+            MMArch::virt_2_phys(VirtAddr::new(buf_ptr)).unwrap().data() as u64
+        );
         volatile_set_bit!(cmdtbl.prdt_entry[las].dbc, 1 << 31, true); // 允许中断
         volatile_write_bit!(
             cmdtbl.prdt_entry[las].dbc,
@@ -336,7 +354,7 @@ impl AhciDisk {
                 break;
             }
             if (volatile_read!(port.is) & HBA_PxIS_TFES) > 0 {
-                kerror!("Write disk error");
+                error!("Write disk error");
                 return Err(SystemError::EIO);
             }
         }

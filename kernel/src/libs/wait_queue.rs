@@ -2,11 +2,12 @@
 use core::intrinsics::unlikely;
 
 use alloc::{collections::LinkedList, sync::Arc, vec::Vec};
+use log::{error, warn};
+use system_error::SystemError;
 
 use crate::{
-    arch::CurrentIrqArch,
+    arch::{ipc::signal::Signal, CurrentIrqArch},
     exception::InterruptArch,
-    kerror,
     process::{ProcessControlBlock, ProcessManager, ProcessState},
     sched::{schedule, SchedMode},
 };
@@ -32,6 +33,34 @@ impl WaitQueue {
         WaitQueue(SpinLock::new(InnerWaitQueue::INIT))
     }
 
+    pub fn prepare_to_wait_event(&self, interruptible: bool) -> Result<(), SystemError> {
+        let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock_irqsave();
+        let pcb = ProcessManager::current_pcb();
+        if Signal::signal_pending_state(interruptible, false, &pcb) {
+            return Err(SystemError::ERESTARTSYS);
+        } else {
+            ProcessManager::mark_sleep(interruptible).unwrap_or_else(|e| {
+                panic!("sleep error: {:?}", e);
+            });
+            guard.wait_list.push_back(ProcessManager::current_pcb());
+            drop(guard);
+        }
+        Ok(())
+    }
+
+    pub fn finish_wait(&self) {
+        let pcb = ProcessManager::current_pcb();
+        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
+        let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock_irqsave();
+
+        writer.set_state(ProcessState::Runnable);
+        writer.set_wakeup();
+
+        guard.wait_list.retain(|x| !Arc::ptr_eq(x, &pcb));
+        drop(guard);
+        drop(writer);
+    }
+
     /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断
     pub fn sleep(&self) {
         before_sleep_check(0);
@@ -50,7 +79,7 @@ impl WaitQueue {
         F: FnOnce(),
     {
         before_sleep_check(0);
-        let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock();
+        let mut guard: SpinLockGuard<InnerWaitQueue> = self.0.lock_irqsave();
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::mark_sleep(true).unwrap_or_else(|e| {
             panic!("sleep error: {:?}", e);
@@ -237,7 +266,7 @@ impl WaitQueue {
 
             if wake {
                 ProcessManager::wakeup(&to_wakeup).unwrap_or_else(|e| {
-                    kerror!("wakeup pid: {:?} error: {:?}", to_wakeup.pid(), e);
+                    error!("wakeup pid: {:?} error: {:?}", to_wakeup.pid(), e);
                 });
                 continue;
             } else {
@@ -265,7 +294,7 @@ impl InnerWaitQueue {
 fn before_sleep_check(max_preempt: usize) {
     let pcb = ProcessManager::current_pcb();
     if unlikely(pcb.preempt_count() > max_preempt) {
-        kwarn!(
+        warn!(
             "Process {:?}: Try to sleep when preempt count is {}",
             pcb.pid().data(),
             pcb.preempt_count()

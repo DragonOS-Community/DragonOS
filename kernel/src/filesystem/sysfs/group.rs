@@ -1,6 +1,7 @@
 use core::intrinsics::unlikely;
 
 use alloc::{string::ToString, sync::Arc};
+use log::{error, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -10,7 +11,6 @@ use crate::{
         sysfs::{dir::SysKernDirPriv, sysfs_instance, SysFSKernPrivateData},
         vfs::{syscall::ModeType, IndexNode},
     },
-    kwarn,
     libs::casting::DowncastArc,
 };
 
@@ -38,7 +38,7 @@ impl SysFS {
                 continue;
             }
             if let Err(e) = self.do_create_group(kobj, group, update) {
-                kerror!(
+                error!(
                     "Failed to create group '{}', err={e:?}",
                     group.name().unwrap_or("")
                 );
@@ -136,9 +136,8 @@ impl SysFS {
         if let Some(name) = group.name() {
             parent_inode = inode
                 .find(name)
-                .map_err(|e| {
-                    kwarn!("sysfs group '{name}' not found for kobject {kobj:?}");
-                    e
+                .inspect_err(|_e| {
+                    warn!("sysfs group '{name}' not found for kobject {kobj:?}");
                 })?
                 .downcast_arc()
                 .unwrap();
@@ -189,7 +188,7 @@ impl SysFS {
             }
 
             if unlikely((mode.bits() & (!0o644)) != 0) {
-                kwarn!(
+                warn!(
                     "Attribute '{name}' has invalid mode 0{mode:o}",
                     name = attr.name(),
                     mode = mode
@@ -204,7 +203,7 @@ impl SysFS {
         }
 
         if let Err(e) = e {
-            kerror!(
+            error!(
                 "Failed to create sysfs files for group '{}', err={e:?}",
                 group.name().unwrap_or("")
             );

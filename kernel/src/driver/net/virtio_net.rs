@@ -10,6 +10,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::{debug, error};
 use smoltcp::{iface, phy, wire};
 use unified_init::macros::unified_init;
 use virtio_drivers::device::net::VirtIONet;
@@ -39,7 +40,6 @@ use crate::{
     exception::{irqdesc::IrqReturn, IrqNumber},
     filesystem::kernfs::KernFSInode,
     init::initcall::INITCALL_POSTCORE,
-    kerror,
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
@@ -357,12 +357,12 @@ impl phy::Device for VirtIONicDeviceInner {
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
-        // kdebug!("VirtioNet: transmit");
+        // debug!("VirtioNet: transmit");
         if self.inner.lock_irqsave().can_send() {
-            // kdebug!("VirtioNet: can send");
+            // debug!("VirtioNet: can send");
             return Some(VirtioNetToken::new(self.clone(), None));
         } else {
-            // kdebug!("VirtioNet: can not send");
+            // debug!("VirtioNet: can not send");
             return None;
         }
     }
@@ -418,14 +418,14 @@ pub fn virtio_net(transport: VirtIOTransport, dev_id: Arc<DeviceId>) {
         match VirtIONet::<HalImpl, VirtIOTransport, 2>::new(transport, 4096) {
             Ok(net) => net,
             Err(_) => {
-                kerror!("VirtIONet init failed");
+                error!("VirtIONet init failed");
                 return;
             }
         };
     let mac = wire::EthernetAddress::from_bytes(&driver_net.mac_address());
     let dev_inner = VirtIONicDeviceInner::new(driver_net);
     let iface = VirtioInterface::new(dev_inner, dev_id);
-    kdebug!("To add virtio net: {}, mac: {}", iface.device_name(), mac);
+    debug!("To add virtio net: {}, mac: {}", iface.device_name(), mac);
     virtio_device_manager()
         .device_add(iface.clone() as Arc<dyn VirtIODevice>)
         .expect("Add virtio net failed");
@@ -471,7 +471,7 @@ impl NetDevice for VirtioInterface {
         let mut guard = self.iface.lock();
         let poll_res = guard.poll(timestamp, self.device_inner.force_get_mut(), sockets);
         // todo: notify!!!
-        // kdebug!("Virtio Interface poll:{poll_res}");
+        // debug!("Virtio Interface poll:{poll_res}");
         if poll_res {
             return Ok(());
         }
@@ -596,7 +596,7 @@ impl VirtIODriver for VirtIONetDriver {
             .arc_any()
             .downcast::<VirtioInterface>()
             .map_err(|_| {
-                kerror!(
+                error!(
                 "VirtIONetDriver::probe() failed: device is not a VirtioInterface. Device: '{:?}'",
                 device.name()
             );

@@ -1,0 +1,27 @@
+{
+  "name": "test_lo",
+  "version": "0.1.0",
+  "description": "test for lo interface",
+  "rust_target": null,
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "apps/test_lo"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "envs": [],
+  "build_once": false,
+  "install_once": false,
+  "target_arch": ["x86_64"]
+}

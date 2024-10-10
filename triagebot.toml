@@ -72,7 +72,7 @@ trigger_files = ["kernel/src/arch/x86_64"]
 [autolabel."O-riscv64"]
 trigger_files = ["kernel/src/arch/riscv64"]
 
-[autolabel."T-driver"]
+[autolabel."A-driver"]
 trigger_files = [
     "kernel/src/driver",
     "kernel/src/arch/x86_64/driver",
@@ -116,29 +116,36 @@ users_on_vacation = []
 [assign.adhoc_groups]
 
 # 驱动程序
-driver = ["@fslongjin", "@YJwu2023", "@GnoCiYeH"]
+driver = ["@dragonos/main"]
+
+# SIG-MM
+sig-mm = ["@dragonos/mm"]
 
 # 虚拟化
-virtulization = ["@fslongjin", "@ZXXYy"]
+virtulization = ["@dragonos/virtualization"]
 
-filesystem = ["@fslongjin"]
+main = [ "@dragonos/main" ]
+network = [ "@dragonos/network" ]
 
 riscv64 = ["@fslongjin"]
 
 x86_64 = ["@fslongjin", "@GnoCiYeH", "@Chiichen"]
 
 # CI/CD
-infra-ci = ["@fslongjin", "@Chiichen"]
+infra = ["@dragonos/infra"]
 
-bootstrap = ["@fslongjin"]
 
 [assign.owners]
-"/.github/workflows" = ["infra-ci"]
-"/triagebot.toml" = ["infra-ci"]
-"/kernel/src/driver" = ["driver"]
-"/kernel/src/filesystem" = ["filesystem"]
+"/.github/workflows" = ["infra"]
+"/.github/actions" = ["infra"]
+"/triagebot.toml" = ["infra"]
+"/kernel/src/driver" = ["main"]
+"/kernel/src/filesystem" = ["main"]
+"/kernel/src/sched" = ["main"]
+"/kernel/src/process" = ["main"]
+"/kernel/src/net" = ["network"]
 "/kernel/src/virt" = ["virtulization"]
 "/kernel/src/arch/x86_64/kvm" = ["virtulization"]
 "/kernel/src/arch/x86_64" = ["x86_64"]
 "/kernel/src/arch/riscv64" = ["riscv64"]
-"/tools" = ["bootstrap"]
+"/tools" = ["infra"]

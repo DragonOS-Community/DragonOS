@@ -1,6 +1,7 @@
 use core::{alloc::Layout, ptr::NonNull, sync::atomic::AtomicBool};
 
 use alloc::boxed::Box;
+use log::debug;
 use slabmalloc::*;
 
 // 全局slab分配器
@@ -18,7 +19,7 @@ pub(crate) struct SlabAllocator {
 impl SlabAllocator {
     /// 创建slab分配器
     pub fn new() -> SlabAllocator {
-        kdebug!("trying to new a slab_allocator");
+        debug!("trying to new a slab_allocator");
         SlabAllocator {
             zone: ZoneAllocator::new(),
         }
@@ -62,7 +63,7 @@ impl SlabAllocator {
 
 /// 初始化slab分配器
 pub unsafe fn slab_init() {
-    kdebug!("trying to init a slab_allocator");
+    debug!("trying to init a slab_allocator");
     SLABALLOCATOR = Some(SlabAllocator::new());
     SLABINITSTATE = true.into();
 }

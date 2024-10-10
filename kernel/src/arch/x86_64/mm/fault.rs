@@ -4,6 +4,7 @@ use core::{
 };
 
 use alloc::sync::Arc;
+use log::error;
 use x86::{bits64::rflags::RFlags, controlregs::Cr4};
 
 use crate::{
@@ -13,7 +14,6 @@ use crate::{
         CurrentIrqArch, MMArch,
     },
     exception::InterruptArch,
-    kerror,
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
         ucontext::{AddressSpace, LockedVMA},
@@ -28,7 +28,7 @@ pub type PageMapper =
 
 impl X86_64MMArch {
     pub fn vma_access_error(vma: Arc<LockedVMA>, error_code: X86PfErrorCode) -> bool {
-        let vm_flags = *vma.lock().vm_flags();
+        let vm_flags = *vma.lock_irqsave().vm_flags();
         let foreign = false;
         if error_code.contains(X86PfErrorCode::X86_PF_PK) {
             return true;
@@ -74,27 +74,27 @@ impl X86_64MMArch {
         if let Some(entry) = mapper.get_entry(address, 0) {
             if entry.present() {
                 if !entry.flags().has_execute() {
-                    kerror!("kernel tried to execute NX-protected page - exploit attempt?");
+                    error!("kernel tried to execute NX-protected page - exploit attempt?");
                 } else if mapper.table().phys().data() & MMArch::ENTRY_FLAG_USER != 0
                     && unsafe { x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_SMEP) }
                 {
-                    kerror!("unable to execute userspace code (SMEP?)");
+                    error!("unable to execute userspace code (SMEP?)");
                 }
             }
         }
         if address.data() < X86_64MMArch::PAGE_SIZE && !regs.is_from_user() {
-            kerror!(
+            error!(
                 "BUG: kernel NULL pointer dereference, address: {:#x}",
                 address.data()
             );
         } else {
-            kerror!(
+            error!(
                 "BUG: unable to handle page fault for address: {:#x}",
                 address.data()
             );
         }
 
-        kerror!(
+        error!(
             "#PF: {} {} in {} mode\n",
             if error_code.contains(X86PfErrorCode::X86_PF_USER) {
                 "user"
@@ -114,7 +114,7 @@ impl X86_64MMArch {
                 "kernel"
             }
         );
-        kerror!(
+        error!(
             "#PF: error_code({:#04x}) - {}\n",
             error_code,
             if !error_code.contains(X86PfErrorCode::X86_PF_PROT) {
@@ -223,7 +223,7 @@ impl X86_64MMArch {
         }
 
         let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
-        let mut space_guard = current_address_space.write();
+        let mut space_guard = current_address_space.write_irqsave();
         let mut fault;
         loop {
             let vma = space_guard.mappings.find_nearest(address);
@@ -236,7 +236,7 @@ impl X86_64MMArch {
                     address.data(),
                 )
             });
-            let guard = vma.lock();
+            let guard = vma.lock_irqsave();
             let region = *guard.region();
             let vm_flags = *guard.vm_flags();
             drop(guard);
@@ -269,11 +269,9 @@ impl X86_64MMArch {
                 );
             }
             let mapper = &mut space_guard.user_mapper.utable;
+            let message = PageFaultMessage::new(vma.clone(), address, flags, mapper);
 
-            fault = PageFaultHandler::handle_mm_fault(
-                PageFaultMessage::new(vma.clone(), address, flags),
-                mapper,
-            );
+            fault = PageFaultHandler::handle_mm_fault(message);
 
             if fault.contains(VmFaultReason::VM_FAULT_COMPLETED) {
                 return;

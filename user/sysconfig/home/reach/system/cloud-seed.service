@@ -1,0 +1,31 @@
+[Unit]
+Description=cloud-seed
+Requires=network-online.target
+After=network-online.target
+
+# If cloud-seed fails, try again every 5 seconds for 30 seconds. If it still
+# fails, reboot the system. If your use of cloud-seed is not critical to system
+# operation, you may consider changing the FailureAction setting.
+StartLimitBurst=6
+StartLimitIntervalSec=5
+FailureAction=reboot
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+Restart=on-failure
+
+ExecStart=/usr/bin/cloud-seed
+Environment=RUST_LOG=debug
+StandardOutput=journal+console
+
+# You can set a more restrictive umask here to restrict the permissions that
+# cloud-seed can create files with.
+UMask=0000
+
+# cloud-seed can run as a non-root user. In this case, files can only be
+# written at paths that this user has permission to write to.
+# User=
+
+[Install]
+WantedBy=multi-user.target

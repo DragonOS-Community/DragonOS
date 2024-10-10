@@ -23,7 +23,7 @@ use crate::{
     mm::{page::Page, MemoryManagementArch},
     net::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
-        socket::SocketInode,
+        socket::Inode as SocketInode,
     },
     process::{cred::Cred, ProcessManager},
 };
@@ -570,9 +570,10 @@ impl File {
         match self.file_type {
             FileType::Socket => {
                 let inode = self.inode.downcast_ref::<SocketInode>().unwrap();
-                let mut socket = inode.inner();
+                // let mut socket = inode.inner();
 
-                return socket.add_epoll(epitem);
+                inode.epoll_items().add(epitem);
+                return Ok(());
             }
             FileType::Pipe => {
                 let inode = self.inode.downcast_ref::<LockedPipeInode>().unwrap();

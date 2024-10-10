@@ -1,6 +1,7 @@
 use core::{any::Any, fmt::Debug, hash::Hash, ops::Deref};
 
 use alloc::{
+    boxed::Box,
     string::String,
     sync::{Arc, Weak},
 };
@@ -21,7 +22,7 @@ use crate::{
 
 use system_error::SystemError;
 
-use super::kset::KSet;
+use super::{kset::KSet, uevent::kobject_uevent};
 
 pub trait KObject: Any + Send + Sync + Debug + CastFromSync {
     fn as_any_ref(&self) -> &dyn core::any::Any;
@@ -103,10 +104,9 @@ bitflags! {
         const ADD_UEVENT_SENT = 1 << 1;
         const REMOVE_UEVENT_SENT = 1 << 2;
         const INITIALIZED = 1 << 3;
+        const UEVENT_SUPPRESS = 1 << 4;
     }
-
 }
-
 #[derive(Debug)]
 pub struct LockedKObjectState(RwLock<KObjectState>);
 
@@ -251,7 +251,7 @@ impl KObjectManager {
         }
 
         // todo: 发送uevent: KOBJ_REMOVE
-
+        // kobject_uevent();
         sysfs_instance().remove_dir(&kobj);
         kobj.update_kobj_state(None, Some(KObjectState::IN_SYSFS));
         let kset = kobj.kset();
@@ -259,6 +259,101 @@ impl KObjectManager {
             kset.leave(&kobj);
         }
         kobj.set_parent(None);
+    }
+
+    fn get_kobj_path_length(kobj: &Arc<dyn KObject>) -> usize {
+        log::info!("get_kobj_path_length() kobj:{:?}", kobj.name());
+        let mut length = 1;
+        let mut parent = kobj.parent().unwrap().upgrade().unwrap();
+        /* walk up the ancestors until we hit the one pointing to the
+         * root.
+         * Add 1 to strlen for leading '/' of each level.
+         */
+        let mut length = 0; // 确保 length 被正确初始化
+        let mut iteration_count = 0; // 用于记录迭代次数
+        const MAX_ITERATIONS: usize = 10; // 最大迭代次数
+
+        loop {
+            log::info!("Iteration {}: parent.name():{:?}", iteration_count, parent.name());
+            length += parent.name().len() + 1;
+            if let Some(weak_parent) = parent.parent() {
+                if let Some(upgraded_parent) = weak_parent.upgrade() {
+                    parent = upgraded_parent;
+                } else {
+                    log::error!("Failed to upgrade weak reference to parent");
+                    break;
+                }
+            } else {
+                log::error!("Parent has no parent");
+                break;
+            }
+
+            iteration_count += 1;
+            if iteration_count >= MAX_ITERATIONS {
+                log::error!("Reached maximum iteration count, breaking to avoid infinite loop");
+                break;
+            }
+        }
+        return length;
+    }
+
+    /*
+        static void fill_kobj_path(struct kobject *kobj, char *path, int length)
+    {
+        struct kobject *parent;
+
+        --length;
+        for (parent = kobj; parent; parent = parent->parent) {
+            int cur = strlen(kobject_name(parent));
+            /* back up enough to print this name with '/' */
+            length -= cur;
+            memcpy(path + length, kobject_name(parent), cur);
+            *(path + --length) = '/';
+        }
+
+        pr_debug("kobject: '%s' (%p): %s: path = '%s'\n", kobject_name(kobj),
+             kobj, __func__, path);
+    }
+         */
+    fn fill_kobj_path(kobj: &Arc<dyn KObject>, path: &mut [u8], length: usize) {
+        let mut parent = kobj.parent().unwrap().upgrade().unwrap();
+        let mut length = length;
+        length -= 1;
+        loop {
+            log::info!("fill_kobj_path parent.name():{:?}", parent.name());
+            let cur = parent.name().len();
+            if length < cur + 1 {
+                // 如果剩余长度不足以容纳当前名称和分隔符，则退出
+                break;
+            }
+            length -= cur;
+            let parent_name = parent.name();
+            let name = parent_name.as_bytes();
+            for i in 0..cur {
+                path[length + i] = name[i];
+            }
+            length -= 1;
+            path[length] = '/' as u8;
+            if let Some(weak_parent) = parent.parent() {
+                if let Some(upgraded_parent) = weak_parent.upgrade() {
+                    parent = upgraded_parent;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    // TODO: 实现kobject_get_path
+    // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject.c#139
+    pub fn kobject_get_path(kobj: &Arc<dyn KObject>) -> String {
+        log::debug!("kobject_get_path() kobj:{:?}", kobj.name());
+        let length = Self::get_kobj_path_length(kobj);
+        let path:&mut [u8] = &mut vec![0; length];
+        Self::fill_kobj_path(kobj, path, length);
+        let path_string = String::from_utf8(path.to_vec()).unwrap();
+        return path_string;
     }
 }
 

@@ -1,6 +1,6 @@
 use core::{fmt::Debug, ptr::null};
 
-use alloc::{collections::BTreeMap, ffi::CString, string::String, sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
@@ -15,8 +15,6 @@ use crate::{
         VirtAddr,
     },
 };
-
-use super::ProcessManager;
 
 /// 系统支持的所有二进制文件加载器的列表
 const BINARY_LOADERS: [&'static dyn BinaryLoader; 1] = [&ELF_LOADER];
@@ -127,7 +125,7 @@ impl ExecParam {
             file,
             vm,
             flags,
-            init_info: ProcInitInfo::new(ProcessManager::current_pcb().basic().name()),
+            init_info: ProcInitInfo::new(),
         })
     }
 
@@ -172,7 +170,7 @@ pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, Sys
     let mut head_buf = [0u8; 512];
     param.file_mut().lseek(SeekFrom::SeekSet(0))?;
     let _bytes = param.file_mut().read(512, &mut head_buf)?;
-    // debug!("load_binary_file: read {} bytes", _bytes);
+    // kdebug!("load_binary_file: read {} bytes", _bytes);
 
     let mut loader = None;
     for bl in BINARY_LOADERS.iter() {
@@ -182,41 +180,39 @@ pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, Sys
             break;
         }
     }
-    // debug!("load_binary_file: loader: {:?}", loader);
+    // kdebug!("load_binary_file: loader: {:?}", loader);
     if loader.is_none() {
         return Err(SystemError::ENOEXEC);
     }
 
     let loader: &&dyn BinaryLoader = loader.unwrap();
     assert!(param.vm().is_current());
-    // debug!("load_binary_file: to load with param: {:?}", param);
+    // kdebug!("load_binary_file: to load with param: {:?}", param);
 
     let result: BinaryLoaderResult = loader
         .load(param, &head_buf)
         .unwrap_or_else(|e| panic!("load_binary_file failed: error: {e:?}, param: {param:?}"));
 
-    // debug!("load_binary_file: load success: {result:?}");
+    // kdebug!("load_binary_file: load success: {result:?}");
     return Ok(result);
 }
 
 /// 程序初始化信息，这些信息会被压入用户栈中
 #[derive(Debug)]
 pub struct ProcInitInfo {
-    pub proc_name: CString,
-    pub args: Vec<CString>,
-    pub envs: Vec<CString>,
+    pub proc_name: String,
+    pub args: Vec<String>,
+    pub envs: Vec<String>,
     pub auxv: BTreeMap<u8, usize>,
-    pub rand_num: [u8; 16],
 }
 
 impl ProcInitInfo {
-    pub fn new(proc_name: &str) -> Self {
+    pub fn new() -> Self {
         Self {
-            proc_name: CString::new(proc_name).unwrap_or(CString::new("").unwrap()),
+            proc_name: String::new(),
             args: Vec::new(),
             envs: Vec::new(),
             auxv: BTreeMap::new(),
-            rand_num: [0u8; 16],
         }
     }
 
@@ -227,7 +223,7 @@ impl ProcInitInfo {
     ///
     /// 返回值是一个元组，第一个元素是最终的用户栈顶地址，第二个元素是环境变量pointer数组的起始地址     
     pub unsafe fn push_at(
-        &mut self,
+        &self,
         ustack: &mut UserStack,
     ) -> Result<(VirtAddr, VirtAddr), SystemError> {
         // 先把程序的名称压入栈中
@@ -238,7 +234,7 @@ impl ProcInitInfo {
             .envs
             .iter()
             .map(|s| {
-                self.push_str(ustack, s).expect("push_str failed");
+                self.push_str(ustack, s.as_str()).expect("push_str failed");
                 ustack.sp()
             })
             .collect::<Vec<_>>();
@@ -248,24 +244,10 @@ impl ProcInitInfo {
             .args
             .iter()
             .map(|s| {
-                self.push_str(ustack, s).expect("push_str failed");
+                self.push_str(ustack, s.as_str()).expect("push_str failed");
                 ustack.sp()
             })
             .collect::<Vec<_>>();
-
-        // 压入随机数，把指针放入auxv
-        self.push_slice(ustack, &[self.rand_num])?;
-        self.auxv
-            .insert(super::abi::AtType::Random as u8, ustack.sp().data());
-
-        // 实现栈的16字节对齐
-        // 用当前栈顶地址减去后续要压栈的长度，得到的压栈后的栈顶地址与0xF按位与操作得到对齐要填充的字节数
-        let length_to_push = (self.auxv.len() + envps.len() + 1 + argps.len() + 1 + 1)
-            * core::mem::align_of::<usize>();
-        self.push_slice(
-            ustack,
-            &vec![0u8; (ustack.sp().data() - length_to_push) & 0xF],
-        )?;
 
         // 压入auxv
         self.push_slice(ustack, &[null::<u8>(), null::<u8>()])?;
@@ -280,6 +262,7 @@ impl ProcInitInfo {
         // 把参数指针压入栈中
         self.push_slice(ustack, &[null::<u8>()])?;
         self.push_slice(ustack, argps.as_slice())?;
+
         let argv_ptr = ustack.sp();
 
         // 把argc压入栈中
@@ -302,9 +285,9 @@ impl ProcInitInfo {
         return Ok(());
     }
 
-    fn push_str(&self, ustack: &mut UserStack, s: &CString) -> Result<(), SystemError> {
-        let bytes = s.as_bytes_with_nul();
-        self.push_slice(ustack, bytes)?;
+    fn push_str(&self, ustack: &mut UserStack, s: &str) -> Result<(), SystemError> {
+        self.push_slice(ustack, &[b'\0'])?;
+        self.push_slice(ustack, s.as_bytes())?;
         return Ok(());
     }
 }

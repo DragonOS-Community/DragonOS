@@ -8,7 +8,6 @@ use core::{
     mem,
     sync::atomic::AtomicU64,
 };
-use log::warn;
 
 use hashbrown::HashMap;
 use system_error::SystemError;
@@ -289,7 +288,7 @@ impl Futex {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         // 满足条件则将当前进程在该bucket上挂起
         bucket_mut.sleep_no_sched(futex_q.clone()).map_err(|e| {
-            warn!("error:{e:?}");
+            kwarn!("error:{e:?}");
             e
         })?;
         drop(futex_map_guard);
@@ -559,7 +558,7 @@ impl Futex {
         let cmparg = sign_extend32(encoded_op & 0x00000fff, 11);
 
         if (encoded_op & (FutexOP::FUTEX_OP_OPARG_SHIFT.bits() << 28) != 0) && oparg > 31 {
-            warn!(
+            kwarn!(
                 "futex_wake_op: pid:{} tries to shift op by {}; fix this program",
                 ProcessManager::current_pcb().pid().data(),
                 oparg

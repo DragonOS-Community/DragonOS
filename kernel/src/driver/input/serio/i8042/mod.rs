@@ -1,5 +1,4 @@
 use alloc::sync::Arc;
-use log::debug;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -34,7 +33,7 @@ pub fn i8042_platform_device() -> Arc<I8042PlatformDevice> {
 // TODO: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/i8042.c#1612
 #[unified_init(INITCALL_DEVICE)]
 pub fn i8042_init() -> Result<(), SystemError> {
-    debug!("i8042 initializing...");
+    kdebug!("i8042 initializing...");
     let i8042_device = Arc::new(I8042PlatformDevice::new());
     device_manager().device_default_initialize(&(i8042_device.clone() as Arc<dyn Device>));
     platform_device_manager().device_add(i8042_device.clone() as Arc<dyn PlatformDevice>)?;
@@ -47,16 +46,14 @@ pub fn i8042_init() -> Result<(), SystemError> {
     Ok(())
 }
 
-/// TODO: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/i8042.c#441
-#[allow(dead_code)]
+// TODO: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/i8042.c#441
 pub fn i8042_start(_serio: &Arc<dyn SerioDevice>) -> Result<(), SystemError> {
-    todo!("i8042_start")
+    todo!()
 }
 
-/// TODO: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/i8042.c#471
-#[allow(dead_code)]
+// TODO: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/i8042.c#471
 pub fn i8042_stop(_serio: &Arc<dyn SerioDevice>) -> Result<(), SystemError> {
-    todo!("i8042_stop")
+    todo!()
 }
 
 /// # 函数的功能

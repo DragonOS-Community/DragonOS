@@ -6,7 +6,7 @@
     "BuildFromSource": {
       "Git": {
         "url" : "https://git.mirrors.dragonos.org.cn/DragonOS-Community/Held.git",
-        "revision": "f192df4"
+        "revision": "76304e995f"
       }
     }
   },

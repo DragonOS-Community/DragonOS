@@ -14,15 +14,6 @@ where
     core: BitMapCore<usize>,
 }
 
-impl<const N: usize> Default for StaticBitmap<N>
-where
-    [(); (N + usize::BITS as usize - 1) / (usize::BITS as usize)]:,
-{
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<const N: usize> StaticBitmap<N>
 where
     [(); (N + usize::BITS as usize - 1) / (usize::BITS as usize)]:,

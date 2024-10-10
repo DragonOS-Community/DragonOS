@@ -2,7 +2,6 @@ use core::intrinsics::unlikely;
 
 use alloc::{string::ToString, sync::Arc};
 use intertrait::CastFrom;
-use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -26,6 +25,7 @@ use crate::{
         msi::MsiMsg,
         HardwareIrqNumber, IrqNumber,
     },
+    kwarn,
     libs::spinlock::{SpinLock, SpinLockGuard},
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
@@ -179,7 +179,6 @@ bitflags! {
     }
 }
 
-#[allow(dead_code)]
 pub(super) fn irq_msi_compose_msg(cfg: &HardwareIrqConfig, msg: &mut MsiMsg, dmar: bool) {
     *msg = MsiMsg::new_zeroed();
 
@@ -207,7 +206,7 @@ pub(super) fn irq_msi_compose_msg(cfg: &HardwareIrqConfig, msg: &mut MsiMsg, dma
         // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/apic/apic.c?fi=__irq_msi_compose_msg#2580
         address_lo.set_virt_destid_8_14(cfg.apic_id.data() >> 8);
     } else if unlikely(cfg.apic_id.data() > 0xff) {
-        warn!(
+        kwarn!(
             "irq_msi_compose_msg: Invalid APIC ID: {}",
             cfg.apic_id.data()
         );
@@ -253,7 +252,7 @@ pub fn arch_early_irq_init() -> Result<(), SystemError> {
 
     // todo: add vector matrix
     // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/apic/vector.c#803
-    warn!("arch_early_irq_init: todo: add vector matrix");
+    kwarn!("arch_early_irq_init: todo: add vector matrix");
 
     local_apic_timer_irq_desc_init();
     arch_ipi_handler_init();

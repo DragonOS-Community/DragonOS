@@ -2,17 +2,19 @@ use crate::libs::align::{page_align_down, page_align_up};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::kernel_mapper::KernelMapper;
 use crate::mm::page::{PAGE_1G_SHIFT, PAGE_4K_SHIFT};
-use crate::mm::{MMArch, MemoryManagementArch};
 use crate::process::ProcessManager;
-
+use crate::{
+    kdebug,
+    mm::{MMArch, MemoryManagementArch},
+};
+use crate::{kerror, kinfo, kwarn};
 use alloc::{collections::LinkedList, vec::Vec};
 use core::mem;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
-use log::{debug, error, info, warn};
 use system_error::SystemError;
 
-use super::page::{EntryFlags, PAGE_4K_SIZE};
+use super::page::{PageFlags, PAGE_4K_SIZE};
 use super::{PhysAddr, VirtAddr};
 
 // 最大的伙伴块的幂
@@ -55,12 +57,9 @@ impl MmioBuddyMemPool {
             free_regions[i as usize] = MaybeUninit::new(SpinLock::new(MmioFreeRegionList::new()));
         }
         let free_regions = unsafe {
-            mem::transmute::<
-                [core::mem::MaybeUninit<
-                    crate::libs::spinlock::SpinLock<crate::mm::mmio_buddy::MmioFreeRegionList>,
-                >; MMIO_BUDDY_REGION_COUNT as usize],
-                [SpinLock<MmioFreeRegionList>; MMIO_BUDDY_REGION_COUNT as usize],
-            >(free_regions)
+            mem::transmute::<_, [SpinLock<MmioFreeRegionList>; MMIO_BUDDY_REGION_COUNT as usize]>(
+                free_regions,
+            )
         };
 
         let pool = MmioBuddyMemPool {
@@ -70,11 +69,11 @@ impl MmioBuddyMemPool {
         };
 
         assert!(pool.pool_start_addr.data() % PAGE_1G_SIZE == 0);
-        debug!("MMIO buddy pool init: created");
+        kdebug!("MMIO buddy pool init: created");
 
         let mut vaddr_base = MMArch::MMIO_BASE;
         let mut remain_size = MMArch::MMIO_SIZE;
-        debug!(
+        kdebug!(
             "BASE: {:?}, TOP: {:?}, size: {:?}",
             MMArch::MMIO_BASE,
             MMArch::MMIO_TOP,
@@ -93,7 +92,7 @@ impl MmioBuddyMemPool {
             }
         }
 
-        debug!("MMIO buddy pool init success");
+        kdebug!("MMIO buddy pool init success");
         return pool;
     }
 
@@ -103,11 +102,11 @@ impl MmioBuddyMemPool {
     ///
     /// @return 创建好的地址区域结构体
     fn create_region(&self, vaddr: VirtAddr) -> MmioBuddyAddrRegion {
-        // debug!("create_region for vaddr: {vaddr:?}");
+        // kdebug!("create_region for vaddr: {vaddr:?}");
 
         let region: MmioBuddyAddrRegion = MmioBuddyAddrRegion::new(vaddr);
 
-        // debug!("create_region for vaddr: {vaddr:?} OK!!!");
+        // kdebug!("create_region for vaddr: {vaddr:?} OK!!!");
         return region;
     }
 
@@ -173,7 +172,7 @@ impl MmioBuddyMemPool {
     ) -> Result<MmioBuddyAddrRegion, MmioResult> {
         // 申请范围错误
         if !(MMIO_BUDDY_MIN_EXP..=MMIO_BUDDY_MAX_EXP).contains(&exp) {
-            debug!("query_addr_region: exp wrong");
+            kdebug!("query_addr_region: exp wrong");
             return Err(MmioResult::WRONGEXP);
         }
         // 没有恰好符合要求的内存块
@@ -204,7 +203,7 @@ impl MmioBuddyMemPool {
                                 }
                             }
                             Err(err) => {
-                                debug!("buddy_pop_region get wrong");
+                                kdebug!("buddy_pop_region get wrong");
                                 return Err(err);
                             }
                         }
@@ -223,7 +222,7 @@ impl MmioBuddyMemPool {
                                 }
                             }
                             Err(err) => {
-                                debug!("buddy_pop_region get wrong");
+                                kdebug!("buddy_pop_region get wrong");
                                 return Err(err);
                             }
                         }
@@ -263,7 +262,7 @@ impl MmioBuddyMemPool {
                     ) {
                         Ok(_) => continue,
                         Err(err) => {
-                            debug!("merge_all_exp get wrong");
+                            kdebug!("merge_all_exp get wrong");
                             return Err(err);
                         }
                     }
@@ -275,7 +274,7 @@ impl MmioBuddyMemPool {
                     ) {
                         Ok(_) => continue,
                         Err(err) => {
-                            debug!("merge_all_exp get wrong");
+                            kdebug!("merge_all_exp get wrong");
                             return Err(err);
                         }
                     }
@@ -310,7 +309,7 @@ impl MmioBuddyMemPool {
         match self.query_addr_region(exp, &mut list_guard) {
             Ok(ret) => return Ok(ret),
             Err(err) => {
-                debug!("mmio_buddy_query_addr_region failed");
+                kdebug!("mmio_buddy_query_addr_region failed");
                 return Err(err);
             }
         }
@@ -434,7 +433,7 @@ impl MmioBuddyMemPool {
                         Err(err) => {
                             // 如果合并失败了要将取出来的元素放回去
                             self.push_block(copy_region, list_guard);
-                            debug!("merge_all_exp: merge_blocks failed");
+                            kdebug!("merge_all_exp: merge_blocks failed");
                             return Err(err);
                         }
                         Ok(_) => continue,
@@ -490,7 +489,7 @@ impl MmioBuddyMemPool {
         // 计算前导0
         #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         let mut size_exp: u32 = 63 - size.leading_zeros();
-        // debug!("create_mmio: size_exp: {}", size_exp);
+        // kdebug!("create_mmio: size_exp: {}", size_exp);
         // 记录最终申请的空间大小
         let mut new_size = size;
         // 对齐要申请的空间大小
@@ -510,7 +509,7 @@ impl MmioBuddyMemPool {
                 return Ok(space_guard);
             }
             Err(_) => {
-                error!(
+                kerror!(
                     "failed to create mmio. pid = {:?}",
                     ProcessManager::current_pcb().pid()
                 );
@@ -544,7 +543,7 @@ impl MmioBuddyMemPool {
         let mut bindings = KernelMapper::lock();
         let mut kernel_mapper = bindings.as_mut();
         if kernel_mapper.is_none() {
-            warn!("release_mmio: kernel_mapper is read only");
+            kwarn!("release_mmio: kernel_mapper is read only");
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
 
@@ -552,7 +551,7 @@ impl MmioBuddyMemPool {
             unsafe {
                 let x: Option<(
                     PhysAddr,
-                    EntryFlags<MMArch>,
+                    PageFlags<MMArch>,
                     crate::mm::page::PageFlush<MMArch>,
                 )> = kernel_mapper
                     .as_mut()
@@ -677,7 +676,7 @@ impl MMIOSpaceGuard {
             return Err(SystemError::EINVAL);
         }
 
-        let flags = EntryFlags::mmio_flags();
+        let flags = PageFlags::mmio_flags();
 
         let mut kernel_mapper = KernelMapper::lock();
         let r = kernel_mapper.map_phys_with_size(self.vaddr, paddr, length, flags, true);
@@ -736,11 +735,11 @@ impl Drop for MMIOSpaceGuard {
 }
 
 pub fn mmio_init() {
-    debug!("Initializing MMIO buddy memory pool...");
+    kdebug!("Initializing MMIO buddy memory pool...");
     // 初始化mmio内存池
     unsafe {
         __MMIO_POOL = Some(MmioBuddyMemPool::new());
     }
 
-    info!("MMIO buddy memory pool init done");
+    kinfo!("MMIO buddy memory pool init done");
 }

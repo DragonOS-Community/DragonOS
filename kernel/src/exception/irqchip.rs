@@ -5,7 +5,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -35,7 +34,6 @@ use super::{
 };
 
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irq.h#506
-#[allow(dead_code)]
 pub trait IrqChip: Sync + Send + Any + Debug {
     fn name(&self) -> &'static str;
     /// start up the interrupt (defaults to ->enable if ENOSYS)
@@ -128,7 +126,6 @@ pub trait IrqChip: Sync + Send + Any + Debug {
     }
 
     /// enable/disable power management wake-on of an interrupt
-    #[allow(dead_code)]
     fn irq_set_wake(&self, _irq_data: &Arc<IrqData>, _on: bool) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -283,7 +280,6 @@ struct InnerIrqChipGeneric {
     chip_types: Vec<IrqChipType>,
 }
 
-#[allow(dead_code)]
 pub trait IrqChipGenericOps: Debug + Send + Sync {
     /// Alternate I/O accessor (defaults to readl if NULL)
     unsafe fn reg_readl(&self, addr: VirtAddr) -> u32;
@@ -437,7 +433,7 @@ impl IrqManager {
                  * 则放弃。
                  */
                 if unlikely(is_chained) {
-                    warn!(
+                    kwarn!(
                         "Chained handler for irq {} is not supported",
                         dt.irq().data()
                     );
@@ -457,7 +453,7 @@ impl IrqManager {
                         &no_irq_chip(),
                     ),
             ) {
-                warn!("No irq chip for irq {}", desc_inner.irq_data().irq().data());
+                kwarn!("No irq chip for irq {}", desc_inner.irq_data().irq().data());
                 return;
             }
         }
@@ -576,7 +572,7 @@ impl IrqHandler for ChainedActionHandler {
     ) -> Result<IrqReturn, SystemError> {
         static ONCE: Once = Once::new();
         ONCE.call_once(|| {
-            warn!("Chained irq {} should not call an action.", irq.data());
+            kwarn!("Chained irq {} should not call an action.", irq.data());
         });
 
         Ok(IrqReturn::NotHandled)

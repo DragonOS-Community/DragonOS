@@ -1,6 +1,5 @@
 use alloc::{boxed::Box, vec::Vec};
 use hashbrown::HashMap;
-use log::debug;
 
 use crate::{driver::base::block::block_device::BlockId, libs::rwlock::RwLock};
 
@@ -16,7 +15,6 @@ static mut CMAPPER: Option<LockedCacheMapper> = None;
 /// 该结构体向外提供BlockCache服务
 pub struct BlockCache;
 
-#[allow(static_mut_refs)]
 unsafe fn mapper() -> Result<&'static mut LockedCacheMapper, BlockCacheError> {
     unsafe {
         match &mut CMAPPER {
@@ -26,7 +24,6 @@ unsafe fn mapper() -> Result<&'static mut LockedCacheMapper, BlockCacheError> {
     };
 }
 
-#[allow(static_mut_refs)]
 unsafe fn space() -> Result<&'static mut LockedCacheSpace, BlockCacheError> {
     unsafe {
         match &mut CSPACE {
@@ -44,7 +41,7 @@ impl BlockCache {
             CSPACE = Some(LockedCacheSpace::new(CacheSpace::new()));
             CMAPPER = Some(LockedCacheMapper::new(CacheMapper::new()));
         }
-        debug!("BlockCache Initialized!");
+        kdebug!("BlockCache Initialized!");
     }
     /// # 函数的功能
     /// 使用blockcache进行对块设备进行连续块的读操作

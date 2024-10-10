@@ -3,7 +3,7 @@ use crate::arch::mm::kernel_page_flags;
 use crate::arch::MMArch;
 
 use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::{page_manager_lock_irqsave, EntryFlags};
+use crate::mm::page::{page_manager_lock_irqsave, PageFlags};
 use crate::mm::{
     allocator::page_frame::{
         allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
@@ -32,7 +32,7 @@ unsafe impl Hal for HalImpl {
             // 清空这块区域，防止出现脏数据
             core::ptr::write_bytes(virt.data() as *mut u8, 0, count.data() * MMArch::PAGE_SIZE);
 
-            let dma_flags: EntryFlags<MMArch> = EntryFlags::mmio_flags();
+            let dma_flags: PageFlags<MMArch> = PageFlags::mmio_flags();
 
             let mut kernel_mapper = KernelMapper::lock();
             let kernel_mapper = kernel_mapper.as_mut().unwrap();
@@ -90,7 +90,7 @@ unsafe impl Hal for HalImpl {
         _direction: BufferDirection,
     ) -> virtio_drivers::PhysAddr {
         let vaddr = VirtAddr::new(buffer.as_ptr() as *mut u8 as usize);
-        //debug!("virt:{:x}", vaddr);
+        //kdebug!("virt:{:x}", vaddr);
         // Nothing to do, as the host already has access to all memory.
         return MMArch::virt_2_phys(vaddr).unwrap().data();
     }

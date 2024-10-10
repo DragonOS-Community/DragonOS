@@ -3,10 +3,9 @@
 //! 架构相关的处理逻辑参考： https://code.dragonos.org.cn/xref/linux-6.6.21/arch/riscv/kernel/traps.c
 use core::hint::spin_loop;
 
-use log::error;
 use system_error::SystemError;
 
-use crate::{arch::syscall::syscall_handler, driver::irqchip::riscv_intc::riscv_intc_irq};
+use crate::{arch::syscall::syscall_handler, driver::irqchip::riscv_intc::riscv_intc_irq, kerror};
 
 use super::TrapFrame;
 
@@ -53,7 +52,7 @@ fn riscv64_do_exception(trap_frame: &mut TrapFrame) {
         let handler = EXCEPTION_HANDLERS[code];
         handler(trap_frame).ok();
     } else {
-        error!("riscv64_do_irq: exception code out of range");
+        kerror!("riscv64_do_irq: exception code out of range");
         loop {
             // kernel die
             spin_loop();
@@ -62,7 +61,7 @@ fn riscv64_do_exception(trap_frame: &mut TrapFrame) {
 }
 
 fn default_handler(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    error!("riscv64_do_irq: handler not found");
+    kerror!("riscv64_do_irq: handler not found");
     loop {
         spin_loop();
     }
@@ -70,7 +69,7 @@ fn default_handler(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
 
 /// 处理指令地址不对齐异常 #0
 fn do_trap_insn_misaligned(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    error!("riscv64_do_irq: do_trap_insn_misaligned");
+    kerror!("riscv64_do_irq: do_trap_insn_misaligned");
     loop {
         spin_loop();
     }
@@ -78,7 +77,7 @@ fn do_trap_insn_misaligned(_trap_frame: &mut TrapFrame) -> Result<(), SystemErro
 
 /// 处理指令访问异常 #1
 fn do_trap_insn_access_fault(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    error!("riscv64_do_irq: do_trap_insn_access_fault");
+    kerror!("riscv64_do_irq: do_trap_insn_access_fault");
     loop {
         spin_loop();
     }
@@ -86,7 +85,7 @@ fn do_trap_insn_access_fault(_trap_frame: &mut TrapFrame) -> Result<(), SystemEr
 
 /// 处理非法指令异常 #2
 fn do_trap_insn_illegal(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    error!("riscv64_do_irq: do_trap_insn_illegal");
+    kerror!("riscv64_do_irq: do_trap_insn_illegal");
     loop {
         spin_loop();
     }
@@ -94,7 +93,7 @@ fn do_trap_insn_illegal(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> 
 
 /// 处理断点异常 #3
 fn do_trap_break(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    error!("riscv64_do_irq: do_trap_break");
+    kerror!("riscv64_do_irq: do_trap_break");
     loop {
         spin_loop();
     }
@@ -102,7 +101,7 @@ fn do_trap_break(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
 
 /// 处理加载地址不对齐异常 #4
 fn do_trap_load_misaligned(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    error!("riscv64_do_irq: do_trap_load_misaligned");
+    kerror!("riscv64_do_irq: do_trap_load_misaligned");
     loop {
         spin_loop();
     }
@@ -110,7 +109,7 @@ fn do_trap_load_misaligned(_trap_frame: &mut TrapFrame) -> Result<(), SystemErro
 
 /// 处理加载访问异常 #5
 fn do_trap_load_access_fault(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    error!("riscv64_do_irq: do_trap_load_access_fault");
+    kerror!("riscv64_do_irq: do_trap_load_access_fault");
     loop {
         spin_loop();
     }
@@ -118,7 +117,7 @@ fn do_trap_load_access_fault(_trap_frame: &mut TrapFrame) -> Result<(), SystemEr
 
 /// 处理存储地址不对齐异常 #6
 fn do_trap_store_misaligned(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    error!("riscv64_do_irq: do_trap_store_misaligned");
+    kerror!("riscv64_do_irq: do_trap_store_misaligned");
     loop {
         spin_loop();
     }
@@ -126,7 +125,7 @@ fn do_trap_store_misaligned(_trap_frame: &mut TrapFrame) -> Result<(), SystemErr
 
 /// 处理存储访问异常 #7
 fn do_trap_store_access_fault(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    error!("riscv64_do_irq: do_trap_store_access_fault");
+    kerror!("riscv64_do_irq: do_trap_store_access_fault");
     loop {
         spin_loop();
     }
@@ -152,9 +151,11 @@ fn do_trap_insn_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError
     let vaddr = trap_frame.badaddr;
     let cause = trap_frame.cause;
     let epc = trap_frame.epc;
-    error!(
+    kerror!(
         "riscv64_do_irq: do_insn_page_fault vaddr: {:#x}, cause: {:?} epc: {:#x}",
-        vaddr, cause, epc
+        vaddr,
+        cause,
+        epc
     );
     loop {
         spin_loop();
@@ -166,9 +167,10 @@ fn do_trap_load_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError
     let vaddr = trap_frame.badaddr;
     let cause = trap_frame.cause;
     let epc = trap_frame.epc;
-    error!(
+    kerror!(
         "riscv64_do_irq: do_trap_load_page_fault: epc: {epc:#x}, vaddr={:#x}, cause={:?}",
-        vaddr, cause
+        vaddr,
+        cause
     );
 
     loop {
@@ -180,9 +182,11 @@ fn do_trap_load_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError
 
 /// 处理页存储错误异常 #15
 fn do_trap_store_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    error!(
+    kerror!(
         "riscv64_do_irq: do_trap_store_page_fault: epc: {:#x}, vaddr={:#x}, cause={:?}",
-        trap_frame.epc, trap_frame.badaddr, trap_frame.cause
+        trap_frame.epc,
+        trap_frame.badaddr,
+        trap_frame.cause
     );
     loop {
         spin_loop();

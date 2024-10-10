@@ -3,6 +3,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::{
     arch::MMArch,
     init::boot_params,
+    kinfo,
     libs::{
         align::page_align_up,
         lib_ui::screen_manager::{ScmBuffer, ScmBufferFlag, ScmBufferInfo},
@@ -10,13 +11,12 @@ use crate::{
         spinlock::SpinLock,
     },
     mm::{
-        allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper, page::EntryFlags,
+        allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper, page::PageFlags,
         MemoryManagementArch,
     },
     time::timer::{Timer, TimerFunction},
 };
 use alloc::{boxed::Box, sync::Arc};
-use log::info;
 use system_error::SystemError;
 
 pub mod console;
@@ -78,7 +78,7 @@ impl VideoRefreshManager {
      * 将帧缓存区映射到地址SPECIAL_MEMOEY_MAPPING_VIRT_ADDR_BASE处
      */
     fn init_frame_buffer(&self) {
-        info!("Re-mapping VBE frame buffer...");
+        kinfo!("Re-mapping VBE frame buffer...");
         let buf_vaddr = boot_params()
             .read_irqsave()
             .screen_info
@@ -95,7 +95,7 @@ impl VideoRefreshManager {
         let count = PageFrameCount::new(
             page_align_up(frame_buffer_info_guard.buf_size()) / MMArch::PAGE_SIZE,
         );
-        let page_flags: EntryFlags<MMArch> = EntryFlags::new().set_execute(true).set_write(true);
+        let page_flags: PageFlags<MMArch> = PageFlags::new().set_execute(true).set_write(true);
 
         let mut kernel_mapper = KernelMapper::lock();
         let mut kernel_mapper = kernel_mapper.as_mut();
@@ -115,7 +115,7 @@ impl VideoRefreshManager {
             }
         }
 
-        info!("VBE frame buffer successfully Re-mapped!");
+        kinfo!("VBE frame buffer successfully Re-mapped!");
     }
 
     /**

@@ -4,7 +4,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use log::debug;
 use system_error::SystemError;
 
 use crate::{
@@ -55,7 +54,7 @@ impl MbrDiskPartitionTableEntry {
 #[repr(packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct MbrDiskPartionTable {
-    pub _reserved: [u8; 446],
+    pub reserved: [u8; 446],
     pub dpte: [MbrDiskPartitionTableEntry; 4], // 磁盘分区表项
     pub bs_trailsig: u16,
 }
@@ -63,7 +62,7 @@ pub struct MbrDiskPartionTable {
 impl Default for MbrDiskPartionTable {
     fn default() -> Self {
         MbrDiskPartionTable {
-            _reserved: [0; 446],
+            reserved: [0; 446],
             dpte: [Default::default(); 4],
             bs_trailsig: Default::default(),
         }
@@ -106,10 +105,10 @@ impl MbrDiskPartionTable {
             table.dpte[i].starting_lba = cursor.read_u32()?;
             table.dpte[i].total_sectors = cursor.read_u32()?;
 
-            debug!("dpte[{i}] = {:?}", table.dpte[i]);
+            kdebug!("dpte[{i}] = {:?}", table.dpte[i]);
         }
         table.bs_trailsig = cursor.read_u16()?;
-        // debug!("bs_trailsig = {}", unsafe {
+        // kdebug!("bs_trailsig = {}", unsafe {
         //     read_unaligned(addr_of!(table.bs_trailsig))
         // });
 

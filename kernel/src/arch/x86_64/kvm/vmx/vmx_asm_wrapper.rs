@@ -1,7 +1,6 @@
 use super::vmcs::VmcsFields;
-
+use crate::kdebug;
 use core::arch::asm;
-use log::debug;
 use system_error::SystemError;
 use x86;
 /// Enable VMX operation.
@@ -9,7 +8,7 @@ pub fn vmxon(vmxon_pa: u64) -> Result<(), SystemError> {
     match unsafe { x86::bits64::vmx::vmxon(vmxon_pa) } {
         Ok(_) => Ok(()),
         Err(e) => {
-            debug!("vmxon fail: {:?}", e);
+            kdebug!("vmxon fail: {:?}", e);
             Err(SystemError::EVMXONFailed)
         }
     }
@@ -28,8 +27,8 @@ pub fn vmx_vmwrite(vmcs_field: u32, value: u64) -> Result<(), SystemError> {
     match unsafe { x86::bits64::vmx::vmwrite(vmcs_field, value) } {
         Ok(_) => Ok(()),
         Err(e) => {
-            debug!("vmx_write fail: {:?}", e);
-            debug!("vmcs_field: {:x}", vmcs_field);
+            kdebug!("vmx_write fail: {:?}", e);
+            kdebug!("vmcs_field: {:x}", vmcs_field);
             Err(SystemError::EVMWRITEFailed)
         }
     }
@@ -40,7 +39,7 @@ pub fn vmx_vmread(vmcs_field: u32) -> Result<u64, SystemError> {
     match unsafe { x86::bits64::vmx::vmread(vmcs_field) } {
         Ok(value) => Ok(value),
         Err(e) => {
-            debug!("vmx_read fail: {:?}", e);
+            kdebug!("vmx_read fail: {:?}", e);
             Err(SystemError::EVMREADFailed)
         }
     }
@@ -64,10 +63,10 @@ pub fn vmx_vmlaunch() -> Result<(), SystemError> {
             "push    rsi",
             "push    rdi",
             "vmwrite {0:r}, rsp",
-            "lea rax, 2f[rip]",
+            "lea rax, 1f[rip]",
             "vmwrite {1:r}, rax",
             "vmlaunch",
-            "2:",
+            "1:",
             "pop    rdi",
             "pop    rsi",
             "pop    rdx",
@@ -83,7 +82,7 @@ pub fn vmx_vmlaunch() -> Result<(), SystemError> {
     // match unsafe { x86::bits64::vmx::vmlaunch() } {
     //     Ok(_) => Ok(()),
     //     Err(e) => {
-    //         debug!("vmx_launch fail: {:?}", e);
+    //         kdebug!("vmx_launch fail: {:?}", e);
     //         Err(SystemError::EVMLAUNCHFailed)
     //     },
     // }

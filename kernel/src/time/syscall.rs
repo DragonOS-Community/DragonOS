@@ -3,7 +3,6 @@ use core::{
     time::Duration,
 };
 
-use log::warn;
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 
@@ -139,7 +138,7 @@ impl Syscall {
     pub fn clock_gettime(clock_id: c_int, tp: *mut PosixTimeSpec) -> Result<usize, SystemError> {
         let clock_id = PosixClockID::try_from(clock_id)?;
         if clock_id != PosixClockID::Realtime {
-            warn!("clock_gettime: currently only support Realtime clock, but got {:?}. Defaultly return realtime!!!\n", clock_id);
+            kwarn!("clock_gettime: currently only support Realtime clock, but got {:?}. Defaultly return realtime!!!\n", clock_id);
         }
         if tp.is_null() {
             return Err(SystemError::EFAULT);

@@ -1,7 +1,6 @@
 use crate::arch::kvm::vmx::vcpu::VcpuContextFrame;
 use crate::arch::KVMArch;
 use crate::driver::base::device::device_number::DeviceNumber;
-use crate::filesystem;
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
     core::generate_inode_id, file::FileMode, FilePrivateData, FileSystem, FileType, IndexNode,
@@ -12,13 +11,13 @@ use crate::mm::VirtAddr;
 use crate::syscall::user_access::copy_from_user;
 use crate::virt::kvm::vcpu::Vcpu;
 use crate::virt::kvm::vm;
+use crate::{filesystem, kdebug};
 use crate::{libs::spinlock::SpinLock, time::PosixTimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
-use log::debug;
 use system_error::SystemError;
 
 // pub const KVM_API_VERSION:u32 = 12;
@@ -103,7 +102,7 @@ impl IndexNode for LockedVcpuInode {
         _data: SpinLockGuard<FilePrivateData>,
         _mode: &FileMode,
     ) -> Result<(), SystemError> {
-        debug!("file private data:{:?}", _data);
+        kdebug!("file private data:{:?}", _data);
         return Ok(());
     }
 
@@ -150,11 +149,11 @@ impl IndexNode for LockedVcpuInode {
     ) -> Result<usize, SystemError> {
         match cmd {
             0xdeadbeef => {
-                debug!("kvm_cpu ioctl");
+                kdebug!("kvm_cpu ioctl");
                 Ok(0)
             }
             KVM_RUN => {
-                debug!("kvm_cpu ioctl");
+                kdebug!("kvm_cpu ioctl");
                 // let guest_stack = vec![0xCC; GUEST_STACK_SIZE];
                 // let host_stack = vec![0xCC; HOST_STACK_SIZE];
                 // let guest_rsp = guest_stack.as_ptr() as u64 + GUEST_STACK_SIZE as u64;
@@ -178,9 +177,12 @@ impl IndexNode for LockedVcpuInode {
                         VirtAddr::new(data),
                     )?;
                 }
-                debug!(
+                kdebug!(
                     "rip={:x}, rflags={:x}, rsp={:x}, rax={:x}",
-                    kvm_regs.rip, kvm_regs.rflags, kvm_regs.regs[6], kvm_regs.regs[0],
+                    kvm_regs.rip,
+                    kvm_regs.rflags,
+                    kvm_regs.regs[6],
+                    kvm_regs.regs[0],
                 );
 
                 let vcpu = vm(0).unwrap().vcpu[0].clone();
@@ -189,7 +191,7 @@ impl IndexNode for LockedVcpuInode {
                 Ok(0)
             }
             _ => {
-                debug!("kvm_cpu ioctl");
+                kdebug!("kvm_cpu ioctl");
                 Ok(usize::MAX)
             }
         }

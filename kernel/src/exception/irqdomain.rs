@@ -6,7 +6,6 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
-use log::{info, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -158,7 +157,7 @@ impl IrqDomainManager {
     ) {
         for i in 0..count {
             if let Err(e) = self.domain_associate(domain, first_irq + i, first_hwirq + i) {
-                warn!("domain associate failed: {:?}, domain '{:?}' didn't like hwirq {} to virq {} mapping.", e, domain.name(), (first_hwirq + i).data(), (first_irq + i).data());
+                kwarn!("domain associate failed: {:?}, domain '{:?}' didn't like hwirq {} to virq {} mapping.", e, domain.name(), (first_hwirq + i).data(), (first_irq + i).data());
             }
         }
     }
@@ -173,7 +172,7 @@ impl IrqDomainManager {
         hwirq: HardwareIrqNumber,
     ) -> Result<(), SystemError> {
         if hwirq >= domain.revmap.read_irqsave().hwirq_max {
-            warn!(
+            kwarn!(
                 "hwirq {} is out of range for domain {:?}",
                 hwirq.data(),
                 domain.name()
@@ -183,12 +182,12 @@ impl IrqDomainManager {
         let irq_data = irq_desc_manager()
             .lookup(irq)
             .ok_or_else(|| {
-                warn!("irq_desc not found for irq {}", irq.data());
+                kwarn!("irq_desc not found for irq {}", irq.data());
                 SystemError::EINVAL
             })?
             .irq_data();
         if irq_data.domain().is_some() {
-            warn!(
+            kwarn!(
                 "irq {} is already associated with domain {:?}",
                 irq.data(),
                 irq_data.domain().unwrap().name()
@@ -204,7 +203,7 @@ impl IrqDomainManager {
         if let Err(e) = r {
             if e != SystemError::ENOSYS {
                 if e != SystemError::EPERM {
-                    info!("domain associate failed: {:?}, domain '{:?}' didn't like hwirq {} to virq {} mapping.", e, domain.name(), hwirq.data(), irq.data());
+                    kinfo!("domain associate failed: {:?}, domain '{:?}' didn't like hwirq {} to virq {} mapping.", e, domain.name(), hwirq.data(), irq.data());
                 }
                 let mut irq_data_guard = irq_data.inner();
                 irq_data_guard.set_domain(None);
@@ -247,7 +246,7 @@ impl IrqDomainManager {
     /// 这是调用 domain_ops->activate 以编程中断控制器的第二步，以便中断实际上可以被传递。
     pub fn activate_irq(&self, irq_data: &Arc<IrqData>, reserve: bool) -> Result<(), SystemError> {
         let mut r = Ok(());
-        // debug!(
+        // kdebug!(
         //     "activate_irq: irq_data.common_data().status().is_activated()={}",
         //     irq_data.common_data().status().is_activated()
         // );
@@ -271,9 +270,9 @@ impl IrqDomainManager {
         let mut r = Ok(());
 
         if let Some(irq_data) = irq_data {
-            // debug!("do_activate_irq: irq_data={:?}", irq_data);
+            // kdebug!("do_activate_irq: irq_data={:?}", irq_data);
             if let Some(domain) = irq_data.domain() {
-                // debug!("do_activate_irq: domain={:?}", domain.name());
+                // kdebug!("do_activate_irq: domain={:?}", domain.name());
                 let parent_data = irq_data.parent_data().and_then(|x| x.upgrade());
                 if let Some(parent_data) = parent_data.clone() {
                     r = self.do_activate_irq(Some(parent_data), reserve);
@@ -644,7 +643,6 @@ pub enum IrqDomainBusToken {
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/irqdomain.h#107
 pub trait IrqDomainOps: Debug + Send + Sync {
     /// 匹配一个中断控制器设备节点到一个主机。
-    #[allow(dead_code)]
     fn match_node(
         &self,
         _irq_domain: &Arc<IrqDomain>,
@@ -668,7 +666,6 @@ pub trait IrqDomainOps: Debug + Send + Sync {
     }
 
     /// 删除一个虚拟中断号与一个硬件中断号之间的映射。
-    #[allow(dead_code)]
     fn unmap(&self, irq_domain: &Arc<IrqDomain>, virq: IrqNumber);
 
     fn activate(

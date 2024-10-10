@@ -1,5 +1,4 @@
 use core::{
-    any::Any,
     fmt::Debug,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -9,7 +8,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use intertrait::CastFromSync;
 use system_error::SystemError;
 
 use crate::{
@@ -131,10 +129,6 @@ impl EPollItem {
         return EPollEventType::empty();
     }
 }
-
-pub trait KernelIoctlData: Send + Sync + Any + Debug + CastFromSync {}
-
-impl KernelIoctlData for EPollItem {}
 
 /// ### Epoll文件的私有信息
 #[derive(Debug, Clone)]
@@ -436,7 +430,6 @@ impl EventPoll {
             }
             // 判断epoll上有没有就绪事件
             let mut available = epoll_guard.ep_events_available();
-
             drop(epoll_guard);
             loop {
                 if available {
@@ -573,7 +566,7 @@ impl EventPoll {
             // 记数加一
             res += 1;
 
-            // crate::debug!("ep send {event:?}");
+            // crate::kdebug!("ep send {event:?}");
 
             if ep_events.contains(EPollEventType::EPOLLONESHOT) {
                 let mut event_writer = epitem.event.write();
@@ -760,7 +753,6 @@ impl EventPoll {
 /// 与C兼容的Epoll事件结构体
 #[derive(Copy, Clone, Default)]
 #[repr(packed)]
-#[repr(C)]
 pub struct EPollEvent {
     /// 表示触发的事件
     events: u32,
@@ -872,8 +864,5 @@ bitflags! {
 
         /// 表示epoll已经被释放，但是在目前的设计中未用到
         const POLLFREE = 0x4000;
-
-        /// listen状态的socket可以接受连接
-        const EPOLL_LISTEN_CAN_ACCEPT = Self::EPOLLIN.bits | Self::EPOLLRDNORM.bits;
     }
 }

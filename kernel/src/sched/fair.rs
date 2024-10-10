@@ -144,10 +144,7 @@ impl FairSchedEntity {
 
     #[allow(clippy::mut_from_ref)]
     pub fn force_mut(&self) -> &mut Self {
-        unsafe {
-            let p = self as *const Self as usize;
-            (p as *mut Self).as_mut().unwrap()
-        }
+        unsafe { &mut *(self as *const Self as usize as *mut Self) }
     }
 
     /// 判断是否是进程持有的调度实体
@@ -419,11 +416,7 @@ impl CfsRunQueue {
     #[inline]
     #[allow(clippy::mut_from_ref)]
     pub fn force_mut(&self) -> &mut Self {
-        unsafe {
-            (self as *const Self as usize as *mut Self)
-                .as_mut()
-                .unwrap()
-        }
+        unsafe { &mut *(self as *const Self as usize as *mut Self) }
     }
 
     #[inline]
@@ -574,7 +567,7 @@ impl CfsRunQueue {
 
         fence(Ordering::SeqCst);
         if unlikely(now <= curr.exec_start) {
-            // warn!(
+            // kwarn!(
             //     "update_current return now <= curr.exec_start now {now} execstart {}",
             //     curr.exec_start
             // );
@@ -603,11 +596,11 @@ impl CfsRunQueue {
     fn account_cfs_rq_runtime(&mut self, delta_exec: u64) {
         if likely(self.runtime_remaining > delta_exec) {
             self.runtime_remaining -= delta_exec;
-            // error!("runtime_remaining {}", self.runtime_remaining);
+            // kerror!("runtime_remaining {}", self.runtime_remaining);
             return;
         }
 
-        // warn!(
+        // kwarn!(
         //     "runtime_remaining {} delta exec {delta_exec} nr_running {}",
         //     self.runtime_remaining,
         //     self.nr_running
@@ -616,14 +609,14 @@ impl CfsRunQueue {
         self.runtime_remaining = 5000 * NSEC_PER_MSEC as u64;
 
         if likely(self.current().is_some()) && self.nr_running > 1 {
-            // error!("account_cfs_rq_runtime");
+            // kerror!("account_cfs_rq_runtime");
             self.rq().resched_current();
         }
     }
 
     /// 计算deadline，如果vruntime到期会重调度
     pub fn update_deadline(&mut self, se: &Arc<FairSchedEntity>) {
-        // error!("vruntime {} deadline {}", se.vruntime, se.deadline);
+        // kerror!("vruntime {} deadline {}", se.vruntime, se.deadline);
         if se.vruntime < se.deadline {
             return;
         }
@@ -1138,7 +1131,7 @@ impl CfsRunQueue {
         self.avg_vruntime_add(se);
         se.force_mut().min_deadline = se.deadline;
         self.entities.insert(se.vruntime, se.clone());
-        // warn!(
+        // kwarn!(
         //     "enqueue pcb {:?} cfsrq {:?}",
         //     se.pcb().pid(),
         //     self.entities
@@ -1160,7 +1153,7 @@ impl CfsRunQueue {
     }
 
     fn inner_dequeue_entity(&mut self, se: &Arc<FairSchedEntity>) {
-        // warn!(
+        // kwarn!(
         //     "before dequeue pcb {:?} cfsrq {:?}",
         //     se.pcb().pid(),
         //     self.entities
@@ -1203,7 +1196,7 @@ impl CfsRunQueue {
         //     )
         //     .as_bytes(),
         // );
-        // warn!(
+        // kwarn!(
         //     "after dequeue pcb {:?}(real: {:?}) cfsrq {:?}",
         //     se.pcb().pid(),
         //     remove.pcb().pid(),
@@ -1373,11 +1366,6 @@ impl CfsRunQueue {
     }
 }
 
-impl Default for CfsRunQueue {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 pub struct CompletelyFairScheduler;
 
 impl CompletelyFairScheduler {

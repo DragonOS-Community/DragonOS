@@ -4,7 +4,6 @@ use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
 };
-use log::error;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -26,6 +25,7 @@ use crate::{
     exception::InterruptArch,
     filesystem::kernfs::KernFSInode,
     init::initcall::INITCALL_DEVICE,
+    kerror,
     libs::{
         mutex::Mutex,
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
@@ -286,7 +286,7 @@ impl RtcClassOps for CmosRtcClassOps {
     }
 
     fn set_time(&self, _dev: &Arc<dyn RtcDevice>, _time: &RtcTime) -> Result<(), SystemError> {
-        error!("set_time is not implemented for CmosRtcClassOps");
+        kerror!("set_time is not implemented for CmosRtcClassOps");
         Err(SystemError::ENOSYS)
     }
 }

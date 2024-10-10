@@ -2,7 +2,6 @@ use alloc::{
     string::ToString,
     sync::{Arc, Weak},
 };
-use log::info;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -101,7 +100,7 @@ fn rtc_hctosys(dev: &Arc<RtcGeneralDevice>) {
     let r = do_settimeofday64(timespec64);
     dev.set_hc2sys_result(r);
 
-    info!(
+    kinfo!(
         "Setting system clock to {} {} UTC ({})",
         time.date_string(),
         time.time_string(),

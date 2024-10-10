@@ -7,6 +7,7 @@ use alloc::{
     collections::LinkedList,
     string::String,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use system_error::SystemError;
 
@@ -277,6 +278,14 @@ pub struct TtyContorlInfo {
 }
 
 #[derive(Debug, Default)]
+pub struct TtyCoreWriteData {
+    /// 写缓冲区
+    pub write_buf: Vec<u8>,
+    /// 写入数量
+    pub write_cnt: usize,
+}
+
+#[derive(Debug, Default)]
 pub struct TtyFlowState {
     /// 表示流控是否被停止
     pub stopped: bool,
@@ -455,6 +464,9 @@ impl TtyCoreData {
         self.epitems.lock().push_back(epitem)
     }
 }
+
+/// TTY 核心接口，不同的tty需要各自实现这个trait
+pub trait TtyCoreFuncs: Debug + Send + Sync {}
 
 impl TtyOperation for TtyCore {
     #[inline]

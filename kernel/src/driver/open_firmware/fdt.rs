@@ -4,7 +4,6 @@ use fdt::{
     node::{FdtNode, NodeProperty},
     Fdt,
 };
-use log::{debug, error, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -80,7 +79,7 @@ impl OpenFirmwareFdtDriver {
         let fdt_vaddr = boot_params().read().fdt().ok_or(SystemError::ENODEV)?;
         let fdt: Fdt<'_> = unsafe {
             fdt::Fdt::from_ptr(fdt_vaddr.as_ptr()).map_err(|e| {
-                error!("failed to parse fdt, err={:?}", e);
+                kerror!("failed to parse fdt, err={:?}", e);
                 SystemError::EINVAL
             })
         }?;
@@ -92,7 +91,7 @@ impl OpenFirmwareFdtDriver {
             .expect("Failed to scan fdt root node.");
 
         self.early_init_scan_chosen(fdt).unwrap_or_else(|_| {
-            warn!("No `chosen` node found");
+            kwarn!("No `chosen` node found");
         });
 
         self.early_init_scan_memory(fdt);
@@ -107,13 +106,13 @@ impl OpenFirmwareFdtDriver {
         if let Some(prop) = node.property("#size-cells") {
             guard.root_size_cells = prop.as_usize().unwrap() as u32;
 
-            // debug!("fdt_root_size_cells={}", guard.root_size_cells);
+            // kdebug!("fdt_root_size_cells={}", guard.root_size_cells);
         }
 
         if let Some(prop) = node.property("#address-cells") {
             guard.root_addr_cells = prop.as_usize().unwrap() as u32;
 
-            // debug!("fdt_root_addr_cells={}", guard.root_addr_cells);
+            // kdebug!("fdt_root_addr_cells={}", guard.root_addr_cells);
         }
 
         return Ok(());
@@ -145,7 +144,7 @@ impl OpenFirmwareFdtDriver {
 
         // TODO: 拼接内核自定义的command line参数
 
-        debug!("Command line: {}", boot_params().read().boot_cmdline_str());
+        kdebug!("Command line: {}", boot_params().read().boot_cmdline_str());
         return Ok(());
     }
 
@@ -195,7 +194,7 @@ impl OpenFirmwareFdtDriver {
                     continue;
                 }
 
-                debug!("Found memory: base={:#x}, size={:#x}", base, size);
+                kdebug!("Found memory: base={:#x}, size={:#x}", base, size);
                 self.early_init_dt_add_memory(base, size);
                 found_memory = true;
             }
@@ -206,7 +205,7 @@ impl OpenFirmwareFdtDriver {
 
     #[cfg(target_arch = "x86_64")]
     pub fn early_init_dt_add_memory(&self, _base: u64, _size: u64) {
-        panic!("x86_64 should not call early_init_dt_add_memory");
+        kBUG!("x86_64 should not call early_init_dt_add_memory");
     }
 
     #[cfg(not(target_arch = "x86_64"))]
@@ -221,7 +220,7 @@ impl OpenFirmwareFdtDriver {
         let mut size = size as usize;
 
         if size < (MMArch::PAGE_SIZE - (base & (!MMArch::PAGE_MASK))) {
-            warn!("Ignoring memory block {:#x}-{:#x}", base, base + size);
+            kwarn!("Ignoring memory block {:#x}-{:#x}", base, base + size);
         }
 
         if PhysAddr::new(base).check_aligned(MMArch::PAGE_SIZE) == false {
@@ -232,11 +231,11 @@ impl OpenFirmwareFdtDriver {
         size = page_align_down(size);
 
         if base > MemBlockManager::MAX_MEMBLOCK_ADDR.data() {
-            warn!("Ignoring memory block {:#x}-{:#x}", base, base + size);
+            kwarn!("Ignoring memory block {:#x}-{:#x}", base, base + size);
         }
 
         if base + size - 1 > MemBlockManager::MAX_MEMBLOCK_ADDR.data() {
-            warn!(
+            kwarn!(
                 "Ignoring memory range {:#x}-{:#x}",
                 MemBlockManager::MAX_MEMBLOCK_ADDR.data() + 1,
                 base + size
@@ -245,13 +244,13 @@ impl OpenFirmwareFdtDriver {
         }
 
         if base + size < MemBlockManager::MIN_MEMBLOCK_ADDR.data() {
-            warn!("Ignoring memory range {:#x}-{:#x}", base, base + size);
+            kwarn!("Ignoring memory range {:#x}-{:#x}", base, base + size);
             return;
         }
 
         if base < MemBlockManager::MIN_MEMBLOCK_ADDR.data() {
             {
-                warn!(
+                kwarn!(
                     "Ignoring memory range {:#x}-{:#x}",
                     base,
                     MemBlockManager::MIN_MEMBLOCK_ADDR.data()
@@ -313,7 +312,7 @@ impl OpenFirmwareFdtDriver {
             if node.size() != 0 {
                 let address = PhysAddr::new(node.address() as usize);
                 let size = node.size();
-                debug!("Reserve memory: {:?}-{:?}", address, address + size);
+                kdebug!("Reserve memory: {:?}-{:?}", address, address + size);
                 mem_block_manager().reserve_block(address, size).unwrap();
             }
         }
@@ -407,7 +406,7 @@ fn reserved_mem_reserve_reg(node: &FdtNode<'_, '_>) -> Result<(), SystemError> {
 
     let mut reg_size = reg.value.len();
     if reg_size > 0 && reg_size % t_len != 0 {
-        error!(
+        kerror!(
             "Reserved memory: invalid reg property in '{}', skipping node.",
             node.name
         );
@@ -432,14 +431,18 @@ fn reserved_mem_reserve_reg(node: &FdtNode<'_, '_>) -> Result<(), SystemError> {
                 .early_init_dt_reserve_memory(PhysAddr::new(base as usize), size as usize, nomap)
                 .is_ok()
         {
-            debug!(
+            kdebug!(
                 "Reserved memory: base={:#x}, size={:#x}, nomap={}",
-                base, size, nomap
+                base,
+                size,
+                nomap
             );
         } else {
-            error!(
+            kerror!(
                 "Failed to reserve memory: base={:#x}, size={:#x}, nomap={}",
-                base, size, nomap
+                base,
+                size,
+                nomap
             );
         }
 
@@ -468,7 +471,8 @@ fn read_cell(reg_value: &[u8], base_index: usize, cells: usize) -> (u64, usize) 
         1 => {
             return (
                 u32::from_be_bytes(reg_value[base_index..base_index + 4].try_into().unwrap())
-                    .into(),
+                    .try_into()
+                    .unwrap(),
                 next_base_index,
             );
         }

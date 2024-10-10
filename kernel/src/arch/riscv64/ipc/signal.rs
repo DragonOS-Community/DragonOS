@@ -1,8 +1,7 @@
-use log::error;
-
 use crate::{
     arch::{sched::sched, CurrentIrqArch},
     exception::InterruptArch,
+    kerror,
     process::ProcessManager,
 };
 
@@ -69,7 +68,7 @@ impl From<usize> for Signal {
             let ret: Signal = unsafe { core::mem::transmute(value) };
             return ret;
         } else {
-            error!("Try to convert an invalid number to Signal");
+            kerror!("Try to convert an invalid number to Signal");
             return Signal::INVALID;
         }
     }
@@ -84,7 +83,7 @@ impl Into<usize> for Signal {
 impl From<i32> for Signal {
     fn from(value: i32) -> Self {
         if value < 0 {
-            error!("Try to convert an invalid number to Signal");
+            kerror!("Try to convert an invalid number to Signal");
             return Signal::INVALID;
         } else {
             return Self::from(value as usize);
@@ -128,7 +127,7 @@ impl Signal {
     pub fn handle_default(&self) {
         match self {
             Signal::INVALID => {
-                error!("attempting to handler an Invalid");
+                kerror!("attempting to handler an Invalid");
             }
             Signal::SIGHUP => sig_terminate(self.clone()),
             Signal::SIGINT => sig_terminate(self.clone()),
@@ -313,7 +312,7 @@ fn sig_terminate_dump(sig: Signal) {
 fn sig_stop(sig: Signal) {
     let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     ProcessManager::mark_stop().unwrap_or_else(|e| {
-        error!(
+        kerror!(
             "sleep error :{:?},failed to sleep process :{:?}, with signal :{:?}",
             e,
             ProcessManager::current_pcb(),
@@ -328,7 +327,7 @@ fn sig_stop(sig: Signal) {
 /// 信号默认处理函数——继续进程
 fn sig_continue(sig: Signal) {
     ProcessManager::wakeup_stop(&ProcessManager::current_pcb()).unwrap_or_else(|_| {
-        error!(
+        kerror!(
             "Failed to wake up process pid = {:?} with signal :{:?}",
             ProcessManager::current_pcb().pid(),
             sig

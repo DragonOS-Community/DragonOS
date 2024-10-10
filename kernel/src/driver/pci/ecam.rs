@@ -1,5 +1,3 @@
-use log::{error, warn};
-
 use crate::mm::PhysAddr;
 
 use super::{
@@ -13,32 +11,27 @@ pub fn pci_ecam_root_info_manager() -> &'static EcamRootInfoManager {
 }
 
 /// Ecam pci root info
-#[derive(Clone, Debug, Copy)]
+#[derive(Clone, Copy)]
 pub struct EcamRootInfo {
-    /// 段组号
-    pub segment_group_number: SegmentGroupNumber,
-    /// 该分组中的最小bus
+    pub segement_group_number: SegmentGroupNumber,
     pub bus_begin: u8,
-    /// 该分组中的最大bus
     pub bus_end: u8,
-    /// 物理基地址       
     pub physical_address_base: PhysAddr,
 }
 
 impl EcamRootInfo {
     pub fn new(
-        segment_group_number: SegmentGroupNumber,
+        segement_group_number: SegmentGroupNumber,
         bus_begin: u8,
         bus_end: u8,
         physical_address_base: PhysAddr,
     ) -> Self {
-        let ecam_root_info = Self {
-            segment_group_number,
+        Self {
+            segement_group_number,
             bus_begin,
             bus_end,
             physical_address_base,
-        };
-        return ecam_root_info;
+        }
     }
 }
 
@@ -53,24 +46,25 @@ impl EcamRootInfoManager {
     ///
     /// - `ecam_root_info`: EcamRootInfo - 要添加的EcamRootInfo实例
     pub fn add_ecam_root_info(&self, ecam_root_info: EcamRootInfo) {
-        if !pci_root_manager().has_root(ecam_root_info.segment_group_number) {
+        if !pci_root_manager().has_root(ecam_root_info.segement_group_number) {
             let root = PciRoot::new(
-                Some(ecam_root_info),
+                ecam_root_info.segement_group_number,
                 PciCam::Ecam,
+                ecam_root_info.physical_address_base,
                 ecam_root_info.bus_begin,
                 ecam_root_info.bus_end,
             );
 
             if let Err(err) = root {
-                error!("add_ecam_root_info(): failed to create PciRoot: {:?}", err);
+                kerror!("add_ecam_root_info(): failed to create PciRoot: {:?}", err);
                 return;
             }
 
             pci_root_manager().add_pci_root(root.unwrap());
         } else {
-            warn!(
+            kwarn!(
                 "add_ecam_root_info(): root {} already exists",
-                ecam_root_info.segment_group_number
+                ecam_root_info.segement_group_number
             );
         }
     }

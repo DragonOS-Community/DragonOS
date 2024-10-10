@@ -2,7 +2,6 @@ use core::ptr::NonNull;
 
 use alloc::sync::Arc;
 use fdt::node::FdtNode;
-use log::info;
 use system_error::SystemError;
 use virtio_drivers::transport::{
     mmio::{MmioTransport, VirtIOHeader},
@@ -55,7 +54,7 @@ impl VirtIOMmioTransport {
 
         match unsafe { MmioTransport::new(header) } {
             Ok(mmio_transport) => {
-                info!( "Detected virtio MMIO device with vendor id {:#X}, device type {:?}, version {:?}, hw irq: {}",
+                kinfo!( "Detected virtio MMIO device with vendor id {:#X}, device type {:?}, version {:?}, hw irq: {}",
                     mmio_transport.vendor_id(),
                     mmio_transport.device_type(),
                     mmio_transport.version(),
@@ -70,7 +69,7 @@ impl VirtIOMmioTransport {
                 })
             }
             Err(_) => {
-                // warn!("MmioTransport::new failed: {:?}", e);
+                // kwarn!("MmioTransport::new failed: {:?}", e);
                 Err(SystemError::EINVAL)
             }
         }

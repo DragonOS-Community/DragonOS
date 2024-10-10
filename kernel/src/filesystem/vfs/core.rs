@@ -1,7 +1,6 @@
 use core::{hint::spin_loop, sync::atomic::Ordering};
 
 use alloc::sync::Arc;
-use log::{error, info};
 use system_error::SystemError;
 
 use crate::{
@@ -14,6 +13,7 @@ use crate::{
         sysfs::sysfs_init,
         vfs::{mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
     },
+    kerror, kinfo,
     process::ProcessManager,
 };
 
@@ -67,7 +67,7 @@ pub fn vfs_init() -> Result<(), SystemError> {
 
     let root_entries = ROOT_INODE().list().expect("VFS init failed");
     if !root_entries.is_empty() {
-        info!("Successfully initialized VFS!");
+        kinfo!("Successfully initialized VFS!");
     }
     return Ok(());
 }
@@ -75,7 +75,7 @@ pub fn vfs_init() -> Result<(), SystemError> {
 /// @brief 迁移伪文件系统的inode
 /// 请注意，为了避免删掉了伪文件系统内的信息，因此没有在原root inode那里调用unlink.
 fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemError> {
-    info!("VFS: Migrating filesystems...");
+    kinfo!("VFS: Migrating filesystems...");
 
     let new_fs = MountFS::new(new_fs, None);
     // 获取新的根文件系统的根节点的引用
@@ -108,7 +108,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
         drop(old_root_inode);
     }
 
-    info!("VFS: Migrate filesystems done!");
+    kinfo!("VFS: Migrate filesystems done!");
 
     return Ok(());
 }
@@ -131,7 +131,7 @@ fn root_partition() -> Arc<Partition> {
 
         let virtio0 = crate::driver::block::virtio_blk::virtio_blk_0();
         if virtio0.is_none() {
-            error!("Failed to get virtio_blk_0");
+            kerror!("Failed to get virtio_blk_0");
             loop {
                 spin_loop();
             }
@@ -142,12 +142,12 @@ fn root_partition() -> Arc<Partition> {
     }
 }
 pub fn mount_root_fs() -> Result<(), SystemError> {
-    info!("Try to mount FAT32 as root fs...");
+    kinfo!("Try to mount FAT32 as root fs...");
     let partiton: Arc<Partition> = root_partition();
 
     let fatfs: Result<Arc<FATFileSystem>, SystemError> = FATFileSystem::new(partiton);
     if fatfs.is_err() {
-        error!(
+        kerror!(
             "Failed to initialize fatfs, code={:?}",
             fatfs.as_ref().err()
         );
@@ -158,12 +158,12 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     let fatfs: Arc<FATFileSystem> = fatfs.unwrap();
     let r = migrate_virtual_filesystem(fatfs);
     if r.is_err() {
-        error!("Failed to migrate virtual filesystem to FAT32!");
+        kerror!("Failed to migrate virtual filesystem to FAT32!");
         loop {
             spin_loop();
         }
     }
-    info!("Successfully migrate rootfs to FAT32!");
+    kinfo!("Successfully migrate rootfs to FAT32!");
 
     return Ok(());
 }
@@ -174,14 +174,14 @@ pub fn do_mkdir_at(
     path: &str,
     mode: FileMode,
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
-    // debug!("Call do mkdir at");
+    // kdebug!("Call do mkdir at");
     let (mut current_inode, path) =
         user_path_at(&ProcessManager::current_pcb(), dirfd, path.trim())?;
     let (name, parent) = rsplit_path(&path);
     if let Some(parent) = parent {
         current_inode = current_inode.lookup(parent)?;
     }
-    // debug!("mkdir at {:?}", current_inode.metadata()?.inode_id);
+    // kdebug!("mkdir at {:?}", current_inode.metadata()?.inode_id);
     return current_inode.mkdir(name, ModeType::from_bits_truncate(mode.bits()));
 }
 
@@ -239,7 +239,7 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::EPERM);
     }
 
-    let (filename, parent_path) = rsplit_path(&remain_path);
+    let (filename, parent_path) = rsplit_path(path);
     // 查找父目录
     let parent_inode: Arc<dyn IndexNode> = inode_begin
         .lookup_follow_symlink(parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;

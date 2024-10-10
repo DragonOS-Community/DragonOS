@@ -1,7 +1,6 @@
 use core::sync::atomic::AtomicU32;
 
 use alloc::{sync::Arc, vec::Vec};
-use log::{debug, error, info};
 use system_error::SystemError;
 
 use crate::{
@@ -203,14 +202,14 @@ impl SmpCpuManager {
                 continue;
             }
 
-            debug!("Bring up CPU {}", cpu_id.data());
+            kdebug!("Bring up CPU {}", cpu_id.data());
 
             if let Err(e) = self.cpu_up(cpu_id, CpuHpState::Online) {
-                error!("Failed to bring up CPU {}: {:?}", cpu_id.data(), e);
+                kerror!("Failed to bring up CPU {}: {:?}", cpu_id.data(), e);
             }
         }
 
-        info!("All non-boot CPUs have been brought up");
+        kinfo!("All non-boot CPUs have been brought up");
     }
 
     fn cpu_up(&self, cpu_id: ProcessorId, target_state: CpuHpState) -> Result<(), SystemError> {
@@ -219,7 +218,7 @@ impl SmpCpuManager {
         }
 
         let cpu_state = self.cpuhp_state(cpu_id).state;
-        debug!(
+        kdebug!(
             "cpu_up: cpu_id: {}, cpu_state: {:?}, target_state: {:?}",
             cpu_id.data(),
             cpu_state,

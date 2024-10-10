@@ -1,5 +1,4 @@
 use alloc::{sync::Arc, vec::Vec};
-use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -201,7 +200,7 @@ impl ConsoleSwitch for BlittingFbConsole {
             vc_data.font.height = font.height;
             vc_data.font.count = font.char_count;
         } else {
-            warn!("The frontend Framebuffer is not implemented");
+            kwarn!("The frontend Framebuffer is not implemented");
         }
 
         vc_data.color_mode = fb.color_depth() != 1;

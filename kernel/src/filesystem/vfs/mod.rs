@@ -20,16 +20,10 @@ use crate::{
         casting::DowncastArc,
         spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::{fault::PageFaultMessage, VmFaultReason},
     time::PosixTimeSpec,
 };
 
-use self::{
-    core::generate_inode_id,
-    file::{FileMode, PageCache},
-    syscall::ModeType,
-    utils::DName,
-};
+use self::{core::generate_inode_id, file::FileMode, syscall::ModeType, utils::DName};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
 
 /// vfs容许的最大的路径名称长度
@@ -356,14 +350,6 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
-    fn kernel_ioctl(
-        &self,
-        _arg: Arc<dyn crate::net::event_poll::KernelIoctlData>,
-        _data: &FilePrivateData,
-    ) -> Result<usize, SystemError> {
-        return Err(SystemError::ENOSYS);
-    }
-
     /// @brief 获取inode所在的文件系统的指针
     fn fs(&self) -> Arc<dyn FileSystem>;
 
@@ -561,14 +547,6 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// - Err(SystemError): If there is an error in finding the parent directory
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         return self.find("..");
-    }
-
-    fn page_cache(&self) -> Option<Arc<PageCache>> {
-        log::error!(
-            "function page_cache() has not yet been implemented for inode:{}",
-            crate::libs::name::get_type_name(&self)
-        );
-        None
     }
 }
 
@@ -819,25 +797,6 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     fn name(&self) -> &str;
 
     fn super_block(&self) -> SuperBlock;
-
-    unsafe fn fault(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
-        panic!(
-            "fault() has not yet been implemented for filesystem: {}",
-            crate::libs::name::get_type_name(&self)
-        )
-    }
-
-    unsafe fn map_pages(
-        &self,
-        _pfm: &mut PageFaultMessage,
-        _start_pgoff: usize,
-        _end_pgoff: usize,
-    ) -> VmFaultReason {
-        panic!(
-            "map_pages() has not yet been implemented for filesystem: {}",
-            crate::libs::name::get_type_name(&self)
-        )
-    }
 }
 
 impl DowncastArc for dyn FileSystem {
@@ -923,7 +882,7 @@ macro_rules! producefs {
         match $initializer_slice.iter().find(|&m| m.name == $filesystem) {
             Some(maker) => maker.call(),
             None => {
-                log::error!("mismatch filesystem type : {}", $filesystem);
+                kerror!("mismatch filesystem type : {}", $filesystem);
                 Err(SystemError::EINVAL)
             }
         }

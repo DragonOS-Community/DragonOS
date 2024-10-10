@@ -1,7 +1,6 @@
 use core::intrinsics::likely;
 
 use alloc::sync::Arc;
-use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -32,7 +31,6 @@ pub struct KernelWaitOption<'a> {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct WaitIdInfo {
     pub pid: Pid,
     pub status: i32,
@@ -71,11 +69,11 @@ pub fn kernel_wait4(
         pidtype = PidType::MAX;
     } else if pid < 0 {
         pidtype = PidType::PGID;
-        warn!("kernel_wait4: currently not support pgid, default to wait for pid\n");
+        kwarn!("kernel_wait4: currently not support pgid, default to wait for pid\n");
         pid = -pid;
     } else if pid == 0 {
         pidtype = PidType::PGID;
-        warn!("kernel_wait4: currently not support pgid, default to wait for pid\n");
+        kwarn!("kernel_wait4: currently not support pgid, default to wait for pid\n");
         pid = ProcessManager::current_pcb().pid().data() as i64;
     } else {
         pidtype = PidType::PID;
@@ -169,7 +167,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
             schedule(SchedMode::SM_NONE);
         } else {
             // todo: 对于pgid的处理
-            warn!("kernel_wait4: currently not support {:?}", kwo.pid_type);
+            kwarn!("kernel_wait4: currently not support {:?}", kwo.pid_type);
             return Err(SystemError::EINVAL);
         }
     }
@@ -227,7 +225,7 @@ fn do_waitpid(
         }
         ProcessState::Exited(status) => {
             let pid = child_pcb.pid();
-            // debug!("wait4: child exited, pid: {:?}, status: {status}\n", pid);
+            // kdebug!("wait4: child exited, pid: {:?}, status: {status}\n", pid);
 
             if likely(!kwo.options.contains(WaitOption::WEXITED)) {
                 return None;
@@ -246,7 +244,7 @@ fn do_waitpid(
             kwo.ret_status = status as i32;
 
             drop(child_pcb);
-            // debug!("wait4: to release {pid:?}");
+            // kdebug!("wait4: to release {pid:?}");
             unsafe { ProcessManager::release(pid) };
             return Some(Ok(pid.into()));
         }

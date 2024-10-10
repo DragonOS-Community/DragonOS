@@ -72,7 +72,7 @@ impl SysFS {
 
         let target_abs_path = "/sys".to_string() + &self.kernfs_path(&target_inode).to_owned();
         // let current_path = self.kernfs_path(inode);
-        // debug!("sysfs: create link {} to {}", current_path, target_abs_path);
+        // kdebug!("sysfs: create link {} to {}", current_path, target_abs_path);
 
         let kn = inode.add_link(name.clone(), &target_inode, target_abs_path);
         if kn.is_ok() {

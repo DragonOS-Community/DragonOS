@@ -1,6 +1,5 @@
 use core::intrinsics::unlikely;
 
-use log::error;
 use system_error::SystemError;
 
 use crate::libs::{
@@ -89,7 +88,7 @@ impl MemBlockManager {
             .expect("Failed to count blocks to add!");
 
         if inner.initial_memory_regions_num + blocks_to_add > INITIAL_MEMORY_REGIONS_NUM {
-            error!("Too many memory regions!");
+            kerror!("Too many memory regions!");
             return Err(SystemError::ENOMEM);
         }
 
@@ -204,7 +203,7 @@ impl MemBlockManager {
 
                 if this.base + this.size != next_base || this.flags != next_flags {
                     if unlikely(this.base + this.size > next_base) {
-                        panic!("this->base + this->size > next->base");
+                        kBUG!("this->base + this->size > next->base");
                     }
                     i += 1;
                     continue;

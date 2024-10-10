@@ -1,8 +1,6 @@
 use core::hint::spin_loop;
 
-use log::error;
-
-use crate::{arch::CurrentIrqArch, exception::InterruptArch, process::ProcessManager};
+use crate::{arch::CurrentIrqArch, exception::InterruptArch, kBUG, process::ProcessManager};
 
 impl ProcessManager {
     /// 每个核的idle进程
@@ -11,11 +9,11 @@ impl ProcessManager {
             if CurrentIrqArch::is_irq_enabled() {
                 riscv::asm::wfi();
             } else {
-                error!("Idle process should not be scheduled with IRQs disabled.");
+                kBUG!("Idle process should not be scheduled with IRQs disabled.");
                 spin_loop();
             }
 
-            // debug!("idle loop");
+            // kdebug!("idle loop");
         }
     }
 }

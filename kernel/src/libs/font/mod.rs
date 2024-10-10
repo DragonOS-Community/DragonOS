@@ -2,7 +2,6 @@ use self::font_type::vga8x16::FONT_VGA_8X16;
 
 pub mod font_type;
 
-#[allow(dead_code)]
 pub struct FontDesc {
     pub index: usize,
     pub name: &'static str,

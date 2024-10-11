@@ -25,10 +25,6 @@ pub fn kenrel_cmdline_param_manager() -> &'static KernelCmdlineManager {
     &KERNEL_CMDLINE_PARAM_MANAGER
 }
 
-// kernel_cmdline_param_arg!(ARG_INIT, init, false, false);
-// kernel_cmdline_param_kv!(KV_INIT, init, "1234");
-// kernel_cmdline_param_early_kv!(EARLY_KV_INIT, init, "123");
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KCmdlineParamType {
     /// bool类型参数
@@ -73,36 +69,45 @@ impl KernelCmdlineParamBuilder {
         self
     }
 
-    pub const fn build(self) -> KernelCmdlineParameter {
-        match self.ty {
-            KCmdlineParamType::Arg => KernelCmdlineParameter::Arg(KernelCmdlineArg {
-                name: self.name,
-                value: self.default_bool,
-                initialized: false,
-                inv: self.inv,
-                default: self.default_bool,
-            }),
-            KCmdlineParamType::KV => KernelCmdlineParameter::KV(KernelCmdlineKV {
-                name: self.name,
-                value: None,
-                initialized: false,
-                default: self.default_str,
-            }),
-            KCmdlineParamType::EarlyKV => KernelCmdlineParameter::EarlyKV(KernelCmdlineEarlyKV {
+    pub const fn build_early_kv(self) -> Option<KernelCmdlineEarlyKV> {
+        if matches!(self.ty, KCmdlineParamType::EarlyKV) {
+            Some(KernelCmdlineEarlyKV {
                 name: self.name,
                 value: [0; KernelCmdlineEarlyKV::VALUE_MAX_LEN],
                 index: 0,
                 initialized: false,
                 default: self.default_str,
-            }),
+            })
+        } else {
+            None
+        }
+    }
+
+    pub const fn build(self) -> Option<KernelCmdlineParameter> {
+        match self.ty {
+            KCmdlineParamType::Arg => Some(KernelCmdlineParameter::Arg(KernelCmdlineArg {
+                name: self.name,
+                value: self.default_bool,
+                initialized: false,
+                inv: self.inv,
+                default: self.default_bool,
+            })),
+            KCmdlineParamType::KV => Some(KernelCmdlineParameter::KV(KernelCmdlineKV {
+                name: self.name,
+                value: None,
+                initialized: false,
+                default: self.default_str,
+            })),
+            _ => None,
         }
     }
 }
 
+#[allow(dead_code)]
 pub enum KernelCmdlineParameter {
     Arg(KernelCmdlineArg),
     KV(KernelCmdlineKV),
-    EarlyKV(KernelCmdlineEarlyKV),
+    EarlyKV(&'static KernelCmdlineEarlyKV),
 }
 
 impl KernelCmdlineParameter {
@@ -129,8 +134,7 @@ impl KernelCmdlineParameter {
             KernelCmdlineParameter::KV(v) => v
                 .value
                 .as_ref()
-                .map(|v| str::from_utf8(v.as_bytes()).ok())
-                .flatten(),
+                .and_then(|v| str::from_utf8(v.as_bytes()).ok()),
             KernelCmdlineParameter::EarlyKV(v) => v.value_str(),
         }
     }
@@ -152,7 +156,7 @@ impl KernelCmdlineParameter {
     /// # Safety
     ///
     /// 只能在内核初始化阶段pid0使用！
-    #[inline(never)]
+    #[allow(clippy::mut_from_ref)]
     unsafe fn force_mut(&self) -> &mut Self {
         let p = self as *const Self as *mut Self;
         p.as_mut().unwrap()
@@ -200,6 +204,17 @@ impl KernelCmdlineEarlyKV {
 
     pub fn value_str(&self) -> Option<&str> {
         core::str::from_utf8(&self.value[..self.index]).ok()
+    }
+
+    /// 强行获取可变引用
+    ///
+    /// # Safety
+    ///
+    /// 只能在内核初始化阶段pid0使用！
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn force_mut(&self) -> &mut Self {
+        let p = self as *const Self as *mut Self;
+        p.as_mut().unwrap()
     }
 }
 
@@ -251,6 +266,7 @@ impl KernelCmdlineManager {
                 let param = unsafe { param.force_mut() };
                 match param {
                     KernelCmdlineParameter::EarlyKV(p) => {
+                        let p = unsafe { p.force_mut() };
                         if let Some(value) = value {
                             let value = value.as_bytes();
                             let len = value.len().min(KernelCmdlineEarlyKV::VALUE_MAX_LEN);
@@ -270,6 +286,7 @@ impl KernelCmdlineManager {
             let x = unsafe { x.force_mut() };
             if let KernelCmdlineParameter::EarlyKV(v) = x {
                 if !v.initialized {
+                    let v = unsafe { v.force_mut() };
                     let len = v.default.len().min(KernelCmdlineEarlyKV::VALUE_MAX_LEN);
                     v.value[..len].copy_from_slice(v.default.as_bytes());
                     v.index = len;
@@ -290,7 +307,7 @@ impl KernelCmdlineManager {
                 if inner.init_path.is_none() {
                     panic!("cmdline: init proc path is not set while init proc args are set");
                 }
-                if argument.len() > 0 {
+                if !argument.is_empty() {
                     inner.init_args.push(CString::new(argument).unwrap());
                 }
                 continue;
@@ -351,7 +368,7 @@ impl KernelCmdlineManager {
                     inner
                         .init_envs
                         .push(CString::new(format!("{}={}", option, val)).unwrap());
-                } else if option.len() > 0 {
+                } else if !option.is_empty() {
                     inner.init_args.push(CString::new(option).unwrap());
                 }
             }

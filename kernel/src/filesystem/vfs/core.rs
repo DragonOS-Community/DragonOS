@@ -130,7 +130,7 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     block_dev_manager().print_gendisks();
     let gendisk = if let Some(rootfs_dev_path) = ROOTFS_PATH_PARAM.value_str() {
         try_find_gendisk_as_rootfs(rootfs_dev_path)
-            .expect(&format!("Failed to find rootfs device {}", rootfs_dev_path))
+            .unwrap_or_else(|| panic!("Failed to find rootfs device {}", rootfs_dev_path))
     } else {
         ROOTFS_TRY_LIST
             .iter()

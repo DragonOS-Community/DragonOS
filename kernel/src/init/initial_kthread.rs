@@ -89,7 +89,12 @@ fn switch_to_user() -> ! {
             &mut proc_init_info,
             &mut trap_frame,
         )
-        .expect(format!("Failed to run specified init process: {:?}", path).as_str());
+        .unwrap_or_else(|e| {
+            panic!(
+                "Failed to run specified init process: {:?}, err: {:?}",
+                path, e
+            )
+        });
     } else {
         let mut ok = false;
         for path in INIT_PROC_TRYLIST.iter() {
@@ -116,7 +121,7 @@ fn try_to_run_init_process(
 ) -> Result<(), SystemError> {
     proc_init_info.proc_name = CString::new(path).unwrap();
     proc_init_info.args.insert(0, CString::new(path).unwrap());
-    if let Err(e) = run_init_process(&proc_init_info, trap_frame) {
+    if let Err(e) = run_init_process(proc_init_info, trap_frame) {
         if e != SystemError::ENOENT {
             error!(
                 "Failed to run init process: {path} exists but couldn't execute it (error {:?})",
@@ -136,16 +141,6 @@ fn run_init_process(
 ) -> Result<(), SystemError> {
     compiler_fence(Ordering::SeqCst);
     let path = proc_init_info.proc_name.to_str().unwrap();
-
-    debug!("Init proc arguments:");
-
-    for arg in &proc_init_info.args {
-        debug!("arg: {:?}", arg);
-    }
-    debug!("Init proc environments:");
-    for env in &proc_init_info.envs {
-        debug!("env: {:?}", env);
-    }
 
     Syscall::do_execve(
         path.to_string(),

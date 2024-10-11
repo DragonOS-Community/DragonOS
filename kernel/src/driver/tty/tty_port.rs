@@ -88,7 +88,7 @@ pub trait TtyPort: Sync + Send + Debug {
             return ld.receive_buf(tty, buf, None, count);
         }
 
-        EventPoll::wakeup_epoll(&tty.core().eptiems(), None)?;
+        EventPoll::wakeup_epoll(tty.core().eptiems(), None)?;
 
         ret
     }

@@ -5,7 +5,7 @@ use log::{error, info};
 use system_error::SystemError;
 
 use crate::{
-    driver::base::block::manager::block_dev_manager,
+    driver::base::block::{gendisk::GenDisk, manager::block_dev_manager},
     filesystem::{
         devfs::devfs_init,
         fat::fs::FATFileSystem,
@@ -28,6 +28,7 @@ use super::{
 
 /// 当没有指定根文件系统时，尝试的根文件系统列表
 const ROOTFS_TRY_LIST: [&str; 4] = ["/dev/sda1", "/dev/sda", "/dev/vda1", "/dev/vda"];
+kernel_cmdline_param_kv!(ROOTFS_PATH_PARAM, root, "");
 
 /// @brief 原子地生成新的Inode号。
 /// 请注意，所有的inode号都需要通过该函数来生成.全局的inode号，除了以下两个特殊的以外，都是唯一的
@@ -116,20 +117,26 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     return Ok(());
 }
 
+fn try_find_gendisk_as_rootfs(path: &str) -> Option<Arc<GenDisk>> {
+    if let Some(gd) = block_dev_manager().lookup_gendisk_by_path(path) {
+        info!("Use {} as rootfs", path);
+        return Some(gd);
+    }
+    return None;
+}
+
 pub fn mount_root_fs() -> Result<(), SystemError> {
     info!("Try to mount root fs...");
     block_dev_manager().print_gendisks();
-
-    let gendisk = ROOTFS_TRY_LIST
-        .iter()
-        .find_map(|&path| {
-            if let Some(gd) = block_dev_manager().lookup_gendisk_by_path(path) {
-                info!("Use {} as rootfs", path);
-                return Some(gd);
-            }
-            return None;
-        })
-        .ok_or(SystemError::ENODEV)?;
+    let gendisk = if let Some(rootfs_dev_path) = ROOTFS_PATH_PARAM.value_str() {
+        try_find_gendisk_as_rootfs(rootfs_dev_path)
+            .expect(&format!("Failed to find rootfs device {}", rootfs_dev_path))
+    } else {
+        ROOTFS_TRY_LIST
+            .iter()
+            .find_map(|&path| try_find_gendisk_as_rootfs(path))
+            .ok_or(SystemError::ENODEV)?
+    };
 
     let fatfs: Result<Arc<FATFileSystem>, SystemError> = FATFileSystem::new(gendisk);
     if fatfs.is_err() {

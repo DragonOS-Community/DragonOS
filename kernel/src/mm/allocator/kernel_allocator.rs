@@ -51,7 +51,7 @@ impl KernelAllocator {
         return Ok(NonNull::from(slice));
     }
 
-    unsafe fn free_in_buddy(&self, ptr: *mut u8, layout: Layout) {
+    pub(super) unsafe fn free_in_buddy(&self, ptr: *mut u8, layout: Layout) {
         // 由于buddy分配的页数量是2的幂，因此释放的时候也需要按照2的幂向上取整。
         let count = (page_align_up(layout.size()) / MMArch::PAGE_SIZE).next_power_of_two();
         let page_frame_count = PageFrameCount::new(count);

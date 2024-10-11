@@ -65,7 +65,12 @@ pub enum AllocationError {
 /// Needs to adhere to safety requirements of a rust allocator (see GlobalAlloc et. al.).
 pub unsafe trait Allocator<'a> {
     fn allocate(&mut self, layout: Layout) -> Result<NonNull<u8>, AllocationError>;
-    fn deallocate(&mut self, ptr: NonNull<u8>, layout: Layout) -> Result<(), AllocationError>;
+    unsafe fn deallocate(
+        &mut self,
+        ptr: NonNull<u8>,
+        layout: Layout,
+        slab_callback: &'static dyn CallBack,
+    ) -> Result<(), AllocationError>;
 
     /// Refill the allocator with a [`ObjectPage`].
     ///
@@ -76,4 +81,9 @@ pub unsafe trait Allocator<'a> {
         layout: Layout,
         new_page: &'a mut ObjectPage<'a>,
     ) -> Result<(), AllocationError>;
+}
+
+/// 将slab_page归还Buddy的回调函数
+pub trait CallBack: Send + Sync {
+    unsafe fn free_slab_page(&self, _: *mut u8, _: usize) {}
 }

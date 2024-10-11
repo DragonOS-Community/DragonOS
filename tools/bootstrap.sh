@@ -232,6 +232,7 @@ rustInstall() {
 
         echo "正在安装DragonOS所需的rust组件...首次安装需要一些时间来更新索引，请耐心等待..."
         cargo install cargo-binutils
+		cargo install bpf-linker
 		rustup toolchain install nightly-2023-08-15-x86_64-unknown-linux-gnu
 		rustup toolchain install $RUST_VERSION-x86_64-unknown-linux-gnu
 		rustup component add rust-src --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu

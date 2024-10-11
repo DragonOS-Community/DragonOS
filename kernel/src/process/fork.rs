@@ -166,6 +166,9 @@ impl ProcessManager {
 
         let pcb = ProcessControlBlock::new(name, new_kstack);
 
+        pcb.sig_info_mut()
+            .set_tty(current_pcb.sig_info_irqsave().tty());
+
         let mut args = KernelCloneArgs::new();
         args.flags = clone_flags;
         args.exit_signal = Signal::SIGCHLD;

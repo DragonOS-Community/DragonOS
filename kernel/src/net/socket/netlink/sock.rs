@@ -1,34 +1,33 @@
-// Sock flags in Rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SockFlags {
-    SockDead,
-    SockDone,
-    SockUrginline,
-    SockKeepopen,
-    SockLinger,
-    SockDestroy,
-    SockBroadcast,
-    SockTimestamp,
-    SockZapped,
-    SockUseWriteQueue,          // whether to call sk->sk_write_space in sock_wfree
-    SockDbg,                    // %SO_DEBUG setting
-    SockRcvtstamp,              // %SO_TIMESTAMP setting
-    SockRcvtstampns,            // %SO_TIMESTAMPNS setting
-    SockLocalroute,             // route locally only, %SO_DONTROUTE setting
-    SockMemalloc,               // VM depends on this socket for swapping
-    SockTimestampingRxSoftware, // %SOF_TIMESTAMPING_RX_SOFTWARE
-    SockFasync,                 // fasync() active
-    SockRxqOvfl,
-    SockZerocopy,   // buffers from userspace
-    SockWifiStatus, // push wifi status to userspace
-    SockNofcs,      // Tell NIC not to do the Ethernet FCS.
+    Dead,
+    Done,
+    Urginline,
+    Keepopen,
+    Linger,
+    Destroy,
+    Broadcast,
+    Timestamp,
+    Zapped,
+    UseWriteQueue,          // whether to call sk->sk_write_space in _wfree
+    Dbg,                    // %SO_DEBUG setting
+    Rcvtstamp,              // %SO_TIMESTAMP setting
+    Rcvtstampns,            // %SO_TIMESTAMPNS setting
+    Localroute,             // route locally only, %SO_DONTROUTE setting
+    Memalloc,               // VM depends on this et for swapping
+    TimestampingRxSoftware, // %SOF_TIMESTAMPING_RX_SOFTWARE
+    Fasync,                 // fasync() active
+    RxqOvfl,
+    Zerocopy,   // buffers from userspace
+    WifiStatus, // push wifi status to userspace
+    Nofcs,      // Tell NIC not to do the Ethernet FCS.
     // Will use last 4 bytes of packet sent from
     // user-space instead.
-    SockFilterLocked,   // Filter cannot be changed anymore
-    SockSelectErrQueue, // Wake select on error queue
-    SockRcuFree,        // wait rcu grace period in sk_destruct()
-    SockTxtime,
-    SockXdp,       // XDP is attached
-    SockTstampNew, // Indicates 64 bit timestamps always
-    SockRcvmark,   // Receive SO_MARK ancillary data with packet
+    FilterLocked,   // Filter cannot be changed anymore
+    SelectErrQueue, // Wake select on error queue
+    RcuFree,        // wait rcu grace period in sk_destruct()
+    Txtime,
+    Xdp,       // XDP is attached
+    TstampNew, // Indicates 64 bit timestamps always
+    Rcvmark,   // Receive SO_MARK ancillary data with packet
 }

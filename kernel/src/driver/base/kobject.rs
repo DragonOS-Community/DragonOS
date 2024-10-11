@@ -333,11 +333,9 @@ impl KObjectManager {
             length -= cur;
             let parent_name = parent.name();
             let name = parent_name.as_bytes();
-            for i in 0..cur {
-                path[length + i] = name[i];
-            }
+            path[length..(cur + length)].copy_from_slice(&name[..cur]);
             length -= 1;
-            path[length] = '/' as u8;
+            path[length] = b'/';
             if let Some(weak_parent) = parent.parent() {
                 if let Some(upgraded_parent) = weak_parent.upgrade() {
                     parent = upgraded_parent;

@@ -19,12 +19,14 @@ use crate::{
         },
         serial::{AtomicBaudRate, BaudRate, DivisorFraction, UartPort},
         tty::{
+            console::ConsoleSwitch,
             kthread::send_to_tty_refresh_thread,
             termios::WindowSize,
             tty_core::{TtyCore, TtyCoreData},
             tty_driver::{TtyDriver, TtyDriverManager, TtyOperation},
-            virtual_terminal::{vc_manager, VirtConsole},
+            virtual_terminal::{vc_manager, virtual_console::VirtualConsoleData, VirtConsole},
         },
+        video::console::dummycon::dummy_console,
     },
     exception::{
         irqdata::IrqHandlerData,
@@ -32,7 +34,7 @@ use crate::{
         manage::irq_manager,
         IrqNumber,
     },
-    libs::rwlock::RwLock,
+    libs::{rwlock::RwLock, spinlock::SpinLock},
 };
 use system_error::SystemError;
 
@@ -265,9 +267,20 @@ impl UartPort for Serial8250PIOPort {
     }
 
     fn handle_irq(&self) -> Result<(), SystemError> {
-        if let Some(c) = self.read_one_byte() {
-            send_to_tty_refresh_thread(&[c]);
+        let mut buf = [0; 8];
+        let mut index = 0;
+
+        // Read up to the size of the buffer
+        while index < buf.len() {
+            if let Some(c) = self.read_one_byte() {
+                buf[index] = c;
+                index += 1;
+            } else {
+                break; // No more bytes to read
+            }
         }
+
+        send_to_tty_refresh_thread(&buf[0..index]);
         Ok(())
     }
 
@@ -385,7 +398,18 @@ impl TtyOperation for Serial8250PIOTtyDriverInner {
         if tty.core().index() >= unsafe { PIO_PORTS.len() } {
             return Err(SystemError::ENODEV);
         }
-        let vc = VirtConsole::new(None);
+
+        *tty.core().window_size_write() = WindowSize::DEFAULT;
+        let vc_data = Arc::new(SpinLock::new(VirtualConsoleData::new(usize::MAX)));
+        let mut vc_data_guard = vc_data.lock_irqsave();
+        vc_data_guard.set_driver_funcs(Arc::downgrade(&dummy_console()) as Weak<dyn ConsoleSwitch>);
+        vc_data_guard.init(
+            Some(tty.core().window_size().row.into()),
+            Some(tty.core().window_size().col.into()),
+            true,
+        );
+        drop(vc_data_guard);
+        let vc = VirtConsole::new(Some(vc_data));
         let vc_index = vc_manager().alloc(vc.clone()).ok_or(SystemError::EBUSY)?;
         self.do_install(driver, tty, vc.clone()).inspect_err(|_| {
             vc_manager().free(vc_index);

@@ -137,7 +137,7 @@ impl IndexNode for EventFdInode {
 
         let pollflag = EPollEventType::from_bits_truncate(self.poll(&data)? as u32);
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
+        EventPoll::wakeup_epoll(&self.epitems, Some(pollflag))?;
 
         return Ok(8);
     }
@@ -184,7 +184,7 @@ impl IndexNode for EventFdInode {
 
         let pollflag = EPollEventType::from_bits_truncate(self.poll(&data)? as u32);
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
+        EventPoll::wakeup_epoll(&self.epitems, Some(pollflag))?;
         return Ok(8);
     }
 

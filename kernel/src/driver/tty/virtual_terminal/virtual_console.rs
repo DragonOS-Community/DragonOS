@@ -206,7 +206,7 @@ impl VirtualConsoleData {
         }
     }
 
-    pub(super) fn init(&mut self, rows: Option<usize>, cols: Option<usize>, clear: bool) {
+    pub fn init(&mut self, rows: Option<usize>, cols: Option<usize>, clear: bool) {
         if let Some(rows) = rows {
             self.rows = rows;
         }
@@ -242,7 +242,7 @@ impl VirtualConsoleData {
         self.driver_funcs.as_ref().unwrap().upgrade().unwrap()
     }
 
-    pub(super) fn set_driver_funcs(&mut self, func: Weak<dyn ConsoleSwitch>) {
+    pub fn set_driver_funcs(&mut self, func: Weak<dyn ConsoleSwitch>) {
         self.driver_funcs = Some(func);
     }
 
@@ -312,7 +312,7 @@ impl VirtualConsoleData {
     ///
     /// ### 返回值
     /// ### （转换后的字符:i32，是否需要更多的数据才能进行转换:bool）
-    pub(super) fn translate(&mut self, c: &mut u32) -> (Option<u32>, bool) {
+    pub fn translate(&mut self, c: &mut u32) -> (Option<u32>, bool) {
         if self.vc_state != VirtualConsoleState::ESnormal {
             // 在控制字符状态下不需要翻译
             return (Some(*c), false);
@@ -440,7 +440,7 @@ impl VirtualConsoleData {
     const CTRL_ALWAYS: u32 = 0x0800f501;
 
     /// ## 用于判断tc(终端字符)在当前VC下是不是需要显示的控制字符
-    pub(super) fn is_control(&self, tc: u32, c: u32) -> bool {
+    pub fn is_control(&self, tc: u32, c: u32) -> bool {
         // 当前vc状态机不在正常状态，即在接收特殊字符的状态，则是控制字符
         if self.vc_state != VirtualConsoleState::ESnormal {
             return true;
@@ -1257,7 +1257,7 @@ impl VirtualConsoleData {
 
     /// ## 处理终端控制字符
     #[inline(never)]
-    pub(super) fn do_control(&mut self, ch: u32) {
+    pub fn do_control(&mut self, ch: u32) {
         // 首先检查是否处于 ANSI 控制字符串状态
         if self.vc_state.is_ansi_control_string() && (8..=13).contains(&ch) {
             return;
@@ -1534,12 +1534,7 @@ impl VirtualConsoleData {
     }
 
     #[inline(never)]
-    pub(super) fn console_write_normal(
-        &mut self,
-        mut tc: u32,
-        c: u32,
-        draw: &mut DrawRegion,
-    ) -> bool {
+    pub fn console_write_normal(&mut self, mut tc: u32, c: u32, draw: &mut DrawRegion) -> bool {
         let mut attr = self.attr;
         let himask = self.hi_font_mask;
         let charmask = if himask == 0 { 0xff } else { 0x1ff };
@@ -1753,7 +1748,7 @@ impl VirtualConsoleData {
         return (self.attr & 0x88) | ((self.attr & 0x70) >> 4) | ((self.attr & 0x07) << 4);
     }
 
-    pub(super) fn flush(&self, draw: &mut DrawRegion) {
+    pub fn flush(&self, draw: &mut DrawRegion) {
         if draw.x.is_none() {
             return;
         }

@@ -400,6 +400,15 @@ impl IndexNode for MountFSInode {
     }
 
     #[inline]
+    fn kernel_ioctl(
+        &self,
+        arg: Arc<dyn crate::net::event_poll::KernelIoctlData>,
+        data: &FilePrivateData,
+    ) -> Result<usize, SystemError> {
+        return self.inner_inode.kernel_ioctl(arg, data);
+    }
+
+    #[inline]
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
         return self.inner_inode.list();
     }

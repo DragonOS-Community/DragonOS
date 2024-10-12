@@ -1,6 +1,5 @@
 //! PIO的串口驱动
 
-use alloc::vec::Vec;
 use core::{
     hint::spin_loop,
     sync::atomic::{AtomicBool, Ordering},
@@ -268,12 +267,14 @@ impl UartPort for Serial8250PIOPort {
     }
 
     fn handle_irq(&self) -> Result<(), SystemError> {
-        let mut buf = Vec::new();
+        let mut buf = [0; 4];
+        let mut index = 0;
         while let Some(c) = self.read_one_byte() {
-            buf.push(c);
+            buf[index] = c;
+            index += 1;
         }
 
-        send_to_tty_refresh_thread(&buf);
+        send_to_tty_refresh_thread(&buf[0..index]);
         Ok(())
     }
 

@@ -267,11 +267,17 @@ impl UartPort for Serial8250PIOPort {
     }
 
     fn handle_irq(&self) -> Result<(), SystemError> {
-        let mut buf = [0; 4];
+        let mut buf = [0; 8];
         let mut index = 0;
-        while let Some(c) = self.read_one_byte() {
-            buf[index] = c;
-            index += 1;
+
+        // Read up to the size of the buffer
+        while index < buf.len() {
+            if let Some(c) = self.read_one_byte() {
+                buf[index] = c;
+                index += 1;
+            } else {
+                break; // No more bytes to read
+            }
         }
 
         send_to_tty_refresh_thread(&buf[0..index]);

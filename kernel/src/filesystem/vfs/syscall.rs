@@ -1624,7 +1624,13 @@ impl Syscall {
         let pathname = user_access::check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
-        return do_fchownat(AtFlags::AT_FDCWD.bits(), &pathname, uid, gid, 0);
+        return do_fchownat(
+            AtFlags::AT_FDCWD.bits(),
+            &pathname,
+            uid,
+            gid,
+            AtFlags::AT_STATX_SYNC_AS_STAT,
+        );
     }
 
     pub fn lchown(pathname: *const u8, uid: usize, gid: usize) -> Result<usize, SystemError> {
@@ -1636,7 +1642,7 @@ impl Syscall {
             &pathname,
             uid,
             gid,
-            AtFlags::AT_SYMLINK_NOFOLLOW.bits() as u32,
+            AtFlags::AT_SYMLINK_NOFOLLOW,
         );
     }
 
@@ -1645,11 +1651,12 @@ impl Syscall {
         pathname: *const u8,
         uid: usize,
         gid: usize,
-        flags: u32,
+        flags: i32,
     ) -> Result<usize, SystemError> {
         let pathname = user_access::check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
+        let flags = AtFlags::try_from(flags)?;
         return do_fchownat(dirfd, &pathname, uid, gid, flags);
     }
 

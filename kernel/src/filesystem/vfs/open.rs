@@ -69,14 +69,14 @@ pub fn do_fchownat(
     path: &str,
     uid: usize,
     gid: usize,
-    flag: u32,
+    flag: AtFlags,
 ) -> Result<usize, SystemError> {
     // 检查flag是否合法
-    if (flag & (!((AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH).bits() as u32))) != 0 {
+    if (flag & (!((AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH)))) != AtFlags::AT_STATX_SYNC_AS_STAT {
         return Err(SystemError::EINVAL);
     }
 
-    let follow_symlink = flag & AtFlags::AT_SYMLINK_NOFOLLOW.bits() as u32 == 0;
+    let follow_symlink = flag & AtFlags::AT_SYMLINK_NOFOLLOW == AtFlags::AT_STATX_SYNC_AS_STAT;
 
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 

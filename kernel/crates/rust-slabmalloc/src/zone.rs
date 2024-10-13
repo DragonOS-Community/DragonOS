@@ -3,7 +3,6 @@
 //! The ZoneAllocator achieves this by having many `SCAllocator`
 
 use crate::*;
-use core::sync::atomic::Ordering;
 
 /// Creates an instance of a zone, we do this in a macro because we
 /// re-use the code in const and non-const functions
@@ -139,16 +138,8 @@ impl<'a> ZoneAllocator<'a> {
 
             // 遍历scallocator中的部分分配的page(partial_page)
             for slab_page in scallocator.slabs.iter_mut() {
-                // 统计page中还可以分配多少个object
-                let mut free_obj_count = 0;
-                // 遍历page中的bitfield(用来统计内存分配情况的u64数组)
-                for b in slab_page.bitfield().iter() {
-                    let bitval = b.load(Ordering::Relaxed);
-                    let free_count = bitval.count_zeros() as usize;
-                    free_obj_count += free_count;
-                }
                 // 剩余可分配object数乘上page中规定的每个object的大小，即空闲空间
-                free += free_obj_count * scallocator.size();
+                free += slab_page.free_obj_count() * scallocator.size();
             }
             // 遍历scallocator中的empty_page，把空页空间也加上去
             free +=
@@ -178,9 +169,15 @@ unsafe impl<'a> crate::Allocator<'a> for ZoneAllocator<'a> {
     /// # Arguments
     ///  * `ptr` - Address of the memory location to free.
     ///  * `layout` - Memory layout of the block pointed to by `ptr`.
-    fn deallocate(&mut self, ptr: NonNull<u8>, layout: Layout) -> Result<(), AllocationError> {
+    ///  * `slab_callback` - The callback function to free slab_page in buddy.
+    unsafe fn deallocate(
+        &mut self,
+        ptr: NonNull<u8>,
+        layout: Layout,
+        slab_callback: &'static dyn CallBack,
+    ) -> Result<(), AllocationError> {
         match ZoneAllocator::get_slab(layout.size()) {
-            Slab::Base(idx) => self.small_slabs[idx].deallocate(ptr, layout),
+            Slab::Base(idx) => self.small_slabs[idx].deallocate(ptr, layout, slab_callback),
             Slab::Unsupported => Err(AllocationError::InvalidLayout),
         }
     }

@@ -10,8 +10,8 @@ use crate::{
         spinlock::SpinLock,
     },
     mm::{
-        allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper, page::EntryFlags, mmio_buddy::mmio_pool
-        MemoryManagementArch,
+        allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper, mmio_buddy::mmio_pool,
+        page::EntryFlags, MemoryManagementArch,
     },
     time::timer::{Timer, TimerFunction},
 };

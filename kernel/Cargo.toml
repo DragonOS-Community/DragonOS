@@ -10,7 +10,7 @@ edition = "2021"
 crate-type = ["staticlib"]
 
 [workspace]
-members = [ 
+members = [
     "crates/*",
 ]
 
@@ -57,7 +57,6 @@ wait_queue_macros = { path = "crates/wait_queue_macros" }
 paste = "=1.0.14"
 slabmalloc = { path = "crates/rust-slabmalloc" }
 log = "0.4.21"
-xarray = "0.1.0"
 lru = "0.12.3"
 
 # target为x86_64时，使用下面的依赖

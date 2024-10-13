@@ -360,7 +360,7 @@ impl InnerAddressSpace {
             | VmFlags::VM_MAYWRITE
             | VmFlags::VM_MAYEXEC;
         // debug!("map_anonymous: len = {}", len);
-      
+
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
 

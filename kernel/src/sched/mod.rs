@@ -111,7 +111,6 @@ pub trait Scheduler {
         flags: WakeupFlags,
     );
 
-    #[allow(dead_code)]
     /// ## 选择接下来最适合运行的任务
     #[allow(dead_code)]
     fn pick_task(rq: &mut CpuRunQueue) -> Option<Arc<ProcessControlBlock>>;

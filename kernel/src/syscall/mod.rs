@@ -998,7 +998,7 @@ impl Syscall {
                 let pathname = args[1] as *const u8;
                 let uid = args[2];
                 let gid = args[3];
-                let flag = args[4] as u32;
+                let flag = args[4] as i32;
                 Self::fchownat(dirfd, pathname, uid, gid, flag)
             }
 

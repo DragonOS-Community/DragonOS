@@ -5,6 +5,7 @@ use unified_init::macros::unified_init;
 
 use crate::{
     driver::base::{
+        device::CommonAttrGroup,
         kobject::{KObjType, KObject, KObjectManager, KObjectSysFSOps},
         kset::KSet,
     },
@@ -45,7 +46,7 @@ impl KObjType for IrqKObjType {
     }
 
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
-        Some(&[&IrqAttrGroup])
+        Some(&[&IrqAttrGroup, &CommonAttrGroup])
     }
 
     fn release(&self, _kobj: Arc<dyn KObject>) {

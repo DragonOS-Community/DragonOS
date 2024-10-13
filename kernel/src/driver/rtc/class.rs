@@ -9,10 +9,11 @@ use unified_init::macros::unified_init;
 use crate::{
     driver::base::{
         class::{class_manager, Class},
-        device::{device_manager, sys_dev_char_kset},
+        device::{device_manager, sys_dev_char_kset, CommonAttrGroup},
         kobject::KObject,
         subsys::SubSysPrivate,
     },
+    filesystem::sysfs::AttributeGroup,
     init::initcall::INITCALL_SUBSYS,
     time::{timekeeping::do_settimeofday64, PosixTimeSpec},
 };
@@ -77,6 +78,9 @@ impl Class for RtcClass {
 
     fn subsystem(&self) -> &SubSysPrivate {
         return &self.subsystem;
+    }
+    fn dev_groups(&self) -> &'static [&'static dyn AttributeGroup] {
+        return &[&CommonAttrGroup];
     }
 }
 

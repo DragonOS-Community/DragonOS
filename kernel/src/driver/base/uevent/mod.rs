@@ -157,13 +157,16 @@ impl Attribute for UeventAttr {
                 writeln!(&mut uevent_content, "DEVTYPE=char").unwrap();
             }
             DeviceType::Net => {
-                // let net_device = device.cast::<dyn Iface>().ok().ok_or(SystemError::EINVAL)?;
-                // let ifindex = net_device.ifindex().expect("Find ifindex error.\n");
+                let net_device = device.clone().cast::<dyn Iface>().map_err(|e: Arc<dyn Device>| {
+                    warn!("device:{:?} is not a net device!", e);
+                    SystemError::EINVAL
+                })?;
+                let iface_id = net_device.nic_id();
                 // let device_name = net_device.iface_name();
                 let device_name = device.name();
-                writeln!(&mut uevent_content, "DEVTYPE=net").unwrap();
+                // writeln!(&mut uevent_content, "DEVTYPE=net").unwrap();
                 writeln!(&mut uevent_content, "INTERFACE={}", device_name).unwrap();
-                // writeln!(&mut uevent_content, "IFINDEX={}", ifindex).unwrap();
+                writeln!(&mut uevent_content, "IFINDEX={}", iface_id).unwrap();
             }
             DeviceType::Bus => {
                 // 处理总线设备类型

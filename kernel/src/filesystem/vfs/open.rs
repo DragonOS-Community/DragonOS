@@ -9,12 +9,12 @@ use super::{
     utils::{rsplit_path, user_path_at},
     FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
-use crate::filesystem::vfs::syscall::UtimensFlags;
-use crate::time::{syscall::PosixTimeval, PosixTimeSpec};
+use crate::{process::cred::GroupInfo, time::{syscall::PosixTimeval, PosixTimeSpec}};
 use crate::{
     driver::base::block::SeekFrom, process::ProcessManager,
     syscall::user_access::check_and_clone_cstr,
 };
+use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
 use alloc::string::String;
 
 pub(super) fn do_faccessat(
@@ -72,12 +72,11 @@ pub fn do_fchownat(
     flag: AtFlags,
 ) -> Result<usize, SystemError> {
     // 检查flag是否合法
-    if (flag & (!((AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH)))) != AtFlags::AT_STATX_SYNC_AS_STAT {
+    if flag.contains(!(AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH)) {
         return Err(SystemError::EINVAL);
     }
 
-    let follow_symlink = flag & AtFlags::AT_SYMLINK_NOFOLLOW == AtFlags::AT_STATX_SYNC_AS_STAT;
-
+    let follow_symlink = flag.contains(!AtFlags::AT_SYMLINK_NOFOLLOW);
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
     // 如果找不到文件，则返回错误码ENOENT

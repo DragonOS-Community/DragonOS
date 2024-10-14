@@ -1,3 +1,5 @@
+use system_error::SystemError;
+
 const F_LINUX_SPECIFIC_BASE: u32 = 1024;
 
 /// fcntl syscall command
@@ -101,6 +103,28 @@ bitflags! {
         /// 应用于整个子树。
         /// AT_RECURSIVE: 0x8000
         const AT_RECURSIVE = 0x8000;
+    }
+}
+
+impl TryFrom<i32> for AtFlags {
+    type Error = SystemError;
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        let valid_flags = AtFlags::AT_SYMLINK_NOFOLLOW.bits
+            | AtFlags::AT_EACCESS.bits
+            | AtFlags::AT_REMOVEDIR.bits
+            | AtFlags::AT_SYMLINK_FOLLOW.bits
+            | AtFlags::AT_NO_AUTOMOUNT.bits
+            | AtFlags::AT_EMPTY_PATH.bits
+            | AtFlags::AT_STATX_SYNC_TYPE.bits
+            | AtFlags::AT_STATX_SYNC_AS_STAT.bits
+            | AtFlags::AT_STATX_FORCE_SYNC.bits
+            | AtFlags::AT_STATX_DONT_SYNC.bits
+            | AtFlags::AT_RECURSIVE.bits;
+        if value & !valid_flags != 0 {
+            return Err(SystemError::EINVAL);
+        }
+
+        Ok(AtFlags::from_bits_truncate(value))
     }
 }
 

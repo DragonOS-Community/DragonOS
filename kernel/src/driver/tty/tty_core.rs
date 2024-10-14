@@ -31,7 +31,7 @@ use super::{
         TtyLineDiscipline,
     },
     tty_port::TtyPort,
-    virtual_terminal::{vc_manager, virtual_console::VirtualConsoleData},
+    virtual_terminal::{vc_manager, virtual_console::VirtualConsoleData, DrawRegion},
 };
 
 #[derive(Debug)]
@@ -103,7 +103,7 @@ impl TtyCore {
         self.line_discipline.clone()
     }
 
-    pub fn write_without_serial(&self, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
+    pub fn write_to_core(&self, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
         self.core
             .driver()
             .driver_funcs()
@@ -488,6 +488,61 @@ impl TtyCoreData {
     #[inline]
     pub fn add_epitem(&self, epitem: Arc<EPollItem>) {
         self.epitems.lock().push_back(epitem)
+    }
+
+    pub fn eptiems(&self) -> &SpinLock<LinkedList<Arc<EPollItem>>> {
+        &self.epitems
+    }
+
+    pub fn do_write(&self, buf: &[u8], mut nr: usize) -> Result<usize, SystemError> {
+        // 关闭中断
+        if let Some(vc_data) = self.vc_data() {
+            let mut vc_data_guard = vc_data.lock_irqsave();
+            let mut offset = 0;
+
+            // 这个参数是用来扫描unicode字符的，但是这部分目前未完成，先写着
+            let mut rescan = false;
+            let mut ch: u32 = 0;
+
+            let mut draw = DrawRegion::default();
+
+            // 首先隐藏光标再写
+            vc_data_guard.hide_cursor();
+
+            while nr != 0 {
+                if !rescan {
+                    ch = buf[offset] as u32;
+                    offset += 1;
+                    nr -= 1;
+                }
+
+                let (tc, rescan_last) = vc_data_guard.translate(&mut ch);
+                if tc.is_none() {
+                    // 表示未转换完成
+                    continue;
+                }
+
+                let tc = tc.unwrap();
+                rescan = rescan_last;
+
+                if vc_data_guard.is_control(tc, ch) {
+                    vc_data_guard.flush(&mut draw);
+                    vc_data_guard.do_control(ch);
+                    continue;
+                }
+
+                if !vc_data_guard.console_write_normal(tc, ch, &mut draw) {
+                    continue;
+                }
+            }
+
+            vc_data_guard.flush(&mut draw);
+
+            // TODO: notify update
+            return Ok(offset);
+        } else {
+            return Ok(0);
+        }
     }
 }
 

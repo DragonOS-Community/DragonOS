@@ -9,12 +9,15 @@ use super::{
     utils::{rsplit_path, user_path_at},
     FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
-use crate::{process::cred::GroupInfo, time::{syscall::PosixTimeval, PosixTimeSpec}};
 use crate::{
     driver::base::block::SeekFrom, process::ProcessManager,
     syscall::user_access::check_and_clone_cstr,
 };
 use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
+use crate::{
+    process::cred::GroupInfo,
+    time::{syscall::PosixTimeval, PosixTimeSpec},
+};
 use alloc::string::String;
 
 pub(super) fn do_faccessat(
@@ -101,8 +104,33 @@ pub fn do_fchownat(
 
 fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usize, SystemError> {
     let mut meta = inode.metadata()?;
-    meta.uid = uid;
-    meta.gid = gid;
+    let cred = ProcessManager::current_pcb().cred();
+    let current_uid = cred.uid.data();
+    let current_gid = cred.gid.data();
+    let mut group_info = GroupInfo::default();
+    if let Some(info) = cred.group_info.as_ref() {
+        group_info = info.clone();
+    }
+
+    // 检查权限
+    match current_uid {
+        0 => {
+            meta.uid = uid;
+            meta.gid = gid;
+        }
+        _ => {
+            // 非文件所有者不能更改信息，且不能更改uid
+            if current_uid != meta.uid || uid != meta.uid {
+                return Err(SystemError::EPERM);
+            }
+            if gid != current_gid && !group_info.gids.contains(&Kgid::from(gid)) {
+                return Err(SystemError::EPERM);
+            }
+            meta.gid = gid;
+        }
+    }
+
+    meta.mode.remove(ModeType::S_ISUID | ModeType::S_ISGID);
     inode.set_metadata(&meta)?;
 
     return Ok(0);

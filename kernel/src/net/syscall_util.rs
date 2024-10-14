@@ -312,7 +312,7 @@ impl From<Endpoint> for SockAddr {
                 }
                 let addr_un = SockAddrUn {
                     sun_family: AddressFamily::Unix as u16,
-                    sun_path: sun_path,
+                    sun_path,
                 };
                 return SockAddr { addr_un };
             }

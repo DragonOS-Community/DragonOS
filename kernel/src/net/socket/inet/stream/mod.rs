@@ -185,15 +185,19 @@ impl TcpSocket {
     }
 
     pub fn try_recv(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        self.inner.read().as_ref().map(|inner| {
-            inner.iface().unwrap().poll();
-            let result = match inner {
-                Inner::Established(inner) => inner.recv_slice(buf),
-                _ => Err(EINVAL),
-            };
-            inner.iface().unwrap().poll();
-            result
-        }).unwrap()
+        self.inner
+            .read()
+            .as_ref()
+            .map(|inner| {
+                inner.iface().unwrap().poll();
+                let result = match inner {
+                    Inner::Established(inner) => inner.recv_slice(buf),
+                    _ => Err(EINVAL),
+                };
+                inner.iface().unwrap().poll();
+                result
+            })
+            .unwrap()
     }
 
     pub fn try_send(&self, buf: &[u8]) -> Result<usize, SystemError> {
@@ -238,7 +242,7 @@ impl Socket for TcpSocket {
     fn get_name(&self) -> Result<Endpoint, SystemError> {
         match self.inner.read().as_ref().expect("Tcp Inner is None") {
             Inner::Init(Init::Unbound(_)) => Ok(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT)),
-            Inner::Init(Init::Bound((_, local))) => Ok(Endpoint::Ip(local.clone())),
+            Inner::Init(Init::Bound((_, local))) => Ok(Endpoint::Ip(*local)),
             Inner::Connecting(connecting) => Ok(Endpoint::Ip(connecting.get_name())),
             Inner::Established(established) => Ok(Endpoint::Ip(established.local_endpoint())),
             Inner::Listening(listening) => Ok(Endpoint::Ip(listening.get_name())),

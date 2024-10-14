@@ -255,12 +255,12 @@ impl IfaceCommon {
             }
         });
 
-            // let closed_sockets = self
-            //     .closing_sockets
-            //     .lock_irq_disabled()
-            //     .extract_if(|closing_socket| closing_socket.is_closed())
-            //     .collect::<Vec<_>>();
-            // drop(closed_sockets);
+        // let closed_sockets = self
+        //     .closing_sockets
+        //     .lock_irq_disabled()
+        //     .extract_if(|closing_socket| closing_socket.is_closed())
+        //     .collect::<Vec<_>>();
+        // drop(closed_sockets);
         // }
     }
 

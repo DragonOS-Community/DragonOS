@@ -230,11 +230,7 @@ impl Socket for SeqpacketSocket {
         if !self.is_nonblocking() {
             loop {
                 wq_wait_event_interruptible!(self.wait_queue, self.is_acceptable(), {})?;
-                match self
-                    .try_accept()
-                    .map(|(seqpacket_socket, remote_endpoint)| {
-                        (seqpacket_socket, Endpoint::from(remote_endpoint))
-                    }) {
+                match self.try_accept() {
                     Ok((socket, epoint)) => return Ok((socket, epoint)),
                     Err(_) => continue,
                 }
@@ -274,7 +270,7 @@ impl Socket for SeqpacketSocket {
         };
 
         if let Some(endpoint) = endpoint {
-            return Ok(Endpoint::from(endpoint));
+            return Ok(endpoint);
         } else {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
@@ -289,7 +285,7 @@ impl Socket for SeqpacketSocket {
         };
 
         if let Some(endpoint) = endpoint {
-            return Ok(Endpoint::from(endpoint));
+            return Ok(endpoint);
         } else {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }

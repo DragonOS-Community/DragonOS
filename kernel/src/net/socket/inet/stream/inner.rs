@@ -3,6 +3,7 @@ use core::sync::atomic::{AtomicU32, AtomicUsize};
 use crate::libs::rwlock::RwLock;
 use crate::net::socket::EPollEventType;
 use crate::net::socket::{self, inet::Types};
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use smoltcp;
 use system_error::SystemError::{self, *};
@@ -30,13 +31,13 @@ where
 
 #[derive(Debug)]
 pub enum Init {
-    Unbound(smoltcp::socket::tcp::Socket<'static>),
+    Unbound(Box<smoltcp::socket::tcp::Socket<'static>>),
     Bound((socket::inet::BoundInner, smoltcp::wire::IpEndpoint)),
 }
 
 impl Init {
     pub(super) fn new() -> Self {
-        Init::Unbound(new_smoltcp_socket())
+        Init::Unbound(Box::new(new_smoltcp_socket()))
     }
 
     /// 传入一个已经绑定的socket
@@ -55,7 +56,7 @@ impl Init {
     ) -> Result<Self, SystemError> {
         match self {
             Init::Unbound(socket) => {
-                let bound = socket::inet::BoundInner::bind(socket, &local_endpoint.addr)?;
+                let bound = socket::inet::BoundInner::bind(*socket, &local_endpoint.addr)?;
                 bound
                     .port_manager()
                     .bind_port(Types::Tcp, local_endpoint.port)?;
@@ -73,7 +74,7 @@ impl Init {
         match self {
             Init::Unbound(socket) => {
                 let (bound, address) =
-                    socket::inet::BoundInner::bind_ephemeral(socket, remote_endpoint.addr)
+                    socket::inet::BoundInner::bind_ephemeral(*socket, remote_endpoint.addr)
                         .map_err(|err| (Self::new(), err))?;
                 let bound_port = bound
                     .port_manager()

@@ -1,7 +1,10 @@
-use libc::{sockaddr, sockaddr_storage, recvfrom, bind, sendto, socket, AF_NETLINK, SOCK_DGRAM, SOCK_CLOEXEC, getpid, c_void};
+use libc::{
+    bind, c_void, getpid, recvfrom, sendto, sockaddr, sockaddr_storage, socket, AF_NETLINK,
+    SOCK_CLOEXEC, SOCK_DGRAM,
+};
 use nix::libc;
 use std::os::unix::io::RawFd;
-use std::{ mem, io};
+use std::{io, mem};
 
 #[repr(C)]
 struct Nlmsghdr {
@@ -14,7 +17,11 @@ struct Nlmsghdr {
 
 fn create_netlink_socket() -> io::Result<RawFd> {
     let sockfd = unsafe {
-        socket(AF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC, libc::NETLINK_KOBJECT_UEVENT)
+        socket(
+            AF_NETLINK,
+            SOCK_DGRAM | SOCK_CLOEXEC,
+            libc::NETLINK_KOBJECT_UEVENT,
+        )
     };
 
     if sockfd < 0 {
@@ -33,7 +40,11 @@ fn bind_netlink_socket(sock: RawFd) -> io::Result<()> {
     addr.nl_groups = 0;
 
     let ret = unsafe {
-        bind(sock, &addr as *const _ as *const sockaddr, mem::size_of::<libc::sockaddr_nl>() as u32)
+        bind(
+            sock,
+            &addr as *const _ as *const sockaddr,
+            mem::size_of::<libc::sockaddr_nl>() as u32,
+        )
     };
 
     if ret < 0 {
@@ -90,7 +101,10 @@ fn receive_uevent(sock: RawFd) -> io::Result<String> {
     // 检查套接字文件描述符是否有效
     if sock < 0 {
         println!("Invalid socket file descriptor: {}", sock);
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid socket file descriptor"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid socket file descriptor",
+        ));
     }
 
     let mut buf = [0u8; 1024];
@@ -100,7 +114,10 @@ fn receive_uevent(sock: RawFd) -> io::Result<String> {
     // 检查缓冲区指针和长度是否有效
     if buf.is_empty() {
         println!("Buffer is empty");
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Buffer is empty"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Buffer is empty",
+        ));
     }
     let len = unsafe {
         recvfrom(
@@ -122,13 +139,19 @@ fn receive_uevent(sock: RawFd) -> io::Result<String> {
     let nlmsghdr_size = mem::size_of::<Nlmsghdr>();
     if (len as usize) < nlmsghdr_size {
         println!("Received message is too short");
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Received message is too short"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Received message is too short",
+        ));
     }
 
     let nlmsghdr = unsafe { &*(buf.as_ptr() as *const Nlmsghdr) };
     if nlmsghdr.nlmsg_len as isize > len {
         println!("Received message is incomplete");
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Received message is incomplete"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Received message is incomplete",
+        ));
     }
 
     let message_data = &buf[nlmsghdr_size..nlmsghdr.nlmsg_len as usize];

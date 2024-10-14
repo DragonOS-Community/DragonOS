@@ -3,6 +3,7 @@ use core::{hint::spin_loop, sync::atomic::Ordering};
 use alloc::sync::Arc;
 use log::{error, info};
 use system_error::SystemError;
+use uefi::proto::console::gop::Mode;
 
 use crate::{
     driver::base::block::{gendisk::GenDisk, manager::block_dev_manager},
@@ -243,6 +244,19 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 
     // 删除文件
     parent_inode.unlink(filename)?;
+
+    return Ok(0);
+}
+
+pub fn do_symlinkat(oldname: &str, newdfd: i32, newname: &str) -> Result<usize, SystemError> {
+    let binding = ProcessManager::current_pcb().fd_table();
+    let fd_table_guard = binding.read();
+    let inode = fd_table_guard
+        .get_file_by_fd(newdfd)
+        .ok_or(SystemError::EBADF)?
+        .inode();
+    drop(fd_table_guard);
+    inode.create(newname, FileType::SymLink, ModeType::from_bits_truncate(0o777))?;
 
     return Ok(0);
 }

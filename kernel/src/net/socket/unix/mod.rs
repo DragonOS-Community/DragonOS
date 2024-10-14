@@ -1,5 +1,6 @@
 pub(crate) mod seqpacket;
-mod stream;
+pub mod stream;
+pub mod ns;
 use crate::{filesystem::vfs::InodeId, libs::rwlock::RwLock, net::socket::*};
 use alloc::sync::Arc;
 use hashbrown::HashMap;

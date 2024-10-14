@@ -1656,8 +1656,9 @@ impl Syscall {
         let pathname = user_access::check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
-        let flags = AtFlags::try_from(flags)?;
-        return do_fchownat(dirfd, &pathname, uid, gid, flags);
+        let pathname = pathname.as_str().trim();
+        let flags = AtFlags::from_bits_truncate(flags);
+        return do_fchownat(dirfd, pathname, uid, gid, flags);
     }
 
     pub fn fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError> {

@@ -164,13 +164,7 @@ impl Cred {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GroupInfo {
     pub gids: Vec<Kgid>,
-}
-
-impl Default for GroupInfo {
-    fn default() -> Self {
-        Self { gids: Vec::new() }
-    }
 }

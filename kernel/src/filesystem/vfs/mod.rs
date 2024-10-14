@@ -690,7 +690,7 @@ impl dyn IndexNode {
         &self,
         path: &str,
         max_follow_times: usize,
-        follow_final_symlink: bool, 
+        follow_final_symlink: bool,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         if self.metadata()?.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);

@@ -126,7 +126,7 @@ impl Init {
         } else {
             smoltcp::wire::IpListenEndpoint::from(local)
         };
-        log::debug!("listen at {:?}", listen_addr);
+        // log::debug!("listen at {:?}", listen_addr);
         let mut inners = Vec::new();
         if let Err(err) = || -> Result<(), SystemError> {
             for _ in 0..(backlog - 1) {

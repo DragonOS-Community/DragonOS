@@ -41,18 +41,18 @@ impl Syscall {
         protocol: usize,
     ) -> Result<usize, SystemError> {
         // 打印收到的参数
-        log::debug!(
-            "socket: address_family={:?}, socket_type={:?}, protocol={:?}",
-            address_family,
-            socket_type,
-            protocol
-        );
+        // log::debug!(
+        //     "socket: address_family={:?}, socket_type={:?}, protocol={:?}",
+        //     address_family,
+        //     socket_type,
+        //     protocol
+        // );
         let address_family = socket::AddressFamily::try_from(address_family as u16)?;
         let type_arg = SysArgSocketType::from_bits_truncate(socket_type as u32);
         let is_nonblock = type_arg.is_nonblock();
         let is_close_on_exec = type_arg.is_cloexec();
         let stype = socket::Type::try_from(type_arg)?;
-        log::debug!("type_arg {:?}  stype {:?}", type_arg, stype);
+        // log::debug!("type_arg {:?}  stype {:?}", type_arg, stype);
 
         let inode = socket::create_socket(
             address_family,
@@ -256,7 +256,7 @@ impl Syscall {
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        log::debug!("bind: socket={:?}", socket);
+        // log::debug!("bind: socket={:?}", socket);
         socket.bind(endpoint)?;
         Ok(0)
     }

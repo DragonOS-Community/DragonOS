@@ -256,7 +256,7 @@ impl Socket for SeqpacketSocket {
     }
 
     fn close(&self) -> Result<(), SystemError> {
-        log::debug!("seqpacket close");
+        // log::debug!("seqpacket close");
         self.shutdown.recv_shutdown();
         self.shutdown.send_shutdown();
         Ok(())
@@ -398,7 +398,7 @@ impl Socket for SeqpacketSocket {
         flags: MessageFlag,
         _address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
-        log::debug!("recvfrom flags {:?}", flags);
+        // log::debug!("recvfrom flags {:?}", flags);
         if flags.contains(MessageFlag::OOB) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
@@ -413,7 +413,7 @@ impl Socket for SeqpacketSocket {
                 match &*self.inner.write() {
                     Inner::Connected(connected) => match connected.recv_slice(buffer) {
                         Ok(usize) => {
-                            log::debug!("recvs from successfully");
+                            // log::debug!("recvs from successfully");
                             return Ok((usize, connected.peer_endpoint().unwrap().clone()));
                         }
                         Err(_) => continue,

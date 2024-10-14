@@ -1,3 +1,4 @@
+
 use std::io::Error;
 use std::os::fd::RawFd;
 use std::fs;
@@ -25,10 +26,11 @@ fn bind_socket(fd: RawFd) -> Result<(), Error> {
             sun_family: AF_UNIX as u16,
             sun_path: [0; 108],
         };
+        addr.sun_path[0] = 0;
         let path_cstr = CString::new(SOCKET_PATH).unwrap();
         let path_bytes = path_cstr.as_bytes();
         for (i, &byte) in path_bytes.iter().enumerate() {
-            addr.sun_path[i] = byte as i8;
+            addr.sun_path[i+1] = byte as i8;
         }
 
         if bind(fd, &addr as *const _ as *const sockaddr, mem::size_of_val(&addr) as socklen_t) == -1 {
@@ -104,11 +106,12 @@ fn test_stream() -> Result<(), Error> {
             sun_family: AF_UNIX as u16,
             sun_path: [0; 108],
         };
+        addr.sun_path[0] = 0;
         let path_cstr = CString::new(SOCKET_PATH).unwrap();
         let path_bytes = path_cstr.as_bytes();
 
         for (i, &byte) in path_bytes.iter().enumerate() {
-            addr.sun_path[i] = byte as i8;
+            addr.sun_path[i+1] = byte as i8;
         }
 
         if connect(client_fd, &addr as *const _ as *const sockaddr, mem::size_of_val(&addr) as socklen_t) == -1 {

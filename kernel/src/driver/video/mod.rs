@@ -9,10 +9,7 @@ use crate::{
         rwlock::{RwLock, RwLockReadGuard},
         spinlock::SpinLock,
     },
-    mm::{
-        allocator::page_frame::PageFrameCount, kernel_mapper::KernelMapper, mmio_buddy::mmio_pool,
-        page::EntryFlags, MemoryManagementArch,
-    },
+    mm::{mmio_buddy::mmio_pool, page::EntryFlags},
     time::timer::{Timer, TimerFunction},
 };
 use alloc::{boxed::Box, sync::Arc};
@@ -102,15 +99,8 @@ impl VideoRefreshManager {
         }
         // 地址映射
         let paddr = bp.screen_info.lfb_base;
-        let count = PageFrameCount::new(
-            page_align_up(frame_buffer_info_guard.buf_size()) / MMArch::PAGE_SIZE,
-        );
         let page_flags: EntryFlags<MMArch> = EntryFlags::new().set_execute(true).set_write(true);
 
-        let mut kernel_mapper = KernelMapper::lock();
-        let mut kernel_mapper = kernel_mapper.as_mut();
-        assert!(kernel_mapper.is_some());
-        let mut vaddr = buf_vaddr;
         unsafe {
             mmio_guard
                 .map_phys_with_flags(paddr, page_align_up(buf_size), page_flags)

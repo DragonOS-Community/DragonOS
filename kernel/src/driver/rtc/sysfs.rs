@@ -9,7 +9,8 @@ use crate::{
     driver::base::{
         class::Class,
         device::{
-            bus::Bus, device_manager, driver::Driver, Device, DeviceCommonData, DeviceType, IdTable,
+            bus::Bus, device_manager, driver::Driver, CommonAttrGroup, Device, DeviceCommonData,
+            DeviceType, IdTable,
         },
         kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,
@@ -172,7 +173,7 @@ impl Device for RtcGeneralDevice {
         true
     }
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
-        Some(&[&RtcAttrGroup])
+        Some(&[&RtcAttrGroup, &CommonAttrGroup])
     }
 
     fn dev_parent(&self) -> Option<Weak<dyn Device>> {

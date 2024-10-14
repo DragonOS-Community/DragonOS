@@ -18,7 +18,7 @@ use crate::{
             device_manager,
             device_number::{DeviceNumber, Major},
             driver::Driver,
-            sys_dev_char_kset, Device, DeviceCommonData, DeviceType, IdTable,
+            sys_dev_char_kset, CommonAttrGroup, Device, DeviceCommonData, DeviceType, IdTable,
         },
         kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,
@@ -111,6 +111,10 @@ impl Class for GraphicsClass {
 
     fn subsystem(&self) -> &SubSysPrivate {
         return &self.subsystem;
+    }
+
+    fn dev_groups(&self) -> &'static [&'static dyn AttributeGroup] {
+        return &[&CommonAttrGroup];
     }
 }
 
@@ -373,7 +377,7 @@ impl Device for FbDevice {
     }
 
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
-        Some(&[&FbDeviceAttrGroup])
+        Some(&[&FbDeviceAttrGroup, &CommonAttrGroup])
     }
 
     fn dev_parent(&self) -> Option<Weak<dyn Device>> {

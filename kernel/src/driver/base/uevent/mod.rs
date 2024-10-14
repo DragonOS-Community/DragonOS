@@ -19,6 +19,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use intertrait::cast::CastArc;
+use log::warn;
 use system_error::SystemError;
 
 use super::block::block_device::{BlockDevice, BlockDeviceOps};
@@ -128,46 +129,60 @@ impl Attribute for UeventAttr {
 
     /// 用户空间读取 uevent 文件，返回 uevent 信息
     fn show(&self, _kobj: Arc<dyn KObject>, _buf: &mut [u8]) -> Result<usize, SystemError> {
-        let device: Arc<dyn KObject> = _kobj
-            .parent()
-            .and_then(|x| x.upgrade())
-            .ok_or(SystemError::ENODEV)?;
-        let device = kobj2device(device).ok_or(SystemError::EINVAL)?;
+        let device = _kobj.cast::<dyn Device>().map_err(|e: Arc<dyn KObject>| {
+            warn!("device:{:?} is not a device!", e);
+            SystemError::EINVAL
+        })?;
+        log::info!("show uevent");
         let device_type = device.dev_type();
         let mut uevent_content = String::new();
+        log::info!("device_type: {:?}", device_type);
         match device_type {
             DeviceType::Block => {
-                let block_device = device
-                    .cast::<dyn BlockDevice>()
-                    .ok()
-                    .ok_or(SystemError::EINVAL)?;
-                let major = block_device.id_table().device_number().major().data();
-                let minor = block_device.id_table().device_number().minor();
-                let device_name = block_device.id_table().name();
+                let major = device.id_table().device_number().major().data();
+                let minor = device.id_table().device_number().minor();
+                let device_name = device.id_table().name();
                 writeln!(&mut uevent_content, "MAJOR={:?}", major).unwrap();
                 writeln!(&mut uevent_content, "MINOR={:?}", minor).unwrap();
                 writeln!(&mut uevent_content, "DEVNAME={}", device_name).unwrap();
                 writeln!(&mut uevent_content, "DEVTYPE=disk").unwrap();
             }
             DeviceType::Char => {
-                let char_device = device
-                    .cast::<dyn CharDevice>()
-                    .ok()
-                    .ok_or(SystemError::EINVAL)?;
-                let major = char_device.id_table().device_number().major().data();
-                let minor = char_device.id_table().device_number().minor();
-                let device_name = char_device.id_table().name();
+                let major = device.id_table().device_number().major().data();
+                let minor = device.id_table().device_number().minor();
+                let device_name = device.id_table().name();
                 writeln!(&mut uevent_content, "MAJOR={}", major).unwrap();
                 writeln!(&mut uevent_content, "MINOR={}", minor).unwrap();
                 writeln!(&mut uevent_content, "DEVNAME={}", device_name).unwrap();
                 writeln!(&mut uevent_content, "DEVTYPE=char").unwrap();
             }
             DeviceType::Net => {
-                let net_device = device.cast::<dyn Iface>().ok().ok_or(SystemError::EINVAL)?;
-                // let ifindex = net_device.ifindex().expect("Find ifindex error.\n");
-                let device_name = net_device.iface_name();
+                let net_device = device.clone().cast::<dyn Iface>().map_err(|e: Arc<dyn Device>| {
+                    warn!("device:{:?} is not a net device!", e);
+                    SystemError::EINVAL
+                })?;
+                let iface_id = net_device.nic_id();
+                let device_name = device.name();
                 writeln!(&mut uevent_content, "INTERFACE={}", device_name).unwrap();
-                // writeln!(&mut uevent_content, "IFINDEX={}", ifindex).unwrap();
+                writeln!(&mut uevent_content, "IFINDEX={}", iface_id).unwrap();
+            }
+            DeviceType::Bus => {
+                // 处理总线设备类型
+                let device_name = device.name();
+                writeln!(&mut uevent_content, "DEVNAME={}", device_name).unwrap();
+                writeln!(&mut uevent_content, "DEVTYPE=bus").unwrap();
+            }
+            DeviceType::Rtc => {
+                // 处理RTC设备类型
+                let device_name = device.name();
+                writeln!(&mut uevent_content, "DEVNAME={}", device_name).unwrap();
+                writeln!(&mut uevent_content, "DEVTYPE=rtc").unwrap();
+            }
+            DeviceType::Pci => {
+                // 处理PCI设备类型
+                let device_name = device.name();
+                writeln!(&mut uevent_content, "DEVNAME={}", device_name).unwrap();
+                writeln!(&mut uevent_content, "DEVTYPE=pci").unwrap();
             }
             _ => {
                 // 处理其他设备类型
@@ -180,17 +195,15 @@ impl Attribute for UeventAttr {
     }
     /// 捕获来自用户空间对 uevent 文件的写操作，触发uevent事件
     fn store(&self, _kobj: Arc<dyn KObject>, _buf: &[u8]) -> Result<usize, SystemError> {
+        log::info!("store uevent");
         return kobject_synth_uevent(_buf, _kobj);
     }
 }
 
-/// 将 kobject 转换为 device
-fn kobj2device(kobj: Arc<dyn KObject>) -> Option<Arc<dyn Device>> {
-    kobj.cast::<dyn Device>().ok()
-}
 
 /// 将设备的基本信息写入 uevent 文件
 fn sysfs_emit_str(buf: &mut [u8], content: &str) -> Result<usize, SystemError> {
+    log::info!("sysfs_emit_str");
     let bytes = content.as_bytes();
     if buf.len() < bytes.len() {
         return Err(SystemError::ENOMEM);
@@ -211,7 +224,10 @@ fn kobject_synth_uevent(buf: &[u8], kobj: Arc<dyn KObject>) -> Result<usize, Sys
     };
 
     if let Err(e) = result {
-        let device = kobj2device(kobj).ok_or(SystemError::EINVAL)?;
+        let device = kobj.cast::<dyn Device>().map_err(|e: Arc<dyn KObject>| {
+            warn!("device:{:?} is not a device!", e);
+            SystemError::EINVAL
+        })?;
         let devname = device.name();
         log::error!("synth uevent: {}: {:?}", devname, e);
         return Err(SystemError::EINVAL);

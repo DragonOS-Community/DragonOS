@@ -168,3 +168,9 @@ impl Cred {
 pub struct GroupInfo {
     pub gids: Vec<Kgid>,
 }
+
+impl Default for GroupInfo {
+    fn default() -> Self {
+        Self { gids: Vec::new() }
+    }
+}

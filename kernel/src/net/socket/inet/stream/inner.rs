@@ -440,4 +440,13 @@ impl Inner {
             Inner::Established(est) => est.with_mut(|socket| socket.recv_capacity()),
         }
     }
+
+    pub fn iface(&self) -> Option<&alloc::sync::Arc<dyn crate::driver::net::Iface>> {
+        match self {
+            Inner::Init(_) => None,
+            Inner::Connecting(conn) => Some(conn.inner.iface()),
+            Inner::Listening(listen) => Some(listen.inners[0].iface()),
+            Inner::Established(est) => Some(est.inner.iface()),
+        }
+    }
 }

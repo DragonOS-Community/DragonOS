@@ -677,6 +677,87 @@ impl dyn IndexNode {
 
         return Ok(result);
     }
+
+    /// @brief 查找文件（考虑符号链接，并且考虑是否返回最终路径的符号链接文件本身）
+    ///
+    /// @param path 文件路径
+    /// @param max_follow_times 最大经过的符号链接的大小
+    /// follow_final_symlink: 是否跟随最后的符号链接
+    ///
+    /// @return Ok(Arc<dyn IndexNode>) 要寻找的目录项的inode
+    /// @return Err(SystemError) 错误码
+    pub fn lookup_follow_symlink2(
+        &self,
+        path: &str,
+        max_follow_times: usize,
+        follow_final_symlink: bool, 
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if self.metadata()?.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
+            (ROOT_INODE().clone(), String::from(rest))
+        } else {
+            (self.find(".")?, String::from(path))
+        };
+
+        while !rest_path.is_empty() {
+            if result.metadata()?.file_type != FileType::Dir {
+                return Err(SystemError::ENOTDIR);
+            }
+
+            let name;
+            match rest_path.find('/') {
+                Some(pos) => {
+                    name = String::from(&rest_path[0..pos]);
+                    rest_path = String::from(&rest_path[pos + 1..]);
+                }
+                None => {
+                    name = rest_path;
+                    rest_path = String::new();
+                }
+            }
+
+            if name.is_empty() {
+                continue;
+            }
+
+            let inode = result.find(&name)?;
+
+            // 如果已经是路径的最后一个部分，并且不希望跟随符号链接
+            if rest_path.is_empty()
+                && !follow_final_symlink
+                && inode.metadata()?.file_type == FileType::SymLink
+            {
+                return Ok(inode); // 返回符号链接本身
+            }
+
+            // 除非是最后一个部分，其他部分遇到符号链接时继续跟随
+            if inode.metadata()?.file_type == FileType::SymLink && max_follow_times > 0 {
+                let mut content = [0u8; 256];
+                let len = inode.read_at(
+                    0,
+                    256,
+                    &mut content,
+                    SpinLock::new(FilePrivateData::Unused).lock(),
+                )?;
+                let link_path = String::from(
+                    ::core::str::from_utf8(&content[..len]).map_err(|_| SystemError::ENOTDIR)?,
+                );
+                let new_path = link_path + "/" + &rest_path;
+                return result.lookup_follow_symlink2(
+                    &new_path,
+                    max_follow_times - 1,
+                    follow_final_symlink,
+                );
+            } else {
+                result = inode;
+            }
+        }
+
+        Ok(result)
+    }
 }
 
 /// IndexNode的元数据

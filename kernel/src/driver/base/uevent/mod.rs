@@ -162,9 +162,7 @@ impl Attribute for UeventAttr {
                     SystemError::EINVAL
                 })?;
                 let iface_id = net_device.nic_id();
-                // let device_name = net_device.iface_name();
                 let device_name = device.name();
-                // writeln!(&mut uevent_content, "DEVTYPE=net").unwrap();
                 writeln!(&mut uevent_content, "INTERFACE={}", device_name).unwrap();
                 writeln!(&mut uevent_content, "IFINDEX={}", iface_id).unwrap();
             }

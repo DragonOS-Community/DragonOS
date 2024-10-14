@@ -255,6 +255,20 @@ pub trait AllocablePage {
         self.bitfield().clear_bit(idx);
         Ok(())
     }
+
+    /// 统计page中还可以分配多少个object
+    fn free_obj_count(&self) -> usize {
+        // 统计page中还可以分配多少个object
+        let mut free_obj_count = 0;
+
+        // 遍历page中的bitfield(用来统计内存分配情况的u64数组)
+        for b in self.bitfield().iter() {
+            let bitval = b.load(Ordering::Relaxed);
+            free_obj_count += bitval.count_zeros() as usize;
+        }
+
+        free_obj_count
+    }
 }
 
 /// Holds allocated data within a 4 KiB page.

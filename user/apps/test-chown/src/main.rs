@@ -40,7 +40,9 @@ fn print_file_owner_group(filename: &str) -> Result<(), Error> {
 //         return Err(Error::last_os_error());
 //     }
 
-//     print_file_owner_group(filename)
+//     let _ = print_file_owner_group(filename);
+//     println!("fchownat OK");
+//     Ok(())
 // }
 
 fn test_chown(filename: &str, new_uid: uid_t, new_gid: gid_t) -> Result<(), Error> {
@@ -52,7 +54,9 @@ fn test_chown(filename: &str, new_uid: uid_t, new_gid: gid_t) -> Result<(), Erro
         return Err(Error::last_os_error());
     }
 
-    print_file_owner_group(filename)
+    let _ = print_file_owner_group(filename);
+    println!("chown OK");
+    Ok(())
 }
 
 fn test_fchown(fd: i32, new_uid: uid_t, new_gid: gid_t) -> Result<(), Error> {
@@ -64,6 +68,9 @@ fn test_fchown(fd: i32, new_uid: uid_t, new_gid: gid_t) -> Result<(), Error> {
     }
 
     // print_file_owner_group(filename);
+    println!("File descriptor owner UID: {}", new_uid);
+    println!("File descriptor group GID: {}", new_gid);
+    println!("fchown OK");
 
     Ok(())
 }
@@ -77,12 +84,14 @@ fn test_fchown(fd: i32, new_uid: uid_t, new_gid: gid_t) -> Result<(), Error> {
 //         return Err(Error::last_os_error());
 //     }
 
-//     print_file_owner_group(symlink_name)
+//     let _ = print_file_owner_group(symlink_name);
+//     println!("lchown OK");
+//     Ok(())
 // }
 
 fn main() -> Result<(), Error> {
-    let filename = "testfile.txt";
-    let symlink_name = "testsymlink";
+    let filename = "/myramfs/testfile.txt";
+    let symlink_name = "/myramfs/testsymlink";
     let new_owner = "nobody"; // 替换为你测试系统中的有效用户名
     let new_group = "nogroup"; // 替换为你测试系统中的有效组名
 
@@ -102,7 +111,7 @@ fn main() -> Result<(), Error> {
     let mut file = File::create(filename)?;
     writeln!(file, "This is a test file for chown system call")?;
 
-    // 创建符号链接
+    // // 创建符号链接
     // std::os::unix::fs::symlink(filename, symlink_name)?;
 
     // 打开文件以测试 fchown

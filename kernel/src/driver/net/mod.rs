@@ -241,24 +241,27 @@ impl IfaceCommon {
             self.poll_at_ms.store(0, Ordering::Relaxed);
         }
 
-        if has_events {
-            // log::debug!("IfaceCommon::poll: has_events");
-            // We never try to hold the write lock in the IRQ context, and we disable IRQ when
-            // holding the write lock. So we don't need to disable IRQ when holding the read lock.
-            self.bounds.read().iter().for_each(|bound_socket| {
-                bound_socket.on_iface_events();
+        // if has_events {
+
+        // log::debug!("IfaceCommon::poll: has_events");
+        // We never try to hold the write lock in the IRQ context, and we disable IRQ when
+        // holding the write lock. So we don't need to disable IRQ when holding the read lock.
+        self.bounds.read().iter().for_each(|bound_socket| {
+            bound_socket.on_iface_events();
+            if has_events {
                 bound_socket
                     .wait_queue()
                     .wakeup(Some(ProcessState::Blocked(true)));
-            });
+            }
+        });
 
-            // let closed_sockets = self
-            //     .closing_sockets
-            //     .lock_irq_disabled()
-            //     .extract_if(|closing_socket| closing_socket.is_closed())
-            //     .collect::<Vec<_>>();
-            // drop(closed_sockets);
-        }
+        // let closed_sockets = self
+        //     .closing_sockets
+        //     .lock_irq_disabled()
+        //     .extract_if(|closing_socket| closing_socket.is_closed())
+        //     .collect::<Vec<_>>();
+        // drop(closed_sockets);
+        // }
     }
 
     pub fn update_ip_addrs(&self, ip_addrs: &[smoltcp::wire::IpCidr]) -> Result<(), SystemError> {

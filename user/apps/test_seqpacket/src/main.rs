@@ -1,8 +1,8 @@
-mod seq_socket;
 mod seq_pair;
+mod seq_socket;
 
-use seq_socket::test_seq_socket;
 use seq_pair::test_seq_pair;
+use seq_socket::test_seq_socket;
 
 fn main() -> Result<(), std::io::Error> {
     if let Err(e) = test_seq_socket() {

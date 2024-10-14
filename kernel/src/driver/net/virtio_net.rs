@@ -257,7 +257,7 @@ impl Device for VirtIONetDevice {
 
 impl VirtIODevice for VirtIONetDevice {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
-        log::warn!("VirtioInterface: poll_ifaces_try_lock_onetime -> poll_ifaces");
+        // log::warn!("VirtioInterface: poll_ifaces_try_lock_onetime -> poll_ifaces");
         poll_ifaces();
         return Ok(IrqReturn::Handled);
     }

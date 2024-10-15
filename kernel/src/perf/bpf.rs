@@ -9,7 +9,7 @@ use crate::include::bindings::linux_bpf::{
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame};
 use crate::mm::page::{page_manager_lock_irqsave, Page, PageFlushAll};
-use crate::mm::MemoryManagementArch;
+use crate::mm::{MemoryManagementArch, PhysAddr};
 use crate::perf::util::{LostSamples, PerfProbeArgs, PerfSample, SampleHeader};
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -38,6 +38,7 @@ pub struct RingPage {
     ptr: usize,
     data_region_size: usize,
     lost: usize,
+    phys_addr: PhysAddr,
 }
 
 impl RingPage {
@@ -47,14 +48,15 @@ impl RingPage {
             size: 0,
             data_region_size: 0,
             lost: 0,
+            phys_addr: PhysAddr::new(0),
         }
     }
 
-    pub fn new_init(start: usize, len: usize) -> Self {
-        Self::init(start as _, len)
+    pub fn new_init(start: usize, len: usize, phys_addr: PhysAddr) -> Self {
+        Self::init(start as _, len, phys_addr)
     }
 
-    fn init(ptr: *mut u8, size: usize) -> Self {
+    fn init(ptr: *mut u8, size: usize, phys_addr: PhysAddr) -> Self {
         assert_eq!(size % PAGE_SIZE, 0);
         assert!(size / PAGE_SIZE >= 2);
         // The first page will be filled with perf_event_mmap_page
@@ -73,6 +75,7 @@ impl RingPage {
             size,
             data_region_size: size - PAGE_SIZE,
             lost: 0,
+            phys_addr,
         }
     }
 
@@ -242,7 +245,7 @@ impl BpfPerfEvent {
         }
         let virt_addr = unsafe { MMArch::phys_2_virt(phy_addr) }.unwrap();
         // create mmap page
-        let mmap_page = RingPage::new_init(virt_addr.data(), len);
+        let mmap_page = RingPage::new_init(virt_addr.data(), len, phy_addr);
         data.mmap_page = mmap_page;
         data.offset = offset;
         Ok(())
@@ -252,6 +255,21 @@ impl BpfPerfEvent {
         let mut inner_data = self.data.lock();
         inner_data.mmap_page.write_event(data);
         Ok(())
+    }
+}
+
+impl Drop for BpfPerfEvent {
+    fn drop(&mut self) {
+        let mut page_manager_guard = page_manager_lock_irqsave();
+        let data = self.data.lock();
+        let phy_addr = data.mmap_page.phys_addr;
+        let len = data.mmap_page.size;
+        let page_count = PageFrameCount::new(len / PAGE_SIZE);
+        let mut cur_phys = PhysPageFrame::new(phy_addr);
+        for i in 0..page_count.data() {
+            page_manager_guard.remove_page(&cur_phys.phys_address());
+            cur_phys = cur_phys.next();
+        }
     }
 }
 

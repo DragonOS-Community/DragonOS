@@ -22,7 +22,7 @@ use crate::{
 
 use system_error::SystemError;
 
-use super::{kset::KSet, uevent::kobject_uevent};
+use super::{device::CommonAttrGroup, kset::KSet, uevent::kobject_uevent};
 
 pub trait KObject: Any + Send + Sync + Debug + CastFromSync {
     fn as_any_ref(&self) -> &dyn core::any::Any;

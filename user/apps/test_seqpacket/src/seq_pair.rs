@@ -1,16 +1,17 @@
 use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
 use std::fs::File;
-use std::io::{Read, Write,Error};
+use std::io::{Error, Read, Write};
 use std::os::fd::FromRawFd;
 
-pub fn test_seq_pair()->Result<(),Error>{
+pub fn test_seq_pair() -> Result<(), Error> {
     // 创建 socket pair
     let (sock1, sock2) = socketpair(
         AddressFamily::Unix,
         SockType::SeqPacket, // 使用 SeqPacket 类型
         None,                // 协议默认
         SockFlag::empty(),
-    ).expect("Failed to create socket pair");
+    )
+    .expect("Failed to create socket pair");
 
     let mut socket1 = unsafe { File::from_raw_fd(sock1) };
     let mut socket2 = unsafe { File::from_raw_fd(sock2) };

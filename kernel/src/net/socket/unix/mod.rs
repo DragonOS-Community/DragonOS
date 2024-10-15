@@ -28,7 +28,7 @@ impl family::Family for Unix {
 
 impl Unix {
     pub fn new_pairs(socket_type: Type) -> Result<(Arc<Inode>, Arc<Inode>), SystemError> {
-        log::debug!("socket_type {:?}", socket_type);
+        // log::debug!("socket_type {:?}", socket_type);
         match socket_type {
             Type::SeqPacket => seqpacket::SeqpacketSocket::new_pairs(),
             Type::Stream | Type::Datagram => stream::StreamSocket::new_pairs(),

@@ -242,10 +242,7 @@ impl Socket for StreamSocket {
         //目前只实现了阻塞式实现
         loop {
             wq_wait_event_interruptible!(self.wait_queue, self.is_acceptable(), {})?;
-            match self
-                .try_accept()
-                .map(|(stream_socket, remote_endpoint)| (stream_socket, remote_endpoint))
-            {
+            match self.try_accept() {
                 Ok((socket, endpoint)) => {
                     debug!("server accept!:{:?}", endpoint);
                     return Ok((socket, endpoint));

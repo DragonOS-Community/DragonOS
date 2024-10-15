@@ -133,7 +133,7 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
                 show &= false;
             }
         }
-
+        show &= false;
         if show {
             debug!("[SYS] [Pid: {:?}] [Call: {:?}]", pid, to_print);
         }

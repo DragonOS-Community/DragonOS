@@ -101,7 +101,7 @@ impl Ping {
 
         for i in 0..this.config.count {
             let _this = this.clone();
-            let handle = thread::spawn(move||{
+            let handle = thread::spawn(move || {
                 _this.ping(i).unwrap();
             });
             _send.fetch_add(1, Ordering::SeqCst);

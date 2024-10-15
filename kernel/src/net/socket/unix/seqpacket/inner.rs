@@ -62,11 +62,7 @@ pub(super) struct Listener {
 impl Listener {
     pub(super) fn new(inode: Endpoint, backlog: usize) -> Self {
         log::debug!("backlog {}", backlog);
-        let back = if backlog > 1024 {
-            1024 as usize
-        } else {
-            backlog
-        };
+        let back = if backlog > 1024 { 1024_usize } else { backlog };
         return Self {
             inode,
             backlog: AtomicUsize::new(back),
@@ -82,7 +78,7 @@ impl Listener {
         log::debug!(" incom len {}", incoming_conns.len());
         let conn = incoming_conns
             .pop_front()
-            .ok_or_else(|| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
         let socket =
             Arc::downcast::<SeqpacketSocket>(conn.inner()).map_err(|_| SystemError::EINVAL)?;
         let peer = match &*socket.inner.read() {
@@ -190,7 +186,7 @@ impl Connected {
         if self.can_send()? {
             return self.send_slice(buf);
         } else {
-            log::debug!("can not send {:?}", String::from_utf8_lossy(&buf[..]));
+            log::debug!("can not send {:?}", String::from_utf8_lossy(buf));
             return Err(SystemError::ENOBUFS);
         }
     }

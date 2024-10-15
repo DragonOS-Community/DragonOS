@@ -25,7 +25,7 @@ use crate::{
             device::{
                 bus::Bus,
                 driver::{Driver, DriverCommonData},
-                Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
+                CommonAttrGroup, Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
             },
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
@@ -41,7 +41,7 @@ use crate::{
         },
     },
     exception::{irqdesc::IrqReturn, IrqNumber},
-    filesystem::kernfs::KernFSInode,
+    filesystem::{kernfs::KernFSInode, sysfs::AttributeGroup},
     init::initcall::INITCALL_POSTCORE,
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
@@ -249,11 +249,15 @@ impl Device for VirtIONetDevice {
     fn set_dev_parent(&self, parent: Option<Weak<dyn Device>>) {
         self.inner().device_common.parent = parent;
     }
+
+    fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
+        Some(&[&CommonAttrGroup])
+    }
 }
 
 impl VirtIODevice for VirtIONetDevice {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
-        log::warn!("VirtioInterface: poll_ifaces_try_lock_onetime -> poll_ifaces");
+        // log::warn!("VirtioInterface: poll_ifaces_try_lock_onetime -> poll_ifaces");
         poll_ifaces();
         return Ok(IrqReturn::Handled);
     }

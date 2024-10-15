@@ -11,7 +11,7 @@ fn create_inet_socket(
     socket_type: Type,
     protocol: smoltcp::wire::IpProtocol,
 ) -> Result<Arc<dyn Socket>, SystemError> {
-    log::debug!("type: {:?}, protocol: {:?}", socket_type, protocol);
+    // log::debug!("type: {:?}, protocol: {:?}", socket_type, protocol);
     use smoltcp::wire::IpProtocol::*;
     use Type::*;
     match socket_type {

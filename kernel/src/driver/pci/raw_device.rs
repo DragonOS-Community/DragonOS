@@ -8,7 +8,10 @@ use alloc::{
 use crate::{
     driver::base::{
         class::Class,
-        device::{bus::Bus, driver::Driver, Device, DeviceCommonData, DeviceType, IdTable},
+        device::{
+            bus::Bus, driver::Driver, CommonAttrGroup, Device, DeviceCommonData, DeviceType,
+            IdTable,
+        },
         kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,
     },
@@ -84,7 +87,7 @@ impl PciDevice for PciGeneralDevice {
 
 impl Device for PciGeneralDevice {
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
-        Some(&[&BasicPciReadOnlyAttrs])
+        Some(&[&BasicPciReadOnlyAttrs, &CommonAttrGroup])
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {

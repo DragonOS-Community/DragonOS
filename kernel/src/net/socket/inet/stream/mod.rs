@@ -185,11 +185,19 @@ impl TcpSocket {
     }
 
     pub fn try_recv(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        poll_ifaces();
-        match self.inner.read().as_ref().expect("Tcp Inner is None") {
-            Inner::Established(inner) => inner.recv_slice(buf),
-            _ => Err(EINVAL),
-        }
+        self.inner
+            .read()
+            .as_ref()
+            .map(|inner| {
+                inner.iface().unwrap().poll();
+                let result = match inner {
+                    Inner::Established(inner) => inner.recv_slice(buf),
+                    _ => Err(EINVAL),
+                };
+                inner.iface().unwrap().poll();
+                result
+            })
+            .unwrap()
     }
 
     pub fn try_send(&self, buf: &[u8]) -> Result<usize, SystemError> {
@@ -221,6 +229,7 @@ impl TcpSocket {
     // should only call on accept
     fn is_acceptable(&self) -> bool {
         // (self.poll() & EP::EPOLLIN.bits() as usize) != 0
+        self.inner.read().as_ref().unwrap().iface().unwrap().poll();
         EP::from_bits_truncate(self.poll() as u32).contains(EP::EPOLLIN)
     }
 }
@@ -233,7 +242,7 @@ impl Socket for TcpSocket {
     fn get_name(&self) -> Result<Endpoint, SystemError> {
         match self.inner.read().as_ref().expect("Tcp Inner is None") {
             Inner::Init(Init::Unbound(_)) => Ok(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT)),
-            Inner::Init(Init::Bound((_, local))) => Ok(Endpoint::Ip(local.clone())),
+            Inner::Init(Init::Bound((_, local))) => Ok(Endpoint::Ip(*local)),
             Inner::Connecting(connecting) => Ok(Endpoint::Ip(connecting.get_name())),
             Inner::Established(established) => Ok(Endpoint::Ip(established.local_endpoint())),
             Inner::Listening(listening) => Ok(Endpoint::Ip(listening.get_name())),
@@ -255,7 +264,7 @@ impl Socket for TcpSocket {
     }
 
     fn poll(&self) -> usize {
-        self.pollee.load(core::sync::atomic::Ordering::Relaxed)
+        self.pollee.load(core::sync::atomic::Ordering::SeqCst)
     }
 
     fn listen(&self, backlog: usize) -> Result<(), SystemError> {

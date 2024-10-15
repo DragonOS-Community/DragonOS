@@ -24,7 +24,7 @@ use crate::{
             device::{
                 bus::Bus,
                 driver::{Driver, DriverCommonData},
-                Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
+                CommonAttrGroup, Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
             },
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
@@ -38,7 +38,7 @@ use crate::{
         },
     },
     exception::{irqdesc::IrqReturn, IrqNumber},
-    filesystem::{kernfs::KernFSInode, mbr::MbrDiskPartionTable},
+    filesystem::{kernfs::KernFSInode, mbr::MbrDiskPartionTable, sysfs::AttributeGroup},
     init::initcall::INITCALL_POSTCORE,
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
@@ -342,7 +342,7 @@ impl VirtIODevice for VirtIOBlkDevice {
 
 impl Device for VirtIOBlkDevice {
     fn dev_type(&self) -> DeviceType {
-        DeviceType::Net
+        DeviceType::Block
     }
 
     fn id_table(&self) -> IdTable {
@@ -406,6 +406,10 @@ impl Device for VirtIOBlkDevice {
 
     fn set_dev_parent(&self, parent: Option<Weak<dyn Device>>) {
         self.inner().device_common.parent = parent;
+    }
+
+    fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
+        Some(&[&CommonAttrGroup])
     }
 }
 
@@ -472,7 +476,7 @@ fn virtio_blk_driver_init() -> Result<(), SystemError> {
     let driver = VirtIOBlkDriver::new();
     virtio_driver_manager()
         .register(driver.clone() as Arc<dyn VirtIODriver>)
-        .expect("Add virtio net driver failed");
+        .expect("Add virtio block driver failed");
     unsafe {
         VIRTIO_BLK_DRIVER = Some(driver);
     }

@@ -3,6 +3,7 @@ use alloc::{
     string::String,
     sync::{Arc, Weak},
 };
+use unix::ns::abs::ABS_INODE_MAP;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sched::SchedMode;
@@ -194,6 +195,17 @@ impl Socket for SeqpacketSocket {
                 };
 
                 INODE_MAP.write_irqsave().insert(inodeid, inode);
+                Ok(())
+            }
+            Endpoint::Abspath((abshandle, path)) => {
+                let inode = match &mut *self.inner.write() {
+                    Inner::Init(init) => init.bind_path(path)?,
+                    _ => {
+                        log::error!("socket has listen or connected");
+                        return Err(SystemError::EINVAL);
+                    }
+                };
+                ABS_INODE_MAP.lock_irqsave().insert(abshandle.name(), inode);
                 Ok(())
             }
             _ => return Err(SystemError::EINVAL),

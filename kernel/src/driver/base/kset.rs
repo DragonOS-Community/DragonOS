@@ -259,6 +259,6 @@ impl KSetUeventOps for KSetUeventOpsDefault {
     }
 
     fn uevent(&self, env: &KobjUeventEnv) -> i32 {
-        0
+        todo!()
     }
 }

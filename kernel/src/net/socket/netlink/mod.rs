@@ -261,14 +261,13 @@ impl VecExt for Vec<u8> {
     }
 }
 
-// todo： net namespace
+/// 创建一个新的内核netlink套接字
 pub fn netlink_kernel_create(
     unit: usize,
     cfg: Option<NetlinkKernelCfg>,
 ) -> Result<NetlinkSock, SystemError> {
-    // THIS_MODULE
-    let mut nlk: NetlinkSock = NetlinkSock::new();
-    let sk: Arc<Mutex<Box<dyn NetlinkSocket>>> = Arc::new(Mutex::new(Box::new(nlk.clone())));
+    let mut nlk: NetlinkSock = NetlinkSock::new(Some(unit));
+    let sk: Arc<Mutex<NetlinkSock>> = Arc::new(Mutex::new(nlk.clone()));
     let groups: u32;
     if unit >= MAX_LINKS {
         return Err(SystemError::EINVAL);
@@ -314,9 +313,9 @@ pub fn netlink_kernel_create(
 }
 
 fn __netlink_create(nlk: &mut NetlinkSock, unit: usize, kern: usize) -> Result<i32, SystemError> {
-    // 其他的初始化配置参数
+    // 初始化配置参数
     nlk.flags = kern as u32;
-    nlk.protocol = unit;
+    nlk.set_protocol(unit);
     return Ok(0);
 }
 
@@ -330,14 +329,14 @@ pub struct Netlink;
 impl family::Family for Netlink {
     /// 用户空间创建一个新的套接字的入口
     fn socket(stype: Type, _protocol: u32) -> Result<Arc<Inode>, SystemError> {
-        let socket = create_netlink_socket(_protocol)?;
+        let socket = create_netlink_socket(_protocol as usize)?;
         Ok(Inode::new(socket))
     }
 }
 /// 用户空间创建一个新的Netlink套接字
-fn create_netlink_socket(_protocol: u32) -> Result<Arc<dyn Socket>, SystemError> {
-    match _protocol as usize {
-        NETLINK_KOBJECT_UEVENT => Ok(Arc::new(af_netlink::NetlinkSock::new())),
+fn create_netlink_socket(_protocol: usize) -> Result<Arc<dyn Socket>, SystemError> {
+    match _protocol {
+        NETLINK_KOBJECT_UEVENT => Ok(Arc::new(af_netlink::NetlinkSock::new(Some(_protocol)))),
         _ => Err(SystemError::EPROTONOSUPPORT),
     }
 }

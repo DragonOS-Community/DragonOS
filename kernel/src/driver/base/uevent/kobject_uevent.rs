@@ -83,15 +83,6 @@ fn uevent_net_exit() {
     UEVENT_SOCK_LIST.lock().clear();
 }
 
-// /* This lock protects uevent_seqnum and uevent_sock_list */
-// static DEFINE_MUTEX(uevent_sock_mutex);
-
-/*
-
-
-
-*/
-
 /// kobject_uevent，和kobject_uevent_env功能一样，只是没有指定任何的环境变量
 pub fn kobject_uevent(kobj: Arc<dyn KObject>, action: KobjectAction) -> Result<(), SystemError> {
     // kobject_uevent和kobject_uevent_env功能一样，只是没有指定任何的环境变量
@@ -101,7 +92,7 @@ pub fn kobject_uevent(kobj: Arc<dyn KObject>, action: KobjectAction) -> Result<(
     }
 }
 
-///  kobject_uevent_env，以envp为环境变量，上报一个指定action的uevent。环境变量的作用是为执行用户空间程序指定运行环境。
+///  kobject_uevent_env，以 envp 为环境变量，上报一个指定 action 的 uevent。环境变量的作用是为执行用户空间程序指定运行环境。
 pub fn kobject_uevent_env(
     kobj: Arc<dyn KObject>,
     action: KobjectAction,
@@ -271,43 +262,7 @@ pub fn kobject_uevent_env(
         return Ok(retval);
     }
     retval = kobject_uevent_net_broadcast(kobj, &env, &action_string, &devpath);
-    //mutex_unlock(&uevent_sock_mutex);
-
-    #[cfg(feature = "UEVENT_HELPER")]
-    fn handle_uevent_helper() {
-        // TODO
-        // 在特性 `UEVENT_HELPER` 开启的情况下，这里的代码会执行
-        // 指定处理uevent的用户空间程序，通常是热插拔程序mdev、udevd等
-        // 	/* call uevent_helper, usually only enabled during early boot */
-        // 	if (uevent_helper[0] && !kobj_usermode_filter(kobj)) {
-        // 		struct subprocess_info *info;
-
-        // 		retval = add_uevent_var(env, "HOME=/");
-        // 		if (retval)
-        // 			goto exit;
-        // 		retval = add_uevent_var(env,
-        // 					"PATH=/sbin:/bin:/usr/sbin:/usr/bin");
-        // 		if (retval)
-        // 			goto exit;
-        // 		retval = init_uevent_argv(env, subsystem);
-        // 		if (retval)
-        // 			goto exit;
-
-        // 		retval = -ENOMEM;
-        // 		info = call_usermodehelper_setup(env->argv[0], env->argv,
-        // 						 env->envp, GFP_KERNEL,
-        // 						 NULL, cleanup_uevent_env, env);
-        // 		if (info) {
-        // 			retval = call_usermodehelper_exec(info, UMH_NO_WAIT);
-        // 			env = NULL;	/* freed by cleanup_uevent_env */
-        // 		}
-        // 	}
-    }
-    #[cfg(not(feature = "UEVENT_HELPER"))]
-    fn handle_uevent_helper() {
-        // 在特性 `UEVENT_HELPER` 关闭的情况下，这里的代码会执行
-    }
-    handle_uevent_helper();
+    // todo: 设置了 UEVENT_HELP 编译条件之后，使用 handle_uevent_helper() 对指定的 uevent 进行处理，通常是热插拔程序 mdev、udev 等
     drop(devpath);
     drop(env);
     log::info!("kobject_uevent_env: retval: {}", retval);
@@ -383,43 +338,10 @@ pub fn kobject_uevent_net_broadcast(
     action_string: &str,
     devpath: &str,
 ) -> i32 {
-    // let net:Net = None;
-    // let mut ops = kobj_ns_ops(kobj);
-
-    // if (!ops && kobj.kset().is_some()) {
-    // 	let ksobj:KObject = &kobj.kset().kobj();
-
-    // 	if (ksobj.parent() != NULL){
-    //         ops = kobj_ns_ops(ksobj.parent());
-    //     }
-
-    // }
-    // TODO: net结构体？
-    // https://code.dragonos.org.cn/xref/linux-6.1.9/include/net/net_namespace.h#60
-    /* kobjects currently only carry network namespace tags and they
-     * are the only tag relevant here since we want to decide which
-     * network namespaces to broadcast the uevent into.
-     */
-    // if (ops && ops.netlink_ns() && kobj.ktype().namespace())
-    // 	if (ops.type() == KOBJ_NS_TYPE_NET)
-    // 		net = kobj.ktype().namespace(kobj);
+    // TODO: net namespace
     // 如果有网络命名空间，则广播标记的uevent；如果没有，则广播未标记的uevent
-    // if !net.is_none() {
-    //     ret = uevent_net_broadcast_tagged(net.unwrap(), env, action_string, devpath);
-    // } else {
     let ret = uevent_net_broadcast_untagged(env, action_string, devpath);
-    // }
     log::info!("kobject_uevent_net_broadcast finish. ret: {}", ret);
-    ret
-}
-
-pub fn uevent_net_broadcast_tagged(
-    sk: &dyn NetlinkSocket,
-    env: &KobjUeventEnv,
-    action_string: &str,
-    devpath: &str,
-) -> i32 {
-    let ret = 0;
     ret
 }
 
@@ -429,7 +351,7 @@ pub fn alloc_uevent_skb<'a>(
     action_string: &'a str,
     devpath: &'a str,
 ) -> Arc<RwLock<SkBuff>> {
-    let skb = Arc::new(RwLock::new(SkBuff::new()));
+    let skb = Arc::new(RwLock::new(SkBuff::new(None)));
     skb
 }
 // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject_uevent.c#309
@@ -445,7 +367,7 @@ pub fn uevent_net_broadcast_untagged(
         devpath
     );
     let mut retval = 0;
-    let mut skb = Arc::new(RwLock::new(SkBuff::new()));
+    let mut skb = Arc::new(RwLock::new(SkBuff::new(None)));
 
     // 锁定 UEVENT_SOCK_LIST 并遍历
     let ue_sk_list = UEVENT_SOCK_LIST.lock();
@@ -456,16 +378,16 @@ pub fn uevent_net_broadcast_untagged(
             continue;
         }
         // 如果 skb 为空，则分配一个新的 skb
-        if skb.read().is_empty() {
+        if skb.read().inner.is_empty() {
             log::info!("uevent_net_broadcast_untagged: alloc_uevent_skb failed");
             retval = SystemError::ENOMEM.to_posix_errno();
             skb = alloc_uevent_skb(env, action_string, devpath);
-            if skb.read().is_empty() {
+            if skb.read().inner.is_empty() {
                 continue;
             }
         }
         log::info!("next is netlink_broadcast");
-        let netlink_socket: Arc<dyn NetlinkSocket> = Arc::new(ue_sk.inner.clone());
+        let netlink_socket = Arc::new(ue_sk.inner.clone());
         retval = match netlink_broadcast(&netlink_socket, Arc::clone(&skb), 0, 1, 1) {
             Ok(_) => 0,
             Err(err) => err.to_posix_errno(),

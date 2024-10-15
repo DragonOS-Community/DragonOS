@@ -1,4 +1,4 @@
-use libc::{sockaddr, sockaddr_storage, recvfrom, bind, sendto, socket, AF_NETLINK, SOCK_DGRAM, SOCK_CLOEXEC, getpid, c_void};
+use libc::{sockaddr,  recvfrom, bind, sendto, socket, AF_NETLINK, SOCK_DGRAM, getpid, c_void};
 use nix::libc;
 use std::os::unix::io::RawFd;
 use std::{ mem, io};
@@ -14,7 +14,7 @@ struct Nlmsghdr {
 
 fn create_netlink_socket() -> io::Result<RawFd> {
     let sockfd = unsafe {
-        socket(AF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC, libc::NETLINK_KOBJECT_UEVENT)
+        socket(AF_NETLINK, SOCK_DGRAM, libc::NETLINK_KOBJECT_UEVENT)
     };
 
     if sockfd < 0 {
@@ -30,7 +30,7 @@ fn bind_netlink_socket(sock: RawFd) -> io::Result<()> {
     let mut addr: libc::sockaddr_nl = unsafe { mem::zeroed() };
     addr.nl_family = AF_NETLINK as u16;
     addr.nl_pid = pid as u32;
-    addr.nl_groups = 0;
+    addr.nl_groups = 1;
 
     let ret = unsafe {
         bind(sock, &addr as *const _ as *const sockaddr, mem::size_of::<libc::sockaddr_nl>() as u32)

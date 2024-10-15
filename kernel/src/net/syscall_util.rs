@@ -32,8 +32,11 @@ impl SysArgSocketType {
 }
 
 use alloc::sync::Arc;
+use alloc::string::String;
 use core::ffi::CStr;
-use unix::INODE_MAP;
+use unix::
+    ns::abs::{alloc_abs_addr, look_up_abs_addr}
+;
 
 use crate::{
     filesystem::vfs::{
@@ -131,6 +134,40 @@ impl SockAddr {
                 }
                 AddressFamily::Unix => {
                     let addr_un: SockAddrUn = addr.addr_un;
+
+                    if addr_un.sun_path[0] == 0 {
+                        // 抽象地址空间，与文件系统没有关系
+                        let path = CStr::from_bytes_until_nul(&addr_un.sun_path[1..])
+                            .map_err(|_| {
+                                log::error!("CStr::from_bytes_until_nul fail");
+                                SystemError::EINVAL
+                            })?
+                            .to_str()
+                            .map_err(|_| {
+                                log::error!("CStr::to_str fail");
+                                SystemError::EINVAL
+                            })?;
+
+                        log::debug!("abs path: {}", path);
+
+                        // 向抽象地址管理器申请或查找抽象地址
+                        let spath = String::from(path);
+                        let abs_find = match look_up_abs_addr(&spath) {
+                            Ok(result) => result,
+                            Err(_) => {
+                                //未找到尝试分配abs
+                                match alloc_abs_addr(spath.clone()) {
+                                    Ok(result) => {
+                                        let unix_abs_endpoint = Endpoint::Abspath((result, spath));
+                                        return Ok(unix_abs_endpoint)
+                                    },
+                                    Err(e) => return Err(e),
+                                };
+                            },
+                        };
+
+                        return Ok(Endpoint::Abspath((abs_find, spath)));
+                    }
 
                     let path = CStr::from_bytes_until_nul(&addr_un.sun_path)
                         .map_err(|_| {

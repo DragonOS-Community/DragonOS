@@ -801,7 +801,7 @@ pub fn disassemble(prog: &[u8]) {
     #[cfg(not(feature = "std"))]
     {
         for insn in to_insn_vec(prog) {
-            info!("{}", insn.desc);
+            log::info!("{}", insn.desc);
         }
     }
 }

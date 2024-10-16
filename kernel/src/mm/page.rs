@@ -772,7 +772,7 @@ pub struct EntryFlags<Arch> {
     phantom: PhantomData<Arch>,
 }
 
-impl<Arch: MemoryManagementArch> Default for PageFlags<Arch> {
+impl<Arch: MemoryManagementArch> Default for EntryFlags<Arch> {
     fn default() -> Self {
         Self::new()
     }

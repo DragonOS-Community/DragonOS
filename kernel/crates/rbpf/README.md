@@ -710,6 +710,10 @@ See
 and [LICENSE-MIT](https://github.com/qmonnet/rbpf/blob/main/LICENSE-MIT) for
 details.
 
+## Version
+[The last commit](https://github.com/qmonnet/rbpf/commit/fe7021b07b08a43b836743a77796d07ce1f4902e)
+
+
 ## Inspired by
 
 * [uBPF](https://github.com/iovisor/ubpf), a C user-space implementation of an

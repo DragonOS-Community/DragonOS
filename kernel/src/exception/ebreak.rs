@@ -18,11 +18,14 @@ impl EBreak {
         let kprobe_list = guard.get_break_list(break_addr);
         if let Some(kprobe_list) = kprobe_list {
             for kprobe in kprobe_list {
-                kprobe.call_pre_handler(frame);
+                let guard = kprobe.read();
+                if guard.is_enabled() {
+                    guard.call_pre_handler(frame);
+                }
             }
-            let probe_point = kprobe_list[0].probe_point();
+            let single_step_address = kprobe_list[0].read().probe_point().single_step_address();
             // setup_single_step
-            setup_single_step(frame, probe_point.single_step_address());
+            setup_single_step(frame, single_step_address);
         } else {
             // For some architectures, they do not support single step execution,
             // and we need to use breakpoint exceptions to simulate

@@ -7,8 +7,8 @@ use alloc::{
 use core::hash::Hash;
 
 use super::kobject::{
-        DynamicKObjKType, KObjType, KObject, KObjectManager, KObjectState, LockedKObjectState,
-    };
+    DynamicKObjKType, KObjType, KObject, KObjectManager, KObjectState, LockedKObjectState,
+};
 use crate::{
     filesystem::kernfs::KernFSInode,
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},

@@ -1025,7 +1025,6 @@ impl Eq for DeviceId {}
 
 impl IrqHandlerData for DeviceId {}
 
-
 lazy_static! {
     /// class_dir列表，通过parent kobject的name和class_dir的name来索引class_dir实例
     static ref CLASS_DIR_KSET_INSTANCE: RwLock<BTreeMap<String, Arc<ClassDir>>> = RwLock::new(BTreeMap::new());

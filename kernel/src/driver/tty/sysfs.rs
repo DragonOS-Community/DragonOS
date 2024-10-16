@@ -63,9 +63,6 @@ impl Class for TtyClass {
         return &self.subsystem;
     }
 
-    fn dev_groups(&self) -> &'static [&'static dyn AttributeGroup] {
-        return &[];
-    }
 }
 
 /// 初始化帧缓冲区子系统

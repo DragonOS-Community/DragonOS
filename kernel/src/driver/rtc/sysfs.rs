@@ -9,8 +9,7 @@ use crate::{
     driver::base::{
         class::Class,
         device::{
-            bus::Bus, device_manager, driver::Driver, Device, DeviceCommonData,
-            DeviceType, IdTable,
+            bus::Bus, device_manager, driver::Driver, Device, DeviceCommonData, DeviceType, IdTable,
         },
         kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,

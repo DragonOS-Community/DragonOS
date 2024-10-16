@@ -49,7 +49,7 @@ impl IndexNode for Inode {
 
     fn poll(
         &self,
-        private_data: &crate::filesystem::vfs::FilePrivateData,
+        _: &crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, SystemError> {
         Ok(self.inner.poll())
     }
@@ -180,11 +180,11 @@ impl Inode {
         self.epoll_items.clone()
     }
 
-    pub fn set_nonblock(&self, nonblock: bool) {
+    pub fn set_nonblock(&self, _nonblock: bool) {
         log::warn!("nonblock is not support yet");
     }
 
-    pub fn set_close_on_exec(&self, close_on_exec: bool) {
+    pub fn set_close_on_exec(&self, _close_on_exec: bool) {
         log::warn!("close_on_exec is not support yet");
     }
 

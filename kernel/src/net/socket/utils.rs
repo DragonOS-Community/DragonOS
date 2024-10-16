@@ -21,7 +21,7 @@ pub fn create_socket(
             todo!("unsupport address family");
         }
     };
-    // inode.set_nonblock(is_nonblock);
-    // inode.set_close_on_exec(is_close_on_exec);
+    inode.set_nonblock(is_nonblock);
+    inode.set_close_on_exec(is_close_on_exec);
     return Ok(inode);
 }

@@ -33,20 +33,17 @@ impl SysArgSocketType {
 
 use alloc::sync::Arc;
 use core::ffi::CStr;
-use unix::INODE_MAP;
 
 use crate::{
     filesystem::vfs::{
-        file::FileMode, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        FileType, IndexNode, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
-    libs::casting::DowncastArc,
     mm::{verify_area, VirtAddr},
-    net::socket::{self, *},
-    process::ProcessManager,
-    syscall::Syscall,
+    net::socket::*,
+    process::ProcessManager
 };
 use smoltcp;
-use system_error::SystemError::{self, *};
+use system_error::SystemError;
 
 // 参考资料： https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/netinet_in.h.html#tag_13_32
 #[repr(C)]

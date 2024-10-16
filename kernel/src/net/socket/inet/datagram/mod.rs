@@ -2,9 +2,7 @@ use inet::InetSocket;
 use smoltcp;
 use system_error::SystemError::{self, *};
 
-use crate::filesystem::vfs::IndexNode;
 use crate::libs::rwlock::RwLock;
-use crate::libs::spinlock::SpinLock;
 use crate::net::event_poll::EPollEventType;
 use crate::net::net_core::poll_ifaces;
 use crate::net::socket::*;
@@ -210,15 +208,11 @@ impl Socket for UdpSocket {
     }
 
     fn send(&self, buffer: &[u8], flags: MessageFlag) -> Result<usize, SystemError> {
-        // if flags.contains(MessageFlag::DONTWAIT) {
+        if flags.contains(MessageFlag::DONTWAIT) {
+            log::warn!("Nonblock send is not implemented yet");
+        }
 
         return self.try_send(buffer, None);
-        // } else {
-        //     // return self
-        //     //     .wait_queue
-        //     //     .busy_wait(EP::EPOLLOUT, || self.try_send(buffer, None));
-        //     todo!()
-        // }
     }
 
     fn send_to(
@@ -227,21 +221,14 @@ impl Socket for UdpSocket {
         flags: MessageFlag,
         address: Endpoint,
     ) -> Result<usize, SystemError> {
-        // if flags.contains(MessageFlag::DONTWAIT) {
+        if flags.contains(MessageFlag::DONTWAIT) {
+            log::warn!("Nonblock send is not implemented yet");
+        }
+
         if let Endpoint::Ip(remote) = address {
             return self.try_send(buffer, Some(remote));
         }
-        // } else {
-        //     // return self
-        //     //     .wait_queue
-        //     //     .busy_wait(EP::EPOLLOUT, || {
-        //     //         if let Endpoint::Ip(remote) = address {
-        //     //             return self.try_send(buffer, Some(remote.addr));
-        //     //         }
-        //     //         return Err(EAFNOSUPPORT);
-        //     //     });
-        //     todo!()
-        // }
+
         return Err(EINVAL);
     }
 

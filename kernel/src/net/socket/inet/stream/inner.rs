@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU32, AtomicUsize};
+use core::sync::atomic::AtomicUsize;
 
 use crate::libs::rwlock::RwLock;
 use crate::net::socket::EPollEventType;
@@ -10,7 +10,7 @@ use system_error::SystemError::{self, *};
 
 use super::inet::UNSPECIFIED_LOCAL_ENDPOINT;
 
-pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
+// pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
 pub const DEFAULT_RX_BUF_SIZE: usize = 512 * 1024;
 pub const DEFAULT_TX_BUF_SIZE: usize = 512 * 1024;
 

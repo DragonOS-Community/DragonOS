@@ -1,27 +1,14 @@
-use core::{cmp::min, ffi::CStr};
-
-use acpi::address;
-use alloc::{boxed::Box, sync::Arc};
+use alloc::sync::Arc;
 use log::debug;
-use num_traits::{FromPrimitive, ToPrimitive};
-use smoltcp::wire;
 use system_error::SystemError::{self, *};
 
 use crate::{
-    filesystem::vfs::{
-        file::{File, FileMode},
-        syscall::{IoVec, IoVecs},
-        FileType,
-    },
-    libs::spinlock::SpinLockGuard,
-    mm::{verify_area, VirtAddr},
-    // net::socket::{netlink::af_netlink::NetlinkSock, AddressFamily},
+    filesystem::vfs::file::{File, FileMode},
     process::ProcessManager,
     syscall::Syscall,
 };
 
-use super::socket::{self, Endpoint, Socket};
-use super::socket::{unix::Unix, AddressFamily as AF};
+use super::socket::{self, Endpoint, unix::Unix, AddressFamily as AF};
 
 pub use super::syscall_util::*;
 
@@ -94,30 +81,9 @@ impl Syscall {
 
         // check address family, only support AF_UNIX
         if address_family != AF::Unix {
+            log::warn!("only support AF_UNIX, {:?} with protocol {:?} is not supported", address_family, protocol);
             return Err(SystemError::EAFNOSUPPORT);
         }
-
-        // 创建一对socket
-        // let inode0 = socket::create_socket(
-        //     address_family,
-        //     stype,
-        //     protocol as u32,
-        //     socket_type.is_nonblock(),
-        //     socket_type.is_cloexec(),
-        // )?;
-        // let inode1 = socket::create_socket(
-        //     address_family,
-        //     stype,
-        //     protocol as u32,
-        //     socket_type.is_nonblock(),
-        //     socket_type.is_cloexec(),
-        // )?;
-
-        // // 进行pair
-        // unsafe {
-        //     inode0.connect(socket::Endpoint::Inode(inode1.clone()))?;
-        //     inode1.connect(socket::Endpoint::Inode(inode0.clone()))?;
-        // }
 
         // 创建一对新的unix socket pair
         let (inode0, inode1) = Unix::new_pairs(stype)?;

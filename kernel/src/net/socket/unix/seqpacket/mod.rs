@@ -118,6 +118,7 @@ impl SeqpacketSocket {
         self.is_nonblocking.load(Ordering::Relaxed)
     }
 
+    #[allow(dead_code)]
     fn set_nonblocking(&self, nonblocking: bool) {
         self.is_nonblocking.store(nonblocking, Ordering::Relaxed);
     }

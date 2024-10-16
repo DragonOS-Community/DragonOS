@@ -21,7 +21,7 @@ use crate::{
 };
 
 use super::socket::{self, Endpoint, Socket};
-use super::socket::{netlink::endpoint, unix::Unix, AddressFamily as AF};
+use super::socket::{unix::Unix, AddressFamily as AF};
 
 pub use super::syscall_util::*;
 

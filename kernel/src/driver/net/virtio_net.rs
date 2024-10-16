@@ -25,7 +25,7 @@ use crate::{
             device::{
                 bus::Bus,
                 driver::{Driver, DriverCommonData},
-                CommonAttrGroup, Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
+                Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
             },
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
@@ -251,7 +251,7 @@ impl Device for VirtIONetDevice {
     }
 
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
-        Some(&[&CommonAttrGroup])
+        None
     }
 }
 

@@ -11,7 +11,7 @@ use crate::{
             bus::{Bus, BusState},
             device_manager,
             driver::Driver,
-            CommonAttrGroup, Device, DeviceCommonData, DevicePrivateData, DeviceType, IdTable,
+            Device, DeviceCommonData, DevicePrivateData, DeviceType, IdTable,
         },
         kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         kset::KSet,
@@ -331,6 +331,6 @@ impl Device for PlatformBusDevice {
     }
 
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
-        Some(&[&CommonAttrGroup])
+        None
     }
 }

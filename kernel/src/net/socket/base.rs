@@ -60,7 +60,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     /// 对应于 Posix `getsockopt` ，获取socket选项
     fn get_option(
         &self,
-        level: OptionsLevel,
+        level: OptionLevel,
         name: usize,
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
@@ -122,7 +122,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     /// - value 选项的值
     /// ## Reference
     /// https://code.dragonos.org.cn/s?refs=sk_setsockopt&project=linux-6.6.21
-    fn set_option(&self, level: OptionsLevel, name: usize, val: &[u8]) -> Result<(), SystemError> {
+    fn set_option(&self, level: OptionLevel, name: usize, val: &[u8]) -> Result<(), SystemError> {
         log::warn!("setsockopt is not implemented");
         Ok(())
     }

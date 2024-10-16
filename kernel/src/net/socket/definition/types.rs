@@ -1,15 +1,3 @@
-mod option;
-pub use option::Options;
-
-mod option_level;
-pub use option_level::OptionsLevel;
-
-mod msg_flag;
-pub use msg_flag::MessageFlag;
-
-mod ipproto;
-pub use ipproto::IPProtocol;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 pub enum Type {
     Stream = 1,

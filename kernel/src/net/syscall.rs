@@ -142,7 +142,7 @@ impl Syscall {
         optname: usize,
         optval: &[u8],
     ) -> Result<usize, SystemError> {
-        let sol = socket::OptionsLevel::try_from(level as u32)?;
+        let sol = socket::OptionLevel::try_from(level as u32)?;
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
@@ -172,10 +172,10 @@ impl Syscall {
             .get_socket(fd as i32)
             .ok_or(EBADF)?;
 
-        let level = socket::OptionsLevel::try_from(level as u32)?;
+        let level = socket::OptionLevel::try_from(level as u32)?;
 
         use socket::Options as SO;
-        use socket::OptionsLevel as SOL;
+        use socket::OptionLevel as SOL;
         if matches!(level, SOL::SOCKET) {
             let optname = SO::try_from(optname as u32).map_err(|_| ENOPROTOOPT)?;
             match optname {
@@ -209,10 +209,11 @@ impl Syscall {
         // protocol number of TCP.
 
         if matches!(level, SOL::TCP) {
+            use socket::inet::stream::TcpOption;
             let optname =
-                PosixTcpSocketOptions::try_from(optname as i32).map_err(|_| ENOPROTOOPT)?;
+                TcpOption::try_from(optname as i32).map_err(|_| ENOPROTOOPT)?;
             match optname {
-                PosixTcpSocketOptions::Congestion => return Ok(0),
+                TcpOption::Congestion => return Ok(0),
                 _ => {
                     return Err(ENOPROTOOPT);
                 }
@@ -546,94 +547,5 @@ impl Syscall {
             sockaddr_in.write_to_user(addr, addrlen)?;
         }
         return Ok(0);
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
-pub enum PosixTcpSocketOptions {
-    /// Turn off Nagle's algorithm.
-    NoDelay = 1,
-    /// Limit MSS.
-    MaxSegment = 2,
-    /// Never send partially complete segments.
-    Cork = 3,
-    /// Start keeplives after this period.
-    KeepIdle = 4,
-    /// Interval between keepalives.
-    KeepIntvl = 5,
-    /// Number of keepalives before death.
-    KeepCnt = 6,
-    /// Number of SYN retransmits.
-    Syncnt = 7,
-    /// Lifetime for orphaned FIN-WAIT-2 state.
-    Linger2 = 8,
-    /// Wake up listener only when data arrive.
-    DeferAccept = 9,
-    /// Bound advertised window
-    WindowClamp = 10,
-    /// Information about this connection.
-    Info = 11,
-    /// Block/reenable quick acks.
-    QuickAck = 12,
-    /// Congestion control algorithm.
-    Congestion = 13,
-    /// TCP MD5 Signature (RFC2385).
-    Md5Sig = 14,
-    /// Use linear timeouts for thin streams
-    ThinLinearTimeouts = 16,
-    /// Fast retrans. after 1 dupack.
-    ThinDupack = 17,
-    /// How long for loss retry before timeout.
-    UserTimeout = 18,
-    /// TCP sock is under repair right now.
-    Repair = 19,
-    RepairQueue = 20,
-    QueueSeq = 21,
-    RepairOptions = 22,
-    /// Enable FastOpen on listeners
-    FastOpen = 23,
-    Timestamp = 24,
-    /// Limit number of unsent bytes in write queue.
-    NotSentLowat = 25,
-    /// Get Congestion Control (optional) info.
-    CCInfo = 26,
-    /// Record SYN headers for new connections.
-    SaveSyn = 27,
-    /// Get SYN headers recorded for connection.
-    SavedSyn = 28,
-    /// Get/set window parameters.
-    RepairWindow = 29,
-    /// Attempt FastOpen with connect.
-    FastOpenConnect = 30,
-    /// Attach a ULP to a TCP connection.
-    ULP = 31,
-    /// TCP MD5 Signature with extensions.
-    Md5SigExt = 32,
-    /// Set the key for Fast Open(cookie).
-    FastOpenKey = 33,
-    /// Enable TFO without a TFO cookie.
-    FastOpenNoCookie = 34,
-    ZeroCopyReceive = 35,
-    /// Notify bytes available to read as a cmsg on read.
-    /// 与TCP_CM_INQ相同
-    INQ = 36,
-    /// delay outgoing packets by XX usec
-    TxDelay = 37,
-}
-
-impl TryFrom<i32> for PosixTcpSocketOptions {
-    type Error = SystemError;
-
-    fn try_from(value: i32) -> Result<Self, Self::Error> {
-        match <Self as FromPrimitive>::from_i32(value) {
-            Some(p) => Ok(p),
-            None => Err(SystemError::EINVAL),
-        }
-    }
-}
-
-impl From<PosixTcpSocketOptions> for i32 {
-    fn from(val: PosixTcpSocketOptions) -> Self {
-        <PosixTcpSocketOptions as ToPrimitive>::to_i32(&val).unwrap()
     }
 }

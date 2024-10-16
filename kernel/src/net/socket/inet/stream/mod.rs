@@ -10,8 +10,11 @@ use crate::sched::SchedMode;
 use inet::{InetSocket, UNSPECIFIED_LOCAL_ENDPOINT};
 use smoltcp;
 
-pub mod inner;
+mod inner;
 use inner::*;
+
+mod option;
+pub use option::Options as TcpOption;
 
 type EP = EPollEventType;
 #[derive(Debug)]

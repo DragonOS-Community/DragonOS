@@ -243,7 +243,7 @@ impl Socket for SeqpacketSocket {
 
     fn set_option(
         &self,
-        _level: crate::net::socket::OptionsLevel,
+        _level: crate::net::socket::OptionLevel,
         _optname: usize,
         _optval: &[u8],
     ) -> Result<(), SystemError> {
@@ -293,7 +293,7 @@ impl Socket for SeqpacketSocket {
 
     fn get_option(
         &self,
-        _level: crate::net::socket::OptionsLevel,
+        _level: crate::net::socket::OptionLevel,
         _name: usize,
         _value: &mut [u8],
     ) -> Result<usize, SystemError> {

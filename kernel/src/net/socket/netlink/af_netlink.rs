@@ -532,7 +532,7 @@ impl Socket for NetlinkSock {
         0
     }
 
-    fn set_option(&self, level: OptionsLevel, name: usize, val: &[u8]) -> Result<(), SystemError> {
+    fn set_option(&self, level: OptionLevel, name: usize, val: &[u8]) -> Result<(), SystemError> {
         return netlink_setsockopt(self, level, name, val);
     }
 }
@@ -1274,11 +1274,11 @@ fn netlink_getsockbyportid(
 /// 设置 netlink 套接字的选项
 fn netlink_setsockopt(
     nlk: &NetlinkSock,
-    level: OptionsLevel,
+    level: OptionLevel,
     optname: usize,
     optval: &[u8],
 ) -> Result<(), SystemError> {
-    if level != OptionsLevel::NETLINK {
+    if level != OptionLevel::NETLINK {
         return Err(SystemError::ENOPROTOOPT);
     }
     let optlen = optval.len();

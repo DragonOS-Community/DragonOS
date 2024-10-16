@@ -51,7 +51,6 @@ impl IndexNode for Inode {
         &self,
         private_data: &crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, SystemError> {
-        // let _ = private_data;
         Ok(self.inner.poll())
     }
 
@@ -105,7 +104,7 @@ impl Inode {
 
     pub fn set_option(
         &self,
-        level: OptionsLevel,
+        level: OptionLevel,
         name: usize,
         value: &[u8],
     ) -> Result<(), SystemError> {
@@ -114,7 +113,7 @@ impl Inode {
 
     pub fn get_option(
         &self,
-        level: OptionsLevel,
+        level: OptionLevel,
         name: usize,
         value: &mut [u8],
     ) -> Result<usize, SystemError> {

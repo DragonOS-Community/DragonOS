@@ -243,7 +243,7 @@ impl Socket for StreamSocket {
 
     fn set_option(
         &self,
-        _level: OptionsLevel,
+        _level: OptionLevel,
         _optname: usize,
         _optval: &[u8],
     ) -> Result<(), SystemError> {
@@ -329,7 +329,7 @@ impl Socket for StreamSocket {
 
     fn get_option(
         &self,
-        _level: OptionsLevel,
+        _level: OptionLevel,
         _name: usize,
         _value: &mut [u8],
     ) -> Result<usize, SystemError> {

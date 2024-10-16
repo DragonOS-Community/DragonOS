@@ -303,7 +303,7 @@ pub fn perf_event_open(
     let page_cache = event.page_cache();
     let perf_event = Arc::new(PerfEventInode::new(event));
     if let Some(cache) = page_cache {
-        cache.set_inode(Arc::downgrade(&(perf_event.clone() as _)));
+        cache.set_inode(Arc::downgrade(&(perf_event.clone() as _)))?;
     }
     let file = File::new(perf_event, file_mode)?;
     let fd_table = ProcessManager::current_pcb().fd_table();

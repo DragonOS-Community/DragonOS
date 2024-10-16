@@ -43,7 +43,6 @@ use super::{
     },
     kset::KSet,
     swnode::software_node_notify,
-    uevent::UeventAttr,
 };
 
 pub mod bus;
@@ -1025,25 +1024,6 @@ impl core::hash::Hash for DeviceId {
 impl Eq for DeviceId {}
 
 impl IrqHandlerData for DeviceId {}
-
-/// sysfs下设备的通用属性组
-#[derive(Debug)]
-pub struct CommonAttrGroup;
-impl AttributeGroup for CommonAttrGroup {
-    fn name(&self) -> Option<&str> {
-        None
-    }
-    fn attrs(&self) -> &[&'static dyn Attribute] {
-        &[&UeventAttr]
-    }
-    fn is_visible(
-        &self,
-        _kobj: alloc::sync::Arc<dyn KObject>,
-        attr: &'static dyn Attribute,
-    ) -> Option<crate::filesystem::vfs::syscall::ModeType> {
-        Some(attr.mode())
-    }
-}
 
 lazy_static! {
     /// class_dir列表，通过parent kobject的name和class_dir的name来索引class_dir实例

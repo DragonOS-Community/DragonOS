@@ -12,4 +12,3 @@ pub mod map;
 pub mod platform;
 pub mod subsys;
 pub mod swnode;
-pub mod uevent;

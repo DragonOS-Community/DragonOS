@@ -8,7 +8,7 @@ use unified_init::macros::unified_init;
 use crate::{
     driver::base::{
         class::{class_manager, Class},
-        device::{sys_dev_char_kset, CommonAttrGroup},
+        device::sys_dev_char_kset,
         kobject::KObject,
         subsys::SubSysPrivate,
     },
@@ -64,7 +64,7 @@ impl Class for TtyClass {
     }
 
     fn dev_groups(&self) -> &'static [&'static dyn AttributeGroup] {
-        return &[&CommonAttrGroup];
+        return &[];
     }
 }
 

@@ -9,7 +9,7 @@ use crate::{
     driver::base::{
         class::Class,
         device::{
-            bus::Bus, driver::Driver, CommonAttrGroup, Device, DeviceCommonData, DeviceType,
+            bus::Bus, driver::Driver, Device, DeviceCommonData, DeviceType,
             IdTable,
         },
         kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
@@ -87,7 +87,7 @@ impl PciDevice for PciGeneralDevice {
 
 impl Device for PciGeneralDevice {
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
-        Some(&[&BasicPciReadOnlyAttrs, &CommonAttrGroup])
+        Some(&[&BasicPciReadOnlyAttrs])
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {

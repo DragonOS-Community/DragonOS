@@ -2,8 +2,6 @@ use super::{
     bus::{bus_manager, Bus},
     Device, DeviceMatchName, DeviceMatcher, IdTable,
 };
-use crate::driver::base::uevent::kobject_uevent::kobject_uevent;
-use crate::driver::base::uevent::KobjectAction;
 use crate::{
     driver::base::{
         device::{bus::BusNotifyEvent, dd::DeviceAttrCoredump, device_manager},
@@ -220,7 +218,6 @@ impl DriverManager {
             })?;
 
         // todo: 发送uevent，类型问题
-        let _ = kobject_uevent(driver.clone() as Arc<dyn KObject>, KobjectAction::KOBJADD);
         // deferred_probe_extend_timeout();
 
         return Ok(());

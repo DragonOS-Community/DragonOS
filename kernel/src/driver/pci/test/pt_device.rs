@@ -11,7 +11,7 @@ use crate::{
         base::{
             class::Class,
             device::{
-                bus::Bus, driver::Driver, CommonAttrGroup, Device, DeviceCommonData, DeviceType,
+                bus::Bus, driver::Driver, Device, DeviceCommonData, DeviceType,
                 IdTable,
             },
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
@@ -77,7 +77,7 @@ impl PciDevice for TestDevice {
 
 impl Device for TestDevice {
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
-        Some(&[&HelloAttr, &CommonAttrGroup])
+        Some(&[&HelloAttr])
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {

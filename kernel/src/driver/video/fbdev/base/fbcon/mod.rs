@@ -11,7 +11,7 @@ use crate::{
         base::{
             class::Class,
             device::{
-                bus::Bus, device_manager, driver::Driver, CommonAttrGroup, Device,
+                bus::Bus, device_manager, driver::Driver, Device,
                 DeviceCommonData, DeviceType, IdTable,
             },
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
@@ -235,7 +235,7 @@ impl Device for FbConsoleDevice {
     }
 
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
-        return Some(&[&AnonymousAttributeGroup, &CommonAttrGroup]);
+        return Some(&[&AnonymousAttributeGroup]);
     }
 
     fn dev_parent(&self) -> Option<Weak<dyn Device>> {

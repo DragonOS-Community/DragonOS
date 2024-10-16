@@ -6,12 +6,9 @@ use alloc::{
 
 use core::hash::Hash;
 
-use super::{
-    kobject::{
+use super::kobject::{
         DynamicKObjKType, KObjType, KObject, KObjectManager, KObjectState, LockedKObjectState,
-    },
-    uevent::KobjUeventEnv,
-};
+    };
 use crate::{
     filesystem::kernfs::KernFSInode,
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -29,8 +26,6 @@ pub struct KSet {
     /// 与父节点有关的一些信息
     parent_data: RwLock<KSetParentData>,
     self_ref: Weak<KSet>,
-    /// kset用于发送uevent的操作函数集。kset能够发送它所包含的各种子kobj、孙kobj的消息，即kobj或其父辈、爷爷辈，都可以发送消息；优先父辈，然后是爷爷辈，以此类推
-    pub uevent_ops: Option<Arc<dyn KSetUeventOps>>,
 }
 
 impl Hash for KSet {
@@ -56,7 +51,6 @@ impl KSet {
             kobj_state: LockedKObjectState::new(None),
             parent_data: RwLock::new(KSetParentData::new(None, None)),
             self_ref: Weak::default(),
-            uevent_ops: Some(Arc::new(KSetUeventOpsDefault)),
         };
 
         let r = Arc::new(r);
@@ -237,28 +231,5 @@ impl InnerKSet {
             name,
             ktype: Some(&DynamicKObjKType),
         }
-    }
-}
-//https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/kobject.h#137
-use core::fmt::Debug;
-pub trait KSetUeventOps: Debug + Send + Sync {
-    fn filter(&self) -> Option<i32>;
-    fn uevent_name(&self) -> String;
-    fn uevent(&self, env: &KobjUeventEnv) -> i32;
-}
-#[derive(Debug)]
-pub struct KSetUeventOpsDefault;
-
-impl KSetUeventOps for KSetUeventOpsDefault {
-    fn filter(&self) -> Option<i32> {
-        Some(0)
-    }
-
-    fn uevent_name(&self) -> String {
-        String::new()
-    }
-
-    fn uevent(&self, env: &KobjUeventEnv) -> i32 {
-        todo!()
     }
 }

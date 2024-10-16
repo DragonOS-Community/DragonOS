@@ -12,7 +12,6 @@ use crate::{
         kobject::KObject,
         subsys::SubSysPrivate,
     },
-    filesystem::sysfs::AttributeGroup,
     init::initcall::INITCALL_SUBSYS,
 };
 
@@ -62,7 +61,6 @@ impl Class for TtyClass {
     fn subsystem(&self) -> &SubSysPrivate {
         return &self.subsystem;
     }
-
 }
 
 /// 初始化帧缓冲区子系统

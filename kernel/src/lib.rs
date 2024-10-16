@@ -81,7 +81,8 @@ extern crate smoltcp;
 extern crate intertrait;
 #[cfg(target_arch = "x86_64")]
 extern crate x86;
-
+#[macro_use]
+extern crate kcmdline_macros;
 extern crate klog_types;
 extern crate uefi;
 extern crate uefi_raw;

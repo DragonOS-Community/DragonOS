@@ -45,7 +45,7 @@ impl BoundInner {
             //     iface
             // }
             // 强绑VirtualIO
-            log::debug!("Not bind to any iface, bind to virtIO");
+            // log::debug!("Not bind to any iface, bind to virtIO");
             let iface = NET_DEVICES
                 .read_irqsave()
                 .get(&0)

@@ -29,8 +29,8 @@ pub fn virtio_probe() {
 
 #[allow(dead_code)]
 fn virtio_probe_pci() {
-    let mut list = PCI_DEVICE_LINKEDLIST.write();
-    let virtio_list = virtio_device_search(&mut list);
+    let list = PCI_DEVICE_LINKEDLIST.write();
+    let virtio_list = virtio_device_search(list);
     for virtio_device in virtio_list {
         let dev_id = virtio_device.common_header.device_id;
         let dev_id = DeviceId::new(None, Some(format!("{dev_id}"))).unwrap();
@@ -88,13 +88,13 @@ pub(super) fn virtio_device_init(
 ///
 /// 返回一个包含所有找到的virtio设备的数组
 fn virtio_device_search<'a>(
-    list: &'a mut RwLockWriteGuard<'_, LinkedList<Box<dyn PciDeviceStructure>>>,
-) -> Vec<&'a mut PciDeviceStructureGeneralDevice> {
+    list: RwLockWriteGuard<'_, LinkedList<Arc<dyn PciDeviceStructure>>>,
+) -> Vec<PciDeviceStructureGeneralDevice> {
     let mut virtio_list = Vec::new();
     let result = get_pci_device_structures_mut_by_vendor_id(list, 0x1AF4);
 
     for device in result {
-        let standard_device = device.as_standard_device_mut().unwrap();
+        let standard_device = device.as_standard_device().unwrap();
         let header = &standard_device.common_header;
         if header.device_id >= 0x1000 && header.device_id <= 0x103F {
             virtio_list.push(standard_device);

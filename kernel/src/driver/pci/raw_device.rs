@@ -37,9 +37,9 @@ struct InnerPciGeneralDevice {
     device_common: DeviceCommonData,
 }
 
-impl From<&PciDeviceStructureGeneralDevice> for PciGeneralDevice {
-    fn from(value: &PciDeviceStructureGeneralDevice) -> Self {
-        let value = Arc::new(value.clone());
+impl From<Arc<PciDeviceStructureGeneralDevice>> for PciGeneralDevice {
+    fn from(value: Arc<PciDeviceStructureGeneralDevice>) -> Self {
+        // let value = Arc::new(value.clone());
         let name: String = value.common_header.bus_device_function.into();
         let kobj_state = LockedKObjectState::new(None);
         let dev_id = PciDeviceID::dummpy();

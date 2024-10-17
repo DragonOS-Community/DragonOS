@@ -10,7 +10,7 @@ use crate::{
 
 use super::socket::{self, unix::Unix, AddressFamily as AF, Endpoint};
 
-pub use super::syscall_util::*;
+pub use super::posix::*;
 
 /// Flags for socket, socketpair, accept4
 const SOCK_CLOEXEC: FileMode = FileMode::O_CLOEXEC;

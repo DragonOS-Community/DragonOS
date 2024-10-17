@@ -286,16 +286,8 @@ impl LoopbackInterface {
             smoltcp::iface::Interface::new(iface_config, &mut driver, Instant::now().into());
         //设置网卡地址为127.0.0.1
         iface.update_ip_addrs(|ip_addrs| {
-            for i in 1..=2 {
-                ip_addrs
-                    .push(IpCidr::new(IpAddress::v4(127, 0, 0, i), 8))
-                    .expect("Push ipCidr failed: full");
-            }
+            ip_addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).expect("Push ipCidr failed: full");
         });
-
-        // iface.routes_mut().update(|routes_map| {
-        //     routes_map[0].
-        // });
 
         Arc::new(LoopbackInterface {
             driver: LoopbackDriverWapper(UnsafeCell::new(driver)),

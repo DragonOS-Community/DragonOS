@@ -23,10 +23,6 @@ fn create_inet_socket(
                     return Err(EPROTONOSUPPORT);
                 }
             }
-            // if !matches!(protocol, Udp) {
-            //     return Err(EPROTONOSUPPORT);
-            // }
-            // return Ok(UdpSocket::new(false));
         }
         PSOCK::Stream => match protocol {
             HopByHop | Tcp => {

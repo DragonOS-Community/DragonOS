@@ -425,12 +425,9 @@ impl ProcessManager {
 
         // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
         // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
-        pcb.sig_info_irqsave()
-            .tty()
-            .unwrap()
-            .core()
-            .contorl_info_irqsave()
-            .pgid = None;
+        if let Some(tty) = pcb.sig_info_irqsave().tty() {
+            tty.core().contorl_info_irqsave().pgid = None;
+        }
         pcb.sig_info_mut().set_tty(None);
 
         drop(pcb);

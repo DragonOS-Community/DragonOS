@@ -35,12 +35,10 @@ use alloc::sync::Arc;
 use core::ffi::CStr;
 
 use crate::{
-    filesystem::vfs::{
-        FileType, IndexNode, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
-    },
+    filesystem::vfs::{FileType, IndexNode, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES},
     mm::{verify_area, VirtAddr},
     net::socket::*,
-    process::ProcessManager
+    process::ProcessManager,
 };
 use smoltcp;
 use system_error::SystemError;

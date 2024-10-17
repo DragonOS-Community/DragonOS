@@ -47,10 +47,7 @@ impl IndexNode for Inode {
         unimplemented!()
     }
 
-    fn poll(
-        &self,
-        _: &crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<usize, SystemError> {
+    fn poll(&self, _: &crate::filesystem::vfs::FilePrivateData) -> Result<usize, SystemError> {
         Ok(self.inner.poll())
     }
 

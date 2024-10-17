@@ -20,6 +20,7 @@ type EP = EPollEventType;
 #[derive(Debug)]
 pub struct TcpSocket {
     inner: RwLock<Option<Inner>>,
+    #[allow(dead_code)]
     shutdown: Shutdown, // TODO set shutdown status
     nonblock: AtomicBool,
     wait_queue: WaitQueue,

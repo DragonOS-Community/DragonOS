@@ -8,7 +8,7 @@ use crate::{
     syscall::Syscall,
 };
 
-use super::socket::{self, Endpoint, unix::Unix, AddressFamily as AF};
+use super::socket::{self, unix::Unix, AddressFamily as AF, Endpoint};
 
 pub use super::syscall_util::*;
 
@@ -81,7 +81,11 @@ impl Syscall {
 
         // check address family, only support AF_UNIX
         if address_family != AF::Unix {
-            log::warn!("only support AF_UNIX, {:?} with protocol {:?} is not supported", address_family, protocol);
+            log::warn!(
+                "only support AF_UNIX, {:?} with protocol {:?} is not supported",
+                address_family,
+                protocol
+            );
             return Err(SystemError::EAFNOSUPPORT);
         }
 
@@ -140,8 +144,8 @@ impl Syscall {
 
         let level = socket::OptionLevel::try_from(level as u32)?;
 
-        use socket::Options as SO;
         use socket::OptionLevel as SOL;
+        use socket::Options as SO;
         if matches!(level, SOL::SOCKET) {
             let optname = SO::try_from(optname as u32).map_err(|_| ENOPROTOOPT)?;
             match optname {
@@ -176,8 +180,7 @@ impl Syscall {
 
         if matches!(level, SOL::TCP) {
             use socket::inet::stream::TcpOption;
-            let optname =
-                TcpOption::try_from(optname as i32).map_err(|_| ENOPROTOOPT)?;
+            let optname = TcpOption::try_from(optname as i32).map_err(|_| ENOPROTOOPT)?;
             match optname {
                 TcpOption::Congestion => return Ok(0),
                 _ => {

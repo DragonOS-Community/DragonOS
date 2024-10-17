@@ -40,6 +40,7 @@ pub enum Options {
     Repair = 19,
     RepairQueue = 20,
     QueueSeq = 21,
+    #[allow(clippy::enum_variant_names)]
     RepairOptions = 22,
     /// Enable FastOpen on listeners
     FastOpen = 23,

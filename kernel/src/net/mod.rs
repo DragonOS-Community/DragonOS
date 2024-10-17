@@ -10,9 +10,9 @@ use crate::{driver::net::Iface, libs::rwlock::RwLock};
 
 pub mod event_poll;
 pub mod net_core;
+pub mod posix;
 pub mod socket;
 pub mod syscall;
-pub mod syscall_util;
 
 lazy_static! {
     /// # 所有网络接口的列表

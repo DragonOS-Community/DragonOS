@@ -230,6 +230,7 @@ impl IfaceCommon {
             let new_instant = instant.total_millis() as u64;
             self.poll_at_ms.store(new_instant, Ordering::Relaxed);
 
+            // TODO: poll at
             // if old_instant == 0 || new_instant < old_instant {
             //     self.polling_wait_queue.wake_all();
             // }
@@ -237,12 +238,8 @@ impl IfaceCommon {
             self.poll_at_ms.store(0, Ordering::Relaxed);
         }
 
-        // if has_events {
-
-        // log::debug!("IfaceCommon::poll: has_events");
-        // We never try to hold the write lock in the IRQ context, and we disable IRQ when
-        // holding the write lock. So we don't need to disable IRQ when holding the read lock.
         self.bounds.read().iter().for_each(|bound_socket| {
+            // incase our inet socket missed the event, we manually notify it each time we poll
             bound_socket.on_iface_events();
             if has_events {
                 bound_socket
@@ -251,13 +248,13 @@ impl IfaceCommon {
             }
         });
 
+        // TODO: remove closed sockets
         // let closed_sockets = self
         //     .closing_sockets
         //     .lock_irq_disabled()
         //     .extract_if(|closing_socket| closing_socket.is_closed())
         //     .collect::<Vec<_>>();
         // drop(closed_sockets);
-        // }
     }
 
     pub fn update_ip_addrs(&self, ip_addrs: &[smoltcp::wire::IpCidr]) -> Result<(), SystemError> {

@@ -38,7 +38,7 @@ use crate::{
         },
     },
     exception::{irqdesc::IrqReturn, IrqNumber},
-    filesystem::{kernfs::KernFSInode, mbr::MbrDiskPartionTable, sysfs::AttributeGroup},
+    filesystem::{kernfs::KernFSInode, mbr::MbrDiskPartionTable},
     init::initcall::INITCALL_POSTCORE,
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
@@ -406,10 +406,6 @@ impl Device for VirtIOBlkDevice {
 
     fn set_dev_parent(&self, parent: Option<Weak<dyn Device>>) {
         self.inner().device_common.parent = parent;
-    }
-
-    fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
-        None
     }
 }
 

@@ -9,7 +9,7 @@ pub enum Type {
     Packet = 10,
 }
 
-use crate::net::syscall_util::PosixArgsSocketType;
+use crate::net::posix::PosixArgsSocketType;
 impl TryFrom<PosixArgsSocketType> for Type {
     type Error = system_error::SystemError;
     fn try_from(x: PosixArgsSocketType) -> Result<Self, Self::Error> {

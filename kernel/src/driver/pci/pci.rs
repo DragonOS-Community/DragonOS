@@ -118,7 +118,7 @@ pub fn get_pci_device_structures_mut_by_vendor_id(
     vendor_id: u16,
 ) -> Vec<Arc<(dyn PciDeviceStructure)>> {
     let mut result :Vec<Arc<(dyn PciDeviceStructure)>>= Vec::new();
-    for box_pci_device_structure in list.read().iter() {
+    for box_pci_device_structure in list.write().iter() {
         if box_pci_device_structure.common_header().vendor_id == vendor_id {
             result.push(box_pci_device_structure.clone());
         }
@@ -145,7 +145,7 @@ pub fn get_pci_device_structure_mut(
     subclass: u8,
 ) -> Vec<Arc<dyn PciDeviceStructure>> {
     let mut result = Vec::new();
-    for box_pci_device_structure in list.read().iter() {
+    for box_pci_device_structure in list.write().iter() {
         if (box_pci_device_structure.common_header().class_code == class_code) && (box_pci_device_structure.common_header().subclass == subclass) {
             result.push(box_pci_device_structure.clone());
         }
@@ -453,7 +453,7 @@ pub struct PciDeviceStructureGeneralDevice {
     pub interrupt_pin: u8, // 指定设备使用的中断引脚。其中值为0x1INTA#、0x2INTB#、0x3INTC#、0x4INTD#，0x0表示设备不使用中断引脚。
     pub min_grant: u8, // 一个只读寄存器，用于指定设备所需的突发周期长度（以 1/4 微秒为单位）（假设时钟速率为 33 MHz）
     pub max_latency: u8, // 一个只读寄存器，指定设备需要多长时间访问一次 PCI 总线（以 1/4 微秒为单位）。
-    pub self_ptr:Option<Weak<Self>>
+    pub self_ptr:RwLock<Weak<Self>>
 }
 impl PciDeviceStructure for PciDeviceStructureGeneralDevice {
     #[inline(always)]
@@ -462,7 +462,7 @@ impl PciDeviceStructure for PciDeviceStructureGeneralDevice {
     }
     #[inline(always)]
     fn as_standard_device(&self) -> Option<Arc<PciDeviceStructureGeneralDevice>> {
-        Some(self.self_ptr.clone()?.upgrade()?)
+        Some(self.self_ptr.read().upgrade()?)
     }
     #[inline(always)]
     fn common_header(&self) -> &PciDeviceStructureHeader {
@@ -718,7 +718,7 @@ fn pci_read_header(
             let general_device: PciDeviceStructureGeneralDevice =
                 pci_read_general_device_header(header, &bus_device_function);
             let box_general_device = Arc::new(general_device);
-            
+            *box_general_device.self_ptr.write()=Arc::downgrade(&box_general_device);
             if add_to_list {
                 PCI_DEVICE_LINKEDLIST.add(box_general_device.clone());
                 //这里实际上不应该使用clone，因为raw是用于sysfs的结构，但是实际上pci设备是在PCI_DEVICE_LINKEDLIST链表上的，
@@ -800,7 +800,7 @@ fn pci_read_general_device_header(
         interrupt_pin,
         min_grant,
         max_latency,
-        self_ptr:None,
+        self_ptr:RwLock::new(Weak::new()),
     }
 
 }

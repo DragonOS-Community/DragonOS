@@ -727,9 +727,7 @@ impl KObject for VirtioInterface {
 #[unified_init(INITCALL_POSTCORE)]
 fn virtio_net_driver_init() -> Result<(), SystemError> {
     let driver = VirtIONetDriver::new();
-    virtio_driver_manager()
-        .register(driver.clone() as Arc<dyn VirtIODriver>)
-        .expect("Add virtio net driver failed");
+    virtio_driver_manager().register(driver.clone() as Arc<dyn VirtIODriver>)?;
     unsafe {
         VIRTIO_NET_DRIVER = Some(driver);
     }

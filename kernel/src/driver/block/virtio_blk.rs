@@ -470,9 +470,7 @@ impl KObject for VirtIOBlkDevice {
 #[unified_init(INITCALL_POSTCORE)]
 fn virtio_blk_driver_init() -> Result<(), SystemError> {
     let driver = VirtIOBlkDriver::new();
-    virtio_driver_manager()
-        .register(driver.clone() as Arc<dyn VirtIODriver>)
-        .expect("Add virtio block driver failed");
+    virtio_driver_manager().register(driver.clone() as Arc<dyn VirtIODriver>)?;
     unsafe {
         VIRTIO_BLK_DRIVER = Some(driver);
     }

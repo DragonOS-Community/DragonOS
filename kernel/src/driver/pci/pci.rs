@@ -16,7 +16,7 @@ use crate::mm::mmio_buddy::{mmio_pool, MMIOSpaceGuard};
 use crate::mm::VirtAddr;
 
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc,Weak};
 use alloc::vec::Vec;
 use alloc::{boxed::Box, collections::LinkedList};
 use bitflags::bitflags;
@@ -113,8 +113,8 @@ impl PciDeviceLinkedList {
 /// ## 返回值
 ///
 /// - 返回匹配的供应商ID的PCI设备结构的引用。
-pub fn get_pci_device_structures_mut_by_vendor_id<'a>(
-    list: PciDeviceLinkedList,
+pub fn get_pci_device_structures_mut_by_vendor_id(
+    list: &PciDeviceLinkedList,
     vendor_id: u16,
 ) -> Vec<Arc<(dyn PciDeviceStructure)>> {
     let mut result :Vec<Arc<(dyn PciDeviceStructure)>>= Vec::new();
@@ -139,16 +139,15 @@ pub fn get_pci_device_structures_mut_by_vendor_id<'a>(
 ///
 /// ## 返回值
 /// - 包含链表中所有满足条件的PCI结构体的可变引用的容器。
-pub fn get_pci_device_structure_mut<'a>(
-    list: &'a mut RwLockWriteGuard<'_, LinkedList<Box<dyn PciDeviceStructure>>>,
+pub fn get_pci_device_structure_mut(
+    list: &PciDeviceLinkedList,
     class_code: u8,
     subclass: u8,
-) -> Vec<&'a mut Box<(dyn PciDeviceStructure)>> {
+) -> Vec<Arc<dyn PciDeviceStructure>> {
     let mut result = Vec::new();
-    for box_pci_device_structure in list.iter_mut() {
-        let common_header = (*box_pci_device_structure).common_header();
-        if (common_header.class_code == class_code) && (common_header.subclass == subclass) {
-            result.push(box_pci_device_structure);
+    for box_pci_device_structure in list.read().iter() {
+        if (box_pci_device_structure.common_header().class_code == class_code) && (box_pci_device_structure.common_header().subclass == subclass) {
+            result.push(box_pci_device_structure.clone());
         }
     }
     result
@@ -316,7 +315,7 @@ pub trait PciDeviceStructure: Send + Sync {
     fn header_type(&self) -> HeaderType;
     /// @brief 当其为standard设备时返回&Pci_Device_Structure_General_Device，其余情况返回None
     #[inline(always)]
-    fn as_standard_device(&self) -> Option<&PciDeviceStructureGeneralDevice> {
+    fn as_standard_device(&self) -> Option<Arc<PciDeviceStructureGeneralDevice>> {
         None
     }
     /// @brief 当其为pci to pci bridge设备时返回&Pci_Device_Structure_Pci_to_Pci_Bridge，其余情况返回None
@@ -332,11 +331,6 @@ pub trait PciDeviceStructure: Send + Sync {
     /// @brief 获取Pci设备共有的common_header
     /// @return 返回其不可变引用
     fn common_header(&self) -> &PciDeviceStructureHeader;
-    /// @brief 当其为standard设备时返回&mut Pci_Device_Structure_General_Device，其余情况返回None
-    #[inline(always)]
-    fn as_standard_device_mut(&self) -> Option<&PciDeviceStructureGeneralDevice> {
-        None
-    }
     /// @brief 当其为pci to pci bridge设备时返回&mut Pci_Device_Structure_Pci_to_Pci_Bridge，其余情况返回None
     #[inline(always)]
     fn as_pci_to_pci_bridge_device_mut(&self) -> Option<&PciDeviceStructurePciToPciBridge> {
@@ -412,7 +406,7 @@ pub trait PciDeviceStructure: Send + Sync {
     /// @brief 返回结构体中的irq_type的可变引用
     fn irq_type_mut(&self) -> Option<&RwLock<IrqType>>;
     /// @brief 返回结构体中的irq_vector的可变引用
-    fn irq_vector_mut(&self) -> Option<&Vec<IrqNumber>>;
+    fn irq_vector_mut(&self) -> Option<&RwLock<Vec<IrqNumber>>>;
 }
 
 /// Pci_Device_Structure_Header PCI设备结构体共有的头部
@@ -445,7 +439,7 @@ pub struct PciDeviceStructureGeneralDevice {
     // 中断结构体，包括legacy,msi,msix三种情况
     pub irq_type: RwLock<IrqType>,
     // 使用的中断号的vec集合
-    pub irq_vector: Vec<IrqNumber>,
+    pub irq_vector: RwLock<Vec<IrqNumber>>,
     pub standard_device_bar: RwLock<PciStandardDeviceBar>,
     pub cardbus_cis_pointer: u32, // 指向卡信息结构，供在 CardBus 和 PCI 之间共享芯片的设备使用。
     pub subsystem_vendor_id: u16,
@@ -459,6 +453,7 @@ pub struct PciDeviceStructureGeneralDevice {
     pub interrupt_pin: u8, // 指定设备使用的中断引脚。其中值为0x1INTA#、0x2INTB#、0x3INTC#、0x4INTD#，0x0表示设备不使用中断引脚。
     pub min_grant: u8, // 一个只读寄存器，用于指定设备所需的突发周期长度（以 1/4 微秒为单位）（假设时钟速率为 33 MHz）
     pub max_latency: u8, // 一个只读寄存器，指定设备需要多长时间访问一次 PCI 总线（以 1/4 微秒为单位）。
+    pub self_ptr:Option<Weak<Self>>
 }
 impl PciDeviceStructure for PciDeviceStructureGeneralDevice {
     #[inline(always)]
@@ -466,12 +461,8 @@ impl PciDeviceStructure for PciDeviceStructureGeneralDevice {
         HeaderType::Standard
     }
     #[inline(always)]
-    fn as_standard_device(&self) -> Option<&PciDeviceStructureGeneralDevice> {
-        Some(self)
-    }
-    #[inline(always)]
-    fn as_standard_device_mut(&self) -> Option<&PciDeviceStructureGeneralDevice> {
-        Some(self)
+    fn as_standard_device(&self) -> Option<Arc<PciDeviceStructureGeneralDevice>> {
+        Some(self.self_ptr.clone()?.upgrade()?)
     }
     #[inline(always)]
     fn common_header(&self) -> &PciDeviceStructureHeader {
@@ -505,7 +496,7 @@ impl PciDeviceStructure for PciDeviceStructureGeneralDevice {
         Some(&self.irq_type)
     }
     #[inline(always)]
-    fn irq_vector_mut(&self) -> Option<&Vec<IrqNumber>> {
+    fn irq_vector_mut(&self) -> Option<&RwLock<Vec<IrqNumber>>> {
         Some(&self.irq_vector)
     }
 }
@@ -517,7 +508,7 @@ pub struct PciDeviceStructurePciToPciBridge {
     // 中断结构体，包括legacy,msi,msix三种情况
     pub irq_type: RwLock<IrqType>,
     // 使用的中断号的vec集合
-    pub irq_vector: Vec<IrqNumber>,
+    pub irq_vector: RwLock<Vec<IrqNumber>>,
     pub bar0: u32,
     pub bar1: u32,
     pub primary_bus_number: u8,
@@ -569,7 +560,7 @@ impl PciDeviceStructure for PciDeviceStructurePciToPciBridge {
         Some(&self.irq_type)
     }
     #[inline(always)]
-    fn irq_vector_mut(&self) -> Option<&Vec<IrqNumber>> {
+    fn irq_vector_mut(&self) -> Option<&RwLock<Vec<IrqNumber>>> {
         Some(&self.irq_vector)
     }
 }
@@ -628,7 +619,7 @@ impl PciDeviceStructure for PciDeviceStructurePciToCardbusBridge {
         None
     }
     #[inline(always)]
-    fn irq_vector_mut(&self) -> Option<&Vec<IrqNumber>> {
+    fn irq_vector_mut(&self) ->Option<&RwLock<Vec<IrqNumber>>> {
         None
     }
 }
@@ -727,6 +718,7 @@ fn pci_read_header(
             let general_device: PciDeviceStructureGeneralDevice =
                 pci_read_general_device_header(header, &bus_device_function);
             let box_general_device = Arc::new(general_device);
+            
             if add_to_list {
                 PCI_DEVICE_LINKEDLIST.add(box_general_device.clone());
                 //这里实际上不应该使用clone，因为raw是用于sysfs的结构，但是实际上pci设备是在PCI_DEVICE_LINKEDLIST链表上的，
@@ -794,7 +786,7 @@ fn pci_read_general_device_header(
     PciDeviceStructureGeneralDevice {
         common_header,
         irq_type: RwLock::new(IrqType::Unused),
-        irq_vector: Vec::new(),
+        irq_vector: RwLock::new(Vec::new()),
         standard_device_bar,
         cardbus_cis_pointer,
         subsystem_vendor_id,
@@ -808,7 +800,9 @@ fn pci_read_general_device_header(
         interrupt_pin,
         min_grant,
         max_latency,
+        self_ptr:None,
     }
+
 }
 
 /// @brief 读取type为0x1的pci设备的header
@@ -864,7 +858,7 @@ fn pci_read_pci_to_pci_bridge_header(
     PciDeviceStructurePciToPciBridge {
         common_header,
         irq_type: RwLock::new(IrqType::Unused),
-        irq_vector: Vec::new(),
+        irq_vector: RwLock::new(Vec::new()),
         bar0,
         bar1,
         primary_bus_number,

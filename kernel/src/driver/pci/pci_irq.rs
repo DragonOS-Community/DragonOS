@@ -155,7 +155,7 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @param self PCI设备的可变引用
     /// @param flag 选择的中断类型（支持多个选择），如PCI_IRQ_ALL_TYPES表示所有中断类型均可，让系统按顺序进行选择
     /// @return Option<IrqType> 失败返回None，成功则返回对应中断类型
-    fn irq_init(&mut self, flag: IRQ) -> Option<IrqType> {
+    fn irq_init(&self, flag: IRQ) -> Option<IrqType> {
         // MSIX中断优先
         if flag.contains(IRQ::PCI_IRQ_MSIX) {
             if let Some(cap_offset) = self.msix_capability_offset() {
@@ -226,7 +226,7 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @brief 启动/关闭设备中断
     /// @param self PCI设备的可变引用
     /// @param enable 开启/关闭
-    fn irq_enable(&mut self, enable: bool) -> Result<u8, PciError> {
+    fn irq_enable(&self, enable: bool) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
             match *irq_type.write() {
                 IrqType::Msix { .. } => {
@@ -315,9 +315,9 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @param self PCI设备的可变引用
     /// @param msg PCI设备install中断时需要传递的共同参数
     /// @return 一切正常返回Ok(0),有错误返回对应错误原因
-    fn irq_install(&mut self, msg: PciIrqMsg) -> Result<u8, PciError> {
+    fn irq_install(&self, msg: PciIrqMsg) -> Result<u8, PciError> {
         if let Some(irq_vector) = self.irq_vector_mut() {
-            if msg.irq_common_message.irq_index as usize > irq_vector.len() {
+            if msg.irq_common_message.irq_index as usize > irq_vector.read().len() {
                 return Err(PciError::PciIrqError(PciIrqError::InvalidIrqIndex(
                     msg.irq_common_message.irq_index,
                 )));
@@ -356,11 +356,11 @@ pub trait PciInterrupt: PciDeviceStructure {
                     ..
                 } => {
                     // 注意：MSI中断分配的中断号必须连续且大小为2的倍数
-                    if self.irq_vector_mut().unwrap().len() > irq_max_num as usize {
+                    if self.irq_vector_mut().unwrap().read().len() > irq_max_num as usize {
                         return Err(PciError::PciIrqError(PciIrqError::DeviceIrqOverflow));
                     }
                     let irq_num =
-                        self.irq_vector_mut().unwrap()[msg.irq_common_message.irq_index as usize];
+                        self.irq_vector_mut().unwrap().read()[msg.irq_common_message.irq_index as usize];
 
                     let irq_num = IrqNumber::new(irq_num.into());
                     let common_msg = &msg.irq_common_message;
@@ -441,7 +441,7 @@ pub trait PciInterrupt: PciDeviceStructure {
                             cap_offset.into(),
                         );
                         let message_control = (data >> 16) as u16;
-                        match self.irq_vector_mut().unwrap().len() {
+                        match self.irq_vector_mut().unwrap().read().len() {
                             1 => {
                                 let temp = message_control & (!0x0070);
                                 pci_root_0().write_config(
@@ -520,11 +520,11 @@ pub trait PciInterrupt: PciDeviceStructure {
                     msix_table_offset,
                     ..
                 } => {
-                    if self.irq_vector_mut().unwrap().len() > irq_max_num as usize {
+                    if self.irq_vector_mut().unwrap().read().len() > irq_max_num as usize {
                         return Err(PciError::PciIrqError(PciIrqError::DeviceIrqOverflow));
                     }
                     let irq_num =
-                        self.irq_vector_mut().unwrap()[msg.irq_common_message.irq_index as usize];
+                        self.irq_vector_mut().unwrap().read()[msg.irq_common_message.irq_index as usize];
 
                     let common_msg = &msg.irq_common_message;
 
@@ -630,7 +630,7 @@ pub trait PciInterrupt: PciDeviceStructure {
                     cap_offset,
                     ..
                 } => {
-                    for vector in self.irq_vector_mut().unwrap() {
+                    for vector in self.irq_vector_mut().unwrap().read().iter() {
                         let irq = IrqNumber::new((*vector).into());
                         irq_manager().free_irq(irq, None);
                     }
@@ -680,7 +680,7 @@ pub trait PciInterrupt: PciDeviceStructure {
                     msix_table_offset,
                     ..
                 } => {
-                    for vector in self.irq_vector_mut().unwrap() {
+                    for vector in self.irq_vector_mut().unwrap().read().iter() {
                         let irq = IrqNumber::new((*vector).into());
                         irq_manager().free_irq(irq, None);
                     }

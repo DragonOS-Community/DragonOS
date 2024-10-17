@@ -118,7 +118,7 @@ impl PciTransport {
     /// - `irq_number_offset` - Currently, this parameter is just simple make a offset to the irq number, cause it's not be allowed to have the same irq number within different device
     #[allow(clippy::extra_unused_type_parameters)]
     pub fn new<H: Hal>(
-        device: &mut PciDeviceStructureGeneralDevice,
+        device: Arc<PciDeviceStructureGeneralDevice>,
         dev_id: Arc<DeviceId>,
     ) -> Result<Self, VirtioPciError> {
         let irq = VIRTIO_RECV_VECTOR;
@@ -136,10 +136,10 @@ impl PciTransport {
         let mut device_cfg = None;
         device.bar_ioremap().unwrap()?;
         device.enable_master();
-        let standard_device = device.as_standard_device_mut().unwrap();
+        let standard_device = device.as_standard_device().unwrap();
         // 目前缺少对PCI设备中断号的统一管理，所以这里需要指定一个中断号。不能与其他中断重复
         let irq_vector = standard_device.irq_vector_mut().unwrap();
-        irq_vector.push(irq);
+        irq_vector.write().push(irq);
         standard_device
             .irq_init(IRQ::PCI_IRQ_MSIX | IRQ::PCI_IRQ_MSI)
             .ok_or(VirtioPciError::UnableToInitIrq)?;
@@ -202,7 +202,7 @@ impl PciTransport {
         }
 
         let common_cfg = get_bar_region::<_>(
-            &device.standard_device_bar,
+            &device.standard_device_bar.read(),
             &common_cfg.ok_or(VirtioPciError::MissingCommonConfig)?,
         )?;
 
@@ -213,14 +213,14 @@ impl PciTransport {
             ));
         }
         //debug!("notify.offset={},notify.length={}",notify_cfg.offset,notify_cfg.length);
-        let notify_region = get_bar_region_slice::<_>(&device.standard_device_bar, &notify_cfg)?;
+        let notify_region = get_bar_region_slice::<_>(&device.standard_device_bar.read(), &notify_cfg)?;
         let isr_status = get_bar_region::<_>(
-            &device.standard_device_bar,
+            &device.standard_device_bar.read(),
             &isr_cfg.ok_or(VirtioPciError::MissingIsrConfig)?,
         )?;
         let config_space = if let Some(device_cfg) = device_cfg {
             Some(get_bar_region_slice::<_>(
-                &device.standard_device_bar,
+                &device.standard_device_bar.read(),
                 &device_cfg,
             )?)
         } else {

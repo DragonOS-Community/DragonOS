@@ -303,18 +303,17 @@ impl Socket for TcpSocket {
     }
 
     fn close(&self) -> Result<(), SystemError> {
-        match self.inner.read().as_ref().expect("Tcp Inner is None") {
-            Inner::Init(_) => {}
-            Inner::Connecting(_) => {
-                return Err(EINPROGRESS);
+        self.inner.read().as_ref().map(
+            |inner| match inner {
+                Inner::Connecting(_) => Err(EINPROGRESS),
+                Inner::Established(es) => {
+                    es.close();
+                    es.release();
+                    Ok(())
+                }
+                _ => Ok(()),
             }
-            Inner::Established(es) => {
-                es.close();
-                es.release();
-            }
-            Inner::Listening(_) => {}
-        }
-        Ok(())
+        ).unwrap_or(Ok(()))
     }
 }
 

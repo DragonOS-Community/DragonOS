@@ -8,7 +8,7 @@ use crate::driver::base::kobject::{
 };
 use crate::driver::base::kset::KSet;
 use crate::filesystem::kernfs::KernFSInode;
-use crate::init::initcall::INITCALL_DEVICE;
+// use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::net::{generate_iface_id, NET_DEVICES};
@@ -26,7 +26,7 @@ use smoltcp::{
     wire::{IpAddress, IpCidr},
 };
 use system_error::SystemError;
-use unified_init::macros::unified_init;
+// use unified_init::macros::unified_init;
 
 use super::{register_netdevice, NetDeivceState, NetDeviceCommonData, Operstate};
 

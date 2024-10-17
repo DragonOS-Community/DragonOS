@@ -241,12 +241,7 @@ impl Socket for StreamSocket {
         }
     }
 
-    fn set_option(
-        &self,
-        _level: OptionsLevel,
-        _optname: usize,
-        _optval: &[u8],
-    ) -> Result<(), SystemError> {
+    fn set_option(&self, _level: PSOL, _optname: usize, _optval: &[u8]) -> Result<(), SystemError> {
         log::warn!("setsockopt is not implemented");
         Ok(())
     }
@@ -329,7 +324,7 @@ impl Socket for StreamSocket {
 
     fn get_option(
         &self,
-        _level: OptionsLevel,
+        _level: PSOL,
         _name: usize,
         _value: &mut [u8],
     ) -> Result<usize, SystemError> {
@@ -338,11 +333,11 @@ impl Socket for StreamSocket {
     }
 
     fn read(&self, buffer: &mut [u8]) -> Result<usize, SystemError> {
-        self.recv(buffer, socket::MessageFlag::empty())
+        self.recv(buffer, socket::PMSG::empty())
     }
 
-    fn recv(&self, buffer: &mut [u8], flags: socket::MessageFlag) -> Result<usize, SystemError> {
-        if !flags.contains(MessageFlag::DONTWAIT) {
+    fn recv(&self, buffer: &mut [u8], flags: socket::PMSG) -> Result<usize, SystemError> {
+        if !flags.contains(PMSG::DONTWAIT) {
             loop {
                 log::debug!("socket try recv");
                 wq_wait_event_interruptible!(
@@ -373,13 +368,13 @@ impl Socket for StreamSocket {
     fn recv_from(
         &self,
         buffer: &mut [u8],
-        flags: socket::MessageFlag,
+        flags: socket::PMSG,
         _address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
-        if flags.contains(MessageFlag::OOB) {
+        if flags.contains(PMSG::OOB) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
-        if !flags.contains(MessageFlag::DONTWAIT) {
+        if !flags.contains(PMSG::DONTWAIT) {
             loop {
                 log::debug!("socket try recv from");
 
@@ -413,16 +408,16 @@ impl Socket for StreamSocket {
     fn recv_msg(
         &self,
         _msg: &mut crate::net::syscall::MsgHdr,
-        _flags: socket::MessageFlag,
+        _flags: socket::PMSG,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
 
-    fn send(&self, buffer: &[u8], flags: socket::MessageFlag) -> Result<usize, SystemError> {
+    fn send(&self, buffer: &[u8], flags: socket::PMSG) -> Result<usize, SystemError> {
         if self.is_peer_shutdown()? {
             return Err(SystemError::EPIPE);
         }
-        if !flags.contains(MessageFlag::DONTWAIT) {
+        if !flags.contains(PMSG::DONTWAIT) {
             loop {
                 match &*self.inner.write() {
                     Inner::Connected(connected) => match connected.try_send(buffer) {
@@ -446,7 +441,7 @@ impl Socket for StreamSocket {
     fn send_msg(
         &self,
         _msg: &crate::net::syscall::MsgHdr,
-        _flags: socket::MessageFlag,
+        _flags: socket::PMSG,
     ) -> Result<usize, SystemError> {
         todo!()
     }
@@ -454,14 +449,14 @@ impl Socket for StreamSocket {
     fn send_to(
         &self,
         _buffer: &[u8],
-        _flags: socket::MessageFlag,
+        _flags: socket::PMSG,
         _address: Endpoint,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
 
     fn write(&self, buffer: &[u8]) -> Result<usize, SystemError> {
-        self.send(buffer, socket::MessageFlag::empty())
+        self.send(buffer, socket::PMSG::empty())
     }
 
     fn send_buffer_size(&self) -> usize {

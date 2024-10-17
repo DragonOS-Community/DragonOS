@@ -5,6 +5,7 @@ use system_error::SystemError::{self, *};
 pub mod port;
 pub use port::PortManager;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Types {
     Raw,

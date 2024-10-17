@@ -10,16 +10,19 @@ use crate::sched::SchedMode;
 use inet::{InetSocket, UNSPECIFIED_LOCAL_ENDPOINT};
 use smoltcp;
 
-pub mod inner;
+mod inner;
 use inner::*;
+
+mod option;
+pub use option::Options as TcpOption;
 
 type EP = EPollEventType;
 #[derive(Debug)]
 pub struct TcpSocket {
     inner: RwLock<Option<Inner>>,
-    shutdown: Shutdown,
+    #[allow(dead_code)]
+    shutdown: Shutdown, // TODO set shutdown status
     nonblock: AtomicBool,
-    epitems: EPollItems,
     wait_queue: WaitQueue,
     self_ref: Weak<Self>,
     pollee: AtomicUsize,
@@ -31,7 +34,6 @@ impl TcpSocket {
             inner: RwLock::new(Some(Inner::Init(Init::new()))),
             shutdown: Shutdown::new(),
             nonblock: AtomicBool::new(nonblock),
-            epitems: EPollItems::default(),
             wait_queue: WaitQueue::default(),
             self_ref: me.clone(),
             pollee: AtomicUsize::new((EP::EPOLLIN.bits() | EP::EPOLLOUT.bits()) as usize),
@@ -43,7 +45,6 @@ impl TcpSocket {
             inner: RwLock::new(Some(Inner::Established(inner))),
             shutdown: Shutdown::new(),
             nonblock: AtomicBool::new(nonblock),
-            epitems: EPollItems::default(),
             wait_queue: WaitQueue::default(),
             self_ref: me.clone(),
             pollee: AtomicUsize::new((EP::EPOLLIN.bits() | EP::EPOLLOUT.bits()) as usize),
@@ -52,18 +53,6 @@ impl TcpSocket {
 
     pub fn is_nonblock(&self) -> bool {
         self.nonblock.load(core::sync::atomic::Ordering::Relaxed)
-    }
-
-    #[inline]
-    fn write_state<F>(&self, mut f: F) -> Result<(), SystemError>
-    where
-        F: FnMut(Inner) -> Result<Inner, SystemError>,
-    {
-        let mut inner_guard = self.inner.write();
-        let inner = inner_guard.take().expect("Tcp Inner is None");
-        let update = f(inner)?;
-        inner_guard.replace(update);
-        Ok(())
     }
 
     pub fn do_bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
@@ -289,11 +278,11 @@ impl Socket for TcpSocket {
         .map(|(inner, endpoint)| (Inode::new(inner), Endpoint::Ip(endpoint)))
     }
 
-    fn recv(&self, buffer: &mut [u8], _flags: MessageFlag) -> Result<usize, SystemError> {
+    fn recv(&self, buffer: &mut [u8], _flags: PMSG) -> Result<usize, SystemError> {
         self.try_recv(buffer)
     }
 
-    fn send(&self, buffer: &[u8], _flags: MessageFlag) -> Result<usize, SystemError> {
+    fn send(&self, buffer: &[u8], _flags: PMSG) -> Result<usize, SystemError> {
         self.try_send(buffer)
     }
 
@@ -314,181 +303,27 @@ impl Socket for TcpSocket {
     }
 
     fn close(&self) -> Result<(), SystemError> {
-        match self.inner.read().as_ref().expect("Tcp Inner is None") {
-            Inner::Init(_) => {}
-            Inner::Connecting(_) => {
-                return Err(EINPROGRESS);
-            }
-            Inner::Established(es) => {
-                es.close();
-                es.release();
-            }
-            Inner::Listening(_) => {}
-        }
-        Ok(())
+        self.inner
+            .read()
+            .as_ref()
+            .map(|inner| match inner {
+                Inner::Connecting(_) => Err(EINPROGRESS),
+                Inner::Established(es) => {
+                    es.close();
+                    es.release();
+                    Ok(())
+                }
+                _ => Ok(()),
+            })
+            .unwrap_or(Ok(()))
     }
 }
 
 impl InetSocket for TcpSocket {
     fn on_iface_events(&self) {
         if self.update_events() {
-            let result = self.finish_connect();
+            let _result = self.finish_connect();
             // set error
         }
     }
 }
-
-// #[derive(Debug)]
-// // #[cast_to([sync] IndexNode)]
-// struct TcpStream {
-//     inner: Established,
-//     shutdown: Shutdown,
-//     nonblock: AtomicBool,
-//     epitems: EPollItems,
-//     wait_queue: WaitQueue,
-//     self_ref: Weak<Self>,
-// }
-
-// impl TcpStream {
-//     pub fn is_nonblock(&self) -> bool {
-//         self.nonblock.load(core::sync::atomic::Ordering::Relaxed)
-//     }
-
-//     pub fn read(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-//         if self.nonblock.load(core::sync::atomic::Ordering::Relaxed) {
-//             return self.recv_slice(buf);
-//         } else {
-//             return self.wait_queue().busy_wait(
-//                 EP::EPOLLIN,
-//                 || self.recv_slice(buf)
-//             )
-//         }
-//     }
-
-//     pub fn recv_slice(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-//         let received = self.inner.recv_slice(buf);
-//         poll_ifaces();
-//         received
-//     }
-
-//     pub fn send_slice(&self, buf: &[u8]) -> Result<usize, SystemError> {
-//         let sent = self.inner.send_slice(buf);
-//         poll_ifaces();
-//         sent
-//     }
-// }
-
-// use crate::net::socket::{Inode, Socket};
-// use crate::filesystem::vfs::IndexNode;
-
-// impl IndexNode for TcpStream {
-//     fn read_at(
-//         &self,
-//         _offset: usize,
-//         _len: usize,
-//         buf: &mut [u8],
-//         data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-//     ) -> Result<usize, SystemError> {
-//         drop(data);
-//         self.read(buf)
-//     }
-
-//     fn write_at(
-//         &self,
-//         _offset: usize,
-//         _len: usize,
-//         buf: &[u8],
-//         data: crate::libs::spinlock::SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
-//     ) -> Result<usize, SystemError> {
-//         drop(data);
-//         self.send_slice(buf)
-//     }
-
-//     fn fs(&self) -> alloc::sync::Arc<dyn crate::filesystem::vfs::FileSystem> {
-//         todo!("TcpSocket::fs")
-//     }
-
-//     fn as_any_ref(&self) -> &dyn core::any::Any {
-//         self
-//     }
-
-//     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
-//         todo!("TcpSocket::list")
-//     }
-
-// }
-
-// impl Socket for TcpStream {
-
-//     fn wait_queue(&self) -> WaitQueue {
-//         self.wait_queue.clone()
-//     }
-
-//     fn poll(&self) -> usize {
-//         // self.inner.with(|socket| {
-//         //     let mut mask = EPollEventType::empty();
-//         //     let shutdown = self.shutdown.get();
-//         //     let state = socket.state();
-//         //     use smoltcp::socket::tcp::State::*;
-//         //     type EP = crate::net::event_poll::EPollEventType;
-
-//         //     if shutdown.is_both_shutdown() || state == Closed {
-//         //         mask |= EP::EPOLLHUP;
-//         //     }
-
-//         //     if shutdown.is_recv_shutdown() {
-//         //         mask |= EP::EPOLLIN | EP::EPOLLRDNORM | EP::EPOLLRDHUP;
-//         //     }
-
-//         //     if state != SynSent && state != SynReceived {
-//         //         if socket.can_recv() {
-//         //             mask |= EP::EPOLLIN | EP::EPOLLRDNORM;
-//         //         }
-
-//         //         if !shutdown.is_send_shutdown() {
-//         //             // __sk_stream_is_writeable，这是一个内联函数，用于判断一个TCP套接字是否可写。
-//         //             //
-//         //             // 以下是函数的逐行解释：
-//         //             // static inline bool __sk_stream_is_writeable(const struct sock *sk, int wake)
-//         //             // - 这行定义了函数__sk_stream_is_writeable，它是一个内联函数（static inline），
-//         //             // 这意味着在调用点直接展开代码，而不是调用函数体。函数接收两个参数：
-//         //             // 一个指向struct sock对象的指针sk（代表套接字），和一个整型变量wake。
-//         //             //
-//         //             // return sk_stream_wspace(sk) >= sk_stream_min_wspace(sk) &&
-//         //             // - 这行代码调用了sk_stream_wspace函数，获取套接字sk的可写空间（write space）大小。
-//         //             // 随后与sk_stream_min_wspace调用结果进行比较，该函数返回套接字为了保持稳定写入速度所需的
-//         //             // 最小可写空间。如果当前可写空间大于或等于最小可写空间，则表达式为真。
-//         //             //       __sk_stream_memory_free(sk, wake);
-//         //             // - 这行代码调用了__sk_stream_memory_free函数，它可能用于检查套接字的内存缓冲区是否
-//         //             // 有足够的空间可供写入数据。参数wake可能用于通知网络协议栈有数据需要发送，如果设置了相应的标志。
-//         //             // 综上所述，__sk_stream_is_writeable函数的目的是判断一个TCP套接字是否可以安全地进行写操作，
-//         //             // 它基于套接字的当前可写空间和所需的最小空间以及内存缓冲区的可用性。只有当这两个条件都满足时，
-//         //             // 函数才会返回true，表示套接字是可写的。
-//         //             if socket.can_send() {
-//         //                 mask |= EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND;
-//         //             } else {
-//         //                 todo!("TcpStream::poll: buffer space not enough");
-//         //             }
-//         //         } else {
-//         //             mask |= EP::EPOLLOUT | EP::EPOLLWRNORM;
-//         //         }
-//         //         // TODO tcp urg data => EPOLLPRI
-//         //     } else if state == SynSent /* inet_test_bit */ {
-//         //         log::warn!("Active TCP fastopen socket with defer_connect");
-//         //         mask |= EP::EPOLLOUT | EP::EPOLLWRNORM;
-//         //     }
-
-//         //     // TODO socket error
-//         //     return Ok(mask);
-//         // })
-//         self.pollee.load(core::sync::atomic::Ordering::Relaxed)
-//     }
-
-//     fn send_buffer_size(&self) -> usize {
-//         self.inner.with(|socket| socket.send_capacity())
-//     }
-
-//     fn recv_buffer_size(&self) -> usize {
-//         self.inner.with(|socket| socket.recv_capacity())
-//     }
-// }

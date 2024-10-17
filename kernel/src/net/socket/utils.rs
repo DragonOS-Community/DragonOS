@@ -5,7 +5,7 @@ use system_error::SystemError;
 
 pub fn create_socket(
     family: socket::AddressFamily,
-    socket_type: socket::Type,
+    socket_type: socket::PSOCK,
     protocol: u32,
     is_nonblock: bool,
     is_close_on_exec: bool,
@@ -21,7 +21,7 @@ pub fn create_socket(
             todo!("unsupport address family");
         }
     };
-    // inode.set_nonblock(is_nonblock);
-    // inode.set_close_on_exec(is_close_on_exec);
+    inode.set_nonblock(is_nonblock);
+    inode.set_close_on_exec(is_close_on_exec);
     return Ok(inode);
 }

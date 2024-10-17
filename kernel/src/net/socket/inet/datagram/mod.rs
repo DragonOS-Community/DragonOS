@@ -2,9 +2,7 @@ use inet::InetSocket;
 use smoltcp;
 use system_error::SystemError::{self, *};
 
-use crate::filesystem::vfs::IndexNode;
 use crate::libs::rwlock::RwLock;
-use crate::libs::spinlock::SpinLock;
 use crate::net::event_poll::EPollEventType;
 use crate::net::net_core::poll_ifaces;
 use crate::net::socket::*;
@@ -209,46 +207,30 @@ impl Socket for UdpSocket {
         return Err(EAFNOSUPPORT);
     }
 
-    fn send(&self, buffer: &[u8], flags: MessageFlag) -> Result<usize, SystemError> {
-        // if flags.contains(MessageFlag::DONTWAIT) {
+    fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError> {
+        if flags.contains(PMSG::DONTWAIT) {
+            log::warn!("Nonblock send is not implemented yet");
+        }
 
         return self.try_send(buffer, None);
-        // } else {
-        //     // return self
-        //     //     .wait_queue
-        //     //     .busy_wait(EP::EPOLLOUT, || self.try_send(buffer, None));
-        //     todo!()
-        // }
     }
 
-    fn send_to(
-        &self,
-        buffer: &[u8],
-        flags: MessageFlag,
-        address: Endpoint,
-    ) -> Result<usize, SystemError> {
-        // if flags.contains(MessageFlag::DONTWAIT) {
+    fn send_to(&self, buffer: &[u8], flags: PMSG, address: Endpoint) -> Result<usize, SystemError> {
+        if flags.contains(PMSG::DONTWAIT) {
+            log::warn!("Nonblock send is not implemented yet");
+        }
+
         if let Endpoint::Ip(remote) = address {
             return self.try_send(buffer, Some(remote));
         }
-        // } else {
-        //     // return self
-        //     //     .wait_queue
-        //     //     .busy_wait(EP::EPOLLOUT, || {
-        //     //         if let Endpoint::Ip(remote) = address {
-        //     //             return self.try_send(buffer, Some(remote.addr));
-        //     //         }
-        //     //         return Err(EAFNOSUPPORT);
-        //     //     });
-        //     todo!()
-        // }
+
         return Err(EINVAL);
     }
 
-    fn recv(&self, buffer: &mut [u8], flags: MessageFlag) -> Result<usize, SystemError> {
+    fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
         use crate::sched::SchedMode;
 
-        return if self.is_nonblock() || flags.contains(MessageFlag::DONTWAIT) {
+        return if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
             self.try_recv(buffer)
         } else {
             loop {
@@ -266,7 +248,7 @@ impl Socket for UdpSocket {
     fn recv_from(
         &self,
         buffer: &mut [u8],
-        flags: MessageFlag,
+        flags: PMSG,
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
         use crate::sched::SchedMode;
@@ -275,7 +257,7 @@ impl Socket for UdpSocket {
             self.connect(endpoint)?;
         }
 
-        return if self.is_nonblock() || flags.contains(MessageFlag::DONTWAIT) {
+        return if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
             self.try_recv(buffer)
         } else {
             loop {

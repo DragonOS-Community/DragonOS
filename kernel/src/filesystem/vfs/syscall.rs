@@ -2,7 +2,6 @@ use core::ffi::c_void;
 use core::mem::size_of;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
-use log::{debug, warn};
 use system_error::SystemError;
 
 use crate::producefs;
@@ -1225,7 +1224,7 @@ impl Syscall {
                 // TODO: unimplemented
                 // 未实现的命令，返回0，不报错。
 
-                warn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
+                log::warn!("fcntl: unimplemented command: {:?}, defaults to 0.", cmd);
                 return Err(SystemError::ENOSYS);
             }
         }
@@ -1614,7 +1613,7 @@ impl Syscall {
 
         // fchmod没完全实现，因此不修改文件的权限
         // todo: 实现fchmod
-        warn!("fchmod not fully implemented");
+        log::warn!("fchmod not fully implemented");
         return Ok(0);
     }
     /// #挂载文件系统

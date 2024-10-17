@@ -117,5 +117,5 @@ use crate::net::socket;
 use alloc::sync::Arc;
 
 pub trait Family {
-    fn socket(stype: socket::Type, protocol: u32) -> Result<Arc<socket::Inode>, SystemError>;
+    fn socket(stype: socket::PSOCK, protocol: u32) -> Result<Arc<socket::Inode>, SystemError>;
 }

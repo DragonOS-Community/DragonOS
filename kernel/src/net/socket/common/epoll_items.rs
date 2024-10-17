@@ -6,10 +6,8 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    libs::{spinlock::SpinLock, wait_queue::EventWaitQueue},
-    net::event_poll::{EPollEventType, EPollItem, EventPoll},
-    process::ProcessManager,
-    sched::{schedule, SchedMode},
+    libs::spinlock::SpinLock,
+    net::event_poll::{EPollItem, EventPoll},
 };
 
 #[derive(Debug, Clone)]

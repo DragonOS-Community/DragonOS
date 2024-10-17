@@ -58,12 +58,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     }
     /// # `get_option`
     /// 对应于 Posix `getsockopt` ，获取socket选项
-    fn get_option(
-        &self,
-        level: OptionsLevel,
-        name: usize,
-        value: &mut [u8],
-    ) -> Result<usize, SystemError> {
+    fn get_option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
         log::warn!("getsockopt is not implemented");
         Ok(0)
     }
@@ -76,42 +71,37 @@ pub trait Socket: Sync + Send + Debug + Any {
     // pselect
     /// # `read`
     fn read(&self, buffer: &mut [u8]) -> Result<usize, SystemError> {
-        self.recv(buffer, MessageFlag::empty())
+        self.recv(buffer, PMSG::empty())
     }
     /// # `recv`
     /// 接收数据，`read` = `recv` with flags = 0
-    fn recv(&self, buffer: &mut [u8], flags: MessageFlag) -> Result<usize, SystemError> {
+    fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
         Err(ENOSYS)
     }
     /// # `recv_from`
     fn recv_from(
         &self,
         buffer: &mut [u8],
-        flags: MessageFlag,
+        flags: PMSG,
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
         Err(ENOSYS)
     }
     /// # `recv_msg`
-    fn recv_msg(&self, msg: &mut MsgHdr, flags: MessageFlag) -> Result<usize, SystemError> {
+    fn recv_msg(&self, msg: &mut MsgHdr, flags: PMSG) -> Result<usize, SystemError> {
         Err(ENOSYS)
     }
     // select
     /// # `send`
-    fn send(&self, buffer: &[u8], flags: MessageFlag) -> Result<usize, SystemError> {
+    fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError> {
         Err(ENOSYS)
     }
     /// # `send_msg`
-    fn send_msg(&self, msg: &MsgHdr, flags: MessageFlag) -> Result<usize, SystemError> {
+    fn send_msg(&self, msg: &MsgHdr, flags: PMSG) -> Result<usize, SystemError> {
         Err(ENOSYS)
     }
     /// # `send_to`
-    fn send_to(
-        &self,
-        buffer: &[u8],
-        flags: MessageFlag,
-        address: Endpoint,
-    ) -> Result<usize, SystemError> {
+    fn send_to(&self, buffer: &[u8], flags: PMSG, address: Endpoint) -> Result<usize, SystemError> {
         Err(ENOSYS)
     }
     /// # `set_option`
@@ -122,7 +112,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     /// - value 选项的值
     /// ## Reference
     /// https://code.dragonos.org.cn/s?refs=sk_setsockopt&project=linux-6.6.21
-    fn set_option(&self, level: OptionsLevel, name: usize, val: &[u8]) -> Result<(), SystemError> {
+    fn set_option(&self, level: PSOL, name: usize, val: &[u8]) -> Result<(), SystemError> {
         log::warn!("setsockopt is not implemented");
         Ok(())
     }
@@ -135,7 +125,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     // socketpair
     /// # `write`
     fn write(&self, buffer: &[u8]) -> Result<usize, SystemError> {
-        self.send(buffer, MessageFlag::empty())
+        self.send(buffer, PMSG::empty())
     }
     // fn write_buffer(&self, _buf: &[u8]) -> Result<usize, SystemError> {
     //     todo!()

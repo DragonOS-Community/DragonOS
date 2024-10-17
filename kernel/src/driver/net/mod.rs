@@ -1,9 +1,5 @@
 use alloc::{fmt, vec::Vec};
 use alloc::{string::String, sync::Arc};
-use smoltcp::{
-    iface,
-    wire::{self, EthernetAddress},
-};
 use sysfs::netdev_register_kobject;
 
 use crate::{

@@ -1,6 +1,6 @@
 bitflags::bitflags! {
     // #[derive(PartialEq, Eq, Debug, Clone, Copy)]
-    pub struct SysArgSocketType: u32 {
+    pub struct PosixArgsSocketType: u32 {
         const DGRAM     = 1;    // 0b0000_0001
         const STREAM    = 2;    // 0b0000_0010
         const RAW       = 3;    // 0b0000_0011
@@ -14,39 +14,34 @@ bitflags::bitflags! {
     }
 }
 
-impl SysArgSocketType {
+impl PosixArgsSocketType {
     #[inline(always)]
-    pub fn types(&self) -> SysArgSocketType {
-        SysArgSocketType::from_bits(self.bits() & 0b_1111).unwrap()
+    pub fn types(&self) -> PosixArgsSocketType {
+        PosixArgsSocketType::from_bits(self.bits() & 0b_1111).unwrap()
     }
 
     #[inline(always)]
     pub fn is_nonblock(&self) -> bool {
-        self.contains(SysArgSocketType::NONBLOCK)
+        self.contains(PosixArgsSocketType::NONBLOCK)
     }
 
     #[inline(always)]
     pub fn is_cloexec(&self) -> bool {
-        self.contains(SysArgSocketType::CLOEXEC)
+        self.contains(PosixArgsSocketType::CLOEXEC)
     }
 }
 
 use alloc::sync::Arc;
 use core::ffi::CStr;
-use unix::INODE_MAP;
 
 use crate::{
-    filesystem::vfs::{
-        file::FileMode, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
-    },
-    libs::casting::DowncastArc,
+    filesystem::vfs::{FileType, IndexNode, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES},
     mm::{verify_area, VirtAddr},
-    net::socket::{self, *},
+    net::socket::*,
     process::ProcessManager,
-    syscall::Syscall,
 };
 use smoltcp;
-use system_error::SystemError::{self, *};
+use system_error::SystemError;
 
 // 参考资料： https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/netinet_in.h.html#tag_13_32
 #[repr(C)]

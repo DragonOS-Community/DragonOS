@@ -23,7 +23,6 @@ impl IrqHandler for DefaultNetIrqHandler {
         _dynamic_data: Option<Arc<dyn IrqHandlerData>>,
     ) -> Result<IrqReturn, SystemError> {
         // poll_ifaces_try_lock_onetime().ok();
-        log::warn!("DefaultNetIrqHandler: poll_ifaces_try_lock_onetime -> poll_ifaces");
         poll_ifaces();
         Ok(IrqReturn::Handled)
     }

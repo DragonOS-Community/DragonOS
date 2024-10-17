@@ -215,12 +215,7 @@ impl Socket for UdpSocket {
         return self.try_send(buffer, None);
     }
 
-    fn send_to(
-        &self,
-        buffer: &[u8],
-        flags: PMSG,
-        address: Endpoint,
-    ) -> Result<usize, SystemError> {
+    fn send_to(&self, buffer: &[u8], flags: PMSG, address: Endpoint) -> Result<usize, SystemError> {
         if flags.contains(PMSG::DONTWAIT) {
             log::warn!("Nonblock send is not implemented yet");
         }

@@ -58,12 +58,7 @@ pub trait Socket: Sync + Send + Debug + Any {
     }
     /// # `get_option`
     /// 对应于 Posix `getsockopt` ，获取socket选项
-    fn get_option(
-        &self,
-        level: PSOL,
-        name: usize,
-        value: &mut [u8],
-    ) -> Result<usize, SystemError> {
+    fn get_option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
         log::warn!("getsockopt is not implemented");
         Ok(0)
     }
@@ -106,12 +101,7 @@ pub trait Socket: Sync + Send + Debug + Any {
         Err(ENOSYS)
     }
     /// # `send_to`
-    fn send_to(
-        &self,
-        buffer: &[u8],
-        flags: PMSG,
-        address: Endpoint,
-    ) -> Result<usize, SystemError> {
+    fn send_to(&self, buffer: &[u8], flags: PMSG, address: Endpoint) -> Result<usize, SystemError> {
         Err(ENOSYS)
     }
     /// # `set_option`

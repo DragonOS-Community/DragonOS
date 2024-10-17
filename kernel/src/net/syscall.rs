@@ -142,7 +142,7 @@ impl Syscall {
             .get_socket(fd as i32)
             .ok_or(EBADF)?;
 
-        use socket::{PSOL, PSO};
+        use socket::{PSO, PSOL};
 
         let level = PSOL::try_from(level as u32)?;
 

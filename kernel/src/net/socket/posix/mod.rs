@@ -1,5 +1,5 @@
 // posix socket and arguments definitions
-// now all posix definitions are with P front like MSG -> PMSG, 
+// now all posix definitions are with P front like MSG -> PMSG,
 // for better understanding and avoiding conflicts with other definitions
 mod msg_flag;
 mod option;

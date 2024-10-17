@@ -303,8 +303,10 @@ impl Socket for TcpSocket {
     }
 
     fn close(&self) -> Result<(), SystemError> {
-        self.inner.read().as_ref().map(
-            |inner| match inner {
+        self.inner
+            .read()
+            .as_ref()
+            .map(|inner| match inner {
                 Inner::Connecting(_) => Err(EINPROGRESS),
                 Inner::Established(es) => {
                     es.close();
@@ -312,8 +314,8 @@ impl Socket for TcpSocket {
                     Ok(())
                 }
                 _ => Ok(()),
-            }
-        ).unwrap_or(Ok(()))
+            })
+            .unwrap_or(Ok(()))
     }
 }
 

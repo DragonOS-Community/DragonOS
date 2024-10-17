@@ -349,11 +349,7 @@ impl Socket for SeqpacketSocket {
         Err(SystemError::ENOSYS)
     }
 
-    fn send(
-        &self,
-        buffer: &[u8],
-        flags: crate::net::socket::PMSG,
-    ) -> Result<usize, SystemError> {
+    fn send(&self, buffer: &[u8], flags: crate::net::socket::PMSG) -> Result<usize, SystemError> {
         if flags.contains(PMSG::OOB) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }

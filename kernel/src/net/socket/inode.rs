@@ -99,12 +99,7 @@ impl Inode {
         self.inner.bind(endpoint)
     }
 
-    pub fn set_option(
-        &self,
-        level: PSOL,
-        name: usize,
-        value: &[u8],
-    ) -> Result<(), SystemError> {
+    pub fn set_option(&self, level: PSOL, name: usize, value: &[u8]) -> Result<(), SystemError> {
         self.inner.set_option(level, name, value)
     }
 

@@ -241,12 +241,7 @@ impl Socket for StreamSocket {
         }
     }
 
-    fn set_option(
-        &self,
-        _level: PSOL,
-        _optname: usize,
-        _optval: &[u8],
-    ) -> Result<(), SystemError> {
+    fn set_option(&self, _level: PSOL, _optname: usize, _optval: &[u8]) -> Result<(), SystemError> {
         log::warn!("setsockopt is not implemented");
         Ok(())
     }

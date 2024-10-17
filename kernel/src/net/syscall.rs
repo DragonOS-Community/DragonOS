@@ -35,10 +35,10 @@ impl Syscall {
         //     protocol
         // );
         let address_family = socket::AddressFamily::try_from(address_family as u16)?;
-        let type_arg = SysArgSocketType::from_bits_truncate(socket_type as u32);
+        let type_arg = PosixArgsSocketType::from_bits_truncate(socket_type as u32);
         let is_nonblock = type_arg.is_nonblock();
         let is_close_on_exec = type_arg.is_cloexec();
-        let stype = socket::Type::try_from(type_arg)?;
+        let stype = socket::PSOCK::try_from(type_arg)?;
         // log::debug!("type_arg {:?}  stype {:?}", type_arg, stype);
 
         let inode = socket::create_socket(
@@ -73,8 +73,8 @@ impl Syscall {
         fds: &mut [i32],
     ) -> Result<usize, SystemError> {
         let address_family = AF::try_from(address_family as u16)?;
-        let socket_type = SysArgSocketType::from_bits_truncate(socket_type as u32);
-        let stype = socket::Type::try_from(socket_type)?;
+        let socket_type = PosixArgsSocketType::from_bits_truncate(socket_type as u32);
+        let stype = socket::PSOCK::try_from(socket_type)?;
 
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
@@ -112,7 +112,7 @@ impl Syscall {
         optname: usize,
         optval: &[u8],
     ) -> Result<usize, SystemError> {
-        let sol = socket::OptionLevel::try_from(level as u32)?;
+        let sol = socket::PSOL::try_from(level as u32)?;
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
@@ -142,14 +142,14 @@ impl Syscall {
             .get_socket(fd as i32)
             .ok_or(EBADF)?;
 
-        let level = socket::OptionLevel::try_from(level as u32)?;
+        use socket::{PSOL, PSO};
 
-        use socket::OptionLevel as SOL;
-        use socket::Options as SO;
-        if matches!(level, SOL::SOCKET) {
-            let optname = SO::try_from(optname as u32).map_err(|_| ENOPROTOOPT)?;
+        let level = PSOL::try_from(level as u32)?;
+
+        if matches!(level, PSOL::SOCKET) {
+            let optname = PSO::try_from(optname as u32).map_err(|_| ENOPROTOOPT)?;
             match optname {
-                SO::SNDBUF => {
+                PSO::SNDBUF => {
                     // 返回发送缓冲区大小
                     unsafe {
                         *optval = socket.send_buffer_size() as u32;
@@ -157,7 +157,7 @@ impl Syscall {
                     }
                     return Ok(0);
                 }
-                SO::RCVBUF => {
+                PSO::RCVBUF => {
                     // 返回默认的接收缓冲区大小
                     unsafe {
                         *optval = socket.recv_buffer_size() as u32;
@@ -178,7 +178,7 @@ impl Syscall {
         // to be interpreted by the TCP protocol, level should be set to the
         // protocol number of TCP.
 
-        if matches!(level, SOL::TCP) {
+        if matches!(level, PSOL::TCP) {
             use socket::inet::stream::TcpOption;
             let optname = TcpOption::try_from(optname as i32).map_err(|_| ENOPROTOOPT)?;
             match optname {
@@ -253,7 +253,7 @@ impl Syscall {
             Some(SockAddr::to_endpoint(addr, addrlen)?)
         };
 
-        let flags = socket::MessageFlag::from_bits_truncate(flags);
+        let flags = socket::PMSG::from_bits_truncate(flags);
 
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
@@ -285,7 +285,7 @@ impl Syscall {
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        let flags = socket::MessageFlag::from_bits_truncate(flags);
+        let flags = socket::PMSG::from_bits_truncate(flags);
 
         if addr.is_null() {
             let (n, _) = socket.recv_from(buf, flags, None)?;
@@ -327,7 +327,7 @@ impl Syscall {
         //     .get_socket(fd as i32)
         //     .ok_or(SystemError::EBADF)?;
 
-        // let flags = socket::MessageFlag::from_bits_truncate(flags as u32);
+        // let flags = socket::PMSG::from_bits_truncate(flags as u32);
 
         // let mut buf = iovs.new_buf(true);
         // // 从socket中读取数据

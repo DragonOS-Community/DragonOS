@@ -1,7 +1,7 @@
 mod base;
 mod buffer;
 mod common;
-mod definition;
+mod posix;
 mod endpoint;
 mod family;
 pub mod inet;
@@ -17,7 +17,7 @@ pub use common::{
     // poll_unit::{EPollItems, WaitQueue},
     EPollItems,
 };
-pub use definition::*;
+pub use posix::*;
 pub use endpoint::*;
 pub use family::{AddressFamily, Family};
 pub use inode::Inode;

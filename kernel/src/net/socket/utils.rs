@@ -5,7 +5,7 @@ use system_error::SystemError;
 
 pub fn create_socket(
     family: socket::AddressFamily,
-    socket_type: socket::Type,
+    socket_type: socket::PSOCK,
     protocol: u32,
     is_nonblock: bool,
     is_close_on_exec: bool,

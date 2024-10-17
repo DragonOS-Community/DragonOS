@@ -8,14 +8,13 @@ use inet::{TcpSocket, UdpSocket};
 use crate::net::socket::*;
 
 fn create_inet_socket(
-    socket_type: Type,
+    socket_type: PSOCK,
     protocol: smoltcp::wire::IpProtocol,
 ) -> Result<Arc<dyn Socket>, SystemError> {
     // log::debug!("type: {:?}, protocol: {:?}", socket_type, protocol);
     use smoltcp::wire::IpProtocol::*;
-    use Type::*;
     match socket_type {
-        Datagram => {
+        PSOCK::Datagram => {
             match protocol {
                 HopByHop | Udp => {
                     return Ok(UdpSocket::new(false));
@@ -29,7 +28,7 @@ fn create_inet_socket(
             // }
             // return Ok(UdpSocket::new(false));
         }
-        Stream => match protocol {
+        PSOCK::Stream => match protocol {
             HopByHop | Tcp => {
                 return Ok(TcpSocket::new(false));
             }
@@ -37,7 +36,7 @@ fn create_inet_socket(
                 return Err(EPROTONOSUPPORT);
             }
         },
-        Raw => {
+        PSOCK::Raw => {
             todo!("raw")
         }
         _ => {
@@ -48,7 +47,7 @@ fn create_inet_socket(
 
 pub struct Inet;
 impl family::Family for Inet {
-    fn socket(stype: Type, protocol: u32) -> Result<Arc<Inode>, SystemError> {
+    fn socket(stype: PSOCK, protocol: u32) -> Result<Arc<Inode>, SystemError> {
         let socket = create_inet_socket(stype, smoltcp::wire::IpProtocol::from(protocol as u8))?;
         Ok(Inode::new(socket))
     }

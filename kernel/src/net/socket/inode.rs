@@ -101,7 +101,7 @@ impl Inode {
 
     pub fn set_option(
         &self,
-        level: OptionLevel,
+        level: PSOL,
         name: usize,
         value: &[u8],
     ) -> Result<(), SystemError> {
@@ -110,7 +110,7 @@ impl Inode {
 
     pub fn get_option(
         &self,
-        level: OptionLevel,
+        level: PSOL,
         name: usize,
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
@@ -125,16 +125,16 @@ impl Inode {
         &self,
         buffer: &[u8],
         address: Endpoint,
-        flags: MessageFlag,
+        flags: PMSG,
     ) -> Result<usize, SystemError> {
         self.inner.send_to(buffer, flags, address)
     }
 
-    pub fn send(&self, buffer: &[u8], flags: MessageFlag) -> Result<usize, SystemError> {
+    pub fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError> {
         self.inner.send(buffer, flags)
     }
 
-    pub fn recv(&self, buffer: &mut [u8], flags: MessageFlag) -> Result<usize, SystemError> {
+    pub fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
         self.inner.recv(buffer, flags)
     }
 
@@ -142,7 +142,7 @@ impl Inode {
     pub fn recv_from(
         &self,
         buffer: &mut [u8],
-        flags: MessageFlag,
+        flags: PMSG,
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
         self.inner.recv_from(buffer, flags, address)

@@ -207,8 +207,8 @@ impl Socket for UdpSocket {
         return Err(EAFNOSUPPORT);
     }
 
-    fn send(&self, buffer: &[u8], flags: MessageFlag) -> Result<usize, SystemError> {
-        if flags.contains(MessageFlag::DONTWAIT) {
+    fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError> {
+        if flags.contains(PMSG::DONTWAIT) {
             log::warn!("Nonblock send is not implemented yet");
         }
 
@@ -218,10 +218,10 @@ impl Socket for UdpSocket {
     fn send_to(
         &self,
         buffer: &[u8],
-        flags: MessageFlag,
+        flags: PMSG,
         address: Endpoint,
     ) -> Result<usize, SystemError> {
-        if flags.contains(MessageFlag::DONTWAIT) {
+        if flags.contains(PMSG::DONTWAIT) {
             log::warn!("Nonblock send is not implemented yet");
         }
 
@@ -232,10 +232,10 @@ impl Socket for UdpSocket {
         return Err(EINVAL);
     }
 
-    fn recv(&self, buffer: &mut [u8], flags: MessageFlag) -> Result<usize, SystemError> {
+    fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
         use crate::sched::SchedMode;
 
-        return if self.is_nonblock() || flags.contains(MessageFlag::DONTWAIT) {
+        return if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
             self.try_recv(buffer)
         } else {
             loop {
@@ -253,7 +253,7 @@ impl Socket for UdpSocket {
     fn recv_from(
         &self,
         buffer: &mut [u8],
-        flags: MessageFlag,
+        flags: PMSG,
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
         use crate::sched::SchedMode;
@@ -262,7 +262,7 @@ impl Socket for UdpSocket {
             self.connect(endpoint)?;
         }
 
-        return if self.is_nonblock() || flags.contains(MessageFlag::DONTWAIT) {
+        return if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
             self.try_recv(buffer)
         } else {
             loop {

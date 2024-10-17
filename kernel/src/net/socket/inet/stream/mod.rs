@@ -278,11 +278,11 @@ impl Socket for TcpSocket {
         .map(|(inner, endpoint)| (Inode::new(inner), Endpoint::Ip(endpoint)))
     }
 
-    fn recv(&self, buffer: &mut [u8], _flags: MessageFlag) -> Result<usize, SystemError> {
+    fn recv(&self, buffer: &mut [u8], _flags: PMSG) -> Result<usize, SystemError> {
         self.try_recv(buffer)
     }
 
-    fn send(&self, buffer: &[u8], _flags: MessageFlag) -> Result<usize, SystemError> {
+    fn send(&self, buffer: &[u8], _flags: PMSG) -> Result<usize, SystemError> {
         self.try_send(buffer)
     }
 

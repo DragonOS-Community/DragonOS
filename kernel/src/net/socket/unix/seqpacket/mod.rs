@@ -244,7 +244,7 @@ impl Socket for SeqpacketSocket {
 
     fn set_option(
         &self,
-        _level: crate::net::socket::OptionLevel,
+        _level: crate::net::socket::PSOL,
         _optname: usize,
         _optval: &[u8],
     ) -> Result<(), SystemError> {
@@ -294,7 +294,7 @@ impl Socket for SeqpacketSocket {
 
     fn get_option(
         &self,
-        _level: crate::net::socket::OptionLevel,
+        _level: crate::net::socket::PSOL,
         _name: usize,
         _value: &mut [u8],
     ) -> Result<usize, SystemError> {
@@ -303,18 +303,18 @@ impl Socket for SeqpacketSocket {
     }
 
     fn read(&self, buffer: &mut [u8]) -> Result<usize, SystemError> {
-        self.recv(buffer, crate::net::socket::MessageFlag::empty())
+        self.recv(buffer, crate::net::socket::PMSG::empty())
     }
 
     fn recv(
         &self,
         buffer: &mut [u8],
-        flags: crate::net::socket::MessageFlag,
+        flags: crate::net::socket::PMSG,
     ) -> Result<usize, SystemError> {
-        if flags.contains(MessageFlag::OOB) {
+        if flags.contains(PMSG::OOB) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
-        if !flags.contains(MessageFlag::DONTWAIT) {
+        if !flags.contains(PMSG::DONTWAIT) {
             loop {
                 wq_wait_event_interruptible!(
                     self.wait_queue,
@@ -344,7 +344,7 @@ impl Socket for SeqpacketSocket {
     fn recv_msg(
         &self,
         _msg: &mut crate::net::syscall::MsgHdr,
-        _flags: crate::net::socket::MessageFlag,
+        _flags: crate::net::socket::PMSG,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -352,15 +352,15 @@ impl Socket for SeqpacketSocket {
     fn send(
         &self,
         buffer: &[u8],
-        flags: crate::net::socket::MessageFlag,
+        flags: crate::net::socket::PMSG,
     ) -> Result<usize, SystemError> {
-        if flags.contains(MessageFlag::OOB) {
+        if flags.contains(PMSG::OOB) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
         if self.is_peer_shutdown()? {
             return Err(SystemError::EPIPE);
         }
-        if !flags.contains(MessageFlag::DONTWAIT) {
+        if !flags.contains(PMSG::DONTWAIT) {
             loop {
                 match &*self.inner.write() {
                     Inner::Connected(connected) => match connected.try_write(buffer) {
@@ -384,26 +384,26 @@ impl Socket for SeqpacketSocket {
     fn send_msg(
         &self,
         _msg: &crate::net::syscall::MsgHdr,
-        _flags: crate::net::socket::MessageFlag,
+        _flags: crate::net::socket::PMSG,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
 
     fn write(&self, buffer: &[u8]) -> Result<usize, SystemError> {
-        self.send(buffer, crate::net::socket::MessageFlag::empty())
+        self.send(buffer, crate::net::socket::PMSG::empty())
     }
 
     fn recv_from(
         &self,
         buffer: &mut [u8],
-        flags: MessageFlag,
+        flags: PMSG,
         _address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
         // log::debug!("recvfrom flags {:?}", flags);
-        if flags.contains(MessageFlag::OOB) {
+        if flags.contains(PMSG::OOB) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
-        if !flags.contains(MessageFlag::DONTWAIT) {
+        if !flags.contains(PMSG::DONTWAIT) {
             loop {
                 wq_wait_event_interruptible!(
                     self.wait_queue,

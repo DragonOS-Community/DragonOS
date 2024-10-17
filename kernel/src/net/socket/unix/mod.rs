@@ -10,27 +10,27 @@ lazy_static! {
     pub static ref INODE_MAP: RwLock<HashMap<InodeId, Endpoint>> = RwLock::new(HashMap::new());
 }
 
-fn create_unix_socket(sock_type: Type) -> Result<Arc<Inode>, SystemError> {
+fn create_unix_socket(sock_type: PSOCK) -> Result<Arc<Inode>, SystemError> {
     match sock_type {
-        Type::Stream | Type::Datagram => stream::StreamSocket::new_inode(),
-        Type::SeqPacket => seqpacket::SeqpacketSocket::new_inode(false),
+        PSOCK::Stream | PSOCK::Datagram => stream::StreamSocket::new_inode(),
+        PSOCK::SeqPacket => seqpacket::SeqpacketSocket::new_inode(false),
         _ => Err(EPROTONOSUPPORT),
     }
 }
 
 impl family::Family for Unix {
-    fn socket(stype: Type, _protocol: u32) -> Result<Arc<Inode>, SystemError> {
+    fn socket(stype: PSOCK, _protocol: u32) -> Result<Arc<Inode>, SystemError> {
         let socket = create_unix_socket(stype)?;
         Ok(socket)
     }
 }
 
 impl Unix {
-    pub fn new_pairs(socket_type: Type) -> Result<(Arc<Inode>, Arc<Inode>), SystemError> {
+    pub fn new_pairs(socket_type: PSOCK) -> Result<(Arc<Inode>, Arc<Inode>), SystemError> {
         // log::debug!("socket_type {:?}", socket_type);
         match socket_type {
-            Type::SeqPacket => seqpacket::SeqpacketSocket::new_pairs(),
-            Type::Stream | Type::Datagram => stream::StreamSocket::new_pairs(),
+            PSOCK::SeqPacket => seqpacket::SeqpacketSocket::new_pairs(),
+            PSOCK::Stream | PSOCK::Datagram => stream::StreamSocket::new_pairs(),
             _ => todo!(),
         }
     }

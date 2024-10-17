@@ -9,10 +9,10 @@ pub enum Type {
     Packet = 10,
 }
 
-use crate::net::syscall_util::SysArgSocketType;
-impl TryFrom<SysArgSocketType> for Type {
+use crate::net::syscall_util::PosixArgsSocketType;
+impl TryFrom<PosixArgsSocketType> for Type {
     type Error = system_error::SystemError;
-    fn try_from(x: SysArgSocketType) -> Result<Self, Self::Error> {
+    fn try_from(x: PosixArgsSocketType) -> Result<Self, Self::Error> {
         use num_traits::FromPrimitive;
         return <Self as FromPrimitive>::from_u32(x.types().bits())
             .ok_or(system_error::SystemError::EINVAL);

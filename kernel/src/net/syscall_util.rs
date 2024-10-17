@@ -1,6 +1,6 @@
 bitflags::bitflags! {
     // #[derive(PartialEq, Eq, Debug, Clone, Copy)]
-    pub struct SysArgSocketType: u32 {
+    pub struct PosixArgsSocketType: u32 {
         const DGRAM     = 1;    // 0b0000_0001
         const STREAM    = 2;    // 0b0000_0010
         const RAW       = 3;    // 0b0000_0011
@@ -14,20 +14,20 @@ bitflags::bitflags! {
     }
 }
 
-impl SysArgSocketType {
+impl PosixArgsSocketType {
     #[inline(always)]
-    pub fn types(&self) -> SysArgSocketType {
-        SysArgSocketType::from_bits(self.bits() & 0b_1111).unwrap()
+    pub fn types(&self) -> PosixArgsSocketType {
+        PosixArgsSocketType::from_bits(self.bits() & 0b_1111).unwrap()
     }
 
     #[inline(always)]
     pub fn is_nonblock(&self) -> bool {
-        self.contains(SysArgSocketType::NONBLOCK)
+        self.contains(PosixArgsSocketType::NONBLOCK)
     }
 
     #[inline(always)]
     pub fn is_cloexec(&self) -> bool {
-        self.contains(SysArgSocketType::CLOEXEC)
+        self.contains(PosixArgsSocketType::CLOEXEC)
     }
 }
 

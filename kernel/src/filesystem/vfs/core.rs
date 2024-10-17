@@ -172,7 +172,8 @@ pub fn do_mkdir_at(
         user_path_at(&ProcessManager::current_pcb(), dirfd, path.trim())?;
     let (name, parent) = rsplit_path(&path);
     if let Some(parent) = parent {
-        current_inode = current_inode.lookup(parent)?;
+        current_inode =
+            current_inode.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
     }
     // debug!("mkdir at {:?}", current_inode.metadata()?.inode_id);
     return current_inode.mkdir(name, ModeType::from_bits_truncate(mode.bits()));

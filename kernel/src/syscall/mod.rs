@@ -295,6 +295,13 @@ impl Syscall {
                 Self::mkdir(path, mode)
             }
 
+            SYS_MKDIRAT => {
+                let dirfd = args[0] as i32;
+                let path = args[1] as *const u8;
+                let mode = args[2];
+                Self::mkdir_at(dirfd, path, mode)
+            }
+
             SYS_NANOSLEEP => {
                 let req = args[0] as *const PosixTimeSpec;
                 let rem = args[1] as *mut PosixTimeSpec;

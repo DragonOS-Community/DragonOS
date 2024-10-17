@@ -157,6 +157,23 @@ impl Socket for StreamSocket {
                     _ => return Err(SystemError::EINVAL),
                 }
             }
+            Endpoint::Abspath((abs_addr, path)) => {
+                let inode_guard = ABS_INODE_MAP.lock_irqsave();
+                let inode = match inode_guard.get(&abs_addr.name()) {
+                    Some(inode) => inode,
+                    None => {
+                        log::debug!("can not find inode from absInodeMap");
+                        return Err(SystemError::EINVAL);
+                    }
+                };
+                match inode {
+                    Endpoint::Inode((inode, _)) => (inode.clone(), path),
+                    _ => {
+                        debug!("when connect, find inode failed!");
+                        return Err(SystemError::EINVAL);
+                    }
+                }
+            }
             _ => return Err(SystemError::EINVAL),
         };
 

@@ -148,24 +148,28 @@ impl SockAddr {
                                 SystemError::EINVAL
                             })?;
 
-                        log::debug!("abs path: {}", path);
 
                         // 向抽象地址管理器申请或查找抽象地址
                         let spath = String::from(path);
+                        log::debug!("abs path: {}", spath);
                         let abs_find = match look_up_abs_addr(&spath) {
                             Ok(result) => result,
                             Err(_) => {
                                 //未找到尝试分配abs
                                 match alloc_abs_addr(spath.clone()) {
                                     Ok(result) => {
+                                        log::debug!("alloc abs addr success!");
                                         let unix_abs_endpoint = Endpoint::Abspath((result, spath));
                                         return Ok(unix_abs_endpoint)
                                     },
-                                    Err(e) => return Err(e),
+                                    Err(e) => {
+                                        log::debug!("alloc abs addr failed!");
+                                        return Err(e)
+                                    },
                                 };
                             },
                         };
-
+                        log::debug!("find alloc abs addr success!");
                         return Ok(Endpoint::Abspath((abs_find, spath)));
                     }
 

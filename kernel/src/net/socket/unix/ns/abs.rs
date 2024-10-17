@@ -1,3 +1,5 @@
+use core::fmt;
+
 use crate::libs::spinlock::SpinLock;
 use crate::net::socket::Endpoint;
 use alloc::string::String;
@@ -11,7 +13,8 @@ lazy_static! {
 }
 
 lazy_static! {
-    pub static ref ABS_INODE_MAP: SpinLock<HashMap<usize, Endpoint>> = SpinLock::new(HashMap::new());
+    pub static ref ABS_INODE_MAP: SpinLock<HashMap<usize, Endpoint>> =
+        SpinLock::new(HashMap::new());
 }
 
 static ABS_ADDRESS_ALLOCATOR: SpinLock<IdAllocator> =
@@ -27,6 +30,20 @@ impl AbsHandle {
 
     pub fn name(&self) -> usize {
         self.0
+    }
+}
+
+impl fmt::Display for AbsHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:05x}", self.0)
+    }
+}
+
+impl Drop for AbsHandle {
+    fn drop(&mut self) {
+        // 释放分配的abs_id
+        ABS_ADDRESS_ALLOCATOR.lock_irqsave().free(self.name());
+        // TODO:inode映射表中相对应的表项
     }
 }
 
@@ -73,7 +90,6 @@ impl AbsHandleMap {
             None => return None,
         };
 
-        //将分配到的abs_addr格式化为16进制的五位字符
         return Some(Arc::new(AbsHandle::new(abs_addr)));
     }
 

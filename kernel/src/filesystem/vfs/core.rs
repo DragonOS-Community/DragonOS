@@ -14,6 +14,7 @@ use crate::{
         sysfs::sysfs_init,
         vfs::{mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
     },
+    libs::spinlock::SpinLock,
     process::ProcessManager,
 };
 
@@ -23,7 +24,7 @@ use super::{
     mount::{init_mountlist, MOUNT_LIST},
     syscall::UmountFlag,
     utils::{rsplit_path, user_path_at},
-    IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    FilePrivateData, IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 /// 当没有指定根文件系统时，尝试的根文件系统列表
@@ -245,6 +246,40 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     // 删除文件
     parent_inode.unlink(filename)?;
 
+    return Ok(0);
+}
+
+pub fn do_symlinkat(from: &str, newdfd: i32, to: &str) -> Result<usize, SystemError> {
+    let pcb = ProcessManager::current_pcb();
+    let (old_begin_inode, old_remain_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), from)?;
+    // info!("old_begin_inode={:?}", old_begin_inode.metadata());
+    let _ =
+        old_begin_inode.lookup_follow_symlink(&old_remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+
+    // 得到新创建节点的父节点
+    let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newdfd, to)?;
+    let (new_name, new_parent_path) = rsplit_path(&new_remain_path);
+    let new_parent = new_begin_inode
+        .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    // info!("new_parent={:?}", new_parent.metadata());
+
+    if new_parent.metadata()?.file_type != FileType::Dir {
+        return Err(SystemError::ENOTDIR);
+    }
+
+    info!("Creating symlink");
+    let new_inode = new_parent.create_with_data(
+        new_name,
+        FileType::SymLink,
+        ModeType::from_bits_truncate(0o777),
+        0,
+    )?;
+
+    let buf = old_remain_path.as_bytes();
+    let len = buf.len();
+    info!("Writing symlink data");
+    new_inode.write_at(0, len, buf, SpinLock::new(FilePrivateData::Unused).lock())?;
+    info!("Symlink created successfully");
     return Ok(0);
 }
 

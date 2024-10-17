@@ -96,6 +96,5 @@ fn virtio_device_search() -> Vec<Arc<PciDeviceStructureGeneralDevice>> {
             virtio_list.push(standard_device);
         }
     }
-
     return virtio_list;
 }

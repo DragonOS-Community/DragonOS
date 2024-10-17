@@ -143,6 +143,7 @@ impl PciTransport {
         standard_device
             .irq_init(IRQ::PCI_IRQ_MSIX | IRQ::PCI_IRQ_MSI)
             .ok_or(VirtioPciError::UnableToInitIrq)?;
+        // panic!();
         // 中断相关信息
         let msg = PciIrqMsg {
             irq_common_message: IrqCommonMsg::init_from(
@@ -154,7 +155,9 @@ impl PciTransport {
             irq_specific_message: IrqSpecificMsg::msi_default(),
         };
         standard_device.irq_install(msg)?;
+        
         standard_device.irq_enable(true)?;
+        // panic!();
         //device_capability为迭代器，遍历其相当于遍历所有的cap空间
         for capability in device.capabilities().unwrap() {
             if capability.id != PCI_CAP_ID_VNDR {

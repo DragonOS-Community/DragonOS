@@ -228,7 +228,7 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @param enable 开启/关闭
     fn irq_enable(&self, enable: bool) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type.write() {
+            match *irq_type.read() {
                 IrqType::Msix { .. } => {
                     return self.msix_enable(enable);
                 }

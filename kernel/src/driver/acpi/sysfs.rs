@@ -22,7 +22,6 @@ use log::{debug, error, warn};
 use system_error::SystemError;
 
 use super::{acpi_kset, AcpiManager};
-
 static mut __HOTPLUG_KSET_INSTANCE: Option<Arc<KSet>> = None;
 static mut __ACPI_TABLES_KSET_INSTANCE: Option<Arc<KSet>> = None;
 static mut __ACPI_TABLES_DATA_KSET_INSTANCE: Option<Arc<KSet>> = None;
@@ -115,7 +114,7 @@ impl AcpiManager {
             acpi_table_attr_list().write().push(attr);
             self.acpi_table_data_init(&header)?;
         }
-
+        // TODO:UEVENT
         return Ok(());
     }
 

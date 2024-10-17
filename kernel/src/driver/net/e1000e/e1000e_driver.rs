@@ -8,7 +8,9 @@ use crate::{
             device::{bus::Bus, driver::Driver, Device, DeviceCommonData, DeviceType, IdTable},
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
         },
-        net::{register_netdevice, NetDeivceState, NetDevice, NetDeviceCommonData, Operstate},
+        net::{
+            register_netdevice, Iface, IfaceCommon, NetDeivceState, NetDeviceCommonData, Operstate,
+        },
     },
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},
@@ -27,11 +29,8 @@ use core::{
     ops::{Deref, DerefMut},
 };
 use log::info;
-use smoltcp::{
-    phy,
-    wire::{self, HardwareAddress},
-};
-use system_error::SystemError;
+use smoltcp::{phy, wire::HardwareAddress};
+// use system_error::SystemError;
 
 use super::e1000e::{E1000EBuffer, E1000EDevice};
 
@@ -78,12 +77,12 @@ impl Debug for E1000EDriverWrapper {
     }
 }
 
-#[cast_to([sync] NetDevice)]
+#[cast_to([sync] Iface)]
 #[cast_to([sync] Device)]
+#[derive(Debug)]
 pub struct E1000EInterface {
     driver: E1000EDriverWrapper,
-    iface_id: usize,
-    iface: SpinLock<smoltcp::iface::Interface>,
+    common: IfaceCommon,
     name: String,
     inner: SpinLock<InnerE1000EInterface>,
     locked_kobj_state: LockedKObjectState,
@@ -201,11 +200,9 @@ impl E1000EInterface {
         let iface =
             smoltcp::iface::Interface::new(iface_config, &mut driver, Instant::now().into());
 
-        let driver: E1000EDriverWrapper = E1000EDriverWrapper(UnsafeCell::new(driver));
         let result = Arc::new(E1000EInterface {
-            driver,
-            iface_id,
-            iface: SpinLock::new(iface),
+            driver: E1000EDriverWrapper(UnsafeCell::new(driver)),
+            common: IfaceCommon::new(iface_id, iface),
             name: format!("eth{}", iface_id),
             inner: SpinLock::new(InnerE1000EInterface {
                 netdevice_common: NetDeviceCommonData::default(),
@@ -220,16 +217,6 @@ impl E1000EInterface {
 
     pub fn inner(&self) -> SpinLockGuard<InnerE1000EInterface> {
         return self.inner.lock();
-    }
-}
-
-impl Debug for E1000EInterface {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("E1000EInterface")
-            .field("iface_id", &self.iface_id)
-            .field("iface", &"smoltcp::iface::Interface")
-            .field("name", &self.name)
-            .finish()
     }
 }
 
@@ -302,15 +289,14 @@ impl Device for E1000EInterface {
     }
 }
 
-impl NetDevice for E1000EInterface {
+impl Iface for E1000EInterface {
+    fn common(&self) -> &IfaceCommon {
+        return &self.common;
+    }
+
     fn mac(&self) -> smoltcp::wire::EthernetAddress {
         let mac = self.driver.inner.lock().mac_address();
         return smoltcp::wire::EthernetAddress::from_bytes(&mac);
-    }
-
-    #[inline]
-    fn nic_id(&self) -> usize {
-        return self.iface_id;
     }
 
     #[inline]
@@ -318,36 +304,8 @@ impl NetDevice for E1000EInterface {
         return self.name.clone();
     }
 
-    fn update_ip_addrs(&self, ip_addrs: &[wire::IpCidr]) -> Result<(), SystemError> {
-        if ip_addrs.len() != 1 {
-            return Err(SystemError::EINVAL);
-        }
-
-        self.iface.lock().update_ip_addrs(|addrs| {
-            let dest = addrs.iter_mut().next();
-
-            if let Some(dest) = dest {
-                *dest = ip_addrs[0];
-            } else {
-                addrs.push(ip_addrs[0]).expect("Push ipCidr failed: full");
-            }
-        });
-        return Ok(());
-    }
-
-    fn poll(&self, sockets: &mut smoltcp::iface::SocketSet) -> Result<(), SystemError> {
-        let timestamp: smoltcp::time::Instant = Instant::now().into();
-        let mut guard = self.iface.lock();
-        let poll_res = guard.poll(timestamp, self.driver.force_get_mut(), sockets);
-        if poll_res {
-            return Ok(());
-        }
-        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-    }
-
-    #[inline(always)]
-    fn inner_iface(&self) -> &SpinLock<smoltcp::iface::Interface> {
-        return &self.iface;
+    fn poll(&self) {
+        self.common.poll(self.driver.force_get_mut())
     }
 
     fn addr_assign_type(&self) -> u8 {

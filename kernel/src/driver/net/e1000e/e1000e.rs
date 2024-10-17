@@ -597,7 +597,7 @@ pub fn e1000e_init() {
 }
 
 pub fn e1000e_probe() -> Result<u64, E1000EPciError> {
-    let mut list = &*PCI_DEVICE_LINKEDLIST;
+    let list = &*PCI_DEVICE_LINKEDLIST;
     let result = get_pci_device_structure_mut(list, NETWORK_CLASS, ETHERNET_SUBCLASS);
     if result.is_empty() {
         return Ok(0);

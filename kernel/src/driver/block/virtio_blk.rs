@@ -38,7 +38,7 @@ use crate::{
         },
     },
     exception::{irqdesc::IrqReturn, IrqNumber},
-    filesystem::{kernfs::KernFSInode, mbr::MbrDiskPartionTable, sysfs::AttributeGroup},
+    filesystem::{kernfs::KernFSInode, mbr::MbrDiskPartionTable},
     init::initcall::INITCALL_POSTCORE,
     libs::{
         rwlock::{RwLockReadGuard, RwLockWriteGuard},

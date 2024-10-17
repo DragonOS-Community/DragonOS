@@ -14,16 +14,14 @@ fn create_inet_socket(
     // log::debug!("type: {:?}, protocol: {:?}", socket_type, protocol);
     use smoltcp::wire::IpProtocol::*;
     match socket_type {
-        PSOCK::Datagram => {
-            match protocol {
-                HopByHop | Udp => {
-                    return Ok(UdpSocket::new(false));
-                }
-                _ => {
-                    return Err(EPROTONOSUPPORT);
-                }
+        PSOCK::Datagram => match protocol {
+            HopByHop | Udp => {
+                return Ok(UdpSocket::new(false));
             }
-        }
+            _ => {
+                return Err(EPROTONOSUPPORT);
+            }
+        },
         PSOCK::Stream => match protocol {
             HopByHop | Tcp => {
                 return Ok(TcpSocket::new(false));

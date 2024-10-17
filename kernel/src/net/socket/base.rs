@@ -1,7 +1,7 @@
 #![allow(unused_variables)]
 
-use crate::net::socket::*;
 use crate::net::posix::MsgHdr;
+use crate::net::socket::*;
 use alloc::sync::Arc;
 use core::any::Any;
 use core::fmt::Debug;

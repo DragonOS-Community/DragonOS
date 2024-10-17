@@ -46,6 +46,7 @@ mod arch;
 mod libs;
 #[macro_use]
 mod include;
+mod cgroup;
 mod debug;
 mod driver; // 如果driver依赖了libs，应该在libs后面导出
 mod exception;
@@ -54,6 +55,7 @@ mod init;
 mod ipc;
 mod misc;
 mod mm;
+mod namespaces;
 mod net;
 mod process;
 mod sched;
@@ -91,8 +93,6 @@ extern crate wait_queue_macros;
 
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
-use crate::process::ProcessManager;
-
 #[cfg(all(feature = "backtrace", target_arch = "x86_64"))]
 extern crate mini_backtrace;
 
@@ -110,6 +110,7 @@ pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator;
 #[no_mangle]
 pub fn panic(info: &PanicInfo) -> ! {
     use log::error;
+    use process::ProcessManager;
 
     error!("Kernel Panic Occurred.");
 

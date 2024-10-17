@@ -1145,6 +1145,7 @@ impl Syscall {
                 let flags = args[1] as u32;
                 Self::sys_eventfd(initval, flags)
             }
+            SYS_UNSHARE => Self::sys_unshare(args[0] as u64),
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

@@ -974,14 +974,6 @@ impl Syscall {
     }
 
     pub fn symlink(oldname: *const u8, newname: *const u8) -> Result<usize, SystemError> {
-        let oldname = check_and_clone_cstr(oldname, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        let newname = check_and_clone_cstr(newname, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        let oldname = oldname.as_str().trim();
-        let newname = newname.as_str().trim();
         return do_symlinkat(oldname, AtFlags::AT_FDCWD.bits(), newname);
     }
 
@@ -990,14 +982,6 @@ impl Syscall {
         newdfd: i32,
         newname: *const u8,
     ) -> Result<usize, SystemError> {
-        let oldname = check_and_clone_cstr(oldname, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        let newname = check_and_clone_cstr(newname, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        let oldname = oldname.as_str().trim();
-        let newname = newname.as_str().trim();
         return do_symlinkat(oldname, newdfd, newname);
     }
 

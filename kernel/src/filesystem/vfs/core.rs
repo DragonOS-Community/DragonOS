@@ -12,10 +12,13 @@ use crate::{
         procfs::procfs_init,
         ramfs::RamFS,
         sysfs::sysfs_init,
-        vfs::{mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
+        vfs::{
+            mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType, MAX_PATHLEN,
+        },
     },
     libs::spinlock::SpinLock,
     process::ProcessManager,
+    syscall::user_access::check_and_clone_cstr,
 };
 
 use super::{
@@ -248,7 +251,16 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     return Ok(0);
 }
 
-pub fn do_symlinkat(from: &str, newdfd: i32, to: &str) -> Result<usize, SystemError> {
+pub fn do_symlinkat(from: *const u8, newdfd: i32, to: *const u8) -> Result<usize, SystemError> {
+    let oldname = check_and_clone_cstr(from, Some(MAX_PATHLEN))?
+        .into_string()
+        .map_err(|_| SystemError::EINVAL)?;
+    let newname = check_and_clone_cstr(to, Some(MAX_PATHLEN))?
+        .into_string()
+        .map_err(|_| SystemError::EINVAL)?;
+    let from = oldname.as_str().trim();
+    let to = newname.as_str().trim();
+
     let pcb = ProcessManager::current_pcb();
     let (old_begin_inode, old_remain_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), from)?;
     // info!("old_begin_inode={:?}", old_begin_inode.metadata());

@@ -49,7 +49,7 @@ impl BoundInner {
             // log::debug!("Not bind to any iface, bind to virtIO");
             let iface = NET_DEVICES
                 .read_irqsave()
-                .get(&0)
+                .get(&1)
                 .expect("??bind without virtIO, serious?")
                 .clone();
             let handle = iface.sockets().lock_no_preempt().add(socket);

@@ -8,7 +8,7 @@ use crate::driver::base::kobject::{
 };
 use crate::driver::base::kset::KSet;
 use crate::filesystem::kernfs::KernFSInode;
-// use crate::init::initcall::INITCALL_DEVICE;
+use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::net::{generate_iface_id, NET_DEVICES};
@@ -26,7 +26,7 @@ use smoltcp::{
     wire::{IpAddress, IpCidr},
 };
 use system_error::SystemError;
-// use unified_init::macros::unified_init;
+use unified_init::macros::unified_init;
 
 use super::{register_netdevice, NetDeivceState, NetDeviceCommonData, Operstate};
 
@@ -278,7 +278,7 @@ impl LoopbackInterface {
     pub fn new(mut driver: LoopbackDriver) -> Arc<Self> {
         let iface_id = generate_iface_id();
         let mut iface_config = smoltcp::iface::Config::new(HardwareAddress::Ethernet(
-            smoltcp::wire::EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
+            smoltcp::wire::EthernetAddress([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
         ));
         iface_config.random_seed = rand() as u64;
 
@@ -500,8 +500,7 @@ pub fn loopback_driver_init() {
 }
 
 /// ## lo网卡设备的注册函数
-//TODO: 现在先不用初始化宏进行注册，使virtonet排在网卡列表头，待网络子系统重构后再使用初始化宏并修复该bug
-// #[unified_init(INITCALL_DEVICE)]
+#[unified_init(INITCALL_DEVICE)]
 pub fn loopback_init() -> Result<(), SystemError> {
     loopback_probe();
     log::debug!("Successfully init loopback device");

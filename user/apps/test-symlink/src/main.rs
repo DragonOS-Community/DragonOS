@@ -1,11 +1,10 @@
 extern crate libc;
 use core::ffi::{c_char, c_void};
-use libc::strerror;
 use libc::{mount, umount};
+use nix::errno::Errno;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
-use nix::errno::Errno;
 
 fn main() {
     mount_test_ramfs();

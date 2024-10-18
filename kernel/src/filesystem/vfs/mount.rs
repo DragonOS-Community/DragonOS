@@ -220,7 +220,10 @@ impl MountFSInode {
             return Ok(String::with_capacity(len));
         }
         let name = self.dname()?;
-        return Ok((self.do_parent()?.do_absolute_path(len + name.0.len() + 1)? + "/" + &name.0).to_lowercase());
+        return Ok(
+            (self.do_parent()?.do_absolute_path(len + name.0.len() + 1)? + "/" + &name.0)
+                .to_lowercase(),
+        );
     }
 }
 

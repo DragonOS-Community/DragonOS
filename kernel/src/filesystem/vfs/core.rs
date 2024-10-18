@@ -278,7 +278,6 @@ pub fn do_symlinkat(from: *const u8, newdfd: i32, to: *const u8) -> Result<usize
         return Err(SystemError::ENOTDIR);
     }
 
-    info!("Creating symlink");
     let new_inode = new_parent.create_with_data(
         new_name,
         FileType::SymLink,
@@ -288,9 +287,7 @@ pub fn do_symlinkat(from: *const u8, newdfd: i32, to: *const u8) -> Result<usize
 
     let buf = old_remain_path.as_bytes();
     let len = buf.len();
-    info!("Writing symlink data");
     new_inode.write_at(0, len, buf, SpinLock::new(FilePrivateData::Unused).lock())?;
-    info!("Symlink created successfully");
     return Ok(0);
 }
 

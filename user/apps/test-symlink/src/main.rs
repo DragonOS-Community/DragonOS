@@ -40,6 +40,8 @@ fn main() {
     assert!(!Path::new(dir).exists(), "Directory was not deleted");
 
     umount_test_ramfs();
+
+    println!("All tests passed!");
 }
 
 fn mount_test_ramfs() {
@@ -62,12 +64,6 @@ fn umount_test_ramfs() {
     let path = b"/mnt/myramfs\0".as_ptr() as *const c_char;
     let result = unsafe { umount(path) };
     if result != 0 {
-        // let err = unsafe { libc::errno() };
-        // let err_msg = unsafe { strerror(err) };
-        // eprintln!(
-        //     "Umount myramfs failed with error: {}",
-        //     unsafe { std::ffi::CStr::from_ptr(err_msg) }.to_string_lossy()
-        // );
         let err = Errno::last();
         println!("Errno: {}", err);
         println!("Infomation: {}", err.desc());

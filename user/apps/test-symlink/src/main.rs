@@ -1,32 +1,77 @@
+extern crate libc;
+use core::ffi::{c_char, c_void};
+use libc::strerror;
+use libc::{mount, umount};
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
+use nix::errno::Errno;
 
 fn main() {
-    // 设置目标文件和符号链接的路径
-    let target = "/myramfs/target_file.txt";
-    let symlink_path = "/myramfs/another/symlink_file.txt";
+    mount_test_ramfs();
 
-    // 创建一个目标文件
+    let target = "/mnt/myramfs/target_file.txt";
+    let symlink_path = "/mnt/myramfs/another/symlink_file.txt";
+    let dir = "/mnt/myramfs/another";
+
     fs::write(target, "This is the content of the target file.")
         .expect("Failed to create target file");
+    fs::create_dir(dir).expect("Failed to create target dir");
 
-    println!("Target file created successfully.");
-    // 创建符号链接
+    assert!(Path::new(target).exists(), "Target file was not created");
+    assert!(Path::new(dir).exists(), "Target dir was not created");
+
     symlink(target, symlink_path).expect("Failed to create symlink");
 
-    // 检查符号链接是否存在
-    if Path::new(symlink_path).exists() {
-        println!("Symlink created successfully.");
-    } else {
-        println!("Failed to create symlink.");
-    }
+    assert!(Path::new(symlink_path).exists(), "Symlink was not created");
 
-    // 读取符号链接的内容
     let symlink_content = fs::read_link(symlink_path).expect("Failed to read symlink");
-    println!("Symlink points to: {}", symlink_content.display());
+    assert_eq!(
+        symlink_content.display().to_string(),
+        target,
+        "Symlink points to the wrong target"
+    );
 
-    // 清理测试文件
     fs::remove_file(symlink_path).expect("Failed to remove symlink");
     fs::remove_file(target).expect("Failed to remove target file");
+    fs::remove_dir(dir).expect("Failed to remove test_dir");
+
+    assert!(!Path::new(symlink_path).exists(), "Symlink was not deleted");
+    assert!(!Path::new(target).exists(), "Target file was not deleted");
+    assert!(!Path::new(dir).exists(), "Directory was not deleted");
+
+    umount_test_ramfs();
+}
+
+fn mount_test_ramfs() {
+    let path = Path::new("mnt/myramfs");
+    let dir = fs::create_dir_all(path);
+    assert!(dir.is_ok(), "mkdir /mnt/myramfs failed");
+
+    let source = b"\0".as_ptr() as *const c_char;
+    let target = b"/mnt/myramfs\0".as_ptr() as *const c_char;
+    let fstype = b"ramfs\0".as_ptr() as *const c_char;
+    // let flags = MS_BIND;
+    let flags = 0;
+    let data = std::ptr::null() as *const c_void;
+    let result = unsafe { mount(source, target, fstype, flags, data) };
+
+    assert_eq!(result, 0, "Mount myramfs failed");
+}
+
+fn umount_test_ramfs() {
+    let path = b"/mnt/myramfs\0".as_ptr() as *const c_char;
+    let result = unsafe { umount(path) };
+    if result != 0 {
+        // let err = unsafe { libc::errno() };
+        // let err_msg = unsafe { strerror(err) };
+        // eprintln!(
+        //     "Umount myramfs failed with error: {}",
+        //     unsafe { std::ffi::CStr::from_ptr(err_msg) }.to_string_lossy()
+        // );
+        let err = Errno::last();
+        println!("Errno: {}", err);
+        println!("Infomation: {}", err.desc());
+    }
+    assert_eq!(result, 0, "Umount myramfs failed");
 }

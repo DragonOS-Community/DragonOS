@@ -8,3 +8,5 @@ authors = [ "sparkzky <sparkhhhhhhhhh@outlook.com>" ]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+libc="0.2"
+nix = "0.23"

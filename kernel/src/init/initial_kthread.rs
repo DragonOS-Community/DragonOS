@@ -8,10 +8,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, process::arch_switch_to_user},
-    driver::{
-        net::e1000e::e1000e::e1000e_init,
-        virtio::virtio::virtio_probe,
-    },
+    driver::{net::e1000e::e1000e::e1000e_init, virtio::virtio::virtio_probe},
     filesystem::vfs::core::mount_root_fs,
     net::net_core::net_init,
     process::{

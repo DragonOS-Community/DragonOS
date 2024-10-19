@@ -12,7 +12,7 @@
   },
   "depends": [],
   "build": {
-    "build_command": "bash dragonos.sh"
+    "build_command": "bash dragonos.sh && mkdir -p $DADK_CURRENT_BUILD_DIR/lib64 && cp $DADK_CURRENT_BUILD_DIR/lib/* $DADK_CURRENT_BUILD_DIR/lib64"
   },
   "install": {
     "in_dragonos_path": "/"

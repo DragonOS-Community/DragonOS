@@ -1839,7 +1839,7 @@ impl IndexNode for LockedFATInode {
     }
 
     fn dname(&self) -> Result<DName, SystemError> {
-        Ok(self.0.lock().dname.clone())
+        Ok(self.0.lock().dname.as_ref().to_lowercase().into())
     }
 
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {

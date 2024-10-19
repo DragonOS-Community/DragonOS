@@ -1392,13 +1392,46 @@ impl IndexNode for LockedFATInode {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         match &guard.inode_type {
             FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
-                let r = f.read(
-                    &guard.fs.upgrade().unwrap(),
-                    &mut buf[0..len],
-                    offset as u64,
-                );
-                guard.update_metadata();
-                return r;
+                if let Some(page_cache) = &guard.page_cache {
+                    let (len, rest) = page_cache.read(offset, buf);
+                    if rest.is_empty() {
+                        return Ok(len);
+                    } else {
+                        let mut err = None;
+                        let mut ret = len;
+                        for (file_offset, len) in rest {
+                            let buf_offset = file_offset - offset;
+                            match f.read(
+                                &guard.fs.upgrade().unwrap(),
+                                &mut buf[buf_offset..(buf_offset + len)],
+                                file_offset as u64,
+                            ) {
+                                Ok(size) => {
+                                    ret += size;
+                                    // page_cache.create_pages(offset, &buf[offset..(offset + len)]);
+                                }
+                                Err(e) => {
+                                    err = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+                        guard.update_metadata();
+                        if let Some(e) = err {
+                            return Err(e);
+                        } else {
+                            return Ok(ret);
+                        }
+                    }
+                } else {
+                    let r = f.read(
+                        &guard.fs.upgrade().unwrap(),
+                        &mut buf[0..len],
+                        offset as u64,
+                    );
+                    guard.update_metadata();
+                    return r;
+                }
             }
             FATDirEntry::Dir(_) => {
                 return Err(SystemError::EISDIR);

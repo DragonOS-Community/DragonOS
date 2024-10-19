@@ -1,4 +1,7 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{
+    cmp::min,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use alloc::{
     string::String,
@@ -10,7 +13,6 @@ use log::error;
 use system_error::SystemError;
 
 use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
-use crate::filesystem::eventfd::EventFdInode;
 use crate::{
     arch::MMArch,
     driver::{
@@ -20,13 +22,20 @@ use crate::{
     filesystem::procfs::ProcfsFilePrivateData,
     ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
     libs::{rwlock::RwLock, spinlock::SpinLock},
-    mm::{page::Page, MemoryManagementArch},
+    mm::{
+        allocator::page_frame::FrameAllocator,
+        page::{page_manager_lock_irqsave, page_reclaimer_lock_irqsave, Page, PageFlags},
+        ucontext::AddressSpace,
+        MemoryManagementArch,
+    },
     net::{
         event_poll::{EPollItem, EPollPrivateData, EventPoll},
         socket::SocketInode,
     },
     process::{cred::Cred, ProcessManager},
+    syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
+use crate::{filesystem::eventfd::EventFdInode, libs::align::page_align_up};
 
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
@@ -126,6 +135,7 @@ impl FileMode {
 pub struct PageCache {
     xarray: SpinLock<XArray<Arc<Page>>>,
     inode: Option<Weak<dyn IndexNode>>,
+    self_ref: Weak<PageCache>,
 }
 
 impl core::fmt::Debug for PageCache {
@@ -146,11 +156,11 @@ impl core::fmt::Debug for PageCache {
 
 impl PageCache {
     pub fn new(inode: Option<Weak<dyn IndexNode>>) -> Arc<PageCache> {
-        let page_cache = Self {
+        Arc::new_cyclic(|weak| Self {
             xarray: SpinLock::new(XArray::new()),
             inode,
-        };
-        Arc::new(page_cache)
+            self_ref: weak.clone(),
+        })
     }
 
     pub fn inode(&self) -> Option<Weak<dyn IndexNode>> {
@@ -178,6 +188,216 @@ impl PageCache {
 
     pub fn set_inode(&mut self, inode: Weak<dyn IndexNode>) {
         self.inode = Some(inode)
+    }
+
+    pub fn create_pages(&self, offset: usize, buf: &[u8]) {
+        let address_space = AddressSpace::current().unwrap();
+        // TODO 这里直接加锁会死锁，后续需要排查一下
+        let mut guard = if let Some(guard) = address_space.try_write_irqsave() {
+            guard
+        } else {
+            return;
+        };
+        let mapper = &mut guard.user_mapper.utable;
+        let allocator = mapper.allocator_mut();
+
+        let len = buf.len();
+        if len == 0 {
+            return;
+        }
+        let start_page_offset = offset >> MMArch::PAGE_SHIFT;
+        let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_offset;
+        let mut guard = self.xarray.lock();
+        let mut cursor = guard.cursor_mut(start_page_offset as u64);
+
+        let mut buf_offset = 0;
+        for i in 0..page_num {
+            // 第一个页可能需要计算页内偏移
+            let page_offset = if i == 0 {
+                offset % MMArch::PAGE_SIZE
+            } else {
+                0
+            };
+
+            // 第一个页和最后一个页可能不满
+            let sub_len = if i == 0 {
+                min(len, MMArch::PAGE_SIZE - page_offset)
+            } else if i == page_num - 1 {
+                (offset + len - 1) % MMArch::PAGE_SIZE + 1
+            } else {
+                MMArch::PAGE_SIZE
+            };
+
+            if let Some(cache_page) = unsafe { allocator.allocate_one() } {
+                unsafe {
+                    core::slice::from_raw_parts_mut(
+                        MMArch::phys_2_virt(cache_page).unwrap().data() as *mut u8,
+                        MMArch::PAGE_SIZE,
+                    )[page_offset..page_offset + sub_len]
+                        .copy_from_slice(&buf[buf_offset..(buf_offset + sub_len)]);
+                }
+                let page = Arc::new(Page::new(true, cache_page));
+
+                page.write_irqsave().add_flags(PageFlags::PG_LRU);
+                page_manager_lock_irqsave().insert(cache_page, &page);
+                page_reclaimer_lock_irqsave().insert_page(cache_page, &page);
+                cursor.store(page.clone());
+
+                page.write_irqsave().set_page_cache_index(
+                    self.self_ref.upgrade(),
+                    Some(offset >> MMArch::PAGE_SHIFT),
+                );
+            }
+
+            buf_offset += sub_len;
+            cursor.next();
+        }
+    }
+
+    /// 从PageCache中读取数据。
+    ///
+    /// ## 参数
+    ///
+    /// - `offset` 偏移量
+    /// - `buf` 缓冲区
+    ///
+    /// ## 返回值
+    ///
+    /// - `usize` 成功读取的长度
+    /// - `Vec<(usize, usize)>` 未成功读取的区间的偏移量和长度集合
+    pub fn read(&self, offset: usize, buf: &mut [u8]) -> (usize, Vec<(usize, usize)>) {
+        let mut not_exist = Vec::new();
+        let len = buf.len();
+        if len == 0 {
+            return (0, not_exist);
+        }
+        let start_page_offset = offset >> MMArch::PAGE_SHIFT;
+        let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_offset;
+
+        let mut guard = self.xarray.lock();
+        let mut cursor = guard.cursor_mut(start_page_offset as u64);
+
+        let mut byte_num = 0;
+        let mut buf_offset = 0;
+        for i in 0..page_num {
+            // 第一个页可能需要计算页内偏移
+            let page_offset = if i == 0 {
+                offset % MMArch::PAGE_SIZE
+            } else {
+                0
+            };
+
+            // 第一个页和最后一个页可能不满
+            let sub_len = if i == 0 {
+                min(len, MMArch::PAGE_SIZE - page_offset)
+            } else if i == page_num - 1 {
+                (offset + len - 1) % MMArch::PAGE_SIZE + 1
+            } else {
+                MMArch::PAGE_SIZE
+            };
+
+            if let Some(page) = cursor.load() {
+                let vaddr =
+                    unsafe { MMArch::phys_2_virt(page.read_irqsave().phys_address()).unwrap() };
+                let sub_buf = &mut buf[buf_offset..(buf_offset + sub_len)];
+
+                if let Ok(user_reader) =
+                    UserBufferReader::new((vaddr.data() + page_offset) as *const u8, sub_len, false)
+                {
+                    if let Ok(size) = user_reader.copy_from_user(sub_buf, 0) {
+                        byte_num += size;
+                    }
+                }
+            } else {
+                let page_offset = (start_page_offset + i) * MMArch::PAGE_SIZE + page_offset;
+                if let Some((offset, len)) = not_exist.last_mut() {
+                    if *offset + *len == page_offset {
+                        *len += sub_len;
+                    } else {
+                        not_exist.push((page_offset, sub_len));
+                    }
+                } else {
+                    not_exist.push((page_offset, sub_len));
+                }
+            }
+
+            buf_offset += sub_len;
+            cursor.next();
+        }
+        (byte_num, not_exist)
+    }
+
+    /// 向PageCache中写入数据。
+    ///
+    /// ## 参数
+    ///
+    /// - `offset` 偏移量
+    /// - `buf` 缓冲区
+    ///
+    /// ## 返回值
+    ///
+    /// - `usize` 成功写入的长度
+    /// - `Vec<(usize, usize)>` 未成功写入的区间的偏移量和长度集合
+    pub fn write(&self, offset: usize, buf: &[u8]) -> (usize, Vec<(usize, usize)>) {
+        let mut not_exist = Vec::new();
+        let len = buf.len();
+        if len == 0 {
+            return (0, not_exist);
+        }
+        let start_page_offset = offset >> MMArch::PAGE_SHIFT;
+        let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_offset;
+
+        let mut guard = self.xarray.lock();
+        let mut cursor = guard.cursor_mut(start_page_offset as u64);
+
+        let mut byte_num = 0;
+        let mut buf_offset = 0;
+        for i in 0..page_num {
+            // 第一个页可能需要计算页内偏移
+            let page_offset = if i == 0 {
+                offset % MMArch::PAGE_SIZE
+            } else {
+                0
+            };
+
+            // 第一个页和最后一个页可能不满
+            let sub_len = if i == 0 {
+                min(len, MMArch::PAGE_SIZE - page_offset)
+            } else if i == page_num - 1 {
+                (offset + len - 1) % MMArch::PAGE_SIZE + 1
+            } else {
+                MMArch::PAGE_SIZE
+            };
+
+            if let Some(page) = cursor.load() {
+                let vaddr =
+                    unsafe { MMArch::phys_2_virt(page.read_irqsave().phys_address()).unwrap() };
+                let sub_buf = &buf[buf_offset..(buf_offset + sub_len)];
+
+                if let Ok(mut user_writer) =
+                    UserBufferWriter::new((vaddr.data() + page_offset) as *mut u8, sub_len, false)
+                {
+                    if let Ok(size) = user_writer.copy_to_user(sub_buf, 0) {
+                        byte_num += size;
+                    }
+                }
+            } else {
+                let page_offset = (start_page_offset + i) * MMArch::PAGE_SIZE + page_offset;
+                if let Some((offset, len)) = not_exist.last_mut() {
+                    if *offset + *len == page_offset {
+                        *len += sub_len;
+                    } else {
+                        not_exist.push((page_offset, sub_len));
+                    }
+                } else {
+                    not_exist.push((page_offset, sub_len));
+                }
+            }
+
+            buf_offset += sub_len;
+            cursor.next();
+        }
+        (byte_num, not_exist)
     }
 }
 

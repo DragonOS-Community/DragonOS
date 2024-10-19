@@ -55,7 +55,7 @@ pub struct PageFaultMessage<'a> {
     flags: FaultFlags,
     /// 页表映射器
     mapper: &'a mut PageMapper,
-    /// 缺页的文件页在文件中的偏移量
+    /// 缺页的文件页在文件中的偏移页号
     file_pgoff: Option<usize>,
     /// 缺页对应PageCache中的文件页
     page: Option<Arc<Page>>,

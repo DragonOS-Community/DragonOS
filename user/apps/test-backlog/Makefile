@@ -10,13 +10,13 @@ else
 endif
 
 ifeq ($(ARCH), x86_64)
-	export RUST_TARGET=x86_64-unknown-linux-musl
+	export RUST_TARGET=x86_64-unknown-linux-gnu
 	export CC=x86_64-linux-musl-gcc
 else ifeq ($(ARCH), riscv64)
 	export RUST_TARGET=riscv64gc-unknown-linux-gnu
-else 
+else
 # 默认为x86_86，用于本地编译
-	export RUST_TARGET=x86_64-unknown-linux-musl
+	export RUST_TARGET=x86_64-unknown-linux-gnu
 endif
 
 run:

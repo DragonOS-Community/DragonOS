@@ -376,7 +376,7 @@ impl InnerAddressSpace {
             PageFrameCount::from_bytes(len).unwrap(),
             prot_flags,
             map_flags,
-            move |page, count, vm_flags, flags, mapper, flusher| {
+            |page, count, vm_flags, flags, mapper, flusher| {
                 if allocate_at_once {
                     VMA::zeroed(
                         page,
@@ -385,7 +385,7 @@ impl InnerAddressSpace {
                         flags,
                         mapper,
                         flusher,
-                        file,
+                        file.clone(),
                         Some(pgoff),
                     )
                 } else {
@@ -393,13 +393,15 @@ impl InnerAddressSpace {
                         VirtRegion::new(page.virt_address(), count.data() * MMArch::PAGE_SIZE),
                         vm_flags,
                         flags,
-                        file,
+                        file.clone(),
                         Some(pgoff),
                         false,
                     )))
                 }
             },
         )?;
+        let file = file.unwrap();
+        let _ = file.inode().mmap(start_vaddr.data(), len, offset);
         return Ok(start_page);
     }
 

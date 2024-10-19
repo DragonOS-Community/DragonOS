@@ -16,10 +16,14 @@ impl DebugException {
         let pc = frame.debug_address();
         if let Some(kprobe_list) = KPROBE_MANAGER.lock().get_debug_list(pc) {
             for kprobe in kprobe_list {
-                kprobe.call_post_handler(frame);
+                let guard = kprobe.read();
+                if guard.is_enabled() {
+                    guard.call_post_handler(frame);
+                    guard.call_event_callback(frame);
+                }
             }
-            let probe_point = kprobe_list[0].probe_point();
-            clear_single_step(frame, probe_point.return_address());
+            let return_address = kprobe_list[0].read().probe_point().return_address();
+            clear_single_step(frame, return_address);
         } else {
             println!("There is no kprobe on pc {:#x}", pc);
         }

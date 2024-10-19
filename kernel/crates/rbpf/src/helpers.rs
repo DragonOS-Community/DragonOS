@@ -263,6 +263,13 @@ pub fn rand(min: u64, max: u64, unused3: u64, unused4: u64, unused5: u64) -> u64
     };
     n
 }
+/// Prints the helper functions name and it's index.
+#[cfg(feature = "std")]
+pub fn show_helper() {
+    for (index, name) in BPF_FUNC_MAPPER.iter().enumerate() {
+        println!("{}:{}", index, name);
+    }
+}
 
 /// See https://github.com/torvalds/linux/blob/master/include/uapi/linux/bpf.h
 pub const BPF_FUNC_MAPPER: &[&str] = &[

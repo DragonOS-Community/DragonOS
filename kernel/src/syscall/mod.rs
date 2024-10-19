@@ -1138,6 +1138,20 @@ impl Syscall {
                 let flags = args[1] as u32;
                 Self::sys_eventfd(initval, flags)
             }
+            SYS_BPF => {
+                let cmd = args[0] as u32;
+                let attr = args[1] as *mut u8;
+                let size = args[2] as u32;
+                Self::sys_bpf(cmd, attr, size)
+            }
+            SYS_PERF_EVENT_OPEN => {
+                let attr = args[0] as *const u8;
+                let pid = args[1] as i32;
+                let cpu = args[2] as i32;
+                let group_fd = args[3] as i32;
+                let flags = args[4] as u32;
+                Self::sys_perf_event_open(attr, pid, cpu, group_fd, flags)
+            }
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

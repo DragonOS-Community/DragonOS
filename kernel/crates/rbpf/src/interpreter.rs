@@ -13,6 +13,7 @@ use crate::{
 };
 
 #[cfg(not(feature = "user"))]
+#[allow(unused)]
 fn check_mem(
     addr: u64,
     len: usize,

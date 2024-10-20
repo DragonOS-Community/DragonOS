@@ -191,6 +191,7 @@ impl PageCache {
     }
 
     pub fn create_pages(&self, offset: usize, buf: &[u8]) {
+        log::debug!("create_pages, offset:{offset}, buf_len:{}", buf.len());
         let address_space = AddressSpace::current().unwrap();
         // TODO 这里直接加锁会死锁，后续需要排查一下
         let mut guard = if let Some(guard) = address_space.try_write_irqsave() {
@@ -229,6 +230,10 @@ impl PageCache {
             };
 
             if let Some(cache_page) = unsafe { allocator.allocate_one() } {
+                // log::debug!(
+                //     "page_offset:{page_offset}, buf_offset:{buf_offset}, sub_len:{sub_len}, buf_len:{len}"
+                // );
+                log::debug!("create page: {:?}", cache_page);
                 unsafe {
                     core::slice::from_raw_parts_mut(
                         MMArch::phys_2_virt(cache_page).unwrap().data() as *mut u8,
@@ -237,12 +242,10 @@ impl PageCache {
                         .copy_from_slice(&buf[buf_offset..(buf_offset + sub_len)]);
                 }
                 let page = Arc::new(Page::new(true, cache_page));
-
                 page.write_irqsave().add_flags(PageFlags::PG_LRU);
                 page_manager_lock_irqsave().insert(cache_page, &page);
                 page_reclaimer_lock_irqsave().insert_page(cache_page, &page);
                 cursor.store(page.clone());
-
                 page.write_irqsave().set_page_cache_index(
                     self.self_ref.upgrade(),
                     Some(offset >> MMArch::PAGE_SHIFT),
@@ -264,8 +267,9 @@ impl PageCache {
     /// ## 返回值
     ///
     /// - `usize` 成功读取的长度
-    /// - `Vec<(usize, usize)>` 未成功读取的区间的偏移量和长度集合
+    /// - `Vec<(usize, usize)>` 未成功读取的区间的起始页号和长度的集合
     pub fn read(&self, offset: usize, buf: &mut [u8]) -> (usize, Vec<(usize, usize)>) {
+        // log::debug!("read offset:{offset}, buf_len:{}", buf.len());
         let mut not_exist = Vec::new();
         let len = buf.len();
         if len == 0 {
@@ -297,6 +301,7 @@ impl PageCache {
             };
 
             if let Some(page) = cursor.load() {
+                log::debug!("load success: {:?}", page.read_irqsave().phys_address());
                 let vaddr =
                     unsafe { MMArch::phys_2_virt(page.read_irqsave().phys_address()).unwrap() };
                 let sub_buf = &mut buf[buf_offset..(buf_offset + sub_len)];
@@ -308,17 +313,14 @@ impl PageCache {
                         byte_num += size;
                     }
                 }
-            } else {
-                let page_offset = (start_page_offset + i) * MMArch::PAGE_SIZE + page_offset;
-                if let Some((offset, len)) = not_exist.last_mut() {
-                    if *offset + *len == page_offset {
-                        *len += sub_len;
-                    } else {
-                        not_exist.push((page_offset, sub_len));
-                    }
+            } else if let Some((page_offset, count)) = not_exist.last_mut() {
+                if *page_offset + *count == start_page_offset + i {
+                    *count += 1;
                 } else {
-                    not_exist.push((page_offset, sub_len));
+                    not_exist.push((start_page_offset + i, 1));
                 }
+            } else {
+                not_exist.push((start_page_offset + i, 1));
             }
 
             buf_offset += sub_len;

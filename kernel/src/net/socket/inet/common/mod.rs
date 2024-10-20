@@ -1,6 +1,6 @@
-use alloc::vec::Vec;
 use crate::net::{Iface, NET_DEVICES};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use system_error::SystemError::{self, *};
 
 pub mod port;
@@ -49,7 +49,7 @@ impl BoundInner {
             // 强绑VirtualIO
             // log::debug!("Not bind to any iface, bind to virtIO");
 
-            let ifaces: Vec<Arc<dyn Iface>>= NET_DEVICES
+            let ifaces: Vec<Arc<dyn Iface>> = NET_DEVICES
                 .read_irqsave()
                 .iter()
                 .filter_map(|(_, v)| {

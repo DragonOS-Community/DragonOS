@@ -11,7 +11,7 @@ endif
 
 ifeq ($(ARCH), x86_64)
 	export RUST_TARGET=x86_64-unknown-linux-gnu
-	export CC=x86_64-linux-musl-gcc
+	export CC=x86_64-linux-gnu-gcc
 else ifeq ($(ARCH), riscv64)
 	export RUST_TARGET=riscv64gc-unknown-linux-gnu
 else

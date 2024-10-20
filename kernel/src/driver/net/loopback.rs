@@ -293,7 +293,7 @@ impl LoopbackInterface {
 
         Arc::new(LoopbackInterface {
             driver: LoopbackDriverWapper(UnsafeCell::new(driver)),
-            common: IfaceCommon::new(iface_id, iface),
+            common: IfaceCommon::new(iface_id, false, iface),
             inner: SpinLock::new(InnerLoopbackInterface {
                 netdevice_common: NetDeviceCommonData::default(),
                 device_common: DeviceCommonData::default(),

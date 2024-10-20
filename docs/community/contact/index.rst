@@ -8,9 +8,7 @@
 
 社区公共邮箱：contact@DragonOS.org
 
-DragonOS社区负责人: 龙进
-
-工作邮箱: longjin@DragonOS.org
+社区管理人员信息：https://community.dragonos.org/governance/staff-info.html
 
 开发交流QQ群： 115763565
 

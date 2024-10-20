@@ -1,0 +1,25 @@
+{
+  "name": "glibc",
+  "version": "2.40.9",
+  "description": "glibc",
+  "rust_target": null,
+  "task_type": {
+    "InstallFromPrebuilt": {
+      "Archive": {
+        "url": "https://github.com/DragonOS-Community/glibc-cross/releases/download/v0.3.1/glibc-2.40.9000-x86_64-linux-gnu.tar.gz"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "clean": {
+    "clean_command": null
+  },
+  "envs": [],
+  "target_arch": ["x86_64"]
+}

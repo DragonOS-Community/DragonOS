@@ -12,9 +12,13 @@ use crate::{
         procfs::procfs_init,
         ramfs::RamFS,
         sysfs::sysfs_init,
-        vfs::{mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
+        vfs::{
+            mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType, MAX_PATHLEN,
+        },
     },
+    libs::spinlock::SpinLock,
     process::ProcessManager,
+    syscall::user_access::check_and_clone_cstr,
 };
 
 use super::{
@@ -23,7 +27,7 @@ use super::{
     mount::{init_mountlist, MOUNT_LIST},
     syscall::UmountFlag,
     utils::{rsplit_path, user_path_at},
-    IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    FilePrivateData, IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 /// 当没有指定根文件系统时，尝试的根文件系统列表
@@ -245,6 +249,48 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     // 删除文件
     parent_inode.unlink(filename)?;
 
+    return Ok(0);
+}
+
+pub fn do_symlinkat(from: *const u8, newdfd: i32, to: *const u8) -> Result<usize, SystemError> {
+    let oldname = check_and_clone_cstr(from, Some(MAX_PATHLEN))?
+        .into_string()
+        .map_err(|_| SystemError::EINVAL)?;
+    let newname = check_and_clone_cstr(to, Some(MAX_PATHLEN))?
+        .into_string()
+        .map_err(|_| SystemError::EINVAL)?;
+    let from = oldname.as_str().trim();
+    let to = newname.as_str().trim();
+
+    // TODO: 添加权限检查，确保进程拥有目标路径的权限
+
+    let pcb = ProcessManager::current_pcb();
+    let (old_begin_inode, old_remain_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), from)?;
+    // info!("old_begin_inode={:?}", old_begin_inode.metadata());
+    let _ =
+        old_begin_inode.lookup_follow_symlink(&old_remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+
+    // 得到新创建节点的父节点
+    let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newdfd, to)?;
+    let (new_name, new_parent_path) = rsplit_path(&new_remain_path);
+    let new_parent = new_begin_inode
+        .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    // info!("new_parent={:?}", new_parent.metadata());
+
+    if new_parent.metadata()?.file_type != FileType::Dir {
+        return Err(SystemError::ENOTDIR);
+    }
+
+    let new_inode = new_parent.create_with_data(
+        new_name,
+        FileType::SymLink,
+        ModeType::from_bits_truncate(0o777),
+        0,
+    )?;
+
+    let buf = old_remain_path.as_bytes();
+    let len = buf.len();
+    new_inode.write_at(0, len, buf, SpinLock::new(FilePrivateData::Unused).lock())?;
     return Ok(0);
 }
 

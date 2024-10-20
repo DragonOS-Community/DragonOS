@@ -399,7 +399,7 @@ impl VirtioInterface {
             device_inner: VirtIONicDeviceInnerWrapper(UnsafeCell::new(device_inner)),
             locked_kobj_state: LockedKObjectState::default(),
             iface_name: format!("eth{}", iface_id),
-            iface_common: super::IfaceCommon::new(iface_id, iface),
+            iface_common: super::IfaceCommon::new(iface_id, true, iface),
             inner: SpinLock::new(InnerVirtIOInterface {
                 kobj_common: KObjectCommonData::default(),
                 device_common: DeviceCommonData::default(),

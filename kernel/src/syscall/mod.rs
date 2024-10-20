@@ -339,6 +339,7 @@ impl Syscall {
                 Self::unlinkat(dirfd, path, flags)
             }
 
+            #[cfg(target_arch = "x86_64")]
             SYS_SYMLINK => {
                 let oldname = args[0] as *const u8;
                 let newname = args[1] as *const u8;

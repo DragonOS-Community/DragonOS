@@ -1,8 +1,10 @@
 use core::ffi::{c_char, c_void};
+use errno::errno;
 use libc::{mount, MS_BIND};
 use std::fs;
 use std::path::Path;
 use std::time;
+
 fn main() {
     let path = Path::new("mnt/tmp");
     let dir = fs::create_dir_all(path);
@@ -26,7 +28,8 @@ fn main() {
     if result == 0 {
         println!("Mount successful");
     } else {
-        println!("Mount failed");
+        let err = errno();
+        println!("Mount failed with error code: {}", err.0);
     }
     let dur = clock.elapsed();
     println!("mount costing time: {} ns", dur.as_nanos());

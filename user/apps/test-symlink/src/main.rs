@@ -57,7 +57,13 @@ fn mount_test_ramfs() {
     let data = std::ptr::null() as *const c_void;
     let result = unsafe { mount(source, target, fstype, flags, data) };
 
-    assert_eq!(result, 0, "Mount myramfs failed");
+    assert_eq!(
+        result,
+        0,
+        "Mount myramfs failed, errno: {}",
+        Errno::last().desc()
+    );
+    println!("Mount myramfs success!");
 }
 
 fn umount_test_ramfs() {

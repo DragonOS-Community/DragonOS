@@ -261,6 +261,8 @@ pub fn do_symlinkat(from: *const u8, newdfd: i32, to: *const u8) -> Result<usize
     let from = oldname.as_str().trim();
     let to = newname.as_str().trim();
 
+    // TODO: 添加权限检查，确保进程拥有目标路径的权限
+
     let pcb = ProcessManager::current_pcb();
     let (old_begin_inode, old_remain_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), from)?;
     // info!("old_begin_inode={:?}", old_begin_inode.metadata());

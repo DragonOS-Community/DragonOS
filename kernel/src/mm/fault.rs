@@ -334,7 +334,6 @@ impl PageFaultHandler {
             cache_page.read_irqsave().page_cache(),
             cache_page.read_irqsave().index(),
         );
-
         ret = ret.union(Self::finish_fault(pfm));
 
         ret

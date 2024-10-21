@@ -2,6 +2,7 @@ use crate::libs::rwlock::RwLock;
 
 use self::boot::BootParams;
 pub mod boot;
+pub mod cmdline;
 #[allow(clippy::module_inception)]
 pub mod init;
 pub mod initcall;

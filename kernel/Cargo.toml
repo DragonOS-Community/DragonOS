@@ -41,6 +41,7 @@ fdt = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/fdt", rev 
 hashbrown = "=0.13.2"
 ida = { path = "crates/ida" }
 intertrait = { path = "crates/intertrait" }
+kcmdline_macros = { path = "crates/kcmdline_macros" }
 kdepends = { path = "crates/kdepends" }
 klog_types = { path = "crates/klog_types" }
 linkme = "=0.3.27"

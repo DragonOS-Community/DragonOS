@@ -19,8 +19,11 @@ source "$HOME/.$CURRENT_SHELL"rc
 emulator="qemu"
 defpackman="apt-get"
 dockerInstall="true"
-export RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
-export RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
+DEFAULT_INSTALL="false"
+
+export RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER:-https://rsproxy.cn}
+export RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT:-https://rsproxy.cn/rustup}
+export RUST_VERSION="${RUST_VERSION:-nightly-2024-07-23}"
 
 banner()
 {
@@ -62,7 +65,7 @@ install_ubuntu_debian_pkg()
         lsb-release \
         llvm-dev libclang-dev clang gcc-multilib \
         gcc build-essential fdisk dosfstools dnsmasq bridge-utils iptables libssl-dev pkg-config \
-		sphinx
+		sphinx make git
 	# 必须分开安装，否则会出现错误
 	sudo "$1" install -y \
 		gcc-riscv64-unknown-elf gcc-riscv64-linux-gnu gdb-multiarch
@@ -73,7 +76,7 @@ install_ubuntu_debian_pkg()
 		sudo apt install -y python3 python3-pip
 	fi
 
-    if [ -z "$(which docker)" ] && [ -n ${dockerInstall} ]; then
+    if [ -z "$(which docker)" ] && [ "${dockerInstall}" = "true" ]; then
         echo "正在安装docker..."
         sudo apt install -y docker.io docker-compose
 		sudo groupadd docker
@@ -190,96 +193,70 @@ rustInstall() {
 	fi
 	# If rustup is not installed we should offer to install it for them
 	if [ -z "$(which rustup)" ]; then
-		echo "您没有安装rustup,"
-		echo "我们强烈建议使用rustup, 是否要立即安装？"
-		echo "*WARNING* 这将会发起这样的一个命令 'curl | sh' "
-		printf "(y/N): "
-		read rustup
-		if echo "$rustup" | grep -iq "^y" ;then
-			#install rustup
-			curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain nightly
-			# You have to add the rustup variables to the $PATH
-			echo "export PATH=\"\$HOME/.cargo/bin:\$PATH\"" >> ~/.bashrc
-			# source the variables so that we can execute rustup commands in the current shell
-			source ~/.cargo/env
-			source "$HOME/.cargo/env"
-		else
-			echo "Rustup will not be installed!"
-		fi
+		echo "正在安装Rust..."
+		#install rustup
+		curl https://sh.rustup.rs -sSf --retry 5 --retry-delay 5 | sh -s -- --default-toolchain ${RUST_VERSION} -y
+		# You have to add the rustup variables to the $PATH
+		echo "export PATH=\"\$HOME/.cargo/bin:\$PATH\"" >> ~/.bashrc
+		# source the variables so that we can execute rustup commands in the current shell
+		source ~/.cargo/env
+		source "$HOME/.cargo/env"
 	fi
 	#
 	if [ -z "$(which rustc)" ]; then
 		echo "Rust 还未被安装"
 		echo "请再次运行脚本，接受rustup安装"
 		echo "或通过以下方式手动安装rustc（不推荐）："
-		echo "curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain nightly"
+		echo "curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain $RUST_VERSION -y"
 		exit
 	else
-        echo "是否为Rust换源为国内镜像源？(Tuna)"
-		echo "如果您在国内，我们推荐您这样做，以提升网络速度。"
-		echo "*WARNING* 这将会替换原有的镜像源设置。"
-		printf "(y/N): "
-		read change_src
-		if echo "$change_src" | grep -iq "^y" ;then
-			touch ~/.cargo/config
-			bash change_rust_src.sh
+		local change_rust_src=""
+		if [ "$DEFAULT_INSTALL" = "true" ]; then
+			change_rust_src="true"
 		else
-			echo "取消换源，您原有的配置不会被改变。"
+			echo "是否为Rust换源为国内镜像源？(Tuna)"
+			echo "如果您在国内，我们推荐您这样做，以提升网络速度。"
+			echo "*WARNING* 这将会替换原有的镜像源设置。"
+			printf "(y/N): "
+			read change_src
+			if echo "$change_src" | grep -iq "^y" ;then
+				change_rust_src="true"
+			else
+				echo "取消换源，您原有的配置不会被改变。"
+			fi
 		fi
+		if [ "$change_rust_src" = "true" ]; then
+			echo "正在为rust换源"
+			bash change_rust_src.sh --sparse
+		fi
+
         echo "正在安装DragonOS所需的rust组件...首次安装需要一些时间来更新索引，请耐心等待..."
         cargo install cargo-binutils
+		cargo install bpf-linker
 		rustup toolchain install nightly-2023-08-15-x86_64-unknown-linux-gnu
-		rustup toolchain install nightly-2024-07-23-x86_64-unknown-linux-gnu
-		rustup component add rust-src --toolchain nightly-2024-07-23-x86_64-unknown-linux-gnu
+		rustup toolchain install $RUST_VERSION-x86_64-unknown-linux-gnu
+		rustup component add rust-src --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
 		rustup component add rust-src --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
-		rustup target add x86_64-unknown-none --toolchain nightly-2024-07-23-x86_64-unknown-linux-gnu
+		rustup target add x86_64-unknown-none --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
 		rustup target add x86_64-unknown-none --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
 		rustup target add x86_64-unknown-linux-musl --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
-		rustup target add x86_64-unknown-linux-musl --toolchain nightly-2024-07-23-x86_64-unknown-linux-gnu
+		rustup target add x86_64-unknown-linux-musl --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
 
-		rustup toolchain install nightly-2024-07-23-riscv64gc-unknown-linux-gnu --force-non-host
+		rustup toolchain install $RUST_VERSION-riscv64gc-unknown-linux-gnu --force-non-host
 		rustup toolchain install nightly-2023-08-15-riscv64gc-unknown-linux-gnu --force-non-host
-		rustup target add riscv64gc-unknown-none-elf --toolchain nightly-2024-07-23-riscv64gc-unknown-linux-gnu
-		rustup target add riscv64imac-unknown-none-elf --toolchain nightly-2024-07-23-riscv64gc-unknown-linux-gnu
+		rustup target add riscv64gc-unknown-none-elf --toolchain $RUST_VERSION-riscv64gc-unknown-linux-gnu
+		rustup target add riscv64imac-unknown-none-elf --toolchain $RUST_VERSION-riscv64gc-unknown-linux-gnu
 		rustup target add riscv64gc-unknown-none-elf --toolchain nightly-2023-08-15-riscv64gc-unknown-linux-gnu
 		rustup target add riscv64imac-unknown-none-elf --toolchain nightly-2023-08-15-riscv64gc-unknown-linux-gnu
         
 		rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
 		rustup component add rust-src
         rustup component add llvm-tools-preview
-		rustup default nightly-2024-07-23
+		rustup default $RUST_VERSION
 		
 		echo "Rust已经成功的在您的计算机上安装！请运行 source ~/.cargo/env 以使rust在当前窗口生效！"
 	fi
 }
-
-####################################################################################
-# 初始化DragonOS的musl交叉编译工具链
-# 主要是把musl交叉编译工具链的rcrt1.o替换为crt1.o (因为rust的rcrt1.o会使用动态链接的解释器，但是DragonOS目前尚未把它加载进来)
-#
-# 为DragonOS开发应用的时候，请使用 `cargo +nightly-2023-08-15-x86_64-unknown-linux-gnu build --target x86_64-unknown-linux-musl` 来编译
-# 	这样编译出来的应用将能二进制兼容DragonOS 
-####################################################################################
-initialize_userland_musl_toolchain()
-{
-	fork_toolchain_from="nightly-2023-08-15-x86_64-unknown-linux-gnu"
-	custom_toolchain="nightly-2023-08-15-x86_64-unknown-linux_dragonos-gnu"
-	custom_toolchain_dir="$(dirname $(rustc --print sysroot))/${custom_toolchain}"
-	# 如果目录为空
-	if [ ! -d "${custom_toolchain_dir}" ]; then
-		echo "Custom toolchain does not exist, creating..."
-		rustup toolchain install ${fork_toolchain_from}
-		rustup component add --toolchain ${fork_toolchain_from} rust-src
-		rustup target add --toolchain ${fork_toolchain_from} x86_64-unknown-linux-musl
-		cp -r $(dirname $(rustc --print sysroot))/${fork_toolchain_from} ${custom_toolchain_dir}
-		self_contained_dir=${custom_toolchain_dir}/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained
-		cp -f ${self_contained_dir}/crt1.o ${self_contained_dir}/rcrt1.o
-	else
-		echo "Custom toolchain already exists."
-	fi
-
-}
-
 
 install_python_pkg()
 {
@@ -298,6 +275,10 @@ while true; do
 	echo "repeat"
 	case "$1" in
 		"--no-docker")
+			dockerInstall=""
+		;;
+		"--default")
+			DEFAULT_INSTALL="true"
 			dockerInstall=""
 		;;
 		"--help")
@@ -349,9 +330,6 @@ fi
 # 安装rust
 rustInstall
 
-
-#  初始化DragonOS的musl交叉编译工具链
-initialize_userland_musl_toolchain
 install_python_pkg
 
 # 安装dadk
@@ -359,10 +337,6 @@ cargo install dadk || exit 1
 
 bashpath=$(cd `dirname $0`; pwd)
 
-# 创建磁盘镜像
-bash ${bashpath}/create_hdd_image.sh
-# 编译安装GCC交叉编译工具链
-bash ${bashpath}/build_gcc_toolchain.sh -cs -kb -kg || (echo "GCC交叉编译工具链安装失败" && exit 1)
 # 编译安装musl交叉编译工具链
 bash ${bashpath}/install_musl_gcc.sh || (echo "musl交叉编译工具链安装失败" && exit 1)
 # 编译安装grub
@@ -370,7 +344,8 @@ bash ${bashpath}/grub_auto_install.sh || (echo "grub安装失败" && exit 1)
 
 # 解决kvm权限问题
 USR=$USER
-sudo adduser $USR kvm
+sudo groupadd kvm || echo "kvm组已存在"
+sudo usermod -aG kvm $USR
 sudo chown $USR /dev/kvm
 
 congratulations

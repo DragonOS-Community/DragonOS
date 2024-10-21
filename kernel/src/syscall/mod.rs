@@ -295,6 +295,13 @@ impl Syscall {
                 Self::mkdir(path, mode)
             }
 
+            SYS_MKDIRAT => {
+                let dirfd = args[0] as i32;
+                let path = args[1] as *const u8;
+                let mode = args[2];
+                Self::mkdir_at(dirfd, path, mode)
+            }
+
             SYS_NANOSLEEP => {
                 let req = args[0] as *const PosixTimeSpec;
                 let rem = args[1] as *mut PosixTimeSpec;
@@ -337,6 +344,20 @@ impl Syscall {
                 let path = args[1] as *const u8;
                 let flags = args[2] as u32;
                 Self::unlinkat(dirfd, path, flags)
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            SYS_SYMLINK => {
+                let oldname = args[0] as *const u8;
+                let newname = args[1] as *const u8;
+                Self::symlink(oldname, newname)
+            }
+
+            SYS_SYMLINKAT => {
+                let oldname = args[0] as *const u8;
+                let newdfd = args[1] as i32;
+                let newname = args[2] as *const u8;
+                Self::symlinkat(oldname, newdfd, newname)
             }
 
             #[cfg(target_arch = "x86_64")]

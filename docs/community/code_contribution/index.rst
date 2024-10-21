@@ -9,7 +9,8 @@
 .. toctree::
    :maxdepth: 1
 
-   the-development-process
+   how-to-contribute <https://community.dragonos.org/contributors/>
+
    c-coding-style
    rust-coding-style
    conventional-commit

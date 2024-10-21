@@ -4,7 +4,10 @@ use alloc::sync::{Arc, Weak};
 use kdepends::thingbuf::mpsc;
 use system_error::SystemError;
 
-use crate::libs::spinlock::{SpinLock, SpinLockGuard};
+use crate::{
+    libs::spinlock::{SpinLock, SpinLockGuard},
+    net::event_poll::EventPoll,
+};
 
 use super::tty_core::TtyCore;
 
@@ -84,6 +87,8 @@ pub trait TtyPort: Sync + Send + Debug {
         if ret.is_err() && ret.clone().unwrap_err() == SystemError::ENOSYS {
             return ld.receive_buf(tty, buf, None, count);
         }
+
+        EventPoll::wakeup_epoll(tty.core().eptiems(), None)?;
 
         ret
     }

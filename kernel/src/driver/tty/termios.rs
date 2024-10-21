@@ -2,7 +2,7 @@ use super::tty_ldisc::LineDisciplineType;
 
 /// ## 窗口大小
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct WindowSize {
     /// 行
     pub row: u16,
@@ -23,12 +23,6 @@ impl WindowSize {
             xpixel,
             ypixel,
         }
-    }
-}
-
-impl Default for WindowSize {
-    fn default() -> Self {
-        Self::DEFAULT
     }
 }
 

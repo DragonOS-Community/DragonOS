@@ -1,17 +1,19 @@
 use core::ffi::{c_char, c_void};
 use libc::{
-    chown, fchown, fchownat, getgrnam, getpwnam, lchown, mount, umount, 
-    gid_t, uid_t, AT_FDCWD, AT_SYMLINK_NOFOLLOW,
+    chown, fchown, fchownat, getgrnam, getpwnam, gid_t, lchown, mount, uid_t, umount, AT_FDCWD,
+    AT_SYMLINK_NOFOLLOW,
 };
 use nix::errno::Errno;
 use std::{
     ffi::CString,
-    fs::{self, File},
-    io::{Error, Write},
-    os::unix::{fs::MetadataExt, io::AsRawFd},
+    fs::{self, metadata, File},
+    io::{self, Error, Write},
+    os::unix::{
+        fs::{MetadataExt, PermissionsExt},
+        io::AsRawFd,
+    },
     path::Path,
 };
-
 
 fn print_file_owner_group(filename: &str) -> Result<(), Error> {
     let metadata = std::fs::metadata(filename)?;
@@ -68,6 +70,7 @@ fn test_lchown(symlink_name: &str, new_uid: uid_t, new_gid: gid_t) -> Result<(),
 }
 
 fn main() -> Result<(), Error> {
+    create_false_file()?;
     mount_test_ramfs();
 
     let filename = "/mnt/myramfs/testfile.txt";
@@ -151,4 +154,22 @@ fn umount_test_ramfs() {
     }
     assert_eq!(result, 0, "Umount myramfs failed");
     println!("Umount myramfs for test success!");
+}
+
+fn create_false_file() -> io::Result<()> {
+    let path = Path::new("/bin/false");
+    if metadata(path).is_ok() {
+        return Ok(());
+    }
+
+    let mut file = File::create(path)?;
+
+    file.write_all(b"#!/bin/bash\nexit 1\n")?;
+
+    let mut permissions = file.metadata()?.permissions();
+    permissions.set_mode(0o755); // 设置权限为755
+    std::fs::set_permissions(path, permissions)?;
+
+    println!("File created successfully at {:?}", path);
+    Ok(())
 }

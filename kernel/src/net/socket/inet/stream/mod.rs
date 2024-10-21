@@ -7,7 +7,7 @@ use crate::net::event_poll::EPollEventType;
 use crate::net::net_core::poll_ifaces;
 use crate::net::socket::*;
 use crate::sched::SchedMode;
-use inet::{InetSocket, UNSPECIFIED_LOCAL_ENDPOINT};
+use inet::{InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4, UNSPECIFIED_LOCAL_ENDPOINT_V6};
 use smoltcp;
 
 mod inner;
@@ -29,9 +29,9 @@ pub struct TcpSocket {
 }
 
 impl TcpSocket {
-    pub fn new(nonblock: bool) -> Arc<Self> {
+    pub fn new(nonblock: bool, v4: bool) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
-            inner: RwLock::new(Some(Inner::Init(Init::new()))),
+            inner: RwLock::new(Some(Inner::Init(Init::new(v4)))),
             shutdown: Shutdown::new(),
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
@@ -69,7 +69,11 @@ impl TcpSocket {
                 writer.replace(Inner::Init(bound));
                 Ok(())
             }
-            _ => Err(EINVAL),
+            any => {
+                writer.replace(any);
+                log::error!("TcpSocket::do_bind: not Init");
+                Err(EINVAL)
+            },
         }
     }
 
@@ -230,7 +234,11 @@ impl Socket for TcpSocket {
 
     fn get_name(&self) -> Result<Endpoint, SystemError> {
         match self.inner.read().as_ref().expect("Tcp Inner is None") {
-            Inner::Init(Init::Unbound(_)) => Ok(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT)),
+            Inner::Init(Init::Unbound((_, v4))) => if *v4 {
+                Ok(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT_V4))
+            } else {
+                Ok(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT_V6))
+            },
             Inner::Init(Init::Bound((_, local))) => Ok(Endpoint::Ip(*local)),
             Inner::Connecting(connecting) => Ok(Endpoint::Ip(connecting.get_name())),
             Inner::Established(established) => Ok(Endpoint::Ip(established.local_endpoint())),
@@ -242,6 +250,7 @@ impl Socket for TcpSocket {
         if let Endpoint::Ip(addr) = endpoint {
             return self.do_bind(addr);
         }
+        log::warn!("TcpSocket::bind: invalid endpoint");
         return Err(EINVAL);
     }
 

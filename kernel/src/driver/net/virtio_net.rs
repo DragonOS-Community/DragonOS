@@ -399,7 +399,7 @@ impl VirtioInterface {
             device_inner: VirtIONicDeviceInnerWrapper(UnsafeCell::new(device_inner)),
             locked_kobj_state: LockedKObjectState::default(),
             iface_name: format!("eth{}", iface_id),
-            iface_common: super::IfaceCommon::new(iface_id, iface),
+            iface_common: super::IfaceCommon::new(iface_id, true, iface),
             inner: SpinLock::new(InnerVirtIOInterface {
                 kobj_common: KObjectCommonData::default(),
                 device_common: DeviceCommonData::default(),
@@ -727,9 +727,7 @@ impl KObject for VirtioInterface {
 #[unified_init(INITCALL_POSTCORE)]
 fn virtio_net_driver_init() -> Result<(), SystemError> {
     let driver = VirtIONetDriver::new();
-    virtio_driver_manager()
-        .register(driver.clone() as Arc<dyn VirtIODriver>)
-        .expect("Add virtio net driver failed");
+    virtio_driver_manager().register(driver.clone() as Arc<dyn VirtIODriver>)?;
     unsafe {
         VIRTIO_NET_DRIVER = Some(driver);
     }

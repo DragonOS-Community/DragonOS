@@ -202,7 +202,7 @@ impl E1000EInterface {
 
         let result = Arc::new(E1000EInterface {
             driver: E1000EDriverWrapper(UnsafeCell::new(driver)),
-            common: IfaceCommon::new(iface_id, iface),
+            common: IfaceCommon::new(iface_id, false, iface),
             name: format!("eth{}", iface_id),
             inner: SpinLock::new(InnerE1000EInterface {
                 netdevice_common: NetDeviceCommonData::default(),

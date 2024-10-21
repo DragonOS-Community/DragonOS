@@ -170,6 +170,9 @@ pub struct IfaceCommon {
     port_manager: PortManager,
     /// 下次轮询的时间
     poll_at_ms: core::sync::atomic::AtomicU64,
+    /// 默认网卡标识
+    /// TODO: 此字段设置目的是解决对bind unspecified地址的分包问题，需要在inet实现多网卡监听或路由子系统实现后移除
+    default_iface: bool,
 }
 
 impl fmt::Debug for IfaceCommon {
@@ -185,7 +188,7 @@ impl fmt::Debug for IfaceCommon {
 }
 
 impl IfaceCommon {
-    pub fn new(iface_id: usize, iface: smoltcp::iface::Interface) -> Self {
+    pub fn new(iface_id: usize, default_iface: bool, iface: smoltcp::iface::Interface) -> Self {
         IfaceCommon {
             iface_id,
             smol_iface: SpinLock::new(iface),
@@ -193,6 +196,7 @@ impl IfaceCommon {
             bounds: RwLock::new(Vec::new()),
             port_manager: PortManager::new(),
             poll_at_ms: core::sync::atomic::AtomicU64::new(0),
+            default_iface,
         }
     }
 
@@ -277,5 +281,10 @@ impl IfaceCommon {
     // 需要bounds储存具体的Inet Socket信息，以提供不同种类inet socket的事件分发
     pub fn bind_socket(&self, socket: Arc<dyn InetSocket>) {
         self.bounds.write().push(socket);
+    }
+
+    // TODO: 需要在inet实现多网卡监听或路由子系统实现后移除
+    pub fn is_default_iface(&self) -> bool {
+        self.default_iface
     }
 }

@@ -112,6 +112,10 @@ impl Class for GraphicsClass {
     fn subsystem(&self) -> &SubSysPrivate {
         return &self.subsystem;
     }
+
+    fn dev_groups(&self) -> &'static [&'static dyn AttributeGroup] {
+        return &[];
+    }
 }
 
 /// 帧缓冲区管理器

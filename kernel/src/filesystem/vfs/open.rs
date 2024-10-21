@@ -1,5 +1,4 @@
 use alloc::sync::Arc;
-use log::warn;
 use system_error::SystemError;
 
 use super::{
@@ -58,7 +57,7 @@ pub fn do_fchmodat(dirfd: i32, path: *const u8, _mode: ModeType) -> Result<usize
     // 如果找不到文件，则返回错误码ENOENT
     let _inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
-    warn!("do_fchmodat: not implemented yet\n");
+    log::warn!("do_fchmodat: not implemented yet\n");
     // todo: 真正去改变文件的权限
 
     return Ok(0);
@@ -81,7 +80,7 @@ fn do_sys_openat2(
     how: OpenHow,
     follow_symlink: bool,
 ) -> Result<usize, SystemError> {
-    // debug!("open path: {}, how: {:?}", path, how);
+    //debug!("open path: {}, how: {:?}", path, how);
     let path = path.trim();
 
     let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;

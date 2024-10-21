@@ -571,6 +571,7 @@ impl DriverManager {
         }
 
         // todo: 发送kobj bind的uevent
+        // kobject_uevent();
     }
 
     fn driver_is_bound(&self, device: &Arc<dyn Device>) -> bool {

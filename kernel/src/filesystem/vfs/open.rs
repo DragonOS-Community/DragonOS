@@ -84,7 +84,7 @@ pub fn do_fchownat(
 
     // 如果找不到文件，则返回错误码ENOENT
     let inode = if follow_symlink {
-        inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        inode.lookup_follow_symlink2(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES, false)
     } else {
         inode.lookup(path.as_str())
     };

@@ -725,7 +725,7 @@ impl dyn IndexNode {
 
             let inode = result.find(&name)?;
 
-            // 如果已经是路径的最后一个部分，并且不希望跟随符号链接
+            // 如果已经是路径的最后一个部分，并且不希望跟随最后的符号链接
             if rest_path.is_empty()
                 && !follow_final_symlink
                 && inode.metadata()?.file_type == FileType::SymLink

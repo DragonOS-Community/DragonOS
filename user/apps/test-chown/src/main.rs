@@ -1,97 +1,77 @@
+use core::ffi::{c_char, c_void};
 use libc::{
-    chown, fchown, fchownat, getgrnam, getpwnam, gid_t, lchown, uid_t, AT_FDCWD,
-    AT_SYMLINK_NOFOLLOW,
+    chown, fchown, fchownat, getgrnam, getpwnam, lchown, mount, umount, 
+    gid_t, uid_t, AT_FDCWD, AT_SYMLINK_NOFOLLOW,
 };
-use std::ffi::CString;
-use std::fs::File;
-use std::io::{Error, Write};
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::io::AsRawFd;
+use nix::errno::Errno;
+use std::{
+    ffi::CString,
+    fs::{self, File},
+    io::{Error, Write},
+    os::unix::{fs::MetadataExt, io::AsRawFd},
+    path::Path,
+};
+
 
 fn print_file_owner_group(filename: &str) -> Result<(), Error> {
     let metadata = std::fs::metadata(filename)?;
     let uid = metadata.uid();
     let gid = metadata.gid();
 
-    // let pw = unsafe { getpwnam(CString::new(uid.to_string())?.as_ptr()) };
-    // let gr = unsafe { getgrnam(CString::new(gid.to_string())?.as_ptr()) };
+    // 确保 UID 和 GID 打印正确
+    assert!(uid > 0, "UID should be greater than 0");
+    assert!(gid > 0, "GID should be greater than 0");
 
-    // if gr.is_null() {
-    //     eprintln!("Invalid GID");
-    //     return Err(Error::last_os_error());
-    // }
-
-    // if pw.is_null() {
-    //     eprintln!("Invalid UID");
-    //     return Err(Error::last_os_error());
-    // }
-
-    println!("File: {}", filename);
-    println!("Owner UID: {}", uid);
-    println!("Group GID: {}", gid);
     Ok(())
 }
+
 fn test_fchownat(filename: &str, new_uid: uid_t, new_gid: gid_t, flags: i32) -> Result<(), Error> {
-    println!("Testing fchownat on file: {}", filename);
     let c_filename = CString::new(filename)?;
     let result = unsafe { fchownat(AT_FDCWD, c_filename.as_ptr(), new_uid, new_gid, flags) };
 
-    if result == -1 {
-        return Err(Error::last_os_error());
-    }
+    // 确保 fchownat 成功
+    assert!(result != -1, "fchownat failed");
 
-    let _ = print_file_owner_group(filename);
-    println!("fchownat OK");
+    print_file_owner_group(filename)?;
     Ok(())
 }
 
 fn test_chown(filename: &str, new_uid: uid_t, new_gid: gid_t) -> Result<(), Error> {
-    println!("Testing chown on file: {}", filename);
     let c_filename = CString::new(filename)?;
     let result = unsafe { chown(c_filename.as_ptr(), new_uid, new_gid) };
 
-    if result == -1 {
-        return Err(Error::last_os_error());
-    }
+    // 确保 chown 成功
+    assert!(result != -1, "chown failed");
 
-    let _ = print_file_owner_group(filename);
-    println!("chown OK");
+    print_file_owner_group(filename)?;
     Ok(())
 }
 
 fn test_fchown(fd: i32, new_uid: uid_t, new_gid: gid_t) -> Result<(), Error> {
-    println!("Testing fchown on file descriptor");
     let result = unsafe { fchown(fd, new_uid, new_gid) };
 
-    if result == -1 {
-        return Err(Error::last_os_error());
-    }
-
-    // print_file_owner_group(filename);
-    println!("File descriptor owner UID: {}", new_uid);
-    println!("File descriptor group GID: {}", new_gid);
-    println!("fchown OK");
+    // 确保 fchown 成功
+    assert!(result != -1, "fchown failed");
 
     Ok(())
 }
 
 fn test_lchown(symlink_name: &str, new_uid: uid_t, new_gid: gid_t) -> Result<(), Error> {
-    println!("Testing lchown on symbolic link: {}", symlink_name);
     let c_symlink = CString::new(symlink_name)?;
     let result = unsafe { lchown(c_symlink.as_ptr(), new_uid, new_gid) };
 
-    if result == -1 {
-        return Err(Error::last_os_error());
-    }
+    // 确保 lchown 成功
+    assert!(result != -1, "lchown failed");
 
-    let _ = print_file_owner_group(symlink_name);
-    println!("lchown OK");
+    print_file_owner_group(symlink_name)?;
     Ok(())
 }
 
 fn main() -> Result<(), Error> {
-    let filename = "/myramfs/testfile.txt";
-    let symlink_name = "/myramfs/testsymlink";
+    mount_test_ramfs();
+
+    let filename = "/mnt/myramfs/testfile.txt";
+    let symlink_name = "/mnt/myramfs/testsymlink";
     let new_owner = "nobody"; // 替换为你测试系统中的有效用户名
     let new_group = "nogroup"; // 替换为你测试系统中的有效组名
 
@@ -99,20 +79,20 @@ fn main() -> Result<(), Error> {
     let pw = unsafe { getpwnam(CString::new(new_owner)?.as_ptr()) };
     let gr = unsafe { getgrnam(CString::new(new_group)?.as_ptr()) };
 
-    if pw.is_null() || gr.is_null() {
-        eprintln!("Invalid user or group name");
-        return Err(Error::last_os_error());
-    }
+    assert!(!pw.is_null(), "Invalid user name");
+    assert!(!gr.is_null(), "Invalid group name");
 
     let new_uid = unsafe { (*pw).pw_uid };
     let new_gid = unsafe { (*gr).gr_gid };
 
     // 创建测试文件
     let mut file = File::create(filename)?;
+    println!("Created test file: {}", filename);
     writeln!(file, "This is a test file for chown system call")?;
 
     // 创建符号链接
     std::os::unix::fs::symlink(filename, symlink_name)?;
+    println!("Created symlink: {}", symlink_name);
 
     // 打开文件以测试 fchown
     let fd = file.as_raw_fd();
@@ -132,5 +112,43 @@ fn main() -> Result<(), Error> {
     // 清理测试文件
     std::fs::remove_file(filename)?;
 
+    umount_test_ramfs();
+
+    println!("All tests passed!");
+
     Ok(())
+}
+
+fn mount_test_ramfs() {
+    let path = Path::new("mnt/myramfs");
+    let dir = fs::create_dir_all(path);
+    assert!(dir.is_ok(), "mkdir /mnt/myramfs failed");
+
+    let source = b"\0".as_ptr() as *const c_char;
+    let target = b"/mnt/myramfs\0".as_ptr() as *const c_char;
+    let fstype = b"ramfs\0".as_ptr() as *const c_char;
+    // let flags = MS_BIND;
+    let flags = 0;
+    let data = std::ptr::null() as *const c_void;
+    let result = unsafe { mount(source, target, fstype, flags, data) };
+
+    assert_eq!(
+        result,
+        0,
+        "Mount myramfs failed, errno: {}",
+        Errno::last().desc()
+    );
+    println!("Mount myramfs for test success!");
+}
+
+fn umount_test_ramfs() {
+    let path = b"/mnt/myramfs\0".as_ptr() as *const c_char;
+    let result = unsafe { umount(path) };
+    if result != 0 {
+        let err = Errno::last();
+        println!("Errno: {}", err);
+        println!("Infomation: {}", err.desc());
+    }
+    assert_eq!(result, 0, "Umount myramfs failed");
+    println!("Umount myramfs for test success!");
 }

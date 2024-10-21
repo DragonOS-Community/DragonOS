@@ -508,6 +508,16 @@ impl IndexNode for MountFSInode {
     fn page_cache(&self) -> Option<Arc<PageCache>> {
         self.inner_inode.page_cache()
     }
+
+    fn read_direct(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        self.inner_inode.read_direct(offset, len, buf, data)
+    }
 }
 
 impl FileSystem for MountFS {

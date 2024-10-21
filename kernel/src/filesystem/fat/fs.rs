@@ -1946,6 +1946,35 @@ impl IndexNode for LockedFATInode {
     fn page_cache(&self) -> Option<Arc<PageCache>> {
         self.0.lock().page_cache.clone()
     }
+
+    fn read_direct(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        match &guard.inode_type {
+            FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
+                let r = f.read(
+                    &guard.fs.upgrade().unwrap(),
+                    &mut buf[0..len],
+                    offset as u64,
+                );
+                guard.update_metadata();
+                return r;
+            }
+
+            FATDirEntry::Dir(_) => {
+                return Err(SystemError::EISDIR);
+            }
+            FATDirEntry::UnInit => {
+                error!("FATFS: param: Inode_type uninitialized.");
+                return Err(SystemError::EROFS);
+            }
+        }
+    }
 }
 
 impl Default for FATFsInfo {

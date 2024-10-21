@@ -73,7 +73,7 @@ impl TcpSocket {
                 writer.replace(any);
                 log::error!("TcpSocket::do_bind: not Init");
                 Err(EINVAL)
-            },
+            }
         }
     }
 
@@ -234,11 +234,13 @@ impl Socket for TcpSocket {
 
     fn get_name(&self) -> Result<Endpoint, SystemError> {
         match self.inner.read().as_ref().expect("Tcp Inner is None") {
-            Inner::Init(Init::Unbound((_, v4))) => if *v4 {
-                Ok(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT_V4))
-            } else {
-                Ok(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT_V6))
-            },
+            Inner::Init(Init::Unbound((_, v4))) => {
+                if *v4 {
+                    Ok(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT_V4))
+                } else {
+                    Ok(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT_V6))
+                }
+            }
             Inner::Init(Init::Bound((_, local))) => Ok(Endpoint::Ip(*local)),
             Inner::Connecting(connecting) => Ok(Endpoint::Ip(connecting.get_name())),
             Inner::Established(established) => Ok(Endpoint::Ip(established.local_endpoint())),

@@ -66,7 +66,7 @@ impl Init {
             Init::Bound(_) => {
                 log::debug!("Already Bound");
                 Err(EINVAL)
-            },
+            }
         }
     }
 

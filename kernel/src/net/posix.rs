@@ -109,7 +109,6 @@ impl SockAddr {
         use crate::net::socket::AddressFamily;
 
         let addr = unsafe { addr.as_ref() }.ok_or(SystemError::EFAULT)?;
-
         unsafe {
             match AddressFamily::try_from(addr.family)? {
                 AddressFamily::INet => {
@@ -122,6 +121,22 @@ impl SockAddr {
 
                     use smoltcp::wire;
                     let ip: wire::IpAddress = wire::IpAddress::from(wire::Ipv4Address::from_bytes(
+                        &u32::from_be(addr_in.sin_addr).to_be_bytes()[..],
+                    ));
+                    let port = u16::from_be(addr_in.sin_port);
+
+                    return Ok(Endpoint::Ip(wire::IpEndpoint::new(ip, port)));
+                }
+                AddressFamily::INet6 => {
+                    if len < addr.len()? {
+                        log::error!("len < addr.len()");
+                        return Err(SystemError::EINVAL);
+                    }
+                    log::debug!("INet6");
+                    let addr_in: SockAddrIn = addr.addr_in;
+
+                    use smoltcp::wire;
+                    let ip: wire::IpAddress = wire::IpAddress::from(wire::Ipv6Address::from_bytes(
                         &u32::from_be(addr_in.sin_addr).to_be_bytes()[..],
                     ));
                     let port = u16::from_be(addr_in.sin_port);

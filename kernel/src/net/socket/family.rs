@@ -102,14 +102,14 @@ pub enum AddressFamily {
     Max = 46,
 }
 
-use system_error::SystemError;
-
 impl core::convert::TryFrom<u16> for AddressFamily {
     type Error = system_error::SystemError;
     fn try_from(x: u16) -> Result<Self, Self::Error> {
         use num_traits::FromPrimitive;
-        use SystemError::*;
-        return <Self as FromPrimitive>::from_u16(x).ok_or(EINVAL);
+        return <Self as FromPrimitive>::from_u16(x).ok_or({
+            log::debug!("AddressFamily::try_from failed: x={}", x);
+            Self::Error::EINVAL
+        });
     }
 }
 
@@ -117,5 +117,8 @@ use crate::net::socket;
 use alloc::sync::Arc;
 
 pub trait Family {
-    fn socket(stype: socket::PSOCK, protocol: u32) -> Result<Arc<socket::Inode>, SystemError>;
+    fn socket(
+        stype: socket::PSOCK,
+        protocol: u32,
+    ) -> Result<Arc<socket::Inode>, system_error::SystemError>;
 }

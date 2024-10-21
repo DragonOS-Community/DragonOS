@@ -13,12 +13,11 @@ pub fn create_socket(
     type AF = socket::AddressFamily;
     let inode = match family {
         AF::INet => socket::inet::Inet::socket(socket_type, protocol)?,
-        AF::INet6 => {
-            todo!("AF_INET6 unimplemented");
-        }
+        // AF::INet6 => socket::inet::Inet6::socket(socket_type, protocol)?,
         AF::Unix => socket::unix::Unix::socket(socket_type, protocol)?,
         _ => {
-            todo!("unsupport address family");
+            log::warn!("unsupport address family");
+            return Err(SystemError::EAFNOSUPPORT);
         }
     };
     inode.set_nonblock(is_nonblock);

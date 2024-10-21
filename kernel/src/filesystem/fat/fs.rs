@@ -1403,7 +1403,7 @@ impl IndexNode for LockedFATInode {
                         return Ok(cache_len);
                     }
 
-                    log::debug!("rest: {:?}", rest);
+                    // log::debug!("read rest: {:?}", rest);
 
                     let mut err = None;
                     for (page_index, count) in rest {
@@ -1445,7 +1445,12 @@ impl IndexNode for LockedFATInode {
                         );
                     }
 
-                    return if let Some(e) = err { Err(e) } else { Ok(len) };
+                    return if let Some(e) = err {
+                        Err(e)
+                    } else {
+                        guard.update_metadata();
+                        Ok(len)
+                    };
                 } else {
                     let r = f.read(
                         &guard.fs.upgrade().unwrap(),
@@ -1509,7 +1514,12 @@ impl IndexNode for LockedFATInode {
                         }
                     }
 
-                    return if let Some(e) = err { Err(e) } else { Ok(len) };
+                    return if let Some(e) = err {
+                        Err(e)
+                    } else {
+                        guard.update_metadata();
+                        Ok(len)
+                    };
                 } else {
                     let r = f.write(fs, &buf[0..len], offset as u64);
                     guard.update_metadata();

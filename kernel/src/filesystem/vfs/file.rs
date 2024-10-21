@@ -211,7 +211,6 @@ impl PageCache {
             let buf_offset = i * MMArch::PAGE_SIZE;
 
             if let Some(cache_page) = unsafe { allocator.allocate_one() } {
-                log::debug!("create page: {:?}", cache_page);
                 unsafe {
                     core::slice::from_raw_parts_mut(
                         MMArch::phys_2_virt(cache_page).unwrap().data() as *mut u8,
@@ -245,7 +244,6 @@ impl PageCache {
     /// - `usize` 成功读取的长度
     /// - `Vec<(usize, usize)>` 未成功读取的区间的起始页号和长度的集合
     pub fn read(&self, offset: usize, buf: &mut [u8]) -> (usize, Vec<(usize, usize)>) {
-        // log::debug!("read offset:{offset}, buf_len:{}", buf.len());
         let mut not_exist = Vec::new();
         let len = buf.len();
         if len == 0 {
@@ -277,7 +275,6 @@ impl PageCache {
             };
 
             if let Some(page) = cursor.load() {
-                log::debug!("load success: {:?}", page.read_irqsave().phys_address());
                 let vaddr =
                     unsafe { MMArch::phys_2_virt(page.read_irqsave().phys_address()).unwrap() };
                 let sub_buf = &mut buf[buf_offset..(buf_offset + sub_len)];
@@ -317,7 +314,6 @@ impl PageCache {
     /// - `usize` 成功写入的长度
     /// - `Vec<(usize, usize)>` 未成功写入的区间的偏移量和长度集合
     pub fn write(&self, offset: usize, buf: &[u8]) -> (usize, Vec<(usize, usize)>) {
-        // log::debug!("read offset:{offset}, buf_len:{}", buf.len());
         let mut not_exist = Vec::new();
         let len = buf.len();
         if len == 0 {

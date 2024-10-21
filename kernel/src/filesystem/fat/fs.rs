@@ -12,6 +12,7 @@ use alloc::{
     vec::Vec,
 };
 
+use crate::arch::MMArch;
 use crate::driver::base::block::gendisk::GenDisk;
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::vfs::file::PageCache;
@@ -19,7 +20,7 @@ use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
-use crate::mm::VmFaultReason;
+use crate::mm::{MemoryManagementArch, VmFaultReason};
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
@@ -1394,14 +1395,75 @@ impl IndexNode for LockedFATInode {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         match &guard.inode_type {
             FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
-                let r = f.read(
-                    &guard.fs.upgrade().unwrap(),
-                    &mut buf[0..len],
-                    offset as u64,
-                );
-                guard.update_metadata();
-                return r;
+                let len = core::cmp::min(f.size() as usize, offset + len) - offset;
+                let buf = &mut buf[0..len];
+
+                if let Some(page_cache) = &guard.page_cache {
+                    let (cache_len, rest) = page_cache.read(offset, buf);
+
+                    if rest.is_empty() {
+                        return Ok(cache_len);
+                    }
+
+                    // log::debug!("read rest: {:?}", rest);
+
+                    let mut err = None;
+                    for (page_index, count) in rest {
+                        let mut page_buf = vec![0u8; MMArch::PAGE_SIZE * count];
+                        let page_buf: &mut [u8] = page_buf.as_mut();
+
+                        if let Err(e) = f.read(
+                            &guard.fs.upgrade().unwrap(),
+                            page_buf,
+                            (page_index * MMArch::PAGE_SIZE) as u64,
+                        ) {
+                            err = Some(e);
+                            break;
+                        };
+
+                        page_cache.create_pages(page_index, page_buf);
+
+                        // 实际要拷贝的内容在文件中的偏移量
+                        let copy_offset = core::cmp::max(page_index * MMArch::PAGE_SIZE, offset);
+                        // 实际要拷贝的内容的长度
+                        let copy_len =
+                            core::cmp::min((page_index + count) * MMArch::PAGE_SIZE, offset + len)
+                                - core::cmp::max(page_index * MMArch::PAGE_SIZE, offset);
+
+                        let page_buf_offset = if page_index * MMArch::PAGE_SIZE < copy_offset {
+                            copy_offset - page_index * MMArch::PAGE_SIZE
+                        } else {
+                            0
+                        };
+
+                        let buf_offset = if offset < copy_offset {
+                            copy_offset - offset
+                        } else {
+                            0
+                        };
+
+                        buf[buf_offset..buf_offset + copy_len].copy_from_slice(
+                            &page_buf[page_buf_offset..page_buf_offset + copy_len],
+                        );
+                    }
+
+                    return if let Some(e) = err {
+                        Err(e)
+                    } else {
+                        guard.update_metadata();
+                        Ok(len)
+                    };
+                } else {
+                    let r = f.read(
+                        &guard.fs.upgrade().unwrap(),
+                        &mut buf[0..len],
+                        offset as u64,
+                    );
+                    guard.update_metadata();
+                    return r;
+                }
             }
+
             FATDirEntry::Dir(_) => {
                 return Err(SystemError::EISDIR);
             }
@@ -1420,17 +1482,57 @@ impl IndexNode for LockedFATInode {
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let page_cache = guard.page_cache.clone();
         let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
 
         match &mut guard.inode_type {
             FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
-                let r = f.write(fs, &buf[0..len], offset as u64);
-                guard.update_metadata();
-                return r;
+                if let Some(page_cache) = page_cache {
+                    let (cache_len, rest) = page_cache.write(offset, buf);
+
+                    if rest.is_empty() {
+                        return Ok(cache_len);
+                    }
+
+                    let mut err = None;
+                    for (page_index, count) in rest {
+                        // 实际要写入的内容在文件中的偏移量
+                        let write_offset = core::cmp::max(page_index * MMArch::PAGE_SIZE, offset);
+                        // 实际要写入的内容的长度
+                        let write_len =
+                            core::cmp::min((page_index + count) * MMArch::PAGE_SIZE, offset + len)
+                                - core::cmp::max(page_index * MMArch::PAGE_SIZE, offset);
+
+                        let buf_offset = if offset < write_offset {
+                            write_offset - offset
+                        } else {
+                            0
+                        };
+
+                        if let Err(e) =
+                            f.write(fs, &buf[buf_offset..write_len], write_offset as u64)
+                        {
+                            err = Some(e);
+                        }
+                    }
+
+                    return if let Some(e) = err {
+                        Err(e)
+                    } else {
+                        guard.update_metadata();
+                        Ok(len)
+                    };
+                } else {
+                    let r = f.write(fs, &buf[0..len], offset as u64);
+                    guard.update_metadata();
+                    return r;
+                }
             }
+
             FATDirEntry::Dir(_) => {
                 return Err(SystemError::EISDIR);
             }
+
             FATDirEntry::UnInit => {
                 error!("FATFS: param: Inode_type uninitialized.");
                 return Err(SystemError::EROFS);
@@ -1853,6 +1955,35 @@ impl IndexNode for LockedFATInode {
 
     fn page_cache(&self) -> Option<Arc<PageCache>> {
         self.0.lock().page_cache.clone()
+    }
+
+    fn read_direct(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        match &guard.inode_type {
+            FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
+                let r = f.read(
+                    &guard.fs.upgrade().unwrap(),
+                    &mut buf[0..len],
+                    offset as u64,
+                );
+                guard.update_metadata();
+                return r;
+            }
+
+            FATDirEntry::Dir(_) => {
+                return Err(SystemError::EISDIR);
+            }
+            FATDirEntry::UnInit => {
+                error!("FATFS: param: Inode_type uninitialized.");
+                return Err(SystemError::EROFS);
+            }
+        }
     }
 }
 

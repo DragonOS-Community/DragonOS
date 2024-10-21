@@ -166,7 +166,7 @@ pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, Sys
     // 读取文件头部，用于判断文件类型
     let mut head_buf = [0u8; 512];
     param.file_mut().lseek(SeekFrom::SeekSet(0))?;
-    let _bytes = param.file_mut().read(512, &mut head_buf)?;
+    let _bytes = param.file_mut().read(512, &mut head_buf, true)?;
     // debug!("load_binary_file: read {} bytes", _bytes);
 
     let mut loader = None;

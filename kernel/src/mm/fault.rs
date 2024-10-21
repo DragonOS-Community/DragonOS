@@ -55,7 +55,7 @@ pub struct PageFaultMessage<'a> {
     flags: FaultFlags,
     /// 页表映射器
     mapper: &'a mut PageMapper,
-    /// 缺页的文件页在文件中的偏移量
+    /// 缺页的文件页在文件中的偏移页号
     file_pgoff: Option<usize>,
     /// 缺页对应PageCache中的文件页
     page: Option<Arc<Page>>,
@@ -659,15 +659,17 @@ impl PageFaultHandler {
             let new_cache_page = allocator.allocate_one().unwrap();
             // (MMArch::phys_2_virt(new_cache_page).unwrap().data() as *mut u8)
             //     .copy_from_nonoverlapping(buf.as_mut_ptr(), MMArch::PAGE_SIZE);
-            file.pread(
-                file_pgoff * MMArch::PAGE_SIZE,
-                MMArch::PAGE_SIZE,
-                core::slice::from_raw_parts_mut(
-                    MMArch::phys_2_virt(new_cache_page).unwrap().data() as *mut u8,
+            file.inode()
+                .read_direct(
+                    file_pgoff * MMArch::PAGE_SIZE,
                     MMArch::PAGE_SIZE,
-                ),
-            )
-            .expect("failed to read file to create pagecache page");
+                    core::slice::from_raw_parts_mut(
+                        MMArch::phys_2_virt(new_cache_page).unwrap().data() as *mut u8,
+                        MMArch::PAGE_SIZE,
+                    ),
+                    file.private_data.lock(),
+                )
+                .expect("failed to read file to create pagecache page");
 
             let page = Arc::new(Page::new(true, new_cache_page));
             pfm.page = Some(page.clone());

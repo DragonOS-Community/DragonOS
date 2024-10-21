@@ -1419,6 +1419,8 @@ impl IndexNode for LockedFATInode {
                             break;
                         };
 
+                        page_cache.create_pages(page_index, page_buf);
+
                         // 实际要拷贝的内容在文件中的偏移量
                         let copy_offset = core::cmp::max(page_index * MMArch::PAGE_SIZE, offset);
                         // 实际要拷贝的内容的长度
@@ -1454,6 +1456,7 @@ impl IndexNode for LockedFATInode {
                     return r;
                 }
             }
+
             FATDirEntry::Dir(_) => {
                 return Err(SystemError::EISDIR);
             }
@@ -1478,32 +1481,35 @@ impl IndexNode for LockedFATInode {
         match &mut guard.inode_type {
             FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
                 if let Some(page_cache) = page_cache {
-                    let (len, rest) = page_cache.write(offset, buf);
+                    let (cache_len, rest) = page_cache.write(offset, buf);
+
                     if rest.is_empty() {
-                        return Ok(len);
-                    } else {
-                        let mut err = None;
-                        let mut ret = len;
-                        for (file_offset, len) in rest {
-                            let buf_offset = file_offset - offset;
-                            let sub_buf = &buf[buf_offset..(buf_offset + len)];
-                            match f.write(fs, sub_buf, file_offset as u64) {
-                                Ok(size) => {
-                                    ret += size;
-                                }
-                                Err(e) => {
-                                    err = Some(e);
-                                    break;
-                                }
-                            }
-                        }
-                        guard.update_metadata();
-                        if let Some(e) = err {
-                            return Err(e);
+                        return Ok(cache_len);
+                    }
+
+                    let mut err = None;
+                    for (page_index, count) in rest {
+                        // 实际要写入的内容在文件中的偏移量
+                        let write_offset = core::cmp::max(page_index * MMArch::PAGE_SIZE, offset);
+                        // 实际要写入的内容的长度
+                        let write_len =
+                            core::cmp::min((page_index + count) * MMArch::PAGE_SIZE, offset + len)
+                                - core::cmp::max(page_index * MMArch::PAGE_SIZE, offset);
+
+                        let buf_offset = if offset < write_offset {
+                            write_offset - offset
                         } else {
-                            return Ok(ret);
+                            0
+                        };
+
+                        if let Err(e) =
+                            f.write(fs, &buf[buf_offset..write_len], write_offset as u64)
+                        {
+                            err = Some(e);
                         }
                     }
+
+                    return if let Some(e) = err { Err(e) } else { Ok(len) };
                 } else {
                     let r = f.write(fs, &buf[0..len], offset as u64);
                     guard.update_metadata();

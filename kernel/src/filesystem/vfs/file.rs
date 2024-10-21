@@ -190,13 +190,17 @@ impl PageCache {
         self.inode = Some(inode)
     }
 
-    pub fn create_pages(&self, offset: usize, buf: &[u8]) {
-        log::debug!("create_pages, offset:{offset}, buf_len:{}", buf.len());
+    pub fn create_pages(&self, page_index: usize, buf: &[u8]) {
+        assert!(buf.len() % MMArch::PAGE_SIZE == 0);
+
+        let page_num = buf.len() / MMArch::PAGE_SIZE;
+
         let address_space = AddressSpace::current().unwrap();
         // TODO 这里直接加锁会死锁，后续需要排查一下
         let mut guard = if let Some(guard) = address_space.try_write_irqsave() {
             guard
         } else {
+            log::debug!("address_space lock failed");
             return;
         };
         let mapper = &mut guard.user_mapper.utable;
@@ -206,53 +210,31 @@ impl PageCache {
         if len == 0 {
             return;
         }
-        let start_page_offset = offset >> MMArch::PAGE_SHIFT;
-        let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_offset;
         let mut guard = self.xarray.lock();
-        let mut cursor = guard.cursor_mut(start_page_offset as u64);
+        let mut cursor = guard.cursor_mut(page_index as u64);
 
-        let mut buf_offset = 0;
         for i in 0..page_num {
-            // 第一个页可能需要计算页内偏移
-            let page_offset = if i == 0 {
-                offset % MMArch::PAGE_SIZE
-            } else {
-                0
-            };
-
-            // 第一个页和最后一个页可能不满
-            let sub_len = if i == 0 {
-                min(len, MMArch::PAGE_SIZE - page_offset)
-            } else if i == page_num - 1 {
-                (offset + len - 1) % MMArch::PAGE_SIZE + 1
-            } else {
-                MMArch::PAGE_SIZE
-            };
+            let buf_offset = i * MMArch::PAGE_SIZE;
 
             if let Some(cache_page) = unsafe { allocator.allocate_one() } {
-                // log::debug!(
-                //     "page_offset:{page_offset}, buf_offset:{buf_offset}, sub_len:{sub_len}, buf_len:{len}"
-                // );
                 log::debug!("create page: {:?}", cache_page);
                 unsafe {
                     core::slice::from_raw_parts_mut(
                         MMArch::phys_2_virt(cache_page).unwrap().data() as *mut u8,
                         MMArch::PAGE_SIZE,
-                    )[page_offset..page_offset + sub_len]
-                        .copy_from_slice(&buf[buf_offset..(buf_offset + sub_len)]);
+                    )
+                    .copy_from_slice(&buf[buf_offset..buf_offset + MMArch::PAGE_SIZE]);
                 }
+
                 let page = Arc::new(Page::new(true, cache_page));
                 page.write_irqsave().add_flags(PageFlags::PG_LRU);
                 page_manager_lock_irqsave().insert(cache_page, &page);
                 page_reclaimer_lock_irqsave().insert_page(cache_page, &page);
-                cursor.store(page.clone());
-                page.write_irqsave().set_page_cache_index(
-                    self.self_ref.upgrade(),
-                    Some(offset >> MMArch::PAGE_SHIFT),
-                );
-            }
+                page.write_irqsave()
+                    .set_page_cache_index(self.self_ref.upgrade(), Some(cursor.index() as usize));
 
-            buf_offset += sub_len;
+                cursor.store(page.clone());
+            }
             cursor.next();
         }
     }
@@ -341,6 +323,7 @@ impl PageCache {
     /// - `usize` 成功写入的长度
     /// - `Vec<(usize, usize)>` 未成功写入的区间的偏移量和长度集合
     pub fn write(&self, offset: usize, buf: &[u8]) -> (usize, Vec<(usize, usize)>) {
+        // log::debug!("read offset:{offset}, buf_len:{}", buf.len());
         let mut not_exist = Vec::new();
         let len = buf.len();
         if len == 0 {
@@ -383,17 +366,14 @@ impl PageCache {
                         byte_num += size;
                     }
                 }
-            } else {
-                let page_offset = (start_page_offset + i) * MMArch::PAGE_SIZE + page_offset;
-                if let Some((offset, len)) = not_exist.last_mut() {
-                    if *offset + *len == page_offset {
-                        *len += sub_len;
-                    } else {
-                        not_exist.push((page_offset, sub_len));
-                    }
+            } else if let Some((page_offset, count)) = not_exist.last_mut() {
+                if *page_offset + *count == start_page_offset + i {
+                    *count += 1;
                 } else {
-                    not_exist.push((page_offset, sub_len));
+                    not_exist.push((start_page_offset + i, 1));
                 }
+            } else {
+                not_exist.push((start_page_offset + i, 1));
             }
 
             buf_offset += sub_len;

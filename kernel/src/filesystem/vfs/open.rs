@@ -146,7 +146,7 @@ pub fn ksys_fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError
 
     drop(fd_table);
 
-    result
+    return result;
 }
 
 pub(super) fn do_sys_open(

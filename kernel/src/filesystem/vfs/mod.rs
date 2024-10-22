@@ -682,7 +682,7 @@ impl dyn IndexNode {
     ///
     /// @param path 文件路径
     /// @param max_follow_times 最大经过的符号链接的大小
-    /// follow_final_symlink: 是否跟随最后的符号链接
+    /// @follow_final_symlink: 是否跟随最后的符号链接
     ///
     /// @return Ok(Arc<dyn IndexNode>) 要寻找的目录项的inode
     /// @return Err(SystemError) 错误码
@@ -756,7 +756,7 @@ impl dyn IndexNode {
             }
         }
 
-        Ok(result)
+        return Ok(result);
     }
 }
 

@@ -42,6 +42,7 @@ impl fmt::Display for AbsHandle {
 impl Drop for AbsHandle {
     fn drop(&mut self) {
         // 释放分配的abs_id
+        log::debug!("abs handle free!");
         ABS_ADDRESS_ALLOCATOR.lock_irqsave().free(self.name());
         // TODO:inode映射表中相对应的表项
     }

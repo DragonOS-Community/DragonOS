@@ -138,7 +138,7 @@ fn test_stream() -> Result<(), Error> {
         send_message(client_fd, MSG2).expect("Failed to send message");
         println!("Server send finish");
 
-        unsafe { close(client_fd) };
+        unsafe { close(server_fd) };
     });
 
     let client_fd = create_stream_socket()?;
@@ -214,7 +214,7 @@ fn test_abstruct_namespace() -> Result<(), Error> {
         send_message(client_fd, MSG2).expect("Failed to send message");
         println!("Server send finish");
 
-        unsafe { close(client_fd) };
+        unsafe { close(server_fd) }
     });
 
     let client_fd = create_stream_socket()?;
@@ -275,6 +275,36 @@ fn test_abstruct_namespace() -> Result<(), Error> {
     Ok(())
 }
 
+fn test_recourse_free() -> Result<(), Error> {
+    let client_fd = create_stream_socket()?;
+    unsafe {
+        let mut addr = sockaddr_un {
+            sun_family: AF_UNIX as u16,
+            sun_path: [0; 108],
+        };
+        addr.sun_path[0] = 0;
+        let path_cstr = CString::new(SOCKET_ABSTRUCT_PATH).unwrap();
+        let path_bytes = path_cstr.as_bytes();
+
+        for (i, &byte) in path_bytes.iter().enumerate() {
+            addr.sun_path[i + 1] = byte as i8;
+        }
+
+        if connect(
+            client_fd,
+            &addr as *const _ as *const sockaddr,
+            mem::size_of_val(&addr) as socklen_t,
+        ) == -1
+        {
+            return Err(Error::last_os_error());
+        }
+    }
+
+    send_message(client_fd, MSG1)?;
+    unsafe { close(client_fd) };
+    Ok(())
+}
+
 fn main() {
     match test_stream() {
         Ok(_) => println!("test for unix stream success"),
@@ -284,5 +314,10 @@ fn main() {
     match test_abstruct_namespace() {
         Ok(_) => println!("test for unix abstruct namespace success"),
         Err(_) => println!("test for unix abstruct namespace failed"),
+    }
+
+    match test_recourse_free() {
+        Ok(_) => println!("not free!"),
+        Err(_) => println!("free!"),
     }
 }

@@ -14,15 +14,17 @@ SECTIONS
 	{
 		KEEP(*(.multiboot_header))
 		KEEP(*(.multiboot2_header))
+		
 		*(.bootstrap)
 		*(.bootstrap.code64)
 		*(.bootstrap.data)
+		
 		. = ALIGN(4096);
 	}
 
-	. = 0x1000000;
-	. += KERNEL_VMA;
+
 	. = ALIGN(32768);
+	. += KERNEL_VMA;
 	text_start_pa = .;
 	.text (text_start_pa): AT(text_start_pa - KERNEL_VMA)
 	{
@@ -55,6 +57,8 @@ SECTIONS
 		_rodata = .;	
 		*(.rodata)
 		*(.rodata.*)
+		*(.note.gnu.*)
+		*(.fixup)
 		_erodata = .;
 	}
 

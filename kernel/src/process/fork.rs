@@ -166,6 +166,11 @@ impl ProcessManager {
 
         let pcb = ProcessControlBlock::new(name, new_kstack);
 
+        // TODO: 注意！这里设置tty的操作不符合Linux的行为！（毕竟创建进程不一定要fork，也可以用clone来创建）
+        // 正确做法应该是在实现进程组之后去管理前台进程组。
+        pcb.sig_info_mut()
+            .set_tty(current_pcb.sig_info_irqsave().tty());
+
         let mut args = KernelCloneArgs::new();
         args.flags = clone_flags;
         args.exit_signal = Signal::SIGCHLD;

@@ -7,28 +7,26 @@ on:
     branches: [ "master", "feat-*", "fix-*"]
 
 jobs:
-  # ensure the toolchain is cached
-  ensure-toolchain:
-    uses: ./.github/workflows/cache-toolchain.yml
   
   format-check:
     name: Format check ${{ matrix.arch }}
     runs-on: ubuntu-latest
-    needs: [ensure-toolchain]
     continue-on-error: true
+    container: dragonos/dragonos-dev:v1.4
 
     strategy:
       matrix:
         arch: [x86_64, riscv64]
 
     steps:
+    - run: echo "Running in dragonos/dragonos-dev:v1.4"
     - uses: actions/checkout@v3
-
-    - uses: ./.github/actions/import-toolchain
 
     - name: Format check
       env:
           ARCH: ${{ matrix.arch }}
+          HOME: /root
+      shell: bash -ileo pipefail {0}
       run: |
             printf "\n" >> kernel/src/include/bindings/bindings.rs
             FMT_CHECK=1 make fmt
@@ -36,38 +34,38 @@ jobs:
   kernel-static-test:
     name: Kernel static test ${{ matrix.arch }}
     runs-on: ubuntu-latest
-    needs: [ensure-toolchain]
     continue-on-error: true
+    container: dragonos/dragonos-dev:v1.4
 
     strategy:
       matrix:
         arch: [x86_64, riscv64]
 
     steps:
-    - uses: actions/checkout@v3
+    - run: echo "Running in dragonos/dragonos-dev:v1.4"
 
-    - uses: ./.github/actions/import-toolchain
+    - uses: actions/checkout@v3
 
     - name: Run kernel static test
       shell: bash -ileo pipefail {0}
       env:
           ARCH: ${{ matrix.arch }}
-      run: bash -c "source ~/.cargo/env && cd kernel && make test"
-    
+          HOME: /root
+      run: bash -c "source /root/.cargo/env && cd kernel && make test"
+
   build-x86_64:
 
     runs-on: ubuntu-latest
-    needs: [ensure-toolchain]
+    container: dragonos/dragonos-dev:v1.4
 
     steps:
+    - run: echo "Running in dragonos/dragonos-dev:v1.4"
+
     - uses: actions/checkout@v3
-
-    - uses: ./.github/actions/import-toolchain
-
-      
     - name: build the DragonOS
       env:
           ARCH: x86_64
+          HOME: /root
       shell: bash -ileo pipefail {0}
 
       run: |
@@ -77,23 +75,23 @@ jobs:
         
         make -j $(nproc)
 
-  
   build-riscv64:
 
     runs-on: ubuntu-latest
-    needs: [ensure-toolchain]
+    container: dragonos/dragonos-dev:v1.4
 
     steps:
+    - run: echo "Running in dragonos/dragonos-dev:v1.4"
+
     - uses: actions/checkout@v3
       with:
         submodules: 'recursive'
-
-    - uses: ./.github/actions/import-toolchain
 
     - name: build the DragonOS
       shell: bash -ileo pipefail {0}
       env:
           ARCH: riscv64
+          HOME: /root
 
       run: source ~/.bashrc && source ~/.cargo/env && make kernel -j $(nproc)
 

@@ -1,7 +1,4 @@
-use core::{
-    fmt::{self, Write},
-    sync::atomic::Ordering,
-};
+use core::fmt::{self, Write};
 
 use alloc::string::ToString;
 use log::{info, Level, Log};
@@ -9,10 +6,7 @@ use log::{info, Level, Log};
 use super::lib_ui::textui::{textui_putstr, FontColor};
 
 use crate::{
-    driver::tty::{
-        tty_driver::TtyOperation, tty_port::tty_port,
-        virtual_terminal::virtual_console::CURRENT_VCNUM,
-    },
+    driver::tty::{tty_driver::TtyOperation, virtual_terminal::vc_manager},
     filesystem::procfs::{
         kmsg::KMSG,
         log::{LogLevel, LogMessage},
@@ -44,10 +38,9 @@ impl PrintkWriter {
     /// 并输出白底黑字
     /// @param str: 要写入的字符
     pub fn __write_string(&mut self, s: &str) {
-        let current_vcnum = CURRENT_VCNUM.load(Ordering::SeqCst);
-        if current_vcnum != -1 {
+        if let Some(current_vc) = vc_manager().current_vc() {
             // tty已经初始化了之后才输出到屏幕
-            let port = tty_port(current_vcnum as usize);
+            let port = current_vc.port();
             let tty = port.port_data().internal_tty();
             if let Some(tty) = tty {
                 let _ = tty.write(tty.core(), s.as_bytes(), s.len());

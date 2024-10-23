@@ -34,7 +34,8 @@ use super::{
     GeneralRtcPriority, RtcClassOps, RtcDevice,
 };
 
-static RTC_GENERAL_DEVICE_IDA: IdAllocator = IdAllocator::new(0, usize::MAX);
+static RTC_GENERAL_DEVICE_IDA: SpinLock<IdAllocator> =
+    SpinLock::new(IdAllocator::new(0, usize::MAX).unwrap());
 
 pub(super) const RTC_HCTOSYS_DEVICE: &str = "rtc0";
 
@@ -63,7 +64,7 @@ impl RtcGeneralDevice {
     ///
     /// 注意，由于还需要进行其他的初始化操作，因此这个函数并不是公开的构造函数。
     fn new(priority: GeneralRtcPriority) -> Arc<Self> {
-        let id = RTC_GENERAL_DEVICE_IDA.alloc().unwrap();
+        let id = RTC_GENERAL_DEVICE_IDA.lock().alloc().unwrap();
         let name = format!("rtc{}", id);
         Arc::new(Self {
             name,
@@ -106,7 +107,7 @@ impl RtcGeneralDevice {
 
 impl Drop for RtcGeneralDevice {
     fn drop(&mut self) {
-        RTC_GENERAL_DEVICE_IDA.free(self.id);
+        RTC_GENERAL_DEVICE_IDA.lock().free(self.id);
     }
 }
 

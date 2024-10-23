@@ -110,7 +110,7 @@ cc = ["@GnoCiYeH"]
 
 [assign]
 warn_non_default_branch = true
-contributing_url = "https://docs.dragonos.org/zh-cn/latest/community/code_contribution/index.html"
+contributing_url = "https://community.dragonos.org/contributors/"
 users_on_vacation = []
 
 [assign.adhoc_groups]

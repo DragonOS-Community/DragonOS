@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 use cc::Build;
 
@@ -13,38 +13,24 @@ impl CFilesArch for X86_64CFilesArch {
         c.define("__x86_64__", None);
     }
 
-    fn setup_global_include_dir(&self, c: &mut cc::Build) {
-        c.include("src/arch/x86_64/include");
+    fn setup_global_include_dir(&self, include_dirs: &mut HashSet<PathBuf>) {
+        include_dirs.insert("src/arch/x86_64/include".into());
     }
 
-    fn setup_files(&self, _c: &mut Build, files: &mut Vec<PathBuf>) {
-        // 获取`kernel/src/arch/x86_64/driver/apic`下的所有C文件
-        files.append(&mut FileUtils::list_all_files(
-            &arch_path("driver/apic"),
-            Some("c"),
-            true,
-        ));
-
-        files.append(&mut FileUtils::list_all_files(
-            &arch_path("init"),
-            Some("c"),
-            true,
-        ));
-        files.append(&mut FileUtils::list_all_files(
-            &arch_path("asm"),
-            Some("c"),
-            true,
-        ));
-        files.append(&mut FileUtils::list_all_files(
-            &arch_path("interrupt"),
-            Some("c"),
-            true,
-        ));
+    fn setup_files(&self, _c: &mut Build, files: &mut HashSet<PathBuf>) {
+        const DIRS: [&str; 4] = ["driver/apic", "init", "asm", "interrupt"];
+        DIRS.iter().for_each(|dir| {
+            FileUtils::list_all_files(&arch_path(dir), Some("c"), true)
+                .into_iter()
+                .for_each(|f| {
+                    files.insert(f);
+                });
+        });
 
         // setup asm files
-        files.push(PathBuf::from("src/arch/x86_64/asm/head.S"));
-        files.push(PathBuf::from("src/arch/x86_64/asm/entry.S"));
-        files.push(PathBuf::from("src/arch/x86_64/asm/apu_boot.S"));
+        files.insert(PathBuf::from("src/arch/x86_64/asm/head.S"));
+        files.insert(PathBuf::from("src/arch/x86_64/asm/entry.S"));
+        files.insert(PathBuf::from("src/arch/x86_64/asm/apu_boot.S"));
     }
 
     fn setup_global_flags(&self, c: &mut Build) {

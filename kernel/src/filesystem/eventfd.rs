@@ -15,7 +15,8 @@ use core::any::Any;
 use ida::IdAllocator;
 use system_error::SystemError;
 
-static EVENTFD_ID_ALLOCATOR: IdAllocator = IdAllocator::new(0, u32::MAX as usize);
+static EVENTFD_ID_ALLOCATOR: SpinLock<IdAllocator> =
+    SpinLock::new(IdAllocator::new(0, u32::MAX as usize).unwrap());
 
 bitflags! {
     pub struct EventFdFlags: u32{
@@ -136,7 +137,7 @@ impl IndexNode for EventFdInode {
 
         let pollflag = EPollEventType::from_bits_truncate(self.poll(&data)? as u32);
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
+        EventPoll::wakeup_epoll(&self.epitems, Some(pollflag))?;
 
         return Ok(8);
     }
@@ -183,7 +184,7 @@ impl IndexNode for EventFdInode {
 
         let pollflag = EPollEventType::from_bits_truncate(self.poll(&data)? as u32);
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
+        EventPoll::wakeup_epoll(&self.epitems, Some(pollflag))?;
         return Ok(8);
     }
 
@@ -251,7 +252,10 @@ impl Syscall {
     /// See: https://man7.org/linux/man-pages/man2/eventfd2.2.html
     pub fn sys_eventfd(init_val: u32, flags: u32) -> Result<usize, SystemError> {
         let flags = EventFdFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
-        let id = EVENTFD_ID_ALLOCATOR.alloc().ok_or(SystemError::ENOMEM)? as u32;
+        let id = EVENTFD_ID_ALLOCATOR
+            .lock()
+            .alloc()
+            .ok_or(SystemError::ENOMEM)? as u32;
         let eventfd = EventFd::new(init_val as u64, flags, id);
         let inode = Arc::new(EventFdInode::new(eventfd));
         let filemode = if flags.contains(EventFdFlags::EFD_CLOEXEC) {

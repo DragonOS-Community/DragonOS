@@ -5,9 +5,9 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use kdepends::xarray::XArray;
 use log::error;
 use system_error::SystemError;
-use xarray::XArray;
 
 use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 use crate::filesystem::eventfd::EventFdInode;

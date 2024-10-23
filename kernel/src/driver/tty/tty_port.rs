@@ -1,30 +1,17 @@
-use core::{fmt::Debug, sync::atomic::Ordering};
+use core::fmt::Debug;
 
 use alloc::sync::{Arc, Weak};
 use kdepends::thingbuf::mpsc;
 use system_error::SystemError;
 
-use crate::libs::spinlock::{SpinLock, SpinLockGuard};
-
-use super::{
-    tty_core::TtyCore,
-    virtual_terminal::{virtual_console::CURRENT_VCNUM, VIRT_CONSOLES},
+use crate::{
+    libs::spinlock::{SpinLock, SpinLockGuard},
+    net::event_poll::EventPoll,
 };
 
+use super::tty_core::TtyCore;
+
 const TTY_PORT_BUFSIZE: usize = 4096;
-
-/// 获取当前tty port
-#[inline]
-pub fn current_tty_port() -> Arc<dyn TtyPort> {
-    VIRT_CONSOLES[CURRENT_VCNUM.load(Ordering::SeqCst) as usize]
-        .lock_irqsave()
-        .port()
-}
-
-#[inline]
-pub fn tty_port(index: usize) -> Arc<dyn TtyPort> {
-    VIRT_CONSOLES[index].lock_irqsave().port()
-}
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -100,6 +87,8 @@ pub trait TtyPort: Sync + Send + Debug {
         if ret.is_err() && ret.clone().unwrap_err() == SystemError::ENOSYS {
             return ld.receive_buf(tty, buf, None, count);
         }
+
+        EventPoll::wakeup_epoll(tty.core().eptiems(), None)?;
 
         ret
     }

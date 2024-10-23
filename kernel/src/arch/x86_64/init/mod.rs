@@ -25,8 +25,8 @@ use super::{
 };
 
 mod boot;
-mod multiboot;
 mod multiboot2;
+mod pvh;
 
 #[derive(Debug)]
 pub struct ArchBootParams {}

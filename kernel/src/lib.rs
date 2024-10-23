@@ -6,6 +6,7 @@
 #![feature(concat_idents)]
 #![feature(const_for)]
 #![feature(const_mut_refs)]
+#![feature(const_option)]
 #![feature(const_trait_impl)]
 #![feature(const_refs_to_cell)]
 #![feature(core_intrinsics)]
@@ -82,7 +83,8 @@ extern crate smoltcp;
 extern crate intertrait;
 #[cfg(target_arch = "x86_64")]
 extern crate x86;
-
+#[macro_use]
+extern crate kcmdline_macros;
 extern crate klog_types;
 extern crate uefi;
 extern crate uefi_raw;

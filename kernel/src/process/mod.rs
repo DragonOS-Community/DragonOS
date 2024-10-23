@@ -422,6 +422,14 @@ impl ProcessManager {
         }
         drop(thread);
         unsafe { pcb.basic_mut().set_user_vm(None) };
+
+        // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
+        // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
+        if let Some(tty) = pcb.sig_info_irqsave().tty() {
+            tty.core().contorl_info_irqsave().pgid = None;
+        }
+        pcb.sig_info_mut().set_tty(None);
+
         drop(pcb);
         ProcessManager::exit_notify();
         // unsafe { CurrentIrqArch::interrupt_enable() };
@@ -704,7 +712,7 @@ impl ProcessControlBlock {
             (Self::generate_pid(), ppid, cwd, cred)
         };
 
-        let basic_info = ProcessBasicInfo::new(Pid(0), ppid, name, cwd, None);
+        let basic_info = ProcessBasicInfo::new(Pid(0), ppid, Pid(0), name, cwd, None);
         let preempt_count = AtomicUsize::new(0);
         let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
 
@@ -1069,6 +1077,8 @@ pub struct ProcessBasicInfo {
     pgid: Pid,
     /// 当前进程的父进程的pid
     ppid: Pid,
+    /// 当前进程所属会话id
+    sid: Pid,
     /// 进程的名字
     name: String,
 
@@ -1087,6 +1097,7 @@ impl ProcessBasicInfo {
     pub fn new(
         pgid: Pid,
         ppid: Pid,
+        sid: Pid,
         name: String,
         cwd: String,
         user_vm: Option<Arc<AddressSpace>>,
@@ -1095,6 +1106,7 @@ impl ProcessBasicInfo {
         return RwLock::new(Self {
             pgid,
             ppid,
+            sid,
             name,
             cwd,
             user_vm,
@@ -1108,6 +1120,10 @@ impl ProcessBasicInfo {
 
     pub fn ppid(&self) -> Pid {
         return self.ppid;
+    }
+
+    pub fn sid(&self) -> Pid {
+        return self.sid;
     }
 
     pub fn name(&self) -> &str {
@@ -1516,8 +1532,8 @@ impl ProcessSignalInfo {
         self.tty.clone()
     }
 
-    pub fn set_tty(&mut self, tty: Arc<TtyCore>) {
-        self.tty = Some(tty);
+    pub fn set_tty(&mut self, tty: Option<Arc<TtyCore>>) {
+        self.tty = tty;
     }
 
     /// 从 pcb 的 siginfo中取出下一个要处理的信号，先处理线程信号，再处理进程信号

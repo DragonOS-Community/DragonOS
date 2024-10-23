@@ -32,6 +32,7 @@ use crate::{
         },
         net::register_netdevice,
         virtio::{
+            irq::virtio_irq_manager,
             sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
             transport::VirtIOTransport,
             virtio_impl::HalImpl,
@@ -844,6 +845,10 @@ impl VirtIODriver for VirtIONetDriver {
         NET_DEVICES
             .write_irqsave()
             .insert(iface.nic_id(), iface.clone());
+
+        virtio_irq_manager()
+            .register_device(device.clone())
+            .expect("Register virtio net irq failed");
 
         return Ok(());
     }

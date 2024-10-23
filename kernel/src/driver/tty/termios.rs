@@ -2,7 +2,7 @@ use super::tty_ldisc::LineDisciplineType;
 
 /// ## 窗口大小
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct WindowSize {
     /// 行
     pub row: u16,
@@ -15,7 +15,8 @@ pub struct WindowSize {
 }
 
 impl WindowSize {
-    pub fn new(row: u16, col: u16, xpixel: u16, ypixel: u16) -> Self {
+    pub const DEFAULT: WindowSize = WindowSize::new(24, 80, 1, 1);
+    pub const fn new(row: u16, col: u16, xpixel: u16, ypixel: u16) -> Self {
         Self {
             row,
             col,
@@ -63,7 +64,6 @@ impl PosixTermios {
         }
     }
 
-    #[allow(dead_code)]
     pub fn to_kernel_termios(self) -> Termios {
         // TODO：这里没有考虑非规范模式
         Termios {

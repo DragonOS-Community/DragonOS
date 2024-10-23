@@ -11,16 +11,22 @@ use crate::{
     driver::{net::e1000e::e1000e::e1000e_init, virtio::virtio::virtio_probe},
     filesystem::vfs::core::mount_root_fs,
     net::net_core::net_init,
-    process::{kthread::KernelThreadMechanism, stdio::stdio_init, ProcessFlags, ProcessManager},
+    process::{
+        exec::ProcInitInfo, kthread::KernelThreadMechanism, stdio::stdio_init, ProcessFlags,
+        ProcessManager,
+    },
     smp::smp_init,
     syscall::Syscall,
 };
 
-use super::initcall::do_initcalls;
+use super::{cmdline::kenrel_cmdline_param_manager, initcall::do_initcalls};
+
+const INIT_PROC_TRYLIST: [&str; 3] = ["/bin/dragonreach", "/bin/init", "/bin/sh"];
 
 pub fn initial_kernel_thread() -> i32 {
     kernel_init().unwrap_or_else(|err| {
-        panic!("Failed to initialize kernel: {:?}", err);
+        log::error!("Failed to initialize kernel: {:?}", err);
+        panic!()
     });
 
     switch_to_user();
@@ -29,10 +35,6 @@ pub fn initial_kernel_thread() -> i32 {
 fn kernel_init() -> Result<(), SystemError> {
     KernelThreadMechanism::init_stage2();
     kenrel_init_freeable()?;
-
-    // 由于目前加锁，速度过慢，所以先不开启双缓冲
-    // scm_enable_double_buffer().expect("Failed to enable double buffer");
-
     #[cfg(target_arch = "x86_64")]
     crate::driver::disk::ahci::ahci_init()
         .inspect_err(|e| log::error!("ahci_init failed: {:?}", e))
@@ -72,39 +74,79 @@ fn switch_to_user() -> ! {
     *current_pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::CFS;
     drop(current_pcb);
 
-    let mut trap_frame = TrapFrame::new();
-    // 逐个尝试运行init进程
-    if try_to_run_init_process("/bin/dragonreach", &mut trap_frame).is_err()
-        && try_to_run_init_process("/bin/init", &mut trap_frame).is_err()
-        && try_to_run_init_process("/bin/sh", &mut trap_frame).is_err()
-    {
-        panic!("Failed to run init process: No working init found.");
-    }
+    let mut proc_init_info = ProcInitInfo::new("");
+    proc_init_info.envs.push(CString::new("PATH=/").unwrap());
+    proc_init_info.args = kenrel_cmdline_param_manager().init_proc_args();
+    proc_init_info.envs = kenrel_cmdline_param_manager().init_proc_envs();
 
+    let mut trap_frame = TrapFrame::new();
+
+    if let Some(path) = kenrel_cmdline_param_manager().init_proc_path() {
+        log::info!("Boot with specified init process: {:?}", path);
+
+        try_to_run_init_process(
+            path.as_c_str().to_str().unwrap(),
+            &mut proc_init_info,
+            &mut trap_frame,
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "Failed to run specified init process: {:?}, err: {:?}",
+                path, e
+            )
+        });
+    } else {
+        let mut ok = false;
+        for path in INIT_PROC_TRYLIST.iter() {
+            if try_to_run_init_process(path, &mut proc_init_info, &mut trap_frame).is_ok() {
+                ok = true;
+                break;
+            }
+        }
+        if !ok {
+            panic!("Failed to run init process: No working init found.");
+        }
+    }
+    drop(proc_init_info);
     // 需要确保执行到这里之后，上面所有的资源都已经释放（比如arc之类的）
     compiler_fence(Ordering::SeqCst);
 
     unsafe { arch_switch_to_user(trap_frame) };
 }
 
-fn try_to_run_init_process(path: &str, trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    if let Err(e) = run_init_process(path, trap_frame) {
+fn try_to_run_init_process(
+    path: &str,
+    proc_init_info: &mut ProcInitInfo,
+    trap_frame: &mut TrapFrame,
+) -> Result<(), SystemError> {
+    proc_init_info.proc_name = CString::new(path).unwrap();
+    proc_init_info.args.insert(0, CString::new(path).unwrap());
+    if let Err(e) = run_init_process(proc_init_info, trap_frame) {
         if e != SystemError::ENOENT {
             error!(
                 "Failed to run init process: {path} exists but couldn't execute it (error {:?})",
                 e
             );
         }
+
+        proc_init_info.args.remove(0);
         return Err(e);
     }
     Ok(())
 }
 
-fn run_init_process(path: &str, trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    let argv = vec![CString::new(path).unwrap()];
-    let envp = vec![CString::new("PATH=/").unwrap()];
-
+fn run_init_process(
+    proc_init_info: &ProcInitInfo,
+    trap_frame: &mut TrapFrame,
+) -> Result<(), SystemError> {
     compiler_fence(Ordering::SeqCst);
-    Syscall::do_execve(path.to_string(), argv, envp, trap_frame)?;
+    let path = proc_init_info.proc_name.to_str().unwrap();
+
+    Syscall::do_execve(
+        path.to_string(),
+        proc_init_info.args.clone(),
+        proc_init_info.envs.clone(),
+        trap_frame,
+    )?;
     Ok(())
 }

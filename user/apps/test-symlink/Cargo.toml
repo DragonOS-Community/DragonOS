@@ -1,0 +1,13 @@
+[package]
+name = "test-symlink"
+version = "0.1.0"
+edition = "2021"
+description = "测试symlink系统调用"
+authors = [ "sparkzky <sparkhhhhhhhhh@outlook.com>" ]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+errno = "0.3.9"
+libc="0.2"
+nix = "0.23"

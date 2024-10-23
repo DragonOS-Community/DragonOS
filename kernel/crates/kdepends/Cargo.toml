@@ -7,9 +7,10 @@ description = "需要导出的依赖项（为保持内核依赖版本与调试�
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-ringbuffer = "0.15.0"
-memoffset = "0.9.0"
 crc = { path = "../crc" }
+memoffset = "0.9.0"
+ringbuffer = "0.15.0"
+xarray = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/xarray", rev = "de93b57c34", features = ["slab-friendly"] }
 
 # 一个无锁MPSC队列
 [dependencies.thingbuf]

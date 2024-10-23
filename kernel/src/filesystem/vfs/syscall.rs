@@ -20,6 +20,7 @@ use crate::{
     time::{syscall::PosixTimeval, PosixTimeSpec},
 };
 
+use super::core::do_symlinkat;
 use super::{
     core::{do_mkdir_at, do_remove_dir, do_unlink_at},
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
@@ -807,6 +808,14 @@ impl Syscall {
         return Ok(0);
     }
 
+    pub fn mkdir_at(dirfd: i32, path: *const u8, mode: usize) -> Result<usize, SystemError> {
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
+        do_mkdir_at(dirfd, &path, FileMode::from_bits_truncate(mode as u32))?;
+        return Ok(0);
+    }
+
     /// **创建硬连接的系统调用**
     ///    
     /// ## 参数
@@ -970,6 +979,18 @@ impl Syscall {
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         return do_unlink_at(AtFlags::AT_FDCWD.bits(), &path).map(|v| v as usize);
+    }
+
+    pub fn symlink(oldname: *const u8, newname: *const u8) -> Result<usize, SystemError> {
+        return do_symlinkat(oldname, AtFlags::AT_FDCWD.bits(), newname);
+    }
+
+    pub fn symlinkat(
+        oldname: *const u8,
+        newdfd: i32,
+        newname: *const u8,
+    ) -> Result<usize, SystemError> {
+        return do_symlinkat(oldname, newdfd, newname);
     }
 
     /// # 修改文件名

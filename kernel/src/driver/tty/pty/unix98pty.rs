@@ -263,7 +263,7 @@ pub fn ptmx_open(
 
     let index = fsinfo.alloc_index()?;
 
-    let tty = TtyDriver::init_tty_device(ptm_driver(), index)?;
+    let tty = ptm_driver().init_tty_device(Some(index))?;
 
     // 设置privdata
     *data = FilePrivateData::Tty(TtyFilePrivateData {

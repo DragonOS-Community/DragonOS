@@ -59,21 +59,29 @@ pub struct SCAllocator<'a, P: AllocablePage> {
     pub(crate) slabs: PageList<'a, P>,
     /// List of full ObjectPages (everything allocated in these don't need to search them).
     pub(crate) full_slabs: PageList<'a, P>,
+    /// Free objects count
+    pub(crate) free_obj_count: usize,
+    /// Maximum free objects num for this `SCAllocator`.
+    pub(crate) free_limit: usize,
 }
 
 /// Creates an instance of a scallocator, we do this in a macro because we
 /// re-use the code in const and non-const functions
 macro_rules! new_sc_allocator {
-    ($size:expr) => {
+    ($size:expr) => {{
+        let obj_per_page = cmin((P::SIZE - OBJECT_PAGE_METADATA_OVERHEAD) / $size, 8 * 64);
         SCAllocator {
             size: $size,
             allocation_count: 0,
-            obj_per_page: cmin((P::SIZE - OBJECT_PAGE_METADATA_OVERHEAD) / $size, 8 * 64),
+            obj_per_page,
             empty_slabs: PageList::new(),
             slabs: PageList::new(),
             full_slabs: PageList::new(),
+            // TODO: 优化free_limit的计算: https://bbs.dragonos.org.cn/t/topic/358
+            free_limit: 2 * obj_per_page,
+            free_obj_count: 0,
         }
-    };
+    }};
 }
 
 impl<'a, P: AllocablePage> SCAllocator<'a, P> {
@@ -241,6 +249,7 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
         *page.next() = Rawlink::none();
         trace!("adding page to SCAllocator {:p}", page);
         self.insert_empty(page);
+        self.free_obj_count += self.obj_per_page;
     }
 
     /// Allocates a block of memory descriped by `layout`.
@@ -294,6 +303,7 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
                 self.size,
                 ptr as usize
             );
+            self.free_obj_count -= 1;
         }
 
         res
@@ -304,7 +314,12 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
     /// May return an error in case an invalid `layout` is provided.
     /// The function may also move internal slab pages between lists partial -> empty
     /// or full -> partial lists.
-    pub fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) -> Result<(), AllocationError> {
+    pub unsafe fn deallocate(
+        &mut self,
+        ptr: NonNull<u8>,
+        layout: Layout,
+        slab_callback: &'static dyn CallBack,
+    ) -> Result<(), AllocationError> {
         assert!(layout.size() <= self.size);
         assert!(self.size <= (P::SIZE - OBJECT_PAGE_METADATA_OVERHEAD));
         trace!(
@@ -324,6 +339,17 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
 
         let ret = slab_page.deallocate(ptr, new_layout);
         debug_assert!(ret.is_ok(), "Slab page deallocate won't fail at the moment");
+        self.free_obj_count += 1;
+        let is_empty_after_dealloc = slab_page.is_empty(self.obj_per_page);
+
+        // 如果slab_page是空白的，且空闲块数大于free_limit，将slab_page归还buddy
+        if self.free_obj_count >= self.free_limit && is_empty_after_dealloc {
+            self.slabs.remove_from_list(slab_page);
+            // 将slab_page归还buddy
+            slab_callback.free_slab_page(slab_page as *const P as *mut u8, P::SIZE);
+        }
+        self.check_page_assignments();
+
         ret
     }
 }

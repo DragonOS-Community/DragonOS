@@ -4,7 +4,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 use klog_types::{AllocatorLog, AllocatorLogType, LogSource, MMLogChannel};
 
-use crate::{arch::CurrentTimeArch, process::Pid, time::TimeArch};
+use crate::{arch::CurrentTimeArch, libs::spinlock::SpinLock, process::Pid, time::TimeArch};
 
 /// 全局的内存分配器日志通道
 ///
@@ -16,7 +16,8 @@ static __MM_ALLOCATOR_LOG_CHANNEL: MMLogChannel<{ MMDebugLogManager::MAX_ALLOC_L
 /// 全局的内存分配器日志id分配器
 ///
 /// id从1开始, 因为0是无效的id
-static __MM_DEBUG_LOG_IDA: ida::IdAllocator = ida::IdAllocator::new(1, usize::MAX);
+static __MM_DEBUG_LOG_IDA: SpinLock<ida::IdAllocator> =
+    SpinLock::new(ida::IdAllocator::new(1, usize::MAX).unwrap());
 
 /// 记录内存分配器的日志
 ///
@@ -50,7 +51,7 @@ impl MMDebugLogManager {
     /// - `pid`：日志来源的pid
     #[allow(dead_code)]
     pub fn log(log_type: AllocatorLogType, source: LogSource, pid: Option<Pid>) {
-        let id = __MM_DEBUG_LOG_IDA.alloc().unwrap();
+        let id = __MM_DEBUG_LOG_IDA.lock_irqsave().alloc().unwrap();
         let log = AllocatorLog::new(
             id as u64,
             log_type,

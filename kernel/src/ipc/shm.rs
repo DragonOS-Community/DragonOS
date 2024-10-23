@@ -125,7 +125,7 @@ pub struct ShmManager {
 impl ShmManager {
     pub fn new() -> Self {
         ShmManager {
-            id_allocator: IdAllocator::new(0, usize::MAX - 1),
+            id_allocator: IdAllocator::new(0, usize::MAX - 1).unwrap(),
             id2shm: HashMap::new(),
             key2id: HashMap::new(),
         }

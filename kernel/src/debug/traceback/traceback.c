@@ -1,5 +1,6 @@
 #include "traceback.h"
 #include <common/printk.h>
+#include <common/string.h>
 #include <process/process.h>
 
 int lookup_kallsyms(uint64_t addr, int level)

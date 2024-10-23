@@ -92,7 +92,7 @@ impl PerfEventInode {
     fn epoll_callback(&self) -> Result<()> {
         let pollflag = EPollEventType::from_bits_truncate(self.do_poll()? as u32);
         // 唤醒epoll中等待的进程
-        EventPoll::wakeup_epoll(&self.epitems, pollflag)
+        EventPoll::wakeup_epoll(&self.epitems, Some(pollflag))
     }
 }
 

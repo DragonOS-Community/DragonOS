@@ -2,14 +2,14 @@
 pub mod ahci_inode;
 pub mod ahcidisk;
 pub mod hba;
-use alloc::sync::Arc;
 use crate::arch::MMArch;
 use crate::driver::base::block::manager::block_dev_manager;
 use crate::driver::block::cache::cached_block_device::BlockCache;
 use crate::driver::disk::ahci::ahcidisk::LockedAhciDisk;
 use crate::driver::pci::pci::{
-    get_pci_device_structure_mut, PciDeviceLinkedList, PciDeviceStructure, PCI_DEVICE_LINKEDLIST
+    get_pci_device_structure_mut, PciDeviceLinkedList, PciDeviceStructure, PCI_DEVICE_LINKEDLIST,
 };
+use alloc::sync::Arc;
 
 use crate::driver::disk::ahci::{
     hba::HbaMem,
@@ -17,7 +17,7 @@ use crate::driver::disk::ahci::{
 };
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::{MemoryManagementArch, VirtAddr};
-use alloc::{boxed::Box,  vec::Vec};
+use alloc::{boxed::Box, vec::Vec};
 use core::sync::atomic::compiler_fence;
 use log::debug;
 use system_error::SystemError;
@@ -36,7 +36,7 @@ pub const HBA_PxIS_TFES: u32 = 1 << 30;
 /// @param list 链表的写锁
 /// @return Result<Vec<&'a mut Box<dyn PciDeviceStructure>>, SystemError>   成功则返回包含所有ahci设备结构体的可变引用的链表，失败则返回err
 fn ahci_device_search(
-    list:&PciDeviceLinkedList,
+    list: &PciDeviceLinkedList,
 ) -> Result<Vec<Arc<dyn PciDeviceStructure>>, SystemError> {
     let result = get_pci_device_structure_mut(list, AHCI_CLASS, AHCI_SUBCLASS);
 
@@ -50,7 +50,7 @@ fn ahci_device_search(
 /// @brief: 初始化 ahci
 pub fn ahci_init() -> Result<(), SystemError> {
     let list = &*PCI_DEVICE_LINKEDLIST;
-    let ahci_device = ahci_device_search(&list)?;
+    let ahci_device = ahci_device_search(list)?;
 
     for device in ahci_device {
         let standard_device = device.as_standard_device().unwrap();

@@ -155,7 +155,7 @@ impl PciTransport {
             irq_specific_message: IrqSpecificMsg::msi_default(),
         };
         standard_device.irq_install(msg)?;
-        
+
         standard_device.irq_enable(true)?;
         // panic!();
         //device_capability为迭代器，遍历其相当于遍历所有的cap空间
@@ -216,7 +216,8 @@ impl PciTransport {
             ));
         }
         //debug!("notify.offset={},notify.length={}",notify_cfg.offset,notify_cfg.length);
-        let notify_region = get_bar_region_slice::<_>(&device.standard_device_bar.read(), &notify_cfg)?;
+        let notify_region =
+            get_bar_region_slice::<_>(&device.standard_device_bar.read(), &notify_cfg)?;
         let isr_status = get_bar_region::<_>(
             &device.standard_device_bar.read(),
             &isr_cfg.ok_or(VirtioPciError::MissingIsrConfig)?,

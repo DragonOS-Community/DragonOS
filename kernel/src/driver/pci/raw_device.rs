@@ -80,6 +80,30 @@ impl PciDevice for PciGeneralDevice {
     fn subsystem_device(&self) -> u16 {
         self.header.subsystem_id
     }
+
+    fn class_code(&self) -> u8 {
+        self.header.common_header.class_code
+    }
+
+    fn revision(&self) -> u8 {
+        self.header.common_header.revision_id
+    }
+
+    fn irq_type(&self) -> &RwLock<super::pci_irq::IrqType> {
+        &self.header.irq_type
+    }
+
+    fn irq_line(&self) -> u8 {
+        self.header.interrupt_line
+    }
+
+    fn interface_code(&self) -> u8 {
+        self.header.common_header.prog_if
+    }
+
+    fn subclass(&self) -> u8 {
+        self.header.common_header.subclass
+    }
 }
 
 impl Device for PciGeneralDevice {

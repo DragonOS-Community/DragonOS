@@ -359,8 +359,8 @@ pub trait PciInterrupt: PciDeviceStructure {
                     if self.irq_vector_mut().unwrap().read().len() > irq_max_num as usize {
                         return Err(PciError::PciIrqError(PciIrqError::DeviceIrqOverflow));
                     }
-                    let irq_num =
-                        self.irq_vector_mut().unwrap().read()[msg.irq_common_message.irq_index as usize];
+                    let irq_num = self.irq_vector_mut().unwrap().read()
+                        [msg.irq_common_message.irq_index as usize];
 
                     let irq_num = IrqNumber::new(irq_num.into());
                     let common_msg = &msg.irq_common_message;
@@ -523,8 +523,8 @@ pub trait PciInterrupt: PciDeviceStructure {
                     if self.irq_vector_mut().unwrap().read().len() > irq_max_num as usize {
                         return Err(PciError::PciIrqError(PciIrqError::DeviceIrqOverflow));
                     }
-                    let irq_num =
-                        self.irq_vector_mut().unwrap().read()[msg.irq_common_message.irq_index as usize];
+                    let irq_num = self.irq_vector_mut().unwrap().read()
+                        [msg.irq_common_message.irq_index as usize];
 
                     let common_msg = &msg.irq_common_message;
 
@@ -571,7 +571,8 @@ pub trait PciInterrupt: PciDeviceStructure {
                     //写入Message Data和Message Address
                     let pcistandardbar = self
                         .bar()
-                        .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))?.read();
+                        .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))?
+                        .read();
                     let msix_bar = pcistandardbar.get_bar(msix_table_bar)?;
                     let vaddr: crate::mm::VirtAddr = msix_bar
                         .virtual_address()
@@ -692,7 +693,8 @@ pub trait PciInterrupt: PciDeviceStructure {
                     let pcistandardbar = self
                         .bar()
                         .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))
-                        .unwrap().read();
+                        .unwrap()
+                        .read();
                     let msix_bar = pcistandardbar.get_bar(msix_table_bar).unwrap();
                     for index in 0..irq_max_num {
                         let vaddr = msix_bar
@@ -821,7 +823,8 @@ pub trait PciInterrupt: PciDeviceStructure {
                     let pcistandardbar = self
                         .bar()
                         .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))
-                        .unwrap().read();
+                        .unwrap()
+                        .read();
                     let msix_bar = pcistandardbar.get_bar(msix_table_bar).unwrap();
                     let vaddr = msix_bar.virtual_address().unwrap()
                         + msix_table_offset as usize

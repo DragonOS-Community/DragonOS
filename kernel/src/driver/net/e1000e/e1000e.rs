@@ -1,15 +1,6 @@
 // 参考手册: PCIe* GbE Controllers Open Source Software Developer’s Manual
 // Refernce: PCIe* GbE Controllers Open Source Software Developer’s Manual
 
-use alloc::string::ToString;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
-use core::intrinsics::unlikely;
-use core::mem::size_of;
-use core::ptr::NonNull;
-use core::slice::{from_raw_parts, from_raw_parts_mut};
-use core::sync::atomic::{compiler_fence, Ordering};
-use log::{debug, info};
 use super::e1000e_driver::e1000e_driver_init;
 use crate::driver::base::device::DeviceId;
 use crate::driver::net::dma::{dma_alloc, dma_dealloc};
@@ -20,6 +11,15 @@ use crate::driver::pci::pci::{
 };
 use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqMsg, IRQ};
 use crate::exception::IrqNumber;
+use alloc::string::ToString;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::intrinsics::unlikely;
+use core::mem::size_of;
+use core::ptr::NonNull;
+use core::slice::{from_raw_parts, from_raw_parts_mut};
+use core::sync::atomic::{compiler_fence, Ordering};
+use log::{debug, info};
 
 use crate::libs::volatile::{ReadOnly, Volatile, WriteOnly};
 
@@ -615,7 +615,14 @@ pub fn e1000e_probe() -> Result<u64, E1000EPciError> {
                 // todo: 根据pci的path来生成device id
                 let e1000e = E1000EDevice::new(
                     standard_device.clone(),
-                    DeviceId::new(None, Some(format!("e1000e_{}", standard_device.common_header.device_id))).unwrap(),
+                    DeviceId::new(
+                        None,
+                        Some(format!(
+                            "e1000e_{}",
+                            standard_device.common_header.device_id
+                        )),
+                    )
+                    .unwrap(),
                 )?;
                 e1000e_driver_init(e1000e);
             }

@@ -6,8 +6,8 @@ use crate::driver::base::device::{Device, DeviceId};
 use crate::driver::block::virtio_blk::virtio_blk;
 use crate::driver::net::virtio_net::virtio_net;
 use crate::driver::pci::pci::{
-    get_pci_device_structures_mut_by_vendor_id, 
-    PciDeviceStructureGeneralDevice, PCI_DEVICE_LINKEDLIST,
+    get_pci_device_structures_mut_by_vendor_id, PciDeviceStructureGeneralDevice,
+    PCI_DEVICE_LINKEDLIST,
 };
 use crate::driver::pci::subsys::pci_bus;
 use crate::driver::virtio::transport::VirtIOTransport;

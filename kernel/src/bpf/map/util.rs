@@ -10,8 +10,8 @@ pub struct BpfMapMeta {
     pub key_size: u32,
     pub value_size: u32,
     pub max_entries: u32,
-    pub map_flags: u32,
-    pub map_name: String,
+    pub _map_flags: u32,
+    pub _map_name: String,
 }
 
 impl TryFrom<&bpf_attr> for BpfMapMeta {
@@ -32,8 +32,8 @@ impl TryFrom<&bpf_attr> for BpfMapMeta {
             key_size: u.key_size,
             value_size: u.value_size,
             max_entries: u.max_entries,
-            map_flags: u.map_flags,
-            map_name,
+            _map_flags: u.map_flags,
+            _map_name: map_name,
         })
     }
 }
@@ -85,8 +85,8 @@ pub fn round_up(x: usize, align: usize) -> usize {
     (x + align - 1) & !(align - 1)
 }
 
-/// flags for BPF_MAP_UPDATE_ELEM command
 bitflags! {
+    /// flags for BPF_MAP_UPDATE_ELEM command
     pub struct BpfMapUpdateElemFlags: u64 {
         /// create new element or update existing
         const BPF_ANY = 0;

@@ -13,9 +13,9 @@ type BpfHashMapValue = Vec<u8>;
 /// See https://ebpf-docs.dylanreimerink.nl/linux/map-type/BPF_MAP_TYPE_HASH/
 #[derive(Debug)]
 pub struct BpfHashMap {
-    max_entries: u32,
-    key_size: u32,
-    value_size: u32,
+    _max_entries: u32,
+    _key_size: u32,
+    _value_size: u32,
     data: BTreeMap<BpfHashMapKey, BpfHashMapValue>,
 }
 
@@ -26,9 +26,9 @@ impl BpfHashMap {
         }
         let value_size = round_up(attr.value_size as usize, 8);
         Ok(Self {
-            max_entries: attr.max_entries,
-            key_size: attr.key_size,
-            value_size: value_size as u32,
+            _max_entries: attr.max_entries,
+            _key_size: attr.key_size,
+            _value_size: value_size as u32,
             data: BTreeMap::new(),
         })
     }

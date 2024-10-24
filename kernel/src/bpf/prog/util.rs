@@ -27,7 +27,7 @@ pub struct BpfProgVerifierInfo {
     pub log_level: VerifierLogLevel,
     /// This attributes indicates the size of the memory region in bytes
     /// indicated by `log_buf` which can safely be written to by the kernel.
-    pub log_buf_size: u32,
+    pub _log_buf_size: u32,
     /// This attributes can be set to a pointer to a memory region
     /// allocated/reservedby the loader process where the verifier log will
     /// be written to.
@@ -39,7 +39,7 @@ pub struct BpfProgVerifierInfo {
     /// space in the buffer while loading, the loading process will fail
     /// and the command will return with an error code of -ENOSPC. So it
     /// is important to correctly size the buffer when enabling logging.
-    pub log_buf_ptr: usize,
+    pub _log_buf_ptr: usize,
 }
 
 impl From<&bpf_attr> for BpfProgVerifierInfo {
@@ -48,8 +48,8 @@ impl From<&bpf_attr> for BpfProgVerifierInfo {
             let u = &attr.__bindgen_anon_3;
             Self {
                 log_level: VerifierLogLevel::from_bits_truncate(u.log_level),
-                log_buf_size: u.log_size,
-                log_buf_ptr: u.log_buf as usize,
+                _log_buf_size: u.log_size,
+                _log_buf_ptr: u.log_buf as usize,
             }
         }
     }

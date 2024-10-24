@@ -18,16 +18,16 @@ use system_error::SystemError;
 #[derive(Debug)]
 pub struct BpfProgVerifier<'a> {
     prog: BpfProg,
-    log_level: VerifierLogLevel,
-    log_buf: &'a mut [u8],
+    _log_level: VerifierLogLevel,
+    _log_buf: &'a mut [u8],
 }
 
 impl<'a> BpfProgVerifier<'a> {
     pub fn new(prog: BpfProg, log_level: VerifierLogLevel, log_buf: &'a mut [u8]) -> Self {
         Self {
             prog,
-            log_level,
-            log_buf,
+            _log_level: log_level,
+            _log_buf: log_buf,
         }
     }
     /// Relocate the program.

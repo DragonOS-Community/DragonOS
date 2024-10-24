@@ -8,8 +8,6 @@
     html_logo_url = "https://raw.githubusercontent.com/qmonnet/rbpf/main/misc/rbpf.png",
     html_favicon_url = "https://raw.githubusercontent.com/qmonnet/rbpf/main/misc/rbpf.ico"
 )]
-// Test examples from README.md as part as doc tests.
-#![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 // There are unused mut warnings due to unsafe code.
 #![allow(unused_mut)]

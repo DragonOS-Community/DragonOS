@@ -15,7 +15,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let mut bpf = Ebpf::load(include_bytes_aligned!(
-        "../../syscall_ebpf/target/bpfel-unknown-none/release/syscall_ebpf"
+        "../syscall_ebpf/target/bpfel-unknown-none/release/syscall_ebpf"
     ))?;
 
     // create a async task to read the log

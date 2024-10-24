@@ -8,7 +8,6 @@ use crate::include::bindings::linux_bpf::BPF_F_CURRENT_CPU;
 use crate::libs::lazy_init::Lazy;
 use alloc::{collections::BTreeMap, sync::Arc};
 use core::ffi::c_void;
-use log::info;
 use system_error::SystemError;
 
 type RawBPFHelperFn = fn(u64, u64, u64, u64, u64) -> u64;
@@ -20,7 +19,7 @@ macro_rules! define_func {
 }
 
 /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_lookup_elem/
-pub unsafe fn raw_map_lookup_elem(map: *mut c_void, key: *const c_void) -> *const c_void {
+unsafe fn raw_map_lookup_elem(map: *mut c_void, key: *const c_void) -> *const c_void {
     let map = Arc::from_raw(map as *const BpfMap);
     let key_size = map.key_size();
     let key = core::slice::from_raw_parts(key as *const u8, key_size);
@@ -36,8 +35,6 @@ pub unsafe fn raw_map_lookup_elem(map: *mut c_void, key: *const c_void) -> *cons
 
 pub fn map_lookup_elem(map: &Arc<BpfMap>, key: &[u8]) -> Result<Option<*const u8>> {
     let mut binding = map.inner_map().lock();
-    // let key_value = u32::from_ne_bytes(key[0..4].try_into().unwrap());
-    // log::info!("<map_lookup_elem> key_value: {:?}", key_value);
     let value = binding.lookup_elem(key);
     match value {
         Ok(Some(value)) => Ok(Some(value.as_ptr())),
@@ -48,7 +45,7 @@ pub fn map_lookup_elem(map: &Arc<BpfMap>, key: &[u8]) -> Result<Option<*const u8
 /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_perf_event_output/
 ///
 /// See https://man7.org/linux/man-pages/man7/bpf-helpers.7.html
-pub unsafe fn raw_perf_event_output(
+unsafe fn raw_perf_event_output(
     ctx: *mut c_void,
     map: *mut c_void,
     flags: u64,
@@ -82,20 +79,16 @@ pub fn perf_event_output(
     } else {
         index
     };
-    let fd = binding.lookup_elem(&key.to_ne_bytes())?.unwrap();
-    let fd = u32::from_ne_bytes(fd.try_into().unwrap());
-    // log::info!(
-    //     "<perf_event_output>: flags: {:x?}, index: {:x?}, fd: {:x?}",
-    //     flags,
-    //     index,
-    //     fd
-    // );
+    let fd = binding
+        .lookup_elem(&key.to_ne_bytes())?
+        .ok_or(SystemError::ENOENT)?;
+    let fd = u32::from_ne_bytes(fd.try_into().map_err(|_| SystemError::EINVAL)?);
     crate::perf::perf_event_output(ctx, fd as usize, flags, data)?;
     Ok(())
 }
 
 /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_probe_read/
-pub fn raw_bpf_probe_read(dst: *mut c_void, size: u32, unsafe_ptr: *const c_void) -> i64 {
+fn raw_bpf_probe_read(dst: *mut c_void, size: u32, unsafe_ptr: *const c_void) -> i64 {
     log::info!(
         "raw_bpf_probe_read, dst:{:x}, size:{}, unsafe_ptr: {:x}",
         dst as usize,
@@ -123,7 +116,7 @@ pub fn bpf_probe_read(dst: &mut [u8], src: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub unsafe fn raw_map_update_elem(
+unsafe fn raw_map_update_elem(
     map: *mut c_void,
     key: *const c_void,
     value: *const c_void,
@@ -152,7 +145,7 @@ pub fn map_update_elem(map: &Arc<BpfMap>, key: &[u8], value: &[u8], flags: u64) 
 /// Delete entry with key from map.
 ///
 /// The delete map element helper call is used to delete values from maps.
-pub unsafe fn raw_map_delete_elem(map: *mut c_void, key: *const c_void) -> i64 {
+unsafe fn raw_map_delete_elem(map: *mut c_void, key: *const c_void) -> i64 {
     let map = Arc::from_raw(map as *const BpfMap);
     let key_size = map.key_size();
     let key = core::slice::from_raw_parts(key as *const u8, key_size);
@@ -186,7 +179,7 @@ pub fn map_delete_elem(map: &Arc<BpfMap>, key: &[u8]) -> Result<()> {
 /// `long (*callback_fn)(struct bpf_map *map, const void key, void *value, void *ctx);`
 ///
 /// For per_cpu maps, the map_value is the value on the cpu where the bpf_prog is running.
-pub unsafe fn raw_map_for_each_elem(
+unsafe fn raw_map_for_each_elem(
     map: *mut c_void,
     cb: *const c_void,
     ctx: *const c_void,
@@ -216,7 +209,7 @@ pub fn map_for_each_elem(
 /// Perform a lookup in percpu map for an entry associated to key on cpu.
 ///
 /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_lookup_percpu_elem/
-pub unsafe fn raw_map_lookup_percpu_elem(
+unsafe fn raw_map_lookup_percpu_elem(
     map: *mut c_void,
     key: *const c_void,
     cpu: u32,
@@ -248,7 +241,7 @@ pub fn map_lookup_percpu_elem(
 /// Push an element value in map.
 ///
 /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_push_elem/
-pub unsafe fn raw_map_push_elem(map: *mut c_void, value: *const c_void, flags: u64) -> i64 {
+unsafe fn raw_map_push_elem(map: *mut c_void, value: *const c_void, flags: u64) -> i64 {
     let map = Arc::from_raw(map as *const BpfMap);
     let value_size = map.value_size();
     let value = core::slice::from_raw_parts(value as *const u8, value_size);
@@ -269,7 +262,7 @@ pub fn map_push_elem(map: &Arc<BpfMap>, value: &[u8], flags: u64) -> Result<()> 
 /// Pop an element from map.
 ///
 /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_pop_elem/
-pub unsafe fn raw_map_pop_elem(map: *mut c_void, value: *mut c_void) -> i64 {
+unsafe fn raw_map_pop_elem(map: *mut c_void, value: *mut c_void) -> i64 {
     let map = Arc::from_raw(map as *const BpfMap);
     let value_size = map.value_size();
     let value = core::slice::from_raw_parts_mut(value as *mut u8, value_size);
@@ -290,7 +283,7 @@ pub fn map_pop_elem(map: &Arc<BpfMap>, value: &mut [u8]) -> Result<()> {
 /// Get an element from map without removing it.
 ///
 /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_peek_elem/
-pub unsafe fn raw_map_peek_elem(map: *mut c_void, value: *mut c_void) -> i64 {
+unsafe fn raw_map_peek_elem(map: *mut c_void, value: *mut c_void) -> i64 {
     let map = Arc::from_raw(map as *const BpfMap);
     let value_size = map.value_size();
     let value = core::slice::from_raw_parts_mut(value as *mut u8, value_size);
@@ -303,7 +296,7 @@ pub unsafe fn raw_map_peek_elem(map: *mut c_void, value: *mut c_void) -> i64 {
 }
 
 pub fn map_peek_elem(map: &Arc<BpfMap>, value: &mut [u8]) -> Result<()> {
-    let mut binding = map.inner_map().lock();
+    let binding = map.inner_map().lock();
     let value = binding.peek_elem(value);
     value
 }

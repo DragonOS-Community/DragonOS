@@ -52,9 +52,9 @@ test-release:
 	RUSTFLAGS=$(RUSTFLAGS) cargo $(TOOLCHAIN) test --target $(RUST_TARGET) --release
 
 build-ebpf:
-	cd ../syscall_ebpf && RUST_LOG=debug cargo xtask build --release
+	cd ./syscall_ebpf && RUST_LOG=debug cargo xtask build --release
 clean-ebpf:
-	cd ../syscall_ebpf && cargo clean
+	cd ./syscall_ebpf && cargo clean
 
 .PHONY: install
 install:build-ebpf

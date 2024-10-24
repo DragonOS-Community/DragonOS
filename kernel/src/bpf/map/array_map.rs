@@ -83,7 +83,7 @@ impl BpfMapCommonOps for ArrayMap {
         if key.len() != 4 {
             return Err(SystemError::EINVAL);
         }
-        let index = u32::from_ne_bytes(key.try_into().unwrap());
+        let index = u32::from_ne_bytes(key.try_into().map_err(|_| SystemError::EINVAL)?);
         if index >= self.max_entries {
             return Err(SystemError::EINVAL);
         }
@@ -94,7 +94,7 @@ impl BpfMapCommonOps for ArrayMap {
         if key.len() != 4 {
             return Err(SystemError::EINVAL);
         }
-        let index = u32::from_ne_bytes(key.try_into().unwrap());
+        let index = u32::from_ne_bytes(key.try_into().map_err(|_| SystemError::EINVAL)?);
         if index >= self.max_entries {
             return Err(SystemError::EINVAL);
         }
@@ -136,7 +136,7 @@ impl BpfMapCommonOps for ArrayMap {
             if key.len() != 4 {
                 return Err(SystemError::EINVAL);
             }
-            let index = u32::from_ne_bytes(key.try_into().unwrap());
+            let index = u32::from_ne_bytes(key.try_into().map_err(|_| SystemError::EINVAL)?);
             if index == self.max_entries - 1 {
                 return Err(SystemError::ENOENT);
             }
@@ -244,19 +244,19 @@ impl PerfEventArrayMap {
 
 impl BpfMapCommonOps for PerfEventArrayMap {
     fn lookup_elem(&mut self, key: &[u8]) -> Result<Option<&[u8]>> {
-        let cpu_id = u32::from_ne_bytes(key.try_into().unwrap());
+        let cpu_id = u32::from_ne_bytes(key.try_into().map_err(|_| SystemError::EINVAL)?);
         let value = self.fds.index(cpu_id);
         Ok(Some(value))
     }
     fn update_elem(&mut self, key: &[u8], value: &[u8], _flags: u64) -> Result<()> {
         assert_eq!(value.len(), 4);
-        let cpu_id = u32::from_ne_bytes(key.try_into().unwrap());
+        let cpu_id = u32::from_ne_bytes(key.try_into().map_err(|_| SystemError::EINVAL)?);
         let old_value = self.fds.index_mut(cpu_id);
         old_value.copy_from_slice(value);
         Ok(())
     }
     fn delete_elem(&mut self, key: &[u8]) -> Result<()> {
-        let cpu_id = u32::from_ne_bytes(key.try_into().unwrap());
+        let cpu_id = u32::from_ne_bytes(key.try_into().map_err(|_| SystemError::EINVAL)?);
         self.fds.index_mut(cpu_id).copy_from_slice(&[0; 4]);
         Ok(())
     }

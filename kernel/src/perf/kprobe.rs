@@ -22,13 +22,13 @@ use rbpf::EbpfVmRawOwned;
 use system_error::SystemError;
 #[derive(Debug)]
 pub struct KprobePerfEvent {
-    args: PerfProbeArgs,
+    _args: PerfProbeArgs,
     kprobe: LockKprobe,
 }
 
 impl Drop for KprobePerfEvent {
     fn drop(&mut self) {
-        unregister_kprobe(self.kprobe.clone()).unwrap();
+        unregister_kprobe(self.kprobe.clone());
     }
 }
 
@@ -39,9 +39,10 @@ impl KprobePerfEvent {
             .downcast_arc::<BpfProg>()
             .ok_or(SystemError::EINVAL)?;
         let prog_slice = file.insns();
-        let mut vm = EbpfVmRawOwned::new(Some(prog_slice.to_vec())).unwrap();
-        vm.register_helper_set(BPF_HELPER_FUN_SET.get()).unwrap();
-
+        let mut vm =
+            EbpfVmRawOwned::new(Some(prog_slice.to_vec())).map_err(|_| SystemError::EINVAL)?;
+        vm.register_helper_set(BPF_HELPER_FUN_SET.get())
+            .map_err(|_| SystemError::EINVAL)?;
         // create a callback to execute the ebpf prog
         let callback = Box::new(KprobePerfCallBack::new(file, vm));
         // update callback for kprobe
@@ -51,13 +52,16 @@ impl KprobePerfEvent {
 }
 
 pub struct KprobePerfCallBack {
-    bpf_prog_file: Arc<BpfProg>,
+    _bpf_prog_file: Arc<BpfProg>,
     vm: EbpfVmRawOwned,
 }
 
 impl KprobePerfCallBack {
     fn new(bpf_prog_file: Arc<BpfProg>, vm: EbpfVmRawOwned) -> Self {
-        Self { bpf_prog_file, vm }
+        Self {
+            _bpf_prog_file: bpf_prog_file,
+            vm,
+        }
     }
 }
 
@@ -71,10 +75,10 @@ impl CallBackFunc for KprobePerfCallBack {
                 size_of::<KProbeContext>(),
             )
         };
-        // log::info!("---------------------Running probe---------------------");
-        let _res = self.vm.execute_program(probe_context).unwrap();
-        // log::info!("Program returned: {res:?} ({res:#x})");
-        // log::info!("---------------------Probe finished---------------------");
+        let _res = self
+            .vm
+            .execute_program(probe_context)
+            .map_err(|_| SystemError::EINVAL);
     }
 }
 
@@ -83,7 +87,7 @@ impl IndexNode for KprobePerfEvent {
         &self,
         _offset: usize,
         _len: usize,
-        buf: &mut [u8],
+        _buf: &mut [u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize> {
         panic!("read_at not implemented for PerfEvent");
@@ -138,12 +142,8 @@ pub fn perf_event_open_kprobe(args: PerfProbeArgs) -> KprobePerfEvent {
     let symbol = args.name.clone();
     log::info!("create kprobe for symbol: {symbol}");
     let kprobe_info = KprobeInfo {
-        pre_handler: |_| {
-            // log::info!("pre_handler:kprobe for perf_event_open_kprobe")
-        },
-        post_handler: |_| {
-            // log::info!("post_handler:kprobe for perf_event_open_kprobe")
-        },
+        pre_handler: |_| {},
+        post_handler: |_| {},
         fault_handler: None,
         event_callback: None,
         symbol: Some(symbol),
@@ -152,5 +152,8 @@ pub fn perf_event_open_kprobe(args: PerfProbeArgs) -> KprobePerfEvent {
         enable: false,
     };
     let kprobe = register_kprobe(kprobe_info).expect("create kprobe failed");
-    KprobePerfEvent { args, kprobe }
+    KprobePerfEvent {
+        _args: args,
+        kprobe,
+    }
 }

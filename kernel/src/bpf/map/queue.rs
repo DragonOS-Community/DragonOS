@@ -1,7 +1,7 @@
-use super::{BpfCallBackFn, BpfMapCommonOps, Result};
+use super::{BpfMapCommonOps, Result};
 use crate::bpf::map::util::{BpfMapMeta, BpfMapUpdateElemFlags};
 use alloc::vec::Vec;
-use core::fmt::{Debug, Formatter};
+use core::fmt::Debug;
 use core::ops::Deref;
 use core::ops::DerefMut;
 use system_error::SystemError;
@@ -132,7 +132,7 @@ impl<T: SpecialMap> BpfMapCommonOps for T {
         self.push(value.to_vec(), flag)
     }
     /// Equal to [QueueMap::pop]
-    fn lookup_and_delete_elem(&mut self, key: &[u8], value: &mut [u8]) -> Result<()> {
+    fn lookup_and_delete_elem(&mut self, _key: &[u8], value: &mut [u8]) -> Result<()> {
         if let Some(v) = self.pop() {
             value.copy_from_slice(&v);
             Ok(())

@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-aya-ebpf = { git = "https://github.com/aya-rs/aya", rev = "3d57d35" }
-aya-log-ebpf = { git = "https://github.com/aya-rs/aya", rev = "3d57d35" }
+aya-ebpf = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/aya.git", rev = "3d57d35" }
+aya-log-ebpf = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/aya.git", rev = "3d57d35" }
 
 syscall_ebpf-common = { path = "../syscall_ebpf-common" }
 

@@ -8,7 +8,7 @@ use crate::include::bindings::linux_bpf::{
 };
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame};
-use crate::mm::page::{page_manager_lock_irqsave, Page, PageFlushAll};
+use crate::mm::page::{page_manager_lock_irqsave, Page};
 use crate::mm::{MemoryManagementArch, PhysAddr};
 use crate::perf::util::{LostSamples, PerfProbeArgs, PerfSample, SampleHeader};
 use alloc::string::String;
@@ -20,7 +20,7 @@ use system_error::SystemError;
 const PAGE_SIZE: usize = MMArch::PAGE_SIZE;
 #[derive(Debug)]
 pub struct BpfPerfEvent {
-    args: PerfProbeArgs,
+    _args: PerfProbeArgs,
     data: SpinLock<BpfPerfEventData>,
 }
 
@@ -219,7 +219,7 @@ impl RingPage {
 impl BpfPerfEvent {
     pub fn new(args: PerfProbeArgs) -> Self {
         BpfPerfEvent {
-            args,
+            _args: args,
             data: SpinLock::new(BpfPerfEventData {
                 enabled: false,
                 mmap_page: RingPage::empty(),
@@ -228,7 +228,7 @@ impl BpfPerfEvent {
             }),
         }
     }
-    pub fn do_mmap(&self, start: usize, len: usize, offset: usize) -> Result<()> {
+    pub fn do_mmap(&self, _start: usize, len: usize, offset: usize) -> Result<()> {
         let mut data = self.data.lock();
         // alloc page frame
         let (phy_addr, page_count) =
@@ -243,7 +243,7 @@ impl BpfPerfEvent {
             data.page_cache.add_page(i, &page);
             cur_phys = cur_phys.next();
         }
-        let virt_addr = unsafe { MMArch::phys_2_virt(phy_addr) }.unwrap();
+        let virt_addr = unsafe { MMArch::phys_2_virt(phy_addr) }.ok_or(SystemError::EFAULT)?;
         // create mmap page
         let mmap_page = RingPage::new_init(virt_addr.data(), len, phy_addr);
         data.mmap_page = mmap_page;
@@ -253,7 +253,7 @@ impl BpfPerfEvent {
 
     pub fn write_event(&self, data: &[u8]) -> Result<()> {
         let mut inner_data = self.data.lock();
-        inner_data.mmap_page.write_event(data);
+        inner_data.mmap_page.write_event(data)?;
         Ok(())
     }
 }
@@ -266,7 +266,7 @@ impl Drop for BpfPerfEvent {
         let len = data.mmap_page.size;
         let page_count = PageFrameCount::new(len / PAGE_SIZE);
         let mut cur_phys = PhysPageFrame::new(phy_addr);
-        for i in 0..page_count.data() {
+        for _ in 0..page_count.data() {
             page_manager_guard.remove_page(&cur_phys.phys_address());
             cur_phys = cur_phys.next();
         }
@@ -280,9 +280,9 @@ impl IndexNode for BpfPerfEvent {
 
     fn read_at(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize> {
         panic!("PerfEventInode does not support read")
@@ -290,9 +290,9 @@ impl IndexNode for BpfPerfEvent {
 
     fn write_at(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &[u8],
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize> {
         panic!("PerfEventInode does not support write")

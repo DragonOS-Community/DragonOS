@@ -2,6 +2,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::kprobe::clear_single_step;
 use crate::debug::kprobe::KPROBE_MANAGER;
 use kprobe::{KprobeOps, ProbeArgs};
+use log::debug;
 use system_error::SystemError;
 
 #[derive(Debug)]
@@ -25,7 +26,7 @@ impl DebugException {
             let return_address = kprobe_list[0].read().probe_point().return_address();
             clear_single_step(frame, return_address);
         } else {
-            println!("There is no kprobe on pc {:#x}", pc);
+            debug!("There is no kprobe on pc {:#x}", pc);
         }
         Ok(())
     }

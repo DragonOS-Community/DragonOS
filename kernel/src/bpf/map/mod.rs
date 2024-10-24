@@ -67,7 +67,7 @@ pub trait BpfMapCommonOps: Send + Sync + Debug + CastFromSync {
     }
 
     /// erform a lookup in percpu map for an entry associated to key on cpu.
-    fn lookup_percpu_elem(&mut self, _key: &[u8], cpu: u32) -> Result<Option<&[u8]>> {
+    fn lookup_percpu_elem(&mut self, _key: &[u8], _cpu: u32) -> Result<Option<&[u8]>> {
         Err(SystemError::ENOSYS)
     }
     /// Get the next key in the map. If key is None, get the first key.

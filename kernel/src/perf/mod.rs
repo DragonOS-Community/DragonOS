@@ -1,4 +1,3 @@
-#![allow(unused)]
 mod bpf;
 mod kprobe;
 mod util;
@@ -313,13 +312,12 @@ pub fn perf_event_open(
 
 pub fn perf_event_output(_ctx: *mut c_void, fd: usize, _flags: u32, data: &[u8]) -> Result<()> {
     let file = get_perf_event_file(fd)?;
-    // info!("perf_event_output: fd: {}, flags: {:x?}", fd, flags);
     let bpf_event_file = file.deref().deref();
     let bpf_event_file = bpf_event_file
         .deref()
         .ref_any()
         .downcast_ref::<BpfPerfEvent>()
-        .unwrap();
+        .ok_or(SystemError::EINVAL)?;
     bpf_event_file.write_event(data)?;
     file.epoll_callback()?;
     Ok(())

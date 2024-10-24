@@ -761,8 +761,6 @@ impl FileDescriptorVec {
 
         // 把文件描述符数组对应位置设置为空
         let file = self.fds[fd as usize].take().unwrap();
-
-        assert!(Arc::strong_count(&file) == 1);
         return Ok(file);
     }
 

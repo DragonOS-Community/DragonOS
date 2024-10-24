@@ -73,8 +73,8 @@ pub fn kprobe_test() {
         detect_func as usize
     );
     detect_func(1, 2);
-    unregister_kprobe(kprobe).unwrap();
-    unregister_kprobe(kprobe2).unwrap();
+    unregister_kprobe(kprobe);
+    unregister_kprobe(kprobe2);
     info!(
         "uninstall 2 kprobes at [detect_func]: {:#x}",
         detect_func as usize

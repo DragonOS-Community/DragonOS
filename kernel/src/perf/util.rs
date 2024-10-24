@@ -30,6 +30,8 @@ pub enum PerfEventIoc {
 }
 
 #[derive(Debug, Clone)]
+#[allow(unused)]
+/// `perf_event_open` syscall arguments.
 pub struct PerfProbeArgs {
     pub config: perf_sw_ids,
     pub name: String,

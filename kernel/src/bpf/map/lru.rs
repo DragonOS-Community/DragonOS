@@ -1,6 +1,5 @@
 use super::{BpfCallBackFn, BpfMapCommonOps, PerCpuInfo, Result};
-use crate::bpf::map::util::{round_up, BpfMapMeta};
-use crate::libs::spinlock::SpinLock;
+use crate::bpf::map::util::BpfMapMeta;
 use alloc::vec::Vec;
 use core::fmt::Debug;
 use core::num::NonZero;
@@ -17,7 +16,7 @@ type BpfHashMapValue = Vec<u8>;
 /// See https://docs.ebpf.io/linux/map-type/BPF_MAP_TYPE_LRU_HASH/
 #[derive(Debug)]
 pub struct LruMap {
-    max_entries: u32,
+    _max_entries: u32,
     data: LruCache<BpfHashMapKey, BpfHashMapValue>,
 }
 
@@ -26,10 +25,11 @@ impl LruMap {
         if attr.value_size == 0 || attr.max_entries == 0 {
             return Err(SystemError::EINVAL);
         }
-        let value_size = round_up(attr.value_size as usize, 8);
         Ok(Self {
-            max_entries: attr.max_entries,
-            data: LruCache::new(NonZero::new(attr.max_entries as usize).unwrap()),
+            _max_entries: attr.max_entries,
+            data: LruCache::new(
+                NonZero::new(attr.max_entries as usize).ok_or(SystemError::EINVAL)?,
+            ),
         })
     }
 }

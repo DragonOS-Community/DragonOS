@@ -1,4 +1,3 @@
-#![allow(unused)]
 pub mod helper;
 pub mod map;
 pub mod prog;

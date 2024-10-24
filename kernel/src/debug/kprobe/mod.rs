@@ -134,9 +134,9 @@ impl KprobeManager {
     }
 }
 
-pub fn kprobe_init() {}
-
 #[cfg(feature = "kprobe_test")]
+#[allow(unused)]
+/// This function is only used for testing kprobe
 pub fn kprobe_test() {
     test::kprobe_test();
 }
@@ -173,12 +173,11 @@ pub fn register_kprobe(kprobe_info: KprobeInfo) -> Result<LockKprobe, SystemErro
 ///
 /// ## 参数
 /// - `kprobe`: 已安装的kprobe
-pub fn unregister_kprobe(kprobe: LockKprobe) -> Result<(), SystemError> {
+pub fn unregister_kprobe(kprobe: LockKprobe) {
     let kprobe_addr = kprobe.read().probe_point().break_address();
     KPROBE_MANAGER.lock().remove_kprobe(&kprobe);
     // 如果没有其他kprobe注册在这个地址上，则删除探测点
     if KPROBE_MANAGER.lock().kprobe_num(kprobe_addr) == 0 {
         KPROBE_POINT_LIST.lock().remove(&kprobe_addr);
     }
-    Ok(())
 }

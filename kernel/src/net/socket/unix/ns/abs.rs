@@ -3,7 +3,6 @@ use core::fmt;
 use crate::libs::spinlock::SpinLock;
 use crate::net::socket::Endpoint;
 use alloc::string::String;
-use alloc::sync::Arc;
 use hashbrown::HashMap;
 use ida::IdAllocator;
 use system_error::SystemError;
@@ -20,7 +19,7 @@ lazy_static! {
 static ABS_ADDRESS_ALLOCATOR: SpinLock<IdAllocator> =
     SpinLock::new(IdAllocator::new(0, (1 << 20) as usize).unwrap());
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AbsHandle(usize);
 
 impl AbsHandle {
@@ -52,7 +51,7 @@ impl Drop for AbsHandle {
 ///
 /// 负责管理抽象命名空间内的地址
 pub struct AbsHandleMap {
-    abs_handle_map: SpinLock<HashMap<String, Arc<AbsHandle>>>,
+    abs_handle_map: SpinLock<HashMap<String, Endpoint>>,
 }
 
 impl AbsHandleMap {
@@ -63,7 +62,7 @@ impl AbsHandleMap {
     }
 
     /// 插入新的地址映射
-    pub fn insert(&self, name: String) -> Result<Arc<AbsHandle>, SystemError> {
+    pub fn insert(&self, name: String) -> Result<Endpoint, SystemError> {
         let mut guard = self.abs_handle_map.lock();
 
         //检查name是否被占用
@@ -71,7 +70,7 @@ impl AbsHandleMap {
             return Err(SystemError::ENOMEM);
         }
 
-        let ads_addr = match self.alloc() {
+        let ads_addr = match self.alloc(name.clone()) {
             Some(addr) => addr.clone(),
             None => return Err(SystemError::ENOMEM),
         };
@@ -83,15 +82,19 @@ impl AbsHandleMap {
     ///
     /// ## 返回
     ///
-    /// 分配到的可用地址
-    pub fn alloc(&self) -> Option<Arc<AbsHandle>> {
+    /// 分配到的可用的抽象端点
+    pub fn alloc(&self, name: String) -> Option<Endpoint> {
         let abs_addr = match ABS_ADDRESS_ALLOCATOR.lock().alloc() {
             Some(addr) => addr,
             //地址被分配
             None => return None,
         };
 
-        return Some(Arc::new(AbsHandle::new(abs_addr)));
+        let result = Some(
+            Endpoint::Abspath((AbsHandle::new(abs_addr), String::from(name)))
+        );
+
+        return result;
     }
 
     /// 进行地址映射
@@ -99,7 +102,7 @@ impl AbsHandleMap {
     /// ## 参数
     ///
     /// name：用户定义的地址
-    pub fn look_up(&self, name: &String) -> Option<Arc<AbsHandle>> {
+    pub fn look_up(&self, name: &String) -> Option<Endpoint> {
         let guard = self.abs_handle_map.lock();
         return guard.get(name).cloned();
     }
@@ -111,7 +114,12 @@ impl AbsHandleMap {
     /// name：待删除的地址
     pub fn remove(&self, name: String) -> Result<(), SystemError> {
         let abs_addr = match look_up_abs_addr(&name) {
-            Ok(result) => result.name(),
+            Ok(result) => {
+                match result {
+                    Endpoint::Abspath((abshandle, _)) => abshandle.name(),
+                    _ => return Err(SystemError::EINVAL)
+                }
+            },
             Err(_) => return Err(SystemError::EINVAL),
         };
 
@@ -131,7 +139,7 @@ impl AbsHandleMap {
 /// ## 返回
 ///
 /// 分配到的抽象地址
-pub fn alloc_abs_addr(name: String) -> Result<Arc<AbsHandle>, SystemError> {
+pub fn alloc_abs_addr(name: String) -> Result<Endpoint, SystemError> {
     match ABSHANDLE_MAP.insert(name) {
         Ok(result) => return Ok(result),
         Err(e) => return Err(e),
@@ -147,7 +155,7 @@ pub fn alloc_abs_addr(name: String) -> Result<Arc<AbsHandle>, SystemError> {
 /// ## 返回
 ///
 /// 查询到的抽象地址
-pub fn look_up_abs_addr(name: &String) -> Result<Arc<AbsHandle>, SystemError> {
+pub fn look_up_abs_addr(name: &String) -> Result<Endpoint, SystemError> {
     match ABSHANDLE_MAP.look_up(name) {
         Some(result) => return Ok(result),
         None => return Err(SystemError::EINVAL),

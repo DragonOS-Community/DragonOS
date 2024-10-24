@@ -17,7 +17,7 @@ pub enum Endpoint {
     /// Unix传递id索引和path所用的端点
     Unixpath((InodeId, String)),
     /// Unix抽象端点
-    Abspath((Arc<AbsHandle>, String)),
+    Abspath((AbsHandle, String)),
     /// NetLink端点
     Netlink(NetlinkEndpoint),
 }

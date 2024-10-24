@@ -40,16 +40,14 @@ use unix::
 
 use crate::{
     filesystem::vfs::{
-        file::FileMode, FileType, IndexNode, MAX_PATHLEN, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        FileType, IndexNode, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
-    libs::casting::DowncastArc,
     mm::{verify_area, VirtAddr},
-    net::socket::{self, *},
+    net::socket::{*},
     process::ProcessManager,
-    syscall::Syscall,
 };
 use smoltcp;
-use system_error::SystemError::{self, *};
+use system_error::SystemError::{self};
 
 // 参考资料： https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/netinet_in.h.html#tag_13_32
 #[repr(C)]
@@ -159,8 +157,7 @@ impl SockAddr {
                                 match alloc_abs_addr(spath.clone()) {
                                     Ok(result) => {
                                         log::debug!("alloc abs addr success!");
-                                        let unix_abs_endpoint = Endpoint::Abspath((result, spath));
-                                        return Ok(unix_abs_endpoint)
+                                        return Ok(result)
                                     },
                                     Err(e) => {
                                         log::debug!("alloc abs addr failed!");
@@ -170,7 +167,7 @@ impl SockAddr {
                             },
                         };
                         log::debug!("find alloc abs addr success!");
-                        return Ok(Endpoint::Abspath((abs_find, spath)));
+                        return Ok(abs_find);
                     }
 
                     let path = CStr::from_bytes_until_nul(&addr_un.sun_path)

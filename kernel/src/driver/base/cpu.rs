@@ -11,8 +11,6 @@ use crate::{
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
-use system_error::SystemError;
-
 use super::{
     class::Class,
     device::{
@@ -24,6 +22,10 @@ use super::{
     kset::KSet,
     subsys::SubSysPrivate,
 };
+use crate::filesystem::kernfs::callback::{KernCallbackData, KernFSCallback};
+use crate::filesystem::vfs::syscall::ModeType;
+use crate::filesystem::vfs::PollStatus;
+use system_error::SystemError;
 
 #[inline(always)]
 pub fn cpu_device_manager() -> &'static CpuDeviceManager {
@@ -198,6 +200,17 @@ impl KObject for CpuSubSystemFakeRootDevice {
     }
 
     fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
+        if let Some(ref inode) = inode {
+            inode
+                .add_file(
+                    "possible".to_string(),
+                    ModeType::from_bits_truncate(0o444),
+                    None,
+                    None,
+                    Some(&CpuPossibleFile),
+                )
+                .unwrap();
+        }
         self.inner.write().kobject_common.kern_inode = inode;
     }
 
@@ -247,5 +260,42 @@ impl KObject for CpuSubSystemFakeRootDevice {
 
     fn set_kobj_state(&self, state: KObjectState) {
         *self.kobj_state_mut() = state;
+    }
+}
+
+#[derive(Debug)]
+pub struct CpuPossibleFile;
+
+impl KernFSCallback for CpuPossibleFile {
+    fn open(&self, _data: KernCallbackData) -> Result<(), SystemError> {
+        Ok(())
+    }
+    fn read(
+        &self,
+        _data: KernCallbackData,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, SystemError> {
+        let cpu_manager = crate::smp::cpu::smp_cpu_manager();
+        let cpus = cpu_manager.present_cpus_count();
+        let data = format!("0-{}", cpus - 1);
+        let len = data.as_bytes().len();
+        let copy_start = offset.min(len);
+        let copy_end = (offset + buf.len()).min(len);
+        let copy_len = copy_end - copy_start;
+        buf[..copy_len].copy_from_slice(&data.as_bytes()[copy_start..copy_end]);
+        Ok(copy_len)
+    }
+    fn write(
+        &self,
+        _data: KernCallbackData,
+        _buf: &[u8],
+        _offset: usize,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::EPERM)
+    }
+
+    fn poll(&self, _data: KernCallbackData) -> Result<PollStatus, SystemError> {
+        Err(SystemError::ENOSYS)
     }
 }

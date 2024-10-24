@@ -51,7 +51,7 @@ jobs:
       env:
           ARCH: ${{ matrix.arch }}
           HOME: /root
-      run: bash -c "source /root/.cargo/env && cd kernel && make test"
+      run: bash -c "source /root/.cargo/env && cd kernel && make test && make test-rbpf"
 
   build-x86_64:
 

@@ -109,23 +109,6 @@ impl DowncastArc for dyn BpfMapCommonOps {
         self
     }
 }
-
-pub struct PerCpuInfo;
-
-impl PerCpuInfo {
-    pub fn cpu_id() -> u32 {
-        // let cpu = crate::smp::core::smp_get_processor_id();
-        // log::info!("cpu_id: {:?}", cpu.data());
-        // cpu.data()
-        0
-    }
-    pub fn num_cpus() -> u32 {
-        // let cpus =  crate::smp::cpu::smp_cpu_manager();
-        // log::info!("num_cpus: {:?}", cpus.present_cpus_count());
-        // cpus.present_cpus_count()
-        1
-    }
-}
 impl BpfMap {
     pub fn new(map: Box<dyn BpfMapCommonOps>, meta: BpfMapMeta) -> Self {
         assert_ne!(meta.key_size, 0);

@@ -2,10 +2,10 @@ mod consts;
 mod print;
 
 use crate::bpf::helper::print::trace_printf;
-use crate::bpf::map::PerCpuInfo;
 use crate::bpf::map::{BpfCallBackFn, BpfMap};
 use crate::include::bindings::linux_bpf::BPF_F_CURRENT_CPU;
 use crate::libs::lazy_init::Lazy;
+use crate::smp::core::smp_get_processor_id;
 use alloc::{collections::BTreeMap, sync::Arc};
 use core::ffi::c_void;
 use system_error::SystemError;
@@ -74,8 +74,7 @@ pub fn perf_event_output(
     let index = flags as u32;
     let flags = (flags >> 32) as u32;
     let key = if index == BPF_F_CURRENT_CPU as u32 {
-        let cpu_id = PerCpuInfo::cpu_id();
-        cpu_id
+        smp_get_processor_id().data()
     } else {
         index
     };

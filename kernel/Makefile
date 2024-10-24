@@ -43,5 +43,7 @@ endif
 
 test:
 # 测试内核库
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-07-23 test --workspace --exclude dragonos_kernel
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-07-23 test --workspace --exclude dragonos_kernel rbpf
 
+test-rbpf:
+	cd crates/rbpf && RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-07-23 test --features=std,user,cranelift

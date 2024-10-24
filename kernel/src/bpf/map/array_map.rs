@@ -5,8 +5,9 @@
 
 use super::super::Result;
 use crate::bpf::map::util::round_up;
-use crate::bpf::map::PerCpuInfo;
 use crate::bpf::map::{BpfCallBackFn, BpfMapCommonOps, BpfMapMeta};
+use crate::mm::percpu::{PerCpu, PerCpuVar};
+use crate::smp::cpu::{smp_cpu_manager, ProcessorId};
 use alloc::{vec, vec::Vec};
 use core::{
     fmt::{Debug, Formatter},
@@ -161,59 +162,58 @@ impl BpfMapCommonOps for ArrayMap {
 ///
 /// See https://ebpf-docs.dylanreimerink.nl/linux/map-type/BPF_MAP_TYPE_PERCPU_ARRAY/
 pub struct PerCpuArrayMap {
-    data: Vec<ArrayMap>,
+    per_cpu_data: PerCpuVar<ArrayMap>,
 }
 
 impl Debug for PerCpuArrayMap {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PerCpuArrayMap")
-            .field("data", &self.data)
+            .field("data", &self.per_cpu_data)
             .finish()
     }
 }
 
 impl PerCpuArrayMap {
     pub fn new(attr: &BpfMapMeta) -> Result<Self> {
-        let num_cpus = PerCpuInfo::num_cpus();
+        let num_cpus = PerCpu::MAX_CPU_NUM;
         let mut data = Vec::with_capacity(num_cpus as usize);
         for _ in 0..num_cpus {
             let array_map = ArrayMap::new(attr)?;
             data.push(array_map);
         }
-        Ok(PerCpuArrayMap { data })
+        let per_cpu_data = PerCpuVar::new(data).ok_or(SystemError::EINVAL)?;
+        Ok(PerCpuArrayMap { per_cpu_data })
     }
 }
 
 impl BpfMapCommonOps for PerCpuArrayMap {
     fn lookup_elem(&mut self, key: &[u8]) -> Result<Option<&[u8]>> {
-        let cpu_id = PerCpuInfo::cpu_id();
-        self.data[cpu_id as usize].lookup_elem(key)
+        self.per_cpu_data.get_mut().lookup_elem(key)
     }
     fn update_elem(&mut self, key: &[u8], value: &[u8], flags: u64) -> Result<()> {
-        let cpu_id = PerCpuInfo::cpu_id();
-        self.data[cpu_id as usize].update_elem(key, value, flags)
+        self.per_cpu_data.get_mut().update_elem(key, value, flags)
     }
     fn delete_elem(&mut self, key: &[u8]) -> Result<()> {
-        let cpu_id = PerCpuInfo::cpu_id();
-        self.data[cpu_id as usize].delete_elem(key)
+        self.per_cpu_data.get_mut().delete_elem(key)
     }
     fn for_each_elem(&mut self, cb: BpfCallBackFn, ctx: *const u8, flags: u64) -> Result<u32> {
-        let cpu_id = PerCpuInfo::cpu_id();
-        self.data[cpu_id as usize].for_each_elem(cb, ctx, flags)
+        self.per_cpu_data.get_mut().for_each_elem(cb, ctx, flags)
     }
     fn lookup_and_delete_elem(&mut self, _key: &[u8], _value: &mut [u8]) -> Result<()> {
         Err(SystemError::EINVAL)
     }
     fn lookup_percpu_elem(&mut self, key: &[u8], cpu: u32) -> Result<Option<&[u8]>> {
-        self.data[cpu as usize].lookup_elem(key)
+        unsafe {
+            self.per_cpu_data
+                .force_get_mut(ProcessorId::new(cpu))
+                .lookup_elem(key)
+        }
     }
     fn get_next_key(&self, key: Option<&[u8]>, next_key: &mut [u8]) -> Result<()> {
-        let cpu_id = PerCpuInfo::cpu_id();
-        self.data[cpu_id as usize].get_next_key(key, next_key)
+        self.per_cpu_data.get_mut().get_next_key(key, next_key)
     }
     fn first_value_ptr(&self) -> Result<*const u8> {
-        let cpu_id = PerCpuInfo::cpu_id();
-        self.data[cpu_id as usize].first_value_ptr()
+        self.per_cpu_data.get_mut().first_value_ptr()
     }
 }
 
@@ -233,7 +233,7 @@ impl Debug for PerfEventArrayMap {
 
 impl PerfEventArrayMap {
     pub fn new(attr: &BpfMapMeta) -> Result<Self> {
-        let num_cpus = PerCpuInfo::num_cpus();
+        let num_cpus = smp_cpu_manager().possible_cpus_count();
         if attr.key_size != 4 || attr.value_size != 4 || attr.max_entries != num_cpus {
             return Err(SystemError::EINVAL);
         }
@@ -262,7 +262,8 @@ impl BpfMapCommonOps for PerfEventArrayMap {
     }
     fn for_each_elem(&mut self, cb: BpfCallBackFn, ctx: *const u8, _flags: u64) -> Result<u32> {
         let mut total_used = 0;
-        for i in 0..PerCpuInfo::num_cpus() {
+        let num_cpus = smp_cpu_manager().possible_cpus_count();
+        for i in 0..num_cpus {
             let key = i.to_ne_bytes();
             let value = self.fds.index(i);
             total_used += 1;

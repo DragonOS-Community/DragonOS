@@ -197,7 +197,7 @@ impl Device for CpuSubSystemFakeRootDevice {
     }
 
     fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
-        Some(&[&AttrCpu])
+        Some(&[&AttrGroupCpu])
     }
 }
 
@@ -260,9 +260,9 @@ impl KObject for CpuSubSystemFakeRootDevice {
 }
 
 #[derive(Debug)]
-pub struct AttrCpu;
+pub struct AttrGroupCpu;
 
-impl AttributeGroup for AttrCpu {
+impl AttributeGroup for AttrGroupCpu {
     fn name(&self) -> Option<&str> {
         None
     }

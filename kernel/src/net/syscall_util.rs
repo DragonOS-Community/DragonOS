@@ -31,19 +31,15 @@ impl SysArgSocketType {
     }
 }
 
-use alloc::sync::Arc;
 use alloc::string::String;
+use alloc::sync::Arc;
 use core::ffi::CStr;
-use unix::
-    ns::abs::{alloc_abs_addr, look_up_abs_addr}
-;
+use unix::ns::abs::{alloc_abs_addr, look_up_abs_addr};
 
 use crate::{
-    filesystem::vfs::{
-        FileType, IndexNode, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES,
-    },
+    filesystem::vfs::{FileType, IndexNode, ROOT_INODE, VFS_MAX_FOLLOW_SYMLINK_TIMES},
     mm::{verify_area, VirtAddr},
-    net::socket::{*},
+    net::socket::*,
     process::ProcessManager,
 };
 use smoltcp;
@@ -146,7 +142,6 @@ impl SockAddr {
                                 SystemError::EINVAL
                             })?;
 
-
                         // 向抽象地址管理器申请或查找抽象地址
                         let spath = String::from(path);
                         log::debug!("abs path: {}", spath);
@@ -157,14 +152,14 @@ impl SockAddr {
                                 match alloc_abs_addr(spath.clone()) {
                                     Ok(result) => {
                                         log::debug!("alloc abs addr success!");
-                                        return Ok(result)
-                                    },
+                                        return Ok(result);
+                                    }
                                     Err(e) => {
                                         log::debug!("alloc abs addr failed!");
-                                        return Err(e)
-                                    },
+                                        return Err(e);
+                                    }
                                 };
-                            },
+                            }
                         };
                         log::debug!("find alloc abs addr success!");
                         return Ok(abs_find);

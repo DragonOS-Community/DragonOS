@@ -6,7 +6,10 @@ use alloc::{
 use inner::{Connected, Init, Inner, Listener};
 use log::debug;
 use system_error::SystemError;
-use unix::{ns::abs::ABS_INODE_MAP, INODE_MAP};
+use unix::{
+    ns::abs::{remove_abs_addr, ABSHANDLE_MAP, ABS_INODE_MAP},
+    INODE_MAP,
+};
 
 use crate::{
     libs::rwlock::RwLock,
@@ -323,7 +326,21 @@ impl Socket for StreamSocket {
     fn close(&self) -> Result<(), SystemError> {
         self.shutdown.recv_shutdown();
         self.shutdown.send_shutdown();
-        Ok(())
+
+        let path = match self.get_name()? {
+            Endpoint::Inode((_, path)) => path,
+            _ => return Err(SystemError::EINVAL),
+        };
+
+        //如果path是空的说明没有bind，不用释放相关映射资源
+        if path.is_empty() {
+            return Ok(());
+        }
+        // TODO: 释放INODE_MAP相关资源
+
+        // 尝试释放相关抽象地址资源
+        let _ = remove_abs_addr(&path);
+        return Ok(());
     }
 
     fn get_peer_name(&self) -> Result<Endpoint, SystemError> {

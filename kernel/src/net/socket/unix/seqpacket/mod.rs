@@ -3,8 +3,8 @@ use alloc::{
     string::String,
     sync::{Arc, Weak},
 };
-use unix::ns::abs::ABS_INODE_MAP;
 use core::sync::atomic::{AtomicBool, Ordering};
+use unix::ns::abs::{remove_abs_addr, ABS_INODE_MAP};
 
 use crate::sched::SchedMode;
 use crate::{libs::rwlock::RwLock, net::socket::*};
@@ -288,7 +288,21 @@ impl Socket for SeqpacketSocket {
         // log::debug!("seqpacket close");
         self.shutdown.recv_shutdown();
         self.shutdown.send_shutdown();
-        Ok(())
+
+        let path = match self.get_name()? {
+            Endpoint::Inode((_, path)) => path,
+            _ => return Err(SystemError::EINVAL),
+        };
+
+        //如果path是空的说明没有bind，不用释放相关映射资源
+        if path.is_empty() {
+            return Ok(());
+        }
+        // TODO: 释放INODE_MAP相关资源
+
+        // 尝试释放相关抽象地址资源
+        let _ = remove_abs_addr(&path);
+        return Ok(());
     }
 
     fn get_peer_name(&self) -> Result<Endpoint, SystemError> {

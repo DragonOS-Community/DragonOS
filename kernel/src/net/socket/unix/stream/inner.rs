@@ -49,8 +49,9 @@ impl Init {
         }
         if let Some(Endpoint::Inode((inode, mut path))) = self.addr.take() {
             path = sun_path;
-            let epoint = Endpoint::Inode((inode, path));
+            let epoint = Endpoint::Inode((inode, path.clone()));
             self.addr.replace(epoint.clone());
+            log::debug!("bind path in inode : {:?}", path);
             return Ok(epoint);
         };
 

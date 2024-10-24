@@ -38,15 +38,6 @@ impl fmt::Display for AbsHandle {
     }
 }
 
-impl Drop for AbsHandle {
-    fn drop(&mut self) {
-        // 释放分配的abs_id
-        log::debug!("abs handle free!");
-        ABS_ADDRESS_ALLOCATOR.lock_irqsave().free(self.name());
-        // TODO:inode映射表中相对应的表项
-    }
-}
-
 /// 抽象地址映射表
 ///
 /// 负责管理抽象命名空间内的地址
@@ -90,9 +81,7 @@ impl AbsHandleMap {
             None => return None,
         };
 
-        let result = Some(
-            Endpoint::Abspath((AbsHandle::new(abs_addr), String::from(name)))
-        );
+        let result = Some(Endpoint::Abspath((AbsHandle::new(abs_addr), name)));
 
         return result;
     }
@@ -112,13 +101,11 @@ impl AbsHandleMap {
     /// ## 参数
     ///
     /// name：待删除的地址
-    pub fn remove(&self, name: String) -> Result<(), SystemError> {
-        let abs_addr = match look_up_abs_addr(&name) {
-            Ok(result) => {
-                match result {
-                    Endpoint::Abspath((abshandle, _)) => abshandle.name(),
-                    _ => return Err(SystemError::EINVAL)
-                }
+    pub fn remove(&self, name: &String) -> Result<(), SystemError> {
+        let abs_addr = match look_up_abs_addr(name) {
+            Ok(result) => match result {
+                Endpoint::Abspath((abshandle, _)) => abshandle.name(),
+                _ => return Err(SystemError::EINVAL),
             },
             Err(_) => return Err(SystemError::EINVAL),
         };
@@ -128,7 +115,7 @@ impl AbsHandleMap {
 
         //释放entry
         let mut guard = self.abs_handle_map.lock();
-        guard.remove(&name);
+        guard.remove(name);
 
         Ok(())
     }
@@ -140,10 +127,7 @@ impl AbsHandleMap {
 ///
 /// 分配到的抽象地址
 pub fn alloc_abs_addr(name: String) -> Result<Endpoint, SystemError> {
-    match ABSHANDLE_MAP.insert(name) {
-        Ok(result) => return Ok(result),
-        Err(e) => return Err(e),
-    }
+    ABSHANDLE_MAP.insert(name)
 }
 
 /// 查找抽象地址
@@ -160,4 +144,29 @@ pub fn look_up_abs_addr(name: &String) -> Result<Endpoint, SystemError> {
         Some(result) => return Ok(result),
         None => return Err(SystemError::EINVAL),
     }
+}
+
+/// 删除抽象地址
+///
+/// ## 参数
+/// name：待删除的地址
+///
+/// ## 返回
+/// 删除的抽象地址
+pub fn remove_abs_addr(name: &String) -> Result<(), SystemError> {
+    let abs_addr = match look_up_abs_addr(name) {
+        Ok(addr) => match addr {
+            Endpoint::Abspath((addr, _)) => addr,
+            _ => return Err(SystemError::EINVAL),
+        },
+        Err(_) => return Err(SystemError::EINVAL),
+    };
+
+    match ABS_INODE_MAP.lock_irqsave().remove(&abs_addr.name()) {
+        Some(_) => log::debug!("free abs inode"),
+        None => log::debug!("not free abs inode"),
+    }
+    ABSHANDLE_MAP.remove(name)?;
+    log::debug!("free abs!");
+    Ok(())
 }

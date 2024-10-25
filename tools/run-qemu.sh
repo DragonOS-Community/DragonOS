@@ -51,12 +51,12 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
   qemu_accel="kvm"
   if [ $(uname) == Darwin ]; then
     qemu_accel=hvf
-  fi
-
-  # 判断系统kvm模块是否加载
-  if ! lsmod | grep -q kvm; then
-    # kvm模块未加载，使用tcg加速
-    qemu_accel="tcg"
+  else
+    # 判断系统kvm模块是否加载
+    if [ ! -e /dev/kvm ]; then
+      # kvm模块未加载，使用tcg加速
+      qemu_accel="tcg"
+    fi
   fi
 fi
 
@@ -88,10 +88,9 @@ BIOS_TYPE=""
 VIRTIO_BLK_DEVICE=false
 # 如果qemu_accel不为空
 if [ -n "${qemu_accel}" ]; then
-  if [ "${qemu_accel}" == "tcg" ]; then
-    QEMU_ACCELARATE="-machine accel=${qemu_accel} "
-  else
-    QEMU_ACCELARATE="-machine accel=${qemu_accel} -enable-kvm "
+    QEMU_ACCELARATE=" -machine accel=${qemu_accel} "
+  if [ "${qemu_accel}" == "kvm" ]; then
+    QEMU_ACCELARATE+=" -enable-kvm "
   fi
 fi
 

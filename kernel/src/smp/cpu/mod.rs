@@ -134,7 +134,6 @@ impl SmpCpuManager {
         &self.possible_cpus
     }
 
-    #[allow(dead_code)]
     pub fn possible_cpus_count(&self) -> u32 {
         self.possible_cnt.load(core::sync::atomic::Ordering::SeqCst)
     }

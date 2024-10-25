@@ -3,7 +3,7 @@ use system_error::SystemError;
 
 use super::{
     class::classes_init,
-    cpu::cpu_device_manager,
+    cpu::CpuDeviceManager,
     device::{bus::buses_init, init::devices_init},
     firmware::firmware_init,
     hypervisor::hypervisor_init,
@@ -20,7 +20,7 @@ pub fn driver_init() -> Result<(), SystemError> {
     hypervisor_init()?;
     platform_bus_init()?;
     serio_bus_init()?;
-    cpu_device_manager().init()?;
+    CpuDeviceManager::init()?;
 
     // 至此，已完成设备驱动模型的初始化
     return Ok(());

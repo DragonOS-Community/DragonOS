@@ -11,6 +11,8 @@ use system_error::SystemError;
 
 use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
 use crate::filesystem::eventfd::EventFdInode;
+use crate::libs::lazy_init::Lazy;
+use crate::perf::PerfEventInode;
 use crate::{
     arch::MMArch,
     driver::{
@@ -125,7 +127,7 @@ impl FileMode {
 /// 页面缓存
 pub struct PageCache {
     xarray: SpinLock<XArray<Arc<Page>>>,
-    inode: Option<Weak<dyn IndexNode>>,
+    inode: Lazy<Weak<dyn IndexNode>>,
 }
 
 impl core::fmt::Debug for PageCache {
@@ -148,13 +150,19 @@ impl PageCache {
     pub fn new(inode: Option<Weak<dyn IndexNode>>) -> Arc<PageCache> {
         let page_cache = Self {
             xarray: SpinLock::new(XArray::new()),
-            inode,
+            inode: {
+                let v: Lazy<Weak<dyn IndexNode>> = Lazy::new();
+                if let Some(inode) = inode {
+                    v.init(inode);
+                }
+                v
+            },
         };
         Arc::new(page_cache)
     }
 
     pub fn inode(&self) -> Option<Weak<dyn IndexNode>> {
-        self.inode.clone()
+        self.inode.try_get().cloned()
     }
 
     pub fn add_page(&self, offset: usize, page: &Arc<Page>) {
@@ -176,8 +184,12 @@ impl PageCache {
         cursor.remove();
     }
 
-    pub fn set_inode(&mut self, inode: Weak<dyn IndexNode>) {
-        self.inode = Some(inode)
+    pub fn set_inode(&self, inode: Weak<dyn IndexNode>) -> Result<(), SystemError> {
+        if self.inode.initialized() {
+            return Err(SystemError::EINVAL);
+        }
+        self.inode.init(inode);
+        Ok(())
     }
 }
 
@@ -603,11 +615,15 @@ impl File {
                 inode.inner().lock().remove_epoll(epoll)
             }
             _ => {
+                let inode = self.inode.downcast_ref::<EventFdInode>();
+                if let Some(inode) = inode {
+                    return inode.remove_epoll(epoll);
+                }
                 let inode = self
                     .inode
-                    .downcast_ref::<EventFdInode>()
+                    .downcast_ref::<PerfEventInode>()
                     .ok_or(SystemError::ENOSYS)?;
-                inode.remove_epoll(epoll)
+                return inode.remove_epoll(epoll);
             }
         }
     }
@@ -745,7 +761,6 @@ impl FileDescriptorVec {
 
         // 把文件描述符数组对应位置设置为空
         let file = self.fds[fd as usize].take().unwrap();
-
         return Ok(file);
     }
 

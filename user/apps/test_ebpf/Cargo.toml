@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-aya = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/tiny-aya.git", rev = "bac99a0" }
-aya-log = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/tiny-aya.git", rev = "bac99a0" }
+aya = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/tiny-aya.git", rev = "0689f13" }
+aya-log = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/tiny-aya.git", rev = "0689f13" }
 
 log = "0.4.22"
 env_logger = "0.11.5"

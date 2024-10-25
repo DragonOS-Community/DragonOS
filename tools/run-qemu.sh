@@ -48,10 +48,16 @@ qemu_trace_usb=trace:usb_xhci_reset,trace:usb_xhci_run,trace:usb_xhci_stop,trace
 
 # 根据架构设置qemu的加速方式
 if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
-    qemu_accel="kvm"
-    if [ $(uname) == Darwin ]; then
-        qemu_accel=hvf  
-    fi
+  qemu_accel="kvm"
+  if [ $(uname) == Darwin ]; then
+    qemu_accel=hvf
+  fi
+
+  # 判断系统kvm模块是否加载
+  if ! lsmod | grep -q kvm; then
+    # kvm模块未加载，使用tcg加速
+    qemu_accel="tcg"
+  fi
 fi
 
 # uboot版本
@@ -82,7 +88,11 @@ BIOS_TYPE=""
 VIRTIO_BLK_DEVICE=false
 # 如果qemu_accel不为空
 if [ -n "${qemu_accel}" ]; then
+  if [ "${qemu_accel}" == "tcg" ]; then
+    QEMU_ACCELARATE="-machine accel=${qemu_accel} "
+  else
     QEMU_ACCELARATE="-machine accel=${qemu_accel} -enable-kvm "
+  fi
 fi
 
 if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then

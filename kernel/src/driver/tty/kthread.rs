@@ -62,6 +62,10 @@ fn tty_refresh_thread() -> i32 {
 
 /// 发送数据到tty刷新线程
 pub fn send_to_tty_refresh_thread(data: &[u8]) {
+    if unsafe { TTY_REFRESH_THREAD.is_none() } {
+        return;
+    }
+
     for item in data {
         KEYBUF.push(*item).ok();
     }

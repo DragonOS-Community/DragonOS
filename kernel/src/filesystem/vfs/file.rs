@@ -242,8 +242,8 @@ impl PageCache {
     ///
     /// ## 返回值
     ///
-    /// - `usize` 成功读取的长度
-    /// - `Vec<(usize, usize)>` 未成功读取的区间的起始页号和长度的集合
+    /// - `Ok(usize)` 成功读取的长度
+    /// - `Err(SystemError)` 失败返回错误码
     pub fn read(
         &self,
         offset: usize,
@@ -252,7 +252,7 @@ impl PageCache {
     ) -> Result<usize, SystemError> {
         let mut not_exist = Vec::new();
         let len = buf.len();
-        log::debug!("offset:{offset}, len:{len}");
+        // log::debug!("offset:{offset}, len:{len}");
         if len == 0 {
             return Ok(0);
         }
@@ -356,22 +356,22 @@ impl PageCache {
     ///
     /// ## 返回值
     ///
-    /// - `usize` 成功写入的长度
-    /// - `Vec<(usize, usize)>` 未成功写入的区间的偏移量和长度集合
-    pub fn write(&self, offset: usize, buf: &[u8]) -> (usize, Vec<(usize, usize)>) {
-        let mut not_exist = Vec::new();
+    /// - `Ok(usize)` 成功读取的长度
+    /// - `Err(SystemError)` 失败返回错误码
+    pub fn write(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
         let len = buf.len();
         if len == 0 {
-            return (0, not_exist);
+            return Ok(0);
         }
+
+        // log::debug!("offset:{offset}, len:{len}");
+
         let start_page_offset = offset >> MMArch::PAGE_SHIFT;
         let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_offset;
 
-        let mut guard = self.xarray.lock();
-        let mut cursor = guard.cursor_mut(start_page_offset as u64);
-
-        let mut byte_num = 0;
         let mut buf_offset = 0;
+        let mut ret = 0;
+
         for i in 0..page_num {
             // 第一个页可能需要计算页内偏移
             let page_offset = if i == 0 {
@@ -389,32 +389,42 @@ impl PageCache {
                 MMArch::PAGE_SIZE
             };
 
+            let mut guard = self.xarray.lock();
+            let mut cursor = guard.cursor_mut(start_page_offset as u64);
+
+            let exist = cursor.load().is_some();
+
+            drop(cursor);
+            drop(guard);
+
+            if !exist {
+                let page_buf = vec![0u8; MMArch::PAGE_SIZE];
+                self.create_pages(start_page_offset + i, &page_buf);
+            }
+
+            let mut guard = self.xarray.lock();
+            let mut cursor = guard.cursor_mut(start_page_offset as u64);
             if let Some(page) = cursor.load() {
                 let vaddr =
                     unsafe { MMArch::phys_2_virt(page.read_irqsave().phys_address()).unwrap() };
                 let sub_buf = &buf[buf_offset..(buf_offset + sub_len)];
 
-                if let Ok(mut user_writer) =
-                    UserBufferWriter::new((vaddr.data() + page_offset) as *mut u8, sub_len, false)
-                {
-                    if let Ok(size) = user_writer.copy_to_user(sub_buf, 0) {
-                        byte_num += size;
-                    }
-                }
-            } else if let Some((page_offset, count)) = not_exist.last_mut() {
-                if *page_offset + *count == start_page_offset + i {
-                    *count += 1;
-                } else {
-                    not_exist.push((start_page_offset + i, 1));
-                }
+                let mut user_writer =
+                    UserBufferWriter::new((vaddr.data() + page_offset) as *mut u8, sub_len, false)?;
+
+                user_writer.copy_to_user(sub_buf, 0)?;
+                ret += sub_len;
+
+                // log::debug!(
+                //     "page_offset:{page_offset}, buf_offset:{buf_offset}, sub_len:{sub_len}"
+                // );
             } else {
-                not_exist.push((start_page_offset + i, 1));
-            }
+                return Err(SystemError::ENOMEM);
+            };
 
             buf_offset += sub_len;
-            cursor.next();
         }
-        (byte_num, not_exist)
+        Ok(ret)
     }
 }
 

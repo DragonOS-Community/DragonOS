@@ -12,7 +12,6 @@ use alloc::{
     vec::Vec,
 };
 
-use crate::arch::MMArch;
 use crate::driver::base::block::gendisk::GenDisk;
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::vfs::file::PageCache;
@@ -20,7 +19,7 @@ use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
-use crate::mm::{MemoryManagementArch, VmFaultReason};
+use crate::mm::VmFaultReason;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, disk_info::Partition, SeekFrom},
     filesystem::vfs::{
@@ -1395,17 +1394,15 @@ impl IndexNode for LockedFATInode {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         match &guard.inode_type {
             FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
-                // let r = f.read(
-                //     &guard.fs.upgrade().unwrap(),
-                //     &mut buf[0..len],
-                //     offset as u64,
+                // log::debug!(
+                //     "read_at len: {len}, offset: {offset}, file_size:{:?}",
+                //     guard.metadata.size
                 // );
-                // log::debug!("buf: {buf:?}");
-                // guard.update_metadata();
-                // return r;
 
-                let len = if offset < f.size() as usize {
-                    core::cmp::min(f.size() as usize, offset + len) - offset
+                let file_size = guard.metadata.size;
+
+                let len = if offset < file_size as usize {
+                    core::cmp::min(file_size as usize, offset + len) - offset
                 } else {
                     0
                 };
@@ -1415,10 +1412,6 @@ impl IndexNode for LockedFATInode {
                 }
 
                 let buf = &mut buf[0..len];
-                // log::debug!(
-                //     "read_at len: {len}, offset: {offset}, f_len:{}",
-                //     f.size()
-                // );
 
                 let read_func = |file_offset: usize, buf: &mut [u8]| {
                     f.read(&guard.fs.upgrade().unwrap(), buf, file_offset as u64)
@@ -1426,7 +1419,6 @@ impl IndexNode for LockedFATInode {
 
                 if let Some(page_cache) = &guard.page_cache {
                     let r = page_cache.read(offset, buf, read_func);
-                    log::debug!("r:{r:?}");
                     return r;
                 } else {
                     let r = f.read(
@@ -1463,40 +1455,10 @@ impl IndexNode for LockedFATInode {
         match &mut guard.inode_type {
             FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
                 if let Some(page_cache) = page_cache {
-                    let (cache_len, rest) = page_cache.write(offset, buf);
-
-                    if rest.is_empty() {
-                        return Ok(cache_len);
-                    }
-
-                    let mut err = None;
-                    for (page_index, count) in rest {
-                        // 实际要写入的内容在文件中的偏移量
-                        let write_offset = core::cmp::max(page_index * MMArch::PAGE_SIZE, offset);
-                        // 实际要写入的内容的长度
-                        let write_len =
-                            core::cmp::min((page_index + count) * MMArch::PAGE_SIZE, offset + len)
-                                - core::cmp::max(page_index * MMArch::PAGE_SIZE, offset);
-
-                        let buf_offset = if offset < write_offset {
-                            write_offset - offset
-                        } else {
-                            0
-                        };
-
-                        if let Err(e) =
-                            f.write(fs, &buf[buf_offset..write_len], write_offset as u64)
-                        {
-                            err = Some(e);
-                        }
-                    }
-
-                    return if let Some(e) = err {
-                        Err(e)
-                    } else {
-                        guard.update_metadata();
-                        Ok(len)
-                    };
+                    let write_len = page_cache.write(offset, buf)?;
+                    let old_size = guard.metadata.size;
+                    guard.metadata.size = core::cmp::max(old_size, (offset + write_len) as i64);
+                    return Ok(write_len);
                 } else {
                     let r = f.write(fs, &buf[0..len], offset as u64);
                     guard.update_metadata();

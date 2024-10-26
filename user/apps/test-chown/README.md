@@ -4,5 +4,5 @@
 
 ### 测试前需要手动添加nogroup用户组和nobody用户（程序里加不了）
 ```groupadd -g 65534 nogroup
-useradd -d /nonexistent -g 65534 -u 65534 -s /bin/false nobody
+useradd -d /nonexistent -g 65534 -u 65534 -s /usr/local/bin/false nobody
 ```

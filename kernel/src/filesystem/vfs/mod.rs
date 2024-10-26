@@ -612,14 +612,21 @@ impl dyn IndexNode {
         return self.do_lookup_follow_symlink(path, max_follow_times, follow_final_symlink);
     }
 
-    /// @brief 查找文件（考虑符号链接，并且考虑是否返回最终路径的符号链接文件本身）
+    /// # 查找文件
+    /// 查找指定路径的文件，考虑符号链接的存在，并可选择是否返回最终路径的符号链接文件本身。
     ///
-    /// @param path 文件路径
-    /// @param max_follow_times 最大经过的符号链接的大小
-    /// @follow_final_symlink: 是否跟随最后的符号链接
+    /// ## 参数
+    /// - `path`: 文件路径
+    /// - `max_follow_times`: 最大经过的符号链接的数量
+    /// - `follow_final_symlink`: 是否跟随最后的符号链接
     ///
-    /// @return Ok(Arc<dyn IndexNode>) 要寻找的目录项的inode
-    /// @return Err(SystemError) 错误码
+    /// ## 返回值
+    /// - `Ok(Arc<dyn IndexNode>)`: 要寻找的目录项的inode
+    /// - `Err(SystemError)`: 错误码，表示查找过程中遇到的错误
+    ///
+    /// ## Safety
+    /// 此函数在处理符号链接时可能会遇到循环引用的情况，`max_follow_times` 参数用于限制符号链接的跟随次数以避免无限循环。
+    #[inline(never)]
     pub fn do_lookup_follow_symlink(
         &self,
         path: &str,
@@ -666,19 +673,15 @@ impl dyn IndexNode {
             }
 
             let inode = result.find(&name)?;
-
+            let file_type = inode.metadata()?.file_type;
             // 如果已经是路径的最后一个部分，并且不希望跟随最后的符号链接
-            if rest_path.is_empty()
-                && !follow_final_symlink
-                && inode.metadata()?.file_type == FileType::SymLink
-            {
+            if rest_path.is_empty() && !follow_final_symlink && file_type == FileType::SymLink {
                 // 返回符号链接本身
                 return Ok(inode);
             }
 
-            // 处理符号链接的问题
-            // 除非是最后一个部分，其他部分遇到符号链接时继续跟随
-            if inode.metadata()?.file_type == FileType::SymLink && max_follow_times > 0 {
+            // 跟随符号链接跳转
+            if file_type == FileType::SymLink && max_follow_times > 0 {
                 let mut content = [0u8; 256];
                 // 读取符号链接
 

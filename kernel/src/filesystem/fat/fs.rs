@@ -1395,64 +1395,39 @@ impl IndexNode for LockedFATInode {
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         match &guard.inode_type {
             FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
-                let len = core::cmp::min(f.size() as usize, offset + len) - offset;
+                // let r = f.read(
+                //     &guard.fs.upgrade().unwrap(),
+                //     &mut buf[0..len],
+                //     offset as u64,
+                // );
+                // log::debug!("buf: {buf:?}");
+                // guard.update_metadata();
+                // return r;
+
+                let len = if offset < f.size() as usize {
+                    core::cmp::min(f.size() as usize, offset + len) - offset
+                } else {
+                    0
+                };
+
+                if len == 0 {
+                    return Ok(0);
+                }
+
                 let buf = &mut buf[0..len];
+                // log::debug!(
+                //     "read_at len: {len}, offset: {offset}, f_len:{}",
+                //     f.size()
+                // );
+
+                let read_func = |file_offset: usize, buf: &mut [u8]| {
+                    f.read(&guard.fs.upgrade().unwrap(), buf, file_offset as u64)
+                };
 
                 if let Some(page_cache) = &guard.page_cache {
-                    let (cache_len, rest) = page_cache.read(offset, buf);
-
-                    if rest.is_empty() {
-                        return Ok(cache_len);
-                    }
-
-                    // log::debug!("read rest: {:?}", rest);
-
-                    let mut err = None;
-                    for (page_index, count) in rest {
-                        let mut page_buf = vec![0u8; MMArch::PAGE_SIZE * count];
-                        let page_buf: &mut [u8] = page_buf.as_mut();
-
-                        if let Err(e) = f.read(
-                            &guard.fs.upgrade().unwrap(),
-                            page_buf,
-                            (page_index * MMArch::PAGE_SIZE) as u64,
-                        ) {
-                            err = Some(e);
-                            break;
-                        };
-
-                        page_cache.create_pages(page_index, page_buf);
-
-                        // 实际要拷贝的内容在文件中的偏移量
-                        let copy_offset = core::cmp::max(page_index * MMArch::PAGE_SIZE, offset);
-                        // 实际要拷贝的内容的长度
-                        let copy_len =
-                            core::cmp::min((page_index + count) * MMArch::PAGE_SIZE, offset + len)
-                                - core::cmp::max(page_index * MMArch::PAGE_SIZE, offset);
-
-                        let page_buf_offset = if page_index * MMArch::PAGE_SIZE < copy_offset {
-                            copy_offset - page_index * MMArch::PAGE_SIZE
-                        } else {
-                            0
-                        };
-
-                        let buf_offset = if offset < copy_offset {
-                            copy_offset - offset
-                        } else {
-                            0
-                        };
-
-                        buf[buf_offset..buf_offset + copy_len].copy_from_slice(
-                            &page_buf[page_buf_offset..page_buf_offset + copy_len],
-                        );
-                    }
-
-                    return if let Some(e) = err {
-                        Err(e)
-                    } else {
-                        guard.update_metadata();
-                        Ok(len)
-                    };
+                    let r = page_cache.read(offset, buf, read_func);
+                    log::debug!("r:{r:?}");
+                    return r;
                 } else {
                     let r = f.read(
                         &guard.fs.upgrade().unwrap(),

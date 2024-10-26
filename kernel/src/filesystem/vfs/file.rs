@@ -204,6 +204,7 @@ impl PageCache {
         if len == 0 {
             return;
         }
+
         let mut guard = self.xarray.lock();
         let mut cursor = guard.cursor_mut(page_index as u64);
 
@@ -243,20 +244,27 @@ impl PageCache {
     ///
     /// - `usize` 成功读取的长度
     /// - `Vec<(usize, usize)>` 未成功读取的区间的起始页号和长度的集合
-    pub fn read(&self, offset: usize, buf: &mut [u8]) -> (usize, Vec<(usize, usize)>) {
+    pub fn read(
+        &self,
+        offset: usize,
+        buf: &mut [u8],
+        read_func: impl Fn(usize, &mut [u8]) -> Result<usize, SystemError>,
+    ) -> Result<usize, SystemError> {
         let mut not_exist = Vec::new();
         let len = buf.len();
+        log::debug!("offset:{offset}, len:{len}");
         if len == 0 {
-            return (0, not_exist);
+            return Ok(0);
         }
+
         let start_page_offset = offset >> MMArch::PAGE_SHIFT;
         let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_offset;
 
         let mut guard = self.xarray.lock();
         let mut cursor = guard.cursor_mut(start_page_offset as u64);
 
-        let mut byte_num = 0;
         let mut buf_offset = 0;
+        let mut ret = 0;
         for i in 0..page_num {
             // 第一个页可能需要计算页内偏移
             let page_offset = if i == 0 {
@@ -282,9 +290,8 @@ impl PageCache {
                 if let Ok(user_reader) =
                     UserBufferReader::new((vaddr.data() + page_offset) as *const u8, sub_len, false)
                 {
-                    if let Ok(size) = user_reader.copy_from_user(sub_buf, 0) {
-                        byte_num += size;
-                    }
+                    user_reader.copy_from_user(sub_buf, 0)?;
+                    ret += sub_len;
                 }
             } else if let Some((page_offset, count)) = not_exist.last_mut() {
                 if *page_offset + *count == start_page_offset + i {
@@ -299,7 +306,45 @@ impl PageCache {
             buf_offset += sub_len;
             cursor.next();
         }
-        (byte_num, not_exist)
+
+        drop(cursor);
+        drop(guard);
+
+        for (page_offset, count) in not_exist {
+            let mut page_buf = vec![0u8; MMArch::PAGE_SIZE * count];
+            read_func(page_offset * MMArch::PAGE_SIZE, page_buf.as_mut())?;
+
+            self.create_pages(page_offset, page_buf.as_mut());
+
+            // 实际要拷贝的内容在文件中的偏移量
+            let copy_offset = core::cmp::max(page_offset * MMArch::PAGE_SIZE, offset);
+            // 实际要拷贝的内容的长度
+            let copy_len = core::cmp::min((page_offset + count) * MMArch::PAGE_SIZE, offset + len)
+                - copy_offset;
+
+            let page_buf_offset = if page_offset * MMArch::PAGE_SIZE < copy_offset {
+                copy_offset - page_offset * MMArch::PAGE_SIZE
+            } else {
+                0
+            };
+
+            let buf_offset = if offset < copy_offset {
+                copy_offset - offset
+            } else {
+                0
+            };
+
+            buf[buf_offset..buf_offset + copy_len]
+                .copy_from_slice(&page_buf[page_buf_offset..page_buf_offset + copy_len]);
+
+            ret += copy_len;
+
+            // log::debug!("page_offset:{page_offset}, count:{count}");
+            // log::debug!("copy_offset:{copy_offset}, copy_len:{copy_len}");
+            // log::debug!("buf_offset:{buf_offset}, page_buf_offset:{page_buf_offset}");
+        }
+
+        Ok(ret)
     }
 
     /// 向PageCache中写入数据。

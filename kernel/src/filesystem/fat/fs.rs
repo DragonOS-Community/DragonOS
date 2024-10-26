@@ -1391,6 +1391,8 @@ impl IndexNode for LockedFATInode {
         buf: &mut [u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        let len = core::cmp::min(len, buf.len());
+        let buf = &mut buf[0..len];
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         match &guard.inode_type {
             FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
@@ -1448,6 +1450,8 @@ impl IndexNode for LockedFATInode {
         buf: &[u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        let len = core::cmp::min(len, buf.len());
+        let buf = &buf[0..len];
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let page_cache = guard.page_cache.clone();
         let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();

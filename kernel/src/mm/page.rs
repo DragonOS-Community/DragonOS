@@ -245,6 +245,7 @@ impl PageReclaimer {
                 };
             }
         }
+
         let inode = page
             .read_irqsave()
             .page_cache
@@ -255,16 +256,31 @@ impl PageReclaimer {
             .unwrap()
             .upgrade()
             .unwrap();
+
+        let len = if let Ok(metadata) = inode.metadata() {
+            let page_index = page.read_irqsave().index().unwrap();
+            let size = metadata.size as usize;
+            if size < page_index * MMArch::PAGE_SIZE {
+                0
+            } else {
+                size - page_index * MMArch::PAGE_SIZE
+            }
+        } else {
+            MMArch::PAGE_SIZE
+        };
+
+        // log::debug!("page writeback");
+
         inode
             .write_at(
-                page.read_irqsave().index().unwrap(),
-                MMArch::PAGE_SIZE,
+                page.read_irqsave().index().unwrap() * MMArch::PAGE_SIZE,
+                len,
                 unsafe {
                     core::slice::from_raw_parts(
                         MMArch::phys_2_virt(page.read_irqsave().phys_addr)
                             .unwrap()
                             .data() as *mut u8,
-                        MMArch::PAGE_SIZE,
+                        len,
                     )
                 },
                 SpinLock::new(FilePrivateData::Unused).lock(),

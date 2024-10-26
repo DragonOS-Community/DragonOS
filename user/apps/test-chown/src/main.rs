@@ -70,7 +70,6 @@ fn test_lchown(symlink_name: &str, new_uid: uid_t, new_gid: gid_t) -> Result<(),
 }
 
 fn main() -> Result<(), Error> {
-    create_false_file()?;
     mount_test_ramfs();
 
     let filename = "/mnt/myramfs/testfile.txt";
@@ -151,25 +150,11 @@ fn umount_test_ramfs() {
         let err = Errno::last();
         println!("Errno: {}", err);
         println!("Infomation: {}", err.desc());
+    } else {
+        // 删除mnt/myramfs
+        let path = Path::new("mnt/myramfs");
+        let _ = fs::remove_dir(path);
     }
     assert_eq!(result, 0, "Umount myramfs failed");
     println!("Umount myramfs for test success!");
-}
-
-fn create_false_file() -> io::Result<()> {
-    let path = Path::new("/bin/false");
-    if metadata(path).is_ok() {
-        return Ok(());
-    }
-
-    let mut file = File::create(path)?;
-
-    file.write_all(b"#!/bin/bash\nexit 1\n")?;
-
-    let mut permissions = file.metadata()?.permissions();
-    permissions.set_mode(0o755); // 设置权限为755
-    std::fs::set_permissions(path, permissions)?;
-
-    println!("File created successfully at {:?}", path);
-    Ok(())
 }

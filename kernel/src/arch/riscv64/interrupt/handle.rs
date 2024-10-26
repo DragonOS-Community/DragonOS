@@ -3,12 +3,12 @@
 //! 架构相关的处理逻辑参考： https://code.dragonos.org.cn/xref/linux-6.6.21/arch/riscv/kernel/traps.c
 use core::hint::spin_loop;
 
-use log::error;
+use log::{error, trace};
 use system_error::SystemError;
 
-use crate::{arch::syscall::syscall_handler, driver::irqchip::riscv_intc::riscv_intc_irq};
-
 use super::TrapFrame;
+use crate::exception::ebreak::EBreak;
+use crate::{arch::syscall::syscall_handler, driver::irqchip::riscv_intc::riscv_intc_irq};
 
 type ExceptionHandler = fn(&mut TrapFrame) -> Result<(), SystemError>;
 
@@ -93,11 +93,10 @@ fn do_trap_insn_illegal(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> 
 }
 
 /// 处理断点异常 #3
-fn do_trap_break(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    error!("riscv64_do_irq: do_trap_break");
-    loop {
-        spin_loop();
-    }
+fn do_trap_break(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    trace!("riscv64_do_irq: do_trap_break");
+    // handle breakpoint
+    EBreak::handle(trap_frame)
 }
 
 /// 处理加载地址不对齐异常 #4

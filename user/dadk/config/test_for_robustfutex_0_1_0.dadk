@@ -6,7 +6,7 @@
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "apps/test-for-robustfutex"
+        "path": "user/apps/test-for-robustfutex"
       }
     }
   },

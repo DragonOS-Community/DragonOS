@@ -6,7 +6,7 @@
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "apps/test_kvm"
+        "path": "user/apps/test_kvm"
       }
     }
   },

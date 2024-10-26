@@ -6,7 +6,7 @@
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "apps/riscv_init"
+        "path": "user/apps/riscv_init"
       }
     }
   },

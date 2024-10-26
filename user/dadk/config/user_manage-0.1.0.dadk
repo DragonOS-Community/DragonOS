@@ -5,7 +5,7 @@
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "apps/user-manage"
+        "path": "user/apps/user-manage"
       }
     }
   },

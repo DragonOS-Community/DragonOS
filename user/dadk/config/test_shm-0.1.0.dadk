@@ -5,7 +5,7 @@
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "apps/test_shm"
+        "path": "user/apps/test_shm"
       }
     }
   },

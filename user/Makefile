@@ -41,15 +41,12 @@ endif
 .PHONY: dadk_run
 dadk_run: install_dadk
 	mkdir -p $(DADK_CACHE_DIR)
-	dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot build
-	dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot install
+	dadk-insiders user build -w $(ROOT_PATH)
+	dadk-insiders user install -w $(ROOT_PATH)
 
 .PHONY: dadk_clean
 dadk_clean: install_dadk
 	@echo dadk_clean
-# 不运行dadk clean的原因是，把clean的工作交给应用程序自己去做，这样可以节省编译时间
-#dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot clean src
-#dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot clean target
 
 all:
 	mkdir -p $(ROOT_PATH)/bin/sysroot

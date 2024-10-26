@@ -6,7 +6,7 @@
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "apps/test-backlog"
+        "path": "user/apps/test-backlog"
       }
     }
   },

@@ -6,7 +6,7 @@
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "apps/test-blockcache"
+        "path": "user/apps/test-blockcache"
       }
     }
   },

@@ -5,7 +5,7 @@
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "apps/test_utimensat"
+        "path": "user/apps/test_utimensat"
       }
     }
   },

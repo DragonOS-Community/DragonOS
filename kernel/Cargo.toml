@@ -23,6 +23,7 @@ kvm = []
 
 fatfs = []
 fatfs-secure = ["fatfs"]
+driver_ps2_mouse = []
 
 # kprobe
 kprobe_test = []

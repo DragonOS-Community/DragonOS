@@ -1409,18 +1409,14 @@ impl IndexNode for LockedFATInode {
                     0
                 };
 
-                if len == 0 {
-                    return Ok(0);
-                }
-
-                let buf = &mut buf[0..len];
-
-                let read_func = |file_offset: usize, buf: &mut [u8]| {
-                    f.read(&guard.fs.upgrade().unwrap(), buf, file_offset as u64)
-                };
-
                 if let Some(page_cache) = &guard.page_cache {
-                    let r = page_cache.read(offset, buf, read_func);
+                    let r = page_cache.read(
+                        offset,
+                        &mut buf[0..len],
+                        |file_offset: usize, buf: &mut [u8]| {
+                            f.read(&guard.fs.upgrade().unwrap(), buf, file_offset as u64)
+                        },
+                    );
                     return r;
                 } else {
                     let r = f.read(

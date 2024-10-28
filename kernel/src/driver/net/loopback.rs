@@ -278,7 +278,7 @@ impl LoopbackInterface {
     pub fn new(mut driver: LoopbackDriver) -> Arc<Self> {
         let iface_id = generate_iface_id();
         let mut iface_config = smoltcp::iface::Config::new(HardwareAddress::Ethernet(
-            smoltcp::wire::EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
+            smoltcp::wire::EthernetAddress([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
         ));
         iface_config.random_seed = rand() as u64;
 
@@ -286,20 +286,14 @@ impl LoopbackInterface {
             smoltcp::iface::Interface::new(iface_config, &mut driver, Instant::now().into());
         //设置网卡地址为127.0.0.1
         iface.update_ip_addrs(|ip_addrs| {
-            for i in 1..=2 {
-                ip_addrs
-                    .push(IpCidr::new(IpAddress::v4(127, 0, 0, i), 8))
-                    .expect("Push ipCidr failed: full");
-            }
+            ip_addrs
+                .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
+                .expect("Push ipCidr failed: full");
         });
-
-        // iface.routes_mut().update(|routes_map| {
-        //     routes_map[0].
-        // });
 
         Arc::new(LoopbackInterface {
             driver: LoopbackDriverWapper(UnsafeCell::new(driver)),
-            common: IfaceCommon::new(iface_id, iface),
+            common: IfaceCommon::new(iface_id, false, iface),
             inner: SpinLock::new(InnerLoopbackInterface {
                 netdevice_common: NetDeviceCommonData::default(),
                 device_common: DeviceCommonData::default(),
@@ -506,8 +500,7 @@ pub fn loopback_driver_init() {
 }
 
 /// ## lo网卡设备的注册函数
-//TODO: 现在先不用初始化宏进行注册，使virtonet排在网卡列表头，待网络子系统重构后再使用初始化宏并修复该bug
-// #[unified_init(INITCALL_DEVICE)]
+#[unified_init(INITCALL_DEVICE)]
 pub fn loopback_init() -> Result<(), SystemError> {
     loopback_probe();
     log::debug!("Successfully init loopback device");

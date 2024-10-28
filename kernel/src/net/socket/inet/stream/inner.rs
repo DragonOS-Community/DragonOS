@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU32, AtomicUsize};
+use core::sync::atomic::AtomicUsize;
 
 use crate::libs::rwlock::RwLock;
 use crate::net::socket::EPollEventType;
@@ -8,9 +8,9 @@ use alloc::vec::Vec;
 use smoltcp;
 use system_error::SystemError::{self, *};
 
-use super::inet::UNSPECIFIED_LOCAL_ENDPOINT;
+use super::inet::UNSPECIFIED_LOCAL_ENDPOINT_V4;
 
-pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
+// pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
 pub const DEFAULT_RX_BUF_SIZE: usize = 512 * 1024;
 pub const DEFAULT_TX_BUF_SIZE: usize = 512 * 1024;
 
@@ -31,13 +31,13 @@ where
 
 #[derive(Debug)]
 pub enum Init {
-    Unbound(Box<smoltcp::socket::tcp::Socket<'static>>),
+    Unbound((Box<smoltcp::socket::tcp::Socket<'static>>, bool)),
     Bound((socket::inet::BoundInner, smoltcp::wire::IpEndpoint)),
 }
 
 impl Init {
-    pub(super) fn new() -> Self {
-        Init::Unbound(Box::new(new_smoltcp_socket()))
+    pub(super) fn new(v4: bool) -> Self {
+        Init::Unbound((Box::new(new_smoltcp_socket()), v4))
     }
 
     /// 传入一个已经绑定的socket
@@ -55,7 +55,7 @@ impl Init {
         local_endpoint: smoltcp::wire::IpEndpoint,
     ) -> Result<Self, SystemError> {
         match self {
-            Init::Unbound(socket) => {
+            Init::Unbound((socket, _)) => {
                 let bound = socket::inet::BoundInner::bind(*socket, &local_endpoint.addr)?;
                 bound
                     .port_manager()
@@ -63,7 +63,10 @@ impl Init {
                 // bound.iface().common().bind_socket()
                 Ok(Init::Bound((bound, local_endpoint)))
             }
-            Init::Bound(_) => Err(EINVAL),
+            Init::Bound(_) => {
+                log::debug!("Already Bound");
+                Err(EINVAL)
+            }
         }
     }
 
@@ -72,14 +75,14 @@ impl Init {
         remote_endpoint: smoltcp::wire::IpEndpoint,
     ) -> Result<(socket::inet::BoundInner, smoltcp::wire::IpEndpoint), (Self, SystemError)> {
         match self {
-            Init::Unbound(socket) => {
+            Init::Unbound((socket, v4)) => {
                 let (bound, address) =
                     socket::inet::BoundInner::bind_ephemeral(*socket, remote_endpoint.addr)
-                        .map_err(|err| (Self::new(), err))?;
+                        .map_err(|err| (Self::new(v4), err))?;
                 let bound_port = bound
                     .port_manager()
                     .bind_ephemeral_port(Types::Tcp)
-                    .map_err(|err| (Self::new(), err))?;
+                    .map_err(|err| (Self::new(v4), err))?;
                 let endpoint = smoltcp::wire::IpEndpoint::new(address, bound_port);
                 Ok((bound, endpoint))
             }
@@ -308,7 +311,8 @@ impl Listening {
             if let Some(name) = socket.local_endpoint() {
                 return name;
             } else {
-                return UNSPECIFIED_LOCAL_ENDPOINT;
+                // TODO: IPV6
+                return UNSPECIFIED_LOCAL_ENDPOINT_V4;
             }
         })
     }

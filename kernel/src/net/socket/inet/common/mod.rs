@@ -1,10 +1,12 @@
 use crate::net::{Iface, NET_DEVICES};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use system_error::SystemError::{self, *};
 
 pub mod port;
 pub use port::PortManager;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Types {
     Raw,
@@ -46,11 +48,26 @@ impl BoundInner {
             // }
             // 强绑VirtualIO
             // log::debug!("Not bind to any iface, bind to virtIO");
-            let iface = NET_DEVICES
+
+            let ifaces: Vec<Arc<dyn Iface>> = NET_DEVICES
                 .read_irqsave()
-                .get(&0)
-                .expect("??bind without virtIO, serious?")
-                .clone();
+                .iter()
+                .filter_map(|(_, v)| {
+                    if v.common().is_default_iface() {
+                        Some(v.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // let iface = NET_DEVICES
+            // .read_irqsave()
+            // .get(&0)
+            // .expect("??bind without virtIO, serious?")
+            // .clone();
+
+            let iface = ifaces[0].clone();
             let handle = iface.sockets().lock_no_preempt().add(socket);
             return Ok(Self { handle, iface });
         } else {

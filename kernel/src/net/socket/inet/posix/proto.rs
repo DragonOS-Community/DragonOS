@@ -1,4 +1,4 @@
-const SOL_SOCKET: u16 = 1;
+pub const SOL_SOCKET: u16 = 1;
 
 #[derive(Debug, Clone, Copy, FromPrimitive, ToPrimitive, PartialEq, Eq)]
 pub enum IPProtocol {

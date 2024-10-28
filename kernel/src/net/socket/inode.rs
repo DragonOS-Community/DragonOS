@@ -47,11 +47,7 @@ impl IndexNode for Inode {
         unimplemented!()
     }
 
-    fn poll(
-        &self,
-        private_data: &crate::filesystem::vfs::FilePrivateData,
-    ) -> Result<usize, SystemError> {
-        // let _ = private_data;
+    fn poll(&self, _: &crate::filesystem::vfs::FilePrivateData) -> Result<usize, SystemError> {
         Ok(self.inner.poll())
     }
 
@@ -103,18 +99,13 @@ impl Inode {
         self.inner.bind(endpoint)
     }
 
-    pub fn set_option(
-        &self,
-        level: OptionsLevel,
-        name: usize,
-        value: &[u8],
-    ) -> Result<(), SystemError> {
+    pub fn set_option(&self, level: PSOL, name: usize, value: &[u8]) -> Result<(), SystemError> {
         self.inner.set_option(level, name, value)
     }
 
     pub fn get_option(
         &self,
-        level: OptionsLevel,
+        level: PSOL,
         name: usize,
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
@@ -129,16 +120,16 @@ impl Inode {
         &self,
         buffer: &[u8],
         address: Endpoint,
-        flags: MessageFlag,
+        flags: PMSG,
     ) -> Result<usize, SystemError> {
         self.inner.send_to(buffer, flags, address)
     }
 
-    pub fn send(&self, buffer: &[u8], flags: MessageFlag) -> Result<usize, SystemError> {
+    pub fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError> {
         self.inner.send(buffer, flags)
     }
 
-    pub fn recv(&self, buffer: &mut [u8], flags: MessageFlag) -> Result<usize, SystemError> {
+    pub fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
         self.inner.recv(buffer, flags)
     }
 
@@ -146,7 +137,7 @@ impl Inode {
     pub fn recv_from(
         &self,
         buffer: &mut [u8],
-        flags: MessageFlag,
+        flags: PMSG,
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
         self.inner.recv_from(buffer, flags, address)
@@ -181,11 +172,11 @@ impl Inode {
         self.epoll_items.clone()
     }
 
-    pub fn set_nonblock(&self, nonblock: bool) {
+    pub fn set_nonblock(&self, _nonblock: bool) {
         log::warn!("nonblock is not support yet");
     }
 
-    pub fn set_close_on_exec(&self, close_on_exec: bool) {
+    pub fn set_close_on_exec(&self, _close_on_exec: bool) {
         log::warn!("close_on_exec is not support yet");
     }
 

@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use alloc::{string::String, sync::Arc};
+use alloc::sync::Arc;
 use system_error::SystemError;
 
 use crate::libs::spinlock::SpinLock;
@@ -75,6 +75,7 @@ impl Buffer {
 #[derive(Debug)]
 pub struct Metadata {
     /// 默认的元数据缓冲区大小
+    #[allow(dead_code)]
     metadata_buf_size: usize,
     /// 默认的缓冲区大小
     buf_size: usize,

@@ -9,7 +9,7 @@ use unified_init::macros::unified_init;
 use crate::{
     driver::base::{
         class::{class_manager, Class},
-        device::{device_manager, sys_dev_char_kset, CommonAttrGroup},
+        device::{device_manager, sys_dev_char_kset},
         kobject::KObject,
         subsys::SubSysPrivate,
     },
@@ -80,7 +80,7 @@ impl Class for RtcClass {
         return &self.subsystem;
     }
     fn dev_groups(&self) -> &'static [&'static dyn AttributeGroup] {
-        return &[&CommonAttrGroup];
+        return &[];
     }
 }
 

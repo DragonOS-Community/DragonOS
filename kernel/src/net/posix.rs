@@ -1,6 +1,10 @@
+//
+// posix.rs 记录了系统调用时用到的结构
+//
+
 bitflags::bitflags! {
     // #[derive(PartialEq, Eq, Debug, Clone, Copy)]
-    pub struct SysArgSocketType: u32 {
+    pub struct PosixArgsSocketType: u32 {
         const DGRAM     = 1;    // 0b0000_0001
         const STREAM    = 2;    // 0b0000_0010
         const RAW       = 3;    // 0b0000_0011
@@ -14,20 +18,20 @@ bitflags::bitflags! {
     }
 }
 
-impl SysArgSocketType {
+impl PosixArgsSocketType {
     #[inline(always)]
-    pub fn types(&self) -> SysArgSocketType {
-        SysArgSocketType::from_bits(self.bits() & 0b_1111).unwrap()
+    pub fn types(&self) -> PosixArgsSocketType {
+        PosixArgsSocketType::from_bits(self.bits() & 0b_1111).unwrap()
     }
 
     #[inline(always)]
     pub fn is_nonblock(&self) -> bool {
-        self.contains(SysArgSocketType::NONBLOCK)
+        self.contains(PosixArgsSocketType::NONBLOCK)
     }
 
     #[inline(always)]
     pub fn is_cloexec(&self) -> bool {
-        self.contains(SysArgSocketType::CLOEXEC)
+        self.contains(PosixArgsSocketType::CLOEXEC)
     }
 }
 
@@ -107,7 +111,6 @@ impl SockAddr {
         use crate::net::socket::AddressFamily;
 
         let addr = unsafe { addr.as_ref() }.ok_or(SystemError::EFAULT)?;
-
         unsafe {
             match AddressFamily::try_from(addr.family)? {
                 AddressFamily::INet => {
@@ -120,6 +123,22 @@ impl SockAddr {
 
                     use smoltcp::wire;
                     let ip: wire::IpAddress = wire::IpAddress::from(wire::Ipv4Address::from_bytes(
+                        &u32::from_be(addr_in.sin_addr).to_be_bytes()[..],
+                    ));
+                    let port = u16::from_be(addr_in.sin_port);
+
+                    return Ok(Endpoint::Ip(wire::IpEndpoint::new(ip, port)));
+                }
+                AddressFamily::INet6 => {
+                    if len < addr.len()? {
+                        log::error!("len < addr.len()");
+                        return Err(SystemError::EINVAL);
+                    }
+                    log::debug!("INet6");
+                    let addr_in: SockAddrIn = addr.addr_in;
+
+                    use smoltcp::wire;
+                    let ip: wire::IpAddress = wire::IpAddress::from(wire::Ipv6Address::from_bytes(
                         &u32::from_be(addr_in.sin_addr).to_be_bytes()[..],
                     ));
                     let port = u16::from_be(addr_in.sin_port);
@@ -219,11 +238,6 @@ impl SockAddr {
                     log::warn!("not support address family {:?}", addr.family);
                     return Err(SystemError::EINVAL);
                 }
-                AddressFamily::Netlink => {
-                    // TODO: support netlink socket
-                    let addr: SockAddrNl = addr.addr_nl;
-                    return Ok(Endpoint::Netlink(NetlinkEndpoint::new(addr)));
-                }
                 _ => {
                     log::warn!("not support address family {:?}", addr.family);
                     return Err(SystemError::EINVAL);
@@ -321,17 +335,6 @@ impl From<Endpoint> for SockAddr {
                 };
 
                 return SockAddr { addr_ll };
-            }
-
-            Endpoint::Netlink(netlink_endpoint) => {
-                let addr_nl = SockAddrNl {
-                    nl_family: AddressFamily::Netlink,
-                    nl_pad: 0,
-                    nl_pid: netlink_endpoint.addr.nl_pid,
-                    nl_groups: netlink_endpoint.addr.nl_groups,
-                };
-
-                return SockAddr { addr_nl };
             }
 
             Endpoint::Inode((_, path)) => {

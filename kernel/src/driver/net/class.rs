@@ -1,7 +1,7 @@
 use crate::{
     driver::base::{
         class::{class_manager, Class},
-        device::{sys_dev_char_kset, CommonAttrGroup},
+        device::sys_dev_char_kset,
         kobject::KObject,
         subsys::SubSysPrivate,
     },
@@ -78,6 +78,6 @@ impl Class for NetClass {
     }
 
     fn dev_groups(&self) -> &'static [&'static dyn AttributeGroup] {
-        return &[&NetAttrGroup, &CommonAttrGroup];
+        return &[&NetAttrGroup];
     }
 }

@@ -4,6 +4,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use core::sync::atomic::{AtomicBool, Ordering};
+use unix::ns::abs::{remove_abs_addr, ABS_INODE_MAP};
 
 use crate::sched::SchedMode;
 use crate::{libs::rwlock::RwLock, net::socket::*};
@@ -136,6 +137,23 @@ impl Socket for SeqpacketSocket {
                     _ => return Err(SystemError::EINVAL),
                 }
             }
+            Endpoint::Abspath((abs_addr, _)) => {
+                let inode_guard = ABS_INODE_MAP.lock_irqsave();
+                let inode = match inode_guard.get(&abs_addr.name()) {
+                    Some(inode) => inode,
+                    None => {
+                        log::debug!("can not find inode from absInodeMap");
+                        return Err(SystemError::EINVAL);
+                    }
+                };
+                match inode {
+                    Endpoint::Inode((inode, _)) => inode.clone(),
+                    _ => {
+                        log::debug!("when connect, find inode failed!");
+                        return Err(SystemError::EINVAL);
+                    }
+                }
+            }
             _ => return Err(SystemError::EINVAL),
         };
         // 远端为服务端
@@ -195,6 +213,17 @@ impl Socket for SeqpacketSocket {
                 };
 
                 INODE_MAP.write_irqsave().insert(inodeid, inode);
+                Ok(())
+            }
+            Endpoint::Abspath((abshandle, path)) => {
+                let inode = match &mut *self.inner.write() {
+                    Inner::Init(init) => init.bind_path(path)?,
+                    _ => {
+                        log::error!("socket has listen or connected");
+                        return Err(SystemError::EINVAL);
+                    }
+                };
+                ABS_INODE_MAP.lock_irqsave().insert(abshandle.name(), inode);
                 Ok(())
             }
             _ => return Err(SystemError::EINVAL),
@@ -260,7 +289,21 @@ impl Socket for SeqpacketSocket {
         // log::debug!("seqpacket close");
         self.shutdown.recv_shutdown();
         self.shutdown.send_shutdown();
-        Ok(())
+
+        let path = match self.get_name()? {
+            Endpoint::Inode((_, path)) => path,
+            _ => return Err(SystemError::EINVAL),
+        };
+
+        //如果path是空的说明没有bind，不用释放相关映射资源
+        if path.is_empty() {
+            return Ok(());
+        }
+        // TODO: 释放INODE_MAP相关资源
+
+        // 尝试释放相关抽象地址资源
+        let _ = remove_abs_addr(&path);
+        return Ok(());
     }
 
     fn get_peer_name(&self) -> Result<Endpoint, SystemError> {

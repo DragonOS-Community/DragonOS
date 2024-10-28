@@ -3,6 +3,8 @@ use alloc::{string::String, sync::Arc};
 
 pub use smoltcp::wire::IpEndpoint;
 
+use super::unix::ns::abs::AbsHandle;
+
 #[derive(Debug, Clone)]
 pub enum Endpoint {
     /// 链路层端点
@@ -13,6 +15,8 @@ pub enum Endpoint {
     Inode((Arc<socket::Inode>, String)),
     /// Unix传递id索引和path所用的端点
     Unixpath((InodeId, String)),
+    /// Unix抽象端点
+    Abspath((AbsHandle, String)),
 }
 
 /// @brief 链路层端点

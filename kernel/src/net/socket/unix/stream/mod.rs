@@ -6,7 +6,10 @@ use alloc::{
 use inner::{Connected, Init, Inner, Listener};
 use log::debug;
 use system_error::SystemError;
-use unix::INODE_MAP;
+use unix::{
+    ns::abs::{remove_abs_addr, ABSHANDLE_MAP, ABS_INODE_MAP},
+    INODE_MAP,
+};
 
 use crate::{
     libs::rwlock::RwLock,
@@ -157,6 +160,23 @@ impl Socket for StreamSocket {
                     _ => return Err(SystemError::EINVAL),
                 }
             }
+            Endpoint::Abspath((abs_addr, path)) => {
+                let inode_guard = ABS_INODE_MAP.lock_irqsave();
+                let inode = match inode_guard.get(&abs_addr.name()) {
+                    Some(inode) => inode,
+                    None => {
+                        log::debug!("can not find inode from absInodeMap");
+                        return Err(SystemError::EINVAL);
+                    }
+                };
+                match inode {
+                    Endpoint::Inode((inode, _)) => (inode.clone(), path),
+                    _ => {
+                        debug!("when connect, find inode failed!");
+                        return Err(SystemError::EINVAL);
+                    }
+                }
+            }
             _ => return Err(SystemError::EINVAL),
         };
 
@@ -198,6 +218,17 @@ impl Socket for StreamSocket {
                     }
                 };
                 INODE_MAP.write_irqsave().insert(inodeid, inode);
+                Ok(())
+            }
+            Endpoint::Abspath((abshandle, path)) => {
+                let inode = match &mut *self.inner.write() {
+                    Inner::Init(init) => init.bind_path(path)?,
+                    _ => {
+                        log::error!("socket has listen or connected");
+                        return Err(SystemError::EINVAL);
+                    }
+                };
+                ABS_INODE_MAP.lock_irqsave().insert(abshandle.name(), inode);
                 Ok(())
             }
             _ => return Err(SystemError::EINVAL),
@@ -290,7 +321,21 @@ impl Socket for StreamSocket {
     fn close(&self) -> Result<(), SystemError> {
         self.shutdown.recv_shutdown();
         self.shutdown.send_shutdown();
-        Ok(())
+
+        let path = match self.get_name()? {
+            Endpoint::Inode((_, path)) => path,
+            _ => return Err(SystemError::EINVAL),
+        };
+
+        //如果path是空的说明没有bind，不用释放相关映射资源
+        if path.is_empty() {
+            return Ok(());
+        }
+        // TODO: 释放INODE_MAP相关资源
+
+        // 尝试释放相关抽象地址资源
+        let _ = remove_abs_addr(&path);
+        return Ok(());
     }
 
     fn get_peer_name(&self) -> Result<Endpoint, SystemError> {

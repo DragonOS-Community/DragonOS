@@ -30,7 +30,11 @@ use crate::{
             kset::KSet,
         },
         virtio::{
-            sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager}, transport::VirtIOTransport, virtio_impl::HalImpl, VirtIODevice, VirtIODeviceIndex, VirtIODriver, VirtIODriverCommonData, VirtioDeviceId, VIRTIO_VENDOR_ID
+            sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
+            transport::VirtIOTransport,
+            virtio_impl::HalImpl,
+            VirtIODevice, VirtIODeviceIndex, VirtIODriver, VirtIODriverCommonData, VirtioDeviceId,
+            VIRTIO_VENDOR_ID,
         },
     },
     exception::{irqdesc::IrqReturn, IrqNumber},

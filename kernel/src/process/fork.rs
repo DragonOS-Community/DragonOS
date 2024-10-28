@@ -125,7 +125,7 @@ impl KernelCloneArgs {
             pidfd: null_addr,
             child_tid: null_addr,
             parent_tid: null_addr,
-            set_tid: vec![0; MAX_PID_NS_LEVEL],
+            set_tid: Vec::with_capacity(MAX_PID_NS_LEVEL),
             exit_signal: Signal::SIGCHLD,
             stack: 0,
             stack_size: 0,
@@ -476,14 +476,18 @@ impl ProcessManager {
                 current_pcb.pid(), pcb.pid(), e
             )
         });
-
-        if pcb.pid().0 != 0 {
+        log::debug!("this1");
+        log::debug!("pid: {:?}", pcb.pid());
+        if current_pcb.pid() != Pid(0) {
             let new_pid = PidStrcut::alloc_pid(
-                pcb.get_nsproxy().read().pid_namespace.clone().unwrap(), // 获取命名空间
+                pcb.get_nsproxy().read().pid_namespace.clone(), // 获取命名空间
                 clone_args.set_tid.clone(),
             )?;
+            log::debug!("this2");
             *pcb.thread_pid.write() = new_pid;
+            log::debug!("this3");
         }
+        log::debug!("this4");
 
         // 设置线程组id、组长
         if clone_flags.contains(CloneFlags::CLONE_THREAD) {

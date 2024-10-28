@@ -106,8 +106,8 @@ impl UidGidExtent {
     }
 }
 impl UserNamespace {
-    pub fn new() -> Result<Self, SystemError> {
-        Ok(Self {
+    pub fn new() -> Self {
+        Self {
             uid_map: UidGidMap::new(),
             gid_map: UidGidMap::new(),
             progid_map: UidGidMap::new(),
@@ -118,11 +118,11 @@ impl UserNamespace {
             parent: None,
             ns_common: Arc::new(NsCommon::new(Box::new(UserNsOperations::new(
                 "User".to_string(),
-            )))?),
+            )))),
             pid: Arc::new(RwLock::new(Pid::new(1))),
             ucount_max: vec![UCOUNT_MAX; Counts as usize],
             ucounts: None,
             rlimit_max: vec![65535, 10, 32000, 64 * 1024],
-        })
+        }
     }
 }

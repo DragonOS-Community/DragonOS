@@ -1,12 +1,12 @@
 {
-  "name": "test_namespace",
+  "name": "test_overlayfs",
   "version": "0.1.0",
-  "description": "test namespace",
+  "description": "test overlayfs",
   "rust_target": null,
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "apps/test_namespace"
+        "path": "apps/test_overlayfs"
       }
     }
   },

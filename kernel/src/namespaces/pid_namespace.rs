@@ -40,98 +40,89 @@ pub struct PidNamespace {
     /// 关联的用户namespace
     user_ns: Arc<UserNamespace>,
     /// 回收孤儿进程的init进程
-    child_reaper: Arc<RwLock<PidStrcut>>,
+    child_reaper: Arc<RwLock<Pid>>,
     /// namespace共有部分
     pub ns_common: Arc<NsCommon>,
 }
 #[derive(Debug, Clone)]
 pub struct PidStrcut {
-    pub pid: Pid,
     pub level: usize,
     pub numbers: Vec<UPid>,
     pub stashed: Arc<dyn IndexNode>,
 }
 #[derive(Debug, Clone)]
 pub struct UPid {
-    pub nr: Pid, // 在某个pid_namespace 中的pid号
+    pub nr: Pid, // 在该pid_namespace 中的pid
     pub ns: Arc<PidNamespace>,
 }
 
-impl UPid {
-    pub fn get_ns(&self) -> Arc<PidNamespace> {
-        self.ns.clone()
-    }
-}
-
-impl Default for PidStrcut {
-    fn default() -> Self {
-        Self {
-            pid: Pid::new(1),
-            level: 0,
-            numbers: Vec::new(),
-            stashed: ROOT_INODE(),
-        }
-    }
-}
 impl PidStrcut {
     pub fn new() -> Self {
         Self {
-            pid: Pid::new(1),
             level: 0,
-            numbers: Vec::new(),
+            numbers: vec![UPid {
+                nr: Pid::new(0),
+                ns: Arc::new(PidNamespace::new()),
+            }],
             stashed: ROOT_INODE(),
         }
     }
 
-    pub fn put_pid(pid: Pid) {}
-
     pub fn alloc_pid(ns: Arc<PidNamespace>, set_tid: Vec<usize>) -> Result<PidStrcut, SystemError> {
-        if set_tid.len() > ns.level + 1 {
+        log::debug!("ns.level: {:?},set_tid.len = {}", ns.level, set_tid.len());
+        let mut set_tid_size = set_tid.len();
+        if set_tid_size > ns.level + 1 {
             return Err(SystemError::EINVAL);
         }
-        let mut numbers = Vec::<UPid>::with_capacity(ns.level);
+
+        let mut numbers = Vec::<UPid>::with_capacity(ns.level + 1);
         let mut tid_iter = set_tid.into_iter().rev();
-        let mut pid_ns = Some(ns.clone());
+        let mut pid_ns = ns.clone(); // 当前正在处理的命名空间
+        log::debug!("rev");
         for i in (0..=ns.level).rev() {
             let tid = tid_iter.next().unwrap_or(0);
-            if tid < 1 || tid > INT16_MAX as usize {
-                return Err(SystemError::EINVAL);
-            }
-            let mut nr = tid;
-            if tid == 0 {
-                if let Some(ns) = pid_ns {
-                    nr = if ns.id_alloctor.read().get_max_id() > PID_MAX {
-                        PID_MAX
-                    } else {
-                        ns.id_alloctor
-                            .write()
-                            .alloc()
-                            .expect("No more id to allocate.")
-                    };
-                    pid_ns = ns.parent.clone();
-                } else {
+            if set_tid_size > 0 {
+                log::debug!("{}", tid);
+                if tid < 1 || tid > INT16_MAX as usize {
                     return Err(SystemError::EINVAL);
                 }
+                set_tid_size -= 1;
             }
+            let mut nr = tid;
+
+            if tid == 0 {
+                nr = pid_ns
+                    .id_alloctor
+                    .write()
+                    .alloc()
+                    .expect("PID allocation failed.");
+            }
+            log::debug!("success");
+
             numbers.insert(
                 i,
                 UPid {
                     nr: Pid::from(nr),
-                    ns: ns.clone(),
+                    ns: pid_ns.clone(),
                 },
             );
-        }
 
-        Ok(Self {
-            pid: numbers[0].nr,
+            if let Some(parent_ns) = &pid_ns.parent {
+                pid_ns = parent_ns.clone();
+            } else {
+                break; // 根命名空间，无需继续向上。
+            }
+        }
+        log::debug!("finish");
+        Ok(PidStrcut {
             level: ns.level,
             numbers,
             stashed: ROOT_INODE(),
         })
     }
 
-    pub fn pid_to_ns(&self) -> Arc<PidNamespace> {
-        self.numbers[self.level].get_ns()
+    pub fn ns_of_pid(&self) -> Arc<PidNamespace> {
+        self.numbers[self.level].ns.clone()
     }
 }
 #[derive(Debug)]
@@ -167,7 +158,7 @@ impl NsOperations for PidNsOperations {
     fn get_parent(&self, ns_common: Arc<NsCommon>) -> Result<Arc<NsCommon>, SystemError> {
         let current = ProcessManager::current_pid();
         let pcb = ProcessManager::find(current).unwrap();
-        let active = pcb.pid_strcut().read().pid_to_ns();
+        let active = pcb.pid_strcut().read().ns_of_pid();
         let mut pid_ns = &PidNamespace::ns_common_to_ns(ns_common).parent;
 
         while let Some(ns) = pid_ns {
@@ -181,19 +172,13 @@ impl NsOperations for PidNsOperations {
 
     fn get(&self, pid: Pid) -> Option<Arc<NsCommon>> {
         let pcb = ProcessManager::find(pid);
-        pcb.and_then(|pcb| {
-            pcb.get_nsproxy()
-                .read()
-                .pid_namespace
-                .clone()
-                .map(|ns| ns.ns_common.clone())
-        })
+        pcb.and_then(|pcb| Some(pcb.get_nsproxy().read().pid_namespace.ns_common.clone()))
     }
     fn install(&self, nsset: &mut NsSet, ns_common: Arc<NsCommon>) -> Result<(), SystemError> {
         let nsproxy = &mut nsset.nsproxy;
         let current = ProcessManager::current_pid();
         let pcb = ProcessManager::find(current).unwrap();
-        let active = pcb.pid_strcut().read().pid_to_ns();
+        let active = pcb.pid_strcut().read().ns_of_pid();
         let mut pid_ns = PidNamespace::ns_common_to_ns(ns_common);
         if pid_ns.level < active.level {
             return Err(SystemError::EINVAL);
@@ -208,32 +193,32 @@ impl NsOperations for PidNsOperations {
         if Arc::ptr_eq(&pid_ns, &active) {
             return Err(SystemError::EINVAL);
         }
-        nsproxy.pid_namespace = Some(pid_ns.clone());
+        nsproxy.pid_namespace = pid_ns.clone();
         Ok(())
     }
 }
 impl PidNamespace {
-    pub fn new() -> Result<Self, SystemError> {
-        Ok(Self {
+    pub fn new() -> Self {
+        Self {
             id_alloctor: RwLock::new(IdAllocator::new(1, PID_MAX).unwrap()),
-            pid_allocated: 0,
+            pid_allocated: 1,
             level: 0,
-            child_reaper: Arc::new(RwLock::new(PidStrcut::new())),
+            child_reaper: Arc::new(RwLock::new(Pid::from(1))),
             parent: None,
-            ucounts: Arc::new(UCounts::new()?),
-            user_ns: Arc::new(UserNamespace::new()?),
+            ucounts: Arc::new(UCounts::new()),
+            user_ns: Arc::new(UserNamespace::new()),
             ns_common: Arc::new(NsCommon::new(Box::new(PidNsOperations::new(
-                "Pid".to_string(),
-            )))?),
-        })
+                "pid".to_string(),
+            )))),
+        }
     }
 
     pub fn create_pid_namespace(
         &self,
-        parent: Option<Arc<PidNamespace>>,
+        parent: Arc<PidNamespace>,
         user_ns: Arc<UserNamespace>,
     ) -> Result<Self, SystemError> {
-        let level = parent.as_ref().map_or(0, |parent| parent.level + 1);
+        let level = parent.level + 1;
         if level > MAX_PID_NS_LEVEL {
             return Err(ENOSPC);
         }
@@ -246,18 +231,14 @@ impl PidNamespace {
 
         let ns_common = Arc::new(NsCommon::new(Box::new(PidNsOperations::new(
             "pid".to_string(),
-        )))?);
-        let child_reaper = if let Some(parent_ns) = &parent {
-            parent_ns.child_reaper.clone()
-        } else {
-            Arc::new(RwLock::new(PidStrcut::new()))
-        };
+        ))));
+        let child_reaper = parent.child_reaper.clone();
         Ok(Self {
             id_alloctor: RwLock::new(IdAllocator::new(1, PID_MAX).unwrap()),
             pid_allocated: PIDNS_ADDING,
             level,
             ucounts,
-            parent,
+            parent: Some(parent),
             user_ns,
             ns_common,
             child_reaper,

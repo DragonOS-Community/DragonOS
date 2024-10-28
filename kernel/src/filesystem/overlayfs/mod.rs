@@ -1,9 +1,12 @@
 #![allow(dead_code, unused_variables, unused_imports)]
 pub mod copy_up;
 pub mod entry;
+use super::ramfs::{LockedRamFSInode, RamFSInode};
+use super::vfs::FSMAKER;
 use super::vfs::{self, FileSystem, FileType, FsInfo, IndexNode, SuperBlock};
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::driver::base::device::device_number::Major;
+use crate::filesystem::vfs::{FileSystemMaker, FileSystemMakerData};
 use crate::libs::spinlock::SpinLock;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -16,6 +19,25 @@ const WHITEOUT_MODE: u64 = 0o020000 | 0o600; // whiteout字符设备文件模式
 const WHITEOUT_DEV: DeviceNumber = DeviceNumber::new(Major::UNNAMED_MAJOR, 0); // Whiteout 文件设备号
 const WHITEOUT_FLAG: u64 = 0x1;
 
+#[distributed_slice(FSMAKER)]
+static OVERLAYFSMAKER: FileSystemMaker = FileSystemMaker::new(
+    "overlayfs",
+    &(OverlayFS::make_overlayfs
+        as fn(
+            Option<&dyn FileSystemMakerData>,
+        ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
+);
+
+pub struct OverlayMountData {
+    upper_dir: String,
+    lower_dirs: Vec<String>,
+    work_dir: String,
+}
+impl FileSystemMakerData for OverlayMountData {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
 #[derive(Debug)]
 pub struct OvlSuperBlock {
     super_block: SuperBlock,
@@ -25,13 +47,12 @@ pub struct OvlSuperBlock {
 
 #[derive(Debug)]
 struct OverlayFS {
-    numlayer: u32,
+    numlayer: usize,
     numfs: u32,
-    numdatalayer: u32,
+    numdatalayer: usize,
     layers: Vec<OvlLayer>, // 第0层为读写层，后面是只读层
-    workbasedir: Arc<dyn IndexNode>,
-    workdir: Arc<dyn IndexNode>,
-    root_inode: Arc<dyn IndexNode>,
+    workdir: Arc<OvlInode>,
+    root_inode: Arc<OvlInode>,
 }
 
 #[derive(Debug)]
@@ -43,6 +64,23 @@ struct OvlInode {
     lower_inode: Option<Arc<dyn IndexNode>>,           // 只读层
     oe: Arc<OvlEntry>,
     fs: Weak<OverlayFS>,
+}
+impl OvlInode {
+    pub fn new(
+        redirect: String,
+        upper: Option<Arc<dyn IndexNode>>,
+        lower_inode: Option<Arc<dyn IndexNode>>,
+    ) -> Self {
+        Self {
+            redirect,
+            file_type: FileType::Dir,
+            flags: SpinLock::new(0),
+            upper_inode: SpinLock::new(upper),
+            lower_inode,
+            oe: Arc::new(OvlEntry::new()),
+            fs: Weak::default(),
+        }
+    }
 }
 
 impl FileSystem for OverlayFS {
@@ -71,13 +109,73 @@ impl FileSystem for OverlayFS {
 }
 
 impl OverlayFS {
+    pub fn new(
+        upper: OvlLayer,
+        lowers: Vec<OvlLayer>,
+        workdir: Arc<OvlInode>,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        if lowers.is_empty() {
+            return Err(SystemError::EINVAL);
+        }
+        let numdatalayer = lowers.len();
+        let mut layers = Vec::new();
+        layers.push(upper);
+        layers.extend(lowers);
+
+        let root_inode = layers[0].mnt.clone();
+        let fs = OverlayFS {
+            numlayer: layers.len(),
+            numfs: 1,
+            numdatalayer,
+            layers,
+            workdir,
+            root_inode,
+        };
+
+        Ok(Arc::new(fs))
+    }
+
     pub fn ovl_upper_mnt(&self) -> Arc<dyn IndexNode> {
         self.layers[0].mnt.clone()
+    }
+    pub fn make_overlayfs(
+        data: Option<&dyn FileSystemMakerData>,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        let mount_data = data
+            .and_then(|d| d.as_any().downcast_ref::<OverlayMountData>())
+            .ok_or(SystemError::EINVAL)?;
+        let upper_layer = OvlLayer {
+            mnt: Arc::new(OvlInode::new(
+                mount_data.upper_dir.clone(),
+                Some(Arc::new(LockedRamFSInode(SpinLock::new(RamFSInode::new())))),
+                None,
+            )),
+            index: 0,
+            fsid: 0,
+        };
+
+        let lower_layers: Vec<OvlLayer> = mount_data
+            .lower_dirs
+            .iter()
+            .enumerate()
+            .map(|(i, dir)| OvlLayer {
+                mnt: Arc::new(OvlInode::new(
+                    dir.clone(),
+                    None,
+                    Some(Arc::new(LockedRamFSInode(SpinLock::new(RamFSInode::new())))),
+                )),
+                index: (i + 1) as u32,
+                fsid: (i + 1) as u32,
+            })
+            .collect();
+
+        let workdir = Arc::new(OvlInode::new(mount_data.work_dir.clone(), None, None));
+
+        OverlayFS::new(upper_layer, lower_layers, workdir)
     }
 }
 
 impl OvlInode {
-    // 返回常规文件相关联的重定向路径
     pub fn ovl_lower_redirect(&self) -> Option<&str> {
         if self.file_type == FileType::File || self.file_type == FileType::Dir {
             Some(&self.redirect)

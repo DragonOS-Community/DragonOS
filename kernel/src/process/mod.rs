@@ -50,7 +50,7 @@ use crate::{
         ucontext::AddressSpace,
         VirtAddr,
     },
-    namespaces::{pid_namespace::PidStrcut, NsProxy},
+    namespaces::{mnt_namespace::FsStruct, pid_namespace::PidStrcut, NsProxy},
     net::socket::SocketInode,
     sched::{
         completion::Completion, cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO, DequeueFlag,
@@ -645,6 +645,9 @@ pub struct ProcessControlBlock {
     /// 线程信息
     thread: RwLock<ThreadInfo>,
 
+    /// 进程文件系统的状态
+    fs: Arc<SpinLock<FsStruct>>,
+
     ///闹钟定时器
     alarm_timer: SpinLock<Option<AlarmTimer>>,
 
@@ -716,11 +719,10 @@ impl ProcessControlBlock {
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find(ppid)
             .map(|p| Arc::downgrade(&p))
             .unwrap_or_default();
-        let pid_strcut = PidStrcut::new();
         let pcb = Self {
             pid,
             tgid: pid,
-            thread_pid: Arc::new(RwLock::new(pid_strcut)),
+            thread_pid: Arc::new(RwLock::new(PidStrcut::new())),
             basic: basic_info,
             preempt_count,
             flags,
@@ -737,9 +739,10 @@ impl ProcessControlBlock {
             children: RwLock::new(Vec::new()),
             wait_queue: WaitQueue::default(),
             thread: RwLock::new(ThreadInfo::new()),
+            fs: Arc::new(SpinLock::new(FsStruct::new())),
             alarm_timer: SpinLock::new(None),
             robust_list: RwLock::new(None),
-            nsproxy: Arc::new(RwLock::new(NsProxy::default())),
+            nsproxy: Arc::new(RwLock::new(NsProxy::new())),
             cred: SpinLock::new(cred),
         };
 
@@ -890,6 +893,11 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn tgid(&self) -> Pid {
         return self.tgid;
+    }
+
+    #[inline(always)]
+    pub fn fs_struct(&self) -> Arc<SpinLock<FsStruct>> {
+        self.fs.clone()
     }
 
     /// 获取文件描述符表的Arc指针

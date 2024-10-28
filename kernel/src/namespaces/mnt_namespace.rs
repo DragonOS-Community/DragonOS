@@ -55,15 +55,21 @@ struct MntNsOperations {
 }
 
 /// 使用该结构体的时候加spinlock
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FsStruct {
-    umask: u32,   //文件权限掩码
-    in_exec: u32, // 是否正在执行exec
-    root: Arc<dyn IndexNode>,
-    pwd: Arc<dyn IndexNode>,
+    umask: u32, //文件权限掩码
+    pub root: Arc<dyn IndexNode>,
+    pub pwd: Arc<dyn IndexNode>,
 }
 
 impl FsStruct {
+    pub fn new() -> Self {
+        Self {
+            umask: 0o22,
+            root: ROOT_INODE(),
+            pwd: ROOT_INODE(),
+        }
+    }
     pub fn set_root(&mut self, inode: Arc<dyn IndexNode>) {
         self.root = inode;
     }
@@ -91,13 +97,7 @@ impl MntNsOperations {
 impl NsOperations for MntNsOperations {
     fn get(&self, pid: crate::process::Pid) -> Option<Arc<NsCommon>> {
         let pcb = ProcessManager::find(pid);
-        pcb.and_then(|pcb| {
-            pcb.get_nsproxy()
-                .read()
-                .mnt_namespace
-                .clone()
-                .map(|ns| ns.ns_common.clone())
-        })
+        pcb.map(|pcb| pcb.get_nsproxy().read().mnt_namespace.ns_common.clone())
     }
     // 不存在这个方法
     fn get_parent(&self, _ns_common: Arc<NsCommon>) -> Result<Arc<NsCommon>, SystemError> {
@@ -113,7 +113,7 @@ impl NsOperations for MntNsOperations {
         if mnt_ns.is_anon_ns() {
             return Err(SystemError::EINVAL);
         }
-        nsproxy.mnt_namespace = Some(mnt_ns);
+        nsproxy.mnt_namespace = mnt_ns;
 
         nsset.fs.lock().set_pwd(ROOT_INODE());
         nsset.fs.lock().set_root(ROOT_INODE());
@@ -128,22 +128,22 @@ impl NsOperations for MntNsOperations {
     }
 }
 impl MntNamespace {
-    pub fn new() -> Result<Self, SystemError> {
+    pub fn new() -> Self {
         let ns_common = Arc::new(NsCommon::new(Box::new(MntNsOperations::new(
             "mnt".to_string(),
-        )))?);
+        ))));
 
-        Ok(Self {
+        Self {
             ns_common,
-            user_ns: Arc::new(UserNamespace::new()?),
-            ucounts: Arc::new(UCounts::new()?),
+            user_ns: Arc::new(UserNamespace::new()),
+            ucounts: Arc::new(UCounts::new()),
             root: None,
             mounts: RBTree::new(),
             poll: WaitQueue::default(),
             seq: AtomicU64::new(0),
             nr_mounts: 0,
             pending_mounts: 0,
-        })
+        }
     }
     /// anon 用来判断是否是匿名的.匿名函数的问题还需要考虑
     pub fn create_mnt_namespace(
@@ -158,7 +158,7 @@ impl MntNamespace {
         let ucounts = ucounts.unwrap();
         let ns_common = Arc::new(NsCommon::new(Box::new(MntNsOperations::new(
             "mnt".to_string(),
-        )))?);
+        ))));
         let seq = AtomicU64::new(0);
         if !anon {
             seq.fetch_add(1, core::sync::atomic::Ordering::SeqCst);

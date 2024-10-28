@@ -1,8 +1,7 @@
 extern crate nix;
 use nix::sched::{self, CloneFlags};
 use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::{self, execvp, fork, ForkResult};
-use std::ffi::CString;
+use nix::unistd::{self, fork, ForkResult};
 use std::process;
 
 fn main() {

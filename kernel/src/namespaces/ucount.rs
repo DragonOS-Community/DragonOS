@@ -47,9 +47,9 @@ pub struct UCounts {
 }
 
 impl UCounts {
-    pub fn new() -> Result<Self, SystemError> {
-        Ok(Self {
-            ns: Arc::new(UserNamespace::new()?),
+    pub fn new() -> Self {
+        Self {
+            ns: Arc::new(UserNamespace::new()),
             uid: 0,
             count: AtomicU32::new(1),
             ucount: (0..Ucount::Counts as usize)
@@ -58,7 +58,7 @@ impl UCounts {
             rlimit: (0..UcountRlimit::Counts as usize)
                 .map(|_| AtomicU32::new(0))
                 .collect(),
-        })
+        }
     }
 
     fn alloc_ucounts(&self, ns: Arc<UserNamespace>, uid: usize) -> Arc<Self> {

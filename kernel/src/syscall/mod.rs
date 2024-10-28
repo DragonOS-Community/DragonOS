@@ -1,6 +1,5 @@
 use core::{
     ffi::{c_int, c_void},
-    ptr::null,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -1045,7 +1044,8 @@ impl Syscall {
                 let source = args[0] as *const u8;
                 let target = args[1] as *const u8;
                 let filesystemtype = args[2] as *const u8;
-                return Self::mount(source, target, filesystemtype, 0, null());
+                let data = args[3] as *const u8; // 额外的mount参数，实现自己的mountdata来获取
+                return Self::mount(source, target, filesystemtype, 0, data);
             }
 
             SYS_UMOUNT2 => {

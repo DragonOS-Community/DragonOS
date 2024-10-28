@@ -5,7 +5,9 @@ use crate::{
     syscall::Syscall,
 };
 
-use super::{create_new_namespaces, namespace::USER_NS, NsProxy};
+use super::namespace::{
+    check_unshare_flags, commit_nsset, prepare_nsset, unshare_nsproxy_namespaces,
+};
 
 impl Syscall {
     pub fn sys_unshare(mut unshare_flags: u64) -> Result<usize, SystemError> {
@@ -25,52 +27,24 @@ impl Syscall {
             unshare_flags |= CloneFlags::CLONE_FS.bits();
         }
 
-        let check = Self::check_unshare_flags(unshare_flags)?;
+        let check = check_unshare_flags(unshare_flags)?;
 
         let current = ProcessManager::current_pcb();
-        if let Some(nsproxy) = Self::unshare_nsproxy_namespaces(unshare_flags)? {
+        if let Some(nsproxy) = unshare_nsproxy_namespaces(unshare_flags)? {
             *current.get_nsproxy().write() = nsproxy;
         }
 
         Ok(check)
     }
 
-    fn check_unshare_flags(unshare_flags: u64) -> Result<usize, SystemError> {
-        let valid_flags = CloneFlags::CLONE_THREAD
-            | CloneFlags::CLONE_FS
-            | CloneFlags::CLONE_NEWNS
-            | CloneFlags::CLONE_SIGHAND
-            | CloneFlags::CLONE_VM
-            | CloneFlags::CLONE_FILES
-            | CloneFlags::CLONE_SYSVSEM
-            | CloneFlags::CLONE_NEWUTS
-            | CloneFlags::CLONE_NEWIPC
-            | CloneFlags::CLONE_NEWNET
-            | CloneFlags::CLONE_NEWUSER
-            | CloneFlags::CLONE_NEWPID
-            | CloneFlags::CLONE_NEWCGROUP;
+    pub fn sys_setns(_fd: i32, flags: u64) -> Result<usize, SystemError> {
+        let check = check_unshare_flags(flags)?;
 
-        if unshare_flags & !valid_flags.bits() != 0 {
-            return Err(SystemError::EINVAL);
-        }
+        let nsset = prepare_nsset(flags)?;
+
+        if check == 0 {
+            commit_nsset(nsset)
+        };
         Ok(0)
-    }
-
-    fn unshare_nsproxy_namespaces(unshare_flags: u64) -> Result<Option<NsProxy>, SystemError> {
-        if (unshare_flags
-            & (CloneFlags::CLONE_NEWNS.bits()
-                | CloneFlags::CLONE_NEWUTS.bits()
-                | CloneFlags::CLONE_NEWIPC.bits()
-                | CloneFlags::CLONE_NEWNET.bits()
-                | CloneFlags::CLONE_NEWPID.bits()
-                | CloneFlags::CLONE_NEWCGROUP.bits()))
-            == 0
-        {
-            return Ok(None);
-        }
-        let current = ProcessManager::current_pid();
-        let pcb = ProcessManager::find(current).unwrap();
-        let new_nsproxy = create_new_namespaces(unshare_flags, &pcb, USER_NS.clone())?;
-        Ok(Some(new_nsproxy))
     }
 }

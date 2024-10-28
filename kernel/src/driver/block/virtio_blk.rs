@@ -163,8 +163,14 @@ unsafe impl Sync for VirtIOBlkDevice {}
 
 impl VirtIOBlkDevice {
     pub fn new(transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {
+        // 设置中断
+        if let Err(err) = transport.setup_irq(dev_id.clone()) {
+            error!("VirtIOBlkDevice '{dev_id:?}' setup_irq failed: {:?}", err);
+            return None;
+        }
+
         let devname = virtioblk_manager().alloc_id()?;
-        let irq = transport.irq().map(|irq| IrqNumber::new(irq.data()));
+        let irq = Some(transport.irq());
         let device_inner = VirtIOBlk::<HalImpl, VirtIOTransport>::new(transport);
         if let Err(e) = device_inner {
             error!("VirtIOBlkDevice '{dev_id:?}' create failed: {:?}", e);

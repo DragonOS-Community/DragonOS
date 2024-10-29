@@ -476,19 +476,13 @@ impl ProcessManager {
                 current_pcb.pid(), pcb.pid(), e
             )
         });
-        log::debug!("this1");
-        log::debug!("pid: {:?}", pcb.pid());
         if current_pcb.pid() != Pid(0) {
             let new_pid = PidStrcut::alloc_pid(
                 pcb.get_nsproxy().read().pid_namespace.clone(), // 获取命名空间
                 clone_args.set_tid.clone(),
             )?;
-            log::debug!("this2");
             *pcb.thread_pid.write() = new_pid;
-            log::debug!("this3");
         }
-        log::debug!("this4");
-
         // 设置线程组id、组长
         if clone_flags.contains(CloneFlags::CLONE_THREAD) {
             pcb.thread.write_irqsave().group_leader =

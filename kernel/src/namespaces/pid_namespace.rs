@@ -68,8 +68,12 @@ impl PidStrcut {
         }
     }
 
+    pub fn put_pid(pid: PidStrcut) {
+        let ns = pid.numbers[pid.level].ns.clone();
+        let id = pid.numbers[pid.level].nr.data();
+        ns.id_alloctor.write().free(id);
+    }
     pub fn alloc_pid(ns: Arc<PidNamespace>, set_tid: Vec<usize>) -> Result<PidStrcut, SystemError> {
-        log::debug!("ns.level: {:?},set_tid.len = {}", ns.level, set_tid.len());
         let mut set_tid_size = set_tid.len();
         if set_tid_size > ns.level + 1 {
             return Err(SystemError::EINVAL);
@@ -78,11 +82,9 @@ impl PidStrcut {
         let mut numbers = Vec::<UPid>::with_capacity(ns.level + 1);
         let mut tid_iter = set_tid.into_iter().rev();
         let mut pid_ns = ns.clone(); // 当前正在处理的命名空间
-        log::debug!("rev");
         for i in (0..=ns.level).rev() {
             let tid = tid_iter.next().unwrap_or(0);
             if set_tid_size > 0 {
-                log::debug!("{}", tid);
                 if tid < 1 || tid > INT16_MAX as usize {
                     return Err(SystemError::EINVAL);
                 }
@@ -97,7 +99,6 @@ impl PidStrcut {
                     .alloc()
                     .expect("PID allocation failed.");
             }
-            log::debug!("success");
 
             numbers.insert(
                 i,
@@ -113,7 +114,6 @@ impl PidStrcut {
                 break; // 根命名空间，无需继续向上。
             }
         }
-        log::debug!("finish");
         Ok(PidStrcut {
             level: ns.level,
             numbers,

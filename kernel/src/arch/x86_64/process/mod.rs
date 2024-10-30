@@ -299,7 +299,7 @@ impl ProcessManager {
     pub fn copy_thread(
         current_pcb: &Arc<ProcessControlBlock>,
         new_pcb: &Arc<ProcessControlBlock>,
-        clone_args: KernelCloneArgs,
+        clone_args: &KernelCloneArgs,
         current_trapframe: &TrapFrame,
     ) -> Result<(), SystemError> {
         let clone_flags = clone_args.flags;

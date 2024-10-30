@@ -935,12 +935,20 @@ impl FileSystemMaker {
         FileSystemMaker { function, name }
     }
 
-    pub fn call(&self) -> Result<Arc<dyn FileSystem>, SystemError> {
-        (self.function)()
+    pub fn call(
+        &self,
+        data: Option<&dyn FileSystemMakerData>,
+    ) -> Result<Arc<dyn FileSystem>, SystemError> {
+        (self.function)(data)
     }
 }
 
-pub type FileSystemNewFunction = fn() -> Result<Arc<dyn FileSystem>, SystemError>;
+pub trait FileSystemMakerData: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+}
+
+pub type FileSystemNewFunction =
+    fn(data: Option<&dyn FileSystemMakerData>) -> Result<Arc<dyn FileSystem>, SystemError>;
 
 #[macro_export]
 macro_rules! define_filesystem_maker_slice {
@@ -956,9 +964,18 @@ macro_rules! define_filesystem_maker_slice {
 /// 调用指定数组中的所有初始化器
 #[macro_export]
 macro_rules! producefs {
-    ($initializer_slice:ident,$filesystem:ident) => {
+    ($initializer_slice:ident,$filesystem:ident,$raw_data : ident) => {
         match $initializer_slice.iter().find(|&m| m.name == $filesystem) {
-            Some(maker) => maker.call(),
+            Some(maker) => {
+                let mount_data = match $filesystem {
+                    "overlay" => OverlayMountData::from_row($raw_data).ok(),
+                    _ => None,
+                };
+                let data: Option<&dyn FileSystemMakerData> =
+                    mount_data.as_ref().map(|d| d as &dyn FileSystemMakerData);
+
+                maker.call(data)
+            }
             None => {
                 log::error!("mismatch filesystem type : {}", $filesystem);
                 Err(SystemError::EINVAL)

@@ -21,6 +21,7 @@
 #![feature(slice_ptr_get)]
 #![feature(sync_unsafe_cell)]
 #![feature(vec_into_raw_parts)]
+#![feature(c_variadic)]
 #![cfg_attr(target_os = "none", no_std)]
 #![allow(internal_features)]
 // clippy的配置
@@ -46,6 +47,7 @@ mod arch;
 mod libs;
 #[macro_use]
 mod include;
+mod bpf;
 mod cgroup;
 mod debug;
 mod driver; // 如果driver依赖了libs，应该在libs后面导出
@@ -57,12 +59,12 @@ mod misc;
 mod mm;
 mod namespaces;
 mod net;
+mod perf;
 mod process;
 mod sched;
 mod smp;
 mod syscall;
 mod time;
-
 #[cfg(target_arch = "x86_64")]
 mod virt;
 
@@ -83,7 +85,8 @@ extern crate smoltcp;
 extern crate intertrait;
 #[cfg(target_arch = "x86_64")]
 extern crate x86;
-
+#[macro_use]
+extern crate kcmdline_macros;
 extern crate klog_types;
 extern crate uefi;
 extern crate uefi_raw;

@@ -33,6 +33,8 @@ fi
 
 INSTALL_POS="$HOME/opt/"
 
+mkdir -p $INSTALL_POS
+
 get_shell_rc_file()
 {
     if [ -n "$ZSH_VERSION" ]; then

@@ -21,11 +21,14 @@ use crate::{
     time::{syscall::PosixTimeval, PosixTimeSpec},
 };
 
+use super::core::do_symlinkat;
 use super::{
     core::{do_mkdir_at, do_remove_dir, do_unlink_at},
     fcntl::{AtFlags, FcntlCommand, FD_CLOEXEC},
     file::{File, FileMode},
-    open::{do_faccessat, do_fchmodat, do_sys_open, do_utimensat, do_utimes},
+    open::{
+        do_faccessat, do_fchmodat, do_fchownat, do_sys_open, do_utimensat, do_utimes, ksys_fchown,
+    },
     utils::{rsplit_path, user_path_at},
     Dirent, FileType, IndexNode, SuperBlock, FSMAKER, MAX_PATHLEN, ROOT_INODE,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
@@ -808,6 +811,14 @@ impl Syscall {
         return Ok(0);
     }
 
+    pub fn mkdir_at(dirfd: i32, path: *const u8, mode: usize) -> Result<usize, SystemError> {
+        let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
+        do_mkdir_at(dirfd, &path, FileMode::from_bits_truncate(mode as u32))?;
+        return Ok(0);
+    }
+
     /// **创建硬连接的系统调用**
     ///    
     /// ## 参数
@@ -971,6 +982,18 @@ impl Syscall {
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         return do_unlink_at(AtFlags::AT_FDCWD.bits(), &path).map(|v| v as usize);
+    }
+
+    pub fn symlink(oldname: *const u8, newname: *const u8) -> Result<usize, SystemError> {
+        return do_symlinkat(oldname, AtFlags::AT_FDCWD.bits(), newname);
+    }
+
+    pub fn symlinkat(
+        oldname: *const u8,
+        newdfd: i32,
+        newname: *const u8,
+    ) -> Result<usize, SystemError> {
+        return do_symlinkat(oldname, newdfd, newname);
     }
 
     /// # 修改文件名
@@ -1618,6 +1641,52 @@ impl Syscall {
         warn!("fchmod not fully implemented");
         return Ok(0);
     }
+
+    pub fn chown(pathname: *const u8, uid: usize, gid: usize) -> Result<usize, SystemError> {
+        let pathname = user_access::check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
+        return do_fchownat(
+            AtFlags::AT_FDCWD.bits(),
+            &pathname,
+            uid,
+            gid,
+            AtFlags::AT_STATX_SYNC_AS_STAT,
+        );
+    }
+
+    pub fn lchown(pathname: *const u8, uid: usize, gid: usize) -> Result<usize, SystemError> {
+        let pathname = user_access::check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
+        return do_fchownat(
+            AtFlags::AT_FDCWD.bits(),
+            &pathname,
+            uid,
+            gid,
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        );
+    }
+
+    pub fn fchownat(
+        dirfd: i32,
+        pathname: *const u8,
+        uid: usize,
+        gid: usize,
+        flags: i32,
+    ) -> Result<usize, SystemError> {
+        let pathname = user_access::check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
+        let pathname = pathname.as_str().trim();
+        let flags = AtFlags::from_bits_truncate(flags);
+        return do_fchownat(dirfd, pathname, uid, gid, flags);
+    }
+
+    pub fn fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError> {
+        return ksys_fchown(fd, uid, gid);
+    }
+
     /// #挂载文件系统
     ///
     /// 用于挂载文件系统,目前仅支持ramfs挂载

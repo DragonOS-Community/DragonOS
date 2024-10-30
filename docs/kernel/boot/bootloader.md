@@ -3,6 +3,11 @@
 ## X86_64
 
 - [x] multiboot2
+- [x] HVM/PVH
+
+### x86_64下的HVM/PVH启动
+
+在DragonOS的note段，有一段PVH header，允许qemu使用`-kernel`参数启动DragonOS内核。
 
 ## RISC-V 64
 

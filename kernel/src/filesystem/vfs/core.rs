@@ -5,16 +5,20 @@ use log::{error, info};
 use system_error::SystemError;
 
 use crate::{
-    driver::base::block::manager::block_dev_manager,
+    driver::base::block::{gendisk::GenDisk, manager::block_dev_manager},
     filesystem::{
         devfs::devfs_init,
         fat::fs::FATFileSystem,
         procfs::procfs_init,
         ramfs::RamFS,
         sysfs::sysfs_init,
-        vfs::{mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType},
+        vfs::{
+            mount::MountFS, syscall::ModeType, AtomicInodeId, FileSystem, FileType, MAX_PATHLEN,
+        },
     },
+    libs::spinlock::SpinLock,
     process::ProcessManager,
+    syscall::user_access::check_and_clone_cstr,
 };
 
 use super::{
@@ -23,11 +27,12 @@ use super::{
     mount::{init_mountlist, MOUNT_LIST},
     syscall::UmountFlag,
     utils::{rsplit_path, user_path_at},
-    IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    FilePrivateData, IndexNode, InodeId, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 
 /// 当没有指定根文件系统时，尝试的根文件系统列表
 const ROOTFS_TRY_LIST: [&str; 4] = ["/dev/sda1", "/dev/sda", "/dev/vda1", "/dev/vda"];
+kernel_cmdline_param_kv!(ROOTFS_PATH_PARAM, root, "");
 
 /// @brief 原子地生成新的Inode号。
 /// 请注意，所有的inode号都需要通过该函数来生成.全局的inode号，除了以下两个特殊的以外，都是唯一的
@@ -116,20 +121,26 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     return Ok(());
 }
 
+fn try_find_gendisk_as_rootfs(path: &str) -> Option<Arc<GenDisk>> {
+    if let Some(gd) = block_dev_manager().lookup_gendisk_by_path(path) {
+        info!("Use {} as rootfs", path);
+        return Some(gd);
+    }
+    return None;
+}
+
 pub fn mount_root_fs() -> Result<(), SystemError> {
     info!("Try to mount root fs...");
     block_dev_manager().print_gendisks();
-
-    let gendisk = ROOTFS_TRY_LIST
-        .iter()
-        .find_map(|&path| {
-            if let Some(gd) = block_dev_manager().lookup_gendisk_by_path(path) {
-                info!("Use {} as rootfs", path);
-                return Some(gd);
-            }
-            return None;
-        })
-        .ok_or(SystemError::ENODEV)?;
+    let gendisk = if let Some(rootfs_dev_path) = ROOTFS_PATH_PARAM.value_str() {
+        try_find_gendisk_as_rootfs(rootfs_dev_path)
+            .unwrap_or_else(|| panic!("Failed to find rootfs device {}", rootfs_dev_path))
+    } else {
+        ROOTFS_TRY_LIST
+            .iter()
+            .find_map(|&path| try_find_gendisk_as_rootfs(path))
+            .ok_or(SystemError::ENODEV)?
+    };
 
     let fatfs: Result<Arc<FATFileSystem>, SystemError> = FATFileSystem::new(gendisk);
     if fatfs.is_err() {
@@ -165,7 +176,8 @@ pub fn do_mkdir_at(
         user_path_at(&ProcessManager::current_pcb(), dirfd, path.trim())?;
     let (name, parent) = rsplit_path(&path);
     if let Some(parent) = parent {
-        current_inode = current_inode.lookup(parent)?;
+        current_inode =
+            current_inode.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
     }
     // debug!("mkdir at {:?}", current_inode.metadata()?.inode_id);
     return current_inode.mkdir(name, ModeType::from_bits_truncate(mode.bits()));
@@ -237,6 +249,48 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     // 删除文件
     parent_inode.unlink(filename)?;
 
+    return Ok(0);
+}
+
+pub fn do_symlinkat(from: *const u8, newdfd: i32, to: *const u8) -> Result<usize, SystemError> {
+    let oldname = check_and_clone_cstr(from, Some(MAX_PATHLEN))?
+        .into_string()
+        .map_err(|_| SystemError::EINVAL)?;
+    let newname = check_and_clone_cstr(to, Some(MAX_PATHLEN))?
+        .into_string()
+        .map_err(|_| SystemError::EINVAL)?;
+    let from = oldname.as_str().trim();
+    let to = newname.as_str().trim();
+
+    // TODO: 添加权限检查，确保进程拥有目标路径的权限
+
+    let pcb = ProcessManager::current_pcb();
+    let (old_begin_inode, old_remain_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), from)?;
+    // info!("old_begin_inode={:?}", old_begin_inode.metadata());
+    let _ =
+        old_begin_inode.lookup_follow_symlink(&old_remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+
+    // 得到新创建节点的父节点
+    let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newdfd, to)?;
+    let (new_name, new_parent_path) = rsplit_path(&new_remain_path);
+    let new_parent = new_begin_inode
+        .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    // info!("new_parent={:?}", new_parent.metadata());
+
+    if new_parent.metadata()?.file_type != FileType::Dir {
+        return Err(SystemError::ENOTDIR);
+    }
+
+    let new_inode = new_parent.create_with_data(
+        new_name,
+        FileType::SymLink,
+        ModeType::from_bits_truncate(0o777),
+        0,
+    )?;
+
+    let buf = old_remain_path.as_bytes();
+    let len = buf.len();
+    new_inode.write_at(0, len, buf, SpinLock::new(FilePrivateData::Unused).lock())?;
     return Ok(0);
 }
 

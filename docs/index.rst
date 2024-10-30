@@ -32,6 +32,7 @@
    kernel/cpu_arch/index
    kernel/container/index
    kernel/libs/index
+   kernel/trace/index
 
 
 

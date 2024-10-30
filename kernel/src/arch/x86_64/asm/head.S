@@ -79,6 +79,7 @@
 #define BOOT_ENTRY_TYPE_MULTIBOOT2  2
 #define BOOT_ENTRY_TYPE_LINUX_32  3
 #define BOOT_ENTRY_TYPE_LINUX_64  4
+#define BOOT_ENTRY_TYPE_LINUX_32_PVH 5
 
 // 直接用 -m64 编译出来的是 64 位代码，
 // 但是启动后的机器是 32 位的，相当于在 32 位机器上跑 64 位程序。
@@ -92,6 +93,19 @@
 // 声明这一段代码以 32 位模式编译
 .code32
 
+/* PVH Header with pvh_start_addr = __linux32_pvh_boot */
+
+	.pushsection .note.dragonos, "a", @note
+	.align 4
+	.long 2f - 1f
+	.long 4f - 3f
+	.long 18
+	1:.asciz "Xen"
+	2:.align 4
+	3:.long __linux32_pvh_boot
+	4:.align 4
+	.popsection
+
 .section ".multiboot_header", "a"
 
 #define MB_FLAGS_FB 0x4
@@ -103,31 +117,6 @@
 MB_MAGIC = 0x1BADB002
 MB_FLAGS = MB_FLAGS_FB
 MB_CHECKSUM = -(MB_MAGIC + MB_FLAGS)
-
-.code32
-multiboot_header:
-    .align 8
-    .long MB_MAGIC
-    .long MB_FLAGS
-    .long MB_CHECKSUM
-    // header_addr if flags[16] is set
-    .long 0
-    // load_addr if flags[16] is set
-    .long 0
-    // load_end_addr if flags[16] is set
-    .long 0
-    // bss_end_addr if flags[16] is set
-    .long 0
-    // entry_addr if flags[16] is set
-    .long 0
-    // mode_type if flags[2] is set
-    .long MB_HEADER_GRAPHIC_MODE_LINEAR
-    // width if flags[2] is set
-    .long 1440
-    // height if flags[2] is set
-    .long 900
-    // depth if flags[2] is set
-    .long 32
 
 
 // multiboot2 文件头
@@ -169,7 +158,20 @@ framebuffer_tag_end:
     .long 8
 multiboot2_header_end:
 
-.section .bootstrap
+// direct_linux32_boot启动的内核入口
+.section .bootstrap, "a"
+.code32
+.global __linux32_pvh_boot
+__linux32_pvh_boot:
+    cli
+    cld
+    // start info 指针
+    mov %ebx, mb_entry_info
+    mov $BOOT_ENTRY_TYPE_LINUX_32_PVH, %ebx
+    mov %ebx, boot_entry_type
+    jmp protected_mode_setup
+
+.code32
 
 
 .global _start
@@ -181,7 +183,7 @@ multiboot2_header_end:
 ENTRY(_start)
     // 关中断
     cli
-    
+
     // multiboot2_info/ multiboot_info 结构体指针
     mov %ebx, mb_entry_info
     //mov %ebx, %e8
@@ -299,7 +301,6 @@ halt:
 .extern Start_Kernel
 ENTRY(_start64)
 
-
     // 初始化寄存器
     mov $0x10, %ax
     mov %ax, %ds
@@ -372,7 +373,7 @@ ENTRY(_start64)
     add $8, %eax
     loop .fill_pt_64_2
 
-
+    
 
 // ==== 加载CR3寄存器
 
@@ -381,6 +382,7 @@ load_cr3:
     movq $__PML4E, %rax //设置页目录基地址
     
     movq %rax, %cr3
+    
     jmp to_switch_seg
 
 load_apu_cr3:
@@ -394,11 +396,12 @@ load_apu_cr3:
     jmp to_switch_seg
 
 to_switch_seg:
-
+    
     movq switch_seg(%rip), %rax
     // 由于ljmp和lcall在GAS中不受支持，因此我们需要先伪造函数调用现场，通过lret的方式，给它跳转过去。才能更新cs寄存器
     // 实在是太妙了！Amazing！
     pushq $0x08 //段选择子
+
     pushq %rax
     lretq
 

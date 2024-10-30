@@ -156,7 +156,7 @@ impl IrqManager {
         *action_guard.flags_mut() = flags;
         *action_guard.dev_id_mut() = dev_id;
         drop(action_guard);
-        debug!("to inner_setup_irq");
+        debug!("to inner_setup_irq: {irq:?}");
         return self.inner_setup_irq(irq, irqaction, desc);
     }
 

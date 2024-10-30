@@ -45,7 +45,7 @@ use super::{
     sysfs::sys_class_tty_instance,
     termios::WindowSize,
     tty_core::{TtyCore, TtyFlag, TtyIoctlCmd},
-    tty_driver::{TtyDriver, TtyDriverManager, TtyDriverSubType, TtyDriverType, TtyOperation},
+    tty_driver::{TtyDriverManager, TtyDriverSubType, TtyDriverType, TtyOperation},
     tty_job_control::TtyJobCtrlManager,
     virtual_terminal::vty_init,
 };
@@ -126,6 +126,10 @@ impl TtyDevice {
     pub fn inner_write(&self) -> RwLockWriteGuard<InnerTtyDevice> {
         self.inner.write()
     }
+
+    pub fn name_ref(&self) -> &str {
+        &self.name
+    }
 }
 
 impl IndexNode for TtyDevice {
@@ -145,7 +149,7 @@ impl IndexNode for TtyDevice {
         let (index, driver) =
             TtyDriverManager::lookup_tty_driver(dev_num).ok_or(SystemError::ENODEV)?;
 
-        let tty = TtyDriver::open_tty(index, driver)?;
+        let tty = driver.open_tty(Some(index))?;
 
         // 设置privdata
         *data = FilePrivateData::Tty(TtyFilePrivateData {
@@ -592,15 +596,6 @@ impl TtyFilePrivateData {
 #[unified_init(INITCALL_DEVICE)]
 #[inline(never)]
 pub fn tty_init() -> Result<(), SystemError> {
-    let tty = TtyDevice::new(
-        "tty0".to_string(),
-        IdTable::new(
-            String::from("tty0"),
-            Some(DeviceNumber::new(Major::TTY_MAJOR, 0)),
-        ),
-        TtyType::Tty,
-    );
-
     let console = TtyDevice::new(
         "console".to_string(),
         IdTable::new(
@@ -610,34 +605,8 @@ pub fn tty_init() -> Result<(), SystemError> {
         TtyType::Tty,
     );
 
-    // 注册tty设备
-    // CharDevOps::cdev_add(
-    //     tty.clone() as Arc<dyn CharDevice>,
-    // IdTable::new(
-    //     String::from("tty0"),
-    //     Some(DeviceNumber::new(Major::TTYAUX_MAJOR, 0)),
-    // ),
-    //     1,
-    // )?;
-
-    // CharDevOps::register_chardev_region(DeviceNumber::new(Major::TTYAUX_MAJOR, 0), 1, "/dev/tty")?;
-
-    // 注册console设备
-    // CharDevOps::cdev_add(
-    //     console.clone() as Arc<dyn CharDevice>,
-    //     IdTable::new(
-    //         String::from("console"),
-    //         Some(DeviceNumber::new(Major::TTYAUX_MAJOR, 1)),
-    //     ),
-    //     1,
-    // )?;
-
-    // CharDevOps::register_chardev_region(DeviceNumber::new(Major::TTYAUX_MAJOR, 1), 1, "/dev/tty")?;
-
-    // 将这两个设备注册到devfs，TODO：这里console设备应该与tty在一个设备group里面
-    device_register(tty.clone())?;
+    // 将设备注册到devfs，TODO：这里console设备应该与tty在一个设备group里面
     device_register(console.clone())?;
-    devfs_register(&tty.name.clone(), tty)?;
     devfs_register(&console.name.clone(), console)?;
 
     serial_init()?;

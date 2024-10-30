@@ -1169,6 +1169,30 @@ pub enum BootTimeVideoType {
     Efi,
 }
 
+impl From<u8> for BootTimeVideoType {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => BootTimeVideoType::UnDefined,
+            0x10 => BootTimeVideoType::Mda,
+            0x11 => BootTimeVideoType::Cga,
+            0x20 => BootTimeVideoType::EgaM,
+            0x21 => BootTimeVideoType::EgaC,
+            0x22 => BootTimeVideoType::VgaC,
+            0x23 => BootTimeVideoType::Vlfb,
+            0x30 => BootTimeVideoType::PicaS3,
+            0x31 => BootTimeVideoType::MipsG364,
+            0x33 => BootTimeVideoType::Sgi,
+            0x40 => BootTimeVideoType::TgaC,
+            0x50 => BootTimeVideoType::Sun,
+            0x51 => BootTimeVideoType::SunPci,
+            0x60 => BootTimeVideoType::Pmac,
+            0x70 => BootTimeVideoType::Efi,
+
+            _ => BootTimeVideoType::UnDefined,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct FbCursor {
     /// 设置选项

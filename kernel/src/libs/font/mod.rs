@@ -40,7 +40,7 @@ impl FontDesc {
         }
 
         for (first, last) in Self::DOUBLE_WIDTH_RANGE {
-            if ch > *first && ch < *last {
+            if ch >= *first && ch < *last {
                 return true;
             }
         }

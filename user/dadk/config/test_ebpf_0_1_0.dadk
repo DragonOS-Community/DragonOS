@@ -1,0 +1,23 @@
+{
+  "name": "test_ebpf",
+  "version": "0.1.0",
+  "description": "to test eBPF",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "apps/test_ebpf"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "target_arch": ["x86_64"]
+}

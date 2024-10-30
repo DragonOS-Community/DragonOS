@@ -8,7 +8,10 @@ use alloc::{boxed::Box, collections::LinkedList, string::String, sync::Arc};
 use system_error::SystemError;
 
 use crate::{
-    driver::{serial::serial8250::send_to_default_serial8250_port, video::video_refresh_manager},
+    driver::{
+        serial::serial8250::send_to_default_serial8250_port,
+        video::{has_video_refresh_manager, video_refresh_manager},
+    },
     libs::{lib_ui::textui::textui_is_enable_put_to_window, rwlock::RwLock, spinlock::SpinLock},
     mm::{mmio_buddy::MMIOSpaceGuard, VirtAddr},
 };
@@ -430,9 +433,10 @@ pub fn scm_reinit() -> Result<(), SystemError> {
 
 #[allow(dead_code)]
 fn true_scm_reinit() -> Result<(), SystemError> {
-    video_refresh_manager()
-        .video_reinitialize(false)
-        .expect("video reinitialize failed");
+    if !has_video_refresh_manager() {
+        return Err(SystemError::ENODEV);
+    }
+    video_refresh_manager().video_reinitialize(false)?;
 
     // 遍历当前所有使用帧缓冲区的框架，更新地址
     let device_buffer = video_refresh_manager().device_buffer().clone();

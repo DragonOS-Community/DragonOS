@@ -1,5 +1,6 @@
 #include "traceback.h"
 #include <common/printk.h>
+#include <common/string.h>
 #include <process/process.h>
 
 int lookup_kallsyms(uint64_t addr, int level)
@@ -24,6 +25,18 @@ int lookup_kallsyms(uint64_t addr, int level)
     }
     else
         return -1;
+}
+
+uint64_t addr_from_symbol(const char *symbol)
+{
+    const char *str = (const char *)&kallsyms_names;
+    for (uint64_t i = 0; i < kallsyms_num; ++i)
+    {
+        if (strcmp(&str[kallsyms_names_index[i]], symbol) == 0)
+            return kallsyms_address[i];
+    }
+    return 0;
+
 }
 
 /**

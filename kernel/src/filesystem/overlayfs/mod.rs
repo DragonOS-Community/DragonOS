@@ -1,9 +1,10 @@
 #![allow(dead_code, unused_variables, unused_imports)]
 pub mod copy_up;
 pub mod entry;
+
 use super::ramfs::{LockedRamFSInode, RamFSInode};
-use super::vfs::FSMAKER;
-use super::vfs::{self, FileSystem, FileType, FsInfo, IndexNode, SuperBlock};
+use super::vfs::{self, FileSystem, FileType, FsInfo, IndexNode, Metadata, SuperBlock};
+use super::vfs::{FSMAKER, ROOT_INODE};
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::driver::base::device::device_number::Major;
 use crate::filesystem::vfs::{FileSystemMaker, FileSystemMakerData};
@@ -21,17 +22,49 @@ const WHITEOUT_FLAG: u64 = 0x1;
 
 #[distributed_slice(FSMAKER)]
 static OVERLAYFSMAKER: FileSystemMaker = FileSystemMaker::new(
-    "overlayfs",
+    "overlay",
     &(OverlayFS::make_overlayfs
         as fn(
             Option<&dyn FileSystemMakerData>,
         ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
 );
-
+#[derive(Debug)]
 pub struct OverlayMountData {
     upper_dir: String,
     lower_dirs: Vec<String>,
     work_dir: String,
+}
+
+impl OverlayMountData {
+    pub fn from_row(raw_data: *const u8) -> Result<Self, SystemError> {
+        if raw_data.is_null() {
+            return Err(SystemError::EINVAL);
+        }
+        let len = (0..)
+            .find(|&i| unsafe { raw_data.add(i).read() } == 0)
+            .ok_or(SystemError::EINVAL)?;
+        let slice = unsafe { core::slice::from_raw_parts(raw_data, len) };
+        let raw_str = core::str::from_utf8(slice).map_err(|_| SystemError::EINVAL)?;
+        let mut data = OverlayMountData {
+            upper_dir: String::new(),
+            lower_dirs: Vec::new(),
+            work_dir: String::new(),
+        };
+
+        for pair in raw_str.split(',') {
+            let mut parts = pair.split('=');
+            let key = parts.next().ok_or(SystemError::EINVAL)?;
+            let value = parts.next().ok_or(SystemError::EINVAL)?;
+
+            match key {
+                "upperdir" => data.upper_dir = value.into(),
+                "lowerdir" => data.lower_dirs = value.split(':').map(|s| s.into()).collect(),
+                "workdir" => data.work_dir = value.into(),
+                _ => return Err(SystemError::EINVAL),
+            }
+        }
+        Ok(data)
+    }
 }
 impl FileSystemMakerData for OverlayMountData {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -147,31 +180,30 @@ impl OverlayFS {
         let upper_layer = OvlLayer {
             mnt: Arc::new(OvlInode::new(
                 mount_data.upper_dir.clone(),
-                Some(Arc::new(LockedRamFSInode(SpinLock::new(RamFSInode::new())))),
+                Some(ROOT_INODE().lookup(&mount_data.upper_dir)?),
                 None,
             )),
             index: 0,
             fsid: 0,
         };
 
-        let lower_layers: Vec<OvlLayer> = mount_data
+        let lower_layers: Result<Vec<OvlLayer>, SystemError> = mount_data
             .lower_dirs
             .iter()
             .enumerate()
-            .map(|(i, dir)| OvlLayer {
-                mnt: Arc::new(OvlInode::new(
-                    dir.clone(),
-                    None,
-                    Some(Arc::new(LockedRamFSInode(SpinLock::new(RamFSInode::new())))),
-                )),
-                index: (i + 1) as u32,
-                fsid: (i + 1) as u32,
+            .map(|(i, dir)| {
+                let lower_inode = ROOT_INODE().lookup(dir)?;
+
+                Ok(OvlLayer {
+                    mnt: Arc::new(OvlInode::new(dir.clone(), None, Some(lower_inode))),
+                    index: (i + 1) as u32,
+                    fsid: (i + 1) as u32,
+                })
             })
             .collect();
 
         let workdir = Arc::new(OvlInode::new(mount_data.work_dir.clone(), None, None));
-
-        OverlayFS::new(upper_layer, lower_layers, workdir)
+        OverlayFS::new(upper_layer, lower_layers?, workdir)
     }
 }
 
@@ -259,6 +291,17 @@ impl IndexNode for OvlInode {
 
     fn fs(&self) -> Arc<dyn FileSystem> {
         self.fs.upgrade().unwrap()
+    }
+
+    fn metadata(&self) -> Result<Metadata, SystemError> {
+        if let Some(ref upper_inode) = *self.upper_inode.lock() {
+            return upper_inode.metadata();
+        }
+
+        if let Some(ref lower_inode) = self.lower_inode {
+            return lower_inode.metadata();
+        }
+        Ok(Metadata::default())
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {

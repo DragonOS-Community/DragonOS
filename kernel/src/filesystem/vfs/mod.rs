@@ -930,14 +930,13 @@ macro_rules! producefs {
     ($initializer_slice:ident,$filesystem:ident,$raw_data : ident) => {
         match $initializer_slice.iter().find(|&m| m.name == $filesystem) {
             Some(maker) => {
-                let data: Option<&dyn FileSystemMakerData> = match $filesystem {
-                    "overlayfs" => unsafe {
-                        ($raw_data as *const OverlayMountData)
-                            .as_ref()
-                            .map(|d| d as &dyn FileSystemMakerData)
-                    },
+                let mount_data = match $filesystem {
+                    "overlay" => OverlayMountData::from_row($raw_data).ok(),
                     _ => None,
                 };
+                let data: Option<&dyn FileSystemMakerData> =
+                    mount_data.as_ref().map(|d| d as &dyn FileSystemMakerData);
+
                 maker.call(data)
             }
             None => {

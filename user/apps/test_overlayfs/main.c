@@ -7,6 +7,20 @@
 #include <string.h>
 #include <errno.h>
 
+// #define LOWERDIR "/tmp/overlayfs/lower"
+// #define UPPERDIR "/tmp/overlayfs/upper"
+// #define WORKDIR "/tmp/overlayfs/work"
+// #define MERGEDDIR "/tmp/overlayfs/merged"
+
+// void create_directories()
+// {
+//     mkdir(LOWERDIR, 0755);
+//     mkdir(UPPERDIR, 0755);
+//     mkdir(WORKDIR, 0755);
+//     mkdir(MERGEDDIR, 0755);
+// }
+#define TMPDIR "/tmp"
+#define OVERLAYFSDIR "/tmp/overlayfs"
 #define LOWERDIR "/tmp/overlayfs/lower"
 #define UPPERDIR "/tmp/overlayfs/upper"
 #define WORKDIR "/tmp/overlayfs/work"
@@ -14,10 +28,13 @@
 
 void create_directories()
 {
+    mkdir(TMPDIR, 0755);
+    mkdir(OVERLAYFSDIR, 0755);
     mkdir(LOWERDIR, 0755);
     mkdir(UPPERDIR, 0755);
     mkdir(WORKDIR, 0755);
     mkdir(MERGEDDIR, 0755);
+    printf("step1 : success\n");
 }
 
 void create_lower_file()
@@ -33,6 +50,7 @@ void create_lower_file()
     }
     write(fd, "This is a lower layer file.\n", 28);
     close(fd);
+    printf("step2 : success\n");
 }
 
 void mount_overlayfs()
@@ -48,58 +66,27 @@ void mount_overlayfs()
         exit(EXIT_FAILURE);
     }
     printf("OverlayFS mounted successfully.\n");
+    printf("step3 : success\n");
 }
 
-void read_merged_file()
+void create_directory_in_merged()
 {
-    char filepath[256];
-    snprintf(filepath, sizeof(filepath), "%s/lowerfile.txt", MERGEDDIR);
+    char dirpath[256];
+    snprintf(dirpath, sizeof(dirpath), "%s/newdir", UPPERDIR);
 
-    char buffer[256];
-    int fd = open(filepath, O_RDONLY);
-    if (fd < 0)
+    if (mkdir(dirpath, 0755) != 0)
     {
-        perror("Failed to open file in merged dir");
+        perror("Failed to create directory in merged dir");
         exit(EXIT_FAILURE);
     }
-    read(fd, buffer, sizeof(buffer));
-    printf("Read from merged file: %s", buffer);
-    close(fd);
-}
-
-void create_upper_file()
-{
-    char filepath[256];
-    snprintf(filepath, sizeof(filepath), "%s/upperfile.txt", MERGEDDIR);
-
-    int fd = open(filepath, O_CREAT | O_WRONLY, 0644);
-    if (fd < 0)
-    {
-        perror("Failed to create file in upperdir");
-        exit(EXIT_FAILURE);
-    }
-    write(fd, "This is an upper layer file.\n", 29);
-    close(fd);
-    printf("File created in upper layer.\n");
-}
-
-void umount_overlayfs()
-{
-    if (umount(MERGEDDIR) != 0)
-    {
-        perror("Unmount failed");
-        exit(EXIT_FAILURE);
-    }
-    printf("OverlayFS unmounted successfully.\n");
+    printf("Directory created in merged: %s\n", dirpath);
+    printf("step4 : success\n");
 }
 
 int main()
 {
     create_directories();
-    create_lower_file();
     mount_overlayfs();
-    read_merged_file();
-    create_upper_file();
-    umount_overlayfs();
+    create_directory_in_merged();
     return 0;
 }

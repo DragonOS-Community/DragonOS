@@ -48,6 +48,12 @@ pub struct MntNamespace {
     pending_mounts: u32,
 }
 
+impl Default for MntNamespace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug)]
 struct MntNsOperations {
     name: String,
@@ -60,6 +66,11 @@ pub struct FsStruct {
     umask: u32, //文件权限掩码
     pub root: Arc<dyn IndexNode>,
     pub pwd: Arc<dyn IndexNode>,
+}
+impl Default for FsStruct {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FsStruct {

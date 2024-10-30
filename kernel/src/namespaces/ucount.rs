@@ -46,6 +46,11 @@ pub struct UCounts {
     rlimit: Vec<AtomicU32>, //[AtomicU32; UCOUNT_RLIMIT_COUNTS as usize],
 }
 
+impl Default for UCounts {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl UCounts {
     pub fn new() -> Self {
         Self {

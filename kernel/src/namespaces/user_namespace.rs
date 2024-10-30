@@ -53,6 +53,12 @@ pub struct UserNamespace {
     pub ucount_max: Vec<u32>, //vec![u32; UCOUNT_COUNTS as usize],
     pub rlimit_max: Vec<u32>, // vec![u32; UCOUNT_RLIMIT_COUNTS as usize],
 }
+
+impl Default for UserNamespace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 #[derive(Debug)]
 struct UserNsOperations {
     name: String,
@@ -105,6 +111,7 @@ impl UidGidExtent {
         }
     }
 }
+
 impl UserNamespace {
     pub fn new() -> Self {
         Self {

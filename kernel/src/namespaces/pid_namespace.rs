@@ -44,11 +44,24 @@ pub struct PidNamespace {
     /// namespace共有部分
     pub ns_common: Arc<NsCommon>,
 }
+
+impl Default for PidNamespace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PidStrcut {
     pub level: usize,
     pub numbers: Vec<UPid>,
     pub stashed: Arc<dyn IndexNode>,
+}
+
+impl Default for PidStrcut {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 #[derive(Debug, Clone)]
 pub struct UPid {
@@ -172,7 +185,7 @@ impl NsOperations for PidNsOperations {
 
     fn get(&self, pid: Pid) -> Option<Arc<NsCommon>> {
         let pcb = ProcessManager::find(pid);
-        pcb.and_then(|pcb| Some(pcb.get_nsproxy().read().pid_namespace.ns_common.clone()))
+        pcb.map(|pcb| pcb.get_nsproxy().read().pid_namespace.ns_common.clone())
     }
     fn install(&self, nsset: &mut NsSet, ns_common: Arc<NsCommon>) -> Result<(), SystemError> {
         let nsproxy = &mut nsset.nsproxy;

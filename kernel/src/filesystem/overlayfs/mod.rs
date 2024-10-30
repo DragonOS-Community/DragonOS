@@ -142,32 +142,6 @@ impl FileSystem for OverlayFS {
 }
 
 impl OverlayFS {
-    pub fn new(
-        upper: OvlLayer,
-        lowers: Vec<OvlLayer>,
-        workdir: Arc<OvlInode>,
-    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
-        if lowers.is_empty() {
-            return Err(SystemError::EINVAL);
-        }
-        let numdatalayer = lowers.len();
-        let mut layers = Vec::new();
-        layers.push(upper);
-        layers.extend(lowers);
-
-        let root_inode = layers[0].mnt.clone();
-        let fs = OverlayFS {
-            numlayer: layers.len(),
-            numfs: 1,
-            numdatalayer,
-            layers,
-            workdir,
-            root_inode,
-        };
-
-        Ok(Arc::new(fs))
-    }
-
     pub fn ovl_upper_mnt(&self) -> Arc<dyn IndexNode> {
         self.layers[0].mnt.clone()
     }
@@ -177,10 +151,14 @@ impl OverlayFS {
         let mount_data = data
             .and_then(|d| d.as_any().downcast_ref::<OverlayMountData>())
             .ok_or(SystemError::EINVAL)?;
+
+        let upper_inode = ROOT_INODE()
+            .lookup(&mount_data.upper_dir)
+            .map_err(|_| SystemError::EINVAL)?;
         let upper_layer = OvlLayer {
             mnt: Arc::new(OvlInode::new(
                 mount_data.upper_dir.clone(),
-                Some(ROOT_INODE().lookup(&mount_data.upper_dir)?),
+                Some(upper_inode),
                 None,
             )),
             index: 0,
@@ -192,8 +170,7 @@ impl OverlayFS {
             .iter()
             .enumerate()
             .map(|(i, dir)| {
-                let lower_inode = ROOT_INODE().lookup(dir)?;
-
+                let lower_inode = ROOT_INODE().lookup(dir).map_err(|_| SystemError::EINVAL)?; // 处理错误
                 Ok(OvlLayer {
                     mnt: Arc::new(OvlInode::new(dir.clone(), None, Some(lower_inode))),
                     index: (i + 1) as u32,
@@ -202,8 +179,29 @@ impl OverlayFS {
             })
             .collect();
 
+        let lower_layers = lower_layers?;
+
         let workdir = Arc::new(OvlInode::new(mount_data.work_dir.clone(), None, None));
-        OverlayFS::new(upper_layer, lower_layers?, workdir)
+
+        if lower_layers.is_empty() {
+            return Err(SystemError::EINVAL);
+        }
+
+        let mut layers = Vec::new();
+        layers.push(upper_layer);
+        layers.extend(lower_layers);
+
+        let root_inode = layers[0].mnt.clone();
+
+        let fs = OverlayFS {
+            numlayer: layers.len(),
+            numfs: 1,
+            numdatalayer: layers.len() - 1,
+            layers,
+            workdir,
+            root_inode,
+        };
+        Ok(Arc::new(fs))
     }
 }
 

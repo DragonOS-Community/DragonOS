@@ -28,6 +28,11 @@ pub struct NsProxy {
     pub pid_namespace: Arc<PidNamespace>,
     pub mnt_namespace: Arc<MntNamespace>,
 }
+impl Default for NsProxy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl NsProxy {
     pub fn new() -> Self {

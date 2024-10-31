@@ -5,6 +5,7 @@ use crate::{
     arch::{
         interrupt::TrapFrame,
         process::table::{USER_CS, USER_DS},
+        rand::rand_bytes,
         CurrentIrqArch,
     },
     exception::InterruptArch,
@@ -74,7 +75,7 @@ impl Syscall {
 
         // 生成16字节随机数
         // TODO 暂时设为0
-        param.init_info_mut().rand_num = [0u8; 16];
+        param.init_info_mut().rand_num = rand_bytes::<16>();
 
         // 把proc_init_info写到用户栈上
         let mut ustack_message = unsafe {

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-CONFIG_FILE=~/.cargo/config.toml
+CONFIG_FILE=/root/.cargo/config.toml
 
 change_rust_src_to_official() {
 echo -e "[source.crates-io]                             \n \

@@ -329,7 +329,7 @@ impl ElfLoader {
         interp_elf_ex: &mut ExecParam,
         load_bias: usize,
     ) -> Result<BinaryLoaderResult, ExecError> {
-        log::debug!("loading elf interp");
+        // log::debug!("loading elf interp");
         let mut head_buf = [0u8; 512];
         interp_elf_ex
             .file_mut()
@@ -362,7 +362,7 @@ impl ElfLoader {
         let mut bss_prot: Option<ProtFlags> = None;
         for section in phdr_table {
             if section.p_type == PT_LOAD {
-                log::debug!("loading {:?}", section);
+                // log::debug!("loading {:?}", section);
                 let mut elf_type = MapFlags::MAP_PRIVATE;
                 let elf_prot = Self::make_prot(section.p_flags, true, true);
                 let vaddr = TryInto::<usize>::try_into(section.p_vaddr).unwrap();
@@ -457,7 +457,7 @@ impl ElfLoader {
                 load_addr + TryInto::<usize>::try_into(interp_hdr.e_entry).unwrap(),
             )));
         }
-        log::debug!("sucessfully load elf interp");
+        // log::debug!("sucessfully load elf interp");
         return Ok(BinaryLoaderResult::new(load_addr));
     }
 
@@ -736,7 +736,7 @@ impl BinaryLoader for ElfLoader {
             if seg.p_filesz > 4096 || seg.p_filesz < 2 {
                 return Err(ExecError::NotExecutable);
             }
-            log::debug!("seg:{:?}", seg);
+            // log::debug!("seg:{:?}", seg);
             let mut buffer = vec![0; seg.p_filesz.try_into().unwrap()];
             let r = param
                 .file_mut()
@@ -762,7 +762,7 @@ impl BinaryLoader for ElfLoader {
                     e
                 ))
             })?;
-            log::debug!("opening interpreter at :{}", interpreter_path);
+            // log::debug!("opening interpreter at :{}", interpreter_path);
             interpreter = Some(
                 ExecParam::new(interpreter_path, param.vm().clone(), ExecParamFlags::EXEC)
                     .map_err(|e| {
@@ -801,7 +801,7 @@ impl BinaryLoader for ElfLoader {
             .filter(|seg| seg.p_type == elf::abi::PT_LOAD);
 
         for seg_to_load in loadable_sections {
-            log::debug!("seg_to_load = {:?}", seg_to_load);
+            // log::debug!("seg_to_load = {:?}", seg_to_load);
             if unlikely(elf_brk > elf_bss) {
                 // debug!(
                 //     "to set brk, elf_brk = {:?}, elf_bss = {:?}",
@@ -866,7 +866,7 @@ impl BinaryLoader for ElfLoader {
 
             // 加载这个段到用户空间
 
-            log::debug!("bias: {load_bias}");
+            // log::debug!("bias: {load_bias}");
             let e = Self::load_elf_segment(
                 &mut user_vm,
                 param,
@@ -881,7 +881,7 @@ impl BinaryLoader for ElfLoader {
                 SystemError::ENOMEM => ExecError::OutOfMemory,
                 _ => ExecError::Other(format!("load_elf_segment failed: {:?}", e)),
             })?;
-            log::debug!("e.0={:?}", e.0);
+            // log::debug!("e.0={:?}", e.0);
             // 如果地址不对，那么就报错
             if !e.1 {
                 return Err(ExecError::BadAddress(Some(e.0)));

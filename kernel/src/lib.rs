@@ -22,6 +22,7 @@
 #![feature(sync_unsafe_cell)]
 #![feature(vec_into_raw_parts)]
 #![feature(c_variadic)]
+#![feature(asm_goto)]
 #![cfg_attr(target_os = "none", no_std)]
 #![allow(internal_features)]
 // clippy的配置

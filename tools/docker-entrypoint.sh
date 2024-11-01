@@ -10,7 +10,7 @@ git-fetch-with-cli = true                               \n \
 " > $CONFIG_FILE
 }
 
-# Check if the GITHUB_WORKFLOW environment variable is set and not empty
+# Check if the GITHUB_ACTION environment variable is set and not empty
 if [ -n "$GITHUB_ACTION" ]; then
     change_rust_src_to_official
 fi

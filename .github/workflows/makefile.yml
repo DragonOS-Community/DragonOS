@@ -12,7 +12,10 @@ jobs:
     name: Format check ${{ matrix.arch }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: dragonos/dragonos-dev:v1.5.1
+    container: 
+      image: dragonos/dragonos-dev:v1.5.1
+      env:
+        GITHUB_ACTION: ${{ github.action }}
 
     strategy:
       matrix:
@@ -35,7 +38,10 @@ jobs:
     name: Kernel static test ${{ matrix.arch }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: dragonos/dragonos-dev:v1.5.1
+    container: 
+      image: dragonos/dragonos-dev:v1.5.1
+      env:
+        GITHUB_ACTION: ${{ github.action }}
 
     strategy:
       matrix:
@@ -56,7 +62,10 @@ jobs:
   build-x86_64:
 
     runs-on: ubuntu-latest
-    container: dragonos/dragonos-dev:v1.5.1
+    container: 
+      image: dragonos/dragonos-dev:v1.5.1
+      env:
+        GITHUB_ACTION: ${{ github.action }}
 
     steps:
     - run: echo "Running in dragonos/dragonos-dev:v1.5.1"
@@ -78,7 +87,10 @@ jobs:
   build-riscv64:
 
     runs-on: ubuntu-latest
-    container: dragonos/dragonos-dev:v1.5.1
+    container: 
+      image: dragonos/dragonos-dev:v1.5.1
+      env:
+        GITHUB_ACTION: ${{ github.action }}
 
     steps:
     - run: echo "Running in dragonos/dragonos-dev:v1.5.1"

@@ -2,108 +2,104 @@ name: Build Check
 
 on:
   push:
-    branches: [ "master", "feat-*", "fix-*"]
+    branches: ["master", "feat-*", "fix-*"]
   pull_request:
-    branches: [ "master", "feat-*", "fix-*"]
+    branches: ["master", "feat-*", "fix-*"]
 
 jobs:
-  
   format-check:
     name: Format check ${{ matrix.arch }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: 
+    container:
       image: dragonos/dragonos-dev:v1.5.1
       env:
-        GITHUB_ACTION: ${{ github.action }}
+        IN_GITHUB_WORKFLOW: 1
 
     strategy:
       matrix:
         arch: [x86_64, riscv64]
 
     steps:
-    - run: echo "Running in dragonos/dragonos-dev:v1.5.1"
-    - uses: actions/checkout@v3
+      - run: echo "Running in dragonos/dragonos-dev:v1.5.1"
+      - uses: actions/checkout@v3
 
-    - name: Format check
-      env:
+      - name: Format check
+        env:
           ARCH: ${{ matrix.arch }}
           HOME: /root
-      shell: bash -ileo pipefail {0}
-      run: |
-            printf "\n" >> kernel/src/include/bindings/bindings.rs
-            FMT_CHECK=1 make fmt
-  
+        shell: bash -ileo pipefail {0}
+        run: |
+          printf "\n" >> kernel/src/include/bindings/bindings.rs
+          FMT_CHECK=1 make fmt
+
   kernel-static-test:
     name: Kernel static test ${{ matrix.arch }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: 
+    container:
       image: dragonos/dragonos-dev:v1.5.1
       env:
-        GITHUB_ACTION: ${{ github.action }}
+        IN_GITHUB_WORKFLOW: 1
 
     strategy:
       matrix:
         arch: [x86_64, riscv64]
 
     steps:
-    - run: echo "Running in dragonos/dragonos-dev:v1.5.1"
+      - run: echo "Running in dragonos/dragonos-dev:v1.5.1"
 
-    - uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-    - name: Run kernel static test
-      shell: bash -ileo pipefail {0}
-      env:
+      - name: Run kernel static test
+        shell: bash -ileo pipefail {0}
+        env:
           ARCH: ${{ matrix.arch }}
           HOME: /root
-      run: bash -c "source /root/.cargo/env && cd kernel && make test && make test-rbpf"
+        run: bash -c "source /root/.cargo/env && cd kernel && make test && make test-rbpf"
 
   build-x86_64:
-
     runs-on: ubuntu-latest
-    container: 
+    container:
       image: dragonos/dragonos-dev:v1.5.1
       env:
-        GITHUB_ACTION: ${{ github.action }}
+        IN_GITHUB_WORKFLOW: 1
 
     steps:
-    - run: echo "Running in dragonos/dragonos-dev:v1.5.1"
+      - run: echo "Running in dragonos/dragonos-dev:v1.5.1"
 
-    - uses: actions/checkout@v3
-    - name: build the DragonOS
-      env:
+      - uses: actions/checkout@v3
+      - name: build the DragonOS
+        env:
           ARCH: x86_64
           HOME: /root
-      shell: bash -ileo pipefail {0}
+        shell: bash -ileo pipefail {0}
 
-      run: |
-        source ~/.bashrc
-        source ~/.cargo/env
-        export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin
-        
-        make -j $(nproc)
+        run: |
+          source ~/.bashrc
+          source ~/.cargo/env
+          export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin
+
+          make -j $(nproc)
 
   build-riscv64:
-
     runs-on: ubuntu-latest
-    container: 
+    container:
       image: dragonos/dragonos-dev:v1.5.1
       env:
-        GITHUB_ACTION: ${{ github.action }}
+        IN_GITHUB_WORKFLOW: 1
 
     steps:
-    - run: echo "Running in dragonos/dragonos-dev:v1.5.1"
+      - run: echo "Running in dragonos/dragonos-dev:v1.5.1"
 
-    - uses: actions/checkout@v3
-      with:
-        submodules: 'recursive'
+      - uses: actions/checkout@v3
+        with:
+          submodules: "recursive"
 
-    - name: build the DragonOS
-      shell: bash -ileo pipefail {0}
-      env:
+      - name: build the DragonOS
+        shell: bash -ileo pipefail {0}
+        env:
           ARCH: riscv64
           HOME: /root
 
-      run: source ~/.bashrc && source ~/.cargo/env && make kernel -j $(nproc)
-
+        run: source ~/.bashrc && source ~/.cargo/env && make kernel -j $(nproc)

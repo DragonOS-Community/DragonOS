@@ -35,6 +35,7 @@ use crate::{
 use super::{
     pipe::{LockedPipeInode, PipeFsPrivateData},
     shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
+    signal::sigprocmask,
     signal_types::{
         SaHandlerType, SigInfo, SigType, Sigaction, SigactionType, UserSigaction, USER_SIG_DFL,
         USER_SIG_ERR, USER_SIG_IGN,
@@ -503,5 +504,57 @@ impl Syscall {
             // 无效操作码
             ShmCtlCmd::Default => Err(SystemError::EINVAL),
         }
+    }
+
+    /// # SYS_SIGPROCMASK系统调用函数，用于设置或查询当前进程的信号屏蔽字
+    ///
+    /// ## 参数
+    ///
+    /// - `how`: 指示如何修改信号屏蔽字
+    /// - `nset`: 新的信号屏蔽字
+    /// - `oset`: 旧的信号屏蔽字的指针，由于可以是NULL，所以用Option包装
+    /// - `sigsetsize`: 信号集的大小
+    ///
+    /// ## 返回值
+    ///
+    /// 成功：0
+    /// 失败：错误码
+    /// 
+    /// ## 说明
+    /// 根据 https://man7.org/linux/man-pages/man2/sigprocmask.2.html ，传进来的oset和nset都是指针类型，这里选择传入usize然后转换为u64的指针类型
+    pub fn rt_sigprocmask(
+        how: i32,
+        nset: usize,
+        oset: Option<usize>,
+        sigsetsize: usize,
+    ) -> Result<usize, SystemError> {
+        if sigsetsize != size_of::<SigSet>() {
+            return Err(SystemError::EFAULT);
+        }
+
+        let reader = UserBufferReader::new(
+            VirtAddr::new(nset).as_ptr::<u64>(),
+            core::mem::size_of::<u64>(),
+            true,
+        )?;
+
+        let nset = reader.read_one_from_user::<u64>(0)?;
+        let mut new_set = SigSet::from_bits_truncate(*nset);
+
+        let to_remove: SigSet =
+            <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
+        new_set.remove(to_remove);
+
+        let oldset_te_return = sigprocmask(how, new_set)?;
+        if let Some(oldset) = oset {
+            let mut writer = UserBufferWriter::new(
+                VirtAddr::new(oldset).as_ptr::<u64>(),
+                core::mem::size_of::<u64>(),
+                true,
+            )?;
+            writer.copy_one_to_user::<u64>(&oldset_te_return.bits(), 0)?;
+        }
+
+        Ok(0)
     }
 }

@@ -865,8 +865,17 @@ impl Syscall {
             }
 
             SYS_RT_SIGPROCMASK => {
-                warn!("SYS_RT_SIGPROCMASK has not yet been implemented");
-                Ok(0)
+                let how = args[0] as i32;
+                let nset = args[1];
+                let oset = args[2];
+                let sigsetsize = args[3];
+                let oldset;
+                if oset == 0 {
+                    oldset = None;
+                } else {
+                    oldset = Some(oset);
+                }
+                Self::rt_sigprocmask(how, nset, oldset, sigsetsize)
             }
 
             SYS_TKILL => {

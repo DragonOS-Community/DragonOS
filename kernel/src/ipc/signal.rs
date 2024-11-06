@@ -469,3 +469,47 @@ pub fn set_current_sig_blocked(new_set: &mut SigSet) {
     recalc_sigpending();
     drop(guard);
 }
+
+const SIG_BLOCK: i32 = 0;
+const SIG_UNBLOCK: i32 = 1;
+const SIG_SETMASK: i32 = 2;
+
+fn __set_current_blocked(new_set: &SigSet) {
+    let pcb = ProcessManager::current_pcb();
+    if pcb.sig_info_irqsave().sig_block().eq(new_set) {
+        return;
+    }
+    let guard = pcb.sig_struct_irqsave();
+
+    // todo: 当一个进程有多个线程后，在这里需要设置每个线程的block字段，并且 retarget_shared_pending（虽然我还没搞明白linux这部分是干啥的）
+    // 设置当前进程的sig blocked
+    *pcb.sig_info_mut().sig_block_mut() = *new_set;
+    recalc_sigpending();
+    drop(guard);
+}
+
+pub fn sigprocmask(how: i32, set: SigSet) -> Result<SigSet, SystemError> {
+    let pcb: Arc<ProcessControlBlock> = ProcessManager::current_pcb();
+    let guard = pcb.sig_info_irqsave();
+    let oset = *guard.sig_block();
+    let mut res_set = oset.clone();
+    drop(guard);
+
+    match how {
+        SIG_BLOCK => {
+            res_set.insert(set);
+        }
+        SIG_UNBLOCK => {
+            res_set.remove(set);
+        }
+        SIG_SETMASK => {
+            res_set = set;
+        }
+        _ => {
+            return Err(SystemError::EINVAL);
+        }
+    }
+
+    __set_current_blocked(&res_set);
+    Ok(oset)
+}

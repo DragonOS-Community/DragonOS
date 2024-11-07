@@ -77,7 +77,6 @@ impl VirtIOIrqManager {
     /// # 返回
     /// - 如果找到了设备，返回一个包含设备的`Option<Arc<dyn VirtIODevice>>`。
     /// - 如果没有找到设备，返回`None`。
-
     pub fn lookup_device(&self, dev_id: &Arc<DeviceId>) -> Option<Arc<dyn VirtIODevice>> {
         let map = self.map.read_irqsave();
         map.get(dev_id).cloned()

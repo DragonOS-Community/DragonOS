@@ -266,8 +266,7 @@ impl BiosParameterBlock {
         bpb.trail_sig = cursor.read_u16()?;
 
         // 计算根目录项占用的空间（单位：字节）
-        let root_sectors = ((bpb.root_entries_cnt as u32 * 32) + (bpb.bytes_per_sector as u32 - 1))
-            / (bpb.bytes_per_sector as u32);
+        let root_sectors = (bpb.root_entries_cnt as u32 * 32).div_ceil(bpb.bytes_per_sector as u32);
 
         // 每FAT扇区数
         let fat_size = if bpb.fat_size_16 != 0 {
@@ -347,9 +346,8 @@ impl BiosParameterBlock {
             }
         };
 
-        let root_sectors = ((self.root_entries_cnt as u32 * 32)
-            + (self.bytes_per_sector as u32 - 1))
-            / (self.bytes_per_sector as u32);
+        let root_sectors =
+            (self.root_entries_cnt as u32 * 32).div_ceil(self.bytes_per_sector as u32);
 
         // 当前分区总扇区数
         let total_sectors = if self.total_sectors_16 != 0 {

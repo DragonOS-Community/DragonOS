@@ -326,9 +326,8 @@ impl FATFileSystem {
         };
 
         // 根目录项占用的扇区数（向上取整）
-        let root_dir_sectors: u64 = ((bpb.root_entries_cnt as u64 * 32)
-            + (bpb.bytes_per_sector as u64 - 1))
-            / (bpb.bytes_per_sector as u64);
+        let root_dir_sectors: u64 =
+            (bpb.root_entries_cnt as u64 * 32).div_ceil(bpb.bytes_per_sector as u64);
 
         // FAT表大小（单位：扇区）
         let fat_size = if bpb.fat_size_16 != 0 {
@@ -935,10 +934,8 @@ impl FATFileSystem {
 
             _ => {
                 // FAT12 / FAT16
-                let root_dir_sectors: u64 = (((self.bpb.root_entries_cnt as u64) * 32)
-                    + self.bpb.bytes_per_sector as u64
-                    - 1)
-                    / self.bpb.bytes_per_sector as u64;
+                let root_dir_sectors: u64 = ((self.bpb.root_entries_cnt as u64) * 32)
+                    .div_ceil(self.bpb.bytes_per_sector as u64);
                 // 数据区扇区数
                 let data_sec: u64 = self.bpb.total_sectors_16 as u64
                     - (self.bpb.rsvd_sec_cnt as u64
@@ -1888,7 +1885,7 @@ struct ClusterIter<'a> {
     fs: &'a FATFileSystem,
 }
 
-impl<'a> Iterator for ClusterIter<'a> {
+impl Iterator for ClusterIter<'_> {
     type Item = Cluster;
 
     fn next(&mut self) -> Option<Self::Item> {

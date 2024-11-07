@@ -323,7 +323,6 @@ impl OpenFirmwareFdtDriver {
     }
 
     /// 保留fdt自身的内存空间
-
     fn early_reserve_fdt_itself(&self, fdt: &Fdt) {
         #[cfg(target_arch = "riscv64")]
         {

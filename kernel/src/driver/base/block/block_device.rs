@@ -20,8 +20,8 @@ use system_error::SystemError;
 
 use super::{disk_info::Partition, gendisk::GenDisk, manager::BlockDevMeta};
 
-/// 该文件定义了 Device 和 BlockDevice 的接口
-/// Notice 设备错误码使用 Posix 规定的 int32_t 的错误码表示，而不是自己定义错误enum
+// 该文件定义了 Device 和 BlockDevice 的接口
+// Notice 设备错误码使用 Posix 规定的 int32_t 的错误码表示，而不是自己定义错误enum
 
 // 使用方法:
 // 假设 blk_dev 是块设备

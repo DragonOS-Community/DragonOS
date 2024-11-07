@@ -23,7 +23,7 @@ DEFAULT_INSTALL="false"
 
 export RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER:-https://rsproxy.cn}
 export RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT:-https://rsproxy.cn/rustup}
-export RUST_VERSION="${RUST_VERSION:-nightly-2024-07-23}"
+export RUST_VERSION="${RUST_VERSION:-nightly-2024-11-05}"
 
 banner()
 {
@@ -233,21 +233,21 @@ rustInstall() {
         echo "正在安装DragonOS所需的rust组件...首次安装需要一些时间来更新索引，请耐心等待..."
         cargo install cargo-binutils
 		cargo install bpf-linker
-		rustup toolchain install nightly-2023-08-15-x86_64-unknown-linux-gnu
+		rustup toolchain install nightly-2024-11-05-x86_64-unknown-linux-gnu
 		rustup toolchain install $RUST_VERSION-x86_64-unknown-linux-gnu
 		rustup component add rust-src --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
-		rustup component add rust-src --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
+		rustup component add rust-src --toolchain nightly-2024-11-05-x86_64-unknown-linux-gnu
 		rustup target add x86_64-unknown-none --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
-		rustup target add x86_64-unknown-none --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
-		rustup target add x86_64-unknown-linux-musl --toolchain nightly-2023-08-15-x86_64-unknown-linux-gnu
+		rustup target add x86_64-unknown-none --toolchain nightly-2024-11-05-x86_64-unknown-linux-gnu
+		rustup target add x86_64-unknown-linux-musl --toolchain nightly-2024-11-05-x86_64-unknown-linux-gnu
 		rustup target add x86_64-unknown-linux-musl --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu
 
 		rustup toolchain install $RUST_VERSION-riscv64gc-unknown-linux-gnu --force-non-host
-		rustup toolchain install nightly-2023-08-15-riscv64gc-unknown-linux-gnu --force-non-host
+		rustup toolchain install nightly-2024-11-05-riscv64gc-unknown-linux-gnu --force-non-host
 		rustup target add riscv64gc-unknown-none-elf --toolchain $RUST_VERSION-riscv64gc-unknown-linux-gnu
 		rustup target add riscv64imac-unknown-none-elf --toolchain $RUST_VERSION-riscv64gc-unknown-linux-gnu
-		rustup target add riscv64gc-unknown-none-elf --toolchain nightly-2023-08-15-riscv64gc-unknown-linux-gnu
-		rustup target add riscv64imac-unknown-none-elf --toolchain nightly-2023-08-15-riscv64gc-unknown-linux-gnu
+		rustup target add riscv64gc-unknown-none-elf --toolchain nightly-2024-11-05-riscv64gc-unknown-linux-gnu
+		rustup target add riscv64imac-unknown-none-elf --toolchain nightly-2024-11-05-riscv64gc-unknown-linux-gnu
         
 		rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
 		rustup component add rust-src

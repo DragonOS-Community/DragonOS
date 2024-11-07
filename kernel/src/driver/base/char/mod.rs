@@ -18,7 +18,7 @@ use super::{
 pub trait CharDevice: Device {
     /// Notice buffer对应设备按字节划分，使用u8类型
     /// Notice offset应该从0开始计数
-
+    ///
     /// @brief: 从设备的第offset个字节开始，读取len个byte，存放到buf中
     /// @parameter offset: 起始字节偏移量
     /// @parameter len: 读取字节的数量

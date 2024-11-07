@@ -212,7 +212,7 @@ impl Syscall {
         return Ok(target_proc.basic().pgid());
     }
     /// @brief 获取当前进程的父进程id
-
+    ///
     /// 若为initproc则ppid设置为0   
     pub fn getppid() -> Result<Pid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();

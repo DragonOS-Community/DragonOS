@@ -18,11 +18,9 @@
 //! # Implementing GlobalAlloc
 //! See the [global alloc](https://github.com/gz/rust-slabmalloc/tree/master/examples/global_alloc.rs) example.
 #![allow(unused_features)]
-#![cfg_attr(feature = "unstable", feature(const_mut_refs))]
 #![no_std]
 #![crate_name = "slabmalloc"]
 #![crate_type = "lib"]
-#![feature(new_uninit)]
 #![feature(maybe_uninit_as_bytes)]
 
 extern crate alloc;
@@ -65,6 +63,8 @@ pub enum AllocationError {
 /// Needs to adhere to safety requirements of a rust allocator (see GlobalAlloc et. al.).
 pub unsafe trait Allocator<'a> {
     fn allocate(&mut self, layout: Layout) -> Result<NonNull<u8>, AllocationError>;
+    /// # Safety
+    /// The caller must ensure that the memory is valid and that the layout is correct.
     unsafe fn deallocate(
         &mut self,
         ptr: NonNull<u8>,
@@ -85,5 +85,7 @@ pub unsafe trait Allocator<'a> {
 
 /// 将slab_page归还Buddy的回调函数
 pub trait CallBack: Send + Sync {
+    /// # Safety
+    /// The caller must ensure that the memory is valid and that the size is correct.
     unsafe fn free_slab_page(&self, _: *mut u8, _: usize) {}
 }

@@ -74,7 +74,7 @@ pub trait IntoBytes {
 }
 
 /// General implementation of `IntoBytes` for `Instruction`
-impl<'i, I: Instruction> IntoBytes for &'i I {
+impl<I: Instruction> IntoBytes for &'_ I {
     type Bytes = Vec<u8>;
 
     /// transform immutable reference of `Instruction` into `Vec<u8>` with size of 8
@@ -347,7 +347,7 @@ impl<'i> Move<'i> {
     }
 }
 
-impl<'i> Instruction for Move<'i> {
+impl Instruction for Move<'_> {
     fn opt_code_byte(&self) -> u8 {
         let op_bits = self.op_bits as u8;
         let src_bit = self.src_bit as u8;
@@ -415,7 +415,7 @@ impl<'i> SwapBytes<'i> {
     }
 }
 
-impl<'i> Instruction for SwapBytes<'i> {
+impl Instruction for SwapBytes<'_> {
     fn opt_code_byte(&self) -> u8 {
         self.endian as u8
     }
@@ -456,19 +456,19 @@ impl<'i> Load<'i> {
     }
 }
 
-impl<'i> Instruction for Load<'i> {
+impl Instruction for Load<'_> {
     fn opt_code_byte(&self) -> u8 {
         let size = self.mem_size as u8;
         let addressing = self.addressing as u8;
         addressing | size | self.source
     }
 
-    fn get_insn_mut(&mut self) -> &mut Insn {
-        &mut self.insn
-    }
-
     fn get_insn(&self) -> &Insn {
         &self.insn
+    }
+
+    fn get_insn_mut(&mut self) -> &mut Insn {
+        &mut self.insn
     }
 }
 
@@ -489,18 +489,18 @@ impl<'i> Store<'i> {
     }
 }
 
-impl<'i> Instruction for Store<'i> {
+impl Instruction for Store<'_> {
     fn opt_code_byte(&self) -> u8 {
         let size = self.mem_size as u8;
         BPF_MEM | BPF_ST | size | self.source
     }
 
-    fn get_insn_mut(&mut self) -> &mut Insn {
-        &mut self.insn
-    }
-
     fn get_insn(&self) -> &Insn {
         &self.insn
+    }
+
+    fn get_insn_mut(&mut self) -> &mut Insn {
+        &mut self.insn
     }
 }
 
@@ -542,19 +542,19 @@ impl<'i> Jump<'i> {
     }
 }
 
-impl<'i> Instruction for Jump<'i> {
+impl Instruction for Jump<'_> {
     fn opt_code_byte(&self) -> u8 {
         let cmp: u8 = self.cond as u8;
         let src_bit = self.src_bit as u8;
         cmp | src_bit | BPF_JMP
     }
 
-    fn get_insn_mut(&mut self) -> &mut Insn {
-        &mut self.insn
-    }
-
     fn get_insn(&self) -> &Insn {
         &self.insn
+    }
+
+    fn get_insn_mut(&mut self) -> &mut Insn {
+        &mut self.insn
     }
 }
 
@@ -602,17 +602,17 @@ impl<'i> FunctionCall<'i> {
     }
 }
 
-impl<'i> Instruction for FunctionCall<'i> {
+impl Instruction for FunctionCall<'_> {
     fn opt_code_byte(&self) -> u8 {
         BPF_CALL | BPF_JMP
     }
 
-    fn get_insn_mut(&mut self) -> &mut Insn {
-        &mut self.insn
-    }
-
     fn get_insn(&self) -> &Insn {
         &self.insn
+    }
+
+    fn get_insn_mut(&mut self) -> &mut Insn {
+        &mut self.insn
     }
 }
 
@@ -631,7 +631,7 @@ impl<'i> Exit<'i> {
     }
 }
 
-impl<'i> Instruction for Exit<'i> {
+impl Instruction for Exit<'_> {
     fn opt_code_byte(&self) -> u8 {
         BPF_EXIT | BPF_JMP
     }

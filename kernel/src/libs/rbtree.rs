@@ -286,7 +286,6 @@ impl<K: Ord + Clone + Debug, V: Clone + Debug> NodePtr<K, V> {
 
 /// A red black tree implemented with Rust
 /// It is required that the keys implement the [`Ord`] traits.
-
 /// # Examples
 /// ```rust
 /// use rbtree::RBTree;
@@ -431,7 +430,7 @@ where
 
 impl<K: Eq + Ord + Debug, V: Eq + Debug> Eq for RBTree<K, V> {}
 
-impl<'a, K: Ord + Debug, V: Debug> Index<&'a K> for RBTree<K, V> {
+impl<K: Ord + Debug, V: Debug> Index<&K> for RBTree<K, V> {
     type Output = V;
 
     #[inline]
@@ -482,7 +481,7 @@ impl<'a, K: Ord + Debug, V: Debug> Clone for Keys<'a, K, V> {
     }
 }
 
-impl<'a, K: Ord + Debug, V: Debug> fmt::Debug for Keys<'a, K, V> {
+impl<K: Ord + Debug, V: Debug> fmt::Debug for Keys<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
     }
@@ -527,7 +526,7 @@ impl<'a, K: Ord + Debug, V: Debug> Clone for Values<'a, K, V> {
     }
 }
 
-impl<'a, K: Ord + Debug, V: Debug> fmt::Debug for Values<'a, K, V> {
+impl<K: Ord + Debug, V: Debug> fmt::Debug for Values<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
     }
@@ -575,7 +574,7 @@ impl<'a, K: Ord + Debug, V: Debug> Clone for ValuesMut<'a, K, V> {
     }
 }
 
-impl<'a, K: Ord + Debug, V: Debug> fmt::Debug for ValuesMut<'a, K, V> {
+impl<K: Ord + Debug, V: Debug> fmt::Debug for ValuesMut<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
     }
@@ -1651,7 +1650,7 @@ mod tests {
         let vec = vec![(1, 1), (2, 2), (3, 3)];
         let mut map: RBTree<_, _> = vec.into_iter().collect();
         for value in map.values_mut() {
-            *value = (*value) * 2
+            *value *= 2
         }
         let values: Vec<_> = map.values().cloned().collect();
         assert_eq!(values.len(), 3);
@@ -1808,7 +1807,7 @@ mod tests {
         b.insert(2, "two");
         b.insert(3, "three");
 
-        a.extend(b.into_iter());
+        a.extend(b);
 
         assert_eq!(a.len(), 3);
         assert_eq!(a[&1], "one");
@@ -1818,6 +1817,7 @@ mod tests {
 
     #[test]
     fn test_rev_iter() {
+        use crate::libs::rbtree::RBTree;
         let mut a = RBTree::new();
         a.insert(1, 1);
         a.insert(2, 2);
@@ -1826,7 +1826,7 @@ mod tests {
         assert_eq!(a.len(), 3);
         let mut cache = vec![];
         for e in a.iter().rev() {
-            cache.push(e.0.clone());
+            cache.push(*e.0);
         }
         assert_eq!(&cache, &vec![3, 2, 1]);
     }

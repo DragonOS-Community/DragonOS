@@ -192,7 +192,7 @@ impl Namespace for PidNamespace {
             return Err(SystemError::EINVAL);
         }
         let mut pid_ns: Arc<PidNamespace> = Arc::new(self.clone());
-        while self.level > active.level {
+        while pid_ns.level > active.level {
             if let Some(ns) = &self.parent {
                 pid_ns = ns.clone();
             } else {

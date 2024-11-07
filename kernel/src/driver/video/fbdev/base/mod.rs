@@ -1,4 +1,5 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
+use render_helper::FrameP;
 use system_error::SystemError;
 
 use crate::{
@@ -107,6 +108,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                 && image.width & (32 / bit_per_pixel - 1) == 0
                 && (8..=32).contains(&bit_per_pixel)
             {
+                // loop{}
                 unsafe { self.fast_imageblit(image, dst1, fg, bg) }
             } else {
                 self.slow_imageblit(
@@ -256,7 +258,8 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         _start_index: u32,
         _pitch_index: u32,
     ) {
-        let mut dst = _dst1.as_ptr::<u32>();
+        // let mut dst = _dst1.as_ptr::<u32>();
+        let mut safe_dst=FrameP::new(self.current_fb_var().height.unwrap(), self.current_fb_var().width.unwrap(), self.current_fb_var().bits_per_pixel, _dst1, 0);
         let mut count = 0;
         let iter = BitIter::new(
             _fg,
@@ -268,17 +271,19 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
             _image.width,
         );
         for (content, full) in iter {
-            unsafe {
-                *dst = content;
+            safe_dst.write(content);
+            // unsafe {
+            //     *dst = content;
 
-                dst = dst.add(1);
-            }
+            //     dst = dst.add(1);
+            // }
 
             if full {
                 count += 1;
-                dst = unsafe {
-                    _dst1.as_ptr::<u8>().add((_pitch_index * count) as usize) as *mut u32
-                };
+                safe_dst.move_with_offset(_pitch_index * count);
+                // dst = unsafe {
+                //     _dst1.as_ptr::<u8>().add((_pitch_index * count) as usize) as *mut u32
+                // };
             }
         }
     }

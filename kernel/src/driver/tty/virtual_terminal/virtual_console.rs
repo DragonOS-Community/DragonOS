@@ -213,7 +213,7 @@ impl VirtualConsoleData {
         if let Some(cols) = cols {
             self.cols = cols;
         }
-
+        self.screen_buf.resize(self.cols * self.rows*2, 0);
         self.pos = self.cols * self.state.y + self.state.x;
         // self.bytes_per_row = self.cols << 1;
 

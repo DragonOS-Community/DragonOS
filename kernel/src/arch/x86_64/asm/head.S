@@ -149,7 +149,7 @@ framebuffer_tag_start:
     .long framebuffer_tag_end - framebuffer_tag_start
     .long 1440   // 宽
     .long 900   // 高
-    .long 32
+    .long 16
 framebuffer_tag_end:
 .align 8
 	.short MULTIBOOT2_HEADER_TAG_END

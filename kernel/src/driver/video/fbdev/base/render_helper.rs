@@ -1,4 +1,6 @@
-use core::slice::Iter;
+use core::{ops::Add, slice::Iter};
+
+use crate::{driver::serial::serial8250::send_to_default_serial8250_port, mm::VirtAddr};
 
 pub struct BitIter<'a> {
     fgcolor: u32,
@@ -168,5 +170,38 @@ impl PixelLineStatus {
             PixelLineStatus::Full(x) => (x, true),
             PixelLineStatus::NotFull(x) => (x, false),
         }
+    }
+}
+
+
+pub struct FrameP{
+    dst:VirtAddr,
+    limit:u32,
+    current:u32,
+}
+
+impl FrameP{
+    pub fn new(frame_height:u32,frame_width:u32,bit_deep:u32,dst:VirtAddr,offset_in_frame:u32)->Self{
+        let limit=frame_height*frame_width*bit_deep/8;
+        Self { dst, limit, current:offset_in_frame }
+    }
+
+    pub fn write<T>(&mut self,data:T){
+        let size=size_of::<T>() as u32;
+        let mut dst=self.dst;
+        if self.current+size>self.limit {
+            send_to_default_serial8250_port("warning:illegal use of frame_pointer has been detected!".as_bytes());
+            panic!();
+        }else{
+            dst=dst.add(self.current as usize);
+        }
+        unsafe {
+            *dst.as_ptr::<T>()=data;
+        }
+        self.current+=size;
+    }
+
+    pub fn move_with_offset(&mut self,offset:u32){
+        self.current+=offset;
     }
 }

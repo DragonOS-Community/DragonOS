@@ -870,6 +870,7 @@ impl Syscall {
                 let oset = args[2];
                 let sigsetsize = args[3];
                 let oldset;
+                // 对应oset传进来一个NULL的情况
                 if oset == 0 {
                     oldset = None;
                 } else {

@@ -1,7 +1,7 @@
 use core::sync::atomic::compiler_fence;
 
 use alloc::sync::Arc;
-use log::warn;
+use log::{debug, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -492,17 +492,20 @@ pub fn sigprocmask(how: i32, set: SigSet) -> Result<SigSet, SystemError> {
     let pcb: Arc<ProcessControlBlock> = ProcessManager::current_pcb();
     let guard = pcb.sig_info_irqsave();
     let oset = *guard.sig_block();
+
     let mut res_set = oset.clone();
     drop(guard);
 
     match how {
         SIG_BLOCK => {
+            debug!("SIG_BLOCK\tGoing to insert is: {}", set.bits());
             res_set.insert(set);
         }
         SIG_UNBLOCK => {
             res_set.remove(set);
         }
         SIG_SETMASK => {
+            debug!("SIG_SETMASK\tGoing to set is: {}", set.bits());
             res_set = set;
         }
         _ => {

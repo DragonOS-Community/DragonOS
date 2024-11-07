@@ -3,7 +3,7 @@ use core::{
     sync::atomic::compiler_fence,
 };
 
-use log::{error, warn};
+use log::{debug, error, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -519,7 +519,7 @@ impl Syscall {
     ///
     /// 成功：0
     /// 失败：错误码
-    /// 
+    ///
     /// ## 说明
     /// 根据 https://man7.org/linux/man-pages/man2/sigprocmask.2.html ，传进来的oset和nset都是指针类型，这里选择传入usize然后转换为u64的指针类型
     pub fn rt_sigprocmask(
@@ -540,6 +540,7 @@ impl Syscall {
 
         let nset = reader.read_one_from_user::<u64>(0)?;
         let mut new_set = SigSet::from_bits_truncate(*nset);
+        debug!("Get Newset: {}", &new_set.bits());
 
         let to_remove: SigSet =
             <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
@@ -547,6 +548,7 @@ impl Syscall {
 
         let oldset_te_return = sigprocmask(how, new_set)?;
         if let Some(oldset) = oset {
+            debug!("Get Oldset to return: {}", &oldset_te_return.bits());
             let mut writer = UserBufferWriter::new(
                 VirtAddr::new(oldset).as_ptr::<u64>(),
                 core::mem::size_of::<u64>(),

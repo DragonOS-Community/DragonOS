@@ -48,13 +48,8 @@ pub struct UCounts {
 
 impl Default for UCounts {
     fn default() -> Self {
-        Self::new()
-    }
-}
-impl UCounts {
-    pub fn new() -> Self {
         Self {
-            ns: Arc::new(UserNamespace::new()),
+            ns: Arc::new(UserNamespace::default()),
             uid: 0,
             count: AtomicU32::new(1),
             ucount: (0..Ucount::Counts as usize)
@@ -65,7 +60,8 @@ impl UCounts {
                 .collect(),
         }
     }
-
+}
+impl UCounts {
     fn alloc_ucounts(&self, ns: Arc<UserNamespace>, uid: usize) -> Arc<Self> {
         let mut counts = COUNT_MANAGER.counts.lock();
         let key = UKey {

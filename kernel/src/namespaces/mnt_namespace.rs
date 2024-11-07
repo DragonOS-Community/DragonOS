@@ -11,10 +11,8 @@ use alloc::sync::Arc;
 use system_error::SystemError;
 
 use super::namespace::Namespace;
-use super::namespace::NsOperations;
 use super::ucount::Ucount::MntNamespaces;
-use super::{namespace::NsCommon, ucount::UCounts, user_namespace::UserNamespace};
-use crate::container_of;
+use super::{ucount::UCounts, user_namespace::UserNamespace};
 use crate::filesystem::vfs::mount::MountFSInode;
 use crate::filesystem::vfs::IndexNode;
 use crate::filesystem::vfs::InodeId;
@@ -26,10 +24,8 @@ use crate::process::fork::CloneFlags;
 use crate::process::ProcessManager;
 use crate::syscall::Syscall;
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MntNamespace {
-    /// namespace 共有的部分
-    ns_common: Arc<NsCommon>,
     /// 关联的用户名字空间
     user_ns: Arc<UserNamespace>,
     /// 资源计数器
@@ -37,11 +33,11 @@ pub struct MntNamespace {
     /// 根文件系统
     root: Option<Arc<MountFS>>,
     /// 红黑树用于挂载所有挂载点
-    mounts: RBTree<InodeId, MountFSInode>,
+    mounts: Arc<RBTree<InodeId, MountFSInode>>,
     /// 等待队列
-    poll: WaitQueue,
+    poll: Arc<WaitQueue>,
     ///  挂载序列号
-    seq: AtomicU64,
+    seq: Arc<AtomicU64>,
     /// 挂载点的数量
     nr_mounts: u32,
     /// 待处理的挂载点
@@ -50,7 +46,16 @@ pub struct MntNamespace {
 
 impl Default for MntNamespace {
     fn default() -> Self {
-        Self::new()
+        Self {
+            user_ns: Arc::new(UserNamespace::default()),
+            ucounts: Arc::new(UCounts::default()),
+            root: None,
+            mounts: Arc::new(RBTree::new()),
+            poll: Arc::new(WaitQueue::default()),
+            seq: Arc::new(AtomicU64::new(0)),
+            nr_mounts: 0,
+            pending_mounts: 0,
+        }
     }
 }
 
@@ -69,18 +74,15 @@ pub struct FsStruct {
 }
 impl Default for FsStruct {
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FsStruct {
-    pub fn new() -> Self {
         Self {
             umask: 0o22,
             root: ROOT_INODE(),
             pwd: ROOT_INODE(),
         }
     }
+}
+
+impl FsStruct {
     pub fn set_root(&mut self, inode: Arc<dyn IndexNode>) {
         self.root = inode;
     }
@@ -90,72 +92,41 @@ impl FsStruct {
 }
 
 impl Namespace for MntNamespace {
-    fn ns_common_to_ns(ns_common: Arc<NsCommon>) -> Arc<Self> {
-        let ns_common_ptr = Arc::as_ptr(&ns_common);
-        container_of!(ns_common_ptr, MntNamespace, ns_common)
+    fn name(&self) -> String {
+        "mnt".to_string()
     }
-}
+    fn get(&self, pid: crate::process::Pid) -> Option<Arc<dyn Namespace>> {
+        ProcessManager::find(pid)
+            .map(|pcb| pcb.get_nsproxy().read().mnt_namespace.clone() as Arc<dyn Namespace>)
+    }
 
-impl MntNsOperations {
-    pub fn new(name: String) -> Self {
-        Self {
-            name,
-            clone_flags: CloneFlags::CLONE_NEWNS,
-        }
+    fn clone_flags(&self) -> CloneFlags {
+        CloneFlags::CLONE_NEWNS
     }
-}
 
-impl NsOperations for MntNsOperations {
-    fn get(&self, pid: crate::process::Pid) -> Option<Arc<NsCommon>> {
-        let pcb = ProcessManager::find(pid);
-        pcb.map(|pcb| pcb.get_nsproxy().read().mnt_namespace.ns_common.clone())
-    }
-    // 不存在这个方法
-    fn get_parent(&self, _ns_common: Arc<NsCommon>) -> Result<Arc<NsCommon>, SystemError> {
-        unreachable!()
-    }
-    fn install(
-        &self,
-        nsset: &mut super::NsSet,
-        ns_common: Arc<NsCommon>,
-    ) -> Result<(), SystemError> {
+    fn put(&self) {}
+
+    fn install(&self, nsset: &mut super::NsSet) -> Result<(), SystemError> {
         let nsproxy = &mut nsset.nsproxy;
-        let mnt_ns = MntNamespace::ns_common_to_ns(ns_common);
-        if mnt_ns.is_anon_ns() {
+        if self.is_anon_ns() {
             return Err(SystemError::EINVAL);
         }
-        nsproxy.mnt_namespace = mnt_ns;
+        nsproxy.mnt_namespace = Arc::new(self.clone());
 
         nsset.fs.lock().set_pwd(ROOT_INODE());
         nsset.fs.lock().set_root(ROOT_INODE());
         Ok(())
     }
-    fn owner(&self, ns_common: Arc<NsCommon>) -> Arc<UserNamespace> {
-        let mnt_ns = MntNamespace::ns_common_to_ns(ns_common);
-        mnt_ns.user_ns.clone()
+
+    fn owner(&self) -> Arc<UserNamespace> {
+        self.user_ns.clone()
     }
-    fn put(&self, ns_common: Arc<NsCommon>) {
-        let pid_ns = MntNamespace::ns_common_to_ns(ns_common);
+    // 不存在这个方法
+    fn get_parent(&self) -> Result<Arc<dyn Namespace>, SystemError> {
+        unreachable!()
     }
 }
 impl MntNamespace {
-    pub fn new() -> Self {
-        let ns_common = Arc::new(NsCommon::new(Box::new(MntNsOperations::new(
-            "mnt".to_string(),
-        ))));
-
-        Self {
-            ns_common,
-            user_ns: Arc::new(UserNamespace::new()),
-            ucounts: Arc::new(UCounts::new()),
-            root: None,
-            mounts: RBTree::new(),
-            poll: WaitQueue::default(),
-            seq: AtomicU64::new(0),
-            nr_mounts: 0,
-            pending_mounts: 0,
-        }
-    }
     /// anon 用来判断是否是匿名的.匿名函数的问题还需要考虑
     pub fn create_mnt_namespace(
         &self,
@@ -167,20 +138,16 @@ impl MntNamespace {
             return Err(SystemError::ENOSPC);
         }
         let ucounts = ucounts.unwrap();
-        let ns_common = Arc::new(NsCommon::new(Box::new(MntNsOperations::new(
-            "mnt".to_string(),
-        ))));
-        let seq = AtomicU64::new(0);
+        let seq = Arc::new(AtomicU64::new(0));
         if !anon {
             seq.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         }
         Ok(Self {
-            ns_common,
             user_ns,
             ucounts,
             root: None,
-            mounts: RBTree::new(),
-            poll: WaitQueue::default(),
+            mounts: Arc::new(RBTree::new()),
+            poll: Arc::new(WaitQueue::default()),
             seq,
             nr_mounts: 0,
             pending_mounts: 0,

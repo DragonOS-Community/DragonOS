@@ -1,4 +1,5 @@
 #![allow(dead_code, unused_variables, unused_imports)]
+use alloc::string::String;
 use core::fmt::Debug;
 
 use crate::filesystem::procfs::ProcFSInode;
@@ -12,30 +13,17 @@ use system_error::SystemError;
 
 // 目前无credit功能，采用全局静态的user_namespace
 lazy_static! {
-    pub static ref USER_NS: Arc<UserNamespace> = Arc::new(UserNamespace::new());
+    pub static ref USER_NS: Arc<UserNamespace> = Arc::new(UserNamespace::default());
 }
 use super::{create_new_namespaces, NsProxy, NsSet};
-pub trait NsOperations: Send + Sync + Debug {
-    fn get(&self, pid: Pid) -> Option<Arc<NsCommon>>;
-    fn put(&self, ns_common: Arc<NsCommon>);
-    fn install(&self, nsset: &mut NsSet, ns_common: Arc<NsCommon>) -> Result<(), SystemError>;
-    fn owner(&self, ns_common: Arc<NsCommon>) -> Arc<UserNamespace>;
-    fn get_parent(&self, ns_common: Arc<NsCommon>) -> Result<Arc<NsCommon>, SystemError>;
-}
-#[derive(Debug)]
-pub struct NsCommon {
-    ops: Box<dyn NsOperations>,
-    stashed: Arc<dyn IndexNode>,
-}
-
-impl NsCommon {
-    pub fn new(ops: Box<dyn NsOperations>) -> Self {
-        let inode = ROOT_INODE().find("proc").unwrap_or_else(|_| ROOT_INODE());
-        Self {
-            ops,
-            stashed: inode,
-        }
-    }
+pub trait Namespace: Send + Sync + Debug {
+    fn name(&self) -> String;
+    fn clone_flags(&self) -> CloneFlags;
+    fn get(&self, pid: Pid) -> Option<Arc<dyn Namespace>>;
+    fn put(&self);
+    fn install(&self, nsset: &mut NsSet) -> Result<(), SystemError>;
+    fn owner(&self) -> Arc<UserNamespace>;
+    fn get_parent(&self) -> Result<Arc<dyn Namespace>, SystemError>;
 }
 
 pub enum NsType {
@@ -47,10 +35,6 @@ pub enum NsType {
     Mnt,
     Cgroup,
     Time,
-}
-
-pub trait Namespace {
-    fn ns_common_to_ns(ns_common: Arc<NsCommon>) -> Arc<Self>;
 }
 
 pub fn check_unshare_flags(unshare_flags: u64) -> Result<usize, SystemError> {

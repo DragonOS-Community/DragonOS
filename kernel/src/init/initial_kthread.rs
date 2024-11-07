@@ -141,7 +141,7 @@ fn run_init_process(
     trap_frame: &mut TrapFrame,
 ) -> Result<(), SystemError> {
     compiler_fence(Ordering::SeqCst);
-    ProcessManager::current_pcb().set_nsproxy(NsProxy::new()); // 初始化init进程的namespace
+    ProcessManager::current_pcb().set_nsproxy(NsProxy::default()); // 初始化init进程的namespace
     let path = proc_init_info.proc_name.to_str().unwrap();
 
     Syscall::do_execve(

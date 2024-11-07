@@ -9,13 +9,12 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-use crate::namespaces::namespace::NsCommon;
 use crate::namespaces::ucount::UCounts;
 use crate::process::fork::CloneFlags;
 use crate::process::Pid;
 use alloc::sync::Arc;
 
-use super::namespace::NsOperations;
+use super::namespace::Namespace;
 use super::ucount::Ucount::Counts;
 
 const UID_GID_MAP_MAX_BASE_EXTENTS: usize = 5;
@@ -46,50 +45,57 @@ pub struct UserNamespace {
     level: u32,
     owner: usize,
     group: usize,
-    ns_common: Arc<NsCommon>,
     flags: u32,
     pid: Arc<RwLock<Pid>>,
     pub ucounts: Option<Arc<UCounts>>,
-    pub ucount_max: Vec<u32>, //vec![u32; UCOUNT_COUNTS as usize],
-    pub rlimit_max: Vec<u32>, // vec![u32; UCOUNT_RLIMIT_COUNTS as usize],
+    pub ucount_max: Vec<u32>,
+    pub rlimit_max: Vec<u32>,
 }
 
 impl Default for UserNamespace {
     fn default() -> Self {
-        Self::new()
-    }
-}
-#[derive(Debug)]
-struct UserNsOperations {
-    name: String,
-    clone_flags: CloneFlags,
-}
-impl UserNsOperations {
-    pub fn new(name: String) -> Self {
         Self {
-            name,
-            clone_flags: CloneFlags::CLONE_NEWUSER,
+            uid_map: UidGidMap::new(),
+            gid_map: UidGidMap::new(),
+            progid_map: UidGidMap::new(),
+            owner: 0,
+            level: 0,
+            group: 0,
+            flags: 1,
+            parent: None,
+            pid: Arc::new(RwLock::new(Pid::new(1))),
+            ucount_max: vec![UCOUNT_MAX; Counts as usize],
+            ucounts: None,
+            rlimit_max: vec![65535, 10, 32000, 64 * 1024],
         }
     }
 }
-impl NsOperations for UserNsOperations {
-    fn get(&self, pid: Pid) -> Option<Arc<NsCommon>> {
+impl Namespace for UserNamespace {
+    fn name(&self) -> String {
+        "user".to_string()
+    }
+
+    fn clone_flags(&self) -> CloneFlags {
+        CloneFlags::CLONE_NEWUSER
+    }
+
+    fn get(&self, pid: Pid) -> Option<Arc<dyn Namespace>> {
         unimplemented!()
     }
-    fn get_parent(&self, ns_common: Arc<NsCommon>) -> Result<Arc<NsCommon>, SystemError> {
+
+    fn put(&self) {
         unimplemented!()
     }
-    fn install(
-        &self,
-        nsset: &mut super::NsSet,
-        ns_common: Arc<NsCommon>,
-    ) -> Result<(), SystemError> {
+
+    fn install(&self, nsset: &mut super::NsSet) -> Result<(), SystemError> {
         unimplemented!()
     }
-    fn owner(&self, ns_common: Arc<NsCommon>) -> Arc<UserNamespace> {
+
+    fn owner(&self) -> Arc<UserNamespace> {
         unimplemented!()
     }
-    fn put(&self, ns_common: Arc<NsCommon>) {
+
+    fn get_parent(&self) -> Result<Arc<dyn Namespace>, SystemError> {
         unimplemented!()
     }
 }
@@ -108,28 +114,6 @@ impl UidGidExtent {
             first: 0,
             lower_first: 0,
             count: u32::MAX,
-        }
-    }
-}
-
-impl UserNamespace {
-    pub fn new() -> Self {
-        Self {
-            uid_map: UidGidMap::new(),
-            gid_map: UidGidMap::new(),
-            progid_map: UidGidMap::new(),
-            owner: 0,
-            level: 0,
-            group: 0,
-            flags: 1,
-            parent: None,
-            ns_common: Arc::new(NsCommon::new(Box::new(UserNsOperations::new(
-                "User".to_string(),
-            )))),
-            pid: Arc::new(RwLock::new(Pid::new(1))),
-            ucount_max: vec![UCOUNT_MAX; Counts as usize],
-            ucounts: None,
-            rlimit_max: vec![65535, 10, 32000, 64 * 1024],
         }
     }
 }

@@ -730,7 +730,7 @@ impl ProcessControlBlock {
         let pcb = Self {
             pid,
             tgid: pid,
-            thread_pid: Arc::new(RwLock::new(PidStrcut::new())),
+            thread_pid: Arc::new(RwLock::new(PidStrcut::default())),
             basic: basic_info,
             preempt_count,
             flags,
@@ -747,10 +747,10 @@ impl ProcessControlBlock {
             children: RwLock::new(Vec::new()),
             wait_queue: WaitQueue::default(),
             thread: RwLock::new(ThreadInfo::new()),
-            fs: Arc::new(SpinLock::new(FsStruct::new())),
+            fs: Arc::new(SpinLock::new(FsStruct::default())),
             alarm_timer: SpinLock::new(None),
             robust_list: RwLock::new(None),
-            nsproxy: Arc::new(RwLock::new(NsProxy::new())),
+            nsproxy: Arc::new(RwLock::new(NsProxy::default())),
             cred: SpinLock::new(cred),
         };
 

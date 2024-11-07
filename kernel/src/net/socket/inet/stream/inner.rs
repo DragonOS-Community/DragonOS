@@ -129,14 +129,16 @@ impl Init {
         } else {
             smoltcp::wire::IpListenEndpoint::from(local)
         };
-        // log::debug!("listen at {:?}", listen_addr);
+        log::debug!("listen at {:?}", listen_addr);
         let mut inners = Vec::new();
         if let Err(err) = || -> Result<(), SystemError> {
             for _ in 0..(backlog - 1) {
                 // -1 because the first one is already bound
                 let new_listen = socket::inet::BoundInner::bind(
                     new_listen_smoltcp_socket(listen_addr),
-                    &local.addr,
+                    listen_addr.addr.as_ref().unwrap_or(
+                        &smoltcp::wire::IpAddress::from(smoltcp::wire::Ipv4Address::UNSPECIFIED)
+                    ),
                 )?;
                 inners.push(new_listen);
             }
@@ -155,6 +157,7 @@ impl Init {
         return Ok(Listening {
             inners,
             connect: AtomicUsize::new(0),
+            listen_addr,
         });
     }
 }
@@ -245,6 +248,7 @@ impl Connecting {
 pub struct Listening {
     inners: Vec<socket::inet::BoundInner>,
     connect: AtomicUsize,
+    listen_addr: smoltcp::wire::IpListenEndpoint,
 }
 
 impl Listening {
@@ -258,23 +262,20 @@ impl Listening {
             return Err(EAGAIN_OR_EWOULDBLOCK);
         }
 
-        let (local_endpoint, remote_endpoint) = connected
+        let remote_endpoint = connected
             .with::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-                (
-                    socket
-                        .local_endpoint()
-                        .expect("A Connected Tcp With No Local Endpoint"),
-                    socket
-                        .remote_endpoint()
-                        .expect("A Connected Tcp With No Remote Endpoint"),
-                )
+                socket
+                    .remote_endpoint()
+                    .expect("A Connected Tcp With No Remote Endpoint")
             });
 
         // log::debug!("local at {:?}", local_endpoint);
 
         let mut new_listen = socket::inet::BoundInner::bind(
-            new_listen_smoltcp_socket(local_endpoint),
-            &local_endpoint.addr,
+            new_listen_smoltcp_socket(self.listen_addr),
+            self.listen_addr.addr.as_ref().unwrap_or(
+                &smoltcp::wire::IpAddress::from(smoltcp::wire::Ipv4Address::UNSPECIFIED),
+            ),
         )?;
 
         // swap the connected socket with the new_listen socket

@@ -869,13 +869,8 @@ impl Syscall {
                 let nset = args[1];
                 let oset = args[2];
                 let sigsetsize = args[3];
-                let oldset;
                 // 对应oset传进来一个NULL的情况
-                if oset == 0 {
-                    oldset = None;
-                } else {
-                    oldset = Some(oset);
-                }
+                let oldset = if oset == 0 { None } else { Some(oset) };
                 Self::rt_sigprocmask(how, nset, oldset, sigsetsize)
             }
 

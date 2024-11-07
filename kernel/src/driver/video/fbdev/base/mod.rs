@@ -259,7 +259,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         _pitch_index: u32,
     ) {
         // let mut dst = _dst1.as_ptr::<u32>();
-        let mut safe_dst=FrameP::new(self.current_fb_var().height.unwrap(), self.current_fb_var().width.unwrap(), self.current_fb_var().bits_per_pixel, _dst1, 0);
+        let mut safe_dst=FrameP::new(self.current_fb_var().yres, self.current_fb_var().xres, self.current_fb_var().bits_per_pixel, _dst1, 0);
         let mut count = 0;
         let iter = BitIter::new(
             _fg,

@@ -202,6 +202,6 @@ impl FrameP{
     }
 
     pub fn move_with_offset(&mut self,offset:u32){
-        self.current+=offset;
+        self.current=offset;
     }
 }

@@ -2,7 +2,7 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicUsize};
 use system_error::SystemError::{self, *};
 
-use crate::libs::rwlock::RwLock;
+use crate::{arch::init, libs::rwlock::RwLock};
 use crate::net::event_poll::EPollEventType;
 use crate::net::net_core::poll_ifaces;
 use crate::net::socket::*;
@@ -29,9 +29,9 @@ pub struct TcpSocket {
 }
 
 impl TcpSocket {
-    pub fn new(nonblock: bool, v4: bool) -> Arc<Self> {
+    pub fn new(nonblock: bool, ver: smoltcp::wire::IpVersion) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
-            inner: RwLock::new(Some(Inner::Init(Init::new(v4)))),
+            inner: RwLock::new(Some(Inner::Init(Init::new(ver)))),
             shutdown: Shutdown::new(),
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
@@ -234,12 +234,11 @@ impl Socket for TcpSocket {
 
     fn get_name(&self) -> Result<Endpoint, SystemError> {
         match self.inner.read().as_ref().expect("Tcp Inner is None") {
-            Inner::Init(Init::Unbound((_, v4))) => {
-                if *v4 {
-                    Ok(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT_V4))
-                } else {
-                    Ok(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT_V6))
-                }
+            Inner::Init(Init::Unbound((_, ver))) => {
+                Ok(Endpoint::Ip( match ver {
+                    smoltcp::wire::IpVersion::Ipv4 => UNSPECIFIED_LOCAL_ENDPOINT_V4,
+                    smoltcp::wire::IpVersion::Ipv6 => UNSPECIFIED_LOCAL_ENDPOINT_V6,
+                }))
             }
             Inner::Init(Init::Bound((_, local))) => Ok(Endpoint::Ip(*local)),
             Inner::Connecting(connecting) => Ok(Endpoint::Ip(connecting.get_name())),
@@ -324,7 +323,14 @@ impl Socket for TcpSocket {
                     es.release();
                     Ok(())
                 }
-                _ => Ok(()),
+                Inner::Listening(ls) => {
+                    ls.close();
+                    Ok(())
+                }
+                Inner::Init(init) => {
+                    init.close();
+                    Ok(())
+                },
             })
             .unwrap_or(Ok(()))
     }

@@ -41,40 +41,24 @@ impl BoundInner {
         T: smoltcp::socket::AnySocket<'static>,
     {
         if address.is_unspecified() {
-            // let inner = Vec::new();
-            // for (_, iface) in *NET_DEVICES.read_irqsave() {
-            //     let handle = iface.sockets().lock_no_preempt().add(socket);
-            //     iface
-            // }
             // 强绑VirtualIO
-            // log::debug!("Not bind to any iface, bind to virtIO");
-
-            let ifaces: Vec<Arc<dyn Iface>> = NET_DEVICES
+            let iface = NET_DEVICES
                 .read_irqsave()
                 .iter()
-                .filter_map(|(_, v)| {
+                .find_map(|(_, v)| {
                     if v.common().is_default_iface() {
                         Some(v.clone())
                     } else {
                         None
                     }
                 })
-                .collect();
+                .expect("No default interface");
 
-            // let iface = NET_DEVICES
-            // .read_irqsave()
-            // .get(&0)
-            // .expect("??bind without virtIO, serious?")
-            // .clone();
-
-            let iface = ifaces[0].clone();
             let handle = iface.sockets().lock_no_preempt().add(socket);
             return Ok(Self { handle, iface });
         } else {
             let iface = get_iface_to_bind(address).ok_or(ENODEV)?;
             let handle = iface.sockets().lock_no_preempt().add(socket);
-            // log::debug!("Bind to iface: {}", iface.iface_name());
-            // return Ok(Self { inner: vec![(handle, iface)] });
             return Ok(Self { handle, iface });
         }
     }

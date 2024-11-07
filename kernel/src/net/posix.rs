@@ -122,29 +122,29 @@ impl SockAddr {
                     let addr_in: SockAddrIn = addr.addr_in;
 
                     use smoltcp::wire;
-                    let ip: wire::IpAddress = wire::IpAddress::from(wire::Ipv4Address::from_bytes(
-                        &u32::from_be(addr_in.sin_addr).to_be_bytes()[..],
+                    let ip: wire::IpAddress = wire::IpAddress::from(wire::Ipv4Address::from_bits(
+                        u32::from_be(addr_in.sin_addr),
                     ));
                     let port = u16::from_be(addr_in.sin_port);
 
                     return Ok(Endpoint::Ip(wire::IpEndpoint::new(ip, port)));
                 }
-                AddressFamily::INet6 => {
-                    if len < addr.len()? {
-                        log::error!("len < addr.len()");
-                        return Err(SystemError::EINVAL);
-                    }
-                    log::debug!("INet6");
-                    let addr_in: SockAddrIn = addr.addr_in;
+                // AddressFamily::INet6 => {
+                //     if len < addr.len()? {
+                //         log::error!("len < addr.len()");
+                //         return Err(SystemError::EINVAL);
+                //     }
+                //     log::debug!("INet6");
+                //     let addr_in: SockAddrIn = addr.addr_in;
 
-                    use smoltcp::wire;
-                    let ip: wire::IpAddress = wire::IpAddress::from(wire::Ipv6Address::from_bytes(
-                        &u32::from_be(addr_in.sin_addr).to_be_bytes()[..],
-                    ));
-                    let port = u16::from_be(addr_in.sin_port);
+                //     use smoltcp::wire;
+                //     let ip: wire::IpAddress = wire::IpAddress::from(wire::Ipv6Address::from_bits(
+                //         u128::from_be(addr_in.sin_addr),
+                //     ));
+                //     let port = u16::from_be(addr_in.sin_port);
 
-                    return Ok(Endpoint::Ip(wire::IpEndpoint::new(ip, port)));
-                }
+                //     return Ok(Endpoint::Ip(wire::IpEndpoint::new(ip, port)));
+                // }
                 AddressFamily::Unix => {
                     let addr_un: SockAddrUn = addr.addr_un;
 
@@ -232,12 +232,7 @@ impl SockAddr {
                     };
 
                     return Ok(Endpoint::Unixpath((inode.metadata()?.inode_id, path)));
-                }
-                AddressFamily::Packet => {
-                    // TODO: support packet socket
-                    log::warn!("not support address family {:?}", addr.family);
-                    return Err(SystemError::EINVAL);
-                }
+                },
                 _ => {
                     log::warn!("not support address family {:?}", addr.family);
                     return Err(SystemError::EINVAL);
@@ -312,7 +307,7 @@ impl From<Endpoint> for SockAddr {
                     let addr_in = SockAddrIn {
                         sin_family: AddressFamily::INet as u16,
                         sin_port: ip_endpoint.port.to_be(),
-                        sin_addr: u32::from_be_bytes(ipv4_addr.0).to_be(),
+                        sin_addr: ipv4_addr.to_bits(),
                         sin_zero: [0; 8],
                     };
 

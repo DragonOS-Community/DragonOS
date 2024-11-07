@@ -585,11 +585,11 @@ impl phy::TxToken for VirtioNetToken {
 impl phy::RxToken for VirtioNetToken {
     fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
         // 为了线程安全，这里需要对VirtioNet进行加【写锁】，以保证对设备的互斥访问。
-        let mut rx_buf = self.rx_buffer.unwrap();
-        let result = f(rx_buf.packet_mut());
+        let rx_buf = self.rx_buffer.unwrap();
+        let result = f(rx_buf.packet());
         self.driver
             .inner
             .lock()

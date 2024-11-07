@@ -209,19 +209,21 @@ impl IfaceCommon {
         let mut interface = self.smol_iface.lock_irqsave();
 
         let (has_events, poll_at) = {
-            let mut has_events = false;
-            let mut poll_at;
-            loop {
-                has_events |= interface.poll(timestamp, device, &mut sockets);
-                poll_at = interface.poll_at(timestamp, &sockets);
-                let Some(instant) = poll_at else {
-                    break;
-                };
-                if instant > timestamp {
-                    break;
+            (
+                matches!(
+                    interface.poll(timestamp, device, &mut sockets), 
+                    smoltcp::iface::PollResult::SocketStateChanged
+                ), 
+                loop {
+                    let poll_at = interface.poll_at(timestamp, &sockets);
+                    let Some(instant) = poll_at else {
+                        break poll_at;
+                    };
+                    if instant > timestamp {
+                        break poll_at;
+                    }
                 }
-            }
-            (has_events, poll_at)
+            )
         };
 
         // drop sockets here to avoid deadlock

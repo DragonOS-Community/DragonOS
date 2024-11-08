@@ -70,18 +70,19 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         let bit_per_pixel = self.current_fb_var().bits_per_pixel;
 
         // 计算图像在帧缓冲中的起始位
-        let mut bitstart = (y * self.current_fb_fix().line_length * 8) + (x * bit_per_pixel);
+        let bitstart = (y * self.current_fb_fix().line_length * 8) + (x * bit_per_pixel);
         let start_index = bitstart & (32 - 1);
         let pitch_index = (self.current_fb_fix().line_length & (byte_per_pixel - 1)) * 8;
         let dst2 = boot_param.screen_info.lfb_virt_base;
         if dst2.is_none() {
             return;
         }
-        let mut safe_pointer=FrameP::new(
-self.current_fb_var().yres as usize,
- self.current_fb_var().xres as usize,
-    self.current_fb_var().bits_per_pixel as usize,
-         dst2.unwrap(), image
+        let mut safe_pointer = FrameP::new(
+            self.current_fb_var().yres as usize,
+            self.current_fb_var().xres as usize,
+            self.current_fb_var().bits_per_pixel as usize,
+            dst2.unwrap(),
+            image,
         );
         let _ = self.fb_sync();
 
@@ -107,12 +108,7 @@ self.current_fb_var().yres as usize,
             {
                 unsafe { self.fast_imageblit(image, &mut safe_pointer, fg, bg) }
             } else {
-                self.slow_imageblit(
-                    image,
-                    &mut safe_pointer,
-                    fg,
-                    bg,
-                )
+                self.slow_imageblit(image, &mut safe_pointer, fg, bg)
             }
         } else {
             todo!("color image blit todo");
@@ -125,7 +121,7 @@ self.current_fb_var().yres as usize,
     /// 要求 image->width 可以被像素或 dword (ppw) 整除。
     /// 要求 fix->line_length 可以被 4 整除。
     /// 扫描线的开始和结束都是 dword 对齐的。
-    unsafe fn fast_imageblit(&self, image: &FbImage,  dst1: &mut FrameP, fg: u32, bg: u32) {
+    unsafe fn fast_imageblit(&self, image: &FbImage, dst1: &mut FrameP, fg: u32, bg: u32) {
         let bpp = self.current_fb_var().bits_per_pixel;
         let mut fgx = fg;
         let mut bgx = bg;
@@ -161,7 +157,7 @@ self.current_fb_var().yres as usize,
         let mut src;
         let mut offset = 0;
         let mut j = 0;
-        let mut count=0;
+        let mut count = 0;
         for _ in (0..image.height).rev() {
             shift = 8;
             src = offset;
@@ -183,7 +179,7 @@ self.current_fb_var().yres as usize,
                         dst1.write(color_tab[(image.data[src] as usize >> 6) & bitmask]);
                         dst1.write(color_tab[(image.data[src] as usize >> 4) & bitmask]);
                         dst1.write(color_tab[(image.data[src] as usize >> 2) & bitmask]);
-                        dst1.write(color_tab[(image.data[src] as usize ) & bitmask]);
+                        dst1.write(color_tab[(image.data[src] as usize) & bitmask]);
                         src += 1;
                         j -= 4;
                     }
@@ -222,19 +218,13 @@ self.current_fb_var().yres as usize,
                 j -= 1;
             }
 
-            count+=1;
-            dst1.move_with_offset(self.current_fb_fix().line_length*count);
+            count += 1;
+            dst1.move_with_offset(self.current_fb_fix().line_length * count);
             offset += spitch as usize;
         }
     }
 
-    fn slow_imageblit(
-        &self,
-        _image: &FbImage,
-        safe_dst:&mut FrameP,
-        _fg: u32,
-        _bg: u32,
-    ) {
+    fn slow_imageblit(&self, _image: &FbImage, safe_dst: &mut FrameP, _fg: u32, _bg: u32) {
         let mut count = 0;
         let mut pt_status = FramePointerStatus::Normal;
         let iter = BitIter::new(
@@ -258,7 +248,7 @@ self.current_fb_var().yres as usize,
             }
             if full {
                 count += 1;
-                safe_dst.move_with_offset(self.current_fb_fix().line_length*count);
+                safe_dst.move_with_offset(self.current_fb_fix().line_length * count);
                 pt_status = FramePointerStatus::Normal;
             }
         }

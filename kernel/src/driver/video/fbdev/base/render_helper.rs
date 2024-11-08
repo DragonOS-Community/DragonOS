@@ -273,8 +273,6 @@ impl FrameP {
         // }
         self.current_xpos = self.start_xpos;
     }
-
-    
 }
 
 pub enum FramePointerStatus {

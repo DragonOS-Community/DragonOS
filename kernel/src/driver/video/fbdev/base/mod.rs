@@ -73,9 +73,6 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         let mut bitstart = (y * self.current_fb_fix().line_length * 8) + (x * bit_per_pixel);
         let start_index = bitstart & (32 - 1);
         let pitch_index = (self.current_fb_fix().line_length & (byte_per_pixel - 1)) * 8;
-        // 位转字节
-        bitstart /= 8;
-
         let dst2 = boot_param.screen_info.lfb_virt_base;
         if dst2.is_none() {
             return;

@@ -111,34 +111,31 @@ pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator;
 #[panic_handler]
 #[no_mangle]
 pub fn panic(info: &PanicInfo) -> ! {
-    use driver::serial::serial8250::send_to_default_serial8250_port;
     use log::error;
     use process::ProcessManager;
 
-    send_to_default_serial8250_port(format!("Kernel Panic Occurred.").as_bytes());
+    error!("Kernel Panic Occurred.");
 
     match info.location() {
         Some(loc) => {
-            let s = format!(
+            println!(
                 "Location:\n\tFile: {}\n\tLine: {}, Column: {}",
                 loc.file(),
                 loc.line(),
                 loc.column()
             );
-            send_to_default_serial8250_port(s.as_bytes());
         }
         None => {
-            send_to_default_serial8250_port("No location info".as_bytes());
+            println!("No location info");
         }
     }
-    let s = format!("Message:\n\t{}", info.message());
+    println!("Message:\n\t{}", info.message());
 
     #[cfg(all(feature = "backtrace", target_arch = "x86_64"))]
     {
         unsafe {
             let bt = mini_backtrace::Backtrace::<16>::capture();
-            format!("Rust Panic Backtrace:\n");
-            send_to_default_serial8250_port(s.as_bytes());
+            println!("Rust Panic Backtrace:");
             let mut level = 0;
             for frame in bt.frames {
                 lookup_kallsyms(frame as u64, level);
@@ -147,7 +144,7 @@ pub fn panic(info: &PanicInfo) -> ! {
         };
     }
 
-    format!("Current PCB:\n\t{:?}", (ProcessManager::current_pcb()));
+    println!("Current PCB:\n\t{:?}", (ProcessManager::current_pcb()));
 
     ProcessManager::exit(usize::MAX);
 }

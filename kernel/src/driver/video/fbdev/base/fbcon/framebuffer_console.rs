@@ -228,7 +228,7 @@ impl ConsoleSwitch for BlittingFbConsole {
             vc_data.pos = vc_data.state.x + vc_data.state.y * vc_data.cols;
 
             let new_size = vc_data.cols * vc_data.rows;
-            // vc_data.screen_buf.resize(new_size, 0);
+            vc_data.screen_buf.resize(new_size, 0);
         } else {
             unimplemented!("Resize is not supported at the moment!");
         }
@@ -311,29 +311,11 @@ impl ConsoleSwitch for BlittingFbConsole {
         }
         let fbcon_data = self.fbcon_data();
         let c = buf[0];
-        let width = (vc_data.font.width + 7) / 8;
-        let x_display_max = self.fb().current_fb_var().xres / width;
-        let mut count = count as u32;
-        let mut times = 0;
-        while count > x_display_max {
-            self.put_string(
-                vc_data,
-                buf,
-                x_display_max,
-                fbcon_data.display.real_y(ypos + times),
-                xpos,
-                self.get_color(vc_data, c, true),
-                self.get_color(vc_data, c, false),
-            )?;
-            panic!();
-            count -= x_display_max;
-            times += 1;
-        }
         self.put_string(
             vc_data,
             buf,
-            count,
-            fbcon_data.display.real_y(ypos + times),
+            count as u32,
+            fbcon_data.display.real_y(ypos),
             xpos,
             self.get_color(vc_data, c, true),
             self.get_color(vc_data, c, false),

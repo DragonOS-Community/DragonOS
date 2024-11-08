@@ -7,7 +7,11 @@ use crate::{
     driver::net::{NetDevice, Operstate},
     libs::rwlock::RwLockReadGuard,
     net::{socket::SocketPollMethod, NET_DEVICES},
-    time::timer::{next_n_ms_timer_jiffies, Timer, TimerFunction},
+    time::{
+        sleep::nanosleep,
+        timer::{next_n_ms_timer_jiffies, Timer, TimerFunction},
+        PosixTimeSpec,
+    },
 };
 
 use super::{
@@ -118,6 +122,14 @@ fn dhcp_query() -> Result<(), SystemError> {
                     .remove_default_ipv4_route();
             }
         }
+        // 在睡眠前释放锁
+        drop(binding);
+
+        let sleep_time = PosixTimeSpec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        let _ = nanosleep(sleep_time)?;
     }
 
     return Err(SystemError::ETIMEDOUT);

@@ -91,6 +91,12 @@ impl Debug for InnerVirtIONetDevice {
 
 impl VirtIONetDevice {
     pub fn new(transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {
+        // 设置中断
+        if let Err(err) = transport.setup_irq(dev_id.clone()) {
+            error!("VirtIONetDevice '{dev_id:?}' setup_irq failed: {:?}", err);
+            return None;
+        }
+
         let driver_net: VirtIONet<HalImpl, VirtIOTransport, 2> =
             match VirtIONet::<HalImpl, VirtIOTransport, 2>::new(transport, 4096) {
                 Ok(net) => net,

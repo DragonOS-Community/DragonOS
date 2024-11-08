@@ -140,6 +140,11 @@ impl IdAllocator {
     pub fn used(&self) -> usize {
         self.used
     }
+
+    /// 返回最大id数
+    pub fn get_max_id(&self) -> usize {
+        self.max_id
+    }
 }
 
 impl core::fmt::Debug for IdAllocator {

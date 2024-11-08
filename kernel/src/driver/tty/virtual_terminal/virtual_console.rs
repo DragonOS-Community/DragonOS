@@ -1287,13 +1287,11 @@ impl VirtualConsoleData {
                 // 水平制表符（Horizontal Tab）
                 self.pos -= self.state.x;
 
-                let ret = self.tab_stop.next_index(self.state.x + 1);
-
-                if let Some(x) = ret {
-                    self.state.x = x;
-                } else {
-                    self.state.x = self.cols - 1;
-                }
+                self.state.x = self
+                    .tab_stop
+                    .next_index(self.state.x + 1)
+                    .unwrap_or(self.cols - 1);
+                self.state.x = core::cmp::min(self.state.x, self.cols - 1);
 
                 self.pos += self.state.x;
                 // TODO: notify
@@ -1555,7 +1553,7 @@ impl VirtualConsoleData {
             }
 
             // 未找到
-            if (!self.utf || self.display_ctrl || c < 128) && c & !charmask == 0 {
+            if (!self.utf || self.display_ctrl || c < 128) && (c & !charmask) == 0 {
                 tc = c;
             } else {
                 let tmp = self.unicode_to_index(0xfffd);
@@ -1590,7 +1588,7 @@ impl VirtualConsoleData {
             // TODO: 处理unicode screen buf
 
             if himask != 0 {
-                tc = (if tc & 0x100 != 0 { himask as u32 } else { 0 }) | (tc & 0xff);
+                tc = (if (tc & 0x100) != 0 { himask as u32 } else { 0 }) | (tc & 0xff);
             }
 
             tc |= ((attr as u32) << 8) & (!himask as u32);
@@ -1606,7 +1604,7 @@ impl VirtualConsoleData {
 
             self.screen_buf[self.pos] = tc as u16;
 
-            if draw.x.is_none() {
+            if self.should_update() && draw.x.is_none() {
                 // 设置draw参数
                 draw.x = Some(self.state.x as u32);
                 draw.offset = self.pos;
@@ -1623,7 +1621,7 @@ impl VirtualConsoleData {
             }
 
             width -= 1;
-            if width == 0 {
+            if width <= 0 {
                 break;
             }
             let tmp = self.unicode_to_index(' ' as u32);
@@ -1633,7 +1631,6 @@ impl VirtualConsoleData {
         if invert {
             self.flush(draw);
         }
-
         true
     }
 

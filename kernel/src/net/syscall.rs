@@ -116,7 +116,7 @@ impl Syscall {
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        debug!("setsockopt: level={:?}", level);
+        debug!("setsockopt: level = {:?} ", sol);
         return socket.set_option(sol, optname, optval).map(|_| 0);
     }
 

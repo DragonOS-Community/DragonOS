@@ -104,8 +104,9 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
     ];
     mfence();
     let pid = ProcessManager::current_pcb().pid();
-    let mut show = (syscall_num != SYS_SCHED) && (pid.data() >= 7);
-    // let mut show = true;
+    let mut show = 
+        (syscall_num != SYS_SCHED) && (pid.data() >= 7);
+        // false;
 
     let to_print = SysCall::try_from(syscall_num);
     if let Ok(to_print) = to_print {
@@ -115,21 +116,21 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
                 // show &= false;
             }
             SYS_RECVFROM | SYS_SENDTO | SYS_SENDMSG | SYS_RECVMSG => {
-                show &= false;
+                // show &= false;
             }
             SYS_SOCKET | SYS_GETSOCKNAME | SYS_GETPEERNAME | SYS_SOCKETPAIR | SYS_SETSOCKOPT
             | SYS_GETSOCKOPT => {
-                show &= false;
+                // show &= false;
             }
             SYS_OPEN | SYS_OPENAT | SYS_CREAT | SYS_CLOSE => {
-                show &= false;
+                // show &= false;
             }
             SYS_READ | SYS_WRITE | SYS_READV | SYS_WRITEV | SYS_PREAD64 | SYS_PWRITE64
             | SYS_PREADV | SYS_PWRITEV | SYS_PREADV2 => {
                 show &= false;
             }
             _ => {
-                show &= false;
+                // show &= false;
             }
         }
         if show {

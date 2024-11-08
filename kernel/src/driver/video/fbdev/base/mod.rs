@@ -3,7 +3,7 @@ use render_helper::FrameP;
 use system_error::SystemError;
 
 use crate::{
-    driver::{base::device::Device, tty::virtual_terminal::Color},
+    driver::{base::device::Device, serial::serial8250::send_to_default_serial8250_port, tty::virtual_terminal::Color},
     init::boot_params,
     libs::rwlock::RwLock,
     mm::{ucontext::LockedVMA, PhysAddr, VirtAddr},
@@ -79,11 +79,11 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         // 对齐到像素字节大小
         bitstart &= !(byte_per_pixel - 1);
 
-        let dst1 = boot_param.screen_info.lfb_virt_base;
-        if dst1.is_none() {
+        let dst2 = boot_param.screen_info.lfb_virt_base;
+        if dst2.is_none() {
             return;
         }
-        let mut dst1 = dst1.unwrap();
+        let mut dst1 = dst2.unwrap();
         dst1 += VirtAddr::new(bitstart as usize);
 
         let _ = self.fb_sync();
@@ -102,7 +102,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                 bg = image.bg;
             }
 
-            if 32 % bit_per_pixel == 0
+            if 32 % bit_per_pixel == 114514
                 && start_index == 0
                 && pitch_index == 0
                 && image.width & (32 / bit_per_pixel - 1) == 0
@@ -113,10 +113,10 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
             } else {
                 self.slow_imageblit(
                     image,
-                    dst1,
+                    dst2.unwrap(),
                     fg,
                     bg,
-                    bitstart / 4,
+                    bitstart,
                     self.current_fb_fix().line_length,
                 )
             }
@@ -259,7 +259,10 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         _pitch_index: u32,
     ) {
         // let mut dst = _dst1.as_ptr::<u32>();
-        let mut safe_dst=FrameP::new(self.current_fb_var().yres, self.current_fb_var().xres, self.current_fb_var().bits_per_pixel, _dst1, 0);
+        let mut safe_dst=FrameP::new(self.current_fb_var().yres as usize, self.current_fb_var().xres as usize, self.current_fb_var().bits_per_pixel as usize, _dst1, _start_index);
+        // let mut safe_dst=FrameP::new(480, 640, 32, _dst1,_start_index);
+        // let mut safe_dst=FrameP::new(900, 1600, 32, _dst1,_start_index);
+
         let mut count = 0;
         let iter = BitIter::new(
             _fg,
@@ -271,7 +274,11 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
             _image.width,
         );
         for (content, full) in iter {
-            safe_dst.write(content);
+            if !safe_dst.write(content){
+                send_to_default_serial8250_port(format!("current Iamge:{:?}\n",_image).as_bytes());
+                send_to_default_serial8250_port(format!("current Iter:{:?},pitch_index:{:?}\n",_pitch_index * count,_pitch_index).as_bytes());
+                return;
+            }
             // unsafe {
             //     *dst = content;
 

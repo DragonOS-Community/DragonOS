@@ -1,6 +1,6 @@
 use core::{ops::Add, slice::Iter};
 
-use crate::{driver::serial::serial8250::send_to_default_serial8250_port, mm::VirtAddr};
+use crate::{arch::cpu::current_cpu_id, driver::serial::serial8250::send_to_default_serial8250_port, mm::VirtAddr};
 
 pub struct BitIter<'a> {
     fgcolor: u32,
@@ -173,32 +173,39 @@ impl PixelLineStatus {
     }
 }
 
-
+#[derive(Debug)]
 pub struct FrameP{
     dst:VirtAddr,
-    limit:u32,
+    limit:VirtAddr,
     current:u32,
+    start_offset:u32
 }
 
 impl FrameP{
-    pub fn new(frame_height:u32,frame_width:u32,bit_deep:u32,dst:VirtAddr,offset_in_frame:u32)->Self{
-        let limit=frame_height*frame_width*bit_deep/8;
-        Self { dst, limit, current:offset_in_frame }
+    pub fn new(frame_height:usize,frame_width:usize,bit_deep:usize,dst:VirtAddr,offset:u32)->Self{
+        // let limit=(frame_height*frame_width-offset_in_frame)*bit_deep/8;
+        // let limit=(frame_height*frame_width-offset_in_frame)*bit_deep/8;
+        let limit = VirtAddr::new(frame_height*frame_width*bit_deep/8)+dst;
+        Self { dst, limit, current:0,start_offset:offset }
     }
-
-    pub fn write<T>(&mut self,data:T){
+    pub fn write<T>(&mut self,data:T)->bool{
         let size=size_of::<T>() as u32;
         let mut dst=self.dst;
-        if self.current+size>self.limit {
-            send_to_default_serial8250_port("warning:illegal use of frame_pointer has been detected!".as_bytes());
-            panic!();
+
+        // if self.current+size>self.limit {
+        // if true {
+        if self.dst.data()+self.current as usize+self.start_offset as usize+size_of::<T>()>self.limit.data() {
+            send_to_default_serial8250_port(format!("warning:illegal use of frame_pointer has been detected! FB:{:?}\n",self).as_bytes());
+            // panic!();
+            return false;
         }else{
-            dst=dst.add(self.current as usize);
+            dst=dst.add(self.current as usize+self.start_offset as usize);
         }
         unsafe {
             *dst.as_ptr::<T>()=data;
         }
         self.current+=size;
+        return true;
     }
 
     pub fn move_with_offset(&mut self,offset:u32){

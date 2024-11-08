@@ -146,7 +146,7 @@ pub struct VirtualConsoleData {
 impl VirtualConsoleData {
     #[inline(never)]
     pub fn new(num: usize) -> Self {
-        let mut a=Self {
+        let mut a = Self {
             state: VirtualConsoleInfo::new(0, 0),
             saved_state: Default::default(),
             cols: Default::default(),
@@ -204,8 +204,8 @@ impl VirtualConsoleData {
             cursor_type: VcCursor::empty(),
             vc_index: num,
         };
-        a.screen_buf.resize(15000,0);
-        a.screen_buf[14000]=0;
+        a.screen_buf.resize(15000, 0);
+        a.screen_buf[14000] = 0;
         a
     }
 
@@ -1603,7 +1603,7 @@ impl VirtualConsoleData {
             //     self.state.y,
             //     self.cols,
             // );
-            
+
             self.screen_buf[self.pos] = tc as u16;
 
             if draw.x.is_none() {

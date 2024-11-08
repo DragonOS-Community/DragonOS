@@ -1,9 +1,12 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
-use render_helper::FrameP;
+use render_helper::{FrameP, FramePointerStatus};
 use system_error::SystemError;
 
 use crate::{
-    driver::{base::device::Device, serial::serial8250::send_to_default_serial8250_port, tty::virtual_terminal::Color},
+    driver::{
+        base::device::Device, serial::serial8250::send_to_default_serial8250_port,
+        tty::virtual_terminal::Color,
+    },
     init::boot_params,
     libs::rwlock::RwLock,
     mm::{ucontext::LockedVMA, PhysAddr, VirtAddr},
@@ -78,7 +81,6 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
 
         // 对齐到像素字节大小
         bitstart &= !(byte_per_pixel - 1);
-
         let dst2 = boot_param.screen_info.lfb_virt_base;
         if dst2.is_none() {
             return;
@@ -259,7 +261,13 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         _pitch_index: u32,
     ) {
         // let mut dst = _dst1.as_ptr::<u32>();
-        let mut safe_dst=FrameP::new(self.current_fb_var().yres as usize, self.current_fb_var().xres as usize, self.current_fb_var().bits_per_pixel as usize, _dst1, _start_index);
+        let mut safe_dst = FrameP::new(
+            self.current_fb_var().yres as usize,
+            self.current_fb_var().xres as usize,
+            self.current_fb_var().bits_per_pixel as usize,
+            _dst1,
+            _image,
+        );
         // let mut safe_dst=FrameP::new(480, 640, 32, _dst1,_start_index);
         // let mut safe_dst=FrameP::new(900, 1600, 32, _dst1,_start_index);
 
@@ -273,11 +281,23 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
             _image.data.iter(),
             _image.width,
         );
+        let mut pt_status = FramePointerStatus::Normal;
         for (content, full) in iter {
-            if !safe_dst.write(content){
-                send_to_default_serial8250_port(format!("current Iamge:{:?}\n",_image).as_bytes());
-                send_to_default_serial8250_port(format!("current Iter:{:?},pitch_index:{:?}\n",_pitch_index * count,_pitch_index).as_bytes());
-                return;
+            // if !safe_dst.write(content){
+            //     send_to_default_serial8250_port(format!("current Iamge:{:?}\n",_image).as_bytes());
+            //     send_to_default_serial8250_port(format!("current Iter:{:?},pitch_index:{:?}\n",_pitch_index * count,_pitch_index).as_bytes());
+            //     return;
+            // }
+            match pt_status {
+                FramePointerStatus::OutOfBuffer => {
+                    return;
+                }
+                FramePointerStatus::OutOfScreen => {
+                    
+                }
+                FramePointerStatus::Normal => {
+                    pt_status = safe_dst.write(content);
+                }
             }
             // unsafe {
             //     *dst = content;
@@ -288,9 +308,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
             if full {
                 count += 1;
                 safe_dst.move_with_offset(_pitch_index * count);
-                // dst = unsafe {
-                //     _dst1.as_ptr::<u8>().add((_pitch_index * count) as usize) as *mut u32
-                // };
+                pt_status = FramePointerStatus::Normal;
             }
         }
     }

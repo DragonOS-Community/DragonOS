@@ -1,6 +1,11 @@
 use core::{ops::Add, slice::Iter};
 
-use crate::{arch::cpu::current_cpu_id, driver::serial::serial8250::send_to_default_serial8250_port, mm::VirtAddr};
+use crate::{
+    arch::cpu::current_cpu_id, driver::serial::serial8250::send_to_default_serial8250_port,
+    mm::VirtAddr,
+};
+
+use super::FbImage;
 
 pub struct BitIter<'a> {
     fgcolor: u32,
@@ -174,41 +179,88 @@ impl PixelLineStatus {
 }
 
 #[derive(Debug)]
-pub struct FrameP{
-    dst:VirtAddr,
-    limit:VirtAddr,
-    current:u32,
-    start_offset:u32
+pub struct FrameP {
+    dst: VirtAddr,
+    limit: VirtAddr,
+    current: usize,
+    start_offset: usize,
+    start_xpos: usize,
+    current_xpos: usize,
+    limit_xpos:usize,
 }
 
-impl FrameP{
-    pub fn new(frame_height:usize,frame_width:usize,bit_deep:usize,dst:VirtAddr,offset:u32)->Self{
+impl FrameP {
+    pub fn new(
+        frame_height: usize,
+        frame_width: usize,
+        bitdepth: usize,
+        dst: VirtAddr,
+        image: &FbImage,
+    ) -> Self {
         // let limit=(frame_height*frame_width-offset_in_frame)*bit_deep/8;
         // let limit=(frame_height*frame_width-offset_in_frame)*bit_deep/8;
-        let limit = VirtAddr::new(frame_height*frame_width*bit_deep/8)+dst;
-        Self { dst, limit, current:0,start_offset:offset }
+        let byte_per_pixel = bitdepth / 8;
+        let limit = VirtAddr::new(frame_height * frame_width * byte_per_pixel) + dst;
+        Self {
+            dst,
+            limit,
+            current: 0,
+            start_offset: start_offset(image, bitdepth as u32, (frame_width * bitdepth / 8) as u32) as usize,
+            start_xpos: image.x  as usize * byte_per_pixel ,
+            current_xpos: image.x as usize * byte_per_pixel ,
+            limit_xpos:frame_width*byte_per_pixel ,
+        }
     }
-    pub fn write<T>(&mut self,data:T)->bool{
-        let size=size_of::<T>() as u32;
-        let mut dst=self.dst;
+    pub fn write<T>(&mut self, data: T) -> FramePointerStatus {
+        let size = size_of::<T>();
+        let mut dst = self.dst;
 
         // if self.current+size>self.limit {
         // if true {
-        if self.dst.data()+self.current as usize+self.start_offset as usize+size_of::<T>()>self.limit.data() {
-            send_to_default_serial8250_port(format!("warning:illegal use of frame_pointer has been detected! FB:{:?}\n",self).as_bytes());
+        if self.dst.data() + self.current  + self.start_offset  + size
+            > self.limit.data()
+        {
+            // send_to_default_serial8250_port(format!("warning:illegal use of frame_pointer has been detected! FB:{:?}\n",self).as_bytes());
             // panic!();
-            return false;
-        }else{
-            dst=dst.add(self.current as usize+self.start_offset as usize);
+            return FramePointerStatus::OutOfBuffer;
+        }
+        else if self.current_xpos+size>self.limit_xpos{
+            return FramePointerStatus::OutOfScreen;
+        }
+         else {
+            dst = dst.add(self.current + self.start_offset );
+
         }
         unsafe {
-            *dst.as_ptr::<T>()=data;
+            *dst.as_ptr::<T>() = data;
         }
-        self.current+=size;
-        return true;
+        self.current += size;
+        self.current_xpos+=size;
+        
+        return FramePointerStatus::Normal;
     }
 
-    pub fn move_with_offset(&mut self,offset:u32){
-        self.current=offset;
+    pub fn move_with_offset(&mut self, offset: u32) {
+        self.current = offset as usize;
+        self.current_xpos=self.start_xpos;
     }
+}
+
+pub enum FramePointerStatus {
+    Normal,
+    OutOfScreen,
+    OutOfBuffer,
+}
+
+pub fn start_offset(image: &FbImage, bitdepth: u32, line_length: u32) -> u32 {
+    let x = image.x;
+    let y = image.y;
+    let mut bitstart = (y * line_length * 8) + (x * bitdepth);
+    let byte_per_pixel = core::mem::size_of::<u32>() as u32;
+    // 位转字节
+    bitstart /= 8;
+
+    // 对齐到像素字节大小
+    bitstart &= !(byte_per_pixel - 1);
+    return bitstart;
 }

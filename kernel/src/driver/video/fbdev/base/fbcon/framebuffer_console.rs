@@ -312,33 +312,32 @@ impl ConsoleSwitch for BlittingFbConsole {
         let fbcon_data = self.fbcon_data();
         let c = buf[0];
         let width = (vc_data.font.width + 7) / 8;
-        let x_display_max=self.fb().current_fb_var().xres/width;
-        let mut count=count as u32;
-        let mut times=0;
-        while count>x_display_max {
+        let x_display_max = self.fb().current_fb_var().xres / width;
+        let mut count = count as u32;
+        let mut times = 0;
+        while count > x_display_max {
             self.put_string(
                 vc_data,
                 buf,
                 x_display_max,
-                fbcon_data.display.real_y(ypos+times),
+                fbcon_data.display.real_y(ypos + times),
                 xpos,
                 self.get_color(vc_data, c, true),
                 self.get_color(vc_data, c, false),
             )?;
             panic!();
-            count-=x_display_max;
-            times+=1;
+            count -= x_display_max;
+            times += 1;
         }
         self.put_string(
             vc_data,
             buf,
-            count ,
-            fbcon_data.display.real_y(ypos+times),
+            count,
+            fbcon_data.display.real_y(ypos + times),
             xpos,
             self.get_color(vc_data, c, true),
             self.get_color(vc_data, c, false),
         )
-        
     }
 
     fn con_getxy(

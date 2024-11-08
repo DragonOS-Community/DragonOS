@@ -130,7 +130,7 @@ pub fn panic(info: &PanicInfo) -> ! {
             send_to_default_serial8250_port("No location info".as_bytes());
         }
     }
-    let s=format!("Message:\n\t{}", info.message());
+    let s = format!("Message:\n\t{}", info.message());
 
     #[cfg(all(feature = "backtrace", target_arch = "x86_64"))]
     {

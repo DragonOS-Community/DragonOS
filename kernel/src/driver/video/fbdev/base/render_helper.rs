@@ -1,9 +1,6 @@
 use core::{ops::Add, slice::Iter};
 
-use crate::{
-    arch::cpu::current_cpu_id, driver::serial::serial8250::send_to_default_serial8250_port,
-    mm::VirtAddr,
-};
+use crate::mm::VirtAddr;
 
 use super::FbImage;
 
@@ -178,14 +175,13 @@ impl PixelLineStatus {
     }
 }
 
-
 /// # 结构功能
 /// 安全的FrameBufferPointer
 /// 使用该结构体访问FrameBuffer可以防止超出FrameBuffer区域的访问
 /// 需要注意，使用该指针写入时，任何超出屏幕的写入都是无效的！即使仍然可以写入显存。
 /// 此外由于FbImage中的x和y变量采用u32类型，所以并未考虑左越界和上越界的安全性(即Image.x<0或Image.y<0的情况)
 /// ## 成员
-/// 
+///
 ///  - "dst" : 显存base address，通常是0xffffa1003ff00000
 ///  - "limit" : 显存区域上界，可以通过公式计算：limit = dst + 分辨率高*分辨率宽*每个像素的**字节**数。也就是说任何对于显存的访问应该限制在[dst,limit)中
 ///  - "current" : 当前相对于start_offset的位移
@@ -201,10 +197,8 @@ pub struct FrameP {
     start_offset: usize,
     start_xpos: usize,
     current_xpos: usize,
-    limit_xpos:usize,
+    limit_xpos: usize,
 }
-
-
 
 impl FrameP {
     pub fn new(
@@ -220,10 +214,11 @@ impl FrameP {
             dst,
             limit,
             current: 0,
-            start_offset: start_offset(image, bitdepth as u32, (frame_width * bitdepth / 8) as u32) as usize,
-            start_xpos: image.x  as usize * byte_per_pixel ,
-            current_xpos: image.x as usize * byte_per_pixel ,
-            limit_xpos:frame_width*byte_per_pixel ,
+            start_offset: start_offset(image, bitdepth as u32, (frame_width * bitdepth / 8) as u32)
+                as usize,
+            start_xpos: image.x as usize * byte_per_pixel,
+            current_xpos: image.x as usize * byte_per_pixel,
+            limit_xpos: frame_width * byte_per_pixel,
         }
     }
 
@@ -236,20 +231,17 @@ impl FrameP {
         let mut dst = self.dst;
 
         // 你最终要写入的位置实际上是[dst+start_offset+current,dst+start_offset+current+size),所以我们要确定你写入的位置是否超过limit
-        if self.dst.data() + self.current  + self.start_offset  + size
-            > self.limit.data()
-        {
+        if self.dst.data() + self.current + self.start_offset + size > self.limit.data() {
             return FramePointerStatus::OutOfBuffer;
         }
         // 我们也不希望你的x超出屏幕右边，超出屏幕右边的部分会被忽略掉，因为如果写入显存会导致内存风险
-        else if self.current_xpos+size>self.limit_xpos{
+        else if self.current_xpos + size > self.limit_xpos {
             return FramePointerStatus::OutOfScreen;
         }
         // 如果上面两个检查都通过了，我们就可以写入显存了
         else {
             // 这里是写入位置的实际虚拟地址
-            dst = dst.add(self.current + self.start_offset );
-
+            dst = dst.add(self.current + self.start_offset);
         }
         // 写入操作
         unsafe {
@@ -257,7 +249,7 @@ impl FrameP {
         }
         // 写入后更新current和xpos
         self.current += size;
-        self.current_xpos+=size;
+        self.current_xpos += size;
         // 由于写入正常，我们返回正常的状态
         return FramePointerStatus::Normal;
     }
@@ -279,11 +271,11 @@ impl FrameP {
 
         //     }
         // }
-        self.current_xpos=self.start_xpos;
+        self.current_xpos = self.start_xpos;
     }
+
+    
 }
-
-
 
 pub enum FramePointerStatus {
     /// 表示状态正常

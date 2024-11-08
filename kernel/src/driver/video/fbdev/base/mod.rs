@@ -3,10 +3,7 @@ use render_helper::{FrameP, FramePointerStatus};
 use system_error::SystemError;
 
 use crate::{
-    driver::{
-        base::device::Device, serial::serial8250::send_to_default_serial8250_port,
-        tty::virtual_terminal::Color,
-    },
+    driver::{base::device::Device, tty::virtual_terminal::Color},
     init::boot_params,
     libs::rwlock::RwLock,
     mm::{ucontext::LockedVMA, PhysAddr, VirtAddr},
@@ -79,15 +76,16 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         // 位转字节
         bitstart /= 8;
 
-        // 对齐到像素字节大小
-        bitstart &= !(byte_per_pixel - 1);
         let dst2 = boot_param.screen_info.lfb_virt_base;
         if dst2.is_none() {
             return;
         }
-        let mut dst1 = dst2.unwrap();
-        dst1 += VirtAddr::new(bitstart as usize);
-
+        let mut safe_pointer=FrameP::new(
+self.current_fb_var().yres as usize,
+ self.current_fb_var().xres as usize,
+    self.current_fb_var().bits_per_pixel as usize,
+         dst2.unwrap(), image
+        );
         let _ = self.fb_sync();
 
         if image.depth == 1 {
@@ -110,15 +108,13 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                 && image.width & (32 / bit_per_pixel - 1) == 0
                 && (8..=32).contains(&bit_per_pixel)
             {
-                unsafe { self.fast_imageblit(image, dst1, fg, bg) }
+                unsafe { self.fast_imageblit(image, &mut safe_pointer, fg, bg) }
             } else {
                 self.slow_imageblit(
                     image,
-                    dst2.unwrap(),
+                    &mut safe_pointer,
                     fg,
                     bg,
-                    bitstart,
-                    self.current_fb_fix().line_length,
                 )
             }
         } else {
@@ -132,7 +128,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
     /// 要求 image->width 可以被像素或 dword (ppw) 整除。
     /// 要求 fix->line_length 可以被 4 整除。
     /// 扫描线的开始和结束都是 dword 对齐的。
-    unsafe fn fast_imageblit(&self, image: &FbImage, mut dst1: VirtAddr, fg: u32, bg: u32) {
+    unsafe fn fast_imageblit(&self, image: &FbImage,  dst1: &mut FrameP, fg: u32, bg: u32) {
         let bpp = self.current_fb_var().bits_per_pixel;
         let mut fgx = fg;
         let mut bgx = bg;
@@ -164,13 +160,12 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
             color_tab[idx] = (*val & eorx) ^ bgx;
         }
 
-        let mut dst;
         let mut shift;
         let mut src;
         let mut offset = 0;
         let mut j = 0;
+        let mut count=0;
         for _ in (0..image.height).rev() {
-            dst = dst1.as_ptr::<u32>();
             shift = 8;
             src = offset;
             match ppw {
@@ -178,10 +173,8 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                     // 8bpp
                     j = k;
                     while j >= 2 {
-                        *dst = color_tab[(image.data[src] as usize >> 4) & bitmask];
-                        dst = dst.add(1);
-                        *dst = color_tab[(image.data[src] as usize) & bitmask];
-                        dst = dst.add(1);
+                        dst1.write(color_tab[(image.data[src] as usize >> 4) & bitmask]);
+                        dst1.write(color_tab[(image.data[src] as usize) & bitmask]);
                         j -= 2;
                         src += 1;
                     }
@@ -190,14 +183,10 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                     // 16bpp
                     j = k;
                     while j >= 4 {
-                        *dst = color_tab[(image.data[src] as usize >> 6) & bitmask];
-                        dst = dst.add(1);
-                        *dst = color_tab[(image.data[src] as usize >> 4) & bitmask];
-                        dst = dst.add(1);
-                        *dst = color_tab[(image.data[src] as usize >> 2) & bitmask];
-                        dst = dst.add(1);
-                        *dst = color_tab[(image.data[src] as usize) & bitmask];
-                        dst = dst.add(1);
+                        dst1.write(color_tab[(image.data[src] as usize >> 6) & bitmask]);
+                        dst1.write(color_tab[(image.data[src] as usize >> 4) & bitmask]);
+                        dst1.write(color_tab[(image.data[src] as usize >> 2) & bitmask]);
+                        dst1.write(color_tab[(image.data[src] as usize ) & bitmask]);
                         src += 1;
                         j -= 4;
                     }
@@ -206,22 +195,14 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                     // 32 bpp
                     j = k;
                     while j >= 8 {
-                        *dst = color_tab[(image.data[src] as usize >> 7) & bitmask];
-                        dst = dst.add(1);
-                        *dst = color_tab[(image.data[src] as usize >> 6) & bitmask];
-                        dst = dst.add(1);
-                        *dst = color_tab[(image.data[src] as usize >> 5) & bitmask];
-                        dst = dst.add(1);
-                        *dst = color_tab[(image.data[src] as usize >> 4) & bitmask];
-                        dst = dst.add(1);
-                        *dst = color_tab[(image.data[src] as usize >> 3) & bitmask];
-                        dst = dst.add(1);
-                        *dst = color_tab[(image.data[src] as usize >> 2) & bitmask];
-                        dst = dst.add(1);
-                        *dst = color_tab[(image.data[src] as usize >> 1) & bitmask];
-                        dst = dst.add(1);
-                        *dst = color_tab[(image.data[src] as usize) & bitmask];
-                        dst = dst.add(1);
+                        dst1.write(color_tab[(image.data[src] as usize >> 7) & bitmask]);
+                        dst1.write(color_tab[(image.data[src] as usize >> 6) & bitmask]);
+                        dst1.write(color_tab[(image.data[src] as usize >> 5) & bitmask]);
+                        dst1.write(color_tab[(image.data[src] as usize >> 4) & bitmask]);
+                        dst1.write(color_tab[(image.data[src] as usize >> 3) & bitmask]);
+                        dst1.write(color_tab[(image.data[src] as usize >> 2) & bitmask]);
+                        dst1.write(color_tab[(image.data[src] as usize >> 1) & bitmask]);
+                        dst1.write(color_tab[(image.data[src] as usize) & bitmask]);
                         src += 1;
                         j -= 8;
                     }
@@ -236,8 +217,7 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
              */
             while j != 0 {
                 shift -= ppw;
-                *dst = color_tab[(image.data[src] as usize >> shift) & bitmask];
-                dst = dst.add(1);
+                dst1.write(color_tab[(image.data[src] as usize >> shift) & bitmask]);
                 if shift == 0 {
                     shift = 8;
                     src += 1;
@@ -245,7 +225,8 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                 j -= 1;
             }
 
-            dst1 += VirtAddr::new(self.current_fb_fix().line_length as usize);
+            count+=1;
+            dst1.move_with_offset(self.current_fb_fix().line_length*count);
             offset += spitch as usize;
         }
     }
@@ -253,20 +234,12 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
     fn slow_imageblit(
         &self,
         _image: &FbImage,
-        _dst1: VirtAddr,
+        safe_dst:&mut FrameP,
         _fg: u32,
         _bg: u32,
-        _start_index: u32,
-        _pitch_index: u32,
     ) {
-        let mut safe_dst = FrameP::new(
-            self.current_fb_var().yres as usize,
-            self.current_fb_var().xres as usize,
-            self.current_fb_var().bits_per_pixel as usize,
-            _dst1,
-            _image,
-        );
         let mut count = 0;
+        let mut pt_status = FramePointerStatus::Normal;
         let iter = BitIter::new(
             _fg,
             _bg,
@@ -276,22 +249,19 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
             _image.data.iter(),
             _image.width,
         );
-        let mut pt_status = FramePointerStatus::Normal;
         for (content, full) in iter {
             match pt_status {
                 FramePointerStatus::OutOfBuffer => {
                     return;
                 }
-                FramePointerStatus::OutOfScreen => {
-                    
-                }
+                FramePointerStatus::OutOfScreen => {}
                 FramePointerStatus::Normal => {
                     pt_status = safe_dst.write(content);
                 }
             }
             if full {
                 count += 1;
-                safe_dst.move_with_offset(_pitch_index * count);
+                safe_dst.move_with_offset(self.current_fb_fix().line_length*count);
                 pt_status = FramePointerStatus::Normal;
             }
         }

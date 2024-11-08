@@ -104,13 +104,12 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                 bg = image.bg;
             }
 
-            if 32 % bit_per_pixel == 114514
+            if 32 % bit_per_pixel == 0
                 && start_index == 0
                 && pitch_index == 0
                 && image.width & (32 / bit_per_pixel - 1) == 0
                 && (8..=32).contains(&bit_per_pixel)
             {
-                // loop{}
                 unsafe { self.fast_imageblit(image, dst1, fg, bg) }
             } else {
                 self.slow_imageblit(
@@ -260,7 +259,6 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         _start_index: u32,
         _pitch_index: u32,
     ) {
-        // let mut dst = _dst1.as_ptr::<u32>();
         let mut safe_dst = FrameP::new(
             self.current_fb_var().yres as usize,
             self.current_fb_var().xres as usize,
@@ -268,9 +266,6 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
             _dst1,
             _image,
         );
-        // let mut safe_dst=FrameP::new(480, 640, 32, _dst1,_start_index);
-        // let mut safe_dst=FrameP::new(900, 1600, 32, _dst1,_start_index);
-
         let mut count = 0;
         let iter = BitIter::new(
             _fg,
@@ -283,11 +278,6 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
         );
         let mut pt_status = FramePointerStatus::Normal;
         for (content, full) in iter {
-            // if !safe_dst.write(content){
-            //     send_to_default_serial8250_port(format!("current Iamge:{:?}\n",_image).as_bytes());
-            //     send_to_default_serial8250_port(format!("current Iter:{:?},pitch_index:{:?}\n",_pitch_index * count,_pitch_index).as_bytes());
-            //     return;
-            // }
             match pt_status {
                 FramePointerStatus::OutOfBuffer => {
                     return;
@@ -299,12 +289,6 @@ pub trait FrameBuffer: FrameBufferInfo + FrameBufferOps + Device {
                     pt_status = safe_dst.write(content);
                 }
             }
-            // unsafe {
-            //     *dst = content;
-
-            //     dst = dst.add(1);
-            // }
-
             if full {
                 count += 1;
                 safe_dst.move_with_offset(_pitch_index * count);

@@ -6,7 +6,7 @@
     "BuildFromSource": {
       "Git": {
         "url": "https://git.mirrors.dragonos.org.cn/DragonOS-Community/NovaShell.git",
-        "revision": "7bb802ad1e"
+        "revision": "cb835e03e4"
       }
     }
   },

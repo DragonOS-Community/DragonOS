@@ -570,7 +570,7 @@ impl Syscall {
         drop(fd_table_guard);
         let file = file.unwrap();
 
-        return file.read(buf.len(), buf, false);
+        return file.read(buf.len(), buf);
     }
 
     /// @brief 根据文件描述符，向文件写入数据。尝试写入的数据长度与buf的长度相同。
@@ -639,7 +639,7 @@ impl Syscall {
         drop(fd_table_guard);
         let file = file.unwrap();
 
-        return file.pread(offset, len, buf, false);
+        return file.pread(offset, len, buf);
     }
 
     /// # sys_pwrite64 系统调用的实际执行函数
@@ -1575,7 +1575,7 @@ impl Syscall {
 
         let file = File::new(inode, FileMode::O_RDONLY)?;
 
-        let len = file.read(buf_size, ubuf, false)?;
+        let len = file.read(buf_size, ubuf)?;
 
         return Ok(len);
     }

@@ -257,18 +257,21 @@ impl PageCache {
     ///
     /// - `Ok(usize)` 成功读取的长度
     /// - `Err(SystemError)` 失败返回错误码
-    pub fn read(
-        &self,
-        offset: usize,
-        buf: &mut [u8],
-        read_func: impl Fn(usize, &mut [u8]) -> Result<usize, SystemError>,
-    ) -> Result<usize, SystemError> {
-        let mut not_exist = Vec::new();
-        let len = buf.len();
-        // log::debug!("offset:{offset}, len:{len}");
+    pub fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let inode = self.inode.upgrade().unwrap();
+        let file_size = inode.metadata().unwrap().size;
+
+        let len = if offset < file_size as usize {
+            core::cmp::min(file_size as usize, offset + buf.len()) - offset
+        } else {
+            0
+        };
+
         if len == 0 {
             return Ok(0);
         }
+
+        let mut not_exist = Vec::new();
 
         let start_page_offset = offset >> MMArch::PAGE_SHIFT;
         let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_offset;
@@ -325,7 +328,7 @@ impl PageCache {
 
         for (page_offset, count) in not_exist {
             let mut page_buf = vec![0u8; MMArch::PAGE_SIZE * count];
-            read_func(page_offset * MMArch::PAGE_SIZE, page_buf.as_mut())?;
+            inode.read_page_sync(page_offset * MMArch::PAGE_SIZE, page_buf.as_mut())?;
 
             self.create_pages(page_offset, page_buf.as_mut());
 
@@ -496,18 +499,12 @@ impl File {
     /// ### 返回值
     /// - `Ok(usize)`: 成功读取的字节数
     /// - `Err(SystemError)`: 错误码
-    pub fn read(
-        &self,
-        len: usize,
-        buf: &mut [u8],
-        read_direct: bool,
-    ) -> Result<usize, SystemError> {
+    pub fn read(&self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         self.do_read(
             self.offset.load(core::sync::atomic::Ordering::SeqCst),
             len,
             buf,
             true,
-            read_direct,
         )
     }
 
@@ -539,14 +536,8 @@ impl File {
     ///
     /// ### 返回值
     /// - `Ok(usize)`: 成功读取的字节数
-    pub fn pread(
-        &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        read_direct: bool,
-    ) -> Result<usize, SystemError> {
-        self.do_read(offset, len, buf, false, read_direct)
+    pub fn pread(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.do_read(offset, len, buf, false)
     }
 
     /// ## 从buf向文件中指定的偏移处写入指定的字节数的数据
@@ -568,7 +559,6 @@ impl File {
         len: usize,
         buf: &mut [u8],
         update_offset: bool,
-        read_direct: bool,
     ) -> Result<usize, SystemError> {
         // 先检查本文件在权限等规则下，是否可读取。
         self.readable()?;
@@ -576,7 +566,7 @@ impl File {
             return Err(SystemError::ENOBUFS);
         }
 
-        let r = if read_direct {
+        let r = if self.mode().contains(FileMode::O_DIRECT) {
             self.inode
                 .read_direct(offset, len, buf, self.private_data.lock())
         } else {

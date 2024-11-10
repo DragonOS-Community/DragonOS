@@ -128,6 +128,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
     }
+
+    fn read_page_sync(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
+
     /// @brief 打开文件
     ///
     /// @return 成功：Ok()
@@ -600,16 +605,12 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// - `Err(SystemError)``: Err(Posix错误码)
     fn read_direct(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        data: SpinLockGuard<FilePrivateData>,
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
+        _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        if self.page_cache().is_none() {
-            return self.read_at(offset, len, buf, data);
-        } else {
-            return Err(SystemError::ENOSYS);
-        }
+        return Err(SystemError::ENOSYS);
     }
 }
 

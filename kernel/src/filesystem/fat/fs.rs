@@ -1384,49 +1384,17 @@ impl FATFsInfo {
 }
 
 impl IndexNode for LockedFATInode {
-    fn read_at(
-        &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let len = core::cmp::min(len, buf.len());
-        let buf = &mut buf[0..len];
-        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+    fn read_page_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let guard: SpinLockGuard<FATInode> = self.0.lock();
+        let len = buf.len();
         match &guard.inode_type {
             FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
-                // log::debug!(
-                //     "read_at len: {len}, offset: {offset}, file_size:{:?}",
-                //     guard.metadata.size
-                // );
-
-                let file_size = guard.metadata.size;
-
-                let len = if offset < file_size as usize {
-                    core::cmp::min(file_size as usize, offset + len) - offset
-                } else {
-                    0
-                };
-
-                if let Some(page_cache) = &guard.page_cache {
-                    let r = page_cache.read(
-                        offset,
-                        &mut buf[0..len],
-                        |file_offset: usize, buf: &mut [u8]| {
-                            f.read(&guard.fs.upgrade().unwrap(), buf, file_offset as u64)
-                        },
-                    );
-                    return r;
-                } else {
-                    let r = f.read(
-                        &guard.fs.upgrade().unwrap(),
-                        &mut buf[0..len],
-                        offset as u64,
-                    );
-                    guard.update_metadata();
-                    return r;
-                }
+                let r = f.read(
+                    &guard.fs.upgrade().unwrap(),
+                    &mut buf[0..len],
+                    offset as u64,
+                );
+                return r;
             }
 
             FATDirEntry::Dir(_) => {
@@ -1436,6 +1404,25 @@ impl IndexNode for LockedFATInode {
                 error!("FATFS: param: Inode_type uninitialized.");
                 return Err(SystemError::EROFS);
             }
+        }
+    }
+
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        let len = core::cmp::min(len, buf.len());
+        let buf = &mut buf[0..len];
+
+        let page_cache = self.0.lock().page_cache.clone();
+        if let Some(page_cache) = page_cache {
+            let r = page_cache.read(offset, &mut buf[0..len]);
+            return r;
+        } else {
+            return self.read_direct(offset, len, buf, data);
         }
     }
 
@@ -1901,7 +1888,7 @@ impl IndexNode for LockedFATInode {
         buf: &mut [u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let guard: SpinLockGuard<FATInode> = self.0.lock();
         match &guard.inode_type {
             FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
                 let r = f.read(
@@ -1909,7 +1896,6 @@ impl IndexNode for LockedFATInode {
                     &mut buf[0..len],
                     offset as u64,
                 );
-                guard.update_metadata();
                 return r;
             }
 

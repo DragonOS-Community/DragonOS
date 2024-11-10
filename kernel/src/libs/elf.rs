@@ -341,7 +341,7 @@ impl ElfLoader {
 
         while remain > 0 {
             let read_size = min(remain, buf_size);
-            file.read(read_size, &mut buf[..read_size], true)?;
+            file.read(read_size, &mut buf[..read_size])?;
             // debug!("copy_to_user: vaddr={:?}, read_size = {read_size}", vaddr);
             unsafe {
                 copy_to_user(vaddr, &buf[..read_size]).map_err(|_| SystemError::EFAULT)?;
@@ -448,7 +448,7 @@ impl ElfLoader {
                 .map_err(|_| elf::ParseError::BadOffset(shoff as u64))?;
             let shdr_buf_size = ehdr.e_shentsize * 2;
             let mut shdr_buf = vec![0u8; shdr_buf_size as usize];
-            file.read(shdr_buf_size as usize, &mut shdr_buf, true)
+            file.read(shdr_buf_size as usize, &mut shdr_buf)
                 .map_err(|_| elf::ParseError::BadOffset(shoff as u64))?;
 
             let mut offset = 0;
@@ -481,7 +481,7 @@ impl ElfLoader {
         data_buf.clear();
         data_buf.resize(size, 0);
 
-        file.read(size, data_buf, true)
+        file.read(size, data_buf)
             .expect("read program header table failed");
         let buf = data_buf.get_bytes(0..size)?;
 

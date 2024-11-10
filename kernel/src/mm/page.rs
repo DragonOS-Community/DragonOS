@@ -186,20 +186,7 @@ impl PageReclaimer {
     /// - `count`: 需要缩减的页面数量
     pub fn shrink_list(&mut self, count: PageFrameCount) {
         for _ in 0..count.data() {
-            let (paddr, page) = self.lru.pop_lru().expect("pagecache is empty");
-            let page_cache = page.read_irqsave().page_cache().unwrap();
-            for vma in page.read_irqsave().anon_vma() {
-                let address_space = vma.lock_irqsave().address_space().unwrap();
-                let address_space = address_space.upgrade().unwrap();
-                let mut guard = address_space.write();
-                let mapper = &mut guard.user_mapper.utable;
-                let virt = vma.lock_irqsave().page_address(&page).unwrap();
-                unsafe {
-                    mapper.unmap(virt, false).unwrap().flush();
-                }
-            }
-            page_cache.remove_page(page.read_irqsave().index().unwrap());
-            page_manager_lock_irqsave().remove_page(&paddr);
+            let (_, page) = self.lru.pop_lru().expect("pagecache is empty");
             if page.read_irqsave().flags.contains(PageFlags::PG_DIRTY) {
                 Self::page_writeback(&page, true);
             }
@@ -233,6 +220,7 @@ impl PageReclaimer {
             let virt = vma.lock_irqsave().page_address(page).unwrap();
             if unmap {
                 unsafe {
+                    // 取消页表映射
                     mapper.unmap(virt, false).unwrap().flush();
                 }
             } else {
@@ -286,6 +274,12 @@ impl PageReclaimer {
                 SpinLock::new(FilePrivateData::Unused).lock(),
             )
             .unwrap();
+
+        // 删除页面
+        let page_cache = page.read_irqsave().page_cache().unwrap();
+        let paddr = page.read_irqsave().phys_address();
+        page_cache.remove_page(page.read_irqsave().index().unwrap());
+        page_manager_lock_irqsave().remove_page(&paddr);
     }
 
     /// lru脏页刷新

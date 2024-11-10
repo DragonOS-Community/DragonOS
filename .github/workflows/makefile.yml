@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     container:
-      image: dragonos/dragonos-dev:v1.5.1
+      image: dragonos/dragonos-dev:v1.5.3
       env:
         IN_GITHUB_WORKFLOW: 1
 
@@ -21,7 +21,7 @@ jobs:
         arch: [x86_64, riscv64]
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.5.1"
+      - run: echo "Running in dragonos/dragonos-dev:v1.5.3"
       - uses: actions/checkout@v3
 
       - name: Format check
@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     container:
-      image: dragonos/dragonos-dev:v1.5.1
+      image: dragonos/dragonos-dev:v1.5.3
       env:
         IN_GITHUB_WORKFLOW: 1
 
@@ -47,7 +47,7 @@ jobs:
         arch: [x86_64, riscv64]
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.5.1"
+      - run: echo "Running in dragonos/dragonos-dev:v1.5.3"
 
       - uses: actions/checkout@v3
 
@@ -61,12 +61,12 @@ jobs:
   build-x86_64:
     runs-on: ubuntu-latest
     container:
-      image: dragonos/dragonos-dev:v1.5.1
+      image: dragonos/dragonos-dev:v1.5.3
       env:
         IN_GITHUB_WORKFLOW: 1
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.5.1"
+      - run: echo "Running in dragonos/dragonos-dev:v1.5.3"
 
       - uses: actions/checkout@v3
       - name: build the DragonOS
@@ -85,12 +85,12 @@ jobs:
   build-riscv64:
     runs-on: ubuntu-latest
     container:
-      image: dragonos/dragonos-dev:v1.5.1
+      image: dragonos/dragonos-dev:v1.5.3
       env:
         IN_GITHUB_WORKFLOW: 1
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.5.1"
+      - run: echo "Running in dragonos/dragonos-dev:v1.5.3"
 
       - uses: actions/checkout@v3
         with:

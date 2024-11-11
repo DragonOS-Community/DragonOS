@@ -296,6 +296,26 @@ impl IndexNode for MountFSInode {
         return self.inner_inode.write_at(offset, len, buf, data);
     }
 
+    fn read_direct(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        self.inner_inode.read_direct(offset, len, buf, data)
+    }
+
+    fn write_direct(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        self.inner_inode.write_direct(offset, len, buf, data)
+    }
+
     #[inline]
     fn fs(&self) -> Arc<dyn FileSystem> {
         return self.mount_fs.clone();
@@ -534,16 +554,6 @@ impl IndexNode for MountFSInode {
 
     fn page_cache(&self) -> Option<Arc<PageCache>> {
         self.inner_inode.page_cache()
-    }
-
-    fn read_direct(
-        &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        data: SpinLockGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        self.inner_inode.read_direct(offset, len, buf, data)
     }
 }
 

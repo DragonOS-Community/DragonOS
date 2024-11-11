@@ -1384,22 +1384,38 @@ impl FATFsInfo {
 }
 
 impl IndexNode for LockedFATInode {
-    fn read_page_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+    fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         let guard: SpinLockGuard<FATInode> = self.0.lock();
-        let len = buf.len();
         match &guard.inode_type {
             FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
-                let r = f.read(
-                    &guard.fs.upgrade().unwrap(),
-                    &mut buf[0..len],
-                    offset as u64,
-                );
+                let r = f.read(&guard.fs.upgrade().unwrap(), buf, offset as u64);
                 return r;
             }
 
             FATDirEntry::Dir(_) => {
                 return Err(SystemError::EISDIR);
             }
+            FATDirEntry::UnInit => {
+                error!("FATFS: param: Inode_type uninitialized.");
+                return Err(SystemError::EROFS);
+            }
+        }
+    }
+
+    fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
+        let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
+
+        match &mut guard.inode_type {
+            FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
+                let r = f.write(fs, buf, offset as u64);
+                return r;
+            }
+
+            FATDirEntry::Dir(_) => {
+                return Err(SystemError::EISDIR);
+            }
+
             FATDirEntry::UnInit => {
                 error!("FATFS: param: Inode_type uninitialized.");
                 return Err(SystemError::EROFS);
@@ -1431,37 +1447,43 @@ impl IndexNode for LockedFATInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
         let buf = &buf[0..len];
-        let mut guard: SpinLockGuard<FATInode> = self.0.lock();
-        let page_cache = guard.page_cache.clone();
-        let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
 
-        match &mut guard.inode_type {
-            FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
-                if let Some(page_cache) = page_cache {
-                    let write_len = page_cache.write(offset, buf)?;
-                    let old_size = guard.metadata.size;
-                    guard.metadata.size = core::cmp::max(old_size, (offset + write_len) as i64);
-                    return Ok(write_len);
-                } else {
-                    let r = f.write(fs, &buf[0..len], offset as u64);
-                    guard.update_metadata();
-                    return r;
-                }
-            }
-
-            FATDirEntry::Dir(_) => {
-                return Err(SystemError::EISDIR);
-            }
-
-            FATDirEntry::UnInit => {
-                error!("FATFS: param: Inode_type uninitialized.");
-                return Err(SystemError::EROFS);
-            }
+        let page_cache = self.0.lock().page_cache.clone();
+        if let Some(page_cache) = page_cache {
+            let write_len = page_cache.write(offset, buf)?;
+            let mut guard = self.0.lock();
+            let old_size = guard.metadata.size;
+            guard.metadata.size = core::cmp::max(old_size, (offset + write_len) as i64);
+            return Ok(write_len);
+        } else {
+            return self.write_direct(offset, len, buf, data);
         }
+    }
+
+    fn read_direct(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        let len = core::cmp::min(len, buf.len());
+        self.read_sync(offset, &mut buf[0..len])
+    }
+
+    fn write_direct(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        let len = core::cmp::min(len, buf.len());
+        self.write_sync(offset, &buf[0..len])
     }
 
     fn create(
@@ -1879,34 +1901,6 @@ impl IndexNode for LockedFATInode {
 
     fn page_cache(&self) -> Option<Arc<PageCache>> {
         self.0.lock().page_cache.clone()
-    }
-
-    fn read_direct(
-        &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let guard: SpinLockGuard<FATInode> = self.0.lock();
-        match &guard.inode_type {
-            FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
-                let r = f.read(
-                    &guard.fs.upgrade().unwrap(),
-                    &mut buf[0..len],
-                    offset as u64,
-                );
-                return r;
-            }
-
-            FATDirEntry::Dir(_) => {
-                return Err(SystemError::EISDIR);
-            }
-            FATDirEntry::UnInit => {
-                error!("FATFS: param: Inode_type uninitialized.");
-                return Err(SystemError::EROFS);
-            }
-        }
     }
 }
 

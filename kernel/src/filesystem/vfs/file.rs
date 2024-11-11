@@ -328,7 +328,7 @@ impl PageCache {
 
         for (page_offset, count) in not_exist {
             let mut page_buf = vec![0u8; MMArch::PAGE_SIZE * count];
-            inode.read_page_sync(page_offset * MMArch::PAGE_SIZE, page_buf.as_mut())?;
+            inode.read_sync(page_offset * MMArch::PAGE_SIZE, page_buf.as_mut())?;
 
             self.create_pages(page_offset, page_buf.as_mut());
 

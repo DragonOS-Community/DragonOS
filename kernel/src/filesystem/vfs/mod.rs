@@ -129,7 +129,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
-    fn read_page_sync(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+    fn read_sync(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
+
+    fn write_sync(&self, _offset: usize, _buf: &[u8]) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
@@ -188,6 +192,52 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         buf: &[u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
+
+    /// # 在inode的指定偏移量开始，读取指定大小的数据，忽略PageCache
+    ///
+    /// ## 参数
+    ///
+    /// - `offset`: 起始位置在Inode中的偏移量
+    /// - `len`: 要读取的字节数
+    /// - `buf`: 缓冲区
+    /// - `data`: 各文件系统系统所需私有信息
+    ///
+    /// ## 返回值
+    ///
+    /// - `Ok(usize)``: Ok(读取的字节数)
+    /// - `Err(SystemError)``: Err(Posix错误码)
+    fn read_direct(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
+
+    /// # 在inode的指定偏移量开始，写入指定大小的数据，忽略PageCache
+    ///
+    /// ## 参数
+    ///
+    /// - `offset`: 起始位置在Inode中的偏移量
+    /// - `len`: 要读取的字节数
+    /// - `buf`: 缓冲区
+    /// - `data`: 各文件系统系统所需私有信息
+    ///
+    /// ## 返回值
+    ///
+    /// - `Ok(usize)``: Ok(读取的字节数)
+    /// - `Err(SystemError)``: Err(Posix错误码)
+    fn write_direct(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
 
     /// @brief 获取当前inode的状态。
     ///
@@ -577,29 +627,6 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
             crate::libs::name::get_type_name(&self)
         );
         None
-    }
-
-    /// # 在inode的指定偏移量开始，读取指定大小的数据，忽略PageCache
-    ///
-    /// ## 参数
-    ///
-    /// - `offset`: 起始位置在Inode中的偏移量
-    /// - `len`: 要读取的字节数
-    /// - `buf`: 缓冲区
-    /// - `_data`: 各文件系统系统所需私有信息
-    ///
-    /// ## 返回值
-    ///
-    /// - `Ok(usize)``: Ok(读取的字节数)
-    /// - `Err(SystemError)``: Err(Posix错误码)
-    fn read_direct(
-        &self,
-        _offset: usize,
-        _len: usize,
-        _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        return Err(SystemError::ENOSYS);
     }
 }
 

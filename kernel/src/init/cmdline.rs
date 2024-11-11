@@ -43,6 +43,7 @@ pub struct KernelCmdlineParamBuilder {
     inv: bool,
 }
 
+#[allow(dead_code)]
 impl KernelCmdlineParamBuilder {
     pub const fn new(name: &'static str, ty: KCmdlineParamType) -> Self {
         Self {
@@ -110,6 +111,7 @@ pub enum KernelCmdlineParameter {
     EarlyKV(&'static KernelCmdlineEarlyKV),
 }
 
+#[allow(dead_code)]
 impl KernelCmdlineParameter {
     pub fn name(&self) -> &str {
         match self {
@@ -195,6 +197,7 @@ pub struct KernelCmdlineEarlyKV {
     default: &'static str,
 }
 
+#[allow(dead_code)]
 impl KernelCmdlineEarlyKV {
     pub const VALUE_MAX_LEN: usize = 256;
 

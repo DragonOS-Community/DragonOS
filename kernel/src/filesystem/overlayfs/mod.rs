@@ -14,6 +14,7 @@ use alloc::sync::Arc;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
 use entry::{OvlEntry, OvlLayer};
+use linkme::distributed_slice;
 use system_error::SystemError;
 
 const WHITEOUT_MODE: u64 = 0o020000 | 0o600; // whiteout字符设备文件模式与权限
@@ -89,7 +90,7 @@ struct OverlayFS {
 }
 
 #[derive(Debug)]
-struct OvlInode {
+pub struct OvlInode {
     redirect: String, // 重定向路径
     file_type: FileType,
     flags: SpinLock<u64>,

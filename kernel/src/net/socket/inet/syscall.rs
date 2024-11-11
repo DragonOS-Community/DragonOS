@@ -12,13 +12,14 @@ fn create_inet_socket(
     socket_type: PSOCK,
     protocol: smoltcp::wire::IpProtocol,
 ) -> Result<Arc<dyn Socket>, SystemError> {
-    // log::debug!("type: {:?}, protocol: {:?}", socket_type, protocol);
+    log::debug!("type: {:?}, protocol: {:?}", socket_type, protocol);
     use smoltcp::wire::IpProtocol::*;
     match socket_type {
         PSOCK::Datagram => match protocol {
             HopByHop | Udp => {
-                return Err(EPROTONOSUPPORT);
-                // return Ok(UdpSocket::new(false));
+                log::debug!("create udp socket");
+                // return Err(EPROTONOSUPPORT);
+                return Ok(UdpSocket::new(false));
             }
             _ => {
                 return Err(EPROTONOSUPPORT);
@@ -26,6 +27,7 @@ fn create_inet_socket(
         },
         PSOCK::Stream => match protocol {
             HopByHop | Tcp => {
+                log::debug!("create tcp socket");
                 return Ok(TcpSocket::new(false, version));
             }
             _ => {

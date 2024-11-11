@@ -188,7 +188,13 @@ impl Syscall {
     /// @brief 获取当前进程的pid
     pub fn getpid() -> Result<Pid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
-        return Ok(current_pcb.tgid());
+        // if let Some(pid_ns) = &current_pcb.get_nsproxy().read().pid_namespace {
+        //     // 获取该进程在命名空间中的 PID
+        //     return Ok(current_pcb.pid_strcut().read().numbers[pid_ns.level].nr);
+        //     // 返回命名空间中的 PID
+        // }
+        // 默认返回 tgid
+        Ok(current_pcb.tgid())
     }
 
     /// @brief 获取指定进程的pgid

@@ -8,7 +8,7 @@ use alloc::{
 use unified_init::macros::unified_init;
 
 use crate::{
-    arch::{io::PortIOArch, CurrentPortIOArch},
+    arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch},
     driver::{
         base::device::device_number::{DeviceNumber, Major},
         input::ps2_dev::Ps2StatusRegister,
@@ -17,7 +17,7 @@ use crate::{
         irqdata::IrqHandlerData,
         irqdesc::{IrqHandleFlags, IrqHandler, IrqReturn},
         manage::irq_manager,
-        IrqNumber,
+        InterruptArch, IrqNumber,
     },
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode},
@@ -186,17 +186,24 @@ impl IrqHandler for Ps2KeyboardIrqHandler {
         _dev_id: Option<Arc<dyn IrqHandlerData>>,
     ) -> Result<IrqReturn, SystemError> {
         // 先检查状态寄存器，看看是否有数据
-        let status = unsafe { CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_STATUS.into()) };
-        let status = Ps2StatusRegister::from(status);
-        if !status.outbuf_full() {
-            return Ok(IrqReturn::Handled);
+        let mut fsm = PS2_KEYBOARD_FSM.lock();
+        let mut handled = false;
+        loop {
+            let status = unsafe { CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_STATUS.into()) };
+            let status = Ps2StatusRegister::from(status);
+            if status.outbuf_full() {
+                let input = unsafe { CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_DATA.into()) };
+                fsm.parse(input);
+                handled = true;
+            } else {
+                break;
+            }
         }
-
-        let input = unsafe { CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_DATA.into()) };
-        // wait_ps2_keyboard_read();
-        PS2_KEYBOARD_FSM.lock().parse(input);
-
-        return Ok(IrqReturn::Handled);
+        if handled {
+            Ok(IrqReturn::Handled)
+        } else {
+            Ok(IrqReturn::NotHandled)
+        }
     }
 }
 
@@ -219,8 +226,27 @@ fn wait_ps2_keyboard_write() {
         spin_loop();
     }
 }
+
+fn force_clear_input_buffer() {
+    loop {
+        let status = unsafe { CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_STATUS.into()) };
+        let status = Ps2StatusRegister::from(status);
+        if status.outbuf_full() {
+            unsafe { CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_DATA.into()) };
+        } else {
+            break;
+        }
+    }
+}
+
 #[unified_init(INITCALL_DEVICE)]
 fn ps2_keyboard_init() -> Result<(), SystemError> {
+    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+    // 先读一下键盘的数据，防止由于在键盘初始化之前，由于按键被按下从而导致接收不到中断。
+    // 清空键盘缓冲区
+    force_clear_input_buffer();
+
     // ======== 初始化键盘控制器，写入配置值 =========
     wait_ps2_keyboard_write();
     unsafe {
@@ -245,12 +271,9 @@ fn ps2_keyboard_init() -> Result<(), SystemError> {
         )
         .expect("Failed to request irq for ps2 keyboard");
 
-    // 先读一下键盘的数据，防止由于在键盘初始化之前，由于按键被按下从而导致接收不到中断。
-    let status = unsafe { CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_STATUS.into()) };
-    let status = Ps2StatusRegister::from(status);
-    if status.outbuf_full() {
-        unsafe { CurrentPortIOArch::in8(PORT_PS2_KEYBOARD_DATA.into()) };
-    }
+    // 清空键盘缓冲区
+    force_clear_input_buffer();
+    drop(irq_guard);
 
     // 将设备挂载到devfs
     ps2_keyboard_register();

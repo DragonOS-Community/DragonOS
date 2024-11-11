@@ -1,0 +1,25 @@
+{
+  "name": "test_overlayfs",
+  "version": "0.1.0",
+  "description": "test overlayfs",
+  "rust_target": null,
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "apps/test_overlayfs"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "install": {
+    "in_dragonos_path": "/bin"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "envs": [],
+  "target_arch": ["x86_64"]
+}

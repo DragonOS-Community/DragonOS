@@ -23,7 +23,10 @@ kvm = []
 
 fatfs = []
 fatfs-secure = ["fatfs"]
+driver_ps2_mouse = []
 
+# kprobe
+kprobe_test = []
 
 # 运行时依赖项
 [dependencies]
@@ -58,8 +61,12 @@ wait_queue_macros = { path = "crates/wait_queue_macros" }
 paste = "=1.0.14"
 slabmalloc = { path = "crates/rust-slabmalloc" }
 log = "0.4.21"
+kprobe = { path = "crates/kprobe" }
+xarray = "0.1.0"
 lru = "0.12.3"
 
+rbpf = { path = "crates/rbpf" }
+printf-compat = { version = "0.1.1", default-features = false }
 # target为x86_64时，使用下面的依赖
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 mini-backtrace = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/mini-backtrace.git", rev = "e0b1d90940" }

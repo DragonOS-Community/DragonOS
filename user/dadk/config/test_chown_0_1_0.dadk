@@ -1,0 +1,29 @@
+{
+  "name": "test-chown",
+  "version": "0.1.0",
+  "description": "chown系列系统调用",
+  "rust_target": "x86_64-unknown-dragonos",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "apps/test-chown"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "make install"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "clean": {
+    "clean_command": "make clean"
+  },
+  "envs": [],
+  "build_once": false,
+  "install_once": false,
+  "target_arch": [
+    "x86_64"
+  ]
+}

@@ -1,12 +1,12 @@
-if [ ! -f "glibc-2.40.tar.gz" ]; then
-  wget https://ftp.gnu.org/gnu/glibc/glibc-2.40.tar.gz
+if [ ! -f "glibc-2.35.tar.gz" ]; then
+  wget https://ftp.gnu.org/gnu/glibc/glibc-2.35.tar.gz
 fi
-if [ ! -d "glibc-2.40" ]; then
-  tar -xvf glibc-2.40.tar.gz
-  cp ./install_deps.sh ./glibc-2.40/
-  cp ./default_configure.sh ./glibc-2.40/
+if [ ! -d "glibc-2.35" ]; then
+  tar -xvf glibc-2.35.tar.gz
+  cp ./install_deps.sh ./glibc-2.35/
+  cp ./default_configure.sh ./glibc-2.35/
 fi
-cd glibc-2.40
+cd glibc-2.35
 bash install_deps.sh
 bash default_configure.sh
 cd build

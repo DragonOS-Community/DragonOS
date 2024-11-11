@@ -297,7 +297,6 @@ pub struct UserSigaction {
  * siginfo中，根据signal的来源不同，该info中对应了不同的数据./=
  * 请注意，该info最大占用16字节
  */
-
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct SigInfo {

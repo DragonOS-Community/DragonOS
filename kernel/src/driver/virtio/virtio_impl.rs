@@ -23,7 +23,9 @@ unsafe impl Hal for HalImpl {
         _direction: BufferDirection,
     ) -> (virtio_drivers::PhysAddr, NonNull<u8>) {
         let page_num = PageFrameCount::new(
-            ((pages * PAGE_SIZE + MMArch::PAGE_SIZE - 1) / MMArch::PAGE_SIZE).next_power_of_two(),
+            (pages * PAGE_SIZE)
+                .div_ceil(MMArch::PAGE_SIZE)
+                .next_power_of_two(),
         );
         unsafe {
             let (paddr, count) =
@@ -55,7 +57,9 @@ unsafe impl Hal for HalImpl {
         pages: usize,
     ) -> i32 {
         let page_count = PageFrameCount::new(
-            ((pages * PAGE_SIZE + MMArch::PAGE_SIZE - 1) / MMArch::PAGE_SIZE).next_power_of_two(),
+            (pages * PAGE_SIZE)
+                .div_ceil(MMArch::PAGE_SIZE)
+                .next_power_of_two(),
         );
 
         // 恢复页面属性

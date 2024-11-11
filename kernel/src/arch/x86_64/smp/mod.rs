@@ -1,5 +1,4 @@
 use core::{
-    arch::asm,
     hint::spin_loop,
     sync::atomic::{compiler_fence, fence, AtomicBool, Ordering},
 };
@@ -65,14 +64,13 @@ unsafe extern "C" fn smp_ap_start() -> ! {
 
 #[naked]
 unsafe extern "sysv64" fn smp_init_switch_stack(st: &ApStartStackInfo) -> ! {
-    asm!(concat!("
+    core::arch::naked_asm!(concat!("
         mov rsp, [rdi + {off_rsp}]
         mov rbp, [rdi + {off_rsp}]
         jmp {stage1}
     "), 
         off_rsp = const(offset_of!(ApStartStackInfo, vaddr)),
-        stage1 = sym smp_ap_start_stage1,
-    options(noreturn));
+        stage1 = sym smp_ap_start_stage1);
 }
 
 unsafe extern "C" fn smp_ap_start_stage1() -> ! {

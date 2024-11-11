@@ -319,6 +319,7 @@ impl IrqDomainManager {
     /// - `handler_data`: 中断流处理程序数据
     /// - `handler_name`: 中断处理程序名称
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub fn domain_set_info(
         &self,
         domain: &Arc<IrqDomain>,
@@ -557,14 +558,17 @@ impl IrqDomain {
     }
 
     /// The number of mapped interrupts
+    #[allow(dead_code)]
     pub fn map_count(&self) -> u32 {
         self.revmap_read_irqsave().map.len() as u32
     }
 
+    #[allow(dead_code)]
     pub fn host_data(&self) -> Option<Arc<dyn IrqChipData>> {
         self.inner.lock_irqsave().host_data.clone()
     }
 
+    #[allow(dead_code)]
     pub fn set_host_data(&self, host_data: Option<Arc<dyn IrqChipData>>) {
         self.inner.lock_irqsave().host_data = host_data;
     }

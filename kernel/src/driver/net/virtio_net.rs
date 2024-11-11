@@ -539,8 +539,14 @@ impl VirtioNetToken {
 }
 
 impl phy::Device for VirtIONicDeviceInner {
-    type RxToken<'a> = VirtioNetToken where Self: 'a;
-    type TxToken<'a> = VirtioNetToken where Self: 'a;
+    type RxToken<'a>
+        = VirtioNetToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = VirtioNetToken
+    where
+        Self: 'a;
 
     fn receive(
         &mut self,

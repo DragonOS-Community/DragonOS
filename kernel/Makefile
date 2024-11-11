@@ -36,14 +36,14 @@ check: ECHO
 # @echo "Checking kernel... ARCH=$(ARCH)"
 # @exit 1
 ifeq ($(ARCH), x86_64)
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-07-23 check --workspace $(CARGO_ZBUILD) --message-format=json --target ./src/$(TARGET_JSON)
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 check --workspace $(CARGO_ZBUILD) --message-format=json --target ./src/$(TARGET_JSON)
 else ifeq ($(ARCH), riscv64)
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-07-23 check --workspace $(CARGO_ZBUILD) --message-format=json --target $(TARGET_JSON)
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 check --workspace $(CARGO_ZBUILD) --message-format=json --target $(TARGET_JSON)
 endif
 
 test:
 # 测试内核库
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-07-23 test --workspace --exclude dragonos_kernel rbpf
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 test --workspace --exclude dragonos_kernel rbpf
 
 test-rbpf:
-	cd crates/rbpf && RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-07-23 test --features=std,user,cranelift
+	cd crates/rbpf && RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 test --features=std,user,cranelift

@@ -1,5 +1,4 @@
 // 导出 ahci 相关的 module
-pub mod ahci_inode;
 pub mod ahcidisk;
 pub mod hba;
 use crate::arch::MMArch;

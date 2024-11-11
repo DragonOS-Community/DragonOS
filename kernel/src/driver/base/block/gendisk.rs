@@ -161,6 +161,7 @@ impl GenDiskMap {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn max_idx(&self) -> u32 {
         self.max_idx.load(Ordering::SeqCst)
     }

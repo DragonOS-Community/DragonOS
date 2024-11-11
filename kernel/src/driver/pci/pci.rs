@@ -1474,7 +1474,7 @@ pub struct ExternalCapabilityIterator<'a> {
     pub bus_device_function: BusDeviceFunction,
     pub next_capability_offset: Option<u16>,
 }
-impl<'a> Iterator for ExternalCapabilityIterator<'a> {
+impl Iterator for ExternalCapabilityIterator<'_> {
     type Item = ExternalCapabilityInfo;
     fn next(&mut self) -> Option<Self::Item> {
         let offset = self.next_capability_offset?;

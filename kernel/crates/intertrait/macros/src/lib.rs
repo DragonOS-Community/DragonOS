@@ -61,7 +61,6 @@ mod item_type;
 /// #[derive(std::fmt::Debug)]
 /// struct Data;
 /// ```
-
 #[proc_macro_attribute]
 pub fn cast_to(args: TokenStream, input: TokenStream) -> TokenStream {
     match parse::<Targets>(args) {

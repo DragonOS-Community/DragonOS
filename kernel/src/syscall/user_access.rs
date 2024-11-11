@@ -160,7 +160,7 @@ pub struct UserBufferReader<'a> {
 }
 
 #[allow(dead_code)]
-impl<'a> UserBufferReader<'a> {
+impl UserBufferReader<'_> {
     /// 构造一个指向用户空间位置的BufferReader，为了兼容类似传入 *const u8 的情况，使用单独的泛型来进行初始化
     ///
     /// @param addr 用户空间指针
@@ -321,7 +321,7 @@ impl<'a> UserBufferWriter<'a> {
         return Ok(());
     }
 
-    pub fn buffer<T>(&'a mut self, offset: usize) -> Result<&mut [T], SystemError> {
+    pub fn buffer<T>(&'a mut self, offset: usize) -> Result<&'a mut [T], SystemError> {
         Self::convert_with_offset::<T>(self.buffer, offset).map_err(|_| SystemError::EINVAL)
     }
 

@@ -71,6 +71,7 @@ impl OpenFirmwareFdtDriver {
         return Ok(());
     }
 
+    #[allow(dead_code)]
     pub unsafe fn set_fdt_map_guard(&self, guard: Option<MMIOSpaceGuard>) {
         self.inner.write().fdt_map_guard = guard;
     }
@@ -293,6 +294,7 @@ impl OpenFirmwareFdtDriver {
     /// 在UEFI初始化后，扫描FDT中的`/reserved-memory`节点，设置保留的内存
     ///
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/of/fdt.c#634
+    #[allow(dead_code)]
     pub fn early_init_fdt_scan_reserved_mem(&self) {
         let vaddr = boot_params().read().fdt();
         if vaddr.is_none() {
@@ -323,7 +325,6 @@ impl OpenFirmwareFdtDriver {
     }
 
     /// 保留fdt自身的内存空间
-
     fn early_reserve_fdt_itself(&self, fdt: &Fdt) {
         #[cfg(target_arch = "riscv64")]
         {

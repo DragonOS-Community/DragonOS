@@ -579,17 +579,6 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         None
     }
 
-    /// @brief 在inode的指定偏移量开始，读取指定大小的数据
-    ///
-    /// @param offset 起始位置在Inode中的偏移量
-    /// @param len 要读取的字节数
-    /// @param buf 缓冲区. 请注意，必须满足@buf.len()>=@len
-    /// @param _data 各文件系统系统所需私有信息
-    ///
-    /// @return 成功：Ok(读取的字节数)
-    ///         失败：Err(Posix错误码)
-    ///
-
     /// # 在inode的指定偏移量开始，读取指定大小的数据，忽略PageCache
     ///
     /// ## 参数

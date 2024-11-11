@@ -1,16 +1,6 @@
 // 参考手册: PCIe* GbE Controllers Open Source Software Developer’s Manual
 // Refernce: PCIe* GbE Controllers Open Source Software Developer’s Manual
 
-use alloc::string::ToString;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
-use core::intrinsics::unlikely;
-use core::mem::size_of;
-use core::ptr::NonNull;
-use core::slice::{from_raw_parts, from_raw_parts_mut};
-use core::sync::atomic::{compiler_fence, Ordering};
-use log::{debug, info};
-
 use super::e1000e_driver::e1000e_driver_init;
 use crate::driver::base::device::DeviceId;
 use crate::driver::net::dma::{dma_alloc, dma_dealloc};
@@ -21,6 +11,15 @@ use crate::driver::pci::pci::{
 };
 use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqMsg, IRQ};
 use crate::exception::IrqNumber;
+use alloc::string::ToString;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::intrinsics::unlikely;
+use core::mem::size_of;
+use core::ptr::NonNull;
+use core::slice::{from_raw_parts, from_raw_parts_mut};
+use core::sync::atomic::{compiler_fence, Ordering};
+use log::{debug, info};
 
 use crate::libs::volatile::{ReadOnly, Volatile, WriteOnly};
 
@@ -200,14 +199,14 @@ impl E1000EDevice {
     // init the device for PCI standard device struct
     #[allow(unused_assignments)]
     pub fn new(
-        device: &mut PciDeviceStructureGeneralDevice,
+        device: Arc<PciDeviceStructureGeneralDevice>,
         device_id: Arc<DeviceId>,
     ) -> Result<Self, E1000EPciError> {
         // 从BAR0获取我们需要的寄存器
         // Build registers sturcts from BAR0
         device.bar_ioremap().unwrap()?;
         device.enable_master();
-        let bar = device.bar().ok_or(E1000EPciError::BarGetFailed)?;
+        let bar = device.bar().ok_or(E1000EPciError::BarGetFailed)?.read();
         let bar0 = bar.get_bar(0)?;
         let (address, size) = bar0
             .memory_address_size()
@@ -226,7 +225,7 @@ impl E1000EDevice {
         // 初始化msi中断
         // initialize msi interupt
         let irq_vector = device.irq_vector_mut().unwrap();
-        irq_vector.push(E1000E_RECV_VECTOR);
+        irq_vector.write().push(E1000E_RECV_VECTOR);
         device.irq_init(IRQ::PCI_IRQ_MSI).expect("IRQ Init Failed");
         let msg = PciIrqMsg {
             irq_common_message: IrqCommonMsg::init_from(
@@ -598,26 +597,32 @@ pub fn e1000e_init() {
 }
 
 pub fn e1000e_probe() -> Result<u64, E1000EPciError> {
-    let mut list = PCI_DEVICE_LINKEDLIST.write();
-    let result = get_pci_device_structure_mut(&mut list, NETWORK_CLASS, ETHERNET_SUBCLASS);
+    let list = &*PCI_DEVICE_LINKEDLIST;
+    let result = get_pci_device_structure_mut(list, NETWORK_CLASS, ETHERNET_SUBCLASS);
     if result.is_empty() {
         return Ok(0);
     }
     for device in result {
-        let standard_device = device.as_standard_device_mut().unwrap();
-        let header = &standard_device.common_header;
-        if header.vendor_id == 0x8086 {
+        let standard_device = device.as_standard_device().unwrap();
+        if standard_device.common_header.vendor_id == 0x8086 {
             // intel
-            if E1000E_DEVICE_ID.contains(&header.device_id) {
+            if E1000E_DEVICE_ID.contains(&standard_device.common_header.device_id) {
                 debug!(
                     "Detected e1000e PCI device with device id {:#x}",
-                    header.device_id
+                    standard_device.common_header.device_id
                 );
 
                 // todo: 根据pci的path来生成device id
                 let e1000e = E1000EDevice::new(
-                    standard_device,
-                    DeviceId::new(None, Some(format!("e1000e_{}", header.device_id))).unwrap(),
+                    standard_device.clone(),
+                    DeviceId::new(
+                        None,
+                        Some(format!(
+                            "e1000e_{}",
+                            standard_device.common_header.device_id
+                        )),
+                    )
+                    .unwrap(),
                 )?;
                 e1000e_driver_init(e1000e);
             }

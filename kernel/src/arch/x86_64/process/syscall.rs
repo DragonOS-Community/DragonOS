@@ -5,10 +5,10 @@ use crate::{
     arch::{
         interrupt::TrapFrame,
         process::table::{USER_CS, USER_DS},
-        rand::rand_bytes,
         CurrentIrqArch,
     },
     exception::InterruptArch,
+    libs::rand::rand_bytes,
     mm::ucontext::AddressSpace,
     process::{
         exec::{load_binary_file, ExecParam, ExecParamFlags},
@@ -74,7 +74,6 @@ impl Syscall {
         param.init_info_mut().envs = envp;
 
         // 生成16字节随机数
-        // TODO 暂时设为0
         param.init_info_mut().rand_num = rand_bytes::<16>();
 
         // 把proc_init_info写到用户栈上

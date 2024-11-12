@@ -156,9 +156,9 @@ impl Syscall {
         regs: &mut TrapFrame,
     ) -> Result<(), SystemError> {
         let address_space = AddressSpace::new(true).expect("Failed to create new address space");
-        let old_vm = do_execve_switch_user_vm(address_space.clone());
         // debug!("to load binary file");
         let mut param = ExecParam::new(path.as_str(), address_space.clone(), ExecParamFlags::EXEC)?;
+        let old_vm = do_execve_switch_user_vm(address_space.clone());
 
         // 加载可执行文件
         let load_result = load_binary_file(&mut param).inspect_err(|_| {

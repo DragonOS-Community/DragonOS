@@ -841,7 +841,6 @@ impl Drop for UserMapper {
             deallocate_page_frames(
                 PhysPageFrame::new(self.utable.table().phys()),
                 PageFrameCount::new(1),
-                &mut page_manager_lock_irqsave(),
             )
         };
     }
@@ -1171,14 +1170,7 @@ impl LockedVMA {
 
             // 如果物理页的anon_vma链表长度为0并且不是共享页，则释放物理页.
             if page.read_irqsave().can_deallocate() {
-                unsafe {
-                    drop(page);
-                    deallocate_page_frames(
-                        PhysPageFrame::new(paddr),
-                        PageFrameCount::new(1),
-                        &mut page_manager_guard,
-                    )
-                };
+                page_manager_guard.remove_page(&paddr);
             }
 
             flusher.consume(flush);

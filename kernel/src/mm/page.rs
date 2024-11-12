@@ -19,7 +19,7 @@ use crate::{
     exception::ipi::{IpiKind, IpiTarget},
     filesystem::vfs::{file::PageCache, FilePrivateData},
     init::initcall::INITCALL_CORE,
-    ipc::shm::ShmId,
+    ipc::shm::{shm_manager_lock, ShmId},
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
@@ -29,7 +29,9 @@ use crate::{
 };
 
 use super::{
-    allocator::page_frame::{FrameAllocator, PageFrameCount},
+    allocator::page_frame::{
+        deallocate_page_frames, FrameAllocator, PageFrameCount, PhysPageFrame,
+    },
     syscall::ProtFlags,
     ucontext::LockedVMA,
     MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
@@ -216,7 +218,7 @@ impl PageReclaimer {
         let inode = page_cache.inode().clone().unwrap().upgrade().unwrap();
         let page_index = guard.index().unwrap();
 
-        for vma in guard.anon_vma() {
+        for vma in guard.vma_set() {
             let address_space = vma.lock_irqsave().address_space().unwrap();
             let address_space = address_space.upgrade().unwrap();
             let mut guard = address_space.write();
@@ -342,7 +344,7 @@ pub struct InnerPage {
     /// 共享页id（如果是共享页）
     shm_id: Option<ShmId>,
     /// 映射到当前page的VMA
-    anon_vma: HashSet<Arc<LockedVMA>>,
+    vma_set: HashSet<Arc<LockedVMA>>,
     /// 标志
     flags: PageFlags,
     /// 页所在的物理页帧号
@@ -360,7 +362,7 @@ impl InnerPage {
             shared,
             free_when_zero: dealloc_when_zero,
             shm_id: None,
-            anon_vma: HashSet::new(),
+            vma_set: HashSet::new(),
             flags: PageFlags::empty(),
             phys_addr,
             index: None,
@@ -370,13 +372,13 @@ impl InnerPage {
 
     /// 将vma加入anon_vma
     pub fn insert_vma(&mut self, vma: Arc<LockedVMA>) {
-        self.anon_vma.insert(vma);
+        self.vma_set.insert(vma);
         self.map_count += 1;
     }
 
     /// 将vma从anon_vma中删去
     pub fn remove_vma(&mut self, vma: &LockedVMA) {
-        self.anon_vma.remove(vma);
+        self.vma_set.remove(vma);
         self.map_count -= 1;
     }
 
@@ -427,8 +429,8 @@ impl InnerPage {
     }
 
     #[inline(always)]
-    pub fn anon_vma(&self) -> &HashSet<Arc<LockedVMA>> {
-        &self.anon_vma
+    pub fn vma_set(&self) -> &HashSet<Arc<LockedVMA>> {
+        &self.vma_set
     }
 
     #[inline(always)]
@@ -459,6 +461,18 @@ impl InnerPage {
     #[inline(always)]
     pub fn phys_address(&self) -> PhysAddr {
         self.phys_addr
+    }
+}
+
+impl Drop for InnerPage {
+    fn drop(&mut self) {
+        assert!(self.map_count == 0, "page drop when map count is non-zero");
+        if self.shared {
+            shm_manager_lock().free_id(&self.shm_id.unwrap());
+        }
+        unsafe {
+            deallocate_page_frames(PhysPageFrame::new(self.phys_addr), PageFrameCount::new(1))
+        };
     }
 }
 

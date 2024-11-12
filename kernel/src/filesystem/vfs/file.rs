@@ -157,6 +157,18 @@ impl core::fmt::Debug for PageCache {
     }
 }
 
+impl Drop for PageCache {
+    fn drop(&mut self) {
+        let xarray = self.xarray.lock_irqsave();
+        let mut page_manager = page_manager_lock_irqsave();
+        for index in 0..=u64::MAX {
+            if let Some(page) = xarray.load(index) {
+                page_manager.remove_page(&page.read_irqsave().phys_address());
+            }
+        }
+    }
+}
+
 impl PageCache {
     pub fn new(inode: Option<Weak<dyn IndexNode>>) -> Arc<PageCache> {
         Arc::new_cyclic(|weak| Self {
@@ -177,20 +189,20 @@ impl PageCache {
     }
 
     pub fn add_page(&self, offset: usize, page: &Arc<Page>) {
-        let mut guard = self.xarray.lock();
+        let mut guard = self.xarray.lock_irqsave();
         let mut cursor = guard.cursor_mut(offset as u64);
         cursor.store(page.clone());
     }
 
     pub fn get_page(&self, offset: usize) -> Option<Arc<Page>> {
-        let mut guard = self.xarray.lock();
+        let mut guard = self.xarray.lock_irqsave();
         let mut cursor = guard.cursor_mut(offset as u64);
         let page = cursor.load().map(|r| (*r).clone());
         page
     }
 
     pub fn remove_page(&self, offset: usize) {
-        let mut guard = self.xarray.lock();
+        let mut guard = self.xarray.lock_irqsave();
         let mut cursor = guard.cursor_mut(offset as u64);
         cursor.remove();
     }
@@ -218,7 +230,7 @@ impl PageCache {
             return;
         }
 
-        let mut guard = self.xarray.lock();
+        let mut guard = self.xarray.lock_irqsave();
         let mut cursor = guard.cursor_mut(page_index as u64);
 
         for i in 0..page_num {
@@ -276,7 +288,7 @@ impl PageCache {
         let start_page_offset = offset >> MMArch::PAGE_SHIFT;
         let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_offset;
 
-        let mut guard = self.xarray.lock();
+        let mut guard = self.xarray.lock_irqsave();
         let mut cursor = guard.cursor_mut(start_page_offset as u64);
 
         let mut buf_offset = 0;
@@ -344,11 +356,7 @@ impl PageCache {
                 0
             };
 
-            let buf_offset = if offset < copy_offset {
-                copy_offset - offset
-            } else {
-                0
-            };
+            let buf_offset = copy_offset.saturating_sub(offset);
 
             buf[buf_offset..buf_offset + copy_len]
                 .copy_from_slice(&page_buf[page_buf_offset..page_buf_offset + copy_len]);
@@ -405,7 +413,7 @@ impl PageCache {
                 MMArch::PAGE_SIZE
             };
 
-            let mut guard = self.xarray.lock();
+            let mut guard = self.xarray.lock_irqsave();
             let mut cursor = guard.cursor_mut(start_page_offset as u64);
 
             let exist = cursor.load().is_some();
@@ -418,7 +426,7 @@ impl PageCache {
                 self.create_pages(start_page_offset + i, &page_buf);
             }
 
-            let mut guard = self.xarray.lock();
+            let mut guard = self.xarray.lock_irqsave();
             let mut cursor = guard.cursor_mut(start_page_offset as u64);
             if let Some(page) = cursor.load() {
                 let vaddr =

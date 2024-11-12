@@ -445,7 +445,7 @@ impl KernelShm {
             let page = page_manager_guard.get(&cur_phys.phys_address()).unwrap();
             id_set.extend(
                 page.read_irqsave()
-                    .anon_vma()
+                    .vma_set()
                     .iter()
                     .map(|vma| vma.id())
                     .collect::<Vec<_>>(),

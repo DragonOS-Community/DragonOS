@@ -10,12 +10,11 @@ use system_error::SystemError;
 
 use super::{user_access::UserBufferWriter, Syscall};
 
-#[repr(C)]
-
 /// 系统信息
 ///
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/uapi/linux/sysinfo.h#8
 #[derive(Debug, Default, Copy, Clone)]
+#[repr(C)]
 pub struct SysInfo {
     uptime: u64,
     loads: [u64; 3],

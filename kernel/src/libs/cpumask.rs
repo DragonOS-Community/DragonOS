@@ -129,7 +129,7 @@ pub struct CpuMaskIter<'a> {
     begin: bool,
 }
 
-impl<'a> Iterator for CpuMaskIter<'a> {
+impl Iterator for CpuMaskIter<'_> {
     type Item = ProcessorId;
 
     fn next(&mut self) -> Option<ProcessorId> {

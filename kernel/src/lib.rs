@@ -2,20 +2,15 @@
 #![feature(alloc_error_handler)]
 #![feature(allocator_api)]
 #![feature(arbitrary_self_types)]
-#![feature(asm_const)]
 #![feature(concat_idents)]
 #![feature(const_for)]
-#![feature(const_mut_refs)]
-#![feature(const_option)]
 #![feature(const_trait_impl)]
-#![feature(const_refs_to_cell)]
 #![feature(core_intrinsics)]
 #![feature(c_void_variant)]
 #![feature(extract_if)]
 #![feature(fn_align)]
 #![feature(linked_list_retain)]
 #![feature(naked_functions)]
-#![feature(new_uninit)]
 #![feature(ptr_internals)]
 #![feature(trait_upcasting)]
 #![feature(slice_ptr_get)]
@@ -23,16 +18,19 @@
 #![feature(vec_into_raw_parts)]
 #![feature(c_variadic)]
 #![cfg_attr(target_os = "none", no_std)]
-#![allow(internal_features)]
+#![allow(static_mut_refs, non_local_definitions, internal_features)]
 // clippy的配置
 #![deny(clippy::all)]
-#![allow(clippy::bad_bit_mask)]
 // DragonOS允许在函数中使用return语句（尤其是长函数时，我们推荐这么做）
-#![allow(clippy::let_and_return)]
-#![allow(clippy::needless_pass_by_ref_mut)]
-#![allow(clippy::needless_return)]
-#![allow(clippy::single_char_pattern)]
-#![allow(clippy::upper_case_acronyms)]
+#![allow(
+    clippy::macro_metavars_in_unsafe,
+    clippy::upper_case_acronyms,
+    clippy::single_char_pattern,
+    clippy::needless_return,
+    clippy::needless_pass_by_ref_mut,
+    clippy::let_and_return,
+    clippy::bad_bit_mask
+)]
 
 #[cfg(test)]
 #[macro_use]

@@ -286,10 +286,12 @@ impl IrqDesc {
         );
     }
 
+    #[allow(dead_code)]
     pub fn set_probe(&self) {
         self.modify_status(IrqLineStatus::IRQ_NOPROBE, IrqLineStatus::empty());
     }
 
+    #[allow(dead_code)]
     pub fn set_noprobe(&self) {
         self.modify_status(IrqLineStatus::empty(), IrqLineStatus::IRQ_NOPROBE);
     }
@@ -416,6 +418,7 @@ impl InnerIrqDesc {
         self.line_status.insert(IrqLineStatus::IRQ_NOTHREAD);
     }
 
+    #[allow(dead_code)]
     pub fn clear_nothread(&mut self) {
         self.line_status.remove(IrqLineStatus::IRQ_NOTHREAD);
     }
@@ -451,6 +454,7 @@ impl InnerIrqDesc {
         !self.line_status.contains(IrqLineStatus::IRQ_NOAUTOEN)
     }
 
+    #[allow(dead_code)]
     pub fn can_thread(&self) -> bool {
         !self.line_status.contains(IrqLineStatus::IRQ_NOTHREAD)
     }
@@ -486,6 +490,7 @@ impl InnerIrqDesc {
         self.actions.clear();
     }
 
+    #[allow(dead_code)]
     pub fn remove_action(&mut self, action: &Arc<IrqAction>) {
         self.actions.retain(|a| !Arc::ptr_eq(a, action));
     }
@@ -506,14 +511,17 @@ impl InnerIrqDesc {
         &self.common_data
     }
 
+    #[allow(dead_code)]
     pub fn depth(&self) -> u32 {
         self.depth
     }
 
+    #[allow(dead_code)]
     pub fn wake_depth(&self) -> u32 {
         self.wake_depth
     }
 
+    #[allow(dead_code)]
     pub fn set_depth(&mut self, depth: u32) {
         self.depth = depth;
     }
@@ -540,6 +548,7 @@ impl InnerIrqDesc {
         &mut self.percpu_enabled
     }
 
+    #[allow(dead_code)]
     pub fn percpu_affinity(&self) -> &Option<CpuMask> {
         &self.percpu_affinity
     }
@@ -969,6 +978,7 @@ impl IrqDescManager {
     }
 
     /// 设置指定irq的可用cpu为所有cpu
+    #[allow(dead_code)]
     pub fn set_percpu_devid_all(&self, irq: IrqNumber) -> Result<(), SystemError> {
         self.set_percpu_devid(irq, None)
     }

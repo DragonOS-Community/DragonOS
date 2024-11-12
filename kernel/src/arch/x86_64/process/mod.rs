@@ -425,7 +425,7 @@ impl ProcessManager {
 /// 保存上下文，然后切换进程，接着jmp到`switch_finish_hook`钩子函数
 #[naked]
 unsafe extern "sysv64" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBInfo) {
-    asm!(
+    core::arch::naked_asm!(
         // As a quick reminder for those who are unfamiliar with the System V ABI (extern "C"):
         //
         // - the current parameters are passed in the registers `rdi`, `rsi`,
@@ -498,13 +498,12 @@ unsafe extern "sysv64" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut Arc
         off_gs = const(offset_of!(ArchPCBInfo, gs)),
 
         switch_hook = sym crate::process::switch_finish_hook,
-        options(noreturn),
     );
 }
 
 #[naked]
 unsafe extern "sysv64" fn switch_back() -> ! {
-    asm!("ret", options(noreturn));
+    core::arch::naked_asm!("ret");
 }
 
 pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {

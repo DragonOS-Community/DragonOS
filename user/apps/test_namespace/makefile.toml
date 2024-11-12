@@ -1,7 +1,7 @@
 # Makefile.toml
 
 [env]
-TOOLCHAIN = "+nightly-2023-08-15-x86_64-unknown-linux-gnu"
+TOOLCHAIN = "+nightly-2024-11-05-x86_64-unknown-linux-gnu"
 
 ARCH = { default = "x86_64" }
 RUST_TARGET = { default = { if = "eq(env.ARCH, 'riscv64')", value = "riscv64gc-unknown-linux-gnu", else = "x86_64-unknown-linux-musl" } }

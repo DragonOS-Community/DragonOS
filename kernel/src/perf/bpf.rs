@@ -208,6 +208,8 @@ impl RingPage {
         let data_head = unsafe { &(*(self.ptr as *mut perf_event_mmap_page)).data_head };
         data_tail != data_head
     }
+
+    #[allow(dead_code)]
     pub fn as_slice(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.ptr as *const u8, self.size) }
     }

@@ -14,7 +14,7 @@ use crate::{
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
         },
-        pci::{dev_id::PciDeviceID, device::PciDevice},
+        pci::{dev_id::PciDeviceID, device::PciDevice, pci_irq::IrqType},
     },
     filesystem::{
         kernfs::KernFSInode,
@@ -36,6 +36,7 @@ pub struct TestDevice {
     device_data: RwLock<DeviceCommonData>,
     kobj_data: RwLock<KObjectCommonData>,
     kobj_state: LockedKObjectState,
+    static_type: RwLock<IrqType>,
 }
 
 impl TestDevice {
@@ -46,6 +47,7 @@ impl TestDevice {
             device_data: common_dev,
             kobj_data: common_kobj,
             kobj_state: LockedKObjectState::new(None),
+            static_type: RwLock::new(IrqType::Unused),
         }
     }
 }
@@ -69,6 +71,30 @@ impl PciDevice for TestDevice {
 
     fn subsystem_device(&self) -> u16 {
         return 0xffff;
+    }
+
+    fn class_code(&self) -> u8 {
+        return 0xff;
+    }
+
+    fn irq_line(&self) -> u8 {
+        return 0xff;
+    }
+
+    fn revision(&self) -> u8 {
+        return 0xff;
+    }
+
+    fn irq_type(&self) -> &RwLock<crate::driver::pci::pci_irq::IrqType> {
+        return &self.static_type;
+    }
+
+    fn interface_code(&self) -> u8 {
+        return 0xff;
+    }
+
+    fn subclass(&self) -> u8 {
+        return 0xff;
     }
 }
 

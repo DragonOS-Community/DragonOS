@@ -78,9 +78,8 @@ pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
 
 #[naked]
 unsafe extern "C" fn ready_to_switch_to_user(trap_frame: usize, new_pc: usize) -> ! {
-    asm!(
-        concat!(
-            "
+    core::arch::naked_asm!(concat!(
+        "
             // 设置trap frame
             mv sp, a0
             // 设置返回地址
@@ -88,9 +87,7 @@ unsafe extern "C" fn ready_to_switch_to_user(trap_frame: usize, new_pc: usize) -
             jr a1
             
             "
-        ),
-        options(noreturn)
-    );
+    ));
 }
 
 impl ProcessManager {
@@ -227,7 +224,7 @@ impl ProcessManager {
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/arch/riscv/kernel/entry.S#233
 #[naked]
 unsafe extern "C" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBInfo) {
-    core::arch::asm!(concat!(
+    core::arch::naked_asm!(concat!(
         "
             sd ra, {off_ra}(a0)
             sd sp, {off_sp}(a0)
@@ -304,8 +301,7 @@ unsafe extern "C" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut ArchPCBI
     off_s9 = const(offset_of!(ArchPCBInfo, s9)),
     off_s10 = const(offset_of!(ArchPCBInfo, s10)),
     off_s11 = const(offset_of!(ArchPCBInfo, s11)),
-    before_switch_finish_hook = sym before_switch_finish_hook,
-    options(noreturn));
+    before_switch_finish_hook = sym before_switch_finish_hook);
 }
 
 /// 在切换上下文完成后的钩子函数(必须在这里加一个跳转函数，否则会出现relocation truncated to fit: R_RISCV_JAL错误)

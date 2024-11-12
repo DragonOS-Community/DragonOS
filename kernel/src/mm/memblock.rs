@@ -473,7 +473,7 @@ pub struct MemBlockIter<'a> {
 }
 
 #[allow(dead_code)]
-impl<'a> MemBlockIter<'a> {
+impl MemBlockIter<'_> {
     /// 获取内存区域数量
     pub fn total_num(&self) -> usize {
         self.inner.initial_memory_regions_num
@@ -490,7 +490,7 @@ impl<'a> MemBlockIter<'a> {
     }
 }
 
-impl<'a> Iterator for MemBlockIter<'a> {
+impl Iterator for MemBlockIter<'_> {
     type Item = PhysMemoryArea;
 
     fn next(&mut self) -> Option<Self::Item> {

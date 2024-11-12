@@ -298,7 +298,6 @@ pub fn scm_init(enable_put_to_window: bool) {
 /// ## 参数
 ///
 /// - framework 要启动的ui框架
-
 pub fn scm_framework_enable(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemError> {
     // 获取信息
     let metadata = framework.metadata()?;
@@ -321,7 +320,6 @@ pub fn scm_framework_enable(framework: Arc<dyn ScmUiFramework>) -> Result<i32, S
 ///
 /// ## 参数
 /// - framework 框架结构体
-
 pub fn scm_register(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemError> {
     // 把ui框架加入链表
 

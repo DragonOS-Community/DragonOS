@@ -1,5 +1,4 @@
 #![no_std]
-#![feature(const_refs_to_cell)]
 #![feature(const_size_of_val)]
 #![allow(clippy::needless_return)]
 

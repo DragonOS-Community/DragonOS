@@ -705,16 +705,17 @@ impl ProcessControlBlock {
 
     #[inline(never)]
     fn do_create_pcb(name: String, kstack: KernelStack, is_idle: bool) -> Arc<Self> {
-        let (pid, ppid, cwd, cred) = if is_idle {
+        let (pid, ppid, cwd, cred, tty) = if is_idle {
             let cred = INIT_CRED.clone();
-            (Pid(0), Pid(0), "/".to_string(), cred)
+            (Pid(0), Pid(0), "/".to_string(), cred, None)
         } else {
             let ppid = ProcessManager::current_pcb().pid();
             let mut cred = ProcessManager::current_pcb().cred();
             cred.cap_permitted = cred.cap_ambient;
             cred.cap_effective = cred.cap_ambient;
             let cwd = ProcessManager::current_pcb().basic().cwd();
-            (Self::generate_pid(), ppid, cwd, cred)
+            let tty = ProcessManager::current_pcb().sig_info_irqsave().tty();
+            (Self::generate_pid(), ppid, cwd, cred, tty)
         };
 
         let basic_info = ProcessBasicInfo::new(Pid(0), ppid, Pid(0), name, cwd, None);
@@ -753,6 +754,8 @@ impl ProcessControlBlock {
             nsproxy: Arc::new(RwLock::new(NsProxy::new())),
             cred: SpinLock::new(cred),
         };
+
+        pcb.sig_info.write().set_tty(tty);
 
         // 初始化系统调用栈
         #[cfg(target_arch = "x86_64")]

@@ -116,7 +116,7 @@ pub struct PerfSample<'a> {
     pub value: &'a [u8],
 }
 
-impl<'a> PerfSample<'a> {
+impl PerfSample<'_> {
     pub fn calculate_size(value_size: usize) -> usize {
         size_of::<SampleHeader>() + value_size
     }

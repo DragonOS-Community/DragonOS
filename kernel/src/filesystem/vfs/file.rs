@@ -1062,7 +1062,7 @@ impl<'a> FileDescriptorIterator<'a> {
     }
 }
 
-impl<'a> Iterator for FileDescriptorIterator<'a> {
+impl Iterator for FileDescriptorIterator<'_> {
     type Item = (i32, Arc<File>);
 
     fn next(&mut self) -> Option<Self::Item> {

@@ -186,8 +186,14 @@ impl Clone for LoopbackDriver {
 }
 
 impl phy::Device for LoopbackDriver {
-    type RxToken<'a> = LoopbackRxToken where Self: 'a;
-    type TxToken<'a> = LoopbackTxToken where Self: 'a;
+    type RxToken<'a>
+        = LoopbackRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = LoopbackTxToken
+    where
+        Self: 'a;
     /// ## 返回设备的物理层特性。
     /// lo设备的最大传输单元为65535，最大突发大小为1，传输介质默认为Ethernet
     fn capabilities(&self) -> phy::DeviceCapabilities {

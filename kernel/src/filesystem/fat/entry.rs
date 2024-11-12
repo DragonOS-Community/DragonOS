@@ -256,8 +256,7 @@ impl FATFile {
         // 如果还需要更多的簇
         if bytes_remain_in_cluster < extra_bytes {
             let clusters_to_allocate =
-                (extra_bytes - bytes_remain_in_cluster + fs.bytes_per_cluster() - 1)
-                    / fs.bytes_per_cluster();
+                (extra_bytes - bytes_remain_in_cluster).div_ceil(fs.bytes_per_cluster());
             let last_cluster = if let Some(c) = fs.get_last_cluster(self.first_cluster) {
                 c
             } else {
@@ -338,7 +337,7 @@ impl FATFile {
             return Ok(());
         }
 
-        let new_last_cluster = (new_size + fs.bytes_per_cluster() - 1) / fs.bytes_per_cluster();
+        let new_last_cluster = new_size.div_ceil(fs.bytes_per_cluster());
         if let Some(begin_delete) =
             fs.get_cluster_by_relative(self.first_cluster, new_last_cluster as usize)
         {
@@ -463,8 +462,7 @@ impl FATDir {
 
         // 计算需要申请多少个簇
         let clusters_required =
-            (remain_entries * FATRawDirEntry::DIR_ENTRY_LEN + fs.bytes_per_cluster() - 1)
-                / fs.bytes_per_cluster();
+            (remain_entries * FATRawDirEntry::DIR_ENTRY_LEN).div_ceil(fs.bytes_per_cluster());
         let mut first_cluster = Cluster::default();
         let mut prev_cluster = current_cluster;
         // debug!(

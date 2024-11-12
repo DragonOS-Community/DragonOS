@@ -14,13 +14,14 @@ use crate::{
     },
     filesystem::kernfs::KernFSInode,
     libs::{
-        rwlock::RwLockWriteGuard,
+        rwlock::{RwLock, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
 };
 
 use super::{
     dev_id::PciDeviceID,
+    pci_irq::IrqType,
     subsys::{pci_bus, pci_bus_device},
 };
 
@@ -83,6 +84,12 @@ pub trait PciDevice: Device {
     fn device_id(&self) -> u16;
     fn subsystem_vendor(&self) -> u16;
     fn subsystem_device(&self) -> u16;
+    fn revision(&self) -> u8;
+    fn class_code(&self) -> u8;
+    fn irq_type(&self) -> &RwLock<IrqType>;
+    fn irq_line(&self) -> u8;
+    fn subclass(&self) -> u8;
+    fn interface_code(&self) -> u8;
 }
 
 /// #结构功能

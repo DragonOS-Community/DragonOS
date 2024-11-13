@@ -1,7 +1,7 @@
 use core::sync::atomic::compiler_fence;
 
 use alloc::sync::Arc;
-use log::{debug, warn};
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -441,38 +441,9 @@ pub(super) fn do_sigaction(
     return Ok(());
 }
 
-/// 设置当前进程的屏蔽信号 (sig_block)，待引入 [sigprocmask](https://man7.org/linux/man-pages/man2/sigprocmask.2.html) 系统调用后要删除这个散装函数
-///
-/// ## 参数
-///
-/// - `new_set` 新的屏蔽信号bitmap的值
-pub fn set_current_sig_blocked(new_set: &mut SigSet) {
-    let to_remove: SigSet =
-        <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
-    new_set.remove(to_remove);
-    //TODO 把这个散装函数用 sigsetops 替换掉
-    let pcb = ProcessManager::current_pcb();
-
-    /*
-        如果当前pcb的sig_blocked和新的相等，那么就不用改变它。
-        请注意，一个进程的sig_blocked字段不能被其他进程修改！
-    */
-    if pcb.sig_info_irqsave().sig_block().eq(new_set) {
-        return;
-    }
-
-    let guard = pcb.sig_struct_irqsave();
-    // todo: 当一个进程有多个线程后，在这里需要设置每个线程的block字段，并且 retarget_shared_pending（虽然我还没搞明白linux这部分是干啥的）
-
-    // 设置当前进程的sig blocked
-    *pcb.sig_info_mut().sig_block_mut() = *new_set;
-    recalc_sigpending();
-    drop(guard);
-}
-
-const SIG_BLOCK: i32 = 0;
-const SIG_UNBLOCK: i32 = 1;
-const SIG_SETMASK: i32 = 2;
+pub const SIG_BLOCK: i32 = 0;
+pub const SIG_UNBLOCK: i32 = 1;
+pub const SIG_SETMASK: i32 = 2;
 
 /// 设置当前进程的屏蔽信号 (sig_block)
 ///
@@ -481,6 +452,10 @@ const SIG_SETMASK: i32 = 2;
 /// - `new_set` 新的屏蔽信号bitmap的值
 fn __set_current_blocked(new_set: &SigSet) {
     let pcb = ProcessManager::current_pcb();
+    /*
+        如果当前pcb的sig_blocked和新的相等，那么就不用改变它。
+        请注意，一个进程的sig_blocked字段不能被其他进程修改！
+    */
     if pcb.sig_info_irqsave().sig_block().eq(new_set) {
         return;
     }

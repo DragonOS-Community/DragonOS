@@ -3,7 +3,7 @@ use system_error::SystemError;
 use crate::{
     arch::ipc::signal::SigSet,
     filesystem::vfs::file::FileMode,
-    ipc::signal::set_current_sig_blocked,
+    ipc::signal::{sigprocmask, SIG_SETMASK},
     mm::VirtAddr,
     syscall::{
         user_access::{UserBufferReader, UserBufferWriter},
@@ -96,7 +96,7 @@ impl Syscall {
         sigmask: &mut SigSet,
     ) -> Result<usize, SystemError> {
         // 设置屏蔽的信号
-        set_current_sig_blocked(sigmask);
+        sigprocmask(SIG_SETMASK, *sigmask)?;
 
         let wait_ret = Self::epoll_wait(epfd, epoll_event, max_events, timespec);
 

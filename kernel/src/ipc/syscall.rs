@@ -3,7 +3,7 @@ use core::{
     sync::atomic::compiler_fence,
 };
 
-use log::{debug, error, warn};
+use log::{error, warn};
 use system_error::SystemError;
 
 use crate::{

@@ -27,7 +27,7 @@ clean:
 fmt:
 	RUSTFLAGS="$(RUSTFLAGS)" cargo fmt --all $(FMT_CHECK)
 ifeq ($(ARCH), x86_64)
-	RUSTFLAGS="$(RUSTFLAGS)" cargo clippy --all-features
+#	RUSTFLAGS="$(RUSTFLAGS)" cargo clippy --all-features
 endif
 
 

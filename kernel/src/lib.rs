@@ -93,8 +93,11 @@ extern crate wait_queue_macros;
 
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
-#[cfg(all(feature = "backtrace", target_arch = "x86_64"))]
-extern crate mini_backtrace;
+#[cfg(feature = "backtrace")]
+use unwinding::{
+    abi::{UnwindContext, UnwindReasonCode, _Unwind_GetIP},
+    panic::UserUnwindTrace,
+};
 
 extern "C" {
     fn lookup_kallsyms(addr: u64, level: i32) -> i32;
@@ -105,12 +108,37 @@ extern "C" {
 pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator;
 
 /// 全局的panic处理函数
+///
+/// How to use unwinding lib:
+///
+/// ```
+/// pub fn test_unwind() {
+///    struct UnwindTest;
+///    impl Drop for UnwindTest {
+///        fn drop(&mut self) {
+///            println!("Drop UnwindTest");
+///        }
+///    }
+///    let res1 = unwinding::panic::catch_unwind(|| {
+///        let _unwind_test = UnwindTest;
+///        println!("Test panic...");
+///        panic!("Test panic");
+///    });
+///    assert_eq!(res1.is_err(), true);
+///    let res2 = unwinding::panic::catch_unwind(|| {
+///        let _unwind_test = UnwindTest;
+///        println!("Test no panic...");
+///        0
+///    });
+///    assert_eq!(res2.is_ok(), true);
+/// }
+/// ```
+///
 #[cfg(target_os = "none")]
 #[panic_handler]
 #[no_mangle]
 pub fn panic(info: &PanicInfo) -> ! {
     use log::error;
-    use process::ProcessManager;
 
     error!("Kernel Panic Occurred.");
 
@@ -128,21 +156,44 @@ pub fn panic(info: &PanicInfo) -> ! {
         }
     }
     println!("Message:\n\t{}", info.message());
-
-    #[cfg(all(feature = "backtrace", target_arch = "x86_64"))]
-    {
-        unsafe {
-            let bt = mini_backtrace::Backtrace::<16>::capture();
-            println!("Rust Panic Backtrace:");
-            let mut level = 0;
-            for frame in bt.frames {
-                lookup_kallsyms(frame as u64, level);
-                level += 1;
-            }
-        };
+    const MAX_DEPTH: u8 = 2;
+    static DEPTH: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    let depth = DEPTH.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    if depth >= MAX_DEPTH {
+        println!("Panic depth is too deep, stop unwinding.");
+        loop {}
     }
+    #[cfg(feature = "backtrace")]
+    {
+        let mut data = CallbackData { counter: 0 };
+        println!("Rust Panic Backtrace:");
+        let res = unwinding::panic::begin_panic_with_hook::<Tracer>(
+            alloc::boxed::Box::new(()),
+            &mut data,
+        );
+        panic!("panic unreachable: {:?}", res.0);
+    }
+    // println!("Current PCB:\n\t{:?}", (ProcessManager::current_pcb()));
+    // process::ProcessManager::exit(usize::MAX);
+}
 
-    println!("Current PCB:\n\t{:?}", (ProcessManager::current_pcb()));
+/// User hook for unwinding
+///
+/// During stack backtrace, the user can print the function location of the current stack frame.
+struct Tracer;
+struct CallbackData {
+    counter: usize,
+}
+impl UserUnwindTrace for Tracer {
+    type Arg = CallbackData;
 
-    ProcessManager::exit(usize::MAX);
+    fn trace(ctx: &UnwindContext<'_>, arg: *mut Self::Arg) -> UnwindReasonCode {
+        let data = unsafe { &mut *(arg) };
+        data.counter += 1;
+        let pc = _Unwind_GetIP(ctx);
+        unsafe {
+            lookup_kallsyms(pc as u64, data.counter as i32);
+        }
+        UnwindReasonCode::NO_REASON
+    }
 }

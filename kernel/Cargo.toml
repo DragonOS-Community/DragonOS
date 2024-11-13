@@ -17,7 +17,7 @@ members = [
 [features]
 default = ["backtrace", "kvm", "fatfs", "fatfs-secure"]
 # 内核栈回溯
-backtrace = []
+backtrace = ["dep:unwinding"]
 # kvm
 kvm = []
 
@@ -67,9 +67,16 @@ lru = "0.12.3"
 
 rbpf = { path = "crates/rbpf" }
 printf-compat = { version = "0.1.1", default-features = false }
+
+unwinding = { git = "https://github.com/Godones/unwinding.git", branch = "hook", default-features = false,  optional = true, features = [
+    "unwinder",
+    "fde-gnu-eh-frame-hdr",
+    "panic",
+    "personality"
+]}
+
 # target为x86_64时，使用下面的依赖
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-mini-backtrace = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/mini-backtrace.git", rev = "e0b1d90940" }
 multiboot2 = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/multiboot2", rev = "05739aab40" }
 raw-cpuid = "11.0.1"
 x86 = "=0.52.0"

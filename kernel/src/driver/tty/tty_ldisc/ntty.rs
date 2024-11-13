@@ -785,13 +785,11 @@ impl NTtyData {
         signal: Signal,
     ) {
         // 先处理信号
-        let mut ctrl_info = tty.core().contorl_info_irqsave();
+        let ctrl_info = tty.core().contorl_info_irqsave();
         let pg = ctrl_info.pgid;
         if let Some(pg) = pg {
             let _ = Syscall::kill(pg, signal as i32);
         }
-
-        ctrl_info.pgid = None;
 
         if !termios.local_mode.contains(LocalMode::NOFLSH) {
             // 重置

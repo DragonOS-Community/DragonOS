@@ -540,7 +540,7 @@ impl Syscall {
 
         let nset = reader.read_one_from_user::<u64>(0)?;
         let mut new_set = SigSet::from_bits_truncate(*nset);
-        debug!("Get Newset: {}", &new_set.bits());
+        // debug!("Get Newset: {}", &new_set.bits());
 
         let to_remove: SigSet =
             <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
@@ -548,7 +548,7 @@ impl Syscall {
 
         let oldset_te_return = sigprocmask(how, new_set)?;
         if let Some(oldset) = oset {
-            debug!("Get Oldset to return: {}", &oldset_te_return.bits());
+            // debug!("Get Oldset to return: {}", &oldset_te_return.bits());
             let mut writer = UserBufferWriter::new(
                 VirtAddr::new(oldset).as_ptr::<u64>(),
                 core::mem::size_of::<u64>(),

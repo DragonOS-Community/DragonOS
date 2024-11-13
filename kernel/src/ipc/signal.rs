@@ -498,14 +498,14 @@ pub fn sigprocmask(how: i32, set: SigSet) -> Result<SigSet, SystemError> {
 
     match how {
         SIG_BLOCK => {
-            debug!("SIG_BLOCK\tGoing to insert is: {}", set.bits());
+            // debug!("SIG_BLOCK\tGoing to insert is: {}", set.bits());
             res_set.insert(set);
         }
         SIG_UNBLOCK => {
             res_set.remove(set);
         }
         SIG_SETMASK => {
-            debug!("SIG_SETMASK\tGoing to set is: {}", set.bits());
+            // debug!("SIG_SETMASK\tGoing to set is: {}", set.bits());
             res_set = set;
         }
         _ => {

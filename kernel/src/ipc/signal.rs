@@ -504,7 +504,7 @@ pub fn sigprocmask(how: i32, set: SigSet) -> Result<SigSet, SystemError> {
     let guard = pcb.sig_info_irqsave();
     let oset = *guard.sig_block();
 
-    let mut res_set = oset.clone();
+    let mut res_set = oset;
     drop(guard);
 
     match how {

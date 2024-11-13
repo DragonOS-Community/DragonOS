@@ -474,6 +474,11 @@ const SIG_BLOCK: i32 = 0;
 const SIG_UNBLOCK: i32 = 1;
 const SIG_SETMASK: i32 = 2;
 
+/// 设置当前进程的屏蔽信号 (sig_block)
+///
+/// ## 参数
+///
+/// - `new_set` 新的屏蔽信号bitmap的值
 fn __set_current_blocked(new_set: &SigSet) {
     let pcb = ProcessManager::current_pcb();
     if pcb.sig_info_irqsave().sig_block().eq(new_set) {
@@ -488,6 +493,12 @@ fn __set_current_blocked(new_set: &SigSet) {
     drop(guard);
 }
 
+/// 设置当前进程的屏蔽信号 (sig_block)
+///
+/// ## 参数
+///
+/// - `how` 设置方式
+/// - `new_set` 新的屏蔽信号bitmap的值
 pub fn sigprocmask(how: i32, set: SigSet) -> Result<SigSet, SystemError> {
     let pcb: Arc<ProcessControlBlock> = ProcessManager::current_pcb();
     let guard = pcb.sig_info_irqsave();

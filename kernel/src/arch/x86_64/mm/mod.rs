@@ -500,7 +500,7 @@ unsafe fn allocator_init() {
         for i in 0..total_num {
             let area = mem_block_manager().get_initial_memory_region(i).unwrap();
             // debug!("area: base={:?}, size={:#x}, end={:?}", area.base, area.size, area.base + area.size);
-            for i in 0..((area.size + MMArch::PAGE_SIZE - 1) / MMArch::PAGE_SIZE) {
+            for i in 0..area.size.div_ceil(MMArch::PAGE_SIZE) {
                 let paddr = area.base.add(i * MMArch::PAGE_SIZE);
                 let vaddr = unsafe { MMArch::phys_2_virt(paddr) }.unwrap();
                 let flags = kernel_page_flags::<MMArch>(vaddr);

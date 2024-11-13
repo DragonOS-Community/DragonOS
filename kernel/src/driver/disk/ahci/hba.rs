@@ -1,11 +1,10 @@
+//! 文件说明: 实现了 AHCI 中的控制器 HBA 的相关行为
 use core::{intrinsics::size_of, ptr};
 
 use core::sync::atomic::compiler_fence;
 
 use crate::arch::MMArch;
 use crate::mm::{MemoryManagementArch, PhysAddr};
-
-/// 文件说明: 实现了 AHCI 中的控制器 HBA 的相关行为
 
 /// 根据 AHCI 写出 HBA 的 Command
 pub const ATA_CMD_READ_DMA_EXT: u8 = 0x25; // 读操作，并且退出

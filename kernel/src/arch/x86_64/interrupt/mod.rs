@@ -4,11 +4,12 @@ pub mod ipi;
 pub mod msi;
 pub mod trap;
 
+use core::any::Any;
 use core::{
     arch::asm,
     sync::atomic::{compiler_fence, Ordering},
 };
-
+use kprobe::ProbeArgs;
 use log::error;
 use system_error::SystemError;
 
@@ -176,5 +177,22 @@ impl TrapFrame {
     /// 判断当前中断是否来自用户模式
     pub fn is_from_user(&self) -> bool {
         return (self.cs & 0x3) != 0;
+    }
+    /// 设置当前的程序计数器
+    pub fn set_pc(&mut self, pc: usize) {
+        self.rip = pc as u64;
+    }
+}
+
+impl ProbeArgs for TrapFrame {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn break_address(&self) -> usize {
+        (self.rip - 1) as usize
+    }
+
+    fn debug_address(&self) -> usize {
+        self.rip as usize
     }
 }

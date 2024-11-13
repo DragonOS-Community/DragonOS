@@ -45,7 +45,7 @@ macro_rules! interrupt_handler {
             #[naked]
             #[no_mangle]
             unsafe extern "C" fn [<irq_handler $name>]() {
-                core::arch::asm!(
+                core::arch::naked_asm!(
                     concat!(
                         "
                         push 0x0
@@ -60,8 +60,7 @@ macro_rules! interrupt_handler {
                         jmp x86_64_do_irq
                         "
                     ),
-                    irqnum = const($name),
-                    options(noreturn)
+                    irqnum = const($name)
                 );
             }
         }

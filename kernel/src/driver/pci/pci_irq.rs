@@ -155,7 +155,7 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @param self PCI设备的可变引用
     /// @param flag 选择的中断类型（支持多个选择），如PCI_IRQ_ALL_TYPES表示所有中断类型均可，让系统按顺序进行选择
     /// @return Option<IrqType> 失败返回None，成功则返回对应中断类型
-    fn irq_init(&mut self, flag: IRQ) -> Option<IrqType> {
+    fn irq_init(&self, flag: IRQ) -> Option<IrqType> {
         // MSIX中断优先
         if flag.contains(IRQ::PCI_IRQ_MSIX) {
             if let Some(cap_offset) = self.msix_capability_offset() {
@@ -174,7 +174,7 @@ pub trait PciInterrupt: PciDeviceStructure {
                 );
                 let pending_table_bar = (data & 0x07) as u8;
                 let pending_table_offset = data & (!0x07);
-                *self.irq_type_mut()? = IrqType::Msix {
+                *self.irq_type_mut()?.write() = IrqType::Msix {
                     msix_table_bar,
                     msix_table_offset,
                     pending_table_bar,
@@ -201,7 +201,7 @@ pub trait PciInterrupt: PciDeviceStructure {
                 let maskable = (message_control & 0x0100) != 0;
                 let address_64 = (message_control & 0x0080) != 0;
                 let irq_max_num = (1 << (((message_control & 0x000e) >> 1) + 1)) as u16;
-                *self.irq_type_mut()? = IrqType::Msi {
+                *self.irq_type_mut()?.write() = IrqType::Msi {
                     address_64,
                     maskable,
                     irq_max_num,
@@ -217,7 +217,7 @@ pub trait PciInterrupt: PciDeviceStructure {
         }
         // 最后选择legacy#
         if flag.contains(IRQ::PCI_IRQ_LEGACY) {
-            *self.irq_type_mut()? = IrqType::Legacy;
+            *self.irq_type_mut()?.write() = IrqType::Legacy;
             return Some(IrqType::Legacy);
         }
         None
@@ -226,9 +226,9 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @brief 启动/关闭设备中断
     /// @param self PCI设备的可变引用
     /// @param enable 开启/关闭
-    fn irq_enable(&mut self, enable: bool) -> Result<u8, PciError> {
+    fn irq_enable(&self, enable: bool) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type {
+            match *irq_type.read() {
                 IrqType::Msix { .. } => {
                     return self.msix_enable(enable);
                 }
@@ -248,9 +248,9 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @brief 启动/关闭设备MSIX中断
     /// @param self PCI设备的可变引用
     /// @param enable 开启/关闭
-    fn msix_enable(&mut self, enable: bool) -> Result<u8, PciError> {
+    fn msix_enable(&self, enable: bool) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type {
+            match *irq_type.read() {
                 IrqType::Msix { cap_offset, .. } => {
                     let mut message = pci_root_0()
                         .read_config(self.common_header().bus_device_function, cap_offset.into());
@@ -279,9 +279,9 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @brief 启动/关闭设备MSI中断
     /// @param self PCI设备的可变引用
     /// @param enable 开启/关闭
-    fn msi_enable(&mut self, enable: bool) -> Result<u8, PciError> {
+    fn msi_enable(&self, enable: bool) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type {
+            match *irq_type.read() {
                 IrqType::Msi { cap_offset, .. } => {
                     let mut message = pci_root_0()
                         .read_config(self.common_header().bus_device_function, cap_offset.into());
@@ -315,9 +315,9 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @param self PCI设备的可变引用
     /// @param msg PCI设备install中断时需要传递的共同参数
     /// @return 一切正常返回Ok(0),有错误返回对应错误原因
-    fn irq_install(&mut self, msg: PciIrqMsg) -> Result<u8, PciError> {
+    fn irq_install(&self, msg: PciIrqMsg) -> Result<u8, PciError> {
         if let Some(irq_vector) = self.irq_vector_mut() {
-            if msg.irq_common_message.irq_index as usize > irq_vector.len() {
+            if msg.irq_common_message.irq_index as usize > irq_vector.read().len() {
                 return Err(PciError::PciIrqError(PciIrqError::InvalidIrqIndex(
                     msg.irq_common_message.irq_index,
                 )));
@@ -325,7 +325,7 @@ pub trait PciInterrupt: PciDeviceStructure {
         }
         self.irq_enable(false)?; //中断设置更改前先关闭对应PCI设备的中断
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type {
+            match *irq_type.read() {
                 IrqType::Msix { .. } => {
                     return self.msix_install(msg);
                 }
@@ -346,9 +346,9 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @param self PCI设备的可变引用
     /// @param msg PCI设备install中断时需要传递的共同参数
     /// @return 一切正常返回Ok(0),有错误返回对应错误原因
-    fn msi_install(&mut self, msg: PciIrqMsg) -> Result<u8, PciError> {
+    fn msi_install(&self, msg: PciIrqMsg) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type {
+            match *irq_type.read() {
                 IrqType::Msi {
                     address_64,
                     irq_max_num,
@@ -356,11 +356,11 @@ pub trait PciInterrupt: PciDeviceStructure {
                     ..
                 } => {
                     // 注意：MSI中断分配的中断号必须连续且大小为2的倍数
-                    if self.irq_vector_mut().unwrap().len() > irq_max_num as usize {
+                    if self.irq_vector_mut().unwrap().read().len() > irq_max_num as usize {
                         return Err(PciError::PciIrqError(PciIrqError::DeviceIrqOverflow));
                     }
-                    let irq_num =
-                        self.irq_vector_mut().unwrap()[msg.irq_common_message.irq_index as usize];
+                    let irq_num = self.irq_vector_mut().unwrap().read()
+                        [msg.irq_common_message.irq_index as usize];
 
                     let irq_num = IrqNumber::new(irq_num.into());
                     let common_msg = &msg.irq_common_message;
@@ -441,7 +441,7 @@ pub trait PciInterrupt: PciDeviceStructure {
                             cap_offset.into(),
                         );
                         let message_control = (data >> 16) as u16;
-                        match self.irq_vector_mut().unwrap().len() {
+                        match self.irq_vector_mut().unwrap().read().len() {
                             1 => {
                                 let temp = message_control & (!0x0070);
                                 pci_root_0().write_config(
@@ -511,20 +511,20 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @param self PCI设备的可变引用
     /// @param msg PCI设备install中断时需要传递的共同参数
     /// @return 一切正常返回Ok(0),有错误返回对应错误原因
-    fn msix_install(&mut self, msg: PciIrqMsg) -> Result<u8, PciError> {
+    fn msix_install(&self, msg: PciIrqMsg) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type {
+            match *irq_type.read() {
                 IrqType::Msix {
                     irq_max_num,
                     msix_table_bar,
                     msix_table_offset,
                     ..
                 } => {
-                    if self.irq_vector_mut().unwrap().len() > irq_max_num as usize {
+                    if self.irq_vector_mut().unwrap().read().len() > irq_max_num as usize {
                         return Err(PciError::PciIrqError(PciIrqError::DeviceIrqOverflow));
                     }
-                    let irq_num =
-                        self.irq_vector_mut().unwrap()[msg.irq_common_message.irq_index as usize];
+                    let irq_num = self.irq_vector_mut().unwrap().read()
+                        [msg.irq_common_message.irq_index as usize];
 
                     let common_msg = &msg.irq_common_message;
 
@@ -571,7 +571,8 @@ pub trait PciInterrupt: PciDeviceStructure {
                     //写入Message Data和Message Address
                     let pcistandardbar = self
                         .bar()
-                        .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))?;
+                        .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))?
+                        .read();
                     let msix_bar = pcistandardbar.get_bar(msix_table_bar)?;
                     let vaddr: crate::mm::VirtAddr = msix_bar
                         .virtual_address()
@@ -603,7 +604,7 @@ pub trait PciInterrupt: PciDeviceStructure {
     fn irq_uninstall(&mut self) -> Result<u8, PciError> {
         self.irq_enable(false)?; //中断设置更改前先关闭对应PCI设备的中断
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type {
+            match *irq_type.read() {
                 IrqType::Msix { .. } => {
                     return self.msix_uninstall();
                 }
@@ -622,15 +623,15 @@ pub trait PciInterrupt: PciDeviceStructure {
     }
     /// @brief 进行PCI设备中断的卸载（MSI）
     /// @param self PCI设备的可变引用
-    fn msi_uninstall(&mut self) -> Result<u8, PciError> {
+    fn msi_uninstall(&self) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type {
+            match *irq_type.read() {
                 IrqType::Msi {
                     address_64,
                     cap_offset,
                     ..
                 } => {
-                    for vector in self.irq_vector_mut().unwrap() {
+                    for vector in self.irq_vector_mut().unwrap().read().iter() {
                         let irq = IrqNumber::new((*vector).into());
                         irq_manager().free_irq(irq, None);
                     }
@@ -670,9 +671,9 @@ pub trait PciInterrupt: PciDeviceStructure {
     }
     /// @brief 进行PCI设备中断的卸载(MSIX)
     /// @param self PCI设备的可变引用
-    fn msix_uninstall(&mut self) -> Result<u8, PciError> {
+    fn msix_uninstall(&self) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type {
+            match *irq_type.read() {
                 IrqType::Msix {
                     irq_max_num,
                     cap_offset,
@@ -680,7 +681,7 @@ pub trait PciInterrupt: PciDeviceStructure {
                     msix_table_offset,
                     ..
                 } => {
-                    for vector in self.irq_vector_mut().unwrap() {
+                    for vector in self.irq_vector_mut().unwrap().read().iter() {
                         let irq = IrqNumber::new((*vector).into());
                         irq_manager().free_irq(irq, None);
                     }
@@ -692,7 +693,8 @@ pub trait PciInterrupt: PciDeviceStructure {
                     let pcistandardbar = self
                         .bar()
                         .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))
-                        .unwrap();
+                        .unwrap()
+                        .read();
                     let msix_bar = pcistandardbar.get_bar(msix_table_bar).unwrap();
                     for index in 0..irq_max_num {
                         let vaddr = msix_bar
@@ -726,7 +728,7 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @param irq_index 中断的位置（在vec中的index和安装的index相同）
     fn irq_mask(&mut self, irq_index: u16) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type {
+            match *irq_type.read() {
                 IrqType::Msix { .. } => {
                     return self.msix_mask(irq_index);
                 }
@@ -746,9 +748,9 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @brief 屏蔽相应位置的中断(MSI)
     /// @param self PCI设备的可变引用
     /// @param irq_index 中断的位置（在vec中的index和安装的index相同）
-    fn msi_mask(&mut self, irq_index: u16) -> Result<u8, PciError> {
+    fn msi_mask(&self, irq_index: u16) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type {
+            match *irq_type.read() {
                 IrqType::Msi {
                     maskable,
                     address_64,
@@ -804,9 +806,9 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @brief 屏蔽相应位置的中断(MSIX)
     /// @param self PCI设备的可变引用
     /// @param irq_index 中断的位置（在vec中的index和安装的index相同）
-    fn msix_mask(&mut self, irq_index: u16) -> Result<u8, PciError> {
+    fn msix_mask(&self, irq_index: u16) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type {
+            match *irq_type.read() {
                 IrqType::Msix {
                     irq_max_num,
                     msix_table_bar,
@@ -821,7 +823,8 @@ pub trait PciInterrupt: PciDeviceStructure {
                     let pcistandardbar = self
                         .bar()
                         .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))
-                        .unwrap();
+                        .unwrap()
+                        .read();
                     let msix_bar = pcistandardbar.get_bar(msix_table_bar).unwrap();
                     let vaddr = msix_bar.virtual_address().unwrap()
                         + msix_table_offset as usize
@@ -845,9 +848,9 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @brief 解除屏蔽相应位置的中断
     /// @param self PCI设备的可变引用
     /// @param irq_index 中断的位置（在vec中的index和安装的index相同）
-    fn irq_unmask(&mut self, irq_index: u16) -> Result<u8, PciError> {
+    fn irq_unmask(&self, irq_index: u16) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type {
+            match *irq_type.read() {
                 IrqType::Msix { .. } => {
                     return self.msix_unmask(irq_index);
                 }
@@ -867,9 +870,9 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @brief 解除屏蔽相应位置的中断（MSI）
     /// @param self PCI设备的可变引用
     /// @param irq_index 中断的位置（在vec中的index和安装的index相同）
-    fn msi_unmask(&mut self, irq_index: u16) -> Result<u8, PciError> {
+    fn msi_unmask(&self, irq_index: u16) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type {
+            match *irq_type.read() {
                 IrqType::Msi {
                     maskable,
                     address_64,
@@ -924,9 +927,9 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @brief 解除屏蔽相应位置的中断(MSIX)
     /// @param self PCI设备的可变引用
     /// @param irq_index 中断的位置（在vec中的index和安装的index相同）
-    fn msix_unmask(&mut self, irq_index: u16) -> Result<u8, PciError> {
+    fn msix_unmask(&self, irq_index: u16) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type {
+            match *irq_type.read() {
                 IrqType::Msix {
                     irq_max_num,
                     msix_table_bar,
@@ -941,7 +944,8 @@ pub trait PciInterrupt: PciDeviceStructure {
                     let pcistandardbar = self
                         .bar()
                         .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))
-                        .unwrap();
+                        .unwrap()
+                        .read();
                     let msix_bar = pcistandardbar.get_bar(msix_table_bar).unwrap();
                     let vaddr = msix_bar.virtual_address().unwrap()
                         + msix_table_offset as usize
@@ -966,9 +970,9 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @param self PCI设备的可变引用
     /// @param irq_index 中断的位置（在vec中的index和安装的index相同）
     /// @return 是否在挂起过程中产生中断（异常情况也返回false）
-    fn irq_check_pending(&mut self, irq_index: u16) -> Result<bool, PciError> {
+    fn irq_check_pending(&self, irq_index: u16) -> Result<bool, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type {
+            match *irq_type.read() {
                 IrqType::Msix { .. } => {
                     return self.msix_check_pending(irq_index);
                 }
@@ -989,9 +993,9 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @param self PCI设备的可变引用
     /// @param irq_index 中断的位置（在vec中的index和安装的index相同）
     /// @return 是否在挂起过程中产生中断（异常情况也返回false）
-    fn msi_check_pending(&mut self, irq_index: u16) -> Result<bool, PciError> {
+    fn msi_check_pending(&self, irq_index: u16) -> Result<bool, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type {
+            match *irq_type.read() {
                 IrqType::Msi {
                     maskable,
                     address_64,
@@ -1038,9 +1042,9 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @param self PCI设备的可变引用
     /// @param irq_index 中断的位置（在vec中的index和安装的index相同）
     /// @return 是否在挂起过程中产生中断（异常情况也返回false）
-    fn msix_check_pending(&mut self, irq_index: u16) -> Result<bool, PciError> {
+    fn msix_check_pending(&self, irq_index: u16) -> Result<bool, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type {
+            match *irq_type.read() {
                 IrqType::Msix {
                     irq_max_num,
                     pending_table_bar,
@@ -1055,7 +1059,8 @@ pub trait PciInterrupt: PciDeviceStructure {
                     let pcistandardbar = self
                         .bar()
                         .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))
-                        .unwrap();
+                        .unwrap()
+                        .read();
                     let pending_bar = pcistandardbar.get_bar(pending_table_bar).unwrap();
                     let vaddr = pending_bar.virtual_address().unwrap()
                         + pending_table_offset as usize

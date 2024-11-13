@@ -122,6 +122,7 @@ static CASTER_MAP: once_cell::sync::Lazy<HashMap<(TypeId, TypeId), BoxedCaster, 
 static mut CASTER_MAP: Option<HashMap<(TypeId, TypeId), BoxedCaster, BuildFastHasher>> = None;
 
 #[cfg(target_os = "none")]
+#[allow(static_mut_refs)]
 pub fn caster_map() -> &'static HashMap<(TypeId, TypeId), BoxedCaster, BuildFastHasher> {
     return unsafe {
         CASTER_MAP.as_ref().unwrap_or_else(|| {

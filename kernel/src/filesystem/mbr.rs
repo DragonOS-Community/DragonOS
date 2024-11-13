@@ -169,7 +169,7 @@ impl<'a> MbrPartitionIter<'a> {
     }
 }
 
-impl<'a> Iterator for MbrPartitionIter<'a> {
+impl Iterator for MbrPartitionIter<'_> {
     type Item = Partition;
 
     fn next(&mut self) -> Option<Self::Item> {

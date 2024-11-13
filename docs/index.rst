@@ -30,8 +30,11 @@
    kernel/debug/index
    kernel/ktest/index
    kernel/cpu_arch/index
+   kernel/container/index
    kernel/libs/index
    kernel/net/index
+   kernel/trace/index
+
 
 
 .. toctree::

@@ -16,7 +16,7 @@ struct EmptyIdaItemRef<'a> {
     _marker: PhantomData<&'a EmptyIdaItem>,
 }
 
-impl<'a> Deref for EmptyIdaItemRef<'a> {
+impl Deref for EmptyIdaItemRef<'_> {
     type Target = EmptyIdaItem;
 
     fn deref(&self) -> &Self::Target {
@@ -27,7 +27,10 @@ impl<'a> Deref for EmptyIdaItemRef<'a> {
 struct EmptyIdaItem;
 
 unsafe impl kdepends::xarray::ItemEntry for EmptyIdaItem {
-    type Ref<'a> = EmptyIdaItemRef<'a> where Self: 'a;
+    type Ref<'a>
+        = EmptyIdaItemRef<'a>
+    where
+        Self: 'a;
 
     fn into_raw(self) -> *const () {
         core::ptr::null()
@@ -139,6 +142,11 @@ impl IdAllocator {
     /// 返回已经使用的id数量
     pub fn used(&self) -> usize {
         self.used
+    }
+
+    /// 返回最大id数
+    pub fn get_max_id(&self) -> usize {
+        self.max_id
     }
 }
 

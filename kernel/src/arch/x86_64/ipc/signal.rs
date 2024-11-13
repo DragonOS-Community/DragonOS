@@ -431,8 +431,6 @@ impl SignalArch for X86_64SignalArch {
             return;
         }
 
-        let pcb = ProcessManager::current_pcb();
-
         let mut sig_number: Signal;
         let mut info: Option<SigInfo>;
         let mut sigaction: Sigaction;
@@ -483,9 +481,13 @@ impl SignalArch for X86_64SignalArch {
         //避免死锁
         drop(siginfo_mut_guard);
         drop(sig_guard);
+        drop(pcb);
 
         // 做完上面的检查后，开中断
         CurrentIrqArch::interrupt_enable();
+
+        // 注意！由于handle_signal里面可能会退出进程，
+        // 因此这里需要检查清楚：上面所有的锁、arc指针都被释放了。否则会产生资源泄露的问题！
         let res: Result<i32, SystemError> =
             handle_signal(sig_number, &mut sigaction, &info.unwrap(), &oldset, frame);
         if res.is_err() {

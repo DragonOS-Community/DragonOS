@@ -1,6 +1,5 @@
 use crate::net::{Iface, NET_DEVICES};
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use system_error::SystemError::{self, *};
 
 pub mod port;

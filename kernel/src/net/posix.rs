@@ -232,7 +232,7 @@ impl SockAddr {
                     };
 
                     return Ok(Endpoint::Unixpath((inode.metadata()?.inode_id, path)));
-                },
+                }
                 _ => {
                     log::warn!("not support address family {:?}", addr.family);
                     return Err(SystemError::EINVAL);

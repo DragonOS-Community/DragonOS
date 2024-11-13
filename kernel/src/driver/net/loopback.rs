@@ -52,7 +52,7 @@ impl phy::RxToken for LoopbackRxToken {
     /// 返回函数 `f` 在 `self.buffer` 上的调用结果。
     fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&[u8]) -> R
+        F: FnOnce(&[u8]) -> R,
     {
         f(self.buffer.as_slice())
     }
@@ -277,7 +277,7 @@ impl LoopbackInterface {
     /// 返回一个 `Arc<Self>`，即一个指向新创建的 `LoopbackInterface` 实例的智能指针。
     pub fn new(mut driver: LoopbackDriver) -> Arc<Self> {
         let iface_id = generate_iface_id();
-        
+
         let hardware_addr = HardwareAddress::Ethernet(smoltcp::wire::EthernetAddress([
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ]));
@@ -296,9 +296,7 @@ impl LoopbackInterface {
 
         //设置网卡地址为127.0.0.1
         iface.update_ip_addrs(|ip_addrs| {
-            ip_addrs
-                .push(cidr)
-                .expect("Push ipCidr failed: full");
+            ip_addrs.push(cidr).expect("Push ipCidr failed: full");
         });
 
         iface.routes_mut().update(|routes_map| {

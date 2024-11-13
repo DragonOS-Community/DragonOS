@@ -2,7 +2,7 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicUsize};
 use system_error::SystemError::{self, *};
 
-use crate::{arch::init, libs::rwlock::RwLock};
+use crate::libs::rwlock::RwLock;
 use crate::net::event_poll::EPollEventType;
 use crate::net::net_core::poll_ifaces;
 use crate::net::socket::*;
@@ -234,12 +234,10 @@ impl Socket for TcpSocket {
 
     fn get_name(&self) -> Result<Endpoint, SystemError> {
         match self.inner.read().as_ref().expect("Tcp Inner is None") {
-            Inner::Init(Init::Unbound((_, ver))) => {
-                Ok(Endpoint::Ip( match ver {
-                    smoltcp::wire::IpVersion::Ipv4 => UNSPECIFIED_LOCAL_ENDPOINT_V4,
-                    smoltcp::wire::IpVersion::Ipv6 => UNSPECIFIED_LOCAL_ENDPOINT_V6,
-                }))
-            }
+            Inner::Init(Init::Unbound((_, ver))) => Ok(Endpoint::Ip(match ver {
+                smoltcp::wire::IpVersion::Ipv4 => UNSPECIFIED_LOCAL_ENDPOINT_V4,
+                smoltcp::wire::IpVersion::Ipv6 => UNSPECIFIED_LOCAL_ENDPOINT_V6,
+            })),
             Inner::Init(Init::Bound((_, local))) => Ok(Endpoint::Ip(*local)),
             Inner::Connecting(connecting) => Ok(Endpoint::Ip(connecting.get_name())),
             Inner::Established(established) => Ok(Endpoint::Ip(established.local_endpoint())),
@@ -330,7 +328,7 @@ impl Socket for TcpSocket {
                 Inner::Init(init) => {
                     init.close();
                     Ok(())
-                },
+                }
             })
             .unwrap_or(Ok(()))
     }
@@ -361,7 +359,7 @@ impl Socket for TcpSocket {
                         return Err(EINVAL);
                     }
                 }
-            },
+            }
             KeepIntvl => {
                 if val.len() == 4 {
                     let mut writer = self.inner.write();
@@ -370,7 +368,9 @@ impl Socket for TcpSocket {
                         Inner::Established(established) => {
                             let interval = u32::from_ne_bytes([val[0], val[1], val[2], val[3]]);
                             established.with_mut(|socket| {
-                                socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(interval as u64)));
+                                socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(
+                                    interval as u64,
+                                )));
                             });
                             writer.replace(Inner::Established(established));
                         }
@@ -382,7 +382,7 @@ impl Socket for TcpSocket {
                 } else {
                     return Err(EINVAL);
                 }
-            },
+            }
             KeepCnt => {
                 // if val.len() == 4 {
                 //     let mut writer = self.inner.write();
@@ -403,10 +403,8 @@ impl Socket for TcpSocket {
                 // } else {
                 //     return Err(EINVAL);
                 // }
-            },
-            KeepIdle => {
-                
-            },
+            }
+            KeepIdle => {}
             _ => {
                 log::debug!("TcpSocket::set_option: not supported");
                 // return Err(ENOPROTOOPT);

@@ -156,13 +156,6 @@ pub fn panic(info: &PanicInfo) -> ! {
         }
     }
     println!("Message:\n\t{}", info.message());
-    const MAX_DEPTH: u8 = 2;
-    static DEPTH: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-    let depth = DEPTH.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-    if depth >= MAX_DEPTH {
-        println!("Panic depth is too deep, stop unwinding.");
-        loop {}
-    }
     #[cfg(feature = "backtrace")]
     {
         let mut data = CallbackData { counter: 0 };
@@ -171,10 +164,13 @@ pub fn panic(info: &PanicInfo) -> ! {
             alloc::boxed::Box::new(()),
             &mut data,
         );
-        panic!("panic unreachable: {:?}", res.0);
+        log::error!("panic unreachable: {:?}", res.0);
     }
-    // println!("Current PCB:\n\t{:?}", (ProcessManager::current_pcb()));
-    // process::ProcessManager::exit(usize::MAX);
+    println!(
+        "Current PCB:\n\t{:?}",
+        process::ProcessManager::current_pcb()
+    );
+    process::ProcessManager::exit(usize::MAX)
 }
 
 /// User hook for unwinding

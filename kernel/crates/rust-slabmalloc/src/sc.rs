@@ -314,6 +314,9 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
     /// May return an error in case an invalid `layout` is provided.
     /// The function may also move internal slab pages between lists partial -> empty
     /// or full -> partial lists.
+    ///
+    /// # Safety
+    /// The caller must ensure that the `layout` is valid.
     pub unsafe fn deallocate(
         &mut self,
         ptr: NonNull<u8>,

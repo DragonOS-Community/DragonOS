@@ -32,10 +32,7 @@ impl UnboundUdp {
         return Self { socket };
     }
 
-    pub fn bind(
-        self,
-        local_endpoint: smoltcp::wire::IpEndpoint,
-    ) -> Result<BoundUdp, SystemError> {
+    pub fn bind(self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<BoundUdp, SystemError> {
         // let (addr, port) = (local_endpoint.addr, local_endpoint.port);
         // if self.socket.bind(local_endpoint).is_err() {
         //     log::debug!("bind failed!");
@@ -44,25 +41,25 @@ impl UnboundUdp {
         let inner = BoundInner::bind(self.socket, &local_endpoint.addr)?;
         let bind_addr = local_endpoint.addr;
         let bind_port = if local_endpoint.port == 0 {
-            inner
-            .port_manager()
-            .bind_ephemeral_port(InetTypes::Udp)?
+            inner.port_manager().bind_ephemeral_port(InetTypes::Udp)?
         } else {
             local_endpoint.port
         };
 
         if bind_addr.is_unspecified() {
-            if inner.with_mut::<smoltcp::socket::udp::Socket,_,_>(|socket| {
-                socket.bind(bind_port)
-            }).is_err() {
+            if inner
+                .with_mut::<smoltcp::socket::udp::Socket, _, _>(|socket| socket.bind(bind_port))
+                .is_err()
+            {
                 return Err(SystemError::EINVAL);
             }
-        } else {
-            if inner.with_mut::<smoltcp::socket::udp::Socket,_,_>(|socket| {
+        } else if inner
+            .with_mut::<smoltcp::socket::udp::Socket, _, _>(|socket| {
                 socket.bind(smoltcp::wire::IpEndpoint::new(bind_addr, bind_port))
-            }).is_err() {
-                return Err(SystemError::EINVAL);
-            }
+            })
+            .is_err()
+        {
+            return Err(SystemError::EINVAL);
         }
         Ok(BoundUdp {
             inner,

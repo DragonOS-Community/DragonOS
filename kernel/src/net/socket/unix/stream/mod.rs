@@ -7,7 +7,7 @@ use inner::{Connected, Init, Inner, Listener};
 use log::debug;
 use system_error::SystemError;
 use unix::{
-    ns::abs::{remove_abs_addr, ABSHANDLE_MAP, ABS_INODE_MAP},
+    ns::abs::{remove_abs_addr, ABS_INODE_MAP},
     INODE_MAP,
 };
 

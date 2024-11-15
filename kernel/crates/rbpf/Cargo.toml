@@ -1,0 +1,78 @@
+[package]
+
+# Project metadata
+name = "rbpf"
+version = "0.2.0"
+authors = ["Quentin <quentin@isovalent.com>"]
+
+# Additional metadata for packaging
+description = "Virtual machine and JIT compiler for eBPF programs"
+repository = "https://github.com/qmonnet/rbpf"
+readme = "README.md"
+keywords = ["BPF", "eBPF", "interpreter", "JIT", "filtering"]
+license = "Apache-2.0/MIT"
+edition = "2021"
+
+# Packaging directives
+include = [
+    "src/**",
+    "examples/**",
+    "tests/**",
+    "bench/**",
+    "LICENSE*",
+    "Cargo.toml",
+]
+
+[dependencies]
+
+# Default features (std) are disabled so that the dependencies don't pull in the
+# standard library when the crate is compiled for no_std
+byteorder = { version = "1.2", default-features = false }
+log = {version = "0.4.21", default-features = false }
+combine = { version = "4.6", default-features = false }
+
+# Optional Dependencies when using the standard library
+libc = { version = "0.2", optional = true }
+time = { version = "0.2", optional = true }
+
+# Optional Dependencies for the CraneLift JIT
+cranelift-codegen = { version = "0.99", optional = true }
+cranelift-frontend = { version = "0.99", optional = true }
+cranelift-jit = { version = "0.99", optional = true }
+cranelift-native = { version = "0.99", optional = true }
+cranelift-module = { version = "0.99", optional = true }
+
+[dev-dependencies]
+
+elf = "0.0.10"
+json = "0.11"
+hex = "0.4.3"
+
+[features]
+#default = ["std", "user", "cranelift"]
+cargo-clippy = []
+std = ["dep:time", "dep:libc", "combine/std"]
+cranelift = [
+    "dep:cranelift-codegen",
+    "dep:cranelift-frontend",
+    "dep:cranelift-jit",
+    "dep:cranelift-native",
+    "dep:cranelift-module",
+]
+user = []
+
+# Examples that depend on the standard library should be disabled when
+# testing the `no_std` configuration.
+[[example]]
+name = "disassemble"
+required-features = ["std"]
+
+[[example]]
+name = "uptime"
+required-features = ["std"]
+
+[[example]]
+name = "to_json"
+
+[[example]]
+name = "rbpf_plugin"

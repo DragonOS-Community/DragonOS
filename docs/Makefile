@@ -36,3 +36,6 @@ help:
 .PHONY:
 html-multiversion:
 	rm -rf ./$(BUILDDIR) && CURRENT_GIT_COMMIT_DIRTY=0 sphinx-multiversion $(SPHINXOPTS) "$(SOURCEDIR)" ./$(BUILDDIR)/html && cp -rf ./$(BUILDDIR)/html/master/* ./$(BUILDDIR)/html/
+
+http_server:
+	python3 -m http.server --directory $(BUILDDIR)/html

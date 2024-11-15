@@ -82,6 +82,14 @@ trigger_files = [
 [autolabel."T-virtulization"]
 trigger_files = ["kernel/src/virt", "kernel/src/arch/x86_64/kvm"]
 
+[autolabel."T-Obs and Test"]
+trigger_files = [
+    "/kernel/crates/rbpf",
+    "/kernel/crates/kprobe",
+    "/kernel/src/debug/kprobe",
+    "/kernel/src/bpf",
+]
+
 [autolabel."S-等待审查"]
 new_pr = true
 
@@ -107,10 +115,14 @@ cc = ["@fslongjin"]
 message = "tty驱动发生了更改，请进行审查"
 cc = ["@GnoCiYeH"]
 
+[mentions."kernel/src/bpf"]
+message = "BPF部分发生了更改，请进行审查"
+cc = ["@Godones"]
+
 
 [assign]
 warn_non_default_branch = true
-contributing_url = "https://docs.dragonos.org/zh-cn/latest/community/code_contribution/index.html"
+contributing_url = "https://community.dragonos.org/contributors/"
 users_on_vacation = []
 
 [assign.adhoc_groups]
@@ -120,6 +132,13 @@ driver = ["@dragonos/main"]
 
 # SIG-MM
 sig-mm = ["@dragonos/mm"]
+
+sig-obs = [
+    "@dragonos/sig-observation-testing",
+    "@Chiichen",
+    "@Godones"
+]
+
 
 # 虚拟化
 virtulization = ["@dragonos/virtualization"]
@@ -148,4 +167,8 @@ infra = ["@dragonos/infra"]
 "/kernel/src/arch/x86_64/kvm" = ["virtulization"]
 "/kernel/src/arch/x86_64" = ["x86_64"]
 "/kernel/src/arch/riscv64" = ["riscv64"]
+"/kernel/crates/rbpf" = ["sig-obs"]
+"/kernel/crates/kprobe" = ["sig-obs"]
+"/kernel/src/debug/kprobe" = ["sig-obs"]
+"/kernel/src/bpf" = ["sig-obs"]
 "/tools" = ["infra"]

@@ -104,15 +104,16 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
     ];
     mfence();
     let pid = ProcessManager::current_pcb().pid();
-    let mut show = (syscall_num != SYS_SCHED) && (pid.data() >= 7);
-    // let mut show = true;
+    let mut show = 
+        (syscall_num != SYS_SCHED) && (pid.data() >= 7);
+        // false;
 
     let to_print = SysCall::try_from(syscall_num);
     if let Ok(to_print) = to_print {
         use SysCall::*;
         match to_print {
             SYS_ACCEPT | SYS_ACCEPT4 | SYS_BIND | SYS_CONNECT | SYS_SHUTDOWN | SYS_LISTEN => {
-                // show &= false;
+                show &= false;
             }
             SYS_RECVFROM | SYS_SENDTO | SYS_SENDMSG | SYS_RECVMSG => {
                 show &= false;

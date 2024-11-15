@@ -2,7 +2,7 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicUsize};
 use system_error::SystemError::{self, *};
 
-use crate::{arch::init, libs::rwlock::RwLock};
+use crate::libs::rwlock::RwLock;
 use crate::net::event_poll::EPollEventType;
 use crate::net::net_core::poll_ifaces;
 use crate::net::socket::*;
@@ -234,12 +234,10 @@ impl Socket for TcpSocket {
 
     fn get_name(&self) -> Result<Endpoint, SystemError> {
         match self.inner.read().as_ref().expect("Tcp Inner is None") {
-            Inner::Init(Init::Unbound((_, ver))) => {
-                Ok(Endpoint::Ip( match ver {
-                    smoltcp::wire::IpVersion::Ipv4 => UNSPECIFIED_LOCAL_ENDPOINT_V4,
-                    smoltcp::wire::IpVersion::Ipv6 => UNSPECIFIED_LOCAL_ENDPOINT_V6,
-                }))
-            }
+            Inner::Init(Init::Unbound((_, ver))) => Ok(Endpoint::Ip(match ver {
+                smoltcp::wire::IpVersion::Ipv4 => UNSPECIFIED_LOCAL_ENDPOINT_V4,
+                smoltcp::wire::IpVersion::Ipv6 => UNSPECIFIED_LOCAL_ENDPOINT_V6,
+            })),
             Inner::Init(Init::Bound((_, local))) => Ok(Endpoint::Ip(*local)),
             Inner::Connecting(connecting) => Ok(Endpoint::Ip(connecting.get_name())),
             Inner::Established(established) => Ok(Endpoint::Ip(established.local_endpoint())),
@@ -330,9 +328,89 @@ impl Socket for TcpSocket {
                 Inner::Init(init) => {
                     init.close();
                     Ok(())
-                },
+                }
             })
             .unwrap_or(Ok(()))
+    }
+
+    fn set_option(&self, level: PSOL, name: usize, val: &[u8]) -> Result<(), SystemError> {
+        if level != PSOL::TCP {
+            // return Err(EINVAL);
+            log::debug!("TcpSocket::set_option: not TCP");
+            return Ok(());
+        }
+        use option::Options::{self, *};
+        let option_name = Options::try_from(name as i32)?;
+        log::debug!("TCP Option: {:?}, value = {:?}", option_name, val);
+        match option_name {
+            NoDelay => {
+                let nagle_enabled = val[0] != 0;
+                let mut writer = self.inner.write();
+                let inner = writer.take().expect("Tcp Inner is None");
+                match inner {
+                    Inner::Established(established) => {
+                        established.with_mut(|socket| {
+                            socket.set_nagle_enabled(nagle_enabled);
+                        });
+                        writer.replace(Inner::Established(established));
+                    }
+                    _ => {
+                        writer.replace(inner);
+                        return Err(EINVAL);
+                    }
+                }
+            }
+            KeepIntvl => {
+                if val.len() == 4 {
+                    let mut writer = self.inner.write();
+                    let inner = writer.take().expect("Tcp Inner is None");
+                    match inner {
+                        Inner::Established(established) => {
+                            let interval = u32::from_ne_bytes([val[0], val[1], val[2], val[3]]);
+                            established.with_mut(|socket| {
+                                socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(
+                                    interval as u64,
+                                )));
+                            });
+                            writer.replace(Inner::Established(established));
+                        }
+                        _ => {
+                            writer.replace(inner);
+                            return Err(EINVAL);
+                        }
+                    }
+                } else {
+                    return Err(EINVAL);
+                }
+            }
+            KeepCnt => {
+                // if val.len() == 4 {
+                //     let mut writer = self.inner.write();
+                //     let inner = writer.take().expect("Tcp Inner is None");
+                //     match inner {
+                //         Inner::Established(established) => {
+                //             let count = u32::from_ne_bytes([val[0], val[1], val[2], val[3]]);
+                //             established.with_mut(|socket| {
+                //                 socket.set_keep_alive_count(count);
+                //             });
+                //             writer.replace(Inner::Established(established));
+                //         }
+                //         _ => {
+                //             writer.replace(inner);
+                //             return Err(EINVAL);
+                //         }
+                //     }
+                // } else {
+                //     return Err(EINVAL);
+                // }
+            }
+            KeepIdle => {}
+            _ => {
+                log::debug!("TcpSocket::set_option: not supported");
+                // return Err(ENOPROTOOPT);
+            }
+        }
+        Ok(())
     }
 }
 

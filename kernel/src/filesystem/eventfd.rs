@@ -5,6 +5,7 @@ use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::event_poll::{EPollEventType, EPollItem, EventPoll, KernelIoctlData};
 use crate::process::ProcessManager;
+use crate::sched::SchedMode;
 use crate::syscall::Syscall;
 use alloc::collections::LinkedList;
 use alloc::string::String;
@@ -76,6 +77,11 @@ impl EventFdInode {
 
         Err(SystemError::ENOENT)
     }
+
+    fn readable(&self) -> bool {
+        let count = self.eventfd.lock().count;
+        return count > 0;
+    }
 }
 
 impl IndexNode for EventFdInode {
@@ -104,26 +110,29 @@ impl IndexNode for EventFdInode {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data_guard: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        let data = data_guard.clone();
+        drop(data_guard);
         if len < 8 {
             return Err(SystemError::EINVAL);
         }
-        let mut val = loop {
-            let val = self.eventfd.lock().count;
-            if val != 0 {
-                break val;
-            }
-            if self
-                .eventfd
-                .lock()
-                .flags
-                .contains(EventFdFlags::EFD_NONBLOCK)
-            {
+        let mut lock_efd = self.eventfd.lock();
+        while lock_efd.count == 0 {
+            if lock_efd.flags.contains(EventFdFlags::EFD_NONBLOCK) {
+                drop(lock_efd);
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
-            self.wait_queue.sleep();
-        };
+
+            drop(lock_efd);
+            let r = wq_wait_event_interruptible!(self.wait_queue, self.readable(), {});
+            if r.is_err() {
+                return Err(SystemError::ERESTARTSYS);
+            }
+
+            lock_efd = self.eventfd.lock();
+        }
+        let mut val = lock_efd.count;
 
         let mut eventfd = self.eventfd.lock();
         if eventfd.flags.contains(EventFdFlags::EFD_SEMAPHORE) {

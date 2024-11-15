@@ -211,9 +211,9 @@ impl IfaceCommon {
         let (has_events, poll_at) = {
             (
                 matches!(
-                    interface.poll(timestamp, device, &mut sockets), 
+                    interface.poll(timestamp, device, &mut sockets),
                     smoltcp::iface::PollResult::SocketStateChanged
-                ), 
+                ),
                 loop {
                     let poll_at = interface.poll_at(timestamp, &sockets);
                     let Some(instant) = poll_at else {
@@ -222,7 +222,7 @@ impl IfaceCommon {
                     if instant > timestamp {
                         break poll_at;
                     }
-                }
+                },
             )
         };
 

@@ -11,8 +11,6 @@ use crate::{
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
-use system_error::SystemError;
-
 use super::{
     class::Class,
     device::{
@@ -24,29 +22,36 @@ use super::{
     kset::KSet,
     subsys::SubSysPrivate,
 };
+use crate::filesystem::sysfs::file::sysfs_emit_str;
+use crate::filesystem::sysfs::{Attribute, AttributeGroup, SysFSOpsSupport};
+use crate::filesystem::vfs::syscall::ModeType;
+use crate::libs::lazy_init::Lazy;
+use system_error::SystemError;
 
-#[inline(always)]
-pub fn cpu_device_manager() -> &'static CpuDeviceManager {
-    return &CpuDeviceManager;
-}
+static CPU_DEVICE_MANAGER: Lazy<CpuDeviceManager> = Lazy::new();
 
 #[derive(Debug)]
-pub struct CpuDeviceManager;
+pub struct CpuDeviceManager {
+    _root_device: Arc<CpuSubSystemFakeRootDevice>,
+}
 
 impl CpuDeviceManager {
     /// 初始化设备驱动模型的CPU子系统
     ///
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/cpu.c?fi=get_cpu_device#622
-    pub fn init(&self) -> Result<(), SystemError> {
+    pub fn init() -> Result<(), SystemError> {
         let cpu_subsys = CpuSubSystem::new();
         let root_device = CpuSubSystemFakeRootDevice::new();
         subsystem_manager()
             .subsys_system_register(
                 &(cpu_subsys as Arc<dyn Bus>),
-                &(root_device as Arc<dyn Device>),
+                &(root_device.clone() as Arc<dyn Device>),
             )
             .expect("register cpu subsys failed");
-
+        let manager = Self {
+            _root_device: root_device,
+        };
+        CPU_DEVICE_MANAGER.init(manager);
         return Ok(());
     }
 }
@@ -190,6 +195,10 @@ impl Device for CpuSubSystemFakeRootDevice {
     fn set_dev_parent(&self, dev_parent: Option<Weak<dyn Device>>) {
         self.inner.write().device_common.parent = dev_parent;
     }
+
+    fn attribute_groups(&self) -> Option<&'static [&'static dyn AttributeGroup]> {
+        Some(&[&AttrGroupCpu])
+    }
 }
 
 impl KObject for CpuSubSystemFakeRootDevice {
@@ -247,5 +256,72 @@ impl KObject for CpuSubSystemFakeRootDevice {
 
     fn set_kobj_state(&self, state: KObjectState) {
         *self.kobj_state_mut() = state;
+    }
+}
+
+#[derive(Debug)]
+pub struct AttrGroupCpu;
+
+impl AttributeGroup for AttrGroupCpu {
+    fn name(&self) -> Option<&str> {
+        None
+    }
+    fn attrs(&self) -> &[&'static dyn Attribute] {
+        &[&AttrCpuPossible, &AttrCpuOnline]
+    }
+    fn is_visible(
+        &self,
+        _kobj: Arc<dyn KObject>,
+        _attr: &'static dyn Attribute,
+    ) -> Option<ModeType> {
+        None
+    }
+}
+
+#[derive(Debug)]
+pub struct AttrCpuPossible;
+
+impl Attribute for AttrCpuPossible {
+    fn name(&self) -> &str {
+        "possible"
+    }
+
+    fn mode(&self) -> ModeType {
+        ModeType::S_IRUGO
+    }
+
+    fn support(&self) -> SysFSOpsSupport {
+        SysFSOpsSupport::ATTR_SHOW
+    }
+
+    fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let cpu_manager = crate::smp::cpu::smp_cpu_manager();
+        let cpus = cpu_manager.possible_cpus_count();
+        let data = format!("0-{}", cpus - 1);
+        sysfs_emit_str(buf, &data)
+    }
+}
+
+#[derive(Debug)]
+pub struct AttrCpuOnline;
+
+impl Attribute for AttrCpuOnline {
+    fn name(&self) -> &str {
+        "online"
+    }
+
+    fn mode(&self) -> ModeType {
+        ModeType::S_IRUGO
+    }
+
+    fn support(&self) -> SysFSOpsSupport {
+        SysFSOpsSupport::ATTR_SHOW
+    }
+
+    fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let cpu_manager = crate::smp::cpu::smp_cpu_manager();
+        let cpus = cpu_manager.present_cpus_count();
+        let data = format!("0-{}", cpus - 1);
+        sysfs_emit_str(buf, &data)
     }
 }

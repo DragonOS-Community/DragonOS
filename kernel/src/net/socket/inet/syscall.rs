@@ -47,9 +47,9 @@ pub struct Inet;
 impl family::Family for Inet {
     fn socket(stype: PSOCK, protocol: u32) -> Result<Arc<Inode>, SystemError> {
         let socket = create_inet_socket(
-            smoltcp::wire::IpVersion::Ipv4, 
-            stype, 
-            smoltcp::wire::IpProtocol::from(protocol as u8)
+            smoltcp::wire::IpVersion::Ipv4,
+            stype,
+            smoltcp::wire::IpProtocol::from(protocol as u8),
         )?;
         Ok(Inode::new(socket))
     }

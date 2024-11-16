@@ -157,12 +157,19 @@ impl core::fmt::Debug for PageCache {
 
 impl Drop for PageCache {
     fn drop(&mut self) {
+        // 尝试获取文件大小并计算页数量
+        let file_page_num = || -> Option<u64> {
+            let size = self.inode()?.upgrade()?.metadata().ok()?.size;
+            (page_align_up(size.try_into().ok()?) >> MMArch::PAGE_SHIFT)
+                .try_into()
+                .ok()
+        };
+
+        let page_num = file_page_num().unwrap_or((i64::MAX as u64 >> MMArch::PAGE_SHIFT) + 1);
         let xarray = self.xarray.lock_irqsave();
         let mut page_manager = page_manager_lock_irqsave();
-        for index in 0..=u64::MAX {
-            if let Some(page) = xarray.load(index) {
-                page_manager.remove_page(&page.read_irqsave().phys_address());
-            }
+        for (_, page) in xarray.range(0..page_num) {
+            page_manager.remove_page(&page.read_irqsave().phys_address());
         }
     }
 }

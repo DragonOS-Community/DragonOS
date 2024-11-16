@@ -8,7 +8,7 @@ use crate::include::bindings::linux_bpf::{
 };
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame};
-use crate::mm::page::{page_manager_lock_irqsave, Page};
+use crate::mm::page::{page_manager_lock_irqsave, Page, PageType};
 use crate::mm::{MemoryManagementArch, PhysAddr};
 use crate::perf::util::{LostSamples, PerfProbeArgs, PerfSample, SampleHeader};
 use alloc::string::String;
@@ -239,9 +239,8 @@ impl BpfPerfEvent {
         let mut page_manager_guard = page_manager_lock_irqsave();
         let mut cur_phys = PhysPageFrame::new(phy_addr);
         for i in 0..page_count.data() {
-            let page = Arc::new(Page::new(true, cur_phys.phys_address()));
-            let paddr = cur_phys.phys_address();
-            page_manager_guard.insert(paddr, &page);
+            let page = Arc::new(Page::new(true, cur_phys.phys_address(), PageType::Other));
+            page_manager_guard.insert(&page)?;
             data.page_cache.add_page(i, &page);
             cur_phys = cur_phys.next();
         }

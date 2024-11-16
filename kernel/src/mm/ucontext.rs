@@ -35,7 +35,7 @@ use super::{
     allocator::page_frame::{
         deallocate_page_frames, PageFrameCount, PhysPageFrame, VirtPageFrame, VirtPageFrameIter,
     },
-    page::{EntryFlags, Flusher, InactiveFlusher, Page, PageFlushAll},
+    page::{EntryFlags, Flusher, InactiveFlusher, Page, PageFlushAll, PageType},
     syscall::{MadvFlags, MapFlags, MremapFlags, ProtFlags},
     MemoryManagementArch, PageTableKind, VirtAddr, VirtRegion, VmFlags,
 };
@@ -1653,7 +1653,10 @@ impl VMA {
 
     pub fn page_address(&self, page: &Arc<Page>) -> Result<VirtAddr, SystemError> {
         let page_guard = page.read_irqsave();
-        let index = page_guard.index().unwrap();
+        let index = match page_guard.page_type() {
+            PageType::File(info) => info.index,
+            _ => return Err(SystemError::EINVAL),
+        };
         if index >= self.file_pgoff.unwrap() {
             let address =
                 self.region.start + ((index - self.file_pgoff.unwrap()) << MMArch::PAGE_SHIFT);

@@ -22,7 +22,7 @@ use crate::mm::MemoryManagementArch;
 
 use super::{
     allocator::page_frame::FrameAllocator,
-    page::{page_reclaimer_lock_irqsave, Page, PageFlags},
+    page::{page_reclaimer_lock_irqsave, FileMapInfo, Page, PageFlags, PageType},
 };
 
 bitflags! {
@@ -314,7 +314,8 @@ impl PageFaultHandler {
         }
         let cow_page_phys = cow_page_phys.unwrap();
 
-        let cow_page = Arc::new(Page::new(false, cow_page_phys));
+        let cow_page = Arc::new(Page::copy(cache_page.read_irqsave(), cow_page_phys));
+        cow_page.write_irqsave().set_shared(false);
         pfm.cow_page = Some(cow_page.clone());
 
         //复制PageCache内容到新的页内
@@ -329,11 +330,7 @@ impl PageFaultHandler {
         let mut page_manager_guard = page_manager_lock_irqsave();
 
         // 新页加入页管理器中
-        page_manager_guard.insert(cow_page_phys, &cow_page);
-        cow_page.write_irqsave().set_page_cache_index(
-            cache_page.read_irqsave().page_cache(),
-            cache_page.read_irqsave().index(),
-        );
+        page_manager_guard.insert(&cow_page).expect("insert failed");
 
         ret = ret.union(Self::finish_fault(pfm));
 
@@ -669,16 +666,21 @@ impl PageFaultHandler {
             )
             .expect("failed to read file to create pagecache page");
 
-            let page = Arc::new(Page::new(true, new_cache_page));
+            let page = page_manager_lock_irqsave()
+                .create_page(
+                    true,
+                    PageType::File(FileMapInfo {
+                        page_cache: page_cache.clone(),
+                        index: file_pgoff,
+                    }),
+                )
+                .expect("failed to create page");
             pfm.page = Some(page.clone());
 
             page.write_irqsave().add_flags(PageFlags::PG_LRU);
-            page_manager_lock_irqsave().insert(new_cache_page, &page);
+
             page_reclaimer_lock_irqsave().insert_page(new_cache_page, &page);
             page_cache.add_page(file_pgoff, &page);
-
-            page.write_irqsave()
-                .set_page_cache_index(Some(page_cache), Some(file_pgoff));
         }
         ret
     }

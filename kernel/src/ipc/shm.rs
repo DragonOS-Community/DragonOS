@@ -7,7 +7,7 @@ use crate::{
     },
     mm::{
         allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame},
-        page::{page_manager_lock_irqsave, Page},
+        page::{page_manager_lock_irqsave, Page, PageType},
         PhysAddr,
     },
     process::{Pid, ProcessManager},
@@ -165,10 +165,9 @@ impl ShmManager {
         let mut page_manager_guard = page_manager_lock_irqsave();
         let mut cur_phys = PhysPageFrame::new(phys_page.0);
         for _ in 0..page_count.data() {
-            let page = Arc::new(Page::new(true, cur_phys.phys_address()));
+            let page = Arc::new(Page::new(true, cur_phys.phys_address(), PageType::Shared));
             page.write_irqsave().set_shm_id(shm_id);
-            let paddr = cur_phys.phys_address();
-            page_manager_guard.insert(paddr, &page);
+            page_manager_guard.insert(&page)?;
             cur_phys = cur_phys.next();
         }
 

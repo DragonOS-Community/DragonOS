@@ -13,8 +13,6 @@ use log::error;
 use system_error::SystemError;
 
 use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
-use crate::filesystem::eventfd::EventFdInode;
-use crate::libs::align::page_align_up;
 use crate::libs::lazy_init::Lazy;
 use crate::perf::PerfEventInode;
 use crate::{
@@ -27,9 +25,7 @@ use crate::{
     ipc::pipe::{LockedPipeInode, PipeFsPrivateData},
     libs::{rwlock::RwLock, spinlock::SpinLock},
     mm::{
-        allocator::page_frame::FrameAllocator,
         page::{page_manager_lock_irqsave, page_reclaimer_lock_irqsave, Page, PageFlags},
-        ucontext::AddressSpace,
         MemoryManagementArch,
     },
     net::{
@@ -39,6 +35,8 @@ use crate::{
     process::{cred::Cred, ProcessManager},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
+use crate::{filesystem::eventfd::EventFdInode, mm::page::FileMapInfo};
+use crate::{libs::align::page_align_up, mm::page::PageType};
 
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
@@ -215,47 +213,53 @@ impl PageCache {
         Ok(())
     }
 
-    pub fn create_pages(&self, page_index: usize, buf: &[u8]) {
+    pub fn create_pages(&self, page_index: usize, buf: &[u8]) -> Result<(), SystemError> {
         assert!(buf.len() % MMArch::PAGE_SIZE == 0);
 
         let page_num = buf.len() / MMArch::PAGE_SIZE;
 
-        let address_space = AddressSpace::current().unwrap();
-        let mut guard = address_space.write_irqsave();
-        let mapper = &mut guard.user_mapper.utable;
-        let allocator = mapper.allocator_mut();
-
         let len = buf.len();
         if len == 0 {
-            return;
+            return Ok(());
         }
 
         let mut guard = self.xarray.lock_irqsave();
         let mut cursor = guard.cursor_mut(page_index as u64);
+        let mut page_manager_guard = page_manager_lock_irqsave();
 
         for i in 0..page_num {
             let buf_offset = i * MMArch::PAGE_SIZE;
 
-            if let Some(cache_page) = unsafe { allocator.allocate_one() } {
-                unsafe {
-                    core::slice::from_raw_parts_mut(
-                        MMArch::phys_2_virt(cache_page).unwrap().data() as *mut u8,
-                        MMArch::PAGE_SIZE,
-                    )
-                    .copy_from_slice(&buf[buf_offset..buf_offset + MMArch::PAGE_SIZE]);
-                }
+            let page = page_manager_guard.create_page(
+                true,
+                PageType::File(FileMapInfo {
+                    page_cache: self
+                        .self_ref
+                        .upgrade()
+                        .expect("failed to get self_arc of pagecache"),
+                    index: page_index,
+                }),
+            )?;
 
-                let page = Arc::new(Page::new(true, cache_page));
-                page.write_irqsave().add_flags(PageFlags::PG_LRU);
-                page_manager_lock_irqsave().insert(cache_page, &page);
-                page_reclaimer_lock_irqsave().insert_page(cache_page, &page);
-                page.write_irqsave()
-                    .set_page_cache_index(self.self_ref.upgrade(), Some(cursor.index() as usize));
-
-                cursor.store(page.clone());
+            let mut page_guard = page.write_irqsave();
+            let paddr = page_guard.phys_address();
+            unsafe {
+                core::slice::from_raw_parts_mut(
+                    MMArch::phys_2_virt(paddr).unwrap().data() as *mut u8,
+                    MMArch::PAGE_SIZE,
+                )
+                .copy_from_slice(&buf[buf_offset..buf_offset + MMArch::PAGE_SIZE]);
             }
+
+            page_guard.add_flags(PageFlags::PG_LRU);
+            page_reclaimer_lock_irqsave().insert_page(paddr, &page);
+
+            cursor.store(page.clone());
+
             cursor.next();
         }
+
+        Ok(())
     }
 
     /// 从PageCache中读取数据。
@@ -342,7 +346,7 @@ impl PageCache {
             let mut page_buf = vec![0u8; MMArch::PAGE_SIZE * count];
             inode.read_sync(page_offset * MMArch::PAGE_SIZE, page_buf.as_mut())?;
 
-            self.create_pages(page_offset, page_buf.as_mut());
+            self.create_pages(page_offset, page_buf.as_mut())?;
 
             // 实际要拷贝的内容在文件中的偏移量
             let copy_offset = core::cmp::max(page_offset * MMArch::PAGE_SIZE, offset);
@@ -423,7 +427,7 @@ impl PageCache {
 
             if !exist {
                 let page_buf = vec![0u8; MMArch::PAGE_SIZE];
-                self.create_pages(start_page_offset + i, &page_buf);
+                self.create_pages(start_page_offset + i, &page_buf)?;
             }
 
             let mut guard = self.xarray.lock_irqsave();
@@ -443,7 +447,7 @@ impl PageCache {
                 //     "page_offset:{page_offset}, buf_offset:{buf_offset}, sub_len:{sub_len}"
                 // );
             } else {
-                return Err(SystemError::ENOMEM);
+                return Err(SystemError::EIO);
             };
 
             buf_offset += sub_len;

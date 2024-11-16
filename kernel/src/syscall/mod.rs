@@ -10,6 +10,7 @@ use crate::{
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::{page::PAGE_4K_SIZE, syscall::MremapFlags},
     net::syscall::MsgHdr,
+    process,
     process::{
         fork::KernelCloneArgs,
         resource::{RLimit64, RUsage},
@@ -83,7 +84,7 @@ impl Syscall {
         frame: &mut TrapFrame,
     ) -> Result<usize, SystemError> {
         let res = unwinding::panic::catch_unwind(|| Self::handle(syscall_num, args, frame));
-        res.unwrap_or_else(|_e| Err(SystemError::ENOTRECOVERABLE))
+        res.unwrap_or_else(|_| ProcessManager::exit(usize::MAX))
     }
     /// @brief 系统调用分发器，用于分发系统调用。
     ///

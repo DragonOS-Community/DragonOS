@@ -2,9 +2,11 @@ use std::io::{Error, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::str;
 
+use crate::Test;
+
 const MSG: &str = "Hello, unix stream socketpair!";
 
-pub fn test_unix_stream_pair() -> std::io::Result<()> {
+fn test_unix_stream_pair() -> std::io::Result<()> {
     let (mut sock0, mut sock1) = UnixStream::pair()?;
 
     sock1.write_all(MSG.as_bytes())?;
@@ -17,5 +19,11 @@ pub fn test_unix_stream_pair() -> std::io::Result<()> {
         Ok(())
     } else {
         Err(Error::from_raw_os_error(-1))
+    }
+}
+
+impl Test {
+    pub fn test_unix_stream_pair() -> std::io::Result<()> {
+        test_unix_stream_pair()
     }
 }

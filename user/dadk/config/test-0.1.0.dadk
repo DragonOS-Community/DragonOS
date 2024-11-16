@@ -1,11 +1,11 @@
 {
-  "name": "test_socket",
+  "name": "test",
   "version": "0.1.0",
-  "description": "测试socket",
+  "description": "测试工具",
   "task_type": {
     "BuildFromSource": {
       "Local": {
-        "path": "apps/test_socket"
+        "path": "apps/test"
       }
     }
   },
@@ -19,5 +19,8 @@
   "install": {
     "in_dragonos_path": "/"
   },
-  "target_arch": ["x86_64"]
+  "target_arch": [
+    "x86_64",
+    "riscv64"
+  ]
 }

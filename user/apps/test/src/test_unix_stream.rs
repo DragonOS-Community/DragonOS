@@ -3,6 +3,10 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::thread;
 use std::{fs, str};
 
+use log::info;
+
+use crate::Test;
+
 const SOCKET_PATH: &str = "/test.socket";
 const MSG: &str = "Hello, unix stream socket!";
 
@@ -14,8 +18,8 @@ fn client() -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn test_unix_stream() -> std::io::Result<()> {
-    println!("unix stream socket path: {}", SOCKET_PATH);
+fn test_unix_stream() -> std::io::Result<()> {
+    info!("unix stream socket path: {}", SOCKET_PATH);
     // 删除可能已存在的socket文件
     fs::remove_file(&SOCKET_PATH).ok();
     // 创建Unix域监听socket
@@ -38,5 +42,11 @@ pub fn test_unix_stream() -> std::io::Result<()> {
         Ok(())
     } else {
         Err(Error::from_raw_os_error(-1))
+    }
+}
+
+impl Test {
+    pub fn test_unix_stream() -> std::io::Result<()> {
+        test_unix_stream()
     }
 }

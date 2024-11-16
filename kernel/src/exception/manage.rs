@@ -785,6 +785,7 @@ impl IrqManager {
         );
     }
 
+    #[allow(dead_code)]
     pub fn irq_set_affinity(
         &self,
         irq_data: &Arc<IrqData>,

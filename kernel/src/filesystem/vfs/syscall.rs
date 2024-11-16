@@ -1,4 +1,5 @@
-use core::ffi::c_void;
+use crate::filesystem::overlayfs::OverlayMountData;
+use crate::filesystem::vfs::FileSystemMakerData;
 use core::mem::size_of;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
@@ -1706,7 +1707,7 @@ impl Syscall {
         target: *const u8,
         filesystemtype: *const u8,
         _mountflags: usize,
-        _data: *const c_void,
+        data: *const u8,
     ) -> Result<usize, SystemError> {
         let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?
             .into_string()
@@ -1715,7 +1716,7 @@ impl Syscall {
         let fstype_str = user_access::check_and_clone_cstr(filesystemtype, Some(MAX_PATHLEN))?;
         let fstype_str = fstype_str.to_str().map_err(|_| SystemError::EINVAL)?;
 
-        let fstype = producefs!(FSMAKER, fstype_str)?;
+        let fstype = producefs!(FSMAKER, fstype_str, data)?;
 
         Vcore::do_mount(fstype, &target)?;
 

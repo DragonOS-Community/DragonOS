@@ -1,8 +1,21 @@
+use alloc::{string::ToString, sync::Arc};
+
 use virtio_drivers::transport::Transport;
 
-use crate::exception::HardwareIrqNumber;
+use crate::{
+    driver::{
+        base::device::DeviceId,
+        pci::{
+            pci::{PciDeviceStructure, PciError},
+            pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqError, PciIrqMsg, IRQ},
+        },
+    },
+    exception::IrqNumber,
+};
 
-use super::{transport_mmio::VirtIOMmioTransport, transport_pci::PciTransport};
+use super::{
+    irq::DefaultVirtioIrqHandler, transport_mmio::VirtIOMmioTransport, transport_pci::PciTransport,
+};
 
 pub enum VirtIOTransport {
     Pci(PciTransport),
@@ -10,11 +23,34 @@ pub enum VirtIOTransport {
 }
 
 impl VirtIOTransport {
-    pub fn irq(&self) -> Option<HardwareIrqNumber> {
+    pub fn irq(&self) -> IrqNumber {
         match self {
-            VirtIOTransport::Mmio(transport) => Some(transport.irq()),
-            _ => None,
+            VirtIOTransport::Pci(transport) => transport.irq(),
+            VirtIOTransport::Mmio(transport) => IrqNumber::new(transport.irq().data()),
         }
+    }
+
+    /// 设置中断
+    pub fn setup_irq(&self, dev_id: Arc<DeviceId>) -> Result<(), PciError> {
+        if let VirtIOTransport::Pci(transport) = self {
+            let standard_device = transport.pci_device().as_standard_device().unwrap();
+            standard_device
+                .irq_init(IRQ::PCI_IRQ_MSIX | IRQ::PCI_IRQ_MSI)
+                .ok_or(PciError::PciIrqError(PciIrqError::IrqNotInited))?;
+            // 中断相关信息
+            let msg = PciIrqMsg {
+                irq_common_message: IrqCommonMsg::init_from(
+                    0,
+                    "Virtio_IRQ".to_string(),
+                    &DefaultVirtioIrqHandler,
+                    dev_id,
+                ),
+                irq_specific_message: IrqSpecificMsg::msi_default(),
+            };
+            standard_device.irq_install(msg)?;
+            standard_device.irq_enable(true)?;
+        }
+        return Ok(());
     }
 }
 

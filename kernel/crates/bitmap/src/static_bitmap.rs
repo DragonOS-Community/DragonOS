@@ -8,15 +8,15 @@ use crate::{bitmap_core::BitMapCore, traits::BitMapOps};
 #[derive(Debug, Clone)]
 pub struct StaticBitmap<const N: usize>
 where
-    [(); (N + usize::BITS as usize - 1) / (usize::BITS as usize)]:,
+    [(); N.div_ceil(usize::BITS as usize)]:,
 {
-    pub data: [usize; (N + usize::BITS as usize - 1) / (usize::BITS as usize)],
+    pub data: [usize; N.div_ceil(usize::BITS as usize)],
     core: BitMapCore<usize>,
 }
 
 impl<const N: usize> Default for StaticBitmap<N>
 where
-    [(); (N + usize::BITS as usize - 1) / (usize::BITS as usize)]:,
+    [(); N.div_ceil(usize::BITS as usize)]:,
 {
     fn default() -> Self {
         Self::new()
@@ -25,12 +25,12 @@ where
 
 impl<const N: usize> StaticBitmap<N>
 where
-    [(); (N + usize::BITS as usize - 1) / (usize::BITS as usize)]:,
+    [(); N.div_ceil(usize::BITS as usize)]:,
 {
     /// 创建一个新的静态位图
     pub const fn new() -> Self {
         Self {
-            data: [0; (N + usize::BITS as usize - 1) / (usize::BITS as usize)],
+            data: [0; N.div_ceil(usize::BITS as usize)],
             core: BitMapCore::new(),
         }
     }
@@ -38,7 +38,7 @@ where
 
 impl<const N: usize> BitMapOps<usize> for StaticBitmap<N>
 where
-    [(); (N + usize::BITS as usize - 1) / (usize::BITS as usize)]:,
+    [(); N.div_ceil(usize::BITS as usize)]:,
 {
     #[inline]
     fn get(&self, index: usize) -> Option<bool> {

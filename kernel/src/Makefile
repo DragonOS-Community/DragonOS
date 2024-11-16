@@ -40,7 +40,7 @@ kernel_subdirs := debug
 
 
 kernel_rust:
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-07-23 $(CARGO_ZBUILD) build --release --target $(TARGET_JSON)
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 $(CARGO_ZBUILD) build --release --target $(TARGET_JSON)
 
 
 all: kernel

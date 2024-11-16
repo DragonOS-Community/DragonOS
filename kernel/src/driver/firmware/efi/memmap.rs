@@ -67,7 +67,7 @@ impl<'a> EFIMemoryDescIter<'a> {
     }
 }
 
-impl<'a> Iterator for EFIMemoryDescIter<'a> {
+impl Iterator for EFIMemoryDescIter<'_> {
     type Item = MemoryDescriptor;
 
     fn next(&mut self) -> Option<Self::Item> {

@@ -74,8 +74,7 @@ impl EFIManager {
             warn!("report systable header: failed to map systable header, err: {fw_ptr:?}");
         }
 
-        let s = CStr::from_bytes_with_nul(&tmp_buf)
-            .unwrap_or_else(|_| CStr::from_bytes_with_nul(b"Unknown\0").unwrap());
+        let s = CStr::from_bytes_with_nul(&tmp_buf).unwrap_or(c"Unknown");
         info!("EFI version: {:?}, vendor: {:?}", header.revision, s);
     }
 

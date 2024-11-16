@@ -49,6 +49,7 @@ impl BootParams {
         core::str::from_utf8(&self.boot_cmdline()[..self.boot_cmdline_len()]).unwrap()
     }
 
+    #[allow(dead_code)]
     pub fn bootloader_name(&self) -> Option<&str> {
         self.bootloader_name.as_deref()
     }

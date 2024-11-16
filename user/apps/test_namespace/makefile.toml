@@ -1,0 +1,63 @@
+# Makefile.toml
+
+[env]
+TOOLCHAIN = "+nightly-2024-11-05-x86_64-unknown-linux-gnu"
+
+ARCH = { default = "x86_64" }
+RUST_TARGET = { default = { if = "eq(env.ARCH, 'riscv64')", value = "riscv64gc-unknown-linux-gnu", else = "x86_64-unknown-linux-musl" } }
+INSTALL_DIR = { default = { if = "defined(env.DADK_CURRENT_BUILD_DIR)", value = "${DADK_CURRENT_BUILD_DIR}", else = "./install" } }
+
+[tasks.build]
+description = "Build the project"
+command = "cargo"
+args = ["${TOOLCHAIN}", "build", "--target", "${RUST_TARGET}"]
+
+[tasks.run]
+description = "Run the project"
+command = "cargo"
+args = ["${TOOLCHAIN}", "run", "--target", "${RUST_TARGET}"]
+
+[tasks.clean]
+description = "Clean the project"
+command = "cargo"
+args = ["${TOOLCHAIN}", "clean", "--target", "${RUST_TARGET}"]
+
+[tasks.test]
+description = "Run the tests"
+command = "cargo"
+args = ["${TOOLCHAIN}", "test", "--target", "${RUST_TARGET}"]
+
+[tasks.doc]
+description = "Generate documentation"
+command = "cargo"
+args = ["${TOOLCHAIN}", "doc", "--target", "${RUST_TARGET}"]
+
+[tasks.fmt]
+description = "Format the code"
+command = "cargo"
+args = ["${TOOLCHAIN}", "fmt"]
+
+[tasks.fmt-check]
+description = "Check code format"
+command = "cargo"
+args = ["${TOOLCHAIN}", "fmt", "--check"]
+
+[tasks.run-release]
+description = "Run the project in release mode"
+command = "cargo"
+args = ["${TOOLCHAIN}", "run", "--target", "${RUST_TARGET}", "--release"]
+
+[tasks.build-release]
+description = "Build the project in release mode"
+command = "cargo"
+args = ["${TOOLCHAIN}", "build", "--target", "${RUST_TARGET}", "--release"]
+
+[tasks.test-release]
+description = "Test the project in release mode"
+command = "cargo"
+args = ["${TOOLCHAIN}", "test", "--target", "${RUST_TARGET}", "--release"]
+
+[tasks.install]
+description = "Install the project"
+command = "cargo"
+args = ["${TOOLCHAIN}", "install", "--target", "${RUST_TARGET}", "--path", ".", "--no-track", "--root", "${INSTALL_DIR}", "--force"]

@@ -13,7 +13,7 @@ pub struct AllocBitmap {
 
 impl AllocBitmap {
     pub fn new(elements: usize) -> Self {
-        let data = vec![0usize; (elements + usize::BITS as usize - 1) / (usize::BITS as usize)];
+        let data = vec![0usize; elements.div_ceil(usize::BITS as usize)];
         Self {
             elements,
             data,

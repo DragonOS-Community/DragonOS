@@ -10,6 +10,7 @@ use crate::{
     arch::{interrupt::TrapFrame, process::arch_switch_to_user},
     driver::{net::e1000e::e1000e::e1000e_init, virtio::virtio::virtio_probe},
     filesystem::vfs::core::mount_root_fs,
+    namespaces::NsProxy,
     net::net_core::net_init,
     process::{
         exec::ProcInitInfo, kthread::KernelThreadMechanism, stdio::stdio_init, ProcessFlags,
@@ -140,6 +141,7 @@ fn run_init_process(
     trap_frame: &mut TrapFrame,
 ) -> Result<(), SystemError> {
     compiler_fence(Ordering::SeqCst);
+    ProcessManager::current_pcb().set_nsproxy(NsProxy::new()); // 初始化init进程的namespace
     let path = proc_init_info.proc_name.to_str().unwrap();
 
     Syscall::do_execve(
@@ -148,5 +150,6 @@ fn run_init_process(
         proc_init_info.envs.clone(),
         trap_frame,
     )?;
+
     Ok(())
 }

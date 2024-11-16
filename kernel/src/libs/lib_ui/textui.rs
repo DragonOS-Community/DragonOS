@@ -595,7 +595,6 @@ impl TextuiWindow {
     /// -flags 标志位
     /// -vlines_num 虚拟行的总数
     /// -chars_num 每行最大的字符数
-
     pub fn new(flags: WindowFlag, vlines_num: i32, chars_num: i32) -> Self {
         let mut initial_vlines = Vec::new();
 
@@ -667,10 +666,8 @@ impl TextuiWindow {
 
     /// 重新渲染某个窗口的某个虚拟行
     /// ## 参数
-
     /// - window 窗口结构体
     /// - vline_id 虚拟行号
-
     fn textui_refresh_vline(&mut self, vline_id: LineId) -> Result<(), SystemError> {
         if self.flags.contains(WindowFlag::TEXTUI_CHROMATIC) {
             return self.textui_refresh_characters(
@@ -788,12 +785,10 @@ impl TextuiWindow {
     }
     /// 根据输入的一个字符在窗口上输出
     /// ## 参数
-
     /// - window 窗口
     /// - character 字符
     /// - FRcolor 前景色（RGB）
     /// - BKcolor 背景色（RGB）
-
     fn textui_putchar_window(
         &mut self,
         character: char,
@@ -1027,7 +1022,6 @@ where
 /// - character 字符
 /// - FRcolor 前景色（RGB）
 /// - BKcolor 背景色（RGB）
-
 #[no_mangle]
 pub extern "C" fn rs_textui_putchar(character: u8, fr_color: u32, bk_color: u32) -> i32 {
     if let Some(current_vc) = vc_manager().current_vc() {

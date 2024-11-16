@@ -44,4 +44,4 @@ jobs:
         AWS_SECRET_ACCESS_KEY: ${{ secrets.DOCS_DEPLOY_S3_SECRET_KEY }}
       
       run: |
-        aws s3 sync ./_build/html s3://dragonos-docs --delete
+        aws s3 sync ./_build/html s3://dragonos-docs --delete --exclude "p/*"

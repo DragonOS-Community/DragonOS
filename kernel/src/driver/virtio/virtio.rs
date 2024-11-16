@@ -6,17 +6,15 @@ use crate::driver::base::device::{Device, DeviceId};
 use crate::driver::block::virtio_blk::virtio_blk;
 use crate::driver::net::virtio_net::virtio_net;
 use crate::driver::pci::pci::{
-    get_pci_device_structures_mut_by_vendor_id, PciDeviceStructure,
-    PciDeviceStructureGeneralDevice, PCI_DEVICE_LINKEDLIST,
+    get_pci_device_structures_mut_by_vendor_id, PciDeviceStructureGeneralDevice,
+    PCI_DEVICE_LINKEDLIST,
 };
 use crate::driver::pci::subsys::pci_bus;
 use crate::driver::virtio::transport::VirtIOTransport;
-use crate::libs::rwlock::RwLockWriteGuard;
 
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use alloc::{boxed::Box, collections::LinkedList};
 use log::{debug, error, warn};
 use virtio_drivers::transport::{DeviceType, Transport};
 
@@ -29,12 +27,11 @@ pub fn virtio_probe() {
 
 #[allow(dead_code)]
 fn virtio_probe_pci() {
-    let mut list = PCI_DEVICE_LINKEDLIST.write();
-    let virtio_list = virtio_device_search(&mut list);
+    let virtio_list = virtio_device_search();
     for virtio_device in virtio_list {
         let dev_id = virtio_device.common_header.device_id;
         let dev_id = DeviceId::new(None, Some(format!("{dev_id}"))).unwrap();
-        match PciTransport::new::<HalImpl>(virtio_device, dev_id.clone()) {
+        match PciTransport::new::<HalImpl>(virtio_device.clone(), dev_id.clone()) {
             Ok(mut transport) => {
                 debug!(
                     "Detected virtio PCI device with device type {:?}, features {:#018x}",
@@ -87,19 +84,17 @@ pub(super) fn virtio_device_init(
 /// ## 返回值
 ///
 /// 返回一个包含所有找到的virtio设备的数组
-fn virtio_device_search<'a>(
-    list: &'a mut RwLockWriteGuard<'_, LinkedList<Box<dyn PciDeviceStructure>>>,
-) -> Vec<&'a mut PciDeviceStructureGeneralDevice> {
+fn virtio_device_search() -> Vec<Arc<PciDeviceStructureGeneralDevice>> {
+    let list = &*PCI_DEVICE_LINKEDLIST;
     let mut virtio_list = Vec::new();
     let result = get_pci_device_structures_mut_by_vendor_id(list, 0x1AF4);
 
     for device in result {
-        let standard_device = device.as_standard_device_mut().unwrap();
+        let standard_device = device.as_standard_device().unwrap();
         let header = &standard_device.common_header;
         if header.device_id >= 0x1000 && header.device_id <= 0x103F {
             virtio_list.push(standard_device);
         }
     }
-
     return virtio_list;
 }

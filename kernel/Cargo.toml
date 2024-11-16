@@ -68,7 +68,8 @@ lru = "0.12.3"
 
 rbpf = { path = "crates/rbpf" }
 printf-compat = { version = "0.1.1", default-features = false }
-static-keys = { git = "https://github.com/Godones/static-keys.git", branch = "old-rust" }
+static-keys = "=0.6.1"
+
 # target为x86_64时，使用下面的依赖
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 mini-backtrace = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/mini-backtrace.git", rev = "e0b1d90940" }

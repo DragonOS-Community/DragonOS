@@ -56,7 +56,8 @@ all:
 
 	@echo 用户态程序编译完成
 
-copy_sysconfig: dadk_run
+.PHONY: copy_sysconfig
+copy_sysconfig:
 	cp -r sysconfig/* $(ROOT_PATH)/bin/sysroot/
 
 

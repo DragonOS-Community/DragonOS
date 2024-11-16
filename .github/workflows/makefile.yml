@@ -12,14 +12,14 @@ jobs:
     name: Format check ${{ matrix.arch }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: dragonos/dragonos-dev:v1.5
+    container: dragonos/dragonos-dev:v1.6
 
     strategy:
       matrix:
         arch: [x86_64, riscv64]
 
     steps:
-    - run: echo "Running in dragonos/dragonos-dev:v1.5"
+    - run: echo "Running in dragonos/dragonos-dev:v1.6"
     - uses: actions/checkout@v3
 
     - name: Format check
@@ -35,14 +35,14 @@ jobs:
     name: Kernel static test ${{ matrix.arch }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: dragonos/dragonos-dev:v1.5
+    container: dragonos/dragonos-dev:v1.6
 
     strategy:
       matrix:
         arch: [x86_64, riscv64]
 
     steps:
-    - run: echo "Running in dragonos/dragonos-dev:v1.5"
+    - run: echo "Running in dragonos/dragonos-dev:v1.6"
 
     - uses: actions/checkout@v3
 
@@ -56,10 +56,10 @@ jobs:
   build-x86_64:
 
     runs-on: ubuntu-latest
-    container: dragonos/dragonos-dev:v1.5
+    container: dragonos/dragonos-dev:v1.6
 
     steps:
-    - run: echo "Running in dragonos/dragonos-dev:v1.5"
+    - run: echo "Running in dragonos/dragonos-dev:v1.6"
 
     - uses: actions/checkout@v3
     - name: build the DragonOS
@@ -78,10 +78,10 @@ jobs:
   build-riscv64:
 
     runs-on: ubuntu-latest
-    container: dragonos/dragonos-dev:v1.5
+    container: dragonos/dragonos-dev:v1.6
 
     steps:
-    - run: echo "Running in dragonos/dragonos-dev:v1.5"
+    - run: echo "Running in dragonos/dragonos-dev:v1.6"
 
     - uses: actions/checkout@v3
       with:

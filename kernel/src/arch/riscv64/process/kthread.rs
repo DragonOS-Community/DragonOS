@@ -66,7 +66,7 @@ impl KernelThreadMechanism {
 pub(super) unsafe extern "C" fn kernel_thread_bootstrap_stage1() {
     // 这个函数要是naked的，只是因为现在还没有实现，而naked func不能打`unimplemented!()`
     // 所以先写成了普通函数
-    asm!(concat!(
+    core::arch::naked_asm!(concat!(
         "
             ld x3, {off_gp}(sp)
             ld x5, {off_t0}(sp)
@@ -111,8 +111,7 @@ pub(super) unsafe extern "C" fn kernel_thread_bootstrap_stage1() {
         off_t4 = const offset_of!(TrapFrame, t4),
         off_t5 = const offset_of!(TrapFrame, t5),
         off_t6 = const offset_of!(TrapFrame, t6),
-        stage2_func = sym jump_to_stage2,
-        options(noreturn),
+        stage2_func = sym jump_to_stage2
     );
 }
 

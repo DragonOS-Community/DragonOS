@@ -326,9 +326,8 @@ impl FATFileSystem {
         };
 
         // 根目录项占用的扇区数（向上取整）
-        let root_dir_sectors: u64 = ((bpb.root_entries_cnt as u64 * 32)
-            + (bpb.bytes_per_sector as u64 - 1))
-            / (bpb.bytes_per_sector as u64);
+        let root_dir_sectors: u64 =
+            (bpb.root_entries_cnt as u64 * 32).div_ceil(bpb.bytes_per_sector as u64);
 
         // FAT表大小（单位：扇区）
         let fat_size = if bpb.fat_size_16 != 0 {
@@ -843,6 +842,7 @@ impl FATFileSystem {
     /// @return Ok(true) 正常
     /// @return Ok(false) 不正常
     /// @return Err(SystemError) 在判断时发生错误
+    #[allow(dead_code)]
     pub fn is_hard_error_bit_ok(&mut self) -> Result<bool, SystemError> {
         match self.bpb.fat_type {
             FATType::FAT32(_) => {
@@ -935,10 +935,8 @@ impl FATFileSystem {
 
             _ => {
                 // FAT12 / FAT16
-                let root_dir_sectors: u64 = (((self.bpb.root_entries_cnt as u64) * 32)
-                    + self.bpb.bytes_per_sector as u64
-                    - 1)
-                    / self.bpb.bytes_per_sector as u64;
+                let root_dir_sectors: u64 = ((self.bpb.root_entries_cnt as u64) * 32)
+                    .div_ceil(self.bpb.bytes_per_sector as u64);
                 // 数据区扇区数
                 let data_sec: u64 = self.bpb.total_sectors_16 as u64
                     - (self.bpb.rsvd_sec_cnt as u64
@@ -1283,6 +1281,7 @@ impl FATFsInfo {
     /// @brief 根据fsinfo的信息，计算当前总的空闲簇数量
     ///
     /// @param 当前文件系统的最大簇号
+    #[allow(dead_code)]
     pub fn count_free_cluster(&self, max_cluster: Cluster) -> Option<u64> {
         let count_clusters = max_cluster.cluster_num - RESERVED_CLUSTERS as u64 + 1;
         // 信息不合理，当前的FsInfo中存储的free count大于计算出来的值
@@ -1301,6 +1300,7 @@ impl FATFsInfo {
     /// @brief 更新FsInfo中的“空闲簇统计信息“为new_count
     ///
     /// 请注意，除非手动调用`flush()`，否则本函数不会将数据刷入磁盘
+    #[allow(dead_code)]
     pub fn update_free_count_abs(&mut self, new_count: u32) {
         self.free_count = new_count;
     }
@@ -1308,6 +1308,7 @@ impl FATFsInfo {
     /// @brief 更新FsInfo中的“空闲簇统计信息“，把它加上delta.
     ///
     /// 请注意，除非手动调用`flush()`，否则本函数不会将数据刷入磁盘
+    #[allow(dead_code)]
     pub fn update_free_count_delta(&mut self, delta: i32) {
         self.free_count = (self.free_count as i32 + delta) as u32;
     }
@@ -1360,6 +1361,7 @@ impl FATFsInfo {
     /// @brief 读取磁盘上的Fs Info扇区，将里面的内容更新到结构体中
     ///
     /// @param partition fs info所在的分区
+    #[allow(dead_code)]
     pub fn update(&mut self, partition: Arc<Partition>) -> Result<(), SystemError> {
         if let Some(off) = self.offset {
             let in_block_offset = off % LBA_SIZE as u64;
@@ -1888,7 +1890,7 @@ struct ClusterIter<'a> {
     fs: &'a FATFileSystem,
 }
 
-impl<'a> Iterator for ClusterIter<'a> {
+impl Iterator for ClusterIter<'_> {
     type Item = Cluster;
 
     fn next(&mut self) -> Option<Self::Item> {

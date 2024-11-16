@@ -1,5 +1,3 @@
-use core::arch::asm;
-
 use alloc::sync::Arc;
 use system_error::SystemError;
 
@@ -61,7 +59,7 @@ impl KernelThreadMechanism {
 /// 跳转之后，指向Box<KernelThreadClosure>的指针将传入到stage2的函数
 #[naked]
 pub(super) unsafe extern "sysv64" fn kernel_thread_bootstrap_stage1() {
-    asm!(
+    core::arch::naked_asm!(
         concat!(
             "
 
@@ -92,6 +90,5 @@ pub(super) unsafe extern "sysv64" fn kernel_thread_bootstrap_stage1() {
             "
         ),
         stage2_func = sym kernel_thread_bootstrap_stage2,
-        options(noreturn)
     )
 }

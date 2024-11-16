@@ -844,7 +844,7 @@ impl<'a> FutexIterator<'a> {
     }
 }
 
-impl<'a> Iterator for FutexIterator<'a> {
+impl Iterator for FutexIterator<'_> {
     type Item = VirtAddr;
 
     fn next(&mut self) -> Option<Self::Item> {

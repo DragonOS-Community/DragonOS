@@ -303,10 +303,10 @@ impl<'a> ObjectPage<'a> {
 }
 
 // These needs some more work to be really safe...
-unsafe impl<'a> Send for ObjectPage<'a> {}
-unsafe impl<'a> Sync for ObjectPage<'a> {}
+unsafe impl Send for ObjectPage<'_> {}
+unsafe impl Sync for ObjectPage<'_> {}
 
-impl<'a> AllocablePage for ObjectPage<'a> {
+impl AllocablePage for ObjectPage<'_> {
     const SIZE: usize = OBJECT_PAGE_SIZE;
 
     fn bitfield(&self) -> &[AtomicU64; 8] {
@@ -331,7 +331,7 @@ impl<'a> Default for ObjectPage<'a> {
     }
 }
 
-impl<'a> fmt::Debug for ObjectPage<'a> {
+impl fmt::Debug for ObjectPage<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "ObjectPage")
     }

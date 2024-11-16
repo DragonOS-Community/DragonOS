@@ -275,13 +275,13 @@ struct RunningCountGuard<'a> {
 }
 
 impl<'a> RunningCountGuard<'a> {
-    fn new(cpu_running_count: &'a PerCpuVar<AtomicI16>) -> RunningCountGuard {
+    fn new(cpu_running_count: &'a PerCpuVar<AtomicI16>) -> RunningCountGuard<'a> {
         cpu_running_count.get().fetch_add(1, Ordering::SeqCst);
         return RunningCountGuard { cpu_running_count };
     }
 }
 
-impl<'a> Drop for RunningCountGuard<'a> {
+impl Drop for RunningCountGuard<'_> {
     fn drop(&mut self) {
         self.cpu_running_count.get().fetch_sub(1, Ordering::SeqCst);
     }

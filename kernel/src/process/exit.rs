@@ -39,7 +39,7 @@ pub struct WaitIdInfo {
     pub cause: i32,
 }
 
-impl<'a> KernelWaitOption<'a> {
+impl KernelWaitOption<'_> {
     pub fn new(pid_type: PidType, pid: Pid, options: WaitOption) -> Self {
         Self {
             pid_type,

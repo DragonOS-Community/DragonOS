@@ -317,7 +317,7 @@ pub struct PciRootIterator<'a> {
     index: usize,
 }
 
-impl<'a> Iterator for PciRootIterator<'a> {
+impl Iterator for PciRootIterator<'_> {
     type Item = Arc<PciRoot>;
 
     fn next(&mut self) -> Option<Self::Item> {

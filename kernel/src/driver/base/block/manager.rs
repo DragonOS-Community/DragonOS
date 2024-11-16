@@ -134,6 +134,7 @@ impl BlockDevManager {
     }
 
     /// 卸载磁盘设备
+    #[allow(dead_code)]
     pub fn unregister(&self, dev: &Arc<dyn BlockDevice>) {
         let mut inner = self.inner();
         inner.disks.remove(dev.dev_name());

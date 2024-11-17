@@ -10,4 +10,4 @@
    :maxdepth: 2
 
    namespaces/index
-   filesystem/unionfs/index
+   ../filesystem/unionfs/index

@@ -34,19 +34,22 @@ else
 	FMT_CHECK=
 endif
 
+# Check if ARCH matches the arch field in dadk-manifest.toml
+check_arch:
+	@bash tools/check_arch.sh
 
 .PHONY: all 
 all: kernel user
 
 
 .PHONY: kernel
-kernel:
+kernel: check_arch
 	mkdir -p bin/kernel/
 	
 	$(MAKE) -C ./kernel all ARCH=$(ARCH) || (sh -c "echo 内核编译失败" && exit 1)
 	
 .PHONY: user
-user:
+user: check_arch
 	$(MAKE) -C ./user all ARCH=$(ARCH) || (sh -c "echo 用户程序编译失败" && exit 1)
 
 .PHONY: clean
@@ -61,11 +64,6 @@ clean:
 ECHO:
 	@echo "$@"
 
-cppcheck-xml: 
-	cppcheck kernel user --platform=unix64 --std=c11 -I user/libs/ -I=kernel/ --force -j $(NPROCS) --xml 2> cppcheck.xml
-
-cppcheck:
-	cppcheck kernel user --platform=unix64 --std=c11 -I user/libs/ -I=kernel/ --force -j $(NPROCS)
 
 docs: ECHO
 	bash -c "cd docs && make html && cd .."
@@ -81,74 +79,74 @@ else
 endif
 
 # 写入磁盘镜像
-write_diskimage:
+write_diskimage: check_arch
 	@echo "write_diskimage arch=$(ARCH)"
-	bash -c "export ARCH=$(ARCH); cd tools && bash grub_auto_install.sh && sudo ARCH=$(ARCH) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=legacy && cd .."
+	bash -c "export ARCH=$(ARCH); cd tools && bash grub_auto_install.sh && sudo DADK=$(DADK) ARCH=$(ARCH) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=legacy && cd .."
 
 # 写入磁盘镜像(uefi)
-write_diskimage-uefi:
-	bash -c "export ARCH=$(ARCH); cd tools && bash grub_auto_install.sh && sudo ARCH=$(ARCH) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
+write_diskimage-uefi: check_arch
+	bash -c "export ARCH=$(ARCH); cd tools && bash grub_auto_install.sh && sudo DADK=$(DADK) ARCH=$(ARCH) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
 # 不编译，直接启动QEMU
-qemu:
+qemu: check_arch
 	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=window && cd .."
 
 # 不编译，直接启动QEMU,不显示图像
-qemu-nographic:
+qemu-nographic: check_arch
 	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=nographic && cd .."
 
 # 不编译，直接启动QEMU(UEFI)
-qemu-uefi:
+qemu-uefi: check_arch
 	sh -c "cd tools && bash run-qemu.sh --bios=uefi --display=window && cd .."
 # 不编译，直接启动QEMU,使用VNC Display作为图像输出
-qemu-vnc:
+qemu-vnc: check_arch
 	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=vnc && cd .."
 # 不编译，直接启动QEMU(UEFI),使用VNC Display作为图像输出
-qemu-uefi-vnc:
+qemu-uefi-vnc: check_arch
 	sh -c "cd tools && bash run-qemu.sh --bios=uefi --display=vnc && cd .."
 	
 # 编译并写入磁盘镜像
-build:
+build: check_arch
 	$(MAKE) all -j $(NPROCS)
 	$(MAKE) write_diskimage || exit 1
 
 # 在docker中编译，并写入磁盘镜像
-docker:
+docker: check_arch
 	@echo "使用docker构建"
 	sudo bash tools/build_in_docker.sh || exit 1
 	$(MAKE) write_diskimage || exit 1
 	
 # uefi方式启动
-run-uefi:
+run-uefi: check_arch
 	$(MAKE) all -j $(NPROCS)
 	$(MAKE) write_diskimage-uefi || exit 1
 	$(MAKE) qemu-uefi
 	
 # 编译并启动QEMU
-run:
+run: check_arch
 	$(MAKE) all -j $(NPROCS)
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu
 
 # uefi方式启动，使用VNC Display作为图像输出
-run-uefi-vnc:
+run-uefi-vnc: check_arch
 	$(MAKE) all -j $(NPROCS)
 	$(MAKE) write_diskimage-uefi || exit 1
 	$(MAKE) qemu-uefi-vnc
 	
 # 编译并启动QEMU，使用VNC Display作为图像输出
-run-vnc:
+run-vnc: check_arch
 	$(MAKE) all -j $(NPROCS)
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu-vnc
 
 # 在docker中编译，并启动QEMU
-run-docker:
+run-docker: check_arch
 	@echo "使用docker构建并运行"
 	sudo bash tools/build_in_docker.sh || exit 1
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu
 
-fmt:
+fmt: check_arch
 	@echo "格式化代码" 
 	FMT_CHECK=$(FMT_CHECK) $(MAKE) fmt -C kernel
 	FMT_CHECK=$(FMT_CHECK) $(MAKE) fmt -C user

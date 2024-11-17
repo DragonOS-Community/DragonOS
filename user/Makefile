@@ -41,8 +41,8 @@ endif
 .PHONY: dadk_run
 dadk_run: install_dadk
 	mkdir -p $(DADK_CACHE_DIR)
-	dadk-insiders user build -w $(ROOT_PATH)
-	dadk-insiders user install -w $(ROOT_PATH)
+	$(DADK) user build -w $(ROOT_PATH)
+	$(DADK) user install -w $(ROOT_PATH)
 
 .PHONY: dadk_clean
 dadk_clean: install_dadk

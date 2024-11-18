@@ -142,6 +142,7 @@ pub struct PageCache {
 
 impl Drop for PageCache {
     fn drop(&mut self) {
+        log::debug!("page cache drop");
         let guard = self.pages.lock_irqsave();
         let mut page_manager = page_manager_lock_irqsave();
         for page in guard.values() {
@@ -192,7 +193,7 @@ impl PageCache {
         Ok(())
     }
 
-    pub fn create_pages(&self, page_index: usize, buf: &[u8]) -> Result<(), SystemError> {
+    pub fn create_pages(&self, start_page_index: usize, buf: &[u8]) -> Result<(), SystemError> {
         assert!(buf.len() % MMArch::PAGE_SIZE == 0);
 
         let page_num = buf.len() / MMArch::PAGE_SIZE;
@@ -205,8 +206,9 @@ impl PageCache {
         let mut guard = self.pages.lock_irqsave();
         let mut page_manager_guard = page_manager_lock_irqsave();
 
-        for i in page_index..page_index + page_num {
+        for i in 0..page_num {
             let buf_offset = i * MMArch::PAGE_SIZE;
+            let page_index = start_page_index + i;
 
             let page = page_manager_guard.create_page(
                 true,
@@ -230,7 +232,7 @@ impl PageCache {
             }
 
             page_guard.add_flags(PageFlags::PG_LRU);
-            guard.insert(i, page.clone());
+            guard.insert(page_index, page.clone());
 
             page_reclaimer_lock_irqsave().insert_page(paddr, &page);
         }
@@ -265,14 +267,16 @@ impl PageCache {
 
         let mut not_exist = Vec::new();
 
-        let start_page_offset = offset >> MMArch::PAGE_SHIFT;
-        let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_offset;
+        let start_page_index = offset >> MMArch::PAGE_SHIFT;
+        let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_index;
 
         let guard = self.pages.lock_irqsave();
 
         let mut buf_offset = 0;
         let mut ret = 0;
-        for i in start_page_offset..start_page_offset + page_num {
+        for i in 0..page_num {
+            let page_index = start_page_index + i;
+
             // 第一个页可能需要计算页内偏移
             let page_offset = if i == 0 {
                 offset % MMArch::PAGE_SIZE
@@ -289,7 +293,7 @@ impl PageCache {
                 MMArch::PAGE_SIZE
             };
 
-            if let Some(page) = guard.get(&i) {
+            if let Some(page) = guard.get(&page_index) {
                 let vaddr =
                     unsafe { MMArch::phys_2_virt(page.read_irqsave().phys_address()).unwrap() };
                 let sub_buf = &mut buf[buf_offset..(buf_offset + sub_len)];
@@ -300,14 +304,14 @@ impl PageCache {
                     user_reader.copy_from_user(sub_buf, 0)?;
                     ret += sub_len;
                 }
-            } else if let Some((page_offset, count)) = not_exist.last_mut() {
-                if *page_offset + *count == start_page_offset + i {
+            } else if let Some((index, count)) = not_exist.last_mut() {
+                if *index + *count == page_index {
                     *count += 1;
                 } else {
-                    not_exist.push((start_page_offset + i, 1));
+                    not_exist.push((page_index, 1));
                 }
             } else {
-                not_exist.push((start_page_offset + i, 1));
+                not_exist.push((page_index, 1));
             }
 
             buf_offset += sub_len;
@@ -315,20 +319,20 @@ impl PageCache {
 
         drop(guard);
 
-        for (page_offset, count) in not_exist {
+        for (page_index, count) in not_exist {
             let mut page_buf = vec![0u8; MMArch::PAGE_SIZE * count];
-            inode.read_sync(page_offset * MMArch::PAGE_SIZE, page_buf.as_mut())?;
+            inode.read_sync(page_index * MMArch::PAGE_SIZE, page_buf.as_mut())?;
 
-            self.create_pages(page_offset, page_buf.as_mut())?;
+            self.create_pages(page_index, page_buf.as_mut())?;
 
             // 实际要拷贝的内容在文件中的偏移量
-            let copy_offset = core::cmp::max(page_offset * MMArch::PAGE_SIZE, offset);
+            let copy_offset = core::cmp::max(page_index * MMArch::PAGE_SIZE, offset);
             // 实际要拷贝的内容的长度
-            let copy_len = core::cmp::min((page_offset + count) * MMArch::PAGE_SIZE, offset + len)
+            let copy_len = core::cmp::min((page_index + count) * MMArch::PAGE_SIZE, offset + len)
                 - copy_offset;
 
-            let page_buf_offset = if page_offset * MMArch::PAGE_SIZE < copy_offset {
-                copy_offset - page_offset * MMArch::PAGE_SIZE
+            let page_buf_offset = if page_index * MMArch::PAGE_SIZE < copy_offset {
+                copy_offset - page_index * MMArch::PAGE_SIZE
             } else {
                 0
             };
@@ -367,13 +371,15 @@ impl PageCache {
 
         // log::debug!("offset:{offset}, len:{len}");
 
-        let start_page_offset = offset >> MMArch::PAGE_SHIFT;
-        let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_offset;
+        let start_page_index = offset >> MMArch::PAGE_SHIFT;
+        let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_index;
 
         let mut buf_offset = 0;
         let mut ret = 0;
 
-        for i in start_page_offset..start_page_offset + page_num {
+        for i in 0..page_num {
+            let page_index = start_page_index + i;
+
             // 第一个页可能需要计算页内偏移
             let page_offset = if i == 0 {
                 offset % MMArch::PAGE_SIZE
@@ -391,16 +397,16 @@ impl PageCache {
             };
 
             let guard = self.pages.lock_irqsave();
-            let exist = guard.get(&i).is_some();
+            let exist = guard.get(&page_index).is_some();
             drop(guard);
 
             if !exist {
                 let page_buf = vec![0u8; MMArch::PAGE_SIZE];
-                self.create_pages(start_page_offset + i, &page_buf)?;
+                self.create_pages(page_index, &page_buf)?;
             }
 
             let guard = self.pages.lock_irqsave();
-            if let Some(page) = guard.get(&i) {
+            if let Some(page) = guard.get(&page_index) {
                 let vaddr =
                     unsafe { MMArch::phys_2_virt(page.read_irqsave().phys_address()).unwrap() };
                 let sub_buf = &buf[buf_offset..(buf_offset + sub_len)];

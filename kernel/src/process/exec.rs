@@ -121,7 +121,7 @@ impl ExecParam {
         let inode = ROOT_INODE().lookup(file_path)?;
 
         // 读取文件头部，用于判断文件类型
-        let file = File::new(inode, FileMode::O_RDONLY | FileMode::O_DIRECT)?;
+        let file = File::new(inode, FileMode::O_RDONLY)?;
 
         Ok(Self {
             file,

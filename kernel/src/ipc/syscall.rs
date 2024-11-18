@@ -35,7 +35,7 @@ use crate::{
 use super::{
     pipe::{LockedPipeInode, PipeFsPrivateData},
     shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
-    signal::sigprocmask,
+    signal::set_sigprocmask,
     signal_types::{
         SaHandlerType, SigInfo, SigType, Sigaction, SigactionType, UserSigaction, USER_SIG_DFL,
         USER_SIG_ERR, USER_SIG_IGN,
@@ -546,7 +546,7 @@ impl Syscall {
             <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
         new_set.remove(to_remove);
 
-        let oldset_te_return = sigprocmask(how, new_set)?;
+        let oldset_te_return = set_sigprocmask(how, new_set)?;
         if let Some(oldset) = oset {
             // debug!("Get Oldset to return: {}", &oldset_te_return.bits());
             let mut writer = UserBufferWriter::new(

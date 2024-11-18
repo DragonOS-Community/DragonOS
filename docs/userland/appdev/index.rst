@@ -8,3 +8,4 @@
 
    rust-quick-start
    c-cpp-quick-start
+   DADK文档 <https://docs.dragonos.org.cn/p/dadk/>

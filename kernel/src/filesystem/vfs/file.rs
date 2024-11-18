@@ -428,6 +428,37 @@ impl PageCache {
         }
         Ok(ret)
     }
+
+    pub fn resize(&self, len: usize) -> Result<(), SystemError> {
+        let page_num = page_align_up(len) / MMArch::PAGE_SIZE;
+
+        let mut guard = self.pages.lock_irqsave();
+        let mut reclaimer = page_reclaimer_lock_irqsave();
+        for (_i, page) in guard.drain_filter(|index, _page| *index >= page_num) {
+            let _ = reclaimer.remove_page(&page.read_irqsave().phys_address());
+        }
+
+        if page_num > 0 {
+            let last_page_index = page_num - 1;
+            let last_len = len - last_page_index * MMArch::PAGE_SIZE;
+            if let Some(page) = guard.get(&last_page_index) {
+                let vaddr =
+                    unsafe { MMArch::phys_2_virt(page.read_irqsave().phys_address()).unwrap() };
+
+                unsafe {
+                    core::slice::from_raw_parts_mut(
+                        (vaddr.data() + last_len) as *mut u8,
+                        MMArch::PAGE_SIZE - last_len,
+                    )
+                    .fill(0)
+                };
+            } else {
+                return Err(SystemError::EIO);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// @brief 抽象文件结构体

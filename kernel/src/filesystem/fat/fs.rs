@@ -129,9 +129,8 @@ pub struct FATInode {
 }
 
 impl FATInode {
-    /// @brief 更新当前inode的元数据
-    pub fn update_metadata(&mut self) {
-        // todo: 更新文件的访问时间等信息
+    /// 将inode的元数据与磁盘同步
+    pub fn synchronize_metadata(&mut self) {
         match &self.inode_type {
             FATDirEntry::File(f) | FATDirEntry::VolId(f) => {
                 self.metadata.size = f.size() as i64;
@@ -144,6 +143,19 @@ impl FATInode {
                 return;
             }
         };
+    }
+
+    /// 更新inode的元数据
+    pub fn update_metadata(&mut self, size: Option<i64>) {
+        if let Some(new_size) = size {
+            self.metadata.size = new_size;
+        }
+        self.update_time();
+    }
+
+    /// 更新访问时间
+    pub fn update_time(&mut self) {
+        log::warn!("update_time has not yet been implemented");
     }
 
     fn find(&mut self, name: &str) -> Result<Arc<LockedFATInode>, SystemError> {
@@ -234,7 +246,7 @@ impl LockedFATInode {
 
         inode.0.lock().self_ref = Arc::downgrade(&inode);
 
-        inode.0.lock().update_metadata();
+        inode.0.lock().synchronize_metadata();
 
         return inode;
     }
@@ -1438,6 +1450,7 @@ impl IndexNode for LockedFATInode {
         let page_cache = self.0.lock().page_cache.clone();
         if let Some(page_cache) = page_cache {
             let r = page_cache.read(offset, &mut buf[0..len]);
+            // self.0.lock_irqsave().update_metadata();
             return r;
         } else {
             return self.read_direct(offset, len, buf, data);
@@ -1459,7 +1472,7 @@ impl IndexNode for LockedFATInode {
             let write_len = page_cache.write(offset, buf)?;
             let mut guard = self.0.lock();
             let old_size = guard.metadata.size;
-            guard.metadata.size = core::cmp::max(old_size, (offset + write_len) as i64);
+            guard.update_metadata(Some(core::cmp::max(old_size, (offset + write_len) as i64)));
             return Ok(write_len);
         } else {
             return self.write_direct(offset, len, buf, data);
@@ -1474,7 +1487,9 @@ impl IndexNode for LockedFATInode {
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
-        self.read_sync(offset, &mut buf[0..len])
+        let r = self.read_sync(offset, &mut buf[0..len]);
+        // self.0.lock_irqsave().update_metadata();
+        return r;
     }
 
     fn write_direct(
@@ -1485,7 +1500,9 @@ impl IndexNode for LockedFATInode {
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
-        self.write_sync(offset, &buf[0..len])
+        let r = self.write_sync(offset, &buf[0..len]);
+        // self.0.lock_irqsave().update_metadata();
+        return r;
     }
 
     fn create(
@@ -1544,6 +1561,10 @@ impl IndexNode for LockedFATInode {
         Ok(())
     }
     fn resize(&self, len: usize) -> Result<(), SystemError> {
+        if let Some(page_cache) = self.page_cache() {
+            return page_cache.resize(len);
+        }
+
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();
         let fs: &Arc<FATFileSystem> = &guard.fs.upgrade().unwrap();
         let old_size = guard.metadata.size as usize;
@@ -1575,7 +1596,7 @@ impl IndexNode for LockedFATInode {
                         file.truncate(fs, len as u64)?;
                     }
                 }
-                guard.update_metadata();
+                guard.synchronize_metadata();
                 return Ok(());
             }
             FATDirEntry::Dir(_) => return Err(SystemError::ENOSYS),

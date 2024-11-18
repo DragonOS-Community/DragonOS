@@ -204,6 +204,10 @@ impl PageReclaimer {
         self.lru.put(paddr, page.clone());
     }
 
+    pub fn remove_page(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
+        self.lru.pop(paddr)
+    }
+
     /// lru链表缩减
     /// ## 参数
     ///

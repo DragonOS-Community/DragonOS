@@ -118,8 +118,8 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         _ => {}
     }
     syscall_return!(
-        Syscall::handle(syscall_num, &args, frame).unwrap_or_else(|e| e.to_posix_errno() as usize)
-            as u64,
+        Syscall::catch_handle(syscall_num, &args, frame)
+            .unwrap_or_else(|e| e.to_posix_errno() as usize) as u64,
         frame,
         show
     );

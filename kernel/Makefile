@@ -6,7 +6,7 @@ include ./env.mk
 ifeq ($(ARCH), x86_64)
 	export TARGET_JSON=arch/x86_64/x86_64-unknown-none.json
 else ifeq ($(ARCH), riscv64)
-	export TARGET_JSON=riscv64gc-unknown-none-elf
+	export TARGET_JSON=arch/riscv64/riscv64gc-unknown-none-elf.json
 endif
 
 export CARGO_ZBUILD=-Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem
@@ -27,7 +27,7 @@ clean:
 fmt:
 	RUSTFLAGS="$(RUSTFLAGS)" cargo fmt --all $(FMT_CHECK)
 ifeq ($(ARCH), x86_64)
-	RUSTFLAGS="$(RUSTFLAGS)" cargo clippy --all-features
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 clippy --all-features
 endif
 
 
@@ -38,7 +38,7 @@ check: ECHO
 ifeq ($(ARCH), x86_64)
 	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 check --workspace $(CARGO_ZBUILD) --message-format=json --target ./src/$(TARGET_JSON)
 else ifeq ($(ARCH), riscv64)
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 check --workspace $(CARGO_ZBUILD) --message-format=json --target $(TARGET_JSON)
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 check --workspace $(CARGO_ZBUILD) --message-format=json --target ./src/$(TARGET_JSON)
 endif
 
 test:

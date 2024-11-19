@@ -1,5 +1,6 @@
 use core::{
     ffi::{c_int, c_void},
+    hint::spin_loop,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -84,7 +85,9 @@ impl Syscall {
         frame: &mut TrapFrame,
     ) -> Result<usize, SystemError> {
         let res = unwinding::panic::catch_unwind(|| Self::handle(syscall_num, args, frame));
-        res.unwrap_or_else(|_| ProcessManager::exit(usize::MAX))
+        res.unwrap_or_else(|_| loop {
+            spin_loop();
+        })
     }
     /// @brief 系统调用分发器，用于分发系统调用。
     ///

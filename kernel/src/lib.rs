@@ -170,7 +170,8 @@ pub fn panic(info: &PanicInfo) -> ! {
         "Current PCB:\n\t{:?}",
         process::ProcessManager::current_pcb()
     );
-    process::ProcessManager::exit(usize::MAX)
+    process::ProcessManager::exit(usize::MAX);
+    loop {}
 }
 
 /// User hook for unwinding

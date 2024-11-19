@@ -27,7 +27,7 @@ clean:
 fmt:
 	RUSTFLAGS="$(RUSTFLAGS)" cargo fmt --all $(FMT_CHECK)
 ifeq ($(ARCH), x86_64)
-#	RUSTFLAGS="$(RUSTFLAGS)" cargo clippy --all-features
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 clippy --all-features
 endif
 
 
@@ -38,7 +38,7 @@ check: ECHO
 ifeq ($(ARCH), x86_64)
 	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 check --workspace $(CARGO_ZBUILD) --message-format=json --target ./src/$(TARGET_JSON)
 else ifeq ($(ARCH), riscv64)
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 check --workspace $(CARGO_ZBUILD) --message-format=json --target $(TARGET_JSON)
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 check --workspace $(CARGO_ZBUILD) --message-format=json --target ./src/$(TARGET_JSON)
 endif
 
 test:

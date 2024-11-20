@@ -645,6 +645,7 @@ impl Iface for VirtioInterface {
     }
 
     fn poll(&self) {
+        // log::debug!("VirtioInterface: poll");
         self.iface_common.poll(self.device_inner.force_get_mut())
     }
 

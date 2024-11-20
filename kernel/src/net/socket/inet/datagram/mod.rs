@@ -84,11 +84,11 @@ impl UdpSocket {
         &self,
         buf: &mut [u8],
     ) -> Result<(usize, smoltcp::wire::IpEndpoint), SystemError> {
-        poll_ifaces();
         let received = match self.inner.read().as_ref().expect("Udp Inner is None") {
             UdpInner::Bound(bound) => bound.try_recv(buf),
             _ => Err(ENOTCONN),
         };
+        poll_ifaces();
         return received;
     }
 

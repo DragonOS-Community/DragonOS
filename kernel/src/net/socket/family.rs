@@ -106,10 +106,8 @@ impl core::convert::TryFrom<u16> for AddressFamily {
     type Error = system_error::SystemError;
     fn try_from(x: u16) -> Result<Self, Self::Error> {
         use num_traits::FromPrimitive;
-        return <Self as FromPrimitive>::from_u16(x).ok_or({
-            log::debug!("AddressFamily::try_from failed: x={}", x);
-            Self::Error::EINVAL
-        });
+        // this will return EINVAL but still works, idk why
+        return <Self as FromPrimitive>::from_u16(x).ok_or(Self::Error::EINVAL);
     }
 }
 

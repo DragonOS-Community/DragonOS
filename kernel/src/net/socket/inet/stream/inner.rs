@@ -207,14 +207,18 @@ impl Connecting {
         self.inner.with_mut(f)
     }
 
-    pub fn into_result(self) -> (Inner, Option<SystemError>) {
+    pub fn into_result(self) -> (Inner, Result<(), SystemError>) {
         use ConnectResult::*;
         let result = *self.result.read_irqsave();
         match result {
-            Connecting => (Inner::Connecting(self), Some(EAGAIN_OR_EWOULDBLOCK)),
-            Connected => (Inner::Established(Established { inner: self.inner }), None),
-            Refused => (Inner::Init(Init::new_bound(self.inner)), Some(ECONNREFUSED)),
+            Connecting => (Inner::Connecting(self), Err(EAGAIN_OR_EWOULDBLOCK)),
+            Connected => (Inner::Established(Established { inner: self.inner }), Ok(())),
+            Refused => (Inner::Init(Init::new_bound(self.inner)), Err(ECONNREFUSED)),
         }
+    }
+
+    pub unsafe fn into_established(self) -> Established {
+        Established { inner: self.inner }
     }
 
     /// Returns `true` when `conn_result` becomes ready, which indicates that the caller should
@@ -224,9 +228,9 @@ impl Connecting {
     /// _exactly_ once. The caller is responsible for not missing this event.
     #[must_use]
     pub(super) fn update_io_events(&self) -> bool {
-        if matches!(*self.result.read_irqsave(), ConnectResult::Connecting) {
-            return false;
-        }
+        // if matches!(*self.result.read_irqsave(), ConnectResult::Connecting) {
+        //     return false;
+        // }
 
         self.inner
             .with_mut(|socket: &mut smoltcp::socket::tcp::Socket| {
@@ -237,11 +241,14 @@ impl Connecting {
 
                 // Connected
                 if socket.can_send() {
+                    log::debug!("can send");
                     *result = ConnectResult::Connected;
                     return true;
                 }
                 // Connecting
                 if socket.is_open() {
+                    log::debug!("connecting");
+                    *result = ConnectResult::Connecting;
                     return false;
                 }
                 // Refused
@@ -309,7 +316,6 @@ impl Listening {
         });
 
         if let Some(position) = position {
-            // log::debug!("Can accept!");
             self.connect
                 .store(position, core::sync::atomic::Ordering::Relaxed);
             pollee.fetch_or(
@@ -317,7 +323,6 @@ impl Listening {
                 core::sync::atomic::Ordering::Relaxed,
             );
         } else {
-            // log::debug!("Can't accept!");
             pollee.fetch_and(
                 !EPollEventType::EPOLLIN.bits() as usize,
                 core::sync::atomic::Ordering::Relaxed,

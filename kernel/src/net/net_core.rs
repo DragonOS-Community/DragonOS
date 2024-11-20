@@ -42,7 +42,7 @@ pub fn net_init() -> Result<(), SystemError> {
 
 fn dhcp_query() -> Result<(), SystemError> {
     let binding = NET_DEVICES.write_irqsave();
-    log::debug!("binding: {:?}", *binding);
+    // log::debug!("binding: {:?}", *binding);
     //由于现在os未实现在用户态为网卡动态分配内存，而lo网卡的id最先分配且ip固定不能被分配
     //所以特判取用id为1的网卡（也就是virtio_net）
     let net_face = binding.get(&1).ok_or(SystemError::ENODEV)?.clone();
@@ -63,7 +63,7 @@ fn dhcp_query() -> Result<(), SystemError> {
     // let dhcp_handle = SOCKET_SET.lock_irqsave().add(dhcp_socket);
     let dhcp_handle = sockets().add(dhcp_socket);
 
-    const DHCP_TRY_ROUND: u8 = 10;
+    const DHCP_TRY_ROUND: u8 = 100;
     for i in 0..DHCP_TRY_ROUND {
         log::debug!("DHCP try round: {}", i);
         net_face.poll();
@@ -137,8 +137,8 @@ fn dhcp_query() -> Result<(), SystemError> {
         drop(binding);
 
         let sleep_time = PosixTimeSpec {
-            tv_sec: 5,
-            tv_nsec: 0,
+            tv_sec: 0,
+            tv_nsec: 50,
         };
         let _ = nanosleep(sleep_time)?;
     }
@@ -147,7 +147,7 @@ fn dhcp_query() -> Result<(), SystemError> {
 }
 
 pub fn poll_ifaces() {
-    // log::debug!("poll_ifaces");
+    log::debug!("poll_ifaces");
     let guard: RwLockReadGuard<BTreeMap<usize, Arc<dyn Iface>>> = NET_DEVICES.read_irqsave();
     if guard.len() == 0 {
         warn!("poll_ifaces: No net driver found!");

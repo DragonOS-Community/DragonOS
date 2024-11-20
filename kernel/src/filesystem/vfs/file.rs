@@ -13,8 +13,8 @@ use log::error;
 use system_error::SystemError;
 
 use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
-use crate::libs::lazy_init::Lazy;
 use crate::perf::PerfEventInode;
+use crate::{arch::mm::LockedFrameAllocator, libs::lazy_init::Lazy};
 use crate::{
     arch::MMArch,
     driver::{
@@ -33,7 +33,6 @@ use crate::{
         socket::SocketInode,
     },
     process::{cred::Cred, ProcessManager},
-    syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 use crate::{filesystem::eventfd::EventFdInode, mm::page::FileMapInfo};
 use crate::{libs::align::page_align_up, mm::page::PageType};
@@ -210,7 +209,7 @@ impl PageCache {
             let buf_offset = i * MMArch::PAGE_SIZE;
             let page_index = start_page_index + i;
 
-            let page = page_manager_guard.create_page(
+            let page = page_manager_guard.create_one_page(
                 true,
                 PageType::File(FileMapInfo {
                     page_cache: self
@@ -219,22 +218,16 @@ impl PageCache {
                         .expect("failed to get self_arc of pagecache"),
                     index: page_index,
                 }),
+                PageFlags::PG_LRU,
+                &mut LockedFrameAllocator,
             )?;
 
             let mut page_guard = page.write_irqsave();
-            let paddr = page_guard.phys_address();
             unsafe {
-                core::slice::from_raw_parts_mut(
-                    MMArch::phys_2_virt(paddr).unwrap().data() as *mut u8,
-                    MMArch::PAGE_SIZE,
-                )
-                .copy_from_slice(&buf[buf_offset..buf_offset + MMArch::PAGE_SIZE]);
+                page_guard.copy_from_slice(&buf[buf_offset..buf_offset + MMArch::PAGE_SIZE]);
             }
 
-            page_guard.add_flags(PageFlags::PG_LRU);
             guard.insert(page_index, page.clone());
-
-            page_reclaimer_lock_irqsave().insert_page(paddr, &page);
         }
 
         Ok(())
@@ -294,16 +287,13 @@ impl PageCache {
             };
 
             if let Some(page) = guard.get(&page_index) {
-                let vaddr =
-                    unsafe { MMArch::phys_2_virt(page.read_irqsave().phys_address()).unwrap() };
                 let sub_buf = &mut buf[buf_offset..(buf_offset + sub_len)];
-
-                if let Ok(user_reader) =
-                    UserBufferReader::new((vaddr.data() + page_offset) as *const u8, sub_len, false)
-                {
-                    user_reader.copy_from_user(sub_buf, 0)?;
-                    ret += sub_len;
+                unsafe {
+                    sub_buf.copy_from_slice(
+                        &page.read_irqsave().as_slice()[page_offset..page_offset + sub_len],
+                    );
                 }
+                ret += sub_len;
             } else if let Some((index, count)) = not_exist.last_mut() {
                 if *index + *count == page_index {
                     *count += 1;
@@ -407,14 +397,13 @@ impl PageCache {
 
             let guard = self.pages.lock_irqsave();
             if let Some(page) = guard.get(&page_index) {
-                let vaddr =
-                    unsafe { MMArch::phys_2_virt(page.read_irqsave().phys_address()).unwrap() };
                 let sub_buf = &buf[buf_offset..(buf_offset + sub_len)];
 
-                let mut user_writer =
-                    UserBufferWriter::new((vaddr.data() + page_offset) as *mut u8, sub_len, false)?;
+                unsafe {
+                    page.write_irqsave().as_slice_mut()[page_offset..page_offset + sub_len]
+                        .copy_from_slice(sub_buf);
+                }
 
-                user_writer.copy_to_user(sub_buf, 0)?;
                 ret += sub_len;
 
                 // log::debug!(

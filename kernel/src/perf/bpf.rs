@@ -7,8 +7,8 @@ use crate::include::bindings::linux_bpf::{
     perf_event_header, perf_event_mmap_page, perf_event_type,
 };
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
-use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame};
-use crate::mm::page::{page_manager_lock_irqsave, Page, PageType};
+use crate::mm::allocator::page_frame::{PageFrameCount, PhysPageFrame};
+use crate::mm::page::{page_manager_lock_irqsave, PageFlags, PageType};
 use crate::mm::{MemoryManagementArch, PhysAddr};
 use crate::perf::util::{LostSamples, PerfProbeArgs, PerfSample, SampleHeader};
 use alloc::string::String;
@@ -232,17 +232,16 @@ impl BpfPerfEvent {
     }
     pub fn do_mmap(&self, _start: usize, len: usize, offset: usize) -> Result<()> {
         let mut data = self.data.lock();
-        // alloc page frame
-        let (phy_addr, page_count) =
-            unsafe { LockedFrameAllocator.allocate(PageFrameCount::new(len / PAGE_SIZE)) }
-                .ok_or(SystemError::ENOSPC)?;
         let mut page_manager_guard = page_manager_lock_irqsave();
-        let mut cur_phys = PhysPageFrame::new(phy_addr);
-        for i in 0..page_count.data() {
-            let page = Arc::new(Page::new(true, cur_phys.phys_address(), PageType::Other));
-            page_manager_guard.insert(&page)?;
-            data.page_cache.add_page(i, &page);
-            cur_phys = cur_phys.next();
+        let (phy_addr, pages) = page_manager_guard.create_pages(
+            true,
+            PageType::Other,
+            PageFlags::empty(),
+            &mut LockedFrameAllocator,
+            PageFrameCount::new(len / PAGE_SIZE),
+        )?;
+        for i in 0..pages.len() {
+            data.page_cache.add_page(i, pages.get(i).unwrap());
         }
         let virt_addr = unsafe { MMArch::phys_2_virt(phy_addr) }.ok_or(SystemError::EFAULT)?;
         // create mmap page

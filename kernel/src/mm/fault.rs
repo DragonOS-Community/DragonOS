@@ -22,7 +22,7 @@ use crate::mm::MemoryManagementArch;
 
 use super::{
     allocator::page_frame::FrameAllocator,
-    page::{page_reclaimer_lock_irqsave, FileMapInfo, Page, PageFlags, PageType},
+    page::{FileMapInfo, Page, PageFlags, PageType},
 };
 
 bitflags! {
@@ -308,29 +308,15 @@ impl PageFaultHandler {
         let cache_page = pfm.page.clone().unwrap();
         let mapper = &mut pfm.mapper;
 
-        let cow_page_phys = mapper.allocator_mut().allocate_one();
-        if cow_page_phys.is_none() {
+        let mut page_manager_guard = page_manager_lock_irqsave();
+        if let Ok(page) = page_manager_guard.copy_page(
+            &cache_page.read_irqsave().phys_address(),
+            mapper.allocator_mut(),
+        ) {
+            pfm.cow_page = Some(page.clone());
+        } else {
             return VmFaultReason::VM_FAULT_OOM;
         }
-        let cow_page_phys = cow_page_phys.unwrap();
-
-        let cow_page = Arc::new(Page::copy(cache_page.read_irqsave(), cow_page_phys));
-        cow_page.write_irqsave().set_shared(false);
-        pfm.cow_page = Some(cow_page.clone());
-
-        //复制PageCache内容到新的页内
-        let new_frame = MMArch::phys_2_virt(cow_page_phys).unwrap();
-        (new_frame.data() as *mut u8).copy_from_nonoverlapping(
-            MMArch::phys_2_virt(cache_page.read_irqsave().phys_address())
-                .unwrap()
-                .data() as *mut u8,
-            MMArch::PAGE_SIZE,
-        );
-
-        let mut page_manager_guard = page_manager_lock_irqsave();
-
-        // 新页加入页管理器中
-        page_manager_guard.insert(&cow_page).expect("insert failed");
 
         ret = ret.union(Self::finish_fault(pfm));
 
@@ -667,19 +653,18 @@ impl PageFaultHandler {
             .expect("failed to read file to create pagecache page");
 
             let page = page_manager_lock_irqsave()
-                .create_page(
+                .create_one_page(
                     true,
                     PageType::File(FileMapInfo {
                         page_cache: page_cache.clone(),
                         index: file_pgoff,
                     }),
+                    PageFlags::PG_LRU,
+                    allocator,
                 )
                 .expect("failed to create page");
             pfm.page = Some(page.clone());
 
-            page.write_irqsave().add_flags(PageFlags::PG_LRU);
-
-            page_reclaimer_lock_irqsave().insert_page(new_cache_page, &page);
             page_cache.add_page(file_pgoff, &page);
         }
         ret

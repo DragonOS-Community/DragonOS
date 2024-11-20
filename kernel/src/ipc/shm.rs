@@ -7,14 +7,14 @@ use crate::{
     },
     mm::{
         allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame},
-        page::{page_manager_lock_irqsave, Page, PageType},
+        page::{page_manager_lock_irqsave, PageFlags, PageType},
         PhysAddr,
     },
     process::{Pid, ProcessManager},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::PosixTimeSpec,
 };
-use alloc::{sync::Arc, vec::Vec};
+use alloc::vec::Vec;
 use core::sync::atomic::{compiler_fence, Ordering};
 use hashbrown::{HashMap, HashSet};
 use ida::IdAllocator;
@@ -159,20 +159,20 @@ impl ShmManager {
 
         // 分配共享内存页面
         let page_count = PageFrameCount::from_bytes(page_align_up(size)).unwrap();
-        let phys_page =
-            unsafe { LockedFrameAllocator.allocate(page_count) }.ok_or(SystemError::EINVAL)?;
         // 创建共享内存page，并添加到PAGE_MANAGER中
         let mut page_manager_guard = page_manager_lock_irqsave();
-        let mut cur_phys = PhysPageFrame::new(phys_page.0);
-        for _ in 0..page_count.data() {
-            let page = Arc::new(Page::new(true, cur_phys.phys_address(), PageType::Shared));
+        let (paddr, pages) = page_manager_guard.create_pages(
+            true,
+            PageType::Shared,
+            PageFlags::empty(),
+            &mut LockedFrameAllocator,
+            page_count,
+        )?;
+        for page in pages {
             page.write_irqsave().set_shm_id(shm_id);
-            page_manager_guard.insert(&page)?;
-            cur_phys = cur_phys.next();
         }
 
         // 创建共享内存信息结构体
-        let paddr = phys_page.0;
         let kern_ipc_perm = KernIpcPerm {
             id: shm_id,
             key,

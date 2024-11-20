@@ -1,10 +1,5 @@
 user_sub_dirs = apps
 
-SUBDIR_ROOTS := . 
-DIRS := . $(shell find $(SUBDIR_ROOTS) -type d)
-GARBAGE_PATTERNS := *.o *.a
-GARBAGE := $(foreach DIR,$(DIRS),$(addprefix $(DIR)/,$(GARBAGE_PATTERNS)))
-
 DADK_VERSION=$(shell dadk -V | awk 'END {print $$2}')
 # 最小的DADK版本
 MIN_DADK_VERSION = 0.1.11
@@ -65,7 +60,6 @@ copy_sysconfig: dadk_run
 
 .PHONY: clean
 clean:
-	rm -rf $(GARBAGE)
 	$(MAKE) dadk_clean
 	@list='$(user_sub_dirs)'; for subdir in $$list; do \
 		echo "Clean in dir: $$subdir";\

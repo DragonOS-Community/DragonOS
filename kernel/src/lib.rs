@@ -94,12 +94,6 @@ extern crate wait_queue_macros;
 
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
-#[cfg(feature = "backtrace")]
-use unwinding::{
-    abi::{UnwindContext, UnwindReasonCode, _Unwind_GetIP},
-    panic::UserUnwindTrace,
-};
-
 extern "C" {
     fn lookup_kallsyms(addr: u64, level: i32) -> i32;
 }
@@ -159,9 +153,9 @@ pub fn panic(info: &PanicInfo) -> ! {
     println!("Message:\n\t{}", info.message());
     #[cfg(feature = "backtrace")]
     {
-        let mut data = CallbackData { counter: 0 };
+        let mut data = hook::CallbackData { counter: 0 };
         println!("Rust Panic Backtrace:");
-        let res = unwinding::panic::begin_panic_with_hook::<Tracer>(
+        let res = unwinding::panic::begin_panic_with_hook::<hook::Tracer>(
             alloc::boxed::Box::new(()),
             &mut data,
         );
@@ -172,26 +166,31 @@ pub fn panic(info: &PanicInfo) -> ! {
         process::ProcessManager::current_pcb()
     );
     process::ProcessManager::exit(usize::MAX);
-    loop {}
 }
+#[cfg(feature = "backtrace")]
+mod hook {
+    use crate::lookup_kallsyms;
+    use unwinding::abi::{UnwindContext, UnwindReasonCode, _Unwind_GetIP};
+    use unwinding::panic::UserUnwindTrace;
 
-/// User hook for unwinding
-///
-/// During stack backtrace, the user can print the function location of the current stack frame.
-struct Tracer;
-struct CallbackData {
-    counter: usize,
-}
-impl UserUnwindTrace for Tracer {
-    type Arg = CallbackData;
+    /// User hook for unwinding
+    ///
+    /// During stack backtrace, the user can print the function location of the current stack frame.
+    pub struct Tracer;
+    pub struct CallbackData {
+        pub counter: usize,
+    }
+    impl UserUnwindTrace for Tracer {
+        type Arg = CallbackData;
 
-    fn trace(ctx: &UnwindContext<'_>, arg: *mut Self::Arg) -> UnwindReasonCode {
-        let data = unsafe { &mut *(arg) };
-        data.counter += 1;
-        let pc = _Unwind_GetIP(ctx);
-        unsafe {
-            lookup_kallsyms(pc as u64, data.counter as i32);
+        fn trace(ctx: &UnwindContext<'_>, arg: *mut Self::Arg) -> UnwindReasonCode {
+            let data = unsafe { &mut *(arg) };
+            data.counter += 1;
+            let pc = _Unwind_GetIP(ctx);
+            unsafe {
+                lookup_kallsyms(pc as u64, data.counter as i32);
+            }
+            UnwindReasonCode::NO_REASON
         }
-        UnwindReasonCode::NO_REASON
     }
 }

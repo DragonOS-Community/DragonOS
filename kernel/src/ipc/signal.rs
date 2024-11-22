@@ -445,6 +445,38 @@ pub const SIG_BLOCK: i32 = 0;
 pub const SIG_UNBLOCK: i32 = 1;
 pub const SIG_SETMASK: i32 = 2;
 
+macro_rules! iterate_thread_group {
+    ($pcb:expr,$action:expr,$($param:expr),*) => {
+        let tgid = $pcb.tgid();
+
+        // 暴力遍历每一个线程，找到相同的tgid
+        for &pid in $pcb.children_read_irqsave().iter() {
+            if let Some(child) = ProcessManager::find(pid) {
+                if child.tgid() == tgid {
+                    $action(child,$($param),*);
+                }
+            }
+        }
+    };
+}
+
+fn __set_task_blocked(pcb: &Arc<ProcessControlBlock>, new_set: &SigSet) {
+    //todo 还有一个对线程组是否为空的判断，下面对线程组组长的判断算吗？
+    if pcb.has_pending_signal() {
+        let mut newblocked = *new_set;
+        let guard = pcb.sig_info_irqsave();
+        newblocked.remove(*guard.sig_block());
+        drop(guard);
+
+        // 从主线程开始去遍历
+        if let Some(group_leader) = pcb.threads_read_irqsave().group_leader() {
+            retarget_shared_pending(group_leader, newblocked);
+        }
+    }
+    *pcb.sig_info_mut().sig_block_mut() = *new_set;
+    recalc_sigpending();
+}
+
 fn __set_current_blocked(new_set: &SigSet) {
     let pcb = ProcessManager::current_pcb();
     /*
@@ -462,6 +494,42 @@ fn __set_current_blocked(new_set: &SigSet) {
     drop(guard);
 }
 
+fn retarget_shared_pending(pcb: Arc<ProcessControlBlock>, which: SigSet) {
+    let retarget = pcb.sig_info_irqsave().sig_shared_pending().signal();
+    retarget.intersects(which);
+    if retarget.is_empty() {
+        return;
+    }
+
+    // 对于线程组中的每一个线程都要执行的函数
+    let thread_handling_function = |pcb: Arc<ProcessControlBlock>, retarget: &SigSet| {
+        if retarget.is_empty() {
+            return;
+        }
+
+        if pcb.flags().contains(ProcessFlags::EXITING) {
+            return;
+        }
+
+        let blocked = pcb.sig_info_irqsave().sig_shared_pending().signal();
+        if retarget.difference(blocked).is_empty() {
+            return;
+        }
+
+        retarget.intersects(blocked);
+        if !pcb.has_pending_signal() {
+            let guard = pcb.sig_struct_irqsave();
+            signal_wake_up(pcb.clone(), guard, false);
+        }
+        // 之前的对retarget的判断移动到最前面，因为对于当前线程的线程的处理已经结束，对于后面的线程在一开始判断retarget为空即可结束处理
+
+        // debug!("handle done");
+    };
+
+    iterate_thread_group!(pcb, thread_handling_function, &retarget);
+    // debug!("retarget_shared_pending done!");
+}
+
 /// 设置当前进程的屏蔽信号 (sig_block)
 ///
 /// ## 参数
@@ -472,18 +540,6 @@ pub fn set_current_blocked(new_set: &mut SigSet) {
         <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
     new_set.remove(to_remove);
     __set_current_blocked(new_set);
-}
-
-fn __set_task_blocked(pcb: &Arc<ProcessControlBlock>, new_set: &SigSet) {
-    //todo 还有一个对线程组是否为空的判断
-    if pcb.has_pending_signal() {
-        // let mut newblocked = SigSet::default();
-        // let guard = pcb.sig_info_irqsave();
-        // newblocked.insert(*new_set | *guard.sig_block());
-        //todo  retarget_shared_pending （未实现）
-    }
-    *pcb.sig_info_mut().sig_block_mut() = *new_set;
-    recalc_sigpending();
 }
 
 /// 设置当前进程的屏蔽信号 (sig_block)

@@ -1050,6 +1050,14 @@ impl ProcessControlBlock {
     pub fn set_nsproxy(&self, nsprsy: NsProxy) {
         *self.nsproxy.write() = nsprsy;
     }
+
+    pub fn children_read_irqsave(&self) -> RwLockReadGuard<Vec<Pid>> {
+        self.children.read_irqsave()
+    }
+
+    pub fn threads_read_irqsave(&self) -> RwLockReadGuard<ThreadInfo> {
+        self.thread.read_irqsave()
+    }
 }
 
 impl Drop for ProcessControlBlock {
@@ -1079,6 +1087,12 @@ pub struct ThreadInfo {
     vfork_done: Option<Arc<Completion>>,
     /// 线程组的组长
     group_leader: Weak<ProcessControlBlock>,
+}
+
+impl Default for ThreadInfo {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ThreadInfo {

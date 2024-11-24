@@ -11,5 +11,5 @@
   "executables": true,
   "features": "-mmx,-sse,+soft-float",
   "disable-redzone": true,
-  "panic-strategy": "unwind"
+  "panic-strategy": "abort"
 }

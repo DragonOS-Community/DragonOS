@@ -15,7 +15,7 @@ members = [
 ]
 
 [features]
-default = ["kvm", "fatfs", "fatfs-secure", "static_keys_test"]
+default = ["backtrace", "kvm", "fatfs", "fatfs-secure", "static_keys_test"]
 # 内核栈回溯
 backtrace = ["dep:unwinding"]
 # kvm

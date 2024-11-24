@@ -6,7 +6,7 @@ GARBAGE := $(foreach DIR,$(DIRS),$(addprefix $(DIR)/,$(GARBAGE_PATTERNS)))
 DIR_LIB=libs
 lib_patterns := *.a
 LIB_FILES := $(foreach DIR,$(DIR_LIB),$(addprefix $(DIR)/,$(lib_patterns)))
-EXT_FEATURES =
+
 
 # unwind/backtrace related
 UNWIND_ENABLE ?= yes
@@ -16,10 +16,7 @@ RUSTFLAGS_UNWIND =
 ifeq ($(UNWIND_ENABLE), yes)
 	CFLAGS_UNWIND = -funwind-tables
 	LDFLAGS_UNWIND = --eh-frame-hdr
-	RUSTFLAGS_UNWIND = -Cforce-unwind-tables -Clink-arg=-Wl,eh_frame.ld
-	EXT_FEATURES += backtrace
-else
-	RUSTFLAGS_UNWIND = -Cpanic=abort
+	RUSTFLAGS_UNWIND = -Cforce-unwind-tables -Clink-arg=-Wl,eh_frame.ld -Cpanic=abort
 endif
 
 RUSTFLAGS += $(RUSTFLAGS_UNWIND)
@@ -41,10 +38,7 @@ kernel_subdirs := debug
 
 
 kernel_rust:
-	RUSTFLAGS="$(RUSTFLAGS)" \
-	cargo +nightly-2024-11-05 $(CARGO_ZBUILD) build --release \
-	--target $(TARGET_JSON) \
-	--features "$(EXT_FEATURES)"
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 $(CARGO_ZBUILD) build --release --target $(TARGET_JSON)
 
 
 all: kernel
@@ -133,3 +127,7 @@ clean:
 		cd $$subdir && $(MAKE) clean;\
 		cd .. ;\
 	done
+
+.PHONY: check
+check:
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 $(CARGO_ZBUILD) check --workspace --message-format=json --target $(TARGET_JSON)

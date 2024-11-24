@@ -33,13 +33,7 @@ endif
 
 .PHONY: check
 check: ECHO
-# @echo "Checking kernel... ARCH=$(ARCH)"
-# @exit 1
-ifeq ($(ARCH), x86_64)
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 check --workspace $(CARGO_ZBUILD) --message-format=json --target ./src/$(TARGET_JSON)
-else ifeq ($(ARCH), riscv64)
-	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 check --workspace $(CARGO_ZBUILD) --message-format=json --target ./src/$(TARGET_JSON)
-endif
+	$(MAKE) -C src check ARCH=$(ARCH)
 
 test:
 # 测试内核库

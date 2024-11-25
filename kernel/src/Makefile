@@ -14,11 +14,9 @@ CFLAGS_UNWIND =
 LDFLAGS_UNWIND =
 RUSTFLAGS_UNWIND =
 ifeq ($(UNWIND_ENABLE), yes)
-    CFLAGS_UNWIND = -funwind-tables
-ifeq ($(ARCH), x86_64)
-    LDFLAGS_UNWIND = --eh-frame-hdr
-    RUSTFLAGS_UNWIND = -Cforce-unwind-tables -Clink-arg=-Wl,eh_frame.ld
-endif
+	CFLAGS_UNWIND = -funwind-tables
+	LDFLAGS_UNWIND = --eh-frame-hdr
+	RUSTFLAGS_UNWIND = -Cforce-unwind-tables -Clink-arg=-Wl,eh_frame.ld -Cpanic=unwind
 endif
 
 RUSTFLAGS += $(RUSTFLAGS_UNWIND)
@@ -58,7 +56,6 @@ ECHO:
 	@echo "$@"
 
 $(kernel_subdirs): ECHO
-
 	$(MAKE) -C $@ all CFLAGS="$(CFLAGS)" ASFLAGS="$(ASFLAGS)"  kernel_root_path="$(shell pwd)"
 
 kernel: $(kernel_subdirs) kernel_rust
@@ -66,7 +63,26 @@ kernel: $(kernel_subdirs) kernel_rust
 __link_riscv64_kernel:
 	@echo "Linking kernel..."
 	$(LD) -b elf64-littleriscv -z muldefs $(LDFLAGS_UNWIND) -o kernel $(shell find . -name "*.o") ../target/riscv64gc-unknown-none-elf/release/libdragonos_kernel.a -T arch/riscv64/link.ld --no-relax
+	# 生成kallsyms
+	current_dir=$(pwd)
+
+	@dbg='debug';for x in $$dbg; do \
+		cd $$x;\
+		$(MAKE) generate_kallsyms kernel_root_path="$(shell pwd)"||exit 1;\
+		cd ..;\
+	done
+
+# 重新链接
+	@echo "Re-Linking kernel..."
+	@echo $(shell find . -name "*.o")
+	$(LD) -b elf64-littleriscv -z muldefs $(LDFLAGS_UNWIND) -o kernel $(shell find . -name "*.o") ../target/riscv64gc-unknown-none-elf/release/libdragonos_kernel.a ./debug/kallsyms.o  -T arch/riscv64/link.ld --no-relax
+	@echo "Generating kernel ELF file..."
+
+ifeq ($(UNWIND_ENABLE), yes)
+	$(OBJCOPY) -I elf64-littleriscv -O elf64-littleriscv kernel ../../bin/kernel/kernel.elf
+else
 	$(OBJCOPY) -I elf64-littleriscv -O elf64-littleriscv -R ".eh_frame" kernel ../../bin/kernel/kernel.elf
+endif
 	@rm kernel
 	$(MAKE) __dragon_stub PAYLOAD_ELF="$(shell pwd)/../../bin/kernel/kernel.elf"
 
@@ -111,3 +127,7 @@ clean:
 		cd $$subdir && $(MAKE) clean;\
 		cd .. ;\
 	done
+
+.PHONY: check
+check:
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 $(CARGO_ZBUILD) check --workspace --message-format=json --target $(TARGET_JSON)

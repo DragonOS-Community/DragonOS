@@ -117,12 +117,19 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         }
         _ => {}
     }
-    syscall_return!(
-        Syscall::handle(syscall_num, &args, frame).unwrap_or_else(|e| e.to_posix_errno() as usize)
-            as u64,
-        frame,
-        show
-    );
+    let mut syscall_handle = || -> u64 {
+        #[cfg(feature = "backtrace")]
+        {
+            Syscall::catch_handle(syscall_num, &args, frame)
+                .unwrap_or_else(|e| e.to_posix_errno() as usize) as u64
+        }
+        #[cfg(not(feature = "backtrace"))]
+        {
+            Syscall::handle(syscall_num, &args, frame)
+                .unwrap_or_else(|e| e.to_posix_errno() as usize) as u64
+        }
+    };
+    syscall_return!(syscall_handle(), frame, show);
 }
 
 /// 系统调用初始化

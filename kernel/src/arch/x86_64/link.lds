@@ -26,6 +26,7 @@ SECTIONS
 	. = ALIGN(32768);
 	. += KERNEL_VMA;
 	text_start_pa = .;
+	__executable_start = .;
 	.text (text_start_pa): AT(text_start_pa - KERNEL_VMA)
 	{
 		_text = .;
@@ -37,6 +38,7 @@ SECTIONS
 		*(.text.*)
 
 		_etext = .;
+		__etext = .;
 	}
 	. = ALIGN(32768);
 	data_start_pa = .;
@@ -59,6 +61,7 @@ SECTIONS
 		*(.rodata.*)
 		*(.note.gnu.*)
 		*(.fixup)
+		*(.gcc_except_table .gcc_except_table.*)
 		_erodata = .;
 	}
 

@@ -168,11 +168,13 @@ impl PageManager {
         }
 
         let mut cur_phys = PhysPageFrame::new(start_paddr);
-        let mut ret = Vec::new();
+        let mut ret: Vec<Arc<Page>> = Vec::new();
         for _ in 0..count.data() {
             let page = Page::new(shared, cur_phys.phys_address(), page_type.clone(), flags);
             if let Err(e) = self.insert(&page) {
-                unsafe { deallocate_page_frames(PhysPageFrame::new(start_paddr), count) };
+                for insert_page in ret {
+                    self.remove_page(&insert_page.read_irqsave().phys_addr);
+                }
                 return Err(e);
             }
             ret.push(page);
@@ -199,12 +201,14 @@ impl PageManager {
     ) -> Result<Arc<Page>, SystemError> {
         let old_page = self.get(old_phys).ok_or(SystemError::EINVAL)?;
         let paddr = unsafe { allocator.allocate_one().ok_or(SystemError::ENOMEM)? };
-        let deallocate_page = |_: &SystemError| unsafe {
-            deallocate_page_frames(PhysPageFrame::new(paddr), PageFrameCount::ONE)
-        };
 
-        let page = Page::copy(old_page.read_irqsave(), paddr).inspect_err(deallocate_page)?;
-        self.insert(&page).inspect_err(deallocate_page)?;
+        assert!(!self.contains(&paddr), "phys page: {paddr:?} already exist");
+
+        let page = Page::copy(old_page.read_irqsave(), paddr)
+            .inspect_err(|_| unsafe { allocator.free_one(paddr) })?;
+
+        self.insert(&page)?;
+
         Ok(page)
     }
 }

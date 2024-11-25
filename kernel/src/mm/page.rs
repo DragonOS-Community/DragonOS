@@ -644,6 +644,22 @@ impl InnerPage {
         )
         .copy_from_slice(slice);
     }
+
+    pub unsafe fn truncate(&mut self, len: usize) {
+        if len > MMArch::PAGE_SIZE {
+            return;
+        }
+
+        let vaddr = unsafe { MMArch::phys_2_virt(self.phys_address()).unwrap() };
+
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                (vaddr.data() + len) as *mut u8,
+                MMArch::PAGE_SIZE - len,
+            )
+            .fill(0)
+        };
+    }
 }
 
 impl Drop for InnerPage {

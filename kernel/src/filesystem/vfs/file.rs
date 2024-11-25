@@ -431,15 +431,8 @@ impl PageCache {
             let last_page_index = page_num - 1;
             let last_len = len - last_page_index * MMArch::PAGE_SIZE;
             if let Some(page) = guard.get(&last_page_index) {
-                let vaddr =
-                    unsafe { MMArch::phys_2_virt(page.read_irqsave().phys_address()).unwrap() };
-
                 unsafe {
-                    core::slice::from_raw_parts_mut(
-                        (vaddr.data() + last_len) as *mut u8,
-                        MMArch::PAGE_SIZE - last_len,
-                    )
-                    .fill(0)
+                    page.write_irqsave().truncate(last_len);
                 };
             } else {
                 return Err(SystemError::EIO);

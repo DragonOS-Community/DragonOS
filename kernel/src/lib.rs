@@ -37,8 +37,6 @@
 #[macro_use]
 extern crate std;
 
-use core::panic::PanicInfo;
-
 /// 导出x86_64架构相关的代码，命名为arch模块
 #[macro_use]
 mod arch;
@@ -94,104 +92,6 @@ extern crate wait_queue_macros;
 
 use crate::mm::allocator::kernel_allocator::KernelAllocator;
 
-#[cfg(feature = "backtrace")]
-use unwinding::{
-    abi::{UnwindContext, UnwindReasonCode, _Unwind_GetIP},
-    panic::UserUnwindTrace,
-};
-
-extern "C" {
-    fn lookup_kallsyms(addr: u64, level: i32) -> i32;
-}
-
 // 声明全局的分配器
 #[cfg_attr(not(test), global_allocator)]
 pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator;
-
-/// 全局的panic处理函数
-///
-/// How to use unwinding lib:
-///
-/// ```
-/// pub fn test_unwind() {
-///    struct UnwindTest;
-///    impl Drop for UnwindTest {
-///        fn drop(&mut self) {
-///            println!("Drop UnwindTest");
-///        }
-///    }
-///    let res1 = unwinding::panic::catch_unwind(|| {
-///        let _unwind_test = UnwindTest;
-///        println!("Test panic...");
-///        panic!("Test panic");
-///    });
-///    assert_eq!(res1.is_err(), true);
-///    let res2 = unwinding::panic::catch_unwind(|| {
-///        let _unwind_test = UnwindTest;
-///        println!("Test no panic...");
-///        0
-///    });
-///    assert_eq!(res2.is_ok(), true);
-/// }
-/// ```
-///
-#[cfg(target_os = "none")]
-#[panic_handler]
-#[no_mangle]
-pub fn panic(info: &PanicInfo) -> ! {
-    use log::error;
-
-    error!("Kernel Panic Occurred.");
-
-    match info.location() {
-        Some(loc) => {
-            println!(
-                "Location:\n\tFile: {}\n\tLine: {}, Column: {}",
-                loc.file(),
-                loc.line(),
-                loc.column()
-            );
-        }
-        None => {
-            println!("No location info");
-        }
-    }
-    println!("Message:\n\t{}", info.message());
-    #[cfg(feature = "backtrace")]
-    {
-        let mut data = CallbackData { counter: 0 };
-        println!("Rust Panic Backtrace:");
-        let res = unwinding::panic::begin_panic_with_hook::<Tracer>(
-            alloc::boxed::Box::new(()),
-            &mut data,
-        );
-        log::error!("panic unreachable: {:?}", res.0);
-    }
-    println!(
-        "Current PCB:\n\t{:?}",
-        process::ProcessManager::current_pcb()
-    );
-    process::ProcessManager::exit(usize::MAX);
-    loop {}
-}
-
-/// User hook for unwinding
-///
-/// During stack backtrace, the user can print the function location of the current stack frame.
-struct Tracer;
-struct CallbackData {
-    counter: usize,
-}
-impl UserUnwindTrace for Tracer {
-    type Arg = CallbackData;
-
-    fn trace(ctx: &UnwindContext<'_>, arg: *mut Self::Arg) -> UnwindReasonCode {
-        let data = unsafe { &mut *(arg) };
-        data.counter += 1;
-        let pc = _Unwind_GetIP(ctx);
-        unsafe {
-            lookup_kallsyms(pc as u64, data.counter as i32);
-        }
-        UnwindReasonCode::NO_REASON
-    }
-}

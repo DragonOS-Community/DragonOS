@@ -61,6 +61,7 @@ SECTIONS
 		*(.rodata.*)
 		*(.note.gnu.*)
 		*(.fixup)
+		*(.gcc_except_table .gcc_except_table.*)
 		_erodata = .;
 	}
 

@@ -16,7 +16,7 @@ RUSTFLAGS_UNWIND =
 ifeq ($(UNWIND_ENABLE), yes)
 	CFLAGS_UNWIND = -funwind-tables
 	LDFLAGS_UNWIND = --eh-frame-hdr
-	RUSTFLAGS_UNWIND = -Cforce-unwind-tables -Clink-arg=-Wl,eh_frame.ld
+	RUSTFLAGS_UNWIND = -Cforce-unwind-tables -Clink-arg=-Wl,eh_frame.ld -Cpanic=unwind
 endif
 
 RUSTFLAGS += $(RUSTFLAGS_UNWIND)
@@ -127,3 +127,7 @@ clean:
 		cd $$subdir && $(MAKE) clean;\
 		cd .. ;\
 	done
+
+.PHONY: check
+check:
+	RUSTFLAGS="$(RUSTFLAGS)" cargo +nightly-2024-11-05 $(CARGO_ZBUILD) check --workspace --message-format=json --target $(TARGET_JSON)

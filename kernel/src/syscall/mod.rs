@@ -1,6 +1,5 @@
 use core::{
     ffi::{c_int, c_void},
-    hint::spin_loop,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -11,7 +10,6 @@ use crate::{
     libs::{futex::constant::FutexFlag, rand::GRandFlags},
     mm::{page::PAGE_4K_SIZE, syscall::MremapFlags},
     net::syscall::MsgHdr,
-    process,
     process::{
         fork::KernelCloneArgs,
         resource::{RLimit64, RUsage},
@@ -79,6 +77,7 @@ impl Syscall {
     /// 系统调用分发器，用于分发系统调用。
     ///
     /// 与[handle]不同，这个函数会捕获系统调用处理函数的panic，返回错误码。
+    #[cfg(feature = "backtrace")]
     pub fn catch_handle(
         syscall_num: usize,
         args: &[usize],
@@ -86,7 +85,7 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         let res = unwinding::panic::catch_unwind(|| Self::handle(syscall_num, args, frame));
         res.unwrap_or_else(|_| loop {
-            spin_loop();
+            core::hint::spin_loop();
         })
     }
     /// @brief 系统调用分发器，用于分发系统调用。

@@ -2,6 +2,8 @@
 //! 然后在当前目录执行 `cargo expand --bin unified-init-expand`
 //! 就可以看到把proc macro展开后的代码了
 #![no_std]
+#![allow(internal_features)]
+#![feature(lang_items)]
 
 fn main() {
     todo!()
@@ -13,6 +15,10 @@ fn main() {
 pub fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
+
+#[cfg(target_os = "none")]
+#[lang = "eh_personality"]
+unsafe extern "C" fn eh_personality() {}
 
 #[cfg(test)]
 mod tests {

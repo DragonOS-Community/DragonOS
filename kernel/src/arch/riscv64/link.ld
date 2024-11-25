@@ -62,6 +62,7 @@ SECTIONS
 		_rodata = .;	
 		*(.rodata)
 		*(.rodata.*)
+		*(.gcc_except_table .gcc_except_table.*)
 		_erodata = .;
 	}
 

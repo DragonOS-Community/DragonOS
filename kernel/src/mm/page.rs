@@ -171,7 +171,10 @@ impl PageManager {
         let mut ret = Vec::new();
         for _ in 0..count.data() {
             let page = Page::new(shared, cur_phys.phys_address(), page_type.clone(), flags);
-            self.insert(&page)?;
+            if let Err(e) = self.insert(&page) {
+                unsafe { deallocate_page_frames(PhysPageFrame::new(start_paddr), count) };
+                return Err(e);
+            }
             ret.push(page);
             cur_phys = cur_phys.next();
         }
@@ -196,8 +199,12 @@ impl PageManager {
     ) -> Result<Arc<Page>, SystemError> {
         let old_page = self.get(old_phys).ok_or(SystemError::EINVAL)?;
         let paddr = unsafe { allocator.allocate_one().ok_or(SystemError::ENOMEM)? };
-        let page = Page::copy(old_page.read_irqsave(), paddr)?;
-        self.insert(&page)?;
+        let deallocate_page = |_: &SystemError| unsafe {
+            deallocate_page_frames(PhysPageFrame::new(paddr), PageFrameCount::ONE)
+        };
+
+        let page = Page::copy(old_page.read_irqsave(), paddr).inspect_err(deallocate_page)?;
+        self.insert(&page).inspect_err(deallocate_page)?;
         Ok(page)
     }
 }

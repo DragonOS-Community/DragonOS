@@ -6,6 +6,7 @@ use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode};
 use crate::include::bindings::linux_bpf::{
     perf_event_header, perf_event_mmap_page, perf_event_type,
 };
+use crate::libs::align::page_align_up;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::allocator::page_frame::{PageFrameCount, PhysPageFrame};
 use crate::mm::page::{page_manager_lock_irqsave, PageFlags, PageType};
@@ -238,7 +239,7 @@ impl BpfPerfEvent {
             PageType::Other,
             PageFlags::empty(),
             &mut LockedFrameAllocator,
-            PageFrameCount::new(len / PAGE_SIZE),
+            PageFrameCount::new(page_align_up(len) / PAGE_SIZE),
         )?;
         for i in 0..pages.len() {
             data.page_cache.add_page(i, pages.get(i).unwrap());

@@ -171,6 +171,8 @@ impl Iterator for VirtPageFrameIter {
 pub struct PageFrameCount(usize);
 
 impl PageFrameCount {
+    pub const ONE: PageFrameCount = PageFrameCount(1);
+
     // @brief 初始化PageFrameCount
     pub const fn new(count: usize) -> Self {
         return Self(count);

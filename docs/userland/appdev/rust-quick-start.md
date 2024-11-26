@@ -2,19 +2,14 @@
 
 ## 编译环境
 
-&emsp;&emsp;DragonOS与Linux具有部分二进制兼容性，因此可以使用Linux的Rust编译器进行编译，但是需要进行一些配置：
-
-您可以参考DragonOS的`tools/bootstrap.sh`中，`initialize_userland_musl_toolchain()`函数的实现，进行配置。
-或者，只要运行一下bootstrap.sh就可以了。
-
-主要是因为DragonOS还不支持动态链接，但是默认的工具链里面，包含了动态链接解释器相关的代码，因此像脚本内那样，进行替换就能运行。
+&emsp;&emsp;DragonOS与Linux具有部分二进制兼容性，因此可以使用Linux的Rust编译器进行编译。
 
 ## 配置项目
 
 ### 从模板创建
 
 :::{note}
-该功能需要dadk 0.1.4及以上版本方能支持
+该功能需要dadk 0.2.0及以上版本方能支持。旧版的请参考历史版本的DragonOS文档。
 :::
 
 1. 使用DragonOS的tools目录下的`bootstrap.sh`脚本初始化环境
@@ -30,7 +25,7 @@ cargo generate --git https://git.mirrors.dragonos.org/DragonOS-Community/Rust-Ap
 ```
 
 4. 使用`cargo run`来运行项目
-5. 在DragonOS的`user/dadk/config`目录下，使用`dadk new`命令，创建编译配置,安装到DragonOS的`/`目录下。 
+5. 在DragonOS的`user/dadk/config`目录下，参考模版[userapp_config.toml](https://github.com/DragonOS-Community/DADK/blob/main/dadk-config/templates/config/userapp_config.toml)，创建编译配置,安装到DragonOS的`/`目录下。 
 (在dadk的编译命令选项处，请使用Makefile里面的`make install`配置进行编译、安装)
 6. 编译DragonOS即可安装
 

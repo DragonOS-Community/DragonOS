@@ -284,7 +284,7 @@ impl InnerPageCache {
 
         let mut reclaimer = page_reclaimer_lock_irqsave();
         for (_i, page) in self.pages.drain_filter(|index, _page| *index >= page_num) {
-            let _ = reclaimer.remove_page(&page.read_irqsave().phys_address());
+            let _ = reclaimer.remove_page(&page.phys_address());
         }
 
         if page_num > 0 {
@@ -308,7 +308,7 @@ impl Drop for InnerPageCache {
         log::debug!("page cache drop");
         let mut page_manager = page_manager_lock_irqsave();
         for page in self.pages.values() {
-            page_manager.remove_page(&page.read_irqsave().phys_address());
+            page_manager.remove_page(&page.phys_address());
         }
     }
 }

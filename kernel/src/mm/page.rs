@@ -95,7 +95,7 @@ impl PageManager {
     }
 
     fn insert(&mut self, page: &Arc<Page>) -> Result<Arc<Page>, SystemError> {
-        let phys = page.read_irqsave().phys_address();
+        let phys = page.phys_address();
         if !self.phys2page.contains_key(&phys) {
             self.phys2page.insert(phys, page.clone());
             Ok(page.clone())
@@ -433,6 +433,8 @@ bitflags! {
 #[derive(Debug)]
 pub struct Page {
     inner: RwLock<InnerPage>,
+    /// 页面所在物理地址
+    phys_addr: PhysAddr,
 }
 
 impl Page {
@@ -452,6 +454,7 @@ impl Page {
         let inner = InnerPage::new(shared, phys_addr, page_type, flags);
         let page = Arc::new(Self {
             inner: RwLock::new(inner),
+            phys_addr,
         });
         if page.read_irqsave().flags == PageFlags::PG_LRU {
             page_reclaimer_lock_irqsave().insert_page(phys_addr, &page);
@@ -487,7 +490,13 @@ impl Page {
         }
         Ok(Arc::new(Self {
             inner: RwLock::new(inner),
+            phys_addr: new_phys,
         }))
+    }
+
+    #[inline(always)]
+    pub fn phys_address(&self) -> PhysAddr {
+        self.phys_addr
     }
 
     pub fn read_irqsave(&self) -> RwLockReadGuard<InnerPage> {
@@ -514,7 +523,7 @@ pub struct InnerPage {
     vma_set: HashSet<Arc<LockedVMA>>,
     /// 标志
     flags: PageFlags,
-    /// 页所在的物理页帧号
+    /// 页面所在物理地址
     phys_addr: PhysAddr,
     /// 页面类型
     page_type: PageType,
@@ -618,7 +627,7 @@ impl InnerPage {
     }
 
     #[inline(always)]
-    pub fn phys_address(&self) -> PhysAddr {
+    fn phys_address(&self) -> PhysAddr {
         self.phys_addr
     }
 
@@ -654,7 +663,7 @@ impl InnerPage {
             return;
         }
 
-        let vaddr = unsafe { MMArch::phys_2_virt(self.phys_address()).unwrap() };
+        let vaddr = unsafe { MMArch::phys_2_virt(self.phys_addr).unwrap() };
 
         unsafe {
             core::slice::from_raw_parts_mut(
@@ -1412,7 +1421,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             )
             .ok()?;
         drop(page_manager_guard);
-        let phys = page.read_irqsave().phys_address();
+        let phys = page.phys_address();
         return self.map_phys(virt, phys, flags);
     }
 

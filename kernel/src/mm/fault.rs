@@ -309,10 +309,9 @@ impl PageFaultHandler {
         let mapper = &mut pfm.mapper;
 
         let mut page_manager_guard = page_manager_lock_irqsave();
-        if let Ok(page) = page_manager_guard.copy_page(
-            &cache_page.read_irqsave().phys_address(),
-            mapper.allocator_mut(),
-        ) {
+        if let Ok(page) =
+            page_manager_guard.copy_page(&cache_page.phys_address(), mapper.allocator_mut())
+        {
             pfm.cow_page = Some(page.clone());
         } else {
             return VmFaultReason::VM_FAULT_OOM;
@@ -594,7 +593,7 @@ impl PageFaultHandler {
             if let Some(page) = page_cache.lock_irqsave().get_page(pgoff) {
                 let page_guard = page.read_irqsave();
                 if page_guard.flags().contains(PageFlags::PG_UPTODATE) {
-                    let phys = page_guard.phys_address();
+                    let phys = page.phys_address();
 
                     let address =
                         VirtAddr::new(addr.data() + ((pgoff - start_pgoff) << MMArch::PAGE_SHIFT));
@@ -697,7 +696,7 @@ impl PageFaultHandler {
             cache_page.expect("no cache_page in PageFaultMessage")
         };
 
-        let page_phys = page_to_map.read_irqsave().phys_address();
+        let page_phys = page_to_map.phys_address();
 
         mapper.map_phys(address, page_phys, vma_guard.flags());
         page_to_map.write_irqsave().insert_vma(pfm.vma());

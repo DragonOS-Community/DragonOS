@@ -65,7 +65,7 @@ UBOOT_VERSION="v2023.10"
 RISCV64_UBOOT_PATH="arch/riscv64/u-boot-${UBOOT_VERSION}-riscv64"
 
 
-DISK_NAME="disk-${ARCH}.img"
+DISK_NAME="disk-image-${ARCH}.img"
 
 QEMU=qemu-system-${ARCH}
 QEMU_DISK_IMAGE="../bin/${DISK_NAME}"

@@ -591,7 +591,7 @@ impl PageFaultHandler {
                 << MMArch::PAGE_SHIFT);
 
         for pgoff in start_pgoff..=end_pgoff {
-            if let Some(page) = page_cache.get_page(pgoff) {
+            if let Some(page) = page_cache.lock_irqsave().get_page(pgoff) {
                 let page_guard = page.read_irqsave();
                 if page_guard.flags().contains(PageFlags::PG_UPTODATE) {
                     let phys = page_guard.phys_address();
@@ -625,7 +625,7 @@ impl PageFaultHandler {
         let mapper = &mut pfm.mapper;
         let mut ret = VmFaultReason::empty();
 
-        if let Some(page) = page_cache.get_page(file_pgoff) {
+        if let Some(page) = page_cache.lock_irqsave().get_page(file_pgoff) {
             // TODO 异步从磁盘中预读页面进PageCache
 
             // 直接将PageCache中的页面作为要映射的页面
@@ -665,7 +665,7 @@ impl PageFaultHandler {
                 .expect("failed to create page");
             pfm.page = Some(page.clone());
 
-            page_cache.add_page(file_pgoff, &page);
+            page_cache.lock_irqsave().add_page(file_pgoff, &page);
         }
         ret
     }

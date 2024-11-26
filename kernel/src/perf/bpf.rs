@@ -242,7 +242,9 @@ impl BpfPerfEvent {
             PageFrameCount::new(page_align_up(len) / PAGE_SIZE),
         )?;
         for i in 0..pages.len() {
-            data.page_cache.add_page(i, pages.get(i).unwrap());
+            data.page_cache
+                .lock_irqsave()
+                .add_page(i, pages.get(i).unwrap());
         }
         let virt_addr = unsafe { MMArch::phys_2_virt(phy_addr) }.ok_or(SystemError::EFAULT)?;
         // create mmap page

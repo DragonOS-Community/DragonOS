@@ -389,7 +389,7 @@ impl PageReclaimer {
 
         if unmap {
             // 删除页面
-            page_cache.remove_page(page_index);
+            page_cache.lock_irqsave().remove_page(page_index);
             page_manager_lock_irqsave().remove_page(&paddr);
         } else {
             // 清除标记

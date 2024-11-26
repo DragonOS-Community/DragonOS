@@ -13,7 +13,6 @@ use log::error;
 use system_error::SystemError;
 
 use super::{Dirent, FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
-use crate::perf::PerfEventInode;
 use crate::{arch::mm::LockedFrameAllocator, libs::lazy_init::Lazy};
 use crate::{
     arch::MMArch,
@@ -36,6 +35,7 @@ use crate::{
 };
 use crate::{filesystem::eventfd::EventFdInode, mm::page::FileMapInfo};
 use crate::{libs::align::page_align_up, mm::page::PageType};
+use crate::{libs::spinlock::SpinLockGuard, perf::PerfEventInode};
 
 /// 文件私有信息的枚举类型
 #[derive(Debug, Clone)]
@@ -134,65 +134,37 @@ impl FileMode {
 /// 页面缓存
 #[derive(Debug)]
 pub struct PageCache {
-    pages: SpinLock<HashMap<usize, Arc<Page>>>,
+    inner: SpinLock<InnerPageCache>,
     inode: Lazy<Weak<dyn IndexNode>>,
-    self_ref: Weak<PageCache>,
 }
 
-impl Drop for PageCache {
-    fn drop(&mut self) {
-        log::debug!("page cache drop");
-        let guard = self.pages.lock_irqsave();
-        let mut page_manager = page_manager_lock_irqsave();
-        for page in guard.values() {
-            page_manager.remove_page(&page.read_irqsave().phys_address());
+#[derive(Debug)]
+pub struct InnerPageCache {
+    pages: HashMap<usize, Arc<Page>>,
+    page_cache_ref: Weak<PageCache>,
+}
+
+impl InnerPageCache {
+    pub fn new(page_cache_ref: Weak<PageCache>) -> InnerPageCache {
+        Self {
+            pages: HashMap::new(),
+            page_cache_ref,
         }
     }
-}
 
-impl PageCache {
-    pub fn new(inode: Option<Weak<dyn IndexNode>>) -> Arc<PageCache> {
-        Arc::new_cyclic(|weak| Self {
-            pages: SpinLock::new(HashMap::new()),
-            inode: {
-                let v: Lazy<Weak<dyn IndexNode>> = Lazy::new();
-                if let Some(inode) = inode {
-                    v.init(inode);
-                }
-                v
-            },
-            self_ref: weak.clone(),
-        })
-    }
-
-    pub fn inode(&self) -> Option<Weak<dyn IndexNode>> {
-        self.inode.try_get().cloned()
-    }
-
-    pub fn add_page(&self, offset: usize, page: &Arc<Page>) {
-        let mut guard = self.pages.lock_irqsave();
-        guard.insert(offset, page.clone());
+    pub fn add_page(&mut self, offset: usize, page: &Arc<Page>) {
+        self.pages.insert(offset, page.clone());
     }
 
     pub fn get_page(&self, offset: usize) -> Option<Arc<Page>> {
-        let guard = self.pages.lock_irqsave();
-        guard.get(&offset).cloned()
+        self.pages.get(&offset).cloned()
     }
 
-    pub fn remove_page(&self, offset: usize) -> Option<Arc<Page>> {
-        let mut guard = self.pages.lock_irqsave();
-        guard.remove(&offset)
+    pub fn remove_page(&mut self, offset: usize) -> Option<Arc<Page>> {
+        self.pages.remove(&offset)
     }
 
-    pub fn set_inode(&self, inode: Weak<dyn IndexNode>) -> Result<(), SystemError> {
-        if self.inode.initialized() {
-            return Err(SystemError::EINVAL);
-        }
-        self.inode.init(inode);
-        Ok(())
-    }
-
-    pub fn create_pages(&self, start_page_index: usize, buf: &[u8]) -> Result<(), SystemError> {
+    fn create_pages(&mut self, start_page_index: usize, buf: &[u8]) -> Result<(), SystemError> {
         assert!(buf.len() % MMArch::PAGE_SIZE == 0);
 
         let page_num = buf.len() / MMArch::PAGE_SIZE;
@@ -202,7 +174,6 @@ impl PageCache {
             return Ok(());
         }
 
-        let mut guard = self.pages.lock_irqsave();
         let mut page_manager_guard = page_manager_lock_irqsave();
 
         for i in 0..page_num {
@@ -213,7 +184,7 @@ impl PageCache {
                 true,
                 PageType::File(FileMapInfo {
                     page_cache: self
-                        .self_ref
+                        .page_cache_ref
                         .upgrade()
                         .expect("failed to get self_arc of pagecache"),
                     index: page_index,
@@ -227,7 +198,7 @@ impl PageCache {
                 page_guard.copy_from_slice(&buf[buf_offset..buf_offset + MMArch::PAGE_SIZE]);
             }
 
-            guard.insert(page_index, page.clone());
+            self.add_page(page_index, &page);
         }
 
         Ok(())
@@ -244,8 +215,14 @@ impl PageCache {
     ///
     /// - `Ok(usize)` 成功读取的长度
     /// - `Err(SystemError)` 失败返回错误码
-    pub fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let inode = self.inode.upgrade().unwrap();
+    pub fn read(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let inode = self
+            .page_cache_ref
+            .upgrade()
+            .unwrap()
+            .inode
+            .upgrade()
+            .unwrap();
         let file_size = inode.metadata().unwrap().size;
 
         let len = if offset < file_size as usize {
@@ -262,8 +239,6 @@ impl PageCache {
 
         let start_page_index = offset >> MMArch::PAGE_SHIFT;
         let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_index;
-
-        let guard = self.pages.lock_irqsave();
 
         let mut buf_offset = 0;
         let mut ret = 0;
@@ -286,7 +261,7 @@ impl PageCache {
                 MMArch::PAGE_SIZE
             };
 
-            if let Some(page) = guard.get(&page_index) {
+            if let Some(page) = self.get_page(page_index) {
                 let sub_buf = &mut buf[buf_offset..(buf_offset + sub_len)];
                 unsafe {
                     sub_buf.copy_from_slice(
@@ -307,9 +282,8 @@ impl PageCache {
             buf_offset += sub_len;
         }
 
-        drop(guard);
-
         for (page_index, count) in not_exist {
+            // TODO 这里使用buffer避免多次读取磁盘，将来引入异步IO直接写入页面，减少内存开销和拷贝
             let mut page_buf = vec![0u8; MMArch::PAGE_SIZE * count];
             inode.read_sync(page_index * MMArch::PAGE_SIZE, page_buf.as_mut())?;
 
@@ -353,7 +327,7 @@ impl PageCache {
     ///
     /// - `Ok(usize)` 成功读取的长度
     /// - `Err(SystemError)` 失败返回错误码
-    pub fn write(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+    pub fn write(&mut self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
         let len = buf.len();
         if len == 0 {
             return Ok(0);
@@ -386,17 +360,14 @@ impl PageCache {
                 MMArch::PAGE_SIZE
             };
 
-            let guard = self.pages.lock_irqsave();
-            let exist = guard.get(&page_index).is_some();
-            drop(guard);
+            let exist = self.get_page(page_index).is_some();
 
             if !exist {
                 let page_buf = vec![0u8; MMArch::PAGE_SIZE];
                 self.create_pages(page_index, &page_buf)?;
             }
 
-            let guard = self.pages.lock_irqsave();
-            if let Some(page) = guard.get(&page_index) {
+            if let Some(page) = self.get_page(page_index) {
                 let sub_buf = &buf[buf_offset..(buf_offset + sub_len)];
 
                 unsafe {
@@ -418,19 +389,18 @@ impl PageCache {
         Ok(ret)
     }
 
-    pub fn resize(&self, len: usize) -> Result<(), SystemError> {
+    pub fn resize(&mut self, len: usize) -> Result<(), SystemError> {
         let page_num = page_align_up(len) / MMArch::PAGE_SIZE;
 
-        let mut guard = self.pages.lock_irqsave();
         let mut reclaimer = page_reclaimer_lock_irqsave();
-        for (_i, page) in guard.drain_filter(|index, _page| *index >= page_num) {
+        for (_i, page) in self.pages.drain_filter(|index, _page| *index >= page_num) {
             let _ = reclaimer.remove_page(&page.read_irqsave().phys_address());
         }
 
         if page_num > 0 {
             let last_page_index = page_num - 1;
             let last_len = len - last_page_index * MMArch::PAGE_SIZE;
-            if let Some(page) = guard.get(&last_page_index) {
+            if let Some(page) = self.get_page(last_page_index) {
                 unsafe {
                     page.write_irqsave().truncate(last_len);
                 };
@@ -440,6 +410,47 @@ impl PageCache {
         }
 
         Ok(())
+    }
+}
+
+impl Drop for InnerPageCache {
+    fn drop(&mut self) {
+        log::debug!("page cache drop");
+        let mut page_manager = page_manager_lock_irqsave();
+        for page in self.pages.values() {
+            page_manager.remove_page(&page.read_irqsave().phys_address());
+        }
+    }
+}
+
+impl PageCache {
+    pub fn new(inode: Option<Weak<dyn IndexNode>>) -> Arc<PageCache> {
+        Arc::new_cyclic(|weak| Self {
+            inner: SpinLock::new(InnerPageCache::new(weak.clone())),
+            inode: {
+                let v: Lazy<Weak<dyn IndexNode>> = Lazy::new();
+                if let Some(inode) = inode {
+                    v.init(inode);
+                }
+                v
+            },
+        })
+    }
+
+    pub fn inode(&self) -> Option<Weak<dyn IndexNode>> {
+        self.inode.try_get().cloned()
+    }
+
+    pub fn set_inode(&self, inode: Weak<dyn IndexNode>) -> Result<(), SystemError> {
+        if self.inode.initialized() {
+            return Err(SystemError::EINVAL);
+        }
+        self.inode.init(inode);
+        Ok(())
+    }
+
+    pub fn lock_irqsave(&self) -> SpinLockGuard<InnerPageCache> {
+        self.inner.lock_irqsave()
     }
 }
 

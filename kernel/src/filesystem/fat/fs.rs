@@ -1449,7 +1449,7 @@ impl IndexNode for LockedFATInode {
 
         let page_cache = self.0.lock().page_cache.clone();
         if let Some(page_cache) = page_cache {
-            let r = page_cache.read(offset, &mut buf[0..len]);
+            let r = page_cache.lock_irqsave().read(offset, &mut buf[0..len]);
             // self.0.lock_irqsave().update_metadata();
             return r;
         } else {
@@ -1469,7 +1469,7 @@ impl IndexNode for LockedFATInode {
 
         let page_cache = self.0.lock().page_cache.clone();
         if let Some(page_cache) = page_cache {
-            let write_len = page_cache.write(offset, buf)?;
+            let write_len = page_cache.lock_irqsave().write(offset, buf)?;
             let mut guard = self.0.lock();
             let old_size = guard.metadata.size;
             guard.update_metadata(Some(core::cmp::max(old_size, (offset + write_len) as i64)));
@@ -1562,7 +1562,7 @@ impl IndexNode for LockedFATInode {
     }
     fn resize(&self, len: usize) -> Result<(), SystemError> {
         if let Some(page_cache) = self.page_cache() {
-            return page_cache.resize(len);
+            return page_cache.lock_irqsave().resize(len);
         }
 
         let mut guard: SpinLockGuard<FATInode> = self.0.lock();

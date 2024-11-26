@@ -14,7 +14,7 @@ use alloc::{
 
 use crate::driver::base::block::gendisk::GenDisk;
 use crate::driver::base::device::device_number::DeviceNumber;
-use crate::filesystem::vfs::file::PageCache;
+use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;

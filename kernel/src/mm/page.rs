@@ -17,7 +17,7 @@ use lru::LruCache;
 use crate::{
     arch::{interrupt::ipi::send_ipi, mm::LockedFrameAllocator, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
-    filesystem::vfs::{file::PageCache, FilePrivateData},
+    filesystem::{page_cache::PageCache, vfs::FilePrivateData},
     init::initcall::INITCALL_CORE,
     ipc::shm::{shm_manager_lock, ShmId},
     libs::{

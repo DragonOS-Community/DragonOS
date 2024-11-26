@@ -14,7 +14,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::ROOT_INODE,
+    filesystem::{page_cache::PageCache, vfs::ROOT_INODE},
     libs::{
         casting::DowncastArc,
         rwlock::RwLock,
@@ -24,10 +24,8 @@ use crate::{
 };
 
 use super::{
-    file::{FileMode, PageCache},
-    syscall::ModeType,
-    utils::DName,
-    FilePrivateData, FileSystem, FileType, IndexNode, InodeId, Magic, SuperBlock,
+    file::FileMode, syscall::ModeType, utils::DName, FilePrivateData, FileSystem, FileType,
+    IndexNode, InodeId, Magic, SuperBlock,
 };
 
 const MOUNTFS_BLOCK_SIZE: u64 = 512;

@@ -24,13 +24,10 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-use self::{
-    core::generate_inode_id,
-    file::{FileMode, PageCache},
-    syscall::ModeType,
-    utils::DName,
-};
+use self::{core::generate_inode_id, file::FileMode, syscall::ModeType, utils::DName};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
+
+use super::page_cache::PageCache;
 
 /// vfs容许的最大的路径名称长度
 pub const MAX_PATHLEN: usize = 1024;

@@ -2,7 +2,8 @@ mod bpf;
 mod kprobe;
 mod util;
 
-use crate::filesystem::vfs::file::{File, FileMode, PageCache};
+use crate::filesystem::page_cache::PageCache;
+use crate::filesystem::vfs::file::{File, FileMode};
 use crate::filesystem::vfs::syscall::ModeType;
 use crate::filesystem::vfs::{
     FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Metadata, SuperBlock,

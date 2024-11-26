@@ -1,7 +1,7 @@
 use super::{PerfEventOps, Result};
 use crate::arch::mm::LockedFrameAllocator;
 use crate::arch::MMArch;
-use crate::filesystem::vfs::file::PageCache;
+use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode};
 use crate::include::bindings::linux_bpf::{
     perf_event_header, perf_event_mmap_page, perf_event_type,

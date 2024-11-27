@@ -144,7 +144,7 @@ impl TcpSocket {
         match result {
             Ok(()) | Err(EINPROGRESS) => {
                 init.iface().unwrap().poll();
-            },
+            }
             _ => {}
         }
 
@@ -172,17 +172,15 @@ impl TcpSocket {
         let mut write_state = self.inner.write();
         let inner = write_state.take().expect("Tcp Inner is None");
         let (replace, result) = match inner {
-            Inner::Connecting(conn) => {
-                conn.into_result()
-            }
+            Inner::Connecting(conn) => conn.into_result(),
             Inner::Established(es) => {
                 log::warn!("TODO: check new established");
                 (Inner::Established(es), Ok(()))
-            }, // TODO check established
+            } // TODO check established
             _ => {
                 log::warn!("TODO: connecting socket error options");
                 (inner, Err(EINVAL))
-            }, // TODO socket error options
+            } // TODO socket error options
         };
         write_state.replace(replace);
         result
@@ -207,9 +205,7 @@ impl TcpSocket {
     pub fn try_send(&self, buf: &[u8]) -> Result<usize, SystemError> {
         // TODO: add nonblock check of connecting socket
         let sent = match self.inner.read().as_ref().expect("Tcp Inner is None") {
-            Inner::Established(inner) => {
-                inner.send_slice(buf)
-            }
+            Inner::Established(inner) => inner.send_slice(buf),
             _ => Err(EINVAL),
         };
         self.inner.read().as_ref().unwrap().iface().unwrap().poll();
@@ -219,9 +215,7 @@ impl TcpSocket {
     fn update_events(&self) -> bool {
         match self.inner.read().as_ref().expect("Tcp Inner is None") {
             Inner::Init(_) => false,
-            Inner::Connecting(connecting) => {
-                connecting.update_io_events()
-            },
+            Inner::Connecting(connecting) => connecting.update_io_events(),
             Inner::Established(established) => {
                 established.update_io_events(&self.pollee);
                 false
@@ -277,13 +271,13 @@ impl Socket for TcpSocket {
             return Err(EINVAL);
         };
         self.start_connect(endpoint)?; // Only Nonblock or error will return error.
-        
+
         return loop {
             match self.check_connect() {
-                Err(EAGAIN_OR_EWOULDBLOCK) => {},
+                Err(EAGAIN_OR_EWOULDBLOCK) => {}
                 result => break result,
             }
-        }
+        };
     }
 
     fn poll(&self) -> usize {
@@ -301,11 +295,7 @@ impl Socket for TcpSocket {
             loop {
                 match self.try_accept() {
                     Err(EAGAIN_OR_EWOULDBLOCK) => {
-                        wq_wait_event_interruptible!(
-                            self.wait_queue, 
-                            self.in_notify(),
-                            {}
-                        )?;
+                        wq_wait_event_interruptible!(self.wait_queue, self.in_notify(), {})?;
                     }
                     result => break result,
                 }
@@ -339,9 +329,7 @@ impl Socket for TcpSocket {
     }
 
     fn close(&self) -> Result<(), SystemError> {
-        let inner = self.inner
-            .write()
-            .take().unwrap();
+        let inner = self.inner.write().take().unwrap();
 
         match inner {
             // complete connecting socket close logic
@@ -350,7 +338,7 @@ impl Socket for TcpSocket {
                 conn.close();
                 conn.release();
                 Ok(())
-            },
+            }
             Inner::Established(es) => {
                 es.close();
                 es.release();

@@ -15,9 +15,9 @@ members = [
 ]
 
 [features]
-default = ["backtrace", "kvm", "fatfs", "fatfs-secure"]
+default = ["backtrace", "kvm", "fatfs", "fatfs-secure", "static_keys_test"]
 # 内核栈回溯
-backtrace = []
+backtrace = ["dep:unwinding"]
 # kvm
 kvm = []
 
@@ -27,6 +27,7 @@ driver_ps2_mouse = []
 
 # kprobe
 kprobe_test = []
+static_keys_test = []
 
 # 运行时依赖项
 [dependencies]
@@ -67,9 +68,17 @@ lru = "0.12.3"
 
 rbpf = { path = "crates/rbpf" }
 printf-compat = { version = "0.1.1", default-features = false }
+
+static-keys = "=0.6.1"
+unwinding = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/unwinding", rev = "4eb845da62", default-features = false,  optional = true, features = [
+    "unwinder",
+    "fde-gnu-eh-frame-hdr",
+    "panic",
+    "personality"
+]}
+
 # target为x86_64时，使用下面的依赖
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-mini-backtrace = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/mini-backtrace.git", rev = "e0b1d90940" }
 multiboot2 = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/multiboot2", rev = "05739aab40" }
 raw-cpuid = "11.0.1"
 x86 = "=0.52.0"

@@ -7,7 +7,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 
-#define FIFO_PATH "/bin/test_fifo"
+#define FIFO_PATH "/bin/test_fifo" // 使用 /tmp 目录避免权限问题
 
 // 信号处理函数
 void sigpipe_handler(int signo) {
@@ -19,9 +19,9 @@ void sigpipe_handler(int signo) {
 void test_fifo_write(const char *scenario_desc, int nonblocking) {
     int fd;
     char *data = "Hello, FIFO!";
-    printf("\n--- Testing: %s ---\n", scenario_desc);
+    printf("\n--- Testing: %s (nonblocking=%d) ---\n", scenario_desc, nonblocking);
 
-    // 设置 O_NONBLOCK 标志
+    // 设置写模式和非阻塞模式标志
     int flags = O_WRONLY;
     if (nonblocking) {
         flags |= O_NONBLOCK;
@@ -45,6 +45,8 @@ void test_fifo_write(const char *scenario_desc, int nonblocking) {
             printf("Result: Write failed with EPIPE (no readers available).\n");
         } else if (errno == ENXIO) {
             printf("Result: Write failed with ENXIO (FIFO never had readers).\n");
+        } else if (errno == EAGAIN) {
+            printf("Result: Write failed with EAGAIN (nonblocking write, pipe full or no readers).\n");
         } else {
             perror("Write failed with an unexpected error");
         }
@@ -56,13 +58,15 @@ void test_fifo_write(const char *scenario_desc, int nonblocking) {
     close(fd);
 }
 
-void run_tests() {
+void test_case1(int nonblocking) {
+    // Case 1: No readers (FIFO never had readers)
+    test_fifo_write("No readers (FIFO never had readers)", nonblocking);
+}
+
+void test_case2(int nonblocking) {
     pid_t reader_pid;
 
-    // Case 1: Test with no readers (FIFO never had readers)
-    test_fifo_write("No readers (FIFO never had readers)", 1);
-
-    // Case 2: Test with a reader that disconnects
+    // Case 2: Reader exists but disconnects
     reader_pid = fork();
     if (reader_pid == 0) {
         // 子进程充当读端
@@ -77,10 +81,14 @@ void run_tests() {
     }
 
     sleep(5); // 确保读端已打开
-    test_fifo_write("Reader exists but disconnects", 0);
+    test_fifo_write("Reader exists but disconnects", nonblocking);
     waitpid(reader_pid, NULL, 0); // 等待读端子进程退出
+}
 
-    // Case 3: Test with an active reader
+void test_case3(int nonblocking) {
+    pid_t reader_pid;
+
+    // Case 3: Active reader exists
     reader_pid = fork();
     if (reader_pid == 0) {
         // 子进程充当读端
@@ -95,7 +103,7 @@ void run_tests() {
     }
 
     sleep(1); // 确保读端已打开
-    test_fifo_write("Active reader exists", 0);
+    test_fifo_write("Active reader exists", nonblocking);
     waitpid(reader_pid, NULL, 0); // 等待读端子进程退出
 }
 
@@ -109,8 +117,17 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    // 运行测试
-    run_tests();
+    // 测试阻塞模式下的三种情况
+    printf("========== Testing Blocking Mode ==========\n");
+    test_case1(0); // 阻塞模式下没有读端
+    test_case2(0); // 阻塞模式下读端断开
+    test_case3(0); // 阻塞模式下读端存在
+
+    // 测试非阻塞模式下的三种情况
+    // printf("\n========== Testing Nonblocking Mode ==========\n");
+    // test_case1(1); // 非阻塞模式下没有读端
+    // test_case2(1); // 非阻塞模式下读端断开
+    // test_case3(1); // 非阻塞模式下读端存在
 
     // 删除 FIFO
     unlink(FIFO_PATH);

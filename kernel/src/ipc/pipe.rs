@@ -1,4 +1,7 @@
+use core::sync::atomic::compiler_fence;
+
 use crate::{
+    arch::ipc::signal::{SigCode, Signal},
     filesystem::vfs::{
         core::generate_inode_id, file::FileMode, syscall::ModeType, FilePrivateData, FileSystem,
         FileType, IndexNode, Metadata,
@@ -8,7 +11,7 @@ use crate::{
         wait_queue::WaitQueue,
     },
     net::event_poll::{EPollEventType, EPollItem, EventPoll},
-    process::ProcessState,
+    process::{ProcessManager, ProcessState},
     sched::SchedMode,
     time::PosixTimeSpec,
 };
@@ -19,6 +22,8 @@ use alloc::{
     vec::Vec,
 };
 use system_error::SystemError;
+
+use super::signal_types::{SigInfo, SigType};
 
 /// 我们设定pipe_buff的总大小为1024字节
 const PIPE_BUFF_SIZE: usize = 1024;
@@ -59,6 +64,7 @@ pub struct InnerPipeInode {
     metadata: Metadata,
     reader: u32,
     writer: u32,
+    had_reader: bool,
     epitems: SpinLock<LinkedList<Arc<EPollItem>>>,
 }
 
@@ -131,6 +137,7 @@ impl LockedPipeInode {
             valid_cnt: 0,
             read_pos: 0,
             write_pos: 0,
+            had_reader: false,
             data: [0; PIPE_BUFF_SIZE],
 
             metadata: Metadata {
@@ -278,15 +285,31 @@ impl IndexNode for LockedPipeInode {
         mut data: SpinLockGuard<FilePrivateData>,
         mode: &crate::filesystem::vfs::file::FileMode,
     ) -> Result<(), SystemError> {
+        let accmode = mode.accmode();
         let mut guard = self.inner.lock();
         // 不能以读写方式打开管道
-        if mode.contains(FileMode::O_RDWR) {
+        if accmode==FileMode::O_RDWR.bits() {
             return Err(SystemError::EACCES);
         }
-        if mode.contains(FileMode::O_RDONLY) {
+        else if accmode==FileMode::O_RDONLY.bits() {
             guard.reader += 1;
+            guard.had_reader = true;
+            println!(
+                "FIFO:     pipe try open in read mode with reader pid:{:?}",
+                ProcessManager::current_pid()
+            );
         }
-        if mode.contains(FileMode::O_WRONLY) {
+        else if accmode==FileMode::O_WRONLY.bits() {
+            println!(
+                "FIFO:     pipe try open in write mode with {} reader, writer pid:{:?}",
+                guard.reader,
+                ProcessManager::current_pid()
+            );
+            if guard.reader == 0 {
+                if mode.contains(FileMode::O_NONBLOCK) {
+                    return Err(SystemError::ENXIO);
+                }
+            }
             guard.writer += 1;
         }
 
@@ -311,10 +334,11 @@ impl IndexNode for LockedPipeInode {
         } else {
             return Err(SystemError::EBADF);
         }
+        let accmode = mode.accmode();
         let mut guard = self.inner.lock();
 
         // 写端关闭
-        if mode.contains(FileMode::O_WRONLY) {
+        if accmode==FileMode::O_WRONLY.bits() {
             assert!(guard.writer > 0);
             guard.writer -= 1;
             // 如果已经没有写端了，则唤醒读端
@@ -325,7 +349,7 @@ impl IndexNode for LockedPipeInode {
         }
 
         // 读端关闭
-        if mode.contains(FileMode::O_RDONLY) {
+        if accmode==FileMode::O_RDONLY.bits() {
             assert!(guard.reader > 0);
             guard.reader -= 1;
             // 如果已经没有写端了，则唤醒读端
@@ -361,7 +385,35 @@ impl IndexNode for LockedPipeInode {
         let mut inode = self.inner.lock();
 
         if inode.reader == 0 {
-            // TODO: 如果已经没有读端存在了，则向写端进程发送SIGPIPE信号
+            if !inode.had_reader {
+                // 如果从未有读端，直接返回 ENXIO，无论是否阻塞模式
+                return Err(SystemError::ENXIO);
+            } else {
+                // 如果曾经有读端，现在已关闭
+                match mode.contains(FileMode::O_NONBLOCK) {
+                    true => {
+                        // 非阻塞模式，直接返回 EPIPE
+                        return Err(SystemError::EPIPE);
+                    }
+                    false => {
+                        let sig = Signal::SIGPIPE;
+                        let mut info = SigInfo::new(
+                            sig,
+                            0,
+                            SigCode::Kernel,
+                            SigType::Kill(ProcessManager::current_pid()),
+                        );
+                        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+                        let _retval = sig
+                            .send_signal_info(Some(&mut info), ProcessManager::current_pid())
+                            .map(|x| x as usize);
+
+                        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                        return Err(SystemError::EPIPE);
+                    }
+                }
+            }
         }
 
         // 如果管道空间不够

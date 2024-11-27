@@ -293,16 +293,16 @@ impl IndexNode for LockedPipeInode {
         } else if accmode == FileMode::O_RDONLY.bits() {
             guard.reader += 1;
             guard.had_reader = true;
-            println!(
-                "FIFO:     pipe try open in read mode with reader pid:{:?}",
-                ProcessManager::current_pid()
-            );
+            // println!(
+            //     "FIFO:     pipe try open in read mode with reader pid:{:?}",
+            //     ProcessManager::current_pid()
+            // );
         } else if accmode == FileMode::O_WRONLY.bits() {
-            println!(
-                "FIFO:     pipe try open in write mode with {} reader, writer pid:{:?}",
-                guard.reader,
-                ProcessManager::current_pid()
-            );
+            // println!(
+            //     "FIFO:     pipe try open in write mode with {} reader, writer pid:{:?}",
+            //     guard.reader,
+            //     ProcessManager::current_pid()
+            // );
             if guard.reader == 0 {
                 if mode.contains(FileMode::O_NONBLOCK) {
                     return Err(SystemError::ENXIO);

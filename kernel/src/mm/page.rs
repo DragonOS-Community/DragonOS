@@ -124,12 +124,11 @@ impl PageManager {
     /// - `Err(SystemError)`: 错误码
     pub fn create_one_page(
         &mut self,
-        shared: bool,
         page_type: PageType,
         flags: PageFlags,
         allocator: &mut dyn FrameAllocator,
     ) -> Result<Arc<Page>, SystemError> {
-        self.create_pages(shared, page_type, flags, allocator, PageFrameCount::new(1))?
+        self.create_pages(page_type, flags, allocator, PageFrameCount::ONE)?
             .1
             .first()
             .ok_or(SystemError::ENOMEM)
@@ -152,7 +151,6 @@ impl PageManager {
     /// - `Err(SystemError)`: 错误码
     pub fn create_pages(
         &mut self,
-        shared: bool,
         page_type: PageType,
         flags: PageFlags,
         allocator: &mut dyn FrameAllocator,
@@ -170,7 +168,7 @@ impl PageManager {
         let mut cur_phys = PhysPageFrame::new(start_paddr);
         let mut ret: Vec<Arc<Page>> = Vec::new();
         for _ in 0..count.data() {
-            let page = Page::new(shared, cur_phys.phys_address(), page_type.clone(), flags);
+            let page = Page::new(cur_phys.phys_address(), page_type.clone(), flags);
             if let Err(e) = self.insert(&page) {
                 for insert_page in ret {
                     self.remove_page(&insert_page.read_irqsave().phys_addr);
@@ -427,6 +425,7 @@ bitflags! {
         const PG_PRIVATE = 1 << 15;
         const PG_RECLAIM = 1 << 18;
         const PG_SWAPBACKED = 1 << 19;
+        const PG_UNEVICTABLE = 1 << 20;
     }
 }
 
@@ -450,8 +449,8 @@ impl Page {
     /// ## 返回值
     ///
     /// - `Arc<Page>`: 新页面
-    fn new(shared: bool, phys_addr: PhysAddr, page_type: PageType, flags: PageFlags) -> Arc<Page> {
-        let inner = InnerPage::new(shared, phys_addr, page_type, flags);
+    fn new(phys_addr: PhysAddr, page_type: PageType, flags: PageFlags) -> Arc<Page> {
+        let inner = InnerPage::new(phys_addr, page_type, flags);
         let page = Arc::new(Self {
             inner: RwLock::new(inner),
             phys_addr,
@@ -477,10 +476,9 @@ impl Page {
         old_guard: RwLockReadGuard<InnerPage>,
         new_phys: PhysAddr,
     ) -> Result<Arc<Page>, SystemError> {
-        let shared = old_guard.shared();
         let page_type = old_guard.page_type().clone();
         let flags = *old_guard.flags();
-        let inner = InnerPage::new(shared, new_phys, page_type, flags);
+        let inner = InnerPage::new(new_phys, page_type, flags);
         unsafe {
             let old_vaddr =
                 MMArch::phys_2_virt(old_guard.phys_address()).ok_or(SystemError::EFAULT)?;
@@ -511,14 +509,6 @@ impl Page {
 #[derive(Debug)]
 /// 物理页面信息
 pub struct InnerPage {
-    /// 映射计数
-    map_count: usize,
-    /// 是否为共享页
-    shared: bool,
-    /// 映射计数为0时，是否可回收
-    free_when_zero: bool,
-    /// 共享页id（如果是共享页）
-    shm_id: Option<ShmId>,
     /// 映射到当前page的VMA
     vma_set: HashSet<Arc<LockedVMA>>,
     /// 标志
@@ -530,13 +520,8 @@ pub struct InnerPage {
 }
 
 impl InnerPage {
-    pub fn new(shared: bool, phys_addr: PhysAddr, page_type: PageType, flags: PageFlags) -> Self {
-        let dealloc_when_zero = !shared;
+    pub fn new(phys_addr: PhysAddr, page_type: PageType, flags: PageFlags) -> Self {
         Self {
-            map_count: 0,
-            shared,
-            free_when_zero: dealloc_when_zero,
-            shm_id: None,
             vma_set: HashSet::new(),
             flags,
             phys_addr,
@@ -547,30 +532,20 @@ impl InnerPage {
     /// 将vma加入anon_vma
     pub fn insert_vma(&mut self, vma: Arc<LockedVMA>) {
         self.vma_set.insert(vma);
-        self.map_count += 1;
     }
 
     /// 将vma从anon_vma中删去
     pub fn remove_vma(&mut self, vma: &LockedVMA) {
         self.vma_set.remove(vma);
-        self.map_count -= 1;
     }
 
     /// 判断当前物理页是否能被回
     pub fn can_deallocate(&self) -> bool {
-        self.map_count == 0 && self.free_when_zero
+        self.map_count() == 0 && !self.flags.contains(PageFlags::PG_UNEVICTABLE)
     }
 
     pub fn shared(&self) -> bool {
-        self.shared
-    }
-
-    pub fn set_shared(&mut self, shared: bool) {
-        self.shared = shared;
-    }
-
-    pub fn shm_id(&self) -> Option<ShmId> {
-        self.shm_id
+        self.map_count() > 1
     }
 
     pub fn page_cache(&self) -> Option<Arc<PageCache>> {
@@ -588,14 +563,6 @@ impl InnerPage {
         self.page_type = page_type;
     }
 
-    pub fn set_shm_id(&mut self, shm_id: ShmId) {
-        self.shm_id = Some(shm_id);
-    }
-
-    pub fn set_dealloc_when_zero(&mut self, dealloc_when_zero: bool) {
-        self.free_when_zero = dealloc_when_zero;
-    }
-
     #[inline(always)]
     pub fn vma_set(&self) -> &HashSet<Arc<LockedVMA>> {
         &self.vma_set
@@ -603,7 +570,7 @@ impl InnerPage {
 
     #[inline(always)]
     pub fn map_count(&self) -> usize {
-        self.map_count
+        self.vma_set.len()
     }
 
     #[inline(always)]
@@ -677,11 +644,12 @@ impl InnerPage {
 
 impl Drop for InnerPage {
     fn drop(&mut self) {
-        assert!(self.map_count == 0, "page drop when map count is non-zero");
-        if self.shared {
-            if let Some(shm_id) = self.shm_id {
-                shm_manager_lock().free_id(&shm_id);
-            }
+        assert!(
+            self.map_count() == 0,
+            "page drop when map count is non-zero"
+        );
+        if let PageType::Shm(shm_id) = self.page_type {
+            shm_manager_lock().free_id(&shm_id);
         }
         unsafe {
             deallocate_page_frames(PhysPageFrame::new(self.phys_addr), PageFrameCount::new(1))
@@ -689,13 +657,15 @@ impl Drop for InnerPage {
     }
 }
 
+/// 页面类型，包含额外的页面信息
 #[derive(Debug, Clone)]
 pub enum PageType {
-    Uninit,
-    Anonymous,
+    /// 普通页面，不含额外信息
+    Normal,
+    /// 文件映射页，含文件映射相关信息
     File(FileMapInfo),
-    Shared,
-    Other,
+    /// 共享内存页，记录ShmId
+    Shm(ShmId),
 }
 
 #[derive(Debug, Clone)]
@@ -1414,8 +1384,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             page_manager_lock_irqsave();
         let page = page_manager_guard
             .create_one_page(
-                false,
-                PageType::Uninit,
+                PageType::Normal,
                 PageFlags::empty(),
                 &mut self.frame_allocator,
             )

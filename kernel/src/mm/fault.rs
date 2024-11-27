@@ -653,7 +653,6 @@ impl PageFaultHandler {
 
             let page = page_manager_lock_irqsave()
                 .create_one_page(
-                    true,
                     PageType::File(FileMapInfo {
                         page_cache: page_cache.clone(),
                         index: file_pgoff,

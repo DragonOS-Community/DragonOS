@@ -16,11 +16,10 @@ use crate::{
         FilePrivateData,
     },
     ipc::shm::{shm_manager_lock, IPC_PRIVATE},
-    libs::align::page_align_up,
-    libs::spinlock::SpinLock,
+    libs::{align::page_align_up, spinlock::SpinLock},
     mm::{
         allocator::page_frame::{PageFrameCount, PhysPageFrame, VirtPageFrame},
-        page::{page_manager_lock_irqsave, EntryFlags, PageFlushAll},
+        page::{page_manager_lock_irqsave, EntryFlags, PageFlushAll, PageType},
         syscall::ProtFlags,
         ucontext::{AddressSpace, VMA},
         VirtAddr, VmFlags,
@@ -443,13 +442,18 @@ impl Syscall {
         // 如果物理页的shm_id为None，代表不是共享页
         let mut page_manager_guard = page_manager_lock_irqsave();
         let page = page_manager_guard.get(&paddr).ok_or(SystemError::EINVAL)?;
-        let shm_id = page.read_irqsave().shm_id().ok_or(SystemError::EINVAL)?;
+        let page_guard = page.read_irqsave();
+        let shm_id = if let PageType::Shm(shm_id) = page_guard.page_type() {
+            shm_id
+        } else {
+            return Err(SystemError::EINVAL);
+        };
         drop(page_manager_guard);
 
         // 获取对应共享页管理信息
         let mut shm_manager_guard = shm_manager_lock();
         let kernel_shm = shm_manager_guard
-            .get_mut(&shm_id)
+            .get_mut(shm_id)
             .ok_or(SystemError::EINVAL)?;
         // 更新最后一次断开连接时间
         kernel_shm.update_dtim();

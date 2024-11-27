@@ -161,16 +161,12 @@ impl ShmManager {
         let page_count = PageFrameCount::from_bytes(page_align_up(size)).unwrap();
         // 创建共享内存page，并添加到PAGE_MANAGER中
         let mut page_manager_guard = page_manager_lock_irqsave();
-        let (paddr, pages) = page_manager_guard.create_pages(
-            true,
-            PageType::Shared,
+        let (paddr, _page) = page_manager_guard.create_pages(
+            PageType::Shm(shm_id),
             PageFlags::empty(),
             &mut LockedFrameAllocator,
             page_count,
         )?;
-        for page in pages {
-            page.write_irqsave().set_shm_id(shm_id);
-        }
 
         // 创建共享内存信息结构体
         let kern_ipc_perm = KernIpcPerm {
@@ -324,7 +320,7 @@ impl ShmManager {
             // 设置共享内存物理页当映射计数等于0时可被回收
             for _ in 0..count.data() {
                 let page = page_manager_guard.get_unwrap(&cur_phys.phys_address());
-                page.write_irqsave().set_dealloc_when_zero(true);
+                page.write_irqsave().remove_flags(PageFlags::PG_UNEVICTABLE);
 
                 cur_phys = cur_phys.next();
             }

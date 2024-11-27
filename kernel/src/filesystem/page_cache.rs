@@ -71,7 +71,6 @@ impl InnerPageCache {
             let page_index = start_page_index + i;
 
             let page = page_manager_guard.create_one_page(
-                true,
                 PageType::File(FileMapInfo {
                     page_cache: self
                         .page_cache_ref

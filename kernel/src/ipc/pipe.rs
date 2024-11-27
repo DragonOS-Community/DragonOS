@@ -288,18 +288,16 @@ impl IndexNode for LockedPipeInode {
         let accmode = mode.accmode();
         let mut guard = self.inner.lock();
         // 不能以读写方式打开管道
-        if accmode==FileMode::O_RDWR.bits() {
+        if accmode == FileMode::O_RDWR.bits() {
             return Err(SystemError::EACCES);
-        }
-        else if accmode==FileMode::O_RDONLY.bits() {
+        } else if accmode == FileMode::O_RDONLY.bits() {
             guard.reader += 1;
             guard.had_reader = true;
             println!(
                 "FIFO:     pipe try open in read mode with reader pid:{:?}",
                 ProcessManager::current_pid()
             );
-        }
-        else if accmode==FileMode::O_WRONLY.bits() {
+        } else if accmode == FileMode::O_WRONLY.bits() {
             println!(
                 "FIFO:     pipe try open in write mode with {} reader, writer pid:{:?}",
                 guard.reader,
@@ -338,7 +336,7 @@ impl IndexNode for LockedPipeInode {
         let mut guard = self.inner.lock();
 
         // 写端关闭
-        if accmode==FileMode::O_WRONLY.bits() {
+        if accmode == FileMode::O_WRONLY.bits() {
             assert!(guard.writer > 0);
             guard.writer -= 1;
             // 如果已经没有写端了，则唤醒读端
@@ -349,7 +347,7 @@ impl IndexNode for LockedPipeInode {
         }
 
         // 读端关闭
-        if accmode==FileMode::O_RDONLY.bits() {
+        if accmode == FileMode::O_RDONLY.bits() {
             assert!(guard.reader > 0);
             guard.reader -= 1;
             // 如果已经没有写端了，则唤醒读端

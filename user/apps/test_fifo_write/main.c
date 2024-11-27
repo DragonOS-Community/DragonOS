@@ -118,16 +118,16 @@ int main() {
     }
 
     // 测试阻塞模式下的三种情况
-    printf("========== Testing Blocking Mode ==========\n");
-    test_case1(0); // 阻塞模式下没有读端
-    test_case2(0); // 阻塞模式下读端断开
-    test_case3(0); // 阻塞模式下读端存在
+    // printf("========== Testing Blocking Mode ==========\n");
+    // test_case1(0); // 阻塞模式下没有读端
+    // test_case2(0); // 阻塞模式下读端断开
+    // test_case3(0); // 阻塞模式下读端存在
 
     // 测试非阻塞模式下的三种情况
-    // printf("\n========== Testing Nonblocking Mode ==========\n");
-    // test_case1(1); // 非阻塞模式下没有读端
-    // test_case2(1); // 非阻塞模式下读端断开
-    // test_case3(1); // 非阻塞模式下读端存在
+    printf("\n========== Testing Nonblocking Mode ==========\n");
+    test_case1(1); // 非阻塞模式下没有读端
+    test_case2(1); // 非阻塞模式下读端断开
+    test_case3(1); // 非阻塞模式下读端存在
 
     // 删除 FIFO
     unlink(FIFO_PATH);

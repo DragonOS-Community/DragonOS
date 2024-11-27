@@ -303,10 +303,8 @@ impl IndexNode for LockedPipeInode {
             //     guard.reader,
             //     ProcessManager::current_pid()
             // );
-            if guard.reader == 0 {
-                if mode.contains(FileMode::O_NONBLOCK) {
-                    return Err(SystemError::ENXIO);
-                }
+            if guard.reader == 0 && mode.contains(FileMode::O_NONBLOCK) {
+                return Err(SystemError::ENXIO);
             }
             guard.writer += 1;
         }

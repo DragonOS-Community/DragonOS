@@ -163,7 +163,7 @@ impl ShmManager {
         let mut page_manager_guard = page_manager_lock_irqsave();
         let (paddr, _page) = page_manager_guard.create_pages(
             PageType::Shm(shm_id),
-            PageFlags::empty(),
+            PageFlags::PG_UNEVICTABLE,
             &mut LockedFrameAllocator,
             page_count,
         )?;

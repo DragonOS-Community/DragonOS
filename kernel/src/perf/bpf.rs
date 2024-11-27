@@ -236,7 +236,7 @@ impl BpfPerfEvent {
         let mut page_manager_guard = page_manager_lock_irqsave();
         let (phy_addr, pages) = page_manager_guard.create_pages(
             PageType::Normal,
-            PageFlags::empty(),
+            PageFlags::PG_UNEVICTABLE,
             &mut LockedFrameAllocator,
             PageFrameCount::new(page_align_up(len) / PAGE_SIZE),
         )?;

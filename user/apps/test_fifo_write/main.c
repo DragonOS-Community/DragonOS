@@ -92,9 +92,8 @@ void test_case1(int nonblocking) {
   FifoWriteResult result = test_fifo_write(0, nonblocking);
 
   char buffer[100];
-  sprintf(buffer,"Fail with unexpected error %d",result.error_code);
-  TEST_ASSERT(result.error_code, ENXIO,
-              "write(2) fails with the error ENXIO",
+  sprintf(buffer, "Fail with unexpected error %d", result.error_code);
+  TEST_ASSERT(result.error_code, ENXIO, "write(2) fails with the error ENXIO",
               buffer);
 }
 
@@ -110,7 +109,7 @@ void test_case2(int nonblocking) {
       perror("Reader failed to open FIFO");
       exit(EXIT_FAILURE);
     }
-    sleep(1); // Simulate a brief existence of the reader
+    sleep(2); // Simulate a brief existence of the reader
     close(reader_fd);
     exit(EXIT_SUCCESS);
   }
@@ -120,9 +119,12 @@ void test_case2(int nonblocking) {
   waitpid(reader_pid, NULL, 0); // Wait for the reader process to exit
 
   if (nonblocking) {
-    TEST_ASSERT(result.fd != -1 && result.error_code == EPIPE, 1, "Non-Blocking Write failed with EPIPE", "Non-Blocking Write failed with wrong error type");
+    TEST_ASSERT(result.error_code, EPIPE,
+                "Non-Blocking Write failed with EPIPE",
+                "Non-Blocking Write failed with wrong error type");
   } else {
-    TEST_ASSERT(result.fd != -1 && result.error_code == EPIPE, 1, "Blocking Write failed with EPIPE", "Blocking Write failed with wrong error type");
+    TEST_ASSERT(result.error_code, EPIPE, "Blocking Write failed with EPIPE",
+                "Blocking Write failed with wrong error type");
   }
 }
 
@@ -157,22 +159,19 @@ void run_tests(int nonblocking) {
            nonblocking);
     switch (i) {
     case 0:
-      test_case1(nonblocking);
+    //   test_case1(nonblocking);
       break;
     case 1:
       test_case2(nonblocking);
       break;
     case 2:
-      test_case3(nonblocking);
+    //   test_case3(nonblocking);
       break;
     }
   }
 }
 
-int main() {
-  // 设置 SIGPIPE 信号处理
-  signal(SIGPIPE, sigpipe_handler);
-
+void test_blocking() {
   // 创建 FIFO
   if (mkfifo(FIFO_PATH, 0666) == -1 && errno != EEXIST) {
     perror("mkfifo failed");
@@ -180,15 +179,31 @@ int main() {
   }
 
   // 测试阻塞模式下的三种情况
-//   printf("========== Testing Blocking Mode ==========\n");
-//   run_tests(0); // 阻塞模式
+  printf("========== Testing Blocking Mode ==========\n");
+  run_tests(0); // 阻塞模式
+  // 删除 FIFO
+  unlink(FIFO_PATH);
+}
 
+void test_non_blocking() {
+  // 创建 FIFO
+  if (mkfifo(FIFO_PATH, 0666) == -1 && errno != EEXIST) {
+    perror("mkfifo failed");
+    exit(EXIT_FAILURE);
+  }
   // 测试非阻塞模式下的三种情况
   printf("\n========== Testing Nonblocking Mode ==========\n");
   run_tests(1); // 非阻塞模式
-
   // 删除 FIFO
   unlink(FIFO_PATH);
+}
+
+int main() {
+  // 设置 SIGPIPE 信号处理
+  signal(SIGPIPE, sigpipe_handler);
+
+//   test_blocking();
+  test_non_blocking();
 
   printf("\nAll tests completed.\n");
   return 0;

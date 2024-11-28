@@ -212,7 +212,10 @@ impl Connecting {
         let result = *self.result.read_irqsave();
         match result {
             Connecting => (Inner::Connecting(self), Err(EAGAIN_OR_EWOULDBLOCK)),
-            Connected => (Inner::Established(Established { inner: self.inner }), Ok(())),
+            Connected => (
+                Inner::Established(Established { inner: self.inner }),
+                Ok(()),
+            ),
             Refused => (Inner::Init(Init::new_bound(self.inner)), Err(ECONNREFUSED)),
         }
     }

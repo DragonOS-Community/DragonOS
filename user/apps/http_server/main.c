@@ -17,6 +17,8 @@
 
 #define DEFAULT_PAGE "/index.html"
 
+static int request_counter = 0;
+
 int security_check(char *path)
 {
     // 检查路径是否包含 ..
@@ -214,7 +216,7 @@ int main(int argc, char const *argv[])
 
     while (1)
     {
-        printf("Waiting for a client...\n");
+        printf("[#%d] Waiting for a client...\n", request_counter++);
 
         // 等待并接受客户端连接
         if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t *)&addrlen)) < 0)

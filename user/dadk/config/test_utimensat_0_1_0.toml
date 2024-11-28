@@ -1,0 +1,36 @@
+# 用户程序名称
+name = "test_utimensat"
+# 版本号
+version = "0.1.0"
+# 用户程序描述信息
+description = "test_utimensat"
+# 目标架构
+target-arch = ["x86_64"]
+
+# 任务源
+[task-source]
+# 构建类型
+type = "build-from-source"
+# 构建来源
+source = "local"
+# 路径或URL
+source-path = "user/apps/test_utimensat"
+
+# 构建相关信息
+[build]
+# （可选）构建命令
+build-command = "make install"
+
+# 安装相关信息
+[install]
+# （可选）安装到DragonOS的路径
+in-dragonos-path = "/bin"
+
+# 清除相关信息
+[clean]
+# （可选）清除命令
+clean-command = "make clean"
+
+# （可选）依赖项
+# 注意：如果没有依赖项，忽略此项，不允许只留一个[[depends]]
+# 由于原文件中"depends"为空数组，此处不包含任何依赖项

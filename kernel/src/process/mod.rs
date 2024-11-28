@@ -275,7 +275,12 @@ impl ProcessManager {
                 // avoid deadlock
                 drop(writer);
 
-                let rq = cpu_rq(pcb.sched_info().on_cpu().unwrap().data() as usize);
+                let rq = cpu_rq(
+                    pcb.sched_info()
+                        .on_cpu()
+                        .unwrap_or(smp_get_processor_id())
+                        .data() as usize,
+                );
 
                 let (rq, _guard) = rq.self_lock();
                 rq.update_rq_clock();

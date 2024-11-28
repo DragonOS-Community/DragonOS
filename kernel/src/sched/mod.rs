@@ -63,8 +63,8 @@ pub const SCHED_CAPACITY_SHIFT: u64 = SCHED_FIXEDPOINT_SHIFT;
 pub const SCHED_CAPACITY_SCALE: u64 = 1 << SCHED_CAPACITY_SHIFT;
 
 #[inline]
-pub fn cpu_irq_time(cpu: usize) -> &'static mut IrqTime {
-    unsafe { CPU_IRQ_TIME.as_mut().unwrap()[cpu] }
+pub fn cpu_irq_time(cpu: ProcessorId) -> &'static mut IrqTime {
+    unsafe { CPU_IRQ_TIME.as_mut().unwrap()[cpu.data() as usize] }
 }
 
 #[inline]
@@ -289,7 +289,7 @@ pub struct CpuRunQueue {
     lock: SpinLock<()>,
     lock_on_who: AtomicUsize,
 
-    cpu: usize,
+    cpu: ProcessorId,
     clock_task: u64,
     clock: u64,
     prev_irq_time: u64,
@@ -329,7 +329,7 @@ pub struct CpuRunQueue {
 }
 
 impl CpuRunQueue {
-    pub fn new(cpu: usize) -> Self {
+    pub fn new(cpu: ProcessorId) -> Self {
         Self {
             lock: SpinLock::new(()),
             lock_on_who: AtomicUsize::new(usize::MAX),
@@ -460,6 +460,7 @@ impl CpuRunQueue {
         self.enqueue_task(pcb.clone(), flags);
 
         *pcb.sched_info().on_rq.lock_irqsave() = OnRq::Queued;
+        pcb.sched_info().set_on_cpu(Some(self.cpu));
     }
 
     /// 检查对应的task是否可以抢占当前运行的task
@@ -638,7 +639,7 @@ impl CpuRunQueue {
 
         let cpu = self.cpu;
 
-        if cpu == smp_get_processor_id().data() as usize {
+        if cpu == smp_get_processor_id() {
             // assert!(
             //     Arc::ptr_eq(&current, &ProcessManager::current_pcb()),
             //     "rq current name {} process current {}",
@@ -653,7 +654,7 @@ impl CpuRunQueue {
         }
 
         // 向目标cpu发送重调度ipi
-        send_resched_ipi(ProcessorId::new(cpu as u32));
+        send_resched_ipi(cpu);
     }
 
     /// 选择下一个task
@@ -986,7 +987,7 @@ pub fn sched_init() {
 
         let mut cpu_runqueue = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
         for cpu in 0..PerCpu::MAX_CPU_NUM as usize {
-            let rq = Arc::new(CpuRunQueue::new(cpu));
+            let rq = Arc::new(CpuRunQueue::new(ProcessorId::new(cpu as u32)));
             rq.cfs.force_mut().set_rq(Arc::downgrade(&rq));
             cpu_runqueue.push(rq);
         }

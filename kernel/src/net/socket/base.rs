@@ -118,6 +118,8 @@ pub trait Socket: Sync + Send + Debug + Any {
     }
     /// # `shutdown`
     fn shutdown(&self, how: ShutdownTemp) -> Result<(), SystemError> {
+        // TODO 构建shutdown系统调用
+        // set shutdown bit
         Err(ENOSYS)
     }
     // sockatmark

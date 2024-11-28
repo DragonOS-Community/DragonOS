@@ -53,21 +53,21 @@ impl Shutdown {
             .fetch_or(SEND_SHUTDOWN, core::sync::atomic::Ordering::SeqCst);
     }
 
-    // pub fn is_recv_shutdown(&self) -> bool {
-    //     self.bit.load(core::sync::atomic::Ordering::SeqCst) & RCV_SHUTDOWN != 0
-    // }
+    pub fn is_recv_shutdown(&self) -> bool {
+        self.bit.load(core::sync::atomic::Ordering::SeqCst) & RCV_SHUTDOWN != 0
+    }
 
-    // pub fn is_send_shutdown(&self) -> bool {
-    //     self.bit.load(core::sync::atomic::Ordering::SeqCst) & SEND_SHUTDOWN != 0
-    // }
+    pub fn is_send_shutdown(&self) -> bool {
+        self.bit.load(core::sync::atomic::Ordering::SeqCst) & SEND_SHUTDOWN != 0
+    }
 
-    // pub fn is_both_shutdown(&self) -> bool {
-    //     self.bit.load(core::sync::atomic::Ordering::SeqCst) & SHUTDOWN_MASK == SHUTDOWN_MASK
-    // }
+    pub fn is_both_shutdown(&self) -> bool {
+        self.bit.load(core::sync::atomic::Ordering::SeqCst) & SHUTDOWN_MASK == SHUTDOWN_MASK
+    }
 
-    // pub fn is_empty(&self) -> bool {
-    //     self.bit.load(core::sync::atomic::Ordering::SeqCst) == 0
-    // }
+    pub fn is_empty(&self) -> bool {
+        self.bit.load(core::sync::atomic::Ordering::SeqCst) == 0
+    }
 
     pub fn from_how(how: usize) -> Self {
         Self::from(ShutdownBit::from_bits_truncate(how as u8))

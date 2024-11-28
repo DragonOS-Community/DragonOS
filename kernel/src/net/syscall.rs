@@ -367,7 +367,7 @@ impl Syscall {
         let socket: Arc<socket::Inode> = ProcessManager::current_pcb()
             .get_socket(fd as i32)
             .ok_or(SystemError::EBADF)?;
-        socket.shutdown(socket::ShutdownTemp::from_how(how))?;
+        socket.shutdown(how.try_into()?)?;
         return Ok(0);
     }
 

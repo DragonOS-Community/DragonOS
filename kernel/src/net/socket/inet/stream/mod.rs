@@ -338,6 +338,28 @@ impl Socket for TcpSocket {
             .recv_buffer_size()
     }
 
+
+    fn shutdown(&self, how: ShutdownTemp) -> Result<(), SystemError> {
+        let self_shutdown = self.shutdown.get().bits();
+        let diff = how.bits().difference(self_shutdown);
+        match diff.is_empty(){
+            true => {
+                return Ok(())
+            },
+            false => {
+                if diff.contains(ShutdownBit::SHUT_RD){
+                    self.shutdown.recv_shutdown();
+                    // TODO 协议栈处理
+                }
+                if diff.contains(ShutdownBit::SHUT_WR){
+                    self.shutdown.send_shutdown();
+                    // TODO 协议栈处理
+                }
+            },
+        }
+        Ok(()) 
+    }
+
     fn close(&self) -> Result<(), SystemError> {
         let inner = self.inner
             .write()

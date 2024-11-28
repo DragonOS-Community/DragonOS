@@ -1,4 +1,6 @@
-use core::sync::atomic::AtomicU8;
+use core::{default, sync::atomic::AtomicU8};
+
+use system_error::SystemError;
 
 bitflags! {
     /// @brief 用于指定socket的关闭类型
@@ -101,8 +103,8 @@ impl ShutdownTemp {
         self.bit == 0
     }
 
-    pub fn from_how(how: usize) -> Self {
-        Self { bit: how as u8 + 1 }
+    pub fn bits(&self) -> ShutdownBit {
+        ShutdownBit { bits: self.bit }
     }
 }
 
@@ -113,6 +115,19 @@ impl From<ShutdownBit> for ShutdownTemp {
             ShutdownBit::SHUT_WR => Self { bit: SEND_SHUTDOWN },
             ShutdownBit::SHUT_RDWR => Self { bit: SHUTDOWN_MASK },
             _ => Self { bit: 0 },
+        }
+    }
+}
+
+impl TryFrom<usize> for ShutdownTemp {
+    type Error = SystemError;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        match value {
+            0 | 1 | 2 => Ok(ShutdownTemp {
+                bit: value as u8 + 1,
+            }),
+            _ => Err(SystemError::EINVAL),
         }
     }
 }

@@ -582,6 +582,8 @@ impl Vmx {
     /// 是否需要拦截页面故障
     #[inline]
     pub fn vmx_need_pf_intercept(&self, _vcpu: &VirtCpu) -> bool {
-        true
+        // if (!enable_ept)
+		// return true;
+        false
     }
 }

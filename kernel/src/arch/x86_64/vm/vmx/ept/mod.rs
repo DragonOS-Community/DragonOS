@@ -86,9 +86,9 @@ impl EptPageTable {
     /// 设置当前页表的第i个页表项
     pub unsafe fn set_entry(&self, i: usize, entry: EptPageEntry<MMArch>) -> Option<()> {
         let entry_virt = self.entry_virt(i)?;
-        MMArch::write::<u64>(entry_virt, entry.data());
+        MMArch::write::<EptPageEntry<MMArch>>(entry_virt, entry);
         let page_entry = MMArch::read::<EptPageEntry<MMArch>>(entry_virt);
-        kdebug!("Set EPT entry: {:?} , index : {:?}" , page_entry , i);
+        kdebug!("Set EPT entry: {:?} , index : {:?}", page_entry, i);
         return Some(());
     }
     /// 判断当前页表的第i个页表项是否已经填写了值
@@ -164,7 +164,7 @@ impl EptPageTable {
         // if addr < self.base || addr >= self.base.add(mask) {
         //     return None;
         // } else {
-            return Some((addr.data() >> shift) & MMArch::PAGE_ENTRY_MASK);
+        return Some((addr.data() >> shift) & MMArch::PAGE_ENTRY_MASK);
         //}
     }
 
@@ -175,10 +175,10 @@ impl EptPageTable {
         // 返回下一级页表
         let phys = unsafe { self.entry(index)?.address() };
 
-        let base ;
-        if let Ok(phys) = phys{
+        let base;
+        if let Ok(phys) = phys {
             base = VirtAddr::new(phys_2_virt(phys as usize));
-        }else{
+        } else {
             base = VirtAddr::new(phys_2_virt(phys.unwrap_err() as usize));
         }
 
@@ -189,12 +189,20 @@ impl EptPageTable {
             // Not Present的情况下，返回None
             // 这里之所以绕了一圈，是因为在虚拟机启动阶段的page_fault的addr是not_present的，但是也要进行映射
             // 可能有点问题，但是先这么写
-            if _phys & 0x7== 0x000 {
+            if _phys & 0x7 == 0x000 {
                 return None;
             }
-            return Some(EptPageTable::new(base, PhysAddr::new(_phys as usize), level));
+            return Some(EptPageTable::new(
+                base,
+                PhysAddr::new(_phys as usize),
+                level,
+            ));
         }
-        return Some(EptPageTable::new(base, PhysAddr::new(phys.unwrap() as usize), level));
+        return Some(EptPageTable::new(
+            base,
+            PhysAddr::new(phys.unwrap() as usize),
+            level,
+        ));
     }
 }
 
@@ -244,7 +252,11 @@ pub struct EptPageMapper {
 impl EptPageMapper {
     /// 返回最上层的ept页表
     pub fn table(&self) -> EptPageTable {
-        EptPageTable::new(VirtAddr::new(phys_2_virt(self.root_page_addr.data())), self.root_page_addr, PageLevel::LevelNum)
+        EptPageTable::new(
+            VirtAddr::new(phys_2_virt(self.root_page_addr.data())),
+            self.root_page_addr,
+            PageLevel::LevelNum,
+        )
     }
     pub fn root_page_addr() -> PhysAddr {
         let eptp = VmxAsm::vmx_vmread(control::EPTP_FULL);
@@ -323,7 +335,8 @@ impl EptPageMapper {
 
     /// 从当前EptPageMapper的页分配器中分配一个物理页(hpa)，并将其映射到指定的gpa
     pub fn map(&mut self, gpa: PhysAddr, flags: PageFlags<MMArch>) -> Option<PageFlush<MMArch>> {
-        self.map_gpa(gpa,  flags)
+        let gpa = PhysAddr::new(gpa.data() & (!MMArch::PAGE_NEGATIVE_MASK) & !0xFFF);
+        self.map_gpa(gpa, flags)
     }
 
     ///映射一个hpa到指定的gpa
@@ -339,7 +352,6 @@ impl EptPageMapper {
             //return None;
         }
 
-        let gpa = PhysAddr::new(gpa.data() & (!MMArch::PAGE_NEGATIVE_MASK));
         // TODO： 验证flags是否合法
 
         let mut table = self.table();
@@ -348,34 +360,47 @@ impl EptPageMapper {
             let i = unsafe { table.index_of(gpa).unwrap() };
             assert!(i < MMArch::PAGE_ENTRY_NUM);
             if table.level() == PageLevel::Level4K {
-                //检查是否映射过
+                //检查这个4K页面是否映射过
                 if table.entry_mapped(i).unwrap() {
-                    kwarn!("index :: {:?} , Page hva :: {:?} already mapped", i , gpa);
-                    let set_entry = unsafe {
+                    unsafe {
                         let entry_virt = table.entry_virt(i)?;
-                    return Some(PageFlush::new(entry_virt));};
+                        let _set_entry = MMArch::read::<EptPageEntry<MMArch>>(entry_virt);
+                        kwarn!(
+                            "index :: {:?} , Page gpa :: {:?} already mapped,content is: {:x}",
+                            i,
+                            gpa,
+                            _set_entry.data()
+                        );
+                        return None;
+                    };
                 }
 
                 //分配一个entry的物理页
                 compiler_fence(Ordering::SeqCst);
                 let hpa: PhysAddr = unsafe { self.frame_allocator.allocate_one() }?;
                 kdebug!("Allocate hpa: {:?}", hpa);
+                // 修改全局页管理器
                 let mut page_manager_guard: SpinLockGuard<'static, PageManager> =
-                page_manager_lock_irqsave();
+                    page_manager_lock_irqsave();
                 if !page_manager_guard.contains(&hpa) {
                     page_manager_guard.insert(hpa, Page::new(false));
                 }
                 drop(page_manager_guard);
-                let entry = EptPageEntry::new(hpa.data() as u64, flags);
+                // 清空这个页帧
+                unsafe {
+                    MMArch::write_bytes(MMArch::phys_2_virt(gpa).unwrap(), 0, MMArch::PAGE_SIZE)
+                };
+                let entry = EptPageEntry::new(hpa.data() as u64 | 0x0600_0000_0000_0000, flags);
                 unsafe { table.set_entry(i, entry) };
                 compiler_fence(Ordering::SeqCst);
 
                 //打印页表项以进行验证
                 kdebug!("4K table: {:?}", table);
-                let set_entry = unsafe {
+                unsafe {
                     let entry_virt = table.entry_virt(i)?;
-                    MMArch::read::<EptPageEntry<MMArch>>(entry_virt)};
-                kdebug!("Read EPT entry by  MMArch::read::<EptPageEntry<MMArch>>(entry_virt): {:?}", set_entry);
+                    let _set_entry = MMArch::read::<EptPageEntry<MMArch>>(entry_virt);
+                    kdebug!("Read EPT entry by  MMArch::read::<EptPageEntry<MMArch>>(entry_virt = {:x}): {:?}",entry_virt.data(), _set_entry);
+                }
 
                 return Some(PageFlush::new((unsafe { table.entry_virt(i)? })));
             } else {
@@ -397,10 +422,10 @@ impl EptPageMapper {
                     };
 
                     // fixme::设置页表项的flags，可能有点问题
-                    let flags: PageFlags<MMArch> = unsafe { PageFlags::from_data(7) };
+                    let flags: PageFlags<MMArch> = unsafe { PageFlags::from_data(0x7) };
 
                     kdebug!("EptEntryFlags: {:?}", flags);
-                    kdebug!("frame is: {:?} , index is: {:?}", frame ,i);
+                    kdebug!("frame is: {:?} , index is: {:?}", frame, i);
                     // 把新分配的页表映射到当前页表
                     unsafe { table.set_entry(i, EptPageEntry::new(frame.data() as u64, flags)) };
 
@@ -427,17 +452,24 @@ pub fn debug_eptp() {
     }
 }
 unsafe fn traverse_ept_table(table_addr: VirtAddr, level: u8) {
-    if level == 0 {
+
+    if level == (u8::MAX) {
         return;
     }
 
-    let entries = MMArch::read_array::<u64>(table_addr, 512);
+    let entries = MMArch::read_array::<u64>(table_addr, 511);
     for (i, entry) in entries.iter().enumerate() {
-        if level == 1{
-            kdebug!("Level {} - index {}: HPA: 0x{:x}", level, i, *entry);
-        }
-        if *entry & 0x7 != 0 {
-            let next_level_addr = VirtAddr::new(phys_2_virt((*entry & 0xFFFFFFFFF000) as usize));
+        //打印已分配的entry和4K页表的所有entry
+        if *entry & 0x7 != 0 || level == 0 {
+            let next_level_addr = if level != 0 {
+                VirtAddr::new(phys_2_virt((*entry & 0xFFFFFFFFF000) as usize))
+            } else {
+                //暂未分配地址
+                if *entry == 0 {
+                    continue;
+                }
+                VirtAddr::new(phys_2_virt((*entry & 0xFFFFFFFFF000) as usize))
+            };
             let entry_value = MMArch::read::<u64>(next_level_addr);
             kdebug!(
                 "Level {} - index {}: HPA: 0x{:x}, read_to: 0x{:x}",
@@ -446,7 +478,6 @@ unsafe fn traverse_ept_table(table_addr: VirtAddr, level: u8) {
                 *entry, /*& 0xFFFFFFFFF000*/
                 entry_value,
             );
-
             // 递归遍历下一级页表
             traverse_ept_table(next_level_addr, level - 1);
         }

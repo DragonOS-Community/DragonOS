@@ -1968,6 +1968,7 @@ impl Vmx {
         self.dump_sel("CS: ", guest::CS_SELECTOR);
         self.dump_sel("DS: ", guest::DS_SELECTOR);
         self.dump_sel("SS: ", guest::SS_SELECTOR);
+        self.dump_sel("ES: ", guest::ES_SELECTOR);
         self.dump_sel("FS: ", guest::FS_SELECTOR);
         self.dump_sel("GS: ", guest::GS_SELECTOR);
 
@@ -3049,12 +3050,16 @@ impl Vmx {
         if exit_fastpath != ExitFastpathCompletion::None {
             return Err(SystemError::EINVAL);
         }
+        
         match VmxExitHandlers::try_handle_exit(
             vcpu,
             vm,
             VmxExitReasonBasic::from(exit_reason.basic()),
         ) {
-            Some(Ok(r)) => return Ok(r),
+            Some(Ok(r)) => {
+                self.dump_vmcs(vcpu);
+                return Ok(r)
+            },
             Some(Err(_)) | None => unexpected_vmexit(vcpu),
         }
     }

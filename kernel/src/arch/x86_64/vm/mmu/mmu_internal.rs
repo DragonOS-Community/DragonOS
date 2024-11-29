@@ -323,7 +323,7 @@ impl VirtCpu {
             // };
             kdebug!("{:?}",&page_fault);
             //flags ：rwx
-            let page_flags: PageFlags<MMArch> = unsafe { PageFlags::from_data(7) } ;
+            let page_flags: PageFlags<MMArch> = unsafe { PageFlags::from_data(0xb77) } ;
             mapper.map(PhysAddr::new( page_fault.gpa() as usize), page_flags);
             debug_eptp();
 

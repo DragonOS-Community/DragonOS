@@ -31,6 +31,7 @@ use super::{
 
 pub mod lapic;
 pub mod vcpu;
+pub mod page;
 #[allow(dead_code)]
 pub const TSS_IOPB_BASE_OFFSET: usize = 0x66;
 pub const TSS_BASE_SIZE: usize = 0x68;
@@ -64,6 +65,11 @@ pub struct X86KvmArch {
     msr_fliter: Option<Box<KvmX86MsrFilter>>,
 
     pub noncoherent_dma_count: AtomicU32,
+
+    pub active_mmu_pages: Vec<u64>,
+
+    pub n_max_mmu_pages: usize,
+    pub n_used_mmu_pages:usize,
 }
 
 impl X86KvmArch {
@@ -221,7 +227,7 @@ pub trait KvmFunc: Send + Sync + Debug {
         vcpu: &mut VirtCpu,
         vm: &Vm,
         fastpath: ExitFastpathCompletion,
-    ) -> Result<u64, SystemError>;
+    ) -> Result<i32, SystemError>;
 }
 
 /// ## 中断抑制的原因位

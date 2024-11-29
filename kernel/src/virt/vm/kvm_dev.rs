@@ -187,7 +187,7 @@ pub struct KvmInstance {
 
 impl KvmInstance {
     const KVM_CREATE_VCPU: u32 = 0xAE41;
-    const KVM_SET_USER_MEMORY_REGION: u32 = 0xAE46;
+    const KVM_SET_USER_MEMORY_REGION: u32 = 0x4020AE46;
 
     pub fn new(vm: Arc<LockedVm>) -> Arc<Self> {
         Arc::new(Self {
@@ -314,10 +314,10 @@ pub struct KvmVcpuDev {
 
 impl KvmVcpuDev {
     const KVM_RUN: u32 = 0xAE80;
-    const KVM_GET_REGS: u32 = 0xAE81;
-    const KVM_SET_REGS: u32 = 0xAE82;
-    const KVM_GET_SREGS: u32 = 0xAE83;
-    const KVM_SET_SREGS: u32 = 0xAE84;
+    const KVM_GET_REGS: u32 = 0x8090AE81;
+    const KVM_SET_REGS: u32 = 0x4090AE82;
+    const KVM_GET_SREGS: u32 = 0x8138AE83;
+    const KVM_SET_SREGS: u32 = 0x4138AE84;
 
     pub fn new(vcpu: Arc<LockedVirtCpu>) -> Arc<Self> {
         Arc::new(Self {
@@ -427,9 +427,13 @@ impl IndexNode for KvmVcpuDev {
                 let mut sreg = UapiKvmSegmentRegs::default();
                 user_reader.copy_one_from_user(&mut sreg, 0)?;
 
-                self.vcpu.lock().set_segment_regs(&mut sreg)?;
+                if let Ok(res) = self.vcpu.lock().set_segment_regs(&mut sreg){
+                    return Ok(0);
+                }else{
+                    kdebug!("set segment regs failed");
+                    return Err(SystemError::EINVAL);
+                }
 
-                return Ok(0);
             }
 
             _ => {

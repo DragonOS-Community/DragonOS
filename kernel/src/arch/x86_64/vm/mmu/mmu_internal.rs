@@ -3,8 +3,9 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{intrinsics::unlikely, ops::Index};
+use core::{intrinsics::unlikely, ops::Index, ptr};
 use x86::vmx::vmcs::{guest, host};
+use crate::{arch::{kvm::vmx::{ept::EptMapper, mmu::tdp_set_eptp}, vm::{kvm_host::page, vmx::ept::debug_eptp}}, mm::VirtAddr};
 
 use system_error::SystemError;
 
@@ -109,6 +110,9 @@ impl KvmPageFault {
     pub fn gpa(&self) -> u64 {
         self.addr.data() as u64
     }
+    pub fn hva(&self) -> u64 {
+        self.hva
+    }
 }
 
 impl VirtCpu {
@@ -118,9 +122,9 @@ impl VirtCpu {
         vm: &Vm,
         cr2_or_gpa: u64,
         mut error_code: u64,
-        insn: Option<u64>,
-        insn_len: usize,
-    ) -> Result<u64, SystemError> {
+        _insn: Option<u64>,
+        _insn_len: usize,
+    ) -> Result<i32, SystemError> {
         let mut emulation_type = EmulType::PF;
         let direct = self.arch.mmu().root_role.get_direct();
         // IMPLICIT_ACCESS 是一个 KVM 定义的标志，用于在模拟触发隐式访问的指令时正确执行 SMAP 检查。
@@ -147,16 +151,15 @@ impl VirtCpu {
 
         if r == PFRet::Invalid {
             r = self
-                .do_page_fault(vm, cr2_or_gpa, error_code as u32, false, emulation_type)?
+                .do_page_fault(vm, cr2_or_gpa, (error_code & 0xFFFFFFFF) as u32, false, emulation_type)?
                 .into();
             if r == PFRet::Invalid {
                 return Err(SystemError::EIO);
             }
         }
 
-        if r == PFRet::Err {
-            //return SystemError::EFAULT;
-            todo!()
+        if i32::from(r.clone()) < 0 {
+            return Ok(i32::from(r));
         }
         if r != PFRet::Emulate {
             return Ok(1);
@@ -193,7 +196,7 @@ impl VirtCpu {
         error_code: u32,
         prefetch: bool,
         mut emultype: EmulType,
-    ) -> Result<u64, SystemError> {
+    ) -> Result<i32, SystemError> {
         //初始化page fault
         let mut page_fault = KvmPageFault {
             addr: PhysAddr::new(cr2_or_gpa as usize),
@@ -214,6 +217,8 @@ impl VirtCpu {
         //处理直接映射
         if self.arch.mmu().root_role.get_direct() {
             page_fault.gfn = (page_fault.addr.data() >> PAGE_SHIFT) as u64;
+            kdebug!("page_fault.addr.data() : 0x{:x}", page_fault.addr.data());
+            kdebug!("do_page_fault : gfn = 0x{:x}", page_fault.gfn);
             page_fault.slot = self.gfn_to_memslot(page_fault.gfn, vm); //kvm_vcpu_gfn_to_memslot(vcpu, fault.gfn);没完成
         }
         //异步页面错误（Async #PF），也称为预取错误（prefetch faults），
@@ -225,6 +230,7 @@ impl VirtCpu {
         let r = if page_fault.is_tdp {
             self.tdp_page_fault(vm, &mut page_fault).unwrap()
         } else {
+            //目前的处理page_fault的方法只有tdp_page_fault,所以这里是不会执行的
             let handle = self.arch.mmu().page_fault.unwrap();
             handle(self, &page_fault).unwrap()
         };
@@ -240,7 +246,7 @@ impl VirtCpu {
             PFRet::Spurious => self.stat.pf_spurious += 1,
             _ => {}
         }
-
+        kdebug!("do_page_fault return r = {}", r);
         Ok(r)
     }
 
@@ -257,9 +263,10 @@ impl VirtCpu {
         &mut self,
         vm: &Vm,
         page_fault: &mut KvmPageFault,
-    ) -> Result<u64, SystemError> {
+    ) -> Result<i32, SystemError> {
         // 如果 shadow_memtype_mask 为真，并且虚拟机有非一致性 DMA
         //if shadow_memtype_mask != 0 && self.kvm().lock().arch.noncoherent_dma_count > 0 {
+        //这一段不是很懂
         while page_fault.max_level > PageLevel::Level4K as u8 {
             let page_num = PageLevel::kvm_pages_per_hpage(page_fault.max_level);
 
@@ -285,10 +292,10 @@ impl VirtCpu {
         &self,
         vm: &Vm,
         page_fault: &mut KvmPageFault,
-    ) -> Result<u64, SystemError> {
+    ) -> Result<i32, SystemError> {
         //page_fault_handle_page_track(page_fault)
         //fast_page_fault(page_fault);
-        //mmu_topup_memory_caches(false);//补充内存缓存
+        //mmu_topup_memory_caches(false);
         let mut r = self
             .kvm_faultin_pfn(vm, page_fault, 1 | 1 << 1 | 1 << 2)
             .unwrap();
@@ -297,32 +304,42 @@ impl VirtCpu {
         }
 
         r = PFRet::Retry;
+        //todo 判断页表是否过时
+        //if is_page_fault_stale(vcpu, fault)  ?
         //实际的映射
-        self.tdp_map(page_fault);
+        r=self.tdp_map(page_fault)?.into();
+        
         Ok(r.into())
     }
-    fn tdp_map(&self, page_fault: &mut KvmPageFault) -> Result<u64, SystemError> {
-        //没有实现SPTE，huge page相关
-        let mmu = self.arch.mmu();
-        let kvm = self.kvm();
-        let ret = PFRet::Retry;
+    fn tdp_map(&self, page_fault: &mut KvmPageFault) -> Result<i32, SystemError> {
+        //没有实现huge page相关
+        // let mmu = self.arch.mmu();
+        // let kvm = self.kvm();
+        // let ret = PFRet::Retry;
         let mut mapper = EptPageMapper::lock();
-        if mapper.is_mapped(page_fault) {
-            kdebug!("page fault is already mapped");
-            return Ok(PFRet::Continue.into());
-        };
-        let page_flags = PageFlags::from_prot_flags(ProtFlags::from_bits_truncate(0x7_u64), false);
-        mapper.map(PhysAddr::new(page_fault.gpa() as usize), page_flags);
-        if mapper.is_mapped(page_fault) {
-            kdebug!("page fault is mapped now");
-        };
+        // if mapper.is_mapped(page_fault) {
+            //     kdebug!("page fault is already mapped");
+            //     return Ok(PFRet::Continue.into());
+            // };
+            kdebug!("{:?}",&page_fault);
+            //flags ：rwx
+            let page_flags: PageFlags<MMArch> = unsafe { PageFlags::from_data(7) } ;
+            mapper.map(PhysAddr::new( page_fault.gpa() as usize), page_flags);
+            debug_eptp();
+
+        //原kvm实现
+        // let mut mapper = EptMapper::lock();
+        // unsafe { mapper.walk(page_fault.gpa(), page_fault.pfn()<<PAGE_SHIFT, page_flags).is_ok() };
+
+        
+        
         kdebug!("The ept_root_addr is {:?}", EptPageMapper::root_page_addr());
         //todo: 一些参数的更新
         Ok(PFRet::Fixed.into())
         //todo!()
     }
 
-    fn direct_page_fault(&self, page_fault: &KvmPageFault) -> Result<u64, SystemError> {
+    fn direct_page_fault(&self, page_fault: &KvmPageFault) -> Result<i32, SystemError> {
         todo!()
     }
 

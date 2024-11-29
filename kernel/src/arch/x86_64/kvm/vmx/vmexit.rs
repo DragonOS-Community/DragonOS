@@ -263,7 +263,7 @@ extern "C" fn vmexit_handler() {
 }
 
 #[no_mangle]
-fn adjust_rip(rip: u64) -> Result<(), SystemError> {
+pub fn adjust_rip(rip: u64) -> Result<(), SystemError> {
     let instruction_length = vmx_vmread(VmcsFields::VMEXIT_INSTR_LEN as u32)?;
     vmx_vmwrite(VmcsFields::GUEST_RIP as u32, rip + instruction_length)?;
     Ok(())

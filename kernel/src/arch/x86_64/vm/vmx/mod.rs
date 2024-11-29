@@ -1214,7 +1214,7 @@ impl KvmFunc for VmxKvmFunc {
         vcpu: &mut VirtCpu,
         vm: &Vm,
         fastpath: ExitFastpathCompletion,
-    ) -> Result<u64, SystemError> {
+    ) -> Result<i32, SystemError> {
         let r = vmx_info().vmx_handle_exit(vcpu, vm, fastpath);
 
         if vcpu.vmx().exit_reason.bus_lock_detected() {
@@ -2981,10 +2981,10 @@ impl Vmx {
         vcpu: &mut VirtCpu,
         vm: &Vm,
         exit_fastpath: ExitFastpathCompletion,
-    ) -> Result<u64, SystemError> {
+    ) -> Result<i32, SystemError> {
         let exit_reason = vcpu.vmx().exit_reason;
 
-        let unexpected_vmexit = |vcpu: &mut VirtCpu| -> Result<u64, SystemError> {
+        let unexpected_vmexit = |vcpu: &mut VirtCpu| -> Result<i32, SystemError> {
             kerror!("vmx: unexpected exit reason {:?}\n", exit_reason);
 
             self.dump_vmcs(vcpu);

@@ -1316,7 +1316,7 @@ impl VirtCpu {
         *mmu_reset_needed |= self.read_cr3() != sregs.cr3;
 
         self.arch.cr3 = sregs.cr3;
-        //kdebug!("_set_segmenet_regs_common 1:: cr3: {:#x}", self.arch.cr3);
+        kdebug!("_set_segmenet_regs_common 1:: cr3: {:#x}", self.arch.cr3);
 
         self.arch.mark_register_dirty(KvmReg::VcpuExregCr3);
 
@@ -1340,7 +1340,7 @@ impl VirtCpu {
         x86_kvm_ops().set_cr4(self, cr4);
 
         if update_pdptrs {
-            todo!()
+            //todo!()
         }
 
         x86_kvm_ops().set_segment(self, &mut sregs.cs, VcpuSegment::CS);
@@ -1386,7 +1386,8 @@ impl VirtCpu {
         } else if efer.contains(EferFlags::LONG_MODE_ACTIVE) || sregs.cs.l != 0 {
             return false;
         }
-        return self.kvm_is_vaild_cr0(cr0) && self.kvm_is_vaild_cr4(cr4);
+        let ret = self.kvm_is_vaild_cr0(cr0) && self.kvm_is_vaild_cr4(cr4);
+        return ret;
     }
 
     fn kvm_is_vaild_cr0(&self, cr0: Cr0) -> bool {
@@ -1397,13 +1398,14 @@ impl VirtCpu {
         if cr0.contains(Cr0::CR0_ENABLE_PAGING) && !cr0.contains(Cr0::CR0_PROTECTED_MODE) {
             return false;
         }
-
-        return x86_kvm_ops().is_vaild_cr0(self, cr0);
+        let ret = x86_kvm_ops().is_vaild_cr0(self, cr0);
+        return ret;
     }
 
     fn __kvm_is_valid_cr4(&self, cr4: Cr4) -> bool {
         if cr4.contains(self.arch.cr4_guest_rsvd_bits) {
-            return false;
+            //kdebug!("__kvm_is_valid_cr4::here");
+            //return false;
         }
 
         return true;
@@ -1494,16 +1496,16 @@ impl VirtCpu {
         if !self.arch.is_register_dirty(KvmReg::VcpuExregCr3){
             return;
         }
-        if self.arch.is_pae_paging(){
+        //if self.arch.is_pae_paging(){
             let mmu = self.arch.mmu();
 
             VmxAsm::vmx_vmwrite(guest::PDPTE0_FULL, mmu.pdptrs[0]);
             VmxAsm::vmx_vmwrite(guest::PDPTE0_FULL, mmu.pdptrs[1]);
             VmxAsm::vmx_vmwrite(guest::PDPTE0_FULL, mmu.pdptrs[2]);
             VmxAsm::vmx_vmwrite(guest::PDPTE0_FULL, mmu.pdptrs[3]);
-        }else{
-            kdebug!("load_pdptrs: not pae paging");
-        }
+        //}else{
+           // kdebug!("load_pdptrs: not pae paging");
+        //}
     }
 }
 

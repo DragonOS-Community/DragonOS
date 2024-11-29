@@ -393,6 +393,15 @@ impl X86_64MMArch {
         // 不支持的原因是，目前好像没有能正确的设置page-level的xd位，会触发page fault
         return true;
     }
+
+    pub unsafe fn read_array<T>(addr: VirtAddr, count: usize) -> Vec<T> {
+        // 实现读取数组逻辑
+        let mut vec = Vec::with_capacity(count);
+        for i in 0..count {
+            vec.push(Self::read(addr + i * core::mem::size_of::<T>()));
+        }
+        vec
+    } 
 }
 
 impl VirtAddr {

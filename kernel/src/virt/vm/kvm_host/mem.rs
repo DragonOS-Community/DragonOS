@@ -585,7 +585,7 @@ impl Vm {
 ///
 /// # 错误
 /// 如果内存槽为空或无效，或者尝试对只读内存槽进行写操作，则返回 `SystemError::KVM_HVA_ERR_BAD`。
-fn __gfn_to_hva_many(
+pub fn __gfn_to_hva_many(
     slot: &Option<&KvmMemSlot>,
     gfn: u64,
     nr_pages: Option<&mut u64>,

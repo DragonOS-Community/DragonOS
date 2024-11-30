@@ -394,7 +394,8 @@ impl ProcessManager {
         pcb.sched_info
             .inner_lock_write_irqsave()
             .set_state(ProcessState::Exited(exit_code));
-        pcb.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
+        pcb.wait_queue.mark_dead();
+        pcb.wait_queue.wakeup_all(Some(ProcessState::Blocked(true)));
 
         let rq = cpu_rq(smp_get_processor_id().data() as usize);
         let (rq, guard) = rq.self_lock();
@@ -430,7 +431,11 @@ impl ProcessManager {
         // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
         // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
         if let Some(tty) = pcb.sig_info_irqsave().tty() {
-            tty.core().contorl_info_irqsave().pgid = None;
+            // 临时解决方案！！！ 临时解决方案！！！ 引入进程组之后，要重写这个更新前台进程组的逻辑
+            let mut g = tty.core().contorl_info_irqsave();
+            if g.pgid == Some(pid) {
+                g.pgid = None;
+            }
         }
         pcb.sig_info_mut().set_tty(None);
 

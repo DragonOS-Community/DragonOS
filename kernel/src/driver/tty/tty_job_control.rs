@@ -62,7 +62,7 @@ impl TtyJobCtrlManager {
             } else {
                 // 暂时使用kill而不是killpg
                 Syscall::kill(pgid, sig as i32)?;
-                return Err(SystemError::ERESTART);
+                return Err(SystemError::ERESTARTSYS);
             }
         }
 

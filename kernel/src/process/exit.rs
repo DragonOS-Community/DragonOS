@@ -5,13 +5,10 @@ use log::warn;
 use system_error::SystemError;
 
 use crate::{
-    arch::{
-        ipc::signal::{SigChildCode, Signal},
-        CurrentIrqArch,
-    },
-    exception::InterruptArch,
+    arch::ipc::signal::{SigChildCode, Signal},
     sched::{schedule, SchedMode},
     syscall::user_access::UserBufferWriter,
+    time::{sleep::nanosleep, Duration},
 };
 
 use super::{
@@ -108,72 +105,92 @@ pub fn kernel_wait4(
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/exit.c#1573
 fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
     let mut retval: Result<usize, SystemError>;
-    // todo: 在signal struct里面增加等待队列，并在这里初始化子进程退出的回调，使得子进程退出时，能唤醒当前进程。
+    let mut tmp_child_pcb: Option<Arc<ProcessControlBlock>> = None;
 
-    loop {
-        kwo.no_task_error = Some(SystemError::ECHILD);
-        let child_pcb = ProcessManager::find(kwo.pid).ok_or(SystemError::ECHILD);
-        if kwo.pid_type != PidType::MAX && child_pcb.is_err() {
+    macro_rules! notask {
+        ($outer: lifetime) => {
             if let Some(err) = &kwo.no_task_error {
                 retval = Err(err.clone());
             } else {
                 retval = Ok(0);
             }
 
-            if !kwo.options.contains(WaitOption::WNOHANG) {
-                retval = Err(SystemError::ERESTARTSYS);
-                if !ProcessManager::current_pcb()
-                    .sig_info_irqsave()
-                    .sig_pending()
-                    .has_pending()
-                {
+            if retval.is_err() && !kwo.options.contains(WaitOption::WNOHANG) {
+                retval = Err(SystemError::EINTR);
+                // retval = Err(SystemError::ERESTARTSYS);
+                if !ProcessManager::current_pcb().has_pending_signal() {
+                    schedule(SchedMode::SM_PREEMPT);
                     // todo: 增加子进程退出的回调后，这里可以直接等待在自身的child_wait等待队列上。
                     continue;
                 } else {
-                    break;
+                    break $outer;
                 }
             } else {
-                break;
+                break $outer;
             }
+        };
+    }
+    // todo: 在signal struct里面增加等待队列，并在这里初始化子进程退出的回调，使得子进程退出时，能唤醒当前进程。
+
+    'outer: loop {
+        kwo.no_task_error = Some(SystemError::ECHILD);
+        let child_pcb = ProcessManager::find(kwo.pid).ok_or(SystemError::ECHILD);
+        if kwo.pid_type != PidType::MAX && child_pcb.is_err() {
+            notask!('outer);
         }
 
         if kwo.pid_type == PidType::PID {
             let child_pcb = child_pcb.unwrap();
             // 获取weak引用，以便于在do_waitpid中能正常drop pcb
             let child_weak = Arc::downgrade(&child_pcb);
+            log::debug!("do_wait: child_pcb: {:?}", child_pcb.pid());
             let r = do_waitpid(child_pcb, kwo);
+            log::debug!("do_wait: do_waitpid return: {:?}", r);
             if let Some(r) = r {
                 return r;
             } else {
-                child_weak.upgrade().unwrap().wait_queue.sleep();
+                if let Err(SystemError::ESRCH) = child_weak.upgrade().unwrap().wait_queue.sleep() {
+                    return Err(SystemError::ECHILD);
+                }
             }
         } else if kwo.pid_type == PidType::MAX {
             // 等待任意子进程
-            // todo: 这里有问题！如果正在for循环的过程中，子进程退出了，可能会导致父进程永远等待。
+            // todo: 这里有问题！应当让当前进程sleep到自身的child_wait等待队列上，这样才高效。（还没实现）
             let current_pcb = ProcessManager::current_pcb();
-            let rd_childen = current_pcb.children.read();
-            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-            for pid in rd_childen.iter() {
-                let pcb = ProcessManager::find(*pid).ok_or(SystemError::ECHILD)?;
-                let state = pcb.sched_info().inner_lock_read_irqsave().state();
-                if state.is_exited() {
-                    kwo.ret_status = state.exit_code().unwrap() as i32;
-                    drop(pcb);
-                    unsafe { ProcessManager::release(*pid) };
-                    return Ok((*pid).into());
-                } else {
-                    unsafe { pcb.wait_queue.sleep_without_schedule() };
+            loop {
+                let rd_childen = current_pcb.children.read();
+                if rd_childen.is_empty() {
+                    break;
                 }
+                for pid in rd_childen.iter() {
+                    let pcb = ProcessManager::find(*pid).ok_or(SystemError::ECHILD)?;
+                    let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
+                    let state = sched_guard.state();
+                    if state.is_exited() {
+                        kwo.ret_status = state.exit_code().unwrap() as i32;
+                        kwo.no_task_error = None;
+                        // 由于pcb的drop方法里面要获取父进程的children字段的写锁，所以这里不能直接drop pcb，
+                        // 而是要先break到外层循环，以便释放父进程的children字段的锁,才能drop pcb。
+                        // 否则会死锁。
+                        tmp_child_pcb = Some(pcb.clone());
+                        unsafe { ProcessManager::release(*pid) };
+                        retval = Ok((*pid).into());
+                        break 'outer;
+                    }
+                }
+                nanosleep(Duration::from_millis(100).into())?;
             }
-            drop(irq_guard);
-            schedule(SchedMode::SM_NONE);
         } else {
             // todo: 对于pgid的处理
             warn!("kernel_wait4: currently not support {:?}", kwo.pid_type);
             return Err(SystemError::EINVAL);
         }
+        log::debug!("xxxx, pending: {}", ProcessManager::current_pcb().has_pending_signal());
+        notask!('outer);
     }
 
+    drop(tmp_child_pcb);
+    log::debug!("do_wait, retval = {:?}, kwo: {:?}", retval, kwo.no_task_error);
     return retval;
 }
 

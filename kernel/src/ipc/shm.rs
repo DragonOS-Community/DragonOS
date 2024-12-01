@@ -318,6 +318,7 @@ impl ShmManager {
         let mut page_manager_guard = page_manager_lock_irqsave();
         if map_count > 0 {
             // 设置共享内存物理页当映射计数等于0时可被回收
+            // TODO 后续需要加入到lru中
             for _ in 0..count.data() {
                 let page = page_manager_guard.get_unwrap(&cur_phys.phys_address());
                 page.write_irqsave().remove_flags(PageFlags::PG_UNEVICTABLE);

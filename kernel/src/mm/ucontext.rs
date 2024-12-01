@@ -21,6 +21,7 @@ use crate::{
     arch::{mm::PageMapper, CurrentIrqArch, MMArch},
     exception::InterruptArch,
     filesystem::vfs::file::File,
+    ipc::shm::shm_manager_lock,
     libs::{
         align::page_align_up,
         rwlock::RwLock,
@@ -1166,10 +1167,16 @@ impl LockedVMA {
 
             // 从anon_vma中删除当前VMA
             let page = page_manager_guard.get_unwrap(&paddr);
-            page.write_irqsave().remove_vma(self);
+            let mut page_guard = page.write_irqsave();
+            page_guard.remove_vma(self);
 
-            // 如果物理页的anon_vma链表长度为0并且不是共享页，则释放物理页.
-            if page.read_irqsave().can_deallocate() {
+            // 如果物理页的vma链表长度为0并且未标记为不可回收，则释放物理页.
+            // TODO 后续由lru释放物理页面
+            if page_guard.can_deallocate() {
+                if let PageType::Shm(shm_id) = page_guard.page_type() {
+                    shm_manager_lock().free_id(shm_id);
+                }
+
                 page_manager_guard.remove_page(&paddr);
             }
 

@@ -19,7 +19,7 @@ use crate::{
     exception::ipi::{IpiKind, IpiTarget},
     filesystem::{page_cache::PageCache, vfs::FilePrivateData},
     init::initcall::INITCALL_CORE,
-    ipc::shm::{shm_manager_lock, ShmId},
+    ipc::shm::ShmId,
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
@@ -648,9 +648,7 @@ impl Drop for InnerPage {
             self.map_count() == 0,
             "page drop when map count is non-zero"
         );
-        if let PageType::Shm(shm_id) = self.page_type {
-            shm_manager_lock().free_id(&shm_id);
-        }
+
         unsafe {
             deallocate_page_frames(PhysPageFrame::new(self.phys_addr), PageFrameCount::new(1))
         };

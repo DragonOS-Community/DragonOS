@@ -422,7 +422,7 @@ impl VmxKvmFunc {
         VmxAsm::vmx_vmwrite(seg_field.limit, 0xffff);
 
         let mut ar = 0x93;
-        if seg == VcpuSegment::CS {
+        if seg == VcpuSegment::CS {//todo疑似DS
             ar |= 0x08;
         }
 
@@ -1818,7 +1818,7 @@ impl Vmx {
             .vmentry_ctrl
             .contains(EntryControls::LOAD_IA32_PAT)
         {
-            VmxAsm::vmx_vmwrite(guest::IA32_PAT_FULL, vcpu.arch.pat)
+            VmxAsm::vmx_vmwrite(guest::IA32_PAT_FULL, vcpu.arch.pat)//todo
         }
 
         let mut loaded_vmcs = vcpu.vmx().loaded_vmcs.lock();
@@ -1888,10 +1888,10 @@ impl Vmx {
     /// 打印VMCS信息用于debug
     pub fn dump_vmcs(&self, vcpu: &VirtCpu) {
         let vmentry_ctl =
-            EntryControls::from_bits_truncate(self.vmread(control::VMENTRY_CONTROLS) as u32);
+            unsafe { EntryControls::from_bits_unchecked(self.vmread(control::VMENTRY_CONTROLS) as u32) };
 
         let vmexit_ctl =
-            ExitControls::from_bits_truncate(self.vmread(control::VMEXIT_CONTROLS) as u32);
+            unsafe { ExitControls::from_bits_unchecked(self.vmread(control::VMEXIT_CONTROLS) as u32) };
 
         let cpu_based_exec_ctl = PrimaryControls::from_bits_truncate(
             self.vmread(control::PRIMARY_PROCBASED_EXEC_CONTROLS) as u32,
@@ -1904,9 +1904,9 @@ impl Vmx {
         // let cr4 = Cr4::from_bits_truncate(self.vmread(guest::CR4) as usize);
 
         let secondary_exec_control = if self.has_sceondary_exec_ctrls() {
-            SecondaryControls::from_bits_truncate(
+            unsafe { SecondaryControls::from_bits_unchecked(
                 self.vmread(control::SECONDARY_PROCBASED_EXEC_CONTROLS) as u32,
-            )
+            ) }
         } else {
             SecondaryControls::empty()
         };

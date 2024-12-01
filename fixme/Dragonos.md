@@ -108,4 +108,4 @@ $	 VMEntry: intr_info = 0x0, errcode = 0x0, ilen = 0x0
 	 IDTVectoring: info = 0x8000030d, errcode = 0x0
 	 TSC Offset = 0x0
 $	 EPT pointer = 0x1b2e901e //少了huge page
-	 Virtual processor ID = 0x1
+$    Virtual processor ID = 0x1

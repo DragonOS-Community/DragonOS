@@ -388,7 +388,7 @@ impl EptPageMapper {
                 drop(page_manager_guard);
                 // 清空这个页帧
                 unsafe {
-                    MMArch::write_bytes(MMArch::phys_2_virt(gpa).unwrap(), 0, MMArch::PAGE_SIZE)
+                    MMArch::write_bytes(MMArch::phys_2_virt(hpa).unwrap(), 0, MMArch::PAGE_SIZE)
                 };
                 let entry = EptPageEntry::new(hpa.data() as u64 | 0x0600_0000_0000_0000, flags);
                 unsafe { table.set_entry(i, entry) };

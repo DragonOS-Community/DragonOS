@@ -287,8 +287,8 @@ impl LoadedVmcs {
     }
 
     pub fn msr_write_intercepted(&mut self, msr: u32) -> bool {
-        if PrimaryControls::from_bits_truncate(self.controls_get(ControlsType::Exec) as u32)
-            .contains(PrimaryControls::USE_MSR_BITMAPS)
+        if unsafe { PrimaryControls::from_bits_unchecked(self.controls_get(ControlsType::Exec) as u32)
+            .contains(PrimaryControls::USE_MSR_BITMAPS) }
         {
             return true;
         }

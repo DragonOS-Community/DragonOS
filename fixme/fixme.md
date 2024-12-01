@@ -56,3 +56,5 @@ x/16x 0xffff8000
 ![alt text](image-3.png)
 ![alt text](image-4.png)
 ![alt text](image-5.png)
+
+//为什么第一次vmentry会外中断

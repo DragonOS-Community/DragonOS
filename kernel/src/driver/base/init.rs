@@ -5,6 +5,7 @@ use super::{
     class::classes_init,
     cpu::CpuDeviceManager,
     device::{bus::buses_init, init::devices_init},
+    event_source::init_event_source_bus,
     firmware::firmware_init,
     hypervisor::hypervisor_init,
     platform::platform_bus_init,
@@ -21,7 +22,7 @@ pub fn driver_init() -> Result<(), SystemError> {
     platform_bus_init()?;
     serio_bus_init()?;
     CpuDeviceManager::init()?;
-
+    init_event_source_bus()?;
     // 至此，已完成设备驱动模型的初始化
     return Ok(());
 }

@@ -6,6 +6,7 @@ use crate::bpf::map::{BpfCallBackFn, BpfMap};
 use crate::include::bindings::linux_bpf::BPF_F_CURRENT_CPU;
 use crate::libs::lazy_init::Lazy;
 use crate::smp::core::smp_get_processor_id;
+use crate::time::Instant;
 use alloc::{collections::BTreeMap, sync::Arc};
 use core::ffi::c_void;
 use system_error::SystemError;
@@ -300,6 +301,10 @@ pub fn map_peek_elem(map: &Arc<BpfMap>, value: &mut [u8]) -> Result<()> {
     value
 }
 
+pub fn bpf_ktime_get_ns() -> u64 {
+    (Instant::now().total_micros() * 1000) as u64
+}
+
 pub static BPF_HELPER_FUN_SET: Lazy<BTreeMap<u32, RawBPFHelperFn>> = Lazy::new();
 
 /// Initialize the helper functions.
@@ -311,6 +316,7 @@ pub fn init_helper_functions() {
         map.insert(HELPER_MAP_LOOKUP_ELEM, define_func!(raw_map_lookup_elem));
         map.insert(HELPER_MAP_UPDATE_ELEM, define_func!(raw_map_update_elem));
         map.insert(HELPER_MAP_DELETE_ELEM, define_func!(raw_map_delete_elem));
+        map.insert(HELPER_KTIME_GET_NS, define_func!(bpf_ktime_get_ns));
         map.insert(
             HELPER_MAP_FOR_EACH_ELEM,
             define_func!(raw_map_for_each_elem),

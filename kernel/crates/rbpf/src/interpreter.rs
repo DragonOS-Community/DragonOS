@@ -660,9 +660,9 @@ pub fn execute_program(
                             // Save the callee saved registers
                             pre_stack.save_registers(&reg[6..=9]);
                             // Save the return address
-                            pre_stack.save_return_address(insn_ptr as u16);
+                            pre_stack.save_return_address(insn_ptr as u64);
                             // save the stack pointer
-                            pre_stack.save_sp(reg[10] as u16);
+                            pre_stack.save_sp(reg[10]);
                             let mut stack = StackFrame::new();
                             log::trace!("BPF TO BPF CALL: new pc: {} + {} = {}",insn_ptr ,insn.imm,insn_ptr + insn.imm as usize);
                             reg[10] = stack.as_ptr() as u64 + stack.len() as u64;
@@ -695,7 +695,7 @@ pub fn execute_program(
                     // Restore the return address
                     insn_ptr = stack.get_return_address() as usize;
                     // Restore the stack pointer
-                    reg[10] = stack.get_sp() as u64;
+                    reg[10] = stack.get_sp();
                     log::trace!("EXIT: new pc: {}", insn_ptr);
                 }
             }

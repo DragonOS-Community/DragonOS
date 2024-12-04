@@ -1,0 +1,25 @@
+use crate::driver::base::device::bus::{bus_register, Bus};
+use crate::driver::base::event_source::subsys::EventSourceBus;
+use alloc::sync::Arc;
+use system_error::SystemError;
+
+mod kprobe;
+mod subsys;
+
+static mut EVENT_SOURCE_BUS: Option<Arc<EventSourceBus>> = None;
+
+fn get_event_source_bus() -> Option<Arc<EventSourceBus>> {
+    unsafe { EVENT_SOURCE_BUS.clone() }
+}
+
+pub fn init_event_source_bus() -> Result<(), SystemError> {
+    let event_source_bus = EventSourceBus::new();
+    let r = bus_register(event_source_bus.clone() as Arc<dyn Bus>);
+    if r.is_err() {
+        unsafe { EVENT_SOURCE_BUS = None };
+        return r;
+    }
+    unsafe { EVENT_SOURCE_BUS = Some(event_source_bus.clone()) };
+    kprobe::kprobe_subsys_init()?;
+    Ok(())
+}

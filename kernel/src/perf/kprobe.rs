@@ -39,8 +39,10 @@ impl KprobePerfEvent {
             .downcast_arc::<BpfProg>()
             .ok_or(SystemError::EINVAL)?;
         let prog_slice = file.insns();
-        let mut vm =
-            EbpfVmRawOwned::new(Some(prog_slice.to_vec())).map_err(|_| SystemError::EINVAL)?;
+        let mut vm = EbpfVmRawOwned::new(Some(prog_slice.to_vec())).map_err(|e| {
+            log::error!("create ebpf vm failed: {:?}", e);
+            SystemError::EINVAL
+        })?;
         vm.register_helper_set(BPF_HELPER_FUN_SET.get())
             .map_err(|_| SystemError::EINVAL)?;
         // create a callback to execute the ebpf prog
@@ -75,10 +77,10 @@ impl CallBackFunc for KprobePerfCallBack {
                 size_of::<KProbeContext>(),
             )
         };
-        let _res = self
-            .vm
-            .execute_program(probe_context)
-            .map_err(|_| SystemError::EINVAL);
+        let res = self.vm.execute_program(probe_context);
+        if res.is_err() {
+            log::error!("kprobe callback error: {:?}", res);
+        }
     }
 }
 

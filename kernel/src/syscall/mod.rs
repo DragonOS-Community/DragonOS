@@ -1213,6 +1213,7 @@ impl Syscall {
                 let flags = args[4] as u32;
                 Self::sys_perf_event_open(attr, pid, cpu, group_fd, flags)
             }
+            SYS_SETRLIMIT => Ok(0),
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };
 

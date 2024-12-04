@@ -267,9 +267,10 @@ impl X86_64MMArch {
                         });
                 } else {
                     log::error!(
-                        "No mapped vma, error_code: {:#b}, address: {:#x}",
+                        "No mapped vma, error_code: {:#b}, address: {:#x}, flags: {:?}",
                         error_code,
                         address.data(),
+                        flags
                     );
                     let pid = ProcessManager::current_pid();
                     let mut info =

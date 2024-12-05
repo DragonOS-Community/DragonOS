@@ -47,7 +47,6 @@ use alloc::sync::Arc;
 ///
 /// fn test() {
 ///     let a = A { name: "a".to_string() };
-
 ///     let a_arc: Arc<dyn Base> = Arc::new(a) as Arc<dyn Base>;
 ///     let a_arc2: Option<Arc<A>> = a_arc.downcast_arc::<A>();
 ///     assert!(a_arc2.is_some());

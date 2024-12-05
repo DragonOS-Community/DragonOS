@@ -103,7 +103,7 @@ impl TtyCore {
         self.line_discipline.clone()
     }
 
-    pub fn write_without_serial(&self, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
+    pub fn write_to_core(&self, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
         self.core
             .driver()
             .driver_funcs()

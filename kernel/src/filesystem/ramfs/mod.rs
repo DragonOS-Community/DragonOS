@@ -1,7 +1,7 @@
 use core::any::Any;
 use core::intrinsics::unlikely;
 
-use crate::filesystem::vfs::FSMAKER;
+use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
 use crate::libs::rwlock::RwLock;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
@@ -35,7 +35,7 @@ const RAMFS_MAX_NAMELEN: usize = 64;
 const RAMFS_BLOCK_SIZE: u64 = 512;
 /// @brief 内存文件系统的Inode结构体
 #[derive(Debug)]
-struct LockedRamFSInode(SpinLock<RamFSInode>);
+pub struct LockedRamFSInode(pub SpinLock<RamFSInode>);
 
 /// @brief 内存文件系统结构体
 #[derive(Debug)]
@@ -70,6 +70,35 @@ pub struct RamFSInode {
     name: DName,
 }
 
+impl RamFSInode {
+    pub fn new() -> Self {
+        Self {
+            parent: Weak::default(),
+            self_ref: Weak::default(),
+            children: BTreeMap::new(),
+            data: Vec::new(),
+            metadata: Metadata {
+                dev_id: 0,
+                inode_id: generate_inode_id(),
+                size: 0,
+                blk_size: 0,
+                blocks: 0,
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
+                file_type: FileType::Dir,
+                mode: ModeType::from_bits_truncate(0o777),
+                nlinks: 1,
+                uid: 0,
+                gid: 0,
+                raw_dev: DeviceNumber::default(),
+            },
+            fs: Weak::default(),
+            special_node: None,
+            name: Default::default(),
+        }
+    }
+}
 impl FileSystem for RamFS {
     fn root_inode(&self) -> Arc<dyn super::vfs::IndexNode> {
         return self.root_inode.clone();
@@ -105,31 +134,8 @@ impl RamFS {
             RAMFS_MAX_NAMELEN as u64,
         );
         // 初始化root inode
-        let root: Arc<LockedRamFSInode> = Arc::new(LockedRamFSInode(SpinLock::new(RamFSInode {
-            parent: Weak::default(),
-            self_ref: Weak::default(),
-            children: BTreeMap::new(),
-            data: Vec::new(),
-            metadata: Metadata {
-                dev_id: 0,
-                inode_id: generate_inode_id(),
-                size: 0,
-                blk_size: 0,
-                blocks: 0,
-                atime: PosixTimeSpec::default(),
-                mtime: PosixTimeSpec::default(),
-                ctime: PosixTimeSpec::default(),
-                file_type: FileType::Dir,
-                mode: ModeType::from_bits_truncate(0o777),
-                nlinks: 1,
-                uid: 0,
-                gid: 0,
-                raw_dev: DeviceNumber::default(),
-            },
-            fs: Weak::default(),
-            special_node: None,
-            name: Default::default(),
-        })));
+        let root: Arc<LockedRamFSInode> =
+            Arc::new(LockedRamFSInode(SpinLock::new(RamFSInode::new())));
 
         let result: Arc<RamFS> = Arc::new(RamFS {
             root_inode: root,
@@ -147,7 +153,9 @@ impl RamFS {
         return result;
     }
 
-    pub fn make_ramfs() -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+    pub fn make_ramfs(
+        _data: Option<&dyn FileSystemMakerData>,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
         let fs = RamFS::new();
         return Ok(fs);
     }
@@ -155,7 +163,10 @@ impl RamFS {
 #[distributed_slice(FSMAKER)]
 static RAMFSMAKER: FileSystemMaker = FileSystemMaker::new(
     "ramfs",
-    &(RamFS::make_ramfs as fn() -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
+    &(RamFS::make_ramfs
+        as fn(
+            Option<&dyn FileSystemMakerData>,
+        ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
 );
 
 impl IndexNode for LockedRamFSInode {

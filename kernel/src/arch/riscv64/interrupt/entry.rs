@@ -4,7 +4,6 @@ use crate::arch::{
     interrupt::TrapFrame,
 };
 use asm_macros::{restore_from_x6_to_x31, save_from_x6_to_x31};
-use core::arch::asm;
 use kdepends::memoffset::offset_of;
 
 /// Riscv64中断处理入口
@@ -12,7 +11,7 @@ use kdepends::memoffset::offset_of;
 #[no_mangle]
 #[repr(align(4))]
 pub unsafe extern "C" fn handle_exception() -> ! {
-    asm!(
+    core::arch::naked_asm!(
         concat!("
         /*
 	        * If coming from userspace, preserve the user thread pointer and load
@@ -27,15 +26,14 @@ pub unsafe extern "C" fn handle_exception() -> ! {
             j {_restore_kernel_tpsp}
         "),
         csr_scratch = const CSR_SSCRATCH,
-        _restore_kernel_tpsp = sym _restore_kernel_tpsp,
-        options(noreturn),
+        _restore_kernel_tpsp = sym _restore_kernel_tpsp
     )
 }
 
 #[naked]
 #[no_mangle]
 unsafe extern "C" fn _restore_kernel_tpsp() -> ! {
-    asm!(
+    core::arch::naked_asm!(
         concat!("
             // 这次是从内核态进入中断
             // 从sscratch寄存器加载当前cpu的上下文
@@ -48,16 +46,14 @@ unsafe extern "C" fn _restore_kernel_tpsp() -> ! {
         "),
         csr_scratch = const CSR_SSCRATCH,
         lc_off_kernel_sp = const offset_of!(LocalContext, kernel_sp),
-        _save_context = sym _save_context,
-
-        options(noreturn),
+        _save_context = sym _save_context
     )
 }
 
 #[naked]
 #[no_mangle]
 unsafe extern "C" fn _save_context() -> ! {
-    asm!(
+    core::arch::naked_asm!(
         concat!("
 
 
@@ -164,15 +160,14 @@ unsafe extern "C" fn _save_context() -> ! {
         csr_epc = const CSR_SEPC,
         csr_tval = const CSR_STVAL,
         csr_cause = const CSR_SCAUSE,
-        csr_scratch = const CSR_SSCRATCH,
-        options(noreturn),
+        csr_scratch = const CSR_SSCRATCH
     )
 }
 
 #[naked]
 #[no_mangle]
 pub unsafe extern "C" fn ret_from_exception() -> ! {
-    asm!(
+    core::arch::naked_asm!(
         concat!("
             ld s0, {off_status}(sp)
             andi s0, s0, {sr_spp}
@@ -249,8 +244,6 @@ pub unsafe extern "C" fn ret_from_exception() -> ! {
         off_t6 = const offset_of!(TrapFrame, t6),
         off_sp = const offset_of!(TrapFrame, sp),
         off_tp = const offset_of!(TrapFrame, tp),
-        off_epc = const offset_of!(TrapFrame, epc),
-
-        options(noreturn),
+        off_epc = const offset_of!(TrapFrame, epc)
     )
 }

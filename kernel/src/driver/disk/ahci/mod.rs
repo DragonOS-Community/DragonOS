@@ -1,24 +1,22 @@
 // 导出 ahci 相关的 module
-pub mod ahci_inode;
 pub mod ahcidisk;
 pub mod hba;
-
 use crate::arch::MMArch;
 use crate::driver::base::block::manager::block_dev_manager;
 use crate::driver::block::cache::cached_block_device::BlockCache;
 use crate::driver::disk::ahci::ahcidisk::LockedAhciDisk;
 use crate::driver::pci::pci::{
-    get_pci_device_structure_mut, PciDeviceStructure, PCI_DEVICE_LINKEDLIST,
+    get_pci_device_structure_mut, PciDeviceLinkedList, PciDeviceStructure, PCI_DEVICE_LINKEDLIST,
 };
+use alloc::sync::Arc;
 
 use crate::driver::disk::ahci::{
     hba::HbaMem,
     hba::{HbaPort, HbaPortType},
 };
-use crate::libs::rwlock::RwLockWriteGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::{MemoryManagementArch, VirtAddr};
-use alloc::{boxed::Box, collections::LinkedList, vec::Vec};
+use alloc::{boxed::Box, vec::Vec};
 use core::sync::atomic::compiler_fence;
 use log::debug;
 use system_error::SystemError;
@@ -36,9 +34,9 @@ pub const HBA_PxIS_TFES: u32 = 1 << 30;
 /// @brief 寻找所有的ahci设备
 /// @param list 链表的写锁
 /// @return Result<Vec<&'a mut Box<dyn PciDeviceStructure>>, SystemError>   成功则返回包含所有ahci设备结构体的可变引用的链表，失败则返回err
-fn ahci_device_search<'a>(
-    list: &'a mut RwLockWriteGuard<'_, LinkedList<Box<dyn PciDeviceStructure>>>,
-) -> Result<Vec<&'a mut Box<dyn PciDeviceStructure>>, SystemError> {
+fn ahci_device_search(
+    list: &PciDeviceLinkedList,
+) -> Result<Vec<Arc<dyn PciDeviceStructure>>, SystemError> {
     let result = get_pci_device_structure_mut(list, AHCI_CLASS, AHCI_SUBCLASS);
 
     if result.is_empty() {
@@ -50,11 +48,11 @@ fn ahci_device_search<'a>(
 
 /// @brief: 初始化 ahci
 pub fn ahci_init() -> Result<(), SystemError> {
-    let mut list = PCI_DEVICE_LINKEDLIST.write();
-    let ahci_device = ahci_device_search(&mut list)?;
+    let list = &*PCI_DEVICE_LINKEDLIST;
+    let ahci_device = ahci_device_search(list)?;
 
     for device in ahci_device {
-        let standard_device = device.as_standard_device_mut().unwrap();
+        let standard_device = device.as_standard_device().unwrap();
         standard_device.bar_ioremap();
         // 对于每一个ahci控制器分配一块空间
         let ahci_port_base_vaddr =
@@ -62,6 +60,7 @@ pub fn ahci_init() -> Result<(), SystemError> {
         let virtaddr = standard_device
             .bar()
             .ok_or(SystemError::EACCES)?
+            .read()
             .get_bar(5)
             .or(Err(SystemError::EACCES))?
             .virtual_address()

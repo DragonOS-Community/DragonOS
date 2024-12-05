@@ -1,6 +1,5 @@
 use core::{
     ffi::{c_int, c_void},
-    ptr::null,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -74,6 +73,20 @@ impl Syscall {
         info!("Syscall init successfully!");
 
         return r;
+    }
+    /// 系统调用分发器，用于分发系统调用。
+    ///
+    /// 与[handle]不同，这个函数会捕获系统调用处理函数的panic，返回错误码。
+    #[cfg(feature = "backtrace")]
+    pub fn catch_handle(
+        syscall_num: usize,
+        args: &[usize],
+        frame: &mut TrapFrame,
+    ) -> Result<usize, SystemError> {
+        let res = unwinding::panic::catch_unwind(|| Self::handle(syscall_num, args, frame));
+        res.unwrap_or_else(|_| loop {
+            core::hint::spin_loop();
+        })
     }
     /// @brief 系统调用分发器，用于分发系统调用。
     ///
@@ -295,6 +308,13 @@ impl Syscall {
                 Self::mkdir(path, mode)
             }
 
+            SYS_MKDIRAT => {
+                let dirfd = args[0] as i32;
+                let path = args[1] as *const u8;
+                let mode = args[2];
+                Self::mkdir_at(dirfd, path, mode)
+            }
+
             SYS_NANOSLEEP => {
                 let req = args[0] as *const PosixTimeSpec;
                 let rem = args[1] as *mut PosixTimeSpec;
@@ -337,6 +357,20 @@ impl Syscall {
                 let path = args[1] as *const u8;
                 let flags = args[2] as u32;
                 Self::unlinkat(dirfd, path, flags)
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            SYS_SYMLINK => {
+                let oldname = args[0] as *const u8;
+                let newname = args[1] as *const u8;
+                Self::symlink(oldname, newname)
+            }
+
+            SYS_SYMLINKAT => {
+                let oldname = args[0] as *const u8;
+                let newdfd = args[1] as i32;
+                let newname = args[2] as *const u8;
+                Self::symlinkat(oldname, newdfd, newname)
             }
 
             #[cfg(target_arch = "x86_64")]
@@ -978,8 +1012,32 @@ impl Syscall {
             }
 
             SYS_FCHOWN => {
-                warn!("SYS_FCHOWN has not yet been implemented");
-                Ok(0)
+                let dirfd = args[0] as i32;
+                let uid = args[1];
+                let gid = args[2];
+                Self::fchown(dirfd, uid, gid)
+            }
+            #[cfg(target_arch = "x86_64")]
+            SYS_CHOWN => {
+                let pathname = args[0] as *const u8;
+                let uid = args[1];
+                let gid = args[2];
+                Self::chown(pathname, uid, gid)
+            }
+            #[cfg(target_arch = "x86_64")]
+            SYS_LCHOWN => {
+                let pathname = args[0] as *const u8;
+                let uid = args[1];
+                let gid = args[2];
+                Self::lchown(pathname, uid, gid)
+            }
+            SYS_FCHOWNAT => {
+                let dirfd = args[0] as i32;
+                let pathname = args[1] as *const u8;
+                let uid = args[2];
+                let gid = args[3];
+                let flag = args[4] as i32;
+                Self::fchownat(dirfd, pathname, uid, gid, flag)
             }
 
             SYS_FSYNC => {
@@ -1047,7 +1105,9 @@ impl Syscall {
                 let source = args[0] as *const u8;
                 let target = args[1] as *const u8;
                 let filesystemtype = args[2] as *const u8;
-                return Self::mount(source, target, filesystemtype, 0, null());
+                let mountflags = args[3];
+                let data = args[4] as *const u8; // 额外的mount参数，实现自己的mountdata来获取
+                return Self::mount(source, target, filesystemtype, mountflags, data);
             }
 
             SYS_UMOUNT2 => {
@@ -1139,6 +1199,21 @@ impl Syscall {
                 let initval = args[0] as u32;
                 let flags = args[1] as u32;
                 Self::sys_eventfd(initval, flags)
+            }
+            SYS_UNSHARE => Self::sys_unshare(args[0] as u64),
+            SYS_BPF => {
+                let cmd = args[0] as u32;
+                let attr = args[1] as *mut u8;
+                let size = args[2] as u32;
+                Self::sys_bpf(cmd, attr, size)
+            }
+            SYS_PERF_EVENT_OPEN => {
+                let attr = args[0] as *const u8;
+                let pid = args[1] as i32;
+                let cpu = args[2] as i32;
+                let group_fd = args[3] as i32;
+                let flags = args[4] as u32;
+                Self::sys_perf_event_open(attr, pid, cpu, group_fd, flags)
             }
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
         };

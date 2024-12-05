@@ -9,3 +9,4 @@
 
    traceback
    debug-kernel-with-gdb
+   profiling-kernel-with-dadk

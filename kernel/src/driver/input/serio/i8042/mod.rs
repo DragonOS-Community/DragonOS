@@ -69,7 +69,7 @@ pub fn i8042_setup_aux() -> Result<(), SystemError> {
     )));
     serio_device_manager().register_port(aux_port.clone() as Arc<dyn SerioDevice>)?;
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "driver_ps2_mouse"))]
     crate::driver::input::ps2_mouse::ps_mouse_device::rs_ps2_mouse_device_init(
         aux_port.clone() as Arc<dyn Device>
     )?;

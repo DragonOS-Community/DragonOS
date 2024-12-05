@@ -46,11 +46,19 @@ impl BootParams {
 
     /// 开机命令行参数字符串
     pub fn boot_cmdline_str(&self) -> &str {
-        core::str::from_utf8(self.boot_cmdline()).unwrap()
+        core::str::from_utf8(&self.boot_cmdline()[..self.boot_cmdline_len()]).unwrap()
     }
 
+    #[allow(dead_code)]
     pub fn bootloader_name(&self) -> Option<&str> {
         self.bootloader_name.as_deref()
+    }
+
+    pub fn boot_cmdline_len(&self) -> usize {
+        self.boot_command_line
+            .iter()
+            .position(|&x| x == 0)
+            .unwrap_or(self.boot_command_line.len())
     }
 
     /// 追加开机命令行参数
@@ -149,13 +157,6 @@ pub fn boot_callbacks() -> &'static dyn BootCallbacks {
 }
 
 pub(super) fn boot_callback_except_early() {
-    boot_callbacks()
-        .init_kernel_cmdline()
-        .inspect_err(|e| {
-            log::error!("Failed to init kernel cmdline: {:?}", e);
-        })
-        .ok();
-
     let mut boot_params = boot_params().write();
     boot_params.bootloader_name = boot_callbacks()
         .init_bootloader_name()

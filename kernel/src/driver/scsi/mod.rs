@@ -64,6 +64,7 @@ impl ScsiManager {
         BlockDevName::new(format!("sd{}", x), id)
     }
 
+    #[allow(dead_code)]
     pub fn free_id(&self, id: usize) {
         if id >= Self::MAX_DEVICES {
             return;

@@ -1,5 +1,3 @@
-use log::warn;
-
 use crate::{
     arch::{
         init::{early_setup_arch, setup_arch, setup_arch_post},
@@ -30,8 +28,12 @@ use crate::{
         clocksource::clocksource_boot_finish, timekeeping::timekeeping_init, timer::timer_init,
     },
 };
+use log::warn;
 
-use super::boot::boot_callback_except_early;
+use super::{
+    boot::{boot_callback_except_early, boot_callbacks},
+    cmdline::kenrel_cmdline_param_manager,
+};
 
 /// The entry point for the kernel
 ///
@@ -52,18 +54,19 @@ pub fn start_kernel() -> ! {
 #[inline(never)]
 fn do_start_kernel() {
     init_before_mem_init();
-    early_init_logging();
 
-    early_setup_arch().expect("setup_arch failed");
     unsafe { mm_init() };
 
+    // crate::debug::jump_label::static_keys_init();
     if scm_reinit().is_ok() {
         if let Err(e) = textui_init() {
             warn!("Failed to init textui: {:?}", e);
         }
     }
-
+    // 初始化内核命令行参数
+    kenrel_cmdline_param_manager().init();
     boot_callback_except_early();
+
     init_intertrait();
 
     vfs_init().expect("vfs init failed");
@@ -86,9 +89,9 @@ fn do_start_kernel() {
     kthread_init();
     setup_arch_post().expect("setup_arch_post failed");
     clocksource_boot_finish();
-
     Futex::init();
-
+    crate::bpf::init_bpf_system();
+    crate::debug::jump_label::static_keys_init();
     #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
     crate::virt::kvm::kvm_init();
 }
@@ -99,4 +102,16 @@ fn init_before_mem_init() {
     serial_early_init().expect("serial early init failed");
     let video_ok = unsafe { VideoRefreshManager::video_init().is_ok() };
     scm_init(video_ok);
+
+    early_init_logging();
+
+    early_setup_arch().expect("setup_arch failed");
+
+    boot_callbacks()
+        .init_kernel_cmdline()
+        .inspect_err(|e| {
+            log::error!("Failed to init kernel cmdline: {:?}", e);
+        })
+        .ok();
+    kenrel_cmdline_param_manager().early_init();
 }

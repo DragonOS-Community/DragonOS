@@ -1,6 +1,6 @@
 use crate::driver::base::device::bus::{bus_register, Bus};
-use crate::driver::base::event_source::subsys::EventSourceBus;
 use crate::init::initcall::INITCALL_SUBSYS;
+use crate::misc::events::subsys::EventSourceBus;
 use alloc::sync::Arc;
 use system_error::SystemError;
 use unified_init::macros::unified_init;

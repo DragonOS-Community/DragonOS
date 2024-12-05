@@ -1,9 +1,9 @@
 use crate::driver::base::device::bus::Bus;
 use crate::driver::base::device::{device_manager, device_register, sys_devices_kset, Device};
-use crate::driver::base::event_source::get_event_source_bus;
-use crate::driver::base::event_source::kprobe::device::{KprobeAttr, KprobeDevice};
 use crate::driver::base::kobject::KObject;
 use crate::init::initcall::INITCALL_DEVICE;
+use crate::misc::events::get_event_source_bus;
+use crate::misc::events::kprobe::device::{KprobeAttr, KprobeDevice};
 use alloc::sync::Arc;
 use system_error::SystemError;
 use unified_init::macros::unified_init;

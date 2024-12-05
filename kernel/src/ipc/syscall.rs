@@ -525,9 +525,12 @@ impl Syscall {
     pub fn rt_sigprocmask(
         how: i32,
         nset: usize,
-        oset: Option<usize>,
+        oldset: usize,
         sigsetsize: usize,
     ) -> Result<usize, SystemError> {
+        // 对应oset传进来一个NULL的情况
+        let oset = if oldset == 0 { None } else { Some(oldset) };
+
         if sigsetsize != size_of::<SigSet>() {
             return Err(SystemError::EFAULT);
         }

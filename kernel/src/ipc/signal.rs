@@ -441,27 +441,36 @@ pub(super) fn do_sigaction(
     return Ok(());
 }
 
-pub const SIG_BLOCK: i32 = 0;
-pub const SIG_UNBLOCK: i32 = 1;
-pub const SIG_SETMASK: i32 = 2;
+/// https://code.dragonos.org.cn/xref/linux-6.6.21/include/uapi/asm-generic/signal-defs.h#72
+/// 对应SIG_BLOCK，SIG_UNBLOCK，SIG_SETMASK
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigHow {
+    Block,
+    Unblock,
+    SetMask,
+    // 缺省值
+    Default,
+}
 
-macro_rules! iterate_thread_group {
-    ($pcb:expr,$action:expr,$($param:expr),*) => {
-        let tgid = $pcb.tgid();
-
-        // 暴力遍历每一个线程，找到相同的tgid
-        for &pid in $pcb.children_read_irqsave().iter() {
-            if let Some(child) = ProcessManager::find(pid) {
-                if child.tgid() == tgid {
-                    $action(child,$($param),*);
-                }
-            }
+impl From<i32> for SigHow {
+    fn from(value: i32) -> Self {
+        match value {
+            0 => SigHow::Block,
+            1 => SigHow::Unblock,
+            2 => SigHow::SetMask,
+            _ => SigHow::Default,
         }
-    };
+    }
+}
+
+impl From<SigHow> for i32 {
+    fn from(value: SigHow) -> Self {
+        value as i32
+    }
 }
 
 fn __set_task_blocked(pcb: &Arc<ProcessControlBlock>, new_set: &SigSet) {
-    //todo 还有一个对线程组是否为空的判断，下面对线程组组长的判断算吗？
+    //todo 还有一个对线程组是否为空的判断，进程组、线程组实现之后，需要更改这里。
     if pcb.has_pending_signal() {
         let mut newblocked = *new_set;
         let guard = pcb.sig_info_irqsave();
@@ -488,7 +497,6 @@ fn __set_current_blocked(new_set: &SigSet) {
     }
     let guard = pcb.sig_struct_irqsave();
 
-    // todo: 当一个进程有多个线程后，在这里需要设置每个线程的block字段，并且 retarget_shared_pending（虽然我还没搞明白linux这部分是干啥的）
     __set_task_blocked(&pcb, new_set);
 
     drop(guard);
@@ -526,7 +534,15 @@ fn retarget_shared_pending(pcb: Arc<ProcessControlBlock>, which: SigSet) {
         // debug!("handle done");
     };
 
-    iterate_thread_group!(pcb, thread_handling_function, &retarget);
+    // 暴力遍历每一个线程，找到相同的tgid
+    let tgid = pcb.tgid();
+    for &pid in pcb.children_read_irqsave().iter() {
+        if let Some(child) = ProcessManager::find(pid) {
+            if child.tgid() == tgid {
+                thread_handling_function(child, &retarget);
+            }
+        }
+    }
     // debug!("retarget_shared_pending done!");
 }
 
@@ -556,15 +572,15 @@ pub fn set_sigprocmask(how: i32, set: SigSet) -> Result<SigSet, SystemError> {
     let mut res_set = oset;
     drop(guard);
 
-    match how {
-        SIG_BLOCK => {
+    match how.into() {
+        SigHow::Block => {
             // debug!("SIG_BLOCK\tGoing to insert is: {}", set.bits());
             res_set.insert(set);
         }
-        SIG_UNBLOCK => {
+        SigHow::Unblock => {
             res_set.remove(set);
         }
-        SIG_SETMASK => {
+        SigHow::SetMask => {
             // debug!("SIG_SETMASK\tGoing to set is: {}", set.bits());
             res_set = set;
         }

@@ -172,7 +172,7 @@
 //     }
 //     ///在当前页表的当前级别中，移动到下一个条目。下一个条目可以指向一个page backing guest memory ，
 //     ///或者另一个页表，或者它可能是不存在的。如果迭代器能够移动到页表中的下一个条目，则返回true，
-//     ///如果迭代器已经在当前页表的末尾，则返回false。   
+//     ///如果迭代器已经在当前页表的末尾，则返回false。
 //     fn try_step_side(&mut self) -> bool {
 //         //检查迭代器是否已经在当前页表的末尾。
 //         if shadow_pt_index(self.gfn << PAGE_SHIFT, self.level) == (PT64_ENT_PER_PAGE - 1) as u64 {
@@ -210,7 +210,7 @@
 //     if !is_shadow_present_pte(spte) || is_last_spte(spte, level) {
 //         return None;
 //     }
-//     Some(VirtAddr::new(virt_2_phys//__va 
+//     Some(VirtAddr::new(virt_2_phys//__va
 //         ((spte_to_pfn(spte)<<PAGE_SHIFT) as usize
 //     )))
 // }

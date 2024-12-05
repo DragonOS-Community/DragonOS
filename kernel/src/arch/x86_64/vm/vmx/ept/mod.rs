@@ -1,29 +1,22 @@
-use super::vmx_info;
-use crate::arch::mm::{LockedFrameAllocator, PageMapper};
+use crate::arch::mm::LockedFrameAllocator;
 use crate::arch::vm::asm::VmxAsm;
-use crate::arch::vm::kvm_host::{gfn_to_gpa, gpa_to_gfn};
 use crate::arch::vm::mmu::mmu::PageLevel;
 use crate::arch::vm::mmu::mmu_internal::KvmPageFault;
 use crate::arch::vm::mmu::pte::EptPageEntry;
-use crate::arch::x86_64::mm::X86_64MMArch;
 use crate::arch::MMArch;
-use crate::libs::rwlock::RwLock;
-use crate::libs::spinlock::{SpinLock, SpinLockGuard};
+use crate::libs::spinlock::SpinLockGuard;
 use crate::mm::allocator::page_frame::FrameAllocator;
 use crate::mm::page::{
-    page_manager_lock_irqsave, Page, PageEntry, PageFlags, PageFlush, PageManager, PageTable,
+    page_manager_lock_irqsave, Page, PageFlags, PageFlush, PageManager,
 };
-use crate::mm::{phys_2_virt, MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr};
+use crate::mm::{phys_2_virt, MemoryManagementArch, PhysAddr, VirtAddr};
 use crate::smp::core::smp_get_processor_id;
 use crate::smp::cpu::AtomicProcessorId;
 use crate::smp::cpu::ProcessorId;
-use crate::{kdebug, kerror, kinfo, kwarn};
-use core::marker::PhantomData;
+use crate::{kdebug, kerror, kwarn};
 use core::ops::Add;
 use core::sync::atomic::{compiler_fence, AtomicUsize, Ordering};
-use hashbrown::HashMap;
 use system_error::SystemError;
-use x86::apic::Level;
 use x86::msr;
 use x86::vmx::vmcs::control;
 
@@ -183,9 +176,8 @@ impl EptPageTable {
         }
 
         let level = self.level - 1;
-        if phys.is_err() {
+        if let Err(_phys) = phys {
             kdebug!("EptPageTable::next_level_table: phys {:?}", phys);
-            let _phys = phys.unwrap_err();
             // Not Present的情况下，返回None
             // 这里之所以绕了一圈，是因为在虚拟机启动阶段的page_fault的addr是not_present的，但是也要进行映射
             // 可能有点问题，但是先这么写
@@ -255,10 +247,11 @@ impl EptPageMapper {
         EptPageTable::new(
             VirtAddr::new(phys_2_virt(self.root_page_addr.data())),
             self.root_page_addr,
-            PageLevel::LevelNum,
+            PageLevel::Level512G,
         )
     }
     pub fn root_page_addr() -> PhysAddr {
+        //PML4的物理地址
         let eptp = VmxAsm::vmx_vmread(control::EPTP_FULL);
         let addr = eptp & 0xFFFF_FFFF_FFFF_F000; //去除低12位
         PhysAddr::new(addr as usize)
@@ -340,7 +333,6 @@ impl EptPageMapper {
     }
 
     ///映射一个hpa到指定的gpa
-    /// fixme:感觉有问题,但说不出来
     pub fn map_gpa(
         &mut self,
         gpa: PhysAddr,
@@ -349,7 +341,6 @@ impl EptPageMapper {
         // 验证虚拟地址和物理地址是否对齐
         if !(gpa.check_aligned(MMArch::PAGE_SIZE)) {
             kerror!("Try to map unaligned page: gpa={:?}", gpa);
-            //return None;
         }
 
         // TODO： 验证flags是否合法
@@ -390,19 +381,17 @@ impl EptPageMapper {
                 unsafe {
                     MMArch::write_bytes(MMArch::phys_2_virt(hpa).unwrap(), 0, MMArch::PAGE_SIZE)
                 };
-                let entry = EptPageEntry::new(hpa.data() as u64 | 0x0600_0000_0000_0000, flags);
+                let entry = EptPageEntry::new(hpa.data() as u64, flags);
                 unsafe { table.set_entry(i, entry) };
                 compiler_fence(Ordering::SeqCst);
 
                 //打印页表项以进行验证
-                kdebug!("4K table: {:?}", table);
                 unsafe {
                     let entry_virt = table.entry_virt(i)?;
                     let _set_entry = MMArch::read::<EptPageEntry<MMArch>>(entry_virt);
-                    kdebug!("Read EPT entry by  MMArch::read::<EptPageEntry<MMArch>>(entry_virt = {:x}): {:?}",entry_virt.data(), _set_entry);
                 }
 
-                return Some(PageFlush::new((unsafe { table.entry_virt(i)? })));
+                return Some(PageFlush::new(unsafe { table.entry_virt(i)? }));
             } else {
                 let next_table = table.next_level_table(i);
                 if let Some(next_table) = next_table {
@@ -424,35 +413,32 @@ impl EptPageMapper {
                     // fixme::设置页表项的flags，可能有点问题
                     let flags: PageFlags<MMArch> = unsafe { PageFlags::from_data(0x7) };
 
-                    kdebug!("EptEntryFlags: {:?}", flags);
-                    kdebug!("frame is: {:?} , index is: {:?}", frame, i);
                     // 把新分配的页表映射到当前页表
                     unsafe { table.set_entry(i, EptPageEntry::new(frame.data() as u64, flags)) };
 
                     // 获取新分配的页表
                     table = table.next_level_table(i)?;
-                    kdebug!("next table: {:?}", table);
                 }
             }
         }
     }
 }
-
+#[allow(dead_code)]
+//调试EPT页表用，可以打印出EPT页表的值
 pub fn debug_eptp() {
-    let PML4_hpa: PhysAddr = EptPageMapper::lock().table().phys();
+    let pml4_hpa: PhysAddr = EptPageMapper::lock().table().phys();
     kdebug!("Prepare to read EPTP address");
-    let PML4_hva = VirtAddr::new(phys_2_virt(PML4_hpa.data()));
-    kdebug!("PML4_hpa: 0x{:x}", PML4_hpa.data());
-    kdebug!("PML4_hva: 0x{:x}", PML4_hva.data()); //Level1G
+    let pml4_hva = VirtAddr::new(phys_2_virt(pml4_hpa.data()));
+    kdebug!("PML4_hpa: 0x{:x}", pml4_hpa.data());
+    kdebug!("PML4_hva: 0x{:x}", pml4_hva.data()); //Level512G
     unsafe {
-        let entry = MMArch::read::<u64>(PML4_hva);
+        let entry = MMArch::read::<u64>(pml4_hva);
         kdebug!("Value at EPTP address: 0x{:x}", entry); //Level2M
                                                          // 遍历并打印所有已分配的页面
-        traverse_ept_table(PML4_hva, 4);
+        traverse_ept_table(pml4_hva, 4);
     }
 }
 unsafe fn traverse_ept_table(table_addr: VirtAddr, level: u8) {
-
     if level == (u8::MAX) {
         return;
     }
@@ -472,7 +458,7 @@ unsafe fn traverse_ept_table(table_addr: VirtAddr, level: u8) {
             };
             let entry_value = MMArch::read::<u64>(next_level_addr);
             kdebug!(
-                "Level {} - index {}: HPA: 0x{:x}, read_to: 0x{:x}",
+                "Level {} - index {}: HPA: 0x{:016x}, read_to: 0x{:016x}",
                 level,
                 i,
                 *entry, /*& 0xFFFFFFFFF000*/

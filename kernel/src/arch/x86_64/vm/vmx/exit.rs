@@ -1,18 +1,17 @@
 use bitfield_struct::bitfield;
 use system_error::SystemError;
-use x86::vmx::vmcs::{control, guest, host, ro};
+use x86::vmx::vmcs::{guest, ro};
 
 use crate::{
     arch::{
-        kvm::vmx::{vmcs::VmcsFields, vmexit::adjust_rip, vmx_asm_wrapper::vmx_vmread},
+        kvm::vmx::{vmcs::VmcsFields, vmx_asm_wrapper::vmx_vmread},
         vm::asm::{IntrInfo, VmxAsm},
     },
-    kdebug, kerror,
-    libs::spinlock::SpinLockGuard,
+    kdebug,
     virt::vm::kvm_host::{vcpu::VirtCpu, Vm},
 };
 
-use super::{ept::EptViolationExitQual, vmx_info, PageFaultErr, Vmx};
+use super::{ept::EptViolationExitQual, vmx_info, PageFaultErr};
 extern crate num_traits;
 
 #[bitfield(u32)]
@@ -267,7 +266,6 @@ impl VmxExitHandlers {
             VmxExitReasonBasic::EPT_VIOLATION => {
                 let r = Some(Self::handle_ept_violation(vcpu, vm));
                 debug();
-                //adjust_rip(guest_rip).unwrap();
                 r
             }
             VmxExitReasonBasic::EXTERNAL_INTERRUPT => {
@@ -305,37 +303,38 @@ impl VmxExitHandlers {
 
         // 根据故障类型确定错误代码
         let mut error_code = if exit_qualification & (EptViolationExitQual::ACC_READ.bits()) != 0 {
-            kdebug!("error_code::ACC_READ");
+            //kdebug!("error_code::ACC_READ");
             PageFaultErr::PFERR_USER.bits()
         } else {
             0
         };
         error_code |= if exit_qualification & (EptViolationExitQual::ACC_WRITE.bits()) != 0 {
-            kdebug!("error_code::ACC_WRITE");
+            //kdebug!("error_code::ACC_WRITE");
             PageFaultErr::PFERR_WRITE.bits()
         } else {
             0
         };
         error_code |= if exit_qualification & (EptViolationExitQual::ACC_INSTR.bits()) != 0 {
             //actice
-            kdebug!("error_code::ACC_INSTR");
+            //kdebug!("error_code::ACC_INSTR");
             PageFaultErr::PFERR_FETCH.bits()
         } else {
             0
         };
         error_code |= if exit_qualification & (EptViolationExitQual::RWX_MASK.bits()) != 0 {
-            kdebug!("error_code::RWX_MASK");
+            //kdebug!("error_code::RWX_MASK");
             PageFaultErr::PFERR_PRESENT.bits()
         } else {
             0
         };
-        if exit_qualification & (EptViolationExitQual::GVA_IS_VALID.bits()) != 0 {//调试用
-            kdebug!("GVA is valid");
+        if exit_qualification & (EptViolationExitQual::GVA_IS_VALID.bits()) != 0 {
+            //调试用
+            //kdebug!("GVA is valid");
         } else {
-            kdebug!("GVA is invalid");
+            //kdebug!("GVA is invalid");
         }
         error_code |= if exit_qualification & (EptViolationExitQual::GVA_TRANSLATED.bits()) != 0 {
-            kdebug!("error_code:GVA GVA_TRANSLATED");
+            //kdebug!("error_code:GVA GVA_TRANSLATED");
             PageFaultErr::PFERR_GUEST_FINAL.bits() //active
         } else {
             PageFaultErr::PFERR_GUEST_PAGE.bits()
@@ -355,50 +354,50 @@ impl VmxExitHandlers {
         vcpu.page_fault(vm, gpa, error_code, None, 0)
     }
 }
-fn debug(){
-//     // 3
-//     let info = VmxAsm::vmx_vmread(VmcsFields::VMEXIT_INSTR_LEN as u32);
-//     kdebug!("vmexit handler: VMEXIT_INSTR_LEN: 0x{:x}!", info);
+fn debug() {
+    //     // 3
+    //     let info = VmxAsm::vmx_vmread(VmcsFields::VMEXIT_INSTR_LEN as u32);
+    //     kdebug!("vmexit handler: VMEXIT_INSTR_LEN: 0x{:x}!", info);
 
-//     //0
-//     let info = VmxAsm::vmx_vmread(VmcsFields::VMEXIT_INSTR_INFO as u32);
-//     kdebug!("vmexit handler: VMEXIT_INSTR_INFO: 0x{:x}!", info);
+    //     //0
+    //     let info = VmxAsm::vmx_vmread(VmcsFields::VMEXIT_INSTR_INFO as u32);
+    //     kdebug!("vmexit handler: VMEXIT_INSTR_INFO: 0x{:x}!", info);
 
-//     //0x64042
-//     /*0x64042：
+    //     //0x64042
+    //     /*0x64042：
 
-//     将其转换为二进制：0x64042 的二进制表示是 110010000001000010。
-//     每个位代表一个异常向量（例如，除以零，调试，不可屏蔽中断，断点等）。
+    //     将其转换为二进制：0x64042 的二进制表示是 110010000001000010。
+    //     每个位代表一个异常向量（例如，除以零，调试，不可屏蔽中断，断点等）。
 
-// 从 vmx_update_exception_bitmap 函数中，我们看到设置的特定异常：
+    // 从 vmx_update_exception_bitmap 函数中，我们看到设置的特定异常：
 
-//     PF_VECTOR：页面错误
-//     UD_VECTOR：未定义操作码
-//     MC_VECTOR：机器检查
-//     DB_VECTOR：调试
-//     AC_VECTOR：对齐检查
+    //     PF_VECTOR：页面错误
+    //     UD_VECTOR：未定义操作码
+    //     MC_VECTOR：机器检查
+    //     DB_VECTOR：调试
+    //     AC_VECTOR：对齐检查
 
-// 值 0x64042 设置了与这些异常相对应的位，这意味着当这些异常在来宾中发生时将导致 VM 退出。 */
-//     let info = VmxAsm::vmx_vmread(control::EXCEPTION_BITMAP);
-//     kdebug!("vmexit handler: EXCEPTION_BITMAP: 0x{:x}!", info);
+    // 值 0x64042 设置了与这些异常相对应的位，这意味着当这些异常在来宾中发生时将导致 VM 退出。 */
+    //     let info = VmxAsm::vmx_vmread(control::EXCEPTION_BITMAP);
+    //     kdebug!("vmexit handler: EXCEPTION_BITMAP: 0x{:x}!", info);
 
-//     //9
-//     let info = VmxAsm::vmx_vmread(control::PAGE_FAULT_ERR_CODE_MASK);
-//     kdebug!("vmexit handler: PAGE_FAULT_ERR_CODE_MASK: 0x{:x}!", info);
+    //     //9
+    //     let info = VmxAsm::vmx_vmread(control::PAGE_FAULT_ERR_CODE_MASK);
+    //     kdebug!("vmexit handler: PAGE_FAULT_ERR_CODE_MASK: 0x{:x}!", info);
 
-//     //1
-//     let info = VmxAsm::vmx_vmread(control::PAGE_FAULT_ERR_CODE_MATCH);
-//     kdebug!("vmexit handler: PAGE_FAULT_ERR_CODE_MATCH: 0x{:x}!", info);
+    //     //1
+    //     let info = VmxAsm::vmx_vmread(control::PAGE_FAULT_ERR_CODE_MATCH);
+    //     kdebug!("vmexit handler: PAGE_FAULT_ERR_CODE_MATCH: 0x{:x}!", info);
 
-//     //0
-//     let info = VmxAsm::vmx_vmread(control::EPTP_LIST_ADDR_FULL);
-//     kdebug!("vmexit handler: EPTP_LIST_ADDR_FULL: 0x{:x}!", info);
+    //     //0
+    //     let info = VmxAsm::vmx_vmread(control::EPTP_LIST_ADDR_FULL);
+    //     kdebug!("vmexit handler: EPTP_LIST_ADDR_FULL: 0x{:x}!", info);
 
-//     let info = VmxAsm::vmx_vmread(ro::VM_INSTRUCTION_ERROR);
-//     kdebug!("vmexit handler: VM_INSTRUCTION_ERROR: 0x{:x}!", info);
+    //     let info = VmxAsm::vmx_vmread(ro::VM_INSTRUCTION_ERROR);
+    //     kdebug!("vmexit handler: VM_INSTRUCTION_ERROR: 0x{:x}!", info);
 
-    let info = VmxAsm::vmx_vmread(ro::EXIT_REASON);
-    kdebug!("vmexit handler: EXIT_REASON:{}!", info);//48:EPT VIOLATION
+    // let info = VmxAsm::vmx_vmread(ro::EXIT_REASON);
+    // kdebug!("vmexit handler: EXIT_REASON:0x{:x}!", info);//EPT VIOLATION
 
     // let info = VmxAsm::vmx_vmread(ro::VMEXIT_INTERRUPTION_INFO);
     // kdebug!("vmexit handler: VMEXIT_INTERRUPTION_INFO: 0x{:x}!", info);
@@ -408,7 +407,7 @@ fn debug(){
 
     // let info = VmxAsm::vmx_vmread(ro::IDT_VECTORING_INFO);
     // kdebug!("vmexit handler: IDT_VECTORING_INFO: 0x{:x}!", info);
-    
+
     // let info = VmxAsm::vmx_vmread(ro::IDT_VECTORING_ERR_CODE);
     // kdebug!("vmexit handler: IDT_VECTORING_ERR_CODE: 0x{:x}!", info);
 
@@ -418,7 +417,6 @@ fn debug(){
     // let info = VmxAsm::vmx_vmread(ro::VMEXIT_INSTRUCTION_INFO);
     // kdebug!("vmexit handler: VMEXIT_INSTRUCTION_INFO: 0x{:x}!", info);
 
-
     //panic
     // let info = VmxAsm::vmx_vmread(control::EPTP_INDEX);
     // kdebug!("vmexit handler: EPTP_INDEX: 0x{:x}!", info);
@@ -426,5 +424,4 @@ fn debug(){
     //panic
     // let info = VmxAsm::vmx_vmread(control::VIRT_EXCEPTION_INFO_ADDR_FULL);
     // kdebug!("vmexit handler: VIRT_EXCEPTION_INFO_ADDR_FULL: 0x{:x}!", info);
-
 }

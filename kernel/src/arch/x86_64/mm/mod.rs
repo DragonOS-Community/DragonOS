@@ -401,7 +401,7 @@ impl X86_64MMArch {
             vec.push(Self::read(addr + i * core::mem::size_of::<T>()));
         }
         vec
-    } 
+    }
 }
 
 impl VirtAddr {

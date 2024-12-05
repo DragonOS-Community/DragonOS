@@ -17,7 +17,7 @@ use x86_64::registers::control::EferFlags;
 
 use crate::arch::vm::asm::VmxAsm;
 use crate::arch::vm::vmx::exit::ExitFastpathCompletion;
-use crate::{kdebug, kwarn};
+use crate::kwarn;
 use crate::virt::vm::kvm_host::mem::KvmMmuMemoryCache;
 use crate::virt::vm::kvm_host::vcpu::VcpuMode;
 use crate::{
@@ -47,7 +47,7 @@ use crate::{
 };
 
 use super::{lapic::KvmLapic, HFlags, KvmCommonRegs, KvmIrqChipMode};
-
+const MSR_IA32_CR_PAT_DEFAULT: u64 = 0x0007_0406_0007_0406;
 #[derive(Debug)]
 pub struct X86VcpuArch {
     /// 最近一次尝试进入虚拟机的主机cpu
@@ -257,8 +257,8 @@ impl X86VcpuArch {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn is_pae_paging(&mut self) -> bool {
-
         let flag1 = self.is_long_mode();
         let flag2 = self.is_pae();
         let flag3 = self.is_paging();
@@ -269,7 +269,6 @@ impl X86VcpuArch {
     #[inline]
     pub fn is_pae(&mut self) -> bool {
         !self.read_cr4_bits(Cr4::CR4_ENABLE_PAE).is_empty()
-
     }
     #[inline]
     pub fn is_paging(&mut self) -> bool {
@@ -606,6 +605,7 @@ impl X86VcpuArch {
 
 impl VirtCpu {
     pub fn init_arch(&mut self, vm: &mut Vm, id: usize) -> Result<(), SystemError> {
+        //kvm_arch_vcpu_create
         vm.vcpu_precreate(id)?;
 
         self.arch.last_vmentry_cpu = ProcessorId::INVALID;
@@ -627,6 +627,10 @@ impl VirtCpu {
         }
 
         x86_kvm_ops().vcpu_create(self, vm);
+
+        //lots of todo!!!
+
+        self.arch.pat = MSR_IA32_CR_PAT_DEFAULT;
 
         self.load();
         self.vcpu_reset(vm, false)?;
@@ -1200,7 +1204,6 @@ impl VirtCpu {
         if !self.arch.is_register_available(KvmReg::VcpuExregCr3) {
             x86_kvm_ops().cache_reg(&mut self.arch, KvmReg::VcpuExregCr3);
         }
-        kdebug!("read_cr3:: cr3: {:#x}", self.arch.cr3);
         return self.arch.cr3;
     }
 
@@ -1316,7 +1319,6 @@ impl VirtCpu {
         *mmu_reset_needed |= self.read_cr3() != sregs.cr3;
 
         self.arch.cr3 = sregs.cr3;
-        kdebug!("_set_segmenet_regs_common 1:: cr3: {:#x}", self.arch.cr3);
 
         self.arch.mark_register_dirty(KvmReg::VcpuExregCr3);
 
@@ -1491,20 +1493,20 @@ impl VirtCpu {
         }
     }
 
-    pub fn load_pdptrs(&mut self){
+    pub fn load_pdptrs(&mut self) {
         //let mmu = self.arch.mmu();
-        if !self.arch.is_register_dirty(KvmReg::VcpuExregCr3){
+        if !self.arch.is_register_dirty(KvmReg::VcpuExregCr3) {
             return;
         }
         //if self.arch.is_pae_paging(){
-            let mmu = self.arch.mmu();
+        let mmu = self.arch.mmu();
 
-            VmxAsm::vmx_vmwrite(guest::PDPTE0_FULL, mmu.pdptrs[0]);
-            VmxAsm::vmx_vmwrite(guest::PDPTE0_FULL, mmu.pdptrs[1]);
-            VmxAsm::vmx_vmwrite(guest::PDPTE0_FULL, mmu.pdptrs[2]);
-            VmxAsm::vmx_vmwrite(guest::PDPTE0_FULL, mmu.pdptrs[3]);
+        VmxAsm::vmx_vmwrite(guest::PDPTE0_FULL, mmu.pdptrs[0]);
+        VmxAsm::vmx_vmwrite(guest::PDPTE0_FULL, mmu.pdptrs[1]);
+        VmxAsm::vmx_vmwrite(guest::PDPTE0_FULL, mmu.pdptrs[2]);
+        VmxAsm::vmx_vmwrite(guest::PDPTE0_FULL, mmu.pdptrs[3]);
         //}else{
-           // kdebug!("load_pdptrs: not pae paging");
+        // kdebug!("load_pdptrs: not pae paging");
         //}
     }
 }

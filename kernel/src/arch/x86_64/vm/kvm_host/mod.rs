@@ -30,8 +30,8 @@ use super::{
 };
 
 pub mod lapic;
-pub mod vcpu;
 pub mod page;
+pub mod vcpu;
 #[allow(dead_code)]
 pub const TSS_IOPB_BASE_OFFSET: usize = 0x66;
 pub const TSS_BASE_SIZE: usize = 0x68;
@@ -69,7 +69,7 @@ pub struct X86KvmArch {
     pub active_mmu_pages: Vec<u64>,
 
     pub n_max_mmu_pages: usize,
-    pub n_used_mmu_pages:usize,
+    pub n_used_mmu_pages: usize,
 }
 
 impl X86KvmArch {

@@ -1,10 +1,7 @@
-use crate::arch::kvm::vmx::ept;
 use crate::arch::vm::asm::VmxAsm;
 use crate::arch::vm::kvm_host::page::KVM_MIN_FREE_MMU_PAGES;
-use crate::arch::vm::mmu::mmu_internal::KvmMmuPage;
 use crate::kerror;
-use crate::mm::page::PageEntry;
-use crate::mm::{phys_2_virt, PhysAddr, VirtAddr};
+use crate::mm::PhysAddr;
 use crate::virt::kvm::host_mem::PAGE_SHIFT;
 use crate::{arch::mm::X86_64MMArch, kdebug, kwarn};
 use crate::{
@@ -15,13 +12,12 @@ use crate::{
 };
 use alloc::{sync::Arc, vec::Vec};
 use bitfield_struct::bitfield;
-use x86::vmx::vmcs::guest;
 use core::intrinsics::likely;
 use core::ops::{Add, Sub};
-use core::ptr;
 use raw_cpuid::CpuId;
 use system_error::SystemError;
 use x86::controlregs::{Cr0, Cr4};
+use x86::vmx::vmcs::guest;
 use x86_64::registers::control::EferFlags;
 
 use super::super::{vmx::vmx_info, x86_kvm_ops};
@@ -115,7 +111,6 @@ impl PageLevel {
     pub fn kvm_pages_per_hpage(level: u8) -> u64 {
         Self::kvm_hpage_size(level) / PAGE_SIZE
     }
-    
 }
 ///计算给定 GFN（Guest Frame Number）在指定级别上的对齐值
 pub fn gfn_round_for_level(gfn: u64, level: u8) -> u64 {
@@ -156,11 +151,11 @@ pub struct KvmMmu {
 
     pae_root: Vec<u64>,
 
-    pub pdptrs: [u64;4],
+    pub pdptrs: [u64; 4],
 }
 
 impl KvmMmu {
-    pub fn _save_pdptrs(&mut self){
+    pub fn _save_pdptrs(&mut self) {
         self.pdptrs[0] = VmxAsm::vmx_vmread(guest::PDPTE0_FULL);
         self.pdptrs[1] = VmxAsm::vmx_vmread(guest::PDPTE1_FULL);
         self.pdptrs[2] = VmxAsm::vmx_vmread(guest::PDPTE2_FULL);
@@ -312,7 +307,7 @@ pub struct KvmMmuRoleRegs {
 /// page falut的返回值, 用于表示页面错误的处理结果
 /// 应用在handle_mmio_page_fault()、mmu.page_fault()、fast_page_fault()和
 /// kvm_mmu_do_page_fault()等
-#[derive(Debug, Eq, PartialEq, FromPrimitive,Clone)]
+#[derive(Debug, Eq, PartialEq, FromPrimitive, Clone)]
 #[repr(u32)]
 pub enum PFRet {
     Continue,       // RET_PF_CONTINUE: 到目前为止一切正常，继续处理页面错误。
@@ -588,10 +583,10 @@ impl VirtCpu {
         Ok(())
     }
 
-    fn mmu_alloc_direct_roots(&mut self,vm: &Vm) -> Result<(), SystemError> {
+    fn mmu_alloc_direct_roots(&mut self, vm: &Vm) -> Result<(), SystemError> {
         let shadow_root_level = self.arch.mmu().root_role.level();
         let r: Result<(), SystemError> = self.make_mmu_pages_available(vm);
-        let root:PhysAddr;
+        let root: PhysAddr;
         if KvmMmu::tdp_enabled() {
             root = self.kvm_tdp_mmu_get_vcpu_root_hpa().unwrap();
             let mut mmu = self.arch.mmu();
@@ -609,47 +604,45 @@ impl VirtCpu {
         Ok(())
     }
 
-    fn mmu_alloc_shadow_roots(&mut self,_vm: &Vm) -> Result<(), SystemError> {
+    fn mmu_alloc_shadow_roots(&mut self, _vm: &Vm) -> Result<(), SystemError> {
         todo!();
     }
-    fn make_mmu_pages_available(&mut self,vm: &Vm) -> Result<(), SystemError> {
+    fn make_mmu_pages_available(&mut self, vm: &Vm) -> Result<(), SystemError> {
         let avail = Self::kvm_mmu_available_pages(vm);
-        if likely(avail >= KVM_MIN_FREE_MMU_PAGES){
+        if likely(avail >= KVM_MIN_FREE_MMU_PAGES) {
             return Ok(());
         }
         //kvm_mmu_zap_oldest_mmu_pages(vm, KVM_REFILL_PAGES - avail);
-        if Self::kvm_mmu_available_pages(vm) == 0{
+        if Self::kvm_mmu_available_pages(vm) == 0 {
             return Err(SystemError::ENOSPC);
         }
         Ok(())
     }
     fn kvm_mmu_available_pages(vm: &Vm) -> usize {
-        if vm.arch.n_max_mmu_pages > vm.arch.n_used_mmu_pages
-        {
-            return vm.arch.n_max_mmu_pages - vm.arch.n_used_mmu_pages
+        if vm.arch.n_max_mmu_pages > vm.arch.n_used_mmu_pages {
+            return vm.arch.n_max_mmu_pages - vm.arch.n_used_mmu_pages;
         }
         return 0;
     }
-    fn kvm_tdp_mmu_get_vcpu_root_hpa(&self) -> Result<PhysAddr,SystemError>{
-
+    fn kvm_tdp_mmu_get_vcpu_root_hpa(&self) -> Result<PhysAddr, SystemError> {
         //todo Check for an existing root before allocating a new one.  Note, the
         // role check prevents consuming an invalid root.
         let root = self.tdp_mmu_alloc_sp().unwrap();
         Ok(PhysAddr::new(root as usize))
     }
-    fn tdp_mmu_alloc_sp(&self) -> Result<u64,SystemError>{
-       // 申请并创建新的页表
-       let mapper: crate::mm::page::PageMapper<X86_64MMArch, LockedFrameAllocator> = unsafe {
-        PageMapper::create(PageTableKind::EPT, LockedFrameAllocator)
-        .ok_or(SystemError::ENOMEM)?
-    };
-    
-    let ept_root_hpa = mapper.table().phys();
-    
-    self.arch.mmu().root.hpa = ept_root_hpa.data() as u64;
-    
-    kdebug!("ept_root_hpa:{:x}!", ept_root_hpa.data() as u64);
-    
-    return Ok(self.arch.mmu().root.hpa);
+    fn tdp_mmu_alloc_sp(&self) -> Result<u64, SystemError> {
+        // 申请并创建新的页表
+        let mapper: crate::mm::page::PageMapper<X86_64MMArch, LockedFrameAllocator> = unsafe {
+            PageMapper::create(PageTableKind::EPT, LockedFrameAllocator)
+                .ok_or(SystemError::ENOMEM)?
+        };
+
+        let ept_root_hpa = mapper.table().phys();
+
+        self.arch.mmu().root.hpa = ept_root_hpa.data() as u64;
+
+        kdebug!("ept_root_hpa:{:x}!", ept_root_hpa.data() as u64);
+
+        return Ok(self.arch.mmu().root.hpa);
     }
 }

@@ -11,7 +11,8 @@ use crate::{
         mmu::mmu::PageLevel, CPU_BASED_ALWAYSON_WITHOUT_TRUE_MSR,
         PIN_BASED_ALWAYSON_WITHOUT_TRUE_MSR, VM_ENTRY_ALWAYSON_WITHOUT_TRUE_MSR,
         VM_EXIT_ALWAYSON_WITHOUT_TRUE_MSR,
-    }, kdebug, virt::vm::kvm_host::vcpu::VirtCpu
+    },
+    virt::vm::kvm_host::vcpu::VirtCpu,
 };
 
 use super::{vmcs::feat::VmxFeat, Vmx};
@@ -583,7 +584,7 @@ impl Vmx {
     #[inline]
     pub fn vmx_need_pf_intercept(&self, _vcpu: &VirtCpu) -> bool {
         // if (!enable_ept)
-		// return true;
+        // return true;
         false
     }
 }

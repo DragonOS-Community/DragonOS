@@ -1,27 +1,23 @@
-use alloc::{
-    boxed::Box,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
-use core::{intrinsics::unlikely, ops::Index, ptr};
+use crate::arch::vm::vmx::ept::debug_eptp;
+use alloc::sync::Arc;
+use core::{intrinsics::unlikely, ops::Index};
 use x86::vmx::vmcs::{guest, host};
-use crate::{arch::{kvm::vmx::{ept::EptMapper, mmu::tdp_set_eptp}, vm::{kvm_host::page, vmx::ept::debug_eptp}}, mm::VirtAddr};
 
 use system_error::SystemError;
 
 use crate::{
-    arch::{vm::{
-        asm::VmxAsm,
-        kvm_host::{EmulType, KVM_PFN_NOSLOT},
-        mmu::{
-            mmu::{PFRet, PageLevel},
+    arch::{
+        vm::{
+            asm::VmxAsm,
+            kvm_host::{EmulType, KVM_PFN_NOSLOT},
+            mmu::mmu::{PFRet, PageLevel},
+            mtrr::kvm_mtrr_check_gfn_range_consistency,
+            vmx::{ept::EptPageMapper, PageFaultErr},
         },
-        mtrr::kvm_mtrr_check_gfn_range_consistency,
-        vmx::{ept::EptPageMapper, PageFaultErr},
-    }, MMArch},
+        MMArch,
+    },
     kdebug, kwarn,
-    libs::spinlock::SpinLockGuard,
-    mm::{page::PageFlags, syscall::ProtFlags, virt_2_phys, PhysAddr},
+    mm::{page::PageFlags, PhysAddr},
     virt::{
         kvm::host_mem::PAGE_SHIFT,
         vm::kvm_host::{
@@ -127,10 +123,6 @@ impl VirtCpu {
     ) -> Result<i32, SystemError> {
         let mut emulation_type = EmulType::PF;
         let direct = self.arch.mmu().root_role.get_direct();
-        // IMPLICIT_ACCESS 是一个 KVM 定义的标志，用于在模拟触发隐式访问的指令时正确执行 SMAP 检查。
-        // 防止内核态代码（超级用户模式）访问用户态内存。它是通过设置 CR4 寄存器中的 SMAP 位来启用的。
-        // 如果硬件生成的错误代码与 KVM 定义的值冲突，则发出警告。
-        // 清除该标志并继续，不终止虚拟机，因为 KVM 不可能依赖于 KVM 不知道的标志。
         if error_code & PageFaultErr::PFERR_IMPLICIT_ACCESS.bits() != 0 {
             kwarn!("Implicit access error code detected");
             error_code &= !PageFaultErr::PFERR_IMPLICIT_ACCESS.bits();
@@ -151,7 +143,13 @@ impl VirtCpu {
 
         if r == PFRet::Invalid {
             r = self
-                .do_page_fault(vm, cr2_or_gpa, (error_code & 0xFFFFFFFF) as u32, false, emulation_type)?
+                .do_page_fault(
+                    vm,
+                    cr2_or_gpa,
+                    (error_code & 0xFFFFFFFF) as u32,
+                    false,
+                    emulation_type,
+                )?
                 .into();
             if r == PFRet::Invalid {
                 return Err(SystemError::EIO);
@@ -266,7 +264,6 @@ impl VirtCpu {
     ) -> Result<i32, SystemError> {
         // 如果 shadow_memtype_mask 为真，并且虚拟机有非一致性 DMA
         //if shadow_memtype_mask != 0 && self.kvm().lock().arch.noncoherent_dma_count > 0 {
-        //这一段不是很懂
         while page_fault.max_level > PageLevel::Level4K as u8 {
             let page_num = PageLevel::kvm_pages_per_hpage(page_fault.max_level);
 
@@ -286,6 +283,7 @@ impl VirtCpu {
             return self.kvm_tdp_mmu_page_fault(vm, page_fault);
         }
 
+        //正常是不会执行到这里的，因为我们的是支持ept的
         self.direct_page_fault(page_fault)
     }
     fn kvm_tdp_mmu_page_fault(
@@ -304,35 +302,23 @@ impl VirtCpu {
         }
 
         r = PFRet::Retry;
-        //todo 判断页表是否过时
-        //if is_page_fault_stale(vcpu, fault)  ?
+        //if self.is_page_fault_stale(page_fault) {return;}
+
         //实际的映射
-        r=self.tdp_map(page_fault)?.into();
-        
+        r = self.tdp_mmu_map(page_fault)?.into();
+
         Ok(r.into())
     }
-    fn tdp_map(&self, page_fault: &mut KvmPageFault) -> Result<i32, SystemError> {
-        //没有实现huge page相关
-        // let mmu = self.arch.mmu();
-        // let kvm = self.kvm();
-        // let ret = PFRet::Retry;
+    //没有实现huge page相关
+    fn tdp_mmu_map(&self, page_fault: &mut KvmPageFault) -> Result<i32, SystemError> {
+        // let ret = PFRet::Retry;//下面的逻辑和linux不一致，可能在判断返回值会有问题
         let mut mapper = EptPageMapper::lock();
-        // if mapper.is_mapped(page_fault) {
-            //     kdebug!("page fault is already mapped");
-            //     return Ok(PFRet::Continue.into());
-            // };
-            kdebug!("{:?}",&page_fault);
-            //flags ：rwx
-            let page_flags: PageFlags<MMArch> = unsafe { PageFlags::from_data(0xb77) } ;
-            mapper.map(PhysAddr::new( page_fault.gpa() as usize), page_flags);
-            debug_eptp();
+        kdebug!("{:?}", &page_fault);
+        //flags ：rwx
+        let page_flags: PageFlags<MMArch> = unsafe { PageFlags::from_data(0xb77) };
+        mapper.map(PhysAddr::new(page_fault.gpa() as usize), page_flags);
+        //debug_eptp();
 
-        //原kvm实现
-        // let mut mapper = EptMapper::lock();
-        // unsafe { mapper.walk(page_fault.gpa(), page_fault.pfn()<<PAGE_SHIFT, page_flags).is_ok() };
-
-        
-        
         kdebug!("The ept_root_addr is {:?}", EptPageMapper::root_page_addr());
         //todo: 一些参数的更新
         Ok(PFRet::Fixed.into())

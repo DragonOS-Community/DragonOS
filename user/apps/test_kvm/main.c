@@ -512,26 +512,29 @@ int kvm(uint8_t code[], size_t code_len)
 
   /*汇编指令解释
 0xB0 0x61 (mov al, 0x61)
-
 解释：将立即数 0x61（ASCII 字符 'a'）加载到 AL 寄存器中。
+
 0xBA 0x17 0x02 (mov dx, 0x0217)
-
+Linux: ilen = 3 外中断和EPT_VIOLATION
 解释：将立即数 0x0217 加载到 DX 寄存器中。
-0xEE (out dx, al)
 
+0xEE (out dx, al)
 解释：将 AL 寄存器的值输出到 DX 寄存器指定的端口。
+
 0xB0 0x0A (mov al, 0x0A)
-
 解释：将立即数 0x0A（换行符）加载到 AL 寄存器中。
+
 0xEE (out dx, al)
-
 解释：将 AL 寄存器的值输出到 DX 寄存器指定的端口。
-0xF4 (hlt)
 
+0xF4 (hlt)
 解释：执行 hlt 指令，使处理器进入休眠状态，直到下一个外部中断到来。*/
+
 int main()
 {
-  uint8_t code[] = "\xB0\x61\xBA\x17\x02\xEE\xB0\n\xEE\xF4";
+	//uint8_t code[] = "\xB0\x61\xBA\x17\x02\xEE\xB0\n\xEE\xF4";
+  	//uint8_t code[] = "\xB0\x61\xBA\x17\x02\xEE\xF4";
+	uint8_t code[] = "\xB0\x61\xF4";
   kvm(code, sizeof(code));
   return 0;
 }

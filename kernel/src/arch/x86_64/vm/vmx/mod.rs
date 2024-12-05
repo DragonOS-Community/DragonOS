@@ -2,7 +2,6 @@ use core::intrinsics::likely;
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicBool, Ordering};
 use exit::VmxExitHandlers;
-use x86::segmentation::GateDescriptorBuilder;
 use x86_64::registers::control::Cr3Flags;
 use x86_64::structures::paging::PhysFrame;
 
@@ -422,10 +421,9 @@ impl VmxKvmFunc {
         VmxAsm::vmx_vmwrite(seg_field.limit, 0xffff);
 
         let mut ar = 0x93;
-        if seg == VcpuSegment::CS {//todo疑似DS
+        if seg == VcpuSegment::CS {
             ar |= 0x08;
         }
-
         VmxAsm::vmx_vmwrite(seg_field.ar_bytes, ar);
     }
 }
@@ -482,7 +480,6 @@ impl KvmFunc for VmxKvmFunc {
             // VCPU_EXREG_PDPTR
             KvmReg::NrVcpuRegs => {
                 if vmx_info().enable_ept {
-
                     todo!()
                 }
             }
@@ -1204,7 +1201,7 @@ impl KvmFunc for VmxKvmFunc {
         if basic == VmxExitReasonBasic::EXTERNAL_INTERRUPT {
             Vmx::handle_external_interrupt_irqoff(vcpu);
         } else if basic == VmxExitReasonBasic::EXCEPTION_OR_NMI {
-            todo!()
+            //todo!()
         }
     }
 
@@ -1240,7 +1237,6 @@ impl KvmFunc for VmxKvmFunc {
             } else if vcpu.arch.is_register_dirty(KvmReg::VcpuExregCr3) {
                 guest_cr3 = vcpu.arch.cr3;
                 kdebug!("load_mmu_pgd: guest_cr3 = {:#x}", guest_cr3);
-
             } else {
                 return;
             }
@@ -1818,7 +1814,7 @@ impl Vmx {
             .vmentry_ctrl
             .contains(EntryControls::LOAD_IA32_PAT)
         {
-            VmxAsm::vmx_vmwrite(guest::IA32_PAT_FULL, vcpu.arch.pat)//todo
+            VmxAsm::vmx_vmwrite(guest::IA32_PAT_FULL, vcpu.arch.pat) //todo
         }
 
         let mut loaded_vmcs = vcpu.vmx().loaded_vmcs.lock();
@@ -1887,11 +1883,13 @@ impl Vmx {
 
     /// 打印VMCS信息用于debug
     pub fn dump_vmcs(&self, vcpu: &VirtCpu) {
-        let vmentry_ctl =
-            unsafe { EntryControls::from_bits_unchecked(self.vmread(control::VMENTRY_CONTROLS) as u32) };
+        let vmentry_ctl = unsafe {
+            EntryControls::from_bits_unchecked(self.vmread(control::VMENTRY_CONTROLS) as u32)
+        };
 
-        let vmexit_ctl =
-            unsafe { ExitControls::from_bits_unchecked(self.vmread(control::VMEXIT_CONTROLS) as u32) };
+        let vmexit_ctl = unsafe {
+            ExitControls::from_bits_unchecked(self.vmread(control::VMEXIT_CONTROLS) as u32)
+        };
 
         let cpu_based_exec_ctl = PrimaryControls::from_bits_truncate(
             self.vmread(control::PRIMARY_PROCBASED_EXEC_CONTROLS) as u32,
@@ -1904,9 +1902,11 @@ impl Vmx {
         // let cr4 = Cr4::from_bits_truncate(self.vmread(guest::CR4) as usize);
 
         let secondary_exec_control = if self.has_sceondary_exec_ctrls() {
-            unsafe { SecondaryControls::from_bits_unchecked(
-                self.vmread(control::SECONDARY_PROCBASED_EXEC_CONTROLS) as u32,
-            ) }
+            unsafe {
+                SecondaryControls::from_bits_unchecked(
+                    self.vmread(control::SECONDARY_PROCBASED_EXEC_CONTROLS) as u32,
+                )
+            }
         } else {
             SecondaryControls::empty()
         };
@@ -2984,7 +2984,11 @@ impl Vmx {
         exit_fastpath: ExitFastpathCompletion,
     ) -> Result<i32, SystemError> {
         let exit_reason = vcpu.vmx().exit_reason;
-
+        // self.dump_vmcs(vcpu);
+        {
+            let reason = self.vmread(ro::EXIT_REASON);
+            kdebug!("vm_exit reason 0x{:x}\n", reason);
+        }
         let unexpected_vmexit = |vcpu: &mut VirtCpu| -> Result<i32, SystemError> {
             kerror!("vmx: unexpected exit reason {:?}\n", exit_reason);
 
@@ -3050,16 +3054,16 @@ impl Vmx {
         if exit_fastpath != ExitFastpathCompletion::None {
             return Err(SystemError::EINVAL);
         }
-        
+
         match VmxExitHandlers::try_handle_exit(
             vcpu,
             vm,
             VmxExitReasonBasic::from(exit_reason.basic()),
         ) {
             Some(Ok(r)) => {
-                self.dump_vmcs(vcpu);
-                return Ok(r)
-            },
+                kdebug!("vmx: handled exit return {:?}\n", r);
+                return Ok(r);
+            }
             Some(Err(_)) | None => unexpected_vmexit(vcpu),
         }
     }
@@ -3655,14 +3659,22 @@ pub enum VmxL1dFlushState {
     NotRequired,
 }
 
+#[derive(Debug, PartialEq)]
 pub struct VmxSegmentField {
     selector: u32,
     base: u32,
     limit: u32,
     ar_bytes: u32,
 }
-
+//fix
 pub const KVM_VMX_SEGMENT_FIELDS: &[VmxSegmentField] = &[
+    // ES
+    VmxSegmentField {
+        selector: guest::ES_SELECTOR,
+        base: guest::ES_BASE,
+        limit: guest::ES_LIMIT,
+        ar_bytes: guest::ES_ACCESS_RIGHTS,
+    },
     // CS
     VmxSegmentField {
         selector: guest::CS_SELECTOR,
@@ -3670,19 +3682,19 @@ pub const KVM_VMX_SEGMENT_FIELDS: &[VmxSegmentField] = &[
         limit: guest::CS_LIMIT,
         ar_bytes: guest::CS_ACCESS_RIGHTS,
     },
+    // SS
+    VmxSegmentField {
+        selector: guest::SS_SELECTOR,
+        base: guest::SS_BASE,
+        limit: guest::SS_LIMIT,
+        ar_bytes: guest::SS_ACCESS_RIGHTS,
+    },
     // DS
     VmxSegmentField {
         selector: guest::DS_SELECTOR,
         base: guest::DS_BASE,
         limit: guest::DS_LIMIT,
         ar_bytes: guest::DS_ACCESS_RIGHTS,
-    },
-    // ES
-    VmxSegmentField {
-        selector: guest::ES_SELECTOR,
-        base: guest::ES_BASE,
-        limit: guest::ES_LIMIT,
-        ar_bytes: guest::ES_ACCESS_RIGHTS,
     },
     // FS
     VmxSegmentField {
@@ -3697,13 +3709,6 @@ pub const KVM_VMX_SEGMENT_FIELDS: &[VmxSegmentField] = &[
         base: guest::GS_BASE,
         limit: guest::GS_LIMIT,
         ar_bytes: guest::GS_ACCESS_RIGHTS,
-    },
-    // SS
-    VmxSegmentField {
-        selector: guest::SS_SELECTOR,
-        base: guest::SS_BASE,
-        limit: guest::SS_LIMIT,
-        ar_bytes: guest::SS_ACCESS_RIGHTS,
     },
     // TR
     VmxSegmentField {
@@ -3754,7 +3759,4 @@ unsafe extern "C" fn vmx_update_host_rsp(vcpu_vmx: &VmxVCpuPriv, host_rsp: usize
 unsafe extern "C" fn vmx_spec_ctrl_restore_host(_vcpu_vmx: &VmxVCpuPriv, _flags: u32) {
     // TODO
     kwarn!("vmx_spec_ctrl_restore_host todo!");
-}
-const fn vmcs_control_bit(x: u32) -> u32 {
-    1 << (x & 0x1f)
 }

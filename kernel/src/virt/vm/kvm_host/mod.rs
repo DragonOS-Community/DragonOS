@@ -18,10 +18,7 @@ use crate::{
         CurrentKvmManager, KvmArch, VirtCpuArch,
     },
     filesystem::vfs::file::{File, FileMode},
-    libs::{
-        rbtree::RBTree,
-        spinlock::{SpinLock, SpinLockGuard},
-    },
+    libs::spinlock::{SpinLock, SpinLockGuard},
     mm::ucontext::AddressSpace,
     process::ProcessManager,
     smp::cpu::ProcessorId,

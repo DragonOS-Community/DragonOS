@@ -427,13 +427,12 @@ impl IndexNode for KvmVcpuDev {
                 let mut sreg = UapiKvmSegmentRegs::default();
                 user_reader.copy_one_from_user(&mut sreg, 0)?;
 
-                if let Ok(res) = self.vcpu.lock().set_segment_regs(&mut sreg){
+                if let Ok(res) = self.vcpu.lock().set_segment_regs(&mut sreg) {
                     return Ok(0);
-                }else{
+                } else {
                     kdebug!("set segment regs failed");
                     return Err(SystemError::EINVAL);
                 }
-
             }
 
             _ => {

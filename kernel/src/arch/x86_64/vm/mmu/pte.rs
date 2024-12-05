@@ -1,6 +1,10 @@
-use core::{fmt::{Debug, Error, Formatter}, marker::PhantomData};
+use core::{
+    fmt::{Debug, Error, Formatter},
+    marker::PhantomData,
+};
 
-use crate::{arch::MMArch, mm::{page::PageFlags, MemoryManagementArch, PhysAddr}};
+use crate::mm::{page::PageFlags, MemoryManagementArch}
+;
 
 bitflags::bitflags! {
     pub struct PteFlags: u64 {

@@ -350,7 +350,7 @@ impl VmxExitHandlers {
         // if allow_smaller_maxphyaddr && kvm_vcpu_is_illegal_gpa(vcpu, gpa) {
         //     return kvm_emulate_instruction(vcpu, 0);
         // }
-        kdebug!("EPT violation: error_code={:#x}", error_code);
+        //kdebug!("EPT violation: error_code={:#x}", error_code);
         vcpu.page_fault(vm, gpa, error_code, None, 0)
     }
 }

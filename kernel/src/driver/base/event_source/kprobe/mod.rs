@@ -3,12 +3,15 @@ use crate::driver::base::device::{device_manager, device_register, sys_devices_k
 use crate::driver::base::event_source::get_event_source_bus;
 use crate::driver::base::event_source::kprobe::device::{KprobeAttr, KprobeDevice};
 use crate::driver::base::kobject::KObject;
+use crate::init::initcall::INITCALL_DEVICE;
 use alloc::sync::Arc;
 use system_error::SystemError;
+use unified_init::macros::unified_init;
 
 pub mod device;
 static mut KPROBE_DEVICE: Option<Arc<KprobeDevice>> = None;
 
+#[unified_init(INITCALL_DEVICE)]
 pub fn kprobe_subsys_init() -> Result<(), SystemError> {
     let kprobe_device = KprobeDevice::new(Some(Arc::downgrade(
         &(sys_devices_kset() as Arc<dyn KObject>),

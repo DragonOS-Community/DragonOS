@@ -405,11 +405,7 @@ impl ProcFS {
          * In the above, 5.4.8 is what kernel is actually expecting, while
          * uname() call will return 5.4.0 in info.release.
          */
-        let binding = inode.create(
-            "version_signature",
-            FileType::File,
-            ModeType::from_bits_truncate(0o444),
-        );
+        let binding = inode.create("version_signature", FileType::File, ModeType::S_IRUGO);
         if let Ok(version_signature) = binding {
             let version_signature = version_signature
                 .as_any_ref()

@@ -172,11 +172,11 @@ impl Attribute for KprobeAttr {
     }
 
     fn mode(&self) -> ModeType {
-        ModeType::from_bits_truncate(0o444)
+        ModeType::S_IRUGO
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::ATTR_SHOW | SysFSOpsSupport::BATTR_READ
+        SysFSOpsSupport::ATTR_SHOW
     }
     fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
         if buf.is_empty() {

@@ -535,10 +535,7 @@ impl Syscall {
             return Err(SystemError::EFAULT);
         }
 
-        let sighow: SigHow = match SigHow::try_from(how) {
-            Ok(how) => how,
-            Err(e) => return Err(e),
-        };
+        let sighow = SigHow::try_from(how)?;
 
         let reader = UserBufferReader::new(
             VirtAddr::new(nset).as_ptr::<u64>(),

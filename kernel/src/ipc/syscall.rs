@@ -530,16 +530,15 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         // 对应oset传进来一个NULL的情况
         let oset = if oldset == 0 { None } else { Some(oldset) };
-        let sighow: SigHow;
 
         if sigsetsize != size_of::<SigSet>() {
             return Err(SystemError::EFAULT);
         }
 
-        match SigHow::try_from(how) {
-            Ok(how) => sighow = how,
+        let sighow: SigHow = match SigHow::try_from(how) {
+            Ok(how) => how,
             Err(e) => return Err(e),
-        }
+        };
 
         let reader = UserBufferReader::new(
             VirtAddr::new(nset).as_ptr::<u64>(),

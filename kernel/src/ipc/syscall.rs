@@ -35,7 +35,7 @@ use crate::{
 use super::{
     pipe::{LockedPipeInode, PipeFsPrivateData},
     shm::{ShmCtlCmd, ShmFlags, ShmId, ShmKey},
-    signal::set_sigprocmask,
+    signal::{set_sigprocmask, SigHow},
     signal_types::{
         SaHandlerType, SigInfo, SigType, Sigaction, SigactionType, UserSigaction, USER_SIG_DFL,
         USER_SIG_ERR, USER_SIG_IGN,
@@ -530,9 +530,15 @@ impl Syscall {
     ) -> Result<usize, SystemError> {
         // 对应oset传进来一个NULL的情况
         let oset = if oldset == 0 { None } else { Some(oldset) };
+        let sighow: SigHow;
 
         if sigsetsize != size_of::<SigSet>() {
             return Err(SystemError::EFAULT);
+        }
+
+        match SigHow::try_from(how) {
+            Ok(how) => sighow = how,
+            Err(e) => return Err(e),
         }
 
         let reader = UserBufferReader::new(
@@ -549,7 +555,7 @@ impl Syscall {
             <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
         new_set.remove(to_remove);
 
-        let oldset_te_return = set_sigprocmask(how, new_set)?;
+        let oldset_te_return = set_sigprocmask(sighow, new_set)?;
         if let Some(oldset) = oset {
             // debug!("Get Oldset to return: {}", &oldset_te_return.bits());
             let mut writer = UserBufferWriter::new(

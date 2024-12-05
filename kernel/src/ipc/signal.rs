@@ -445,27 +445,20 @@ pub(super) fn do_sigaction(
 /// 对应SIG_BLOCK，SIG_UNBLOCK，SIG_SETMASK
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SigHow {
-    Block,
-    Unblock,
-    SetMask,
-    // 缺省值
-    Default,
+    Block = 0,
+    Unblock = 1,
+    SetMask = 2,
 }
 
-impl From<i32> for SigHow {
-    fn from(value: i32) -> Self {
+impl TryFrom<i32> for SigHow {
+    type Error = SystemError;
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
         match value {
-            0 => SigHow::Block,
-            1 => SigHow::Unblock,
-            2 => SigHow::SetMask,
-            _ => SigHow::Default,
+            0 => Ok(SigHow::Block),
+            1 => Ok(SigHow::Unblock),
+            2 => Ok(SigHow::SetMask),
+            _ => Err(SystemError::EINVAL),
         }
-    }
-}
-
-impl From<SigHow> for i32 {
-    fn from(value: SigHow) -> Self {
-        value as i32
     }
 }
 
@@ -564,7 +557,7 @@ pub fn set_current_blocked(new_set: &mut SigSet) {
 ///
 /// - `how` 设置方式
 /// - `new_set` 新的屏蔽信号bitmap的值
-pub fn set_sigprocmask(how: i32, set: SigSet) -> Result<SigSet, SystemError> {
+pub fn set_sigprocmask(how: SigHow, set: SigSet) -> Result<SigSet, SystemError> {
     let pcb: Arc<ProcessControlBlock> = ProcessManager::current_pcb();
     let guard = pcb.sig_info_irqsave();
     let oset = *guard.sig_block();
@@ -572,7 +565,7 @@ pub fn set_sigprocmask(how: i32, set: SigSet) -> Result<SigSet, SystemError> {
     let mut res_set = oset;
     drop(guard);
 
-    match how.into() {
+    match how {
         SigHow::Block => {
             // debug!("SIG_BLOCK\tGoing to insert is: {}", set.bits());
             res_set.insert(set);
@@ -583,9 +576,6 @@ pub fn set_sigprocmask(how: i32, set: SigSet) -> Result<SigSet, SystemError> {
         SigHow::SetMask => {
             // debug!("SIG_SETMASK\tGoing to set is: {}", set.bits());
             res_set = set;
-        }
-        _ => {
-            return Err(SystemError::EINVAL);
         }
     }
 

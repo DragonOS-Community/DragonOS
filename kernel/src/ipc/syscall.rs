@@ -521,15 +521,16 @@ impl Syscall {
     /// 失败：错误码
     ///
     /// ## 说明
-    /// 根据 https://man7.org/linux/man-pages/man2/sigprocmask.2.html ，传进来的oset和nset都是指针类型，这里选择传入usize然后转换为u64的指针类型
+    /// 根据 https://man7.org/linux/man-pages/man2/sigprocmask.2.html ，传进来的oldset和newset都是指针类型，这里选择传入usize然后转换为u64的指针类型
     pub fn rt_sigprocmask(
         how: i32,
-        nset: usize,
+        newset: usize,
         oldset: usize,
         sigsetsize: usize,
     ) -> Result<usize, SystemError> {
         // 对应oset传进来一个NULL的情况
         let oset = if oldset == 0 { None } else { Some(oldset) };
+        let nset = if newset == 0 { None } else { Some(newset) };
 
         if sigsetsize != size_of::<SigSet>() {
             return Err(SystemError::EFAULT);
@@ -537,29 +538,31 @@ impl Syscall {
 
         let sighow = SigHow::try_from(how)?;
 
-        let reader = UserBufferReader::new(
-            VirtAddr::new(nset).as_ptr::<u64>(),
-            core::mem::size_of::<u64>(),
-            true,
-        )?;
+        let mut new_set = SigSet::default();
+        if let Some(nset) = nset {
+            let reader = UserBufferReader::new(
+                VirtAddr::new(nset).as_ptr::<u64>(),
+                core::mem::size_of::<u64>(),
+                true,
+            )?;
 
-        let nset = reader.read_one_from_user::<u64>(0)?;
-        let mut new_set = SigSet::from_bits_truncate(*nset);
-        // debug!("Get Newset: {}", &new_set.bits());
+            let nset = reader.read_one_from_user::<u64>(0)?;
+            new_set = SigSet::from_bits_truncate(*nset);
+            // debug!("Get Newset: {}", &new_set.bits());
+            let to_remove: SigSet =
+                <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
+            new_set.remove(to_remove);
+        }
 
-        let to_remove: SigSet =
-            <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
-        new_set.remove(to_remove);
-
-        let oldset_te_return = set_sigprocmask(sighow, new_set)?;
+        let oldset_to_return = set_sigprocmask(sighow, new_set)?;
         if let Some(oldset) = oset {
-            // debug!("Get Oldset to return: {}", &oldset_te_return.bits());
+            // debug!("Get Oldset to return: {}", &oldset_to_return.bits());
             let mut writer = UserBufferWriter::new(
                 VirtAddr::new(oldset).as_ptr::<u64>(),
                 core::mem::size_of::<u64>(),
                 true,
             )?;
-            writer.copy_one_to_user::<u64>(&oldset_te_return.bits(), 0)?;
+            writer.copy_one_to_user::<u64>(&oldset_to_return.bits(), 0)?;
         }
 
         Ok(0)

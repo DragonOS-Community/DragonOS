@@ -3,6 +3,19 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#define TEST_ASSERT(left, right, success_msg, fail_msg)                        \
+    do {                                                                       \
+        if ((left) == (right)) {                                               \
+            printf("[PASS] %s\n", success_msg);                                \
+        } else {                                                               \
+            printf("[FAIL] %s: Expected 0x%lx, but got 0x%lx\n",               \
+                   fail_msg,                                                   \
+                   (unsigned long)(right),                                     \
+                   (unsigned long)(left));                                     \
+        }                                                                      \
+    } while (0)
+
+
 void signal_handler(int signo) {
     if (signo == SIGINT) {
         printf("\nReceived SIGINT (Ctrl+C)\n");
@@ -19,14 +32,22 @@ void print_signal_mask(const char *msg, const sigset_t *mask) {
     printf("\n");
 }
 
-void check_signal_in_mask(int signo, const char *msg) {
-    sigset_t current_mask;
-    sigprocmask(SIG_SETMASK, NULL, &current_mask);
-    if (sigismember(&current_mask, signo)) {
-        printf("%s: Signal %d is in the mask.\n", msg, signo);
-    } else {
-        printf("%s: Signal %d is not in the mask.\n", msg, signo);
+// 获取当前屏蔽字的函数
+unsigned long get_signal_mask() {
+    sigset_t sigset;
+    if (sigprocmask(SIG_BLOCK, NULL, &sigset) == -1) {
+        perror("sigprocmask");
+        return -1; // 返回错误标记
     }
+
+    // 将信号集编码为位掩码
+    unsigned long mask = 0;
+    for (int i = 1; i < NSIG; i++) {
+        if (sigismember(&sigset, i)) {
+            mask |= 1UL << (i - 1);
+        }
+    }
+    return mask;
 }
 
 int main() {
@@ -52,9 +73,16 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
+    // 打印 old_mask 的值
+    print_signal_mask("old_mask", &old_mask);
 
     // 检查 SIGINT 是否被屏蔽
-    check_signal_in_mask(SIGINT, "After blocking SIGINT");
+    unsigned long actual_mask = get_signal_mask();
+    unsigned long expected_mask = (1UL << (SIGINT - 1));
+    TEST_ASSERT(actual_mask,
+                expected_mask,
+                "Signal mask is as expected",
+                "Signal mask mismatch");
 
     printf("SIGINT is now blocked. Try pressing Ctrl+C...\n");
 
@@ -64,13 +92,19 @@ int main() {
            "have appeared.\n");
 
     // 恢复原来的信号屏蔽字
-    if (sigprocmask(SIG_SETMASK, &old_mask, NULL) < 0) {
+    if (sigprocmask(SIG_SETMASK, &old_mask, &old_mask) < 0) {
         perror("sigprocmask - SIG_SETMASK");
         exit(EXIT_FAILURE);
     }
+    print_signal_mask("old_mask returned", &old_mask);
 
     // 检查 SIGINT 是否被解除屏蔽
-    check_signal_in_mask(SIGINT, "After unblocking SIGINT");
+    actual_mask = get_signal_mask();
+    expected_mask = 0;
+    TEST_ASSERT(actual_mask,
+                expected_mask,
+                "Signal mask is as expected",
+                "Signal mask mismatch");
 
     printf("SIGINT is now unblocked. Try pressing Ctrl+C again...\n");
 

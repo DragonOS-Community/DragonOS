@@ -25,6 +25,7 @@ use crate::{
         procfs::procfs_register_pid,
         vfs::{file::FileDescriptorVec, MAX_PATHLEN},
     },
+    libs::rand::rand_bytes,
     mm::{
         ucontext::{AddressSpace, UserStack},
         verify_area, MemoryManagementArch, VirtAddr,
@@ -184,7 +185,7 @@ impl Syscall {
         };
         let (user_sp, argv_ptr) = unsafe {
             param
-                .init_info()
+                .init_info_mut()
                 .push_at(
                     // address_space
                     //     .write()

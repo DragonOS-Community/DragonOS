@@ -14,9 +14,8 @@ use crate::{
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::PosixTimeSpec,
 };
-use alloc::vec::Vec;
 use core::sync::atomic::{compiler_fence, Ordering};
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 use ida::IdAllocator;
 use log::info;
 use num::ToPrimitive;
@@ -371,6 +370,8 @@ pub struct KernelShm {
     shm_start_paddr: PhysAddr,
     /// 共享内存大小(bytes)，注意是用户指定的大小（未经过页面对齐）
     shm_size: usize,
+    /// 映射计数
+    map_count: usize,
     /// 最后一次连接的时间
     shm_atim: PosixTimeSpec,
     /// 最后一次断开连接的时间
@@ -390,6 +391,7 @@ impl KernelShm {
             kern_ipc_perm,
             shm_start_paddr,
             shm_size,
+            map_count: 0,
             shm_atim: PosixTimeSpec::new(0, 0),
             shm_dtim: PosixTimeSpec::new(0, 0),
             shm_ctim: PosixTimeSpec::now(),
@@ -432,26 +434,7 @@ impl KernelShm {
 
     /// 共享内存段的映射计数（有多少个不同的VMA映射）
     pub fn map_count(&self) -> usize {
-        let mut page_manager_guard = page_manager_lock_irqsave();
-        let mut id_set: HashSet<usize> = HashSet::new();
-        let mut cur_phys = PhysPageFrame::new(self.shm_start_paddr);
-        let page_count = PageFrameCount::from_bytes(page_align_up(self.shm_size)).unwrap();
-
-        for _ in 0..page_count.data() {
-            let page = page_manager_guard.get(&cur_phys.phys_address()).unwrap();
-            id_set.extend(
-                page.read_irqsave()
-                    .vma_set()
-                    .iter()
-                    .map(|vma| vma.id())
-                    .collect::<Vec<_>>(),
-            );
-
-            cur_phys = cur_phys.next();
-        }
-
-        // 由于LockedVMA的id是独一无二的，因此有多少个不同的id，就代表着有多少个不同的VMA映射到共享内存段
-        return id_set.len();
+        self.map_count
     }
 
     pub fn copy_from(&mut self, shm_id_ds: PosixShmIdDs) {
@@ -469,6 +452,19 @@ impl KernelShm {
         }
 
         self.update_ctim();
+    }
+
+    pub fn mode(&self) -> &ShmFlags {
+        &self.kern_ipc_perm.mode
+    }
+
+    pub fn increase_count(&mut self) {
+        self.map_count += 1;
+    }
+
+    pub fn decrease_count(&mut self) {
+        assert!(self.map_count > 0, "map_count is zero");
+        self.map_count -= 1;
     }
 }
 

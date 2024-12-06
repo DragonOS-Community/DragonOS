@@ -403,6 +403,9 @@ impl Syscall {
         // 更新最后一次连接时间
         kernel_shm.update_atim();
 
+        // 映射计数增加
+        kernel_shm.increase_count();
+
         Ok(r)
     }
 
@@ -457,7 +460,14 @@ impl Syscall {
             .ok_or(SystemError::EINVAL)?;
         // 更新最后一次断开连接时间
         kernel_shm.update_dtim();
-        drop(shm_manager_guard);
+
+        // 映射计数减少
+        kernel_shm.decrease_count();
+
+        // 释放shm_id
+        if kernel_shm.map_count() == 0 && kernel_shm.mode().contains(ShmFlags::SHM_DEST) {
+            shm_manager_guard.free_id(shm_id);
+        }
 
         // 取消映射
         let flusher: PageFlushAll<MMArch> = PageFlushAll::new();

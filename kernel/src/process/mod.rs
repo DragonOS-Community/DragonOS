@@ -275,7 +275,12 @@ impl ProcessManager {
                 // avoid deadlock
                 drop(writer);
 
-                let rq = cpu_rq(pcb.sched_info().on_cpu().unwrap().data() as usize);
+                let rq = cpu_rq(
+                    pcb.sched_info()
+                        .on_cpu()
+                        .unwrap_or(smp_get_processor_id())
+                        .data() as usize,
+                );
 
                 let (rq, _guard) = rq.self_lock();
                 rq.update_rq_clock();
@@ -421,6 +426,7 @@ impl ProcessManager {
         }
         drop(thread);
         unsafe { pcb.basic_mut().set_user_vm(None) };
+        pcb.exit_files();
 
         // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
         // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
@@ -1049,6 +1055,11 @@ impl ProcessControlBlock {
 
     pub fn set_nsproxy(&self, nsprsy: NsProxy) {
         *self.nsproxy.write() = nsprsy;
+    }
+
+    /// Exit fd table when process exit
+    fn exit_files(&self) {
+        self.basic.write_irqsave().set_fd_table(None);
     }
 }
 

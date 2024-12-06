@@ -1,13 +1,8 @@
 user_sub_dirs = apps
 
-SUBDIR_ROOTS := . 
-DIRS := . $(shell find $(SUBDIR_ROOTS) -type d)
-GARBAGE_PATTERNS := *.o *.a
-GARBAGE := $(foreach DIR,$(DIRS),$(addprefix $(DIR)/,$(GARBAGE_PATTERNS)))
-
 DADK_VERSION=$(shell dadk -V | awk 'END {print $$2}')
 # 最小的DADK版本
-MIN_DADK_VERSION = 0.1.11
+MIN_DADK_VERSION = 0.2.0
 DADK_CACHE_DIR = $(ROOT_PATH)/bin/dadk_cache
 
 ECHO:
@@ -41,15 +36,12 @@ endif
 .PHONY: dadk_run
 dadk_run: install_dadk
 	mkdir -p $(DADK_CACHE_DIR)
-	dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot build
-	dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot install
+	$(DADK) user build -w $(ROOT_PATH)
+	$(DADK) user install -w $(ROOT_PATH)
 
 .PHONY: dadk_clean
 dadk_clean: install_dadk
 	@echo dadk_clean
-# 不运行dadk clean的原因是，把clean的工作交给应用程序自己去做，这样可以节省编译时间
-#dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot clean src
-#dadk --config-dir dadk/config --cache-dir $(DADK_CACHE_DIR) --dragonos-dir $(ROOT_PATH)/bin/sysroot clean target
 
 all:
 	mkdir -p $(ROOT_PATH)/bin/sysroot
@@ -59,13 +51,13 @@ all:
 
 	@echo 用户态程序编译完成
 
-copy_sysconfig: dadk_run
+.PHONY: copy_sysconfig
+copy_sysconfig:
 	cp -r sysconfig/* $(ROOT_PATH)/bin/sysroot/
 
 
 .PHONY: clean
 clean:
-	rm -rf $(GARBAGE)
 	$(MAKE) dadk_clean
 	@list='$(user_sub_dirs)'; for subdir in $$list; do \
 		echo "Clean in dir: $$subdir";\

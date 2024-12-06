@@ -1,14 +1,17 @@
 use core::sync::atomic::{compiler_fence, AtomicUsize, Ordering};
 
 use crate::{
-    arch::CurrentIrqArch, exception::InterruptArch, process::ProcessControlBlock,
-    smp::core::smp_get_processor_id, time::jiffies::TICK_NESC,
+    arch::CurrentIrqArch,
+    exception::InterruptArch,
+    process::ProcessControlBlock,
+    smp::{core::smp_get_processor_id, cpu::ProcessorId},
+    time::jiffies::TICK_NESC,
 };
 use alloc::sync::Arc;
 
 use super::{clock::SchedClock, cpu_irq_time};
 
-pub fn irq_time_read(cpu: usize) -> u64 {
+pub fn irq_time_read(cpu: ProcessorId) -> u64 {
     compiler_fence(Ordering::SeqCst);
     let irqtime = cpu_irq_time(cpu);
 
@@ -49,7 +52,7 @@ impl IrqTime {
     }
 
     pub fn irqtime_start() {
-        let cpu = smp_get_processor_id().data() as usize;
+        let cpu = smp_get_processor_id();
         let irq_time = cpu_irq_time(cpu);
         compiler_fence(Ordering::SeqCst);
         irq_time.irq_start_time = SchedClock::sched_clock_cpu(cpu) as u64;
@@ -58,7 +61,7 @@ impl IrqTime {
 
     pub fn irqtime_account_irq(_pcb: Arc<ProcessControlBlock>) {
         compiler_fence(Ordering::SeqCst);
-        let cpu = smp_get_processor_id().data() as usize;
+        let cpu = smp_get_processor_id();
         let irq_time = cpu_irq_time(cpu);
         compiler_fence(Ordering::SeqCst);
         let delta = SchedClock::sched_clock_cpu(cpu) as u64 - irq_time.irq_start_time;
@@ -93,7 +96,7 @@ impl CpuTimeFunc {
         let mut accounted = Self::steal_account_process_time(max);
 
         if accounted < max {
-            let irqtime = cpu_irq_time(smp_get_processor_id().data() as usize);
+            let irqtime = cpu_irq_time(smp_get_processor_id());
             accounted += irqtime.irqtime_tick_accounted(max - accounted);
         }
 

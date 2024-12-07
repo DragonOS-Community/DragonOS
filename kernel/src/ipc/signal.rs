@@ -441,18 +441,46 @@ pub(super) fn do_sigaction(
     return Ok(());
 }
 
-/// 设置当前进程的屏蔽信号 (sig_block)，待引入 [sigprocmask](https://man7.org/linux/man-pages/man2/sigprocmask.2.html) 系统调用后要删除这个散装函数
-///
-/// ## 参数
-///
-/// - `new_set` 新的屏蔽信号bitmap的值
-pub fn set_current_sig_blocked(new_set: &mut SigSet) {
-    let to_remove: SigSet =
-        <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
-    new_set.remove(to_remove);
-    //TODO 把这个散装函数用 sigsetops 替换掉
-    let pcb = ProcessManager::current_pcb();
+/// https://code.dragonos.org.cn/xref/linux-6.6.21/include/uapi/asm-generic/signal-defs.h#72
+/// 对应SIG_BLOCK，SIG_UNBLOCK，SIG_SETMASK
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigHow {
+    Block = 0,
+    Unblock = 1,
+    SetMask = 2,
+}
 
+impl TryFrom<i32> for SigHow {
+    type Error = SystemError;
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(SigHow::Block),
+            1 => Ok(SigHow::Unblock),
+            2 => Ok(SigHow::SetMask),
+            _ => Err(SystemError::EINVAL),
+        }
+    }
+}
+
+fn __set_task_blocked(pcb: &Arc<ProcessControlBlock>, new_set: &SigSet) {
+    //todo 还有一个对线程组是否为空的判断，进程组、线程组实现之后，需要更改这里。
+    if pcb.has_pending_signal() {
+        let mut newblocked = *new_set;
+        let guard = pcb.sig_info_irqsave();
+        newblocked.remove(*guard.sig_block());
+        drop(guard);
+
+        // 从主线程开始去遍历
+        if let Some(group_leader) = pcb.threads_read_irqsave().group_leader() {
+            retarget_shared_pending(group_leader, newblocked);
+        }
+    }
+    *pcb.sig_info_mut().sig_block_mut() = *new_set;
+    recalc_sigpending();
+}
+
+fn __set_current_blocked(new_set: &SigSet) {
+    let pcb = ProcessManager::current_pcb();
     /*
         如果当前pcb的sig_blocked和新的相等，那么就不用改变它。
         请注意，一个进程的sig_blocked字段不能被其他进程修改！
@@ -460,12 +488,97 @@ pub fn set_current_sig_blocked(new_set: &mut SigSet) {
     if pcb.sig_info_irqsave().sig_block().eq(new_set) {
         return;
     }
-
     let guard = pcb.sig_struct_irqsave();
-    // todo: 当一个进程有多个线程后，在这里需要设置每个线程的block字段，并且 retarget_shared_pending（虽然我还没搞明白linux这部分是干啥的）
 
-    // 设置当前进程的sig blocked
-    *pcb.sig_info_mut().sig_block_mut() = *new_set;
-    recalc_sigpending();
+    __set_task_blocked(&pcb, new_set);
+
     drop(guard);
+}
+
+fn retarget_shared_pending(pcb: Arc<ProcessControlBlock>, which: SigSet) {
+    let retarget = pcb.sig_info_irqsave().sig_shared_pending().signal();
+    retarget.intersects(which);
+    if retarget.is_empty() {
+        return;
+    }
+
+    // 对于线程组中的每一个线程都要执行的函数
+    let thread_handling_function = |pcb: Arc<ProcessControlBlock>, retarget: &SigSet| {
+        if retarget.is_empty() {
+            return;
+        }
+
+        if pcb.flags().contains(ProcessFlags::EXITING) {
+            return;
+        }
+
+        let blocked = pcb.sig_info_irqsave().sig_shared_pending().signal();
+        if retarget.difference(blocked).is_empty() {
+            return;
+        }
+
+        retarget.intersects(blocked);
+        if !pcb.has_pending_signal() {
+            let guard = pcb.sig_struct_irqsave();
+            signal_wake_up(pcb.clone(), guard, false);
+        }
+        // 之前的对retarget的判断移动到最前面，因为对于当前线程的线程的处理已经结束，对于后面的线程在一开始判断retarget为空即可结束处理
+
+        // debug!("handle done");
+    };
+
+    // 暴力遍历每一个线程，找到相同的tgid
+    let tgid = pcb.tgid();
+    for &pid in pcb.children_read_irqsave().iter() {
+        if let Some(child) = ProcessManager::find(pid) {
+            if child.tgid() == tgid {
+                thread_handling_function(child, &retarget);
+            }
+        }
+    }
+    // debug!("retarget_shared_pending done!");
+}
+
+/// 设置当前进程的屏蔽信号 (sig_block)
+///
+/// ## 参数
+///
+/// - `new_set` 新的屏蔽信号bitmap的值
+pub fn set_current_blocked(new_set: &mut SigSet) {
+    let to_remove: SigSet =
+        <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();
+    new_set.remove(to_remove);
+    __set_current_blocked(new_set);
+}
+
+/// 设置当前进程的屏蔽信号 (sig_block)
+///
+/// ## 参数
+///
+/// - `how` 设置方式
+/// - `new_set` 新的屏蔽信号bitmap的值
+pub fn set_sigprocmask(how: SigHow, set: SigSet) -> Result<SigSet, SystemError> {
+    let pcb: Arc<ProcessControlBlock> = ProcessManager::current_pcb();
+    let guard = pcb.sig_info_irqsave();
+    let oset = *guard.sig_block();
+
+    let mut res_set = oset;
+    drop(guard);
+
+    match how {
+        SigHow::Block => {
+            // debug!("SIG_BLOCK\tGoing to insert is: {}", set.bits());
+            res_set.insert(set);
+        }
+        SigHow::Unblock => {
+            res_set.remove(set);
+        }
+        SigHow::SetMask => {
+            // debug!("SIG_SETMASK\tGoing to set is: {}", set.bits());
+            res_set = set;
+        }
+    }
+
+    __set_current_blocked(&res_set);
+    Ok(oset)
 }

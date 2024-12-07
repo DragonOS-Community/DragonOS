@@ -12,7 +12,7 @@ use crate::{
     },
     exception::InterruptArch,
     ipc::{
-        signal::set_current_sig_blocked,
+        signal::set_current_blocked,
         signal_types::{SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch},
     },
     mm::MemoryManagementArch,
@@ -511,7 +511,7 @@ impl SignalArch for X86_64SignalArch {
             return trap_frame.rax;
         }
         let mut sigmask: SigSet = unsafe { (*frame).context.oldmask };
-        set_current_sig_blocked(&mut sigmask);
+        set_current_blocked(&mut sigmask);
         // 从用户栈恢复sigcontext
         if !unsafe { &mut (*frame).context }.restore_sigcontext(trap_frame) {
             error!("unable to restore sigcontext");

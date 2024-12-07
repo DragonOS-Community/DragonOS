@@ -64,9 +64,9 @@ ENTRY(ret_from_intr)
     // 进入信号处理流程
     cli
 
-    // 将原本要返回的栈帧的栈指针传入do_signal的第一个参数
+    // 将原本要返回的栈帧的栈指针传入irqentry_exit的第一个参数
     movq %rsp, %rdi
-    callq do_signal
+    callq irqentry_exit
     cli
 
 __entry_ret_from_intr_before_gs_check_2:
@@ -375,10 +375,10 @@ ENTRY(syscall_64)
     sti
     callq *%rdx //调用服务程序
 
-    // 将原本要返回的栈帧的栈指针传入do_signal的第一个参数
+    // 将原本要返回的栈帧的栈指针传入 irqentry_exit 的第一个参数
     movq %rsp, %rdi
 
-    callq do_signal
+    callq irqentry_exit
 
     cli
     

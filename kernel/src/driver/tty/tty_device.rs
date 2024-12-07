@@ -263,7 +263,7 @@ impl IndexNode for TtyDevice {
                 break;
             }
 
-            if pcb.sig_info_irqsave().sig_pending().has_pending() {
+            if pcb.has_pending_signal_fast() {
                 return Err(SystemError::ERESTARTSYS);
             }
         }

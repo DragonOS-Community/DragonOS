@@ -24,13 +24,10 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-use self::{
-    core::generate_inode_id,
-    file::{FileMode, PageCache},
-    syscall::ModeType,
-    utils::DName,
-};
+use self::{core::generate_inode_id, file::FileMode, syscall::ModeType, utils::DName};
 pub use self::{core::ROOT_INODE, file::FilePrivateData, mount::MountFS};
+
+use super::page_cache::PageCache;
 
 /// vfs容许的最大的路径名称长度
 pub const MAX_PATHLEN: usize = 1024;
@@ -128,6 +125,15 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
     }
+
+    fn read_sync(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
+
+    fn write_sync(&self, _offset: usize, _buf: &[u8]) -> Result<usize, SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
+
     /// @brief 打开文件
     ///
     /// @return 成功：Ok()
@@ -183,6 +189,52 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         buf: &[u8],
         _data: SpinLockGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
+
+    /// # 在inode的指定偏移量开始，读取指定大小的数据，忽略PageCache
+    ///
+    /// ## 参数
+    ///
+    /// - `offset`: 起始位置在Inode中的偏移量
+    /// - `len`: 要读取的字节数
+    /// - `buf`: 缓冲区
+    /// - `data`: 各文件系统系统所需私有信息
+    ///
+    /// ## 返回值
+    ///
+    /// - `Ok(usize)``: Ok(读取的字节数)
+    /// - `Err(SystemError)``: Err(Posix错误码)
+    fn read_direct(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
+
+    /// # 在inode的指定偏移量开始，写入指定大小的数据，忽略PageCache
+    ///
+    /// ## 参数
+    ///
+    /// - `offset`: 起始位置在Inode中的偏移量
+    /// - `len`: 要读取的字节数
+    /// - `buf`: 缓冲区
+    /// - `data`: 各文件系统系统所需私有信息
+    ///
+    /// ## 返回值
+    ///
+    /// - `Ok(usize)``: Ok(读取的字节数)
+    /// - `Err(SystemError)``: Err(Posix错误码)
+    fn write_direct(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
+        _data: SpinLockGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        return Err(SystemError::ENOSYS);
+    }
 
     /// @brief 获取当前inode的状态。
     ///

@@ -16,9 +16,12 @@
     } while (0)
 
 
+static int signal_received = 0;
+
 void signal_handler(int signo) {
     if (signo == SIGINT) {
         printf("\nReceived SIGINT (Ctrl+C)\n");
+        signal_received = 1;
     }
 }
 
@@ -60,6 +63,11 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
+    signal_received = 0;
+    kill(getpid(), SIGINT);
+    TEST_ASSERT(signal_received, 1, "SIGINT was received", "SIGINT was not received");
+    signal_received = 0;
+
     // 初始化新的信号集，并将 SIGINT 添加到其中
     sigemptyset(&new_mask);
     sigaddset(&new_mask, SIGINT);
@@ -84,13 +92,15 @@ int main() {
                 "Signal mask is as expected",
                 "Signal mask mismatch");
 
-    printf("SIGINT is now blocked. Try pressing Ctrl+C...\n");
+    printf("SIGINT is now blocked.\n");
+    signal_received = 0;
+    // 向当前进程发送 SIGINT
+    kill(getpid(), SIGINT);
 
     // 等待 5 秒，以便测试 SIGINT 是否被屏蔽
     sleep(5);
-    printf("\nIf you pressed Ctrl+C, SIGINT was blocked, and no message should "
-           "have appeared.\n");
-
+    TEST_ASSERT(signal_received, 0, "SIGINT was blocked", "SIGINT was not blocked");
+    signal_received = 0;
     // 恢复原来的信号屏蔽字
     if (sigprocmask(SIG_SETMASK, &old_mask, &old_mask) < 0) {
         perror("sigprocmask - SIG_SETMASK");
@@ -106,10 +116,14 @@ int main() {
                 "Signal mask is as expected",
                 "Signal mask mismatch");
 
-    printf("SIGINT is now unblocked. Try pressing Ctrl+C again...\n");
+    printf("SIGINT is now unblocked.\n");
+
+    signal_received = 0;
+    kill(getpid(), SIGINT);
 
     // 等待 5 秒，以便测试 SIGINT 是否解除屏蔽
     sleep(5);
+    TEST_ASSERT(signal_received, 1, "SIGINT was received", "SIGINT was not received");
 
     printf("Exiting program.\n");
     return 0;

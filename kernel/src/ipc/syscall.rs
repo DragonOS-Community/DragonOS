@@ -19,7 +19,7 @@ use crate::{
     libs::{align::page_align_up, spinlock::SpinLock},
     mm::{
         allocator::page_frame::{PageFrameCount, PhysPageFrame, VirtPageFrame},
-        page::{page_manager_lock_irqsave, EntryFlags, PageFlushAll, PageType},
+        page::{page_manager_lock_irqsave, EntryFlags, PageFlushAll},
         syscall::ProtFlags,
         ucontext::{AddressSpace, VMA},
         VirtAddr, VmFlags,
@@ -432,41 +432,6 @@ impl Syscall {
         // 判断vaddr是否为起始地址
         if vma.lock_irqsave().region().start() != vaddr {
             return Err(SystemError::EINVAL);
-        }
-
-        // 获取映射的物理地址
-        let paddr = address_write_guard
-            .user_mapper
-            .utable
-            .translate(vaddr)
-            .ok_or(SystemError::EINVAL)?
-            .0;
-
-        // 如果物理页的shm_id为None，代表不是共享页
-        let mut page_manager_guard = page_manager_lock_irqsave();
-        let page = page_manager_guard.get(&paddr).ok_or(SystemError::EINVAL)?;
-        let page_guard = page.read_irqsave();
-        let shm_id = if let PageType::Shm(shm_id) = page_guard.page_type() {
-            shm_id
-        } else {
-            return Err(SystemError::EINVAL);
-        };
-        drop(page_manager_guard);
-
-        // 获取对应共享页管理信息
-        let mut shm_manager_guard = shm_manager_lock();
-        let kernel_shm = shm_manager_guard
-            .get_mut(shm_id)
-            .ok_or(SystemError::EINVAL)?;
-        // 更新最后一次断开连接时间
-        kernel_shm.update_dtim();
-
-        // 映射计数减少
-        kernel_shm.decrease_count();
-
-        // 释放shm_id
-        if kernel_shm.map_count() == 0 && kernel_shm.mode().contains(ShmFlags::SHM_DEST) {
-            shm_manager_guard.free_id(shm_id);
         }
 
         // 取消映射

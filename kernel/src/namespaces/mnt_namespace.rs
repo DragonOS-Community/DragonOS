@@ -24,7 +24,7 @@ use crate::process::fork::CloneFlags;
 use crate::process::ProcessManager;
 use crate::syscall::Syscall;
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MntNamespace {
     /// 关联的用户名字空间
     user_ns: Arc<UserNamespace>,
@@ -33,9 +33,9 @@ pub struct MntNamespace {
     /// 根文件系统
     root: Option<Arc<MountFS>>,
     /// 红黑树用于挂载所有挂载点
-    mounts: Arc<RBTree<InodeId, MountFSInode>>,
+    mounts: RBTree<InodeId, MountFSInode>,
     /// 等待队列
-    poll: Arc<WaitQueue>,
+    poll: WaitQueue,
     ///  挂载序列号
     seq: Arc<AtomicU64>,
     /// 挂载点的数量
@@ -50,8 +50,8 @@ impl Default for MntNamespace {
             user_ns: Arc::new(UserNamespace::default()),
             ucounts: Arc::new(UCounts::default()),
             root: None,
-            mounts: Arc::new(RBTree::new()),
-            poll: Arc::new(WaitQueue::default()),
+            mounts: RBTree::new(),
+            poll: WaitQueue::default(),
             seq: Arc::new(AtomicU64::new(0)),
             nr_mounts: 0,
             pending_mounts: 0,
@@ -95,9 +95,8 @@ impl Namespace for MntNamespace {
     fn name(&self) -> String {
         "mnt".to_string()
     }
-    fn get(&self, pid: crate::process::Pid) -> Option<Arc<dyn Namespace>> {
-        ProcessManager::find(pid)
-            .map(|pcb| pcb.get_nsproxy().read().mnt_namespace.clone() as Arc<dyn Namespace>)
+    fn get(&self, pid: crate::process::Pid) -> Option<Arc<Self>> {
+        ProcessManager::find(pid).map(|pcb| pcb.get_nsproxy().read().mnt_namespace.clone())
     }
 
     fn clone_flags(&self) -> CloneFlags {
@@ -106,12 +105,12 @@ impl Namespace for MntNamespace {
 
     fn put(&self) {}
 
-    fn install(&self, nsset: &mut super::NsSet) -> Result<(), SystemError> {
+    fn install(nsset: &mut super::NsSet, ns: Arc<Self>) -> Result<(), SystemError> {
         let nsproxy = &mut nsset.nsproxy;
-        if self.is_anon_ns() {
+        if ns.is_anon_ns() {
             return Err(SystemError::EINVAL);
         }
-        nsproxy.mnt_namespace = Arc::new(self.clone());
+        nsproxy.mnt_namespace = ns.clone();
 
         nsset.fs.lock().set_pwd(ROOT_INODE());
         nsset.fs.lock().set_root(ROOT_INODE());
@@ -121,8 +120,9 @@ impl Namespace for MntNamespace {
     fn owner(&self) -> Arc<UserNamespace> {
         self.user_ns.clone()
     }
+
     // 不存在这个方法
-    fn get_parent(&self) -> Result<Arc<dyn Namespace>, SystemError> {
+    fn get_parent(&self) -> Result<Arc<Self>, SystemError> {
         unreachable!()
     }
 }
@@ -146,8 +146,8 @@ impl MntNamespace {
             user_ns,
             ucounts,
             root: None,
-            mounts: Arc::new(RBTree::new()),
-            poll: Arc::new(WaitQueue::default()),
+            mounts: RBTree::new(),
+            poll: WaitQueue::default(),
             seq,
             nr_mounts: 0,
             pending_mounts: 0,

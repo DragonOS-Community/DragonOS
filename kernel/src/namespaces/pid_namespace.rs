@@ -163,7 +163,7 @@ impl Namespace for PidNamespace {
         self.user_ns.clone()
     }
 
-    fn get_parent(&self) -> Result<Arc<dyn Namespace>, SystemError> {
+    fn get_parent(&self) -> Result<Arc<Self>, SystemError> {
         let current = ProcessManager::current_pid();
         let pcb = ProcessManager::find(current).unwrap();
         let active = pcb.pid_strcut().read().ns_of_pid();
@@ -178,22 +178,21 @@ impl Namespace for PidNamespace {
         Err(SystemError::EPERM)
     }
 
-    fn get(&self, pid: Pid) -> Option<Arc<dyn Namespace>> {
-        ProcessManager::find(pid)
-            .map(|pcb| pcb.get_nsproxy().read().pid_namespace.clone() as Arc<dyn Namespace>)
+    fn get(&self, pid: Pid) -> Option<Arc<Self>> {
+        ProcessManager::find(pid).map(|pcb| pcb.get_nsproxy().read().pid_namespace.clone())
     }
 
-    fn install(&self, nsset: &mut NsSet) -> Result<(), SystemError> {
+    fn install(nsset: &mut NsSet, ns: Arc<Self>) -> Result<(), SystemError> {
         let nsproxy = &mut nsset.nsproxy;
         let current = ProcessManager::current_pid();
         let pcb = ProcessManager::find(current).unwrap();
         let active = pcb.pid_strcut().read().ns_of_pid();
-        if self.level < active.level {
+        if ns.level < active.level {
             return Err(SystemError::EINVAL);
         }
-        let mut pid_ns: Arc<PidNamespace> = Arc::new(self.clone());
+        let mut pid_ns: Arc<PidNamespace> = ns.clone();
         while pid_ns.level > active.level {
-            if let Some(ns) = &self.parent {
+            if let Some(ns) = &ns.parent {
                 pid_ns = ns.clone();
             } else {
                 break;

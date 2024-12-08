@@ -19,11 +19,11 @@ use super::{create_new_namespaces, NsProxy, NsSet};
 pub trait Namespace: Send + Sync + Debug {
     fn name(&self) -> String;
     fn clone_flags(&self) -> CloneFlags;
-    fn get(&self, pid: Pid) -> Option<Arc<dyn Namespace>>;
+    fn get(&self, pid: Pid) -> Option<Arc<Self>>;
     fn put(&self);
-    fn install(&self, nsset: &mut NsSet) -> Result<(), SystemError>;
+    fn install(nsset: &mut NsSet, ns: Arc<Self>) -> Result<(), SystemError>;
     fn owner(&self) -> Arc<UserNamespace>;
-    fn get_parent(&self) -> Result<Arc<dyn Namespace>, SystemError>;
+    fn get_parent(&self) -> Result<Arc<Self>, SystemError>;
 }
 
 pub enum NsType {

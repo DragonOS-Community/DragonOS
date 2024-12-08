@@ -79,7 +79,7 @@ impl Namespace for UserNamespace {
         CloneFlags::CLONE_NEWUSER
     }
 
-    fn get(&self, pid: Pid) -> Option<Arc<dyn Namespace>> {
+    fn get(&self, pid: Pid) -> Option<Arc<Self>> {
         unimplemented!()
     }
 
@@ -87,7 +87,7 @@ impl Namespace for UserNamespace {
         unimplemented!()
     }
 
-    fn install(&self, nsset: &mut super::NsSet) -> Result<(), SystemError> {
+    fn install(nsset: &mut super::NsSet, ns: Arc<Self>) -> Result<(), SystemError> {
         unimplemented!()
     }
 
@@ -95,7 +95,7 @@ impl Namespace for UserNamespace {
         unimplemented!()
     }
 
-    fn get_parent(&self) -> Result<Arc<dyn Namespace>, SystemError> {
+    fn get_parent(&self) -> Result<Arc<Self>, SystemError> {
         unimplemented!()
     }
 }

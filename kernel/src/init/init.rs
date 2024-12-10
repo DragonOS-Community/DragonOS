@@ -2,6 +2,7 @@ use crate::{
     arch::{
         init::{early_setup_arch, setup_arch, setup_arch_post},
         time::time_init,
+        vm::vmx::vmx_init,
         CurrentIrqArch, CurrentSMPArch, CurrentSchedArch,
     },
     driver::{
@@ -92,8 +93,11 @@ fn do_start_kernel() {
     Futex::init();
     crate::bpf::init_bpf_system();
     crate::debug::jump_label::static_keys_init();
+
+    // #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
+    // crate::virt::kvm::kvm_init();
     #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
-    crate::virt::kvm::kvm_init();
+    vmx_init().unwrap();
 }
 
 /// 在内存管理初始化之前，执行的初始化

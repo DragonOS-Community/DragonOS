@@ -1,5 +1,6 @@
 #![no_main] // <1>
 #![feature(alloc_error_handler)]
+#![feature(new_zeroed_alloc)]
 #![feature(allocator_api)]
 #![feature(arbitrary_self_types)]
 #![feature(concat_idents)]
@@ -18,6 +19,8 @@
 #![feature(vec_into_raw_parts)]
 #![feature(c_variadic)]
 #![feature(asm_goto)]
+// match语句中能够使用范围
+#![feature(exclusive_range_pattern)]
 #![cfg_attr(target_os = "none", no_std)]
 #![allow(static_mut_refs, non_local_definitions, internal_features)]
 // clippy的配置
